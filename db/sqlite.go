@@ -60,7 +60,7 @@ func OpenSqlite(path string) (*SqliteStreamDB, error) {
     return ret, nil
 }
 
-func (conn *SqliteStreamDB) InitCDC() error {
+func (conn *SqliteStreamDB) InstallCDC() error {
     log.Info().Msg("Creating log table...")
 
     if _, err := conn.Exec(logTableCreateStatement); err != nil {
@@ -71,6 +71,11 @@ func (conn *SqliteStreamDB) InitCDC() error {
     }
 
     return conn.initTriggers()
+}
+
+func (conn *SqliteStreamDB) RemoveCDC() error {
+    log.Warn().Msg("Uninstalling all CDC hooks...")
+    return conn.cleanAll()
 }
 
 func (conn *SqliteStreamDB) Execute(query string) error {

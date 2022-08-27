@@ -19,6 +19,7 @@ import (
 var peers = make(map[string]*transport.QUICSession, 0)
 
 func main() {
+    cleanup := flag.Bool("cleanup", false, "Cleanup all hooks and tables")
     dbPathString := flag.String("db-path", ":memory:", "Path to SQLITE DB")
     bindAddress := flag.String("bind", "0.0.0.0:8160", "Bind address for server")
     peersAddrs := flag.String("peers", "", "IP:PORT list of peers separated by comma (,)")
@@ -43,7 +44,18 @@ func main() {
     }
     defer srcDb.Close()
 
-    if err := srcDb.InitCDC(); err != nil {
+    if *cleanup {
+        err = srcDb.RemoveCDC()
+        if err != nil {
+            log.Panic().Err(err).Msg("Unable to clean up...")
+        } else {
+            log.Info().Msg("Cleanup complete...")
+        }
+
+        return
+    }
+
+    if err := srcDb.InstallCDC(); err != nil {
         log.Error().Err(err).Msg("Unable to install CDC tables")
         return
     }
