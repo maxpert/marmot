@@ -13,3 +13,10 @@
 
 # Dependency directories (remove the comment below to include it)
 # vendor/
+build/
+.idea
+.DS_Store
+*.cert
+*.crt
+*.key
+*.pem
