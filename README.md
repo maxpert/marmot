@@ -22,4 +22,4 @@ build/marmot -bind 0.0.0.0:8160 -peers 127.0.0.1:8161 -db-path /tmp/cache-2.db -
 
 ## Production status
 
-Highly experimental and still WIP.
+Highly experimental. You can view my personal [status board here](https://sibte.notion.site/Marmot-Plan-056983fad27a49d4a16fb91031e6ab98).
