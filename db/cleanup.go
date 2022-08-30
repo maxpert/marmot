@@ -3,24 +3,26 @@ package db
 import (
     "fmt"
 
+    "github.com/doug-martin/goqu/v9"
     "github.com/rs/zerolog/log"
 )
 
-const selectAllTriggers = `SELECT name FROM sqlite_master WHERE type ='trigger' AND NAME LIKE '__marmot%'`
 const deleteTriggerQuery = `DROP TRIGGER IF EXISTS %s`
-const deleteMarmotTables = `
-DROP TABLE IF EXISTS __marmot__change__log;
-DROP TABLE IF EXISTS __marmot__replica__log;
-`
+const deleteMarmotTables = `DROP TABLE IF EXISTS %s;`
 
 func (conn *SqliteStreamDB) cleanAll() error {
-    triggers, err := conn.RunQuery(selectAllTriggers)
+    triggers := make([]string, 0)
+    err := conn.
+        Select("name").
+        From("sqlite_master").
+        Where(goqu.And(goqu.Ex{"type": "trigger"}, goqu.C("name").Like(conn.prefix+"%"))).
+        Prepared(true).
+        ScanVals(&triggers)
     if err != nil {
         return err
     }
 
-    for _, t := range triggers {
-        name := t["name"].(string)
+    for _, name := range triggers {
         query := fmt.Sprintf(deleteTriggerQuery, name)
         _, err = conn.Exec(query)
         if err != nil {
@@ -28,9 +30,23 @@ func (conn *SqliteStreamDB) cleanAll() error {
         }
     }
 
-    _, err = conn.Exec(deleteMarmotTables)
+    tables := make([]string, 0)
+    err = conn.
+        Select("name").
+        From("sqlite_master").
+        Where(goqu.And(goqu.Ex{"type": "table"}, goqu.C("name").Like(conn.prefix+"%"))).
+        Prepared(true).
+        ScanVals(&tables)
     if err != nil {
-        log.Error().Err(err).Msg("Unable to delete marmot tables")
+        return err
+    }
+
+    for _, name := range tables {
+        query := fmt.Sprintf(deleteMarmotTables, name)
+        _, err = conn.Exec(query)
+        if err != nil {
+            log.Error().Err(err).Msg("Unable to delete marmot tables")
+        }
     }
 
     return nil

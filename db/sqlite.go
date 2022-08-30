@@ -6,35 +6,30 @@ import (
     "time"
 
     "github.com/bep/debounce"
+    "github.com/doug-martin/goqu/v9"
     "github.com/fsnotify/fsnotify"
+    "github.com/fxamacker/cbor/v2"
     "github.com/rs/zerolog/log"
 )
 
 type SqliteStreamDB struct {
-    *sql.DB
+    *goqu.Database
     watcher   *fsnotify.Watcher
     debounced func(f func())
-    OnChange  func(event *ChangeLogEvent)
+    prefix    string
+    OnChange  func(event *ChangeLogEvent) error
 }
 
 type ChangeLogEvent struct {
     Id          int64
     ChangeRowId int64
     Type        string
-    Table       string
+    TableName   string
     Row         map[string]any
 }
 
-type changeLogEntry struct {
-    Id          int64
-    TableName   string
-    Type        string
-    ChangeRowId int64
-    JsonPayload string
-}
-
 func OpenSqlite(path string) (*SqliteStreamDB, error) {
-    connectionStr := fmt.Sprintf("file://%s?_journal_mode=wal", path)
+    connectionStr := fmt.Sprintf("%s?_journal_mode=wal&mode=memory", path)
     conn, err := sql.Open("sqlite3", connectionStr)
     if err != nil {
         return nil, err
@@ -50,9 +45,11 @@ func OpenSqlite(path string) (*SqliteStreamDB, error) {
         return nil, err
     }
 
+    sqliteQu := goqu.Dialect("sqlite3")
     ret := &SqliteStreamDB{
-        DB:        conn,
+        Database:  sqliteQu.DB(conn),
         watcher:   watcher,
+        prefix:    "__marmot__",
         debounced: debounce.New(50 * time.Millisecond),
     }
 
@@ -61,14 +58,13 @@ func OpenSqlite(path string) (*SqliteStreamDB, error) {
 }
 
 func (conn *SqliteStreamDB) InstallCDC() error {
-    log.Info().Msg("Creating log table...")
+    log.Debug().Msg("Creating log table...")
+    createChangeLogQuery := fmt.Sprintf(logTableCreateStatement, conn.metaTable(changeLogName))
+    if _, err := conn.Exec(createChangeLogQuery); err != nil {
+        return err
+    }
 
-    if _, err := conn.Exec(logTableCreateStatement); err != nil {
-        return err
-    }
-    if _, err := conn.Exec(replicaTableCreateStatement); err != nil {
-        return err
-    }
+    log.Debug().Msg("Creating replica table...")
 
     return conn.initTriggers()
 }
@@ -94,80 +90,14 @@ func (conn *SqliteStreamDB) Execute(query string) error {
     return nil
 }
 
-func (conn *SqliteStreamDB) RunQuery(query string, args ...any) ([]map[string]any, error) {
-    st, err := conn.Prepare(query)
-    if err != nil {
-        return nil, err
-    }
-
-    stmt := &enhancedStatement{st}
-    defer stmt.Finalize()
-
-    rws, err := stmt.Query(args...)
-    if err != nil {
-        return nil, err
-    }
-
-    rs := &enhancedResultSet{rws}
-    defer rs.Finalize()
-
-    resultSet := make([]map[string]any, 0)
-    for {
-        step := rs.Next()
-        if !step {
-            break
-        }
-
-        row, err := rs.fetchRow()
-        if err != nil {
-            return nil, err
-        }
-
-        resultSet = append(resultSet, row)
-    }
-
-    if rs.Err() != nil {
-        return nil, rs.Err()
-    }
-
-    return resultSet, nil
+func (conn *SqliteStreamDB) metaTable(name string) string {
+    return conn.prefix + name
 }
 
-func (conn *SqliteStreamDB) RunTransactionQuery(txn *sql.Tx, query string, args ...any) ([]map[string]any, error) {
-    st, err := txn.Prepare(query)
-    if err != nil {
-        return nil, err
-    }
+func (e *ChangeLogEvent) Marshal() ([]byte, error) {
+    return cbor.Marshal(e)
+}
 
-    stmt := &enhancedStatement{st}
-    defer stmt.Finalize()
-
-    rws, err := stmt.Query(args...)
-    if err != nil {
-        return nil, err
-    }
-
-    rs := &enhancedResultSet{rws}
-    defer rs.Finalize()
-
-    resultSet := make([]map[string]any, 0)
-    for {
-        step := rs.Next()
-        if !step {
-            break
-        }
-
-        row, err := rs.fetchRow()
-        if err != nil {
-            return nil, err
-        }
-
-        resultSet = append(resultSet, row)
-    }
-
-    if rs.Err() != nil {
-        return nil, rs.Err()
-    }
-
-    return resultSet, nil
+func (e *ChangeLogEvent) Unmarshal(data []byte) error {
+    return cbor.Unmarshal(data, e)
 }

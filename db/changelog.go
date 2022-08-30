@@ -1,18 +1,19 @@
 package db
 
 import (
-    "context"
-    "database/sql"
     "fmt"
     "strings"
     "time"
 
+    "github.com/doug-martin/goqu/v9"
     "github.com/fsnotify/fsnotify"
     "github.com/rs/zerolog/log"
     "github.com/samber/lo"
 )
 
-const logTableCreateStatement = `CREATE TABLE IF NOT EXISTS __marmot__change__log(
+const changeLogName = "change__log"
+
+const logTableCreateStatement = `CREATE TABLE IF NOT EXISTS %s(
     id              integer primary key,
     table_name      text,
     type            text,
@@ -20,74 +21,90 @@ const logTableCreateStatement = `CREATE TABLE IF NOT EXISTS __marmot__change__lo
     row_map_serial  blob
 );`
 
-const listTableQuery = `SELECT name 
-FROM sqlite_master 
-WHERE type ='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '__marmot__%'`
+type changeLogEntry struct {
+    Id            int64  `db:"id"`
+    TableName     string `db:"table_name"`
+    Type          string `db:"type"`
+    ChangeRowId   int64  `db:"change_row_id"`
+    SerializedRow []byte `db:"row_map_serial"`
+}
 
-const selectChangesId = "SELECT id, table_name, type, change_row_id FROM __marmot__change__log"
-const dropTriggerStatement = `DROP TRIGGER IF EXISTS __marmot__on_%[1]s_%[2]s;`
-const createTriggerStatement = `CREATE TRIGGER IF NOT EXISTS __marmot__on_%[1]s_%[2]s
-AFTER %[2]s ON %[1]s 
-WHEN
-    (SELECT COUNT(*) 
-    FROM __marmot__replica__log as r 
-    WHERE r.change_row_id = %[3]s.rowid AND r.table_name = '%[1]s' AND r.type = '%[2]s') = 0
-BEGIN
-    INSERT INTO __marmot__change__log(
-        id,
-        table_name, 
-        type, 
-        change_row_id
-    ) VALUES(
-        abs(random()),
-        '%[1]s', 
-        '%[2]s', 
-        %[3]s.rowid
-    );
-END;`
+func createTriggerSQL(prefix, table, event, logTable, newOld string) string {
+    // 1: prefix, 2: table, 3: event 4: log_table 5: NEW/OLD
+    const createTriggerStatement = `CREATE TRIGGER IF NOT EXISTS %[1]son_%[2]s_%[3]s
+    AFTER %[3]s ON %[2]s
+    BEGIN
+        INSERT INTO %[4]s(
+            id,
+            table_name, 
+            type, 
+            change_row_id
+        ) VALUES(
+            abs(random()),
+            '%[2]s', 
+            '%[3]s', 
+            %[5]s.rowid
+        );
+    END;`
+    return fmt.Sprintf(createTriggerStatement, prefix, table, event, logTable, newOld)
+}
+
+func dropTriggerSQL(prefix, table, event string) string {
+    // 1: prefix, 2: table, 3: event
+    const dropTriggerStatement = `DROP TRIGGER IF EXISTS %[1]son_%[2]s_%[3]s;`
+    return fmt.Sprintf(dropTriggerStatement, prefix, table, event)
+}
 
 func (conn *SqliteStreamDB) initTriggers() error {
-    liftName := func(tpl map[string]any, _ int) string {
-        return tpl["name"].(string)
-    }
-
     log.Info().Msg("Listing tables...")
-    rs, err := conn.RunQuery(listTableQuery)
+    tableNames := make([]string, 0)
+    err := conn.Select("name").
+        From("sqlite_master").
+        Where(
+            goqu.And(
+                goqu.Ex{"type": "table"},
+                goqu.Ex{"name": goqu.Op{"notLike": "sqlite_%"}},
+                goqu.Ex{"name": goqu.Op{"notLike": conn.prefix + "%"}},
+            ),
+        ).
+        Prepared(true).
+        Executor().
+        ScanVals(&tableNames)
+
     if err != nil {
         return err
     }
 
-    tableNames := lo.Map[map[string]any, string](rs, liftName)
-
     for _, name := range tableNames {
         log.Info().Msg(fmt.Sprintf("Creating trigger for %v", name))
+        logTableName := conn.metaTable(changeLogName)
 
-        query := fmt.Sprintf(dropTriggerStatement, name, "insert")
+        query := dropTriggerSQL(conn.prefix, name, "insert")
         if err := conn.Execute(query); err != nil {
             return err
         }
 
-        query = fmt.Sprintf(createTriggerStatement, name, "insert", "NEW")
+        query = createTriggerSQL(conn.prefix, name, "insert", logTableName, "NEW")
         if err := conn.Execute(query); err != nil {
             return err
         }
 
-        query = fmt.Sprintf(dropTriggerStatement, name, "update")
+        query = dropTriggerSQL(conn.prefix, name, "update")
         if err := conn.Execute(query); err != nil {
             return err
         }
 
-        query = fmt.Sprintf(createTriggerStatement, name, "update", "NEW")
+        query = createTriggerSQL(conn.prefix, name, "update", logTableName, "NEW")
         if err := conn.Execute(query); err != nil {
             return err
         }
 
-        query = fmt.Sprintf(dropTriggerStatement, name, "delete")
+        query = dropTriggerSQL(conn.prefix, name, "update")
         if err := conn.Execute(query); err != nil {
             return err
         }
 
-        query = fmt.Sprintf(createTriggerStatement, name, "delete", "OLD")
+        query = createTriggerSQL(conn.prefix, name, "delete", logTableName, "OLD")
         if err := conn.Execute(query); err != nil {
             return err
         }
@@ -112,10 +129,10 @@ func (conn *SqliteStreamDB) watchChanges(path string) {
             }
 
             if ev.Op != fsnotify.Chmod {
-                conn.debounced(conn.scanChangeLog)
+                conn.debounced(conn.publishChangeLog)
             }
         case <-time.After(time.Second * 1):
-            conn.debounced(conn.scanChangeLog)
+            conn.debounced(conn.publishChangeLog)
             if errShm != nil {
                 errShm = watcher.Add(shmPath)
             }
@@ -127,145 +144,138 @@ func (conn *SqliteStreamDB) watchChanges(path string) {
     }
 }
 
-func (conn *SqliteStreamDB) scanChangeLog() {
-    tx, err := conn.BeginTx(context.Background(), &sql.TxOptions{
-        Isolation: sql.LevelLinearizable,
-        ReadOnly:  true,
+func (conn *SqliteStreamDB) publishChangeLog() {
+    var changes []*changeLogEntry
+    err := conn.WithTx(func(tx *goqu.TxDatabase) error {
+        return tx.From(conn.metaTable(changeLogName)).Prepared(true).ScanStructs(&changes)
     })
-    if err != nil {
-        log.Error().Err(err).Msg("Unable to start read transaction")
-        return
-    }
-    defer func(tx *sql.Tx) {
-        _ = tx.Rollback()
-    }(tx)
 
-    rs, err := conn.RunTransactionQuery(tx, selectChangesId)
     if err != nil {
         log.Error().Err(err).Msg("Error scanning last row ID")
         return
     }
 
-    if err := tx.Commit(); err != nil {
-        log.Error().Err(err).Msg("Unable to commit transaction")
-    }
-
-    if len(rs) == 0 {
+    if len(changes) == 0 {
         return
     }
 
-    log.Debug().Int("total", len(rs)).Msg("New changes...")
-    changes := make([]*changeLogEntry, 0, len(rs))
-
-    for _, r := range rs {
-        currId, ok := r["id"].(int64)
-        if ok {
-            log.Debug().Msg(fmt.Sprintf("Row updated %v", r))
-            changes = append(changes, &changeLogEntry{
-                ChangeRowId: r["change_row_id"].(int64),
-                Type:        r["type"].(string),
-                TableName:   r["table_name"].(string),
-                Id:          currId,
-            })
-        }
-    }
-
-    err = conn.consumeChanges(changes)
+    err = conn.consumeChangeLogs(changes)
     if err != nil {
         log.Error().Err(err).Msg("Unable to consume changes")
     }
 }
 
-func (conn *SqliteStreamDB) consumeChanges(changes []*changeLogEntry) error {
+func (conn *SqliteStreamDB) consumeChangeLogs(changes []*changeLogEntry) error {
     perTableChanges := lo.GroupBy[*changeLogEntry, string](changes, func(e *changeLogEntry) string {
         return e.TableName
     })
 
     for tableName, tableChanges := range perTableChanges {
+        // Consume each batch in transaction
         deletes, upserts := conn.splitDeleteAndUpserts(tableChanges)
 
-        tx, err := conn.Begin()
+        err := conn.consumeDeletes(deletes, tableName)
         if err != nil {
             return err
         }
 
-        err = conn.consumeDeletes(tx, deletes, tableName)
+        err = conn.consumeUpserts(upserts, tableName)
         if err != nil {
-            _ = tx.Rollback()
             return err
         }
 
-        err = conn.consumeUpserts(tx, upserts, tableName)
-        if err != nil {
-            _ = tx.Rollback()
-            return err
-        }
-
-        err = tx.Commit()
-        if err != nil {
-            return err
-        }
+        return nil
     }
 
     return nil
 }
 
-func (conn *SqliteStreamDB) consumeUpserts(tx *sql.Tx, upserts []*changeLogEntry, tableName string) error {
-    placeHolders := strings.Split(strings.Repeat("?", len(upserts)), "")
-    placeHoldersStr := strings.Join(placeHolders, ", ")
-    conditionalPostfix := fmt.Sprintf("FROM %s WHERE rowid IN(%s)", tableName, placeHoldersStr)
+func (conn *SqliteStreamDB) consumeUpserts(upserts []*changeLogEntry, tableName string) error {
     changeRowIds := lo.Map[*changeLogEntry, any](upserts, func(e *changeLogEntry, _ int) any {
         return e.ChangeRowId
     })
 
-    if err := conn.selectAndPublishRows(tx, upserts, conditionalPostfix, changeRowIds); err != nil {
+    query, params, err := conn.From(tableName).
+        Select("rowid", "*").
+        Where(goqu.C("rowid").In(changeRowIds)).
+        Prepared(true).
+        ToSQL()
+    if err != nil {
         return err
     }
 
-    rowIds := lo.Map[*changeLogEntry, any](upserts, func(e *changeLogEntry, _ int) any {
-        return e.Id
-    })
+    rawRows, err := conn.Query(query, params...)
+    if err != nil {
+        return nil
+    }
 
-    if err := conn.deleteChangeLogRows(tx, rowIds); err != nil {
-        return err
+    rows := &enhancedRows{rawRows}
+    upsertMap := lo.Associate[*changeLogEntry, int64, *changeLogEntry](
+        upserts,
+        func(l *changeLogEntry) (int64, *changeLogEntry) {
+            return l.ChangeRowId, l
+        },
+    )
+
+    for rows.Next() {
+        row, err := rows.fetchRow()
+        if err != nil {
+            return err
+        }
+
+        changeRowID := row["rowid"].(int64)
+        changeRow := upsertMap[changeRowID]
+        if conn.OnChange != nil {
+            err = conn.OnChange(&ChangeLogEvent{
+                Id:          changeRow.Id,
+                Type:        changeRow.Type,
+                TableName:   changeRow.TableName,
+                ChangeRowId: changeRowID,
+                Row:         row,
+            })
+
+            if err != nil {
+                return err
+            }
+        }
+
+        _, err = conn.
+            Delete(conn.metaTable(changeLogName)).
+            Where(goqu.Ex{"rowid": changeRow.Id}).
+            Executor().
+            Exec()
+        if err != nil {
+            return err
+        }
     }
 
     return nil
 }
 
-func (conn *SqliteStreamDB) consumeDeletes(tx *sql.Tx, deletes []*changeLogEntry, tableName string) error {
+func (conn *SqliteStreamDB) consumeDeletes(deletes []*changeLogEntry, tableName string) error {
     for _, d := range deletes {
         if conn.OnChange != nil {
-            conn.OnChange(&ChangeLogEvent{
+            err := conn.OnChange(&ChangeLogEvent{
                 Id:          d.Id,
                 Row:         nil,
                 Type:        "delete",
-                Table:       tableName,
+                TableName:   tableName,
                 ChangeRowId: d.ChangeRowId,
             })
+
+            if err != nil {
+                return err
+            }
+
+            _, err = conn.
+                Delete(conn.metaTable(changeLogName)).
+                Where(goqu.Ex{"rowid": d.Id}).
+                Executor().
+                Exec()
+            if err != nil {
+                return err
+            }
         }
-    }
-
-    rowIds := lo.Map[*changeLogEntry, any](deletes, func(e *changeLogEntry, _ int) any {
-        return e.Id
-    })
-
-    return conn.deleteChangeLogRows(tx, rowIds)
-}
-
-func (conn *SqliteStreamDB) deleteChangeLogRows(tx *sql.Tx, rowIds []any) error {
-    placeHolders := strings.Split(strings.Repeat("?", len(rowIds)), "")
-    placeHoldersStr := strings.Join(placeHolders, ", ")
-    del := fmt.Sprintf("DELETE FROM __marmot__change__log WHERE rowid IN(%[1]s)", placeHoldersStr)
-    delSt, err := tx.Prepare(del)
-    if err != nil {
-        return err
-    }
-
-    defer (&enhancedStatement{delSt}).Finalize()
-    _, err = delSt.Exec(rowIds...)
-    if err != nil {
-        return err
     }
 
     return nil
@@ -282,51 +292,4 @@ func (conn *SqliteStreamDB) splitDeleteAndUpserts(tableChanges []*changeLogEntry
         }
     }
     return deletes, upserts
-}
-
-func (conn *SqliteStreamDB) selectAndPublishRows(tx *sql.Tx, upserts []*changeLogEntry, conditionalPostfix string, rowIds []any) error {
-    sel := fmt.Sprintf("SELECT rowid, * %s", conditionalPostfix)
-    selSt, err := tx.Prepare(sel)
-    if err != nil {
-        return err
-    }
-
-    selStmt := &enhancedStatement{selSt}
-    defer selStmt.Finalize()
-
-    changedRows, err := selStmt.Query(rowIds...)
-    if err != nil {
-        return err
-    }
-
-    upsertMap := make(map[int64]*changeLogEntry)
-    for _, e := range upserts {
-        upsertMap[e.ChangeRowId] = e
-    }
-
-    rs := &enhancedResultSet{changedRows}
-    for {
-        step := rs.Next()
-        if !step {
-            break
-        }
-
-        row, err := rs.fetchRow()
-        if err != nil {
-            return err
-        }
-
-        changeRowID := row["rowid"].(int64)
-        if conn.OnChange != nil {
-            conn.OnChange(&ChangeLogEvent{
-                Id:          upsertMap[changeRowID].Id,
-                Type:        upsertMap[changeRowID].Type,
-                Table:       upsertMap[changeRowID].TableName,
-                ChangeRowId: changeRowID,
-                Row:         row,
-            })
-        }
-    }
-
-    return nil
 }

@@ -17,11 +17,11 @@ func (stmt *enhancedStatement) Finalize() {
     }
 }
 
-type enhancedResultSet struct {
+type enhancedRows struct {
     *sql.Rows
 }
 
-func (rs *enhancedResultSet) fetchRow() (map[string]any, error) {
+func (rs *enhancedRows) fetchRow() (map[string]any, error) {
     columns, err := rs.Columns()
     if err != nil {
         return nil, err
@@ -45,7 +45,7 @@ func (rs *enhancedResultSet) fetchRow() (map[string]any, error) {
     return row, nil
 }
 
-func (rs *enhancedResultSet) Finalize() {
+func (rs *enhancedRows) Finalize() {
     err := rs.Close()
     if err != nil {
         log.Error().Err(err).Msg("Unable to close result set")

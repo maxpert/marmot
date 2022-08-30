@@ -20,3 +20,4 @@ build/
 *.crt
 *.key
 *.pem
+marmot
