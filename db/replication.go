@@ -3,9 +3,12 @@ package db
 import (
     "errors"
     "fmt"
+    "strings"
 
     "github.com/doug-martin/goqu/v9"
 )
+
+const upsertQuery = `INSERT OR REPLACE INTO %s(%s) VALUES (%s)`
 
 func (conn *SqliteStreamDB) Replicate(event *ChangeLogEvent) error {
     if err := conn.consumeReplicationEvent(event); err != nil {
@@ -57,31 +60,30 @@ func replicateRow(tx *goqu.TxDatabase, event *ChangeLogEvent) error {
 }
 
 func replicateUpsert(tx *goqu.TxDatabase, event *ChangeLogEvent) error {
-    row := make(map[string]any)
+    columnNames := make([]string, 0, len(event.Row))
+    columnValues := make([]any, 0, len(event.Row))
+
+    columnNames = append(columnNames, "rowid")
+    columnValues = append(columnValues, event.ChangeRowId)
+
     for k, v := range event.Row {
-        row[k] = v
+        columnNames = append(columnNames, k)
+        columnValues = append(columnValues, v)
     }
-    row["rowid"] = event.ChangeRowId
 
-    _, err := tx.Insert(event.TableName).
-        Rows(row).
-        Prepared(true).
-        Executor().
-        Exec()
+    query := fmt.Sprintf(
+        upsertQuery,
+        event.TableName,
+        strings.Join(columnNames, ", "),
+        strings.Join(strings.Split(strings.Repeat("?", len(columnNames)), ""), ", "),
+    )
 
+    stmt, err := tx.Prepare(query)
     if err != nil {
-        err = replicateDelete(tx, event)
-        if err != nil {
-            return err
-        }
-
-        _, err = tx.Insert(event.TableName).
-            Rows(row).
-            Prepared(true).
-            Executor().
-            Exec()
+        return err
     }
 
+    _, err = stmt.Exec(columnValues...)
     return err
 }
 

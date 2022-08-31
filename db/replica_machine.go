@@ -1,7 +1,6 @@
 package db
 
 import (
-    "fmt"
     "io"
 
     "github.com/fxamacker/cbor/v2"
@@ -34,15 +33,20 @@ func (ssm *SQLiteStateMachine) Update(bytes []byte) (sm.Result, error) {
         return sm.Result{}, err
     }
 
+    logger := log.With().
+        Int64("change_row_id", event.Payload.ChangeRowId).
+        Int64("row_id", event.Payload.Id).
+        Str("table_name", event.Payload.TableName).
+        Logger()
+
+    logger.Debug().Msg("Propagating...")
     if event.FromNodeId != ssm.NodeID {
         err := ssm.DB.Replicate(event.Payload)
         if err != nil {
-            return sm.Result{}, err
+            logger.Error().Err(err).Msg("Change not applied...")
         }
-
     }
 
-    log.Debug().Msg(fmt.Sprintf("Propagated... %v %v", event.Payload.TableName, event.Payload.ChangeRowId))
     return sm.Result{Value: 1}, nil
 }
 
