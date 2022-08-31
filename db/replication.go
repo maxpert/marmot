@@ -18,6 +18,12 @@ func (conn *SqliteStreamDB) Replicate(event *ChangeLogEvent) error {
 }
 
 func (conn *SqliteStreamDB) consumeReplicationEvent(event *ChangeLogEvent) error {
+    tableInfo, err := conn.GetTableInfo(event.TableName)
+    if err != nil {
+        return err
+    }
+
+    primaryKeyMap := getPrimaryKeyMap(tableInfo, event)
     return conn.WithTx(func(tnx *goqu.TxDatabase) error {
         _, err := tnx.Insert(conn.metaTable(replicaInName)).
             Rows(goqu.Record{
@@ -34,38 +40,49 @@ func (conn *SqliteStreamDB) consumeReplicationEvent(event *ChangeLogEvent) error
             return err
         }
 
-        err = replicateRow(tnx, event)
+        err = replicateRow(tnx, event, primaryKeyMap)
         if err != nil {
             return err
         }
 
-        _, err = tnx.Delete(conn.metaTable(replicaInName)).Where(goqu.Ex{
-            "id": event.Id,
-        }).Prepared(true).Executor().Exec()
+        _, err = tnx.Delete(conn.metaTable(replicaInName)).
+            Where(goqu.Ex{
+                "id": event.Id,
+            }).
+            Prepared(true).
+            Executor().
+            Exec()
 
         return err
     })
 }
 
-func replicateRow(tx *goqu.TxDatabase, event *ChangeLogEvent) error {
+func getPrimaryKeyMap(tableInfo map[string]*ColumnInfo, event *ChangeLogEvent) map[string]any {
+    ret := make(map[string]any)
+    for name, info := range tableInfo {
+        if info.IsPrimaryKey {
+            ret[name] = event.Row[name]
+        }
+    }
+
+    return ret
+}
+
+func replicateRow(tx *goqu.TxDatabase, event *ChangeLogEvent, pkMap map[string]any) error {
     if event.Type == "insert" || event.Type == "update" {
-        return replicateUpsert(tx, event)
+        return replicateUpsert(tx, event, pkMap)
     }
 
     if event.Type == "delete" {
-        return replicateDelete(tx, event)
+        return replicateDelete(tx, event, pkMap)
     }
 
     return errors.New(fmt.Sprintf("invalid operation type %s", event.Type))
 }
 
-func replicateUpsert(tx *goqu.TxDatabase, event *ChangeLogEvent) error {
+func replicateUpsert(tx *goqu.TxDatabase, event *ChangeLogEvent, _ map[string]any) error {
     columnNames := make([]string, 0, len(event.Row))
     columnValues := make([]any, 0, len(event.Row))
-
-    columnNames = append(columnNames, "rowid")
-    columnValues = append(columnValues, event.ChangeRowId)
-
     for k, v := range event.Row {
         columnNames = append(columnNames, k)
         columnValues = append(columnValues, v)
@@ -87,9 +104,9 @@ func replicateUpsert(tx *goqu.TxDatabase, event *ChangeLogEvent) error {
     return err
 }
 
-func replicateDelete(tx *goqu.TxDatabase, event *ChangeLogEvent) error {
+func replicateDelete(tx *goqu.TxDatabase, event *ChangeLogEvent, pkMap map[string]any) error {
     _, err := tx.Delete(event.TableName).
-        Where(goqu.Ex{"rowid": event.ChangeRowId}).
+        Where(goqu.Ex(pkMap)).
         Prepared(true).
         Executor().
         Exec()

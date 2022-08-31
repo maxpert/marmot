@@ -1,4 +1,4 @@
-package db
+package lib
 
 import (
     "io"
@@ -6,11 +6,12 @@ import (
     "github.com/fxamacker/cbor/v2"
     sm "github.com/lni/dragonboat/v3/statemachine"
     "github.com/rs/zerolog/log"
+    "marmot/db"
 )
 
 type SQLiteStateMachine struct {
     NodeID    uint64
-    DB        *SqliteStreamDB
+    DB        *db.SqliteStreamDB
     lastIndex uint64
 }
 
@@ -28,25 +29,29 @@ func (e *ReplicationEvent[T]) Unmarshal(data []byte) error {
 }
 
 func (ssm *SQLiteStateMachine) Update(bytes []byte) (sm.Result, error) {
-    event := &ReplicationEvent[ChangeLogEvent]{}
+    event := &ReplicationEvent[db.ChangeLogEvent]{}
     if err := event.Unmarshal(bytes); err != nil {
         return sm.Result{}, err
     }
 
     logger := log.With().
-        Int64("change_row_id", event.Payload.ChangeRowId).
-        Int64("row_id", event.Payload.Id).
+        Int64("table_id", event.Payload.ChangeRowId).
+        Int64("stream_row_id", event.Payload.Id).
         Str("table_name", event.Payload.TableName).
+        Str("type", event.Payload.Type).
         Logger()
 
-    logger.Debug().Msg("Propagating...")
-    if event.FromNodeId != ssm.NodeID {
-        err := ssm.DB.Replicate(event.Payload)
-        if err != nil {
-            logger.Error().Err(err).Msg("Change not applied...")
-        }
+    if event.FromNodeId == ssm.NodeID {
+        return sm.Result{Value: 0}, nil
     }
 
+    err := ssm.DB.Replicate(event.Payload)
+    if err != nil {
+        logger.Error().Err(err).Msg("Row not replicated...")
+        return sm.Result{Value: 0}, nil
+    }
+
+    logger.Debug().Msg("Replicated row")
     return sm.Result{Value: 1}, nil
 }
 
@@ -66,7 +71,7 @@ func (ssm *SQLiteStateMachine) Close() error {
     return nil
 }
 
-func NewDBStateMachine(shardID uint64, db *SqliteStreamDB) sm.IStateMachine {
+func NewDBStateMachine(shardID uint64, db *db.SqliteStreamDB) sm.IStateMachine {
     return &SQLiteStateMachine{
         DB:        db,
         NodeID:    shardID,

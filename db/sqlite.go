@@ -16,10 +16,10 @@ import (
 
 type SqliteStreamDB struct {
     *goqu.Database
+    OnChange  func(event *ChangeLogEvent) error
     watcher   *fsnotify.Watcher
     debounced func(f func())
     prefix    string
-    OnChange  func(event *ChangeLogEvent) error
 }
 
 type ChangeLogEvent struct {
@@ -28,6 +28,14 @@ type ChangeLogEvent struct {
     Type        string
     TableName   string
     Row         map[string]any
+}
+
+type ColumnInfo struct {
+    Name         string `db:"name"`
+    Type         string `db:"type"`
+    NotNull      bool   `db:"notnull"`
+    DefaultValue any    `db:"dflt_value"`
+    IsPrimaryKey bool   `db:"pk"`
 }
 
 func OpenSqlite(path string) (*SqliteStreamDB, error) {
@@ -71,7 +79,6 @@ func (conn *SqliteStreamDB) InstallCDC(tables []string) error {
     }
 
     log.Debug().Msg("Creating replica table...")
-
     return conn.initTriggers(tables)
 }
 
@@ -98,6 +105,35 @@ func (conn *SqliteStreamDB) Execute(query string) error {
 
 func (conn *SqliteStreamDB) metaTable(name string) string {
     return conn.prefix + name
+}
+
+func (conn *SqliteStreamDB) GetTableInfo(table string) (map[string]*ColumnInfo, error) {
+    query := "SELECT name, type, `notnull`, dflt_value, pk FROM pragma_table_info(?)"
+    stmt, err := conn.Prepare(query)
+    if err != nil {
+        return nil, err
+    }
+
+    rows, err := stmt.Query(table)
+    if err != nil {
+        return nil, err
+    }
+
+    tableInfo := make(map[string]*ColumnInfo)
+    for rows.Next() {
+        if rows.Err() != nil {
+            return nil, rows.Err()
+        }
+
+        c := ColumnInfo{}
+        err = rows.Scan(&c.Name, &c.Type, &c.NotNull, &c.DefaultValue, &c.IsPrimaryKey)
+        if err != nil {
+            return nil, err
+        }
+
+    }
+
+    return tableInfo, nil
 }
 
 func (e *ChangeLogEvent) Marshal() ([]byte, error) {

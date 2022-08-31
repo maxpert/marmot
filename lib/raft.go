@@ -26,6 +26,7 @@ type RaftServer struct {
     clusterMap   map[uint64]uint64
     stateMachine statemachine.IStateMachine
     nodeHost     *dragonboat.NodeHost
+    nodeUser     map[uint64]dragonboat.INodeUser
 }
 
 func NewRaftServer(
@@ -45,7 +46,7 @@ func NewRaftServer(
         metaPath:     metaPath,
         clusterMap:   make(map[uint64]uint64),
         lock:         &sync.RWMutex{},
-        stateMachine: db.NewDBStateMachine(nodeID, database),
+        stateMachine: NewDBStateMachine(nodeID, database),
     }
 }
 
@@ -180,8 +181,14 @@ func (r *RaftServer) Propose(key uint64, data []byte, dur time.Duration) (*drago
     }
 
     clusterIndex = key % uint64(len(clusterIds))
-    session := r.nodeHost.GetNoOPSession(clusterIds[clusterIndex])
-    req, err := r.nodeHost.Propose(session, data, dur)
+    clusterId := clusterIds[clusterIndex]
+    nodeUser, err := r.getNodeUser(clusterId)
+    if err != nil {
+        return nil, err
+    }
+
+    session := r.nodeHost.GetNoOPSession(clusterId)
+    req, err := nodeUser.Propose(session, data, dur)
     if err != nil {
         return nil, err
     }
@@ -211,4 +218,23 @@ func parseInitialMembersMap(peersAddrs string) map[uint64]string {
     }
 
     return peersMap
+}
+
+func (r *RaftServer) getNodeUser(clusterID uint64) (dragonboat.INodeUser, error) {
+    r.lock.RLock()
+    if val, ok := r.nodeUser[clusterID]; ok {
+        r.lock.RUnlock()
+        return val, nil
+    }
+
+    r.lock.RUnlock()
+    r.lock.Lock()
+    defer r.lock.Unlock()
+
+    val, err := r.nodeHost.GetNodeUser(clusterID)
+    if err != nil {
+        return nil, err
+    }
+    r.nodeUser[clusterID] = val
+    return val, nil
 }
