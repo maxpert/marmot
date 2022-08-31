@@ -5,7 +5,6 @@ import (
     "fmt"
 
     "github.com/doug-martin/goqu/v9"
-    "github.com/doug-martin/goqu/v9/exp"
 )
 
 func (conn *SqliteStreamDB) Replicate(event *ChangeLogEvent) error {
@@ -66,10 +65,22 @@ func replicateUpsert(tx *goqu.TxDatabase, event *ChangeLogEvent) error {
 
     _, err := tx.Insert(event.TableName).
         Rows(row).
-        OnConflict(exp.NewDoUpdateConflictExpression("", event.Row)).
         Prepared(true).
         Executor().
         Exec()
+
+    if err != nil {
+        err = replicateDelete(tx, event)
+        if err != nil {
+            return err
+        }
+
+        _, err = tx.Insert(event.TableName).
+            Rows(row).
+            Prepared(true).
+            Executor().
+            Exec()
+    }
 
     return err
 }
