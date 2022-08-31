@@ -3,7 +3,6 @@ module marmot
 go 1.18
 
 require (
-	github.com/bep/debounce v1.2.1
 	github.com/doug-martin/goqu/v9 v9.18.0
 	github.com/fsnotify/fsnotify v1.5.4
 	github.com/fxamacker/cbor/v2 v2.4.0

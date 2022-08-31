@@ -144,10 +144,10 @@ func (conn *SqliteStreamDB) watchChanges(path string) {
             }
 
             if ev.Op != fsnotify.Chmod {
-                conn.debounced(conn.publishChangeLog)
+                conn.publishChangeLog()
             }
         case <-time.After(time.Millisecond * 500):
-            conn.debounced(conn.publishChangeLog)
+            conn.publishChangeLog()
             if errShm != nil {
                 errShm = watcher.Add(shmPath)
             }
@@ -160,6 +160,9 @@ func (conn *SqliteStreamDB) watchChanges(path string) {
 }
 
 func (conn *SqliteStreamDB) publishChangeLog() {
+    conn.publishLock.Lock()
+    defer conn.publishLock.Unlock()
+
     for {
         var changes []*changeLogEntry
         err := conn.WithTx(func(tx *goqu.TxDatabase) error {
@@ -231,6 +234,8 @@ func (conn *SqliteStreamDB) consumeUpserts(upserts []*changeLogEntry, tableName 
     }
 
     rows := &enhancedRows{rawRows}
+    defer rows.Finalize()
+
     upsertMap := lo.Associate[*changeLogEntry, int64, *changeLogEntry](
         upserts,
         func(l *changeLogEntry) (int64, *changeLogEntry) {
@@ -246,6 +251,12 @@ func (conn *SqliteStreamDB) consumeUpserts(upserts []*changeLogEntry, tableName 
 
         changeRowID := row["rowid"].(int64)
         changeRow := upsertMap[changeRowID]
+        logger := log.With().
+            Int64("rowid", changeRowID).
+            Str("table", changeRow.TableName).
+            Str("type", changeRow.Type).
+            Logger()
+
         if conn.OnChange != nil {
             err = conn.OnChange(&ChangeLogEvent{
                 Id:          changeRow.Id,
@@ -256,6 +267,7 @@ func (conn *SqliteStreamDB) consumeUpserts(upserts []*changeLogEntry, tableName 
             })
 
             if err != nil {
+                logger.Error().Err(err).Msg("Upsert failed to notify on change")
                 return err
             }
         }
@@ -265,9 +277,13 @@ func (conn *SqliteStreamDB) consumeUpserts(upserts []*changeLogEntry, tableName 
             Where(goqu.Ex{"rowid": changeRow.Id}).
             Executor().
             Exec()
+
         if err != nil {
+            logger.Error().Err(err).Msg("Unable to delete change set row")
             return err
         }
+
+        logger.Debug().Msg("Notified upsert...")
     }
 
     return nil
@@ -275,6 +291,12 @@ func (conn *SqliteStreamDB) consumeUpserts(upserts []*changeLogEntry, tableName 
 
 func (conn *SqliteStreamDB) consumeDeletes(deletes []*changeLogEntry, tableName string) error {
     for _, d := range deletes {
+        logger := log.With().
+            Int64("rowid", d.ChangeRowId).
+            Str("table", d.TableName).
+            Str("type", d.Type).
+            Logger()
+
         if conn.OnChange != nil {
             err := conn.OnChange(&ChangeLogEvent{
                 Id:          d.Id,
@@ -285,6 +307,7 @@ func (conn *SqliteStreamDB) consumeDeletes(deletes []*changeLogEntry, tableName 
             })
 
             if err != nil {
+                logger.Error().Err(err).Msg("Delete failed to notify on change")
                 return err
             }
 
@@ -294,9 +317,12 @@ func (conn *SqliteStreamDB) consumeDeletes(deletes []*changeLogEntry, tableName 
                 Executor().
                 Exec()
             if err != nil {
+                logger.Error().Err(err).Msg("Unable to delete change set row")
                 return err
             }
         }
+
+        logger.Debug().Msg("Notified delete...")
     }
 
     return nil

@@ -5,9 +5,8 @@ import (
     "encoding/binary"
     "fmt"
     "hash/fnv"
-    "time"
+    "sync"
 
-    "github.com/bep/debounce"
     "github.com/doug-martin/goqu/v9"
     "github.com/fsnotify/fsnotify"
     "github.com/fxamacker/cbor/v2"
@@ -16,10 +15,10 @@ import (
 
 type SqliteStreamDB struct {
     *goqu.Database
-    OnChange  func(event *ChangeLogEvent) error
-    watcher   *fsnotify.Watcher
-    debounced func(f func())
-    prefix    string
+    OnChange    func(event *ChangeLogEvent) error
+    watcher     *fsnotify.Watcher
+    prefix      string
+    publishLock *sync.Mutex
 }
 
 type ChangeLogEvent struct {
@@ -57,10 +56,10 @@ func OpenSqlite(path string) (*SqliteStreamDB, error) {
 
     sqliteQu := goqu.Dialect("sqlite3")
     ret := &SqliteStreamDB{
-        Database:  sqliteQu.DB(conn),
-        watcher:   watcher,
-        prefix:    "__marmot__",
-        debounced: debounce.New(50 * time.Millisecond),
+        Database:    sqliteQu.DB(conn),
+        watcher:     watcher,
+        prefix:      "__marmot__",
+        publishLock: &sync.Mutex{},
     }
 
     go ret.watchChanges(path)
