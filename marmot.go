@@ -70,7 +70,12 @@ func main() {
     }
 
     srcDb.OnChange = func(event *db.ChangeLogEvent) error {
-        data, err := event.Marshal()
+        ev := &db.ReplicationEvent[db.ChangeLogEvent]{
+            FromNodeId: *nodeID,
+            Payload:    event,
+        }
+
+        data, err := ev.Marshal()
         if err != nil {
             return err
         }

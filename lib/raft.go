@@ -158,7 +158,7 @@ func (r *RaftServer) GetActiveClusters() []uint64 {
     defer r.lock.RUnlock()
 
     ret := make([]uint64, 0)
-    for clusterID, _ := range r.clusterMap {
+    for clusterID := range r.clusterMap {
         ret = append(ret, clusterID)
     }
 
@@ -173,7 +173,11 @@ func (r *RaftServer) GetClusterMap() map[uint64]uint64 {
 
 func (r *RaftServer) Propose(key uint64, data []byte, dur time.Duration) (*dragonboat.RequestResult, error) {
     clusterIds := r.GetActiveClusters()
-    clusterIndex := key % uint64(len(clusterIds))
+    clusterIndex := uint64(1)
+    if len(clusterIds) != 0 {
+        clusterIndex = key % uint64(len(clusterIds))
+    }
+
     session := r.nodeHost.GetNoOPSession(clusterIds[clusterIndex])
     req, err := r.nodeHost.Propose(session, data, dur)
     if err != nil {

@@ -58,8 +58,14 @@ func replicateRow(tx *goqu.TxDatabase, event *ChangeLogEvent) error {
 }
 
 func replicateUpsert(tx *goqu.TxDatabase, event *ChangeLogEvent) error {
+    row := make(map[string]any)
+    for k, v := range event.Row {
+        row[k] = v
+    }
+    row["rowid"] = event.ChangeRowId
+
     _, err := tx.Insert(event.TableName).
-        Rows(event.Row).
+        Rows(row).
         OnConflict(exp.NewDoUpdateConflictExpression("", event.Row)).
         Prepared(true).
         Executor().
@@ -71,6 +77,7 @@ func replicateUpsert(tx *goqu.TxDatabase, event *ChangeLogEvent) error {
 func replicateDelete(tx *goqu.TxDatabase, event *ChangeLogEvent) error {
     _, err := tx.Delete(event.TableName).
         Where(goqu.Ex{"rowid": event.ChangeRowId}).
+        Prepared(true).
         Executor().
         Exec()
 
