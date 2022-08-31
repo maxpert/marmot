@@ -4,9 +4,11 @@ A passive multi-master SQLite replicator.
 [![Go](https://github.com/maxpert/marmot/actions/workflows/go.yml/badge.svg)](https://github.com/maxpert/marmot/actions/workflows/go.yml)
 
 ## What is it useful for right now?
-If you are using SQLite as ephemeral storage or a scenario where eventual consistency is fine for you.
-Marmot can give you a solid replication between your nodes. Marmot builds on top of fault-tolerant
-consensus protocol (Multi-Group Raft), thus allowing robust recovery and replication. 
+If you are using SQLite as ephemeral storage, or a scenario where eventual consistency is fine for you.
+Marmot can give you a solid replication between your nodes as Marmot builds on top of fault-tolerant
+consensus protocol (Multi-Group Raft), thus allowing robust recovery and replication. This means 
+if you are running a medium traffic website based on SQLite you should be easily able to handle 
+load without any problems. Read heavy workloads won't be bottle-neck at all.
 
 ## Running
 
@@ -33,4 +35,4 @@ Right now there are a few limitations on current solution:
 
 ## Production status
 
-Highly experimental. You can view my personal [status board here](https://sibte.notion.site/Marmot-Plan-056983fad27a49d4a16fb91031e6ab98).
+Beta as I've only used it personally for my production site using SQLite storage as cache, while it's traffic heavy I won't take it as testiment of this being production ready. You can view my personal [status board here](https://sibte.notion.site/Marmot-Plan-056983fad27a49d4a16fb91031e6ab98).
