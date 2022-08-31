@@ -56,8 +56,8 @@ func (r *RaftServer) config(clusterID uint64) config.Config {
         ElectionRTT:             10,
         HeartbeatRTT:            1,
         CheckQuorum:             true,
-        SnapshotEntries:         100_000,
-        CompactionOverhead:      1,
+        SnapshotEntries:         0,
+        CompactionOverhead:      0,
         EntryCompressionType:    config.Snappy,
         SnapshotCompressionType: config.Snappy,
     }

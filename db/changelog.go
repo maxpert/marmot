@@ -146,7 +146,7 @@ func (conn *SqliteStreamDB) watchChanges(path string) {
             if ev.Op != fsnotify.Chmod {
                 conn.debounced(conn.publishChangeLog)
             }
-        case <-time.After(time.Second * 1):
+        case <-time.After(time.Millisecond * 500):
             conn.debounced(conn.publishChangeLog)
             if errShm != nil {
                 errShm = watcher.Add(shmPath)
@@ -160,23 +160,29 @@ func (conn *SqliteStreamDB) watchChanges(path string) {
 }
 
 func (conn *SqliteStreamDB) publishChangeLog() {
-    var changes []*changeLogEntry
-    err := conn.WithTx(func(tx *goqu.TxDatabase) error {
-        return tx.From(conn.metaTable(changeLogName)).Prepared(true).ScanStructs(&changes)
-    })
+    for {
+        var changes []*changeLogEntry
+        err := conn.WithTx(func(tx *goqu.TxDatabase) error {
+            return tx.From(conn.metaTable(changeLogName)).Limit(100).Prepared(true).ScanStructs(&changes)
+        })
 
-    if err != nil {
-        log.Error().Err(err).Msg("Error scanning last row ID")
-        return
-    }
+        if err != nil {
+            log.Error().Err(err).Msg("Error scanning last row ID")
+            return
+        }
 
-    if len(changes) == 0 {
-        return
-    }
+        if len(changes) <= 0 {
+            return
+        }
 
-    err = conn.consumeChangeLogs(changes)
-    if err != nil {
-        log.Error().Err(err).Msg("Unable to consume changes")
+        err = conn.consumeChangeLogs(changes)
+        if err != nil {
+            log.Error().Err(err).Msg("Unable to consume changes")
+        }
+
+        if len(changes) <= 100 {
+            return
+        }
     }
 }
 
