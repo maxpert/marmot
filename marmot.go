@@ -80,7 +80,12 @@ func main() {
             return err
         }
 
-        res, err := raft.Propose(1, data, 1*time.Second)
+        hash, err := event.Hash()
+        if err != nil {
+            return err
+        }
+
+        res, err := raft.Propose(hash, data, 1*time.Second)
         if err != nil {
             return err
         }

@@ -2,6 +2,7 @@ package lib
 
 import (
     "context"
+    "errors"
     "fmt"
     "strconv"
     "strings"
@@ -174,10 +175,11 @@ func (r *RaftServer) GetClusterMap() map[uint64]uint64 {
 func (r *RaftServer) Propose(key uint64, data []byte, dur time.Duration) (*dragonboat.RequestResult, error) {
     clusterIds := r.GetActiveClusters()
     clusterIndex := uint64(1)
-    if len(clusterIds) != 0 {
-        clusterIndex = key % uint64(len(clusterIds))
+    if len(clusterIds) == 0 {
+        return nil, errors.New("cluster not ready")
     }
 
+    clusterIndex = key % uint64(len(clusterIds))
     session := r.nodeHost.GetNoOPSession(clusterIds[clusterIndex])
     req, err := r.nodeHost.Propose(session, data, dur)
     if err != nil {
