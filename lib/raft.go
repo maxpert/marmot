@@ -4,6 +4,7 @@ import (
     "context"
     "errors"
     "fmt"
+    "math/rand"
     "strconv"
     "strings"
     "sync"
@@ -47,6 +48,7 @@ func NewRaftServer(
         clusterMap:   make(map[uint64]uint64),
         lock:         &sync.RWMutex{},
         stateMachine: NewDBStateMachine(nodeID, database),
+        nodeUser:     map[uint64]dragonboat.INodeUser{},
     }
 }
 
@@ -142,6 +144,50 @@ func (r *RaftServer) AddNode(peerID uint64, address string, clusterIDs ...uint64
     }
 
     return nil
+}
+
+func (r *RaftServer) ShuffleCluster() error {
+    nodeMap := r.GetNodeMap()
+    allNodeList := make([]uint64, 0)
+
+    for nodeID, _ := range nodeMap {
+        allNodeList = append(allNodeList, nodeID)
+    }
+
+    rand.Seed(time.Now().UnixNano())
+
+    for nodeIndex, nodeID := range allNodeList {
+        clusterIDs := nodeMap[nodeID]
+        for _, clusterID := range clusterIDs {
+            newOwnerNodeIndex := rand.Uint64() % uint64(len(allNodeList))
+            if newOwnerNodeIndex != uint64(nodeIndex) {
+                newOwnerNodeID := allNodeList[newOwnerNodeIndex]
+
+                log.Debug().Msg(fmt.Sprintf("Moving %v from %v to %v", clusterID, nodeID, newOwnerNodeID))
+                if err := r.TransferClusters(newOwnerNodeID, clusterID); err != nil {
+                    return err
+                }
+            }
+        }
+    }
+
+    return nil
+}
+
+func (r *RaftServer) GetNodeMap() map[uint64][]uint64 {
+    nodeMap := map[uint64][]uint64{}
+
+    for clusterID, nodeID := range r.GetClusterMap() {
+        clusters, ok := nodeMap[nodeID]
+        if !ok {
+            clusters = make([]uint64, 0)
+        }
+
+        clusters = append(clusters, clusterID)
+        nodeMap[nodeID] = clusters
+    }
+
+    return nodeMap
 }
 
 func (r *RaftServer) TransferClusters(toPeerID uint64, clusterIDs ...uint64) error {
