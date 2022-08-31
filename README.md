@@ -35,4 +35,8 @@ Right now there are a few limitations on current solution:
 
 ## Production status
 
-Beta as I've only used it personally for my production site using SQLite storage as cache, while it's traffic heavy I won't take it as testiment of this being production ready. You can view my personal [status board here](https://sibte.notion.site/Marmot-Plan-056983fad27a49d4a16fb91031e6ab98).
+Beta as I've only used it personally for my production site using SQLite storage as cache, while it's traffic heavy I won't take it as testiment of this being production ready. You can view my personal [status board here](https://sibte.notion.site/Marmot-056983fad27a49d4a16fb91031e6ab98).
+
+## FAQs
+
+For FAQs visit [this page](https://sibte.notion.site/sibte/Marmot-056983fad27a49d4a16fb91031e6ab98)
