@@ -1,6 +1,8 @@
 # Marmot
 A distributed SQLite ephemeral replicator.  
 
+[![Go](https://github.com/maxpert/marmot/actions/workflows/go.yml/badge.svg)](https://github.com/maxpert/marmot/actions/workflows/go.yml)
+
 ## What is it useful for right now?
 If you are using SQLite as ephemeral storage or a scenario where eventual consistency is fine for you.
 Marmot can give you a solid replication between your nodes. Marmot builds on top of fault-tolerant
