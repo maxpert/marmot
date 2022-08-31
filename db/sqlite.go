@@ -2,7 +2,9 @@ package db
 
 import (
     "database/sql"
+    "encoding/binary"
     "fmt"
+    "hash/fnv"
     "time"
 
     "github.com/bep/debounce"
@@ -57,16 +59,20 @@ func OpenSqlite(path string) (*SqliteStreamDB, error) {
     return ret, nil
 }
 
-func (conn *SqliteStreamDB) InstallCDC() error {
+func (conn *SqliteStreamDB) InstallCDC(tables []string) error {
     log.Debug().Msg("Creating log table...")
-    createChangeLogQuery := fmt.Sprintf(logTableCreateStatement, conn.metaTable(changeLogName))
+    createChangeLogQuery := fmt.Sprintf(
+        logTableCreateStatement,
+        conn.metaTable(changeLogName),
+        conn.metaTable(replicaInName),
+    )
     if _, err := conn.Exec(createChangeLogQuery); err != nil {
         return err
     }
 
     log.Debug().Msg("Creating replica table...")
 
-    return conn.initTriggers()
+    return conn.initTriggers(tables)
 }
 
 func (conn *SqliteStreamDB) RemoveCDC() error {
@@ -100,4 +106,21 @@ func (e *ChangeLogEvent) Marshal() ([]byte, error) {
 
 func (e *ChangeLogEvent) Unmarshal(data []byte) error {
     return cbor.Unmarshal(data, e)
+}
+
+func (e *ChangeLogEvent) Hash() (uint64, error) {
+    hasher := fnv.New64()
+    _, err := hasher.Write([]byte(e.TableName))
+    if err != nil {
+        return 0, err
+    }
+
+    b := make([]byte, 8)
+    binary.LittleEndian.PutUint64(b, uint64(e.ChangeRowId))
+    _, err = hasher.Write(b)
+    if err != nil {
+        return 0, err
+    }
+
+    return hasher.Sum64(), nil
 }

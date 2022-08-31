@@ -17,13 +17,31 @@ func (conn *SqliteStreamDB) Replicate(event *ChangeLogEvent) error {
 
 func (conn *SqliteStreamDB) consumeReplicationEvent(event *ChangeLogEvent) error {
     return conn.WithTx(func(tnx *goqu.TxDatabase) error {
-        err := replicateRow(tnx, event)
-        if err != nil {
+        _, err := tnx.Insert(conn.metaTable(replicaInName)).
+            Rows(goqu.Record{
+                "id":            event.Id,
+                "type":          event.Type,
+                "table_name":    event.TableName,
+                "change_row_id": event.ChangeRowId,
+            }).
+            Prepared(true).
+            Executor().
+            Exec()
 
+        if err != nil {
             return err
         }
 
-        return nil
+        err = replicateRow(tnx, event)
+        if err != nil {
+            return err
+        }
+
+        _, err = tnx.Delete(conn.metaTable(replicaInName)).Where(goqu.Ex{
+            "id": event.Id,
+        }).Prepared(true).Executor().Exec()
+
+        return err
     })
 }
 
@@ -41,8 +59,9 @@ func replicateRow(tx *goqu.TxDatabase, event *ChangeLogEvent) error {
 
 func replicateUpsert(tx *goqu.TxDatabase, event *ChangeLogEvent) error {
     _, err := tx.Insert(event.TableName).
-        OnConflict(exp.NewDoUpdateConflictExpression("", event.Row)).
         Rows(event.Row).
+        OnConflict(exp.NewDoUpdateConflictExpression("", event.Row)).
+        Prepared(true).
         Executor().
         Exec()
 

@@ -12,14 +12,26 @@ import (
 )
 
 const changeLogName = "change__log"
+const replicaInName = "replica_in"
 
-const logTableCreateStatement = `CREATE TABLE IF NOT EXISTS %s(
+const logTableCreateStatement = `
+CREATE TABLE IF NOT EXISTS %[1]s(
     id              integer primary key,
     table_name      text,
     type            text,
     change_row_id   integer,
     row_map_serial  blob
-);`
+);
+
+CREATE TABLE IF NOT EXISTS %[2]s(
+    id              integer primary key,
+    table_name      text,
+    type            text,
+    change_row_id   integer
+);
+
+CREATE INDEX IF NOT EXISTS %[2]s_tuple ON %[2]s(change_row_id, table_name); 
+`
 
 type changeLogEntry struct {
     Id            int64  `db:"id"`
@@ -29,10 +41,15 @@ type changeLogEntry struct {
     SerializedRow []byte `db:"row_map_serial"`
 }
 
-func createTriggerSQL(prefix, table, event, logTable, newOld string) string {
-    // 1: prefix, 2: table, 3: event 4: log_table 5: NEW/OLD
+func createTriggerSQL(prefix, table, event, logTable, newOld, replicaTable string) string {
+    // 1: prefix, 2: table, 3: event 4: log_table 5: NEW/OLD 6: replica_table
     const createTriggerStatement = `CREATE TRIGGER IF NOT EXISTS %[1]son_%[2]s_%[3]s
     AFTER %[3]s ON %[2]s
+    WHEN (
+        SELECT COUNT(*) 
+        FROM %[6]s
+        WHERE change_row_id = %[5]s.rowid AND table_name = '%[2]s' AND type = '%[3]s'
+    ) < 1
     BEGIN
         INSERT INTO %[4]s(
             id,
@@ -46,7 +63,7 @@ func createTriggerSQL(prefix, table, event, logTable, newOld string) string {
             %[5]s.rowid
         );
     END;`
-    return fmt.Sprintf(createTriggerStatement, prefix, table, event, logTable, newOld)
+    return fmt.Sprintf(createTriggerStatement, prefix, table, event, logTable, newOld, replicaTable)
 }
 
 func dropTriggerSQL(prefix, table, event string) string {
@@ -55,59 +72,57 @@ func dropTriggerSQL(prefix, table, event string) string {
     return fmt.Sprintf(dropTriggerStatement, prefix, table, event)
 }
 
-func (conn *SqliteStreamDB) initTriggers() error {
+func (conn *SqliteStreamDB) initTriggers(tableNames []string) error {
     log.Info().Msg("Listing tables...")
-    tableNames := make([]string, 0)
-    err := conn.Select("name").
-        From("sqlite_master").
-        Where(
-            goqu.And(
-                goqu.Ex{"type": "table"},
-                goqu.Ex{"name": goqu.Op{"notLike": "sqlite_%"}},
-                goqu.Ex{"name": goqu.Op{"notLike": conn.prefix + "%"}},
-            ),
-        ).
-        Prepared(true).
-        Executor().
-        ScanVals(&tableNames)
 
-    if err != nil {
+    for _, tableName := range tableNames {
+        name := strings.TrimSpace(tableName)
+        if strings.HasPrefix(name, "sqlite_") || strings.HasPrefix(name, conn.prefix) {
+            continue
+        }
+
+        log.Info().Msg(fmt.Sprintf("Creating trigger for %v", name))
+        err := conn.createTriggersFor(name)
+        if err != nil {
+            return err
+        }
+    }
+
+    return nil
+}
+
+func (conn *SqliteStreamDB) createTriggersFor(name string) error {
+    logTableName := conn.metaTable(changeLogName)
+    repTableName := conn.metaTable(replicaInName)
+
+    query := dropTriggerSQL(conn.prefix, name, "insert")
+    if err := conn.Execute(query); err != nil {
         return err
     }
 
-    for _, name := range tableNames {
-        log.Info().Msg(fmt.Sprintf("Creating trigger for %v", name))
-        logTableName := conn.metaTable(changeLogName)
+    query = createTriggerSQL(conn.prefix, name, "insert", logTableName, "NEW", repTableName)
+    if err := conn.Execute(query); err != nil {
+        return err
+    }
 
-        query := dropTriggerSQL(conn.prefix, name, "insert")
-        if err := conn.Execute(query); err != nil {
-            return err
-        }
+    query = dropTriggerSQL(conn.prefix, name, "update")
+    if err := conn.Execute(query); err != nil {
+        return err
+    }
 
-        query = createTriggerSQL(conn.prefix, name, "insert", logTableName, "NEW")
-        if err := conn.Execute(query); err != nil {
-            return err
-        }
+    query = createTriggerSQL(conn.prefix, name, "update", logTableName, "NEW", repTableName)
+    if err := conn.Execute(query); err != nil {
+        return err
+    }
 
-        query = dropTriggerSQL(conn.prefix, name, "update")
-        if err := conn.Execute(query); err != nil {
-            return err
-        }
+    query = dropTriggerSQL(conn.prefix, name, "update")
+    if err := conn.Execute(query); err != nil {
+        return err
+    }
 
-        query = createTriggerSQL(conn.prefix, name, "update", logTableName, "NEW")
-        if err := conn.Execute(query); err != nil {
-            return err
-        }
-
-        query = dropTriggerSQL(conn.prefix, name, "update")
-        if err := conn.Execute(query); err != nil {
-            return err
-        }
-
-        query = createTriggerSQL(conn.prefix, name, "delete", logTableName, "OLD")
-        if err := conn.Execute(query); err != nil {
-            return err
-        }
+    query = createTriggerSQL(conn.prefix, name, "delete", logTableName, "OLD", repTableName)
+    if err := conn.Execute(query); err != nil {
+        return err
     }
 
     return nil

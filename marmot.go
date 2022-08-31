@@ -4,6 +4,7 @@ import (
     "errors"
     "flag"
     "fmt"
+    "strings"
     "time"
 
     "github.com/godruoyi/go-snowflake"
@@ -19,10 +20,12 @@ func main() {
     dbPathString := flag.String("db-path", "/tmp/marmot.db", "Path to SQLITE DB")
     metaPath := flag.String("meta-path", "/tmp/raft", "Path to meta information files")
     nodeID := flag.Uint64("node-id", uint64(snowflake.PrivateIPToMachineID()), "Node ID")
-    joinFlag := flag.Bool("join", false, "Join existing cluster")
-    clusterID := flag.Uint64("cluster-id", 1, "Cluster ID")
-    bindAddress := flag.String("bind", "0.0.0.0:8160", "Bind address for server")
-    peersAddrs := flag.String("peers", "", "<CLUSTER_ID>@IP:PORT list of peers separated by comma (,)")
+    followFlag := flag.Bool("follow", false, "Start Raft in follower mode")
+    shards := flag.Uint64("shards", 16, "Total number of shards for this instance")
+    bindAddress := flag.String("bind", "0.0.0.0:8160", "Bind address for Raft server")
+    bindPane := flag.String("bind-pane", "localhost:6010", "Bind address for control pane server")
+    initialAddrs := flag.String("bootstrap", "", "<CLUSTER_ID>@IP:PORT list of initial nodes separated by comma (,)")
+    tables := flag.String("replicate", "", "List of tables to replicate seperated by comma (,)")
     verbose := flag.Bool("verbose", false, "Log debug level")
     flag.Parse()
 
@@ -41,25 +44,29 @@ func main() {
         return
     }
 
-    if *cleanup {
-        err = srcDb.RemoveCDC()
-        if err != nil {
-            log.Panic().Err(err).Msg("Unable to clean up...")
-        } else {
-            log.Info().Msg("Cleanup complete...")
-        }
-
-        return
-    }
-
-    if err := srcDb.InstallCDC(); err != nil {
-        log.Error().Err(err).Msg("Unable to install CDC tables")
-        return
-    }
-
-    nodeHost, err := lib.InitRaft(*bindAddress, *nodeID, *clusterID, *metaPath, srcDb, *peersAddrs, *joinFlag)
+    err = srcDb.RemoveCDC()
     if err != nil {
-        log.Panic().Err(err).Msg("Unable to start Raft")
+        log.Panic().Err(err).Msg("Unable to clean up...")
+    } else {
+        log.Info().Msg("Cleanup complete...")
+    }
+
+    if *cleanup {
+        return
+    }
+
+    raft := lib.NewRaftServer(*bindAddress, *nodeID, *metaPath, srcDb)
+    err = raft.Init()
+    if err != nil {
+        log.Panic().Err(err).Msg("Unable to initialize raft server")
+    }
+
+    if !*followFlag {
+        clusterIds := makeRange(1, *shards)
+        err = raft.BindCluster(*initialAddrs, false, clusterIds...)
+        if err != nil {
+            log.Panic().Err(err).Msg("Unable to start Raft")
+        }
     }
 
     srcDb.OnChange = func(event *db.ChangeLogEvent) error {
@@ -68,13 +75,11 @@ func main() {
             return err
         }
 
-        session := nodeHost.GetNoOPSession(*clusterID)
-        req, err := nodeHost.Propose(session, data, 1*time.Second)
+        res, err := raft.Propose(1, data, 1*time.Second)
         if err != nil {
             return err
         }
 
-        res := <-req.ResultC()
         if !res.Committed() {
             return errors.New("replication failed")
         }
@@ -82,7 +87,25 @@ func main() {
         return nil
     }
 
-    for {
-        time.Sleep(2 * time.Second)
+    tableNames := strings.Split(*tables, ",")
+    if tableNames[0] == "" {
+        tableNames = make([]string, 0, 0)
     }
+    if err := srcDb.InstallCDC(tableNames); err != nil {
+        log.Error().Err(err).Msg("Unable to install CDC tables")
+        return
+    }
+
+    err = lib.NewControlPane(raft).Run(*bindPane)
+    if err != nil {
+        log.Panic().Err(err).Msg("Control pane not working")
+    }
+}
+
+func makeRange(min, max uint64) []uint64 {
+    a := make([]uint64, max-min+1)
+    for i := range a {
+        a[i] = min + uint64(i)
+    }
+    return a
 }
