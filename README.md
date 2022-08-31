@@ -1,5 +1,5 @@
 # Marmot
-A multi-master SQLite replicator.  
+A passive multi-master SQLite replicator. 
 
 [![Go](https://github.com/maxpert/marmot/actions/workflows/go.yml/badge.svg)](https://github.com/maxpert/marmot/actions/workflows/go.yml)
 
@@ -21,6 +21,15 @@ Make sure you have 2 SQLite DBs with exact same schemas (ideally empty):
 build/marmot -bootstrap 2@127.0.0.1:8162 -bind 127.0.0.1:8161 -bind-pane localhost:6001 -node-id 1 -replicate table1,table2 -db-path /tmp/cache-1.db
 build/marmot -bootstrap 1@127.0.0.1:8161 -bind 127.0.0.1:8162 -bind-pane localhost:6002 -node-id 2 -replicate table1,table2 -db-path /tmp/cache-2.db
 ```
+
+## Limitations
+Right now there are a few limitations on current solution:
+ - Only incremental, change stream i.e. tables should exist with matching schema, and existing rows won't be copied over. SQLite tools are enough for that.
+ - Tables `WITHOUT ROWID` won't work (no plan to support them as well, composite keys can be very tricky to replicate).
+ - When streaming changes if replication target fails, the change is simply dropped.
+ - Only WAL mode supported.
+ - Won't create DB file if it doesn't exist.
+ 
 
 ## Production status
 
