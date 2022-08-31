@@ -1,12 +1,12 @@
 # Marmot
-A distributed SQLite ephemeral cache replicator.  
+A distributed SQLite ephemeral replicator.  
+
+## What is it useful for right now?
+If you are using SQLite as ephemeral storage or a scenario where eventual consistency is fine for you.
+Marmot can give you a solid replication between your nodes. Marmot builds on top of fault-tolerant
+consensus protocol (Multi-Group Raft), thus allowing robust recovery and replication. 
 
 ## Running
-
-Generate certificate:
-```shell
-openssl req -x509 -nodes -days 36500 -newkey rsa:2048 -subj "/CN=Marmot/C=US/L=San Fransisco" -addext "subjectAltName=DNS.1:localhost IP.1:127.0.0.1" -keyout server.key -out server.crt
-```
 
 Build
 ```shell
@@ -16,8 +16,8 @@ go build -o build/marmot ./marmot.go
 Make sure you have 2 SQLite DBs with exact same schemas (ideally empty):
 
 ```shell
-build/marmot -bind 0.0.0.0:8161 -peers 127.0.0.1:8160 -db-path /tmp/cache.db -verbose
-build/marmot -bind 0.0.0.0:8160 -peers 127.0.0.1:8161 -db-path /tmp/cache-2.db -verbose
+build/marmot -bootstrap 2@127.0.0.1:8162 -bind 127.0.0.1:8161 -bind-pane localhost:6001 -node-id 1 -replicate table1,table2 -db-path /tmp/cache-1.db
+build/marmot -bootstrap 1@127.0.0.1:8161 -bind 127.0.0.1:8162 -bind-pane localhost:6002 -node-id 2 -replicate table1,table2 -db-path /tmp/cache-2.db
 ```
 
 ## Production status
