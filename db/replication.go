@@ -83,6 +83,8 @@ func replicateRow(tx *goqu.TxDatabase, event *ChangeLogEvent, pkMap map[string]a
 func replicateUpsert(tx *goqu.TxDatabase, event *ChangeLogEvent, _ map[string]any) error {
     columnNames := make([]string, 0, len(event.Row))
     columnValues := make([]any, 0, len(event.Row))
+    columnNames = append(columnNames, "rowid")
+    columnValues = append(columnValues, event.ChangeRowId)
     for k, v := range event.Row {
         columnNames = append(columnNames, k)
         columnValues = append(columnValues, v)
