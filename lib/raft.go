@@ -264,10 +264,10 @@ func (r *RaftServer) mutateNodeMap(nodeID uint64, f func(map[uint64]bool)) {
     }
 
     f(m)
+    r.nodeMap[nodeID] = m
+
     if len(m) <= 0 {
         delete(r.nodeMap, nodeID)
-    } else {
-        r.nodeMap[nodeID] = m
     }
 }
 
