@@ -15,10 +15,11 @@ import (
 
 type SqliteStreamDB struct {
     *goqu.Database
-    OnChange    func(event *ChangeLogEvent) error
+    dbPath      string
     watcher     *fsnotify.Watcher
     prefix      string
     publishLock *sync.Mutex
+    OnChange    func(event *ChangeLogEvent) error
 }
 
 type ChangeLogEvent struct {
@@ -58,11 +59,11 @@ func OpenSqlite(path string) (*SqliteStreamDB, error) {
     ret := &SqliteStreamDB{
         Database:    sqliteQu.DB(conn),
         watcher:     watcher,
+        dbPath:      path,
         prefix:      "__marmot__",
         publishLock: &sync.Mutex{},
     }
 
-    go ret.watchChanges(path)
     return ret, nil
 }
 
@@ -78,7 +79,13 @@ func (conn *SqliteStreamDB) InstallCDC(tables []string) error {
     }
 
     log.Debug().Msg("Creating replica table...")
-    return conn.initTriggers(tables)
+    err := conn.initTriggers(tables)
+    if err != nil {
+        return err
+    }
+
+    go conn.watchChanges(conn.dbPath)
+    return nil
 }
 
 func (conn *SqliteStreamDB) RemoveCDC() error {

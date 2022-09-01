@@ -24,10 +24,12 @@ type RaftServer struct {
     nodeID       uint64
     metaPath     string
     lock         *sync.RWMutex
-    clusterMap   map[uint64]uint64
     stateMachine statemachine.IStateMachine
     nodeHost     *dragonboat.NodeHost
-    nodeUser     map[uint64]dragonboat.INodeUser
+
+    nodeUser   map[uint64]dragonboat.INodeUser
+    nodeMap    map[uint64]map[uint64]bool
+    clusterMap map[uint64]uint64
 }
 
 func NewRaftServer(
@@ -40,15 +42,19 @@ func NewRaftServer(
     logger.GetLogger("rsm").SetLevel(logger.WARNING)
     logger.GetLogger("transport").SetLevel(logger.ERROR)
     logger.GetLogger("grpc").SetLevel(logger.WARNING)
+    logger.GetLogger("dragonboat").SetLevel(logger.WARNING)
+    logger.GetLogger("logdb").SetLevel(logger.WARNING)
+    logger.GetLogger("config").SetLevel(logger.WARNING)
 
     return &RaftServer{
         bindAddress:  bindAddress,
         nodeID:       nodeID,
         metaPath:     metaPath,
-        clusterMap:   make(map[uint64]uint64),
-        lock:         &sync.RWMutex{},
         stateMachine: NewDBStateMachine(nodeID, database),
+        lock:         &sync.RWMutex{},
         nodeUser:     map[uint64]dragonboat.INodeUser{},
+        clusterMap:   make(map[uint64]uint64),
+        nodeMap:      map[uint64]map[uint64]bool{},
     }
 }
 
@@ -59,24 +65,11 @@ func (r *RaftServer) config(clusterID uint64) config.Config {
         ElectionRTT:             10,
         HeartbeatRTT:            1,
         CheckQuorum:             true,
-        SnapshotEntries:         0,
+        SnapshotEntries:         1,
         CompactionOverhead:      0,
         EntryCompressionType:    config.Snappy,
         SnapshotCompressionType: config.Snappy,
     }
-}
-
-func (r *RaftServer) LeaderUpdated(info raftio.LeaderInfo) {
-    r.lock.Lock()
-    defer r.lock.Unlock()
-
-    if info.LeaderID == 0 {
-        delete(r.clusterMap, info.ClusterID)
-    } else {
-        r.clusterMap[info.ClusterID] = info.LeaderID
-    }
-
-    log.Info().Msg(fmt.Sprintf("Leader updated... %v -> %v", info.ClusterID, info.LeaderID))
 }
 
 func (r *RaftServer) Init() error {
@@ -102,7 +95,7 @@ func (r *RaftServer) Init() error {
 }
 
 func (r *RaftServer) BindCluster(initMembers string, join bool, clusterIDs ...uint64) error {
-    initialMembers := parseInitialMembersMap(initMembers)
+    initialMembers := parsePeersMap(initMembers)
     if !join {
         initialMembers[r.nodeID] = r.bindAddress
     }
@@ -146,11 +139,14 @@ func (r *RaftServer) AddNode(peerID uint64, address string, clusterIDs ...uint64
     return nil
 }
 
-func (r *RaftServer) ShuffleCluster() error {
+func (r *RaftServer) ShuffleCluster(nodes ...uint64) error {
     nodeMap := r.GetNodeMap()
     allNodeList := make([]uint64, 0)
+    if len(nodes) > 0 {
+        allNodeList = append(allNodeList, nodes...)
+    }
 
-    for nodeID, _ := range nodeMap {
+    for nodeID := range nodeMap {
         allNodeList = append(allNodeList, nodeID)
     }
 
@@ -177,13 +173,12 @@ func (r *RaftServer) ShuffleCluster() error {
 func (r *RaftServer) GetNodeMap() map[uint64][]uint64 {
     nodeMap := map[uint64][]uint64{}
 
-    for clusterID, nodeID := range r.GetClusterMap() {
-        clusters, ok := nodeMap[nodeID]
-        if !ok {
-            clusters = make([]uint64, 0)
+    for nodeID, clusterMap := range r.nodeMap {
+        clusters := make([]uint64, 0)
+        for clusterID := range clusterMap {
+            clusters = append(clusters, clusterID)
         }
 
-        clusters = append(clusters, clusterID)
         nodeMap[nodeID] = clusters
     }
 
@@ -243,11 +238,44 @@ func (r *RaftServer) Propose(key uint64, data []byte, dur time.Duration) (*drago
     return &res, err
 }
 
+func (r *RaftServer) LeaderUpdated(info raftio.LeaderInfo) {
+    r.lock.Lock()
+    defer r.lock.Unlock()
+
+    if info.LeaderID == 0 {
+        delete(r.clusterMap, info.ClusterID)
+        r.mutateNodeMap(info.LeaderID, func(m map[uint64]bool) {
+            delete(m, info.ClusterID)
+        })
+    } else {
+        r.clusterMap[info.ClusterID] = info.LeaderID
+        r.mutateNodeMap(info.LeaderID, func(m map[uint64]bool) {
+            m[info.ClusterID] = true
+        })
+    }
+
+    log.Debug().Msg(fmt.Sprintf("Leader updated... %v -> %v", info.ClusterID, info.LeaderID))
+}
+
+func (r *RaftServer) mutateNodeMap(nodeID uint64, f func(map[uint64]bool)) {
+    m, ok := r.nodeMap[nodeID]
+    if !ok {
+        m = make(map[uint64]bool, 0)
+    }
+
+    f(m)
+    if len(m) <= 0 {
+        delete(r.nodeMap, nodeID)
+    } else {
+        r.nodeMap[nodeID] = m
+    }
+}
+
 func (r *RaftServer) stateMachineFactory(_ uint64, _ uint64) statemachine.IStateMachine {
     return r.stateMachine
 }
 
-func parseInitialMembersMap(peersAddrs string) map[uint64]string {
+func parsePeersMap(peersAddrs string) map[uint64]string {
     peersMap := make(map[uint64]string)
     if peersAddrs == "" {
         return peersMap

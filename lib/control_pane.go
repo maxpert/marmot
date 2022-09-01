@@ -7,6 +7,7 @@ import (
     "time"
 
     "github.com/gin-gonic/gin"
+    "github.com/rs/zerolog/log"
 )
 
 type ControlPane struct {
@@ -15,6 +16,7 @@ type ControlPane struct {
 }
 
 func NewControlPane(raft *RaftServer) *ControlPane {
+    gin.SetMode(gin.ReleaseMode)
     r := &ControlPane{
         engine: gin.New(),
         raft:   raft,
@@ -38,6 +40,7 @@ func (c *ControlPane) Run(addr string) error {
 func (c *ControlPane) startCluster(g *gin.Context) {
     clusterId, err := strconv.ParseUint(g.Param("cluster"), 10, 64)
     if err != nil {
+        log.Err(err).Msg("bind cluster error")
         g.JSON(500, err.Error())
         return
     }
@@ -47,6 +50,7 @@ func (c *ControlPane) startCluster(g *gin.Context) {
 
     err = c.raft.BindCluster(members, join, clusterId)
     if err != nil {
+        log.Err(err).Msg("bind cluster error")
         g.JSON(500, err.Error())
         return
     }
@@ -57,12 +61,14 @@ func (c *ControlPane) startCluster(g *gin.Context) {
 func (c *ControlPane) addNode(g *gin.Context) {
     nodeId, err := strconv.ParseUint(g.Param("node"), 10, 64)
     if err != nil {
+        log.Err(err).Msg("add node error")
         g.JSON(500, err.Error())
         return
     }
 
     clusterId, err := strconv.ParseUint(g.Param("cluster"), 10, 64)
     if err != nil {
+        log.Err(err).Msg("add node error")
         g.JSON(500, err.Error())
         return
     }
@@ -71,6 +77,7 @@ func (c *ControlPane) addNode(g *gin.Context) {
 
     err = c.raft.AddNode(nodeId, nodeAddrs, clusterId)
     if err != nil {
+        log.Err(err).Msg("add node error")
         g.JSON(500, err.Error())
         return
     }
@@ -81,18 +88,21 @@ func (c *ControlPane) addNode(g *gin.Context) {
 func (c *ControlPane) moveCluster(g *gin.Context) {
     clusterId, err := strconv.ParseUint(g.Param("cluster"), 10, 64)
     if err != nil {
+        log.Err(err).Msg("move cluster error")
         g.JSON(500, err.Error())
         return
     }
 
     nodeId, err := strconv.ParseUint(g.Param("node"), 10, 64)
     if err != nil {
+        log.Err(err).Msg("move cluster error")
         g.JSON(500, err.Error())
         return
     }
 
     err = c.raft.TransferClusters(nodeId, clusterId)
     if err != nil {
+        log.Err(err).Msg("move cluster error")
         g.JSON(500, err.Error())
         return
     }
@@ -106,8 +116,9 @@ func (c *ControlPane) clusterInfo(g *gin.Context) {
 }
 
 func (c *ControlPane) shuffleNodes(g *gin.Context) {
-    err := c.raft.ShuffleCluster()
+    err := c.raft.ShuffleCluster(c.raft.nodeID)
     if err != nil {
+        log.Err(err).Msg("shuffle nodes error")
         g.AbortWithStatus(500)
         return
     }
