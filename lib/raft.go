@@ -28,7 +28,7 @@ type RaftServer struct {
     nodeHost     *dragonboat.NodeHost
 
     nodeUser   map[uint64]dragonboat.INodeUser
-    nodeMap    map[uint64]map[uint64]bool
+    nodeMap    map[uint64]map[uint64]uint64
     clusterMap map[uint64]uint64
 }
 
@@ -54,7 +54,7 @@ func NewRaftServer(
         lock:         &sync.RWMutex{},
         nodeUser:     map[uint64]dragonboat.INodeUser{},
         clusterMap:   make(map[uint64]uint64),
-        nodeMap:      map[uint64]map[uint64]bool{},
+        nodeMap:      map[uint64]map[uint64]uint64{},
     }
 }
 
@@ -243,24 +243,25 @@ func (r *RaftServer) LeaderUpdated(info raftio.LeaderInfo) {
     defer r.lock.Unlock()
 
     if info.LeaderID == 0 {
+        previousLeader := r.clusterMap[info.ClusterID]
         delete(r.clusterMap, info.ClusterID)
-        r.mutateNodeMap(info.LeaderID, func(m map[uint64]bool) {
+        r.mutateNodeMap(previousLeader, func(m map[uint64]uint64) {
             delete(m, info.ClusterID)
         })
     } else {
         r.clusterMap[info.ClusterID] = info.LeaderID
-        r.mutateNodeMap(info.LeaderID, func(m map[uint64]bool) {
-            m[info.ClusterID] = true
+        r.mutateNodeMap(info.LeaderID, func(m map[uint64]uint64) {
+            m[info.ClusterID] = info.Term
         })
     }
 
     log.Debug().Msg(fmt.Sprintf("Leader updated... %v -> %v", info.ClusterID, info.LeaderID))
 }
 
-func (r *RaftServer) mutateNodeMap(nodeID uint64, f func(map[uint64]bool)) {
+func (r *RaftServer) mutateNodeMap(nodeID uint64, f func(map[uint64]uint64)) {
     m, ok := r.nodeMap[nodeID]
     if !ok {
-        m = make(map[uint64]bool, 0)
+        m = make(map[uint64]uint64, 0)
     }
 
     f(m)
