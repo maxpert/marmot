@@ -15,6 +15,7 @@
 # vendor/
 build/
 .idea
+.vscode
 .DS_Store
 *.cert
 *.crt

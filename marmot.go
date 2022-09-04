@@ -96,7 +96,7 @@ func main() {
 
 	tableNames := strings.Split(*tables, ",")
 	if tableNames[0] == "" {
-		tableNames = make([]string, 0, 0)
+		tableNames = make([]string, 0)
 	}
 	if err := srcDb.InstallCDC(tableNames); err != nil {
 		log.Error().Err(err).Msg("Unable to install CDC tables")

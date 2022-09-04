@@ -28,8 +28,8 @@ type ChangeLogState = int16
 
 const (
 	Pending   ChangeLogState = 0
-	Published                = 1
-	Failed                   = -1
+	Published ChangeLogState = 1
+	Failed    ChangeLogState = -1
 )
 const changeLogName = "change_log"
 const upsertQuery = `INSERT OR REPLACE INTO %s(%s) VALUES (%s)`
@@ -217,11 +217,11 @@ func (conn *SqliteStreamDB) publishChangeLog() {
 }
 
 func (conn *SqliteStreamDB) consumeChangeLogs(tableName string, changes []*changeLogEntry) error {
-	rowIds := lo.Map[*changeLogEntry, int64](changes, func(e *changeLogEntry, i int) int64 {
+	rowIds := lo.Map(changes, func(e *changeLogEntry, i int) int64 {
 		return e.Id
 	})
 
-	changeMap := lo.Associate[*changeLogEntry, int64, *changeLogEntry](
+	changeMap := lo.Associate(
 		changes,
 		func(l *changeLogEntry) (int64, *changeLogEntry) {
 			return l.Id, l
@@ -324,7 +324,7 @@ func replicateRow(tx *goqu.TxDatabase, event *ChangeLogEvent, pkMap map[string]a
 		return replicateDelete(tx, event, pkMap)
 	}
 
-	return errors.New(fmt.Sprintf("invalid operation type %s", event.Type))
+	return fmt.Errorf("invalid operation type %s", event.Type)
 }
 
 func replicateUpsert(tx *goqu.TxDatabase, event *ChangeLogEvent, _ map[string]any) error {
