@@ -2,6 +2,7 @@ package db
 
 import (
     "bytes"
+    "database/sql"
     "errors"
     "fmt"
     "regexp"
@@ -26,8 +27,9 @@ var spaceStripper = regexp.MustCompile(`\n\s+`)
 type ChangeLogState = int16
 
 const (
-    Pending ChangeLogState = 0
-    Failed                 = -1
+    Pending   ChangeLogState = 0
+    Published                = 1
+    Failed                   = -1
 )
 const changeLogName = "change_log"
 const upsertQuery = `INSERT OR REPLACE INTO %s(%s) VALUES (%s)`
@@ -82,6 +84,7 @@ func (conn *SqliteStreamDB) Replicate(event *ChangeLogEvent) error {
 func (conn *SqliteStreamDB) consumeReplicationEvent(event *ChangeLogEvent) error {
     return conn.WithTx(func(tnx *goqu.TxDatabase) error {
         primaryKeyMap := conn.getPrimaryKeyMap(event)
+        log.Debug().Msg(fmt.Sprintf("Consuming replication event for %v", primaryKeyMap))
         return replicateRow(tnx, event, primaryKeyMap)
     })
 }
@@ -194,30 +197,82 @@ func (conn *SqliteStreamDB) publishChangeLog() {
 }
 
 func (conn *SqliteStreamDB) consumeChangeLogs(tableName string, changes []*changeLogEntry) error {
-    // Consume each batch in transaction
-    deletes, upserts := conn.splitDeleteAndUpserts(changes)
+    rowIds := lo.Map[*changeLogEntry, int64](changes, func(e *changeLogEntry, i int) int64 {
+        return e.Id
+    })
 
-    err := conn.consumeDeletes(tableName, deletes)
+    changeMap := lo.Associate[*changeLogEntry, int64, *changeLogEntry](
+        changes,
+        func(l *changeLogEntry) (int64, *changeLogEntry) {
+            return l.Id, l
+        },
+    )
+
+    idColumnName := conn.prefix + "change_log_id"
+    rawRows, err := conn.fetchChangeRows(tableName, idColumnName, rowIds)
     if err != nil {
         return err
     }
 
-    err = conn.consumeUpserts(tableName, upserts)
-    if err != nil {
-        return err
+    rows := &enhancedRows{rawRows}
+    defer rows.Finalize()
+
+    for rows.Next() {
+        row, err := rows.fetchRow()
+        if err != nil {
+            return err
+        }
+
+        changeRowID := row[idColumnName].(int64)
+        changeRow := changeMap[changeRowID]
+        delete(row, idColumnName)
+
+        logger := log.With().
+            Int64("rowid", changeRowID).
+            Str("table", tableName).
+            Str("type", changeRow.Type).
+            Logger()
+
+        if conn.OnChange != nil {
+            err = conn.OnChange(&ChangeLogEvent{
+                Id:        changeRowID,
+                Type:      changeRow.Type,
+                TableName: tableName,
+                Row:       row,
+            })
+
+            if err != nil {
+                logger.Error().Err(err).Msg("Change failed to notify on change")
+                return err
+            }
+        }
+
+        _, err = conn.
+            Update(conn.metaTable(tableName, changeLogName)).
+            Set(goqu.Record{"state": Published}).
+            Where(goqu.Ex{"id": changeRow.Id}).
+            Prepared(true).
+            Executor().
+            Exec()
+
+        if err != nil {
+            logger.Error().Err(err).Msg("Unable to cleanup change set row")
+            return err
+        }
+
+        logger.Debug().Msg("Notified change...")
     }
 
     return nil
 }
 
-func (conn *SqliteStreamDB) consumeUpserts(tableName string, upserts []*changeLogEntry) error {
-    rowIds := lo.Map[*changeLogEntry, int64](upserts, func(e *changeLogEntry, i int) int64 {
-        return e.Id
-    })
-
-    tableCols := conn.watchTablesSchema[tableName]
+func (conn *SqliteStreamDB) fetchChangeRows(
+    tableName string,
+    idColumnName string,
+    rowIds []int64,
+) (*sql.Rows, error) {
     columnNames := make([]any, 0)
-    idColumnName := conn.prefix + "change_log_id"
+    tableCols := conn.watchTablesSchema[tableName]
     columnNames = append(columnNames, goqu.C("id").As(idColumnName))
     for _, col := range tableCols {
         columnNames = append(columnNames, goqu.C("val_"+col.Name).As(col.Name))
@@ -229,121 +284,15 @@ func (conn *SqliteStreamDB) consumeUpserts(tableName string, upserts []*changeLo
         Prepared(true).
         ToSQL()
     if err != nil {
-        return err
+        return nil, err
     }
 
     rawRows, err := conn.Query(query, params...)
     if err != nil {
-        return nil
+        return nil, err
     }
 
-    rows := &enhancedRows{rawRows}
-    defer rows.Finalize()
-
-    upsertMap := lo.Associate[*changeLogEntry, int64, *changeLogEntry](
-        upserts,
-        func(l *changeLogEntry) (int64, *changeLogEntry) {
-            return l.Id, l
-        },
-    )
-
-    for rows.Next() {
-        row, err := rows.fetchRow()
-        if err != nil {
-            return err
-        }
-
-        changeRowID := row[idColumnName].(int64)
-        changeRow := upsertMap[changeRowID]
-        delete(row, idColumnName)
-
-        logger := log.With().
-            Int64("rowid", changeRowID).
-            Str("table", tableName).
-            Str("type", changeRow.Type).
-            Logger()
-
-        if conn.OnChange != nil {
-            err = conn.OnChange(&ChangeLogEvent{
-                Id:        changeRow.Id,
-                Type:      changeRow.Type,
-                TableName: tableName,
-                Row:       row,
-            })
-
-            if err != nil {
-                logger.Error().Err(err).Msg("Upsert failed to notify on change")
-                return err
-            }
-        }
-
-        _, err = conn.
-            Delete(conn.metaTable(tableName, changeLogName)).
-            Where(goqu.Ex{"id": changeRow.Id}).
-            Prepared(true).
-            Executor().
-            Exec()
-
-        if err != nil {
-            logger.Error().Err(err).Msg("Unable to delete change set row")
-            return err
-        }
-
-        logger.Debug().Msg("Notified upsert...")
-    }
-
-    return nil
-}
-
-func (conn *SqliteStreamDB) consumeDeletes(tableName string, deletes []*changeLogEntry) error {
-    for _, changeRow := range deletes {
-        logger := log.With().
-            Str("table", tableName).
-            Str("type", changeRow.Type).
-            Logger()
-
-        if conn.OnChange != nil {
-            err := conn.OnChange(&ChangeLogEvent{
-                Row:       nil,
-                Type:      "delete",
-                TableName: tableName,
-            })
-
-            if err != nil {
-                logger.Error().Err(err).Msg("Delete failed to notify on change")
-                return err
-            }
-
-            _, err = conn.
-                Delete(conn.metaTable(tableName, changeLogName)).
-                Where(goqu.Ex{"id": changeRow.Id}).
-                Prepared(true).
-                Executor().
-                Exec()
-
-            if err != nil {
-                logger.Error().Err(err).Msg("Unable to delete change set row")
-                return err
-            }
-        }
-
-        logger.Debug().Msg("Notified delete...")
-    }
-
-    return nil
-}
-
-func (conn *SqliteStreamDB) splitDeleteAndUpserts(tableChanges []*changeLogEntry) ([]*changeLogEntry, []*changeLogEntry) {
-    deletes := make([]*changeLogEntry, 0)
-    upserts := make([]*changeLogEntry, 0)
-    for _, tableChange := range tableChanges {
-        if strings.ToLower(tableChange.Type) == "delete" {
-            deletes = append(deletes, tableChange)
-        } else {
-            upserts = append(upserts, tableChange)
-        }
-    }
-    return deletes, upserts
+    return rawRows, nil
 }
 
 func replicateRow(tx *goqu.TxDatabase, event *ChangeLogEvent, pkMap map[string]any) error {

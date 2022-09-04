@@ -7,6 +7,7 @@ CREATE TABLE IF NOT EXISTS {{$ChangeLogTableName}} (
     val_{{$col.Name}} {{$col.Type}} {{if $col.NotNull}} NOT NULL {{end}},
 {{end}}
     type TEXT,
+    created_at INTEGER,
     state INTEGER
 );
 
@@ -24,12 +25,14 @@ BEGIN
         val_{{$col.Name}},
     {{end}}
     type,
+    created_at,
     state
     ) VALUES(
     {{range $col := $.Columns}}
         {{$read_target}}.{{$col.Name}},
     {{end}}
     '{{$trigger}}',
+    CAST((strftime('%s','now') || substr(strftime('%f','now'),4)) as INT),
     0 -- Pending
     );
 
