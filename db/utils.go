@@ -29,7 +29,7 @@ func (rs *enhancedRows) fetchRow() (map[string]any, error) {
 
 	scanRow := make([]any, len(columns))
 	rowPointers := make([]any, len(columns))
-	for i, _ := range scanRow {
+	for i := range scanRow {
 		rowPointers[i] = &scanRow[i]
 	}
 
