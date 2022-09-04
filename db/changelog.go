@@ -62,7 +62,6 @@ func (conn *SqliteStreamDB) Replicate(event *ChangeLogEvent) error {
 
 func (conn *SqliteStreamDB) CleanupChangeLogs() error {
     for name := range conn.watchTablesSchema {
-        log.Debug().Str("table", name).Msg("Cleaning up change logs")
         metaTableName := conn.metaTable(name, changeLogName)
         _, err := conn.Delete(metaTableName).
             Where(goqu.Ex{"state": Published}).
@@ -101,7 +100,11 @@ func (conn *SqliteStreamDB) tableCDCScriptFor(tableName string) (string, error) 
 func (conn *SqliteStreamDB) consumeReplicationEvent(event *ChangeLogEvent) error {
     return conn.WithTx(func(tnx *goqu.TxDatabase) error {
         primaryKeyMap := conn.getPrimaryKeyMap(event)
-        log.Debug().Msg(fmt.Sprintf("Consuming replication event for %v", primaryKeyMap))
+        log.Debug().
+            Str("table", event.TableName).
+            Str("type", event.Type).
+            Int64("id", event.Id).
+            Msg(fmt.Sprintf("Consuming replication event with PK %v", primaryKeyMap))
         return replicateRow(tnx, event, primaryKeyMap)
     })
 }
