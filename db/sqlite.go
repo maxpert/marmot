@@ -2,7 +2,6 @@ package db
 
 import (
     "database/sql"
-    "encoding/binary"
     "fmt"
     "hash/fnv"
     "sync"
@@ -10,24 +9,25 @@ import (
     "github.com/doug-martin/goqu/v9"
     "github.com/fsnotify/fsnotify"
     "github.com/fxamacker/cbor/v2"
+    "github.com/mattn/go-sqlite3"
     "github.com/rs/zerolog/log"
 )
 
 type SqliteStreamDB struct {
     *goqu.Database
-    dbPath      string
-    watcher     *fsnotify.Watcher
-    prefix      string
-    publishLock *sync.Mutex
-    OnChange    func(event *ChangeLogEvent) error
+    dbPath            string
+    watcher           *fsnotify.Watcher
+    prefix            string
+    publishLock       *sync.Mutex
+    watchTablesSchema map[string][]*ColumnInfo
+    OnChange          func(event *ChangeLogEvent) error
 }
 
 type ChangeLogEvent struct {
-    Id          int64
-    ChangeRowId int64
-    Type        string
-    TableName   string
-    Row         map[string]any
+    Id        int64
+    Type      string
+    TableName string
+    Row       map[string]any
 }
 
 type ColumnInfo struct {
@@ -39,8 +39,17 @@ type ColumnInfo struct {
 }
 
 func OpenSqlite(path string) (*SqliteStreamDB, error) {
+    driver := &sqlite3.SQLiteDriver{
+        ConnectHook: func(conn *sqlite3.SQLiteConn) error {
+            return conn.RegisterFunc("marmot_version", func() string {
+                return "0.1"
+            }, true)
+        },
+    }
+    sql.Register("sqlite-marmot", driver)
+
     connectionStr := fmt.Sprintf("%s?_journal_mode=wal&mode=memory", path)
-    conn, err := sql.Open("sqlite3", connectionStr)
+    conn, err := sql.Open("sqlite-marmot", connectionStr)
     if err != nil {
         return nil, err
     }
@@ -57,28 +66,27 @@ func OpenSqlite(path string) (*SqliteStreamDB, error) {
 
     sqliteQu := goqu.Dialect("sqlite3")
     ret := &SqliteStreamDB{
-        Database:    sqliteQu.DB(conn),
-        watcher:     watcher,
-        dbPath:      path,
-        prefix:      "__marmot__",
-        publishLock: &sync.Mutex{},
+        Database:          sqliteQu.DB(conn),
+        watcher:           watcher,
+        dbPath:            path,
+        prefix:            "__marmot__",
+        publishLock:       &sync.Mutex{},
+        watchTablesSchema: map[string][]*ColumnInfo{},
     }
 
     return ret, nil
 }
 
 func (conn *SqliteStreamDB) InstallCDC(tables []string) error {
-    log.Debug().Msg("Creating log table...")
-    createChangeLogQuery := fmt.Sprintf(
-        logTableCreateStatement,
-        conn.metaTable(changeLogName),
-        conn.metaTable(replicaInName),
-    )
-    if _, err := conn.Exec(createChangeLogQuery); err != nil {
-        return err
+
+    for _, n := range tables {
+        colInfo, err := conn.GetTableInfo(n)
+        if err != nil {
+            return err
+        }
+        conn.watchTablesSchema[n] = colInfo
     }
 
-    log.Debug().Msg("Creating replica table...")
     err := conn.initTriggers(tables)
     if err != nil {
         return err
@@ -109,11 +117,11 @@ func (conn *SqliteStreamDB) Execute(query string) error {
     return nil
 }
 
-func (conn *SqliteStreamDB) metaTable(name string) string {
-    return conn.prefix + name
+func (conn *SqliteStreamDB) metaTable(tableName string, name string) string {
+    return conn.prefix + tableName + "_" + name
 }
 
-func (conn *SqliteStreamDB) GetTableInfo(table string) (map[string]*ColumnInfo, error) {
+func (conn *SqliteStreamDB) GetTableInfo(table string) ([]*ColumnInfo, error) {
     query := "SELECT name, type, `notnull`, dflt_value, pk FROM pragma_table_info(?)"
     stmt, err := conn.Prepare(query)
     if err != nil {
@@ -125,7 +133,8 @@ func (conn *SqliteStreamDB) GetTableInfo(table string) (map[string]*ColumnInfo, 
         return nil, err
     }
 
-    tableInfo := make(map[string]*ColumnInfo)
+    tableInfo := make([]*ColumnInfo, 0)
+    hasPrimaryKey := false
     for rows.Next() {
         if rows.Err() != nil {
             return nil, rows.Err()
@@ -137,6 +146,21 @@ func (conn *SqliteStreamDB) GetTableInfo(table string) (map[string]*ColumnInfo, 
             return nil, err
         }
 
+        if c.IsPrimaryKey {
+            hasPrimaryKey = true
+        }
+
+        tableInfo = append(tableInfo, &c)
+    }
+
+    if !hasPrimaryKey {
+        tableInfo = append(tableInfo, &ColumnInfo{
+            Name:         "rowid",
+            IsPrimaryKey: true,
+            Type:         "INT",
+            NotNull:      true,
+            DefaultValue: nil,
+        })
     }
 
     return tableInfo, nil
@@ -157,12 +181,6 @@ func (e *ChangeLogEvent) Hash() (uint64, error) {
         return 0, err
     }
 
-    b := make([]byte, 8)
-    binary.LittleEndian.PutUint64(b, uint64(e.ChangeRowId))
-    _, err = hasher.Write(b)
-    if err != nil {
-        return 0, err
-    }
-
+    // Hash primary keys (TODO)
     return hasher.Sum64(), nil
 }

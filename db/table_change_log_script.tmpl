@@ -1,0 +1,46 @@
+{{$ChangeLogTableName := (printf "%s%s_change_log" .Prefix .TableName)}}
+
+DROP TABLE IF EXISTS {{$ChangeLogTableName}};
+CREATE TABLE IF NOT EXISTS {{$ChangeLogTableName}} (
+    id   INTEGER PRIMARY KEY AUTOINCREMENT,
+{{range $index, $col := .Columns}}
+    val_{{$col.Name}} {{$col.Type}} {{if $col.NotNull}} NOT NULL {{end}},
+{{end}}
+    type TEXT,
+    state INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS {{$ChangeLogTableName}}_state_index ON {{$ChangeLogTableName}} (state);
+CREATE INDEX IF NOT EXISTS {{$ChangeLogTableName}}_pk_index ON {{$ChangeLogTableName}} (
+{{range $index, $col := .Columns}}
+    {{if $col.IsPrimaryKey}}val_{{$col.Name}},{{end}}
+{{end}}
+type
+);
+
+{{range $trigger, $read_target := .Triggers}}
+DROP TRIGGER IF EXISTS {{$ChangeLogTableName}}_on_{{$trigger}};
+CREATE TRIGGER IF NOT EXISTS {{$ChangeLogTableName}}_on_{{$trigger}}
+AFTER {{$trigger}} ON {{$.TableName}}
+WHEN (SELECT COUNT(*) FROM pragma_function_list WHERE name='marmot_version') < 1
+BEGIN
+
+    INSERT INTO {{$ChangeLogTableName}}(
+    {{range $col := $.Columns}}
+        val_{{$col.Name}},
+    {{end}}
+    type,
+    state
+    ) VALUES(
+    {{range $col := $.Columns}}
+        {{$read_target}}.{{$col.Name}},
+    {{end}}
+    '{{$trigger}}',
+    0 -- Pending
+    );
+
+END;
+
+{{end}}
+
+

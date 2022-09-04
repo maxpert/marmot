@@ -104,8 +104,11 @@ func (r *RaftServer) BindCluster(initMembers string, join bool, clusterIDs ...ui
     defer r.lock.Unlock()
 
     for _, clusterID := range clusterIDs {
-        log.Debug().Uint64("cluster", clusterID).Msg("Starting cluster...")
         cfg := r.config(clusterID)
+        log.Debug().
+            Uint64("cluster", clusterID).
+            Uint64("node", r.nodeID).
+            Msg("Starting cluster...")
         err := r.nodeHost.StartCluster(initialMembers, join, r.stateMachineFactory, cfg)
         if err != nil {
             return err
@@ -292,6 +295,7 @@ func parsePeersMap(peersAddrs string) map[uint64]string {
         peersMap[peerShard] = peerInf[1]
     }
 
+    log.Debug().Msg(fmt.Sprintf("Peer map %v", peersMap))
     return peersMap
 }
 

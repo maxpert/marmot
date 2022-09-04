@@ -1,9 +1,15 @@
 package db
 
 import (
+    "bytes"
+    "errors"
     "fmt"
+    "regexp"
     "strings"
+    "text/template"
     "time"
+
+    _ "embed"
 
     "github.com/doug-martin/goqu/v9"
     "github.com/fsnotify/fsnotify"
@@ -11,118 +17,109 @@ import (
     "github.com/samber/lo"
 )
 
-const changeLogName = "change__log"
-const replicaInName = "replica_in"
+//go:embed table_change_log_script.tmpl
+var tableChangeLogScriptTemplate string
+var tableChangeLogTpl *template.Template
 
-const logTableCreateStatement = `
-CREATE TABLE IF NOT EXISTS %[1]s(
-    id              integer primary key,
-    table_name      text,
-    type            text,
-    change_row_id   integer,
-    row_map_serial  blob
-);
+var spaceStripper = regexp.MustCompile(`\n\s+`)
 
-CREATE TABLE IF NOT EXISTS %[2]s(
-    id              integer primary key,
-    table_name      text,
-    type            text,
-    change_row_id   integer
-);
+type ChangeLogState = int16
 
-CREATE INDEX IF NOT EXISTS %[2]s_tuple ON %[2]s(change_row_id, table_name); 
-`
+const (
+    Pending ChangeLogState = 0
+    Failed                 = -1
+)
+const changeLogName = "change_log"
+const upsertQuery = `INSERT OR REPLACE INTO %s(%s) VALUES (%s)`
+
+type triggerTemplateData struct {
+    Prefix    string
+    TableName string
+    Columns   []*ColumnInfo
+    Triggers  map[string]string
+}
 
 type changeLogEntry struct {
-    Id            int64  `db:"id"`
-    TableName     string `db:"table_name"`
-    Type          string `db:"type"`
-    ChangeRowId   int64  `db:"change_row_id"`
-    SerializedRow []byte `db:"row_map_serial"`
+    Id    int64  `db:"id"`
+    Type  string `db:"type"`
+    State string `db:"state"`
 }
 
-func createTriggerSQL(prefix, table, event, logTable, newOld, replicaTable string) string {
-    // 1: prefix, 2: table, 3: event 4: log_table 5: NEW/OLD 6: replica_table
-    const createTriggerStatement = `CREATE TRIGGER IF NOT EXISTS %[1]son_%[2]s_%[3]s
-    AFTER %[3]s ON %[2]s
-    WHEN (
-        SELECT COUNT(*) 
-        FROM %[6]s
-        WHERE change_row_id = %[5]s.rowid AND table_name = '%[2]s' AND type = '%[3]s'
-    ) < 1
-    BEGIN
-        INSERT INTO %[4]s(
-            id,
-            table_name, 
-            type, 
-            change_row_id
-        ) VALUES(
-            abs(random()),
-            '%[2]s', 
-            '%[3]s', 
-            %[5]s.rowid
-        );
-    END;`
-    return fmt.Sprintf(createTriggerStatement, prefix, table, event, logTable, newOld, replicaTable)
+func init() {
+    tableChangeLogTpl = template.Must(
+        template.New("tableChangeLogScriptTemplate").Parse(tableChangeLogScriptTemplate),
+    )
 }
 
-func dropTriggerSQL(prefix, table, event string) string {
-    // 1: prefix, 2: table, 3: event
-    const dropTriggerStatement = `DROP TRIGGER IF EXISTS %[1]son_%[2]s_%[3]s;`
-    return fmt.Sprintf(dropTriggerStatement, prefix, table, event)
+func (conn *SqliteStreamDB) tableCDCScriptFor(tableName string) (string, error) {
+    columns, ok := conn.watchTablesSchema[tableName]
+    if !ok {
+        return "", errors.New("table info not found")
+    }
+
+    buf := new(bytes.Buffer)
+    err := tableChangeLogTpl.Execute(buf, &triggerTemplateData{
+        Prefix:    conn.prefix,
+        Triggers:  map[string]string{"insert": "NEW", "update": "NEW", "delete": "OLD"},
+        Columns:   columns,
+        TableName: tableName,
+    })
+
+    if err != nil {
+        return "", err
+    }
+
+    return spaceStripper.ReplaceAllString(buf.String(), "\n    "), nil
+}
+
+func (conn *SqliteStreamDB) Replicate(event *ChangeLogEvent) error {
+    if err := conn.consumeReplicationEvent(event); err != nil {
+        return err
+    }
+    return nil
+}
+
+func (conn *SqliteStreamDB) consumeReplicationEvent(event *ChangeLogEvent) error {
+    return conn.WithTx(func(tnx *goqu.TxDatabase) error {
+        primaryKeyMap := conn.getPrimaryKeyMap(event)
+        return replicateRow(tnx, event, primaryKeyMap)
+    })
+}
+
+func (conn *SqliteStreamDB) getPrimaryKeyMap(event *ChangeLogEvent) map[string]any {
+    ret := make(map[string]any)
+    tableColsSchema, ok := conn.watchTablesSchema[event.TableName]
+    if !ok {
+        return nil
+    }
+
+    for _, col := range tableColsSchema {
+        if col.IsPrimaryKey {
+            ret[col.Name] = event.Row[col.Name]
+        }
+    }
+
+    return ret
 }
 
 func (conn *SqliteStreamDB) initTriggers(tableNames []string) error {
-    log.Info().Msg("Listing tables...")
-
     for _, tableName := range tableNames {
         name := strings.TrimSpace(tableName)
         if strings.HasPrefix(name, "sqlite_") || strings.HasPrefix(name, conn.prefix) {
             continue
         }
 
+        script, err := conn.tableCDCScriptFor(name)
+        if err != nil {
+            log.Error().Err(err).Msg("Failed to prepare CDC statement")
+            return err
+        }
+
         log.Info().Msg(fmt.Sprintf("Creating trigger for %v", name))
-        err := conn.createTriggersFor(name)
+        _, err = conn.Exec(script)
         if err != nil {
             return err
         }
-    }
-
-    return nil
-}
-
-func (conn *SqliteStreamDB) createTriggersFor(name string) error {
-    logTableName := conn.metaTable(changeLogName)
-    repTableName := conn.metaTable(replicaInName)
-
-    query := dropTriggerSQL(conn.prefix, name, "insert")
-    if err := conn.Execute(query); err != nil {
-        return err
-    }
-
-    query = createTriggerSQL(conn.prefix, name, "insert", logTableName, "NEW", repTableName)
-    if err := conn.Execute(query); err != nil {
-        return err
-    }
-
-    query = dropTriggerSQL(conn.prefix, name, "update")
-    if err := conn.Execute(query); err != nil {
-        return err
-    }
-
-    query = createTriggerSQL(conn.prefix, name, "update", logTableName, "NEW", repTableName)
-    if err := conn.Execute(query); err != nil {
-        return err
-    }
-
-    query = dropTriggerSQL(conn.prefix, name, "update")
-    if err := conn.Execute(query); err != nil {
-        return err
-    }
-
-    query = createTriggerSQL(conn.prefix, name, "delete", logTableName, "OLD", repTableName)
-    if err := conn.Execute(query); err != nil {
-        return err
     }
 
     return nil
@@ -163,10 +160,17 @@ func (conn *SqliteStreamDB) publishChangeLog() {
     conn.publishLock.Lock()
     defer conn.publishLock.Unlock()
 
-    for {
+    scanLimit := uint(100)
+
+    for tableName := range conn.watchTablesSchema {
         var changes []*changeLogEntry
         err := conn.WithTx(func(tx *goqu.TxDatabase) error {
-            return tx.From(conn.metaTable(changeLogName)).Limit(100).Prepared(true).ScanStructs(&changes)
+            return tx.Select("id", "type", "state").
+                From(conn.metaTable(tableName, changeLogName)).
+                Where(goqu.Ex{"state": Pending}).
+                Limit(scanLimit).
+                Prepared(true).
+                ScanStructs(&changes)
         })
 
         if err != nil {
@@ -178,50 +182,50 @@ func (conn *SqliteStreamDB) publishChangeLog() {
             return
         }
 
-        err = conn.consumeChangeLogs(changes)
+        err = conn.consumeChangeLogs(tableName, changes)
         if err != nil {
             log.Error().Err(err).Msg("Unable to consume changes")
         }
 
-        if len(changes) <= 100 {
-            return
+        if uint(len(changes)) <= scanLimit {
+            break
         }
     }
 }
 
-func (conn *SqliteStreamDB) consumeChangeLogs(changes []*changeLogEntry) error {
-    perTableChanges := lo.GroupBy[*changeLogEntry, string](changes, func(e *changeLogEntry) string {
-        return e.TableName
-    })
+func (conn *SqliteStreamDB) consumeChangeLogs(tableName string, changes []*changeLogEntry) error {
+    // Consume each batch in transaction
+    deletes, upserts := conn.splitDeleteAndUpserts(changes)
 
-    for tableName, tableChanges := range perTableChanges {
-        // Consume each batch in transaction
-        deletes, upserts := conn.splitDeleteAndUpserts(tableChanges)
+    err := conn.consumeDeletes(tableName, deletes)
+    if err != nil {
+        return err
+    }
 
-        err := conn.consumeDeletes(deletes, tableName)
-        if err != nil {
-            return err
-        }
-
-        err = conn.consumeUpserts(upserts, tableName)
-        if err != nil {
-            return err
-        }
-
-        return nil
+    err = conn.consumeUpserts(tableName, upserts)
+    if err != nil {
+        return err
     }
 
     return nil
 }
 
-func (conn *SqliteStreamDB) consumeUpserts(upserts []*changeLogEntry, tableName string) error {
-    changeRowIds := lo.Map[*changeLogEntry, any](upserts, func(e *changeLogEntry, _ int) any {
-        return e.ChangeRowId
+func (conn *SqliteStreamDB) consumeUpserts(tableName string, upserts []*changeLogEntry) error {
+    rowIds := lo.Map[*changeLogEntry, int64](upserts, func(e *changeLogEntry, i int) int64 {
+        return e.Id
     })
 
-    query, params, err := conn.From(tableName).
-        Select("rowid", "*").
-        Where(goqu.C("rowid").In(changeRowIds)).
+    tableCols := conn.watchTablesSchema[tableName]
+    columnNames := make([]any, 0)
+    idColumnName := conn.prefix + "change_log_id"
+    columnNames = append(columnNames, goqu.C("id").As(idColumnName))
+    for _, col := range tableCols {
+        columnNames = append(columnNames, goqu.C("val_"+col.Name).As(col.Name))
+    }
+
+    query, params, err := conn.From(conn.metaTable(tableName, changeLogName)).
+        Select(columnNames...).
+        Where(goqu.C("id").In(rowIds)).
         Prepared(true).
         ToSQL()
     if err != nil {
@@ -239,7 +243,7 @@ func (conn *SqliteStreamDB) consumeUpserts(upserts []*changeLogEntry, tableName 
     upsertMap := lo.Associate[*changeLogEntry, int64, *changeLogEntry](
         upserts,
         func(l *changeLogEntry) (int64, *changeLogEntry) {
-            return l.ChangeRowId, l
+            return l.Id, l
         },
     )
 
@@ -249,21 +253,22 @@ func (conn *SqliteStreamDB) consumeUpserts(upserts []*changeLogEntry, tableName 
             return err
         }
 
-        changeRowID := row["rowid"].(int64)
+        changeRowID := row[idColumnName].(int64)
         changeRow := upsertMap[changeRowID]
+        delete(row, idColumnName)
+
         logger := log.With().
             Int64("rowid", changeRowID).
-            Str("table", changeRow.TableName).
+            Str("table", tableName).
             Str("type", changeRow.Type).
             Logger()
 
         if conn.OnChange != nil {
             err = conn.OnChange(&ChangeLogEvent{
-                Id:          changeRow.Id,
-                Type:        changeRow.Type,
-                TableName:   changeRow.TableName,
-                ChangeRowId: changeRowID,
-                Row:         row,
+                Id:        changeRow.Id,
+                Type:      changeRow.Type,
+                TableName: tableName,
+                Row:       row,
             })
 
             if err != nil {
@@ -273,8 +278,9 @@ func (conn *SqliteStreamDB) consumeUpserts(upserts []*changeLogEntry, tableName 
         }
 
         _, err = conn.
-            Delete(conn.metaTable(changeLogName)).
-            Where(goqu.Ex{"rowid": changeRow.Id}).
+            Delete(conn.metaTable(tableName, changeLogName)).
+            Where(goqu.Ex{"id": changeRow.Id}).
+            Prepared(true).
             Executor().
             Exec()
 
@@ -289,21 +295,18 @@ func (conn *SqliteStreamDB) consumeUpserts(upserts []*changeLogEntry, tableName 
     return nil
 }
 
-func (conn *SqliteStreamDB) consumeDeletes(deletes []*changeLogEntry, tableName string) error {
-    for _, d := range deletes {
+func (conn *SqliteStreamDB) consumeDeletes(tableName string, deletes []*changeLogEntry) error {
+    for _, changeRow := range deletes {
         logger := log.With().
-            Int64("rowid", d.ChangeRowId).
-            Str("table", d.TableName).
-            Str("type", d.Type).
+            Str("table", tableName).
+            Str("type", changeRow.Type).
             Logger()
 
         if conn.OnChange != nil {
             err := conn.OnChange(&ChangeLogEvent{
-                Id:          d.Id,
-                Row:         nil,
-                Type:        "delete",
-                TableName:   tableName,
-                ChangeRowId: d.ChangeRowId,
+                Row:       nil,
+                Type:      "delete",
+                TableName: tableName,
             })
 
             if err != nil {
@@ -312,10 +315,12 @@ func (conn *SqliteStreamDB) consumeDeletes(deletes []*changeLogEntry, tableName 
             }
 
             _, err = conn.
-                Delete(conn.metaTable(changeLogName)).
-                Where(goqu.Ex{"rowid": d.Id}).
+                Delete(conn.metaTable(tableName, changeLogName)).
+                Where(goqu.Ex{"id": changeRow.Id}).
+                Prepared(true).
                 Executor().
                 Exec()
+
             if err != nil {
                 logger.Error().Err(err).Msg("Unable to delete change set row")
                 return err
@@ -339,4 +344,50 @@ func (conn *SqliteStreamDB) splitDeleteAndUpserts(tableChanges []*changeLogEntry
         }
     }
     return deletes, upserts
+}
+
+func replicateRow(tx *goqu.TxDatabase, event *ChangeLogEvent, pkMap map[string]any) error {
+    if event.Type == "insert" || event.Type == "update" {
+        return replicateUpsert(tx, event, pkMap)
+    }
+
+    if event.Type == "delete" {
+        return replicateDelete(tx, event, pkMap)
+    }
+
+    return errors.New(fmt.Sprintf("invalid operation type %s", event.Type))
+}
+
+func replicateUpsert(tx *goqu.TxDatabase, event *ChangeLogEvent, _ map[string]any) error {
+    columnNames := make([]string, 0, len(event.Row))
+    columnValues := make([]any, 0, len(event.Row))
+    for k, v := range event.Row {
+        columnNames = append(columnNames, k)
+        columnValues = append(columnValues, v)
+    }
+
+    query := fmt.Sprintf(
+        upsertQuery,
+        event.TableName,
+        strings.Join(columnNames, ", "),
+        strings.Join(strings.Split(strings.Repeat("?", len(columnNames)), ""), ", "),
+    )
+
+    stmt, err := tx.Prepare(query)
+    if err != nil {
+        return err
+    }
+
+    _, err = stmt.Exec(columnValues...)
+    return err
+}
+
+func replicateDelete(tx *goqu.TxDatabase, event *ChangeLogEvent, pkMap map[string]any) error {
+    _, err := tx.Delete(event.TableName).
+        Where(goqu.Ex(pkMap)).
+        Prepared(true).
+        Executor().
+        Exec()
+
+    return err
 }

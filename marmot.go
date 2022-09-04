@@ -3,12 +3,10 @@ package main
 import (
     "errors"
     "flag"
-    "fmt"
     "strings"
     "time"
 
     "github.com/godruoyi/go-snowflake"
-    "github.com/mattn/go-sqlite3"
     "github.com/rs/zerolog"
     "github.com/rs/zerolog/log"
     "marmot/db"
@@ -35,8 +33,6 @@ func main() {
         log.Logger = log.Level(zerolog.InfoLevel)
     }
 
-    driver := &sqlite3.SQLiteDriver{}
-    log.Debug().Msg(fmt.Sprintf("Extensions = %v", driver.Extensions))
     log.Debug().Str("path", *dbPathString).Msg("Opening database")
     srcDb, err := db.OpenSqlite(*dbPathString)
     if err != nil {

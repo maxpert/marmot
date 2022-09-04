@@ -35,8 +35,7 @@ func (ssm *SQLiteStateMachine) Update(bytes []byte) (sm.Result, error) {
     }
 
     logger := log.With().
-        Int64("table_id", event.Payload.ChangeRowId).
-        Int64("stream_row_id", event.Payload.Id).
+        Int64("table_id", event.Payload.Id).
         Str("table_name", event.Payload.TableName).
         Str("type", event.Payload.Type).
         Logger()
