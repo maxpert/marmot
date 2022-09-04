@@ -59,6 +59,11 @@ func (ssm *SQLiteStateMachine) Lookup(_ interface{}) (interface{}, error) {
 }
 
 func (ssm *SQLiteStateMachine) SaveSnapshot(_ io.Writer, _ sm.ISnapshotFileCollection, _ <-chan struct{}) error {
+    err := ssm.DB.CleanupChangeLogs()
+    if err != nil {
+        return err
+    }
+
     return nil
 }
 

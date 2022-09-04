@@ -53,6 +53,30 @@ func init() {
     )
 }
 
+func (conn *SqliteStreamDB) Replicate(event *ChangeLogEvent) error {
+    if err := conn.consumeReplicationEvent(event); err != nil {
+        return err
+    }
+    return nil
+}
+
+func (conn *SqliteStreamDB) CleanupChangeLogs() error {
+    for name := range conn.watchTablesSchema {
+        log.Debug().Str("table", name).Msg("Cleaning up change logs")
+        metaTableName := conn.metaTable(name, changeLogName)
+        _, err := conn.Delete(metaTableName).
+            Where(goqu.Ex{"state": Published}).
+            Prepared(true).
+            Executor().
+            Exec()
+
+        if err != nil {
+            return err
+        }
+    }
+    return nil
+}
+
 func (conn *SqliteStreamDB) tableCDCScriptFor(tableName string) (string, error) {
     columns, ok := conn.watchTablesSchema[tableName]
     if !ok {
@@ -72,13 +96,6 @@ func (conn *SqliteStreamDB) tableCDCScriptFor(tableName string) (string, error) 
     }
 
     return spaceStripper.ReplaceAllString(buf.String(), "\n    "), nil
-}
-
-func (conn *SqliteStreamDB) Replicate(event *ChangeLogEvent) error {
-    if err := conn.consumeReplicationEvent(event); err != nil {
-        return err
-    }
-    return nil
 }
 
 func (conn *SqliteStreamDB) consumeReplicationEvent(event *ChangeLogEvent) error {
