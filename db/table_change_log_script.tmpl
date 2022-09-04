@@ -11,12 +11,6 @@ CREATE TABLE IF NOT EXISTS {{$ChangeLogTableName}} (
 );
 
 CREATE INDEX IF NOT EXISTS {{$ChangeLogTableName}}_state_index ON {{$ChangeLogTableName}} (state);
-CREATE INDEX IF NOT EXISTS {{$ChangeLogTableName}}_pk_index ON {{$ChangeLogTableName}} (
-{{range $index, $col := .Columns}}
-    {{if $col.IsPrimaryKey}}val_{{$col.Name}},{{end}}
-{{end}}
-type
-);
 
 {{range $trigger, $read_target := .Triggers}}
 DROP TRIGGER IF EXISTS {{$ChangeLogTableName}}_on_{{$trigger}};
