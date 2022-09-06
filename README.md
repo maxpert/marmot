@@ -27,15 +27,14 @@ build/marmot -bootstrap 1@127.0.0.1:8161 -bind 127.0.0.1:8162 -bind-pane localho
 ## Limitations
 Right now there are a few limitations on current solution:
  - Only incremental, change stream i.e. tables should exist with matching schema, and existing rows won't be copied over. SQLite tools are enough for that.
- - Tables `WITHOUT ROWID` won't work (no plan to support them as well, composite keys can be very tricky to replicate).
- - When streaming changes if replication target fails, the change is simply dropped.
  - Only WAL mode supported.
  - Won't create DB file if it doesn't exist.
+ - Right now no support for copying previous data of table into existing table, or copy schema. Would be introduced in future though.
  
 
 ## Production status
 
-Beta as I've only used it personally for my production site using SQLite storage as cache, while it's traffic heavy I won't take it as testiment of this being production ready. You can view my personal [status board here](https://sibte.notion.site/Marmot-056983fad27a49d4a16fb91031e6ab98).
+Being used for ephemeral cache storage in production services, on a very read heavy site. You can view my personal [status board here](https://sibte.notion.site/Marmot-056983fad27a49d4a16fb91031e6ab98).
 
 ## FAQs
 
