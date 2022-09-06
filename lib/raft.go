@@ -84,6 +84,20 @@ func (r *RaftServer) Init() error {
 		RTTMillisecond:    300,
 		RaftAddress:       r.bindAddress,
 		RaftEventListener: r,
+		LogDBFactory: func(
+			hostConfig config.NodeHostConfig,
+			_ config.LogDBCallback,
+			_ []string,
+			_ []string,
+		) (raftio.ILogDB, error) {
+			path := fmt.Sprintf("%s/logdb-%d.sqlite?_journal=wal", r.metaPath, r.nodeID)
+			logDB, err := NewSQLiteLogDB(path)
+			if err != nil {
+				return nil, err
+			}
+
+			return logDB, err
+		},
 	}
 
 	nodeHost, err := dragonboat.NewNodeHost(hostConfig)

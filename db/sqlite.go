@@ -107,7 +107,7 @@ func (conn *SqliteStreamDB) Execute(query string) error {
 		return err
 	}
 
-	stmt := &enhancedStatement{st}
+	stmt := &EnhancedStatement{st}
 	defer stmt.Finalize()
 
 	if _, err := stmt.Exec(); err != nil {

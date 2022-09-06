@@ -6,22 +6,22 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-type enhancedStatement struct {
+type EnhancedStatement struct {
 	*sql.Stmt
 }
 
-func (stmt *enhancedStatement) Finalize() {
+func (stmt *EnhancedStatement) Finalize() {
 	err := stmt.Close()
 	if err != nil {
 		log.Error().Err(err).Msg("Unable to close statement")
 	}
 }
 
-type enhancedRows struct {
+type EnhancedRows struct {
 	*sql.Rows
 }
 
-func (rs *enhancedRows) fetchRow() (map[string]any, error) {
+func (rs *EnhancedRows) fetchRow() (map[string]any, error) {
 	columns, err := rs.Columns()
 	if err != nil {
 		return nil, err
@@ -45,7 +45,7 @@ func (rs *enhancedRows) fetchRow() (map[string]any, error) {
 	return row, nil
 }
 
-func (rs *enhancedRows) Finalize() {
+func (rs *EnhancedRows) Finalize() {
 	err := rs.Close()
 	if err != nil {
 		log.Error().Err(err).Msg("Unable to close result set")

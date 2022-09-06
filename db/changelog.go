@@ -234,7 +234,7 @@ func (conn *SqliteStreamDB) consumeChangeLogs(tableName string, changes []*chang
 		return err
 	}
 
-	rows := &enhancedRows{rawRows}
+	rows := &EnhancedRows{rawRows}
 	defer rows.Finalize()
 
 	for rows.Next() {
