@@ -259,6 +259,7 @@ func (conn *SqliteStreamDB) consumeChangeLogs(tableName string, changes []*chang
 				Type:      changeRow.Type,
 				TableName: tableName,
 				Row:       row,
+				tableInfo: conn.watchTablesSchema[tableName],
 			})
 
 			if err != nil {
