@@ -1,8 +1,8 @@
 CREATE TABLE IF NOT EXISTS raft_info(
     entry_index UNSIGNED BIG INT,
     node_id UNSIGNED BIG INT NOT NULL,
-    cluster_id UNSIGNED BIG INT,
-    entry_type INTEGER,
+    cluster_id UNSIGNED BIG INT NOT NULL,
+    entry_type INTEGER NOT NULL,
     payload BLOB
 );
 
