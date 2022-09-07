@@ -7,6 +7,7 @@ import (
 	_ "embed"
 
 	"github.com/doug-martin/goqu/v9"
+	"github.com/lni/dragonboat/v3/config"
 	"github.com/lni/dragonboat/v3/raftio"
 	"github.com/lni/dragonboat/v3/raftpb"
 	_ "github.com/mattn/go-sqlite3"
@@ -30,6 +31,12 @@ type raftInfoEntry struct {
 	Payload   []byte            `db:"payload"`
 }
 
+type SQLiteLogDBFactory struct {
+	metaPath string
+	nodeID   uint64
+	path     string
+}
+
 const raftInfoTable = "raft_info"
 
 const (
@@ -42,7 +49,34 @@ const (
 //go:embed log_db_script.sql
 var logDBScript string
 
-func NewSQLiteLogDB(path string) (*SQLiteLogDB, error) {
+func NewSQLiteLogDBFactory(metaPath string, nodeID uint64) *SQLiteLogDBFactory {
+	path := fmt.Sprintf("%s/logdb-%d.sqlite?_journal=wal", metaPath, nodeID)
+	return &SQLiteLogDBFactory{
+		metaPath: metaPath,
+		nodeID:   nodeID,
+		path:     path,
+	}
+}
+
+func (f *SQLiteLogDBFactory) Name() string {
+	return f.metaPath
+}
+
+func (f *SQLiteLogDBFactory) Create(
+	_ config.NodeHostConfig,
+	_ config.LogDBCallback,
+	_ []string,
+	_ []string,
+) (raftio.ILogDB, error) {
+	logDB, err := newSQLiteLogDB(f.path)
+	if err != nil {
+		return nil, err
+	}
+
+	return logDB, err
+}
+
+func newSQLiteLogDB(path string) (*SQLiteLogDB, error) {
 	conn, err := sql.Open("sqlite3", path)
 	if err != nil {
 		return nil, err
@@ -135,7 +169,6 @@ func (s *SQLiteLogDB) GetBootstrapInfo(clusterID uint64, nodeID uint64) (raftpb.
 }
 
 func (s *SQLiteLogDB) SaveRaftState(updates []raftpb.Update, shardID uint64) error {
-	log.Debug().Uint64("shardID", shardID).Msg("Saving...")
 	return s.db.WithTx(func(tx *goqu.TxDatabase) error {
 		for _, upd := range updates {
 			if !raftpb.IsEmptyState(upd.State) {
@@ -208,7 +241,6 @@ func (s *SQLiteLogDB) IterateEntries(
 		Uint64("maxSize", maxSize).
 		Logger()
 
-	logger.Debug().Msg("IterateEntries")
 	rows, err := s.db.
 		Select("payload").
 		From(raftInfoTable).
@@ -237,11 +269,6 @@ func (s *SQLiteLogDB) IterateEntries(
 			return entries, size, err
 		}
 
-		currentSize += uint64(len(bts))
-		if currentSize > maxSize {
-			break
-		}
-
 		e := raftpb.Entry{}
 		err = e.Unmarshal(bts)
 		if err != nil {
@@ -249,13 +276,17 @@ func (s *SQLiteLogDB) IterateEntries(
 		}
 
 		ret = append(ret, e)
+		currentSize += uint64(e.SizeUpperLimit())
+		if currentSize > maxSize {
+			break
+		}
 	}
 
 	if len(ret) == 0 {
 		return entries, size, nil
 	}
 
-	logger.Debug().
+	logger.Trace().
 		Uint64("size", currentSize).
 		Int("entries", len(ret)).
 		Msg("Entries returned...")
@@ -460,13 +491,9 @@ func saveInfoTuple(
 		return err
 	}
 
-	_, err = db.Insert(raftInfoTable).Rows(&raftInfoEntry{
-		Index:     index,
-		NodeId:    nodeID,
-		ClusterId: clusterID,
-		Type:      entryType,
-		Payload:   data,
-	}).Prepared(true).Executor().Exec()
-
+	query := fmt.Sprintf(`
+			INSERT OR REPLACE INTO %s(entry_index, node_id, cluster_id, entry_type, payload)
+			VALUES(?, ?, ?, ?, ?);`, raftInfoTable)
+	_, err = db.Exec(query, index, nodeID, clusterID, entryType, data)
 	return err
 }

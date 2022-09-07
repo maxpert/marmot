@@ -9,6 +9,6 @@ CREATE TABLE IF NOT EXISTS raft_info(
 CREATE INDEX IF NOT EXISTS raft_info_tpl_index
     ON raft_info(node_id, cluster_id, entry_type);
 
-CREATE INDEX IF NOT EXISTS raft_info_entry_index
-    ON raft_info(entry_index, node_id, cluster_id)
+CREATE UNIQUE INDEX IF NOT EXISTS raft_info_entry_index
+    ON raft_info(entry_index, node_id, cluster_id, entry_type)
     WHERE entry_index IS NOT NULL;
