@@ -273,15 +273,15 @@ func (s *SQLiteLogDB) IterateEntries(
 	defer eRow.Finalize()
 
 	expectedIndex := low
+	buff := make([]byte, 0)
 	for eRow.Next() {
-		bts := make([]byte, 0)
-		err = eRow.Scan(&bts)
+		err = eRow.Scan(&buff)
 		if err != nil {
 			return entries, size, err
 		}
 
 		e := raftpb.Entry{}
-		err = e.Unmarshal(bts)
+		err = e.Unmarshal(buff)
 		if err != nil {
 			return entries, size, err
 		}
@@ -389,31 +389,42 @@ func (s *SQLiteLogDB) DeleteSnapshot(clusterID uint64, nodeID uint64, index uint
 }
 
 func (s *SQLiteLogDB) ListSnapshots(clusterID uint64, nodeID uint64, index uint64) ([]raftpb.Snapshot, error) {
-	entries := make([]raftInfoEntry, 0)
 	exps := []goqu.Expression{
 		goqu.C("node_id").Eq(nodeID),
 		goqu.C("cluster_id").Eq(clusterID),
 		goqu.C("entry_type").Eq(Snapshot),
 	}
+
 	if index != math.MaxUint64 {
 		exps = append(exps, goqu.C("entry_index").Lte(index))
 	}
 
-	err := s.db.
+	rows, err := s.db.
+		Select("payload").
 		From(raftInfoTable).
 		Where(exps...).
 		Order(goqu.C("entry_index").Asc()).
 		Prepared(true).
-		ScanStructs(&entries)
+		Executor().
+		Query()
 
 	if err != nil {
 		return nil, err
 	}
 
+	eRows := db.EnhancedRows{Rows: rows}
+	defer eRows.Finalize()
+
 	ret := make([]raftpb.Snapshot, 0)
-	for _, entry := range entries {
+	buf := make([]byte, 0)
+	for eRows.Next() {
+		err = eRows.Scan(&buf)
+		if err != nil {
+			return nil, err
+		}
+
 		snp := raftpb.Snapshot{}
-		err = snp.Unmarshal(entry.Payload)
+		err = snp.Unmarshal(buf)
 		if err != nil {
 			return nil, err
 		}
