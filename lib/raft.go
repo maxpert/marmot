@@ -262,8 +262,6 @@ func (r *RaftServer) LeaderUpdated(info raftio.LeaderInfo) {
 			m[info.ClusterID] = info.Term
 		})
 	}
-
-	log.Debug().Msg(fmt.Sprintf("Leader updated... %v -> %v", info.ClusterID, info.LeaderID))
 }
 
 func (r *RaftServer) mutateNodeMap(nodeID uint64, f func(map[uint64]uint64)) {

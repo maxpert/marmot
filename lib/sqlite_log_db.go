@@ -11,7 +11,6 @@ import (
 	"github.com/lni/dragonboat/v3/raftio"
 	"github.com/lni/dragonboat/v3/raftpb"
 	_ "github.com/mattn/go-sqlite3"
-	"github.com/rs/zerolog/log"
 	"github.com/samber/lo"
 	"marmot/db"
 )
@@ -233,14 +232,6 @@ func (s *SQLiteLogDB) IterateEntries(
 	high uint64,
 	maxSize uint64,
 ) ([]raftpb.Entry, uint64, error) {
-	logger := log.With().
-		Uint64("cluster", clusterID).
-		Uint64("node", nodeID).
-		Uint64("start", low).
-		Uint64("end", high).
-		Uint64("maxSize", maxSize).
-		Logger()
-
 	rows, err := s.db.
 		Select("payload").
 		From(raftInfoTable).
@@ -286,15 +277,10 @@ func (s *SQLiteLogDB) IterateEntries(
 		return entries, size, nil
 	}
 
-	logger.Trace().
-		Uint64("size", currentSize).
-		Int("entries", len(ret)).
-		Msg("Entries returned...")
 	return ret, currentSize, nil
 }
 
 func (s *SQLiteLogDB) ReadRaftState(clusterID uint64, nodeID uint64, snapshotIndex uint64) (raftio.RaftState, error) {
-	log.Debug().Msg("ReadRaftState")
 	entry := raftInfoEntry{}
 	ret := raftio.RaftState{}
 
