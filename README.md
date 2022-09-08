@@ -83,7 +83,9 @@ Right now there are a few limitations on current solution:
 
 ## Production status
 
-Being used for ephemeral cache storage in production services, on a very read heavy site. You can view my personal [status board here](https://sibte.notion.site/Marmot-056983fad27a49d4a16fb91031e6ab98).
+Being used for ephemeral cache storage in production services, on a very read heavy site. You can view my personal [status board here](https://sibte.notion.site/Marmot-056983fad27a49d4a16fb91031e6ab98). Here is an image from a production server running Marmot:
+
+![image](https://user-images.githubusercontent.com/22441/189140305-3b7849dc-bd26-4059-bef4-bec6549ac5a7.png)
 
 ## FAQs
 
