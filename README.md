@@ -1,5 +1,5 @@
 # Marmot
-A passive multi-master SQLite replicator. 
+A distributed SQLite replicator. 
 
 [![Go](https://github.com/maxpert/marmot/actions/workflows/go.yml/badge.svg)](https://github.com/maxpert/marmot/actions/workflows/go.yml)
 
