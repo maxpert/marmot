@@ -29,6 +29,7 @@ func NewControlPane(raft *RaftServer) *ControlPane {
 	routes.GET("/add/cluster/:cluster/node/:node", r.addNode)
 	routes.GET("/shuffle", r.shuffleNodes)
 	routes.GET("/info", r.clusterInfo)
+	routes.GET("/restore", r.restoreSnapshot)
 
 	return r
 }
@@ -113,6 +114,16 @@ func (c *ControlPane) moveCluster(g *gin.Context) {
 func (c *ControlPane) clusterInfo(g *gin.Context) {
 	cmap := c.raft.GetNodeMap()
 	g.JSON(200, cmap)
+}
+
+func (c *ControlPane) restoreSnapshot(g *gin.Context) {
+	index, err := c.raft.RequestSnapshot(60 * time.Second)
+	if err != nil {
+		_ = g.AbortWithError(500, err)
+		return
+	}
+
+	g.JSON(200, index)
 }
 
 func (c *ControlPane) shuffleNodes(g *gin.Context) {

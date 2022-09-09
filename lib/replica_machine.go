@@ -1,7 +1,11 @@
 package lib
 
 import (
+	"fmt"
 	"io"
+	"os"
+	"path"
+	"sync"
 
 	"marmot/db"
 
@@ -10,16 +14,26 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
+type snapshotState = uint8
+
 type SQLiteStateMachine struct {
-	NodeID    uint64
-	DB        *db.SqliteStreamDB
-	lastIndex uint64
+	NodeID        uint64
+	DB            *db.SqliteStreamDB
+	SnapshotsPath string
+	snapshotLock  *sync.Mutex
+	snapshotState snapshotState
 }
 
 type ReplicationEvent[T any] struct {
 	FromNodeId uint64
 	Payload    *T
 }
+
+const (
+	snapshotNotInitialized snapshotState = 0
+	snapshotSaved          snapshotState = 1
+	snapshotRestored       snapshotState = 2
+)
 
 func (e *ReplicationEvent[T]) Marshal() ([]byte, error) {
 	return cbor.Marshal(e)
@@ -59,27 +73,71 @@ func (ssm *SQLiteStateMachine) Lookup(_ interface{}) (interface{}, error) {
 	return 0, nil
 }
 
-func (ssm *SQLiteStateMachine) SaveSnapshot(_ io.Writer, _ sm.ISnapshotFileCollection, _ <-chan struct{}) error {
-	err := ssm.DB.CleanupChangeLogs()
+func (ssm *SQLiteStateMachine) SaveSnapshot(_ io.Writer, files sm.ISnapshotFileCollection, _ <-chan struct{}) error {
+	ssm.snapshotLock.Lock()
+	defer ssm.snapshotLock.Unlock()
+
+	tmpPath := path.Join(ssm.SnapshotsPath, "marmot", "snapshot")
+	err := os.MkdirAll(tmpPath, 0744)
+	if err != nil {
+		log.Error().Err(err).Msg("Unable to create directory for snapshot")
+		return err
+	}
+
+	bkFilePath := path.Join(tmpPath, "backup.sqlite")
+
+	err = ssm.DB.BackupTo(bkFilePath)
 	if err != nil {
 		return err
 	}
 
+	files.AddFile(0, bkFilePath, nil)
+	ssm.snapshotState = snapshotSaved
+	log.Debug().Msg("SaveSnapshot")
 	return nil
 }
 
-func (ssm *SQLiteStateMachine) RecoverFromSnapshot(_ io.Reader, _ []sm.SnapshotFile, _ <-chan struct{}) error {
+func (ssm *SQLiteStateMachine) RecoverFromSnapshot(_ io.Reader, sps []sm.SnapshotFile, _ <-chan struct{}) error {
+	ssm.snapshotLock.Lock()
+	defer ssm.snapshotLock.Unlock()
+
+	if len(sps) < 1 {
+		return fmt.Errorf("not file snapshots to restore")
+	}
+
+	err := ssm.DB.RestoreFrom(sps[0].Filepath)
+	if err != nil {
+		return err
+	}
+
+	ssm.snapshotState = snapshotRestored
+	log.Debug().Msg("RecoverFromSnapshot")
 	return nil
+}
+
+func (ssm *SQLiteStateMachine) HasRestoredSnapshot() bool {
+	ssm.snapshotLock.Lock()
+	defer ssm.snapshotLock.Unlock()
+
+	return ssm.snapshotState == snapshotRestored
+}
+
+func (ssm *SQLiteStateMachine) HasSavedSnapshot() bool {
+	ssm.snapshotLock.Lock()
+	defer ssm.snapshotLock.Unlock()
+
+	return ssm.snapshotState == snapshotSaved
 }
 
 func (ssm *SQLiteStateMachine) Close() error {
 	return nil
 }
 
-func NewDBStateMachine(shardID uint64, db *db.SqliteStreamDB) sm.IStateMachine {
+func NewDBStateMachine(shardID uint64, db *db.SqliteStreamDB, path string) *SQLiteStateMachine {
 	return &SQLiteStateMachine{
-		DB:        db,
-		NodeID:    shardID,
-		lastIndex: 0,
+		DB:            db,
+		NodeID:        shardID,
+		SnapshotsPath: path,
+		snapshotLock:  &sync.Mutex{},
 	}
 }

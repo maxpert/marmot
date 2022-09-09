@@ -25,7 +25,7 @@ type RaftServer struct {
 	nodeID       uint64
 	metaPath     string
 	lock         *sync.RWMutex
-	stateMachine statemachine.IStateMachine
+	stateMachine *SQLiteStateMachine
 	nodeHost     *dragonboat.NodeHost
 
 	nodeUser   map[uint64]dragonboat.INodeUser
@@ -51,7 +51,7 @@ func NewRaftServer(
 		bindAddress:  bindAddress,
 		nodeID:       nodeID,
 		metaPath:     metaPath,
-		stateMachine: NewDBStateMachine(nodeID, database),
+		stateMachine: NewDBStateMachine(nodeID, database, metaPath),
 		lock:         &sync.RWMutex{},
 		nodeUser:     map[uint64]dragonboat.INodeUser{},
 		clusterMap:   make(map[uint64]uint64),
@@ -66,8 +66,8 @@ func (r *RaftServer) config(clusterID uint64) config.Config {
 		ElectionRTT:             10,
 		HeartbeatRTT:            1,
 		CheckQuorum:             true,
-		SnapshotEntries:         10_000,
-		CompactionOverhead:      1000,
+		SnapshotEntries:         1,
+		CompactionOverhead:      0,
 		EntryCompressionType:    config.Snappy,
 		SnapshotCompressionType: config.Snappy,
 	}
@@ -123,6 +123,26 @@ func (r *RaftServer) BindCluster(initMembers string, join bool, clusterIDs ...ui
 	}
 
 	return nil
+}
+
+func (r *RaftServer) RequestSnapshot(timeout time.Duration) (uint64, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	for clusterID, nodeID := range r.clusterMap {
+		if nodeID == r.nodeID || nodeID == 0 {
+			continue
+		}
+
+		ret, err := r.nodeHost.SyncRequestSnapshot(ctx, clusterID, dragonboat.SnapshotOption{})
+		if err != nil {
+			return 0, err
+		}
+
+		return ret, nil
+	}
+
+	return 0, nil
 }
 
 func (r *RaftServer) AddNode(peerID uint64, address string, clusterIDs ...uint64) error {
@@ -262,6 +282,10 @@ func (r *RaftServer) LeaderUpdated(info raftio.LeaderInfo) {
 			m[info.ClusterID] = info.Term
 		})
 	}
+}
+
+func (r *RaftServer) SnapshotCompleted() bool {
+	return r.stateMachine.HasRestoredSnapshot() || r.stateMachine.HasSavedSnapshot()
 }
 
 func (r *RaftServer) mutateNodeMap(nodeID uint64, f func(map[uint64]uint64)) {

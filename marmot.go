@@ -35,8 +35,13 @@ func main() {
 		log.Logger = log.Level(zerolog.InfoLevel)
 	}
 
+	tableNames := strings.Split(*tables, ",")
+	if tableNames[0] == "" {
+		tableNames = make([]string, 0)
+	}
+
 	log.Debug().Str("path", *dbPathString).Msg("Opening database")
-	srcDb, err := db.OpenSqlite(*dbPathString)
+	srcDb, err := db.OpenStreamDB(*dbPathString, tableNames)
 	if err != nil {
 		log.Error().Err(err).Msg("Unable to open database")
 		return
@@ -68,7 +73,26 @@ func main() {
 		}
 	}
 
-	srcDb.OnChange = func(event *db.ChangeLogEvent) error {
+	log.Info().Msg("Waiting for raft snapshots...")
+	for !raft.SnapshotCompleted() {
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	srcDb.OnChange = onTableChanged(nodeID, raft)
+	log.Info().Msg("Starting change data capture pipeline...")
+	if err := srcDb.StartWatching(); err != nil {
+		log.Error().Err(err).Msg("Unable to install change data capture pipeline")
+		return
+	}
+
+	err = lib.NewControlPane(raft).Run(*bindPane)
+	if err != nil {
+		log.Panic().Err(err).Msg("Control pane not working")
+	}
+}
+
+func onTableChanged(nodeID *uint64, raft *lib.RaftServer) func(event *db.ChangeLogEvent) error {
+	return func(event *db.ChangeLogEvent) error {
 		ev := &lib.ReplicationEvent[db.ChangeLogEvent]{
 			FromNodeId: *nodeID,
 			Payload:    event,
@@ -94,20 +118,6 @@ func main() {
 		}
 
 		return nil
-	}
-
-	tableNames := strings.Split(*tables, ",")
-	if tableNames[0] == "" {
-		tableNames = make([]string, 0)
-	}
-	if err := srcDb.InstallCDC(tableNames); err != nil {
-		log.Error().Err(err).Msg("Unable to install CDC tables")
-		return
-	}
-
-	err = lib.NewControlPane(raft).Run(*bindPane)
-	if err != nil {
-		log.Panic().Err(err).Msg("Control pane not working")
 	}
 }
 
