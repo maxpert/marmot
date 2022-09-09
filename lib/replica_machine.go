@@ -77,15 +77,12 @@ func (ssm *SQLiteStateMachine) SaveSnapshot(_ io.Writer, files sm.ISnapshotFileC
 	ssm.snapshotLock.Lock()
 	defer ssm.snapshotLock.Unlock()
 
-	tmpPath := path.Join(ssm.SnapshotsPath, "marmot", "snapshot")
-	err := os.MkdirAll(tmpPath, 0744)
+	bkFileDir, err := ssm.GetSnapshotDir()
 	if err != nil {
-		log.Error().Err(err).Msg("Unable to create directory for snapshot")
 		return err
 	}
 
-	bkFilePath := path.Join(tmpPath, "backup.sqlite")
-
+	bkFilePath := path.Join(bkFileDir, "backup.sqlite")
 	err = ssm.DB.BackupTo(bkFilePath)
 	if err != nil {
 		return err
@@ -93,26 +90,46 @@ func (ssm *SQLiteStateMachine) SaveSnapshot(_ io.Writer, files sm.ISnapshotFileC
 
 	files.AddFile(0, bkFilePath, nil)
 	ssm.snapshotState = snapshotSaved
-	log.Debug().Msg("SaveSnapshot")
+	log.Info().Str("path", bkFilePath).Msg("Snapshot saved")
 	return nil
 }
 
 func (ssm *SQLiteStateMachine) RecoverFromSnapshot(_ io.Reader, sps []sm.SnapshotFile, _ <-chan struct{}) error {
-	ssm.snapshotLock.Lock()
-	defer ssm.snapshotLock.Unlock()
-
 	if len(sps) < 1 {
 		return fmt.Errorf("not file snapshots to restore")
 	}
 
-	err := ssm.DB.RestoreFrom(sps[0].Filepath)
+	err := ssm.ImportSnapshot(sps[0].Filepath)
 	if err != nil {
 		return err
 	}
 
-	ssm.snapshotState = snapshotRestored
-	log.Debug().Msg("RecoverFromSnapshot")
 	return nil
+}
+
+func (ssm *SQLiteStateMachine) ImportSnapshot(filepath string) error {
+	ssm.snapshotLock.Lock()
+	defer ssm.snapshotLock.Unlock()
+
+	err := ssm.DB.RestoreFrom(filepath)
+	if err != nil {
+		return err
+	}
+
+	log.Info().Str("path", filepath).Msg("Snapshot imported")
+	ssm.snapshotState = snapshotRestored
+	return nil
+}
+
+func (ssm *SQLiteStateMachine) GetSnapshotDir() (string, error) {
+	tmpPath := path.Join(ssm.SnapshotsPath, "marmot", "snapshot")
+	err := os.MkdirAll(tmpPath, 0744)
+	if err != nil {
+		log.Error().Err(err).Msg("Unable to create directory for snapshot")
+		return "", err
+	}
+
+	return tmpPath, nil
 }
 
 func (ssm *SQLiteStateMachine) HasRestoredSnapshot() bool {
@@ -133,10 +150,10 @@ func (ssm *SQLiteStateMachine) Close() error {
 	return nil
 }
 
-func NewDBStateMachine(shardID uint64, db *db.SqliteStreamDB, path string) *SQLiteStateMachine {
+func NewDBStateMachine(nodeID uint64, db *db.SqliteStreamDB, path string) *SQLiteStateMachine {
 	return &SQLiteStateMachine{
 		DB:            db,
-		NodeID:        shardID,
+		NodeID:        nodeID,
 		SnapshotsPath: path,
 		snapshotLock:  &sync.Mutex{},
 	}

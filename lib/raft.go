@@ -125,24 +125,25 @@ func (r *RaftServer) BindCluster(initMembers string, join bool, clusterIDs ...ui
 	return nil
 }
 
-func (r *RaftServer) RequestSnapshot(timeout time.Duration) (uint64, error) {
+func (r *RaftServer) RestoreLatestSnapshot(timeout time.Duration) (uint64, uint64, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	for clusterID, nodeID := range r.clusterMap {
+	for clusterID, nodeID := range r.GetClusterMap() {
 		if nodeID == r.nodeID || nodeID == 0 {
 			continue
 		}
 
 		ret, err := r.nodeHost.SyncRequestSnapshot(ctx, clusterID, dragonboat.SnapshotOption{})
+
 		if err != nil {
-			return 0, err
+			return 0, 0, err
 		}
 
-		return ret, nil
+		return ret, clusterID, nil
 	}
 
-	return 0, nil
+	return 0, 0, nil
 }
 
 func (r *RaftServer) AddNode(peerID uint64, address string, clusterIDs ...uint64) error {
@@ -229,8 +230,10 @@ func (r *RaftServer) GetActiveClusters() []uint64 {
 	defer r.lock.RUnlock()
 
 	ret := make([]uint64, 0)
-	for clusterID := range r.clusterMap {
-		ret = append(ret, clusterID)
+	for clusterID, nodeID := range r.clusterMap {
+		if nodeID != 0 {
+			ret = append(ret, clusterID)
+		}
 	}
 
 	return ret

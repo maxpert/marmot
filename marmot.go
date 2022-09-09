@@ -73,11 +73,6 @@ func main() {
 		}
 	}
 
-	log.Info().Msg("Waiting for raft snapshots...")
-	for !raft.SnapshotCompleted() {
-		time.Sleep(100 * time.Millisecond)
-	}
-
 	srcDb.OnChange = onTableChanged(nodeID, raft)
 	log.Info().Msg("Starting change data capture pipeline...")
 	if err := srcDb.StartWatching(); err != nil {
