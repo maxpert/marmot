@@ -274,7 +274,7 @@ func (conn *SqliteStreamDB) RestoreFrom(bkFilePath string) error {
 		for tableName, _ := range conn.watchTablesSchema {
 			query := fmt.Sprintf(`
 					DELETE FROM main.%[1]s; 
-					INSERT OR REPLACE INTO main.%[1]s SELECT * FROM backup.%[1]s`,
+					INSERT INTO main.%[1]s SELECT * FROM backup.%[1]s`,
 				tableName)
 			_, err = tx.Exec(query)
 			if err != nil {
