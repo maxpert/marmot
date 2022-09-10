@@ -119,7 +119,7 @@ func OpenRaw(path string) (*sqlite3.SQLiteConn, error) {
 }
 
 func (conn *SqliteStreamDB) StartWatching() error {
-	for tableName, _ := range conn.watchTablesSchema {
+	for tableName := range conn.watchTablesSchema {
 		err := conn.initTriggers(tableName)
 		if err != nil {
 			return err
@@ -271,7 +271,7 @@ func (conn *SqliteStreamDB) RestoreFrom(bkFilePath string) error {
 	}()
 
 	return conn.WithTx(func(tx *goqu.TxDatabase) error {
-		for tableName, _ := range conn.watchTablesSchema {
+		for tableName := range conn.watchTablesSchema {
 			query := fmt.Sprintf(`
 					DELETE FROM main.%[1]s; 
 					INSERT INTO main.%[1]s SELECT * FROM backup.%[1]s`,

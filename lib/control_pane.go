@@ -117,7 +117,7 @@ func (c *ControlPane) clusterInfo(g *gin.Context) {
 }
 
 func (c *ControlPane) restoreSnapshot(g *gin.Context) {
-	index, _, err := c.raft.RestoreLatestSnapshot(60 * time.Second)
+	index, _, err := c.raft.RequestSnapshot(60 * time.Second)
 	if err != nil {
 		_ = g.AbortWithError(500, err)
 		return

@@ -66,8 +66,8 @@ func (r *RaftServer) config(clusterID uint64) config.Config {
 		ElectionRTT:             10,
 		HeartbeatRTT:            1,
 		CheckQuorum:             true,
-		SnapshotEntries:         100_000,
-		CompactionOverhead:      1000,
+		SnapshotEntries:         1,
+		CompactionOverhead:      0,
 		EntryCompressionType:    config.Snappy,
 		SnapshotCompressionType: config.Snappy,
 	}
@@ -114,7 +114,7 @@ func (r *RaftServer) BindCluster(initMembers string, join bool, clusterIDs ...ui
 			Uint64("cluster", clusterID).
 			Uint64("node", r.nodeID).
 			Msg("Starting cluster...")
-		err := r.nodeHost.StartCluster(initialMembers, join, r.stateMachineFactory, cfg)
+		err := r.nodeHost.StartOnDiskCluster(initialMembers, join, r.stateMachineFactory, cfg)
 		if err != nil {
 			return err
 		}
@@ -125,7 +125,7 @@ func (r *RaftServer) BindCluster(initMembers string, join bool, clusterIDs ...ui
 	return nil
 }
 
-func (r *RaftServer) RestoreLatestSnapshot(timeout time.Duration) (uint64, uint64, error) {
+func (r *RaftServer) RequestSnapshot(timeout time.Duration) (uint64, uint64, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
@@ -305,7 +305,7 @@ func (r *RaftServer) mutateNodeMap(nodeID uint64, f func(map[uint64]uint64)) {
 	}
 }
 
-func (r *RaftServer) stateMachineFactory(_ uint64, _ uint64) statemachine.IStateMachine {
+func (r *RaftServer) stateMachineFactory(_ uint64, _ uint64) statemachine.IOnDiskStateMachine {
 	return r.stateMachine
 }
 

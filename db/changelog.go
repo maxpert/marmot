@@ -18,6 +18,8 @@ import (
 	"github.com/samber/lo"
 )
 
+var ErrNoTableMapping = errors.New("no table mapping found")
+
 //go:embed table_change_log_script.tmpl
 var tableChangeLogScriptTemplate string
 var tableChangeLogTpl *template.Template
@@ -104,6 +106,10 @@ func (conn *SqliteStreamDB) tableCDCScriptFor(tableName string) (string, error) 
 func (conn *SqliteStreamDB) consumeReplicationEvent(event *ChangeLogEvent) error {
 	return conn.WithTx(func(tnx *goqu.TxDatabase) error {
 		primaryKeyMap := conn.getPrimaryKeyMap(event)
+		if primaryKeyMap == nil {
+			return ErrNoTableMapping
+		}
+
 		log.Debug().
 			Str("table", event.TableName).
 			Str("type", event.Type).
