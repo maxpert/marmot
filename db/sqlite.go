@@ -12,7 +12,7 @@ import (
 	"github.com/doug-martin/goqu/v9"
 	"github.com/fsnotify/fsnotify"
 	"github.com/fxamacker/cbor/v2"
-	"github.com/mattn/go-sqlite3"
+	"github.com/rqlite/go-sqlite3"
 	"github.com/rs/zerolog/log"
 )
 
@@ -45,7 +45,7 @@ type ColumnInfo struct {
 
 func OpenStreamDB(path string, tables []string) (*SqliteStreamDB, error) {
 	var rawConn *sqlite3.SQLiteConn
-	driver := &sqlite3.SQLiteDriver{
+	d := &sqlite3.SQLiteDriver{
 		ConnectHook: func(conn *sqlite3.SQLiteConn) error {
 			rawConn = conn
 			return conn.RegisterFunc("marmot_version", func() string {
@@ -53,7 +53,7 @@ func OpenStreamDB(path string, tables []string) (*SqliteStreamDB, error) {
 			}, true)
 		},
 	}
-	sql.Register("sqlite-marmot", driver)
+	sql.Register("sqlite-marmot", d)
 
 	connectionStr := fmt.Sprintf("%s?_journal_mode=wal", path)
 	conn, err := sql.Open("sqlite-marmot", connectionStr)
