@@ -25,7 +25,7 @@ type RaftServer struct {
 	nodeID       uint64
 	metaPath     string
 	lock         *sync.RWMutex
-	stateMachine statemachine.IStateMachine
+	stateMachine *SQLiteStateMachine
 	nodeHost     *dragonboat.NodeHost
 
 	nodeUser   map[uint64]dragonboat.INodeUser
@@ -51,7 +51,7 @@ func NewRaftServer(
 		bindAddress:  bindAddress,
 		nodeID:       nodeID,
 		metaPath:     metaPath,
-		stateMachine: NewDBStateMachine(nodeID, database),
+		stateMachine: NewDBStateMachine(nodeID, database, metaPath),
 		lock:         &sync.RWMutex{},
 		nodeUser:     map[uint64]dragonboat.INodeUser{},
 		clusterMap:   make(map[uint64]uint64),
@@ -66,7 +66,7 @@ func (r *RaftServer) config(clusterID uint64) config.Config {
 		ElectionRTT:             10,
 		HeartbeatRTT:            1,
 		CheckQuorum:             true,
-		SnapshotEntries:         10_000,
+		SnapshotEntries:         50_000,
 		CompactionOverhead:      1000,
 		EntryCompressionType:    config.Snappy,
 		SnapshotCompressionType: config.Snappy,
@@ -114,7 +114,7 @@ func (r *RaftServer) BindCluster(initMembers string, join bool, clusterIDs ...ui
 			Uint64("cluster", clusterID).
 			Uint64("node", r.nodeID).
 			Msg("Starting cluster...")
-		err := r.nodeHost.StartCluster(initialMembers, join, r.stateMachineFactory, cfg)
+		err := r.nodeHost.StartOnDiskCluster(initialMembers, join, r.stateMachineFactory, cfg)
 		if err != nil {
 			return err
 		}
@@ -123,6 +123,27 @@ func (r *RaftServer) BindCluster(initMembers string, join bool, clusterIDs ...ui
 	}
 
 	return nil
+}
+
+func (r *RaftServer) RequestSnapshot(timeout time.Duration) (uint64, uint64, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	for clusterID, nodeID := range r.GetClusterMap() {
+		if nodeID == r.nodeID || nodeID == 0 {
+			continue
+		}
+
+		ret, err := r.nodeHost.SyncRequestSnapshot(ctx, clusterID, dragonboat.SnapshotOption{})
+
+		if err != nil {
+			return 0, 0, err
+		}
+
+		return ret, clusterID, nil
+	}
+
+	return 0, 0, nil
 }
 
 func (r *RaftServer) AddNode(peerID uint64, address string, clusterIDs ...uint64) error {
@@ -209,8 +230,10 @@ func (r *RaftServer) GetActiveClusters() []uint64 {
 	defer r.lock.RUnlock()
 
 	ret := make([]uint64, 0)
-	for clusterID := range r.clusterMap {
-		ret = append(ret, clusterID)
+	for clusterID, nodeID := range r.clusterMap {
+		if nodeID != 0 {
+			ret = append(ret, clusterID)
+		}
 	}
 
 	return ret
@@ -264,6 +287,10 @@ func (r *RaftServer) LeaderUpdated(info raftio.LeaderInfo) {
 	}
 }
 
+func (r *RaftServer) SnapshotCompleted() bool {
+	return r.stateMachine.HasRestoredSnapshot() || r.stateMachine.HasSavedSnapshot()
+}
+
 func (r *RaftServer) mutateNodeMap(nodeID uint64, f func(map[uint64]uint64)) {
 	m, ok := r.nodeMap[nodeID]
 	if !ok {
@@ -278,7 +305,7 @@ func (r *RaftServer) mutateNodeMap(nodeID uint64, f func(map[uint64]uint64)) {
 	}
 }
 
-func (r *RaftServer) stateMachineFactory(_ uint64, _ uint64) statemachine.IStateMachine {
+func (r *RaftServer) stateMachineFactory(_ uint64, _ uint64) statemachine.IOnDiskStateMachine {
 	return r.stateMachine
 }
 

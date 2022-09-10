@@ -18,6 +18,8 @@ import (
 	"github.com/samber/lo"
 )
 
+var ErrNoTableMapping = errors.New("no table mapping found")
+
 //go:embed table_change_log_script.tmpl
 var tableChangeLogScriptTemplate string
 var tableChangeLogTpl *template.Template
@@ -76,6 +78,10 @@ func (conn *SqliteStreamDB) CleanupChangeLogs() error {
 	return nil
 }
 
+func (conn *SqliteStreamDB) metaTable(tableName string, name string) string {
+	return conn.prefix + tableName + "_" + name
+}
+
 func (conn *SqliteStreamDB) tableCDCScriptFor(tableName string) (string, error) {
 	columns, ok := conn.watchTablesSchema[tableName]
 	if !ok {
@@ -100,6 +106,10 @@ func (conn *SqliteStreamDB) tableCDCScriptFor(tableName string) (string, error) 
 func (conn *SqliteStreamDB) consumeReplicationEvent(event *ChangeLogEvent) error {
 	return conn.WithTx(func(tnx *goqu.TxDatabase) error {
 		primaryKeyMap := conn.getPrimaryKeyMap(event)
+		if primaryKeyMap == nil {
+			return ErrNoTableMapping
+		}
+
 		log.Debug().
 			Str("table", event.TableName).
 			Str("type", event.Type).
@@ -125,24 +135,22 @@ func (conn *SqliteStreamDB) getPrimaryKeyMap(event *ChangeLogEvent) map[string]a
 	return ret
 }
 
-func (conn *SqliteStreamDB) initTriggers(tableNames []string) error {
-	for _, tableName := range tableNames {
-		name := strings.TrimSpace(tableName)
-		if strings.HasPrefix(name, "sqlite_") || strings.HasPrefix(name, conn.prefix) {
-			continue
-		}
+func (conn *SqliteStreamDB) initTriggers(tableName string) error {
+	name := strings.TrimSpace(tableName)
+	if strings.HasPrefix(name, "sqlite_") || strings.HasPrefix(name, conn.prefix) {
+		return fmt.Errorf("invalid table to watch %s", tableName)
+	}
 
-		script, err := conn.tableCDCScriptFor(name)
-		if err != nil {
-			log.Error().Err(err).Msg("Failed to prepare CDC statement")
-			return err
-		}
+	script, err := conn.tableCDCScriptFor(name)
+	if err != nil {
+		log.Error().Err(err).Msg("Failed to prepare CDC statement")
+		return err
+	}
 
-		log.Info().Msg(fmt.Sprintf("Creating trigger for %v", name))
-		_, err = conn.Exec(script)
-		if err != nil {
-			return err
-		}
+	log.Info().Msg(fmt.Sprintf("Creating trigger for %v", name))
+	_, err = conn.Exec(script)
+	if err != nil {
+		return err
 	}
 
 	return nil

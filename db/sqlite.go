@@ -2,10 +2,12 @@ package db
 
 import (
 	"database/sql"
+	"database/sql/driver"
 	"fmt"
 	"hash/fnv"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/doug-martin/goqu/v9"
 	"github.com/fsnotify/fsnotify"
@@ -16,6 +18,7 @@ import (
 
 type SqliteStreamDB struct {
 	*goqu.Database
+	rawConnection     *sqlite3.SQLiteConn
 	dbPath            string
 	watcher           *fsnotify.Watcher
 	prefix            string
@@ -40,9 +43,11 @@ type ColumnInfo struct {
 	IsPrimaryKey bool   `db:"pk"`
 }
 
-func OpenSqlite(path string) (*SqliteStreamDB, error) {
+func OpenStreamDB(path string, tables []string) (*SqliteStreamDB, error) {
+	var rawConn *sqlite3.SQLiteConn
 	driver := &sqlite3.SQLiteDriver{
 		ConnectHook: func(conn *sqlite3.SQLiteConn) error {
+			rawConn = conn
 			return conn.RegisterFunc("marmot_version", func() string {
 				return "0.1"
 			}, true)
@@ -50,8 +55,15 @@ func OpenSqlite(path string) (*SqliteStreamDB, error) {
 	}
 	sql.Register("sqlite-marmot", driver)
 
-	connectionStr := fmt.Sprintf("%s?_journal_mode=wal&mode=memory", path)
+	connectionStr := fmt.Sprintf("%s?_journal_mode=wal", path)
 	conn, err := sql.Open("sqlite-marmot", connectionStr)
+	if err != nil {
+		return nil, err
+	}
+
+	conn.SetConnMaxLifetime(0)
+	conn.SetConnMaxIdleTime(10 * time.Second)
+	err = conn.Ping()
 	if err != nil {
 		return nil, err
 	}
@@ -69,6 +81,7 @@ func OpenSqlite(path string) (*SqliteStreamDB, error) {
 	sqliteQu := goqu.Dialect("sqlite3")
 	ret := &SqliteStreamDB{
 		Database:          sqliteQu.DB(conn),
+		rawConnection:     rawConn,
 		watcher:           watcher,
 		dbPath:            path,
 		prefix:            "__marmot__",
@@ -76,22 +89,43 @@ func OpenSqlite(path string) (*SqliteStreamDB, error) {
 		watchTablesSchema: map[string][]*ColumnInfo{},
 	}
 
+	for _, n := range tables {
+		colInfo, err := ret.GetTableInfo(n)
+		if err != nil {
+			return nil, err
+		}
+
+		ret.watchTablesSchema[n] = colInfo
+	}
+
 	return ret, nil
 }
 
-func (conn *SqliteStreamDB) InstallCDC(tables []string) error {
+func OpenRaw(path string) (driver.Conn, *sqlite3.SQLiteConn, error) {
+	var rawConnection *sqlite3.SQLiteConn
+	d := &sqlite3.SQLiteDriver{
+		ConnectHook: func(conn *sqlite3.SQLiteConn) error {
+			rawConnection = conn
+			return conn.RegisterFunc("marmot_version", func() string {
+				return "0.1"
+			}, true)
+		},
+	}
 
-	for _, n := range tables {
-		colInfo, err := conn.GetTableInfo(n)
+	driverConn, err := d.Open(path)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return driverConn, rawConnection, err
+}
+
+func (conn *SqliteStreamDB) StartWatching() error {
+	for tableName := range conn.watchTablesSchema {
+		err := conn.initTriggers(tableName)
 		if err != nil {
 			return err
 		}
-		conn.watchTablesSchema[n] = colInfo
-	}
-
-	err := conn.initTriggers(tables)
-	if err != nil {
-		return err
 	}
 
 	go conn.watchChanges(conn.dbPath)
@@ -117,10 +151,6 @@ func (conn *SqliteStreamDB) Execute(query string) error {
 	}
 
 	return nil
-}
-
-func (conn *SqliteStreamDB) metaTable(tableName string, name string) string {
-	return conn.prefix + tableName + "_" + name
 }
 
 func (conn *SqliteStreamDB) GetTableInfo(table string) ([]*ColumnInfo, error) {
@@ -166,6 +196,113 @@ func (conn *SqliteStreamDB) GetTableInfo(table string) ([]*ColumnInfo, error) {
 	}
 
 	return tableInfo, nil
+}
+
+func (conn *SqliteStreamDB) BackupTo(bkFilePath string) error {
+	var backup *sqlite3.SQLiteBackup = nil
+	_, src, err := OpenRaw(fmt.Sprintf("%s?_foreign_keys=false", conn.dbPath))
+	if err != nil {
+		return err
+	}
+
+	_, dest, err := OpenRaw(fmt.Sprintf("%s?_foreign_keys=false", bkFilePath))
+	if err != nil {
+		return err
+	}
+
+	defer func() {
+		var err error
+
+		if backup != nil {
+			err = backup.Finish()
+		}
+		if err != nil {
+			log.Error().Err(err).Msg("Unable to finish backup DB")
+		}
+
+		err = dest.Close()
+		if err != nil {
+			log.Error().Err(err).Msg("Unable to close backup DB")
+		}
+
+		err = src.Close()
+		if err != nil {
+			log.Error().Err(err).Msg("Unable to close backup DB")
+		}
+	}()
+
+	backup, err = dest.Backup("main", src, "main")
+	if err != nil {
+		return err
+	}
+
+	for {
+		done, err := backup.Step(-1)
+		if err != nil {
+			return err
+		}
+
+		if done {
+			break
+		}
+
+		time.Sleep(150 * time.Millisecond)
+	}
+
+	return nil
+}
+
+func (conn *SqliteStreamDB) RestoreFrom(bkFilePath string) error {
+	_, dest, err := OpenRaw(
+		fmt.Sprintf(
+			"%s?_journal_mode=wal&_foreign_keys=false&_txlock=deferred",
+			conn.dbPath,
+		),
+	)
+	if err != nil {
+		return err
+	}
+
+	_, err = dest.Exec("ATTACH DATABASE ? AS backup", []driver.Value{bkFilePath})
+	if err != nil {
+		return err
+	}
+
+	tx, err := dest.Begin()
+	if err != nil {
+		return err
+	}
+
+	defer func() {
+		err = dest.Close()
+		if err != nil {
+			log.Warn().Err(err).Msg("Unable to close database")
+		}
+	}()
+
+	for tableName := range conn.watchTablesSchema {
+		query := fmt.Sprintf(
+			"DELETE FROM main.%[1]s; INSERT INTO main.%[1]s SELECT * FROM backup.%[1]s;",
+			tableName,
+		)
+		_, err = dest.Exec(query, []driver.Value{})
+		if err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+
+		log.Debug().Msg("Imported " + tableName)
+	}
+
+	return tx.Commit()
+}
+
+func (conn *SqliteStreamDB) GetRawConnection() *sqlite3.SQLiteConn {
+	return conn.rawConnection
+}
+
+func (conn *SqliteStreamDB) GetPath() string {
+	return conn.dbPath
 }
 
 func (e *ChangeLogEvent) Marshal() ([]byte, error) {
