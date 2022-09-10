@@ -23,6 +23,7 @@ jobs:
     - uses: actions/checkout@v3
     - uses: wangyoucao577/go-release-action@v1.30
       with:
+        pre_command: export CGO_ENABLED=1
         github_token: ${{ secrets.GITHUB_TOKEN }}
         goos: ${{ matrix.goos }}
         goarch: ${{ matrix.goarch }}
