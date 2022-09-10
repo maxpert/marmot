@@ -23,7 +23,7 @@ type indexState struct {
 type SQLiteStateMachine struct {
 	NodeID        uint64
 	DB            *db.SqliteStreamDB
-	SnapshotsPath string
+	RaftPath      string
 	snapshotLock  *sync.Mutex
 	snapshotState snapshotState
 	indexState    *indexState
@@ -52,7 +52,7 @@ func NewDBStateMachine(nodeID uint64, db *db.SqliteStreamDB, path string) *SQLit
 	return &SQLiteStateMachine{
 		DB:            db,
 		NodeID:        nodeID,
-		SnapshotsPath: path,
+		RaftPath:      path,
 		snapshotLock:  &sync.Mutex{},
 		snapshotState: 0,
 		indexState:    &indexState{Index: 0},
@@ -105,6 +105,7 @@ func (ssm *SQLiteStateMachine) Sync() error {
 }
 
 func (ssm *SQLiteStateMachine) PrepareSnapshot() (interface{}, error) {
+	log.Debug().Msg("PrepareSnapshot")
 	bkFileDir, err := ssm.GetSnapshotDir()
 	if err != nil {
 		return nil, err
@@ -143,6 +144,7 @@ func (ssm *SQLiteStateMachine) SaveSnapshot(path interface{}, writer io.Writer, 
 }
 
 func (ssm *SQLiteStateMachine) RecoverFromSnapshot(reader io.Reader, _ <-chan struct{}) error {
+	log.Debug().Msg("RecoverFromSnapshot")
 	basePath, err := ssm.GetSnapshotDir()
 	if err != nil {
 		return err
@@ -160,12 +162,13 @@ func (ssm *SQLiteStateMachine) RecoverFromSnapshot(reader io.Reader, _ <-chan st
 		return err
 	}
 
-	err = fo.Close()
+	// Flush file contents before handing off
+	err = fo.Sync()
 	if err != nil {
 		return err
 	}
 
-	err = ssm.ImportSnapshot(filepath)
+	err = ssm.importSnapshot(filepath)
 	if err != nil {
 		return err
 	}
@@ -177,22 +180,8 @@ func (ssm *SQLiteStateMachine) Lookup(_ interface{}) (interface{}, error) {
 	return 0, nil
 }
 
-func (ssm *SQLiteStateMachine) ImportSnapshot(filepath string) error {
-	ssm.snapshotLock.Lock()
-	defer ssm.snapshotLock.Unlock()
-
-	err := ssm.DB.RestoreFrom(filepath)
-	if err != nil {
-		return err
-	}
-
-	log.Info().Str("path", filepath).Msg("Snapshot imported")
-	ssm.snapshotState = snapshotRestored
-	return nil
-}
-
 func (ssm *SQLiteStateMachine) GetSnapshotDir() (string, error) {
-	tmpPath := path.Join(ssm.SnapshotsPath, "marmot", "snapshot")
+	tmpPath := path.Join(ssm.RaftPath, "marmot")
 	err := os.MkdirAll(tmpPath, 0744)
 	if err != nil {
 		log.Error().Err(err).Msg("Unable to create directory for snapshot")
@@ -217,6 +206,21 @@ func (ssm *SQLiteStateMachine) HasSavedSnapshot() bool {
 }
 
 func (ssm *SQLiteStateMachine) Close() error {
+	return nil
+}
+
+func (ssm *SQLiteStateMachine) importSnapshot(filepath string) error {
+	ssm.snapshotLock.Lock()
+	defer ssm.snapshotLock.Unlock()
+
+	log.Info().Str("path", filepath).Msg("Importing...")
+	err := ssm.DB.RestoreFrom(filepath)
+	if err != nil {
+		return err
+	}
+
+	log.Info().Str("path", filepath).Msg("Snapshot imported")
+	ssm.snapshotState = snapshotRestored
 	return nil
 }
 
@@ -255,6 +259,11 @@ func (ssm *SQLiteStateMachine) saveIndex() error {
 	}
 
 	_, err = fo.Write(b)
+	if err != nil {
+		return err
+	}
+
+	err = fo.Sync()
 	if err != nil {
 		return err
 	}

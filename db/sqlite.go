@@ -2,9 +2,9 @@ package db
 
 import (
 	"database/sql"
+	"database/sql/driver"
 	"fmt"
 	"hash/fnv"
-	"os"
 	"sort"
 	"sync"
 	"time"
@@ -55,7 +55,7 @@ func OpenStreamDB(path string, tables []string) (*SqliteStreamDB, error) {
 	}
 	sql.Register("sqlite-marmot", driver)
 
-	connectionStr := fmt.Sprintf("%s?_journal_mode=wal&mode=memory", path)
+	connectionStr := fmt.Sprintf("%s?_journal_mode=wal", path)
 	conn, err := sql.Open("sqlite-marmot", connectionStr)
 	if err != nil {
 		return nil, err
@@ -101,21 +101,23 @@ func OpenStreamDB(path string, tables []string) (*SqliteStreamDB, error) {
 	return ret, nil
 }
 
-func OpenRaw(path string) (*sqlite3.SQLiteConn, error) {
+func OpenRaw(path string) (driver.Conn, *sqlite3.SQLiteConn, error) {
 	var rawConnection *sqlite3.SQLiteConn
 	d := &sqlite3.SQLiteDriver{
 		ConnectHook: func(conn *sqlite3.SQLiteConn) error {
 			rawConnection = conn
-			return nil
+			return conn.RegisterFunc("marmot_version", func() string {
+				return "0.1"
+			}, true)
 		},
 	}
 
-	_, err := d.Open(path)
+	driverConn, err := d.Open(path)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	return rawConnection, err
+	return driverConn, rawConnection, err
 }
 
 func (conn *SqliteStreamDB) StartWatching() error {
@@ -198,8 +200,12 @@ func (conn *SqliteStreamDB) GetTableInfo(table string) ([]*ColumnInfo, error) {
 
 func (conn *SqliteStreamDB) BackupTo(bkFilePath string) error {
 	var backup *sqlite3.SQLiteBackup = nil
-	src := conn.GetRawConnection()
-	dest, err := OpenRaw(fmt.Sprintf("%s?_foreign_keys=false", bkFilePath))
+	_, src, err := OpenRaw(fmt.Sprintf("%s?_foreign_keys=false", conn.dbPath))
+	if err != nil {
+		return err
+	}
+
+	_, dest, err := OpenRaw(fmt.Sprintf("%s?_foreign_keys=false", bkFilePath))
 	if err != nil {
 		return err
 	}
@@ -215,6 +221,11 @@ func (conn *SqliteStreamDB) BackupTo(bkFilePath string) error {
 		}
 
 		err = dest.Close()
+		if err != nil {
+			log.Error().Err(err).Msg("Unable to close backup DB")
+		}
+
+		err = src.Close()
 		if err != nil {
 			log.Error().Err(err).Msg("Unable to close backup DB")
 		}
@@ -234,56 +245,56 @@ func (conn *SqliteStreamDB) BackupTo(bkFilePath string) error {
 		if done {
 			break
 		}
+
+		time.Sleep(150 * time.Millisecond)
 	}
 
 	return nil
 }
 
 func (conn *SqliteStreamDB) RestoreFrom(bkFilePath string) error {
-	bkStats, err := os.Lstat(bkFilePath)
-	if err != nil {
-		return err
-	}
-	dbStats, err := os.Lstat(conn.dbPath)
+	_, dest, err := OpenRaw(
+		fmt.Sprintf(
+			"%s?_journal_mode=wal&_foreign_keys=false&_txlock=deferred",
+			conn.dbPath,
+		),
+	)
 	if err != nil {
 		return err
 	}
 
-	if bkStats.ModTime().Before(dbStats.ModTime()) {
-		return nil
+	_, err = dest.Exec("ATTACH DATABASE ? AS backup", []driver.Value{bkFilePath})
+	if err != nil {
+		return err
 	}
 
-	_, err = conn.Exec("ATTACH DATABASE ? AS backup", bkFilePath)
+	tx, err := dest.Begin()
 	if err != nil {
 		return err
 	}
 
 	defer func() {
-		for {
-			log.Debug().Msg("Detaching database")
-			_, err := conn.Exec("DETACH DATABASE backup")
-			if err == nil {
-				break
-			}
-
-			time.Sleep(1 * time.Second)
+		err = dest.Close()
+		if err != nil {
+			log.Warn().Err(err).Msg("Unable to close database")
 		}
 	}()
 
-	return conn.WithTx(func(tx *goqu.TxDatabase) error {
-		for tableName := range conn.watchTablesSchema {
-			query := fmt.Sprintf(`
-					DELETE FROM main.%[1]s; 
-					INSERT INTO main.%[1]s SELECT * FROM backup.%[1]s`,
-				tableName)
-			_, err = tx.Exec(query)
-			if err != nil {
-				return err
-			}
+	for tableName := range conn.watchTablesSchema {
+		query := fmt.Sprintf(
+			"DELETE FROM main.%[1]s; INSERT INTO main.%[1]s SELECT * FROM backup.%[1]s;",
+			tableName,
+		)
+		_, err = dest.Exec(query, []driver.Value{})
+		if err != nil {
+			_ = tx.Rollback()
+			return err
 		}
 
-		return nil
-	})
+		log.Debug().Msg("Imported " + tableName)
+	}
+
+	return tx.Commit()
 }
 
 func (conn *SqliteStreamDB) GetRawConnection() *sqlite3.SQLiteConn {

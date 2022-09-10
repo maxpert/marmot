@@ -119,6 +119,7 @@ func (c *ControlPane) clusterInfo(g *gin.Context) {
 func (c *ControlPane) restoreSnapshot(g *gin.Context) {
 	index, _, err := c.raft.RequestSnapshot(60 * time.Second)
 	if err != nil {
+		log.Error().Err(err).Msg("Unable to request snapshot")
 		_ = g.AbortWithError(500, err)
 		return
 	}
