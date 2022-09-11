@@ -128,7 +128,7 @@ func (conn *SqliteStreamDB) StartWatching() error {
 
 func (conn *SqliteStreamDB) RemoveCDC() error {
 	log.Warn().Msg("Uninstalling all CDC hooks...")
-	return conn.cleanAll()
+	return cleanMarmotTablesAndTriggers(conn.Database, conn.prefix)
 }
 
 func (conn *SqliteStreamDB) Execute(query string) error {
@@ -193,54 +193,35 @@ func (conn *SqliteStreamDB) GetTableInfo(table string) ([]*ColumnInfo, error) {
 }
 
 func (conn *SqliteStreamDB) BackupTo(bkFilePath string) error {
-	var backup *sqlite3.SQLiteBackup = nil
-	_, src, err := OpenRaw(fmt.Sprintf("%s?_foreign_keys=false", conn.dbPath))
-	if err != nil {
-		return err
-	}
-
-	_, dest, err := OpenRaw(fmt.Sprintf("%s?_foreign_keys=false", bkFilePath))
+	_, src, err := OpenRaw(fmt.Sprintf("%s?_foreign_keys=false&_journal_mode=wal", conn.dbPath))
 	if err != nil {
 		return err
 	}
 
 	defer func() {
-		var err error
-
-		if backup != nil {
-			err = backup.Finish()
-		}
-		if err != nil {
-			log.Error().Err(err).Msg("Unable to finish backup DB")
-		}
-
-		err = dest.Close()
-		if err != nil {
-			log.Error().Err(err).Msg("Unable to close backup DB")
-		}
-
-		err = src.Close()
-		if err != nil {
+		if err := src.Close(); err != nil {
 			log.Error().Err(err).Msg("Unable to close backup DB")
 		}
 	}()
 
-	backup, err = dest.Backup("main", src, "main")
+	_, err = src.Exec("VACUUM main INTO ?;", []driver.Value{bkFilePath})
 	if err != nil {
 		return err
 	}
 
-	for {
-		done, err := backup.Step(-1)
-		if err != nil {
-			return err
-		}
+	if err := src.Close(); err != nil {
+		log.Error().Err(err).Msg("Unable to close source DB")
+	}
 
-		if done {
-			break
-		}
+	sqlDB, src, err := OpenRaw(fmt.Sprintf("%s?_foreign_keys=false&_journal_mode=wal", bkFilePath))
+	if err != nil {
+		return err
+	}
 
-		time.Sleep(150 * time.Millisecond)
+	gSQL := goqu.New("sqlite", sqlDB)
+	err = cleanMarmotTablesAndTriggers(gSQL, conn.prefix)
+	if err != nil {
+		return err
 	}
 
 	return nil

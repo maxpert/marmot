@@ -364,6 +364,11 @@ func (s *SQLiteLogDB) CompactEntriesTo(clusterID uint64, nodeID uint64, index ui
 		close(ch)
 	}()
 
+	_, err := s.db.Exec("PRAGMA wal_checkpoint(TRUNCATE);")
+	if err != nil {
+		return nil, err
+	}
+
 	return ch, nil
 }
 
