@@ -12,8 +12,8 @@ jobs:
     strategy:
       matrix:
         # build and publish in parallel: linux/386, linux/amd64, linux/arm64, windows/386, windows/amd64, darwin/amd64, darwin/arm64
-        goos: [linux, darwin]
-        goarch: [amd64, arm64]
+        goos: [linux]
+        goarch: [amd64]
         exclude:
           - goarch: "386"
             goos: darwin
@@ -23,6 +23,7 @@ jobs:
     - uses: actions/checkout@v3
     - uses: wangyoucao577/go-release-action@v1.30
       with:
+        pre_command: export CGO_ENABLED=1
         github_token: ${{ secrets.GITHUB_TOKEN }}
         goos: ${{ matrix.goos }}
         goarch: ${{ matrix.goarch }}
