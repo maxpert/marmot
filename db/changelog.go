@@ -62,20 +62,29 @@ func (conn *SqliteStreamDB) Replicate(event *ChangeLogEvent) error {
 	return nil
 }
 
-func (conn *SqliteStreamDB) CleanupChangeLogs() error {
+func (conn *SqliteStreamDB) CleanupChangeLogs() (int64, error) {
+	total := int64(0)
 	for name := range conn.watchTablesSchema {
 		metaTableName := conn.metaTable(name, changeLogName)
-		_, err := conn.Delete(metaTableName).
+		rs, err := conn.Delete(metaTableName).
 			Where(goqu.Ex{"state": Published}).
 			Prepared(true).
 			Executor().
 			Exec()
 
 		if err != nil {
-			return err
+			return 0, err
 		}
+
+		count, err := rs.RowsAffected()
+		if err != nil {
+			return 0, err
+		}
+
+		total += count
 	}
-	return nil
+
+	return total, nil
 }
 
 func (conn *SqliteStreamDB) metaTable(tableName string, name string) string {
@@ -189,9 +198,21 @@ func (conn *SqliteStreamDB) watchChanges(path string) {
 
 func (conn *SqliteStreamDB) publishChangeLog() {
 	conn.publishLock.Lock()
-	defer conn.publishLock.Unlock()
-
 	scanLimit := uint(100)
+	processed := uint64(0)
+
+	defer func() {
+		if processed > uint64(0) {
+			cnt, err := conn.CleanupChangeLogs()
+			if err != nil {
+				log.Warn().Err(err).Msg("Unable to cleanup change logs")
+			} else if cnt > int64(0) {
+				log.Info().Int64("cleaned", cnt).Uint64("published", processed).Msg("Rows published")
+			}
+		}
+
+		conn.publishLock.Unlock()
+	}()
 
 	for tableName := range conn.watchTablesSchema {
 		var changes []*changeLogEntry
@@ -218,6 +239,7 @@ func (conn *SqliteStreamDB) publishChangeLog() {
 			log.Error().Err(err).Msg("Unable to consume changes")
 		}
 
+		processed += uint64(len(changes))
 		if uint(len(changes)) <= scanLimit {
 			break
 		}
