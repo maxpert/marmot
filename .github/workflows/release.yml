@@ -72,7 +72,7 @@ jobs:
 
       - name: Build marmot
         run: |
-          CGO_ENABLED=1 go build -ldflags "-s -w ${{ env.LDFLAGS }} -o marmot .
+          CGO_ENABLED=1 go build -ldflags "-s -w ${{ env.LDFLAGS }}" -o marmot .
           tar -czvf marmot-${{ env.VERSION }}-${{ env.GOOS }}-${{ env.GOARCH }}${{ env.GOARM }}${{ env.SUFFIX }}.tar.gz marmot LICENSE README
 
       - name: Upload binary artifact
