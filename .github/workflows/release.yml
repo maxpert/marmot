@@ -30,24 +30,6 @@ jobs:
             cc:   aarch64-linux-gnu-gcc
             static: true
 
-          - arch: arm
-            arm:  6
-            cc:   arm-linux-gnueabi-gcc
-
-          - arch: arm
-            arm:  6
-            cc:   arm-linux-gnueabi-gcc
-            static: true
-
-          - arch: arm
-            arm:  7
-            cc:   arm-linux-gnueabihf-gcc
-
-          - arch: arm
-            arm:  7
-            cc:   arm-linux-gnueabihf-gcc
-            static: true
-
     env:
       GOOS:   linux
       GOARCH: ${{ matrix.arch }}
