@@ -1,4 +1,4 @@
-module marmot
+module github.com/maxpert/marmot
 
 go 1.18
 

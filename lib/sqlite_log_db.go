@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"math"
+	"time"
 
 	_ "embed"
 
@@ -12,9 +13,9 @@ import (
 	"github.com/lni/dragonboat/v3/raftio"
 	"github.com/lni/dragonboat/v3/raftpb"
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/maxpert/marmot/db"
 	"github.com/rs/zerolog/log"
 	"github.com/samber/lo"
-	"marmot/db"
 )
 
 type raftInfoEntryType = int16
@@ -361,13 +362,36 @@ func (s *SQLiteLogDB) CompactEntriesTo(clusterID uint64, nodeID uint64, index ui
 	log.Trace().Msg(fmt.Sprintf("CompactEntriesTo c: %d n: %d i: %d", clusterID, nodeID, index))
 
 	defer func() {
+		var rows *sql.Rows
+		for {
+			if rows != nil {
+				_ = rows.Close()
+			}
+
+			rows, err := s.db.Query("PRAGMA wal_checkpoint(TRUNCATE)")
+			if err != nil {
+				break
+			}
+
+			rows.Next()
+
+			var busy, logi, checkpointed int64
+			err = rows.Scan(&busy, &logi, &checkpointed)
+			if err != nil {
+				break
+			}
+
+			if busy == 0 {
+				break
+			}
+
+			_ = rows.Close()
+			time.Sleep(100 * time.Millisecond)
+		}
+
+		_ = rows.Close()
 		close(ch)
 	}()
-
-	_, err := s.db.Exec("PRAGMA wal_checkpoint(TRUNCATE);")
-	if err != nil {
-		return nil, err
-	}
 
 	return ch, nil
 }

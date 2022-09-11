@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"marmot/db"
+	"github.com/maxpert/marmot/db"
 
 	"github.com/lni/dragonboat/v3"
 	"github.com/lni/dragonboat/v3/config"

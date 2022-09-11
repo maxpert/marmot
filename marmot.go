@@ -7,8 +7,8 @@ import (
 	"strings"
 	"time"
 
-	"marmot/db"
-	"marmot/lib"
+	"github.com/maxpert/marmot/db"
+	"github.com/maxpert/marmot/lib"
 
 	"github.com/godruoyi/go-snowflake"
 	"github.com/rs/zerolog"

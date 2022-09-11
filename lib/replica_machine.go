@@ -7,10 +7,9 @@ import (
 	"path"
 	"sync"
 
-	"marmot/db"
-
 	"github.com/fxamacker/cbor/v2"
 	sm "github.com/lni/dragonboat/v3/statemachine"
+	"github.com/maxpert/marmot/db"
 	"github.com/rs/zerolog/log"
 )
 
