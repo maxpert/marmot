@@ -7,7 +7,6 @@ require (
 	github.com/fsnotify/fsnotify v1.5.4
 	github.com/fxamacker/cbor/v2 v2.4.0
 	github.com/gin-gonic/gin v1.4.0
-	github.com/godruoyi/go-snowflake v0.0.1
 	github.com/lni/dragonboat/v3 v3.3.5
 	github.com/mattn/go-sqlite3 v1.14.15
 	github.com/rs/zerolog v1.27.0

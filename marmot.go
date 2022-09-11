@@ -4,13 +4,13 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"math/rand"
 	"strings"
 	"time"
 
 	"github.com/maxpert/marmot/db"
 	"github.com/maxpert/marmot/lib"
 
-	"github.com/godruoyi/go-snowflake"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 )
@@ -19,7 +19,7 @@ func main() {
 	cleanup := flag.Bool("cleanup", false, "Cleanup all hooks and tables")
 	dbPathString := flag.String("db-path", "/tmp/marmot.db", "Path to SQLite database")
 	metaPath := flag.String("raft-path", "/tmp/raft", "Path to save raft information")
-	nodeID := flag.Uint64("node-id", uint64(snowflake.PrivateIPToMachineID()), "Node ID")
+	nodeID := flag.Uint64("node-id", rand.Uint64(), "Node ID")
 	followFlag := flag.Bool("follow", false, "Start Raft in follower mode")
 	shards := flag.Uint64("shards", 16, "Total number of shards for this instance")
 	bindAddress := flag.String("bind", "0.0.0.0:8160", "Bind address for Raft server")
