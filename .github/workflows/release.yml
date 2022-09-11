@@ -10,7 +10,6 @@ on:
       - synchronize
       - reopened
 
-name: Release (Linux)
 jobs:
   build:
     runs-on: ubuntu-18.04
@@ -86,11 +85,13 @@ jobs:
       - name: Get release
         id: release
         uses: bruceadams/get-release@v1.2.3
+        if: github.event_name == 'release'
         env:
           GITHUB_TOKEN: ${{ github.token }}
 
       - name: Upload release tarball
         uses: actions/upload-release-asset@v1.0.2
+        if: github.event_name == 'release'
         env:
           GITHUB_TOKEN: ${{ github.token }}
         with:
