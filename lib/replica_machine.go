@@ -81,12 +81,10 @@ func (ssm *SQLiteStateMachine) Update(entries []sm.Entry) ([]sm.Entry, error) {
 			Str("type", event.Payload.Type).
 			Logger()
 
-		if event.FromNodeId != ssm.NodeID {
-			err := ssm.DB.Replicate(event.Payload)
-			if err != nil {
-				logger.Error().Err(err).Msg("Row not replicated...")
-				return nil, err
-			}
+		err := ssm.DB.Replicate(event.Payload)
+		if err != nil {
+			logger.Error().Err(err).Msg("Row not replicated...")
+			return nil, err
 		}
 
 		ssm.indexState.Index = entry.Index
