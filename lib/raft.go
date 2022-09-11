@@ -59,20 +59,6 @@ func NewRaftServer(
 	}
 }
 
-func (r *RaftServer) config(clusterID uint64) config.Config {
-	return config.Config{
-		NodeID:                  r.nodeID,
-		ClusterID:               clusterID,
-		ElectionRTT:             10,
-		HeartbeatRTT:            1,
-		CheckQuorum:             true,
-		SnapshotEntries:         50_000,
-		CompactionOverhead:      1000,
-		EntryCompressionType:    config.Snappy,
-		SnapshotCompressionType: config.Snappy,
-	}
-}
-
 func (r *RaftServer) Init() error {
 	r.lock.Lock()
 	defer r.lock.Unlock()
@@ -346,4 +332,18 @@ func (r *RaftServer) getNodeUser(clusterID uint64) (dragonboat.INodeUser, error)
 	}
 	r.nodeUser[clusterID] = val
 	return val, nil
+}
+
+func (r *RaftServer) config(clusterID uint64) config.Config {
+	return config.Config{
+		NodeID:                  r.nodeID,
+		ClusterID:               clusterID,
+		ElectionRTT:             10,
+		HeartbeatRTT:            1,
+		CheckQuorum:             true,
+		SnapshotEntries:         1,
+		CompactionOverhead:      0,
+		EntryCompressionType:    config.Snappy,
+		SnapshotCompressionType: config.Snappy,
+	}
 }

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,7 +15,15 @@ import (
 	"github.com/fxamacker/cbor/v2"
 	"github.com/mattn/go-sqlite3"
 	"github.com/rs/zerolog/log"
+	"github.com/samber/lo"
 )
+
+const restoreBackupSQL = `PRAGMA wal_checkpoint(TRUNCATE);
+INSERT OR REPLACE INTO main.%[1]s(%[2]s) 
+SELECT %[2]s FROM backup.%[1]s 
+LIMIT %[3]d OFFSET %[4]d;`
+
+const batchSize = 1000
 
 type SqliteStreamDB struct {
 	*goqu.Database
@@ -44,30 +53,14 @@ type ColumnInfo struct {
 }
 
 func OpenStreamDB(path string, tables []string) (*SqliteStreamDB, error) {
-	var rawConn *sqlite3.SQLiteConn
-	d := &sqlite3.SQLiteDriver{
-		ConnectHook: func(conn *sqlite3.SQLiteConn) error {
-			rawConn = conn
-			return conn.RegisterFunc("marmot_version", func() string {
-				return "0.1"
-			}, true)
-		},
-	}
-	sql.Register("sqlite-marmot", d)
-
 	connectionStr := fmt.Sprintf("%s?_journal_mode=wal", path)
-	conn, err := sql.Open("sqlite-marmot", connectionStr)
+	conn, rawConn, err := OpenRaw(connectionStr)
 	if err != nil {
 		return nil, err
 	}
 
 	conn.SetConnMaxLifetime(0)
 	conn.SetConnMaxIdleTime(10 * time.Second)
-	err = conn.Ping()
-	if err != nil {
-		return nil, err
-	}
-
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		return nil, err
@@ -101,23 +94,24 @@ func OpenStreamDB(path string, tables []string) (*SqliteStreamDB, error) {
 	return ret, nil
 }
 
-func OpenRaw(path string) (driver.Conn, *sqlite3.SQLiteConn, error) {
-	var rawConnection *sqlite3.SQLiteConn
+func OpenRaw(dns string) (*sql.DB, *sqlite3.SQLiteConn, error) {
+	var rawConn *sqlite3.SQLiteConn
 	d := &sqlite3.SQLiteDriver{
 		ConnectHook: func(conn *sqlite3.SQLiteConn) error {
-			rawConnection = conn
+			rawConn = conn
 			return conn.RegisterFunc("marmot_version", func() string {
 				return "0.1"
 			}, true)
 		},
 	}
 
-	driverConn, err := d.Open(path)
+	conn := sql.OpenDB(SqliteDriverConnector{driver: d, dns: dns})
+	err := conn.Ping()
 	if err != nil {
 		return nil, nil, err
 	}
 
-	return driverConn, rawConnection, err
+	return conn, rawConn, nil
 }
 
 func (conn *SqliteStreamDB) StartWatching() error {
@@ -253,48 +247,54 @@ func (conn *SqliteStreamDB) BackupTo(bkFilePath string) error {
 }
 
 func (conn *SqliteStreamDB) RestoreFrom(bkFilePath string) error {
-	_, dest, err := OpenRaw(
-		fmt.Sprintf(
-			"%s?_journal_mode=wal&_foreign_keys=false&_txlock=deferred",
-			conn.dbPath,
-		),
-	)
+	dns := fmt.Sprintf("%s?_journal_mode=wal&_foreign_keys=false&_txlock=deferred",
+		conn.dbPath)
+	sqlDB, dest, err := OpenRaw(dns)
 	if err != nil {
 		return err
 	}
 
+	gSQL := goqu.New("sqlite", sqlDB)
 	_, err = dest.Exec("ATTACH DATABASE ? AS backup", []driver.Value{bkFilePath})
 	if err != nil {
 		return err
 	}
 
-	tx, err := dest.Begin()
-	if err != nil {
-		return err
-	}
-
 	defer func() {
-		err = dest.Close()
-		if err != nil {
-			log.Warn().Err(err).Msg("Unable to close database")
-		}
+		_ = dest.Close()
 	}()
 
-	for tableName := range conn.watchTablesSchema {
-		query := fmt.Sprintf(
-			"DELETE FROM main.%[1]s; INSERT INTO main.%[1]s SELECT * FROM backup.%[1]s;",
-			tableName,
-		)
-		_, err = dest.Exec(query, []driver.Value{})
+	for tableName, cols := range conn.watchTablesSchema {
+		names := lo.Map(cols, func(c *ColumnInfo, i int) string {
+			return c.Name
+		})
+
+		totalRows, err := gSQL.From(tableName).Count()
 		if err != nil {
-			_ = tx.Rollback()
 			return err
 		}
 
-		log.Debug().Msg("Imported " + tableName)
+		for i := int64(0); i < totalRows; i += batchSize {
+			log.Debug().Int64("page", i).Msg("Restoring " + tableName)
+			err = gSQL.WithTx(func(tx *goqu.TxDatabase) error {
+				query := fmt.Sprintf(restoreBackupSQL, tableName, strings.Join(names, ", "), i+batchSize, i)
+				_, err = tx.Exec(query)
+				if err != nil {
+					return err
+				}
+
+				return nil
+			})
+
+			if err != nil {
+				return err
+			}
+		}
+
+		log.Debug().Msg("Restored " + tableName)
 	}
 
-	return tx.Commit()
+	return nil
 }
 
 func (conn *SqliteStreamDB) GetRawConnection() *sqlite3.SQLiteConn {

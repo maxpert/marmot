@@ -435,8 +435,14 @@ func (s *SQLiteLogDB) ListSnapshots(clusterID uint64, nodeID uint64, index uint6
 	return ret, nil
 }
 
-func (s *SQLiteLogDB) ImportSnapshot(_ raftpb.Snapshot, _ uint64) error {
-	return nil
+func (s *SQLiteLogDB) ImportSnapshot(snp raftpb.Snapshot, nodeID uint64) error {
+	return s.db.WithTx(func(tx *goqu.TxDatabase) error {
+		err := saveInfoTuple(tx, &snp.Index, nodeID, snp.ClusterId, Snapshot, snp.Marshal)
+		if err != nil {
+			return err
+		}
+		return nil
+	})
 }
 
 func (s *SQLiteLogDB) getEntryRange(nodeID, clusterID uint64) (uint64, uint64, error) {
