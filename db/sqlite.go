@@ -5,8 +5,9 @@ import (
 	"database/sql/driver"
 	"fmt"
 	"hash/fnv"
+	"io"
+	"os"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
@@ -15,7 +16,6 @@ import (
 	"github.com/fxamacker/cbor/v2"
 	"github.com/mattn/go-sqlite3"
 	"github.com/rs/zerolog/log"
-	"github.com/samber/lo"
 )
 
 const restoreBackupSQL = `PRAGMA wal_checkpoint(TRUNCATE);
@@ -228,54 +228,50 @@ func (conn *SqliteStreamDB) BackupTo(bkFilePath string) error {
 }
 
 func (conn *SqliteStreamDB) RestoreFrom(bkFilePath string) error {
-	dns := fmt.Sprintf("%s?_journal_mode=wal&_foreign_keys=false&_txlock=deferred",
-		conn.dbPath)
-	sqlDB, dest, err := OpenRaw(dns)
+	dnsTpl := "%s?_journal_mode=wal&_foreign_keys=false&&_busy_timeout=30000&_txlock=%s"
+	dns := fmt.Sprintf(dnsTpl, conn.dbPath, "immediate")
+	destDB, dest, err := OpenRaw(dns)
 	if err != nil {
 		return err
 	}
-
-	gSQL := goqu.New("sqlite", sqlDB)
-	_, err = dest.Exec("ATTACH DATABASE ? AS backup", []driver.Value{bkFilePath})
-	if err != nil {
-		return err
-	}
-
 	defer func() {
 		_ = dest.Close()
 	}()
 
-	for tableName, cols := range conn.watchTablesSchema {
-		names := lo.Map(cols, func(c *ColumnInfo, i int) string {
-			return c.Name
-		})
+	dns = fmt.Sprintf(dnsTpl, bkFilePath, "immediate")
+	srcDB, src, err := OpenRaw(dns)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = src.Close()
+	}()
 
-		totalRows, err := gSQL.From(tableName).Count()
-		if err != nil {
-			return err
-		}
+	dgSQL := goqu.New("sqlite", destDB)
+	sgSQL := goqu.New("sqlite", srcDB)
 
-		for i := int64(0); i < totalRows; i += batchSize {
-			log.Debug().Int64("page", i).Msg("Restoring " + tableName)
-			err = gSQL.WithTx(func(tx *goqu.TxDatabase) error {
-				query := fmt.Sprintf(restoreBackupSQL, tableName, strings.Join(names, ", "), i+batchSize, i)
-				_, err = tx.Exec(query)
-				if err != nil {
-					return err
-				}
-
-				return nil
-			})
-
+	// Source locking is required so that any lock related metadata is mirrored in destination
+	// Transacting on both src and dest in immediate mode makes sure nobody
+	// else is modifying or interacting with DB
+	return sgSQL.WithTx(func(_ *goqu.TxDatabase) error {
+		return dgSQL.WithTx(func(_ *goqu.TxDatabase) error {
+			fi, err := os.OpenFile(bkFilePath, os.O_RDWR, 0)
 			if err != nil {
 				return err
 			}
-		}
+			defer fi.Close()
 
-		log.Debug().Msg("Restored " + tableName)
-	}
+			fo, err := os.OpenFile(conn.dbPath, os.O_WRONLY, 0)
+			if err != nil {
+				return err
+			}
+			defer fo.Close()
 
-	return nil
+			bytesWritten, err := io.Copy(fo, fi)
+			log.Debug().Int64("bytes", bytesWritten).Msg("Backup bytes copied...")
+			return err
+		})
+	})
 }
 
 func (conn *SqliteStreamDB) GetRawConnection() *sqlite3.SQLiteConn {

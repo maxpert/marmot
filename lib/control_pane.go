@@ -23,6 +23,7 @@ func NewControlPane(raft *RaftServer) *ControlPane {
 	}
 
 	r.engine.Use(gin.Recovery())
+	r.engine.MaxMultipartMemory = 8 << 20
 	routes := r.engine.Group("/", authRequired)
 	routes.GET("/start/cluster/:cluster/mode/:mode", r.startCluster)
 	routes.GET("/move/cluster/:cluster/node/:node", r.moveCluster)
@@ -30,6 +31,7 @@ func NewControlPane(raft *RaftServer) *ControlPane {
 	routes.GET("/shuffle", r.shuffleNodes)
 	routes.GET("/info", r.clusterInfo)
 	routes.GET("/restore", r.restoreSnapshot)
+	routes.POST("/restore", r.restoreSnapshotFrom)
 
 	return r
 }
@@ -114,6 +116,37 @@ func (c *ControlPane) moveCluster(g *gin.Context) {
 func (c *ControlPane) clusterInfo(g *gin.Context) {
 	cmap := c.raft.GetNodeMap()
 	g.JSON(200, cmap)
+}
+
+func (c *ControlPane) restoreSnapshotFrom(g *gin.Context) {
+	file, err := g.FormFile("dump")
+	if err != nil {
+		log.Error().Err(err).Msg("Unable to load dump file")
+		g.AbortWithError(400, err)
+		return
+	}
+
+	tmpFile, err := os.CreateTemp("", "*.sqlite")
+	if err != nil {
+		g.AbortWithError(500, err)
+		return
+	}
+	tmpPath := tmpFile.Name()
+	tmpFile.Close()
+
+	err = g.SaveUploadedFile(file, tmpPath)
+	if err != nil {
+		g.AbortWithError(500, err)
+		return
+	}
+
+	err = c.raft.stateMachine.DB.RestoreFrom(tmpPath)
+	if err != nil {
+		g.AbortWithError(500, err)
+		return
+	}
+
+	g.JSON(200, "OK")
 }
 
 func (c *ControlPane) restoreSnapshot(g *gin.Context) {
