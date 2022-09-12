@@ -68,10 +68,10 @@ Marmot scans these tables to publish them to other nodes in cluster by:
  - Using the hash decide the primary cluster the change belongs to.
  - Propose the change to the calculated cluster, before marking entry to be applied to cluster.
  - As soon as quorum of nodes accept and confirm change log (See `SQLiteLogDB`), row changes are applied via state machine
-   to local tables of the node and primary proposer will remove from change log table. This means each tuple due to 
-   consensus will have only one deterministic order of changes getting in cluster in case of race-conditions. Once 
-   the order is determined for a change it's applied in an upsert or delete manner to the table. So it's quite 
-   possible that a change committed locally is overwritten or replaced later because it was not the last one 
+   to local tables of the node and primary proposer will remove from change log table. This means every row in database 
+   due to consensus will have only one deterministic order of changes getting in cluster in case of race-conditions. 
+ - Once the order is determined for a change it's applied in an upsert or delete manner to the table. So it's quite 
+   possible that a row committed locally is overwritten or replaced later because it was not the last one 
    in order of cluster wide commit order. 
 
 ## Limitations
