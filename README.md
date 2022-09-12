@@ -64,22 +64,21 @@ and then Marmot can publish them to rest of the nodes. This is how it works inte
 
 When you are running Marmot process, it's watching for changes on DB file and WAL file. Everytime there is a change
 Marmot scans these tables to publish them to other nodes in cluster by:
- - Gather all change records, and for each record calculate a consistent hash based on table name and primary keys.
- - Using the hash decide the primary shard the change belongs to.
- - Propose the change to the cluster.
- - As soon as quorum of nodes apply the change to local tables change is considered committed, and
-   remove from change log table. These changes are applied in an upsert manner, meaning each tuple
-   due to consensus will have one deterministic order of changes getting applied in case or 
-   race-condition. So it's quite possible that a change committed locally is overwritten
-   because it was not the last one in.
+ - Gather all change records, and for each record calculate a consistent hash based on table name + primary keys.
+ - Using the hash decide the primary cluster the change belongs to.
+ - Propose the change to the calculated cluster, before marking entry to be applied to cluster.
+ - As soon as quorum of nodes accept and confirm change log (See `SQLiteLogDB`), row changes are applied via state machine
+   to local tables of the node and primary proposer will remove from change log table. This means each tuple due to 
+   consensus will have only one deterministic order of changes getting in cluster in case of race-conditions. Once 
+   the order is determined for a change it's applied in an upsert or delete manner to the table. So it's quite 
+   possible that a change committed locally is overwritten or replaced later because it was not the last one 
+   in order of cluster wide commit order. 
 
 ## Limitations
 Right now there are a few limitations on current solution:
  - Only incremental, change stream i.e. tables should exist with matching schema, and existing rows won't be copied over. SQLite tools are enough for that.
- - Only WAL mode supported.
- - Won't create DB file if it doesn't exist.
+ - WAL mode required - since your DB is gonna be processed by multiple process the only way to do have multi-process changes reliably is via WAL. 
  - Right now no support for copying previous data of table into existing table, or copy schema. Would be introduced in future though.
- 
 
 ## Production status
 
