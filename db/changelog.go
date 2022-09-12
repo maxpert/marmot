@@ -201,6 +201,10 @@ func (conn *SqliteStreamDB) publishChangeLog() {
 	scanLimit := uint(100)
 	processed := uint64(0)
 
+	// TODO: Move cleanup logic to time based cleanup
+	// In order to reduce frequent writes, change the logic below
+	// to only do in place updates, and the periodically do
+	// table cleanup.
 	defer func() {
 		if processed > uint64(0) {
 			cnt, err := conn.CleanupChangeLogs()
