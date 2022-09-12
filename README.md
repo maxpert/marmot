@@ -17,11 +17,12 @@ Build
 go build -o build/marmot ./marmot.go
 ```
 
-Make sure you have 2 SQLite DBs with exact same schemas (ideally empty):
+Make sure you have 2 SQLite DBs with exact same schemas (ideally exact same state):
 
 ```shell
-build/marmot -bootstrap 2@127.0.0.1:8162 -bind 127.0.0.1:8161 -bind-pane localhost:6001 -node-id 1 -replicate table1,table2 -db-path /tmp/cache-1.db
-build/marmot -bootstrap 1@127.0.0.1:8161 -bind 127.0.0.1:8162 -bind-pane localhost:6002 -node-id 2 -replicate table1,table2 -db-path /tmp/cache-2.db
+rm -rf /tmp/raft # Clear out previous raft state, only do for cold start
+build/marmot -bootstrap 2@127.0.0.1:8162 -bind 127.0.0.1:8161 -bind-pane localhost:6001 -node-id 1 -db-path /tmp/cache-1.db
+build/marmot -bootstrap 1@127.0.0.1:8161 -bind 127.0.0.1:8162 -bind-pane localhost:6002 -node-id 2 -db-path /tmp/cache-2.db
 ```
 
 ## Documentation
@@ -50,7 +51,7 @@ configure marmot:
  - `bind-pane` - A `host:port` combination for control panel address (default: `localhost:6010`). All the endpoints
    are basic auth protected which should be set via `AUTH_KEY` env variable (e.g. `AUTH_KEY='Basic ...'`). This 
    address should not be a public accessible, and should be only used for cluster management. This in future 
-   will serve as full control panel hosting and cluster management API. 
+   will serve as full control panel hosting and cluster management API. **EXPERIMENTAL**
  - `verbose` - Specify if system should dump debug logs on console as well. Only use this for debugging. 
 
 ## How does it work?
@@ -77,13 +78,17 @@ Marmot scans these tables to publish them to other nodes in cluster by:
 
 ## Limitations
 Right now there are a few limitations on current solution:
- - Only incremental, change stream i.e. tables should exist with matching schema, and existing rows won't be copied over. SQLite tools are enough for that.
- - WAL mode required - since your DB is gonna be processed by multiple process the only way to do have multi-process changes reliably is via WAL. 
- - Right now no support for copying previous data of table into existing table, or copy schema. Would be introduced in future though.
+ - You can't watch tables selectively on a DB. This is due to various limitations around snapshot and restore mechanism.
+ - WAL mode required - since your DB is going to be processed by multiple process the only way to have multi-process 
+   changes reliably is via WAL. 
+ - Booting off a snapshot is WIP so there might be problems in cold start yet. However, if you can have start off node
+   with same copies of DB it will work flawlessly. 
 
 ## Production status
 
-Being used for ephemeral cache storage in production services, on a very read heavy site. You can view my personal [status board here](https://sibte.notion.site/Marmot-056983fad27a49d4a16fb91031e6ab98). Here is an image from a production server running Marmot:
+Being used for ephemeral cache storage in production services, on a very read heavy site. 
+You can view my personal [status board here](https://sibte.notion.site/Marmot-056983fad27a49d4a16fb91031e6ab98). 
+Here is an image from a production server running Marmot:
 
 ![image](https://user-images.githubusercontent.com/22441/189140305-3b7849dc-bd26-4059-bef4-bec6549ac5a7.png)
 
