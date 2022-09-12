@@ -36,7 +36,7 @@ configure marmot:
  - `replicate` - A comma seperated list of tables to replicate with no spaces in between (e.g. news,history) 
    (default: [empty])
  - `node-id` - An ID number (positive integer) to represent an ID for this node, this is required to be a unique
-   number per node, and used for consensus protocol. (default)
+   number per node, and used for consensus protocol. (default: 0)
  - `bind` - A `host:port` combination of listen for other nodes on (default: `0.0.0.0:8610`)
  - `raft-path` - Path of directory to save consensus related logs, states, and snapshots (default: `/tmp/raft`)
  - `shards` - Number of shards over which the tables will be replicated on, marmot uses shards to distribute the 
