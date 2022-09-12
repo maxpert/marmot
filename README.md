@@ -34,7 +34,8 @@ configure marmot:
  - `db-path` - Path to DB from which given tables will be replicated. These tables can be specified in `replicate`
    option. (default: `/tmp/marmot.db`)
  - `replicate` - A comma seperated list of tables to replicate with no spaces in between (e.g. news,history) 
-   (default: [empty])
+   (default: [empty]) **DEPRECATED after 0.3.11 now all tables are parsed and listed, this is required for
+   snapshots to recover quickly**
  - `node-id` - An ID number (positive integer) to represent an ID for this node, this is required to be a unique
    number per node, and used for consensus protocol. (default: 0)
  - `bind` - A `host:port` combination of listen for other nodes on (default: `0.0.0.0:8610`)

@@ -23,7 +23,7 @@ INSERT OR REPLACE INTO main.%[1]s(%[2]s)
 SELECT %[2]s FROM backup.%[1]s 
 LIMIT %[3]d OFFSET %[4]d;`
 
-const batchSize = 1000
+var MarmotPrefix = "__marmot__"
 
 type SqliteStreamDB struct {
 	*goqu.Database
@@ -52,6 +52,31 @@ type ColumnInfo struct {
 	IsPrimaryKey bool   `db:"pk"`
 }
 
+func GetAllDBTables(path string) ([]string, error) {
+	connectionStr := fmt.Sprintf("%s?_journal_mode=wal", path)
+	conn, rawConn, err := OpenRaw(connectionStr)
+	if err != nil {
+		return nil, err
+	}
+	defer rawConn.Close()
+	defer conn.Close()
+
+	gSQL := goqu.New("sqlite", conn)
+
+	names := make([]string, 0)
+	err = gSQL.Select("name").From("sqlite_schema").Where(
+		goqu.C("type").Eq("table"),
+		goqu.C("name").NotLike("sqlite_%"),
+		goqu.C("name").NotLike(MarmotPrefix+"%"),
+	).ScanVals(&names)
+
+	if err != nil {
+		return nil, err
+	}
+
+	return names, nil
+}
+
 func OpenStreamDB(path string, tables []string) (*SqliteStreamDB, error) {
 	connectionStr := fmt.Sprintf("%s?_journal_mode=wal", path)
 	conn, rawConn, err := OpenRaw(connectionStr)
@@ -77,7 +102,7 @@ func OpenStreamDB(path string, tables []string) (*SqliteStreamDB, error) {
 		rawConnection:     rawConn,
 		watcher:           watcher,
 		dbPath:            path,
-		prefix:            "__marmot__",
+		prefix:            MarmotPrefix,
 		publishLock:       &sync.Mutex{},
 		watchTablesSchema: map[string][]*ColumnInfo{},
 	}

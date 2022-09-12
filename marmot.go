@@ -5,7 +5,6 @@ import (
 	"flag"
 	"fmt"
 	"math/rand"
-	"strings"
 	"time"
 
 	"github.com/maxpert/marmot/db"
@@ -25,7 +24,6 @@ func main() {
 	bindAddress := flag.String("bind", "0.0.0.0:8160", "Bind address for Raft server")
 	bindPane := flag.String("bind-pane", "localhost:6010", "Bind address for control pane server")
 	initialAddrs := flag.String("bootstrap", "", "<CLUSTER_ID>@IP:PORT list of initial nodes separated by comma (,)")
-	tables := flag.String("replicate", "", "List of tables to replicate seperated by comma (,)")
 	verbose := flag.Bool("verbose", false, "Log debug level")
 	flag.Parse()
 
@@ -35,12 +33,8 @@ func main() {
 		log.Logger = log.Level(zerolog.InfoLevel)
 	}
 
-	tableNames := strings.Split(*tables, ",")
-	if tableNames[0] == "" {
-		tableNames = make([]string, 0)
-	}
-
 	log.Debug().Str("path", *dbPathString).Msg("Opening database")
+	tableNames, err := db.GetAllDBTables(*dbPathString)
 	srcDb, err := db.OpenStreamDB(*dbPathString, tableNames)
 	if err != nil {
 		log.Error().Err(err).Msg("Unable to open database")
