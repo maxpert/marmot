@@ -297,7 +297,7 @@ func (conn *SqliteStreamDB) consumeChangeLogs(tableName string, changes []*chang
 			})
 
 			if err != nil {
-				logger.Error().Err(err).Msg("Change failed to notify on change")
+				logger.Error().Err(err).Msg("Failed to acquire consensus")
 				return err
 			}
 		}

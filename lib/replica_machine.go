@@ -71,6 +71,7 @@ func (ssm *SQLiteStateMachine) Update(entries []sm.Entry) ([]sm.Entry, error) {
 	for _, entry := range entries {
 		event := &ReplicationEvent[db.ChangeLogEvent]{}
 		if err := event.Unmarshal(entry.Cmd); err != nil {
+			log.Error().Err(err).Msg("Unable to unmarshal command")
 			return nil, err
 		}
 
