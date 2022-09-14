@@ -41,11 +41,13 @@ configure marmot:
    number per node, and used for consensus protocol. (default: 0)
  - `bind` - A `host:port` combination of listen for other nodes on (default: `0.0.0.0:8610`)
  - `raft-path` - Path of directory to save consensus related logs, states, and snapshots (default: `/tmp/raft`)
- - `shards` - Number of shards over which the tables will be replicated on, marmot uses shards to distribute the 
-   ownership of replication. Which allows you to distribute load over multiple nodes rather than single master. 
-   By default, there are 16 shards which means you should be easily able to have upto 16 master nodes. Beyond
-   that you should this flag to have a bigger cluster. Higher shards also mean more disk space, and memory 
-   usage per node. Ideally these shards should be elastic (to be implemented). 
+ - `shards` - Number of shards over which the database tables replication will be distributed on. It serves as mechanism for
+   consistently hashing leader from Hash(<table_name> + <primary/composite_key>) for all the nodes. These partitions can
+   be assigned to various nodes in cluster which allows you to distribute leadership load over multiple nodes rather 
+   than single master. By default, there are 16 shards which means you should be easily able to have upto 16 leader 
+   nodes. Beyond that you should use this flag to create a bigger cluster. Higher shards also mean more disk space, 
+   and memory usage per node. Marmot has basic a very rough version of adding shards, via control pane, but it
+   needs more polishing to make it idiot-proof.
  - `bootstrap` - A comma seperated list of initial bootstrap nodes `<node_id>@<ip>:<port>` (e.g. 
    `2@127.0.0.1:8162,3@127.0.0.1:8163` will specify 2 bootstrap nodes for cluster).
  - `bind-pane` - A `host:port` combination for control panel address (default: `localhost:6010`). All the endpoints
