@@ -56,6 +56,7 @@ configure marmot:
    will serve as full control panel hosting and cluster management API. **EXPERIMENTAL**
  - `verbose` - Specify if system should dump debug logs on console as well. Only use this for debugging. 
 
+For more details and internal workings of marmot [go to these docs](https://github.com/maxpert/marmot/blob/master/docs/overview.md).
 
 ## Limitations
 Right now there are a few limitations on current solution:
