@@ -211,7 +211,10 @@ func (conn *SqliteStreamDB) publishChangeLog() {
 			if err != nil {
 				log.Warn().Err(err).Msg("Unable to cleanup change logs")
 			} else if cnt > int64(0) {
-				log.Info().Int64("cleaned", cnt).Uint64("published", processed).Msg("Rows published")
+				log.Debug().
+					Int64("cleaned", cnt).
+					Uint64("published", processed).
+					Msg("Rows published")
 			}
 		}
 
