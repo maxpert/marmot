@@ -6,7 +6,7 @@ A distributed SQLite replicator.
 ## What is it useful for right now?
 If you are using SQLite as ephemeral storage, or a scenario where eventual consistency is fine for you.
 Marmot can give you a solid replication between your nodes as Marmot builds on top of fault-tolerant
-consensus protocol (Multi-Group Raft), thus allowing robust recovery and replication. This means 
+consensus protocol ([Multi-Raft](https://tikv.org/deep-dive/scalability/multi-raft/)), thus allowing robust recovery and replication. This means 
 if you are running a medium traffic website based on SQLite you should be easily able to handle 
 load without any problems. Read heavy workloads won't be bottle-neck at all.
 
@@ -44,7 +44,15 @@ configure marmot:
  - `node-id` - An ID number (positive integer) to represent an ID for this node, this is required to be a unique
    number per node, and used for consensus protocol. (default: 0)
  - `bind` - A `host:port` combination of listen for other nodes on (default: `0.0.0.0:8610`)
- - `raft-path` - Path of directory to save consensus related logs, states, and snapshots (default: `/tmp/raft`)
+ - `
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ -path` - Path of directory to save consensus related logs, states, and snapshots (default: `/tmp/raft`)
  - `shards` - Number of shards over which the database tables replication will be distributed on. It serves as mechanism for
    consistently hashing leader from Hash(<table_name> + <primary/composite_key>) for all the nodes. These partitions can
    be assigned to various nodes in cluster which allows you to distribute leadership load over multiple nodes rather 
