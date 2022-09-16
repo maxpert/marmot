@@ -27,7 +27,7 @@ build/marmot -bootstrap 1@127.0.0.1:8161 -bind 127.0.0.1:8162 -bind-pane localho
 
 ## Demos
 
- - [Scaling Pocketbase with Marmot](https://studio.youtube.com/video/VSa-VJso050)
+ - [Scaling Pocketbase with Marmot](https://youtube.com/video/VSa-VJso050)
 
 ## Documentation
 
