@@ -6,9 +6,15 @@ A distributed SQLite replicator.
 ## What is it useful for right now?
 If you are using SQLite as ephemeral storage, or a scenario where eventual consistency is fine for you.
 Marmot can give you a solid replication between your nodes as Marmot builds on top of fault-tolerant
-consensus protocol ([Multi-Raft](https://tikv.org/deep-dive/scalability/multi-raft/)), thus allowing robust recovery and replication. This means 
-if you are running a medium traffic website based on SQLite you should be easily able to handle 
-load without any problems. Read heavy workloads won't be bottle-neck at all.
+consensus protocol ([Multi-Raft](https://tikv.org/deep-dive/scalability/multi-raft/)), thus allowing 
+robust recovery and replication. This means if you are running a medium traffic website based on 
+SQLite you should be easily able to handle load without any problems. Read heavy workloads won't 
+be bottle-necked at all as Marmot serves as a side car letting you build replication cluster
+without making any changes to your application code, and allows you to keep using to your
+SQLite database file. In a typical setting your setup would look like this:
+
+![image](https://user-images.githubusercontent.com/22441/190715676-8b785596-f267-49a3-aa27-21afbe74d0be.png)
+
 
 ## Running
 
