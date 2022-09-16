@@ -25,6 +25,10 @@ build/marmot -bootstrap 2@127.0.0.1:8162 -bind 127.0.0.1:8161 -bind-pane localho
 build/marmot -bootstrap 1@127.0.0.1:8161 -bind 127.0.0.1:8162 -bind-pane localhost:6002 -node-id 2 -db-path /tmp/cache-2.db
 ```
 
+## Demos
+
+ - [Scaling Pocketbase with Marmot](https://studio.youtube.com/video/VSa-VJso050)
+
 ## Documentation
 
 Marmot is picks simplicity, and lesser knobs to configure by choice. Here are command line options you can use to
