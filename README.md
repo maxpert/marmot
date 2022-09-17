@@ -19,7 +19,8 @@ SQLite database file. In a typical setting your setup would look like this:
 
 **MARMOT IS STILL EARLY FOR PRODUCTION USAGE WHERE DB CORRUPTION IS UNACCEPTABLE. USE IT FOR EPHEMERAL STORAGE USE CASE ONLY WHERE LOOSING DATA OR CORRUPTION OF DB FILE IS NOT AN ISSUE.**
 
-Being used for ephemeral cache storage in production services, on a very read heavy site.
+Right now it's being used for ephemeral cache storage in production services, on a very read heavy site. This easily replicates cache values across
+the cluster, keeping a fast local copy of cache database.
 
 ## Running
 
