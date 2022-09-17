@@ -86,6 +86,7 @@ Right now there are a few limitations on current solution:
 
 ## Production status
 
+**NOTICE: MARMOT IS STILL EARLY FOR PRODUCTION USAGE. USE IT FOR EPHEMERAL STORAGE USE CASE ONLY WHERE LOOSING DATA OR CORRUPTION OF DB FILE IS NOT AN ISSUE. SNAPSHOT SAVE/RESTORE AND COMPACTION STILL NEEDS MORE TESTING.**
 Being used for ephemeral cache storage in production services, on a very read heavy site. 
 You can view my personal [status board here](https://sibte.notion.site/Marmot-056983fad27a49d4a16fb91031e6ab98). 
 Here is an image from a production server running Marmot:
