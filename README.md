@@ -15,6 +15,11 @@ SQLite database file. In a typical setting your setup would look like this:
 
 ![image](https://user-images.githubusercontent.com/22441/190715676-8b785596-f267-49a3-aa27-21afbe74d0be.png)
 
+## Production status
+
+**MARMOT IS STILL EARLY FOR PRODUCTION USAGE WHERE DB CORRUPTION IS UNACCEPTABLE. USE IT FOR EPHEMERAL STORAGE USE CASE ONLY WHERE LOOSING DATA OR CORRUPTION OF DB FILE IS NOT AN ISSUE.**
+
+Being used for ephemeral cache storage in production services, on a very read heavy site.
 
 ## Running
 
@@ -50,15 +55,7 @@ configure marmot:
  - `node-id` - An ID number (positive integer) to represent an ID for this node, this is required to be a unique
    number per node, and used for consensus protocol. (default: 0)
  - `bind` - A `host:port` combination of listen for other nodes on (default: `0.0.0.0:8610`)
- - `
- 
- 
- 
- 
- 
- 
- 
- -path` - Path of directory to save consensus related logs, states, and snapshots (default: `/tmp/raft`)
+ - `raft-path` - Path of directory to save consensus related logs, states, and snapshots (default: `/tmp/raft`)
  - `shards` - Number of shards over which the database tables replication will be distributed on. It serves as mechanism for
    consistently hashing leader from Hash(<table_name> + <primary/composite_key>) for all the nodes. These partitions can
    be assigned to various nodes in cluster which allows you to distribute leadership load over multiple nodes rather 
@@ -81,17 +78,10 @@ Right now there are a few limitations on current solution:
  - You can't watch tables selectively on a DB. This is due to various limitations around snapshot and restore mechanism.
  - WAL mode required - since your DB is going to be processed by multiple process the only way to have multi-process 
    changes reliably is via WAL. 
- - Booting off a snapshot is WIP so there might be problems in cold start yet. However, if you can have start off node
-   with same copies of DB it will work flawlessly. 
-
-## Production status
-
-**NOTICE: MARMOT IS STILL EARLY FOR PRODUCTION USAGE. USE IT FOR EPHEMERAL STORAGE USE CASE ONLY WHERE LOOSING DATA OR CORRUPTION OF DB FILE IS NOT AN ISSUE. SNAPSHOT SAVE/RESTORE AND COMPACTION STILL NEEDS MORE TESTING.**
-Being used for ephemeral cache storage in production services, on a very read heavy site. 
-You can view my personal [status board here](https://sibte.notion.site/Marmot-056983fad27a49d4a16fb91031e6ab98). 
-Here is an image from a production server running Marmot:
-
-![image](https://user-images.githubusercontent.com/22441/189140305-3b7849dc-bd26-4059-bef4-bec6549ac5a7.png)
+ - Downloading snapshots of database is still WIP. However, if you can have start off node with same copies of DB it will 
+   work flawlessly.
+ - Marmot is eventually consistent. This simply means rows can get synced out of order, and `SERIALIZABLE` assumptions 
+   on transactions might not hold true anymore.
 
 ## FAQs
 
