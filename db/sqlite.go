@@ -289,23 +289,27 @@ func (conn *SqliteStreamDB) RestoreFrom(bkFilePath string) error {
 	// else is modifying or interacting with DB
 	return sgSQL.WithTx(func(_ *goqu.TxDatabase) error {
 		return dgSQL.WithTx(func(_ *goqu.TxDatabase) error {
-			fi, err := os.OpenFile(bkFilePath, os.O_RDWR, 0)
-			if err != nil {
-				return err
-			}
-			defer fi.Close()
-
-			fo, err := os.OpenFile(conn.dbPath, os.O_WRONLY, 0)
-			if err != nil {
-				return err
-			}
-			defer fo.Close()
-
-			bytesWritten, err := io.Copy(fo, fi)
-			log.Debug().Int64("bytes", bytesWritten).Msg("Backup bytes copied...")
-			return err
+			return copyFile(bkFilePath, conn.dbPath)
 		})
 	})
+}
+
+func copyFile(fromPath, toPath string) error {
+	fi, err := os.OpenFile(fromPath, os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	defer fi.Close()
+
+	fo, err := os.OpenFile(toPath, os.O_WRONLY, 0)
+	if err != nil {
+		return err
+	}
+	defer fo.Close()
+
+	bytesWritten, err := io.Copy(fo, fi)
+	log.Debug().Int64("bytes", bytesWritten).Msg("Backup bytes copied...")
+	return err
 }
 
 func (conn *SqliteStreamDB) GetRawConnection() *sqlite3.SQLiteConn {

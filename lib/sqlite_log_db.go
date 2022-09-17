@@ -363,13 +363,16 @@ func (s *SQLiteLogDB) CompactEntriesTo(clusterID uint64, nodeID uint64, index ui
 
 	defer func() {
 		var rows *sql.Rows
+		var err error
+
 		for {
 			if rows != nil {
 				_ = rows.Close()
 			}
 
-			rows, err := s.db.Query("PRAGMA wal_checkpoint(TRUNCATE)")
+			rows, err = s.db.Query("PRAGMA wal_checkpoint(TRUNCATE)")
 			if err != nil {
+				log.Error().Err(err).Msg("Unable to compact checkpoint")
 				break
 			}
 
@@ -378,18 +381,24 @@ func (s *SQLiteLogDB) CompactEntriesTo(clusterID uint64, nodeID uint64, index ui
 			var busy, logi, checkpointed int64
 			err = rows.Scan(&busy, &logi, &checkpointed)
 			if err != nil {
+				log.Error().Err(err).Msg("Unable to read checkpoint data")
 				break
 			}
 
 			if busy == 0 {
+				log.Info().
+					Int64("log_index", logi).
+					Int64("checkpointed", checkpointed).
+					Msg("Checkpoint complete")
 				break
 			}
 
-			_ = rows.Close()
-			time.Sleep(100 * time.Millisecond)
+			time.Sleep(200 * time.Millisecond)
 		}
 
-		_ = rows.Close()
+		if rows != nil {
+			_ = rows.Close()
+		}
 		close(ch)
 	}()
 
