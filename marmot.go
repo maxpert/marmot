@@ -15,7 +15,7 @@ import (
 )
 
 func main() {
-	cleanup := flag.Bool("cleanup", false, "Cleanup all hooks and tables")
+	cleanup := flag.Bool("cleanup", false, "Cleanup all trigger hooks for marmot")
 	dbPathString := flag.String("db-path", "/tmp/marmot.db", "Path to SQLite database")
 	metaPath := flag.String("raft-path", "/tmp/raft", "Path to save raft information")
 	nodeID := flag.Uint64("node-id", rand.Uint64(), "Node ID")
@@ -41,14 +41,14 @@ func main() {
 		return
 	}
 
-	err = srcDb.RemoveCDC()
-	if err != nil {
-		log.Panic().Err(err).Msg("Unable to clean up...")
-	} else {
-		log.Info().Msg("Cleanup complete...")
-	}
-
 	if *cleanup {
+		err = srcDb.RemoveCDC(true)
+		if err != nil {
+			log.Panic().Err(err).Msg("Unable to clean up...")
+		} else {
+			log.Info().Msg("Cleanup complete...")
+		}
+
 		return
 	}
 

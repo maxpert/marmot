@@ -10,7 +10,7 @@ import (
 const deleteTriggerQuery = `DROP TRIGGER IF EXISTS %s`
 const deleteMarmotTables = `DROP TABLE IF EXISTS %s;`
 
-func cleanMarmotTablesAndTriggers(conn *goqu.Database, prefix string) error {
+func cleanMarmotTriggers(conn *goqu.Database, prefix string) error {
 	triggers := make([]string, 0)
 	err := conn.
 		Select("name").
@@ -27,11 +27,16 @@ func cleanMarmotTablesAndTriggers(conn *goqu.Database, prefix string) error {
 		_, err = conn.Exec(query)
 		if err != nil {
 			log.Error().Err(err).Str("name", name).Msg("Unable to delete trigger")
+			return err
 		}
 	}
 
+	return nil
+}
+
+func clearMarmotTables(conn *goqu.Database, prefix string) error {
 	tables := make([]string, 0)
-	err = conn.
+	err := conn.
 		Select("name").
 		From("sqlite_master").
 		Where(goqu.And(goqu.Ex{"type": "table"}, goqu.C("name").Like(prefix+"%"))).
@@ -46,6 +51,7 @@ func cleanMarmotTablesAndTriggers(conn *goqu.Database, prefix string) error {
 		_, err = conn.Exec(query)
 		if err != nil {
 			log.Error().Err(err).Msg("Unable to delete marmot tables")
+			return err
 		}
 	}
 

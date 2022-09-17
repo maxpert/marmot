@@ -1,6 +1,5 @@
 {{$ChangeLogTableName := (printf "%s%s_change_log" .Prefix .TableName)}}
 
-DROP TABLE IF EXISTS {{$ChangeLogTableName}};
 CREATE TABLE IF NOT EXISTS {{$ChangeLogTableName}} (
     id   INTEGER PRIMARY KEY AUTOINCREMENT,
 {{range $index, $col := .Columns}}
