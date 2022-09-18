@@ -139,7 +139,7 @@ func OpenRaw(dns string) (*sql.DB, *sqlite3.SQLiteConn, error) {
 	return conn, rawConn, nil
 }
 
-func (conn *SqliteStreamDB) StartWatching() error {
+func (conn *SqliteStreamDB) InstallCDC() error {
 	for tableName := range conn.watchTablesSchema {
 		err := conn.initTriggers(tableName)
 		if err != nil {
@@ -287,11 +287,32 @@ func (conn *SqliteStreamDB) RestoreFrom(bkFilePath string) error {
 	// Source locking is required so that any lock related metadata is mirrored in destination
 	// Transacting on both src and dest in immediate mode makes sure nobody
 	// else is modifying or interacting with DB
-	return sgSQL.WithTx(func(_ *goqu.TxDatabase) error {
+	err = sgSQL.WithTx(func(_ *goqu.TxDatabase) error {
 		return dgSQL.WithTx(func(_ *goqu.TxDatabase) error {
-			return copyFile(bkFilePath, conn.dbPath)
+			err := copyFile(conn.dbPath, bkFilePath)
+			if err != nil {
+				return err
+			}
+
+			err = copyFile(conn.dbPath+"-wal", bkFilePath+"-wal")
+			if err != nil {
+				return err
+			}
+
+			err = copyFile(conn.dbPath+"-shm", bkFilePath+"-shm")
+			if err != nil {
+				return err
+			}
+
+			return nil
 		})
 	})
+
+	if err != nil {
+		return err
+	}
+
+	return conn.InstallCDC()
 }
 
 func (conn *SqliteStreamDB) GetRawConnection() *sqlite3.SQLiteConn {
@@ -343,7 +364,7 @@ func (e *ChangeLogEvent) Hash() (uint64, error) {
 	return hasher.Sum64(), nil
 }
 
-func copyFile(fromPath, toPath string) error {
+func copyFile(toPath, fromPath string) error {
 	fi, err := os.OpenFile(fromPath, os.O_RDWR, 0)
 	if err != nil {
 		return err
@@ -357,6 +378,10 @@ func copyFile(fromPath, toPath string) error {
 	defer fo.Close()
 
 	bytesWritten, err := io.Copy(fo, fi)
-	log.Debug().Int64("bytes", bytesWritten).Msg("Backup bytes copied...")
+	log.Debug().
+		Int64("bytes", bytesWritten).
+		Str("from", fromPath).
+		Str("to", toPath).
+		Msg("copyFile")
 	return err
 }

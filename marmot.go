@@ -69,7 +69,7 @@ func main() {
 
 	srcDb.OnChange = onTableChanged(nodeID, raft)
 	log.Info().Msg("Starting change data capture pipeline...")
-	if err := srcDb.StartWatching(); err != nil {
+	if err := srcDb.InstallCDC(); err != nil {
 		log.Error().Err(err).Msg("Unable to install change data capture pipeline")
 		return
 	}
