@@ -140,7 +140,7 @@ func (c *ControlPane) restoreSnapshotFrom(g *gin.Context) {
 		return
 	}
 
-	err = c.raft.stateMachine.DB.RestoreFrom(tmpPath)
+	err = c.raft.GetSnapshotStateMachine().DB.RestoreFrom(tmpPath)
 	if err != nil {
 		g.AbortWithError(500, err)
 		return

@@ -20,17 +20,20 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-type RaftServer struct {
-	bindAddress  string
-	nodeID       uint64
-	metaPath     string
-	lock         *sync.RWMutex
-	stateMachine *SQLiteStateMachine
-	nodeHost     *dragonboat.NodeHost
+var MaxLogEntries = uint64(10_000)
 
-	nodeUser   map[uint64]dragonboat.INodeUser
-	nodeMap    map[uint64]map[uint64]uint64
-	clusterMap map[uint64]uint64
+type RaftServer struct {
+	bindAddress string
+	nodeID      uint64
+	metaPath    string
+	lock        *sync.RWMutex
+	nodeHost    *dragonboat.NodeHost
+	database    *db.SqliteStreamDB
+
+	clusterStateMachine map[uint64]*SQLiteStateMachine
+	nodeUser            map[uint64]dragonboat.INodeUser
+	nodeMap             map[uint64]map[uint64]uint64
+	clusterMap          map[uint64]uint64
 }
 
 func NewRaftServer(
@@ -48,14 +51,16 @@ func NewRaftServer(
 	logger.GetLogger("config").SetLevel(logger.WARNING)
 
 	return &RaftServer{
-		bindAddress:  bindAddress,
-		nodeID:       nodeID,
-		metaPath:     metaPath,
-		stateMachine: NewDBStateMachine(nodeID, database, metaPath),
-		lock:         &sync.RWMutex{},
-		nodeUser:     map[uint64]dragonboat.INodeUser{},
-		clusterMap:   make(map[uint64]uint64),
-		nodeMap:      map[uint64]map[uint64]uint64{},
+		bindAddress: bindAddress,
+		nodeID:      nodeID,
+		database:    database,
+		metaPath:    metaPath,
+		lock:        &sync.RWMutex{},
+
+		nodeUser:            map[uint64]dragonboat.INodeUser{},
+		clusterMap:          make(map[uint64]uint64),
+		nodeMap:             map[uint64]map[uint64]uint64{},
+		clusterStateMachine: map[uint64]*SQLiteStateMachine{},
 	}
 }
 
@@ -91,9 +96,6 @@ func (r *RaftServer) BindCluster(initMembers string, join bool, clusterIDs ...ui
 		initialMembers[r.nodeID] = r.bindAddress
 	}
 
-	r.lock.Lock()
-	defer r.lock.Unlock()
-
 	for _, clusterID := range clusterIDs {
 		cfg := r.config(clusterID)
 		log.Debug().
@@ -104,8 +106,6 @@ func (r *RaftServer) BindCluster(initMembers string, join bool, clusterIDs ...ui
 		if err != nil {
 			return err
 		}
-
-		r.clusterMap[clusterID] = 0
 	}
 
 	return nil
@@ -179,6 +179,19 @@ func (r *RaftServer) ShuffleCluster(nodes ...uint64) error {
 					return err
 				}
 			}
+		}
+	}
+
+	return nil
+}
+
+func (r *RaftServer) GetSnapshotStateMachine() *SQLiteStateMachine {
+	r.lock.RLock()
+	defer r.lock.RUnlock()
+
+	for _, sm := range r.clusterStateMachine {
+		if sm.IsSnapshotEnabled() {
+			return sm
 		}
 	}
 
@@ -273,10 +286,6 @@ func (r *RaftServer) LeaderUpdated(info raftio.LeaderInfo) {
 	}
 }
 
-func (r *RaftServer) SnapshotCompleted() bool {
-	return r.stateMachine.HasRestoredSnapshot() || r.stateMachine.HasSavedSnapshot()
-}
-
 func (r *RaftServer) mutateNodeMap(nodeID uint64, f func(map[uint64]uint64)) {
 	m, ok := r.nodeMap[nodeID]
 	if !ok {
@@ -291,28 +300,18 @@ func (r *RaftServer) mutateNodeMap(nodeID uint64, f func(map[uint64]uint64)) {
 	}
 }
 
-func (r *RaftServer) stateMachineFactory(_ uint64, _ uint64) statemachine.IOnDiskStateMachine {
-	return r.stateMachine
-}
+func (r *RaftServer) stateMachineFactory(clusterID uint64, nodeID uint64) statemachine.IOnDiskStateMachine {
+	r.lock.Lock()
+	defer r.lock.Unlock()
 
-func parsePeersMap(peersAddrs string) map[uint64]string {
-	peersMap := make(map[uint64]string)
-	if peersAddrs == "" {
-		return peersMap
+	firstNode := len(r.clusterStateMachine) == 0
+	sm, ok := r.clusterStateMachine[clusterID]
+	if !ok {
+		sm = NewDBStateMachine(clusterID, nodeID, r.database, r.metaPath, firstNode)
+		r.clusterStateMachine[clusterID] = sm
 	}
 
-	for _, peer := range strings.Split(peersAddrs, ",") {
-		peerInf := strings.Split(peer, "@")
-		peerShard, err := strconv.ParseUint(peerInf[0], 10, 64)
-		if err != nil {
-			continue
-		}
-
-		peersMap[peerShard] = peerInf[1]
-	}
-
-	log.Debug().Msg(fmt.Sprintf("Peer map %v", peersMap))
-	return peersMap
+	return sm
 }
 
 func (r *RaftServer) getNodeUser(clusterID uint64) (dragonboat.INodeUser, error) {
@@ -341,9 +340,29 @@ func (r *RaftServer) config(clusterID uint64) config.Config {
 		ElectionRTT:             10,
 		HeartbeatRTT:            1,
 		CheckQuorum:             true,
-		SnapshotEntries:         10_000,
+		SnapshotEntries:         MaxLogEntries,
 		CompactionOverhead:      0,
 		EntryCompressionType:    config.Snappy,
 		SnapshotCompressionType: config.Snappy,
 	}
+}
+
+func parsePeersMap(peersAddrs string) map[uint64]string {
+	peersMap := make(map[uint64]string)
+	if peersAddrs == "" {
+		return peersMap
+	}
+
+	for _, peer := range strings.Split(peersAddrs, ",") {
+		peerInf := strings.Split(peer, "@")
+		peerShard, err := strconv.ParseUint(peerInf[0], 10, 64)
+		if err != nil {
+			continue
+		}
+
+		peersMap[peerShard] = peerInf[1]
+	}
+
+	log.Debug().Msg(fmt.Sprintf("Peer map %v", peersMap))
+	return peersMap
 }

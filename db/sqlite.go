@@ -231,12 +231,7 @@ func (conn *SqliteStreamDB) BackupTo(bkFilePath string) error {
 	if err != nil {
 		return err
 	}
-
-	defer func() {
-		if err := src.Close(); err != nil {
-			log.Error().Err(err).Msg("Unable to close backup DB")
-		}
-	}()
+	defer src.Close()
 
 	_, err = src.Exec("VACUUM main INTO ?;", []driver.Value{bkFilePath})
 	if err != nil {

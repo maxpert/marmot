@@ -20,12 +20,15 @@ type indexState struct {
 }
 
 type SQLiteStateMachine struct {
-	NodeID        uint64
-	DB            *db.SqliteStreamDB
-	RaftPath      string
-	snapshotLock  *sync.Mutex
-	snapshotState snapshotState
-	indexState    *indexState
+	NodeID    uint64
+	ClusterID uint64
+	DB        *db.SqliteStreamDB
+	RaftPath  string
+
+	enableSnapshots bool
+	snapshotLock    *sync.Mutex
+	snapshotState   snapshotState
+	indexState      *indexState
 }
 
 type ReplicationEvent[T any] struct {
@@ -47,14 +50,22 @@ func (e *ReplicationEvent[T]) Unmarshal(data []byte) error {
 	return cbor.Unmarshal(data, e)
 }
 
-func NewDBStateMachine(nodeID uint64, db *db.SqliteStreamDB, path string) *SQLiteStateMachine {
+func NewDBStateMachine(
+	clusterID, nodeID uint64,
+	db *db.SqliteStreamDB,
+	path string,
+	enableSnapshots bool,
+) *SQLiteStateMachine {
 	return &SQLiteStateMachine{
-		DB:            db,
-		NodeID:        nodeID,
-		RaftPath:      path,
-		snapshotLock:  &sync.Mutex{},
-		snapshotState: 0,
-		indexState:    &indexState{Index: 0},
+		DB:        db,
+		NodeID:    nodeID,
+		ClusterID: clusterID,
+		RaftPath:  path,
+
+		enableSnapshots: enableSnapshots,
+		snapshotLock:    &sync.Mutex{},
+		snapshotState:   0,
+		indexState:      &indexState{Index: 0},
 	}
 }
 
@@ -103,8 +114,12 @@ func (ssm *SQLiteStateMachine) Sync() error {
 }
 
 func (ssm *SQLiteStateMachine) PrepareSnapshot() (interface{}, error) {
+	if !ssm.enableSnapshots {
+		return nil, nil
+	}
+
 	log.Debug().Msg("PrepareSnapshot")
-	bkFileDir, err := ssm.GetSnapshotDir()
+	bkFileDir, err := ssm.getSnapshotDir()
 	if err != nil {
 		return nil, err
 	}
@@ -119,6 +134,10 @@ func (ssm *SQLiteStateMachine) PrepareSnapshot() (interface{}, error) {
 }
 
 func (ssm *SQLiteStateMachine) SaveSnapshot(path interface{}, writer io.Writer, _ <-chan struct{}) error {
+	if !ssm.enableSnapshots {
+		return nil
+	}
+
 	ssm.snapshotLock.Lock()
 	defer ssm.snapshotLock.Unlock()
 	filepath, ok := path.(string)
@@ -142,8 +161,12 @@ func (ssm *SQLiteStateMachine) SaveSnapshot(path interface{}, writer io.Writer, 
 }
 
 func (ssm *SQLiteStateMachine) RecoverFromSnapshot(reader io.Reader, _ <-chan struct{}) error {
+	if !ssm.enableSnapshots {
+		return nil
+	}
+
 	log.Debug().Msg("RecoverFromSnapshot")
-	basePath, err := ssm.GetSnapshotDir()
+	basePath, err := ssm.getSnapshotDir()
 	if err != nil {
 		return err
 	}
@@ -178,15 +201,8 @@ func (ssm *SQLiteStateMachine) Lookup(_ interface{}) (interface{}, error) {
 	return 0, nil
 }
 
-func (ssm *SQLiteStateMachine) GetSnapshotDir() (string, error) {
-	tmpPath := path.Join(ssm.RaftPath, "marmot")
-	err := os.MkdirAll(tmpPath, 0744)
-	if err != nil {
-		log.Error().Err(err).Msg("Unable to create directory for snapshot")
-		return "", err
-	}
-
-	return tmpPath, nil
+func (ssm *SQLiteStateMachine) IsSnapshotEnabled() bool {
+	return ssm.enableSnapshots
 }
 
 func (ssm *SQLiteStateMachine) HasRestoredSnapshot() bool {
@@ -222,6 +238,17 @@ func (ssm *SQLiteStateMachine) importSnapshot(filepath string) error {
 	return nil
 }
 
+func (ssm *SQLiteStateMachine) getSnapshotDir() (string, error) {
+	tmpPath := path.Join(ssm.RaftPath, fmt.Sprintf("marmot-%d-%d", ssm.ClusterID, ssm.NodeID))
+	err := os.MkdirAll(tmpPath, 0744)
+	if err != nil {
+		log.Error().Err(err).Msg("Unable to create directory for snapshot")
+		return "", err
+	}
+
+	return tmpPath, nil
+}
+
 func (ssm *SQLiteStateMachine) cleanup(f *os.File, filepath string) {
 	if err := f.Close(); err != nil {
 		log.Warn().Err(err).Str("path", filepath).Msg("Unable to close snapshot file")
@@ -234,12 +261,11 @@ func (ssm *SQLiteStateMachine) cleanup(f *os.File, filepath string) {
 }
 
 func (ssm *SQLiteStateMachine) saveIndex() error {
-	basePath, err := ssm.GetSnapshotDir()
+	filepath, err := ssm.getIndexFilePath()
 	if err != nil {
 		return err
 	}
 
-	filepath := path.Join(basePath, "index.state")
 	fo, err := os.OpenFile(filepath, os.O_RDWR|os.O_CREATE|os.O_SYNC, 0644)
 	if err != nil {
 		return err
@@ -270,12 +296,11 @@ func (ssm *SQLiteStateMachine) saveIndex() error {
 }
 
 func (ssm *SQLiteStateMachine) readIndex() error {
-	basePath, err := ssm.GetSnapshotDir()
+	filepath, err := ssm.getIndexFilePath()
 	if err != nil {
 		return err
 	}
 
-	filepath := path.Join(basePath, "index.state")
 	fi, err := os.OpenFile(filepath, os.O_RDONLY, 0)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -297,4 +322,14 @@ func (ssm *SQLiteStateMachine) readIndex() error {
 	}
 
 	return nil
+}
+
+func (ssm *SQLiteStateMachine) getIndexFilePath() (string, error) {
+	basePath, err := ssm.getSnapshotDir()
+	if err != nil {
+		return "", err
+	}
+
+	filepath := path.Join(basePath, "current-index")
+	return filepath, nil
 }

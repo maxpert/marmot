@@ -15,7 +15,7 @@ func cleanMarmotTriggers(conn *goqu.Database, prefix string) error {
 	err := conn.
 		Select("name").
 		From("sqlite_master").
-		Where(goqu.And(goqu.Ex{"type": "trigger"}, goqu.C("name").Like(prefix+"%"))).
+		Where(goqu.C("type").Eq("trigger"), goqu.C("name").Like(prefix+"%")).
 		Prepared(true).
 		ScanVals(&triggers)
 	if err != nil {
@@ -39,7 +39,7 @@ func clearMarmotTables(conn *goqu.Database, prefix string) error {
 	err := conn.
 		Select("name").
 		From("sqlite_master").
-		Where(goqu.And(goqu.Ex{"type": "table"}, goqu.C("name").Like(prefix+"%"))).
+		Where(goqu.C("type").Eq("table"), goqu.C("name").Like(prefix+"%")).
 		Prepared(true).
 		ScanVals(&tables)
 	if err != nil {

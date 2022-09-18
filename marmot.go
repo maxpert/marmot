@@ -65,6 +65,11 @@ func main() {
 		if err != nil {
 			log.Panic().Err(err).Msg("Unable to start Raft")
 		}
+
+		log.Info().Msg("Waiting for cluster to come up...")
+		for uint64(len(raft.GetActiveClusters())) != *shards {
+			time.Sleep(500 * time.Millisecond)
+		}
 	}
 
 	srcDb.OnChange = onTableChanged(nodeID, raft)
