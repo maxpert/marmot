@@ -15,8 +15,13 @@ import (
 
 type snapshotState = uint8
 
-type indexState struct {
+type appliedIndexInfo struct {
 	Index uint64
+}
+
+type stateSaveInfo struct {
+	appliedIndex appliedIndexInfo
+	dbPath       string
 }
 
 type SQLiteStateMachine struct {
@@ -28,7 +33,7 @@ type SQLiteStateMachine struct {
 	enableSnapshots bool
 	snapshotLock    *sync.Mutex
 	snapshotState   snapshotState
-	indexState      *indexState
+	applied         *appliedIndexInfo
 }
 
 type ReplicationEvent[T any] struct {
@@ -64,8 +69,8 @@ func NewDBStateMachine(
 
 		enableSnapshots: enableSnapshots,
 		snapshotLock:    &sync.Mutex{},
-		snapshotState:   0,
-		indexState:      &indexState{Index: 0},
+		snapshotState:   snapshotNotInitialized,
+		applied:         &appliedIndexInfo{Index: 0},
 	}
 }
 
@@ -75,7 +80,7 @@ func (ssm *SQLiteStateMachine) Open(_ <-chan struct{}) (uint64, error) {
 		return 0, err
 	}
 
-	return ssm.indexState.Index, nil
+	return ssm.applied.Index, nil
 }
 
 func (ssm *SQLiteStateMachine) Update(entries []sm.Entry) ([]sm.Entry, error) {
@@ -98,12 +103,12 @@ func (ssm *SQLiteStateMachine) Update(entries []sm.Entry) ([]sm.Entry, error) {
 			return nil, err
 		}
 
-		ssm.indexState.Index = entry.Index
+		ssm.applied.Index = entry.Index
 		if err := ssm.saveIndex(); err != nil {
 			return nil, err
 		}
 
-		entry.Result = sm.Result{Value: 0}
+		entry.Result = sm.Result{Value: entry.Index}
 	}
 
 	return entries, nil
@@ -114,11 +119,16 @@ func (ssm *SQLiteStateMachine) Sync() error {
 }
 
 func (ssm *SQLiteStateMachine) PrepareSnapshot() (interface{}, error) {
+	log.Debug().
+		Uint64("cluster", ssm.ClusterID).
+		Uint64("node", ssm.NodeID).
+		Bool("enabled", ssm.enableSnapshots).
+		Msg("Preparing snapshot...")
+
 	if !ssm.enableSnapshots {
-		return nil, nil
+		return stateSaveInfo{dbPath: "", appliedIndex: *ssm.applied}, nil
 	}
 
-	log.Debug().Msg("PrepareSnapshot")
 	bkFileDir, err := ssm.getSnapshotDir()
 	if err != nil {
 		return nil, err
@@ -130,71 +140,116 @@ func (ssm *SQLiteStateMachine) PrepareSnapshot() (interface{}, error) {
 		return nil, err
 	}
 
-	return bkFilePath, nil
+	return stateSaveInfo{dbPath: bkFilePath, appliedIndex: *ssm.applied}, nil
 }
 
-func (ssm *SQLiteStateMachine) SaveSnapshot(path interface{}, writer io.Writer, _ <-chan struct{}) error {
-	if !ssm.enableSnapshots {
-		return nil
+func (ssm *SQLiteStateMachine) SaveSnapshot(st interface{}, writer io.Writer, _ <-chan struct{}) error {
+	log.Debug().
+		Uint64("cluster", ssm.ClusterID).
+		Uint64("node", ssm.NodeID).
+		Bool("enabled", ssm.enableSnapshots).
+		Msg("Saving snapshot...")
+
+	stInfo, ok := st.(stateSaveInfo)
+	if !ok {
+		return fmt.Errorf(fmt.Sprintf("invalid save state info %v", st))
+	}
+
+	mBytes, err := cbor.Marshal(stInfo.appliedIndex)
+	err = writeUint32(writer, uint32(len(mBytes)))
+	if err != nil {
+		return err
+	}
+
+	_, err = writer.Write(mBytes)
+	if err != nil {
+		return err
+	}
+
+	// Write length of filepath as indicator for following up stream
+	err = writeUint32(writer, uint32(len(stInfo.dbPath)))
+	if err != nil {
+		return err
+	}
+
+	if stInfo.dbPath != "" {
+		filepath := stInfo.dbPath
+		fi, err := os.Open(filepath)
+		if err != nil {
+			return err
+		}
+		defer ssm.cleanup(fi, filepath)
+
+		_, err = io.Copy(writer, fi)
+		if err != nil {
+			return err
+		}
 	}
 
 	ssm.snapshotLock.Lock()
 	defer ssm.snapshotLock.Unlock()
-	filepath, ok := path.(string)
-	if !ok {
-		return fmt.Errorf(fmt.Sprintf("invalid file path %v", path))
-	}
-
-	fi, err := os.Open(filepath)
-	if err != nil {
-		return err
-	}
-	defer ssm.cleanup(fi, filepath)
-
-	_, err = io.Copy(writer, fi)
-	if err != nil {
-		return err
-	}
-
 	ssm.snapshotState = snapshotSaved
 	return nil
 }
 
 func (ssm *SQLiteStateMachine) RecoverFromSnapshot(reader io.Reader, _ <-chan struct{}) error {
-	if !ssm.enableSnapshots {
-		return nil
-	}
+	log.Debug().
+		Uint64("cluster", ssm.ClusterID).
+		Uint64("node", ssm.NodeID).
+		Bool("enabled", ssm.enableSnapshots).
+		Msg("Recovering from snapshot...")
 
-	log.Debug().Msg("RecoverFromSnapshot")
-	basePath, err := ssm.getSnapshotDir()
+	appIndex := appliedIndexInfo{}
+	buffLen, err := readUint32(reader)
 	if err != nil {
 		return err
 	}
 
-	filepath := path.Join(basePath, "restore.sqlite")
-	fo, err := os.OpenFile(filepath, os.O_TRUNC|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		return err
-	}
-	defer ssm.cleanup(fo, filepath)
-
-	_, err = io.Copy(fo, reader)
+	dec := cbor.NewDecoder(io.LimitReader(reader, int64(buffLen)))
+	err = dec.Decode(&appIndex)
 	if err != nil {
 		return err
 	}
 
-	// Flush file contents before handing off
-	err = fo.Sync()
+	hasData, err := readUint32(reader)
 	if err != nil {
 		return err
 	}
 
-	err = ssm.importSnapshot(filepath)
-	if err != nil {
-		return err
+	ssm.snapshotLock.Lock()
+	defer ssm.snapshotLock.Unlock()
+	if hasData != 0 {
+		basePath, err := ssm.getSnapshotDir()
+		if err != nil {
+			return err
+		}
+
+		filepath := path.Join(basePath, "restore.sqlite")
+		fo, err := os.OpenFile(filepath, os.O_TRUNC|os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			return err
+		}
+		defer ssm.cleanup(fo, filepath)
+
+		_, err = io.Copy(fo, reader)
+		if err != nil {
+			return err
+		}
+
+		// Flush file contents before handing off
+		err = fo.Sync()
+		if err != nil {
+			return err
+		}
+
+		err = ssm.importSnapshot(filepath)
+		if err != nil {
+			return err
+		}
 	}
 
-	return nil
+	ssm.applied = &appIndex
+	return ssm.saveIndex()
 }
 
 func (ssm *SQLiteStateMachine) Lookup(_ interface{}) (interface{}, error) {
@@ -224,9 +279,6 @@ func (ssm *SQLiteStateMachine) Close() error {
 }
 
 func (ssm *SQLiteStateMachine) importSnapshot(filepath string) error {
-	ssm.snapshotLock.Lock()
-	defer ssm.snapshotLock.Unlock()
-
 	log.Info().Str("path", filepath).Msg("Importing...")
 	err := ssm.DB.RestoreFrom(filepath)
 	if err != nil {
@@ -277,7 +329,7 @@ func (ssm *SQLiteStateMachine) saveIndex() error {
 		return err
 	}
 
-	b, err := cbor.Marshal(ssm.indexState)
+	b, err := cbor.Marshal(ssm.applied)
 	if err != nil {
 		return err
 	}
@@ -292,6 +344,11 @@ func (ssm *SQLiteStateMachine) saveIndex() error {
 		return err
 	}
 
+	log.Debug().
+		Uint64("node_id", ssm.NodeID).
+		Uint64("cluster_id", ssm.ClusterID).
+		Uint64("index", ssm.applied.Index).
+		Msg("Saved index")
 	return nil
 }
 
@@ -316,7 +373,7 @@ func (ssm *SQLiteStateMachine) readIndex() error {
 		return err
 	}
 
-	err = cbor.Unmarshal(b, ssm.indexState)
+	err = cbor.Unmarshal(b, ssm.applied)
 	if err != nil {
 		return err
 	}

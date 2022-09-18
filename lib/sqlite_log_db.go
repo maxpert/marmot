@@ -475,10 +475,53 @@ func (s *SQLiteLogDB) ListSnapshots(clusterID uint64, nodeID uint64, index uint6
 
 func (s *SQLiteLogDB) ImportSnapshot(snp raftpb.Snapshot, nodeID uint64) error {
 	return s.db.WithTx(func(tx *goqu.TxDatabase) error {
-		err := saveInfoTuple(tx, &snp.Index, nodeID, snp.ClusterId, Snapshot, snp.Marshal)
+		if raftpb.IsEmptySnapshot(snp) {
+			return nil
+		}
+
+		// Replace Bootstrap
+		err := deleteInfoTuple(tx, nodeID, snp.ClusterId, Bootstrap, []goqu.Expression{})
 		if err != nil {
 			return err
 		}
+
+		bootstrap := raftpb.Bootstrap{
+			Join: true,
+			Type: snp.Type,
+		}
+		err = saveInfoTuple(tx, nil, nodeID, snp.ClusterId, Bootstrap, bootstrap.Marshal)
+		if err != nil {
+			return err
+		}
+
+		// Replace state
+		err = deleteInfoTuple(tx, nodeID, snp.ClusterId, State, []goqu.Expression{})
+		if err != nil {
+			return err
+		}
+
+		state := raftpb.State{
+			Term:   snp.Term,
+			Commit: snp.Index,
+		}
+		err = saveInfoTuple(tx, nil, nodeID, snp.ClusterId, State, state.Marshal)
+		if err != nil {
+			return err
+		}
+
+		// Delete snapshot log entries ahead of index
+		err = deleteInfoTuple(tx, nodeID, snp.ClusterId, Snapshot, []goqu.Expression{
+			goqu.C("entry_index").Gte(snp.Index),
+		})
+		if err != nil {
+			return err
+		}
+
+		err = saveInfoTuple(tx, &snp.Index, nodeID, snp.ClusterId, Snapshot, snp.Marshal)
+		if err != nil {
+			return err
+		}
+
 		return nil
 	})
 }

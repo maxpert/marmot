@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -69,16 +70,19 @@ func (r *RaftServer) Init() error {
 	defer r.lock.Unlock()
 
 	metaAbsPath := fmt.Sprintf("%s/node-%d", r.metaPath, r.nodeID)
-	factory := NewSQLiteLogDBFactory(r.metaPath, r.nodeID)
 	hostConfig := config.NodeHostConfig{
 		WALDir:            metaAbsPath,
 		NodeHostDir:       metaAbsPath,
 		RTTMillisecond:    300,
 		RaftAddress:       r.bindAddress,
 		RaftEventListener: r,
-		Expert: config.ExpertConfig{
+	}
+
+	if strings.ToLower(os.Getenv("SQLITE_LOG_STORE")) == "true" {
+		factory := NewSQLiteLogDBFactory(r.metaPath, r.nodeID)
+		hostConfig.Expert = config.ExpertConfig{
 			LogDBFactory: factory,
-		},
+		}
 	}
 
 	nodeHost, err := dragonboat.NewNodeHost(hostConfig)
@@ -304,10 +308,9 @@ func (r *RaftServer) stateMachineFactory(clusterID uint64, nodeID uint64) statem
 	r.lock.Lock()
 	defer r.lock.Unlock()
 
-	firstNode := len(r.clusterStateMachine) == 0
 	sm, ok := r.clusterStateMachine[clusterID]
 	if !ok {
-		sm = NewDBStateMachine(clusterID, nodeID, r.database, r.metaPath, firstNode)
+		sm = NewDBStateMachine(clusterID, nodeID, r.database, r.metaPath, clusterID == 1)
 		r.clusterStateMachine[clusterID] = sm
 	}
 
