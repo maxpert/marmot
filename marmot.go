@@ -21,6 +21,7 @@ func main() {
 	nodeID := flag.Uint64("node-id", rand.Uint64(), "Node ID")
 	followFlag := flag.Bool("follow", false, "Start Raft in follower mode")
 	shards := flag.Uint64("shards", 16, "Total number of shards for this instance")
+	maxLogEntries := flag.Uint64("max-log-entries", 1024, "Total number of log entries per shard before snapshotting")
 	bindAddress := flag.String("bind", "0.0.0.0:8160", "Bind address for Raft server")
 	bindPane := flag.String("bind-pane", "localhost:6010", "Bind address for control pane server")
 	initialAddrs := flag.String("bootstrap", "", "<CLUSTER_ID>@IP:PORT list of initial nodes separated by comma (,)")
@@ -52,6 +53,9 @@ func main() {
 		return
 	}
 
+	// Set max log entries from command line
+	lib.MaxLogEntries = *maxLogEntries
+
 	*metaPath = fmt.Sprintf("%s/node-%d", *metaPath, *nodeID)
 	raft := lib.NewRaftServer(*bindAddress, *nodeID, *metaPath, srcDb)
 	err = raft.Init()
@@ -72,7 +76,7 @@ func main() {
 		}
 	}
 
-	srcDb.OnChange = onTableChanged(nodeID, raft)
+	srcDb.OnChange = onTableChanged(raft, *nodeID, *shards)
 	log.Info().Msg("Starting change data capture pipeline...")
 	if err := srcDb.InstallCDC(); err != nil {
 		log.Error().Err(err).Msg("Unable to install change data capture pipeline")
@@ -85,10 +89,14 @@ func main() {
 	}
 }
 
-func onTableChanged(nodeID *uint64, raft *lib.RaftServer) func(event *db.ChangeLogEvent) error {
+func onTableChanged(raft *lib.RaftServer, nodeID uint64, shards uint64) func(event *db.ChangeLogEvent) error {
 	return func(event *db.ChangeLogEvent) error {
+		if uint64(len(raft.GetActiveClusters())) != shards {
+			return db.ErrLogNotReadyToPublish
+		}
+
 		ev := &lib.ReplicationEvent[db.ChangeLogEvent]{
-			FromNodeId: *nodeID,
+			FromNodeId: nodeID,
 			Payload:    event,
 		}
 

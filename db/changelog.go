@@ -18,7 +18,11 @@ import (
 	"github.com/samber/lo"
 )
 
+// ScanLimit is number of change log rows processed at a time, to limit memory usage
+const ScanLimit = uint(100)
+
 var ErrNoTableMapping = errors.New("no table mapping found")
+var ErrLogNotReadyToPublish = errors.New("not ready to publish changes")
 
 //go:embed table_change_log_script.tmpl
 var tableChangeLogScriptTemplate string
@@ -198,7 +202,6 @@ func (conn *SqliteStreamDB) watchChanges(path string) {
 
 func (conn *SqliteStreamDB) publishChangeLog() {
 	conn.publishLock.Lock()
-	scanLimit := uint(100)
 	processed := uint64(0)
 
 	// TODO: Move cleanup logic to time based cleanup
@@ -227,7 +230,7 @@ func (conn *SqliteStreamDB) publishChangeLog() {
 			return tx.Select("id", "type", "state").
 				From(conn.metaTable(tableName, changeLogName)).
 				Where(goqu.Ex{"state": Pending}).
-				Limit(scanLimit).
+				Limit(ScanLimit).
 				Prepared(true).
 				ScanStructs(&changes)
 		})
@@ -243,11 +246,15 @@ func (conn *SqliteStreamDB) publishChangeLog() {
 
 		err = conn.consumeChangeLogs(tableName, changes)
 		if err != nil {
+			if err == ErrLogNotReadyToPublish {
+				break
+			}
+
 			log.Error().Err(err).Msg("Unable to consume changes")
 		}
 
 		processed += uint64(len(changes))
-		if uint(len(changes)) <= scanLimit {
+		if uint(len(changes)) <= ScanLimit {
 			break
 		}
 	}
@@ -300,7 +307,11 @@ func (conn *SqliteStreamDB) consumeChangeLogs(tableName string, changes []*chang
 			})
 
 			if err != nil {
-				logger.Error().Err(err).Msg("Failed to acquire consensus")
+				if err == ErrLogNotReadyToPublish {
+					return err
+				}
+
+				logger.Error().Err(err).Msg("Failed to publish for table " + tableName)
 				return err
 			}
 		}

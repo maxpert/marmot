@@ -344,11 +344,6 @@ func (ssm *SQLiteStateMachine) saveIndex() error {
 		return err
 	}
 
-	log.Debug().
-		Uint64("node_id", ssm.NodeID).
-		Uint64("cluster_id", ssm.ClusterID).
-		Uint64("index", ssm.applied.Index).
-		Msg("Saved index")
 	return nil
 }
 
