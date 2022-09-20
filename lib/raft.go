@@ -245,14 +245,13 @@ func (r *RaftServer) GetClusterMap() map[uint64]uint64 {
 	return r.clusterMap
 }
 
-func (r *RaftServer) Propose(key uint64, data []byte, dur time.Duration) (*dragonboat.RequestResult, error) {
+func (r *RaftServer) Propose(clusterKey uint64, data []byte, dur time.Duration) (*dragonboat.RequestResult, error) {
 	clusterIds := r.GetActiveClusters()
-	clusterIndex := uint64(1)
 	if len(clusterIds) == 0 {
 		return nil, errors.New("cluster not ready")
 	}
 
-	clusterIndex = key % uint64(len(clusterIds))
+	clusterIndex := clusterKey % uint64(len(clusterIds))
 	clusterId := clusterIds[clusterIndex]
 	nodeUser, err := r.getNodeUser(clusterId)
 	if err != nil {

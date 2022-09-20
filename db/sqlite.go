@@ -4,24 +4,16 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"fmt"
-	"hash/fnv"
 	"io"
 	"os"
-	"sort"
 	"sync"
 	"time"
 
 	"github.com/doug-martin/goqu/v9"
 	"github.com/fsnotify/fsnotify"
-	"github.com/fxamacker/cbor/v2"
 	"github.com/mattn/go-sqlite3"
 	"github.com/rs/zerolog/log"
 )
-
-const restoreBackupSQL = `PRAGMA wal_checkpoint(TRUNCATE);
-INSERT OR REPLACE INTO main.%[1]s(%[2]s) 
-SELECT %[2]s FROM backup.%[1]s 
-LIMIT %[3]d OFFSET %[4]d;`
 
 var MarmotPrefix = "__marmot__"
 
@@ -34,14 +26,6 @@ type SqliteStreamDB struct {
 	publishLock       *sync.Mutex
 	watchTablesSchema map[string][]*ColumnInfo
 	OnChange          func(event *ChangeLogEvent) error
-}
-
-type ChangeLogEvent struct {
-	Id        int64
-	Type      string
-	TableName string
-	Row       map[string]any
-	tableInfo []*ColumnInfo `cbor:"-"`
 }
 
 type ColumnInfo struct {
@@ -316,47 +300,6 @@ func (conn *SqliteStreamDB) GetRawConnection() *sqlite3.SQLiteConn {
 
 func (conn *SqliteStreamDB) GetPath() string {
 	return conn.dbPath
-}
-
-func (e *ChangeLogEvent) Marshal() ([]byte, error) {
-	return cbor.Marshal(e)
-}
-
-func (e *ChangeLogEvent) Unmarshal(data []byte) error {
-	return cbor.Unmarshal(data, e)
-}
-
-func (e *ChangeLogEvent) Hash() (uint64, error) {
-	hasher := fnv.New64()
-	_, err := hasher.Write([]byte(e.TableName))
-	if err != nil {
-		return 0, err
-	}
-
-	pkColumns := make([]string, 0, len(e.tableInfo))
-	for _, itm := range e.tableInfo {
-		if itm.IsPrimaryKey {
-			pkColumns = append(pkColumns, itm.Name)
-		}
-	}
-
-	pkTuples := make([]any, len(pkColumns))
-	sort.Strings(pkColumns)
-	for i, pk := range pkColumns {
-		pkTuples[i] = e.Row[pk]
-	}
-
-	bts, err := cbor.Marshal(pkTuples)
-	if err != nil {
-		return 0, err
-	}
-
-	_, err = hasher.Write(bts)
-	if err != nil {
-		return 0, err
-	}
-
-	return hasher.Sum64(), nil
 }
 
 func copyFile(toPath, fromPath string) error {
