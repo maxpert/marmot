@@ -244,7 +244,7 @@ func (s *SQLiteLogDB) IterateEntries(
 		Uint64("entries", uint64(len(entries))).
 		Logger()
 
-	min, count, err := s.getEntryRange(nodeID, clusterID)
+	min, count, err := s.getEntryRange(nodeID, clusterID, nil)
 	if err == raftio.ErrNoSavedLog {
 		logger.Warn().Msg("No entries...")
 		return entries, size, nil
@@ -312,7 +312,7 @@ func (s *SQLiteLogDB) ReadRaftState(clusterID uint64, nodeID uint64, snapshotInd
 	ret := raftio.RaftState{}
 	log.Trace().Msg(fmt.Sprintf("ReadRaftState %d %d %d", clusterID, nodeID, snapshotIndex))
 
-	firstIndex, entriesCount, err := s.getEntryRange(nodeID, clusterID)
+	minIndex, entriesCount, err := s.getEntryRange(nodeID, clusterID, &snapshotIndex)
 	if err != nil {
 		return ret, err
 	}
@@ -337,13 +337,8 @@ func (s *SQLiteLogDB) ReadRaftState(clusterID uint64, nodeID uint64, snapshotInd
 		return ret, err
 	}
 
-	ret.FirstIndex = firstIndex
+	ret.FirstIndex = minIndex
 	ret.EntryCount = entriesCount
-
-	// Have to investigate but existing code in dragonboat suggests with 1 entry it returns 0
-	if snapshotIndex == (firstIndex + entriesCount - 1) {
-		ret.EntryCount = 0
-	}
 
 	return ret, nil
 }
@@ -528,11 +523,10 @@ func (s *SQLiteLogDB) ImportSnapshot(snp raftpb.Snapshot, nodeID uint64) error {
 	})
 }
 
-func (s *SQLiteLogDB) getEntryRange(nodeID, clusterID uint64) (uint64, uint64, error) {
+func (s *SQLiteLogDB) getEntryRange(nodeID, clusterID uint64, index *uint64) (uint64, uint64, error) {
 	count := uint64(0)
-	ok, err := s.db.From(raftInfoTable).Select(
-		goqu.COUNT("entry_index"),
-	).
+	ok, err := s.db.From(raftInfoTable).
+		Select(goqu.COUNT("entry_index")).
 		Where(goqu.Ex{"node_id": nodeID, "cluster_id": clusterID, "entry_type": Entry}).
 		Prepared(true).
 		Executor().
@@ -542,19 +536,38 @@ func (s *SQLiteLogDB) getEntryRange(nodeID, clusterID uint64) (uint64, uint64, e
 		return 0, 0, err
 	}
 
-	if !ok {
+	if !ok || count == 0 {
 		return 0, 0, raftio.ErrNoSavedLog
 	}
 
-	if count <= 0 {
-		return 0, 0, nil
+	if index == nil {
+		return 0, count, nil
+	}
+
+	max := uint64(0)
+	_, err = s.db.From(raftInfoTable).
+		Select(goqu.MAX("entry_index")).
+		Where(goqu.Ex{"node_id": nodeID, "cluster_id": clusterID, "entry_type": Entry}).
+		Prepared(true).
+		Executor().
+		ScanVal(&max)
+
+	if err != nil {
+		return 0, 0, err
+	}
+
+	if max == *index {
+		return max, 0, nil
 	}
 
 	min := uint64(0)
-	ok, err = s.db.From(raftInfoTable).Select(
-		goqu.MIN("entry_index"),
-	).
-		Where(goqu.Ex{"node_id": nodeID, "cluster_id": clusterID, "entry_type": Entry}).
+	_, err = s.db.From(raftInfoTable).
+		Select(goqu.MIN("entry_index")).
+		Where(
+			goqu.Ex{"node_id": nodeID, "cluster_id": clusterID, "entry_type": Entry},
+			goqu.C("entry_index").Gte(*index),
+			goqu.C("entry_index").Lte(max),
+		).
 		Prepared(true).
 		Executor().
 		ScanVal(&min)
@@ -563,11 +576,7 @@ func (s *SQLiteLogDB) getEntryRange(nodeID, clusterID uint64) (uint64, uint64, e
 		return 0, 0, err
 	}
 
-	if !ok {
-		return 0, 0, raftio.ErrNoSavedLog
-	}
-
-	return min, count, nil
+	return min, max - min + 1, nil
 }
 
 func deleteInfoTuple(
@@ -596,7 +605,7 @@ func deleteInfoTuple(
 
 	exps = append(exps, additionalExpressions...)
 
-	logger.Trace().Msg("Deleted rows")
+	logger.Trace().Msg("deleteInfoTuple")
 	_, err := db.Delete(raftInfoTable).
 		Where(exps...).
 		Prepared(true).
@@ -662,6 +671,6 @@ func saveInfoTuple(
 		"payload":     data,
 	}).Prepared(true).Executor().Exec()
 
-	logger.Trace().Err(err).Msg("Saved")
+	logger.Trace().Err(err).Msg("saveTupleInfo")
 	return err
 }

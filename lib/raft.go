@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -78,11 +77,9 @@ func (r *RaftServer) Init() error {
 		RaftEventListener: r,
 	}
 
-	if strings.ToLower(os.Getenv("SQLITE_LOG_STORE")) == "true" {
-		factory := NewSQLiteLogDBFactory(r.metaPath, r.nodeID)
-		hostConfig.Expert = config.ExpertConfig{
-			LogDBFactory: factory,
-		}
+	factory := NewSQLiteLogDBFactory(r.metaPath, r.nodeID)
+	hostConfig.Expert = config.ExpertConfig{
+		LogDBFactory: factory,
 	}
 
 	nodeHost, err := dragonboat.NewNodeHost(hostConfig)
