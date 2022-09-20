@@ -126,8 +126,8 @@ func (conn *SqliteStreamDB) consumeReplicationEvent(event *ChangeLogEvent) error
 		log.Debug().
 			Str("table", event.TableName).
 			Str("type", event.Type).
-			Int64("id", event.Id).
-			Msg(fmt.Sprintf("Consuming replication event with PK %v", primaryKeyMap))
+			Int64("event_id", event.Id).
+			Msg(fmt.Sprintf("Replicating %v", primaryKeyMap))
 		return replicateRow(tnx, event, primaryKeyMap)
 	})
 }
@@ -217,7 +217,7 @@ func (conn *SqliteStreamDB) publishChangeLog() {
 				log.Debug().
 					Int64("cleaned", cnt).
 					Uint64("published", processed).
-					Msg("Rows published")
+					Msg("Cleaned up change log")
 			}
 		}
 

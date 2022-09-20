@@ -2,6 +2,7 @@ package lib
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"math"
 	"time"
@@ -50,6 +51,7 @@ const (
 
 //go:embed log_db_script.sql
 var logDBScript string
+var errIndexNotApplicable = errors.New("index can not be applied for this save type")
 
 func NewSQLiteLogDBFactory(metaPath string, nodeID uint64) *SQLiteLogDBFactory {
 	path := fmt.Sprintf("%s/logdb-%d.sqlite?_journal=wal", metaPath, nodeID)
@@ -615,6 +617,13 @@ func saveInfoTuple(
 	entryType raftInfoEntryType,
 	f func() ([]byte, error),
 ) error {
+	// Assert that BootStrap and State has no index
+	if entryType == Bootstrap || entryType == State {
+		if index != nil {
+			return errIndexNotApplicable
+		}
+	}
+
 	data, err := f()
 	if err != nil {
 		return err
