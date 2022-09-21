@@ -22,6 +22,20 @@ SQLite database file. In a typical setting your setup would look like this:
 Right now it's being used for ephemeral cache storage in production services, on a very read heavy site. This easily replicates cache values across
 the cluster, keeping a fast local copy of cache database.
 
+## Features
+
+ - MultiRaft based consensus with ability to manually move a cluster around
+ - Bidirectional replication with almost masterless architecture
+ - Ability to snapshot and fully recover from those snapshots
+ - SQLite based log storage
+
+To be implemented for next GA:
+ - Command batching + compression for speeding up bulk load / commit commands to propagate quickly
+ - On the fly join and cluster rebalancing
+ - Per node database level command ordering
+ - Gossip and SRV based node discovery
+ - CDC output to NATS and log file
+
 ## Running
 
 Build
