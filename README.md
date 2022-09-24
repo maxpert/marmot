@@ -6,26 +6,22 @@ A distributed SQLite replicator.
 ## What is it useful for right now?
 If you are using SQLite as ephemeral storage, or a scenario where eventual consistency is fine for you.
 Marmot can give you a solid replication between your nodes as Marmot builds on top of fault-tolerant 
-[NATS](https://tikv.org/deep-dive/scalability/multi-raft/), thus allowing robust recovery and 
-replication. This means if you are running a medium traffic website based on SQLite you 
-should be easily able to handle load without any problems. Read heavy workloads won't 
-be bottle-necked at all as Marmot serves as a side car letting you build replication 
-cluster without making any changes to your application code, and allows you to keep 
-using to your SQLite database file. In a typical setting your setup would look 
-like this:
-
-![image](https://user-images.githubusercontent.com/22441/190715676-8b785596-f267-49a3-aa27-21afbe74d0be.png)
+[NATS](https://nats.io/), thus allowing robust recovery and replication. This means if you are 
+running a medium traffic website based on SQLite you should be easily able to handle load 
+without any problems. Read heavy workloads won't be bottle-necked at all as Marmot serves 
+as a side car letting you build replication cluster without making any changes to your 
+application code, and allows you to keep using to your SQLite database file. 
 
 ## Production status
 
-**MARMOT IS READY FOR PRODUCTION USAGE NOW**
+**MARMOT IS NOT READY FOR PRODUCTION USAGE**
 
 Right now it's being used for ephemeral cache storage in production services, on a very read heavy site. 
 This easily replicates cache values across the cluster, keeping a fast local copy of cache database.
 
 ## Features
 
- - Built on top of NATS
+ - Built on top of NATS, abstracting stream distribution and replication
  - Bidirectional replication with almost masterless architecture
  - Ability to snapshot and fully recover from those snapshots
  - SQLite based log storage
@@ -51,13 +47,13 @@ build/marmot -nats-url nats://127.0.0.1:4222 -node-id 2 -db-path /tmp/cache-2.db
 
 ## Demos
 
-Demos for `v0.3.x`
+Demos for `v0.3.x` with PocketBase `v0.7.5`:
  - [Scaling Pocketbase with Marmot](https://youtube.com/video/VSa-VJso050)
  - [Scaling Pocketbase with Marmot - Follow up](https://www.youtube.com/watch?v=Zapupe_FREc)
 
 ## Documentation
 
-Marmot is picks simplicity, and lesser knobs to configure by choice. Here are command line options you can use to
+Marmot picks simplicity, and lesser knobs to configure by choice. Here are command line options you can use to
 configure marmot:
 
  - `cleanup` - Just cleanup and exit marmot. Useful for scenarios where you are performing a cleanup of hooks and 
