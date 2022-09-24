@@ -13,7 +13,7 @@ const NodeNamePrefix = "marmot-node"
 
 var MaxLogEntries = int64(1024)
 var StreamNamePrefix = "marmot-changes"
-var SubjectPrefix = "change-event"
+var SubjectPrefix = "marmot.change"
 
 type Replicator struct {
 	nodeID uint64
