@@ -16,7 +16,7 @@ func main() {
 	dbPathString := flag.String("db-path", "/tmp/marmot.db", "Path to SQLite database")
 	nodeID := flag.Uint64("node-id", rand.Uint64(), "Node ID")
 	natsAddr := flag.String("nats-url", lib.DefaultUrl, "NATS server URL")
-	shards := flag.Uint64("shards", 512, "Number of stream shards to distribute change log on")
+	shards := flag.Uint64("shards", 8, "Number of stream shards to distribute change log on")
 	verbose := flag.Bool("verbose", false, "Log debug level")
 	flag.Parse()
 
@@ -57,9 +57,22 @@ func main() {
 		return
 	}
 
-	err = rep.Listen(onChangeEvent(streamDB))
+	errChan := make(chan error)
+	for i := uint64(0); i < *shards; i++ {
+		go changeListener(streamDB, rep, i+1)
+	}
+
+	err = <-errChan
 	if err != nil {
-		log.Panic().Err(err).Msg("Listener terminated")
+		log.Panic().Err(err).Msg("Terminated listener")
+	}
+}
+
+func changeListener(streamDB *db.SqliteStreamDB, rep *lib.Replicator, shard uint64) {
+	log.Debug().Uint64("shard", shard).Msg("Listening stream")
+	err := rep.Listen(shard, onChangeEvent(streamDB))
+	if err != nil {
+		log.Panic().Err(err).Msg("Listener error")
 	}
 }
 
@@ -71,6 +84,11 @@ func onChangeEvent(streamDB *db.SqliteStreamDB) func(data []byte) error {
 			return err
 		}
 
+		ok, _ := streamDB.DeleteChangeLog(ev.Payload)
+		if ok {
+			return nil
+		}
+
 		return streamDB.Replicate(ev.Payload)
 	}
 }
@@ -78,8 +96,9 @@ func onChangeEvent(streamDB *db.SqliteStreamDB) func(data []byte) error {
 func onTableChanged(r *lib.Replicator, nodeID uint64, shards uint64) func(event *db.ChangeLogEvent) error {
 	return func(event *db.ChangeLogEvent) error {
 		ev := &lib.ReplicationEvent[db.ChangeLogEvent]{
-			FromNodeId: nodeID,
-			Payload:    event,
+			FromNodeId:  nodeID,
+			ChangeRowId: event.Id,
+			Payload:     event,
 		}
 
 		data, err := ev.Marshal()
