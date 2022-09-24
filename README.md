@@ -61,6 +61,7 @@ configure marmot:
  - `db-path` - Path to DB from which all tables will be replicated (default: `/tmp/marmot.db`)
  - `node-id` - An ID number (positive integer) to represent an ID for this node, this is required to be a unique
    number per node, and used for consensus protocol. (default: 0)
+ - `log-replicas` - Number of copies to be committed for single change log. By default it set to `floor(shards/2) + 1`. 
  - `shards` - Number of shards over which the database tables replication will be distributed on. It serves as mechanism for
    consistently hashing JetStream from `Hash(<table_name> + <primary/composite_key>)`. This will allow NATS servers to 
    distribute load and scale for wider clusters. Look at internal docs on how these JetStreams and subjects are named.

@@ -17,8 +17,11 @@ func main() {
 	nodeID := flag.Uint64("node-id", rand.Uint64(), "Node ID")
 	natsAddr := flag.String("nats-url", lib.DefaultUrl, "NATS server URL")
 	shards := flag.Uint64("shards", 8, "Number of stream shards to distribute change log on")
+	logReplicas := flag.Int("log-replicas", 0, "Number of copies to be committed for single change log")
 	verbose := flag.Bool("verbose", false, "Log debug level")
 	flag.Parse()
+
+	lib.EntryReplicas = *logReplicas
 
 	if *verbose {
 		log.Logger = log.Level(zerolog.DebugLevel)
@@ -28,6 +31,11 @@ func main() {
 
 	log.Debug().Str("path", *dbPathString).Msg("Opening database")
 	tableNames, err := db.GetAllDBTables(*dbPathString)
+	if err != nil {
+		log.Error().Err(err).Msg("Unable to list all tables")
+		return
+	}
+
 	streamDB, err := db.OpenStreamDB(*dbPathString, tableNames)
 	if err != nil {
 		log.Error().Err(err).Msg("Unable to open database")

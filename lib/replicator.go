@@ -12,6 +12,7 @@ const DefaultUrl = nats.DefaultURL
 const NodeNamePrefix = "marmot-node"
 
 var MaxLogEntries = int64(1024)
+var EntryReplicas = int(0)
 var StreamNamePrefix = "marmot-changes"
 var SubjectPrefix = "marmot.change"
 
@@ -131,6 +132,11 @@ func topicName(shardID uint64) string {
 
 func makeConfig(shardID uint64, totalShards uint64) *nats.StreamConfig {
 	streamName := fmt.Sprintf("%s-%d-%d", StreamNamePrefix, totalShards, shardID)
+	replicas := EntryReplicas
+	if replicas < 1 {
+		replicas = int(totalShards>>1) + 1
+	}
+
 	return &nats.StreamConfig{
 		Name:              streamName,
 		Subjects:          []string{topicName(shardID)},
@@ -143,6 +149,6 @@ func makeConfig(shardID uint64, totalShards uint64) *nats.StreamConfig {
 		MaxMsgsPerSubject: -1,
 		Duplicates:        0,
 		DenyDelete:        true,
-		Replicas:          int(totalShards>>1 + 1),
+		Replicas:          replicas,
 	}
 }
