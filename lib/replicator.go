@@ -14,7 +14,7 @@ const NodeNamePrefix = "marmot-node"
 var MaxLogEntries = int64(1024)
 var EntryReplicas = int(0)
 var StreamNamePrefix = "marmot-changes"
-var SubjectPrefix = "marmot.change"
+var SubjectPrefix = "marmot-change-log"
 
 type Replicator struct {
 	nodeID uint64
@@ -33,12 +33,13 @@ func NewReplicator(nodeID uint64, natsServer string, shards uint64) (*Replicator
 
 	streamMap := map[uint64]nats.JetStream{}
 	for i := uint64(0); i < shards; i++ {
+		shard := i + 1
 		js, err := nc.JetStream()
 		if err != nil {
 			return nil, err
 		}
 
-		streamCfg := makeConfig(i+1, shards)
+		streamCfg := makeShardConfig(shard, shards)
 		_, err = js.StreamInfo(streamCfg.Name)
 		if err != nil {
 			_, err = js.AddStream(streamCfg)
@@ -50,11 +51,11 @@ func NewReplicator(nodeID uint64, natsServer string, shards uint64) (*Replicator
 			return nil, err
 		}
 
-		log.Info().
-			Uint64("id", i).
+		log.Debug().
+			Uint64("shard", shard).
 			Msg("Created stream")
 
-		streamMap[i+1] = js
+		streamMap[shard] = js
 	}
 
 	return &Replicator{
@@ -73,7 +74,7 @@ func (r *Replicator) Publish(hash uint64, payload []byte) error {
 		log.Panic().Uint64("shard", shardID).Msg("Invalid shard")
 	}
 
-	ack, err := js.Publish(topicName(shardID), payload)
+	ack, err := js.Publish(subjectName(shardID), payload)
 	if err != nil {
 		return err
 	}
@@ -86,7 +87,7 @@ func (r *Replicator) Listen(shardID uint64, callback func(payload []byte) error)
 	js := r.streamMap[shardID]
 
 	sub, err := js.SubscribeSync(
-		topicName(shardID),
+		subjectName(shardID),
 		nats.Durable(nodeName(r.nodeID)),
 		nats.ManualAck(),
 	)
@@ -122,15 +123,7 @@ func (r *Replicator) Listen(shardID uint64, callback func(payload []byte) error)
 	return nil
 }
 
-func nodeName(nodeID uint64) string {
-	return fmt.Sprintf("%s-%d", NodeNamePrefix, nodeID)
-}
-
-func topicName(shardID uint64) string {
-	return fmt.Sprintf("%s.%d", SubjectPrefix, shardID)
-}
-
-func makeConfig(shardID uint64, totalShards uint64) *nats.StreamConfig {
+func makeShardConfig(shardID uint64, totalShards uint64) *nats.StreamConfig {
 	streamName := fmt.Sprintf("%s-%d-%d", StreamNamePrefix, totalShards, shardID)
 	replicas := EntryReplicas
 	if replicas < 1 {
@@ -139,7 +132,7 @@ func makeConfig(shardID uint64, totalShards uint64) *nats.StreamConfig {
 
 	return &nats.StreamConfig{
 		Name:              streamName,
-		Subjects:          []string{topicName(shardID)},
+		Subjects:          []string{subjectName(shardID)},
 		Discard:           nats.DiscardOld,
 		MaxMsgs:           MaxLogEntries,
 		Storage:           nats.FileStorage,
@@ -151,4 +144,12 @@ func makeConfig(shardID uint64, totalShards uint64) *nats.StreamConfig {
 		DenyDelete:        true,
 		Replicas:          replicas,
 	}
+}
+
+func nodeName(nodeID uint64) string {
+	return fmt.Sprintf("%s-%d", NodeNamePrefix, nodeID)
+}
+
+func subjectName(shardID uint64) string {
+	return fmt.Sprintf("%s-%d", SubjectPrefix, shardID)
 }
