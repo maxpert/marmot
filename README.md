@@ -12,6 +12,9 @@ without any problems. Read heavy workloads won't be bottle-necked at all as Marm
 as a side car letting you build replication cluster without making any changes to your 
 application code, and allows you to keep using to your SQLite database file. 
 
+## Dependencies
+Starting 0.4+ Marmot depends on [nats-server](https://nats.io/download/).
+
 ## Production status
 
 **MARMOT IS NOT READY FOR PRODUCTION USAGE**
@@ -46,8 +49,10 @@ build/marmot -nats-url nats://127.0.0.1:4222 -node-id 2 -db-path /tmp/cache-2.db
 ```
 
 ## Demos
+Demos for `v0.4.x`:
+ - Scaling Pocketbase with Marmot [Coming soon]
 
-Demos for `v0.3.x` with PocketBase `v0.7.5`:
+Demos for `v0.3.x` (Legacy) with PocketBase `v0.7.5`:
  - [Scaling Pocketbase with Marmot](https://youtube.com/video/VSa-VJso050)
  - [Scaling Pocketbase with Marmot - Follow up](https://www.youtube.com/watch?v=Zapupe_FREc)
 
