@@ -50,7 +50,7 @@ build/marmot -nats-url nats://127.0.0.1:4222 -node-id 2 -db-path /tmp/cache-2.db
 
 ## Demos
 Demos for `v0.4.x`:
- - Scaling Pocketbase with Marmot [Coming soon]
+ - [Scaling Pocketbase with Marmot](https://www.youtube.com/watch?v=QqZl61bJ9BA)
 
 Demos for `v0.3.x` (Legacy) with PocketBase `v0.7.5`:
  - [Scaling Pocketbase with Marmot](https://youtube.com/video/VSa-VJso050)
