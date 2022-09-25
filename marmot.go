@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"math/rand"
+	"time"
 
 	"github.com/maxpert/marmot/db"
 	"github.com/maxpert/marmot/lib"
@@ -67,20 +68,35 @@ func main() {
 
 	errChan := make(chan error)
 	for i := uint64(0); i < *shards; i++ {
-		go changeListener(streamDB, rep, i+1)
+		go changeListener(streamDB, rep, i+1, errChan)
 	}
 
-	err = <-errChan
-	if err != nil {
-		log.Panic().Err(err).Msg("Terminated listener")
+	cleanupInterval := 5 * time.Second
+	cleanupTicker := time.NewTicker(cleanupInterval)
+	defer cleanupTicker.Stop()
+
+	for {
+		select {
+		case err = <-errChan:
+			if err != nil {
+				log.Panic().Err(err).Msg("Terminated listener")
+			}
+		case t := <-cleanupTicker.C:
+			cnt, err := streamDB.CleanupChangeLogs(t.Add(-cleanupInterval))
+			if err != nil {
+				log.Warn().Err(err).Msg("Unable to cleanup change logs")
+			} else if cnt > 0 {
+				log.Debug().Int64("count", cnt).Msg("Cleaned up DB change logs")
+			}
+		}
 	}
 }
 
-func changeListener(streamDB *db.SqliteStreamDB, rep *lib.Replicator, shard uint64) {
+func changeListener(streamDB *db.SqliteStreamDB, rep *lib.Replicator, shard uint64, errChan chan error) {
 	log.Debug().Uint64("shard", shard).Msg("Listening stream")
 	err := rep.Listen(shard, onChangeEvent(streamDB))
 	if err != nil {
-		log.Panic().Err(err).Msg("Listener error")
+		errChan <- err
 	}
 }
 
@@ -89,14 +105,11 @@ func onChangeEvent(streamDB *db.SqliteStreamDB) func(data []byte) error {
 		ev := &lib.ReplicationEvent[db.ChangeLogEvent]{}
 		err := ev.Unmarshal(data)
 		if err != nil {
+			log.Error().Err(err).Send()
 			return err
 		}
 
-		ok, _ := streamDB.DeleteChangeLog(ev.Payload)
-		if ok {
-			return nil
-		}
-
+		_, _ = streamDB.DeleteChangeLog(ev.Payload)
 		return streamDB.Replicate(ev.Payload)
 	}
 }
@@ -104,9 +117,8 @@ func onChangeEvent(streamDB *db.SqliteStreamDB) func(data []byte) error {
 func onTableChanged(r *lib.Replicator, nodeID uint64, shards uint64) func(event *db.ChangeLogEvent) error {
 	return func(event *db.ChangeLogEvent) error {
 		ev := &lib.ReplicationEvent[db.ChangeLogEvent]{
-			FromNodeId:  nodeID,
-			ChangeRowId: event.Id,
-			Payload:     event,
+			FromNodeId: nodeID,
+			Payload:    event,
 		}
 
 		data, err := ev.Marshal()
@@ -119,7 +131,7 @@ func onTableChanged(r *lib.Replicator, nodeID uint64, shards uint64) func(event 
 			return err
 		}
 
-		err = r.Publish(hash%shards, data)
+		err = r.Publish(hash, data)
 		if err != nil {
 			return err
 		}

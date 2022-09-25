@@ -30,9 +30,6 @@ Yes it will require additional storage to old/new values from triggers. But righ
 Ask marmot to remove hooks and log tables by:
 `marmot -db-path /path/to/your/db.db -cleanup`
 
-Cleanup the Raft logs and snapshot by:
-`rm -rf /tmp/raft`
-
 ### How would many shards should I have?
 
 It depends on your usecase and what problem you are solving for. In a typical setting you should not need more than couple of dozen shards. While read scaling won't be a problem, your write throughput will depend on your network and 

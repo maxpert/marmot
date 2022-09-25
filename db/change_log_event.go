@@ -75,7 +75,7 @@ func (e *ChangeLogEvent) getSortedPKColumns() []string {
 
 	tablePKColumnsLock.Lock()
 	defer tablePKColumnsLock.Unlock()
-	tablePKColumnsCache[e.TableName] = pkColumns
 
+	tablePKColumnsCache[e.TableName] = pkColumns
 	return pkColumns
 }

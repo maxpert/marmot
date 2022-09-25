@@ -89,12 +89,15 @@ func (conn *SqliteStreamDB) DeleteChangeLog(event *ChangeLogEvent) (bool, error)
 	return count > 0, nil
 }
 
-func (conn *SqliteStreamDB) CleanupChangeLogs() (int64, error) {
+func (conn *SqliteStreamDB) CleanupChangeLogs(beforeTime time.Time) (int64, error) {
 	total := int64(0)
 	for name := range conn.watchTablesSchema {
 		metaTableName := conn.metaTable(name, changeLogName)
 		rs, err := conn.Delete(metaTableName).
-			Where(goqu.Ex{"state": Published}).
+			Where(
+				goqu.C("state").Eq(Published),
+				goqu.C("created_at").Lte(beforeTime.UnixMilli()),
+			).
 			Prepared(true).
 			Executor().
 			Exec()
@@ -199,6 +202,8 @@ func (conn *SqliteStreamDB) watchChanges(path string) {
 
 	errShm := watcher.Add(shmPath)
 	errWal := watcher.Add(walPath)
+	changeLogTicker := time.NewTicker(time.Millisecond * 100)
+	updateTime := time.Now()
 
 	for {
 		select {
@@ -210,8 +215,11 @@ func (conn *SqliteStreamDB) watchChanges(path string) {
 			if ev.Op != fsnotify.Chmod {
 				conn.publishChangeLog()
 			}
-		case <-time.After(time.Millisecond * 500):
-			conn.publishChangeLog()
+		case t := <-changeLogTicker.C:
+			if t.After(updateTime) {
+				conn.publishChangeLog()
+			}
+
 			if errShm != nil {
 				errShm = watcher.Add(shmPath)
 			}
@@ -220,6 +228,8 @@ func (conn *SqliteStreamDB) watchChanges(path string) {
 				errWal = watcher.Add(walPath)
 			}
 		}
+
+		updateTime = time.Now()
 	}
 }
 

@@ -8,11 +8,12 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
+const maxReplcateRetries = 7
 const DefaultUrl = nats.DefaultURL
 const NodeNamePrefix = "marmot-node"
 
 var MaxLogEntries = int64(1024)
-var EntryReplicas = int(0)
+var EntryReplicas = 0
 var StreamNamePrefix = "marmot-changes"
 var SubjectPrefix = "marmot-change-log"
 
@@ -40,11 +41,10 @@ func NewReplicator(nodeID uint64, natsServer string, shards uint64) (*Replicator
 		}
 
 		streamCfg := makeShardConfig(shard, shards)
-		_, err = js.StreamInfo(streamCfg.Name)
-		if err != nil {
-			_, err = js.AddStream(streamCfg)
-		} else {
-			_, err = js.UpdateStream(streamCfg)
+		info, err := js.StreamInfo(streamCfg.Name)
+		if err == nats.ErrStreamNotFound {
+			log.Debug().Uint64("shard", shard).Msg("Creating stream")
+			info, err = js.AddStream(streamCfg)
 		}
 
 		if err != nil {
@@ -53,7 +53,14 @@ func NewReplicator(nodeID uint64, natsServer string, shards uint64) (*Replicator
 
 		log.Debug().
 			Uint64("shard", shard).
-			Msg("Created stream")
+			Str("name", info.Config.Name).
+			Int("replicas", info.Config.Replicas).
+			Str("leader", info.Cluster.Leader).
+			Msg("Stream ready...")
+
+		if err != nil {
+			return nil, err
+		}
 
 		streamMap[shard] = js
 	}
@@ -89,7 +96,6 @@ func (r *Replicator) Listen(shardID uint64, callback func(payload []byte) error)
 	sub, err := js.SubscribeSync(
 		subjectName(shardID),
 		nats.Durable(nodeName(r.nodeID)),
-		nats.ManualAck(),
 	)
 
 	if err != nil {
@@ -97,6 +103,7 @@ func (r *Replicator) Listen(shardID uint64, callback func(payload []byte) error)
 	}
 	defer sub.Unsubscribe()
 
+	replRetry := 0
 	for sub.IsValid() {
 		msg, err := sub.NextMsg(1 * time.Second)
 
@@ -111,9 +118,17 @@ func (r *Replicator) Listen(shardID uint64, callback func(payload []byte) error)
 		log.Debug().Str("sub", msg.Subject).Uint64("shard", shardID).Send()
 		err = callback(msg.Data)
 		if err != nil {
-			return err
+			if replRetry > maxReplcateRetries {
+				return err
+			}
+
+			log.Error().Err(err).Msg("Unable to process message retrying")
+			msg.Nak()
+			replRetry++
+			continue
 		}
 
+		replRetry = 0
 		err = msg.Ack()
 		if err != nil {
 			return err

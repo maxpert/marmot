@@ -13,7 +13,7 @@ as a side car letting you build replication cluster without making any changes t
 application code, and allows you to keep using to your SQLite database file. 
 
 ## Dependencies
-Starting 0.4+ Marmot depends on [nats-server](https://nats.io/download/).
+Starting 0.4+ Marmot depends on [nats-server](https://nats.io/download/) with JetStream support.
 
 ## Production status
 
