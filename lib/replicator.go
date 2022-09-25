@@ -8,12 +8,12 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-const maxReplcateRetries = 7
+const maxReplicateRetries = 7
 const DefaultUrl = nats.DefaultURL
 const NodeNamePrefix = "marmot-node"
 
 var MaxLogEntries = int64(1024)
-var EntryReplicas = 0
+var EntryReplicas = 1
 var StreamNamePrefix = "marmot-changes"
 var SubjectPrefix = "marmot-change-log"
 
@@ -118,7 +118,7 @@ func (r *Replicator) Listen(shardID uint64, callback func(payload []byte) error)
 		log.Debug().Str("sub", msg.Subject).Uint64("shard", shardID).Send()
 		err = callback(msg.Data)
 		if err != nil {
-			if replRetry > maxReplcateRetries {
+			if replRetry > maxReplicateRetries {
 				return err
 			}
 

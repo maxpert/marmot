@@ -56,7 +56,7 @@ Demos for `v0.3.x` (Legacy) with PocketBase `v0.7.5`:
  - [Scaling Pocketbase with Marmot](https://youtube.com/video/VSa-VJso050)
  - [Scaling Pocketbase with Marmot - Follow up](https://www.youtube.com/watch?v=Zapupe_FREc)
 
-## Documentation
+## CLI Documentation
 
 Marmot picks simplicity, and lesser knobs to configure by choice. Here are command line options you can use to
 configure marmot:
@@ -65,13 +65,25 @@ configure marmot:
    change logs. (default: `false`)
  - `db-path` - Path to DB from which all tables will be replicated (default: `/tmp/marmot.db`)
  - `node-id` - An ID number (positive integer) to represent an ID for this node, this is required to be a unique
-   number per node, and used for consensus protocol. (default: 0)
- - `log-replicas` - Number of copies to be committed for single change log. By default it set to `floor(shards/2) + 1`. 
- - `shards` - Number of shards over which the database tables replication will be distributed on. It serves as mechanism for
-   consistently hashing JetStream from `Hash(<table_name> + <primary/composite_key>)`. This will allow NATS servers to 
-   distribute load and scale for wider clusters. Look at internal docs on how these JetStreams and subjects are named.
- - `nats-url` - URL string for NATS servers, it can also point to multipule servers as long as its comma separated (e.g.
+   number per node, and used for consensus protocol. (default: random number)
+ - `nats-url` - URL string for NATS servers, it can also point to multiple servers as long as its comma separated (e.g.
    `nats://user:pass@127.0.0.1:4222` or `nats://user:pass@host-a:4222, nats://user:pass@host-b:4222`)
+ - `max-log-entries` - Number of change log entries that should be caped in NATS JetStream. This property only applies
+   when stream has not been created. If stream was never created before Marmot with automatically created stream with
+   name prefix `stream-prefix` with attached subjects prefixed by `subject-prefix` (default: `1024`). It's 
+   recommended to use a good high value in production environments.
+ - `log-replicas` - Number of replicas for each change log entry committed to NATS (default: `1`). **Set this value to 
+   at least quorum of cluster nodes to make sure that your replication logs are fault-tolerant**.
+ - `subject-prefix` - Prefix for subject over which change logs will be published. Marmot distributes load by sharding
+   change logs over given `shards`. Each subject will have pattern `<subject-prefix>-<shard-id>` 
+   (default: `marmot-change-log`).
+ - `stream-prefix` - Prefix for JetStream names for against which each sharded subject is attached. This allows to
+   distribute these JetStream leaders among nodes in cluster. Each stream will have pattern of 
+   `<stream-prefix>-<shards>-<shard-id>` (default: `marmot-changes`).
+ - `shards` - Number of shards over which the database tables replication will be distributed on. It serves as mechanism for
+   consistently hashing JetStream from `Hash(<table_name> + <primary/composite_key>)`. This will allow NATS servers to
+   distribute load and scale for wider clusters. Look at internal docs on how these JetStreams and subjects are named
+   (default: `8`).
  - `verbose` - Specify if system should dump debug logs on console as well. Only use this for debugging. 
 
 For more details and internal workings of marmot [go to these docs](https://github.com/maxpert/marmot/blob/master/docs/overview.md).

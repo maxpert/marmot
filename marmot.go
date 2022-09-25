@@ -18,11 +18,17 @@ func main() {
 	nodeID := flag.Uint64("node-id", rand.Uint64(), "Node ID")
 	natsAddr := flag.String("nats-url", lib.DefaultUrl, "NATS server URL")
 	shards := flag.Uint64("shards", 8, "Number of stream shards to distribute change log on")
-	logReplicas := flag.Int("log-replicas", 0, "Number of copies to be committed for single change log")
+	maxLogEntries := flag.Int64("max-log-entries", 1024, "Maximum number of change log entries to persist")
+	logReplicas := flag.Int("log-replicas", 1, "Number of copies to be committed for single change log")
+	subjectPrefix := flag.String("subject-prefix", "marmot-change-log", "Prefix for publish subjects")
+	streamPrefix := flag.String("stream-prefix", "marmot-changes", "Prefix for publish subjects")
 	verbose := flag.Bool("verbose", false, "Log debug level")
 	flag.Parse()
 
+	lib.MaxLogEntries = *maxLogEntries
 	lib.EntryReplicas = *logReplicas
+	lib.SubjectPrefix = *subjectPrefix
+	lib.StreamNamePrefix = *streamPrefix
 
 	if *verbose {
 		log.Logger = log.Level(zerolog.DebugLevel)
@@ -59,7 +65,7 @@ func main() {
 		log.Panic().Err(err).Msg("Unable to connect")
 	}
 
-	streamDB.OnChange = onTableChanged(rep, *nodeID, *shards)
+	streamDB.OnChange = onTableChanged(rep, *nodeID)
 	log.Info().Msg("Starting change data capture pipeline...")
 	if err := streamDB.InstallCDC(); err != nil {
 		log.Error().Err(err).Msg("Unable to install change data capture pipeline")
@@ -114,7 +120,7 @@ func onChangeEvent(streamDB *db.SqliteStreamDB) func(data []byte) error {
 	}
 }
 
-func onTableChanged(r *lib.Replicator, nodeID uint64, shards uint64) func(event *db.ChangeLogEvent) error {
+func onTableChanged(r *lib.Replicator, nodeID uint64) func(event *db.ChangeLogEvent) error {
 	return func(event *db.ChangeLogEvent) error {
 		ev := &lib.ReplicationEvent[db.ChangeLogEvent]{
 			FromNodeId: nodeID,
