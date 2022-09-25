@@ -66,6 +66,29 @@ func (conn *SqliteStreamDB) Replicate(event *ChangeLogEvent) error {
 	return nil
 }
 
+func (conn *SqliteStreamDB) DeleteChangeLog(event *ChangeLogEvent) (bool, error) {
+	metaTableName := conn.metaTable(event.TableName, changeLogName)
+	rs, err := conn.Delete(metaTableName).
+		Where(goqu.Ex{
+			"state": Published,
+			"id":    event.Id,
+		}).
+		Prepared(true).
+		Executor().
+		Exec()
+
+	if err != nil {
+		return false, err
+	}
+
+	count, err := rs.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+
+	return count > 0, nil
+}
+
 func (conn *SqliteStreamDB) CleanupChangeLogs() (int64, error) {
 	total := int64(0)
 	for name := range conn.watchTablesSchema {
@@ -204,25 +227,7 @@ func (conn *SqliteStreamDB) publishChangeLog() {
 	conn.publishLock.Lock()
 	processed := uint64(0)
 
-	// TODO: Move cleanup logic to time based cleanup
-	// In order to reduce frequent writes, change the logic below
-	// to only do in place updates, and the periodically do
-	// table cleanup.
-	defer func() {
-		if processed > uint64(0) {
-			cnt, err := conn.CleanupChangeLogs()
-			if err != nil {
-				log.Warn().Err(err).Msg("Unable to cleanup change logs")
-			} else if cnt > int64(0) {
-				log.Debug().
-					Int64("cleaned", cnt).
-					Uint64("published", processed).
-					Msg("Cleaned up change log")
-			}
-		}
-
-		conn.publishLock.Unlock()
-	}()
+	defer conn.publishLock.Unlock()
 
 	for tableName := range conn.watchTablesSchema {
 		var changes []*changeLogEntry

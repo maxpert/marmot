@@ -1,11 +1,8 @@
 package main
 
 import (
-	"errors"
 	"flag"
-	"fmt"
 	"math/rand"
-	"time"
 
 	"github.com/maxpert/marmot/db"
 	"github.com/maxpert/marmot/lib"
@@ -17,16 +14,14 @@ import (
 func main() {
 	cleanup := flag.Bool("cleanup", false, "Cleanup all trigger hooks for marmot")
 	dbPathString := flag.String("db-path", "/tmp/marmot.db", "Path to SQLite database")
-	metaPath := flag.String("raft-path", "/tmp/raft", "Path to save raft information")
 	nodeID := flag.Uint64("node-id", rand.Uint64(), "Node ID")
-	followFlag := flag.Bool("follow", false, "Start Raft in follower mode")
-	shards := flag.Uint64("shards", 16, "Total number of shards for this instance")
-	maxLogEntries := flag.Uint64("max-log-entries", 1024, "Total number of log entries per shard before snapshotting")
-	bindAddress := flag.String("bind", "0.0.0.0:8160", "Bind address for Raft server")
-	bindPane := flag.String("bind-pane", "localhost:6010", "Bind address for control pane server")
-	initialAddrs := flag.String("bootstrap", "", "<CLUSTER_ID>@IP:PORT list of initial nodes separated by comma (,)")
+	natsAddr := flag.String("nats-url", lib.DefaultUrl, "NATS server URL")
+	shards := flag.Uint64("shards", 8, "Number of stream shards to distribute change log on")
+	logReplicas := flag.Int("log-replicas", 0, "Number of copies to be committed for single change log")
 	verbose := flag.Bool("verbose", false, "Log debug level")
 	flag.Parse()
+
+	lib.EntryReplicas = *logReplicas
 
 	if *verbose {
 		log.Logger = log.Level(zerolog.DebugLevel)
@@ -36,14 +31,19 @@ func main() {
 
 	log.Debug().Str("path", *dbPathString).Msg("Opening database")
 	tableNames, err := db.GetAllDBTables(*dbPathString)
-	srcDb, err := db.OpenStreamDB(*dbPathString, tableNames)
+	if err != nil {
+		log.Error().Err(err).Msg("Unable to list all tables")
+		return
+	}
+
+	streamDB, err := db.OpenStreamDB(*dbPathString, tableNames)
 	if err != nil {
 		log.Error().Err(err).Msg("Unable to open database")
 		return
 	}
 
 	if *cleanup {
-		err = srcDb.RemoveCDC(true)
+		err = streamDB.RemoveCDC(true)
 		if err != nil {
 			log.Panic().Err(err).Msg("Unable to clean up...")
 		} else {
@@ -53,51 +53,60 @@ func main() {
 		return
 	}
 
-	// Set max log entries from command line
-	lib.MaxLogEntries = *maxLogEntries
-
-	*metaPath = fmt.Sprintf("%s/node-%d", *metaPath, *nodeID)
-	raft := lib.NewRaftServer(*bindAddress, *nodeID, *metaPath, srcDb)
-	err = raft.Init()
+	rep, err := lib.NewReplicator(*nodeID, *natsAddr, *shards)
 	if err != nil {
-		log.Panic().Err(err).Msg("Unable to initialize raft server")
+		log.Panic().Err(err).Msg("Unable to connect")
 	}
 
-	if !*followFlag {
-		clusterIds := makeRange(1, *shards)
-		err = raft.BindCluster(*initialAddrs, false, clusterIds...)
-		if err != nil {
-			log.Panic().Err(err).Msg("Unable to start Raft")
-		}
-
-		log.Info().Msg("Waiting for cluster to come up...")
-		for uint64(len(raft.GetActiveClusters())) != *shards {
-			time.Sleep(500 * time.Millisecond)
-		}
-	}
-
-	srcDb.OnChange = onTableChanged(raft, *nodeID, *shards)
+	streamDB.OnChange = onTableChanged(rep, *nodeID, *shards)
 	log.Info().Msg("Starting change data capture pipeline...")
-	if err := srcDb.InstallCDC(); err != nil {
+	if err := streamDB.InstallCDC(); err != nil {
 		log.Error().Err(err).Msg("Unable to install change data capture pipeline")
 		return
 	}
 
-	err = lib.NewControlPane(raft).Run(*bindPane)
+	errChan := make(chan error)
+	for i := uint64(0); i < *shards; i++ {
+		go changeListener(streamDB, rep, i+1)
+	}
+
+	err = <-errChan
 	if err != nil {
-		log.Panic().Err(err).Msg("Control pane not working")
+		log.Panic().Err(err).Msg("Terminated listener")
 	}
 }
 
-func onTableChanged(raft *lib.RaftServer, nodeID uint64, shards uint64) func(event *db.ChangeLogEvent) error {
-	return func(event *db.ChangeLogEvent) error {
-		if uint64(len(raft.GetActiveClusters())) != shards {
-			return db.ErrLogNotReadyToPublish
+func changeListener(streamDB *db.SqliteStreamDB, rep *lib.Replicator, shard uint64) {
+	log.Debug().Uint64("shard", shard).Msg("Listening stream")
+	err := rep.Listen(shard, onChangeEvent(streamDB))
+	if err != nil {
+		log.Panic().Err(err).Msg("Listener error")
+	}
+}
+
+func onChangeEvent(streamDB *db.SqliteStreamDB) func(data []byte) error {
+	return func(data []byte) error {
+		ev := &lib.ReplicationEvent[db.ChangeLogEvent]{}
+		err := ev.Unmarshal(data)
+		if err != nil {
+			return err
 		}
 
+		ok, _ := streamDB.DeleteChangeLog(ev.Payload)
+		if ok {
+			return nil
+		}
+
+		return streamDB.Replicate(ev.Payload)
+	}
+}
+
+func onTableChanged(r *lib.Replicator, nodeID uint64, shards uint64) func(event *db.ChangeLogEvent) error {
+	return func(event *db.ChangeLogEvent) error {
 		ev := &lib.ReplicationEvent[db.ChangeLogEvent]{
-			FromNodeId: nodeID,
-			Payload:    event,
+			FromNodeId:  nodeID,
+			ChangeRowId: event.Id,
+			Payload:     event,
 		}
 
 		data, err := ev.Marshal()
@@ -110,23 +119,11 @@ func onTableChanged(raft *lib.RaftServer, nodeID uint64, shards uint64) func(eve
 			return err
 		}
 
-		res, err := raft.Propose(hash, data, 1*time.Second)
+		err = r.Publish(hash%shards, data)
 		if err != nil {
 			return err
 		}
 
-		if !res.Committed() {
-			return errors.New("replication failed")
-		}
-
 		return nil
 	}
-}
-
-func makeRange(min, max uint64) []uint64 {
-	a := make([]uint64, max-min+1)
-	for i := range a {
-		a[i] = min + uint64(i)
-	}
-	return a
 }
