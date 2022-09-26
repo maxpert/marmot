@@ -4,7 +4,6 @@ A distributed SQLite replicator.
 [![Go](https://github.com/maxpert/marmot/actions/workflows/go.yml/badge.svg)](https://github.com/maxpert/marmot/actions/workflows/go.yml)
 
 ## What is it useful for right now?
-If you are using SQLite as ephemeral storage, or a scenario where eventual consistency is fine for you.
 Marmot can give you a solid replication between your nodes as Marmot builds on top of fault-tolerant 
 [NATS](https://nats.io/), thus allowing robust recovery and replication. This means if you are 
 running a medium traffic website based on SQLite you should be easily able to handle load 
@@ -17,10 +16,8 @@ Starting 0.4+ Marmot depends on [nats-server](https://nats.io/download/) with Je
 
 ## Production status
 
-**MARMOT IS NOT READY FOR PRODUCTION USAGE**
-
-Right now it's being used for ephemeral cache storage in production services, on a very read heavy site. 
-This easily replicates cache values across the cluster, keeping a fast local copy of cache database.
+ - `v0.4` is production ready.
+ - `v0.3` is deprecated, and unstable. DO NOT USE IT IN PRODUCTION.
 
 ## Features
 
@@ -31,7 +28,7 @@ This easily replicates cache values across the cluster, keeping a fast local cop
 
 To be implemented for next GA:
  - Command batching + compression for speeding up bulk load / commit commands to propagate quickly
- - Per node database level command ordering
+ - Database snapshotting and restore for cold-start and out-of-date nodes
 
 ## Running
 
