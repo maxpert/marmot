@@ -16,8 +16,8 @@ Starting 0.4+ Marmot depends on [nats-server](https://nats.io/download/) with Je
 
 ## Production status
 
- - `v0.4` is production ready.
- - `v0.3` is deprecated, and unstable. DO NOT USE IT IN PRODUCTION.
+ - `v0.4.x` is production ready.
+ - `v0.3.x` is deprecated, and unstable. DO NOT USE IT IN PRODUCTION.
 
 ## Features
 
