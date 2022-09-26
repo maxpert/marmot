@@ -1,4 +1,4 @@
-package lib
+package logstream
 
 import "github.com/fxamacker/cbor/v2"
 
