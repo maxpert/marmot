@@ -33,7 +33,9 @@ those JetStreams (To be automated in future versions).
 
 ## Dependencies
 Starting 0.4+ Marmot depends on [nats-server](https://nats.io/download/) with JetStream support.
-Instead of building an in process consensus algorithm, 
+Instead of building an in process consensus algorithm, this unlocks more use-cases like letting 
+external applications subscribe to these changes and build more complex use-cases around their
+application needs.
 
 ## Production status
 
