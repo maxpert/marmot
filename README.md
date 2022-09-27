@@ -3,16 +3,37 @@ A distributed SQLite replicator.
 
 [![Go](https://github.com/maxpert/marmot/actions/workflows/go.yml/badge.svg)](https://github.com/maxpert/marmot/actions/workflows/go.yml)
 
-## What is it useful for right now?
+## What & Why?
 Marmot can give you a solid replication between your nodes as Marmot builds on top of fault-tolerant 
 [NATS](https://nats.io/), thus allowing robust recovery and replication. This means if you are 
-running a medium traffic website based on SQLite you should be easily able to handle load 
-without any problems. Read heavy workloads won't be bottle-necked at all as Marmot serves 
-as a side car letting you build replication cluster without making any changes to your 
-application code, and allows you to keep using to your SQLite database file. 
+running a read heavy website based on SQLite you should be easily able to scale it out by
+adding more SQLite replicated nodes. SQLite is a probably the most ubiquitous DB that 
+exists almost everywhere, this project aims to make it even more ubiquitous for 
+server side applications by building a masterless replication layer on top.
+
+## What is the difference from others?
+
+There are a few solutions like [rqlite](https://github.com/rqlite/rqlite), [dqlite](https://dqlite.io/), and 
+[LiteFS](https://github.com/superfly/litefs) etc. All of them either are layers on top of SQLite (e.g. 
+rqlite, dqlite) that requires them to sit in the middle with network layer in order to provide 
+replication; or intercept phsycial page level writes to stream them off to replicas. In both
+cases they are mostly single primary where all the writes have to go, backed by multiple 
+replicas that can only be readonly. 
+
+Marmot on the other hand is born different. Instead of being single primary it is "masterless", instead of being strongly consistent, 
+it's eventually consistent, does not require any changes to your application logic for reading/writing. This means:
+
+ - You can read and write to your SQLite database like you normally do.
+ - You can write on any node! You don't have to go to single master for writing your data.
+ - As long as you start with same copy of database, all the mutations will eventually converge (hence eventually consistent).
+
+Marmot is a CDC (Change Data Capture) pipeline running top of NATS. It can automatically confgure appropriate JetStreams making sure 
+those streams evenly distribute load over those shards, so scaling simply boils down to adding more nodes, and rebalancing 
+those JetStreams (To be automated in future versions). 
 
 ## Dependencies
 Starting 0.4+ Marmot depends on [nats-server](https://nats.io/download/) with JetStream support.
+Instead of building an in process consensus algorithm, 
 
 ## Production status
 
