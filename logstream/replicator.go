@@ -1,9 +1,11 @@
 package logstream
 
 import (
+	"bytes"
 	"fmt"
 	"time"
 
+	"github.com/klauspost/compress/zstd"
 	"github.com/nats-io/nats.go"
 	"github.com/rs/zerolog/log"
 )
@@ -18,14 +20,15 @@ var StreamNamePrefix = "marmot-changes"
 var SubjectPrefix = "marmot-change-log"
 
 type Replicator struct {
-	nodeID uint64
-	shards uint64
+	nodeID             uint64
+	shards             uint64
+	compressionEnabled bool
 
 	client    *nats.Conn
 	streamMap map[uint64]nats.JetStream
 }
 
-func NewReplicator(nodeID uint64, natsServer string, shards uint64) (*Replicator, error) {
+func NewReplicator(nodeID uint64, natsServer string, shards uint64, compress bool) (*Replicator, error) {
 	nc, err := nats.Connect(natsServer, nats.Name(nodeName(nodeID)))
 
 	if err != nil {
@@ -66,8 +69,9 @@ func NewReplicator(nodeID uint64, natsServer string, shards uint64) (*Replicator
 	}
 
 	return &Replicator{
-		client: nc,
-		nodeID: nodeID,
+		client:             nc,
+		nodeID:             nodeID,
+		compressionEnabled: compress,
 
 		shards:    shards,
 		streamMap: streamMap,
@@ -79,6 +83,15 @@ func (r *Replicator) Publish(hash uint64, payload []byte) error {
 	js, ok := r.streamMap[shardID]
 	if !ok {
 		log.Panic().Uint64("shard", shardID).Msg("Invalid shard")
+	}
+
+	if r.compressionEnabled {
+		compPayload, err := compress(payload)
+		if err != nil {
+			return err
+		}
+
+		payload = compPayload
 	}
 
 	ack, err := js.Publish(subjectName(shardID), payload)
@@ -115,8 +128,16 @@ func (r *Replicator) Listen(shardID uint64, callback func(payload []byte) error)
 			return err
 		}
 
+		payload := msg.Data
+		if r.compressionEnabled {
+			payload, err = decompress(msg.Data)
+			if err != nil {
+				return err
+			}
+		}
+
 		log.Debug().Str("sub", msg.Subject).Uint64("shard", shardID).Send()
-		err = callback(msg.Data)
+		err = callback(payload)
 		if err != nil {
 			if replRetry > maxReplicateRetries {
 				return err
@@ -167,4 +188,39 @@ func nodeName(nodeID uint64) string {
 
 func subjectName(shardID uint64) string {
 	return fmt.Sprintf("%s-%d", SubjectPrefix, shardID)
+}
+
+func compress(payload []byte) ([]byte, error) {
+	buff := make([]byte, 0)
+	enc, err := zstd.NewWriter(bytes.NewBuffer(buff))
+	if err != nil {
+		return nil, err
+	}
+
+	_, err = enc.Write(payload)
+	if err != nil {
+		return nil, err
+	}
+
+	err = enc.Flush()
+	if err != nil {
+		return nil, err
+	}
+
+	return buff, nil
+}
+
+func decompress(payload []byte) ([]byte, error) {
+	dec, err := zstd.NewReader(bytes.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+
+	buff := make([]byte, 0)
+	_, err = dec.Read(buff)
+	if err != nil {
+		return nil, err
+	}
+
+	return buff, nil
 }

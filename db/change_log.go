@@ -66,7 +66,7 @@ func (conn *SqliteStreamDB) Replicate(event *ChangeLogEvent) error {
 	return nil
 }
 
-func (conn *SqliteStreamDB) DeleteChangeLog(event *ChangeLogEvent) (bool, error) {
+func (conn *SqliteStreamDB) DeletePublishedLog(event *ChangeLogEvent) (bool, error) {
 	metaTableName := conn.metaTable(event.TableName, changeLogName)
 	rs, err := conn.Delete(metaTableName).
 		Where(goqu.Ex{

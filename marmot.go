@@ -22,6 +22,7 @@ func main() {
 	logReplicas := flag.Int("log-replicas", 1, "Number of copies to be committed for single change log")
 	subjectPrefix := flag.String("subject-prefix", "marmot-change-log", "Prefix for publish subjects")
 	streamPrefix := flag.String("stream-prefix", "marmot-changes", "Prefix for publish subjects")
+	enableCompress := flag.Bool("compress", false, "Enable message compression")
 	verbose := flag.Bool("verbose", false, "Log debug level")
 	flag.Parse()
 
@@ -60,7 +61,7 @@ func main() {
 		return
 	}
 
-	rep, err := logstream.NewReplicator(*nodeID, *natsAddr, *shards)
+	rep, err := logstream.NewReplicator(*nodeID, *natsAddr, *shards, *enableCompress)
 	if err != nil {
 		log.Panic().Err(err).Msg("Unable to connect")
 	}
@@ -115,7 +116,7 @@ func onChangeEvent(streamDB *db.SqliteStreamDB) func(data []byte) error {
 			return err
 		}
 
-		_, _ = streamDB.DeleteChangeLog(ev.Payload)
+		_, _ = streamDB.DeletePublishedLog(ev.Payload)
 		return streamDB.Replicate(ev.Payload)
 	}
 }
