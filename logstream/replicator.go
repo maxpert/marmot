@@ -42,7 +42,7 @@ func NewReplicator(nodeID uint64, natsServer string, shards uint64, compress boo
 			return nil, err
 		}
 
-		streamCfg := makeShardConfig(shard, shards)
+		streamCfg := makeShardConfig(shard, shards, compress)
 		info, err := js.StreamInfo(streamCfg.Name)
 		if err == nats.ErrStreamNotFound {
 			log.Debug().Uint64("shard", shard).Msg("Creating stream")
@@ -163,8 +163,13 @@ func (r *Replicator) Listen(shardID uint64, callback func(payload []byte) error)
 	return nil
 }
 
-func makeShardConfig(shardID uint64, totalShards uint64) *nats.StreamConfig {
-	streamName := fmt.Sprintf("%s-%d-%d", StreamNamePrefix, totalShards, shardID)
+func makeShardConfig(shardID uint64, totalShards uint64, compressed bool) *nats.StreamConfig {
+	compPostfix := ""
+	if compressed {
+		compPostfix = "-c"
+	}
+
+	streamName := fmt.Sprintf("%s%s-%d", StreamNamePrefix, compPostfix, shardID)
 	replicas := EntryReplicas
 	if replicas < 1 {
 		replicas = int(totalShards>>1) + 1
