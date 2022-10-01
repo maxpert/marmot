@@ -1,7 +1,6 @@
 package logstream
 
 import (
-	"bytes"
 	"fmt"
 	"time"
 
@@ -54,11 +53,16 @@ func NewReplicator(nodeID uint64, natsServer string, shards uint64, compress boo
 			return nil, err
 		}
 
+		leader := ""
+		if info.Cluster != nil {
+			leader = info.Cluster.Leader
+		}
+
 		log.Debug().
 			Uint64("shard", shard).
 			Str("name", info.Config.Name).
 			Int("replicas", info.Config.Replicas).
-			Str("leader", info.Cluster.Leader).
+			Str("leader", leader).
 			Msg("Stream ready...")
 
 		if err != nil {
@@ -86,7 +90,7 @@ func (r *Replicator) Publish(hash uint64, payload []byte) error {
 	}
 
 	if r.compressionEnabled {
-		compPayload, err := compress(payload)
+		compPayload, err := payloadCompress(payload)
 		if err != nil {
 			return err
 		}
@@ -130,7 +134,7 @@ func (r *Replicator) Listen(shardID uint64, callback func(payload []byte) error)
 
 		payload := msg.Data
 		if r.compressionEnabled {
-			payload, err = decompress(msg.Data)
+			payload, err = payloadDecompress(msg.Data)
 			if err != nil {
 				return err
 			}
@@ -190,37 +194,20 @@ func subjectName(shardID uint64) string {
 	return fmt.Sprintf("%s-%d", SubjectPrefix, shardID)
 }
 
-func compress(payload []byte) ([]byte, error) {
-	buff := make([]byte, 0)
-	enc, err := zstd.NewWriter(bytes.NewBuffer(buff))
+func payloadCompress(payload []byte) ([]byte, error) {
+	enc, err := zstd.NewWriter(nil)
 	if err != nil {
 		return nil, err
 	}
 
-	_, err = enc.Write(payload)
-	if err != nil {
-		return nil, err
-	}
-
-	err = enc.Flush()
-	if err != nil {
-		return nil, err
-	}
-
-	return buff, nil
+	return enc.EncodeAll(payload, nil), nil
 }
 
-func decompress(payload []byte) ([]byte, error) {
-	dec, err := zstd.NewReader(bytes.NewReader(payload))
+func payloadDecompress(payload []byte) ([]byte, error) {
+	dec, err := zstd.NewReader(nil)
 	if err != nil {
 		return nil, err
 	}
 
-	buff := make([]byte, 0)
-	_, err = dec.Read(buff)
-	if err != nil {
-		return nil, err
-	}
-
-	return buff, nil
+	return dec.DecodeAll(payload, nil)
 }
