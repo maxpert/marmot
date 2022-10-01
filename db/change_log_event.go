@@ -1,15 +1,16 @@
 package db
 
 import (
+	"hash/crc64"
 	"sort"
 	"sync"
 
-	"github.com/cespare/xxhash"
 	"github.com/fxamacker/cbor/v2"
 )
 
 var tablePKColumnsCache = make(map[string][]string)
 var tablePKColumnsLock = sync.RWMutex{}
+var crc64Table = crc64.MakeTable(crc64.ECMA)
 
 type ChangeLogEvent struct {
 	Id        int64
@@ -28,7 +29,7 @@ func (e *ChangeLogEvent) Unmarshal(data []byte) error {
 }
 
 func (e *ChangeLogEvent) Hash() (uint64, error) {
-	hasher := xxhash.New()
+	hasher := crc64.New(crc64Table)
 	enc := cbor.NewEncoder(hasher)
 	err := enc.StartIndefiniteArray()
 	if err != nil {
@@ -42,7 +43,7 @@ func (e *ChangeLogEvent) Hash() (uint64, error) {
 
 	pkColumns := e.getSortedPKColumns()
 	for _, pk := range pkColumns {
-		err = enc.Encode(e.Row[pk])
+		err = enc.Encode([]any{pk, e.Row[pk]})
 		if err != nil {
 			return 0, err
 		}
