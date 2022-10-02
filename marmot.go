@@ -115,7 +115,6 @@ func onChangeEvent(streamDB *db.SqliteStreamDB) func(data []byte) error {
 			return err
 		}
 
-		_, _ = streamDB.DeleteChangeLog(ev.Payload)
 		return streamDB.Replicate(ev.Payload)
 	}
 }
