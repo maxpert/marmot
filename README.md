@@ -2,6 +2,7 @@
 A distributed SQLite replicator. 
 
 [![Go](https://github.com/maxpert/marmot/actions/workflows/go.yml/badge.svg)](https://github.com/maxpert/marmot/actions/workflows/go.yml)
+[![Discord](https://badgen.net/badge/icon/discord?icon=discord&label)](https://discord.gg/AWUwY66XsE)
 
 ## What & Why?
 Marmot can give you a solid replication between your nodes as Marmot builds on top of fault-tolerant 
@@ -119,6 +120,7 @@ Right now there are a few limitations on current solution:
  - Marmot is eventually consistent. This simply means rows can get synced out of order, and `SERIALIZABLE` assumptions 
    on transactions might not hold true anymore.
 
-## FAQs
+## FAQs & Community 
 
-For FAQs visit [this page](https://sibte.notion.site/sibte/Marmot-056983fad27a49d4a16fb91031e6ab98)
+ - For FAQs visit [this page](https://sibte.notion.site/sibte/Marmot-056983fad27a49d4a16fb91031e6ab98)
+ - For community visit our [discord](https://discord.gg/AWUwY66XsE) or discussions on GitHub
