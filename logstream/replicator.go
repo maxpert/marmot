@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/klauspost/compress/zstd"
 	"github.com/nats-io/nats.go"
 	"github.com/rs/zerolog/log"
 )
@@ -18,14 +19,15 @@ var StreamNamePrefix = "marmot-changes"
 var SubjectPrefix = "marmot-change-log"
 
 type Replicator struct {
-	nodeID uint64
-	shards uint64
+	nodeID             uint64
+	shards             uint64
+	compressionEnabled bool
 
 	client    *nats.Conn
 	streamMap map[uint64]nats.JetStream
 }
 
-func NewReplicator(nodeID uint64, natsServer string, shards uint64) (*Replicator, error) {
+func NewReplicator(nodeID uint64, natsServer string, shards uint64, compress bool) (*Replicator, error) {
 	nc, err := nats.Connect(natsServer, nats.Name(nodeName(nodeID)))
 
 	if err != nil {
@@ -40,7 +42,7 @@ func NewReplicator(nodeID uint64, natsServer string, shards uint64) (*Replicator
 			return nil, err
 		}
 
-		streamCfg := makeShardConfig(shard, shards)
+		streamCfg := makeShardConfig(shard, shards, compress)
 		info, err := js.StreamInfo(streamCfg.Name)
 		if err == nats.ErrStreamNotFound {
 			log.Debug().Uint64("shard", shard).Msg("Creating stream")
@@ -51,11 +53,16 @@ func NewReplicator(nodeID uint64, natsServer string, shards uint64) (*Replicator
 			return nil, err
 		}
 
+		leader := ""
+		if info.Cluster != nil {
+			leader = info.Cluster.Leader
+		}
+
 		log.Debug().
 			Uint64("shard", shard).
 			Str("name", info.Config.Name).
 			Int("replicas", info.Config.Replicas).
-			Str("leader", info.Cluster.Leader).
+			Str("leader", leader).
 			Msg("Stream ready...")
 
 		if err != nil {
@@ -66,8 +73,9 @@ func NewReplicator(nodeID uint64, natsServer string, shards uint64) (*Replicator
 	}
 
 	return &Replicator{
-		client: nc,
-		nodeID: nodeID,
+		client:             nc,
+		nodeID:             nodeID,
+		compressionEnabled: compress,
 
 		shards:    shards,
 		streamMap: streamMap,
@@ -79,6 +87,15 @@ func (r *Replicator) Publish(hash uint64, payload []byte) error {
 	js, ok := r.streamMap[shardID]
 	if !ok {
 		log.Panic().Uint64("shard", shardID).Msg("Invalid shard")
+	}
+
+	if r.compressionEnabled {
+		compPayload, err := payloadCompress(payload)
+		if err != nil {
+			return err
+		}
+
+		payload = compPayload
 	}
 
 	ack, err := js.Publish(subjectName(shardID), payload)
@@ -115,8 +132,16 @@ func (r *Replicator) Listen(shardID uint64, callback func(payload []byte) error)
 			return err
 		}
 
+		payload := msg.Data
+		if r.compressionEnabled {
+			payload, err = payloadDecompress(msg.Data)
+			if err != nil {
+				return err
+			}
+		}
+
 		log.Debug().Str("sub", msg.Subject).Uint64("shard", shardID).Send()
-		err = callback(msg.Data)
+		err = callback(payload)
 		if err != nil {
 			if replRetry > maxReplicateRetries {
 				return err
@@ -138,8 +163,13 @@ func (r *Replicator) Listen(shardID uint64, callback func(payload []byte) error)
 	return nil
 }
 
-func makeShardConfig(shardID uint64, totalShards uint64) *nats.StreamConfig {
-	streamName := fmt.Sprintf("%s-%d-%d", StreamNamePrefix, totalShards, shardID)
+func makeShardConfig(shardID uint64, totalShards uint64, compressed bool) *nats.StreamConfig {
+	compPostfix := ""
+	if compressed {
+		compPostfix = "-c"
+	}
+
+	streamName := fmt.Sprintf("%s%s-%d", StreamNamePrefix, compPostfix, shardID)
 	replicas := EntryReplicas
 	if replicas < 1 {
 		replicas = int(totalShards>>1) + 1
@@ -167,4 +197,22 @@ func nodeName(nodeID uint64) string {
 
 func subjectName(shardID uint64) string {
 	return fmt.Sprintf("%s-%d", SubjectPrefix, shardID)
+}
+
+func payloadCompress(payload []byte) ([]byte, error) {
+	enc, err := zstd.NewWriter(nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return enc.EncodeAll(payload, nil), nil
+}
+
+func payloadDecompress(payload []byte) ([]byte, error) {
+	dec, err := zstd.NewReader(nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return dec.DecodeAll(payload, nil)
 }
