@@ -10,7 +10,7 @@ import (
 const deleteTriggerQuery = `DROP TRIGGER IF EXISTS %s`
 const deleteMarmotTables = `DROP TABLE IF EXISTS %s;`
 
-func cleanMarmotTriggers(conn *goqu.Database, prefix string) error {
+func removeMarmotTriggers(conn *goqu.Database, prefix string) error {
 	triggers := make([]string, 0)
 	err := conn.
 		Select("name").
@@ -34,7 +34,7 @@ func cleanMarmotTriggers(conn *goqu.Database, prefix string) error {
 	return nil
 }
 
-func clearMarmotTables(conn *goqu.Database, prefix string) error {
+func removeMarmotTables(conn *goqu.Database, prefix string) error {
 	tables := make([]string, 0)
 	err := conn.
 		Select("name").

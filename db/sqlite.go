@@ -137,13 +137,13 @@ func (conn *SqliteStreamDB) InstallCDC() error {
 
 func (conn *SqliteStreamDB) RemoveCDC(tables bool) error {
 	log.Info().Msg("Uninstalling all CDC triggers...")
-	err := cleanMarmotTriggers(conn.Database, conn.prefix)
+	err := removeMarmotTriggers(conn.Database, conn.prefix)
 	if err != nil {
 		return err
 	}
 
 	if tables {
-		return clearMarmotTables(conn.Database, conn.prefix)
+		return removeMarmotTables(conn.Database, conn.prefix)
 	}
 
 	return nil
@@ -232,7 +232,12 @@ func (conn *SqliteStreamDB) BackupTo(bkFilePath string) error {
 	}
 
 	gSQL := goqu.New("sqlite", sqlDB)
-	err = cleanMarmotTriggers(gSQL, conn.prefix)
+	err = removeMarmotTriggers(gSQL, conn.prefix)
+	if err != nil {
+		return err
+	}
+
+	err = removeMarmotTables(gSQL, conn.prefix)
 	if err != nil {
 		return err
 	}
