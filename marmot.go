@@ -28,9 +28,11 @@ func main() {
 	flag.Parse()
 
 	logstream.MaxLogEntries = *maxLogEntries
-	logstream.EntryReplicas = *logReplicas
 	logstream.SubjectPrefix = *subjectPrefix
 	logstream.StreamNamePrefix = *streamPrefix
+
+	logstream.EntryReplicas = *logReplicas
+	snapshot.BucketReplicas = *logReplicas
 
 	if *verbose {
 		log.Logger = log.Level(zerolog.DebugLevel)
