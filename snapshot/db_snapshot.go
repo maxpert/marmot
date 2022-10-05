@@ -11,15 +11,16 @@ import (
 	"time"
 
 	"github.com/maxpert/marmot/db"
-	"github.com/maxpert/marmot/logstream"
 	"github.com/nats-io/nats.go"
 	"github.com/rs/zerolog/log"
 )
 
+var BucketReplicas = 1
 var ErrInvalidSnapshot = errors.New("invalid snapshot")
+var ErrPendingSnapshot = errors.New("system busy capturing snapshot")
 var BucketPrefix = "marmot-snapshot"
 
-const TempDirPattern = "marmot-snapshot/*"
+const TempDirPattern = "marmot-snapshot-*"
 const FileName = "snapshot.db"
 const HashHeaderKey = "marmot-snapshot-tag"
 
@@ -36,7 +37,11 @@ func NewNatsDBSnapshot(d *db.SqliteStreamDB) *NatsDBSnapshot {
 }
 
 func (n *NatsDBSnapshot) SaveSnapshot(conn *nats.Conn) error {
-	n.mutex.Lock()
+	locked := n.mutex.TryLock()
+	if !locked {
+		return ErrPendingSnapshot
+	}
+
 	defer n.mutex.Unlock()
 
 	blb, err := getBlobStore(conn)
@@ -146,7 +151,7 @@ func (n *NatsDBSnapshot) RestoreSnapshot(conn *nats.Conn) error {
 func cleanupDir(p string) {
 	for i := 0; i < 5; i++ {
 		err := os.RemoveAll(p)
-		if err != nil {
+		if err == nil {
 			return
 		}
 
@@ -179,10 +184,10 @@ func getBlobStore(conn *nats.Conn) (nats.ObjectStore, error) {
 	}
 
 	blb, err := js.ObjectStore(blobBucketName())
-	if err == nats.ErrBucketNotFound {
+	if err == nats.ErrStreamNotFound {
 		blb, err = js.CreateObjectStore(&nats.ObjectStoreConfig{
 			Bucket:      keyValueBucketName(),
-			Replicas:    logstream.EntryReplicas,
+			Replicas:    BucketReplicas,
 			Storage:     nats.FileStorage,
 			Description: "Bucket to store snapshot",
 		})
