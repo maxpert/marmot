@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/klauspost/compress/zstd"
+	"github.com/maxpert/marmot/snapshot"
 	"github.com/nats-io/nats.go"
 	"github.com/rs/zerolog/log"
 )
@@ -15,6 +16,7 @@ const NodeNamePrefix = "marmot-node"
 
 var MaxLogEntries = int64(1024)
 var EntryReplicas = 1
+var SnapshotShardID = uint64(1)
 var StreamNamePrefix = "marmot-changes"
 var SubjectPrefix = "marmot-change-log"
 
@@ -25,9 +27,16 @@ type Replicator struct {
 
 	client    *nats.Conn
 	streamMap map[uint64]nats.JetStream
+	snapshot  snapshot.NatsSnapshot
 }
 
-func NewReplicator(nodeID uint64, natsServer string, shards uint64, compress bool) (*Replicator, error) {
+func NewReplicator(
+	nodeID uint64,
+	natsServer string,
+	shards uint64,
+	compress bool,
+	snapshot snapshot.NatsSnapshot,
+) (*Replicator, error) {
 	nc, err := nats.Connect(natsServer, nats.Name(nodeName(nodeID)))
 
 	if err != nil {
@@ -79,6 +88,7 @@ func NewReplicator(nodeID uint64, natsServer string, shards uint64, compress boo
 
 		shards:    shards,
 		streamMap: streamMap,
+		snapshot:  snapshot,
 	}, nil
 }
 
@@ -101,6 +111,10 @@ func (r *Replicator) Publish(hash uint64, payload []byte) error {
 	ack, err := js.Publish(subjectName(shardID), payload)
 	if err != nil {
 		return err
+	}
+
+	if ack.Sequence%uint64(MaxLogEntries) == 0 && shardID == SnapshotShardID {
+		go r.saveSnapshot()
 	}
 
 	log.Debug().Uint64("seq", ack.Sequence).Msg(ack.Stream)
@@ -161,6 +175,27 @@ func (r *Replicator) Listen(shardID uint64, callback func(payload []byte) error)
 	}
 
 	return nil
+}
+
+func (r *Replicator) RestoreSnapshot() error {
+	if r.snapshot == nil {
+		return nil
+	}
+
+	return r.snapshot.RestoreSnapshot(r.client)
+}
+
+func (r *Replicator) saveSnapshot() {
+	if r.snapshot == nil {
+		return
+	}
+
+	err := r.snapshot.SaveSnapshot(r.client)
+	if err != nil {
+		log.Error().
+			Err(err).
+			Msg("Unable snapshot database")
+	}
 }
 
 func makeShardConfig(shardID uint64, totalShards uint64, compressed bool) *nats.StreamConfig {
