@@ -113,8 +113,9 @@ func (r *Replicator) Publish(hash uint64, payload []byte) error {
 		return err
 	}
 
-	if ack.Sequence%uint64(MaxLogEntries) == 0 && shardID == SnapshotShardID {
-		go r.saveSnapshot()
+	snapshotEntries := uint64(MaxLogEntries) / r.shards
+	if snapshotEntries != 0 && ack.Sequence%snapshotEntries == 0 && shardID == SnapshotShardID {
+		go r.SaveSnapshot()
 	}
 
 	log.Debug().Uint64("seq", ack.Sequence).Msg(ack.Stream)
@@ -185,7 +186,7 @@ func (r *Replicator) RestoreSnapshot() error {
 	return r.snapshot.RestoreSnapshot(r.client)
 }
 
-func (r *Replicator) saveSnapshot() {
+func (r *Replicator) SaveSnapshot() {
 	if r.snapshot == nil {
 		return
 	}
