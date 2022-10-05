@@ -7,6 +7,7 @@ import (
 
 	"github.com/maxpert/marmot/db"
 	"github.com/maxpert/marmot/logstream"
+	"github.com/maxpert/marmot/snapshot"
 
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
@@ -61,9 +62,20 @@ func main() {
 		return
 	}
 
-	rep, err := logstream.NewReplicator(*nodeID, *natsAddr, *shards, *enableCompress)
+	rep, err := logstream.NewReplicator(
+		*nodeID,
+		*natsAddr,
+		*shards,
+		*enableCompress,
+		snapshot.NewNatsDBSnapshot(streamDB),
+	)
 	if err != nil {
 		log.Panic().Err(err).Msg("Unable to connect")
+	}
+
+	err = rep.RestoreSnapshot()
+	if err != nil {
+		log.Panic().Err(err).Msg("Unable to restore snapshot")
 	}
 
 	streamDB.OnChange = onTableChanged(rep, *nodeID)
