@@ -10,16 +10,16 @@ import (
 	"sync"
 	"time"
 
+	"github.com/maxpert/marmot/cfg"
 	"github.com/maxpert/marmot/db"
 	"github.com/nats-io/nats.go"
 	"github.com/rs/zerolog/log"
 )
 
-var BucketReplicas = 1
 var ErrInvalidSnapshot = errors.New("invalid snapshot")
 var ErrPendingSnapshot = errors.New("system busy capturing snapshot")
-var BucketPrefix = "marmot-snapshot"
 
+const BucketPrefix = "marmot-snapshot"
 const TempDirPattern = "marmot-snapshot-*"
 const FileName = "snapshot.db"
 const HashHeaderKey = "marmot-snapshot-tag"
@@ -187,7 +187,7 @@ func getBlobStore(conn *nats.Conn) (nats.ObjectStore, error) {
 	if err == nats.ErrStreamNotFound {
 		blb, err = js.CreateObjectStore(&nats.ObjectStoreConfig{
 			Bucket:      keyValueBucketName(),
-			Replicas:    BucketReplicas,
+			Replicas:    *cfg.LogReplicas,
 			Storage:     nats.FileStorage,
 			Description: "Bucket to store snapshot",
 		})

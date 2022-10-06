@@ -5,20 +5,15 @@ import (
 	"time"
 
 	"github.com/klauspost/compress/zstd"
+	"github.com/maxpert/marmot/cfg"
 	"github.com/maxpert/marmot/snapshot"
 	"github.com/nats-io/nats.go"
 	"github.com/rs/zerolog/log"
 )
 
 const maxReplicateRetries = 7
-const DefaultUrl = nats.DefaultURL
 const NodeNamePrefix = "marmot-node"
-
-var MaxLogEntries = int64(1024)
-var EntryReplicas = 1
-var SnapshotShardID = uint64(1)
-var StreamNamePrefix = "marmot-changes"
-var SubjectPrefix = "marmot-change-log"
+const SnapshotShardID = uint64(1)
 
 type Replicator struct {
 	nodeID             uint64
@@ -113,7 +108,7 @@ func (r *Replicator) Publish(hash uint64, payload []byte) error {
 		return err
 	}
 
-	snapshotEntries := uint64(MaxLogEntries) / r.shards
+	snapshotEntries := uint64(*cfg.MaxLogEntries) / r.shards
 	if snapshotEntries != 0 && ack.Sequence%snapshotEntries == 0 && shardID == SnapshotShardID {
 		go r.SaveSnapshot()
 	}
@@ -205,8 +200,8 @@ func makeShardConfig(shardID uint64, totalShards uint64, compressed bool) *nats.
 		compPostfix = "-c"
 	}
 
-	streamName := fmt.Sprintf("%s%s-%d", StreamNamePrefix, compPostfix, shardID)
-	replicas := EntryReplicas
+	streamName := fmt.Sprintf("%s%s-%d", *cfg.StreamPrefix, compPostfix, shardID)
+	replicas := *cfg.LogReplicas
 	if replicas < 1 {
 		replicas = int(totalShards>>1) + 1
 	}
@@ -215,7 +210,7 @@ func makeShardConfig(shardID uint64, totalShards uint64, compressed bool) *nats.
 		Name:              streamName,
 		Subjects:          []string{subjectName(shardID)},
 		Discard:           nats.DiscardOld,
-		MaxMsgs:           MaxLogEntries,
+		MaxMsgs:           *cfg.MaxLogEntries,
 		Storage:           nats.FileStorage,
 		Retention:         nats.LimitsPolicy,
 		AllowDirect:       true,
@@ -232,7 +227,7 @@ func nodeName(nodeID uint64) string {
 }
 
 func subjectName(shardID uint64) string {
-	return fmt.Sprintf("%s-%d", SubjectPrefix, shardID)
+	return fmt.Sprintf("%s-%d", *cfg.SubjectPrefix, shardID)
 }
 
 func payloadCompress(payload []byte) ([]byte, error) {
