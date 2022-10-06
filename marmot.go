@@ -2,9 +2,9 @@ package main
 
 import (
 	"flag"
-	"math/rand"
 	"time"
 
+	"github.com/maxpert/marmot/cfg"
 	"github.com/maxpert/marmot/db"
 	"github.com/maxpert/marmot/logstream"
 	"github.com/maxpert/marmot/snapshot"
@@ -14,46 +14,28 @@ import (
 )
 
 func main() {
-	cleanup := flag.Bool("cleanup", false, "Cleanup all trigger hooks for marmot")
-	dbPathString := flag.String("db-path", "/tmp/marmot.db", "Path to SQLite database")
-	nodeID := flag.Uint64("node-id", rand.Uint64(), "Node ID")
-	natsAddr := flag.String("nats-url", logstream.DefaultUrl, "NATS server URL")
-	shards := flag.Uint64("shards", 8, "Number of stream shards to distribute change log on")
-	maxLogEntries := flag.Int64("max-log-entries", 1024, "Maximum number of change log entries to persist")
-	logReplicas := flag.Int("log-replicas", 1, "Number of copies to be committed for single change log")
-	subjectPrefix := flag.String("subject-prefix", "marmot-change-log", "Prefix for publish subjects")
-	streamPrefix := flag.String("stream-prefix", "marmot-changes", "Prefix for publish subjects")
-	enableCompress := flag.Bool("compress", false, "Enable message compression")
-	verbose := flag.Bool("verbose", false, "Log debug level")
 	flag.Parse()
 
-	logstream.MaxLogEntries = *maxLogEntries
-	logstream.SubjectPrefix = *subjectPrefix
-	logstream.StreamNamePrefix = *streamPrefix
-
-	logstream.EntryReplicas = *logReplicas
-	snapshot.BucketReplicas = *logReplicas
-
-	if *verbose {
+	if *cfg.Verbose {
 		log.Logger = log.Level(zerolog.DebugLevel)
 	} else {
 		log.Logger = log.Level(zerolog.InfoLevel)
 	}
 
-	log.Debug().Str("path", *dbPathString).Msg("Opening database")
-	tableNames, err := db.GetAllDBTables(*dbPathString)
+	log.Debug().Str("path", *cfg.DBPathString).Msg("Opening database")
+	tableNames, err := db.GetAllDBTables(*cfg.DBPathString)
 	if err != nil {
 		log.Error().Err(err).Msg("Unable to list all tables")
 		return
 	}
 
-	streamDB, err := db.OpenStreamDB(*dbPathString, tableNames)
+	streamDB, err := db.OpenStreamDB(*cfg.DBPathString, tableNames)
 	if err != nil {
 		log.Error().Err(err).Msg("Unable to open database")
 		return
 	}
 
-	if *cleanup {
+	if *cfg.Cleanup {
 		err = streamDB.RemoveCDC(true)
 		if err != nil {
 			log.Panic().Err(err).Msg("Unable to clean up...")
@@ -65,10 +47,10 @@ func main() {
 	}
 
 	rep, err := logstream.NewReplicator(
-		*nodeID,
-		*natsAddr,
-		*shards,
-		*enableCompress,
+		*cfg.NodeID,
+		*cfg.NatsAddr,
+		*cfg.Shards,
+		*cfg.EnableCompress,
 		snapshot.NewNatsDBSnapshot(streamDB),
 	)
 	if err != nil {
@@ -80,7 +62,7 @@ func main() {
 		log.Panic().Err(err).Msg("Unable to restore snapshot")
 	}
 
-	streamDB.OnChange = onTableChanged(rep, *nodeID)
+	streamDB.OnChange = onTableChanged(rep, *cfg.NodeID)
 	log.Info().Msg("Starting change data capture pipeline...")
 	if err := streamDB.InstallCDC(); err != nil {
 		log.Error().Err(err).Msg("Unable to install change data capture pipeline")
@@ -88,7 +70,7 @@ func main() {
 	}
 
 	errChan := make(chan error)
-	for i := uint64(0); i < *shards; i++ {
+	for i := uint64(0); i < *cfg.Shards; i++ {
 		go changeListener(streamDB, rep, i+1, errChan)
 	}
 
