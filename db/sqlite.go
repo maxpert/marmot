@@ -15,17 +15,20 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
+const snapshotTransactionMode = "exclusive"
+
 var MarmotPrefix = "__marmot__"
 
 type SqliteStreamDB struct {
 	*goqu.Database
-	rawConnection     *sqlite3.SQLiteConn
+	OnChange      func(event *ChangeLogEvent) error
+	rawConnection *sqlite3.SQLiteConn
+	watcher       *fsnotify.Watcher
+	publishLock   *sync.Mutex
+
 	dbPath            string
-	watcher           *fsnotify.Watcher
 	prefix            string
-	publishLock       *sync.Mutex
 	watchTablesSchema map[string][]*ColumnInfo
-	OnChange          func(event *ChangeLogEvent) error
 }
 
 type ColumnInfo struct {
@@ -46,19 +49,30 @@ func GetAllDBTables(path string) ([]string, error) {
 	defer conn.Close()
 
 	gSQL := goqu.New("sqlite", conn)
-
 	names := make([]string, 0)
-	err = gSQL.Select("name").From("sqlite_schema").Where(
-		goqu.C("type").Eq("table"),
-		goqu.C("name").NotLike("sqlite_%"),
-		goqu.C("name").NotLike(MarmotPrefix+"%"),
-	).ScanVals(&names)
+	err = gSQL.WithTx(func(tx *goqu.TxDatabase) error {
+		return listDBTables(&names, tx)
+	})
 
 	if err != nil {
 		return nil, err
 	}
 
 	return names, nil
+}
+
+func listDBTables(names *[]string, gSQL *goqu.TxDatabase) error {
+	err := gSQL.Select("name").From("sqlite_schema").Where(
+		goqu.C("type").Eq("table"),
+		goqu.C("name").NotLike("sqlite_%"),
+		goqu.C("name").NotLike(MarmotPrefix+"%"),
+	).ScanVals(names)
+
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func OpenStreamDB(path string, tables []string) (*SqliteStreamDB, error) {
@@ -91,13 +105,21 @@ func OpenStreamDB(path string, tables []string) (*SqliteStreamDB, error) {
 		watchTablesSchema: map[string][]*ColumnInfo{},
 	}
 
-	for _, n := range tables {
-		colInfo, err := ret.GetTableInfo(n)
-		if err != nil {
-			return nil, err
+	err = ret.WithTx(func(tx *goqu.TxDatabase) error {
+		for _, n := range tables {
+			colInfo, err := getTableInfo(tx, n)
+			if err != nil {
+				return err
+			}
+
+			ret.watchTablesSchema[n] = colInfo
 		}
 
-		ret.watchTablesSchema[n] = colInfo
+		return nil
+	})
+
+	if err != nil {
+		return nil, err
 	}
 
 	return ret, nil
@@ -124,14 +146,22 @@ func OpenRaw(dns string) (*sql.DB, *sqlite3.SQLiteConn, error) {
 }
 
 func (conn *SqliteStreamDB) InstallCDC() error {
+	err := conn.installChangeLogTriggers()
+	if err != nil {
+		return err
+	}
+
+	go conn.watchChanges(conn.dbPath)
+	return nil
+}
+
+func (conn *SqliteStreamDB) installChangeLogTriggers() error {
 	for tableName := range conn.watchTablesSchema {
 		err := conn.initTriggers(tableName)
 		if err != nil {
 			return err
 		}
 	}
-
-	go conn.watchChanges(conn.dbPath)
 	return nil
 }
 
@@ -165,9 +195,9 @@ func (conn *SqliteStreamDB) Execute(query string) error {
 	return nil
 }
 
-func (conn *SqliteStreamDB) GetTableInfo(table string) ([]*ColumnInfo, error) {
+func getTableInfo(tx *goqu.TxDatabase, table string) ([]*ColumnInfo, error) {
 	query := "SELECT name, type, `notnull`, dflt_value, pk FROM pragma_table_info(?)"
-	stmt, err := conn.Prepare(query)
+	stmt, err := tx.Prepare(query)
 	if err != nil {
 		return nil, err
 	}
@@ -211,7 +241,7 @@ func (conn *SqliteStreamDB) GetTableInfo(table string) ([]*ColumnInfo, error) {
 }
 
 func (conn *SqliteStreamDB) BackupTo(bkFilePath string) error {
-	_, src, err := OpenRaw(fmt.Sprintf("%s?_foreign_keys=false&_journal_mode=wal", conn.dbPath))
+	sqlDB, src, err := OpenRaw(fmt.Sprintf("%s?mode=ro&_foreign_keys=false&_journal_mode=wal", conn.dbPath))
 	if err != nil {
 		return err
 	}
@@ -222,11 +252,12 @@ func (conn *SqliteStreamDB) BackupTo(bkFilePath string) error {
 		return err
 	}
 
-	if err := src.Close(); err != nil {
-		log.Error().Err(err).Msg("Unable to close source DB")
+	err = src.Close()
+	if err != nil {
+		return err
 	}
 
-	sqlDB, src, err := OpenRaw(fmt.Sprintf("%s?_foreign_keys=false&_journal_mode=wal", bkFilePath))
+	sqlDB, src, err = OpenRaw(fmt.Sprintf("%s?_foreign_keys=false&_journal_mode=wal", bkFilePath))
 	if err != nil {
 		return err
 	}
@@ -247,23 +278,19 @@ func (conn *SqliteStreamDB) BackupTo(bkFilePath string) error {
 
 func (conn *SqliteStreamDB) RestoreFrom(bkFilePath string) error {
 	dnsTpl := "%s?_journal_mode=wal&_foreign_keys=false&&_busy_timeout=30000&_txlock=%s"
-	dns := fmt.Sprintf(dnsTpl, conn.dbPath, "immediate")
+	dns := fmt.Sprintf(dnsTpl, conn.dbPath, snapshotTransactionMode)
 	destDB, dest, err := OpenRaw(dns)
 	if err != nil {
 		return err
 	}
-	defer func() {
-		_ = dest.Close()
-	}()
+	defer dest.Close()
 
-	dns = fmt.Sprintf(dnsTpl, bkFilePath, "immediate")
+	dns = fmt.Sprintf(dnsTpl, bkFilePath, snapshotTransactionMode)
 	srcDB, src, err := OpenRaw(dns)
 	if err != nil {
 		return err
 	}
-	defer func() {
-		_ = src.Close()
-	}()
+	defer src.Close()
 
 	dgSQL := goqu.New("sqlite", destDB)
 	sgSQL := goqu.New("sqlite", srcDB)
@@ -271,7 +298,7 @@ func (conn *SqliteStreamDB) RestoreFrom(bkFilePath string) error {
 	// Source locking is required so that any lock related metadata is mirrored in destination
 	// Transacting on both src and dest in immediate mode makes sure nobody
 	// else is modifying or interacting with DB
-	err = sgSQL.WithTx(func(_ *goqu.TxDatabase) error {
+	err = sgSQL.WithTx(func(dtx *goqu.TxDatabase) error {
 		return dgSQL.WithTx(func(_ *goqu.TxDatabase) error {
 			err := copyFile(conn.dbPath, bkFilePath)
 			if err != nil {
@@ -288,6 +315,24 @@ func (conn *SqliteStreamDB) RestoreFrom(bkFilePath string) error {
 				return err
 			}
 
+			// List and update table list within transaction
+			tableNames := make([]string, 0)
+			err = listDBTables(&tableNames, dtx)
+			if err != nil {
+				return err
+			}
+
+			tableSchema := map[string][]*ColumnInfo{}
+			for _, n := range tableNames {
+				colInfo, err := getTableInfo(dtx, n)
+				if err != nil {
+					return err
+				}
+
+				tableSchema[n] = colInfo
+			}
+
+			conn.watchTablesSchema = tableSchema
 			return nil
 		})
 	})
@@ -296,7 +341,7 @@ func (conn *SqliteStreamDB) RestoreFrom(bkFilePath string) error {
 		return err
 	}
 
-	return conn.InstallCDC()
+	return conn.installChangeLogTriggers()
 }
 
 func (conn *SqliteStreamDB) GetRawConnection() *sqlite3.SQLiteConn {
