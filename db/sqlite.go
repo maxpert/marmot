@@ -61,21 +61,7 @@ func GetAllDBTables(path string) ([]string, error) {
 	return names, nil
 }
 
-func listDBTables(names *[]string, gSQL *goqu.TxDatabase) error {
-	err := gSQL.Select("name").From("sqlite_schema").Where(
-		goqu.C("type").Eq("table"),
-		goqu.C("name").NotLike("sqlite_%"),
-		goqu.C("name").NotLike(MarmotPrefix+"%"),
-	).ScanVals(names)
-
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func OpenStreamDB(path string, tables []string) (*SqliteStreamDB, error) {
+func OpenStreamDB(path string) (*SqliteStreamDB, error) {
 	connectionStr := fmt.Sprintf("%s?_journal_mode=wal", path)
 	conn, rawConn, err := OpenRaw(connectionStr)
 	if err != nil {
@@ -94,32 +80,14 @@ func OpenStreamDB(path string, tables []string) (*SqliteStreamDB, error) {
 		return nil, err
 	}
 
-	sqliteQu := goqu.Dialect("sqlite3")
 	ret := &SqliteStreamDB{
-		Database:          sqliteQu.DB(conn),
+		Database:          goqu.New("sqlite3", conn),
 		rawConnection:     rawConn,
 		watcher:           watcher,
 		dbPath:            path,
 		prefix:            MarmotPrefix,
 		publishLock:       &sync.Mutex{},
 		watchTablesSchema: map[string][]*ColumnInfo{},
-	}
-
-	err = ret.WithTx(func(tx *goqu.TxDatabase) error {
-		for _, n := range tables {
-			colInfo, err := getTableInfo(tx, n)
-			if err != nil {
-				return err
-			}
-
-			ret.watchTablesSchema[n] = colInfo
-		}
-
-		return nil
-	})
-
-	if err != nil {
-		return nil, err
 	}
 
 	return ret, nil
@@ -145,8 +113,24 @@ func OpenRaw(dns string) (*sql.DB, *sqlite3.SQLiteConn, error) {
 	return conn, rawConn, nil
 }
 
-func (conn *SqliteStreamDB) InstallCDC() error {
-	err := conn.installChangeLogTriggers()
+func (conn *SqliteStreamDB) InstallCDC(tables []string) error {
+	err := conn.WithTx(func(tx *goqu.TxDatabase) error {
+		for _, n := range tables {
+			colInfo, err := getTableInfo(tx, n)
+			if err != nil {
+				return err
+			}
+
+			conn.watchTablesSchema[n] = colInfo
+		}
+
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	err = conn.installChangeLogTriggers()
 	if err != nil {
 		return err
 	}
@@ -315,24 +299,6 @@ func (conn *SqliteStreamDB) RestoreFrom(bkFilePath string) error {
 				return err
 			}
 
-			// List and update table list within transaction
-			tableNames := make([]string, 0)
-			err = listDBTables(&tableNames, dtx)
-			if err != nil {
-				return err
-			}
-
-			tableSchema := map[string][]*ColumnInfo{}
-			for _, n := range tableNames {
-				colInfo, err := getTableInfo(dtx, n)
-				if err != nil {
-					return err
-				}
-
-				tableSchema[n] = colInfo
-			}
-
-			conn.watchTablesSchema = tableSchema
 			return nil
 		})
 	})
@@ -341,7 +307,27 @@ func (conn *SqliteStreamDB) RestoreFrom(bkFilePath string) error {
 		return err
 	}
 
-	return conn.installChangeLogTriggers()
+	// Perform checkpoints to make sure database is full ready
+	row := dgSQL.QueryRow("PRAGMA wal_checkpoint(truncate);")
+	rBusy, rLog, rCheckpoint := int64(1), int64(0), int64(0)
+	for rBusy != 0 {
+		err = row.Scan(&rBusy, &rLog, &rCheckpoint)
+		if err != nil {
+			return err
+		}
+
+		if rBusy != 0 {
+			log.Debug().
+				Int64("busy", rBusy).
+				Int64("log", rLog).
+				Int64("checkpoint", rCheckpoint).
+				Msg("Waiting checkpoint...")
+
+			time.Sleep(500 * time.Millisecond)
+		}
+	}
+
+	return nil
 }
 
 func (conn *SqliteStreamDB) GetRawConnection() *sqlite3.SQLiteConn {
@@ -372,4 +358,18 @@ func copyFile(toPath, fromPath string) error {
 		Str("to", toPath).
 		Msg("copyFile")
 	return err
+}
+
+func listDBTables(names *[]string, gSQL *goqu.TxDatabase) error {
+	err := gSQL.Select("name").From("sqlite_schema").Where(
+		goqu.C("type").Eq("table"),
+		goqu.C("name").NotLike("sqlite_%"),
+		goqu.C("name").NotLike(MarmotPrefix+"%"),
+	).ScanVals(names)
+
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
