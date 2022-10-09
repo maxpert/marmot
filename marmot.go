@@ -51,6 +51,11 @@ func main() {
 		log.Panic().Err(err).Msg("Unable to connect")
 	}
 
+	if *cfg.SaveSnapshot {
+		rep.SaveSnapshot()
+		return
+	}
+
 	err = rep.RestoreSnapshot()
 	if err != nil {
 		log.Panic().Err(err).Msg("Unable to restore snapshot")
