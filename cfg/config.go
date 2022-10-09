@@ -8,6 +8,7 @@ import (
 )
 
 var Cleanup = flag.Bool("cleanup", false, "Cleanup all trigger hooks for marmot")
+var SaveSnapshot = flag.Bool("save-snapshot", false, "Only take snapshot and upload")
 var DBPathString = flag.String("db-path", "/tmp/marmot.db", "Path to SQLite database")
 var NodeID = flag.Uint64("node-id", rand.Uint64(), "Node ID")
 var NatsAddr = flag.String("nats-url", nats.DefaultURL, "NATS server URL")
