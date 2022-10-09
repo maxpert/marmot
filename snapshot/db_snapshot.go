@@ -3,7 +3,7 @@ package snapshot
 import (
 	"errors"
 	"fmt"
-	"hash/crc64"
+	"hash/fnv"
 	"io"
 	"os"
 	"path"
@@ -70,6 +70,11 @@ func (n *NatsDBSnapshot) SaveSnapshot(conn *nats.Conn) error {
 		return err
 	}
 	defer rfl.Close()
+
+	err = blb.Delete(FileName)
+	if err != nil {
+		return err
+	}
 
 	info, err := blb.Put(&nats.ObjectMeta{
 		Name: FileName,
@@ -168,7 +173,7 @@ func fileHash(p string) (string, error) {
 	}
 	defer f.Close()
 
-	h := crc64.New(crc64.MakeTable(crc64.ECMA))
+	h := fnv.New64()
 	if _, err := io.Copy(h, f); err != nil {
 		return "", err
 	}
