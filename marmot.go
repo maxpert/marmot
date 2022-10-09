@@ -23,13 +23,7 @@ func main() {
 	}
 
 	log.Debug().Str("path", *cfg.DBPathString).Msg("Opening database")
-	tableNames, err := db.GetAllDBTables(*cfg.DBPathString)
-	if err != nil {
-		log.Error().Err(err).Msg("Unable to list all tables")
-		return
-	}
-
-	streamDB, err := db.OpenStreamDB(*cfg.DBPathString, tableNames)
+	streamDB, err := db.OpenStreamDB(*cfg.DBPathString)
 	if err != nil {
 		log.Error().Err(err).Msg("Unable to open database")
 		return
@@ -62,9 +56,16 @@ func main() {
 		log.Panic().Err(err).Msg("Unable to restore snapshot")
 	}
 
+	log.Info().Msg("Listing tables to watch...")
+	tableNames, err := db.GetAllDBTables(*cfg.DBPathString)
+	if err != nil {
+		log.Error().Err(err).Msg("Unable to list all tables")
+		return
+	}
+
 	streamDB.OnChange = onTableChanged(rep, *cfg.NodeID)
 	log.Info().Msg("Starting change data capture pipeline...")
-	if err := streamDB.InstallCDC(); err != nil {
+	if err := streamDB.InstallCDC(tableNames); err != nil {
 		log.Error().Err(err).Msg("Unable to install change data capture pipeline")
 		return
 	}
