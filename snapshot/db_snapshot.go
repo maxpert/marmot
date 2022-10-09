@@ -72,7 +72,7 @@ func (n *NatsDBSnapshot) SaveSnapshot(conn *nats.Conn) error {
 	defer rfl.Close()
 
 	err = blb.Delete(FileName)
-	if err != nil {
+	if err != nil && err != nats.ErrObjectNotFound {
 		return err
 	}
 
