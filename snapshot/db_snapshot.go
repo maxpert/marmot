@@ -19,7 +19,6 @@ import (
 var ErrInvalidSnapshot = errors.New("invalid snapshot")
 var ErrPendingSnapshot = errors.New("system busy capturing snapshot")
 
-const BucketPrefix = "marmot-snapshot"
 const TempDirPattern = "marmot-snapshot-*"
 const FileName = "snapshot.db"
 const HashHeaderKey = "marmot-snapshot-tag"
@@ -92,16 +91,27 @@ func (n *NatsDBSnapshot) RestoreSnapshot(conn *nats.Conn) error {
 	n.mutex.Lock()
 	defer n.mutex.Unlock()
 
-	blb, err := getBlobStore(conn)
+	tmpSnapshotPath, err := os.MkdirTemp(os.TempDir(), TempDirPattern)
+	if err != nil {
+		return err
+	}
+	defer cleanupDir(tmpSnapshotPath)
+
+	bkFilePath := path.Join(tmpSnapshotPath, FileName)
+	err = n.db.BackupTo(bkFilePath)
 	if err != nil {
 		return err
 	}
 
-	tmpSnapshot, err := os.MkdirTemp(os.TempDir(), TempDirPattern)
+	hash, err := fileHash(bkFilePath)
 	if err != nil {
 		return err
 	}
-	defer cleanupDir(tmpSnapshot)
+
+	blb, err := getBlobStore(conn)
+	if err != nil {
+		return err
+	}
 
 	info, err := blb.GetInfo(FileName)
 	if err == nats.ErrObjectNotFound {
@@ -115,17 +125,6 @@ func (n *NatsDBSnapshot) RestoreSnapshot(conn *nats.Conn) error {
 	snapshotHash, ok := info.Headers[HashHeaderKey]
 	if !ok || len(snapshotHash) != 1 {
 		return ErrInvalidSnapshot
-	}
-
-	bkFilePath := path.Join(tmpSnapshot, FileName)
-	err = n.db.BackupTo(bkFilePath)
-	if err != nil {
-		return err
-	}
-
-	hash, err := fileHash(bkFilePath)
-	if err != nil {
-		return err
 	}
 
 	if hash == snapshotHash[0] {
@@ -156,7 +155,7 @@ func cleanupDir(p string) {
 		}
 
 		log.Warn().Err(err).Str("path", p).Msg("Unable to cleanup directory path")
-		time.Sleep(2 * time.Second)
+		time.Sleep(1 * time.Second)
 	}
 
 	log.Error().Str("path", p).Msg("Unable to cleanup temp path, this might cause disk wastage")
@@ -186,7 +185,7 @@ func getBlobStore(conn *nats.Conn) (nats.ObjectStore, error) {
 	blb, err := js.ObjectStore(blobBucketName())
 	if err == nats.ErrStreamNotFound {
 		blb, err = js.CreateObjectStore(&nats.ObjectStoreConfig{
-			Bucket:      keyValueBucketName(),
+			Bucket:      blobBucketName(),
 			Replicas:    *cfg.LogReplicas,
 			Storage:     nats.FileStorage,
 			Description: "Bucket to store snapshot",
@@ -196,10 +195,6 @@ func getBlobStore(conn *nats.Conn) (nats.ObjectStore, error) {
 	return blb, err
 }
 
-func keyValueBucketName() string {
-	return BucketPrefix + "-meta"
-}
-
 func blobBucketName() string {
-	return BucketPrefix + "-blob"
+	return *cfg.StreamPrefix + "-snapshot-store"
 }
