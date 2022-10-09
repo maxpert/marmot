@@ -120,21 +120,18 @@ func (r *Replicator) Publish(hash uint64, payload []byte) error {
 func (r *Replicator) Listen(shardID uint64, callback func(payload []byte) error) error {
 	js := r.streamMap[shardID]
 
-	sub, err := js.SubscribeSync(
-		subjectName(shardID),
-		nats.Durable(nodeName(r.nodeID)),
-	)
-
+	sub, err := js.SubscribeSync(subjectName(shardID))
 	if err != nil {
 		return err
 	}
 	defer sub.Unsubscribe()
 
-	replRetry := 0
+	repRetry := 0
 	for sub.IsValid() {
-		msg, err := sub.NextMsg(1 * time.Second)
+		msg, err := sub.NextMsg(5 * time.Second)
 
 		if err == nats.ErrTimeout {
+			repRetry = 0
 			continue
 		}
 
@@ -153,21 +150,22 @@ func (r *Replicator) Listen(shardID uint64, callback func(payload []byte) error)
 		log.Debug().Str("sub", msg.Subject).Uint64("shard", shardID).Send()
 		err = callback(payload)
 		if err != nil {
-			if replRetry > maxReplicateRetries {
+			if repRetry > maxReplicateRetries {
 				return err
 			}
 
 			log.Error().Err(err).Msg("Unable to process message retrying")
 			msg.Nak()
-			replRetry++
+			repRetry++
 			continue
 		}
 
-		replRetry = 0
 		err = msg.Ack()
 		if err != nil {
 			return err
 		}
+
+		repRetry = 0
 	}
 
 	return nil
@@ -204,6 +202,10 @@ func makeShardConfig(shardID uint64, totalShards uint64, compressed bool) *nats.
 	replicas := *cfg.LogReplicas
 	if replicas < 1 {
 		replicas = int(totalShards>>1) + 1
+	}
+
+	if replicas > 5 {
+		replicas = 5
 	}
 
 	return &nats.StreamConfig{
