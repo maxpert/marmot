@@ -1,7 +1,7 @@
 package db
 
 import (
-	"hash/crc64"
+	"hash/fnv"
 	"sort"
 	"sync"
 
@@ -10,7 +10,6 @@ import (
 
 var tablePKColumnsCache = make(map[string][]string)
 var tablePKColumnsLock = sync.RWMutex{}
-var crc64Table = crc64.MakeTable(crc64.ECMA)
 
 type ChangeLogEvent struct {
 	Id        int64
@@ -29,7 +28,7 @@ func (e *ChangeLogEvent) Unmarshal(data []byte) error {
 }
 
 func (e *ChangeLogEvent) Hash() (uint64, error) {
-	hasher := crc64.New(crc64Table)
+	hasher := fnv.New64()
 	enc := cbor.NewEncoder(hasher)
 	err := enc.StartIndefiniteArray()
 	if err != nil {
