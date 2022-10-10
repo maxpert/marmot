@@ -218,6 +218,11 @@ func (conn *SqliteStreamDB) BackupTo(bkFilePath string) error {
 	}
 	defer src.Close()
 
+	err = performCheckpoint(goqu.New("sqlite", sqlDB))
+	if err != nil {
+		return err
+	}
+
 	_, err = src.Exec("VACUUM main INTO ?;", []driver.Value{bkFilePath})
 	if err != nil {
 		return err
@@ -382,7 +387,7 @@ func performCheckpoint(gSQL *goqu.Database) error {
 				Int64("checkpoint", rCheckpoint).
 				Msg("Waiting checkpoint...")
 
-			time.Sleep(500 * time.Millisecond)
+			time.Sleep(100 * time.Millisecond)
 		}
 	}
 
