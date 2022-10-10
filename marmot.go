@@ -56,7 +56,7 @@ func main() {
 		return
 	}
 
-	if *cfg.RestoreSnapshot {
+	if *cfg.EnableSnapshot {
 		err = rep.RestoreSnapshot()
 		if err != nil {
 			log.Panic().Err(err).Msg("Unable to restore snapshot")
