@@ -110,13 +110,15 @@ func (r *Replicator) Publish(hash uint64, payload []byte) error {
 		return err
 	}
 
-	snapshotEntries := uint64(*cfg.MaxLogEntries) / r.shards
-	if snapshotEntries != 0 && ack.Sequence%snapshotEntries == 0 && shardID == SnapshotShardID {
-		log.Debug().
-			Uint64("seq", ack.Sequence).
-			Str("stream", ack.Stream).
-			Msg("Initiating save snapshot")
-		go r.SaveSnapshot()
+	if *cfg.EnableSnapshot {
+		snapshotEntries := uint64(*cfg.MaxLogEntries) / r.shards
+		if snapshotEntries != 0 && ack.Sequence%snapshotEntries == 0 && shardID == SnapshotShardID {
+			log.Debug().
+				Uint64("seq", ack.Sequence).
+				Str("stream", ack.Stream).
+				Msg("Initiating save snapshot")
+			go r.SaveSnapshot()
+		}
 	}
 
 	return nil
