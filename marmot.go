@@ -56,9 +56,11 @@ func main() {
 		return
 	}
 
-	err = rep.RestoreSnapshot()
-	if err != nil {
-		log.Panic().Err(err).Msg("Unable to restore snapshot")
+	if *cfg.RestoreSnapshot {
+		err = rep.RestoreSnapshot()
+		if err != nil {
+			log.Panic().Err(err).Msg("Unable to restore snapshot")
+		}
 	}
 
 	log.Info().Msg("Listing tables to watch...")
