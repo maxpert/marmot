@@ -91,7 +91,9 @@ func (r *Replicator) Publish(hash uint64, payload []byte) error {
 	shardID := (hash % r.shards) + 1
 	js, ok := r.streamMap[shardID]
 	if !ok {
-		log.Panic().Uint64("shard", shardID).Msg("Invalid shard")
+		log.Panic().
+			Uint64("shard", shardID).
+			Msg("Invalid shard")
 	}
 
 	if r.compressionEnabled {
@@ -110,10 +112,13 @@ func (r *Replicator) Publish(hash uint64, payload []byte) error {
 
 	snapshotEntries := uint64(*cfg.MaxLogEntries) / r.shards
 	if snapshotEntries != 0 && ack.Sequence%snapshotEntries == 0 && shardID == SnapshotShardID {
+		log.Debug().
+			Uint64("seq", ack.Sequence).
+			Str("stream", ack.Stream).
+			Msg("Initiating save snapshot")
 		go r.SaveSnapshot()
 	}
 
-	log.Debug().Uint64("seq", ack.Sequence).Msg(ack.Stream)
 	return nil
 }
 
@@ -147,7 +152,6 @@ func (r *Replicator) Listen(shardID uint64, callback func(payload []byte) error)
 			}
 		}
 
-		log.Debug().Str("sub", msg.Subject).Uint64("shard", shardID).Send()
 		err = callback(payload)
 		if err != nil {
 			if repRetry > maxReplicateRetries {

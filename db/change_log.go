@@ -136,11 +136,16 @@ func (conn *SqliteStreamDB) consumeReplicationEvent(event *ChangeLogEvent) error
 			return ErrNoTableMapping
 		}
 
-		log.Debug().
-			Str("table", event.TableName).
-			Str("type", event.Type).
+		logEv := log.Debug().
 			Int64("event_id", event.Id).
-			Msg(fmt.Sprintf("Replicating %v", primaryKeyMap))
+			Str("type", event.Type)
+
+		for k, v := range primaryKeyMap {
+			logEv = logEv.Str(event.TableName+"."+k, fmt.Sprintf("%v", v))
+		}
+
+		logEv.Send()
+
 		return replicateRow(tnx, event, primaryKeyMap)
 	})
 }
