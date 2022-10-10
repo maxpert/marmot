@@ -46,13 +46,14 @@ jobs:
         with:
           node-version: "16"
           cache: ${{ steps.detect-package-manager.outputs.manager }}
+          cache-dependency-path: docs/yarn.lock
       - name: Setup Pages
         uses: actions/configure-pages@v2
       - name: Restore cache
         uses: actions/cache@v3
         with:
           path: |
-            .next/cache
+            docs/.next/cache
           key: ${{ runner.os }}-nextjs-${{ hashFiles('**/package-lock.json', '**/yarn.lock') }}-${{ hashFiles('**.[jt]s', '**.[jt]sx') }}
           restore-keys: |
             ${{ runner.os }}-nextjs-${{ hashFiles('**/package-lock.json', '**/yarn.lock') }}-
