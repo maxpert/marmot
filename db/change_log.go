@@ -239,7 +239,10 @@ func (conn *SqliteStreamDB) getGlobalChanges(limit uint) ([]globalChangeLogEntry
 }
 
 func (conn *SqliteStreamDB) publishChangeLog() {
-	conn.publishLock.Lock()
+	if !conn.publishLock.TryLock() {
+		log.Warn().Msg("Publish in progress skipping...")
+		return
+	}
 	defer conn.publishLock.Unlock()
 
 	changes, err := conn.getGlobalChanges(ScanLimit)
