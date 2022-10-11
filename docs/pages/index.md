@@ -1,25 +1,32 @@
-# How does it work?
+# What is Marmot?
 
-Marmot works by using a pretty basic trick so that each process that's access database can capture changes,
-and then Marmot can publish them to rest of the nodes. This is how it works internally:
+Marmot can give you a solid replication between your nodes as Marmot builds on top of fault-tolerant [NATS](https://nats.io/), thus allowing robust recovery and replication. Marmot is designed to be a side car that is eventually consistent, thus optimized for read heavy workloads. 
 
-- Each table gets a `__marmot__<table_name>_change_log` that will record a every change via triggers to
-  change log.
-- Each table gets `insert`, `update`, `delete` triggers in that kicks in `AFTER` the changes have been
-  committed to the table. These triggers record `OLD` or `NEW` values into the table.
+# Why?
 
-When you are running Marmot process, it's watching for changes on DB file and WAL file. Everytime there is a change
-Marmot scans these tables to publish them to other nodes in cluster by:
+SQLite is a probably the most ubiquitous DB that exists almost everywhere, this project aims to make it even more ubiquitous for server 
+side applications by building a masterless replication layer on top. This means if you are running a read heavy website based on SQLite 
+you should be easily able to scale it out by adding more nodes of your app with SQLite replicated nodes. 
 
-- Gather all change records, and for each record calculate a consistent hash based on table name + primary keys.
-- Using the hash decide JetStream and subject the change belongs to. And publish the change into that specific JetStream.
-- Once JetStream has replicated the change log, mark the change published.
-- As soon as change is published to JetStream rest of the nodes replay that log, and row changes are applied via state machine
-  to local tables of the node. This means every row in database due to RAFT consensus at stream level will have only one 
-  deterministic order of changes getting in cluster in case of race-conditions.
-- Once the order is determined for a change it's applied in an upsert or delete manner to the table. So it's quite
-  possible that a row committed locally is overwritten or replaced later because it was not the last one
-  in order of cluster wide commit order.
+# Why not others?
+
+There are a few solutions like [rqlite](https://github.com/rqlite/rqlite), [dqlite](https://dqlite.io/), and 
+[LiteFS](https://github.com/superfly/litefs) etc. All of them either are layers on top of SQLite (e.g. 
+rqlite, dqlite) that requires them to sit in the middle with network layer in order to provide 
+replication; or intercept phsycial page level writes to stream them off to replicas. In both
+cases they are mostly single primary where all the writes have to go, backed by multiple 
+replicas that can only be readonly. 
+
+Marmot on the other hand is born different. Instead of being single primary it is "masterless", instead of being strongly consistent, 
+it's eventually consistent, does not require any changes to your application logic for reading/writing. This means:
+
+ - You can read and write to your SQLite database like you normally do.
+ - You can write on any node! You don't have to go to single master for writing your data.
+ - As long as you start with same copy of database, all the mutations will eventually converge (hence eventually consistent).
+
+Marmot is a CDC (Change Data Capture) pipeline running top of NATS. It can automatically confgure appropriate JetStreams making sure 
+those streams evenly distribute load over those shards, so scaling simply boils down to adding more nodes, and rebalancing 
+those JetStreams (To be automated in future versions). 
 
 ## FAQ
 
