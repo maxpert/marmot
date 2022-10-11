@@ -136,9 +136,6 @@ func (conn *SqliteStreamDB) tableCDCScriptFor(tableName string) (string, error) 
 }
 
 func (conn *SqliteStreamDB) consumeReplicationEvent(event *ChangeLogEvent) error {
-	conn.dbLock.Lock()
-	defer conn.dbLock.Unlock()
-
 	sqlConn, err := conn.pool.Borrow()
 	if err != nil {
 		return err
@@ -277,9 +274,6 @@ func (conn *SqliteStreamDB) publishChangeLog() {
 	}
 	defer conn.publishLock.Unlock()
 
-	conn.dbLock.Lock()
-	defer conn.dbLock.Unlock()
-
 	changes, err := conn.getGlobalChanges(ScanLimit)
 	if err != nil {
 		log.Error().Err(err).Msg("Unable to scan global changes")
@@ -290,23 +284,10 @@ func (conn *SqliteStreamDB) publishChangeLog() {
 		return
 	}
 
-	sqlConn, err := conn.pool.Borrow()
-	if err != nil {
-		log.Error().Err(err).Msg("Unable to acquire connection from pool")
-	}
-	defer sqlConn.Return()
-
 	for _, change := range changes {
-		logEntries := changeLogEntry{}
-
-		found, err := sqlConn.DB().Select("id", "type", "state").
-			From(conn.metaTable(change.TableName, changeLogName)).
-			Where(
-				goqu.C("state").Eq(Pending),
-				goqu.C("id").Eq(change.ChangeTableId),
-			).
-			Prepared(true).
-			ScanStruct(&logEntries)
+		logEntry := changeLogEntry{}
+		found := false
+		found, err = conn.getChangeEntry(&logEntry, change)
 
 		if err != nil {
 			log.Error().Err(err).Msg("Error scanning last row ID")
@@ -321,7 +302,7 @@ func (conn *SqliteStreamDB) publishChangeLog() {
 			return
 		}
 
-		err = conn.consumeChangeLogs(change.TableName, []*changeLogEntry{&logEntries})
+		err = conn.consumeChangeLogs(change.TableName, []*changeLogEntry{&logEntry})
 		if err != nil {
 			if err == ErrLogNotReadyToPublish {
 				break
@@ -330,35 +311,61 @@ func (conn *SqliteStreamDB) publishChangeLog() {
 			log.Error().Err(err).Msg("Unable to consume changes")
 		}
 
-		err = sqlConn.DB().WithTx(func(tx *goqu.TxDatabase) error {
-			_, err = tx.Update(conn.metaTable(change.TableName, changeLogName)).
-				Set(goqu.Record{"state": Published}).
-				Where(goqu.Ex{"id": change.ChangeTableId}).
-				Prepared(true).
-				Executor().
-				Exec()
-
-			if err != nil {
-				return err
-			}
-
-			_, err = tx.Delete(conn.globalMetaTable()).
-				Where(goqu.C("id").Eq(change.Id)).
-				Prepared(true).
-				Executor().
-				Exec()
-
-			if err != nil {
-				return err
-			}
-
-			return nil
-		})
-
+		err = conn.cleanupChangeLog(change)
 		if err != nil {
 			log.Error().Err(err).Msg("Unable to cleanup change log")
 		}
 	}
+}
+
+func (conn *SqliteStreamDB) cleanupChangeLog(change globalChangeLogEntry) error {
+	sqlConn, err := conn.pool.Borrow()
+	if err != nil {
+		return err
+	}
+	defer sqlConn.Return()
+
+	return sqlConn.DB().WithTx(func(tx *goqu.TxDatabase) error {
+		_, err = tx.Update(conn.metaTable(change.TableName, changeLogName)).
+			Set(goqu.Record{"state": Published}).
+			Where(goqu.Ex{"id": change.ChangeTableId}).
+			Prepared(true).
+			Executor().
+			Exec()
+
+		if err != nil {
+			return err
+		}
+
+		_, err = tx.Delete(conn.globalMetaTable()).
+			Where(goqu.C("id").Eq(change.Id)).
+			Prepared(true).
+			Executor().
+			Exec()
+
+		if err != nil {
+			return err
+		}
+
+		return nil
+	})
+}
+
+func (conn *SqliteStreamDB) getChangeEntry(entry *changeLogEntry, change globalChangeLogEntry) (bool, error) {
+	sqlConn, err := conn.pool.Borrow()
+	if err != nil {
+		return false, err
+	}
+	defer sqlConn.Return()
+
+	return sqlConn.DB().Select("id", "type", "state").
+		From(conn.metaTable(change.TableName, changeLogName)).
+		Where(
+			goqu.C("state").Eq(Pending),
+			goqu.C("id").Eq(change.ChangeTableId),
+		).
+		Prepared(true).
+		ScanStruct(entry)
 }
 
 func (conn *SqliteStreamDB) consumeChangeLogs(tableName string, changes []*changeLogEntry) error {
