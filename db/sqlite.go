@@ -25,6 +25,7 @@ type SqliteStreamDB struct {
 	rawConnection *sqlite3.SQLiteConn
 	watcher       *fsnotify.Watcher
 	publishLock   *sync.Mutex
+	dbLock        *sync.Mutex
 
 	dbPath            string
 	prefix            string
@@ -68,6 +69,7 @@ func OpenStreamDB(path string) (*SqliteStreamDB, error) {
 		watcher:           nil,
 		dbPath:            path,
 		prefix:            MarmotPrefix,
+		dbLock:            &sync.Mutex{},
 		publishLock:       &sync.Mutex{},
 		watchTablesSchema: map[string][]*ColumnInfo{},
 	}
