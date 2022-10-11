@@ -130,6 +130,9 @@ func (conn *SqliteStreamDB) tableCDCScriptFor(tableName string) (string, error) 
 }
 
 func (conn *SqliteStreamDB) consumeReplicationEvent(event *ChangeLogEvent) error {
+	conn.dbLock.Lock()
+	defer conn.dbLock.Unlock()
+
 	return conn.WithTx(func(tnx *goqu.TxDatabase) error {
 		primaryKeyMap := conn.getPrimaryKeyMap(event)
 		if primaryKeyMap == nil {
@@ -244,6 +247,9 @@ func (conn *SqliteStreamDB) publishChangeLog() {
 		return
 	}
 	defer conn.publishLock.Unlock()
+
+	conn.dbLock.Lock()
+	defer conn.dbLock.Unlock()
 
 	changes, err := conn.getGlobalChanges(ScanLimit)
 	if err != nil {
