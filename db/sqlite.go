@@ -11,7 +11,7 @@ import (
 
 	"github.com/doug-martin/goqu/v9"
 	"github.com/fsnotify/fsnotify"
-	"github.com/maxpert/go-sqlite3"
+	"github.com/mattn/go-sqlite3"
 	"github.com/rs/zerolog/log"
 )
 

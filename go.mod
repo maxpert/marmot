@@ -7,7 +7,7 @@ require (
 	github.com/fsnotify/fsnotify v1.5.4
 	github.com/fxamacker/cbor/v2 v2.4.0
 	github.com/klauspost/compress v1.15.10
-	github.com/maxpert/go-sqlite3 v0.0.0-20221010212617-7d24751489a2
+	github.com/mattn/go-sqlite3 v1.14.15
 	github.com/nats-io/nats.go v1.16.1-0.20220906180156-a1017eec10b0
 	github.com/rs/zerolog v1.27.0
 	github.com/samber/lo v1.27.0
