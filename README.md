@@ -122,7 +122,7 @@ Right now there are a few limitations on current solution:
 
 ## FAQs & Community 
 
- - For FAQs visit [this page](https://sibte.notion.site/sibte/Marmot-056983fad27a49d4a16fb91031e6ab98)
+ - For FAQs visit [this page](https://maxpert.github.io/marmot/#faq)
  - For community visit our [discord](https://discord.gg/AWUwY66XsE) or discussions on GitHub
 
 ## Our sponsor
