@@ -1,9 +1,12 @@
 import Link from "next/link";
+import { useTheme } from "nextra-theme-docs";
 import MemoMarmotLogo from "./Icons/MarmotLogo";
 
 export const Hero = () => {
+  const theme = useTheme();
+  console.log(theme);
   return (
-    <section className="py-24 flex items-center min-h-screen justify-center">
+    <section className="flex items-center min-h-screen justify-center">
       <div className="max-w-full">
         <MemoMarmotLogo width="60rem" />
         <div className="text-center">
