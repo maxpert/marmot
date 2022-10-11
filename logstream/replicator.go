@@ -5,18 +5,15 @@ import (
 	"time"
 
 	"github.com/klauspost/compress/zstd"
+	"github.com/maxpert/marmot/cfg"
+	"github.com/maxpert/marmot/snapshot"
 	"github.com/nats-io/nats.go"
 	"github.com/rs/zerolog/log"
 )
 
 const maxReplicateRetries = 7
-const DefaultUrl = nats.DefaultURL
 const NodeNamePrefix = "marmot-node"
-
-var MaxLogEntries = int64(1024)
-var EntryReplicas = 1
-var StreamNamePrefix = "marmot-changes"
-var SubjectPrefix = "marmot-change-log"
+const SnapshotShardID = uint64(1)
 
 type Replicator struct {
 	nodeID             uint64
@@ -25,9 +22,16 @@ type Replicator struct {
 
 	client    *nats.Conn
 	streamMap map[uint64]nats.JetStream
+	snapshot  snapshot.NatsSnapshot
 }
 
-func NewReplicator(nodeID uint64, natsServer string, shards uint64, compress bool) (*Replicator, error) {
+func NewReplicator(
+	nodeID uint64,
+	natsServer string,
+	shards uint64,
+	compress bool,
+	snapshot snapshot.NatsSnapshot,
+) (*Replicator, error) {
 	nc, err := nats.Connect(natsServer, nats.Name(nodeName(nodeID)))
 
 	if err != nil {
@@ -79,6 +83,7 @@ func NewReplicator(nodeID uint64, natsServer string, shards uint64, compress boo
 
 		shards:    shards,
 		streamMap: streamMap,
+		snapshot:  snapshot,
 	}, nil
 }
 
@@ -86,7 +91,9 @@ func (r *Replicator) Publish(hash uint64, payload []byte) error {
 	shardID := (hash % r.shards) + 1
 	js, ok := r.streamMap[shardID]
 	if !ok {
-		log.Panic().Uint64("shard", shardID).Msg("Invalid shard")
+		log.Panic().
+			Uint64("shard", shardID).
+			Msg("Invalid shard")
 	}
 
 	if r.compressionEnabled {
@@ -103,28 +110,35 @@ func (r *Replicator) Publish(hash uint64, payload []byte) error {
 		return err
 	}
 
-	log.Debug().Uint64("seq", ack.Sequence).Msg(ack.Stream)
+	if *cfg.EnableSnapshot {
+		snapshotEntries := uint64(*cfg.MaxLogEntries) / r.shards
+		if snapshotEntries != 0 && ack.Sequence%snapshotEntries == 0 && shardID == SnapshotShardID {
+			log.Debug().
+				Uint64("seq", ack.Sequence).
+				Str("stream", ack.Stream).
+				Msg("Initiating save snapshot")
+			go r.SaveSnapshot()
+		}
+	}
+
 	return nil
 }
 
 func (r *Replicator) Listen(shardID uint64, callback func(payload []byte) error) error {
 	js := r.streamMap[shardID]
 
-	sub, err := js.SubscribeSync(
-		subjectName(shardID),
-		nats.Durable(nodeName(r.nodeID)),
-	)
-
+	sub, err := js.SubscribeSync(subjectName(shardID))
 	if err != nil {
 		return err
 	}
 	defer sub.Unsubscribe()
 
-	replRetry := 0
+	repRetry := 0
 	for sub.IsValid() {
-		msg, err := sub.NextMsg(1 * time.Second)
+		msg, err := sub.NextMsg(5 * time.Second)
 
 		if err == nats.ErrTimeout {
+			repRetry = 0
 			continue
 		}
 
@@ -140,27 +154,48 @@ func (r *Replicator) Listen(shardID uint64, callback func(payload []byte) error)
 			}
 		}
 
-		log.Debug().Str("sub", msg.Subject).Uint64("shard", shardID).Send()
 		err = callback(payload)
 		if err != nil {
-			if replRetry > maxReplicateRetries {
+			if repRetry > maxReplicateRetries {
 				return err
 			}
 
 			log.Error().Err(err).Msg("Unable to process message retrying")
 			msg.Nak()
-			replRetry++
+			repRetry++
 			continue
 		}
 
-		replRetry = 0
 		err = msg.Ack()
 		if err != nil {
 			return err
 		}
+
+		repRetry = 0
 	}
 
 	return nil
+}
+
+func (r *Replicator) RestoreSnapshot() error {
+	if r.snapshot == nil {
+		return nil
+	}
+
+	return r.snapshot.RestoreSnapshot(r.client)
+}
+
+func (r *Replicator) SaveSnapshot() {
+	if r.snapshot == nil {
+		return
+	}
+
+	err := r.snapshot.SaveSnapshot(r.client)
+	if err != nil {
+		log.Error().
+			Err(err).
+			Msg("Unable snapshot database")
+	}
 }
 
 func makeShardConfig(shardID uint64, totalShards uint64, compressed bool) *nats.StreamConfig {
@@ -169,17 +204,21 @@ func makeShardConfig(shardID uint64, totalShards uint64, compressed bool) *nats.
 		compPostfix = "-c"
 	}
 
-	streamName := fmt.Sprintf("%s%s-%d", StreamNamePrefix, compPostfix, shardID)
-	replicas := EntryReplicas
+	streamName := fmt.Sprintf("%s%s-%d", *cfg.StreamPrefix, compPostfix, shardID)
+	replicas := *cfg.LogReplicas
 	if replicas < 1 {
 		replicas = int(totalShards>>1) + 1
+	}
+
+	if replicas > 5 {
+		replicas = 5
 	}
 
 	return &nats.StreamConfig{
 		Name:              streamName,
 		Subjects:          []string{subjectName(shardID)},
 		Discard:           nats.DiscardOld,
-		MaxMsgs:           MaxLogEntries,
+		MaxMsgs:           *cfg.MaxLogEntries,
 		Storage:           nats.FileStorage,
 		Retention:         nats.LimitsPolicy,
 		AllowDirect:       true,
@@ -196,7 +235,7 @@ func nodeName(nodeID uint64) string {
 }
 
 func subjectName(shardID uint64) string {
-	return fmt.Sprintf("%s-%d", SubjectPrefix, shardID)
+	return fmt.Sprintf("%s-%d", *cfg.SubjectPrefix, shardID)
 }
 
 func payloadCompress(payload []byte) ([]byte, error) {
