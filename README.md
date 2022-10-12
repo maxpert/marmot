@@ -116,7 +116,7 @@ configure marmot:
     processes those entries. This helps recover from correct sequence 
     checkpoint (default: `/tmp/seq-map.cbor`) `Since 0.6.x`
 
-For more details and internal workings of marmot [go to these docs](https://github.com/maxpert/marmot/blob/master/docs/overview.md).
+For more details and internal workings of marmot [go to these docs](https://maxpert.github.io/marmot/).
 
 ## Limitations
 Right now there are a few limitations on current solution:
