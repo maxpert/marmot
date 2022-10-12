@@ -40,7 +40,7 @@ type ColumnInfo struct {
 }
 
 func RestoreFrom(destPath, bkFilePath string) error {
-	dnsTpl := "%s?_journal_mode=wal&_foreign_keys=false&_busy_timeout=30000&_txlock=%s"
+	dnsTpl := "%s?_journal_mode=WAL&_foreign_keys=false&_busy_timeout=30000&_txlock=%s"
 	dns := fmt.Sprintf(dnsTpl, destPath, snapshotTransactionMode)
 	destDB, dest, err := pool.OpenRaw(dns)
 	if err != nil {
@@ -80,7 +80,7 @@ func RestoreFrom(destPath, bkFilePath string) error {
 }
 
 func GetAllDBTables(path string) ([]string, error) {
-	connectionStr := fmt.Sprintf("%s?_journal_mode=wal", path)
+	connectionStr := fmt.Sprintf("%s?_journal_mode=WAL", path)
 	conn, rawConn, err := pool.OpenRaw(connectionStr)
 	if err != nil {
 		return nil, err
@@ -102,7 +102,7 @@ func GetAllDBTables(path string) ([]string, error) {
 }
 
 func OpenStreamDB(path string) (*SqliteStreamDB, error) {
-	dbPool, err := pool.NewSQLitePool(fmt.Sprintf("%s?_journal_mode=wal", path), PoolSize, true)
+	dbPool, err := pool.NewSQLitePool(fmt.Sprintf("%s?_journal_mode=WAL", path), PoolSize, true)
 	if err != nil {
 		return nil, err
 	}
@@ -242,28 +242,31 @@ func getTableInfo(tx *goqu.TxDatabase, table string) ([]*ColumnInfo, error) {
 }
 
 func (conn *SqliteStreamDB) BackupTo(bkFilePath string) error {
-	sqlDB, src, err := pool.OpenRaw(fmt.Sprintf("%s?mode=ro&_foreign_keys=false&_journal_mode=wal", conn.dbPath))
+	sqlDB, rawDB, err := pool.OpenRaw(fmt.Sprintf("%s?mode=ro&_foreign_keys=false&_journal_mode=WAL", conn.dbPath))
 	if err != nil {
 		return err
 	}
-	defer src.Close()
+	defer sqlDB.Close()
+	defer rawDB.Close()
 
-	err = performCheckpoint(goqu.New("sqlite", sqlDB))
-	if err != nil {
-		return err
-	}
-
-	_, err = src.Exec("VACUUM main INTO ?;", []driver.Value{bkFilePath})
+	_, err = rawDB.Exec("VACUUM main INTO ?;", []driver.Value{bkFilePath})
 	if err != nil {
 		return err
 	}
 
-	err = src.Close()
+	err = rawDB.Close()
 	if err != nil {
 		return err
 	}
 
-	sqlDB, src, err = pool.OpenRaw(fmt.Sprintf("%s?_foreign_keys=false&_journal_mode=wal", bkFilePath))
+	err = sqlDB.Close()
+	if err != nil {
+		return err
+	}
+
+	// Now since we have separate copy of DB we don't need to deal with WAL journals or foreign keys
+	// We need to remove all the marmot specific tables, triggers, and vacuum out the junk.
+	sqlDB, rawDB, err = pool.OpenRaw(fmt.Sprintf("%s?_foreign_keys=false&_journal_mode=TRUNCATE", bkFilePath))
 	if err != nil {
 		return err
 	}
@@ -275,6 +278,11 @@ func (conn *SqliteStreamDB) BackupTo(bkFilePath string) error {
 	}
 
 	err = removeMarmotTables(gSQL, conn.prefix)
+	if err != nil {
+		return err
+	}
+
+	_, err = gSQL.Exec("VACUUM;")
 	if err != nil {
 		return err
 	}
