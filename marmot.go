@@ -16,10 +16,12 @@ import (
 func main() {
 	flag.Parse()
 
+	gLog := zerolog.New(zerolog.NewConsoleWriter()).With().Timestamp().Logger()
+
 	if *cfg.Verbose {
-		log.Logger = log.Level(zerolog.DebugLevel)
+		log.Logger = gLog.Level(zerolog.DebugLevel)
 	} else {
-		log.Logger = log.Level(zerolog.InfoLevel)
+		log.Logger = gLog.Level(zerolog.InfoLevel)
 	}
 
 	log.Debug().Str("path", *cfg.DBPathString).Msg("Opening database")
@@ -48,7 +50,7 @@ func main() {
 		snapshot.NewNatsDBSnapshot(streamDB),
 	)
 	if err != nil {
-		log.Panic().Err(err).Msg("Unable to connect")
+		log.Panic().Err(err).Msg("Unable to initialize replicators")
 	}
 
 	if *cfg.SaveSnapshot {

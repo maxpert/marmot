@@ -9,7 +9,9 @@ import (
 
 var Cleanup = flag.Bool("cleanup", false, "Only cleanup marmot triggers and changelogs")
 var SaveSnapshot = flag.Bool("save-snapshot", false, "Only take snapshot and upload")
+
 var EnableSnapshot = flag.Bool("enable-snapshot", true, "Restore snapshot at boot")
+var SeqMapPath = flag.String("seq-map-path", "/tmp/seq-map.cbor", "Path to stream sequence map")
 var DBPathString = flag.String("db-path", "/tmp/marmot.db", "Path to SQLite database")
 var NodeID = flag.Uint64("node-id", rand.Uint64(), "Node ID")
 var NatsAddr = flag.String("nats-url", nats.DefaultURL, "NATS server URL")

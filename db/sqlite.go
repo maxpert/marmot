@@ -39,6 +39,46 @@ type ColumnInfo struct {
 	IsPrimaryKey bool   `db:"pk"`
 }
 
+func RestoreFrom(destPath, bkFilePath string) error {
+	dnsTpl := "%s?_journal_mode=wal&_foreign_keys=false&_busy_timeout=30000&_txlock=%s"
+	dns := fmt.Sprintf(dnsTpl, destPath, snapshotTransactionMode)
+	destDB, dest, err := pool.OpenRaw(dns)
+	if err != nil {
+		return err
+	}
+	defer dest.Close()
+
+	dns = fmt.Sprintf(dnsTpl, bkFilePath, snapshotTransactionMode)
+	srcDB, src, err := pool.OpenRaw(dns)
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+
+	dgSQL := goqu.New("sqlite", destDB)
+	sgSQL := goqu.New("sqlite", srcDB)
+
+	// Source locking is required so that any lock related metadata is mirrored in destination
+	// Transacting on both src and dest in immediate mode makes sure nobody
+	// else is modifying or interacting with DB
+	err = sgSQL.WithTx(func(dtx *goqu.TxDatabase) error {
+		return dgSQL.WithTx(func(_ *goqu.TxDatabase) error {
+			return copyFile(destPath, bkFilePath)
+		})
+	})
+
+	if err != nil {
+		return err
+	}
+
+	err = performCheckpoint(dgSQL)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
 func GetAllDBTables(path string) ([]string, error) {
 	connectionStr := fmt.Sprintf("%s?_journal_mode=wal", path)
 	conn, rawConn, err := pool.OpenRaw(connectionStr)
@@ -63,6 +103,17 @@ func GetAllDBTables(path string) ([]string, error) {
 
 func OpenStreamDB(path string) (*SqliteStreamDB, error) {
 	dbPool, err := pool.NewSQLitePool(fmt.Sprintf("%s?_journal_mode=wal", path), PoolSize, true)
+	if err != nil {
+		return nil, err
+	}
+
+	conn, err := dbPool.Borrow()
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Return()
+
+	err = performCheckpoint(conn.DB())
 	if err != nil {
 		return nil, err
 	}
@@ -231,46 +282,6 @@ func (conn *SqliteStreamDB) BackupTo(bkFilePath string) error {
 	return nil
 }
 
-func (conn *SqliteStreamDB) RestoreFrom(bkFilePath string) error {
-	dnsTpl := "%s?_journal_mode=wal&_foreign_keys=false&_busy_timeout=30000&_txlock=%s"
-	dns := fmt.Sprintf(dnsTpl, conn.dbPath, snapshotTransactionMode)
-	destDB, dest, err := pool.OpenRaw(dns)
-	if err != nil {
-		return err
-	}
-	defer dest.Close()
-
-	dns = fmt.Sprintf(dnsTpl, bkFilePath, snapshotTransactionMode)
-	srcDB, src, err := pool.OpenRaw(dns)
-	if err != nil {
-		return err
-	}
-	defer src.Close()
-
-	dgSQL := goqu.New("sqlite", destDB)
-	sgSQL := goqu.New("sqlite", srcDB)
-
-	// Source locking is required so that any lock related metadata is mirrored in destination
-	// Transacting on both src and dest in immediate mode makes sure nobody
-	// else is modifying or interacting with DB
-	err = sgSQL.WithTx(func(dtx *goqu.TxDatabase) error {
-		return dgSQL.WithTx(func(_ *goqu.TxDatabase) error {
-			return copyFile(conn.dbPath, bkFilePath)
-		})
-	})
-
-	if err != nil {
-		return err
-	}
-
-	err = performCheckpoint(dgSQL)
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
 func (conn *SqliteStreamDB) GetRawConnection() *sqlite3.SQLiteConn {
 	return conn.rawConnection
 }
@@ -286,7 +297,7 @@ func copyFile(toPath, fromPath string) error {
 	}
 	defer fi.Close()
 
-	fo, err := os.OpenFile(toPath, os.O_WRONLY|os.O_TRUNC, 0)
+	fo, err := os.OpenFile(toPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC|os.O_SYNC, 0)
 	if err != nil {
 		return err
 	}
@@ -317,6 +328,8 @@ func listDBTables(names *[]string, gSQL *goqu.TxDatabase) error {
 
 func performCheckpoint(gSQL *goqu.Database) error {
 	rBusy, rLog, rCheckpoint := int64(1), int64(0), int64(0)
+	log.Debug().Msg("Forcing WAL checkpoint")
+
 	for rBusy != 0 {
 		row := gSQL.QueryRow("PRAGMA wal_checkpoint(truncate);")
 		err := row.Scan(&rBusy, &rLog, &rCheckpoint)
