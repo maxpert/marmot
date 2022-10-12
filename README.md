@@ -95,18 +95,26 @@ configure marmot:
    name prefix `stream-prefix` with attached subjects prefixed by `subject-prefix` (default: `1024`). It's 
    recommended to use a good high value in production environments.
  - `log-replicas` - Number of replicas for each change log entry committed to NATS (default: `1`). **Set this value to 
-   at least quorum of cluster nodes to make sure that your replication logs are fault-tolerant**.
+   at least quorum of cluster nodes to make sure that your replication logs are fault-tolerant**. `Since 0.4.x`
  - `subject-prefix` - Prefix for subject over which change logs will be published. Marmot distributes load by sharding
    change logs over given `shards`. Each subject will have pattern `<subject-prefix>-<shard-id>` 
    (default: `marmot-change-log`).
  - `stream-prefix` - Prefix for JetStream names for against which each sharded subject is attached. This allows to
    distribute these JetStream leaders among nodes in cluster. Each stream will have pattern of 
-   `<stream-prefix>-<shards>-<shard-id>` (default: `marmot-changes`).
+   `<stream-prefix>-<shard-id>` (default: `marmot-changes`).
  - `shards` - Number of shards over which the database tables replication will be distributed on. It serves as mechanism for
    consistently hashing JetStream from `Hash(<table_name> + <primary/composite_key>)`. This will allow NATS servers to
    distribute load and scale for wider clusters. Look at internal docs on how these JetStreams and subjects are named
    (default: `8`).
  - `verbose` - Specify if system should dump debug logs on console as well. Only use this for debugging. 
+ - `save-snapshot` - Just snapshot the local database, and upload snapshot to NATS server (default: `false`) `Since 0.6.x`
+ - `enable-snapshot` - Enable capability to save and restore snapshots so that extremely lagging servers can restore snapshots at 
+    boot time, and nodes can save snapshots everytime shard `1` hits sequence of multiples `max-log-entries/shards`. In theory 
+    due to even distribution of logs among shards this will always cause a snapshot to be taken very close to 
+    `max-log-entries`, and that snapshot will be saved in `OBJ_<stream-prefix>-snapshot-store`. (default: `true`) `Since 0.6.x`
+ - `seq-map-path` - Path where Marmot saves copy of sequence entries processed so far for every shard as it 
+    processes those entries. This helps recover from correct sequence 
+    checkpoint (default: `/tmp/seq-map.cbor`) `Since 0.6.x`
 
 For more details and internal workings of marmot [go to these docs](https://github.com/maxpert/marmot/blob/master/docs/overview.md).
 
