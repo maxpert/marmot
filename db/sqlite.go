@@ -63,7 +63,22 @@ func RestoreFrom(destPath, bkFilePath string) error {
 	// else is modifying or interacting with DB
 	err = sgSQL.WithTx(func(dtx *goqu.TxDatabase) error {
 		return dgSQL.WithTx(func(_ *goqu.TxDatabase) error {
-			return copyFile(destPath, bkFilePath)
+			err = copyFile(destPath, bkFilePath)
+			if err != nil {
+				return err
+			}
+
+			err = copyFile(destPath+"-shm", bkFilePath+"-shm")
+			if err != nil {
+				return err
+			}
+
+			err = copyFile(destPath+"-wal", bkFilePath+"-wal")
+			if err != nil {
+				return err
+			}
+
+			return nil
 		})
 	})
 
