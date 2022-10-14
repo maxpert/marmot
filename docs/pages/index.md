@@ -1,6 +1,12 @@
-# What is Marmot?
+Marmot is a distributed, multi-master, fault-tolerant, and eventually consistent SQLite replicator. It's built on top of [NATS](https://nats.io/). This
+allows Marmot to give you a solid replication layer for your nodes using SQLite as database, thus allowing robust recovery and replication. In a 
+typical setting Marmot can be used to distribute your CMS, forums, etc. 
 
-Marmot can give you a solid replication between your nodes as Marmot builds on top of fault-tolerant [NATS](https://nats.io/), thus allowing robust recovery and replication. Marmot is designed to be a side car that is eventually consistent, thus optimized for read heavy workloads. 
+Checkout following demos:
+
+<iframe width="560" height="315" src="https://www.youtube.com/embed/GQ5x8pc9vuI" title="YouTube video player" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe>
+
+<iframe width="560" height="315" src="https://www.youtube.com/embed/QqZl61bJ9BA" title="YouTube video player" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe>
 
 # Why?
 
@@ -30,16 +36,22 @@ those JetStreams (To be automated in future versions).
 
 ## FAQ
 
+### What happens to serializability of my transactions?
+
+So in case of a race condition [RAFT quorum](https://docs.nats.io/running-a-nats-service/configuration/clustering/jetstream_clustering#raft) 
+will let the last writer win. Which means there is NO serializability guarantee of a transaction spanning multiple tables. This is a design 
+choice right now we have made, in order to avoid any sort of global locking, and performance. 
+
 ### Won’t capturing changes with triggers use more disk space?
 
-Yes it will require additional storage to old/new values from triggers. But right now that is the only way sqlite can and should allow one to capture changes. However, in a typical setting these captured changes will be picked up pretty quickly. Disk space is usually cheapest part of modern cloud, so I won’t obsess over it.
+Yes it will require additional storage to old/new values from triggers. But right now that is the only way sqlite can and should allow one to capture changes. However, in a typical setting these captured changes will be picked up pretty quickly. Disk space is usually cheapest part of modern cloud.
 
-### How do I do a fresh restart?
+### How do I cleanup my database?
 
 Ask marmot to remove hooks and log tables by:
 `marmot -db-path /path/to/your/db.db -cleanup`
 
-### How would many shards should I have?
+### How many shards should I have?
 
 It depends on your usecase and what problem you are solving for. In a typical setting you should not need more than couple of dozen shards. While read scaling won't be a problem, your write throughput will depend on your network and
 disk speeds (Network being the biggest culprit).
