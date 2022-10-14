@@ -44,7 +44,7 @@ application needs.
 
 ## Production status
 
- - `v0.4.x` is production ready.
+ - `v0.4.x` onwards in pre production state. We have been using it to successfully run a read heavy site (138.3 writes / sec).
  - `v0.3.x` is deprecated, and unstable. DO NOT USE IT IN PRODUCTION.
 
 ## Features
