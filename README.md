@@ -34,7 +34,18 @@ it's eventually consistent, does not require any changes to your application log
 
 Marmot is a CDC (Change Data Capture) pipeline running top of NATS. It can automatically confgure appropriate JetStreams making sure 
 those streams evenly distribute load over those shards, so scaling simply boils down to adding more nodes, and rebalancing 
-those JetStreams (To be automated in future versions). 
+those JetStreams (To be automated in future versions). Due Marmot's integration with NATS, one can build really complex pipelines 
+on top of these change logs. For example, one can write a simple [Deno script](https://gist.github.com/maxpert/d50a49dfb2f307b30b7cae841c9607e1), 
+and watch change logs just by doing:
+
+```
+deno run --allow-net https://gist.githubusercontent.com/maxpert/d50a49dfb2f307b30b7cae841c9607e1/raw/6d30803c140b0ba602545c1c0878d3394be548c3/watch-marmot-change-logs.ts -u <nats_username> -p <nats_password> -s <comma_seperated_server_list>
+```
+
+The output will look something like this:
+![image](https://user-images.githubusercontent.com/22441/196061378-21f885b3-7958-4a7e-994b-09d4e86df721.png)
+
+
 
 ## Dependencies
 Starting 0.4+ Marmot depends on [nats-server](https://nats.io/download/) with JetStream support.
@@ -55,9 +66,7 @@ application needs.
  - Bidirectional replication with almost masterless architecture
  - Ability to snapshot and fully recover from those snapshots
  - SQLite based log storage
-
-To be implemented for next GA:
- - Command batching + compression for speeding up bulk load / commit commands to propagate quickly
+ - Command compression
  - Database snapshotting and restore for cold-start and out-of-date nodes
 
 ## Running
