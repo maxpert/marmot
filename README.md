@@ -4,10 +4,6 @@
 [![Go](https://github.com/maxpert/marmot/actions/workflows/go.yml/badge.svg)](https://github.com/maxpert/marmot/actions/workflows/go.yml)
 [![Discord](https://badgen.net/badge/icon/discord?icon=discord&label=Marmot)](https://discord.gg/AWUwY66XsE)
 ![GitHub](https://img.shields.io/github/license/maxpert/marmot)
-![Eventually Consistent](https://img.shields.io/badge/Eventually%20Consistent-✔️-green)
-![Multi-Master Replication](https://img.shields.io/badge/Multi--Master%20Replication-✔️-green)
-![Fault Tolerant](https://img.shields.io/badge/Fault%20Tolerant-✔️-green)
-![Built on NATS](https://img.shields.io/badge/Built%20on%20NATS-✔️-green)
 
 ## What & Why?
 Marmot can give you a solid replication between your nodes as Marmot builds on top of fault-tolerant 
@@ -62,6 +58,11 @@ application needs.
  - `v0.3.x` is deprecated, and unstable. DO NOT USE IT IN PRODUCTION.
 
 ## Features
+
+![Eventually Consistent](https://img.shields.io/badge/Eventually%20Consistent-✔️-green)
+![Multi-Master Replication](https://img.shields.io/badge/Multi--Master%20Replication-✔️-green)
+![Fault Tolerant](https://img.shields.io/badge/Fault%20Tolerant-✔️-green)
+![Built on NATS](https://img.shields.io/badge/Built%20on%20NATS-✔️-green)
 
  - Built on top of NATS, abstracting stream distribution and replication
  - Bidirectional replication with almost masterless architecture
