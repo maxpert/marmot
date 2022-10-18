@@ -52,7 +52,8 @@ application needs.
 
 ## Production status
 
- - `v0.6.x` introduces snapshot save/restore. It's in pre-production state. Is being used successfully to run a read heavy site (138.3 writes / sec).
+ - `v0.6.x` introduces snapshot save/restore. It's in pre-production state. Is being used successfully 
+    to run a read heavy site (per node 4,796 reads /sec, 138.3 writes / sec).
  - `v0.5.x` introduces change log compression with zstd.
  - `v0.4.x` introduces NATS based change log streaming, and continious multi-directional sync.
  - `v0.3.x` is deprecated, and unstable. DO NOT USE IT IN PRODUCTION.
