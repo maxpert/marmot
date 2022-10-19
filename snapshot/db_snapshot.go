@@ -82,6 +82,9 @@ func (n *NatsDBSnapshot) SaveSnapshot(conn *nats.Conn) error {
 			HashHeaderKey: {hash},
 		},
 	}, rfl)
+	if err != nil {
+		return err
+	}
 
 	log.Info().
 		Str("hash", hash).

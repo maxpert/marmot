@@ -29,6 +29,10 @@ func (r *replicationState) init() error {
 	r.fl = fl
 
 	idx, err := fl.Seek(0, io.SeekEnd)
+	if err != nil {
+		return err
+	}
+
 	if idx < 1 {
 		return nil
 	}
