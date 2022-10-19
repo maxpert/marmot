@@ -4,8 +4,15 @@ import (
 	"flag"
 	"math/rand"
 
+	"github.com/knadh/koanf"
+	"github.com/knadh/koanf/parsers/yaml"
+	"github.com/knadh/koanf/providers/file"
 	"github.com/nats-io/nats.go"
 )
+
+type Configuration struct {
+	Cleanup bool `koanf:"cleanup"`
+}
 
 var Cleanup = flag.Bool("cleanup", false, "Only cleanup marmot triggers and changelogs")
 var SaveSnapshot = flag.Bool("save-snapshot", false, "Only take snapshot and upload")
@@ -22,3 +29,19 @@ var SubjectPrefix = flag.String("subject-prefix", "marmot-change-log", "Prefix f
 var StreamPrefix = flag.String("stream-prefix", "marmot-changes", "Prefix for publish subjects")
 var EnableCompress = flag.Bool("compress", false, "Enable message compression")
 var Verbose = flag.Bool("verbose", false, "Log debug level")
+
+func Init(path string) (*Configuration, error) {
+	k := koanf.New(path)
+	err := k.Load(file.Provider("marmot.yaml"), yaml.Parser())
+	if err != nil {
+		return nil, err
+	}
+
+	conf := &Configuration{}
+	err = k.Unmarshal(".", conf)
+	if err != nil {
+		return nil, err
+	}
+
+	return conf, nil
+}
