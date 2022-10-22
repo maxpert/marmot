@@ -19,7 +19,7 @@ type replicationState struct {
 }
 
 func (r *replicationState) init() error {
-	fl, err := os.OpenFile(*cfg.SeqMapPath, os.O_RDWR|os.O_CREATE|os.O_SYNC, 0666)
+	fl, err := os.OpenFile(cfg.Config.SeqMapPath, os.O_RDWR|os.O_CREATE|os.O_SYNC, 0666)
 	if err != nil {
 		return err
 	}

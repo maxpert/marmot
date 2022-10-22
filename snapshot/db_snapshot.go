@@ -165,7 +165,7 @@ func getBlobStore(conn *nats.Conn) (nats.ObjectStore, error) {
 	if err == nats.ErrStreamNotFound {
 		blb, err = js.CreateObjectStore(&nats.ObjectStoreConfig{
 			Bucket:      blobBucketName(),
-			Replicas:    *cfg.LogReplicas,
+			Replicas:    cfg.Config.Snapshot.Replicas,
 			Storage:     nats.FileStorage,
 			Description: "Bucket to store snapshot",
 		})
@@ -175,5 +175,5 @@ func getBlobStore(conn *nats.Conn) (nats.ObjectStore, error) {
 }
 
 func blobBucketName() string {
-	return *cfg.StreamPrefix + "-snapshot-store"
+	return cfg.Config.NATS.StreamPrefix + "-snapshot-store"
 }
