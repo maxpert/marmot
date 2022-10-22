@@ -22,7 +22,7 @@ replication; or intercept physical page level writes to stream them off to repli
 cases they are mostly single primary where all the writes have to go, backed by multiple 
 replicas that can only be readonly. 
 
-Marmot on the other hand is born different. 
+Marmot on the other hand is born different. It's born to act as a side-car to your existing processes:
  - Instead of requiring single primary, there is no primary! Which means any node can make changes to its local DB. 
  - Instead of being strongly consistent, it's eventually consistent. Which means no locking, or blocking of nodes.
  - It does not require any changes to your application logic for reading/writing. 
