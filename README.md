@@ -19,21 +19,31 @@ There are a few solutions like [rqlite](https://github.com/rqlite/rqlite), [dqli
 [LiteFS](https://github.com/superfly/litefs) etc. All of them either are layers on top of SQLite (e.g. 
 rqlite, dqlite) that requires them to sit in the middle with network layer in order to provide 
 replication; or intercept physical page level writes to stream them off to replicas. In both
-cases they are mostly single primary where all the writes have to go, backed by multiple 
-replicas that can only be readonly. 
+cases they require a single primary node where all the writes have to go, and then these 
+changes are applied to multiple readonly replicas. 
 
 Marmot on the other hand is born different. It's born to act as a side-car to your existing processes:
- - Instead of requiring single primary, there is no primary! Which means any node can make changes to its local DB. 
+ - Instead of requiring single primary, there is no primary! Which means any node can make changes to its local DB.
+   Marmot will use triggers to capture your changes (hence atomic records), and then stream them off to NATS. 
  - Instead of being strongly consistent, it's eventually consistent. Which means no locking, or blocking of nodes.
  - It does not require any changes to your application logic for reading/writing. 
 
 Making these choices has multiple benefits:
 
-Marmot is a CDC (Change Data Capture) pipeline running top of NATS. It can automatically confgure appropriate JetStreams making sure 
-those streams evenly distribute load over those shards, so scaling simply boils down to adding more nodes, and rebalancing 
-those JetStreams (To be automated in future versions). Due Marmot's integration with NATS, one can build really complex pipelines 
-on top of these change logs. For example, one can write a simple [Deno script](https://gist.github.com/maxpert/d50a49dfb2f307b30b7cae841c9607e1), 
-and watch change logs just by doing:
+- You can read and write to your SQLite database like you normally do. No extension, or VFS changes.
+- You can write on any node! You don't have to go to single primary for writing your data.
+- As long as you start with same copy of database, all the mutations will eventually converge
+  (hence eventually consistent).
+
+Marmot is a CDC (Change Data Capture) pipeline running top of NATS. It can automatically configure appropriate JetStreams making sure
+those streams evenly distribute load over those shards, so scaling simply boils down to adding more nodes, and re-balancing
+those JetStreams (To be automated in future versions).
+
+## Dependencies
+Starting 0.4+ Marmot depends on [nats-server](https://nats.io/download/) with JetStream support.
+Instead of building an in process consensus algorithm, this unlocks more use-cases like letting 
+external applications subscribe to these changes and build more complex use-cases around their
+application needs. Here is one example that you can just run locally using Deno:
 
 ```
 deno run --allow-net https://gist.githubusercontent.com/maxpert/d50a49dfb2f307b30b7cae841c9607e1/raw/6d30803c140b0ba602545c1c0878d3394be548c3/watch-marmot-change-logs.ts -u <nats_username> -p <nats_password> -s <comma_seperated_server_list>
@@ -42,50 +52,26 @@ deno run --allow-net https://gist.githubusercontent.com/maxpert/d50a49dfb2f307b3
 The output will look something like this:
 ![image](https://user-images.githubusercontent.com/22441/196061378-21f885b3-7958-4a7e-994b-09d4e86df721.png)
 
-
- - You can read and write to your SQLite database like you normally do. No extension, or VFS changes.
- - You can write on any node! You don't have to go to single primary for writing your data.
- - As long as you start with same copy of database, all the mutations will eventually converge 
-   (hence eventually consistent).
-
-Marmot is a CDC (Change Data Capture) pipeline running top of NATS. It can automatically configure appropriate JetStreams making sure 
-those streams evenly distribute load over those shards, so scaling simply boils down to adding more nodes, and re-balancing 
-those JetStreams (To be automated in future versions). 
-
-## Dependencies
-Starting 0.4+ Marmot depends on [nats-server](https://nats.io/download/) with JetStream support.
-Instead of building an in process consensus algorithm, this unlocks more use-cases like letting 
-external applications subscribe to these changes and build more complex use-cases around their
-application needs.
-
 ## Production status
 
  - `v0.6.x` introduces snapshot save/restore. It's in pre-production state. Is being used successfully 
     to run a read heavy site (per node 4,796 reads /sec, 138.3 writes / sec).
  - `v0.5.x` introduces change log compression with zstd.
- - `v0.4.x` introduces NATS based change log streaming, and continious multi-directional sync.
+ - `v0.4.x` introduces NATS based change log streaming, and continuous multi-directional sync.
  - `v0.3.x` is deprecated, and unstable. DO NOT USE IT IN PRODUCTION.
 
 ## Features
 
 ![Eventually Consistent](https://img.shields.io/badge/Eventually%20Consistent-✔️-green)
-![Multi-Master Replication](https://img.shields.io/badge/Multi--Master%20Replication-✔️-green)
+![Leaderless Replication](https://img.shields.io/badge/Leaderless%20Replication-✔️-green)
 ![Fault Tolerant](https://img.shields.io/badge/Fault%20Tolerant-✔️-green)
 ![Built on NATS](https://img.shields.io/badge/Built%20on%20NATS-✔️-green)
 
- - Built on top of NATS, abstracting stream distribution and replication
- - Bidirectional replication with almost masterless architecture
- - Ability to snapshot and fully recover from those snapshots
- - SQLite based log storage
- - Command compression
+ - Leaderless replication never requiring a single node to handle all write load.
  - Built on top of NATS, abstracting stream distribution and replication.
- - Leaderless replication requiring no single node to handle write load.
  - Ability to snapshot and fully recover from those snapshots.
- - SQLite based log storage.
-
-To be implemented for next GA:
- - Command batching + compression for speeding up bulk load / commit commands to propagate quickly
- - Database snapshotting and restore for cold-start and out-of-date nodes
+ - SQLite based log storage, so all the tooling with SQLite is at your disposal.
+ - Support for log entry compression, handling content heavy CMS needs.
 
 ## Running
 
@@ -94,12 +80,12 @@ Build
 go build -o build/marmot ./marmot.go
 ```
 
-Make sure you have 2 SQLite DBs with exact same schemas (ideally exact same state):
+Make sure you have 2 SQLite DBs with exact same schemas and just run:
 
 ```shell
 nats-server --jetstream
-build/marmot -nats-url nats://127.0.0.1:4222 -node-id 1 -db-path /tmp/cache-1.db
-build/marmot -nats-url nats://127.0.0.1:4222 -node-id 2 -db-path /tmp/cache-2.db
+build/marmot -config examples/config-1.toml -verbose
+build/marmot -config examples/config-2.toml -verbose
 ```
 
 ## Demos

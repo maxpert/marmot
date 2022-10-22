@@ -1,14 +1,14 @@
 # Path to target SQLite database
-db_path="/tmp/marmot.db"
+db_path="/tmp/cache-2.db"
 
 # ID to uniquely identify your nodes in your cluster
 # It's recommended to always configure this
-# node_id=1
+node_id=2
 
 # Path to persist the saved sequence map on disk for warm reboot
 # If this file is missing Marmot has to download snapshot
 # and replay all logs in order to restore database
-# seq_map_path="/tmp/seq-map.cbor"
+seq_map_path="/tmp/seq-map-2.cbor"
 
 
 # Snapshots are used to limit log size and have a database snapshot backedup on your
