@@ -40,7 +40,7 @@ type ColumnInfo struct {
 }
 
 func RestoreFrom(destPath, bkFilePath string) error {
-	dnsTpl := "%s?_journal_mode=WAL&_foreign_keys=false&_busy_timeout=30000&_txlock=%s"
+	dnsTpl := "%s?_journal_mode=WAL&_foreign_keys=false&_busy_timeout=30000&_sync=FULL&_txlock=%s"
 	dns := fmt.Sprintf(dnsTpl, destPath, snapshotTransactionMode)
 	destDB, dest, err := pool.OpenRaw(dns)
 	if err != nil {
