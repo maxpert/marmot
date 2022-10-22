@@ -25,12 +25,12 @@ func main() {
 	}
 
 	var writer io.Writer = zerolog.NewConsoleWriter()
-	if cfg.Config.StdOutFormat == "json" {
+	if cfg.Config.Logging.Format == "json" {
 		writer = os.Stdout
 	}
 	gLog := zerolog.New(writer).With().Timestamp().Logger()
 
-	if cfg.Config.Verbose {
+	if cfg.Config.Logging.Verbose {
 		log.Logger = gLog.Level(zerolog.DebugLevel)
 	} else {
 		log.Logger = gLog.Level(zerolog.InfoLevel)
@@ -56,9 +56,9 @@ func main() {
 
 	rep, err := logstream.NewReplicator(
 		cfg.Config.NodeID,
-		strings.Join(cfg.Config.NatsAddr, ", "),
-		cfg.Config.Shards,
-		cfg.Config.EnableCompress,
+		strings.Join(cfg.Config.NATS.URLs, ", "),
+		cfg.Config.ReplicationLog.Shards,
+		cfg.Config.ReplicationLog.Compress,
 		snapshot.NewNatsDBSnapshot(streamDB),
 	)
 	if err != nil {
@@ -70,7 +70,7 @@ func main() {
 		return
 	}
 
-	if cfg.Config.EnableSnapshot {
+	if cfg.Config.Snapshot.Enable {
 		err = rep.RestoreSnapshot()
 		if err != nil {
 			log.Panic().Err(err).Msg("Unable to restore snapshot")
@@ -92,7 +92,7 @@ func main() {
 	}
 
 	errChan := make(chan error)
-	for i := uint64(0); i < cfg.Config.Shards; i++ {
+	for i := uint64(0); i < cfg.Config.ReplicationLog.Shards; i++ {
 		go changeListener(streamDB, rep, i+1, errChan)
 	}
 

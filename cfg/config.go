@@ -10,20 +10,38 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
+type ReplicationLogConfiguration struct {
+	Shards     uint64 `toml:"shards"`
+	MaxEntries int64  `toml:"max_entries"`
+	Replicas   int    `toml:"replicas"`
+	Compress   bool   `toml:"compress"`
+}
+
+type SnapshotConfiguration struct {
+	Enable   bool `toml:"enabled"`
+	Replicas int  `toml:"replicas"`
+}
+
+type NATSConfiguration struct {
+	URLs          []string `toml:"urls"`
+	SubjectPrefix string   `toml:"subject_prefix"`
+	StreamPrefix  string   `toml:"stream_prefix"`
+}
+
+type LoggingConfiguration struct {
+	Verbose bool   `toml:"verbose"`
+	Format  string `toml:"format"`
+}
+
 type Configuration struct {
-	EnableSnapshot bool     `toml:"enable_snapshot"`
-	SeqMapPath     string   `toml:"meta_path"`
-	DBPath         string   `toml:"db_path"`
-	NodeID         uint64   `toml:"node_id"`
-	NatsAddr       []string `toml:"nats_urls"`
-	Shards         uint64   `toml:"shards"`
-	MaxLogEntries  int64    `toml:"max_log_entries"`
-	LogReplicas    int      `toml:"log_replicas"`
-	SubjectPrefix  string   `toml:"subject_prefix"`
-	StreamPrefix   string   `toml:"stream_prefix"`
-	EnableCompress bool     `toml:"compress_logs"`
-	Verbose        bool     `toml:"verbose"`
-	StdOutFormat   string   `toml:"stdout_format"`
+	SeqMapPath string `toml:"seq_map_path"`
+	DBPath     string `toml:"db_path"`
+	NodeID     uint64 `toml:"node_id"`
+
+	Snapshot       SnapshotConfiguration       `toml:"snapshot"`
+	ReplicationLog ReplicationLogConfiguration `toml:"replication_log"`
+	NATS           NATSConfiguration           `toml:"nats"`
+	Logging        LoggingConfiguration        `toml:"logging"`
 }
 
 var ConfigPath = flag.String("config", "marmot.toml", "Path to configuration file")
@@ -31,19 +49,32 @@ var Cleanup = flag.Bool("cleanup", false, "Only cleanup marmot triggers and chan
 var SaveSnapshot = flag.Bool("save-snapshot", false, "Only take snapshot and upload")
 
 var Config = &Configuration{
-	EnableSnapshot: true,
-	SeqMapPath:     "/tmp/seq-map.cbor",
-	DBPath:         "/tmp/marmot.db",
-	NodeID:         1,
-	NatsAddr:       []string{nats.DefaultURL},
-	Shards:         8,
-	MaxLogEntries:  1024,
-	LogReplicas:    1,
-	SubjectPrefix:  "marmot-change-log",
-	StreamPrefix:   "marmot-changes",
-	EnableCompress: true,
-	Verbose:        false,
-	StdOutFormat:   "console",
+	SeqMapPath: "/tmp/seq-map.cbor",
+	DBPath:     "/tmp/marmot.db",
+	NodeID:     1,
+
+	Snapshot: SnapshotConfiguration{
+		Enable:   true,
+		Replicas: 1,
+	},
+
+	ReplicationLog: ReplicationLogConfiguration{
+		Shards:     8,
+		MaxEntries: 1024,
+		Replicas:   1,
+		Compress:   true,
+	},
+
+	NATS: NATSConfiguration{
+		URLs:          []string{nats.DefaultURL},
+		SubjectPrefix: "marmot-change-log",
+		StreamPrefix:  "marmot-changes",
+	},
+
+	Logging: LoggingConfiguration{
+		Verbose: false,
+		Format:  "console",
+	},
 }
 
 func init() {

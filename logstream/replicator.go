@@ -118,13 +118,13 @@ func (r *Replicator) Publish(hash uint64, payload []byte) error {
 		return err
 	}
 
-	if cfg.Config.EnableSnapshot {
+	if cfg.Config.Snapshot.Enable {
 		seq, err := r.repState.save(ack.Stream, ack.Sequence)
 		if err != nil {
 			return err
 		}
 
-		snapshotEntries := uint64(cfg.Config.MaxLogEntries) / r.shards
+		snapshotEntries := uint64(cfg.Config.ReplicationLog.MaxEntries) / r.shards
 		if snapshotEntries != 0 && seq%snapshotEntries == 0 && shardID == SnapshotShardID {
 			log.Debug().
 				Uint64("seq", seq).
@@ -258,7 +258,7 @@ func (r *Replicator) invokeListener(callback func(payload []byte) error, msg *na
 
 func makeShardConfig(shardID uint64, totalShards uint64, compressed bool) *nats.StreamConfig {
 	streamName := streamName(shardID, compressed)
-	replicas := cfg.Config.LogReplicas
+	replicas := cfg.Config.ReplicationLog.Replicas
 	if replicas < 1 {
 		replicas = int(totalShards>>1) + 1
 	}
@@ -271,7 +271,7 @@ func makeShardConfig(shardID uint64, totalShards uint64, compressed bool) *nats.
 		Name:              streamName,
 		Subjects:          []string{subjectName(shardID)},
 		Discard:           nats.DiscardOld,
-		MaxMsgs:           cfg.Config.MaxLogEntries,
+		MaxMsgs:           cfg.Config.ReplicationLog.MaxEntries,
 		Storage:           nats.FileStorage,
 		Retention:         nats.LimitsPolicy,
 		AllowDirect:       true,
@@ -293,11 +293,11 @@ func streamName(shardID uint64, compressed bool) string {
 		compPostfix = "-c"
 	}
 
-	return fmt.Sprintf("%s%s-%d", cfg.Config.StreamPrefix, compPostfix, shardID)
+	return fmt.Sprintf("%s%s-%d", cfg.Config.NATS.StreamPrefix, compPostfix, shardID)
 }
 
 func subjectName(shardID uint64) string {
-	return fmt.Sprintf("%s-%d", cfg.Config.SubjectPrefix, shardID)
+	return fmt.Sprintf("%s-%d", cfg.Config.NATS.SubjectPrefix, shardID)
 }
 
 func payloadCompress(payload []byte) ([]byte, error) {
