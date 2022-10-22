@@ -2,46 +2,70 @@ package cfg
 
 import (
 	"flag"
-	"math/rand"
+	"hash/fnv"
+	"os"
 
-	"github.com/knadh/koanf"
-	"github.com/knadh/koanf/parsers/yaml"
-	"github.com/knadh/koanf/providers/file"
+	"github.com/BurntSushi/toml"
+	"github.com/denisbrodbeck/machineid"
 	"github.com/nats-io/nats.go"
 )
 
 type Configuration struct {
-	Cleanup bool `koanf:"cleanup"`
+	EnableSnapshot bool     `toml:"enable_snapshot"`
+	SeqMapPath     string   `toml:"meta_path"`
+	DBPath         string   `toml:"db_path"`
+	NodeID         uint64   `toml:"node_id"`
+	NatsAddr       []string `toml:"nats_urls"`
+	Shards         uint64   `toml:"shards"`
+	MaxLogEntries  int64    `toml:"max_log_entries"`
+	LogReplicas    int      `toml:"log_replicas"`
+	SubjectPrefix  string   `toml:"subject_prefix"`
+	StreamPrefix   string   `toml:"stream_prefix"`
+	EnableCompress bool     `toml:"compress_logs"`
+	Verbose        bool     `toml:"verbose"`
+	StdOutFormat   string   `toml:"stdout_format"`
 }
 
+var ConfigPath = flag.String("config", "marmot.toml", "Path to configuration file")
 var Cleanup = flag.Bool("cleanup", false, "Only cleanup marmot triggers and changelogs")
 var SaveSnapshot = flag.Bool("save-snapshot", false, "Only take snapshot and upload")
 
-var EnableSnapshot = flag.Bool("enable-snapshot", true, "Restore snapshot at boot")
-var SeqMapPath = flag.String("seq-map-path", "/tmp/seq-map.cbor", "Path to stream sequence map")
-var DBPathString = flag.String("db-path", "/tmp/marmot.db", "Path to SQLite database")
-var NodeID = flag.Uint64("node-id", rand.Uint64(), "Node ID")
-var NatsAddr = flag.String("nats-url", nats.DefaultURL, "NATS server URL")
-var Shards = flag.Uint64("shards", 8, "Number of stream shards to distribute change log on")
-var MaxLogEntries = flag.Int64("max-log-entries", 1024, "Maximum number of change log entries to persist")
-var LogReplicas = flag.Int("log-replicas", 1, "Number of copies to be committed for single change log")
-var SubjectPrefix = flag.String("subject-prefix", "marmot-change-log", "Prefix for publish subjects")
-var StreamPrefix = flag.String("stream-prefix", "marmot-changes", "Prefix for publish subjects")
-var EnableCompress = flag.Bool("compress", false, "Enable message compression")
-var Verbose = flag.Bool("verbose", false, "Log debug level")
+var Config = &Configuration{
+	EnableSnapshot: true,
+	SeqMapPath:     "/tmp/seq-map.cbor",
+	DBPath:         "/tmp/marmot.db",
+	NodeID:         1,
+	NatsAddr:       []string{nats.DefaultURL},
+	Shards:         8,
+	MaxLogEntries:  1024,
+	LogReplicas:    1,
+	SubjectPrefix:  "marmot-change-log",
+	StreamPrefix:   "marmot-changes",
+	EnableCompress: true,
+	Verbose:        false,
+	StdOutFormat:   "console",
+}
 
-func Init(path string) (*Configuration, error) {
-	k := koanf.New(path)
-	err := k.Load(file.Provider("marmot.yaml"), yaml.Parser())
+func init() {
+	id, err := machineid.ID()
 	if err != nil {
-		return nil, err
+		panic(err)
 	}
 
-	conf := &Configuration{}
-	err = k.Unmarshal(".", conf)
+	hasher := fnv.New64()
+	_, err = hasher.Write([]byte(id))
 	if err != nil {
-		return nil, err
+		panic(err)
 	}
 
-	return conf, nil
+	Config.NodeID = hasher.Sum64()
+}
+
+func Load(path string) error {
+	_, err := toml.DecodeFile(path, Config)
+	if os.IsNotExist(err) {
+		return nil
+	}
+
+	return err
 }

@@ -2,6 +2,9 @@ package main
 
 import (
 	"flag"
+	"io"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/maxpert/marmot/cfg"
@@ -16,16 +19,25 @@ import (
 func main() {
 	flag.Parse()
 
-	gLog := zerolog.New(zerolog.NewConsoleWriter()).With().Timestamp().Logger()
+	err := cfg.Load(*cfg.ConfigPath)
+	if err != nil {
+		panic(err)
+	}
 
-	if *cfg.Verbose {
+	var writer io.Writer = zerolog.NewConsoleWriter()
+	if cfg.Config.StdOutFormat == "json" {
+		writer = os.Stdout
+	}
+	gLog := zerolog.New(writer).With().Timestamp().Logger()
+
+	if cfg.Config.Verbose {
 		log.Logger = gLog.Level(zerolog.DebugLevel)
 	} else {
 		log.Logger = gLog.Level(zerolog.InfoLevel)
 	}
 
-	log.Debug().Str("path", *cfg.DBPathString).Msg("Opening database")
-	streamDB, err := db.OpenStreamDB(*cfg.DBPathString)
+	log.Debug().Str("path", cfg.Config.DBPath).Msg("Opening database")
+	streamDB, err := db.OpenStreamDB(cfg.Config.DBPath)
 	if err != nil {
 		log.Error().Err(err).Msg("Unable to open database")
 		return
@@ -43,10 +55,10 @@ func main() {
 	}
 
 	rep, err := logstream.NewReplicator(
-		*cfg.NodeID,
-		*cfg.NatsAddr,
-		*cfg.Shards,
-		*cfg.EnableCompress,
+		cfg.Config.NodeID,
+		strings.Join(cfg.Config.NatsAddr, ", "),
+		cfg.Config.Shards,
+		cfg.Config.EnableCompress,
 		snapshot.NewNatsDBSnapshot(streamDB),
 	)
 	if err != nil {
@@ -58,7 +70,7 @@ func main() {
 		return
 	}
 
-	if *cfg.EnableSnapshot {
+	if cfg.Config.EnableSnapshot {
 		err = rep.RestoreSnapshot()
 		if err != nil {
 			log.Panic().Err(err).Msg("Unable to restore snapshot")
@@ -66,13 +78,13 @@ func main() {
 	}
 
 	log.Info().Msg("Listing tables to watch...")
-	tableNames, err := db.GetAllDBTables(*cfg.DBPathString)
+	tableNames, err := db.GetAllDBTables(cfg.Config.DBPath)
 	if err != nil {
 		log.Error().Err(err).Msg("Unable to list all tables")
 		return
 	}
 
-	streamDB.OnChange = onTableChanged(rep, *cfg.NodeID)
+	streamDB.OnChange = onTableChanged(rep, cfg.Config.NodeID)
 	log.Info().Msg("Starting change data capture pipeline...")
 	if err := streamDB.InstallCDC(tableNames); err != nil {
 		log.Error().Err(err).Msg("Unable to install change data capture pipeline")
@@ -80,7 +92,7 @@ func main() {
 	}
 
 	errChan := make(chan error)
-	for i := uint64(0); i < *cfg.Shards; i++ {
+	for i := uint64(0); i < cfg.Config.Shards; i++ {
 		go changeListener(streamDB, rep, i+1, errChan)
 	}
 
