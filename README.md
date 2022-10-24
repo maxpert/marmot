@@ -6,12 +6,11 @@
 ![GitHub](https://img.shields.io/github/license/maxpert/marmot)
 
 ## What & Why?
-Marmot can give you a solid replication between your nodes as Marmot builds on top of fault-tolerant 
-[NATS](https://nats.io/), thus allowing robust recovery and replication. This means if you are 
-running a read heavy website based on SQLite you should be easily able to scale it out by
-adding more SQLite replicated nodes. SQLite is a probably the most ubiquitous DB that 
-exists almost everywhere, this project aims to make it even more ubiquitous for 
-server side applications by building a replication layer on top.
+Marmot is a distributed SQLite replicator with leaderless, and eventual consistency. It allows you to build a robust replication 
+between your nodes by building on top of fault-tolerant [NATS Jetsream](https://nats.io/). This means if you are running a read 
+heavy website based on SQLite, you should be easily able to scale it out by adding more SQLite replicated nodes. SQLite is 
+probably the most ubiquitous DB that exists almost everywhere, Marmot aims to make it even more ubiquitous for server 
+side applications by building a replication layer on top.
 
 ## What is the difference from others?
 
