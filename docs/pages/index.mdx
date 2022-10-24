@@ -1,8 +1,11 @@
 # Marmot - a distributed SQLite replicator
 
-Marmot is a distributed, multi-master, fault-tolerant, and eventually consistent SQLite replicator. It's built on top of [NATS](https://nats.io/). This
-allows Marmot to give you a solid replication layer for your nodes using SQLite as database, thus allowing robust recovery and replication. In a 
-typical setting Marmot can be used to distribute your CMS, forums, etc. 
+Marmot is a distributed SQLite replicator with leaderless, and eventual consistency. It allows you to build a robust replication 
+between your nodes by building on top of fault-tolerant [NATS Jetsream](https://nats.io/). This means if you are running a read 
+heavy website based on SQLite, you should be easily able to scale it out by adding more SQLite replicated nodes. SQLite is 
+probably the most ubiquitous DB that exists almost everywhere, Marmot aims to make it even more ubiquitous for server 
+side applications by building a replication layer on top. In a typical setting Marmot can be used to distribute your 
+CMS, forums, etc. 
 
 Checkout following demos:
 
