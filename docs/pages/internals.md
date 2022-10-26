@@ -15,8 +15,8 @@ and then Marmot can publish them to rest of the nodes. This is how it works inte
   triggers are compiled via Go's builtin templating system, and installed to database at boot time.
   
 - Each `insert`, `update`, `delete` triggers for every table `AFTER` the changes have been
-  committed to the table. These triggers record `OLD` (ON DELETE) or `NEW` (ON 
-  INSERT OR UPDATE) values into the table.
+  committed to the table. These triggers record `OLD` (ON DELETE) or `NEW` (ON INSERT OR 
+  UPDATE) values into the table.
 
 ## Replication
 
@@ -33,13 +33,13 @@ Marmot:
   possible that a row committed locally is overwritten or replaced later because it was not the last one
   in order of cluster wide commit order.
 
-## Why Snapshots
+## Snapshotting
 
 In a normal distributed system it's pretty typical for nodes to go down for really long time. In that particular case a node coming back up can 
 be lagging so far behind that `max-log-entries` might not be sufficient to fully play all logs and restore the state of database. In that case 
 it required that a node restores a snapshot and apply current log entries to be fully up to date. 
 
-As of `v0.6.0-RC` Marmot supports taking snapshot and being able to fully restore it via [NATS Object Storage](https://docs.nats.io/using-nats/developer/develop_jetstream/object). 
+As of `v0.6.0+` Marmot supports taking snapshot and being able to fully restore it via [NATS Object Storage](https://docs.nats.io/using-nats/developer/develop_jetstream/object). 
 
  > In future Marmot plans to support more storage mechanisms like S3 (and compatible APIs including BlackBlaze and Minio), Azure Blob, and SFTP.
 
