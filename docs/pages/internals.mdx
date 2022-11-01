@@ -32,6 +32,28 @@ Marmot:
 - Once the order is determined for a change it's applied in an upsert or delete manner to the table. So it's quite
   possible that a row committed locally is overwritten or replaced later because it was not the last one
   in order of cluster wide commit order.
+  
+## Changelog format
+
+Changelog is a CBOR serialized (and compressed if configured) payload that has following interface definition:
+
+```typescript
+interface MarmotPublishedRow {
+  FromNodeId: number;
+  Payload: {
+    Id: number;
+    Type: "insert" | "update" | "delete";
+    TableName: string;
+    Row: {[ColumnName: string]: any}
+  };
+}
+```
+
+`FromNodeId` points to node ID who sent the changelog (configured when launching). `Payload.TableName` points to the table that changed with mutation
+type of `Payload.Type`. Then `Payload.Row` contains flat map of column name to value
+
+> There is alot of optimization that can be done to this payload overall, in future using ProtoBuf or more optimized serialization format is 
+> absolutely an open option. 
 
 ## Snapshotting
 
