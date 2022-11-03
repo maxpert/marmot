@@ -130,4 +130,6 @@ Right now there are a few limitations on current solution:
 
 Last but not least we would like to thank our sponsors who have been supporting development of this project.
 
+[<img src="https://resources.jetbrains.com/storage/products/company/brand/logos/GoLand_icon.png" alt="GoLand logo." height="64" />
+<img src="https://resources.jetbrains.com/storage/products/company/brand/logos/jb_beam.png" alt="JetBrains Logo (Main) logo." height="64">](https://www.jetbrains.com/?utm_medium=opensource&utm_source=marmot)
 [![DigitalOcean Referral Badge](https://web-platforms.sfo2.cdn.digitaloceanspaces.com/WWW/Badge%201.svg)](https://www.digitalocean.com/?utm_medium=opensource&utm_source=marmot)
