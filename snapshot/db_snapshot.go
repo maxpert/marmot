@@ -82,6 +82,9 @@ func (n *NatsDBSnapshot) SaveSnapshot(conn *nats.Conn) error {
 			HashHeaderKey: {hash},
 		},
 	}, rfl)
+	if err != nil {
+		return err
+	}
 
 	log.Info().
 		Str("hash", hash).
@@ -103,38 +106,9 @@ func (n *NatsDBSnapshot) RestoreSnapshot(conn *nats.Conn) error {
 	defer cleanupDir(tmpSnapshotPath)
 
 	bkFilePath := path.Join(tmpSnapshotPath, FileName)
-	err = n.db.BackupTo(bkFilePath)
-	if err != nil {
-		return err
-	}
-
-	hash, err := fileHash(bkFilePath)
-	if err != nil {
-		return err
-	}
-
 	blb, err := getBlobStore(conn)
 	if err != nil {
 		return err
-	}
-
-	info, err := blb.GetInfo(FileName)
-	if err == nats.ErrObjectNotFound {
-		return nil
-	}
-
-	if err != nil {
-		return err
-	}
-
-	snapshotHash, ok := info.Headers[HashHeaderKey]
-	if !ok || len(snapshotHash) != 1 {
-		return ErrInvalidSnapshot
-	}
-
-	if hash == snapshotHash[0] {
-		log.Info().Msg("DB Snapshot already up to date, skipping restore")
-		return nil
 	}
 
 	err = blb.GetFile(FileName, bkFilePath)
@@ -143,7 +117,7 @@ func (n *NatsDBSnapshot) RestoreSnapshot(conn *nats.Conn) error {
 	}
 
 	log.Info().Str("path", bkFilePath).Msg("Downloaded snapshot, restoring...")
-	err = n.db.RestoreFrom(bkFilePath)
+	err = db.RestoreFrom(n.db.GetPath(), bkFilePath)
 	if err != nil {
 		return err
 	}
@@ -191,7 +165,7 @@ func getBlobStore(conn *nats.Conn) (nats.ObjectStore, error) {
 	if err == nats.ErrStreamNotFound {
 		blb, err = js.CreateObjectStore(&nats.ObjectStoreConfig{
 			Bucket:      blobBucketName(),
-			Replicas:    *cfg.LogReplicas,
+			Replicas:    cfg.Config.Snapshot.Replicas,
 			Storage:     nats.FileStorage,
 			Description: "Bucket to store snapshot",
 		})
@@ -201,5 +175,5 @@ func getBlobStore(conn *nats.Conn) (nats.ObjectStore, error) {
 }
 
 func blobBucketName() string {
-	return *cfg.StreamPrefix + "-snapshot-store"
+	return cfg.Config.NATS.StreamPrefix + "-snapshot-store"
 }

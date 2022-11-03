@@ -2,6 +2,9 @@ package main
 
 import (
 	"flag"
+	"io"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/maxpert/marmot/cfg"
@@ -16,14 +19,25 @@ import (
 func main() {
 	flag.Parse()
 
-	if *cfg.Verbose {
-		log.Logger = log.Level(zerolog.DebugLevel)
-	} else {
-		log.Logger = log.Level(zerolog.InfoLevel)
+	err := cfg.Load(*cfg.ConfigPath)
+	if err != nil {
+		panic(err)
 	}
 
-	log.Debug().Str("path", *cfg.DBPathString).Msg("Opening database")
-	streamDB, err := db.OpenStreamDB(*cfg.DBPathString)
+	var writer io.Writer = zerolog.NewConsoleWriter()
+	if cfg.Config.Logging.Format == "json" {
+		writer = os.Stdout
+	}
+	gLog := zerolog.New(writer).With().Timestamp().Logger()
+
+	if cfg.Config.Logging.Verbose {
+		log.Logger = gLog.Level(zerolog.DebugLevel)
+	} else {
+		log.Logger = gLog.Level(zerolog.InfoLevel)
+	}
+
+	log.Debug().Str("path", cfg.Config.DBPath).Msg("Opening database")
+	streamDB, err := db.OpenStreamDB(cfg.Config.DBPath)
 	if err != nil {
 		log.Error().Err(err).Msg("Unable to open database")
 		return
@@ -41,14 +55,14 @@ func main() {
 	}
 
 	rep, err := logstream.NewReplicator(
-		*cfg.NodeID,
-		*cfg.NatsAddr,
-		*cfg.Shards,
-		*cfg.EnableCompress,
+		cfg.Config.NodeID,
+		strings.Join(cfg.Config.NATS.URLs, ", "),
+		cfg.Config.ReplicationLog.Shards,
+		cfg.Config.ReplicationLog.Compress,
 		snapshot.NewNatsDBSnapshot(streamDB),
 	)
 	if err != nil {
-		log.Panic().Err(err).Msg("Unable to connect")
+		log.Panic().Err(err).Msg("Unable to initialize replicators")
 	}
 
 	if *cfg.SaveSnapshot {
@@ -56,7 +70,7 @@ func main() {
 		return
 	}
 
-	if *cfg.EnableSnapshot {
+	if cfg.Config.Snapshot.Enable {
 		err = rep.RestoreSnapshot()
 		if err != nil {
 			log.Panic().Err(err).Msg("Unable to restore snapshot")
@@ -64,13 +78,13 @@ func main() {
 	}
 
 	log.Info().Msg("Listing tables to watch...")
-	tableNames, err := db.GetAllDBTables(*cfg.DBPathString)
+	tableNames, err := db.GetAllDBTables(cfg.Config.DBPath)
 	if err != nil {
 		log.Error().Err(err).Msg("Unable to list all tables")
 		return
 	}
 
-	streamDB.OnChange = onTableChanged(rep, *cfg.NodeID)
+	streamDB.OnChange = onTableChanged(rep, cfg.Config.NodeID)
 	log.Info().Msg("Starting change data capture pipeline...")
 	if err := streamDB.InstallCDC(tableNames); err != nil {
 		log.Error().Err(err).Msg("Unable to install change data capture pipeline")
@@ -78,7 +92,7 @@ func main() {
 	}
 
 	errChan := make(chan error)
-	for i := uint64(0); i < *cfg.Shards; i++ {
+	for i := uint64(0); i < cfg.Config.ReplicationLog.Shards; i++ {
 		go changeListener(streamDB, rep, i+1, errChan)
 	}
 
