@@ -12,7 +12,6 @@ import (
 )
 
 const maxReplicateRetries = 7
-const NodeNamePrefix = "marmot-node"
 const SnapshotShardID = uint64(1)
 
 type Replicator struct {
@@ -33,7 +32,7 @@ func NewReplicator(
 	compress bool,
 	snapshot snapshot.NatsSnapshot,
 ) (*Replicator, error) {
-	nc, err := nats.Connect(natsServer, nats.Name(nodeName(nodeID)))
+	nc, err := nats.Connect(natsServer, nats.Name(cfg.Config.NodeName()))
 
 	if err != nil {
 		return nil, err
@@ -202,7 +201,7 @@ func (r *Replicator) RestoreSnapshot() error {
 
 		savedSeq := r.repState.get(strName)
 		if savedSeq < info.State.FirstSeq {
-			return r.snapshot.RestoreSnapshot(r.client)
+			return r.snapshot.RestoreSnapshot()
 		}
 	}
 
@@ -214,7 +213,7 @@ func (r *Replicator) SaveSnapshot() {
 		return
 	}
 
-	err := r.snapshot.SaveSnapshot(r.client)
+	err := r.snapshot.SaveSnapshot()
 	if err != nil {
 		log.Error().
 			Err(err).
@@ -281,10 +280,6 @@ func makeShardConfig(shardID uint64, totalShards uint64, compressed bool) *nats.
 		DenyDelete:        true,
 		Replicas:          replicas,
 	}
-}
-
-func nodeName(nodeID uint64) string {
-	return fmt.Sprintf("%s-%d", NodeNamePrefix, nodeID)
 }
 
 func streamName(shardID uint64, compressed bool) string {

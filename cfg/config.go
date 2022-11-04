@@ -2,12 +2,21 @@ package cfg
 
 import (
 	"flag"
+	"fmt"
 	"hash/fnv"
 	"os"
 
 	"github.com/BurntSushi/toml"
 	"github.com/denisbrodbeck/machineid"
 	"github.com/nats-io/nats.go"
+)
+
+type SnapshotStoreType string
+
+const NodeNamePrefix = "marmot-node"
+const (
+	Nats SnapshotStoreType = "nats"
+	S3                     = "s3"
 )
 
 type ReplicationLogConfiguration struct {
@@ -17,9 +26,25 @@ type ReplicationLogConfiguration struct {
 	Compress   bool   `toml:"compress"`
 }
 
+type S3Configuration struct {
+	Endpoint     string `toml:"endpoint"`
+	AccessKey    string `toml:"access_key"`
+	SecretKey    string `toml:"secret"`
+	SessionToken string `toml:"session_token"`
+	Bucket       string `toml:"bucket"`
+	UseSSL       bool   `toml:"use_ssl"`
+}
+
+type ObjectStoreConfiguration struct {
+	Replicas   int    `toml:"replicas"`
+	BucketName string `toml:"bucket"`
+}
+
 type SnapshotConfiguration struct {
-	Enable   bool `toml:"enabled"`
-	Replicas int  `toml:"replicas"`
+	Enable    bool                     `toml:"enabled"`
+	StoreType SnapshotStoreType        `toml:"store"`
+	Nats      ObjectStoreConfiguration `toml:"nats"`
+	S3        S3Configuration          `toml:"s3"`
 }
 
 type NATSConfiguration struct {
@@ -54,8 +79,12 @@ var Config = &Configuration{
 	NodeID:     1,
 
 	Snapshot: SnapshotConfiguration{
-		Enable:   true,
-		Replicas: 1,
+		Enable:    true,
+		StoreType: Nats,
+		Nats: ObjectStoreConfiguration{
+			Replicas: 1,
+		},
+		S3: S3Configuration{},
 	},
 
 	ReplicationLog: ReplicationLogConfiguration{
@@ -99,4 +128,12 @@ func Load(path string) error {
 	}
 
 	return err
+}
+
+func (c *Configuration) SnapshotStorageType() SnapshotStoreType {
+	return c.Snapshot.StoreType
+}
+
+func (c *Configuration) NodeName() string {
+	return fmt.Sprintf("%s-%d", NodeNamePrefix, c.NodeID)
 }
