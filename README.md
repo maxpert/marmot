@@ -38,6 +38,20 @@ Marmot is a CDC (Change Data Capture) pipeline running top of NATS. It can autom
 those streams evenly distribute load over those shards, so scaling simply boils down to adding more nodes, and re-balancing
 those JetStreams (To be automated in future versions).
 
+## Features
+
+![Eventually Consistent](https://img.shields.io/badge/Eventually%20Consistent-✔️-green)
+![Leaderless Replication](https://img.shields.io/badge/Leaderless%20Replication-✔️-green)
+![Fault Tolerant](https://img.shields.io/badge/Fault%20Tolerant-✔️-green)
+![Built on NATS](https://img.shields.io/badge/Built%20on%20NATS-✔️-green)
+
+ - Leaderless replication never requiring a single node to handle all write load.
+ - NATS/S3 Snapshot support. 
+ - Built on top of NATS, abstracting stream distribution and replication.
+ - Ability to snapshot and fully recover from those snapshots.
+ - SQLite based log storage, so all the tooling with SQLite is at your disposal.
+ - Support for log entry compression, handling content heavy CMS needs.
+
 ## Dependencies
 Starting 0.4+ Marmot depends on [nats-server](https://nats.io/download/) with JetStream support.
 Instead of building an in process consensus algorithm, this unlocks more use-cases like letting 
@@ -59,19 +73,6 @@ The output will look something like this:
  - `v0.5.x` introduces change log compression with zstd.
  - `v0.4.x` introduces NATS based change log streaming, and continuous multi-directional sync.
  - `v0.3.x` is deprecated, and unstable. DO NOT USE IT IN PRODUCTION.
-
-## Features
-
-![Eventually Consistent](https://img.shields.io/badge/Eventually%20Consistent-✔️-green)
-![Leaderless Replication](https://img.shields.io/badge/Leaderless%20Replication-✔️-green)
-![Fault Tolerant](https://img.shields.io/badge/Fault%20Tolerant-✔️-green)
-![Built on NATS](https://img.shields.io/badge/Built%20on%20NATS-✔️-green)
-
- - Leaderless replication never requiring a single node to handle all write load.
- - Built on top of NATS, abstracting stream distribution and replication.
- - Ability to snapshot and fully recover from those snapshots.
- - SQLite based log storage, so all the tooling with SQLite is at your disposal.
- - Support for log entry compression, handling content heavy CMS needs.
 
 ## Running
 
