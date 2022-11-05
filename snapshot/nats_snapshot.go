@@ -1,10 +1,32 @@
 package snapshot
 
 import (
-	"github.com/nats-io/nats.go"
+	"errors"
+
+	"github.com/maxpert/marmot/cfg"
 )
 
+var ErrInvalidStorageType = errors.New("invalid snapshot storage type")
+
 type NatsSnapshot interface {
-	SaveSnapshot(nats *nats.Conn) error
-	RestoreSnapshot(nats *nats.Conn) error
+	SaveSnapshot() error
+	RestoreSnapshot() error
+}
+
+type Storage interface {
+	Upload(name, filePath string) error
+	Download(filePath, name string) error
+}
+
+func NewSnapshotStorage() (Storage, error) {
+	c := cfg.Config
+
+	switch c.SnapshotStorageType() {
+	case cfg.Nats:
+		return newNatsStorage()
+	case cfg.S3:
+		return newS3Storage()
+	}
+
+	return nil, ErrInvalidStorageType
 }

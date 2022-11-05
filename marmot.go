@@ -54,12 +54,17 @@ func main() {
 		return
 	}
 
+	snpStore, err := snapshot.NewSnapshotStorage()
+	if err != nil {
+		log.Panic().Err(err).Msg("Unable to initialize snapshot storage")
+	}
+
 	rep, err := logstream.NewReplicator(
 		cfg.Config.NodeID,
 		strings.Join(cfg.Config.NATS.URLs, ", "),
 		cfg.Config.ReplicationLog.Shards,
 		cfg.Config.ReplicationLog.Compress,
-		snapshot.NewNatsDBSnapshot(streamDB),
+		snapshot.NewNatsDBSnapshot(streamDB, snpStore),
 	)
 	if err != nil {
 		log.Panic().Err(err).Msg("Unable to initialize replicators")
