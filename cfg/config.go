@@ -27,6 +27,7 @@ type ReplicationLogConfiguration struct {
 }
 
 type S3Configuration struct {
+	DirPath      string `toml:"path"`
 	Endpoint     string `toml:"endpoint"`
 	AccessKey    string `toml:"access_key"`
 	SecretKey    string `toml:"secret"`

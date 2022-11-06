@@ -2,6 +2,7 @@ package snapshot
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/maxpert/marmot/cfg"
@@ -17,7 +18,8 @@ type s3Storage struct {
 func (s s3Storage) Upload(name, filePath string) error {
 	ctx := context.Background()
 	cS3 := cfg.Config.Snapshot.S3
-	info, err := s.mc.FPutObject(ctx, cS3.Bucket, name, filePath, minio.PutObjectOptions{})
+	bucketPath := fmt.Sprintf("%s/%s", cS3.DirPath, name)
+	info, err := s.mc.FPutObject(ctx, cS3.Bucket, bucketPath, filePath, minio.PutObjectOptions{})
 	if err != nil {
 		return err
 	}
@@ -35,8 +37,8 @@ func (s s3Storage) Upload(name, filePath string) error {
 func (s s3Storage) Download(filePath, name string) error {
 	ctx := context.Background()
 	cS3 := cfg.Config.Snapshot.S3
-
-	return s.mc.FGetObject(ctx, cS3.Bucket, name, filePath, minio.GetObjectOptions{})
+	bucketPath := fmt.Sprintf("%s/%s", cS3.DirPath, name)
+	return s.mc.FGetObject(ctx, cS3.Bucket, bucketPath, filePath, minio.GetObjectOptions{})
 }
 
 func newS3Storage() (*s3Storage, error) {

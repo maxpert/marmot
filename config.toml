@@ -20,8 +20,8 @@ db_path="/tmp/marmot.db"
 [snapshot]
 # Disabling snapshot disables both restore and save
 enabled=true
-# Storage for snapshot can be "nats" | "s3"
-#store="s3"
+# Storage for snapshot can be "nats" | "s3" (default "nats")
+store="nats"
 
 # When setting snapshot.store to "nats" [snapshot.nats] will be used to configure snapshotting details
 # NATS connection settings (urls etc.) will be loaded from global [nats] configurations
@@ -29,17 +29,20 @@ enabled=true
 # Number of NATS replicas of snapshot object store (max 5). Recommended values: 2-3
 replicas=1
 # Bucket name for object store to save snapshot on.
-#bucket="custom-bucket name"
+#bucket="custom-bucket-name"
 
 # When setting snapshot.store to "s3" [snapshot.s3] will be used to configure snapshotting details
 [snapshot.s3]
+# Directory path within bucket where snapshot is saved and restore from
+path="snapshots/marmot"
+
 # For S3 this will be `s3.region-code.amazonaws.com` (check your AWS Console for details).
 # For Minio this will point to the host where Minio lives
-#endpoint="192.168.0.122:9000"
+endpoint="127.0.0.1:9000"
 
 # By default false but should be set to true depending upong Minio configuration, for S3 it should be
 # always true. This essentially lets you select between https and http for your hosting.
-#use_ssl=false
+use_ssl=false
 
 # Access key ID or Minio user name
 #access_key="marmot"
@@ -48,7 +51,7 @@ replicas=1
 #secret="ChangeMe"
 
 # Bucket name where snapshots live
-#bucket="marmot"
+bucket="marmot"
 
 # Change log that is published and persisted in JetStreams by Marmot.
 # Marmot auto-configures missing JetStreams when booting up for you.
