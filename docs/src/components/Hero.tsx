@@ -1,10 +1,7 @@
 import Link from "next/link";
-import { useTheme } from "nextra-theme-docs";
 import MemoMarmotLogo from "./Icons/MarmotLogo";
 
 export const Hero = () => {
-  const theme = useTheme();
-  console.log(theme);
   return (
     <section className="flex items-center min-h-screen justify-center">
       <div className="max-w-full">
@@ -21,7 +18,9 @@ export const Hero = () => {
 
         <div className="mt-6 flex items-center justify-center gap-4">
           <a
-            href="#"
+            href="https://github.com/maxpert/marmot/releases/latest"
+            target="_blank"
+            rel="noopener noreferrer"
             className="transform rounded-md bg-marmot-blue-600 px-5 py-3 font-medium text-white transition-colors hover:bg-marmot-blue-800"
           >
             Download latest
