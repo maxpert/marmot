@@ -1,25 +1,20 @@
 # Marmot - a distributed SQLite replicator
 
-<<<<<<<< HEAD:docs/src/pages/overview.md
-Marmot can give you a solid replication between your nodes as Marmot builds on top of fault-tolerant [NATS](https://nats.io/), thus allowing robust recovery and replication. Marmot is designed to be a side car that is eventually consistent, thus optimized for read heavy workloads.
-========
-Marmot is a distributed SQLite replicator with leaderless, and eventual consistency. It allows you to build a robust replication 
-between your nodes by building on top of fault-tolerant [NATS Jetsream](https://nats.io/). This means if you are running a read 
-heavy website based on SQLite, you should be easily able to scale it out by adding more SQLite replicated nodes. SQLite is 
-probably the most ubiquitous DB that exists almost everywhere, Marmot aims to make it even more ubiquitous for server 
-side applications by building a replication layer on top. In a typical setting Marmot can be used to distribute your 
-CMS, forums, etc. 
->>>>>>>> upstream/master:docs/src/pages/index.mdx
+Marmot is a distributed SQLite replicator with leaderless, and eventual consistency. It allows you to build a robust replication
+between your nodes by building on top of fault-tolerant [NATS Jetsream](https://nats.io/). This means if you are running a read
+heavy website based on SQLite, you should be easily able to scale it out by adding more SQLite replicated nodes. SQLite is
+probably the most ubiquitous DB that exists almost everywhere, Marmot aims to make it even more ubiquitous for server
+side applications by building a replication layer on top. In a typical setting Marmot can be used to distribute your
+CMS, forums, etc.
 
 Checkout following demos:
 
 <center>
 <iframe width="560" height="315" src="https://www.youtube.com/embed/GQ5x8pc9vuI" title="YouTube video player" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe>
- 
+
 
 <iframe width="560" height="315" src="https://www.youtube.com/embed/QqZl61bJ9BA" title="YouTube video player" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe>
 </center>
-
 
 ## Why?
 
@@ -51,9 +46,9 @@ those JetStreams (To be automated in future versions).
 
 ### What happens to serializability of my transactions?
 
-So in case of a race condition [RAFT quorum](https://docs.nats.io/running-a-nats-service/configuration/clustering/jetstream_clustering#raft) 
-will let the last writer win. Which means there is NO serializability guarantee of a transaction spanning multiple tables. This is a design 
-choice right now we have made, in order to avoid any sort of global locking, and performance. 
+So in case of a race condition [RAFT quorum](https://docs.nats.io/running-a-nats-service/configuration/clustering/jetstream_clustering#raft)
+will let the last writer win. Which means there is NO serializability guarantee of a transaction spanning multiple tables. This is a design
+choice right now we have made, in order to avoid any sort of global locking, and performance.
 
 ### Won’t capturing changes with triggers use more disk space?
 
