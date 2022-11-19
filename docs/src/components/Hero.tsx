@@ -25,7 +25,7 @@ export const Hero = () => {
           >
             Download latest
           </a>
-          <Link href="/how">
+          <Link href="/intro">
             <a className="transform rounded-md border border-slate-200 px-5 py-3 font-medium text-slate-900 transition-colors hover:bg-marmot-blue-400 hover:text-white">
               Read the docs
             </a>
