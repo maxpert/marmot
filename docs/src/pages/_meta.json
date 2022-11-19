@@ -1,7 +1,5 @@
 {
   "index": "Welcome",
-  "intro": "Introduction",
-  "overview": "Overview",
-  "internals": "Internals",
-  "how": "How"
+  "intro": "Overview",
+  "internals": "Internals"
 }
