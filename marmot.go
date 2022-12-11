@@ -75,7 +75,7 @@ func main() {
 		return
 	}
 
-	if cfg.Config.Snapshot.Enable {
+	if cfg.Config.Snapshot.Enable && cfg.Config.Replicate {
 		err = rep.RestoreSnapshot()
 		if err != nil {
 			log.Panic().Err(err).Msg("Unable to restore snapshot")
@@ -101,7 +101,7 @@ func main() {
 		go changeListener(streamDB, rep, i+1, errChan)
 	}
 
-	cleanupInterval := 5 * time.Second
+	cleanupInterval := time.Duration(cfg.Config.CleanInterval) * time.Second
 	cleanupTicker := time.NewTicker(cleanupInterval)
 	defer cleanupTicker.Stop()
 
@@ -132,6 +132,10 @@ func changeListener(streamDB *db.SqliteStreamDB, rep *logstream.Replicator, shar
 
 func onChangeEvent(streamDB *db.SqliteStreamDB) func(data []byte) error {
 	return func(data []byte) error {
+		if !cfg.Config.Replicate {
+			return nil
+		}
+
 		ev := &logstream.ReplicationEvent[db.ChangeLogEvent]{}
 		err := ev.Unmarshal(data)
 		if err != nil {
@@ -145,6 +149,10 @@ func onChangeEvent(streamDB *db.SqliteStreamDB) func(data []byte) error {
 
 func onTableChanged(r *logstream.Replicator, nodeID uint64) func(event *db.ChangeLogEvent) error {
 	return func(event *db.ChangeLogEvent) error {
+		if !cfg.Config.Publish {
+			return nil
+		}
+
 		ev := &logstream.ReplicationEvent[db.ChangeLogEvent]{
 			FromNodeId: nodeID,
 			Payload:    event,

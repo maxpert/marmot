@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"github.com/maxpert/marmot/cfg"
 	"regexp"
 	"strings"
 	"text/template"
@@ -17,9 +18,6 @@ import (
 	"github.com/rs/zerolog/log"
 	"github.com/samber/lo"
 )
-
-// ScanLimit is number of change log rows processed at a time, to limit memory usage
-const ScanLimit = uint(128)
 
 var ErrNoTableMapping = errors.New("no table mapping found")
 var ErrLogNotReadyToPublish = errors.New("not ready to publish changes")
@@ -248,7 +246,7 @@ func (conn *SqliteStreamDB) watchChanges(watcher *fsnotify.Watcher, path string)
 	}
 }
 
-func (conn *SqliteStreamDB) getGlobalChanges(limit uint) ([]globalChangeLogEntry, error) {
+func (conn *SqliteStreamDB) getGlobalChanges(limit uint32) ([]globalChangeLogEntry, error) {
 	sqlConn, err := conn.pool.Borrow()
 	if err != nil {
 		return nil, err
@@ -258,7 +256,8 @@ func (conn *SqliteStreamDB) getGlobalChanges(limit uint) ([]globalChangeLogEntry
 	var entries []globalChangeLogEntry
 	err = sqlConn.DB().
 		From(conn.globalMetaTable()).
-		Limit(limit).
+		Order(goqu.I("id").Asc()).
+		Limit(uint(limit)).
 		ScanStructs(&entries)
 
 	if err != nil {
@@ -274,7 +273,7 @@ func (conn *SqliteStreamDB) publishChangeLog() {
 	}
 	defer conn.publishLock.Unlock()
 
-	changes, err := conn.getGlobalChanges(ScanLimit)
+	changes, err := conn.getGlobalChanges(cfg.Config.ScanMaxChanges)
 	if err != nil {
 		log.Error().Err(err).Msg("Unable to scan global changes")
 		return

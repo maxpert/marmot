@@ -10,6 +10,21 @@ db_path="/tmp/marmot.db"
 # and replay all logs in order to restore database
 # seq_map_path="/tmp/seq-map.cbor"
 
+# Replication enabled/disabled (default: true)
+# This will allow process to consume incoming changes from NATS
+# replicate = true
+
+# Publishing enabled/disabled (default: true)
+# This will allow process to control publishing of local DB changes to NATS
+# publish = true
+
+# Number of maximum rows to process per change allows configuring the maximum number of rows Marmot
+# will process (scan/load in memory) before publishing to NATS (default: 512)
+# scan_max_changes = 512
+
+# Cleanup interval in seconds used to clean up published rows. This is done in order to reduce write
+# load on the system (default: 5)
+# cleanup_interval = 5
 
 # Snapshots are used to limit log size and have a database snapshot backedup on your
 # configured blob storage (NATS for now). This helps speedier recovery or cold boot
