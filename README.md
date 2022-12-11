@@ -67,7 +67,7 @@ The output will look something like this:
 
 ## Production status
 
- - `v0.7.x` moves to file based configuration rather than CLI flags, and (currently WIP) S3 compatible snapshot storage 
+ - `v0.7.x` moves to file based configuration rather than CLI flags, and S3 compatible snapshot storage 
  - `v0.6.x` introduces snapshot save/restore. It's in pre-production state. Is being used successfully 
     to run a read heavy site (per node 4,796 reads /sec, 138.3 writes / sec).
  - `v0.5.x` introduces change log compression with zstd.
