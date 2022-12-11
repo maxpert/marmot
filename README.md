@@ -124,7 +124,7 @@ Right now there are a few limitations on current solution:
 
 ## FAQs & Community 
 
- - For FAQs visit [this page](https://maxpert.github.io/marmot/#faq)
+ - For FAQs visit [this page](https://maxpert.github.io/marmot/intro#faq)
  - For community visit our [discord](https://discord.gg/AWUwY66XsE) or discussions on GitHub
 
 ## Our sponsor
