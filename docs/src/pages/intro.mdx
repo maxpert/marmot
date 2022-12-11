@@ -47,11 +47,14 @@ those JetStreams (To be automated in future versions).
 
 ## FAQ
 
-### What happens to serializability of my transactions?
+### What happens when there is a race condition?
 
-So in case of a race condition [RAFT quorum](https://docs.nats.io/running-a-nats-service/configuration/clustering/jetstream_clustering#raft)
-will let the last writer win. Which means there is NO serializability guarantee of a transaction spanning multiple tables. This is a design
-choice right now we have made, in order to avoid any sort of global locking, and performance.
+In Marmot every row is uniquely mapped to a JetStream in NATS. This guarantees that for a node to publish changes about a row it has to go through 
+same JetStream as everyone else. If two nodes both perform a change to same row, both of the nodes will compete to publish their change changes to
+JetStream cluster, and due to [RAFT quorum](https://docs.nats.io/running-a-nats-service/configuration/clustering/jetstream_clustering#raft) 
+requirements one one of the writer will be able to get it's changes published. Now as these changes are applied (even the publisher applies 
+it's own changes to database) the **last writer** will always win. This means there is NO serializability guarantee of a transaction 
+spanning multiple tables. This is a design choice, in order to avoid any sort of global locking, and performance. 
 
 ### Won't capturing changes with triggers use more disk space?
 
@@ -69,4 +72,4 @@ disk speeds (Network being the biggest culprit).
 
 ### Can I use Marmot as single primary and multiple replicas?
 
-Yes you can. If you write code so that only one node is making changes to DB and rest of them open DB in readonly mode you are effectively doing single primary and multiple replicas. We do plan to introduce a configuration in future to explicitly forbid an instance of Marmot to capture changes as well. 
+Yes you can. There are two flags in configuration that will allow you to do that. First flag `publish` enables/disables publishing local changes to NATS, you should disable `publish` (set it to `false`) on replicas. Second flag is `replicate` that enables/disables replicating changes from NATS on to local node. You should disable `replicate` (set it to `false`) on primary.
