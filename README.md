@@ -115,10 +115,8 @@ For more details and internal workings of marmot [go to these docs](https://maxp
 ## Limitations
 Right now there are a few limitations on current solution:
  - You can't watch tables selectively on a DB. This is due to various limitations around snapshot and restore mechanism.
- - WAL mode required - since your DB is going to be processed by multiple process the only way to have multi-process 
+ - WAL mode required - since your DB is going to be processed by multiple processes the only way to have multi-process 
    changes reliably is via WAL. 
- - Downloading snapshots of database is still WIP. However, it doesn't affect replication functionality as everything 
-   is upsert or delete. Right snapshots are not restore, or initialized.
  - Marmot is eventually consistent. This simply means rows can get synced out of order, and `SERIALIZABLE` assumptions 
    on transactions might not hold true anymore.
 
