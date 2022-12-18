@@ -4,6 +4,7 @@ go 1.18
 
 require (
 	github.com/BurntSushi/toml v1.2.0
+	github.com/asaskevich/EventBus v0.0.0-20200907212545-49d423059eef
 	github.com/denisbrodbeck/machineid v1.0.1
 	github.com/doug-martin/goqu/v9 v9.18.0
 	github.com/fsnotify/fsnotify v1.5.4

@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"flag"
+	"github.com/maxpert/marmot/utils"
 	"io"
 	"os"
 	"strings"
@@ -12,6 +14,7 @@ import (
 	"github.com/maxpert/marmot/logstream"
 	"github.com/maxpert/marmot/snapshot"
 
+	"github.com/asaskevich/EventBus"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 )
@@ -89,7 +92,10 @@ func main() {
 		return
 	}
 
-	streamDB.OnChange = onTableChanged(rep, cfg.Config.NodeID)
+	eventBus := EventBus.New()
+	ctxSt := utils.NewStateContext()
+
+	streamDB.OnChange = onTableChanged(rep, ctxSt, eventBus, cfg.Config.NodeID)
 	log.Info().Msg("Starting change data capture pipeline...")
 	if err := streamDB.InstallCDC(tableNames); err != nil {
 		log.Error().Err(err).Msg("Unable to install change data capture pipeline")
@@ -98,9 +104,10 @@ func main() {
 
 	errChan := make(chan error)
 	for i := uint64(0); i < cfg.Config.ReplicationLog.Shards; i++ {
-		go changeListener(streamDB, rep, i+1, errChan)
+		go changeListener(streamDB, rep, ctxSt, eventBus, i+1, errChan)
 	}
 
+	sleepTimeout := utils.EventBusTimeout(eventBus, "pulse", time.Duration(cfg.Config.SleepTimeout)*time.Second)
 	cleanupInterval := time.Duration(cfg.Config.CleanInterval) * time.Second
 	cleanupTicker := time.NewTicker(cleanupInterval)
 	defer cleanupTicker.Stop()
@@ -118,20 +125,40 @@ func main() {
 			} else if cnt > 0 {
 				log.Debug().Int64("count", cnt).Msg("Cleaned up DB change logs")
 			}
+		case <-sleepTimeout.Next():
+			log.Info().Msg("No more events to process, initiating shutdown")
+			ctxSt.Cancel()
+			if cfg.Config.Snapshot.Enable && cfg.Config.Publish {
+				rep.SaveSnapshot()
+			}
+
+			os.Exit(0)
 		}
 	}
 }
 
-func changeListener(streamDB *db.SqliteStreamDB, rep *logstream.Replicator, shard uint64, errChan chan error) {
+func changeListener(
+	streamDB *db.SqliteStreamDB,
+	rep *logstream.Replicator,
+	ctxSt *utils.StateContext,
+	events EventBus.BusPublisher,
+	shard uint64,
+	errChan chan error,
+) {
 	log.Debug().Uint64("shard", shard).Msg("Listening stream")
-	err := rep.Listen(shard, onChangeEvent(streamDB))
+	err := rep.Listen(shard, onChangeEvent(streamDB, ctxSt, events))
 	if err != nil {
 		errChan <- err
 	}
 }
 
-func onChangeEvent(streamDB *db.SqliteStreamDB) func(data []byte) error {
+func onChangeEvent(streamDB *db.SqliteStreamDB, ctxSt *utils.StateContext, events EventBus.BusPublisher) func(data []byte) error {
 	return func(data []byte) error {
+		events.Publish("pulse")
+		if ctxSt.IsCanceled() {
+			return context.Canceled
+		}
+
 		if !cfg.Config.Replicate {
 			return nil
 		}
@@ -147,8 +174,13 @@ func onChangeEvent(streamDB *db.SqliteStreamDB) func(data []byte) error {
 	}
 }
 
-func onTableChanged(r *logstream.Replicator, nodeID uint64) func(event *db.ChangeLogEvent) error {
+func onTableChanged(r *logstream.Replicator, ctxSt *utils.StateContext, events EventBus.BusPublisher, nodeID uint64) func(event *db.ChangeLogEvent) error {
 	return func(event *db.ChangeLogEvent) error {
+		events.Publish("pulse")
+		if ctxSt.IsCanceled() {
+			return context.Canceled
+		}
+
 		if !cfg.Config.Publish {
 			return nil
 		}

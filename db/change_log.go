@@ -2,6 +2,7 @@ package db
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -303,7 +304,7 @@ func (conn *SqliteStreamDB) publishChangeLog() {
 
 		err = conn.consumeChangeLogs(change.TableName, []*changeLogEntry{&logEntry})
 		if err != nil {
-			if err == ErrLogNotReadyToPublish {
+			if err == ErrLogNotReadyToPublish || err == context.Canceled {
 				break
 			}
 
@@ -414,7 +415,7 @@ func (conn *SqliteStreamDB) consumeChangeLogs(tableName string, changes []*chang
 			})
 
 			if err != nil {
-				if err == ErrLogNotReadyToPublish {
+				if err == ErrLogNotReadyToPublish || err == context.Canceled {
 					return err
 				}
 

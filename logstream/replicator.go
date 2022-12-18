@@ -1,6 +1,7 @@
 package logstream
 
 import (
+	"context"
 	"fmt"
 	"time"
 
@@ -169,6 +170,10 @@ func (r *Replicator) Listen(shardID uint64, callback func(payload []byte) error)
 		err = r.invokeListener(callback, msg)
 		if err != nil {
 			msg.Nak()
+			if err == context.Canceled {
+				return nil
+			}
+
 			log.Error().Err(err).Msg("Replication failed, terminating...")
 			return err
 		}
@@ -242,6 +247,10 @@ func (r *Replicator) invokeListener(callback func(payload []byte) error, msg *na
 		}
 
 		err = callback(payload)
+		if err == context.Canceled {
+			return err
+		}
+
 		if err == nil {
 			return nil
 		}
