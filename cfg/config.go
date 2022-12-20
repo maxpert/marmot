@@ -67,6 +67,7 @@ type Configuration struct {
 	Replicate      bool   `toml:"replicate"`
 	ScanMaxChanges uint32 `toml:"scan_max_changes"`
 	CleanInterval  uint32 `toml:"cleanup_interval"`
+	SleepTimeout   uint32 `toml:"sleep_timeout"`
 
 	Snapshot       SnapshotConfiguration       `toml:"snapshot"`
 	ReplicationLog ReplicationLogConfiguration `toml:"replication_log"`
@@ -86,6 +87,7 @@ var Config = &Configuration{
 	Replicate:      true,
 	ScanMaxChanges: 512,
 	CleanInterval:  5,
+	SleepTimeout:   0,
 
 	Snapshot: SnapshotConfiguration{
 		Enable:    true,

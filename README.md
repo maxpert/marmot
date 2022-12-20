@@ -51,6 +51,7 @@ those JetStreams (To be automated in future versions).
  - Ability to snapshot and fully recover from those snapshots.
  - SQLite based log storage, so all the tooling with SQLite is at your disposal.
  - Support for log entry compression, handling content heavy CMS needs.
+ - Sleep timeout support for serverless scenarios.
 
 ## Dependencies
 Starting 0.4+ Marmot depends on [nats-server](https://nats.io/download/) with JetStream support.
@@ -67,9 +68,10 @@ The output will look something like this:
 
 ## Production status
 
- - `v0.7.x` moves to file based configuration rather than CLI flags, and S3 compatible snapshot storage 
- - `v0.6.x` introduces snapshot save/restore. It's in pre-production state. Is being used successfully 
-    to run a read heavy site (per node 4,796 reads /sec, 138.3 writes / sec).
+ - `v0.7.x` moves to file based configuration rather than CLI flags, and S3 compatible snapshot storage. Is being used 
+   successfully to run a read heavy site (per node 4,796 reads/sec, 138.3 writes/sec on **single core shared**
+   2.8GHz CPU and 1GB RAM).
+ - `v0.6.x` introduces snapshot save/restore. It's in pre-production state.
  - `v0.5.x` introduces change log compression with zstd.
  - `v0.4.x` introduces NATS based change log streaming, and continuous multi-directional sync.
  - `v0.3.x` is deprecated, and unstable. DO NOT USE IT IN PRODUCTION.
@@ -85,9 +87,11 @@ Make sure you have 2 SQLite DBs with exact same schemas and just run:
 
 ```shell
 nats-server --jetstream
-build/marmot -config examples/config-1.toml -verbose
-build/marmot -config examples/config-2.toml -verbose
+build/marmot -config config-1.toml -verbose
+build/marmot -config config-2.toml -verbose
 ```
+
+Here `config-1.toml` and `config-2.toml` should can be copies of `config.toml` with updated node ID and DB paths.
 
 ## Demos
 Demos for `v0.4.x`:

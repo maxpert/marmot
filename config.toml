@@ -26,6 +26,10 @@ db_path="/tmp/marmot.db"
 # load on the system (default: 5)
 # cleanup_interval = 5
 
+# Sleep timeout, useful for serverless scenarios. If there is no activity within given timelimit,
+# a snapshot will be performed and process will exit. Value of 0 means it's disabled (default: 0).
+# sleep_timeout = 15
+
 # Snapshots are used to limit log size and have a database snapshot backedup on your
 # configured blob storage (NATS for now). This helps speedier recovery or cold boot
 # nodes to come up. A Snapshot is taken every log entries are close to max_entries
