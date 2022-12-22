@@ -101,7 +101,7 @@ var Config = &Configuration{
 	},
 
 	ReplicationLog: ReplicationLogConfiguration{
-		Shards:     8,
+		Shards:     1,
 		MaxEntries: 1024,
 		Replicas:   1,
 		Compress:   true,
