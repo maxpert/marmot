@@ -60,14 +60,15 @@ type LoggingConfiguration struct {
 }
 
 type Configuration struct {
-	SeqMapPath     string `toml:"seq_map_path"`
-	DBPath         string `toml:"db_path"`
-	NodeID         uint64 `toml:"node_id"`
-	Publish        bool   `toml:"publish"`
-	Replicate      bool   `toml:"replicate"`
-	ScanMaxChanges uint32 `toml:"scan_max_changes"`
-	CleanInterval  uint32 `toml:"cleanup_interval"`
-	SleepTimeout   uint32 `toml:"sleep_timeout"`
+	SeqMapPath      string `toml:"seq_map_path"`
+	DBPath          string `toml:"db_path"`
+	NodeID          uint64 `toml:"node_id"`
+	Publish         bool   `toml:"publish"`
+	Replicate       bool   `toml:"replicate"`
+	ScanMaxChanges  uint32 `toml:"scan_max_changes"`
+	CleanupInterval uint32 `toml:"cleanup_interval"`
+	SleepTimeout    uint32 `toml:"sleep_timeout"`
+	PollingInterval uint32 `toml:"polling_interval"`
 
 	Snapshot       SnapshotConfiguration       `toml:"snapshot"`
 	ReplicationLog ReplicationLogConfiguration `toml:"replication_log"`
@@ -80,14 +81,15 @@ var Cleanup = flag.Bool("cleanup", false, "Only cleanup marmot triggers and chan
 var SaveSnapshot = flag.Bool("save-snapshot", false, "Only take snapshot and upload")
 
 var Config = &Configuration{
-	SeqMapPath:     "/tmp/seq-map.cbor",
-	DBPath:         "/tmp/marmot.db",
-	NodeID:         1,
-	Publish:        true,
-	Replicate:      true,
-	ScanMaxChanges: 512,
-	CleanInterval:  5,
-	SleepTimeout:   0,
+	SeqMapPath:      "/tmp/seq-map.cbor",
+	DBPath:          "/tmp/marmot.db",
+	NodeID:          1,
+	Publish:         true,
+	Replicate:       true,
+	ScanMaxChanges:  512,
+	CleanupInterval: 5000,
+	SleepTimeout:    0,
+	PollingInterval: 0,
 
 	Snapshot: SnapshotConfiguration{
 		Enable:    true,

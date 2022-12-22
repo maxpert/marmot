@@ -22,13 +22,17 @@ db_path="/tmp/marmot.db"
 # will process (scan/load in memory) before publishing to NATS (default: 512)
 # scan_max_changes = 512
 
-# Cleanup interval in seconds used to clean up published rows. This is done in order to reduce write
-# load on the system (default: 5)
-# cleanup_interval = 5
+# Cleanup interval in milliseconds used to clean up published rows. This is done in order to reduce write
+# load on the system (default: 5000)
+# cleanup_interval = 5000
 
-# Sleep timeout, useful for serverless scenarios. If there is no activity within given timelimit,
-# a snapshot will be performed and process will exit. Value of 0 means it's disabled (default: 0).
-# sleep_timeout = 15
+# Sleep timeout in milliseconds, useful for serverless scenarios. If there is no activity within given timelimit,
+# a snapshot will be performed, and process will exit. Value of 0 means it's disabled (default: 0).
+# sleep_timeout = 15000
+
+# Polling interval in milliseconds, that will explicitly check DB for change logs. This should not be required,
+# it's only useful for broken or buggy file system watchers. Value of 0 means it's disabled (default: 0)
+# polling_interval = 0
 
 # Snapshots are used to limit log size and have a database snapshot backedup on your
 # configured blob storage (NATS for now). This helps speedier recovery or cold boot

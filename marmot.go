@@ -107,8 +107,12 @@ func main() {
 		go changeListener(streamDB, rep, ctxSt, eventBus, i+1, errChan)
 	}
 
-	sleepTimeout := utils.EventBusTimeout(eventBus, "pulse", time.Duration(cfg.Config.SleepTimeout)*time.Second)
-	cleanupInterval := time.Duration(cfg.Config.CleanInterval) * time.Second
+	sleepTimeout := utils.AutoResetEventTimer(
+		eventBus,
+		"pulse",
+		time.Duration(cfg.Config.SleepTimeout)*time.Millisecond,
+	)
+	cleanupInterval := time.Duration(cfg.Config.CleanupInterval) * time.Millisecond
 	cleanupTicker := time.NewTicker(cleanupInterval)
 	defer cleanupTicker.Stop()
 
@@ -125,7 +129,7 @@ func main() {
 			} else if cnt > 0 {
 				log.Debug().Int64("count", cnt).Msg("Cleaned up DB change logs")
 			}
-		case <-sleepTimeout.Next():
+		case <-sleepTimeout.Channel():
 			log.Info().Msg("No more events to process, initiating shutdown")
 			ctxSt.Cancel()
 			if cfg.Config.Snapshot.Enable && cfg.Config.Publish {

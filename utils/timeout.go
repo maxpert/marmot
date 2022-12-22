@@ -12,7 +12,7 @@ type TimeoutPublisher struct {
 	publisher chan time.Time
 }
 
-func EventBusTimeout(bus EventBus.Bus, eventName string, duration time.Duration) *TimeoutPublisher {
+func AutoResetEventTimer(bus EventBus.Bus, eventName string, duration time.Duration) *TimeoutPublisher {
 	t := NewTimeoutPublisher(duration)
 	err := bus.Subscribe(eventName, func(args ...any) {
 		t.Reset()
@@ -40,13 +40,23 @@ func NewTimeoutPublisher(duration time.Duration) *TimeoutPublisher {
 }
 
 func (t *TimeoutPublisher) Reset() {
-	if t.ticker != nil {
-		t.ticker.Reset(t.duration)
+	if t.ticker == nil {
+		return
 	}
+
+	t.ticker.Reset(t.duration)
 }
 
-func (t *TimeoutPublisher) Next() <-chan time.Time {
-	if t.publisher != nil {
+func (t *TimeoutPublisher) Stop() {
+	if t.ticker == nil {
+		return
+	}
+
+	t.ticker.Stop()
+}
+
+func (t *TimeoutPublisher) Channel() <-chan time.Time {
+	if t.ticker == nil {
 		return t.publisher
 	}
 

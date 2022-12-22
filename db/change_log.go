@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/maxpert/marmot/cfg"
+	"github.com/maxpert/marmot/utils"
 	"regexp"
 	"strings"
 	"text/template"
@@ -212,8 +213,11 @@ func (conn *SqliteStreamDB) watchChanges(watcher *fsnotify.Watcher, path string)
 	errShm := watcher.Add(shmPath)
 	errWal := watcher.Add(walPath)
 
-	changeLogTicker := time.NewTicker(time.Millisecond * 250)
-	updateTime := time.Now()
+	tickerDur := time.Duration(cfg.Config.PollingInterval) * time.Millisecond
+	changeLogTicker := utils.NewTimeoutPublisher(tickerDur)
+
+	// Publish change logs for any residual change logs before starting watcher
+	conn.publishChangeLog()
 
 	for {
 		select {
@@ -225,10 +229,8 @@ func (conn *SqliteStreamDB) watchChanges(watcher *fsnotify.Watcher, path string)
 			if ev.Op != fsnotify.Chmod {
 				conn.publishChangeLog()
 			}
-		case t := <-changeLogTicker.C:
-			if t.After(updateTime) {
-				conn.publishChangeLog()
-			}
+		case <-changeLogTicker.Channel():
+			conn.publishChangeLog()
 		}
 
 		if errDB != nil {
@@ -243,11 +245,14 @@ func (conn *SqliteStreamDB) watchChanges(watcher *fsnotify.Watcher, path string)
 			errWal = watcher.Add(walPath)
 		}
 
-		updateTime = time.Now()
+		changeLogTicker.Reset()
 	}
 }
 
 func (conn *SqliteStreamDB) getGlobalChanges(limit uint32) ([]globalChangeLogEntry, error) {
+	sw := utils.NewStopWatch("scan_changes")
+	defer sw.Log(log.Debug())
+
 	sqlConn, err := conn.pool.Borrow()
 	if err != nil {
 		return nil, err
