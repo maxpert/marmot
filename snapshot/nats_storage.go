@@ -64,7 +64,13 @@ func (n *natsStorage) Download(filePath, name string) error {
 		return err
 	}
 
-	return blb.GetFile(name, filePath)
+	err = blb.GetFile(name, filePath)
+	if err == nats.ErrObjectNotFound {
+		log.Warn().Msg("No snapshot found, system will now continue without restoring snapshot")
+		return nil
+	}
+
+	return err
 }
 
 func newNatsStorage() (*natsStorage, error) {
