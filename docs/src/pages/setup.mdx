@@ -59,8 +59,10 @@ tar -xf goreman.tar.gz
 ## config
 -----------
 
+
 `mm1/config.toml`
 ```toml
+-- marmot instance 1 : for pocketbase instance 1
 -- path to your pocketbase pb_data/data.db or your sqlite db
 db_path="~/code/marmot/pb_10a/pb_data/data.db"
 node_id=1
@@ -97,6 +99,7 @@ format="console"
 
 `mm2/config.toml`
 ```toml
+-- marmot instance 2 : for pocketbase instance 2
 -- path to your pocketbase pb_data/data.db or your sqlite db 
 db_path="~/code/marmot/pb_10b/pb_data/data.db"
 node_id=2
@@ -132,6 +135,7 @@ format="console"
 
 `nats/nats-1.conf`
 ```ts
+// nats instance 1 for marmot instance 1
 listen: 0.0.0.0:4222
 server_name: natt1
 
@@ -165,6 +169,7 @@ jetstream:{
 
 `nats/nats-2.conf`
 ```ts
+// nats instance 2 for marmot instance 2
 listen: 0.0.0.0:4223
 server_name: natt2
 
@@ -196,7 +201,35 @@ jetstream:{
 
 ```
 
-and finaly we'll set up goreman to run all these commands 
+
+## usage
+
+after adding the config files we'll start both pocke base instances
+
+```ts
+pocketbase1: ~/code/marmot/pb_10a/pocketbase serve
+pocketbase2: ~/code/marmot/pb_10b/pocketbase serve --http="127.0.0.1:8091"
+```
+default pocketbase runs on `127.0.0.1:8090` so the second instance is put on `127.0.0.1:8091` to avoid conflicts 
+```ts
+10:38:14 pb1 | > Server started at: http://127.0.0.1:8090
+10:38:14 pb1 |   - REST API: http://127.0.0.1:8090/api/
+10:38:14 pb1 |   - Admin UI: http://127.0.0.1:8090/_/
+```
+```ts
+10:38:50 pb2 | > Server started at: http://127.0.0.1:8091
+10:38:50 pb2 |   - REST API: http://127.0.0.1:8091/api/
+10:38:50 pb2 |   - Admin UI: http://127.0.0.1:8091/_/
+```
+
+now we bring up the NATS servers
+and add data to pocketbase-1 while leaving pocketbase-2 empty but with the same schema 
+then bring up marmot-1 and 2 and also show what happens when 1 or 2  stops  while the other is still running
+
+https://user-images.githubusercontent.com/72096712/209428356-f06b59ca-4215-4b07-8a38-f8c66cc1022e.mp4
+
+
+and finaly we'll set up goreman to run all the commands at once for extra convenience
 > you might need to adjust the file paths to match your setup
 
 `Procfile`
@@ -209,7 +242,7 @@ nats-2: nats-server -c ./nats/nats-2.conf
 
 
 marmot-1: sleep 10 && ./mm1/marmot -config ./mm1/config.toml 
-marmot-2: sleep 10 && ./mm2/marmot -config ./mm2config.toml
+marmot-2: sleep 10 && ./mm2/marmot -config ./mm2/config.toml
 
 ```
 
