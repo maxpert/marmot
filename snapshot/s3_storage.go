@@ -42,8 +42,7 @@ func (s s3Storage) Download(filePath, name string) error {
 	err := s.mc.FGetObject(ctx, cS3.Bucket, bucketPath, filePath, minio.GetObjectOptions{})
 	if mErr, ok := err.(minio.ErrorResponse); ok {
 		if mErr.StatusCode == http.StatusNotFound {
-			log.Warn().Msg("No snapshot found, system will now continue without restoring snapshot")
-			return nil
+			return ErrNoSnapshotFound
 		}
 	}
 

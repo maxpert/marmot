@@ -66,8 +66,7 @@ func (n *natsStorage) Download(filePath, name string) error {
 
 	err = blb.GetFile(name, filePath)
 	if err == nats.ErrObjectNotFound {
-		log.Warn().Msg("No snapshot found, system will now continue without restoring snapshot")
-		return nil
+		return ErrNoSnapshotFound
 	}
 
 	return err
