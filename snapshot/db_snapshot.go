@@ -67,6 +67,11 @@ func (n *NatsDBSnapshot) RestoreSnapshot() error {
 
 	bkFilePath := path.Join(tmpSnapshotPath, snapshotFileName)
 	err = n.storage.Download(bkFilePath, snapshotFileName)
+	if err == ErrNoSnapshotFound {
+		log.Warn().Err(err).Msg("System will now continue without restoring snapshot")
+		return nil
+	}
+
 	if err != nil {
 		return err
 	}

@@ -3,6 +3,7 @@ package snapshot
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"time"
 
 	"github.com/maxpert/marmot/cfg"
@@ -38,7 +39,14 @@ func (s s3Storage) Download(filePath, name string) error {
 	ctx := context.Background()
 	cS3 := cfg.Config.Snapshot.S3
 	bucketPath := fmt.Sprintf("%s/%s", cS3.DirPath, name)
-	return s.mc.FGetObject(ctx, cS3.Bucket, bucketPath, filePath, minio.GetObjectOptions{})
+	err := s.mc.FGetObject(ctx, cS3.Bucket, bucketPath, filePath, minio.GetObjectOptions{})
+	if mErr, ok := err.(minio.ErrorResponse); ok {
+		if mErr.StatusCode == http.StatusNotFound {
+			return ErrNoSnapshotFound
+		}
+	}
+
+	return err
 }
 
 func newS3Storage() (*s3Storage, error) {
