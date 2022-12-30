@@ -38,6 +38,15 @@ Marmot is a CDC (Change Data Capture) pipeline running top of NATS. It can autom
 those streams evenly distribute load over those shards, so scaling simply boils down to adding more nodes, and re-balancing
 those JetStreams (To be automated in future versions).
 
+## What happens when there is a race condition?
+
+In Marmot every row is uniquely mapped to a JetStream. This guarantees that for any node to publish changes for a row it has to go through 
+same JetStream as everyone else. If two nodes perform a change to same row in parallel, both of the nodes will compete to publish their 
+change to JetStream cluster. Due to [RAFT quorum](https://docs.nats.io/running-a-nats-service/configuration/clustering/jetstream_clustering#raft) 
+constraint only one of the writer will be able to get it's changes published first. Now as these changes are applied (even the publisher applies 
+it's own changes to database) the **last writer** will always win. This means there is NO serializability guarantee of a transaction 
+spanning multiple tables. This is a design choice, in order to avoid any sort of global locking, and performance. 
+
 ## Features
 
 ![Eventually Consistent](https://img.shields.io/badge/Eventually%20Consistent-✔️-green)
