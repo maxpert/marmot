@@ -79,9 +79,7 @@ type Configuration struct {
 var ConfigPath = flag.String("config", "marmot.toml", "Path to configuration file")
 var Cleanup = flag.Bool("cleanup", false, "Only cleanup marmot triggers and changelogs")
 var SaveSnapshot = flag.Bool("save-snapshot", false, "Only take snapshot and upload")
-
 var ClusterListenAddr = flag.String("cluster-addr", "", "Cluster listening address")
-
 var ClusterPeers = flag.String("cluster-peers", "", "Comma seperated list of clusters")
 
 var Config = &Configuration{

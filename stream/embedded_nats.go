@@ -1,22 +1,23 @@
 package stream
 
 import (
-	"github.com/maxpert/marmot/cfg"
-	"github.com/nats-io/nats-server/v2/logger"
-	"github.com/nats-io/nats-server/v2/server"
-	"github.com/rs/zerolog/log"
 	"net"
 	"os"
 	"path"
 	"strconv"
 	"sync"
+
+	"github.com/maxpert/marmot/cfg"
+	"github.com/nats-io/nats-server/v2/logger"
+	"github.com/nats-io/nats-server/v2/server"
+	"github.com/rs/zerolog/log"
 )
 
 var embeddedServer *server.Server = nil
 var embeddedLock = &sync.Mutex{}
 
 func parseHostAndPort(adr string) (string, int, error) {
-	host, portStr, err := net.SplitHostPort(*cfg.ClusterListenAddr)
+	host, portStr, err := net.SplitHostPort(adr)
 	if err != nil {
 		return "", 0, err
 	}
