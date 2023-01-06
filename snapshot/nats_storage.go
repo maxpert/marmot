@@ -1,12 +1,11 @@
 package snapshot
 
 import (
-	"os"
-	"strings"
-
 	"github.com/maxpert/marmot/cfg"
+	"github.com/maxpert/marmot/stream"
 	"github.com/nats-io/nats.go"
 	"github.com/rs/zerolog/log"
+	"os"
 )
 
 const hashHeaderKey = "marmot-snapshot-tag"
@@ -72,17 +71,6 @@ func (n *natsStorage) Download(filePath, name string) error {
 	return err
 }
 
-func newNatsStorage() (*natsStorage, error) {
-	c := cfg.Config
-	urls := strings.Join(c.NATS.URLs, ", ")
-	nc, err := nats.Connect(urls, nats.Name(c.NodeName()))
-	if err != nil {
-		return nil, err
-	}
-
-	return &natsStorage{nc: nc}, nil
-}
-
 func getBlobStore(conn *nats.Conn) (nats.ObjectStore, error) {
 	js, err := conn.JetStream()
 	if err != nil {
@@ -100,6 +88,15 @@ func getBlobStore(conn *nats.Conn) (nats.ObjectStore, error) {
 	}
 
 	return blb, err
+}
+
+func newNatsStorage() (*natsStorage, error) {
+	nc, err := stream.Connect()
+	if err != nil {
+		return nil, err
+	}
+
+	return &natsStorage{nc: nc}, nil
 }
 
 func blobBucketName() string {

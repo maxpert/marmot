@@ -3,6 +3,7 @@ package logstream
 import (
 	"context"
 	"fmt"
+	"github.com/maxpert/marmot/stream"
 	"time"
 
 	"github.com/klauspost/compress/zstd"
@@ -28,13 +29,11 @@ type Replicator struct {
 
 func NewReplicator(
 	nodeID uint64,
-	natsServer string,
 	shards uint64,
 	compress bool,
 	snapshot snapshot.NatsSnapshot,
 ) (*Replicator, error) {
-	nc, err := nats.Connect(natsServer, nats.Name(cfg.Config.NodeName()))
-
+	nc, err := stream.Connect()
 	if err != nil {
 		return nil, err
 	}
@@ -48,13 +47,14 @@ func NewReplicator(
 		}
 
 		streamCfg := makeShardConfig(shard, shards, compress)
-		info, err := js.StreamInfo(streamName(shard, compress))
+		info, err := js.StreamInfo(streamName(shard, compress), nats.MaxWait(10*time.Second))
 		if err == nats.ErrStreamNotFound {
 			log.Debug().Uint64("shard", shard).Msg("Creating stream")
 			info, err = js.AddStream(streamCfg)
 		}
 
 		if err != nil {
+			log.Error().Err(err).Str("name", streamName(shard, compress)).Msg("Unable to get stream info...")
 			return nil, err
 		}
 
