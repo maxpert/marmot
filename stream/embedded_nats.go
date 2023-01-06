@@ -2,7 +2,6 @@ package stream
 
 import (
 	"net"
-	"os"
 	"path"
 	"strconv"
 	"sync"
@@ -44,7 +43,7 @@ func startEmbeddedServer(nodeName string) (*server.Server, error) {
 		Port:               -1,
 		NoSigs:             true,
 		JetStream:          true,
-		StoreDir:           path.Join(os.TempDir(), "nats", nodeName),
+		StoreDir:           path.Join(cfg.TmpDir, "nats", nodeName),
 		JetStreamMaxMemory: 1 << 25,
 		JetStreamMaxStore:  1 << 30,
 		Routes:             server.RoutesFromStr(*cfg.ClusterPeers),

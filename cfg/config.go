@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"os"
+	"path"
 
 	"github.com/BurntSushi/toml"
 	"github.com/denisbrodbeck/machineid"
@@ -82,9 +83,11 @@ var SaveSnapshot = flag.Bool("save-snapshot", false, "Only take snapshot and upl
 var ClusterListenAddr = flag.String("cluster-addr", "", "Cluster listening address")
 var ClusterPeers = flag.String("cluster-peers", "", "Comma seperated list of clusters")
 
+var TmpDir = os.TempDir()
+
 var Config = &Configuration{
-	SeqMapPath:      "/tmp/seq-map.cbor",
-	DBPath:          "/tmp/marmot.db",
+	SeqMapPath:      path.Join(TmpDir, "seq-map.cbor"),
+	DBPath:          path.Join(TmpDir, "marmot.db"),
 	NodeID:          1,
 	Publish:         true,
 	Replicate:       true,
