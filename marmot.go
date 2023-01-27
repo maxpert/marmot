@@ -6,7 +6,6 @@ import (
 	"github.com/maxpert/marmot/utils"
 	"io"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/maxpert/marmot/cfg"
@@ -64,7 +63,6 @@ func main() {
 
 	rep, err := logstream.NewReplicator(
 		cfg.Config.NodeID,
-		strings.Join(cfg.Config.NATS.URLs, ", "),
 		cfg.Config.ReplicationLog.Shards,
 		cfg.Config.ReplicationLog.Compress,
 		snapshot.NewNatsDBSnapshot(streamDB, snpStore),

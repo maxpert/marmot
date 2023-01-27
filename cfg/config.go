@@ -5,10 +5,10 @@ import (
 	"fmt"
 	"hash/fnv"
 	"os"
+	"path"
 
 	"github.com/BurntSushi/toml"
 	"github.com/denisbrodbeck/machineid"
-	"github.com/nats-io/nats.go"
 )
 
 type SnapshotStoreType string
@@ -49,9 +49,10 @@ type SnapshotConfiguration struct {
 }
 
 type NATSConfiguration struct {
-	URLs          []string `toml:"urls"`
-	SubjectPrefix string   `toml:"subject_prefix"`
-	StreamPrefix  string   `toml:"stream_prefix"`
+	URLs             []string `toml:"urls"`
+	SubjectPrefix    string   `toml:"subject_prefix"`
+	StreamPrefix     string   `toml:"stream_prefix"`
+	ServerConfigFile string   `toml:"server_config"`
 }
 
 type LoggingConfiguration struct {
@@ -79,10 +80,14 @@ type Configuration struct {
 var ConfigPath = flag.String("config", "marmot.toml", "Path to configuration file")
 var Cleanup = flag.Bool("cleanup", false, "Only cleanup marmot triggers and changelogs")
 var SaveSnapshot = flag.Bool("save-snapshot", false, "Only take snapshot and upload")
+var ClusterListenAddr = flag.String("cluster-addr", "", "Cluster listening address")
+var ClusterPeers = flag.String("cluster-peers", "", "Comma seperated list of clusters")
+
+var TmpDir = os.TempDir()
 
 var Config = &Configuration{
-	SeqMapPath:      "/tmp/seq-map.cbor",
-	DBPath:          "/tmp/marmot.db",
+	SeqMapPath:      path.Join(TmpDir, "seq-map.cbor"),
+	DBPath:          path.Join(TmpDir, "marmot.db"),
 	NodeID:          1,
 	Publish:         true,
 	Replicate:       true,
@@ -108,9 +113,10 @@ var Config = &Configuration{
 	},
 
 	NATS: NATSConfiguration{
-		URLs:          []string{nats.DefaultURL},
-		SubjectPrefix: "marmot-change-log",
-		StreamPrefix:  "marmot-changes",
+		URLs:             []string{},
+		SubjectPrefix:    "marmot-change-log",
+		StreamPrefix:     "marmot-changes",
+		ServerConfigFile: "",
 	},
 
 	Logging: LoggingConfiguration{
