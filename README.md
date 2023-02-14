@@ -47,6 +47,16 @@ constraint only one of the writer will be able to get it's changes published fir
 it's own changes to database) the **last writer** will always win. This means there is NO serializability guarantee of a transaction 
 spanning multiple tables. This is a design choice, in order to avoid any sort of global locking, and performance. 
 
+
+## Limitations
+Right now there are a few limitations on current solution:
+ - You can't watch tables selectively on a DB. This is due to various limitations around snapshot and restore mechanism.
+ - WAL mode required - since your DB is going to be processed by multiple processes the only way to have multi-process 
+   changes reliably is via WAL. 
+ - Marmot is eventually consistent. This simply means rows can get synced out of order, and `SERIALIZABLE` assumptions 
+   on transactions might not hold true anymore.
+   
+
 ## Features
 
 ![Eventually Consistent](https://img.shields.io/badge/Eventually%20Consistent-✔️-green)
@@ -125,14 +135,6 @@ configure marmot:
 
 For more details and internal workings of marmot [go to these docs](https://maxpert.github.io/marmot/).
 
-## Limitations
-Right now there are a few limitations on current solution:
- - You can't watch tables selectively on a DB. This is due to various limitations around snapshot and restore mechanism.
- - WAL mode required - since your DB is going to be processed by multiple processes the only way to have multi-process 
-   changes reliably is via WAL. 
- - Marmot is eventually consistent. This simply means rows can get synced out of order, and `SERIALIZABLE` assumptions 
-   on transactions might not hold true anymore.
-
 ## FAQs & Community 
 
  - For FAQs visit [this page](https://maxpert.github.io/marmot/intro#faq)
@@ -144,4 +146,3 @@ Last but not least we would like to thank our sponsors who have been supporting 
 
 [<img src="https://resources.jetbrains.com/storage/products/company/brand/logos/GoLand_icon.png" alt="GoLand logo." height="64" />
 <img src="https://resources.jetbrains.com/storage/products/company/brand/logos/jb_beam.png" alt="JetBrains Logo (Main) logo." height="64">](https://www.jetbrains.com/?utm_medium=opensource&utm_source=marmot)
-[![DigitalOcean Referral Badge](https://web-platforms.sfo2.cdn.digitaloceanspaces.com/WWW/Badge%201.svg)](https://www.digitalocean.com/?utm_medium=opensource&utm_source=marmot)
