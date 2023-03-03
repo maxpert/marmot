@@ -105,6 +105,12 @@ subject_prefix="marmot-change-log"
 # JetStream name prefix used for publishing log entries, it's usually suffixed by shard number
 # to get the full JetStream name
 stream_prefix="marmot-changes"
+# Seed file used for client nkey authentication
+# nk -gen user > user.seed
+# nk -inkey user.seed -pubout > user.pub
+# Set to user.seed
+# Reference https://docs.nats.io/running-a-nats-service/nats_admin/security/jwt#what-are-nkeys
+seed_file=""
 
 
 # Console STDOUT configurations
