@@ -1,10 +1,11 @@
 package stream
 
 import (
-	"github.com/maxpert/marmot/cfg"
-	"github.com/nats-io/nats.go"
 	"strings"
 	"time"
+
+	"github.com/maxpert/marmot/cfg"
+	"github.com/nats-io/nats.go"
 )
 
 func Connect() (*nats.Conn, error) {
@@ -21,6 +22,15 @@ func Connect() (*nats.Conn, error) {
 		}
 
 		opts = append(opts, nats.InProcessServer(server))
+	}
+
+	if cfg.Config.NATS.SeedFile != "" {
+		opt, err := nats.NkeyOptionFromSeed(cfg.Config.NATS.SeedFile)
+		if err != nil {
+			return nil, err
+		}
+
+		opts = append(opts, opt)
 	}
 
 	nc, err := nats.Connect(serverUrl, opts...)
