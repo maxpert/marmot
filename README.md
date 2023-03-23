@@ -97,17 +97,33 @@ The output will look something like this:
 
 ## Running
 
-Build
+### Build
 ```shell
 go build -o build/marmot ./marmot.go
 ```
-
 Make sure you have 2 SQLite DBs with exact same schemas and just run:
+
+### Run
 
 ```shell
 nats-server --jetstream
 build/marmot -config config-1.toml -verbose
 build/marmot -config config-2.toml -verbose
+```
+
+### Build for Docker
+```
+docker build \
+  --build-arg MACHINE_ID=$(cat /var/lib/dbus/machine-id) # REGISTER machine id (under linux)
+  -t marmot \ # TAG the docker container (builds latest from github)
+  . # build context at root of repo
+```
+
+### Run for docker
+```
+nats-server --jetstream
+docker run -it -v ./config-1.toml:/src/config-1 marmot -config /src/config-1.toml
+docker run -it -v ./config-2.toml:/src/config-2 marmot -config /src/config-2.toml
 ```
 
 Here `config-1.toml` and `config-2.toml` should can be copies of `config.toml` with updated node ID and DB paths.
