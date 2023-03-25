@@ -23,7 +23,7 @@ RUN go build -ldflags \
   "-linkmode external -extldflags -static" \
   -o dist/linux/amd64/marmot && \
   cp dist/linux/amd64/marmot /usr/local/bin && \
-  chmod +x /usr/bin/marmot
+  chmod +x /usr/local/bin/marmot
 
 RUN echo $MACHINE_ID > /etc/machine-id
 
