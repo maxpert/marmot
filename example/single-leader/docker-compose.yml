@@ -1,0 +1,37 @@
+version: '3.7'
+services:
+  marmot-leader:
+    container_name: marmot_leader
+    build:
+      context: services/leader
+      dockerfile: $PWD/../Dockerfile
+    command: "marmot -config /app/nets.config"
+    expose:
+      - 4222
+      - 8222
+    volumes:
+      - $PWD/services/leader:/app
+
+  marmot-follower-1:
+    container_name: marmot_follower_1
+    build:
+      context: services/follower_1
+      dockerfile: $PWD/../Dockerfile
+    command: "marmot"
+    expose:
+      - 4222
+      - 8222
+    volumes:
+      - $PWD/services/follower_1:/app
+
+  marmot-follower-2:
+    container_name: marmot_follower_2
+    build:
+      context: services/follower_2
+      dockerfile: $PWD/../Dockerfile
+    command: "marmot"
+    expose:
+      - 4222
+      - 8222
+    volumes:
+      - $PWD/services/follower_2:/app

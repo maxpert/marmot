@@ -1,0 +1,10 @@
+node_id=2
+db_path="/app/chinook.db"
+
+[nats]
+subject_prefix = "chinook-change-log"
+stream_prefix = "chinook-changes"
+urls = ["nats://marmot-leader:4222"]
+
+[logging]
+verbose=true

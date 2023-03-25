@@ -1,0 +1,19 @@
+node_id=0
+db_path="/app/chinook.db"
+
+[snapshot]
+enabled=false
+
+[replication_log]
+replicas=1
+shards=3
+max_entries=1024
+compress=true
+
+[nats]
+subject_prefix = "chinook-change-log"
+stream_prefix = "chinook-changes"
+server_config="/app/nats.config"
+
+[logging]
+verbose=true
