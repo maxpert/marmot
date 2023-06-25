@@ -32,11 +32,12 @@ type SqliteStreamDB struct {
 }
 
 type ColumnInfo struct {
-	Name         string `db:"name"`
-	Type         string `db:"type"`
-	NotNull      bool   `db:"notnull"`
-	DefaultValue any    `db:"dflt_value"`
-	IsPrimaryKey bool   `db:"pk"`
+	Name            string `db:"name"`
+	Type            string `db:"type"`
+	NotNull         bool   `db:"notnull"`
+	DefaultValue    any    `db:"dflt_value"`
+	PrimaryKeyIndex int    `db:"pk"`
+	IsPrimaryKey    bool
 }
 
 func RestoreFrom(destPath, bkFilePath string) error {
@@ -231,10 +232,12 @@ func getTableInfo(tx *goqu.TxDatabase, table string) ([]*ColumnInfo, error) {
 		}
 
 		c := ColumnInfo{}
-		err = rows.Scan(&c.Name, &c.Type, &c.NotNull, &c.DefaultValue, &c.IsPrimaryKey)
+		err = rows.Scan(&c.Name, &c.Type, &c.NotNull, &c.DefaultValue, &c.PrimaryKeyIndex)
 		if err != nil {
 			return nil, err
 		}
+
+		c.IsPrimaryKey = c.PrimaryKeyIndex > 0
 
 		if c.IsPrimaryKey {
 			hasPrimaryKey = true
