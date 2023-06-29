@@ -6,13 +6,19 @@
 ![GitHub](https://img.shields.io/github/license/maxpert/marmot)
 
 ## What & Why?
+
 Marmot is a distributed SQLite replicator with leaderless, and eventual consistency. It allows you to build a robust replication 
-between your nodes by building on top of fault-tolerant [NATS Jetstream](https://nats.io/). This means if you are running a read 
-heavy website based on SQLite, you should be easily able to scale it out by adding more SQLite replicated nodes. SQLite is 
-probably the most ubiquitous DB that exists almost everywhere, Marmot aims to make it even more ubiquitous for server 
+between your nodes by building on top of fault-tolerant [NATS Jetstream](https://nats.io/). 
+
+So if you are running a read heavy website based on SQLite, you should be easily able to scale it out by adding more SQLite replicated nodes. 
+SQLite is probably the most ubiquitous DB that exists almost everywhere, Marmot aims to make it even more ubiquitous for server 
 side applications by building a replication layer on top.
 
 ## What is the difference from others?
+
+Marmot is essentially a CDC (Change Data Capture) and replication pipeline running top of NATS. It can automatically configure appropriate 
+JetStreams making sure those streams evenly distribute load over those shards, so scaling simply boils down to adding more nodes, and 
+re-balancing those JetStreams (auto rebalancing not implemented yet).
 
 There are a few solutions like [rqlite](https://github.com/rqlite/rqlite), [dqlite](https://dqlite.io/), and 
 [LiteFS](https://github.com/superfly/litefs) etc. All of them either are layers on top of SQLite (e.g. 
@@ -33,10 +39,6 @@ Making these choices has multiple benefits:
 - You can write on any node! You don't have to go to single primary for writing your data.
 - As long as you start with same copy of database, all the mutations will eventually converge
   (hence eventually consistent).
-
-Marmot is a CDC (Change Data Capture) pipeline running top of NATS. It can automatically configure appropriate JetStreams making sure
-those streams evenly distribute load over those shards, so scaling simply boils down to adding more nodes, and re-balancing
-those JetStreams (To be automated in future versions).
 
 ## What happens when there is a race condition?
 

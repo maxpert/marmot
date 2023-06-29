@@ -43,7 +43,6 @@ func startEmbeddedServer(nodeName string) (*server.Server, error) {
 		Port:               -1,
 		NoSigs:             true,
 		JetStream:          true,
-		StoreDir:           path.Join(cfg.TmpDir, "nats", nodeName),
 		JetStreamMaxMemory: 1 << 25,
 		JetStreamMaxStore:  1 << 30,
 		Routes:             server.RoutesFromStr(*cfg.ClusterPeers),
@@ -61,6 +60,10 @@ func startEmbeddedServer(nodeName string) (*server.Server, error) {
 		opts.Cluster.ListenStr = *cfg.ClusterListenAddr
 		opts.Cluster.Host = host
 		opts.Cluster.Port = port
+	}
+
+	if opts.StoreDir == "" {
+		opts.StoreDir = path.Join(cfg.TmpDir, "nats", nodeName)
 	}
 
 	if cfg.Config.NATS.ServerConfigFile != "" {
