@@ -11,9 +11,9 @@ require (
 	github.com/fxamacker/cbor/v2 v2.4.0
 	github.com/klauspost/compress v1.16.5
 	github.com/mattn/go-sqlite3 v1.14.17
-	github.com/minio/minio-go/v7 v7.0.56
-	github.com/nats-io/nats-server/v2 v2.9.17
-	github.com/nats-io/nats.go v1.26.0
+	github.com/minio/minio-go/v7 v7.0.58
+	github.com/nats-io/nats-server/v2 v2.9.19
+	github.com/nats-io/nats.go v1.27.1
 	github.com/rs/zerolog v1.29.1
 	github.com/samber/lo v1.38.1
 )
