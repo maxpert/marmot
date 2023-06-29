@@ -95,10 +95,14 @@ compress=true
 # NATS server configurations
 [nats]
 # List of NATS server to use as boot server. Reference NATS documentation on how to pass
-# authentication credentials as part of URL.
+# authentication credentials as part of URL. Leaving out this list empty will result
+# in embedded NATS server being started with node named `marmot-node-{node_id}`. 
+# NATS configuration can provided via `server_config` variable
 urls=[
     "nats://localhost:4222"
 ]
+    # Embedded server config file
+    server_config=""
 # Subject prefix used when publishing log entries, it's usually suffixed by shard number
 # to get the full subject name
 subject_prefix="marmot-change-log"
