@@ -11,7 +11,7 @@ import (
 func Connect() (*nats.Conn, error) {
 	opts := []nats.Option{
 		nats.Name(cfg.Config.NodeName()),
-		nats.Timeout(60 * time.Second),
+		nats.Timeout(10 * time.Second),
 	}
 
 	serverUrl := strings.Join(cfg.Config.NATS.URLs, ", ")

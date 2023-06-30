@@ -101,8 +101,8 @@ compress=true
 urls=[
     "nats://localhost:4222"
 ]
-    # Embedded server config file
-    server_config=""
+# Embedded server config file
+server_config=""
 # Subject prefix used when publishing log entries, it's usually suffixed by shard number
 # to get the full subject name
 subject_prefix="marmot-change-log"
