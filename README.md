@@ -14,6 +14,30 @@ So if you are running a read heavy website based on SQLite, you should be easily
 SQLite is probably the most ubiquitous DB that exists almost everywhere, Marmot aims to make it even more ubiquitous for server 
 side applications by building a replication layer on top.
 
+## Quick Start
+
+Download [latest](https://github.com/maxpert/marmot/releases/latest) Marmot and extract package using:
+
+```
+tar vxzf marmot-v*.tar.gz
+```
+
+From extracted directory run `examples/run-cluster.sh`. Make a change in `/tmp/marmot-1.db` using:
+
+```
+bash > sqlite3 /tmp/marmot-1.db
+sqlite3 > INSERT INTO Books (title, author, publication_year) VALUES ('Pride and Prejudice', 'Jane Austen', 1813);
+```
+
+Now observe changes getting propagated to other database `/tmp/marmot-2.db`:
+
+```
+bash > sqlite3 /tmp/marmot-2.db
+sqlite3 > SELECT * FROM Books;
+```
+
+You should be able to make changes interchangeably and see the changes getting propagated.
+
 ## What is the difference from others?
 
 Marmot is essentially a CDC (Change Data Capture) and replication pipeline running top of NATS. It can automatically configure appropriate 
@@ -95,15 +119,6 @@ The output will look something like this:
  - `v0.5.x` introduces change log compression with zstd.
  - `v0.4.x` introduces NATS based change log streaming, and continuous multi-directional sync.
  - `v0.3.x` is deprecated, and unstable. DO NOT USE IT IN PRODUCTION.
-
-## Running
-
-Build
-```shell
-go build -o build/marmot ./marmot.go
-```
-
-From the root directory run `examples/run-cluster.sh` 
 
 ## Demos
 Demos for `v0.4.x`:
