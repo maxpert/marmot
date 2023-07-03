@@ -3,8 +3,9 @@ package logstream
 import (
 	"context"
 	"fmt"
-	"github.com/maxpert/marmot/stream"
 	"time"
+
+	"github.com/maxpert/marmot/stream"
 
 	"github.com/klauspost/compress/zstd"
 	"github.com/maxpert/marmot/cfg"

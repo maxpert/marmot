@@ -14,8 +14,15 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-var embeddedServer *server.Server = nil
-var embeddedLock = &sync.Mutex{}
+type embeddedNats struct {
+	server *server.Server
+	lock   *sync.Mutex
+}
+
+var embeddedIns = &embeddedNats{
+	server: nil,
+	lock:   &sync.Mutex{},
+}
 
 func parseHostAndPort(adr string) (string, int, error) {
 	host, portStr, err := net.SplitHostPort(adr)
@@ -31,12 +38,12 @@ func parseHostAndPort(adr string) (string, int, error) {
 	return host, port, nil
 }
 
-func startEmbeddedServer(nodeName string) (*server.Server, error) {
-	embeddedLock.Lock()
-	defer embeddedLock.Unlock()
+func startEmbeddedServer(nodeName string) (*embeddedNats, error) {
+	embeddedIns.lock.Lock()
+	defer embeddedIns.lock.Unlock()
 
-	if embeddedServer != nil {
-		return embeddedServer, nil
+	if embeddedIns.server != nil {
+		return embeddedIns, nil
 	}
 
 	opts := &server.Options{
@@ -90,35 +97,40 @@ func startEmbeddedServer(nodeName string) (*server.Server, error) {
 	)
 	s.Start()
 
-	err = touchStreamReady(nodeName, s)
-	if err != nil {
-		return nil, err
-	}
-
-	embeddedServer = s
-	return s, nil
+	embeddedIns.server = s
+	return embeddedIns, nil
 }
 
-func touchStreamReady(nodeName string, s *server.Server) error {
+func (e *embeddedNats) prepareConnection(opts ...nats.Option) (*nats.Conn, error) {
+	e.lock.Lock()
+	s := e.server
+	e.lock.Unlock()
+
+	for !s.ReadyForConnections(1 * time.Second) {
+		continue
+	}
+
+	opts = append(opts, nats.InProcessServer(s))
 	for {
-		c, err := nats.Connect("", nats.InProcessServer(s))
+		c, err := nats.Connect("", opts...)
 		if err != nil {
-			return err
+			log.Warn().Err(err).Msg("NATS server not accepting connections...")
+			continue
 		}
 
 		j, err := c.JetStream()
 		if err != nil {
-			return err
+			return nil, err
 		}
 
-		st, err := j.StreamInfo(nodeName, nats.MaxWait(1*time.Second))
+		st, err := j.StreamInfo("marmot-r", nats.MaxWait(1*time.Second))
 		if err == nats.ErrStreamNotFound || st != nil {
 			log.Info().Msg("Streaming ready...")
-			return nil
+			return c, nil
 		}
 
 		c.Close()
-		log.Info().Err(err).Msg("Streams not ready, waiting for NATS streams to come up...")
+		log.Debug().Err(err).Msg("Streams not ready, waiting for NATS streams to come up...")
 		time.Sleep(1 * time.Second)
 	}
 }

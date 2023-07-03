@@ -14,14 +14,33 @@ func Connect() (*nats.Conn, error) {
 		nats.Timeout(10 * time.Second),
 	}
 
-	serverUrl := strings.Join(cfg.Config.NATS.URLs, ", ")
-	if serverUrl == "" {
-		server, err := startEmbeddedServer(cfg.Config.NodeName())
+	creds, err := getNatsAuthFromConfig()
+	if err != nil {
+		return nil, err
+	}
+
+	opts = append(opts, creds...)
+	if len(cfg.Config.NATS.URLs) == 0 {
+		embedded, err := startEmbeddedServer(cfg.Config.NodeName())
 		if err != nil {
 			return nil, err
 		}
 
-		opts = append(opts, nats.InProcessServer(server))
+		return embedded.prepareConnection(opts...)
+	}
+
+	return nats.Connect(
+		strings.Join(cfg.Config.NATS.URLs, ", "),
+		opts...,
+	)
+}
+
+func getNatsAuthFromConfig() ([]nats.Option, error) {
+	opts := make([]nats.Option, 0)
+
+	if cfg.Config.NATS.CredsUser != "" {
+		opt := nats.UserInfo(cfg.Config.NATS.CredsUser, cfg.Config.NATS.CredsPassword)
+		opts = append(opts, opt)
 	}
 
 	if cfg.Config.NATS.SeedFile != "" {
@@ -33,10 +52,5 @@ func Connect() (*nats.Conn, error) {
 		opts = append(opts, opt)
 	}
 
-	nc, err := nats.Connect(serverUrl, opts...)
-	if err != nil {
-		return nil, err
-	}
-
-	return nc, nil
+	return opts, nil
 }
