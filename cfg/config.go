@@ -91,7 +91,7 @@ var TmpDir = os.TempDir()
 var Config = &Configuration{
 	SeqMapPath:      path.Join(TmpDir, "seq-map.cbor"),
 	DBPath:          path.Join(TmpDir, "marmot.db"),
-	NodeID:          1,
+	NodeID:          0,
 	Publish:         true,
 	Replicate:       true,
 	ScanMaxChanges:  512,
@@ -120,6 +120,9 @@ var Config = &Configuration{
 		SubjectPrefix:    "marmot-change-log",
 		StreamPrefix:     "marmot-changes",
 		ServerConfigFile: "",
+		SeedFile:         "",
+		CredsPassword:    "",
+		CredsUser:        "",
 	},
 
 	Logging: LoggingConfiguration{

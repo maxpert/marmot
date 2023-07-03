@@ -8,7 +8,7 @@
 ## What & Why?
 
 Marmot is a distributed SQLite replicator with leaderless, and eventual consistency. It allows you to build a robust replication 
-between your nodes by building on top of fault-tolerant [NATS Jetstream](https://nats.io/). 
+between your nodes by building on top of fault-tolerant [NATS JetStream](https://nats.io/). 
 
 So if you are running a read heavy website based on SQLite, you should be easily able to scale it out by adding more SQLite replicated nodes. 
 SQLite is probably the most ubiquitous DB that exists almost everywhere, Marmot aims to make it even more ubiquitous for server 
@@ -45,8 +45,8 @@ Making these choices has multiple benefits:
 In Marmot every row is uniquely mapped to a JetStream. This guarantees that for any node to publish changes for a row it has to go through 
 same JetStream as everyone else. If two nodes perform a change to same row in parallel, both of the nodes will compete to publish their 
 change to JetStream cluster. Due to [RAFT quorum](https://docs.nats.io/running-a-nats-service/configuration/clustering/jetstream_clustering#raft) 
-constraint only one of the writer will be able to get it's changes published first. Now as these changes are applied (even the publisher applies 
-it's own changes to database) the **last writer** will always win. This means there is NO serializability guarantee of a transaction 
+constraint only one of the writer will be able to get its changes published first. Now as these changes are applied (even the publisher applies 
+its own changes to database) the **last writer** will always win. This means there is NO serializability guarantee of a transaction 
 spanning multiple tables. This is a design choice, in order to avoid any sort of global locking, and performance. 
 
 
@@ -67,18 +67,18 @@ Right now there are a few limitations on current solution:
 ![Built on NATS](https://img.shields.io/badge/Built%20on%20NATS-✔️-green)
 
  - Leaderless replication never requiring a single node to handle all write load.
- - NATS/S3 Snapshot support. 
- - Built on top of NATS, abstracting stream distribution and replication.
- - Ability to snapshot and fully recover from those snapshots.
+ - NATS/S3 Snapshot support. Ability to snapshot and fully recover from those snapshots.
+ - Built with NATS, abstracting stream distribution and replication.
  - SQLite based log storage, so all the tooling with SQLite is at your disposal.
  - Support for log entry compression, handling content heavy CMS needs.
  - Sleep timeout support for serverless scenarios.
+ 
 
 ## Dependencies
-Starting 0.4+ Marmot depends on [nats-server](https://nats.io/download/) with JetStream support.
-Instead of building an in process consensus algorithm, this unlocks more use-cases like letting 
-external applications subscribe to these changes and build more complex use-cases around their
-application needs. Here is one example that you can just run locally using Deno:
+Starting 0.8+ Marmot comes with embedded [nats-server](https://nats.io/download/) with JetStream support. This not only reduces 
+the dependencies/processes that one might have to spin up, but also provides with out-of-box tooling like 
+[nat-cli](https://github.com/nats-io/natscli). You can also use existing libraries to build additional
+tooling and scripts due to standard library support. Here is one example using Deno:
 
 ```
 deno run --allow-net https://gist.githubusercontent.com/maxpert/d50a49dfb2f307b30b7cae841c9607e1/raw/6d30803c140b0ba602545c1c0878d3394be548c3/watch-marmot-change-logs.ts -u <nats_username> -p <nats_password> -s <comma_seperated_server_list>
@@ -89,9 +89,8 @@ The output will look something like this:
 
 ## Production status
 
- - `v0.7.x` moves to file based configuration rather than CLI flags, and S3 compatible snapshot storage. Is being used 
-   successfully to run a read heavy site (per node 4,796 reads/sec, 138.3 writes/sec on **single core shared**
-   2.8GHz CPU and 1GB RAM).
+ - `v0.8.x` introduced support for embedded NATS. This is recommended version for production.
+ - `v0.7.x` moves to file based configuration rather than CLI flags, and S3 compatible snapshot storage. 
  - `v0.6.x` introduces snapshot save/restore. It's in pre-production state.
  - `v0.5.x` introduces change log compression with zstd.
  - `v0.4.x` introduces NATS based change log streaming, and continuous multi-directional sync.
@@ -104,15 +103,7 @@ Build
 go build -o build/marmot ./marmot.go
 ```
 
-Make sure you have 2 SQLite DBs with exact same schemas and just run:
-
-```shell
-nats-server --jetstream
-build/marmot -config config-1.toml -verbose
-build/marmot -config config-2.toml -verbose
-```
-
-Here `config-1.toml` and `config-2.toml` should can be copies of `config.toml` with updated node ID and DB paths.
+From the root directory run `examples/run-cluster.sh` 
 
 ## Demos
 Demos for `v0.4.x`:
@@ -134,6 +125,10 @@ configure marmot:
    change logs. (default: `false`)
  - `save-snapshot` - Just snapshot the local database, and upload snapshot to NATS server (default: `false`) 
    `Since 0.6.x`
+ - `cluster-addr` - Sets the binding address for cluster (default: disabled) `Since 0.8.x`, when specifying
+   this flag at-least two nodes will be required (or `replication_log.replicas`)
+ - `cluster-peers` - Comma separated list of `nats://<host>:<port>/` peers of NATS cluster (default: none) 
+   `Since 0.8.x`.
 
 For more details and internal workings of marmot [go to these docs](https://maxpert.github.io/marmot/).
 
