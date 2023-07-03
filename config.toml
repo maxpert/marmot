@@ -99,9 +99,10 @@ compress=true
 # in embedded NATS server being started with node named `marmot-node-{node_id}`. 
 # NATS configuration can provided via `server_config` variable
 urls=[
-    "nats://localhost:4222"
+#    "nats://localhost:4222"
+#    "nats://<user>:<password>@<host>:<port>"
 ]
-# Embedded server config file
+# Embedded server config file (will be only used if URLs array is empty)
 server_config=""
 # Subject prefix used when publishing log entries, it's usually suffixed by shard number
 # to get the full subject name
@@ -115,7 +116,9 @@ stream_prefix="marmot-changes"
 # Set to user.seed
 # Reference https://docs.nats.io/running-a-nats-service/nats_admin/security/jwt#what-are-nkeys
 seed_file=""
-
+# User credentials used for plain user password authentication
+user_name=""
+user_password=""
 
 # Console STDOUT configurations
 [logging]
