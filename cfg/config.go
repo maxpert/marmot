@@ -54,6 +54,8 @@ type NATSConfiguration struct {
 	StreamPrefix     string   `toml:"stream_prefix"`
 	ServerConfigFile string   `toml:"server_config"`
 	SeedFile         string   `toml:"seed_file"`
+	CredsUser        string   `toml:"user_name"`
+	CredsPassword    string   `toml:"user_password"`
 }
 
 type LoggingConfiguration struct {
