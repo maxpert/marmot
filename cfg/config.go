@@ -9,6 +9,8 @@ import (
 
 	"github.com/BurntSushi/toml"
 	"github.com/denisbrodbeck/machineid"
+	"github.com/google/uuid"
+	"github.com/rs/zerolog/log"
 )
 
 type SnapshotStoreType string
@@ -134,7 +136,8 @@ var Config = &Configuration{
 func init() {
 	id, err := machineid.ID()
 	if err != nil {
-		panic(err)
+		log.Warn().Err(err).Msg("⚠️⚠️⚠️ Unable to read machine ID from OS, generating random ID ⚠️⚠️⚠️")
+		id = uuid.NewString()
 	}
 
 	hasher := fnv.New64()
