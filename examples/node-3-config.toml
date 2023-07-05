@@ -1,0 +1,3 @@
+seq_map_path="/tmp/marmot-3-sm.cbor"
+db_path="/tmp/marmot-3.db"
+node_id=3
