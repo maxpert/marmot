@@ -59,17 +59,17 @@ func startEmbeddedServer(nodeName string) (*embeddedNats, error) {
 		},
 	}
 
-	if *cfg.ClusterPeers != "" {
-		opts.Routes = server.RoutesFromStr(*cfg.ClusterPeers)
+	if *cfg.ClusterPeersFlag != "" {
+		opts.Routes = server.RoutesFromStr(*cfg.ClusterPeersFlag)
 	}
 
-	if *cfg.ClusterListenAddr != "" {
-		host, port, err := parseHostAndPort(*cfg.ClusterListenAddr)
+	if *cfg.ClusterAddrFlag != "" {
+		host, port, err := parseHostAndPort(*cfg.ClusterAddrFlag)
 		if err != nil {
 			return nil, err
 		}
 
-		opts.Cluster.ListenStr = *cfg.ClusterListenAddr
+		opts.Cluster.ListenStr = *cfg.ClusterAddrFlag
 		opts.Cluster.Host = host
 		opts.Cluster.Port = port
 	}
@@ -82,7 +82,7 @@ func startEmbeddedServer(nodeName string) (*embeddedNats, error) {
 	}
 
 	if opts.StoreDir == "" {
-		opts.StoreDir = path.Join(cfg.TmpDir, "nats", nodeName)
+		opts.StoreDir = path.Join(cfg.DataRootDir, "nats", nodeName)
 	}
 
 	s, err := server.NewServer(opts)

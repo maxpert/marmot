@@ -6,12 +6,13 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"github.com/maxpert/marmot/cfg"
-	"github.com/maxpert/marmot/utils"
 	"regexp"
 	"strings"
 	"text/template"
 	"time"
+
+	"github.com/maxpert/marmot/cfg"
+	"github.com/maxpert/marmot/utils"
 
 	_ "embed"
 
@@ -316,14 +317,14 @@ func (conn *SqliteStreamDB) publishChangeLog() {
 			log.Error().Err(err).Msg("Unable to consume changes")
 		}
 
-		err = conn.cleanupChangeLog(change)
+		err = conn.markChangePublished(change)
 		if err != nil {
 			log.Error().Err(err).Msg("Unable to cleanup change log")
 		}
 	}
 }
 
-func (conn *SqliteStreamDB) cleanupChangeLog(change globalChangeLogEntry) error {
+func (conn *SqliteStreamDB) markChangePublished(change globalChangeLogEntry) error {
 	sqlConn, err := conn.pool.Borrow()
 	if err != nil {
 		return err

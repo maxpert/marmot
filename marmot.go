@@ -3,10 +3,11 @@ package main
 import (
 	"context"
 	"flag"
-	"github.com/maxpert/marmot/utils"
 	"io"
 	"os"
 	"time"
+
+	"github.com/maxpert/marmot/utils"
 
 	"github.com/maxpert/marmot/cfg"
 	"github.com/maxpert/marmot/db"
@@ -21,7 +22,7 @@ import (
 func main() {
 	flag.Parse()
 
-	err := cfg.Load(*cfg.ConfigPath)
+	err := cfg.Load(*cfg.ConfigPathFlag)
 	if err != nil {
 		panic(err)
 	}
@@ -30,7 +31,11 @@ func main() {
 	if cfg.Config.Logging.Format == "json" {
 		writer = os.Stdout
 	}
-	gLog := zerolog.New(writer).With().Timestamp().Logger()
+	gLog := zerolog.New(writer).
+		With().
+		Timestamp().
+		Uint64("node_id", cfg.Config.NodeID).
+		Logger()
 
 	if cfg.Config.Logging.Verbose {
 		log.Logger = gLog.Level(zerolog.DebugLevel)
@@ -45,7 +50,7 @@ func main() {
 		return
 	}
 
-	if *cfg.Cleanup {
+	if *cfg.CleanupFlag {
 		err = streamDB.RemoveCDC(true)
 		if err != nil {
 			log.Panic().Err(err).Msg("Unable to clean up...")
@@ -71,7 +76,7 @@ func main() {
 		log.Panic().Err(err).Msg("Unable to initialize replicators")
 	}
 
-	if *cfg.SaveSnapshot {
+	if *cfg.SaveSnapshotFlag {
 		rep.SaveSnapshot()
 		return
 	}

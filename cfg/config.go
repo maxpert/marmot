@@ -6,6 +6,7 @@ import (
 	"hash/fnv"
 	"os"
 	"path"
+	"path/filepath"
 
 	"github.com/BurntSushi/toml"
 	"github.com/denisbrodbeck/machineid"
@@ -82,17 +83,16 @@ type Configuration struct {
 	Logging        LoggingConfiguration        `toml:"logging"`
 }
 
-var ConfigPath = flag.String("config", "marmot.toml", "Path to configuration file")
-var Cleanup = flag.Bool("cleanup", false, "Only cleanup marmot triggers and changelogs")
-var SaveSnapshot = flag.Bool("save-snapshot", false, "Only take snapshot and upload")
-var ClusterListenAddr = flag.String("cluster-addr", "", "Cluster listening address")
-var ClusterPeers = flag.String("cluster-peers", "", "Comma separated list of clusters")
+var ConfigPathFlag = flag.String("config", "marmot.toml", "Path to configuration file")
+var CleanupFlag = flag.Bool("cleanup", false, "Only cleanup marmot triggers and changelogs")
+var SaveSnapshotFlag = flag.Bool("save-snapshot", false, "Only take snapshot and upload")
+var ClusterAddrFlag = flag.String("cluster-addr", "", "Cluster listening address")
+var ClusterPeersFlag = flag.String("cluster-peers", "", "Comma separated list of clusters")
 
-var TmpDir = os.TempDir()
-
+var DataRootDir = os.TempDir()
 var Config = &Configuration{
-	SeqMapPath:      path.Join(TmpDir, "seq-map.cbor"),
-	DBPath:          path.Join(TmpDir, "marmot.db"),
+	SeqMapPath:      "",
+	DBPath:          path.Join(DataRootDir, "marmot.db"),
 	NodeID:          0,
 	Publish:         true,
 	Replicate:       true,
@@ -149,13 +149,26 @@ func init() {
 	Config.NodeID = hasher.Sum64()
 }
 
-func Load(path string) error {
-	_, err := toml.DecodeFile(path, Config)
+func Load(filePath string) error {
+	_, err := toml.DecodeFile(filePath, Config)
 	if os.IsNotExist(err) {
 		return nil
 	}
 
-	return err
+	if err != nil {
+		return err
+	}
+
+	DataRootDir, err = filepath.Abs(path.Dir(Config.DBPath))
+	if err != nil {
+		return err
+	}
+
+	if Config.SeqMapPath == "" {
+		Config.SeqMapPath = path.Join(DataRootDir, "seq-map.cbor")
+	}
+
+	return nil
 }
 
 func (c *Configuration) SnapshotStorageType() SnapshotStoreType {
