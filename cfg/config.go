@@ -83,7 +83,7 @@ type Configuration struct {
 	Logging        LoggingConfiguration        `toml:"logging"`
 }
 
-var ConfigPathFlag = flag.String("config", "marmot.toml", "Path to configuration file")
+var ConfigPathFlag = flag.String("config", "", "Path to configuration file")
 var CleanupFlag = flag.Bool("cleanup", false, "Only cleanup marmot triggers and changelogs")
 var SaveSnapshotFlag = flag.Bool("save-snapshot", false, "Only take snapshot and upload")
 var ClusterAddrFlag = flag.String("cluster-addr", "", "Cluster listening address")
@@ -91,7 +91,7 @@ var ClusterPeersFlag = flag.String("cluster-peers", "", "Comma separated list of
 
 var DataRootDir = os.TempDir()
 var Config = &Configuration{
-	SeqMapPath:      "",
+	SeqMapPath:      path.Join(DataRootDir, "seq-map.cbor"),
 	DBPath:          path.Join(DataRootDir, "marmot.db"),
 	NodeID:          0,
 	Publish:         true,

@@ -72,6 +72,10 @@ func startEmbeddedServer(nodeName string) (*embeddedNats, error) {
 		opts.Cluster.ListenStr = *cfg.ClusterAddrFlag
 		opts.Cluster.Host = host
 		opts.Cluster.Port = port
+		opts.LeafNode = server.LeafNodeOpts{
+			Host: host,
+			Port: port + 1,
+		}
 	}
 
 	if cfg.Config.NATS.ServerConfigFile != "" {
