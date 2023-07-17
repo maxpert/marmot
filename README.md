@@ -38,6 +38,14 @@ sqlite3 > SELECT * FROM Books;
 
 You should be able to make changes interchangeably and see the changes getting propagated.
 
+## Out in wild
+
+Here are some official, and community demos showing Marmot out in wild:
+ - [Isso + Marmot on Fly.io](https://marmotisso.maxpert.repl.co/)
+ - [PocketBase + Marmot on Fly.io](https://gist.github.com/maxpert/5eb89da751e263e9b02af32d0d45314b)
+ - [Scaling PocketBase with Marmot 0.4.x](https://www.youtube.com/watch?v=QqZl61bJ9BA)
+ - [Scaling Keystone 6 with Marmot 0.4.x](https://youtu.be/GQ5x8pc9vuI)
+
 ## What is the difference from others?
 
 Marmot is essentially a CDC (Change Data Capture) and replication pipeline running top of NATS. It can automatically configure appropriate 
@@ -81,6 +89,9 @@ Right now there are a few limitations on current solution:
    changes reliably is via WAL. 
  - Marmot is eventually consistent. This simply means rows can get synced out of order, and `SERIALIZABLE` assumptions 
    on transactions might not hold true anymore.
+ - Marmot does not support schema changes propagation, so any tables you create or columns you change won't be reflected.
+   This feature is being [debated](https://github.com/maxpert/marmot/discussions/59) and will be available in future
+   versions of Marmot. 
    
 
 ## Features
@@ -119,15 +130,6 @@ The output will look something like this:
  - `v0.5.x` introduces change log compression with zstd.
  - `v0.4.x` introduces NATS based change log streaming, and continuous multi-directional sync.
  - `v0.3.x` is deprecated, and unstable. DO NOT USE IT IN PRODUCTION.
-
-## Demos
-Demos for `v0.4.x`:
- - [Scaling PocketBase with Marmot](https://www.youtube.com/watch?v=QqZl61bJ9BA)
- - [Scaling Keystone 6 with Marmot](https://youtu.be/GQ5x8pc9vuI)
-
-Demos for `v0.3.x` (Legacy) with PocketBase `v0.7.5`:
- - [Scaling PocketBase with Marmot](https://youtube.com/video/VSa-VJso050)
- - [Scaling PocketBase with Marmot - Follow up](https://www.youtube.com/watch?v=Zapupe_FREc)
 
 ## CLI Documentation
 
