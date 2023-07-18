@@ -41,7 +41,7 @@ You should be able to make changes interchangeably and see the changes getting p
 ## Out in wild
 
 Here are some official, and community demos showing Marmot out in wild:
- - [Isso + Marmot on Fly.io](https://marmotisso.maxpert.repl.co/)
+ - [Isso + Marmot on Fly.io](https://maxpert.github.io/marmot/demo)
  - [PocketBase + Marmot on Fly.io](https://gist.github.com/maxpert/5eb89da751e263e9b02af32d0d45314b)
  - [Scaling PocketBase with Marmot 0.4.x](https://www.youtube.com/watch?v=QqZl61bJ9BA)
  - [Scaling Keystone 6 with Marmot 0.4.x](https://youtu.be/GQ5x8pc9vuI)
