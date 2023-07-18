@@ -21,10 +21,14 @@ export const Hero = () => {
             href="https://github.com/maxpert/marmot/releases/latest"
             target="_blank"
             rel="noopener noreferrer"
-            className="transform rounded-md bg-marmot-blue-600 px-5 py-3 font-medium text-white transition-colors hover:bg-marmot-blue-800"
-          >
+            className="transform rounded-md bg-marmot-blue-600 px-5 py-3 font-medium text-white transition-colors hover:bg-marmot-blue-800">
             Download latest
           </a>
+          <Link href="/demo">
+            <a className="transform rounded-md border bg-marmot-blue-200 border-slate-200 px-5 py-3 font-medium text-slate-900 transition-colors hover:bg-marmot-blue-400 hover:text-white">
+              See it in action
+            </a>
+          </Link>
           <Link href="/intro">
             <a className="transform rounded-md border bg-marmot-blue-200 border-slate-200 px-5 py-3 font-medium text-slate-900 transition-colors hover:bg-marmot-blue-400 hover:text-white">
               Read the docs
