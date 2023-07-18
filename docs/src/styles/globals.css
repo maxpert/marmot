@@ -3,8 +3,8 @@
 @tailwind utilities;
 
 .isso-postbox input, .isso-postbox textarea {
-	background-color: #111;
-	border: #eee;
+	background-color: #111 !important;
+	border: #eee !important;
 }
 
 .isso-postbox input[type=button] {
