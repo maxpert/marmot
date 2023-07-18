@@ -5,6 +5,7 @@
 .isso-postbox input, .isso-postbox textarea {
 	background-color: #111 !important;
 	border: #eee !important;
+	color: #ccc !important;
 }
 
 .isso-postbox input[type=button] {
