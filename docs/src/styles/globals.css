@@ -15,7 +15,7 @@
 @media (prefers-color-scheme: dark) {
   .isso-postbox input, .isso-postbox textarea {
     background-color: var(--color-bg-dark) !important;
-    border: var(--color-border-dark) !important;
+    border: var(--color-border-dark) 1px solid !important;
     color: var(--color-text-dark) !important;
   }
 }
@@ -23,7 +23,7 @@
 @media (prefers-color-scheme: light) {
   .isso-postbox input, .isso-postbox textarea {
     background-color: var(--color-bg-light) !important;
-    border: var(--color-border-light) !important;
+    border: var(--color-border-light) 1px solid !important;
     color: var(--color-text-light) !important;
   }
 }
