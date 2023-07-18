@@ -2,12 +2,32 @@
 @tailwind components;
 @tailwind utilities;
 
-.isso-postbox input, .isso-postbox textarea {
-	background-color: #111 !important;
-	border: #eee !important;
-	color: #ccc !important;
+:root {
+  --color-bg-dark: #111;
+  --color-border-dark: #eee;
+  --color-text-dark: #ccc;
+
+  --color-bg-light: #fff;
+  --color-border-light: #ddd;
+  --color-text-light: #999;
+}
+
+@media (prefers-color-scheme: dark) {
+  .isso-postbox input, .isso-postbox textarea {
+    background-color: var(--color-bg-dark) !important;
+    border: var(--color-border-dark) !important;
+    color: var(--color-text-dark) !important;
+  }
+}
+
+@media (prefers-color-scheme: light) {
+  .isso-postbox input, .isso-postbox textarea {
+    background-color: var(--color-bg-light) !important;
+    border: var(--color-border-light) !important;
+    color: var(--color-text-light) !important;
+  }
 }
 
 .isso-postbox input[type=button] {
-	border-radius: 5px;
+  border-radius: 5px;
 }
