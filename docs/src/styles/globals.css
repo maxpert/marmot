@@ -1,3 +1,12 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+.isso-postbox input, .isso-postbox textarea {
+	background-color: #111;
+	border: #eee;
+}
+
+.isso-postbox input[type=button] {
+	border-radius: 5px;
+}
