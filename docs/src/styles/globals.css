@@ -28,6 +28,6 @@
   }
 }
 
-.isso-postbox input[type=button] {
+.isso-postbox input, .isso-postbox textarea {
   border-radius: 5px;
 }
