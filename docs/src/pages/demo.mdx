@@ -1,0 +1,33 @@
+---
+title: Marmot + Isso Demo
+---
+
+## What & Why?
+
+This is a demo page which shows how one can pair Marmot with Isso and push commenting system closer to the edge.
+These nodes scale up or down based on traffic, and write from everywhere.
+
+
+## What is Marmot?
+
+Marmot is an distributed SQLite replicator that runs as a side-car to you service, and replicates data across cluster using embedded NATS. Marmot relies on [JetStream](https://docs.nats.io/nats-concepts/jetstream) based CDC (Change Data Capture) to replicate changes. JetStream under the hood uses RAFT for consensus and allows for eventually consistent SQLite replicas (multi-primary replication).
+
+## What is Isso?
+
+[Isso](https://isso-comments.de/) is a commenting system like Disqus. Users can edit or delete own comments (within 15 minutes by default). Best part about Isso is that it uses SQLite!
+
+## What is Fly.io?
+
+Fly is a platform for running full stack apps and databases close to your users. Compute jobs at Fly.io are virtualized using Firecracker, the virtualization engine developed at AWS as the engine for Lambda and Fargate.
+
+## Source code
+You can access code for this deployment [here](https://gitlab.com/maxpert/marmot-denokv).
+
+
+## Demo
+
+<section id="isso-thread">
+    <noscript>Javascript needs to be activated to view comments.</noscript>
+</section>
+
+<script data-isso="//marmot-demo.fly.dev/" src="//marmot-demo.fly.dev/js/embed.min.js"></script>

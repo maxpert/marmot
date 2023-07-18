@@ -1,5 +1,6 @@
 {
   "index": "Welcome",
+  "demo":  "Demo",
   "intro": "Overview",
   "internals": "Internals"
 }
