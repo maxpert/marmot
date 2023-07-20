@@ -24,6 +24,7 @@ import (
 
 var ErrNoTableMapping = errors.New("no table mapping found")
 var ErrLogNotReadyToPublish = errors.New("not ready to publish changes")
+var ErrEndOfWatch = errors.New("watching event finished")
 
 //go:embed table_change_log_script.tmpl
 var tableChangeLogScriptTemplate string
@@ -221,17 +222,28 @@ func (conn *SqliteStreamDB) watchChanges(watcher *fsnotify.Watcher, path string)
 	conn.publishChangeLog()
 
 	for {
-		select {
-		case ev, ok := <-watcher.Events:
-			if !ok {
-				return
-			}
+		err := conn.WithReadTx(func(_tx *sql.Tx) error {
+			select {
+			case ev, ok := <-watcher.Events:
+				if !ok {
+					return ErrEndOfWatch
+				}
 
-			if ev.Op != fsnotify.Chmod {
+				if ev.Op != fsnotify.Chmod {
+					conn.publishChangeLog()
+				}
+			case <-changeLogTicker.Channel():
 				conn.publishChangeLog()
 			}
-		case <-changeLogTicker.Channel():
-			conn.publishChangeLog()
+
+			return nil
+		})
+
+		if err != nil {
+			log.Warn().Err(err).Msg("Error watching changes; trying to resubscribe...")
+			errDB = watcher.Add(path)
+			errShm = watcher.Add(shmPath)
+			errWal = watcher.Add(walPath)
 		}
 
 		if errDB != nil {

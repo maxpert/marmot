@@ -1,6 +1,8 @@
 package db
 
 import (
+	"context"
+	"database/sql"
 	"database/sql/driver"
 	"fmt"
 	"io"
@@ -314,6 +316,34 @@ func (conn *SqliteStreamDB) GetRawConnection() *sqlite3.SQLiteConn {
 
 func (conn *SqliteStreamDB) GetPath() string {
 	return conn.dbPath
+}
+
+func (conn *SqliteStreamDB) WithReadTx(cb func(tx *sql.Tx) error) error {
+	var tx *sql.Tx = nil
+	db, _, err := pool.OpenRaw(fmt.Sprintf("%s?_journal_mode=WAL", conn.dbPath))
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer func() {
+		if r := recover(); r != nil {
+			log.Error().Any("recover", r).Msg("Recovered read transaction")
+		}
+
+		if tx != nil {
+			err = tx.Rollback()
+			if err != nil {
+				log.Error().Err(err).Msg("Error performing read transaction")
+			}
+		}
+
+		db.Close()
+		cancel()
+	}()
+
+	tx, err = db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	return cb(tx)
 }
 
 func copyFile(toPath, fromPath string) error {
