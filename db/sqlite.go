@@ -184,16 +184,6 @@ func (conn *SqliteStreamDB) InstallCDC(tables []string) error {
 	return nil
 }
 
-func (conn *SqliteStreamDB) installChangeLogTriggers() error {
-	for tableName := range conn.watchTablesSchema {
-		err := conn.initTriggers(tableName)
-		if err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func (conn *SqliteStreamDB) RemoveCDC(tables bool) error {
 	sqlConn, err := conn.pool.Borrow()
 	if err != nil {
@@ -211,6 +201,20 @@ func (conn *SqliteStreamDB) RemoveCDC(tables bool) error {
 		return removeMarmotTables(sqlConn.DB(), conn.prefix)
 	}
 
+	return nil
+}
+
+func (conn *SqliteStreamDB) installChangeLogTriggers() error {
+	if err := conn.initGlobalChangeLog(); err != nil {
+		return err
+	}
+
+	for tableName := range conn.watchTablesSchema {
+		err := conn.initTriggers(tableName)
+		if err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
