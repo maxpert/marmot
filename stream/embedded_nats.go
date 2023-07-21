@@ -57,6 +57,7 @@ func startEmbeddedServer(nodeName string) (*embeddedNats, error) {
 		Cluster: server.ClusterOpts{
 			Name: "e-marmot",
 		},
+		LeafNode: server.LeafNodeOpts{},
 	}
 
 	if *cfg.ClusterPeersFlag != "" {
@@ -72,10 +73,12 @@ func startEmbeddedServer(nodeName string) (*embeddedNats, error) {
 		opts.Cluster.ListenStr = *cfg.ClusterAddrFlag
 		opts.Cluster.Host = host
 		opts.Cluster.Port = port
-		opts.LeafNode = server.LeafNodeOpts{
-			Host: host,
-			Port: port + 1,
-		}
+		opts.LeafNode.Host = host
+		opts.LeafNode.Port = port + 1
+	}
+
+	if *cfg.LeafServerFlag != "" {
+		opts.LeafNode.Remotes = parseRemoteLeafOpts()
 	}
 
 	if cfg.Config.NATS.ServerConfigFile != "" {
