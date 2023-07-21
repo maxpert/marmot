@@ -12,24 +12,18 @@ import (
 	"github.com/samber/lo"
 )
 
-func routesFromStr(routesStr string) []*url.URL {
-	routes := strings.Split(routesStr, ",")
-	if len(routes) == 0 {
-		return nil
-	}
-	var routeUrls []*url.URL
-
-	for _, r := range routes {
-		r = strings.TrimSpace(r)
-		u, _ := url.Parse(r)
+func discoverAndFlattenRoutes(urls []*url.URL) []*url.URL {
+	ret := make([]*url.URL, 0)
+	for _, u := range urls {
 		if u.Scheme == "dns" {
-			routeUrls = append(routeUrls, discoverPeers(u)...)
+			ret = append(ret, discoverPeers(u)...)
 			continue
 		}
 
-		routeUrls = append(routeUrls, u)
+		ret = append(ret, u)
 	}
-	return routeUrls
+
+	return ret
 }
 
 func discoverPeers(u *url.URL) []*url.URL {
