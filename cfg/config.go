@@ -88,6 +88,7 @@ var CleanupFlag = flag.Bool("cleanup", false, "Only cleanup marmot triggers and 
 var SaveSnapshotFlag = flag.Bool("save-snapshot", false, "Only take snapshot and upload")
 var ClusterAddrFlag = flag.String("cluster-addr", "", "Cluster listening address")
 var ClusterPeersFlag = flag.String("cluster-peers", "", "Comma separated list of clusters")
+var LeafServerFlag = flag.String("leaf-server", "", "Comma separated list of leaf servers")
 
 var DataRootDir = os.TempDir()
 var Config = &Configuration{

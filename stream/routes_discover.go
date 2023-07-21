@@ -8,9 +8,28 @@ import (
 	"strings"
 	"time"
 
+	"github.com/maxpert/marmot/cfg"
+	"github.com/nats-io/nats-server/v2/server"
 	"github.com/rs/zerolog/log"
 	"github.com/samber/lo"
 )
+
+func parseRemoteLeafOpts() []*server.RemoteLeafOpts {
+	leafServers := server.RoutesFromStr(*cfg.LeafServerFlag)
+	if len(leafServers) != 0 {
+		leafServers = discoverAndFlattenRoutes(leafServers)
+	}
+
+	return lo.Map[*url.URL, *server.RemoteLeafOpts](leafServers, func(u *url.URL, _ int) *server.RemoteLeafOpts {
+		hub := u.Query().Get("hub") == "true"
+		r := &server.RemoteLeafOpts{
+			URLs: []*url.URL{u},
+			Hub:  hub,
+		}
+
+		return r
+	})
+}
 
 func discoverAndFlattenRoutes(urls []*url.URL) []*url.URL {
 	ret := make([]*url.URL, 0)
