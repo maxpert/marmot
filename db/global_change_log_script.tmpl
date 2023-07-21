@@ -1,0 +1,7 @@
+{{$GlobalChangeLogTableName := (printf "%s_change_log_global" .Prefix)}}
+
+CREATE TABLE IF NOT EXISTS {{$GlobalChangeLogTableName}} (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    change_table_id INTEGER,
+    table_name      TEXT
+);

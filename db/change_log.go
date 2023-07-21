@@ -28,7 +28,11 @@ var ErrEndOfWatch = errors.New("watching event finished")
 
 //go:embed table_change_log_script.tmpl
 var tableChangeLogScriptTemplate string
+
+//go:embed global_change_log_script.tmpl
+var globalChangeLogScriptTemplate string
 var tableChangeLogTpl *template.Template
+var globalChangeLogTpl *template.Template
 
 var spaceStripper = regexp.MustCompile(`\n\s+`)
 
@@ -41,6 +45,10 @@ const (
 )
 const changeLogName = "change_log"
 const upsertQuery = `INSERT OR REPLACE INTO %s(%s) VALUES (%s)`
+
+type globalChangeLogTemplateData struct {
+	Prefix string
+}
 
 type triggerTemplateData struct {
 	Prefix    string
@@ -64,6 +72,10 @@ type changeLogEntry struct {
 func init() {
 	tableChangeLogTpl = template.Must(
 		template.New("tableChangeLogScriptTemplate").Parse(tableChangeLogScriptTemplate),
+	)
+
+	globalChangeLogTpl = template.Must(
+		template.New("globalChangeLogScriptTemplate").Parse(globalChangeLogScriptTemplate),
 	)
 }
 
@@ -114,6 +126,19 @@ func (conn *SqliteStreamDB) metaTable(tableName string, name string) string {
 
 func (conn *SqliteStreamDB) globalMetaTable() string {
 	return conn.prefix + "_change_log_global"
+}
+
+func (conn *SqliteStreamDB) globalCDCScript() (string, error) {
+	buf := new(bytes.Buffer)
+	err := globalChangeLogTpl.Execute(buf, &globalChangeLogTemplateData{
+		Prefix: conn.prefix,
+	})
+
+	if err != nil {
+		return "", err
+	}
+
+	return spaceStripper.ReplaceAllString(buf.String(), "\n    "), nil
 }
 
 func (conn *SqliteStreamDB) tableCDCScriptFor(tableName string) (string, error) {
@@ -178,6 +203,27 @@ func (conn *SqliteStreamDB) getPrimaryKeyMap(event *ChangeLogEvent) map[string]a
 	}
 
 	return ret
+}
+
+func (conn *SqliteStreamDB) initGlobalChangeLog() error {
+	sqlConn, err := conn.pool.Borrow()
+	if err != nil {
+		return err
+	}
+	defer sqlConn.Return()
+
+	script, err := conn.globalCDCScript()
+	if err != nil {
+		return err
+	}
+
+	log.Info().Msg("Creating global change log table")
+	_, err = sqlConn.DB().Exec(script)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func (conn *SqliteStreamDB) initTriggers(tableName string) error {
