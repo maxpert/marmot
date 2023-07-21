@@ -138,14 +138,27 @@ configure marmot:
 
  - `config` - Path to a TOML configuration file. Check out `config.toml` comments for detailed documentation
    on various configurable options. 
- - `cleanup` - Just cleanup and exit marmot. Useful for scenarios where you are performing a cleanup of hooks and 
-   change logs. (default: `false`)
- - `save-snapshot` - Just snapshot the local database, and upload snapshot to NATS server (default: `false`) 
-   `Since 0.6.x`
- - `cluster-addr` - Sets the binding address for cluster (default: disabled) `Since 0.8.x`, when specifying
-   this flag at-least two nodes will be required (or `replication_log.replicas`)
- - `cluster-peers` - Comma separated list of `nats://<host>:<port>/` peers of NATS cluster (default: none) 
-   `Since 0.8.x`.
+ - `cleanup` (default: `false`) - Just cleanup and exit marmot. Useful for scenarios where you are 
+   performing a cleanup of hooks and change logs. 
+ - `save-snapshot` (default: `false` `Since 0.6.x`) - Just snapshot the local database, and upload snapshot 
+   to NATS/S3 server
+ - `cluster-addr` (default: none `Since 0.8.x`) - Sets the binding address for cluster, when specifying
+   this flag at-least two nodes will be required (or `replication_log.replicas`). It's a simple 
+   `<bind_address>:<port>` pair that can be used to bind cluster listening server. 
+   - Since `v0.8.4` Marmot will automatically expose a leaf server on `<bind_address>:<port + 1>`. This is
+     intended to reduce the number for flags. So if you expose cluster on port `4222` the port `4223` will
+     be automatically a leaf server listener.
+ - `cluster-peers` (default: none `Since 0.8.x`) - Comma separated list of `nats://<host>:<port>/` peers of 
+   NATS cluster. You can also use (Since version `v0.8.4` ) `dns://<dns>:<port>/` to A/AAAA record lookups. 
+   Marmot will automatically resolve the DNS IPs at boot time to expand the routes with value of 
+   `nats://<ip>:<port>/` value, where `<ip>` is replaced with all the DNS entries queried. There
+   are two additional query parameters you can use:
+   - `min` - forcing Marmot to wait for minimum number of entries (e.g. `dns://foo:4222/?min=3` will require
+     3 DNS entries to be present before embedded NATs server is started)
+   - `interval_ms` - delay between DNS queries, which will prevent Marmot from flooding DNS server.
+ - `leaf-server` (default: none `Since v0.8.4` )- Comma separated list of `nats://<host>:<port>/` 
+   or `dns://<dns>:<port>/` just like `cluster-peers` can be used to connect to a cluster 
+   as a leaf node. 
 
 For more details and internal workings of marmot [go to these docs](https://maxpert.github.io/marmot/).
 
