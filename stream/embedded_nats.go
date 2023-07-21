@@ -60,7 +60,7 @@ func startEmbeddedServer(nodeName string) (*embeddedNats, error) {
 	}
 
 	if *cfg.ClusterPeersFlag != "" {
-		opts.Routes = routesFromStr(*cfg.ClusterPeersFlag)
+		opts.Routes = server.RoutesFromStr(*cfg.ClusterPeersFlag)
 	}
 
 	if *cfg.ClusterAddrFlag != "" {
@@ -83,6 +83,10 @@ func startEmbeddedServer(nodeName string) (*embeddedNats, error) {
 		if err != nil {
 			return nil, err
 		}
+	}
+
+	if len(opts.Routes) != 0 {
+		opts.Routes = discoverAndFlattenRoutes(opts.Routes)
 	}
 
 	if opts.StoreDir == "" {
