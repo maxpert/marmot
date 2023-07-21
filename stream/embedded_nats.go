@@ -85,6 +85,10 @@ func startEmbeddedServer(nodeName string) (*embeddedNats, error) {
 		}
 	}
 
+	if len(opts.Routes) != 0 {
+		opts.Routes = discoverAndFlattenRoutes(opts.Routes)
+	}
+
 	if opts.StoreDir == "" {
 		opts.StoreDir = path.Join(cfg.DataRootDir, "nats", nodeName)
 	}
