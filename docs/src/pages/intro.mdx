@@ -79,18 +79,21 @@ Making these choices has multiple benefits:
 
 ### What happens when there is a race condition?
 
-In Marmot every row is uniquely mapped to a JetStream. This guarantees that for any node to publish changes for a row it has to go through 
-same JetStream as everyone else. If two nodes perform a change to same row in parallel, both of the nodes will compete to publish their 
-change to JetStream cluster. Due to [RAFT quorum](https://docs.nats.io/running-a-nats-service/configuration/clustering/jetstream_clustering#raft) 
-constraint only one of the writer will be able to get its changes published first. Now as these changes are applied (even the publisher applies
-its own changes to database) the **last writer** will always win. This means there is NO serializability guarantee of a transaction
-spanning multiple tables. This is a design choice, in order to avoid any sort of global locking, and performance. 
+In Marmot every row is uniquely mapped to a JetStream. This guarantees that for any node to publish changes for a row it
+has to go through same JetStream as everyone else. If two nodes perform a change to same row in parallel, both of the
+nodes will compete to publish their change to JetStream cluster. Due to
+[RAFT quorum](https://docs.nats.io/running-a-nats-service/configuration/clustering/jetstream_clustering#raft)
+constraint only one of the writer will be able to get its changes published first. Now as these changes are applied
+(even the publisher applies its own changes to database) the **last writer** will always win. This means there is
+NO serializability guarantee of a transaction spanning multiple tables. This is a design choice, in order to avoid
+any sort of global locking, and performance.
 
 ### Won't capturing changes with triggers use more disk space?
 
 Yes it will require additional storage to old/new values from triggers. But right now that is the only way
 sqlite can and should allow one to capture changes. However, in a typical setting these captured
-changes will be picked up pretty quickly. Disk space is usually cheapest part of modern cloud.
+changes will be picked up pretty quickly, and cleaned up as soon as they have been pushed to NATS.
+Disk space is usually the cheapest part of modern cloud, so it should not be a huge problem.
 
 ### How do I cleanup my database?
 
