@@ -60,7 +60,7 @@ func startEmbeddedServer(nodeName string) (*embeddedNats, error) {
 	}
 
 	if *cfg.ClusterPeersFlag != "" {
-		opts.Routes = server.RoutesFromStr(*cfg.ClusterPeersFlag)
+		opts.Routes = routesFromStr(*cfg.ClusterPeersFlag)
 	}
 
 	if *cfg.ClusterAddrFlag != "" {
