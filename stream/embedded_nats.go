@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/maxpert/marmot/cfg"
-	"github.com/nats-io/nats-server/v2/logger"
 	"github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
 	"github.com/rs/zerolog/log"
@@ -102,7 +101,7 @@ func startEmbeddedServer(nodeName string) (*embeddedNats, error) {
 	}
 
 	s.SetLogger(
-		logger.NewStdLogger(true, opts.Debug, opts.Trace, true, false),
+		&natsLogger{log.With().Str("from", "nats").Logger()},
 		opts.Debug,
 		opts.Trace,
 	)
