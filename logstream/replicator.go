@@ -48,7 +48,7 @@ func NewReplicator(
 			return nil, err
 		}
 
-		streamCfg := makeShardConfig(shard, shards, compress)
+		streamCfg := makeShardStreamConfig(shard, shards, compress)
 		info, err := js.StreamInfo(streamName(shard, compress), nats.MaxWait(10*time.Second))
 		if err == nats.ErrStreamNotFound {
 			log.Debug().Uint64("shard", shard).Msg("Creating stream")
@@ -56,8 +56,23 @@ func NewReplicator(
 		}
 
 		if err != nil {
-			log.Error().Err(err).Str("name", streamName(shard, compress)).Msg("Unable to get stream info...")
+			log.Error().
+				Err(err).
+				Str("name", streamName(shard, compress)).
+				Msg("Unable to get stream info...")
 			return nil, err
+		}
+
+		if !eqShardStreamConfig(&info.Config, streamCfg) {
+			log.Warn().Msgf("Stream configuration not same for %s, updating...", streamName(shard, compress))
+			info, err = js.UpdateStream(streamCfg)
+			if err != nil {
+				log.Error().
+					Err(err).
+					Str("name", streamName(shard, compress)).
+					Msg("Unable update stream info...")
+				return nil, err
+			}
 		}
 
 		leader := ""
@@ -274,7 +289,7 @@ func (r *Replicator) invokeListener(callback func(payload []byte) error, msg *na
 	return err
 }
 
-func makeShardConfig(shardID uint64, totalShards uint64, compressed bool) *nats.StreamConfig {
+func makeShardStreamConfig(shardID uint64, totalShards uint64, compressed bool) *nats.StreamConfig {
 	streamName := streamName(shardID, compressed)
 	replicas := cfg.Config.ReplicationLog.Replicas
 	if replicas < 1 {
@@ -299,6 +314,23 @@ func makeShardConfig(shardID uint64, totalShards uint64, compressed bool) *nats.
 		DenyDelete:        true,
 		Replicas:          replicas,
 	}
+}
+
+func eqShardStreamConfig(a *nats.StreamConfig, b *nats.StreamConfig) bool {
+	return a.Name == b.Name &&
+		len(a.Subjects) == 1 &&
+		len(b.Subjects) == 1 &&
+		a.Subjects[0] == b.Subjects[0] &&
+		a.Discard == b.Discard &&
+		a.MaxMsgs == b.MaxMsgs &&
+		a.Storage == b.Storage &&
+		a.Retention == b.Retention &&
+		a.AllowDirect == b.AllowDirect &&
+		a.MaxConsumers == b.MaxConsumers &&
+		a.MaxMsgsPerSubject == b.MaxMsgsPerSubject &&
+		a.Duplicates == b.Duplicates &&
+		a.DenyDelete == b.DenyDelete &&
+		a.Replicas == b.Replicas
 }
 
 func streamName(shardID uint64, compressed bool) string {
