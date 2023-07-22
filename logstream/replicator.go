@@ -30,11 +30,13 @@ type Replicator struct {
 }
 
 func NewReplicator(
-	nodeID uint64,
-	shards uint64,
-	compress bool,
 	snapshot snapshot.NatsSnapshot,
 ) (*Replicator, error) {
+	nodeID := cfg.Config.NodeID
+	shards := cfg.Config.ReplicationLog.Shards
+	compress := cfg.Config.ReplicationLog.Compress
+	updateExisting := cfg.Config.ReplicationLog.UpdateExisting
+
 	nc, err := stream.Connect()
 	if err != nil {
 		return nil, err
@@ -63,7 +65,7 @@ func NewReplicator(
 			return nil, err
 		}
 
-		if !eqShardStreamConfig(&info.Config, streamCfg) {
+		if updateExisting && !eqShardStreamConfig(&info.Config, streamCfg) {
 			log.Warn().Msgf("Stream configuration not same for %s, updating...", streamName(shard, compress))
 			info, err = js.UpdateStream(streamCfg)
 			if err != nil {
