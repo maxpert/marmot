@@ -23,6 +23,8 @@ func NewSnapshotStorage() (Storage, error) {
 	c := cfg.Config
 
 	switch c.SnapshotStorageType() {
+	case cfg.WebDAV:
+		return newWebDAVStorage()
 	case cfg.Nats:
 		return newNatsStorage()
 	case cfg.S3:
