@@ -46,6 +46,7 @@ type ObjectStoreConfiguration struct {
 
 type SnapshotConfiguration struct {
 	Enable    bool                     `toml:"enabled"`
+	Interval  uint32                   `toml:"interval"`
 	StoreType SnapshotStoreType        `toml:"store"`
 	Nats      ObjectStoreConfiguration `toml:"nats"`
 	S3        S3Configuration          `toml:"s3"`
@@ -104,6 +105,7 @@ var Config = &Configuration{
 
 	Snapshot: SnapshotConfiguration{
 		Enable:    true,
+		Interval:  0,
 		StoreType: Nats,
 		Nats: ObjectStoreConfiguration{
 			Replicas: 1,

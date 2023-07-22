@@ -1,9 +1,10 @@
 package utils
 
 import (
+	"time"
+
 	"github.com/asaskevich/EventBus"
 	"github.com/rs/zerolog/log"
-	"time"
 )
 
 type TimeoutPublisher struct {
@@ -35,7 +36,6 @@ func NewTimeoutPublisher(duration time.Duration) *TimeoutPublisher {
 	}
 
 	ticker := time.NewTicker(duration)
-	ticker.Stop()
 	return &TimeoutPublisher{duration: duration, ticker: ticker, publisher: nil}
 }
 

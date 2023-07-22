@@ -268,6 +268,8 @@ func (conn *SqliteStreamDB) watchChanges(watcher *fsnotify.Watcher, path string)
 	conn.publishChangeLog()
 
 	for {
+		changeLogTicker.Reset()
+
 		err := conn.WithReadTx(func(_tx *sql.Tx) error {
 			select {
 			case ev, ok := <-watcher.Events:
@@ -303,8 +305,6 @@ func (conn *SqliteStreamDB) watchChanges(watcher *fsnotify.Watcher, path string)
 		if errWal != nil {
 			errWal = watcher.Add(walPath)
 		}
-
-		changeLogTicker.Reset()
 	}
 }
 
