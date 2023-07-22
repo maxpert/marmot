@@ -45,6 +45,10 @@ db_path="/tmp/marmot.db"
 enabled=true
 # Storage for snapshot can be "nats" | "s3" (default "nats")
 store="nats"
+# Interval sets perodic interval in milliseconds after which an automatic snapshot should be saved
+# If there was a snapshot saved within interval range due to other log threshold triggers, then
+# new snapshot won't be saved (since it's within time range), a value of 0 means it's disabled.
+interval=0
 
 # When setting snapshot.store to "nats" [snapshot.nats] will be used to configure snapshotting details
 # NATS connection settings (urls etc.) will be loaded from global [nats] configurations

@@ -21,6 +21,7 @@ type Replicator struct {
 	nodeID             uint64
 	shards             uint64
 	compressionEnabled bool
+	lastSnapshot       time.Time
 
 	client    *nats.Conn
 	repState  *replicationState
@@ -88,6 +89,7 @@ func NewReplicator(
 		client:             nc,
 		nodeID:             nodeID,
 		compressionEnabled: compress,
+		lastSnapshot:       time.Time{},
 
 		shards:    shards,
 		streamMap: streamMap,
@@ -214,6 +216,10 @@ func (r *Replicator) RestoreSnapshot() error {
 	return nil
 }
 
+func (r *Replicator) LastSaveSnapshotTime() time.Time {
+	return r.lastSnapshot
+}
+
 func (r *Replicator) SaveSnapshot() {
 	if r.snapshot == nil {
 		return
@@ -224,7 +230,10 @@ func (r *Replicator) SaveSnapshot() {
 		log.Error().
 			Err(err).
 			Msg("Unable snapshot database")
+		return
 	}
+
+	r.lastSnapshot = time.Now()
 }
 
 func (r *Replicator) invokeListener(callback func(payload []byte) error, msg *nats.Msg) error {
