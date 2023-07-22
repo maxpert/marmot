@@ -89,7 +89,7 @@ func NewReplicator(
 		client:             nc,
 		nodeID:             nodeID,
 		compressionEnabled: compress,
-		lastSnapshot:       time.Now(),
+		lastSnapshot:       time.Time{},
 
 		shards:    shards,
 		streamMap: streamMap,
