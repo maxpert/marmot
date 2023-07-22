@@ -94,6 +94,10 @@ max_entries=1024
 # Enable log compression, uses zstd to compress logs as they are streamd to NATS
 # This is useful for DB storing large blobs that can be compressed.
 compress=true
+# Update existing stream if the configurations of JetStream don't match up with configurations
+# generated due to parameters above. Use this option carefully because changing shards,
+# or max_etries etc. might have undesired side-effects on existing running cluster
+update_existing=false
 
 
 # NATS server configurations
