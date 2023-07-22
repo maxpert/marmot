@@ -1,11 +1,12 @@
 package snapshot
 
 import (
+	"os"
+
 	"github.com/maxpert/marmot/cfg"
 	"github.com/maxpert/marmot/stream"
 	"github.com/nats-io/nats.go"
 	"github.com/rs/zerolog/log"
-	"os"
 )
 
 const hashHeaderKey = "marmot-snapshot-tag"
@@ -49,8 +50,8 @@ func (n *natsStorage) Upload(name, filePath string) error {
 	log.Info().
 		Str("hash", hash).
 		Str("file_name", name).
-		Uint64("size", info.Size).
 		Str("file_path", filePath).
+		Uint64("size", info.Size).
 		Uint32("chunks", info.Chunks).
 		Msg("Snapshot saved to NATS")
 

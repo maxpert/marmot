@@ -18,8 +18,9 @@ type SnapshotStoreType string
 
 const NodeNamePrefix = "marmot-node"
 const (
-	Nats SnapshotStoreType = "nats"
-	S3                     = "s3"
+	Nats   SnapshotStoreType = "nats"
+	S3                       = "s3"
+	WebDAV                   = "webdav"
 )
 
 type ReplicationLogConfiguration struct {
@@ -27,6 +28,13 @@ type ReplicationLogConfiguration struct {
 	MaxEntries int64  `toml:"max_entries"`
 	Replicas   int    `toml:"replicas"`
 	Compress   bool   `toml:"compress"`
+}
+
+type WebDAVConfiguration struct {
+	Url    string `toml:"url"`
+	Login  string `toml:"login"`
+	Secret string `toml:"secret"`
+	Path   string `toml:"path"`
 }
 
 type S3Configuration struct {
@@ -50,6 +58,7 @@ type SnapshotConfiguration struct {
 	StoreType SnapshotStoreType        `toml:"store"`
 	Nats      ObjectStoreConfiguration `toml:"nats"`
 	S3        S3Configuration          `toml:"s3"`
+	WebDAV    WebDAVConfiguration      `toml:"webdav"`
 }
 
 type NATSConfiguration struct {
@@ -110,7 +119,8 @@ var Config = &Configuration{
 		Nats: ObjectStoreConfiguration{
 			Replicas: 1,
 		},
-		S3: S3Configuration{},
+		S3:     S3Configuration{},
+		WebDAV: WebDAVConfiguration{},
 	},
 
 	ReplicationLog: ReplicationLogConfiguration{
