@@ -46,8 +46,8 @@ enabled=true
 # Storage for snapshot can be "nats" | "s3" (default "nats")
 store="nats"
 # Interval sets perodic interval in milliseconds after which an automatic snapshot should be saved
-# If there has been a snapshot within interval range due to other log threshold, then that
-# snapshot will be respected, a value of 0 means it's disabled
+# If there was a snapshot saved within interval range due to other log threshold triggers, then
+# new snapshot won't be saved (since it's within time range), a value of 0 means it's disabled.
 interval=0
 
 # When setting snapshot.store to "nats" [snapshot.nats] will be used to configure snapshotting details
