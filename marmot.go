@@ -66,7 +66,7 @@ func main() {
 		log.Panic().Err(err).Msg("Unable to initialize snapshot storage")
 	}
 
-	rep, err := logstream.NewReplicator(
+	replicator, err := logstream.NewReplicator(
 		cfg.Config.NodeID,
 		cfg.Config.ReplicationLog.Shards,
 		cfg.Config.ReplicationLog.Compress,
@@ -77,12 +77,12 @@ func main() {
 	}
 
 	if *cfg.SaveSnapshotFlag {
-		rep.SaveSnapshot()
+		replicator.SaveSnapshot()
 		return
 	}
 
 	if cfg.Config.Snapshot.Enable && cfg.Config.Replicate {
-		err = rep.RestoreSnapshot()
+		err = replicator.RestoreSnapshot()
 		if err != nil {
 			log.Panic().Err(err).Msg("Unable to restore snapshot")
 		}
@@ -98,7 +98,7 @@ func main() {
 	eventBus := EventBus.New()
 	ctxSt := utils.NewStateContext()
 
-	streamDB.OnChange = onTableChanged(rep, ctxSt, eventBus, cfg.Config.NodeID)
+	streamDB.OnChange = onTableChanged(replicator, ctxSt, eventBus, cfg.Config.NodeID)
 	log.Info().Msg("Starting change data capture pipeline...")
 	if err := streamDB.InstallCDC(tableNames); err != nil {
 		log.Error().Err(err).Msg("Unable to install change data capture pipeline")
@@ -107,7 +107,7 @@ func main() {
 
 	errChan := make(chan error)
 	for i := uint64(0); i < cfg.Config.ReplicationLog.Shards; i++ {
-		go changeListener(streamDB, rep, ctxSt, eventBus, i+1, errChan)
+		go changeListener(streamDB, replicator, ctxSt, eventBus, i+1, errChan)
 	}
 
 	sleepTimeout := utils.AutoResetEventTimer(
@@ -118,6 +118,10 @@ func main() {
 	cleanupInterval := time.Duration(cfg.Config.CleanupInterval) * time.Millisecond
 	cleanupTicker := time.NewTicker(cleanupInterval)
 	defer cleanupTicker.Stop()
+
+	snapshotInterval := time.Duration(cfg.Config.Snapshot.Interval) * time.Millisecond
+	snapshotTicker := utils.NewTimeoutPublisher(snapshotInterval)
+	defer snapshotTicker.Stop()
 
 	for {
 		select {
@@ -132,11 +136,24 @@ func main() {
 			} else if cnt > 0 {
 				log.Debug().Int64("count", cnt).Msg("Cleaned up DB change logs")
 			}
+		case <-snapshotTicker.Channel():
+			if cfg.Config.Snapshot.Enable && cfg.Config.Publish {
+				lastSnapshotTime := replicator.LastSaveSnapshotTime()
+				now := time.Now()
+				if now.Sub(lastSnapshotTime) >= snapshotInterval {
+					log.Info().
+						Time("last_snapshot", lastSnapshotTime).
+						Dur("duration", now.Sub(lastSnapshotTime)).
+						Msg("Saving timer based snapshot")
+					replicator.SaveSnapshot()
+				}
+			}
 		case <-sleepTimeout.Channel():
 			log.Info().Msg("No more events to process, initiating shutdown")
 			ctxSt.Cancel()
 			if cfg.Config.Snapshot.Enable && cfg.Config.Publish {
-				rep.SaveSnapshot()
+				log.Info().Msg("Saving snapshot before going to sleep")
+				replicator.SaveSnapshot()
 			}
 
 			os.Exit(0)
