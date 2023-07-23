@@ -3,9 +3,10 @@ package snapshot
 import (
 	"fmt"
 	"io"
-	"math/rand"
+	"io/fs"
 	"os"
 	"path"
+	"time"
 
 	"github.com/maxpert/marmot/cfg"
 	"github.com/rs/zerolog/log"
@@ -24,14 +25,19 @@ func (w *webDAVStorage) Upload(name, filePath string) error {
 	}
 	defer rfl.Close()
 
-	randomPath := path.Join(w.path, fmt.Sprintf("%d-pending.db", rand.Uint32()))
-	err = w.client.WriteStream(randomPath, rfl, 0644)
+	err = w.makeStoragePath()
 	if err != nil {
 		return err
 	}
 
-	completedPath := path.Join(w.path, name)
-	err = w.client.Rename(randomPath, completedPath, true)
+	nodePath := fmt.Sprintf("%s-%d-temp-%s", cfg.Config.NodeName(), time.Now().UnixMilli(), name)
+	err = w.client.WriteStream(nodePath, rfl, 0644)
+	if err != nil {
+		return err
+	}
+
+	completedPath := path.Join("/", w.path, name)
+	err = w.client.Rename(nodePath, completedPath, true)
 	if err != nil {
 		return err
 	}
@@ -48,6 +54,11 @@ func (w *webDAVStorage) Download(filePath, name string) error {
 	completedPath := path.Join(w.path, name)
 	rst, err := w.client.ReadStream(completedPath)
 	if err != nil {
+		if fsErr, ok := err.(*fs.PathError); ok {
+			if wdErr, ok := fsErr.Err.(gowebdav.StatusError); ok && wdErr.Status == 404 {
+				return ErrNoSnapshotFound
+			}
+		}
 		return err
 	}
 	defer rst.Close()
@@ -70,15 +81,32 @@ func (w *webDAVStorage) Download(filePath, name string) error {
 	return nil
 }
 
-func newWebDAVStorage() (*webDAVStorage, error) {
-	webDAVCfg := cfg.Config.Snapshot.WebDAV
-	cl := gowebdav.NewAuthClient(webDAVCfg.Url, gowebdav.NewAutoAuth(webDAVCfg.Login, webDAVCfg.Secret))
-	if webDAVCfg.Path != "" {
-		err := cl.MkdirAll(webDAVCfg.Path, 0644)
-		if err != nil {
-			return nil, err
+func (w *webDAVStorage) makeStoragePath() error {
+	err := w.client.MkdirAll(w.path, 0740)
+	if err == nil {
+		return nil
+	}
+
+	if fsError, ok := err.(*os.PathError); ok {
+		if wdErr, ok := fsError.Err.(gowebdav.StatusError); ok {
+			if wdErr.Status == 409 { // Conflict means directory already exists!
+				return nil
+			}
 		}
 	}
 
-	return &webDAVStorage{client: cl, path: webDAVCfg.Path}, nil
+	return err
+}
+
+func newWebDAVStorage() (*webDAVStorage, error) {
+	webDAVCfg := cfg.Config.Snapshot.WebDAV
+	cl := gowebdav.NewAuthClient(webDAVCfg.Url, gowebdav.NewAutoAuth(webDAVCfg.Login, webDAVCfg.Secret))
+	ret := &webDAVStorage{client: cl, path: webDAVCfg.Path}
+
+	err := cl.Connect()
+	if err != nil {
+		return nil, err
+	}
+
+	return ret, nil
 }
