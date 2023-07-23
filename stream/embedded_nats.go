@@ -51,7 +51,7 @@ func startEmbeddedServer(nodeName string) (*embeddedNats, error) {
 		Port:               -1,
 		NoSigs:             true,
 		JetStream:          true,
-		JetStreamMaxMemory: 1 << 25,
+		JetStreamMaxMemory: 1 << 20,
 		JetStreamMaxStore:  1 << 30,
 		Cluster: server.ClusterOpts{
 			Name: "e-marmot",
