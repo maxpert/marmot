@@ -17,6 +17,7 @@ require (
 	github.com/nats-io/nats.go v1.28.0
 	github.com/rs/zerolog v1.29.1
 	github.com/samber/lo v1.38.1
+	github.com/studio-b12/gowebdav v0.9.0
 )
 
 require (

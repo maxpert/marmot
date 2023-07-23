@@ -43,7 +43,7 @@ db_path="/tmp/marmot.db"
 [snapshot]
 # Disabling snapshot disables both restore and save
 enabled=true
-# Storage for snapshot can be "nats" | "s3" (default "nats")
+# Storage for snapshot can be "nats" | "webdav" | "s3" (default "nats")
 store="nats"
 # Interval sets perodic interval in milliseconds after which an automatic snapshot should be saved
 # If there was a snapshot saved within interval range due to other log threshold triggers, then
@@ -60,12 +60,12 @@ replicas=1
 
 # When setting snapshot.store to "s3" [snapshot.s3] will be used to configure snapshotting details
 [snapshot.s3]
-# Directory path within bucket where snapshot is saved and restore from
-path="snapshots/marmot"
-
 # For S3 this will be `s3.region-code.amazonaws.com` (check your AWS Console for details).
 # For Minio this will point to the host where Minio lives
 endpoint="127.0.0.1:9000"
+
+# Directory path within bucket where snapshot is saved and restore from
+path="snapshots/marmot"
 
 # By default false but should be set to true depending upong Minio configuration, for S3 it should be
 # always true. This essentially lets you select between https and http for your hosting.
@@ -79,6 +79,11 @@ use_ssl=false
 
 # Bucket name where snapshots live
 bucket="marmot"
+
+[snapshot.webdav]
+# URL of the WebDAV server root
+url="https://<webdav_server>/<web_dav_path>?dir=/snapshots/path/for/marmot&login=<username>&secret=<password>"
+
 
 # Change log that is published and persisted in JetStreams by Marmot.
 # Marmot auto-configures missing JetStreams when booting up for you.

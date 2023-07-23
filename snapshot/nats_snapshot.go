@@ -8,6 +8,7 @@ import (
 
 var ErrInvalidStorageType = errors.New("invalid snapshot storage type")
 var ErrNoSnapshotFound = errors.New("no snapshot found")
+var ErrRequiredParameterMissing = errors.New("required parameter missing")
 
 type NatsSnapshot interface {
 	SaveSnapshot() error
@@ -23,6 +24,8 @@ func NewSnapshotStorage() (Storage, error) {
 	c := cfg.Config
 
 	switch c.SnapshotStorageType() {
+	case cfg.WebDAV:
+		return newWebDAVStorage()
 	case cfg.Nats:
 		return newNatsStorage()
 	case cfg.S3:
