@@ -79,9 +79,12 @@ func (n *natsStorage) Download(filePath, name string) error {
 			log.Warn().
 				Err(err).
 				Int("Status", jsmErr.APIError().Code).
-				Msg("Error downloading snapshot, retrying...")
-			time.Sleep(time.Second)
-			continue
+				Msg("Error downloading snapshot")
+
+			if jsmErr.APIError().Code == 503 {
+				time.Sleep(time.Second)
+				continue
+			}
 		}
 
 		return err
