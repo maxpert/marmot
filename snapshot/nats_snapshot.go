@@ -8,6 +8,7 @@ import (
 
 var ErrInvalidStorageType = errors.New("invalid snapshot storage type")
 var ErrNoSnapshotFound = errors.New("no snapshot found")
+var ErrRequiredParameterMissing = errors.New("required parameter missing")
 
 type NatsSnapshot interface {
 	SaveSnapshot() error
