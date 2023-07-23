@@ -31,10 +31,7 @@ type ReplicationLogConfiguration struct {
 }
 
 type WebDAVConfiguration struct {
-	Url    string `toml:"url"`
-	Login  string `toml:"login"`
-	Secret string `toml:"secret"`
-	Path   string `toml:"path"`
+	Url string `toml:"url"`
 }
 
 type S3Configuration struct {

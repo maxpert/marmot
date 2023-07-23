@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net/url"
 	"os"
 	"path"
 	"time"
@@ -12,6 +13,10 @@ import (
 	"github.com/rs/zerolog/log"
 	"github.com/studio-b12/gowebdav"
 )
+
+const queryParamTargetDir = "dir"
+const queryParamLogin = "login"
+const queryParamSecret = "secret"
 
 type webDAVStorage struct {
 	client *gowebdav.Client
@@ -100,10 +105,34 @@ func (w *webDAVStorage) makeStoragePath() error {
 
 func newWebDAVStorage() (*webDAVStorage, error) {
 	webDAVCfg := cfg.Config.Snapshot.WebDAV
-	cl := gowebdav.NewAuthClient(webDAVCfg.Url, gowebdav.NewAutoAuth(webDAVCfg.Login, webDAVCfg.Secret))
-	ret := &webDAVStorage{client: cl, path: webDAVCfg.Path}
+	u, err := url.Parse(webDAVCfg.Url)
+	if err != nil {
+		return nil, err
+	}
 
-	err := cl.Connect()
+	qp := u.Query()
+	targetDir := qp.Get(queryParamTargetDir)
+	if targetDir == "" {
+		targetDir = "/"
+	}
+
+	login := qp.Get(queryParamLogin)
+	secret := qp.Get(queryParamSecret)
+	if login == "" || secret == "" {
+		return nil, ErrRequiredParameterMissing
+	}
+
+	// Remove webdav parameters from query params
+	qp.Del(queryParamTargetDir)
+	qp.Del(queryParamLogin)
+	qp.Del(queryParamSecret)
+
+	// Set query params without parameters
+	u.RawQuery = qp.Encode()
+	cl := gowebdav.NewAuthClient(u.String(), gowebdav.NewAutoAuth(login, secret))
+	ret := &webDAVStorage{client: cl, path: targetDir}
+
+	err = cl.Connect()
 	if err != nil {
 		return nil, err
 	}
