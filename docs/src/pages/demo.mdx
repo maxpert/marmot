@@ -2,16 +2,10 @@
 title: Marmot + Isso Demo
 ---
 
-## What & Why?
-
-This is a demo page which shows how one can pair Marmot with Isso and push commenting system closer to the edge.
-These nodes scale up or down based on traffic, and write from everywhere.
-
-
 ## What is Marmot?
 
-Marmot is a distributed SQLite replicator that runs as a side-car to you service, and replicates data across
-cluster using embedded NATS. Marmot relies on [JetStream](https://docs.nats.io/nats-concepts/jetstream)
+[Marmot](https://github.com/maxpert/marmot) is a distributed SQLite replicator that runs as a side-car to you service, and replicates 
+data across cluster using embedded NATS. Marmot relies on [JetStream](https://docs.nats.io/nats-concepts/jetstream)
 based CDC (Change Data Capture) to replicate changes. JetStream under the hood uses RAFT for consensus
 and allows for eventually consistent SQLite replicas (multi-primary replication).
 
@@ -26,9 +20,16 @@ Fly is a platform for running full stack apps and databases close to your users.
 virtualized using Firecracker, the virtualization engine developed at AWS as the
 engine for Lambda and Fargate.
 
-## Source code
-You can access code for this deployment [here](https://gitlab.com/maxpert/marmot-denokv).
+## Why should I care?
 
+This demo effectively shows how Isso can be scaled out and pushed closer to the edge. Many out of box SQLite tools can be scaled 
+similarly. Your fly.io nodes scale up or down based on traffic, and write from everywhere. This allows horizontal scalability
+of your Isso close to the user. With NATS embedded into Marmot, a sharded RAFT is used to capture changes, and replay them 
+across the fly nodes. So if you are running a single node SQLite site you can now add redundancy to that with Marmot.
+
+## How do I configure one for myself?
+
+You can access code and follow the instructions [here](https://gitlab.com/maxpert/marmot-denokv).
 
 ## Demo
 
