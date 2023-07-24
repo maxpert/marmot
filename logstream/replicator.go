@@ -17,6 +17,8 @@ import (
 const maxReplicateRetries = 7
 const SnapshotShardID = uint64(1)
 
+var SnapshotLeaseTTL = 10 * time.Second
+
 type Replicator struct {
 	nodeID             uint64
 	shards             uint64
@@ -25,6 +27,7 @@ type Replicator struct {
 
 	client    *nats.Conn
 	repState  *replicationState
+	metaStore *replicatorMetaStore
 	snapshot  snapshot.NatsSnapshot
 	streamMap map[uint64]nats.JetStreamContext
 }
@@ -85,6 +88,11 @@ func NewReplicator(
 		return nil, err
 	}
 
+	metaStore, err := newReplicatorMetaStore(cfg.EmbeddedClusterName, nc)
+	if err != nil {
+		return nil, err
+	}
+
 	return &Replicator{
 		client:             nc,
 		nodeID:             nodeID,
@@ -95,6 +103,7 @@ func NewReplicator(
 		streamMap: streamMap,
 		snapshot:  snapshot,
 		repState:  repState,
+		metaStore: metaStore,
 	}, nil
 }
 
@@ -221,6 +230,24 @@ func (r *Replicator) LastSaveSnapshotTime() time.Time {
 }
 
 func (r *Replicator) SaveSnapshot() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	locked, err := r.metaStore.ContextRefreshingLease("snapshot", SnapshotLeaseTTL, ctx)
+	if err != nil {
+		log.Warn().Err(err).Msg("Error acquiring snapshot lock")
+		return
+	}
+
+	if !locked {
+		log.Info().Msg("Snapshot saving already locked, skipping")
+		return
+	}
+
+	r.ForceSaveSnapshot()
+}
+
+func (r *Replicator) ForceSaveSnapshot() {
 	if r.snapshot == nil {
 		return
 	}
