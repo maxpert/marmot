@@ -60,14 +60,14 @@ cases they require a single primary node where all the writes have to go, and th
 changes are applied to multiple readonly replicas. 
 
 Marmot on the other hand is born different. It's born to act as a side-car to your existing processes:
- - Instead of requiring single primary, there is no primary! Which means any node can make changes to its local DB.
-   Marmot will use triggers to capture your changes (hence atomic records), and then stream them off to NATS. 
- - Instead of being strongly consistent, it's eventually consistent. Which means no locking, or blocking of nodes.
- - It does not require any changes to your application logic for reading/writing. 
+ - Instead of requiring single primary, there is **no primary**! Which means **any node can make changes to its local DB**.
+   Marmot will use triggers to capture your changes, and then stream them off to NATS. 
+ - Instead of being strongly consistent, Marmot is **eventually consistent**. Which means no locking, or blocking of nodes.
+ - It does not require any changes to your existing SQLite application logic for reading/writing. 
 
 Making these choices has multiple benefits:
 
-- You can read and write to your SQLite database like you normally do. No extension, or VFS changes.
+- You can read, and write to your SQLite database like you normally do. No extension, or VFS changes.
 - You can write on any node! You don't have to go to single primary for writing your data.
 - As long as you start with same copy of database, all the mutations will eventually converge
   (hence eventually consistent).
@@ -84,15 +84,15 @@ spanning multiple tables. This is a design choice, in order to avoid any sort of
 
 ## Limitations
 Right now there are a few limitations on current solution:
- - You can't watch tables selectively on a DB. This is due to various limitations around snapshot and restore mechanism.
- - WAL mode required - since your DB is going to be processed by multiple processes the only way to have multi-process 
-   changes reliably is via WAL. 
- - Marmot is eventually consistent. This simply means rows can get synced out of order, and `SERIALIZABLE` assumptions 
-   on transactions might not hold true anymore.
  - Marmot does not support schema changes propagation, so any tables you create or columns you change won't be reflected.
    This feature is being [debated](https://github.com/maxpert/marmot/discussions/59) and will be available in future
    versions of Marmot. 
-   
+ - You can't watch tables selectively on a DB. This is due to various limitations around snapshot and restore mechanism.
+ - WAL mode required - since your DB is going to be processed by multiple processes the only way to have multi-process 
+   changes reliably is via WAL. 
+ - Marmot is eventually consistent - This simply means rows can get synced out of order, and `SERIALIZABLE` assumptions 
+   on transactions might not hold true anymore. However your application can choose to redirect writes to single node
+   so that your changes are always replayed in order.  
 
 ## Features
 
@@ -102,9 +102,8 @@ Right now there are a few limitations on current solution:
 ![Built on NATS](https://img.shields.io/badge/Built%20on%20NATS-✔️-green)
 
  - Leaderless replication never requiring a single node to handle all write load.
- - NATS/S3 Snapshot support. Ability to snapshot and fully recover from those snapshots.
+ - NATS/S3/WebDAV snapshot support. Ability to snapshot and fully recover from those snapshots.
  - Built with NATS, abstracting stream distribution and replication.
- - SQLite based log storage, so all the tooling with SQLite is at your disposal.
  - Support for log entry compression, handling content heavy CMS needs.
  - Sleep timeout support for serverless scenarios.
  
