@@ -25,10 +25,11 @@ const (
 )
 
 type ReplicationLogConfiguration struct {
-	Shards     uint64 `toml:"shards"`
-	MaxEntries int64  `toml:"max_entries"`
-	Replicas   int    `toml:"replicas"`
-	Compress   bool   `toml:"compress"`
+	Shards         uint64 `toml:"shards"`
+	MaxEntries     int64  `toml:"max_entries"`
+	Replicas       int    `toml:"replicas"`
+	Compress       bool   `toml:"compress"`
+	UpdateExisting bool   `toml:"update_existing"`
 }
 
 type WebDAVConfiguration struct {
@@ -122,10 +123,11 @@ var Config = &Configuration{
 	},
 
 	ReplicationLog: ReplicationLogConfiguration{
-		Shards:     1,
-		MaxEntries: 1024,
-		Replicas:   1,
-		Compress:   true,
+		Shards:         1,
+		MaxEntries:     1024,
+		Replicas:       1,
+		Compress:       true,
+		UpdateExisting: false,
 	},
 
 	NATS: NATSConfiguration{
