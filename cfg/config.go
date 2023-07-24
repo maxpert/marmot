@@ -17,6 +17,7 @@ import (
 type SnapshotStoreType string
 
 const NodeNamePrefix = "marmot-node"
+const EmbeddedClusterName = "e-marmot"
 const (
 	Nats   SnapshotStoreType = "nats"
 	S3                       = "s3"
