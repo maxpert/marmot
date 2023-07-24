@@ -77,7 +77,7 @@ func main() {
 	}
 
 	if *cfg.SaveSnapshotFlag {
-		replicator.SaveSnapshot()
+		replicator.ForceSaveSnapshot()
 		return
 	}
 
@@ -144,7 +144,7 @@ func main() {
 					log.Info().
 						Time("last_snapshot", lastSnapshotTime).
 						Dur("duration", now.Sub(lastSnapshotTime)).
-						Msg("Saving timer based snapshot")
+						Msg("Triggering timer based snapshot save")
 					replicator.SaveSnapshot()
 				}
 			}
@@ -153,7 +153,7 @@ func main() {
 			ctxSt.Cancel()
 			if cfg.Config.Snapshot.Enable && cfg.Config.Publish {
 				log.Info().Msg("Saving snapshot before going to sleep")
-				replicator.SaveSnapshot()
+				replicator.ForceSaveSnapshot()
 			}
 
 			os.Exit(0)
