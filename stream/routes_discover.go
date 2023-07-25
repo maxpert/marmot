@@ -9,33 +9,73 @@ import (
 	"time"
 
 	"github.com/maxpert/marmot/cfg"
+	"github.com/maxpert/marmot/utils"
 	"github.com/nats-io/nats-server/v2/server"
+	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"github.com/samber/lo"
 )
 
+type UrlsArray []*url.URL
+
+func (u UrlsArray) MarshalZerologArray(a *zerolog.Array) {
+	for _, x := range u {
+		a.Str(x.String())
+	}
+}
+
+func watchAndRefreshRoutes(srv *server.Server, orgOpts *server.Options, routes []*url.URL) {
+	copyOpts := &server.Options{}
+	err := utils.DeepCopy(copyOpts, orgOpts)
+	if err != nil {
+		log.Error().Err(err).Msg("Unable to create deep copy of server options")
+		return
+	}
+
+	for {
+		newRoutes := flattenRoutes(routes, false)
+		if len(newRoutes) == len(copyOpts.Routes) {
+			time.Sleep(5 * time.Second)
+			continue
+		}
+
+		log.Info().
+			Array("new_routes", UrlsArray(newRoutes)).
+			Msg("Found new DNS routes, reloading NATS server")
+
+		copyOpts.Routes = newRoutes
+		err = srv.ReloadOptions(copyOpts)
+		if err != nil {
+			log.Error().Err(err).Msg("Unable to reload options for NATS")
+			time.Sleep(1 * time.Second)
+		}
+	}
+}
+
 func parseRemoteLeafOpts() []*server.RemoteLeafOpts {
 	leafServers := server.RoutesFromStr(*cfg.LeafServerFlag)
 	if len(leafServers) != 0 {
-		leafServers = discoverAndFlattenRoutes(leafServers)
+		leafServers = flattenRoutes(leafServers, true)
 	}
 
-	return lo.Map[*url.URL, *server.RemoteLeafOpts](leafServers, func(u *url.URL, _ int) *server.RemoteLeafOpts {
-		hub := u.Query().Get("hub") == "true"
-		r := &server.RemoteLeafOpts{
-			URLs: []*url.URL{u},
-			Hub:  hub,
-		}
+	return lo.Map[*url.URL, *server.RemoteLeafOpts](
+		leafServers,
+		func(u *url.URL, _ int) *server.RemoteLeafOpts {
+			hub := u.Query().Get("hub") == "true"
+			r := &server.RemoteLeafOpts{
+				URLs: []*url.URL{u},
+				Hub:  hub,
+			}
 
-		return r
-	})
+			return r
+		})
 }
 
-func discoverAndFlattenRoutes(urls []*url.URL) []*url.URL {
+func flattenRoutes(urls []*url.URL, waitDNSEntries bool) []*url.URL {
 	ret := make([]*url.URL, 0)
 	for _, u := range urls {
 		if u.Scheme == "dns" {
-			ret = append(ret, discoverPeers(u)...)
+			ret = append(ret, queryDNSRoutes(u, waitDNSEntries)...)
 			continue
 		}
 
@@ -45,7 +85,7 @@ func discoverAndFlattenRoutes(urls []*url.URL) []*url.URL {
 	return ret
 }
 
-func discoverPeers(u *url.URL) []*url.URL {
+func queryDNSRoutes(u *url.URL, waitDNSEntries bool) []*url.URL {
 	minPeerStr := u.Query().Get("min")
 	intervalStr := u.Query().Get("interval_ms")
 
@@ -63,10 +103,15 @@ func discoverPeers(u *url.URL) []*url.URL {
 		Str("url", u.String()).
 		Int("min_peers", minPeers).
 		Int("interval", interval).
+		Bool("wait_dns_entries", waitDNSEntries).
 		Msg("Starting DNS A/AAAA peer discovery")
 
+	if waitDNSEntries {
+		minPeers = 0
+	}
+
 	for {
-		peers, err := getARecordPeers(u)
+		peers, err := getDirectNATSAddresses(u)
 		if err != nil {
 			log.Error().
 				Err(err).
@@ -90,7 +135,7 @@ func discoverPeers(u *url.URL) []*url.URL {
 	}
 }
 
-func getARecordPeers(u *url.URL) ([]*url.URL, error) {
+func getDirectNATSAddresses(u *url.URL) ([]*url.URL, error) {
 	v4, v6, err := queryDNS(u.Hostname())
 	if err != nil {
 		return nil, err
