@@ -68,6 +68,8 @@ type NATSConfiguration struct {
 	SeedFile         string   `toml:"seed_file"`
 	CredsUser        string   `toml:"user_name"`
 	CredsPassword    string   `toml:"user_password"`
+	BindAddress      string   `toml:"bind_address"`
+	DNSPollInterval  int64    `toml:"dns_poll_interval"`
 }
 
 type LoggingConfiguration struct {
@@ -98,7 +100,6 @@ var SaveSnapshotFlag = flag.Bool("save-snapshot", false, "Only take snapshot and
 var ClusterAddrFlag = flag.String("cluster-addr", "", "Cluster listening address")
 var ClusterPeersFlag = flag.String("cluster-peers", "", "Comma separated list of clusters")
 var LeafServerFlag = flag.String("leaf-servers", "", "Comma separated list of leaf servers")
-var BindNATSAddr = flag.String("nats-bind", "127.0.0.1:4222", "Bind address for embedded NATS")
 
 var DataRootDir = os.TempDir()
 var Config = &Configuration{
@@ -139,6 +140,8 @@ var Config = &Configuration{
 		SeedFile:         "",
 		CredsPassword:    "",
 		CredsUser:        "",
+		BindAddress:      "0.0.0.0:4222",
+		DNSPollInterval:  5_000,
 	},
 
 	Logging: LoggingConfiguration{
