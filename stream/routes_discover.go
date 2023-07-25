@@ -11,20 +11,11 @@ import (
 	"github.com/maxpert/marmot/cfg"
 	"github.com/maxpert/marmot/utils"
 	"github.com/nats-io/nats-server/v2/server"
-	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"github.com/samber/lo"
 )
 
-type UrlsArray []*url.URL
-
-func (u UrlsArray) MarshalZerologArray(a *zerolog.Array) {
-	for _, x := range u {
-		a.Str(x.String())
-	}
-}
-
-func watchAndRefreshRoutes(srv *server.Server, orgOpts *server.Options, routes []*url.URL) {
+func pollAndReloadRoutes(srv *server.Server, orgOpts *server.Options, routes []*url.URL, interval time.Duration) {
 	copyOpts := &server.Options{}
 	err := utils.DeepCopy(copyOpts, orgOpts)
 	if err != nil {
@@ -33,9 +24,9 @@ func watchAndRefreshRoutes(srv *server.Server, orgOpts *server.Options, routes [
 	}
 
 	for {
+		time.Sleep(interval)
 		newRoutes := flattenRoutes(routes, false)
 		if utils.DeepEqualArray(newRoutes, copyOpts.Routes) {
-			time.Sleep(5 * time.Second)
 			continue
 		}
 

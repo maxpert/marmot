@@ -2,7 +2,6 @@ package stream
 
 import (
 	"net"
-	"net/url"
 	"path"
 	"strconv"
 	"sync"
@@ -46,20 +45,15 @@ func startEmbeddedServer(nodeName string) (*embeddedNats, error) {
 		return embeddedIns, nil
 	}
 
-	addr, err := url.Parse(*cfg.BindNATSAddr)
-	if err != nil {
-		return nil, err
-	}
-
-	bindPort, err := strconv.Atoi(addr.Port())
+	host, port, err := parseHostAndPort(cfg.Config.NATS.BindAddress)
 	if err != nil {
 		return nil, err
 	}
 
 	opts := &server.Options{
 		ServerName:         nodeName,
-		Host:               addr.Hostname(),
-		Port:               bindPort,
+		Host:               host,
+		Port:               port,
 		NoSigs:             true,
 		JetStream:          true,
 		JetStreamMaxMemory: -1,
@@ -119,8 +113,9 @@ func startEmbeddedServer(nodeName string) (*embeddedNats, error) {
 	)
 	s.Start()
 
-	if len(opts.Routes) != len(originalRoutes) {
-		go watchAndRefreshRoutes(s, opts, originalRoutes)
+	if cfg.Config.NATS.DNSPollInterval > 0 && len(opts.Routes) != len(originalRoutes) {
+		pollInterval := time.Duration(cfg.Config.NATS.DNSPollInterval) * time.Millisecond
+		go pollAndReloadRoutes(s, opts, originalRoutes, pollInterval)
 	}
 
 	embeddedIns.server = s
