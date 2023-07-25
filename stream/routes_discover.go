@@ -34,7 +34,7 @@ func watchAndRefreshRoutes(srv *server.Server, orgOpts *server.Options, routes [
 
 	for {
 		newRoutes := flattenRoutes(routes, false)
-		if len(newRoutes) == len(copyOpts.Routes) {
+		if utils.DeepEqualArray(newRoutes, copyOpts.Routes) {
 			time.Sleep(5 * time.Second)
 			continue
 		}
