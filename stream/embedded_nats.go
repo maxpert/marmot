@@ -2,6 +2,7 @@ package stream
 
 import (
 	"net"
+	"net/url"
 	"path"
 	"strconv"
 	"sync"
@@ -45,10 +46,20 @@ func startEmbeddedServer(nodeName string) (*embeddedNats, error) {
 		return embeddedIns, nil
 	}
 
+	addr, err := url.Parse(*cfg.BindNATSAddr)
+	if err != nil {
+		return nil, err
+	}
+
+	bindPort, err := strconv.Atoi(addr.Port())
+	if err != nil {
+		return nil, err
+	}
+
 	opts := &server.Options{
 		ServerName:         nodeName,
-		Host:               "127.0.0.1",
-		Port:               -1,
+		Host:               addr.Hostname(),
+		Port:               bindPort,
 		NoSigs:             true,
 		JetStream:          true,
 		JetStreamMaxMemory: -1,
@@ -87,8 +98,9 @@ func startEmbeddedServer(nodeName string) (*embeddedNats, error) {
 		}
 	}
 
+	originalRoutes := opts.Routes
 	if len(opts.Routes) != 0 {
-		opts.Routes = discoverAndFlattenRoutes(opts.Routes)
+		opts.Routes = flattenRoutes(originalRoutes, true)
 	}
 
 	if opts.StoreDir == "" {
@@ -106,6 +118,10 @@ func startEmbeddedServer(nodeName string) (*embeddedNats, error) {
 		opts.Trace,
 	)
 	s.Start()
+
+	if len(opts.Routes) != len(originalRoutes) {
+		go watchAndRefreshRoutes(s, opts, originalRoutes)
+	}
 
 	embeddedIns.server = s
 	return embeddedIns, nil

@@ -97,7 +97,8 @@ var CleanupFlag = flag.Bool("cleanup", false, "Only cleanup marmot triggers and 
 var SaveSnapshotFlag = flag.Bool("save-snapshot", false, "Only take snapshot and upload")
 var ClusterAddrFlag = flag.String("cluster-addr", "", "Cluster listening address")
 var ClusterPeersFlag = flag.String("cluster-peers", "", "Comma separated list of clusters")
-var LeafServerFlag = flag.String("leaf-server", "", "Comma separated list of leaf servers")
+var LeafServerFlag = flag.String("leaf-servers", "", "Comma separated list of leaf servers")
+var BindNATSAddr = flag.String("nats-bind", "127.0.0.1:4222", "Bind address for embedded NATS")
 
 var DataRootDir = os.TempDir()
 var Config = &Configuration{
