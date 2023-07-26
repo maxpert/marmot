@@ -17,25 +17,27 @@ import (
 func parseRemoteLeafOpts() []*server.RemoteLeafOpts {
 	leafServers := server.RoutesFromStr(*cfg.LeafServerFlag)
 	if len(leafServers) != 0 {
-		leafServers = discoverAndFlattenRoutes(leafServers)
+		leafServers = flattenRoutes(leafServers, true)
 	}
 
-	return lo.Map[*url.URL, *server.RemoteLeafOpts](leafServers, func(u *url.URL, _ int) *server.RemoteLeafOpts {
-		hub := u.Query().Get("hub") == "true"
-		r := &server.RemoteLeafOpts{
-			URLs: []*url.URL{u},
-			Hub:  hub,
-		}
+	return lo.Map[*url.URL, *server.RemoteLeafOpts](
+		leafServers,
+		func(u *url.URL, _ int) *server.RemoteLeafOpts {
+			hub := u.Query().Get("hub") == "true"
+			r := &server.RemoteLeafOpts{
+				URLs: []*url.URL{u},
+				Hub:  hub,
+			}
 
-		return r
-	})
+			return r
+		})
 }
 
-func discoverAndFlattenRoutes(urls []*url.URL) []*url.URL {
+func flattenRoutes(urls []*url.URL, waitDNSEntries bool) []*url.URL {
 	ret := make([]*url.URL, 0)
 	for _, u := range urls {
 		if u.Scheme == "dns" {
-			ret = append(ret, discoverPeers(u)...)
+			ret = append(ret, queryDNSRoutes(u, waitDNSEntries)...)
 			continue
 		}
 
@@ -45,7 +47,7 @@ func discoverAndFlattenRoutes(urls []*url.URL) []*url.URL {
 	return ret
 }
 
-func discoverPeers(u *url.URL) []*url.URL {
+func queryDNSRoutes(u *url.URL, waitDNSEntries bool) []*url.URL {
 	minPeerStr := u.Query().Get("min")
 	intervalStr := u.Query().Get("interval_ms")
 
@@ -63,10 +65,15 @@ func discoverPeers(u *url.URL) []*url.URL {
 		Str("url", u.String()).
 		Int("min_peers", minPeers).
 		Int("interval", interval).
+		Bool("wait_dns_entries", waitDNSEntries).
 		Msg("Starting DNS A/AAAA peer discovery")
 
+	if waitDNSEntries {
+		minPeers = 0
+	}
+
 	for {
-		peers, err := getARecordPeers(u)
+		peers, err := getDirectNATSAddresses(u)
 		if err != nil {
 			log.Error().
 				Err(err).
@@ -90,7 +97,7 @@ func discoverPeers(u *url.URL) []*url.URL {
 	}
 }
 
-func getARecordPeers(u *url.URL) ([]*url.URL, error) {
+func getDirectNATSAddresses(u *url.URL) ([]*url.URL, error) {
 	v4, v6, err := queryDNS(u.Hostname())
 	if err != nil {
 		return nil, err

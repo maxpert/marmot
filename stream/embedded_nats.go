@@ -45,10 +45,15 @@ func startEmbeddedServer(nodeName string) (*embeddedNats, error) {
 		return embeddedIns, nil
 	}
 
+	host, port, err := parseHostAndPort(cfg.Config.NATS.BindAddress)
+	if err != nil {
+		return nil, err
+	}
+
 	opts := &server.Options{
 		ServerName:         nodeName,
-		Host:               "127.0.0.1",
-		Port:               -1,
+		Host:               host,
+		Port:               port,
 		NoSigs:             true,
 		JetStream:          true,
 		JetStreamMaxMemory: -1,
@@ -87,8 +92,9 @@ func startEmbeddedServer(nodeName string) (*embeddedNats, error) {
 		}
 	}
 
+	originalRoutes := opts.Routes
 	if len(opts.Routes) != 0 {
-		opts.Routes = discoverAndFlattenRoutes(opts.Routes)
+		opts.Routes = flattenRoutes(originalRoutes, true)
 	}
 
 	if opts.StoreDir == "" {
