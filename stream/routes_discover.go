@@ -9,39 +9,10 @@ import (
 	"time"
 
 	"github.com/maxpert/marmot/cfg"
-	"github.com/maxpert/marmot/utils"
 	"github.com/nats-io/nats-server/v2/server"
 	"github.com/rs/zerolog/log"
 	"github.com/samber/lo"
 )
-
-func pollAndReloadRoutes(srv *server.Server, orgOpts *server.Options, routes []*url.URL, interval time.Duration) {
-	copyOpts := &server.Options{}
-	err := utils.DeepCopy(copyOpts, orgOpts)
-	if err != nil {
-		log.Error().Err(err).Msg("Unable to create deep copy of server options")
-		return
-	}
-
-	for {
-		time.Sleep(interval)
-		newRoutes := flattenRoutes(routes, false)
-		if utils.DeepEqualArray(newRoutes, copyOpts.Routes) {
-			continue
-		}
-
-		log.Info().
-			Array("new_routes", UrlsArray(newRoutes)).
-			Msg("Found new DNS routes, reloading NATS server")
-
-		copyOpts.Routes = newRoutes
-		err = srv.ReloadOptions(copyOpts)
-		if err != nil {
-			log.Error().Err(err).Msg("Unable to reload options for NATS")
-			time.Sleep(1 * time.Second)
-		}
-	}
-}
 
 func parseRemoteLeafOpts() []*server.RemoteLeafOpts {
 	leafServers := server.RoutesFromStr(*cfg.LeafServerFlag)
