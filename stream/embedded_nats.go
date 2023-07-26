@@ -113,11 +113,6 @@ func startEmbeddedServer(nodeName string) (*embeddedNats, error) {
 	)
 	s.Start()
 
-	if cfg.Config.NATS.DNSPollInterval > 0 && len(opts.Routes) != len(originalRoutes) {
-		pollInterval := time.Duration(cfg.Config.NATS.DNSPollInterval) * time.Millisecond
-		go pollAndReloadRoutes(s, opts, originalRoutes, pollInterval)
-	}
-
 	embeddedIns.server = s
 	return embeddedIns, nil
 }
