@@ -115,6 +115,8 @@ urls=[
 #    "nats://localhost:4222"
 #    "nats://<user>:<password>@<host>:<port>"
 ]
+# Embedded server bind address
+bind_address="0.0.0.0:4222"
 # Embedded server config file (will be only used if URLs array is empty)
 server_config=""
 # Subject prefix used when publishing log entries, it's usually suffixed by shard number
