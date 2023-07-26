@@ -22,6 +22,7 @@ const (
 	Nats   SnapshotStoreType = "nats"
 	S3                       = "s3"
 	WebDAV                   = "webdav"
+	SFTP                     = "sftp"
 )
 
 type ReplicationLogConfiguration struct {
@@ -33,6 +34,10 @@ type ReplicationLogConfiguration struct {
 }
 
 type WebDAVConfiguration struct {
+	Url string `toml:"url"`
+}
+
+type SFTPConfiguration struct {
 	Url string `toml:"url"`
 }
 
@@ -58,6 +63,7 @@ type SnapshotConfiguration struct {
 	Nats      ObjectStoreConfiguration `toml:"nats"`
 	S3        S3Configuration          `toml:"s3"`
 	WebDAV    WebDAVConfiguration      `toml:"webdav"`
+	SFTP      SFTPConfiguration        `toml:"sftp"`
 }
 
 type NATSConfiguration struct {
@@ -121,6 +127,7 @@ var Config = &Configuration{
 		},
 		S3:     S3Configuration{},
 		WebDAV: WebDAVConfiguration{},
+		SFTP:   SFTPConfiguration{},
 	},
 
 	ReplicationLog: ReplicationLogConfiguration{

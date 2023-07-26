@@ -101,7 +101,7 @@ func (m *replicatorMetaStore) ContextRefreshingLease(
 				return
 			} else if !locked {
 				log.Warn().Str("name", name).Msg("Unable to acquire lease")
-				return
+				continue
 			}
 
 			refresh.Reset(duration / 2)
