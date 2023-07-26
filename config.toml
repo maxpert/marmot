@@ -117,10 +117,6 @@ urls=[
 ]
 # Embedded server bind address
 bind_address="0.0.0.0:4222"
-# DNS polling interval for all the cluster peers starting with `dns:`. The interval is specified
-# in milliseconds to keep it consistent with rest of timers, but one should not use anything less
-# than few seconds. A value of 0 means it's disabled. By default the value is 5000ms.
-dns_poll_interval=5000
 # Embedded server config file (will be only used if URLs array is empty)
 server_config=""
 # Subject prefix used when publishing log entries, it's usually suffixed by shard number
