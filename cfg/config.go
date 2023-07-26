@@ -69,7 +69,6 @@ type NATSConfiguration struct {
 	CredsUser        string   `toml:"user_name"`
 	CredsPassword    string   `toml:"user_password"`
 	BindAddress      string   `toml:"bind_address"`
-	DNSPollInterval  int64    `toml:"dns_poll_interval"`
 }
 
 type LoggingConfiguration struct {
@@ -141,7 +140,6 @@ var Config = &Configuration{
 		CredsPassword:    "",
 		CredsUser:        "",
 		BindAddress:      "0.0.0.0:4222",
-		DNSPollInterval:  5_000,
 	},
 
 	Logging: LoggingConfiguration{
