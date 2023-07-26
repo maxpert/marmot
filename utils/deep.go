@@ -2,16 +2,17 @@ package utils
 
 import (
 	"bytes"
-	"encoding/gob"
 	"reflect"
+
+	"github.com/fxamacker/cbor/v2"
 )
 
 func DeepCopy(dst, src any) error {
 	var buf bytes.Buffer
-	if err := gob.NewEncoder(&buf).Encode(src); err != nil {
+	if err := cbor.NewEncoder(&buf).Encode(src); err != nil {
 		return err
 	}
-	return gob.NewDecoder(&buf).Decode(dst)
+	return cbor.NewDecoder(&buf).Decode(dst)
 }
 
 func DeepEqualArray[T any](a, b []T) bool {
