@@ -280,6 +280,24 @@ func (r *Replicator) ForceSaveSnapshot() {
 	r.lastSnapshot = time.Now()
 }
 
+func (r *Replicator) ReloadCertificates() error {
+	if cfg.Config.NATS.CAFile != "" {
+		err := nats.RootCAs(cfg.Config.NATS.CAFile)(&r.client.Opts)
+		if err != nil {
+			return err
+		}
+	}
+
+	if cfg.Config.NATS.CertFile != "" && cfg.Config.NATS.KeyFile != "" {
+		err := nats.ClientCert(cfg.Config.NATS.CertFile, cfg.Config.NATS.KeyFile)(&r.client.Opts)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 func (r *Replicator) invokeListener(callback func(payload []byte) error, msg *nats.Msg) error {
 	var err error
 	payload := msg.Data
