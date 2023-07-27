@@ -97,6 +97,10 @@ func newSFTPStorage() (*sftpStorage, error) {
 				Msg("Host connected for SFTP storage")
 			return nil
 		},
+		BannerCallback: func(message string) error {
+			log.Info().Str("message", message).Msgf("Server message...")
+			return nil
+		},
 	}
 
 	// Connect to the SSH server
