@@ -110,7 +110,7 @@ Right now there are a few limitations on current solution:
      - ![AWS S3](https://img.shields.io/badge/AWS%20S3-%E2%9C%94%EF%B8%8F-green)
      - ![Minio](https://img.shields.io/badge/Minio-%E2%9C%94%EF%B8%8F-green)
      - ![Blackblaze](https://img.shields.io/badge/Blackblaze-%E2%9C%94%EF%B8%8F-green)
-     - 
+     - ![SeaweedFS](https://img.shields.io/badge/SeaweedFS-%E2%9C%94%EF%B8%8F-green)
 
  - Built with NATS, abstracting stream distribution and replication.
  - Support for log entry compression, handling content heavy CMS needs.
