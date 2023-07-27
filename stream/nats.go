@@ -19,7 +19,13 @@ func Connect() (*nats.Conn, error) {
 		return nil, err
 	}
 
+	tls, err := getNatsTLSFromConfig()
+	if err != nil {
+		return nil, err
+	}
+
 	opts = append(opts, creds...)
+	opts = append(opts, tls...)
 	if len(cfg.Config.NATS.URLs) == 0 {
 		embedded, err := startEmbeddedServer(cfg.Config.NodeName())
 		if err != nil {
@@ -49,6 +55,22 @@ func getNatsAuthFromConfig() ([]nats.Option, error) {
 			return nil, err
 		}
 
+		opts = append(opts, opt)
+	}
+
+	return opts, nil
+}
+
+func getNatsTLSFromConfig() ([]nats.Option, error) {
+	opts := make([]nats.Option, 0)
+
+	if cfg.Config.NATS.CAFile != "" {
+		opt := nats.RootCAs(cfg.Config.NATS.CAFile)
+		opts = append(opts, opt)
+	}
+
+	if cfg.Config.NATS.CertFile != "" && cfg.Config.NATS.KeyFile != "" {
+		opt := nats.ClientCert(cfg.Config.NATS.CertFile, cfg.Config.NATS.KeyFile)
 		opts = append(opts, opt)
 	}
 
