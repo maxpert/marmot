@@ -15,6 +15,7 @@ require (
 	github.com/minio/minio-go/v7 v7.0.61
 	github.com/nats-io/nats-server/v2 v2.9.20
 	github.com/nats-io/nats.go v1.28.0
+	github.com/pkg/sftp v1.13.5
 	github.com/rs/zerolog v1.29.1
 	github.com/samber/lo v1.38.1
 	github.com/studio-b12/gowebdav v0.9.0
@@ -25,6 +26,7 @@ require (
 	github.com/golang/protobuf v1.5.2 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
 	github.com/klauspost/cpuid/v2 v2.2.5 // indirect
+	github.com/kr/fs v0.1.0 // indirect
 	github.com/lib/pq v1.10.4 // indirect
 	github.com/mattn/go-colorable v0.1.13 // indirect
 	github.com/mattn/go-isatty v0.0.19 // indirect

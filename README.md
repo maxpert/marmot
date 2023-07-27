@@ -102,7 +102,11 @@ Right now there are a few limitations on current solution:
 ![Built on NATS](https://img.shields.io/badge/Built%20on%20NATS-✔️-green)
 
  - Leaderless replication never requiring a single node to handle all write load.
- - NATS/S3/WebDAV snapshot support. Ability to snapshot and fully recover from those snapshots.
+ - Ability to snapshot and fully recover from those snapshots. Multiple storage options for snapshot:
+   - ![NATS Blob Storage](https://img.shields.io/badge/NATS%20Blob-%E2%9C%94%EF%B8%8F-green) 
+   - ![S3 Compatible](https://img.shields.io/badge/S3%20Compatible-%E2%9C%94%EF%B8%8F-green) 
+   - ![WebDAV](https://img.shields.io/badge/WebDAV-%E2%9C%94%EF%B8%8F-green)
+   - ![SFTP](https://img.shields.io/badge/SFTP-%E2%9C%94%EF%B8%8F-green)
  - Built with NATS, abstracting stream distribution and replication.
  - Support for log entry compression, handling content heavy CMS needs.
  - Sleep timeout support for serverless scenarios.
