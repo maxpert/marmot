@@ -74,6 +74,9 @@ type NATSConfiguration struct {
 	SeedFile         string   `toml:"seed_file"`
 	CredsUser        string   `toml:"user_name"`
 	CredsPassword    string   `toml:"user_password"`
+	CAFile           string   `toml:"ca_file"`
+	CertFile         string   `toml:"cert_file"`
+	KeyFile          string   `toml:"key_file"`
 	BindAddress      string   `toml:"bind_address"`
 }
 
