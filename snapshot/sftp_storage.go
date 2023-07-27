@@ -18,14 +18,17 @@ type sftpStorage struct {
 }
 
 func (s *sftpStorage) Upload(name, filePath string) error {
-	// Open the source file
+	err := s.client.MkdirAll(s.uploadPath)
+	if err != nil {
+		return err
+	}
+
 	srcFile, err := os.Open(filePath)
 	if err != nil {
 		return err
 	}
 	defer srcFile.Close()
 
-	// Create the destination file
 	uploadPath := path.Join(s.uploadPath, name)
 	dstFile, err := s.client.OpenFile(uploadPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC)
 	if err != nil {
@@ -33,7 +36,6 @@ func (s *sftpStorage) Upload(name, filePath string) error {
 	}
 	defer dstFile.Close()
 
-	// Copy the file
 	bytes, err := dstFile.ReadFrom(srcFile)
 	if err != nil {
 		return err
@@ -49,8 +51,8 @@ func (s *sftpStorage) Upload(name, filePath string) error {
 }
 
 func (s *sftpStorage) Download(filePath, name string) error {
-	// Open the source file
-	srcFile, err := s.client.Open(path.Join(s.uploadPath, filePath))
+	remotePath := path.Join(s.uploadPath, name)
+	srcFile, err := s.client.Open(remotePath)
 	if err != nil {
 		if err.Error() == "file does not exist" {
 			return ErrNoSnapshotFound
@@ -59,15 +61,19 @@ func (s *sftpStorage) Download(filePath, name string) error {
 	}
 	defer srcFile.Close()
 
-	// Create the destination file
-	dstFile, err := os.Create(name)
+	dstFile, err := os.Create(filePath)
 	if err != nil {
 		return err
 	}
 	defer dstFile.Close()
 
-	// Copy the file
-	_, err = dstFile.ReadFrom(srcFile)
+	bytes, err := dstFile.ReadFrom(srcFile)
+	log.Info().
+		Str("file_name", name).
+		Str("file_path", filePath).
+		Str("sftp_path", remotePath).
+		Int64("bytes", bytes).
+		Msg("Snapshot downloaded from SFTP server")
 	return err
 }
 
