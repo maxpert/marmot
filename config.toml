@@ -84,6 +84,9 @@ bucket="marmot"
 # URL of the WebDAV server root
 url="https://<webdav_server>/<web_dav_path>?dir=/snapshots/path/for/marmot&login=<username>&secret=<password>"
 
+[snapshot.sftp]
+# URL of the SFTP server with path
+url="sftp://<user>:<password>@<sftp_server>:<port>/path/to/save/snapshot"
 
 # Change log that is published and persisted in JetStreams by Marmot.
 # Marmot auto-configures missing JetStreams when booting up for you.
