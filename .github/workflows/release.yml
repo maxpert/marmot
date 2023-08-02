@@ -4,6 +4,8 @@ name: Release
 on:
   release:
     types: [created]
+  push:
+    branches: [master]
   pull_request:
     types:
       - opened
@@ -100,10 +102,10 @@ jobs:
     strategy:
       matrix:
         include:
-          - arch: amd64
+          - arch: arm64
             cc: gcc
 
-          - arch: arm
+          - arch: amd64
             cc: gcc
     env:
       GOOS: darwin
