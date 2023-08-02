@@ -10,16 +10,63 @@ jobs:
 
   linux-build:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - arch:   amd64
+            cc:     gcc
+
+          - arch:   amd64
+            cc:     gcc
+            static: true
+
+          - arch: arm64
+            cc:   aarch64-linux-gnu-gcc
+
+          - arch: arm64
+            cc:   aarch64-linux-gnu-gcc
+            static: true
+          - arch: arm
+            arm:  6
+            cc:   arm-linux-gnueabi-gcc
+
+          - arch: arm
+            arm:  6
+            cc:   arm-linux-gnueabi-gcc
+            static: true
+
+          - arch: arm
+            arm:  7
+            cc:   arm-linux-gnueabihf-gcc
+
+          - arch: arm
+            arm:  7
+            cc:   arm-linux-gnueabihf-gcc
+            static: true
+    env:
+      GOOS:   linux
+      GOARCH: ${{ matrix.arch }}
+      GOARM:  ${{ matrix.arm }}
+      CC:     ${{ matrix.cc }}
+      LDFLAGS: ${{ matrix.static && '-extldflags "-static"' || '' }}
+      SUFFIX: "${{ matrix.static && '-static' || ''}}"
+      VERSION: "${{ github.event_name == 'release' && github.event.release.name || github.sha }}"
     steps:
-    - uses: actions/checkout@v3
+      - uses: actions/checkout@v3
 
-    - name: Set up Go
-      uses: actions/setup-go@v4
-      with:
-        go-version: "^1.20.7"
+      - uses: actions/setup-go@v4
+        with:
+          go-version: '^1.20.7'
 
-    - name: Build
-      run: go build -v ./...
+      - name: Install cross-compilers
+        run: |
+          sudo apt-get update 
+          sudo apt-get install -y gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf gcc-arm-linux-gnueabi
+
+      - name: Build marmot
+        run: |
+          CGO_ENABLED=1 go build -ldflags "-s -w ${{ env.LDFLAGS }}" -o marmot .
+          tar -czvf marmot-${{ env.VERSION }}-${{ env.GOOS }}-${{ env.GOARCH }}${{ env.GOARM }}${{ env.SUFFIX }}.tar.gz marmot config.toml LICENSE README.md examples/*
 
     # - name: Test
     #   run: go test -v ./...
@@ -34,5 +81,18 @@ jobs:
         with:
           go-version: "^1.20.7"
 
-      - name: Build
-        run: go build -v ./...
+      - name: Build x86
+        run: CGO_ENABLED=1 go build -v ./...
+
+  mac-build-arm64:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: "^1.20.7"
+
+      - name: Build ARM64
+        run: CGO_ENABLED=1 GOARCH=arm64 go build -v ./...
