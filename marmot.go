@@ -189,7 +189,7 @@ func onChangeEvent(streamDB *db.SqliteStreamDB, ctxSt *utils.StateContext, event
 			return err
 		}
 
-		return streamDB.Replicate(ev.Payload)
+		return streamDB.Replicate(&ev.Payload)
 	}
 }
 
@@ -206,7 +206,7 @@ func onTableChanged(r *logstream.Replicator, ctxSt *utils.StateContext, events E
 
 		ev := &logstream.ReplicationEvent[db.ChangeLogEvent]{
 			FromNodeId: nodeID,
-			Payload:    event,
+			Payload:    *event,
 		}
 
 		data, err := ev.Marshal()

@@ -2,6 +2,7 @@ package logstream
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -178,8 +179,7 @@ func (r *Replicator) Listen(shardID uint64, callback func(payload []byte) error)
 	savedSeq := r.repState.get(streamName(shardID, r.compressionEnabled))
 	for sub.IsValid() {
 		msg, err := sub.NextMsg(5 * time.Second)
-
-		if err == nats.ErrTimeout {
+		if errors.Is(err, nats.ErrTimeout) {
 			continue
 		}
 
@@ -199,7 +199,7 @@ func (r *Replicator) Listen(shardID uint64, callback func(payload []byte) error)
 		err = r.invokeListener(callback, msg)
 		if err != nil {
 			msg.Nak()
-			if err == context.Canceled {
+			if errors.Is(err, context.Canceled) {
 				return nil
 			}
 
