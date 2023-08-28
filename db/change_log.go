@@ -368,7 +368,7 @@ func (conn *SqliteStreamDB) publishChangeLog() {
 
 		err = conn.consumeChangeLogs(change.TableName, []*changeLogEntry{&logEntry})
 		if err != nil {
-			if err == ErrLogNotReadyToPublish || err == context.Canceled {
+			if errors.Is(err, ErrLogNotReadyToPublish) || errors.Is(err, context.Canceled) {
 				break
 			}
 
