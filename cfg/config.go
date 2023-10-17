@@ -20,9 +20,9 @@ const NodeNamePrefix = "marmot-node"
 const EmbeddedClusterName = "e-marmot"
 const (
 	Nats   SnapshotStoreType = "nats"
-	S3                       = "s3"
-	WebDAV                   = "webdav"
-	SFTP                     = "sftp"
+	S3     SnapshotStoreType = "s3"
+	WebDAV SnapshotStoreType = "webdav"
+	SFTP   SnapshotStoreType = "sftp"
 )
 
 type ReplicationLogConfiguration struct {
@@ -67,17 +67,20 @@ type SnapshotConfiguration struct {
 }
 
 type NATSConfiguration struct {
-	URLs             []string `toml:"urls"`
-	SubjectPrefix    string   `toml:"subject_prefix"`
-	StreamPrefix     string   `toml:"stream_prefix"`
-	ServerConfigFile string   `toml:"server_config"`
-	SeedFile         string   `toml:"seed_file"`
-	CredsUser        string   `toml:"user_name"`
-	CredsPassword    string   `toml:"user_password"`
-	CAFile           string   `toml:"ca_file"`
-	CertFile         string   `toml:"cert_file"`
-	KeyFile          string   `toml:"key_file"`
-	BindAddress      string   `toml:"bind_address"`
+	URLs                     []string `toml:"urls"`
+	SubjectPrefix            string   `toml:"subject_prefix"`
+	StreamPrefix             string   `toml:"stream_prefix"`
+	ServerConfigFile         string   `toml:"server_config"`
+	SeedFile                 string   `toml:"seed_file"`
+	CredsUser                string   `toml:"user_name"`
+	CredsPassword            string   `toml:"user_password"`
+	CAFile                   string   `toml:"ca_file"`
+	CertFile                 string   `toml:"cert_file"`
+	KeyFile                  string   `toml:"key_file"`
+	BindAddress              string   `toml:"bind_address"`
+	ConnectRetries           int      `toml:"connect_retries"`
+	ConnectRetryDelaySeconds int      `toml:"connect_retry_delay_seconds"`
+	ConnectTimeoutSeconds    int      `toml:"connect_timeout_seconds"`
 }
 
 type LoggingConfiguration struct {
@@ -191,6 +194,14 @@ func Load(filePath string) error {
 
 	if Config.SeqMapPath == "" {
 		Config.SeqMapPath = path.Join(DataRootDir, "seq-map.cbor")
+	}
+
+	if Config.NATS.ConnectRetries == 0 {
+		Config.NATS.ConnectRetries = 1
+	}
+
+	if Config.NATS.ConnectTimeoutSeconds == 0 {
+		Config.NATS.ConnectTimeoutSeconds = 10
 	}
 
 	return nil

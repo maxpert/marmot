@@ -1,17 +1,19 @@
 package stream
 
 import (
+	"fmt"
 	"strings"
 	"time"
 
 	"github.com/maxpert/marmot/cfg"
 	"github.com/nats-io/nats.go"
+	"github.com/rs/zerolog/log"
 )
 
 func Connect() (*nats.Conn, error) {
 	opts := []nats.Option{
 		nats.Name(cfg.Config.NodeName()),
-		nats.Timeout(10 * time.Second),
+		nats.Timeout(time.Duration(cfg.Config.NATS.ConnectTimeoutSeconds) * time.Second),
 	}
 
 	creds, err := getNatsAuthFromConfig()
@@ -35,10 +37,30 @@ func Connect() (*nats.Conn, error) {
 		return embedded.prepareConnection(opts...)
 	}
 
-	return nats.Connect(
-		strings.Join(cfg.Config.NATS.URLs, ", "),
-		opts...,
-	)
+	url := strings.Join(cfg.Config.NATS.URLs, ", ")
+
+	var conn *nats.Conn
+	for i := 0; i < cfg.Config.NATS.ConnectRetries; i++ {
+		conn, err = nats.Connect(url, opts...)
+		if err == nil {
+			break
+		}
+
+		log.Warn().Err(err).Msg(fmt.Sprintf(
+			"NATS connection attempt %d/%d failed", i+1, cfg.Config.NATS.ConnectRetries,
+		))
+
+		if cfg.Config.NATS.ConnectRetryDelaySeconds > 0 {
+			log.Warn().Msg(fmt.Sprintf(
+				"Retrying in %d seconds...", cfg.Config.NATS.ConnectRetries,
+			))
+			time.Sleep(time.Duration(cfg.Config.NATS.ConnectRetryDelaySeconds))
+		}
+
+		continue
+	}
+
+	return conn, err
 }
 
 func getNatsAuthFromConfig() ([]nats.Option, error) {
