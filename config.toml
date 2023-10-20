@@ -137,12 +137,8 @@ seed_file=""
 # User credentials used for plain user password authentication
 user_name=""
 user_password=""
-# Number of retries if establishing a NATS connection
-connect_retries=1
-# Number of seconds to wait between NATS connection retries
-connect_retry_delay_seconds=30
-# Timeout for each NATS connection attempt
-connect_timeout_seconds=10
+# Total minutes to wait while establishing the NATS server connection (will be only used if URLs array is not empty)
+connect_total_wait_minutes=1
 
 # Console STDOUT configurations
 [logging]

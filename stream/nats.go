@@ -11,10 +11,7 @@ import (
 )
 
 func Connect() (*nats.Conn, error) {
-	opts := []nats.Option{
-		nats.Name(cfg.Config.NodeName()),
-		nats.Timeout(time.Duration(cfg.Config.NATS.ConnectTimeoutSeconds) * time.Second),
-	}
+	opts := setupConnOptions()
 
 	creds, err := getNatsAuthFromConfig()
 	if err != nil {
@@ -37,30 +34,10 @@ func Connect() (*nats.Conn, error) {
 		return embedded.prepareConnection(opts...)
 	}
 
-	url := strings.Join(cfg.Config.NATS.URLs, ", ")
-
-	var conn *nats.Conn
-	for i := 0; i < cfg.Config.NATS.ConnectRetries; i++ {
-		conn, err = nats.Connect(url, opts...)
-		if err == nil {
-			break
-		}
-
-		log.Warn().Err(err).Msg(fmt.Sprintf(
-			"NATS connection attempt %d/%d failed", i+1, cfg.Config.NATS.ConnectRetries,
-		))
-
-		if cfg.Config.NATS.ConnectRetryDelaySeconds > 0 {
-			log.Warn().Msg(fmt.Sprintf(
-				"Retrying in %d seconds...", cfg.Config.NATS.ConnectRetries,
-			))
-			time.Sleep(time.Duration(cfg.Config.NATS.ConnectRetryDelaySeconds))
-		}
-
-		continue
-	}
-
-	return conn, err
+	return nats.Connect(
+		strings.Join(cfg.Config.NATS.URLs, ", "),
+		opts...,
+	)
 }
 
 func getNatsAuthFromConfig() ([]nats.Option, error) {
@@ -97,4 +74,32 @@ func getNatsTLSFromConfig() ([]nats.Option, error) {
 	}
 
 	return opts, nil
+}
+
+func setupConnOptions() []nats.Option {
+	opts := []nats.Option{
+		nats.Name(cfg.Config.NodeName()),
+		nats.Timeout(10 * time.Second),
+		nats.ClosedHandler(func(nc *nats.Conn) {
+			log.Fatal().Msg(fmt.Sprintf("Exiting: %v", nc.LastError()))
+		}),
+	}
+	if cfg.Config.NATS.ConnectTotalWaitMinutes == 0 {
+		return opts
+	}
+
+	totalWait := time.Duration(cfg.Config.NATS.ConnectTotalWaitMinutes) * time.Minute
+	reconnectDelay := time.Second
+
+	opts = append(opts, nats.RetryOnFailedConnect(true))
+	opts = append(opts, nats.ReconnectWait(reconnectDelay))
+	opts = append(opts, nats.MaxReconnects(int(totalWait/reconnectDelay)))
+	opts = append(opts, nats.DisconnectErrHandler(func(nc *nats.Conn, err error) {
+		log.Printf("Disconnected due to: %v, will attempt reconnects for %.0fm", err, totalWait.Minutes())
+	}))
+	opts = append(opts, nats.ReconnectHandler(func(nc *nats.Conn) {
+		log.Printf("Reconnected to [%s]", nc.ConnectedUrl())
+	}))
+
+	return opts
 }
