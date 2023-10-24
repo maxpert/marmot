@@ -1,7 +1,6 @@
 package stream
 
 import (
-	"fmt"
 	"strings"
 	"time"
 
@@ -82,17 +81,24 @@ func setupConnOptions() []nats.Option {
 
 	return []nats.Option{
 		nats.Name(cfg.Config.NodeName()),
-		nats.ClosedHandler(func(nc *nats.Conn) {
-			log.Fatal().Msg(fmt.Sprintf("Exiting: %v", nc.LastError()))
-		}),
 		nats.RetryOnFailedConnect(true),
 		nats.ReconnectWait(time.Second),
 		nats.MaxReconnects(cfg.Config.NATS.ConnectRetries),
+		nats.ClosedHandler(func(nc *nats.Conn) {
+			log.Fatal().
+				Err(nc.LastError()).
+				Msg("NATS client exiting")
+		}),
 		nats.DisconnectErrHandler(func(nc *nats.Conn, err error) {
-			log.Printf("Disconnected due to: %v, will attempt to reconnect for %d seconds", err, totalWait)
+			log.Error().
+				Err(err).
+				Int("totalWait", totalWait).
+				Msg("NATS client disconnected - will attempt to reconnect")
 		}),
 		nats.ReconnectHandler(func(nc *nats.Conn) {
-			log.Printf("Reconnected to [%s]", nc.ConnectedUrl())
+			log.Info().
+				Str("url", nc.ConnectedUrl()).
+				Msg("NATS client reconnected")
 		}),
 	}
 }
