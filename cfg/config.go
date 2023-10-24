@@ -151,6 +151,7 @@ var Config = &Configuration{
 		CredsPassword:    "",
 		CredsUser:        "",
 		BindAddress:      "0.0.0.0:4222",
+		ConnectRetries:   5,
 	},
 
 	Logging: LoggingConfiguration{
