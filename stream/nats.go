@@ -77,29 +77,22 @@ func getNatsTLSFromConfig() ([]nats.Option, error) {
 }
 
 func setupConnOptions() []nats.Option {
-	opts := []nats.Option{
+	// total wait = ( default nats.Timeout (2s) + nats.ReconnectWait (1s) ) * connect_retries
+	totalWait := 3 * cfg.Config.NATS.ConnectRetries
+
+	return []nats.Option{
 		nats.Name(cfg.Config.NodeName()),
-		nats.Timeout(10 * time.Second),
 		nats.ClosedHandler(func(nc *nats.Conn) {
 			log.Fatal().Msg(fmt.Sprintf("Exiting: %v", nc.LastError()))
 		}),
+		nats.RetryOnFailedConnect(true),
+		nats.ReconnectWait(time.Second),
+		nats.MaxReconnects(cfg.Config.NATS.ConnectRetries),
+		nats.DisconnectErrHandler(func(nc *nats.Conn, err error) {
+			log.Printf("Disconnected due to: %v, will attempt to reconnect for %d seconds", err, totalWait)
+		}),
+		nats.ReconnectHandler(func(nc *nats.Conn) {
+			log.Printf("Reconnected to [%s]", nc.ConnectedUrl())
+		}),
 	}
-	if cfg.Config.NATS.ConnectTotalWaitMinutes == 0 {
-		return opts
-	}
-
-	totalWait := time.Duration(cfg.Config.NATS.ConnectTotalWaitMinutes) * time.Minute
-	reconnectDelay := time.Second
-
-	opts = append(opts, nats.RetryOnFailedConnect(true))
-	opts = append(opts, nats.ReconnectWait(reconnectDelay))
-	opts = append(opts, nats.MaxReconnects(int(totalWait/reconnectDelay)))
-	opts = append(opts, nats.DisconnectErrHandler(func(nc *nats.Conn, err error) {
-		log.Printf("Disconnected due to: %v, will attempt reconnects for %.0fm", err, totalWait.Minutes())
-	}))
-	opts = append(opts, nats.ReconnectHandler(func(nc *nats.Conn) {
-		log.Printf("Reconnected to [%s]", nc.ConnectedUrl())
-	}))
-
-	return opts
 }
