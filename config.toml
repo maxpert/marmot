@@ -138,7 +138,8 @@ seed_file=""
 user_name=""
 user_password=""
 # Number of retries when establishing the NATS server connection (will be only used if URLs array is not empty)
-connect_retries=60
+connect_retries=5
+
 
 # Console STDOUT configurations
 [logging]
