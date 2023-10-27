@@ -33,10 +33,26 @@ func Connect() (*nats.Conn, error) {
 		return embedded.prepareConnection(opts...)
 	}
 
-	return nats.Connect(
-		strings.Join(cfg.Config.NATS.URLs, ", "),
-		opts...,
-	)
+	url := strings.Join(cfg.Config.NATS.URLs, ", ")
+
+	var conn *nats.Conn
+	for i := 0; i < cfg.Config.NATS.ConnectRetries; i++ {
+		conn, err = nats.Connect(url, opts...)
+		if err == nil && conn.Status() == nats.CONNECTED {
+			break
+		}
+
+		log.Warn().
+			Err(err).
+			Int("attempt", i+1).
+			Int("attempt_limit", cfg.Config.NATS.ConnectRetries).
+			Str("status", conn.Status().String()).
+			Msg("NATS connection failed")
+
+		continue
+	}
+
+	return conn, err
 }
 
 func getNatsAuthFromConfig() ([]nats.Option, error) {
@@ -76,9 +92,6 @@ func getNatsTLSFromConfig() ([]nats.Option, error) {
 }
 
 func setupConnOptions() []nats.Option {
-	// total wait = ( default nats.Timeout (2s) + nats.ReconnectWait (1s) ) * connect_retries
-	totalWait := 3 * cfg.Config.NATS.ConnectRetries
-
 	return []nats.Option{
 		nats.Name(cfg.Config.NodeName()),
 		nats.RetryOnFailedConnect(true),
@@ -92,8 +105,7 @@ func setupConnOptions() []nats.Option {
 		nats.DisconnectErrHandler(func(nc *nats.Conn, err error) {
 			log.Error().
 				Err(err).
-				Int("totalWait", totalWait).
-				Msg("NATS client disconnected - will attempt to reconnect")
+				Msg("NATS client disconnected")
 		}),
 		nats.ReconnectHandler(func(nc *nats.Conn) {
 			log.Info().
