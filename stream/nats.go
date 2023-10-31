@@ -48,8 +48,6 @@ func Connect() (*nats.Conn, error) {
 			Int("attempt_limit", cfg.Config.NATS.ConnectRetries).
 			Str("status", conn.Status().String()).
 			Msg("NATS connection failed")
-
-		continue
 	}
 
 	return conn, err
@@ -95,7 +93,7 @@ func setupConnOptions() []nats.Option {
 	return []nats.Option{
 		nats.Name(cfg.Config.NodeName()),
 		nats.RetryOnFailedConnect(true),
-		nats.ReconnectWait(time.Second),
+		nats.ReconnectWait(time.Duration(cfg.Config.NATS.ReconnectWaitSeconds) * time.Second),
 		nats.MaxReconnects(cfg.Config.NATS.ConnectRetries),
 		nats.ClosedHandler(func(nc *nats.Conn) {
 			log.Fatal().
