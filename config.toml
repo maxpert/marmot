@@ -120,7 +120,7 @@ urls=[
 ]
 # Embedded server bind address
 bind_address="0.0.0.0:4222"
-# Embedded server config file (will be only used if URLs array is empty)
+# Embedded server config file (will only be used if URLs array is empty)
 server_config=""
 # Subject prefix used when publishing log entries, it's usually suffixed by shard number
 # to get the full subject name
@@ -137,6 +137,11 @@ seed_file=""
 # User credentials used for plain user password authentication
 user_name=""
 user_password=""
+# Number of retries when establishing the NATS server connection (will only be used if URLs array is not empty)
+connect_retries=5
+# Wait time between NATS reconnect attempts (will only be used if URLs array is not empty)
+reconnect_wait_seconds=2
+
 
 # Console STDOUT configurations
 [logging]
