@@ -6,13 +6,11 @@ import (
 
 	"github.com/maxpert/marmot/cfg"
 	"github.com/nats-io/nats.go"
+	"github.com/rs/zerolog/log"
 )
 
 func Connect() (*nats.Conn, error) {
-	opts := []nats.Option{
-		nats.Name(cfg.Config.NodeName()),
-		nats.Timeout(10 * time.Second),
-	}
+	opts := setupConnOptions()
 
 	creds, err := getNatsAuthFromConfig()
 	if err != nil {
@@ -35,10 +33,24 @@ func Connect() (*nats.Conn, error) {
 		return embedded.prepareConnection(opts...)
 	}
 
-	return nats.Connect(
-		strings.Join(cfg.Config.NATS.URLs, ", "),
-		opts...,
-	)
+	url := strings.Join(cfg.Config.NATS.URLs, ", ")
+
+	var conn *nats.Conn
+	for i := 0; i < cfg.Config.NATS.ConnectRetries; i++ {
+		conn, err = nats.Connect(url, opts...)
+		if err == nil && conn.Status() == nats.CONNECTED {
+			break
+		}
+
+		log.Warn().
+			Err(err).
+			Int("attempt", i+1).
+			Int("attempt_limit", cfg.Config.NATS.ConnectRetries).
+			Str("status", conn.Status().String()).
+			Msg("NATS connection failed")
+	}
+
+	return conn, err
 }
 
 func getNatsAuthFromConfig() ([]nats.Option, error) {
@@ -75,4 +87,28 @@ func getNatsTLSFromConfig() ([]nats.Option, error) {
 	}
 
 	return opts, nil
+}
+
+func setupConnOptions() []nats.Option {
+	return []nats.Option{
+		nats.Name(cfg.Config.NodeName()),
+		nats.RetryOnFailedConnect(true),
+		nats.ReconnectWait(time.Duration(cfg.Config.NATS.ReconnectWaitSeconds) * time.Second),
+		nats.MaxReconnects(cfg.Config.NATS.ConnectRetries),
+		nats.ClosedHandler(func(nc *nats.Conn) {
+			log.Fatal().
+				Err(nc.LastError()).
+				Msg("NATS client exiting")
+		}),
+		nats.DisconnectErrHandler(func(nc *nats.Conn, err error) {
+			log.Error().
+				Err(err).
+				Msg("NATS client disconnected")
+		}),
+		nats.ReconnectHandler(func(nc *nats.Conn) {
+			log.Info().
+				Str("url", nc.ConnectedUrl()).
+				Msg("NATS client reconnected")
+		}),
+	}
 }
