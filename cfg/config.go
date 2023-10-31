@@ -67,18 +67,19 @@ type SnapshotConfiguration struct {
 }
 
 type NATSConfiguration struct {
-	URLs             []string `toml:"urls"`
-	SubjectPrefix    string   `toml:"subject_prefix"`
-	StreamPrefix     string   `toml:"stream_prefix"`
-	ServerConfigFile string   `toml:"server_config"`
-	SeedFile         string   `toml:"seed_file"`
-	CredsUser        string   `toml:"user_name"`
-	CredsPassword    string   `toml:"user_password"`
-	CAFile           string   `toml:"ca_file"`
-	CertFile         string   `toml:"cert_file"`
-	KeyFile          string   `toml:"key_file"`
-	BindAddress      string   `toml:"bind_address"`
-	ConnectRetries   int      `toml:"connect_retries"`
+	URLs                 []string `toml:"urls"`
+	SubjectPrefix        string   `toml:"subject_prefix"`
+	StreamPrefix         string   `toml:"stream_prefix"`
+	ServerConfigFile     string   `toml:"server_config"`
+	SeedFile             string   `toml:"seed_file"`
+	CredsUser            string   `toml:"user_name"`
+	CredsPassword        string   `toml:"user_password"`
+	CAFile               string   `toml:"ca_file"`
+	CertFile             string   `toml:"cert_file"`
+	KeyFile              string   `toml:"key_file"`
+	BindAddress          string   `toml:"bind_address"`
+	ConnectRetries       int      `toml:"connect_retries"`
+	ReconnectWaitSeconds int      `toml:"reconnect_wait_seconds"`
 }
 
 type LoggingConfiguration struct {
@@ -143,15 +144,16 @@ var Config = &Configuration{
 	},
 
 	NATS: NATSConfiguration{
-		URLs:             []string{},
-		SubjectPrefix:    "marmot-change-log",
-		StreamPrefix:     "marmot-changes",
-		ServerConfigFile: "",
-		SeedFile:         "",
-		CredsPassword:    "",
-		CredsUser:        "",
-		BindAddress:      "0.0.0.0:4222",
-		ConnectRetries:   5,
+		URLs:                 []string{},
+		SubjectPrefix:        "marmot-change-log",
+		StreamPrefix:         "marmot-changes",
+		ServerConfigFile:     "",
+		SeedFile:             "",
+		CredsPassword:        "",
+		CredsUser:            "",
+		BindAddress:          "0.0.0.0:4222",
+		ConnectRetries:       5,
+		ReconnectWaitSeconds: 2,
 	},
 
 	Logging: LoggingConfiguration{
