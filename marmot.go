@@ -7,6 +7,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/maxpert/marmot/telemetry"
 	"github.com/maxpert/marmot/utils"
 
 	"github.com/maxpert/marmot/cfg"
@@ -42,6 +43,9 @@ func main() {
 	} else {
 		log.Logger = gLog.Level(zerolog.InfoLevel)
 	}
+
+	log.Debug().Msg("Initializing telemetry")
+	telemetry.InitializeTelemetry()
 
 	log.Debug().Str("path", cfg.Config.DBPath).Msg("Opening database")
 	streamDB, err := db.OpenStreamDB(cfg.Config.DBPath)

@@ -14,6 +14,7 @@ import (
 	"github.com/fsnotify/fsnotify"
 	"github.com/mattn/go-sqlite3"
 	"github.com/maxpert/marmot/pool"
+	"github.com/maxpert/marmot/telemetry"
 	"github.com/rs/zerolog/log"
 )
 
@@ -21,6 +22,13 @@ const snapshotTransactionMode = "exclusive"
 
 var PoolSize = 4
 var MarmotPrefix = "__marmot__"
+
+type statsSqliteStreamDB struct {
+	published      telemetry.Counter
+	pendingPublish telemetry.Gauge
+	countChanges   telemetry.Histogram
+	scanChanges    telemetry.Histogram
+}
 
 type SqliteStreamDB struct {
 	OnChange      func(event *ChangeLogEvent) error
@@ -31,6 +39,7 @@ type SqliteStreamDB struct {
 	dbPath            string
 	prefix            string
 	watchTablesSchema map[string][]*ColumnInfo
+	stats             *statsSqliteStreamDB
 }
 
 type ColumnInfo struct {
@@ -142,6 +151,12 @@ func OpenStreamDB(path string) (*SqliteStreamDB, error) {
 		prefix:            MarmotPrefix,
 		publishLock:       &sync.Mutex{},
 		watchTablesSchema: map[string][]*ColumnInfo{},
+		stats: &statsSqliteStreamDB{
+			published:      telemetry.NewCounter("published", "number of rows published"),
+			pendingPublish: telemetry.NewGauge("pending_publish", "rows pending publishing"),
+			countChanges:   telemetry.NewHistogram("count_changes", "latency counting changes in microseconds"),
+			scanChanges:    telemetry.NewHistogram("scan_changes", "latency scanning change rows in DB"),
+		},
 	}
 
 	return ret, nil

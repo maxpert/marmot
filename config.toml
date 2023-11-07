@@ -142,6 +142,15 @@ connect_retries=5
 # Wait time between NATS reconnect attempts (will only be used if URLs array is not empty)
 reconnect_wait_seconds=2
 
+[prometheus]
+# Enable/Disable prometheus telemetry collection
+enable=false
+# HTTP endpoint to expose for prometheus matrix collection
+# bind=":3010"
+# Namespace for prometheus (default: `marmot`), applies to all counters, gaugues, histograms
+# namespace=""
+# Subsystem for prometheus (default: empty), applies to all counters, gauges, histograms
+# subsystem=""
 
 # Console STDOUT configurations
 [logging]
