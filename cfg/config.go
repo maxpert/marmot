@@ -87,6 +87,13 @@ type LoggingConfiguration struct {
 	Format  string `toml:"format"`
 }
 
+type PrometheusConfiguration struct {
+	Bind      string `toml:"bind"`
+	Enable    bool   `toml:"enable"`
+	Namespace string `toml:"namespace"`
+	Subsystem string `toml:"subsystem"`
+}
+
 type Configuration struct {
 	SeqMapPath      string `toml:"seq_map_path"`
 	DBPath          string `toml:"db_path"`
@@ -102,6 +109,7 @@ type Configuration struct {
 	ReplicationLog ReplicationLogConfiguration `toml:"replication_log"`
 	NATS           NATSConfiguration           `toml:"nats"`
 	Logging        LoggingConfiguration        `toml:"logging"`
+	Prometheus     PrometheusConfiguration     `toml:"prometheus"`
 }
 
 var ConfigPathFlag = flag.String("config", "", "Path to configuration file")
@@ -159,6 +167,13 @@ var Config = &Configuration{
 	Logging: LoggingConfiguration{
 		Verbose: false,
 		Format:  "console",
+	},
+
+	Prometheus: PrometheusConfiguration{
+		Bind:      ":3010",
+		Enable:    false,
+		Namespace: "marmot",
+		Subsystem: "",
 	},
 }
 

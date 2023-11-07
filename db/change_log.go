@@ -310,7 +310,7 @@ func (conn *SqliteStreamDB) watchChanges(watcher *fsnotify.Watcher, path string)
 
 func (conn *SqliteStreamDB) getGlobalChanges(limit uint32) ([]globalChangeLogEntry, error) {
 	sw := utils.NewStopWatch("scan_changes")
-	defer sw.Log(log.Debug())
+	defer sw.Log(log.Debug(), conn.stats.scanChanges)
 
 	sqlConn, err := conn.pool.Borrow()
 	if err != nil {
@@ -331,12 +331,39 @@ func (conn *SqliteStreamDB) getGlobalChanges(limit uint32) ([]globalChangeLogEnt
 	return entries, nil
 }
 
+func (conn *SqliteStreamDB) countChanges() (int64, error) {
+	sw := utils.NewStopWatch("count_changes")
+	defer sw.Log(log.Debug(), conn.stats.countChanges)
+
+	sqlConn, err := conn.pool.Borrow()
+	if err != nil {
+		return -1, err
+	}
+	defer sqlConn.Return()
+
+	return sqlConn.DB().
+		From(conn.globalMetaTable()).
+		Count()
+}
+
 func (conn *SqliteStreamDB) publishChangeLog() {
 	if !conn.publishLock.TryLock() {
 		log.Warn().Msg("Publish in progress skipping...")
 		return
 	}
 	defer conn.publishLock.Unlock()
+
+	cnt, err := conn.countChanges()
+	if err != nil {
+		log.Error().Err(err).Msg("Unable to count global changes")
+		return
+	}
+
+	conn.stats.pendingPublish.Set(float64(cnt))
+	if cnt <= 0 {
+		log.Debug().Msg("no new rows")
+		return
+	}
 
 	changes, err := conn.getGlobalChanges(cfg.Config.ScanMaxChanges)
 	if err != nil {
@@ -379,6 +406,8 @@ func (conn *SqliteStreamDB) publishChangeLog() {
 		if err != nil {
 			log.Error().Err(err).Msg("Unable to cleanup change log")
 		}
+
+		conn.stats.published.Inc()
 	}
 }
 

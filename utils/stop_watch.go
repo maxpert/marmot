@@ -1,8 +1,10 @@
 package utils
 
 import (
-	"github.com/rs/zerolog"
 	"time"
+
+	"github.com/maxpert/marmot/telemetry"
+	"github.com/rs/zerolog"
 )
 
 type StopWatch struct {
@@ -21,6 +23,11 @@ func (t *StopWatch) Stop() time.Duration {
 	return time.Since(t.startTime)
 }
 
-func (t *StopWatch) Log(e *zerolog.Event) {
-	e.Dur("duration", t.Stop()).Str("name", t.name).Send()
+func (t *StopWatch) Log(e *zerolog.Event, hist telemetry.Histogram) {
+	dur := t.Stop()
+	if hist != nil {
+		hist.Observe(float64(dur.Microseconds()))
+	}
+
+	e.Dur("duration", dur).Str("name", t.name).Send()
 }
