@@ -39,7 +39,8 @@ You should be able to make changes interchangeably and see the changes getting p
 
 ## Out in wild
 
-Here are some official, and community demos showing Marmot out in wild:
+Here are some official, and community demos/usages showing Marmot out in wild:
+ - [2-node HA for edge Kubernetes - Using Marmot](https://www.youtube.com/watch?v=HycGtLjlikI)
  - [Scaling Isso with Marmot on Fly.io](https://maxpert.github.io/marmot/demo)
  - [Scaling PocketBase with Marmot on Fly.io](https://github.com/maxpert/marmot-pocketbase-flyio)
  - [Scaling PocketBase with Marmot 0.4.x](https://www.youtube.com/watch?v=QqZl61bJ9BA)
