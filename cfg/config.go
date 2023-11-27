@@ -159,7 +159,7 @@ var Config = &Configuration{
 		SeedFile:             "",
 		CredsPassword:        "",
 		CredsUser:            "",
-		BindAddress:          "0.0.0.0:4222",
+		BindAddress:          ":-1",
 		ConnectRetries:       5,
 		ReconnectWaitSeconds: 2,
 	},
