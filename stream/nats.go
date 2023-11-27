@@ -96,7 +96,7 @@ func setupConnOptions() []nats.Option {
 		nats.ReconnectWait(time.Duration(cfg.Config.NATS.ReconnectWaitSeconds) * time.Second),
 		nats.MaxReconnects(cfg.Config.NATS.ConnectRetries),
 		nats.ClosedHandler(func(nc *nats.Conn) {
-			log.Fatal().
+			log.Error().
 				Err(nc.LastError()).
 				Msg("NATS client exiting")
 		}),
