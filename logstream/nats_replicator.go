@@ -20,7 +20,7 @@ const SnapshotShardID = uint64(1)
 
 var SnapshotLeaseTTL = 10 * time.Second
 
-type Replicator struct {
+type NatsReplicator struct {
 	nodeID             uint64
 	shards             uint64
 	compressionEnabled bool
@@ -33,9 +33,9 @@ type Replicator struct {
 	streamMap map[uint64]nats.JetStreamContext
 }
 
-func NewReplicator(
+func NewNatsReplicator(
 	snapshot snapshot.NatsSnapshot,
-) (*Replicator, error) {
+) (*NatsReplicator, error) {
 	nodeID := cfg.Config.NodeID
 	shards := cfg.Config.ReplicationLog.Shards
 	compress := cfg.Config.ReplicationLog.Compress
@@ -111,7 +111,7 @@ func NewReplicator(
 		return nil, err
 	}
 
-	return &Replicator{
+	return &NatsReplicator{
 		client:             nc,
 		nodeID:             nodeID,
 		compressionEnabled: compress,
@@ -125,7 +125,7 @@ func NewReplicator(
 	}, nil
 }
 
-func (r *Replicator) Publish(hash uint64, payload []byte) error {
+func (r *NatsReplicator) Publish(hash uint64, payload []byte) error {
 	shardID := (hash % r.shards) + 1
 	js, ok := r.streamMap[shardID]
 	if !ok {
@@ -167,7 +167,7 @@ func (r *Replicator) Publish(hash uint64, payload []byte) error {
 	return nil
 }
 
-func (r *Replicator) Listen(shardID uint64, callback func(payload []byte) error) error {
+func (r *NatsReplicator) Listen(shardID uint64, callback func(payload []byte) error) error {
 	js := r.streamMap[shardID]
 
 	sub, err := js.SubscribeSync(subjectName(shardID))
@@ -221,7 +221,7 @@ func (r *Replicator) Listen(shardID uint64, callback func(payload []byte) error)
 	return nil
 }
 
-func (r *Replicator) RestoreSnapshot() error {
+func (r *NatsReplicator) RestoreSnapshot() error {
 	if r.snapshot == nil {
 		return nil
 	}
@@ -242,11 +242,11 @@ func (r *Replicator) RestoreSnapshot() error {
 	return nil
 }
 
-func (r *Replicator) LastSaveSnapshotTime() time.Time {
+func (r *NatsReplicator) LastSaveSnapshotTime() time.Time {
 	return r.lastSnapshot
 }
 
-func (r *Replicator) SaveSnapshot() {
+func (r *NatsReplicator) SaveSnapshot() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -264,7 +264,7 @@ func (r *Replicator) SaveSnapshot() {
 	r.ForceSaveSnapshot()
 }
 
-func (r *Replicator) ForceSaveSnapshot() {
+func (r *NatsReplicator) ForceSaveSnapshot() {
 	if r.snapshot == nil {
 		return
 	}
@@ -280,7 +280,7 @@ func (r *Replicator) ForceSaveSnapshot() {
 	r.lastSnapshot = time.Now()
 }
 
-func (r *Replicator) ReloadCertificates() error {
+func (r *NatsReplicator) ReloadCertificates() error {
 	if cfg.Config.NATS.CAFile != "" {
 		err := nats.RootCAs(cfg.Config.NATS.CAFile)(&r.client.Opts)
 		if err != nil {
@@ -298,7 +298,7 @@ func (r *Replicator) ReloadCertificates() error {
 	return nil
 }
 
-func (r *Replicator) invokeListener(callback func(payload []byte) error, msg *nats.Msg) error {
+func (r *NatsReplicator) invokeListener(callback func(payload []byte) error, msg *nats.Msg) error {
 	var err error
 	payload := msg.Data
 

@@ -82,6 +82,11 @@ type NATSConfiguration struct {
 	ReconnectWaitSeconds int      `toml:"reconnect_wait_seconds"`
 }
 
+type RaftConfiguration struct {
+	Enabled bool   `toml:"enabled"`
+	BaseDir string `toml:"base_dir"`
+}
+
 type LoggingConfiguration struct {
 	Verbose bool   `toml:"verbose"`
 	Format  string `toml:"format"`
@@ -110,6 +115,7 @@ type Configuration struct {
 	NATS           NATSConfiguration           `toml:"nats"`
 	Logging        LoggingConfiguration        `toml:"logging"`
 	Prometheus     PrometheusConfiguration     `toml:"prometheus"`
+	Raft           RaftConfiguration           `toml:"raft"`
 }
 
 var ConfigPathFlag = flag.String("config", "", "Path to configuration file")
@@ -174,6 +180,11 @@ var Config = &Configuration{
 		Enable:    false,
 		Namespace: "marmot",
 		Subsystem: "",
+	},
+
+	Raft: RaftConfiguration{
+		Enabled: false,
+		BaseDir: os.TempDir(),
 	},
 }
 

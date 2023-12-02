@@ -70,7 +70,7 @@ func main() {
 		log.Panic().Err(err).Msg("Unable to initialize snapshot storage")
 	}
 
-	replicator, err := logstream.NewReplicator(snapshot.NewNatsDBSnapshot(streamDB, snpStore))
+	replicator, err := logstream.NewNatsReplicator(snapshot.NewNatsDBSnapshot(streamDB, snpStore))
 	if err != nil {
 		log.Panic().Err(err).Msg("Unable to initialize replicators")
 	}
@@ -162,7 +162,7 @@ func main() {
 
 func changeListener(
 	streamDB *db.SqliteStreamDB,
-	rep *logstream.Replicator,
+	rep *logstream.NatsReplicator,
 	ctxSt *utils.StateContext,
 	events EventBus.BusPublisher,
 	shard uint64,
@@ -197,7 +197,7 @@ func onChangeEvent(streamDB *db.SqliteStreamDB, ctxSt *utils.StateContext, event
 	}
 }
 
-func onTableChanged(r *logstream.Replicator, ctxSt *utils.StateContext, events EventBus.BusPublisher, nodeID uint64) func(event *db.ChangeLogEvent) error {
+func onTableChanged(r *logstream.NatsReplicator, ctxSt *utils.StateContext, events EventBus.BusPublisher, nodeID uint64) func(event *db.ChangeLogEvent) error {
 	return func(event *db.ChangeLogEvent) error {
 		events.Publish("pulse")
 		if ctxSt.IsCanceled() {
