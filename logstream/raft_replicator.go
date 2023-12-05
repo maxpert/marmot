@@ -29,12 +29,14 @@ func raftBoltStore(baseDir, name string) (*boltdb.BoltStore, error) {
 	return db, err
 }
 
-func prepareRaftCluster(nodes ...string) []raft.Server {
+func parseRaftNodeAddress(suff raft.ServerSuffrage, nodes ...string) []raft.Server {
 	var ret []raft.Server
 	for _, n := range nodes {
 		if !strings.HasPrefix(n, "raft:") {
+			log.Warn().Str("address", n).Msg("Invalid node address, must start with raft:")
 			continue
 		}
+
 		n = strings.TrimPrefix(n, "raft:")
 		u, err := url.Parse(n)
 		if err != nil {
@@ -43,7 +45,7 @@ func prepareRaftCluster(nodes ...string) []raft.Server {
 		}
 
 		ret = append(ret, raft.Server{
-			Suffrage: raft.Voter,
+			Suffrage: suff,
 			ID:       raft.ServerID(u.Scheme),
 			Address:  raft.ServerAddress(u.Host),
 		})
@@ -58,12 +60,12 @@ func NewRaftReplicator(
 	bindAddress string,
 	joinAddresses []string,
 ) (*RaftReplicator, error) {
-	logWriter := log.With().Str("replicator", "marmot-raft").Logger()
+	logWriter := log.With().Str("node", nodeID).Logger()
 	hcLogger := hclog.New(&hclog.LoggerOptions{
-		Name:        "marmot-raft",
-		Output:      logWriter,
-		Level:       hclog.DefaultLevel,
+		Name:        nodeID,
+		Level:       hclog.Info,
 		DisableTime: true,
+		JSONFormat:  true,
 	})
 
 	raftConfig := raft.DefaultConfig()
@@ -72,8 +74,8 @@ func NewRaftReplicator(
 	raftConfig.LogLevel = "INFO"
 	raftConfig.Logger = hcLogger
 
-	baseDir := filepath.Join(rootDir, fmt.Sprintf("%v", nodeID))
-	err := os.MkdirAll(baseDir, 0770)
+	baseDir := filepath.Join(rootDir, fmt.Sprintf("data-%v", nodeID))
+	err := os.MkdirAll(baseDir, 0o755)
 	if err != nil {
 		return nil, err
 	}
@@ -88,7 +90,7 @@ func NewRaftReplicator(
 		return nil, err
 	}
 
-	fss, err := raft.NewFileSnapshotStore(baseDir, 3, logWriter)
+	fss, err := raft.NewFileSnapshotStoreWithLogger(baseDir, 3, hcLogger)
 	tm, err := raft.NewTCPTransportWithConfig(bindAddress, nil, &raft.NetworkTransportConfig{
 		MaxPool:         4,
 		MaxRPCsInFlight: 2,
@@ -105,7 +107,7 @@ func NewRaftReplicator(
 
 	selfUrl := fmt.Sprintf("raft:%s://%s", nodeID, bindAddress)
 	f := rft.BootstrapCluster(raft.Configuration{
-		Servers: prepareRaftCluster(append(joinAddresses, selfUrl)...),
+		Servers: parseRaftNodeAddress(raft.Voter, append(joinAddresses, selfUrl)...),
 	})
 
 	if err = f.Error(); err != nil && !errors.Is(err, raft.ErrCantBootstrap) {
@@ -116,4 +118,23 @@ func NewRaftReplicator(
 		raft: rft,
 		sm:   sm,
 	}, nil
+}
+
+func (r *RaftReplicator) Shutdown() {
+	f := r.raft.Shutdown()
+	if f.Error() != nil {
+		log.Warn().Err(f.Error()).Msg("Unable to shutdown")
+	}
+}
+
+func (r *RaftReplicator) AddMember(url string) error {
+	mem := parseRaftNodeAddress(raft.Voter, url)
+	f := r.raft.AddVoter(mem[0].ID, mem[0].Address, 0, 2*time.Second)
+	return f.Error()
+}
+
+func (r *RaftReplicator) AddFollower(url string) error {
+	mem := parseRaftNodeAddress(raft.Nonvoter, url)
+	f := r.raft.AddNonvoter(mem[0].ID, mem[0].Address, 0, 2*time.Second)
+	return f.Error()
 }
