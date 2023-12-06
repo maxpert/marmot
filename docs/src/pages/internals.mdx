@@ -125,11 +125,11 @@ possible that you might have an outdated copy of database until the logs are ful
 
 | Scenario | Description |
 | --- | --- |
-| Configuration Load Failure | If there's an error loading the configuration (`cfg.Load(*cfg.ConfigPathFlag)`), the program will panic and exit. |
-| Database Open Failure | If the program fails to open the database (`db.OpenStreamDB(cfg.Config.DBPath)`), it logs an error and returns, which will cause the program to exit. |
-| Cleanup Change Data Capture Pipeline Failure | If the cleanup flag (`*cfg.CleanupFlag`) is set and there's an error during the cleanup process (`streamDB.RemoveCDC(true)`), the program will panic and exit. |
-| Snapshot Storage Initialization Failure | If there's an error initializing the snapshot storage (`snapshot.NewSnapshotStorage()`), the program will panic and exit. |
-| Replicator Initialization Failure | If there's an error initializing the replicators (`logstream.NewReplicator(snapshot.NewNatsDBSnapshot(streamDB, snpStore))`), the program will panic and exit. |
-| Snapshot Restoration Failure | If snapshot and replication are enabled (`cfg.Config.Snapshot.Enable && cfg.Config.Replicate`) and there's an error restoring the snapshot (`replicator.RestoreSnapshot()`), the program will panic and exit. |
-| Table Listing Failure | If there's an error listing all tables (`db.GetAllDBTables(cfg.Config.DBPath)`), it logs an error and returns, which will cause the program to exit. |
-| Change Data Capture Pipeline Installation Failure | If there's an error installing the change data capture pipeline (`streamDB.InstallCDC(tableNames)`), it logs an error and returns, which will cause the program to exit. |
+| Configuration Load Failure | If there's an error loading the configuration (`cfg.Load(*cfg.ConfigPathFlag)`), Marmot will panic and exit. |
+| Database Open Failure | If the program fails to open the database (`db.OpenStreamDB(cfg.Config.DBPath)`), it logs an error and returns, which will cause Marmot to exit. |
+| Cleanup Change Data Capture Pipeline Failure | If the cleanup flag (`*cfg.CleanupFlag`) is set and there's an error during the cleanup process (`streamDB.RemoveCDC(true)`), Marmot will panic and exit. |
+| Snapshot Storage Initialization Failure | If there's an error initializing the snapshot storage (`snapshot.NewSnapshotStorage()`), Marmot will panic and exit. |
+| Replicator Initialization Failure | If there's an error initializing the replicators (`logstream.NewReplicator(snapshot.NewNatsDBSnapshot(streamDB, snpStore))`), Marmot will panic and exit. |
+| Snapshot Restoration Failure | If snapshot and replication are enabled (`cfg.Config.Snapshot.Enable && cfg.Config.Replicate`) and there's an error restoring the snapshot (`replicator.RestoreSnapshot()`), Marmot will panic and exit. |
+| Table Listing Failure | If there's an error listing all tables (`db.GetAllDBTables(cfg.Config.DBPath)`), it logs an error and returns, which will cause Marmot to exit. |
+| Change Data Capture Pipeline Installation Failure | If there's an error installing the change data capture pipeline (`streamDB.InstallCDC(tableNames)`), it logs an error and returns, which will cause Marmot to exit. |
