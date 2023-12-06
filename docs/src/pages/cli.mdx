@@ -4,6 +4,34 @@ title: Marmot CLI
 
 # Marmot CLI Documentation
 
+## Usage
+
+You can run Marmot like this:
+
+```bash
+marmot --config /path/to/config.toml -cluster-addr localhost:4221 -cluster-peers 'nats://localhost:4222/'
+```
+
+You can clean up marmot triggers and changelogs this:
+
+```bash
+marmot --config /path/to/config.toml --cleanup
+```
+
+You can take snapshot and upload:
+
+```bash
+marmot --config /path/to/config.toml --save-snapshot
+```
+
+Minimal Config
+
+```toml
+seq_map_path="/tmp/marmot-1-sm.cbor"
+db_path="/tmp/marmot-1.db"
+node_id=1
+```
+
 ## Flags
 
 - `--config`: Path to the configuration file.
@@ -63,22 +91,74 @@ The configuration file is in TOML format and contains the following sections:
 - `namespace`: Namespace for Prometheus.
 - `subsystem`: Subsystem for Prometheus.
 
-## Usage
 
-You can run Marmot with a configuration file like this:
 
-```bash
-marmot --config /path/to/config.toml
-```
+## Sample Config File
 
-You can perform a cleanup like this:
+```toml 
+[replication_log]
+shards = 1
+max_entries = 1024
+replicas = 1
+compress = true
+update_existing = false
 
-```bash
-marmot --config /path/to/config.toml --cleanup
-```
+[snapshot]
+enabled = true
+interval = 0
+store = "nats"
 
-You can take snapshot and upload:
+[snapshot.nats]
+replicas = 1
+bucket = "bucket-name"
 
-```bash
-marmot --config /path/to/config.toml --save-snapshot
+[snapshot.s3]
+path = "path"
+endpoint = "endpoint"
+access_key = "access-key"
+secret = "secret-key"
+session_token = "session-token"
+bucket = "bucket-name"
+use_ssl = true
+
+[snapshot.webdav]
+url = "webdav-url"
+
+[snapshot.sftp]
+url = "sftp-url"
+
+[nats]
+urls = ["nats-url"]
+subject_prefix = "marmot-change-log"
+stream_prefix = "marmot-changes"
+server_config = "server-config"
+seed_file = "seed-file"
+user_name = "user-name"
+user_password = "user-password"
+ca_file = "ca-file"
+cert_file = "cert-file"
+key_file = "key-file"
+bind_address = ":-1"
+connect_retries = 5
+reconnect_wait_seconds = 2
+
+[logging]
+verbose = false
+format = "console"
+
+[prometheus]
+bind = ":3010"
+enable = false
+namespace = "marmot"
+subsystem = ""
+
+seq_map_path = "seq-map-path"
+db_path = "db-path"
+node_id = 1
+publish = true
+replicate = true
+scan_max_changes = 512
+cleanup_interval = 5000
+sleep_timeout = 0
+polling_interval = 0
 ```
