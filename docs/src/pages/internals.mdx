@@ -9,8 +9,8 @@ sequenceDiagram
     main->>+db: OpenStreamDB
     main->>+snapshot: NewSnapshotStorage
     main->>+logstream: NewReplicator
-    onChangeEvent->>+db: Replicate
-    onTableChanged->>+logstream: Publish    
+    onTableChanged->>+logstream: Publish 
+    onChangeEvent->>+db: Replicate   
     loop Every minute
         main->>+db: CleanupChangeLogs
         main->>+snapshot: SaveSnapshot
