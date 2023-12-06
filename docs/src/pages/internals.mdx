@@ -9,9 +9,12 @@ sequenceDiagram
     main->>+db: OpenStreamDB
     main->>+snapshot: NewSnapshotStorage
     main->>+logstream: NewReplicator
+    opt
+      main->>+snapshot: RestoreSnapshot
+    end
     onTableChanged->>+logstream: Publish 
     onChangeEvent->>+db: Replicate   
-    loop Every minute
+    loop
         main->>+db: CleanupChangeLogs
         main->>+snapshot: SaveSnapshot
     end
@@ -81,11 +84,8 @@ case a node coming back up can be lagging so far behind that `max-log-entries` m
 fully play all logs and restore the state of database. In that case it required that a node restores a
 snapshot and apply current log entries to be fully up-to-date.
 
-As of `v0.6.0+` Marmot supports taking snapshot and being able to fully restore it via
-[NATS Object Storage](https://docs.nats.io/using-nats/developer/develop_jetstream/object).
-
- > In future Marmot plans to support more storage mechanisms like S3 (and compatible APIs including BlackBlaze
- > and Minio), Azure Blob, and SFTP.
+Marmot supports taking snapshot and being able to fully restore it via
+[NATS Object Storage](https://docs.nats.io/using-nats/developer/develop_jetstream/object), S3 (and compatible APIs including BlackBlaze and Minio), Azure Blob, and SFTP.
 
 ### Saving Snapshot
 Everytime a node publishes a new change log to NATs, it saves sequence number of the entry in JetStream. The saved
