@@ -1,6 +1,7 @@
 {
   "index": "Welcome",
-  "demo":  "Demo",
   "intro": "Overview",
+  "demo":  "Demo",
+  "cli": "CLI",
   "internals": "Internals"
 }
