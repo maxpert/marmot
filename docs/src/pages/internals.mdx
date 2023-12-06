@@ -9,11 +9,15 @@ sequenceDiagram
     main->>+db: OpenStreamDB
     main->>+snapshot: NewSnapshotStorage
     main->>+logstream: NewReplicator
+    onTableChanged->>+db: Register 
+    onChangeEvent->>+logstream: Register  
     opt
       main->>+snapshot: RestoreSnapshot
     end
-    onTableChanged->>+logstream: Publish 
-    onChangeEvent->>+db: Replicate   
+    loop
+        onTableChanged->>+logstream: Publish 
+        onChangeEvent->>+db: Replicate 
+    end   
     loop
         main->>+db: CleanupChangeLogs
         main->>+snapshot: SaveSnapshot
