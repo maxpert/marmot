@@ -2,6 +2,21 @@
 
 There are multiple components in Marmot that make it work. Let's look at them one by one: 
 
+```mermaid
+sequenceDiagram
+    main->>+main: Parse flag
+    main->>+main: Load cfg
+    main->>+db: OpenStreamDB
+    main->>+snapshot: NewSnapshotStorage
+    main->>+logstream: NewReplicator
+    onChangeEvent->>+db: Replicate
+    onTableChanged->>+logstream: Publish    
+    loop Every minute
+        main->>+db: CleanupChangeLogs
+        main->>+snapshot: SaveSnapshot
+    end
+        main->>main: Shutdown
+```
 
 ## Triggers and data capture
 
