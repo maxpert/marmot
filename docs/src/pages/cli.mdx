@@ -1,0 +1,84 @@
+---
+title: Marmot CLI
+---
+
+# Marmot CLI Documentation
+
+## Flags
+
+- `--config`: Path to the configuration file.
+- `--cleanup`: If set, only cleanup marmot triggers and changelogs.
+- `--save-snapshot`: If set, only take snapshot and upload.
+- `--cluster-addr`: Cluster listening address.
+- `--cluster-peers`: Comma separated list of clusters.
+- `--leaf-servers`: Comma separated list of leaf servers.
+
+## Configuration
+
+The configuration file is in TOML format and contains the following sections:
+
+### Snapshot Configuration
+
+- `enabled`: Enable snapshotting.
+- `interval`: Interval for taking snapshots.
+- `store`: Type of storage for snapshots. Options are "nats", "s3", "webdav", "sftp".
+- `nats`: NATS object store configuration.
+- `s3`: S3 configuration.
+- `webdav`: WebDAV configuration.
+- `sftp`: SFTP configuration.
+
+### Replication Log Configuration
+
+- `shards`: Number of shards.
+- `max_entries`: Maximum number of entries.
+- `replicas`: Number of replicas.
+- `compress`: Enable compression.
+- `update_existing`: Update existing entries.
+
+### NATS Configuration
+
+- `urls`: NATS server URLs.
+- `subject_prefix`: Subject prefix for NATS messages.
+- `stream_prefix`: Stream prefix for NATS messages.
+- `server_config`: Server configuration file for NATS.
+- `seed_file`: Seed file for NATS.
+- `user_name`: User name for NATS.
+- `user_password`: User password for NATS.
+- `ca_file`: CA file for NATS.
+- `cert_file`: Certificate file for NATS.
+- `key_file`: Key file for NATS.
+- `bind_address`: Bind address for NATS.
+- `connect_retries`: Number of connection retries for NATS.
+- `reconnect_wait_seconds`: Wait time in seconds before reconnecting to NATS.
+
+### Logging Configuration
+
+- `verbose`: Enable verbose logging.
+- `format`: Logging format.
+
+### Prometheus Configuration
+
+- `bind`: Bind address for Prometheus.
+- `enable`: Enable Prometheus.
+- `namespace`: Namespace for Prometheus.
+- `subsystem`: Subsystem for Prometheus.
+
+## Usage
+
+You can run Marmot with a configuration file like this:
+
+```bash
+marmot --config /path/to/config.toml
+```
+
+You can perform a cleanup like this:
+
+```bash
+marmot --config /path/to/config.toml --cleanup
+```
+
+You can take snapshot and upload:
+
+```bash
+marmot --config /path/to/config.toml --save-snapshot
+```
