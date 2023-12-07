@@ -129,9 +129,17 @@ Once snapshot has been copied over, Marmot installs same triggers, and change lo
 processing logs applying them all on the snapshot. This means while Marmot is restoring the DB it's quite
 possible that you might have an outdated copy of database until the logs are fully applied.
 
+## Monitoring
 
+### Prometheus Metrics
+| Field Name | Type | Description |
+|------------|------|-------------|
+| published | Counter | Number of rows published |
+| pending_publish | Gauge | Number of rows pending publishing |
+| count_changes | Histogram | Latency of counting changes in microseconds |
+| scan_changes | Histogram | Latency of scanning change rows in the database |
 
-## Error Scenarios
+### Error Scenarios
 
 | Scenario | Description |
 | --- | --- |
