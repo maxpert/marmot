@@ -81,6 +81,10 @@ name to value.
 > There is alot of optimization that can be done to this payload overall, in future using
 > ProtoBuf or more optimized serialization format is absolutely an open option.
 
+### Changelog Cleanup
+Marmot performs periodic cleanup of change logs that were created before a specified time (default: 5 seconds). 
+It iterates over the watched tables, deletes entries from their respective meta tables where the state is "Published" and the creation time is earlier than the specified time.
+
 ## Snapshotting
 
 In a normal distributed system it's pretty typical for nodes to go down for really long time. In that particular
@@ -124,6 +128,8 @@ the files.
 Once snapshot has been copied over, Marmot installs same triggers, and change log tables again in DB, and starts
 processing logs applying them all on the snapshot. This means while Marmot is restoring the DB it's quite
 possible that you might have an outdated copy of database until the logs are fully applied.
+
+
 
 ## Error Scenarios
 
