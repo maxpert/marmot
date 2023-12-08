@@ -105,6 +105,14 @@ sequence number of shard 1 is multiple of 128 a snapshot will be taken and uploa
 will be saved in `OBJ_<stream-prefix>-snapshot-store`. Statistically due to even distribution of hashes among shards
 everytime shard 1 hit max snapshot entries, rest of the shards will have almost same number of new entries.
 
+| Component | Description |
+|-----------|-------------|
+| `ReplicationLog.MaxEntries` | A configuration value that specifies the maximum number of entries that can be stored in the replication log. Determines the total number of entries that can be stored across all shards.|
+| `r.shards` | The number of shards in the replication system. Each shard handles a portion of the data. | 
+| `snapshotEntries` | Calculated as `ReplicationLog.MaxEntries / r.shards`. Determine the frequency of snapshot saving. A snapshot is saved every `snapshotEntries` number of entries for the shard 1. |
+
+The condition if snapshotEntries != 0 && seq%snapshotEntries == 0 && shardID == 1 checks if the current sequence number (seq) is a multiple of snapshotEntries and if the current shard is the snapshot shard. If both conditions are true, a snapshot is saved.
+
 Once it has been decided that system wants to save snapshot, a temporary path is created where we used awesome feature
 of SQLite called `VACUUM INTO <PATH>`. Where SQLite optimizes the DB, and gives us a compacted snapshot of database.
 After which Marmot removes all the hooks, and triggers from the snapshot, and re-VACUUM packs the database for upload.
