@@ -129,6 +129,40 @@ Once snapshot has been copied over, Marmot installs same triggers, and change lo
 processing logs applying them all on the snapshot. This means while Marmot is restoring the DB it's quite
 possible that you might have an outdated copy of database until the logs are fully applied.
 
+```mermaid
+sequenceDiagram
+    participant Marmot1 as Marmot 1
+    participant logstream as logstream
+    participant Marmot2 as Marmot 2
+
+    Marmot1->>logstream: Replication (seq:1)
+
+    logstream->>Marmot2: Replication (seq:1)
+
+    Marmot1->>logstream: Replication continues (seq:2)
+
+    logstream->>Marmot2: Replication continues (seq:2)
+
+    Note over Marmot2: Marmot Process 2 goes down for a long period of time
+
+    Marmot1->>logstream: ......
+
+    Marmot1->>Marmot1: Save snapshot (seq:2000)
+
+    Marmot1->>logstream: Replication continues (seq:2001)
+
+    Marmot1->>logstream: Replication continues (seq:2002)
+
+    Note over Marmot2: Marmot Process 2 restarts
+
+    Marmot2->>Marmot2: First sequence number of logstream (seq:978) > saved sequence number (seq:2)?
+    alt Yes
+        Marmot2->>Marmot2: Restore snapshot with seq: 2000 and pick up changes from 2001
+    else No
+        Marmot2->>Marmot2: Pick up changes from the saved sequence number
+    end
+  ```
+
 ## Monitoring
 
 ### Prometheus Metrics
