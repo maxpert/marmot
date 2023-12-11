@@ -2,8 +2,10 @@ package main_test
 
 import (
 	"database/sql"
+	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -19,9 +21,25 @@ func TestMarmot(t *testing.T) {
 }
 
 func cleanup() {
-	os.RemoveAll("/tmp/marmot-1-*")
-	os.RemoveAll("/tmp/marmot-2-*")
-	os.RemoveAll("/tmp/marmot-3-*")
+	patterns := []string{
+		"/tmp/marmot-1*",
+		"/tmp/marmot-2*",
+		"/tmp/marmot-3*",
+	}
+
+	for _, pattern := range patterns {
+		files, err := filepath.Glob(pattern)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		for _, file := range files {
+			err := os.RemoveAll(file)
+			if err != nil {
+				log.Fatal(err)
+			}
+		}
+	}
 	os.RemoveAll("/tmp/nats")
 }
 
@@ -34,12 +52,12 @@ func startCluster() (*exec.Cmd, *exec.Cmd, *exec.Cmd) {
 	createDB("/tmp/marmot-3.db")
 
 	node1 := startNode("examples/node-1-config.toml", "localhost:4221", "nats://localhost:4222/,nats://localhost:4223/")
-	time.Sleep(time.Second)
 
 	node2 := startNode("examples/node-2-config.toml", "localhost:4222", "nats://localhost:4221/,nats://localhost:4223/")
-	time.Sleep(time.Second)
 
 	node3 := startNode("examples/node-3-config.toml", "localhost:4223", "nats://localhost:4221/,nats://localhost:4222/")
+
+	time.Sleep(time.Second * 10)
 
 	return node1, node2, node3
 }
@@ -98,7 +116,11 @@ func createDB(dbFile string) {
 }
 
 func startNode(config, addr, peers string) *exec.Cmd {
-	cmd := exec.Command("go", "run", "marmot", "-config", config, "-cluster-addr", addr, "-cluster-peers", peers)
+	cmd := exec.Command("marmot", "-config", config, "-cluster-addr", addr, "-cluster-peers", peers)
+	if wd, err := os.Getwd(); err == nil {
+		wd = wd[:len(wd)-len("/tests/e2e")]
+		cmd.Dir = wd
+	}
 	err := cmd.Start()
 	Expect(err).To(BeNil())
 	return cmd
