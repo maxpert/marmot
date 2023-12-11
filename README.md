@@ -175,6 +175,12 @@ For more details and internal workings of marmot [go to these docs](https://maxp
  - For FAQs visit [this page](https://maxpert.github.io/marmot/intro#faq)
  - For community visit our [discord](https://discord.gg/AWUwY66XsE) or discussions on GitHub
 
+## E2E Test Suite
+
+```
+ginkgo tests/e2e
+```
+
 ## Our sponsor
 
 Last but not least we would like to thank our sponsors who have been supporting development of this project.
