@@ -278,9 +278,11 @@ func (conn *SqliteStreamDB) watchChanges(watcher *fsnotify.Watcher, path string)
 				}
 
 				if ev.Op != fsnotify.Chmod {
+					log.Debug().Int("change", int(ev.Op)).Msg("Change detected")
 					conn.publishChangeLog()
 				}
 			case <-changeLogTicker.Channel():
+				log.Debug().Dur("timeout", tickerDur).Msg("Change polling timeout")
 				conn.publishChangeLog()
 			}
 
