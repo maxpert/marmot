@@ -2,28 +2,6 @@
 
 There are multiple components in Marmot that make it work. Let's look at them one by one: 
 
-```mermaid
-sequenceDiagram
-    main->>+main: Parse flag
-    main->>+main: Load cfg
-    main->>+db: OpenStreamDB
-    main->>+snapshot: NewSnapshotStorage
-    main->>+logstream: NewReplicator
-    onTableChanged->>+db: Register 
-    onChangeEvent->>+logstream: Register  
-    opt
-      main->>+snapshot: RestoreSnapshot
-    end
-    loop
-        onTableChanged->>+logstream: Publish 
-        onChangeEvent->>+db: Replicate 
-    end   
-    loop
-        main->>+db: CleanupChangeLogs
-        main->>+snapshot: SaveSnapshot
-    end
-        main->>main: Shutdown
-```
 
 ## Triggers and data capture
 
@@ -81,10 +59,6 @@ name to value.
 > There is alot of optimization that can be done to this payload overall, in future using
 > ProtoBuf or more optimized serialization format is absolutely an open option.
 
-### Changelog Cleanup
-Marmot performs periodic cleanup of change logs that were created before a specified time (default: 5 seconds). 
-It iterates over the watched tables, deletes entries from their respective meta tables where the state is "Published" and the creation time is earlier than the specified time.
-
 ## Snapshotting
 
 In a normal distributed system it's pretty typical for nodes to go down for really long time. In that particular
@@ -92,8 +66,11 @@ case a node coming back up can be lagging so far behind that `max-log-entries` m
 fully play all logs and restore the state of database. In that case it required that a node restores a
 snapshot and apply current log entries to be fully up-to-date.
 
-Marmot supports taking snapshot and being able to fully restore it via
-[NATS Object Storage](https://docs.nats.io/using-nats/developer/develop_jetstream/object), S3 (and compatible APIs including BlackBlaze and Minio), Azure Blob, and SFTP.
+As of `v0.6.0+` Marmot supports taking snapshot and being able to fully restore it via
+[NATS Object Storage](https://docs.nats.io/using-nats/developer/develop_jetstream/object).
+
+ > In future Marmot plans to support more storage mechanisms like S3 (and compatible APIs including BlackBlaze
+ > and Minio), Azure Blob, and SFTP.
 
 ### Saving Snapshot
 Everytime a node publishes a new change log to NATs, it saves sequence number of the entry in JetStream. The saved
@@ -104,14 +81,6 @@ of `shards` e.g. `max-log-entries` of 1024 and total 8 shards will result in 128
 sequence number of shard 1 is multiple of 128 a snapshot will be taken and uploaded to NATS Object. The snapshot
 will be saved in `OBJ_<stream-prefix>-snapshot-store`. Statistically due to even distribution of hashes among shards
 everytime shard 1 hit max snapshot entries, rest of the shards will have almost same number of new entries.
-
-| Component | Description |
-|-----------|-------------|
-| `ReplicationLog.MaxEntries` | A configuration value that specifies the maximum number of entries that can be stored in the replication log. Determines the total number of entries that can be stored across all shards.|
-| `r.shards` | The number of shards in the replication system. Each shard handles a portion of the data. | 
-| `snapshotEntries` | Calculated as `ReplicationLog.MaxEntries / r.shards`. Determine the frequency of snapshot saving. A snapshot is saved every `snapshotEntries` number of entries for the shard 1. |
-
-The condition if snapshotEntries != 0 && seq%snapshotEntries == 0 && shardID == 1 checks if the current sequence number (seq) is a multiple of snapshotEntries and if the current shard is the snapshot shard. If both conditions are true, a snapshot is saved.
 
 Once it has been decided that system wants to save snapshot, a temporary path is created where we used awesome feature
 of SQLite called `VACUUM INTO <PATH>`. Where SQLite optimizes the DB, and gives us a compacted snapshot of database.
@@ -136,60 +105,3 @@ the files.
 Once snapshot has been copied over, Marmot installs same triggers, and change log tables again in DB, and starts
 processing logs applying them all on the snapshot. This means while Marmot is restoring the DB it's quite
 possible that you might have an outdated copy of database until the logs are fully applied.
-
-```mermaid
-sequenceDiagram
-    participant Marmot1 as Marmot 1
-    participant logstream as logstream
-    participant Marmot2 as Marmot 2
-
-    Marmot1->>logstream: Replication (seq:1)
-
-    logstream->>Marmot2: Replication (seq:1)
-
-    Marmot1->>logstream: Replication continues (seq:2)
-
-    logstream->>Marmot2: Replication continues (seq:2)
-
-    Note over Marmot2: Marmot Process 2 goes down for a long period of time
-
-    Marmot1->>logstream: ......
-
-    Marmot1->>Marmot1: Save snapshot (seq:2000)
-
-    Marmot1->>logstream: Replication continues (seq:2001)
-
-    Marmot1->>logstream: Replication continues (seq:2002)
-
-    Note over Marmot2: Marmot Process 2 restarts
-
-    Marmot2->>Marmot2: First sequence number of logstream (seq:978) > saved sequence number (seq:2)?
-    alt Yes
-        Marmot2->>Marmot2: Restore snapshot with seq: 2000 and pick up changes from 2001
-    else No
-        Marmot2->>Marmot2: Pick up changes from the saved sequence number
-    end
-  ```
-
-## Monitoring
-
-### Prometheus Metrics
-| Field Name | Type | Description |
-|------------|------|-------------|
-| published | Counter | Number of rows published |
-| pending_publish | Gauge | Number of rows pending publishing |
-| count_changes | Histogram | Latency of counting changes in microseconds |
-| scan_changes | Histogram | Latency of scanning change rows in the database |
-
-### Error Scenarios
-
-| Scenario | Description |
-| --- | --- |
-| Configuration Load Failure | If there's an error loading the configuration (`cfg.Load(*cfg.ConfigPathFlag)`), Marmot will panic and exit. |
-| Database Open Failure | If the program fails to open the database (`db.OpenStreamDB(cfg.Config.DBPath)`), it logs an error and returns, which will cause Marmot to exit. |
-| Cleanup Change Data Capture Pipeline Failure | If the cleanup flag (`*cfg.CleanupFlag`) is set and there's an error during the cleanup process (`streamDB.RemoveCDC(true)`), Marmot will panic and exit. |
-| Snapshot Storage Initialization Failure | If there's an error initializing the snapshot storage (`snapshot.NewSnapshotStorage()`), Marmot will panic and exit. |
-| Replicator Initialization Failure | If there's an error initializing the replicators (`logstream.NewReplicator(snapshot.NewNatsDBSnapshot(streamDB, snpStore))`), Marmot will panic and exit. |
-| Snapshot Restoration Failure | If snapshot and replication are enabled (`cfg.Config.Snapshot.Enable && cfg.Config.Replicate`) and there's an error restoring the snapshot (`replicator.RestoreSnapshot()`), Marmot will panic and exit. |
-| Table Listing Failure | If there's an error listing all tables (`db.GetAllDBTables(cfg.Config.DBPath)`), it logs an error and returns, which will cause Marmot to exit. |
-| Change Data Capture Pipeline Installation Failure | If there's an error installing the change data capture pipeline (`streamDB.InstallCDC(tableNames)`), it logs an error and returns, which will cause Marmot to exit. |
