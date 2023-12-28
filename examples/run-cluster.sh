@@ -34,11 +34,11 @@ cleanup() {
 
 trap cleanup EXIT
 rm -rf /tmp/nats
-./marmot -config examples/node-1-config.toml -cluster-addr localhost:4221 -cluster-peers 'nats://localhost:4222/' &
+./marmot -config examples/node-1-config.toml -cluster-addr localhost:4221 -cluster-peers 'nats://localhost:4222/,nats://localhost:4223/' &
 job1=$!
 
 sleep 1
-./marmot -config examples/node-2-config.toml -cluster-addr localhost:4222 -cluster-peers 'nats://localhost:4221/' &
+./marmot -config examples/node-2-config.toml -cluster-addr localhost:4222 -cluster-peers 'nats://localhost:4221/,nats://localhost:4223/' &
 job2=$!
 
 sleep 1
