@@ -270,6 +270,7 @@ func (conn *SqliteStreamDB) watchChanges(watcher *fsnotify.Watcher, path string)
 	for {
 		changeLogTicker.Reset()
 
+		changesPublished := false
 		err := conn.WithReadTx(func(_tx *sql.Tx) error {
 			select {
 			case ev, ok := <-watcher.Events:
@@ -277,13 +278,15 @@ func (conn *SqliteStreamDB) watchChanges(watcher *fsnotify.Watcher, path string)
 					return ErrEndOfWatch
 				}
 
+				log.Debug().Int("change", int(ev.Op)).Msg("Change detected")
 				if ev.Op != fsnotify.Chmod {
-					log.Debug().Int("change", int(ev.Op)).Msg("Change detected")
 					conn.publishChangeLog()
+					changesPublished = true
 				}
 			case <-changeLogTicker.Channel():
 				log.Debug().Dur("timeout", tickerDur).Msg("Change polling timeout")
 				conn.publishChangeLog()
+				changesPublished = true
 			}
 
 			return nil
@@ -307,6 +310,8 @@ func (conn *SqliteStreamDB) watchChanges(watcher *fsnotify.Watcher, path string)
 		if errWal != nil {
 			errWal = watcher.Add(walPath)
 		}
+
+		log.Debug().Bool("changes", changesPublished).Msg("Changes published")
 	}
 }
 
