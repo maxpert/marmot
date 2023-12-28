@@ -263,6 +263,7 @@ func (conn *SqliteStreamDB) filterChangesTo(changed chan fsnotify.Event, watcher
 			}
 
 			if ev.Op == fsnotify.Chmod {
+				time.Sleep(1 * time.Millisecond)
 				continue
 			}
 
@@ -285,7 +286,7 @@ func (conn *SqliteStreamDB) watchChanges(watcher *fsnotify.Watcher, path string)
 
 	// Publish change logs for any residual change logs before starting watcher
 	conn.publishChangeLog()
-	conn.filterChangesTo(dbChanged, watcher)
+	go conn.filterChangesTo(dbChanged, watcher)
 
 	for {
 		changeLogTicker.Reset()
