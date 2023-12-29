@@ -263,7 +263,6 @@ func (conn *SqliteStreamDB) filterChangesTo(changed chan fsnotify.Event, watcher
 			}
 
 			if ev.Op == fsnotify.Chmod {
-				time.Sleep(1 * time.Millisecond)
 				continue
 			}
 
