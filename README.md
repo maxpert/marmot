@@ -81,6 +81,8 @@ constraint only one of the writer will be able to get its changes published firs
 its own changes to database) the **last writer** will always win. This means there is NO serializability guarantee of a transaction 
 spanning multiple tables. This is a design choice, in order to avoid any sort of global locking, and performance. 
 
+## Stargazers over time
+[![Stargazers over time](https://starchart.cc/maxpert/marmot.svg?variant=adaptive)](https://starchart.cc/maxpert/marmot)
 
 ## Limitations
 Right now there are a few limitations on current solution:
