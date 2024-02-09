@@ -4,6 +4,9 @@ import (
 	"context"
 	"flag"
 	"io"
+	"net/http"
+	"net/http/pprof"
+	_ "net/http/pprof"
 	"os"
 	"time"
 
@@ -22,7 +25,6 @@ import (
 
 func main() {
 	flag.Parse()
-
 	err := cfg.Load(*cfg.ConfigPathFlag)
 	if err != nil {
 		panic(err)
@@ -42,6 +44,22 @@ func main() {
 		log.Logger = gLog.Level(zerolog.DebugLevel)
 	} else {
 		log.Logger = gLog.Level(zerolog.InfoLevel)
+	}
+
+	if *cfg.ProfServer != "" {
+		go func() {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/debug/pprof/", pprof.Index)
+			mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+			mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+			mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+			mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+
+			err := http.ListenAndServe(*cfg.ProfServer, mux)
+			if err != nil {
+				log.Error().Err(err).Msg("unable to bind profiler server")
+			}
+		}()
 	}
 
 	log.Debug().Msg("Initializing telemetry")

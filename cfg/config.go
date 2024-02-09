@@ -118,6 +118,7 @@ var SaveSnapshotFlag = flag.Bool("save-snapshot", false, "Only take snapshot and
 var ClusterAddrFlag = flag.String("cluster-addr", "", "Cluster listening address")
 var ClusterPeersFlag = flag.String("cluster-peers", "", "Comma separated list of clusters")
 var LeafServerFlag = flag.String("leaf-servers", "", "Comma separated list of leaf servers")
+var ProfServer = flag.String("pprof", "", "PProf listening address")
 
 var DataRootDir = os.TempDir()
 var Config = &Configuration{
