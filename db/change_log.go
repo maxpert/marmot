@@ -253,6 +253,24 @@ func (conn *SqliteStreamDB) initTriggers(tableName string) error {
 	return nil
 }
 
+func (conn *SqliteStreamDB) filterChangesTo(changed chan fsnotify.Event, watcher *fsnotify.Watcher) {
+	for {
+		select {
+		case ev, ok := <-watcher.Events:
+			if !ok {
+				close(changed)
+				return
+			}
+
+			if ev.Op == fsnotify.Chmod {
+				continue
+			}
+
+			changed <- ev
+		}
+	}
+}
+
 func (conn *SqliteStreamDB) watchChanges(watcher *fsnotify.Watcher, path string) {
 	shmPath := path + "-shm"
 	walPath := path + "-wal"
@@ -260,27 +278,29 @@ func (conn *SqliteStreamDB) watchChanges(watcher *fsnotify.Watcher, path string)
 	errDB := watcher.Add(path)
 	errShm := watcher.Add(shmPath)
 	errWal := watcher.Add(walPath)
+	dbChanged := make(chan fsnotify.Event)
 
 	tickerDur := time.Duration(cfg.Config.PollingInterval) * time.Millisecond
 	changeLogTicker := utils.NewTimeoutPublisher(tickerDur)
 
 	// Publish change logs for any residual change logs before starting watcher
 	conn.publishChangeLog()
+	go conn.filterChangesTo(dbChanged, watcher)
 
 	for {
 		changeLogTicker.Reset()
 
 		err := conn.WithReadTx(func(_tx *sql.Tx) error {
 			select {
-			case ev, ok := <-watcher.Events:
+			case ev, ok := <-dbChanged:
 				if !ok {
 					return ErrEndOfWatch
 				}
 
-				if ev.Op != fsnotify.Chmod {
-					conn.publishChangeLog()
-				}
+				log.Debug().Int("change", int(ev.Op)).Msg("Change detected")
+				conn.publishChangeLog()
 			case <-changeLogTicker.Channel():
+				log.Debug().Dur("timeout", tickerDur).Msg("Change polling timeout")
 				conn.publishChangeLog()
 			}
 
