@@ -29,7 +29,7 @@ BEGIN
         state
     ) VALUES(
         {{range $col := $.Columns}}
-            {{$read_target}}.{{$col.Name}},
+            {{$read_target}}.'{{$col.Name}}',
         {{end}}
         '{{$trigger}}',
         CAST((strftime('%s','now') || substr(strftime('%f','now'),4)) as INT),

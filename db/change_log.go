@@ -592,7 +592,7 @@ func replicateUpsert(tx *goqu.TxDatabase, event *ChangeLogEvent, _ map[string]an
 	columnNames := make([]string, 0, len(event.Row))
 	columnValues := make([]any, 0, len(event.Row))
 	for k, v := range event.Row {
-		columnNames = append(columnNames, k)
+		columnNames = append(columnNames, "'"+k+"'")
 		columnValues = append(columnValues, v)
 	}
 
