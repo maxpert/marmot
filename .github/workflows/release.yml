@@ -74,7 +74,7 @@ jobs:
           tar -czvf marmot-${{ env.VERSION }}-${{ env.GOOS }}-${{ env.GOARCH }}${{ env.GOARM }}${{ env.SUFFIX }}.tar.gz marmot config.toml LICENSE README.md examples/*
 
       - name: Upload binary artifact
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@v4
         with:
           name: marmot-${{ env.VERSION }}-${{ env.GOOS }}-${{ env.GOARCH }}${{ env.GOARM }}${{ env.SUFFIX }}.tar.gz
           path: marmot-${{ env.VERSION }}-${{ env.GOOS }}-${{ env.GOARCH }}${{ env.GOARM }}${{ env.SUFFIX }}.tar.gz
@@ -127,7 +127,7 @@ jobs:
           tar -czvf marmot-${{ env.VERSION }}-${{ env.GOOS }}-${{ env.GOARCH }}${{ env.SUFFIX }}.tar.gz marmot config.toml LICENSE README.md examples/*
 
       - name: Upload binary artifact
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@v4
         with:
           name: marmot-${{ env.VERSION }}-${{ env.GOOS }}-${{ env.GOARCH }}${{ env.SUFFIX }}.tar.gz
           path: marmot-${{ env.VERSION }}-${{ env.GOOS }}-${{ env.GOARCH }}${{ env.SUFFIX }}.tar.gz
