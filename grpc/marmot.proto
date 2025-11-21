@@ -59,6 +59,7 @@ enum NodeStatus {
   ALIVE = 0;
   SUSPECT = 1;
   DEAD = 2;
+  JOINING = 3;  // Node is catching up, receives gossip but not replication
 }
 
 message JoinRequest {
@@ -161,6 +162,7 @@ message Row {
 message StreamRequest {
   uint64 from_txn_id = 1;
   uint64 requesting_node_id = 2;
+  string database = 3;  // Optional: filter by database, empty = all
 }
 
 message ChangeEvent {
@@ -179,6 +181,13 @@ message SnapshotInfoResponse {
   int64 snapshot_size_bytes = 2;
   int32 total_chunks = 3;
   HLC timestamp = 4;
+  repeated DatabaseFileInfo databases = 5;
+}
+
+message DatabaseFileInfo {
+  string name = 1;        // Database name (e.g., "marmot", "__marmot_system")
+  string filename = 2;    // Relative path
+  int64 size_bytes = 3;
 }
 
 message SnapshotRequest {
@@ -190,4 +199,6 @@ message SnapshotChunk {
   int32 total_chunks = 2;
   bytes data = 3;
   string checksum = 4;
+  string filename = 5;      // Which database file this chunk belongs to
+  bool is_last_for_file = 6; // True if this is the last chunk for this file
 }

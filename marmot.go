@@ -105,6 +105,7 @@ func main() {
 		clock,
 	)
 	grpcServer.SetReplicationHandler(replicationHandler)
+	grpcServer.SetDatabaseManager(dbMgr)
 
 	log.Info().Msg("Database Manager and replication handlers initialized")
 

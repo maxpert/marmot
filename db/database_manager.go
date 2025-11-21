@@ -346,3 +346,111 @@ func MigrateFromLegacy(oldDBPath, newDataDir string, nodeID uint64, clock *hlc.C
 	log.Info().Msg("Legacy database migration completed")
 	return nil
 }
+
+// SnapshotInfo contains information about a database file for snapshot transfer
+type SnapshotInfo struct {
+	Name     string // Database name (e.g., "marmot", "__marmot_system")
+	Filename string // Relative path from data directory
+	FullPath string // Absolute path
+	Size     int64  // File size in bytes
+}
+
+// TakeSnapshot checkpoints all databases and returns their file information
+// This should be called before streaming snapshot data to ensure consistency
+func (dm *DatabaseManager) TakeSnapshot() ([]SnapshotInfo, uint64, error) {
+	dm.mu.RLock()
+	defer dm.mu.RUnlock()
+
+	var snapshots []SnapshotInfo
+
+	// Checkpoint and get info for system database
+	systemDBPath := filepath.Join(dm.dataDir, SystemDatabaseName+".db")
+	if err := dm.checkpointDatabase(dm.systemDB); err != nil {
+		return nil, 0, fmt.Errorf("failed to checkpoint system database: %w", err)
+	}
+
+	info, err := os.Stat(systemDBPath)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to stat system database: %w", err)
+	}
+
+	snapshots = append(snapshots, SnapshotInfo{
+		Name:     SystemDatabaseName,
+		Filename: SystemDatabaseName + ".db",
+		FullPath: systemDBPath,
+		Size:     info.Size(),
+	})
+
+	// Checkpoint and get info for all user databases
+	for name, db := range dm.databases {
+		if err := dm.checkpointDatabase(db); err != nil {
+			log.Warn().Err(err).Str("database", name).Msg("Failed to checkpoint database")
+			continue
+		}
+
+		dbPath := filepath.Join(dm.dataDir, "databases", name+".db")
+		info, err := os.Stat(dbPath)
+		if err != nil {
+			log.Warn().Err(err).Str("database", name).Msg("Failed to stat database")
+			continue
+		}
+
+		snapshots = append(snapshots, SnapshotInfo{
+			Name:     name,
+			Filename: filepath.Join("databases", name+".db"),
+			FullPath: dbPath,
+			Size:     info.Size(),
+		})
+	}
+
+	// Get max committed transaction ID
+	maxTxnID, err := dm.GetMaxCommittedTxnID()
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to get max txn id: %w", err)
+	}
+
+	log.Info().
+		Int("databases", len(snapshots)).
+		Uint64("max_txn_id", maxTxnID).
+		Msg("Snapshot prepared")
+
+	return snapshots, maxTxnID, nil
+}
+
+// checkpointDatabase forces a WAL checkpoint to ensure data is in the main database file
+func (dm *DatabaseManager) checkpointDatabase(db *MVCCDatabase) error {
+	_, err := db.GetDB().Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+	return err
+}
+
+// GetMaxCommittedTxnID returns the highest committed transaction ID across all databases
+func (dm *DatabaseManager) GetMaxCommittedTxnID() (uint64, error) {
+	dm.mu.RLock()
+	defer dm.mu.RUnlock()
+
+	var maxTxnID uint64
+
+	// Check all user databases
+	for name, db := range dm.databases {
+		var dbMax uint64
+		err := db.GetDB().QueryRow(`
+			SELECT COALESCE(MAX(txn_id), 0)
+			FROM __marmot__txn_records
+			WHERE status = 'COMMITTED'
+		`).Scan(&dbMax)
+		if err != nil {
+			log.Warn().Err(err).Str("database", name).Msg("Failed to get max txn_id")
+			continue
+		}
+		if dbMax > maxTxnID {
+			maxTxnID = dbMax
+		}
+	}
+
+	return maxTxnID, nil
+}
+
+// GetDataDir returns the data directory path
+func (dm *DatabaseManager) GetDataDir() string {
+	return dm.dataDir
+}

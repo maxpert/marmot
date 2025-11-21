@@ -248,3 +248,49 @@ func (nr *NodeRegistry) CountAlive() int {
 
 	return count
 }
+
+// GetReplicationEligible returns nodes eligible for replication (ALIVE only, excludes JOINING)
+// JOINING nodes are catching up and should not receive write replication yet
+func (nr *NodeRegistry) GetReplicationEligible() []*NodeState {
+	nr.mu.RLock()
+	defer nr.mu.RUnlock()
+
+	nodes := make([]*NodeState, 0)
+	for _, node := range nr.nodes {
+		// Only ALIVE nodes participate in replication
+		// JOINING nodes are syncing and shouldn't receive writes
+		if node.Status == NodeStatus_ALIVE {
+			nodeCopy := &NodeState{
+				NodeId:      node.NodeId,
+				Address:     node.Address,
+				Status:      node.Status,
+				Incarnation: node.Incarnation,
+			}
+			nodes = append(nodes, nodeCopy)
+		}
+	}
+
+	return nodes
+}
+
+// MarkJoining marks a node as joining (catching up)
+func (nr *NodeRegistry) MarkJoining(nodeID uint64) {
+	nr.mu.Lock()
+	defer nr.mu.Unlock()
+
+	if node, exists := nr.nodes[nodeID]; exists {
+		node.Status = NodeStatus_JOINING
+		log.Info().Uint64("node_id", nodeID).Msg("Node marked as joining (catching up)")
+	}
+}
+
+// MarkAlive marks a node as alive (fully synced)
+func (nr *NodeRegistry) MarkAlive(nodeID uint64) {
+	nr.mu.Lock()
+	defer nr.mu.Unlock()
+
+	if node, exists := nr.nodes[nodeID]; exists {
+		node.Status = NodeStatus_ALIVE
+		log.Info().Uint64("node_id", nodeID).Msg("Node marked as alive")
+	}
+}

@@ -2,15 +2,24 @@ package grpc
 
 import (
 	"context"
+	"crypto/md5"
 	"fmt"
+	"io"
 	"net"
+	"os"
 	"sync"
 	"time"
 
+	"github.com/maxpert/marmot/db"
 	"github.com/rs/zerolog/log"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/reflection"
+)
+
+const (
+	// SnapshotChunkSize is the size of each snapshot chunk (4MB)
+	SnapshotChunkSize = 4 * 1024 * 1024
 )
 
 // Server implements the gRPC server for Marmot
@@ -28,6 +37,7 @@ type Server struct {
 	registry           *NodeRegistry
 	hasher             *ConsistentHash // NOTE: Not used for full database replication. Reserved for future multi-DB partitioning.
 	replicationHandler *ReplicationHandler
+	dbManager          *db.DatabaseManager
 
 	mu sync.RWMutex
 }
@@ -201,30 +211,216 @@ func (s *Server) Read(ctx context.Context, req *ReadRequest) (*ReadResponse, err
 }
 
 // StreamChanges handles change streaming for catch-up
-// Future Phase: This will stream transaction logs to enable fast catch-up for recovering nodes.
-// Useful for bringing new replicas up to speed or recovering from network partitions.
+// Streams committed transactions from a given txn_id for delta sync
 func (s *Server) StreamChanges(req *StreamRequest, stream MarmotService_StreamChangesServer) error {
-	log.Warn().Msg("StreamChanges not yet implemented - will support transaction log streaming")
+	s.mu.RLock()
+	dbManager := s.dbManager
+	s.mu.RUnlock()
+
+	if dbManager == nil {
+		return fmt.Errorf("database manager not initialized")
+	}
+
+	log.Info().
+		Uint64("from_txn_id", req.FromTxnId).
+		Uint64("requesting_node", req.RequestingNodeId).
+		Str("database", req.Database).
+		Msg("Starting change stream")
+
+	// Get databases to stream from
+	var databases []string
+	if req.Database != "" {
+		databases = []string{req.Database}
+	} else {
+		databases = dbManager.ListDatabases()
+	}
+
+	// Stream changes from each database
+	for _, dbName := range databases {
+		mdb, err := dbManager.GetDatabase(dbName)
+		if err != nil {
+			log.Warn().Err(err).Str("database", dbName).Msg("Failed to get database for streaming")
+			continue
+		}
+
+		// Query committed transactions after from_txn_id
+		rows, err := mdb.GetDB().Query(`
+			SELECT txn_id, commit_ts_wall, commit_ts_logical
+			FROM __marmot__txn_records
+			WHERE status = 'COMMITTED' AND txn_id > ?
+			ORDER BY txn_id
+		`, req.FromTxnId)
+		if err != nil {
+			log.Warn().Err(err).Str("database", dbName).Msg("Failed to query transactions")
+			continue
+		}
+
+		for rows.Next() {
+			var txnID uint64
+			var commitWall int64
+			var commitLogical int32
+
+			if err := rows.Scan(&txnID, &commitWall, &commitLogical); err != nil {
+				log.Warn().Err(err).Msg("Failed to scan transaction")
+				continue
+			}
+
+			event := &ChangeEvent{
+				TxnId: txnID,
+				Timestamp: &HLC{
+					WallTime: commitWall,
+					Logical:  commitLogical,
+				},
+				// Note: Full statement details would require storing them in txn_records
+				// For now, we just signal that a transaction exists
+				Statements: []*Statement{},
+			}
+
+			if err := stream.Send(event); err != nil {
+				rows.Close()
+				return fmt.Errorf("failed to send change event: %w", err)
+			}
+		}
+		rows.Close()
+	}
+
+	log.Info().
+		Uint64("from_txn_id", req.FromTxnId).
+		Msg("Change stream completed")
+
 	return nil
 }
 
 // =======================
-// SNAPSHOT METHODS (Stubs for now)
+// SNAPSHOT METHODS
 // =======================
 
-// GetSnapshotInfo returns snapshot metadata
-// Future Phase: Returns metadata about available snapshots for bulk node bootstrap.
-// Enables new nodes to request full database snapshots instead of replaying all transactions.
+// GetSnapshotInfo returns snapshot metadata for bootstrap
 func (s *Server) GetSnapshotInfo(ctx context.Context, req *SnapshotInfoRequest) (*SnapshotInfoResponse, error) {
-	log.Warn().Msg("GetSnapshotInfo not yet implemented - will support snapshot metadata queries")
-	return &SnapshotInfoResponse{}, nil
+	s.mu.RLock()
+	dbManager := s.dbManager
+	s.mu.RUnlock()
+
+	if dbManager == nil {
+		return nil, fmt.Errorf("database manager not initialized")
+	}
+
+	log.Info().
+		Uint64("requesting_node", req.RequestingNodeId).
+		Msg("Snapshot info requested")
+
+	// Take snapshot (checkpoints all databases)
+	snapshots, maxTxnID, err := dbManager.TakeSnapshot()
+	if err != nil {
+		return nil, fmt.Errorf("failed to take snapshot: %w", err)
+	}
+
+	// Calculate total size and chunks
+	var totalSize int64
+	var dbInfos []*DatabaseFileInfo
+	for _, snap := range snapshots {
+		totalSize += snap.Size
+		dbInfos = append(dbInfos, &DatabaseFileInfo{
+			Name:      snap.Name,
+			Filename:  snap.Filename,
+			SizeBytes: snap.Size,
+		})
+	}
+
+	totalChunks := int32((totalSize + SnapshotChunkSize - 1) / SnapshotChunkSize)
+
+	return &SnapshotInfoResponse{
+		SnapshotTxnId:     maxTxnID,
+		SnapshotSizeBytes: totalSize,
+		TotalChunks:       totalChunks,
+		Databases:         dbInfos,
+	}, nil
 }
 
-// StreamSnapshot handles snapshot chunk streaming
-// Future Phase: Streams database snapshot chunks to enable fast node bootstrap.
-// Complements GetSnapshotInfo by providing the actual snapshot data transfer.
+// StreamSnapshot streams snapshot chunks to requesting node
 func (s *Server) StreamSnapshot(req *SnapshotRequest, stream MarmotService_StreamSnapshotServer) error {
-	log.Warn().Msg("StreamSnapshot not yet implemented - will support snapshot data streaming")
+	s.mu.RLock()
+	dbManager := s.dbManager
+	s.mu.RUnlock()
+
+	if dbManager == nil {
+		return fmt.Errorf("database manager not initialized")
+	}
+
+	log.Info().
+		Uint64("requesting_node", req.RequestingNodeId).
+		Msg("Starting snapshot stream")
+
+	// Take snapshot
+	snapshots, _, err := dbManager.TakeSnapshot()
+	if err != nil {
+		return fmt.Errorf("failed to take snapshot: %w", err)
+	}
+
+	// Calculate total chunks across all files
+	var totalChunks int32
+	for _, snap := range snapshots {
+		fileChunks := int32((snap.Size + SnapshotChunkSize - 1) / SnapshotChunkSize)
+		if fileChunks == 0 {
+			fileChunks = 1 // At least one chunk for empty files
+		}
+		totalChunks += fileChunks
+	}
+
+	chunkIndex := int32(0)
+
+	// Stream each database file
+	for _, snap := range snapshots {
+		file, err := os.Open(snap.FullPath)
+		if err != nil {
+			return fmt.Errorf("failed to open %s: %w", snap.Filename, err)
+		}
+
+		buf := make([]byte, SnapshotChunkSize)
+		for {
+			n, err := file.Read(buf)
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				file.Close()
+				return fmt.Errorf("failed to read %s: %w", snap.Filename, err)
+			}
+
+			// Calculate checksum
+			checksum := fmt.Sprintf("%x", md5.Sum(buf[:n]))
+
+			// Check if this is the last chunk for this file
+			pos, _ := file.Seek(0, io.SeekCurrent)
+			info, _ := file.Stat()
+			isLastForFile := pos >= info.Size()
+
+			chunk := &SnapshotChunk{
+				ChunkIndex:    chunkIndex,
+				TotalChunks:   totalChunks,
+				Data:          buf[:n],
+				Checksum:      checksum,
+				Filename:      snap.Filename,
+				IsLastForFile: isLastForFile,
+			}
+
+			if err := stream.Send(chunk); err != nil {
+				file.Close()
+				return fmt.Errorf("failed to send chunk: %w", err)
+			}
+
+			chunkIndex++
+		}
+
+		file.Close()
+		log.Debug().Str("file", snap.Filename).Msg("Finished streaming file")
+	}
+
+	log.Info().
+		Uint64("requesting_node", req.RequestingNodeId).
+		Int32("total_chunks", totalChunks).
+		Msg("Snapshot stream completed")
+
 	return nil
 }
 
@@ -248,4 +444,11 @@ func (s *Server) SetReplicationHandler(handler *ReplicationHandler) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.replicationHandler = handler
+}
+
+// SetDatabaseManager sets the database manager for snapshot operations
+func (s *Server) SetDatabaseManager(manager *db.DatabaseManager) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.dbManager = manager
 }
