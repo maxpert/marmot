@@ -30,7 +30,7 @@ func (r *LocalReader) ReadSnapshot(ctx context.Context, nodeID uint64, req *coor
 	}
 
 	// Execute MVCC read
-	columns, rows, err := mvccDB.ExecuteMVCCRead(ctx, req.Query)
+	columns, rows, err := mvccDB.ExecuteMVCCRead(ctx, req.Query, req.Args...)
 	if err != nil {
 		return &coordinator.ReadResponse{
 			Success: false,

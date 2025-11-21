@@ -82,7 +82,26 @@ var (
 // Now uses Vitess sqlparser for production-grade MySQL compatibility
 func ParseStatement(sql string) Statement {
 	// Use Vitess parser as primary
-	return ParseStatementVitess(sql)
+	stmt := ParseStatementVitess(sql)
+	// Normalize SQL for SQLite compatibility
+	stmt.SQL = NormalizeSQLForSQLite(stmt.SQL)
+	return stmt
+}
+
+// NormalizeSQLForSQLite converts MySQL-style SQL to SQLite-compatible SQL
+// This is the central place for all MySQL -> SQLite transformations
+func NormalizeSQLForSQLite(sql string) string {
+	// Convert backslash escapes to SQLite double-quote escapes
+	// MySQL/Vitess uses \' but SQLite uses ''
+	sql = strings.ReplaceAll(sql, `\'`, `''`)
+
+	// Convert backslash-escaped double quotes if any
+	sql = strings.ReplaceAll(sql, `\"`, `"`)
+
+	// Convert backslash-escaped backslashes
+	sql = strings.ReplaceAll(sql, `\\`, `\`)
+
+	return sql
 }
 
 

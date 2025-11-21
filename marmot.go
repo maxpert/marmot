@@ -1,10 +1,12 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/maxpert/marmot/cfg"
@@ -80,6 +82,36 @@ func main() {
 	// Check if we're joining an existing cluster or starting as seed
 	isJoiningCluster := len(cfg.Config.Cluster.SeedNodes) > 0
 
+	// If joining cluster, check if we need to catch up (sync data from peers)
+	if isJoiningCluster {
+		catchUpClient := marmotgrpc.NewCatchUpClient(
+			cfg.Config.NodeID,
+			cfg.Config.DataDir,
+			grpcServer.GetNodeRegistry(),
+			cfg.Config.Cluster.SeedNodes,
+		)
+
+		if catchUpClient.NeedsCatchUp() {
+			log.Info().Msg("Node needs to catch up - downloading snapshot from cluster")
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+			snapshotTxnID, err := catchUpClient.CatchUp(ctx)
+			cancel()
+			if err != nil {
+				log.Fatal().Err(err).Msg("Failed to catch up from cluster")
+				return
+			}
+			log.Info().Uint64("snapshot_txn_id", snapshotTxnID).Msg("Catch-up completed")
+		} else {
+			log.Info().Msg("Node data exists - skipping catch-up")
+		}
+	}
+
+	// Migrate legacy single-database layout if present (marmot.db -> databases/marmot.db)
+	legacyDBPath := filepath.Join(cfg.Config.DataDir, "marmot.db")
+	if err := db.MigrateFromLegacy(legacyDBPath, cfg.Config.DataDir, cfg.Config.NodeID, clock); err != nil {
+		log.Warn().Err(err).Msg("Legacy database migration failed")
+	}
+
 	dbMgr, err := db.NewDatabaseManager(cfg.Config.DataDir, cfg.Config.NodeID, clock)
 	if err != nil {
 		log.Fatal().Err(err).Msg("Failed to initialize Database Manager")
@@ -95,8 +127,6 @@ func main() {
 		} else if imported > 0 {
 			log.Info().Int("count", imported).Msg("Imported existing databases from data directory")
 		}
-	} else {
-		log.Info().Msg("Joining cluster - skipping database import (will sync from peers)")
 	}
 
 	// Get default database for backward compatibility with replication handler

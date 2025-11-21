@@ -89,6 +89,8 @@ func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, qu
 		return h.handleShowCreateTable(session, stmt)
 	case protocol.StatementShowIndexes:
 		return h.handleShowIndexes(session, stmt)
+	case protocol.StatementShowTableStatus:
+		return h.handleShowTableStatus(session, stmt)
 	case protocol.StatementInformationSchema:
 		return h.handleInformationSchema(session, query)
 	}

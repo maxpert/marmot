@@ -340,6 +340,16 @@ func ParseStatementVitess(sql string) Statement {
 						stmt.Database = showBasic.Tbl.Qualifier.String()
 					}
 				}
+			case sqlparser.TableStatus:
+				stmt.Type = StatementShowTableStatus
+				// Extract database name and filter
+				if showBasic.DbName.NotEmpty() {
+					stmt.Database = showBasic.DbName.String()
+				}
+				// Extract table name from LIKE filter if present
+				if showBasic.Filter != nil && showBasic.Filter.Like != "" {
+					stmt.TableName = showBasic.Filter.Like
+				}
 			default:
 				// Other SHOW commands treated as SELECT
 				stmt.Type = StatementSelect

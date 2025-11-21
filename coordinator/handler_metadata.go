@@ -277,6 +277,85 @@ func (h *CoordinatorHandler) handleShowIndexes(session *protocol.ConnectionSessi
 	}, nil
 }
 
+// handleShowTableStatus returns table status information (for DBeaver compatibility)
+func (h *CoordinatorHandler) handleShowTableStatus(session *protocol.ConnectionSession, stmt protocol.Statement) (*protocol.ResultSet, error) {
+	dbName := stmt.Database
+	if dbName == "" {
+		dbName = session.CurrentDatabase
+	}
+
+	if dbName == "" {
+		return nil, fmt.Errorf("no database selected")
+	}
+
+	log.Debug().
+		Str("database", dbName).
+		Str("table", stmt.TableName).
+		Msg("Handling SHOW TABLE STATUS")
+
+	// Build query to get table info
+	query := "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+	if stmt.TableName != "" {
+		query = fmt.Sprintf("SELECT name FROM sqlite_master WHERE type='table' AND name = '%s'", stmt.TableName)
+	}
+
+	resp, err := h.execMetadataQuery(dbName, query)
+	if err != nil {
+		return nil, err
+	}
+
+	var tables [][]interface{}
+	for _, row := range resp.Rows {
+		tableName, _ := row["name"].(string)
+
+		// Return MySQL-compatible table status
+		tables = append(tables, []interface{}{
+			tableName,                // Name
+			"InnoDB",                 // Engine
+			10,                       // Version
+			"Dynamic",                // Row_format
+			0,                        // Rows
+			0,                        // Avg_row_length
+			0,                        // Data_length
+			0,                        // Max_data_length
+			0,                        // Index_length
+			0,                        // Data_free
+			nil,                      // Auto_increment
+			nil,                      // Create_time
+			nil,                      // Update_time
+			nil,                      // Check_time
+			"utf8mb4_general_ci",     // Collation
+			nil,                      // Checksum
+			"",                       // Create_options
+			"",                       // Comment
+		})
+	}
+
+	return &protocol.ResultSet{
+		Columns: []protocol.ColumnDef{
+			{Name: "Name", Type: 0xFD},
+			{Name: "Engine", Type: 0xFD},
+			{Name: "Version", Type: 0x03},
+			{Name: "Row_format", Type: 0xFD},
+			{Name: "Rows", Type: 0x08},
+			{Name: "Avg_row_length", Type: 0x08},
+			{Name: "Data_length", Type: 0x08},
+			{Name: "Max_data_length", Type: 0x08},
+			{Name: "Index_length", Type: 0x08},
+			{Name: "Data_free", Type: 0x08},
+			{Name: "Auto_increment", Type: 0x08},
+			{Name: "Create_time", Type: 0x0C},
+			{Name: "Update_time", Type: 0x0C},
+			{Name: "Check_time", Type: 0x0C},
+			{Name: "Collation", Type: 0xFD},
+			{Name: "Checksum", Type: 0x08},
+			{Name: "Create_options", Type: 0xFD},
+			{Name: "Comment", Type: 0xFD},
+		},
+		Rows: tables,
+	}, nil
+}
+
 // handleInformationSchema handles INFORMATION_SCHEMA queries
 func (h *CoordinatorHandler) handleInformationSchema(session *protocol.ConnectionSession, query string) (*protocol.ResultSet, error) {
 	queryUpper := strings.ToUpper(query)

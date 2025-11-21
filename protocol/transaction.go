@@ -98,6 +98,7 @@ const (
 	StatementShowColumns
 	StatementShowCreateTable
 	StatementShowIndexes
+	StatementShowTableStatus
 	StatementInformationSchema
 )
 
