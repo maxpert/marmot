@@ -275,7 +275,10 @@ func (h *CoordinatorHandler) getSystemVariable(varExpr string, session *protocol
 	if strings.Contains(varExpr, "database()") {
 		return session.CurrentDatabase
 	}
-	if strings.Contains(varExpr, "autocommit") || strings.Contains(varExpr, "auto_increment") {
+	if strings.Contains(varExpr, "autocommit") {
+		return 1
+	}
+	if strings.Contains(varExpr, "auto_increment") {
 		return 1
 	}
 	if strings.Contains(varExpr, "sql_mode") {
@@ -287,8 +290,20 @@ func (h *CoordinatorHandler) getSystemVariable(varExpr string, session *protocol
 	if strings.Contains(varExpr, "collation") {
 		return "utf8mb4_general_ci"
 	}
+	if strings.Contains(varExpr, "system_time_zone") {
+		return "UTC"
+	}
 	if strings.Contains(varExpr, "time_zone") {
 		return "SYSTEM"
+	}
+	if strings.Contains(varExpr, "interactive_timeout") {
+		return 28800
+	}
+	if strings.Contains(varExpr, "wait_timeout") {
+		return 28800
+	}
+	if strings.Contains(varExpr, "net_write_timeout") {
+		return 60
 	}
 	if strings.Contains(varExpr, "timeout") {
 		return 28800
@@ -302,6 +317,9 @@ func (h *CoordinatorHandler) getSystemVariable(varExpr string, session *protocol
 	if strings.Contains(varExpr, "transaction_isolation") || strings.Contains(varExpr, "tx_isolation") {
 		return "REPEATABLE-READ"
 	}
+	if strings.Contains(varExpr, "tx_read_only") || strings.Contains(varExpr, "read_only") {
+		return 0
+	}
 	if strings.Contains(varExpr, "performance_schema") {
 		return 0
 	}
@@ -311,7 +329,11 @@ func (h *CoordinatorHandler) getSystemVariable(varExpr string, session *protocol
 	if strings.Contains(varExpr, "license") {
 		return "Apache-2.0"
 	}
+	if strings.Contains(varExpr, "init_connect") {
+		return ""
+	}
 
-	// Default: return empty string
+	// Default: return empty string for unknown variables
+	// Note: This may cause issues with JDBC if it expects a numeric value
 	return ""
 }
