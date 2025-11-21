@@ -1,35 +1,39 @@
 package main
 
 import (
-	"context"
 	"flag"
+	"fmt"
 	"io"
-	"net/http"
-	"net/http/pprof"
-	_ "net/http/pprof"
 	"os"
 	"time"
 
-	"github.com/maxpert/marmot/telemetry"
-	"github.com/maxpert/marmot/utils"
-
 	"github.com/maxpert/marmot/cfg"
+	"github.com/maxpert/marmot/coordinator"
 	"github.com/maxpert/marmot/db"
-	"github.com/maxpert/marmot/logstream"
-	"github.com/maxpert/marmot/snapshot"
+	marmotgrpc "github.com/maxpert/marmot/grpc"
+	"github.com/maxpert/marmot/hlc"
+	"github.com/maxpert/marmot/protocol"
+	"github.com/maxpert/marmot/telemetry"
 
-	"github.com/asaskevich/EventBus"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 )
 
 func main() {
 	flag.Parse()
+
+	// Load configuration
 	err := cfg.Load(*cfg.ConfigPathFlag)
 	if err != nil {
 		panic(err)
 	}
 
+	// Validate configuration
+	if err := cfg.Validate(); err != nil {
+		panic(fmt.Sprintf("Invalid configuration: %v", err))
+	}
+
+	// Setup logging
 	var writer io.Writer = zerolog.NewConsoleWriter()
 	if cfg.Config.Logging.Format == "json" {
 		writer = os.Stdout
@@ -46,206 +50,167 @@ func main() {
 		log.Logger = gLog.Level(zerolog.InfoLevel)
 	}
 
-	if *cfg.ProfServer != "" {
-		go func() {
-			mux := http.NewServeMux()
-			mux.HandleFunc("/debug/pprof/", pprof.Index)
-			mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
-			mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
-			mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
-			mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
-
-			err := http.ListenAndServe(*cfg.ProfServer, mux)
-			if err != nil {
-				log.Error().Err(err).Msg("unable to bind profiler server")
-			}
-		}()
-	}
-
+	log.Info().Msg("Marmot v2.0 - Leaderless SQLite Replication")
 	log.Debug().Msg("Initializing telemetry")
 	telemetry.InitializeTelemetry()
 
-	log.Debug().Str("path", cfg.Config.DBPath).Msg("Opening database")
-	streamDB, err := db.OpenStreamDB(cfg.Config.DBPath)
+	// Phase 1: Initialize gRPC server with gossip
+	log.Info().Msg("Initializing gRPC server")
+	grpcServer, err := initializeGRPCServer()
 	if err != nil {
-		log.Error().Err(err).Msg("Unable to open database")
+		log.Fatal().Err(err).Msg("Failed to initialize gRPC server")
 		return
 	}
 
-	if *cfg.CleanupFlag {
-		err = streamDB.RemoveCDC(true)
-		if err != nil {
-			log.Panic().Err(err).Msg("Unable to clean up...")
-		} else {
-			log.Info().Msg("Cleanup complete...")
-		}
-
+	// Start gRPC server
+	if err := grpcServer.Start(); err != nil {
+		log.Fatal().Err(err).Msg("Failed to start gRPC server")
 		return
 	}
+	defer grpcServer.Stop()
 
-	snpStore, err := snapshot.NewSnapshotStorage()
+	// Start gossip protocol
+	log.Info().Msg("Starting gossip protocol")
+	client, gossip := startGossip(grpcServer)
+
+	// Phase 5: Initialize Database Manager
+	log.Info().Msg("Initializing Database Manager")
+	clock := hlc.NewClock(cfg.Config.NodeID)
+
+	// Migrate legacy database if it exists
+	if err := db.MigrateFromLegacy(cfg.Config.DBPath, cfg.Config.DataDir, cfg.Config.NodeID, clock); err != nil {
+		log.Error().Err(err).Msg("Failed to migrate legacy database")
+	}
+
+	dbMgr, err := db.NewDatabaseManager(cfg.Config.DataDir, cfg.Config.NodeID, clock)
 	if err != nil {
-		log.Panic().Err(err).Msg("Unable to initialize snapshot storage")
+		log.Fatal().Err(err).Msg("Failed to initialize Database Manager")
+		return
 	}
+	defer dbMgr.Close()
 
-	replicator, err := logstream.NewReplicator(snapshot.NewNatsDBSnapshot(streamDB, snpStore))
+	// Get default database for backward compatibility with replication handler
+	defaultDB, err := dbMgr.GetDatabase(db.DefaultDatabaseName)
 	if err != nil {
-		log.Panic().Err(err).Msg("Unable to initialize replicators")
-	}
-
-	if *cfg.SaveSnapshotFlag {
-		replicator.ForceSaveSnapshot()
+		log.Fatal().Err(err).Msg("Failed to get default database")
 		return
 	}
 
-	if cfg.Config.Snapshot.Enable && cfg.Config.Replicate {
-		err = replicator.RestoreSnapshot()
-		if err != nil {
-			log.Panic().Err(err).Msg("Unable to restore snapshot")
-		}
-	}
-
-	log.Info().Msg("Listing tables to watch...")
-	tableNames, err := db.GetAllDBTables(cfg.Config.DBPath)
-	if err != nil {
-		log.Error().Err(err).Msg("Unable to list all tables")
-		return
-	}
-
-	eventBus := EventBus.New()
-	ctxSt := utils.NewStateContext()
-
-	streamDB.OnChange = onTableChanged(replicator, ctxSt, eventBus, cfg.Config.NodeID)
-	log.Info().Msg("Starting change data capture pipeline...")
-	if err := streamDB.InstallCDC(tableNames); err != nil {
-		log.Error().Err(err).Msg("Unable to install change data capture pipeline")
-		return
-	}
-
-	errChan := make(chan error)
-	for i := uint64(0); i < cfg.Config.ReplicationLog.Shards; i++ {
-		go changeListener(streamDB, replicator, ctxSt, eventBus, i+1, errChan)
-	}
-
-	sleepTimeout := utils.AutoResetEventTimer(
-		eventBus,
-		"pulse",
-		time.Duration(cfg.Config.SleepTimeout)*time.Millisecond,
+	// Phase 5: Wire up replication handlers
+	log.Info().Msg("Wiring up replication handlers")
+	replicationHandler := marmotgrpc.NewReplicationHandler(
+		cfg.Config.NodeID,
+		defaultDB.GetDB(),
+		defaultDB.GetTransactionManager(),
+		clock,
 	)
-	cleanupInterval := time.Duration(cfg.Config.CleanupInterval) * time.Millisecond
-	cleanupTicker := time.NewTicker(cleanupInterval)
-	defer cleanupTicker.Stop()
+	grpcServer.SetReplicationHandler(replicationHandler)
 
-	snapshotInterval := time.Duration(cfg.Config.Snapshot.Interval) * time.Millisecond
-	snapshotTicker := utils.NewTimeoutPublisher(snapshotInterval)
-	defer snapshotTicker.Stop()
+	log.Info().Msg("Database Manager and replication handlers initialized")
 
-	for {
-		select {
-		case err = <-errChan:
-			if err != nil {
-				log.Panic().Err(err).Msg("Terminated listener")
-			}
-		case t := <-cleanupTicker.C:
-			cnt, err := streamDB.CleanupChangeLogs(t.Add(-cleanupInterval))
-			if err != nil {
-				log.Warn().Err(err).Msg("Unable to cleanup change logs")
-			} else if cnt > 0 {
-				log.Debug().Int64("count", cnt).Msg("Cleaned up DB change logs")
-			}
-		case <-snapshotTicker.Channel():
-			if cfg.Config.Snapshot.Enable && cfg.Config.Publish {
-				lastSnapshotTime := replicator.LastSaveSnapshotTime()
-				now := time.Now()
-				if now.Sub(lastSnapshotTime) >= snapshotInterval {
-					log.Info().
-						Time("last_snapshot", lastSnapshotTime).
-						Dur("duration", now.Sub(lastSnapshotTime)).
-						Msg("Triggering timer based snapshot save")
-					replicator.SaveSnapshot()
-				}
-			}
-		case <-sleepTimeout.Channel():
-			log.Info().Msg("No more events to process, initiating shutdown")
-			ctxSt.Cancel()
-			if cfg.Config.Snapshot.Enable && cfg.Config.Publish {
-				log.Info().Msg("Saving snapshot before going to sleep")
-				replicator.ForceSaveSnapshot()
-			}
+	// Phase 7: Setup transaction coordinators for full database replication
+	log.Info().Msg("Setting up transaction coordinators")
+	nodeProvider := marmotgrpc.NewGossipNodeProvider(gossip.GetNodeRegistry())
+	replicator := marmotgrpc.NewGRPCReplicator(client)
 
-			os.Exit(0)
-		}
+	writeTimeout := time.Duration(cfg.Config.Replication.WriteTimeoutMS) * time.Millisecond
+	readTimeout := time.Duration(cfg.Config.Replication.ReadTimeoutMS) * time.Millisecond
+
+	// Initialize LocalReplicator for WriteCoordinator
+	localReplicator := db.NewLocalReplicator(cfg.Config.NodeID, dbMgr, clock)
+
+	writeCoordinator := coordinator.NewWriteCoordinator(
+		cfg.Config.NodeID,
+		nodeProvider,
+		replicator,
+		localReplicator,
+		writeTimeout,
+	)
+
+	// Initialize LocalReader for ReadCoordinator
+	localReader := db.NewLocalReader(dbMgr)
+
+	readCoordinator := coordinator.NewReadCoordinator(
+		cfg.Config.NodeID,
+		nodeProvider,
+		localReader,
+		readTimeout,
+	)
+
+	log.Info().Msg("Transaction coordinators initialized")
+
+	// Phase 8: Initialize MySQL protocol server
+	log.Info().Msg("Initializing MySQL protocol server")
+
+	// Create handler to bridge MySQL protocol and coordinators
+	handler := coordinator.NewCoordinatorHandler(
+		cfg.Config.NodeID,
+		writeCoordinator,
+		readCoordinator,
+		clock,
+		dbMgr,
+	)
+
+	// Create and start MySQL server
+	mysqlServer := protocol.NewMySQLServer(
+		fmt.Sprintf("%s:%d", cfg.Config.MySQL.BindAddress, cfg.Config.MySQL.Port),
+		handler,
+	)
+
+	if err := mysqlServer.Start(); err != nil {
+		log.Fatal().Err(err).Msg("Failed to start MySQL server")
+		return
 	}
+	defer mysqlServer.Stop()
+
+	log.Info().Msg("Marmot v2.0 started successfully")
+	log.Info().
+		Uint64("node_id", cfg.Config.NodeID).
+		Int("grpc_port", cfg.Config.Cluster.GRPCPort).
+		Str("db_path", cfg.Config.DBPath).
+		Msg("Node is operational")
+
+	// Keep running
+	select {}
 }
 
-func changeListener(
-	streamDB *db.SqliteStreamDB,
-	rep *logstream.Replicator,
-	ctxSt *utils.StateContext,
-	events EventBus.BusPublisher,
-	shard uint64,
-	errChan chan error,
-) {
-	log.Debug().Uint64("shard", shard).Msg("Listening stream")
-	err := rep.Listen(shard, onChangeEvent(streamDB, ctxSt, events))
+func initializeGRPCServer() (*marmotgrpc.Server, error) {
+	config := marmotgrpc.ServerConfig{
+		NodeID:  cfg.Config.NodeID,
+		Address: cfg.Config.Cluster.GRPCBindAddress,
+		Port:    cfg.Config.Cluster.GRPCPort,
+	}
+
+	server, err := marmotgrpc.NewServer(config)
 	if err != nil {
-		errChan <- err
+		return nil, err
 	}
+
+	return server, nil
 }
 
-func onChangeEvent(streamDB *db.SqliteStreamDB, ctxSt *utils.StateContext, events EventBus.BusPublisher) func(data []byte) error {
-	return func(data []byte) error {
-		events.Publish("pulse")
-		if ctxSt.IsCanceled() {
-			return context.Canceled
-		}
+func startGossip(server *marmotgrpc.Server) (*marmotgrpc.Client, *marmotgrpc.GossipProtocol) {
+	gossipConfig := marmotgrpc.DefaultGossipConfig()
 
-		if !cfg.Config.Replicate {
-			return nil
-		}
+	// Get gossip protocol from server (already initialized)
+	gossip := server.GetGossipProtocol()
 
-		ev := &logstream.ReplicationEvent[db.ChangeLogEvent]{}
-		err := ev.Unmarshal(data)
-		if err != nil {
-			log.Error().Err(err).Send()
-			return err
-		}
+	// Create and set client
+	client := marmotgrpc.NewClient(cfg.Config.NodeID)
+	gossip.SetClient(client)
 
-		return streamDB.Replicate(&ev.Payload)
+	// Join cluster if seed nodes are configured
+	if len(cfg.Config.Cluster.SeedNodes) > 0 {
+		log.Info().Strs("seeds", cfg.Config.Cluster.SeedNodes).Msg("Joining cluster")
+		if err := gossip.JoinCluster(cfg.Config.Cluster.SeedNodes, cfg.Config.Cluster.GRPCAdvertiseAddress); err != nil {
+			log.Warn().Err(err).Msg("Failed to join cluster, starting as single node")
+		}
+	} else {
+		log.Info().Msg("No seed nodes configured, starting as single-node cluster")
 	}
-}
 
-func onTableChanged(r *logstream.Replicator, ctxSt *utils.StateContext, events EventBus.BusPublisher, nodeID uint64) func(event *db.ChangeLogEvent) error {
-	return func(event *db.ChangeLogEvent) error {
-		events.Publish("pulse")
-		if ctxSt.IsCanceled() {
-			return context.Canceled
-		}
+	// Start gossip protocol
+	gossip.Start(gossipConfig)
 
-		if !cfg.Config.Publish {
-			return nil
-		}
-
-		ev := &logstream.ReplicationEvent[db.ChangeLogEvent]{
-			FromNodeId: nodeID,
-			Payload:    *event,
-		}
-
-		data, err := ev.Marshal()
-		if err != nil {
-			return err
-		}
-
-		hash, err := event.Hash()
-		if err != nil {
-			return err
-		}
-
-		err = r.Publish(hash, data)
-		if err != nil {
-			return err
-		}
-
-		return nil
-	}
+	return client, gossip
 }

@@ -1,0 +1,193 @@
+syntax = "proto3";
+package marmot.v2;
+
+option go_package = "github.com/maxpert/marmot/grpc";
+
+// Single gRPC service for all peer communication
+service MarmotService {
+  // ===== GOSSIP PROTOCOL =====
+  // Periodic gossip messages (SWIM-style)
+  rpc Gossip(GossipRequest) returns (GossipResponse);
+
+  // Join cluster
+  rpc Join(JoinRequest) returns (JoinResponse);
+
+  // Heartbeat/health check
+  rpc Ping(PingRequest) returns (PingResponse);
+
+  // ===== REPLICATION =====
+  // Replicate transaction (quorum writes)
+  rpc ReplicateTransaction(TransactionRequest)
+      returns (TransactionResponse);
+
+  // Quorum read
+  rpc Read(ReadRequest) returns (ReadResponse);
+
+  // Streaming changes (for catch-up)
+  rpc StreamChanges(StreamRequest)
+      returns (stream ChangeEvent);
+
+  // ===== SNAPSHOT TRANSFER =====
+  // Get snapshot metadata
+  rpc GetSnapshotInfo(SnapshotInfoRequest)
+      returns (SnapshotInfoResponse);
+
+  // Stream snapshot chunks
+  rpc StreamSnapshot(SnapshotRequest)
+      returns (stream SnapshotChunk);
+}
+
+// ===== GOSSIP MESSAGES =====
+message GossipRequest {
+  uint64 source_node_id = 1;
+  repeated NodeState nodes = 2;
+  uint64 incarnation = 3;
+}
+
+message GossipResponse {
+  repeated NodeState nodes = 1;
+}
+
+message NodeState {
+  uint64 node_id = 1;
+  string address = 2;
+  NodeStatus status = 3;
+  uint64 incarnation = 4;
+}
+
+enum NodeStatus {
+  ALIVE = 0;
+  SUSPECT = 1;
+  DEAD = 2;
+}
+
+message JoinRequest {
+  uint64 node_id = 1;
+  string address = 2;
+}
+
+message JoinResponse {
+  bool success = 1;
+  repeated NodeState cluster_nodes = 2;
+}
+
+message PingRequest {
+  uint64 source_node_id = 1;
+}
+
+message PingResponse {
+  uint64 node_id = 1;
+  NodeStatus status = 2;
+}
+
+// ===== REPLICATION MESSAGES =====
+message TransactionRequest {
+  uint64 txn_id = 1;
+  uint64 source_node_id = 2;
+  repeated Statement statements = 3;
+  HLC timestamp = 4;
+  // Phase for 2PC protocol
+  TransactionPhase phase = 5;
+  // Consistency level
+  ConsistencyLevel consistency = 6;
+  // Target database name
+  string database = 7;
+}
+
+enum TransactionPhase {
+  PREPARE = 0;  // Phase 1: Create write intents
+  COMMIT = 1;   // Phase 2: Commit transaction
+  ABORT = 2;    // Abort: Rollback transaction
+}
+
+enum ConsistencyLevel {
+  CONSISTENCY_ONE = 0;
+  CONSISTENCY_QUORUM = 1;
+  CONSISTENCY_ALL = 2;
+}
+
+message Statement {
+  string sql = 1;
+  StatementType type = 2;
+  string table_name = 3;
+  // Target database name
+  string database = 4;
+}
+
+enum StatementType {
+  INSERT = 0;
+  UPDATE = 1;
+  DELETE = 2;
+  DDL = 3;
+  REPLACE = 4;
+}
+
+message HLC {
+  int64 wall_time = 1;
+  int32 logical = 2;
+  uint64 node_id = 3;
+}
+
+message TransactionResponse {
+  bool success = 1;
+  string error_message = 2;
+  HLC applied_at = 3;
+  // Write-write conflict detection
+  bool conflict_detected = 4;
+  string conflict_details = 5;
+}
+
+message ReadRequest {
+  string query = 1;
+  uint64 source_node_id = 2;
+  // Snapshot timestamp for MVCC reads
+  HLC snapshot_ts = 3;
+  // Consistency level
+  ConsistencyLevel consistency = 4;
+  string table_name = 5;
+  // Target database name
+  string database = 6;
+}
+
+message ReadResponse {
+  repeated Row rows = 1;
+  HLC timestamp = 2;
+}
+
+message Row {
+  map<string, bytes> columns = 1;
+}
+
+message StreamRequest {
+  uint64 from_txn_id = 1;
+  uint64 requesting_node_id = 2;
+}
+
+message ChangeEvent {
+  uint64 txn_id = 1;
+  repeated Statement statements = 2;
+  HLC timestamp = 3;
+}
+
+// ===== SNAPSHOT MESSAGES =====
+message SnapshotInfoRequest {
+  uint64 requesting_node_id = 1;
+}
+
+message SnapshotInfoResponse {
+  uint64 snapshot_txn_id = 1;
+  int64 snapshot_size_bytes = 2;
+  int32 total_chunks = 3;
+  HLC timestamp = 4;
+}
+
+message SnapshotRequest {
+  uint64 requesting_node_id = 1;
+}
+
+message SnapshotChunk {
+  int32 chunk_index = 1;
+  int32 total_chunks = 2;
+  bytes data = 3;
+  string checksum = 4;
+}

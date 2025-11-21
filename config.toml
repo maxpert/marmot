@@ -1,160 +1,207 @@
-# Path to target SQLite database
-db_path="/tmp/marmot.db"
+# Marmot v2.0 Configuration
+# Leaderless SQLite Replication with MVCC
 
-# ID to uniquely identify your nodes in your cluster
-# It's recommended to always configure this
-# node_id=1
+# ==============================================================================
+# NODE IDENTITY
+# ==============================================================================
 
-# Path to persist the saved sequence map on disk for warm reboot
-# If this file is missing Marmot has to download snapshot
-# and replay all logs in order to restore database
-# seq_map_path="/tmp/seq-map.cbor"
+# Unique identifier for this node (0 = auto-generate from machine ID)
+node_id = 0
 
-# Replication enabled/disabled (default: true)
-# This will allow process to consume incoming changes from NATS
-# replicate = true
+# Directory for node data (logs, state, etc.)
+data_dir = "./marmot-data"
 
-# Publishing enabled/disabled (default: true)
-# This will allow process to control publishing of local DB changes to NATS
-# publish = true
+# Path to SQLite database file
+db_path = "./marmot-data/marmot.db"
 
-# Number of maximum rows to process per change allows configuring the maximum number of rows Marmot
-# will process (scan/load in memory) before publishing to NATS (default: 512)
-# scan_max_changes = 512
+# ==============================================================================
+# MVCC (Multi-Version Concurrency Control)
+# ==============================================================================
 
-# Cleanup interval in milliseconds used to clean up published rows. This is done in order to reduce write
-# load on the system (default: 5000)
-# cleanup_interval = 5000
+[mvcc]
+# Garbage collection interval (seconds)
+gc_interval_seconds = 30
 
-# Sleep timeout in milliseconds, useful for serverless scenarios. If there is no activity within given timelimit,
-# a snapshot will be performed, and process will exit. Value of 0 means it's disabled (default: 0).
-# sleep_timeout = 15000
+# How long to retain old transaction records (hours)
+gc_retention_hours = 1
 
-# Polling interval in milliseconds, that will explicitly check DB for change logs. This should not be required,
-# it's only useful for broken or buggy file system watchers. Value of 0 means it's disabled (default: 0)
-# polling_interval = 0
+# Transaction timeout without heartbeat (seconds)
+heartbeat_timeout_seconds = 10
 
-# Snapshots are used to limit log size and have a database snapshot backedup on your
-# configured blob storage (NATS for now). This helps speedier recovery or cold boot
-# nodes to come up. A Snapshot is taken every log entries are close to max_entries
-# configured in replication_log section. It's recommended to use a large value
-# for maximum entries in replication log, because SQLite can do 1000s of TPS
-# replaying a couple thousands of entries should be really quick.
+# Number of MVCC versions to keep per row
+version_retention_count = 10
+
+# Time window for Last-Write-Wins conflict resolution (seconds)
+conflict_window_seconds = 10
+
+# ==============================================================================
+# CLUSTER MEMBERSHIP
+# ==============================================================================
+
+[cluster]
+# Address to bind gRPC server (0.0.0.0 = all interfaces)
+grpc_bind_address = "0.0.0.0"
+
+# Address other nodes use to connect to this node
+# Leave empty to auto-detect (hostname:grpc_port)
+# Override for NAT/Docker: "public-ip:8080" or "service-name:8080"
+grpc_advertise_address = ""
+
+# gRPC port for cluster communication
+grpc_port = 8080
+
+# List of seed nodes to join cluster (empty = start as first node)
+# Example: ["node1.example.com:8080", "node2.example.com:8080"]
+seed_nodes = []
+
+# Gossip protocol interval (milliseconds)
+gossip_interval_ms = 1000
+
+# Number of random peers to gossip with each round
+gossip_fanout = 3
+
+# Time before marking unresponsive node as suspect (milliseconds)
+suspect_timeout_ms = 5000
+
+# Time before declaring suspect node as dead (milliseconds)
+dead_timeout_ms = 10000
+
+# ==============================================================================
+# REPLICATION
+# ==============================================================================
+
+[replication]
+# Number of replicas for each data item
+replication_factor = 3
+
+# Virtual nodes per physical node for consistent hashing
+virtual_nodes = 150
+
+# Default write consistency level
+# Options: ONE, TWO, THREE, QUORUM, ALL, LOCAL_ONE
+default_write_consistency = "QUORUM"
+
+# Default read consistency level
+default_read_consistency = "LOCAL_ONE"
+
+# Timeout for write operations (milliseconds)
+write_timeout_ms = 5000
+
+# Timeout for read operations (milliseconds)
+read_timeout_ms = 2000
+
+# Enable anti-entropy background sync
+enable_anti_entropy = true
+
+# Anti-entropy sync interval (seconds)
+anti_entropy_interval_seconds = 600
+
+# ==============================================================================
+# CONNECTION POOL
+# ==============================================================================
+
+[connection_pool]
+# Number of connections per pool
+pool_size = 4
+
+# Maximum idle time for connections (seconds)
+max_idle_time_seconds = 10
+
+# Maximum lifetime for connections (seconds)
+max_lifetime_seconds = 300
+
+# ==============================================================================
+# GRPC CLIENT
+# ==============================================================================
+
+[grpc_client]
+# Send keepalive ping every N seconds
+keepalive_time_seconds = 10
+
+# Timeout for keepalive ping response (seconds)
+keepalive_timeout_seconds = 3
+
+# Maximum retry attempts for failed requests
+max_retries = 3
+
+# Backoff duration between retries (milliseconds)
+retry_backoff_ms = 100
+
+# ==============================================================================
+# TRANSACTION COORDINATOR
+# ==============================================================================
+
+[coordinator]
+# Timeout for 2PC prepare phase (milliseconds)
+prepare_timeout_ms = 2000
+
+# Timeout for 2PC commit phase (milliseconds)
+commit_timeout_ms = 2000
+
+# Timeout for 2PC abort phase (milliseconds)
+abort_timeout_ms = 2000
+
+# ==============================================================================
+# MYSQL PROTOCOL SERVER
+# ==============================================================================
+
+[mysql]
+# Enable MySQL wire protocol server
+enabled = true
+
+# Address to bind MySQL server (0.0.0.0 = all interfaces)
+bind_address = "0.0.0.0"
+
+# MySQL protocol port
+port = 3306
+
+# Maximum concurrent MySQL connections
+max_connections = 1000
+
+# ==============================================================================
+# SNAPSHOT (Not yet implemented)
+# ==============================================================================
+
 [snapshot]
-# Disabling snapshot disables both restore and save
-enabled=true
-# Storage for snapshot can be "nats" | "webdav" | "s3" (default "nats")
-store="nats"
-# Interval sets perodic interval in milliseconds after which an automatic snapshot should be saved
-# If there was a snapshot saved within interval range due to other log threshold triggers, then
-# new snapshot won't be saved (since it's within time range), a value of 0 means it's disabled.
-interval=0
+# Enable periodic snapshots
+enabled = false
 
-# When setting snapshot.store to "nats" [snapshot.nats] will be used to configure snapshotting details
-# NATS connection settings (urls etc.) will be loaded from global [nats] configurations
-[snapshot.nats]
-# Number of NATS replicas of snapshot object store (max 5). Recommended values: 2-3
-replicas=1
-# Bucket name for object store to save snapshot on.
-#bucket="custom-bucket-name"
+# Snapshot interval (seconds)
+interval_seconds = 300
 
-# When setting snapshot.store to "s3" [snapshot.s3] will be used to configure snapshotting details
-[snapshot.s3]
-# For S3 this will be `s3.region-code.amazonaws.com` (check your AWS Console for details).
-# For Minio this will point to the host where Minio lives
-endpoint="127.0.0.1:9000"
+# Snapshot storage type: peer, s3, webdav, sftp, local
+store = "peer"
 
-# Directory path within bucket where snapshot is saved and restore from
-path="snapshots/marmot"
+# Snapshot chunk size (MB)
+chunk_size_mb = 5
 
-# By default false but should be set to true depending upong Minio configuration, for S3 it should be
-# always true. This essentially lets you select between https and http for your hosting.
-use_ssl=false
+# Number of parallel chunks for snapshot transfer
+parallel_chunks = 5
 
-# Access key ID or Minio user name
-#access_key="marmot"
+# Number of changes before triggering full snapshot
+incremental_threshold = 10000
 
-# Secret Key or Minio password
-#secret="ChangeMe"
+# ==============================================================================
+# LOGGING
+# ==============================================================================
 
-# Bucket name where snapshots live
-bucket="marmot"
+[logging]
+# Enable verbose debug logging
+verbose = true
 
-[snapshot.webdav]
-# URL of the WebDAV server root
-url="https://<webdav_server>/<web_dav_path>?dir=/snapshots/path/for/marmot&login=<username>&secret=<password>"
+# Log format: "console" (human-readable) or "json" (structured)
+format = "console"
 
-[snapshot.sftp]
-# URL of the SFTP server with path
-url="sftp://<user>:<password>@<sftp_server>:<port>/path/to/save/snapshot"
-
-# Change log that is published and persisted in JetStreams by Marmot.
-# Marmot auto-configures missing JetStreams when booting up for you.
-[replication_log]
-# Number of replicas per log to configure (user > 1 for failover and redundancy).
-replicas=1
-# Number of shards to divide the logs over, each JetStream and subject will be prefixed
-# by the configured `subject_prefix` and `stream_prefix` under nats
-shards=1
-# Max log entries JetStream should persist, JetStream is configured to drop older entries
-# Each JetStream is configured to persist on file.
-max_entries=1024
-# Enable log compression, uses zstd to compress logs as they are streamd to NATS
-# This is useful for DB storing large blobs that can be compressed.
-compress=true
-# Update existing stream if the configurations of JetStream don't match up with configurations
-# generated due to parameters above. Use this option carefully because changing shards,
-# or max_etries etc. might have undesired side-effects on existing running cluster
-update_existing=false
-
-
-# NATS server configurations
-[nats]
-# List of NATS server to use as boot server. Reference NATS documentation on how to pass
-# authentication credentials as part of URL. Leaving out this list empty will result
-# in embedded NATS server being started with node named `marmot-node-{node_id}`. 
-# NATS configuration can provided via `server_config` variable
-urls=[
-#    "nats://localhost:4222"
-#    "nats://<user>:<password>@<host>:<port>"
-]
-# Embedded server bind address
-bind_address="0.0.0.0:4222"
-# Embedded server config file (will only be used if URLs array is empty)
-server_config=""
-# Subject prefix used when publishing log entries, it's usually suffixed by shard number
-# to get the full subject name
-subject_prefix="marmot-change-log"
-# JetStream name prefix used for publishing log entries, it's usually suffixed by shard number
-# to get the full JetStream name
-stream_prefix="marmot-changes"
-# Seed file used for client nkey authentication
-# nk -gen user > user.seed
-# nk -inkey user.seed -pubout > user.pub
-# Set to user.seed
-# Reference https://docs.nats.io/running-a-nats-service/nats_admin/security/jwt#what-are-nkeys
-seed_file=""
-# User credentials used for plain user password authentication
-user_name=""
-user_password=""
-# Number of retries when establishing the NATS server connection (will only be used if URLs array is not empty)
-connect_retries=5
-# Wait time between NATS reconnect attempts (will only be used if URLs array is not empty)
-reconnect_wait_seconds=2
+# ==============================================================================
+# METRICS
+# ==============================================================================
 
 [prometheus]
-# Enable/Disable prometheus telemetry collection
-enable=false
-# HTTP endpoint to expose for prometheus matrix collection
-# bind=":3010"
-# Namespace for prometheus (default: `marmot`), applies to all counters, gaugues, histograms
-# namespace=""
-# Subsystem for prometheus (default: empty), applies to all counters, gauges, histograms
-# subsystem=""
+# Enable Prometheus metrics endpoint
+enabled = false
 
-# Console STDOUT configurations
-[logging]
-# Configure console logging
-verbose=true
-# "console" | "json"
-format="console"
+# Address to bind metrics server
+address = "0.0.0.0"
+
+# Prometheus metrics port
+port = 9090

@@ -1,4 +1,21 @@
 #!/bin/bash
+# Marmot v2.0 - Example 3-Node Cluster
+# Full Database Replication: ALL nodes get ALL data
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+echo "=== Marmot v2.0 Example Cluster ==="
+echo "Starting 3-node cluster with full database replication"
+echo ""
+
+# Clean up old data
+echo "Cleaning up old data..."
+rm -rf /tmp/marmot-node-*
+
+# Create database for initial data (will be replicated to all nodes)
 create_db() {
     local db_file="$1"
     cat <<EOF | sqlite3 "$db_file"
@@ -19,30 +36,83 @@ VALUES
 ('1984', 'George Orwell', 1949),
 ('The Great Gatsby', 'F. Scott Fitzgerald', 1925);
 EOF
-    echo "Created $db_file"
+    echo "✓ Created initial database: $db_file"
 }
 
-rm -rf /tmp/marmot-1-* /tmp/marmot-2-* /tmp/marmot-3-*
-create_db /tmp/marmot-1.db
-create_db /tmp/marmot-2.db
-create_db /tmp/marmot-3.db
+# Create data directories
+mkdir -p /tmp/marmot-node-1 /tmp/marmot-node-2 /tmp/marmot-node-3
 
+# Create initial database (will replicate to other nodes)
+create_db /tmp/marmot-node-1/marmot.db
+create_db /tmp/marmot-node-2/marmot.db
+create_db /tmp/marmot-node-3/marmot.db
 
+# Build marmot if needed
+if [ ! -f "$REPO_ROOT/marmot" ]; then
+    echo "Building marmot..."
+    cd "$REPO_ROOT"
+    go build -o marmot .
+    echo "✓ Build complete"
+fi
+
+# Cleanup function
 cleanup() {
-    kill "$job1" "$job2" "$job3"
+    echo ""
+    echo "Shutting down cluster..."
+    kill "$job1" "$job2" "$job3" 2>/dev/null || true
+    wait 2>/dev/null || true
+    echo "✓ Cluster stopped"
 }
-
 trap cleanup EXIT
-rm -rf /tmp/nats
-./marmot -config examples/node-1-config.toml -cluster-addr localhost:4221 -cluster-peers 'nats://localhost:4222/' &
+
+echo ""
+echo "Starting nodes..."
+echo "  Node 1: gRPC 8081, MySQL 3307"
+echo "  Node 2: gRPC 8082, MySQL 3308"
+echo "  Node 3: gRPC 8083, MySQL 3309"
+echo ""
+
+# Start Node 1
+"$REPO_ROOT/marmot" --config "$SCRIPT_DIR/node-1-config.toml" > /tmp/marmot-node-1/marmot.log 2>&1 &
 job1=$!
+echo "✓ Node 1 started (PID: $job1)"
 
-sleep 1
-./marmot -config examples/node-2-config.toml -cluster-addr localhost:4222 -cluster-peers 'nats://localhost:4221/' &
+sleep 2
+
+# Start Node 2
+"$REPO_ROOT/marmot" --config "$SCRIPT_DIR/node-2-config.toml" > /tmp/marmot-node-2/marmot.log 2>&1 &
 job2=$!
+echo "✓ Node 2 started (PID: $job2)"
 
-sleep 1
-./marmot -config examples/node-3-config.toml -cluster-addr localhost:4223 -cluster-peers 'nats://localhost:4221/,nats://localhost:4222/' &
+sleep 2
+
+# Start Node 3
+"$REPO_ROOT/marmot" --config "$SCRIPT_DIR/node-3-config.toml" > /tmp/marmot-node-3/marmot.log 2>&1 &
 job3=$!
+echo "✓ Node 3 started (PID: $job3)"
 
+sleep 2
+
+echo ""
+echo "=== Cluster Running ==="
+echo ""
+echo "Connect to any node via MySQL protocol:"
+echo "  mysql -h 127.0.0.1 -P 3307 -u root"
+echo "  mysql -h 127.0.0.1 -P 3308 -u root"
+echo "  mysql -h 127.0.0.1 -P 3309 -u root"
+echo ""
+echo "Example queries:"
+echo "  SELECT * FROM Books;"
+echo "  INSERT INTO Books (title, author, publication_year) VALUES ('New Book', 'New Author', 2024);"
+echo ""
+echo "Logs:"
+echo "  tail -f /tmp/marmot-node-1/marmot.log"
+echo "  tail -f /tmp/marmot-node-2/marmot.log"
+echo "  tail -f /tmp/marmot-node-3/marmot.log"
+echo ""
+echo "Press Ctrl+C to stop the cluster"
+echo "================================"
+echo ""
+
+# Wait for all jobs
 wait $job1 $job2 $job3

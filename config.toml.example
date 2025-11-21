@@ -1,0 +1,224 @@
+# Marmot v2.0 Configuration
+# Leaderless SQLite Replication with MVCC
+
+# ==============================================================================
+# NODE IDENTITY
+# ==============================================================================
+
+# Unique identifier for this node (0 = auto-generate from machine ID)
+node_id = 0
+
+# Directory for node data (logs, state, etc.)
+data_dir = "./marmot-data"
+
+# Path to SQLite database file
+db_path = "./marmot-data/marmot.db"
+
+# ==============================================================================
+# MVCC (Multi-Version Concurrency Control)
+# ==============================================================================
+
+[mvcc]
+# Garbage collection interval (seconds)
+gc_interval_seconds = 30
+
+# How long to retain old transaction records (hours)
+gc_retention_hours = 1
+
+# Transaction timeout without heartbeat (seconds)
+heartbeat_timeout_seconds = 10
+
+# Number of MVCC versions to keep per row
+version_retention_count = 10
+
+# Time window for Last-Write-Wins conflict resolution (seconds)
+conflict_window_seconds = 10
+
+# ==============================================================================
+# CLUSTER MEMBERSHIP
+# ==============================================================================
+
+[cluster]
+# Address to bind gRPC server (0.0.0.0 = all interfaces)
+grpc_bind_address = "0.0.0.0"
+
+# Address other nodes use to connect to this node
+# Leave empty to auto-detect (hostname:grpc_port)
+# Override for NAT/Docker: "public-ip:8080" or "service-name:8080"
+grpc_advertise_address = ""
+
+# gRPC port for cluster communication
+grpc_port = 8080
+
+# List of seed nodes to join cluster (empty = start as first node)
+# Example: ["node1.example.com:8080", "node2.example.com:8080"]
+seed_nodes = []
+
+# Gossip protocol interval (milliseconds)
+gossip_interval_ms = 1000
+
+# Number of random peers to gossip with each round
+gossip_fanout = 3
+
+# Time before marking unresponsive node as suspect (milliseconds)
+suspect_timeout_ms = 5000
+
+# Time before declaring suspect node as dead (milliseconds)
+dead_timeout_ms = 10000
+
+# ==============================================================================
+# REPLICATION
+# ==============================================================================
+# Marmot v2.0 uses FULL DATABASE REPLICATION:
+# - ALL nodes receive ALL writes (complete database copy on every node)
+# - Writes require QUORUM acknowledgment (e.g., 2 out of 3 nodes)
+# - Dead nodes catch up via snapshots when they rejoin
+# - No partitioning: entire database is replicated everywhere
+#
+# NOTE: replication_factor and virtual_nodes are reserved for future
+# multi-database partitioning support and are not currently used.
+# ==============================================================================
+
+[replication]
+# Number of replicas for each data item (NOT USED - reserved for future multi-DB support)
+replication_factor = 3
+
+# Virtual nodes per physical node for consistent hashing (NOT USED - reserved for future)
+virtual_nodes = 150
+
+# Default write consistency level
+# How many nodes must ACK before write is considered successful:
+# - ONE: Any single node ACKs (fastest, least durable)
+# - QUORUM: Majority of nodes ACK (recommended - balances speed & durability)
+# - ALL: All alive nodes ACK (slowest, most durable)
+default_write_consistency = "QUORUM"
+
+# Default read consistency level
+# How many nodes to read from:
+# - LOCAL_ONE: Read from coordinator node only (fastest, may be stale)
+# - ONE: Read from any single node (fast, may be stale)
+# - QUORUM: Read from majority of nodes (consistent, slower)
+# - ALL: Read from all nodes (most consistent, slowest)
+default_read_consistency = "LOCAL_ONE"
+
+# Timeout for write operations (milliseconds)
+write_timeout_ms = 5000
+
+# Timeout for read operations (milliseconds)
+read_timeout_ms = 2000
+
+# Enable anti-entropy background sync
+enable_anti_entropy = true
+
+# Anti-entropy sync interval (seconds)
+anti_entropy_interval_seconds = 600
+
+# ==============================================================================
+# CONNECTION POOL
+# ==============================================================================
+
+[connection_pool]
+# Number of connections per pool
+pool_size = 4
+
+# Maximum idle time for connections (seconds)
+max_idle_time_seconds = 10
+
+# Maximum lifetime for connections (seconds)
+max_lifetime_seconds = 300
+
+# ==============================================================================
+# GRPC CLIENT
+# ==============================================================================
+
+[grpc_client]
+# Send keepalive ping every N seconds
+keepalive_time_seconds = 10
+
+# Timeout for keepalive ping response (seconds)
+keepalive_timeout_seconds = 3
+
+# Maximum retry attempts for failed requests
+max_retries = 3
+
+# Backoff duration between retries (milliseconds)
+retry_backoff_ms = 100
+
+# ==============================================================================
+# TRANSACTION COORDINATOR
+# ==============================================================================
+
+[coordinator]
+# Timeout for 2PC prepare phase (milliseconds)
+prepare_timeout_ms = 2000
+
+# Timeout for 2PC commit phase (milliseconds)
+commit_timeout_ms = 2000
+
+# Timeout for 2PC abort phase (milliseconds)
+abort_timeout_ms = 2000
+
+# ==============================================================================
+# MYSQL PROTOCOL SERVER
+# ==============================================================================
+
+[mysql]
+# Enable MySQL wire protocol server
+enabled = true
+
+# Address to bind MySQL server (0.0.0.0 = all interfaces)
+bind_address = "0.0.0.0"
+
+# MySQL protocol port
+port = 3306
+
+# Maximum concurrent MySQL connections
+max_connections = 1000
+
+# ==============================================================================
+# SNAPSHOT (Not yet implemented)
+# ==============================================================================
+
+[snapshot]
+# Enable periodic snapshots
+enabled = false
+
+# Snapshot interval (seconds)
+interval_seconds = 300
+
+# Snapshot storage type: peer, s3, webdav, sftp, local
+store = "peer"
+
+# Snapshot chunk size (MB)
+chunk_size_mb = 5
+
+# Number of parallel chunks for snapshot transfer
+parallel_chunks = 5
+
+# Number of changes before triggering full snapshot
+incremental_threshold = 10000
+
+# ==============================================================================
+# LOGGING
+# ==============================================================================
+
+[logging]
+# Enable verbose debug logging
+verbose = false
+
+# Log format: "console" (human-readable) or "json" (structured)
+format = "console"
+
+# ==============================================================================
+# METRICS
+# ==============================================================================
+
+[prometheus]
+# Enable Prometheus metrics endpoint
+enabled = false
+
+# Address to bind metrics server
+address = "0.0.0.0"
+
+# Prometheus metrics port
+port = 9090

@@ -22,6 +22,7 @@ build/
 *.key
 *.pem
 marmot
+marmot-v2
 dist/
 
 # NPM Stuff
@@ -29,3 +30,6 @@ node_modules/
 npm-debug.log
 yarn-error.log
 yarn-debug.log
+
+CALUDE.md
+V2-Plan.md

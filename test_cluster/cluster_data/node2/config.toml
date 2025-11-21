@@ -1,0 +1,60 @@
+node_id = 2
+data_dir = "/Users/zohaib/repos/marmot/test_cluster/cluster_data/node2"
+db_path = "/Users/zohaib/repos/marmot/test_cluster/cluster_data/node2/marmot.db"
+
+[mvcc]
+gc_interval_seconds = 30
+gc_retention_hours = 1
+heartbeat_timeout_seconds = 10
+version_retention_count = 10
+conflict_window_seconds = 10
+
+[connection_pool]
+pool_size = 4
+max_idle_time_seconds = 10
+max_lifetime_seconds = 300
+
+[grpc_client]
+keepalive_time_seconds = 10
+keepalive_timeout_seconds = 3
+max_retries = 3
+retry_backoff_ms = 100
+
+[coordinator]
+prepare_timeout_ms = 2000
+commit_timeout_ms = 2000
+abort_timeout_ms = 2000
+
+[cluster]
+grpc_bind_address = "0.0.0.0"
+grpc_port = 8082
+seed_nodes = ["localhost:8081"]
+gossip_interval_ms = 1000
+gossip_fanout = 2
+suspect_timeout_ms = 5000
+dead_timeout_ms = 10000
+
+[replication]
+replication_factor = 3
+virtual_nodes = 150
+default_write_consistency = "QUORUM"
+default_read_consistency = "LOCAL_ONE"
+write_timeout_ms = 5000
+read_timeout_ms = 2000
+enable_anti_entropy = true
+anti_entropy_interval_seconds = 600
+
+[mysql]
+enabled = true
+bind_address = "0.0.0.0"
+port = 3308
+max_connections = 100
+
+[logging]
+verbose = true
+format = "console"
+
+[prometheus]
+enabled = false
+address = "0.0.0.0"
+port = 9092

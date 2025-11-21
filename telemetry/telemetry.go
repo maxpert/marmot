@@ -1,6 +1,7 @@
 package telemetry
 
 import (
+	"fmt"
 	"net/http"
 	"strconv"
 
@@ -59,8 +60,8 @@ func NewCounter(name string, help string) Counter {
 	}
 
 	ret := prometheus.NewCounter(prometheus.CounterOpts{
-		Namespace: cfg.Config.Prometheus.Namespace,
-		Subsystem: cfg.Config.Prometheus.Subsystem,
+		Namespace: "marmot",
+		Subsystem: "v2",
 		Name:      name,
 		Help:      help,
 		ConstLabels: map[string]string{
@@ -78,8 +79,8 @@ func NewGauge(name string, help string) Gauge {
 	}
 
 	ret := prometheus.NewGauge(prometheus.GaugeOpts{
-		Namespace: cfg.Config.Prometheus.Namespace,
-		Subsystem: cfg.Config.Prometheus.Subsystem,
+		Namespace: "marmot",
+		Subsystem: "v2",
 		Name:      name,
 		Help:      help,
 		ConstLabels: map[string]string{
@@ -97,8 +98,8 @@ func NewHistogram(name string, help string) Histogram {
 	}
 
 	ret := prometheus.NewHistogram(prometheus.HistogramOpts{
-		Namespace: cfg.Config.Prometheus.Namespace,
-		Subsystem: cfg.Config.Prometheus.Subsystem,
+		Namespace: "marmot",
+		Subsystem: "v2",
 		Name:      name,
 		Help:      help,
 		ConstLabels: map[string]string{
@@ -111,19 +112,22 @@ func NewHistogram(name string, help string) Histogram {
 }
 
 func InitializeTelemetry() {
-	if !cfg.Config.Prometheus.Enable {
+	if !cfg.Config.Prometheus.Enabled {
 		return
 	}
 
 	registry = prometheus.NewRegistry()
+	addr := fmt.Sprintf("%s:%d", cfg.Config.Prometheus.Address, cfg.Config.Prometheus.Port)
 	server := http.Server{
-		Addr:    cfg.Config.Prometheus.Bind,
+		Addr:    addr,
 		Handler: promhttp.HandlerFor(registry, promhttp.HandlerOpts{Registry: registry}),
 	}
 
+	log.Info().Str("address", addr).Msg("Starting Prometheus metrics server")
+
 	go func() {
 		if err := server.ListenAndServe(); err != nil {
-			log.Error().Err(err).Msg("Unable to start controller listener")
+			log.Error().Err(err).Msg("Unable to start Prometheus listener")
 		}
 	}()
 }

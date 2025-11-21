@@ -1,0 +1,155 @@
+#!/bin/bash
+# Marmot v2.0 - Single Node Example
+# Simplest way to run Marmot
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+echo "=== Marmot v2.0 Single Node ==="
+echo ""
+
+# Clean up old data
+echo "Cleaning up old data..."
+rm -rf /tmp/marmot-single
+
+# Create data directory
+mkdir -p /tmp/marmot-single
+
+# Create initial database with sample data
+echo "Creating sample database..."
+cat <<EOF | sqlite3 /tmp/marmot-single/marmot.db
+DROP TABLE IF EXISTS Books;
+CREATE TABLE Books (
+    id INTEGER PRIMARY KEY,
+    title TEXT NOT NULL,
+    author TEXT NOT NULL,
+    publication_year INTEGER
+);
+INSERT INTO Books (title, author, publication_year)
+VALUES
+('The Hitchhiker''s Guide to the Galaxy', 'Douglas Adams', 1979),
+('The Lord of the Rings', 'J.R.R. Tolkien', 1954),
+('Harry Potter and the Sorcerer''s Stone', 'J.K. Rowling', 1997);
+EOF
+echo "✓ Sample database created"
+
+# Create config
+cat > /tmp/marmot-single/config.toml <<'TOML'
+# Marmot v2.0 - Single Node Configuration
+
+node_id = 1
+data_dir = "/tmp/marmot-single"
+db_path = "/tmp/marmot-single/marmot.db"
+
+[mvcc]
+gc_interval_seconds = 30
+gc_retention_hours = 1
+heartbeat_timeout_seconds = 10
+version_retention_count = 10
+conflict_window_seconds = 10
+
+[cluster]
+grpc_bind_address = "0.0.0.0"
+grpc_port = 8080
+seed_nodes = []  # No peers - single node
+gossip_interval_ms = 1000
+gossip_fanout = 2
+suspect_timeout_ms = 5000
+dead_timeout_ms = 10000
+
+[replication]
+replication_factor = 1
+virtual_nodes = 150
+default_write_consistency = "LOCAL_ONE"
+default_read_consistency = "LOCAL_ONE"
+write_timeout_ms = 5000
+read_timeout_ms = 2000
+
+[connection_pool]
+pool_size = 4
+max_idle_time_seconds = 10
+max_lifetime_seconds = 300
+
+[grpc_client]
+keepalive_time_seconds = 10
+keepalive_timeout_seconds = 3
+max_retries = 3
+retry_backoff_ms = 100
+
+[coordinator]
+prepare_timeout_ms = 2000
+commit_timeout_ms = 2000
+abort_timeout_ms = 2000
+
+[mysql]
+enabled = true
+bind_address = "0.0.0.0"
+port = 3306
+max_connections = 100
+
+[logging]
+verbose = true
+format = "console"
+
+[prometheus]
+enabled = false
+TOML
+
+echo "✓ Configuration created"
+
+# Build marmot if needed
+if [ ! -f "$REPO_ROOT/marmot" ]; then
+    echo "Building marmot..."
+    cd "$REPO_ROOT"
+    go build -o marmot .
+    echo "✓ Build complete"
+fi
+
+# Cleanup function
+cleanup() {
+    echo ""
+    echo "Shutting down..."
+    kill "$pid" 2>/dev/null || true
+    echo "✓ Stopped"
+}
+trap cleanup EXIT
+
+echo ""
+echo "Starting Marmot single node..."
+"$REPO_ROOT/marmot" --config /tmp/marmot-single/config.toml > /tmp/marmot-single/marmot.log 2>&1 &
+pid=$!
+
+sleep 2
+
+if ps -p $pid > /dev/null; then
+    echo "✓ Marmot started (PID: $pid)"
+else
+    echo "✗ Failed to start. Check /tmp/marmot-single/marmot.log"
+    exit 1
+fi
+
+echo ""
+echo "=== Node Running ==="
+echo ""
+echo "Connect via MySQL:"
+echo "  mysql -h 127.0.0.1 -P 3306 -u root"
+echo ""
+echo "Example queries:"
+echo "  SELECT * FROM Books;"
+echo "  INSERT INTO Books (title, author, publication_year) VALUES ('New Book', 'Author', 2024);"
+echo ""
+echo "Logs:"
+echo "  tail -f /tmp/marmot-single/marmot.log"
+echo ""
+echo "Ports:"
+echo "  gRPC:  8080"
+echo "  MySQL: 3306"
+echo ""
+echo "Press Ctrl+C to stop"
+echo "==================="
+echo ""
+
+# Wait for process
+wait $pid
