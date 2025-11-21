@@ -68,7 +68,7 @@ address = "0.0.0.0"
 port = ${GRPC_PORT}
 
 [cluster]
-seeds = ["${SEED_ADDR}"]
+seed_nodes = ["${SEED_ADDR}"]
 
 [replication]
 write_timeout_ms = 5000

@@ -2,8 +2,10 @@ package db
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -345,6 +347,126 @@ func MigrateFromLegacy(oldDBPath, newDataDir string, nodeID uint64, clock *hlc.C
 
 	log.Info().Msg("Legacy database migration completed")
 	return nil
+}
+
+// ImportExistingDatabases scans a directory for existing SQLite .db files
+// and imports them into the database manager. This is used on first startup
+// of a seed node to make existing databases available.
+func (dm *DatabaseManager) ImportExistingDatabases(importDir string) (int, error) {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+
+	if importDir == "" {
+		return 0, nil
+	}
+
+	// Check if import directory exists
+	info, err := os.Stat(importDir)
+	if os.IsNotExist(err) {
+		log.Debug().Str("dir", importDir).Msg("Import directory does not exist, skipping")
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("failed to stat import directory: %w", err)
+	}
+	if !info.IsDir() {
+		return 0, fmt.Errorf("import path is not a directory: %s", importDir)
+	}
+
+	// Scan for .db files
+	entries, err := os.ReadDir(importDir)
+	if err != nil {
+		return 0, fmt.Errorf("failed to read import directory: %w", err)
+	}
+
+	imported := 0
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+
+		name := entry.Name()
+		if !strings.HasSuffix(name, ".db") {
+			continue
+		}
+
+		// Skip system database files
+		if strings.HasPrefix(name, "__marmot") {
+			continue
+		}
+
+		// Skip WAL and SHM files
+		if strings.HasSuffix(name, "-wal") || strings.HasSuffix(name, "-shm") {
+			continue
+		}
+
+		// Extract database name (remove .db suffix)
+		dbName := strings.TrimSuffix(name, ".db")
+
+		// Skip if already exists
+		if _, exists := dm.databases[dbName]; exists {
+			log.Debug().Str("name", dbName).Msg("Database already exists, skipping import")
+			continue
+		}
+
+		// Copy database file to databases directory
+		srcPath := filepath.Join(importDir, name)
+		dstPath := filepath.Join(dm.dataDir, "databases", name)
+
+		if err := copyFile(srcPath, dstPath); err != nil {
+			log.Warn().Err(err).Str("name", dbName).Msg("Failed to copy database file")
+			continue
+		}
+
+		// Copy WAL and SHM files if they exist
+		copyFile(srcPath+"-wal", dstPath+"-wal")
+		copyFile(srcPath+"-shm", dstPath+"-shm")
+
+		// Open and register the database
+		db, err := NewMVCCDatabase(dstPath, dm.nodeID, dm.clock)
+		if err != nil {
+			log.Warn().Err(err).Str("name", dbName).Msg("Failed to open imported database")
+			os.Remove(dstPath)
+			continue
+		}
+
+		// Register in system database
+		createdAt := time.Now().UnixNano()
+		relPath := filepath.Join("databases", name)
+		_, err = dm.systemDB.GetDB().Exec(
+			"INSERT OR IGNORE INTO __marmot_databases (name, created_at, path) VALUES (?, ?, ?)",
+			dbName, createdAt, relPath,
+		)
+		if err != nil {
+			log.Warn().Err(err).Str("name", dbName).Msg("Failed to register imported database")
+			db.Close()
+			continue
+		}
+
+		dm.databases[dbName] = db
+		imported++
+		log.Info().Str("name", dbName).Str("src", srcPath).Msg("Imported existing database")
+	}
+
+	return imported, nil
+}
+
+// copyFile copies a file from src to dst
+func copyFile(src, dst string) error {
+	srcFile, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer srcFile.Close()
+
+	dstFile, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer dstFile.Close()
+
+	_, err = io.Copy(dstFile, srcFile)
+	return err
 }
 
 // SnapshotInfo contains information about a database file for snapshot transfer

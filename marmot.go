@@ -77,10 +77,8 @@ func main() {
 	log.Info().Msg("Initializing Database Manager")
 	clock := hlc.NewClock(cfg.Config.NodeID)
 
-	// Migrate legacy database if it exists
-	if err := db.MigrateFromLegacy(cfg.Config.DBPath, cfg.Config.DataDir, cfg.Config.NodeID, clock); err != nil {
-		log.Error().Err(err).Msg("Failed to migrate legacy database")
-	}
+	// Check if we're joining an existing cluster or starting as seed
+	isJoiningCluster := len(cfg.Config.Cluster.SeedNodes) > 0
 
 	dbMgr, err := db.NewDatabaseManager(cfg.Config.DataDir, cfg.Config.NodeID, clock)
 	if err != nil {
@@ -88,6 +86,18 @@ func main() {
 		return
 	}
 	defer dbMgr.Close()
+
+	// If starting as seed node (no seeds configured), import existing databases from data_dir
+	if !isJoiningCluster {
+		imported, err := dbMgr.ImportExistingDatabases(cfg.Config.DataDir)
+		if err != nil {
+			log.Warn().Err(err).Msg("Failed to import existing databases")
+		} else if imported > 0 {
+			log.Info().Int("count", imported).Msg("Imported existing databases from data directory")
+		}
+	} else {
+		log.Info().Msg("Joining cluster - skipping database import (will sync from peers)")
+	}
 
 	// Get default database for backward compatibility with replication handler
 	defaultDB, err := dbMgr.GetDatabase(db.DefaultDatabaseName)
@@ -168,7 +178,7 @@ func main() {
 	log.Info().
 		Uint64("node_id", cfg.Config.NodeID).
 		Int("grpc_port", cfg.Config.Cluster.GRPCPort).
-		Str("db_path", cfg.Config.DBPath).
+		Str("data_dir", cfg.Config.DataDir).
 		Msg("Node is operational")
 
 	// Keep running

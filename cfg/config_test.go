@@ -15,7 +15,6 @@ func TestValidate_ValidConfig(t *testing.T) {
 	Config = &Configuration{
 		NodeID:  1,
 		DataDir: "./test-data",
-		DBPath:  "./test-data/test.db",
 		Cluster: ClusterConfiguration{
 			GRPCPort: 8080,
 		},

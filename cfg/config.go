@@ -6,7 +6,6 @@ import (
 	"hash/fnv"
 	"os"
 	"path"
-	"path/filepath"
 
 	"github.com/BurntSushi/toml"
 	"github.com/denisbrodbeck/machineid"
@@ -138,7 +137,6 @@ type CoordinatorConfiguration struct {
 type Configuration struct {
 	NodeID  uint64 `toml:"node_id"`
 	DataDir string `toml:"data_dir"`
-	DBPath  string `toml:"db_path"`
 
 	Snapshot       SnapshotConfiguration       `toml:"snapshot"`
 	Cluster        ClusterConfiguration        `toml:"cluster"`
@@ -165,7 +163,6 @@ var (
 var Config = &Configuration{
 	NodeID:  0, // Auto-generate
 	DataDir: "./marmot-data",
-	DBPath:  "./marmot-data/marmot.db",
 
 	Snapshot: SnapshotConfiguration{
 		Enabled:         true,
@@ -263,7 +260,6 @@ func Load(configPath string) error {
 	// Apply CLI overrides
 	if *DataDirFlag != "" {
 		Config.DataDir = *DataDirFlag
-		Config.DBPath = filepath.Join(Config.DataDir, "marmot.db")
 	}
 	if *NodeIDFlag != 0 {
 		Config.NodeID = *NodeIDFlag
@@ -289,9 +285,6 @@ func Load(configPath string) error {
 	if err := os.MkdirAll(Config.DataDir, 0755); err != nil {
 		return fmt.Errorf("failed to create data directory: %w", err)
 	}
-
-	// Update DBPath to be absolute
-	Config.DBPath = filepath.Join(Config.DataDir, filepath.Base(Config.DBPath))
 
 	return nil
 }
