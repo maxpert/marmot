@@ -67,7 +67,6 @@ create_node_config() {
 
 node_id = $node_id
 data_dir = "$data_dir"
-db_path = "$data_dir/marmot.db"
 
 [mvcc]
 gc_interval_seconds = 30

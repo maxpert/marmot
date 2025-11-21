@@ -3,7 +3,6 @@
 
 node_id = 3
 data_dir = "/tmp/marmot-node-3"
-db_path = "/tmp/marmot-node-3/marmot.db"
 
 [mvcc]
 gc_interval_seconds = 30

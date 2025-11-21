@@ -41,7 +41,6 @@ cat > /tmp/marmot-single/config.toml <<'TOML'
 
 node_id = 1
 data_dir = "/tmp/marmot-single"
-db_path = "/tmp/marmot-single/marmot.db"
 
 [mvcc]
 gc_interval_seconds = 30

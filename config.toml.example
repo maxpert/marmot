@@ -9,10 +9,8 @@
 node_id = 0
 
 # Directory for node data (logs, state, etc.)
+# Place existing SQLite .db files here - they will be imported on first startup
 data_dir = "./marmot-data"
-
-# Path to SQLite database file
-db_path = "./marmot-data/marmot.db"
 
 # ==============================================================================
 # MVCC (Multi-Version Concurrency Control)

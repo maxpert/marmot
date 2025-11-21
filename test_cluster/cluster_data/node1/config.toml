@@ -1,6 +1,5 @@
 node_id = 1
 data_dir = "/Users/zohaib/repos/marmot/test_cluster/cluster_data/node1"
-db_path = "/Users/zohaib/repos/marmot/test_cluster/cluster_data/node1/marmot.db"
 
 [mvcc]
 gc_interval_seconds = 30
