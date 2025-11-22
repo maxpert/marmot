@@ -57,6 +57,7 @@ data_dir = "${DATA_DIR}"
 [cluster]
 grpc_bind_address = "0.0.0.0"
 grpc_port = ${GRPC_PORT}
+grpc_advertise_address = "localhost:${GRPC_PORT}"
 seed_nodes = ["${SEED_ADDR}"]
 gossip_interval_ms = 1000
 gossip_fanout = 3
@@ -69,8 +70,12 @@ bind_address = "0.0.0.0"
 port = ${MYSQL_PORT}
 
 [replication]
+default_write_consistency = "QUORUM"  # Replicate to majority
+default_read_consistency = "LOCAL_ONE"
 write_timeout_ms = 5000
 read_timeout_ms = 2000
+enable_anti_entropy = true
+anti_entropy_interval_seconds = 60
 
 [logging]
 verbose = true
