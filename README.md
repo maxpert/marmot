@@ -166,11 +166,30 @@ Marmot handles various failure and recovery scenarios automatically:
 | **Extended outage** | Snapshot transfer + delta sync |
 | **New node joining** | Full snapshot from existing node |
 
+**Anti-Entropy Background Process:**
+
+Marmot v2 includes an automatic anti-entropy system that continuously monitors and repairs replication lag across the cluster:
+
+1. **Lag Detection**: Every 60 seconds (configurable), each node queries peers for their replication state
+2. **Smart Recovery Decision**:
+   - **Delta Sync** if lag < 10,000 transactions AND < 1 hour: Streams missed transactions incrementally
+   - **Snapshot Transfer** if lag exceeds thresholds: Full database file transfer for efficiency
+3. **Multi-Database Support**: Tracks and syncs each database independently
+4. **GC Coordination**: Garbage collection respects peer replication state - logs aren't deleted until all peers have applied them
+
 **Delta Sync Process:**
-1. Recovering node queries `last_applied_txn_id` for each peer
-2. Requests transactions since that ID via `StreamChanges`
+1. Lagging node queries `last_applied_txn_id` for each peer/database
+2. Requests transactions since that ID via `StreamChanges` RPC
 3. Applies changes using LWW conflict resolution
-4. Updates replication state tracking
+4. Updates replication state tracking (per-database)
+5. Progress logged every 100 transactions
+
+**GC Safe Point:**
+- Transaction logs are retained with a two-tier policy:
+  - **Min retention** (1 hour): Don't delete if any peer needs it
+  - **Max retention** (4 hours): Force delete to prevent unbounded growth
+- Each database tracks replication progress per peer
+- GC queries minimum applied txn_id across all peers before cleanup
 
 ### Consistency Guarantees
 
@@ -208,11 +227,13 @@ data_dir = "./marmot-data"
 ```toml
 [mvcc]
 gc_interval_seconds = 30        # Garbage collection interval
-gc_retention_hours = 1          # Keep transaction records for this long
+gc_retention_hours = 1          # Deprecated: Use replication.gc_min_retention_hours instead
 heartbeat_timeout_seconds = 10  # Transaction timeout without heartbeat
 version_retention_count = 10    # MVCC versions to keep per row
 conflict_window_seconds = 10    # LWW conflict resolution window
 ```
+
+**Note**: GC retention is now managed by the replication configuration to coordinate with anti-entropy. The `gc_retention_hours` setting is deprecated in favor of `replication.gc_min_retention_hours` and `replication.gc_max_retention_hours`.
 
 ### Connection Pool
 
@@ -259,13 +280,25 @@ dead_timeout_ms = 10000        # Dead timeout
 
 ```toml
 [replication]
-default_write_consistency = "QUORUM"      # Write consistency level
+default_write_consistency = "QUORUM"      # Write consistency level: ONE, QUORUM, ALL
 default_read_consistency = "LOCAL_ONE"    # Read consistency level
 write_timeout_ms = 5000                   # Write operation timeout
 read_timeout_ms = 2000                    # Read operation timeout
-enable_anti_entropy = true                # Enable anti-entropy repairs
-anti_entropy_interval_seconds = 600       # Anti-entropy interval
+
+# Anti-Entropy Configuration
+enable_anti_entropy = true                 # Enable automatic catch-up for lagging nodes
+anti_entropy_interval_seconds = 60         # How often to check for lag (default: 60s)
+delta_sync_threshold_transactions = 10000  # Max lag to use delta sync vs snapshot
+delta_sync_threshold_seconds = 3600        # Max time lag (1 hour) to use delta sync
+gc_min_retention_hours = 1                 # Min retention before GC (respects peer lag)
+gc_max_retention_hours = 4                 # Max retention before forced GC
 ```
+
+**Anti-Entropy Tuning:**
+- **Small clusters (2-3 nodes)**: Use default settings (60s interval)
+- **Large clusters (5+ nodes)**: Consider increasing interval to 120-180s to reduce network overhead
+- **High write throughput**: Increase `delta_sync_threshold_transactions` to 50000+
+- **Long-running clusters**: Keep `gc_max_retention_hours` at 4+ to handle extended outages
 
 ### MySQL Protocol Server
 
