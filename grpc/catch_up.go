@@ -91,10 +91,7 @@ func (c *CatchUpClient) CatchUp(ctx context.Context) (uint64, error) {
 
 	log.Info().
 		Uint64("snapshot_txn_id", snapshotInfo.SnapshotTxnId).
-		Msg("Catch-up completed successfully")
-
-	// Mark ourselves as ALIVE
-	c.registry.MarkAlive(c.nodeID)
+		Msg("Catch-up completed successfully - node stays JOINING until fully initialized")
 
 	return snapshotInfo.SnapshotTxnId, nil
 }

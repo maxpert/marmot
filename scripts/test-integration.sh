@@ -350,6 +350,72 @@ fi
 echo -e "${GREEN}✓ Node 3 started (port 8083, mysql 3309)${NC}"
 
 echo ""
+echo "Waiting for all nodes to be ready..."
+# Poll until all nodes can accept connections and execute queries
+MAX_WAIT=30  # Maximum 30 seconds
+WAIT_COUNT=0
+ALL_READY=false
+
+while [ $WAIT_COUNT -lt $MAX_WAIT ]; do
+    # Try to ping all three nodes
+    NODE1_OK=false
+    NODE2_OK=false
+    NODE3_OK=false
+
+    if $MYSQL_CLI -h localhost -P 3307 -u root -e "SELECT 1;" > /dev/null 2>&1; then
+        NODE1_OK=true
+    fi
+
+    if $MYSQL_CLI -h localhost -P 3308 -u root -e "SELECT 1;" > /dev/null 2>&1; then
+        NODE2_OK=true
+    fi
+
+    if $MYSQL_CLI -h localhost -P 3309 -u root -e "SELECT 1;" > /dev/null 2>&1; then
+        NODE3_OK=true
+    fi
+
+    if [ "$NODE1_OK" = true ] && [ "$NODE2_OK" = true ] && [ "$NODE3_OK" = true ]; then
+        ALL_READY=true
+        break
+    fi
+
+    sleep 1
+    WAIT_COUNT=$((WAIT_COUNT + 1))
+done
+
+if [ "$ALL_READY" = false ]; then
+    echo -e "${RED}✗ Timeout waiting for nodes to be ready${NC}"
+    exit 1
+fi
+echo -e "${GREEN}✓ All nodes ready (waited ${WAIT_COUNT}s)${NC}"
+
+# Poll cluster state table to ensure all nodes are ALIVE
+echo "Waiting for cluster membership to stabilize..."
+MAX_CLUSTER_WAIT=30
+CLUSTER_WAIT_COUNT=0
+CLUSTER_STABLE=false
+
+while [ $CLUSTER_WAIT_COUNT -lt $MAX_CLUSTER_WAIT ]; do
+    # Query cluster state directly from SQLite (MySQL protocol has issues with system DB)
+    ALIVE_COUNT=$(sqlite3 /tmp/marmot-node-1/__marmot_system.db \
+        "SELECT COUNT(*) FROM __marmot_cluster_nodes WHERE status='ALIVE';" 2>/dev/null || echo "0")
+
+    if [[ "$ALIVE_COUNT" == "3" ]]; then
+        CLUSTER_STABLE=true
+        break
+    fi
+
+    sleep 1
+    CLUSTER_WAIT_COUNT=$((CLUSTER_WAIT_COUNT + 1))
+done
+
+if [ "$CLUSTER_STABLE" = false ]; then
+    echo -e "${YELLOW}⚠ Warning: Not all nodes reached ALIVE state (${ALIVE_COUNT}/3), continuing anyway${NC}"
+else
+    echo -e "${GREEN}✓ Cluster membership stabilized - all 3 nodes ALIVE (waited ${CLUSTER_WAIT_COUNT}s)${NC}"
+fi
+
+echo ""
 echo "Creating test database..."
 $MYSQL_CLI -h localhost -P 3307 -u root -e "CREATE DATABASE testdb;" 2>&1 > /dev/null
 sleep 2

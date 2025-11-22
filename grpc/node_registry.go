@@ -19,7 +19,18 @@ func copySchemaVersionMap(m map[string]uint64) map[string]uint64 {
 	return result
 }
 
-// NodeRegistry tracks cluster membership
+// copyNodeState creates a deep copy of a NodeState
+func copyNodeState(node *NodeState) *NodeState {
+	return &NodeState{
+		NodeId:                 node.NodeId,
+		Address:                node.Address,
+		Status:                 node.Status,
+		Incarnation:            node.Incarnation,
+		DatabaseSchemaVersions: copySchemaVersionMap(node.DatabaseSchemaVersions),
+	}
+}
+
+// NodeRegistry tracks cluster membership using SWIM protocol
 type NodeRegistry struct {
 	localNodeID uint64
 	nodes       map[uint64]*NodeState
@@ -28,20 +39,22 @@ type NodeRegistry struct {
 }
 
 // NewNodeRegistry creates a new node registry
-func NewNodeRegistry(localNodeID uint64) *NodeRegistry {
+func NewNodeRegistry(localNodeID uint64, advertiseAddress string) *NodeRegistry {
 	nr := &NodeRegistry{
 		localNodeID: localNodeID,
 		nodes:       make(map[uint64]*NodeState),
 		lastSeen:    make(map[uint64]time.Time),
 	}
 
-	// Add self to registry
+	// Add self to registry as ALIVE
+	now := time.Now()
 	nr.nodes[localNodeID] = &NodeState{
 		NodeId:      localNodeID,
+		Address:     advertiseAddress,
 		Status:      NodeStatus_ALIVE,
 		Incarnation: 0,
 	}
-	nr.lastSeen[localNodeID] = time.Now()
+	nr.lastSeen[localNodeID] = now
 
 	return nr
 }
@@ -53,19 +66,20 @@ func (nr *NodeRegistry) Add(node *NodeState) {
 
 	nr.nodes[node.NodeId] = node
 	nr.lastSeen[node.NodeId] = time.Now()
-
-	log.Debug().
-		Uint64("node_id", node.NodeId).
-		Str("address", node.Address).
-		Str("status", node.Status.String()).
-		Msg("Node added to registry")
 }
 
-// Update updates a node's state
+// Update updates a node's state using SWIM protocol rules
 func (nr *NodeRegistry) Update(node *NodeState) {
 	nr.mu.Lock()
 	defer nr.mu.Unlock()
 
+	// Rule 1: SWIM refutation - local node rejects non-ALIVE status for itself
+	if node.NodeId == nr.localNodeID {
+		nr.handleSelfUpdate(node)
+		return
+	}
+
+	// Rule 2: Discover new nodes
 	existing, exists := nr.nodes[node.NodeId]
 	if !exists {
 		nr.nodes[node.NodeId] = node
@@ -73,37 +87,45 @@ func (nr *NodeRegistry) Update(node *NodeState) {
 		return
 	}
 
-	// Always update lastSeen when we hear about a node (even if state doesn't change)
+	// Rule 3: Always update lastSeen (even if state unchanged)
 	nr.lastSeen[node.NodeId] = time.Now()
 
-	// Update state only if newer incarnation
-	// SWIM protocol: updates with same/older incarnation should be ignored
+	// Rule 4: Apply SWIM state update rules
 	if node.Incarnation > existing.Incarnation {
+		// Higher incarnation always wins
 		nr.nodes[node.NodeId] = node
-
-		log.Debug().
-			Uint64("node_id", node.NodeId).
-			Str("old_status", existing.Status.String()).
-			Str("new_status", node.Status.String()).
-			Msg("Node state updated")
-	} else if node.Incarnation == existing.Incarnation {
-		// With same incarnation, only allow status escalation (ALIVE -> SUSPECT -> DEAD)
-		shouldUpdate := false
-		if existing.Status == NodeStatus_ALIVE && node.Status != NodeStatus_ALIVE {
-			shouldUpdate = true // Escalate ALIVE -> SUSPECT or DEAD
-		} else if existing.Status == NodeStatus_SUSPECT && node.Status == NodeStatus_DEAD {
-			shouldUpdate = true // Escalate SUSPECT -> DEAD
-		}
-
-		if shouldUpdate {
-			nr.nodes[node.NodeId] = node
-			log.Debug().
-				Uint64("node_id", node.NodeId).
-				Str("old_status", existing.Status.String()).
-				Str("new_status", node.Status.String()).
-				Msg("Node state updated")
-		}
+	} else if node.Incarnation == existing.Incarnation && nr.shouldEscalate(existing.Status, node.Status) {
+		// Same incarnation: only allow escalation (ALIVE -> SUSPECT -> DEAD)
+		existing.Status = node.Status
 	}
+	// Ignore updates with same/older incarnation that don't escalate
+}
+
+// handleSelfUpdate implements SWIM refutation for local node
+func (nr *NodeRegistry) handleSelfUpdate(node *NodeState) {
+	self := nr.nodes[nr.localNodeID]
+
+	// If someone claims we're SUSPECT/DEAD, refute by incrementing incarnation
+	if node.Status != NodeStatus_ALIVE && node.Incarnation >= self.Incarnation {
+		self.Incarnation = node.Incarnation + 1
+		self.Status = NodeStatus_ALIVE
+		log.Warn().
+			Uint64("refuted_incarnation", node.Incarnation).
+			Uint64("new_incarnation", self.Incarnation).
+			Msg("SWIM refutation: rejecting SUSPECT/DEAD claim")
+	}
+}
+
+// shouldEscalate returns true if oldStatus -> newStatus is a valid escalation
+func (nr *NodeRegistry) shouldEscalate(oldStatus, newStatus NodeStatus) bool {
+	// ALIVE -> SUSPECT -> DEAD is the only valid escalation path
+	if oldStatus == NodeStatus_ALIVE && (newStatus == NodeStatus_SUSPECT || newStatus == NodeStatus_DEAD) {
+		return true
+	}
+	if oldStatus == NodeStatus_SUSPECT && newStatus == NodeStatus_DEAD {
+		return true
+	}
+	return false
 }
 
 // Get retrieves a node's state (returns a copy to avoid race conditions)
@@ -116,15 +138,7 @@ func (nr *NodeRegistry) Get(nodeID uint64) (*NodeState, bool) {
 		return nil, false
 	}
 
-	// Return a copy to avoid races when caller accesses fields
-	nodeCopy := &NodeState{
-		NodeId:                 node.NodeId,
-		Address:                node.Address,
-		Status:                 node.Status,
-		Incarnation:            node.Incarnation,
-		DatabaseSchemaVersions: copySchemaVersionMap(node.DatabaseSchemaVersions),
-	}
-	return nodeCopy, true
+	return copyNodeState(node), true
 }
 
 // GetAll returns all nodes (returns copies to avoid race conditions)
@@ -134,15 +148,7 @@ func (nr *NodeRegistry) GetAll() []*NodeState {
 
 	nodes := make([]*NodeState, 0, len(nr.nodes))
 	for _, node := range nr.nodes {
-		// Return a copy to avoid races during serialization
-		nodeCopy := &NodeState{
-			NodeId:                 node.NodeId,
-			Address:                node.Address,
-			Status:                 node.Status,
-			Incarnation:            node.Incarnation,
-			DatabaseSchemaVersions: copySchemaVersionMap(node.DatabaseSchemaVersions),
-		}
-		nodes = append(nodes, nodeCopy)
+		nodes = append(nodes, copyNodeState(node))
 	}
 
 	return nodes
@@ -156,15 +162,7 @@ func (nr *NodeRegistry) GetAlive() []*NodeState {
 	nodes := make([]*NodeState, 0)
 	for _, node := range nr.nodes {
 		if node.Status == NodeStatus_ALIVE {
-			// Return a copy to avoid races during serialization
-			nodeCopy := &NodeState{
-				NodeId:                 node.NodeId,
-				Address:                node.Address,
-				Status:                 node.Status,
-				Incarnation:            node.Incarnation,
-				DatabaseSchemaVersions: copySchemaVersionMap(node.DatabaseSchemaVersions),
-			}
-			nodes = append(nodes, nodeCopy)
+			nodes = append(nodes, copyNodeState(node))
 		}
 	}
 
@@ -204,38 +202,29 @@ func (nr *NodeRegistry) Remove(nodeID uint64) {
 	log.Info().Uint64("node_id", nodeID).Msg("Node removed from registry")
 }
 
-// CheckTimeouts checks for nodes that haven't been seen recently
+// CheckTimeouts marks nodes as SUSPECT or DEAD based on timeout rules
 func (nr *NodeRegistry) CheckTimeouts(suspectTimeout, deadTimeout time.Duration) {
 	nr.mu.Lock()
 	defer nr.mu.Unlock()
 
 	now := time.Now()
-
 	for nodeID, node := range nr.nodes {
 		if nodeID == nr.localNodeID {
-			continue // Skip self
+			continue
 		}
 
-		lastSeen := nr.lastSeen[nodeID]
-		elapsed := now.Sub(lastSeen)
+		elapsed := now.Sub(nr.lastSeen[nodeID])
 
 		switch node.Status {
 		case NodeStatus_ALIVE:
 			if elapsed > suspectTimeout {
 				node.Status = NodeStatus_SUSPECT
-				log.Warn().
-					Uint64("node_id", nodeID).
-					Dur("elapsed", elapsed).
-					Msg("Node became suspect (timeout)")
+				log.Warn().Uint64("node_id", nodeID).Msg("Node marked SUSPECT")
 			}
-
 		case NodeStatus_SUSPECT:
 			if elapsed > deadTimeout {
 				node.Status = NodeStatus_DEAD
-				log.Error().
-					Uint64("node_id", nodeID).
-					Dur("elapsed", elapsed).
-					Msg("Node declared dead (timeout)")
+				log.Error().Uint64("node_id", nodeID).Msg("Node marked DEAD")
 			}
 		}
 	}
@@ -275,14 +264,7 @@ func (nr *NodeRegistry) GetReplicationEligible() []*NodeState {
 		// Only ALIVE nodes participate in replication
 		// JOINING nodes are syncing and shouldn't receive writes
 		if node.Status == NodeStatus_ALIVE {
-			nodeCopy := &NodeState{
-				NodeId:                 node.NodeId,
-				Address:                node.Address,
-				Status:                 node.Status,
-				Incarnation:            node.Incarnation,
-				DatabaseSchemaVersions: copySchemaVersionMap(node.DatabaseSchemaVersions),
-			}
-			nodes = append(nodes, nodeCopy)
+			nodes = append(nodes, copyNodeState(node))
 		}
 	}
 
@@ -307,7 +289,8 @@ func (nr *NodeRegistry) MarkAlive(nodeID uint64) {
 
 	if node, exists := nr.nodes[nodeID]; exists {
 		node.Status = NodeStatus_ALIVE
-		log.Info().Uint64("node_id", nodeID).Msg("Node marked as alive")
+		node.Incarnation++ // Increment to propagate state change via gossip
+		nr.lastSeen[nodeID] = time.Now()
 	}
 }
 
@@ -317,13 +300,19 @@ func (nr *NodeRegistry) UpdateSchemaVersions(versions map[string]uint64) {
 	nr.mu.Lock()
 	defer nr.mu.Unlock()
 
-	if node, exists := nr.nodes[nr.localNodeID]; exists {
-		node.DatabaseSchemaVersions = copySchemaVersionMap(versions)
-		log.Debug().
+	node, exists := nr.nodes[nr.localNodeID]
+	if !exists {
+		log.Error().
 			Uint64("node_id", nr.localNodeID).
-			Interface("versions", versions).
-			Msg("Updated schema versions")
+			Msg("BUG: Local node not found in registry during schema version update")
+		return
 	}
+
+	node.DatabaseSchemaVersions = copySchemaVersionMap(versions)
+	log.Debug().
+		Uint64("node_id", nr.localNodeID).
+		Interface("versions", versions).
+		Msg("Updated schema versions")
 }
 
 // GetLocalSchemaVersions returns the local node's schema versions

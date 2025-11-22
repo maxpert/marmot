@@ -37,7 +37,7 @@ type testNode struct {
 
 // newTestNode creates a new test node with in-memory networking
 func newTestNode(nodeID uint64, replicas, vnodes int) *testNode {
-	registry := NewNodeRegistry(nodeID)
+	registry := NewNodeRegistry(nodeID, fmt.Sprintf("localhost:808%d", nodeID))
 
 	client := NewClient(nodeID)
 

@@ -3,6 +3,7 @@ package coordinator
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"strings"
 	"time"
 
@@ -29,6 +30,41 @@ type SchemaVersionManager interface {
 // NodeRegistry interface to avoid import cycles
 type NodeRegistry interface {
 	UpdateSchemaVersions(versions map[string]uint64)
+	CountAlive() int
+	GetAll() []any // Returns slice of node states (avoids import cycle)
+}
+
+// NodeState represents cluster node state
+type NodeState struct {
+	NodeId      uint64
+	Address     string
+	Status      NodeStatus
+	Incarnation uint64
+}
+
+// NodeStatus enum
+type NodeStatus int32
+
+const (
+	NodeStatus_JOINING NodeStatus = 0
+	NodeStatus_ALIVE   NodeStatus = 1
+	NodeStatus_SUSPECT NodeStatus = 2
+	NodeStatus_DEAD    NodeStatus = 3
+)
+
+func (s NodeStatus) String() string {
+	switch s {
+	case NodeStatus_JOINING:
+		return "JOINING"
+	case NodeStatus_ALIVE:
+		return "ALIVE"
+	case NodeStatus_SUSPECT:
+		return "SUSPECT"
+	case NodeStatus_DEAD:
+		return "DEAD"
+	default:
+		return "UNKNOWN"
+	}
 }
 
 // CoordinatorHandler implements protocol.ConnectionHandler
@@ -69,6 +105,13 @@ func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, qu
 	// Intercept MySQL system variable queries
 	if strings.Contains(query, "@@") || strings.Contains(strings.ToUpper(query), "DATABASE()") {
 		return h.handleSystemQuery(session, query)
+	}
+
+	// Intercept cluster state queries
+	upperQuery := strings.ToUpper(strings.TrimSpace(query))
+	if strings.Contains(upperQuery, "FROM MARMOT_CLUSTER_NODES") ||
+	   strings.Contains(upperQuery, "FROM MARMOT.CLUSTER_NODES") {
+		return h.handleClusterStateQuery(session, query)
 	}
 
 	stmt := protocol.ParseStatement(query)
@@ -419,4 +462,63 @@ func (h *CoordinatorHandler) getSystemVariable(varExpr string, session *protocol
 	// Default: return empty string for unknown variables
 	// Note: This may cause issues with JDBC if it expects a numeric value
 	return ""
+}
+
+// handleClusterStateQuery returns current cluster membership state
+func (h *CoordinatorHandler) handleClusterStateQuery(session *protocol.ConnectionSession, query string) (*protocol.ResultSet, error) {
+	// Get cluster state from node registry
+	rawNodes := h.nodeRegistry.GetAll()
+
+	// Extract fields using reflection/type assertion
+	nodes := make([]*NodeState, 0, len(rawNodes))
+	for _, n := range rawNodes {
+		// Type assert to access fields
+		// The underlying type is *grpc.NodeState but we avoid import cycle
+		// So we use reflection-like field access via any
+		nMap := make(map[string]interface{})
+
+		// Use reflection to extract fields
+		nVal := reflect.ValueOf(n)
+		if nVal.Kind() == reflect.Ptr {
+			nVal = nVal.Elem()
+		}
+
+		nMap["NodeId"] = nVal.FieldByName("NodeId").Uint()
+		nMap["Address"] = nVal.FieldByName("Address").String()
+		nMap["Incarnation"] = nVal.FieldByName("Incarnation").Uint()
+
+		statusVal := nVal.FieldByName("Status")
+		statusInt := int32(statusVal.Int())
+
+		nodes = append(nodes, &NodeState{
+			NodeId:      nMap["NodeId"].(uint64),
+			Address:     nMap["Address"].(string),
+			Status:      NodeStatus(statusInt),
+			Incarnation: nMap["Incarnation"].(uint64),
+		})
+	}
+
+	// Build result set
+	columns := []protocol.ColumnDef{
+		{Name: "node_id", Type: 0x08},    // MYSQL_TYPE_LONGLONG
+		{Name: "address", Type: 0xFD},    // MYSQL_TYPE_VAR_STRING
+		{Name: "status", Type: 0xFD},     // MYSQL_TYPE_VAR_STRING
+		{Name: "incarnation", Type: 0x08}, // MYSQL_TYPE_LONGLONG
+	}
+
+	rows := make([][]interface{}, 0, len(nodes))
+	for _, node := range nodes {
+		row := []interface{}{
+			node.NodeId,
+			node.Address,
+			node.Status.String(),
+			node.Incarnation,
+		}
+		rows = append(rows, row)
+	}
+
+	return &protocol.ResultSet{
+		Columns: columns,
+		Rows:    rows,
+	}, nil
 }

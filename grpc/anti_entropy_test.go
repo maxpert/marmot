@@ -99,7 +99,7 @@ func TestAntiEntropyGetStats(t *testing.T) {
 // TestAntiEntropyStartStop tests start/stop lifecycle
 func TestAntiEntropyStartStop(t *testing.T) {
 	// Create a minimal registry for testing
-	registry := NewNodeRegistry(1)
+	registry := NewNodeRegistry(1, "localhost:8081")
 
 	ae := &AntiEntropyService{
 		nodeID:                1,

@@ -6,7 +6,7 @@ import (
 )
 
 func TestNodeRegistry_Add(t *testing.T) {
-	nr := NewNodeRegistry(1)
+	nr := NewNodeRegistry(1, "localhost:8081")
 
 	// Should start with self
 	if nr.Count() != 1 {
@@ -34,7 +34,7 @@ func TestNodeRegistry_Add(t *testing.T) {
 }
 
 func TestNodeRegistry_Get(t *testing.T) {
-	nr := NewNodeRegistry(1)
+	nr := NewNodeRegistry(1, "localhost:8081")
 
 	// Get self
 	node, exists := nr.Get(1)
@@ -69,7 +69,7 @@ func TestNodeRegistry_Get(t *testing.T) {
 }
 
 func TestNodeRegistry_Update(t *testing.T) {
-	nr := NewNodeRegistry(1)
+	nr := NewNodeRegistry(1, "localhost:8081")
 
 	// Add node
 	nr.Add(&NodeState{
@@ -123,7 +123,7 @@ func TestNodeRegistry_Update(t *testing.T) {
 }
 
 func TestNodeRegistry_GetAlive(t *testing.T) {
-	nr := NewNodeRegistry(1)
+	nr := NewNodeRegistry(1, "localhost:8081")
 
 	// Add mix of alive and dead nodes
 	nr.Add(&NodeState{NodeId: 2, Status: NodeStatus_ALIVE})
@@ -147,7 +147,7 @@ func TestNodeRegistry_GetAlive(t *testing.T) {
 }
 
 func TestNodeRegistry_MarkSuspect(t *testing.T) {
-	nr := NewNodeRegistry(1)
+	nr := NewNodeRegistry(1, "localhost:8081")
 
 	nr.Add(&NodeState{
 		NodeId: 2,
@@ -163,7 +163,7 @@ func TestNodeRegistry_MarkSuspect(t *testing.T) {
 }
 
 func TestNodeRegistry_MarkDead(t *testing.T) {
-	nr := NewNodeRegistry(1)
+	nr := NewNodeRegistry(1, "localhost:8081")
 
 	nr.Add(&NodeState{
 		NodeId: 2,
@@ -179,7 +179,7 @@ func TestNodeRegistry_MarkDead(t *testing.T) {
 }
 
 func TestNodeRegistry_Remove(t *testing.T) {
-	nr := NewNodeRegistry(1)
+	nr := NewNodeRegistry(1, "localhost:8081")
 
 	nr.Add(&NodeState{NodeId: 2})
 	nr.Add(&NodeState{NodeId: 3})
@@ -201,7 +201,7 @@ func TestNodeRegistry_Remove(t *testing.T) {
 }
 
 func TestNodeRegistry_CheckTimeouts(t *testing.T) {
-	nr := NewNodeRegistry(1)
+	nr := NewNodeRegistry(1, "localhost:8081")
 
 	// Add node and record when we saw it
 	nr.Add(&NodeState{
@@ -233,7 +233,7 @@ func TestNodeRegistry_CheckTimeouts(t *testing.T) {
 }
 
 func TestNodeRegistry_CheckTimeouts_SkipsSelf(t *testing.T) {
-	nr := NewNodeRegistry(1)
+	nr := NewNodeRegistry(1, "localhost:8081")
 
 	// Manipulate self's lastSeen
 	nr.lastSeen[1] = time.Now().Add(-100 * time.Second)
@@ -249,7 +249,7 @@ func TestNodeRegistry_CheckTimeouts_SkipsSelf(t *testing.T) {
 }
 
 func TestNodeRegistry_CountAlive(t *testing.T) {
-	nr := NewNodeRegistry(1)
+	nr := NewNodeRegistry(1, "localhost:8081")
 
 	// Add mix of nodes
 	nr.Add(&NodeState{NodeId: 2, Status: NodeStatus_ALIVE})
@@ -266,7 +266,7 @@ func TestNodeRegistry_CountAlive(t *testing.T) {
 }
 
 func TestNodeRegistry_GetAll(t *testing.T) {
-	nr := NewNodeRegistry(1)
+	nr := NewNodeRegistry(1, "localhost:8081")
 
 	nr.Add(&NodeState{NodeId: 2})
 	nr.Add(&NodeState{NodeId: 3})
@@ -292,7 +292,7 @@ func TestNodeRegistry_GetAll(t *testing.T) {
 }
 
 func BenchmarkNodeRegistry_Add(b *testing.B) {
-	nr := NewNodeRegistry(1)
+	nr := NewNodeRegistry(1, "localhost:8081")
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -304,7 +304,7 @@ func BenchmarkNodeRegistry_Add(b *testing.B) {
 }
 
 func BenchmarkNodeRegistry_Get(b *testing.B) {
-	nr := NewNodeRegistry(1)
+	nr := NewNodeRegistry(1, "localhost:8081")
 
 	// Pre-populate
 	for i := 2; i <= 1000; i++ {
@@ -321,7 +321,7 @@ func BenchmarkNodeRegistry_Get(b *testing.B) {
 }
 
 func BenchmarkNodeRegistry_GetAlive(b *testing.B) {
-	nr := NewNodeRegistry(1)
+	nr := NewNodeRegistry(1, "localhost:8081")
 
 	// Pre-populate with mix
 	for i := 2; i <= 1000; i++ {
@@ -341,5 +341,181 @@ func BenchmarkNodeRegistry_GetAlive(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		nr.GetAlive()
+	}
+}
+
+// TestSWIMRefutation verifies that a node refutes SUSPECT/DEAD claims about itself
+func TestSWIMRefutation(t *testing.T) {
+	localID := uint64(1)
+	nr := NewNodeRegistry(localID, "localhost:8081")
+
+	// Verify local node starts as ALIVE at incarnation 0
+	self, exists := nr.Get(localID)
+	if !exists {
+		t.Fatal("Local node should exist in registry")
+	}
+	if self.Status != NodeStatus_ALIVE {
+		t.Errorf("Local node should be ALIVE, got %v", self.Status)
+	}
+	if self.Incarnation != 0 {
+		t.Errorf("Local node should have incarnation 0, got %d", self.Incarnation)
+	}
+
+	// Test 1: Another node claims we're SUSPECT at incarnation 0
+	// We should refute by incrementing to incarnation 1
+	suspectClaim := &NodeState{
+		NodeId:      localID,
+		Status:      NodeStatus_SUSPECT,
+		Incarnation: 0,
+		Address:     "localhost:8081",
+	}
+	nr.Update(suspectClaim)
+
+	self, _ = nr.Get(localID)
+	if self.Status != NodeStatus_ALIVE {
+		t.Errorf("Should have refuted SUSPECT claim, status is %v", self.Status)
+	}
+	if self.Incarnation != 1 {
+		t.Errorf("Should have incremented incarnation to 1, got %d", self.Incarnation)
+	}
+
+	// Test 2: Another SUSPECT claim at same incarnation (1)
+	// We should refute again
+	suspectClaim2 := &NodeState{
+		NodeId:      localID,
+		Status:      NodeStatus_SUSPECT,
+		Incarnation: 1,
+		Address:     "localhost:8081",
+	}
+	nr.Update(suspectClaim2)
+
+	self, _ = nr.Get(localID)
+	if self.Status != NodeStatus_ALIVE {
+		t.Errorf("Should have refuted second SUSPECT claim, status is %v", self.Status)
+	}
+	if self.Incarnation != 2 {
+		t.Errorf("Should have incremented incarnation to 2, got %d", self.Incarnation)
+	}
+
+	// Test 3: DEAD claim should also be refuted
+	deadClaim := &NodeState{
+		NodeId:      localID,
+		Status:      NodeStatus_DEAD,
+		Incarnation: 2,
+		Address:     "localhost:8081",
+	}
+	nr.Update(deadClaim)
+
+	self, _ = nr.Get(localID)
+	if self.Status != NodeStatus_ALIVE {
+		t.Errorf("Should have refuted DEAD claim, status is %v", self.Status)
+	}
+	if self.Incarnation != 3 {
+		t.Errorf("Should have incremented incarnation to 3, got %d", self.Incarnation)
+	}
+}
+
+// TestStateEscalation verifies ALIVE -> SUSPECT -> DEAD escalation rules
+func TestStateEscalation(t *testing.T) {
+	nr := NewNodeRegistry(1, "localhost:8081")
+
+	// Add a remote node as ALIVE
+	remoteID := uint64(2)
+	remoteNode := &NodeState{
+		NodeId:      remoteID,
+		Status:      NodeStatus_ALIVE,
+		Incarnation: 0,
+		Address:     "localhost:8082",
+	}
+	nr.Add(remoteNode)
+
+	// Test 1: Same incarnation, escalate ALIVE -> SUSPECT
+	suspectUpdate := &NodeState{
+		NodeId:      remoteID,
+		Status:      NodeStatus_SUSPECT,
+		Incarnation: 0,
+		Address:     "localhost:8082",
+	}
+	nr.Update(suspectUpdate)
+
+	node, _ := nr.Get(remoteID)
+	if node.Status != NodeStatus_SUSPECT {
+		t.Errorf("Should escalate to SUSPECT, got %v", node.Status)
+	}
+
+	// Test 2: Same incarnation, escalate SUSPECT -> DEAD
+	deadUpdate := &NodeState{
+		NodeId:      remoteID,
+		Status:      NodeStatus_DEAD,
+		Incarnation: 0,
+		Address:     "localhost:8082",
+	}
+	nr.Update(deadUpdate)
+
+	node, _ = nr.Get(remoteID)
+	if node.Status != NodeStatus_DEAD {
+		t.Errorf("Should escalate to DEAD, got %v", node.Status)
+	}
+
+	// Test 3: Same incarnation, try to de-escalate DEAD -> ALIVE (should be ignored)
+	aliveUpdate := &NodeState{
+		NodeId:      remoteID,
+		Status:      NodeStatus_ALIVE,
+		Incarnation: 0,
+		Address:     "localhost:8082",
+	}
+	nr.Update(aliveUpdate)
+
+	node, _ = nr.Get(remoteID)
+	if node.Status != NodeStatus_DEAD {
+		t.Errorf("Should not de-escalate, status should remain DEAD, got %v", node.Status)
+	}
+}
+
+// TestIncarnationOrdering verifies higher incarnations always win
+func TestIncarnationOrdering(t *testing.T) {
+	nr := NewNodeRegistry(1, "localhost:8081")
+
+	// Add node at incarnation 5
+	remoteID := uint64(2)
+	nr.Add(&NodeState{
+		NodeId:      remoteID,
+		Status:      NodeStatus_ALIVE,
+		Incarnation: 5,
+		Address:     "localhost:8082",
+	})
+
+	// Test 1: Lower incarnation update should be ignored
+	oldUpdate := &NodeState{
+		NodeId:      remoteID,
+		Status:      NodeStatus_DEAD,
+		Incarnation: 3,
+		Address:     "localhost:8082",
+	}
+	nr.Update(oldUpdate)
+
+	node, _ := nr.Get(remoteID)
+	if node.Incarnation != 5 {
+		t.Errorf("Should ignore old incarnation, have %d", node.Incarnation)
+	}
+	if node.Status != NodeStatus_ALIVE {
+		t.Errorf("Status should remain ALIVE, got %v", node.Status)
+	}
+
+	// Test 2: Higher incarnation should always win
+	newUpdate := &NodeState{
+		NodeId:      remoteID,
+		Status:      NodeStatus_SUSPECT,
+		Incarnation: 10,
+		Address:     "localhost:8082",
+	}
+	nr.Update(newUpdate)
+
+	node, _ = nr.Get(remoteID)
+	if node.Incarnation != 10 {
+		t.Errorf("Should accept higher incarnation, have %d", node.Incarnation)
+	}
+	if node.Status != NodeStatus_SUSPECT {
+		t.Errorf("Status should be SUSPECT, got %v", node.Status)
 	}
 }

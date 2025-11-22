@@ -100,9 +100,9 @@ func main() {
 				log.Fatal().Err(err).Msg("Failed to catch up from cluster")
 				return
 			}
-			log.Info().Uint64("snapshot_txn_id", snapshotTxnID).Msg("Catch-up completed")
+			log.Info().Uint64("snapshot_txn_id", snapshotTxnID).Msg("Catch-up completed - staying in JOINING")
 		} else {
-			log.Info().Msg("Node data exists - skipping catch-up")
+			log.Info().Msg("Node data exists - skipping catch-up, staying in JOINING")
 		}
 	}
 
@@ -215,6 +215,9 @@ func main() {
 	log.Info().Msg("Initializing MySQL protocol server")
 
 	// Create handler to bridge MySQL protocol and coordinators
+	// Wrap node registry to provide []any interface (avoids import cycle)
+	registryAdapter := marmotgrpc.NewNodeRegistryAdapter(gossip.GetNodeRegistry())
+
 	handler := coordinator.NewCoordinatorHandler(
 		cfg.Config.NodeID,
 		writeCoordinator,
@@ -223,7 +226,7 @@ func main() {
 		dbMgr,
 		ddlLockMgr,
 		schemaVersionMgr,
-		gossip.GetNodeRegistry(),
+		registryAdapter,
 	)
 
 	// Create and start MySQL server
@@ -238,6 +241,14 @@ func main() {
 	}
 	defer mysqlServer.Stop()
 
+	// Now that all services are initialized and running, mark node as ALIVE
+	if isJoiningCluster {
+		grpcServer.GetNodeRegistry().MarkAlive(cfg.Config.NodeID)
+		// Immediately broadcast ALIVE status to accelerate propagation
+		gossip.BroadcastImmediate()
+		log.Info().Msg("Node fully initialized - transitioned to ALIVE")
+	}
+
 	log.Info().Msg("Marmot v2.0 started successfully")
 	log.Info().
 		Uint64("node_id", cfg.Config.NodeID).
@@ -251,9 +262,10 @@ func main() {
 
 func initializeGRPCServer() (*marmotgrpc.Server, error) {
 	config := marmotgrpc.ServerConfig{
-		NodeID:  cfg.Config.NodeID,
-		Address: cfg.Config.Cluster.GRPCBindAddress,
-		Port:    cfg.Config.Cluster.GRPCPort,
+		NodeID:           cfg.Config.NodeID,
+		Address:          cfg.Config.Cluster.GRPCBindAddress,
+		Port:             cfg.Config.Cluster.GRPCPort,
+		AdvertiseAddress: cfg.Config.Cluster.GRPCAdvertiseAddress,
 	}
 
 	server, err := marmotgrpc.NewServer(config)

@@ -44,9 +44,10 @@ type Server struct {
 
 // ServerConfig holds configuration for the gRPC server
 type ServerConfig struct {
-	NodeID  uint64
-	Address string
-	Port    int
+	NodeID           uint64
+	Address          string
+	Port             int
+	AdvertiseAddress string
 }
 
 // NewServer creates a new gRPC server
@@ -57,8 +58,8 @@ func NewServer(config ServerConfig) (*Server, error) {
 		port:    config.Port,
 	}
 
-	// Initialize components
-	s.registry = NewNodeRegistry(config.NodeID)
+	// Initialize components with advertise address
+	s.registry = NewNodeRegistry(config.NodeID, config.AdvertiseAddress)
 	s.gossip = NewGossipProtocol(config.NodeID, s.registry)
 
 	return s, nil
@@ -121,10 +122,13 @@ func (s *Server) Stop() {
 
 // Gossip handles gossip protocol messages
 func (s *Server) Gossip(ctx context.Context, req *GossipRequest) (*GossipResponse, error) {
-	log.Debug().
-		Uint64("from_node", req.SourceNodeId).
-		Int("nodes", len(req.Nodes)).
-		Msg("Received gossip message")
+	// Update lastSeen for the source node (the node that sent this gossip message)
+	// This prevents marking active gossiping nodes as SUSPECT
+	s.registry.mu.Lock()
+	if _, exists := s.registry.nodes[req.SourceNodeId]; exists {
+		s.registry.lastSeen[req.SourceNodeId] = time.Now()
+	}
+	s.registry.mu.Unlock()
 
 	// Merge received node states
 	for _, nodeState := range req.Nodes {
@@ -145,11 +149,12 @@ func (s *Server) Join(ctx context.Context, req *JoinRequest) (*JoinResponse, err
 		Str("address", req.Address).
 		Msg("Node joining cluster")
 
-	// Add node to registry
+	// Add node to registry with JOINING status
+	// The node will transition to ALIVE after it completes catch-up
 	nodeState := &NodeState{
 		NodeId:      req.NodeId,
 		Address:     req.Address,
-		Status:      NodeStatus_ALIVE,
+		Status:      NodeStatus_JOINING,
 		Incarnation: 0,
 	}
 	s.registry.Add(nodeState)
