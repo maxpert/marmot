@@ -2,7 +2,6 @@ package grpc
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 
 	"github.com/maxpert/marmot/db"
@@ -13,17 +12,15 @@ import (
 // ReplicationHandler handles transaction replication with MVCC
 type ReplicationHandler struct {
 	nodeID uint64
-	db     *sql.DB
-	txnMgr *db.MVCCTransactionManager
+	dbMgr  *db.DatabaseManager
 	clock  *hlc.Clock
 }
 
 // NewReplicationHandler creates a new replication handler
-func NewReplicationHandler(nodeID uint64, database *sql.DB, txnMgr *db.MVCCTransactionManager, clock *hlc.Clock) *ReplicationHandler {
+func NewReplicationHandler(nodeID uint64, dbMgr *db.DatabaseManager, clock *hlc.Clock) *ReplicationHandler {
 	return &ReplicationHandler{
 		nodeID: nodeID,
-		db:     database,
-		txnMgr: txnMgr,
+		dbMgr:  dbMgr,
 		clock:  clock,
 	}
 }
@@ -56,8 +53,26 @@ func (rh *ReplicationHandler) HandleReplicateTransaction(ctx context.Context, re
 
 // handlePrepare processes Phase 1 of 2PC: Create write intents
 func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *TransactionRequest) (*TransactionResponse, error) {
+	// Get the target database from request
+	dbName := req.Database
+	if dbName == "" {
+		dbName = db.DefaultDatabaseName
+	}
+
+	// Get database instance
+	dbInstance, err := rh.dbMgr.GetDatabase(dbName)
+	if err != nil {
+		return &TransactionResponse{
+			Success:      false,
+			ErrorMessage: fmt.Sprintf("database %s not found: %v", dbName, err),
+		}, nil
+	}
+
+	txnMgr := dbInstance.GetTransactionManager()
+	database := dbInstance.GetDB()
+
 	// Begin local transaction
-	txn, err := rh.txnMgr.BeginTransaction(req.SourceNodeId)
+	txn, err := txnMgr.BeginTransaction(req.SourceNodeId)
 	if err != nil {
 		return &TransactionResponse{
 			Success:      false,
@@ -77,16 +92,16 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 	}
 
 	// Update the transaction ID in the active transactions map
-	rh.txnMgr.UpdateTransactionID(originalID, req.TxnId)
+	txnMgr.UpdateTransactionID(originalID, req.TxnId)
 
 	// Update transaction record in database with coordinator's ID
-	_, err = rh.db.Exec(`
+	_, err = database.Exec(`
 		UPDATE __marmot__txn_records
 		SET txn_id = ?
 		WHERE txn_id = ?
 	`, req.TxnId, originalID)
 	if err != nil {
-		rh.txnMgr.AbortTransaction(txn)
+		txnMgr.AbortTransaction(txn)
 		return &TransactionResponse{
 			Success:      false,
 			ErrorMessage: fmt.Sprintf("failed to update txn ID: %v", err),
@@ -100,11 +115,12 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 			SQL:       stmt.Sql,
 			Type:      convertStatementType(stmt.Type),
 			TableName: stmt.TableName,
+			Database:  stmt.Database,
 		}
 
 		// Add statement to transaction
-		if err := rh.txnMgr.AddStatement(txn, internalStmt); err != nil {
-			rh.txnMgr.AbortTransaction(txn)
+		if err := txnMgr.AddStatement(txn, internalStmt); err != nil {
+			txnMgr.AbortTransaction(txn)
 			return &TransactionResponse{
 				Success:      false,
 				ErrorMessage: fmt.Sprintf("failed to add statement: %v", err),
@@ -120,10 +136,10 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 			"timestamp": req.Timestamp.WallTime,
 		})
 
-		err := rh.txnMgr.WriteIntent(txn, stmt.TableName, rowKey, internalStmt, dataSnapshot)
+		err := txnMgr.WriteIntent(txn, stmt.TableName, rowKey, internalStmt, dataSnapshot)
 		if err != nil {
 			// Write-write conflict detected!
-			rh.txnMgr.AbortTransaction(txn)
+			txnMgr.AbortTransaction(txn)
 			return &TransactionResponse{
 				Success:          false,
 				ErrorMessage:     fmt.Sprintf("write conflict: %v", err),
@@ -146,8 +162,25 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 
 // handleCommit processes Phase 2 of 2PC: Commit transaction
 func (rh *ReplicationHandler) handleCommit(ctx context.Context, req *TransactionRequest) (*TransactionResponse, error) {
+	// Get the target database from request
+	dbName := req.Database
+	if dbName == "" {
+		dbName = db.DefaultDatabaseName
+	}
+
+	// Get database instance
+	dbInstance, err := rh.dbMgr.GetDatabase(dbName)
+	if err != nil {
+		return &TransactionResponse{
+			Success:      false,
+			ErrorMessage: fmt.Sprintf("database %s not found: %v", dbName, err),
+		}, nil
+	}
+
+	txnMgr := dbInstance.GetTransactionManager()
+
 	// Retrieve transaction from active transactions
-	txn := rh.txnMgr.GetTransaction(req.TxnId)
+	txn := txnMgr.GetTransaction(req.TxnId)
 	if txn == nil {
 		return &TransactionResponse{
 			Success:      false,
@@ -156,7 +189,7 @@ func (rh *ReplicationHandler) handleCommit(ctx context.Context, req *Transaction
 	}
 
 	// Commit the transaction
-	err := rh.txnMgr.CommitTransaction(txn)
+	err = txnMgr.CommitTransaction(txn)
 	if err != nil {
 		return &TransactionResponse{
 			Success:      false,
@@ -176,8 +209,25 @@ func (rh *ReplicationHandler) handleCommit(ctx context.Context, req *Transaction
 
 // handleAbort processes abort: Rollback transaction
 func (rh *ReplicationHandler) handleAbort(ctx context.Context, req *TransactionRequest) (*TransactionResponse, error) {
+	// Get the target database from request
+	dbName := req.Database
+	if dbName == "" {
+		dbName = db.DefaultDatabaseName
+	}
+
+	// Get database instance
+	dbInstance, err := rh.dbMgr.GetDatabase(dbName)
+	if err != nil {
+		return &TransactionResponse{
+			Success:      false,
+			ErrorMessage: fmt.Sprintf("database %s not found: %v", dbName, err),
+		}, nil
+	}
+
+	txnMgr := dbInstance.GetTransactionManager()
+
 	// Retrieve transaction from active transactions
-	txn := rh.txnMgr.GetTransaction(req.TxnId)
+	txn := txnMgr.GetTransaction(req.TxnId)
 	if txn == nil {
 		// Transaction not found - already aborted or never started
 		return &TransactionResponse{
@@ -186,7 +236,7 @@ func (rh *ReplicationHandler) handleAbort(ctx context.Context, req *TransactionR
 	}
 
 	// Abort the transaction
-	err := rh.txnMgr.AbortTransaction(txn)
+	err = txnMgr.AbortTransaction(txn)
 	if err != nil {
 		return &TransactionResponse{
 			Success:      false,
@@ -209,8 +259,28 @@ func (rh *ReplicationHandler) HandleRead(ctx context.Context, req *ReadRequest) 
 	}
 	rh.clock.Update(snapshotTS)
 
+	// Get the target database from request
+	dbName := req.Database
+	if dbName == "" {
+		dbName = db.DefaultDatabaseName
+	}
+
+	// Get database instance
+	dbInstance, err := rh.dbMgr.GetDatabase(dbName)
+	if err != nil {
+		return &ReadResponse{
+			Timestamp: &HLC{
+				WallTime: rh.clock.Now().WallTime,
+				Logical:  rh.clock.Now().Logical,
+				NodeId:   rh.nodeID,
+			},
+		}, fmt.Errorf("database %s not found: %w", dbName, err)
+	}
+
+	database := dbInstance.GetDB()
+
 	// Execute local snapshot read
-	rows, err := rh.db.QueryContext(ctx, req.Query)
+	rows, err := database.QueryContext(ctx, req.Query)
 	if err != nil {
 		return &ReadResponse{
 			Timestamp: &HLC{

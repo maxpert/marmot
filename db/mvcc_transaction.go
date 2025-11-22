@@ -589,7 +589,8 @@ func (tm *MVCCTransactionManager) cleanupOldTransactionRecords() (int, error) {
 	tm.mu.RUnlock()
 
 	var minAppliedTxnID uint64 = 0
-	if getMinAppliedFn != nil && dbName != "" {
+	// Skip replication tracking for system database (it's not replicated)
+	if getMinAppliedFn != nil && dbName != "" && dbName != "__marmot_system" {
 		minTxnID, err := getMinAppliedFn(dbName)
 		if err == nil {
 			minAppliedTxnID = minTxnID

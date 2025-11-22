@@ -19,24 +19,42 @@ type DatabaseManager interface {
 	DropDatabase(name string) error
 }
 
+// SchemaVersionManager interface to avoid import cycles
+type SchemaVersionManager interface {
+	GetSchemaVersion(database string) (uint64, error)
+	IncrementSchemaVersion(database string, ddlSQL string, txnID uint64) (uint64, error)
+	GetAllSchemaVersions() (map[string]uint64, error)
+}
+
+// NodeRegistry interface to avoid import cycles
+type NodeRegistry interface {
+	UpdateSchemaVersions(versions map[string]uint64)
+}
+
 // CoordinatorHandler implements protocol.ConnectionHandler
 // It routes queries to the appropriate coordinator (Read or Write)
 type CoordinatorHandler struct {
-	nodeID     uint64
-	writeCoord *WriteCoordinator
-	readCoord  *ReadCoordinator
-	clock      *hlc.Clock
-	dbManager  DatabaseManager
+	nodeID           uint64
+	writeCoord       *WriteCoordinator
+	readCoord        *ReadCoordinator
+	clock            *hlc.Clock
+	dbManager        DatabaseManager
+	ddlLockMgr       *DDLLockManager
+	schemaVersionMgr SchemaVersionManager
+	nodeRegistry     NodeRegistry
 }
 
 // NewCoordinatorHandler creates a new handler
-func NewCoordinatorHandler(nodeID uint64, writeCoord *WriteCoordinator, readCoord *ReadCoordinator, clock *hlc.Clock, dbManager DatabaseManager) *CoordinatorHandler {
+func NewCoordinatorHandler(nodeID uint64, writeCoord *WriteCoordinator, readCoord *ReadCoordinator, clock *hlc.Clock, dbManager DatabaseManager, ddlLockMgr *DDLLockManager, schemaVersionMgr SchemaVersionManager, nodeRegistry NodeRegistry) *CoordinatorHandler {
 	return &CoordinatorHandler{
-		nodeID:     nodeID,
-		writeCoord: writeCoord,
-		readCoord:  readCoord,
-		clock:      clock,
-		dbManager:  dbManager,
+		nodeID:           nodeID,
+		writeCoord:       writeCoord,
+		readCoord:        readCoord,
+		clock:            clock,
+		dbManager:        dbManager,
+		ddlLockMgr:       ddlLockMgr,
+		schemaVersionMgr: schemaVersionMgr,
+		nodeRegistry:     nodeRegistry,
 	}
 }
 
@@ -115,13 +133,54 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, consistency
 	txnID := h.clock.Now().WallTime // Simple ID generation for now
 	startTS := h.clock.Now()
 
+	// Detect DDL and handle differently
+	isDDL := stmt.Type == protocol.StatementDDL
+
+	// Rewrite DDL for idempotency (safe to replay)
+	if isDDL {
+		originalSQL := stmt.SQL
+		stmt.SQL = protocol.RewriteDDLForIdempotency(originalSQL)
+		if stmt.SQL != originalSQL {
+			log.Debug().
+				Str("original", originalSQL).
+				Str("rewritten", stmt.SQL).
+				Msg("Rewrote DDL for idempotency")
+		}
+	}
+
+	if isDDL && h.ddlLockMgr != nil {
+		// Acquire cluster-wide DDL lock for this database
+		_, err := h.ddlLockMgr.AcquireLock(stmt.Database, h.nodeID, uint64(txnID), startTS)
+		if err != nil {
+			return nil, fmt.Errorf("failed to acquire DDL lock: %w", err)
+		}
+		// Release lock when done (even if transaction fails)
+		defer func() {
+			if releaseErr := h.ddlLockMgr.ReleaseLock(stmt.Database, uint64(txnID)); releaseErr != nil {
+				log.Error().Err(releaseErr).Str("database", stmt.Database).Msg("Failed to release DDL lock")
+			}
+		}()
+	}
+
+	// Get current schema version for this database
+	var schemaVersion uint64
+	if h.schemaVersionMgr != nil {
+		var err error
+		schemaVersion, err = h.schemaVersionMgr.GetSchemaVersion(stmt.Database)
+		if err != nil {
+			log.Warn().Err(err).Str("database", stmt.Database).Msg("Failed to get schema version, using 0")
+			schemaVersion = 0
+		}
+	}
+
 	txn := &Transaction{
-		ID:               uint64(txnID),
-		NodeID:           h.nodeID,
-		Statements:       []protocol.Statement{stmt},
-		StartTS:          startTS,
-		WriteConsistency: consistency,
-		Database:         stmt.Database,
+		ID:                    uint64(txnID),
+		NodeID:                h.nodeID,
+		Statements:            []protocol.Statement{stmt},
+		StartTS:               startTS,
+		WriteConsistency:      consistency,
+		Database:              stmt.Database,
+		RequiredSchemaVersion: schemaVersion, // Current version required
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -129,6 +188,30 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, consistency
 
 	if err := h.writeCoord.WriteTransaction(ctx, txn); err != nil {
 		return nil, err
+	}
+
+	// If DDL succeeded, increment schema version
+	if isDDL && h.schemaVersionMgr != nil {
+		newVersion, err := h.schemaVersionMgr.IncrementSchemaVersion(stmt.Database, stmt.SQL, uint64(txnID))
+		if err != nil {
+			log.Error().Err(err).Str("database", stmt.Database).Msg("Failed to increment schema version")
+		} else {
+			log.Info().
+				Str("database", stmt.Database).
+				Uint64("new_version", newVersion).
+				Uint64("txn_id", uint64(txnID)).
+				Msg("Schema version incremented after DDL")
+
+			// Update gossip with new schema versions
+			if h.nodeRegistry != nil {
+				allVersions, err := h.schemaVersionMgr.GetAllSchemaVersions()
+				if err != nil {
+					log.Error().Err(err).Msg("Failed to get schema versions for gossip")
+				} else {
+					h.nodeRegistry.UpdateSchemaVersions(allVersions)
+				}
+			}
+		}
 	}
 
 	// Return OK result

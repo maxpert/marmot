@@ -76,7 +76,7 @@ func TestMySQLServerIntegration(t *testing.T) {
 	readCoord := coordinator.NewReadCoordinator(1, nodeProvider, localReader, time.Second)
 
 	// Setup Handler
-	handler := coordinator.NewCoordinatorHandler(1, writeCoord, readCoord, clock, nil)
+	handler := coordinator.NewCoordinatorHandler(1, writeCoord, readCoord, clock, nil, nil, nil, nil)
 
 	// Setup Server
 	port := 3307 // Use non-standard port

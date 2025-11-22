@@ -13,6 +13,7 @@ Marmot v2 is a leaderless, distributed SQLite replication system built on a goss
 - **MySQL Protocol Compatible**: Connect with any MySQL client (DBeaver, MySQL Workbench, mysql CLI)
 - **MVCC Transactions**: Snapshot isolation with conflict detection and resolution
 - **Multi-Database Support**: Create and manage multiple databases per cluster
+- **DDL Replication**: Distributed schema changes with automatic idempotency and cluster-wide locking
 - **Production-Ready SQL Parser**: Powered by Vitess sqlparser (same tech as YouTube)
 
 ## Quick Start
@@ -25,6 +26,32 @@ Marmot v2 is a leaderless, distributed SQLite replication system built on a goss
 mysql -h localhost -P 3306 -u root
 
 # Or use DBeaver, MySQL Workbench, etc.
+```
+
+### Testing Replication
+
+```bash
+# Test DDL and DML replication across a 2-node cluster
+./scripts/test-ddl-replication.sh
+
+# This script will:
+# 1. Start a 2-node cluster
+# 2. Create a table on node 1 and verify it replicates to node 2
+# 3. Insert data on node 1 and verify it replicates to node 2
+# 4. Update data on node 2 and verify it replicates to node 1
+# 5. Delete data on node 1 and verify it replicates to node 2
+
+# Manual cluster testing
+./examples/start-seed.sh              # Start seed node (port 8081, mysql 3307)
+./examples/join-cluster.sh 2 localhost:8081  # Join node 2 (port 8082, mysql 3308)
+./examples/join-cluster.sh 3 localhost:8081  # Join node 3 (port 8083, mysql 3309)
+
+# Connect to any node and run queries
+mysql --protocol=TCP -h localhost -P 3307 -u root
+mysql --protocol=TCP -h localhost -P 3308 -u root
+
+# Cleanup
+pkill -f marmot-v2
 ```
 
 ## Architecture
@@ -44,6 +71,54 @@ Marmot v2 uses a fundamentally different architecture from other SQLite replicat
 2. **Conflict Resolution**: Last-Write-Wins (LWW) with HLC timestamps
 3. **Cluster Membership**: SWIM-style gossip with failure detection
 4. **Data Replication**: Full database replication - all nodes receive all data
+5. **DDL Replication**: Cluster-wide schema changes with automatic idempotency
+
+## DDL Replication
+
+Marmot v2 supports **distributed DDL (Data Definition Language) replication** without requiring master election:
+
+### How It Works
+
+1. **Cluster-Wide Locking**: Each DDL operation acquires a distributed lock per database (default: 30-second lease)
+   - Prevents concurrent schema changes on the same database
+   - Locks automatically expire if a node crashes
+   - Different databases can have concurrent DDL operations
+
+2. **Automatic Idempotency**: DDL statements are automatically rewritten for safe replay
+   ```sql
+   CREATE TABLE users (id INT)
+   → CREATE TABLE IF NOT EXISTS users (id INT)
+
+   DROP TABLE users
+   → DROP TABLE IF EXISTS users
+   ```
+
+3. **Schema Version Tracking**: Each database maintains a schema version counter
+   - Incremented on every DDL operation
+   - Exchanged via gossip protocol for drift detection
+   - Used by delta sync to validate transaction applicability
+
+4. **Quorum-Based Replication**: DDL replicates like DML through the same 2PC mechanism
+   - No special master node needed
+   - Works with existing consistency levels (QUORUM, ALL, etc.)
+
+### Configuration
+
+```toml
+[ddl]
+# DDL lock lease duration (seconds)
+lock_lease_seconds = 30
+
+# Automatically rewrite DDL for idempotency
+enable_idempotent = true
+```
+
+### Best Practices
+
+- ✅ **Do**: Execute DDL from a single connection/node at a time
+- ✅ **Do**: Use qualified table names (`mydb.users` instead of `users`)
+- ⚠️ **Caution**: ALTER TABLE is less idempotent - avoid replaying failed ALTER operations
+- ❌ **Don't**: Run concurrent DDL on the same database from multiple nodes
 
 ## Stargazers over time
 [![Stargazers over time](https://starchart.cc/maxpert/marmot.svg?variant=adaptive)](https://starchart.cc/maxpert/marmot)
@@ -61,18 +136,18 @@ Marmot supports a wide range of MySQL/SQLite statements through its MySQL protoc
 | `SELECT` | ✅ Full | N/A | Read operations |
 | `LOAD DATA` | ✅ Full | ✅ Yes | Bulk data loading |
 | **DDL - Data Definition** |
-| `CREATE TABLE` | ✅ Full | ⚠️ Limited | Schema changes require coordination |
-| `ALTER TABLE` | ✅ Full | ⚠️ Limited | Schema changes require coordination |
-| `DROP TABLE` | ✅ Full | ⚠️ Limited | Schema changes require coordination |
+| `CREATE TABLE` | ✅ Full | ✅ Yes | Replicated with cluster-wide locking |
+| `ALTER TABLE` | ✅ Full | ✅ Yes | Replicated with cluster-wide locking |
+| `DROP TABLE` | ✅ Full | ✅ Yes | Replicated with cluster-wide locking |
 | `TRUNCATE TABLE` | ✅ Full | ✅ Yes | |
-| `RENAME TABLE` | ✅ Full | ⚠️ Limited | Schema changes require coordination |
-| `CREATE/DROP INDEX` | ✅ Full | ⚠️ Limited | Schema changes require coordination |
-| `CREATE/DROP VIEW` | ✅ Full | ⚠️ Limited | Schema changes require coordination |
-| `CREATE/DROP TRIGGER` | ✅ Full | ⚠️ Limited | Schema changes require coordination |
+| `RENAME TABLE` | ✅ Full | ✅ Yes | Replicated with cluster-wide locking |
+| `CREATE/DROP INDEX` | ✅ Full | ✅ Yes | Replicated with cluster-wide locking |
+| `CREATE/DROP VIEW` | ✅ Full | ✅ Yes | Replicated with cluster-wide locking |
+| `CREATE/DROP TRIGGER` | ✅ Full | ✅ Yes | Replicated with cluster-wide locking |
 | **Database Management** |
-| `CREATE DATABASE` | ✅ Full | ⚠️ Limited | Database-level operations |
-| `DROP DATABASE` | ✅ Full | ⚠️ Limited | Database-level operations |
-| `ALTER DATABASE` | ✅ Full | ⚠️ Limited | Database-level operations |
+| `CREATE DATABASE` | ✅ Full | ✅ Yes | Replicated with cluster-wide locking |
+| `DROP DATABASE` | ✅ Full | ✅ Yes | Replicated with cluster-wide locking |
+| `ALTER DATABASE` | ✅ Full | ✅ Yes | Replicated with cluster-wide locking |
 | `SHOW DATABASES` | ✅ Full | N/A | Metadata query |
 | `SHOW TABLES` | ✅ Full | N/A | Metadata query |
 | `USE database` | ✅ Full | N/A | Session state |

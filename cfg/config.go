@@ -135,6 +135,12 @@ type CoordinatorConfiguration struct {
 	AbortTimeoutMS   int `toml:"abort_timeout_ms"`   // Timeout for abort phase
 }
 
+// DDLConfiguration controls DDL replication behavior
+type DDLConfiguration struct {
+	LockLeaseSeconds int  `toml:"lock_lease_seconds"` // DDL lock lease duration in seconds
+	EnableIdempotent bool `toml:"enable_idempotent"`  // Automatically rewrite DDL for idempotency
+}
+
 // Configuration is the main configuration structure
 type Configuration struct {
 	NodeID  uint64 `toml:"node_id"`
@@ -147,6 +153,7 @@ type Configuration struct {
 	ConnectionPool ConnectionPoolConfiguration `toml:"connection_pool"`
 	GRPCClient     GRPCClientConfiguration     `toml:"grpc_client"`
 	Coordinator    CoordinatorConfiguration    `toml:"coordinator"`
+	DDL            DDLConfiguration            `toml:"ddl"`
 	MySQL          MySQLConfiguration          `toml:"mysql"`
 	Logging        LoggingConfiguration        `toml:"logging"`
 	Prometheus     PrometheusConfiguration     `toml:"prometheus"`
@@ -226,6 +233,11 @@ var Config = &Configuration{
 		PrepareTimeoutMS: 2000, // 2 second timeout for prepare phase
 		CommitTimeoutMS:  2000, // 2 second timeout for commit phase
 		AbortTimeoutMS:   2000, // 2 second timeout for abort phase
+	},
+
+	DDL: DDLConfiguration{
+		LockLeaseSeconds: 30,  // 30 second DDL lock lease
+		EnableIdempotent: true, // Auto-rewrite DDL for idempotency
 	},
 
 	MySQL: MySQLConfiguration{

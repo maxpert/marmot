@@ -88,6 +88,9 @@ func (dm *DatabaseManager) initSystemDatabase() error {
 
 	dm.systemDB = systemDB
 
+	// Add system database to the databases map so it can be retrieved via GetDatabase()
+	dm.databases[SystemDatabaseName] = systemDB
+
 	// Create database registry table
 	_, err = systemDB.GetDB().Exec(`
 		CREATE TABLE IF NOT EXISTS __marmot_databases (
@@ -300,7 +303,10 @@ func (dm *DatabaseManager) ListDatabases() []string {
 
 	names := make([]string, 0, len(dm.databases))
 	for name := range dm.databases {
-		names = append(names, name)
+		// Exclude system database from user-visible list
+		if name != SystemDatabaseName {
+			names = append(names, name)
+		}
 	}
 
 	return names

@@ -152,6 +152,21 @@ commit_timeout_ms = 2000
 abort_timeout_ms = 2000
 
 # ==============================================================================
+# DDL REPLICATION
+# ==============================================================================
+
+[ddl]
+# DDL lock lease duration (seconds)
+# Prevents concurrent DDL operations on the same database across the cluster
+# If a node crashes while holding a DDL lock, the lock expires after this duration
+lock_lease_seconds = 30
+
+# Automatically rewrite DDL for idempotency
+# Converts "CREATE TABLE foo" to "CREATE TABLE IF NOT EXISTS foo", etc.
+# This allows safe replay of DDL operations after failures or during catch-up
+enable_idempotent = true
+
+# ==============================================================================
 # MYSQL PROTOCOL SERVER
 # ==============================================================================
 

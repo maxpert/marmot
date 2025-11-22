@@ -7,6 +7,18 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
+// copySchemaVersionMap creates a deep copy of a schema version map
+func copySchemaVersionMap(m map[string]uint64) map[string]uint64 {
+	if m == nil {
+		return nil
+	}
+	result := make(map[string]uint64, len(m))
+	for k, v := range m {
+		result[k] = v
+	}
+	return result
+}
+
 // NodeRegistry tracks cluster membership
 type NodeRegistry struct {
 	localNodeID uint64
@@ -106,10 +118,11 @@ func (nr *NodeRegistry) Get(nodeID uint64) (*NodeState, bool) {
 
 	// Return a copy to avoid races when caller accesses fields
 	nodeCopy := &NodeState{
-		NodeId:      node.NodeId,
-		Address:     node.Address,
-		Status:      node.Status,
-		Incarnation: node.Incarnation,
+		NodeId:                 node.NodeId,
+		Address:                node.Address,
+		Status:                 node.Status,
+		Incarnation:            node.Incarnation,
+		DatabaseSchemaVersions: copySchemaVersionMap(node.DatabaseSchemaVersions),
 	}
 	return nodeCopy, true
 }
@@ -123,10 +136,11 @@ func (nr *NodeRegistry) GetAll() []*NodeState {
 	for _, node := range nr.nodes {
 		// Return a copy to avoid races during serialization
 		nodeCopy := &NodeState{
-			NodeId:      node.NodeId,
-			Address:     node.Address,
-			Status:      node.Status,
-			Incarnation: node.Incarnation,
+			NodeId:                 node.NodeId,
+			Address:                node.Address,
+			Status:                 node.Status,
+			Incarnation:            node.Incarnation,
+			DatabaseSchemaVersions: copySchemaVersionMap(node.DatabaseSchemaVersions),
 		}
 		nodes = append(nodes, nodeCopy)
 	}
@@ -144,10 +158,11 @@ func (nr *NodeRegistry) GetAlive() []*NodeState {
 		if node.Status == NodeStatus_ALIVE {
 			// Return a copy to avoid races during serialization
 			nodeCopy := &NodeState{
-				NodeId:      node.NodeId,
-				Address:     node.Address,
-				Status:      node.Status,
-				Incarnation: node.Incarnation,
+				NodeId:                 node.NodeId,
+				Address:                node.Address,
+				Status:                 node.Status,
+				Incarnation:            node.Incarnation,
+				DatabaseSchemaVersions: copySchemaVersionMap(node.DatabaseSchemaVersions),
 			}
 			nodes = append(nodes, nodeCopy)
 		}
@@ -261,10 +276,11 @@ func (nr *NodeRegistry) GetReplicationEligible() []*NodeState {
 		// JOINING nodes are syncing and shouldn't receive writes
 		if node.Status == NodeStatus_ALIVE {
 			nodeCopy := &NodeState{
-				NodeId:      node.NodeId,
-				Address:     node.Address,
-				Status:      node.Status,
-				Incarnation: node.Incarnation,
+				NodeId:                 node.NodeId,
+				Address:                node.Address,
+				Status:                 node.Status,
+				Incarnation:            node.Incarnation,
+				DatabaseSchemaVersions: copySchemaVersionMap(node.DatabaseSchemaVersions),
 			}
 			nodes = append(nodes, nodeCopy)
 		}
@@ -292,5 +308,71 @@ func (nr *NodeRegistry) MarkAlive(nodeID uint64) {
 	if node, exists := nr.nodes[nodeID]; exists {
 		node.Status = NodeStatus_ALIVE
 		log.Info().Uint64("node_id", nodeID).Msg("Node marked as alive")
+	}
+}
+
+// UpdateSchemaVersions updates the schema versions for the local node
+// This is called when DDL operations complete
+func (nr *NodeRegistry) UpdateSchemaVersions(versions map[string]uint64) {
+	nr.mu.Lock()
+	defer nr.mu.Unlock()
+
+	if node, exists := nr.nodes[nr.localNodeID]; exists {
+		node.DatabaseSchemaVersions = copySchemaVersionMap(versions)
+		log.Debug().
+			Uint64("node_id", nr.localNodeID).
+			Interface("versions", versions).
+			Msg("Updated schema versions")
+	}
+}
+
+// GetLocalSchemaVersions returns the local node's schema versions
+func (nr *NodeRegistry) GetLocalSchemaVersions() map[string]uint64 {
+	nr.mu.RLock()
+	defer nr.mu.RUnlock()
+
+	if node, exists := nr.nodes[nr.localNodeID]; exists {
+		return copySchemaVersionMap(node.DatabaseSchemaVersions)
+	}
+	return nil
+}
+
+// DetectSchemaD rift logs warnings for nodes with different schema versions
+func (nr *NodeRegistry) DetectSchemaDrift() {
+	nr.mu.RLock()
+	defer nr.mu.RUnlock()
+
+	localNode, exists := nr.nodes[nr.localNodeID]
+	if !exists {
+		return
+	}
+
+	for nodeID, node := range nr.nodes {
+		if nodeID == nr.localNodeID || node.Status != NodeStatus_ALIVE {
+			continue
+		}
+
+		// Check each database
+		for dbName, localVersion := range localNode.DatabaseSchemaVersions {
+			peerVersion, hasPeerVersion := node.DatabaseSchemaVersions[dbName]
+
+			if !hasPeerVersion {
+				log.Warn().
+					Uint64("peer_node", nodeID).
+					Str("database", dbName).
+					Uint64("local_version", localVersion).
+					Msg("Peer missing schema version for database")
+				continue
+			}
+
+			if peerVersion != localVersion {
+				log.Warn().
+					Uint64("peer_node", nodeID).
+					Str("database", dbName).
+					Uint64("local_version", localVersion).
+					Uint64("peer_version", peerVersion).
+					Msg("Schema version drift detected")
+			}
+		}
 	}
 }

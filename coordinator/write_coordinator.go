@@ -41,26 +41,29 @@ type ConflictHandler interface {
 
 // Transaction represents a distributed transaction
 type Transaction struct {
-	ID               uint64
-	NodeID           uint64
-	Statements       []protocol.Statement
-	StartTS          hlc.Timestamp
-	CommitTS         hlc.Timestamp
-	WriteConsistency protocol.ConsistencyLevel
-	ReadConsistency  protocol.ConsistencyLevel
-	Database         string // Target database name
+	ID                    uint64
+	NodeID                uint64
+	Statements            []protocol.Statement
+	StartTS               hlc.Timestamp
+	CommitTS              hlc.Timestamp
+	WriteConsistency      protocol.ConsistencyLevel
+	ReadConsistency       protocol.ConsistencyLevel
+	Database              string // Target database name
+	RequiredSchemaVersion uint64 // Minimum schema version required to execute this transaction
 }
 
 // ReplicationRequest is sent to replica nodes
 type ReplicationRequest struct {
-	TxnID      uint64
-	NodeID     uint64
-	Statements []protocol.Statement
-	StartTS    hlc.Timestamp
+	TxnID                 uint64
+	NodeID                uint64
+	Statements            []protocol.Statement
+	StartTS               hlc.Timestamp
 	// Phase indicates transaction phase
-	Phase ReplicationPhase
+	Phase                 ReplicationPhase
 	// Target database name
-	Database string
+	Database              string
+	// Minimum schema version required to execute this transaction
+	RequiredSchemaVersion uint64
 }
 
 // ReplicationPhase indicates which phase of 2PC
@@ -140,12 +143,13 @@ func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transacti
 	// Wait for QUORUM acknowledgments (includes self)
 
 	prepReq := &ReplicationRequest{
-		TxnID:      txn.ID,
-		NodeID:     wc.nodeID,
-		Statements: txn.Statements,
-		StartTS:    txn.StartTS,
-		Phase:      PhasePrep,
-		Database:   txn.Database,
+		TxnID:                 txn.ID,
+		NodeID:                wc.nodeID,
+		Statements:            txn.Statements,
+		StartTS:               txn.StartTS,
+		Phase:                 PhasePrep,
+		Database:              txn.Database,
+		RequiredSchemaVersion: txn.RequiredSchemaVersion,
 	}
 
 	// Replicate to other nodes

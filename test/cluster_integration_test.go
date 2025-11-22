@@ -159,7 +159,7 @@ func createTestNode(nodeID int) (*TestNode, error) {
 	)
 
 	// Create coordinator handler
-	handler := coordinator.NewCoordinatorHandler(uint64(nodeID), writeCoord, readCoord, clock, nil)
+	handler := coordinator.NewCoordinatorHandler(uint64(nodeID), writeCoord, readCoord, clock, nil, nil, nil, nil)
 
 	return &TestNode{
 		NodeID:  uint64(nodeID),

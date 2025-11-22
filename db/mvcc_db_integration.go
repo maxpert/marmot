@@ -265,6 +265,8 @@ func initializeMVCCSchema(db *sql.DB) error {
 		CreateMVCCVersionsTable,
 		CreateMetadataTable,
 		CreateReplicationStateTable,
+		CreateSchemaVersionTable,
+		CreateDDLLockTable,
 	}
 
 	for _, schema := range schemas {

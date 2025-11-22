@@ -57,6 +57,9 @@ message NodeState {
   string address = 2;
   NodeStatus status = 3;
   uint64 incarnation = 4;
+  // Schema versions per database (for DDL drift detection)
+  // key = database_name, value = schema_version
+  map<string, uint64> database_schema_versions = 5;
 }
 
 enum NodeStatus {
@@ -174,6 +177,7 @@ message ChangeEvent {
   repeated Statement statements = 2;
   HLC timestamp = 3;
   string database = 4;  // Target database for these changes
+  uint64 required_schema_version = 5;  // Minimum schema version required for this transaction
 }
 
 message ReplicationStateRequest {

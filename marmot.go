@@ -129,19 +129,11 @@ func main() {
 		}
 	}
 
-	// Get default database for backward compatibility with replication handler
-	defaultDB, err := dbMgr.GetDatabase(db.DefaultDatabaseName)
-	if err != nil {
-		log.Fatal().Err(err).Msg("Failed to get default database")
-		return
-	}
-
 	// Phase 5: Wire up replication handlers
 	log.Info().Msg("Wiring up replication handlers")
 	replicationHandler := marmotgrpc.NewReplicationHandler(
 		cfg.Config.NodeID,
-		defaultDB.GetDB(),
-		defaultDB.GetTransactionManager(),
+		dbMgr,
 		clock,
 	)
 	grpcServer.SetReplicationHandler(replicationHandler)
@@ -149,14 +141,23 @@ func main() {
 
 	log.Info().Msg("Database Manager and replication handlers initialized")
 
+	// Initialize schema version manager using system database (needed for delta sync)
+	systemDB, err := dbMgr.GetDatabase(db.SystemDatabaseName)
+	if err != nil {
+		log.Fatal().Err(err).Msg("Failed to get system database for schema versioning")
+		return
+	}
+	schemaVersionMgr := db.NewSchemaVersionManager(systemDB.GetDB())
+
 	// Phase 6: Setup anti-entropy service for catching up lagging nodes
 	log.Info().Msg("Setting up anti-entropy service")
 	deltaSync := marmotgrpc.NewDeltaSyncClient(marmotgrpc.DeltaSyncConfig{
-		NodeID:      cfg.Config.NodeID,
-		Client:      client,
-		DBManager:   dbMgr,
-		Clock:       clock,
-		ApplyTxnsFn: replicationHandler.HandleReplicateTransaction,
+		NodeID:           cfg.Config.NodeID,
+		Client:           client,
+		DBManager:        dbMgr,
+		Clock:            clock,
+		ApplyTxnsFn:      replicationHandler.HandleReplicateTransaction,
+		SchemaVersionMgr: schemaVersionMgr,
 	})
 
 	antiEntropy := marmotgrpc.NewAntiEntropyServiceFromConfig(
@@ -206,6 +207,10 @@ func main() {
 
 	log.Info().Msg("Transaction coordinators initialized")
 
+	// Initialize DDL lock manager for cluster-wide DDL serialization
+	ddlLockLease := time.Duration(cfg.Config.DDL.LockLeaseSeconds) * time.Second
+	ddlLockMgr := coordinator.NewDDLLockManager(ddlLockLease)
+
 	// Phase 8: Initialize MySQL protocol server
 	log.Info().Msg("Initializing MySQL protocol server")
 
@@ -216,6 +221,9 @@ func main() {
 		readCoordinator,
 		clock,
 		dbMgr,
+		ddlLockMgr,
+		schemaVersionMgr,
+		gossip.GetNodeRegistry(),
 	)
 
 	// Create and start MySQL server

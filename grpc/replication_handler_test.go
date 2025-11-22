@@ -11,17 +11,23 @@ import (
 	"github.com/maxpert/marmot/hlc"
 )
 
-func setupTestReplicationHandler(t *testing.T, nodeID uint64) (*ReplicationHandler, *db.MVCCDatabase) {
-	dbPath := "/tmp/test_replication_" + string(rune(nodeID)) + ".db"
-	os.Remove(dbPath)
-	t.Cleanup(func() { os.Remove(dbPath) })
+func setupTestReplicationHandler(t *testing.T, nodeID uint64) (*ReplicationHandler, *db.DatabaseManager) {
+	dataDir := "/tmp/test_replication_" + string(rune(nodeID))
+	os.RemoveAll(dataDir)
+	t.Cleanup(func() { os.RemoveAll(dataDir) })
 
 	clock := hlc.NewClock(nodeID)
-	mdb, err := db.NewMVCCDatabase(dbPath, nodeID, clock)
+	dbMgr, err := db.NewDatabaseManager(dataDir, nodeID, clock)
 	if err != nil {
-		t.Fatalf("Failed to create MVCC database: %v", err)
+		t.Fatalf("Failed to create Database Manager: %v", err)
 	}
-	t.Cleanup(func() { mdb.Close() })
+	t.Cleanup(func() { dbMgr.Close() })
+
+	// Get default database
+	mdb, err := dbMgr.GetDatabase(db.DefaultDatabaseName)
+	if err != nil {
+		t.Fatalf("Failed to get default database: %v", err)
+	}
 
 	// Create test table
 	_, err = mdb.GetDB().Exec(`
@@ -35,12 +41,12 @@ func setupTestReplicationHandler(t *testing.T, nodeID uint64) (*ReplicationHandl
 		t.Fatalf("Failed to create table: %v", err)
 	}
 
-	handler := NewReplicationHandler(nodeID, mdb.GetDB(), mdb.GetTransactionManager(), clock)
-	return handler, mdb
+	handler := NewReplicationHandler(nodeID, dbMgr, clock)
+	return handler, dbMgr
 }
 
 func TestReplicationHandler_PreparePhase(t *testing.T) {
-	handler, _ := setupTestReplicationHandler(t, 1)
+	handler, dbMgr := setupTestReplicationHandler(t, 1)
 
 	clock := hlc.NewClock(100)
 	ts := clock.Now()
@@ -60,7 +66,8 @@ func TestReplicationHandler_PreparePhase(t *testing.T) {
 			Logical:  ts.Logical,
 			NodeId:   100,
 		},
-		Phase: TransactionPhase_PREPARE,
+		Phase:    TransactionPhase_PREPARE,
+		Database: db.DefaultDatabaseName,
 	}
 
 	resp, err := handler.HandleReplicateTransaction(context.Background(), req)
@@ -75,8 +82,9 @@ func TestReplicationHandler_PreparePhase(t *testing.T) {
 	t.Logf("✓ Prepare phase successful: write intent created for txn %d", req.TxnId)
 
 	// Verify write intent exists
+	mdb, _ := dbMgr.GetDatabase(db.DefaultDatabaseName)
 	var count int
-	err = handler.db.QueryRow("SELECT COUNT(*) FROM __marmot__write_intents WHERE txn_id = ?", req.TxnId).Scan(&count)
+	err = mdb.GetDB().QueryRow("SELECT COUNT(*) FROM __marmot__write_intents WHERE txn_id = ?", req.TxnId).Scan(&count)
 	if err != nil {
 		t.Fatalf("Failed to query write intents: %v", err)
 	}
@@ -89,7 +97,7 @@ func TestReplicationHandler_PreparePhase(t *testing.T) {
 }
 
 func TestReplicationHandler_CommitPhase(t *testing.T) {
-	handler, _ := setupTestReplicationHandler(t, 1)
+	handler, dbMgr := setupTestReplicationHandler(t, 1)
 
 	clock := hlc.NewClock(100)
 	ts := clock.Now()
@@ -110,7 +118,8 @@ func TestReplicationHandler_CommitPhase(t *testing.T) {
 			Logical:  ts.Logical,
 			NodeId:   100,
 		},
-		Phase: TransactionPhase_PREPARE,
+		Phase:    TransactionPhase_PREPARE,
+		Database: db.DefaultDatabaseName,
 	}
 
 	resp, err := handler.HandleReplicateTransaction(context.Background(), prepareReq)
@@ -131,6 +140,7 @@ func TestReplicationHandler_CommitPhase(t *testing.T) {
 		Statements:   prepareReq.Statements,
 		Timestamp:    prepareReq.Timestamp,
 		Phase:        TransactionPhase_COMMIT,
+		Database:     db.DefaultDatabaseName,
 	}
 
 	resp, err = handler.HandleReplicateTransaction(context.Background(), commitReq)
@@ -148,8 +158,9 @@ func TestReplicationHandler_CommitPhase(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 
 	// Verify transaction is committed
+	mdb, _ := dbMgr.GetDatabase(db.DefaultDatabaseName)
 	var status string
-	err = handler.db.QueryRow("SELECT status FROM __marmot__txn_records WHERE txn_id = ?", commitReq.TxnId).Scan(&status)
+	err = mdb.GetDB().QueryRow("SELECT status FROM __marmot__txn_records WHERE txn_id = ?", commitReq.TxnId).Scan(&status)
 	if err != nil {
 		t.Fatalf("Failed to query txn status: %v", err)
 	}
@@ -162,7 +173,7 @@ func TestReplicationHandler_CommitPhase(t *testing.T) {
 }
 
 func TestReplicationHandler_AbortPhase(t *testing.T) {
-	handler, _ := setupTestReplicationHandler(t, 1)
+	handler, dbMgr := setupTestReplicationHandler(t, 1)
 
 	clock := hlc.NewClock(100)
 	ts := clock.Now()
@@ -183,7 +194,8 @@ func TestReplicationHandler_AbortPhase(t *testing.T) {
 			Logical:  ts.Logical,
 			NodeId:   100,
 		},
-		Phase: TransactionPhase_PREPARE,
+		Phase:    TransactionPhase_PREPARE,
+		Database: db.DefaultDatabaseName,
 	}
 
 	resp, err := handler.HandleReplicateTransaction(context.Background(), prepareReq)
@@ -204,6 +216,7 @@ func TestReplicationHandler_AbortPhase(t *testing.T) {
 		Statements:   prepareReq.Statements,
 		Timestamp:    prepareReq.Timestamp,
 		Phase:        TransactionPhase_ABORT,
+		Database:     db.DefaultDatabaseName,
 	}
 
 	resp, err = handler.HandleReplicateTransaction(context.Background(), abortReq)
@@ -221,8 +234,9 @@ func TestReplicationHandler_AbortPhase(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 
 	// Verify transaction is aborted
+	mdb, _ := dbMgr.GetDatabase(db.DefaultDatabaseName)
 	var status string
-	err = handler.db.QueryRow("SELECT status FROM __marmot__txn_records WHERE txn_id = ?", abortReq.TxnId).Scan(&status)
+	err = mdb.GetDB().QueryRow("SELECT status FROM __marmot__txn_records WHERE txn_id = ?", abortReq.TxnId).Scan(&status)
 	if err != nil {
 		t.Fatalf("Failed to query txn status: %v", err)
 	}
@@ -235,7 +249,7 @@ func TestReplicationHandler_AbortPhase(t *testing.T) {
 
 	// Verify write intents are cleaned up
 	var count int
-	err = handler.db.QueryRow("SELECT COUNT(*) FROM __marmot__write_intents WHERE txn_id = ?", abortReq.TxnId).Scan(&count)
+	err = mdb.GetDB().QueryRow("SELECT COUNT(*) FROM __marmot__write_intents WHERE txn_id = ?", abortReq.TxnId).Scan(&count)
 	if err != nil {
 		t.Fatalf("Failed to query write intents: %v", err)
 	}
@@ -269,7 +283,8 @@ func TestReplicationHandler_ConflictDetection(t *testing.T) {
 			Logical:  ts.Logical,
 			NodeId:   100,
 		},
-		Phase: TransactionPhase_PREPARE,
+		Phase:    TransactionPhase_PREPARE,
+		Database: db.DefaultDatabaseName,
 	}
 
 	resp, err := handler.HandleReplicateTransaction(context.Background(), txn1Req)
@@ -299,7 +314,8 @@ func TestReplicationHandler_ConflictDetection(t *testing.T) {
 			Logical:  ts.Logical,
 			NodeId:   100,
 		},
-		Phase: TransactionPhase_PREPARE,
+		Phase:    TransactionPhase_PREPARE,
+		Database: db.DefaultDatabaseName,
 	}
 
 	resp, err = handler.HandleReplicateTransaction(context.Background(), txn2Req)
@@ -319,9 +335,10 @@ func TestReplicationHandler_ConflictDetection(t *testing.T) {
 }
 
 func TestReplicationHandler_Read(t *testing.T) {
-	handler, mdb := setupTestReplicationHandler(t, 1)
+	handler, dbMgr := setupTestReplicationHandler(t, 1)
 
 	// Insert test data
+	mdb, _ := dbMgr.GetDatabase(db.DefaultDatabaseName)
 	_, err := mdb.GetDB().Exec("INSERT INTO users (id, name, balance) VALUES (1, 'Alice', 100)")
 	if err != nil {
 		t.Fatalf("Failed to insert test data: %v", err)
@@ -340,6 +357,7 @@ func TestReplicationHandler_Read(t *testing.T) {
 			NodeId:   100,
 		},
 		TableName: "users",
+		Database:  db.DefaultDatabaseName,
 	}
 
 	resp, err := handler.HandleRead(context.Background(), readReq)

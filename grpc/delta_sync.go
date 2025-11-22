@@ -14,11 +14,12 @@ import (
 // DeltaSyncClient handles incremental replication catch-up
 // It streams changes from a peer and applies them locally
 type DeltaSyncClient struct {
-	client      *Client
-	dbManager   *db.DatabaseManager
-	nodeID      uint64
-	clock       *hlc.Clock
-	applyTxnsFn ApplyTransactionFunc
+	client           *Client
+	dbManager        *db.DatabaseManager
+	nodeID           uint64
+	clock            *hlc.Clock
+	applyTxnsFn      ApplyTransactionFunc
+	schemaVersionMgr *db.SchemaVersionManager
 }
 
 // ApplyTransactionFunc applies a replicated transaction to the local database
@@ -27,21 +28,23 @@ type ApplyTransactionFunc func(ctx context.Context, txnReq *TransactionRequest) 
 
 // DeltaSyncConfig holds configuration for delta sync
 type DeltaSyncConfig struct {
-	NodeID      uint64
-	Client      *Client
-	DBManager   *db.DatabaseManager
-	Clock       *hlc.Clock
-	ApplyTxnsFn ApplyTransactionFunc
+	NodeID           uint64
+	Client           *Client
+	DBManager        *db.DatabaseManager
+	Clock            *hlc.Clock
+	ApplyTxnsFn      ApplyTransactionFunc
+	SchemaVersionMgr *db.SchemaVersionManager
 }
 
 // NewDeltaSyncClient creates a new delta sync client
 func NewDeltaSyncClient(config DeltaSyncConfig) *DeltaSyncClient {
 	return &DeltaSyncClient{
-		client:      config.Client,
-		dbManager:   config.DBManager,
-		nodeID:      config.NodeID,
-		clock:       config.Clock,
-		applyTxnsFn: config.ApplyTxnsFn,
+		client:           config.Client,
+		dbManager:        config.DBManager,
+		nodeID:           config.NodeID,
+		clock:            config.Clock,
+		applyTxnsFn:      config.ApplyTxnsFn,
+		schemaVersionMgr: config.SchemaVersionMgr,
 	}
 }
 
@@ -206,6 +209,31 @@ func (ds *DeltaSyncClient) applyChangeEvent(ctx context.Context, event *ChangeEv
 	database := event.Database
 	if database == "" {
 		database = "marmot" // Default database
+	}
+
+	// Schema version validation: Check if we need to catch up DDL first
+	if ds.schemaVersionMgr != nil && event.RequiredSchemaVersion > 0 {
+		localVersion, err := ds.schemaVersionMgr.GetSchemaVersion(database)
+		if err != nil {
+			log.Warn().Err(err).Str("database", database).Msg("Failed to get local schema version")
+		} else if localVersion < event.RequiredSchemaVersion {
+			// We're behind! This transaction requires a newer schema version
+			// This means we missed a DDL statement - we need to catch up
+			log.Warn().
+				Str("database", database).
+				Uint64("local_version", localVersion).
+				Uint64("required_version", event.RequiredSchemaVersion).
+				Uint64("txn_id", event.TxnId).
+				Msg("Schema version gap detected - transaction requires newer schema")
+
+			// For now, we'll try to apply anyway (DDL should be idempotent)
+			// In a more sophisticated implementation, we would:
+			// 1. Fetch missing DDL transactions from peer
+			// 2. Apply them in order
+			// 3. Then apply this transaction
+			// But since DDL is replicated through the same stream and is idempotent,
+			// we should have already received it if we're streaming in order
+		}
 	}
 
 	// Convert to TransactionRequest

@@ -124,6 +124,32 @@ const (
 		PRIMARY KEY (peer_node_id, database_name)
 	);
 	`
+
+	// CreateSchemaVersionTable tracks schema evolution per database
+	// Used to ensure nodes apply DDL in order and detect schema drift
+	// Enables QUORUM-based DDL replication with automatic catch-up
+	CreateSchemaVersionTable = `
+	CREATE TABLE IF NOT EXISTS __marmot__schema_versions (
+		database_name TEXT PRIMARY KEY,
+		schema_version INTEGER NOT NULL DEFAULT 0,
+		last_ddl_sql TEXT,
+		last_ddl_txn_id INTEGER,
+		updated_at INTEGER NOT NULL
+	);
+	`
+
+	// CreateDDLLockTable provides cluster-wide DDL serialization
+	// Prevents concurrent DDL statements on the same database from conflicting
+	// Uses HLC timestamps and lease-based locking
+	CreateDDLLockTable = `
+	CREATE TABLE IF NOT EXISTS __marmot__ddl_locks (
+		database_name TEXT PRIMARY KEY,
+		locked_by_node_id INTEGER NOT NULL,
+		locked_at INTEGER NOT NULL,
+		lease_expires_at INTEGER NOT NULL,
+		txn_id INTEGER  -- Transaction ID that holds the lock
+	);
+	`
 )
 
 // Transaction status constants

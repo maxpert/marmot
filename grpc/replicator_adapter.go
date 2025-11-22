@@ -28,13 +28,14 @@ func (gr *GRPCReplicator) ReplicateTransaction(ctx context.Context, nodeID uint6
 	grpcReq := &TransactionRequest{
 		TxnId:        req.TxnID,
 		SourceNodeId: req.NodeID,
-		Statements:   convertStatementsToProto(req.Statements),
+		Statements:   convertStatementsToProto(req.Statements, req.Database),
 		Timestamp: &HLC{
 			WallTime: req.StartTS.WallTime,
 			Logical:  req.StartTS.Logical,
 			NodeId:   req.StartTS.NodeID,
 		},
-		Phase: convertPhaseToProto(req.Phase),
+		Phase:    convertPhaseToProto(req.Phase),
+		Database: req.Database,
 	}
 
 	// Call gRPC client
@@ -55,13 +56,19 @@ func (gr *GRPCReplicator) ReplicateTransaction(ctx context.Context, nodeID uint6
 }
 
 // convertStatementsToProto converts protocol.Statement to gRPC Statement
-func convertStatementsToProto(stmts []protocol.Statement) []*Statement {
+func convertStatementsToProto(stmts []protocol.Statement, database string) []*Statement {
 	protoStmts := make([]*Statement, len(stmts))
 	for i, stmt := range stmts {
+		// Use statement's database if set, otherwise use the transaction's database
+		stmtDB := stmt.Database
+		if stmtDB == "" {
+			stmtDB = database
+		}
 		protoStmts[i] = &Statement{
 			Sql:       stmt.SQL,
 			Type:      convertStatementTypeToProto(stmt.Type),
 			TableName: stmt.TableName,
+			Database:  stmtDB,
 		}
 	}
 	return protoStmts
