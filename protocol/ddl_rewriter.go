@@ -24,6 +24,10 @@ var (
 
 	// DROP INDEX patterns
 	dropIndexRe = regexp.MustCompile(`(?i)^\s*DROP\s+INDEX\s+(\w+)`)
+
+	// TRUNCATE TABLE patterns (SQLite doesn't support TRUNCATE, convert to DELETE)
+	truncateTableRe = regexp.MustCompile(`(?i)^\s*TRUNCATE\s+TABLE\s+(\w+)`)
+	truncateRe      = regexp.MustCompile(`(?i)^\s*TRUNCATE\s+(\w+)`)
 )
 
 // RewriteDDLForIdempotency rewrites a DDL statement to be idempotent
@@ -114,6 +118,20 @@ func RewriteDDLForIdempotency(sql string) string {
 		// Insert "IF EXISTS" after DROP INDEX
 		rewritten := dropIndexRe.ReplaceAllString(trimmed, "DROP INDEX IF EXISTS $1")
 		return rewritten
+	}
+
+	// TRUNCATE TABLE - SQLite doesn't support TRUNCATE, convert to DELETE FROM
+	if strings.HasPrefix(upperSQL, "TRUNCATE") {
+		// TRUNCATE TABLE tablename → DELETE FROM tablename
+		if match := truncateTableRe.FindStringSubmatch(trimmed); len(match) >= 2 {
+			tableName := match[1]
+			return "DELETE FROM " + tableName
+		}
+		// TRUNCATE tablename (without TABLE keyword) → DELETE FROM tablename
+		if match := truncateRe.FindStringSubmatch(trimmed); len(match) >= 2 {
+			tableName := match[1]
+			return "DELETE FROM " + tableName
+		}
 	}
 
 	// ALTER TABLE and other DDL statements: return as-is

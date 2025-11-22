@@ -247,6 +247,10 @@ func main() {
 		// Immediately broadcast ALIVE status to accelerate propagation
 		gossip.BroadcastImmediate()
 		log.Info().Msg("Node fully initialized - transitioned to ALIVE")
+	} else {
+		// Seed node is immediately ALIVE (no need to catch up)
+		grpcServer.GetNodeRegistry().MarkAlive(cfg.Config.NodeID)
+		log.Info().Msg("Seed node fully initialized - now ALIVE")
 	}
 
 	log.Info().Msg("Marmot v2.0 started successfully")
