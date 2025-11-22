@@ -309,6 +309,82 @@ func (s *Server) StreamChanges(req *StreamRequest, stream MarmotService_StreamCh
 	return nil
 }
 
+// GetReplicationState returns current replication state for anti-entropy
+// Returns per-database replication progress for the requesting peer
+func (s *Server) GetReplicationState(ctx context.Context, req *ReplicationStateRequest) (*ReplicationStateResponse, error) {
+	s.mu.RLock()
+	dbManager := s.dbManager
+	s.mu.RUnlock()
+
+	if dbManager == nil {
+		return nil, fmt.Errorf("database manager not initialized")
+	}
+
+	log.Debug().
+		Uint64("requesting_node", req.RequestingNodeId).
+		Str("database_filter", req.Database).
+		Msg("Replication state requested")
+
+	var states []*DatabaseReplicationState
+
+	// Get list of databases to query
+	var databases []string
+	if req.Database != "" {
+		// Specific database requested
+		databases = []string{req.Database}
+	} else {
+		// All databases
+		databases = dbManager.ListDatabases()
+	}
+
+	// Query replication state for each database
+	for _, dbName := range databases {
+		// Get last applied txn_id from replication_state table for this peer
+		repState, err := dbManager.GetReplicationState(req.RequestingNodeId, dbName)
+		var lastAppliedTxnID uint64
+		var lastAppliedTS *HLC
+		var lastSyncTime int64
+		var syncStatus string
+
+		if err != nil {
+			// No replication state yet for this peer/database - use defaults
+			lastAppliedTxnID = 0
+			lastAppliedTS = &HLC{WallTime: 0, Logical: 0, NodeId: s.nodeID}
+			lastSyncTime = 0
+			syncStatus = "SYNCED"
+		} else {
+			lastAppliedTxnID = repState.LastAppliedTxnID
+			lastAppliedTS = &HLC{
+				WallTime: repState.LastAppliedTSWall,
+				Logical:  repState.LastAppliedTSLog,
+				NodeId:   s.nodeID,
+			}
+			lastSyncTime = repState.LastSyncTime
+			syncStatus = repState.SyncStatus
+		}
+
+		// Get current max txn_id in this database
+		maxTxnID, err := dbManager.GetMaxTxnID(dbName)
+		if err != nil {
+			log.Warn().Err(err).Str("database", dbName).Msg("Failed to get max txn_id")
+			maxTxnID = 0
+		}
+
+		states = append(states, &DatabaseReplicationState{
+			DatabaseName:         dbName,
+			LastAppliedTxnId:     lastAppliedTxnID,
+			LastAppliedTimestamp: lastAppliedTS,
+			LastSyncTime:         lastSyncTime,
+			SyncStatus:           syncStatus,
+			CurrentMaxTxnId:      maxTxnID,
+		})
+	}
+
+	return &ReplicationStateResponse{
+		States: states,
+	}, nil
+}
+
 // =======================
 // SNAPSHOT METHODS
 // =======================

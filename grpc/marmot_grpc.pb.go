@@ -25,6 +25,7 @@ const (
 	MarmotService_ReplicateTransaction_FullMethodName = "/marmot.v2.MarmotService/ReplicateTransaction"
 	MarmotService_Read_FullMethodName                 = "/marmot.v2.MarmotService/Read"
 	MarmotService_StreamChanges_FullMethodName        = "/marmot.v2.MarmotService/StreamChanges"
+	MarmotService_GetReplicationState_FullMethodName  = "/marmot.v2.MarmotService/GetReplicationState"
 	MarmotService_GetSnapshotInfo_FullMethodName      = "/marmot.v2.MarmotService/GetSnapshotInfo"
 	MarmotService_StreamSnapshot_FullMethodName       = "/marmot.v2.MarmotService/StreamSnapshot"
 )
@@ -49,6 +50,8 @@ type MarmotServiceClient interface {
 	Read(ctx context.Context, in *ReadRequest, opts ...grpc.CallOption) (*ReadResponse, error)
 	// Streaming changes (for catch-up)
 	StreamChanges(ctx context.Context, in *StreamRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ChangeEvent], error)
+	// Get replication state (for anti-entropy)
+	GetReplicationState(ctx context.Context, in *ReplicationStateRequest, opts ...grpc.CallOption) (*ReplicationStateResponse, error)
 	// ===== SNAPSHOT TRANSFER =====
 	// Get snapshot metadata
 	GetSnapshotInfo(ctx context.Context, in *SnapshotInfoRequest, opts ...grpc.CallOption) (*SnapshotInfoResponse, error)
@@ -133,6 +136,16 @@ func (c *marmotServiceClient) StreamChanges(ctx context.Context, in *StreamReque
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type MarmotService_StreamChangesClient = grpc.ServerStreamingClient[ChangeEvent]
 
+func (c *marmotServiceClient) GetReplicationState(ctx context.Context, in *ReplicationStateRequest, opts ...grpc.CallOption) (*ReplicationStateResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReplicationStateResponse)
+	err := c.cc.Invoke(ctx, MarmotService_GetReplicationState_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *marmotServiceClient) GetSnapshotInfo(ctx context.Context, in *SnapshotInfoRequest, opts ...grpc.CallOption) (*SnapshotInfoResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(SnapshotInfoResponse)
@@ -182,6 +195,8 @@ type MarmotServiceServer interface {
 	Read(context.Context, *ReadRequest) (*ReadResponse, error)
 	// Streaming changes (for catch-up)
 	StreamChanges(*StreamRequest, grpc.ServerStreamingServer[ChangeEvent]) error
+	// Get replication state (for anti-entropy)
+	GetReplicationState(context.Context, *ReplicationStateRequest) (*ReplicationStateResponse, error)
 	// ===== SNAPSHOT TRANSFER =====
 	// Get snapshot metadata
 	GetSnapshotInfo(context.Context, *SnapshotInfoRequest) (*SnapshotInfoResponse, error)
@@ -214,6 +229,9 @@ func (UnimplementedMarmotServiceServer) Read(context.Context, *ReadRequest) (*Re
 }
 func (UnimplementedMarmotServiceServer) StreamChanges(*StreamRequest, grpc.ServerStreamingServer[ChangeEvent]) error {
 	return status.Errorf(codes.Unimplemented, "method StreamChanges not implemented")
+}
+func (UnimplementedMarmotServiceServer) GetReplicationState(context.Context, *ReplicationStateRequest) (*ReplicationStateResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetReplicationState not implemented")
 }
 func (UnimplementedMarmotServiceServer) GetSnapshotInfo(context.Context, *SnapshotInfoRequest) (*SnapshotInfoResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetSnapshotInfo not implemented")
@@ -343,6 +361,24 @@ func _MarmotService_StreamChanges_Handler(srv interface{}, stream grpc.ServerStr
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type MarmotService_StreamChangesServer = grpc.ServerStreamingServer[ChangeEvent]
 
+func _MarmotService_GetReplicationState_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReplicationStateRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MarmotServiceServer).GetReplicationState(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: MarmotService_GetReplicationState_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MarmotServiceServer).GetReplicationState(ctx, req.(*ReplicationStateRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _MarmotService_GetSnapshotInfo_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(SnapshotInfoRequest)
 	if err := dec(in); err != nil {
@@ -398,6 +434,10 @@ var MarmotService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Read",
 			Handler:    _MarmotService_Read_Handler,
+		},
+		{
+			MethodName: "GetReplicationState",
+			Handler:    _MarmotService_GetReplicationState_Handler,
 		},
 		{
 			MethodName: "GetSnapshotInfo",

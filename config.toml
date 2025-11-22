@@ -83,10 +83,28 @@ write_timeout_ms = 5000
 read_timeout_ms = 2000
 
 # Enable anti-entropy background sync
+# Automatically catches up lagging nodes by replaying missed transactions
 enable_anti_entropy = true
 
 # Anti-entropy sync interval (seconds)
-anti_entropy_interval_seconds = 600
+# How often to check for and repair replication lag (default: 60 = 1 minute)
+anti_entropy_interval_seconds = 60
+
+# Delta sync threshold (transactions)
+# If a node lags by more than this many transactions, use snapshot instead of delta sync
+delta_sync_threshold_transactions = 10000
+
+# Delta sync threshold (seconds)
+# If a node lags by more than this duration, use snapshot instead of delta sync
+delta_sync_threshold_seconds = 3600
+
+# Minimum GC retention (hours)
+# Transaction logs kept for at least this long to support replication catch-up
+gc_min_retention_hours = 1
+
+# Maximum GC retention (hours)
+# Force GC after this duration even if peers lagging (prevents unbounded growth)
+gc_max_retention_hours = 4
 
 # ==============================================================================
 # CONNECTION POOL

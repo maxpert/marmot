@@ -27,6 +27,10 @@ service MarmotService {
   rpc StreamChanges(StreamRequest)
       returns (stream ChangeEvent);
 
+  // Get replication state (for anti-entropy)
+  rpc GetReplicationState(ReplicationStateRequest)
+      returns (ReplicationStateResponse);
+
   // ===== SNAPSHOT TRANSFER =====
   // Get snapshot metadata
   rpc GetSnapshotInfo(SnapshotInfoRequest)
@@ -170,6 +174,24 @@ message ChangeEvent {
   repeated Statement statements = 2;
   HLC timestamp = 3;
   string database = 4;  // Target database for these changes
+}
+
+message ReplicationStateRequest {
+  uint64 requesting_node_id = 1;
+  string database = 2;  // Optional: filter by specific database, empty = all
+}
+
+message ReplicationStateResponse {
+  repeated DatabaseReplicationState states = 1;
+}
+
+message DatabaseReplicationState {
+  string database_name = 1;
+  uint64 last_applied_txn_id = 2;
+  HLC last_applied_timestamp = 3;
+  int64 last_sync_time = 4;
+  string sync_status = 5;  // SYNCED, CATCHING_UP, FAILED
+  uint64 current_max_txn_id = 6;  // Latest txn_id in this database
 }
 
 // ===== SNAPSHOT MESSAGES =====

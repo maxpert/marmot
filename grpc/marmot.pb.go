@@ -1212,6 +1212,186 @@ func (x *ChangeEvent) GetDatabase() string {
 	return ""
 }
 
+type ReplicationStateRequest struct {
+	state            protoimpl.MessageState `protogen:"open.v1"`
+	RequestingNodeId uint64                 `protobuf:"varint,1,opt,name=requesting_node_id,json=requestingNodeId,proto3" json:"requesting_node_id,omitempty"`
+	Database         string                 `protobuf:"bytes,2,opt,name=database,proto3" json:"database,omitempty"` // Optional: filter by specific database, empty = all
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
+}
+
+func (x *ReplicationStateRequest) Reset() {
+	*x = ReplicationStateRequest{}
+	mi := &file_grpc_marmot_proto_msgTypes[16]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ReplicationStateRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ReplicationStateRequest) ProtoMessage() {}
+
+func (x *ReplicationStateRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_grpc_marmot_proto_msgTypes[16]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ReplicationStateRequest.ProtoReflect.Descriptor instead.
+func (*ReplicationStateRequest) Descriptor() ([]byte, []int) {
+	return file_grpc_marmot_proto_rawDescGZIP(), []int{16}
+}
+
+func (x *ReplicationStateRequest) GetRequestingNodeId() uint64 {
+	if x != nil {
+		return x.RequestingNodeId
+	}
+	return 0
+}
+
+func (x *ReplicationStateRequest) GetDatabase() string {
+	if x != nil {
+		return x.Database
+	}
+	return ""
+}
+
+type ReplicationStateResponse struct {
+	state         protoimpl.MessageState      `protogen:"open.v1"`
+	States        []*DatabaseReplicationState `protobuf:"bytes,1,rep,name=states,proto3" json:"states,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ReplicationStateResponse) Reset() {
+	*x = ReplicationStateResponse{}
+	mi := &file_grpc_marmot_proto_msgTypes[17]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ReplicationStateResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ReplicationStateResponse) ProtoMessage() {}
+
+func (x *ReplicationStateResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_grpc_marmot_proto_msgTypes[17]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ReplicationStateResponse.ProtoReflect.Descriptor instead.
+func (*ReplicationStateResponse) Descriptor() ([]byte, []int) {
+	return file_grpc_marmot_proto_rawDescGZIP(), []int{17}
+}
+
+func (x *ReplicationStateResponse) GetStates() []*DatabaseReplicationState {
+	if x != nil {
+		return x.States
+	}
+	return nil
+}
+
+type DatabaseReplicationState struct {
+	state                protoimpl.MessageState `protogen:"open.v1"`
+	DatabaseName         string                 `protobuf:"bytes,1,opt,name=database_name,json=databaseName,proto3" json:"database_name,omitempty"`
+	LastAppliedTxnId     uint64                 `protobuf:"varint,2,opt,name=last_applied_txn_id,json=lastAppliedTxnId,proto3" json:"last_applied_txn_id,omitempty"`
+	LastAppliedTimestamp *HLC                   `protobuf:"bytes,3,opt,name=last_applied_timestamp,json=lastAppliedTimestamp,proto3" json:"last_applied_timestamp,omitempty"`
+	LastSyncTime         int64                  `protobuf:"varint,4,opt,name=last_sync_time,json=lastSyncTime,proto3" json:"last_sync_time,omitempty"`
+	SyncStatus           string                 `protobuf:"bytes,5,opt,name=sync_status,json=syncStatus,proto3" json:"sync_status,omitempty"`                     // SYNCED, CATCHING_UP, FAILED
+	CurrentMaxTxnId      uint64                 `protobuf:"varint,6,opt,name=current_max_txn_id,json=currentMaxTxnId,proto3" json:"current_max_txn_id,omitempty"` // Latest txn_id in this database
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
+}
+
+func (x *DatabaseReplicationState) Reset() {
+	*x = DatabaseReplicationState{}
+	mi := &file_grpc_marmot_proto_msgTypes[18]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DatabaseReplicationState) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DatabaseReplicationState) ProtoMessage() {}
+
+func (x *DatabaseReplicationState) ProtoReflect() protoreflect.Message {
+	mi := &file_grpc_marmot_proto_msgTypes[18]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DatabaseReplicationState.ProtoReflect.Descriptor instead.
+func (*DatabaseReplicationState) Descriptor() ([]byte, []int) {
+	return file_grpc_marmot_proto_rawDescGZIP(), []int{18}
+}
+
+func (x *DatabaseReplicationState) GetDatabaseName() string {
+	if x != nil {
+		return x.DatabaseName
+	}
+	return ""
+}
+
+func (x *DatabaseReplicationState) GetLastAppliedTxnId() uint64 {
+	if x != nil {
+		return x.LastAppliedTxnId
+	}
+	return 0
+}
+
+func (x *DatabaseReplicationState) GetLastAppliedTimestamp() *HLC {
+	if x != nil {
+		return x.LastAppliedTimestamp
+	}
+	return nil
+}
+
+func (x *DatabaseReplicationState) GetLastSyncTime() int64 {
+	if x != nil {
+		return x.LastSyncTime
+	}
+	return 0
+}
+
+func (x *DatabaseReplicationState) GetSyncStatus() string {
+	if x != nil {
+		return x.SyncStatus
+	}
+	return ""
+}
+
+func (x *DatabaseReplicationState) GetCurrentMaxTxnId() uint64 {
+	if x != nil {
+		return x.CurrentMaxTxnId
+	}
+	return 0
+}
+
 // ===== SNAPSHOT MESSAGES =====
 type SnapshotInfoRequest struct {
 	state            protoimpl.MessageState `protogen:"open.v1"`
@@ -1222,7 +1402,7 @@ type SnapshotInfoRequest struct {
 
 func (x *SnapshotInfoRequest) Reset() {
 	*x = SnapshotInfoRequest{}
-	mi := &file_grpc_marmot_proto_msgTypes[16]
+	mi := &file_grpc_marmot_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1234,7 +1414,7 @@ func (x *SnapshotInfoRequest) String() string {
 func (*SnapshotInfoRequest) ProtoMessage() {}
 
 func (x *SnapshotInfoRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_grpc_marmot_proto_msgTypes[16]
+	mi := &file_grpc_marmot_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1247,7 +1427,7 @@ func (x *SnapshotInfoRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SnapshotInfoRequest.ProtoReflect.Descriptor instead.
 func (*SnapshotInfoRequest) Descriptor() ([]byte, []int) {
-	return file_grpc_marmot_proto_rawDescGZIP(), []int{16}
+	return file_grpc_marmot_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *SnapshotInfoRequest) GetRequestingNodeId() uint64 {
@@ -1270,7 +1450,7 @@ type SnapshotInfoResponse struct {
 
 func (x *SnapshotInfoResponse) Reset() {
 	*x = SnapshotInfoResponse{}
-	mi := &file_grpc_marmot_proto_msgTypes[17]
+	mi := &file_grpc_marmot_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1282,7 +1462,7 @@ func (x *SnapshotInfoResponse) String() string {
 func (*SnapshotInfoResponse) ProtoMessage() {}
 
 func (x *SnapshotInfoResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_grpc_marmot_proto_msgTypes[17]
+	mi := &file_grpc_marmot_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1295,7 +1475,7 @@ func (x *SnapshotInfoResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SnapshotInfoResponse.ProtoReflect.Descriptor instead.
 func (*SnapshotInfoResponse) Descriptor() ([]byte, []int) {
-	return file_grpc_marmot_proto_rawDescGZIP(), []int{17}
+	return file_grpc_marmot_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *SnapshotInfoResponse) GetSnapshotTxnId() uint64 {
@@ -1344,7 +1524,7 @@ type DatabaseFileInfo struct {
 
 func (x *DatabaseFileInfo) Reset() {
 	*x = DatabaseFileInfo{}
-	mi := &file_grpc_marmot_proto_msgTypes[18]
+	mi := &file_grpc_marmot_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1356,7 +1536,7 @@ func (x *DatabaseFileInfo) String() string {
 func (*DatabaseFileInfo) ProtoMessage() {}
 
 func (x *DatabaseFileInfo) ProtoReflect() protoreflect.Message {
-	mi := &file_grpc_marmot_proto_msgTypes[18]
+	mi := &file_grpc_marmot_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1369,7 +1549,7 @@ func (x *DatabaseFileInfo) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DatabaseFileInfo.ProtoReflect.Descriptor instead.
 func (*DatabaseFileInfo) Descriptor() ([]byte, []int) {
-	return file_grpc_marmot_proto_rawDescGZIP(), []int{18}
+	return file_grpc_marmot_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *DatabaseFileInfo) GetName() string {
@@ -1402,7 +1582,7 @@ type SnapshotRequest struct {
 
 func (x *SnapshotRequest) Reset() {
 	*x = SnapshotRequest{}
-	mi := &file_grpc_marmot_proto_msgTypes[19]
+	mi := &file_grpc_marmot_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1414,7 +1594,7 @@ func (x *SnapshotRequest) String() string {
 func (*SnapshotRequest) ProtoMessage() {}
 
 func (x *SnapshotRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_grpc_marmot_proto_msgTypes[19]
+	mi := &file_grpc_marmot_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1427,7 +1607,7 @@ func (x *SnapshotRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SnapshotRequest.ProtoReflect.Descriptor instead.
 func (*SnapshotRequest) Descriptor() ([]byte, []int) {
-	return file_grpc_marmot_proto_rawDescGZIP(), []int{19}
+	return file_grpc_marmot_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *SnapshotRequest) GetRequestingNodeId() uint64 {
@@ -1451,7 +1631,7 @@ type SnapshotChunk struct {
 
 func (x *SnapshotChunk) Reset() {
 	*x = SnapshotChunk{}
-	mi := &file_grpc_marmot_proto_msgTypes[20]
+	mi := &file_grpc_marmot_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1463,7 +1643,7 @@ func (x *SnapshotChunk) String() string {
 func (*SnapshotChunk) ProtoMessage() {}
 
 func (x *SnapshotChunk) ProtoReflect() protoreflect.Message {
-	mi := &file_grpc_marmot_proto_msgTypes[20]
+	mi := &file_grpc_marmot_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1476,7 +1656,7 @@ func (x *SnapshotChunk) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SnapshotChunk.ProtoReflect.Descriptor instead.
 func (*SnapshotChunk) Descriptor() ([]byte, []int) {
-	return file_grpc_marmot_proto_rawDescGZIP(), []int{20}
+	return file_grpc_marmot_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *SnapshotChunk) GetChunkIndex() int32 {
@@ -1602,7 +1782,20 @@ const file_grpc_marmot_proto_rawDesc = "" +
 	"statements\x18\x02 \x03(\v2\x14.marmot.v2.StatementR\n" +
 	"statements\x12,\n" +
 	"\ttimestamp\x18\x03 \x01(\v2\x0e.marmot.v2.HLCR\ttimestamp\x12\x1a\n" +
-	"\bdatabase\x18\x04 \x01(\tR\bdatabase\"C\n" +
+	"\bdatabase\x18\x04 \x01(\tR\bdatabase\"c\n" +
+	"\x17ReplicationStateRequest\x12,\n" +
+	"\x12requesting_node_id\x18\x01 \x01(\x04R\x10requestingNodeId\x12\x1a\n" +
+	"\bdatabase\x18\x02 \x01(\tR\bdatabase\"W\n" +
+	"\x18ReplicationStateResponse\x12;\n" +
+	"\x06states\x18\x01 \x03(\v2#.marmot.v2.DatabaseReplicationStateR\x06states\"\xa8\x02\n" +
+	"\x18DatabaseReplicationState\x12#\n" +
+	"\rdatabase_name\x18\x01 \x01(\tR\fdatabaseName\x12-\n" +
+	"\x13last_applied_txn_id\x18\x02 \x01(\x04R\x10lastAppliedTxnId\x12D\n" +
+	"\x16last_applied_timestamp\x18\x03 \x01(\v2\x0e.marmot.v2.HLCR\x14lastAppliedTimestamp\x12$\n" +
+	"\x0elast_sync_time\x18\x04 \x01(\x03R\flastSyncTime\x12\x1f\n" +
+	"\vsync_status\x18\x05 \x01(\tR\n" +
+	"syncStatus\x12+\n" +
+	"\x12current_max_txn_id\x18\x06 \x01(\x04R\x0fcurrentMaxTxnId\"C\n" +
 	"\x13SnapshotInfoRequest\x12,\n" +
 	"\x12requesting_node_id\x18\x01 \x01(\x04R\x10requestingNodeId\"\xfa\x01\n" +
 	"\x14SnapshotInfoResponse\x12&\n" +
@@ -1649,14 +1842,15 @@ const file_grpc_marmot_proto_rawDesc = "" +
 	"\n" +
 	"\x06DELETE\x10\x02\x12\a\n" +
 	"\x03DDL\x10\x03\x12\v\n" +
-	"\aREPLACE\x10\x042\xb3\x04\n" +
+	"\aREPLACE\x10\x042\x93\x05\n" +
 	"\rMarmotService\x12=\n" +
 	"\x06Gossip\x12\x18.marmot.v2.GossipRequest\x1a\x19.marmot.v2.GossipResponse\x127\n" +
 	"\x04Join\x12\x16.marmot.v2.JoinRequest\x1a\x17.marmot.v2.JoinResponse\x127\n" +
 	"\x04Ping\x12\x16.marmot.v2.PingRequest\x1a\x17.marmot.v2.PingResponse\x12U\n" +
 	"\x14ReplicateTransaction\x12\x1d.marmot.v2.TransactionRequest\x1a\x1e.marmot.v2.TransactionResponse\x127\n" +
 	"\x04Read\x12\x16.marmot.v2.ReadRequest\x1a\x17.marmot.v2.ReadResponse\x12C\n" +
-	"\rStreamChanges\x12\x18.marmot.v2.StreamRequest\x1a\x16.marmot.v2.ChangeEvent0\x01\x12R\n" +
+	"\rStreamChanges\x12\x18.marmot.v2.StreamRequest\x1a\x16.marmot.v2.ChangeEvent0\x01\x12^\n" +
+	"\x13GetReplicationState\x12\".marmot.v2.ReplicationStateRequest\x1a#.marmot.v2.ReplicationStateResponse\x12R\n" +
 	"\x0fGetSnapshotInfo\x12\x1e.marmot.v2.SnapshotInfoRequest\x1a\x1f.marmot.v2.SnapshotInfoResponse\x12H\n" +
 	"\x0eStreamSnapshot\x12\x1a.marmot.v2.SnapshotRequest\x1a\x18.marmot.v2.SnapshotChunk0\x01B Z\x1egithub.com/maxpert/marmot/grpcb\x06proto3"
 
@@ -1673,34 +1867,37 @@ func file_grpc_marmot_proto_rawDescGZIP() []byte {
 }
 
 var file_grpc_marmot_proto_enumTypes = make([]protoimpl.EnumInfo, 4)
-var file_grpc_marmot_proto_msgTypes = make([]protoimpl.MessageInfo, 22)
+var file_grpc_marmot_proto_msgTypes = make([]protoimpl.MessageInfo, 25)
 var file_grpc_marmot_proto_goTypes = []any{
-	(NodeStatus)(0),              // 0: marmot.v2.NodeStatus
-	(TransactionPhase)(0),        // 1: marmot.v2.TransactionPhase
-	(ConsistencyLevel)(0),        // 2: marmot.v2.ConsistencyLevel
-	(StatementType)(0),           // 3: marmot.v2.StatementType
-	(*GossipRequest)(nil),        // 4: marmot.v2.GossipRequest
-	(*GossipResponse)(nil),       // 5: marmot.v2.GossipResponse
-	(*NodeState)(nil),            // 6: marmot.v2.NodeState
-	(*JoinRequest)(nil),          // 7: marmot.v2.JoinRequest
-	(*JoinResponse)(nil),         // 8: marmot.v2.JoinResponse
-	(*PingRequest)(nil),          // 9: marmot.v2.PingRequest
-	(*PingResponse)(nil),         // 10: marmot.v2.PingResponse
-	(*TransactionRequest)(nil),   // 11: marmot.v2.TransactionRequest
-	(*Statement)(nil),            // 12: marmot.v2.Statement
-	(*HLC)(nil),                  // 13: marmot.v2.HLC
-	(*TransactionResponse)(nil),  // 14: marmot.v2.TransactionResponse
-	(*ReadRequest)(nil),          // 15: marmot.v2.ReadRequest
-	(*ReadResponse)(nil),         // 16: marmot.v2.ReadResponse
-	(*Row)(nil),                  // 17: marmot.v2.Row
-	(*StreamRequest)(nil),        // 18: marmot.v2.StreamRequest
-	(*ChangeEvent)(nil),          // 19: marmot.v2.ChangeEvent
-	(*SnapshotInfoRequest)(nil),  // 20: marmot.v2.SnapshotInfoRequest
-	(*SnapshotInfoResponse)(nil), // 21: marmot.v2.SnapshotInfoResponse
-	(*DatabaseFileInfo)(nil),     // 22: marmot.v2.DatabaseFileInfo
-	(*SnapshotRequest)(nil),      // 23: marmot.v2.SnapshotRequest
-	(*SnapshotChunk)(nil),        // 24: marmot.v2.SnapshotChunk
-	nil,                          // 25: marmot.v2.Row.ColumnsEntry
+	(NodeStatus)(0),                  // 0: marmot.v2.NodeStatus
+	(TransactionPhase)(0),            // 1: marmot.v2.TransactionPhase
+	(ConsistencyLevel)(0),            // 2: marmot.v2.ConsistencyLevel
+	(StatementType)(0),               // 3: marmot.v2.StatementType
+	(*GossipRequest)(nil),            // 4: marmot.v2.GossipRequest
+	(*GossipResponse)(nil),           // 5: marmot.v2.GossipResponse
+	(*NodeState)(nil),                // 6: marmot.v2.NodeState
+	(*JoinRequest)(nil),              // 7: marmot.v2.JoinRequest
+	(*JoinResponse)(nil),             // 8: marmot.v2.JoinResponse
+	(*PingRequest)(nil),              // 9: marmot.v2.PingRequest
+	(*PingResponse)(nil),             // 10: marmot.v2.PingResponse
+	(*TransactionRequest)(nil),       // 11: marmot.v2.TransactionRequest
+	(*Statement)(nil),                // 12: marmot.v2.Statement
+	(*HLC)(nil),                      // 13: marmot.v2.HLC
+	(*TransactionResponse)(nil),      // 14: marmot.v2.TransactionResponse
+	(*ReadRequest)(nil),              // 15: marmot.v2.ReadRequest
+	(*ReadResponse)(nil),             // 16: marmot.v2.ReadResponse
+	(*Row)(nil),                      // 17: marmot.v2.Row
+	(*StreamRequest)(nil),            // 18: marmot.v2.StreamRequest
+	(*ChangeEvent)(nil),              // 19: marmot.v2.ChangeEvent
+	(*ReplicationStateRequest)(nil),  // 20: marmot.v2.ReplicationStateRequest
+	(*ReplicationStateResponse)(nil), // 21: marmot.v2.ReplicationStateResponse
+	(*DatabaseReplicationState)(nil), // 22: marmot.v2.DatabaseReplicationState
+	(*SnapshotInfoRequest)(nil),      // 23: marmot.v2.SnapshotInfoRequest
+	(*SnapshotInfoResponse)(nil),     // 24: marmot.v2.SnapshotInfoResponse
+	(*DatabaseFileInfo)(nil),         // 25: marmot.v2.DatabaseFileInfo
+	(*SnapshotRequest)(nil),          // 26: marmot.v2.SnapshotRequest
+	(*SnapshotChunk)(nil),            // 27: marmot.v2.SnapshotChunk
+	nil,                              // 28: marmot.v2.Row.ColumnsEntry
 }
 var file_grpc_marmot_proto_depIdxs = []int32{
 	6,  // 0: marmot.v2.GossipRequest.nodes:type_name -> marmot.v2.NodeState
@@ -1718,32 +1915,36 @@ var file_grpc_marmot_proto_depIdxs = []int32{
 	2,  // 12: marmot.v2.ReadRequest.consistency:type_name -> marmot.v2.ConsistencyLevel
 	17, // 13: marmot.v2.ReadResponse.rows:type_name -> marmot.v2.Row
 	13, // 14: marmot.v2.ReadResponse.timestamp:type_name -> marmot.v2.HLC
-	25, // 15: marmot.v2.Row.columns:type_name -> marmot.v2.Row.ColumnsEntry
+	28, // 15: marmot.v2.Row.columns:type_name -> marmot.v2.Row.ColumnsEntry
 	12, // 16: marmot.v2.ChangeEvent.statements:type_name -> marmot.v2.Statement
 	13, // 17: marmot.v2.ChangeEvent.timestamp:type_name -> marmot.v2.HLC
-	13, // 18: marmot.v2.SnapshotInfoResponse.timestamp:type_name -> marmot.v2.HLC
-	22, // 19: marmot.v2.SnapshotInfoResponse.databases:type_name -> marmot.v2.DatabaseFileInfo
-	4,  // 20: marmot.v2.MarmotService.Gossip:input_type -> marmot.v2.GossipRequest
-	7,  // 21: marmot.v2.MarmotService.Join:input_type -> marmot.v2.JoinRequest
-	9,  // 22: marmot.v2.MarmotService.Ping:input_type -> marmot.v2.PingRequest
-	11, // 23: marmot.v2.MarmotService.ReplicateTransaction:input_type -> marmot.v2.TransactionRequest
-	15, // 24: marmot.v2.MarmotService.Read:input_type -> marmot.v2.ReadRequest
-	18, // 25: marmot.v2.MarmotService.StreamChanges:input_type -> marmot.v2.StreamRequest
-	20, // 26: marmot.v2.MarmotService.GetSnapshotInfo:input_type -> marmot.v2.SnapshotInfoRequest
-	23, // 27: marmot.v2.MarmotService.StreamSnapshot:input_type -> marmot.v2.SnapshotRequest
-	5,  // 28: marmot.v2.MarmotService.Gossip:output_type -> marmot.v2.GossipResponse
-	8,  // 29: marmot.v2.MarmotService.Join:output_type -> marmot.v2.JoinResponse
-	10, // 30: marmot.v2.MarmotService.Ping:output_type -> marmot.v2.PingResponse
-	14, // 31: marmot.v2.MarmotService.ReplicateTransaction:output_type -> marmot.v2.TransactionResponse
-	16, // 32: marmot.v2.MarmotService.Read:output_type -> marmot.v2.ReadResponse
-	19, // 33: marmot.v2.MarmotService.StreamChanges:output_type -> marmot.v2.ChangeEvent
-	21, // 34: marmot.v2.MarmotService.GetSnapshotInfo:output_type -> marmot.v2.SnapshotInfoResponse
-	24, // 35: marmot.v2.MarmotService.StreamSnapshot:output_type -> marmot.v2.SnapshotChunk
-	28, // [28:36] is the sub-list for method output_type
-	20, // [20:28] is the sub-list for method input_type
-	20, // [20:20] is the sub-list for extension type_name
-	20, // [20:20] is the sub-list for extension extendee
-	0,  // [0:20] is the sub-list for field type_name
+	22, // 18: marmot.v2.ReplicationStateResponse.states:type_name -> marmot.v2.DatabaseReplicationState
+	13, // 19: marmot.v2.DatabaseReplicationState.last_applied_timestamp:type_name -> marmot.v2.HLC
+	13, // 20: marmot.v2.SnapshotInfoResponse.timestamp:type_name -> marmot.v2.HLC
+	25, // 21: marmot.v2.SnapshotInfoResponse.databases:type_name -> marmot.v2.DatabaseFileInfo
+	4,  // 22: marmot.v2.MarmotService.Gossip:input_type -> marmot.v2.GossipRequest
+	7,  // 23: marmot.v2.MarmotService.Join:input_type -> marmot.v2.JoinRequest
+	9,  // 24: marmot.v2.MarmotService.Ping:input_type -> marmot.v2.PingRequest
+	11, // 25: marmot.v2.MarmotService.ReplicateTransaction:input_type -> marmot.v2.TransactionRequest
+	15, // 26: marmot.v2.MarmotService.Read:input_type -> marmot.v2.ReadRequest
+	18, // 27: marmot.v2.MarmotService.StreamChanges:input_type -> marmot.v2.StreamRequest
+	20, // 28: marmot.v2.MarmotService.GetReplicationState:input_type -> marmot.v2.ReplicationStateRequest
+	23, // 29: marmot.v2.MarmotService.GetSnapshotInfo:input_type -> marmot.v2.SnapshotInfoRequest
+	26, // 30: marmot.v2.MarmotService.StreamSnapshot:input_type -> marmot.v2.SnapshotRequest
+	5,  // 31: marmot.v2.MarmotService.Gossip:output_type -> marmot.v2.GossipResponse
+	8,  // 32: marmot.v2.MarmotService.Join:output_type -> marmot.v2.JoinResponse
+	10, // 33: marmot.v2.MarmotService.Ping:output_type -> marmot.v2.PingResponse
+	14, // 34: marmot.v2.MarmotService.ReplicateTransaction:output_type -> marmot.v2.TransactionResponse
+	16, // 35: marmot.v2.MarmotService.Read:output_type -> marmot.v2.ReadResponse
+	19, // 36: marmot.v2.MarmotService.StreamChanges:output_type -> marmot.v2.ChangeEvent
+	21, // 37: marmot.v2.MarmotService.GetReplicationState:output_type -> marmot.v2.ReplicationStateResponse
+	24, // 38: marmot.v2.MarmotService.GetSnapshotInfo:output_type -> marmot.v2.SnapshotInfoResponse
+	27, // 39: marmot.v2.MarmotService.StreamSnapshot:output_type -> marmot.v2.SnapshotChunk
+	31, // [31:40] is the sub-list for method output_type
+	22, // [22:31] is the sub-list for method input_type
+	22, // [22:22] is the sub-list for extension type_name
+	22, // [22:22] is the sub-list for extension extendee
+	0,  // [0:22] is the sub-list for field type_name
 }
 
 func init() { file_grpc_marmot_proto_init() }
@@ -1757,7 +1958,7 @@ func file_grpc_marmot_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_grpc_marmot_proto_rawDesc), len(file_grpc_marmot_proto_rawDesc)),
 			NumEnums:      4,
-			NumMessages:   22,
+			NumMessages:   25,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

@@ -71,12 +71,16 @@ type ClusterConfiguration struct {
 
 // ReplicationConfiguration controls replication behavior
 type ReplicationConfiguration struct {
-	DefaultWriteConsist  string `toml:"default_write_consistency"`
-	DefaultReadConsist   string `toml:"default_read_consistency"`
-	WriteTimeoutMS       int    `toml:"write_timeout_ms"`
-	ReadTimeoutMS        int    `toml:"read_timeout_ms"`
-	EnableAntiEntropy    bool   `toml:"enable_anti_entropy"`
-	AntiEntropyIntervalS int    `toml:"anti_entropy_interval_seconds"`
+	DefaultWriteConsist          string `toml:"default_write_consistency"`
+	DefaultReadConsist           string `toml:"default_read_consistency"`
+	WriteTimeoutMS               int    `toml:"write_timeout_ms"`
+	ReadTimeoutMS                int    `toml:"read_timeout_ms"`
+	EnableAntiEntropy            bool   `toml:"enable_anti_entropy"`
+	AntiEntropyIntervalS         int    `toml:"anti_entropy_interval_seconds"`
+	DeltaSyncThresholdTxns       int    `toml:"delta_sync_threshold_transactions"`
+	DeltaSyncThresholdSeconds    int    `toml:"delta_sync_threshold_seconds"`
+	GCMinRetentionHours          int    `toml:"gc_min_retention_hours"`
+	GCMaxRetentionHours          int    `toml:"gc_max_retention_hours"`
 }
 
 // MySQLConfiguration for MySQL wire protocol server
@@ -185,12 +189,16 @@ var Config = &Configuration{
 	},
 
 	Replication: ReplicationConfiguration{
-		DefaultWriteConsist:  "QUORUM",
-		DefaultReadConsist:   "LOCAL_ONE",
-		WriteTimeoutMS:       5000,
-		ReadTimeoutMS:        2000,
-		EnableAntiEntropy:    true,
-		AntiEntropyIntervalS: 600, // 10 minutes
+		DefaultWriteConsist:       "QUORUM",
+		DefaultReadConsist:        "LOCAL_ONE",
+		WriteTimeoutMS:            5000,
+		ReadTimeoutMS:             2000,
+		EnableAntiEntropy:         true,
+		AntiEntropyIntervalS:      60,    // 1 minute (production best practice)
+		DeltaSyncThresholdTxns:    10000, // Trigger snapshot if lag > 10k transactions
+		DeltaSyncThresholdSeconds: 3600,  // Trigger snapshot if lag > 1 hour
+		GCMinRetentionHours:       1,     // Minimum 1 hour retention for replication
+		GCMaxRetentionHours:       4,     // Force GC after 4 hours (prevent unbounded growth)
 	},
 
 	MVCC: MVCCConfiguration{

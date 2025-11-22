@@ -109,16 +109,19 @@ const (
 	);
 	`
 
-	// CreateReplicationStateTable tracks replication progress per peer
+	// CreateReplicationStateTable tracks replication progress per peer per database
 	// Used for delta sync catch-up after partition heals
+	// Multi-database support: tracks each database independently
 	CreateReplicationStateTable = `
 	CREATE TABLE IF NOT EXISTS __marmot__replication_state (
-		peer_node_id INTEGER PRIMARY KEY,
+		peer_node_id INTEGER NOT NULL,
+		database_name TEXT NOT NULL,
 		last_applied_txn_id INTEGER NOT NULL DEFAULT 0,
 		last_applied_ts_wall INTEGER NOT NULL DEFAULT 0,
 		last_applied_ts_logical INTEGER NOT NULL DEFAULT 0,
 		last_sync_time INTEGER NOT NULL,
-		sync_status TEXT NOT NULL DEFAULT 'SYNCED' -- SYNCED, CATCHING_UP, FAILED
+		sync_status TEXT NOT NULL DEFAULT 'SYNCED', -- SYNCED, CATCHING_UP, FAILED
+		PRIMARY KEY (peer_node_id, database_name)
 	);
 	`
 )
