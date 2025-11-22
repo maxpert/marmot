@@ -230,12 +230,12 @@ func TestOldTransactionRecordCleanup(t *testing.T) {
 		t.Fatalf("Expected transaction record to exist, found %d", count)
 	}
 
-	// Manually set the created_at to 2 hours ago (older than 1 hour retention)
-	oldTS := time.Now().Add(-2 * time.Hour).UnixNano()
+	// Manually set the created_at to 5 hours ago (older than 4 hour max retention)
+	oldTS := time.Now().Add(-5 * time.Hour).UnixNano()
 	_, err = db.Exec("UPDATE __marmot__txn_records SET created_at = ? WHERE txn_id = ?", oldTS, txn.ID)
 	assertNoError(t, err, "Failed to update created_at")
 
-	t.Log("✓ Simulated old transaction record (2 hours old)")
+	t.Log("✓ Simulated old transaction record (5 hours old)")
 
 	// Run GC cleanup
 	cleanedCount, err := tm.cleanupOldTransactionRecords()
