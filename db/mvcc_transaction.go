@@ -39,17 +39,25 @@ type WriteIntent struct {
 	DataSnapshot []byte
 }
 
+// MinAppliedTxnIDFunc returns the minimum last_applied_txn_id across all peers for a database
+// Used for GC coordination to prevent deleting logs needed by lagging peers
+type MinAppliedTxnIDFunc func(database string) (uint64, error)
+
 // MVCCTransactionManager manages MVCC transactions
 type MVCCTransactionManager struct {
-	db               *sql.DB
-	clock            *hlc.Clock
-	activeTxns       map[uint64]*MVCCTransaction
-	mu               sync.RWMutex
-	gcInterval       time.Duration
-	gcThreshold      time.Duration
-	heartbeatTimeout time.Duration
-	stopGC           chan struct{}
-	gcRunning        bool
+	db                 *sql.DB
+	clock              *hlc.Clock
+	activeTxns         map[uint64]*MVCCTransaction
+	mu                 sync.RWMutex
+	gcInterval         time.Duration
+	gcThreshold        time.Duration
+	gcMinRetention     time.Duration // Minimum retention for replication
+	gcMaxRetention     time.Duration // Force GC after this duration
+	heartbeatTimeout   time.Duration
+	stopGC             chan struct{}
+	gcRunning          bool
+	databaseName       string              // Name of database this manager manages
+	getMinAppliedTxnID MinAppliedTxnIDFunc // Callback for GC coordination
 }
 
 // NewMVCCTransactionManager creates a new transaction manager
@@ -57,6 +65,8 @@ func NewMVCCTransactionManager(db *sql.DB, clock *hlc.Clock) *MVCCTransactionMan
 	// Import config values (with fallback to defaults if config not loaded)
 	gcInterval := 30 * time.Second
 	gcThreshold := 1 * time.Hour
+	gcMinRetention := 1 * time.Hour
+	gcMaxRetention := 4 * time.Hour
 	heartbeatTimeout := 10 * time.Second
 
 	// Try to use config values if available
@@ -64,6 +74,8 @@ func NewMVCCTransactionManager(db *sql.DB, clock *hlc.Clock) *MVCCTransactionMan
 		gcInterval = time.Duration(cfg.Config.MVCC.GCIntervalSeconds) * time.Second
 		gcThreshold = time.Duration(cfg.Config.MVCC.GCRetentionHours) * time.Hour
 		heartbeatTimeout = time.Duration(cfg.Config.MVCC.HeartbeatTimeoutSeconds) * time.Second
+		gcMinRetention = time.Duration(cfg.Config.Replication.GCMinRetentionHours) * time.Hour
+		gcMaxRetention = time.Duration(cfg.Config.Replication.GCMaxRetentionHours) * time.Hour
 	}
 
 	tm := &MVCCTransactionManager{
@@ -72,15 +84,34 @@ func NewMVCCTransactionManager(db *sql.DB, clock *hlc.Clock) *MVCCTransactionMan
 		activeTxns:       make(map[uint64]*MVCCTransaction),
 		gcInterval:       gcInterval,
 		gcThreshold:      gcThreshold,
+		gcMinRetention:   gcMinRetention,
+		gcMaxRetention:   gcMaxRetention,
 		heartbeatTimeout: heartbeatTimeout,
 		stopGC:           make(chan struct{}),
 		gcRunning:        false,
+		databaseName:     "", // Set later via SetDatabaseName()
 	}
 
 	// Start background garbage collection
 	tm.StartGarbageCollection()
 
 	return tm
+}
+
+// SetDatabaseName sets the database name for this transaction manager
+// Used for GC coordination across peers
+func (tm *MVCCTransactionManager) SetDatabaseName(name string) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	tm.databaseName = name
+}
+
+// SetMinAppliedTxnIDFunc sets the callback for querying minimum applied txn_id across peers
+// Used for GC safe point calculation
+func (tm *MVCCTransactionManager) SetMinAppliedTxnIDFunc(fn MinAppliedTxnIDFunc) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	tm.getMinAppliedTxnID = fn
 }
 
 // BeginTransaction starts a new MVCC transaction
@@ -543,19 +574,86 @@ func (tm *MVCCTransactionManager) cleanupStaleTransactions() (int, error) {
 }
 
 // cleanupOldTransactionRecords removes old COMMITTED/ABORTED transaction records
+// with GC safe point coordination to prevent deleting logs needed by lagging peers
 func (tm *MVCCTransactionManager) cleanupOldTransactionRecords() (int, error) {
-	cutoff := time.Now().Add(-tm.gcThreshold).UnixNano()
+	now := time.Now()
 
-	result, err := tm.db.Exec(`
-		DELETE FROM __marmot__txn_records
-		WHERE (status = ? OR status = ?) AND created_at < ?
-	`, TxnStatusCommitted, TxnStatusAborted, cutoff)
+	// Calculate time-based cutoffs
+	minRetentionCutoff := now.Add(-tm.gcMinRetention).UnixNano()
+	maxRetentionCutoff := now.Add(-tm.gcMaxRetention).UnixNano()
+
+	// Get GC safe point from peer replication tracking
+	tm.mu.RLock()
+	getMinAppliedFn := tm.getMinAppliedTxnID
+	dbName := tm.databaseName
+	tm.mu.RUnlock()
+
+	var minAppliedTxnID uint64 = 0
+	if getMinAppliedFn != nil && dbName != "" {
+		minTxnID, err := getMinAppliedFn(dbName)
+		if err == nil {
+			minAppliedTxnID = minTxnID
+		} else {
+			log.Warn().Err(err).Str("database", dbName).Msg("GC: Failed to get min applied txn_id, proceeding with time-based GC only")
+		}
+	}
+
+	var result sql.Result
+	var err error
+
+	if minAppliedTxnID > 0 {
+		// GC with peer coordination: delete only if ALL of the following are true:
+		// 1. Transaction is COMMITTED or ABORTED
+		// 2. Transaction is older than gc_min_retention
+		// 3. Transaction has been applied by all peers (txn_id < minAppliedTxnID)
+		// OR transaction is older than gc_max_retention (force GC to prevent unbounded growth)
+		result, err = tm.db.Exec(`
+			DELETE FROM __marmot__txn_records
+			WHERE (status = ? OR status = ?)
+			  AND (
+			    (created_at < ? AND txn_id < ?)   -- Applied by all peers + past min retention
+			    OR created_at < ?                 -- Force GC after max retention
+			  )
+		`, TxnStatusCommitted, TxnStatusAborted,
+		   minRetentionCutoff, minAppliedTxnID,
+		   maxRetentionCutoff)
+
+		if err == nil {
+			log.Debug().
+				Str("database", dbName).
+				Uint64("min_applied_txn_id", minAppliedTxnID).
+				Time("min_retention_cutoff", time.Unix(0, minRetentionCutoff)).
+				Time("max_retention_cutoff", time.Unix(0, maxRetentionCutoff)).
+				Msg("GC: Coordinated cleanup with peer tracking")
+		}
+	} else {
+		// No peer tracking available - use time-based GC only
+		// Delete if older than gc_max_retention (conservative approach)
+		result, err = tm.db.Exec(`
+			DELETE FROM __marmot__txn_records
+			WHERE (status = ? OR status = ?) AND created_at < ?
+		`, TxnStatusCommitted, TxnStatusAborted, maxRetentionCutoff)
+
+		if err == nil {
+			log.Debug().
+				Str("database", dbName).
+				Time("max_retention_cutoff", time.Unix(0, maxRetentionCutoff)).
+				Msg("GC: Time-based cleanup only (no peer tracking)")
+		}
+	}
 
 	if err != nil {
 		return 0, err
 	}
 
 	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected > 0 {
+		log.Info().
+			Str("database", dbName).
+			Int64("deleted_records", rowsAffected).
+			Msg("GC: Cleaned up old transaction records")
+	}
+
 	return int(rowsAffected), nil
 }
 

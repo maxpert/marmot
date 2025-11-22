@@ -188,3 +188,31 @@ func (c *Client) Read(ctx context.Context, nodeID uint64, req *ReadRequest) (*Re
 
 	return client.Read(ctx, req)
 }
+
+// GetClientByAddress returns a MarmotServiceClient for an address
+// If not already connected, it creates a connection using a temporary node ID
+func (c *Client) GetClientByAddress(address string) (MarmotServiceClient, error) {
+	c.mu.RLock()
+	// Check if we already have a connection to this address
+	for nodeID, conn := range c.connections {
+		if conn.Target() == address {
+			client := c.clients[nodeID]
+			c.mu.RUnlock()
+			return client, nil
+		}
+	}
+	c.mu.RUnlock()
+
+	// No existing connection, create a new one with temporary node ID
+	// Use a hash of the address as a pseudo node ID
+	tempNodeID := uint64(0)
+	for _, b := range []byte(address) {
+		tempNodeID = tempNodeID*31 + uint64(b)
+	}
+
+	if err := c.Connect(tempNodeID, address); err != nil {
+		return nil, err
+	}
+
+	return c.GetClient(tempNodeID)
+}

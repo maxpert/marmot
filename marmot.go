@@ -149,6 +149,32 @@ func main() {
 
 	log.Info().Msg("Database Manager and replication handlers initialized")
 
+	// Phase 6: Setup anti-entropy service for catching up lagging nodes
+	log.Info().Msg("Setting up anti-entropy service")
+	deltaSync := marmotgrpc.NewDeltaSyncClient(marmotgrpc.DeltaSyncConfig{
+		NodeID:      cfg.Config.NodeID,
+		Client:      client,
+		DBManager:   dbMgr,
+		Clock:       clock,
+		ApplyTxnsFn: replicationHandler.HandleReplicateTransaction,
+	})
+
+	antiEntropy := marmotgrpc.NewAntiEntropyServiceFromConfig(
+		cfg.Config.NodeID,
+		grpcServer.GetNodeRegistry(),
+		client,
+		dbMgr,
+		deltaSync,
+		clock,
+		nil, // Snapshot function will be wired up later if needed
+	)
+
+	// Start anti-entropy service
+	antiEntropy.Start()
+	defer antiEntropy.Stop()
+
+	log.Info().Msg("Anti-entropy service initialized")
+
 	// Phase 7: Setup transaction coordinators for full database replication
 	log.Info().Msg("Setting up transaction coordinators")
 	nodeProvider := marmotgrpc.NewGossipNodeProvider(gossip.GetNodeRegistry())

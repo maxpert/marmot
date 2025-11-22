@@ -83,6 +83,9 @@ func (dm *DatabaseManager) initSystemDatabase() error {
 		return fmt.Errorf("failed to create system database: %w", err)
 	}
 
+	// Wire up GC coordination for system database
+	dm.wireGCCoordination(systemDB, SystemDatabaseName)
+
 	dm.systemDB = systemDB
 
 	// Create database registry table
@@ -138,8 +141,19 @@ func (dm *DatabaseManager) openDatabase(name, path string) error {
 		return fmt.Errorf("failed to open database %s: %w", name, err)
 	}
 
+	// Wire up GC coordination for transaction log retention
+	dm.wireGCCoordination(db, name)
+
 	dm.databases[name] = db
 	return nil
+}
+
+// wireGCCoordination sets up GC safe point tracking for a database
+// This ensures transaction logs are retained until all peers have applied them
+func (dm *DatabaseManager) wireGCCoordination(mdb *MVCCDatabase, dbName string) {
+	txnMgr := mdb.GetTransactionManager()
+	txnMgr.SetDatabaseName(dbName)
+	txnMgr.SetMinAppliedTxnIDFunc(dm.GetMinAppliedTxnID)
 }
 
 // ensureDefaultDatabase ensures the default database exists
@@ -180,6 +194,9 @@ func (dm *DatabaseManager) CreateDatabase(name string) error {
 	if err != nil {
 		return fmt.Errorf("failed to create database file: %w", err)
 	}
+
+	// Wire up GC coordination for newly created database
+	dm.wireGCCoordination(db, name)
 
 	// Register in system database
 	createdAt := time.Now().UnixNano()
@@ -430,6 +447,9 @@ func (dm *DatabaseManager) ImportExistingDatabases(importDir string) (int, error
 			continue
 		}
 
+		// Wire up GC coordination for imported database
+		dm.wireGCCoordination(db, dbName)
+
 		// Register in system database
 		createdAt := time.Now().UnixNano()
 		relPath := filepath.Join("databases", name)
@@ -642,7 +662,7 @@ func (dm *DatabaseManager) GetAllReplicationStates() ([]ReplicationState, error)
 	var allStates []ReplicationState
 
 	// Query each database for its replication state
-	for dbName, mdb := range dm.databases {
+	for _, mdb := range dm.databases {
 		rows, err := mdb.GetDB().Query(`
 			SELECT peer_node_id, database_name, last_applied_txn_id, last_applied_ts_wall,
 			       last_applied_ts_logical, last_sync_time, sync_status
@@ -687,4 +707,24 @@ func (dm *DatabaseManager) GetMinAppliedTxnID(database string) (uint64, error) {
 	`, database).Scan(&minTxnID)
 
 	return minTxnID, err
+}
+
+// GetMaxTxnID returns the maximum transaction ID in a database
+// This is used to calculate replication lag
+func (dm *DatabaseManager) GetMaxTxnID(database string) (uint64, error) {
+	dm.mu.RLock()
+	defer dm.mu.RUnlock()
+
+	db, ok := dm.databases[database]
+	if !ok {
+		return 0, fmt.Errorf("database %s not found", database)
+	}
+
+	var maxTxnID uint64
+	err := db.GetDB().QueryRow(`
+		SELECT COALESCE(MAX(txn_id), 0)
+		FROM __marmot__txn_records
+	`).Scan(&maxTxnID)
+
+	return maxTxnID, err
 }
