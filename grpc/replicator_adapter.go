@@ -83,6 +83,12 @@ func convertStatementTypeToProto(stmtType protocol.StatementType) StatementType 
 		return StatementType_UPDATE
 	case protocol.StatementDelete:
 		return StatementType_DELETE
+	case protocol.StatementReplace:
+		return StatementType_REPLACE
+	case protocol.StatementDDL:
+		return StatementType_DDL
+	case protocol.StatementCreateDatabase, protocol.StatementDropDatabase:
+		return StatementType_DDL  // Database operations are DDL
 	default:
 		return StatementType_INSERT
 	}

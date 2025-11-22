@@ -91,10 +91,6 @@ func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, qu
 		return h.handleShowDatabases()
 	case protocol.StatementUseDatabase:
 		return h.handleUseDatabase(session, stmt.Database)
-	case protocol.StatementCreateDatabase:
-		return h.handleCreateDatabase(stmt.Database)
-	case protocol.StatementDropDatabase:
-		return h.handleDropDatabase(stmt.Database)
 	}
 
 	// Handle metadata queries (for DBeaver compatibility)
@@ -134,7 +130,9 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, consistency
 	startTS := h.clock.Now()
 
 	// Detect DDL and handle differently
-	isDDL := stmt.Type == protocol.StatementDDL
+	isDDL := stmt.Type == protocol.StatementDDL ||
+		stmt.Type == protocol.StatementCreateDatabase ||
+		stmt.Type == protocol.StatementDropDatabase
 
 	// Rewrite DDL for idempotency (safe to replay)
 	if isDDL {

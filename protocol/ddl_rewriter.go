@@ -13,6 +13,12 @@ var (
 	// DROP TABLE patterns
 	dropTableRe = regexp.MustCompile(`(?i)^\s*DROP\s+TABLE\s+(\w+)`)
 
+	// CREATE DATABASE patterns
+	createDatabaseRe = regexp.MustCompile(`(?i)^\s*CREATE\s+DATABASE\s+(\w+)`)
+
+	// DROP DATABASE patterns
+	dropDatabaseRe = regexp.MustCompile(`(?i)^\s*DROP\s+DATABASE\s+(\w+)`)
+
 	// CREATE INDEX patterns
 	createIndexRe = regexp.MustCompile(`(?i)^\s*CREATE\s+(UNIQUE\s+)?INDEX\s+(\w+)`)
 
@@ -55,6 +61,28 @@ func RewriteDDLForIdempotency(sql string) string {
 		}
 		// Insert "IF EXISTS" after DROP TABLE
 		rewritten := dropTableRe.ReplaceAllString(trimmed, "DROP TABLE IF EXISTS $1")
+		return rewritten
+	}
+
+	// CREATE DATABASE
+	if strings.HasPrefix(upperSQL, "CREATE DATABASE") {
+		// Check if already has IF NOT EXISTS
+		if strings.Contains(upperSQL, "IF NOT EXISTS") {
+			return trimmed
+		}
+		// Insert "IF NOT EXISTS" after CREATE DATABASE
+		rewritten := createDatabaseRe.ReplaceAllString(trimmed, "CREATE DATABASE IF NOT EXISTS $1")
+		return rewritten
+	}
+
+	// DROP DATABASE
+	if strings.HasPrefix(upperSQL, "DROP DATABASE") {
+		// Check if already has IF EXISTS
+		if strings.Contains(upperSQL, "IF EXISTS") {
+			return trimmed
+		}
+		// Insert "IF EXISTS" after DROP DATABASE
+		rewritten := dropDatabaseRe.ReplaceAllString(trimmed, "DROP DATABASE IF EXISTS $1")
 		return rewritten
 	}
 

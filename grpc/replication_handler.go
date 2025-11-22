@@ -3,10 +3,12 @@ package grpc
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/maxpert/marmot/db"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/protocol"
+	"github.com/rs/zerolog/log"
 )
 
 // ReplicationHandler handles transaction replication with MVCC
@@ -53,6 +55,59 @@ func (rh *ReplicationHandler) HandleReplicateTransaction(ctx context.Context, re
 
 // handlePrepare processes Phase 1 of 2PC: Create write intents
 func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *TransactionRequest) (*TransactionResponse, error) {
+	log.Debug().
+		Uint64("node_id", rh.nodeID).
+		Str("database", req.Database).
+		Int("num_statements", len(req.Statements)).
+		Msg("handlePrepare called")
+
+	// Handle CREATE DATABASE and DROP DATABASE specially
+	// These operations don't need MVCC transaction management
+	if len(req.Statements) == 1 {
+		stmt := req.Statements[0]
+		stmtType := convertStatementType(stmt.Type)
+
+		log.Debug().
+			Uint64("node_id", rh.nodeID).
+			Int("stmt_type", int(stmtType)).
+			Str("stmt_database", stmt.Database).
+			Str("sql", stmt.Sql).
+			Msg("Checking statement type")
+
+		// Check if it's a CREATE DATABASE or DROP DATABASE by examining the SQL
+		upperSQL := strings.ToUpper(strings.TrimSpace(stmt.Sql))
+
+		if strings.HasPrefix(upperSQL, "CREATE DATABASE") {
+			// Execute CREATE DATABASE directly
+			log.Info().Str("database", stmt.Database).Uint64("node_id", rh.nodeID).Msg("Executing CREATE DATABASE via replication")
+			err := rh.dbMgr.CreateDatabase(stmt.Database)
+			if err != nil {
+				log.Error().Err(err).Str("database", stmt.Database).Msg("CREATE DATABASE failed")
+				return &TransactionResponse{
+					Success:      false,
+					ErrorMessage: fmt.Sprintf("failed to create database: %v", err),
+				}, nil
+			}
+			log.Info().Str("database", stmt.Database).Uint64("node_id", rh.nodeID).Msg("CREATE DATABASE succeeded via replication")
+			return &TransactionResponse{Success: true}, nil
+		}
+
+		if strings.HasPrefix(upperSQL, "DROP DATABASE") {
+			// Execute DROP DATABASE directly
+			log.Info().Str("database", stmt.Database).Uint64("node_id", rh.nodeID).Msg("Executing DROP DATABASE via replication")
+			err := rh.dbMgr.DropDatabase(stmt.Database)
+			if err != nil {
+				log.Error().Err(err).Str("database", stmt.Database).Msg("DROP DATABASE failed")
+				return &TransactionResponse{
+					Success:      false,
+					ErrorMessage: fmt.Sprintf("failed to drop database: %v", err),
+				}, nil
+			}
+			log.Info().Str("database", stmt.Database).Uint64("node_id", rh.nodeID).Msg("DROP DATABASE succeeded via replication")
+			return &TransactionResponse{Success: true}, nil
+		}
+	}
+
 	// Get the target database from request
 	dbName := req.Database
 	if dbName == "" {

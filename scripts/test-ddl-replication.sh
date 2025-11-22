@@ -45,10 +45,36 @@ fi
 echo -e "${GREEN}✓ Node 2 started and joined cluster${NC}"
 echo ""
 
+# Test 0: CREATE DATABASE (DDL)
+echo "Test 0: CREATE DATABASE on node 1"
+echo "----------------------------------"
+$MYSQL_CLI -h localhost -P 3307 -u root -e "CREATE DATABASE testdb;" 2>&1 || echo "Warning: CREATE DATABASE may have produced warnings"
+
+echo -e "${GREEN}✓ Database created on node 1${NC}"
+sleep 2
+
+echo "Checking if testdb replicated to node 2..."
+DATABASES_NODE2=$($MYSQL_CLI -h localhost -P 3308 -u root -e "SHOW DATABASES;" 2>&1 | grep -i testdb || echo "")
+
+if [[ -n "$DATABASES_NODE2" ]]; then
+    echo -e "${GREEN}✓ SUCCESS: testdb replicated to node 2${NC}"
+else
+    echo -e "${RED}✗ FAIL: testdb NOT found on node 2${NC}"
+    echo "Databases on node 2:"
+    $MYSQL_CLI -h localhost -P 3308 -u root -e "SHOW DATABASES;" 2>&1 || true
+    echo ""
+    echo "Checking logs for errors..."
+    echo "=== Seed log ==="
+    tail -30 /tmp/seed.log | grep -i "database\|error"
+    echo "=== Node 2 log ==="
+    tail -30 /tmp/node2.log | grep -i "database\|error"
+fi
+echo ""
+
 # Test 1: CREATE TABLE (DDL)
-echo "Test 1: CREATE TABLE on node 1"
-echo "-------------------------------"
-$MYSQL_CLI -h localhost -P 3307 -u root -e "CREATE TABLE Books (
+echo "Test 1: CREATE TABLE on node 1 in testdb"
+echo "-----------------------------------------"
+$MYSQL_CLI -h localhost -P 3307 -u root testdb -e "CREATE TABLE Books (
     id INTEGER PRIMARY KEY,
     title TEXT NOT NULL,
     author TEXT NOT NULL,
@@ -59,21 +85,21 @@ echo -e "${GREEN}✓ Table created on node 1${NC}"
 sleep 2
 
 echo "Checking if Books table replicated to node 2..."
-TABLES_NODE2=$($MYSQL_CLI -h localhost -P 3308 -u root -e "SHOW TABLES;" 2>&1 | grep -i books || echo "")
+TABLES_NODE2=$($MYSQL_CLI -h localhost -P 3308 -u root testdb -e "SHOW TABLES;" 2>&1 | grep -i books || echo "")
 
 if [[ -n "$TABLES_NODE2" ]]; then
     echo -e "${GREEN}✓ SUCCESS: Books table replicated to node 2${NC}"
 else
     echo -e "${RED}✗ FAIL: Books table NOT found on node 2${NC}"
     echo "Tables on node 2:"
-    $MYSQL_CLI -h localhost -P 3308 -u root -e "SHOW TABLES;" 2>&1 || true
+    $MYSQL_CLI -h localhost -P 3308 -u root testdb -e "SHOW TABLES;" 2>&1 || true
 fi
 echo ""
 
 # Test 2: INSERT (DML)
 echo "Test 2: INSERT data on node 1"
 echo "-----------------------------"
-$MYSQL_CLI -h localhost -P 3307 -u root -e "INSERT INTO Books (id, title, author, publication_year) VALUES
+$MYSQL_CLI -h localhost -P 3307 -u root testdb -e "INSERT INTO Books (id, title, author, publication_year) VALUES
     (1, 'The Great Gatsby', 'F. Scott Fitzgerald', 1925),
     (2, '1984', 'George Orwell', 1949),
     (3, 'To Kill a Mockingbird', 'Harper Lee', 1960);" 2>&1 || echo "Warning: INSERT may have produced warnings"
@@ -82,12 +108,12 @@ echo -e "${GREEN}✓ Data inserted on node 1${NC}"
 sleep 2
 
 echo "Checking if data replicated to node 2..."
-COUNT_NODE2=$($MYSQL_CLI -h localhost -P 3308 -u root -e "SELECT COUNT(*) as count FROM Books;" 2>&1 | tail -1)
+COUNT_NODE2=$($MYSQL_CLI -h localhost -P 3308 -u root testdb -e "SELECT COUNT(*) as count FROM Books;" 2>&1 | tail -1)
 
 if [[ "$COUNT_NODE2" == "3" ]]; then
     echo -e "${GREEN}✓ SUCCESS: 3 rows replicated to node 2${NC}"
     echo "Data on node 2:"
-    $MYSQL_CLI -h localhost -P 3308 -u root -e "SELECT * FROM Books;" 2>&1 || true
+    $MYSQL_CLI -h localhost -P 3308 -u root testdb -e "SELECT * FROM Books;" 2>&1 || true
 else
     echo -e "${RED}✗ FAIL: Expected 3 rows on node 2, got: $COUNT_NODE2${NC}"
 fi
@@ -96,13 +122,13 @@ echo ""
 # Test 3: UPDATE (DML)
 echo "Test 3: UPDATE data on node 2"
 echo "-----------------------------"
-$MYSQL_CLI -h localhost -P 3308 -u root -e "UPDATE Books SET publication_year = 1926 WHERE id = 1;" 2>&1 || echo "Warning: UPDATE may have produced warnings"
+$MYSQL_CLI -h localhost -P 3308 -u root testdb -e "UPDATE Books SET publication_year = 1926 WHERE id = 1;" 2>&1 || echo "Warning: UPDATE may have produced warnings"
 
 echo -e "${GREEN}✓ Data updated on node 2${NC}"
 sleep 3
 
 echo "Checking if update replicated to node 1..."
-YEAR_NODE1=$($MYSQL_CLI -h localhost -P 3307 -u root -e "SELECT publication_year FROM Books WHERE id = 1;" 2>&1 | tail -1)
+YEAR_NODE1=$($MYSQL_CLI -h localhost -P 3307 -u root testdb -e "SELECT publication_year FROM Books WHERE id = 1;" 2>&1 | tail -1)
 
 if [[ "$YEAR_NODE1" == "1926" ]]; then
     echo -e "${GREEN}✓ SUCCESS: Update replicated to node 1${NC}"
@@ -114,13 +140,13 @@ echo ""
 # Test 4: DELETE (DML)
 echo "Test 4: DELETE data on node 1"
 echo "-----------------------------"
-$MYSQL_CLI -h localhost -P 3307 -u root -e "DELETE FROM Books WHERE id = 2;" 2>&1 || echo "Warning: DELETE may have produced warnings"
+$MYSQL_CLI -h localhost -P 3307 -u root testdb -e "DELETE FROM Books WHERE id = 2;" 2>&1 || echo "Warning: DELETE may have produced warnings"
 
 echo -e "${GREEN}✓ Data deleted on node 1${NC}"
 sleep 2
 
 echo "Checking if delete replicated to node 2..."
-COUNT_AFTER_DELETE=$($MYSQL_CLI -h localhost -P 3308 -u root -e "SELECT COUNT(*) as count FROM Books;" 2>&1 | tail -1)
+COUNT_AFTER_DELETE=$($MYSQL_CLI -h localhost -P 3308 -u root testdb -e "SELECT COUNT(*) as count FROM Books;" 2>&1 | tail -1)
 
 if [[ "$COUNT_AFTER_DELETE" == "2" ]]; then
     echo -e "${GREEN}✓ SUCCESS: Delete replicated to node 2 (2 rows remaining)${NC}"
