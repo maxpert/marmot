@@ -69,12 +69,6 @@ dead_timeout_ms = 10000
 # ==============================================================================
 
 [replication]
-# Number of replicas for each data item
-replication_factor = 3
-
-# Virtual nodes per physical node for consistent hashing
-virtual_nodes = 150
-
 # Default write consistency level
 # Options: ONE, TWO, THREE, QUORUM, ALL, LOCAL_ONE
 default_write_consistency = "QUORUM"

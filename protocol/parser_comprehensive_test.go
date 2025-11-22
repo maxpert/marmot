@@ -590,12 +590,12 @@ func TestParser_Comprehensive_SelectNested(t *testing.T) {
 		{
 			name:     "Subquery with ANY",
 			sql:      "SELECT * FROM users WHERE id = ANY (SELECT user_id FROM orders)",
-			wantType: StatementSelect,
+			wantType: StatementUnsupported, // ANY is MySQL-only, not supported in SQLite
 		},
 		{
 			name:     "Subquery with ALL",
 			sql:      "SELECT * FROM products WHERE price > ALL (SELECT price FROM discounted_items)",
-			wantType: StatementSelect,
+			wantType: StatementUnsupported, // ALL is MySQL-only, not supported in SQLite
 		},
 		{
 			name:     "Multiple subqueries",
@@ -1539,7 +1539,7 @@ func TestParser_Comprehensive_EdgeCases(t *testing.T) {
 		{
 			name:     "Query with # comment",
 			sql:      "# This is a comment\nSELECT * FROM users",
-			wantType: StatementSelect,
+			wantType: StatementUnsupported, // # comments are MySQL-only
 		},
 		{
 			name:      "Backtick identifiers",
@@ -1638,7 +1638,7 @@ func TestParser_Comprehensive_EdgeCases(t *testing.T) {
 		{
 			name:     "Escaped quotes",
 			sql:      "INSERT INTO users (id, name) VALUES (103, 'it\\'s working')",
-			wantType: StatementInsert,
+			wantType: StatementUnsupported, // Backslash escapes are MySQL-only, use '' in SQLite
 		},
 		{
 			name:     "Double quotes",

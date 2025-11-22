@@ -23,8 +23,6 @@ func TestValidate_ValidConfig(t *testing.T) {
 			Port:    3306,
 		},
 		Replication: ReplicationConfiguration{
-			ReplicationFactor:   3,
-			VirtualNodes:        150,
 			DefaultWriteConsist: "QUORUM",
 			DefaultReadConsist:  "LOCAL_ONE",
 		},
@@ -74,8 +72,6 @@ func TestValidate_InvalidGRPCPort(t *testing.T) {
 				Enabled: false,
 			},
 			Replication: ReplicationConfiguration{
-				ReplicationFactor:   3,
-				VirtualNodes:        150,
 				DefaultWriteConsist: "QUORUM",
 				DefaultReadConsist:  "LOCAL_ONE",
 			},
@@ -101,8 +97,6 @@ func TestValidate_InvalidMySQLPort(t *testing.T) {
 			Port:    -1,
 		},
 		Replication: ReplicationConfiguration{
-			ReplicationFactor:   3,
-			VirtualNodes:        150,
 			DefaultWriteConsist: "QUORUM",
 			DefaultReadConsist:  "LOCAL_ONE",
 		},
@@ -111,56 +105,6 @@ func TestValidate_InvalidMySQLPort(t *testing.T) {
 	err := Validate()
 	if err == nil {
 		t.Error("Expected error for invalid MySQL port")
-	}
-}
-
-func TestValidate_InvalidReplicationFactor(t *testing.T) {
-	original := Config
-	defer func() { Config = original }()
-
-	Config = &Configuration{
-		Cluster: ClusterConfiguration{
-			GRPCPort: 8080,
-		},
-		MySQL: MySQLConfiguration{
-			Enabled: false,
-		},
-		Replication: ReplicationConfiguration{
-			ReplicationFactor:   0,
-			VirtualNodes:        150,
-			DefaultWriteConsist: "QUORUM",
-			DefaultReadConsist:  "LOCAL_ONE",
-		},
-	}
-
-	err := Validate()
-	if err == nil {
-		t.Error("Expected error for invalid replication factor")
-	}
-}
-
-func TestValidate_InvalidVirtualNodes(t *testing.T) {
-	original := Config
-	defer func() { Config = original }()
-
-	Config = &Configuration{
-		Cluster: ClusterConfiguration{
-			GRPCPort: 8080,
-		},
-		MySQL: MySQLConfiguration{
-			Enabled: false,
-		},
-		Replication: ReplicationConfiguration{
-			ReplicationFactor:   3,
-			VirtualNodes:        0,
-			DefaultWriteConsist: "QUORUM",
-			DefaultReadConsist:  "LOCAL_ONE",
-		},
-	}
-
-	err := Validate()
-	if err == nil {
-		t.Error("Expected error for invalid virtual nodes")
 	}
 }
 
@@ -176,8 +120,6 @@ func TestValidate_InvalidWriteConsistency(t *testing.T) {
 			Enabled: false,
 		},
 		Replication: ReplicationConfiguration{
-			ReplicationFactor:   3,
-			VirtualNodes:        150,
 			DefaultWriteConsist: "INVALID",
 			DefaultReadConsist:  "LOCAL_ONE",
 		},
@@ -201,8 +143,6 @@ func TestValidate_InvalidReadConsistency(t *testing.T) {
 			Enabled: false,
 		},
 		Replication: ReplicationConfiguration{
-			ReplicationFactor:   3,
-			VirtualNodes:        150,
 			DefaultWriteConsist: "QUORUM",
 			DefaultReadConsist:  "INVALID",
 		},
@@ -232,8 +172,6 @@ func TestLoad_NonExistentFile(t *testing.T) {
 			Port: 3306,
 		},
 		Replication: ReplicationConfiguration{
-			ReplicationFactor:   3,
-			VirtualNodes:        150,
 			DefaultWriteConsist: "QUORUM",
 			DefaultReadConsist:  "LOCAL_ONE",
 		},
@@ -369,8 +307,6 @@ func BenchmarkValidate(b *testing.B) {
 			Port:    3306,
 		},
 		Replication: ReplicationConfiguration{
-			ReplicationFactor:   3,
-			VirtualNodes:        150,
 			DefaultWriteConsist: "QUORUM",
 			DefaultReadConsist:  "LOCAL_ONE",
 		},

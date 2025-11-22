@@ -25,11 +25,16 @@ const (
 		-- Heartbeat for long-running transactions
 		last_heartbeat INTEGER,
 		-- List of tables involved (for cleanup)
-		tables_involved TEXT
+		tables_involved TEXT,
+		-- JSON array of SQL statements for delta sync replication
+		statements_json TEXT,
+		-- Database name for routing
+		database_name TEXT
 	);
 
 	CREATE INDEX IF NOT EXISTS idx_txn_status ON __marmot__txn_records(status);
 	CREATE INDEX IF NOT EXISTS idx_txn_heartbeat ON __marmot__txn_records(last_heartbeat);
+	CREATE INDEX IF NOT EXISTS idx_txn_commit_ts ON __marmot__txn_records(commit_ts_wall, commit_ts_logical);
 	`
 
 	// CreateWriteIntentsTable stores provisional writes (intents)
@@ -101,6 +106,19 @@ const (
 		key TEXT PRIMARY KEY,
 		value TEXT NOT NULL,
 		updated_at INTEGER NOT NULL
+	);
+	`
+
+	// CreateReplicationStateTable tracks replication progress per peer
+	// Used for delta sync catch-up after partition heals
+	CreateReplicationStateTable = `
+	CREATE TABLE IF NOT EXISTS __marmot__replication_state (
+		peer_node_id INTEGER PRIMARY KEY,
+		last_applied_txn_id INTEGER NOT NULL DEFAULT 0,
+		last_applied_ts_wall INTEGER NOT NULL DEFAULT 0,
+		last_applied_ts_logical INTEGER NOT NULL DEFAULT 0,
+		last_sync_time INTEGER NOT NULL,
+		sync_status TEXT NOT NULL DEFAULT 'SYNCED' -- SYNCED, CATCHING_UP, FAILED
 	);
 	`
 )

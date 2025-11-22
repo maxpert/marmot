@@ -3,6 +3,7 @@ package grpc
 import (
 	"context"
 	"crypto/md5"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -35,7 +36,6 @@ type Server struct {
 	// Components
 	gossip             *GossipProtocol
 	registry           *NodeRegistry
-	hasher             *ConsistentHash // NOTE: Not used for full database replication. Reserved for future multi-DB partitioning.
 	replicationHandler *ReplicationHandler
 	dbManager          *db.DatabaseManager
 
@@ -59,9 +59,6 @@ func NewServer(config ServerConfig) (*Server, error) {
 
 	// Initialize components
 	s.registry = NewNodeRegistry(config.NodeID)
-	// NOTE: Consistent hashing not currently used for full database replication
-	// Reserved for future multi-database partitioning support
-	s.hasher = NewConsistentHash(3, 150)
 	s.gossip = NewGossipProtocol(config.NodeID, s.registry)
 
 	return s, nil
@@ -157,9 +154,6 @@ func (s *Server) Join(ctx context.Context, req *JoinRequest) (*JoinResponse, err
 	}
 	s.registry.Add(nodeState)
 
-	// Add to consistent hash
-	s.hasher.AddNode(req.NodeId)
-
 	// Notify gossip protocol to connect to new node
 	if s.gossip != nil {
 		s.gossip.OnNodeJoin(nodeState)
@@ -243,9 +237,10 @@ func (s *Server) StreamChanges(req *StreamRequest, stream MarmotService_StreamCh
 			continue
 		}
 
-		// Query committed transactions after from_txn_id
+		// Query committed transactions after from_txn_id with statements
 		rows, err := mdb.GetDB().Query(`
-			SELECT txn_id, commit_ts_wall, commit_ts_logical
+			SELECT txn_id, commit_ts_wall, commit_ts_logical,
+			       COALESCE(statements_json, '[]'), COALESCE(database_name, '')
 			FROM __marmot__txn_records
 			WHERE status = 'COMMITTED' AND txn_id > ?
 			ORDER BY txn_id
@@ -259,10 +254,34 @@ func (s *Server) StreamChanges(req *StreamRequest, stream MarmotService_StreamCh
 			var txnID uint64
 			var commitWall int64
 			var commitLogical int32
+			var statementsJSON string
+			var databaseName string
 
-			if err := rows.Scan(&txnID, &commitWall, &commitLogical); err != nil {
+			if err := rows.Scan(&txnID, &commitWall, &commitLogical, &statementsJSON, &databaseName); err != nil {
 				log.Warn().Err(err).Msg("Failed to scan transaction")
 				continue
+			}
+
+			// Parse statements from JSON
+			var statements []*Statement
+			if statementsJSON != "" && statementsJSON != "[]" {
+				var rawStatements []struct {
+					SQL       string `json:"SQL"`
+					Type      int    `json:"Type"`
+					TableName string `json:"TableName"`
+					Database  string `json:"Database"`
+				}
+				if err := json.Unmarshal([]byte(statementsJSON), &rawStatements); err != nil {
+					log.Warn().Err(err).Uint64("txn_id", txnID).Msg("Failed to parse statements JSON")
+				} else {
+					for _, s := range rawStatements {
+						statements = append(statements, &Statement{
+							Sql:       s.SQL,
+							TableName: s.TableName,
+							Database:  s.Database,
+						})
+					}
+				}
 			}
 
 			event := &ChangeEvent{
@@ -271,9 +290,8 @@ func (s *Server) StreamChanges(req *StreamRequest, stream MarmotService_StreamCh
 					WallTime: commitWall,
 					Logical:  commitLogical,
 				},
-				// Note: Full statement details would require storing them in txn_records
-				// For now, we just signal that a transaction exists
-				Statements: []*Statement{},
+				Statements: statements,
+				Database:   databaseName,
 			}
 
 			if err := stream.Send(event); err != nil {
@@ -427,11 +445,6 @@ func (s *Server) StreamSnapshot(req *SnapshotRequest, stream MarmotService_Strea
 // GetNodeRegistry returns the node registry (for testing/debugging)
 func (s *Server) GetNodeRegistry() *NodeRegistry {
 	return s.registry
-}
-
-// GetConsistentHash returns the consistent hash (for testing/debugging)
-func (s *Server) GetConsistentHash() *ConsistentHash {
-	return s.hasher
 }
 
 // GetGossipProtocol returns the gossip protocol instance

@@ -576,3 +576,91 @@ func (dm *DatabaseManager) GetMaxCommittedTxnID() (uint64, error) {
 func (dm *DatabaseManager) GetDataDir() string {
 	return dm.dataDir
 }
+
+// ReplicationState tracks replication progress with a peer node
+type ReplicationState struct {
+	PeerNodeID        uint64
+	LastAppliedTxnID  uint64
+	LastAppliedTSWall int64
+	LastAppliedTSLog  int32
+	LastSyncTime      int64
+	SyncStatus        string // SYNCED, CATCHING_UP, FAILED
+}
+
+// GetReplicationState gets the replication state for a specific peer
+func (dm *DatabaseManager) GetReplicationState(peerNodeID uint64) (*ReplicationState, error) {
+	dm.mu.RLock()
+	defer dm.mu.RUnlock()
+
+	// Check default database for replication state
+	defaultDB, ok := dm.databases[DefaultDatabaseName]
+	if !ok {
+		return nil, fmt.Errorf("default database not found")
+	}
+
+	var state ReplicationState
+	err := defaultDB.GetDB().QueryRow(`
+		SELECT peer_node_id, last_applied_txn_id, last_applied_ts_wall,
+		       last_applied_ts_logical, last_sync_time, sync_status
+		FROM __marmot__replication_state
+		WHERE peer_node_id = ?
+	`, peerNodeID).Scan(
+		&state.PeerNodeID, &state.LastAppliedTxnID, &state.LastAppliedTSWall,
+		&state.LastAppliedTSLog, &state.LastSyncTime, &state.SyncStatus,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &state, nil
+}
+
+// UpdateReplicationState updates or inserts replication state for a peer
+func (dm *DatabaseManager) UpdateReplicationState(state *ReplicationState) error {
+	dm.mu.RLock()
+	defer dm.mu.RUnlock()
+
+	defaultDB, ok := dm.databases[DefaultDatabaseName]
+	if !ok {
+		return fmt.Errorf("default database not found")
+	}
+
+	_, err := defaultDB.GetDB().Exec(`
+		INSERT OR REPLACE INTO __marmot__replication_state
+		(peer_node_id, last_applied_txn_id, last_applied_ts_wall, last_applied_ts_logical, last_sync_time, sync_status)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, state.PeerNodeID, state.LastAppliedTxnID, state.LastAppliedTSWall,
+		state.LastAppliedTSLog, state.LastSyncTime, state.SyncStatus)
+	return err
+}
+
+// GetAllReplicationStates returns replication state for all known peers
+func (dm *DatabaseManager) GetAllReplicationStates() ([]ReplicationState, error) {
+	dm.mu.RLock()
+	defer dm.mu.RUnlock()
+
+	defaultDB, ok := dm.databases[DefaultDatabaseName]
+	if !ok {
+		return nil, fmt.Errorf("default database not found")
+	}
+
+	rows, err := defaultDB.GetDB().Query(`
+		SELECT peer_node_id, last_applied_txn_id, last_applied_ts_wall,
+		       last_applied_ts_logical, last_sync_time, sync_status
+		FROM __marmot__replication_state
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var states []ReplicationState
+	for rows.Next() {
+		var s ReplicationState
+		if err := rows.Scan(&s.PeerNodeID, &s.LastAppliedTxnID, &s.LastAppliedTSWall,
+			&s.LastAppliedTSLog, &s.LastSyncTime, &s.SyncStatus); err != nil {
+			return nil, err
+		}
+		states = append(states, s)
+	}
+	return states, nil
+}

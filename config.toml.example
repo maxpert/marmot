@@ -67,23 +67,8 @@ dead_timeout_ms = 10000
 # ==============================================================================
 # REPLICATION
 # ==============================================================================
-# Marmot v2.0 uses FULL DATABASE REPLICATION:
-# - ALL nodes receive ALL writes (complete database copy on every node)
-# - Writes require QUORUM acknowledgment (e.g., 2 out of 3 nodes)
-# - Dead nodes catch up via snapshots when they rejoin
-# - No partitioning: entire database is replicated everywhere
-#
-# NOTE: replication_factor and virtual_nodes are reserved for future
-# multi-database partitioning support and are not currently used.
-# ==============================================================================
 
 [replication]
-# Number of replicas for each data item (NOT USED - reserved for future multi-DB support)
-replication_factor = 3
-
-# Virtual nodes per physical node for consistent hashing (NOT USED - reserved for future)
-virtual_nodes = 150
-
 # Default write consistency level
 # How many nodes must ACK before write is considered successful:
 # - ONE: Any single node ACKs (fastest, least durable)

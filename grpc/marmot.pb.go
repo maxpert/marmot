@@ -1149,6 +1149,7 @@ type ChangeEvent struct {
 	TxnId         uint64                 `protobuf:"varint,1,opt,name=txn_id,json=txnId,proto3" json:"txn_id,omitempty"`
 	Statements    []*Statement           `protobuf:"bytes,2,rep,name=statements,proto3" json:"statements,omitempty"`
 	Timestamp     *HLC                   `protobuf:"bytes,3,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
+	Database      string                 `protobuf:"bytes,4,opt,name=database,proto3" json:"database,omitempty"` // Target database for these changes
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1202,6 +1203,13 @@ func (x *ChangeEvent) GetTimestamp() *HLC {
 		return x.Timestamp
 	}
 	return nil
+}
+
+func (x *ChangeEvent) GetDatabase() string {
+	if x != nil {
+		return x.Database
+	}
+	return ""
 }
 
 // ===== SNAPSHOT MESSAGES =====
@@ -1587,13 +1595,14 @@ const file_grpc_marmot_proto_rawDesc = "" +
 	"\rStreamRequest\x12\x1e\n" +
 	"\vfrom_txn_id\x18\x01 \x01(\x04R\tfromTxnId\x12,\n" +
 	"\x12requesting_node_id\x18\x02 \x01(\x04R\x10requestingNodeId\x12\x1a\n" +
-	"\bdatabase\x18\x03 \x01(\tR\bdatabase\"\x88\x01\n" +
+	"\bdatabase\x18\x03 \x01(\tR\bdatabase\"\xa4\x01\n" +
 	"\vChangeEvent\x12\x15\n" +
 	"\x06txn_id\x18\x01 \x01(\x04R\x05txnId\x124\n" +
 	"\n" +
 	"statements\x18\x02 \x03(\v2\x14.marmot.v2.StatementR\n" +
 	"statements\x12,\n" +
-	"\ttimestamp\x18\x03 \x01(\v2\x0e.marmot.v2.HLCR\ttimestamp\"C\n" +
+	"\ttimestamp\x18\x03 \x01(\v2\x0e.marmot.v2.HLCR\ttimestamp\x12\x1a\n" +
+	"\bdatabase\x18\x04 \x01(\tR\bdatabase\"C\n" +
 	"\x13SnapshotInfoRequest\x12,\n" +
 	"\x12requesting_node_id\x18\x01 \x01(\x04R\x10requestingNodeId\"\xfa\x01\n" +
 	"\x14SnapshotInfoResponse\x12&\n" +

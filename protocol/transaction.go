@@ -100,6 +100,9 @@ const (
 	StatementShowIndexes
 	StatementShowTableStatus
 	StatementInformationSchema
+
+	// Unsupported - invalid syntax or incompatible statement
+	StatementUnsupported
 )
 
 // Statement represents a single SQL statement
@@ -108,6 +111,7 @@ type Statement struct {
 	Type      StatementType
 	TableName string
 	Database  string // Target database name
+	Error     string // Error message if Type is StatementUnsupported
 }
 
 // Transaction represents a buffered transaction

@@ -28,7 +28,6 @@ func testGossipConfig() GossipConfig {
 type testNode struct {
 	nodeID   uint64
 	registry *NodeRegistry
-	hasher   *ConsistentHash
 	gossip   *GossipProtocol
 	client   *Client
 	server   *Server
@@ -39,8 +38,6 @@ type testNode struct {
 // newTestNode creates a new test node with in-memory networking
 func newTestNode(nodeID uint64, replicas, vnodes int) *testNode {
 	registry := NewNodeRegistry(nodeID)
-	hasher := NewConsistentHash(replicas, vnodes)
-	hasher.AddNode(nodeID)
 
 	client := NewClient(nodeID)
 
@@ -49,7 +46,6 @@ func newTestNode(nodeID uint64, replicas, vnodes int) *testNode {
 		address:  fmt.Sprintf("node-%d", nodeID),
 		port:     8080,
 		registry: registry,
-		hasher:   hasher,
 	}
 
 	gossip := NewGossipProtocol(nodeID, registry)
@@ -63,7 +59,6 @@ func newTestNode(nodeID uint64, replicas, vnodes int) *testNode {
 	return &testNode{
 		nodeID:   nodeID,
 		registry: registry,
-		hasher:   hasher,
 		gossip:   gossip,
 		client:   client,
 		server:   server,
@@ -108,14 +103,13 @@ func (tn *testNode) connectTo(other *testNode) error {
 	tn.client.connections[other.nodeID] = conn
 	tn.client.clients[other.nodeID] = NewMarmotServiceClient(conn)
 
-	// Add to registry and hasher
+	// Add to registry
 	tn.registry.Add(&NodeState{
 		NodeId:      other.nodeID,
 		Address:     fmt.Sprintf("node-%d:8080", other.nodeID),
 		Status:      NodeStatus_ALIVE,
 		Incarnation: 0,
 	})
-	tn.hasher.AddNode(other.nodeID)
 
 	return nil
 }

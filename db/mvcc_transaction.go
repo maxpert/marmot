@@ -259,12 +259,26 @@ func (tm *MVCCTransactionManager) CommitTransaction(txn *MVCCTransaction) error 
 		}
 	}
 
-	// Mark transaction as COMMITTED in transaction record
-	_, err := tm.db.Exec(`
+	// Serialize statements for delta sync replication
+	statementsJSON, err := json.Marshal(txn.Statements)
+	if err != nil {
+		return fmt.Errorf("failed to serialize statements: %w", err)
+	}
+
+	// Determine database name from first statement
+	dbName := ""
+	if len(txn.Statements) > 0 {
+		dbName = txn.Statements[0].Database
+	}
+
+	// Mark transaction as COMMITTED in transaction record with statements
+	_, err = tm.db.Exec(`
 		UPDATE __marmot__txn_records
-		SET status = ?, commit_ts_wall = ?, commit_ts_logical = ?, committed_at = ?
+		SET status = ?, commit_ts_wall = ?, commit_ts_logical = ?, committed_at = ?,
+		    statements_json = ?, database_name = ?
 		WHERE txn_id = ?
-	`, TxnStatusCommitted, commitTS.WallTime, commitTS.Logical, time.Now().UnixNano(), txn.ID)
+	`, TxnStatusCommitted, commitTS.WallTime, commitTS.Logical, time.Now().UnixNano(),
+		string(statementsJSON), dbName, txn.ID)
 
 	if err != nil {
 		return fmt.Errorf("failed to mark transaction as committed: %w", err)
@@ -582,4 +596,118 @@ func SerializeData(data interface{}) ([]byte, error) {
 // DeserializeData helper for data snapshots
 func DeserializeData(data []byte, v interface{}) error {
 	return json.Unmarshal(data, v)
+}
+
+// =======================
+// LWW CONFLICT RESOLUTION
+// =======================
+
+// ApplyDeltaWithLWW applies a delta change using Last-Writer-Wins based on HLC timestamps
+// This is used during partition healing to merge divergent writes
+// Returns: applied (bool), error
+func (tm *MVCCTransactionManager) ApplyDeltaWithLWW(tableName, rowKey string, sqlStmt string,
+	incomingTS hlc.Timestamp, txnID uint64) (bool, error) {
+
+	// Check the latest MVCC version for this row
+	var existingWall int64
+	var existingLogical int32
+	var existingNodeID uint64
+	err := tm.db.QueryRow(`
+		SELECT ts_wall, ts_logical, node_id
+		FROM __marmot__mvcc_versions
+		WHERE table_name = ? AND row_key = ?
+		ORDER BY ts_wall DESC, ts_logical DESC, node_id DESC
+		LIMIT 1
+	`, tableName, rowKey).Scan(&existingWall, &existingLogical, &existingNodeID)
+
+	if err == sql.ErrNoRows {
+		// No existing version - apply the change
+		return tm.applyDeltaChange(tableName, rowKey, sqlStmt, incomingTS, txnID)
+	}
+	if err != nil {
+		return false, fmt.Errorf("failed to check existing version: %w", err)
+	}
+
+	existingTS := hlc.Timestamp{
+		WallTime: existingWall,
+		Logical:  existingLogical,
+		NodeID:   existingNodeID,
+	}
+
+	// LWW: Compare timestamps
+	cmp := hlc.Compare(incomingTS, existingTS)
+	if cmp > 0 {
+		// Incoming is newer - apply the change
+		return tm.applyDeltaChange(tableName, rowKey, sqlStmt, incomingTS, txnID)
+	}
+	if cmp == 0 && incomingTS.NodeID > existingTS.NodeID {
+		// Tie-breaker: higher node ID wins
+		return tm.applyDeltaChange(tableName, rowKey, sqlStmt, incomingTS, txnID)
+	}
+
+	// Existing version is newer or same - skip
+	log.Debug().
+		Str("table", tableName).
+		Str("row", rowKey).
+		Int64("incoming_wall", incomingTS.WallTime).
+		Int64("existing_wall", existingWall).
+		Msg("LWW: Skipping older delta change")
+	return false, nil
+}
+
+// applyDeltaChange executes the SQL and records the MVCC version
+func (tm *MVCCTransactionManager) applyDeltaChange(tableName, rowKey, sqlStmt string,
+	ts hlc.Timestamp, txnID uint64) (bool, error) {
+
+	// Execute the SQL statement
+	_, err := tm.db.Exec(sqlStmt)
+	if err != nil {
+		// Log but don't fail - row might not exist for UPDATE/DELETE
+		log.Debug().Err(err).Str("sql", sqlStmt).Msg("Delta change execution failed")
+	}
+
+	// Record MVCC version
+	_, err = tm.db.Exec(`
+		INSERT OR REPLACE INTO __marmot__mvcc_versions
+		(table_name, row_key, ts_wall, ts_logical, node_id, txn_id, operation, data_snapshot, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, 'DELTA', NULL, ?)
+	`, tableName, rowKey, ts.WallTime, ts.Logical, ts.NodeID, txnID, time.Now().UnixNano())
+
+	if err != nil {
+		return false, fmt.Errorf("failed to record MVCC version: %w", err)
+	}
+
+	log.Debug().
+		Str("table", tableName).
+		Str("row", rowKey).
+		Int64("ts_wall", ts.WallTime).
+		Msg("LWW: Applied delta change")
+	return true, nil
+}
+
+// GetLatestVersion returns the latest MVCC version timestamp for a row
+func (tm *MVCCTransactionManager) GetLatestVersion(tableName, rowKey string) (*hlc.Timestamp, error) {
+	var wall int64
+	var logical int32
+	var nodeID uint64
+	err := tm.db.QueryRow(`
+		SELECT ts_wall, ts_logical, node_id
+		FROM __marmot__mvcc_versions
+		WHERE table_name = ? AND row_key = ?
+		ORDER BY ts_wall DESC, ts_logical DESC, node_id DESC
+		LIMIT 1
+	`, tableName, rowKey).Scan(&wall, &logical, &nodeID)
+
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	return &hlc.Timestamp{
+		WallTime: wall,
+		Logical:  logical,
+		NodeID:   nodeID,
+	}, nil
 }

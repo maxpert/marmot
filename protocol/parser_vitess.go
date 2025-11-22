@@ -1,14 +1,23 @@
 package protocol
 
 import (
+	"database/sql"
 	"regexp"
 	"strings"
+	"sync"
 
+	_ "github.com/mattn/go-sqlite3"
 	"vitess.io/vitess/go/vt/sqlparser"
 )
 
 // Global parser instance (reused for efficiency)
 var vitessParser *sqlparser.Parser
+
+// SQLite syntax validator (in-memory, persistent)
+var (
+	sqliteSyntaxChecker *sql.DB
+	sqliteCheckerMu     sync.Mutex
+)
 
 func init() {
 	var err error
@@ -16,13 +25,215 @@ func init() {
 	if err != nil {
 		panic("failed to initialize Vitess parser: " + err.Error())
 	}
+
+	// Initialize in-memory SQLite for syntax validation
+	sqliteSyntaxChecker, err = sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		panic("failed to initialize SQLite syntax checker: " + err.Error())
+	}
+}
+
+// ValidateSQLiteSyntax checks if a query is valid SQLite syntax
+// Returns nil if valid, error if invalid (only for true syntax errors)
+func ValidateSQLiteSyntax(query string) error {
+	sqliteCheckerMu.Lock()
+	defer sqliteCheckerMu.Unlock()
+
+	stmt, err := sqliteSyntaxChecker.Prepare(query)
+	if err != nil {
+		errStr := err.Error()
+		// Ignore "no such table/column" errors - those are schema errors, not syntax errors
+		// We only want to catch true syntax errors
+		if strings.Contains(errStr, "no such table") ||
+			strings.Contains(errStr, "no such column") ||
+			strings.Contains(errStr, "no such index") ||
+			strings.Contains(errStr, "no such view") ||
+			strings.Contains(errStr, "no such trigger") {
+			return nil // Schema error, not syntax error - allow it
+		}
+		return err
+	}
+	stmt.Close()
+	return nil
+}
+
+// shouldValidateWithSQLite returns true if we should validate this SQL against SQLite
+// Only validate DML statements - these are what get replicated and executed on SQLite
+func shouldValidateWithSQLite(sql string) bool {
+	// Strip leading comments
+	upper := strings.ToUpper(strings.TrimSpace(sql))
+	for strings.HasPrefix(upper, "/*") {
+		if idx := strings.Index(upper, "*/"); idx >= 0 {
+			upper = strings.TrimSpace(upper[idx+2:])
+		} else {
+			break
+		}
+	}
+	for strings.HasPrefix(upper, "--") || strings.HasPrefix(upper, "#") {
+		if idx := strings.Index(upper, "\n"); idx >= 0 {
+			upper = strings.TrimSpace(upper[idx+1:])
+		} else {
+			return false
+		}
+	}
+
+	// Only validate core DML that gets replicated
+	return strings.HasPrefix(upper, "INSERT ") ||
+		strings.HasPrefix(upper, "UPDATE ") ||
+		strings.HasPrefix(upper, "DELETE ") ||
+		strings.HasPrefix(upper, "SELECT ") ||
+		strings.HasPrefix(upper, "REPLACE ")
+}
+
+// isNonPreparableStatement checks if a statement cannot be validated via Prepare()
+// These include transaction control, session commands, and certain admin statements
+func isNonPreparableStatement(sql string) bool {
+	// Strip leading comments (/* ... */ and -- style)
+	upper := strings.ToUpper(strings.TrimSpace(sql))
+	for strings.HasPrefix(upper, "/*") {
+		if idx := strings.Index(upper, "*/"); idx >= 0 {
+			upper = strings.TrimSpace(upper[idx+2:])
+		} else {
+			break
+		}
+	}
+	for strings.HasPrefix(upper, "--") || strings.HasPrefix(upper, "#") {
+		if idx := strings.Index(upper, "\n"); idx >= 0 {
+			upper = strings.TrimSpace(upper[idx+1:])
+		} else {
+			return true // Comment-only statement
+		}
+	}
+
+	// Transaction control - can't be prepared
+	if strings.HasPrefix(upper, "BEGIN") ||
+		strings.HasPrefix(upper, "START TRANSACTION") ||
+		strings.HasPrefix(upper, "COMMIT") ||
+		strings.HasPrefix(upper, "ROLLBACK") ||
+		strings.HasPrefix(upper, "END") ||
+		strings.HasPrefix(upper, "SAVEPOINT") ||
+		strings.HasPrefix(upper, "RELEASE") {
+		return true
+	}
+
+	// Session/connection commands
+	if strings.HasPrefix(upper, "SET ") ||
+		strings.HasPrefix(upper, "USE ") ||
+		strings.HasPrefix(upper, "SHOW ") {
+		return true
+	}
+
+	// Database management - syntax differs between MySQL and SQLite
+	if strings.HasPrefix(upper, "CREATE DATABASE") ||
+		strings.HasPrefix(upper, "CREATE SCHEMA") ||
+		strings.HasPrefix(upper, "DROP DATABASE") ||
+		strings.HasPrefix(upper, "DROP SCHEMA") ||
+		strings.HasPrefix(upper, "ALTER DATABASE") ||
+		strings.HasPrefix(upper, "ALTER SCHEMA") {
+		return true
+	}
+
+	// DCL - user/privilege management
+	if strings.HasPrefix(upper, "GRANT ") ||
+		strings.HasPrefix(upper, "REVOKE ") ||
+		strings.HasPrefix(upper, "CREATE USER") ||
+		strings.HasPrefix(upper, "DROP USER") ||
+		strings.HasPrefix(upper, "ALTER USER") ||
+		strings.HasPrefix(upper, "RENAME USER") ||
+		strings.HasPrefix(upper, "CREATE ROLE") ||
+		strings.HasPrefix(upper, "DROP ROLE") ||
+		strings.HasPrefix(upper, "SET ROLE") {
+		return true
+	}
+
+	// DDL that SQLite doesn't support same way
+	if strings.HasPrefix(upper, "CREATE PROCEDURE") ||
+		strings.HasPrefix(upper, "DROP PROCEDURE") ||
+		strings.HasPrefix(upper, "ALTER PROCEDURE") ||
+		strings.HasPrefix(upper, "CREATE FUNCTION") ||
+		strings.HasPrefix(upper, "DROP FUNCTION") ||
+		strings.HasPrefix(upper, "ALTER FUNCTION") ||
+		strings.HasPrefix(upper, "CREATE TRIGGER") ||
+		strings.HasPrefix(upper, "DROP TRIGGER") ||
+		strings.HasPrefix(upper, "CREATE EVENT") ||
+		strings.HasPrefix(upper, "DROP EVENT") ||
+		strings.HasPrefix(upper, "ALTER EVENT") ||
+		strings.HasPrefix(upper, "CREATE SERVER") ||
+		strings.HasPrefix(upper, "DROP SERVER") ||
+		strings.HasPrefix(upper, "ALTER SERVER") ||
+		strings.HasPrefix(upper, "CREATE LOGFILE") ||
+		strings.HasPrefix(upper, "DROP LOGFILE") ||
+		strings.HasPrefix(upper, "ALTER LOGFILE") ||
+		strings.HasPrefix(upper, "CREATE TABLESPACE") ||
+		strings.HasPrefix(upper, "DROP TABLESPACE") ||
+		strings.HasPrefix(upper, "ALTER TABLESPACE") ||
+		strings.HasPrefix(upper, "CREATE SPATIAL") ||
+		strings.HasPrefix(upper, "DROP SPATIAL") ||
+		strings.HasPrefix(upper, "CREATE RESOURCE") ||
+		strings.HasPrefix(upper, "DROP RESOURCE") ||
+		strings.HasPrefix(upper, "ALTER RESOURCE") ||
+		strings.HasPrefix(upper, "ALTER VIEW") ||
+		strings.HasPrefix(upper, "TRUNCATE ") ||
+		strings.HasPrefix(upper, "LOAD DATA") ||
+		strings.HasPrefix(upper, "LOAD XML") ||
+		strings.HasPrefix(upper, "RENAME TABLE") {
+		return true
+	}
+
+	// Admin commands
+	if strings.HasPrefix(upper, "INSTALL ") ||
+		strings.HasPrefix(upper, "UNINSTALL ") ||
+		strings.HasPrefix(upper, "OPTIMIZE ") ||
+		strings.HasPrefix(upper, "REPAIR ") ||
+		strings.HasPrefix(upper, "ANALYZE ") ||
+		strings.HasPrefix(upper, "CHECK ") ||
+		strings.HasPrefix(upper, "FLUSH ") ||
+		strings.HasPrefix(upper, "RESET ") ||
+		strings.HasPrefix(upper, "PURGE ") ||
+		strings.HasPrefix(upper, "KILL ") {
+		return true
+	}
+
+	// EXPLAIN and PRAGMA
+	if strings.HasPrefix(upper, "EXPLAIN") ||
+		strings.HasPrefix(upper, "PRAGMA") {
+		return true
+	}
+
+	// XA transactions
+	if strings.HasPrefix(upper, "XA ") {
+		return true
+	}
+
+	// Lock statements
+	if strings.HasPrefix(upper, "LOCK ") ||
+		strings.HasPrefix(upper, "UNLOCK ") {
+		return true
+	}
+
+	return false
 }
 
 // ParseStatementVitess uses Vitess sqlparser for accurate MySQL parsing
+// First validates syntax against SQLite, then extracts metadata via Vitess
 func ParseStatementVitess(sql string) Statement {
 	sql = strings.TrimSpace(sql)
 
 	stmt := Statement{SQL: sql}
+
+	// Step 1: Validate DML syntax against SQLite first
+	// Only validate INSERT/UPDATE/DELETE/SELECT - these are the replicated statements
+	// Skip DDL and other statement types as they have MySQL/SQLite syntax differences
+	if shouldValidateWithSQLite(sql) {
+		if err := ValidateSQLiteSyntax(sql); err != nil {
+			// Invalid SQLite syntax - reject early with clear error
+			stmt.Type = StatementUnsupported
+			stmt.Error = "invalid SQLite syntax: " + err.Error()
+			return stmt
+		}
+	}
+
+	// Step 2: Continue with Vitess parsing to extract metadata (table names, type, etc.)
 
 	// Check for savepoint statements first (Vitess doesn't parse these properly)
 	if savepointPattern.MatchString(sql) || releaseSavepointPattern.MatchString(sql) {

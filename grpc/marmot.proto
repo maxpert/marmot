@@ -169,6 +169,7 @@ message ChangeEvent {
   uint64 txn_id = 1;
   repeated Statement statements = 2;
   HLC timestamp = 3;
+  string database = 4;  // Target database for these changes
 }
 
 // ===== SNAPSHOT MESSAGES =====

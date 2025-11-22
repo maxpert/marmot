@@ -74,7 +74,7 @@ func TestParseStatement_VitessEdgeCases(t *testing.T) {
 		{
 			name:     "Complex UPDATE with JOIN",
 			sql:      "UPDATE users u JOIN orders o ON u.id = o.user_id SET u.total = o.amount",
-			wantType: StatementUpdate,
+			wantType: StatementUnsupported, // UPDATE...JOIN is MySQL-only
 			// Note: Table extraction from complex JOINs is best-effort
 			// wantTable: "users", // Vitess may parse this differently
 		},
@@ -86,12 +86,12 @@ func TestParseStatement_VitessEdgeCases(t *testing.T) {
 		{
 			name:     "DBeaver-style comment - Main connection",
 			sql:      "/* ApplicationName=DBeaver 25.2.5 - Main */ SET autocommit=1",
-			wantType: StatementSet,
+			wantType: StatementSet, // SET skips SQLite validation
 		},
 		{
 			name:     "DBeaver-style comment - Metadata",
 			sql:      "/* ApplicationName=DBeaver 25.2.5 - Metadata */ SET autocommit=1",
-			wantType: StatementSet,
+			wantType: StatementSet, // SET skips SQLite validation
 		},
 		{
 			name:      "String with semicolon",
@@ -108,7 +108,7 @@ func TestParseStatement_VitessEdgeCases(t *testing.T) {
 		{
 			name:     "MySQL-style comment",
 			sql:      "# This is a comment\nSELECT * FROM users",
-			wantType: StatementSelect,
+			wantType: StatementUnsupported, // # comments are MySQL-only, not SQLite
 		},
 		{
 			name:     "Double-dash comment",
@@ -153,8 +153,8 @@ func TestParseStatement_VitessEdgeCases(t *testing.T) {
 		{
 			name:      "INSERT with ON DUPLICATE KEY UPDATE",
 			sql:       "INSERT INTO users VALUES (1, 'alice') ON DUPLICATE KEY UPDATE name = 'alice'",
-			wantType:  StatementInsert,
-			wantTable: "users",
+			wantType:  StatementUnsupported, // MySQL-only, use INSERT OR REPLACE in SQLite
+			wantTable: "",
 		},
 		{
 			name:      "REPLACE with qualified name",
@@ -280,52 +280,53 @@ func TestParseStatement_MySQLCompatibility(t *testing.T) {
 		{
 			name:     "STRAIGHT_JOIN",
 			sql:      "SELECT * FROM users STRAIGHT_JOIN orders ON users.id = orders.user_id",
-			wantType: StatementSelect,
+			wantType: StatementUnsupported, // MySQL-only join hint
 		},
 		{
 			name:     "FORCE INDEX",
 			sql:      "SELECT * FROM users FORCE INDEX (idx_email) WHERE email = 'test@example.com'",
-			wantType: StatementSelect,
+			wantType: StatementUnsupported, // MySQL-only hint
 		},
 		{
 			name:     "USE INDEX",
 			sql:      "SELECT * FROM users USE INDEX (idx_name) WHERE name = 'alice'",
-			wantType: StatementSelect,
+			wantType: StatementUnsupported, // MySQL-only hint
 		},
 		{
 			name:     "IGNORE INDEX",
 			sql:      "SELECT * FROM users IGNORE INDEX (idx_id) WHERE id = 1",
-			wantType: StatementSelect,
+			wantType: StatementUnsupported, // MySQL-only hint
 		},
 		{
 			name:     "INSERT IGNORE",
 			sql:      "INSERT IGNORE INTO users VALUES (1, 'alice')",
-			wantType: StatementInsert,
+			wantType: StatementUnsupported, // MySQL-only, use INSERT OR IGNORE in SQLite
 		},
+		// MySQL-specific syntax - rejected by SQLite validation
 		{
 			name:     "INSERT DELAYED",
 			sql:      "INSERT DELAYED INTO logs VALUES (1, 'message')",
-			wantType: StatementInsert,
+			wantType: StatementUnsupported, // MySQL-only
 		},
 		{
 			name:     "DELETE with LIMIT",
 			sql:      "DELETE FROM logs WHERE old = 1 LIMIT 1000",
-			wantType: StatementDelete,
+			wantType: StatementUnsupported, // DELETE LIMIT not in standard SQLite
 		},
 		{
 			name:     "UPDATE with LIMIT",
 			sql:      "UPDATE users SET active = 0 LIMIT 10",
-			wantType: StatementUpdate,
+			wantType: StatementUnsupported, // UPDATE LIMIT not in standard SQLite
 		},
 		{
 			name:     "SELECT with LOCK IN SHARE MODE",
 			sql:      "SELECT * FROM users WHERE id = 1 LOCK IN SHARE MODE",
-			wantType: StatementSelect,
+			wantType: StatementUnsupported, // MySQL locking not in SQLite
 		},
 		{
 			name:     "SELECT with FOR UPDATE",
 			sql:      "SELECT * FROM users WHERE id = 1 FOR UPDATE",
-			wantType: StatementSelect,
+			wantType: StatementUnsupported, // MySQL locking not in SQLite
 		},
 	}
 

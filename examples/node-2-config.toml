@@ -22,8 +22,6 @@ suspect_timeout_ms = 5000
 dead_timeout_ms = 10000
 
 [replication]
-replication_factor = 3
-virtual_nodes = 150
 default_write_consistency = "QUORUM"
 default_read_consistency = "LOCAL_ONE"
 write_timeout_ms = 5000

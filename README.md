@@ -43,7 +43,7 @@ Marmot v2 uses a fundamentally different architecture from other SQLite replicat
 1. **Write Coordination**: 2PC (Two-Phase Commit) with configurable consistency (ONE, QUORUM, ALL)
 2. **Conflict Resolution**: Last-Write-Wins (LWW) with HLC timestamps
 3. **Cluster Membership**: SWIM-style gossip with failure detection
-4. **Data Placement**: Consistent hashing with configurable replication factor
+4. **Data Replication**: Full database replication - all nodes receive all data
 
 ## Stargazers over time
 [![Stargazers over time](https://starchart.cc/maxpert/marmot.svg?variant=adaptive)](https://starchart.cc/maxpert/marmot)
@@ -140,6 +140,51 @@ mysql -h localhost -P 3306 -u root
 mysql://root@localhost:3306/marmot
 ```
 
+## Recovery Scenarios
+
+Marmot handles various failure and recovery scenarios automatically:
+
+### Network Partition (Split-Brain)
+
+| Scenario | Behavior |
+|----------|----------|
+| **Minority partition** | Writes **fail** - cannot achieve quorum |
+| **Majority partition** | Writes **succeed** - quorum achieved |
+| **Partition heals** | Delta sync + LWW merges divergent data |
+
+**How it works:**
+1. During partition, only the majority side can commit writes (quorum enforcement)
+2. When partition heals, nodes exchange transaction logs via `StreamChanges` RPC
+3. Conflicts resolved using Last-Writer-Wins (LWW) with HLC timestamps
+4. Higher node ID breaks ties for simultaneous writes
+
+### Node Failure & Recovery
+
+| Scenario | Recovery Method |
+|----------|-----------------|
+| **Brief outage** | Delta sync - replay missed transactions |
+| **Extended outage** | Snapshot transfer + delta sync |
+| **New node joining** | Full snapshot from existing node |
+
+**Delta Sync Process:**
+1. Recovering node queries `last_applied_txn_id` for each peer
+2. Requests transactions since that ID via `StreamChanges`
+3. Applies changes using LWW conflict resolution
+4. Updates replication state tracking
+
+### Consistency Guarantees
+
+| Write Consistency | Behavior |
+|-------------------|----------|
+| `ONE` | Returns after 1 node ACK (fast, less durable) |
+| `QUORUM` | Returns after majority ACK (default, balanced) |
+| `ALL` | Returns after all nodes ACK (slow, most durable) |
+
+**Conflict Resolution:**
+- All conflicts resolved via LWW using HLC timestamps
+- No data loss - later write always wins deterministically
+- Tie-breaker: higher node ID wins for equal timestamps
+
 ## Limitations
 
 - **Schema Changes**: DDL operations work locally but are not automatically replicated. Coordinate schema changes manually across all nodes.
@@ -214,8 +259,6 @@ dead_timeout_ms = 10000        # Dead timeout
 
 ```toml
 [replication]
-replication_factor = 3                    # Number of replicas
-virtual_nodes = 150                       # Virtual nodes for consistent hashing
 default_write_consistency = "QUORUM"      # Write consistency level
 default_read_consistency = "LOCAL_ONE"    # Read consistency level
 write_timeout_ms = 5000                   # Write operation timeout

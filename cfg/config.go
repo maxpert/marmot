@@ -71,8 +71,6 @@ type ClusterConfiguration struct {
 
 // ReplicationConfiguration controls replication behavior
 type ReplicationConfiguration struct {
-	ReplicationFactor    int    `toml:"replication_factor"`
-	VirtualNodes         int    `toml:"virtual_nodes"`
 	DefaultWriteConsist  string `toml:"default_write_consistency"`
 	DefaultReadConsist   string `toml:"default_read_consistency"`
 	WriteTimeoutMS       int    `toml:"write_timeout_ms"`
@@ -187,8 +185,6 @@ var Config = &Configuration{
 	},
 
 	Replication: ReplicationConfiguration{
-		ReplicationFactor:    3,
-		VirtualNodes:         150,
 		DefaultWriteConsist:  "QUORUM",
 		DefaultReadConsist:   "LOCAL_ONE",
 		WriteTimeoutMS:       5000,
@@ -322,14 +318,6 @@ func Validate() error {
 
 	if Config.MySQL.Enabled && (Config.MySQL.Port < 1 || Config.MySQL.Port > 65535) {
 		return fmt.Errorf("invalid MySQL port: %d", Config.MySQL.Port)
-	}
-
-	if Config.Replication.ReplicationFactor < 1 {
-		return fmt.Errorf("replication factor must be >= 1")
-	}
-
-	if Config.Replication.VirtualNodes < 1 {
-		return fmt.Errorf("virtual nodes must be >= 1")
 	}
 
 	// Validate consistency levels
