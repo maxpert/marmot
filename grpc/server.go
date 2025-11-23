@@ -693,3 +693,47 @@ func (s *Server) checkPromotionCriteria() bool {
 	localDatabases := dbManager.ListDatabases()
 	return len(localDatabases) > 0
 }
+
+// =======================
+// DELTA SYNC DETECTION
+// =======================
+
+// GetLatestTxnIDs returns the latest transaction ID for each database
+// This is used by peers to determine if they need to catch up
+func (s *Server) GetLatestTxnIDs(ctx context.Context, req *LatestTxnIDsRequest) (*LatestTxnIDsResponse, error) {
+	s.mu.RLock()
+	dbManager := s.dbManager
+	s.mu.RUnlock()
+
+	if dbManager == nil {
+		return nil, fmt.Errorf("database manager not initialized")
+	}
+
+	log.Debug().
+		Uint64("requesting_node", req.RequestingNodeId).
+		Msg("Latest transaction IDs requested")
+
+	txnIDs := make(map[string]uint64)
+
+	// Get all databases
+	databases := dbManager.ListDatabases()
+
+	// Query max txn_id for each database
+	for _, dbName := range databases {
+		maxTxnID, err := dbManager.GetMaxTxnID(dbName)
+		if err != nil {
+			log.Warn().Err(err).Str("database", dbName).Msg("Failed to get max txn_id")
+			continue
+		}
+		txnIDs[dbName] = maxTxnID
+	}
+
+	log.Debug().
+		Uint64("requesting_node", req.RequestingNodeId).
+		Int("databases", len(txnIDs)).
+		Msg("Returning latest transaction IDs")
+
+	return &LatestTxnIDsResponse{
+		DatabaseTxnIds: txnIDs,
+	}, nil
+}

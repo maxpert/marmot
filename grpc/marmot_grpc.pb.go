@@ -28,6 +28,7 @@ const (
 	MarmotService_GetReplicationState_FullMethodName  = "/marmot.v2.MarmotService/GetReplicationState"
 	MarmotService_GetSnapshotInfo_FullMethodName      = "/marmot.v2.MarmotService/GetSnapshotInfo"
 	MarmotService_StreamSnapshot_FullMethodName       = "/marmot.v2.MarmotService/StreamSnapshot"
+	MarmotService_GetLatestTxnIDs_FullMethodName      = "/marmot.v2.MarmotService/GetLatestTxnIDs"
 )
 
 // MarmotServiceClient is the client API for MarmotService service.
@@ -57,6 +58,8 @@ type MarmotServiceClient interface {
 	GetSnapshotInfo(ctx context.Context, in *SnapshotInfoRequest, opts ...grpc.CallOption) (*SnapshotInfoResponse, error)
 	// Stream snapshot chunks
 	StreamSnapshot(ctx context.Context, in *SnapshotRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[SnapshotChunk], error)
+	// Get latest transaction IDs per database (for delta sync detection)
+	GetLatestTxnIDs(ctx context.Context, in *LatestTxnIDsRequest, opts ...grpc.CallOption) (*LatestTxnIDsResponse, error)
 }
 
 type marmotServiceClient struct {
@@ -175,6 +178,16 @@ func (c *marmotServiceClient) StreamSnapshot(ctx context.Context, in *SnapshotRe
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type MarmotService_StreamSnapshotClient = grpc.ServerStreamingClient[SnapshotChunk]
 
+func (c *marmotServiceClient) GetLatestTxnIDs(ctx context.Context, in *LatestTxnIDsRequest, opts ...grpc.CallOption) (*LatestTxnIDsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(LatestTxnIDsResponse)
+	err := c.cc.Invoke(ctx, MarmotService_GetLatestTxnIDs_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // MarmotServiceServer is the server API for MarmotService service.
 // All implementations must embed UnimplementedMarmotServiceServer
 // for forward compatibility.
@@ -202,6 +215,8 @@ type MarmotServiceServer interface {
 	GetSnapshotInfo(context.Context, *SnapshotInfoRequest) (*SnapshotInfoResponse, error)
 	// Stream snapshot chunks
 	StreamSnapshot(*SnapshotRequest, grpc.ServerStreamingServer[SnapshotChunk]) error
+	// Get latest transaction IDs per database (for delta sync detection)
+	GetLatestTxnIDs(context.Context, *LatestTxnIDsRequest) (*LatestTxnIDsResponse, error)
 	mustEmbedUnimplementedMarmotServiceServer()
 }
 
@@ -238,6 +253,9 @@ func (UnimplementedMarmotServiceServer) GetSnapshotInfo(context.Context, *Snapsh
 }
 func (UnimplementedMarmotServiceServer) StreamSnapshot(*SnapshotRequest, grpc.ServerStreamingServer[SnapshotChunk]) error {
 	return status.Errorf(codes.Unimplemented, "method StreamSnapshot not implemented")
+}
+func (UnimplementedMarmotServiceServer) GetLatestTxnIDs(context.Context, *LatestTxnIDsRequest) (*LatestTxnIDsResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetLatestTxnIDs not implemented")
 }
 func (UnimplementedMarmotServiceServer) mustEmbedUnimplementedMarmotServiceServer() {}
 func (UnimplementedMarmotServiceServer) testEmbeddedByValue()                       {}
@@ -408,6 +426,24 @@ func _MarmotService_StreamSnapshot_Handler(srv interface{}, stream grpc.ServerSt
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type MarmotService_StreamSnapshotServer = grpc.ServerStreamingServer[SnapshotChunk]
 
+func _MarmotService_GetLatestTxnIDs_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(LatestTxnIDsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MarmotServiceServer).GetLatestTxnIDs(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: MarmotService_GetLatestTxnIDs_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MarmotServiceServer).GetLatestTxnIDs(ctx, req.(*LatestTxnIDsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // MarmotService_ServiceDesc is the grpc.ServiceDesc for MarmotService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -442,6 +478,10 @@ var MarmotService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetSnapshotInfo",
 			Handler:    _MarmotService_GetSnapshotInfo_Handler,
+		},
+		{
+			MethodName: "GetLatestTxnIDs",
+			Handler:    _MarmotService_GetLatestTxnIDs_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

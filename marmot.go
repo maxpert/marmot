@@ -82,27 +82,53 @@ func main() {
 	// Check if we're joining an existing cluster or starting as seed
 	isJoiningCluster := len(cfg.Config.Cluster.SeedNodes) > 0
 
-	// If joining cluster, check if we need to catch up (sync data from peers)
+	// If joining cluster, always determine if we need to catch up (even if we have data)
+	// This fixes the bug where restarted nodes with stale data skip catch-up
+	var catchUpDecision *marmotgrpc.CatchUpDecision
+	var catchUpClient *marmotgrpc.CatchUpClient
+
 	if isJoiningCluster {
-		catchUpClient := marmotgrpc.NewCatchUpClient(
+		catchUpClient = marmotgrpc.NewCatchUpClient(
 			cfg.Config.NodeID,
 			cfg.Config.DataDir,
 			grpcServer.GetNodeRegistry(),
 			cfg.Config.Cluster.SeedNodes,
 		)
 
-		if catchUpClient.NeedsCatchUp() {
-			log.Info().Msg("Node needs to catch up - downloading snapshot from cluster")
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-			snapshotTxnID, err := catchUpClient.CatchUp(ctx)
-			cancel()
-			if err != nil {
-				log.Fatal().Err(err).Msg("Failed to catch up from cluster")
-				return
-			}
-			log.Info().Uint64("snapshot_txn_id", snapshotTxnID).Msg("Catch-up completed - staying in JOINING")
+		log.Info().Msg("Determining catch-up strategy by comparing with cluster state...")
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		decision, err := catchUpClient.DetermineCatchUpStrategy(ctx)
+		cancel()
+
+		if err != nil {
+			log.Warn().Err(err).Msg("Failed to determine catch-up strategy - will attempt to continue")
 		} else {
-			log.Info().Msg("Node data exists - skipping catch-up, staying in JOINING")
+			catchUpDecision = decision
+			switch decision.Strategy {
+			case marmotgrpc.NO_CATCHUP:
+				log.Info().Msg("Node is up to date - no catch-up needed")
+
+			case marmotgrpc.FULL_SNAPSHOT:
+				log.Info().
+					Str("peer", decision.PeerAddr).
+					Msg("Full snapshot required - downloading from cluster")
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+				snapshotTxnID, err := catchUpClient.CatchUp(ctx)
+				cancel()
+				if err != nil {
+					log.Fatal().Err(err).Msg("Failed to download snapshot from cluster")
+					return
+				}
+				log.Info().Uint64("snapshot_txn_id", snapshotTxnID).Msg("Snapshot download completed")
+
+			case marmotgrpc.DELTA_SYNC:
+				log.Info().
+					Int("databases_behind", len(decision.DatabaseDeltas)).
+					Str("peer", decision.PeerAddr).
+					Msg("Delta sync required - will catch up after database initialization")
+				// Delta sync will be performed after database manager is initialized
+				// We store the decision for later use
+			}
 		}
 	}
 
@@ -159,6 +185,19 @@ func main() {
 		ApplyTxnsFn:      replicationHandler.HandleReplicateTransaction,
 		SchemaVersionMgr: schemaVersionMgr,
 	})
+
+	// If we determined we need delta sync, perform it now that database manager is initialized
+	if isJoiningCluster && catchUpDecision != nil && catchUpDecision.Strategy == marmotgrpc.DELTA_SYNC {
+		log.Info().Msg("Performing delta sync now that database manager is initialized")
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		err := catchUpClient.PerformDeltaSync(ctx, catchUpDecision, deltaSync)
+		cancel()
+		if err != nil {
+			log.Fatal().Err(err).Msg("Failed to perform delta sync")
+			return
+		}
+		log.Info().Msg("Delta sync completed successfully")
+	}
 
 	antiEntropy := marmotgrpc.NewAntiEntropyServiceFromConfig(
 		cfg.Config.NodeID,

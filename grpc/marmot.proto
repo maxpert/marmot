@@ -39,6 +39,10 @@ service MarmotService {
   // Stream snapshot chunks
   rpc StreamSnapshot(SnapshotRequest)
       returns (stream SnapshotChunk);
+
+  // Get latest transaction IDs per database (for delta sync detection)
+  rpc GetLatestTxnIDs(LatestTxnIDsRequest)
+      returns (LatestTxnIDsResponse);
 }
 
 // ===== GOSSIP MESSAGES =====
@@ -228,4 +232,14 @@ message SnapshotChunk {
   string checksum = 4;
   string filename = 5;      // Which database file this chunk belongs to
   bool is_last_for_file = 6; // True if this is the last chunk for this file
+}
+
+// ===== DELTA SYNC DETECTION =====
+message LatestTxnIDsRequest {
+  uint64 requesting_node_id = 1;
+}
+
+message LatestTxnIDsResponse {
+  // Map of database name to latest committed txn_id
+  map<string, uint64> database_txn_ids = 1;
 }

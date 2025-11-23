@@ -3,16 +3,33 @@ package grpc
 import (
 	"context"
 	"crypto/md5"
+	"database/sql"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"time"
 
+	_ "github.com/mattn/go-sqlite3" // SQLite driver
 	"github.com/rs/zerolog/log"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
+
+// CatchUpStrategy determines how a node should catch up with the cluster
+type CatchUpStrategy int
+
+const (
+	// NO_CATCHUP - Node is up to date, no catch-up needed
+	NO_CATCHUP CatchUpStrategy = iota
+	// DELTA_SYNC - Node is slightly behind, use transaction log replay
+	DELTA_SYNC
+	// FULL_SNAPSHOT - Node is far behind or has no data, need full snapshot
+	FULL_SNAPSHOT
+)
+
+// DeltaSyncThreshold - If behind by more than this many transactions, use snapshot
+const DeltaSyncThreshold = 1000
 
 // CatchUpClient handles the client-side of node catch-up
 type CatchUpClient struct {
@@ -229,6 +246,7 @@ func (c *CatchUpClient) applySnapshot(ctx context.Context, client MarmotServiceC
 }
 
 // NeedsCatchUp checks if this node needs to catch up (e.g., empty data directory)
+// DEPRECATED: Use DetermineCatchUpStrategy instead
 func (c *CatchUpClient) NeedsCatchUp() bool {
 	// Check if system database exists
 	systemDBPath := filepath.Join(c.dataDir, "__marmot_system.db")
@@ -243,4 +261,280 @@ func (c *CatchUpClient) NeedsCatchUp() bool {
 	}
 
 	return false
+}
+
+// DatabaseTxnInfo holds transaction state for a database
+type DatabaseTxnInfo struct {
+	DatabaseName string
+	MaxTxnID     uint64
+}
+
+// GetLocalMaxTxnID queries the local database files to get the max transaction ID per database
+// This allows us to compare our state with peers to determine if we're behind
+func (c *CatchUpClient) GetLocalMaxTxnID(ctx context.Context) (map[string]uint64, error) {
+	result := make(map[string]uint64)
+
+	// Check if system database exists
+	systemDBPath := filepath.Join(c.dataDir, "__marmot_system.db")
+	if _, err := os.Stat(systemDBPath); os.IsNotExist(err) {
+		// No system database - we have no data
+		return result, nil
+	}
+
+	// Open system database to get list of registered databases
+	systemDB, err := sql.Open("sqlite3", systemDBPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open system database: %w", err)
+	}
+	defer systemDB.Close()
+
+	// Query database registry
+	rows, err := systemDB.Query("SELECT name, path FROM __marmot_databases")
+	if err != nil {
+		// Table doesn't exist yet - empty database
+		return result, nil
+	}
+	defer rows.Close()
+
+	databases := make(map[string]string)
+	for rows.Next() {
+		var name, path string
+		if err := rows.Scan(&name, &path); err != nil {
+			log.Warn().Err(err).Msg("Failed to scan database metadata")
+			continue
+		}
+		databases[name] = path
+	}
+
+	// Query max txn_id from each database
+	for dbName, dbPath := range databases {
+		fullPath := filepath.Join(c.dataDir, dbPath)
+		maxTxnID, err := c.getMaxTxnIDFromDB(fullPath)
+		if err != nil {
+			log.Warn().Err(err).Str("database", dbName).Msg("Failed to get max txn_id")
+			continue
+		}
+		result[dbName] = maxTxnID
+	}
+
+	return result, nil
+}
+
+// getMaxTxnIDFromDB queries the maximum transaction ID from a database file
+func (c *CatchUpClient) getMaxTxnIDFromDB(dbPath string) (uint64, error) {
+	// Check if database file exists
+	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+		return 0, nil
+	}
+
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		return 0, fmt.Errorf("failed to open database: %w", err)
+	}
+	defer db.Close()
+
+	var maxTxnID uint64
+	err = db.QueryRow(`
+		SELECT COALESCE(MAX(txn_id), 0)
+		FROM __marmot__txn_records
+		WHERE status = 'COMMITTED'
+	`).Scan(&maxTxnID)
+	if err != nil {
+		// Table might not exist yet
+		return 0, nil
+	}
+
+	return maxTxnID, nil
+}
+
+// GetPeerMaxTxnIDs queries a peer node for its latest transaction IDs per database
+func (c *CatchUpClient) GetPeerMaxTxnIDs(ctx context.Context, peerAddr string) (map[string]uint64, error) {
+	// Connect to peer
+	conn, err := grpc.DialContext(ctx, peerAddr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithBlock(),
+		grpc.WithTimeout(10*time.Second),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to peer %s: %w", peerAddr, err)
+	}
+	defer conn.Close()
+
+	client := NewMarmotServiceClient(conn)
+
+	// Query peer for latest txn IDs
+	resp, err := client.GetLatestTxnIDs(ctx, &LatestTxnIDsRequest{
+		RequestingNodeId: c.nodeID,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get latest txn IDs from peer: %w", err)
+	}
+
+	return resp.DatabaseTxnIds, nil
+}
+
+// CatchUpDecision contains the strategy and sync information
+type CatchUpDecision struct {
+	Strategy       CatchUpStrategy
+	PeerAddr       string
+	DatabaseDeltas map[string]DeltaInfo // Per-database sync info
+}
+
+// DeltaInfo contains delta sync information for a database
+type DeltaInfo struct {
+	DatabaseName string
+	LocalTxnID   uint64
+	PeerTxnID    uint64
+	TxnsBehind   uint64
+}
+
+// DetermineCatchUpStrategy determines the best catch-up strategy by comparing local vs cluster state
+// This is the main entry point for catch-up detection
+func (c *CatchUpClient) DetermineCatchUpStrategy(ctx context.Context) (*CatchUpDecision, error) {
+	decision := &CatchUpDecision{
+		Strategy:       NO_CATCHUP,
+		DatabaseDeltas: make(map[string]DeltaInfo),
+	}
+
+	// Step 1: Get local transaction IDs
+	localTxnIDs, err := c.GetLocalMaxTxnID(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get local txn IDs: %w", err)
+	}
+
+	// Step 2: Find an available seed node
+	seedAddr, err := c.findAvailableSeed(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("no available seed node: %w", err)
+	}
+	decision.PeerAddr = seedAddr
+
+	// Step 3: Get peer transaction IDs
+	peerTxnIDs, err := c.GetPeerMaxTxnIDs(ctx, seedAddr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get peer txn IDs: %w", err)
+	}
+
+	// Step 4: Compare local vs peer state
+	if len(localTxnIDs) == 0 && len(peerTxnIDs) > 0 {
+		// We have no data, peer has data - need full snapshot
+		decision.Strategy = FULL_SNAPSHOT
+		log.Info().
+			Str("peer", seedAddr).
+			Msg("No local data found - full snapshot required")
+		return decision, nil
+	}
+
+	if len(peerTxnIDs) == 0 {
+		// Peer has no data - we're up to date (or we're the first node)
+		decision.Strategy = NO_CATCHUP
+		log.Info().Msg("Peer has no data - no catch-up needed")
+		return decision, nil
+	}
+
+	// Step 5: Calculate deltas per database
+	var totalTxnsBehind uint64
+	var maxDeltaForAnyDB uint64
+
+	// Check all databases that exist on peer
+	for dbName, peerTxnID := range peerTxnIDs {
+		localTxnID := localTxnIDs[dbName] // 0 if database doesn't exist locally
+
+		if peerTxnID > localTxnID {
+			delta := peerTxnID - localTxnID
+			totalTxnsBehind += delta
+
+			if delta > maxDeltaForAnyDB {
+				maxDeltaForAnyDB = delta
+			}
+
+			decision.DatabaseDeltas[dbName] = DeltaInfo{
+				DatabaseName: dbName,
+				LocalTxnID:   localTxnID,
+				PeerTxnID:    peerTxnID,
+				TxnsBehind:   delta,
+			}
+
+			log.Debug().
+				Str("database", dbName).
+				Uint64("local_txn_id", localTxnID).
+				Uint64("peer_txn_id", peerTxnID).
+				Uint64("behind_by", delta).
+				Msg("Database delta calculated")
+		}
+	}
+
+	// Step 6: Determine strategy based on delta size
+	if totalTxnsBehind == 0 {
+		decision.Strategy = NO_CATCHUP
+		log.Info().Msg("Node is up to date - no catch-up needed")
+	} else if maxDeltaForAnyDB > DeltaSyncThreshold {
+		// Any database is too far behind - use snapshot
+		decision.Strategy = FULL_SNAPSHOT
+		log.Info().
+			Uint64("max_delta", maxDeltaForAnyDB).
+			Uint64("threshold", DeltaSyncThreshold).
+			Msg("Delta too large for any database - full snapshot required")
+	} else {
+		// Small delta - use incremental sync
+		decision.Strategy = DELTA_SYNC
+		log.Info().
+			Uint64("total_txns_behind", totalTxnsBehind).
+			Uint64("max_delta", maxDeltaForAnyDB).
+			Int("databases_to_sync", len(decision.DatabaseDeltas)).
+			Msg("Delta sync strategy selected")
+	}
+
+	return decision, nil
+}
+
+// PerformDeltaSync performs incremental catch-up using transaction logs
+// This is called when the node is only slightly behind and can catch up via delta sync
+func (c *CatchUpClient) PerformDeltaSync(ctx context.Context, decision *CatchUpDecision, deltaSyncClient *DeltaSyncClient) error {
+	if deltaSyncClient == nil {
+		return fmt.Errorf("delta sync client not provided")
+	}
+
+	log.Info().
+		Int("databases_to_sync", len(decision.DatabaseDeltas)).
+		Str("peer", decision.PeerAddr).
+		Msg("Starting delta sync")
+
+	// Mark ourselves as JOINING during sync
+	c.registry.MarkJoining(c.nodeID)
+
+	// Sync each database that's behind
+	for dbName, deltaInfo := range decision.DatabaseDeltas {
+		log.Info().
+			Str("database", dbName).
+			Uint64("from_txn_id", deltaInfo.LocalTxnID).
+			Uint64("to_txn_id", deltaInfo.PeerTxnID).
+			Uint64("txns_to_apply", deltaInfo.TxnsBehind).
+			Msg("Starting database delta sync")
+
+		// Use existing DeltaSyncClient to sync from peer
+		result, err := deltaSyncClient.SyncFromPeer(
+			ctx,
+			0, // peerNodeID will be determined by address
+			decision.PeerAddr,
+			dbName,
+			deltaInfo.LocalTxnID,
+		)
+
+		if err != nil {
+			return fmt.Errorf("failed to sync database %s: %w", dbName, err)
+		}
+
+		log.Info().
+			Str("database", dbName).
+			Int("txns_applied", result.TxnsApplied).
+			Uint64("final_txn_id", result.LastAppliedTxnID).
+			Msg("Database delta sync completed")
+	}
+
+	log.Info().
+		Int("databases_synced", len(decision.DatabaseDeltas)).
+		Msg("Delta sync completed successfully")
+
+	return nil
 }
