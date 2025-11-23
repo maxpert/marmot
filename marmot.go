@@ -82,18 +82,19 @@ func main() {
 	// Check if we're joining an existing cluster or starting as seed
 	isJoiningCluster := len(cfg.Config.Cluster.SeedNodes) > 0
 
-	// If joining cluster, always determine if we need to catch up (even if we have data)
+	// Create catch-up client for both seed nodes (for anti-entropy) and joining nodes
+	catchUpClient := marmotgrpc.NewCatchUpClient(
+		cfg.Config.NodeID,
+		cfg.Config.DataDir,
+		grpcServer.GetNodeRegistry(),
+		cfg.Config.Cluster.SeedNodes,
+	)
+
+	// If joining cluster, determine if we need to catch up (even if we have data)
 	// This fixes the bug where restarted nodes with stale data skip catch-up
 	var catchUpDecision *marmotgrpc.CatchUpDecision
-	var catchUpClient *marmotgrpc.CatchUpClient
 
 	if isJoiningCluster {
-		catchUpClient = marmotgrpc.NewCatchUpClient(
-			cfg.Config.NodeID,
-			cfg.Config.DataDir,
-			grpcServer.GetNodeRegistry(),
-			cfg.Config.Cluster.SeedNodes,
-		)
 
 		log.Info().Msg("Determining catch-up strategy by comparing with cluster state...")
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -199,6 +200,11 @@ func main() {
 		log.Info().Msg("Delta sync completed successfully")
 	}
 
+	// Create snapshot function for anti-entropy
+	snapshotFunc := func(ctx context.Context, peerNodeID uint64, peerAddr string, database string) error {
+		return catchUpClient.CatchUpFromPeer(ctx, peerNodeID, peerAddr, database)
+	}
+
 	antiEntropy := marmotgrpc.NewAntiEntropyServiceFromConfig(
 		cfg.Config.NodeID,
 		grpcServer.GetNodeRegistry(),
@@ -206,7 +212,7 @@ func main() {
 		dbMgr,
 		deltaSync,
 		clock,
-		nil, // Snapshot function will be wired up later if needed
+		snapshotFunc,
 	)
 
 	// Start anti-entropy service

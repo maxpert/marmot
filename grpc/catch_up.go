@@ -49,6 +49,57 @@ func NewCatchUpClient(nodeID uint64, dataDir string, registry *NodeRegistry, see
 	}
 }
 
+// CatchUpFromPeer downloads a snapshot of a specific database from a peer
+// Used by anti-entropy to trigger snapshots for lagging databases
+func (c *CatchUpClient) CatchUpFromPeer(ctx context.Context, peerNodeID uint64, peerAddr string, database string) error {
+	log.Info().
+		Uint64("peer_node", peerNodeID).
+		Str("peer_addr", peerAddr).
+		Str("database", database).
+		Msg("Starting snapshot download for database from peer")
+
+	// Connect to peer
+	conn, err := grpc.DialContext(ctx, peerAddr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithBlock(),
+		grpc.WithDefaultCallOptions(
+			grpc.MaxCallRecvMsgSize(100*1024*1024),
+		),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to connect to peer: %w", err)
+	}
+	defer conn.Close()
+
+	client := NewMarmotServiceClient(conn)
+
+	// Get snapshot info (will include all databases, we filter later)
+	snapshotInfo, err := client.GetSnapshotInfo(ctx, &SnapshotInfoRequest{
+		RequestingNodeId: c.nodeID,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to get snapshot info: %w", err)
+	}
+
+	log.Info().
+		Str("database", database).
+		Uint64("snapshot_txn_id", snapshotInfo.SnapshotTxnId).
+		Int64("size_bytes", snapshotInfo.SnapshotSizeBytes).
+		Msg("Received snapshot info for database")
+
+	// Apply snapshot for this database
+	if err := c.applySnapshot(ctx, client, snapshotInfo); err != nil {
+		return fmt.Errorf("failed to apply snapshot: %w", err)
+	}
+
+	log.Info().
+		Str("database", database).
+		Uint64("snapshot_txn_id", snapshotInfo.SnapshotTxnId).
+		Msg("Snapshot download completed for database")
+
+	return nil
+}
+
 // CatchUp performs the full catch-up process
 // Returns the snapshot txn_id after which normal replication can begin
 func (c *CatchUpClient) CatchUp(ctx context.Context) (uint64, error) {
