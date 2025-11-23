@@ -3,6 +3,7 @@ package grpc
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -292,6 +293,31 @@ func (ae *AntiEntropyService) syncPeerDatabase(ctx context.Context, peer *NodeSt
 			dbState.LastAppliedTxnId,
 		)
 		if err != nil {
+			// Check if error is due to gap detection (missing transactions)
+			// If so, fall back to snapshot instead of failing
+			errMsg := err.Error()
+			if strings.Contains(errMsg, "gap detected") {
+				log.Warn().
+					Err(err).
+					Uint64("peer_node", peer.NodeId).
+					Str("database", database).
+					Msg("Gap detected in delta sync, falling back to snapshot")
+
+				// Try snapshot instead
+				if ae.snapshotFunc != nil {
+					if snapErr := ae.snapshotFunc(ctx, peer.NodeId, peer.Address, database); snapErr != nil {
+						return fmt.Errorf("delta sync failed with gap (transactions GC'd) and snapshot fallback failed: %w", snapErr)
+					}
+
+					log.Info().
+						Uint64("peer_node", peer.NodeId).
+						Str("database", database).
+						Msg("Snapshot fallback completed successfully after gap detection")
+					return nil
+				}
+				return fmt.Errorf("delta sync failed with gap (transactions GC'd) but snapshot function not configured: %w", err)
+			}
+			// Other errors - fail normally
 			return fmt.Errorf("delta sync failed: %w", err)
 		}
 

@@ -6,6 +6,7 @@ import (
 	"io"
 	"time"
 
+	"github.com/maxpert/marmot/cfg"
 	"github.com/maxpert/marmot/db"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/rs/zerolog/log"
@@ -91,6 +92,7 @@ func (ds *DeltaSyncClient) SyncFromPeer(ctx context.Context, peerNodeID uint64, 
 	}
 
 	// Apply changes as they stream in
+	firstEventReceived := false
 	for {
 		event, err := stream.Recv()
 		if err == io.EOF {
@@ -108,6 +110,34 @@ func (ds *DeltaSyncClient) SyncFromPeer(ctx context.Context, peerNodeID uint64, 
 				Uint64("txn_id", event.TxnId).
 				Msg("Skipping already-applied transaction")
 			continue
+		}
+
+		// Gap detection: Check if the first received transaction indicates missing data
+		// This happens when GC has deleted transactions between fromTxnID and the first available one
+		if !firstEventReceived {
+			firstEventReceived = true
+			gap := event.TxnId - fromTxnID
+
+			// If gap is larger than delta sync threshold, we have missing transactions
+			// This means GC deleted them and we need a snapshot instead
+			if gap > uint64(cfg.Config.Replication.DeltaSyncThresholdTxns) {
+				result.Err = fmt.Errorf(
+					"gap detected: requested from txn_id %d but first available is %d (gap: %d txns, threshold: %d). "+
+						"Transactions likely GC'd - full snapshot required",
+					fromTxnID,
+					event.TxnId,
+					gap,
+					cfg.Config.Replication.DeltaSyncThresholdTxns,
+				)
+				log.Warn().
+					Uint64("requested_from", fromTxnID).
+					Uint64("first_available", event.TxnId).
+					Uint64("gap", gap).
+					Int("threshold", cfg.Config.Replication.DeltaSyncThresholdTxns).
+					Str("database", database).
+					Msg("Gap detected in transaction stream - snapshot required")
+				return result, result.Err
+			}
 		}
 
 		// Apply the transaction locally
