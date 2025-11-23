@@ -37,6 +37,7 @@ type NodeRegistry struct {
 	lastSeen        map[uint64]time.Time
 	mu              sync.RWMutex
 	onNodeAliveFunc func(*NodeState) // Callback when node transitions to ALIVE
+	onNodeDeadFunc  func(*NodeState) // Callback when node transitions to DEAD
 	callbackMu      sync.RWMutex
 }
 
@@ -199,26 +200,48 @@ func (nr *NodeRegistry) GetAlive() []*NodeState {
 	return nodes
 }
 
-// MarkSuspect marks a node as suspect
-func (nr *NodeRegistry) MarkSuspect(nodeID uint64) {
+// transitionState transitions a node to a new state with SWIM protocol compliance
+func (nr *NodeRegistry) transitionState(nodeID uint64, newStatus NodeStatus, reason string) {
 	nr.mu.Lock()
 	defer nr.mu.Unlock()
 
-	if node, exists := nr.nodes[nodeID]; exists {
-		node.Status = NodeStatus_SUSPECT
-		log.Warn().Uint64("node_id", nodeID).Msg("Node marked as suspect")
+	node, exists := nr.nodes[nodeID]
+	if !exists {
+		return
 	}
+
+	// Validate transition follows SWIM escalation rules
+	if !nr.shouldEscalate(node.Status, newStatus) {
+		log.Debug().
+			Uint64("node_id", nodeID).
+			Str("current", node.Status.String()).
+			Str("new", newStatus.String()).
+			Msg("Invalid state transition, skipping")
+		return
+	}
+
+	oldStatus := node.Status
+	node.Status = newStatus
+	node.Incarnation++ // Increment to propagate via gossip
+
+	log.Warn().
+		Uint64("node_id", nodeID).
+		Str("old_status", oldStatus.String()).
+		Str("new_status", newStatus.String()).
+		Uint64("incarnation", node.Incarnation).
+		Str("reason", reason).
+		Msg("Node state transition")
+}
+
+// MarkSuspect marks a node as suspect
+// Increments incarnation per SWIM protocol to propagate suspicion via gossip
+func (nr *NodeRegistry) MarkSuspect(nodeID uint64) {
+	nr.transitionState(nodeID, NodeStatus_SUSPECT, "gossip timeout")
 }
 
 // MarkDead marks a node as dead
 func (nr *NodeRegistry) MarkDead(nodeID uint64) {
-	nr.mu.Lock()
-	defer nr.mu.Unlock()
-
-	if node, exists := nr.nodes[nodeID]; exists {
-		node.Status = NodeStatus_DEAD
-		log.Warn().Uint64("node_id", nodeID).Msg("Node marked as dead")
-	}
+	nr.transitionState(nodeID, NodeStatus_DEAD, "failure timeout")
 }
 
 // Remove removes a node from the registry
@@ -235,9 +258,10 @@ func (nr *NodeRegistry) Remove(nodeID uint64) {
 // CheckTimeouts marks nodes as SUSPECT or DEAD based on timeout rules
 func (nr *NodeRegistry) CheckTimeouts(suspectTimeout, deadTimeout time.Duration) {
 	nr.mu.Lock()
-	defer nr.mu.Unlock()
 
 	now := time.Now()
+	var deadNodes []*NodeState // Track nodes that became DEAD for cleanup callback
+
 	for nodeID, node := range nr.nodes {
 		if nodeID == nr.localNodeID {
 			continue
@@ -255,6 +279,22 @@ func (nr *NodeRegistry) CheckTimeouts(suspectTimeout, deadTimeout time.Duration)
 			if elapsed > deadTimeout {
 				node.Status = NodeStatus_DEAD
 				log.Error().Uint64("node_id", nodeID).Msg("Node marked DEAD")
+				deadNodes = append(deadNodes, copyNodeState(node))
+			}
+		}
+	}
+
+	nr.mu.Unlock()
+
+	// Call cleanup callback for DEAD nodes outside lock
+	if len(deadNodes) > 0 {
+		nr.callbackMu.RLock()
+		callback := nr.onNodeDeadFunc
+		nr.callbackMu.RUnlock()
+
+		if callback != nil {
+			for _, node := range deadNodes {
+				callback(node)
 			}
 		}
 	}
@@ -361,6 +401,13 @@ func (nr *NodeRegistry) SetOnNodeAlive(callback func(*NodeState)) {
 	nr.callbackMu.Lock()
 	defer nr.callbackMu.Unlock()
 	nr.onNodeAliveFunc = callback
+}
+
+// SetOnNodeDead sets the callback for when a node becomes DEAD
+func (nr *NodeRegistry) SetOnNodeDead(callback func(*NodeState)) {
+	nr.callbackMu.Lock()
+	defer nr.callbackMu.Unlock()
+	nr.onNodeDeadFunc = callback
 }
 
 // DetectSchemaDrift logs warnings for nodes with different schema versions

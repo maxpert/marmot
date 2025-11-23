@@ -31,19 +31,23 @@ func NewClient(nodeID uint64) *Client {
 }
 
 // Connect establishes a connection to a peer node
+// Idempotent: safe to call multiple times for the same node
 func (c *Client) Connect(nodeID uint64, address string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// Check if already connected
+	// Idempotent: return success if already connected
 	if _, exists := c.connections[nodeID]; exists {
+		log.Debug().
+			Uint64("node_id", nodeID).
+			Msg("Already connected, skipping")
 		return nil
 	}
 
 	log.Debug().
 		Uint64("node_id", nodeID).
 		Str("address", address).
-		Msg("Connecting to peer")
+		Msg("Establishing new connection")
 
 	// Get keepalive settings from config
 	keepaliveTime := 10 * time.Second

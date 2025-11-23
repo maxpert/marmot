@@ -350,24 +350,33 @@ func (gp *GossipProtocol) IncrementIncarnation() {
 
 // OnNodeJoin is called when a new node joins the cluster
 func (gp *GossipProtocol) OnNodeJoin(node *NodeState) {
-	// Connect to the new node if we have its address
-	if node.NodeId != gp.nodeID && node.Address != "" {
-		if err := gp.client.Connect(node.NodeId, node.Address); err != nil {
-			log.Warn().
-				Err(err).
-				Uint64("node_id", node.NodeId).
-				Str("address", node.Address).
-				Msg("Failed to connect to joining node")
-		} else {
-			log.Info().
-				Uint64("node_id", node.NodeId).
-				Str("address", node.Address).
-				Msg("Connected to joining node")
-		}
+	// Skip if it's ourselves or no address provided
+	if node.NodeId == gp.nodeID || node.Address == "" {
+		return
 	}
+
+	// Attempt to establish connection
+	if err := gp.client.Connect(node.NodeId, node.Address); err != nil {
+		log.Error().
+			Err(err).
+			Uint64("node_id", node.NodeId).
+			Str("address", node.Address).
+			Msg("Failed to establish connection to node - will retry on next gossip round")
+		return
+	}
+
+	log.Info().
+		Uint64("node_id", node.NodeId).
+		Str("address", node.Address).
+		Msg("Successfully connected to node")
 }
 
 // GetNodeRegistry returns the node registry for accessing cluster membership
 func (gp *GossipProtocol) GetNodeRegistry() *NodeRegistry {
 	return gp.registry
+}
+
+// GetClient returns the gRPC client for connection management
+func (gp *GossipProtocol) GetClient() *Client {
+	return gp.client
 }

@@ -64,13 +64,45 @@ func NewServer(config ServerConfig) (*Server, error) {
 
 	// Set up callback to connect to nodes when they become ALIVE
 	s.registry.SetOnNodeAlive(func(node *NodeState) {
-		if s.gossip != nil {
-			log.Info().
-				Uint64("node_id", node.NodeId).
-				Str("address", node.Address).
-				Msg("Node became ALIVE, establishing connection")
-			s.gossip.OnNodeJoin(node)
+		// Defensive checks
+		if node == nil {
+			log.Error().Msg("BUG: OnNodeAlive called with nil node")
+			return
 		}
+		if node.Address == "" {
+			log.Warn().
+				Uint64("node_id", node.NodeId).
+				Msg("Skipping connection - node has no address")
+			return
+		}
+		if s.gossip == nil {
+			log.Warn().Msg("Gossip protocol not initialized, skipping connection")
+			return
+		}
+
+		log.Info().
+			Uint64("node_id", node.NodeId).
+			Str("address", node.Address).
+			Msg("Node became ALIVE, establishing connection")
+		s.gossip.OnNodeJoin(node)
+	})
+
+	// Set up callback to disconnect from nodes when they become DEAD
+	s.registry.SetOnNodeDead(func(node *NodeState) {
+		// Defensive checks
+		if node == nil {
+			log.Error().Msg("BUG: OnNodeDead called with nil node")
+			return
+		}
+		if s.gossip == nil {
+			log.Warn().Msg("Gossip protocol not initialized, skipping disconnect")
+			return
+		}
+
+		log.Info().
+			Uint64("node_id", node.NodeId).
+			Msg("Node became DEAD, closing connection")
+		s.gossip.GetClient().Disconnect(node.NodeId)
 	})
 
 	return s, nil

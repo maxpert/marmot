@@ -248,8 +248,11 @@ func main() {
 		checkInterval := time.Duration(cfg.Config.Cluster.Promotion.CheckIntervalSeconds) * time.Second
 		minHealthyDuration := time.Duration(cfg.Config.Cluster.Promotion.MinHealthyDurationSec) * time.Second
 
-		ctx := context.Background()
-		go grpcServer.RunPromotionChecker(ctx, checkInterval, minHealthyDuration)
+		// Create cancellable context for graceful shutdown
+		promotionCtx, promotionCancel := context.WithCancel(context.Background())
+		defer promotionCancel() // Cancel on shutdown
+
+		go grpcServer.RunPromotionChecker(promotionCtx, checkInterval, minHealthyDuration)
 
 		log.Info().Msg("Node fully initialized - staying in JOINING, promotion checker running")
 	} else {
