@@ -70,6 +70,5 @@ verbose = true
 format = "console"
 
 [prometheus]
-enabled = false
-address = "0.0.0.0"
-port = 9092
+# Metrics served on gRPC port at http://localhost:8082/metrics
+enabled = true

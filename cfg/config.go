@@ -113,10 +113,9 @@ type LoggingConfiguration struct {
 }
 
 // PrometheusConfiguration for metrics
+// Metrics are served on the gRPC port at /metrics endpoint
 type PrometheusConfiguration struct {
-	Enabled bool   `toml:"enabled"`
-	Address string `toml:"address"`
-	Port    int    `toml:"port"`
+	Enabled bool `toml:"enabled"`
 }
 
 // MVCCConfiguration controls MVCC transaction manager behavior
@@ -277,9 +276,7 @@ var Config = &Configuration{
 	},
 
 	Prometheus: PrometheusConfiguration{
-		Enabled: true,
-		Address: "0.0.0.0",
-		Port:    9090,
+		Enabled: true, // Served on gRPC port at /metrics
 	},
 }
 

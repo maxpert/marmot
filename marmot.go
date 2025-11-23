@@ -64,6 +64,11 @@ func main() {
 		return
 	}
 
+	// Set metrics handler if Prometheus is enabled
+	if metricsHandler := telemetry.GetMetricsHandler(); metricsHandler != nil {
+		grpcServer.SetMetricsHandler(metricsHandler)
+	}
+
 	// Start gRPC server
 	if err := grpcServer.Start(); err != nil {
 		log.Fatal().Err(err).Msg("Failed to start gRPC server")

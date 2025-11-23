@@ -1,7 +1,6 @@
 package telemetry
 
 import (
-	"fmt"
 	"net/http"
 	"strconv"
 
@@ -117,17 +116,14 @@ func InitializeTelemetry() {
 	}
 
 	registry = prometheus.NewRegistry()
-	addr := fmt.Sprintf("%s:%d", cfg.Config.Prometheus.Address, cfg.Config.Prometheus.Port)
-	server := http.Server{
-		Addr:    addr,
-		Handler: promhttp.HandlerFor(registry, promhttp.HandlerOpts{Registry: registry}),
+	log.Info().Msg("Prometheus metrics enabled - will be served on gRPC port at /metrics")
+}
+
+// GetMetricsHandler returns the HTTP handler for Prometheus metrics
+// Returns nil if Prometheus is not enabled
+func GetMetricsHandler() http.Handler {
+	if registry == nil {
+		return nil
 	}
-
-	log.Info().Str("address", addr).Msg("Starting Prometheus metrics server")
-
-	go func() {
-		if err := server.ListenAndServe(); err != nil {
-			log.Error().Err(err).Msg("Unable to start Prometheus listener")
-		}
-	}()
+	return promhttp.HandlerFor(registry, promhttp.HandlerOpts{Registry: registry})
 }

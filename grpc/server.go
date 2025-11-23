@@ -7,12 +7,14 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"os"
 	"sync"
 	"time"
 
 	"github.com/maxpert/marmot/db"
 	"github.com/rs/zerolog/log"
+	"github.com/soheilhy/cmux"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/reflection"
@@ -32,12 +34,14 @@ type Server struct {
 	port     int
 	server   *grpc.Server
 	listener net.Listener
+	mux      cmux.CMux
 
 	// Components
 	gossip             *GossipProtocol
 	registry           *NodeRegistry
 	replicationHandler *ReplicationHandler
 	dbManager          *db.DatabaseManager
+	metricsHandler     http.Handler
 
 	mu sync.RWMutex
 }
@@ -108,7 +112,7 @@ func NewServer(config ServerConfig) (*Server, error) {
 	return s, nil
 }
 
-// Start starts the gRPC server
+// Start starts the gRPC server (and optional HTTP metrics on same port)
 func (s *Server) Start() error {
 	addr := fmt.Sprintf("%s:%d", s.address, s.port)
 	listener, err := net.Listen("tcp", addr)
@@ -141,12 +145,51 @@ func (s *Server) Start() error {
 		Uint64("node_id", s.nodeID).
 		Msg("Starting gRPC server")
 
-	// Start in goroutine
-	go func() {
-		if err := s.server.Serve(listener); err != nil {
-			log.Error().Err(err).Msg("gRPC server failed")
+	// If we have a metrics handler, use cmux to multiplex HTTP and gRPC
+	if s.metricsHandler != nil {
+		log.Info().Msg("Multiplexing HTTP metrics (/metrics) and gRPC on same port")
+		s.mux = cmux.New(listener)
+
+		// Match HTTP requests (for /metrics)
+		httpListener := s.mux.Match(cmux.HTTP1Fast())
+
+		// Match gRPC requests (everything else)
+		grpcListener := s.mux.Match(cmux.Any())
+
+		// Start HTTP server for metrics
+		httpMux := http.NewServeMux()
+		httpMux.Handle("/metrics", s.metricsHandler)
+		httpServer := &http.Server{
+			Handler: httpMux,
 		}
-	}()
+
+		go func() {
+			if err := httpServer.Serve(httpListener); err != nil {
+				log.Error().Err(err).Msg("HTTP metrics server failed")
+			}
+		}()
+
+		// Start gRPC server
+		go func() {
+			if err := s.server.Serve(grpcListener); err != nil {
+				log.Error().Err(err).Msg("gRPC server failed")
+			}
+		}()
+
+		// Start cmux
+		go func() {
+			if err := s.mux.Serve(); err != nil {
+				log.Error().Err(err).Msg("cmux failed")
+			}
+		}()
+	} else {
+		// No metrics, just serve gRPC normally
+		go func() {
+			if err := s.server.Serve(listener); err != nil {
+				log.Error().Err(err).Msg("gRPC server failed")
+			}
+		}()
+	}
 
 	return nil
 }
@@ -588,6 +631,13 @@ func (s *Server) SetReplicationHandler(handler *ReplicationHandler) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.replicationHandler = handler
+}
+
+// SetMetricsHandler sets the Prometheus metrics HTTP handler
+func (s *Server) SetMetricsHandler(handler http.Handler) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.metricsHandler = handler
 }
 
 // SetDatabaseManager sets the database manager for snapshot operations
