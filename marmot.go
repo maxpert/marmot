@@ -241,12 +241,17 @@ func main() {
 	}
 	defer mysqlServer.Stop()
 
-	// Now that all services are initialized and running, mark node as ALIVE
+	// Now that all services are initialized and running, handle node state
 	if isJoiningCluster {
-		grpcServer.GetNodeRegistry().MarkAlive(cfg.Config.NodeID)
-		// Immediately broadcast ALIVE status to accelerate propagation
-		gossip.BroadcastImmediate()
-		log.Info().Msg("Node fully initialized - transitioned to ALIVE")
+		// Start promotion checker to automatically transition from JOINING → ALIVE
+		// when node is ready (has databases and is healthy)
+		checkInterval := time.Duration(cfg.Config.Cluster.Promotion.CheckIntervalSeconds) * time.Second
+		minHealthyDuration := time.Duration(cfg.Config.Cluster.Promotion.MinHealthyDurationSec) * time.Second
+
+		ctx := context.Background()
+		go grpcServer.RunPromotionChecker(ctx, checkInterval, minHealthyDuration)
+
+		log.Info().Msg("Node fully initialized - staying in JOINING, promotion checker running")
 	} else {
 		// Seed node is immediately ALIVE (no need to catch up)
 		grpcServer.GetNodeRegistry().MarkAlive(cfg.Config.NodeID)

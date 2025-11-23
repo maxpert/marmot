@@ -57,16 +57,31 @@ type SnapshotConfiguration struct {
 	SFTP            SFTPConfiguration   `toml:"sftp"`
 }
 
+// PromotionConfiguration controls JOINING → ALIVE promotion
+type PromotionConfiguration struct {
+	CheckIntervalSeconds  int  `toml:"check_interval_seconds"`   // How often to check for promotion
+	MinHealthyDurationSec int  `toml:"min_healthy_duration_sec"` // Must be healthy for this long before promotion
+	RequireAllDatabases   bool `toml:"require_all_databases"`    // All databases must exist before promotion
+}
+
+// BackpressureConfiguration controls snapshot streaming backpressure
+type BackpressureConfiguration struct {
+	MaxQueueDepth   int `toml:"max_queue_depth"`    // Max apply queue depth before pausing
+	CheckIntervalMS int `toml:"check_interval_ms"`  // How often to check queue depth
+}
+
 // ClusterConfiguration controls cluster membership and communication
 type ClusterConfiguration struct {
-	GRPCBindAddress      string   `toml:"grpc_bind_address"`
-	GRPCAdvertiseAddress string   `toml:"grpc_advertise_address"` // Address other nodes use to connect (defaults to hostname:port)
-	GRPCPort             int      `toml:"grpc_port"`
-	SeedNodes            []string `toml:"seed_nodes"`
-	GossipIntervalMS     int      `toml:"gossip_interval_ms"`
-	GossipFanout         int      `toml:"gossip_fanout"`
-	SuspectTimeoutMS     int      `toml:"suspect_timeout_ms"`
-	DeadTimeoutMS        int      `toml:"dead_timeout_ms"`
+	GRPCBindAddress      string                     `toml:"grpc_bind_address"`
+	GRPCAdvertiseAddress string                     `toml:"grpc_advertise_address"` // Address other nodes use to connect (defaults to hostname:port)
+	GRPCPort             int                        `toml:"grpc_port"`
+	SeedNodes            []string                   `toml:"seed_nodes"`
+	GossipIntervalMS     int                        `toml:"gossip_interval_ms"`
+	GossipFanout         int                        `toml:"gossip_fanout"`
+	SuspectTimeoutMS     int                        `toml:"suspect_timeout_ms"`
+	DeadTimeoutMS        int                        `toml:"dead_timeout_ms"`
+	Promotion            PromotionConfiguration     `toml:"promotion"`
+	Backpressure         BackpressureConfiguration  `toml:"backpressure"`
 }
 
 // ReplicationConfiguration controls replication behavior
@@ -193,6 +208,15 @@ var Config = &Configuration{
 		GossipFanout:     3,
 		SuspectTimeoutMS: 5000,
 		DeadTimeoutMS:    10000,
+		Promotion: PromotionConfiguration{
+			CheckIntervalSeconds:  2,    // Check every 2 seconds
+			MinHealthyDurationSec: 3,    // Must be healthy for 3 seconds
+			RequireAllDatabases:   true, // Require all databases synced
+		},
+		Backpressure: BackpressureConfiguration{
+			MaxQueueDepth:   1000, // Max 1000 items in apply queue
+			CheckIntervalMS: 100,  // Check every 100ms
+		},
 	},
 
 	Replication: ReplicationConfiguration{

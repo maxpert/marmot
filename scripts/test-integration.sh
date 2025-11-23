@@ -394,11 +394,46 @@ if [ "$ALL_READY" = false ]; then
 fi
 echo -e "${GREEN}✓ All nodes ready (waited ${WAIT_COUNT}s)${NC}"
 
-# Wait for cluster membership to stabilize
-echo "Waiting for cluster membership to stabilize..."
-# Give nodes time to join, gossip, and transition to ALIVE
-sleep 5
-echo -e "${GREEN}✓ Cluster membership stabilization period complete${NC}"
+# Wait for cluster membership to stabilize by checking for promotion messages
+echo "Waiting for all joining nodes to be promoted to ALIVE..."
+WAIT_COUNT=0
+MAX_WAIT=30
+ALL_PROMOTED=false
+
+while [ $WAIT_COUNT -lt $MAX_WAIT ]; do
+    # Check logs for promotion messages
+    # Node 1 is seed so it's immediately ALIVE
+    # Nodes 2 and 3 need to be promoted
+    NODE2_PROMOTED=false
+    NODE3_PROMOTED=false
+
+    if grep -q "Promoting node from JOINING to ALIVE" /tmp/node2.log 2>/dev/null; then
+        NODE2_PROMOTED=true
+    fi
+
+    if grep -q "Promoting node from JOINING to ALIVE" /tmp/node3.log 2>/dev/null; then
+        NODE3_PROMOTED=true
+    fi
+
+    if [ "$NODE2_PROMOTED" = true ] && [ "$NODE3_PROMOTED" = true ]; then
+        ALL_PROMOTED=true
+        echo -e "${GREEN}✓ All nodes promoted to ALIVE (waited ${WAIT_COUNT}s)${NC}"
+        # Give a bit more time for gossip to propagate the ALIVE status
+        sleep 2
+        break
+    fi
+
+    sleep 1
+    WAIT_COUNT=$((WAIT_COUNT + 1))
+done
+
+if [ "$ALL_PROMOTED" = false ]; then
+    echo -e "${RED}✗ ERROR: Not all nodes were promoted to ALIVE within ${MAX_WAIT}s${NC}"
+    echo -e "${RED}  Node 2 promoted: $NODE2_PROMOTED${NC}"
+    echo -e "${RED}  Node 3 promoted: $NODE3_PROMOTED${NC}"
+    echo -e "${RED}  Cannot proceed with tests - cluster not stable${NC}"
+    exit 1
+fi
 
 echo ""
 echo "Creating test database..."

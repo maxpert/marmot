@@ -62,6 +62,17 @@ func NewServer(config ServerConfig) (*Server, error) {
 	s.registry = NewNodeRegistry(config.NodeID, config.AdvertiseAddress)
 	s.gossip = NewGossipProtocol(config.NodeID, s.registry)
 
+	// Set up callback to connect to nodes when they become ALIVE
+	s.registry.SetOnNodeAlive(func(node *NodeState) {
+		if s.gossip != nil {
+			log.Info().
+				Uint64("node_id", node.NodeId).
+				Str("address", node.Address).
+				Msg("Node became ALIVE, establishing connection")
+			s.gossip.OnNodeJoin(node)
+		}
+	})
+
 	return s, nil
 }
 
@@ -174,9 +185,16 @@ func (s *Server) Join(ctx context.Context, req *JoinRequest) (*JoinResponse, err
 
 // Ping handles health check requests
 func (s *Server) Ping(ctx context.Context, req *PingRequest) (*PingResponse, error) {
+	// Return actual node status from registry, not hardcoded ALIVE
+	node, exists := s.registry.Get(s.nodeID)
+	status := NodeStatus_ALIVE // Default to ALIVE if not found
+	if exists {
+		status = node.Status
+	}
+
 	return &PingResponse{
 		NodeId: s.nodeID,
-		Status: NodeStatus_ALIVE,
+		Status: status,
 	}, nil
 }
 
@@ -545,4 +563,101 @@ func (s *Server) SetDatabaseManager(manager *db.DatabaseManager) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.dbManager = manager
+}
+
+// =======================
+// PROMOTION CHECKER
+// =======================
+
+// RunPromotionChecker periodically checks if a JOINING node is ready to be promoted to ALIVE
+// This implements the automatic JOINING → ALIVE transition based on promotion criteria
+func (s *Server) RunPromotionChecker(ctx context.Context, checkInterval time.Duration, minHealthyDuration time.Duration) {
+	ticker := time.NewTicker(checkInterval)
+	defer ticker.Stop()
+
+	// Track when node first became eligible for promotion
+	var eligibleSince *time.Time
+
+	log.Debug().
+		Dur("check_interval", checkInterval).
+		Dur("min_healthy_duration", minHealthyDuration).
+		Msg("Started promotion checker")
+
+	// Helper function to run promotion check
+	runCheck := func() {
+		// Check if we're currently in JOINING state
+		currentNode, exists := s.registry.Get(s.nodeID)
+		if !exists || currentNode.Status != NodeStatus_JOINING {
+			eligibleSince = nil
+			return
+		}
+
+		// Check promotion criteria
+		eligible := s.checkPromotionCriteria()
+
+		if eligible {
+			// Track how long we've been eligible
+			if eligibleSince == nil {
+				now := time.Now()
+				eligibleSince = &now
+				log.Debug().Msg("Node became eligible for promotion")
+			}
+
+			// Check if we've been healthy long enough
+			if time.Since(*eligibleSince) >= minHealthyDuration {
+				log.Info().Msg("Promoting node from JOINING to ALIVE")
+
+				// Promote to ALIVE
+				s.registry.MarkAlive(s.nodeID)
+
+				// Immediately broadcast ALIVE status to accelerate propagation
+				if s.gossip != nil {
+					s.gossip.BroadcastImmediate()
+				}
+
+				// Reset eligibility timer (we're now ALIVE)
+				eligibleSince = nil
+			}
+		} else {
+			// Not eligible, reset timer
+			if eligibleSince != nil {
+				eligibleSince = nil
+			}
+		}
+	}
+
+	// Run initial check immediately
+	runCheck()
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Info().Msg("Promotion checker stopped")
+			return
+		case <-ticker.C:
+			runCheck()
+		}
+	}
+}
+
+// checkPromotionCriteria checks if the node meets all criteria for promotion to ALIVE
+func (s *Server) checkPromotionCriteria() bool {
+	s.mu.RLock()
+	dbManager := s.dbManager
+	s.mu.RUnlock()
+
+	if dbManager == nil {
+		return false
+	}
+
+	// Get list of databases from seed node (first ALIVE node we find)
+	aliveNodes := s.registry.GetReplicationEligible()
+	if len(aliveNodes) == 0 {
+		// No ALIVE nodes yet - we might be the first node (seed)
+		return true
+	}
+
+	// Check that we have at least one database
+	localDatabases := dbManager.ListDatabases()
+	return len(localDatabases) > 0
 }

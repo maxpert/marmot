@@ -32,10 +32,12 @@ func copyNodeState(node *NodeState) *NodeState {
 
 // NodeRegistry tracks cluster membership using SWIM protocol
 type NodeRegistry struct {
-	localNodeID uint64
-	nodes       map[uint64]*NodeState
-	lastSeen    map[uint64]time.Time
-	mu          sync.RWMutex
+	localNodeID     uint64
+	nodes           map[uint64]*NodeState
+	lastSeen        map[uint64]time.Time
+	mu              sync.RWMutex
+	onNodeAliveFunc func(*NodeState) // Callback when node transitions to ALIVE
+	callbackMu      sync.RWMutex
 }
 
 // NewNodeRegistry creates a new node registry
@@ -71,10 +73,10 @@ func (nr *NodeRegistry) Add(node *NodeState) {
 // Update updates a node's state using SWIM protocol rules
 func (nr *NodeRegistry) Update(node *NodeState) {
 	nr.mu.Lock()
-	defer nr.mu.Unlock()
 
 	// Rule 1: SWIM refutation - local node rejects non-ALIVE status for itself
 	if node.NodeId == nr.localNodeID {
+		nr.mu.Unlock()
 		nr.handleSelfUpdate(node)
 		return
 	}
@@ -84,21 +86,44 @@ func (nr *NodeRegistry) Update(node *NodeState) {
 	if !exists {
 		nr.nodes[node.NodeId] = node
 		nr.lastSeen[node.NodeId] = time.Now()
+		nr.mu.Unlock()
 		return
 	}
 
 	// Rule 3: Always update lastSeen (even if state unchanged)
 	nr.lastSeen[node.NodeId] = time.Now()
 
+	// Track if node transitions to ALIVE for callback
+	becameAlive := false
+
 	// Rule 4: Apply SWIM state update rules
 	if node.Incarnation > existing.Incarnation {
 		// Higher incarnation always wins
+		oldStatus := existing.Status
 		nr.nodes[node.NodeId] = node
+
+		// Check if node became ALIVE
+		if oldStatus != NodeStatus_ALIVE && node.Status == NodeStatus_ALIVE {
+			becameAlive = true
+		}
 	} else if node.Incarnation == existing.Incarnation && nr.shouldEscalate(existing.Status, node.Status) {
 		// Same incarnation: only allow escalation (ALIVE -> SUSPECT -> DEAD)
 		existing.Status = node.Status
 	}
 	// Ignore updates with same/older incarnation that don't escalate
+
+	nr.mu.Unlock()
+
+	// Call callback outside lock to avoid deadlock
+	if becameAlive {
+		nr.callbackMu.RLock()
+		callback := nr.onNodeAliveFunc
+		nr.callbackMu.RUnlock()
+
+		if callback != nil {
+			callback(node)
+		}
+	}
 }
 
 // handleSelfUpdate implements SWIM refutation for local node
@@ -108,10 +133,15 @@ func (nr *NodeRegistry) handleSelfUpdate(node *NodeState) {
 	// If someone claims we're SUSPECT/DEAD, refute by incrementing incarnation
 	if node.Status != NodeStatus_ALIVE && node.Incarnation >= self.Incarnation {
 		self.Incarnation = node.Incarnation + 1
-		self.Status = NodeStatus_ALIVE
-		log.Warn().
+		// Only set to ALIVE if we're not JOINING
+		// JOINING nodes stay JOINING until explicitly promoted
+		if self.Status != NodeStatus_JOINING {
+			self.Status = NodeStatus_ALIVE
+		}
+		log.Debug().
 			Uint64("refuted_incarnation", node.Incarnation).
 			Uint64("new_incarnation", self.Incarnation).
+			Str("current_status", self.Status.String()).
 			Msg("SWIM refutation: rejecting SUSPECT/DEAD claim")
 	}
 }
@@ -326,7 +356,14 @@ func (nr *NodeRegistry) GetLocalSchemaVersions() map[string]uint64 {
 	return nil
 }
 
-// DetectSchemaD rift logs warnings for nodes with different schema versions
+// SetOnNodeAlive sets the callback for when a node becomes ALIVE
+func (nr *NodeRegistry) SetOnNodeAlive(callback func(*NodeState)) {
+	nr.callbackMu.Lock()
+	defer nr.callbackMu.Unlock()
+	nr.onNodeAliveFunc = callback
+}
+
+// DetectSchemaDrift logs warnings for nodes with different schema versions
 func (nr *NodeRegistry) DetectSchemaDrift() {
 	nr.mu.RLock()
 	defer nr.mu.RUnlock()
