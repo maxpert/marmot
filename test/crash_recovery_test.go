@@ -375,6 +375,52 @@ func (h *ClusterHarness) ExecNode(nodeID int, query string, args ...interface{})
 	return db.Exec(query, args...)
 }
 
+// WaitForTableExists waits for a table to be replicated to all nodes
+func (h *ClusterHarness) WaitForTableExists(tableName string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+
+	for _, node := range h.Nodes {
+		nodeID := node.NodeID
+		for time.Now().Before(deadline) {
+			// Use inline value instead of prepared statement
+			query := fmt.Sprintf("SELECT name FROM sqlite_master WHERE type='table' AND name='%s'", tableName)
+			rows, err := h.QueryNode(nodeID, query)
+			if err == nil {
+				var name string
+				found := false
+				if rows.Next() {
+					rows.Scan(&name)
+					found = true
+				}
+				rows.Close()
+				if found {
+					break // Table exists on this node
+				}
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+
+		// Final check
+		query := fmt.Sprintf("SELECT name FROM sqlite_master WHERE type='table' AND name='%s'", tableName)
+		rows, err := h.QueryNode(nodeID, query)
+		if err != nil {
+			return fmt.Errorf("node %d: failed to query table: %v", nodeID, err)
+		}
+		var name string
+		found := false
+		if rows.Next() {
+			rows.Scan(&name)
+			found = true
+		}
+		rows.Close()
+		if !found {
+			return fmt.Errorf("node %d: table %s not replicated within %v", nodeID, tableName, timeout)
+		}
+	}
+
+	return nil
+}
+
 // StartCluster starts all nodes in the cluster
 func (h *ClusterHarness) StartCluster() error {
 	h.t.Logf("Starting %d-node cluster...", numNodes)
@@ -394,6 +440,10 @@ func (h *ClusterHarness) StartCluster() error {
 			return err
 		}
 	}
+
+	// Additional wait for gRPC connections to establish between nodes
+	// This ensures quorum replication is ready before returning
+	time.Sleep(2 * time.Second)
 
 	h.t.Logf("Cluster started successfully")
 	return nil
@@ -438,7 +488,11 @@ func TestNodeRestartWithStaleData(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create table: %v", err)
 	}
-	time.Sleep(1 * time.Second) // Allow DDL to replicate
+
+	// Wait for table to replicate to all nodes
+	if err := harness.WaitForTableExists("test_recovery", 5*time.Second); err != nil {
+		t.Fatalf("Failed to replicate table: %v", err)
+	}
 
 	// Write initial data that replicates to all nodes
 	t.Logf("Writing initial data...")
