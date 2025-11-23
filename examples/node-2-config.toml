@@ -26,12 +26,22 @@ default_write_consistency = "QUORUM"
 default_read_consistency = "LOCAL_ONE"
 write_timeout_ms = 5000
 read_timeout_ms = 2000
+
+# Anti-Entropy: Background healing for eventual consistency
+# - Detects and repairs divergence between replicas
+# - Uses delta sync for small lags, snapshot for large lags
+# - Includes gap detection to prevent incomplete data after GC
 enable_anti_entropy = true
-anti_entropy_interval_seconds = 60
-delta_sync_threshold_transactions = 10000
-delta_sync_threshold_seconds = 3600
-gc_min_retention_hours = 1
-gc_max_retention_hours = 4
+anti_entropy_interval_seconds = 60         # Check every 60 seconds
+delta_sync_threshold_transactions = 10000  # Delta sync if lag < 10K txns
+delta_sync_threshold_seconds = 3600        # Snapshot if lag > 1 hour
+
+# Garbage Collection: Reclaim disk space
+# - gc_min must be >= delta_sync_threshold (validated at startup)
+# - gc_max should be >= 2x delta_sync_threshold (recommended)
+# - Set gc_max = 0 for unlimited retention
+gc_min_retention_hours = 2   # Keep at least 2 hours (>= 1 hour delta threshold)
+gc_max_retention_hours = 24  # Force delete after 24 hours
 
 [connection_pool]
 pool_size = 4
