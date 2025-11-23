@@ -225,11 +225,11 @@ var Config = &Configuration{
 		WriteTimeoutMS:            5000,
 		ReadTimeoutMS:             2000,
 		EnableAntiEntropy:         true,
-		AntiEntropyIntervalS:      60,    // 1 minute (production best practice)
+		AntiEntropyIntervalS:      60,    // 1 minute - continuous background healing (like Riak's 15s)
 		DeltaSyncThresholdTxns:    10000, // Trigger snapshot if lag > 10k transactions
-		DeltaSyncThresholdSeconds: 3600,  // Trigger snapshot if lag > 1 hour
-		GCMinRetentionHours:       1,     // Minimum 1 hour retention for replication
-		GCMaxRetentionHours:       4,     // Force GC after 4 hours (prevent unbounded growth)
+		DeltaSyncThresholdSeconds: 3600,  // 1 hour - trigger snapshot after this (like Cassandra's daily repair)
+		GCMinRetentionHours:       2,     // 2 hours - MUST be >= 2x delta threshold (safety margin)
+		GCMaxRetentionHours:       24,    // 24 hours - 24x delta threshold (like Cassandra's 10-day gc_grace)
 	},
 
 	MVCC: MVCCConfiguration{
@@ -440,6 +440,53 @@ func Validate() error {
 
 	if Config.Coordinator.AbortTimeoutMS < 1 {
 		return fmt.Errorf("coordinator abort timeout must be >= 1ms")
+	}
+
+	// Validate anti-entropy and GC parameter alignment (fail-fast)
+	// Critical: GC must retain data longer than anti-entropy thresholds to enable snapshot recovery
+	if Config.Replication.EnableAntiEntropy {
+		deltaSyncThresholdHours := float64(Config.Replication.DeltaSyncThresholdSeconds) / 3600.0
+
+		// Rule 1: GC min retention must be at least as long as delta sync threshold
+		// This ensures nodes within the threshold window can use delta sync
+		if float64(Config.Replication.GCMinRetentionHours) < deltaSyncThresholdHours {
+			return fmt.Errorf(
+				"gc_min_retention_hours (%d) must be >= delta_sync_threshold_seconds in hours (%.1f). "+
+					"GC cannot delete data needed for delta sync. "+
+					"Recommendation: set gc_min_retention_hours to %d",
+				Config.Replication.GCMinRetentionHours,
+				deltaSyncThresholdHours,
+				int(deltaSyncThresholdHours)+1,
+			)
+		}
+
+		// Rule 2: GC max retention should be at least 2x delta sync threshold
+		// This provides safety margin for nodes that are slightly delayed
+		// UNLESS gc_max_retention_hours is 0 (unlimited)
+		if Config.Replication.GCMaxRetentionHours > 0 {
+			minRecommendedMaxRetention := deltaSyncThresholdHours * 2.0
+			if float64(Config.Replication.GCMaxRetentionHours) < minRecommendedMaxRetention {
+				return fmt.Errorf(
+					"gc_max_retention_hours (%d) should be at least 2x delta_sync_threshold_seconds in hours (%.1f). "+
+						"Current ratio: %.1fx. This prevents snapshot recovery if nodes are down longer than expected. "+
+						"Recommendation: set gc_max_retention_hours to at least %d (or disable force GC with value 0)",
+					Config.Replication.GCMaxRetentionHours,
+					minRecommendedMaxRetention,
+					float64(Config.Replication.GCMaxRetentionHours)/deltaSyncThresholdHours,
+					int(minRecommendedMaxRetention)+1,
+				)
+			}
+
+			// Rule 3: GC min must be strictly less than GC max (when max > 0)
+			if Config.Replication.GCMinRetentionHours >= Config.Replication.GCMaxRetentionHours {
+				return fmt.Errorf(
+					"gc_min_retention_hours (%d) must be < gc_max_retention_hours (%d). "+
+						"Set gc_max_retention_hours to 0 for unlimited retention, or increase it above gc_min_retention_hours",
+					Config.Replication.GCMinRetentionHours,
+					Config.Replication.GCMaxRetentionHours,
+				)
+			}
+		}
 	}
 
 	return nil
