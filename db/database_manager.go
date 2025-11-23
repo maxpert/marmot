@@ -531,6 +531,11 @@ func (dm *DatabaseManager) TakeSnapshot() ([]SnapshotInfo, uint64, error) {
 
 	// Checkpoint and get info for all user databases
 	for name, db := range dm.databases {
+		// Skip system database (already handled above)
+		if name == SystemDatabaseName {
+			continue
+		}
+
 		if err := dm.checkpointDatabase(db); err != nil {
 			log.Warn().Err(err).Str("database", name).Msg("Failed to checkpoint database")
 			continue
