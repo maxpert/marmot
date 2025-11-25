@@ -57,7 +57,7 @@ func (c *Client) Connect(nodeID uint64, address string) error {
 		keepaliveTimeout = time.Duration(cfg.Config.GRPCClient.KeepaliveTimeoutSeconds) * time.Second
 	}
 
-	// Create connection with keepalive
+	// Create connection with keepalive and auth interceptors
 	conn, err := grpc.NewClient(
 		address,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
@@ -70,6 +70,8 @@ func (c *Client) Connect(nodeID uint64, address string) error {
 			grpc.MaxCallRecvMsgSize(100*1024*1024), // 100MB
 			grpc.MaxCallSendMsgSize(100*1024*1024),
 		),
+		grpc.WithChainUnaryInterceptor(UnaryClientInterceptor()),
+		grpc.WithChainStreamInterceptor(StreamClientInterceptor()),
 	)
 	if err != nil {
 		return fmt.Errorf("failed to connect to node %d: %w", nodeID, err)

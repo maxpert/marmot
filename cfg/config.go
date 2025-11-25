@@ -76,6 +76,7 @@ type ClusterConfiguration struct {
 	GRPCAdvertiseAddress string                    `toml:"grpc_advertise_address"` // Address other nodes use to connect (defaults to hostname:port)
 	GRPCPort             int                       `toml:"grpc_port"`
 	SeedNodes            []string                  `toml:"seed_nodes"`
+	ClusterSecret        string                    `toml:"cluster_secret"` // PSK for cluster authentication (env: MARMOT_CLUSTER_SECRET)
 	GossipIntervalMS     int                       `toml:"gossip_interval_ms"`
 	GossipFanout         int                       `toml:"gossip_fanout"`
 	SuspectTimeoutMS     int                       `toml:"suspect_timeout_ms"`
@@ -317,6 +318,11 @@ func Load(configPath string) error {
 		Config.MySQL.Port = *MySQLPortFlag
 	}
 
+	// Environment variable override for cluster secret (takes precedence over config)
+	if envSecret := os.Getenv("MARMOT_CLUSTER_SECRET"); envSecret != "" {
+		Config.Cluster.ClusterSecret = envSecret
+	}
+
 	// Auto-generate node ID if not set
 	if Config.NodeID == 0 {
 		var err error
@@ -509,4 +515,14 @@ func Validate() error {
 // GetSeqMapPath returns the path to the sequence map file (legacy, may remove)
 func GetSeqMapPath() string {
 	return path.Join(Config.DataDir, "seq-map.cbor")
+}
+
+// IsClusterAuthEnabled returns true if cluster authentication is configured
+func IsClusterAuthEnabled() bool {
+	return Config.Cluster.ClusterSecret != ""
+}
+
+// GetClusterSecret returns the cluster secret for PSK authentication
+func GetClusterSecret() string {
+	return Config.Cluster.ClusterSecret
 }

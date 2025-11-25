@@ -53,6 +53,12 @@ func main() {
 	}
 
 	log.Info().Msg("Marmot v2.0 - Leaderless SQLite Replication")
+
+	// Warn if cluster authentication is not configured
+	if !cfg.IsClusterAuthEnabled() {
+		log.Warn().Msg("WARNING: Cluster authentication is disabled. Set cluster_secret in config or MARMOT_CLUSTER_SECRET env var for production use.")
+	}
+
 	log.Debug().Msg("Initializing telemetry")
 	telemetry.InitializeTelemetry()
 

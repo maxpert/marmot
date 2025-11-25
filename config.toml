@@ -52,6 +52,12 @@ grpc_port = 8080
 # Example: ["node1.example.com:8080", "node2.example.com:8080"]
 seed_nodes = []
 
+# Cluster authentication secret (PSK)
+# All nodes in the cluster must use the same secret
+# Can also be set via MARMOT_CLUSTER_SECRET environment variable (takes precedence)
+# Leave empty to disable authentication (NOT recommended for production)
+cluster_secret = ""
+
 # Gossip protocol interval (milliseconds)
 gossip_interval_ms = 1000
 

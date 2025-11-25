@@ -375,11 +375,46 @@ abort_timeout_ms = 2000   # Abort phase timeout
 grpc_bind_address = "0.0.0.0"
 grpc_port = 8080
 seed_nodes = []                # List of seed node addresses
+cluster_secret = ""            # PSK for cluster authentication (see Security section)
 gossip_interval_ms = 1000      # Gossip interval
 gossip_fanout = 3              # Number of peers to gossip to
 suspect_timeout_ms = 5000      # Suspect timeout
 dead_timeout_ms = 10000        # Dead timeout
 ```
+
+### Security
+
+Marmot supports Pre-Shared Key (PSK) authentication for cluster communication. **This is strongly recommended for production deployments.**
+
+```toml
+[cluster]
+# All nodes in the cluster must use the same secret
+cluster_secret = "your-secret-key-here"
+```
+
+**Environment Variable (Recommended):**
+
+For production, use the environment variable to avoid storing secrets in config files:
+
+```bash
+export MARMOT_CLUSTER_SECRET="your-secret-key-here"
+./marmot
+```
+
+The environment variable takes precedence over the config file.
+
+**Generating a Secret:**
+
+```bash
+# Generate a secure random secret
+openssl rand -base64 32
+```
+
+**Behavior:**
+- If `cluster_secret` is empty and `MARMOT_CLUSTER_SECRET` is not set, authentication is disabled
+- A warning is logged at startup when authentication is disabled
+- All gRPC endpoints (gossip, replication, snapshots) are protected when authentication is enabled
+- Nodes with mismatched secrets will fail to communicate (connection rejected with "invalid cluster secret")
 
 ### Replication
 

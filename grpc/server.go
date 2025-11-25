@@ -132,6 +132,8 @@ func (s *Server) Start() error {
 			Time:    60 * time.Second, // Ping client if no activity for 60s
 			Timeout: 10 * time.Second, // Wait 10s for ping ack before closing connection
 		}),
+		grpc.ChainUnaryInterceptor(UnaryServerInterceptor()),
+		grpc.ChainStreamInterceptor(StreamServerInterceptor()),
 	)
 
 	// Register service
