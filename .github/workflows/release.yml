@@ -59,9 +59,9 @@ jobs:
     steps:
       - uses: actions/checkout@v3
 
-      - uses: actions/setup-go@v4
+      - uses: actions/setup-go@v5
         with:
-          go-version: '^1.21.3'
+          go-version: '^1.23'
 
       - name: Install cross-compilers
         run: |
@@ -80,23 +80,12 @@ jobs:
           path: marmot-${{ env.VERSION }}-${{ env.GOOS }}-${{ env.GOARCH }}${{ env.GOARM }}${{ env.SUFFIX }}.tar.gz
           if-no-files-found: error
 
-      - name: Get release
-        id: release
-        uses: bruceadams/get-release@v1.2.3
-        if: github.event_name == 'release'
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-
       - name: Upload release tarball
-        uses: actions/upload-release-asset@v1.0.2
+        uses: softprops/action-gh-release@v2
         if: github.event_name == 'release'
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
         with:
-          upload_url: ${{ steps.release.outputs.upload_url }}
-          asset_path: marmot-${{ env.VERSION }}-${{ env.GOOS }}-${{ env.GOARCH }}${{ env.GOARM }}${{ env.SUFFIX }}.tar.gz
-          asset_name: marmot-${{ env.VERSION }}-${{ env.GOOS }}-${{ env.GOARCH }}${{ env.GOARM }}${{ env.SUFFIX }}.tar.gz
-          asset_content_type: application/gzip
+          files: marmot-${{ env.VERSION }}-${{ env.GOOS }}-${{ env.GOARCH }}${{ env.GOARM }}${{ env.SUFFIX }}.tar.gz
+
   mac-build:
     runs-on: macos-latest
     strategy:
@@ -117,9 +106,9 @@ jobs:
     steps:
       - uses: actions/checkout@v3
 
-      - uses: actions/setup-go@v4
+      - uses: actions/setup-go@v5
         with:
-          go-version: '^1.21.3'
+          go-version: '^1.23'
 
       - name: Build marmot
         run: |
@@ -133,20 +122,8 @@ jobs:
           path: marmot-${{ env.VERSION }}-${{ env.GOOS }}-${{ env.GOARCH }}${{ env.SUFFIX }}.tar.gz
           if-no-files-found: error
 
-      - name: Get release
-        id: release
-        uses: bruceadams/get-release@v1.2.3
-        if: github.event_name == 'release'
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-
       - name: Upload release tarball
-        uses: actions/upload-release-asset@v1.0.2
+        uses: softprops/action-gh-release@v2
         if: github.event_name == 'release'
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
         with:
-          upload_url: ${{ steps.release.outputs.upload_url }}
-          asset_path: marmot-${{ env.VERSION }}-${{ env.GOOS }}-${{ env.GOARCH }}${{ env.SUFFIX }}.tar.gz
-          asset_name: marmot-${{ env.VERSION }}-${{ env.GOOS }}-${{ env.GOARCH }}${{ env.SUFFIX }}.tar.gz
-          asset_content_type: application/gzip
+          files: marmot-${{ env.VERSION }}-${{ env.GOOS }}-${{ env.GOARCH }}${{ env.SUFFIX }}.tar.gz

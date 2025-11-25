@@ -21,7 +21,7 @@ data_dir = "./marmot-data"
 gc_interval_seconds = 30
 
 # How long to retain old transaction records (hours)
-gc_retention_hours = 1
+gc_retention_hours = 2
 
 # Transaction timeout without heartbeat (seconds)
 heartbeat_timeout_seconds = 10
@@ -100,11 +100,12 @@ delta_sync_threshold_seconds = 3600
 
 # Minimum GC retention (hours)
 # Transaction logs kept for at least this long to support replication catch-up
-gc_min_retention_hours = 1
+# Must be >= delta_sync_threshold_seconds / 3600
+gc_min_retention_hours = 2
 
 # Maximum GC retention (hours)
 # Force GC after this duration even if peers lagging (prevents unbounded growth)
-gc_max_retention_hours = 4
+gc_max_retention_hours = 24
 
 # ==============================================================================
 # CONNECTION POOL
@@ -175,10 +176,10 @@ enable_idempotent = true
 enabled = true
 
 # Address to bind MySQL server (0.0.0.0 = all interfaces)
-bind_address = "0.0.0.0"
+bind_address = "127.0.0.1"
 
 # MySQL protocol port
-port = 3306
+port = 3307
 
 # Maximum concurrent MySQL connections
 max_connections = 1000
@@ -212,7 +213,7 @@ incremental_threshold = 10000
 
 [logging]
 # Enable verbose debug logging
-verbose = true
+verbose = false
 
 # Log format: "console" (human-readable) or "json" (structured)
 format = "console"
