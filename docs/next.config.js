@@ -5,6 +5,10 @@
 const nextConfig = {
   reactStrictMode: true,
   basePath: "/marmot",
+  output: "export",
+  images: {
+    unoptimized: true,
+  },
 };
 
 const withNextra = require("nextra")({
