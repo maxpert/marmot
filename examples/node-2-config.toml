@@ -10,6 +10,7 @@ gc_retention_hours = 1
 heartbeat_timeout_seconds = 10
 version_retention_count = 10
 conflict_window_seconds = 10
+lock_wait_timeout_seconds = 50  # How long to wait for locks (MySQL: innodb_lock_wait_timeout)
 
 [cluster]
 grpc_bind_address = "0.0.0.0"
@@ -58,6 +59,10 @@ retry_backoff_ms = 100
 prepare_timeout_ms = 2000
 commit_timeout_ms = 2000
 abort_timeout_ms = 2000
+
+[query_pipeline]
+transpiler_cache_size = 10000       # LRU cache for MySQL→SQLite transpilation (default: 10000)
+validator_pool_size = 8             # SQLite connection pool for validation (default: 8)
 
 [mysql]
 enabled = true

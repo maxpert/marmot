@@ -1,6 +1,7 @@
 package db
 
 import (
+	"database/sql"
 	"fmt"
 	"io"
 	"os"
@@ -287,6 +288,15 @@ func (dm *DatabaseManager) GetDatabase(name string) (*MVCCDatabase, error) {
 	return db, nil
 }
 
+// GetDatabaseConnection returns the *sql.DB for a database
+func (dm *DatabaseManager) GetDatabaseConnection(name string) (*sql.DB, error) {
+	mvccDB, err := dm.GetDatabase(name)
+	if err != nil {
+		return nil, err
+	}
+	return mvccDB.GetDB(), nil
+}
+
 // DatabaseExists checks if a database exists
 func (dm *DatabaseManager) DatabaseExists(name string) bool {
 	dm.mu.RLock()
@@ -340,6 +350,50 @@ func (dm *DatabaseManager) Close() error {
 
 	log.Info().Msg("DatabaseManager closed")
 	return lastErr
+}
+
+// ReopenDatabase closes and reopens a specific database connection.
+// This is used after a snapshot is applied to reload the new database file.
+func (dm *DatabaseManager) ReopenDatabase(name string) error {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+
+	// Get the existing database
+	db, exists := dm.databases[name]
+	if !exists {
+		return fmt.Errorf("database %s does not exist", name)
+	}
+
+	// Get the path from system database before closing
+	var dbPath string
+	err := dm.systemDB.GetDB().QueryRow(
+		"SELECT path FROM __marmot_databases WHERE name = ?", name,
+	).Scan(&dbPath)
+	if err != nil {
+		return fmt.Errorf("failed to get database path: %w", err)
+	}
+
+	// Close the current database connection
+	log.Info().Str("name", name).Msg("Closing database for snapshot reload")
+	if err := db.Close(); err != nil {
+		log.Warn().Err(err).Str("name", name).Msg("Error closing database during reopen")
+	}
+
+	// Reopen the database with the same path
+	fullPath := filepath.Join(dm.dataDir, dbPath)
+	newDB, err := NewMVCCDatabase(fullPath, dm.nodeID, dm.clock)
+	if err != nil {
+		return fmt.Errorf("failed to reopen database %s: %w", name, err)
+	}
+
+	// Wire up GC coordination
+	dm.wireGCCoordination(newDB, name)
+
+	// Update the map
+	dm.databases[name] = newDB
+
+	log.Info().Str("name", name).Msg("Database reopened after snapshot")
+	return nil
 }
 
 // MigrateFromLegacy migrates from single database to multi-database structure
@@ -720,8 +774,9 @@ func (dm *DatabaseManager) GetMinAppliedTxnID(database string) (uint64, error) {
 	return minTxnID, err
 }
 
-// GetMaxTxnID returns the maximum transaction ID in a database
-// This is used to calculate replication lag
+// GetMaxTxnID returns the maximum COMMITTED transaction ID in a database
+// This is used to calculate replication lag and peer selection for anti-entropy
+// Only committed transactions are considered to ensure consistency with snapshots
 func (dm *DatabaseManager) GetMaxTxnID(database string) (uint64, error) {
 	dm.mu.RLock()
 	defer dm.mu.RUnlock()
@@ -735,7 +790,29 @@ func (dm *DatabaseManager) GetMaxTxnID(database string) (uint64, error) {
 	err := db.GetDB().QueryRow(`
 		SELECT COALESCE(MAX(txn_id), 0)
 		FROM __marmot__txn_records
+		WHERE status = 'COMMITTED'
 	`).Scan(&maxTxnID)
 
 	return maxTxnID, err
+}
+
+// GetCommittedTxnCount returns the count of committed transactions in a database
+// This is used by anti-entropy to compare data completeness between nodes
+func (dm *DatabaseManager) GetCommittedTxnCount(database string) (int64, error) {
+	dm.mu.RLock()
+	defer dm.mu.RUnlock()
+
+	db, ok := dm.databases[database]
+	if !ok {
+		return 0, fmt.Errorf("database %s not found", database)
+	}
+
+	var count int64
+	err := db.GetDB().QueryRow(`
+		SELECT COUNT(*)
+		FROM __marmot__txn_records
+		WHERE status = 'COMMITTED'
+	`).Scan(&count)
+
+	return count, err
 }

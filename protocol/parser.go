@@ -3,7 +3,18 @@ package protocol
 import (
 	"regexp"
 	"strings"
+
+	"github.com/maxpert/marmot/protocol/query"
+	"github.com/rs/zerolog/log"
 )
+
+// truncateSQLForLog returns first n chars of SQL for logging
+func truncateSQLForLog(sql string, n int) string {
+	if len(sql) <= n {
+		return sql
+	}
+	return sql[:n] + "..."
+}
 
 var (
 	// Consistency hint pattern: /*+ CONSISTENCY(LEVEL) */
@@ -36,28 +47,28 @@ var (
 	loadXMLPattern = regexp.MustCompile(`(?i)^\s*LOAD\s+XML\s+`)
 
 	// DDL patterns for MySQL-specific objects not in Vitess
-	createTriggerPattern      = regexp.MustCompile(`(?i)^\s*CREATE\s+TRIGGER\s+`)
-	dropTriggerPattern        = regexp.MustCompile(`(?i)^\s*DROP\s+TRIGGER\s+`)
-	createProcedurePattern    = regexp.MustCompile(`(?i)^\s*CREATE\s+PROCEDURE\s+`)
-	dropProcedurePattern      = regexp.MustCompile(`(?i)^\s*DROP\s+PROCEDURE\s+`)
-	alterProcedurePattern     = regexp.MustCompile(`(?i)^\s*ALTER\s+PROCEDURE\s+`)
-	createFunctionPattern     = regexp.MustCompile(`(?i)^\s*CREATE\s+FUNCTION\s+`)
-	dropFunctionPattern       = regexp.MustCompile(`(?i)^\s*DROP\s+FUNCTION\s+`)
-	alterFunctionPattern      = regexp.MustCompile(`(?i)^\s*ALTER\s+FUNCTION\s+`)
-	createEventPattern        = regexp.MustCompile(`(?i)^\s*CREATE\s+EVENT\s+`)
-	dropEventPattern          = regexp.MustCompile(`(?i)^\s*DROP\s+EVENT\s+`)
-	alterEventPattern         = regexp.MustCompile(`(?i)^\s*ALTER\s+EVENT\s+`)
-	createTablespacePattern   = regexp.MustCompile(`(?i)^\s*CREATE\s+TABLESPACE\s+`)
-	dropTablespacePattern     = regexp.MustCompile(`(?i)^\s*DROP\s+TABLESPACE\s+`)
-	alterTablespacePattern    = regexp.MustCompile(`(?i)^\s*ALTER\s+TABLESPACE\s+`)
-	createLogfileGroupPattern = regexp.MustCompile(`(?i)^\s*CREATE\s+LOGFILE\s+GROUP\s+`)
-	dropLogfileGroupPattern   = regexp.MustCompile(`(?i)^\s*DROP\s+LOGFILE\s+GROUP\s+`)
-	alterLogfileGroupPattern  = regexp.MustCompile(`(?i)^\s*ALTER\s+LOGFILE\s+GROUP\s+`)
-	createServerPattern       = regexp.MustCompile(`(?i)^\s*CREATE\s+SERVER\s+`)
-	dropServerPattern         = regexp.MustCompile(`(?i)^\s*DROP\s+SERVER\s+`)
-	alterServerPattern        = regexp.MustCompile(`(?i)^\s*ALTER\s+SERVER\s+`)
-	createSpatialRefPattern   = regexp.MustCompile(`(?i)^\s*CREATE\s+SPATIAL\s+REFERENCE\s+SYSTEM\s+`)
-	dropSpatialRefPattern     = regexp.MustCompile(`(?i)^\s*DROP\s+SPATIAL\s+REFERENCE\s+SYSTEM\s+`)
+	createTriggerPattern       = regexp.MustCompile(`(?i)^\s*CREATE\s+TRIGGER\s+`)
+	dropTriggerPattern         = regexp.MustCompile(`(?i)^\s*DROP\s+TRIGGER\s+`)
+	createProcedurePattern     = regexp.MustCompile(`(?i)^\s*CREATE\s+PROCEDURE\s+`)
+	dropProcedurePattern       = regexp.MustCompile(`(?i)^\s*DROP\s+PROCEDURE\s+`)
+	alterProcedurePattern      = regexp.MustCompile(`(?i)^\s*ALTER\s+PROCEDURE\s+`)
+	createFunctionPattern      = regexp.MustCompile(`(?i)^\s*CREATE\s+FUNCTION\s+`)
+	dropFunctionPattern        = regexp.MustCompile(`(?i)^\s*DROP\s+FUNCTION\s+`)
+	alterFunctionPattern       = regexp.MustCompile(`(?i)^\s*ALTER\s+FUNCTION\s+`)
+	createEventPattern         = regexp.MustCompile(`(?i)^\s*CREATE\s+EVENT\s+`)
+	dropEventPattern           = regexp.MustCompile(`(?i)^\s*DROP\s+EVENT\s+`)
+	alterEventPattern          = regexp.MustCompile(`(?i)^\s*ALTER\s+EVENT\s+`)
+	createTablespacePattern    = regexp.MustCompile(`(?i)^\s*CREATE\s+TABLESPACE\s+`)
+	dropTablespacePattern      = regexp.MustCompile(`(?i)^\s*DROP\s+TABLESPACE\s+`)
+	alterTablespacePattern     = regexp.MustCompile(`(?i)^\s*ALTER\s+TABLESPACE\s+`)
+	createLogfileGroupPattern  = regexp.MustCompile(`(?i)^\s*CREATE\s+LOGFILE\s+GROUP\s+`)
+	dropLogfileGroupPattern    = regexp.MustCompile(`(?i)^\s*DROP\s+LOGFILE\s+GROUP\s+`)
+	alterLogfileGroupPattern   = regexp.MustCompile(`(?i)^\s*ALTER\s+LOGFILE\s+GROUP\s+`)
+	createServerPattern        = regexp.MustCompile(`(?i)^\s*CREATE\s+SERVER\s+`)
+	dropServerPattern          = regexp.MustCompile(`(?i)^\s*DROP\s+SERVER\s+`)
+	alterServerPattern         = regexp.MustCompile(`(?i)^\s*ALTER\s+SERVER\s+`)
+	createSpatialRefPattern    = regexp.MustCompile(`(?i)^\s*CREATE\s+SPATIAL\s+REFERENCE\s+SYSTEM\s+`)
+	dropSpatialRefPattern      = regexp.MustCompile(`(?i)^\s*DROP\s+SPATIAL\s+REFERENCE\s+SYSTEM\s+`)
 	createResourceGroupPattern = regexp.MustCompile(`(?i)^\s*CREATE\s+RESOURCE\s+GROUP\s+`)
 	dropResourceGroupPattern   = regexp.MustCompile(`(?i)^\s*DROP\s+RESOURCE\s+GROUP\s+`)
 	alterResourceGroupPattern  = regexp.MustCompile(`(?i)^\s*ALTER\s+RESOURCE\s+GROUP\s+`)
@@ -78,14 +89,61 @@ var (
 	setDefaultRolePattern = regexp.MustCompile(`(?i)^\s*SET\s+DEFAULT\s+ROLE\s+`)
 )
 
+var globalPipeline *query.Pipeline
+
+func InitializePipeline(cacheSize, poolSize int) error {
+	var err error
+	globalPipeline, err = query.NewPipeline(cacheSize, poolSize)
+	return err
+}
+
 // ParseStatement analyzes a SQL statement and returns its type and metadata
-// Now uses Vitess sqlparser for production-grade MySQL compatibility
+// Now uses the new clean layered architecture with caching
 func ParseStatement(sql string) Statement {
-	// Use Vitess parser as primary
-	stmt := ParseStatementVitess(sql)
-	// Normalize SQL for SQLite compatibility
-	stmt.SQL = NormalizeSQLForSQLite(stmt.SQL)
+	ctx := query.NewContext(sql, nil)
+
+	if err := globalPipeline.Process(ctx); err != nil {
+		// Log parsing failures for debugging
+		log.Debug().
+			Err(err).
+			Str("sql_prefix", truncateSQLForLog(sql, 80)).
+			Msg("PARSE: Pipeline processing failed")
+		return Statement{
+			SQL:   sql,
+			Type:  StatementUnsupported,
+			Error: err.Error(),
+		}
+	}
+
+	stmt := Statement{
+		SQL:       ctx.TranspiledSQL,
+		Type:      mapQueryTypeToProtocolType(ctx.StatementType),
+		TableName: ctx.TableName,
+		Database:  ctx.Database,
+		// Use CDC-extracted row key from context (extracted before transpilation)
+		RowKey: ctx.CDCRowKey,
+		Error: func() string {
+			if ctx.ValidationErr != nil {
+				return ctx.ValidationErr.Error()
+			}
+			return ""
+		}(),
+		// Populate CDC data from context (extracted in pipeline before transpilation)
+		OldValues: ctx.CDCOldValues,
+		NewValues: ctx.CDCNewValues,
+	}
+
 	return stmt
+}
+
+// mapQueryTypeToProtocolType converts query.StatementType to protocol.StatementType
+// These two enums have the same constant names but live in different packages
+func mapQueryTypeToProtocolType(qt query.StatementType) StatementType {
+	// Both enums are defined in the same order with the same names
+	// query.StatementInsert = 0, protocol.StatementInsert = 0
+	// query.StatementReplace = 1, protocol.StatementReplace = 1
+	// etc.
+	return StatementType(qt)
 }
 
 // NormalizeSQLForSQLite converts MySQL-style SQL to SQLite-compatible SQL
@@ -103,7 +161,6 @@ func NormalizeSQLForSQLite(sql string) string {
 
 	return sql
 }
-
 
 // extractTableName extracts table name using a regex pattern
 func extractTableName(sql, pattern string) string {

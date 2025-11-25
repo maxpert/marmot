@@ -66,36 +66,36 @@ type PromotionConfiguration struct {
 
 // BackpressureConfiguration controls snapshot streaming backpressure
 type BackpressureConfiguration struct {
-	MaxQueueDepth   int `toml:"max_queue_depth"`    // Max apply queue depth before pausing
-	CheckIntervalMS int `toml:"check_interval_ms"`  // How often to check queue depth
+	MaxQueueDepth   int `toml:"max_queue_depth"`   // Max apply queue depth before pausing
+	CheckIntervalMS int `toml:"check_interval_ms"` // How often to check queue depth
 }
 
 // ClusterConfiguration controls cluster membership and communication
 type ClusterConfiguration struct {
-	GRPCBindAddress      string                     `toml:"grpc_bind_address"`
-	GRPCAdvertiseAddress string                     `toml:"grpc_advertise_address"` // Address other nodes use to connect (defaults to hostname:port)
-	GRPCPort             int                        `toml:"grpc_port"`
-	SeedNodes            []string                   `toml:"seed_nodes"`
-	GossipIntervalMS     int                        `toml:"gossip_interval_ms"`
-	GossipFanout         int                        `toml:"gossip_fanout"`
-	SuspectTimeoutMS     int                        `toml:"suspect_timeout_ms"`
-	DeadTimeoutMS        int                        `toml:"dead_timeout_ms"`
-	Promotion            PromotionConfiguration     `toml:"promotion"`
-	Backpressure         BackpressureConfiguration  `toml:"backpressure"`
+	GRPCBindAddress      string                    `toml:"grpc_bind_address"`
+	GRPCAdvertiseAddress string                    `toml:"grpc_advertise_address"` // Address other nodes use to connect (defaults to hostname:port)
+	GRPCPort             int                       `toml:"grpc_port"`
+	SeedNodes            []string                  `toml:"seed_nodes"`
+	GossipIntervalMS     int                       `toml:"gossip_interval_ms"`
+	GossipFanout         int                       `toml:"gossip_fanout"`
+	SuspectTimeoutMS     int                       `toml:"suspect_timeout_ms"`
+	DeadTimeoutMS        int                       `toml:"dead_timeout_ms"`
+	Promotion            PromotionConfiguration    `toml:"promotion"`
+	Backpressure         BackpressureConfiguration `toml:"backpressure"`
 }
 
 // ReplicationConfiguration controls replication behavior
 type ReplicationConfiguration struct {
-	DefaultWriteConsist          string `toml:"default_write_consistency"`
-	DefaultReadConsist           string `toml:"default_read_consistency"`
-	WriteTimeoutMS               int    `toml:"write_timeout_ms"`
-	ReadTimeoutMS                int    `toml:"read_timeout_ms"`
-	EnableAntiEntropy            bool   `toml:"enable_anti_entropy"`
-	AntiEntropyIntervalS         int    `toml:"anti_entropy_interval_seconds"`
-	DeltaSyncThresholdTxns       int    `toml:"delta_sync_threshold_transactions"`
-	DeltaSyncThresholdSeconds    int    `toml:"delta_sync_threshold_seconds"`
-	GCMinRetentionHours          int    `toml:"gc_min_retention_hours"`
-	GCMaxRetentionHours          int    `toml:"gc_max_retention_hours"`
+	DefaultWriteConsist       string `toml:"default_write_consistency"`
+	DefaultReadConsist        string `toml:"default_read_consistency"`
+	WriteTimeoutMS            int    `toml:"write_timeout_ms"`
+	ReadTimeoutMS             int    `toml:"read_timeout_ms"`
+	EnableAntiEntropy         bool   `toml:"enable_anti_entropy"`
+	AntiEntropyIntervalS      int    `toml:"anti_entropy_interval_seconds"`
+	DeltaSyncThresholdTxns    int    `toml:"delta_sync_threshold_transactions"`
+	DeltaSyncThresholdSeconds int    `toml:"delta_sync_threshold_seconds"`
+	GCMinRetentionHours       int    `toml:"gc_min_retention_hours"`
+	GCMaxRetentionHours       int    `toml:"gc_max_retention_hours"`
 }
 
 // MySQLConfiguration for MySQL wire protocol server
@@ -125,6 +125,7 @@ type MVCCConfiguration struct {
 	HeartbeatTimeoutSeconds int `toml:"heartbeat_timeout_seconds"` // Transaction timeout without heartbeat
 	VersionRetentionCount   int `toml:"version_retention_count"`   // How many MVCC versions to keep per row
 	ConflictWindowSeconds   int `toml:"conflict_window_seconds"`   // LWW conflict resolution window
+	LockWaitTimeoutSeconds  int `toml:"lock_wait_timeout_seconds"` // How long to wait for locks (MySQL: innodb_lock_wait_timeout)
 }
 
 // ConnectionPoolConfiguration controls database connection pooling
@@ -155,6 +156,12 @@ type DDLConfiguration struct {
 	EnableIdempotent bool `toml:"enable_idempotent"`  // Automatically rewrite DDL for idempotency
 }
 
+// QueryPipelineConfiguration controls query processing pipeline
+type QueryPipelineConfiguration struct {
+	TranspilerCacheSize int `toml:"transpiler_cache_size"` // LRU cache size for transpiled queries
+	ValidatorPoolSize   int `toml:"validator_pool_size"`   // SQLite connection pool size for validation
+}
+
 // Configuration is the main configuration structure
 type Configuration struct {
 	NodeID  uint64 `toml:"node_id"`
@@ -168,6 +175,7 @@ type Configuration struct {
 	GRPCClient     GRPCClientConfiguration     `toml:"grpc_client"`
 	Coordinator    CoordinatorConfiguration    `toml:"coordinator"`
 	DDL            DDLConfiguration            `toml:"ddl"`
+	QueryPipeline  QueryPipelineConfiguration  `toml:"query_pipeline"`
 	MySQL          MySQLConfiguration          `toml:"mysql"`
 	Logging        LoggingConfiguration        `toml:"logging"`
 	Prometheus     PrometheusConfiguration     `toml:"prometheus"`
@@ -237,6 +245,7 @@ var Config = &Configuration{
 		HeartbeatTimeoutSeconds: 10, // Timeout transactions after 10s without heartbeat
 		VersionRetentionCount:   10, // Keep last 10 MVCC versions per row
 		ConflictWindowSeconds:   10, // 10 second window for LWW conflict resolution
+		LockWaitTimeoutSeconds:  50, // MySQL default: innodb_lock_wait_timeout
 	},
 
 	ConnectionPool: ConnectionPoolConfiguration{
@@ -259,7 +268,7 @@ var Config = &Configuration{
 	},
 
 	DDL: DDLConfiguration{
-		LockLeaseSeconds: 30,  // 30 second DDL lock lease
+		LockLeaseSeconds: 30,   // 30 second DDL lock lease
 		EnableIdempotent: true, // Auto-rewrite DDL for idempotency
 	},
 
@@ -316,6 +325,14 @@ func Load(configPath string) error {
 			return fmt.Errorf("failed to generate node ID: %w", err)
 		}
 		log.Info().Uint64("node_id", Config.NodeID).Msg("Auto-generated node ID")
+	}
+
+	// Set query pipeline defaults if not configured
+	if Config.QueryPipeline.TranspilerCacheSize == 0 {
+		Config.QueryPipeline.TranspilerCacheSize = 10000
+	}
+	if Config.QueryPipeline.ValidatorPoolSize == 0 {
+		Config.QueryPipeline.ValidatorPoolSize = 8
 	}
 
 	// Ensure data directory exists

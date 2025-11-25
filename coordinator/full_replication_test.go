@@ -45,62 +45,6 @@ func (m *mockNodeProvider) RemoveNode(nodeID uint64) {
 	}
 }
 
-// mockReplicator implements Replicator for testing
-type mockReplicator struct {
-	responses      map[uint64]*ReplicationResponse
-	callCount      int
-	prepareLatency time.Duration
-	commitLatency  time.Duration
-	mu             sync.Mutex
-}
-
-func newMockReplicator() *mockReplicator {
-	return &mockReplicator{
-		responses:      make(map[uint64]*ReplicationResponse),
-		prepareLatency: 10 * time.Millisecond,
-		commitLatency:  5 * time.Millisecond,
-	}
-}
-
-func (m *mockReplicator) ReplicateTransaction(ctx context.Context, nodeID uint64, req *ReplicationRequest) (*ReplicationResponse, error) {
-	m.mu.Lock()
-	m.callCount++
-	m.mu.Unlock()
-
-	// Simulate network latency
-	if req.Phase == PhasePrep {
-		time.Sleep(m.prepareLatency)
-	} else if req.Phase == PhaseCommit {
-		time.Sleep(m.commitLatency)
-	}
-
-	// Check if we have a pre-configured response for this node
-	m.mu.Lock()
-	resp, exists := m.responses[nodeID]
-	m.mu.Unlock()
-
-	if exists {
-		return resp, nil
-	}
-
-	// Default: success
-	return &ReplicationResponse{
-		Success: true,
-	}, nil
-}
-
-func (m *mockReplicator) SetNodeResponse(nodeID uint64, resp *ReplicationResponse) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.responses[nodeID] = resp
-}
-
-func (m *mockReplicator) GetCallCount() int {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.callCount
-}
-
 // TestFullReplication_QuorumWrite tests that writes succeed with quorum
 func TestFullReplication_QuorumWrite(t *testing.T) {
 	// Setup: 5-node cluster
@@ -142,11 +86,15 @@ func TestFullReplication_QuorumWrite(t *testing.T) {
 
 	// Verify replicator was called for all nodes including self
 	callCount := replicator.GetCallCount()
-	// Should be called twice per node: PREPARE + COMMIT
-	// 5 nodes (including self) × 2 phases = 10 calls
-	expectedCalls := 10
-	if callCount != expectedCalls {
-		t.Errorf("Expected %d replication calls, got %d", expectedCalls, callCount)
+	// With quorum optimization:
+	// - PREPARE sent to all 5 nodes
+	// - Coordinator waits for quorum (3) and exits early
+	// - COMMIT sent only to nodes that ACKed PREPARE (3 nodes)
+	// - Total: 5 PREPARE + 3 COMMIT = 8 calls (minimum for quorum)
+	expectedMinCalls := 8
+	expectedMaxCalls := 10 // If all nodes respond before quorum check
+	if callCount < expectedMinCalls || callCount > expectedMaxCalls {
+		t.Errorf("Expected %d-%d replication calls, got %d", expectedMinCalls, expectedMaxCalls, callCount)
 	}
 }
 
@@ -234,12 +182,17 @@ func TestFullReplication_AllNodesReceiveWrite(t *testing.T) {
 		t.Fatalf("Expected write to succeed, got error: %v", err)
 	}
 
-	// Verify all nodes including self received the write
-	// 3 nodes (including self) × 2 phases (PREPARE + COMMIT) = 6 calls
+	// Verify all nodes including self received the PREPARE
+	// With quorum optimization:
+	// - PREPARE sent to all 3 nodes
+	// - Coordinator waits for quorum (2) and exits early
+	// - COMMIT sent only to nodes that ACKed PREPARE (2 nodes)
+	// - Total: 3 PREPARE + 2 COMMIT = 5 calls (minimum for quorum)
 	callCount := replicator.GetCallCount()
-	expectedCalls := 6
-	if callCount != expectedCalls {
-		t.Errorf("Expected %d replication calls (all nodes), got %d", expectedCalls, callCount)
+	expectedMinCalls := 5
+	expectedMaxCalls := 6 // If all 3 PREPARE responses arrive before quorum check
+	if callCount < expectedMinCalls || callCount > expectedMaxCalls {
+		t.Errorf("Expected %d-%d replication calls, got %d", expectedMinCalls, expectedMaxCalls, callCount)
 	}
 }
 

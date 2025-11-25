@@ -207,7 +207,20 @@ func main() {
 
 	// Create snapshot function for anti-entropy
 	snapshotFunc := func(ctx context.Context, peerNodeID uint64, peerAddr string, database string) error {
-		return catchUpClient.CatchUpFromPeer(ctx, peerNodeID, peerAddr, database)
+		// Download snapshot to disk
+		if err := catchUpClient.CatchUpFromPeer(ctx, peerNodeID, peerAddr, database); err != nil {
+			return err
+		}
+
+		// Reload the database connection to pick up the new snapshot file
+		// This is critical: the old connection still points to the old data
+		if err := dbMgr.ReopenDatabase(database); err != nil {
+			log.Error().Err(err).Str("database", database).Msg("Failed to reload database after snapshot")
+			return fmt.Errorf("database reload failed after snapshot: %w", err)
+		}
+
+		log.Info().Str("database", database).Msg("Database reloaded after snapshot download")
+		return nil
 	}
 
 	antiEntropy := marmotgrpc.NewAntiEntropyServiceFromConfig(
@@ -278,6 +291,15 @@ func main() {
 		schemaVersionMgr,
 		registryAdapter,
 	)
+
+	// Initialize query pipeline with configured values
+	if err := protocol.InitializePipeline(
+		cfg.Config.QueryPipeline.TranspilerCacheSize,
+		cfg.Config.QueryPipeline.ValidatorPoolSize,
+	); err != nil {
+		log.Fatal().Err(err).Msg("Failed to initialize query pipeline")
+		return
+	}
 
 	// Create and start MySQL server
 	mysqlServer := protocol.NewMySQLServer(

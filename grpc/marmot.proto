@@ -118,20 +118,49 @@ enum ConsistencyLevel {
   CONSISTENCY_ALL = 2;
 }
 
+// Statement represents either a DML row change or a DDL schema change
+// Following industry standard CDC approach (MySQL binlog, TiDB TiCDC, CockroachDB)
 message Statement {
-  string sql = 1;
-  StatementType type = 2;
-  string table_name = 3;
-  // Target database name
-  string database = 4;
+  StatementType type = 1;
+  string table_name = 2;
+  string database = 3;  // Target database name (required)
+
+  // Use oneof to clearly separate DML (row changes) from DDL (schema changes)
+  oneof payload {
+    RowChange row_change = 4;  // For INSERT/UPDATE/DELETE - actual row data
+    DDLChange ddl_change = 5;  // For DDL - SQL statement only
+  }
+}
+
+// Row-level change data (DML operations)
+// Follows MySQL binlog row format and TiDB TiCDC approach
+message RowChange {
+  // Primary key value for MVCC conflict detection
+  string row_key = 1;
+
+  // Row images (before/after values)
+  // - INSERT: only new_values populated
+  // - UPDATE: both old_values and new_values populated (for conflict detection)
+  // - DELETE: only old_values populated (or just row_key is sufficient)
+  // - REPLACE: old_values for conflict check, new_values for data
+  map<string, bytes> old_values = 2;  // Column name -> serialized value (before image)
+  map<string, bytes> new_values = 3;  // Column name -> serialized value (after image)
+}
+
+// DDL schema change (CREATE/DROP/ALTER)
+// DDL operations must ship SQL because schema changes cannot be represented as row data
+message DDLChange {
+  string sql = 1;  // Transpiled SQLite DDL statement
 }
 
 enum StatementType {
   INSERT = 0;
   UPDATE = 1;
   DELETE = 2;
-  DDL = 3;
-  REPLACE = 4;
+  REPLACE = 3;
+  DDL = 4;
+  CREATE_DATABASE = 5;
+  DROP_DATABASE = 6;
 }
 
 message HLC {
@@ -200,6 +229,7 @@ message DatabaseReplicationState {
   int64 last_sync_time = 4;
   string sync_status = 5;  // SYNCED, CATCHING_UP, FAILED
   uint64 current_max_txn_id = 6;  // Latest txn_id in this database
+  int64 committed_txn_count = 7;  // Number of committed transactions (for row count comparison)
 }
 
 // ===== SNAPSHOT MESSAGES =====

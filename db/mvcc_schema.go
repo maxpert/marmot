@@ -150,7 +150,6 @@ const (
 		txn_id INTEGER  -- Transaction ID that holds the lock
 	);
 	`
-
 )
 
 // Transaction status constants

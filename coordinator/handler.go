@@ -2,6 +2,7 @@ package coordinator
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"reflect"
 	"strings"
@@ -18,6 +19,7 @@ type DatabaseManager interface {
 	DatabaseExists(name string) bool
 	CreateDatabase(name string) error
 	DropDatabase(name string) error
+	GetDatabaseConnection(name string) (*sql.DB, error)
 }
 
 // SchemaVersionManager interface to avoid import cycles
@@ -110,7 +112,7 @@ func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, qu
 	// Intercept cluster state queries
 	upperQuery := strings.ToUpper(strings.TrimSpace(query))
 	if strings.Contains(upperQuery, "FROM MARMOT_CLUSTER_NODES") ||
-	   strings.Contains(upperQuery, "FROM MARMOT.CLUSTER_NODES") {
+		strings.Contains(upperQuery, "FROM MARMOT.CLUSTER_NODES") {
 		return h.handleClusterStateQuery(session, query)
 	}
 
@@ -121,11 +123,17 @@ func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, qu
 		Int("stmt_type", int(stmt.Type)).
 		Str("table", stmt.TableName).
 		Str("database", stmt.Database).
+		Str("row_key", stmt.RowKey).
 		Msg("Parsed statement")
 
 	// Handle SET commands as no-op (return OK)
 	if stmt.Type == protocol.StatementSet {
 		return nil, nil
+	}
+
+	// Handle transaction control statements (BEGIN/COMMIT/ROLLBACK)
+	if protocol.IsTransactionControl(stmt) {
+		return h.handleTransactionControl(session, stmt)
 	}
 
 	// Handle database management commands
@@ -157,20 +165,104 @@ func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, qu
 		stmt.Database = session.CurrentDatabase
 	}
 
+	// Generate row key for DML statements with CDC data
+	// This must happen here (coordinator layer) because:
+	// 1. CDC extraction has already populated NewValues/OldValues
+	// 2. We have database context available
+	// 3. Row key is needed for MVCC write intents (distributed locking)
+	if protocol.IsMutation(stmt) && stmt.RowKey == "" {
+		// Only generate for DML operations that have CDC data
+		isDML := stmt.Type == protocol.StatementInsert ||
+			stmt.Type == protocol.StatementUpdate ||
+			stmt.Type == protocol.StatementDelete ||
+			stmt.Type == protocol.StatementReplace
+
+		if isDML && (len(stmt.NewValues) > 0 || len(stmt.OldValues) > 0) {
+			// Get database connection to access schema
+			sqlDB, err := h.dbManager.GetDatabaseConnection(stmt.Database)
+			if err != nil {
+				return nil, fmt.Errorf("failed to get database for row key generation: %w", err)
+			}
+
+			// Create schema provider and get table schema
+			schemaProvider := protocol.NewSchemaProvider(sqlDB)
+			schema, err := schemaProvider.GetTableSchema(stmt.TableName)
+			if err != nil {
+				return nil, fmt.Errorf("failed to get schema for table %s: %w", stmt.TableName, err)
+			}
+
+			// Generate row key from CDC values
+			// For INSERT/UPDATE: use NewValues
+			// For DELETE: use OldValues
+			var rowKey string
+			if len(stmt.NewValues) > 0 {
+				rowKey, err = protocol.GenerateRowKey(schema, stmt.NewValues)
+			} else {
+				rowKey, err = protocol.GenerateRowKey(schema, stmt.OldValues)
+			}
+
+			if err != nil {
+				return nil, fmt.Errorf("failed to generate row key for %s.%s: %w", stmt.Database, stmt.TableName, err)
+			}
+
+			stmt.RowKey = rowKey
+			log.Debug().
+				Str("database", stmt.Database).
+				Str("table", stmt.TableName).
+				Str("row_key", rowKey).
+				Msg("Generated row key for DML statement")
+		}
+	}
+
 	// Check for consistency hint
 	consistency, _ := protocol.ExtractConsistencyHint(query)
 
-	if protocol.IsMutation(stmt) {
+	isMutation := protocol.IsMutation(stmt)
+	inTransaction := session.InTransaction()
+
+	log.Debug().
+		Uint64("node_id", h.nodeID).
+		Int("stmt_type", int(stmt.Type)).
+		Bool("is_mutation", isMutation).
+		Bool("in_transaction", inTransaction).
+		Str("table", stmt.TableName).
+		Str("database", stmt.Database).
+		Str("sql_prefix", truncateSQL(query, 60)).
+		Msg("ROUTE: Routing decision")
+
+	// If in explicit transaction, buffer mutations instead of immediate 2PC
+	if inTransaction && isMutation {
+		return h.bufferStatement(session, stmt)
+	}
+
+	// Normal path - immediate execution (for YCSB and auto-commit clients)
+	if isMutation {
 		return h.handleMutation(stmt, consistency)
 	}
 
 	return h.handleRead(stmt, consistency)
 }
 
+// truncateSQL returns first n chars of SQL for logging
+func truncateSQL(sql string, n int) string {
+	if len(sql) <= n {
+		return sql
+	}
+	return sql[:n] + "..."
+}
+
 func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, consistency protocol.ConsistencyLevel) (*protocol.ResultSet, error) {
 	// Create transaction
 	txnID := h.clock.Now().WallTime // Simple ID generation for now
 	startTS := h.clock.Now()
+
+	log.Debug().
+		Uint64("node_id", h.nodeID).
+		Uint64("txn_id", uint64(txnID)).
+		Int("stmt_type", int(stmt.Type)).
+		Str("table", stmt.TableName).
+		Str("database", stmt.Database).
+		Msg("MUTATION: Starting handleMutation")
 
 	// Detect DDL and handle differently
 	isDDL := stmt.Type == protocol.StatementDDL ||
@@ -255,8 +347,12 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, consistency
 		}
 	}
 
-	// Return OK result
-	return nil, nil
+	// Return OK result with rows affected
+	// For now, we return 1 row affected for successful mutations
+	// In the future, we could enhance this to return actual rows affected from the database
+	return &protocol.ResultSet{
+		RowsAffected: 1,
+	}, nil
 }
 
 func (h *CoordinatorHandler) handleRead(stmt protocol.Statement, consistency protocol.ConsistencyLevel) (*protocol.ResultSet, error) {
@@ -273,10 +369,22 @@ func (h *CoordinatorHandler) handleRead(stmt protocol.Statement, consistency pro
 
 	resp, err := h.readCoord.ReadTransaction(ctx, req)
 	if err != nil {
+		log.Warn().
+			Err(err).
+			Str("database", stmt.Database).
+			Str("table", stmt.TableName).
+			Str("sql", stmt.SQL).
+			Msg("Returning error to client: read transaction failed")
 		return nil, err
 	}
 
 	if !resp.Success {
+		log.Warn().
+			Str("error", resp.Error).
+			Str("database", stmt.Database).
+			Str("table", stmt.TableName).
+			Str("sql", stmt.SQL).
+			Msg("Returning error to client: read transaction unsuccessful")
 		return nil, fmt.Errorf("%s", resp.Error)
 	}
 
@@ -500,9 +608,9 @@ func (h *CoordinatorHandler) handleClusterStateQuery(session *protocol.Connectio
 
 	// Build result set
 	columns := []protocol.ColumnDef{
-		{Name: "node_id", Type: 0x08},    // MYSQL_TYPE_LONGLONG
-		{Name: "address", Type: 0xFD},    // MYSQL_TYPE_VAR_STRING
-		{Name: "status", Type: 0xFD},     // MYSQL_TYPE_VAR_STRING
+		{Name: "node_id", Type: 0x08},     // MYSQL_TYPE_LONGLONG
+		{Name: "address", Type: 0xFD},     // MYSQL_TYPE_VAR_STRING
+		{Name: "status", Type: 0xFD},      // MYSQL_TYPE_VAR_STRING
 		{Name: "incarnation", Type: 0x08}, // MYSQL_TYPE_LONGLONG
 	}
 
@@ -520,5 +628,174 @@ func (h *CoordinatorHandler) handleClusterStateQuery(session *protocol.Connectio
 	return &protocol.ResultSet{
 		Columns: columns,
 		Rows:    rows,
+	}, nil
+}
+
+// handleTransactionControl handles BEGIN, COMMIT, and ROLLBACK statements
+func (h *CoordinatorHandler) handleTransactionControl(session *protocol.ConnectionSession, stmt protocol.Statement) (*protocol.ResultSet, error) {
+	switch stmt.Type {
+	case protocol.StatementBegin:
+		return h.handleBegin(session)
+	case protocol.StatementCommit:
+		return h.handleCommit(session)
+	case protocol.StatementRollback:
+		return h.handleRollback(session)
+	default:
+		// Savepoint and other transaction control - just return OK for now
+		log.Debug().
+			Int("stmt_type", int(stmt.Type)).
+			Msg("Unsupported transaction control statement, returning OK")
+		return nil, nil
+	}
+}
+
+// handleBegin starts a new explicit transaction
+func (h *CoordinatorHandler) handleBegin(session *protocol.ConnectionSession) (*protocol.ResultSet, error) {
+	if session.InTransaction() {
+		// MySQL allows nested BEGIN but it implicitly commits the previous transaction
+		// For simplicity, we'll just ignore nested BEGIN (like MySQL with autocommit)
+		log.Debug().
+			Uint64("conn_id", session.ConnID).
+			Msg("BEGIN while already in transaction - ignoring")
+		return nil, nil
+	}
+
+	txnID := uint64(h.clock.Now().WallTime)
+	startTS := h.clock.Now()
+
+	session.BeginTransaction(txnID, startTS, session.CurrentDatabase)
+
+	log.Debug().
+		Uint64("conn_id", session.ConnID).
+		Uint64("txn_id", txnID).
+		Str("database", session.CurrentDatabase).
+		Msg("BEGIN: Started explicit transaction")
+
+	return nil, nil // OK response
+}
+
+// handleCommit commits the accumulated statements via 2PC
+func (h *CoordinatorHandler) handleCommit(session *protocol.ConnectionSession) (*protocol.ResultSet, error) {
+	if !session.InTransaction() {
+		// No active transaction - just return OK (MySQL behavior)
+		log.Debug().
+			Uint64("conn_id", session.ConnID).
+			Msg("COMMIT without active transaction - ignoring")
+		return nil, nil
+	}
+
+	txnState := session.GetTransaction()
+	if txnState == nil || len(txnState.Statements) == 0 {
+		// Empty transaction - just clear and return OK
+		session.EndTransaction()
+		log.Debug().
+			Uint64("conn_id", session.ConnID).
+			Msg("COMMIT: Empty transaction")
+		return nil, nil
+	}
+
+	log.Debug().
+		Uint64("conn_id", session.ConnID).
+		Uint64("txn_id", txnState.TxnID).
+		Int("stmt_count", len(txnState.Statements)).
+		Msg("COMMIT: Executing batched transaction via 2PC")
+
+	// Create 2PC transaction with ALL accumulated statements
+	txn := &Transaction{
+		ID:                    txnState.TxnID,
+		NodeID:                h.nodeID,
+		Statements:            txnState.Statements,
+		StartTS:               txnState.StartTS,
+		WriteConsistency:      protocol.ConsistencyQuorum, // Default to quorum for explicit transactions
+		Database:              txnState.Database,
+		RequiredSchemaVersion: 0, // Will be set by handleMutation if needed
+	}
+
+	// Get schema version if schema manager is available
+	if h.schemaVersionMgr != nil {
+		schemaVersion, err := h.schemaVersionMgr.GetSchemaVersion(txnState.Database)
+		if err != nil {
+			log.Warn().Err(err).Str("database", txnState.Database).Msg("Failed to get schema version for transaction")
+		} else {
+			txn.RequiredSchemaVersion = schemaVersion
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second) // Longer timeout for batched transactions
+	defer cancel()
+
+	err := h.writeCoord.WriteTransaction(ctx, txn)
+
+	// Clear transaction state regardless of outcome
+	session.EndTransaction()
+
+	if err != nil {
+		log.Error().
+			Err(err).
+			Uint64("conn_id", session.ConnID).
+			Uint64("txn_id", txnState.TxnID).
+			Int("stmt_count", len(txnState.Statements)).
+			Msg("COMMIT: 2PC failed")
+		return nil, err
+	}
+
+	log.Debug().
+		Uint64("conn_id", session.ConnID).
+		Uint64("txn_id", txnState.TxnID).
+		Int("stmt_count", len(txnState.Statements)).
+		Msg("COMMIT: Transaction committed successfully")
+
+	return &protocol.ResultSet{
+		RowsAffected: int64(len(txnState.Statements)),
+	}, nil
+}
+
+// handleRollback discards the accumulated statements
+func (h *CoordinatorHandler) handleRollback(session *protocol.ConnectionSession) (*protocol.ResultSet, error) {
+	if !session.InTransaction() {
+		// No active transaction - just return OK
+		log.Debug().
+			Uint64("conn_id", session.ConnID).
+			Msg("ROLLBACK without active transaction - ignoring")
+		return nil, nil
+	}
+
+	txnState := session.GetTransaction()
+	stmtCount := 0
+	if txnState != nil {
+		stmtCount = len(txnState.Statements)
+	}
+
+	// Just discard the buffer - no network activity needed
+	session.EndTransaction()
+
+	log.Debug().
+		Uint64("conn_id", session.ConnID).
+		Int("discarded_stmts", stmtCount).
+		Msg("ROLLBACK: Discarded buffered statements")
+
+	return nil, nil // OK response
+}
+
+// bufferStatement adds a mutation to the active transaction buffer
+func (h *CoordinatorHandler) bufferStatement(session *protocol.ConnectionSession, stmt protocol.Statement) (*protocol.ResultSet, error) {
+	session.AddStatement(stmt)
+
+	txnState := session.GetTransaction()
+	stmtCount := 0
+	if txnState != nil {
+		stmtCount = len(txnState.Statements)
+	}
+
+	log.Debug().
+		Uint64("conn_id", session.ConnID).
+		Str("table", stmt.TableName).
+		Int("stmt_type", int(stmt.Type)).
+		Int("buffered_count", stmtCount).
+		Msg("Buffered statement in transaction")
+
+	// Return OK immediately (optimistic - actual execution on COMMIT)
+	return &protocol.ResultSet{
+		RowsAffected: 1,
 	}, nil
 }

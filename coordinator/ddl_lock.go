@@ -22,12 +22,12 @@ type DDLLockManager struct {
 
 // DDLLock represents a cluster-wide DDL lock
 type DDLLock struct {
-	Database      string
-	NodeID        uint64
-	TxnID         uint64
-	AcquiredAt    hlc.Timestamp
-	ExpiresAt     time.Time
-	ReleaseChan   chan struct{} // Closed when lock is released
+	Database    string
+	NodeID      uint64
+	TxnID       uint64
+	AcquiredAt  hlc.Timestamp
+	ExpiresAt   time.Time
+	ReleaseChan chan struct{} // Closed when lock is released
 }
 
 // NewDDLLockManager creates a new DDL lock manager

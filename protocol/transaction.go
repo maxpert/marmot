@@ -107,11 +107,17 @@ const (
 
 // Statement represents a single SQL statement
 type Statement struct {
-	SQL       string
-	Type      StatementType
-	TableName string
-	Database  string // Target database name
-	Error     string // Error message if Type is StatementUnsupported
+	SQL       string        `json:"SQL"`
+	Type      StatementType `json:"Type"`
+	TableName string        `json:"TableName"`
+	Database  string        `json:"Database"` // Target database name
+	RowKey    string        `json:"RowKey"`   // Primary key value extracted during parsing (for MVCC conflict detection)
+	Error     string        `json:"Error"`    // Error message if Type is StatementUnsupported
+
+	// CDC: Row-level change data (for DML operations)
+	// Populated after local execution, sent to replicas instead of SQL
+	OldValues map[string][]byte `json:"OldValues"` // Before image (for UPDATE/DELETE)
+	NewValues map[string][]byte `json:"NewValues"` // After image (for INSERT/UPDATE/REPLACE)
 }
 
 // Transaction represents a buffered transaction

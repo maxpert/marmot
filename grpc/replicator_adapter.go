@@ -7,6 +7,7 @@ import (
 	"github.com/maxpert/marmot/coordinator"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/protocol"
+	"github.com/rs/zerolog/log"
 )
 
 // GRPCReplicator implements coordinator.Replicator using gRPC client
@@ -55,7 +56,7 @@ func (gr *GRPCReplicator) ReplicateTransaction(ctx context.Context, nodeID uint6
 	return resp, nil
 }
 
-// convertStatementsToProto converts protocol.Statement to gRPC Statement
+// convertStatementsToProto converts protocol.Statement to gRPC Statement with CDC
 func convertStatementsToProto(stmts []protocol.Statement, database string) []*Statement {
 	protoStmts := make([]*Statement, len(stmts))
 	for i, stmt := range stmts {
@@ -64,12 +65,49 @@ func convertStatementsToProto(stmts []protocol.Statement, database string) []*St
 		if stmtDB == "" {
 			stmtDB = database
 		}
-		protoStmts[i] = &Statement{
-			Sql:       stmt.SQL,
+
+		protoStmt := &Statement{
 			Type:      convertStatementTypeToProto(stmt.Type),
 			TableName: stmt.TableName,
 			Database:  stmtDB,
 		}
+
+		// For DML operations: send CDC row data
+		// For DDL operations: send SQL
+		isDML := stmt.Type == protocol.StatementInsert ||
+			stmt.Type == protocol.StatementUpdate ||
+			stmt.Type == protocol.StatementDelete ||
+			stmt.Type == protocol.StatementReplace
+
+		if isDML && (len(stmt.NewValues) > 0 || len(stmt.OldValues) > 0) {
+			// CDC path: send row data instead of SQL
+			protoStmt.Payload = &Statement_RowChange{
+				RowChange: &RowChange{
+					RowKey:    stmt.RowKey,
+					OldValues: stmt.OldValues,
+					NewValues: stmt.NewValues,
+				},
+			}
+		} else {
+			// DDL or DML without CDC data: send SQL
+			log.Debug().
+				Str("sql_prefix", func() string {
+					if len(stmt.SQL) > 50 {
+						return stmt.SQL[:50]
+					}
+					return stmt.SQL
+				}()).
+				Bool("is_ddl", !isDML).
+				Msg("Sending SQL to remote node (DDL or DML fallback)")
+
+			protoStmt.Payload = &Statement_DdlChange{
+				DdlChange: &DDLChange{
+					Sql: stmt.SQL,
+				},
+			}
+		}
+
+		protoStmts[i] = protoStmt
 	}
 	return protoStmts
 }
@@ -87,8 +125,10 @@ func convertStatementTypeToProto(stmtType protocol.StatementType) StatementType 
 		return StatementType_REPLACE
 	case protocol.StatementDDL:
 		return StatementType_DDL
-	case protocol.StatementCreateDatabase, protocol.StatementDropDatabase:
-		return StatementType_DDL  // Database operations are DDL
+	case protocol.StatementCreateDatabase:
+		return StatementType_CREATE_DATABASE
+	case protocol.StatementDropDatabase:
+		return StatementType_DROP_DATABASE
 	default:
 		return StatementType_INSERT
 	}

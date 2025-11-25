@@ -47,6 +47,7 @@ type MinAppliedTxnIDFunc func(database string) (uint64, error)
 type MVCCTransactionManager struct {
 	db                 *sql.DB
 	clock              *hlc.Clock
+	schemaProvider     *protocol.SchemaProvider // Schema provider for table metadata
 	activeTxns         map[uint64]*MVCCTransaction
 	mu                 sync.RWMutex
 	gcInterval         time.Duration
@@ -81,6 +82,7 @@ func NewMVCCTransactionManager(db *sql.DB, clock *hlc.Clock) *MVCCTransactionMan
 	tm := &MVCCTransactionManager{
 		db:               db,
 		clock:            clock,
+		schemaProvider:   protocol.NewSchemaProvider(db),
 		activeTxns:       make(map[uint64]*MVCCTransaction),
 		gcInterval:       gcInterval,
 		gcThreshold:      gcThreshold,
@@ -280,13 +282,36 @@ func (tm *MVCCTransactionManager) CommitTransaction(txn *MVCCTransaction) error 
 
 	txn.CommitTS = commitTS
 
-	// Execute DDL/DCL/Admin statements directly
-	// These are not handled by MVCC versioning
-	// Execute ALL statements (DML and DDL) directly on the base table
-	// This ensures the base table reflects the latest committed state
+	// Execute statements on the base table
+	// - For CDC-based DML: Use row data directly (no SQL execution needed)
+	// - For DDL (except CREATE/DROP DATABASE): Execute SQL (schema changes must use SQL)
+	// - For CREATE/DROP DATABASE: Skip SQL execution (already done in handleCommit before this is called)
+	// - For DML without CDC data: Fall back to SQL execution
 	for _, stmt := range txn.Statements {
-		if _, err := tm.db.Exec(stmt.SQL); err != nil {
-			return fmt.Errorf("failed to execute statement: %w", err)
+		// Skip CREATE/DROP DATABASE - these are executed before CommitTransaction is called
+		if stmt.Type == protocol.StatementCreateDatabase || stmt.Type == protocol.StatementDropDatabase {
+			continue
+		}
+
+		// Check if this is DML with CDC data
+		isDML := stmt.Type == protocol.StatementInsert ||
+			stmt.Type == protocol.StatementUpdate ||
+			stmt.Type == protocol.StatementDelete ||
+			stmt.Type == protocol.StatementReplace
+
+		if isDML && (len(stmt.NewValues) > 0 || len(stmt.OldValues) > 0) {
+			// CDC path: Write row data directly without executing SQL
+			if err := tm.writeCDCData(stmt); err != nil {
+				return fmt.Errorf("failed to write CDC data for %s: %w", stmt.TableName, err)
+			}
+		} else {
+			// DDL or DML without CDC data: Execute SQL
+			if stmt.SQL == "" {
+				return fmt.Errorf("statement has no SQL and no CDC data")
+			}
+			if _, err := tm.db.Exec(stmt.SQL); err != nil {
+				return fmt.Errorf("failed to execute statement: %w", err)
+			}
 		}
 	}
 
@@ -616,8 +641,8 @@ func (tm *MVCCTransactionManager) cleanupOldTransactionRecords() (int, error) {
 			    OR created_at < ?                 -- Force GC after max retention
 			  )
 		`, TxnStatusCommitted, TxnStatusAborted,
-		   minRetentionCutoff, minAppliedTxnID,
-		   maxRetentionCutoff)
+			minRetentionCutoff, minAppliedTxnID,
+			maxRetentionCutoff)
 
 		if err == nil {
 			log.Debug().
@@ -809,4 +834,168 @@ func (tm *MVCCTransactionManager) GetLatestVersion(tableName, rowKey string) (*h
 		Logical:  logical,
 		NodeID:   nodeID,
 	}, nil
+}
+
+// writeCDCData writes CDC row data directly to the base table
+// This is the core CDC implementation - replicas receive row data, not SQL
+func (tm *MVCCTransactionManager) writeCDCData(stmt protocol.Statement) error {
+	switch stmt.Type {
+	case protocol.StatementInsert, protocol.StatementReplace:
+		return tm.writeCDCInsert(stmt.TableName, stmt.NewValues)
+	case protocol.StatementUpdate:
+		return tm.writeCDCUpdate(stmt.TableName, stmt.RowKey, stmt.NewValues)
+	case protocol.StatementDelete:
+		return tm.writeCDCDelete(stmt.TableName, stmt.RowKey, stmt.OldValues)
+	default:
+		return fmt.Errorf("unsupported statement type for CDC: %v", stmt.Type)
+	}
+}
+
+// writeCDCInsert performs INSERT OR REPLACE using CDC row data
+func (tm *MVCCTransactionManager) writeCDCInsert(tableName string, newValues map[string][]byte) error {
+	if len(newValues) == 0 {
+		return fmt.Errorf("no values to insert")
+	}
+
+	// Build INSERT OR REPLACE statement
+	columns := make([]string, 0, len(newValues))
+	placeholders := make([]string, 0, len(newValues))
+	values := make([]interface{}, 0, len(newValues))
+
+	// Collect columns (order doesn't matter for INSERT OR REPLACE with all columns)
+	for col := range newValues {
+		columns = append(columns, col)
+		placeholders = append(placeholders, "?")
+
+		// Deserialize value from JSON
+		var value interface{}
+		if err := json.Unmarshal(newValues[col], &value); err != nil {
+			return fmt.Errorf("failed to deserialize value for column %s: %w", col, err)
+		}
+		values = append(values, value)
+	}
+
+	sql := fmt.Sprintf("INSERT OR REPLACE INTO %s (%s) VALUES (%s)",
+		tableName,
+		strings.Join(columns, ", "),
+		strings.Join(placeholders, ", "))
+
+	_, err := tm.db.Exec(sql, values...)
+	return err
+}
+
+// writeCDCUpdate performs UPDATE using CDC row data
+func (tm *MVCCTransactionManager) writeCDCUpdate(tableName string, rowKey string, newValues map[string][]byte) error {
+	if len(newValues) == 0 {
+		return fmt.Errorf("no values to update")
+	}
+
+	// Get table schema to build proper WHERE clause
+	schema, err := tm.schemaProvider.GetTableSchema(tableName)
+	if err != nil {
+		return fmt.Errorf("failed to get schema for table %s: %w", tableName, err)
+	}
+
+	// Build UPDATE statement with SET clause
+	setClauses := make([]string, 0, len(newValues))
+	values := make([]interface{}, 0, len(newValues)+len(schema.PrimaryKeys))
+
+	for col, valBytes := range newValues {
+		// Skip PK columns in SET clause (they're in WHERE clause)
+		isPK := false
+		for _, pkCol := range schema.PrimaryKeys {
+			if col == pkCol {
+				isPK = true
+				break
+			}
+		}
+		if isPK {
+			continue
+		}
+
+		setClauses = append(setClauses, fmt.Sprintf("%s = ?", col))
+
+		// Deserialize value from JSON
+		var value interface{}
+		if err := json.Unmarshal(valBytes, &value); err != nil {
+			return fmt.Errorf("failed to deserialize value for column %s: %w", col, err)
+		}
+		values = append(values, value)
+	}
+
+	// Build WHERE clause using primary key columns
+	// For both single and composite PK: extract PK values from newValues
+	// (newValues contains both SET columns and PK columns from WHERE clause)
+	whereClauses := make([]string, 0, len(schema.PrimaryKeys))
+
+	for _, pkCol := range schema.PrimaryKeys {
+		pkValue, ok := newValues[pkCol]
+		if !ok {
+			return fmt.Errorf("primary key column %s not found in CDC data", pkCol)
+		}
+
+		whereClauses = append(whereClauses, fmt.Sprintf("%s = ?", pkCol))
+
+		// Deserialize PK value
+		var value interface{}
+		if err := json.Unmarshal(pkValue, &value); err != nil {
+			return fmt.Errorf("failed to deserialize PK value for column %s: %w", pkCol, err)
+		}
+		values = append(values, value)
+	}
+
+	sql := fmt.Sprintf("UPDATE %s SET %s WHERE %s",
+		tableName,
+		strings.Join(setClauses, ", "),
+		strings.Join(whereClauses, " AND "))
+
+	_, err = tm.db.Exec(sql, values...)
+	return err
+}
+
+// writeCDCDelete performs DELETE using CDC row data
+func (tm *MVCCTransactionManager) writeCDCDelete(tableName string, rowKey string, oldValues map[string][]byte) error {
+	if rowKey == "" {
+		return fmt.Errorf("empty row key for delete")
+	}
+
+	// Get table schema to build proper WHERE clause
+	schema, err := tm.schemaProvider.GetTableSchema(tableName)
+	if err != nil {
+		return fmt.Errorf("failed to get schema for table %s: %w", tableName, err)
+	}
+
+	// Build WHERE clause using primary key columns
+	whereClauses := make([]string, 0, len(schema.PrimaryKeys))
+	values := make([]interface{}, 0, len(schema.PrimaryKeys))
+
+	if len(schema.PrimaryKeys) == 1 {
+		// Single PK: row key is the value directly
+		whereClauses = append(whereClauses, fmt.Sprintf("%s = ?", schema.PrimaryKeys[0]))
+		values = append(values, rowKey)
+	} else {
+		// Composite PK: extract PK values from oldValues
+		for _, pkCol := range schema.PrimaryKeys {
+			pkValue, ok := oldValues[pkCol]
+			if !ok {
+				return fmt.Errorf("primary key column %s not found in CDC old values", pkCol)
+			}
+
+			whereClauses = append(whereClauses, fmt.Sprintf("%s = ?", pkCol))
+
+			// Deserialize PK value
+			var value interface{}
+			if err := json.Unmarshal(pkValue, &value); err != nil {
+				return fmt.Errorf("failed to deserialize PK value for column %s: %w", pkCol, err)
+			}
+			values = append(values, value)
+		}
+	}
+
+	sql := fmt.Sprintf("DELETE FROM %s WHERE %s",
+		tableName,
+		strings.Join(whereClauses, " AND "))
+
+	_, err = tm.db.Exec(sql, values...)
+	return err
 }

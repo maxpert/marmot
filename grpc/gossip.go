@@ -118,6 +118,19 @@ func (gp *GossipProtocol) gossipLoop(config GossipConfig) {
 func (gp *GossipProtocol) doGossipRound() {
 	peers := gp.selectRandomPeers(gp.fanout)
 	if len(peers) == 0 {
+		// Log registry state when no peers found - helps debug membership issues
+		allNodes := gp.registry.GetAll()
+		log.Debug().
+			Uint64("node_id", gp.nodeID).
+			Int("total_registry_nodes", len(allNodes)).
+			Msg("GOSSIP: No peers selected for gossip round")
+		for _, n := range allNodes {
+			log.Debug().
+				Uint64("node_id", gp.nodeID).
+				Uint64("registry_node", n.NodeId).
+				Str("status", n.Status.String()).
+				Msg("GOSSIP: Registry state when no peers")
+		}
 		return
 	}
 
@@ -129,8 +142,23 @@ func (gp *GossipProtocol) doGossipRound() {
 		Incarnation:  gp.incarnation,
 	}
 
+	// Log what we're sending
+	for _, node := range allNodes {
+		log.Debug().
+			Uint64("node_id", gp.nodeID).
+			Uint64("target_node", node.NodeId).
+			Str("status", node.Status.String()).
+			Uint64("incarnation", node.Incarnation).
+			Msg("GOSSIP: Sending node state")
+	}
+
 	// Send to selected peers
 	for _, peer := range peers {
+		log.Debug().
+			Uint64("node_id", gp.nodeID).
+			Uint64("peer", peer.NodeId).
+			Str("peer_status", peer.Status.String()).
+			Msg("GOSSIP: Sending to peer")
 		go gp.sendGossip(peer, req)
 	}
 }
@@ -202,30 +230,67 @@ func (gp *GossipProtocol) BroadcastAndVerifyAlive(maxRetries int, retryInterval 
 
 // sendGossip sends a gossip message to a peer
 func (gp *GossipProtocol) sendGossip(peer *NodeState, req *GossipRequest) {
+	// For DEAD nodes, try to reconnect first - they might have recovered
+	if peer.Status == NodeStatus_DEAD && peer.Address != "" {
+		if err := gp.client.Connect(peer.NodeId, peer.Address); err != nil {
+			log.Debug().
+				Err(err).
+				Uint64("peer", peer.NodeId).
+				Msg("GOSSIP: Failed to reconnect to DEAD node")
+			return
+		}
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
 	resp, err := gp.client.SendGossip(ctx, peer.NodeId, req)
 	if err != nil {
-		gp.registry.MarkSuspect(peer.NodeId)
+		log.Debug().
+			Err(err).
+			Uint64("node_id", gp.nodeID).
+			Uint64("peer", peer.NodeId).
+			Str("peer_status", peer.Status.String()).
+			Msg("GOSSIP: SendGossip FAILED")
+		// Only mark suspect for non-DEAD nodes
+		// DEAD nodes are already in worst state
+		if peer.Status != NodeStatus_DEAD {
+			gp.registry.MarkSuspect(peer.NodeId)
+		}
 		return
 	}
 
+	log.Debug().
+		Uint64("node_id", gp.nodeID).
+		Uint64("peer", peer.NodeId).
+		Int("nodes_received", len(resp.Nodes)).
+		Msg("GOSSIP: SendGossip SUCCESS")
+
 	// Merge received node states
 	for _, nodeState := range resp.Nodes {
+		log.Debug().
+			Uint64("node_id", gp.nodeID).
+			Uint64("from_peer", peer.NodeId).
+			Uint64("update_node", nodeState.NodeId).
+			Str("status", nodeState.Status.String()).
+			Uint64("incarnation", nodeState.Incarnation).
+			Msg("GOSSIP: Applying update from peer")
 		gp.registry.Update(nodeState)
 	}
 }
 
 // selectRandomPeers selects random peers for gossiping
-// Note: Include ALL nodes except DEAD for gossip (ALIVE + JOINING + SUSPECT)
+// Note: Include ALL nodes including DEAD - this allows recovery when dead nodes restart
+// The SWIM protocol relies on gossip to propagate state, and excluding DEAD nodes
+// permanently prevents restarted nodes from being re-discovered
 func (gp *GossipProtocol) selectRandomPeers(n int) []*NodeState {
 	allNodes := gp.registry.GetAll()
 
-	// Filter out self and DEAD nodes
+	// Filter out only self - include ALL other nodes (ALIVE, JOINING, SUSPECT, DEAD)
+	// Dead nodes might have recovered, and gossip is how we discover this
 	peers := make([]*NodeState, 0)
 	for _, node := range allNodes {
-		if node.NodeId != gp.nodeID && node.Status != NodeStatus_DEAD {
+		if node.NodeId != gp.nodeID {
 			peers = append(peers, node)
 		}
 	}
@@ -264,67 +329,161 @@ func (gp *GossipProtocol) timeoutLoop(suspectTimeout, deadTimeout time.Duration)
 
 // JoinCluster sends join requests to seed nodes with advertise address
 func (gp *GossipProtocol) JoinCluster(seedAddresses []string, advertiseAddress string) error {
-	log.Info().
+	log.Debug().
+		Uint64("node_id", gp.nodeID).
 		Strs("seeds", seedAddresses).
 		Str("advertise_address", advertiseAddress).
-		Msg("Joining cluster via seed nodes")
+		Str("timestamp", time.Now().Format("15:04:05.000")).
+		Msg("BOOT: JoinCluster called")
 
 	for i, addr := range seedAddresses {
 		// Use temporary node ID for seeds (will be replaced with actual)
 		seedNodeID := uint64(1000 + i)
 
+		log.Debug().
+			Uint64("node_id", gp.nodeID).
+			Str("seed_addr", addr).
+			Str("timestamp", time.Now().Format("15:04:05.000")).
+			Msg("BOOT: Attempting to connect to seed")
+
 		// Connect to seed
 		if err := gp.client.Connect(seedNodeID, addr); err != nil {
-			log.Warn().
+			log.Debug().
 				Err(err).
+				Uint64("node_id", gp.nodeID).
 				Str("address", addr).
-				Msg("Failed to connect to seed node")
+				Str("timestamp", time.Now().Format("15:04:05.000")).
+				Msg("BOOT: Failed to connect to seed node")
 			continue
 		}
 
-		// Send join request with our advertise address
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		req := &JoinRequest{
-			NodeId:  gp.nodeID,
-			Address: advertiseAddress,
+		log.Debug().
+			Uint64("node_id", gp.nodeID).
+			Str("seed_addr", addr).
+			Str("timestamp", time.Now().Format("15:04:05.000")).
+			Msg("BOOT: Connected to seed, sending join request")
+
+		// Retry join request with increasing timeout (lazy gRPC connection may need time)
+		var resp *JoinResponse
+		var err error
+		maxRetries := 3
+		baseTimeout := 5 * time.Second
+
+		for attempt := 1; attempt <= maxRetries; attempt++ {
+			timeout := time.Duration(attempt) * baseTimeout // 5s, 10s, 15s
+			ctx, cancel := context.WithTimeout(context.Background(), timeout)
+			req := &JoinRequest{
+				NodeId:  gp.nodeID,
+				Address: advertiseAddress,
+			}
+
+			resp, err = gp.client.SendJoin(ctx, seedNodeID, req)
+			cancel()
+
+			if err == nil {
+				break
+			}
+
+			log.Debug().
+				Err(err).
+				Uint64("node_id", gp.nodeID).
+				Str("address", addr).
+				Int("attempt", attempt).
+				Int("max_retries", maxRetries).
+				Dur("timeout", timeout).
+				Str("timestamp", time.Now().Format("15:04:05.000")).
+				Msg("BOOT: Join request failed, retrying")
+
+			// Small delay before retry
+			if attempt < maxRetries {
+				time.Sleep(500 * time.Millisecond)
+			}
 		}
 
-		resp, err := gp.client.SendJoin(ctx, seedNodeID, req)
-		cancel()
-
 		if err != nil {
-			log.Warn().
+			log.Debug().
 				Err(err).
+				Uint64("node_id", gp.nodeID).
 				Str("address", addr).
-				Msg("Failed to send join request")
+				Str("timestamp", time.Now().Format("15:04:05.000")).
+				Msg("BOOT: Failed to send join request after all retries")
 			continue
 		}
 
 		if !resp.Success {
-			log.Warn().
+			log.Debug().
+				Uint64("node_id", gp.nodeID).
 				Str("address", addr).
-				Msg("Join request rejected")
+				Str("timestamp", time.Now().Format("15:04:05.000")).
+				Msg("BOOT: Join request rejected")
 			continue
 		}
 
+		log.Debug().
+			Uint64("node_id", gp.nodeID).
+			Int("cluster_nodes_count", len(resp.ClusterNodes)).
+			Str("timestamp", time.Now().Format("15:04:05.000")).
+			Msg("BOOT: Join successful, received cluster nodes")
+
 		// Add received cluster nodes to registry
 		for _, node := range resp.ClusterNodes {
+			log.Debug().
+				Uint64("local_node_id", gp.nodeID).
+				Uint64("received_node_id", node.NodeId).
+				Str("received_status", node.Status.String()).
+				Str("received_address", node.Address).
+				Str("timestamp", time.Now().Format("15:04:05.000")).
+				Msg("BOOT: Processing cluster node from join response")
+
+			// Skip adding ourselves - we already have our own entry as ALIVE
+			if node.NodeId == gp.nodeID {
+				log.Debug().
+					Uint64("node_id", node.NodeId).
+					Str("timestamp", time.Now().Format("15:04:05.000")).
+					Msg("BOOT: Skipping self in cluster nodes")
+				continue
+			}
+
 			gp.registry.Add(node)
+			log.Debug().
+				Uint64("local_node_id", gp.nodeID).
+				Uint64("added_node_id", node.NodeId).
+				Str("timestamp", time.Now().Format("15:04:05.000")).
+				Msg("BOOT: Added node to registry from join response")
 
 			// Connect to new nodes
-			if node.NodeId != gp.nodeID && node.Address != "" {
+			if node.Address != "" {
 				if err := gp.client.Connect(node.NodeId, node.Address); err != nil {
-					log.Warn().
+					log.Debug().
 						Err(err).
 						Uint64("node_id", node.NodeId).
-						Msg("Failed to connect to cluster node")
+						Str("timestamp", time.Now().Format("15:04:05.000")).
+						Msg("BOOT: Failed to connect to cluster node")
+				} else {
+					log.Debug().
+						Uint64("local_node_id", gp.nodeID).
+						Uint64("connected_to", node.NodeId).
+						Str("timestamp", time.Now().Format("15:04:05.000")).
+						Msg("BOOT: Connected to cluster node")
 				}
 			}
 		}
 
-		log.Info().
-			Int("cluster_size", len(resp.ClusterNodes)).
-			Msg("Successfully joined cluster")
+		// Log final registry state
+		allNodes := gp.registry.GetAll()
+		log.Debug().
+			Uint64("node_id", gp.nodeID).
+			Int("total_nodes_in_registry", len(allNodes)).
+			Str("timestamp", time.Now().Format("15:04:05.000")).
+			Msg("BOOT: Join complete, final registry state")
+		for _, n := range allNodes {
+			log.Debug().
+				Uint64("node_id", gp.nodeID).
+				Uint64("registry_node", n.NodeId).
+				Str("status", n.Status.String()).
+				Str("address", n.Address).
+				Msg("BOOT: Registry entry")
+		}
 
 		return nil
 	}

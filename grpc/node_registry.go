@@ -43,6 +43,12 @@ type NodeRegistry struct {
 
 // NewNodeRegistry creates a new node registry
 func NewNodeRegistry(localNodeID uint64, advertiseAddress string) *NodeRegistry {
+	log.Debug().
+		Uint64("node_id", localNodeID).
+		Str("advertise_address", advertiseAddress).
+		Str("timestamp", time.Now().Format("15:04:05.000")).
+		Msg("BOOT: Creating node registry")
+
 	nr := &NodeRegistry{
 		localNodeID: localNodeID,
 		nodes:       make(map[uint64]*NodeState),
@@ -58,6 +64,11 @@ func NewNodeRegistry(localNodeID uint64, advertiseAddress string) *NodeRegistry 
 		Incarnation: 0,
 	}
 	nr.lastSeen[localNodeID] = now
+
+	log.Debug().
+		Uint64("node_id", localNodeID).
+		Str("timestamp", time.Now().Format("15:04:05.000")).
+		Msg("BOOT: Node registry created - self added as ALIVE")
 
 	return nr
 }
@@ -77,14 +88,20 @@ func (nr *NodeRegistry) Update(node *NodeState) {
 
 	// Rule 1: SWIM refutation - local node rejects non-ALIVE status for itself
 	if node.NodeId == nr.localNodeID {
+		nr.handleSelfUpdateLocked(node)
 		nr.mu.Unlock()
-		nr.handleSelfUpdate(node)
 		return
 	}
 
 	// Rule 2: Discover new nodes
 	existing, exists := nr.nodes[node.NodeId]
 	if !exists {
+		log.Debug().
+			Uint64("local_node", nr.localNodeID).
+			Uint64("new_node", node.NodeId).
+			Str("status", node.Status.String()).
+			Uint64("incarnation", node.Incarnation).
+			Msg("REGISTRY: Adding NEW node")
 		nr.nodes[node.NodeId] = node
 		nr.lastSeen[node.NodeId] = time.Now()
 		nr.mu.Unlock()
@@ -101,6 +118,14 @@ func (nr *NodeRegistry) Update(node *NodeState) {
 	if node.Incarnation > existing.Incarnation {
 		// Higher incarnation always wins
 		oldStatus := existing.Status
+		log.Debug().
+			Uint64("local_node", nr.localNodeID).
+			Uint64("update_node", node.NodeId).
+			Str("old_status", oldStatus.String()).
+			Str("new_status", node.Status.String()).
+			Uint64("old_inc", existing.Incarnation).
+			Uint64("new_inc", node.Incarnation).
+			Msg("REGISTRY: Updating node (higher incarnation)")
 		nr.nodes[node.NodeId] = node
 
 		// Check if node became ALIVE
@@ -109,7 +134,23 @@ func (nr *NodeRegistry) Update(node *NodeState) {
 		}
 	} else if node.Incarnation == existing.Incarnation && nr.shouldEscalate(existing.Status, node.Status) {
 		// Same incarnation: only allow escalation (ALIVE -> SUSPECT -> DEAD)
+		log.Debug().
+			Uint64("local_node", nr.localNodeID).
+			Uint64("update_node", node.NodeId).
+			Str("old_status", existing.Status.String()).
+			Str("new_status", node.Status.String()).
+			Uint64("incarnation", node.Incarnation).
+			Msg("REGISTRY: Escalating node status (same incarnation)")
 		existing.Status = node.Status
+	} else {
+		log.Debug().
+			Uint64("local_node", nr.localNodeID).
+			Uint64("update_node", node.NodeId).
+			Str("existing_status", existing.Status.String()).
+			Str("incoming_status", node.Status.String()).
+			Uint64("existing_inc", existing.Incarnation).
+			Uint64("incoming_inc", node.Incarnation).
+			Msg("REGISTRY: Ignoring update (stale or invalid)")
 	}
 	// Ignore updates with same/older incarnation that don't escalate
 
@@ -127,8 +168,9 @@ func (nr *NodeRegistry) Update(node *NodeState) {
 	}
 }
 
-// handleSelfUpdate implements SWIM refutation for local node
-func (nr *NodeRegistry) handleSelfUpdate(node *NodeState) {
+// handleSelfUpdateLocked implements SWIM refutation for local node
+// Caller must hold nr.mu lock
+func (nr *NodeRegistry) handleSelfUpdateLocked(node *NodeState) {
 	self := nr.nodes[nr.localNodeID]
 
 	// If someone claims we're SUSPECT/DEAD, refute by incrementing incarnation

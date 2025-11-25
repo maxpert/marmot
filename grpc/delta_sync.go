@@ -2,8 +2,11 @@ package grpc
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 
 	"github.com/maxpert/marmot/cfg"
@@ -51,11 +54,11 @@ func NewDeltaSyncClient(config DeltaSyncConfig) *DeltaSyncClient {
 
 // DeltaSyncResult contains the result of a delta sync operation
 type DeltaSyncResult struct {
-	Database           string
-	TxnsApplied        int
-	LastAppliedTxnID   uint64
-	LastAppliedTS      *hlc.Timestamp
-	Err                error
+	Database         string
+	TxnsApplied      int
+	LastAppliedTxnID uint64
+	LastAppliedTS    *hlc.Timestamp
+	Err              error
 }
 
 // SyncFromPeer performs delta sync for a specific database from a peer
@@ -304,9 +307,39 @@ func (ds *DeltaSyncClient) applyChangeEvent(ctx context.Context, event *ChangeEv
 	defer tx.Rollback()
 
 	for _, stmt := range event.Statements {
-		if _, err := tx.ExecContext(ctx, stmt.Sql); err != nil {
+		// Check for CDC data (RowChange payload)
+		if rowChange := stmt.GetRowChange(); rowChange != nil && (len(rowChange.NewValues) > 0 || len(rowChange.OldValues) > 0) {
+			// CDC path: apply row data directly
+			if err := ds.applyCDCStatement(tx, stmt); err != nil {
+				return fmt.Errorf("failed to apply CDC statement: %w", err)
+			}
+			log.Debug().
+				Str("table", stmt.TableName).
+				Str("row_key", rowChange.RowKey).
+				Int("new_values", len(rowChange.NewValues)).
+				Int("old_values", len(rowChange.OldValues)).
+				Msg("DELTA-SYNC: Applied CDC data")
+			continue
+		}
+
+		// SQL path: execute SQL statement
+		sql := stmt.GetSQL()
+		if sql == "" {
+			// CRITICAL: Don't silently skip - this means CDC data was lost during serialization
+			// Fail the sync so anti-entropy knows to try again or use snapshot
+			return fmt.Errorf("statement has no SQL and no CDC data (table=%s, type=%d) - CDC data may have been lost during serialization", stmt.TableName, stmt.Type)
+		}
+		if _, err := tx.ExecContext(ctx, sql); err != nil {
 			return fmt.Errorf("failed to execute statement: %w", err)
 		}
+		log.Debug().
+			Str("sql_prefix", func() string {
+				if len(sql) > 50 {
+					return sql[:50]
+				}
+				return sql
+			}()).
+			Msg("DELTA-SYNC: Executed SQL")
 	}
 
 	// Commit the transaction
@@ -315,6 +348,104 @@ func (ds *DeltaSyncClient) applyChangeEvent(ctx context.Context, event *ChangeEv
 	}
 
 	return nil
+}
+
+// applyCDCStatement applies a CDC statement to the database
+func (ds *DeltaSyncClient) applyCDCStatement(tx *sql.Tx, stmt *Statement) error {
+	rowChange := stmt.GetRowChange()
+	if rowChange == nil {
+		return fmt.Errorf("no row change data")
+	}
+
+	switch stmt.Type {
+	case StatementType_INSERT, StatementType_REPLACE:
+		return ds.applyCDCInsert(tx, stmt.TableName, rowChange.NewValues)
+	case StatementType_UPDATE:
+		return ds.applyCDCUpdate(tx, stmt.TableName, rowChange.RowKey, rowChange.NewValues)
+	case StatementType_DELETE:
+		return ds.applyCDCDelete(tx, stmt.TableName, rowChange.RowKey, rowChange.OldValues)
+	default:
+		return fmt.Errorf("unsupported statement type for CDC: %v", stmt.Type)
+	}
+}
+
+// applyCDCInsert performs INSERT OR REPLACE using CDC row data
+func (ds *DeltaSyncClient) applyCDCInsert(tx *sql.Tx, tableName string, newValues map[string][]byte) error {
+	if len(newValues) == 0 {
+		return fmt.Errorf("no values to insert")
+	}
+
+	columns := make([]string, 0, len(newValues))
+	placeholders := make([]string, 0, len(newValues))
+	values := make([]interface{}, 0, len(newValues))
+
+	for col := range newValues {
+		columns = append(columns, col)
+		placeholders = append(placeholders, "?")
+
+		var value interface{}
+		if err := json.Unmarshal(newValues[col], &value); err != nil {
+			return fmt.Errorf("failed to deserialize value for column %s: %w", col, err)
+		}
+		values = append(values, value)
+	}
+
+	sqlStmt := fmt.Sprintf("INSERT OR REPLACE INTO %s (%s) VALUES (%s)",
+		tableName,
+		strings.Join(columns, ", "),
+		strings.Join(placeholders, ", "))
+
+	_, err := tx.Exec(sqlStmt, values...)
+	return err
+}
+
+// applyCDCUpdate performs UPDATE using CDC row data
+func (ds *DeltaSyncClient) applyCDCUpdate(tx *sql.Tx, tableName string, rowKey string, newValues map[string][]byte) error {
+	if len(newValues) == 0 {
+		return fmt.Errorf("no values to update")
+	}
+
+	// For simplicity, convert UPDATE to INSERT OR REPLACE (upsert semantics)
+	// This works because we have all the column values in CDC
+	return ds.applyCDCInsert(tx, tableName, newValues)
+}
+
+// applyCDCDelete performs DELETE using CDC row data
+func (ds *DeltaSyncClient) applyCDCDelete(tx *sql.Tx, tableName string, rowKey string, oldValues map[string][]byte) error {
+	// Use row key to identify primary key
+	// For single-column PK, rowKey is the value
+	// For compound PK, rowKey is col1:val1|col2:val2
+
+	if rowKey == "" && len(oldValues) == 0 {
+		return fmt.Errorf("no row key or old values for delete")
+	}
+
+	// If we have old values, extract PK columns and build WHERE clause
+	if len(oldValues) > 0 {
+		// Use all columns as WHERE clause (safe but may be slower)
+		whereClauses := make([]string, 0, len(oldValues))
+		values := make([]interface{}, 0, len(oldValues))
+
+		for col, valBytes := range oldValues {
+			whereClauses = append(whereClauses, fmt.Sprintf("%s = ?", col))
+			var value interface{}
+			if err := json.Unmarshal(valBytes, &value); err != nil {
+				return fmt.Errorf("failed to deserialize value for column %s: %w", col, err)
+			}
+			values = append(values, value)
+		}
+
+		sqlStmt := fmt.Sprintf("DELETE FROM %s WHERE %s",
+			tableName,
+			strings.Join(whereClauses, " AND "))
+
+		_, err := tx.Exec(sqlStmt, values...)
+		return err
+	}
+
+	// Fallback: use row key (assumes single PK column named 'id')
+	_, err := tx.Exec(fmt.Sprintf("DELETE FROM %s WHERE id = ?", tableName), rowKey)
+	return err
 }
 
 // GetPeerReplicationLag queries a peer to get its current replication state

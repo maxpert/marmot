@@ -54,14 +54,14 @@ type Transaction struct {
 
 // ReplicationRequest is sent to replica nodes
 type ReplicationRequest struct {
-	TxnID                 uint64
-	NodeID                uint64
-	Statements            []protocol.Statement
-	StartTS               hlc.Timestamp
+	TxnID      uint64
+	NodeID     uint64
+	Statements []protocol.Statement
+	StartTS    hlc.Timestamp
 	// Phase indicates transaction phase
-	Phase                 ReplicationPhase
+	Phase ReplicationPhase
 	// Target database name
-	Database              string
+	Database string
 	// Minimum schema version required to execute this transaction
 	RequiredSchemaVersion uint64
 }
@@ -108,6 +108,13 @@ func NewWriteCoordinator(nodeID uint64, nodeProvider NodeProvider, replicator Re
 // - Background replication continues to stragglers
 // - Dead nodes catch up via snapshot + delta logs when they rejoin
 func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transaction) error {
+	log.Debug().
+		Uint64("node_id", wc.nodeID).
+		Uint64("txn_id", txn.ID).
+		Str("database", txn.Database).
+		Int("stmt_count", len(txn.Statements)).
+		Msg("2PC: WriteTransaction started")
+
 	// Get all alive nodes for full replication
 	allNodes, err := wc.nodeProvider.GetAliveNodes()
 	if err != nil {
@@ -118,6 +125,13 @@ func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transacti
 	if clusterSize == 0 {
 		return fmt.Errorf("no alive nodes in cluster")
 	}
+
+	log.Debug().
+		Uint64("node_id", wc.nodeID).
+		Uint64("txn_id", txn.ID).
+		Int("cluster_size", clusterSize).
+		Interface("alive_nodes", allNodes).
+		Msg("2PC: Cluster state")
 
 	// Validate consistency level against cluster size
 	if err := ValidateConsistencyLevel(txn.WriteConsistency, clusterSize); err != nil {
@@ -175,20 +189,30 @@ func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transacti
 		respChan <- response{nodeID: wc.nodeID, resp: resp, err: err}
 	}()
 
-	// Collect responses
+	// Collect responses from all nodes before proceeding to commit phase
 	prepResponses := make(map[uint64]*ReplicationResponse)
-	for i := 0; i < len(otherNodes)+1; i++ {
+	totalNodes := len(otherNodes) + 1
+
+	// Wait for all nodes to respond to ensure consistent commit phase
+	// Note: Early exit optimization was removed because it caused nodes that responded
+	// after quorum to be excluded from the commit phase, leading to failures
+	for i := 0; i < totalNodes; i++ {
 		select {
 		case r := <-respChan:
 			if r.err != nil {
 				log.Error().Err(r.err).Uint64("node_id", r.nodeID).Msg("Prepare failed")
-				continue
-			}
-			// Only count successful responses
-			if r.resp != nil && r.resp.Success {
+			} else if r.resp != nil && r.resp.Success {
 				prepResponses[r.nodeID] = r.resp
 			} else {
-				log.Warn().Uint64("node_id", r.nodeID).Msg("Prepare returned unsuccessful response")
+				errorMsg := "unknown"
+				if r.resp != nil {
+					errorMsg = r.resp.Error
+				}
+				log.Warn().
+					Uint64("node_id", r.nodeID).
+					Uint64("txn_id", txn.ID).
+					Str("error", errorMsg).
+					Msg("Prepare returned unsuccessful response")
 			}
 		case <-ctx.Done():
 			return fmt.Errorf("prepare timeout")
@@ -198,25 +222,35 @@ func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transacti
 	// Check for conflicts from remote nodes
 	for nodeID, resp := range prepResponses {
 		if resp.ConflictDetected {
-			// Write-write conflict detected on remote node - ABORT
-			wc.abortTransaction(ctx, allNodes, txn.ID) // Abort all nodes, including self if it prepared
-			return fmt.Errorf("write-write conflict detected on node %d: %s (TRANSACTION ABORTED)",
-				nodeID, resp.ConflictDetails)
+			log.Warn().
+				Uint64("node_id", nodeID).
+				Uint64("txn_id", txn.ID).
+				Str("conflict_details", resp.ConflictDetails).
+				Msg("Write-write conflict detected - aborting transaction")
+
+			wc.abortTransaction(ctx, allNodes, txn.ID)
+			return &protocol.MySQLError{
+				Code:     1205, // ER_LOCK_WAIT_TIMEOUT
+				SQLState: "HY000",
+				Message:  fmt.Sprintf("write-write conflict detected on node %d: %s (TRANSACTION ABORTED)", nodeID, resp.ConflictDetails),
+			}
 		}
 	}
 
-	// Count responses: remote nodes + self
-	totalAcks := len(prepResponses)
-
 	// Check if quorum was achieved
+	totalAcks := len(prepResponses)
 	if totalAcks < requiredQuorum {
-		// Quorum not achieved - abort
-		wc.abortTransaction(ctx, allNodes, txn.ID) // Abort all nodes, including self if it prepared
+		log.Warn().
+			Uint64("txn_id", txn.ID).
+			Int("total_acks", totalAcks).
+			Int("required_quorum", requiredQuorum).
+			Int("cluster_size", clusterSize).
+			Msg("Prepare quorum not achieved - aborting transaction")
+
+		wc.abortTransaction(ctx, allNodes, txn.ID)
 		return fmt.Errorf("prepare quorum not achieved: got %d acks, need %d out of %d nodes (TRANSACTION ABORTED)",
 			totalAcks, requiredQuorum, clusterSize)
 	}
-
-	// Quorum achieved! Proceed to commit phase
 
 	// ====================
 	// PHASE 2: COMMIT
@@ -247,21 +281,32 @@ func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transacti
 		}(nodeID)
 	}
 
-	// Wait for commits (best effort)
+	// Wait for QUORUM commits only (not all prepared nodes)
 	commitResponses := make(map[uint64]*ReplicationResponse)
 	for i := 0; i < len(prepResponses); i++ {
 		select {
 		case r := <-commitChan:
-			if r.err == nil {
+			if r.err == nil && r.resp != nil && r.resp.Success {
 				commitResponses[r.nodeID] = r.resp
+
+				// OPTIMIZATION: Return early once quorum achieved
+				if len(commitResponses) >= requiredQuorum {
+					goto commitQuorumAchieved
+				}
 			} else {
 				log.Error().Err(r.err).Uint64("node_id", r.nodeID).Msg("Commit failed")
 			}
 		case <-time.After(wc.timeout):
-			// Timeout on commit is okay, we assume eventual consistency via recovery
+			// Timeout on commit - check if we already have quorum
+			if len(commitResponses) >= requiredQuorum {
+				log.Warn().Msg("Commit timeout for some nodes, but quorum achieved")
+				goto commitQuorumAchieved
+			}
 			log.Warn().Msg("Commit response timed out for one or more nodes. Will be repaired by anti-entropy.")
 		}
 	}
+
+commitQuorumAchieved:
 
 	// Count commit acks
 	totalCommitAcks := len(commitResponses)
@@ -280,6 +325,13 @@ func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transacti
 	// Success! Transaction committed on quorum of nodes
 	// Coordinator returns success to client
 	// Background: Stragglers will catch up via anti-entropy
+	log.Debug().
+		Uint64("node_id", wc.nodeID).
+		Uint64("txn_id", txn.ID).
+		Int("commit_acks", totalCommitAcks).
+		Int("required_quorum", requiredQuorum).
+		Msg("2PC: Transaction committed successfully")
+
 	return nil
 }
 

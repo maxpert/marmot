@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"database/sql"
+	"fmt"
 	"regexp"
 	"strings"
 	"sync"
@@ -33,13 +34,100 @@ func init() {
 	}
 }
 
+// transpileMySQLToSQLite converts MySQL-specific syntax to SQLite-compatible syntax
+// This handles all known syntax differences between MySQL DML and SQLite
+func transpileMySQLToSQLite(sql string) string {
+	// === INSERT statements ===
+
+	// INSERT IGNORE INTO -> INSERT OR IGNORE INTO
+	re := regexp.MustCompile(`(?i)\bINSERT\s+IGNORE\s+INTO\b`)
+	sql = re.ReplaceAllString(sql, "INSERT OR IGNORE INTO")
+
+	// REPLACE INTO -> INSERT OR REPLACE INTO
+	// Only match REPLACE at start of statement (not "INSERT OR REPLACE")
+	re = regexp.MustCompile(`(?i)^\s*REPLACE\s+INTO\b`)
+	sql = re.ReplaceAllString(sql, "INSERT OR REPLACE INTO")
+
+	// === Index hints (all statement types) ===
+
+	// FORCE INDEX(name) or FORCE INDEX(`name`)
+	re = regexp.MustCompile(`(?i)\s+FORCE\s+INDEX\s*\([^)]+\)`)
+	sql = re.ReplaceAllString(sql, "")
+
+	// USE INDEX(name)
+	re = regexp.MustCompile(`(?i)\s+USE\s+INDEX\s*\([^)]+\)`)
+	sql = re.ReplaceAllString(sql, "")
+
+	// IGNORE INDEX(name)
+	re = regexp.MustCompile(`(?i)\s+IGNORE\s+INDEX\s*\([^)]+\)`)
+	sql = re.ReplaceAllString(sql, "")
+
+	// === SELECT hints and modifiers ===
+
+	// STRAIGHT_JOIN
+	re = regexp.MustCompile(`(?i)\bSTRAIGHT_JOIN\b`)
+	sql = re.ReplaceAllString(sql, "JOIN")
+
+	// SQL_CALC_FOUND_ROWS
+	re = regexp.MustCompile(`(?i)\bSQL_CALC_FOUND_ROWS\b`)
+	sql = re.ReplaceAllString(sql, "")
+
+	// SQL_CACHE / SQL_NO_CACHE
+	re = regexp.MustCompile(`(?i)\bSQL_(NO_)?CACHE\b`)
+	sql = re.ReplaceAllString(sql, "")
+
+	// SQL_SMALL_RESULT / SQL_BIG_RESULT / SQL_BUFFER_RESULT
+	re = regexp.MustCompile(`(?i)\bSQL_(SMALL|BIG|BUFFER)_RESULT\b`)
+	sql = re.ReplaceAllString(sql, "")
+
+	// HIGH_PRIORITY / LOW_PRIORITY / DELAYED
+	re = regexp.MustCompile(`(?i)\b(HIGH|LOW)_PRIORITY\b`)
+	sql = re.ReplaceAllString(sql, "")
+	re = regexp.MustCompile(`(?i)\bDELAYED\b`)
+	sql = re.ReplaceAllString(sql, "")
+
+	// === Locking clauses ===
+
+	// FOR UPDATE
+	re = regexp.MustCompile(`(?i)\s+FOR\s+UPDATE(\s+|$)`)
+	sql = re.ReplaceAllString(sql, " ")
+
+	// LOCK IN SHARE MODE
+	re = regexp.MustCompile(`(?i)\s+LOCK\s+IN\s+SHARE\s+MODE(\s+|$)`)
+	sql = re.ReplaceAllString(sql, " ")
+
+	// === LIMIT clause ===
+
+	// MySQL: LIMIT offset, count → SQLite: LIMIT count OFFSET offset
+	re = regexp.MustCompile(`(?i)\bLIMIT\s+(\d+)\s*,\s*(\d+)`)
+	sql = re.ReplaceAllStringFunc(sql, func(match string) string {
+		parts := regexp.MustCompile(`(?i)\bLIMIT\s+(\d+)\s*,\s*(\d+)`).FindStringSubmatch(match)
+		if len(parts) == 3 {
+			return fmt.Sprintf("LIMIT %s OFFSET %s", parts[2], parts[1])
+		}
+		return match
+	})
+
+	// Clean up multiple spaces left by removals
+	re = regexp.MustCompile(`\s+`)
+	sql = re.ReplaceAllString(sql, " ")
+
+	// Clean up space before closing parenthesis or comma
+	sql = strings.TrimSpace(sql)
+
+	return sql
+}
+
 // ValidateSQLiteSyntax checks if a query is valid SQLite syntax
 // Returns nil if valid, error if invalid (only for true syntax errors)
 func ValidateSQLiteSyntax(query string) error {
 	sqliteCheckerMu.Lock()
 	defer sqliteCheckerMu.Unlock()
 
-	stmt, err := sqliteSyntaxChecker.Prepare(query)
+	// Translate MySQL-specific syntax to SQLite for validation
+	queryToValidate := transpileMySQLToSQLite(query)
+
+	stmt, err := sqliteSyntaxChecker.Prepare(queryToValidate)
 	if err != nil {
 		errStr := err.Error()
 		// Ignore "no such table/column" errors - those are schema errors, not syntax errors
@@ -286,6 +374,22 @@ func ParseStatementVitess(sql string) Statement {
 		return stmt
 	}
 
+	// Check for SQLite-specific INSERT syntax (from transpiled MySQL queries)
+	// INSERT OR IGNORE INTO ... or INSERT OR REPLACE INTO ...
+	insertOrPattern := regexp.MustCompile(`(?i)^\s*INSERT\s+OR\s+(IGNORE|REPLACE)\s+INTO\s+(\w+)`)
+	if matches := insertOrPattern.FindStringSubmatch(sql); len(matches) > 0 {
+		if len(matches) > 1 && strings.ToUpper(matches[1]) == "REPLACE" {
+			stmt.Type = StatementReplace
+		} else {
+			stmt.Type = StatementInsert
+		}
+		// Extract table name
+		if len(matches) > 2 {
+			stmt.TableName = matches[2]
+		}
+		return stmt
+	}
+
 	// Check for DDL statements that Vitess might not handle properly
 	// Triggers
 	if createTriggerPattern.MatchString(sql) || dropTriggerPattern.MatchString(sql) {
@@ -379,7 +483,13 @@ func ParseStatementVitess(sql string) Statement {
 		if fallback.Type != StatementSelect {
 			return fallback
 		}
-		// Unknown - treat as SELECT (safe default)
+		// Unknown statement - validate against SQLite to check if it's valid SQL
+		if validateErr := ValidateSQLiteSyntax(sql); validateErr != nil {
+			stmt.Type = StatementUnsupported
+			stmt.Error = "invalid SQL syntax: " + validateErr.Error()
+			return stmt
+		}
+		// Valid SQL but unknown type - treat as SELECT (safe default)
 		stmt.Type = StatementSelect
 		return stmt
 	}
@@ -622,6 +732,10 @@ func ParseStatementVitess(sql string) Statement {
 		stripDatabaseQualifiers(parsed)
 		stmt.SQL = sqlparser.String(parsed)
 	}
+
+	// Transpile MySQL-specific syntax to SQLite-compatible syntax
+	// This must be done AFTER sqlparser.String() to fix the rendered SQL
+	stmt.SQL = transpileMySQLToSQLite(stmt.SQL)
 
 	return stmt
 }

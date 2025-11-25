@@ -47,11 +47,11 @@ create_db /tmp/marmot-node-1/marmot.db
 create_db /tmp/marmot-node-2/marmot.db
 create_db /tmp/marmot-node-3/marmot.db
 
-# Build marmot if needed
-if [ ! -f "$REPO_ROOT/marmot" ]; then
-    echo "Building marmot..."
+# Build marmot-v2 if needed
+if [ ! -f "$REPO_ROOT/marmot-v2" ]; then
+    echo "Building marmot-v2..."
     cd "$REPO_ROOT"
-    go build -o marmot .
+    go build -o marmot-v2 .
     echo "✓ Build complete"
 fi
 
@@ -73,21 +73,21 @@ echo "  Node 3: gRPC 8083, MySQL 3309"
 echo ""
 
 # Start Node 1
-"$REPO_ROOT/marmot" --config "$SCRIPT_DIR/node-1-config.toml" > /tmp/marmot-node-1/marmot.log 2>&1 &
+"$REPO_ROOT/marmot-v2" --config "$SCRIPT_DIR/node-1-config.toml" > /tmp/marmot-node-1/marmot.log 2>&1 &
 job1=$!
 echo "✓ Node 1 started (PID: $job1)"
 
 sleep 2
 
 # Start Node 2
-"$REPO_ROOT/marmot" --config "$SCRIPT_DIR/node-2-config.toml" > /tmp/marmot-node-2/marmot.log 2>&1 &
+"$REPO_ROOT/marmot-v2" --config "$SCRIPT_DIR/node-2-config.toml" > /tmp/marmot-node-2/marmot.log 2>&1 &
 job2=$!
 echo "✓ Node 2 started (PID: $job2)"
 
 sleep 2
 
 # Start Node 3
-"$REPO_ROOT/marmot" --config "$SCRIPT_DIR/node-3-config.toml" > /tmp/marmot-node-3/marmot.log 2>&1 &
+"$REPO_ROOT/marmot-v2" --config "$SCRIPT_DIR/node-3-config.toml" > /tmp/marmot-node-3/marmot.log 2>&1 &
 job3=$!
 echo "✓ Node 3 started (PID: $job3)"
 

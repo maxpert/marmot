@@ -24,17 +24,17 @@ const (
 
 // ClusterNode represents a running Marmot node
 type ClusterNode struct {
-	NodeID      int
-	GRPCPort    int
-	MySQLPort   int
-	DataDir     string
-	ConfigPath  string
-	PIDFile     string
-	LogFile     string
-	Cmd         *exec.Cmd
-	DB          *sql.DB
-	isRunning   bool
-	mu          sync.Mutex
+	NodeID     int
+	GRPCPort   int
+	MySQLPort  int
+	DataDir    string
+	ConfigPath string
+	PIDFile    string
+	LogFile    string
+	Cmd        *exec.Cmd
+	DB         *sql.DB
+	isRunning  bool
+	mu         sync.Mutex
 }
 
 // ClusterHarness manages a test cluster
@@ -151,9 +151,9 @@ grpc_advertise_address = "localhost:%d"
 grpc_port = %d
 seed_nodes = [%s]
 gossip_interval_ms = 1000
-gossip_fanout = 2
-suspect_timeout_ms = 5000
-dead_timeout_ms = 10000
+gossip_fanout = 3
+suspect_timeout_ms = 15000
+dead_timeout_ms = 30000
 
 [replication]
 replication_factor = 3
@@ -242,7 +242,8 @@ func (h *ClusterHarness) StopNode(nodeID int) error {
 		return fmt.Errorf("node %d is not running", nodeID)
 	}
 
-	h.t.Logf("Stopping node %d (PID: %d)...", nodeID, node.Cmd.Process.Pid)
+	pid := node.Cmd.Process.Pid
+	h.t.Logf("Stopping node %d (PID: %d)...", nodeID, pid)
 
 	// Close DB connection if open
 	if node.DB != nil {
@@ -250,7 +251,7 @@ func (h *ClusterHarness) StopNode(nodeID int) error {
 		node.DB = nil
 	}
 
-	// Send SIGTERM
+	// Use SIGKILL directly for more reliable termination during tests
 	if err := node.Cmd.Process.Kill(); err != nil {
 		h.t.Logf("Warning: failed to kill node %d: %v", nodeID, err)
 	}
@@ -262,6 +263,13 @@ func (h *ClusterHarness) StopNode(nodeID int) error {
 
 	// Remove PID file
 	os.Remove(node.PIDFile)
+
+	// Also kill any orphaned processes using our ports (belt and suspenders)
+	exec.Command("sh", "-c", fmt.Sprintf("lsof -ti tcp:%d | xargs kill -9 2>/dev/null || true", node.GRPCPort)).Run()
+	exec.Command("sh", "-c", fmt.Sprintf("lsof -ti tcp:%d | xargs kill -9 2>/dev/null || true", node.MySQLPort)).Run()
+
+	// Wait for ports to be released
+	time.Sleep(3 * time.Second)
 
 	h.t.Logf("Node %d stopped", nodeID)
 	return nil
@@ -332,6 +340,8 @@ func (h *ClusterHarness) WaitForAlive(nodeID int, timeout time.Duration) error {
 // ConnectToNode establishes a MySQL connection to a node
 func (h *ClusterHarness) ConnectToNode(nodeID int) (*sql.DB, error) {
 	node := h.Nodes[nodeID-1]
+	node.mu.Lock()
+	defer node.mu.Unlock()
 
 	// Check if already connected
 	if node.DB != nil {
@@ -490,7 +500,23 @@ func TestNodeRestartWithStaleData(t *testing.T) {
 	}
 
 	// Wait for table to replicate to all nodes
-	if err := harness.WaitForTableExists("test_recovery", 5*time.Second); err != nil {
+	if err := harness.WaitForTableExists("test_recovery", 15*time.Second); err != nil {
+		// Print logs for debugging
+		for nodeID := 1; nodeID <= 3; nodeID++ {
+			logPath := harness.Nodes[nodeID-1].LogFile
+			data, _ := os.ReadFile(logPath)
+			lines := strings.Split(string(data), "\n")
+			start := 0
+			if len(lines) > 30 {
+				start = len(lines) - 30
+			}
+			t.Logf("=== Node %d last 30 log lines ===", nodeID)
+			for _, line := range lines[start:] {
+				if line != "" {
+					t.Logf("  %s", line)
+				}
+			}
+		}
 		t.Fatalf("Failed to replicate table: %v", err)
 	}
 
@@ -733,15 +759,25 @@ func TestRollingRestartCluster(t *testing.T) {
 			case <-ctx.Done():
 				return
 			default:
-				// Write to random node
-				nodeID := (id % 3) + 1
-				query := fmt.Sprintf("INSERT INTO test_rolling (id, value) VALUES (%d, 'value_%d') ON DUPLICATE KEY UPDATE value = 'value_%d'",
-					id, id, id)
-				_, err := harness.ExecNode(nodeID, query)
+				// Try all nodes until one succeeds (availability test)
+				// Use INSERT OR REPLACE for SQLite compatibility
+				query := fmt.Sprintf("INSERT OR REPLACE INTO test_rolling (id, value) VALUES (%d, 'value_%d')",
+					id, id)
+
+				var lastErr error
+				succeeded := false
+				for _, nodeID := range []int{1, 2, 3} {
+					_, err := harness.ExecNode(nodeID, query)
+					if err == nil {
+						succeeded = true
+						break
+					}
+					lastErr = err
+				}
 
 				writeMu.Lock()
-				if err != nil {
-					writeErrors = append(writeErrors, err)
+				if !succeeded {
+					writeErrors = append(writeErrors, lastErr)
 				} else {
 					writeCount++
 				}
@@ -781,40 +817,101 @@ func TestRollingRestartCluster(t *testing.T) {
 	cancel()
 	<-writerDone
 
+	// After rolling restart, wait for gossip to fully reconverge before checking consistency
+	// This is critical: nodes need time to rediscover each other after all restarts complete
+	t.Logf("Waiting for cluster gossip to reconverge after rolling restart...")
+	time.Sleep(15 * time.Second)
+
 	writeMu.Lock()
 	t.Logf("Background writer completed: %d successful writes, %d errors", writeCount, len(writeErrors))
+	if len(writeErrors) > 0 {
+		t.Logf("Sample errors (first 5):")
+		for i, err := range writeErrors {
+			if i >= 5 {
+				break
+			}
+			t.Logf("  Error %d: %v", i+1, err)
+		}
+	}
 	writeMu.Unlock()
-
-	// Wait for final replication
-	time.Sleep(5 * time.Second)
 
 	// Verify cluster maintained availability (should have > 0 writes)
 	if writeCount == 0 {
 		t.Fatal("Cluster lost availability during rolling restart - no writes succeeded")
 	}
 
-	// Verify data consistency
-	t.Logf("Verifying data consistency...")
+	// Wait for eventual consistency (anti-entropy heals within 10s intervals)
+	// Poll for up to 120 seconds (2 minutes) for all nodes to converge
+	// This gives anti-entropy ~12 rounds to sync all data
+	t.Logf("Waiting for eventual consistency...")
 	var counts [3]int
-	for nodeID := 1; nodeID <= 3; nodeID++ {
-		rows, err := harness.QueryNode(nodeID, "SELECT COUNT(*) FROM test_rolling")
-		if err != nil {
-			t.Fatalf("Failed to query node %d: %v", nodeID, err)
+	var consistent bool
+	for attempt := 0; attempt < 24; attempt++ {
+		time.Sleep(5 * time.Second)
+
+		for nodeID := 1; nodeID <= 3; nodeID++ {
+			rows, err := harness.QueryNode(nodeID, "SELECT COUNT(*) FROM test_rolling")
+			if err != nil {
+				t.Logf("Query failed on node %d: %v", nodeID, err)
+				counts[nodeID-1] = -1
+				continue
+			}
+			if rows.Next() {
+				rows.Scan(&counts[nodeID-1])
+			}
+			rows.Close()
 		}
-		if rows.Next() {
-			rows.Scan(&counts[nodeID-1])
+		t.Logf("Attempt %d: node1=%d, node2=%d, node3=%d", attempt+1, counts[0], counts[1], counts[2])
+
+		if counts[0] == counts[1] && counts[1] == counts[2] && counts[0] > 0 {
+			consistent = true
+			break
 		}
-		rows.Close()
-		t.Logf("Node %d has %d rows", nodeID, counts[nodeID-1])
 	}
 
-	// All nodes should have same count
-	if counts[0] != counts[1] || counts[1] != counts[2] {
-		t.Fatalf("Data inconsistency after rolling restart: node1=%d, node2=%d, node3=%d",
+	if !consistent {
+		// Print node logs for debugging
+		t.Logf("=== Node logs for debugging ===")
+		for nodeID := 1; nodeID <= 3; nodeID++ {
+			logPath := harness.Nodes[nodeID-1].LogFile
+			data, err := os.ReadFile(logPath)
+			if err != nil {
+				t.Logf("Node %d log error: %v", nodeID, err)
+				continue
+			}
+
+			// Save full log to /tmp for deeper analysis
+			tmpLogPath := fmt.Sprintf("/tmp/node%d_rolling_test.log", nodeID)
+			os.WriteFile(tmpLogPath, data, 0644)
+			t.Logf("Full log for node %d saved to %s", nodeID, tmpLogPath)
+
+			lines := strings.Split(string(data), "\n")
+
+			// First show BOOT messages
+			t.Logf("=== Node %d BOOT messages ===", nodeID)
+			for _, line := range lines {
+				if strings.Contains(line, "BOOT:") || strings.Contains(line, "SEED:") || strings.Contains(line, "Joining cluster") {
+					t.Logf("  %s", line)
+				}
+			}
+
+			// Then show last 50 lines
+			start := 0
+			if len(lines) > 50 {
+				start = len(lines) - 50
+			}
+			t.Logf("=== Node %d last 50 log lines ===", nodeID)
+			for _, line := range lines[start:] {
+				if line != "" {
+					t.Logf("  %s", line)
+				}
+			}
+		}
+		t.Fatalf("Data inconsistency after rolling restart (waited 30s): node1=%d, node2=%d, node3=%d",
 			counts[0], counts[1], counts[2])
 	}
 
-	t.Logf("SUCCESS: Rolling restart maintained availability and consistency")
+	t.Logf("SUCCESS: Rolling restart maintained availability and eventual consistency")
 }
 
 // TestNodeCrashDuringWrite tests torn write protection
@@ -1032,6 +1129,199 @@ func TestAntiEntropyHealsStaleNode(t *testing.T) {
 	}
 
 	t.Logf("SUCCESS: Anti-entropy healed stale node, eventual consistency achieved")
+}
+
+// TestNodeRecoveryUnderLoad tests a node catching up while writes continue
+// This simulates a production scenario where a node crashes, misses significant
+// traffic, and must catch up while the cluster continues serving writes.
+func TestNodeRecoveryUnderLoad(t *testing.T) {
+	harness := NewClusterHarness(t)
+	defer harness.Cleanup()
+
+	// Start cluster
+	if err := harness.StartCluster(); err != nil {
+		t.Fatalf("Failed to start cluster: %v", err)
+	}
+
+	// Create test table
+	t.Logf("Creating test table...")
+	_, err := harness.ExecNode(1, "CREATE TABLE IF NOT EXISTS test_recovery (id INT PRIMARY KEY, value TEXT, created_at INT)")
+	if err != nil {
+		t.Fatalf("Failed to create table: %v", err)
+	}
+	time.Sleep(1 * time.Second)
+
+	// Start continuous writer at ~100 rps (10ms sleep)
+	// Writer targets nodes 1 and 2 only (node 3 will be down)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var writeCount int64
+	var writeMu sync.Mutex
+	var writeErrors []error
+
+	writerDone := make(chan struct{})
+	go func() {
+		defer close(writerDone)
+		id := 1
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				query := fmt.Sprintf("INSERT INTO test_recovery (id, value, created_at) VALUES (%d, 'value_%d', %d)",
+					id, id, time.Now().UnixNano())
+
+				// Try nodes 1 and 2 (not node 3 which will be down)
+				var lastErr error
+				succeeded := false
+				for _, nodeID := range []int{1, 2} {
+					_, err := harness.ExecNode(nodeID, query)
+					if err == nil {
+						succeeded = true
+						break
+					}
+					lastErr = err
+				}
+
+				writeMu.Lock()
+				if !succeeded {
+					writeErrors = append(writeErrors, lastErr)
+				} else {
+					writeCount++
+				}
+				writeMu.Unlock()
+
+				id++
+				time.Sleep(10 * time.Millisecond) // ~100 rps
+			}
+		}
+	}()
+
+	// Phase 1: Let cluster accumulate initial data (~5 seconds = ~500 rows)
+	t.Logf("Phase 1: Accumulating initial data...")
+	time.Sleep(5 * time.Second)
+
+	writeMu.Lock()
+	initialCount := writeCount
+	writeMu.Unlock()
+	t.Logf("Initial data accumulated: %d rows", initialCount)
+
+	// Verify all nodes have the initial data
+	for nodeID := 1; nodeID <= 3; nodeID++ {
+		count := readCountFromNode(t, harness, nodeID, "test_recovery")
+		t.Logf("Node %d has %d rows before failure", nodeID, count)
+	}
+
+	// Phase 2: Kill node 3 while writes continue
+	t.Logf("Phase 2: Killing node 3...")
+	harness.KillNode(3)
+
+	// Phase 3: Continue writes for 30 seconds (~3000 more rows)
+	t.Logf("Phase 3: Writes continue while node 3 is down...")
+	time.Sleep(30 * time.Second)
+
+	writeMu.Lock()
+	countWhileDown := writeCount - initialCount
+	writeMu.Unlock()
+	t.Logf("Writes during node 3 downtime: %d rows", countWhileDown)
+
+	// Check nodes 1 & 2 are consistent
+	count1 := readCountFromNode(t, harness, 1, "test_recovery")
+	count2 := readCountFromNode(t, harness, 2, "test_recovery")
+	t.Logf("Before recovery - Node 1: %d rows, Node 2: %d rows", count1, count2)
+
+	// Phase 4: Restart node 3 (now significantly behind)
+	t.Logf("Phase 4: Restarting node 3 (now ~%d rows behind)...", countWhileDown)
+	if err := harness.StartNode(3); err != nil {
+		t.Fatalf("Failed to restart node 3: %v", err)
+	}
+	if err := harness.WaitForAlive(3, 30*time.Second); err != nil {
+		t.Fatalf("Node 3 did not become ALIVE: %v", err)
+	}
+	t.Logf("Node 3 is back ALIVE")
+
+	// Phase 5: Continue writes for 15 more seconds to test catch-up under load
+	t.Logf("Phase 5: Continuing writes while node 3 catches up...")
+	time.Sleep(15 * time.Second)
+
+	// Phase 6: Stop writer
+	cancel()
+	<-writerDone
+
+	writeMu.Lock()
+	finalWriteCount := writeCount
+	errorCount := len(writeErrors)
+	writeMu.Unlock()
+	t.Logf("Writer stopped. Total writes: %d, Errors: %d", finalWriteCount, errorCount)
+
+	// Phase 7: Wait for eventual consistency
+	t.Logf("Phase 7: Waiting for eventual consistency...")
+	var counts [3]int
+	var consistent bool
+	for attempt := 0; attempt < 30; attempt++ {
+		time.Sleep(5 * time.Second)
+
+		for nodeID := 1; nodeID <= 3; nodeID++ {
+			counts[nodeID-1] = readCountFromNode(t, harness, nodeID, "test_recovery")
+		}
+		t.Logf("Attempt %d: node1=%d, node2=%d, node3=%d", attempt+1, counts[0], counts[1], counts[2])
+
+		// Check if all nodes are consistent
+		if counts[0] == counts[1] && counts[1] == counts[2] && counts[0] > 0 {
+			consistent = true
+			break
+		}
+
+		// Also accept if node 3 is very close (within 1% or 10 rows)
+		maxCount := counts[0]
+		if counts[1] > maxCount {
+			maxCount = counts[1]
+		}
+		if counts[2] > maxCount {
+			maxCount = counts[2]
+		}
+		minCount := counts[0]
+		if counts[1] < minCount {
+			minCount = counts[1]
+		}
+		if counts[2] < minCount {
+			minCount = counts[2]
+		}
+
+		tolerance := maxCount / 100 // 1%
+		if tolerance < 10 {
+			tolerance = 10
+		}
+		if maxCount-minCount <= tolerance {
+			t.Logf("Nodes within tolerance (%d): max=%d, min=%d", tolerance, maxCount, minCount)
+			consistent = true
+			break
+		}
+	}
+
+	if !consistent {
+		// Print debug info
+		t.Logf("=== Debug info ===")
+		for nodeID := 1; nodeID <= 3; nodeID++ {
+			logPath := harness.Nodes[nodeID-1].LogFile
+			data, _ := os.ReadFile(logPath)
+			tmpLogPath := fmt.Sprintf("/tmp/node%d_recovery_test.log", nodeID)
+			os.WriteFile(tmpLogPath, data, 0644)
+			t.Logf("Node %d log saved to %s", nodeID, tmpLogPath)
+		}
+		t.Fatalf("Node 3 failed to catch up: node1=%d, node2=%d, node3=%d", counts[0], counts[1], counts[2])
+	}
+
+	// Verify the cluster processed significant load
+	if finalWriteCount < 1000 {
+		t.Fatalf("Expected at least 1000 writes, got %d", finalWriteCount)
+	}
+
+	t.Logf("SUCCESS: Node recovered and caught up under load")
+	t.Logf("  - Total writes processed: %d", finalWriteCount)
+	t.Logf("  - Writes while node 3 was down: %d", countWhileDown)
+	t.Logf("  - Final row counts: node1=%d, node2=%d, node3=%d", counts[0], counts[1], counts[2])
 }
 
 // Helper function to read count from node

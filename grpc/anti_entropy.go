@@ -25,10 +25,10 @@ type AntiEntropyService struct {
 	snapshotFunc SnapshotTransferFunc
 
 	// Configuration
-	interval                    time.Duration
-	deltaThresholdTxns          int
-	deltaThresholdSeconds       int
-	enabled                     bool
+	interval              time.Duration
+	deltaThresholdTxns    int
+	deltaThresholdSeconds int
+	enabled               bool
 
 	// Control
 	stopCh  chan struct{}
@@ -42,17 +42,17 @@ type SnapshotTransferFunc func(ctx context.Context, peerNodeID uint64, peerAddr 
 
 // AntiEntropyConfig holds configuration for anti-entropy service
 type AntiEntropyConfig struct {
-	NodeID                  uint64
-	Registry                *NodeRegistry
-	Client                  *Client
-	DBManager               *db.DatabaseManager
-	DeltaSync               *DeltaSyncClient
-	Clock                   *hlc.Clock
-	SnapshotFunc            SnapshotTransferFunc
-	Interval                time.Duration
-	DeltaThresholdTxns      int
-	DeltaThresholdSeconds   int
-	Enabled                 bool
+	NodeID                uint64
+	Registry              *NodeRegistry
+	Client                *Client
+	DBManager             *db.DatabaseManager
+	DeltaSync             *DeltaSyncClient
+	Clock                 *hlc.Clock
+	SnapshotFunc          SnapshotTransferFunc
+	Interval              time.Duration
+	DeltaThresholdTxns    int
+	DeltaThresholdSeconds int
+	Enabled               bool
 }
 
 // NewAntiEntropyService creates a new anti-entropy service
@@ -147,8 +147,9 @@ func (ae *AntiEntropyService) runLoop() {
 	ticker := time.NewTicker(ae.interval)
 	defer ticker.Stop()
 
-	// Run once immediately on startup
-	ae.performAntiEntropy()
+	// Wait briefly for gossip to discover cluster members, then run anti-entropy
+	// This ensures we have ALIVE peers to sync with after a restart
+	ae.runStartupSync()
 
 	for {
 		select {
@@ -158,6 +159,60 @@ func (ae *AntiEntropyService) runLoop() {
 			return
 		}
 	}
+}
+
+// runStartupSync performs anti-entropy at startup, waiting for peers if needed
+func (ae *AntiEntropyService) runStartupSync() {
+	log.Debug().
+		Uint64("node_id", ae.nodeID).
+		Str("timestamp", time.Now().Format("15:04:05.000")).
+		Msg("ANTI-ENTROPY: Running startup sync")
+
+	// Try up to 5 times with 2 second delays to find ALIVE peers
+	// This gives gossip time to propagate membership after a restart
+	maxAttempts := 5
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		nodes := ae.registry.GetAll()
+		aliveCount := 0
+		for _, node := range nodes {
+			if node.Status == NodeStatus_ALIVE && node.NodeId != ae.nodeID {
+				aliveCount++
+			}
+		}
+
+		if aliveCount > 0 {
+			log.Debug().
+				Uint64("node_id", ae.nodeID).
+				Int("alive_peers", aliveCount).
+				Int("attempt", attempt).
+				Str("timestamp", time.Now().Format("15:04:05.000")).
+				Msg("ANTI-ENTROPY: Found ALIVE peers, starting sync")
+			ae.performAntiEntropy()
+			return
+		}
+
+		log.Debug().
+			Uint64("node_id", ae.nodeID).
+			Int("attempt", attempt).
+			Int("max_attempts", maxAttempts).
+			Str("timestamp", time.Now().Format("15:04:05.000")).
+			Msg("ANTI-ENTROPY: No ALIVE peers found, waiting for gossip")
+
+		// Wait for gossip to discover peers (unless this is the last attempt)
+		if attempt < maxAttempts {
+			select {
+			case <-time.After(2 * time.Second):
+				// Continue to next attempt
+			case <-ae.stopCh:
+				return
+			}
+		}
+	}
+
+	log.Debug().
+		Uint64("node_id", ae.nodeID).
+		Str("timestamp", time.Now().Format("15:04:05.000")).
+		Msg("ANTI-ENTROPY: No ALIVE peers after startup wait, will sync on next interval")
 }
 
 // performAntiEntropy performs a single anti-entropy round
@@ -181,22 +236,159 @@ func (ae *AntiEntropyService) performAntiEntropy() {
 		return
 	}
 
-	log.Info().
+	log.Debug().
+		Uint64("node_id", ae.nodeID).
 		Int("peer_count", len(aliveNodes)).
-		Msg("Checking replication lag across peers")
+		Str("timestamp", time.Now().Format("15:04:05.000")).
+		Msg("ANTI-ENTROPY: Starting round")
 
-	// Check and sync each peer
-	var wg sync.WaitGroup
-	for _, node := range aliveNodes {
-		wg.Add(1)
-		go func(peerNode *NodeState) {
-			defer wg.Done()
-			ae.syncPeer(ctx, peerNode)
-		}(node)
+	// For each database, find the peer with highest max_txn_id and sync ONLY from that peer
+	// This prevents race conditions from concurrent snapshot downloads
+	databases := ae.dbManager.ListDatabases()
+	log.Debug().
+		Uint64("node_id", ae.nodeID).
+		Int("database_count", len(databases)).
+		Strs("databases", databases).
+		Msg("ANTI-ENTROPY: Checking databases for sync")
+
+	for _, dbName := range databases {
+		bestPeer := ae.findBestPeerForDatabase(ctx, aliveNodes, dbName)
+		if bestPeer != nil {
+			log.Debug().
+				Uint64("node_id", ae.nodeID).
+				Uint64("best_peer", bestPeer.NodeId).
+				Str("database", dbName).
+				Msg("ANTI-ENTROPY: Found best peer, starting sync")
+			if err := ae.syncPeerDatabase(ctx, bestPeer, dbName); err != nil {
+				log.Warn().
+					Err(err).
+					Uint64("peer_node", bestPeer.NodeId).
+					Str("database", dbName).
+					Msg("Failed to sync from best peer")
+			}
+		} else {
+			log.Debug().
+				Uint64("node_id", ae.nodeID).
+				Str("database", dbName).
+				Msg("ANTI-ENTROPY: No better peer found (we may be up to date)")
+		}
 	}
 
-	wg.Wait()
 	log.Debug().Msg("Anti-entropy round completed")
+}
+
+// findBestPeerForDatabase finds the peer with highest max_txn_id or most transactions
+// Uses two criteria:
+// 1. Higher max_txn_id indicates more recent transactions
+// 2. Higher committed_txn_count indicates more data (tiebreaker when max_txn_id is the same)
+// Returns nil if we're already up to date with all peers
+func (ae *AntiEntropyService) findBestPeerForDatabase(ctx context.Context, aliveNodes []*NodeState, database string) *NodeState {
+	localMaxTxnID, err := ae.dbManager.GetMaxTxnID(database)
+	if err != nil {
+		log.Warn().Err(err).Str("database", database).Msg("Failed to get local max txn_id")
+		localMaxTxnID = 0
+	}
+
+	localTxnCount, err := ae.dbManager.GetCommittedTxnCount(database)
+	if err != nil {
+		log.Warn().Err(err).Str("database", database).Msg("Failed to get local txn count")
+		localTxnCount = 0
+	}
+
+	log.Debug().
+		Uint64("node_id", ae.nodeID).
+		Str("database", database).
+		Uint64("local_max_txn", localMaxTxnID).
+		Int64("local_txn_count", localTxnCount).
+		Int("peers_to_check", len(aliveNodes)).
+		Msg("ANTI-ENTROPY: Comparing with peers")
+
+	var bestPeer *NodeState
+	var bestMaxTxnID uint64 = localMaxTxnID
+	var bestTxnCount int64 = localTxnCount
+
+	for _, peer := range aliveNodes {
+		client, err := ae.client.GetClientByAddress(peer.Address)
+		if err != nil {
+			log.Debug().
+				Err(err).
+				Uint64("node_id", ae.nodeID).
+				Uint64("peer_node", peer.NodeId).
+				Msg("ANTI-ENTROPY: Failed to get client for peer")
+			continue
+		}
+
+		resp, err := client.GetReplicationState(ctx, &ReplicationStateRequest{
+			RequestingNodeId: ae.nodeID,
+			Database:         database,
+		})
+		if err != nil {
+			log.Debug().
+				Err(err).
+				Uint64("node_id", ae.nodeID).
+				Uint64("peer_node", peer.NodeId).
+				Msg("ANTI-ENTROPY: Failed to get replication state from peer")
+			continue
+		}
+
+		for _, state := range resp.States {
+			if state.DatabaseName != database {
+				continue
+			}
+
+			peerMaxTxn := state.CurrentMaxTxnId
+			peerTxnCount := state.CommittedTxnCount
+
+			log.Debug().
+				Uint64("node_id", ae.nodeID).
+				Uint64("peer_node", peer.NodeId).
+				Str("state_db", state.DatabaseName).
+				Uint64("peer_max_txn", peerMaxTxn).
+				Int64("peer_txn_count", peerTxnCount).
+				Uint64("best_max_txn", bestMaxTxnID).
+				Int64("best_txn_count", bestTxnCount).
+				Msg("ANTI-ENTROPY: Checking peer state")
+
+			// Select peer if:
+			// 1. Peer has higher max_txn_id, OR
+			// 2. Peer has same max_txn_id but more committed transactions (more data)
+			shouldSelect := peerMaxTxn > bestMaxTxnID ||
+				(peerMaxTxn == bestMaxTxnID && peerTxnCount > bestTxnCount)
+
+			if shouldSelect {
+				bestMaxTxnID = peerMaxTxn
+				bestTxnCount = peerTxnCount
+				bestPeer = peer
+				log.Debug().
+					Uint64("node_id", ae.nodeID).
+					Uint64("new_best_peer", peer.NodeId).
+					Uint64("new_best_txn", bestMaxTxnID).
+					Int64("new_best_count", bestTxnCount).
+					Msg("ANTI-ENTROPY: Found better peer")
+			}
+		}
+	}
+
+	if bestPeer != nil {
+		log.Debug().
+			Uint64("node_id", ae.nodeID).
+			Uint64("best_peer", bestPeer.NodeId).
+			Str("database", database).
+			Uint64("local_max_txn", localMaxTxnID).
+			Int64("local_txn_count", localTxnCount).
+			Uint64("peer_max_txn", bestMaxTxnID).
+			Int64("peer_txn_count", bestTxnCount).
+			Msg("ANTI-ENTROPY: Found best peer for sync")
+	} else {
+		log.Debug().
+			Uint64("node_id", ae.nodeID).
+			Str("database", database).
+			Uint64("local_max_txn", localMaxTxnID).
+			Int64("local_txn_count", localTxnCount).
+			Msg("ANTI-ENTROPY: We have the most data, no sync needed")
+	}
+
+	return bestPeer
 }
 
 // syncPeer checks and syncs a single peer across all databases
@@ -222,8 +414,10 @@ func (ae *AntiEntropyService) syncPeer(ctx context.Context, peer *NodeState) {
 }
 
 // syncPeerDatabase syncs a single database with a peer
+// In a leaderless system, we need to compare our local max txn ID with the peer's
+// If peer has more transactions, we pull from them
 func (ae *AntiEntropyService) syncPeerDatabase(ctx context.Context, peer *NodeState, database string) error {
-	// Get peer's replication state
+	// Get peer's replication state (peer returns their max txn ID)
 	client, err := ae.client.GetClientByAddress(peer.Address)
 	if err != nil {
 		return fmt.Errorf("failed to connect to peer: %w", err)
@@ -247,7 +441,7 @@ func (ae *AntiEntropyService) syncPeerDatabase(ctx context.Context, peer *NodeSt
 	}
 
 	if dbState == nil {
-		// Peer doesn't have this database yet, might need to sync
+		// Peer doesn't have this database yet
 		log.Debug().
 			Uint64("peer_node", peer.NodeId).
 			Str("database", database).
@@ -255,96 +449,135 @@ func (ae *AntiEntropyService) syncPeerDatabase(ctx context.Context, peer *NodeSt
 		return nil
 	}
 
-	// Calculate lag
-	lag := dbState.CurrentMaxTxnId - dbState.LastAppliedTxnId
-	if lag == 0 {
-		log.Debug().
-			Uint64("peer_node", peer.NodeId).
-			Str("database", database).
-			Msg("Peer is up to date")
-		return nil
+	// Get our local max txn ID for comparison
+	localMaxTxnID, err := ae.dbManager.GetMaxTxnID(database)
+	if err != nil {
+		log.Warn().Err(err).Str("database", database).Msg("Failed to get local max txn_id")
+		localMaxTxnID = 0
 	}
 
-	// Calculate time lag
-	timeLag := time.Since(time.Unix(0, dbState.LastSyncTime))
+	peerMaxTxnID := dbState.CurrentMaxTxnId
+	peerTxnCount := dbState.CommittedTxnCount
 
-	log.Info().
+	// Get local committed txn count
+	localTxnCount, err := ae.dbManager.GetCommittedTxnCount(database)
+	if err != nil {
+		log.Warn().Err(err).Str("database", database).Msg("Failed to get local txn count")
+		localTxnCount = 0
+	}
+
+	log.Debug().
+		Uint64("node_id", ae.nodeID).
 		Uint64("peer_node", peer.NodeId).
 		Str("database", database).
-		Uint64("lag_txns", lag).
-		Dur("lag_time", timeLag).
-		Str("sync_status", dbState.SyncStatus).
-		Msg("Peer is lagging, initiating catch-up")
+		Uint64("local_max_txn", localMaxTxnID).
+		Uint64("peer_max_txn", peerMaxTxnID).
+		Int64("local_txn_count", localTxnCount).
+		Int64("peer_txn_count", peerTxnCount).
+		Msg("ANTI-ENTROPY: Comparing with peer")
 
-	// Decide: delta sync or snapshot?
-	if ae.shouldUseDeltaSync(lag, timeLag) {
-		// Use delta sync (incremental)
-		log.Info().
-			Uint64("peer_node", peer.NodeId).
-			Str("database", database).
-			Uint64("from_txn_id", dbState.LastAppliedTxnId).
-			Msg("Using delta sync for catch-up")
+	// If peer has more transactions than us OR peer has same max_txn but more txn_count,
+	// we need to pull from them
+	needsSync := peerMaxTxnID > localMaxTxnID ||
+		(peerMaxTxnID == localMaxTxnID && peerTxnCount > localTxnCount)
 
-		result, err := ae.deltaSync.SyncFromPeer(
-			ctx,
-			peer.NodeId,
-			peer.Address,
-			database,
-			dbState.LastAppliedTxnId,
-		)
-		if err != nil {
-			// Check if error is due to gap detection (missing transactions)
-			// If so, fall back to snapshot instead of failing
-			errMsg := err.Error()
-			if strings.Contains(errMsg, "gap detected") {
-				log.Warn().
-					Err(err).
-					Uint64("peer_node", peer.NodeId).
-					Str("database", database).
-					Msg("Gap detected in delta sync, falling back to snapshot")
+	if needsSync {
+		lag := peerMaxTxnID - localMaxTxnID
+		txnCountDiff := peerTxnCount - localTxnCount
 
-				// Try snapshot instead
-				if ae.snapshotFunc != nil {
-					if snapErr := ae.snapshotFunc(ctx, peer.NodeId, peer.Address, database); snapErr != nil {
-						return fmt.Errorf("delta sync failed with gap (transactions GC'd) and snapshot fallback failed: %w", snapErr)
-					}
-
-					log.Info().
-						Uint64("peer_node", peer.NodeId).
-						Str("database", database).
-						Msg("Snapshot fallback completed successfully after gap detection")
-					return nil
-				}
-				return fmt.Errorf("delta sync failed with gap (transactions GC'd) but snapshot function not configured: %w", err)
-			}
-			// Other errors - fail normally
-			return fmt.Errorf("delta sync failed: %w", err)
-		}
-
-		log.Info().
-			Uint64("peer_node", peer.NodeId).
-			Str("database", database).
-			Int("txns_applied", result.TxnsApplied).
-			Msg("Delta sync completed")
-	} else {
-		// Use snapshot (full database transfer)
-		log.Info().
+		log.Debug().
+			Uint64("node_id", ae.nodeID).
 			Uint64("peer_node", peer.NodeId).
 			Str("database", database).
 			Uint64("lag_txns", lag).
-			Msg("Lag too large, using snapshot transfer")
+			Int64("txn_count_diff", txnCountDiff).
+			Msg("ANTI-ENTROPY: We are behind peer, pulling transactions")
 
-		if ae.snapshotFunc != nil {
-			if err := ae.snapshotFunc(ctx, peer.NodeId, peer.Address, database); err != nil {
-				return fmt.Errorf("snapshot transfer failed: %w", err)
-			}
-
-			log.Info().
+		// If max_txn_id is the same but txn_count differs, we have divergent data
+		// Delta sync won't work because there's no sequential gap to fill
+		// We need a full snapshot to reconcile
+		if lag == 0 && txnCountDiff > 0 {
+			log.Warn().
+				Uint64("node_id", ae.nodeID).
 				Uint64("peer_node", peer.NodeId).
 				Str("database", database).
-				Msg("Snapshot transfer completed")
+				Int64("local_txn_count", localTxnCount).
+				Int64("peer_txn_count", peerTxnCount).
+				Msg("ANTI-ENTROPY: Data divergence detected, using snapshot")
+
+			if ae.snapshotFunc != nil {
+				if err := ae.snapshotFunc(ctx, peer.NodeId, peer.Address, database); err != nil {
+					return fmt.Errorf("snapshot transfer for divergent data failed: %w", err)
+				}
+			} else {
+				log.Warn().Msg("Snapshot function not configured for divergent data reconciliation")
+			}
+			return nil
+		}
+
+		// Calculate time lag based on last sync time
+		timeLag := time.Since(time.Unix(0, dbState.LastSyncTime))
+
+		// Decide: delta sync or snapshot?
+		if ae.shouldUseDeltaSync(lag, timeLag) {
+			// Use delta sync - pull transactions from peer starting after our local max
+			log.Debug().
+				Uint64("peer_node", peer.NodeId).
+				Str("database", database).
+				Uint64("from_txn_id", localMaxTxnID).
+				Msg("ANTI-ENTROPY: Using delta sync for catch-up")
+
+			result, err := ae.deltaSync.SyncFromPeer(
+				ctx,
+				peer.NodeId,
+				peer.Address,
+				database,
+				localMaxTxnID, // Start from our local max, pull newer transactions
+			)
+			if err != nil {
+				// Check if error is due to gap detection (missing transactions)
+				// If so, fall back to snapshot instead of failing
+				errMsg := err.Error()
+				if strings.Contains(errMsg, "gap detected") {
+					log.Warn().
+						Err(err).
+						Uint64("peer_node", peer.NodeId).
+						Str("database", database).
+						Msg("Gap detected in delta sync, falling back to snapshot")
+
+					// Try snapshot instead
+					if ae.snapshotFunc != nil {
+						if snapErr := ae.snapshotFunc(ctx, peer.NodeId, peer.Address, database); snapErr != nil {
+							return fmt.Errorf("delta sync failed with gap (transactions GC'd) and snapshot fallback failed: %w", snapErr)
+						}
+						return nil
+					}
+					return fmt.Errorf("delta sync failed with gap (transactions GC'd) but snapshot function not configured: %w", err)
+				}
+				// Other errors - fail normally
+				return fmt.Errorf("delta sync failed: %w", err)
+			}
+
+			log.Debug().
+				Uint64("peer_node", peer.NodeId).
+				Str("database", database).
+				Int("txns_applied", result.TxnsApplied).
+				Msg("ANTI-ENTROPY: Delta sync completed")
 		} else {
-			log.Warn().Msg("Snapshot function not configured, skipping snapshot transfer")
+			// Use snapshot (full database transfer)
+			log.Debug().
+				Uint64("peer_node", peer.NodeId).
+				Str("database", database).
+				Uint64("lag_txns", lag).
+				Msg("ANTI-ENTROPY: Lag too large, using snapshot")
+
+			if ae.snapshotFunc != nil {
+				if err := ae.snapshotFunc(ctx, peer.NodeId, peer.Address, database); err != nil {
+					return fmt.Errorf("snapshot transfer failed: %w", err)
+				}
+			} else {
+				log.Warn().Msg("Snapshot function not configured, skipping snapshot transfer")
+			}
 		}
 	}
 
@@ -377,10 +610,10 @@ func (ae *AntiEntropyService) GetStats() map[string]interface{} {
 	defer ae.mu.Unlock()
 
 	return map[string]interface{}{
-		"enabled":                   ae.enabled,
-		"running":                   ae.running,
-		"interval_seconds":          ae.interval.Seconds(),
-		"delta_threshold_txns":      ae.deltaThresholdTxns,
-		"delta_threshold_seconds":   ae.deltaThresholdSeconds,
+		"enabled":                 ae.enabled,
+		"running":                 ae.running,
+		"interval_seconds":        ae.interval.Seconds(),
+		"delta_threshold_txns":    ae.deltaThresholdTxns,
+		"delta_threshold_seconds": ae.deltaThresholdSeconds,
 	}
 }

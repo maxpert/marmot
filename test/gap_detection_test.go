@@ -5,141 +5,208 @@ import (
 	"fmt"
 	"testing"
 	"time"
+
+	_ "github.com/mattn/go-sqlite3"
 )
 
-// TestGapDetectionTriggersSnapshot tests that gap detection causes fallback to snapshot
-// Scenario: Node offline longer than GC retention, transactions get GC'd, delta sync detects gap
+// Gap Detection Integration Test
+//
+// This test validates the critical gap detection and snapshot-based recovery mechanism
+// in Marmot's anti-entropy system. It simulates a realistic scenario where a node falls
+// far behind and its transaction log is garbage collected, creating a "gap" that prevents
+// delta synchronization.
+//
+// Background:
+// - Marmot uses anti-entropy for eventual consistency (continuous background healing)
+// - Delta sync: Replays missing transactions from peer's txn log (efficient for small lags)
+// - Snapshot sync: Full database transfer (fallback for large lags or GC gaps)
+// - Gap detection: When txn records are missing (GC'd), delta sync is impossible
+//
+// Test Scenario:
+// This simulates a real-world production scenario where:
+// 1. A node goes offline for an extended period (e.g., hardware failure, network partition)
+// 2. The cluster continues processing 15,000+ transactions
+// 3. Garbage collection runs on the offline node's stale database
+// 4. When the node restarts, it cannot use delta sync (missing txn records)
+// 5. Anti-entropy must detect the gap and automatically trigger snapshot recovery
+//
+// Success Criteria:
+// - Node 3 successfully catches up via snapshot transfer
+// - Final data consistency across all nodes (within acceptable bounds)
+// - No data loss or corruption
+
+// TestGapDetectionTriggersSnapshot validates snapshot-based recovery when delta sync is impossible.
+//
+// Test Flow:
+// 1. Start 3-node cluster with quorum=2
+// 2. Insert 100 initial rows, verify on all nodes
+// 3. Kill node 3
+// 4. Insert 15,000 rows while node 3 is down
+// 5. Simulate GC gap: Delete txn records 101-10100 from node 3's SQLite database
+// 6. Restart node 3
+// 7. Wait for anti-entropy to detect gap and trigger snapshot
+// 8. Assert: Node 3 eventually has close to node 1's row count
 func TestGapDetectionTriggersSnapshot(t *testing.T) {
 	harness := NewClusterHarness(t)
 	defer harness.Cleanup()
 
 	// Start cluster
+	t.Log("Starting 3-node cluster...")
 	if err := harness.StartCluster(); err != nil {
 		t.Fatalf("Failed to start cluster: %v", err)
 	}
 
-	// Create test table
+	// Create test table (CDC-compatible with explicit column list)
 	t.Logf("Creating test table...")
-	_, err := harness.ExecNode(1, "CREATE TABLE IF NOT EXISTS test_gap_detection (id INT PRIMARY KEY, value TEXT)")
+	_, err := harness.ExecNode(1, "CREATE TABLE test_gap_detection (id INT PRIMARY KEY, value TEXT)")
 	if err != nil {
 		t.Fatalf("Failed to create table: %v", err)
 	}
-	time.Sleep(1 * time.Second)
 
-	// Write initial batch of transactions (1-100)
-	t.Logf("Writing initial batch of transactions...")
+	// Wait for table to replicate
+	if err := harness.WaitForTableExists("test_gap_detection", 10*time.Second); err != nil {
+		t.Fatalf("Table did not replicate: %v", err)
+	}
+
+	// Insert 100 initial rows with explicit column lists (CDC requirement)
+	t.Logf("Inserting 100 initial rows...")
 	for i := 1; i <= 100; i++ {
-		query := fmt.Sprintf("INSERT INTO test_gap_detection (id, value) VALUES (%d, 'initial_%d')", i, i)
-		_, err := harness.ExecNode(1, query)
+		_, err := harness.ExecNode(1, "INSERT INTO test_gap_detection (id, value) VALUES (?, ?)", i, fmt.Sprintf("value_%d", i))
 		if err != nil {
-			t.Fatalf("Failed to insert: %v", err)
+			t.Fatalf("Failed to insert row %d: %v", i, err)
 		}
 	}
+
+	// Wait for replication to all nodes
 	time.Sleep(3 * time.Second)
 
-	// Verify all nodes have the data
+	// Verify initial data on all nodes
+	t.Logf("Verifying initial data on all nodes...")
 	for nodeID := 1; nodeID <= 3; nodeID++ {
-		count := getRowCount(t, harness, nodeID, "test_gap_detection")
-		t.Logf("Node %d has %d rows initially", nodeID, count)
+		count := getGapTestRowCount(t, harness, nodeID, "test_gap_detection")
 		if count != 100 {
-			t.Fatalf("Node %d should have 100 rows, got %d", nodeID, count)
+			t.Fatalf("Node %d has %d rows, expected 100", nodeID, count)
 		}
+		t.Logf("Node %d: %d rows (OK)", nodeID, count)
 	}
 
-	// Kill node 3 to simulate extended downtime
-	t.Logf("Killing node 3 to simulate extended downtime...")
-	harness.KillNode(3)
-	time.Sleep(2 * time.Second)
+	// Kill node 3 (simulate crash)
+	t.Logf("Killing node 3...")
+	if err := harness.KillNode(3); err != nil {
+		t.Fatalf("Failed to kill node 3: %v", err)
+	}
 
-	// Write many more transactions while node 3 is down (101-15100)
-	// This will exceed the delta sync threshold (10000 txns)
-	t.Logf("Writing large batch of transactions while node 3 is down (this may take a minute)...")
-	batchSize := 100
-	totalInserts := 15000
-	for i := 101; i <= totalInserts+100; i++ {
-		query := fmt.Sprintf("INSERT INTO test_gap_detection (id, value) VALUES (%d, 'while_down_%d')", i, i)
-		_, err := harness.ExecNode(1, query)
+	// Wait for cluster to detect node 3 is down
+	time.Sleep(3 * time.Second)
+
+	// Insert 15,000 rows while node 3 is down (ids 101-15100)
+	t.Logf("Inserting 15,000 rows while node 3 is down (this may take a minute)...")
+	for i := 101; i <= 15100; i++ {
+		_, err := harness.ExecNode(1, "INSERT INTO test_gap_detection (id, value) VALUES (?, ?)", i, fmt.Sprintf("value_%d", i))
 		if err != nil {
-			t.Logf("Warning: insert %d failed: %v", i, err)
+			t.Fatalf("Failed to insert row %d: %v", i, err)
 		}
-
-		// Progress update every 1000 inserts
 		if i%1000 == 0 {
-			t.Logf("Progress: inserted %d transactions", i-100)
-		}
-	}
-	time.Sleep(2 * time.Second)
-
-	// Verify nodes 1 & 2 have all the data
-	for nodeID := 1; nodeID <= 2; nodeID++ {
-		count := getRowCount(t, harness, nodeID, "test_gap_detection")
-		t.Logf("Node %d has %d rows after bulk insert", nodeID, count)
-		if count < 10000 {
-			t.Fatalf("Node %d should have at least 10000 rows, got %d", nodeID, count)
+			t.Logf("Inserted %d rows...", i)
 		}
 	}
 
-	// Now simulate gap by manually deleting transaction records from node 3's database
-	// This simulates what would happen if GC deleted old transactions
-	t.Logf("Simulating GC by deleting old transaction records from node 3's database...")
-	node3DB := harness.nodes[3].dataDir + "/databases/marmot.db"
-	conn, err := sql.Open("sqlite3", node3DB)
+	t.Logf("Completed inserting 15,000 rows")
+
+	// Verify node 1 has all data
+	count1 := getGapTestRowCount(t, harness, 1, "test_gap_detection")
+	t.Logf("Node 1 has %d rows", count1)
+	if count1 < 15100 {
+		t.Fatalf("Node 1 should have at least 15100 rows, got %d", count1)
+	}
+
+	// Simulate GC gap: Open node 3's SQLite database and delete txn records
+	t.Logf("Simulating GC gap on node 3...")
+	node3DBPath := fmt.Sprintf("%s/test.db", harness.Nodes[2].DataDir)
+	sqliteDB, err := sql.Open("sqlite3", node3DBPath)
 	if err != nil {
 		t.Fatalf("Failed to open node 3 database: %v", err)
 	}
+	defer sqliteDB.Close()
 
-	// Delete transactions 100-10100 (simulating GC)
-	// This creates a gap where node 3 has up to txn 100, but peer has 10100+
-	deleteQuery := "DELETE FROM __marmot__txn_records WHERE txn_id > 100 AND txn_id <= 10100"
-	_, err = conn.Exec(deleteQuery)
+	// Delete transaction records 101-10100 to simulate GC
+	result, err := sqliteDB.Exec("DELETE FROM __marmot__txn_records WHERE txn_id BETWEEN 101 AND 10100")
 	if err != nil {
-		conn.Close()
-		t.Fatalf("Failed to delete transactions: %v", err)
+		t.Fatalf("Failed to delete txn records: %v", err)
 	}
-	conn.Close()
+	deleted, _ := result.RowsAffected()
+	t.Logf("Deleted %d transaction records (simulating GC gap)", deleted)
 
-	t.Logf("Deleted transactions 101-10100 from node 3 (simulating GC)")
+	// Close SQLite connection before restarting node
+	sqliteDB.Close()
 
-	// Restart node 3 - it should detect the gap and trigger snapshot
-	t.Logf("Restarting node 3 - it should detect gap and fall back to snapshot...")
+	// Restart node 3
+	t.Logf("Restarting node 3...")
 	if err := harness.StartNode(3); err != nil {
 		t.Fatalf("Failed to restart node 3: %v", err)
 	}
 
-	// Wait for node to become alive
 	if err := harness.WaitForAlive(3, 30*time.Second); err != nil {
-		t.Fatalf("Node 3 did not become ALIVE: %v", err)
+		t.Fatalf("Node 3 did not become alive: %v", err)
 	}
 
-	// Wait for anti-entropy to run and detect the gap
-	// Anti-entropy runs every 60 seconds, so give it time to detect and heal
-	t.Logf("Waiting for anti-entropy to detect gap and trigger snapshot (this may take up to 2 minutes)...")
-	time.Sleep(90 * time.Second)
+	// Wait for anti-entropy to detect gap and trigger snapshot
+	t.Logf("Waiting up to 90 seconds for anti-entropy to detect gap and sync via snapshot...")
+	maxWait := 90 * time.Second
+	startTime := time.Now()
+	lastCount := 0
 
-	// Verify node 3 eventually gets all the data via snapshot
-	count := getRowCount(t, harness, 3, "test_gap_detection")
-	t.Logf("Node 3 has %d rows after gap detection and snapshot", count)
+	for time.Since(startTime) < maxWait {
+		time.Sleep(5 * time.Second)
 
-	// Should have close to the same amount as other nodes
-	node1Count := getRowCount(t, harness, 1, "test_gap_detection")
-	if count < node1Count-1000 {
-		t.Fatalf("Node 3 did not catch up via snapshot: has %d rows, node 1 has %d rows (diff > 1000)", count, node1Count)
+		count3 := getGapTestRowCount(t, harness, 3, "test_gap_detection")
+		count1 := getGapTestRowCount(t, harness, 1, "test_gap_detection")
+
+		t.Logf("Progress: Node 3 has %d rows, Node 1 has %d rows (elapsed: %v)",
+			count3, count1, time.Since(startTime).Round(time.Second))
+
+		if count3 > lastCount {
+			lastCount = count3
+		}
+
+		// Success condition: Node 3 is within 1000 rows of Node 1
+		if count3 >= count1-1000 {
+			t.Logf("SUCCESS: Node 3 caught up via snapshot! Node 3: %d rows, Node 1: %d rows", count3, count1)
+			return
+		}
+
+		// Check if we're making progress
+		if count3 > 100 {
+			t.Logf("Node 3 is syncing... (%d rows so far)", count3)
+		}
 	}
 
-	t.Logf("SUCCESS: Gap detection triggered snapshot, node 3 caught up (has %d rows)", count)
+	// Timeout - check final state
+	count3 := getGapTestRowCount(t, harness, 3, "test_gap_detection")
+	count1Final := getGapTestRowCount(t, harness, 1, "test_gap_detection")
+
+	t.Errorf("TIMEOUT: Node 3 did not catch up after 90 seconds")
+	t.Errorf("Final state: Node 3 has %d rows, Node 1 has %d rows", count3, count1Final)
+	t.Errorf("Expected Node 3 to have at least %d rows (within 1000 of Node 1)", count1Final-1000)
+	t.Fatal("Gap detection and snapshot sync failed")
 }
 
-// Helper to get row count from a table
-func getRowCount(t *testing.T, harness *ClusterHarness, nodeID int, table string) int {
+// getGapTestRowCount returns the number of rows in a table on a specific node
+// (renamed to avoid conflict with other test helper functions)
+func getGapTestRowCount(t *testing.T, harness *ClusterHarness, nodeID int, table string) int {
 	rows, err := harness.QueryNode(nodeID, fmt.Sprintf("SELECT COUNT(*) FROM %s", table))
 	if err != nil {
-		t.Fatalf("Failed to query node %d: %v", nodeID, err)
+		t.Logf("Warning: Failed to query node %d: %v", nodeID, err)
 		return 0
 	}
+	defer rows.Close()
+
 	var count int
 	if rows.Next() {
-		rows.Scan(&count)
+		if err := rows.Scan(&count); err != nil {
+			t.Logf("Warning: Failed to scan count from node %d: %v", nodeID, err)
+			return 0
+		}
 	}
-	rows.Close()
 	return count
 }

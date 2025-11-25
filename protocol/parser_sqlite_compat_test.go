@@ -64,7 +64,7 @@ func setupTestDB(t *testing.T) *sql.DB {
 			expires_at TEXT
 		);
 	`
-	
+
 	_, err = db.Exec(schema)
 	if err != nil {
 		t.Fatalf("Failed to create schema: %v", err)
@@ -121,7 +121,7 @@ func TestParser_SQLiteExecution_BatchInserts(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			stmt := ParseStatement(tt.mysqlQuery)
-			
+
 			// Execute parsed SQL in SQLite
 			_, err := db.Exec(stmt.SQL)
 			if err != nil {
@@ -187,7 +187,7 @@ func TestParser_SQLiteExecution_Updates(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			stmt := ParseStatement(tt.mysqlQuery)
-			
+
 			_, err := db.Exec(stmt.SQL)
 			if err != nil {
 				t.Fatalf("Failed to execute: %v\nSQL: %s", err, stmt.SQL)

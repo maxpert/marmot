@@ -125,12 +125,12 @@ func (h *CoordinatorHandler) handleShowColumns(session *protocol.ConnectionSessi
 
 		// Build MySQL-compatible SHOW COLUMNS result
 		columns = append(columns, []interface{}{
-			name,        // Field
-			mysqlType,   // Type
-			nullable,    // Null
-			key,         // Key
-			dfltValue,   // Default
-			"",          // Extra
+			name,      // Field
+			mysqlType, // Type
+			nullable,  // Null
+			key,       // Key
+			dfltValue, // Default
+			"",        // Extra
 		})
 	}
 
@@ -310,24 +310,24 @@ func (h *CoordinatorHandler) handleShowTableStatus(session *protocol.ConnectionS
 
 		// Return MySQL-compatible table status
 		tables = append(tables, []interface{}{
-			tableName,                // Name
-			"InnoDB",                 // Engine
-			10,                       // Version
-			"Dynamic",                // Row_format
-			0,                        // Rows
-			0,                        // Avg_row_length
-			0,                        // Data_length
-			0,                        // Max_data_length
-			0,                        // Index_length
-			0,                        // Data_free
-			nil,                      // Auto_increment
-			nil,                      // Create_time
-			nil,                      // Update_time
-			nil,                      // Check_time
-			"utf8mb4_general_ci",     // Collation
-			nil,                      // Checksum
-			"",                       // Create_options
-			"",                       // Comment
+			tableName,            // Name
+			"InnoDB",             // Engine
+			10,                   // Version
+			"Dynamic",            // Row_format
+			0,                    // Rows
+			0,                    // Avg_row_length
+			0,                    // Data_length
+			0,                    // Max_data_length
+			0,                    // Index_length
+			0,                    // Data_free
+			nil,                  // Auto_increment
+			nil,                  // Create_time
+			nil,                  // Update_time
+			nil,                  // Check_time
+			"utf8mb4_general_ci", // Collation
+			nil,                  // Checksum
+			"",                   // Create_options
+			"",                   // Comment
 		})
 	}
 
@@ -411,27 +411,27 @@ func (h *CoordinatorHandler) handleInformationSchemaTables(session *protocol.Con
 		tableName, _ := row["name"].(string)
 
 		tables = append(tables, []interface{}{
-			"def",        // TABLE_CATALOG
-			dbName,       // TABLE_SCHEMA
-			tableName,    // TABLE_NAME
-			"BASE TABLE", // TABLE_TYPE
-			"InnoDB",     // ENGINE
-			10,           // VERSION
-			"Dynamic",    // ROW_FORMAT
-			nil,          // TABLE_ROWS
-			nil,          // AVG_ROW_LENGTH
-			nil,          // DATA_LENGTH
-			nil,          // MAX_DATA_LENGTH
-			nil,          // INDEX_LENGTH
-			nil,          // DATA_FREE
-			nil,          // AUTO_INCREMENT
-			nil,          // CREATE_TIME
-			nil,          // UPDATE_TIME
-			nil,          // CHECK_TIME
+			"def",                // TABLE_CATALOG
+			dbName,               // TABLE_SCHEMA
+			tableName,            // TABLE_NAME
+			"BASE TABLE",         // TABLE_TYPE
+			"InnoDB",             // ENGINE
+			10,                   // VERSION
+			"Dynamic",            // ROW_FORMAT
+			nil,                  // TABLE_ROWS
+			nil,                  // AVG_ROW_LENGTH
+			nil,                  // DATA_LENGTH
+			nil,                  // MAX_DATA_LENGTH
+			nil,                  // INDEX_LENGTH
+			nil,                  // DATA_FREE
+			nil,                  // AUTO_INCREMENT
+			nil,                  // CREATE_TIME
+			nil,                  // UPDATE_TIME
+			nil,                  // CHECK_TIME
 			"utf8mb4_general_ci", // TABLE_COLLATION
-			nil,          // CHECKSUM
-			"",           // CREATE_OPTIONS
-			"",           // TABLE_COMMENT
+			nil,                  // CHECKSUM
+			"",                   // CREATE_OPTIONS
+			"",                   // TABLE_COMMENT
 		})
 	}
 
@@ -702,26 +702,26 @@ func (h *CoordinatorHandler) getTableColumns(dbName, tableName string) ([][]inte
 		}
 
 		columns = append(columns, []interface{}{
-			"def",                    // TABLE_CATALOG
-			dbName,                   // TABLE_SCHEMA
-			tableName,                // TABLE_NAME
-			name,                     // COLUMN_NAME
-			cid + 1,                  // ORDINAL_POSITION
-			defaultVal,               // COLUMN_DEFAULT
-			nullable,                 // IS_NULLABLE
-			dataType,                 // DATA_TYPE
-			nil,                      // CHARACTER_MAXIMUM_LENGTH
-			nil,                      // CHARACTER_OCTET_LENGTH
-			nil,                      // NUMERIC_PRECISION
-			nil,                      // NUMERIC_SCALE
-			nil,                      // DATETIME_PRECISION
-			"utf8mb4",                // CHARACTER_SET_NAME
-			"utf8mb4_general_ci",     // COLLATION_NAME
-			mysqlType,                // COLUMN_TYPE
-			key,                      // COLUMN_KEY
-			"",                       // EXTRA
+			"def",                             // TABLE_CATALOG
+			dbName,                            // TABLE_SCHEMA
+			tableName,                         // TABLE_NAME
+			name,                              // COLUMN_NAME
+			cid + 1,                           // ORDINAL_POSITION
+			defaultVal,                        // COLUMN_DEFAULT
+			nullable,                          // IS_NULLABLE
+			dataType,                          // DATA_TYPE
+			nil,                               // CHARACTER_MAXIMUM_LENGTH
+			nil,                               // CHARACTER_OCTET_LENGTH
+			nil,                               // NUMERIC_PRECISION
+			nil,                               // NUMERIC_SCALE
+			nil,                               // DATETIME_PRECISION
+			"utf8mb4",                         // CHARACTER_SET_NAME
+			"utf8mb4_general_ci",              // COLLATION_NAME
+			mysqlType,                         // COLUMN_TYPE
+			key,                               // COLUMN_KEY
+			"",                                // EXTRA
 			"select,insert,update,references", // PRIVILEGES
-			"",                       // COLUMN_COMMENT
+			"",                                // COLUMN_COMMENT
 		})
 	}
 

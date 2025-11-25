@@ -4,21 +4,15 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"regexp"
 	"strings"
+	"time"
 
 	"github.com/maxpert/marmot/coordinator"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/protocol"
 
 	_ "github.com/mattn/go-sqlite3"
-)
-
-var (
-	reInsert   = regexp.MustCompile(`(?i)INSERT\s+INTO\s+(\w+)\s+(?:\(([^)]+)\))?\s*VALUES\s*\(([^)]+)\)`)
-	reUpdate   = regexp.MustCompile(`(?i)UPDATE\s+(\w+)\s+SET\s+.*\s+WHERE\s+(\w+)\s*=\s*(\?|'[^']*'|\d+)`)
-	reDelete   = regexp.MustCompile(`(?i)DELETE\s+FROM\s+(\w+)\s+WHERE\s+(\w+)\s*=\s*(\?|'[^']*'|\d+)`)
-	reSelectPK = regexp.MustCompile(`(?i)SELECT\s+.*\s+FROM\s+(\w+)\s+WHERE\s+(\w+)\s*=\s*(\?|'[^']*'|\d+)`)
+	rqlitesql "github.com/rqlite/sql"
 )
 
 // MVCCDatabase wraps a SQL database with MVCC transaction support
@@ -29,6 +23,7 @@ type MVCCDatabase struct {
 	clock         *hlc.Clock
 	nodeID        uint64
 	replicationFn ReplicationFunc
+	commitBatcher *CommitBatcher
 }
 
 // ReplicationFunc is called to replicate transactions to other nodes
@@ -59,6 +54,26 @@ func NewMVCCDatabase(dbPath string, nodeID uint64, clock *hlc.Clock) (*MVCCDatab
 		if err != nil {
 			return nil, fmt.Errorf("failed to enable WAL mode: %w", err)
 		}
+
+		// PRAGMA synchronous=NORMAL is safe with WAL mode
+		// FULL is unnecessary overhead - WAL provides durability with checkpoint
+		_, err = db.Exec("PRAGMA synchronous=NORMAL")
+		if err != nil {
+			return nil, fmt.Errorf("failed to set synchronous mode: %w", err)
+		}
+
+		// Increase cache size for better write performance (64MB)
+		// Negative value = kilobytes, positive = pages
+		_, err = db.Exec("PRAGMA cache_size=-64000")
+		if err != nil {
+			return nil, fmt.Errorf("failed to set cache size: %w", err)
+		}
+
+		// Store temp tables in memory for faster operations
+		_, err = db.Exec("PRAGMA temp_store=MEMORY")
+		if err != nil {
+			return nil, fmt.Errorf("failed to set temp store: %w", err)
+		}
 	}
 
 	// Initialize MVCC schema
@@ -69,11 +84,18 @@ func NewMVCCDatabase(dbPath string, nodeID uint64, clock *hlc.Clock) (*MVCCDatab
 	// Create transaction manager
 	txnMgr := NewMVCCTransactionManager(db, clock)
 
+	// Create commit batcher for SQLite-level batching
+	// Batch up to 20 commits with max 2ms wait
+	// This reduces fsync overhead without adding latency
+	commitBatcher := NewCommitBatcher(db, 20, 2*time.Millisecond)
+	commitBatcher.Start()
+
 	return &MVCCDatabase{
-		db:     db,
-		txnMgr: txnMgr,
-		clock:  clock,
-		nodeID: nodeID,
+		db:            db,
+		txnMgr:        txnMgr,
+		clock:         clock,
+		nodeID:        nodeID,
+		commitBatcher: commitBatcher,
 	}, nil
 }
 
@@ -173,25 +195,15 @@ func (mdb *MVCCDatabase) ExecuteQuery(ctx context.Context, query string, args ..
 }
 
 // ExecuteMVCCRead executes a read query with full MVCC support
+// Uses rqlite/sql AST parser for proper SQL analysis
 func (mdb *MVCCDatabase) ExecuteMVCCRead(ctx context.Context, query string, args ...interface{}) ([]string, []map[string]interface{}, error) {
 	snapshotTS := mdb.clock.Now()
 
-	// Try to parse simple PK lookup
-	// SELECT * FROM table WHERE id = ?
-	matches := reSelectPK.FindStringSubmatch(query)
-	if len(matches) == 4 {
-		tableName := matches[1]
-		// col := matches[2] // assume PK
-		val := matches[3]
-
-		// Clean up value
-		val = strings.Trim(val, "'")
-		if val == "?" && len(args) > 0 {
-			val = fmt.Sprintf("%v", args[0])
-		}
-
-		// Use ReadWithWriteIntentCheck
-		row, err := coordinator.ReadWithWriteIntentCheck(mdb.db, snapshotTS, tableName, val)
+	// Parse SELECT with rqlite/sql parser for MVCC optimization
+	tableName, pkValue := parseSelectForMVCC(query, args)
+	if tableName != "" && pkValue != "" {
+		// Use ReadWithWriteIntentCheck for PK lookups
+		row, err := coordinator.ReadWithWriteIntentCheck(mdb.db, snapshotTS, tableName, pkValue)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -240,6 +252,76 @@ func (mdb *MVCCDatabase) ExecuteMVCCRead(ctx context.Context, query string, args
 	return columns, results, nil
 }
 
+// parseSelectForMVCC parses a SELECT query using rqlite/sql AST
+// Returns (tableName, pkValue) if this is a simple PK lookup, otherwise ("", "")
+func parseSelectForMVCC(query string, args []interface{}) (string, string) {
+	parser := rqlitesql.NewParser(strings.NewReader(query))
+	stmt, err := parser.ParseStatement()
+	if err != nil {
+		return "", ""
+	}
+
+	sel, ok := stmt.(*rqlitesql.SelectStatement)
+	if !ok {
+		return "", ""
+	}
+
+	// Extract table name from FROM clause
+	tableName := ""
+	if sel.Source != nil {
+		tableName = rqlitesql.SourceName(sel.Source)
+	}
+	if tableName == "" {
+		return "", ""
+	}
+
+	// Check for simple WHERE clause with equality on single column (potential PK)
+	if sel.WhereExpr == nil {
+		return "", ""
+	}
+
+	pkValue := extractPKFromWhere(sel.WhereExpr, args)
+	if pkValue == "" {
+		return "", ""
+	}
+
+	return tableName, pkValue
+}
+
+// extractPKFromWhere extracts the PK value from a WHERE expression
+// Only handles simple cases: WHERE col = value or WHERE col = ?
+func extractPKFromWhere(whereExpr rqlitesql.Expr, args []interface{}) string {
+	if whereExpr == nil {
+		return ""
+	}
+
+	// Check for binary expression (col = value)
+	binExpr, ok := whereExpr.(*rqlitesql.BinaryExpr)
+	if !ok {
+		return ""
+	}
+
+	// Must be equality
+	if binExpr.Op != rqlitesql.EQ {
+		return ""
+	}
+
+	// Extract value from right side
+	switch v := binExpr.Y.(type) {
+	case *rqlitesql.StringLit:
+		return v.Value
+	case *rqlitesql.NumberLit:
+		return v.Value
+	case *rqlitesql.BindExpr:
+		// Parameter placeholder - use first arg
+		if len(args) > 0 {
+			return fmt.Sprintf("%v", args[0])
+		}
+	}
+
+	return ""
+}
+
 // ExecuteQueryRow executes a single-row query with MVCC snapshot isolation
 func (mdb *MVCCDatabase) ExecuteQueryRow(ctx context.Context, query string, args ...interface{}) *sql.Row {
 	// Get current snapshot timestamp
@@ -279,31 +361,15 @@ func initializeMVCCSchema(db *sql.DB) error {
 }
 
 // extractRowKeyFromStatement extracts row key from statement
+// The row key is extracted during parsing from the original MySQL AST,
+// so we just use the pre-extracted value from the Statement struct
 func extractRowKeyFromStatement(stmt protocol.Statement) string {
-	// 1. Try INSERT
-	if matches := reInsert.FindStringSubmatch(stmt.SQL); len(matches) >= 3 {
-		// matches[3] is VALUES part "1, 'hello'"
-		// We assume first value is PK for now
-		parts := strings.Split(matches[3], ",")
-		if len(parts) > 0 {
-			return strings.TrimSpace(strings.Trim(strings.TrimSpace(parts[0]), "'"))
-		}
+	// If RowKey was extracted during parsing, use it
+	if stmt.RowKey != "" {
+		return stmt.RowKey
 	}
 
-	// 2. Try UPDATE
-	if matches := reUpdate.FindStringSubmatch(stmt.SQL); len(matches) >= 4 {
-		// matches[3] is value
-		val := matches[3]
-		return strings.Trim(val, "'")
-	}
-
-	// 3. Try DELETE
-	if matches := reDelete.FindStringSubmatch(stmt.SQL); len(matches) >= 4 {
-		val := matches[3]
-		return strings.Trim(val, "'")
-	}
-
-	// Fallback: Hash of SQL
+	// Fallback: use hash of SQL (this should rarely happen)
 	return fmt.Sprintf("%x", []byte(stmt.SQL)[:min(16, len(stmt.SQL))])
 }
 

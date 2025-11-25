@@ -14,7 +14,8 @@ Marmot v2 is a leaderless, distributed SQLite replication system built on a goss
 - **MVCC Transactions**: Snapshot isolation with conflict detection and resolution
 - **Multi-Database Support**: Create and manage multiple databases per cluster
 - **DDL Replication**: Distributed schema changes with automatic idempotency and cluster-wide locking
-- **Production-Ready SQL Parser**: Powered by Vitess sqlparser (same tech as YouTube)
+- **Production-Ready SQL Parser**: Powered by rqlite/sql AST parser for MySQL→SQLite transpilation
+- **CDC-Based Replication**: Row-level change data capture for consistent replication
 
 ## Quick Start
 
@@ -53,6 +54,9 @@ mysql --protocol=TCP -h localhost -P 3308 -u root
 # Cleanup
 pkill -f marmot-v2
 ```
+
+## Stargazers over time
+[![Stargazers over time](https://starchart.cc/maxpert/marmot.svg?variant=adaptive)](https://starchart.cc/maxpert/marmot)
 
 ## Architecture
 
@@ -120,8 +124,28 @@ enable_idempotent = true
 - ⚠️ **Caution**: ALTER TABLE is less idempotent - avoid replaying failed ALTER operations
 - ❌ **Don't**: Run concurrent DDL on the same database from multiple nodes
 
-## Stargazers over time
-[![Stargazers over time](https://starchart.cc/maxpert/marmot.svg?variant=adaptive)](https://starchart.cc/maxpert/marmot)
+## CDC-Based Replication
+
+Marmot v2 uses **Change Data Capture (CDC)** for replication instead of SQL statement replay:
+
+### How It Works
+
+1. **Row-Level Capture**: Instead of replicating SQL statements, Marmot captures the actual row data changes (INSERT/UPDATE/DELETE)
+2. **Binary Data Format**: Row data is serialized as CDC messages with column values, ensuring consistent replication regardless of SQL dialect
+3. **Deterministic Application**: Row data is applied directly to the target database, avoiding parsing ambiguities
+
+### Benefits
+
+- **Consistency**: Same row data applied everywhere, no SQL parsing differences
+- **Performance**: Binary format is more efficient than SQL text
+- **Reliability**: No issues with SQL syntax variations between MySQL and SQLite
+
+### Row Key Extraction
+
+For UPDATE and DELETE operations, Marmot automatically extracts row keys:
+- Uses PRIMARY KEY columns when available
+- Falls back to ROWID for tables without explicit primary key
+- Handles composite primary keys correctly
 
 ## SQL Statement Compatibility
 
@@ -181,7 +205,7 @@ Marmot supports a wide range of MySQL/SQLite statements through its MySQL protoc
 
 ### Important Notes
 
-1. **Schema Changes**: While DDL statements are parsed and executed locally, schema replication is limited. All nodes should start with the same schema, and schema changes should be coordinated manually across all nodes.
+1. **Schema Changes (DDL)**: DDL statements are fully replicated with cluster-wide locking and automatic idempotency. See the DDL Replication section for details.
 
 2. **XA Transactions**: Marmot has its own distributed transaction protocol based on 2PC. MySQL XA transactions are not compatible with Marmot's replication model.
 
@@ -203,7 +227,7 @@ Marmot provides full support for MySQL metadata queries, enabling GUI tools like
 - **INFORMATION_SCHEMA**: Queries against `INFORMATION_SCHEMA.TABLES`, `INFORMATION_SCHEMA.COLUMNS`, `INFORMATION_SCHEMA.SCHEMATA`, and `INFORMATION_SCHEMA.STATISTICS`
 - **Type Conversion**: Automatic SQLite-to-MySQL type mapping for compatibility
 
-These metadata queries are powered by the **Vitess SQL parser**, providing production-grade MySQL query compatibility.
+These metadata queries are powered by the **rqlite/sql AST parser**, providing production-grade MySQL query compatibility.
 
 ### Connecting with MySQL Clients
 
@@ -249,22 +273,28 @@ Marmot v2 includes an automatic anti-entropy system that continuously monitors a
 2. **Smart Recovery Decision**:
    - **Delta Sync** if lag < 10,000 transactions AND < 1 hour: Streams missed transactions incrementally
    - **Snapshot Transfer** if lag exceeds thresholds: Full database file transfer for efficiency
-3. **Multi-Database Support**: Tracks and syncs each database independently
-4. **GC Coordination**: Garbage collection respects peer replication state - logs aren't deleted until all peers have applied them
+3. **Gap Detection**: Detects when transaction logs have been GC'd and automatically falls back to snapshot
+4. **Multi-Database Support**: Tracks and syncs each database independently
+5. **GC Coordination**: Garbage collection respects peer replication state - logs aren't deleted until all peers have applied them
 
 **Delta Sync Process:**
 1. Lagging node queries `last_applied_txn_id` for each peer/database
 2. Requests transactions since that ID via `StreamChanges` RPC
-3. Applies changes using LWW conflict resolution
-4. Updates replication state tracking (per-database)
-5. Progress logged every 100 transactions
+3. **Gap Detection**: Checks if first received txn_id has a large gap from requested ID
+   - If gap > delta_sync_threshold_txns, indicates missing (GC'd) transactions
+   - Automatically falls back to snapshot transfer to prevent data loss
+4. Applies changes using LWW conflict resolution
+5. Updates replication state tracking (per-database)
+6. Progress logged every 100 transactions
 
-**GC Safe Point:**
+**GC Coordination with Anti-Entropy:**
 - Transaction logs are retained with a two-tier policy:
-  - **Min retention** (1 hour): Don't delete if any peer needs it
-  - **Max retention** (4 hours): Force delete to prevent unbounded growth
+  - **Min retention** (2 hours): Must be >= delta sync threshold, respects peer lag
+  - **Max retention** (24 hours): Force delete after this time to prevent unbounded growth
+- Config validation enforces: `gc_min >= delta_threshold` and `gc_max >= 2x delta_threshold`
 - Each database tracks replication progress per peer
 - GC queries minimum applied txn_id across all peers before cleanup
+- **Gap detection** prevents data loss if GC runs while nodes are offline
 
 ### Consistency Guarantees
 
@@ -281,10 +311,10 @@ Marmot v2 includes an automatic anti-entropy system that continuously monitors a
 
 ## Limitations
 
-- **Schema Changes**: DDL operations work locally but are not automatically replicated. Coordinate schema changes manually across all nodes.
 - **Selective Table Watching**: All tables in a database are replicated. Selective table replication is not supported.
 - **WAL Mode Required**: SQLite must use WAL mode for reliable multi-process changes.
 - **Eventually Consistent**: Rows may sync out of order. `SERIALIZABLE` transaction assumptions may not hold across nodes.
+- **Concurrent DDL**: Avoid running concurrent DDL operations on the same database from multiple nodes (protected by cluster-wide lock with 30s lease).
 
 ## Configuration
 
@@ -360,20 +390,41 @@ default_read_consistency = "LOCAL_ONE"    # Read consistency level
 write_timeout_ms = 5000                   # Write operation timeout
 read_timeout_ms = 2000                    # Read operation timeout
 
-# Anti-Entropy Configuration
+# Anti-Entropy: Background healing for eventual consistency
+# - Detects and repairs divergence between replicas
+# - Uses delta sync for small lags, snapshot for large lags
+# - Includes gap detection to prevent incomplete data after GC
 enable_anti_entropy = true                 # Enable automatic catch-up for lagging nodes
 anti_entropy_interval_seconds = 60         # How often to check for lag (default: 60s)
-delta_sync_threshold_transactions = 10000  # Max lag to use delta sync vs snapshot
-delta_sync_threshold_seconds = 3600        # Max time lag (1 hour) to use delta sync
-gc_min_retention_hours = 1                 # Min retention before GC (respects peer lag)
-gc_max_retention_hours = 4                 # Max retention before forced GC
+delta_sync_threshold_transactions = 10000  # Delta sync if lag < 10K txns
+delta_sync_threshold_seconds = 3600        # Snapshot if lag > 1 hour
+
+# Garbage Collection: Reclaim disk space by deleting old transaction records
+# - gc_min must be >= delta_sync_threshold (validated at startup)
+# - gc_max should be >= 2x delta_sync_threshold (recommended)
+# - Set gc_max = 0 for unlimited retention
+gc_min_retention_hours = 2   # Keep at least 2 hours (>= 1 hour delta threshold)
+gc_max_retention_hours = 24  # Force delete after 24 hours
 ```
 
 **Anti-Entropy Tuning:**
 - **Small clusters (2-3 nodes)**: Use default settings (60s interval)
 - **Large clusters (5+ nodes)**: Consider increasing interval to 120-180s to reduce network overhead
 - **High write throughput**: Increase `delta_sync_threshold_transactions` to 50000+
-- **Long-running clusters**: Keep `gc_max_retention_hours` at 4+ to handle extended outages
+- **Long-running clusters**: Keep `gc_max_retention_hours` at 24+ to handle extended outages
+
+**GC Configuration Rules (Validated at Startup):**
+- `gc_min_retention_hours` must be >= `delta_sync_threshold_seconds` (in hours)
+- `gc_max_retention_hours` should be >= 2x `delta_sync_threshold_seconds`
+- Violating these rules will cause startup failure with helpful error messages
+
+### Query Pipeline
+
+```toml
+[query_pipeline]
+transpiler_cache_size = 10000  # LRU cache for MySQL→SQLite transpilation
+validator_pool_size = 8        # SQLite connection pool for validation
+```
 
 ### MySQL Protocol Server
 
@@ -393,13 +444,23 @@ verbose = false          # Enable verbose logging
 format = "console"       # Log format: console or json
 ```
 
-### Prometheus
+### Prometheus Metrics
 
 ```toml
 [prometheus]
-enabled = true
-address = "0.0.0.0"
-port = 9090
+enabled = true  # Metrics served on gRPC port at /metrics endpoint
+```
+
+**Accessing Metrics:**
+```bash
+# Metrics are multiplexed with gRPC on the same port
+curl http://localhost:8080/metrics
+
+# Prometheus scrape config
+scrape_configs:
+  - job_name: 'marmot'
+    static_configs:
+      - targets: ['node1:8080', 'node2:8080', 'node3:8080']
 ```
 
 See `config.toml` for complete configuration reference with detailed comments.

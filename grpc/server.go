@@ -208,18 +208,19 @@ func (s *Server) Stop() {
 
 // Gossip handles gossip protocol messages
 func (s *Server) Gossip(ctx context.Context, req *GossipRequest) (*GossipResponse, error) {
-	// Update lastSeen for the source node (the node that sent this gossip message)
-	// This prevents marking active gossiping nodes as SUSPECT
+	// Merge received node states - this includes the source node's state
+	// which allows restarted nodes to be re-discovered
+	for _, nodeState := range req.Nodes {
+		s.registry.Update(nodeState)
+	}
+
+	// Update lastSeen for the source node after Update() to ensure
+	// the node exists in registry (it should be in req.Nodes)
 	s.registry.mu.Lock()
 	if _, exists := s.registry.nodes[req.SourceNodeId]; exists {
 		s.registry.lastSeen[req.SourceNodeId] = time.Now()
 	}
 	s.registry.mu.Unlock()
-
-	// Merge received node states
-	for _, nodeState := range req.Nodes {
-		s.registry.Update(nodeState)
-	}
 
 	// Return our view of the cluster
 	nodes := s.registry.GetAll()
@@ -230,10 +231,12 @@ func (s *Server) Gossip(ctx context.Context, req *GossipRequest) (*GossipRespons
 
 // Join handles node join requests
 func (s *Server) Join(ctx context.Context, req *JoinRequest) (*JoinResponse, error) {
-	log.Info().
-		Uint64("node_id", req.NodeId).
-		Str("address", req.Address).
-		Msg("Node joining cluster")
+	log.Debug().
+		Uint64("local_node_id", s.nodeID).
+		Uint64("joining_node_id", req.NodeId).
+		Str("joining_address", req.Address).
+		Str("timestamp", time.Now().Format("15:04:05.000")).
+		Msg("SEED: Received join request")
 
 	// Add node to registry with JOINING status
 	// The node will transition to ALIVE after it completes catch-up
@@ -252,6 +255,21 @@ func (s *Server) Join(ctx context.Context, req *JoinRequest) (*JoinResponse, err
 
 	// Return current cluster state
 	nodes := s.registry.GetAll()
+
+	log.Debug().
+		Uint64("local_node_id", s.nodeID).
+		Int("cluster_nodes_count", len(nodes)).
+		Str("timestamp", time.Now().Format("15:04:05.000")).
+		Msg("SEED: Returning cluster nodes to joining node")
+	for _, n := range nodes {
+		log.Debug().
+			Uint64("local_node_id", s.nodeID).
+			Uint64("returning_node_id", n.NodeId).
+			Str("returning_status", n.Status.String()).
+			Str("returning_address", n.Address).
+			Msg("SEED: Cluster node in response")
+	}
+
 	return &JoinResponse{
 		Success:      true,
 		ClusterNodes: nodes,
@@ -360,24 +378,70 @@ func (s *Server) StreamChanges(req *StreamRequest, stream MarmotService_StreamCh
 				continue
 			}
 
-			// Parse statements from JSON
+			// Parse statements from JSON - must include CDC data (NewValues, OldValues, RowKey)
 			var statements []*Statement
 			if statementsJSON != "" && statementsJSON != "[]" {
 				var rawStatements []struct {
-					SQL       string `json:"SQL"`
-					Type      int    `json:"Type"`
-					TableName string `json:"TableName"`
-					Database  string `json:"Database"`
+					SQL       string            `json:"SQL"`
+					Type      int               `json:"Type"`
+					TableName string            `json:"TableName"`
+					Database  string            `json:"Database"`
+					RowKey    string            `json:"RowKey"`
+					OldValues map[string][]byte `json:"OldValues"`
+					NewValues map[string][]byte `json:"NewValues"`
 				}
 				if err := json.Unmarshal([]byte(statementsJSON), &rawStatements); err != nil {
 					log.Warn().Err(err).Uint64("txn_id", txnID).Msg("Failed to parse statements JSON")
 				} else {
 					for _, s := range rawStatements {
-						statements = append(statements, &Statement{
-							Sql:       s.SQL,
+						stmt := &Statement{
+							Type:      StatementType(s.Type),
 							TableName: s.TableName,
 							Database:  s.Database,
-						})
+						}
+
+						// For DML with CDC data, use RowChange payload
+						// For DDL or DML without CDC, use DdlChange payload with SQL
+						isDML := s.Type == int(StatementType_INSERT) ||
+							s.Type == int(StatementType_UPDATE) ||
+							s.Type == int(StatementType_DELETE) ||
+							s.Type == int(StatementType_REPLACE)
+
+						if isDML && (len(s.NewValues) > 0 || len(s.OldValues) > 0) {
+							// CDC path: send row data
+							stmt.Payload = &Statement_RowChange{
+								RowChange: &RowChange{
+									RowKey:    s.RowKey,
+									OldValues: s.OldValues,
+									NewValues: s.NewValues,
+								},
+							}
+							log.Debug().
+								Uint64("txn_id", txnID).
+								Str("table", s.TableName).
+								Str("row_key", s.RowKey).
+								Int("new_values", len(s.NewValues)).
+								Int("old_values", len(s.OldValues)).
+								Msg("STREAM: Sending CDC data for anti-entropy")
+						} else {
+							// DDL or DML without CDC: send SQL
+							stmt.Payload = &Statement_DdlChange{
+								DdlChange: &DDLChange{
+									Sql: s.SQL,
+								},
+							}
+							log.Debug().
+								Uint64("txn_id", txnID).
+								Str("sql_prefix", func() string {
+									if len(s.SQL) > 50 {
+										return s.SQL[:50]
+									}
+									return s.SQL
+								}()).
+								Msg("STREAM: Sending SQL for anti-entropy")
+						}
+
+						statements = append(statements, stmt)
 					}
 				}
 			}
@@ -468,6 +532,13 @@ func (s *Server) GetReplicationState(ctx context.Context, req *ReplicationStateR
 			maxTxnID = 0
 		}
 
+		// Get committed transaction count for data completeness comparison
+		txnCount, err := dbManager.GetCommittedTxnCount(dbName)
+		if err != nil {
+			log.Warn().Err(err).Str("database", dbName).Msg("Failed to get committed txn count")
+			txnCount = 0
+		}
+
 		states = append(states, &DatabaseReplicationState{
 			DatabaseName:         dbName,
 			LastAppliedTxnId:     lastAppliedTxnID,
@@ -475,6 +546,7 @@ func (s *Server) GetReplicationState(ctx context.Context, req *ReplicationStateR
 			LastSyncTime:         lastSyncTime,
 			SyncStatus:           syncStatus,
 			CurrentMaxTxnId:      maxTxnID,
+			CommittedTxnCount:    txnCount,
 		})
 	}
 

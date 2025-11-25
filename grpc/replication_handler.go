@@ -3,7 +3,6 @@ package grpc
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	"github.com/maxpert/marmot/db"
 	"github.com/maxpert/marmot/hlc"
@@ -61,50 +60,113 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 		Int("num_statements", len(req.Statements)).
 		Msg("handlePrepare called")
 
-	// Handle CREATE DATABASE and DROP DATABASE specially
-	// These operations don't need MVCC transaction management
+	// Handle CREATE DATABASE and DROP DATABASE using system database for transaction tracking
+	// These operations need 2PC but don't have a user database to track the transaction in
 	if len(req.Statements) == 1 {
 		stmt := req.Statements[0]
 		stmtType := convertStatementType(stmt.Type)
 
-		log.Debug().
-			Uint64("node_id", rh.nodeID).
-			Int("stmt_type", int(stmtType)).
-			Str("stmt_database", stmt.Database).
-			Str("sql", stmt.Sql).
-			Msg("Checking statement type")
-
-		// Check if it's a CREATE DATABASE or DROP DATABASE by examining the SQL
-		upperSQL := strings.ToUpper(strings.TrimSpace(stmt.Sql))
-
-		if strings.HasPrefix(upperSQL, "CREATE DATABASE") {
-			// Execute CREATE DATABASE directly
-			log.Info().Str("database", stmt.Database).Uint64("node_id", rh.nodeID).Msg("Executing CREATE DATABASE via replication")
-			err := rh.dbMgr.CreateDatabase(stmt.Database)
+		if stmtType == protocol.StatementCreateDatabase || stmtType == protocol.StatementDropDatabase {
+			// Use system database for transaction management
+			systemDB, err := rh.dbMgr.GetDatabase("__marmot_system")
 			if err != nil {
-				log.Error().Err(err).Str("database", stmt.Database).Msg("CREATE DATABASE failed")
 				return &TransactionResponse{
 					Success:      false,
-					ErrorMessage: fmt.Sprintf("failed to create database: %v", err),
+					ErrorMessage: fmt.Sprintf("system database not found: %v", err),
 				}, nil
 			}
-			log.Info().Str("database", stmt.Database).Uint64("node_id", rh.nodeID).Msg("CREATE DATABASE succeeded via replication")
-			return &TransactionResponse{Success: true}, nil
-		}
 
-		if strings.HasPrefix(upperSQL, "DROP DATABASE") {
-			// Execute DROP DATABASE directly
-			log.Info().Str("database", stmt.Database).Uint64("node_id", rh.nodeID).Msg("Executing DROP DATABASE via replication")
-			err := rh.dbMgr.DropDatabase(stmt.Database)
+			txnMgr := systemDB.GetTransactionManager()
+			txn, err := txnMgr.BeginTransaction(req.SourceNodeId)
 			if err != nil {
-				log.Error().Err(err).Str("database", stmt.Database).Msg("DROP DATABASE failed")
 				return &TransactionResponse{
 					Success:      false,
-					ErrorMessage: fmt.Sprintf("failed to drop database: %v", err),
+					ErrorMessage: fmt.Sprintf("failed to begin transaction: %v", err),
 				}, nil
 			}
-			log.Info().Str("database", stmt.Database).Uint64("node_id", rh.nodeID).Msg("DROP DATABASE succeeded via replication")
-			return &TransactionResponse{Success: true}, nil
+
+			// Override transaction ID to match coordinator's
+			originalID := txn.ID
+			txn.ID = req.TxnId
+			txn.StartTS = hlc.Timestamp{
+				WallTime: req.Timestamp.WallTime,
+				Logical:  req.Timestamp.Logical,
+				NodeID:   req.Timestamp.NodeId,
+			}
+
+			txnMgr.UpdateTransactionID(originalID, req.TxnId)
+
+			// Update transaction record in system database
+			_, err = systemDB.GetDB().Exec(`
+				UPDATE __marmot__txn_records
+				SET txn_id = ?
+				WHERE txn_id = ?
+			`, req.TxnId, originalID)
+			if err != nil {
+				txnMgr.AbortTransaction(txn)
+				return &TransactionResponse{
+					Success:      false,
+					ErrorMessage: fmt.Sprintf("failed to update txn ID: %v", err),
+				}, nil
+			}
+
+			// Convert proto statement to internal format
+			internalStmt := protocol.Statement{
+				SQL:       stmt.GetSQL(),
+				Type:      stmtType,
+				TableName: stmt.TableName,
+				Database:  stmt.Database,
+			}
+
+			// Add statement to transaction
+			if err := txnMgr.AddStatement(txn, internalStmt); err != nil {
+				txnMgr.AbortTransaction(txn)
+				return &TransactionResponse{
+					Success:      false,
+					ErrorMessage: fmt.Sprintf("failed to add statement: %v", err),
+				}, nil
+			}
+
+			// Create write intent for database operation
+			rowKey := stmt.Database
+			opName := "CREATE_DATABASE"
+			if stmtType == protocol.StatementDropDatabase {
+				opName = "DROP_DATABASE"
+			}
+			snapshotData := map[string]interface{}{
+				"type":          int(stmt.Type),
+				"timestamp":     req.Timestamp.WallTime,
+				"database_name": stmt.Database,
+				"operation":     opName,
+			}
+			dataSnapshot, _ := db.SerializeData(snapshotData)
+
+			err = txnMgr.WriteIntent(txn, "__marmot__database_operations", rowKey, internalStmt, dataSnapshot)
+			if err != nil {
+				txnMgr.AbortTransaction(txn)
+				return &TransactionResponse{
+					Success:          false,
+					ErrorMessage:     fmt.Sprintf("write conflict: %v", err),
+					ConflictDetected: true,
+					ConflictDetails:  err.Error(),
+				}, nil
+			}
+
+			log.Info().
+				Str("database", stmt.Database).
+				Str("operation", opName).
+				Uint64("node_id", rh.nodeID).
+				Uint64("txn_id", req.TxnId).
+				Msg("Database operation prepared (intent created)")
+
+			return &TransactionResponse{
+				Success: true,
+				AppliedAt: &HLC{
+					WallTime: rh.clock.Now().WallTime,
+					Logical:  rh.clock.Now().Logical,
+					NodeId:   rh.nodeID,
+				},
+			}, nil
 		}
 	}
 
@@ -167,10 +229,17 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 	for _, stmt := range req.Statements {
 		// Convert proto statement to internal format
 		internalStmt := protocol.Statement{
-			SQL:       stmt.Sql,
+			SQL:       stmt.GetSQL(),
 			Type:      convertStatementType(stmt.Type),
 			TableName: stmt.TableName,
 			Database:  stmt.Database,
+			RowKey:    stmt.GetRowKey(),
+		}
+
+		// If CDC data is present, populate it
+		if rowChange := stmt.GetRowChange(); rowChange != nil {
+			internalStmt.OldValues = rowChange.OldValues
+			internalStmt.NewValues = rowChange.NewValues
 		}
 
 		// Add statement to transaction
@@ -182,14 +251,34 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 			}, nil
 		}
 
-		// Create write intent for this statement
-		// Extract row key from statement (simplified - in real impl would parse SQL)
-		rowKey := extractRowKey(stmt.Sql, stmt.TableName)
-		dataSnapshot, _ := db.SerializeData(map[string]interface{}{
-			"sql":       stmt.Sql,
+		// Use pre-extracted row key from protobuf message
+		// The row key was extracted from the original MySQL AST during parsing
+		rowKey := stmt.GetRowKey()
+		if rowKey == "" {
+			// Fallback to hash if no row key was extracted
+			sql := stmt.GetSQL()
+			if sql == "" {
+				sql = "unknown"
+			}
+			log.Warn().
+				Str("sql", sql).
+				Msg("Empty RowKey received - using fallback hex hash")
+			rowKey = fmt.Sprintf("%x", []byte(sql)[:min(16, len(sql))])
+		}
+
+		// Serialize data snapshot (CDC data if available, otherwise SQL)
+		snapshotData := map[string]interface{}{
 			"type":      stmt.Type.String(),
 			"timestamp": req.Timestamp.WallTime,
-		})
+		}
+		if stmt.HasCDCData() {
+			snapshotData["cdc_data"] = true
+			snapshotData["old_values_count"] = len(stmt.GetRowChange().OldValues)
+			snapshotData["new_values_count"] = len(stmt.GetRowChange().NewValues)
+		} else {
+			snapshotData["sql"] = stmt.GetSQL()
+		}
+		dataSnapshot, _ := db.SerializeData(snapshotData)
 
 		err := txnMgr.WriteIntent(txn, stmt.TableName, rowKey, internalStmt, dataSnapshot)
 		if err != nil {
@@ -217,7 +306,72 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 
 // handleCommit processes Phase 2 of 2PC: Commit transaction
 func (rh *ReplicationHandler) handleCommit(ctx context.Context, req *TransactionRequest) (*TransactionResponse, error) {
-	// Get the target database from request
+	// Check if this is a database operation (CREATE/DROP DATABASE)
+	// These are tracked in the system database
+	systemDB, err := rh.dbMgr.GetDatabase("__marmot_system")
+	if err == nil {
+		// Try to find transaction in system database first
+		systemTxnMgr := systemDB.GetTransactionManager()
+		systemTxn := systemTxnMgr.GetTransaction(req.TxnId)
+
+		if systemTxn != nil && len(systemTxn.Statements) > 0 {
+			stmt := systemTxn.Statements[0]
+
+			// Check if it's a database operation
+			if stmt.Type == protocol.StatementCreateDatabase || stmt.Type == protocol.StatementDropDatabase {
+				// Execute the database operation BEFORE committing the transaction
+				var dbOpErr error
+				if stmt.Type == protocol.StatementCreateDatabase {
+					log.Info().Str("database", stmt.Database).Uint64("node_id", rh.nodeID).Msg("Executing CREATE DATABASE in commit phase")
+					dbOpErr = rh.dbMgr.CreateDatabase(stmt.Database)
+				} else {
+					log.Info().Str("database", stmt.Database).Uint64("node_id", rh.nodeID).Msg("Executing DROP DATABASE in commit phase")
+					dbOpErr = rh.dbMgr.DropDatabase(stmt.Database)
+				}
+
+				if dbOpErr != nil {
+					opName := "CREATE_DATABASE"
+					if stmt.Type == protocol.StatementDropDatabase {
+						opName = "DROP_DATABASE"
+					}
+					log.Error().Err(dbOpErr).Str("database", stmt.Database).Str("operation", opName).Msg("Database operation failed in commit phase")
+					systemTxnMgr.AbortTransaction(systemTxn)
+					return &TransactionResponse{
+						Success:      false,
+						ErrorMessage: fmt.Sprintf("database operation failed: %v", dbOpErr),
+					}, nil
+				}
+
+				// Now commit the transaction to mark it as completed
+				if err := systemTxnMgr.CommitTransaction(systemTxn); err != nil {
+					// Database operation succeeded but transaction commit failed
+					// This is not ideal but the operation is done
+					log.Warn().Err(err).Str("database", stmt.Database).Msg("Database operation succeeded but transaction commit failed")
+				}
+
+				opName := "CREATE_DATABASE"
+				if stmt.Type == protocol.StatementDropDatabase {
+					opName = "DROP_DATABASE"
+				}
+				log.Info().
+					Str("database", stmt.Database).
+					Str("operation", opName).
+					Uint64("node_id", rh.nodeID).
+					Msg("Database operation committed successfully")
+
+				return &TransactionResponse{
+					Success: true,
+					AppliedAt: &HLC{
+						WallTime: rh.clock.Now().WallTime,
+						Logical:  rh.clock.Now().Logical,
+						NodeId:   rh.nodeID,
+					},
+				}, nil
+			}
+		}
+	}
+
+	// Regular operation - get user database
 	dbName := req.Database
 	if dbName == "" {
 		dbName = db.DefaultDatabaseName
@@ -264,7 +418,20 @@ func (rh *ReplicationHandler) handleCommit(ctx context.Context, req *Transaction
 
 // handleAbort processes abort: Rollback transaction
 func (rh *ReplicationHandler) handleAbort(ctx context.Context, req *TransactionRequest) (*TransactionResponse, error) {
-	// Get the target database from request
+	// Check system database first for database operations
+	systemDB, err := rh.dbMgr.GetDatabase("__marmot_system")
+	if err == nil {
+		systemTxnMgr := systemDB.GetTransactionManager()
+		systemTxn := systemTxnMgr.GetTransaction(req.TxnId)
+		if systemTxn != nil {
+			if err := systemTxnMgr.AbortTransaction(systemTxn); err != nil {
+				log.Warn().Err(err).Uint64("txn_id", req.TxnId).Msg("Failed to abort system database transaction")
+			}
+			return &TransactionResponse{Success: true}, nil
+		}
+	}
+
+	// Try user database
 	dbName := req.Database
 	if dbName == "" {
 		dbName = db.DefaultDatabaseName
@@ -273,10 +440,8 @@ func (rh *ReplicationHandler) handleAbort(ctx context.Context, req *TransactionR
 	// Get database instance
 	dbInstance, err := rh.dbMgr.GetDatabase(dbName)
 	if err != nil {
-		return &TransactionResponse{
-			Success:      false,
-			ErrorMessage: fmt.Sprintf("database %s not found: %v", dbName, err),
-		}, nil
+		// Database not found - transaction likely never started or already aborted
+		return &TransactionResponse{Success: true}, nil
 	}
 
 	txnMgr := dbInstance.GetTransactionManager()
@@ -407,58 +572,13 @@ func convertStatementType(st StatementType) protocol.StatementType {
 		return protocol.StatementReplace
 	case StatementType_DDL:
 		return protocol.StatementDDL
+	case StatementType_CREATE_DATABASE:
+		return protocol.StatementCreateDatabase
+	case StatementType_DROP_DATABASE:
+		return protocol.StatementDropDatabase
 	default:
 		return protocol.StatementInsert // Default to insert
 	}
-}
-
-// extractRowKey extracts row key from SQL statement (simplified)
-// In a real implementation, this would parse the SQL and extract primary key values
-func extractRowKey(sql, tableName string) string {
-	// Simple heuristic: look for "WHERE id = X" pattern
-	// For testing purposes, extract the ID value
-	var rowKey string
-
-	// Try to extract from WHERE clause
-	if idx := indexOf(sql, "WHERE id = "); idx >= 0 {
-		start := idx + len("WHERE id = ")
-		// Extract the number
-		end := start
-		for end < len(sql) && (sql[end] >= '0' && sql[end] <= '9') {
-			end++
-		}
-		if end > start {
-			rowKey = sql[start:end]
-		}
-	}
-
-	// Try to extract from VALUES clause for INSERT
-	if rowKey == "" && indexOf(sql, "VALUES (") >= 0 {
-		start := indexOf(sql, "VALUES (") + len("VALUES (")
-		end := start
-		for end < len(sql) && (sql[end] >= '0' && sql[end] <= '9') {
-			end++
-		}
-		if end > start {
-			rowKey = sql[start:end]
-		}
-	}
-
-	// Fallback: use hash
-	if rowKey == "" {
-		rowKey = fmt.Sprintf("%x", []byte(sql)[:min(16, len(sql))])
-	}
-
-	return rowKey
-}
-
-func indexOf(s, substr string) int {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return i
-		}
-	}
-	return -1
 }
 
 func min(a, b int) int {

@@ -50,6 +50,26 @@ func (tdm *TestDatabaseManager) GetDatabase(name string) (*db.MVCCDatabase, erro
 	return tdm.db, nil
 }
 
+func (tdm *TestDatabaseManager) ListDatabases() []string {
+	return []string{"marmot"}
+}
+
+func (tdm *TestDatabaseManager) DatabaseExists(name string) bool {
+	return true
+}
+
+func (tdm *TestDatabaseManager) CreateDatabase(name string) error {
+	return nil
+}
+
+func (tdm *TestDatabaseManager) DropDatabase(name string) error {
+	return nil
+}
+
+func (tdm *TestDatabaseManager) GetDatabaseConnection(name string) (*sql.DB, error) {
+	return tdm.db.GetDB(), nil
+}
+
 func TestMySQLServerIntegration(t *testing.T) {
 	// Setup temporary DB
 	dbPath := "file::memory:?cache=shared"
@@ -76,7 +96,7 @@ func TestMySQLServerIntegration(t *testing.T) {
 	readCoord := coordinator.NewReadCoordinator(1, nodeProvider, localReader, time.Second)
 
 	// Setup Handler
-	handler := coordinator.NewCoordinatorHandler(1, writeCoord, readCoord, clock, nil, nil, nil, nil)
+	handler := coordinator.NewCoordinatorHandler(1, writeCoord, readCoord, clock, dbMgr, nil, nil, nil)
 
 	// Setup Server
 	port := 3307 // Use non-standard port
@@ -111,8 +131,8 @@ func TestMySQLServerIntegration(t *testing.T) {
 	_, err = db.Exec("CREATE TABLE users (id INT PRIMARY KEY, name TEXT)")
 	require.NoError(t, err)
 
-	// Test Insert
-	_, err = db.Exec("INSERT INTO users VALUES (1, 'alice')")
+	// Test Insert (CDC requires explicit column list)
+	_, err = db.Exec("INSERT INTO users (id, name) VALUES (1, 'alice')")
 	require.NoError(t, err)
 
 	// Test Select
