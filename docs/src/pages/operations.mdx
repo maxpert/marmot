@@ -1,0 +1,66 @@
+---
+title: Operations
+---
+
+# Operations
+
+## Security
+
+Marmot supports Pre-Shared Key (PSK) authentication for cluster communication. **This is strongly recommended for production deployments.**
+
+```toml
+[cluster]
+# All nodes in the cluster must use the same secret
+cluster_secret = "your-secret-key-here"
+```
+
+**Environment Variable (Recommended):**
+
+For production, use the environment variable to avoid storing secrets in config files:
+
+```bash
+export MARMOT_CLUSTER_SECRET="your-secret-key-here"
+./marmot
+```
+
+The environment variable takes precedence over the config file.
+
+**Generating a Secret:**
+
+```bash
+# Generate a secure random secret
+openssl rand -base64 32
+```
+
+**Behavior:**
+- If `cluster_secret` is empty and `MARMOT_CLUSTER_SECRET` is not set, authentication is disabled
+- A warning is logged at startup when authentication is disabled
+- All gRPC endpoints (gossip, replication, snapshots) are protected when authentication is enabled
+- Nodes with mismatched secrets will fail to communicate (connection rejected with "invalid cluster secret")
+
+## Logging
+
+```toml
+[logging]
+verbose = false          # Enable verbose logging
+format = "console"       # Log format: console or json
+```
+
+## Prometheus Metrics
+
+```toml
+[prometheus]
+enabled = true  # Metrics served on gRPC port at /metrics endpoint
+```
+
+**Accessing Metrics:**
+```bash
+# Metrics are multiplexed with gRPC on the same port
+curl http://localhost:8080/metrics
+
+# Prometheus scrape config
+scrape_configs:
+  - job_name: 'marmot'
+    static_configs:
+      - targets: ['node1:8080', 'node2:8080', 'node3:8080']
+```

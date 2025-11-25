@@ -6,12 +6,12 @@ const basePath = "/marmot";
 export default {
   project: { link: "https://github.com/maxpert/marmot" },
   docsRepositoryBase: "https://github.com/maxpert/marmot/tree/master/docs",
-  titleSuffix: " - Marmot",
+  titleSuffix: " - Marmot V2",
   logo: (
     <>
       <img width={50} style={{ marginRight: 5 }} src={`${basePath}/logo.png`} />
       <span className="text-gray-600 font-normal hidden md:inline">
-        A distributed SQLite replicator built on top of NATS
+        A distributed SQLite replicator built on a gossip-based protocol
       </span>
     </>
   ),
@@ -23,11 +23,11 @@ export default {
       <meta httpEquiv="Content-Language" content="en" />
       <meta
         name="description"
-        content="Marmot: A distributed SQLite replicator built on top of NATS"
+        content="Marmot: A distributed SQLite replicator built on a gossip-based protocol"
       />
       <meta
         name="og:description"
-        content="Marmot: A distributed SQLite replicator built on top of NATS"
+        content="Marmot: A distributed SQLite replicator built on a gossip-based protocol"
       />
       <meta name="twitter:card" content="summary_large_image" />
       <meta name="twitter:image" content={`${basePath}/logo.png`} />
@@ -35,7 +35,7 @@ export default {
       <meta name="twitter:url" content="https://github.com/maxpert/marmot" />
       <meta
         name="og:title"
-        content="Marmot: A distributed SQLite replicator built on top of NATS"
+        content="Marmot: A distributed SQLite replicator built on a gossip-based protocol"
       />
       <meta name="og:image" content={`${basePath}/logo.png`} />
       <meta name="apple-mobile-web-app-title" content="Marmot" />

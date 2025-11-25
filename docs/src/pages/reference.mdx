@@ -1,0 +1,124 @@
+---
+title: Reference
+---
+
+# Configuration Reference
+
+Marmot v2 uses a TOML configuration file (default: `config.toml`). All settings have sensible defaults.
+
+## Core Configuration
+
+```toml
+node_id = 0  # 0 = auto-generate
+data_dir = "./marmot-data"
+```
+
+## MVCC Transaction Manager
+
+```toml
+[mvcc]
+gc_interval_seconds = 30        # Garbage collection interval
+gc_retention_hours = 1          # Deprecated: Use replication.gc_min_retention_hours instead
+heartbeat_timeout_seconds = 10  # Transaction timeout without heartbeat
+version_retention_count = 10    # MVCC versions to keep per row
+conflict_window_seconds = 10    # LWW conflict resolution window
+```
+
+**Note**: GC retention is now managed by the replication configuration to coordinate with anti-entropy. The `gc_retention_hours` setting is deprecated in favor of `replication.gc_min_retention_hours` and `replication.gc_max_retention_hours`.
+
+## Connection Pool
+
+```toml
+[connection_pool]
+pool_size = 4              # Number of SQLite connections
+max_idle_time_seconds = 10 # Max idle time before closing
+max_lifetime_seconds = 300 # Max connection lifetime (0 = unlimited)
+```
+
+## gRPC Client
+
+```toml
+[grpc_client]
+keepalive_time_seconds = 10    # Keepalive ping interval
+keepalive_timeout_seconds = 3  # Keepalive ping timeout
+max_retries = 3                # Max retry attempts
+retry_backoff_ms = 100         # Retry backoff duration
+```
+
+## Coordinator
+
+```toml
+[coordinator]
+prepare_timeout_ms = 2000 # Prepare phase timeout
+commit_timeout_ms = 2000  # Commit phase timeout
+abort_timeout_ms = 2000   # Abort phase timeout
+```
+
+## Cluster
+
+```toml
+[cluster]
+grpc_bind_address = "0.0.0.0"
+grpc_port = 8080
+seed_nodes = []                # List of seed node addresses
+cluster_secret = ""            # PSK for cluster authentication (see Security section)
+gossip_interval_ms = 1000      # Gossip interval
+gossip_fanout = 3              # Number of peers to gossip to
+suspect_timeout_ms = 5000      # Suspect timeout
+dead_timeout_ms = 10000        # Dead timeout
+```
+
+## Replication
+
+```toml
+[replication]
+default_write_consistency = "QUORUM"      # Write consistency level: ONE, QUORUM, ALL
+default_read_consistency = "LOCAL_ONE"    # Read consistency level
+write_timeout_ms = 5000                   # Write operation timeout
+read_timeout_ms = 2000                    # Read operation timeout
+
+# Anti-Entropy: Background healing for eventual consistency
+# - Detects and repairs divergence between replicas
+# - Uses delta sync for small lags, snapshot for large lags
+# - Includes gap detection to prevent incomplete data after GC
+enable_anti_entropy = true                 # Enable automatic catch-up for lagging nodes
+anti_entropy_interval_seconds = 60         # How often to check for lag (default: 60s)
+delta_sync_threshold_transactions = 10000  # Delta sync if lag < 10K txns
+delta_sync_threshold_seconds = 3600        # Snapshot if lag > 1 hour
+
+# Garbage Collection: Reclaim disk space by deleting old transaction records
+# - gc_min must be >= delta_sync_threshold (validated at startup)
+# - gc_max should be >= 2x delta_sync_threshold (recommended)
+# - Set gc_max = 0 for unlimited retention
+gc_min_retention_hours = 2   # Keep at least 2 hours (>= 1 hour delta threshold)
+gc_max_retention_hours = 24  # Force delete after 24 hours
+```
+
+**Anti-Entropy Tuning:**
+- **Small clusters (2-3 nodes)**: Use default settings (60s interval)
+- **Large clusters (5+ nodes)**: Consider increasing interval to 120-180s to reduce network overhead
+- **High write throughput**: Increase `delta_sync_threshold_transactions` to 50000+
+- **Long-running clusters**: Keep `gc_max_retention_hours` at 24+ to handle extended outages
+
+**GC Configuration Rules (Validated at Startup):**
+- `gc_min_retention_hours` must be >= `delta_sync_threshold_seconds` (in hours)
+- `gc_max_retention_hours` should be >= 2x `delta_sync_threshold_seconds`
+- Violating these rules will cause startup failure with helpful error messages
+
+## Query Pipeline
+
+```toml
+[query_pipeline]
+transpiler_cache_size = 10000  # LRU cache for MySQL→SQLite transpilation
+validator_pool_size = 8        # SQLite connection pool for validation
+```
+
+## MySQL Protocol Server
+
+```toml
+[mysql]
+enabled = true
+bind_address = "0.0.0.0"
+port = 3306
+max_connections = 1000
+```

@@ -1,0 +1,35 @@
+---
+title: Architecture
+---
+
+# Architecture
+
+Marmot v2 uses a fundamentally different architecture from other SQLite replication solutions:
+
+**vs. rqlite/dqlite/LiteFS:**
+- ❌ They require a primary node for all writes
+- ✅ Marmot allows writes on **any node**
+- ❌ They use leader election (Raft)
+- ✅ Marmot uses **gossip protocol** (no leader)
+- ❌ They require proxy layer or page-level interception
+- ✅ Marmot uses **MySQL protocol** for direct database access
+
+**How It Works:**
+1. **Write Coordination**: 2PC (Two-Phase Commit) with configurable consistency (ONE, QUORUM, ALL)
+2. **Conflict Resolution**: Last-Write-Wins (LWW) with HLC timestamps
+3. **Cluster Membership**: SWIM-style gossip with failure detection
+4. **Data Replication**: Full database replication - all nodes receive all data
+5. **DDL Replication**: Cluster-wide schema changes with automatic idempotency
+
+## Consistency Guarantees
+
+| Write Consistency | Behavior |
+|-------------------|----------|
+| `ONE` | Returns after 1 node ACK (fast, less durable) |
+| `QUORUM` | Returns after majority ACK (default, balanced) |
+| `ALL` | Returns after all nodes ACK (slow, most durable) |
+
+**Conflict Resolution:**
+- All conflicts resolved via LWW using HLC timestamps
+- No data loss - later write always wins deterministically
+- Tie-breaker: higher node ID wins for equal timestamps

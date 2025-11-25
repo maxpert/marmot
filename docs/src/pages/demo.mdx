@@ -1,40 +1,135 @@
 ---
-title: Marmot + Isso Demo
+title: Local Cluster Demo
 ---
 
-## What is Marmot?
+# Local Cluster Demo
 
-[Marmot](https://github.com/maxpert/marmot) is a distributed SQLite replicator that runs as a side-car to you service, and replicates 
-data across cluster using embedded NATS. Marmot relies on [JetStream](https://docs.nats.io/nats-concepts/jetstream)
-based CDC (Change Data Capture) to replicate changes. JetStream under the hood uses RAFT for consensus
-and allows for eventually consistent SQLite replicas (multi-primary replication).
+This guide will walk you through setting up a local 3-node Marmot cluster and testing replication capabilities.
 
-## What is Isso?
+## Prerequisites
 
-[Isso](https://isso-comments.de/) is a commenting system like Disqus. Users can edit or delete own
-comments (within 15 minutes by default). Best part about Isso is that it uses SQLite!
+- **Marmot Binary**: Ensure you have the `marmot-v2` binary built and available.
+- **MySQL Client**: `mysql` CLI or any GUI client (DBeaver, etc.).
+- **Terminal**: A terminal with bash/zsh.
 
-## What is Fly.io?
+## Step 1: Start the Cluster
 
-Fly is a platform for running full stack apps and databases close to your users. Compute jobs at Fly.io are
-virtualized using Firecracker, the virtualization engine developed at AWS as the
-engine for Lambda and Fargate.
+We will start 3 nodes on your local machine.
 
-## Why should I care?
+### Node 1 (Seed Node)
+Open a new terminal tab/window and run:
 
-This demo effectively shows how Isso can be scaled out and pushed closer to the edge. Many out of box SQLite tools can be scaled 
-similarly. Your fly.io nodes scale up or down based on traffic, and write from everywhere. This allows horizontal scalability
-of your Isso close to the user. With NATS embedded into Marmot, a sharded RAFT is used to capture changes, and replay them 
-across the fly nodes. So if you are running a single node SQLite site you can now add redundancy to that with Marmot.
+```bash
+# Node 1: HTTP 8081, MySQL 3307
+./marmot-v2 -config cfg/config.toml -cluster-addr :8081 -mysql-port 3307 -node-id 1
+```
 
-## How do I configure one for myself?
+### Node 2
+Open a second terminal tab/window and join the cluster:
 
-You can access code and follow the instructions [here](https://gitlab.com/maxpert/marmot-denokv).
+```bash
+# Node 2: HTTP 8082, MySQL 3308
+./marmot-v2 -config cfg/config.toml -cluster-addr :8082 -mysql-port 3308 -node-id 2 -seeds localhost:8081
+```
 
-## Demo
+### Node 3
+Open a third terminal tab/window and join the cluster:
 
-<section id="isso-thread">
-    <noscript>Javascript needs to be activated to view comments.</noscript>
-</section>
+```bash
+# Node 3: HTTP 8083, MySQL 3309
+./marmot-v2 -config cfg/config.toml -cluster-addr :8083 -mysql-port 3309 -node-id 3 -seeds localhost:8081
+```
 
-<script data-isso="//marmot-demo.fly.dev/" src="//marmot-demo.fly.dev/js/embed.min.js"></script>
+> **Note**: You should see logs indicating that nodes have joined the cluster and established connections.
+
+## Step 2: Test Replication
+
+Now let's verify that data replicates across the cluster.
+
+### Connect to Node 1
+Open a fourth terminal tab/window:
+
+```bash
+mysql -h 127.0.0.1 -P 3307 -u root
+```
+
+Run the following SQL:
+
+```sql
+-- Create a database and table
+CREATE DATABASE demo;
+USE demo;
+CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(50));
+
+-- Insert some data
+INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob');
+```
+
+### Connect to Node 2
+In a new terminal tab (or exit the previous mysql session):
+
+```bash
+mysql -h 127.0.0.1 -P 3308 -u root
+```
+
+Verify data replication:
+
+```sql
+USE demo;
+SELECT * FROM users;
+-- Should show Alice and Bob
+```
+
+Make changes on Node 2:
+
+```sql
+-- Update a record
+UPDATE users SET name = 'Bobby' WHERE id = 2;
+
+-- Insert a new record
+INSERT INTO users VALUES (3, 'Charlie');
+```
+
+### Connect to Node 3
+Check Node 3:
+
+```bash
+mysql -h 127.0.0.1 -P 3309 -u root
+```
+
+Verify all changes:
+
+```sql
+USE demo;
+SELECT * FROM users;
+-- Should show:
+-- 1 | Alice
+-- 2 | Bobby
+-- 3 | Charlie
+```
+
+## Step 3: Test Fault Tolerance
+
+Let's simulate a node failure.
+
+1. **Kill Node 2**: Go to the terminal running Node 2 and press `Ctrl+C`.
+2. **Write to Node 1**:
+   ```sql
+   INSERT INTO users VALUES (4, 'Dave');
+   ```
+3. **Restart Node 2**: Run the same command to start Node 2 again.
+4. **Verify Recovery**: Connect to Node 2 and check if it caught up.
+   ```sql
+   SELECT * FROM users WHERE id = 4;
+   -- Should show Dave
+   ```
+
+Marmot's anti-entropy mechanism ensures that Node 2 automatically fetches missing data from peers upon rejoining.
+
+## Cleanup
+
+To stop all nodes, simply `Ctrl+C` in each terminal window. To clean up the data directories:
+
+```bash
+rm -rf ./marmot-data*
+```

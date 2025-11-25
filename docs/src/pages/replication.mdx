@@ -1,0 +1,132 @@
+---
+title: Replication
+---
+
+# Replication
+
+## DDL Replication
+
+Marmot v2 supports **distributed DDL (Data Definition Language) replication** without requiring master election:
+
+### How It Works
+
+1. **Cluster-Wide Locking**: Each DDL operation acquires a distributed lock per database (default: 30-second lease)
+   - Prevents concurrent schema changes on the same database
+   - Locks automatically expire if a node crashes
+   - Different databases can have concurrent DDL operations
+
+2. **Automatic Idempotency**: DDL statements are automatically rewritten for safe replay
+   ```sql
+   CREATE TABLE users (id INT)
+   → CREATE TABLE IF NOT EXISTS users (id INT)
+
+   DROP TABLE users
+   → DROP TABLE IF EXISTS users
+   ```
+
+3. **Schema Version Tracking**: Each database maintains a schema version counter
+   - Incremented on every DDL operation
+   - Exchanged via gossip protocol for drift detection
+   - Used by delta sync to validate transaction applicability
+
+4. **Quorum-Based Replication**: DDL replicates like DML through the same 2PC mechanism
+   - No special master node needed
+   - Works with existing consistency levels (QUORUM, ALL, etc.)
+
+### Configuration
+
+```toml
+[ddl]
+# DDL lock lease duration (seconds)
+lock_lease_seconds = 30
+
+# Automatically rewrite DDL for idempotency
+enable_idempotent = true
+```
+
+### Best Practices
+
+- ✅ **Do**: Execute DDL from a single connection/node at a time
+- ✅ **Do**: Use qualified table names (`mydb.users` instead of `users`)
+- ⚠️ **Caution**: ALTER TABLE is less idempotent - avoid replaying failed ALTER operations
+- ❌ **Don't**: Run concurrent DDL on the same database from multiple nodes
+
+## CDC-Based Replication
+
+Marmot v2 uses **Change Data Capture (CDC)** for replication instead of SQL statement replay:
+
+### How It Works
+
+1. **Row-Level Capture**: Instead of replicating SQL statements, Marmot captures the actual row data changes (INSERT/UPDATE/DELETE)
+2. **Binary Data Format**: Row data is serialized as CDC messages with column values, ensuring consistent replication regardless of SQL dialect
+3. **Deterministic Application**: Row data is applied directly to the target database, avoiding parsing ambiguities
+
+### Benefits
+
+- **Consistency**: Same row data applied everywhere, no SQL parsing differences
+- **Performance**: Binary format is more efficient than SQL text
+- **Reliability**: No issues with SQL syntax variations between MySQL and SQLite
+
+### Row Key Extraction
+
+For UPDATE and DELETE operations, Marmot automatically extracts row keys:
+- Uses PRIMARY KEY columns when available
+- Falls back to ROWID for tables without explicit primary key
+- Handles composite primary keys correctly
+
+## Recovery Scenarios
+
+Marmot handles various failure and recovery scenarios automatically:
+
+### Network Partition (Split-Brain)
+
+| Scenario | Behavior |
+|----------|----------|
+| **Minority partition** | Writes **fail** - cannot achieve quorum |
+| **Majority partition** | Writes **succeed** - quorum achieved |
+| **Partition heals** | Delta sync + LWW merges divergent data |
+
+**How it works:**
+1. During partition, only the majority side can commit writes (quorum enforcement)
+2. When partition heals, nodes exchange transaction logs via `StreamChanges` RPC
+3. Conflicts resolved using Last-Writer-Wins (LWW) with HLC timestamps
+4. Higher node ID breaks ties for simultaneous writes
+
+### Node Failure & Recovery
+
+| Scenario | Recovery Method |
+|----------|-----------------|
+| **Brief outage** | Delta sync - replay missed transactions |
+| **Extended outage** | Snapshot transfer + delta sync |
+| **New node joining** | Full snapshot from existing node |
+
+**Anti-Entropy Background Process:**
+
+Marmot v2 includes an automatic anti-entropy system that continuously monitors and repairs replication lag across the cluster:
+
+1. **Lag Detection**: Every 60 seconds (configurable), each node queries peers for their replication state
+2. **Smart Recovery Decision**:
+   - **Delta Sync** if lag < 10,000 transactions AND < 1 hour: Streams missed transactions incrementally
+   - **Snapshot Transfer** if lag exceeds thresholds: Full database file transfer for efficiency
+3. **Gap Detection**: Detects when transaction logs have been GC'd and automatically falls back to snapshot
+4. **Multi-Database Support**: Tracks and syncs each database independently
+5. **GC Coordination**: Garbage collection respects peer replication state - logs aren't deleted until all peers have applied them
+
+**Delta Sync Process:**
+1. Lagging node queries `last_applied_txn_id` for each peer/database
+2. Requests transactions since that ID via `StreamChanges` RPC
+3. **Gap Detection**: Checks if first received txn_id has a large gap from requested ID
+   - If gap > delta_sync_threshold_txns, indicates missing (GC'd) transactions
+   - Automatically falls back to snapshot transfer to prevent data loss
+4. Applies changes using LWW conflict resolution
+5. Updates replication state tracking (per-database)
+6. Progress logged every 100 transactions
+
+**GC Coordination with Anti-Entropy:**
+- Transaction logs are retained with a two-tier policy:
+  - **Min retention** (2 hours): Must be >= delta sync threshold, respects peer lag
+  - **Max retention** (24 hours): Force delete after this time to prevent unbounded growth
+- Config validation enforces: `gc_min >= delta_threshold` and `gc_max >= 2x delta_threshold`
+- Each database tracks replication progress per peer
+- GC queries minimum applied txn_id across all peers before cleanup
+- **Gap detection** prevents data loss if GC runs while nodes are offline

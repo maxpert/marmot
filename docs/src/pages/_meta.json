@@ -1,6 +1,10 @@
 {
-  "index": "Welcome",
-  "demo":  "Demo",
-  "intro": "Overview",
-  "internals": "Internals"
+  "index": "Introduction",
+  "getting-started": "Getting Started",
+  "architecture": "Architecture",
+  "replication": "Replication",
+  "compatibility": "Compatibility",
+  "operations": "Operations",
+  "reference": "Reference",
+  "demo": "Demo"
 }

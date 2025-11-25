@@ -1,0 +1,43 @@
+---
+title: Getting Started
+---
+
+# Getting Started
+
+## Quick Start
+
+```bash
+# Start a single-node cluster
+./marmot-v2
+
+# Connect with MySQL client
+mysql -h localhost -P 3306 -u root
+
+# Or use DBeaver, MySQL Workbench, etc.
+```
+
+### Testing Replication
+
+```bash
+# Test DDL and DML replication across a 2-node cluster
+./scripts/test-ddl-replication.sh
+
+# This script will:
+# 1. Start a 2-node cluster
+# 2. Create a table on node 1 and verify it replicates to node 2
+# 3. Insert data on node 1 and verify it replicates to node 2
+# 4. Update data on node 2 and verify it replicates to node 1
+# 5. Delete data on node 1 and verify it replicates to node 2
+
+# Manual cluster testing
+./examples/start-seed.sh              # Start seed node (port 8081, mysql 3307)
+./examples/join-cluster.sh 2 localhost:8081  # Join node 2 (port 8082, mysql 3308)
+./examples/join-cluster.sh 3 localhost:8081  # Join node 3 (port 8083, mysql 3309)
+
+# Connect to any node and run queries
+mysql --protocol=TCP -h localhost -P 3307 -u root
+mysql --protocol=TCP -h localhost -P 3308 -u root
+
+# Cleanup
+pkill -f marmot-v2
+```

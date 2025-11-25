@@ -1,0 +1,104 @@
+---
+title: Compatibility
+---
+
+# Compatibility
+
+## SQL Statement Compatibility
+
+Marmot supports a wide range of MySQL/SQLite statements through its MySQL protocol server. The following table shows compatibility for different statement types:
+
+| Statement Type | Support | Replication | Notes |
+|---------------|---------|-------------|-------|
+| **DML - Data Manipulation** |
+| `INSERT` / `REPLACE` | ✅ Full | ✅ Yes | Includes qualified table names (db.table) |
+| `UPDATE` | ✅ Full | ✅ Yes | Includes qualified table names |
+| `DELETE` | ✅ Full | ✅ Yes | Includes qualified table names |
+| `SELECT` | ✅ Full | N/A | Read operations |
+| `LOAD DATA` | ✅ Full | ✅ Yes | Bulk data loading |
+| **DDL - Data Definition** |
+| `CREATE TABLE` | ✅ Full | ✅ Yes | Replicated with cluster-wide locking |
+| `ALTER TABLE` | ✅ Full | ✅ Yes | Replicated with cluster-wide locking |
+| `DROP TABLE` | ✅ Full | ✅ Yes | Replicated with cluster-wide locking |
+| `TRUNCATE TABLE` | ✅ Full | ✅ Yes | |
+| `RENAME TABLE` | ✅ Full | ✅ Yes | Replicated with cluster-wide locking |
+| `CREATE/DROP INDEX` | ✅ Full | ✅ Yes | Replicated with cluster-wide locking |
+| `CREATE/DROP VIEW` | ✅ Full | ✅ Yes | Replicated with cluster-wide locking |
+| `CREATE/DROP TRIGGER` | ✅ Full | ✅ Yes | Replicated with cluster-wide locking |
+| **Database Management** |
+| `CREATE DATABASE` | ✅ Full | ✅ Yes | Replicated with cluster-wide locking |
+| `DROP DATABASE` | ✅ Full | ✅ Yes | Replicated with cluster-wide locking |
+| `ALTER DATABASE` | ✅ Full | ✅ Yes | Replicated with cluster-wide locking |
+| `SHOW DATABASES` | ✅ Full | N/A | Metadata query |
+| `SHOW TABLES` | ✅ Full | N/A | Metadata query |
+| `USE database` | ✅ Full | N/A | Session state |
+| **Transaction Control** |
+| `BEGIN` / `START TRANSACTION` | ✅ Full | N/A | Transaction boundary |
+| `COMMIT` | ✅ Full | ✅ Yes | Commits distributed transaction |
+| `ROLLBACK` | ✅ Full | ✅ Yes | Aborts distributed transaction |
+| `SAVEPOINT` | ✅ Full | ✅ Yes | Nested transaction support |
+| **Locking** |
+| `LOCK TABLES` | ✅ Parsed | ❌ No | Requires distributed locking coordination |
+| `UNLOCK TABLES` | ✅ Parsed | ❌ No | Requires distributed locking coordination |
+| **Session Configuration** |
+| `SET` statements | ✅ Parsed | ❌ No | Session-local, not replicated |
+| **XA Transactions** |
+| `XA START/END/PREPARE` | ✅ Parsed | ❌ No | Marmot uses its own 2PC protocol |
+| `XA COMMIT/ROLLBACK` | ✅ Parsed | ❌ No | Not compatible with Marmot's model |
+| **DCL - Data Control** |
+| `GRANT` / `REVOKE` | ✅ Parsed | ❌ No | User management not replicated |
+| `CREATE/DROP USER` | ✅ Parsed | ❌ No | User management not replicated |
+| `ALTER USER` | ✅ Parsed | ❌ No | User management not replicated |
+| **Administrative** |
+| `OPTIMIZE TABLE` | ✅ Parsed | ❌ No | Node-local administrative command |
+| `REPAIR TABLE` | ✅ Parsed | ❌ No | Node-local administrative command |
+
+### Legend
+- ✅ **Full**: Fully supported and working
+- ✅ **Parsed**: Statement is parsed and recognized
+- ⚠️ **Limited**: Works but has limitations in distributed context
+- ❌ **No**: Not supported or not replicated
+- **N/A**: Not applicable (read-only or session-local)
+
+### Important Notes
+
+1. **Schema Changes (DDL)**: DDL statements are fully replicated with cluster-wide locking and automatic idempotency. See the DDL Replication section for details.
+
+2. **XA Transactions**: Marmot has its own distributed transaction protocol based on 2PC. MySQL XA transactions are not compatible with Marmot's replication model.
+
+3. **User Management (DCL)**: User and privilege management statements are local to each node. For production deployments, consider handling authentication at the application or proxy level.
+
+4. **Table Locking**: `LOCK TABLES` statements are recognized but not enforced across the cluster. Use application-level coordination for distributed locking needs.
+
+5. **Qualified Names**: Marmot fully supports qualified table names (e.g., `db.table`) in DML and DDL operations.
+
+## MySQL Protocol & Metadata Queries
+
+Marmot includes a MySQL-compatible protocol server, allowing you to connect using any MySQL client (DBeaver, MySQL Workbench, mysql CLI, etc.). The server supports:
+
+### Metadata Query Support
+
+Marmot provides full support for MySQL metadata queries, enabling GUI tools like DBeaver to browse databases, tables, and columns:
+
+- **SHOW Commands**: `SHOW DATABASES`, `SHOW TABLES`, `SHOW COLUMNS FROM table`, `SHOW CREATE TABLE`, `SHOW INDEXES`
+- **INFORMATION_SCHEMA**: Queries against `INFORMATION_SCHEMA.TABLES`, `INFORMATION_SCHEMA.COLUMNS`, `INFORMATION_SCHEMA.SCHEMATA`, and `INFORMATION_SCHEMA.STATISTICS`
+- **Type Conversion**: Automatic SQLite-to-MySQL type mapping for compatibility
+
+These metadata queries are powered by the **rqlite/sql AST parser**, providing production-grade MySQL query compatibility.
+
+### Connecting with MySQL Clients
+
+```bash
+# Using mysql CLI
+mysql -h localhost -P 3306 -u root
+
+# Connection string for applications
+mysql://root@localhost:3306/marmot
+```
+
+## Limitations
+
+- **Selective Table Watching**: All tables in a database are replicated. Selective table replication is not supported.
+- **WAL Mode Required**: SQLite must use WAL mode for reliable multi-process changes.
+- **Eventually Consistent**: Rows may sync out of order. `SERIALIZABLE` transaction assumptions may not hold across nodes.
+- **Concurrent DDL**: Avoid running concurrent DDL operations on the same database from multiple nodes (protected by cluster-wide lock with 30s lease).
