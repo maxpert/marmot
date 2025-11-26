@@ -317,3 +317,163 @@ func BenchmarkValidate(b *testing.B) {
 		Validate()
 	}
 }
+
+// Replica configuration tests
+
+func TestReplicaConfigDefaults(t *testing.T) {
+	// The global Config variable has defaults set at initialization
+	// Verify replica defaults are correctly initialized
+	if Config.Replica.Enabled {
+		t.Error("Replica should be disabled by default")
+	}
+
+	if Config.Replica.ReconnectIntervalSec != 5 {
+		t.Errorf("Expected reconnect_interval_seconds=5, got %d", Config.Replica.ReconnectIntervalSec)
+	}
+
+	if Config.Replica.ReconnectMaxBackoffSec != 30 {
+		t.Errorf("Expected reconnect_max_backoff_seconds=30, got %d", Config.Replica.ReconnectMaxBackoffSec)
+	}
+
+	if Config.Replica.InitialSyncTimeoutMin != 30 {
+		t.Errorf("Expected initial_sync_timeout_minutes=30, got %d", Config.Replica.InitialSyncTimeoutMin)
+	}
+}
+
+func TestReplicaConfigValidation_MissingMasterAddress(t *testing.T) {
+	original := Config
+	defer func() { Config = original }()
+
+	Config = &Configuration{
+		Cluster: ClusterConfiguration{
+			GRPCPort: 8080,
+		},
+		MySQL: MySQLConfiguration{
+			Enabled: true,
+			Port:    3306,
+		},
+		Replication: ReplicationConfiguration{
+			DefaultWriteConsist: "QUORUM",
+			DefaultReadConsist:  "LOCAL_ONE",
+		},
+		Replica: ReplicaConfiguration{
+			Enabled:       true,
+			MasterAddress: "", // Missing
+		},
+	}
+
+	err := Validate()
+	if err == nil {
+		t.Error("Expected error for missing master_address when replica enabled")
+	}
+}
+
+func TestReplicaConfigValidation_MutuallyExclusiveWithSeedNodes(t *testing.T) {
+	original := Config
+	defer func() { Config = original }()
+
+	Config = &Configuration{
+		Cluster: ClusterConfiguration{
+			GRPCPort:  8080,
+			SeedNodes: []string{"node1:8080"},
+		},
+		MySQL: MySQLConfiguration{
+			Enabled: true,
+			Port:    3306,
+		},
+		Replication: ReplicationConfiguration{
+			DefaultWriteConsist: "QUORUM",
+			DefaultReadConsist:  "LOCAL_ONE",
+		},
+		Replica: ReplicaConfiguration{
+			Enabled:       true,
+			MasterAddress: "master:8080",
+		},
+	}
+
+	err := Validate()
+	if err == nil {
+		t.Error("Expected error when both replica mode and seed_nodes are configured")
+	}
+}
+
+func TestReplicaConfigValidation_ValidConfig(t *testing.T) {
+	original := Config
+	defer func() { Config = original }()
+
+	Config = &Configuration{
+		NodeID:  1,
+		DataDir: "./test-data",
+		Cluster: ClusterConfiguration{
+			GRPCPort: 8080,
+		},
+		MySQL: MySQLConfiguration{
+			Enabled: true,
+			Port:    3306,
+		},
+		Replication: ReplicationConfiguration{
+			DefaultWriteConsist: "QUORUM",
+			DefaultReadConsist:  "LOCAL_ONE",
+		},
+		MVCC: MVCCConfiguration{
+			GCIntervalSeconds:       30,
+			GCRetentionHours:        1,
+			HeartbeatTimeoutSeconds: 10,
+			VersionRetentionCount:   10,
+			ConflictWindowSeconds:   10,
+		},
+		ConnectionPool: ConnectionPoolConfiguration{
+			PoolSize:           4,
+			MaxIdleTimeSeconds: 10,
+			MaxLifetimeSeconds: 300,
+		},
+		GRPCClient: GRPCClientConfiguration{
+			KeepaliveTimeSeconds:    10,
+			KeepaliveTimeoutSeconds: 3,
+			MaxRetries:              3,
+			RetryBackoffMS:          100,
+		},
+		Coordinator: CoordinatorConfiguration{
+			PrepareTimeoutMS: 2000,
+			CommitTimeoutMS:  2000,
+			AbortTimeoutMS:   2000,
+		},
+		Replica: ReplicaConfiguration{
+			Enabled:                true,
+			MasterAddress:          "master:8080",
+			ReconnectIntervalSec:   5,
+			ReconnectMaxBackoffSec: 30,
+			InitialSyncTimeoutMin:  30,
+		},
+	}
+
+	err := Validate()
+	if err != nil {
+		t.Errorf("Expected no error for valid replica config, got: %v", err)
+	}
+}
+
+func TestIsReplicaMode(t *testing.T) {
+	original := Config
+	defer func() { Config = original }()
+
+	// Test disabled
+	Config = &Configuration{
+		Replica: ReplicaConfiguration{
+			Enabled: false,
+		},
+	}
+	if IsReplicaMode() {
+		t.Error("Expected IsReplicaMode()=false when disabled")
+	}
+
+	// Test enabled
+	Config = &Configuration{
+		Replica: ReplicaConfiguration{
+			Enabled: true,
+		},
+	}
+	if !IsReplicaMode() {
+		t.Error("Expected IsReplicaMode()=true when enabled")
+	}
+}

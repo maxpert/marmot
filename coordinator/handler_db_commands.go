@@ -21,25 +21,7 @@ func (h *CoordinatorHandler) handleShowDatabases() (*protocol.ResultSet, error) 
 		}, nil
 	}
 
-	databases := h.dbManager.ListDatabases()
-
-	rows := make([][]interface{}, 0, len(databases))
-	for _, dbName := range databases {
-		// Skip system database from user-visible list
-		if dbName == SystemDatabaseName {
-			continue
-		}
-		rows = append(rows, []interface{}{dbName})
-	}
-
-	rs := &protocol.ResultSet{
-		Columns: []protocol.ColumnDef{
-			{Name: "Database", Type: 0xFD}, // VAR_STRING
-		},
-		Rows: rows,
-	}
-
-	return rs, nil
+	return h.metadata.HandleShowDatabases()
 }
 
 // handleUseDatabase changes the current database for the session

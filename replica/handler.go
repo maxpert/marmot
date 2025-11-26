@@ -1,0 +1,222 @@
+package replica
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/maxpert/marmot/db"
+	"github.com/maxpert/marmot/hlc"
+	"github.com/maxpert/marmot/protocol"
+	"github.com/maxpert/marmot/protocol/handlers"
+
+	"github.com/rs/zerolog/log"
+)
+
+// SystemDatabaseName is the name of the internal Marmot system database
+const SystemDatabaseName = "__marmot_system"
+
+// ReadOnlyHandler implements protocol.ConnectionHandler for read-only replicas
+// It rejects all mutations and executes reads locally
+type ReadOnlyHandler struct {
+	dbManager *db.DatabaseManager
+	clock     *hlc.Clock
+	replica   *Replica
+	metadata  *handlers.MetadataHandler
+}
+
+// NewReadOnlyHandler creates a new read-only handler
+func NewReadOnlyHandler(dbManager *db.DatabaseManager, clock *hlc.Clock, replica *Replica) *ReadOnlyHandler {
+	return &ReadOnlyHandler{
+		dbManager: dbManager,
+		clock:     clock,
+		replica:   replica,
+		metadata:  handlers.NewMetadataHandler(dbManager, SystemDatabaseName),
+	}
+}
+
+// HandleQuery processes a SQL query (read-only)
+func (h *ReadOnlyHandler) HandleQuery(session *protocol.ConnectionSession, query string) (*protocol.ResultSet, error) {
+	log.Debug().
+		Uint64("conn_id", session.ConnID).
+		Str("database", session.CurrentDatabase).
+		Str("query", query).
+		Msg("Handling query (read-only)")
+
+	// Intercept MySQL system variable queries
+	if strings.Contains(query, "@@") || strings.Contains(strings.ToUpper(query), "DATABASE()") {
+		return h.handleSystemQuery(session, query)
+	}
+
+	stmt := protocol.ParseStatement(query)
+
+	log.Debug().
+		Uint64("conn_id", session.ConnID).
+		Int("stmt_type", int(stmt.Type)).
+		Str("table", stmt.TableName).
+		Str("database", stmt.Database).
+		Msg("Parsed statement")
+
+	// Reject all mutations with MySQL read-only error
+	if protocol.IsMutation(stmt) {
+		log.Debug().
+			Uint64("conn_id", session.ConnID).
+			Int("stmt_type", int(stmt.Type)).
+			Msg("Rejecting mutation on read-only replica")
+		return nil, protocol.ErrReadOnly()
+	}
+
+	// Reject transaction control for writes (BEGIN is ok for reads, but COMMIT on writes is not)
+	// Allow read-only transactions for compatibility
+	if protocol.IsTransactionControl(stmt) {
+		// Allow BEGIN/START TRANSACTION (for read-only transactions)
+		// Allow COMMIT/ROLLBACK (no-op for read-only)
+		switch stmt.Type {
+		case protocol.StatementBegin:
+			// For read-only replica, we don't need real transaction tracking
+			// Just set a flag for client compatibility
+			return nil, nil
+		case protocol.StatementCommit, protocol.StatementRollback:
+			return nil, nil
+		default:
+			// Savepoints, XA transactions - reject
+			return nil, protocol.ErrReadOnly()
+		}
+	}
+
+	// Handle SET commands as no-op (return OK)
+	if stmt.Type == protocol.StatementSet {
+		return nil, nil
+	}
+
+	// Handle database management commands (read-only)
+	switch stmt.Type {
+	case protocol.StatementShowDatabases:
+		return h.metadata.HandleShowDatabases()
+	case protocol.StatementUseDatabase:
+		if err := h.metadata.HandleUseDatabase(stmt.Database); err != nil {
+			return nil, err
+		}
+		session.CurrentDatabase = stmt.Database
+		return nil, nil
+	}
+
+	// Handle metadata queries
+	switch stmt.Type {
+	case protocol.StatementShowTables:
+		dbName := stmt.Database
+		if dbName == "" {
+			dbName = session.CurrentDatabase
+		}
+		return h.metadata.HandleShowTables(dbName)
+	case protocol.StatementShowColumns:
+		dbName := stmt.Database
+		if dbName == "" {
+			dbName = session.CurrentDatabase
+		}
+		return h.metadata.HandleShowColumns(dbName, stmt.TableName)
+	case protocol.StatementShowCreateTable:
+		dbName := stmt.Database
+		if dbName == "" {
+			dbName = session.CurrentDatabase
+		}
+		return h.metadata.HandleShowCreateTable(dbName, stmt.TableName)
+	case protocol.StatementShowIndexes:
+		dbName := stmt.Database
+		if dbName == "" {
+			dbName = session.CurrentDatabase
+		}
+		return h.metadata.HandleShowIndexes(dbName, stmt.TableName)
+	case protocol.StatementShowTableStatus:
+		dbName := stmt.Database
+		if dbName == "" {
+			dbName = session.CurrentDatabase
+		}
+		return h.metadata.HandleShowTableStatus(dbName, stmt.TableName)
+	case protocol.StatementInformationSchema:
+		return h.metadata.HandleInformationSchema(session.CurrentDatabase, query)
+	}
+
+	// Set database context from session if not specified in statement
+	if stmt.Database == "" {
+		stmt.Database = session.CurrentDatabase
+	}
+
+	// Execute read locally
+	return h.executeLocalRead(stmt)
+}
+
+// handleSystemQuery handles MySQL system variable queries
+func (h *ReadOnlyHandler) handleSystemQuery(session *protocol.ConnectionSession, query string) (*protocol.ResultSet, error) {
+	config := handlers.SystemVarConfig{
+		ReadOnly:       true,
+		VersionComment: "Marmot Read-Only Replica",
+		ConnID:         session.ConnID,
+		CurrentDB:      session.CurrentDatabase,
+	}
+	return handlers.HandleSystemQuery(query, config)
+}
+
+// executeLocalRead executes a read query locally
+func (h *ReadOnlyHandler) executeLocalRead(stmt protocol.Statement) (*protocol.ResultSet, error) {
+	if stmt.Database == "" {
+		return nil, fmt.Errorf("ERROR 1046 (3D000): No database selected")
+	}
+
+	sqlDB, err := h.dbManager.GetDatabaseConnection(stmt.Database)
+	if err != nil {
+		return nil, err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	rows, err := sqlDB.QueryContext(ctx, stmt.SQL)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	// Get column info
+	columns, err := rows.Columns()
+	if err != nil {
+		return nil, err
+	}
+
+	result := &protocol.ResultSet{
+		Columns: make([]protocol.ColumnDef, len(columns)),
+		Rows:    make([][]interface{}, 0),
+	}
+
+	for i, col := range columns {
+		result.Columns[i] = protocol.ColumnDef{Name: col}
+	}
+
+	// Scan rows
+	for rows.Next() {
+		values := make([]interface{}, len(columns))
+		valuePtrs := make([]interface{}, len(columns))
+		for i := range values {
+			valuePtrs[i] = &values[i]
+		}
+
+		if err := rows.Scan(valuePtrs...); err != nil {
+			return nil, err
+		}
+
+		// Convert sql.RawBytes to string for proper MySQL encoding
+		row := make([]interface{}, len(columns))
+		for i, v := range values {
+			if b, ok := v.([]byte); ok {
+				row[i] = string(b)
+			} else {
+				row[i] = v
+			}
+		}
+
+		result.Rows = append(result.Rows, row)
+	}
+
+	return result, rows.Err()
+}

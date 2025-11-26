@@ -34,6 +34,12 @@ func ErrDeadlock() *MySQLError {
 	return NewMySQLError(1213, "40001", "Deadlock found when trying to get lock; try restarting transaction")
 }
 
+// ErrReadOnly returns error 1290 - server is running with --read-only option
+// This is the standard MySQL error for read-only replicas
+func ErrReadOnly() *MySQLError {
+	return NewMySQLError(1290, "HY000", "The MySQL server is running with the --read-only option so it cannot execute this statement")
+}
+
 // IsRetryableError checks if an error is a retryable transaction error
 func IsRetryableError(err error) bool {
 	mysqlErr, ok := err.(*MySQLError)

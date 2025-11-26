@@ -15,6 +15,7 @@ import (
 	marmotgrpc "github.com/maxpert/marmot/grpc"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/protocol"
+	"github.com/maxpert/marmot/replica"
 	"github.com/maxpert/marmot/telemetry"
 
 	"github.com/rs/zerolog"
@@ -52,6 +53,24 @@ func main() {
 		log.Logger = gLog.Level(zerolog.InfoLevel)
 	}
 
+	// Branch based on operating mode
+	if cfg.IsReplicaMode() {
+		log.Info().Msg("Marmot v2.0 - Read-Only Replica Mode")
+		log.Info().
+			Str("master_address", cfg.Config.Replica.MasterAddress).
+			Msg("Following master node")
+
+		// Warn if cluster authentication is not configured
+		if !cfg.IsClusterAuthEnabled() {
+			log.Warn().Msg("WARNING: Cluster authentication is disabled. Set cluster_secret in config or MARMOT_CLUSTER_SECRET env var for production use.")
+		}
+
+		// Run replica mode (does not return until shutdown)
+		replica.Run()
+		return
+	}
+
+	// Cluster mode
 	log.Info().Msg("Marmot v2.0 - Leaderless SQLite Replication")
 
 	// Warn if cluster authentication is not configured
