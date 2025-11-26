@@ -412,3 +412,218 @@ func TestYCSB_CacheEffectiveness(t *testing.T) {
 		t.Errorf("Cached result differs from original\nOriginal: %s\nCached:   %s", ctx1.TranspiledSQL, ctx2.TranspiledSQL)
 	}
 }
+
+// TestYCSB_CDCExtraction_SQLiteDialect tests that CDC extraction works for SQLite dialect queries
+// This is the fix for the original bug where INSERT OR IGNORE caused empty row_key
+func TestYCSB_CDCExtraction_SQLiteDialect(t *testing.T) {
+	pipeline, err := NewPipeline(1000, 4)
+	if err != nil {
+		t.Fatalf("Failed to create pipeline: %v", err)
+	}
+	defer pipeline.Close()
+
+	tests := []struct {
+		name              string
+		query             string
+		expectedDialect   Dialect
+		expectedCDCCols   []string // Expected columns in CDC NewValues
+		expectedTableName string
+	}{
+		{
+			name:              "INSERT OR IGNORE (SQLite dialect) should have CDC",
+			query:             "INSERT OR IGNORE INTO usertable (YCSB_KEY, FIELD0, FIELD1) VALUES ('user123', 'val0', 'val1')",
+			expectedDialect:   DialectSQLite,
+			expectedCDCCols:   []string{"YCSB_KEY", "FIELD0", "FIELD1"},
+			expectedTableName: "usertable",
+		},
+		{
+			name:              "INSERT OR REPLACE (SQLite dialect) should have CDC",
+			query:             "INSERT OR REPLACE INTO usertable (YCSB_KEY, FIELD0) VALUES ('user456', 'val0')",
+			expectedDialect:   DialectSQLite,
+			expectedCDCCols:   []string{"YCSB_KEY", "FIELD0"},
+			expectedTableName: "usertable",
+		},
+		{
+			name:              "INSERT IGNORE (MySQL dialect) should have CDC",
+			query:             "INSERT IGNORE INTO usertable (YCSB_KEY, FIELD0) VALUES ('user789', 'val0')",
+			expectedDialect:   DialectMySQL,
+			expectedCDCCols:   []string{"YCSB_KEY", "FIELD0"},
+			expectedTableName: "usertable",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := NewContext(tt.query, nil)
+			if err := pipeline.Process(ctx); err != nil {
+				t.Fatalf("Pipeline processing failed: %v", err)
+			}
+
+			// Verify dialect detection
+			if ctx.SourceDialect != tt.expectedDialect {
+				t.Errorf("Dialect mismatch: got %d, want %d", ctx.SourceDialect, tt.expectedDialect)
+			}
+
+			// Verify CDC extraction populated NewValues
+			if len(ctx.CDCNewValues) == 0 {
+				t.Errorf("CDC NewValues is empty - CDC extraction failed for %s dialect", dialectName(tt.expectedDialect))
+			}
+
+			// Verify all expected columns are present in CDC
+			for _, col := range tt.expectedCDCCols {
+				if _, ok := ctx.CDCNewValues[col]; !ok {
+					t.Errorf("Missing CDC column: %s (dialect: %s)", col, dialectName(tt.expectedDialect))
+				}
+			}
+
+			// Verify table name extraction
+			if ctx.TableName != tt.expectedTableName {
+				t.Errorf("Table name mismatch: got %s, want %s", ctx.TableName, tt.expectedTableName)
+			}
+		})
+	}
+}
+
+// TestYCSB_CDCExtraction_UpdateDelete tests CDC for UPDATE/DELETE in both dialects
+func TestYCSB_CDCExtraction_UpdateDelete(t *testing.T) {
+	pipeline, err := NewPipeline(1000, 4)
+	if err != nil {
+		t.Fatalf("Failed to create pipeline: %v", err)
+	}
+	defer pipeline.Close()
+
+	tests := []struct {
+		name            string
+		query           string
+		expectedDialect Dialect
+		wantCDCNewVals  bool
+		wantCDCOldVals  bool
+	}{
+		{
+			name:            "UPDATE (MySQL dialect)",
+			query:           "UPDATE usertable SET FIELD0 = 'new' WHERE YCSB_KEY = 'user123'",
+			expectedDialect: DialectMySQL,
+			wantCDCNewVals:  true, // SET values + WHERE pk
+			wantCDCOldVals:  false,
+		},
+		{
+			name:            "DELETE (MySQL dialect)",
+			query:           "DELETE FROM usertable WHERE YCSB_KEY = 'user456'",
+			expectedDialect: DialectMySQL,
+			wantCDCNewVals:  false,
+			wantCDCOldVals:  true, // WHERE pk values
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := NewContext(tt.query, nil)
+			if err := pipeline.Process(ctx); err != nil {
+				t.Fatalf("Pipeline processing failed: %v", err)
+			}
+
+			if tt.wantCDCNewVals && len(ctx.CDCNewValues) == 0 {
+				t.Errorf("Expected CDC NewValues to be populated")
+			}
+			if tt.wantCDCOldVals && len(ctx.CDCOldValues) == 0 {
+				t.Errorf("Expected CDC OldValues to be populated")
+			}
+		})
+	}
+}
+
+func dialectName(d Dialect) string {
+	switch d {
+	case DialectMySQL:
+		return "MySQL"
+	case DialectSQLite:
+		return "SQLite"
+	default:
+		return "Unknown"
+	}
+}
+
+// TestDDL_BothDialects tests that DDL statements are properly classified and have table name extracted
+// DDL uses SQL-based replication (no row-level CDC), so we verify proper classification
+func TestDDL_BothDialects(t *testing.T) {
+	pipeline, err := NewPipeline(1000, 4)
+	if err != nil {
+		t.Fatalf("Failed to create pipeline: %v", err)
+	}
+	defer pipeline.Close()
+
+	tests := []struct {
+		name              string
+		query             string
+		expectedType      StatementType
+		expectedTableName string
+		expectMutation    bool
+	}{
+		// MySQL dialect DDL
+		{
+			name:              "CREATE TABLE (MySQL)",
+			query:             "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(100))",
+			expectedType:      StatementDDL,
+			expectedTableName: "users",
+			expectMutation:    true,
+		},
+		{
+			name:              "CREATE TABLE IF NOT EXISTS (MySQL)",
+			query:             "CREATE TABLE IF NOT EXISTS orders (id INT PRIMARY KEY)",
+			expectedType:      StatementDDL,
+			expectedTableName: "orders",
+			expectMutation:    true,
+		},
+		{
+			name:              "ALTER TABLE ADD COLUMN (MySQL)",
+			query:             "ALTER TABLE users ADD COLUMN email VARCHAR(255)",
+			expectedType:      StatementDDL,
+			expectedTableName: "users",
+			expectMutation:    true,
+		},
+		{
+			name:              "DROP TABLE (MySQL)",
+			query:             "DROP TABLE IF EXISTS temp_table",
+			expectedType:      StatementDDL,
+			expectedTableName: "temp_table",
+			expectMutation:    true,
+		},
+		// SQLite dialect DDL (PRAGMA statements are SQLite-specific)
+		{
+			name:              "PRAGMA (SQLite)",
+			query:             "PRAGMA table_info(users)",
+			expectedType:      StatementUnsupported, // PRAGMA isn't DDL
+			expectedTableName: "",
+			expectMutation:    false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := NewContext(tt.query, nil)
+			if err := pipeline.Process(ctx); err != nil {
+				t.Fatalf("Pipeline processing failed: %v", err)
+			}
+
+			if ctx.StatementType != tt.expectedType {
+				t.Errorf("StatementType mismatch: got %d, want %d", ctx.StatementType, tt.expectedType)
+			}
+
+			if tt.expectedTableName != "" && ctx.TableName != tt.expectedTableName {
+				t.Errorf("TableName mismatch: got %s, want %s", ctx.TableName, tt.expectedTableName)
+			}
+
+			if ctx.IsMutation != tt.expectMutation {
+				t.Errorf("IsMutation mismatch: got %v, want %v", ctx.IsMutation, tt.expectMutation)
+			}
+
+			// DDL should NOT have CDC data (it's replicated as SQL)
+			if tt.expectedType == StatementDDL {
+				if len(ctx.CDCNewValues) > 0 || len(ctx.CDCOldValues) > 0 {
+					t.Errorf("DDL should not have CDC data, but got NewValues=%d, OldValues=%d",
+						len(ctx.CDCNewValues), len(ctx.CDCOldValues))
+				}
+			}
+		})
+	}
+}

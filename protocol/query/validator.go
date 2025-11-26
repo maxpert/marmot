@@ -90,6 +90,7 @@ func (v *Validator) ValidateAndClassify(ctx *QueryContext) error {
 
 // classifyFromAST classifies statement type and extracts table name using rqlite/sql parser
 // This provides proper AST-based classification without string matching
+// Also populates ctx.SQLiteAST for use in CDC extraction
 func classifyFromAST(ctx *QueryContext) {
 	parser := rqlitesql.NewParser(strings.NewReader(ctx.TranspiledSQL))
 	astStmt, err := parser.ParseStatement()
@@ -98,6 +99,9 @@ func classifyFromAST(ctx *QueryContext) {
 		ctx.StatementType = StatementUnsupported
 		return
 	}
+
+	// Store the AST for CDC extraction
+	ctx.SQLiteAST = astStmt
 
 	switch s := astStmt.(type) {
 	case *rqlitesql.InsertStatement:

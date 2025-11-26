@@ -3,6 +3,7 @@ package query
 import (
 	"strings"
 
+	rqlitesql "github.com/rqlite/sql"
 	"vitess.io/vitess/go/vt/sqlparser"
 )
 
@@ -87,7 +88,8 @@ type QueryContext struct {
 	OriginalSQL string
 	Parameters  []interface{}
 
-	AST           sqlparser.Statement
+	AST           sqlparser.Statement // Vitess AST (for MySQL dialect)
+	SQLiteAST     rqlitesql.Statement // rqlite AST (for SQLite dialect)
 	StatementType StatementType
 	TableName     string
 	Database      string

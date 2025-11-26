@@ -8,13 +8,28 @@ This document provides a comprehensive reference for SQL compatibility in Marmot
 
 ## Overview
 
-Marmot's query pipeline:
+Marmot's query pipeline supports both MySQL and SQLite SQL dialects:
 
+### MySQL Dialect (Default)
 1. **Parse**: MySQL SQL is parsed using the Vitess SQL parser
 2. **Classify**: Statements are classified (SELECT, INSERT, UPDATE, DELETE, DDL, etc.)
-3. **Validate**: CDC (Change Data Capture) requirements are validated for write operations
+3. **CDC Extract**: Change Data Capture extracts row-level data from MySQL AST
 4. **Transpile**: MySQL syntax is converted to SQLite-compatible syntax
-5. **Execute**: Transpiled SQL is executed against SQLite
+5. **Validate**: Transpiled SQL is validated against SQLite grammar
+6. **Execute**: SQL is executed against SQLite
+
+### SQLite Dialect (Auto-detected)
+SQLite-specific syntax (e.g., `INSERT OR IGNORE`, `INSERT OR REPLACE`, `PRAGMA`) is automatically detected and processed differently:
+
+1. **Detect**: SQLite dialect markers trigger alternate path
+2. **Parse**: SQL is parsed using the rqlite/sql parser
+3. **CDC Extract**: Change Data Capture extracts row-level data from SQLite AST
+4. **Validate**: SQL is validated against SQLite
+5. **Execute**: SQL is executed directly
+
+**SQLite dialect markers** (auto-detected):
+- `INSERT OR IGNORE`, `INSERT OR REPLACE`, `INSERT OR ABORT`, `INSERT OR FAIL`, `INSERT OR ROLLBACK`
+- `PRAGMA`, `ATTACH`, `DETACH`, `VACUUM`, `ANALYZE` (without TABLE)
 
 ## Data Types
 
@@ -475,7 +490,9 @@ SELECT * FROM users LIMIT 20, 10;
 | `INSERT INTO t (cols) VALUES (...)` | ✅ Full | ✅ Yes | Standard form |
 | `INSERT INTO t VALUES (...)` | ❌ Not Supported | - | CDC requires column list |
 | `INSERT INTO t (cols) VALUES (...), (...)` | ✅ Full | ✅ Yes | Multi-row insert |
-| `INSERT IGNORE INTO t (cols) VALUES (...)` | ✅ Full | ✅ Yes | Ignore constraint violations |
+| `INSERT IGNORE INTO t (cols) VALUES (...)` | ✅ Full | ✅ Yes | MySQL: Ignore constraints |
+| `INSERT OR IGNORE INTO t (cols) VALUES (...)` | ✅ Full | ✅ Yes | SQLite: Ignore constraints |
+| `INSERT OR REPLACE INTO t (cols) VALUES (...)` | ✅ Full | ✅ Yes | SQLite: Upsert behavior |
 | `INSERT INTO t (cols) SELECT ...` | ❌ Not Supported | - | CDC cannot track |
 | `INSERT ... ON DUPLICATE KEY UPDATE` | ❌ Not Supported | - | Vitess limitation |
 | `INSERT LOW_PRIORITY` | ❌ Not Supported | - | Vitess limitation |
@@ -489,8 +506,14 @@ INSERT INTO users (id, name, email) VALUES (1, 'Alice', 'alice@example.com');
 -- Supported: multi-row insert
 INSERT INTO users (id, name) VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie');
 
--- Supported: INSERT IGNORE
+-- Supported: INSERT IGNORE (MySQL syntax)
 INSERT IGNORE INTO users (id, name) VALUES (1, 'Alice');
+
+-- Supported: INSERT OR IGNORE (SQLite syntax - auto-detected)
+INSERT OR IGNORE INTO users (id, name) VALUES (1, 'Alice');
+
+-- Supported: INSERT OR REPLACE (SQLite upsert - auto-detected)
+INSERT OR REPLACE INTO users (id, name, email) VALUES (1, 'Alice', 'alice@new.com');
 
 -- NOT supported: no column list
 -- INSERT INTO users VALUES (1, 'Alice', 'alice@example.com');  -- Error: CDC requires columns
