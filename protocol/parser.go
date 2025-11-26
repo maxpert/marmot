@@ -131,6 +131,12 @@ func ParseStatement(sql string) Statement {
 		// Populate CDC data from context (extracted in pipeline before transpilation)
 		OldValues: ctx.CDCOldValues,
 		NewValues: ctx.CDCNewValues,
+		// INFORMATION_SCHEMA filter values extracted from WHERE clause
+		ISFilter: InformationSchemaFilter{
+			SchemaName: ctx.ISFilter.SchemaName,
+			TableName:  ctx.ISFilter.TableName,
+			ColumnName: ctx.ISFilter.ColumnName,
+		},
 	}
 
 	return stmt

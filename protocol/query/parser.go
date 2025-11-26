@@ -138,6 +138,7 @@ func classifyStatement(ctx *QueryContext, stmt sqlparser.Statement) {
 		ctx.StatementType = StatementSelect
 		if isInformationSchemaQuery(parsed) {
 			ctx.StatementType = StatementInformationSchema
+			ctx.ISFilter = extractInformationSchemaFilter(parsed)
 		}
 
 	case *sqlparser.CreateTable:
@@ -239,6 +240,76 @@ func isInformationSchemaQuery(sel *sqlparser.Select) bool {
 		}
 	}
 	return false
+}
+
+// extractInformationSchemaFilter extracts WHERE clause filter values from INFORMATION_SCHEMA queries
+func extractInformationSchemaFilter(sel *sqlparser.Select) InformationSchemaFilter {
+	filter := InformationSchemaFilter{}
+	if sel.Where == nil {
+		return filter
+	}
+	extractFiltersFromExpr(sel.Where.Expr, &filter)
+	return filter
+}
+
+// extractFiltersFromExpr recursively walks WHERE expression to find equality comparisons
+func extractFiltersFromExpr(expr sqlparser.Expr, filter *InformationSchemaFilter) {
+	switch e := expr.(type) {
+	case *sqlparser.AndExpr:
+		extractFiltersFromExpr(e.Left, filter)
+		extractFiltersFromExpr(e.Right, filter)
+	case *sqlparser.OrExpr:
+		// For OR expressions, we can't reliably extract filters
+		// but we still walk both sides in case there's an AND somewhere
+		extractFiltersFromExpr(e.Left, filter)
+		extractFiltersFromExpr(e.Right, filter)
+	case *sqlparser.ComparisonExpr:
+		if e.Operator == sqlparser.EqualOp {
+			extractEqualityFilter(e, filter)
+		}
+	}
+}
+
+// extractEqualityFilter extracts column = 'value' patterns
+func extractEqualityFilter(cmp *sqlparser.ComparisonExpr, filter *InformationSchemaFilter) {
+	// Get column name (could be on left or right side)
+	var colName string
+	var value string
+
+	if col, ok := cmp.Left.(*sqlparser.ColName); ok {
+		colName = strings.ToUpper(col.Name.String())
+		value = extractStringValue(cmp.Right)
+	} else if col, ok := cmp.Right.(*sqlparser.ColName); ok {
+		colName = strings.ToUpper(col.Name.String())
+		value = extractStringValue(cmp.Left)
+	}
+
+	if value == "" {
+		return
+	}
+
+	switch colName {
+	case "TABLE_SCHEMA", "SCHEMA_NAME":
+		filter.SchemaName = value
+	case "TABLE_NAME":
+		filter.TableName = value
+	case "COLUMN_NAME":
+		filter.ColumnName = value
+	}
+}
+
+// extractStringValue extracts string literal value from expression
+func extractStringValue(expr sqlparser.Expr) string {
+	switch v := expr.(type) {
+	case *sqlparser.Literal:
+		// Remove surrounding quotes
+		val := v.Val
+		if len(val) >= 2 && (val[0] == '\'' || val[0] == '"') {
+			return val[1 : len(val)-1]
+		}
+		return val
+	}
+	return ""
 }
 
 func extractMetadata(ctx *QueryContext, stmt sqlparser.Statement) {

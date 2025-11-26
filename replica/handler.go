@@ -135,7 +135,7 @@ func (h *ReadOnlyHandler) HandleQuery(session *protocol.ConnectionSession, query
 		}
 		return h.metadata.HandleShowTableStatus(dbName, stmt.TableName)
 	case protocol.StatementInformationSchema:
-		return h.metadata.HandleInformationSchema(session.CurrentDatabase, query)
+		return h.metadata.HandleInformationSchema(session.CurrentDatabase, stmt)
 	}
 
 	// Set database context from session if not specified in statement

@@ -180,7 +180,7 @@ func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, qu
 		}
 		return h.metadata.HandleShowTableStatus(dbName, stmt.TableName)
 	case protocol.StatementInformationSchema:
-		return h.metadata.HandleInformationSchema(session.CurrentDatabase, query)
+		return h.metadata.HandleInformationSchema(session.CurrentDatabase, stmt)
 	}
 
 	// Set database context from session if not specified in statement

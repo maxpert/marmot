@@ -105,6 +105,13 @@ const (
 	StatementUnsupported
 )
 
+// InformationSchemaFilter holds extracted WHERE clause values for INFORMATION_SCHEMA queries
+type InformationSchemaFilter struct {
+	SchemaName string // From TABLE_SCHEMA = 'x' or SCHEMA_NAME = 'x'
+	TableName  string // From TABLE_NAME = 'x'
+	ColumnName string // From COLUMN_NAME = 'x'
+}
+
 // Statement represents a single SQL statement
 type Statement struct {
 	SQL       string        `json:"SQL"`
@@ -118,6 +125,9 @@ type Statement struct {
 	// Populated after local execution, sent to replicas instead of SQL
 	OldValues map[string][]byte `json:"OldValues"` // Before image (for UPDATE/DELETE)
 	NewValues map[string][]byte `json:"NewValues"` // After image (for INSERT/UPDATE/REPLACE)
+
+	// ISFilter holds extracted WHERE clause values for INFORMATION_SCHEMA queries
+	ISFilter InformationSchemaFilter `json:"ISFilter,omitempty"`
 }
 
 // Transaction represents a buffered transaction

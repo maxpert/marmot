@@ -53,6 +53,13 @@ const (
 	StatementUnsupported
 )
 
+// InformationSchemaFilter holds extracted WHERE clause values for INFORMATION_SCHEMA queries
+type InformationSchemaFilter struct {
+	SchemaName string // From TABLE_SCHEMA = 'x' or SCHEMA_NAME = 'x'
+	TableName  string // From TABLE_NAME = 'x'
+	ColumnName string // From COLUMN_NAME = 'x'
+}
+
 type QueryContext struct {
 	OriginalSQL string
 	Parameters  []interface{}
@@ -81,6 +88,9 @@ type QueryContext struct {
 	CDCRowKey    string
 	CDCOldValues map[string][]byte
 	CDCNewValues map[string][]byte
+
+	// InformationSchema filter values extracted from WHERE clause (for INFORMATION_SCHEMA queries)
+	ISFilter InformationSchemaFilter
 
 	ExecutionErr error
 	RowsAffected int64
