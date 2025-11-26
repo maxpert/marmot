@@ -81,3 +81,23 @@ func appendClusterSecret(ctx context.Context) context.Context {
 	}
 	return metadata.AppendToOutgoingContext(ctx, ClusterSecretHeader, cfg.GetClusterSecret())
 }
+
+// UnaryClientInterceptorWithSecret returns a client interceptor that uses a specific secret
+func UnaryClientInterceptorWithSecret(secret string) grpc.UnaryClientInterceptor {
+	return func(ctx context.Context, method string, req, reply interface{}, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+		if secret != "" {
+			ctx = metadata.AppendToOutgoingContext(ctx, ClusterSecretHeader, secret)
+		}
+		return invoker(ctx, method, req, reply, cc, opts...)
+	}
+}
+
+// StreamClientInterceptorWithSecret returns a stream client interceptor that uses a specific secret
+func StreamClientInterceptorWithSecret(secret string) grpc.StreamClientInterceptor {
+	return func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
+		if secret != "" {
+			ctx = metadata.AppendToOutgoingContext(ctx, ClusterSecretHeader, secret)
+		}
+		return streamer(ctx, desc, cc, method, opts...)
+	}
+}

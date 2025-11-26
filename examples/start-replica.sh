@@ -2,22 +2,23 @@
 #
 # Start a read-only replica that streams from a master cluster
 #
-# Usage: ./start-replica.sh <replica_id> <master_address>
+# Usage: ./start-replica.sh <replica_id> <master_address> [secret]
 #
 # Example:
-#   # Start master cluster first (in another terminal):
-#   ./examples/start-seed.sh
+#   # Start master cluster first (in another terminal) with a cluster secret:
+#   MARMOT_CLUSTER_SECRET=my-secret ./examples/start-seed.sh
 #
-#   # Start replica 1:
-#   ./start-replica.sh 1 localhost:8081
+#   # Start replica 1 (must use same secret as master):
+#   ./start-replica.sh 1 localhost:8081 my-secret
 #
-#   # Start replica 2:
-#   ./start-replica.sh 2 localhost:8081
+#   # Or set via environment:
+#   MARMOT_REPLICA_SECRET=my-secret ./start-replica.sh 1 localhost:8081
 
 set -e
 
 REPLICA_ID=${1:-1}
 MASTER_ADDR=${2:-"localhost:8081"}
+REPLICA_SECRET=${3:-${MARMOT_REPLICA_SECRET:-""}}
 
 # Calculate ports based on replica ID
 # Replica 1: mysql=3317, grpc=8091
@@ -30,6 +31,13 @@ GRPC_PORT=$((8090 + REPLICA_ID))
 DATA_DIR="/tmp/marmot-replica-${REPLICA_ID}"
 CONFIG_FILE="/tmp/marmot-replica-${REPLICA_ID}.toml"
 
+if [ -z "${REPLICA_SECRET}" ]; then
+    echo "ERROR: Replica secret is required for PSK authentication"
+    echo "Usage: ./start-replica.sh <replica_id> <master_address> <secret>"
+    echo "   or: MARMOT_REPLICA_SECRET=<secret> ./start-replica.sh <replica_id> <master_address>"
+    exit 1
+fi
+
 echo "=== Marmot Read-Only Replica ==="
 echo "Replica ID:    ${REPLICA_ID}"
 echo "Master:        ${MASTER_ADDR}"
@@ -37,6 +45,7 @@ echo "MySQL Port:    ${MYSQL_PORT}"
 echo "gRPC Port:     ${GRPC_PORT}"
 echo "Data Dir:      ${DATA_DIR}"
 echo "Config:        ${CONFIG_FILE}"
+echo "Auth:          PSK enabled"
 echo ""
 
 # Clean up previous data (optional - comment out to preserve data)
@@ -69,6 +78,7 @@ port = ${MYSQL_PORT}
 [replica]
 enabled = true
 master_address = "${MASTER_ADDR}"
+secret = "${REPLICA_SECRET}"
 reconnect_interval_seconds = 5
 reconnect_max_backoff_seconds = 30
 initial_sync_timeout_minutes = 30

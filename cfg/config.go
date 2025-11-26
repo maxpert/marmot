@@ -171,6 +171,7 @@ type ReplicaConfiguration struct {
 	ReconnectIntervalSec   int    `toml:"reconnect_interval_seconds"`    // Initial reconnect interval (default: 5)
 	ReconnectMaxBackoffSec int    `toml:"reconnect_max_backoff_seconds"` // Max reconnect backoff (default: 30)
 	InitialSyncTimeoutMin  int    `toml:"initial_sync_timeout_minutes"`  // Timeout for initial snapshot (default: 30)
+	Secret                 string `toml:"secret"`                        // PSK for authenticating with master (env: MARMOT_REPLICA_SECRET)
 }
 
 // Configuration is the main configuration structure
@@ -340,6 +341,11 @@ func Load(configPath string) error {
 	// Environment variable override for cluster secret (takes precedence over config)
 	if envSecret := os.Getenv("MARMOT_CLUSTER_SECRET"); envSecret != "" {
 		Config.Cluster.ClusterSecret = envSecret
+	}
+
+	// Environment variable override for replica secret (takes precedence over config)
+	if envSecret := os.Getenv("MARMOT_REPLICA_SECRET"); envSecret != "" {
+		Config.Replica.Secret = envSecret
 	}
 
 	// Auto-generate node ID if not set
@@ -535,6 +541,11 @@ func Validate() error {
 			return fmt.Errorf("replica.master_address is required when replica mode is enabled")
 		}
 
+		// Replica secret is required for authentication
+		if Config.Replica.Secret == "" {
+			return fmt.Errorf("replica.secret is required when replica mode is enabled (PSK authentication mandatory)")
+		}
+
 		// Replica mode and cluster mode are mutually exclusive
 		if len(Config.Cluster.SeedNodes) > 0 {
 			return fmt.Errorf("replica mode cannot be used with cluster seed_nodes - replicas do not join the cluster")
@@ -575,4 +586,14 @@ func GetClusterSecret() string {
 // IsReplicaMode returns true if read-only replica mode is enabled
 func IsReplicaMode() bool {
 	return Config.Replica.Enabled
+}
+
+// GetReplicaSecret returns the replica secret for PSK authentication with master
+func GetReplicaSecret() string {
+	return Config.Replica.Secret
+}
+
+// IsReplicaAuthEnabled returns true if replica authentication is configured
+func IsReplicaAuthEnabled() bool {
+	return Config.Replica.Secret != ""
 }

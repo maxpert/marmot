@@ -216,10 +216,16 @@ func (s *StreamClient) Stop() {
 	s.disconnect()
 }
 
-// connect establishes connection to master
+// connect establishes connection to master with PSK authentication
 func (s *StreamClient) connect(ctx context.Context) error {
 	if s.conn != nil {
 		return nil // Already connected
+	}
+
+	// Get replica secret for PSK authentication
+	replicaSecret := cfg.GetReplicaSecret()
+	if replicaSecret == "" {
+		return fmt.Errorf("replica.secret is required for connecting to master")
 	}
 
 	// Get keepalive settings from config
@@ -241,8 +247,8 @@ func (s *StreamClient) connect(ctx context.Context) error {
 			grpc.MaxCallRecvMsgSize(100*1024*1024),
 			grpc.MaxCallSendMsgSize(100*1024*1024),
 		),
-		grpc.WithChainUnaryInterceptor(marmotgrpc.UnaryClientInterceptor()),
-		grpc.WithChainStreamInterceptor(marmotgrpc.StreamClientInterceptor()),
+		grpc.WithChainUnaryInterceptor(marmotgrpc.UnaryClientInterceptorWithSecret(replicaSecret)),
+		grpc.WithChainStreamInterceptor(marmotgrpc.StreamClientInterceptorWithSecret(replicaSecret)),
 	)
 	if err != nil {
 		return fmt.Errorf("failed to dial master: %w", err)
@@ -251,6 +257,7 @@ func (s *StreamClient) connect(ctx context.Context) error {
 	s.conn = conn
 	s.client = marmotgrpc.NewMarmotServiceClient(conn)
 
+	log.Info().Str("master", s.masterAddr).Msg("Connected to master with PSK authentication")
 	return nil
 }
 
