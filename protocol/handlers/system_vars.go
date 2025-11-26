@@ -80,7 +80,7 @@ func handleSimpleSystemVariable(queryUpper string, config SystemVarConfig) *prot
 		"@@COLLATION_SERVER":                 "utf8mb4_general_ci",
 		"@@INIT_CONNECT":                     "",
 		"@@INTERACTIVE_TIMEOUT":              28800,
-		"@@LICENSE":                          "Apache-2.0",
+		"@@LICENSE":                          "MIT",
 		"@@LOWER_CASE_TABLE_NAMES":           0,
 		"@@NET_BUFFER_LENGTH":                16384,
 		"@@NET_WRITE_TIMEOUT":                60,
@@ -269,7 +269,7 @@ func getSystemVariableValue(varExpr string, config SystemVarConfig) interface{} 
 		return 0
 	}
 	if strings.Contains(varExpr, "license") {
-		return "Apache-2.0"
+		return "MIT"
 	}
 	if strings.Contains(varExpr, "init_connect") {
 		return ""
