@@ -10,6 +10,7 @@ import (
 
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/protocol"
+	"github.com/maxpert/marmot/protocol/handlers"
 	"github.com/rs/zerolog/log"
 )
 
@@ -80,6 +81,7 @@ type CoordinatorHandler struct {
 	ddlLockMgr       *DDLLockManager
 	schemaVersionMgr SchemaVersionManager
 	nodeRegistry     NodeRegistry
+	metadata         *handlers.MetadataHandler
 }
 
 // NewCoordinatorHandler creates a new handler
@@ -93,6 +95,7 @@ func NewCoordinatorHandler(nodeID uint64, writeCoord *WriteCoordinator, readCoor
 		ddlLockMgr:       ddlLockMgr,
 		schemaVersionMgr: schemaVersionMgr,
 		nodeRegistry:     nodeRegistry,
+		metadata:         handlers.NewMetadataHandler(dbManager, SystemDatabaseName),
 	}
 }
 
@@ -147,17 +150,37 @@ func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, qu
 	// Handle metadata queries (for DBeaver compatibility)
 	switch stmt.Type {
 	case protocol.StatementShowTables:
-		return h.handleShowTables(session, stmt)
+		dbName := stmt.Database
+		if dbName == "" {
+			dbName = session.CurrentDatabase
+		}
+		return h.metadata.HandleShowTables(dbName)
 	case protocol.StatementShowColumns:
-		return h.handleShowColumns(session, stmt)
+		dbName := stmt.Database
+		if dbName == "" {
+			dbName = session.CurrentDatabase
+		}
+		return h.metadata.HandleShowColumns(dbName, stmt.TableName)
 	case protocol.StatementShowCreateTable:
-		return h.handleShowCreateTable(session, stmt)
+		dbName := stmt.Database
+		if dbName == "" {
+			dbName = session.CurrentDatabase
+		}
+		return h.metadata.HandleShowCreateTable(dbName, stmt.TableName)
 	case protocol.StatementShowIndexes:
-		return h.handleShowIndexes(session, stmt)
+		dbName := stmt.Database
+		if dbName == "" {
+			dbName = session.CurrentDatabase
+		}
+		return h.metadata.HandleShowIndexes(dbName, stmt.TableName)
 	case protocol.StatementShowTableStatus:
-		return h.handleShowTableStatus(session, stmt)
+		dbName := stmt.Database
+		if dbName == "" {
+			dbName = session.CurrentDatabase
+		}
+		return h.metadata.HandleShowTableStatus(dbName, stmt.TableName)
 	case protocol.StatementInformationSchema:
-		return h.handleInformationSchema(session, query)
+		return h.metadata.HandleInformationSchema(session.CurrentDatabase, query)
 	}
 
 	// Set database context from session if not specified in statement
@@ -427,149 +450,13 @@ func (h *CoordinatorHandler) handleRead(stmt protocol.Statement, consistency pro
 }
 
 func (h *CoordinatorHandler) handleSystemQuery(session *protocol.ConnectionSession, query string) (*protocol.ResultSet, error) {
-	// Parse column names from SELECT statement
-	// Example: SELECT @@version AS version, @@sql_mode AS sql_mode
-
-	// Extract the SELECT portion (remove comments and LIMIT)
-	queryUpper := strings.ToUpper(query)
-	selectIdx := strings.Index(queryUpper, "SELECT")
-	if selectIdx == -1 {
-		return &protocol.ResultSet{
-			Columns: []protocol.ColumnDef{{Name: "Value", Type: 0xFD}},
-			Rows:    [][]interface{}{{""}},
-		}, nil
+	config := handlers.SystemVarConfig{
+		ReadOnly:       false,
+		VersionComment: "Marmot",
+		ConnID:         session.ConnID,
+		CurrentDB:      session.CurrentDatabase,
 	}
-
-	// Find FROM or LIMIT or end of string
-	fromIdx := strings.Index(queryUpper[selectIdx:], "FROM")
-	limitIdx := strings.Index(queryUpper[selectIdx:], "LIMIT")
-	endIdx := len(query)
-
-	if fromIdx != -1 {
-		endIdx = selectIdx + fromIdx
-	} else if limitIdx != -1 {
-		endIdx = selectIdx + limitIdx
-	}
-
-	// Extract column list
-	columnsPart := strings.TrimSpace(query[selectIdx+6 : endIdx])
-
-	// Split by comma (simple split, doesn't handle nested functions perfectly)
-	parts := strings.Split(columnsPart, ",")
-
-	var columns []protocol.ColumnDef
-	var values []interface{}
-
-	for _, part := range parts {
-		part = strings.TrimSpace(part)
-
-		// Extract alias using AS or just the last word
-		var colName string
-		if strings.Contains(strings.ToUpper(part), " AS ") {
-			asIdx := strings.LastIndex(strings.ToUpper(part), " AS ")
-			colName = strings.TrimSpace(part[asIdx+4:])
-		} else {
-			// Use the variable name itself
-			words := strings.Fields(part)
-			if len(words) > 0 {
-				colName = words[len(words)-1]
-			} else {
-				colName = "value"
-			}
-		}
-
-		// Clean up column name (remove backticks, quotes)
-		colName = strings.Trim(colName, "`'\"")
-
-		columns = append(columns, protocol.ColumnDef{Name: colName, Type: 0xFD})
-
-		// Return appropriate values for known variables
-		value := h.getSystemVariable(part, session)
-		values = append(values, value)
-	}
-
-	if len(columns) == 0 {
-		columns = []protocol.ColumnDef{{Name: "Value", Type: 0xFD}}
-		values = []interface{}{""}
-	}
-
-	return &protocol.ResultSet{
-		Columns: columns,
-		Rows:    [][]interface{}{values},
-	}, nil
-}
-
-func (h *CoordinatorHandler) getSystemVariable(varExpr string, session *protocol.ConnectionSession) interface{} {
-	varExpr = strings.ToLower(varExpr)
-
-	// Common system variables
-	if strings.Contains(varExpr, "version") {
-		return "8.0.0-marmot"
-	}
-	if strings.Contains(varExpr, "database()") {
-		return session.CurrentDatabase
-	}
-	if strings.Contains(varExpr, "autocommit") {
-		return 1
-	}
-	if strings.Contains(varExpr, "auto_increment") {
-		return 1
-	}
-	if strings.Contains(varExpr, "sql_mode") {
-		return "STRICT_TRANS_TABLES"
-	}
-	if strings.Contains(varExpr, "character_set") || strings.Contains(varExpr, "charset") {
-		return "utf8mb4"
-	}
-	if strings.Contains(varExpr, "collation") {
-		return "utf8mb4_general_ci"
-	}
-	if strings.Contains(varExpr, "system_time_zone") {
-		return "UTC"
-	}
-	if strings.Contains(varExpr, "time_zone") {
-		return "SYSTEM"
-	}
-	if strings.Contains(varExpr, "interactive_timeout") {
-		return 28800
-	}
-	if strings.Contains(varExpr, "wait_timeout") {
-		return 28800
-	}
-	if strings.Contains(varExpr, "net_write_timeout") {
-		return 60
-	}
-	if strings.Contains(varExpr, "timeout") {
-		return 28800
-	}
-	if strings.Contains(varExpr, "max_allowed_packet") {
-		return 67108864
-	}
-	if strings.Contains(varExpr, "lower_case_table_names") {
-		return 0
-	}
-	if strings.Contains(varExpr, "transaction_isolation") || strings.Contains(varExpr, "tx_isolation") {
-		return "REPEATABLE-READ"
-	}
-	if strings.Contains(varExpr, "tx_read_only") || strings.Contains(varExpr, "read_only") {
-		return 0
-	}
-	if strings.Contains(varExpr, "performance_schema") {
-		return 0
-	}
-	if strings.Contains(varExpr, "query_cache") {
-		return 0
-	}
-	if strings.Contains(varExpr, "license") {
-		return "Apache-2.0"
-	}
-	if strings.Contains(varExpr, "init_connect") {
-		return ""
-	}
-
-	// Default: return empty string for unknown variables
-	// Note: This may cause issues with JDBC if it expects a numeric value
-	return ""
+	return handlers.HandleSystemQuery(query, config)
 }
 
 // handleClusterStateQuery returns current cluster membership state
