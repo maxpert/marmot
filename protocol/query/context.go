@@ -3,6 +3,7 @@ package query
 import (
 	"strings"
 
+	rqlitesql "github.com/rqlite/sql"
 	"vitess.io/vitess/go/vt/sqlparser"
 )
 
@@ -51,13 +52,44 @@ const (
 	StatementShowTableStatus
 	StatementInformationSchema
 	StatementUnsupported
+
+	// New statement types to eliminate pre-parse string matching
+	StatementSystemVariable // SELECT @@version, SELECT DATABASE(), etc.
+	StatementVirtualTable   // SELECT * FROM MARMOT_CLUSTER_NODES, etc.
 )
+
+// InformationSchemaTableType identifies which INFORMATION_SCHEMA table is being queried
+type InformationSchemaTableType int
+
+const (
+	ISTableUnknown    InformationSchemaTableType = iota
+	ISTableTables                                // INFORMATION_SCHEMA.TABLES
+	ISTableColumns                               // INFORMATION_SCHEMA.COLUMNS
+	ISTableSchemata                              // INFORMATION_SCHEMA.SCHEMATA
+	ISTableStatistics                            // INFORMATION_SCHEMA.STATISTICS
+)
+
+// VirtualTableType identifies which Marmot virtual table is being queried
+type VirtualTableType int
+
+const (
+	VirtualTableUnknown      VirtualTableType = iota
+	VirtualTableClusterNodes                  // MARMOT_CLUSTER_NODES or MARMOT.CLUSTER_NODES
+)
+
+// InformationSchemaFilter holds extracted WHERE clause values for INFORMATION_SCHEMA queries
+type InformationSchemaFilter struct {
+	SchemaName string // From TABLE_SCHEMA = 'x' or SCHEMA_NAME = 'x'
+	TableName  string // From TABLE_NAME = 'x'
+	ColumnName string // From COLUMN_NAME = 'x'
+}
 
 type QueryContext struct {
 	OriginalSQL string
 	Parameters  []interface{}
 
-	AST           sqlparser.Statement
+	AST           sqlparser.Statement // Vitess AST (for MySQL dialect)
+	SQLiteAST     rqlitesql.Statement // rqlite AST (for SQLite dialect)
 	StatementType StatementType
 	TableName     string
 	Database      string
@@ -81,6 +113,18 @@ type QueryContext struct {
 	CDCRowKey    string
 	CDCOldValues map[string][]byte
 	CDCNewValues map[string][]byte
+
+	// InformationSchema filter values extracted from WHERE clause (for INFORMATION_SCHEMA queries)
+	ISFilter InformationSchemaFilter
+
+	// InformationSchema table type (which table is being queried)
+	ISTableType InformationSchemaTableType
+
+	// Virtual table type (for MARMOT_* virtual tables)
+	VirtualTableType VirtualTableType
+
+	// System variable metadata (for @@var and DATABASE() queries)
+	SystemVarNames []string // List of system variables referenced (e.g., ["version", "sql_mode"])
 
 	ExecutionErr error
 	RowsAffected int64

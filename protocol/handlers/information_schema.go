@@ -3,42 +3,42 @@ package handlers
 import (
 	"database/sql"
 	"fmt"
-	"strings"
 
 	"github.com/maxpert/marmot/protocol"
 	"github.com/rs/zerolog/log"
 )
 
-// HandleInformationSchema handles INFORMATION_SCHEMA queries
-func (m *MetadataHandler) HandleInformationSchema(currentDB, query string) (*protocol.ResultSet, error) {
-	queryUpper := strings.ToUpper(query)
-
+// HandleInformationSchema handles INFORMATION_SCHEMA queries using pre-parsed filter values
+func (m *MetadataHandler) HandleInformationSchema(currentDB string, stmt protocol.Statement) (*protocol.ResultSet, error) {
 	log.Debug().
-		Str("query", query).
+		Int("is_table_type", int(stmt.ISTableType)).
+		Str("filter_schema", stmt.ISFilter.SchemaName).
+		Str("filter_table", stmt.ISFilter.TableName).
 		Msg("Handling INFORMATION_SCHEMA query")
 
-	// Detect which INFORMATION_SCHEMA table is being queried
-	if strings.Contains(queryUpper, "INFORMATION_SCHEMA.TABLES") {
-		return m.handleInformationSchemaTables(currentDB, query)
-	} else if strings.Contains(queryUpper, "INFORMATION_SCHEMA.COLUMNS") {
-		return m.handleInformationSchemaColumns(currentDB, query)
-	} else if strings.Contains(queryUpper, "INFORMATION_SCHEMA.SCHEMATA") {
-		return m.handleInformationSchemaSchemata(query)
-	} else if strings.Contains(queryUpper, "INFORMATION_SCHEMA.STATISTICS") {
-		return m.handleInformationSchemaStatistics(currentDB, query)
+	// Route based on pre-parsed table type (no string matching needed)
+	switch stmt.ISTableType {
+	case protocol.ISTableTables:
+		return m.handleInformationSchemaTables(currentDB, stmt.ISFilter)
+	case protocol.ISTableColumns:
+		return m.handleInformationSchemaColumns(currentDB, stmt.ISFilter)
+	case protocol.ISTableSchemata:
+		return m.handleInformationSchemaSchemata(stmt.ISFilter)
+	case protocol.ISTableStatistics:
+		return m.handleInformationSchemaStatistics(currentDB, stmt.ISFilter)
+	default:
+		// Unsupported INFORMATION_SCHEMA table - return empty result
+		return &protocol.ResultSet{
+			Columns: []protocol.ColumnDef{},
+			Rows:    [][]interface{}{},
+		}, nil
 	}
-
-	// Unsupported INFORMATION_SCHEMA table - return empty result
-	return &protocol.ResultSet{
-		Columns: []protocol.ColumnDef{},
-		Rows:    [][]interface{}{},
-	}, nil
 }
 
 // handleInformationSchemaTables handles queries to INFORMATION_SCHEMA.TABLES
-func (m *MetadataHandler) handleInformationSchemaTables(currentDB, query string) (*protocol.ResultSet, error) {
-	// Extract database name from WHERE clause if present
-	dbName := extractWhereValue(query, "TABLE_SCHEMA")
+func (m *MetadataHandler) handleInformationSchemaTables(currentDB string, filter protocol.InformationSchemaFilter) (*protocol.ResultSet, error) {
+	// Use filter value or fall back to current database
+	dbName := filter.SchemaName
 	if dbName == "" {
 		dbName = currentDB
 	}
@@ -125,10 +125,10 @@ func (m *MetadataHandler) handleInformationSchemaTables(currentDB, query string)
 }
 
 // handleInformationSchemaColumns handles queries to INFORMATION_SCHEMA.COLUMNS
-func (m *MetadataHandler) handleInformationSchemaColumns(currentDB, query string) (*protocol.ResultSet, error) {
-	// Extract database and table names from WHERE clause
-	dbName := extractWhereValue(query, "TABLE_SCHEMA")
-	tableName := extractWhereValue(query, "TABLE_NAME")
+func (m *MetadataHandler) handleInformationSchemaColumns(currentDB string, filter protocol.InformationSchemaFilter) (*protocol.ResultSet, error) {
+	// Use filter values or fall back to current database
+	dbName := filter.SchemaName
+	tableName := filter.TableName
 
 	if dbName == "" {
 		dbName = currentDB
@@ -206,9 +206,8 @@ func (m *MetadataHandler) handleInformationSchemaColumns(currentDB, query string
 }
 
 // handleInformationSchemaSchemata handles queries to INFORMATION_SCHEMA.SCHEMATA
-func (m *MetadataHandler) handleInformationSchemaSchemata(query string) (*protocol.ResultSet, error) {
-	// Extract schema name from WHERE clause if present
-	schemaName := extractWhereValue(query, "SCHEMA_NAME")
+func (m *MetadataHandler) handleInformationSchemaSchemata(filter protocol.InformationSchemaFilter) (*protocol.ResultSet, error) {
+	schemaName := filter.SchemaName
 
 	log.Debug().
 		Str("schema", schemaName).
@@ -250,9 +249,9 @@ func (m *MetadataHandler) handleInformationSchemaSchemata(query string) (*protoc
 }
 
 // handleInformationSchemaStatistics handles queries to INFORMATION_SCHEMA.STATISTICS
-func (m *MetadataHandler) handleInformationSchemaStatistics(currentDB, query string) (*protocol.ResultSet, error) {
-	dbName := extractWhereValue(query, "TABLE_SCHEMA")
-	tableName := extractWhereValue(query, "TABLE_NAME")
+func (m *MetadataHandler) handleInformationSchemaStatistics(currentDB string, filter protocol.InformationSchemaFilter) (*protocol.ResultSet, error) {
+	dbName := filter.SchemaName
+	tableName := filter.TableName
 
 	if dbName == "" {
 		dbName = currentDB

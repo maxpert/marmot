@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"fmt"
 	"reflect"
-	"strings"
 	"time"
 
 	"github.com/maxpert/marmot/hlc"
@@ -107,19 +106,18 @@ func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, qu
 		Str("query", query).
 		Msg("Handling query")
 
-	// Intercept MySQL system variable queries
-	if strings.Contains(query, "@@") || strings.Contains(strings.ToUpper(query), "DATABASE()") {
-		return h.handleSystemQuery(session, query)
-	}
-
-	// Intercept cluster state queries
-	upperQuery := strings.ToUpper(strings.TrimSpace(query))
-	if strings.Contains(upperQuery, "FROM MARMOT_CLUSTER_NODES") ||
-		strings.Contains(upperQuery, "FROM MARMOT.CLUSTER_NODES") {
-		return h.handleClusterStateQuery(session, query)
-	}
-
+	// Parse first - all routing decisions based on parsed Statement
 	stmt := protocol.ParseStatement(query)
+
+	// Handle system variable queries (@@version, DATABASE(), etc.)
+	if stmt.Type == protocol.StatementSystemVariable {
+		return h.handleSystemQuery(session, stmt)
+	}
+
+	// Handle virtual table queries (MARMOT_CLUSTER_NODES, etc.)
+	if stmt.Type == protocol.StatementVirtualTable {
+		return h.handleVirtualTableQuery(session, stmt)
+	}
 
 	log.Debug().
 		Uint64("conn_id", session.ConnID).
@@ -180,7 +178,7 @@ func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, qu
 		}
 		return h.metadata.HandleShowTableStatus(dbName, stmt.TableName)
 	case protocol.StatementInformationSchema:
-		return h.metadata.HandleInformationSchema(session.CurrentDatabase, query)
+		return h.metadata.HandleInformationSchema(session.CurrentDatabase, stmt)
 	}
 
 	// Set database context from session if not specified in statement
@@ -449,18 +447,28 @@ func (h *CoordinatorHandler) handleRead(stmt protocol.Statement, consistency pro
 	return rs, nil
 }
 
-func (h *CoordinatorHandler) handleSystemQuery(session *protocol.ConnectionSession, query string) (*protocol.ResultSet, error) {
+func (h *CoordinatorHandler) handleSystemQuery(session *protocol.ConnectionSession, stmt protocol.Statement) (*protocol.ResultSet, error) {
 	config := handlers.SystemVarConfig{
 		ReadOnly:       false,
 		VersionComment: "Marmot",
 		ConnID:         session.ConnID,
 		CurrentDB:      session.CurrentDatabase,
 	}
-	return handlers.HandleSystemQuery(query, config)
+	return handlers.HandleSystemVariableQuery(stmt, config)
 }
 
-// handleClusterStateQuery returns current cluster membership state
-func (h *CoordinatorHandler) handleClusterStateQuery(session *protocol.ConnectionSession, query string) (*protocol.ResultSet, error) {
+// handleVirtualTableQuery handles queries to Marmot virtual tables (MARMOT_CLUSTER_NODES, etc.)
+func (h *CoordinatorHandler) handleVirtualTableQuery(session *protocol.ConnectionSession, stmt protocol.Statement) (*protocol.ResultSet, error) {
+	switch stmt.VirtualTableType {
+	case protocol.VirtualTableClusterNodes:
+		return h.handleClusterNodesQuery()
+	default:
+		return nil, fmt.Errorf("unknown virtual table type: %d", stmt.VirtualTableType)
+	}
+}
+
+// handleClusterNodesQuery returns current cluster membership state
+func (h *CoordinatorHandler) handleClusterNodesQuery() (*protocol.ResultSet, error) {
 	// Get cluster state from node registry
 	rawNodes := h.nodeRegistry.GetAll()
 

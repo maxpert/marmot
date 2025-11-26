@@ -4,6 +4,7 @@
   "architecture": "Architecture",
   "replication": "Replication",
   "compatibility": "Compatibility",
+  "sql-reference": "SQL Reference",
   "operations": "Operations",
   "reference": "Reference",
   "demo": "Demo"

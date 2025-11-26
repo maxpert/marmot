@@ -1,0 +1,874 @@
+---
+title: SQL Reference
+---
+
+# SQL Reference
+
+This document provides a comprehensive reference for SQL compatibility in Marmot. Marmot accepts MySQL-dialect SQL through its MySQL protocol server and automatically transpiles queries to SQLite for execution.
+
+## Overview
+
+Marmot's query pipeline supports both MySQL and SQLite SQL dialects:
+
+### MySQL Dialect (Default)
+1. **Parse**: MySQL SQL is parsed using the Vitess SQL parser
+2. **Classify**: Statements are classified (SELECT, INSERT, UPDATE, DELETE, DDL, etc.)
+3. **CDC Extract**: Change Data Capture extracts row-level data from MySQL AST
+4. **Transpile**: MySQL syntax is converted to SQLite-compatible syntax
+5. **Validate**: Transpiled SQL is validated against SQLite grammar
+6. **Execute**: SQL is executed against SQLite
+
+### SQLite Dialect (Auto-detected)
+SQLite-specific syntax (e.g., `INSERT OR IGNORE`, `INSERT OR REPLACE`, `PRAGMA`) is automatically detected and processed differently:
+
+1. **Detect**: SQLite dialect markers trigger alternate path
+2. **Parse**: SQL is parsed using the rqlite/sql parser
+3. **CDC Extract**: Change Data Capture extracts row-level data from SQLite AST
+4. **Validate**: SQL is validated against SQLite
+5. **Execute**: SQL is executed directly
+
+**SQLite dialect markers** (auto-detected):
+- `INSERT OR IGNORE`, `INSERT OR REPLACE`, `INSERT OR ABORT`, `INSERT OR FAIL`, `INSERT OR ROLLBACK`
+- `PRAGMA`, `ATTACH`, `DETACH`, `VACUUM`, `ANALYZE` (without TABLE)
+
+## Data Types
+
+### Type Mapping (MySQL → SQLite)
+
+| MySQL Type | SQLite Type | Notes |
+|------------|-------------|-------|
+| `TINYINT`, `SMALLINT`, `MEDIUMINT`, `INT`, `BIGINT` | `INTEGER` | All integer types map to INTEGER |
+| `FLOAT`, `DOUBLE`, `REAL` | `REAL` | Floating point types |
+| `DECIMAL(p,s)`, `NUMERIC(p,s)` | `NUMERIC` | SQLite affinity rules apply |
+| `CHAR(n)`, `VARCHAR(n)` | `TEXT` | Length constraints not enforced |
+| `TINYTEXT`, `TEXT`, `MEDIUMTEXT`, `LONGTEXT` | `TEXT` | All text types map to TEXT |
+| `BINARY(n)`, `VARBINARY(n)` | `BLOB` | Binary data |
+| `TINYBLOB`, `BLOB`, `MEDIUMBLOB`, `LONGBLOB` | `BLOB` | All blob types map to BLOB |
+| `DATE`, `TIME`, `DATETIME`, `TIMESTAMP` | `TEXT` | Stored as ISO-8601 strings |
+| `YEAR` | `INTEGER` | 4-digit year |
+| `BOOLEAN`, `BOOL` | `INTEGER` | 0 = false, 1 = true |
+| `ENUM('a','b','c')` | `TEXT` | Stored as string value |
+| `SET('a','b','c')` | `TEXT` | Stored as comma-separated string |
+| `JSON` | `TEXT` | Use SQLite JSON functions |
+
+### Type Affinity
+
+SQLite uses type affinity rather than strict types. All MySQL type constraints are advisory only - SQLite will accept any value in any column.
+
+```sql
+-- MySQL syntax (works in Marmot)
+CREATE TABLE users (
+    id INT PRIMARY KEY,
+    name VARCHAR(100),
+    email VARCHAR(255) UNIQUE,
+    balance DECIMAL(10,2),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Transpiled to SQLite
+CREATE TABLE users (
+    id INTEGER PRIMARY KEY,
+    name TEXT,
+    email TEXT UNIQUE,
+    balance NUMERIC,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+---
+
+## SELECT Statements
+
+### Basic SELECT
+
+```sql
+-- Fully supported
+SELECT * FROM users;
+SELECT id, name, email FROM users WHERE status = 'active';
+SELECT DISTINCT category FROM products;
+SELECT ALL name FROM users;  -- ALL is default
+```
+
+### SELECT Modifiers
+
+| Modifier | Support | Transpilation |
+|----------|---------|---------------|
+| `DISTINCT` | ✅ Full | Passed through |
+| `ALL` | ✅ Full | Passed through |
+| `HIGH_PRIORITY` | ✅ Parsed | Removed (MySQL-only hint) |
+| `SQL_SMALL_RESULT` | ✅ Parsed | Removed (MySQL-only hint) |
+| `SQL_BIG_RESULT` | ✅ Parsed | Removed (MySQL-only hint) |
+| `SQL_BUFFER_RESULT` | ✅ Parsed | Removed (MySQL-only hint) |
+| `SQL_NO_CACHE` | ✅ Parsed | Removed (MySQL-only hint) |
+| `SQL_CALC_FOUND_ROWS` | ✅ Parsed | Removed (MySQL-only hint) |
+| `STRAIGHT_JOIN` | ❌ Not Supported | Vitess parser limitation |
+
+```sql
+-- These MySQL hints are parsed but removed during transpilation
+SELECT HIGH_PRIORITY * FROM users;           -- → SELECT * FROM users
+SELECT SQL_NO_CACHE * FROM users;            -- → SELECT * FROM users
+SELECT SQL_CALC_FOUND_ROWS * FROM users;     -- → SELECT * FROM users
+```
+
+### Column Expressions
+
+```sql
+-- Aliases
+SELECT name AS user_name, email AS contact FROM users;
+
+-- Expressions
+SELECT id, price * quantity AS total FROM orders;
+SELECT CONCAT(first_name, ' ', last_name) AS full_name FROM users;
+
+-- Aggregate functions
+SELECT COUNT(*), SUM(amount), AVG(price), MIN(id), MAX(id) FROM orders;
+
+-- Scalar subqueries
+SELECT id, (SELECT COUNT(*) FROM orders WHERE user_id = users.id) AS order_count FROM users;
+```
+
+---
+
+## JOIN Operations
+
+### Supported JOIN Types
+
+| JOIN Type | Support | Example |
+|-----------|---------|---------|
+| `[INNER] JOIN` | ✅ Full | `SELECT * FROM a JOIN b ON a.id = b.a_id` |
+| `LEFT [OUTER] JOIN` | ✅ Full | `SELECT * FROM a LEFT JOIN b ON a.id = b.a_id` |
+| `RIGHT [OUTER] JOIN` | ✅ Full | `SELECT * FROM a RIGHT JOIN b ON a.id = b.a_id` |
+| `CROSS JOIN` | ✅ Full | `SELECT * FROM a CROSS JOIN b` |
+| `NATURAL JOIN` | ✅ Full | `SELECT * FROM a NATURAL JOIN b` |
+| `NATURAL LEFT JOIN` | ✅ Full | `SELECT * FROM a NATURAL LEFT JOIN b` |
+| `NATURAL RIGHT JOIN` | ✅ Full | `SELECT * FROM a NATURAL RIGHT JOIN b` |
+
+### JOIN Conditions
+
+```sql
+-- ON clause
+SELECT u.name, o.total
+FROM users u
+JOIN orders o ON u.id = o.user_id;
+
+-- USING clause
+SELECT * FROM users u JOIN orders o USING(user_id);
+SELECT * FROM t1 JOIN t2 USING(col1, col2);
+
+-- Multiple conditions
+SELECT * FROM users u
+JOIN orders o ON u.id = o.user_id AND o.status = 'completed';
+
+-- OR in JOIN
+SELECT * FROM users u
+JOIN orders o ON u.id = o.user_id OR u.email = o.email;
+```
+
+### Multiple JOINs
+
+```sql
+-- Chain of JOINs
+SELECT u.name, o.total, p.name AS product
+FROM users u
+JOIN orders o ON u.id = o.user_id
+JOIN order_items oi ON o.id = oi.order_id
+JOIN products p ON oi.product_id = p.id;
+
+-- Mixed JOIN types
+SELECT u.name, o.total, r.rating
+FROM users u
+LEFT JOIN orders o ON u.id = o.user_id
+INNER JOIN reviews r ON o.id = r.order_id;
+
+-- Self JOIN
+SELECT e.name AS employee, m.name AS manager
+FROM employees e
+LEFT JOIN employees m ON e.manager_id = m.id;
+```
+
+### Derived Tables (Subquery in FROM)
+
+```sql
+-- Derived table with alias (required)
+SELECT * FROM (SELECT id, name FROM users WHERE active = 1) AS active_users;
+
+-- JOIN with derived table
+SELECT u.name, stats.total_orders
+FROM users u
+JOIN (
+    SELECT user_id, COUNT(*) AS total_orders
+    FROM orders
+    GROUP BY user_id
+) AS stats ON u.id = stats.user_id;
+```
+
+---
+
+## Set Operations
+
+### UNION
+
+| Operation | Support | Notes |
+|-----------|---------|-------|
+| `UNION` | ✅ Full | Removes duplicates |
+| `UNION ALL` | ✅ Full | Keeps duplicates |
+| `UNION DISTINCT` | ❌ Not Supported | Use `UNION` instead |
+| `INTERSECT` | ❌ Not Supported | Vitess parser limitation |
+| `EXCEPT` | ❌ Not Supported | Vitess parser limitation |
+
+```sql
+-- Supported
+SELECT id FROM users UNION SELECT id FROM admins;
+SELECT id FROM t1 UNION ALL SELECT id FROM t2;
+SELECT id FROM t1 UNION SELECT id FROM t2 UNION SELECT id FROM t3;
+
+-- With ORDER BY and LIMIT (applied to final result)
+SELECT id FROM users UNION SELECT id FROM admins ORDER BY id LIMIT 10;
+
+-- Not supported (use UNION instead)
+-- SELECT id FROM t1 UNION DISTINCT SELECT id FROM t2;  -- Error
+-- SELECT id FROM t1 INTERSECT SELECT id FROM t2;       -- Error
+-- SELECT id FROM t1 EXCEPT SELECT id FROM t2;          -- Error
+```
+
+---
+
+## Subqueries
+
+### Supported Subquery Patterns
+
+| Pattern | Support | Example |
+|---------|---------|---------|
+| Scalar subquery in SELECT | ✅ Full | `SELECT (SELECT MAX(id) FROM t)` |
+| Scalar subquery in WHERE | ✅ Full | `WHERE id = (SELECT MAX(id) FROM t)` |
+| `IN (subquery)` | ✅ Full | `WHERE id IN (SELECT id FROM t)` |
+| `NOT IN (subquery)` | ✅ Full | `WHERE id NOT IN (SELECT id FROM t)` |
+| `EXISTS (subquery)` | ✅ Full | `WHERE EXISTS (SELECT 1 FROM t WHERE ...)` |
+| `NOT EXISTS (subquery)` | ✅ Full | `WHERE NOT EXISTS (SELECT 1 FROM t WHERE ...)` |
+| `> ANY (subquery)` | ❌ Not Supported | Vitess parser limitation |
+| `> SOME (subquery)` | ❌ Not Supported | Vitess parser limitation |
+| `> ALL (subquery)` | ❌ Not Supported | Vitess parser limitation |
+| Derived table (FROM) | ✅ Full | `FROM (SELECT ...) AS alias` |
+| Correlated subquery | ✅ Full | References outer query |
+
+```sql
+-- Scalar subqueries
+SELECT id, (SELECT COUNT(*) FROM orders WHERE user_id = users.id) AS order_count FROM users;
+SELECT * FROM users WHERE id = (SELECT MAX(user_id) FROM orders);
+
+-- IN / NOT IN
+SELECT * FROM users WHERE id IN (SELECT user_id FROM orders WHERE total > 100);
+SELECT * FROM users WHERE id NOT IN (SELECT user_id FROM banned_users);
+
+-- EXISTS / NOT EXISTS
+SELECT * FROM users u WHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id);
+SELECT * FROM users u WHERE NOT EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id);
+
+-- Correlated subqueries
+SELECT * FROM users u WHERE (SELECT COUNT(*) FROM orders o WHERE o.user_id = u.id) > 5;
+SELECT u.name, (SELECT MAX(o.total) FROM orders o WHERE o.user_id = u.id) AS max_order FROM users u;
+
+-- Subquery in HAVING
+SELECT user_id, COUNT(*) AS cnt FROM orders
+GROUP BY user_id
+HAVING COUNT(*) > (SELECT AVG(order_count) FROM (SELECT COUNT(*) AS order_count FROM orders GROUP BY user_id) t);
+```
+
+---
+
+## Window Functions
+
+### Ranking Functions
+
+| Function | Support | Example |
+|----------|---------|---------|
+| `ROW_NUMBER()` | ✅ Full | `ROW_NUMBER() OVER (ORDER BY id)` |
+| `RANK()` | ✅ Full | `RANK() OVER (ORDER BY score DESC)` |
+| `DENSE_RANK()` | ✅ Full | `DENSE_RANK() OVER (ORDER BY score DESC)` |
+| `NTILE(n)` | ✅ Full | `NTILE(4) OVER (ORDER BY salary)` |
+
+### Navigation Functions
+
+| Function | Support | Example |
+|----------|---------|---------|
+| `LAG(col)` | ✅ Full | `LAG(value) OVER (ORDER BY date)` |
+| `LAG(col, offset, default)` | ✅ Full | `LAG(value, 2, 0) OVER (ORDER BY date)` |
+| `LEAD(col)` | ✅ Full | `LEAD(value) OVER (ORDER BY date)` |
+| `FIRST_VALUE(col)` | ✅ Full | `FIRST_VALUE(name) OVER (ORDER BY id)` |
+| `LAST_VALUE(col)` | ✅ Full | `LAST_VALUE(name) OVER (ORDER BY id)` |
+| `NTH_VALUE(col, n)` | ✅ Full | `NTH_VALUE(name, 3) OVER (ORDER BY id)` |
+
+### Aggregate Window Functions
+
+```sql
+-- Running totals and aggregates
+SELECT id, amount,
+    SUM(amount) OVER (ORDER BY id) AS running_total,
+    AVG(amount) OVER (PARTITION BY category) AS category_avg,
+    COUNT(*) OVER (PARTITION BY user_id) AS user_order_count
+FROM orders;
+```
+
+### PARTITION BY and ORDER BY
+
+```sql
+-- Single partition column
+SELECT id, ROW_NUMBER() OVER (PARTITION BY category ORDER BY price DESC) AS rnk FROM products;
+
+-- Multiple partition columns
+SELECT id, ROW_NUMBER() OVER (PARTITION BY year, month ORDER BY day) AS day_of_month FROM calendar;
+```
+
+### Frame Specifications
+
+| Frame | Support | Example |
+|-------|---------|---------|
+| `ROWS BETWEEN n PRECEDING AND CURRENT ROW` | ✅ Full | Moving window |
+| `ROWS UNBOUNDED PRECEDING` | ✅ Full | From start to current |
+| `ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING` | ✅ Full | Entire partition |
+| `RANGE BETWEEN INTERVAL n DAY PRECEDING AND CURRENT ROW` | ❌ Not Supported | Vitess limitation |
+
+```sql
+-- Supported frame specifications
+SELECT id,
+    SUM(amount) OVER (ORDER BY date ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS moving_sum,
+    SUM(amount) OVER (ORDER BY date ROWS UNBOUNDED PRECEDING) AS cumulative,
+    SUM(amount) OVER (ORDER BY date ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS total
+FROM data;
+```
+
+### Named Windows
+
+| Feature | Support | Notes |
+|---------|---------|-------|
+| Single WINDOW definition | ✅ Full | `WINDOW w AS (ORDER BY id)` |
+| Multiple WINDOW definitions | ❌ Not Supported | Vitess limitation |
+
+```sql
+-- Supported: single named window
+SELECT id,
+    ROW_NUMBER() OVER w AS rn,
+    SUM(amount) OVER w AS running_total
+FROM orders
+WINDOW w AS (ORDER BY created_at);
+
+-- Not supported: multiple named windows
+-- SELECT id, ROW_NUMBER() OVER w1, SUM(amount) OVER w2
+-- FROM orders WINDOW w1 AS (ORDER BY id), w2 AS (PARTITION BY category);
+```
+
+---
+
+## Common Table Expressions (CTEs)
+
+### Simple CTEs
+
+```sql
+-- Basic CTE
+WITH active_users AS (
+    SELECT * FROM users WHERE status = 'active'
+)
+SELECT * FROM active_users;
+
+-- CTE with explicit column list
+WITH user_stats(user_id, total_orders) AS (
+    SELECT user_id, COUNT(*) FROM orders GROUP BY user_id
+)
+SELECT * FROM user_stats;
+
+-- Multiple CTEs
+WITH
+    a AS (SELECT 1 AS x),
+    b AS (SELECT 2 AS y),
+    c AS (SELECT 3 AS z)
+SELECT * FROM a, b, c;
+
+-- CTEs referencing each other
+WITH
+    first_cte AS (SELECT id FROM users),
+    second_cte AS (SELECT id FROM first_cte WHERE id > 10)
+SELECT * FROM second_cte;
+```
+
+### Recursive CTEs
+
+```sql
+-- Generate number sequence
+WITH RECURSIVE nums AS (
+    SELECT 1 AS n
+    UNION ALL
+    SELECT n + 1 FROM nums WHERE n < 10
+)
+SELECT * FROM nums;
+
+-- Tree traversal (hierarchical data)
+WITH RECURSIVE tree AS (
+    -- Anchor: root nodes
+    SELECT id, name, parent_id, 0 AS depth
+    FROM categories
+    WHERE parent_id IS NULL
+
+    UNION ALL
+
+    -- Recursive: children
+    SELECT c.id, c.name, c.parent_id, t.depth + 1
+    FROM categories c
+    JOIN tree t ON c.parent_id = t.id
+)
+SELECT * FROM tree;
+```
+
+---
+
+## GROUP BY and HAVING
+
+### GROUP BY
+
+| Feature | Support | Notes |
+|---------|---------|-------|
+| Single column | ✅ Full | `GROUP BY category` |
+| Multiple columns | ✅ Full | `GROUP BY year, month` |
+| Column position | ✅ Full | `GROUP BY 1` (first column) |
+| Expression | ✅ Full | `GROUP BY YEAR(created_at)` |
+| Alias reference | ✅ Full | `GROUP BY yr` (with `AS yr`) |
+| `WITH ROLLUP` | ❌ Not Supported | Vitess limitation |
+
+```sql
+-- Basic GROUP BY
+SELECT category, COUNT(*) FROM products GROUP BY category;
+
+-- Multiple columns
+SELECT year, month, SUM(sales) FROM revenue GROUP BY year, month;
+
+-- With HAVING
+SELECT category, COUNT(*) AS cnt FROM products
+GROUP BY category
+HAVING cnt > 5;
+
+-- Multiple aggregates
+SELECT category, COUNT(*), SUM(price), AVG(price), MIN(price), MAX(price)
+FROM products
+GROUP BY category;
+
+-- With ORDER BY and LIMIT
+SELECT category, COUNT(*) AS cnt FROM products
+GROUP BY category
+ORDER BY cnt DESC
+LIMIT 10;
+```
+
+---
+
+## LIMIT and OFFSET
+
+### Syntax Variations
+
+| Syntax | Support | Transpilation |
+|--------|---------|---------------|
+| `LIMIT n` | ✅ Full | Passed through |
+| `LIMIT n OFFSET m` | ✅ Full | Passed through |
+| `LIMIT m, n` (MySQL) | ✅ Full | → `LIMIT n OFFSET m` |
+
+```sql
+-- Standard syntax
+SELECT * FROM users LIMIT 10;
+SELECT * FROM users LIMIT 10 OFFSET 20;
+
+-- MySQL comma syntax (transpiled)
+SELECT * FROM users LIMIT 20, 10;
+-- Transpiled to: SELECT * FROM users LIMIT 10 OFFSET 20
+```
+
+---
+
+## INSERT Statements
+
+### Supported Variations
+
+| Variation | Support | Replication | Notes |
+|-----------|---------|-------------|-------|
+| `INSERT INTO t (cols) VALUES (...)` | ✅ Full | ✅ Yes | Standard form |
+| `INSERT INTO t VALUES (...)` | ❌ Not Supported | - | CDC requires column list |
+| `INSERT INTO t (cols) VALUES (...), (...)` | ✅ Full | ✅ Yes | Multi-row insert |
+| `INSERT IGNORE INTO t (cols) VALUES (...)` | ✅ Full | ✅ Yes | MySQL: Ignore constraints |
+| `INSERT OR IGNORE INTO t (cols) VALUES (...)` | ✅ Full | ✅ Yes | SQLite: Ignore constraints |
+| `INSERT OR REPLACE INTO t (cols) VALUES (...)` | ✅ Full | ✅ Yes | SQLite: Upsert behavior |
+| `INSERT INTO t (cols) SELECT ...` | ❌ Not Supported | - | CDC cannot track |
+| `INSERT ... ON DUPLICATE KEY UPDATE` | ❌ Not Supported | - | Vitess limitation |
+| `INSERT LOW_PRIORITY` | ❌ Not Supported | - | Vitess limitation |
+| `INSERT DELAYED` | ❌ Not Supported | - | Deprecated in MySQL |
+| `INSERT ... SET col=val` | ❌ Not Supported | - | Vitess limitation |
+
+```sql
+-- Supported: explicit column list (REQUIRED for CDC)
+INSERT INTO users (id, name, email) VALUES (1, 'Alice', 'alice@example.com');
+
+-- Supported: multi-row insert
+INSERT INTO users (id, name) VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie');
+
+-- Supported: INSERT IGNORE (MySQL syntax)
+INSERT IGNORE INTO users (id, name) VALUES (1, 'Alice');
+
+-- Supported: INSERT OR IGNORE (SQLite syntax - auto-detected)
+INSERT OR IGNORE INTO users (id, name) VALUES (1, 'Alice');
+
+-- Supported: INSERT OR REPLACE (SQLite upsert - auto-detected)
+INSERT OR REPLACE INTO users (id, name, email) VALUES (1, 'Alice', 'alice@new.com');
+
+-- NOT supported: no column list
+-- INSERT INTO users VALUES (1, 'Alice', 'alice@example.com');  -- Error: CDC requires columns
+
+-- NOT supported: INSERT ... SELECT
+-- INSERT INTO archive SELECT * FROM users WHERE status = 'inactive';  -- Error
+
+-- NOT supported: ON DUPLICATE KEY UPDATE
+-- INSERT INTO users (id, name) VALUES (1, 'Alice') ON DUPLICATE KEY UPDATE name = 'Alice';  -- Error
+```
+
+### Why Column Lists Are Required
+
+Marmot uses CDC (Change Data Capture) to replicate changes. Without explicit column names, the system cannot determine which columns are being modified, making replication unreliable.
+
+---
+
+## REPLACE Statements
+
+### Supported Variations
+
+| Variation | Support | Replication | Notes |
+|-----------|---------|-------------|-------|
+| `REPLACE INTO t (cols) VALUES (...)` | ✅ Full | ✅ Yes | Standard form |
+| `REPLACE INTO t VALUES (...)` | ❌ Not Supported | - | CDC requires column list |
+| `REPLACE INTO t (cols) SELECT ...` | ❌ Not Supported | - | CDC cannot track |
+| `REPLACE ... SET col=val` | ❌ Not Supported | - | Vitess limitation |
+
+```sql
+-- Supported: explicit column list
+REPLACE INTO users (id, name) VALUES (1, 'Alice');
+
+-- NOT supported: no column list
+-- REPLACE INTO users VALUES (1, 'Alice');  -- Error
+```
+
+---
+
+## UPDATE Statements
+
+### Supported Variations
+
+| Variation | Support | Replication | Notes |
+|-----------|---------|-------------|-------|
+| `UPDATE t SET col=val WHERE pk=x` | ✅ Full | ✅ Yes | Standard form |
+| `UPDATE t SET col=col+1 WHERE pk=x` | ✅ Full | ✅ Yes | Expression in SET |
+| `UPDATE t SET col=val` (no WHERE) | ❌ Not Supported | - | CDC requires WHERE |
+| `UPDATE t SET col=val WHERE col IN (subquery)` | ❌ Not Supported | - | Cannot extract PK |
+| `UPDATE t1 JOIN t2 ...` | ❌ Not Supported | - | Vitess limitation |
+| `UPDATE t1, t2 SET ...` | ❌ Not Supported | - | Vitess limitation |
+| `UPDATE t SET ... LIMIT n` | ❌ Not Supported | - | Vitess limitation |
+| `UPDATE LOW_PRIORITY` | ❌ Not Supported | - | Vitess limitation |
+| `UPDATE IGNORE` | ❌ Not Supported | - | Vitess limitation |
+
+```sql
+-- Supported: simple UPDATE with WHERE
+UPDATE users SET name = 'Bob' WHERE id = 1;
+
+-- Supported: multiple columns
+UPDATE users SET name = 'Bob', email = 'bob@example.com', updated_at = NOW() WHERE id = 1;
+
+-- Supported: expression in SET
+UPDATE products SET stock = stock - 1 WHERE id = 100;
+
+-- NOT supported: no WHERE clause
+-- UPDATE users SET status = 'inactive';  -- Error: unsafe multi-row update
+
+-- NOT supported: subquery in WHERE
+-- UPDATE users SET status = 'premium' WHERE id IN (SELECT user_id FROM orders);  -- Error
+```
+
+### Why WHERE Is Required
+
+For CDC replication, Marmot needs to identify the specific row being modified. Updates without WHERE clauses could affect multiple rows unpredictably, making replication non-deterministic.
+
+---
+
+## DELETE Statements
+
+### Supported Variations
+
+| Variation | Support | Replication | Notes |
+|-----------|---------|-------------|-------|
+| `DELETE FROM t WHERE pk=x` | ✅ Full | ✅ Yes | Standard form |
+| `DELETE FROM t` (no WHERE) | ❌ Not Supported | - | CDC requires WHERE |
+| `DELETE FROM t WHERE col IN (subquery)` | ❌ Not Supported | - | Cannot extract PK |
+| `DELETE FROM t USING t1, t2 ...` | ❌ Not Supported | - | Vitess limitation |
+| `DELETE t FROM t JOIN ...` | ❌ Not Supported | - | Vitess limitation |
+| `DELETE t1, t2 FROM ...` | ❌ Not Supported | - | Vitess limitation |
+| `DELETE FROM t ORDER BY ... LIMIT n` | ❌ Not Supported | - | Vitess limitation |
+| `DELETE LOW_PRIORITY` | ❌ Not Supported | - | Vitess limitation |
+| `DELETE IGNORE` | ❌ Not Supported | - | Vitess limitation |
+
+```sql
+-- Supported: simple DELETE with WHERE
+DELETE FROM users WHERE id = 1;
+
+-- NOT supported: no WHERE clause
+-- DELETE FROM temp_table;  -- Error: unsafe multi-row delete
+
+-- NOT supported: subquery in WHERE
+-- DELETE FROM users WHERE id IN (SELECT user_id FROM banned_users);  -- Error
+
+-- Use TRUNCATE for deleting all rows (DDL operation)
+TRUNCATE TABLE temp_table;
+```
+
+---
+
+## DDL Statements
+
+### CREATE TABLE
+
+```sql
+-- Basic table
+CREATE TABLE users (
+    id INT PRIMARY KEY,
+    name VARCHAR(100),
+    email VARCHAR(255) UNIQUE
+);
+
+-- With IF NOT EXISTS
+CREATE TABLE IF NOT EXISTS users (id INT PRIMARY KEY);
+
+-- With constraints
+CREATE TABLE orders (
+    id INT PRIMARY KEY,
+    user_id INT,
+    total DECIMAL(10,2),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id),
+    INDEX idx_user (user_id)
+);
+```
+
+### ALTER TABLE
+
+```sql
+ALTER TABLE users ADD COLUMN age INT;
+ALTER TABLE users DROP COLUMN age;
+ALTER TABLE users MODIFY COLUMN name VARCHAR(200);
+ALTER TABLE users ADD INDEX idx_name (name);
+ALTER TABLE users RENAME TO customers;
+```
+
+### DROP TABLE
+
+```sql
+DROP TABLE users;
+DROP TABLE IF EXISTS users;
+DROP TABLE users, orders, products;  -- Multiple tables
+```
+
+### CREATE/DROP INDEX
+
+```sql
+CREATE INDEX idx_name ON users (name);
+CREATE UNIQUE INDEX idx_email ON users (email);
+DROP INDEX idx_name ON users;
+```
+
+### CREATE/DROP DATABASE
+
+```sql
+CREATE DATABASE mydb;
+CREATE DATABASE IF NOT EXISTS mydb;
+DROP DATABASE mydb;
+DROP DATABASE IF EXISTS mydb;
+```
+
+### Other DDL
+
+```sql
+TRUNCATE TABLE logs;
+RENAME TABLE users TO customers;
+```
+
+---
+
+## Locking Clauses
+
+### SELECT ... FOR UPDATE
+
+| Clause | Support | Notes |
+|--------|---------|-------|
+| `FOR UPDATE` | ✅ Full | Acquired in SQLite |
+| `FOR UPDATE OF table` | ❌ Not Supported | Vitess limitation |
+| `FOR UPDATE NOWAIT` | ❌ Not Supported | Vitess limitation |
+| `FOR UPDATE SKIP LOCKED` | ❌ Not Supported | Vitess limitation |
+| `FOR SHARE` | ❌ Not Supported | Use `LOCK IN SHARE MODE` |
+| `LOCK IN SHARE MODE` | ✅ Full | Legacy syntax |
+
+```sql
+-- Supported
+SELECT * FROM users WHERE id = 1 FOR UPDATE;
+SELECT * FROM users WHERE id = 1 LOCK IN SHARE MODE;
+
+-- NOT supported
+-- SELECT * FROM users WHERE id = 1 FOR UPDATE NOWAIT;
+-- SELECT * FROM queue WHERE processed = 0 FOR UPDATE SKIP LOCKED LIMIT 10;
+```
+
+---
+
+## Index Hints
+
+| Hint | Support | Transpilation |
+|------|---------|---------------|
+| `USE INDEX (idx)` | ✅ Full | Removed (SQLite ignores) |
+| `FORCE INDEX (idx)` | ✅ Full | Removed (SQLite ignores) |
+| `IGNORE INDEX (idx)` | ✅ Full | Removed (SQLite ignores) |
+| `USE INDEX FOR JOIN (idx)` | ❌ Not Supported | Vitess limitation |
+| `FORCE INDEX FOR ORDER BY (idx)` | ❌ Not Supported | Vitess limitation |
+| `IGNORE INDEX FOR GROUP BY (idx)` | ❌ Not Supported | Vitess limitation |
+
+```sql
+-- Parsed and removed (SQLite doesn't use hints)
+SELECT * FROM users USE INDEX (idx_name) WHERE name = 'Alice';
+SELECT * FROM users FORCE INDEX (idx_name) WHERE name LIKE 'A%';
+SELECT * FROM users IGNORE INDEX (idx_name) WHERE name = 'Alice';
+```
+
+---
+
+## System Variables and Functions
+
+### Supported System Variables
+
+```sql
+SELECT @@version;           -- Returns Marmot version
+SELECT @@sql_mode;          -- Returns empty string
+SELECT @@autocommit;        -- Returns 1
+SELECT DATABASE();          -- Returns current database name
+SELECT SCHEMA();            -- Alias for DATABASE()
+```
+
+### Multiple Variables
+
+```sql
+SELECT @@version AS ver, @@sql_mode AS mode;
+SELECT DATABASE() AS db, @@autocommit AS auto;
+```
+
+---
+
+## Virtual Tables
+
+### MARMOT_CLUSTER_NODES
+
+Query cluster membership:
+
+```sql
+SELECT * FROM MARMOT_CLUSTER_NODES;
+SELECT * FROM MARMOT.CLUSTER_NODES;
+SELECT * FROM marmot_cluster_nodes;  -- Case-insensitive
+
+-- Returns columns:
+-- node_id, address, state, last_seen
+```
+
+---
+
+## INFORMATION_SCHEMA
+
+### Supported Tables
+
+| Table | Support | Notes |
+|-------|---------|-------|
+| `INFORMATION_SCHEMA.TABLES` | ✅ Full | Table metadata |
+| `INFORMATION_SCHEMA.COLUMNS` | ✅ Full | Column metadata |
+| `INFORMATION_SCHEMA.SCHEMATA` | ✅ Full | Database metadata |
+| `INFORMATION_SCHEMA.STATISTICS` | ✅ Full | Index metadata |
+| Other tables | ❌ Not Supported | Falls back to SQLite |
+
+```sql
+-- List tables
+SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = 'mydb';
+
+-- List columns
+SELECT COLUMN_NAME, DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_SCHEMA = 'mydb' AND TABLE_NAME = 'users';
+
+-- List databases
+SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA;
+
+-- List indexes
+SELECT INDEX_NAME, COLUMN_NAME FROM INFORMATION_SCHEMA.STATISTICS
+WHERE TABLE_SCHEMA = 'mydb' AND TABLE_NAME = 'users';
+```
+
+---
+
+## Transpilation Rules Summary
+
+### MySQL → SQLite Transformations
+
+| MySQL Syntax | SQLite Syntax | Notes |
+|-------------|---------------|-------|
+| `LIMIT m, n` | `LIMIT n OFFSET m` | Argument order swapped |
+| `INT UNSIGNED` | `INTEGER` | UNSIGNED removed |
+| `VARCHAR(n)` | `TEXT` | Length constraint removed |
+| `DATETIME` | `TEXT` | Date stored as ISO string |
+| `AUTO_INCREMENT` | `AUTOINCREMENT` | Keyword changed |
+| `BOOLEAN` | `INTEGER` | Type changed |
+| `HIGH_PRIORITY` | (removed) | MySQL-only hint |
+| `SQL_NO_CACHE` | (removed) | MySQL-only hint |
+| `USE INDEX (idx)` | (removed) | SQLite ignores hints |
+| `` `identifier` `` | `"identifier"` | Backticks to double quotes |
+| `NOW()` | `datetime('now')` | Function translation |
+| `CURDATE()` | `date('now')` | Function translation |
+| `UNIX_TIMESTAMP()` | `strftime('%s', 'now')` | Function translation |
+
+---
+
+## Limitations Summary
+
+### Vitess Parser Limitations
+
+These features are not supported because the Vitess MySQL parser doesn't recognize them:
+
+- `STRAIGHT_JOIN` modifier
+- `UNION DISTINCT`, `INTERSECT`, `EXCEPT`
+- `INSERT ... ON DUPLICATE KEY UPDATE`
+- `INSERT LOW_PRIORITY`, `INSERT DELAYED`, `INSERT ... SET`
+- `UPDATE ... JOIN`, `UPDATE ... LIMIT`, `UPDATE IGNORE`
+- `DELETE ... USING`, `DELETE ... JOIN`, `DELETE ... ORDER BY LIMIT`
+- `FOR UPDATE NOWAIT`, `FOR UPDATE SKIP LOCKED`, `FOR SHARE`
+- `> ANY (subquery)`, `> SOME (subquery)`, `> ALL (subquery)`
+- `GROUP BY ... WITH ROLLUP`
+- `RANGE BETWEEN INTERVAL n DAY PRECEDING`
+- Multiple `WINDOW` definitions
+- `USE INDEX FOR JOIN`, `FORCE INDEX FOR ORDER BY`
+
+### CDC Requirements
+
+These features are valid SQL but rejected by Marmot's CDC (Change Data Capture) constraints:
+
+| Requirement | Reason |
+|-------------|--------|
+| INSERT must have column list | CDC needs to know which columns are modified |
+| INSERT ... SELECT not allowed | Cannot track individual row values |
+| UPDATE must have WHERE clause | Cannot reliably replicate multi-row updates |
+| DELETE must have WHERE clause | Cannot reliably replicate multi-row deletes |
+| WHERE must have extractable PK | Complex subqueries prevent row identification |
+
+### Workarounds
+
+For unsupported features, consider these alternatives:
+
+| Instead of | Use |
+|------------|-----|
+| `UNION DISTINCT` | `UNION` (implies DISTINCT) |
+| `INTERSECT` | Subquery with `EXISTS` |
+| `EXCEPT` | Subquery with `NOT EXISTS` |
+| `ON DUPLICATE KEY UPDATE` | Check existence first, then INSERT or UPDATE |
+| `UPDATE ... LIMIT` | Add primary key constraint to WHERE |
+| `DELETE FROM t` (all) | `TRUNCATE TABLE t` |
+| `FOR UPDATE SKIP LOCKED` | Application-level locking |

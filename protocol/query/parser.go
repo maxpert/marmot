@@ -136,8 +136,19 @@ func classifyStatement(ctx *QueryContext, stmt sqlparser.Statement) {
 
 	case *sqlparser.Select:
 		ctx.StatementType = StatementSelect
-		if isInformationSchemaQuery(parsed) {
+		// Check for system variables (@@var, DATABASE()) - these take priority
+		if sysVars := extractSystemVariables(parsed); len(sysVars) > 0 {
+			ctx.StatementType = StatementSystemVariable
+			ctx.SystemVarNames = sysVars
+		} else if vtType := detectVirtualTable(parsed); vtType != VirtualTableUnknown {
+			// Check for Marmot virtual tables
+			ctx.StatementType = StatementVirtualTable
+			ctx.VirtualTableType = vtType
+		} else if isTableType := detectInformationSchemaTable(parsed); isTableType != ISTableUnknown {
+			// Check for INFORMATION_SCHEMA queries
 			ctx.StatementType = StatementInformationSchema
+			ctx.ISTableType = isTableType
+			ctx.ISFilter = extractInformationSchemaFilter(parsed)
 		}
 
 	case *sqlparser.CreateTable:
@@ -197,6 +208,30 @@ func classifyStatement(ctx *QueryContext, stmt sqlparser.Statement) {
 	case *sqlparser.UnlockTables:
 		ctx.StatementType = StatementLock
 
+	case *sqlparser.Union:
+		// Union queries - check left side for special detection
+		// System vars/virtual tables in unions are rare edge cases
+		// Default to regular SELECT for unions
+		ctx.StatementType = StatementSelect
+		// Check if left side is a special query type
+		if leftSelect, ok := parsed.Left.(*sqlparser.Select); ok {
+			if sysVars := extractSystemVariables(leftSelect); len(sysVars) > 0 {
+				ctx.StatementType = StatementSystemVariable
+				ctx.SystemVarNames = sysVars
+				// Also check right side for additional system vars
+				if rightSelect, ok := parsed.Right.(*sqlparser.Select); ok {
+					ctx.SystemVarNames = append(ctx.SystemVarNames, extractSystemVariables(rightSelect)...)
+				}
+			} else if vtType := detectVirtualTable(leftSelect); vtType != VirtualTableUnknown {
+				ctx.StatementType = StatementVirtualTable
+				ctx.VirtualTableType = vtType
+			} else if isTableType := detectInformationSchemaTable(leftSelect); isTableType != ISTableUnknown {
+				ctx.StatementType = StatementInformationSchema
+				ctx.ISTableType = isTableType
+				ctx.ISFilter = extractInformationSchemaFilter(leftSelect)
+			}
+		}
+
 	default:
 		ctx.StatementType = StatementSelect
 	}
@@ -225,20 +260,171 @@ func classifyShowStatement(ctx *QueryContext, parsed *sqlparser.Show) {
 	}
 }
 
-func isInformationSchemaQuery(sel *sqlparser.Select) bool {
+// extractSystemVariables finds @@variable references and DATABASE() calls in SELECT
+func extractSystemVariables(sel *sqlparser.Select) []string {
+	var vars []string
+	if sel.SelectExprs == nil {
+		return vars
+	}
+	for _, expr := range sel.SelectExprs.Exprs {
+		switch e := expr.(type) {
+		case *sqlparser.AliasedExpr:
+			vars = append(vars, extractVarsFromExpr(e.Expr)...)
+		}
+	}
+	return vars
+}
+
+// extractVarsFromExpr recursively finds system variables in an expression
+func extractVarsFromExpr(expr sqlparser.Expr) []string {
+	var vars []string
+	switch e := expr.(type) {
+	case *sqlparser.Variable:
+		// @@global.version, @@session.sql_mode, @@version
+		vars = append(vars, strings.ToUpper(e.Name.String()))
+	case *sqlparser.FuncExpr:
+		// DATABASE(), VERSION(), USER(), etc.
+		funcName := strings.ToUpper(e.Name.String())
+		if funcName == "DATABASE" || funcName == "SCHEMA" ||
+			funcName == "VERSION" || funcName == "USER" ||
+			funcName == "CURRENT_USER" || funcName == "SESSION_USER" ||
+			funcName == "SYSTEM_USER" || funcName == "CONNECTION_ID" {
+			vars = append(vars, funcName+"()")
+		}
+	case *sqlparser.BinaryExpr:
+		vars = append(vars, extractVarsFromExpr(e.Left)...)
+		vars = append(vars, extractVarsFromExpr(e.Right)...)
+	case *sqlparser.CaseExpr:
+		if e.Expr != nil {
+			vars = append(vars, extractVarsFromExpr(e.Expr)...)
+		}
+		for _, when := range e.Whens {
+			vars = append(vars, extractVarsFromExpr(when.Cond)...)
+			vars = append(vars, extractVarsFromExpr(when.Val)...)
+		}
+		if e.Else != nil {
+			vars = append(vars, extractVarsFromExpr(e.Else)...)
+		}
+	}
+	return vars
+}
+
+// detectVirtualTable checks if query references Marmot virtual tables
+func detectVirtualTable(sel *sqlparser.Select) VirtualTableType {
+	for _, tableExpr := range sel.From {
+		if aliased, ok := tableExpr.(*sqlparser.AliasedTableExpr); ok {
+			if tableName, ok := aliased.Expr.(sqlparser.TableName); ok {
+				name := strings.ToUpper(tableName.Name.String())
+				qualifier := ""
+				if tableName.Qualifier.NotEmpty() {
+					qualifier = strings.ToUpper(tableName.Qualifier.String())
+				}
+				// MARMOT_CLUSTER_NODES or MARMOT.CLUSTER_NODES
+				if name == "MARMOT_CLUSTER_NODES" ||
+					(qualifier == "MARMOT" && name == "CLUSTER_NODES") {
+					return VirtualTableClusterNodes
+				}
+			}
+		}
+	}
+	return VirtualTableUnknown
+}
+
+// detectInformationSchemaTable detects which INFORMATION_SCHEMA table is being queried
+func detectInformationSchemaTable(sel *sqlparser.Select) InformationSchemaTableType {
 	for _, tableExpr := range sel.From {
 		if aliased, ok := tableExpr.(*sqlparser.AliasedTableExpr); ok {
 			if tableName, ok := aliased.Expr.(sqlparser.TableName); ok {
 				if tableName.Qualifier.NotEmpty() {
 					qualifier := strings.ToUpper(tableName.Qualifier.String())
 					if qualifier == "INFORMATION_SCHEMA" {
-						return true
+						name := strings.ToUpper(tableName.Name.String())
+						switch name {
+						case "TABLES":
+							return ISTableTables
+						case "COLUMNS":
+							return ISTableColumns
+						case "SCHEMATA":
+							return ISTableSchemata
+						case "STATISTICS":
+							return ISTableStatistics
+						}
 					}
 				}
 			}
 		}
 	}
-	return false
+	return ISTableUnknown
+}
+
+// extractInformationSchemaFilter extracts WHERE clause filter values from INFORMATION_SCHEMA queries
+func extractInformationSchemaFilter(sel *sqlparser.Select) InformationSchemaFilter {
+	filter := InformationSchemaFilter{}
+	if sel.Where == nil {
+		return filter
+	}
+	extractFiltersFromExpr(sel.Where.Expr, &filter)
+	return filter
+}
+
+// extractFiltersFromExpr recursively walks WHERE expression to find equality comparisons
+func extractFiltersFromExpr(expr sqlparser.Expr, filter *InformationSchemaFilter) {
+	switch e := expr.(type) {
+	case *sqlparser.AndExpr:
+		extractFiltersFromExpr(e.Left, filter)
+		extractFiltersFromExpr(e.Right, filter)
+	case *sqlparser.OrExpr:
+		// For OR expressions, we can't reliably extract filters
+		// but we still walk both sides in case there's an AND somewhere
+		extractFiltersFromExpr(e.Left, filter)
+		extractFiltersFromExpr(e.Right, filter)
+	case *sqlparser.ComparisonExpr:
+		if e.Operator == sqlparser.EqualOp {
+			extractEqualityFilter(e, filter)
+		}
+	}
+}
+
+// extractEqualityFilter extracts column = 'value' patterns
+func extractEqualityFilter(cmp *sqlparser.ComparisonExpr, filter *InformationSchemaFilter) {
+	// Get column name (could be on left or right side)
+	var colName string
+	var value string
+
+	if col, ok := cmp.Left.(*sqlparser.ColName); ok {
+		colName = strings.ToUpper(col.Name.String())
+		value = extractStringValue(cmp.Right)
+	} else if col, ok := cmp.Right.(*sqlparser.ColName); ok {
+		colName = strings.ToUpper(col.Name.String())
+		value = extractStringValue(cmp.Left)
+	}
+
+	if value == "" {
+		return
+	}
+
+	switch colName {
+	case "TABLE_SCHEMA", "SCHEMA_NAME":
+		filter.SchemaName = value
+	case "TABLE_NAME":
+		filter.TableName = value
+	case "COLUMN_NAME":
+		filter.ColumnName = value
+	}
+}
+
+// extractStringValue extracts string literal value from expression
+func extractStringValue(expr sqlparser.Expr) string {
+	switch v := expr.(type) {
+	case *sqlparser.Literal:
+		// Remove surrounding quotes
+		val := v.Val
+		if len(val) >= 2 && (val[0] == '\'' || val[0] == '"') {
+			return val[1 : len(val)-1]
+		}
+		return val
+	}
+	return ""
 }
 
 func extractMetadata(ctx *QueryContext, stmt sqlparser.Statement) {

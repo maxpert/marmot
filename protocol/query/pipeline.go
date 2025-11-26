@@ -1,6 +1,8 @@
 package query
 
 import (
+	"fmt"
+
 	"github.com/maxpert/marmot/protocol/cdc"
 	"vitess.io/vitess/go/vt/sqlparser"
 )
@@ -41,13 +43,17 @@ func (p *Pipeline) Close() {
 }
 
 func (p *Pipeline) Process(ctx *QueryContext) error {
-	// SHORT-CIRCUIT: If SQL is already valid SQLite syntax, bypass Vitess parser
-	// Vitess is a MySQL parser and cannot parse SQLite-specific syntax like INSERT OR REPLACE
+	// SQLite dialect: Parse with rqlite/sql, extract CDC, validate
 	if ctx.SourceDialect == DialectSQLite {
 		ctx.TranspiledSQL = ctx.OriginalSQL
 
-		// Validate and classify using SQLite's own parser (via Prepare)
+		// Parse with rqlite/sql parser and classify
 		if err := p.validator.ValidateAndClassify(ctx); err != nil {
+			return err
+		}
+
+		// Extract CDC data using SQLite AST (same as MySQL path)
+		if err := extractSQLiteCDC(ctx); err != nil {
 			return err
 		}
 
@@ -128,8 +134,39 @@ func extractCDC(ctx *QueryContext) error {
 	// Only extract CDC for DML operations
 	switch ctx.StatementType {
 	case StatementInsert, StatementReplace, StatementUpdate, StatementDelete:
+		// Require Vitess AST to be populated for DML
+		if ctx.AST == nil {
+			return fmt.Errorf("Vitess AST not populated for DML statement (required for CDC)")
+		}
+
 		// REQUIRED: CDC extraction must succeed for DML
 		rowData, err := cdc.ExtractRowData(ctx.AST)
+		if err != nil {
+			return err
+		}
+
+		// Populate CDC fields in context (row key will be generated at caller level)
+		ctx.CDCOldValues = rowData.OldValues
+		ctx.CDCNewValues = rowData.NewValues
+	}
+
+	return nil
+}
+
+// extractSQLiteCDC extracts CDC (Change Data Capture) row data from SQLite AST
+// This is the SQLite equivalent of extractCDC for statements parsed as SQLite dialect
+// For DML operations (INSERT/UPDATE/DELETE), CDC extraction is REQUIRED
+func extractSQLiteCDC(ctx *QueryContext) error {
+	// Only extract CDC for DML operations
+	switch ctx.StatementType {
+	case StatementInsert, StatementReplace, StatementUpdate, StatementDelete:
+		// Require SQLite AST to be populated for DML
+		if ctx.SQLiteAST == nil {
+			return fmt.Errorf("SQLite AST not populated for DML statement (required for CDC)")
+		}
+
+		// REQUIRED: CDC extraction must succeed for DML
+		rowData, err := cdc.ExtractRowDataFromSQLite(ctx.SQLiteAST)
 		if err != nil {
 			return err
 		}

@@ -3,7 +3,6 @@ package replica
 import (
 	"context"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/maxpert/marmot/db"
@@ -44,12 +43,13 @@ func (h *ReadOnlyHandler) HandleQuery(session *protocol.ConnectionSession, query
 		Str("query", query).
 		Msg("Handling query (read-only)")
 
-	// Intercept MySQL system variable queries
-	if strings.Contains(query, "@@") || strings.Contains(strings.ToUpper(query), "DATABASE()") {
-		return h.handleSystemQuery(session, query)
-	}
-
+	// Parse first - all routing decisions based on parsed Statement
 	stmt := protocol.ParseStatement(query)
+
+	// Handle system variable queries (@@version, DATABASE(), etc.)
+	if stmt.Type == protocol.StatementSystemVariable {
+		return h.handleSystemQuery(session, stmt)
+	}
 
 	log.Debug().
 		Uint64("conn_id", session.ConnID).
@@ -135,7 +135,7 @@ func (h *ReadOnlyHandler) HandleQuery(session *protocol.ConnectionSession, query
 		}
 		return h.metadata.HandleShowTableStatus(dbName, stmt.TableName)
 	case protocol.StatementInformationSchema:
-		return h.metadata.HandleInformationSchema(session.CurrentDatabase, query)
+		return h.metadata.HandleInformationSchema(session.CurrentDatabase, stmt)
 	}
 
 	// Set database context from session if not specified in statement
@@ -148,14 +148,14 @@ func (h *ReadOnlyHandler) HandleQuery(session *protocol.ConnectionSession, query
 }
 
 // handleSystemQuery handles MySQL system variable queries
-func (h *ReadOnlyHandler) handleSystemQuery(session *protocol.ConnectionSession, query string) (*protocol.ResultSet, error) {
+func (h *ReadOnlyHandler) handleSystemQuery(session *protocol.ConnectionSession, stmt protocol.Statement) (*protocol.ResultSet, error) {
 	config := handlers.SystemVarConfig{
 		ReadOnly:       true,
 		VersionComment: "Marmot Read-Only Replica",
 		ConnID:         session.ConnID,
 		CurrentDB:      session.CurrentDatabase,
 	}
-	return handlers.HandleSystemQuery(query, config)
+	return handlers.HandleSystemVariableQuery(stmt, config)
 }
 
 // executeLocalRead executes a read query locally
