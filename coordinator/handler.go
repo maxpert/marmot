@@ -327,10 +327,14 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, consistency
 		}
 	}
 
+	// Expand multi-row INSERTs into multiple statements
+	// Each row gets its own statement with its own CDC data
+	statements := h.expandMultiRowInsert(stmt)
+
 	txn := &Transaction{
 		ID:                    uint64(txnID),
 		NodeID:                h.nodeID,
-		Statements:            []protocol.Statement{stmt},
+		Statements:            statements,
 		StartTS:               startTS,
 		WriteConsistency:      consistency,
 		Database:              stmt.Database,
@@ -670,6 +674,66 @@ func (h *CoordinatorHandler) handleRollback(session *protocol.ConnectionSession)
 		Msg("ROLLBACK: Discarded buffered statements")
 
 	return nil, nil // OK response
+}
+
+// expandMultiRowInsert expands a multi-row INSERT statement into multiple single-row statements
+// Each row gets its own statement with its own CDC data for proper replication
+// For non-INSERT statements or single-row INSERTs, returns the original statement
+func (h *CoordinatorHandler) expandMultiRowInsert(stmt protocol.Statement) []protocol.Statement {
+	// Only expand for INSERT/REPLACE statements with multiple CDC rows
+	if (stmt.Type != protocol.StatementInsert && stmt.Type != protocol.StatementReplace) ||
+		len(stmt.CDCRows) <= 1 {
+		// Single row or non-INSERT - return as-is
+		return []protocol.Statement{stmt}
+	}
+
+	// Get schema for row key generation
+	var schemaProvider *protocol.SchemaProvider
+	if sqlDB, err := h.dbManager.GetDatabaseConnection(stmt.Database); err == nil {
+		schemaProvider = protocol.NewSchemaProvider(sqlDB)
+	}
+
+	var schema *protocol.TableSchema
+	if schemaProvider != nil {
+		schema, _ = schemaProvider.GetTableSchema(stmt.TableName)
+	}
+
+	// Expand into multiple statements
+	statements := make([]protocol.Statement, len(stmt.CDCRows))
+	for i, cdcRow := range stmt.CDCRows {
+		// Create a new statement for each row with its own CDC data
+		expandedStmt := protocol.Statement{
+			SQL:              stmt.SQL, // Same SQL (will be ignored on replicas, CDC data used instead)
+			Type:             stmt.Type,
+			TableName:        stmt.TableName,
+			Database:         stmt.Database,
+			Error:            stmt.Error,
+			OldValues:        cdcRow.OldValues,
+			NewValues:        cdcRow.NewValues,
+			CDCRows:          nil, // Single row doesn't need CDCRows
+			ISFilter:         stmt.ISFilter,
+			ISTableType:      stmt.ISTableType,
+			VirtualTableType: stmt.VirtualTableType,
+			SystemVarNames:   stmt.SystemVarNames,
+		}
+
+		// Generate row key for this statement
+		if schema != nil && len(cdcRow.NewValues) > 0 {
+			if rowKey, err := protocol.GenerateRowKey(schema, cdcRow.NewValues); err == nil {
+				expandedStmt.RowKey = rowKey
+			}
+		}
+
+		statements[i] = expandedStmt
+	}
+
+	log.Debug().
+		Int("original_rows", len(stmt.CDCRows)).
+		Int("expanded_stmts", len(statements)).
+		Str("table", stmt.TableName).
+		Msg("Expanded multi-row INSERT into multiple statements")
+
+	return statements
 }
 
 // bufferStatement adds a mutation to the active transaction buffer

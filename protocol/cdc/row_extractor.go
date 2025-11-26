@@ -20,6 +20,7 @@ type RowData struct {
 // - MySQL binlog: sends before/after row images
 // - TiDB TiCDC: sends "p" (previous) and "u" (updated) data
 // - CockroachDB: uses diff option for before/after values
+// NOTE: For multi-row INSERTs, this only returns the FIRST row. Use ExtractAllRowData instead.
 func ExtractRowData(ast sqlparser.Statement) (*RowData, error) {
 	if ast == nil {
 		return nil, fmt.Errorf("nil AST")
@@ -35,6 +36,82 @@ func ExtractRowData(ast sqlparser.Statement) (*RowData, error) {
 	default:
 		return nil, fmt.Errorf("unsupported statement type: %T", stmt)
 	}
+}
+
+// ExtractAllRowData extracts ALL rows from a MySQL AST for CDC replication
+// For INSERT statements with multiple rows (VALUES (...), (...)), returns one RowData per row
+// For UPDATE/DELETE, returns a single-element slice (same as ExtractRowData)
+func ExtractAllRowData(ast sqlparser.Statement) ([]*RowData, error) {
+	if ast == nil {
+		return nil, fmt.Errorf("nil AST")
+	}
+
+	switch stmt := ast.(type) {
+	case *sqlparser.Insert:
+		return extractAllFromInsert(stmt)
+	case *sqlparser.Update:
+		rowData, err := extractFromUpdate(stmt)
+		if err != nil {
+			return nil, err
+		}
+		return []*RowData{rowData}, nil
+	case *sqlparser.Delete:
+		rowData, err := extractFromDelete(stmt)
+		if err != nil {
+			return nil, err
+		}
+		return []*RowData{rowData}, nil
+	default:
+		return nil, fmt.Errorf("unsupported statement type: %T", stmt)
+	}
+}
+
+// extractAllFromInsert extracts ALL rows from a multi-row INSERT statement
+func extractAllFromInsert(stmt *sqlparser.Insert) ([]*RowData, error) {
+	// Get column names
+	columns := make([]string, 0)
+	if stmt.Columns != nil {
+		for _, col := range stmt.Columns {
+			columns = append(columns, col.String())
+		}
+	}
+
+	if len(columns) == 0 {
+		return nil, fmt.Errorf("INSERT must have explicit column list for CDC")
+	}
+
+	// Get values from VALUES clause
+	rows, ok := stmt.Rows.(sqlparser.Values)
+	if !ok || len(rows) == 0 {
+		return nil, fmt.Errorf("invalid INSERT VALUES clause")
+	}
+
+	// Extract each row
+	result := make([]*RowData, 0, len(rows))
+	for rowIdx, row := range rows {
+		if len(row) != len(columns) {
+			return nil, fmt.Errorf("column count mismatch in row %d: %d columns, %d values", rowIdx, len(columns), len(row))
+		}
+
+		newValues := make(map[string][]byte)
+		for i, col := range columns {
+			value, err := extractValue(row[i])
+			if err != nil {
+				return nil, fmt.Errorf("failed to extract value for column %s in row %d: %w", col, rowIdx, err)
+			}
+
+			valueBytes, err := serializeValue(value)
+			if err != nil {
+				return nil, fmt.Errorf("failed to serialize value for column %s in row %d: %w", col, rowIdx, err)
+			}
+
+			newValues[col] = valueBytes
+		}
+
+		result = append(result, &RowData{NewValues: newValues})
+	}
+
+	return result, nil
 }
 
 // extractFromInsert extracts row data from INSERT statement

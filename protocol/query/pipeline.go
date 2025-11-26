@@ -130,6 +130,7 @@ func stripDatabaseQualifiers(ctx *QueryContext) {
 // extractCDC extracts CDC (Change Data Capture) row data from AST
 // This must be called BEFORE transpilation to ensure AST validity
 // For DML operations (INSERT/UPDATE/DELETE), CDC extraction is REQUIRED
+// For multi-row INSERTs, extracts ALL rows into CDCRows
 func extractCDC(ctx *QueryContext) error {
 	// Only extract CDC for DML operations
 	switch ctx.StatementType {
@@ -139,15 +140,26 @@ func extractCDC(ctx *QueryContext) error {
 			return fmt.Errorf("Vitess AST not populated for DML statement (required for CDC)")
 		}
 
-		// REQUIRED: CDC extraction must succeed for DML
-		rowData, err := cdc.ExtractRowData(ctx.AST)
+		// Extract ALL rows (handles multi-row INSERTs)
+		rowDataList, err := cdc.ExtractAllRowData(ctx.AST)
 		if err != nil {
 			return err
 		}
 
-		// Populate CDC fields in context (row key will be generated at caller level)
-		ctx.CDCOldValues = rowData.OldValues
-		ctx.CDCNewValues = rowData.NewValues
+		// Convert to CDCRow slice
+		ctx.CDCRows = make([]*CDCRow, len(rowDataList))
+		for i, rd := range rowDataList {
+			ctx.CDCRows[i] = &CDCRow{
+				OldValues: rd.OldValues,
+				NewValues: rd.NewValues,
+			}
+		}
+
+		// For backwards compatibility, populate single-row fields with first row
+		if len(rowDataList) > 0 {
+			ctx.CDCOldValues = rowDataList[0].OldValues
+			ctx.CDCNewValues = rowDataList[0].NewValues
+		}
 	}
 
 	return nil
@@ -156,6 +168,7 @@ func extractCDC(ctx *QueryContext) error {
 // extractSQLiteCDC extracts CDC (Change Data Capture) row data from SQLite AST
 // This is the SQLite equivalent of extractCDC for statements parsed as SQLite dialect
 // For DML operations (INSERT/UPDATE/DELETE), CDC extraction is REQUIRED
+// For multi-row INSERTs, extracts ALL rows into CDCRows
 func extractSQLiteCDC(ctx *QueryContext) error {
 	// Only extract CDC for DML operations
 	switch ctx.StatementType {
@@ -165,15 +178,26 @@ func extractSQLiteCDC(ctx *QueryContext) error {
 			return fmt.Errorf("SQLite AST not populated for DML statement (required for CDC)")
 		}
 
-		// REQUIRED: CDC extraction must succeed for DML
-		rowData, err := cdc.ExtractRowDataFromSQLite(ctx.SQLiteAST)
+		// Extract ALL rows (handles multi-row INSERTs)
+		rowDataList, err := cdc.ExtractAllRowDataFromSQLite(ctx.SQLiteAST)
 		if err != nil {
 			return err
 		}
 
-		// Populate CDC fields in context (row key will be generated at caller level)
-		ctx.CDCOldValues = rowData.OldValues
-		ctx.CDCNewValues = rowData.NewValues
+		// Convert to CDCRow slice
+		ctx.CDCRows = make([]*CDCRow, len(rowDataList))
+		for i, rd := range rowDataList {
+			ctx.CDCRows[i] = &CDCRow{
+				OldValues: rd.OldValues,
+				NewValues: rd.NewValues,
+			}
+		}
+
+		// For backwards compatibility, populate single-row fields with first row
+		if len(rowDataList) > 0 {
+			ctx.CDCOldValues = rowDataList[0].OldValues
+			ctx.CDCNewValues = rowDataList[0].NewValues
+		}
 	}
 
 	return nil

@@ -135,6 +135,12 @@ type InformationSchemaFilter struct {
 	ColumnName string // From COLUMN_NAME = 'x'
 }
 
+// CDCRow represents a single row's CDC data for multi-row INSERT support
+type CDCRow struct {
+	OldValues map[string][]byte `json:"OldValues"` // Before image (for UPDATE/DELETE)
+	NewValues map[string][]byte `json:"NewValues"` // After image (for INSERT/UPDATE/REPLACE)
+}
+
 // Statement represents a single SQL statement
 type Statement struct {
 	SQL       string        `json:"SQL"`
@@ -148,6 +154,11 @@ type Statement struct {
 	// Populated after local execution, sent to replicas instead of SQL
 	OldValues map[string][]byte `json:"OldValues"` // Before image (for UPDATE/DELETE)
 	NewValues map[string][]byte `json:"NewValues"` // After image (for INSERT/UPDATE/REPLACE)
+
+	// CDCRows holds ALL rows from multi-row INSERT statements
+	// For single-row DML or UPDATE/DELETE, this contains one element
+	// The coordinator expands multi-row INSERTs into multiple statements
+	CDCRows []*CDCRow `json:"CDCRows,omitempty"`
 
 	// ISFilter holds extracted WHERE clause values for INFORMATION_SCHEMA queries
 	ISFilter InformationSchemaFilter `json:"ISFilter,omitempty"`

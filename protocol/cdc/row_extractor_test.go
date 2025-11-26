@@ -208,3 +208,128 @@ func TestExtractRowData_YCSBWorkload(t *testing.T) {
 		})
 	}
 }
+
+func TestExtractAllRowData_MultiRowInsert(t *testing.T) {
+	tests := []struct {
+		name     string
+		sql      string
+		wantRows int
+		wantCols []string // Expected columns in each row's new_values
+		wantErr  bool
+	}{
+		{
+			name:     "single row insert",
+			sql:      "INSERT INTO users (id, name) VALUES (1, 'Alice')",
+			wantRows: 1,
+			wantCols: []string{"id", "name"},
+			wantErr:  false,
+		},
+		{
+			name:     "two row insert",
+			sql:      "INSERT INTO users (id, name) VALUES (1, 'Alice'), (2, 'Bob')",
+			wantRows: 2,
+			wantCols: []string{"id", "name"},
+			wantErr:  false,
+		},
+		{
+			name:     "three row insert",
+			sql:      "INSERT INTO products (sku, name, price) VALUES ('A1', 'Widget', '9.99'), ('B2', 'Gadget', '19.99'), ('C3', 'Thing', '29.99')",
+			wantRows: 3,
+			wantCols: []string{"sku", "name", "price"},
+			wantErr:  false,
+		},
+		{
+			name:     "YCSB batch insert",
+			sql:      "INSERT INTO usertable (YCSB_KEY, field0, field1, field2) VALUES ('user1', 'a', 'b', 'c'), ('user2', 'd', 'e', 'f'), ('user3', 'g', 'h', 'i'), ('user4', 'j', 'k', 'l')",
+			wantRows: 4,
+			wantCols: []string{"YCSB_KEY", "field0", "field1", "field2"},
+			wantErr:  false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			parser := sqlparser.NewTestParser()
+			ast, err := parser.Parse(tt.sql)
+			if err != nil {
+				t.Fatalf("failed to parse SQL: %v", err)
+			}
+
+			rows, err := ExtractAllRowData(ast)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("ExtractAllRowData() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if tt.wantErr {
+				return
+			}
+
+			if len(rows) != tt.wantRows {
+				t.Errorf("ExtractAllRowData() got %d rows, want %d", len(rows), tt.wantRows)
+				return
+			}
+
+			// Verify each row has the expected columns
+			for i, row := range rows {
+				if len(row.NewValues) != len(tt.wantCols) {
+					t.Errorf("Row %d: NewValues count = %d, want %d", i, len(row.NewValues), len(tt.wantCols))
+				}
+				for _, col := range tt.wantCols {
+					if _, ok := row.NewValues[col]; !ok {
+						t.Errorf("Row %d: Missing column in NewValues: %s", i, col)
+					}
+				}
+				// INSERT should have empty OldValues
+				if len(row.OldValues) != 0 {
+					t.Errorf("Row %d: OldValues should be empty for INSERT, got %d entries", i, len(row.OldValues))
+				}
+			}
+		})
+	}
+}
+
+func TestExtractAllRowData_UpdateDelete(t *testing.T) {
+	// UPDATE and DELETE should return single-element slice
+	tests := []struct {
+		name     string
+		sql      string
+		wantRows int
+		wantErr  bool
+	}{
+		{
+			name:     "update returns single row",
+			sql:      "UPDATE users SET name = 'Jane' WHERE id = 1",
+			wantRows: 1,
+			wantErr:  false,
+		},
+		{
+			name:     "delete returns single row",
+			sql:      "DELETE FROM users WHERE id = 1",
+			wantRows: 1,
+			wantErr:  false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			parser := sqlparser.NewTestParser()
+			ast, err := parser.Parse(tt.sql)
+			if err != nil {
+				t.Fatalf("failed to parse SQL: %v", err)
+			}
+
+			rows, err := ExtractAllRowData(ast)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("ExtractAllRowData() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if tt.wantErr {
+				return
+			}
+
+			if len(rows) != tt.wantRows {
+				t.Errorf("ExtractAllRowData() got %d rows, want %d", len(rows), tt.wantRows)
+			}
+		})
+	}
+}
