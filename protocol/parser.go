@@ -137,6 +137,10 @@ func ParseStatement(sql string) Statement {
 			TableName:  ctx.ISFilter.TableName,
 			ColumnName: ctx.ISFilter.ColumnName,
 		},
+		// New fields to eliminate pre-parse string matching in handlers
+		ISTableType:      InformationSchemaTableType(ctx.ISTableType),
+		VirtualTableType: VirtualTableType(ctx.VirtualTableType),
+		SystemVarNames:   ctx.SystemVarNames,
 	}
 
 	return stmt

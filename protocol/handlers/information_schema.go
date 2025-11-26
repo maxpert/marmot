@@ -3,7 +3,6 @@ package handlers
 import (
 	"database/sql"
 	"fmt"
-	"strings"
 
 	"github.com/maxpert/marmot/protocol"
 	"github.com/rs/zerolog/log"
@@ -11,30 +10,29 @@ import (
 
 // HandleInformationSchema handles INFORMATION_SCHEMA queries using pre-parsed filter values
 func (m *MetadataHandler) HandleInformationSchema(currentDB string, stmt protocol.Statement) (*protocol.ResultSet, error) {
-	queryUpper := strings.ToUpper(stmt.SQL)
-
 	log.Debug().
-		Str("query", stmt.SQL).
+		Int("is_table_type", int(stmt.ISTableType)).
 		Str("filter_schema", stmt.ISFilter.SchemaName).
 		Str("filter_table", stmt.ISFilter.TableName).
 		Msg("Handling INFORMATION_SCHEMA query")
 
-	// Detect which INFORMATION_SCHEMA table is being queried
-	if strings.Contains(queryUpper, "INFORMATION_SCHEMA.TABLES") {
+	// Route based on pre-parsed table type (no string matching needed)
+	switch stmt.ISTableType {
+	case protocol.ISTableTables:
 		return m.handleInformationSchemaTables(currentDB, stmt.ISFilter)
-	} else if strings.Contains(queryUpper, "INFORMATION_SCHEMA.COLUMNS") {
+	case protocol.ISTableColumns:
 		return m.handleInformationSchemaColumns(currentDB, stmt.ISFilter)
-	} else if strings.Contains(queryUpper, "INFORMATION_SCHEMA.SCHEMATA") {
+	case protocol.ISTableSchemata:
 		return m.handleInformationSchemaSchemata(stmt.ISFilter)
-	} else if strings.Contains(queryUpper, "INFORMATION_SCHEMA.STATISTICS") {
+	case protocol.ISTableStatistics:
 		return m.handleInformationSchemaStatistics(currentDB, stmt.ISFilter)
+	default:
+		// Unsupported INFORMATION_SCHEMA table - return empty result
+		return &protocol.ResultSet{
+			Columns: []protocol.ColumnDef{},
+			Rows:    [][]interface{}{},
+		}, nil
 	}
-
-	// Unsupported INFORMATION_SCHEMA table - return empty result
-	return &protocol.ResultSet{
-		Columns: []protocol.ColumnDef{},
-		Rows:    [][]interface{}{},
-	}, nil
 }
 
 // handleInformationSchemaTables handles queries to INFORMATION_SCHEMA.TABLES

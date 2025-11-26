@@ -51,6 +51,29 @@ const (
 	StatementShowTableStatus
 	StatementInformationSchema
 	StatementUnsupported
+
+	// New statement types to eliminate pre-parse string matching
+	StatementSystemVariable // SELECT @@version, SELECT DATABASE(), etc.
+	StatementVirtualTable   // SELECT * FROM MARMOT_CLUSTER_NODES, etc.
+)
+
+// InformationSchemaTableType identifies which INFORMATION_SCHEMA table is being queried
+type InformationSchemaTableType int
+
+const (
+	ISTableUnknown    InformationSchemaTableType = iota
+	ISTableTables                                // INFORMATION_SCHEMA.TABLES
+	ISTableColumns                               // INFORMATION_SCHEMA.COLUMNS
+	ISTableSchemata                              // INFORMATION_SCHEMA.SCHEMATA
+	ISTableStatistics                            // INFORMATION_SCHEMA.STATISTICS
+)
+
+// VirtualTableType identifies which Marmot virtual table is being queried
+type VirtualTableType int
+
+const (
+	VirtualTableUnknown      VirtualTableType = iota
+	VirtualTableClusterNodes                  // MARMOT_CLUSTER_NODES or MARMOT.CLUSTER_NODES
 )
 
 // InformationSchemaFilter holds extracted WHERE clause values for INFORMATION_SCHEMA queries
@@ -91,6 +114,15 @@ type QueryContext struct {
 
 	// InformationSchema filter values extracted from WHERE clause (for INFORMATION_SCHEMA queries)
 	ISFilter InformationSchemaFilter
+
+	// InformationSchema table type (which table is being queried)
+	ISTableType InformationSchemaTableType
+
+	// Virtual table type (for MARMOT_* virtual tables)
+	VirtualTableType VirtualTableType
+
+	// System variable metadata (for @@var and DATABASE() queries)
+	SystemVarNames []string // List of system variables referenced (e.g., ["version", "sql_mode"])
 
 	ExecutionErr error
 	RowsAffected int64
