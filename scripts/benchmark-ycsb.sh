@@ -64,21 +64,29 @@ install_ycsb() {
     cd "$REPO_ROOT"
 }
 
-# Step 2: Build Marmot
+# Step 2: Build Marmot with preupdate hook support
 build_marmot() {
     echo ""
-    echo -e "${YELLOW}[2/6] Building Marmot...${NC}"
+    echo -e "${YELLOW}[2/6] Building Marmot with preupdate hook support...${NC}"
     cd "$REPO_ROOT"
-    go build -o marmot-v2 .
-    echo -e "${GREEN}✓ Marmot built successfully${NC}"
+    go build -tags=sqlite_preupdate_hook -o marmot-v2 .
+    echo -e "${GREEN}✓ Marmot built successfully (with sqlite_preupdate_hook)${NC}"
 }
 
 # Step 3: Clean up any existing processes
 cleanup() {
     echo ""
     echo -e "${YELLOW}[3/6] Cleaning up existing processes...${NC}"
-    pkill -f "marmot-v2" || true
-    sleep 2
+
+    # Kill any marmot processes
+    pkill -9 -f "marmot-v2" 2>/dev/null || true
+
+    # Kill processes on our ports (MySQL wire protocol and gRPC)
+    for port in 3307 3308 3309 8081 8082 8083; do
+        lsof -ti:$port 2>/dev/null | xargs kill -9 2>/dev/null || true
+    done
+
+    sleep 3
     rm -rf /tmp/marmot-node-* || true
     echo -e "${GREEN}✓ Cleanup complete${NC}"
 }
@@ -88,24 +96,59 @@ start_cluster() {
     echo ""
     echo -e "${YELLOW}[4/6] Starting 3-node cluster...${NC}"
 
-    # Start node 1 (seed)
     cd "$REPO_ROOT"
+
+    # Start node 1 (seed)
     ./marmot-v2 --config examples/node-1-config.toml > /tmp/node1.log 2>&1 &
+    NODE1_PID=$!
     sleep 5
+
+    # Verify node 1 started
+    if ! kill -0 $NODE1_PID 2>/dev/null; then
+        echo -e "${RED}✗ Node 1 failed to start. Check /tmp/node1.log${NC}"
+        tail -20 /tmp/node1.log
+        exit 1
+    fi
 
     # Start node 2
     ./marmot-v2 --config examples/node-2-config.toml > /tmp/node2.log 2>&1 &
+    NODE2_PID=$!
     sleep 3
+
+    # Verify node 2 started
+    if ! kill -0 $NODE2_PID 2>/dev/null; then
+        echo -e "${RED}✗ Node 2 failed to start. Check /tmp/node2.log${NC}"
+        tail -20 /tmp/node2.log
+        exit 1
+    fi
 
     # Start node 3
     ./marmot-v2 --config examples/node-3-config.toml > /tmp/node3.log 2>&1 &
+    NODE3_PID=$!
     sleep 3
+
+    # Verify node 3 started
+    if ! kill -0 $NODE3_PID 2>/dev/null; then
+        echo -e "${RED}✗ Node 3 failed to start. Check /tmp/node3.log${NC}"
+        tail -20 /tmp/node3.log
+        exit 1
+    fi
 
     echo -e "${GREEN}✓ Cluster started (nodes on ports 3307, 3308, 3309)${NC}"
 
-    # Wait for cluster to be ready
+    # Wait for cluster to stabilize and verify MySQL ports are listening
     echo -e "${YELLOW}Waiting for cluster to stabilize...${NC}"
     sleep 5
+
+    # Verify all MySQL ports are listening
+    for port in 3307 3308 3309; do
+        if ! lsof -ti:$port >/dev/null 2>&1; then
+            echo -e "${RED}✗ Port $port not listening${NC}"
+            exit 1
+        fi
+    done
+
+    echo -e "${GREEN}✓ All nodes ready${NC}"
 }
 
 # Step 5: Create YCSB workload file

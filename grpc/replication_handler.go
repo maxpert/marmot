@@ -7,22 +7,25 @@ import (
 	"github.com/maxpert/marmot/db"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/protocol"
+	"github.com/maxpert/marmot/protocol/filter"
 	"github.com/rs/zerolog/log"
 )
 
 // ReplicationHandler handles transaction replication with MVCC
 type ReplicationHandler struct {
-	nodeID uint64
-	dbMgr  *db.DatabaseManager
-	clock  *hlc.Clock
+	nodeID        uint64
+	dbMgr         *db.DatabaseManager
+	clock         *hlc.Clock
+	guardRegistry *GuardRegistry
 }
 
 // NewReplicationHandler creates a new replication handler
-func NewReplicationHandler(nodeID uint64, dbMgr *db.DatabaseManager, clock *hlc.Clock) *ReplicationHandler {
+func NewReplicationHandler(nodeID uint64, dbMgr *db.DatabaseManager, clock *hlc.Clock, guardRegistry *GuardRegistry) *ReplicationHandler {
 	return &ReplicationHandler{
-		nodeID: nodeID,
-		dbMgr:  dbMgr,
-		clock:  clock,
+		nodeID:        nodeID,
+		dbMgr:         dbMgr,
+		clock:         clock,
+		guardRegistry: guardRegistry,
 	}
 }
 
@@ -58,7 +61,21 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 		Uint64("node_id", rh.nodeID).
 		Str("database", req.Database).
 		Int("num_statements", len(req.Statements)).
+		Int("num_guards", len(req.MutationGuards)).
 		Msg("handlePrepare called")
+
+	// Check MutationGuards for conflicts before processing statements
+	if len(req.MutationGuards) > 0 && rh.guardRegistry != nil {
+		conflictResult := rh.checkMutationGuardConflicts(req)
+		if conflictResult.HasConflict {
+			return &TransactionResponse{
+				Success:          false,
+				ErrorMessage:     conflictResult.Details,
+				ConflictDetected: true,
+				ConflictDetails:  conflictResult.Details,
+			}, nil
+		}
+	}
 
 	// Handle CREATE DATABASE and DROP DATABASE using system database for transaction tracking
 	// These operations need 2PC but don't have a user database to track the transaction in
@@ -293,6 +310,11 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 		}
 	}
 
+	// Register MutationGuards after successful prepare
+	if len(req.MutationGuards) > 0 {
+		rh.registerMutationGuards(req)
+	}
+
 	// Success! Write intents created
 	return &TransactionResponse{
 		Success: true,
@@ -359,6 +381,11 @@ func (rh *ReplicationHandler) handleCommit(ctx context.Context, req *Transaction
 					Uint64("node_id", rh.nodeID).
 					Msg("Database operation committed successfully")
 
+				// Remove MutationGuards after successful database operation commit
+				if rh.guardRegistry != nil {
+					rh.guardRegistry.Remove(req.TxnId)
+				}
+
 				return &TransactionResponse{
 					Success: true,
 					AppliedAt: &HLC{
@@ -406,6 +433,11 @@ func (rh *ReplicationHandler) handleCommit(ctx context.Context, req *Transaction
 		}, nil
 	}
 
+	// Remove MutationGuards after successful commit
+	if rh.guardRegistry != nil {
+		rh.guardRegistry.Remove(req.TxnId)
+	}
+
 	return &TransactionResponse{
 		Success: true,
 		AppliedAt: &HLC{
@@ -418,6 +450,11 @@ func (rh *ReplicationHandler) handleCommit(ctx context.Context, req *Transaction
 
 // handleAbort processes abort: Rollback transaction
 func (rh *ReplicationHandler) handleAbort(ctx context.Context, req *TransactionRequest) (*TransactionResponse, error) {
+	// Always remove MutationGuards on abort (idempotent)
+	if rh.guardRegistry != nil {
+		rh.guardRegistry.Remove(req.TxnId)
+	}
+
 	// Check system database first for database operations
 	systemDB, err := rh.dbMgr.GetDatabase("__marmot_system")
 	if err == nil {
@@ -586,4 +623,101 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// checkMutationGuardConflicts checks for conflicts using MutationGuard filters
+func (rh *ReplicationHandler) checkMutationGuardConflicts(req *TransactionRequest) ConflictResult {
+	for table, guard := range req.MutationGuards {
+		// Deserialize Bloom filter
+		f, err := filter.DeserializeBloom(guard.Filter)
+		if err != nil {
+			log.Warn().Err(err).Str("table", table).Msg("Failed to deserialize MutationGuard filter")
+			continue
+		}
+
+		// Extract keys from statements for overlap check
+		keys := rh.extractKeysForTable(req.Statements, table)
+
+		// Build active guard for conflict check
+		// Filter-only (no keys) guards are serialized per table
+		activeGuard := &ActiveGuard{
+			TxnID:  req.TxnId,
+			Table:  table,
+			Filter: f,
+			Keys:   keys,
+			Timestamp: hlc.Timestamp{
+				WallTime: req.Timestamp.WallTime,
+				Logical:  req.Timestamp.Logical,
+				NodeID:   req.Timestamp.NodeId,
+			},
+			RowCount:     guard.ExpectedRowCount,
+			IsFilterOnly: len(keys) == 0,
+		}
+
+		// Check for conflicts with existing guards
+		result := rh.guardRegistry.CheckConflict(activeGuard)
+		if result.HasConflict {
+			log.Debug().
+				Uint64("txn_id", req.TxnId).
+				Uint64("conflicting_txn", result.ConflictingTxn).
+				Str("table", table).
+				Bool("should_wait", result.ShouldWait).
+				Bool("filter_only", activeGuard.IsFilterOnly).
+				Msg("MutationGuard conflict detected")
+			return result
+		}
+	}
+
+	return ConflictResult{HasConflict: false}
+}
+
+// registerMutationGuards registers guards after successful prepare
+func (rh *ReplicationHandler) registerMutationGuards(req *TransactionRequest) {
+	if rh.guardRegistry == nil {
+		return
+	}
+
+	for table, guard := range req.MutationGuards {
+		f, err := filter.DeserializeBloom(guard.Filter)
+		if err != nil {
+			continue
+		}
+
+		keys := rh.extractKeysForTable(req.Statements, table)
+		activeGuard := &ActiveGuard{
+			TxnID:  req.TxnId,
+			Table:  table,
+			Filter: f,
+			Keys:   keys,
+			Timestamp: hlc.Timestamp{
+				WallTime: req.Timestamp.WallTime,
+				Logical:  req.Timestamp.Logical,
+				NodeID:   req.Timestamp.NodeId,
+			},
+			RowCount:     guard.ExpectedRowCount,
+			IsFilterOnly: len(keys) == 0,
+		}
+
+		if err := rh.guardRegistry.Register(activeGuard); err != nil {
+			log.Warn().Err(err).
+				Uint64("txn_id", req.TxnId).
+				Str("table", table).
+				Msg("Failed to register MutationGuard")
+		}
+	}
+}
+
+// extractKeysForTable extracts hashed row keys for a specific table from statements
+func (rh *ReplicationHandler) extractKeysForTable(stmts []*Statement, table string) []uint64 {
+	var keys []uint64
+	for _, stmt := range stmts {
+		if stmt.TableName != table {
+			continue
+		}
+		rowKey := stmt.GetRowKey()
+		if rowKey != "" {
+			keys = append(keys, filter.HashRowKeyXXH64(rowKey))
+		}
+	}
+	return keys
 }

@@ -20,6 +20,24 @@ type DatabaseManager interface {
 	CreateDatabase(name string) error
 	DropDatabase(name string) error
 	GetDatabaseConnection(name string) (*sql.DB, error)
+	// GetMVCCDatabase returns the MVCCDatabase for executing with hooks
+	GetMVCCDatabase(name string) (MVCCDatabaseProvider, error)
+}
+
+// MVCCDatabaseProvider provides access to MVCC database operations
+type MVCCDatabaseProvider interface {
+	ExecuteLocalWithHooks(ctx context.Context, txnID uint64, statements []protocol.Statement) (PendingExecution, error)
+}
+
+// PendingExecution represents a locally executed transaction waiting for quorum
+type PendingExecution interface {
+	GetRowCounts() map[string]int64
+	GetTotalRowCount() int64
+	BuildFilters() map[string][]byte
+	Commit() error
+	Rollback() error
+	// FlushIntentLog fsyncs intent log to disk. Call ONLY for multi-row ops before 2PC.
+	FlushIntentLog() error
 }
 
 // SchemaVersionManager interface to avoid import cycles
@@ -100,7 +118,7 @@ func NewCoordinatorHandler(nodeID uint64, writeCoord *WriteCoordinator, readCoor
 
 // HandleQuery processes a SQL query
 func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, query string) (*protocol.ResultSet, error) {
-	log.Debug().
+	log.Trace().
 		Uint64("conn_id", session.ConnID).
 		Str("database", session.CurrentDatabase).
 		Str("query", query).
@@ -119,12 +137,10 @@ func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, qu
 		return h.handleVirtualTableQuery(session, stmt)
 	}
 
-	log.Debug().
+	log.Trace().
 		Uint64("conn_id", session.ConnID).
 		Int("stmt_type", int(stmt.Type)).
 		Str("table", stmt.TableName).
-		Str("database", stmt.Database).
-		Str("row_key", stmt.RowKey).
 		Msg("Parsed statement")
 
 	// Handle SET commands as no-op (return OK)
@@ -227,11 +243,6 @@ func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, qu
 			}
 
 			stmt.RowKey = rowKey
-			log.Debug().
-				Str("database", stmt.Database).
-				Str("table", stmt.TableName).
-				Str("row_key", rowKey).
-				Msg("Generated row key for DML statement")
 		}
 	}
 
@@ -241,15 +252,11 @@ func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, qu
 	isMutation := protocol.IsMutation(stmt)
 	inTransaction := session.InTransaction()
 
-	log.Debug().
-		Uint64("node_id", h.nodeID).
+	log.Trace().
 		Int("stmt_type", int(stmt.Type)).
 		Bool("is_mutation", isMutation).
-		Bool("in_transaction", inTransaction).
 		Str("table", stmt.TableName).
-		Str("database", stmt.Database).
-		Str("sql_prefix", truncateSQL(query, 60)).
-		Msg("ROUTE: Routing decision")
+		Msg("Routing query")
 
 	// If in explicit transaction, buffer mutations instead of immediate 2PC
 	if inTransaction && isMutation {
@@ -264,26 +271,9 @@ func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, qu
 	return h.handleRead(stmt, consistency)
 }
 
-// truncateSQL returns first n chars of SQL for logging
-func truncateSQL(sql string, n int) string {
-	if len(sql) <= n {
-		return sql
-	}
-	return sql[:n] + "..."
-}
-
 func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, consistency protocol.ConsistencyLevel) (*protocol.ResultSet, error) {
-	// Create transaction
-	txnID := h.clock.Now().WallTime // Simple ID generation for now
+	txnID := h.clock.Now().WallTime
 	startTS := h.clock.Now()
-
-	log.Debug().
-		Uint64("node_id", h.nodeID).
-		Uint64("txn_id", uint64(txnID)).
-		Int("stmt_type", int(stmt.Type)).
-		Str("table", stmt.TableName).
-		Str("database", stmt.Database).
-		Msg("MUTATION: Starting handleMutation")
 
 	// Detect DDL and handle differently
 	isDDL := stmt.Type == protocol.StatementDDL ||
@@ -331,6 +321,40 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, consistency
 	// Each row gets its own statement with its own CDC data
 	statements := h.expandMultiRowInsert(stmt)
 
+	// For DML operations, try to execute locally with hooks to capture affected rows
+	// This enables MutationGuard-based conflict detection for multi-row operations
+	var pendingExec PendingExecution
+	var rowsAffected int64 = 1
+
+	isDML := stmt.Type == protocol.StatementInsert ||
+		stmt.Type == protocol.StatementUpdate ||
+		stmt.Type == protocol.StatementDelete ||
+		stmt.Type == protocol.StatementReplace
+
+	// cancelHookCtx is called after pendingExec.Commit/Rollback to release the context
+	// CRITICAL: Do NOT call cancel() before Commit/Rollback - Go's database/sql.Tx
+	// watches the context and auto-rolls back if cancelled before explicit commit
+	var cancelHookCtx context.CancelFunc
+
+	if isDML && stmt.Database != "" {
+		mvccDB, err := h.dbManager.GetMVCCDatabase(stmt.Database)
+		if err == nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			cancelHookCtx = cancel // Store for later - DO NOT call yet
+			pendingExec, err = mvccDB.ExecuteLocalWithHooks(ctx, uint64(txnID), statements)
+
+			if err != nil {
+				cancel() // Only cancel on error
+				log.Warn().Err(err).Msg("Failed to execute with hooks, falling back to statement-based")
+				pendingExec = nil
+				cancelHookCtx = nil
+			} else {
+				rowsAffected = pendingExec.GetTotalRowCount()
+			}
+		}
+	}
+
+	// Build transaction for replication
 	txn := &Transaction{
 		ID:                    uint64(txnID),
 		NodeID:                h.nodeID,
@@ -338,13 +362,57 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, consistency
 		StartTS:               startTS,
 		WriteConsistency:      consistency,
 		Database:              stmt.Database,
-		RequiredSchemaVersion: schemaVersion, // Current version required
+		RequiredSchemaVersion: schemaVersion,
+		LocalExecutionDone:    pendingExec != nil, // Skip local replication if already executed
+	}
+
+	// If we have pending execution with multiple rows, build MutationGuards
+	if pendingExec != nil && rowsAffected > 1 {
+		// Flush intent log for multi-row operations before 2PC
+		if err := pendingExec.FlushIntentLog(); err != nil {
+			log.Warn().Err(err).Msg("Failed to flush intent log")
+		}
+		filters := pendingExec.BuildFilters()
+		rowCounts := pendingExec.GetRowCounts()
+
+		if len(filters) > 0 {
+			txn.MutationGuards = make(map[string]*MutationGuard)
+			for table, filterBytes := range filters {
+				txn.MutationGuards[table] = &MutationGuard{
+					Filter:           filterBytes,
+					ExpectedRowCount: rowCounts[table],
+				}
+			}
+		}
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	if err := h.writeCoord.WriteTransaction(ctx, txn); err != nil {
+	err := h.writeCoord.WriteTransaction(ctx, txn)
+
+	// Handle pending execution commit/rollback based on quorum result
+	if pendingExec != nil {
+		if err != nil {
+			// Quorum failed - rollback local execution
+			if rollbackErr := pendingExec.Rollback(); rollbackErr != nil {
+				log.Error().Err(rollbackErr).Msg("Failed to rollback local execution after quorum failure")
+			}
+			if cancelHookCtx != nil {
+				cancelHookCtx()
+			}
+			return nil, err
+		}
+		// Quorum succeeded - commit local execution
+		if commitErr := pendingExec.Commit(); commitErr != nil {
+			log.Error().Err(commitErr).Msg("Failed to commit local execution after quorum success")
+			// Note: Quorum already succeeded, so other nodes have the data
+			// This is an inconsistency that should be handled by anti-entropy
+		}
+		if cancelHookCtx != nil {
+			cancelHookCtx()
+		}
+	} else if err != nil {
 		return nil, err
 	}
 
@@ -372,11 +440,8 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, consistency
 		}
 	}
 
-	// Return OK result with rows affected
-	// For now, we return 1 row affected for successful mutations
-	// In the future, we could enhance this to return actual rows affected from the database
 	return &protocol.ResultSet{
-		RowsAffected: 1,
+		RowsAffected: rowsAffected,
 	}, nil
 }
 

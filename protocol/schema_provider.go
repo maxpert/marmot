@@ -3,12 +3,13 @@ package protocol
 import (
 	"crypto/sha256"
 	"database/sql"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
 	"sync"
+
+	"github.com/maxpert/marmot/protocol/filter"
 )
 
 // TableSchema represents the schema of a table
@@ -139,63 +140,36 @@ func (sp *SchemaProvider) calculateSchemaVersion(schema *TableSchema) uint64 {
 	return version
 }
 
-// GenerateRowKey generates a deterministic row key from primary key values
-// For composite keys: sorts PK columns by name, then hashes concatenated values
-// This ensures all nodes generate the same row key for the same row
+// GenerateRowKey generates a deterministic row key from primary key values.
+// This is used by the AST-based path where values may be JSON-encoded.
+// Delegates to filter.SerializeRowKey after extracting JSON values.
 func GenerateRowKey(schema *TableSchema, values map[string][]byte) (string, error) {
 	if len(schema.PrimaryKeys) == 0 {
 		return "", fmt.Errorf("no primary keys defined for table %s", schema.TableName)
 	}
 
-	// For single-column PK, use the value directly (after JSON unmarshal)
-	if len(schema.PrimaryKeys) == 1 {
-		pkCol := schema.PrimaryKeys[0]
-		pkValue, ok := values[pkCol]
-		if !ok {
-			return "", fmt.Errorf("primary key column %s not found in values", pkCol)
+	// Extract JSON values and convert to raw bytes for serialization
+	processedValues := make(map[string][]byte, len(values))
+	for col, val := range values {
+		if val == nil {
+			continue
 		}
-
-		// Unmarshal JSON to get actual value
-		var val string
-		if err := json.Unmarshal(pkValue, &val); err != nil {
-			// If not JSON, use raw bytes
-			val = string(pkValue)
-		}
-
-		return val, nil
+		// Extract string from potentially JSON-encoded value
+		processedValues[col] = []byte(extractStringValue(val))
 	}
 
-	// For composite keys: sort PK columns by name for determinism
-	sortedPKs := make([]string, len(schema.PrimaryKeys))
-	copy(sortedPKs, schema.PrimaryKeys)
-	sort.Strings(sortedPKs)
+	return filter.SerializeRowKey(schema.TableName, schema.PrimaryKeys, processedValues), nil
+}
 
-	// Build composite key: concatenate sorted PK values
-	var keyBuilder strings.Builder
-	for i, pkCol := range sortedPKs {
-		pkValue, ok := values[pkCol]
-		if !ok {
-			return "", fmt.Errorf("primary key column %s not found in values", pkCol)
-		}
-
-		// Unmarshal JSON to get actual value
-		var val string
-		if err := json.Unmarshal(pkValue, &val); err != nil {
-			// If not JSON, use raw bytes as hex
-			val = hex.EncodeToString(pkValue)
-		}
-
-		if i > 0 {
-			keyBuilder.WriteString(":")
-		}
-		keyBuilder.WriteString(val)
+// extractStringValue extracts a string from a byte slice, handling JSON encoding
+func extractStringValue(pkValue []byte) string {
+	// Try to unmarshal as JSON string first
+	var val string
+	if err := json.Unmarshal(pkValue, &val); err != nil {
+		// If not JSON, use raw bytes as string
+		val = string(pkValue)
 	}
-
-	compositeKey := keyBuilder.String()
-
-	// Hash the composite key for consistent length and format
-	hash := sha256.Sum256([]byte(compositeKey))
-	return hex.EncodeToString(hash[:]), nil
+	return val
 }
 
 // ValidateRowKey validates that a row key matches expected schema version

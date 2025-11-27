@@ -50,6 +50,18 @@ type Transaction struct {
 	ReadConsistency       protocol.ConsistencyLevel
 	Database              string // Target database name
 	RequiredSchemaVersion uint64 // Minimum schema version required to execute this transaction
+	// MutationGuards holds per-table Bloom filters for multi-row mutations
+	// Key is table name, value is serialized filter + expected row count
+	MutationGuards map[string]*MutationGuard
+	// LocalExecutionDone indicates that local execution was already performed
+	// (e.g., via ExecuteLocalWithHooks). Skip local replication in WriteTransaction.
+	LocalExecutionDone bool
+}
+
+// MutationGuard contains filter data for conflict detection
+type MutationGuard struct {
+	Filter           []byte // Serialized Bloom filter (0.0001% FP, XXH64)
+	ExpectedRowCount int64
 }
 
 // ReplicationRequest is sent to replica nodes
@@ -64,6 +76,8 @@ type ReplicationRequest struct {
 	Database string
 	// Minimum schema version required to execute this transaction
 	RequiredSchemaVersion uint64
+	// MutationGuards for conflict detection (MutationGuard protocol)
+	MutationGuards map[string]*MutationGuard
 }
 
 // ReplicationPhase indicates which phase of 2PC
@@ -108,10 +122,8 @@ func NewWriteCoordinator(nodeID uint64, nodeProvider NodeProvider, replicator Re
 // - Background replication continues to stragglers
 // - Dead nodes catch up via snapshot + delta logs when they rejoin
 func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transaction) error {
-	log.Debug().
-		Uint64("node_id", wc.nodeID).
+	log.Trace().
 		Uint64("txn_id", txn.ID).
-		Str("database", txn.Database).
 		Int("stmt_count", len(txn.Statements)).
 		Msg("2PC: WriteTransaction started")
 
@@ -126,11 +138,9 @@ func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transacti
 		return fmt.Errorf("no alive nodes in cluster")
 	}
 
-	log.Debug().
-		Uint64("node_id", wc.nodeID).
+	log.Trace().
 		Uint64("txn_id", txn.ID).
 		Int("cluster_size", clusterSize).
-		Interface("alive_nodes", allNodes).
 		Msg("2PC: Cluster state")
 
 	// Validate consistency level against cluster size
@@ -153,7 +163,7 @@ func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transacti
 	// ====================
 	// PHASE 1: PREPARE (Create Write Intents)
 	// ====================
-	// Broadcast to ALL nodes (self + others)
+	// Broadcast to ALL nodes (self + others, unless local execution already done)
 	// Wait for QUORUM acknowledgments (includes self)
 
 	prepReq := &ReplicationRequest{
@@ -164,6 +174,7 @@ func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transacti
 		Phase:                 PhasePrep,
 		Database:              txn.Database,
 		RequiredSchemaVersion: txn.RequiredSchemaVersion,
+		MutationGuards:        txn.MutationGuards,
 	}
 
 	// Replicate to other nodes
@@ -173,7 +184,16 @@ func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transacti
 		resp   *ReplicationResponse
 		err    error
 	}
-	respChan := make(chan response, len(otherNodes)+1) // +1 for local
+
+	// Determine if we need to replicate to self
+	// If LocalExecutionDone is true, skip local replication - pendingExec will handle commit
+	skipLocalReplication := txn.LocalExecutionDone
+	totalNodes := len(otherNodes)
+	if !skipLocalReplication {
+		totalNodes++ // Include self
+	}
+
+	respChan := make(chan response, totalNodes)
 
 	// Send to other nodes
 	for _, nodeID := range otherNodes {
@@ -183,15 +203,21 @@ func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transacti
 		}(nodeID)
 	}
 
-	// Send to self (local)
-	go func() {
-		resp, err := wc.localReplicator.ReplicateTransaction(ctx, wc.nodeID, prepReq)
-		respChan <- response{nodeID: wc.nodeID, resp: resp, err: err}
-	}()
+	// Send to self (local) only if local execution not already done
+	if !skipLocalReplication {
+		go func() {
+			resp, err := wc.localReplicator.ReplicateTransaction(ctx, wc.nodeID, prepReq)
+			respChan <- response{nodeID: wc.nodeID, resp: resp, err: err}
+		}()
+	}
 
 	// Collect responses from all nodes before proceeding to commit phase
 	prepResponses := make(map[uint64]*ReplicationResponse)
-	totalNodes := len(otherNodes) + 1
+
+	// If local execution already done, count self as an ACK
+	if skipLocalReplication {
+		prepResponses[wc.nodeID] = &ReplicationResponse{Success: true}
+	}
 
 	// Wait for all nodes to respond to ensure consistent commit phase
 	// Note: Early exit optimization was removed because it caused nodes that responded
@@ -256,7 +282,7 @@ func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transacti
 	// PHASE 2: COMMIT
 	// ====================
 	// Quorum of write intents created successfully with no conflicts
-	// Commit to quorum nodes (including self) and return success
+	// Commit to quorum nodes (excluding self if local execution done) and return success
 	// Background replication continues to remaining nodes via anti-entropy
 	commitReq := &ReplicationRequest{
 		TxnID:    txn.ID,
@@ -266,9 +292,21 @@ func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transacti
 		Database: txn.Database,
 	}
 
-	// Send commit to all prepared nodes (including self)
-	commitChan := make(chan response, len(prepResponses))
+	// Count nodes to commit (exclude self if local execution already done)
+	commitNodes := 0
 	for nodeID := range prepResponses {
+		if nodeID != wc.nodeID || !skipLocalReplication {
+			commitNodes++
+		}
+	}
+
+	// Send commit to all prepared nodes (excluding self if local execution done)
+	commitChan := make(chan response, commitNodes)
+	for nodeID := range prepResponses {
+		// Skip local commit if local execution already done - pendingExec.Commit() handles it
+		if nodeID == wc.nodeID && skipLocalReplication {
+			continue
+		}
 		go func(nid uint64) {
 			var resp *ReplicationResponse
 			var err error
@@ -283,7 +321,13 @@ func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transacti
 
 	// Wait for QUORUM commits only (not all prepared nodes)
 	commitResponses := make(map[uint64]*ReplicationResponse)
-	for i := 0; i < len(prepResponses); i++ {
+
+	// If local execution done, count self as committed (will be committed by pendingExec.Commit())
+	if skipLocalReplication {
+		commitResponses[wc.nodeID] = &ReplicationResponse{Success: true}
+	}
+
+	for i := 0; i < commitNodes; i++ {
 		select {
 		case r := <-commitChan:
 			if r.err == nil && r.resp != nil && r.resp.Success {
@@ -321,16 +365,6 @@ commitQuorumAchieved:
 		return fmt.Errorf("commit quorum degraded: got %d acks, expected %d (PARTIAL COMMIT - will be repaired by anti-entropy)",
 			totalCommitAcks, requiredQuorum)
 	}
-
-	// Success! Transaction committed on quorum of nodes
-	// Coordinator returns success to client
-	// Background: Stragglers will catch up via anti-entropy
-	log.Debug().
-		Uint64("node_id", wc.nodeID).
-		Uint64("txn_id", txn.ID).
-		Int("commit_acks", totalCommitAcks).
-		Int("required_quorum", requiredQuorum).
-		Msg("2PC: Transaction committed successfully")
 
 	return nil
 }

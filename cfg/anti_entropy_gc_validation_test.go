@@ -136,6 +136,7 @@ func TestValidate_AntiEntropyGCAlignment(t *testing.T) {
 					PrepareTimeoutMS: 2000,
 					CommitTimeoutMS:  2000,
 					AbortTimeoutMS:   2000,
+					IntentTTLMS:      30000,
 				},
 			}
 

@@ -70,6 +70,10 @@ func (tdm *TestDatabaseManager) GetDatabaseConnection(name string) (*sql.DB, err
 	return tdm.db.GetDB(), nil
 }
 
+func (tdm *TestDatabaseManager) GetMVCCDatabase(name string) (coordinator.MVCCDatabaseProvider, error) {
+	return tdm.db, nil
+}
+
 func TestMySQLServerIntegration(t *testing.T) {
 	// Setup temporary DB
 	dbPath := "file::memory:?cache=shared"
@@ -78,7 +82,7 @@ func TestMySQLServerIntegration(t *testing.T) {
 	// defer os.Remove(dbPath)
 
 	clock := hlc.NewClock(1)
-	mvccDB, err := db.NewMVCCDatabase(dbPath, 1, clock)
+	mvccDB, err := db.NewMVCCDatabase(dbPath, 1, clock, "/tmp")
 	require.NoError(t, err)
 	defer mvccDB.Close()
 

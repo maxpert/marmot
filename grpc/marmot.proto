@@ -104,6 +104,17 @@ message TransactionRequest {
   ConsistencyLevel consistency = 6;
   // Target database name
   string database = 7;
+  // MutationGuard: table_name -> guard metadata (for multi-row mutations)
+  map<string, MutationGuard> mutation_guards = 8;
+}
+
+// Per-table mutation guard metadata for conflict detection
+// Used for multi-row mutations and range queries
+message MutationGuard {
+  // Bloom filter serialized bytes (0.0001% FP rate, XXH64)
+  bytes filter = 1;
+  // Number of rows expected for this table
+  int64 expected_row_count = 2;
 }
 
 enum TransactionPhase {

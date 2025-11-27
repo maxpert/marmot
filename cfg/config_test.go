@@ -48,6 +48,7 @@ func TestValidate_ValidConfig(t *testing.T) {
 			PrepareTimeoutMS: 2000,
 			CommitTimeoutMS:  2000,
 			AbortTimeoutMS:   2000,
+			IntentTTLMS:      30000,
 		},
 	}
 
@@ -437,6 +438,7 @@ func TestReplicaConfigValidation_ValidConfig(t *testing.T) {
 			PrepareTimeoutMS: 2000,
 			CommitTimeoutMS:  2000,
 			AbortTimeoutMS:   2000,
+			IntentTTLMS:      30000,
 		},
 		Replica: ReplicaConfiguration{
 			Enabled:                true,
@@ -444,6 +446,7 @@ func TestReplicaConfigValidation_ValidConfig(t *testing.T) {
 			ReconnectIntervalSec:   5,
 			ReconnectMaxBackoffSec: 30,
 			InitialSyncTimeoutMin:  30,
+			Secret:                 "test-secret",
 		},
 	}
 

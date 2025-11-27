@@ -86,6 +86,11 @@ func (m *DDLMockDatabaseManager) GetDatabaseConnection(name string) (*sql.DB, er
 	return sqlDB, nil
 }
 
+func (m *DDLMockDatabaseManager) GetMVCCDatabase(name string) (coordinator.MVCCDatabaseProvider, error) {
+	// Return nil - DDL tests don't use MutationGuard flow
+	return nil, fmt.Errorf("not implemented in DDL mock")
+}
+
 // DDLMockReader implements coordinator.Reader for testing
 type DDLMockReader struct{}
 

@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/maxpert/marmot/coordinator"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/rs/zerolog/log"
 )
@@ -79,7 +80,7 @@ func NewDatabaseManager(dataDir string, nodeID uint64, clock *hlc.Clock) (*Datab
 func (dm *DatabaseManager) initSystemDatabase() error {
 	systemDBPath := filepath.Join(dm.dataDir, SystemDatabaseName+".db")
 
-	systemDB, err := NewMVCCDatabase(systemDBPath, dm.nodeID, dm.clock)
+	systemDB, err := NewMVCCDatabase(systemDBPath, dm.nodeID, dm.clock, dm.dataDir)
 	if err != nil {
 		return fmt.Errorf("failed to create system database: %w", err)
 	}
@@ -140,7 +141,7 @@ func (dm *DatabaseManager) loadDatabases() error {
 
 // openDatabase opens a database and adds it to the registry
 func (dm *DatabaseManager) openDatabase(name, path string) error {
-	db, err := NewMVCCDatabase(path, dm.nodeID, dm.clock)
+	db, err := NewMVCCDatabase(path, dm.nodeID, dm.clock, dm.dataDir)
 	if err != nil {
 		return fmt.Errorf("failed to open database %s: %w", name, err)
 	}
@@ -194,7 +195,7 @@ func (dm *DatabaseManager) CreateDatabase(name string) error {
 	dbPath := filepath.Join("databases", name+".db")
 	fullPath := filepath.Join(dm.dataDir, dbPath)
 
-	db, err := NewMVCCDatabase(fullPath, dm.nodeID, dm.clock)
+	db, err := NewMVCCDatabase(fullPath, dm.nodeID, dm.clock, dm.dataDir)
 	if err != nil {
 		return fmt.Errorf("failed to create database file: %w", err)
 	}
@@ -297,6 +298,11 @@ func (dm *DatabaseManager) GetDatabaseConnection(name string) (*sql.DB, error) {
 	return mvccDB.GetDB(), nil
 }
 
+// GetMVCCDatabase returns the MVCCDatabase as coordinator.MVCCDatabaseProvider
+func (dm *DatabaseManager) GetMVCCDatabase(name string) (coordinator.MVCCDatabaseProvider, error) {
+	return dm.GetDatabase(name)
+}
+
 // DatabaseExists checks if a database exists
 func (dm *DatabaseManager) DatabaseExists(name string) bool {
 	dm.mu.RLock()
@@ -381,7 +387,7 @@ func (dm *DatabaseManager) ReopenDatabase(name string) error {
 
 	// Reopen the database with the same path
 	fullPath := filepath.Join(dm.dataDir, dbPath)
-	newDB, err := NewMVCCDatabase(fullPath, dm.nodeID, dm.clock)
+	newDB, err := NewMVCCDatabase(fullPath, dm.nodeID, dm.clock, dm.dataDir)
 	if err != nil {
 		return fmt.Errorf("failed to reopen database %s: %w", name, err)
 	}
@@ -500,7 +506,7 @@ func (dm *DatabaseManager) ImportExistingDatabases(importDir string) (int, error
 		copyFile(srcPath+"-shm", dstPath+"-shm")
 
 		// Open and register the database
-		db, err := NewMVCCDatabase(dstPath, dm.nodeID, dm.clock)
+		db, err := NewMVCCDatabase(dstPath, dm.nodeID, dm.clock, dm.dataDir)
 		if err != nil {
 			log.Warn().Err(err).Str("name", dbName).Msg("Failed to open imported database")
 			os.Remove(dstPath)
