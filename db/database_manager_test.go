@@ -373,7 +373,7 @@ func TestMigrateFromLegacy(t *testing.T) {
 
 	// Create legacy database
 	legacyPath := filepath.Join(tmpDir, "old_marmot.db")
-	legacyDB, err := NewMVCCDatabase(legacyPath, 1, clock, tmpDir)
+	legacyDB, err := NewMVCCDatabase(legacyPath, 1, clock, nil)
 	if err != nil {
 		t.Fatalf("Failed to create legacy database: %v", err)
 	}

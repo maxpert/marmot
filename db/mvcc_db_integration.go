@@ -27,7 +27,7 @@ type MVCCDatabase struct {
 	replicationFn ReplicationFunc
 	commitBatcher *CommitBatcher
 	schemaCache   *SchemaCache // Shared schema cache for preupdate hooks
-	dataDir       string       // Data directory for intent logs
+	systemDB      *sql.DB      // System DB for intent entries (separate file)
 }
 
 // ReplicationFunc is called to replicate transactions to other nodes
@@ -35,7 +35,8 @@ type MVCCDatabase struct {
 type ReplicationFunc func(ctx context.Context, txn *MVCCTransaction) error
 
 // NewMVCCDatabase creates a new MVCC-enabled database
-func NewMVCCDatabase(dbPath string, nodeID uint64, clock *hlc.Clock, dataDir string) (*MVCCDatabase, error) {
+// systemDB is the system database (*sql.DB) for storing intent entries during hooks
+func NewMVCCDatabase(dbPath string, nodeID uint64, clock *hlc.Clock, systemDB *sql.DB) (*MVCCDatabase, error) {
 	// Open SQLite database with WAL mode for better concurrency
 	// WAL mode allows concurrent readers with a writer
 	dsn := dbPath
@@ -101,7 +102,7 @@ func NewMVCCDatabase(dbPath string, nodeID uint64, clock *hlc.Clock, dataDir str
 		nodeID:        nodeID,
 		commitBatcher: commitBatcher,
 		schemaCache:   NewSchemaCache(),
-		dataDir:       dataDir,
+		systemDB:      systemDB,
 	}, nil
 }
 
@@ -135,9 +136,9 @@ func (mdb *MVCCDatabase) GetSchemaCache() *SchemaCache {
 	return mdb.schemaCache
 }
 
-// GetDataDir returns the data directory for intent logs
-func (mdb *MVCCDatabase) GetDataDir() string {
-	return mdb.dataDir
+// GetSystemDB returns the system database for intent entries
+func (mdb *MVCCDatabase) GetSystemDB() *sql.DB {
+	return mdb.systemDB
 }
 
 // PendingLocalExecution represents a locally executed transaction waiting for quorum
@@ -196,12 +197,12 @@ func (p *PendingLocalExecution) Rollback() error {
 	return nil
 }
 
-// GetIntentLog returns the intent log for async streaming
-func (p *PendingLocalExecution) GetIntentLog() interface{} {
+// GetIntentEntries returns CDC entries from the system database
+func (p *PendingLocalExecution) GetIntentEntries() ([]*IntentEntry, error) {
 	if p.session == nil {
-		return nil
+		return nil, nil
 	}
-	return p.session.GetIntentLog()
+	return p.session.GetIntentEntries()
 }
 
 // FlushIntentLog fsyncs the intent log to disk.
@@ -237,7 +238,7 @@ func (mdb *MVCCDatabase) ExecuteLocalWithHooks(ctx context.Context, txnID uint64
 	}
 
 	// Create ephemeral session with dedicated connection
-	session, err := StartEphemeralSession(ctx, mdb.db, mdb.schemaCache, txnID, mdb.dataDir, tables)
+	session, err := StartEphemeralSession(ctx, mdb.db, mdb.systemDB, mdb.schemaCache, txnID, tables)
 	if err != nil {
 		return nil, fmt.Errorf("failed to start session: %w", err)
 	}

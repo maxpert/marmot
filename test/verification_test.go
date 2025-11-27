@@ -82,7 +82,7 @@ func TestMySQLServerIntegration(t *testing.T) {
 	// defer os.Remove(dbPath)
 
 	clock := hlc.NewClock(1)
-	mvccDB, err := db.NewMVCCDatabase(dbPath, 1, clock, "/tmp")
+	mvccDB, err := db.NewMVCCDatabase(dbPath, 1, clock, nil)
 	require.NoError(t, err)
 	defer mvccDB.Close()
 

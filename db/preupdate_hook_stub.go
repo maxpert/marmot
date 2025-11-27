@@ -10,7 +10,6 @@ import (
 	"sync"
 
 	"github.com/maxpert/marmot/protocol/filter"
-	"github.com/maxpert/marmot/protocol/intentlog"
 )
 
 var ErrPreupdateHookNotEnabled = errors.New("preupdate hook requires build tag: sqlite_preupdate_hook")
@@ -52,7 +51,7 @@ func (c *SchemaCache) InvalidateAll() {}
 type EphemeralHookSession struct{}
 
 // StartEphemeralSession returns an error when preupdate hook is not enabled
-func StartEphemeralSession(ctx context.Context, db *sql.DB, schemaCache *SchemaCache, txnID uint64, dataDir string, tables []string) (*EphemeralHookSession, error) {
+func StartEphemeralSession(ctx context.Context, userDB *sql.DB, systemDB *sql.DB, schemaCache *SchemaCache, txnID uint64, tables []string) (*EphemeralHookSession, error) {
 	return nil, ErrPreupdateHookNotEnabled
 }
 
@@ -91,7 +90,24 @@ func (s *EphemeralHookSession) GetRowCounts() map[string]int64 {
 	return nil
 }
 
-// GetIntentLog returns nil (stub)
-func (s *EphemeralHookSession) GetIntentLog() *intentlog.Log {
-	return nil
+// IntentEntry represents a CDC entry (stub)
+type IntentEntry struct {
+	TxnID     uint64
+	Seq       uint64
+	Operation uint8
+	Table     string
+	RowKey    string
+	OldValues map[string][]byte
+	NewValues map[string][]byte
+	CreatedAt int64
+}
+
+// GetIntentEntries returns nil (stub)
+func (s *EphemeralHookSession) GetIntentEntries() ([]*IntentEntry, error) {
+	return nil, ErrPreupdateHookNotEnabled
+}
+
+// GetTxnID returns 0 (stub)
+func (s *EphemeralHookSession) GetTxnID() uint64 {
+	return 0
 }

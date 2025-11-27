@@ -13,10 +13,17 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/mattn/go-sqlite3"
 	"github.com/maxpert/marmot/protocol/filter"
-	"github.com/maxpert/marmot/protocol/intentlog"
+)
+
+// Operation constants for intent entries
+const (
+	OpInsertInt uint8 = 0
+	OpUpdateInt uint8 = 1
+	OpDeleteInt uint8 = 2
 )
 
 // SchemaCache provides thread-safe caching of table schemas.
@@ -114,10 +121,13 @@ func loadSchema(conn *sqlite3.SQLiteConn, tableName string) (*tableSchema, error
 
 // EphemeralHookSession represents a CDC capture session with its own dedicated connection.
 // The connection is held open for the duration of the session and closed on Commit/Rollback.
+// CDC entries are stored in the system database's __marmot__intent_entries table.
 type EphemeralHookSession struct {
-	conn        *sql.Conn                             // Dedicated DB connection (closed on end)
-	tx          *sql.Tx                               // Active transaction
-	log         *intentlog.Log                        // Intent log for this session
+	conn        *sql.Conn                             // Dedicated user DB connection (closed on end)
+	tx          *sql.Tx                               // Active transaction on user DB
+	systemDB    *sql.DB                               // System DB for intent entry storage
+	txnID       uint64                                // Transaction ID for intent entries
+	seq         uint64                                // Sequence counter for entries
 	builders    map[string]*filter.BloomFilterBuilder // table -> builder
 	schemaCache *SchemaCache                          // Shared schema cache
 	mu          sync.Mutex
@@ -125,23 +135,19 @@ type EphemeralHookSession struct {
 
 // StartEphemeralSession creates a new CDC capture session with a dedicated connection.
 // The session owns the connection and will close it when done.
-func StartEphemeralSession(ctx context.Context, db *sql.DB, schemaCache *SchemaCache, txnID uint64, dataDir string, tables []string) (*EphemeralHookSession, error) {
+// CDC entries are written to the system database (separate file) during hooks.
+func StartEphemeralSession(ctx context.Context, userDB *sql.DB, systemDB *sql.DB, schemaCache *SchemaCache, txnID uint64, tables []string) (*EphemeralHookSession, error) {
 	// Get a dedicated connection for this session
-	conn, err := db.Conn(ctx)
+	conn, err := userDB.Conn(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get connection: %w", err)
 	}
 
-	// Create intent log
-	log, err := intentlog.New(txnID, dataDir)
-	if err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("create intent log: %w", err)
-	}
-
 	session := &EphemeralHookSession{
 		conn:        conn,
-		log:         log,
+		systemDB:    systemDB,
+		txnID:       txnID,
+		seq:         0,
 		builders:    make(map[string]*filter.BloomFilterBuilder),
 		schemaCache: schemaCache,
 	}
@@ -169,7 +175,6 @@ func StartEphemeralSession(ctx context.Context, db *sql.DB, schemaCache *SchemaC
 		return nil
 	})
 	if err != nil {
-		log.Delete()
 		conn.Close()
 		return nil, err
 	}
@@ -209,12 +214,8 @@ func (s *EphemeralHookSession) Commit() error {
 	// Unregister hook and close connection
 	s.cleanup()
 
-	// Close intent log (no fsync - already flushed if needed for multi-row)
-	// Then delete the log file - it's no longer needed after commit
-	if s.log != nil {
-		s.log.Close()
-		s.log.Delete()
-	}
+	// Delete intent entries from system DB (fast indexed delete)
+	s.systemDB.Exec("DELETE FROM __marmot__intent_entries WHERE txn_id = ?", s.txnID)
 
 	return txErr
 }
@@ -232,25 +233,16 @@ func (s *EphemeralHookSession) Rollback() error {
 	// Unregister hook and close connection
 	s.cleanup()
 
-	// Close and delete intent log on rollback
-	if s.log != nil {
-		s.log.Close()
-		s.log.Delete()
-	}
+	// Delete intent entries from system DB
+	s.systemDB.Exec("DELETE FROM __marmot__intent_entries WHERE txn_id = ?", s.txnID)
 
 	return txErr
 }
 
-// FlushIntentLog fsyncs the intent log to disk.
-// Call this ONLY for multi-row operations before starting 2PC.
-// Single-row operations skip fsync for performance.
+// FlushIntentLog is a no-op for SQLite-based storage.
+// SQLite WAL mode handles durability automatically.
+// Kept for API compatibility.
 func (s *EphemeralHookSession) FlushIntentLog() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.log != nil {
-		return s.log.Flush()
-	}
 	return nil
 }
 
@@ -299,60 +291,82 @@ func (s *EphemeralHookSession) hookCallback(data sqlite3.SQLitePreUpdateData) {
 		newDest[i] = new(interface{})
 	}
 
-	entry := &intentlog.Entry{
-		Table: data.TableName,
-	}
+	var operation uint8
+	var oldValues, newValues map[string][]byte
+	var rowKey string
 
-	// Determine operation type
+	// Determine operation type and capture values
 	switch data.Op {
 	case sqlite3.SQLITE_INSERT:
-		entry.Operation = intentlog.OpInsert
+		operation = OpInsertInt
 		if err := data.New(newDest...); err == nil {
-			entry.NewValues = s.buildValueMap(schema.columns, newDest)
+			newValues = s.buildValueMap(schema.columns, newDest)
 		}
+		pkValues := s.extractPKValuesFromDest(schema, newDest, data.NewRowID)
+		rowKey = s.serializePK(data.TableName, schema, pkValues)
+
 	case sqlite3.SQLITE_UPDATE:
-		entry.Operation = intentlog.OpUpdate
+		operation = OpUpdateInt
 		if err := data.Old(oldDest...); err == nil {
-			entry.OldValues = s.buildValueMap(schema.columns, oldDest)
+			oldValues = s.buildValueMap(schema.columns, oldDest)
 		}
 		if err := data.New(newDest...); err == nil {
-			entry.NewValues = s.buildValueMap(schema.columns, newDest)
+			newValues = s.buildValueMap(schema.columns, newDest)
 		}
-	case sqlite3.SQLITE_DELETE:
-		entry.Operation = intentlog.OpDelete
-		if err := data.Old(oldDest...); err == nil {
-			entry.OldValues = s.buildValueMap(schema.columns, oldDest)
-		}
-	default:
-		return
-	}
-
-	// Ensure builder exists for this table
-	if _, ok := s.builders[data.TableName]; !ok {
-		s.builders[data.TableName] = filter.NewBloomFilterBuilder()
-	}
-
-	// Build row key from primary key values
-	if data.Op == sqlite3.SQLITE_UPDATE {
 		// Track both old and new PK for updates
 		oldPK := s.extractPKValuesFromDest(schema, oldDest, data.OldRowID)
 		newPK := s.extractPKValuesFromDest(schema, newDest, data.NewRowID)
 		oldKey := s.serializePK(data.TableName, schema, oldPK)
 		newKey := s.serializePK(data.TableName, schema, newPK)
+		rowKey = newKey
 
-		entry.RowKey = newKey
+		// Ensure builder exists for this table
+		if _, ok := s.builders[data.TableName]; !ok {
+			s.builders[data.TableName] = filter.NewBloomFilterBuilder()
+		}
 		s.builders[data.TableName].AddRowKey(oldKey)
 		if oldKey != newKey {
 			s.builders[data.TableName].AddRowKey(newKey)
 		}
-	} else {
-		pkValues := s.extractPKValues(schema, oldDest, newDest, data.Op, data.OldRowID, data.NewRowID)
-		entry.RowKey = s.serializePK(data.TableName, schema, pkValues)
-		s.builders[data.TableName].AddRowKey(entry.RowKey)
+
+	case sqlite3.SQLITE_DELETE:
+		operation = OpDeleteInt
+		if err := data.Old(oldDest...); err == nil {
+			oldValues = s.buildValueMap(schema.columns, oldDest)
+		}
+		pkValues := s.extractPKValuesFromDest(schema, oldDest, data.OldRowID)
+		rowKey = s.serializePK(data.TableName, schema, pkValues)
+
+	default:
+		return
 	}
 
-	// Append to intent log
-	s.log.Append(entry)
+	// Ensure builder exists for this table (for non-UPDATE operations)
+	if data.Op != sqlite3.SQLITE_UPDATE {
+		if _, ok := s.builders[data.TableName]; !ok {
+			s.builders[data.TableName] = filter.NewBloomFilterBuilder()
+		}
+		s.builders[data.TableName].AddRowKey(rowKey)
+	}
+
+	// Serialize values to JSON
+	var oldJSON, newJSON []byte
+	if oldValues != nil {
+		oldJSON, _ = json.Marshal(oldValues)
+	}
+	if newValues != nil {
+		newJSON, _ = json.Marshal(newValues)
+	}
+
+	// Increment sequence
+	s.seq++
+
+	// Write to system DB (separate database file, so this is safe during hook)
+	s.systemDB.Exec(`
+		INSERT INTO __marmot__intent_entries
+		(txn_id, seq, operation, table_name, row_key, old_values, new_values, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	`, s.txnID, s.seq, operation, data.TableName, rowKey, oldJSON, newJSON, time.Now().UnixNano())
 }
 
 // buildValueMap converts column values to a map
@@ -423,14 +437,6 @@ func (s *EphemeralHookSession) extractPKValuesFromDest(schema *tableSchema, dest
 	return pkValues
 }
 
-// extractPKValues extracts primary key values based on operation type
-func (s *EphemeralHookSession) extractPKValues(schema *tableSchema, oldDest, newDest []interface{}, op int, oldRowID, newRowID int64) map[string][]byte {
-	if op == sqlite3.SQLITE_DELETE {
-		return s.extractPKValuesFromDest(schema, oldDest, oldRowID)
-	}
-	return s.extractPKValuesFromDest(schema, newDest, newRowID)
-}
-
 // serializePK creates a deterministic string key from PK values
 func (s *EphemeralHookSession) serializePK(table string, schema *tableSchema, pkValues map[string][]byte) string {
 	return filter.SerializeRowKey(table, schema.pkColumns, pkValues)
@@ -460,7 +466,51 @@ func (s *EphemeralHookSession) GetRowCounts() map[string]int64 {
 	return counts
 }
 
-// GetIntentLog returns the intent log for streaming
-func (s *EphemeralHookSession) GetIntentLog() *intentlog.Log {
-	return s.log
+// IntentEntry represents a CDC entry stored in the system database
+type IntentEntry struct {
+	TxnID     uint64
+	Seq       uint64
+	Operation uint8
+	Table     string
+	RowKey    string
+	OldValues map[string][]byte
+	NewValues map[string][]byte
+	CreatedAt int64
+}
+
+// GetIntentEntries reads all intent entries for this session from the system DB
+func (s *EphemeralHookSession) GetIntentEntries() ([]*IntentEntry, error) {
+	rows, err := s.systemDB.Query(`
+		SELECT txn_id, seq, operation, table_name, row_key, old_values, new_values, created_at
+		FROM __marmot__intent_entries
+		WHERE txn_id = ?
+		ORDER BY seq
+	`, s.txnID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var entries []*IntentEntry
+	for rows.Next() {
+		entry := &IntentEntry{}
+		var oldJSON, newJSON []byte
+		if err := rows.Scan(&entry.TxnID, &entry.Seq, &entry.Operation, &entry.Table,
+			&entry.RowKey, &oldJSON, &newJSON, &entry.CreatedAt); err != nil {
+			return nil, err
+		}
+		if oldJSON != nil {
+			json.Unmarshal(oldJSON, &entry.OldValues)
+		}
+		if newJSON != nil {
+			json.Unmarshal(newJSON, &entry.NewValues)
+		}
+		entries = append(entries, entry)
+	}
+	return entries, rows.Err()
+}
+
+// GetTxnID returns the transaction ID for this session
+func (s *EphemeralHookSession) GetTxnID() uint64 {
+	return s.txnID
 }
