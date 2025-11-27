@@ -17,7 +17,7 @@ func TestMVCCDatabase_Creation(t *testing.T) {
 	defer os.Remove(dbPath)
 
 	clock := hlc.NewClock(1)
-	mdb, err := NewMVCCDatabase(dbPath, 1, clock)
+	mdb, err := NewMVCCDatabase(dbPath, 1, clock, nil)
 	if err != nil {
 		t.Fatalf("Failed to create MVCC database: %v", err)
 	}
@@ -48,7 +48,7 @@ func TestMVCCDatabase_SimpleTransaction(t *testing.T) {
 	defer os.Remove(dbPath)
 
 	clock := hlc.NewClock(1)
-	mdb, err := NewMVCCDatabase(dbPath, 1, clock)
+	mdb, err := NewMVCCDatabase(dbPath, 1, clock, nil)
 	if err != nil {
 		t.Fatalf("Failed to create MVCC database: %v", err)
 	}
@@ -100,7 +100,7 @@ func TestMVCCDatabase_ConflictDetection(t *testing.T) {
 	defer os.Remove(dbPath)
 
 	clock := hlc.NewClock(1)
-	mdb, err := NewMVCCDatabase(dbPath, 1, clock)
+	mdb, err := NewMVCCDatabase(dbPath, 1, clock, nil)
 	if err != nil {
 		t.Fatalf("Failed to create MVCC database: %v", err)
 	}
@@ -169,7 +169,7 @@ func TestMVCCDatabase_Query(t *testing.T) {
 	defer os.Remove(dbPath)
 
 	clock := hlc.NewClock(1)
-	mdb, err := NewMVCCDatabase(dbPath, 1, clock)
+	mdb, err := NewMVCCDatabase(dbPath, 1, clock, nil)
 	if err != nil {
 		t.Fatalf("Failed to create MVCC database: %v", err)
 	}
@@ -223,7 +223,7 @@ func TestMVCCDatabase_GetTransaction(t *testing.T) {
 	defer os.Remove(dbPath)
 
 	clock := hlc.NewClock(1)
-	mdb, err := NewMVCCDatabase(dbPath, 1, clock)
+	mdb, err := NewMVCCDatabase(dbPath, 1, clock, nil)
 	if err != nil {
 		t.Fatalf("Failed to create MVCC database: %v", err)
 	}
@@ -265,7 +265,7 @@ func TestMVCCDatabase_ConcurrentReads(t *testing.T) {
 	defer os.Remove(dbPath)
 
 	clock := hlc.NewClock(1)
-	mdb, err := NewMVCCDatabase(dbPath, 1, clock)
+	mdb, err := NewMVCCDatabase(dbPath, 1, clock, nil)
 	if err != nil {
 		t.Fatalf("Failed to create MVCC database: %v", err)
 	}
@@ -324,7 +324,7 @@ func TestMVCCDatabase_TransactionLifecycle(t *testing.T) {
 	defer os.Remove(dbPath)
 
 	clock := hlc.NewClock(1)
-	mdb, err := NewMVCCDatabase(dbPath, 1, clock)
+	mdb, err := NewMVCCDatabase(dbPath, 1, clock, nil)
 	if err != nil {
 		t.Fatalf("Failed to create MVCC database: %v", err)
 	}

@@ -59,6 +59,8 @@ retry_backoff_ms = 100
 prepare_timeout_ms = 2000
 commit_timeout_ms = 2000
 abort_timeout_ms = 2000
+intent_ttl_ms = 60000      # MutationGuard TTL (60 seconds)
+max_guard_rows = 65536     # Max rows for hash list guards (64K)
 
 [query_pipeline]
 transpiler_cache_size = 10000       # LRU cache for MySQL→SQLite transpilation (default: 10000)

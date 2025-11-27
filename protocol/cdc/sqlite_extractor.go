@@ -9,6 +9,7 @@ import (
 
 // ExtractRowDataFromSQLite extracts row-level data from a SQLite AST for CDC replication
 // This is the SQLite equivalent of ExtractRowData which uses Vitess AST
+// NOTE: For multi-row INSERTs, this only returns the FIRST row. Use ExtractAllRowDataFromSQLite instead.
 func ExtractRowDataFromSQLite(ast rqlitesql.Statement) (*RowData, error) {
 	if ast == nil {
 		return nil, fmt.Errorf("nil AST")
@@ -24,6 +25,83 @@ func ExtractRowDataFromSQLite(ast rqlitesql.Statement) (*RowData, error) {
 	default:
 		return nil, fmt.Errorf("unsupported statement type for CDC: %T", stmt)
 	}
+}
+
+// ExtractAllRowDataFromSQLite extracts ALL rows from a SQLite AST for CDC replication
+// For INSERT statements with multiple rows (VALUES (...), (...)), returns one RowData per row
+// For UPDATE/DELETE, returns a single-element slice (same as ExtractRowDataFromSQLite)
+func ExtractAllRowDataFromSQLite(ast rqlitesql.Statement) ([]*RowData, error) {
+	if ast == nil {
+		return nil, fmt.Errorf("nil AST")
+	}
+
+	switch stmt := ast.(type) {
+	case *rqlitesql.InsertStatement:
+		return extractAllFromSQLiteInsert(stmt)
+	case *rqlitesql.UpdateStatement:
+		rowData, err := extractFromSQLiteUpdate(stmt)
+		if err != nil {
+			return nil, err
+		}
+		return []*RowData{rowData}, nil
+	case *rqlitesql.DeleteStatement:
+		rowData, err := extractFromSQLiteDelete(stmt)
+		if err != nil {
+			return nil, err
+		}
+		return []*RowData{rowData}, nil
+	default:
+		return nil, fmt.Errorf("unsupported statement type for CDC: %T", stmt)
+	}
+}
+
+// extractAllFromSQLiteInsert extracts ALL rows from a multi-row SQLite INSERT statement
+func extractAllFromSQLiteInsert(stmt *rqlitesql.InsertStatement) ([]*RowData, error) {
+	// Get column names
+	columns := make([]string, 0, len(stmt.Columns))
+	for _, col := range stmt.Columns {
+		columns = append(columns, rqlitesql.IdentName(col))
+	}
+
+	if len(columns) == 0 {
+		return nil, fmt.Errorf("INSERT must have explicit column list for CDC")
+	}
+
+	// Check for INSERT ... SELECT (not supported for CDC)
+	if stmt.Select != nil {
+		return nil, fmt.Errorf("INSERT ... SELECT not supported for CDC")
+	}
+
+	if len(stmt.ValueLists) == 0 {
+		return nil, fmt.Errorf("INSERT must have VALUES clause for CDC")
+	}
+
+	// Extract each row
+	result := make([]*RowData, 0, len(stmt.ValueLists))
+	for rowIdx, valueList := range stmt.ValueLists {
+		if len(valueList.Exprs) != len(columns) {
+			return nil, fmt.Errorf("column count mismatch in row %d: %d columns, %d values", rowIdx, len(columns), len(valueList.Exprs))
+		}
+
+		newValues := make(map[string][]byte)
+		for i, col := range columns {
+			value, err := extractSQLiteExprValue(valueList.Exprs[i])
+			if err != nil {
+				return nil, fmt.Errorf("failed to extract value for column %s in row %d: %w", col, rowIdx, err)
+			}
+
+			valueBytes, err := serializeValue(value)
+			if err != nil {
+				return nil, fmt.Errorf("failed to serialize value for column %s in row %d: %w", col, rowIdx, err)
+			}
+
+			newValues[col] = valueBytes
+		}
+
+		result = append(result, &RowData{NewValues: newValues})
+	}
+
+	return result, nil
 }
 
 // extractFromSQLiteInsert extracts row data from SQLite INSERT statement

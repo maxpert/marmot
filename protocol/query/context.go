@@ -84,6 +84,12 @@ type InformationSchemaFilter struct {
 	ColumnName string // From COLUMN_NAME = 'x'
 }
 
+// CDCRow represents a single row's CDC data for multi-row INSERT support
+type CDCRow struct {
+	OldValues map[string][]byte // Before image (for UPDATE/DELETE)
+	NewValues map[string][]byte // After image (for INSERT/UPDATE/REPLACE)
+}
+
 type QueryContext struct {
 	OriginalSQL string
 	Parameters  []interface{}
@@ -113,6 +119,11 @@ type QueryContext struct {
 	CDCRowKey    string
 	CDCOldValues map[string][]byte
 	CDCNewValues map[string][]byte
+
+	// CDCRows holds ALL rows from multi-row INSERT statements
+	// For single-row DML or UPDATE/DELETE, this contains one element
+	// The coordinator expands multi-row INSERTs into multiple statements
+	CDCRows []*CDCRow
 
 	// InformationSchema filter values extracted from WHERE clause (for INFORMATION_SCHEMA queries)
 	ISFilter InformationSchemaFilter

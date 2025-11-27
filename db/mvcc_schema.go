@@ -150,6 +150,25 @@ const (
 		txn_id INTEGER  -- Transaction ID that holds the lock
 	);
 	`
+
+	// CreateIntentEntriesTable stores CDC entries captured during preupdate_hook
+	// This replaces the file-based intent log with SQLite-based storage
+	// Stored in system database (__marmot_system.db) to allow writes during hooks
+	CreateIntentEntriesTable = `
+	CREATE TABLE IF NOT EXISTS __marmot__intent_entries (
+		txn_id INTEGER NOT NULL,
+		seq INTEGER NOT NULL,
+		operation INTEGER NOT NULL,  -- 0=INSERT, 1=UPDATE, 2=DELETE
+		table_name TEXT NOT NULL,
+		row_key TEXT NOT NULL,
+		old_values BLOB,  -- JSON, NULL for INSERT
+		new_values BLOB,  -- JSON, NULL for DELETE
+		created_at INTEGER NOT NULL,
+		PRIMARY KEY (txn_id, seq)
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_intent_entries_txn ON __marmot__intent_entries(txn_id);
+	`
 )
 
 // Transaction status constants

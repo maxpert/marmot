@@ -144,6 +144,8 @@ retry_backoff_ms = 100
 prepare_timeout_ms = 2000
 commit_timeout_ms = 2000
 abort_timeout_ms = 2000
+intent_ttl_ms = 60000
+max_guard_rows = 65536
 
 [cluster]
 grpc_bind_address = "0.0.0.0"

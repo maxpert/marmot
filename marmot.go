@@ -188,10 +188,20 @@ func main() {
 
 	// Phase 5: Wire up replication handlers
 	log.Info().Msg("Wiring up replication handlers")
+
+	// Create guard registry for MutationGuard conflict detection
+	intentTTL := 30 * time.Second // Default intent TTL
+	if cfg.Config.Coordinator.IntentTTLMS > 0 {
+		intentTTL = time.Duration(cfg.Config.Coordinator.IntentTTLMS) * time.Millisecond
+	}
+	guardRegistry := marmotgrpc.NewGuardRegistry(intentTTL)
+	defer guardRegistry.Stop()
+
 	replicationHandler := marmotgrpc.NewReplicationHandler(
 		cfg.Config.NodeID,
 		dbMgr,
 		clock,
+		guardRegistry,
 	)
 	grpcServer.SetReplicationHandler(replicationHandler)
 	grpcServer.SetDatabaseManager(dbMgr)

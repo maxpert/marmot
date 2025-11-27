@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/maxpert/marmot/coordinator"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/rs/zerolog/log"
 )
@@ -79,7 +80,7 @@ func NewDatabaseManager(dataDir string, nodeID uint64, clock *hlc.Clock) (*Datab
 func (dm *DatabaseManager) initSystemDatabase() error {
 	systemDBPath := filepath.Join(dm.dataDir, SystemDatabaseName+".db")
 
-	systemDB, err := NewMVCCDatabase(systemDBPath, dm.nodeID, dm.clock)
+	systemDB, err := NewMVCCDatabase(systemDBPath, dm.nodeID, dm.clock, nil)
 	if err != nil {
 		return fmt.Errorf("failed to create system database: %w", err)
 	}
@@ -103,6 +104,15 @@ func (dm *DatabaseManager) initSystemDatabase() error {
 	if err != nil {
 		return fmt.Errorf("failed to create database registry table: %w", err)
 	}
+
+	// Create intent entries table for CDC capture during preupdate hooks
+	_, err = systemDB.GetDB().Exec(CreateIntentEntriesTable)
+	if err != nil {
+		return fmt.Errorf("failed to create intent entries table: %w", err)
+	}
+
+	// Cleanup any orphaned intent entries from previous crashes
+	dm.cleanupOrphanedIntents()
 
 	log.Info().Str("path", systemDBPath).Msg("System database initialized")
 	return nil
@@ -140,7 +150,7 @@ func (dm *DatabaseManager) loadDatabases() error {
 
 // openDatabase opens a database and adds it to the registry
 func (dm *DatabaseManager) openDatabase(name, path string) error {
-	db, err := NewMVCCDatabase(path, dm.nodeID, dm.clock)
+	db, err := NewMVCCDatabase(path, dm.nodeID, dm.clock, dm.systemDB.GetDB())
 	if err != nil {
 		return fmt.Errorf("failed to open database %s: %w", name, err)
 	}
@@ -194,7 +204,7 @@ func (dm *DatabaseManager) CreateDatabase(name string) error {
 	dbPath := filepath.Join("databases", name+".db")
 	fullPath := filepath.Join(dm.dataDir, dbPath)
 
-	db, err := NewMVCCDatabase(fullPath, dm.nodeID, dm.clock)
+	db, err := NewMVCCDatabase(fullPath, dm.nodeID, dm.clock, dm.systemDB.GetDB())
 	if err != nil {
 		return fmt.Errorf("failed to create database file: %w", err)
 	}
@@ -297,6 +307,11 @@ func (dm *DatabaseManager) GetDatabaseConnection(name string) (*sql.DB, error) {
 	return mvccDB.GetDB(), nil
 }
 
+// GetMVCCDatabase returns the MVCCDatabase as coordinator.MVCCDatabaseProvider
+func (dm *DatabaseManager) GetMVCCDatabase(name string) (coordinator.MVCCDatabaseProvider, error) {
+	return dm.GetDatabase(name)
+}
+
 // DatabaseExists checks if a database exists
 func (dm *DatabaseManager) DatabaseExists(name string) bool {
 	dm.mu.RLock()
@@ -381,7 +396,7 @@ func (dm *DatabaseManager) ReopenDatabase(name string) error {
 
 	// Reopen the database with the same path
 	fullPath := filepath.Join(dm.dataDir, dbPath)
-	newDB, err := NewMVCCDatabase(fullPath, dm.nodeID, dm.clock)
+	newDB, err := NewMVCCDatabase(fullPath, dm.nodeID, dm.clock, dm.systemDB.GetDB())
 	if err != nil {
 		return fmt.Errorf("failed to reopen database %s: %w", name, err)
 	}
@@ -500,7 +515,7 @@ func (dm *DatabaseManager) ImportExistingDatabases(importDir string) (int, error
 		copyFile(srcPath+"-shm", dstPath+"-shm")
 
 		// Open and register the database
-		db, err := NewMVCCDatabase(dstPath, dm.nodeID, dm.clock)
+		db, err := NewMVCCDatabase(dstPath, dm.nodeID, dm.clock, dm.systemDB.GetDB())
 		if err != nil {
 			log.Warn().Err(err).Str("name", dbName).Msg("Failed to open imported database")
 			os.Remove(dstPath)
@@ -815,4 +830,36 @@ func (dm *DatabaseManager) GetCommittedTxnCount(database string) (int64, error) 
 	`).Scan(&count)
 
 	return count, err
+}
+
+// GetSystemDB returns the system database's sql.DB for intent writes
+// This is used by EphemeralHookSession to write CDC entries during preupdate hooks
+func (dm *DatabaseManager) GetSystemDB() *sql.DB {
+	return dm.systemDB.GetDB()
+}
+
+// cleanupOrphanedIntents removes intent entries from crashed transactions
+// Called during startup to clean up any orphaned entries from previous crashes
+func (dm *DatabaseManager) cleanupOrphanedIntents() {
+	result, err := dm.systemDB.GetDB().Exec(`
+		DELETE FROM __marmot__intent_entries
+	`)
+	if err != nil {
+		log.Warn().Err(err).Msg("Failed to cleanup orphaned intent entries")
+		return
+	}
+
+	if rows, _ := result.RowsAffected(); rows > 0 {
+		log.Info().Int64("rows", rows).Msg("Cleaned up orphaned intent entries from previous crash")
+	}
+}
+
+// DeleteIntentEntries removes all intent entries for a transaction
+// Called after successful commit or rollback
+func (dm *DatabaseManager) DeleteIntentEntries(txnID uint64) error {
+	_, err := dm.systemDB.GetDB().Exec(
+		"DELETE FROM __marmot__intent_entries WHERE txn_id = ?",
+		txnID,
+	)
+	return err
 }

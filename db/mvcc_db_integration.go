@@ -11,9 +11,11 @@ import (
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/protocol"
 
-	_ "github.com/mattn/go-sqlite3"
 	rqlitesql "github.com/rqlite/sql"
 )
+
+// Ensure PendingLocalExecution implements coordinator.PendingExecution
+var _ coordinator.PendingExecution = (*PendingLocalExecution)(nil)
 
 // MVCCDatabase wraps a SQL database with MVCC transaction support
 // This is the main integration point between application layer and MVCC storage
@@ -24,6 +26,8 @@ type MVCCDatabase struct {
 	nodeID        uint64
 	replicationFn ReplicationFunc
 	commitBatcher *CommitBatcher
+	schemaCache   *SchemaCache // Shared schema cache for preupdate hooks
+	systemDB      *sql.DB      // System DB for intent entries (separate file)
 }
 
 // ReplicationFunc is called to replicate transactions to other nodes
@@ -31,7 +35,8 @@ type MVCCDatabase struct {
 type ReplicationFunc func(ctx context.Context, txn *MVCCTransaction) error
 
 // NewMVCCDatabase creates a new MVCC-enabled database
-func NewMVCCDatabase(dbPath string, nodeID uint64, clock *hlc.Clock) (*MVCCDatabase, error) {
+// systemDB is the system database (*sql.DB) for storing intent entries during hooks
+func NewMVCCDatabase(dbPath string, nodeID uint64, clock *hlc.Clock, systemDB *sql.DB) (*MVCCDatabase, error) {
 	// Open SQLite database with WAL mode for better concurrency
 	// WAL mode allows concurrent readers with a writer
 	dsn := dbPath
@@ -96,6 +101,8 @@ func NewMVCCDatabase(dbPath string, nodeID uint64, clock *hlc.Clock) (*MVCCDatab
 		clock:         clock,
 		nodeID:        nodeID,
 		commitBatcher: commitBatcher,
+		schemaCache:   NewSchemaCache(),
+		systemDB:      systemDB,
 	}, nil
 }
 
@@ -122,6 +129,135 @@ func (mdb *MVCCDatabase) GetClock() *hlc.Clock {
 // Close closes the database
 func (mdb *MVCCDatabase) Close() error {
 	return mdb.db.Close()
+}
+
+// GetSchemaCache returns the shared schema cache for preupdate hooks
+func (mdb *MVCCDatabase) GetSchemaCache() *SchemaCache {
+	return mdb.schemaCache
+}
+
+// GetSystemDB returns the system database for intent entries
+func (mdb *MVCCDatabase) GetSystemDB() *sql.DB {
+	return mdb.systemDB
+}
+
+// PendingLocalExecution represents a locally executed transaction waiting for quorum
+// The SQLite transaction is held open until Commit or Rollback is called
+type PendingLocalExecution struct {
+	session *EphemeralHookSession // Ephemeral session (owns its connection)
+	db      *MVCCDatabase
+}
+
+// GetRowCounts returns the number of affected rows per table
+func (p *PendingLocalExecution) GetRowCounts() map[string]int64 {
+	if p.session == nil {
+		return nil
+	}
+	return p.session.GetRowCounts()
+}
+
+// GetTotalRowCount returns total rows affected across all tables
+func (p *PendingLocalExecution) GetTotalRowCount() int64 {
+	counts := p.GetRowCounts()
+	var total int64
+	for _, count := range counts {
+		total += count
+	}
+	return total
+}
+
+// GetKeyHashes returns XXH64 hashes of affected row keys per table.
+// Used for MutationGuard hash list conflict detection.
+// Returns nil for tables exceeding maxRows to let MVCC handle conflicts.
+func (p *PendingLocalExecution) GetKeyHashes(maxRows int) map[string][]uint64 {
+	if p.session == nil {
+		return nil
+	}
+	return p.session.GetKeyHashes(maxRows)
+}
+
+// Commit finalizes the local transaction
+func (p *PendingLocalExecution) Commit() error {
+	if p.session != nil {
+		return p.session.Commit()
+	}
+	return nil
+}
+
+// Rollback aborts the local transaction
+func (p *PendingLocalExecution) Rollback() error {
+	if p.session != nil {
+		return p.session.Rollback()
+	}
+	return nil
+}
+
+// GetIntentEntries returns CDC entries from the system database
+func (p *PendingLocalExecution) GetIntentEntries() ([]*IntentEntry, error) {
+	if p.session == nil {
+		return nil, nil
+	}
+	return p.session.GetIntentEntries()
+}
+
+// FlushIntentLog is a no-op with SQLite-backed intent storage.
+// SQLite WAL mode handles durability automatically.
+// Kept for API compatibility.
+func (p *PendingLocalExecution) FlushIntentLog() error {
+	if p.session == nil {
+		return nil
+	}
+	return p.session.FlushIntentLog()
+}
+
+// ExecuteLocalWithHooks executes SQL locally with preupdate hooks capturing changes.
+// Returns a PendingExecution that holds the transaction open.
+// Caller MUST call Commit() or Rollback() on the result.
+//
+// This implements the coordinator flow:
+// 1. Create ephemeral session with dedicated connection
+// 2. Register hooks and preload schemas
+// 3. BEGIN TRANSACTION locally
+// 4. Execute mutation commands (hooks capture affected rows)
+// 5. Return without commit - caller decides based on quorum result
+func (mdb *MVCCDatabase) ExecuteLocalWithHooks(ctx context.Context, txnID uint64, statements []protocol.Statement) (coordinator.PendingExecution, error) {
+	// Extract table names from statements
+	tables := make([]string, 0)
+	seen := make(map[string]struct{})
+	for _, stmt := range statements {
+		if stmt.TableName != "" {
+			if _, ok := seen[stmt.TableName]; !ok {
+				tables = append(tables, stmt.TableName)
+				seen[stmt.TableName] = struct{}{}
+			}
+		}
+	}
+
+	// Create ephemeral session with dedicated connection
+	session, err := StartEphemeralSession(ctx, mdb.db, mdb.systemDB, mdb.schemaCache, txnID, tables)
+	if err != nil {
+		return nil, fmt.Errorf("failed to start session: %w", err)
+	}
+
+	// Begin transaction on the session's connection
+	if err := session.BeginTx(ctx); err != nil {
+		session.Rollback()
+		return nil, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+
+	// Execute each statement
+	for _, stmt := range statements {
+		if err := session.ExecContext(ctx, stmt.SQL); err != nil {
+			session.Rollback()
+			return nil, fmt.Errorf("failed to execute statement: %w", err)
+		}
+	}
+
+	// Return pending execution - transaction held open
+	return &PendingLocalExecution{
+		session: session,
+		db:      mdb,
+	}, nil
 }
 
 // ExecuteTransaction executes a transaction with MVCC semantics
