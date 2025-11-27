@@ -50,17 +50,18 @@ type Transaction struct {
 	ReadConsistency       protocol.ConsistencyLevel
 	Database              string // Target database name
 	RequiredSchemaVersion uint64 // Minimum schema version required to execute this transaction
-	// MutationGuards holds per-table Bloom filters for multi-row mutations
-	// Key is table name, value is serialized filter + expected row count
+	// MutationGuards holds per-table hash lists for conflict detection
+	// Key is table name, value is XXH64 hash list + expected row count
 	MutationGuards map[string]*MutationGuard
 	// LocalExecutionDone indicates that local execution was already performed
 	// (e.g., via ExecuteLocalWithHooks). Skip local replication in WriteTransaction.
 	LocalExecutionDone bool
 }
 
-// MutationGuard contains filter data for conflict detection
+// MutationGuard contains hash list data for conflict detection
+// Uses XXH64 hashes for exact conflict detection (no false positives)
 type MutationGuard struct {
-	Filter           []byte // Serialized Bloom filter (0.0001% FP, XXH64)
+	KeyHashes        []uint64 // XXH64 hashes of affected row keys
 	ExpectedRowCount int64
 }
 

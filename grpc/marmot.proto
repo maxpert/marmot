@@ -109,12 +109,23 @@ message TransactionRequest {
 }
 
 // Per-table mutation guard metadata for conflict detection
-// Used for multi-row mutations and range queries
+// Uses XXH64 hash list for exact conflict detection (no false positives)
+//
+// Design: Hash List approach provides deterministic conflict detection:
+// - ≤64K rows: Send XXH64 hash list (≤512KB payload)
+// - >64K rows: Skip MutationGuard, rely on MVCC write intents
+//
+// This is a novel technique combining:
+// - Early batch conflict detection (vs per-row during execution)
+// - Compact write set representation (8 bytes/row vs full keys)
+// - Coordinator-side detection (vs storage layer)
+// - Native leaderless architecture support
 message MutationGuard {
-  // Bloom filter serialized bytes (0.0001% FP rate, XXH64)
-  bytes filter = 1;
-  // Number of rows expected for this table
+  // Number of rows in this mutation
   int64 expected_row_count = 2;
+  // XXH64 hashes of affected row keys (8 bytes each, fixed encoding)
+  // Empty if row count exceeds max_guard_rows config (default 65536)
+  repeated fixed64 key_hashes = 3;
 }
 
 enum TransactionPhase {

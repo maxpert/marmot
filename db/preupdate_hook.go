@@ -466,6 +466,26 @@ func (s *EphemeralHookSession) GetRowCounts() map[string]int64 {
 	return counts
 }
 
+// GetKeyHashes returns XXH64 hashes of affected row keys per table.
+// Used for MutationGuard hash list conflict detection.
+// Returns nil for tables exceeding maxRows to let MVCC handle conflicts.
+func (s *EphemeralHookSession) GetKeyHashes(maxRows int) map[string][]uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	hashes := make(map[string][]uint64)
+	for table, builder := range s.builders {
+		count := builder.Count()
+		if maxRows > 0 && count > maxRows {
+			// Exceeds max - return empty slice to signal MVCC fallback
+			hashes[table] = nil
+			continue
+		}
+		hashes[table] = builder.Keys()
+	}
+	return hashes
+}
+
 // IntentEntry represents a CDC entry stored in the system database
 type IntentEntry struct {
 	TxnID     uint64

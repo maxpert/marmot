@@ -167,7 +167,7 @@ func convertMutationGuardsToProto(guards map[string]*coordinator.MutationGuard) 
 	result := make(map[string]*MutationGuard, len(guards))
 	for table, guard := range guards {
 		result[table] = &MutationGuard{
-			Filter:           guard.Filter,
+			KeyHashes:        guard.KeyHashes,
 			ExpectedRowCount: guard.ExpectedRowCount,
 		}
 	}

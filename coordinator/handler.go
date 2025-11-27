@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"time"
 
+	"github.com/maxpert/marmot/cfg"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/protocol"
 	"github.com/maxpert/marmot/protocol/handlers"
@@ -33,7 +34,8 @@ type MVCCDatabaseProvider interface {
 type PendingExecution interface {
 	GetRowCounts() map[string]int64
 	GetTotalRowCount() int64
-	BuildFilters() map[string][]byte
+	BuildFilters() map[string][]byte // Deprecated: use GetKeyHashes
+	GetKeyHashes(maxRows int) map[string][]uint64
 	Commit() error
 	Rollback() error
 	// FlushIntentLog is a no-op with SQLite-backed intent storage (WAL handles durability).
@@ -372,14 +374,18 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, consistency
 		// FlushIntentLog is a no-op with SQLite-backed storage (WAL handles durability)
 		// Kept for backwards compatibility
 		_ = pendingExec.FlushIntentLog()
-		filters := pendingExec.BuildFilters()
+
+		// Get hash lists for conflict detection
+		// maxRows controls the threshold - tables exceeding this use MVCC fallback
+		maxRows := cfg.Config.Coordinator.MaxGuardRows
+		keyHashes := pendingExec.GetKeyHashes(maxRows)
 		rowCounts := pendingExec.GetRowCounts()
 
-		if len(filters) > 0 {
+		if len(keyHashes) > 0 {
 			txn.MutationGuards = make(map[string]*MutationGuard)
-			for table, filterBytes := range filters {
+			for table, hashes := range keyHashes {
 				txn.MutationGuards[table] = &MutationGuard{
-					Filter:           filterBytes,
+					KeyHashes:        hashes, // nil if exceeds maxRows (MVCC fallback)
 					ExpectedRowCount: rowCounts[table],
 				}
 			}

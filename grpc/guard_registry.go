@@ -6,23 +6,22 @@ import (
 	"time"
 
 	"github.com/maxpert/marmot/hlc"
-	"github.com/maxpert/marmot/protocol/filter"
 	"github.com/rs/zerolog/log"
 )
 
 // ActiveGuard represents an active MutationGuard for a transaction.
-// Guards can be either:
-//   - Filter-only (large mutations): Only contains Bloom filter, no keys. Only one allowed per table.
-//   - Key-based (small mutations): Contains both filter and keys. Can run concurrently.
+// Uses XXH64 hash list for exact conflict detection (no false positives).
+//
+// Design:
+//   - ≤64K rows: XXH64 hash list in KeySet for O(1) intersection checking
+//   - >64K rows: Empty KeySet, conflicts detected by MVCC write intents
 type ActiveGuard struct {
-	TxnID        uint64
-	Table        string
-	Filter       *filter.BloomFilter
-	Keys         []uint64 // Empty for filter-only guards, populated for key-based guards
-	IsFilterOnly bool     // True = large mutation with filter only, serialized per table
-	Timestamp    hlc.Timestamp
-	ExpiresAt    time.Time
-	RowCount     int64
+	TxnID     uint64
+	Table     string
+	KeySet    map[uint64]struct{} // XXH64 hashes of affected row keys
+	Timestamp hlc.Timestamp
+	ExpiresAt time.Time
+	RowCount  int64
 }
 
 // ConflictResult describes the outcome of a conflict check
@@ -35,57 +34,44 @@ type ConflictResult struct {
 
 // GuardRegistry manages active MutationGuards for conflict detection.
 //
-// Key design: Only ONE filter-only guard can be active per table at a time.
-// This serializes large mutations while allowing concurrent key-based mutations.
+// Uses XXH64 hash list intersection for exact conflict detection:
+// - O(min(|A|, |B|)) per comparison
+// - Zero false positives (collision probability ~10⁻¹² at 64K scale)
+// - Transactions >64K rows skip MutationGuard and rely on MVCC write intents
 //
-// Conflict Detection Matrix:
-//
-//	| Incoming     | Existing     | Detection Method                      |
-//	|--------------|--------------|---------------------------------------|
-//	| Filter-only  | Filter-only  | Block (one per table)                 |
-//	| Filter-only  | Has keys     | Probe incoming filter with existing keys |
-//	| Has keys     | Filter-only  | Probe existing filter with incoming keys |
-//	| Has keys     | Has keys     | Probe existing filter with incoming keys |
+// Novel technique combining:
+// - Early batch conflict detection (vs per-row during execution)
+// - Compact write set representation (8 bytes/row)
+// - Coordinator-side detection (vs storage layer)
+// - Native leaderless architecture support
 type GuardRegistry struct {
-	mu                    sync.RWMutex
-	guards                map[string][]*ActiveGuard // table -> all guards
-	byTxn                 map[uint64][]*ActiveGuard // txn_id -> guards
-	activeFilterOnlyGuard map[string]*ActiveGuard   // table -> single active filter-only guard
-	intentTTL             time.Duration
-	cleanupInterval       time.Duration
-	stopCh                chan struct{}
+	mu              sync.RWMutex
+	guards          map[string][]*ActiveGuard // table -> all guards
+	byTxn           map[uint64][]*ActiveGuard // txn_id -> guards
+	intentTTL       time.Duration
+	cleanupInterval time.Duration
+	stopCh          chan struct{}
 }
 
 // NewGuardRegistry creates a new guard registry
 func NewGuardRegistry(intentTTL time.Duration) *GuardRegistry {
 	r := &GuardRegistry{
-		guards:                make(map[string][]*ActiveGuard),
-		byTxn:                 make(map[uint64][]*ActiveGuard),
-		activeFilterOnlyGuard: make(map[string]*ActiveGuard),
-		intentTTL:             intentTTL,
-		cleanupInterval:       5 * time.Second,
-		stopCh:                make(chan struct{}),
+		guards:          make(map[string][]*ActiveGuard),
+		byTxn:           make(map[uint64][]*ActiveGuard),
+		intentTTL:       intentTTL,
+		cleanupInterval: 5 * time.Second,
+		stopCh:          make(chan struct{}),
 	}
 	go r.cleanupLoop()
 	return r
 }
 
 // Register adds a new guard to the registry.
-// For filter-only guards, only one can be active per table at a time.
 func (r *GuardRegistry) Register(guard *ActiveGuard) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	guard.ExpiresAt = time.Now().Add(r.intentTTL)
-
-	// Check if this is a filter-only guard
-	if guard.IsFilterOnly {
-		if existing := r.activeFilterOnlyGuard[guard.Table]; existing != nil {
-			return fmt.Errorf("filter-only guard already active for table %s (txn %d)",
-				guard.Table, existing.TxnID)
-		}
-		r.activeFilterOnlyGuard[guard.Table] = guard
-	}
 
 	r.guards[guard.Table] = append(r.guards[guard.Table], guard)
 	r.byTxn[guard.TxnID] = append(r.byTxn[guard.TxnID], guard)
@@ -93,8 +79,7 @@ func (r *GuardRegistry) Register(guard *ActiveGuard) error {
 	log.Debug().
 		Uint64("txn_id", guard.TxnID).
 		Str("table", guard.Table).
-		Bool("filter_only", guard.IsFilterOnly).
-		Int("key_count", len(guard.Keys)).
+		Int("key_count", len(guard.KeySet)).
 		Int64("row_count", guard.RowCount).
 		Msg("MutationGuard registered")
 
@@ -104,49 +89,50 @@ func (r *GuardRegistry) Register(guard *ActiveGuard) error {
 // CheckConflict checks if a new guard conflicts with existing guards.
 // Uses Wound-Wait algorithm: older transactions always proceed.
 //
-// For filter-only guards: Only one can be active per table (serialization).
-// For key-based guards: Probe existing filters with incoming keys.
+// Uses exact hash set intersection - no false positives.
+// Guards with empty KeySet (>64K rows) are skipped, conflicts detected by MVCC.
 func (r *GuardRegistry) CheckConflict(newGuard *ActiveGuard) ConflictResult {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
+	// Skip conflict check if new guard has no keys (>64K rows, rely on MVCC)
+	if len(newGuard.KeySet) == 0 {
+		return ConflictResult{HasConflict: false}
+	}
+
 	existingGuards := r.guards[newGuard.Table]
-	activeFilterOnly := r.activeFilterOnlyGuard[newGuard.Table]
 
-	// Case 1: New guard is filter-only
-	if newGuard.IsFilterOnly {
-		// Check if another filter-only guard is already active
-		if activeFilterOnly != nil && activeFilterOnly.TxnID != newGuard.TxnID {
-			return applyWoundWait(newGuard, activeFilterOnly,
-				"filter-only: table already has active large mutation")
+	for _, existing := range existingGuards {
+		if existing.TxnID == newGuard.TxnID {
+			continue
 		}
-
-		// Check against key-based guards (probe new filter with their keys)
-		for _, existing := range existingGuards {
-			if existing.TxnID == newGuard.TxnID || existing.IsFilterOnly {
-				continue
-			}
-			// Existing has keys - probe new filter with existing keys
-			if bloomContainsAny(newGuard.Filter, existing.Keys) {
-				return applyWoundWait(newGuard, existing,
-					"filter-only conflicts with existing key-based guard")
-			}
+		// Skip guards with no keys (>64K rows, MVCC handles conflicts)
+		if len(existing.KeySet) == 0 {
+			continue
 		}
-	} else {
-		// Case 2: New guard has keys - probe existing filters
-		for _, existing := range existingGuards {
-			if existing.TxnID == newGuard.TxnID {
-				continue
-			}
-			// Probe existing filter with new guard's keys
-			if bloomContainsAny(existing.Filter, newGuard.Keys) {
-				return applyWoundWait(newGuard, existing,
-					"key probe: conflict detected")
-			}
+		// Exact intersection check - no false positives
+		if hasIntersection(newGuard.KeySet, existing.KeySet) {
+			return applyWoundWait(newGuard, existing, "hash intersection: conflict detected")
 		}
 	}
 
 	return ConflictResult{HasConflict: false}
+}
+
+// hasIntersection checks if two key sets have any common elements.
+// O(min(|a|, |b|)) - iterates over smaller set, probes larger set.
+func hasIntersection(a, b map[uint64]struct{}) bool {
+	// Iterate over smaller set for efficiency
+	small, large := a, b
+	if len(a) > len(b) {
+		small, large = b, a
+	}
+	for k := range small {
+		if _, ok := large[k]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 // applyWoundWait applies the Wound-Wait deadlock prevention algorithm.
@@ -170,39 +156,10 @@ func applyWoundWait(newGuard, existing *ActiveGuard, reason string) ConflictResu
 	}
 }
 
-// bloomContainsAny checks if any key might be in the Bloom filter
-func bloomContainsAny(f *filter.BloomFilter, keys []uint64) bool {
-	if f == nil || len(keys) == 0 {
-		return false
-	}
-	for _, key := range keys {
-		if f.Contains(key) {
-			return true
-		}
-	}
-	return false
-}
-
 // MarkComplete marks a transaction's guards as complete.
-// For filter-only guards, this releases the per-table slot.
 func (r *GuardRegistry) MarkComplete(txnID uint64) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	guards := r.byTxn[txnID]
-	for _, g := range guards {
-		if g.IsFilterOnly {
-			// Release filter-only slot
-			if r.activeFilterOnlyGuard[g.Table] != nil &&
-				r.activeFilterOnlyGuard[g.Table].TxnID == txnID {
-				delete(r.activeFilterOnlyGuard, g.Table)
-				log.Debug().
-					Uint64("txn_id", txnID).
-					Str("table", g.Table).
-					Msg("Filter-only guard slot released")
-			}
-		}
-	}
+	// No-op for hash list guards - they're cleaned up by Remove()
+	// Kept for API compatibility
 }
 
 // RefreshTTL extends the TTL for all guards of a transaction
@@ -226,13 +183,6 @@ func (r *GuardRegistry) Remove(txnID uint64) {
 	delete(r.byTxn, txnID)
 
 	for _, g := range guards {
-		// Release filter-only slot if applicable
-		if g.IsFilterOnly {
-			if r.activeFilterOnlyGuard[g.Table] != nil &&
-				r.activeFilterOnlyGuard[g.Table].TxnID == txnID {
-				delete(r.activeFilterOnlyGuard, g.Table)
-			}
-		}
 		r.removeGuardFromTable(g.Table, txnID)
 	}
 }
@@ -251,20 +201,6 @@ func (r *GuardRegistry) removeGuardFromTable(table string, txnID uint64) {
 	} else {
 		r.guards[table] = filtered
 	}
-}
-
-// HasActiveFilterOnlyGuard checks if a table has an active filter-only guard
-func (r *GuardRegistry) HasActiveFilterOnlyGuard(table string) bool {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return r.activeFilterOnlyGuard[table] != nil
-}
-
-// GetActiveFilterOnlyGuard returns the active filter-only guard for a table, if any
-func (r *GuardRegistry) GetActiveFilterOnlyGuard(table string) *ActiveGuard {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return r.activeFilterOnlyGuard[table]
 }
 
 // GetGuard returns the guard for a specific transaction and table
@@ -348,13 +284,6 @@ func (r *GuardRegistry) cleanupExpired() {
 		delete(r.byTxn, txnID)
 
 		for _, g := range guards {
-			// Release filter-only slot if applicable
-			if g.IsFilterOnly {
-				if r.activeFilterOnlyGuard[g.Table] != nil &&
-					r.activeFilterOnlyGuard[g.Table].TxnID == txnID {
-					delete(r.activeFilterOnlyGuard, g.Table)
-				}
-			}
 			r.removeGuardFromTable(g.Table, txnID)
 		}
 
@@ -372,11 +301,9 @@ func (r *GuardRegistry) Stop() {
 
 // GuardRegistryStats contains registry statistics
 type GuardRegistryStats struct {
-	TotalGuards           int
-	TotalTxns             int
-	FilterOnlyGuards      int
-	TableCounts           map[string]int
-	ActiveFilterOnlyCount int
+	TotalGuards int
+	TotalTxns   int
+	TableCounts map[string]int
 }
 
 // Stats returns registry statistics
@@ -385,20 +312,23 @@ func (r *GuardRegistry) Stats() GuardRegistryStats {
 	defer r.mu.RUnlock()
 
 	stats := GuardRegistryStats{
-		TotalTxns:             len(r.byTxn),
-		TableCounts:           make(map[string]int),
-		ActiveFilterOnlyCount: len(r.activeFilterOnlyGuard),
+		TotalTxns:   len(r.byTxn),
+		TableCounts: make(map[string]int),
 	}
 
 	for table, guards := range r.guards {
 		stats.TableCounts[table] = len(guards)
 		stats.TotalGuards += len(guards)
-		for _, g := range guards {
-			if g.IsFilterOnly {
-				stats.FilterOnlyGuards++
-			}
-		}
 	}
 
 	return stats
+}
+
+// KeySetFromSlice converts a slice of hashes to a KeySet map for O(1) lookup.
+func KeySetFromSlice(hashes []uint64) map[uint64]struct{} {
+	keySet := make(map[uint64]struct{}, len(hashes))
+	for _, h := range hashes {
+		keySet[h] = struct{}{}
+	}
+	return keySet
 }

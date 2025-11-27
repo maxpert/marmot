@@ -5,34 +5,20 @@ import (
 	"time"
 
 	"github.com/maxpert/marmot/hlc"
-	"github.com/maxpert/marmot/protocol/filter"
 )
 
-// makeTestGuard creates a key-based guard for testing
+// makeTestGuard creates a KeySet-based guard for testing
 func makeTestGuard(txnID uint64, table string, keys []uint64, ts int64) *ActiveGuard {
-	f := filter.NewBloomFilterFromKeys(keys)
-	return &ActiveGuard{
-		TxnID:        txnID,
-		Table:        table,
-		Filter:       f,
-		Keys:         keys,
-		IsFilterOnly: false,
-		Timestamp:    hlc.Timestamp{WallTime: ts, Logical: 0, NodeID: 1},
-		RowCount:     int64(len(keys)),
+	keySet := make(map[uint64]struct{}, len(keys))
+	for _, k := range keys {
+		keySet[k] = struct{}{}
 	}
-}
-
-// makeFilterOnlyGuard creates a filter-only guard (no keys) for testing
-func makeFilterOnlyGuard(txnID uint64, table string, keys []uint64, ts int64) *ActiveGuard {
-	f := filter.NewBloomFilterFromKeys(keys)
 	return &ActiveGuard{
-		TxnID:        txnID,
-		Table:        table,
-		Filter:       f,
-		Keys:         nil, // No keys for filter-only
-		IsFilterOnly: true,
-		Timestamp:    hlc.Timestamp{WallTime: ts, Logical: 0, NodeID: 1},
-		RowCount:     int64(len(keys)),
+		TxnID:     txnID,
+		Table:     table,
+		KeySet:    keySet,
+		Timestamp: hlc.Timestamp{WallTime: ts, Logical: 0, NodeID: 1},
+		RowCount:  int64(len(keys)),
 	}
 }
 
@@ -170,168 +156,6 @@ func TestGuardRegistry_CheckConflict_SameTxn(t *testing.T) {
 	}
 }
 
-// Filter-only guard tests
-
-func TestGuardRegistry_FilterOnly_SinglePerTable(t *testing.T) {
-	r := NewGuardRegistry(60 * time.Second)
-	defer r.Stop()
-
-	// Register first filter-only guard
-	guard1 := makeFilterOnlyGuard(100, "users", []uint64{1, 2, 3}, 1000)
-	if err := r.Register(guard1); err != nil {
-		t.Fatalf("First filter-only register failed: %v", err)
-	}
-
-	if !r.HasActiveFilterOnlyGuard("users") {
-		t.Error("Should have active filter-only guard for users")
-	}
-
-	// Try to register second filter-only guard - should fail
-	guard2 := makeFilterOnlyGuard(200, "users", []uint64{10, 20, 30}, 2000)
-	err := r.Register(guard2)
-	if err == nil {
-		t.Error("Second filter-only guard should fail to register")
-	}
-}
-
-func TestGuardRegistry_FilterOnly_DifferentTables(t *testing.T) {
-	r := NewGuardRegistry(60 * time.Second)
-	defer r.Stop()
-
-	// Register filter-only guard for users
-	guard1 := makeFilterOnlyGuard(100, "users", []uint64{1, 2, 3}, 1000)
-	if err := r.Register(guard1); err != nil {
-		t.Fatalf("Register users failed: %v", err)
-	}
-
-	// Register filter-only guard for orders - should succeed (different table)
-	guard2 := makeFilterOnlyGuard(200, "orders", []uint64{10, 20, 30}, 2000)
-	if err := r.Register(guard2); err != nil {
-		t.Fatalf("Register orders failed: %v", err)
-	}
-
-	if !r.HasActiveFilterOnlyGuard("users") {
-		t.Error("Should have active filter-only guard for users")
-	}
-	if !r.HasActiveFilterOnlyGuard("orders") {
-		t.Error("Should have active filter-only guard for orders")
-	}
-}
-
-func TestGuardRegistry_FilterOnly_CheckConflict_WoundWait(t *testing.T) {
-	r := NewGuardRegistry(60 * time.Second)
-	defer r.Stop()
-
-	// Register filter-only guard (older)
-	guard1 := makeFilterOnlyGuard(100, "users", []uint64{1, 2, 3}, 1000)
-	r.Register(guard1)
-
-	// New filter-only guard (younger) should conflict
-	guard2 := makeFilterOnlyGuard(200, "users", []uint64{10, 20, 30}, 2000)
-	result := r.CheckConflict(guard2)
-
-	if !result.HasConflict {
-		t.Error("Younger filter-only should conflict with older")
-	}
-	if !result.ShouldWait {
-		t.Error("Younger should wait for older")
-	}
-}
-
-func TestGuardRegistry_FilterOnly_KeyBasedCanProbe(t *testing.T) {
-	r := NewGuardRegistry(60 * time.Second)
-	defer r.Stop()
-
-	// Register filter-only guard with keys 1,2,3
-	filterOnlyGuard := makeFilterOnlyGuard(100, "users", []uint64{1, 2, 3}, 1000)
-	r.Register(filterOnlyGuard)
-
-	// Key-based guard with non-overlapping keys should succeed
-	keyGuard1 := makeTestGuard(200, "users", []uint64{10, 20, 30}, 2000)
-	result := r.CheckConflict(keyGuard1)
-	if result.HasConflict {
-		t.Error("Non-overlapping key-based guard should not conflict")
-	}
-
-	// Key-based guard with overlapping keys should conflict
-	keyGuard2 := makeTestGuard(300, "users", []uint64{2, 3, 4}, 3000)
-	result = r.CheckConflict(keyGuard2)
-	if !result.HasConflict {
-		t.Error("Overlapping key-based guard should conflict with filter-only")
-	}
-}
-
-func TestGuardRegistry_FilterOnly_ProbesKeyBasedGuards(t *testing.T) {
-	r := NewGuardRegistry(60 * time.Second)
-	defer r.Stop()
-
-	// Register key-based guard with keys 1,2,3
-	keyGuard := makeTestGuard(100, "users", []uint64{1, 2, 3}, 1000)
-	r.Register(keyGuard)
-
-	// Filter-only guard with non-overlapping keys should succeed
-	filterGuard1 := makeFilterOnlyGuard(200, "users", []uint64{10, 20, 30}, 2000)
-	result := r.CheckConflict(filterGuard1)
-	if result.HasConflict {
-		t.Error("Non-overlapping filter-only guard should not conflict")
-	}
-
-	// Filter-only guard with overlapping keys should conflict
-	filterGuard2 := makeFilterOnlyGuard(300, "users", []uint64{2, 3, 4}, 3000)
-	result = r.CheckConflict(filterGuard2)
-	if !result.HasConflict {
-		t.Error("Overlapping filter-only guard should conflict with key-based")
-	}
-}
-
-func TestGuardRegistry_MarkComplete_ReleasesFilterOnlySlot(t *testing.T) {
-	r := NewGuardRegistry(60 * time.Second)
-	defer r.Stop()
-
-	// Register filter-only guard
-	guard1 := makeFilterOnlyGuard(100, "users", []uint64{1, 2, 3}, 1000)
-	r.Register(guard1)
-
-	if !r.HasActiveFilterOnlyGuard("users") {
-		t.Error("Should have active filter-only guard")
-	}
-
-	// Mark complete
-	r.MarkComplete(100)
-
-	if r.HasActiveFilterOnlyGuard("users") {
-		t.Error("MarkComplete should release filter-only slot")
-	}
-
-	// Now another filter-only guard can register
-	guard2 := makeFilterOnlyGuard(200, "users", []uint64{10, 20, 30}, 2000)
-	if err := r.Register(guard2); err != nil {
-		t.Fatalf("Should be able to register after MarkComplete: %v", err)
-	}
-}
-
-func TestGuardRegistry_Remove_ReleasesFilterOnlySlot(t *testing.T) {
-	r := NewGuardRegistry(60 * time.Second)
-	defer r.Stop()
-
-	// Register filter-only guard
-	guard1 := makeFilterOnlyGuard(100, "users", []uint64{1, 2, 3}, 1000)
-	r.Register(guard1)
-
-	// Remove
-	r.Remove(100)
-
-	if r.HasActiveFilterOnlyGuard("users") {
-		t.Error("Remove should release filter-only slot")
-	}
-
-	// Now another filter-only guard can register
-	guard2 := makeFilterOnlyGuard(200, "users", []uint64{10, 20, 30}, 2000)
-	if err := r.Register(guard2); err != nil {
-		t.Fatalf("Should be able to register after Remove: %v", err)
-	}
-}
-
 func TestGuardRegistry_RefreshTTL(t *testing.T) {
 	r := NewGuardRegistry(1 * time.Second)
 	defer r.Stop()
@@ -410,7 +234,7 @@ func TestGuardRegistry_Stats(t *testing.T) {
 
 	r.Register(makeTestGuard(100, "users", []uint64{1}, 1000))
 	r.Register(makeTestGuard(100, "orders", []uint64{2}, 1000))
-	r.Register(makeFilterOnlyGuard(200, "products", []uint64{3}, 2000))
+	r.Register(makeTestGuard(200, "products", []uint64{3}, 2000))
 
 	stats := r.Stats()
 
@@ -422,14 +246,6 @@ func TestGuardRegistry_Stats(t *testing.T) {
 		t.Errorf("TotalTxns = %d, want 2", stats.TotalTxns)
 	}
 
-	if stats.FilterOnlyGuards != 1 {
-		t.Errorf("FilterOnlyGuards = %d, want 1", stats.FilterOnlyGuards)
-	}
-
-	if stats.ActiveFilterOnlyCount != 1 {
-		t.Errorf("ActiveFilterOnlyCount = %d, want 1", stats.ActiveFilterOnlyCount)
-	}
-
 	if stats.TableCounts["users"] != 1 {
 		t.Errorf("TableCounts[users] = %d, want 1", stats.TableCounts["users"])
 	}
@@ -437,11 +253,10 @@ func TestGuardRegistry_Stats(t *testing.T) {
 
 func TestGuardRegistry_CleanupExpired(t *testing.T) {
 	r := &GuardRegistry{
-		guards:                make(map[string][]*ActiveGuard),
-		byTxn:                 make(map[uint64][]*ActiveGuard),
-		activeFilterOnlyGuard: make(map[string]*ActiveGuard),
-		intentTTL:             100 * time.Millisecond,
-		stopCh:                make(chan struct{}),
+		guards:    make(map[string][]*ActiveGuard),
+		byTxn:     make(map[uint64][]*ActiveGuard),
+		intentTTL: 100 * time.Millisecond,
+		stopCh:    make(chan struct{}),
 	}
 	defer r.Stop()
 
@@ -458,29 +273,6 @@ func TestGuardRegistry_CleanupExpired(t *testing.T) {
 
 	if r.Count() != 0 {
 		t.Errorf("Count = %d, want 0", r.Count())
-	}
-}
-
-func TestGuardRegistry_CleanupExpired_ReleasesFilterOnlySlot(t *testing.T) {
-	r := &GuardRegistry{
-		guards:                make(map[string][]*ActiveGuard),
-		byTxn:                 make(map[uint64][]*ActiveGuard),
-		activeFilterOnlyGuard: make(map[string]*ActiveGuard),
-		intentTTL:             100 * time.Millisecond,
-		stopCh:                make(chan struct{}),
-	}
-	defer r.Stop()
-
-	guard := makeFilterOnlyGuard(100, "users", []uint64{1}, 1000)
-	guard.ExpiresAt = time.Now().Add(-1 * time.Second) // Already expired
-	r.guards["users"] = append(r.guards["users"], guard)
-	r.byTxn[100] = append(r.byTxn[100], guard)
-	r.activeFilterOnlyGuard["users"] = guard
-
-	r.cleanupExpired()
-
-	if r.HasActiveFilterOnlyGuard("users") {
-		t.Error("expired filter-only guard slot should be released")
 	}
 }
 
@@ -506,6 +298,104 @@ func TestGuardRegistry_MultipleTablesConflict(t *testing.T) {
 
 	if result.HasConflict {
 		t.Error("should not detect conflict on products table")
+	}
+}
+
+// Test KeySetFromSlice helper
+func TestKeySetFromSlice(t *testing.T) {
+	hashes := []uint64{1, 2, 3, 4, 5}
+	keySet := KeySetFromSlice(hashes)
+
+	if len(keySet) != 5 {
+		t.Errorf("len(keySet) = %d, want 5", len(keySet))
+	}
+
+	for _, h := range hashes {
+		if _, ok := keySet[h]; !ok {
+			t.Errorf("keySet missing hash %d", h)
+		}
+	}
+}
+
+func TestKeySetFromSlice_Empty(t *testing.T) {
+	keySet := KeySetFromSlice(nil)
+	if len(keySet) != 0 {
+		t.Errorf("len(keySet) = %d, want 0", len(keySet))
+	}
+
+	keySet = KeySetFromSlice([]uint64{})
+	if len(keySet) != 0 {
+		t.Errorf("len(keySet) = %d, want 0", len(keySet))
+	}
+}
+
+// Test hasIntersection helper
+func TestHasIntersection(t *testing.T) {
+	a := map[uint64]struct{}{1: {}, 2: {}, 3: {}}
+	b := map[uint64]struct{}{3: {}, 4: {}, 5: {}}
+
+	if !hasIntersection(a, b) {
+		t.Error("should detect intersection at key 3")
+	}
+}
+
+func TestHasIntersection_NoOverlap(t *testing.T) {
+	a := map[uint64]struct{}{1: {}, 2: {}, 3: {}}
+	b := map[uint64]struct{}{4: {}, 5: {}, 6: {}}
+
+	if hasIntersection(a, b) {
+		t.Error("should not detect intersection for non-overlapping sets")
+	}
+}
+
+func TestHasIntersection_Empty(t *testing.T) {
+	a := map[uint64]struct{}{1: {}, 2: {}, 3: {}}
+	b := map[uint64]struct{}{}
+
+	if hasIntersection(a, b) {
+		t.Error("should not detect intersection with empty set")
+	}
+
+	if hasIntersection(b, a) {
+		t.Error("should not detect intersection with empty set (reversed)")
+	}
+}
+
+func TestHasIntersection_BothEmpty(t *testing.T) {
+	a := map[uint64]struct{}{}
+	b := map[uint64]struct{}{}
+
+	if hasIntersection(a, b) {
+		t.Error("should not detect intersection between empty sets")
+	}
+}
+
+// Test exact conflict detection (no false positives)
+func TestExactConflictDetection_NoFalsePositives(t *testing.T) {
+	r := NewGuardRegistry(60 * time.Second)
+	defer r.Stop()
+
+	// Register guard with specific keys
+	r.Register(makeTestGuard(100, "users", []uint64{1000, 2000, 3000}, 1000))
+
+	// Test many non-overlapping keys - none should conflict
+	for i := uint64(1); i < 100; i++ {
+		// These keys will never overlap with 1000, 2000, 3000
+		keys := []uint64{i, i + 100, i + 200}
+		guard := makeTestGuard(200, "users", keys, 2000)
+		result := r.CheckConflict(guard)
+
+		if result.HasConflict {
+			t.Errorf("false positive detected for keys %v", keys)
+		}
+	}
+
+	// Now test overlapping key - must detect
+	guard := makeTestGuard(200, "users", []uint64{1000, 5000, 6000}, 2000)
+	result := r.CheckConflict(guard)
+
+	if !result.HasConflict {
+		t.Error("should detect conflict for overlapping key 1000")
 	}
 }
 
@@ -561,5 +451,33 @@ func BenchmarkRegister(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		r.Register(guards[i])
+	}
+}
+
+func BenchmarkHasIntersection_SmallSets(b *testing.B) {
+	a := make(map[uint64]struct{}, 10)
+	c := make(map[uint64]struct{}, 10)
+	for i := uint64(0); i < 10; i++ {
+		a[i] = struct{}{}
+		c[i+100] = struct{}{} // Non-overlapping
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		hasIntersection(a, c)
+	}
+}
+
+func BenchmarkHasIntersection_LargeSets(b *testing.B) {
+	a := make(map[uint64]struct{}, 10000)
+	c := make(map[uint64]struct{}, 10000)
+	for i := uint64(0); i < 10000; i++ {
+		a[i] = struct{}{}
+		c[i+100000] = struct{}{} // Non-overlapping
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		hasIntersection(a, c)
 	}
 }

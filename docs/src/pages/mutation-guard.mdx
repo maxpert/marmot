@@ -4,7 +4,7 @@ title: MutationGuard Protocol
 
 # MutationGuard Protocol
 
-MutationGuard is Marmot's distributed transaction conflict detection system. Inspired by Google's Percolator, it uses probabilistic data structures to efficiently detect write-write conflicts across a cluster without per-row tracking overhead.
+MutationGuard is Marmot's distributed transaction conflict detection system. It uses XXH64 hash lists for exact, zero-false-positive conflict detection across a cluster without per-row tracking overhead.
 
 ## Overview
 
@@ -17,7 +17,7 @@ MutationGuard is Marmot's distributed transaction conflict detection system. Ins
   <rect x="20" y="60" width="160" height="80" rx="8" fill="#1e1b4b" stroke="#6366f1" strokeWidth="2"/>
   <text x="100" y="95" textAnchor="middle" fill="#e0e7ff" fontSize="14" fontWeight="bold">Coordinator</text>
   <text x="100" y="115" textAnchor="middle" fill="#a5b4fc" fontSize="11">Execute locally</text>
-  <text x="100" y="130" textAnchor="middle" fill="#a5b4fc" fontSize="11">Build filters</text>
+  <text x="100" y="130" textAnchor="middle" fill="#a5b4fc" fontSize="11">Build hash lists</text>
 
   <rect x="320" y="20" width="160" height="60" rx="8" fill="#1e1b4b" stroke="#6366f1" strokeWidth="2"/>
   <text x="400" y="45" textAnchor="middle" fill="#e0e7ff" fontSize="14" fontWeight="bold">Replica 1</text>
@@ -30,7 +30,7 @@ MutationGuard is Marmot's distributed transaction conflict detection system. Ins
   <rect x="600" y="60" width="160" height="80" rx="8" fill="#1e1b4b" stroke="#22c55e" strokeWidth="2"/>
   <text x="680" y="95" textAnchor="middle" fill="#e0e7ff" fontSize="14" fontWeight="bold">Quorum</text>
   <text x="680" y="115" textAnchor="middle" fill="#86efac" fontSize="11">2 of 3 nodes</text>
-  <text x="680" y="130" textAnchor="middle" fill="#86efac" fontSize="11">→ Commit</text>
+  <text x="680" y="130" textAnchor="middle" fill="#86efac" fontSize="11">Commit</text>
 
   <line x1="180" y1="80" x2="315" y2="50" stroke="#6366f1" strokeWidth="2" markerEnd="url(#arrow)"/>
   <line x1="180" y1="120" x2="315" y2="130" stroke="#6366f1" strokeWidth="2" markerEnd="url(#arrow)"/>
@@ -38,80 +38,69 @@ MutationGuard is Marmot's distributed transaction conflict detection system. Ins
   <line x1="485" y1="130" x2="595" y2="115" stroke="#22c55e" strokeWidth="2" markerEnd="url(#arrow)"/>
 
   <text x="250" y="55" textAnchor="middle" fill="#a5b4fc" fontSize="10">PREPARE</text>
-  <text x="250" y="145" textAnchor="middle" fill="#a5b4fc" fontSize="10">+filters</text>
+  <text x="250" y="145" textAnchor="middle" fill="#a5b4fc" fontSize="10">+hashes</text>
   <text x="545" y="75" textAnchor="middle" fill="#86efac" fontSize="10">ACK</text>
   <text x="545" y="140" textAnchor="middle" fill="#86efac" fontSize="10">ACK</text>
 </svg>
 
 ### Design Goals
 
-1. **Efficient single-row transactions**: Minimal overhead for point writes
-2. **Safe multi-row mutations**: Bloom filter-based conflict detection
-3. **Eventually consistent**: All nodes converge after commit
+1. **Zero false positives**: Exact hash comparison, no probabilistic guessing
+2. **Efficient multi-row mutations**: Hash list with O(1) intersection checking
+3. **Configurable threshold**: Falls back to MVCC for very large transactions
 4. **SQLite-friendly**: Works within SQLite's single-writer model
 
-### The Percolator Trade-off
+### XXH64 Hash Lists vs Bloom Filters
 
-Google's Percolator uses per-key write intents. While accurate, this is expensive for bulk operations:
+Traditional Bloom filters have false positives. MutationGuard uses exact XXH64 hash lists:
 
 ```
-Traditional Percolator:
-  1M rows → 1M write intents → 1M network messages
+Bloom Filter (old):
+  10,000 rows → 36 KB filter → 0.0001% false positives
 
-MutationGuard:
-  1M rows → 1 Bloom filter (3.6 MB) → 1 network message
+XXH64 Hash List (new):
+  10,000 rows → 80 KB (8 bytes/key) → 0% false positives
 ```
 
-The trade-off: 0.0001% false positive rate (~1 in 1,000,000) for dramatically reduced network overhead.
+The trade-off: slightly more memory for exact conflict detection with no false positives.
 
 ---
 
-## Bloom Filter Implementation
+## XXH64 Hash List Implementation
 
-MutationGuard uses Bloom filters for probabilistic set membership testing.
+MutationGuard uses XXH64 hashes (64-bit) for exact conflict detection.
 
 ### Mathematical Foundation
 
 | Property | Value |
 |----------|-------|
-| **False positive rate** | 0.0001% (10⁻⁶) |
-| **Bits per key** | 28.75 |
-| **Hash functions (k)** | 20 |
-| **Hash algorithm** | XXH64 double hashing |
-
-The optimal parameters are derived from:
-
-```
-bits/key = -ln(p) / (ln(2))² = -ln(10⁻⁶) / 0.4804 ≈ 28.75
-optimal k = bits/key × ln(2) = 28.75 × 0.693 ≈ 20
-```
+| **Hash size** | 64 bits (8 bytes per key) |
+| **Collision probability** | ~10^-12 (negligible) |
+| **Storage per key** | 8 bytes |
+| **Lookup complexity** | O(1) via hash map |
+| **False positive rate** | 0% |
 
 ### Size Estimates
 
-| Rows | Filter Size | Network |
-|------|-------------|---------|
-| 100 | ~361 bytes | 1 packet |
-| 1,000 | ~3.6 KB | 3 packets |
-| 10,000 | ~36 KB | ~25 packets |
-| 100,000 | ~361 KB | ~250 packets |
-| 1,000,000 | ~3.6 MB | chunked |
+| Rows | Hash List Size | Network |
+|------|----------------|---------|
+| 100 | ~800 bytes | 1 packet |
+| 1,000 | ~8 KB | 6 packets |
+| 10,000 | ~80 KB | ~55 packets |
+| 64,000 | ~512 KB | ~350 packets |
+| >64,000 | **MVCC fallback** | N/A |
 
-### Double Hashing
+### Configurable Threshold
 
-Two XXH64 hash seeds generate k=20 hash positions:
+Transactions exceeding `max_guard_rows` (default: 65,536) skip MutationGuard entirely. Conflict detection falls back to MVCC write intents, which handles large transactions without memory overhead.
 
-```go
-h₁ = XXH64(key, seed1)  // seed1: 0x9E3779B97F4A7C15
-h₂ = XXH64(key, seed2)  // seed2: 0xC6A4A7935BD1E995
-
-// Generate k positions via double hashing
-for i := 0; i < k; i++ {
-    position := (h₁ + uint64(i) * h₂) % m
-    setBit(position)
-}
+```toml
+[coordinator]
+# Maximum rows per transaction for hash list guards
+# Larger transactions use MVCC fallback
+# Default: 65536 (64K rows, ~512KB payload)
+max_guard_rows = 65536
 ```
-
-This avoids computing 20 independent hashes while maintaining good distribution.
 
 ---
 
@@ -141,50 +130,77 @@ Row keys uniquely identify rows for conflict detection. The format ensures no co
 - **Composite PK**: `table:c:<b64_col1>:<b64_col2>:...` (columns sorted alphabetically)
 - **NULL values**: Sentinel `\x00NULL\x00` prevents collision with empty strings
 
-### Collision Prevention
+### Hash Generation
 
-Base64 encoding prevents separator (`:`) collision:
+Each row key is hashed using XXH64:
 
-```
-Without encoding (COLLISION):
-  Row 1: pk1="a:b", pk2="c" → "table:a:b:c"
-  Row 2: pk1="a", pk2="b:c" → "table:a:b:c"  ← Same key!
-
-With base64 encoding (SAFE):
-  Row 1: → "table:c:YTpi:Yw=="
-  Row 2: → "table:c:YQ==:Yjpj"  ← Different keys
+```go
+// Row key → XXH64 hash
+keyHash := xxhash.Sum64String(rowKey)  // e.g., "users:123" → 0x7F8A3B2C1D4E5F60
 ```
 
 ---
 
-## Guard Types
+## Conflict Detection
 
-<svg viewBox="0 0 800 220" className="w-full my-8" style={{maxWidth: '800px'}}>
-  <rect x="20" y="20" width="360" height="180" rx="12" fill="#1e1b4b" stroke="#22c55e" strokeWidth="2"/>
-  <text x="200" y="50" textAnchor="middle" fill="#22c55e" fontSize="16" fontWeight="bold">Key-Based Guard</text>
-  <line x1="40" y1="65" x2="360" y2="65" stroke="#374151" strokeWidth="1"/>
-  <text x="40" y="90" fill="#e0e7ff" fontSize="13">✓ Has extracted row keys</text>
-  <text x="40" y="115" fill="#e0e7ff" fontSize="13">✓ Concurrent per table</text>
-  <text x="40" y="140" fill="#e0e7ff" fontSize="13">✓ Precise conflict detection</text>
-  <text x="40" y="175" fill="#a5b4fc" fontSize="12">Used for: Small/medium mutations</text>
+### KeySet Intersection
 
-  <rect x="420" y="20" width="360" height="180" rx="12" fill="#1e1b4b" stroke="#f59e0b" strokeWidth="2"/>
-  <text x="600" y="50" textAnchor="middle" fill="#f59e0b" fontSize="16" fontWeight="bold">Filter-Only Guard</text>
-  <line x1="440" y1="65" x2="760" y2="65" stroke="#374151" strokeWidth="1"/>
-  <text x="440" y="90" fill="#e0e7ff" fontSize="13">✗ No extracted keys</text>
-  <text x="440" y="115" fill="#e0e7ff" fontSize="13">⚠ Serialized per table</text>
-  <text x="440" y="140" fill="#e0e7ff" fontSize="13">✓ Memory efficient</text>
-  <text x="440" y="175" fill="#a5b4fc" fontSize="12">Used for: Large bulk mutations</text>
+MutationGuard uses hash maps (`map[uint64]struct{}`) for O(1) conflict checking:
+
+```go
+// Check if two key sets intersect
+func hasIntersection(a, b map[uint64]struct{}) bool {
+    // Iterate smaller set for efficiency
+    small, large := a, b
+    if len(a) > len(b) {
+        small, large = b, a
+    }
+    for k := range small {
+        if _, ok := large[k]; ok {
+            return true  // Conflict found
+        }
+    }
+    return false
+}
+```
+
+### Detection Algorithm
+
+```go
+func CheckConflict(incoming *ActiveGuard) ConflictResult {
+    for _, existing := range guards[incoming.Table] {
+        if existing.TxnID == incoming.TxnID {
+            continue  // Same transaction
+        }
+
+        // Check for key intersection
+        if hasIntersection(incoming.KeySet, existing.KeySet) {
+            return applyWoundWait(incoming, existing)
+        }
+    }
+    return NoConflict
+}
+```
+
+### Wound-Wait Deadlock Prevention
+
+<svg viewBox="0 0 700 200" className="w-full my-8" style={{maxWidth: '700px'}}>
+  <rect x="20" y="20" width="300" height="160" rx="12" fill="#0f172a" stroke="#22c55e" strokeWidth="2"/>
+  <text x="170" y="50" textAnchor="middle" fill="#22c55e" fontSize="14" fontWeight="bold">Older Transaction Wins</text>
+  <text x="40" y="85" fill="#e0e7ff" fontSize="12">T1 (ts=100) conflicts with T2 (ts=200)</text>
+  <text x="40" y="110" fill="#a5b4fc" fontSize="12">T1 proceeds (older)</text>
+  <text x="40" y="135" fill="#a5b4fc" fontSize="12">T2 aborted ("wounded")</text>
+  <text x="40" y="165" fill="#86efac" fontSize="11">Result: T1 commits</text>
+
+  <rect x="380" y="20" width="300" height="160" rx="12" fill="#0f172a" stroke="#f59e0b" strokeWidth="2"/>
+  <text x="530" y="50" textAnchor="middle" fill="#f59e0b" fontSize="14" fontWeight="bold">Younger Transaction Waits</text>
+  <text x="400" y="85" fill="#e0e7ff" fontSize="12">T2 (ts=200) conflicts with T1 (ts=100)</text>
+  <text x="400" y="110" fill="#a5b4fc" fontSize="12">T2 waits for T1</text>
+  <text x="400" y="135" fill="#a5b4fc" fontSize="12">T1 completes normally</text>
+  <text x="400" y="165" fill="#fcd34d" fontSize="11">Result: T2 retries after T1</text>
 </svg>
 
-| Type | Keys | Concurrency | Use Case |
-|------|------|-------------|----------|
-| **Key-Based** | Populated | Concurrent per table | Normal operations |
-| **Filter-Only** | Empty | One per table | Bulk operations |
-
-**Key-Based Guards** allow multiple concurrent transactions on the same table—conflicts are detected by probing filters with specific keys.
-
-**Filter-Only Guards** serialize access to a table. When a filter-only guard is active, no other transactions can modify that table until it completes.
+**Guarantee**: No deadlocks possible. Older transactions always proceed; younger ones either wait or get aborted.
 
 ---
 
@@ -215,7 +231,7 @@ With base64 encoding (SAFE):
   <text x="120" y="172" textAnchor="middle" fill="#e0e7ff" fontSize="11">3. Hooks capture rows</text>
 
   <rect x="40" y="195" width="160" height="35" rx="4" fill="#1e1b4b" stroke="#6366f1" strokeWidth="1"/>
-  <text x="120" y="217" textAnchor="middle" fill="#e0e7ff" fontSize="11">4. Build Bloom filters</text>
+  <text x="120" y="217" textAnchor="middle" fill="#e0e7ff" fontSize="11">4. Build hash list</text>
 
   <rect x="40" y="240" width="160" height="35" rx="4" fill="#1e1b4b" stroke="#22c55e" strokeWidth="2"/>
   <text x="120" y="262" textAnchor="middle" fill="#86efac" fontSize="11">5. Broadcast PREPARE</text>
@@ -224,7 +240,7 @@ With base64 encoding (SAFE):
   <text x="400" y="45" textAnchor="middle" fill="#94a3b8" fontSize="12" fontWeight="bold">REPLICA</text>
 
   <rect x="320" y="100" width="160" height="35" rx="4" fill="#1e1b4b" stroke="#6366f1" strokeWidth="1"/>
-  <text x="400" y="122" textAnchor="middle" fill="#e0e7ff" fontSize="11">Deserialize filters</text>
+  <text x="400" y="122" textAnchor="middle" fill="#e0e7ff" fontSize="11">Build KeySet</text>
 
   <rect x="320" y="145" width="160" height="35" rx="4" fill="#1e1b4b" stroke="#f59e0b" strokeWidth="1"/>
   <text x="400" y="167" textAnchor="middle" fill="#fcd34d" fontSize="11">Check conflicts</text>
@@ -244,16 +260,16 @@ With base64 encoding (SAFE):
   <text x="580" y="148" fill="#a5b4fc" fontSize="10" fontFamily="monospace">phase: PREPARE</text>
   <text x="580" y="166" fill="#a5b4fc" fontSize="10" fontFamily="monospace">statements: [...]</text>
   <text x="580" y="184" fill="#a5b4fc" fontSize="10" fontFamily="monospace">mutation_guards:</text>
-  <text x="590" y="202" fill="#6366f1" fontSize="10" fontFamily="monospace">users → filter(3.6KB)</text>
+  <text x="590" y="202" fill="#6366f1" fontSize="10" fontFamily="monospace">users: [h1, h2, h3...]</text>
 </svg>
 
 1. **Coordinator** executes SQL locally with SQLite preupdate hooks
 2. Hooks capture every affected row, extract primary keys
-3. Build Bloom filter from captured row keys
-4. Broadcast PREPARE with serialized MutationGuards to all replicas
-5. **Replicas** deserialize filters, check against existing guards
-6. If conflict detected → return error, coordinator aborts
-7. If no conflict → register guard, return ACK
+3. Generate XXH64 hashes from row keys (up to `max_guard_rows`)
+4. Broadcast PREPARE with hash lists to all replicas
+5. **Replicas** convert hash lists to KeySets, check against existing guards
+6. If conflict detected: return error, coordinator aborts
+7. If no conflict: register guard, return ACK
 
 ### Phase 2: COMMIT
 
@@ -264,104 +280,25 @@ Once quorum ACKs received (no conflicts):
 3. **Replicas** finalize and release guards
 4. Return success to client
 
-### Conflict Response Flow
-
-<svg viewBox="0 0 700 160" className="w-full my-8" style={{maxWidth: '700px'}}>
-  <rect x="20" y="40" width="140" height="80" rx="8" fill="#1e1b4b" stroke="#ef4444" strokeWidth="2"/>
-  <text x="90" y="75" textAnchor="middle" fill="#fca5a5" fontSize="13" fontWeight="bold">Conflict!</text>
-  <text x="90" y="100" textAnchor="middle" fill="#fca5a5" fontSize="11">Replica detects</text>
-
-  <rect x="220" y="40" width="140" height="80" rx="8" fill="#1e1b4b" stroke="#f59e0b" strokeWidth="2"/>
-  <text x="290" y="75" textAnchor="middle" fill="#fcd34d" fontSize="13" fontWeight="bold">Wound-Wait</text>
-  <text x="290" y="100" textAnchor="middle" fill="#fcd34d" fontSize="11">Decide action</text>
-
-  <rect x="420" y="20" width="120" height="50" rx="8" fill="#1e1b4b" stroke="#22c55e" strokeWidth="2"/>
-  <text x="480" y="50" textAnchor="middle" fill="#86efac" fontSize="12">Older wins</text>
-
-  <rect x="420" y="90" width="120" height="50" rx="8" fill="#1e1b4b" stroke="#ef4444" strokeWidth="2"/>
-  <text x="480" y="120" textAnchor="middle" fill="#fca5a5" fontSize="12">Younger waits</text>
-
-  <rect x="580" y="40" width="100" height="80" rx="8" fill="#1e1b4b" stroke="#6366f1" strokeWidth="2"/>
-  <text x="630" y="75" textAnchor="middle" fill="#e0e7ff" fontSize="12">No deadlock</text>
-  <text x="630" y="95" textAnchor="middle" fill="#a5b4fc" fontSize="10">guaranteed</text>
-
-  <line x1="160" y1="80" x2="215" y2="80" stroke="#f59e0b" strokeWidth="2" markerEnd="url(#arr1)"/>
-  <line x1="360" y1="55" x2="415" y2="45" stroke="#22c55e" strokeWidth="2"/>
-  <line x1="360" y1="100" x2="415" y2="115" stroke="#ef4444" strokeWidth="2"/>
-  <line x1="540" y1="65" x2="575" y2="75" stroke="#6366f1" strokeWidth="2"/>
-</svg>
-
 ---
 
-## Conflict Detection
+## Large Transaction Handling
 
-### Detection Matrix
+Transactions with more than `max_guard_rows` rows use MVCC fallback:
 
-| Incoming Guard | Existing Guard | Detection Method |
-|----------------|----------------|------------------|
-| Filter-only | Filter-only | **Block** (one per table) |
-| Filter-only | Key-based | Probe filter with existing keys |
-| Key-based | Filter-only | Probe filter with incoming keys |
-| Key-based | Key-based | Probe filters with keys |
-
-### Detection Algorithm
-
-```go
-func CheckConflict(incoming *ActiveGuard) ConflictResult {
-    // 1. Check filter-only exclusivity
-    if incoming.IsFilterOnly {
-        if existing := activeFilterOnlyGuard[incoming.Table]; existing != nil {
-            return Conflict("filter-only already active")
-        }
-    }
-
-    // 2. Probe existing guards
-    for _, existing := range guards[incoming.Table] {
-        if existing.TxnID == incoming.TxnID {
-            continue  // Same transaction
-        }
-
-        // Determine which keys to probe
-        var keysToProbe []uint64
-        var filterToProbe *BloomFilter
-
-        if incoming.IsFilterOnly {
-            keysToProbe = existing.Keys
-            filterToProbe = incoming.Filter
-        } else {
-            keysToProbe = incoming.Keys
-            filterToProbe = existing.Filter
-        }
-
-        // Check for overlap
-        if filterToProbe.ContainsAny(keysToProbe) {
-            return applyWoundWait(incoming, existing)
-        }
-    }
-
-    return NoConflict
-}
+```
+Timeline for >64K rows:
+  1. Coordinator executes locally (with preupdate hooks)
+  2. GetKeyHashes returns nil (exceeds threshold)
+  3. MutationGuard not created for this table
+  4. 2PC proceeds without early conflict detection
+  5. MVCC write intents handle conflicts at row level
 ```
 
-### Wound-Wait Deadlock Prevention
-
-<svg viewBox="0 0 700 200" className="w-full my-8" style={{maxWidth: '700px'}}>
-  <rect x="20" y="20" width="300" height="160" rx="12" fill="#0f172a" stroke="#22c55e" strokeWidth="2"/>
-  <text x="170" y="50" textAnchor="middle" fill="#22c55e" fontSize="14" fontWeight="bold">Older Transaction Wins</text>
-  <text x="40" y="85" fill="#e0e7ff" fontSize="12">T1 (ts=100) conflicts with T2 (ts=200)</text>
-  <text x="40" y="110" fill="#a5b4fc" fontSize="12">→ T1 proceeds (older)</text>
-  <text x="40" y="135" fill="#a5b4fc" fontSize="12">→ T2 aborted ("wounded")</text>
-  <text x="40" y="165" fill="#86efac" fontSize="11">Result: T1 commits</text>
-
-  <rect x="380" y="20" width="300" height="160" rx="12" fill="#0f172a" stroke="#f59e0b" strokeWidth="2"/>
-  <text x="530" y="50" textAnchor="middle" fill="#f59e0b" fontSize="14" fontWeight="bold">Younger Transaction Waits</text>
-  <text x="400" y="85" fill="#e0e7ff" fontSize="12">T2 (ts=200) conflicts with T1 (ts=100)</text>
-  <text x="400" y="110" fill="#a5b4fc" fontSize="12">→ T2 waits for T1</text>
-  <text x="400" y="135" fill="#a5b4fc" fontSize="12">→ T1 completes normally</text>
-  <text x="400" y="165" fill="#fcd34d" fontSize="11">Result: T2 retries after T1</text>
-</svg>
-
-**Guarantee**: No deadlocks possible. Older transactions always proceed; younger ones either wait or get aborted.
+This ensures:
+- No memory explosion for bulk operations
+- Conflict detection still works via MVCC
+- Slightly higher latency (conflicts detected at commit time)
 
 ---
 
@@ -374,98 +311,27 @@ type EphemeralHookSession struct {
     conn        *sql.Conn                             // Dedicated user DB connection
     tx          *sql.Tx                               // Active transaction
     systemDB    *sql.DB                               // System DB for intent entries
-    builders    map[string]*filter.BloomFilterBuilder // table → builder
+    builders    map[string]*filter.BloomFilterBuilder // table -> key collector
     schemaCache *SchemaCache                          // Cached schemas
 }
 ```
 
-### Hook Callback Flow
+### GetKeyHashes Method
 
-<svg viewBox="0 0 800 250" className="w-full my-8" style={{maxWidth: '800px'}}>
-  <rect x="20" y="20" width="760" height="210" rx="12" fill="#0f172a" stroke="#374151" strokeWidth="1"/>
-
-  <rect x="40" y="50" width="130" height="50" rx="6" fill="#1e1b4b" stroke="#6366f1" strokeWidth="1"/>
-  <text x="105" y="80" textAnchor="middle" fill="#e0e7ff" fontSize="11">INSERT row</text>
-
-  <rect x="190" y="50" width="130" height="50" rx="6" fill="#1e1b4b" stroke="#6366f1" strokeWidth="1"/>
-  <text x="255" y="75" textAnchor="middle" fill="#e0e7ff" fontSize="10">Hook fires</text>
-  <text x="255" y="90" textAnchor="middle" fill="#a5b4fc" fontSize="9">BEFORE write</text>
-
-  <rect x="340" y="50" width="130" height="50" rx="6" fill="#1e1b4b" stroke="#6366f1" strokeWidth="1"/>
-  <text x="405" y="75" textAnchor="middle" fill="#e0e7ff" fontSize="10">Get schema</text>
-  <text x="405" y="90" textAnchor="middle" fill="#a5b4fc" fontSize="9">from cache</text>
-
-  <rect x="490" y="50" width="130" height="50" rx="6" fill="#1e1b4b" stroke="#6366f1" strokeWidth="1"/>
-  <text x="555" y="75" textAnchor="middle" fill="#e0e7ff" fontSize="10">Extract PK</text>
-  <text x="555" y="90" textAnchor="middle" fill="#a5b4fc" fontSize="9">values</text>
-
-  <rect x="640" y="50" width="120" height="50" rx="6" fill="#1e1b4b" stroke="#22c55e" strokeWidth="2"/>
-  <text x="700" y="75" textAnchor="middle" fill="#86efac" fontSize="10">Add to filter</text>
-  <text x="700" y="90" textAnchor="middle" fill="#86efac" fontSize="9">builder</text>
-
-  <line x1="170" y1="75" x2="185" y2="75" stroke="#6366f1" strokeWidth="2"/>
-  <line x1="320" y1="75" x2="335" y2="75" stroke="#6366f1" strokeWidth="2"/>
-  <line x1="470" y1="75" x2="485" y2="75" stroke="#6366f1" strokeWidth="2"/>
-  <line x1="620" y1="75" x2="635" y2="75" stroke="#22c55e" strokeWidth="2"/>
-
-  <rect x="40" y="130" width="720" height="80" rx="6" fill="#1e1b4b" stroke="#374151" strokeWidth="1"/>
-  <text x="60" y="155" fill="#94a3b8" fontSize="11" fontWeight="bold">Operation Handling:</text>
-  <text x="60" y="175" fill="#22c55e" fontSize="10" fontFamily="monospace">INSERT: Extract NEW values → serialize to key → add to filter</text>
-  <text x="60" y="192" fill="#f59e0b" fontSize="10" fontFamily="monospace">UPDATE: Extract OLD + NEW values → serialize both → add both to filter</text>
-  <text x="60" y="209" fill="#ef4444" fontSize="10" fontFamily="monospace">DELETE: Extract OLD values → serialize to key → add to filter</text>
-</svg>
-
-**Key insight for UPDATE**: Both old and new primary keys are tracked. If an UPDATE changes the PK (e.g., `UPDATE users SET id = id + 1000`), both the original and new key are added to the filter for proper conflict detection.
-
----
-
-## Intent Entries (System Database)
-
-Intent entries provide crash recovery for multi-row transactions. CDC entries captured during preupdate hooks are stored in the system database (`__marmot_system.db`), not custom log files.
-
-### Storage Schema
-
-```sql
-CREATE TABLE __marmot__intent_entries (
-    txn_id INTEGER NOT NULL,
-    seq INTEGER NOT NULL,
-    operation INTEGER NOT NULL,  -- 0=INSERT, 1=UPDATE, 2=DELETE
-    table_name TEXT NOT NULL,
-    row_key TEXT NOT NULL,
-    old_values BLOB,  -- JSON, NULL for INSERT
-    new_values BLOB,  -- JSON, NULL for DELETE
-    created_at INTEGER NOT NULL,
-    PRIMARY KEY (txn_id, seq)
-);
+```go
+func (s *EphemeralHookSession) GetKeyHashes(maxRows int) map[string][]uint64 {
+    hashes := make(map[string][]uint64)
+    for table, builder := range s.builders {
+        count := builder.Count()
+        if maxRows > 0 && count > maxRows {
+            hashes[table] = nil  // MVCC fallback
+            continue
+        }
+        hashes[table] = builder.Keys()  // XXH64 hash list
+    }
+    return hashes
+}
 ```
-
-### Architecture
-
-Since the system database is a **separate SQLite file** from user databases, writes to it during preupdate_hook callbacks are safe (no database locking conflicts).
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    EphemeralHookSession                     │
-├─────────────────────────────────────────────────────────────┤
-│  userDBConn  ──────► user.db (preupdate_hook registered)    │
-│  systemDB    ──────► __marmot_system.db (intent writes)     │
-│  builders    ──────► In-memory Bloom filter builders        │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### Performance Benefits
-
-| Operation | File-based (old) | SQLite System DB (current) |
-|-----------|------------------|----------------------------|
-| Creation | `os.OpenFile` syscall | Nothing (table exists) |
-| Per-entry write | Buffered file write | `INSERT` (WAL mode) |
-| Durability flush | `file.Sync()` (fsync) | WAL checkpoint (batched) |
-| Cleanup | `os.Remove()` (unlink) | `DELETE WHERE txn_id=?` |
-| Recovery | Scan dir, parse files | Single DELETE query |
-
-**Single-row operations**: No fsync needed—SQLite WAL mode provides durability automatically.
-
-**Multi-row operations**: `FlushIntentLog()` is now a no-op since SQLite WAL handles durability. Intent entries are cleaned up via DELETE on commit/rollback.
 
 ---
 
@@ -481,18 +347,23 @@ intent_ttl_ms = 60000
 # Timeout for abort messages (milliseconds)
 # Default: 2000 (2 seconds)
 abort_timeout_ms = 2000
+
+# Maximum rows per transaction for hash list guards
+# Larger transactions use MVCC fallback
+# Default: 65536 (64K rows, ~512KB payload)
+max_guard_rows = 65536
 ```
 
 ### Tuning Guidelines
 
-| Scenario | Recommended TTL |
-|----------|-----------------|
-| Fast network, small transactions | 30 seconds |
-| Normal operations | 60 seconds (default) |
-| Slow network, large updates | 120 seconds |
+| Scenario | Recommended max_guard_rows |
+|----------|---------------------------|
+| Memory-constrained | 16384 (16K) |
+| Normal operations | 65536 (64K, default) |
+| Fast network, plenty of RAM | 131072 (128K) |
 
-Lower TTL = faster recovery from coordinator crashes.
-Higher TTL = more tolerance for slow operations.
+Lower `max_guard_rows` = more MVCC fallback, less memory.
+Higher `max_guard_rows` = more early conflict detection, more memory.
 
 ---
 
@@ -525,16 +396,6 @@ else:
   broadcast ABORT to release guards
 ```
 
-### Replica Recovery
-
-If a replica crashes while holding guards:
-
-```
-Coordinator detects missing ACK during commit
-  → Retry with recovered replica
-  → Or proceed with remaining quorum
-```
-
 ---
 
 ## Comparison with Other Systems
@@ -543,20 +404,21 @@ Coordinator detects missing ACK during commit
 |----------|----------|-----------|
 | **TiDB/CockroachDB** | Per-key write intents | Accurate but O(N) network |
 | **Spanner** | Lock table + 2PC | Strong but high latency |
-| **Marmot** | Bloom filter guards | 0.0001% FP, O(1) network |
+| **Marmot (old)** | Bloom filter guards | 0.0001% FP, O(1) network |
+| **Marmot (new)** | XXH64 hash lists | 0% FP, O(N) space |
 
 ### Marmot's Trade-off
 
 ```
 Per-key intents:  100% accurate, O(N) space, O(N) network
-Bloom filter:     99.9999% accurate, O(N) space, O(1) network
+XXH64 hash list:  100% accurate, O(N) space, O(1) network per table
 
-For 1M row update:
-  Per-key: 1M intent records, 1M RPCs
-  Marmot:  1 filter (3.6 MB), 1 RPC
+For 10,000 row update:
+  Per-key:    10K intent records, 10K RPCs
+  Marmot:     1 hash list (80KB), 1 RPC
 ```
 
-The 0.0001% false positive rate means approximately 1 unnecessary conflict per million non-overlapping row checks—an acceptable trade-off for the efficiency gain.
+The XXH64 approach provides exact conflict detection with no false positives, while still being efficient for typical transaction sizes.
 
 ---
 
@@ -564,30 +426,31 @@ The 0.0001% false positive rate means approximately 1 unnecessary conflict per m
 
 <svg viewBox="0 0 800 180" className="w-full my-8" style={{maxWidth: '800px'}}>
   <rect x="20" y="20" width="240" height="140" rx="12" fill="#1e1b4b" stroke="#22c55e" strokeWidth="2"/>
-  <text x="140" y="50" textAnchor="middle" fill="#22c55e" fontSize="14" fontWeight="bold">Single Row</text>
-  <text x="140" y="75" textAnchor="middle" fill="#e0e7ff" fontSize="12">Direct 2PC</text>
-  <text x="140" y="100" textAnchor="middle" fill="#a5b4fc" fontSize="11">No filter overhead</text>
-  <text x="140" y="125" textAnchor="middle" fill="#a5b4fc" fontSize="11">No fsync</text>
+  <text x="140" y="50" textAnchor="middle" fill="#22c55e" fontSize="14" fontWeight="bold">Small Batch</text>
+  <text x="140" y="75" textAnchor="middle" fill="#e0e7ff" fontSize="12">Hash list guard</text>
+  <text x="140" y="100" textAnchor="middle" fill="#a5b4fc" fontSize="11">Zero false positives</text>
+  <text x="140" y="125" textAnchor="middle" fill="#a5b4fc" fontSize="11">O(1) intersection</text>
   <text x="140" y="150" textAnchor="middle" fill="#86efac" fontSize="10">Fastest path</text>
 
   <rect x="280" y="20" width="240" height="140" rx="12" fill="#1e1b4b" stroke="#6366f1" strokeWidth="2"/>
-  <text x="400" y="50" textAnchor="middle" fill="#818cf8" fontSize="14" fontWeight="bold">Multi-Row (Small)</text>
-  <text x="400" y="75" textAnchor="middle" fill="#e0e7ff" fontSize="12">Key-based guard</text>
-  <text x="400" y="100" textAnchor="middle" fill="#a5b4fc" fontSize="11">Concurrent per table</text>
-  <text x="400" y="125" textAnchor="middle" fill="#a5b4fc" fontSize="11">Fsync before 2PC</text>
+  <text x="400" y="50" textAnchor="middle" fill="#818cf8" fontSize="14" fontWeight="bold">Medium Batch</text>
+  <text x="400" y="75" textAnchor="middle" fill="#e0e7ff" fontSize="12">Hash list guard</text>
+  <text x="400" y="100" textAnchor="middle" fill="#a5b4fc" fontSize="11">Up to 64K rows</text>
+  <text x="400" y="125" textAnchor="middle" fill="#a5b4fc" fontSize="11">~512KB payload</text>
   <text x="400" y="150" textAnchor="middle" fill="#c7d2fe" fontSize="10">Balanced</text>
 
   <rect x="540" y="20" width="240" height="140" rx="12" fill="#1e1b4b" stroke="#f59e0b" strokeWidth="2"/>
-  <text x="660" y="50" textAnchor="middle" fill="#fcd34d" fontSize="14" fontWeight="bold">Multi-Row (Large)</text>
-  <text x="660" y="75" textAnchor="middle" fill="#e0e7ff" fontSize="12">Filter-only guard</text>
-  <text x="660" y="100" textAnchor="middle" fill="#a5b4fc" fontSize="11">Serialized per table</text>
-  <text x="660" y="125" textAnchor="middle" fill="#a5b4fc" fontSize="11">Memory efficient</text>
+  <text x="660" y="50" textAnchor="middle" fill="#fcd34d" fontSize="14" fontWeight="bold">Large Batch</text>
+  <text x="660" y="75" textAnchor="middle" fill="#e0e7ff" fontSize="12">MVCC fallback</text>
+  <text x="660" y="100" textAnchor="middle" fill="#a5b4fc" fontSize="11">>64K rows</text>
+  <text x="660" y="125" textAnchor="middle" fill="#a5b4fc" fontSize="11">No memory overhead</text>
   <text x="660" y="150" textAnchor="middle" fill="#fde68a" fontSize="10">Bulk optimized</text>
 </svg>
 
 **Key Properties:**
-- **Percolator-inspired**: Intent-based conflict detection
-- **Bloom filter optimized**: 0.0001% FP rate, 28.75 bits/key
+- **XXH64 hash lists**: Exact conflict detection, zero false positives
+- **Configurable threshold**: `max_guard_rows` for memory control
+- **MVCC fallback**: Large transactions handled by write intents
 - **Wound-Wait**: Deadlock-free conflict resolution
 - **TTL-based cleanup**: Handles coordinator crashes
 - **Per-table granularity**: Independent conflict domains

@@ -166,7 +166,7 @@ func (p *PendingLocalExecution) GetTotalRowCount() int64 {
 	return total
 }
 
-// BuildFilters returns Bloom filters for each affected table
+// BuildFilters returns Bloom filters for each affected table (deprecated, use GetKeyHashes)
 func (p *PendingLocalExecution) BuildFilters() map[string][]byte {
 	if p.session == nil {
 		return nil
@@ -179,6 +179,16 @@ func (p *PendingLocalExecution) BuildFilters() map[string][]byte {
 		}
 	}
 	return result
+}
+
+// GetKeyHashes returns XXH64 hashes of affected row keys per table.
+// Used for MutationGuard hash list conflict detection.
+// Returns nil for tables exceeding maxRows to let MVCC handle conflicts.
+func (p *PendingLocalExecution) GetKeyHashes(maxRows int) map[string][]uint64 {
+	if p.session == nil {
+		return nil
+	}
+	return p.session.GetKeyHashes(maxRows)
 }
 
 // Commit finalizes the local transaction

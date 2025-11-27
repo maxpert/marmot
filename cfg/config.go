@@ -150,6 +150,7 @@ type CoordinatorConfiguration struct {
 	CommitTimeoutMS  int `toml:"commit_timeout_ms"`  // Timeout for commit phase
 	AbortTimeoutMS   int `toml:"abort_timeout_ms"`   // Timeout for abort phase
 	IntentTTLMS      int `toml:"intent_ttl_ms"`      // TTL for MutationGuard intents (default: 30000)
+	MaxGuardRows     int `toml:"max_guard_rows"`     // Max rows for MutationGuard hash list (default: 65536, ~512KB)
 }
 
 // DDLConfiguration controls DDL replication behavior
@@ -280,6 +281,7 @@ var Config = &Configuration{
 		CommitTimeoutMS:  2000,  // 2 second timeout for commit phase
 		AbortTimeoutMS:   2000,  // 2 second timeout for abort phase
 		IntentTTLMS:      30000, // 30 second TTL for MutationGuard intents
+		MaxGuardRows:     65536, // 64K rows max for MutationGuard (~512KB payload)
 	},
 
 	DDL: DDLConfiguration{

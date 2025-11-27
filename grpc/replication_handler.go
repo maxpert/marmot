@@ -7,7 +7,6 @@ import (
 	"github.com/maxpert/marmot/db"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/protocol"
-	"github.com/maxpert/marmot/protocol/filter"
 	"github.com/rs/zerolog/log"
 )
 
@@ -625,33 +624,24 @@ func min(a, b int) int {
 	return b
 }
 
-// checkMutationGuardConflicts checks for conflicts using MutationGuard filters
+// checkMutationGuardConflicts checks for conflicts using MutationGuard hash list.
+// Uses exact hash set intersection - no false positives.
 func (rh *ReplicationHandler) checkMutationGuardConflicts(req *TransactionRequest) ConflictResult {
 	for table, guard := range req.MutationGuards {
-		// Deserialize Bloom filter
-		f, err := filter.DeserializeBloom(guard.Filter)
-		if err != nil {
-			log.Warn().Err(err).Str("table", table).Msg("Failed to deserialize MutationGuard filter")
-			continue
-		}
-
-		// Extract keys from statements for overlap check
-		keys := rh.extractKeysForTable(req.Statements, table)
+		// Convert hash slice to KeySet for O(1) lookup
+		keySet := KeySetFromSlice(guard.KeyHashes)
 
 		// Build active guard for conflict check
-		// Filter-only (no keys) guards are serialized per table
 		activeGuard := &ActiveGuard{
 			TxnID:  req.TxnId,
 			Table:  table,
-			Filter: f,
-			Keys:   keys,
+			KeySet: keySet,
 			Timestamp: hlc.Timestamp{
 				WallTime: req.Timestamp.WallTime,
 				Logical:  req.Timestamp.Logical,
 				NodeID:   req.Timestamp.NodeId,
 			},
-			RowCount:     guard.ExpectedRowCount,
-			IsFilterOnly: len(keys) == 0,
+			RowCount: guard.ExpectedRowCount,
 		}
 
 		// Check for conflicts with existing guards
@@ -662,7 +652,7 @@ func (rh *ReplicationHandler) checkMutationGuardConflicts(req *TransactionReques
 				Uint64("conflicting_txn", result.ConflictingTxn).
 				Str("table", table).
 				Bool("should_wait", result.ShouldWait).
-				Bool("filter_only", activeGuard.IsFilterOnly).
+				Int("key_count", len(keySet)).
 				Msg("MutationGuard conflict detected")
 			return result
 		}
@@ -678,46 +668,27 @@ func (rh *ReplicationHandler) registerMutationGuards(req *TransactionRequest) {
 	}
 
 	for table, guard := range req.MutationGuards {
-		f, err := filter.DeserializeBloom(guard.Filter)
-		if err != nil {
-			continue
-		}
+		// Convert hash slice to KeySet for O(1) lookup
+		keySet := KeySetFromSlice(guard.KeyHashes)
 
-		keys := rh.extractKeysForTable(req.Statements, table)
 		activeGuard := &ActiveGuard{
 			TxnID:  req.TxnId,
 			Table:  table,
-			Filter: f,
-			Keys:   keys,
+			KeySet: keySet,
 			Timestamp: hlc.Timestamp{
 				WallTime: req.Timestamp.WallTime,
 				Logical:  req.Timestamp.Logical,
 				NodeID:   req.Timestamp.NodeId,
 			},
-			RowCount:     guard.ExpectedRowCount,
-			IsFilterOnly: len(keys) == 0,
+			RowCount: guard.ExpectedRowCount,
 		}
 
 		if err := rh.guardRegistry.Register(activeGuard); err != nil {
 			log.Warn().Err(err).
 				Uint64("txn_id", req.TxnId).
 				Str("table", table).
+				Int("key_count", len(keySet)).
 				Msg("Failed to register MutationGuard")
 		}
 	}
-}
-
-// extractKeysForTable extracts hashed row keys for a specific table from statements
-func (rh *ReplicationHandler) extractKeysForTable(stmts []*Statement, table string) []uint64 {
-	var keys []uint64
-	for _, stmt := range stmts {
-		if stmt.TableName != table {
-			continue
-		}
-		rowKey := stmt.GetRowKey()
-		if rowKey != "" {
-			keys = append(keys, filter.HashRowKeyXXH64(rowKey))
-		}
-	}
-	return keys
 }

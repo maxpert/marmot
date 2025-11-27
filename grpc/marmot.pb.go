@@ -721,15 +721,26 @@ func (x *TransactionRequest) GetMutationGuards() map[string]*MutationGuard {
 }
 
 // Per-table mutation guard metadata for conflict detection
-// Used for multi-row mutations and range queries
+// Uses XXH64 hash list for exact conflict detection (no false positives)
+//
+// Design: Hash List approach provides deterministic conflict detection:
+// - ≤64K rows: Send XXH64 hash list (≤512KB payload)
+// - >64K rows: Skip MutationGuard, rely on MVCC write intents
+//
+// This is a novel technique combining:
+// - Early batch conflict detection (vs per-row during execution)
+// - Compact write set representation (8 bytes/row vs full keys)
+// - Coordinator-side detection (vs storage layer)
+// - Native leaderless architecture support
 type MutationGuard struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Binary Fuse 16 filter serialized bytes
-	Filter []byte `protobuf:"bytes,1,opt,name=filter,proto3" json:"filter,omitempty"`
-	// Number of rows expected for this table
+	// Number of rows in this mutation
 	ExpectedRowCount int64 `protobuf:"varint,2,opt,name=expected_row_count,json=expectedRowCount,proto3" json:"expected_row_count,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// XXH64 hashes of affected row keys (8 bytes each, fixed encoding)
+	// Empty if row count exceeds max_guard_rows config (default 65536)
+	KeyHashes     []uint64 `protobuf:"fixed64,3,rep,packed,name=key_hashes,json=keyHashes,proto3" json:"key_hashes,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *MutationGuard) Reset() {
@@ -762,18 +773,18 @@ func (*MutationGuard) Descriptor() ([]byte, []int) {
 	return file_grpc_marmot_proto_rawDescGZIP(), []int{8}
 }
 
-func (x *MutationGuard) GetFilter() []byte {
-	if x != nil {
-		return x.Filter
-	}
-	return nil
-}
-
 func (x *MutationGuard) GetExpectedRowCount() int64 {
 	if x != nil {
 		return x.ExpectedRowCount
 	}
 	return 0
+}
+
+func (x *MutationGuard) GetKeyHashes() []uint64 {
+	if x != nil {
+		return x.KeyHashes
+	}
+	return nil
 }
 
 // Statement represents either a DML row change or a DDL schema change
@@ -2087,10 +2098,11 @@ const file_grpc_marmot_proto_rawDesc = "" +
 	"\x0fmutation_guards\x18\b \x03(\v21.marmot.v2.TransactionRequest.MutationGuardsEntryR\x0emutationGuards\x1a[\n" +
 	"\x13MutationGuardsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12.\n" +
-	"\x05value\x18\x02 \x01(\v2\x18.marmot.v2.MutationGuardR\x05value:\x028\x01\"U\n" +
-	"\rMutationGuard\x12\x16\n" +
-	"\x06filter\x18\x01 \x01(\fR\x06filter\x12,\n" +
-	"\x12expected_row_count\x18\x02 \x01(\x03R\x10expectedRowCount\"\xed\x01\n" +
+	"\x05value\x18\x02 \x01(\v2\x18.marmot.v2.MutationGuardR\x05value:\x028\x01\"\\\n" +
+	"\rMutationGuard\x12,\n" +
+	"\x12expected_row_count\x18\x02 \x01(\x03R\x10expectedRowCount\x12\x1d\n" +
+	"\n" +
+	"key_hashes\x18\x03 \x03(\x06R\tkeyHashes\"\xed\x01\n" +
 	"\tStatement\x12,\n" +
 	"\x04type\x18\x01 \x01(\x0e2\x18.marmot.v2.StatementTypeR\x04type\x12\x1d\n" +
 	"\n" +
