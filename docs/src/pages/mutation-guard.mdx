@@ -371,9 +371,9 @@ SQLite's preupdate hook captures every row modification before it happens:
 
 ```go
 type EphemeralHookSession struct {
-    conn        *sql.Conn                             // Dedicated connection
+    conn        *sql.Conn                             // Dedicated user DB connection
     tx          *sql.Tx                               // Active transaction
-    log         *intentlog.Log                        // CDC event log
+    systemDB    *sql.DB                               // System DB for intent entries
     builders    map[string]*filter.BloomFilterBuilder // table → builder
     schemaCache *SchemaCache                          // Cached schemas
 }
@@ -419,31 +419,53 @@ type EphemeralHookSession struct {
 
 ---
 
-## Intent Log
+## Intent Entries (System Database)
 
-The intent log provides crash recovery for multi-row transactions.
+Intent entries provide crash recovery for multi-row transactions. CDC entries captured during preupdate hooks are stored in the system database (`__marmot_system.db`), not custom log files.
 
-### File Format
+### Storage Schema
+
+```sql
+CREATE TABLE __marmot__intent_entries (
+    txn_id INTEGER NOT NULL,
+    seq INTEGER NOT NULL,
+    operation INTEGER NOT NULL,  -- 0=INSERT, 1=UPDATE, 2=DELETE
+    table_name TEXT NOT NULL,
+    row_key TEXT NOT NULL,
+    old_values BLOB,  -- JSON, NULL for INSERT
+    new_values BLOB,  -- JSON, NULL for DELETE
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (txn_id, seq)
+);
+```
+
+### Architecture
+
+Since the system database is a **separate SQLite file** from user databases, writes to it during preupdate_hook callbacks are safe (no database locking conflicts).
 
 ```
-[HEADER: 24 bytes]
-  Magic:     "MLOG" (4 bytes)
-  Version:   1 (2 bytes)
-  Reserved:  (2 bytes)
-  TxnID:     uint64 (8 bytes)
-  CreatedAt: int64 nanoseconds (8 bytes)
-
-[ENTRIES...]
-  Each entry:
-  [len:4][seq:8][op:1][table_len:2][table][key_len:4][key]
-  [old_len:4][old_json][new_len:4][new_json][crc32:4]
+┌─────────────────────────────────────────────────────────────┐
+│                    EphemeralHookSession                     │
+├─────────────────────────────────────────────────────────────┤
+│  userDBConn  ──────► user.db (preupdate_hook registered)    │
+│  systemDB    ──────► __marmot_system.db (intent writes)     │
+│  builders    ──────► In-memory Bloom filter builders        │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-### Performance Optimization
+### Performance Benefits
 
-**Single-row operations**: No fsync—intent log is created but not durably persisted. Deleted on commit.
+| Operation | File-based (old) | SQLite System DB (current) |
+|-----------|------------------|----------------------------|
+| Creation | `os.OpenFile` syscall | Nothing (table exists) |
+| Per-entry write | Buffered file write | `INSERT` (WAL mode) |
+| Durability flush | `file.Sync()` (fsync) | WAL checkpoint (batched) |
+| Cleanup | `os.Remove()` (unlink) | `DELETE WHERE txn_id=?` |
+| Recovery | Scan dir, parse files | Single DELETE query |
 
-**Multi-row operations**: `FlushIntentLog()` called before 2PC to ensure durability. Enables recovery if coordinator crashes mid-transaction.
+**Single-row operations**: No fsync needed—SQLite WAL mode provides durability automatically.
+
+**Multi-row operations**: `FlushIntentLog()` is now a no-op since SQLite WAL handles durability. Intent entries are cleaned up via DELETE on commit/rollback.
 
 ---
 
@@ -488,8 +510,14 @@ Timeline:
 
 ### Coordinator Recovery
 
-On restart, the coordinator checks its intent log:
+On restart, orphaned intent entries are cleaned up from the system database:
 
+```sql
+-- Startup cleanup: remove all orphaned entries from crashed transactions
+DELETE FROM __marmot__intent_entries;
+```
+
+For in-progress transactions:
 ```
 if transaction was committed locally:
   resume replication to replicas
@@ -563,4 +591,4 @@ The 0.0001% false positive rate means approximately 1 unnecessary conflict per m
 - **Wound-Wait**: Deadlock-free conflict resolution
 - **TTL-based cleanup**: Handles coordinator crashes
 - **Per-table granularity**: Independent conflict domains
-- **Fsync optimization**: Only multi-row ops sync to disk
+- **SQLite-backed intents**: WAL mode for durability, no custom log files

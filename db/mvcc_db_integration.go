@@ -205,8 +205,9 @@ func (p *PendingLocalExecution) GetIntentEntries() ([]*IntentEntry, error) {
 	return p.session.GetIntentEntries()
 }
 
-// FlushIntentLog fsyncs the intent log to disk.
-// Call ONLY for multi-row operations before 2PC.
+// FlushIntentLog is a no-op with SQLite-backed intent storage.
+// SQLite WAL mode handles durability automatically.
+// Kept for API compatibility.
 func (p *PendingLocalExecution) FlushIntentLog() error {
 	if p.session == nil {
 		return nil

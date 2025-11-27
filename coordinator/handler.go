@@ -36,7 +36,8 @@ type PendingExecution interface {
 	BuildFilters() map[string][]byte
 	Commit() error
 	Rollback() error
-	// FlushIntentLog fsyncs intent log to disk. Call ONLY for multi-row ops before 2PC.
+	// FlushIntentLog is a no-op with SQLite-backed intent storage (WAL handles durability).
+	// Kept for API compatibility.
 	FlushIntentLog() error
 }
 
@@ -368,10 +369,9 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, consistency
 
 	// If we have pending execution with multiple rows, build MutationGuards
 	if pendingExec != nil && rowsAffected > 1 {
-		// Flush intent log for multi-row operations before 2PC
-		if err := pendingExec.FlushIntentLog(); err != nil {
-			log.Warn().Err(err).Msg("Failed to flush intent log")
-		}
+		// FlushIntentLog is a no-op with SQLite-backed storage (WAL handles durability)
+		// Kept for backwards compatibility
+		_ = pendingExec.FlushIntentLog()
 		filters := pendingExec.BuildFilters()
 		rowCounts := pendingExec.GetRowCounts()
 
