@@ -4,6 +4,8 @@ import (
 	"encoding/base64"
 	"fmt"
 	"strings"
+
+	"github.com/cespare/xxhash/v2"
 )
 
 // NullSentinel is used to represent NULL values in row keys.
@@ -97,4 +99,61 @@ func sortStrings(s []string) {
 			}
 		}
 	}
+}
+
+// HashRowKeyXXH64 creates a uint64 hash from a row key string using XXH64.
+func HashRowKeyXXH64(rowKey string) uint64 {
+	return xxhash.Sum64String(rowKey)
+}
+
+// HashPrimaryKeyXXH64 creates a uint64 hash from table name and primary key values.
+func HashPrimaryKeyXXH64(table string, pkValues map[string][]byte) uint64 {
+	h := xxhash.New()
+	h.Write([]byte(table))
+
+	// Sort keys for deterministic hashing
+	keys := make([]string, 0, len(pkValues))
+	for k := range pkValues {
+		keys = append(keys, k)
+	}
+	sortStrings(keys)
+
+	for _, k := range keys {
+		h.Write([]byte(k))
+		h.Write(pkValues[k])
+	}
+
+	return h.Sum64()
+}
+
+// KeyHashCollector collects XXH64 hashes of row keys for conflict detection.
+// Stores only unique hashes for O(1) intersection checking.
+type KeyHashCollector struct {
+	keys map[uint64]struct{}
+}
+
+// NewKeyHashCollector creates a new collector.
+func NewKeyHashCollector() *KeyHashCollector {
+	return &KeyHashCollector{
+		keys: make(map[uint64]struct{}),
+	}
+}
+
+// AddRowKey hashes and adds a row key string.
+func (c *KeyHashCollector) AddRowKey(rowKey string) {
+	c.keys[HashRowKeyXXH64(rowKey)] = struct{}{}
+}
+
+// Count returns the number of unique keys.
+func (c *KeyHashCollector) Count() int {
+	return len(c.keys)
+}
+
+// Keys returns all hashes as a slice.
+func (c *KeyHashCollector) Keys() []uint64 {
+	result := make([]uint64, 0, len(c.keys))
+	for k := range c.keys {
+		result = append(result, k)
+	}
+	return result
 }

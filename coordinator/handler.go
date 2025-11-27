@@ -34,7 +34,6 @@ type MVCCDatabaseProvider interface {
 type PendingExecution interface {
 	GetRowCounts() map[string]int64
 	GetTotalRowCount() int64
-	BuildFilters() map[string][]byte // Deprecated: use GetKeyHashes
 	GetKeyHashes(maxRows int) map[string][]uint64
 	Commit() error
 	Rollback() error

@@ -93,29 +93,19 @@ func TestMutationGuard_MultiRowInsert(t *testing.T) {
 		t.Errorf("Expected 3 total rows, got %d", totalRows)
 	}
 
-	// Check filters
-	filters := pendingExec.BuildFilters()
-	if filters == nil {
-		t.Fatal("Expected filters, got nil")
+	// Check key hashes
+	keyHashes := pendingExec.GetKeyHashes(0) // 0 = no limit
+	if keyHashes == nil {
+		t.Fatal("Expected key hashes, got nil")
 	}
 
-	filterBytes, ok := filters["users"]
+	hashes, ok := keyHashes["users"]
 	if !ok {
-		t.Fatal("Expected filter for 'users' table")
+		t.Fatal("Expected hashes for 'users' table")
 	}
 
-	if len(filterBytes) == 0 {
-		t.Fatal("Expected non-empty filter bytes")
-	}
-
-	// Deserialize and verify filter
-	bloomFilter, err := filter.DeserializeBloom(filterBytes)
-	if err != nil {
-		t.Fatalf("Failed to deserialize bloom filter: %v", err)
-	}
-
-	if bloomFilter.Count() != 3 {
-		t.Errorf("Expected 3 elements in filter, got %d", bloomFilter.Count())
+	if len(hashes) != 3 {
+		t.Errorf("Expected 3 hashes, got %d", len(hashes))
 	}
 
 	// Commit the transaction
@@ -270,25 +260,19 @@ func TestMutationGuard_BatchUpdate(t *testing.T) {
 		t.Errorf("Expected 3 rows updated, got %d", totalRows)
 	}
 
-	// Check filters
-	filters := pendingExec.BuildFilters()
-	if filters == nil {
-		t.Fatal("Expected filters, got nil")
+	// Check key hashes
+	keyHashes := pendingExec.GetKeyHashes(0)
+	if keyHashes == nil {
+		t.Fatal("Expected key hashes, got nil")
 	}
 
-	filterBytes, ok := filters["accounts"]
+	hashes, ok := keyHashes["accounts"]
 	if !ok {
-		t.Fatal("Expected filter for 'accounts' table")
+		t.Fatal("Expected hashes for 'accounts' table")
 	}
 
-	// Deserialize and verify filter
-	bloomFilter, err := filter.DeserializeBloom(filterBytes)
-	if err != nil {
-		t.Fatalf("Failed to deserialize bloom filter: %v", err)
-	}
-
-	if bloomFilter.Count() != 3 {
-		t.Errorf("Expected 3 elements in filter, got %d", bloomFilter.Count())
+	if len(hashes) != 3 {
+		t.Errorf("Expected 3 hashes, got %d", len(hashes))
 	}
 
 	// Commit
@@ -426,24 +410,19 @@ func TestMutationGuard_CompositeKeyWithSeparator(t *testing.T) {
 		t.Errorf("Expected 2 distinct rows (no collision), got %d", totalRows)
 	}
 
-	// Verify filter has 2 distinct entries
-	filters := pendingExec.BuildFilters()
-	if filters == nil {
-		t.Fatal("Expected filters, got nil")
+	// Verify we have 2 distinct hashes
+	keyHashes := pendingExec.GetKeyHashes(0)
+	if keyHashes == nil {
+		t.Fatal("Expected key hashes, got nil")
 	}
 
-	filterBytes := filters["composite_test"]
-	if filterBytes == nil {
-		t.Fatal("Expected filter for composite_test table")
+	hashes := keyHashes["composite_test"]
+	if hashes == nil {
+		t.Fatal("Expected hashes for composite_test table")
 	}
 
-	bloomFilter, err := filter.DeserializeBloom(filterBytes)
-	if err != nil {
-		t.Fatalf("Failed to deserialize bloom filter: %v", err)
-	}
-
-	if bloomFilter.Count() != 2 {
-		t.Errorf("Expected 2 distinct elements in filter (collision prevented), got %d", bloomFilter.Count())
+	if len(hashes) != 2 {
+		t.Errorf("Expected 2 distinct hashes (collision prevented), got %d", len(hashes))
 	}
 
 	err = pendingExec.Commit()
@@ -511,35 +490,35 @@ func TestMutationGuard_UpdatePKChange(t *testing.T) {
 		t.Errorf("Expected 2 keys tracked (old=1, new=100), got %d", totalKeys)
 	}
 
-	filters := pendingExec.BuildFilters()
-	if filters == nil {
-		t.Fatal("Expected filters, got nil")
+	keyHashes := pendingExec.GetKeyHashes(0)
+	if keyHashes == nil {
+		t.Fatal("Expected key hashes, got nil")
 	}
 
-	filterBytes := filters["pk_change_test"]
-	if filterBytes == nil {
-		t.Fatal("Expected filter for pk_change_test table")
+	hashes := keyHashes["pk_change_test"]
+	if hashes == nil {
+		t.Fatal("Expected hashes for pk_change_test table")
 	}
 
-	bloomFilter, err := filter.DeserializeBloom(filterBytes)
-	if err != nil {
-		t.Fatalf("Failed to deserialize bloom filter: %v", err)
+	// Should have 2 hashes: old key (id=1) and new key (id=100)
+	if len(hashes) != 2 {
+		t.Errorf("Expected 2 hashes (old and new PK), got %d", len(hashes))
 	}
 
-	// Filter should have 2 entries: old key (id=1) and new key (id=100)
-	if bloomFilter.Count() != 2 {
-		t.Errorf("Expected 2 keys in filter (old and new PK), got %d", bloomFilter.Count())
-	}
-
-	// Verify both keys are in the filter
+	// Verify both keys are in the hash set
 	oldKeyHash := filter.HashRowKeyXXH64("pk_change_test:1")
 	newKeyHash := filter.HashRowKeyXXH64("pk_change_test:100")
 
-	if !bloomFilter.Contains(oldKeyHash) {
-		t.Error("Filter should contain old PK (id=1)")
+	hashSet := make(map[uint64]struct{})
+	for _, h := range hashes {
+		hashSet[h] = struct{}{}
 	}
-	if !bloomFilter.Contains(newKeyHash) {
-		t.Error("Filter should contain new PK (id=100)")
+
+	if _, ok := hashSet[oldKeyHash]; !ok {
+		t.Error("Hash set should contain old PK (id=1)")
+	}
+	if _, ok := hashSet[newKeyHash]; !ok {
+		t.Error("Hash set should contain new PK (id=100)")
 	}
 
 	err = pendingExec.Commit()
@@ -618,15 +597,12 @@ func TestMutationGuard_StringPKWithSpecialChars(t *testing.T) {
 		t.Errorf("Expected 3 rows, got %d", totalRows)
 	}
 
-	filters := pendingExec.BuildFilters()
-	bloomFilter, err := filter.DeserializeBloom(filters["string_pk_test"])
-	if err != nil {
-		t.Fatalf("Failed to deserialize bloom filter: %v", err)
-	}
+	keyHashes := pendingExec.GetKeyHashes(0)
+	hashes := keyHashes["string_pk_test"]
 
 	// All 3 should be distinct
-	if bloomFilter.Count() != 3 {
-		t.Errorf("Expected 3 distinct elements in filter, got %d", bloomFilter.Count())
+	if len(hashes) != 3 {
+		t.Errorf("Expected 3 distinct hashes, got %d", len(hashes))
 	}
 
 	err = pendingExec.Commit()
@@ -681,11 +657,11 @@ func TestMutationGuard_ASTHookCompatibility(t *testing.T) {
 		t.Fatalf("Failed to execute with hooks: %v", err)
 	}
 
-	// Get the filter (contains the hook-generated row key hash)
-	filters := pendingExec.BuildFilters()
-	hookFilter, err := filter.DeserializeBloom(filters["compat_test"])
-	if err != nil {
-		t.Fatalf("Failed to deserialize bloom filter: %v", err)
+	// Get the key hashes
+	keyHashes := pendingExec.GetKeyHashes(0)
+	hashes := keyHashes["compat_test"]
+	if len(hashes) != 1 {
+		t.Fatalf("Expected 1 hash, got %d", len(hashes))
 	}
 
 	// Generate the expected row key using AST path
@@ -705,11 +681,11 @@ func TestMutationGuard_ASTHookCompatibility(t *testing.T) {
 		t.Errorf("AST row key mismatch: got %q, expected %q", astRowKey, expectedKey)
 	}
 
-	// Hash the AST key and check if it's in the hook-generated filter
+	// Hash the AST key and check if it matches the hook-generated hash
 	astKeyHash := filter.HashRowKeyXXH64(astRowKey)
-	if !hookFilter.Contains(astKeyHash) {
-		t.Errorf("Hook filter does not contain AST-generated key hash!\n  AST key: %q\n  Hash: %d",
-			astRowKey, astKeyHash)
+	if hashes[0] != astKeyHash {
+		t.Errorf("Hook hash does not match AST-generated key hash!\n  AST key: %q\n  AST hash: %d\n  Hook hash: %d",
+			astRowKey, astKeyHash, hashes[0])
 	}
 
 	err = pendingExec.Commit()
@@ -764,11 +740,11 @@ func TestMutationGuard_CompositeKeyCompatibility(t *testing.T) {
 		t.Fatalf("Failed to execute with hooks: %v", err)
 	}
 
-	// Get the filter
-	filters := pendingExec.BuildFilters()
-	hookFilter, err := filter.DeserializeBloom(filters["composite_compat"])
-	if err != nil {
-		t.Fatalf("Failed to deserialize bloom filter: %v", err)
+	// Get the key hashes
+	keyHashes := pendingExec.GetKeyHashes(0)
+	hashes := keyHashes["composite_compat"]
+	if len(hashes) != 1 {
+		t.Fatalf("Expected 1 hash, got %d", len(hashes))
 	}
 
 	// Generate the expected row key using AST path
@@ -785,11 +761,11 @@ func TestMutationGuard_CompositeKeyCompatibility(t *testing.T) {
 		t.Fatalf("GenerateRowKey failed: %v", err)
 	}
 
-	// Hash the AST key and check if it's in the hook-generated filter
+	// Hash the AST key and check if it matches the hook-generated hash
 	astKeyHash := filter.HashRowKeyXXH64(astRowKey)
-	if !hookFilter.Contains(astKeyHash) {
-		t.Errorf("Hook filter does not contain AST-generated composite key hash!\n  AST key: %q\n  Hash: %d",
-			astRowKey, astKeyHash)
+	if hashes[0] != astKeyHash {
+		t.Errorf("Hook hash does not match AST-generated composite key hash!\n  AST key: %q\n  AST hash: %d\n  Hook hash: %d",
+			astRowKey, astKeyHash, hashes[0])
 	}
 
 	err = pendingExec.Commit()
@@ -799,4 +775,72 @@ func TestMutationGuard_CompositeKeyCompatibility(t *testing.T) {
 
 	t.Logf("Composite key format: %q", astRowKey)
 	t.Log("✓ MutationGuard composite key compatibility test passed")
+}
+
+// TestMutationGuard_MaxRowsLimit tests that GetKeyHashes returns nil when exceeding maxRows
+func TestMutationGuard_MaxRowsLimit(t *testing.T) {
+	dbPath := "/tmp/test_mutation_guard_maxrows.db"
+	os.Remove(dbPath)
+	defer os.Remove(dbPath)
+
+	systemDB := createTestSystemDB(t)
+	defer systemDB.Close()
+
+	clock := hlc.NewClock(1)
+	mdb, err := NewMVCCDatabase(dbPath, 1, clock, systemDB)
+	if err != nil {
+		t.Fatalf("Failed to create MVCC database: %v", err)
+	}
+	defer mdb.Close()
+
+	// Create table
+	_, err = mdb.Exec(context.Background(), `
+		CREATE TABLE maxrows_test (
+			id INTEGER PRIMARY KEY,
+			value TEXT
+		)
+	`)
+	if err != nil {
+		t.Fatalf("Failed to create table: %v", err)
+	}
+
+	// Execute 5 inserts
+	statements := []protocol.Statement{
+		{SQL: "INSERT INTO maxrows_test (id, value) VALUES (1, 'a')", Type: protocol.StatementInsert, TableName: "maxrows_test"},
+		{SQL: "INSERT INTO maxrows_test (id, value) VALUES (2, 'b')", Type: protocol.StatementInsert, TableName: "maxrows_test"},
+		{SQL: "INSERT INTO maxrows_test (id, value) VALUES (3, 'c')", Type: protocol.StatementInsert, TableName: "maxrows_test"},
+		{SQL: "INSERT INTO maxrows_test (id, value) VALUES (4, 'd')", Type: protocol.StatementInsert, TableName: "maxrows_test"},
+		{SQL: "INSERT INTO maxrows_test (id, value) VALUES (5, 'e')", Type: protocol.StatementInsert, TableName: "maxrows_test"},
+	}
+
+	ctx := context.Background()
+	pendingExec, err := mdb.ExecuteLocalWithHooks(ctx, 12354, statements)
+	if err != nil {
+		t.Fatalf("Failed to execute with hooks: %v", err)
+	}
+
+	// With maxRows=0 (no limit), should get all 5 hashes
+	keyHashes := pendingExec.GetKeyHashes(0)
+	if len(keyHashes["maxrows_test"]) != 5 {
+		t.Errorf("Expected 5 hashes with no limit, got %d", len(keyHashes["maxrows_test"]))
+	}
+
+	// With maxRows=3, should get nil (exceeds limit, MVCC fallback)
+	keyHashes = pendingExec.GetKeyHashes(3)
+	if keyHashes["maxrows_test"] != nil {
+		t.Errorf("Expected nil hashes when exceeding maxRows, got %d hashes", len(keyHashes["maxrows_test"]))
+	}
+
+	// With maxRows=10, should get all 5 hashes (within limit)
+	keyHashes = pendingExec.GetKeyHashes(10)
+	if len(keyHashes["maxrows_test"]) != 5 {
+		t.Errorf("Expected 5 hashes within limit, got %d", len(keyHashes["maxrows_test"]))
+	}
+
+	err = pendingExec.Commit()
+	if err != nil {
+		t.Fatalf("Failed to commit: %v", err)
+	}
+
+	t.Log("✓ MutationGuard maxRows limit test passed")
 }

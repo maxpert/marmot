@@ -123,13 +123,13 @@ func loadSchema(conn *sqlite3.SQLiteConn, tableName string) (*tableSchema, error
 // The connection is held open for the duration of the session and closed on Commit/Rollback.
 // CDC entries are stored in the system database's __marmot__intent_entries table.
 type EphemeralHookSession struct {
-	conn        *sql.Conn                             // Dedicated user DB connection (closed on end)
-	tx          *sql.Tx                               // Active transaction on user DB
-	systemDB    *sql.DB                               // System DB for intent entry storage
-	txnID       uint64                                // Transaction ID for intent entries
-	seq         uint64                                // Sequence counter for entries
-	builders    map[string]*filter.BloomFilterBuilder // table -> builder
-	schemaCache *SchemaCache                          // Shared schema cache
+	conn        *sql.Conn                           // Dedicated user DB connection (closed on end)
+	tx          *sql.Tx                             // Active transaction on user DB
+	systemDB    *sql.DB                             // System DB for intent entry storage
+	txnID       uint64                              // Transaction ID for intent entries
+	seq         uint64                              // Sequence counter for entries
+	collectors  map[string]*filter.KeyHashCollector // table -> key hash collector
+	schemaCache *SchemaCache                        // Shared schema cache
 	mu          sync.Mutex
 }
 
@@ -148,7 +148,7 @@ func StartEphemeralSession(ctx context.Context, userDB *sql.DB, systemDB *sql.DB
 		systemDB:    systemDB,
 		txnID:       txnID,
 		seq:         0,
-		builders:    make(map[string]*filter.BloomFilterBuilder),
+		collectors:  make(map[string]*filter.KeyHashCollector),
 		schemaCache: schemaCache,
 	}
 
@@ -320,13 +320,13 @@ func (s *EphemeralHookSession) hookCallback(data sqlite3.SQLitePreUpdateData) {
 		newKey := s.serializePK(data.TableName, schema, newPK)
 		rowKey = newKey
 
-		// Ensure builder exists for this table
-		if _, ok := s.builders[data.TableName]; !ok {
-			s.builders[data.TableName] = filter.NewBloomFilterBuilder()
+		// Ensure collector exists for this table
+		if _, ok := s.collectors[data.TableName]; !ok {
+			s.collectors[data.TableName] = filter.NewKeyHashCollector()
 		}
-		s.builders[data.TableName].AddRowKey(oldKey)
+		s.collectors[data.TableName].AddRowKey(oldKey)
 		if oldKey != newKey {
-			s.builders[data.TableName].AddRowKey(newKey)
+			s.collectors[data.TableName].AddRowKey(newKey)
 		}
 
 	case sqlite3.SQLITE_DELETE:
@@ -341,12 +341,12 @@ func (s *EphemeralHookSession) hookCallback(data sqlite3.SQLitePreUpdateData) {
 		return
 	}
 
-	// Ensure builder exists for this table (for non-UPDATE operations)
+	// Ensure collector exists for this table (for non-UPDATE operations)
 	if data.Op != sqlite3.SQLITE_UPDATE {
-		if _, ok := s.builders[data.TableName]; !ok {
-			s.builders[data.TableName] = filter.NewBloomFilterBuilder()
+		if _, ok := s.collectors[data.TableName]; !ok {
+			s.collectors[data.TableName] = filter.NewKeyHashCollector()
 		}
-		s.builders[data.TableName].AddRowKey(rowKey)
+		s.collectors[data.TableName].AddRowKey(rowKey)
 	}
 
 	// Serialize values to JSON
@@ -442,26 +442,14 @@ func (s *EphemeralHookSession) serializePK(table string, schema *tableSchema, pk
 	return filter.SerializeRowKey(table, schema.pkColumns, pkValues)
 }
 
-// BuildFilters builds Bloom filters for each affected table
-func (s *EphemeralHookSession) BuildFilters() map[string]*filter.BloomFilter {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	filters := make(map[string]*filter.BloomFilter)
-	for table, builder := range s.builders {
-		filters[table] = builder.Build()
-	}
-	return filters
-}
-
 // GetRowCounts returns the number of affected rows per table
 func (s *EphemeralHookSession) GetRowCounts() map[string]int64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	counts := make(map[string]int64)
-	for table, builder := range s.builders {
-		counts[table] = int64(builder.Count())
+	for table, collector := range s.collectors {
+		counts[table] = int64(collector.Count())
 	}
 	return counts
 }
@@ -474,14 +462,14 @@ func (s *EphemeralHookSession) GetKeyHashes(maxRows int) map[string][]uint64 {
 	defer s.mu.Unlock()
 
 	hashes := make(map[string][]uint64)
-	for table, builder := range s.builders {
-		count := builder.Count()
+	for table, collector := range s.collectors {
+		count := collector.Count()
 		if maxRows > 0 && count > maxRows {
 			// Exceeds max - return empty slice to signal MVCC fallback
 			hashes[table] = nil
 			continue
 		}
-		hashes[table] = builder.Keys()
+		hashes[table] = collector.Keys()
 	}
 	return hashes
 }

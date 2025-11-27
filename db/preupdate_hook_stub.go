@@ -8,8 +8,6 @@ import (
 	"database/sql"
 	"errors"
 	"sync"
-
-	"github.com/maxpert/marmot/protocol/filter"
 )
 
 var ErrPreupdateHookNotEnabled = errors.New("preupdate hook requires build tag: sqlite_preupdate_hook")
@@ -77,11 +75,6 @@ func (s *EphemeralHookSession) Rollback() error {
 
 // FlushIntentLog returns nil (stub - no intent log without preupdate hooks)
 func (s *EphemeralHookSession) FlushIntentLog() error {
-	return nil
-}
-
-// BuildFilters returns nil (stub)
-func (s *EphemeralHookSession) BuildFilters() map[string]*filter.BloomFilter {
 	return nil
 }
 
