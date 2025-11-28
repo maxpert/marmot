@@ -266,7 +266,11 @@ func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transacti
 			if r.err == nil && r.resp != nil && r.resp.Success {
 				commitResponses[r.nodeID] = r.resp
 			} else {
-				log.Error().Err(r.err).Uint64("node_id", r.nodeID).Msg("Commit failed")
+				errMsg := ""
+				if r.resp != nil {
+					errMsg = r.resp.Error
+				}
+				log.Error().Err(r.err).Uint64("node_id", r.nodeID).Str("resp_error", errMsg).Msg("Commit failed")
 			}
 		case <-time.After(wc.timeout):
 			log.Warn().Msg("Commit response timed out. Will be repaired by anti-entropy.")
