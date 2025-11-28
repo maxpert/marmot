@@ -7,49 +7,52 @@ import (
 	"time"
 
 	"github.com/maxpert/marmot/cfg"
+	grpcpool "github.com/processout/grpc-go-pool"
 	"github.com/rs/zerolog/log"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
 )
 
-// Client manages gRPC connections to peer nodes
+// Client manages gRPC connection pools to peer nodes
 type Client struct {
-	nodeID      uint64
-	connections map[uint64]*grpc.ClientConn
-	clients     map[uint64]MarmotServiceClient
-	mu          sync.RWMutex
+	nodeID uint64
+	pools  map[uint64]*grpcpool.Pool
+	addrs  map[uint64]string // Track addresses for reconnection
+	mu     sync.RWMutex
 }
 
 // NewClient creates a new gRPC client manager
 func NewClient(nodeID uint64) *Client {
 	return &Client{
-		nodeID:      nodeID,
-		connections: make(map[uint64]*grpc.ClientConn),
-		clients:     make(map[uint64]MarmotServiceClient),
+		nodeID: nodeID,
+		pools:  make(map[uint64]*grpcpool.Pool),
+		addrs:  make(map[uint64]string),
 	}
 }
 
-// Connect establishes a connection to a peer node
-// Idempotent: safe to call multiple times for the same node
-func (c *Client) Connect(nodeID uint64, address string) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+// getPoolConfig returns pool configuration from config or defaults
+func getPoolConfig() (poolSize int, idleTimeout, maxLifetime time.Duration) {
+	poolSize = 4
+	idleTimeout = 60 * time.Second
+	maxLifetime = 3600 * time.Second // 1 hour
 
-	// Idempotent: return success if already connected
-	if _, exists := c.connections[nodeID]; exists {
-		log.Debug().
-			Uint64("node_id", nodeID).
-			Msg("Already connected, skipping")
-		return nil
+	if cfg.Config != nil {
+		if cfg.Config.GRPCClient.ConnectionPoolSize > 0 {
+			poolSize = cfg.Config.GRPCClient.ConnectionPoolSize
+		}
+		if cfg.Config.GRPCClient.PoolIdleTimeoutSeconds > 0 {
+			idleTimeout = time.Duration(cfg.Config.GRPCClient.PoolIdleTimeoutSeconds) * time.Second
+		}
+		if cfg.Config.GRPCClient.PoolMaxLifetimeSeconds > 0 {
+			maxLifetime = time.Duration(cfg.Config.GRPCClient.PoolMaxLifetimeSeconds) * time.Second
+		}
 	}
+	return
+}
 
-	log.Debug().
-		Uint64("node_id", nodeID).
-		Str("address", address).
-		Msg("Establishing new connection")
-
-	// Get keepalive settings from config
+// createDialOptions returns common gRPC dial options
+func createDialOptions() []grpc.DialOption {
 	keepaliveTime := 10 * time.Second
 	keepaliveTimeout := 3 * time.Second
 	if cfg.Config != nil {
@@ -57,9 +60,7 @@ func (c *Client) Connect(nodeID uint64, address string) error {
 		keepaliveTimeout = time.Duration(cfg.Config.GRPCClient.KeepaliveTimeoutSeconds) * time.Second
 	}
 
-	// Create connection with keepalive and auth interceptors
-	conn, err := grpc.NewClient(
-		address,
+	return []grpc.DialOption{
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{
 			Time:                keepaliveTime,
@@ -72,144 +73,209 @@ func (c *Client) Connect(nodeID uint64, address string) error {
 		),
 		grpc.WithChainUnaryInterceptor(UnaryClientInterceptor()),
 		grpc.WithChainStreamInterceptor(StreamClientInterceptor()),
-	)
-	if err != nil {
-		return fmt.Errorf("failed to connect to node %d: %w", nodeID, err)
+	}
+}
+
+// Connect establishes a connection pool to a peer node
+// Idempotent: safe to call multiple times for the same node
+func (c *Client) Connect(nodeID uint64, address string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Idempotent: return success if already connected
+	if _, exists := c.pools[nodeID]; exists {
+		log.Debug().
+			Uint64("node_id", nodeID).
+			Msg("Pool already exists, skipping")
+		return nil
 	}
 
-	c.connections[nodeID] = conn
-	c.clients[nodeID] = NewMarmotServiceClient(conn)
+	log.Debug().
+		Uint64("node_id", nodeID).
+		Str("address", address).
+		Msg("Creating connection pool")
+
+	poolSize, idleTimeout, maxLifetime := getPoolConfig()
+	dialOpts := createDialOptions()
+
+	// Factory function for creating connections
+	factory := func() (*grpc.ClientConn, error) {
+		return grpc.NewClient(address, dialOpts...)
+	}
+
+	// Create pool with init=1 (start with 1 connection), capacity=poolSize
+	pool, err := grpcpool.New(factory, 1, poolSize, idleTimeout, maxLifetime)
+	if err != nil {
+		return fmt.Errorf("failed to create connection pool for node %d: %w", nodeID, err)
+	}
+
+	c.pools[nodeID] = pool
+	c.addrs[nodeID] = address
 
 	log.Info().
 		Uint64("node_id", nodeID).
 		Str("address", address).
-		Msg("Connected to peer")
+		Int("pool_size", poolSize).
+		Msg("Connection pool created")
 
 	return nil
 }
 
-// GetClient returns a MarmotServiceClient for a node
-func (c *Client) GetClient(nodeID uint64) (MarmotServiceClient, error) {
+// getConn gets a connection from the pool for a node
+func (c *Client) getConn(nodeID uint64) (*grpcpool.ClientConn, error) {
 	c.mu.RLock()
-	defer c.mu.RUnlock()
+	pool, exists := c.pools[nodeID]
+	c.mu.RUnlock()
 
-	client, exists := c.clients[nodeID]
 	if !exists {
 		return nil, fmt.Errorf("not connected to node %d", nodeID)
 	}
 
-	return client, nil
+	conn, err := pool.Get(context.Background())
+	if err != nil {
+		return nil, fmt.Errorf("failed to get connection from pool for node %d: %w", nodeID, err)
+	}
+
+	return conn, nil
 }
 
-// Disconnect closes the connection to a peer node
+// GetClient returns a MarmotServiceClient for a node
+// IMPORTANT: Caller must call ReleaseClient when done to return connection to pool
+func (c *Client) GetClient(nodeID uint64) (MarmotServiceClient, error) {
+	conn, err := c.getConn(nodeID)
+	if err != nil {
+		return nil, err
+	}
+	// Note: This creates a lightweight wrapper, actual connection is managed by pool
+	// The conn will be returned to pool when the caller calls ReleaseClient
+	return NewMarmotServiceClient(conn), nil
+}
+
+// withPooledClient executes a function with a pooled connection
+// The connection is automatically returned to the pool after the function completes
+func (c *Client) withPooledClient(nodeID uint64, fn func(MarmotServiceClient) error) error {
+	conn, err := c.getConn(nodeID)
+	if err != nil {
+		return err
+	}
+	defer conn.Close() // Returns connection to pool
+
+	client := NewMarmotServiceClient(conn)
+	return fn(client)
+}
+
+// Disconnect closes the connection pool for a peer node
 func (c *Client) Disconnect(nodeID uint64) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	conn, exists := c.connections[nodeID]
+	pool, exists := c.pools[nodeID]
 	if !exists {
 		return nil
 	}
 
-	log.Debug().Uint64("node_id", nodeID).Msg("Disconnecting from peer")
+	log.Debug().Uint64("node_id", nodeID).Msg("Closing connection pool")
 
-	if err := conn.Close(); err != nil {
-		return err
-	}
-
-	delete(c.connections, nodeID)
-	delete(c.clients, nodeID)
+	pool.Close()
+	delete(c.pools, nodeID)
+	delete(c.addrs, nodeID)
 
 	return nil
 }
 
-// Close closes all connections
+// Close closes all connection pools
 func (c *Client) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	for nodeID, conn := range c.connections {
-		log.Debug().Uint64("node_id", nodeID).Msg("Closing connection")
-		if err := conn.Close(); err != nil {
-			log.Error().Err(err).Uint64("node_id", nodeID).Msg("Failed to close connection")
-		}
+	for nodeID, pool := range c.pools {
+		log.Debug().Uint64("node_id", nodeID).Msg("Closing connection pool")
+		pool.Close()
 	}
 
-	c.connections = make(map[uint64]*grpc.ClientConn)
-	c.clients = make(map[uint64]MarmotServiceClient)
+	c.pools = make(map[uint64]*grpcpool.Pool)
+	c.addrs = make(map[uint64]string)
 
 	return nil
 }
 
 // SendGossip sends a gossip message to a peer
 func (c *Client) SendGossip(ctx context.Context, nodeID uint64, req *GossipRequest) (*GossipResponse, error) {
-	client, err := c.GetClient(nodeID)
+	conn, err := c.getConn(nodeID)
 	if err != nil {
 		return nil, err
 	}
+	defer conn.Close()
 
+	client := NewMarmotServiceClient(conn)
 	return client.Gossip(ctx, req)
 }
 
 // SendJoin sends a join request to a peer
 func (c *Client) SendJoin(ctx context.Context, nodeID uint64, req *JoinRequest) (*JoinResponse, error) {
-	client, err := c.GetClient(nodeID)
+	conn, err := c.getConn(nodeID)
 	if err != nil {
 		return nil, err
 	}
+	defer conn.Close()
 
+	client := NewMarmotServiceClient(conn)
 	return client.Join(ctx, req)
 }
 
 // SendPing sends a ping to a peer
 func (c *Client) SendPing(ctx context.Context, nodeID uint64) (*PingResponse, error) {
-	client, err := c.GetClient(nodeID)
+	conn, err := c.getConn(nodeID)
 	if err != nil {
 		return nil, err
 	}
+	defer conn.Close()
 
+	client := NewMarmotServiceClient(conn)
 	req := &PingRequest{
 		SourceNodeId: c.nodeID,
 	}
-
 	return client.Ping(ctx, req)
 }
 
 // ReplicateTransaction sends a transaction to a peer for replication
 func (c *Client) ReplicateTransaction(ctx context.Context, nodeID uint64, req *TransactionRequest) (*TransactionResponse, error) {
-	client, err := c.GetClient(nodeID)
+	conn, err := c.getConn(nodeID)
 	if err != nil {
 		return nil, err
 	}
+	defer conn.Close()
 
+	client := NewMarmotServiceClient(conn)
 	return client.ReplicateTransaction(ctx, req)
 }
 
 // Read sends a read request to a peer
 func (c *Client) Read(ctx context.Context, nodeID uint64, req *ReadRequest) (*ReadResponse, error) {
-	client, err := c.GetClient(nodeID)
+	conn, err := c.getConn(nodeID)
 	if err != nil {
 		return nil, err
 	}
+	defer conn.Close()
 
+	client := NewMarmotServiceClient(conn)
 	return client.Read(ctx, req)
 }
 
 // GetClientByAddress returns a MarmotServiceClient for an address
-// If not already connected, it creates a connection using a temporary node ID
+// If not already connected, it creates a connection pool using a temporary node ID
 func (c *Client) GetClientByAddress(address string) (MarmotServiceClient, error) {
 	c.mu.RLock()
-	// Check if we already have a connection to this address
-	for nodeID, conn := range c.connections {
-		if conn.Target() == address {
-			client := c.clients[nodeID]
+	// Check if we already have a pool for this address
+	for nodeID, addr := range c.addrs {
+		if addr == address {
 			c.mu.RUnlock()
-			return client, nil
+			return c.GetClient(nodeID)
 		}
 	}
 	c.mu.RUnlock()
 
-	// No existing connection, create a new one with temporary node ID
+	// No existing pool, create one with temporary node ID
 	// Use a hash of the address as a pseudo node ID
 	tempNodeID := uint64(0)
 	for _, b := range []byte(address) {
@@ -221,4 +287,44 @@ func (c *Client) GetClientByAddress(address string) (MarmotServiceClient, error)
 	}
 
 	return c.GetClient(tempNodeID)
+}
+
+// PoolStats returns statistics about connection pools
+func (c *Client) PoolStats() map[uint64]PoolStat {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	stats := make(map[uint64]PoolStat)
+	for nodeID, pool := range c.pools {
+		stats[nodeID] = PoolStat{
+			Available: pool.Available(),
+			Capacity:  pool.Capacity(),
+		}
+	}
+	return stats
+}
+
+// PoolStat holds statistics for a connection pool
+type PoolStat struct {
+	Available int
+	Capacity  int
+}
+
+// RegisterTestConnection registers a pre-existing connection for testing
+// This bypasses the normal pool mechanism and stores a single connection
+func (c *Client) RegisterTestConnection(nodeID uint64, conn *grpc.ClientConn) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Create a minimal pool with just this connection
+	factory := func() (*grpc.ClientConn, error) {
+		return conn, nil
+	}
+
+	pool, err := grpcpool.New(factory, 1, 1, time.Hour, time.Hour)
+	if err != nil {
+		return
+	}
+
+	c.pools[nodeID] = pool
 }

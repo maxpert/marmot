@@ -100,8 +100,7 @@ func (tn *testNode) connectTo(other *testNode) error {
 		return err
 	}
 
-	tn.client.connections[other.nodeID] = conn
-	tn.client.clients[other.nodeID] = NewMarmotServiceClient(conn)
+	tn.client.RegisterTestConnection(other.nodeID, conn)
 
 	// Add to registry
 	tn.registry.Add(&NodeState{

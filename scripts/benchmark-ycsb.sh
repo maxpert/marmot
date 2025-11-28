@@ -36,7 +36,7 @@ echo -e "${BLUE}╚════════════════════�
 echo ""
 
 install_ycsb() {
-    echo -e "${YELLOW}[1/8] Checking go-ycsb installation...${NC}"
+    echo -e "${YELLOW}[1/6] Checking go-ycsb installation...${NC}"
 
     if [ -f "$YCSB_BIN" ]; then
         echo -e "${GREEN}  go-ycsb already installed${NC}"
@@ -61,14 +61,14 @@ install_ycsb() {
 }
 
 build_marmot() {
-    echo -e "${YELLOW}[2/8] Building Marmot...${NC}"
+    echo -e "${YELLOW}[2/6] Building Marmot...${NC}"
     cd "$REPO_ROOT"
     go build -o marmot-v2 .
     echo -e "${GREEN}  Built successfully${NC}"
 }
 
 cleanup() {
-    echo -e "${YELLOW}[3/8] Cleaning up...${NC}"
+    echo -e "${YELLOW}[3/6] Cleaning up...${NC}"
     pkill -9 -f "marmot-v2" 2>/dev/null || true
     for port in "${NODE_PORTS[@]}" "${GRPC_PORTS[@]}"; do
         lsof -ti:$port 2>/dev/null | xargs kill -9 2>/dev/null || true
@@ -79,7 +79,7 @@ cleanup() {
 }
 
 start_cluster() {
-    echo -e "${YELLOW}[4/8] Starting 3-node cluster...${NC}"
+    echo -e "${YELLOW}[4/6] Starting 3-node cluster...${NC}"
     cd "$REPO_ROOT"
 
     for i in 1 2 3; do
@@ -101,7 +101,7 @@ start_cluster() {
 }
 
 create_workloads() {
-    echo -e "${YELLOW}[5/8] Creating workload configurations...${NC}"
+    echo -e "${YELLOW}[5/6] Creating workload configurations...${NC}"
     mkdir -p "$RESULTS_DIR"
 
     # Standard YCSB workload (write-heavy)
@@ -117,29 +117,16 @@ insertproportion=0.5
 requestdistribution=zipfian
 EOF
 
-    # Read-heavy workload
-    cat > "$RESULTS_DIR/workload_read" <<EOF
-recordcount=$RECORD_COUNT
-operationcount=$OPERATION_COUNT
-workload=core
-readallfields=true
-readproportion=0.8
-updateproportion=0.1
-scanproportion=0.0
-insertproportion=0.1
-requestdistribution=zipfian
-EOF
-
     echo -e "${GREEN}  Workloads created${NC}"
 }
 
-run_single_node_benchmark() {
+load_data() {
     echo ""
     echo -e "${BLUE}═══════════════════════════════════════════════════════${NC}"
-    echo -e "${BLUE}  Phase 1: Single-Node Throughput (baseline)${NC}"
+    echo -e "${BLUE}  Loading Data ($RECORD_COUNT records)${NC}"
     echo -e "${BLUE}═══════════════════════════════════════════════════════${NC}"
 
-    echo -e "${YELLOW}Loading data via node 1 ($RECORD_COUNT records)...${NC}"
+    echo -e "${YELLOW}Loading data via node 1...${NC}"
     $YCSB_BIN load mysql \
         -P "$RESULTS_DIR/workload_write" \
         -p mysql.host=127.0.0.1 \
@@ -147,22 +134,10 @@ run_single_node_benchmark() {
         -p mysql.user=root \
         -p mysql.db=marmot \
         -p threadcount=10 \
-        2>&1 | tee "$RESULTS_DIR/load_single.log"
-
-    echo ""
-    echo -e "${YELLOW}Running workload against node 1...${NC}"
-    $YCSB_BIN run mysql \
-        -P "$RESULTS_DIR/workload_write" \
-        -p mysql.host=127.0.0.1 \
-        -p mysql.port=3307 \
-        -p mysql.user=root \
-        -p mysql.db=marmot \
-        -p threadcount=$THREAD_COUNT \
-        2>&1 | tee "$RESULTS_DIR/run_single.log"
+        2>&1 | tee "$RESULTS_DIR/load.log"
 }
 
 # Wait for replication to converge across all nodes
-# Polls until all nodes have the same row count or timeout
 wait_for_replication() {
     local table="${1:-usertable}"
     local timeout=$REPLICATION_TIMEOUT
@@ -173,7 +148,6 @@ wait_for_replication() {
 
     while true; do
         local counts=()
-        local all_same=true
 
         # Get row count from each node
         for port in "${NODE_PORTS[@]}"; do
@@ -225,7 +199,7 @@ verify_replication() {
 run_multi_node_benchmark() {
     echo ""
     echo -e "${BLUE}═══════════════════════════════════════════════════════${NC}"
-    echo -e "${BLUE}  Phase 3: Multi-Node Concurrent Writes${NC}"
+    echo -e "${BLUE}  Multi-Node Concurrent Writes${NC}"
     echo -e "${BLUE}═══════════════════════════════════════════════════════${NC}"
 
     echo -e "${YELLOW}Running concurrent workloads against all 3 nodes...${NC}"
@@ -259,7 +233,7 @@ run_multi_node_benchmark() {
 run_read_after_write_test() {
     echo ""
     echo -e "${BLUE}═══════════════════════════════════════════════════════${NC}"
-    echo -e "${BLUE}  Phase 4: Read-After-Write Consistency Test${NC}"
+    echo -e "${BLUE}  Read-After-Write Consistency Test${NC}"
     echo -e "${BLUE}═══════════════════════════════════════════════════════${NC}"
 
     # Insert a unique row on node 1
@@ -331,12 +305,6 @@ show_results() {
     echo -e "${BLUE}╚══════════════════════════════════════════════════════╝${NC}"
     echo ""
 
-    echo -e "${CYAN}Single-Node Throughput (Node 1):${NC}"
-    if [ -f "$RESULTS_DIR/run_single.log" ]; then
-        grep "^INSERT -\|^UPDATE -\|^READ -\|^TOTAL -" "$RESULTS_DIR/run_single.log" | head -4
-    fi
-
-    echo ""
     echo -e "${CYAN}Multi-Node Throughput (per node):${NC}"
     for i in 1 2 3; do
         if [ -f "$RESULTS_DIR/run_node${i}.log" ]; then
@@ -369,7 +337,8 @@ main() {
     create_workloads
     start_cluster
 
-    run_single_node_benchmark
+    echo -e "${YELLOW}[6/6] Running benchmark...${NC}"
+    load_data
     verify_replication
     run_multi_node_benchmark
     verify_replication
