@@ -3,11 +3,14 @@ package grpc
 import (
 	"context"
 	"crypto/md5"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/maxpert/marmot/cfg"
@@ -32,6 +35,114 @@ const (
 
 // DeltaSyncThreshold - If behind by more than this many transactions, use snapshot
 const DeltaSyncThreshold = 1000
+
+// sanitizeSnapshotFilename validates and sanitizes a filename from snapshot stream.
+// Returns error if filename contains path traversal or absolute paths.
+// This prevents malicious servers from writing files outside the data directory.
+func sanitizeSnapshotFilename(filename string) (string, error) {
+	if filename == "" {
+		return "", fmt.Errorf("empty filename")
+	}
+
+	// Reject absolute paths
+	if filepath.IsAbs(filename) {
+		return "", fmt.Errorf("absolute path not allowed: %s", filename)
+	}
+
+	// Clean the path and check for traversal
+	cleaned := filepath.Clean(filename)
+
+	// Reject if cleaned path starts with ..
+	if strings.HasPrefix(cleaned, "..") {
+		return "", fmt.Errorf("path traversal not allowed: %s", filename)
+	}
+
+	// Reject if path contains .. anywhere after cleaning
+	for _, part := range strings.Split(cleaned, string(filepath.Separator)) {
+		if part == ".." {
+			return "", fmt.Errorf("path traversal not allowed: %s", filename)
+		}
+	}
+
+	// Only allow specific patterns for snapshot files
+	if !isValidSnapshotPath(cleaned) {
+		return "", fmt.Errorf("invalid snapshot filename pattern: %s", filename)
+	}
+
+	return cleaned, nil
+}
+
+// isValidSnapshotPath checks if the path matches expected snapshot file patterns
+func isValidSnapshotPath(path string) bool {
+	// System database at root
+	if path == "__marmot_system.db" {
+		return true
+	}
+	// User databases in databases/ subdirectory
+	if strings.HasPrefix(path, "databases"+string(filepath.Separator)) && strings.HasSuffix(path, ".db") {
+		// Ensure no additional directory traversal within databases/
+		relPath := strings.TrimPrefix(path, "databases"+string(filepath.Separator))
+		if !strings.Contains(relPath, string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
+}
+
+// calculateFileSHA256 computes SHA256 checksum of a file
+func calculateFileSHA256(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// verifySnapshotIntegrity verifies downloaded snapshot files against manifest
+func verifySnapshotIntegrity(dataDir string, manifest []*DatabaseFileInfo) error {
+	for _, expected := range manifest {
+		// Skip verification if no checksum provided (backwards compatibility)
+		if expected.Sha256Checksum == "" {
+			continue
+		}
+
+		filePath := filepath.Join(dataDir, expected.Filename)
+
+		// Verify file exists
+		info, err := os.Stat(filePath)
+		if err != nil {
+			return fmt.Errorf("missing file %s: %w", expected.Filename, err)
+		}
+
+		// Verify size
+		if info.Size() != expected.SizeBytes {
+			return fmt.Errorf("size mismatch for %s: expected %d, got %d",
+				expected.Filename, expected.SizeBytes, info.Size())
+		}
+
+		// Verify SHA256
+		actualHash, err := calculateFileSHA256(filePath)
+		if err != nil {
+			return fmt.Errorf("failed to hash %s: %w", expected.Filename, err)
+		}
+		if actualHash != expected.Sha256Checksum {
+			return fmt.Errorf("SHA256 mismatch for %s: expected %s, got %s",
+				expected.Filename, expected.Sha256Checksum, actualHash)
+		}
+
+		log.Debug().
+			Str("file", expected.Filename).
+			Str("sha256", actualHash[:16]+"...").
+			Msg("Verified snapshot file integrity")
+	}
+	return nil
+}
 
 // CatchUpClient handles the client-side of node catch-up
 type CatchUpClient struct {
@@ -251,10 +362,16 @@ func (c *CatchUpClient) applySnapshot(ctx context.Context, client MarmotServiceC
 			return fmt.Errorf("checksum mismatch for %s chunk %d", chunk.Filename, chunk.ChunkIndex)
 		}
 
+		// Sanitize filename to prevent path traversal attacks
+		sanitizedFilename, err := sanitizeSnapshotFilename(chunk.Filename)
+		if err != nil {
+			return fmt.Errorf("invalid snapshot filename: %w", err)
+		}
+
 		// Get or create file
-		file, exists := openFiles[chunk.Filename]
+		file, exists := openFiles[sanitizedFilename]
 		if !exists {
-			filePath := filepath.Join(c.dataDir, chunk.Filename)
+			filePath := filepath.Join(c.dataDir, sanitizedFilename)
 
 			// Remove existing file if present
 			os.Remove(filePath)
@@ -265,7 +382,7 @@ func (c *CatchUpClient) applySnapshot(ctx context.Context, client MarmotServiceC
 			if err != nil {
 				return fmt.Errorf("failed to create file %s: %w", filePath, err)
 			}
-			openFiles[chunk.Filename] = file
+			openFiles[sanitizedFilename] = file
 		}
 
 		// Write chunk
@@ -278,8 +395,8 @@ func (c *CatchUpClient) applySnapshot(ctx context.Context, client MarmotServiceC
 		// Close file if this is the last chunk
 		if chunk.IsLastForFile {
 			file.Close()
-			delete(openFiles, chunk.Filename)
-			log.Debug().Str("file", chunk.Filename).Msg("Finished receiving file")
+			delete(openFiles, sanitizedFilename)
+			log.Debug().Str("file", sanitizedFilename).Msg("Finished receiving file")
 		}
 
 		// Progress logging
@@ -295,6 +412,12 @@ func (c *CatchUpClient) applySnapshot(ctx context.Context, client MarmotServiceC
 		Int("chunks_received", chunksReceived).
 		Msg("Snapshot download completed")
 
+	// Verify snapshot integrity using SHA256 checksums from manifest
+	if err := verifySnapshotIntegrity(c.dataDir, info.Databases); err != nil {
+		return fmt.Errorf("snapshot integrity verification failed: %w", err)
+	}
+
+	log.Info().Msg("Snapshot integrity verified")
 	return nil
 }
 

@@ -1777,12 +1777,13 @@ func (x *SnapshotInfoResponse) GetDatabases() []*DatabaseFileInfo {
 }
 
 type DatabaseFileInfo struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`         // Database name (e.g., "marmot", "__marmot_system")
-	Filename      string                 `protobuf:"bytes,2,opt,name=filename,proto3" json:"filename,omitempty"` // Relative path
-	SizeBytes     int64                  `protobuf:"varint,3,opt,name=size_bytes,json=sizeBytes,proto3" json:"size_bytes,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	Name           string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`         // Database name (e.g., "marmot", "__marmot_system")
+	Filename       string                 `protobuf:"bytes,2,opt,name=filename,proto3" json:"filename,omitempty"` // Relative path
+	SizeBytes      int64                  `protobuf:"varint,3,opt,name=size_bytes,json=sizeBytes,proto3" json:"size_bytes,omitempty"`
+	Sha256Checksum string                 `protobuf:"bytes,4,opt,name=sha256_checksum,json=sha256Checksum,proto3" json:"sha256_checksum,omitempty"` // SHA256 hex digest for integrity verification
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *DatabaseFileInfo) Reset() {
@@ -1834,6 +1835,13 @@ func (x *DatabaseFileInfo) GetSizeBytes() int64 {
 		return x.SizeBytes
 	}
 	return 0
+}
+
+func (x *DatabaseFileInfo) GetSha256Checksum() string {
+	if x != nil {
+		return x.Sha256Checksum
+	}
+	return ""
 }
 
 type SnapshotRequest struct {
@@ -2188,12 +2196,13 @@ const file_grpc_marmot_proto_rawDesc = "" +
 	"\x13snapshot_size_bytes\x18\x02 \x01(\x03R\x11snapshotSizeBytes\x12!\n" +
 	"\ftotal_chunks\x18\x03 \x01(\x05R\vtotalChunks\x12,\n" +
 	"\ttimestamp\x18\x04 \x01(\v2\x0e.marmot.v2.HLCR\ttimestamp\x129\n" +
-	"\tdatabases\x18\x05 \x03(\v2\x1b.marmot.v2.DatabaseFileInfoR\tdatabases\"a\n" +
+	"\tdatabases\x18\x05 \x03(\v2\x1b.marmot.v2.DatabaseFileInfoR\tdatabases\"\x8a\x01\n" +
 	"\x10DatabaseFileInfo\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1a\n" +
 	"\bfilename\x18\x02 \x01(\tR\bfilename\x12\x1d\n" +
 	"\n" +
-	"size_bytes\x18\x03 \x01(\x03R\tsizeBytes\"?\n" +
+	"size_bytes\x18\x03 \x01(\x03R\tsizeBytes\x12'\n" +
+	"\x0fsha256_checksum\x18\x04 \x01(\tR\x0esha256Checksum\"?\n" +
 	"\x0fSnapshotRequest\x12,\n" +
 	"\x12requesting_node_id\x18\x01 \x01(\x04R\x10requestingNodeId\"\xc8\x01\n" +
 	"\rSnapshotChunk\x12\x1f\n" +

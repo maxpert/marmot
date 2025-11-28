@@ -1,7 +1,9 @@
 package db
 
 import (
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
@@ -581,6 +583,22 @@ type SnapshotInfo struct {
 	Filename string // Relative path from data directory
 	FullPath string // Absolute path
 	Size     int64  // File size in bytes
+	SHA256   string // SHA256 hex digest for integrity verification
+}
+
+// calculateFileSHA256 computes SHA256 checksum of a file
+func calculateFileSHA256(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // TakeSnapshot checkpoints all databases and returns their file information
@@ -602,11 +620,17 @@ func (dm *DatabaseManager) TakeSnapshot() ([]SnapshotInfo, uint64, error) {
 		return nil, 0, fmt.Errorf("failed to stat system database: %w", err)
 	}
 
+	systemSHA256, err := calculateFileSHA256(systemDBPath)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to hash system database: %w", err)
+	}
+
 	snapshots = append(snapshots, SnapshotInfo{
 		Name:     SystemDatabaseName,
 		Filename: SystemDatabaseName + ".db",
 		FullPath: systemDBPath,
 		Size:     info.Size(),
+		SHA256:   systemSHA256,
 	})
 
 	// Checkpoint and get info for all user databases
@@ -628,11 +652,18 @@ func (dm *DatabaseManager) TakeSnapshot() ([]SnapshotInfo, uint64, error) {
 			continue
 		}
 
+		dbSHA256, err := calculateFileSHA256(dbPath)
+		if err != nil {
+			log.Warn().Err(err).Str("database", name).Msg("Failed to hash database")
+			continue
+		}
+
 		snapshots = append(snapshots, SnapshotInfo{
 			Name:     name,
 			Filename: filepath.Join("databases", name+".db"),
 			FullPath: dbPath,
 			Size:     info.Size(),
+			SHA256:   dbSHA256,
 		})
 	}
 

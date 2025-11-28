@@ -592,9 +592,10 @@ func (s *Server) GetSnapshotInfo(ctx context.Context, req *SnapshotInfoRequest) 
 	for _, snap := range snapshots {
 		totalSize += snap.Size
 		dbInfos = append(dbInfos, &DatabaseFileInfo{
-			Name:      snap.Name,
-			Filename:  snap.Filename,
-			SizeBytes: snap.Size,
+			Name:           snap.Name,
+			Filename:       snap.Filename,
+			SizeBytes:      snap.Size,
+			Sha256Checksum: snap.SHA256,
 		})
 	}
 

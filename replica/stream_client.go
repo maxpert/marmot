@@ -63,6 +63,59 @@ func NewStreamClient(masterAddr string, nodeID uint64, dbManager *db.DatabaseMan
 	}
 }
 
+// sanitizeSnapshotFilename validates and sanitizes a filename from snapshot stream.
+// Returns error if filename contains path traversal or absolute paths.
+// This prevents malicious masters from writing files outside the data directory.
+func sanitizeSnapshotFilename(filename string) (string, error) {
+	if filename == "" {
+		return "", fmt.Errorf("empty filename")
+	}
+
+	// Reject absolute paths
+	if filepath.IsAbs(filename) {
+		return "", fmt.Errorf("absolute path not allowed: %s", filename)
+	}
+
+	// Clean the path and check for traversal
+	cleaned := filepath.Clean(filename)
+
+	// Reject if cleaned path starts with ..
+	if strings.HasPrefix(cleaned, "..") {
+		return "", fmt.Errorf("path traversal not allowed: %s", filename)
+	}
+
+	// Reject if path contains .. anywhere after cleaning
+	for _, part := range strings.Split(cleaned, string(filepath.Separator)) {
+		if part == ".." {
+			return "", fmt.Errorf("path traversal not allowed: %s", filename)
+		}
+	}
+
+	// Only allow specific patterns for snapshot files
+	if !isValidSnapshotPath(cleaned) {
+		return "", fmt.Errorf("invalid snapshot filename pattern: %s", filename)
+	}
+
+	return cleaned, nil
+}
+
+// isValidSnapshotPath checks if the path matches expected snapshot file patterns
+func isValidSnapshotPath(path string) bool {
+	// System database at root
+	if path == "__marmot_system.db" {
+		return true
+	}
+	// User databases in databases/ subdirectory
+	if strings.HasPrefix(path, "databases"+string(filepath.Separator)) && strings.HasSuffix(path, ".db") {
+		// Ensure no additional directory traversal within databases/
+		relPath := strings.TrimPrefix(path, "databases"+string(filepath.Separator))
+		if !strings.Contains(relPath, string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
+}
+
 // Bootstrap performs initial sync from master
 func (s *StreamClient) Bootstrap(ctx context.Context) error {
 	log.Info().Str("master", s.masterAddr).Msg("Connecting to master for bootstrap")
@@ -478,11 +531,17 @@ func (s *StreamClient) applySnapshot(ctx context.Context, snapshotInfo *marmotgr
 			return fmt.Errorf("checksum mismatch for chunk %d of %s", chunk.ChunkIndex, chunk.Filename)
 		}
 
+		// Sanitize filename to prevent path traversal attacks
+		sanitizedFilename, err := sanitizeSnapshotFilename(chunk.Filename)
+		if err != nil {
+			return fmt.Errorf("invalid snapshot filename: %w", err)
+		}
+
 		// Get or create file
-		file, exists := openFiles[chunk.Filename]
+		file, exists := openFiles[sanitizedFilename]
 		if !exists {
 			// Determine target path
-			targetPath := filepath.Join(dbsDir, chunk.Filename)
+			targetPath := filepath.Join(dbsDir, sanitizedFilename)
 
 			// Backup existing file if any
 			if _, err := os.Stat(targetPath); err == nil {
@@ -495,7 +554,7 @@ func (s *StreamClient) applySnapshot(ctx context.Context, snapshotInfo *marmotgr
 			if err != nil {
 				return fmt.Errorf("failed to create file %s: %w", targetPath, err)
 			}
-			openFiles[chunk.Filename] = file
+			openFiles[sanitizedFilename] = file
 		}
 
 		// Write chunk
@@ -508,8 +567,8 @@ func (s *StreamClient) applySnapshot(ctx context.Context, snapshotInfo *marmotgr
 		// Close file if last chunk for this file
 		if chunk.IsLastForFile {
 			file.Close()
-			delete(openFiles, chunk.Filename)
-			log.Info().Str("file", chunk.Filename).Msg("Completed receiving file")
+			delete(openFiles, sanitizedFilename)
+			log.Info().Str("file", sanitizedFilename).Msg("Completed receiving file")
 		}
 	}
 

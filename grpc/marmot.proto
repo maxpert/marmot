@@ -271,6 +271,7 @@ message DatabaseFileInfo {
   string name = 1;        // Database name (e.g., "marmot", "__marmot_system")
   string filename = 2;    // Relative path
   int64 size_bytes = 3;
+  string sha256_checksum = 4;  // SHA256 hex digest for integrity verification
 }
 
 message SnapshotRequest {
