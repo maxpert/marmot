@@ -205,6 +205,7 @@ run_multi_node_benchmark() {
     echo -e "${YELLOW}Running concurrent workloads against all 3 nodes...${NC}"
 
     # Run YCSB against each node in parallel
+    # Stagger starts slightly to avoid concurrent database initialization
     local pids=()
     for i in "${!NODE_PORTS[@]}"; do
         port=${NODE_PORTS[$i]}
@@ -219,6 +220,7 @@ run_multi_node_benchmark() {
             -p threadcount=$((THREAD_COUNT / 3)) \
             2>&1 > "$RESULTS_DIR/run_node${node_num}.log" &
         pids+=($!)
+        sleep 1  # Stagger to avoid concurrent DDL
     done
 
     # Wait for all to complete
@@ -309,7 +311,7 @@ show_results() {
     for i in 1 2 3; do
         if [ -f "$RESULTS_DIR/run_node${i}.log" ]; then
             echo "  Node $i:"
-            grep "^TOTAL -" "$RESULTS_DIR/run_node${i}.log" | head -1 | sed 's/^/    /'
+            grep "^TOTAL" "$RESULTS_DIR/run_node${i}.log" | tail -1 | sed 's/^/    /'
         fi
     done
 
@@ -319,7 +321,7 @@ show_results() {
     local total_ops=0
     for i in 1 2 3; do
         if [ -f "$RESULTS_DIR/run_node${i}.log" ]; then
-            ops=$(grep "^TOTAL -" "$RESULTS_DIR/run_node${i}.log" | grep -o "OPS: [0-9.]*" | awk '{print $2}' | head -1)
+            ops=$(grep "^TOTAL" "$RESULTS_DIR/run_node${i}.log" | tail -1 | grep -o "OPS: [0-9.]*" | awk '{print $2}')
             if [ -n "$ops" ]; then
                 total_ops=$(echo "$total_ops + $ops" | bc)
             fi
