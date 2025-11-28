@@ -4,6 +4,8 @@ import (
 	"encoding/base64"
 	"fmt"
 	"testing"
+
+	"github.com/vmihailenco/msgpack/v5"
 )
 
 // TestRowKeyCompatibility verifies that GenerateRowKey produces the same format
@@ -176,16 +178,20 @@ func TestRowKeyDeterminism(t *testing.T) {
 	}
 }
 
-// TestRowKeyJSONValues verifies handling of JSON-encoded values
-func TestRowKeyJSONValues(t *testing.T) {
+// TestRowKeyMsgpackValues verifies handling of msgpack-encoded values
+func TestRowKeyMsgpackValues(t *testing.T) {
 	schema := &TableSchema{
-		TableName:   "json_test",
+		TableName:   "msgpack_test",
 		PrimaryKeys: []string{"id"},
 	}
 
-	// JSON-encoded string "123" -> should extract "123"
+	// msgpack-encoded string "123"
+	encoded, err := msgpack.Marshal("123")
+	if err != nil {
+		t.Fatalf("msgpack.Marshal failed: %v", err)
+	}
 	values := map[string][]byte{
-		"id": []byte(`"123"`),
+		"id": encoded,
 	}
 
 	key, err := GenerateRowKey(schema, values)
@@ -193,8 +199,8 @@ func TestRowKeyJSONValues(t *testing.T) {
 		t.Fatalf("GenerateRowKey failed: %v", err)
 	}
 
-	// Should extract the numeric value from JSON string
-	expected := "json_test:123"
+	// Should extract the string value from msgpack
+	expected := "msgpack_test:123"
 	if key != expected {
 		t.Errorf("Row key mismatch:\n  got:      %q\n  expected: %q", key, expected)
 	}
@@ -203,12 +209,15 @@ func TestRowKeyJSONValues(t *testing.T) {
 // TestRowKeyZeroValueAsAutoIncrement verifies that id=0 is treated as auto-increment
 // MySQL semantics: INSERT with id=0 means "use next auto-increment value"
 func TestRowKeyZeroValueAsAutoIncrement(t *testing.T) {
+	// msgpack-encoded "0"
+	msgpackZero, _ := msgpack.Marshal("0")
+
 	tests := []struct {
 		name  string
 		value []byte
 	}{
 		{"raw zero", []byte("0")},
-		{"JSON-encoded zero", []byte(`"0"`)},
+		{"msgpack-encoded zero", msgpackZero},
 	}
 
 	for _, tt := range tests {

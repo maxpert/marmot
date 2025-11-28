@@ -3,13 +3,13 @@ package protocol
 import (
 	"crypto/sha256"
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
 	"sync"
 
 	"github.com/maxpert/marmot/protocol/filter"
+	"github.com/vmihailenco/msgpack/v5"
 )
 
 // TableSchema represents the schema of a table
@@ -183,12 +183,12 @@ func GenerateRowKey(schema *TableSchema, values map[string][]byte) (string, erro
 	return filter.SerializeRowKey(schema.TableName, schema.PrimaryKeys, processedValues), nil
 }
 
-// extractStringValue extracts a string from a byte slice, handling JSON encoding
+// extractStringValue extracts a string from a byte slice, handling msgpack encoding
 func extractStringValue(pkValue []byte) string {
-	// Try to unmarshal as JSON string first
+	// Try to unmarshal as msgpack string first
 	var val string
-	if err := json.Unmarshal(pkValue, &val); err != nil {
-		// If not JSON, use raw bytes as string
+	if err := msgpack.Unmarshal(pkValue, &val); err != nil {
+		// If not msgpack, use raw bytes as string
 		val = string(pkValue)
 	}
 	return val
@@ -196,14 +196,18 @@ func extractStringValue(pkValue []byte) string {
 
 // isZeroValue checks if a byte slice represents a zero value (integer 0)
 // MySQL uses id=0 to indicate "use auto-increment next value"
-// Values may be JSON-encoded strings ("0") or raw bytes (0)
+// Values may be msgpack-encoded strings or raw bytes
 func isZeroValue(val []byte) bool {
 	if len(val) == 0 {
 		return false
 	}
-	s := string(val)
-	// Check JSON-encoded string "0" or raw "0"
-	return s == "0" || s == `"0"`
+	// Try to unmarshal as msgpack string first
+	var s string
+	if err := msgpack.Unmarshal(val, &s); err != nil {
+		// If not msgpack, use raw bytes as string
+		s = string(val)
+	}
+	return s == "0"
 }
 
 // ValidateRowKey validates that a row key matches expected schema version

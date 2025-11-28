@@ -3,7 +3,6 @@ package replica
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"os"
 	"testing"
 	"time"
@@ -12,6 +11,7 @@ import (
 	"github.com/maxpert/marmot/db"
 	marmotgrpc "github.com/maxpert/marmot/grpc"
 	"github.com/maxpert/marmot/hlc"
+	"github.com/vmihailenco/msgpack/v5"
 )
 
 // setupStreamClientTest creates test environment
@@ -94,9 +94,9 @@ func TestStreamClient_ApplyCDCInsert(t *testing.T) {
 	}
 
 	newValues := map[string][]byte{
-		"id":    jsonMarshal(1),
-		"name":  jsonMarshal("Alice"),
-		"email": jsonMarshal("alice@example.com"),
+		"id":    msgpackMarshal(1),
+		"name":  msgpackMarshal("Alice"),
+		"email": msgpackMarshal("alice@example.com"),
 	}
 
 	err = client.applyCDCInsert(tx, "users", newValues)
@@ -159,9 +159,9 @@ func TestStreamClient_ApplyCDCUpdate(t *testing.T) {
 	}
 
 	newValues := map[string][]byte{
-		"id":    jsonMarshal(1),
-		"name":  jsonMarshal("Alice Updated"),
-		"email": jsonMarshal("alice@new.com"),
+		"id":    msgpackMarshal(1),
+		"name":  msgpackMarshal("Alice Updated"),
+		"email": msgpackMarshal("alice@new.com"),
 	}
 
 	err = client.applyCDCInsert(tx, "users", newValues)
@@ -223,9 +223,9 @@ func TestStreamClient_ApplyCDCDelete(t *testing.T) {
 	}
 
 	oldValues := map[string][]byte{
-		"id":    jsonMarshal(1),
-		"name":  jsonMarshal("Alice"),
-		"email": jsonMarshal("alice@example.com"),
+		"id":    msgpackMarshal(1),
+		"name":  msgpackMarshal("Alice"),
+		"email": msgpackMarshal("alice@example.com"),
 	}
 
 	err = client.applyCDCDelete(tx, "users", "", oldValues)
@@ -341,8 +341,8 @@ func TestStreamClient_ApplyChangeEvent(t *testing.T) {
 				Payload: &marmotgrpc.Statement_RowChange{
 					RowChange: &marmotgrpc.RowChange{
 						NewValues: map[string][]byte{
-							"id":   jsonMarshal(1),
-							"data": jsonMarshal("test event"),
+							"id":   msgpackMarshal(1),
+							"data": msgpackMarshal("test event"),
 						},
 					},
 				},
@@ -584,9 +584,9 @@ func TestApplyCDCDelete_NoKeyOrValues(t *testing.T) {
 	}
 }
 
-// Helper to JSON marshal values
-func jsonMarshal(v interface{}) []byte {
-	data, _ := json.Marshal(v)
+// Helper to msgpack marshal values
+func msgpackMarshal(v interface{}) []byte {
+	data, _ := msgpack.Marshal(v)
 	return data
 }
 
@@ -610,8 +610,8 @@ func BenchmarkStreamClient_ApplyCDCInsert(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		tx, _ := sqlDB.BeginTx(context.Background(), nil)
 		newValues := map[string][]byte{
-			"id":   jsonMarshal(i),
-			"name": jsonMarshal("test"),
+			"id":   msgpackMarshal(i),
+			"name": msgpackMarshal("test"),
 		}
 		client.applyCDCInsert(tx, "users", newValues)
 		tx.Commit()
@@ -646,8 +646,8 @@ func BenchmarkStreamClient_ApplyChangeEvent(b *testing.B) {
 					Payload: &marmotgrpc.Statement_RowChange{
 						RowChange: &marmotgrpc.RowChange{
 							NewValues: map[string][]byte{
-								"id":   jsonMarshal(i),
-								"data": jsonMarshal("test"),
+								"id":   msgpackMarshal(i),
+								"data": msgpackMarshal("test"),
 							},
 						},
 					},

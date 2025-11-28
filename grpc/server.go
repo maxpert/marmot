@@ -3,7 +3,6 @@ package grpc
 import (
 	"context"
 	"crypto/md5"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -16,6 +15,7 @@ import (
 	"github.com/maxpert/marmot/db"
 	"github.com/rs/zerolog/log"
 	"github.com/soheilhy/cmux"
+	"github.com/vmihailenco/msgpack/v5"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/reflection"
@@ -385,20 +385,20 @@ func (s *Server) StreamChanges(req *StreamRequest, stream MarmotService_StreamCh
 				continue
 			}
 
-			// Parse statements from JSON - must include CDC data (NewValues, OldValues, RowKey)
+			// Parse statements from msgpack - must include CDC data (NewValues, OldValues, RowKey)
 			var statements []*Statement
 			if statementsJSON != "" && statementsJSON != "[]" {
 				var rawStatements []struct {
-					SQL       string            `json:"SQL"`
-					Type      int               `json:"Type"`
-					TableName string            `json:"TableName"`
-					Database  string            `json:"Database"`
-					RowKey    string            `json:"RowKey"`
-					OldValues map[string][]byte `json:"OldValues"`
-					NewValues map[string][]byte `json:"NewValues"`
+					SQL       string            `msgpack:"SQL"`
+					Type      int               `msgpack:"Type"`
+					TableName string            `msgpack:"TableName"`
+					Database  string            `msgpack:"Database"`
+					RowKey    string            `msgpack:"RowKey"`
+					OldValues map[string][]byte `msgpack:"OldValues"`
+					NewValues map[string][]byte `msgpack:"NewValues"`
 				}
-				if err := json.Unmarshal([]byte(statementsJSON), &rawStatements); err != nil {
-					log.Warn().Err(err).Uint64("txn_id", txnID).Msg("Failed to parse statements JSON")
+				if err := msgpack.Unmarshal([]byte(statementsJSON), &rawStatements); err != nil {
+					log.Warn().Err(err).Uint64("txn_id", txnID).Msg("Failed to parse statements msgpack")
 				} else {
 					for _, s := range rawStatements {
 						stmt := &Statement{

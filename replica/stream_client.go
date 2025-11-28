@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/md5"
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -17,6 +16,7 @@ import (
 	"github.com/maxpert/marmot/db"
 	marmotgrpc "github.com/maxpert/marmot/grpc"
 	"github.com/maxpert/marmot/hlc"
+	"github.com/vmihailenco/msgpack/v5"
 
 	"github.com/rs/zerolog/log"
 	"google.golang.org/grpc"
@@ -609,7 +609,7 @@ func (s *StreamClient) applyCDCInsert(tx *sql.Tx, tableName string, newValues ma
 		placeholders = append(placeholders, "?")
 
 		var value interface{}
-		if err := json.Unmarshal(newValues[col], &value); err != nil {
+		if err := msgpack.Unmarshal(newValues[col], &value); err != nil {
 			return fmt.Errorf("failed to deserialize value for column %s: %w", col, err)
 		}
 		values = append(values, value)
@@ -638,7 +638,7 @@ func (s *StreamClient) applyCDCDelete(tx *sql.Tx, tableName string, rowKey strin
 		for col, valBytes := range oldValues {
 			whereClauses = append(whereClauses, fmt.Sprintf("%s = ?", col))
 			var value interface{}
-			if err := json.Unmarshal(valBytes, &value); err != nil {
+			if err := msgpack.Unmarshal(valBytes, &value); err != nil {
 				return fmt.Errorf("failed to deserialize value for column %s: %w", col, err)
 			}
 			values = append(values, value)

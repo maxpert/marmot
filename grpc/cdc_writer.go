@@ -2,12 +2,12 @@ package grpc
 
 import (
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
 
 	"github.com/maxpert/marmot/protocol"
+	"github.com/vmihailenco/msgpack/v5"
 )
 
 // writeCDCData writes row data directly to the database (CDC approach)
@@ -49,9 +49,9 @@ func writeInsert(db *sql.DB, tableName string, newValues map[string][]byte) erro
 	for _, col := range columns {
 		placeholders = append(placeholders, "?")
 
-		// Deserialize value from JSON
+		// Deserialize value from msgpack
 		var value string
-		if err := json.Unmarshal(newValues[col], &value); err != nil {
+		if err := msgpack.Unmarshal(newValues[col], &value); err != nil {
 			return fmt.Errorf("failed to deserialize value for column %s: %w", col, err)
 		}
 		values = append(values, value)
@@ -98,9 +98,9 @@ func writeUpdate(sqlDB *sql.DB, tableName string, rowKey string, newValues map[s
 
 		setClauses = append(setClauses, fmt.Sprintf("%s = ?", col))
 
-		// Deserialize value from JSON
+		// Deserialize value from msgpack
 		var value interface{}
-		if err := json.Unmarshal(valBytes, &value); err != nil {
+		if err := msgpack.Unmarshal(valBytes, &value); err != nil {
 			return fmt.Errorf("failed to deserialize value for column %s: %w", col, err)
 		}
 		values = append(values, value)
@@ -119,9 +119,9 @@ func writeUpdate(sqlDB *sql.DB, tableName string, rowKey string, newValues map[s
 
 		whereClauses = append(whereClauses, fmt.Sprintf("%s = ?", pkCol))
 
-		// Deserialize PK value
+		// Deserialize PK value from msgpack
 		var value interface{}
-		if err := json.Unmarshal(pkValue, &value); err != nil {
+		if err := msgpack.Unmarshal(pkValue, &value); err != nil {
 			return fmt.Errorf("failed to deserialize PK value for column %s: %w", pkCol, err)
 		}
 		values = append(values, value)
@@ -167,9 +167,9 @@ func writeDelete(sqlDB *sql.DB, tableName string, rowKey string, oldValues map[s
 
 			whereClauses = append(whereClauses, fmt.Sprintf("%s = ?", pkCol))
 
-			// Deserialize PK value
+			// Deserialize PK value from msgpack
 			var value interface{}
-			if err := json.Unmarshal(pkValue, &value); err != nil {
+			if err := msgpack.Unmarshal(pkValue, &value); err != nil {
 				return fmt.Errorf("failed to deserialize PK value for column %s: %w", pkCol, err)
 			}
 			values = append(values, value)

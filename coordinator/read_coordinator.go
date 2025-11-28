@@ -3,12 +3,12 @@ package coordinator
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"time"
 
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/protocol"
+	"github.com/vmihailenco/msgpack/v5"
 )
 
 // ReadCoordinator orchestrates distributed reads with MVCC snapshot isolation
@@ -328,7 +328,7 @@ func ReadWithWriteIntentCheck(db *sql.DB, snapshotTS hlc.Timestamp, tableName, r
 
 				// Deserialize data snapshot
 				var snapshotData map[string]interface{}
-				err = json.Unmarshal(dataSnapshot, &snapshotData)
+				err = msgpack.Unmarshal(dataSnapshot, &snapshotData)
 				if err != nil {
 					return nil, fmt.Errorf("failed to deserialize intent snapshot: %w", err)
 				}
@@ -363,7 +363,7 @@ func ReadWithWriteIntentCheck(db *sql.DB, snapshotTS hlc.Timestamp, tableName, r
 
 	// Deserialize data snapshot
 	var snapshotData map[string]interface{}
-	err = json.Unmarshal(dataSnapshot, &snapshotData)
+	err = msgpack.Unmarshal(dataSnapshot, &snapshotData)
 	if err != nil {
 		return nil, fmt.Errorf("failed to deserialize MVCC snapshot: %w", err)
 	}

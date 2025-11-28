@@ -1,9 +1,9 @@
 package cdc
 
 import (
-	"encoding/json"
 	"fmt"
 
+	"github.com/vmihailenco/msgpack/v5"
 	"vitess.io/vitess/go/vt/sqlparser"
 )
 
@@ -327,7 +327,7 @@ func extractPKValuesFromWhere(expr sqlparser.Expr) (map[string][]byte, error) {
 }
 
 // serializeValue converts a value to bytes for transmission
-// Uses JSON for simplicity (could be optimized with msgpack or protobuf)
+// Uses msgpack for efficient binary serialization
 func serializeValue(value string) ([]byte, error) {
-	return json.Marshal(value)
+	return msgpack.Marshal(value)
 }
