@@ -367,15 +367,18 @@ func (dm *DatabaseManager) Close() error {
 	return lastErr
 }
 
-// ReopenDatabase closes and reopens a specific database connection.
-// This is used after a snapshot is applied to reload the new database file.
+// ReopenDatabase atomically swaps in a new database connection after snapshot apply.
+// Uses "create-swap-close" pattern to avoid closing connections while queries are in-flight:
+// 1. Create new database connection (before closing old one)
+// 2. Atomically swap in the new connection (under lock)
+// 3. Close old database after a delay (in goroutine, lets in-flight queries complete)
 func (dm *DatabaseManager) ReopenDatabase(name string) error {
 	dm.mu.Lock()
-	defer dm.mu.Unlock()
 
 	// Get the existing database
-	db, exists := dm.databases[name]
+	oldDB, exists := dm.databases[name]
 	if !exists {
+		dm.mu.Unlock()
 		return fmt.Errorf("database %s does not exist", name)
 	}
 
@@ -385,29 +388,37 @@ func (dm *DatabaseManager) ReopenDatabase(name string) error {
 		"SELECT path FROM __marmot_databases WHERE name = ?", name,
 	).Scan(&dbPath)
 	if err != nil {
+		dm.mu.Unlock()
 		return fmt.Errorf("failed to get database path: %w", err)
 	}
 
-	// Close the current database connection
-	log.Info().Str("name", name).Msg("Closing database for snapshot reload")
-	if err := db.Close(); err != nil {
-		log.Warn().Err(err).Str("name", name).Msg("Error closing database during reopen")
-	}
-
-	// Reopen the database with the same path
+	// Create new database connection FIRST (before closing old one)
 	fullPath := filepath.Join(dm.dataDir, dbPath)
 	newDB, err := NewMVCCDatabase(fullPath, dm.nodeID, dm.clock, dm.systemDB.GetDB())
 	if err != nil {
+		dm.mu.Unlock()
 		return fmt.Errorf("failed to reopen database %s: %w", name, err)
 	}
 
-	// Wire up GC coordination
+	// Wire up GC coordination for new connection
 	dm.wireGCCoordination(newDB, name)
 
-	// Update the map
+	// Atomically swap in the new connection
 	dm.databases[name] = newDB
+	dm.mu.Unlock()
 
-	log.Info().Str("name", name).Msg("Database reopened after snapshot")
+	log.Info().Str("name", name).Msg("Database connection swapped after snapshot")
+
+	// Close old database in background after delay to let in-flight queries complete
+	// Most SQLite queries complete within 5 seconds (busy_timeout is 50s but that's worst case)
+	go func() {
+		time.Sleep(5 * time.Second)
+		log.Info().Str("name", name).Msg("Closing old database connection after swap delay")
+		if err := oldDB.Close(); err != nil {
+			log.Warn().Err(err).Str("name", name).Msg("Error closing old database connection")
+		}
+	}()
+
 	return nil
 }
 

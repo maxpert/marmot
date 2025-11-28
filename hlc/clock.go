@@ -10,6 +10,7 @@ type Clock struct {
 	nodeID   uint64
 	wallTime int64
 	logical  int32
+	lastMS   int64 // Last millisecond used for txn_id generation - logical resets when this changes
 	mu       sync.Mutex
 }
 
@@ -22,10 +23,12 @@ type Timestamp struct {
 
 // NewClock creates a new HLC instance
 func NewClock(nodeID uint64) *Clock {
+	now := time.Now().UnixNano()
 	return &Clock{
 		nodeID:   nodeID,
-		wallTime: time.Now().UnixNano(),
+		wallTime: now,
 		logical:  0,
+		lastMS:   now / 1_000_000,
 	}
 }
 
@@ -36,15 +39,20 @@ func (c *Clock) Now() Timestamp {
 
 	// Get current physical time
 	physicalNow := time.Now().UnixNano()
+	currentMS := physicalNow / 1_000_000
 
 	if physicalNow > c.wallTime {
-		// Physical time advanced, reset logical clock
 		c.wallTime = physicalNow
-		c.logical = 0
-	} else {
-		// Physical time hasn't advanced (or went backwards), increment logical
-		c.logical++
 	}
+
+	// Reset logical when millisecond changes to prevent overflow into physical bits
+	// ToTxnID uses 18 bits for logical (~262k IDs/ms), so we must reset per-millisecond
+	if currentMS > c.lastMS {
+		c.lastMS = currentMS
+		c.logical = 0
+	}
+
+	c.logical++
 
 	return Timestamp{
 		WallTime: c.wallTime,
@@ -70,6 +78,9 @@ func (c *Clock) Update(remote Timestamp) Timestamp {
 		maxWall = physicalNow
 	}
 
+	// Track millisecond for txn_id uniqueness
+	maxWallMS := maxWall / 1_000_000
+
 	if maxWall == c.wallTime && maxWall == remote.WallTime {
 		// Same wall time: increment logical to be greater than both
 		if remote.Logical > c.logical {
@@ -84,13 +95,19 @@ func (c *Clock) Update(remote Timestamp) Timestamp {
 	} else if maxWall == physicalNow {
 		// Physical time advanced past both
 		c.wallTime = physicalNow
-		c.logical = 0
+		// Only reset logical if millisecond changed
+		if maxWallMS > c.lastMS {
+			c.logical = 0
+		} else {
+			c.logical++
+		}
 	} else {
 		// Local wall time was ahead
 		c.logical++
 	}
 
 	c.wallTime = maxWall
+	c.lastMS = maxWallMS
 
 	return Timestamp{
 		WallTime: c.wallTime,
@@ -151,4 +168,20 @@ func (t Timestamp) PhysicalTime() time.Time {
 // String returns a human-readable representation
 func (t Timestamp) String() string {
 	return t.PhysicalTime().Format(time.RFC3339Nano)
+}
+
+// LogicalBits is the number of bits reserved for logical counter in txn IDs.
+// Following TiDB/Percolator pattern: 18 bits = ~262k IDs per millisecond.
+const LogicalBits = 18
+
+// LogicalMask masks the logical counter to 18 bits for ToTxnID
+const LogicalMask = (1 << LogicalBits) - 1
+
+// ToTxnID converts a timestamp to a unique transaction ID.
+// Uses Percolator/TiDB pattern: (physical_ms << 18) | logical
+// The logical counter is masked to 18 bits to prevent overflow into physical time bits.
+func (t Timestamp) ToTxnID() uint64 {
+	physicalMS := uint64(t.WallTime / 1_000_000)
+	// Mask logical to 18 bits as safety measure
+	return (physicalMS << LogicalBits) | (uint64(t.Logical) & LogicalMask)
 }

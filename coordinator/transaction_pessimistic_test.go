@@ -8,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/maxpert/marmot/cfg"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/protocol"
 )
@@ -20,8 +19,9 @@ func TestMultiStatementTransaction(t *testing.T) {
 	nodes := []uint64{1, 2, 3}
 	nodeProvider := newMockNodeProvider(nodes)
 	replicator := newMockReplicator()
+	clock := hlc.NewClock(1)
 
-	coordinator := NewWriteCoordinator(1, nodeProvider, replicator, replicator, 5*time.Second)
+	coordinator := NewWriteCoordinator(1, nodeProvider, replicator, replicator, 5*time.Second, clock)
 
 	// Simulate BEGIN - start transaction
 	txnState := &TransactionState{
@@ -94,8 +94,9 @@ func TestLockWaitingOnConflict(t *testing.T) {
 	nodes := []uint64{1, 2, 3}
 	nodeProvider := newMockNodeProvider(nodes)
 	replicator := newMockReplicator()
+	clock := hlc.NewClock(1)
 
-	coordinator := NewWriteCoordinator(1, nodeProvider, replicator, replicator, 5*time.Second)
+	coordinator := NewWriteCoordinator(1, nodeProvider, replicator, replicator, 5*time.Second, clock)
 
 	// Transaction 1: Locks row with id=1
 	txn1 := &Transaction{
@@ -167,49 +168,18 @@ func TestLockWaitingOnConflict(t *testing.T) {
 	}
 }
 
-// TestLockWaitTimeout verifies that if a lock is held too long,
-// transaction fails with MySQL error 1205
-func TestLockWaitTimeout(t *testing.T) {
+// TestConflictReturnsDeadlockError verifies that when a conflict is detected,
+// the transaction fails immediately with MySQL error 1213 (deadlock) for client retry
+func TestConflictReturnsDeadlockError(t *testing.T) {
 	nodes := []uint64{1, 2, 3}
 	nodeProvider := newMockNodeProvider(nodes)
 	replicator := newMockReplicator()
+	clock := hlc.NewClock(1)
 
-	// Configure short lock wait timeout for testing
-	oldTimeout := cfg.Config.MVCC.LockWaitTimeoutSeconds
-	cfg.Config.MVCC.LockWaitTimeoutSeconds = 1
-	defer func() {
-		cfg.Config.MVCC.LockWaitTimeoutSeconds = oldTimeout
-	}()
+	coordinator := NewWriteCoordinator(1, nodeProvider, replicator, replicator, 500*time.Millisecond, clock)
 
-	// Use short timeout for testing
-	coordinator := NewWriteCoordinator(1, nodeProvider, replicator, replicator, 500*time.Millisecond)
-
-	// Transaction 1: Holds lock indefinitely
-	txn1 := &Transaction{
-		ID:               100,
-		NodeID:           1,
-		Statements:       []protocol.Statement{{SQL: "UPDATE users SET name='Alice' WHERE id=1", Type: protocol.StatementUpdate}},
-		StartTS:          hlc.Timestamp{WallTime: 1000, Logical: 0},
-		WriteConsistency: protocol.ConsistencyQuorum,
-		Database:         "testdb",
-	}
-
-	// Make txn1 hold the lock by adding a long delay
-	// This simulates a slow-running transaction
-	replicator.SetDelay(txn1.ID, 60*time.Second)
-
-	// Start txn1 in background - it will hold the lock indefinitely
-	txn1Done := make(chan struct{})
-	go func() {
-		coordinator.WriteTransaction(context.Background(), txn1)
-		close(txn1Done)
-	}()
-
-	// Give txn1 time to acquire lock
-	time.Sleep(100 * time.Millisecond)
-
-	// Transaction 2: Should timeout waiting
-	txn2 := &Transaction{
+	// Transaction that will conflict
+	txn := &Transaction{
 		ID:               200,
 		NodeID:           1,
 		Statements:       []protocol.Statement{{SQL: "UPDATE users SET name='Bob' WHERE id=1", Type: protocol.StatementUpdate}},
@@ -218,40 +188,37 @@ func TestLockWaitTimeout(t *testing.T) {
 		Database:         "testdb",
 	}
 
-	// Simulate persistent conflict on nodes 2 and 3: txn2 conflicts with txn1's lock
-	// Set on multiple nodes to ensure conflict is detected even with quorum optimization
-	replicator.SetConflict(2, txn2.ID, "row locked by txn 100")
-	replicator.SetConflict(3, txn2.ID, "row locked by txn 100")
+	// Simulate conflict on nodes 2 and 3
+	replicator.SetPersistentNodeConflict(2, "row locked by txn 100")
+	replicator.SetPersistentNodeConflict(3, "row locked by txn 100")
 
-	// Execute txn2 - should timeout
+	// Execute - should fail immediately with deadlock error
 	start := time.Now()
-	err := coordinator.WriteTransaction(context.Background(), txn2)
+	err := coordinator.WriteTransaction(context.Background(), txn)
 	duration := time.Since(start)
 
-	// Verify: Failed with timeout error
+	// Verify: Failed with error
 	if err == nil {
-		t.Fatal("Expected timeout error, got success")
+		t.Fatal("Expected error, got success")
 	}
 
-	// Verify: Error is MySQL error 1205
+	// Verify: Error is MySQL error 1213 (deadlock - client should retry)
 	mysqlErr, ok := err.(*MySQLError)
 	if !ok {
 		t.Fatalf("Expected MySQLError, got %T: %v", err, err)
 	}
 
-	if mysqlErr.Code != 1205 {
-		t.Errorf("Expected error code 1205, got %d", mysqlErr.Code)
+	if mysqlErr.Code != 1213 {
+		t.Errorf("Expected error code 1213 (deadlock), got %d", mysqlErr.Code)
 	}
 
-	if mysqlErr.SQLState != "HY000" {
-		t.Errorf("Expected SQLSTATE HY000, got %s", mysqlErr.SQLState)
+	if mysqlErr.SQLState != "40001" {
+		t.Errorf("Expected SQLSTATE 40001, got %s", mysqlErr.SQLState)
 	}
 
-	// Verify: Failed quickly (fail-fast on conflict detection)
-	// The current implementation detects conflicts immediately during prepare phase
-	// rather than waiting/retrying, which is correct for distributed 2PC
-	if duration > 500*time.Millisecond {
-		t.Errorf("Expected fast failure on conflict detection, got %v", duration)
+	// Verify: Failed quickly (no internal retry)
+	if duration > 100*time.Millisecond {
+		t.Errorf("Expected immediate failure, but waited %v", duration)
 	}
 }
 
@@ -261,8 +228,9 @@ func TestConcurrentTransactionsSerializeOnConflict(t *testing.T) {
 	nodes := []uint64{1, 2, 3}
 	nodeProvider := newMockNodeProvider(nodes)
 	replicator := newMockReplicator()
+	clock := hlc.NewClock(1)
 
-	coordinator := NewWriteCoordinator(1, nodeProvider, replicator, replicator, 5*time.Second)
+	coordinator := NewWriteCoordinator(1, nodeProvider, replicator, replicator, 5*time.Second, clock)
 
 	// Track execution order
 	var executionOrder []uint64
@@ -327,8 +295,9 @@ func TestNoWaitOnDifferentRows(t *testing.T) {
 	nodes := []uint64{1, 2, 3}
 	nodeProvider := newMockNodeProvider(nodes)
 	replicator := newMockReplicator()
+	clock := hlc.NewClock(1)
 
-	coordinator := NewWriteCoordinator(1, nodeProvider, replicator, replicator, 5*time.Second)
+	coordinator := NewWriteCoordinator(1, nodeProvider, replicator, replicator, 5*time.Second, clock)
 
 	// Track concurrent execution
 	var activeCount atomic.Int32

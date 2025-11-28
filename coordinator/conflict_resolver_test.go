@@ -1,6 +1,7 @@
 package coordinator
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/maxpert/marmot/hlc"
@@ -347,5 +348,18 @@ func BenchmarkSelectWinner(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		cr.SelectWinner(timestamps)
+	}
+}
+
+// Tests for WaitingConflictHandler
+
+func TestDefaultConflictHandler_AlwaysReturnsError(t *testing.T) {
+	handler := &DefaultConflictHandler{}
+	txn := &Transaction{ID: 1}
+	testErr := fmt.Errorf("test conflict error")
+
+	result := handler.OnConflict(txn, testErr)
+	if result != testErr {
+		t.Errorf("DefaultConflictHandler should return the same error, got %v", result)
 	}
 }

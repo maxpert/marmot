@@ -126,10 +126,7 @@ func getConflictWindow() int64 {
 	return 10 * 1000 * 1000 * 1000 // Default: 10 seconds
 }
 
-// ConflictWindow is the default conflict window (deprecated - use getConflictWindow())
-const ConflictWindow = 10 * 1000 * 1000 * 1000 // 10 seconds
-
-// DefaultConflictHandler implements ConflictHandler with simple abort strategy
+// DefaultConflictHandler handles write-write conflicts by aborting the transaction
 type DefaultConflictHandler struct{}
 
 // OnConflict handles write-write conflicts by returning the error (aborting)

@@ -7,16 +7,15 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
-	"encoding/json"
 	"fmt"
 	"io"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/mattn/go-sqlite3"
 	"github.com/maxpert/marmot/protocol/filter"
+	"github.com/vmihailenco/msgpack/v5"
 )
 
 // Operation constants for intent entries
@@ -349,13 +348,13 @@ func (s *EphemeralHookSession) hookCallback(data sqlite3.SQLitePreUpdateData) {
 		s.collectors[data.TableName].AddRowKey(rowKey)
 	}
 
-	// Serialize values to JSON
-	var oldJSON, newJSON []byte
+	// Serialize values to msgpack
+	var oldMsgpack, newMsgpack []byte
 	if oldValues != nil {
-		oldJSON, _ = json.Marshal(oldValues)
+		oldMsgpack, _ = msgpack.Marshal(oldValues)
 	}
 	if newValues != nil {
-		newJSON, _ = json.Marshal(newValues)
+		newMsgpack, _ = msgpack.Marshal(newValues)
 	}
 
 	// Increment sequence
@@ -366,7 +365,7 @@ func (s *EphemeralHookSession) hookCallback(data sqlite3.SQLitePreUpdateData) {
 		INSERT INTO __marmot__intent_entries
 		(txn_id, seq, operation, table_name, row_key, old_values, new_values, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-	`, s.txnID, s.seq, operation, data.TableName, rowKey, oldJSON, newJSON, time.Now().UnixNano())
+	`, s.txnID, s.seq, operation, data.TableName, rowKey, oldMsgpack, newMsgpack, time.Now().UnixNano())
 }
 
 // buildValueMap converts column values to a map
@@ -387,32 +386,14 @@ func (s *EphemeralHookSession) buildValueMap(columns []string, values []interfac
 	return result
 }
 
-// serializeValue converts a value to bytes with deterministic encoding
+// serializeValue converts a value to msgpack bytes for CDC replication.
+// Msgpack preserves type information (int64 stays int64, not float64).
 func (s *EphemeralHookSession) serializeValue(v interface{}) []byte {
-	switch val := v.(type) {
-	case nil:
+	if v == nil {
 		return nil
-	case []byte:
-		return val
-	case string:
-		return []byte(val)
-	case int64:
-		return []byte(strconv.FormatInt(val, 10))
-	case int:
-		return []byte(strconv.Itoa(val))
-	case float64:
-		return []byte(strconv.FormatFloat(val, 'g', -1, 64))
-	case float32:
-		return []byte(strconv.FormatFloat(float64(val), 'g', -1, 32))
-	case bool:
-		if val {
-			return []byte("1")
-		}
-		return []byte("0")
-	default:
-		data, _ := json.Marshal(val)
-		return data
 	}
+	data, _ := msgpack.Marshal(v)
+	return data
 }
 
 // extractPKValuesFromDest extracts primary key values from a destination slice
@@ -508,10 +489,10 @@ func (s *EphemeralHookSession) GetIntentEntries() ([]*IntentEntry, error) {
 			return nil, err
 		}
 		if oldJSON != nil {
-			json.Unmarshal(oldJSON, &entry.OldValues)
+			msgpack.Unmarshal(oldJSON, &entry.OldValues)
 		}
 		if newJSON != nil {
-			json.Unmarshal(newJSON, &entry.NewValues)
+			msgpack.Unmarshal(newJSON, &entry.NewValues)
 		}
 		entries = append(entries, entry)
 	}

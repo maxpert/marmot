@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/maxpert/marmot/cfg"
 	"github.com/maxpert/marmot/coordinator"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/protocol"
@@ -19,8 +20,14 @@ var _ coordinator.PendingExecution = (*PendingLocalExecution)(nil)
 
 // MVCCDatabase wraps a SQL database with MVCC transaction support
 // This is the main integration point between application layer and MVCC storage
+//
+// SQLite WAL mode allows ONE writer + MANY concurrent readers.
+// We maintain separate connection pools:
+// - writeDB: Single connection for all writes (SQLite limitation)
+// - readDB: Multiple connections for concurrent reads (pool_size from config)
 type MVCCDatabase struct {
-	db            *sql.DB
+	writeDB       *sql.DB // Write connection (pool size=1, _txlock=immediate)
+	readDB        *sql.DB // Read connection pool (pool size from config)
 	txnMgr        *MVCCTransactionManager
 	clock         *hlc.Clock
 	nodeID        uint64
@@ -37,66 +44,122 @@ type ReplicationFunc func(ctx context.Context, txn *MVCCTransaction) error
 // NewMVCCDatabase creates a new MVCC-enabled database
 // systemDB is the system database (*sql.DB) for storing intent entries during hooks
 func NewMVCCDatabase(dbPath string, nodeID uint64, clock *hlc.Clock, systemDB *sql.DB) (*MVCCDatabase, error) {
-	// Open SQLite database with WAL mode for better concurrency
-	// WAL mode allows concurrent readers with a writer
-	dsn := dbPath
-	if !strings.Contains(dsn, ":memory:") {
-		if strings.Contains(dsn, "?") {
-			dsn += "&_journal_mode=WAL"
+	// Get timeout from config (LockWaitTimeoutSeconds is in seconds, SQLite needs milliseconds)
+	busyTimeoutMS := cfg.Config.MVCC.LockWaitTimeoutSeconds * 1000
+	poolCfg := cfg.Config.ConnectionPool
+	isMemoryDB := strings.Contains(dbPath, ":memory:")
+
+	// === WRITE CONNECTION ===
+	// Single connection for all writes (SQLite allows only one writer at a time)
+	// Uses _txlock=immediate to acquire write lock at BEGIN, avoiding deadlocks
+	writeDSN := dbPath
+	if !isMemoryDB {
+		if strings.Contains(writeDSN, "?") {
+			writeDSN += fmt.Sprintf("&_journal_mode=WAL&_busy_timeout=%d&_txlock=immediate", busyTimeoutMS)
 		} else {
-			dsn += "?_journal_mode=WAL"
+			writeDSN += fmt.Sprintf("?_journal_mode=WAL&_busy_timeout=%d&_txlock=immediate", busyTimeoutMS)
 		}
 	}
 
-	db, err := sql.Open("sqlite3", dsn)
+	writeDB, err := sql.Open("sqlite3", writeDSN)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open database: %w", err)
+		return nil, fmt.Errorf("failed to open write database: %w", err)
 	}
 
-	// Enable WAL mode explicitly (in case connection string didn't work)
-	if !strings.Contains(dbPath, ":memory:") {
-		_, err = db.Exec("PRAGMA journal_mode=WAL")
-		if err != nil {
-			return nil, fmt.Errorf("failed to enable WAL mode: %w", err)
-		}
+	// Write connection: exactly 1 connection (SQLite limitation)
+	writeDB.SetMaxOpenConns(1)
+	writeDB.SetMaxIdleConns(1)
+	writeDB.SetConnMaxLifetime(0) // Keep connection alive forever
 
-		// PRAGMA synchronous=NORMAL is safe with WAL mode
-		// FULL is unnecessary overhead - WAL provides durability with checkpoint
-		_, err = db.Exec("PRAGMA synchronous=NORMAL")
-		if err != nil {
-			return nil, fmt.Errorf("failed to set synchronous mode: %w", err)
-		}
-
-		// Increase cache size for better write performance (64MB)
-		// Negative value = kilobytes, positive = pages
-		_, err = db.Exec("PRAGMA cache_size=-64000")
-		if err != nil {
-			return nil, fmt.Errorf("failed to set cache size: %w", err)
-		}
-
-		// Store temp tables in memory for faster operations
-		_, err = db.Exec("PRAGMA temp_store=MEMORY")
-		if err != nil {
-			return nil, fmt.Errorf("failed to set temp store: %w", err)
+	// === READ CONNECTION POOL ===
+	// Multiple connections for concurrent reads (WAL mode supports this)
+	// No _txlock needed for reads - they don't acquire write locks
+	// Note: Don't use mode=ro as it can interfere with WAL checkpointing
+	readDSN := dbPath
+	if !isMemoryDB {
+		if strings.Contains(readDSN, "?") {
+			readDSN += fmt.Sprintf("&_journal_mode=WAL&_busy_timeout=%d", busyTimeoutMS)
+		} else {
+			readDSN += fmt.Sprintf("?_journal_mode=WAL&_busy_timeout=%d", busyTimeoutMS)
 		}
 	}
 
-	// Initialize MVCC schema
-	if err := initializeMVCCSchema(db); err != nil {
+	readDB, err := sql.Open("sqlite3", readDSN)
+	if err != nil {
+		writeDB.Close()
+		return nil, fmt.Errorf("failed to open read database: %w", err)
+	}
+
+	// Read connections: pool size from config (default 4)
+	readDB.SetMaxOpenConns(poolCfg.PoolSize)
+	readDB.SetMaxIdleConns(poolCfg.PoolSize)
+	if poolCfg.MaxLifetimeSeconds > 0 {
+		readDB.SetConnMaxLifetime(time.Duration(poolCfg.MaxLifetimeSeconds) * time.Second)
+	}
+	if poolCfg.MaxIdleTimeSeconds > 0 {
+		readDB.SetConnMaxIdleTime(time.Duration(poolCfg.MaxIdleTimeSeconds) * time.Second)
+	}
+
+	// Configure both connections with optimal SQLite settings
+	for _, db := range []*sql.DB{writeDB, readDB} {
+		if !isMemoryDB {
+			_, err = db.Exec("PRAGMA journal_mode=WAL")
+			if err != nil {
+				writeDB.Close()
+				readDB.Close()
+				return nil, fmt.Errorf("failed to enable WAL mode: %w", err)
+			}
+
+			_, err = db.Exec(fmt.Sprintf("PRAGMA busy_timeout=%d", busyTimeoutMS))
+			if err != nil {
+				writeDB.Close()
+				readDB.Close()
+				return nil, fmt.Errorf("failed to set busy timeout: %w", err)
+			}
+
+			// PRAGMA synchronous=NORMAL is safe with WAL mode
+			_, err = db.Exec("PRAGMA synchronous=NORMAL")
+			if err != nil {
+				writeDB.Close()
+				readDB.Close()
+				return nil, fmt.Errorf("failed to set synchronous mode: %w", err)
+			}
+
+			// Increase cache size for better performance (64MB)
+			_, err = db.Exec("PRAGMA cache_size=-64000")
+			if err != nil {
+				writeDB.Close()
+				readDB.Close()
+				return nil, fmt.Errorf("failed to set cache size: %w", err)
+			}
+
+			// Store temp tables in memory
+			_, err = db.Exec("PRAGMA temp_store=MEMORY")
+			if err != nil {
+				writeDB.Close()
+				readDB.Close()
+				return nil, fmt.Errorf("failed to set temp store: %w", err)
+			}
+		}
+	}
+
+	// Initialize MVCC schema (using write connection)
+	if err := initializeMVCCSchema(writeDB); err != nil {
+		writeDB.Close()
+		readDB.Close()
 		return nil, fmt.Errorf("failed to initialize MVCC schema: %w", err)
 	}
 
-	// Create transaction manager
-	txnMgr := NewMVCCTransactionManager(db, clock)
+	// Create transaction manager (uses write connection)
+	txnMgr := NewMVCCTransactionManager(writeDB, clock)
 
-	// Create commit batcher for SQLite-level batching
-	// Batch up to 20 commits with max 2ms wait
-	// This reduces fsync overhead without adding latency
-	commitBatcher := NewCommitBatcher(db, 20, 2*time.Millisecond)
+	// Create commit batcher for SQLite-level batching (uses write connection)
+	commitBatcher := NewCommitBatcher(writeDB, 20, 2*time.Millisecond)
 	commitBatcher.Start()
 
 	return &MVCCDatabase{
-		db:            db,
+		writeDB:       writeDB,
+		readDB:        readDB,
 		txnMgr:        txnMgr,
 		clock:         clock,
 		nodeID:        nodeID,
@@ -111,9 +174,20 @@ func (mdb *MVCCDatabase) SetReplicationFunc(fn ReplicationFunc) {
 	mdb.replicationFn = fn
 }
 
-// GetDB returns the underlying database handle
+// GetDB returns the write database handle (for backwards compatibility)
+// Prefer GetWriteDB() or GetReadDB() for explicit connection selection
 func (mdb *MVCCDatabase) GetDB() *sql.DB {
-	return mdb.db
+	return mdb.writeDB
+}
+
+// GetWriteDB returns the dedicated write connection (pool size=1)
+func (mdb *MVCCDatabase) GetWriteDB() *sql.DB {
+	return mdb.writeDB
+}
+
+// GetReadDB returns the read connection pool (pool size from config)
+func (mdb *MVCCDatabase) GetReadDB() *sql.DB {
+	return mdb.readDB
 }
 
 // GetTransactionManager returns the MVCC transaction manager
@@ -126,9 +200,19 @@ func (mdb *MVCCDatabase) GetClock() *hlc.Clock {
 	return mdb.clock
 }
 
-// Close closes the database
+// Close closes both read and write database connections
 func (mdb *MVCCDatabase) Close() error {
-	return mdb.db.Close()
+	var writeErr, readErr error
+	if mdb.writeDB != nil {
+		writeErr = mdb.writeDB.Close()
+	}
+	if mdb.readDB != nil {
+		readErr = mdb.readDB.Close()
+	}
+	if writeErr != nil {
+		return writeErr
+	}
+	return readErr
 }
 
 // GetSchemaCache returns the shared schema cache for preupdate hooks
@@ -233,8 +317,8 @@ func (mdb *MVCCDatabase) ExecuteLocalWithHooks(ctx context.Context, txnID uint64
 		}
 	}
 
-	// Create ephemeral session with dedicated connection
-	session, err := StartEphemeralSession(ctx, mdb.db, mdb.systemDB, mdb.schemaCache, txnID, tables)
+	// Create ephemeral session with dedicated write connection
+	session, err := StartEphemeralSession(ctx, mdb.writeDB, mdb.systemDB, mdb.schemaCache, txnID, tables)
 	if err != nil {
 		return nil, fmt.Errorf("failed to start session: %w", err)
 	}
@@ -279,11 +363,15 @@ func (mdb *MVCCDatabase) ExecuteTransaction(ctx context.Context, statements []pr
 		// Create write intent for each statement
 		// Extract row key (simplified - would need proper SQL parsing)
 		rowKey := extractRowKeyFromStatement(stmt)
-		dataSnapshot, _ := SerializeData(map[string]interface{}{
+		dataSnapshot, serErr := SerializeData(map[string]interface{}{
 			"sql":       stmt.SQL,
 			"type":      stmt.Type,
 			"timestamp": txn.StartTS.WallTime,
 		})
+		if serErr != nil {
+			mdb.txnMgr.AbortTransaction(txn)
+			return fmt.Errorf("failed to serialize data: %w", serErr)
+		}
 
 		err := mdb.txnMgr.WriteIntent(txn, stmt.TableName, rowKey, stmt, dataSnapshot)
 		if err != nil {
@@ -310,16 +398,14 @@ func (mdb *MVCCDatabase) ExecuteTransaction(ctx context.Context, statements []pr
 }
 
 // ExecuteQuery executes a read query with MVCC snapshot isolation
+// Uses the read connection pool for concurrent read access
 func (mdb *MVCCDatabase) ExecuteQuery(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error) {
 	// Get current snapshot timestamp
 	snapshotTS := mdb.clock.Now()
 
-	// For now, execute directly on base tables
-	// Full MVCC read with version resolution would be implemented here
-	// For now, we rely on SQLite's WAL mode snapshot isolation which provides
-	// a consistent view as of the transaction start time. Full MVCC resolution
-	// with write intent checking is handled in ExecuteMVCCRead for structured queries.
-	rows, err := mdb.db.QueryContext(ctx, query, args...)
+	// Execute on read connection pool for concurrent reads
+	// SQLite's WAL mode provides snapshot isolation at the connection level
+	rows, err := mdb.readDB.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("query failed: %w", err)
 	}
@@ -332,14 +418,15 @@ func (mdb *MVCCDatabase) ExecuteQuery(ctx context.Context, query string, args ..
 
 // ExecuteMVCCRead executes a read query with full MVCC support
 // Uses rqlite/sql AST parser for proper SQL analysis
+// Uses the read connection pool for concurrent read access
 func (mdb *MVCCDatabase) ExecuteMVCCRead(ctx context.Context, query string, args ...interface{}) ([]string, []map[string]interface{}, error) {
 	snapshotTS := mdb.clock.Now()
 
 	// Parse SELECT with rqlite/sql parser for MVCC optimization
 	tableName, pkValue := parseSelectForMVCC(query, args)
 	if tableName != "" && pkValue != "" {
-		// Use ReadWithWriteIntentCheck for PK lookups
-		row, err := coordinator.ReadWithWriteIntentCheck(mdb.db, snapshotTS, tableName, pkValue)
+		// Use ReadWithWriteIntentCheck for PK lookups (uses read connection)
+		row, err := coordinator.ReadWithWriteIntentCheck(mdb.readDB, snapshotTS, tableName, pkValue)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -352,8 +439,8 @@ func (mdb *MVCCDatabase) ExecuteMVCCRead(ctx context.Context, query string, args
 	}
 
 	// Fallback to standard read (Snapshot Isolation via SQLite WAL)
-	// In a real implementation, we would filter these rows against the MVCC versions
-	rows, err := mdb.db.QueryContext(ctx, query, args...)
+	// Uses read connection pool for concurrent reads
+	rows, err := mdb.readDB.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -459,6 +546,7 @@ func extractPKFromWhere(whereExpr rqlitesql.Expr, args []interface{}) string {
 }
 
 // ExecuteQueryRow executes a single-row query with MVCC snapshot isolation
+// Uses the read connection pool for concurrent read access
 func (mdb *MVCCDatabase) ExecuteQueryRow(ctx context.Context, query string, args ...interface{}) *sql.Row {
 	// Get current snapshot timestamp
 	// Note: SQLite's WAL mode provides snapshot isolation at transaction level.
@@ -467,12 +555,13 @@ func (mdb *MVCCDatabase) ExecuteQueryRow(ctx context.Context, query string, args
 	snapshotTS := mdb.clock.Now()
 	_ = snapshotTS
 
-	return mdb.db.QueryRowContext(ctx, query, args...)
+	return mdb.readDB.QueryRowContext(ctx, query, args...)
 }
 
 // Exec executes a statement (for DDL and non-transactional operations)
+// Uses the write connection for data modifications
 func (mdb *MVCCDatabase) Exec(ctx context.Context, query string, args ...interface{}) (sql.Result, error) {
-	return mdb.db.ExecContext(ctx, query, args...)
+	return mdb.writeDB.ExecContext(ctx, query, args...)
 }
 
 // initializeMVCCSchema creates all MVCC system tables

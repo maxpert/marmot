@@ -95,6 +95,7 @@ type PreparedStatement struct {
 	ID           uint32
 	Query        string
 	ParamCount   uint16
+	ParamTypes   []byte // Cached parameter types for subsequent executions
 	OriginalType StatementType
 	Context      *query.QueryContext
 }
@@ -274,7 +275,7 @@ func (s *MySQLServer) processQuery(conn net.Conn, session *ConnectionSession, qu
 
 	rs, err := s.handler.HandleQuery(session, query)
 	if err != nil {
-		s.writeError(conn, 1, 1064, err.Error())
+		s.writeMySQLErr(conn, 1, err)
 		return
 	}
 
@@ -360,14 +361,27 @@ func (s *MySQLServer) writeOK(w io.Writer, seq byte, rowsAffected int64) error {
 }
 
 func (s *MySQLServer) writeError(w io.Writer, seq byte, code uint16, msg string) error {
+	return s.writeErrorWithState(w, seq, code, "HY000", msg)
+}
+
+func (s *MySQLServer) writeErrorWithState(w io.Writer, seq byte, code uint16, sqlState, msg string) error {
 	buf := new(bytes.Buffer)
 	buf.WriteByte(0xFF) // Error packet header
 	binary.Write(buf, binary.LittleEndian, code)
 	buf.WriteByte('#')
-	buf.WriteString("HY000") // SQL State
+	buf.WriteString(sqlState)
 	buf.WriteString(msg)
 
 	return s.writePacket(w, seq, buf.Bytes())
+}
+
+// writeMySQLErr writes a MySQLError to the connection, extracting code/state from the error
+func (s *MySQLServer) writeMySQLErr(w io.Writer, seq byte, err error) error {
+	if mysqlErr, ok := err.(*MySQLError); ok {
+		return s.writeErrorWithState(w, seq, mysqlErr.Code, mysqlErr.SQLState, mysqlErr.Message)
+	}
+	// Default to generic error code 1105 (ER_UNKNOWN_ERROR)
+	return s.writeError(w, seq, 1105, err.Error())
 }
 
 func (s *MySQLServer) writeResultSet(w io.Writer, seq byte, rs *ResultSet) error {
@@ -578,8 +592,16 @@ func packLengthEncodedInt(n uint64) []byte {
 	if n < 251 {
 		return []byte{byte(n)}
 	}
-	// Simplified for this example
-	return []byte{byte(n)}
+	if n < 65536 {
+		return []byte{0xFC, byte(n), byte(n >> 8)}
+	}
+	if n < 16777216 {
+		return []byte{0xFD, byte(n), byte(n >> 8), byte(n >> 16)}
+	}
+	buf := make([]byte, 9)
+	buf[0] = 0xFE
+	binary.LittleEndian.PutUint64(buf[1:], n)
+	return buf
 }
 
 func writeLenEncString(buf *bytes.Buffer, s string) {
@@ -744,18 +766,28 @@ func (s *MySQLServer) handleStmtExecute(conn net.Conn, session *ConnectionSessio
 
 		offset := 9 + nullBitmapLen + 1
 
-		// If new-params-bound-flag is 1, parse type information
+		// Get parameter types - either from payload or cached
 		var paramTypes []byte
 		if newParamsBoundFlag == 1 {
+			// New types provided - parse and cache them
 			if len(payload) < offset+int(stmt.ParamCount)*2 {
 				s.writeError(conn, 1, 1064, "Invalid parameter types")
 				return
 			}
-			paramTypes = payload[offset : offset+int(stmt.ParamCount)*2]
+			paramTypes = make([]byte, int(stmt.ParamCount)*2)
+			copy(paramTypes, payload[offset:offset+int(stmt.ParamCount)*2])
 			offset += int(stmt.ParamCount) * 2
+
+			// Cache param types for subsequent executions
+			session.preparedStmtLock.Lock()
+			stmt.ParamTypes = paramTypes
+			session.preparedStmtLock.Unlock()
+		} else {
+			// Use cached param types
+			paramTypes = stmt.ParamTypes
 		}
 
-		// Parse parameter values
+		// Parse parameter values using the types
 		for i := uint16(0); i < stmt.ParamCount; i++ {
 			// Check NULL bitmap
 			if nullBitmap[i/8]&(1<<(i%8)) != 0 {
@@ -764,9 +796,8 @@ func (s *MySQLServer) handleStmtExecute(conn net.Conn, session *ConnectionSessio
 			}
 
 			// Parse value based on type
-			if newParamsBoundFlag == 1 && len(paramTypes) > int(i)*2 {
+			if len(paramTypes) > int(i)*2 {
 				paramType := paramTypes[i*2]
-				// unsigned := paramTypes[i*2+1]
 
 				var val interface{}
 				var err error
@@ -798,7 +829,7 @@ func (s *MySQLServer) handleStmtExecute(conn net.Conn, session *ConnectionSessio
 	// Execute query
 	rs, err := s.handler.HandleQuery(session, finalQuery)
 	if err != nil {
-		s.writeError(conn, 1, 1064, err.Error())
+		s.writeMySQLErr(conn, 1, err)
 		return
 	}
 

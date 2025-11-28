@@ -10,6 +10,12 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 echo "=== Marmot v2.0 Single Node ==="
 echo ""
 
+# Kill any existing marmot processes
+echo "Stopping any existing marmot processes..."
+pkill -f "marmot-v2" 2>/dev/null || true
+lsof -ti:3306 -ti:8080 2>/dev/null | xargs kill 2>/dev/null || true
+sleep 1
+
 # Clean up old data
 echo "Cleaning up old data..."
 rm -rf /tmp/marmot-single
@@ -98,11 +104,11 @@ TOML
 
 echo "✓ Configuration created"
 
-# Build marmot if needed
-if [ ! -f "$REPO_ROOT/marmot" ]; then
-    echo "Building marmot..."
+# Build marmot-v2 if needed
+if [ ! -f "$REPO_ROOT/marmot-v2" ]; then
+    echo "Building marmot-v2..."
     cd "$REPO_ROOT"
-    go build -o marmot .
+    go build -o marmot-v2 .
     echo "✓ Build complete"
 fi
 
@@ -117,7 +123,7 @@ trap cleanup EXIT
 
 echo ""
 echo "Starting Marmot single node..."
-"$REPO_ROOT/marmot" --config /tmp/marmot-single/config.toml > /tmp/marmot-single/marmot.log 2>&1 &
+"$REPO_ROOT/marmot-v2" --config /tmp/marmot-single/config.toml > /tmp/marmot-single/marmot.log 2>&1 &
 pid=$!
 
 sleep 2

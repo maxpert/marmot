@@ -25,7 +25,7 @@ dead_timeout_ms = 10000
 [replication]
 default_write_consistency = "QUORUM"
 default_read_consistency = "LOCAL_ONE"
-write_timeout_ms = 5000
+write_timeout_ms = 300000
 read_timeout_ms = 2000
 
 # Anti-Entropy: Background healing for eventual consistency
@@ -56,8 +56,8 @@ max_retries = 3
 retry_backoff_ms = 100
 
 [coordinator]
-prepare_timeout_ms = 2000
-commit_timeout_ms = 2000
+prepare_timeout_ms = 120000
+commit_timeout_ms = 120000
 abort_timeout_ms = 2000
 intent_ttl_ms = 60000      # MutationGuard TTL (60 seconds)
 max_guard_rows = 65536     # Max rows for hash list guards (64K)

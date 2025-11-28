@@ -48,11 +48,14 @@ echo "Config:        ${CONFIG_FILE}"
 echo "Auth:          PSK enabled"
 echo ""
 
-# Clean up previous data (optional - comment out to preserve data)
-if [ -d "${DATA_DIR}" ]; then
-    echo "Cleaning up previous data directory..."
-    rm -rf "${DATA_DIR}"
-fi
+# Kill any existing processes on our ports
+echo "Stopping any existing processes on ports ${MYSQL_PORT}, ${GRPC_PORT}..."
+lsof -ti:${MYSQL_PORT} -ti:${GRPC_PORT} 2>/dev/null | xargs kill 2>/dev/null || true
+sleep 1
+
+# Clean up previous data
+echo "Cleaning up previous data directory..."
+rm -rf "${DATA_DIR}"
 
 mkdir -p "${DATA_DIR}"
 
@@ -105,21 +108,18 @@ cat "${CONFIG_FILE}"
 echo "---"
 echo ""
 
-# Find marmot binary
-MARMOT_BIN=""
-if [ -f "./marmot-v2" ]; then
-    MARMOT_BIN="./marmot-v2"
-elif [ -f "./marmot" ]; then
-    MARMOT_BIN="./marmot"
-elif [ -f "../marmot-v2" ]; then
-    MARMOT_BIN="../marmot-v2"
-elif [ -f "../marmot" ]; then
-    MARMOT_BIN="../marmot"
+# Find or build marmot-v2 binary
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+if [ -f "$REPO_ROOT/marmot-v2" ]; then
+    MARMOT_BIN="$REPO_ROOT/marmot-v2"
 else
-    echo "Building marmot..."
-    cd "$(dirname "$0")/.."
+    echo "Building marmot-v2..."
+    cd "$REPO_ROOT"
     go build -o marmot-v2 .
-    MARMOT_BIN="./marmot-v2"
+    MARMOT_BIN="$REPO_ROOT/marmot-v2"
+    echo "✓ Build complete"
 fi
 
 echo "Starting Marmot replica ${REPLICA_ID}..."

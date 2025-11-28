@@ -25,18 +25,13 @@ type WriteCoordinator struct {
 	nodeProvider    NodeProvider
 	replicator      Replicator
 	localReplicator Replicator
-	conflictHandler ConflictHandler
 	timeout         time.Duration
+	clock           *hlc.Clock
 }
 
 // Replicator sends replication requests to remote nodes
 type Replicator interface {
 	ReplicateTransaction(ctx context.Context, nodeID uint64, req *ReplicationRequest) (*ReplicationResponse, error)
-}
-
-// ConflictHandler handles write-write conflicts
-type ConflictHandler interface {
-	OnConflict(txn *Transaction, conflictErr error) error
 }
 
 // Transaction represents a distributed transaction
@@ -101,15 +96,15 @@ type ReplicationResponse struct {
 
 // NewWriteCoordinator creates a new write coordinator for full database replication
 func NewWriteCoordinator(nodeID uint64, nodeProvider NodeProvider, replicator Replicator, localReplicator Replicator,
-	timeout time.Duration) *WriteCoordinator {
+	timeout time.Duration, clock *hlc.Clock) *WriteCoordinator {
 
 	return &WriteCoordinator{
 		nodeID:          nodeID,
 		nodeProvider:    nodeProvider,
 		replicator:      replicator,
 		localReplicator: localReplicator,
-		conflictHandler: &DefaultConflictHandler{}, // Initialized conflict handler
 		timeout:         timeout,
+		clock:           clock,
 	}
 }
 
@@ -164,8 +159,9 @@ func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transacti
 	// ====================
 	// PHASE 1: PREPARE (Create Write Intents)
 	// ====================
-	// Broadcast to ALL nodes (self + others, unless local execution already done)
-	// Wait for QUORUM acknowledgments (includes self)
+	// Single-attempt prepare with MutationGuard conflict detection.
+	// On conflict: abort and return MySQL 1213 to client for retry.
+	// No internal retry - client handles retry at application level.
 
 	prepReq := &ReplicationRequest{
 		TxnID:                 txn.ID,
@@ -178,90 +174,25 @@ func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transacti
 		MutationGuards:        txn.MutationGuards,
 	}
 
-	// Replicate to other nodes
-	// We use a channel to collect responses
-	type response struct {
-		nodeID uint64
-		resp   *ReplicationResponse
-		err    error
-	}
-
-	// Determine if we need to replicate to self
-	// If LocalExecutionDone is true, skip local replication - pendingExec will handle commit
 	skipLocalReplication := txn.LocalExecutionDone
-	totalNodes := len(otherNodes)
-	if !skipLocalReplication {
-		totalNodes++ // Include self
-	}
 
-	respChan := make(chan response, totalNodes)
-
-	// Send to other nodes
-	for _, nodeID := range otherNodes {
-		go func(nid uint64) {
-			resp, err := wc.replicator.ReplicateTransaction(ctx, nid, prepReq)
-			respChan <- response{nodeID: nid, resp: resp, err: err}
-		}(nodeID)
-	}
-
-	// Send to self (local) only if local execution not already done
-	if !skipLocalReplication {
-		go func() {
-			resp, err := wc.localReplicator.ReplicateTransaction(ctx, wc.nodeID, prepReq)
-			respChan <- response{nodeID: wc.nodeID, resp: resp, err: err}
-		}()
-	}
-
-	// Collect responses from all nodes before proceeding to commit phase
-	prepResponses := make(map[uint64]*ReplicationResponse)
+	// Execute prepare phase - single attempt, no retry
+	prepResponses, conflictErr := wc.executePreparePhase(ctx, txn, prepReq, otherNodes, skipLocalReplication)
 
 	// If local execution already done, count self as an ACK
 	if skipLocalReplication {
 		prepResponses[wc.nodeID] = &ReplicationResponse{Success: true}
 	}
 
-	// Wait for all nodes to respond to ensure consistent commit phase
-	// Note: Early exit optimization was removed because it caused nodes that responded
-	// after quorum to be excluded from the commit phase, leading to failures
-	for i := 0; i < totalNodes; i++ {
-		select {
-		case r := <-respChan:
-			if r.err != nil {
-				log.Error().Err(r.err).Uint64("node_id", r.nodeID).Msg("Prepare failed")
-			} else if r.resp != nil && r.resp.Success {
-				prepResponses[r.nodeID] = r.resp
-			} else {
-				errorMsg := "unknown"
-				if r.resp != nil {
-					errorMsg = r.resp.Error
-				}
-				log.Warn().
-					Uint64("node_id", r.nodeID).
-					Uint64("txn_id", txn.ID).
-					Str("error", errorMsg).
-					Msg("Prepare returned unsuccessful response")
-			}
-		case <-ctx.Done():
-			return fmt.Errorf("prepare timeout")
-		}
-	}
-
-	// Check for conflicts from remote nodes
-	for nodeID, resp := range prepResponses {
-		if resp.ConflictDetected {
-			log.Warn().
-				Uint64("node_id", nodeID).
-				Uint64("txn_id", txn.ID).
-				Str("conflict_details", resp.ConflictDetails).
-				Msg("Write-write conflict detected - aborting transaction")
-
-			wc.abortTransaction(ctx, allNodes, txn.ID)
-			return &protocol.MySQLError{
-				Code:     1205, // ER_LOCK_WAIT_TIMEOUT
-				SQLState: "HY000",
-				Message:  fmt.Sprintf("write-write conflict detected on node %d: %s (TRANSACTION ABORTED)", nodeID, resp.ConflictDetails),
-			}
-		}
+	if conflictErr != nil {
+		// Write-write conflict detected - abort and signal client to retry
+		log.Debug().
+			Uint64("txn_id", txn.ID).
+			Err(conflictErr).
+			Msg("Conflict detected - aborting transaction, client should retry")
+		wc.abortTransaction(ctx, allNodes, txn.ID, txn.Database)
+		// Return MySQL 1213 (ER_LOCK_DEADLOCK) - standard signal for client retry
+		return protocol.ErrDeadlock()
 	}
 
 	// Check if quorum was achieved
@@ -274,8 +205,8 @@ func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transacti
 			Int("cluster_size", clusterSize).
 			Msg("Prepare quorum not achieved - aborting transaction")
 
-		wc.abortTransaction(ctx, allNodes, txn.ID)
-		return fmt.Errorf("prepare quorum not achieved: got %d acks, need %d out of %d nodes (TRANSACTION ABORTED)",
+		wc.abortTransaction(ctx, allNodes, txn.ID, txn.Database)
+		return fmt.Errorf("prepare quorum not achieved: got %d acks, need %d out of %d nodes",
 			totalAcks, requiredQuorum, clusterSize)
 	}
 
@@ -328,42 +259,27 @@ func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transacti
 		commitResponses[wc.nodeID] = &ReplicationResponse{Success: true}
 	}
 
-	for i := 0; i < commitNodes; i++ {
+	// Collect commit responses until quorum achieved or all responses received
+	for i := 0; i < commitNodes && len(commitResponses) < requiredQuorum; i++ {
 		select {
 		case r := <-commitChan:
 			if r.err == nil && r.resp != nil && r.resp.Success {
 				commitResponses[r.nodeID] = r.resp
-
-				// OPTIMIZATION: Return early once quorum achieved
-				if len(commitResponses) >= requiredQuorum {
-					goto commitQuorumAchieved
-				}
 			} else {
 				log.Error().Err(r.err).Uint64("node_id", r.nodeID).Msg("Commit failed")
 			}
 		case <-time.After(wc.timeout):
-			// Timeout on commit - check if we already have quorum
-			if len(commitResponses) >= requiredQuorum {
-				log.Warn().Msg("Commit timeout for some nodes, but quorum achieved")
-				goto commitQuorumAchieved
-			}
-			log.Warn().Msg("Commit response timed out for one or more nodes. Will be repaired by anti-entropy.")
+			log.Warn().Msg("Commit response timed out. Will be repaired by anti-entropy.")
 		}
 	}
 
-commitQuorumAchieved:
-
-	// Count commit acks
 	totalCommitAcks := len(commitResponses)
 
-	// We already achieved quorum in PREPARE, so commit phase is best-effort
-	// As long as we have majority, we're good
-	// Stragglers will catch up via anti-entropy or snapshots
+	// Commit phase also requires quorum for durability guarantees.
+	// If commit quorum fails, transaction is partially committed -
+	// anti-entropy will eventually repair stragglers.
 	if totalCommitAcks < requiredQuorum {
-		// This is a critical failure - some nodes committed, some didn't
-		// Log warning but don't fail the transaction (quorum was achieved in PREPARE)
-		// Anti-entropy will fix stragglers
-		return fmt.Errorf("commit quorum degraded: got %d acks, expected %d (PARTIAL COMMIT - will be repaired by anti-entropy)",
+		return fmt.Errorf("commit quorum degraded: got %d acks, expected %d (will be repaired by anti-entropy)",
 			totalCommitAcks, requiredQuorum)
 	}
 
@@ -371,10 +287,11 @@ commitQuorumAchieved:
 }
 
 // abortTransaction sends abort message to all replica nodes
-func (wc *WriteCoordinator) abortTransaction(ctx context.Context, nodeIDs []uint64, txnID uint64) {
+func (wc *WriteCoordinator) abortTransaction(ctx context.Context, nodeIDs []uint64, txnID uint64, database string) {
 	abortReq := &ReplicationRequest{
-		TxnID: txnID,
-		Phase: PhaseAbort,
+		TxnID:    txnID,
+		Phase:    PhaseAbort,
+		Database: database,
 	}
 
 	// Best effort - send abort to all nodes
@@ -387,7 +304,104 @@ func (wc *WriteCoordinator) abortTransaction(ctx context.Context, nodeIDs []uint
 		go func(nid uint64) {
 			ctx, cancel := context.WithTimeout(context.Background(), abortTimeout)
 			defer cancel()
-			wc.replicator.ReplicateTransaction(ctx, nid, abortReq)
+			if nid == wc.nodeID {
+				wc.localReplicator.ReplicateTransaction(ctx, nid, abortReq)
+			} else {
+				wc.replicator.ReplicateTransaction(ctx, nid, abortReq)
+			}
 		}(nodeID)
 	}
+}
+
+// response is a helper struct for collecting async replication responses
+type response struct {
+	nodeID uint64
+	resp   *ReplicationResponse
+	err    error
+}
+
+// executePreparePhase broadcasts prepare requests to all nodes and collects responses.
+// Returns successful responses and a conflict error if any node reports a conflict.
+func (wc *WriteCoordinator) executePreparePhase(ctx context.Context, txn *Transaction, prepReq *ReplicationRequest,
+	otherNodes []uint64, skipLocalReplication bool) (map[uint64]*ReplicationResponse, error) {
+
+	// Calculate total nodes to contact
+	totalNodes := len(otherNodes)
+	if !skipLocalReplication {
+		totalNodes++ // Include self
+	}
+
+	if totalNodes == 0 {
+		return nil, fmt.Errorf("no nodes to replicate to")
+	}
+
+	// Channel for collecting responses
+	prepChan := make(chan response, totalNodes)
+
+	// Send to other nodes
+	for _, nodeID := range otherNodes {
+		go func(nid uint64) {
+			resp, err := wc.replicator.ReplicateTransaction(ctx, nid, prepReq)
+			prepChan <- response{nodeID: nid, resp: resp, err: err}
+		}(nodeID)
+	}
+
+	// Send to self if not skipped
+	if !skipLocalReplication {
+		go func() {
+			resp, err := wc.localReplicator.ReplicateTransaction(ctx, wc.nodeID, prepReq)
+			prepChan <- response{nodeID: wc.nodeID, resp: resp, err: err}
+		}()
+	}
+
+	// Collect responses
+	prepResponses := make(map[uint64]*ReplicationResponse)
+	var conflictErr error
+
+	for i := 0; i < totalNodes; i++ {
+		select {
+		case r := <-prepChan:
+			if r.err != nil {
+				log.Debug().
+					Uint64("txn_id", txn.ID).
+					Uint64("node_id", r.nodeID).
+					Err(r.err).
+					Msg("Prepare failed for node")
+				continue
+			}
+			if r.resp == nil {
+				continue
+			}
+			if r.resp.ConflictDetected {
+				// Any conflict -> return error, client will retry
+				conflictErr = fmt.Errorf("conflict on node %d: %s", r.nodeID, r.resp.ConflictDetails)
+				log.Debug().
+					Uint64("txn_id", txn.ID).
+					Uint64("node_id", r.nodeID).
+					Str("details", r.resp.ConflictDetails).
+					Msg("Write conflict detected - client should retry")
+				continue
+			}
+			if r.resp.Success {
+				prepResponses[r.nodeID] = r.resp
+			} else {
+				log.Debug().
+					Uint64("txn_id", txn.ID).
+					Uint64("node_id", r.nodeID).
+					Str("error", r.resp.Error).
+					Msg("Prepare returned failure")
+			}
+		case <-time.After(wc.timeout):
+			log.Warn().
+				Uint64("txn_id", txn.ID).
+				Msg("Prepare phase timeout waiting for responses")
+		}
+	}
+
+	// If any conflict was detected, return the error
+	if conflictErr != nil {
+		return prepResponses, conflictErr
+	}
+
+	return prepResponses, nil
 }

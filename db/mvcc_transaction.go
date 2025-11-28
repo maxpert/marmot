@@ -2,7 +2,6 @@ package db
 
 import (
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
@@ -12,6 +11,7 @@ import (
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/protocol"
 	"github.com/rs/zerolog/log"
+	"github.com/vmihailenco/msgpack/v5"
 )
 
 // MVCCTransaction represents a transaction with MVCC support
@@ -116,15 +116,20 @@ func (tm *MVCCTransactionManager) SetMinAppliedTxnIDFunc(fn MinAppliedTxnIDFunc)
 	tm.getMinAppliedTxnID = fn
 }
 
-// BeginTransaction starts a new MVCC transaction
+// BeginTransaction starts a new MVCC transaction with auto-generated ID
 func (tm *MVCCTransactionManager) BeginTransaction(nodeID uint64) (*MVCCTransaction, error) {
 	startTS := tm.clock.Now()
 
-	// Generate unique transaction ID from HLC timestamp
-	// Use wall time + logical counter to ensure uniqueness for concurrent transactions
-	// Add logical counter to wall time (logical is small, typically 0-10)
-	txnID := uint64(startTS.WallTime) + uint64(startTS.Logical)
+	// Generate unique transaction ID using Percolator/TiDB pattern: (physical_ms << 18) | logical
+	// This guarantees uniqueness by keeping physical and logical in separate bit ranges
+	txnID := startTS.ToTxnID()
 
+	return tm.BeginTransactionWithID(txnID, nodeID, startTS)
+}
+
+// BeginTransactionWithID starts an MVCC transaction with a specific ID
+// Used by coordinator replication to ensure consistent txn_id across cluster
+func (tm *MVCCTransactionManager) BeginTransactionWithID(txnID, nodeID uint64, startTS hlc.Timestamp) (*MVCCTransaction, error) {
 	txn := &MVCCTransaction{
 		ID:           txnID,
 		NodeID:       nodeID,
@@ -134,9 +139,10 @@ func (tm *MVCCTransactionManager) BeginTransaction(nodeID uint64) (*MVCCTransact
 		WriteIntents: make(map[string]*WriteIntent),
 	}
 
-	// Persist transaction record
+	// Persist transaction record using INSERT OR REPLACE to handle retries
+	// where the previous prepare's record may still exist (e.g., abort didn't complete)
 	_, err := tm.db.Exec(`
-		INSERT INTO __marmot__txn_records
+		INSERT OR REPLACE INTO __marmot__txn_records
 		(txn_id, node_id, status, start_ts_wall, start_ts_logical, created_at, last_heartbeat)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
 	`, txn.ID, nodeID, TxnStatusPending, startTS.WallTime, startTS.Logical,
@@ -202,7 +208,6 @@ func (tm *MVCCTransactionManager) WriteIntent(txn *MVCCTransaction, tableName, r
 	if err != nil {
 		// Check if this is a PRIMARY KEY constraint violation (concurrent intent)
 		if strings.Contains(err.Error(), "UNIQUE constraint failed") || strings.Contains(err.Error(), "PRIMARY KEY constraint failed") {
-			// Another transaction already has an intent on this row
 			// Query to get the conflicting transaction ID
 			var conflictTxnID uint64
 			queryErr := tm.db.QueryRow(`
@@ -211,6 +216,22 @@ func (tm *MVCCTransactionManager) WriteIntent(txn *MVCCTransaction, tableName, r
 			`, tableName, rowKey).Scan(&conflictTxnID)
 
 			if queryErr == nil {
+				// If same transaction already has intent on this row, update it
+				// This happens when DELETE then INSERT on same row in same txn
+				if conflictTxnID == txn.ID {
+					_, updateErr := tm.db.Exec(`
+						UPDATE __marmot__write_intents
+						SET operation = ?, sql_statement = ?, data_snapshot = ?, created_at = ?
+						WHERE table_name = ? AND row_key = ? AND txn_id = ?
+					`, statementTypeToOperation(stmt.Type), stmt.SQL, dataSnapshot, time.Now().UnixNano(),
+						tableName, rowKey, txn.ID)
+					if updateErr != nil {
+						return fmt.Errorf("failed to update write intent: %w", updateErr)
+					}
+					return nil
+				}
+
+				// Write-write conflict detected - return error for client to retry
 				return fmt.Errorf("write-write conflict: row %s:%s locked by transaction %d (current txn: %d)",
 					tableName, rowKey, conflictTxnID, txn.ID)
 			}
@@ -316,7 +337,7 @@ func (tm *MVCCTransactionManager) CommitTransaction(txn *MVCCTransaction) error 
 	}
 
 	// Serialize statements for delta sync replication
-	statementsJSON, err := json.Marshal(txn.Statements)
+	statementsJSON, err := msgpack.Marshal(txn.Statements)
 	if err != nil {
 		return fmt.Errorf("failed to serialize statements: %w", err)
 	}
@@ -343,8 +364,19 @@ func (tm *MVCCTransactionManager) CommitTransaction(txn *MVCCTransaction) error 
 	txn.Status = TxnStatusCommitted
 
 	// Transaction is now COMMITTED
-	// Async: Convert write intents to MVCC versions and cleanup
-	go tm.finalizeCommit(txn)
+	// SYNCHRONOUS cleanup: Remove write intents immediately to avoid blocking other transactions
+	// The async MVCC version creation is secondary and can be deferred
+	for _, intent := range txn.WriteIntents {
+		tm.cleanupIntent(intent)
+	}
+
+	// Remove from active transactions
+	tm.mu.Lock()
+	delete(tm.activeTxns, txn.ID)
+	tm.mu.Unlock()
+
+	// Async: Create MVCC versions for read history (non-blocking)
+	go tm.createMVCCVersionsAsync(txn)
 
 	return nil
 }
@@ -368,9 +400,10 @@ func (tm *MVCCTransactionManager) validateIntent(intent *WriteIntent, txnID uint
 	return currentTxnID == txnID, nil
 }
 
-// finalizeCommit converts write intents to MVCC versions (async)
-func (tm *MVCCTransactionManager) finalizeCommit(txn *MVCCTransaction) {
-	// Convert each write intent to MVCC version
+// createMVCCVersionsAsync creates MVCC version records for committed data (for read history)
+// This is non-critical and can be done asynchronously
+func (tm *MVCCTransactionManager) createMVCCVersionsAsync(txn *MVCCTransaction) {
+	// Convert each write intent to MVCC version for read history
 	for _, intent := range txn.WriteIntents {
 		_, err := tm.db.Exec(`
 			INSERT INTO __marmot__mvcc_versions
@@ -380,18 +413,10 @@ func (tm *MVCCTransactionManager) finalizeCommit(txn *MVCCTransaction) {
 			txn.NodeID, txn.ID, intent.Operation, intent.DataSnapshot, time.Now().UnixNano())
 
 		if err != nil {
-			// Log error but continue - this is async cleanup
+			// Log error but continue - this is async and non-critical
 			log.Error().Err(err).Uint64("txn_id", txn.ID).Msg("Failed to create MVCC version")
 		}
-
-		// Remove the write intent
-		tm.cleanupIntent(intent)
 	}
-
-	// Remove from active transactions
-	tm.mu.Lock()
-	delete(tm.activeTxns, txn.ID)
-	tm.mu.Unlock()
 }
 
 // AbortTransaction aborts the transaction and cleans up write intents
@@ -403,15 +428,10 @@ func (tm *MVCCTransactionManager) AbortTransaction(txn *MVCCTransaction) error {
 		return fmt.Errorf("transaction %d is not pending", txn.ID)
 	}
 
-	// Mark as aborted
-	_, err := tm.db.Exec(`
-		UPDATE __marmot__txn_records
-		SET status = ?
-		WHERE txn_id = ?
-	`, TxnStatusAborted, txn.ID)
-
+	// Delete the transaction record (clean up completely on abort)
+	_, err := tm.db.Exec(`DELETE FROM __marmot__txn_records WHERE txn_id = ?`, txn.ID)
 	if err != nil {
-		return fmt.Errorf("failed to mark transaction as aborted: %w", err)
+		return fmt.Errorf("failed to delete transaction record: %w", err)
 	}
 
 	txn.Status = TxnStatusAborted
@@ -570,14 +590,12 @@ func (tm *MVCCTransactionManager) cleanupStaleTransactions() (int, error) {
 		staleTxnIDs = append(staleTxnIDs, txnID)
 	}
 
-	// Abort each stale transaction
+	// Abort each stale transaction (delete record, consistent with AbortTransaction)
 	for _, txnID := range staleTxnIDs {
-		// Mark as aborted
+		// Delete transaction record (same as AbortTransaction)
 		_, err := tm.db.Exec(`
-			UPDATE __marmot__txn_records
-			SET status = ?
-			WHERE txn_id = ?
-		`, TxnStatusAborted, txnID)
+			DELETE FROM __marmot__txn_records WHERE txn_id = ?
+		`, txnID)
 
 		if err != nil {
 			continue
@@ -714,12 +732,12 @@ func (tm *MVCCTransactionManager) cleanupOldMVCCVersions(keepVersions int) (int,
 
 // SerializeData helper for data snapshots
 func SerializeData(data interface{}) ([]byte, error) {
-	return json.Marshal(data)
+	return msgpack.Marshal(data)
 }
 
 // DeserializeData helper for data snapshots
 func DeserializeData(data []byte, v interface{}) error {
-	return json.Unmarshal(data, v)
+	return msgpack.Unmarshal(data, v)
 }
 
 // =======================
@@ -869,7 +887,7 @@ func (tm *MVCCTransactionManager) writeCDCInsert(tableName string, newValues map
 
 		// Deserialize value from JSON
 		var value interface{}
-		if err := json.Unmarshal(newValues[col], &value); err != nil {
+		if err := msgpack.Unmarshal(newValues[col], &value); err != nil {
 			return fmt.Errorf("failed to deserialize value for column %s: %w", col, err)
 		}
 		values = append(values, value)
@@ -917,7 +935,7 @@ func (tm *MVCCTransactionManager) writeCDCUpdate(tableName string, rowKey string
 
 		// Deserialize value from JSON
 		var value interface{}
-		if err := json.Unmarshal(valBytes, &value); err != nil {
+		if err := msgpack.Unmarshal(valBytes, &value); err != nil {
 			return fmt.Errorf("failed to deserialize value for column %s: %w", col, err)
 		}
 		values = append(values, value)
@@ -938,7 +956,7 @@ func (tm *MVCCTransactionManager) writeCDCUpdate(tableName string, rowKey string
 
 		// Deserialize PK value
 		var value interface{}
-		if err := json.Unmarshal(pkValue, &value); err != nil {
+		if err := msgpack.Unmarshal(pkValue, &value); err != nil {
 			return fmt.Errorf("failed to deserialize PK value for column %s: %w", pkCol, err)
 		}
 		values = append(values, value)
@@ -985,7 +1003,7 @@ func (tm *MVCCTransactionManager) writeCDCDelete(tableName string, rowKey string
 
 			// Deserialize PK value
 			var value interface{}
-			if err := json.Unmarshal(pkValue, &value); err != nil {
+			if err := msgpack.Unmarshal(pkValue, &value); err != nil {
 				return fmt.Errorf("failed to deserialize PK value for column %s: %w", pkCol, err)
 			}
 			values = append(values, value)
