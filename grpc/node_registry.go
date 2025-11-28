@@ -1,6 +1,7 @@
 package grpc
 
 import (
+	"fmt"
 	"sync"
 	"time"
 
@@ -116,7 +117,19 @@ func (nr *NodeRegistry) Update(node *NodeState) {
 
 	// Rule 4: Apply SWIM state update rules
 	if node.Incarnation > existing.Incarnation {
-		// Higher incarnation always wins
+		// Higher incarnation always wins, EXCEPT:
+		// - REMOVED status is sticky (can only be cleared via admin API AllowRejoin)
+		// - If existing is REMOVED, only accept another REMOVED or DEAD (from AllowRejoin)
+		if existing.Status == NodeStatus_REMOVED && node.Status != NodeStatus_REMOVED && node.Status != NodeStatus_DEAD {
+			log.Debug().
+				Uint64("local_node", nr.localNodeID).
+				Uint64("update_node", node.NodeId).
+				Str("incoming_status", node.Status.String()).
+				Msg("REGISTRY: Ignoring update for REMOVED node (sticky state)")
+			nr.mu.Unlock()
+			return
+		}
+
 		oldStatus := existing.Status
 		log.Debug().
 			Uint64("local_node", nr.localNodeID).
@@ -191,11 +204,15 @@ func (nr *NodeRegistry) handleSelfUpdateLocked(node *NodeState) {
 
 // shouldEscalate returns true if oldStatus -> newStatus is a valid escalation
 func (nr *NodeRegistry) shouldEscalate(oldStatus, newStatus NodeStatus) bool {
-	// ALIVE -> SUSPECT -> DEAD is the only valid escalation path
+	// ALIVE -> SUSPECT -> DEAD is the normal escalation path
 	if oldStatus == NodeStatus_ALIVE && (newStatus == NodeStatus_SUSPECT || newStatus == NodeStatus_DEAD) {
 		return true
 	}
 	if oldStatus == NodeStatus_SUSPECT && newStatus == NodeStatus_DEAD {
+		return true
+	}
+	// Any state can escalate to REMOVED (admin action)
+	if newStatus == NodeStatus_REMOVED && oldStatus != NodeStatus_REMOVED {
 		return true
 	}
 	return false
@@ -342,12 +359,19 @@ func (nr *NodeRegistry) CheckTimeouts(suspectTimeout, deadTimeout time.Duration)
 	}
 }
 
-// Count returns the number of nodes
+// Count returns the number of nodes in membership (excludes REMOVED nodes)
+// Used for quorum calculation to prevent split-brain
 func (nr *NodeRegistry) Count() int {
 	nr.mu.RLock()
 	defer nr.mu.RUnlock()
 
-	return len(nr.nodes)
+	count := 0
+	for _, node := range nr.nodes {
+		if node.Status != NodeStatus_REMOVED {
+			count++
+		}
+	}
+	return count
 }
 
 // CountAlive returns the number of alive nodes
@@ -490,4 +514,125 @@ func (nr *NodeRegistry) DetectSchemaDrift() {
 			}
 		}
 	}
+}
+
+// =======================
+// MEMBERSHIP MANAGEMENT
+// =======================
+
+// MarkRemoved marks a node as REMOVED from the cluster
+// This is called by admin API to permanently remove a node
+// The REMOVED state will be gossiped to all other nodes
+func (nr *NodeRegistry) MarkRemoved(nodeID uint64) error {
+	nr.mu.Lock()
+	defer nr.mu.Unlock()
+
+	// Cannot remove self
+	if nodeID == nr.localNodeID {
+		return fmt.Errorf("cannot remove self from cluster")
+	}
+
+	node, exists := nr.nodes[nodeID]
+	if !exists {
+		return fmt.Errorf("node %d not found in registry", nodeID)
+	}
+
+	// Already removed
+	if node.Status == NodeStatus_REMOVED {
+		return nil
+	}
+
+	oldStatus := node.Status
+	node.Status = NodeStatus_REMOVED
+	node.Incarnation++ // Increment to propagate via gossip
+
+	log.Info().
+		Uint64("node_id", nodeID).
+		Str("old_status", oldStatus.String()).
+		Msg("Node marked as REMOVED from cluster")
+
+	return nil
+}
+
+// AllowRejoin clears the REMOVED status for a node, allowing it to rejoin
+// The node must re-join via normal gossip after this
+func (nr *NodeRegistry) AllowRejoin(nodeID uint64) error {
+	nr.mu.Lock()
+	defer nr.mu.Unlock()
+
+	node, exists := nr.nodes[nodeID]
+	if !exists {
+		return fmt.Errorf("node %d not found in registry", nodeID)
+	}
+
+	if node.Status != NodeStatus_REMOVED {
+		return fmt.Errorf("node %d is not in REMOVED state (current: %s)", nodeID, node.Status.String())
+	}
+
+	// Set to DEAD so the node can rejoin via normal Join flow
+	// When the node rejoins, it will transition through JOINING -> ALIVE
+	node.Status = NodeStatus_DEAD
+	node.Incarnation++ // Increment to propagate via gossip
+
+	log.Info().
+		Uint64("node_id", nodeID).
+		Msg("Node allowed to rejoin cluster")
+
+	return nil
+}
+
+// IsRemoved checks if a node is in REMOVED state
+func (nr *NodeRegistry) IsRemoved(nodeID uint64) bool {
+	nr.mu.RLock()
+	defer nr.mu.RUnlock()
+
+	node, exists := nr.nodes[nodeID]
+	if !exists {
+		return false
+	}
+	return node.Status == NodeStatus_REMOVED
+}
+
+// MemberInfo represents membership information for admin API
+type MemberInfo struct {
+	NodeID      uint64
+	Address     string
+	Status      string
+	Incarnation uint64
+}
+
+// GetMembershipInfo returns membership information for all nodes
+func (nr *NodeRegistry) GetMembershipInfo() []MemberInfo {
+	nr.mu.RLock()
+	defer nr.mu.RUnlock()
+
+	members := make([]MemberInfo, 0, len(nr.nodes))
+	for _, node := range nr.nodes {
+		members = append(members, MemberInfo{
+			NodeID:      node.NodeId,
+			Address:     node.Address,
+			Status:      node.Status.String(),
+			Incarnation: node.Incarnation,
+		})
+	}
+	return members
+}
+
+// QuorumInfo returns quorum calculation information
+func (nr *NodeRegistry) QuorumInfo() (totalMembership int, aliveCount int, quorumSize int) {
+	nr.mu.RLock()
+	defer nr.mu.RUnlock()
+
+	for _, node := range nr.nodes {
+		if node.Status != NodeStatus_REMOVED {
+			totalMembership++
+			if node.Status == NodeStatus_ALIVE {
+				aliveCount++
+			}
+		}
+	}
+
+	// Quorum = majority of total membership
+	quorumSize = (totalMembership / 2) + 1
+	return
 }

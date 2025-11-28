@@ -519,3 +519,272 @@ func TestIncarnationOrdering(t *testing.T) {
 		t.Errorf("Status should be SUSPECT, got %v", node.Status)
 	}
 }
+
+// =======================
+// MEMBERSHIP MANAGEMENT TESTS
+// =======================
+
+func TestNodeRegistry_MarkRemoved(t *testing.T) {
+	nr := NewNodeRegistry(1, "localhost:8081")
+
+	// Add a node
+	nr.Add(&NodeState{
+		NodeId:      2,
+		Address:     "localhost:8082",
+		Status:      NodeStatus_ALIVE,
+		Incarnation: 0,
+	})
+
+	// Mark node as removed
+	err := nr.MarkRemoved(2)
+	if err != nil {
+		t.Fatalf("MarkRemoved failed: %v", err)
+	}
+
+	// Verify status
+	node, exists := nr.Get(2)
+	if !exists {
+		t.Fatal("Node should still exist")
+	}
+	if node.Status != NodeStatus_REMOVED {
+		t.Errorf("Expected REMOVED status, got %v", node.Status)
+	}
+
+	// Incarnation should have incremented for gossip propagation
+	if node.Incarnation != 1 {
+		t.Errorf("Expected incarnation 1, got %d", node.Incarnation)
+	}
+}
+
+func TestNodeRegistry_MarkRemoved_CannotRemoveSelf(t *testing.T) {
+	nr := NewNodeRegistry(1, "localhost:8081")
+
+	err := nr.MarkRemoved(1)
+	if err == nil {
+		t.Fatal("Should not be able to remove self")
+	}
+}
+
+func TestNodeRegistry_MarkRemoved_NodeNotFound(t *testing.T) {
+	nr := NewNodeRegistry(1, "localhost:8081")
+
+	err := nr.MarkRemoved(999)
+	if err == nil {
+		t.Fatal("Should fail for non-existent node")
+	}
+}
+
+func TestNodeRegistry_IsRemoved(t *testing.T) {
+	nr := NewNodeRegistry(1, "localhost:8081")
+
+	// Add and remove a node
+	nr.Add(&NodeState{
+		NodeId:      2,
+		Address:     "localhost:8082",
+		Status:      NodeStatus_ALIVE,
+		Incarnation: 0,
+	})
+
+	// Not removed yet
+	if nr.IsRemoved(2) {
+		t.Error("Node should not be removed yet")
+	}
+
+	// Mark as removed
+	nr.MarkRemoved(2)
+
+	// Now should be removed
+	if !nr.IsRemoved(2) {
+		t.Error("Node should be marked as removed")
+	}
+}
+
+func TestNodeRegistry_AllowRejoin(t *testing.T) {
+	nr := NewNodeRegistry(1, "localhost:8081")
+
+	// Add and remove a node
+	nr.Add(&NodeState{
+		NodeId:      2,
+		Address:     "localhost:8082",
+		Status:      NodeStatus_ALIVE,
+		Incarnation: 0,
+	})
+	nr.MarkRemoved(2)
+
+	// Allow rejoin
+	err := nr.AllowRejoin(2)
+	if err != nil {
+		t.Fatalf("AllowRejoin failed: %v", err)
+	}
+
+	// Status should be DEAD (ready for rejoin)
+	node, _ := nr.Get(2)
+	if node.Status != NodeStatus_DEAD {
+		t.Errorf("Expected DEAD status after AllowRejoin, got %v", node.Status)
+	}
+
+	// Node should no longer be considered removed
+	if nr.IsRemoved(2) {
+		t.Error("Node should not be marked as removed after AllowRejoin")
+	}
+}
+
+func TestNodeRegistry_AllowRejoin_NotRemoved(t *testing.T) {
+	nr := NewNodeRegistry(1, "localhost:8081")
+
+	// Add a node but don't remove it
+	nr.Add(&NodeState{
+		NodeId:      2,
+		Address:     "localhost:8082",
+		Status:      NodeStatus_ALIVE,
+		Incarnation: 0,
+	})
+
+	// AllowRejoin should fail since node is not REMOVED
+	err := nr.AllowRejoin(2)
+	if err == nil {
+		t.Fatal("AllowRejoin should fail for non-REMOVED node")
+	}
+}
+
+func TestNodeRegistry_RemovedExcludedFromCount(t *testing.T) {
+	nr := NewNodeRegistry(1, "localhost:8081")
+
+	// Add nodes
+	nr.Add(&NodeState{NodeId: 2, Address: "localhost:8082", Status: NodeStatus_ALIVE})
+	nr.Add(&NodeState{NodeId: 3, Address: "localhost:8083", Status: NodeStatus_ALIVE})
+
+	// Count should be 3
+	if nr.Count() != 3 {
+		t.Errorf("Expected count 3, got %d", nr.Count())
+	}
+
+	// Remove one
+	nr.MarkRemoved(2)
+
+	// Count should now be 2 (REMOVED excluded)
+	if nr.Count() != 2 {
+		t.Errorf("Expected count 2 after removal, got %d", nr.Count())
+	}
+}
+
+func TestNodeRegistry_RemovedIsSticky(t *testing.T) {
+	nr := NewNodeRegistry(1, "localhost:8081")
+
+	// Add a node
+	nr.Add(&NodeState{
+		NodeId:      2,
+		Address:     "localhost:8082",
+		Status:      NodeStatus_ALIVE,
+		Incarnation: 0,
+	})
+
+	// Mark as removed (incarnation becomes 1)
+	nr.MarkRemoved(2)
+
+	// Try to update to ALIVE with higher incarnation via gossip
+	// This should be ignored because REMOVED is sticky
+	nr.Update(&NodeState{
+		NodeId:      2,
+		Address:     "localhost:8082",
+		Status:      NodeStatus_ALIVE,
+		Incarnation: 10, // Higher incarnation
+	})
+
+	// Node should still be REMOVED
+	node, _ := nr.Get(2)
+	if node.Status != NodeStatus_REMOVED {
+		t.Errorf("REMOVED should be sticky, got %v", node.Status)
+	}
+}
+
+func TestNodeRegistry_RemovedPropagatesViaGossip(t *testing.T) {
+	nr := NewNodeRegistry(1, "localhost:8081")
+
+	// Add a node as ALIVE
+	nr.Add(&NodeState{
+		NodeId:      2,
+		Address:     "localhost:8082",
+		Status:      NodeStatus_ALIVE,
+		Incarnation: 5,
+	})
+
+	// Receive REMOVED status via gossip with higher incarnation
+	nr.Update(&NodeState{
+		NodeId:      2,
+		Address:     "localhost:8082",
+		Status:      NodeStatus_REMOVED,
+		Incarnation: 10,
+	})
+
+	// Node should now be REMOVED
+	node, _ := nr.Get(2)
+	if node.Status != NodeStatus_REMOVED {
+		t.Errorf("REMOVED should propagate via gossip, got %v", node.Status)
+	}
+}
+
+func TestNodeRegistry_QuorumInfo(t *testing.T) {
+	nr := NewNodeRegistry(1, "localhost:8081")
+
+	// Add nodes
+	nr.Add(&NodeState{NodeId: 2, Address: "localhost:8082", Status: NodeStatus_ALIVE})
+	nr.Add(&NodeState{NodeId: 3, Address: "localhost:8083", Status: NodeStatus_ALIVE})
+	nr.Add(&NodeState{NodeId: 4, Address: "localhost:8084", Status: NodeStatus_SUSPECT})
+	nr.Add(&NodeState{NodeId: 5, Address: "localhost:8085", Status: NodeStatus_DEAD})
+
+	// Total membership = 5 (excludes REMOVED)
+	// Alive = 3 (nodes 1, 2, 3)
+	// Quorum = 3 (5/2 + 1)
+	total, alive, quorum := nr.QuorumInfo()
+
+	if total != 5 {
+		t.Errorf("Expected total 5, got %d", total)
+	}
+	if alive != 3 {
+		t.Errorf("Expected alive 3, got %d", alive)
+	}
+	if quorum != 3 {
+		t.Errorf("Expected quorum 3, got %d", quorum)
+	}
+
+	// Remove a node
+	nr.MarkRemoved(5)
+
+	// Total membership should decrease
+	total, _, quorum = nr.QuorumInfo()
+	if total != 4 {
+		t.Errorf("Expected total 4 after removal, got %d", total)
+	}
+	if quorum != 3 {
+		t.Errorf("Expected quorum 3 after removal, got %d", quorum)
+	}
+}
+
+func TestNodeRegistry_GetMembershipInfo(t *testing.T) {
+	nr := NewNodeRegistry(1, "localhost:8081")
+
+	nr.Add(&NodeState{NodeId: 2, Address: "localhost:8082", Status: NodeStatus_ALIVE})
+
+	info := nr.GetMembershipInfo()
+	if len(info) != 2 {
+		t.Fatalf("Expected 2 members, got %d", len(info))
+	}
+
+	// Verify info contains expected fields
+	found := false
+	for _, m := range info {
+		if m.NodeID == 2 {
+			found = true
+			if m.Status != "ALIVE" {
+				t.Errorf("Expected ALIVE status, got %s", m.Status)
+			}
+			if m.Address != "localhost:8082" {
+				t.Errorf("Expected localhost:8082, got %s", m.Address)
+			}
+		}
+	}
+	if !found {
+		t.Error("Node 2 not found in membership info")
+	}
+}

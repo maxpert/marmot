@@ -28,6 +28,7 @@ const (
 	NodeStatus_SUSPECT NodeStatus = 1
 	NodeStatus_DEAD    NodeStatus = 2
 	NodeStatus_JOINING NodeStatus = 3 // Node is catching up, receives gossip but not replication
+	NodeStatus_REMOVED NodeStatus = 4 // Node explicitly removed from cluster via admin API
 )
 
 // Enum value maps for NodeStatus.
@@ -37,12 +38,14 @@ var (
 		1: "SUSPECT",
 		2: "DEAD",
 		3: "JOINING",
+		4: "REMOVED",
 	}
 	NodeStatus_value = map[string]int32{
 		"ALIVE":   0,
 		"SUSPECT": 1,
 		"DEAD":    2,
 		"JOINING": 3,
+		"REMOVED": 4,
 	}
 )
 
@@ -2219,13 +2222,14 @@ const file_grpc_marmot_proto_rawDesc = "" +
 	"\x10database_txn_ids\x18\x01 \x03(\v23.marmot.v2.LatestTxnIDsResponse.DatabaseTxnIdsEntryR\x0edatabaseTxnIds\x1aA\n" +
 	"\x13DatabaseTxnIdsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\x04R\x05value:\x028\x01*;\n" +
+	"\x05value\x18\x02 \x01(\x04R\x05value:\x028\x01*H\n" +
 	"\n" +
 	"NodeStatus\x12\t\n" +
 	"\x05ALIVE\x10\x00\x12\v\n" +
 	"\aSUSPECT\x10\x01\x12\b\n" +
 	"\x04DEAD\x10\x02\x12\v\n" +
-	"\aJOINING\x10\x03*6\n" +
+	"\aJOINING\x10\x03\x12\v\n" +
+	"\aREMOVED\x10\x04*6\n" +
 	"\x10TransactionPhase\x12\v\n" +
 	"\aPREPARE\x10\x00\x12\n" +
 	"\n" +

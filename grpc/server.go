@@ -3,15 +3,19 @@ package grpc
 import (
 	"context"
 	"crypto/md5"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/pprof"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/maxpert/marmot/cfg"
 	"github.com/maxpert/marmot/db"
 	"github.com/rs/zerolog/log"
 	"github.com/soheilhy/cmux"
@@ -174,6 +178,12 @@ func (s *Server) Start() error {
 		log.Info().Msg("Metrics endpoint enabled at /metrics")
 	}
 
+	// Register admin endpoints for cluster membership management
+	httpMux.HandleFunc("/admin/cluster/members", s.handleClusterMembers)
+	httpMux.HandleFunc("/admin/cluster/remove/", s.handleClusterRemove)
+	httpMux.HandleFunc("/admin/cluster/allow/", s.handleClusterAllow)
+	log.Info().Msg("Admin endpoints enabled at /admin/cluster/*")
+
 	httpServer := &http.Server{
 		Handler: httpMux,
 	}
@@ -244,6 +254,16 @@ func (s *Server) Join(ctx context.Context, req *JoinRequest) (*JoinResponse, err
 		Str("joining_address", req.Address).
 		Str("timestamp", time.Now().Format("15:04:05.000")).
 		Msg("SEED: Received join request")
+
+	// Reject REMOVED nodes - they must be explicitly allowed to rejoin via admin API
+	if s.registry.IsRemoved(req.NodeId) {
+		log.Warn().
+			Uint64("node_id", req.NodeId).
+			Msg("Rejecting join from REMOVED node - use admin API to allow rejoin")
+		return &JoinResponse{
+			Success: false,
+		}, nil
+	}
 
 	// Add node to registry with JOINING status
 	// The node will transition to ALIVE after it completes catch-up
@@ -866,4 +886,147 @@ func (s *Server) GetLatestTxnIDs(ctx context.Context, req *LatestTxnIDsRequest) 
 	return &LatestTxnIDsResponse{
 		DatabaseTxnIds: txnIDs,
 	}, nil
+}
+
+// =======================
+// ADMIN HTTP HANDLERS
+// =======================
+
+// checkAdminAuth validates PSK authentication for admin endpoints
+// Returns true if authenticated, false otherwise (and writes error response)
+func (s *Server) checkAdminAuth(w http.ResponseWriter, r *http.Request) bool {
+	secret := cfg.GetClusterSecret()
+
+	// If no secret configured, admin endpoints are disabled
+	if secret == "" {
+		http.Error(w, "admin endpoints disabled: cluster_secret not configured", http.StatusForbidden)
+		return false
+	}
+
+	// Check X-Marmot-Secret header
+	providedSecret := r.Header.Get("X-Marmot-Secret")
+	if providedSecret == "" {
+		http.Error(w, "missing X-Marmot-Secret header", http.StatusUnauthorized)
+		return false
+	}
+
+	if providedSecret != secret {
+		http.Error(w, "invalid secret", http.StatusUnauthorized)
+		return false
+	}
+
+	return true
+}
+
+// handleClusterMembers handles GET /admin/cluster/members
+// Returns current cluster membership information
+func (s *Server) handleClusterMembers(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if !s.checkAdminAuth(w, r) {
+		return
+	}
+
+	members := s.registry.GetMembershipInfo()
+	totalMembership, aliveCount, quorumSize := s.registry.QuorumInfo()
+
+	response := map[string]interface{}{
+		"members":          members,
+		"total_membership": totalMembership,
+		"alive_count":      aliveCount,
+		"quorum_size":      quorumSize,
+		"local_node_id":    s.nodeID,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+// handleClusterRemove handles POST /admin/cluster/remove/{node_id}
+// Removes a node from cluster membership
+func (s *Server) handleClusterRemove(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if !s.checkAdminAuth(w, r) {
+		return
+	}
+
+	// Parse node_id from URL path
+	path := strings.TrimPrefix(r.URL.Path, "/admin/cluster/remove/")
+	nodeID, err := strconv.ParseUint(path, 10, 64)
+	if err != nil {
+		http.Error(w, "invalid node_id: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Mark node as removed
+	if err := s.registry.MarkRemoved(nodeID); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Trigger immediate gossip to propagate removal
+	if s.gossip != nil {
+		s.gossip.BroadcastImmediate()
+	}
+
+	// Return updated membership
+	totalMembership, aliveCount, quorumSize := s.registry.QuorumInfo()
+
+	response := map[string]interface{}{
+		"success":          true,
+		"message":          fmt.Sprintf("node %d marked as REMOVED", nodeID),
+		"total_membership": totalMembership,
+		"alive_count":      aliveCount,
+		"quorum_size":      quorumSize,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+// handleClusterAllow handles POST /admin/cluster/allow/{node_id}
+// Allows a removed node to rejoin the cluster
+func (s *Server) handleClusterAllow(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if !s.checkAdminAuth(w, r) {
+		return
+	}
+
+	// Parse node_id from URL path
+	path := strings.TrimPrefix(r.URL.Path, "/admin/cluster/allow/")
+	nodeID, err := strconv.ParseUint(path, 10, 64)
+	if err != nil {
+		http.Error(w, "invalid node_id: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Allow node to rejoin
+	if err := s.registry.AllowRejoin(nodeID); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Trigger immediate gossip to propagate change
+	if s.gossip != nil {
+		s.gossip.BroadcastImmediate()
+	}
+
+	response := map[string]interface{}{
+		"success": true,
+		"message": fmt.Sprintf("node %d allowed to rejoin cluster", nodeID),
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
 }

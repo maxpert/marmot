@@ -71,6 +71,7 @@ enum NodeStatus {
   SUSPECT = 1;
   DEAD = 2;
   JOINING = 3;  // Node is catching up, receives gossip but not replication
+  REMOVED = 4;  // Node explicitly removed from cluster via admin API
 }
 
 message JoinRequest {
