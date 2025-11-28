@@ -46,6 +46,138 @@ verbose = false          # Enable verbose logging
 format = "console"       # Log format: console or json
 ```
 
+## Cluster Membership Management
+
+Marmot provides an admin API for managing cluster membership. This allows operators to view cluster state, remove nodes, and control which nodes can rejoin the cluster.
+
+### Node Lifecycle
+
+**Auto-Join (Default Behavior):**
+- New nodes automatically join the cluster by contacting seed nodes
+- Restarted nodes automatically rejoin via gossip protocol
+- No manual intervention required for normal operations
+
+**Explicit Removal:**
+- Nodes marked as REMOVED via admin API are permanently excluded
+- REMOVED nodes **cannot** auto-rejoin - they are rejected at the gossip layer
+- Must use `/admin/cluster/allow/{node_id}` to permit rejoining
+- This prevents decommissioned or compromised nodes from rejoining
+
+**Prerequisites:**
+- The `cluster_secret` must be configured (see Security section above)
+- Admin endpoints are served on the same port as gRPC (default: 8080)
+
+### View Cluster Members
+
+```bash
+curl -H "X-Marmot-Secret: your-secret" http://localhost:8080/admin/cluster/members
+```
+
+**Response:**
+```json
+{
+  "members": [
+    {"NodeID": 1, "Address": "node1:8080", "Status": "ALIVE", "Incarnation": 5},
+    {"NodeID": 2, "Address": "node2:8080", "Status": "ALIVE", "Incarnation": 3},
+    {"NodeID": 3, "Address": "node3:8080", "Status": "SUSPECT", "Incarnation": 2}
+  ],
+  "total_membership": 3,
+  "alive_count": 2,
+  "quorum_size": 2,
+  "local_node_id": 1
+}
+```
+
+**Node Status Values:**
+| Status | Description |
+|--------|-------------|
+| `ALIVE` | Node is healthy and participating in replication |
+| `SUSPECT` | Node missed recent gossip - may be failing |
+| `DEAD` | Node failed health checks - excluded from replication |
+| `JOINING` | Node is syncing data before becoming ALIVE |
+| `REMOVED` | Node explicitly removed via admin API |
+
+### Remove a Node
+
+Permanently remove a node from the cluster. The node will be excluded from quorum calculations and cannot rejoin until explicitly allowed.
+
+```bash
+curl -X POST -H "X-Marmot-Secret: your-secret" \
+  http://localhost:8080/admin/cluster/remove/2
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "message": "node 2 marked as REMOVED",
+  "total_membership": 2,
+  "alive_count": 2,
+  "quorum_size": 2
+}
+```
+
+**Behavior:**
+- REMOVED state propagates to all nodes via gossip protocol
+- REMOVED nodes are excluded from quorum calculation (affects split-brain prevention)
+- REMOVED nodes cannot rejoin via normal gossip - they will be rejected
+- You cannot remove the local node (prevents self-removal)
+
+### Allow Node to Rejoin
+
+Allow a previously removed node to rejoin the cluster.
+
+```bash
+curl -X POST -H "X-Marmot-Secret: your-secret" \
+  http://localhost:8080/admin/cluster/allow/2
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "message": "node 2 allowed to rejoin cluster"
+}
+```
+
+After this, the node can restart and will go through the normal join process (JOINING → ALIVE).
+
+### Use Cases
+
+**Decommissioning a Node:**
+```bash
+# 1. Remove node from cluster
+curl -X POST -H "X-Marmot-Secret: $SECRET" http://node1:8080/admin/cluster/remove/3
+
+# 2. Stop the node
+ssh node3 'systemctl stop marmot'
+
+# 3. Verify quorum is still achievable
+curl -H "X-Marmot-Secret: $SECRET" http://node1:8080/admin/cluster/members
+```
+
+**Replacing a Failed Node:**
+```bash
+# 1. Remove the failed node
+curl -X POST -H "X-Marmot-Secret: $SECRET" http://node1:8080/admin/cluster/remove/3
+
+# 2. Start replacement node with same or new node_id
+# If reusing node_id, first allow rejoin:
+curl -X POST -H "X-Marmot-Secret: $SECRET" http://node1:8080/admin/cluster/allow/3
+
+# 3. Start the replacement node
+./marmot -config node3-config.toml
+```
+
+**Shrinking Cluster Size:**
+```bash
+# Remove nodes to reduce cluster size
+# Quorum recalculates automatically: (total_membership / 2) + 1
+curl -X POST -H "X-Marmot-Secret: $SECRET" http://node1:8080/admin/cluster/remove/4
+curl -X POST -H "X-Marmot-Secret: $SECRET" http://node1:8080/admin/cluster/remove/5
+# 5-node cluster → 3-node cluster, quorum: 3 → 2
+```
+
 ## Prometheus Metrics
 
 ```toml

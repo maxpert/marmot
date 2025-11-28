@@ -416,6 +416,28 @@ openssl rand -base64 32
 - All gRPC endpoints (gossip, replication, snapshots) are protected when authentication is enabled
 - Nodes with mismatched secrets will fail to communicate (connection rejected with "invalid cluster secret")
 
+### Cluster Membership Management
+
+Marmot provides admin HTTP endpoints for managing cluster membership (requires `cluster_secret` to be configured):
+
+**Node Lifecycle:**
+- New/restarted nodes **auto-join** via gossip - no manual intervention needed
+- Nodes marked REMOVED via admin API **cannot auto-rejoin** - must be explicitly allowed
+- This prevents decommissioned nodes from accidentally rejoining the cluster
+
+```bash
+# View cluster members and quorum info
+curl -H "X-Marmot-Secret: your-secret" http://localhost:8080/admin/cluster/members
+
+# Remove a node from the cluster (excludes from quorum, blocks auto-rejoin)
+curl -X POST -H "X-Marmot-Secret: your-secret" http://localhost:8080/admin/cluster/remove/2
+
+# Allow a removed node to rejoin (node must then restart to join)
+curl -X POST -H "X-Marmot-Secret: your-secret" http://localhost:8080/admin/cluster/allow/2
+```
+
+See the [Operations documentation](https://maxpert.github.io/marmot/operations) for detailed usage and examples.
+
 ### Replication
 
 ```toml
