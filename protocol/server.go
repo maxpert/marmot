@@ -15,6 +15,25 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
+// bufferPool provides reusable bytes.Buffer instances to reduce allocations
+var bufferPool = sync.Pool{
+	New: func() interface{} {
+		return bytes.NewBuffer(make([]byte, 0, 4096))
+	},
+}
+
+func getBuffer() *bytes.Buffer {
+	buf := bufferPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	return buf
+}
+
+func putBuffer(buf *bytes.Buffer) {
+	if buf.Cap() <= 65536 { // Don't pool oversized buffers
+		bufferPool.Put(buf)
+	}
+}
+
 // MySQLServer implements a basic MySQL protocol server
 type MySQLServer struct {
 	address    string
@@ -299,7 +318,8 @@ func (s *MySQLServer) writeHandshake(w io.Writer) error {
 	// Basic handshake packet
 	// https://dev.mysql.com/doc/internals/en/connection-phase-packets.html#packet-Protocol::Handshake
 
-	buf := new(bytes.Buffer)
+	buf := getBuffer()
+	defer putBuffer(buf)
 
 	// Protocol version (10)
 	buf.WriteByte(10)
@@ -347,7 +367,8 @@ func (s *MySQLServer) writeHandshake(w io.Writer) error {
 }
 
 func (s *MySQLServer) writeOK(w io.Writer, seq byte, rowsAffected int64) error {
-	buf := new(bytes.Buffer)
+	buf := getBuffer()
+	defer putBuffer(buf)
 	buf.WriteByte(0x00) // OK packet header
 	// Affected rows (length-encoded integer)
 	buf.Write(packLengthEncodedInt(uint64(rowsAffected)))
@@ -365,7 +386,8 @@ func (s *MySQLServer) writeError(w io.Writer, seq byte, code uint16, msg string)
 }
 
 func (s *MySQLServer) writeErrorWithState(w io.Writer, seq byte, code uint16, sqlState, msg string) error {
-	buf := new(bytes.Buffer)
+	buf := getBuffer()
+	defer putBuffer(buf)
 	buf.WriteByte(0xFF) // Error packet header
 	binary.Write(buf, binary.LittleEndian, code)
 	buf.WriteByte('#')
@@ -392,25 +414,27 @@ func (s *MySQLServer) writeResultSet(w io.Writer, seq byte, rs *ResultSet) error
 	seq++
 
 	// 2. Column Definitions
+	colBuf := getBuffer()
+	defer putBuffer(colBuf)
 	for _, col := range rs.Columns {
-		buf := new(bytes.Buffer)
+		colBuf.Reset()
 
-		writeLenEncString(buf, "def")    // Catalog
-		writeLenEncString(buf, "")       // Schema
-		writeLenEncString(buf, "tbl")    // Table
-		writeLenEncString(buf, "tbl")    // Org Table
-		writeLenEncString(buf, col.Name) // Name
-		writeLenEncString(buf, col.Name) // Org Name
+		writeLenEncString(colBuf, "def")    // Catalog
+		writeLenEncString(colBuf, "")       // Schema
+		writeLenEncString(colBuf, "tbl")    // Table
+		writeLenEncString(colBuf, "tbl")    // Org Table
+		writeLenEncString(colBuf, col.Name) // Name
+		writeLenEncString(colBuf, col.Name) // Org Name
 
-		buf.WriteByte(0x0c)                                  // Length of fixed fields
-		binary.Write(buf, binary.LittleEndian, uint16(33))   // Charset
-		binary.Write(buf, binary.LittleEndian, uint32(1024)) // Length
-		buf.WriteByte(col.Type)                              // Type
-		binary.Write(buf, binary.LittleEndian, uint16(0))    // Flags
-		buf.WriteByte(0)                                     // Decimals
-		buf.Write([]byte{0, 0})                              // Filler
+		colBuf.WriteByte(0x0c)                                  // Length of fixed fields
+		binary.Write(colBuf, binary.LittleEndian, uint16(33))   // Charset
+		binary.Write(colBuf, binary.LittleEndian, uint32(1024)) // Length
+		colBuf.WriteByte(col.Type)                              // Type
+		binary.Write(colBuf, binary.LittleEndian, uint16(0))    // Flags
+		colBuf.WriteByte(0)                                     // Decimals
+		colBuf.Write([]byte{0, 0})                              // Filler
 
-		if err := s.writePacket(w, seq, buf.Bytes()); err != nil {
+		if err := s.writePacket(w, seq, colBuf.Bytes()); err != nil {
 			return err
 		}
 		seq++
@@ -423,17 +447,19 @@ func (s *MySQLServer) writeResultSet(w io.Writer, seq byte, rs *ResultSet) error
 	seq++
 
 	// 4. Rows
+	rowBuf := getBuffer()
+	defer putBuffer(rowBuf)
 	for _, row := range rs.Rows {
-		buf := new(bytes.Buffer)
+		rowBuf.Reset()
 		for _, val := range row {
 			if val == nil {
-				buf.WriteByte(0xFB) // NULL
+				rowBuf.WriteByte(0xFB) // NULL
 			} else {
 				strVal := fmt.Sprintf("%v", val)
-				writeLenEncString(buf, strVal)
+				writeLenEncString(rowBuf, strVal)
 			}
 		}
-		if err := s.writePacket(w, seq, buf.Bytes()); err != nil {
+		if err := s.writePacket(w, seq, rowBuf.Bytes()); err != nil {
 			return err
 		}
 		seq++
@@ -453,25 +479,27 @@ func (s *MySQLServer) writeBinaryResultSet(w io.Writer, seq byte, rs *ResultSet)
 	seq++
 
 	// 2. Column Definitions (same as text protocol)
+	colBuf := getBuffer()
+	defer putBuffer(colBuf)
 	for _, col := range rs.Columns {
-		buf := new(bytes.Buffer)
+		colBuf.Reset()
 
-		writeLenEncString(buf, "def")    // Catalog
-		writeLenEncString(buf, "")       // Schema
-		writeLenEncString(buf, "tbl")    // Table
-		writeLenEncString(buf, "tbl")    // Org Table
-		writeLenEncString(buf, col.Name) // Name
-		writeLenEncString(buf, col.Name) // Org Name
+		writeLenEncString(colBuf, "def")    // Catalog
+		writeLenEncString(colBuf, "")       // Schema
+		writeLenEncString(colBuf, "tbl")    // Table
+		writeLenEncString(colBuf, "tbl")    // Org Table
+		writeLenEncString(colBuf, col.Name) // Name
+		writeLenEncString(colBuf, col.Name) // Org Name
 
-		buf.WriteByte(0x0c)                                  // Length of fixed fields
-		binary.Write(buf, binary.LittleEndian, uint16(33))   // Charset
-		binary.Write(buf, binary.LittleEndian, uint32(1024)) // Length
-		buf.WriteByte(col.Type)                              // Type
-		binary.Write(buf, binary.LittleEndian, uint16(0))    // Flags
-		buf.WriteByte(0)                                     // Decimals
-		buf.Write([]byte{0, 0})                              // Filler
+		colBuf.WriteByte(0x0c)                                  // Length of fixed fields
+		binary.Write(colBuf, binary.LittleEndian, uint16(33))   // Charset
+		binary.Write(colBuf, binary.LittleEndian, uint32(1024)) // Length
+		colBuf.WriteByte(col.Type)                              // Type
+		binary.Write(colBuf, binary.LittleEndian, uint16(0))    // Flags
+		colBuf.WriteByte(0)                                     // Decimals
+		colBuf.Write([]byte{0, 0})                              // Filler
 
-		if err := s.writePacket(w, seq, buf.Bytes()); err != nil {
+		if err := s.writePacket(w, seq, colBuf.Bytes()); err != nil {
 			return err
 		}
 		seq++
@@ -484,16 +512,23 @@ func (s *MySQLServer) writeBinaryResultSet(w io.Writer, seq byte, rs *ResultSet)
 	seq++
 
 	// 4. Binary Rows
+	rowBuf := getBuffer()
+	defer putBuffer(rowBuf)
+
+	// Pre-allocate NULL bitmap once, reuse for each row
+	nullBitmapLen := (len(rs.Columns) + 7 + 2) / 8
+	nullBitmap := make([]byte, nullBitmapLen)
+
 	for _, row := range rs.Rows {
-		buf := new(bytes.Buffer)
+		rowBuf.Reset()
 
 		// Binary row header (0x00)
-		buf.WriteByte(0x00)
+		rowBuf.WriteByte(0x00)
 
-		// NULL bitmap: (column_count + 7 + 2) / 8 bytes
-		// The +2 offset is because the first 2 bits are reserved
-		nullBitmapLen := (len(rs.Columns) + 7 + 2) / 8
-		nullBitmap := make([]byte, nullBitmapLen)
+		// Clear and reuse NULL bitmap
+		for i := range nullBitmap {
+			nullBitmap[i] = 0
+		}
 
 		// Set NULL bits for null values
 		for i, val := range row {
@@ -503,45 +538,18 @@ func (s *MySQLServer) writeBinaryResultSet(w io.Writer, seq byte, rs *ResultSet)
 				nullBitmap[bytePos] |= 1 << bitPos
 			}
 		}
-		buf.Write(nullBitmap)
+		rowBuf.Write(nullBitmap)
 
 		// Write values in binary format
+		var scratch [8]byte
 		for i, val := range row {
 			if val == nil {
 				continue // Already marked in NULL bitmap
 			}
-
-			// Convert value to binary format based on column type
-			switch rs.Columns[i].Type {
-			case 0x01: // TINY
-				buf.WriteByte(byte(fmt.Sprintf("%v", val)[0]))
-			case 0x02: // SHORT
-				v := int16(0)
-				fmt.Sscanf(fmt.Sprintf("%v", val), "%d", &v)
-				binary.Write(buf, binary.LittleEndian, v)
-			case 0x03, 0x09: // LONG, INT24
-				v := int32(0)
-				fmt.Sscanf(fmt.Sprintf("%v", val), "%d", &v)
-				binary.Write(buf, binary.LittleEndian, v)
-			case 0x08: // LONGLONG
-				v := int64(0)
-				fmt.Sscanf(fmt.Sprintf("%v", val), "%d", &v)
-				binary.Write(buf, binary.LittleEndian, v)
-			case 0x04: // FLOAT
-				v := float32(0)
-				fmt.Sscanf(fmt.Sprintf("%v", val), "%f", &v)
-				binary.Write(buf, binary.LittleEndian, v)
-			case 0x05: // DOUBLE
-				v := float64(0)
-				fmt.Sscanf(fmt.Sprintf("%v", val), "%f", &v)
-				binary.Write(buf, binary.LittleEndian, v)
-			default: // STRING, VARCHAR, TEXT, BLOB, etc.
-				strVal := fmt.Sprintf("%v", val)
-				writeLenEncString(buf, strVal)
-			}
+			writeBinaryValue(rowBuf, scratch[:], rs.Columns[i].Type, val)
 		}
 
-		if err := s.writePacket(w, seq, buf.Bytes()); err != nil {
+		if err := s.writePacket(w, seq, rowBuf.Bytes()); err != nil {
 			return err
 		}
 		seq++
@@ -563,10 +571,8 @@ func (s *MySQLServer) writePacket(w io.Writer, seq byte, payload []byte) error {
 	if _, err := w.Write(header); err != nil {
 		return err
 	}
-	if _, err := w.Write(payload); err != nil {
-		return err
-	}
-	return nil
+	_, err := w.Write(payload)
+	return err
 }
 
 func (s *MySQLServer) readPacket(r io.Reader) ([]byte, error) {
@@ -604,17 +610,117 @@ func packLengthEncodedInt(n uint64) []byte {
 	return buf
 }
 
+// writeBinaryValue writes a value in MySQL binary protocol format using direct type assertions
+func writeBinaryValue(buf *bytes.Buffer, scratch []byte, colType byte, val interface{}) {
+	switch colType {
+	case 0x01: // TINY
+		switch v := val.(type) {
+		case int8:
+			buf.WriteByte(byte(v))
+		case int64:
+			buf.WriteByte(byte(v))
+		case int:
+			buf.WriteByte(byte(v))
+		case float64:
+			buf.WriteByte(byte(v))
+		default:
+			buf.WriteByte(0)
+		}
+	case 0x02: // SHORT
+		var v int16
+		switch tv := val.(type) {
+		case int16:
+			v = tv
+		case int64:
+			v = int16(tv)
+		case int:
+			v = int16(tv)
+		case float64:
+			v = int16(tv)
+		}
+		binary.LittleEndian.PutUint16(scratch[:2], uint16(v))
+		buf.Write(scratch[:2])
+	case 0x03, 0x09: // LONG, INT24
+		var v int32
+		switch tv := val.(type) {
+		case int32:
+			v = tv
+		case int64:
+			v = int32(tv)
+		case int:
+			v = int32(tv)
+		case float64:
+			v = int32(tv)
+		}
+		binary.LittleEndian.PutUint32(scratch[:4], uint32(v))
+		buf.Write(scratch[:4])
+	case 0x08: // LONGLONG
+		var v int64
+		switch tv := val.(type) {
+		case int64:
+			v = tv
+		case int:
+			v = int64(tv)
+		case float64:
+			v = int64(tv)
+		}
+		binary.LittleEndian.PutUint64(scratch[:8], uint64(v))
+		buf.Write(scratch[:8])
+	case 0x04: // FLOAT
+		var v float32
+		switch tv := val.(type) {
+		case float32:
+			v = tv
+		case float64:
+			v = float32(tv)
+		case int64:
+			v = float32(tv)
+		case int:
+			v = float32(tv)
+		}
+		binary.LittleEndian.PutUint32(scratch[:4], math.Float32bits(v))
+		buf.Write(scratch[:4])
+	case 0x05: // DOUBLE
+		var v float64
+		switch tv := val.(type) {
+		case float64:
+			v = tv
+		case float32:
+			v = float64(tv)
+		case int64:
+			v = float64(tv)
+		case int:
+			v = float64(tv)
+		}
+		binary.LittleEndian.PutUint64(scratch[:8], math.Float64bits(v))
+		buf.Write(scratch[:8])
+	default: // STRING, VARCHAR, TEXT, BLOB, etc.
+		var s string
+		switch tv := val.(type) {
+		case string:
+			s = tv
+		case []byte:
+			s = string(tv)
+		default:
+			s = fmt.Sprintf("%v", tv)
+		}
+		writeLenEncString(buf, s)
+	}
+}
+
 func writeLenEncString(buf *bytes.Buffer, s string) {
 	l := uint64(len(s))
 	if l < 251 {
 		buf.WriteByte(byte(l))
 	} else if l < 65536 {
 		buf.WriteByte(0xFC)
-		binary.Write(buf, binary.LittleEndian, uint16(l))
+		buf.WriteByte(byte(l))
+		buf.WriteByte(byte(l >> 8))
 	} else {
-		// ... handle larger strings
 		buf.WriteByte(0xFD)
-		binary.Write(buf, binary.LittleEndian, uint32(l))
+		buf.WriteByte(byte(l))
+		buf.WriteByte(byte(l >> 8))
+		buf.WriteByte(byte(l >> 16))
 	}
 	buf.WriteString(s)
 }
@@ -671,7 +777,8 @@ func (s *MySQLServer) handleStmtPrepare(conn net.Conn, session *ConnectionSessio
 		Msg("Statement prepared")
 
 	// Send COM_STMT_PREPARE_OK response
-	buf := new(bytes.Buffer)
+	buf := getBuffer()
+	defer putBuffer(buf)
 
 	// Status (0x00 for OK)
 	buf.WriteByte(0x00)
@@ -697,8 +804,10 @@ func (s *MySQLServer) handleStmtPrepare(conn net.Conn, session *ConnectionSessio
 	// This is required by the MySQL protocol
 	seqNum := byte(2)
 	if paramCount > 0 {
+		paramDefBuf := getBuffer()
+		defer putBuffer(paramDefBuf)
 		for i := uint16(0); i < paramCount; i++ {
-			paramDefBuf := new(bytes.Buffer)
+			paramDefBuf.Reset()
 			writeLenEncString(paramDefBuf, "def")
 			writeLenEncString(paramDefBuf, "")
 			writeLenEncString(paramDefBuf, "")
@@ -718,11 +827,7 @@ func (s *MySQLServer) handleStmtPrepare(conn net.Conn, session *ConnectionSessio
 		}
 
 		// Send EOF packet after parameters
-		eofBuf := new(bytes.Buffer)
-		eofBuf.WriteByte(0xFE)
-		binary.Write(eofBuf, binary.LittleEndian, uint16(0))      // warnings
-		binary.Write(eofBuf, binary.LittleEndian, uint16(0x0002)) // SERVER_STATUS_AUTOCOMMIT
-		s.writePacket(conn, seqNum, eofBuf.Bytes())
+		s.writePacket(conn, seqNum, []byte{0xFE, 0, 0, 0x02, 0})
 	}
 }
 
