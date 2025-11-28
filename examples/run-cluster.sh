@@ -7,6 +7,28 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# pprof options
+PPROF_ENABLED=false
+PPROF_DURATION=30
+PPROF_OUTPUT_DIR="/tmp/marmot-pprof"
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --pprof) PPROF_ENABLED=true; shift ;;
+        --pprof-duration) PPROF_DURATION="$2"; shift 2 ;;
+        --pprof-output) PPROF_OUTPUT_DIR="$2"; shift 2 ;;
+        --help)
+            echo "Usage: $0 [options]"
+            echo "  --pprof              Enable CPU profiling"
+            echo "  --pprof-duration N   Profile duration in seconds (default: 30)"
+            echo "  --pprof-output DIR   Output directory (default: /tmp/marmot-pprof)"
+            exit 0
+            ;;
+        *) echo "Unknown option: $1"; exit 1 ;;
+    esac
+done
+
 echo "=== Marmot v2.0 Example Cluster ==="
 echo "Starting 3-node cluster with full database replication"
 echo ""
@@ -118,6 +140,36 @@ echo ""
 echo "Press Ctrl+C to stop the cluster"
 echo "================================"
 echo ""
+
+# Start pprof capture if enabled
+if [ "$PPROF_ENABLED" = true ]; then
+    mkdir -p "$PPROF_OUTPUT_DIR"
+    echo ""
+    echo "=== pprof Capture Enabled ==="
+    echo "Duration: ${PPROF_DURATION}s"
+    echo "Output: $PPROF_OUTPUT_DIR"
+    echo ""
+    echo "Capturing CPU profiles from all nodes..."
+
+    for port in 8081 8082 8083; do
+        node=$((port - 8080))
+        echo "  Starting profile capture for node $node (port $port)..."
+        curl -s "http://127.0.0.1:${port}/debug/pprof/profile?seconds=${PPROF_DURATION}" \
+            > "$PPROF_OUTPUT_DIR/cpu_node${node}.pprof" &
+    done
+
+    echo ""
+    echo "Profiles will be saved to:"
+    echo "  $PPROF_OUTPUT_DIR/cpu_node1.pprof"
+    echo "  $PPROF_OUTPUT_DIR/cpu_node2.pprof"
+    echo "  $PPROF_OUTPUT_DIR/cpu_node3.pprof"
+    echo ""
+    echo "Run your workload now! pprof is capturing for ${PPROF_DURATION}s..."
+    echo ""
+    echo "After capture completes, analyze with:"
+    echo "  go tool pprof -http=:9090 $PPROF_OUTPUT_DIR/cpu_node1.pprof"
+    echo ""
+fi
 
 # Wait for all jobs
 wait $job1 $job2 $job3

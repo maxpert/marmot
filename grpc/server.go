@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"sync"
 	"time"
@@ -147,51 +148,55 @@ func (s *Server) Start() error {
 		Uint64("node_id", s.nodeID).
 		Msg("Starting gRPC server")
 
-	// If we have a metrics handler, use cmux to multiplex HTTP and gRPC
+	// Always use cmux to multiplex HTTP (pprof + optional metrics) and gRPC on same port
+	log.Info().Msg("Multiplexing HTTP (pprof) and gRPC on same port")
+	s.mux = cmux.New(listener)
+
+	// Match HTTP requests (for /debug/pprof and optionally /metrics)
+	httpListener := s.mux.Match(cmux.HTTP1Fast())
+
+	// Match gRPC requests (everything else)
+	grpcListener := s.mux.Match(cmux.Any())
+
+	// Start HTTP server for pprof (and optionally metrics)
+	httpMux := http.NewServeMux()
+
+	// Register pprof handlers for profiling
+	httpMux.HandleFunc("/debug/pprof/", pprof.Index)
+	httpMux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	httpMux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	httpMux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	httpMux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+
+	// Optionally add metrics handler
 	if s.metricsHandler != nil {
-		log.Info().Msg("Multiplexing HTTP metrics (/metrics) and gRPC on same port")
-		s.mux = cmux.New(listener)
-
-		// Match HTTP requests (for /metrics)
-		httpListener := s.mux.Match(cmux.HTTP1Fast())
-
-		// Match gRPC requests (everything else)
-		grpcListener := s.mux.Match(cmux.Any())
-
-		// Start HTTP server for metrics
-		httpMux := http.NewServeMux()
 		httpMux.Handle("/metrics", s.metricsHandler)
-		httpServer := &http.Server{
-			Handler: httpMux,
-		}
-
-		go func() {
-			if err := httpServer.Serve(httpListener); err != nil {
-				log.Error().Err(err).Msg("HTTP metrics server failed")
-			}
-		}()
-
-		// Start gRPC server
-		go func() {
-			if err := s.server.Serve(grpcListener); err != nil {
-				log.Error().Err(err).Msg("gRPC server failed")
-			}
-		}()
-
-		// Start cmux
-		go func() {
-			if err := s.mux.Serve(); err != nil {
-				log.Error().Err(err).Msg("cmux failed")
-			}
-		}()
-	} else {
-		// No metrics, just serve gRPC normally
-		go func() {
-			if err := s.server.Serve(listener); err != nil {
-				log.Error().Err(err).Msg("gRPC server failed")
-			}
-		}()
+		log.Info().Msg("Metrics endpoint enabled at /metrics")
 	}
+
+	httpServer := &http.Server{
+		Handler: httpMux,
+	}
+
+	go func() {
+		if err := httpServer.Serve(httpListener); err != nil {
+			log.Error().Err(err).Msg("HTTP server failed")
+		}
+	}()
+
+	// Start gRPC server
+	go func() {
+		if err := s.server.Serve(grpcListener); err != nil {
+			log.Error().Err(err).Msg("gRPC server failed")
+		}
+	}()
+
+	// Start cmux
+	go func() {
+		if err := s.mux.Serve(); err != nil {
+			log.Error().Err(err).Msg("cmux failed")
+		}
+	}()
 
 	return nil
 }

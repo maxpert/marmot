@@ -24,6 +24,10 @@ MYSQL_PORT=${MYSQL_PORT:-3307}
 MYSQL_USER=${MYSQL_USER:-root}
 MYSQL_DB=${MYSQL_DB:-marmot}
 
+# pprof configuration
+PPROF_ENABLED=${PPROF_ENABLED:-false}
+PPROF_DURATION=${PPROF_DURATION:-30}  # seconds to capture
+
 # Thread counts to test (CockroachDB style)
 THREAD_COUNTS=${THREAD_COUNTS:-"1 4 8 16 32"}
 
@@ -160,6 +164,30 @@ prepare_data() {
     echo -e "${GREEN}✓ Data prepared${NC}"
 }
 
+capture_pprof() {
+    local workload=$1
+    local threads=$2
+    local duration=$3
+
+    if [ "$PPROF_ENABLED" != "true" ]; then
+        return
+    fi
+
+    echo -e "${YELLOW}  Capturing pprof profiles (${duration}s)...${NC}"
+
+    # Capture CPU profiles from all 3 nodes in parallel
+    for port in 8081 8082 8083; do
+        local node=$((port - 8080))
+        curl -s "http://127.0.0.1:${port}/debug/pprof/profile?seconds=${duration}" \
+            > "$RESULTS_DIR/cpu_${workload}_t${threads}_node${node}.pprof" 2>/dev/null &
+    done
+
+    # Wait for profile capture to complete
+    wait
+
+    echo -e "${GREEN}  ✓ pprof captured${NC}"
+}
+
 run_workload() {
     local workload=$1
     local threads=$2
@@ -167,6 +195,12 @@ run_workload() {
 
     echo ""
     echo -e "${CYAN}Running: $label (threads=$threads, time=${TIME}s)${NC}"
+
+    # Start pprof capture in background if enabled
+    if [ "$PPROF_ENABLED" = "true" ]; then
+        capture_pprof "$workload" "$threads" "$PPROF_DURATION" &
+        PPROF_PID=$!
+    fi
 
     sysbench $workload \
         --db-driver=mysql \
@@ -180,6 +214,11 @@ run_workload() {
         --time=$TIME \
         --report-interval=$REPORT_INTERVAL \
         run 2>&1 | tee "$RESULTS_DIR/${workload}_t${threads}.log"
+
+    # Wait for pprof to finish if it was started
+    if [ "$PPROF_ENABLED" = "true" ] && [ -n "$PPROF_PID" ]; then
+        wait $PPROF_PID 2>/dev/null || true
+    fi
 }
 
 extract_metrics() {
@@ -310,15 +349,18 @@ print_usage() {
     echo "  --threads 'N ...' Thread counts to test (default: '1 4 8 16 32')"
     echo "  --port N          MySQL port (default: 3307)"
     echo "  --skip-cluster    Don't start cluster (use existing)"
+    echo "  --pprof           Enable CPU profiling during benchmarks"
+    echo "  --pprof-duration N  Profile duration in seconds (default: 30)"
     echo "  --help            Show this help"
     echo ""
     echo "Environment variables:"
-    echo "  TABLES, TABLE_SIZE, TIME, THREAD_COUNTS, MYSQL_PORT"
+    echo "  TABLES, TABLE_SIZE, TIME, THREAD_COUNTS, MYSQL_PORT, PPROF_ENABLED"
     echo ""
     echo "Examples:"
     echo "  $0                           # Default settings"
     echo "  $0 --tables 8 --table-size 50000 --time 120"
     echo "  $0 --threads '1 2 4 8 16 32 64'"
+    echo "  $0 --pprof --threads '8'     # Profile with 8 threads"
     echo "  TABLES=16 TABLE_SIZE=100000 $0"
 }
 
@@ -332,6 +374,8 @@ while [[ $# -gt 0 ]]; do
         --threads) THREAD_COUNTS="$2"; shift 2 ;;
         --port) MYSQL_PORT="$2"; shift 2 ;;
         --skip-cluster) SKIP_CLUSTER=true; shift ;;
+        --pprof) PPROF_ENABLED=true; shift ;;
+        --pprof-duration) PPROF_DURATION="$2"; shift 2 ;;
         --help) print_usage; exit 0 ;;
         *) echo "Unknown option: $1"; print_usage; exit 1 ;;
     esac
