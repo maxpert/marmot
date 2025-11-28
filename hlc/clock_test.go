@@ -17,12 +17,11 @@ func TestClock_Now(t *testing.T) {
 		t.Error("Wall time should not be zero")
 	}
 
-	// Calling Now again immediately should increment logical
-	// Logical only resets when millisecond changes (not nanosecond)
-	// to ensure unique txn_ids via ToTxnID()
+	// Calling Now again should produce a strictly greater timestamp
+	// (either by wall time or by logical counter within same ms)
 	ts2 := clock.Now()
-	if ts2.Logical <= ts1.Logical {
-		t.Errorf("Logical should always increment within same millisecond, got %d -> %d", ts1.Logical, ts2.Logical)
+	if !After(ts2, ts1) {
+		t.Errorf("Second timestamp should be after first: ts1=%+v, ts2=%+v", ts1, ts2)
 	}
 }
 
@@ -317,6 +316,94 @@ func TestClock_UniqueTxnIDs(t *testing.T) {
 	}
 	if len(seen) != 10000 {
 		t.Errorf("Expected 10000 unique txn_ids, got %d", len(seen))
+	}
+}
+
+// TestCrossNodeTxnIDUniqueness verifies that different nodes produce different
+// txn IDs even when they have identical wall time and logical counter.
+// This is the CRITICAL test for the multi-node collision bug fix.
+func TestCrossNodeTxnIDUniqueness(t *testing.T) {
+	// Create timestamps with same wall time and logical but different NodeID
+	wallTime := int64(1732000000000000000) // Fixed timestamp
+	logical := int32(1)
+
+	// Test: Different nodes at exact same time must produce different IDs
+	ts1 := Timestamp{WallTime: wallTime, Logical: logical, NodeID: 1}
+	ts2 := Timestamp{WallTime: wallTime, Logical: logical, NodeID: 2}
+	ts3 := Timestamp{WallTime: wallTime, Logical: logical, NodeID: 3}
+
+	id1 := ts1.ToTxnID()
+	id2 := ts2.ToTxnID()
+	id3 := ts3.ToTxnID()
+
+	if id1 == id2 {
+		t.Errorf("COLLISION: Node 1 and Node 2 produced same txn_id=%d at same time!", id1)
+	}
+	if id2 == id3 {
+		t.Errorf("COLLISION: Node 2 and Node 3 produced same txn_id=%d at same time!", id2)
+	}
+	if id1 == id3 {
+		t.Errorf("COLLISION: Node 1 and Node 3 produced same txn_id=%d at same time!", id1)
+	}
+
+	t.Logf("Node 1 ID: %d", id1)
+	t.Logf("Node 2 ID: %d", id2)
+	t.Logf("Node 3 ID: %d", id3)
+}
+
+// TestTxnIDFormat verifies the bit layout of transaction IDs
+func TestTxnIDFormat(t *testing.T) {
+	// Create a known timestamp
+	wallTime := int64(1000000000000) // 1000 seconds in nanoseconds
+	logical := int32(5)
+	nodeID := uint64(3)
+
+	ts := Timestamp{WallTime: wallTime, Logical: logical, NodeID: nodeID}
+	txnID := ts.ToTxnID()
+
+	// Extract components
+	wallMS := uint64(wallTime / 1_000_000) // = 1000
+	expectedID := (wallMS << TotalShiftBits) | ((nodeID & NodeIDMask) << LogicalBits) | (uint64(logical) & LogicalMask)
+
+	if txnID != expectedID {
+		t.Errorf("TxnID format mismatch: got %d, expected %d", txnID, expectedID)
+		t.Logf("wallMS=%d, nodeID=%d, logical=%d", wallMS, nodeID, logical)
+		t.Logf("TotalShiftBits=%d, LogicalBits=%d", TotalShiftBits, LogicalBits)
+	}
+
+	// Verify node ID can be extracted
+	extractedNodeID := (txnID >> LogicalBits) & NodeIDMask
+	if extractedNodeID != nodeID {
+		t.Errorf("Failed to extract nodeID: got %d, expected %d", extractedNodeID, nodeID)
+	}
+
+	// Verify logical can be extracted
+	extractedLogical := txnID & LogicalMask
+	if extractedLogical != uint64(logical) {
+		t.Errorf("Failed to extract logical: got %d, expected %d", extractedLogical, logical)
+	}
+}
+
+// TestTxnIDTimeOrdering verifies that IDs from the same node preserve time ordering
+func TestTxnIDTimeOrdering(t *testing.T) {
+	nodeID := uint64(1)
+
+	// Earlier timestamp
+	ts1 := Timestamp{WallTime: 1000000000000, Logical: 5, NodeID: nodeID}
+	// Later timestamp (same ms, higher logical)
+	ts2 := Timestamp{WallTime: 1000000000000, Logical: 6, NodeID: nodeID}
+	// Even later (higher ms)
+	ts3 := Timestamp{WallTime: 2000000000000, Logical: 1, NodeID: nodeID}
+
+	id1 := ts1.ToTxnID()
+	id2 := ts2.ToTxnID()
+	id3 := ts3.ToTxnID()
+
+	if id1 >= id2 {
+		t.Errorf("Same-ms timestamps should be ordered by logical: id1=%d, id2=%d", id1, id2)
+	}
+	if id2 >= id3 {
+		t.Errorf("Higher-ms timestamp should have higher ID: id2=%d, id3=%d", id2, id3)
 	}
 }
 

@@ -46,7 +46,7 @@ func (c *Clock) Now() Timestamp {
 	}
 
 	// Reset logical when millisecond changes to prevent overflow into physical bits
-	// ToTxnID uses 18 bits for logical (~262k IDs/ms), so we must reset per-millisecond
+	// ToTxnID uses 16 bits for logical (~65k IDs/ms), so we must reset per-millisecond
 	if currentMS > c.lastMS {
 		c.lastMS = currentMS
 		c.logical = 0
@@ -171,17 +171,35 @@ func (t Timestamp) String() string {
 }
 
 // LogicalBits is the number of bits reserved for logical counter in txn IDs.
-// Following TiDB/Percolator pattern: 18 bits = ~262k IDs per millisecond.
-const LogicalBits = 18
+// 16 bits = ~65k IDs per millisecond per node.
+const LogicalBits = 16
 
-// LogicalMask masks the logical counter to 18 bits for ToTxnID
+// LogicalMask masks the logical counter to 16 bits for ToTxnID
 const LogicalMask = (1 << LogicalBits) - 1
 
+// NodeIDBits is the number of bits reserved for node ID in txn IDs.
+// 6 bits = 64 nodes maximum per cluster.
+const NodeIDBits = 6
+
+// NodeIDMask masks the node ID to 6 bits for ToTxnID
+const NodeIDMask = (1 << NodeIDBits) - 1
+
+// TotalShiftBits is the total bits to shift wall time (NodeIDBits + LogicalBits)
+const TotalShiftBits = NodeIDBits + LogicalBits // 22 bits
+
 // ToTxnID converts a timestamp to a unique transaction ID.
-// Uses Percolator/TiDB pattern: (physical_ms << 18) | logical
-// The logical counter is masked to 18 bits to prevent overflow into physical time bits.
+// Format: (physical_ms << 22) | (node_id << 16) | logical
+//
+// Bit allocation (64 bits total):
+//   - 42 bits for wall time in milliseconds (~139 years from epoch)
+//   - 6 bits for node ID (64 nodes max)
+//   - 16 bits for logical counter (~65k per ms per node)
+//
+// This ensures unique IDs across nodes even when transactions
+// occur at the exact same millisecond with the same logical counter.
 func (t Timestamp) ToTxnID() uint64 {
 	physicalMS := uint64(t.WallTime / 1_000_000)
-	// Mask logical to 18 bits as safety measure
-	return (physicalMS << LogicalBits) | (uint64(t.Logical) & LogicalMask)
+	nodeID := t.NodeID & NodeIDMask
+	logical := uint64(t.Logical) & LogicalMask
+	return (physicalMS << TotalShiftBits) | (nodeID << LogicalBits) | logical
 }
