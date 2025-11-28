@@ -4,8 +4,6 @@ import (
 	"encoding/base64"
 	"fmt"
 	"testing"
-
-	"github.com/maxpert/marmot/protocol/filter"
 )
 
 // TestRowKeyCompatibility verifies that GenerateRowKey produces the same format
@@ -18,6 +16,7 @@ func TestRowKeyCompatibility(t *testing.T) {
 		primaryKeys []string
 		values      map[string][]byte
 		expectedKey string
+		expectError bool
 	}{
 		{
 			name:        "single numeric PK",
@@ -75,21 +74,21 @@ func TestRowKeyCompatibility(t *testing.T) {
 			expectedKey: "composite_test:c:" + base64.RawStdEncoding.EncodeToString([]byte("a")) + ":" + base64.RawStdEncoding.EncodeToString([]byte("b:c")),
 		},
 		{
-			name:        "composite key with NULL value",
+			name:        "missing PK column returns error (auto-increment)",
 			tableName:   "nullable_pk",
 			primaryKeys: []string{"a", "b"},
 			values: map[string][]byte{
 				"a": []byte("1"),
-				// "b" is missing (NULL)
+				// "b" is missing - this indicates auto-increment INSERT
 			},
-			expectedKey: "nullable_pk:c:" + base64.RawStdEncoding.EncodeToString([]byte("1")) + ":" + filter.NullSentinel,
+			expectError: true,
 		},
 		{
-			name:        "single NULL PK",
+			name:        "all PKs missing returns error (auto-increment)",
 			tableName:   "single_null",
 			primaryKeys: []string{"id"},
 			values:      map[string][]byte{},
-			expectedKey: "single_null:" + filter.NullSentinel,
+			expectError: true,
 		},
 	}
 
@@ -101,6 +100,12 @@ func TestRowKeyCompatibility(t *testing.T) {
 			}
 
 			rowKey, err := GenerateRowKey(schema, tt.values)
+			if tt.expectError {
+				if err == nil {
+					t.Errorf("Expected error but got row key: %q", rowKey)
+				}
+				return
+			}
 			if err != nil {
 				t.Fatalf("GenerateRowKey failed: %v", err)
 			}
@@ -192,6 +197,34 @@ func TestRowKeyJSONValues(t *testing.T) {
 	expected := "json_test:123"
 	if key != expected {
 		t.Errorf("Row key mismatch:\n  got:      %q\n  expected: %q", key, expected)
+	}
+}
+
+// TestRowKeyZeroValueAsAutoIncrement verifies that id=0 is treated as auto-increment
+// MySQL semantics: INSERT with id=0 means "use next auto-increment value"
+func TestRowKeyZeroValueAsAutoIncrement(t *testing.T) {
+	tests := []struct {
+		name  string
+		value []byte
+	}{
+		{"raw zero", []byte("0")},
+		{"JSON-encoded zero", []byte(`"0"`)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			schema := &TableSchema{
+				TableName:   "test",
+				PrimaryKeys: []string{"id"},
+			}
+
+			values := map[string][]byte{"id": tt.value}
+
+			_, err := GenerateRowKey(schema, values)
+			if err != ErrMissingPrimaryKey {
+				t.Errorf("Expected ErrMissingPrimaryKey for id=%q, got: %v", tt.value, err)
+			}
+		})
 	}
 }
 

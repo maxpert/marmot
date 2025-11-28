@@ -148,7 +148,8 @@ var ErrMissingPrimaryKey = fmt.Errorf("primary key columns not present in values
 // This is used by the AST-based path where values may be JSON-encoded.
 // Delegates to filter.SerializeRowKey after extracting JSON values.
 //
-// Returns ErrMissingPrimaryKey if any PK column is not present in values.
+// Returns ErrMissingPrimaryKey if any PK column is not present in values,
+// or if the PK value is "0" (MySQL auto-increment placeholder).
 // This is expected for INSERT statements with auto-increment PKs.
 func GenerateRowKey(schema *TableSchema, values map[string][]byte) (string, error) {
 	if len(schema.PrimaryKeys) == 0 {
@@ -158,7 +159,13 @@ func GenerateRowKey(schema *TableSchema, values map[string][]byte) (string, erro
 	// Check that all PK columns are present in values
 	// If not, return ErrMissingPrimaryKey (e.g., for auto-increment PKs)
 	for _, pkCol := range schema.PrimaryKeys {
-		if _, ok := values[pkCol]; !ok {
+		val, ok := values[pkCol]
+		if !ok {
+			return "", ErrMissingPrimaryKey
+		}
+		// MySQL treats id=0 as "use auto-increment" - treat it the same as missing
+		// This is for compatibility with MySQL clients that use INSERT ... VALUES (0, ...)
+		if isZeroValue(val) {
 			return "", ErrMissingPrimaryKey
 		}
 	}
@@ -185,6 +192,18 @@ func extractStringValue(pkValue []byte) string {
 		val = string(pkValue)
 	}
 	return val
+}
+
+// isZeroValue checks if a byte slice represents a zero value (integer 0)
+// MySQL uses id=0 to indicate "use auto-increment next value"
+// Values may be JSON-encoded strings ("0") or raw bytes (0)
+func isZeroValue(val []byte) bool {
+	if len(val) == 0 {
+		return false
+	}
+	s := string(val)
+	// Check JSON-encoded string "0" or raw "0"
+	return s == "0" || s == `"0"`
 }
 
 // ValidateRowKey validates that a row key matches expected schema version
