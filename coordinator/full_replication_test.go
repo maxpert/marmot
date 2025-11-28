@@ -12,12 +12,13 @@ import (
 
 // mockNodeProvider implements NodeProvider for testing
 type mockNodeProvider struct {
-	nodes []uint64
-	mu    sync.RWMutex
+	nodes           []uint64
+	totalMembership int // Total membership for split-brain prevention (0 = use len(nodes))
+	mu              sync.RWMutex
 }
 
 func newMockNodeProvider(nodes []uint64) *mockNodeProvider {
-	return &mockNodeProvider{nodes: nodes}
+	return &mockNodeProvider{nodes: nodes, totalMembership: len(nodes)}
 }
 
 func (m *mockNodeProvider) GetAliveNodes() ([]uint64, error) {
@@ -32,6 +33,21 @@ func (m *mockNodeProvider) GetClusterSize() int {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return len(m.nodes)
+}
+
+func (m *mockNodeProvider) GetTotalMembershipSize() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.totalMembership > 0 {
+		return m.totalMembership
+	}
+	return len(m.nodes)
+}
+
+func (m *mockNodeProvider) SetTotalMembership(total int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.totalMembership = total
 }
 
 func (m *mockNodeProvider) RemoveNode(nodeID uint64) {
@@ -315,4 +331,55 @@ func containsAt(s, substr string) bool {
 		}
 	}
 	return false
+}
+
+// TestSplitBrainPrevention verifies that quorum is calculated from total membership
+// to prevent split-brain scenarios. In a 6-node cluster split 3x3, neither partition
+// should be able to achieve quorum (which requires 4 acks based on total membership of 6).
+func TestSplitBrainPrevention(t *testing.T) {
+	clock := hlc.NewClock(1)
+
+	// Simulate partition 1: nodes 1, 2, 3 (can only see each other)
+	// Total membership is 6, but only 3 nodes are alive/reachable
+	partitionNodes := []uint64{1, 2, 3}
+	nodeProvider := newMockNodeProvider(partitionNodes)
+	nodeProvider.SetTotalMembership(6) // Total cluster membership is 6
+
+	replicator := newMockReplicator()
+	localReplicator := newMockReplicator()
+
+	coordinator := NewWriteCoordinator(
+		1,
+		nodeProvider,
+		replicator,
+		localReplicator,
+		1*time.Second,
+		clock,
+	)
+
+	txn := &Transaction{
+		ID:     1,
+		NodeID: 1,
+		Statements: []protocol.Statement{
+			{SQL: "INSERT INTO users (id, name) VALUES (1, 'Alice')"},
+		},
+		StartTS:          clock.Now(),
+		WriteConsistency: protocol.ConsistencyQuorum,
+	}
+
+	ctx := context.Background()
+	err := coordinator.WriteTransaction(ctx, txn)
+
+	// Should fail: quorum requires 4 acks (majority of 6), but only 3 nodes are reachable
+	if err == nil {
+		t.Fatalf("Expected write to fail in partitioned cluster, but it succeeded")
+	}
+
+	// Verify error mentions quorum failure
+	errStr := err.Error()
+	if !contains(errStr, "quorum") {
+		t.Errorf("Expected quorum-related error, got: %v", err)
+	}
+
+	t.Logf("Split-brain prevention working: %v", err)
 }

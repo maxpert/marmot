@@ -37,6 +37,10 @@ func (m *mockNodeProviderOld) GetClusterSize() int {
 	return len(m.nodes)
 }
 
+func (m *mockNodeProviderOld) GetTotalMembershipSize() int {
+	return len(m.nodes)
+}
+
 func TestReadCoordinator_ConsistencyOne(t *testing.T) {
 	clock := hlc.NewClock(1)
 	snapshotTS := clock.Now()

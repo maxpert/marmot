@@ -123,34 +123,41 @@ func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transacti
 		Int("stmt_count", len(txn.Statements)).
 		Msg("2PC: WriteTransaction started")
 
-	// Get all alive nodes for full replication
-	allNodes, err := wc.nodeProvider.GetAliveNodes()
+	// Get all alive nodes for full replication (these are the replication targets)
+	aliveNodes, err := wc.nodeProvider.GetAliveNodes()
 	if err != nil {
 		return fmt.Errorf("failed to get alive nodes: %w", err)
 	}
 
-	clusterSize := len(allNodes)
-	if clusterSize == 0 {
+	aliveCount := len(aliveNodes)
+	if aliveCount == 0 {
 		return fmt.Errorf("no alive nodes in cluster")
 	}
 
+	// CRITICAL: Use TOTAL membership for quorum calculation, not just alive nodes.
+	// This prevents split-brain: in a 6-node cluster split 3x3, each partition
+	// would see clusterSize=3 and achieve quorum=2 if we only counted alive nodes.
+	// By using total membership, quorum=4 and neither partition can write.
+	totalMembership := wc.nodeProvider.GetTotalMembershipSize()
+
 	log.Trace().
 		Uint64("txn_id", txn.ID).
-		Int("cluster_size", clusterSize).
+		Int("alive_nodes", aliveCount).
+		Int("total_membership", totalMembership).
 		Msg("2PC: Cluster state")
 
-	// Validate consistency level against cluster size
-	if err := ValidateConsistencyLevel(txn.WriteConsistency, clusterSize); err != nil {
+	// Validate consistency level against total membership (not just alive)
+	if err := ValidateConsistencyLevel(txn.WriteConsistency, totalMembership); err != nil {
 		return fmt.Errorf("invalid write consistency: %w", err)
 	}
 
-	// Calculate required quorum BEFORE replication
-	requiredQuorum := QuorumSize(txn.WriteConsistency, clusterSize)
+	// Calculate required quorum based on TOTAL membership (split-brain protection)
+	requiredQuorum := QuorumSize(txn.WriteConsistency, totalMembership)
 
 	// Separate other nodes from self for replication
 	// Self will be handled separately (we're the coordinator)
-	otherNodes := make([]uint64, 0, clusterSize-1)
-	for _, nodeID := range allNodes {
+	otherNodes := make([]uint64, 0, aliveCount-1)
+	for _, nodeID := range aliveNodes {
 		if nodeID != wc.nodeID {
 			otherNodes = append(otherNodes, nodeID)
 		}
@@ -190,7 +197,7 @@ func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transacti
 			Uint64("txn_id", txn.ID).
 			Err(conflictErr).
 			Msg("Conflict detected - aborting transaction, client should retry")
-		wc.abortTransaction(ctx, allNodes, txn.ID, txn.Database)
+		wc.abortTransaction(ctx, aliveNodes, txn.ID, txn.Database)
 		// Return MySQL 1213 (ER_LOCK_DEADLOCK) - standard signal for client retry
 		return protocol.ErrDeadlock()
 	}
@@ -202,12 +209,13 @@ func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transacti
 			Uint64("txn_id", txn.ID).
 			Int("total_acks", totalAcks).
 			Int("required_quorum", requiredQuorum).
-			Int("cluster_size", clusterSize).
+			Int("total_membership", totalMembership).
+			Int("alive_nodes", aliveCount).
 			Msg("Prepare quorum not achieved - aborting transaction")
 
-		wc.abortTransaction(ctx, allNodes, txn.ID, txn.Database)
-		return fmt.Errorf("prepare quorum not achieved: got %d acks, need %d out of %d nodes",
-			totalAcks, requiredQuorum, clusterSize)
+		wc.abortTransaction(ctx, aliveNodes, txn.ID, txn.Database)
+		return fmt.Errorf("prepare quorum not achieved: got %d acks, need %d (majority of %d total members, %d alive)",
+			totalAcks, requiredQuorum, totalMembership, aliveCount)
 	}
 
 	// ====================

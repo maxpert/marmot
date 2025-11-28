@@ -35,3 +35,9 @@ func (gnp *GossipNodeProvider) GetClusterSize() int {
 	nodes, _ := gnp.GetAliveNodes()
 	return len(nodes)
 }
+
+// GetTotalMembershipSize returns the total known cluster membership
+// (ALIVE + SUSPECT + DEAD nodes). Used for quorum calculation to prevent split-brain.
+func (gnp *GossipNodeProvider) GetTotalMembershipSize() int {
+	return gnp.registry.Count()
+}
