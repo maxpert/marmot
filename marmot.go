@@ -291,6 +291,7 @@ func main() {
 		replicator,
 		localReplicator,
 		writeTimeout,
+		clock,
 	)
 
 	// Initialize LocalReader for ReadCoordinator

@@ -227,6 +227,17 @@ func IsMutation(stmt Statement) bool {
 	}
 }
 
+// IsDML returns true if the statement is a row-level DML operation
+// (INSERT, UPDATE, DELETE, REPLACE) that requires row key tracking
+func IsDML(stmt Statement) bool {
+	switch stmt.Type {
+	case StatementInsert, StatementUpdate, StatementDelete, StatementReplace:
+		return true
+	default:
+		return false
+	}
+}
+
 // IsTransactionControl returns true if the statement is transaction control
 func IsTransactionControl(stmt Statement) bool {
 	switch stmt.Type {

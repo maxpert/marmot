@@ -3,8 +3,11 @@ package coordinator
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"reflect"
+	"sort"
+	"sync"
 	"time"
 
 	"github.com/maxpert/marmot/cfg"
@@ -64,6 +67,14 @@ type NodeState struct {
 	Incarnation uint64
 }
 
+// getWriteTimeout returns the configured write timeout or the default (300s)
+func getWriteTimeout() time.Duration {
+	if cfg.Config != nil && cfg.Config.Replication.WriteTimeoutMS > 0 {
+		return time.Duration(cfg.Config.Replication.WriteTimeoutMS) * time.Millisecond
+	}
+	return 300 * time.Second
+}
+
 // NodeStatus enum
 type NodeStatus int32
 
@@ -101,6 +112,7 @@ type CoordinatorHandler struct {
 	schemaVersionMgr SchemaVersionManager
 	nodeRegistry     NodeRegistry
 	metadata         *handlers.MetadataHandler
+	recentTxnIDs     sync.Map // txn_id -> conn_id for duplicate detection
 }
 
 // NewCoordinatorHandler creates a new handler
@@ -211,12 +223,7 @@ func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, qu
 	// 3. Row key is needed for MVCC write intents (distributed locking)
 	if protocol.IsMutation(stmt) && stmt.RowKey == "" {
 		// Only generate for DML operations that have CDC data
-		isDML := stmt.Type == protocol.StatementInsert ||
-			stmt.Type == protocol.StatementUpdate ||
-			stmt.Type == protocol.StatementDelete ||
-			stmt.Type == protocol.StatementReplace
-
-		if isDML && (len(stmt.NewValues) > 0 || len(stmt.OldValues) > 0) {
+		if protocol.IsDML(stmt) && (len(stmt.NewValues) > 0 || len(stmt.OldValues) > 0) {
 			// Get database connection to access schema
 			sqlDB, err := h.dbManager.GetDatabaseConnection(stmt.Database)
 			if err != nil {
@@ -241,10 +248,20 @@ func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, qu
 			}
 
 			if err != nil {
-				return nil, fmt.Errorf("failed to generate row key for %s.%s: %w", stmt.Database, stmt.TableName, err)
+				// For INSERT statements with auto-increment PKs, the PK column
+				// is not present in CDC values. This is expected - these INSERTs
+				// don't need write intent tracking since auto-generated PKs are unique.
+				if errors.Is(err, protocol.ErrMissingPrimaryKey) && stmt.Type == protocol.StatementInsert {
+					// Leave rowKey empty - no write intent needed for auto-increment INSERT
+					log.Trace().
+						Str("table", stmt.TableName).
+						Msg("INSERT with auto-increment PK - skipping write intent")
+				} else {
+					return nil, fmt.Errorf("failed to generate row key for %s.%s: %w", stmt.Database, stmt.TableName, err)
+				}
+			} else {
+				stmt.RowKey = rowKey
 			}
-
-			stmt.RowKey = rowKey
 		}
 	}
 
@@ -274,8 +291,10 @@ func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, qu
 }
 
 func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, consistency protocol.ConsistencyLevel) (*protocol.ResultSet, error) {
-	txnID := h.clock.Now().WallTime
+	// Generate txnID using Percolator/TiDB pattern: (physical_ms << 18) | logical
+	// This guarantees uniqueness by keeping physical and logical in separate bit ranges
 	startTS := h.clock.Now()
+	txnID := startTS.ToTxnID()
 
 	// Detect DDL and handle differently
 	isDDL := stmt.Type == protocol.StatementDDL ||
@@ -328,20 +347,20 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, consistency
 	var pendingExec PendingExecution
 	var rowsAffected int64 = 1
 
-	isDML := stmt.Type == protocol.StatementInsert ||
-		stmt.Type == protocol.StatementUpdate ||
-		stmt.Type == protocol.StatementDelete ||
-		stmt.Type == protocol.StatementReplace
-
 	// cancelHookCtx is called after pendingExec.Commit/Rollback to release the context
 	// CRITICAL: Do NOT call cancel() before Commit/Rollback - Go's database/sql.Tx
 	// watches the context and auto-rolls back if cancelled before explicit commit
 	var cancelHookCtx context.CancelFunc
 
-	if isDML && stmt.Database != "" {
+	if protocol.IsDML(stmt) && stmt.Database != "" {
 		mvccDB, err := h.dbManager.GetMVCCDatabase(stmt.Database)
 		if err == nil {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			// Use configured lock wait timeout for hook execution (default 50s like MySQL innodb_lock_wait_timeout)
+			hookTimeout := 50 * time.Second
+			if cfg.Config != nil && cfg.Config.MVCC.LockWaitTimeoutSeconds > 0 {
+				hookTimeout = time.Duration(cfg.Config.MVCC.LockWaitTimeoutSeconds) * time.Second
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), hookTimeout)
 			cancelHookCtx = cancel // Store for later - DO NOT call yet
 			pendingExec, err = mvccDB.ExecuteLocalWithHooks(ctx, uint64(txnID), statements)
 
@@ -391,7 +410,7 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, consistency
 		}
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), getWriteTimeout())
 	defer cancel()
 
 	err := h.writeCoord.WriteTransaction(ctx, txn)
@@ -499,9 +518,14 @@ func (h *CoordinatorHandler) handleRead(stmt protocol.Statement, consistency pro
 				})
 			}
 		} else if len(resp.Rows) > 0 {
-			// Fallback: Infer columns from first row (random order)
+			// Fallback: Infer columns from first row (sorted for consistent order)
 			firstRow := resp.Rows[0]
+			colNames := make([]string, 0, len(firstRow))
 			for colName := range firstRow {
+				colNames = append(colNames, colName)
+			}
+			sort.Strings(colNames)
+			for _, colName := range colNames {
 				rs.Columns = append(rs.Columns, protocol.ColumnDef{
 					Name: colName,
 					Type: 0xFD, // VAR_STRING
@@ -629,8 +653,29 @@ func (h *CoordinatorHandler) handleBegin(session *protocol.ConnectionSession) (*
 		return nil, nil
 	}
 
-	txnID := uint64(h.clock.Now().WallTime)
-	startTS := h.clock.Now()
+	// Generate txnID using Percolator/TiDB pattern: (physical_ms << 18) | logical
+	// This guarantees uniqueness by keeping physical and logical in separate bit ranges
+	// Retry up to 3 times if we somehow generate a duplicate (safety net)
+	var txnID uint64
+	var startTS hlc.Timestamp
+	for attempt := 0; attempt < 3; attempt++ {
+		startTS = h.clock.Now()
+		txnID = startTS.ToTxnID()
+
+		// Check for duplicate (this should never happen with proper HLC)
+		if existing, loaded := h.recentTxnIDs.LoadOrStore(txnID, session.ConnID); loaded {
+			log.Error().
+				Uint64("conn_id", session.ConnID).
+				Uint64("txn_id", txnID).
+				Uint64("existing_conn_id", existing.(uint64)).
+				Int("attempt", attempt).
+				Int64("wall_time", startTS.WallTime).
+				Int32("logical", startTS.Logical).
+				Msg("CRITICAL: Duplicate txn_id detected in handleBegin!")
+			continue // retry with new timestamp
+		}
+		break // unique txnID
+	}
 
 	session.BeginTransaction(txnID, startTS, session.CurrentDatabase)
 
@@ -690,13 +735,15 @@ func (h *CoordinatorHandler) handleCommit(session *protocol.ConnectionSession) (
 		}
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second) // Longer timeout for batched transactions
+	ctx, cancel := context.WithTimeout(context.Background(), getWriteTimeout())
 	defer cancel()
 
 	err := h.writeCoord.WriteTransaction(ctx, txn)
 
 	// Clear transaction state regardless of outcome
 	session.EndTransaction()
+	// Cleanup from recentTxnIDs to prevent memory growth
+	h.recentTxnIDs.Delete(txnState.TxnID)
 
 	if err != nil {
 		log.Error().
@@ -731,12 +778,18 @@ func (h *CoordinatorHandler) handleRollback(session *protocol.ConnectionSession)
 
 	txnState := session.GetTransaction()
 	stmtCount := 0
+	var txnID uint64
 	if txnState != nil {
 		stmtCount = len(txnState.Statements)
+		txnID = txnState.TxnID
 	}
 
 	// Just discard the buffer - no network activity needed
 	session.EndTransaction()
+	// Cleanup from recentTxnIDs to prevent memory growth
+	if txnID != 0 {
+		h.recentTxnIDs.Delete(txnID)
+	}
 
 	log.Debug().
 		Uint64("conn_id", session.ConnID).

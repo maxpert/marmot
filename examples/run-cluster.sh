@@ -11,6 +11,11 @@ echo "=== Marmot v2.0 Example Cluster ==="
 echo "Starting 3-node cluster with full database replication"
 echo ""
 
+# Kill any existing marmot processes
+echo "Stopping any existing marmot processes..."
+pkill -f "marmot-v2" 2>/dev/null || true
+sleep 1
+
 # Clean up old data
 echo "Cleaning up old data..."
 rm -rf /tmp/marmot-node-*

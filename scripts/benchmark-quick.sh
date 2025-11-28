@@ -32,7 +32,10 @@ echo -e "${GREEN}✓ Built${NC}"
 
 # Cleanup
 echo -e "${YELLOW}[2/4] Cleaning up...${NC}"
-pkill -f "marmot-v2" || true
+pkill -9 -f "marmot-v2" 2>/dev/null || true
+for port in 3307 3308 3309 8081 8082 8083; do
+    lsof -ti:$port 2>/dev/null | xargs kill -9 2>/dev/null || true
+done
 sleep 2
 rm -rf /tmp/marmot-node-* || true
 
@@ -84,7 +87,12 @@ $YCSB_BIN run mysql \
     -p threadcount=10
 
 # Cleanup
-pkill -f "marmot-v2" || true
+echo ""
+echo -e "${YELLOW}Cleaning up...${NC}"
+pkill -9 -f "marmot-v2" 2>/dev/null || true
+for port in 3307 3308 3309 8081 8082 8083; do
+    lsof -ti:$port 2>/dev/null | xargs kill -9 2>/dev/null || true
+done
 
 echo ""
 echo -e "${GREEN}✓ Quick benchmark complete!${NC}"

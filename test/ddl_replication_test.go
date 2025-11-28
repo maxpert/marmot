@@ -459,6 +459,7 @@ func TestDDLReplicationBasic(t *testing.T) {
 		replicator,
 		replicator,
 		1*time.Second,
+		clock,
 	)
 
 	readCoord := coordinator.NewReadCoordinator(
@@ -550,6 +551,7 @@ func TestDDLWithConcurrentDML(t *testing.T) {
 		replicator,
 		replicator,
 		1*time.Second,
+		clock,
 	)
 
 	readCoord := coordinator.NewReadCoordinator(

@@ -844,3 +844,288 @@ func TestMutationGuard_MaxRowsLimit(t *testing.T) {
 
 	t.Log("✓ MutationGuard maxRows limit test passed")
 }
+
+// TestAutoIncrementRowID verifies that SQLite's auto-increment rowid is correctly
+// captured via the preupdate hook for row key generation.
+// This is critical for conflict detection with auto-increment primary keys.
+func TestAutoIncrementRowID(t *testing.T) {
+	dbPath := "/tmp/test_autoincrement_rowid.db"
+	os.Remove(dbPath)
+	defer os.Remove(dbPath)
+
+	systemDB := createTestSystemDB(t)
+	defer systemDB.Close()
+
+	clock := hlc.NewClock(1)
+	mdb, err := NewMVCCDatabase(dbPath, 1, clock, systemDB)
+	if err != nil {
+		t.Fatalf("Failed to create MVCC database: %v", err)
+	}
+	defer mdb.Close()
+
+	// Create table with INTEGER PRIMARY KEY (SQLite auto-increment alias)
+	_, err = mdb.Exec(context.Background(), `
+		CREATE TABLE autoincr_test (
+			id INTEGER PRIMARY KEY,
+			name TEXT,
+			value INTEGER
+		)
+	`)
+	if err != nil {
+		t.Fatalf("Failed to create table: %v", err)
+	}
+
+	ctx := context.Background()
+
+	// Insert WITHOUT specifying id - SQLite auto-generates it
+	statements := []protocol.Statement{
+		{
+			SQL:       "INSERT INTO autoincr_test (name, value) VALUES ('first', 100)",
+			Type:      protocol.StatementInsert,
+			TableName: "autoincr_test",
+		},
+		{
+			SQL:       "INSERT INTO autoincr_test (name, value) VALUES ('second', 200)",
+			Type:      protocol.StatementInsert,
+			TableName: "autoincr_test",
+		},
+		{
+			SQL:       "INSERT INTO autoincr_test (name, value) VALUES ('third', 300)",
+			Type:      protocol.StatementInsert,
+			TableName: "autoincr_test",
+		},
+	}
+
+	pendingExec, err := mdb.ExecuteLocalWithHooks(ctx, 12345, statements)
+	if err != nil {
+		t.Fatalf("Failed to execute with hooks: %v", err)
+	}
+
+	// Verify row counts
+	totalRows := pendingExec.GetTotalRowCount()
+	if totalRows != 3 {
+		t.Errorf("Expected 3 rows, got %d", totalRows)
+	}
+
+	// Each row should have a unique hash (from SQLite-generated rowid)
+	keyHashes := pendingExec.GetKeyHashes(0)
+	hashes := keyHashes["autoincr_test"]
+	if len(hashes) != 3 {
+		t.Fatalf("Expected 3 unique hashes for 3 auto-increment inserts, got %d", len(hashes))
+	}
+
+	// Verify all hashes are distinct
+	hashSet := make(map[uint64]bool)
+	for _, h := range hashes {
+		if hashSet[h] {
+			t.Errorf("Found duplicate hash %d - SQLite rowid not being captured correctly", h)
+		}
+		hashSet[h] = true
+	}
+
+	err = pendingExec.Commit()
+	if err != nil {
+		t.Fatalf("Failed to commit: %v", err)
+	}
+
+	// Verify the rows were inserted with sequential IDs
+	rows, err := mdb.ExecuteQuery(ctx, "SELECT id, name FROM autoincr_test ORDER BY id")
+	if err != nil {
+		t.Fatalf("Failed to query: %v", err)
+	}
+	defer rows.Close()
+
+	expectedIDs := []int64{1, 2, 3}
+	i := 0
+	for rows.Next() {
+		var id int64
+		var name string
+		if err := rows.Scan(&id, &name); err != nil {
+			t.Fatalf("Failed to scan: %v", err)
+		}
+		if id != expectedIDs[i] {
+			t.Errorf("Expected id %d, got %d", expectedIDs[i], id)
+		}
+		i++
+	}
+
+	t.Log("✓ Auto-increment rowid capture test passed")
+}
+
+// TestRowIDWithoutExplicitPK verifies that tables without an explicit PRIMARY KEY
+// correctly use SQLite's implicit rowid for row key generation.
+func TestRowIDWithoutExplicitPK(t *testing.T) {
+	dbPath := "/tmp/test_implicit_rowid.db"
+	os.Remove(dbPath)
+	defer os.Remove(dbPath)
+
+	systemDB := createTestSystemDB(t)
+	defer systemDB.Close()
+
+	clock := hlc.NewClock(1)
+	mdb, err := NewMVCCDatabase(dbPath, 1, clock, systemDB)
+	if err != nil {
+		t.Fatalf("Failed to create MVCC database: %v", err)
+	}
+	defer mdb.Close()
+
+	// Create table WITHOUT explicit PRIMARY KEY - SQLite uses implicit rowid
+	_, err = mdb.Exec(context.Background(), `
+		CREATE TABLE no_pk_test (
+			name TEXT,
+			value INTEGER
+		)
+	`)
+	if err != nil {
+		t.Fatalf("Failed to create table: %v", err)
+	}
+
+	ctx := context.Background()
+
+	// Insert rows - SQLite will assign rowid internally
+	statements := []protocol.Statement{
+		{
+			SQL:       "INSERT INTO no_pk_test (name, value) VALUES ('alpha', 1)",
+			Type:      protocol.StatementInsert,
+			TableName: "no_pk_test",
+		},
+		{
+			SQL:       "INSERT INTO no_pk_test (name, value) VALUES ('beta', 2)",
+			Type:      protocol.StatementInsert,
+			TableName: "no_pk_test",
+		},
+	}
+
+	pendingExec, err := mdb.ExecuteLocalWithHooks(ctx, 12346, statements)
+	if err != nil {
+		t.Fatalf("Failed to execute with hooks: %v", err)
+	}
+
+	// Each row should have a unique hash based on implicit rowid
+	keyHashes := pendingExec.GetKeyHashes(0)
+	hashes := keyHashes["no_pk_test"]
+	if len(hashes) != 2 {
+		t.Fatalf("Expected 2 unique hashes for implicit rowid table, got %d", len(hashes))
+	}
+
+	// Hashes must be distinct
+	if hashes[0] == hashes[1] {
+		t.Error("Hashes should be distinct for different rows (implicit rowid)")
+	}
+
+	err = pendingExec.Commit()
+	if err != nil {
+		t.Fatalf("Failed to commit: %v", err)
+	}
+
+	t.Log("✓ Implicit rowid (no PK) test passed")
+}
+
+// TestRowIDConflictDetection verifies that updates to the same row produce
+// identical hashes, enabling MutationGuard conflict detection.
+func TestRowIDConflictDetection(t *testing.T) {
+	dbPath := "/tmp/test_rowid_conflict.db"
+	os.Remove(dbPath)
+	defer os.Remove(dbPath)
+
+	systemDB := createTestSystemDB(t)
+	defer systemDB.Close()
+
+	clock := hlc.NewClock(1)
+	mdb, err := NewMVCCDatabase(dbPath, 1, clock, systemDB)
+	if err != nil {
+		t.Fatalf("Failed to create MVCC database: %v", err)
+	}
+	defer mdb.Close()
+
+	ctx := context.Background()
+
+	// Create table and insert initial row
+	_, err = mdb.Exec(ctx, `
+		CREATE TABLE conflict_test (
+			id INTEGER PRIMARY KEY,
+			counter INTEGER
+		)
+	`)
+	if err != nil {
+		t.Fatalf("Failed to create table: %v", err)
+	}
+
+	_, err = mdb.Exec(ctx, "INSERT INTO conflict_test (id, counter) VALUES (1, 0)")
+	if err != nil {
+		t.Fatalf("Failed to insert initial row: %v", err)
+	}
+
+	// Transaction 1: Update row id=1, capture hash, then rollback
+	statements1 := []protocol.Statement{
+		{
+			SQL:       "UPDATE conflict_test SET counter = 10 WHERE id = 1",
+			Type:      protocol.StatementUpdate,
+			TableName: "conflict_test",
+		},
+	}
+
+	pendingExec1, err := mdb.ExecuteLocalWithHooks(ctx, 100, statements1)
+	if err != nil {
+		t.Fatalf("Txn1 failed to execute: %v", err)
+	}
+	hashes1 := pendingExec1.GetKeyHashes(0)["conflict_test"]
+	pendingExec1.Rollback() // Release lock
+
+	// Transaction 2: Update same row id=1, capture hash
+	statements2 := []protocol.Statement{
+		{
+			SQL:       "UPDATE conflict_test SET counter = 20 WHERE id = 1",
+			Type:      protocol.StatementUpdate,
+			TableName: "conflict_test",
+		},
+	}
+
+	pendingExec2, err := mdb.ExecuteLocalWithHooks(ctx, 200, statements2)
+	if err != nil {
+		t.Fatalf("Txn2 failed to execute: %v", err)
+	}
+	hashes2 := pendingExec2.GetKeyHashes(0)["conflict_test"]
+	pendingExec2.Rollback()
+
+	if len(hashes1) != 1 || len(hashes2) != 1 {
+		t.Fatalf("Expected 1 hash each, got %d and %d", len(hashes1), len(hashes2))
+	}
+
+	// The hashes should be identical since they're updating the same row
+	if hashes1[0] != hashes2[0] {
+		t.Errorf("Same row should produce same hash. Got %d vs %d", hashes1[0], hashes2[0])
+	}
+
+	// Transaction 3: Update DIFFERENT row id=2, should have different hash
+	_, err = mdb.Exec(ctx, "INSERT INTO conflict_test (id, counter) VALUES (2, 0)")
+	if err != nil {
+		t.Fatalf("Failed to insert row 2: %v", err)
+	}
+
+	statements3 := []protocol.Statement{
+		{
+			SQL:       "UPDATE conflict_test SET counter = 30 WHERE id = 2",
+			Type:      protocol.StatementUpdate,
+			TableName: "conflict_test",
+		},
+	}
+
+	pendingExec3, err := mdb.ExecuteLocalWithHooks(ctx, 300, statements3)
+	if err != nil {
+		t.Fatalf("Txn3 failed to execute: %v", err)
+	}
+	hashes3 := pendingExec3.GetKeyHashes(0)["conflict_test"]
+	pendingExec3.Rollback()
+
+	if len(hashes3) != 1 {
+		t.Fatalf("Expected 1 hash for row 2, got %d", len(hashes3))
+	}
+
+	// Row 2's hash should be DIFFERENT from row 1's hash
+	if hashes1[0] == hashes3[0] {
+		t.Errorf("Different rows should have different hashes. Both got %d", hashes1[0])
+	}
+
+	t.Log("✓ RowID conflict detection test passed")
+}

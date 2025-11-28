@@ -60,27 +60,10 @@ func (lr *LocalReplicator) handlePrepare(ctx context.Context, req *coordinator.R
 			}
 
 			txnMgr := systemDB.GetTransactionManager()
-			txn, err := txnMgr.BeginTransaction(req.NodeID)
+			// Use coordinator's txn_id directly to avoid ID collision race conditions
+			txn, err := txnMgr.BeginTransactionWithID(req.TxnID, req.NodeID, req.StartTS)
 			if err != nil {
 				return &coordinator.ReplicationResponse{Success: false, Error: fmt.Sprintf("failed to begin transaction: %v", err)}, nil
-			}
-
-			// Override transaction ID to match coordinator's
-			originalID := txn.ID
-			txn.ID = req.TxnID
-			txn.StartTS = req.StartTS
-
-			txnMgr.UpdateTransactionID(originalID, req.TxnID)
-
-			// Update transaction record in system database
-			_, err = systemDB.GetDB().Exec(`
-				UPDATE __marmot__txn_records
-				SET txn_id = ?
-				WHERE txn_id = ?
-			`, req.TxnID, originalID)
-			if err != nil {
-				txnMgr.AbortTransaction(txn)
-				return &coordinator.ReplicationResponse{Success: false, Error: fmt.Sprintf("failed to update txn ID: %v", err)}, nil
 			}
 
 			// Add statement to transaction
@@ -102,7 +85,10 @@ func (lr *LocalReplicator) handlePrepare(ctx context.Context, req *coordinator.R
 				"database_name": stmt.Database,
 				"operation":     opName,
 			}
-			dataSnapshot, _ := SerializeData(snapshotData)
+			dataSnapshot, err := SerializeData(snapshotData)
+			if err != nil {
+				return &coordinator.ReplicationResponse{Success: false, Error: fmt.Sprintf("failed to serialize data: %v", err)}, nil
+			}
 
 			err = txnMgr.WriteIntent(txn, "__marmot__database_operations", rowKey, stmt, dataSnapshot)
 			if err != nil {
@@ -128,26 +114,9 @@ func (lr *LocalReplicator) handlePrepare(ctx context.Context, req *coordinator.R
 	}
 
 	txnMgr := mvccDB.GetTransactionManager()
-	txn, err := txnMgr.BeginTransaction(req.NodeID)
+	// Use coordinator's txn_id directly to avoid ID collision race conditions
+	txn, err := txnMgr.BeginTransactionWithID(req.TxnID, req.NodeID, req.StartTS)
 	if err != nil {
-		return &coordinator.ReplicationResponse{Success: false, Error: err.Error()}, nil
-	}
-
-	// Override ID
-	originalID := txn.ID
-	txn.ID = req.TxnID
-	txn.StartTS = req.StartTS
-
-	txnMgr.UpdateTransactionID(originalID, req.TxnID)
-
-	// Update DB record
-	_, err = mvccDB.GetDB().Exec(`
-		UPDATE __marmot__txn_records
-		SET txn_id = ?
-		WHERE txn_id = ?
-	`, req.TxnID, originalID)
-	if err != nil {
-		txnMgr.AbortTransaction(txn)
 		return &coordinator.ReplicationResponse{Success: false, Error: err.Error()}, nil
 	}
 
@@ -160,14 +129,23 @@ func (lr *LocalReplicator) handlePrepare(ctx context.Context, req *coordinator.R
 		// Use pre-extracted row key from statement
 		rowKey := stmt.RowKey
 		if rowKey == "" {
-			// Fallback to hash if no row key was extracted
+			// For INSERT statements without explicit PK (auto-increment),
+			// skip write intent creation - no row-level conflict possible
+			if stmt.Type == protocol.StatementInsert {
+				log.Trace().
+					Str("table", stmt.TableName).
+					Msg("LOCAL REPLICATOR: INSERT with auto-increment PK - skipping write intent")
+				continue
+			}
+
+			// For UPDATE/DELETE without rowKey, use SQL hash as fallback
 			sql := stmt.SQL
 			if sql == "" {
 				sql = "unknown"
 			}
 			log.Warn().
 				Str("sql", sql).
-				Msg("LOCAL REPLICATOR: Empty RowKey - using fallback hex hash")
+				Msg("Empty RowKey for non-INSERT - using SQL-derived identifier")
 			rowKey = fmt.Sprintf("%x", []byte(sql)[:min(16, len(sql))])
 		}
 
@@ -185,7 +163,11 @@ func (lr *LocalReplicator) handlePrepare(ctx context.Context, req *coordinator.R
 			// SQL fallback
 			snapshotData["sql"] = stmt.SQL
 		}
-		dataSnapshot, _ := SerializeData(snapshotData)
+		dataSnapshot, serErr := SerializeData(snapshotData)
+		if serErr != nil {
+			txnMgr.AbortTransaction(txn)
+			return &coordinator.ReplicationResponse{Success: false, Error: fmt.Sprintf("failed to serialize data: %v", serErr)}, nil
+		}
 
 		if err := txnMgr.WriteIntent(txn, stmt.TableName, rowKey, stmt, dataSnapshot); err != nil {
 			txnMgr.AbortTransaction(txn)

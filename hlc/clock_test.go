@@ -1,6 +1,7 @@
 package hlc
 
 import (
+	"sync"
 	"testing"
 	"time"
 )
@@ -17,17 +18,11 @@ func TestClock_Now(t *testing.T) {
 	}
 
 	// Calling Now again immediately should increment logical
+	// Logical only resets when millisecond changes (not nanosecond)
+	// to ensure unique txn_ids via ToTxnID()
 	ts2 := clock.Now()
-	if ts2.WallTime != ts1.WallTime {
-		// Physical time advanced - logical resets
-		if ts2.Logical != 0 {
-			t.Errorf("If wall time advanced, logical should reset to 0")
-		}
-	} else {
-		// Same wall time - logical increments
-		if ts2.Logical != ts1.Logical+1 {
-			t.Errorf("Expected logical %d, got %d", ts1.Logical+1, ts2.Logical)
-		}
+	if ts2.Logical <= ts1.Logical {
+		t.Errorf("Logical should always increment within same millisecond, got %d -> %d", ts1.Logical, ts2.Logical)
 	}
 }
 
@@ -279,6 +274,49 @@ func TestClock_LogicalOverflow(t *testing.T) {
 	ts := clock.Now()
 	if ts.NodeID != 1 {
 		t.Error("Clock should still function after logical overflow")
+	}
+}
+
+func TestClock_UniqueTxnIDs(t *testing.T) {
+	clock := NewClock(1)
+	ids := make(chan uint64, 10000)
+
+	// Spawn 100 goroutines each generating 100 txn_ids
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				ts := clock.Now()
+				ids <- ts.ToTxnID()
+			}
+		}()
+	}
+
+	go func() {
+		wg.Wait()
+		close(ids)
+	}()
+
+	seen := make(map[uint64]int)
+	for id := range ids {
+		seen[id]++
+	}
+
+	duplicates := 0
+	for id, count := range seen {
+		if count > 1 {
+			t.Errorf("DUPLICATE: txn_id=%d appears %d times", id, count)
+			duplicates++
+		}
+	}
+
+	if duplicates > 0 {
+		t.Errorf("Found %d duplicate txn_ids out of 10000", duplicates)
+	}
+	if len(seen) != 10000 {
+		t.Errorf("Expected 10000 unique txn_ids, got %d", len(seen))
 	}
 }
 

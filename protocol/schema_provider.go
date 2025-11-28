@@ -140,12 +140,27 @@ func (sp *SchemaProvider) calculateSchemaVersion(schema *TableSchema) uint64 {
 	return version
 }
 
+// ErrMissingPrimaryKey is returned when PK columns are not in the values map
+// This typically happens for INSERT statements with auto-increment PKs
+var ErrMissingPrimaryKey = fmt.Errorf("primary key columns not present in values")
+
 // GenerateRowKey generates a deterministic row key from primary key values.
 // This is used by the AST-based path where values may be JSON-encoded.
 // Delegates to filter.SerializeRowKey after extracting JSON values.
+//
+// Returns ErrMissingPrimaryKey if any PK column is not present in values.
+// This is expected for INSERT statements with auto-increment PKs.
 func GenerateRowKey(schema *TableSchema, values map[string][]byte) (string, error) {
 	if len(schema.PrimaryKeys) == 0 {
 		return "", fmt.Errorf("no primary keys defined for table %s", schema.TableName)
+	}
+
+	// Check that all PK columns are present in values
+	// If not, return ErrMissingPrimaryKey (e.g., for auto-increment PKs)
+	for _, pkCol := range schema.PrimaryKeys {
+		if _, ok := values[pkCol]; !ok {
+			return "", ErrMissingPrimaryKey
+		}
 	}
 
 	// Extract JSON values and convert to raw bytes for serialization

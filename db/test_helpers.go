@@ -41,10 +41,24 @@ func verifyWriteIntentsCleared(t *testing.T, db *sql.DB, txnID uint64) {
 }
 
 // verifyTransactionStatus checks the status of a transaction in the database
+// Note: Aborted transactions are now deleted rather than marked with ABORTED status
 func verifyTransactionStatus(t *testing.T, db *sql.DB, txnID uint64, expectedStatus string) {
 	t.Helper()
 	var status string
 	err := db.QueryRow("SELECT status FROM __marmot__txn_records WHERE txn_id = ?", txnID).Scan(&status)
+
+	// Aborted transactions are deleted rather than marked with status
+	if expectedStatus == TxnStatusAborted {
+		if err == sql.ErrNoRows {
+			// Expected: aborted transactions are deleted
+			return
+		}
+		if err == nil {
+			t.Errorf("Expected transaction %d to be deleted (aborted), but found status %s", txnID, status)
+			return
+		}
+	}
+
 	if err != nil {
 		t.Fatalf("Failed to query transaction status: %v", err)
 	}

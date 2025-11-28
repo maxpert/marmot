@@ -27,6 +27,7 @@ func NewTranspiler(cacheSize int) (*Transpiler, error) {
 	}
 
 	ruleSet := RuleSet{
+		&rules.CreateTableRule{},
 		&rules.TransactionSyntaxRule{},
 		&rules.InsertIgnoreRule{},
 		&rules.ReplaceIntoRule{},

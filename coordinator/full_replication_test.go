@@ -51,6 +51,7 @@ func TestFullReplication_QuorumWrite(t *testing.T) {
 	nodes := []uint64{1, 2, 3, 4, 5}
 	nodeProvider := newMockNodeProvider(nodes)
 	replicator := newMockReplicator()
+	clock := hlc.NewClock(1)
 
 	coordinator := NewWriteCoordinator(
 		1, // node 1 is coordinator
@@ -58,6 +59,7 @@ func TestFullReplication_QuorumWrite(t *testing.T) {
 		replicator,
 		replicator,
 		1*time.Second,
+		clock,
 	)
 
 	// Create a test transaction
@@ -104,6 +106,7 @@ func TestFullReplication_QuorumFailure(t *testing.T) {
 	nodes := []uint64{1, 2, 3, 4, 5}
 	nodeProvider := newMockNodeProvider(nodes)
 	replicator := newMockReplicator()
+	clock := hlc.NewClock(1)
 
 	// Make nodes 2, 3, 4 fail (only node 5 responds)
 	// With coordinator (1) + node 5 = 2 nodes, need 3 for quorum
@@ -117,6 +120,7 @@ func TestFullReplication_QuorumFailure(t *testing.T) {
 		replicator,
 		replicator,
 		1*time.Second,
+		clock,
 	)
 
 	txn := &Transaction{
@@ -152,6 +156,7 @@ func TestFullReplication_AllNodesReceiveWrite(t *testing.T) {
 	nodes := []uint64{1, 2, 3}
 	nodeProvider := newMockNodeProvider(nodes)
 	replicator := newMockReplicator()
+	clock := hlc.NewClock(1)
 
 	coordinator := NewWriteCoordinator(
 		1,
@@ -159,6 +164,7 @@ func TestFullReplication_AllNodesReceiveWrite(t *testing.T) {
 		replicator,
 		replicator,
 		1*time.Second,
+		clock,
 	)
 
 	txn := &Transaction{
@@ -202,6 +208,7 @@ func TestFullReplication_NodeFailureDuringWrite(t *testing.T) {
 	nodes := []uint64{1, 2, 3, 4, 5}
 	nodeProvider := newMockNodeProvider(nodes)
 	replicator := newMockReplicator()
+	clock := hlc.NewClock(1)
 
 	// Node 5 is dead/unresponsive
 	replicator.SetNodeResponse(5, &ReplicationResponse{Success: false})
@@ -212,6 +219,7 @@ func TestFullReplication_NodeFailureDuringWrite(t *testing.T) {
 		replicator,
 		replicator,
 		1*time.Second,
+		clock,
 	)
 
 	txn := &Transaction{

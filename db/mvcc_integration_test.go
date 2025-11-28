@@ -420,19 +420,19 @@ func TestTransactionAbort(t *testing.T) {
 
 	t.Logf("✓ Write intents cleaned up after abort")
 
-	// Verify transaction record shows ABORTED
-	var status string
-	err = db.QueryRow("SELECT status FROM __marmot__txn_records WHERE txn_id = ?", txn.ID).
-		Scan(&status)
+	// Verify transaction record is deleted (aborted transactions are fully cleaned up)
+	var txnCount int
+	err = db.QueryRow("SELECT COUNT(*) FROM __marmot__txn_records WHERE txn_id = ?", txn.ID).
+		Scan(&txnCount)
 	if err != nil {
-		t.Fatalf("Failed to read transaction record: %v", err)
+		t.Fatalf("Failed to query transaction record: %v", err)
 	}
 
-	if status != TxnStatusAborted {
-		t.Errorf("Transaction record status = %s, want ABORTED", status)
+	if txnCount != 0 {
+		t.Errorf("Transaction record not deleted: found %d records after abort", txnCount)
 	}
 
-	t.Logf("✓ Transaction record shows ABORTED status")
+	t.Logf("✓ Transaction record deleted after abort")
 }
 
 // TestExternalSQLiteReadability tests that external tools can read the DB

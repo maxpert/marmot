@@ -94,7 +94,7 @@ func TestMySQLServerIntegration(t *testing.T) {
 	dbMgr := NewTestDatabaseManager(mvccDB)
 
 	localReplicator := db.NewLocalReplicator(1, dbMgr, clock)
-	writeCoord := coordinator.NewWriteCoordinator(1, nodeProvider, replicator, localReplicator, time.Second)
+	writeCoord := coordinator.NewWriteCoordinator(1, nodeProvider, replicator, localReplicator, time.Second, clock)
 
 	localReader := db.NewLocalReader(dbMgr)
 	readCoord := coordinator.NewReadCoordinator(1, nodeProvider, localReader, time.Second)

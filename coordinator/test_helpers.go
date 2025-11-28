@@ -10,15 +10,16 @@ import (
 
 // Enhanced mock replicator with conflict simulation, delays, and call tracking
 type enhancedMockReplicator struct {
-	mu             sync.RWMutex
-	calls          []ReplicationCall
-	responses      map[uint64]*ReplicationResponse // For SetNodeResponse compatibility
-	conflicts      map[uint64]map[uint64]string    // nodeID -> txnID -> conflictMsg
-	delays         map[uint64]time.Duration        // txnID -> delay
-	activeLocks    map[uint64]uint64               // nodeID -> active txnID holding lock
-	callCount      int                             // Simple counter for backward compatibility
-	prepareLatency time.Duration
-	commitLatency  time.Duration
+	mu                  sync.RWMutex
+	calls               []ReplicationCall
+	responses           map[uint64]*ReplicationResponse // For SetNodeResponse compatibility
+	conflicts           map[uint64]map[uint64]string    // nodeID -> txnID -> conflictMsg
+	persistentConflicts map[uint64]string               // nodeID -> conflictMsg (applies to ALL txns)
+	delays              map[uint64]time.Duration        // txnID -> delay
+	activeLocks         map[uint64]uint64               // nodeID -> active txnID holding lock
+	callCount           int                             // Simple counter for backward compatibility
+	prepareLatency      time.Duration
+	commitLatency       time.Duration
 }
 
 // ReplicationCall tracks a replication call for testing
@@ -30,13 +31,14 @@ type ReplicationCall struct {
 
 func newMockReplicator() *enhancedMockReplicator {
 	return &enhancedMockReplicator{
-		calls:          make([]ReplicationCall, 0),
-		responses:      make(map[uint64]*ReplicationResponse),
-		conflicts:      make(map[uint64]map[uint64]string),
-		delays:         make(map[uint64]time.Duration),
-		activeLocks:    make(map[uint64]uint64),
-		prepareLatency: 1 * time.Millisecond,
-		commitLatency:  1 * time.Millisecond,
+		calls:               make([]ReplicationCall, 0),
+		responses:           make(map[uint64]*ReplicationResponse),
+		conflicts:           make(map[uint64]map[uint64]string),
+		persistentConflicts: make(map[uint64]string),
+		delays:              make(map[uint64]time.Duration),
+		activeLocks:         make(map[uint64]uint64),
+		prepareLatency:      1 * time.Millisecond,
+		commitLatency:       1 * time.Millisecond,
 	}
 }
 
@@ -78,7 +80,16 @@ func (m *enhancedMockReplicator) ReplicateTransaction(ctx context.Context, nodeI
 
 	// Handle PREPARE phase - check for conflicts
 	if req.Phase == PhasePrep {
-		// Check if this node has a conflict configured for this txn
+		// Check for persistent conflict first (applies to ALL transactions on this node)
+		if conflictMsg, exists := m.persistentConflicts[nodeID]; exists {
+			return &ReplicationResponse{
+				Success:          true,
+				ConflictDetected: true,
+				ConflictDetails:  conflictMsg,
+			}, nil
+		}
+
+		// Check if this node has a conflict configured for this specific txn
 		if nodeConflicts, exists := m.conflicts[nodeID]; exists {
 			if conflictMsg, hasConflict := nodeConflicts[req.TxnID]; hasConflict {
 				// Conflict detected - return success with conflict flag
@@ -130,6 +141,20 @@ func (m *enhancedMockReplicator) SetConflict(nodeID, txnID uint64, message strin
 	m.conflicts[nodeID][txnID] = message
 }
 
+// SetPersistentNodeConflict configures a conflict that applies to ALL transactions on a node
+func (m *enhancedMockReplicator) SetPersistentNodeConflict(nodeID uint64, message string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.persistentConflicts[nodeID] = message
+}
+
+// ClearPersistentNodeConflict removes a persistent conflict for a node
+func (m *enhancedMockReplicator) ClearPersistentNodeConflict(nodeID uint64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.persistentConflicts, nodeID)
+}
+
 // ClearConflict removes a configured conflict (simulates lock release)
 func (m *enhancedMockReplicator) ClearConflict(nodeID, txnID uint64) {
 	m.mu.Lock()
@@ -174,6 +199,7 @@ func (m *enhancedMockReplicator) Reset() {
 
 	m.calls = make([]ReplicationCall, 0)
 	m.conflicts = make(map[uint64]map[uint64]string)
+	m.persistentConflicts = make(map[uint64]string)
 	m.delays = make(map[uint64]time.Duration)
 	m.activeLocks = make(map[uint64]uint64)
 }

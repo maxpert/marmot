@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/maxpert/marmot/cfg"
+
 	_ "github.com/mattn/go-sqlite3" // SQLite driver
 	"github.com/rs/zerolog/log"
 	"google.golang.org/grpc"
@@ -332,8 +334,11 @@ func (c *CatchUpClient) GetLocalMaxTxnID(ctx context.Context) (map[string]uint64
 		return result, nil
 	}
 
-	// Open system database to get list of registered databases
-	systemDB, err := sql.Open("sqlite3", systemDBPath)
+	// Open system database with WAL mode and busy timeout to avoid conflicts
+	// Use config timeout (in seconds) converted to milliseconds
+	busyTimeoutMS := cfg.Config.MVCC.LockWaitTimeoutSeconds * 1000
+	dsn := fmt.Sprintf("%s?_journal_mode=WAL&_busy_timeout=%d&mode=ro", systemDBPath, busyTimeoutMS)
+	systemDB, err := sql.Open("sqlite3", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open system database: %w", err)
 	}
@@ -378,7 +383,11 @@ func (c *CatchUpClient) getMaxTxnIDFromDB(dbPath string) (uint64, error) {
 		return 0, nil
 	}
 
-	db, err := sql.Open("sqlite3", dbPath)
+	// Open database with WAL mode and busy timeout to avoid conflicts
+	// Use config timeout (in seconds) converted to milliseconds
+	busyTimeoutMS := cfg.Config.MVCC.LockWaitTimeoutSeconds * 1000
+	dsn := fmt.Sprintf("%s?_journal_mode=WAL&_busy_timeout=%d&mode=ro", dbPath, busyTimeoutMS)
+	db, err := sql.Open("sqlite3", dsn)
 	if err != nil {
 		return 0, fmt.Errorf("failed to open database: %w", err)
 	}

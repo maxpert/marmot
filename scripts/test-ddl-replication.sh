@@ -16,8 +16,12 @@ echo ""
 
 # Clean up any existing processes and data
 echo "Cleaning up old processes and data..."
-pkill -f "marmot-v2" 2>/dev/null || true
-sleep 1
+pkill -9 -f "marmot-v2" 2>/dev/null || true
+for port in 3307 3308 3309 8081 8082 8083; do
+    lsof -ti:$port 2>/dev/null | xargs kill -9 2>/dev/null || true
+done
+sleep 2
+rm -rf /tmp/marmot-node-* 2>/dev/null || true
 
 # Start seed node (node 1)
 echo "Starting seed node (port 8081, mysql 3307)..."

@@ -28,8 +28,8 @@ func NewReplicationHandler(nodeID uint64, dbMgr *db.DatabaseManager, clock *hlc.
 	}
 }
 
-// HandleReplicateTransaction handles incoming transaction replication requests
-// This is the CRITICAL gRPC handler that implements 2PC protocol
+// HandleReplicateTransaction handles incoming transaction replication requests.
+// Entry point for all remote 2PC phases (PREPARE, COMMIT, ABORT).
 func (rh *ReplicationHandler) HandleReplicateTransaction(ctx context.Context, req *TransactionRequest) (*TransactionResponse, error) {
 	// Update local clock with incoming timestamp
 	incomingTS := hlc.Timestamp{
@@ -93,36 +93,17 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 			}
 
 			txnMgr := systemDB.GetTransactionManager()
-			txn, err := txnMgr.BeginTransaction(req.SourceNodeId)
-			if err != nil {
-				return &TransactionResponse{
-					Success:      false,
-					ErrorMessage: fmt.Sprintf("failed to begin transaction: %v", err),
-				}, nil
-			}
-
-			// Override transaction ID to match coordinator's
-			originalID := txn.ID
-			txn.ID = req.TxnId
-			txn.StartTS = hlc.Timestamp{
+			// Use coordinator's txn_id directly to avoid ID collision race conditions
+			startTS := hlc.Timestamp{
 				WallTime: req.Timestamp.WallTime,
 				Logical:  req.Timestamp.Logical,
 				NodeID:   req.Timestamp.NodeId,
 			}
-
-			txnMgr.UpdateTransactionID(originalID, req.TxnId)
-
-			// Update transaction record in system database
-			_, err = systemDB.GetDB().Exec(`
-				UPDATE __marmot__txn_records
-				SET txn_id = ?
-				WHERE txn_id = ?
-			`, req.TxnId, originalID)
+			txn, err := txnMgr.BeginTransactionWithID(req.TxnId, req.SourceNodeId, startTS)
 			if err != nil {
-				txnMgr.AbortTransaction(txn)
 				return &TransactionResponse{
 					Success:      false,
-					ErrorMessage: fmt.Sprintf("failed to update txn ID: %v", err),
+					ErrorMessage: fmt.Sprintf("failed to begin transaction: %v", err),
 				}, nil
 			}
 
@@ -202,42 +183,18 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 	}
 
 	txnMgr := dbInstance.GetTransactionManager()
-	database := dbInstance.GetDB()
 
-	// Begin local transaction
-	txn, err := txnMgr.BeginTransaction(req.SourceNodeId)
-	if err != nil {
-		return &TransactionResponse{
-			Success:      false,
-			ErrorMessage: fmt.Sprintf("failed to begin transaction: %v", err),
-		}, nil
-	}
-
-	// Store original ID before override
-	originalID := txn.ID
-
-	// Override transaction ID to match coordinator's
-	txn.ID = req.TxnId
-	txn.StartTS = hlc.Timestamp{
+	// Use coordinator's txn_id directly to avoid ID collision race conditions
+	startTS := hlc.Timestamp{
 		WallTime: req.Timestamp.WallTime,
 		Logical:  req.Timestamp.Logical,
 		NodeID:   req.Timestamp.NodeId,
 	}
-
-	// Update the transaction ID in the active transactions map
-	txnMgr.UpdateTransactionID(originalID, req.TxnId)
-
-	// Update transaction record in database with coordinator's ID
-	_, err = database.Exec(`
-		UPDATE __marmot__txn_records
-		SET txn_id = ?
-		WHERE txn_id = ?
-	`, req.TxnId, originalID)
+	txn, err := txnMgr.BeginTransactionWithID(req.TxnId, req.SourceNodeId, startTS)
 	if err != nil {
-		txnMgr.AbortTransaction(txn)
 		return &TransactionResponse{
 			Success:      false,
-			ErrorMessage: fmt.Sprintf("failed to update txn ID: %v", err),
+			ErrorMessage: fmt.Sprintf("failed to begin transaction: %v", err),
 		}, nil
 	}
 
@@ -271,14 +228,23 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 		// The row key was extracted from the original MySQL AST during parsing
 		rowKey := stmt.GetRowKey()
 		if rowKey == "" {
-			// Fallback to hash if no row key was extracted
+			// For INSERT statements without explicit PK (auto-increment),
+			// skip write intent creation - no row-level conflict possible
+			if internalStmt.Type == protocol.StatementInsert {
+				log.Trace().
+					Str("table", stmt.TableName).
+					Msg("GRPC: INSERT with auto-increment PK - skipping write intent")
+				continue
+			}
+
+			// For UPDATE/DELETE without rowKey, use SQL hash as fallback
 			sql := stmt.GetSQL()
 			if sql == "" {
 				sql = "unknown"
 			}
 			log.Warn().
 				Str("sql", sql).
-				Msg("Empty RowKey received - using fallback hex hash")
+				Msg("Empty RowKey for non-INSERT - using SQL-derived identifier")
 			rowKey = fmt.Sprintf("%x", []byte(sql)[:min(16, len(sql))])
 		}
 
