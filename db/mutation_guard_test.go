@@ -5,29 +5,28 @@ package db
 
 import (
 	"context"
-	"database/sql"
 	"os"
 	"testing"
 
-	_ "github.com/mattn/go-sqlite3"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/protocol"
 	"github.com/maxpert/marmot/protocol/filter"
 )
 
-// createTestSystemDB creates an in-memory SQLite database for intent entry storage during tests
-func createTestSystemDB(t *testing.T) *sql.DB {
+// createMutationGuardTestMetaStore creates a MetaStore for mutation guard tests
+func createMutationGuardTestMetaStore(t *testing.T, dbPath string) MetaStore {
 	t.Helper()
-	systemDB, err := sql.Open("sqlite3", ":memory:?_journal_mode=WAL")
+	metaPath := dbPath + "_meta.db"
+	os.Remove(metaPath)
+	metaStore, err := NewSQLiteMetaStore(metaPath, 5000)
 	if err != nil {
-		t.Fatalf("Failed to create test system DB: %v", err)
+		t.Fatalf("Failed to create test meta store: %v", err)
 	}
-	// Create intent_entries table
-	_, err = systemDB.Exec(CreateIntentEntriesTable)
-	if err != nil {
-		t.Fatalf("Failed to create intent entries table: %v", err)
-	}
-	return systemDB
+	t.Cleanup(func() {
+		metaStore.Close()
+		os.Remove(metaPath)
+	})
+	return metaStore
 }
 
 func TestMutationGuard_MultiRowInsert(t *testing.T) {
@@ -35,11 +34,10 @@ func TestMutationGuard_MultiRowInsert(t *testing.T) {
 	os.Remove(dbPath)
 	defer os.Remove(dbPath)
 
-	systemDB := createTestSystemDB(t)
-	defer systemDB.Close()
+	metaStore := createMutationGuardTestMetaStore(t, dbPath)
 
 	clock := hlc.NewClock(1)
-	mdb, err := NewMVCCDatabase(dbPath, 1, clock, systemDB)
+	mdb, err := NewMVCCDatabase(dbPath, 1, clock, metaStore)
 	if err != nil {
 		t.Fatalf("Failed to create MVCC database: %v", err)
 	}
@@ -132,11 +130,10 @@ func TestMutationGuard_Rollback(t *testing.T) {
 	os.Remove(dbPath)
 	defer os.Remove(dbPath)
 
-	systemDB := createTestSystemDB(t)
-	defer systemDB.Close()
+	metaStore := createMutationGuardTestMetaStore(t, dbPath)
 
 	clock := hlc.NewClock(1)
-	mdb, err := NewMVCCDatabase(dbPath, 1, clock, systemDB)
+	mdb, err := NewMVCCDatabase(dbPath, 1, clock, metaStore)
 	if err != nil {
 		t.Fatalf("Failed to create MVCC database: %v", err)
 	}
@@ -204,11 +201,10 @@ func TestMutationGuard_BatchUpdate(t *testing.T) {
 	os.Remove(dbPath)
 	defer os.Remove(dbPath)
 
-	systemDB := createTestSystemDB(t)
-	defer systemDB.Close()
+	metaStore := createMutationGuardTestMetaStore(t, dbPath)
 
 	clock := hlc.NewClock(1)
-	mdb, err := NewMVCCDatabase(dbPath, 1, clock, systemDB)
+	mdb, err := NewMVCCDatabase(dbPath, 1, clock, metaStore)
 	if err != nil {
 		t.Fatalf("Failed to create MVCC database: %v", err)
 	}
@@ -301,11 +297,10 @@ func TestMutationGuard_SingleRow(t *testing.T) {
 	os.Remove(dbPath)
 	defer os.Remove(dbPath)
 
-	systemDB := createTestSystemDB(t)
-	defer systemDB.Close()
+	metaStore := createMutationGuardTestMetaStore(t, dbPath)
 
 	clock := hlc.NewClock(1)
-	mdb, err := NewMVCCDatabase(dbPath, 1, clock, systemDB)
+	mdb, err := NewMVCCDatabase(dbPath, 1, clock, metaStore)
 	if err != nil {
 		t.Fatalf("Failed to create MVCC database: %v", err)
 	}
@@ -359,11 +354,10 @@ func TestMutationGuard_CompositeKeyWithSeparator(t *testing.T) {
 	os.Remove(dbPath)
 	defer os.Remove(dbPath)
 
-	systemDB := createTestSystemDB(t)
-	defer systemDB.Close()
+	metaStore := createMutationGuardTestMetaStore(t, dbPath)
 
 	clock := hlc.NewClock(1)
-	mdb, err := NewMVCCDatabase(dbPath, 1, clock, systemDB)
+	mdb, err := NewMVCCDatabase(dbPath, 1, clock, metaStore)
 	if err != nil {
 		t.Fatalf("Failed to create MVCC database: %v", err)
 	}
@@ -440,11 +434,10 @@ func TestMutationGuard_UpdatePKChange(t *testing.T) {
 	os.Remove(dbPath)
 	defer os.Remove(dbPath)
 
-	systemDB := createTestSystemDB(t)
-	defer systemDB.Close()
+	metaStore := createMutationGuardTestMetaStore(t, dbPath)
 
 	clock := hlc.NewClock(1)
-	mdb, err := NewMVCCDatabase(dbPath, 1, clock, systemDB)
+	mdb, err := NewMVCCDatabase(dbPath, 1, clock, metaStore)
 	if err != nil {
 		t.Fatalf("Failed to create MVCC database: %v", err)
 	}
@@ -546,11 +539,10 @@ func TestMutationGuard_StringPKWithSpecialChars(t *testing.T) {
 	os.Remove(dbPath)
 	defer os.Remove(dbPath)
 
-	systemDB := createTestSystemDB(t)
-	defer systemDB.Close()
+	metaStore := createMutationGuardTestMetaStore(t, dbPath)
 
 	clock := hlc.NewClock(1)
-	mdb, err := NewMVCCDatabase(dbPath, 1, clock, systemDB)
+	mdb, err := NewMVCCDatabase(dbPath, 1, clock, metaStore)
 	if err != nil {
 		t.Fatalf("Failed to create MVCC database: %v", err)
 	}
@@ -621,11 +613,10 @@ func TestMutationGuard_ASTHookCompatibility(t *testing.T) {
 	os.Remove(dbPath)
 	defer os.Remove(dbPath)
 
-	systemDB := createTestSystemDB(t)
-	defer systemDB.Close()
+	metaStore := createMutationGuardTestMetaStore(t, dbPath)
 
 	clock := hlc.NewClock(1)
-	mdb, err := NewMVCCDatabase(dbPath, 1, clock, systemDB)
+	mdb, err := NewMVCCDatabase(dbPath, 1, clock, metaStore)
 	if err != nil {
 		t.Fatalf("Failed to create MVCC database: %v", err)
 	}
@@ -702,11 +693,10 @@ func TestMutationGuard_CompositeKeyCompatibility(t *testing.T) {
 	os.Remove(dbPath)
 	defer os.Remove(dbPath)
 
-	systemDB := createTestSystemDB(t)
-	defer systemDB.Close()
+	metaStore := createMutationGuardTestMetaStore(t, dbPath)
 
 	clock := hlc.NewClock(1)
-	mdb, err := NewMVCCDatabase(dbPath, 1, clock, systemDB)
+	mdb, err := NewMVCCDatabase(dbPath, 1, clock, metaStore)
 	if err != nil {
 		t.Fatalf("Failed to create MVCC database: %v", err)
 	}
@@ -783,11 +773,10 @@ func TestMutationGuard_MaxRowsLimit(t *testing.T) {
 	os.Remove(dbPath)
 	defer os.Remove(dbPath)
 
-	systemDB := createTestSystemDB(t)
-	defer systemDB.Close()
+	metaStore := createMutationGuardTestMetaStore(t, dbPath)
 
 	clock := hlc.NewClock(1)
-	mdb, err := NewMVCCDatabase(dbPath, 1, clock, systemDB)
+	mdb, err := NewMVCCDatabase(dbPath, 1, clock, metaStore)
 	if err != nil {
 		t.Fatalf("Failed to create MVCC database: %v", err)
 	}
@@ -853,11 +842,10 @@ func TestAutoIncrementRowID(t *testing.T) {
 	os.Remove(dbPath)
 	defer os.Remove(dbPath)
 
-	systemDB := createTestSystemDB(t)
-	defer systemDB.Close()
+	metaStore := createMutationGuardTestMetaStore(t, dbPath)
 
 	clock := hlc.NewClock(1)
-	mdb, err := NewMVCCDatabase(dbPath, 1, clock, systemDB)
+	mdb, err := NewMVCCDatabase(dbPath, 1, clock, metaStore)
 	if err != nil {
 		t.Fatalf("Failed to create MVCC database: %v", err)
 	}
@@ -959,11 +947,10 @@ func TestRowIDWithoutExplicitPK(t *testing.T) {
 	os.Remove(dbPath)
 	defer os.Remove(dbPath)
 
-	systemDB := createTestSystemDB(t)
-	defer systemDB.Close()
+	metaStore := createMutationGuardTestMetaStore(t, dbPath)
 
 	clock := hlc.NewClock(1)
-	mdb, err := NewMVCCDatabase(dbPath, 1, clock, systemDB)
+	mdb, err := NewMVCCDatabase(dbPath, 1, clock, metaStore)
 	if err != nil {
 		t.Fatalf("Failed to create MVCC database: %v", err)
 	}
@@ -1028,11 +1015,10 @@ func TestRowIDConflictDetection(t *testing.T) {
 	os.Remove(dbPath)
 	defer os.Remove(dbPath)
 
-	systemDB := createTestSystemDB(t)
-	defer systemDB.Close()
+	metaStore := createMutationGuardTestMetaStore(t, dbPath)
 
 	clock := hlc.NewClock(1)
-	mdb, err := NewMVCCDatabase(dbPath, 1, clock, systemDB)
+	mdb, err := NewMVCCDatabase(dbPath, 1, clock, metaStore)
 	if err != nil {
 		t.Fatalf("Failed to create MVCC database: %v", err)
 	}

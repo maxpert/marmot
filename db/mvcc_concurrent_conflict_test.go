@@ -15,13 +15,12 @@ import (
 // TestConcurrentWriteIntentConflicts tests that multiple concurrent writes to the same row
 // result in exactly one success and all others get write-write conflicts
 func TestConcurrentWriteIntentConflicts(t *testing.T) {
-	db := setupTestDB(t)
-	defer db.Close()
+	testDB := setupTestDBWithMeta(t)
 
 	clock := hlc.NewClock(1)
-	tm := NewMVCCTransactionManager(db, clock)
+	tm := NewMVCCTransactionManager(testDB.DB, testDB.MetaStore, clock)
 
-	createUserTable(t, db)
+	createUserTable(t, testDB.DB)
 
 	const workers = 20
 	startBarrier := make(chan struct{})
@@ -102,17 +101,16 @@ func TestConcurrentWriteIntentConflicts(t *testing.T) {
 
 // TestHighContentionHotspot tests multiple workers hitting a small number of hot rows
 func TestHighContentionHotspot(t *testing.T) {
-	db := setupTestDB(t)
-	defer db.Close()
+	testDB := setupTestDBWithMeta(t)
 
 	clock := hlc.NewClock(1)
-	tm := NewMVCCTransactionManager(db, clock)
+	tm := NewMVCCTransactionManager(testDB.DB, testDB.MetaStore, clock)
 
-	createUserTable(t, db)
+	createUserTable(t, testDB.DB)
 
 	// Insert hot rows
 	for i := 1; i <= 5; i++ {
-		_, err := db.Exec("INSERT INTO users (id, name, balance) VALUES (?, ?, ?)",
+		_, err := testDB.DB.Exec("INSERT INTO users (id, name, balance) VALUES (?, ?, ?)",
 			i, fmt.Sprintf("User%d", i), 100)
 		assertNoError(t, err, "Failed to insert test data")
 	}
@@ -207,17 +205,16 @@ func TestHighContentionHotspot(t *testing.T) {
 
 // TestSerializableSnapshotIsolation tests that non-conflicting concurrent transactions succeed
 func TestSerializableSnapshotIsolation(t *testing.T) {
-	db := setupTestDB(t)
-	defer db.Close()
+	testDB := setupTestDBWithMeta(t)
 
 	clock := hlc.NewClock(1)
-	tm := NewMVCCTransactionManager(db, clock)
+	tm := NewMVCCTransactionManager(testDB.DB, testDB.MetaStore, clock)
 
-	createUserTable(t, db)
+	createUserTable(t, testDB.DB)
 
 	// Insert initial data
-	db.Exec("INSERT INTO users (id, name, balance) VALUES (1, 'Alice', 100)")
-	db.Exec("INSERT INTO users (id, name, balance) VALUES (2, 'Bob', 100)")
+	testDB.DB.Exec("INSERT INTO users (id, name, balance) VALUES (1, 'Alice', 100)")
+	testDB.DB.Exec("INSERT INTO users (id, name, balance) VALUES (2, 'Bob', 100)")
 
 	var wg sync.WaitGroup
 	results := make(chan error, 2)
@@ -311,13 +308,12 @@ func TestSerializableSnapshotIsolation(t *testing.T) {
 
 // TestWriteIntentLifecycle tests the full lifecycle of a write intent
 func TestWriteIntentLifecycle(t *testing.T) {
-	db := setupTestDB(t)
-	defer db.Close()
+	testDB := setupTestDBWithMeta(t)
 
 	clock := hlc.NewClock(1)
-	tm := NewMVCCTransactionManager(db, clock)
+	tm := NewMVCCTransactionManager(testDB.DB, testDB.MetaStore, clock)
 
-	createUserTable(t, db)
+	createUserTable(t, testDB.DB)
 
 	// Begin transaction
 	txn, err := tm.BeginTransaction(1)
@@ -338,17 +334,15 @@ func TestWriteIntentLifecycle(t *testing.T) {
 
 	t.Log("✓ Write intent created")
 
-	// Verify intent exists in database
-	var count int
-	err = db.QueryRow("SELECT COUNT(*) FROM __marmot__write_intents WHERE txn_id = ? AND table_name = ? AND row_key = ?",
-		txn.ID, "users", "1").Scan(&count)
+	// Verify intent exists in MetaStore
+	intent, err := testDB.MetaStore.GetIntent("users", "1")
 	assertNoError(t, err, "Failed to query write intents")
 
-	if count != 1 {
-		t.Fatalf("Expected 1 write intent, found %d", count)
+	if intent == nil || intent.TxnID != txn.ID {
+		t.Fatalf("Expected write intent for txn %d, found %v", txn.ID, intent)
 	}
 
-	t.Log("✓ Write intent persisted in __marmot__write_intents")
+	t.Log("✓ Write intent persisted in MetaStore")
 
 	// Commit transaction
 	err = tm.CommitTransaction(txn)
@@ -359,32 +353,31 @@ func TestWriteIntentLifecycle(t *testing.T) {
 	// Wait for async finalization
 	time.Sleep(100 * time.Millisecond)
 
-	// Verify intent is cleaned up
-	verifyWriteIntentsCleared(t, db, txn.ID)
+	// Verify intent is cleaned up in MetaStore
+	verifyWriteIntentsClearedMeta(t, testDB.MetaStore, txn.ID)
 	t.Log("✓ Write intent cleaned up")
 
-	// Verify MVCC version was created
-	versionCount := countMVCCVersions(t, db, "users", "1")
+	// Verify MVCC version was created in MetaStore
+	versionCount := countMVCCVersionsMeta(t, testDB.MetaStore, "users", "1")
 	if versionCount != 1 {
 		t.Errorf("Expected 1 MVCC version, found %d", versionCount)
 	}
 
 	t.Log("✓ MVCC version created")
 
-	// Verify transaction status is COMMITTED
-	verifyTransactionStatus(t, db, txn.ID, TxnStatusCommitted)
+	// Verify transaction status is COMMITTED in MetaStore
+	verifyTransactionStatusMeta(t, testDB.MetaStore, txn.ID, TxnStatusCommitted)
 	t.Log("✓ Transaction status is COMMITTED")
 }
 
 // TestTransactionAbortCleanup tests that aborted transactions clean up properly
 func TestTransactionAbortCleanup(t *testing.T) {
-	db := setupTestDB(t)
-	defer db.Close()
+	testDB := setupTestDBWithMeta(t)
 
 	clock := hlc.NewClock(1)
-	tm := NewMVCCTransactionManager(db, clock)
+	tm := NewMVCCTransactionManager(testDB.DB, testDB.MetaStore, clock)
 
-	createUserTable(t, db)
+	createUserTable(t, testDB.DB)
 
 	// Begin transaction
 	txn, err := tm.BeginTransaction(1)
@@ -403,11 +396,10 @@ func TestTransactionAbortCleanup(t *testing.T) {
 	err = tm.WriteIntent(txn, "users", "1", stmt, dataBytes)
 	assertNoError(t, err, "WriteIntent failed")
 
-	// Verify intent exists
-	var intentCount int
-	db.QueryRow("SELECT COUNT(*) FROM __marmot__write_intents WHERE txn_id = ?", txn.ID).Scan(&intentCount)
-	if intentCount != 1 {
-		t.Fatalf("Expected 1 write intent before abort, found %d", intentCount)
+	// Verify intent exists in MetaStore
+	intents, _ := testDB.MetaStore.GetIntentsByTxn(txn.ID)
+	if len(intents) != 1 {
+		t.Fatalf("Expected 1 write intent before abort, found %d", len(intents))
 	}
 
 	t.Log("✓ Write intent created")
@@ -421,20 +413,20 @@ func TestTransactionAbortCleanup(t *testing.T) {
 	// Wait for cleanup
 	time.Sleep(50 * time.Millisecond)
 
-	// Verify write intents are cleaned up
-	verifyWriteIntentsCleared(t, db, txn.ID)
+	// Verify write intents are cleaned up in MetaStore
+	verifyWriteIntentsClearedMeta(t, testDB.MetaStore, txn.ID)
 	t.Log("✓ Write intents cleaned up")
 
-	// Verify no MVCC version was created
-	versionCount := countMVCCVersions(t, db, "users", "1")
+	// Verify no MVCC version was created in MetaStore
+	versionCount := countMVCCVersionsMeta(t, testDB.MetaStore, "users", "1")
 	if versionCount != 0 {
 		t.Errorf("Expected 0 MVCC versions after abort, found %d", versionCount)
 	}
 
 	t.Log("✓ No MVCC version created (correct for aborted transaction)")
 
-	// Verify transaction status is ABORTED
-	verifyTransactionStatus(t, db, txn.ID, TxnStatusAborted)
+	// Verify transaction status is ABORTED in MetaStore
+	verifyTransactionStatusMeta(t, testDB.MetaStore, txn.ID, TxnStatusAborted)
 	t.Log("✓ Transaction status is ABORTED")
 }
 

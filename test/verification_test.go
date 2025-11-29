@@ -29,6 +29,10 @@ func (m *MockNodeProvider) GetClusterSize() int {
 	return len(m.nodes)
 }
 
+func (m *MockNodeProvider) GetTotalMembershipSize() int {
+	return len(m.nodes)
+}
+
 // MockReplicator implements coordinator.Replicator
 type MockReplicator struct{}
 
@@ -75,14 +79,18 @@ func (tdm *TestDatabaseManager) GetMVCCDatabase(name string) (coordinator.MVCCDa
 }
 
 func TestMySQLServerIntegration(t *testing.T) {
-	// Setup temporary DB
-	dbPath := "file::memory:?cache=shared"
-	// os.Remove(dbPath) // Not needed for memory
-	// defer os.Remove(dbPath)
-	// defer os.Remove(dbPath)
+	// Setup temporary DB with MetaStore
+	tmpDir := t.TempDir()
+	dbPath := tmpDir + "/test.db"
+	metaPath := tmpDir + "/test_meta.db"
+
+	// Create MetaStore
+	metaStore, err := db.NewSQLiteMetaStore(metaPath, 5000)
+	require.NoError(t, err)
+	defer metaStore.Close()
 
 	clock := hlc.NewClock(1)
-	mvccDB, err := db.NewMVCCDatabase(dbPath, 1, clock, nil)
+	mvccDB, err := db.NewMVCCDatabase(dbPath, 1, clock, metaStore)
 	require.NoError(t, err)
 	defer mvccDB.Close()
 

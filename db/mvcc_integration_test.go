@@ -12,40 +12,38 @@ import (
 	"github.com/maxpert/marmot/protocol"
 )
 
-// TestMVCCSchemaCreation tests that MVCC schema is created properly
+// TestMVCCSchemaCreation tests that MVCC schema is created properly in MetaStore
 func TestMVCCSchemaCreation(t *testing.T) {
-	db := setupTestDB(t)
-	defer db.Close()
+	testDB := setupTestDBWithMeta(t)
 
-	// Verify transaction records table
+	// Verify transaction records table in meta store
 	var count int
-	err := db.QueryRow("SELECT COUNT(*) FROM __marmot__txn_records").Scan(&count)
+	err := testDB.MetaStore.ReadDB().QueryRow("SELECT COUNT(*) FROM __marmot__txn_records").Scan(&count)
 	if err != nil {
 		t.Fatalf("Transaction records table not created: %v", err)
 	}
 
-	// Verify write intents table
-	err = db.QueryRow("SELECT COUNT(*) FROM __marmot__write_intents").Scan(&count)
+	// Verify write intents table in meta store
+	err = testDB.MetaStore.ReadDB().QueryRow("SELECT COUNT(*) FROM __marmot__write_intents").Scan(&count)
 	if err != nil {
 		t.Fatalf("Write intents table not created: %v", err)
 	}
 
-	// Verify MVCC versions table
-	err = db.QueryRow("SELECT COUNT(*) FROM __marmot__mvcc_versions").Scan(&count)
+	// Verify MVCC versions table in meta store
+	err = testDB.MetaStore.ReadDB().QueryRow("SELECT COUNT(*) FROM __marmot__mvcc_versions").Scan(&count)
 	if err != nil {
 		t.Fatalf("MVCC versions table not created: %v", err)
 	}
 
-	t.Log("✓ All MVCC tables created successfully")
+	t.Log("✓ All MVCC tables created successfully in MetaStore")
 }
 
 // TestUserTableTransparency tests that user tables are stored transparently
 func TestUserTableTransparency(t *testing.T) {
-	db := setupTestDB(t)
-	defer db.Close()
+	testDB := setupTestDBWithMeta(t)
 
 	// Create a normal user table
-	_, err := db.Exec(`
+	_, err := testDB.DB.Exec(`
 		CREATE TABLE users (
 			id INTEGER PRIMARY KEY,
 			name TEXT NOT NULL,
@@ -58,7 +56,7 @@ func TestUserTableTransparency(t *testing.T) {
 	}
 
 	// Insert data directly (bypassing MVCC for now - just testing transparency)
-	_, err = db.Exec("INSERT INTO users (id, name, email, balance) VALUES (?, ?, ?, ?)",
+	_, err = testDB.DB.Exec("INSERT INTO users (id, name, email, balance) VALUES (?, ?, ?, ?)",
 		1, "Alice", "alice@example.com", 100)
 	if err != nil {
 		t.Fatalf("Failed to insert data: %v", err)
@@ -68,7 +66,7 @@ func TestUserTableTransparency(t *testing.T) {
 	var id int
 	var name, email string
 	var balance int
-	err = db.QueryRow("SELECT id, name, email, balance FROM users WHERE id = ?", 1).
+	err = testDB.DB.QueryRow("SELECT id, name, email, balance FROM users WHERE id = ?", 1).
 		Scan(&id, &name, &email, &balance)
 	if err != nil {
 		t.Fatalf("Failed to read data: %v", err)
@@ -85,14 +83,13 @@ func TestUserTableTransparency(t *testing.T) {
 
 // TestTransactionLifecycle tests complete transaction lifecycle
 func TestTransactionLifecycle(t *testing.T) {
-	db := setupTestDB(t)
-	defer db.Close()
+	testDB := setupTestDBWithMeta(t)
 
 	clock := hlc.NewClock(1)
-	tm := NewMVCCTransactionManager(db, clock)
+	tm := NewMVCCTransactionManager(testDB.DB, testDB.MetaStore, clock)
 
 	// Create user table
-	createUserTable(t, db)
+	createUserTable(t, testDB.DB)
 
 	// Begin transaction
 	txn, err := tm.BeginTransaction(1)
@@ -135,30 +132,20 @@ func TestTransactionLifecycle(t *testing.T) {
 	// Wait for async cleanup
 	time.Sleep(100 * time.Millisecond)
 
-	// Verify transaction record
-	var status string
-	err = db.QueryRow("SELECT status FROM __marmot__txn_records WHERE txn_id = ?", txn.ID).
-		Scan(&status)
-	if err != nil {
-		t.Fatalf("Failed to read transaction record: %v", err)
-	}
-
-	if status != TxnStatusCommitted {
-		t.Errorf("Transaction record status = %s, want COMMITTED", status)
-	}
+	// Verify transaction record in MetaStore
+	verifyTransactionStatusMeta(t, testDB.MetaStore, txn.ID, TxnStatusCommitted)
 
 	t.Logf("✓ Transaction record persisted with status COMMITTED")
 }
 
 // TestWriteIntentCreation tests write intent creation and locking
 func TestWriteIntentCreation(t *testing.T) {
-	db := setupTestDB(t)
-	defer db.Close()
+	testDB := setupTestDBWithMeta(t)
 
 	clock := hlc.NewClock(1)
-	tm := NewMVCCTransactionManager(db, clock)
+	tm := NewMVCCTransactionManager(testDB.DB, testDB.MetaStore, clock)
 
-	createUserTable(t, db)
+	createUserTable(t, testDB.DB)
 
 	// Begin transaction
 	txn, err := tm.BeginTransaction(1)
@@ -187,19 +174,17 @@ func TestWriteIntentCreation(t *testing.T) {
 
 	t.Logf("✓ Write intent created for users:1")
 
-	// Verify intent exists in database
-	var intentTxnID uint64
-	err = db.QueryRow("SELECT txn_id FROM __marmot__write_intents WHERE table_name = ? AND row_key = ?",
-		"users", "1").Scan(&intentTxnID)
+	// Verify intent exists in MetaStore
+	intent, err := testDB.MetaStore.GetIntent("users", "1")
 	if err != nil {
 		t.Fatalf("Failed to read write intent: %v", err)
 	}
 
-	if intentTxnID != txn.ID {
-		t.Errorf("Intent txn_id = %d, want %d", intentTxnID, txn.ID)
+	if intent.TxnID != txn.ID {
+		t.Errorf("Intent txn_id = %d, want %d", intent.TxnID, txn.ID)
 	}
 
-	t.Logf("✓ Write intent persisted in __marmot__write_intents")
+	t.Logf("✓ Write intent persisted in MetaStore")
 
 	// Cleanup
 	tm.AbortTransaction(txn)
@@ -207,13 +192,12 @@ func TestWriteIntentCreation(t *testing.T) {
 
 // TestWriteWriteConflictDetection tests that write-write conflicts are detected
 func TestWriteWriteConflictDetection(t *testing.T) {
-	db := setupTestDB(t)
-	defer db.Close()
+	testDB := setupTestDBWithMeta(t)
 
 	clock := hlc.NewClock(1)
-	tm := NewMVCCTransactionManager(db, clock)
+	tm := NewMVCCTransactionManager(testDB.DB, testDB.MetaStore, clock)
 
-	createUserTable(t, db)
+	createUserTable(t, testDB.DB)
 
 	// Transaction 1: Create write intent for users:1
 	txn1, err := tm.BeginTransaction(1)
@@ -269,13 +253,12 @@ func TestWriteWriteConflictDetection(t *testing.T) {
 
 // TestConcurrentTransactionsOnDifferentRows tests MVCC isolation
 func TestConcurrentTransactionsOnDifferentRows(t *testing.T) {
-	db := setupTestDB(t)
-	defer db.Close()
+	testDB := setupTestDBWithMeta(t)
 
 	clock := hlc.NewClock(1)
-	tm := NewMVCCTransactionManager(db, clock)
+	tm := NewMVCCTransactionManager(testDB.DB, testDB.MetaStore, clock)
 
-	createUserTable(t, db)
+	createUserTable(t, testDB.DB)
 
 	var wg sync.WaitGroup
 	errors := make(chan error, 2)
@@ -363,13 +346,12 @@ func TestConcurrentTransactionsOnDifferentRows(t *testing.T) {
 
 // TestTransactionAbort tests transaction abort and cleanup
 func TestTransactionAbort(t *testing.T) {
-	db := setupTestDB(t)
-	defer db.Close()
+	testDB := setupTestDBWithMeta(t)
 
 	clock := hlc.NewClock(1)
-	tm := NewMVCCTransactionManager(db, clock)
+	tm := NewMVCCTransactionManager(testDB.DB, testDB.MetaStore, clock)
 
-	createUserTable(t, db)
+	createUserTable(t, testDB.DB)
 
 	// Begin transaction
 	txn, err := tm.BeginTransaction(1)
@@ -406,44 +388,31 @@ func TestTransactionAbort(t *testing.T) {
 
 	t.Logf("✓ Transaction %d aborted", txn.ID)
 
-	// Verify write intent is cleaned up
-	var count int
-	err = db.QueryRow("SELECT COUNT(*) FROM __marmot__write_intents WHERE txn_id = ?", txn.ID).
-		Scan(&count)
-	if err != nil {
-		t.Fatalf("Failed to query write intents: %v", err)
-	}
-
-	if count != 0 {
-		t.Errorf("Write intents not cleaned up: found %d intents after abort", count)
-	}
+	// Verify write intent is cleaned up in MetaStore
+	verifyWriteIntentsClearedMeta(t, testDB.MetaStore, txn.ID)
 
 	t.Logf("✓ Write intents cleaned up after abort")
 
 	// Verify transaction record is deleted (aborted transactions are fully cleaned up)
-	var txnCount int
-	err = db.QueryRow("SELECT COUNT(*) FROM __marmot__txn_records WHERE txn_id = ?", txn.ID).
-		Scan(&txnCount)
-	if err != nil {
-		t.Fatalf("Failed to query transaction record: %v", err)
-	}
-
-	if txnCount != 0 {
-		t.Errorf("Transaction record not deleted: found %d records after abort", txnCount)
-	}
+	verifyTransactionStatusMeta(t, testDB.MetaStore, txn.ID, TxnStatusAborted)
 
 	t.Logf("✓ Transaction record deleted after abort")
 }
 
 // TestExternalSQLiteReadability tests that external tools can read the DB
 func TestExternalSQLiteReadability(t *testing.T) {
-	dbPath := setupTestDBPath(t)
-	db := openTestDB(t, dbPath)
-	defer db.Close()
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "test.db")
+
+	// Open user DB directly (no MVCC schema needed in user DB)
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
 
 	// Create user table and insert data
 	createUserTable(t, db)
-	_, err := db.Exec("INSERT INTO users (id, name, email, balance) VALUES (?, ?, ?, ?)",
+	_, err = db.Exec("INSERT INTO users (id, name, email, balance) VALUES (?, ?, ?, ?)",
 		1, "Alice", "alice@example.com", 100)
 	if err != nil {
 		t.Fatalf("Failed to insert data: %v", err)
@@ -506,47 +475,12 @@ func TestExternalSQLiteReadability(t *testing.T) {
 			users[1].name, users[1].balance)
 	}
 
-	t.Log("✓ External SQLite tool can read user data transparently")
+	t.Log("✓ External SQLite tool can read user data transparently (no MVCC tables in user DB)")
 	t.Logf("  - User 1: %s (balance: %d)", users[0].name, users[0].balance)
 	t.Logf("  - User 2: %s (balance: %d)", users[1].name, users[1].balance)
 }
 
 // Helper functions
-
-func setupTestDBPath(t *testing.T) string {
-	tmpDir := t.TempDir()
-	return filepath.Join(tmpDir, "test.db")
-}
-
-func openTestDB(t *testing.T, dbPath string) *sql.DB {
-	db, err := sql.Open("sqlite3", dbPath)
-	if err != nil {
-		t.Fatalf("Failed to open database: %v", err)
-	}
-
-	// Create MVCC schema
-	if _, err := db.Exec(CreateTransactionRecordsTable); err != nil {
-		t.Fatalf("Failed to create transaction records table: %v", err)
-	}
-
-	if _, err := db.Exec(CreateWriteIntentsTable); err != nil {
-		t.Fatalf("Failed to create write intents table: %v", err)
-	}
-
-	if _, err := db.Exec(CreateMVCCVersionsTable); err != nil {
-		t.Fatalf("Failed to create MVCC versions table: %v", err)
-	}
-
-	if _, err := db.Exec(CreateMetadataTable); err != nil {
-		t.Fatalf("Failed to create metadata table: %v", err)
-	}
-
-	return db
-}
-
-func setupTestDB(t *testing.T) *sql.DB {
-	return openTestDB(t, setupTestDBPath(t))
-}
 
 func createUserTable(t *testing.T, db *sql.DB) {
 	_, err := db.Exec(`

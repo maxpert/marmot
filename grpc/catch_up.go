@@ -78,7 +78,11 @@ func isValidSnapshotPath(path string) bool {
 	if path == "__marmot_system.db" {
 		return true
 	}
-	// User databases in databases/ subdirectory
+	// System meta database at root
+	if path == "__marmot_system_meta.db" {
+		return true
+	}
+	// User databases and meta databases in databases/ subdirectory
 	if strings.HasPrefix(path, "databases"+string(filepath.Separator)) && strings.HasSuffix(path, ".db") {
 		// Ensure no additional directory traversal within databases/
 		relPath := strings.TrimPrefix(path, "databases"+string(filepath.Separator))

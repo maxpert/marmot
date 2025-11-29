@@ -25,16 +25,17 @@ var _ coordinator.PendingExecution = (*PendingLocalExecution)(nil)
 // We maintain separate connection pools:
 // - writeDB: Single connection for all writes (SQLite limitation)
 // - readDB: Multiple connections for concurrent reads (pool_size from config)
+// - metaStore: Separate MetaStore for transaction metadata (separate file)
 type MVCCDatabase struct {
-	writeDB       *sql.DB // Write connection (pool size=1, _txlock=immediate)
-	readDB        *sql.DB // Read connection pool (pool size from config)
+	writeDB       *sql.DB   // Write connection (pool size=1, _txlock=immediate)
+	readDB        *sql.DB   // Read connection pool (pool size from config)
+	metaStore     MetaStore // Separate metadata storage (transaction records, intents, etc.)
 	txnMgr        *MVCCTransactionManager
 	clock         *hlc.Clock
 	nodeID        uint64
 	replicationFn ReplicationFunc
 	commitBatcher *CommitBatcher
 	schemaCache   *SchemaCache // Shared schema cache for preupdate hooks
-	systemDB      *sql.DB      // System DB for intent entries (separate file)
 }
 
 // ReplicationFunc is called to replicate transactions to other nodes
@@ -42,8 +43,8 @@ type MVCCDatabase struct {
 type ReplicationFunc func(ctx context.Context, txn *MVCCTransaction) error
 
 // NewMVCCDatabase creates a new MVCC-enabled database
-// systemDB is the system database (*sql.DB) for storing intent entries during hooks
-func NewMVCCDatabase(dbPath string, nodeID uint64, clock *hlc.Clock, systemDB *sql.DB) (*MVCCDatabase, error) {
+// metaStore is the MetaStore for storing transaction metadata (intent entries, txn records, etc.)
+func NewMVCCDatabase(dbPath string, nodeID uint64, clock *hlc.Clock, metaStore MetaStore) (*MVCCDatabase, error) {
 	// Get timeout from config (LockWaitTimeoutSeconds is in seconds, SQLite needs milliseconds)
 	busyTimeoutMS := cfg.Config.MVCC.LockWaitTimeoutSeconds * 1000
 	poolCfg := cfg.Config.ConnectionPool
@@ -150,8 +151,8 @@ func NewMVCCDatabase(dbPath string, nodeID uint64, clock *hlc.Clock, systemDB *s
 		return nil, fmt.Errorf("failed to initialize MVCC schema: %w", err)
 	}
 
-	// Create transaction manager (uses write connection)
-	txnMgr := NewMVCCTransactionManager(writeDB, clock)
+	// Create transaction manager (uses write connection + MetaStore)
+	txnMgr := NewMVCCTransactionManager(writeDB, metaStore, clock)
 
 	// Create commit batcher for SQLite-level batching (uses write connection)
 	commitBatcher := NewCommitBatcher(writeDB, 20, 2*time.Millisecond)
@@ -160,12 +161,12 @@ func NewMVCCDatabase(dbPath string, nodeID uint64, clock *hlc.Clock, systemDB *s
 	return &MVCCDatabase{
 		writeDB:       writeDB,
 		readDB:        readDB,
+		metaStore:     metaStore,
 		txnMgr:        txnMgr,
 		clock:         clock,
 		nodeID:        nodeID,
 		commitBatcher: commitBatcher,
 		schemaCache:   NewSchemaCache(),
-		systemDB:      systemDB,
 	}, nil
 }
 
@@ -200,19 +201,36 @@ func (mdb *MVCCDatabase) GetClock() *hlc.Clock {
 	return mdb.clock
 }
 
-// Close closes both read and write database connections
+// Close closes the database connections, MetaStore, and stops GC.
+// Order is important: stop GC first, then close connections.
 func (mdb *MVCCDatabase) Close() error {
-	var writeErr, readErr error
+	// Stop GC goroutine first to prevent it from accessing closed connections
+	if mdb.txnMgr != nil {
+		mdb.txnMgr.StopGarbageCollection()
+	}
+
+	var errs []error
+
 	if mdb.writeDB != nil {
-		writeErr = mdb.writeDB.Close()
+		if err := mdb.writeDB.Close(); err != nil {
+			errs = append(errs, err)
+		}
 	}
 	if mdb.readDB != nil {
-		readErr = mdb.readDB.Close()
+		if err := mdb.readDB.Close(); err != nil {
+			errs = append(errs, err)
+		}
 	}
-	if writeErr != nil {
-		return writeErr
+	if mdb.metaStore != nil {
+		if err := mdb.metaStore.Close(); err != nil {
+			errs = append(errs, err)
+		}
 	}
-	return readErr
+
+	if len(errs) > 0 {
+		return errs[0]
+	}
+	return nil
 }
 
 // GetSchemaCache returns the shared schema cache for preupdate hooks
@@ -220,9 +238,9 @@ func (mdb *MVCCDatabase) GetSchemaCache() *SchemaCache {
 	return mdb.schemaCache
 }
 
-// GetSystemDB returns the system database for intent entries
-func (mdb *MVCCDatabase) GetSystemDB() *sql.DB {
-	return mdb.systemDB
+// GetMetaStore returns the MetaStore for transaction metadata
+func (mdb *MVCCDatabase) GetMetaStore() MetaStore {
+	return mdb.metaStore
 }
 
 // PendingLocalExecution represents a locally executed transaction waiting for quorum
@@ -318,7 +336,7 @@ func (mdb *MVCCDatabase) ExecuteLocalWithHooks(ctx context.Context, txnID uint64
 	}
 
 	// Create ephemeral session with dedicated write connection
-	session, err := StartEphemeralSession(ctx, mdb.writeDB, mdb.systemDB, mdb.schemaCache, txnID, tables)
+	session, err := StartEphemeralSession(ctx, mdb.writeDB, mdb.metaStore, mdb.schemaCache, txnID, tables)
 	if err != nil {
 		return nil, fmt.Errorf("failed to start session: %w", err)
 	}

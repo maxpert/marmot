@@ -11,7 +11,6 @@ import (
 	"io"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/mattn/go-sqlite3"
 	"github.com/maxpert/marmot/protocol/filter"
@@ -120,11 +119,11 @@ func loadSchema(conn *sqlite3.SQLiteConn, tableName string) (*tableSchema, error
 
 // EphemeralHookSession represents a CDC capture session with its own dedicated connection.
 // The connection is held open for the duration of the session and closed on Commit/Rollback.
-// CDC entries are stored in the system database's __marmot__intent_entries table.
+// CDC entries are stored in the per-database MetaStore's __marmot__intent_entries table.
 type EphemeralHookSession struct {
 	conn        *sql.Conn                           // Dedicated user DB connection (closed on end)
 	tx          *sql.Tx                             // Active transaction on user DB
-	systemDB    *sql.DB                             // System DB for intent entry storage
+	metaStore   MetaStore                           // MetaStore for intent entry storage
 	txnID       uint64                              // Transaction ID for intent entries
 	seq         uint64                              // Sequence counter for entries
 	collectors  map[string]*filter.KeyHashCollector // table -> key hash collector
@@ -134,8 +133,8 @@ type EphemeralHookSession struct {
 
 // StartEphemeralSession creates a new CDC capture session with a dedicated connection.
 // The session owns the connection and will close it when done.
-// CDC entries are written to the system database (separate file) during hooks.
-func StartEphemeralSession(ctx context.Context, userDB *sql.DB, systemDB *sql.DB, schemaCache *SchemaCache, txnID uint64, tables []string) (*EphemeralHookSession, error) {
+// CDC entries are written to the per-database MetaStore during hooks.
+func StartEphemeralSession(ctx context.Context, userDB *sql.DB, metaStore MetaStore, schemaCache *SchemaCache, txnID uint64, tables []string) (*EphemeralHookSession, error) {
 	// Get a dedicated connection for this session
 	conn, err := userDB.Conn(ctx)
 	if err != nil {
@@ -144,7 +143,7 @@ func StartEphemeralSession(ctx context.Context, userDB *sql.DB, systemDB *sql.DB
 
 	session := &EphemeralHookSession{
 		conn:        conn,
-		systemDB:    systemDB,
+		metaStore:   metaStore,
 		txnID:       txnID,
 		seq:         0,
 		collectors:  make(map[string]*filter.KeyHashCollector),
@@ -213,8 +212,8 @@ func (s *EphemeralHookSession) Commit() error {
 	// Unregister hook and close connection
 	s.cleanup()
 
-	// Delete intent entries from system DB (fast indexed delete)
-	s.systemDB.Exec("DELETE FROM __marmot__intent_entries WHERE txn_id = ?", s.txnID)
+	// Delete intent entries from MetaStore (fast indexed delete)
+	s.metaStore.DeleteIntentEntries(s.txnID)
 
 	return txErr
 }
@@ -232,8 +231,8 @@ func (s *EphemeralHookSession) Rollback() error {
 	// Unregister hook and close connection
 	s.cleanup()
 
-	// Delete intent entries from system DB
-	s.systemDB.Exec("DELETE FROM __marmot__intent_entries WHERE txn_id = ?", s.txnID)
+	// Delete intent entries from MetaStore
+	s.metaStore.DeleteIntentEntries(s.txnID)
 
 	return txErr
 }
@@ -360,12 +359,8 @@ func (s *EphemeralHookSession) hookCallback(data sqlite3.SQLitePreUpdateData) {
 	// Increment sequence
 	s.seq++
 
-	// Write to system DB (separate database file, so this is safe during hook)
-	s.systemDB.Exec(`
-		INSERT INTO __marmot__intent_entries
-		(txn_id, seq, operation, table_name, row_key, old_values, new_values, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-	`, s.txnID, s.seq, operation, data.TableName, rowKey, oldMsgpack, newMsgpack, time.Now().UnixNano())
+	// Write to MetaStore (separate database file, so this is safe during hook)
+	s.metaStore.WriteIntentEntry(s.txnID, s.seq, operation, data.TableName, rowKey, oldMsgpack, newMsgpack)
 }
 
 // buildValueMap converts column values to a map
@@ -396,13 +391,16 @@ func (s *EphemeralHookSession) serializeValue(v interface{}) []byte {
 	return data
 }
 
-// extractPKValuesFromDest extracts primary key values from a destination slice
+// extractPKValuesFromDest extracts primary key values from a destination slice.
+// PK values are converted to string representation for row key generation,
+// ensuring compatibility with AST-based path which uses string values.
 func (s *EphemeralHookSession) extractPKValuesFromDest(schema *tableSchema, dest []interface{}, rowID int64) map[string][]byte {
 	pkValues := make(map[string][]byte)
 
 	for i, idx := range schema.pkIndices {
 		colName := schema.pkColumns[i]
 		if idx == -1 {
+			// rowid case
 			pkValues[colName] = []byte(fmt.Sprintf("%d", rowID))
 		} else if idx < len(dest) {
 			val := dest[idx]
@@ -410,12 +408,35 @@ func (s *EphemeralHookSession) extractPKValuesFromDest(schema *tableSchema, dest
 				val = *ptr
 			}
 			if val != nil {
-				pkValues[colName] = s.serializeValue(val)
+				// Convert to string representation for row key compatibility
+				// This ensures hook and AST paths produce identical keys
+				pkValues[colName] = pkValueToBytes(val)
 			}
 		}
 	}
 
 	return pkValues
+}
+
+// pkValueToBytes converts a primary key value to its string byte representation.
+// Used for row key generation where values must match AST-based path format.
+func pkValueToBytes(v interface{}) []byte {
+	switch val := v.(type) {
+	case int64:
+		return []byte(fmt.Sprintf("%d", val))
+	case float64:
+		// Check if float is actually an integer
+		if val == float64(int64(val)) {
+			return []byte(fmt.Sprintf("%d", int64(val)))
+		}
+		return []byte(fmt.Sprintf("%v", val))
+	case string:
+		return []byte(val)
+	case []byte:
+		return val
+	default:
+		return []byte(fmt.Sprintf("%v", val))
+	}
 }
 
 // serializePK creates a deterministic string key from PK values
@@ -467,36 +488,9 @@ type IntentEntry struct {
 	CreatedAt int64
 }
 
-// GetIntentEntries reads all intent entries for this session from the system DB
+// GetIntentEntries reads all intent entries for this session from the MetaStore
 func (s *EphemeralHookSession) GetIntentEntries() ([]*IntentEntry, error) {
-	rows, err := s.systemDB.Query(`
-		SELECT txn_id, seq, operation, table_name, row_key, old_values, new_values, created_at
-		FROM __marmot__intent_entries
-		WHERE txn_id = ?
-		ORDER BY seq
-	`, s.txnID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var entries []*IntentEntry
-	for rows.Next() {
-		entry := &IntentEntry{}
-		var oldJSON, newJSON []byte
-		if err := rows.Scan(&entry.TxnID, &entry.Seq, &entry.Operation, &entry.Table,
-			&entry.RowKey, &oldJSON, &newJSON, &entry.CreatedAt); err != nil {
-			return nil, err
-		}
-		if oldJSON != nil {
-			msgpack.Unmarshal(oldJSON, &entry.OldValues)
-		}
-		if newJSON != nil {
-			msgpack.Unmarshal(newJSON, &entry.NewValues)
-		}
-		entries = append(entries, entry)
-	}
-	return entries, rows.Err()
+	return s.metaStore.GetIntentEntries(s.txnID)
 }
 
 // GetTxnID returns the transaction ID for this session

@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/maxpert/marmot/cfg"
 	"github.com/maxpert/marmot/coordinator"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/rs/zerolog/log"
@@ -79,11 +80,25 @@ func NewDatabaseManager(dataDir string, nodeID uint64, clock *hlc.Clock) (*Datab
 }
 
 // initSystemDatabase initializes the system database for metadata storage
+// System database has its own MetaStore for CREATE/DROP DATABASE 2PC tracking
 func (dm *DatabaseManager) initSystemDatabase() error {
 	systemDBPath := filepath.Join(dm.dataDir, SystemDatabaseName+".db")
 
-	systemDB, err := NewMVCCDatabase(systemDBPath, dm.nodeID, dm.clock, nil)
+	// Create MetaStore for system database (for CREATE/DROP DATABASE transactions)
+	metaPath := strings.TrimSuffix(systemDBPath, ".db") + "_meta.db"
+	busyTimeoutMS := 50000 // 50 seconds
+	if cfg.Config != nil {
+		busyTimeoutMS = cfg.Config.MVCC.LockWaitTimeoutSeconds * 1000
+	}
+
+	metaStore, err := NewSQLiteMetaStore(metaPath, busyTimeoutMS)
 	if err != nil {
+		return fmt.Errorf("failed to create system meta store: %w", err)
+	}
+
+	systemDB, err := NewMVCCDatabase(systemDBPath, dm.nodeID, dm.clock, metaStore)
+	if err != nil {
+		metaStore.Close()
 		return fmt.Errorf("failed to create system database: %w", err)
 	}
 
@@ -106,15 +121,6 @@ func (dm *DatabaseManager) initSystemDatabase() error {
 	if err != nil {
 		return fmt.Errorf("failed to create database registry table: %w", err)
 	}
-
-	// Create intent entries table for CDC capture during preupdate hooks
-	_, err = systemDB.GetDB().Exec(CreateIntentEntriesTable)
-	if err != nil {
-		return fmt.Errorf("failed to create intent entries table: %w", err)
-	}
-
-	// Cleanup any orphaned intent entries from previous crashes
-	dm.cleanupOrphanedIntents()
 
 	log.Info().Str("path", systemDBPath).Msg("System database initialized")
 	return nil
@@ -151,9 +157,23 @@ func (dm *DatabaseManager) loadDatabases() error {
 }
 
 // openDatabase opens a database and adds it to the registry
+// Creates a MetaStore for the database (stored in dbname_meta.db)
 func (dm *DatabaseManager) openDatabase(name, path string) error {
-	db, err := NewMVCCDatabase(path, dm.nodeID, dm.clock, dm.systemDB.GetDB())
+	// Create MetaStore for this database
+	metaPath := strings.TrimSuffix(path, ".db") + "_meta.db"
+	busyTimeoutMS := 50000 // 50 seconds
+	if cfg.Config != nil {
+		busyTimeoutMS = cfg.Config.MVCC.LockWaitTimeoutSeconds * 1000
+	}
+
+	metaStore, err := NewSQLiteMetaStore(metaPath, busyTimeoutMS)
 	if err != nil {
+		return fmt.Errorf("failed to create meta store for %s: %w", name, err)
+	}
+
+	db, err := NewMVCCDatabase(path, dm.nodeID, dm.clock, metaStore)
+	if err != nil {
+		metaStore.Close()
 		return fmt.Errorf("failed to open database %s: %w", name, err)
 	}
 
@@ -188,7 +208,7 @@ func (dm *DatabaseManager) ensureDefaultDatabase() error {
 	return nil
 }
 
-// CreateDatabase creates a new database
+// CreateDatabase creates a new database with its own MetaStore
 func (dm *DatabaseManager) CreateDatabase(name string) error {
 	if name == SystemDatabaseName {
 		return fmt.Errorf("cannot create system database")
@@ -206,8 +226,22 @@ func (dm *DatabaseManager) CreateDatabase(name string) error {
 	dbPath := filepath.Join("databases", name+".db")
 	fullPath := filepath.Join(dm.dataDir, dbPath)
 
-	db, err := NewMVCCDatabase(fullPath, dm.nodeID, dm.clock, dm.systemDB.GetDB())
+	// Create MetaStore for this database
+	metaPath := strings.TrimSuffix(fullPath, ".db") + "_meta.db"
+	busyTimeoutMS := 50000 // 50 seconds
+	if cfg.Config != nil {
+		busyTimeoutMS = cfg.Config.MVCC.LockWaitTimeoutSeconds * 1000
+	}
+
+	metaStore, err := NewSQLiteMetaStore(metaPath, busyTimeoutMS)
 	if err != nil {
+		return fmt.Errorf("failed to create meta store: %w", err)
+	}
+
+	db, err := NewMVCCDatabase(fullPath, dm.nodeID, dm.clock, metaStore)
+	if err != nil {
+		metaStore.Close()
+		os.Remove(metaPath)
 		return fmt.Errorf("failed to create database file: %w", err)
 	}
 
@@ -222,7 +256,9 @@ func (dm *DatabaseManager) CreateDatabase(name string) error {
 	)
 	if err != nil {
 		db.Close()
+		metaStore.Close()
 		os.Remove(fullPath)
+		os.Remove(metaPath)
 		return fmt.Errorf("failed to register database in system: %w", err)
 	}
 
@@ -282,6 +318,12 @@ func (dm *DatabaseManager) DropDatabase(name string) error {
 	// Delete WAL and SHM files
 	os.Remove(fullPath + "-wal")
 	os.Remove(fullPath + "-shm")
+
+	// Delete meta database files
+	metaPath := strings.TrimSuffix(fullPath, ".db") + "_meta.db"
+	os.Remove(metaPath)
+	os.Remove(metaPath + "-wal")
+	os.Remove(metaPath + "-shm")
 
 	log.Info().Str("name", name).Msg("Database dropped")
 	return nil
@@ -394,16 +436,33 @@ func (dm *DatabaseManager) ReopenDatabase(name string) error {
 		return fmt.Errorf("failed to get database path: %w", err)
 	}
 
-	// Create new database connection FIRST (before closing old one)
+	// Create MetaStore for this database
 	fullPath := filepath.Join(dm.dataDir, dbPath)
-	newDB, err := NewMVCCDatabase(fullPath, dm.nodeID, dm.clock, dm.systemDB.GetDB())
+	metaPath := strings.TrimSuffix(fullPath, ".db") + "_meta.db"
+	busyTimeoutMS := 50000 // 50 seconds
+	if cfg.Config != nil {
+		busyTimeoutMS = cfg.Config.MVCC.LockWaitTimeoutSeconds * 1000
+	}
+
+	metaStore, err := NewSQLiteMetaStore(metaPath, busyTimeoutMS)
 	if err != nil {
+		dm.mu.Unlock()
+		return fmt.Errorf("failed to create meta store for %s: %w", name, err)
+	}
+
+	// Create new database connection FIRST (before closing old one)
+	newDB, err := NewMVCCDatabase(fullPath, dm.nodeID, dm.clock, metaStore)
+	if err != nil {
+		metaStore.Close()
 		dm.mu.Unlock()
 		return fmt.Errorf("failed to reopen database %s: %w", name, err)
 	}
 
 	// Wire up GC coordination for new connection
 	dm.wireGCCoordination(newDB, name)
+
+	// Get old MetaStore before swap
+	oldMetaStore := oldDB.GetMetaStore()
 
 	// Atomically swap in the new connection
 	dm.databases[name] = newDB
@@ -418,6 +477,11 @@ func (dm *DatabaseManager) ReopenDatabase(name string) error {
 		log.Info().Str("name", name).Msg("Closing old database connection after swap delay")
 		if err := oldDB.Close(); err != nil {
 			log.Warn().Err(err).Str("name", name).Msg("Error closing old database connection")
+		}
+		if oldMetaStore != nil {
+			if err := oldMetaStore.Close(); err != nil {
+				log.Warn().Err(err).Str("name", name).Msg("Error closing old meta store")
+			}
 		}
 	}()
 
@@ -527,11 +591,27 @@ func (dm *DatabaseManager) ImportExistingDatabases(importDir string) (int, error
 		copyFile(srcPath+"-wal", dstPath+"-wal")
 		copyFile(srcPath+"-shm", dstPath+"-shm")
 
+		// Create MetaStore for this imported database
+		metaPath := strings.TrimSuffix(dstPath, ".db") + "_meta.db"
+		busyTimeoutMS := 50000 // 50 seconds
+		if cfg.Config != nil {
+			busyTimeoutMS = cfg.Config.MVCC.LockWaitTimeoutSeconds * 1000
+		}
+
+		metaStore, err := NewSQLiteMetaStore(metaPath, busyTimeoutMS)
+		if err != nil {
+			log.Warn().Err(err).Str("name", dbName).Msg("Failed to create meta store for imported database")
+			os.Remove(dstPath)
+			continue
+		}
+
 		// Open and register the database
-		db, err := NewMVCCDatabase(dstPath, dm.nodeID, dm.clock, dm.systemDB.GetDB())
+		db, err := NewMVCCDatabase(dstPath, dm.nodeID, dm.clock, metaStore)
 		if err != nil {
 			log.Warn().Err(err).Str("name", dbName).Msg("Failed to open imported database")
+			metaStore.Close()
 			os.Remove(dstPath)
+			os.Remove(metaPath)
 			continue
 		}
 
@@ -633,7 +713,35 @@ func (dm *DatabaseManager) TakeSnapshot() ([]SnapshotInfo, uint64, error) {
 		SHA256:   systemSHA256,
 	})
 
-	// Checkpoint and get info for all user databases
+	// Checkpoint and include system database meta DB
+	systemMetaStore := dm.systemDB.GetMetaStore()
+	if systemMetaStore != nil {
+		// Checkpoint meta DB
+		if _, err := systemMetaStore.WriteDB().Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+			log.Warn().Err(err).Msg("Failed to checkpoint system meta database")
+		}
+
+		systemMetaPath := filepath.Join(dm.dataDir, SystemDatabaseName+"_meta.db")
+		metaInfo, err := os.Stat(systemMetaPath)
+		if err == nil {
+			metaSHA256, err := calculateFileSHA256(systemMetaPath)
+			if err == nil {
+				snapshots = append(snapshots, SnapshotInfo{
+					Name:     SystemDatabaseName + "_meta",
+					Filename: SystemDatabaseName + "_meta.db",
+					FullPath: systemMetaPath,
+					Size:     metaInfo.Size(),
+					SHA256:   metaSHA256,
+				})
+			} else {
+				log.Warn().Err(err).Msg("Failed to hash system meta database")
+			}
+		} else {
+			log.Warn().Err(err).Msg("Failed to stat system meta database")
+		}
+	}
+
+	// Checkpoint and get info for all user databases and their meta DBs
 	for name, db := range dm.databases {
 		// Skip system database (already handled above)
 		if name == SystemDatabaseName {
@@ -665,6 +773,30 @@ func (dm *DatabaseManager) TakeSnapshot() ([]SnapshotInfo, uint64, error) {
 			Size:     info.Size(),
 			SHA256:   dbSHA256,
 		})
+
+		// Checkpoint and include meta DB for this database
+		metaStore := db.GetMetaStore()
+		if metaStore != nil {
+			// Checkpoint meta DB
+			if _, err := metaStore.WriteDB().Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+				log.Warn().Err(err).Str("database", name).Msg("Failed to checkpoint meta database")
+			}
+
+			metaPath := filepath.Join(dm.dataDir, "databases", name+"_meta.db")
+			metaInfo, err := os.Stat(metaPath)
+			if err == nil {
+				metaSHA256, err := calculateFileSHA256(metaPath)
+				if err == nil {
+					snapshots = append(snapshots, SnapshotInfo{
+						Name:     name + "_meta",
+						Filename: filepath.Join("databases", name+"_meta.db"),
+						FullPath: metaPath,
+						Size:     metaInfo.Size(),
+						SHA256:   metaSHA256,
+					})
+				}
+			}
+		}
 	}
 
 	// Get max committed transaction ID
@@ -694,10 +826,14 @@ func (dm *DatabaseManager) GetMaxCommittedTxnID() (uint64, error) {
 
 	var maxTxnID uint64
 
-	// Check all user databases
+	// Check all user databases via their MetaStores
 	for name, db := range dm.databases {
+		metaStore := db.GetMetaStore()
+		if metaStore == nil {
+			continue // System DB has no MetaStore
+		}
 		var dbMax uint64
-		err := db.GetDB().QueryRow(`
+		err := metaStore.ReadDB().QueryRow(`
 			SELECT COALESCE(MAX(txn_id), 0)
 			FROM __marmot__txn_records
 			WHERE status = 'COMMITTED'
@@ -735,26 +871,34 @@ func (dm *DatabaseManager) GetReplicationState(peerNodeID uint64, database strin
 	dm.mu.RLock()
 	defer dm.mu.RUnlock()
 
-	// All databases store replication state in their own __marmot__replication_state table
 	db, ok := dm.databases[database]
 	if !ok {
 		return nil, fmt.Errorf("database %s not found", database)
 	}
 
-	var state ReplicationState
-	err := db.GetDB().QueryRow(`
-		SELECT peer_node_id, database_name, last_applied_txn_id, last_applied_ts_wall,
-		       last_applied_ts_logical, last_sync_time, sync_status
-		FROM __marmot__replication_state
-		WHERE peer_node_id = ? AND database_name = ?
-	`, peerNodeID, database).Scan(
-		&state.PeerNodeID, &state.DatabaseName, &state.LastAppliedTxnID, &state.LastAppliedTSWall,
-		&state.LastAppliedTSLog, &state.LastSyncTime, &state.SyncStatus,
-	)
+	metaStore := db.GetMetaStore()
+	if metaStore == nil {
+		return nil, fmt.Errorf("database %s has no meta store", database)
+	}
+
+	rec, err := metaStore.GetReplicationState(peerNodeID, database)
 	if err != nil {
 		return nil, err
 	}
-	return &state, nil
+	if rec == nil {
+		// No replication state yet for this peer/database combination
+		return nil, nil
+	}
+
+	return &ReplicationState{
+		PeerNodeID:        rec.PeerNodeID,
+		DatabaseName:      rec.DatabaseName,
+		LastAppliedTxnID:  rec.LastAppliedTxnID,
+		LastAppliedTSWall: rec.LastAppliedTSWall,
+		LastAppliedTSLog:  rec.LastAppliedTSLogical,
+		LastSyncTime:      rec.LastSyncTime,
+		SyncStatus:        rec.SyncStatus,
+	}, nil
 }
 
 // UpdateReplicationState updates or inserts replication state for a peer and database
@@ -767,13 +911,17 @@ func (dm *DatabaseManager) UpdateReplicationState(state *ReplicationState) error
 		return fmt.Errorf("database %s not found", state.DatabaseName)
 	}
 
-	_, err := db.GetDB().Exec(`
-		INSERT OR REPLACE INTO __marmot__replication_state
-		(peer_node_id, database_name, last_applied_txn_id, last_applied_ts_wall, last_applied_ts_logical, last_sync_time, sync_status)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
-	`, state.PeerNodeID, state.DatabaseName, state.LastAppliedTxnID, state.LastAppliedTSWall,
-		state.LastAppliedTSLog, state.LastSyncTime, state.SyncStatus)
-	return err
+	metaStore := db.GetMetaStore()
+	if metaStore == nil {
+		return fmt.Errorf("database %s has no meta store", state.DatabaseName)
+	}
+
+	return metaStore.UpdateReplicationState(
+		state.PeerNodeID,
+		state.DatabaseName,
+		state.LastAppliedTxnID,
+		hlc.Timestamp{WallTime: state.LastAppliedTSWall, Logical: state.LastAppliedTSLog},
+	)
 }
 
 // GetAllReplicationStates returns replication state for all known peers across all databases
@@ -783,15 +931,19 @@ func (dm *DatabaseManager) GetAllReplicationStates() ([]ReplicationState, error)
 
 	var allStates []ReplicationState
 
-	// Query each database for its replication state
+	// Query each database's MetaStore for its replication state
 	for _, mdb := range dm.databases {
-		rows, err := mdb.GetDB().Query(`
+		metaStore := mdb.GetMetaStore()
+		if metaStore == nil {
+			continue // System DB has no MetaStore
+		}
+
+		rows, err := metaStore.ReadDB().Query(`
 			SELECT peer_node_id, database_name, last_applied_txn_id, last_applied_ts_wall,
 			       last_applied_ts_logical, last_sync_time, sync_status
 			FROM __marmot__replication_state
 		`)
 		if err != nil {
-			// If table doesn't exist in this database yet, skip it
 			continue
 		}
 
@@ -821,14 +973,12 @@ func (dm *DatabaseManager) GetMinAppliedTxnID(database string) (uint64, error) {
 		return 0, fmt.Errorf("database %s not found", database)
 	}
 
-	var minTxnID uint64
-	err := db.GetDB().QueryRow(`
-		SELECT COALESCE(MIN(last_applied_txn_id), 0)
-		FROM __marmot__replication_state
-		WHERE database_name = ?
-	`, database).Scan(&minTxnID)
+	metaStore := db.GetMetaStore()
+	if metaStore == nil {
+		return 0, nil // System DB has no replication state
+	}
 
-	return minTxnID, err
+	return metaStore.GetMinAppliedTxnID(database)
 }
 
 // GetMaxTxnID returns the maximum COMMITTED transaction ID in a database
@@ -843,8 +993,13 @@ func (dm *DatabaseManager) GetMaxTxnID(database string) (uint64, error) {
 		return 0, fmt.Errorf("database %s not found", database)
 	}
 
+	metaStore := db.GetMetaStore()
+	if metaStore == nil {
+		return 0, nil // System DB has no transaction records
+	}
+
 	var maxTxnID uint64
-	err := db.GetDB().QueryRow(`
+	err := metaStore.ReadDB().QueryRow(`
 		SELECT COALESCE(MAX(txn_id), 0)
 		FROM __marmot__txn_records
 		WHERE status = 'COMMITTED'
@@ -864,8 +1019,13 @@ func (dm *DatabaseManager) GetCommittedTxnCount(database string) (int64, error) 
 		return 0, fmt.Errorf("database %s not found", database)
 	}
 
+	metaStore := db.GetMetaStore()
+	if metaStore == nil {
+		return 0, nil // System DB has no transaction records
+	}
+
 	var count int64
-	err := db.GetDB().QueryRow(`
+	err := metaStore.ReadDB().QueryRow(`
 		SELECT COUNT(*)
 		FROM __marmot__txn_records
 		WHERE status = 'COMMITTED'
@@ -874,34 +1034,3 @@ func (dm *DatabaseManager) GetCommittedTxnCount(database string) (int64, error) 
 	return count, err
 }
 
-// GetSystemDB returns the system database's sql.DB for intent writes
-// This is used by EphemeralHookSession to write CDC entries during preupdate hooks
-func (dm *DatabaseManager) GetSystemDB() *sql.DB {
-	return dm.systemDB.GetDB()
-}
-
-// cleanupOrphanedIntents removes intent entries from crashed transactions
-// Called during startup to clean up any orphaned entries from previous crashes
-func (dm *DatabaseManager) cleanupOrphanedIntents() {
-	result, err := dm.systemDB.GetDB().Exec(`
-		DELETE FROM __marmot__intent_entries
-	`)
-	if err != nil {
-		log.Warn().Err(err).Msg("Failed to cleanup orphaned intent entries")
-		return
-	}
-
-	if rows, _ := result.RowsAffected(); rows > 0 {
-		log.Info().Int64("rows", rows).Msg("Cleaned up orphaned intent entries from previous crash")
-	}
-}
-
-// DeleteIntentEntries removes all intent entries for a transaction
-// Called after successful commit or rollback
-func (dm *DatabaseManager) DeleteIntentEntries(txnID uint64) error {
-	_, err := dm.systemDB.GetDB().Exec(
-		"DELETE FROM __marmot__intent_entries WHERE txn_id = ?",
-		txnID,
-	)
-	return err
-}

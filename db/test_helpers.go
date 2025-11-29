@@ -2,6 +2,8 @@ package db
 
 import (
 	"database/sql"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -27,34 +29,92 @@ func isWriteWriteConflict(err error) bool {
 		strings.Contains(errStr, "write conflict")
 }
 
-// verifyWriteIntentsCleared checks that all write intents for a transaction are cleaned up
-func verifyWriteIntentsCleared(t *testing.T, db *sql.DB, txnID uint64) {
-	t.Helper()
-	var count int
-	err := db.QueryRow("SELECT COUNT(*) FROM __marmot__write_intents WHERE txn_id = ?", txnID).Scan(&count)
-	if err != nil {
-		t.Fatalf("Failed to query write intents: %v", err)
+// testDBWithMetaStore holds both the user DB and MetaStore for testing
+type testDBWithMetaStore struct {
+	DB        *sql.DB
+	MetaStore MetaStore
+	dbPath    string
+	metaPath  string
+}
+
+// Close closes both db and metastore, and optionally removes files
+func (t *testDBWithMetaStore) Close() {
+	if t.DB != nil {
+		t.DB.Close()
 	}
-	if count != 0 {
-		t.Errorf("Expected 0 write intents for txn %d, found %d", txnID, count)
+	if t.MetaStore != nil {
+		t.MetaStore.Close()
 	}
 }
 
-// verifyTransactionStatus checks the status of a transaction in the database
-// Note: Aborted transactions are now deleted rather than marked with ABORTED status
-func verifyTransactionStatus(t *testing.T, db *sql.DB, txnID uint64, expectedStatus string) {
+// setupTestDBWithMeta creates both a user DB and MetaStore for testing
+func setupTestDBWithMeta(t *testing.T) *testDBWithMetaStore {
 	t.Helper()
-	var status string
-	err := db.QueryRow("SELECT status FROM __marmot__txn_records WHERE txn_id = ?", txnID).Scan(&status)
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "test.db")
+	return openTestDBWithMeta(t, dbPath)
+}
+
+// openTestDBWithMeta opens an existing path with both user DB and MetaStore
+func openTestDBWithMeta(t *testing.T, dbPath string) *testDBWithMetaStore {
+	t.Helper()
+
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+
+	metaPath := dbPath + "_meta.db"
+	metaStore, err := NewSQLiteMetaStore(metaPath, 5000)
+	if err != nil {
+		db.Close()
+		t.Fatalf("Failed to create meta store: %v", err)
+	}
+
+	result := &testDBWithMetaStore{
+		DB:        db,
+		MetaStore: metaStore,
+		dbPath:    dbPath,
+		metaPath:  metaPath,
+	}
+
+	t.Cleanup(func() {
+		result.Close()
+		os.Remove(dbPath)
+		os.Remove(metaPath)
+		os.Remove(metaPath + "-wal")
+		os.Remove(metaPath + "-shm")
+	})
+
+	return result
+}
+
+// verifyWriteIntentsClearedMeta checks that all write intents for a transaction are cleaned up using MetaStore
+func verifyWriteIntentsClearedMeta(t *testing.T, ms MetaStore, txnID uint64) {
+	t.Helper()
+	intents, err := ms.GetIntentsByTxn(txnID)
+	if err != nil {
+		t.Fatalf("Failed to query write intents: %v", err)
+	}
+	if len(intents) != 0 {
+		t.Errorf("Expected 0 write intents for txn %d, found %d", txnID, len(intents))
+	}
+}
+
+// verifyTransactionStatusMeta checks the status of a transaction using MetaStore
+// Note: Aborted transactions are deleted rather than marked with ABORTED status
+func verifyTransactionStatusMeta(t *testing.T, ms MetaStore, txnID uint64, expectedStatus string) {
+	t.Helper()
+	txnRecord, err := ms.GetTransaction(txnID)
 
 	// Aborted transactions are deleted rather than marked with status
 	if expectedStatus == TxnStatusAborted {
-		if err == sql.ErrNoRows {
+		if err == sql.ErrNoRows || txnRecord == nil {
 			// Expected: aborted transactions are deleted
 			return
 		}
 		if err == nil {
-			t.Errorf("Expected transaction %d to be deleted (aborted), but found status %s", txnID, status)
+			t.Errorf("Expected transaction %d to be deleted (aborted), but found status %s", txnID, txnRecord.Status)
 			return
 		}
 	}
@@ -62,16 +122,19 @@ func verifyTransactionStatus(t *testing.T, db *sql.DB, txnID uint64, expectedSta
 	if err != nil {
 		t.Fatalf("Failed to query transaction status: %v", err)
 	}
-	if status != expectedStatus {
-		t.Errorf("Expected transaction %d status %s, got %s", txnID, expectedStatus, status)
+	if txnRecord == nil {
+		t.Fatalf("Transaction %d not found", txnID)
+	}
+	if txnRecord.Status != expectedStatus {
+		t.Errorf("Expected transaction %d status %s, got %s", txnID, expectedStatus, txnRecord.Status)
 	}
 }
 
-// countMVCCVersions returns the number of MVCC versions for a given table and row
-func countMVCCVersions(t *testing.T, db *sql.DB, tableName, rowKey string) int {
+// countMVCCVersionsMeta returns the number of MVCC versions for a given table and row using MetaStore
+func countMVCCVersionsMeta(t *testing.T, ms MetaStore, tableName, rowKey string) int {
 	t.Helper()
 	var count int
-	err := db.QueryRow("SELECT COUNT(*) FROM __marmot__mvcc_versions WHERE table_name = ? AND row_key = ?",
+	err := ms.ReadDB().QueryRow("SELECT COUNT(*) FROM __marmot__mvcc_versions WHERE table_name = ? AND row_key = ?",
 		tableName, rowKey).Scan(&count)
 	if err != nil {
 		t.Fatalf("Failed to count MVCC versions: %v", err)

@@ -535,7 +535,7 @@ func (s *Server) GetReplicationState(ctx context.Context, req *ReplicationStateR
 		var lastSyncTime int64
 		var syncStatus string
 
-		if err != nil {
+		if err != nil || repState == nil {
 			// No replication state yet for this peer/database - use defaults
 			lastAppliedTxnID = 0
 			lastAppliedTS = &HLC{WallTime: 0, Logical: 0, NodeId: s.nodeID}

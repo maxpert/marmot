@@ -49,7 +49,7 @@ func (c *SchemaCache) InvalidateAll() {}
 type EphemeralHookSession struct{}
 
 // StartEphemeralSession returns an error when preupdate hook is not enabled
-func StartEphemeralSession(ctx context.Context, userDB *sql.DB, systemDB *sql.DB, schemaCache *SchemaCache, txnID uint64, tables []string) (*EphemeralHookSession, error) {
+func StartEphemeralSession(ctx context.Context, userDB *sql.DB, metaStore MetaStore, schemaCache *SchemaCache, txnID uint64, tables []string) (*EphemeralHookSession, error) {
 	return nil, ErrPreupdateHookNotEnabled
 }
 

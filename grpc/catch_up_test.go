@@ -19,9 +19,21 @@ func TestSanitizeSnapshotFilename(t *testing.T) {
 			shouldError: false,
 		},
 		{
+			name:        "system meta database",
+			filename:    "__marmot_system_meta.db",
+			expected:    "__marmot_system_meta.db",
+			shouldError: false,
+		},
+		{
 			name:        "user database in databases dir",
 			filename:    "databases/marmot.db",
 			expected:    "databases/marmot.db",
+			shouldError: false,
+		},
+		{
+			name:        "user meta database in databases dir",
+			filename:    "databases/marmot_meta.db",
+			expected:    "databases/marmot_meta.db",
 			shouldError: false,
 		},
 		{
@@ -124,7 +136,9 @@ func TestIsValidSnapshotPath(t *testing.T) {
 		expected bool
 	}{
 		{"system database", "__marmot_system.db", true},
+		{"system meta database", "__marmot_system_meta.db", true},
 		{"user database", "databases/marmot.db", true},
+		{"user meta database", "databases/marmot_meta.db", true},
 		{"user database other name", "databases/test.db", true},
 		{"nested db", "databases/subdir/test.db", false},
 		{"root db", "marmot.db", false},

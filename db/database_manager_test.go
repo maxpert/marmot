@@ -428,3 +428,123 @@ func TestMigrateFromLegacy(t *testing.T) {
 		t.Errorf("Expected 1 row in migrated table, got %d", count)
 	}
 }
+
+// TestTakeSnapshotIncludesMetaStores verifies that TakeSnapshot includes all meta databases
+func TestTakeSnapshotIncludesMetaStores(t *testing.T) {
+	dm, _ := setupTestDatabaseManager(t)
+	defer dm.Close()
+
+	// Create additional databases
+	if err := dm.CreateDatabase("testdb"); err != nil {
+		t.Fatalf("Failed to create database: %v", err)
+	}
+
+	// Take snapshot
+	snapshots, _, err := dm.TakeSnapshot()
+	if err != nil {
+		t.Fatalf("TakeSnapshot failed: %v", err)
+	}
+
+	// Build a map of snapshot names for easy lookup
+	snapshotNames := make(map[string]bool)
+	for _, snap := range snapshots {
+		snapshotNames[snap.Name] = true
+		t.Logf("Snapshot: %s (path: %s)", snap.Name, snap.Filename)
+	}
+
+	// Verify system database is included
+	if !snapshotNames[SystemDatabaseName] {
+		t.Error("System database not found in snapshots")
+	}
+
+	// Verify system meta database is included
+	if !snapshotNames[SystemDatabaseName+"_meta"] {
+		t.Error("System meta database not found in snapshots")
+	}
+
+	// Verify default database is included
+	if !snapshotNames[DefaultDatabaseName] {
+		t.Error("Default database not found in snapshots")
+	}
+
+	// Verify default meta database is included
+	if !snapshotNames[DefaultDatabaseName+"_meta"] {
+		t.Error("Default meta database not found in snapshots")
+	}
+
+	// Verify testdb is included
+	if !snapshotNames["testdb"] {
+		t.Error("testdb not found in snapshots")
+	}
+
+	// Verify testdb meta database is included
+	if !snapshotNames["testdb_meta"] {
+		t.Error("testdb meta database not found in snapshots")
+	}
+
+	t.Logf("✓ TakeSnapshot includes all databases and their meta stores")
+}
+
+// TestGetReplicationStateNilHandling verifies that GetReplicationState handles nil correctly
+func TestGetReplicationStateNilHandling(t *testing.T) {
+	dm, _ := setupTestDatabaseManager(t)
+	defer dm.Close()
+
+	// Get replication state for a non-existent peer
+	// This should return nil, nil (not found) rather than panic
+	state, err := dm.GetReplicationState(999, DefaultDatabaseName)
+	if err != nil {
+		t.Fatalf("GetReplicationState returned unexpected error: %v", err)
+	}
+
+	// State should be nil when no replication state exists
+	if state != nil {
+		t.Errorf("Expected nil state for non-existent peer, got %+v", state)
+	}
+
+	t.Log("✓ GetReplicationState handles nil correctly for non-existent peers")
+}
+
+// TestGetReplicationStateAfterUpdate verifies that replication state can be set and retrieved
+func TestGetReplicationStateAfterUpdate(t *testing.T) {
+	dm, _ := setupTestDatabaseManager(t)
+	defer dm.Close()
+
+	// Update replication state for a peer
+	state := &ReplicationState{
+		PeerNodeID:        42,
+		DatabaseName:      DefaultDatabaseName,
+		LastAppliedTxnID:  100,
+		LastAppliedTSWall: 1234567890,
+		LastAppliedTSLog:  5,
+		SyncStatus:        "SYNCED",
+	}
+
+	err := dm.UpdateReplicationState(state)
+	if err != nil {
+		t.Fatalf("UpdateReplicationState failed: %v", err)
+	}
+
+	// Get replication state for the peer
+	retrieved, err := dm.GetReplicationState(42, DefaultDatabaseName)
+	if err != nil {
+		t.Fatalf("GetReplicationState returned error: %v", err)
+	}
+
+	if retrieved == nil {
+		t.Fatal("GetReplicationState returned nil for existing peer")
+	}
+
+	// Verify values
+	if retrieved.PeerNodeID != 42 {
+		t.Errorf("Expected PeerNodeID 42, got %d", retrieved.PeerNodeID)
+	}
+	if retrieved.LastAppliedTxnID != 100 {
+		t.Errorf("Expected LastAppliedTxnID 100, got %d", retrieved.LastAppliedTxnID)
+	}
+	if retrieved.SyncStatus != "SYNCED" {
+		t.Errorf("Expected SyncStatus SYNCED, got %s", retrieved.SyncStatus)
+	}
+
+	t.Log("✓ GetReplicationState retrieves correct values after update")
+}

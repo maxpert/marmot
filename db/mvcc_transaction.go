@@ -45,7 +45,8 @@ type MinAppliedTxnIDFunc func(database string) (uint64, error)
 
 // MVCCTransactionManager manages MVCC transactions
 type MVCCTransactionManager struct {
-	db                 *sql.DB
+	db                 *sql.DB   // User database for data operations
+	metaStore          MetaStore // MetaStore for transaction metadata
 	clock              *hlc.Clock
 	schemaProvider     *protocol.SchemaProvider // Schema provider for table metadata
 	activeTxns         map[uint64]*MVCCTransaction
@@ -62,7 +63,7 @@ type MVCCTransactionManager struct {
 }
 
 // NewMVCCTransactionManager creates a new transaction manager
-func NewMVCCTransactionManager(db *sql.DB, clock *hlc.Clock) *MVCCTransactionManager {
+func NewMVCCTransactionManager(db *sql.DB, metaStore MetaStore, clock *hlc.Clock) *MVCCTransactionManager {
 	// Import config values (with fallback to defaults if config not loaded)
 	gcInterval := 30 * time.Second
 	gcThreshold := 1 * time.Hour
@@ -81,6 +82,7 @@ func NewMVCCTransactionManager(db *sql.DB, clock *hlc.Clock) *MVCCTransactionMan
 
 	tm := &MVCCTransactionManager{
 		db:               db,
+		metaStore:        metaStore,
 		clock:            clock,
 		schemaProvider:   protocol.NewSchemaProvider(db),
 		activeTxns:       make(map[uint64]*MVCCTransaction),
@@ -139,16 +141,8 @@ func (tm *MVCCTransactionManager) BeginTransactionWithID(txnID, nodeID uint64, s
 		WriteIntents: make(map[string]*WriteIntent),
 	}
 
-	// Persist transaction record using INSERT OR REPLACE to handle retries
-	// where the previous prepare's record may still exist (e.g., abort didn't complete)
-	_, err := tm.db.Exec(`
-		INSERT OR REPLACE INTO __marmot__txn_records
-		(txn_id, node_id, status, start_ts_wall, start_ts_logical, created_at, last_heartbeat)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
-	`, txn.ID, nodeID, TxnStatusPending, startTS.WallTime, startTS.Logical,
-		time.Now().UnixNano(), time.Now().UnixNano())
-
-	if err != nil {
+	// Persist transaction record to MetaStore
+	if err := tm.metaStore.BeginTransaction(txnID, nodeID, startTS); err != nil {
 		return nil, fmt.Errorf("failed to create transaction record: %w", err)
 	}
 
@@ -185,8 +179,6 @@ func (tm *MVCCTransactionManager) WriteIntent(txn *MVCCTransaction, tableName, r
 	}
 
 	// Create the write intent
-	// Note: We rely on the PRIMARY KEY constraint to atomically detect conflicts
-	// No pre-check needed - the database enforces exclusivity
 	intent := &WriteIntent{
 		TableName:    tableName,
 		RowKey:       rowKey,
@@ -197,43 +189,35 @@ func (tm *MVCCTransactionManager) WriteIntent(txn *MVCCTransaction, tableName, r
 		DataSnapshot: dataSnapshot,
 	}
 
-	// Persist the intent - use plain INSERT to detect PRIMARY KEY conflicts atomically
-	_, err := tm.db.Exec(`
-		INSERT INTO __marmot__write_intents
-		(table_name, row_key, txn_id, ts_wall, ts_logical, node_id, operation, sql_statement, data_snapshot, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, tableName, rowKey, txn.ID, txn.StartTS.WallTime, txn.StartTS.Logical, txn.NodeID,
-		statementTypeToOperation(stmt.Type), stmt.SQL, dataSnapshot, time.Now().UnixNano())
+	// Persist the intent via MetaStore
+	err := tm.metaStore.WriteIntent(txn.ID, tableName, rowKey,
+		statementTypeToOperation(stmt.Type), stmt.SQL, dataSnapshot, txn.StartTS, txn.NodeID)
 
 	if err != nil {
-		// Check if this is a PRIMARY KEY constraint violation (concurrent intent)
+		// Check if this is a write-write conflict
 		if strings.Contains(err.Error(), "UNIQUE constraint failed") || strings.Contains(err.Error(), "PRIMARY KEY constraint failed") {
-			// Query to get the conflicting transaction ID
-			var conflictTxnID uint64
-			queryErr := tm.db.QueryRow(`
-				SELECT txn_id FROM __marmot__write_intents
-				WHERE table_name = ? AND row_key = ?
-			`, tableName, rowKey).Scan(&conflictTxnID)
-
-			if queryErr == nil {
+			// Query to get the conflicting transaction
+			existingIntent, queryErr := tm.metaStore.GetIntent(tableName, rowKey)
+			if queryErr == nil && existingIntent != nil {
 				// If same transaction already has intent on this row, update it
 				// This happens when DELETE then INSERT on same row in same txn
-				if conflictTxnID == txn.ID {
-					_, updateErr := tm.db.Exec(`
-						UPDATE __marmot__write_intents
-						SET operation = ?, sql_statement = ?, data_snapshot = ?, created_at = ?
-						WHERE table_name = ? AND row_key = ? AND txn_id = ?
-					`, statementTypeToOperation(stmt.Type), stmt.SQL, dataSnapshot, time.Now().UnixNano(),
-						tableName, rowKey, txn.ID)
+				if existingIntent.TxnID == txn.ID {
+					// Delete and re-insert to update
+					tm.metaStore.DeleteIntent(tableName, rowKey, txn.ID)
+					updateErr := tm.metaStore.WriteIntent(txn.ID, tableName, rowKey,
+						statementTypeToOperation(stmt.Type), stmt.SQL, dataSnapshot, txn.StartTS, txn.NodeID)
 					if updateErr != nil {
 						return fmt.Errorf("failed to update write intent: %w", updateErr)
 					}
+					// Store in transaction's intent map
+					key := tableName + ":" + rowKey
+					txn.WriteIntents[key] = intent
 					return nil
 				}
 
 				// Write-write conflict detected - return error for client to retry
 				return fmt.Errorf("write-write conflict: row %s:%s locked by transaction %d (current txn: %d)",
-					tableName, rowKey, conflictTxnID, txn.ID)
+					tableName, rowKey, existingIntent.TxnID, txn.ID)
 			}
 		}
 		return fmt.Errorf("failed to persist write intent: %w", err)
@@ -262,11 +246,7 @@ func statementTypeToOperation(st protocol.StatementType) string {
 
 // cleanupIntent removes a stale write intent
 func (tm *MVCCTransactionManager) cleanupIntent(intent *WriteIntent) error {
-	_, err := tm.db.Exec(`
-		DELETE FROM __marmot__write_intents
-		WHERE table_name = ? AND row_key = ? AND txn_id = ?
-	`, intent.TableName, intent.RowKey, intent.TxnID)
-	return err
+	return tm.metaStore.DeleteIntent(intent.TableName, intent.RowKey, intent.TxnID)
 }
 
 // CommitTransaction commits the transaction using 2PC
@@ -348,16 +328,8 @@ func (tm *MVCCTransactionManager) CommitTransaction(txn *MVCCTransaction) error 
 		dbName = txn.Statements[0].Database
 	}
 
-	// Mark transaction as COMMITTED in transaction record with statements
-	_, err = tm.db.Exec(`
-		UPDATE __marmot__txn_records
-		SET status = ?, commit_ts_wall = ?, commit_ts_logical = ?, committed_at = ?,
-		    statements_json = ?, database_name = ?
-		WHERE txn_id = ?
-	`, TxnStatusCommitted, commitTS.WallTime, commitTS.Logical, time.Now().UnixNano(),
-		string(statementsJSON), dbName, txn.ID)
-
-	if err != nil {
+	// Mark transaction as COMMITTED in MetaStore
+	if err := tm.metaStore.CommitTransaction(txn.ID, commitTS, statementsJSON, dbName); err != nil {
 		return fmt.Errorf("failed to mark transaction as committed: %w", err)
 	}
 
@@ -383,21 +355,7 @@ func (tm *MVCCTransactionManager) CommitTransaction(txn *MVCCTransaction) error 
 
 // validateIntent checks if the intent is still held by this transaction
 func (tm *MVCCTransactionManager) validateIntent(intent *WriteIntent, txnID uint64) (bool, error) {
-	var currentTxnID uint64
-	err := tm.db.QueryRow(`
-		SELECT txn_id FROM __marmot__write_intents
-		WHERE table_name = ? AND row_key = ?
-	`, intent.TableName, intent.RowKey).Scan(&currentTxnID)
-
-	if err == sql.ErrNoRows {
-		return false, nil // Intent disappeared
-	}
-
-	if err != nil {
-		return false, err
-	}
-
-	return currentTxnID == txnID, nil
+	return tm.metaStore.ValidateIntent(intent.TableName, intent.RowKey, txnID)
 }
 
 // createMVCCVersionsAsync creates MVCC version records for committed data (for read history)
@@ -405,13 +363,8 @@ func (tm *MVCCTransactionManager) validateIntent(intent *WriteIntent, txnID uint
 func (tm *MVCCTransactionManager) createMVCCVersionsAsync(txn *MVCCTransaction) {
 	// Convert each write intent to MVCC version for read history
 	for _, intent := range txn.WriteIntents {
-		_, err := tm.db.Exec(`
-			INSERT INTO __marmot__mvcc_versions
-			(table_name, row_key, ts_wall, ts_logical, node_id, txn_id, operation, data_snapshot, created_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-		`, intent.TableName, intent.RowKey, txn.CommitTS.WallTime, txn.CommitTS.Logical,
-			txn.NodeID, txn.ID, intent.Operation, intent.DataSnapshot, time.Now().UnixNano())
-
+		err := tm.metaStore.CreateMVCCVersion(intent.TableName, intent.RowKey,
+			txn.CommitTS, txn.NodeID, txn.ID, intent.Operation, intent.DataSnapshot)
 		if err != nil {
 			// Log error but continue - this is async and non-critical
 			log.Error().Err(err).Uint64("txn_id", txn.ID).Msg("Failed to create MVCC version")
@@ -428,18 +381,15 @@ func (tm *MVCCTransactionManager) AbortTransaction(txn *MVCCTransaction) error {
 		return fmt.Errorf("transaction %d is not pending", txn.ID)
 	}
 
-	// Delete the transaction record (clean up completely on abort)
-	_, err := tm.db.Exec(`DELETE FROM __marmot__txn_records WHERE txn_id = ?`, txn.ID)
-	if err != nil {
-		return fmt.Errorf("failed to delete transaction record: %w", err)
+	// Abort the transaction in MetaStore (deletes record)
+	if err := tm.metaStore.AbortTransaction(txn.ID); err != nil {
+		return fmt.Errorf("failed to abort transaction: %w", err)
 	}
 
 	txn.Status = TxnStatusAborted
 
-	// Clean up all write intents
-	for _, intent := range txn.WriteIntents {
-		tm.cleanupIntent(intent)
-	}
+	// Clean up all write intents via MetaStore
+	tm.metaStore.DeleteIntentsByTxn(txn.ID)
 
 	// Remove from active transactions
 	tm.mu.Lock()
@@ -479,17 +429,7 @@ func (tm *MVCCTransactionManager) Heartbeat(txn *MVCCTransaction) error {
 		return fmt.Errorf("cannot heartbeat non-pending transaction %d (status: %s)", txn.ID, txn.Status)
 	}
 
-	_, err := tm.db.Exec(`
-		UPDATE __marmot__txn_records
-		SET last_heartbeat = ?
-		WHERE txn_id = ?
-	`, time.Now().UnixNano(), txn.ID)
-
-	if err != nil {
-		return fmt.Errorf("failed to update heartbeat: %w", err)
-	}
-
-	return nil
+	return tm.metaStore.Heartbeat(txn.ID)
 }
 
 // StartGarbageCollection starts the background garbage collection goroutine
@@ -500,21 +440,30 @@ func (tm *MVCCTransactionManager) StartGarbageCollection() {
 		return
 	}
 	tm.gcRunning = true
+	tm.stopGC = make(chan struct{}) // Fresh channel for this GC cycle
 	tm.mu.Unlock()
 
 	go tm.gcLoop()
 }
 
-// StopGarbageCollection stops the background garbage collection
+// StopGarbageCollection stops the background garbage collection.
+// Safe to call multiple times.
 func (tm *MVCCTransactionManager) StopGarbageCollection() {
 	tm.mu.Lock()
 	if !tm.gcRunning {
 		tm.mu.Unlock()
 		return
 	}
+	tm.gcRunning = false
 	tm.mu.Unlock()
 
-	close(tm.stopGC)
+	// Safe close - only close if not already closed
+	select {
+	case <-tm.stopGC:
+		// Already closed
+	default:
+		close(tm.stopGC)
+	}
 }
 
 // gcLoop runs the garbage collection loop
@@ -567,64 +516,12 @@ func (tm *MVCCTransactionManager) runGarbageCollection() {
 
 // cleanupStaleTransactions aborts transactions that haven't had a heartbeat within the timeout
 func (tm *MVCCTransactionManager) cleanupStaleTransactions() (int, error) {
-	cutoff := time.Now().Add(-tm.heartbeatTimeout).UnixNano()
-
-	// Find stale PENDING transactions
-	rows, err := tm.db.Query(`
-		SELECT txn_id
-		FROM __marmot__txn_records
-		WHERE status = ? AND last_heartbeat < ?
-	`, TxnStatusPending, cutoff)
-
-	if err != nil {
-		return 0, err
-	}
-	defer rows.Close()
-
-	staleTxnIDs := []uint64{}
-	for rows.Next() {
-		var txnID uint64
-		if err := rows.Scan(&txnID); err != nil {
-			continue
-		}
-		staleTxnIDs = append(staleTxnIDs, txnID)
-	}
-
-	// Abort each stale transaction (delete record, consistent with AbortTransaction)
-	for _, txnID := range staleTxnIDs {
-		// Delete transaction record (same as AbortTransaction)
-		_, err := tm.db.Exec(`
-			DELETE FROM __marmot__txn_records WHERE txn_id = ?
-		`, txnID)
-
-		if err != nil {
-			continue
-		}
-
-		// Clean up write intents
-		_, _ = tm.db.Exec(`
-			DELETE FROM __marmot__write_intents
-			WHERE txn_id = ?
-		`, txnID)
-
-		// Remove from active transactions
-		tm.mu.Lock()
-		delete(tm.activeTxns, txnID)
-		tm.mu.Unlock()
-	}
-
-	return len(staleTxnIDs), nil
+	return tm.metaStore.CleanupStaleTransactions(tm.heartbeatTimeout)
 }
 
 // cleanupOldTransactionRecords removes old COMMITTED/ABORTED transaction records
 // with GC safe point coordination to prevent deleting logs needed by lagging peers
 func (tm *MVCCTransactionManager) cleanupOldTransactionRecords() (int, error) {
-	now := time.Now()
-
-	// Calculate time-based cutoffs
-	minRetentionCutoff := now.Add(-tm.gcMinRetention).UnixNano()
-	maxRetentionCutoff := now.Add(-tm.gcMaxRetention).UnixNano()
-
 	// Get GC safe point from peer replication tracking
 	tm.mu.RLock()
 	getMinAppliedFn := tm.getMinAppliedTxnID
@@ -642,92 +539,24 @@ func (tm *MVCCTransactionManager) cleanupOldTransactionRecords() (int, error) {
 		}
 	}
 
-	var result sql.Result
-	var err error
-
-	if minAppliedTxnID > 0 {
-		// GC with peer coordination: delete only if ALL of the following are true:
-		// 1. Transaction is COMMITTED or ABORTED
-		// 2. Transaction is older than gc_min_retention
-		// 3. Transaction has been applied by all peers (txn_id < minAppliedTxnID)
-		// OR transaction is older than gc_max_retention (force GC to prevent unbounded growth)
-		result, err = tm.db.Exec(`
-			DELETE FROM __marmot__txn_records
-			WHERE (status = ? OR status = ?)
-			  AND (
-			    (created_at < ? AND txn_id < ?)   -- Applied by all peers + past min retention
-			    OR created_at < ?                 -- Force GC after max retention
-			  )
-		`, TxnStatusCommitted, TxnStatusAborted,
-			minRetentionCutoff, minAppliedTxnID,
-			maxRetentionCutoff)
-
-		if err == nil {
-			log.Debug().
-				Str("database", dbName).
-				Uint64("min_applied_txn_id", minAppliedTxnID).
-				Time("min_retention_cutoff", time.Unix(0, minRetentionCutoff)).
-				Time("max_retention_cutoff", time.Unix(0, maxRetentionCutoff)).
-				Msg("GC: Coordinated cleanup with peer tracking")
-		}
-	} else {
-		// No peer tracking available - use time-based GC only
-		// Delete if older than gc_max_retention (conservative approach)
-		result, err = tm.db.Exec(`
-			DELETE FROM __marmot__txn_records
-			WHERE (status = ? OR status = ?) AND created_at < ?
-		`, TxnStatusCommitted, TxnStatusAborted, maxRetentionCutoff)
-
-		if err == nil {
-			log.Debug().
-				Str("database", dbName).
-				Time("max_retention_cutoff", time.Unix(0, maxRetentionCutoff)).
-				Msg("GC: Time-based cleanup only (no peer tracking)")
-		}
-	}
-
+	count, err := tm.metaStore.CleanupOldTransactionRecords(tm.gcMinRetention, tm.gcMaxRetention, minAppliedTxnID)
 	if err != nil {
 		return 0, err
 	}
 
-	rowsAffected, _ := result.RowsAffected()
-	if rowsAffected > 0 {
+	if count > 0 {
 		log.Info().
 			Str("database", dbName).
-			Int64("deleted_records", rowsAffected).
+			Int("deleted_records", count).
 			Msg("GC: Cleaned up old transaction records")
 	}
 
-	return int(rowsAffected), nil
+	return count, nil
 }
 
 // cleanupOldMVCCVersions removes old MVCC versions, keeping the latest N versions per row
 func (tm *MVCCTransactionManager) cleanupOldMVCCVersions(keepVersions int) (int, error) {
-	// For each (table_name, row_key), keep only the latest N versions
-	// This is a simplified implementation - production would use a more efficient approach
-
-	result, err := tm.db.Exec(`
-		DELETE FROM __marmot__mvcc_versions
-		WHERE rowid NOT IN (
-			SELECT rowid
-			FROM __marmot__mvcc_versions AS v1
-			WHERE (
-				SELECT COUNT(*)
-				FROM __marmot__mvcc_versions AS v2
-				WHERE v2.table_name = v1.table_name
-				  AND v2.row_key = v1.row_key
-				  AND (v2.ts_wall > v1.ts_wall OR
-				       (v2.ts_wall = v1.ts_wall AND v2.ts_logical > v1.ts_logical))
-			) < ?
-		)
-	`, keepVersions)
-
-	if err != nil {
-		return 0, err
-	}
-
-	rowsAffected, _ := result.RowsAffected()
-	return int(rowsAffected), nil
+	return tm.metaStore.CleanupOldMVCCVersions(keepVersions)
 }
 
 // SerializeData helper for data snapshots
@@ -750,30 +579,21 @@ func DeserializeData(data []byte, v interface{}) error {
 func (tm *MVCCTransactionManager) ApplyDeltaWithLWW(tableName, rowKey string, sqlStmt string,
 	incomingTS hlc.Timestamp, txnID uint64) (bool, error) {
 
-	// Check the latest MVCC version for this row
-	var existingWall int64
-	var existingLogical int32
-	var existingNodeID uint64
-	err := tm.db.QueryRow(`
-		SELECT ts_wall, ts_logical, node_id
-		FROM __marmot__mvcc_versions
-		WHERE table_name = ? AND row_key = ?
-		ORDER BY ts_wall DESC, ts_logical DESC, node_id DESC
-		LIMIT 1
-	`, tableName, rowKey).Scan(&existingWall, &existingLogical, &existingNodeID)
-
-	if err == sql.ErrNoRows {
-		// No existing version - apply the change
-		return tm.applyDeltaChange(tableName, rowKey, sqlStmt, incomingTS, txnID)
-	}
+	// Check the latest MVCC version for this row via MetaStore
+	existing, err := tm.metaStore.GetLatestVersion(tableName, rowKey)
 	if err != nil {
 		return false, fmt.Errorf("failed to check existing version: %w", err)
 	}
 
+	if existing == nil {
+		// No existing version - apply the change
+		return tm.applyDeltaChange(tableName, rowKey, sqlStmt, incomingTS, txnID)
+	}
+
 	existingTS := hlc.Timestamp{
-		WallTime: existingWall,
-		Logical:  existingLogical,
-		NodeID:   existingNodeID,
+		WallTime: existing.TSWall,
+		Logical:  existing.TSLogical,
+		NodeID:   existing.NodeID,
 	}
 
 	// LWW: Compare timestamps
@@ -792,7 +612,7 @@ func (tm *MVCCTransactionManager) ApplyDeltaWithLWW(tableName, rowKey string, sq
 		Str("table", tableName).
 		Str("row", rowKey).
 		Int64("incoming_wall", incomingTS.WallTime).
-		Int64("existing_wall", existingWall).
+		Int64("existing_wall", existing.TSWall).
 		Msg("LWW: Skipping older delta change")
 	return false, nil
 }
@@ -801,20 +621,15 @@ func (tm *MVCCTransactionManager) ApplyDeltaWithLWW(tableName, rowKey string, sq
 func (tm *MVCCTransactionManager) applyDeltaChange(tableName, rowKey, sqlStmt string,
 	ts hlc.Timestamp, txnID uint64) (bool, error) {
 
-	// Execute the SQL statement
+	// Execute the SQL statement on the user database
 	_, err := tm.db.Exec(sqlStmt)
 	if err != nil {
 		// Log but don't fail - row might not exist for UPDATE/DELETE
 		log.Debug().Err(err).Str("sql", sqlStmt).Msg("Delta change execution failed")
 	}
 
-	// Record MVCC version
-	_, err = tm.db.Exec(`
-		INSERT OR REPLACE INTO __marmot__mvcc_versions
-		(table_name, row_key, ts_wall, ts_logical, node_id, txn_id, operation, data_snapshot, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, 'DELTA', NULL, ?)
-	`, tableName, rowKey, ts.WallTime, ts.Logical, ts.NodeID, txnID, time.Now().UnixNano())
-
+	// Record MVCC version in MetaStore
+	err = tm.metaStore.CreateMVCCVersion(tableName, rowKey, ts, ts.NodeID, txnID, "DELTA", nil)
 	if err != nil {
 		return false, fmt.Errorf("failed to record MVCC version: %w", err)
 	}
@@ -829,28 +644,18 @@ func (tm *MVCCTransactionManager) applyDeltaChange(tableName, rowKey, sqlStmt st
 
 // GetLatestVersion returns the latest MVCC version timestamp for a row
 func (tm *MVCCTransactionManager) GetLatestVersion(tableName, rowKey string) (*hlc.Timestamp, error) {
-	var wall int64
-	var logical int32
-	var nodeID uint64
-	err := tm.db.QueryRow(`
-		SELECT ts_wall, ts_logical, node_id
-		FROM __marmot__mvcc_versions
-		WHERE table_name = ? AND row_key = ?
-		ORDER BY ts_wall DESC, ts_logical DESC, node_id DESC
-		LIMIT 1
-	`, tableName, rowKey).Scan(&wall, &logical, &nodeID)
-
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
+	rec, err := tm.metaStore.GetLatestVersion(tableName, rowKey)
 	if err != nil {
 		return nil, err
 	}
+	if rec == nil {
+		return nil, nil
+	}
 
 	return &hlc.Timestamp{
-		WallTime: wall,
-		Logical:  logical,
-		NodeID:   nodeID,
+		WallTime: rec.TSWall,
+		Logical:  rec.TSLogical,
+		NodeID:   rec.NodeID,
 	}, nil
 }
 

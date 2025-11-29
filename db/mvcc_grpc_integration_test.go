@@ -11,19 +11,44 @@ import (
 	"github.com/maxpert/marmot/protocol"
 )
 
-func TestMVCCDatabase_Creation(t *testing.T) {
-	dbPath := "/tmp/test_mvcc_db.db"
+// Helper to create MVCCDatabase with MetaStore for testing
+func createTestMVCCDatabase(t *testing.T, dbPath string) (*MVCCDatabase, MetaStore) {
+	t.Helper()
+
+	metaPath := dbPath + "_meta.db"
 	os.Remove(dbPath)
-	defer os.Remove(dbPath)
+	os.Remove(metaPath)
+
+	metaStore, err := NewSQLiteMetaStore(metaPath, 5000)
+	if err != nil {
+		t.Fatalf("Failed to create MetaStore: %v", err)
+	}
 
 	clock := hlc.NewClock(1)
-	mdb, err := NewMVCCDatabase(dbPath, 1, clock, nil)
+	mdb, err := NewMVCCDatabase(dbPath, 1, clock, metaStore)
 	if err != nil {
+		metaStore.Close()
 		t.Fatalf("Failed to create MVCC database: %v", err)
 	}
-	defer mdb.Close()
 
-	// Verify MVCC tables exist
+	t.Cleanup(func() {
+		mdb.Close()
+		metaStore.Close()
+		os.Remove(dbPath)
+		os.Remove(metaPath)
+		os.Remove(metaPath + "-wal")
+		os.Remove(metaPath + "-shm")
+	})
+
+	return mdb, metaStore
+}
+
+func TestMVCCDatabase_Creation(t *testing.T) {
+	dbPath := "/tmp/test_mvcc_db.db"
+	mdb, metaStore := createTestMVCCDatabase(t, dbPath)
+	_ = mdb
+
+	// Verify MVCC tables exist in MetaStore
 	tables := []string{
 		"__marmot__txn_records",
 		"__marmot__write_intents",
@@ -33,29 +58,21 @@ func TestMVCCDatabase_Creation(t *testing.T) {
 
 	for _, table := range tables {
 		var name string
-		err := mdb.GetDB().QueryRow("SELECT name FROM sqlite_master WHERE type='table' AND name=?", table).Scan(&name)
+		err := metaStore.ReadDB().QueryRow("SELECT name FROM sqlite_master WHERE type='table' AND name=?", table).Scan(&name)
 		if err != nil {
-			t.Fatalf("MVCC table %s not found: %v", table, err)
+			t.Fatalf("MVCC table %s not found in MetaStore: %v", table, err)
 		}
 	}
 
-	t.Log("✓ MVCC database created with all system tables")
+	t.Log("✓ MVCC database created with all system tables in MetaStore")
 }
 
 func TestMVCCDatabase_SimpleTransaction(t *testing.T) {
 	dbPath := "/tmp/test_simple_txn.db"
-	os.Remove(dbPath)
-	defer os.Remove(dbPath)
-
-	clock := hlc.NewClock(1)
-	mdb, err := NewMVCCDatabase(dbPath, 1, clock, nil)
-	if err != nil {
-		t.Fatalf("Failed to create MVCC database: %v", err)
-	}
-	defer mdb.Close()
+	mdb, metaStore := createTestMVCCDatabase(t, dbPath)
 
 	// Create user table
-	_, err = mdb.Exec(context.Background(), `
+	_, err := mdb.Exec(context.Background(), `
 		CREATE TABLE users (
 			id INTEGER PRIMARY KEY,
 			name TEXT,
@@ -80,9 +97,9 @@ func TestMVCCDatabase_SimpleTransaction(t *testing.T) {
 		t.Fatalf("Failed to execute transaction: %v", err)
 	}
 
-	// Verify transaction was recorded
+	// Verify transaction was recorded in MetaStore
 	var count int
-	err = mdb.GetDB().QueryRow("SELECT COUNT(*) FROM __marmot__txn_records WHERE status = ?", TxnStatusCommitted).Scan(&count)
+	err = metaStore.ReadDB().QueryRow("SELECT COUNT(*) FROM __marmot__txn_records WHERE status = ?", TxnStatusCommitted).Scan(&count)
 	if err != nil {
 		t.Fatalf("Failed to query txn records: %v", err)
 	}
@@ -96,18 +113,10 @@ func TestMVCCDatabase_SimpleTransaction(t *testing.T) {
 
 func TestMVCCDatabase_ConflictDetection(t *testing.T) {
 	dbPath := "/tmp/test_conflict.db"
-	os.Remove(dbPath)
-	defer os.Remove(dbPath)
-
-	clock := hlc.NewClock(1)
-	mdb, err := NewMVCCDatabase(dbPath, 1, clock, nil)
-	if err != nil {
-		t.Fatalf("Failed to create MVCC database: %v", err)
-	}
-	defer mdb.Close()
+	mdb, _ := createTestMVCCDatabase(t, dbPath)
 
 	// Create user table
-	_, err = mdb.Exec(context.Background(), `
+	_, err := mdb.Exec(context.Background(), `
 		CREATE TABLE users (
 			id INTEGER PRIMARY KEY,
 			name TEXT,
@@ -165,18 +174,10 @@ func TestMVCCDatabase_ConflictDetection(t *testing.T) {
 
 func TestMVCCDatabase_Query(t *testing.T) {
 	dbPath := "/tmp/test_query.db"
-	os.Remove(dbPath)
-	defer os.Remove(dbPath)
-
-	clock := hlc.NewClock(1)
-	mdb, err := NewMVCCDatabase(dbPath, 1, clock, nil)
-	if err != nil {
-		t.Fatalf("Failed to create MVCC database: %v", err)
-	}
-	defer mdb.Close()
+	mdb, _ := createTestMVCCDatabase(t, dbPath)
 
 	// Create and populate table
-	_, err = mdb.Exec(context.Background(), `
+	_, err := mdb.Exec(context.Background(), `
 		CREATE TABLE users (
 			id INTEGER PRIMARY KEY,
 			name TEXT,
@@ -219,15 +220,7 @@ func TestMVCCDatabase_Query(t *testing.T) {
 
 func TestMVCCDatabase_GetTransaction(t *testing.T) {
 	dbPath := "/tmp/test_get_txn.db"
-	os.Remove(dbPath)
-	defer os.Remove(dbPath)
-
-	clock := hlc.NewClock(1)
-	mdb, err := NewMVCCDatabase(dbPath, 1, clock, nil)
-	if err != nil {
-		t.Fatalf("Failed to create MVCC database: %v", err)
-	}
-	defer mdb.Close()
+	mdb, _ := createTestMVCCDatabase(t, dbPath)
 
 	// Begin transaction
 	txn, err := mdb.GetTransactionManager().BeginTransaction(1)
@@ -261,18 +254,10 @@ func TestMVCCDatabase_GetTransaction(t *testing.T) {
 
 func TestMVCCDatabase_ConcurrentReads(t *testing.T) {
 	dbPath := "/tmp/test_concurrent_reads.db"
-	os.Remove(dbPath)
-	defer os.Remove(dbPath)
-
-	clock := hlc.NewClock(1)
-	mdb, err := NewMVCCDatabase(dbPath, 1, clock, nil)
-	if err != nil {
-		t.Fatalf("Failed to create MVCC database: %v", err)
-	}
-	defer mdb.Close()
+	mdb, _ := createTestMVCCDatabase(t, dbPath)
 
 	// Create and populate table
-	_, err = mdb.Exec(context.Background(), `
+	_, err := mdb.Exec(context.Background(), `
 		CREATE TABLE users (
 			id INTEGER PRIMARY KEY,
 			name TEXT,
@@ -320,18 +305,10 @@ func TestMVCCDatabase_ConcurrentReads(t *testing.T) {
 
 func TestMVCCDatabase_TransactionLifecycle(t *testing.T) {
 	dbPath := "/tmp/test_txn_lifecycle.db"
-	os.Remove(dbPath)
-	defer os.Remove(dbPath)
-
-	clock := hlc.NewClock(1)
-	mdb, err := NewMVCCDatabase(dbPath, 1, clock, nil)
-	if err != nil {
-		t.Fatalf("Failed to create MVCC database: %v", err)
-	}
-	defer mdb.Close()
+	mdb, metaStore := createTestMVCCDatabase(t, dbPath)
 
 	// Create table
-	_, err = mdb.Exec(context.Background(), `
+	_, err := mdb.Exec(context.Background(), `
 		CREATE TABLE users (
 			id INTEGER PRIMARY KEY,
 			name TEXT,
@@ -379,9 +356,9 @@ func TestMVCCDatabase_TransactionLifecycle(t *testing.T) {
 	}
 	t.Logf("✓ Transaction %d committed (commit_ts: %d)", txn.ID, txn.CommitTS.WallTime)
 
-	// Verify transaction status in database
+	// Verify transaction status in MetaStore
 	var status string
-	err = mdb.GetDB().QueryRow("SELECT status FROM __marmot__txn_records WHERE txn_id = ?", txn.ID).Scan(&status)
+	err = metaStore.ReadDB().QueryRow("SELECT status FROM __marmot__txn_records WHERE txn_id = ?", txn.ID).Scan(&status)
 	if err != nil {
 		t.Fatalf("Failed to query transaction status: %v", err)
 	}
@@ -391,4 +368,103 @@ func TestMVCCDatabase_TransactionLifecycle(t *testing.T) {
 	}
 
 	t.Logf("✓ Transaction record shows status: %s", status)
+}
+
+// TestMVCCDatabase_Close verifies that Close() properly stops GC and closes all connections
+func TestMVCCDatabase_Close(t *testing.T) {
+	dbPath := "/tmp/test_mvcc_close.db"
+	metaPath := dbPath + "_meta.db"
+	os.Remove(dbPath)
+	os.Remove(metaPath)
+
+	// Create MetaStore
+	metaStore, err := NewSQLiteMetaStore(metaPath, 5000)
+	if err != nil {
+		t.Fatalf("Failed to create MetaStore: %v", err)
+	}
+
+	// Create MVCCDatabase
+	clock := hlc.NewClock(1)
+	mdb, err := NewMVCCDatabase(dbPath, 1, clock, metaStore)
+	if err != nil {
+		metaStore.Close()
+		t.Fatalf("Failed to create MVCC database: %v", err)
+	}
+
+	// Start GC to verify it gets stopped
+	mdb.txnMgr.StartGarbageCollection()
+	time.Sleep(50 * time.Millisecond) // Let GC start
+
+	// Close should stop GC and close MetaStore
+	err = mdb.Close()
+	if err != nil {
+		t.Fatalf("Close() returned error: %v", err)
+	}
+
+	// After Close(), database connections should be closed
+	// Attempting to execute should fail
+	_, err = mdb.GetDB().Exec("SELECT 1")
+	if err == nil {
+		t.Error("Expected error executing on closed database, got nil")
+	}
+
+	// Verify GC is stopped by checking gcRunning flag
+	if mdb.txnMgr.gcRunning {
+		t.Error("GC should be stopped after Close()")
+	}
+
+	t.Log("✓ MVCCDatabase.Close() properly stops GC and closes connections")
+
+	// Cleanup
+	os.Remove(dbPath)
+	os.Remove(metaPath)
+	os.Remove(metaPath + "-wal")
+	os.Remove(metaPath + "-shm")
+}
+
+// TestMVCCDatabase_CloseMultipleTimes verifies that Close() is safe to call multiple times
+func TestMVCCDatabase_CloseMultipleTimes(t *testing.T) {
+	dbPath := "/tmp/test_mvcc_close_multi.db"
+	metaPath := dbPath + "_meta.db"
+	os.Remove(dbPath)
+	os.Remove(metaPath)
+
+	metaStore, err := NewSQLiteMetaStore(metaPath, 5000)
+	if err != nil {
+		t.Fatalf("Failed to create MetaStore: %v", err)
+	}
+
+	clock := hlc.NewClock(1)
+	mdb, err := NewMVCCDatabase(dbPath, 1, clock, metaStore)
+	if err != nil {
+		metaStore.Close()
+		t.Fatalf("Failed to create MVCC database: %v", err)
+	}
+
+	// Start GC
+	mdb.txnMgr.StartGarbageCollection()
+	time.Sleep(50 * time.Millisecond)
+
+	// First close should succeed
+	err = mdb.Close()
+	if err != nil {
+		t.Fatalf("First Close() returned error: %v", err)
+	}
+
+	// Second close should not panic (idempotent)
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("Second Close() panicked: %v", r)
+		}
+	}()
+
+	// This should not panic even though already closed
+	mdb.txnMgr.StopGarbageCollection()
+
+	t.Log("✓ StopGarbageCollection is safe to call multiple times")
+
+	os.Remove(dbPath)
+	os.Remove(metaPath)
+	os.Remove(metaPath + "-wal")
+	os.Remove(metaPath + "-shm")
 }

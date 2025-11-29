@@ -186,11 +186,6 @@ func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transacti
 	// Execute prepare phase - single attempt, no retry
 	prepResponses, conflictErr := wc.executePreparePhase(ctx, txn, prepReq, otherNodes, skipLocalReplication)
 
-	// If local execution already done, count self as an ACK
-	if skipLocalReplication {
-		prepResponses[wc.nodeID] = &ReplicationResponse{Success: true}
-	}
-
 	if conflictErr != nil {
 		// Write-write conflict detected - abort and signal client to retry
 		log.Debug().
@@ -200,6 +195,14 @@ func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transacti
 		wc.abortTransaction(ctx, aliveNodes, txn.ID, txn.Database)
 		// Return MySQL 1213 (ER_LOCK_DEADLOCK) - standard signal for client retry
 		return protocol.ErrDeadlock()
+	}
+
+	// If local execution already done, count self as an ACK
+	if skipLocalReplication {
+		if prepResponses == nil {
+			prepResponses = make(map[uint64]*ReplicationResponse)
+		}
+		prepResponses[wc.nodeID] = &ReplicationResponse{Success: true}
 	}
 
 	// Check if quorum was achieved
@@ -344,7 +347,9 @@ func (wc *WriteCoordinator) executePreparePhase(ctx context.Context, txn *Transa
 	}
 
 	if totalNodes == 0 {
-		return nil, fmt.Errorf("no nodes to replicate to")
+		// No nodes to contact - this is OK if local execution was already done
+		// Return empty map, caller will add self if skipLocalReplication was true
+		return make(map[uint64]*ReplicationResponse), nil
 	}
 
 	// Channel for collecting responses

@@ -11,21 +11,20 @@ import (
 
 // TestHeartbeat tests that Heartbeat() updates the last_heartbeat timestamp
 func TestHeartbeat(t *testing.T) {
-	db := setupTestDB(t)
-	defer db.Close()
+	testDB := setupTestDBWithMeta(t)
 
 	clock := hlc.NewClock(1)
-	tm := NewMVCCTransactionManager(db, clock)
+	tm := NewMVCCTransactionManager(testDB.DB, testDB.MetaStore, clock)
 	defer tm.StopGarbageCollection()
 
 	// Begin transaction
 	txn, err := tm.BeginTransaction(1)
 	assertNoError(t, err, "BeginTransaction failed")
 
-	// Get initial heartbeat
-	var initialHeartbeat int64
-	err = db.QueryRow("SELECT last_heartbeat FROM __marmot__txn_records WHERE txn_id = ?", txn.ID).Scan(&initialHeartbeat)
-	assertNoError(t, err, "Failed to get initial heartbeat")
+	// Get initial heartbeat from MetaStore
+	txnRecord, err := testDB.MetaStore.GetTransaction(txn.ID)
+	assertNoError(t, err, "Failed to get initial transaction record")
+	initialHeartbeat := txnRecord.LastHeartbeat
 
 	t.Logf("Initial heartbeat: %d", initialHeartbeat)
 
@@ -36,10 +35,10 @@ func TestHeartbeat(t *testing.T) {
 	err = tm.Heartbeat(txn)
 	assertNoError(t, err, "Heartbeat failed")
 
-	// Get updated heartbeat
-	var updatedHeartbeat int64
-	err = db.QueryRow("SELECT last_heartbeat FROM __marmot__txn_records WHERE txn_id = ?", txn.ID).Scan(&updatedHeartbeat)
-	assertNoError(t, err, "Failed to get updated heartbeat")
+	// Get updated heartbeat from MetaStore
+	txnRecord, err = testDB.MetaStore.GetTransaction(txn.ID)
+	assertNoError(t, err, "Failed to get updated transaction record")
+	updatedHeartbeat := txnRecord.LastHeartbeat
 
 	t.Logf("Updated heartbeat: %d", updatedHeartbeat)
 
@@ -53,18 +52,17 @@ func TestHeartbeat(t *testing.T) {
 
 // TestHeartbeatKeepsTransactionAlive tests that regular heartbeats prevent GC cleanup
 func TestHeartbeatKeepsTransactionAlive(t *testing.T) {
-	db := setupTestDB(t)
-	defer db.Close()
+	testDB := setupTestDBWithMeta(t)
 
 	clock := hlc.NewClock(1)
 
 	// Create transaction manager with very short timeout for faster testing
-	tm := NewMVCCTransactionManager(db, clock)
+	tm := NewMVCCTransactionManager(testDB.DB, testDB.MetaStore, clock)
 	tm.heartbeatTimeout = 200 * time.Millisecond // Short timeout for testing
 	tm.StartGarbageCollection()
 	defer tm.StopGarbageCollection()
 
-	createUserTable(t, db)
+	createUserTable(t, testDB.DB)
 
 	// Begin transaction
 	txn, err := tm.BeginTransaction(1)
@@ -115,13 +113,12 @@ func TestHeartbeatKeepsTransactionAlive(t *testing.T) {
 	<-heartbeatDone
 
 	// Verify transaction is still PENDING
-	verifyTransactionStatus(t, db, txn.ID, TxnStatusPending)
+	verifyTransactionStatusMeta(t, testDB.MetaStore, txn.ID, TxnStatusPending)
 
-	// Verify write intent still exists
-	var intentCount int
-	db.QueryRow("SELECT COUNT(*) FROM __marmot__write_intents WHERE txn_id = ?", txn.ID).Scan(&intentCount)
-	if intentCount != 1 {
-		t.Errorf("Expected write intent to still exist, found %d", intentCount)
+	// Verify write intent still exists in MetaStore
+	intents, _ := testDB.MetaStore.GetIntentsByTxn(txn.ID)
+	if len(intents) != 1 {
+		t.Errorf("Expected write intent to still exist, found %d", len(intents))
 	}
 
 	t.Log("✓ Transaction kept alive by regular heartbeats")
@@ -132,18 +129,17 @@ func TestHeartbeatKeepsTransactionAlive(t *testing.T) {
 
 // TestStaleTransactionCleanup tests that GC aborts transactions without heartbeat
 func TestStaleTransactionCleanup(t *testing.T) {
-	db := setupTestDB(t)
-	defer db.Close()
+	testDB := setupTestDBWithMeta(t)
 
 	clock := hlc.NewClock(1)
 
 	// Create transaction manager with short timeout
-	tm := NewMVCCTransactionManager(db, clock)
+	tm := NewMVCCTransactionManager(testDB.DB, testDB.MetaStore, clock)
 	tm.heartbeatTimeout = 100 * time.Millisecond
 	tm.StartGarbageCollection()
 	defer tm.StopGarbageCollection()
 
-	createUserTable(t, db)
+	createUserTable(t, testDB.DB)
 
 	// Begin transaction
 	txn, err := tm.BeginTransaction(1)
@@ -165,7 +161,7 @@ func TestStaleTransactionCleanup(t *testing.T) {
 	t.Log("✓ Transaction created with write intent")
 
 	// Verify transaction is PENDING
-	verifyTransactionStatus(t, db, txn.ID, TxnStatusPending)
+	verifyTransactionStatusMeta(t, testDB.MetaStore, txn.ID, TxnStatusPending)
 
 	// Don't send any heartbeats - let it go stale
 	// Wait for timeout + GC interval
@@ -183,24 +179,23 @@ func TestStaleTransactionCleanup(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// Verify transaction was aborted
-	verifyTransactionStatus(t, db, txn.ID, TxnStatusAborted)
+	verifyTransactionStatusMeta(t, testDB.MetaStore, txn.ID, TxnStatusAborted)
 
 	// Verify write intent was cleaned up
-	verifyWriteIntentsCleared(t, db, txn.ID)
+	verifyWriteIntentsClearedMeta(t, testDB.MetaStore, txn.ID)
 
 	t.Log("✓ Stale transaction was aborted by GC")
 }
 
 // TestOldTransactionRecordCleanup tests that GC removes old transaction records
 func TestOldTransactionRecordCleanup(t *testing.T) {
-	db := setupTestDB(t)
-	defer db.Close()
+	testDB := setupTestDBWithMeta(t)
 
 	clock := hlc.NewClock(1)
-	tm := NewMVCCTransactionManager(db, clock)
+	tm := NewMVCCTransactionManager(testDB.DB, testDB.MetaStore, clock)
 	defer tm.StopGarbageCollection()
 
-	createUserTable(t, db)
+	createUserTable(t, testDB.DB)
 
 	// Create and commit a transaction
 	txn, err := tm.BeginTransaction(1)
@@ -223,17 +218,16 @@ func TestOldTransactionRecordCleanup(t *testing.T) {
 
 	t.Log("✓ Transaction committed")
 
-	// Verify transaction record exists
-	var count int
-	db.QueryRow("SELECT COUNT(*) FROM __marmot__txn_records WHERE txn_id = ?", txn.ID).Scan(&count)
-	if count != 1 {
-		t.Fatalf("Expected transaction record to exist, found %d", count)
+	// Verify transaction record exists in MetaStore
+	txnRecord, err := testDB.MetaStore.GetTransaction(txn.ID)
+	if err != nil || txnRecord == nil {
+		t.Fatalf("Expected transaction record to exist, got error: %v", err)
 	}
 
 	// Manually set the created_at to 25 hours ago (older than 24 hour default max retention)
 	// Note: The config default is 24 hours, not the code fallback of 4 hours
 	oldTS := time.Now().Add(-25 * time.Hour).UnixNano()
-	_, err = db.Exec("UPDATE __marmot__txn_records SET created_at = ? WHERE txn_id = ?", oldTS, txn.ID)
+	_, err = testDB.MetaStore.WriteDB().Exec("UPDATE __marmot__txn_records SET created_at = ? WHERE txn_id = ?", oldTS, txn.ID)
 	assertNoError(t, err, "Failed to update created_at")
 
 	t.Log("✓ Simulated old transaction record (25 hours old)")
@@ -244,10 +238,10 @@ func TestOldTransactionRecordCleanup(t *testing.T) {
 
 	t.Logf("GC cleaned up %d old transaction records", cleanedCount)
 
-	// Verify transaction record was removed
-	db.QueryRow("SELECT COUNT(*) FROM __marmot__txn_records WHERE txn_id = ?", txn.ID).Scan(&count)
-	if count != 0 {
-		t.Errorf("Expected transaction record to be removed, found %d", count)
+	// Verify transaction record was removed from MetaStore
+	txnRecord, _ = testDB.MetaStore.GetTransaction(txn.ID)
+	if txnRecord != nil {
+		t.Errorf("Expected transaction record to be removed, but it still exists")
 	}
 
 	t.Log("✓ Old transaction record was cleaned up")
@@ -255,17 +249,16 @@ func TestOldTransactionRecordCleanup(t *testing.T) {
 
 // TestOldMVCCVersionCleanup tests that GC keeps only the last N versions per row
 func TestOldMVCCVersionCleanup(t *testing.T) {
-	db := setupTestDB(t)
-	defer db.Close()
+	testDB := setupTestDBWithMeta(t)
 
 	clock := hlc.NewClock(1)
-	tm := NewMVCCTransactionManager(db, clock)
+	tm := NewMVCCTransactionManager(testDB.DB, testDB.MetaStore, clock)
 	defer tm.StopGarbageCollection()
 
-	createUserTable(t, db)
+	createUserTable(t, testDB.DB)
 
 	// Insert initial row
-	db.Exec("INSERT INTO users (id, name, balance) VALUES (1, 'Alice', 100)")
+	testDB.DB.Exec("INSERT INTO users (id, name, balance) VALUES (1, 'Alice', 100)")
 
 	// Create 15 versions of the same row
 	for i := 0; i < 15; i++ {
@@ -293,8 +286,8 @@ func TestOldMVCCVersionCleanup(t *testing.T) {
 
 	t.Log("✓ Created 15 MVCC versions for users:1")
 
-	// Verify we have 15 versions
-	versionCount := countMVCCVersions(t, db, "users", "1")
+	// Verify we have 15 versions in MetaStore
+	versionCount := countMVCCVersionsMeta(t, testDB.MetaStore, "users", "1")
 	if versionCount != 15 {
 		t.Errorf("Expected 15 versions, found %d", versionCount)
 	}
@@ -305,8 +298,8 @@ func TestOldMVCCVersionCleanup(t *testing.T) {
 
 	t.Logf("GC cleaned up %d old MVCC versions", cleanedCount)
 
-	// Verify only 10 versions remain
-	versionCount = countMVCCVersions(t, db, "users", "1")
+	// Verify only 10 versions remain in MetaStore
+	versionCount = countMVCCVersionsMeta(t, testDB.MetaStore, "users", "1")
 	if versionCount != 10 {
 		t.Errorf("Expected 10 versions after GC, found %d", versionCount)
 	}
@@ -316,17 +309,16 @@ func TestOldMVCCVersionCleanup(t *testing.T) {
 
 // TestGarbageCollectionIntegration tests the full GC lifecycle
 func TestGarbageCollectionIntegration(t *testing.T) {
-	db := setupTestDB(t)
-	defer db.Close()
+	testDB := setupTestDBWithMeta(t)
 
 	clock := hlc.NewClock(1)
 
-	tm := NewMVCCTransactionManager(db, clock)
+	tm := NewMVCCTransactionManager(testDB.DB, testDB.MetaStore, clock)
 	tm.heartbeatTimeout = 100 * time.Millisecond
 	tm.StartGarbageCollection()
 	defer tm.StopGarbageCollection()
 
-	createUserTable(t, db)
+	createUserTable(t, testDB.DB)
 
 	// Create a stale transaction
 	staleTxn, err := tm.BeginTransaction(1)
@@ -385,11 +377,11 @@ func TestGarbageCollectionIntegration(t *testing.T) {
 	// Stop heartbeats
 	close(stopHeartbeat)
 
-	// Verify stale transaction was aborted
-	verifyTransactionStatus(t, db, staleTxn.ID, TxnStatusAborted)
+	// Verify stale transaction was aborted using MetaStore
+	verifyTransactionStatusMeta(t, testDB.MetaStore, staleTxn.ID, TxnStatusAborted)
 
-	// Verify active transaction is still pending
-	verifyTransactionStatus(t, db, activeTxn.ID, TxnStatusPending)
+	// Verify active transaction is still pending using MetaStore
+	verifyTransactionStatusMeta(t, testDB.MetaStore, activeTxn.ID, TxnStatusPending)
 
 	t.Log("✓ GC correctly distinguished stale vs active transactions")
 
