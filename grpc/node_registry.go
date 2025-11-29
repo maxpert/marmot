@@ -28,6 +28,7 @@ func copyNodeState(node *NodeState) *NodeState {
 		Status:                 node.Status,
 		Incarnation:            node.Incarnation,
 		DatabaseSchemaVersions: copySchemaVersionMap(node.DatabaseSchemaVersions),
+		MinAppliedSeq:          node.MinAppliedSeq,
 	}
 }
 
@@ -635,4 +636,70 @@ func (nr *NodeRegistry) QuorumInfo() (totalMembership int, aliveCount int, quoru
 	// Quorum = majority of total membership
 	quorumSize = (totalMembership / 2) + 1
 	return
+}
+
+// =======================
+// WATERMARK PROTOCOL
+// =======================
+
+// UpdateLocalWatermark updates the minimum applied sequence number for the local node
+// This watermark is gossiped to all peers and used for GC coordination
+func (nr *NodeRegistry) UpdateLocalWatermark(minSeq uint64) {
+	nr.mu.Lock()
+	defer nr.mu.Unlock()
+
+	node, exists := nr.nodes[nr.localNodeID]
+	if !exists {
+		log.Error().
+			Uint64("node_id", nr.localNodeID).
+			Msg("BUG: Local node not found in registry during watermark update")
+		return
+	}
+
+	// Only update if the new watermark is higher (watermarks only advance)
+	if minSeq > node.MinAppliedSeq {
+		node.MinAppliedSeq = minSeq
+		log.Debug().
+			Uint64("node_id", nr.localNodeID).
+			Uint64("watermark", minSeq).
+			Msg("Updated local watermark")
+	}
+}
+
+// GetLocalWatermark returns the local node's watermark
+func (nr *NodeRegistry) GetLocalWatermark() uint64 {
+	nr.mu.RLock()
+	defer nr.mu.RUnlock()
+
+	if node, exists := nr.nodes[nr.localNodeID]; exists {
+		return node.MinAppliedSeq
+	}
+	return 0
+}
+
+// GetClusterMinWatermark returns the minimum watermark across all ALIVE nodes
+// This is the safe point for garbage collection - transactions with seq_num below
+// this value have been applied by all nodes and can be safely cleaned up
+func (nr *NodeRegistry) GetClusterMinWatermark() uint64 {
+	nr.mu.RLock()
+	defer nr.mu.RUnlock()
+
+	var minWatermark uint64 = ^uint64(0) // Max uint64
+	hasAliveNodes := false
+
+	for _, node := range nr.nodes {
+		if node.Status == NodeStatus_ALIVE {
+			hasAliveNodes = true
+			if node.MinAppliedSeq < minWatermark {
+				minWatermark = node.MinAppliedSeq
+			}
+		}
+	}
+
+	// If no alive nodes (shouldn't happen, we're always alive), return 0
+	if !hasAliveNodes {
+		return 0
+	}
+
+	return minWatermark
 }

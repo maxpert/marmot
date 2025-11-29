@@ -381,12 +381,19 @@ func (s *Server) StreamChanges(req *StreamRequest, stream MarmotService_StreamCh
 		}
 
 		// Query committed transactions after from_txn_id with statements
-		rows, err := mdb.GetDB().Query(`
-			SELECT txn_id, commit_ts_wall, commit_ts_logical,
+		// Use MetaStore for transaction records (they're stored in meta database)
+		metaStore := mdb.GetMetaStore()
+		if metaStore == nil {
+			log.Warn().Str("database", dbName).Msg("MetaStore not available for streaming")
+			continue
+		}
+
+		rows, err := metaStore.ReadDB().Query(`
+			SELECT txn_id, COALESCE(seq_num, 0), commit_ts_wall, commit_ts_logical,
 			       COALESCE(statements_json, '[]'), COALESCE(database_name, '')
 			FROM __marmot__txn_records
 			WHERE status = 'COMMITTED' AND txn_id > ?
-			ORDER BY txn_id
+			ORDER BY seq_num, txn_id
 		`, req.FromTxnId)
 		if err != nil {
 			log.Warn().Err(err).Str("database", dbName).Msg("Failed to query transactions")
@@ -395,12 +402,13 @@ func (s *Server) StreamChanges(req *StreamRequest, stream MarmotService_StreamCh
 
 		for rows.Next() {
 			var txnID uint64
+			var seqNum uint64
 			var commitWall int64
 			var commitLogical int32
 			var statementsJSON string
 			var databaseName string
 
-			if err := rows.Scan(&txnID, &commitWall, &commitLogical, &statementsJSON, &databaseName); err != nil {
+			if err := rows.Scan(&txnID, &seqNum, &commitWall, &commitLogical, &statementsJSON, &databaseName); err != nil {
 				log.Warn().Err(err).Msg("Failed to scan transaction")
 				continue
 			}
@@ -474,7 +482,8 @@ func (s *Server) StreamChanges(req *StreamRequest, stream MarmotService_StreamCh
 			}
 
 			event := &ChangeEvent{
-				TxnId: txnID,
+				TxnId:  txnID,
+				SeqNum: seqNum,
 				Timestamp: &HLC{
 					WallTime: commitWall,
 					Logical:  commitLogical,
@@ -566,6 +575,13 @@ func (s *Server) GetReplicationState(ctx context.Context, req *ReplicationStateR
 			txnCount = 0
 		}
 
+		// Get max sequence number for gap detection
+		maxSeqNum, err := dbManager.GetMaxSeqNum(dbName)
+		if err != nil {
+			log.Warn().Err(err).Str("database", dbName).Msg("Failed to get max seq_num")
+			maxSeqNum = 0
+		}
+
 		states = append(states, &DatabaseReplicationState{
 			DatabaseName:         dbName,
 			LastAppliedTxnId:     lastAppliedTxnID,
@@ -574,6 +590,7 @@ func (s *Server) GetReplicationState(ctx context.Context, req *ReplicationStateR
 			SyncStatus:           syncStatus,
 			CurrentMaxTxnId:      maxTxnID,
 			CommittedTxnCount:    txnCount,
+			MaxSeqNum:            maxSeqNum,
 		})
 	}
 

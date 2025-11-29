@@ -143,14 +143,28 @@ func (s *SQLiteMetaStore) BeginTransaction(txnID, nodeID uint64, startTS hlc.Tim
 }
 
 // CommitTransaction marks a transaction as COMMITTED
+// The seq_num is assigned atomically from the node_sequences table
 func (s *SQLiteMetaStore) CommitTransaction(txnID uint64, commitTS hlc.Timestamp, statements []byte, dbName string) error {
-	_, err := s.writeDB.Exec(`
+	// Get the node_id from the transaction record to determine which sequence to use
+	var nodeID uint64
+	err := s.readDB.QueryRow(`SELECT node_id FROM __marmot__txn_records WHERE txn_id = ?`, txnID).Scan(&nodeID)
+	if err != nil {
+		return fmt.Errorf("failed to get node_id for txn %d: %w", txnID, err)
+	}
+
+	// Get next sequence number for this node
+	seqNum, err := s.GetNextSeqNum(nodeID)
+	if err != nil {
+		return fmt.Errorf("failed to get next seq_num for node %d: %w", nodeID, err)
+	}
+
+	_, err = s.writeDB.Exec(`
 		UPDATE __marmot__txn_records
 		SET status = ?, commit_ts_wall = ?, commit_ts_logical = ?, committed_at = ?,
-		    statements_json = ?, database_name = ?
+		    statements_json = ?, database_name = ?, seq_num = ?
 		WHERE txn_id = ?
 	`, MetaTxnStatusCommitted, commitTS.WallTime, commitTS.Logical, time.Now().UnixNano(),
-		string(statements), dbName, txnID)
+		string(statements), dbName, seqNum, txnID)
 	return err
 }
 
@@ -163,7 +177,7 @@ func (s *SQLiteMetaStore) AbortTransaction(txnID uint64) error {
 // GetTransaction retrieves a transaction record by ID
 func (s *SQLiteMetaStore) GetTransaction(txnID uint64) (*TransactionRecord, error) {
 	row := s.readDB.QueryRow(`
-		SELECT txn_id, node_id, status, start_ts_wall, start_ts_logical,
+		SELECT txn_id, node_id, COALESCE(seq_num, 0), status, start_ts_wall, start_ts_logical,
 		       COALESCE(commit_ts_wall, 0), COALESCE(commit_ts_logical, 0),
 		       created_at, COALESCE(committed_at, 0), COALESCE(last_heartbeat, 0),
 		       COALESCE(tables_involved, ''), COALESCE(statements_json, ''),
@@ -174,7 +188,7 @@ func (s *SQLiteMetaStore) GetTransaction(txnID uint64) (*TransactionRecord, erro
 
 	rec := &TransactionRecord{}
 	var stmtsJSON string
-	err := row.Scan(&rec.TxnID, &rec.NodeID, &rec.Status, &rec.StartTSWall, &rec.StartTSLogical,
+	err := row.Scan(&rec.TxnID, &rec.NodeID, &rec.SeqNum, &rec.Status, &rec.StartTSWall, &rec.StartTSLogical,
 		&rec.CommitTSWall, &rec.CommitTSLogical, &rec.CreatedAt, &rec.CommittedAt,
 		&rec.LastHeartbeat, &rec.TablesInvolved, &stmtsJSON, &rec.DatabaseName)
 	if err == sql.ErrNoRows {
@@ -190,7 +204,7 @@ func (s *SQLiteMetaStore) GetTransaction(txnID uint64) (*TransactionRecord, erro
 // GetPendingTransactions retrieves all PENDING transactions
 func (s *SQLiteMetaStore) GetPendingTransactions() ([]*TransactionRecord, error) {
 	rows, err := s.readDB.Query(`
-		SELECT txn_id, node_id, status, start_ts_wall, start_ts_logical,
+		SELECT txn_id, node_id, COALESCE(seq_num, 0), status, start_ts_wall, start_ts_logical,
 		       COALESCE(commit_ts_wall, 0), COALESCE(commit_ts_logical, 0),
 		       created_at, COALESCE(committed_at, 0), COALESCE(last_heartbeat, 0),
 		       COALESCE(tables_involved, ''), COALESCE(statements_json, ''),
@@ -207,7 +221,7 @@ func (s *SQLiteMetaStore) GetPendingTransactions() ([]*TransactionRecord, error)
 	for rows.Next() {
 		rec := &TransactionRecord{}
 		var stmtsJSON string
-		if err := rows.Scan(&rec.TxnID, &rec.NodeID, &rec.Status, &rec.StartTSWall, &rec.StartTSLogical,
+		if err := rows.Scan(&rec.TxnID, &rec.NodeID, &rec.SeqNum, &rec.Status, &rec.StartTSWall, &rec.StartTSLogical,
 			&rec.CommitTSWall, &rec.CommitTSLogical, &rec.CreatedAt, &rec.CommittedAt,
 			&rec.LastHeartbeat, &rec.TablesInvolved, &stmtsJSON, &rec.DatabaseName); err != nil {
 			return nil, err
@@ -237,7 +251,8 @@ func (s *SQLiteMetaStore) WriteIntent(txnID uint64, tableName, rowKey, op, sqlSt
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE constraint failed") || strings.Contains(err.Error(), "PRIMARY KEY constraint failed") {
 			var conflictTxnID uint64
-			queryErr := s.readDB.QueryRow(`
+			// Use writeDB here to get latest data - readDB may have stale WAL snapshot
+			queryErr := s.writeDB.QueryRow(`
 				SELECT txn_id FROM __marmot__write_intents WHERE table_name = ? AND row_key = ?
 			`, tableName, rowKey).Scan(&conflictTxnID)
 
@@ -261,9 +276,10 @@ func (s *SQLiteMetaStore) WriteIntent(txnID uint64, tableName, rowKey, op, sqlSt
 }
 
 // ValidateIntent checks if the intent is still held by the expected transaction
+// Uses writeDB to get latest data - intent queries must be consistent with writes
 func (s *SQLiteMetaStore) ValidateIntent(tableName, rowKey string, expectedTxnID uint64) (bool, error) {
 	var currentTxnID uint64
-	err := s.readDB.QueryRow(`
+	err := s.writeDB.QueryRow(`
 		SELECT txn_id FROM __marmot__write_intents WHERE table_name = ? AND row_key = ?
 	`, tableName, rowKey).Scan(&currentTxnID)
 
@@ -291,8 +307,9 @@ func (s *SQLiteMetaStore) DeleteIntentsByTxn(txnID uint64) error {
 }
 
 // GetIntentsByTxn retrieves all write intents for a transaction
+// Uses writeDB to get latest data - intent queries must be consistent with writes
 func (s *SQLiteMetaStore) GetIntentsByTxn(txnID uint64) ([]*WriteIntentRecord, error) {
-	rows, err := s.readDB.Query(`
+	rows, err := s.writeDB.Query(`
 		SELECT table_name, row_key, txn_id, ts_wall, ts_logical, node_id, operation, sql_statement, data_snapshot, created_at
 		FROM __marmot__write_intents WHERE txn_id = ?
 	`, txnID)
@@ -314,8 +331,9 @@ func (s *SQLiteMetaStore) GetIntentsByTxn(txnID uint64) ([]*WriteIntentRecord, e
 }
 
 // GetIntent retrieves a specific write intent
+// Uses writeDB to get latest data - intent queries must be consistent with writes
 func (s *SQLiteMetaStore) GetIntent(tableName, rowKey string) (*WriteIntentRecord, error) {
-	row := s.readDB.QueryRow(`
+	row := s.writeDB.QueryRow(`
 		SELECT table_name, row_key, txn_id, ts_wall, ts_logical, node_id, operation, sql_statement, data_snapshot, created_at
 		FROM __marmot__write_intents WHERE table_name = ? AND row_key = ?
 	`, tableName, rowKey)
@@ -472,8 +490,9 @@ func (s *SQLiteMetaStore) WriteIntentEntry(txnID, seq uint64, op uint8, table, r
 }
 
 // GetIntentEntries retrieves CDC intent entries for a transaction
+// Uses writeDB to get latest data - intent queries must be consistent with writes
 func (s *SQLiteMetaStore) GetIntentEntries(txnID uint64) ([]*IntentEntry, error) {
-	rows, err := s.readDB.Query(`
+	rows, err := s.writeDB.Query(`
 		SELECT txn_id, seq, operation, table_name, row_key, old_values, new_values, created_at
 		FROM __marmot__intent_entries
 		WHERE txn_id = ?
@@ -510,9 +529,11 @@ func (s *SQLiteMetaStore) DeleteIntentEntries(txnID uint64) error {
 }
 
 // CleanupStaleTransactions aborts transactions that haven't had a heartbeat within the timeout
+// Also cleans up orphaned intents (intents whose transaction record doesn't exist)
 func (s *SQLiteMetaStore) CleanupStaleTransactions(timeout time.Duration) (int, error) {
 	cutoff := time.Now().Add(-timeout).UnixNano()
 
+	// Part 1: Clean up stale PENDING transactions with old heartbeats
 	rows, err := s.readDB.Query(`
 		SELECT txn_id FROM __marmot__txn_records
 		WHERE status = ? AND last_heartbeat < ?
@@ -539,14 +560,43 @@ func (s *SQLiteMetaStore) CleanupStaleTransactions(timeout time.Duration) (int, 
 		s.writeDB.Exec(`DELETE FROM __marmot__intent_entries WHERE txn_id = ?`, txnID)
 	}
 
-	if len(staleTxnIDs) > 0 {
-		log.Info().Int("count", len(staleTxnIDs)).Msg("MetaStore GC: Cleaned up stale transactions")
+	// Part 2: Clean up orphaned intents (intents with no corresponding transaction record)
+	// These can occur when a coordinator crashes before committing/aborting
+	orphanedResult, err := s.writeDB.Exec(`
+		DELETE FROM __marmot__write_intents
+		WHERE created_at < ? AND txn_id NOT IN (
+			SELECT txn_id FROM __marmot__txn_records
+		)
+	`, cutoff)
+	orphanedCount := int64(0)
+	if err == nil {
+		orphanedCount, _ = orphanedResult.RowsAffected()
 	}
-	return len(staleTxnIDs), nil
+
+	// Also clean orphaned intent_entries
+	s.writeDB.Exec(`
+		DELETE FROM __marmot__intent_entries
+		WHERE created_at < ? AND txn_id NOT IN (
+			SELECT txn_id FROM __marmot__txn_records
+		)
+	`, cutoff)
+
+	totalCleaned := len(staleTxnIDs) + int(orphanedCount)
+	if totalCleaned > 0 {
+		log.Info().
+			Int("stale_txns", len(staleTxnIDs)).
+			Int64("orphaned_intents", orphanedCount).
+			Msg("MetaStore GC: Cleaned up stale transactions and orphaned intents")
+	}
+	return totalCleaned, nil
 }
 
 // CleanupOldTransactionRecords removes old COMMITTED/ABORTED transaction records
-func (s *SQLiteMetaStore) CleanupOldTransactionRecords(minRetention, maxRetention time.Duration, minAppliedTxnID uint64) (int, error) {
+// Uses belt-and-suspenders approach:
+// - minAppliedTxnID: Minimum txn_id applied by all peers (from anti-entropy queries)
+// - minAppliedSeqNum: Minimum seq_num from cluster watermark gossip protocol
+// Records are only deleted if they pass BOTH constraints (when both are provided)
+func (s *SQLiteMetaStore) CleanupOldTransactionRecords(minRetention, maxRetention time.Duration, minAppliedTxnID, minAppliedSeqNum uint64) (int, error) {
 	now := time.Now()
 	minRetentionCutoff := now.Add(-minRetention).UnixNano()
 	maxRetentionCutoff := now.Add(-maxRetention).UnixNano()
@@ -554,7 +604,22 @@ func (s *SQLiteMetaStore) CleanupOldTransactionRecords(minRetention, maxRetentio
 	var result sql.Result
 	var err error
 
-	if minAppliedTxnID > 0 {
+	// Build query based on which constraints are available
+	// Priority: Use both when available, fall back to single constraint, then time-only
+	if minAppliedTxnID > 0 && minAppliedSeqNum > 0 {
+		// Both constraints: require both txn_id AND seq_num to pass (belt-and-suspenders)
+		result, err = s.writeDB.Exec(`
+			DELETE FROM __marmot__txn_records
+			WHERE (status = ? OR status = ?)
+			  AND (
+			    (created_at < ? AND txn_id < ? AND (seq_num IS NULL OR seq_num < ?))
+			    OR created_at < ?
+			  )
+		`, MetaTxnStatusCommitted, MetaTxnStatusAborted,
+			minRetentionCutoff, minAppliedTxnID, minAppliedSeqNum,
+			maxRetentionCutoff)
+	} else if minAppliedTxnID > 0 {
+		// Only txn_id constraint
 		result, err = s.writeDB.Exec(`
 			DELETE FROM __marmot__txn_records
 			WHERE (status = ? OR status = ?)
@@ -565,7 +630,20 @@ func (s *SQLiteMetaStore) CleanupOldTransactionRecords(minRetention, maxRetentio
 		`, MetaTxnStatusCommitted, MetaTxnStatusAborted,
 			minRetentionCutoff, minAppliedTxnID,
 			maxRetentionCutoff)
+	} else if minAppliedSeqNum > 0 {
+		// Only seq_num constraint (from cluster watermark)
+		result, err = s.writeDB.Exec(`
+			DELETE FROM __marmot__txn_records
+			WHERE (status = ? OR status = ?)
+			  AND (
+			    (created_at < ? AND (seq_num IS NULL OR seq_num < ?))
+			    OR created_at < ?
+			  )
+		`, MetaTxnStatusCommitted, MetaTxnStatusAborted,
+			minRetentionCutoff, minAppliedSeqNum,
+			maxRetentionCutoff)
 	} else {
+		// No coordination constraints - use max retention only
 		result, err = s.writeDB.Exec(`
 			DELETE FROM __marmot__txn_records
 			WHERE (status = ? OR status = ?) AND created_at < ?
@@ -610,4 +688,51 @@ func (s *SQLiteMetaStore) CleanupOldMVCCVersions(keepVersions int) (int, error) 
 		log.Info().Int64("deleted_versions", rowsAffected).Msg("MetaStore GC: Cleaned up old MVCC versions")
 	}
 	return int(rowsAffected), nil
+}
+
+// GetNextSeqNum atomically increments and returns the next sequence number for a node
+func (s *SQLiteMetaStore) GetNextSeqNum(nodeID uint64) (uint64, error) {
+	var seq uint64
+	err := s.writeDB.QueryRow(`
+		INSERT INTO __marmot__node_sequences (node_id, last_seq_num)
+		VALUES (?, 1)
+		ON CONFLICT(node_id) DO UPDATE SET last_seq_num = last_seq_num + 1
+		RETURNING last_seq_num
+	`, nodeID).Scan(&seq)
+	return seq, err
+}
+
+// GetMaxSeqNum returns the maximum sequence number across all committed transactions
+func (s *SQLiteMetaStore) GetMaxSeqNum() (uint64, error) {
+	var seq sql.NullInt64
+	err := s.readDB.QueryRow(`
+		SELECT MAX(seq_num) FROM __marmot__txn_records
+		WHERE status = ? AND seq_num IS NOT NULL
+	`, MetaTxnStatusCommitted).Scan(&seq)
+	if err != nil {
+		return 0, err
+	}
+	if !seq.Valid {
+		return 0, nil
+	}
+	return uint64(seq.Int64), nil
+}
+
+// GetMinAppliedSeqNum returns the minimum applied sequence number across all peers for a database
+// This is used as the watermark for GC - we can't delete transactions with seq_num >= this value
+func (s *SQLiteMetaStore) GetMinAppliedSeqNum(dbName string) (uint64, error) {
+	// For now, this queries the minimum last_applied_txn_id as a proxy for sequence
+	// TODO: Update replication_state table to track seq_num directly
+	var minSeq sql.NullInt64
+	err := s.readDB.QueryRow(`
+		SELECT MIN(last_applied_txn_id) FROM __marmot__replication_state
+		WHERE database_name = ?
+	`, dbName).Scan(&minSeq)
+	if err != nil {
+		return 0, err
+	}
+	if !minSeq.Valid {
+		return 0, nil
+	}
+	return uint64(minSeq.Int64), nil
 }

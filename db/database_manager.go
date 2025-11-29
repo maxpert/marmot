@@ -1034,3 +1034,21 @@ func (dm *DatabaseManager) GetCommittedTxnCount(database string) (int64, error) 
 	return count, err
 }
 
+// GetMaxSeqNum returns the maximum sequence number in a database
+// This is used by anti-entropy for gap detection
+func (dm *DatabaseManager) GetMaxSeqNum(database string) (uint64, error) {
+	dm.mu.RLock()
+	defer dm.mu.RUnlock()
+
+	db, ok := dm.databases[database]
+	if !ok {
+		return 0, fmt.Errorf("database %s not found", database)
+	}
+
+	metaStore := db.GetMetaStore()
+	if metaStore == nil {
+		return 0, nil // System DB has no transaction records
+	}
+
+	return metaStore.GetMaxSeqNum()
+}

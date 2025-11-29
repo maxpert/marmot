@@ -383,6 +383,17 @@ func (rh *ReplicationHandler) handleCommit(ctx context.Context, req *Transaction
 	// Retrieve transaction from active transactions
 	txn := txnMgr.GetTransaction(req.TxnId)
 	if txn == nil {
+		// Transaction not found in memory - clean up any orphaned intents
+		// This can happen if:
+		// 1. Prepare succeeded but transaction was removed from memory (timeout/GC)
+		// 2. Different node is receiving the commit request
+		// 3. Race condition between prepare and commit
+		metaStore := dbInstance.GetMetaStore()
+		if metaStore != nil {
+			if err := metaStore.DeleteIntentsByTxn(req.TxnId); err != nil {
+				log.Warn().Err(err).Uint64("txn_id", req.TxnId).Msg("Failed to cleanup orphaned intents during commit")
+			}
+		}
 		return &TransactionResponse{
 			Success:      false,
 			ErrorMessage: fmt.Sprintf("transaction %d not found", req.TxnId),
@@ -392,6 +403,11 @@ func (rh *ReplicationHandler) handleCommit(ctx context.Context, req *Transaction
 	// Commit the transaction
 	err = txnMgr.CommitTransaction(txn)
 	if err != nil {
+		// Commit failed - clean up intents to avoid blocking future transactions
+		metaStore := dbInstance.GetMetaStore()
+		if metaStore != nil {
+			metaStore.DeleteIntentsByTxn(req.TxnId)
+		}
 		return &TransactionResponse{
 			Success:      false,
 			ErrorMessage: fmt.Sprintf("failed to commit: %v", err),
@@ -442,7 +458,9 @@ func (rh *ReplicationHandler) handleAbort(ctx context.Context, req *TransactionR
 	// Get database instance
 	dbInstance, err := rh.dbMgr.GetDatabase(dbName)
 	if err != nil {
-		// Database not found - transaction likely never started or already aborted
+		// Database not found - but if it's the default "marmot" database,
+		// we should still try to clean up any orphaned intents that might exist
+		// in the system database's meta store
 		return &TransactionResponse{Success: true}, nil
 	}
 
@@ -451,7 +469,17 @@ func (rh *ReplicationHandler) handleAbort(ctx context.Context, req *TransactionR
 	// Retrieve transaction from active transactions
 	txn := txnMgr.GetTransaction(req.TxnId)
 	if txn == nil {
-		// Transaction not found - already aborted or never started
+		// Transaction not found in memory - but write intents may still exist in DB!
+		// Always clean up intents by txn_id to handle:
+		// 1. Race conditions where abort arrives before/after prepare
+		// 2. Partial failures where some nodes have intents but txn was removed from memory
+		// 3. Client disconnects mid-transaction
+		metaStore := dbInstance.GetMetaStore()
+		if metaStore != nil {
+			if err := metaStore.DeleteIntentsByTxn(req.TxnId); err != nil {
+				log.Warn().Err(err).Uint64("txn_id", req.TxnId).Msg("Failed to cleanup orphaned intents during abort")
+			}
+		}
 		return &TransactionResponse{
 			Success: true, // Idempotent - abort of non-existent txn is success
 		}, nil

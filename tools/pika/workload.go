@@ -38,10 +38,10 @@ func (o OpType) String() string {
 
 // KeyGenerator generates sequential keys for uniform distribution.
 type KeyGenerator struct {
-	prefix   string
-	counter  uint64
-	maxKey   uint64 // Max key for reads/updates (existing rows)
-	rng      *rand.Rand
+	prefix  string
+	counter uint64
+	maxKey  uint64 // Max key for reads/updates (existing rows)
+	rng     *rand.Rand
 }
 
 // NewKeyGenerator creates a key generator.

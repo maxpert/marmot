@@ -58,6 +58,7 @@ type DeltaSyncResult struct {
 	TxnsApplied      int
 	LastAppliedTxnID uint64
 	LastAppliedTS    *hlc.Timestamp
+	ExpectedNextTxn  uint64 // Track expected next txn_id for gap detection
 	Err              error
 }
 
@@ -95,7 +96,9 @@ func (ds *DeltaSyncClient) SyncFromPeer(ctx context.Context, peerNodeID uint64, 
 	}
 
 	// Apply changes as they stream in
-	firstEventReceived := false
+	// Initialize expected next txn to detect both initial and intermediate gaps
+	result.ExpectedNextTxn = fromTxnID + 1
+
 	for {
 		event, err := stream.Recv()
 		if err == io.EOF {
@@ -115,32 +118,59 @@ func (ds *DeltaSyncClient) SyncFromPeer(ctx context.Context, peerNodeID uint64, 
 			continue
 		}
 
-		// Gap detection: Check if the first received transaction indicates missing data
-		// This happens when GC has deleted transactions between fromTxnID and the first available one
-		if !firstEventReceived {
-			firstEventReceived = true
-			gap := event.TxnId - fromTxnID
-
-			// If gap is larger than delta sync threshold, we have missing transactions
-			// This means GC deleted them and we need a snapshot instead
-			if gap > uint64(cfg.Config.Replication.DeltaSyncThresholdTxns) {
-				result.Err = fmt.Errorf(
-					"gap detected: requested from txn_id %d but first available is %d (gap: %d txns, threshold: %d). "+
-						"Transactions likely GC'd - full snapshot required",
-					fromTxnID,
-					event.TxnId,
-					gap,
-					cfg.Config.Replication.DeltaSyncThresholdTxns,
-				)
-				log.Warn().
-					Uint64("requested_from", fromTxnID).
-					Uint64("first_available", event.TxnId).
-					Uint64("gap", gap).
-					Int("threshold", cfg.Config.Replication.DeltaSyncThresholdTxns).
-					Str("database", database).
-					Msg("Gap detected in transaction stream - snapshot required")
-				return result, result.Err
+		// Gap detection: Check EVERY event for missing transactions
+		// If seq_num is available, use it (more reliable than txn_id)
+		// Otherwise fall back to txn_id based gap detection
+		if event.SeqNum > 0 && result.ExpectedNextTxn > 0 {
+			// Use seq_num based gap detection (preferred)
+			if event.SeqNum > result.ExpectedNextTxn {
+				gap := event.SeqNum - result.ExpectedNextTxn
+				if gap > uint64(cfg.Config.Replication.DeltaSyncThresholdTxns) {
+					result.Err = fmt.Errorf(
+						"gap detected: expected seq_num %d but received %d (gap: %d, threshold: %d). "+
+							"Transactions likely GC'd - full snapshot required",
+						result.ExpectedNextTxn,
+						event.SeqNum,
+						gap,
+						cfg.Config.Replication.DeltaSyncThresholdTxns,
+					)
+					log.Warn().
+						Uint64("expected_seq", result.ExpectedNextTxn).
+						Uint64("received_seq", event.SeqNum).
+						Uint64("gap", gap).
+						Int("threshold", cfg.Config.Replication.DeltaSyncThresholdTxns).
+						Str("database", database).
+						Msg("Gap detected in sequence stream - snapshot required")
+					return result, result.Err
+				}
 			}
+			// Update expected next seq_num
+			result.ExpectedNextTxn = event.SeqNum + 1
+		} else {
+			// Fallback to txn_id based gap detection
+			if event.TxnId > result.ExpectedNextTxn {
+				gap := event.TxnId - result.ExpectedNextTxn
+				if gap > uint64(cfg.Config.Replication.DeltaSyncThresholdTxns) {
+					result.Err = fmt.Errorf(
+						"gap detected: expected txn_id %d but received %d (gap: %d txns, threshold: %d). "+
+							"Transactions likely GC'd - full snapshot required",
+						result.ExpectedNextTxn,
+						event.TxnId,
+						gap,
+						cfg.Config.Replication.DeltaSyncThresholdTxns,
+					)
+					log.Warn().
+						Uint64("expected_txn", result.ExpectedNextTxn).
+						Uint64("received_txn", event.TxnId).
+						Uint64("gap", gap).
+						Int("threshold", cfg.Config.Replication.DeltaSyncThresholdTxns).
+						Str("database", database).
+						Msg("Gap detected in transaction stream - snapshot required")
+					return result, result.Err
+				}
+			}
+			// Update expected next txn_id
+			result.ExpectedNextTxn = event.TxnId + 1
 		}
 
 		// Apply the transaction locally

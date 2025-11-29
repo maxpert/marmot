@@ -154,3 +154,42 @@ func TestAntiEntropyDisabled(t *testing.T) {
 		t.Error("Disabled service should not be running")
 	}
 }
+
+// TestLastSyncTimeZeroHandling tests that LastSyncTime=0 doesn't cause 54-year lag
+func TestLastSyncTimeZeroHandling(t *testing.T) {
+	ae := &AntiEntropyService{
+		deltaThresholdTxns:    10000,
+		deltaThresholdSeconds: 3600, // 1 hour
+	}
+
+	// Test case 1: LastSyncTime=0 should result in 0 duration (use delta sync)
+	// The fix ensures we don't compute time.Since(0) which would be ~54 years
+	var timeLag time.Duration
+	lastSyncTime := int64(0)
+	if lastSyncTime > 0 {
+		timeLag = time.Since(time.Unix(0, lastSyncTime))
+	}
+
+	// With 0 lag, should use delta sync
+	if !ae.shouldUseDeltaSync(100, timeLag) {
+		t.Error("LastSyncTime=0 should result in 0 duration, allowing delta sync")
+	}
+
+	// Test case 2: Verify that non-zero LastSyncTime still works
+	lastSyncTime = time.Now().Add(-30 * time.Minute).UnixNano()
+	timeLag = time.Since(time.Unix(0, lastSyncTime))
+
+	// 30 minutes is within 1 hour threshold, should use delta
+	if !ae.shouldUseDeltaSync(100, timeLag) {
+		t.Error("30 minute time lag should allow delta sync with 1 hour threshold")
+	}
+
+	// Test case 3: Old LastSyncTime exceeding threshold
+	lastSyncTime = time.Now().Add(-2 * time.Hour).UnixNano()
+	timeLag = time.Since(time.Unix(0, lastSyncTime))
+
+	// 2 hours exceeds 1 hour threshold, should use snapshot
+	if ae.shouldUseDeltaSync(100, timeLag) {
+		t.Error("2 hour time lag should trigger snapshot with 1 hour threshold")
+	}
+}

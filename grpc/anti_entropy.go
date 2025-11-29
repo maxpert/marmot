@@ -476,14 +476,21 @@ func (ae *AntiEntropyService) syncPeerDatabase(ctx context.Context, peer *NodeSt
 		Int64("peer_txn_count", peerTxnCount).
 		Msg("ANTI-ENTROPY: Comparing with peer")
 
-	// If peer has more transactions than us OR peer has same max_txn but more txn_count,
-	// we need to pull from them
-	needsSync := peerMaxTxnID > localMaxTxnID ||
-		(peerMaxTxnID == localMaxTxnID && peerTxnCount > localTxnCount)
+	// Determine if we need to sync from peer
+	// Primary metric: transaction COUNT (number of committed transactions)
+	// Secondary metric: max txn ID (HLC timestamp) as tiebreaker when counts are equal
+	// This avoids spurious syncs due to HLC drift between nodes
+	needsSync := peerTxnCount > localTxnCount ||
+		(peerTxnCount == localTxnCount && peerMaxTxnID > localMaxTxnID)
 
 	if needsSync {
-		lag := peerMaxTxnID - localMaxTxnID
+		// Use transaction count difference for lag calculation, NOT HLC difference
+		// HLC differences can be millions even for near-simultaneous transactions
 		txnCountDiff := peerTxnCount - localTxnCount
+		var lag uint64
+		if txnCountDiff > 0 {
+			lag = uint64(txnCountDiff)
+		}
 
 		log.Debug().
 			Uint64("node_id", ae.nodeID).
@@ -493,30 +500,31 @@ func (ae *AntiEntropyService) syncPeerDatabase(ctx context.Context, peer *NodeSt
 			Int64("txn_count_diff", txnCountDiff).
 			Msg("ANTI-ENTROPY: We are behind peer, pulling transactions")
 
-		// If max_txn_id is the same but txn_count differs, we have divergent data
-		// Delta sync won't work because there's no sequential gap to fill
-		// We need a full snapshot to reconcile
-		if lag == 0 && txnCountDiff > 0 {
-			log.Warn().
+		// If txn_count is the same but max_txn_id differs, we have divergent HLC timestamps
+		// This is normal in a leaderless system - different nodes may commit at slightly different times
+		// Delta sync should work fine since both nodes have the same number of transactions
+		// Only use snapshot if we can't determine which transactions we're missing
+		if lag == 0 && peerMaxTxnID > localMaxTxnID {
+			log.Debug().
 				Uint64("node_id", ae.nodeID).
 				Uint64("peer_node", peer.NodeId).
 				Str("database", database).
 				Int64("local_txn_count", localTxnCount).
 				Int64("peer_txn_count", peerTxnCount).
-				Msg("ANTI-ENTROPY: Data divergence detected, using snapshot")
+				Uint64("local_max_txn", localMaxTxnID).
+				Uint64("peer_max_txn", peerMaxTxnID).
+				Msg("ANTI-ENTROPY: Same txn count but different max HLC - using delta sync to verify")
 
-			if ae.snapshotFunc != nil {
-				if err := ae.snapshotFunc(ctx, peer.NodeId, peer.Address, database); err != nil {
-					return fmt.Errorf("snapshot transfer for divergent data failed: %w", err)
-				}
-			} else {
-				log.Warn().Msg("Snapshot function not configured for divergent data reconciliation")
-			}
-			return nil
+			// Try delta sync - it will pull any transactions we're missing
+			// If there are no missing transactions, it will be a no-op
 		}
 
 		// Calculate time lag based on last sync time
-		timeLag := time.Since(time.Unix(0, dbState.LastSyncTime))
+		// If LastSyncTime is 0 (first sync), use 0 duration to avoid ~54 year lag
+		var timeLag time.Duration
+		if dbState.LastSyncTime > 0 {
+			timeLag = time.Since(time.Unix(0, dbState.LastSyncTime))
+		}
 
 		// Decide: delta sync or snapshot?
 		if ae.shouldUseDeltaSync(lag, timeLag) {

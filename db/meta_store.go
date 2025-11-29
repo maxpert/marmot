@@ -37,6 +37,11 @@ type MetaStore interface {
 	UpdateReplicationState(peerNodeID uint64, dbName string, lastTxnID uint64, lastTS hlc.Timestamp) error
 	GetMinAppliedTxnID(dbName string) (uint64, error)
 
+	// Sequence numbers for gap-free replication
+	GetNextSeqNum(nodeID uint64) (uint64, error)
+	GetMaxSeqNum() (uint64, error)
+	GetMinAppliedSeqNum(dbName string) (uint64, error)
+
 	// Schema/DDL
 	GetSchemaVersion(dbName string) (int64, error)
 	UpdateSchemaVersion(dbName string, version int64, ddlSQL string, txnID uint64) error
@@ -50,7 +55,7 @@ type MetaStore interface {
 
 	// GC
 	CleanupStaleTransactions(timeout time.Duration) (int, error)
-	CleanupOldTransactionRecords(minRetention, maxRetention time.Duration, minAppliedTxnID uint64) (int, error)
+	CleanupOldTransactionRecords(minRetention, maxRetention time.Duration, minAppliedTxnID, minAppliedSeqNum uint64) (int, error)
 	CleanupOldMVCCVersions(keepVersions int) (int, error)
 
 	// Lifecycle
@@ -63,6 +68,7 @@ type MetaStore interface {
 type TransactionRecord struct {
 	TxnID           uint64
 	NodeID          uint64
+	SeqNum          uint64 // Monotonic sequence for gap detection
 	Status          string
 	StartTSWall     int64
 	StartTSLogical  int32

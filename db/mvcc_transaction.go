@@ -16,15 +16,16 @@ import (
 
 // MVCCTransaction represents a transaction with MVCC support
 // Implements Percolator-style distributed transactions
+// Note: Write intents are stored ONLY in MetaStore (not in memory) for durability
+// and to ensure cleanup happens correctly even after crashes or partial failures.
 type MVCCTransaction struct {
-	ID           uint64
-	NodeID       uint64
-	StartTS      hlc.Timestamp
-	CommitTS     hlc.Timestamp
-	Status       string
-	Statements   []protocol.Statement
-	WriteIntents map[string]*WriteIntent // table:rowkey -> intent
-	mu           sync.RWMutex
+	ID         uint64
+	NodeID     uint64
+	StartTS    hlc.Timestamp
+	CommitTS   hlc.Timestamp
+	Status     string
+	Statements []protocol.Statement
+	mu         sync.RWMutex
 }
 
 // WriteIntent represents a provisional write (intent)
@@ -43,23 +44,28 @@ type WriteIntent struct {
 // Used for GC coordination to prevent deleting logs needed by lagging peers
 type MinAppliedTxnIDFunc func(database string) (uint64, error)
 
+// ClusterMinWatermarkFunc returns the minimum applied seq_num across all alive nodes
+// Used for GC coordination via gossip protocol (no extra RPC calls needed)
+type ClusterMinWatermarkFunc func() uint64
+
 // MVCCTransactionManager manages MVCC transactions
 type MVCCTransactionManager struct {
-	db                 *sql.DB   // User database for data operations
-	metaStore          MetaStore // MetaStore for transaction metadata
-	clock              *hlc.Clock
-	schemaProvider     *protocol.SchemaProvider // Schema provider for table metadata
-	activeTxns         map[uint64]*MVCCTransaction
-	mu                 sync.RWMutex
-	gcInterval         time.Duration
-	gcThreshold        time.Duration
-	gcMinRetention     time.Duration // Minimum retention for replication
-	gcMaxRetention     time.Duration // Force GC after this duration
-	heartbeatTimeout   time.Duration
-	stopGC             chan struct{}
-	gcRunning          bool
-	databaseName       string              // Name of database this manager manages
-	getMinAppliedTxnID MinAppliedTxnIDFunc // Callback for GC coordination
+	db                     *sql.DB   // User database for data operations
+	metaStore              MetaStore // MetaStore for transaction metadata
+	clock                  *hlc.Clock
+	schemaProvider         *protocol.SchemaProvider // Schema provider for table metadata
+	activeTxns             map[uint64]*MVCCTransaction
+	mu                     sync.RWMutex
+	gcInterval             time.Duration
+	gcThreshold            time.Duration
+	gcMinRetention         time.Duration // Minimum retention for replication
+	gcMaxRetention         time.Duration // Force GC after this duration
+	heartbeatTimeout       time.Duration
+	stopGC                 chan struct{}
+	gcRunning              bool
+	databaseName           string                  // Name of database this manager manages
+	getMinAppliedTxnID     MinAppliedTxnIDFunc     // Callback for GC coordination
+	getClusterMinWatermark ClusterMinWatermarkFunc // Callback for GC via gossip watermark
 }
 
 // NewMVCCTransactionManager creates a new transaction manager
@@ -118,6 +124,14 @@ func (tm *MVCCTransactionManager) SetMinAppliedTxnIDFunc(fn MinAppliedTxnIDFunc)
 	tm.getMinAppliedTxnID = fn
 }
 
+// SetClusterMinWatermarkFunc sets the callback for getting cluster minimum watermark
+// This is obtained from the gossip protocol without extra RPC calls
+func (tm *MVCCTransactionManager) SetClusterMinWatermarkFunc(fn ClusterMinWatermarkFunc) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	tm.getClusterMinWatermark = fn
+}
+
 // BeginTransaction starts a new MVCC transaction with auto-generated ID
 func (tm *MVCCTransactionManager) BeginTransaction(nodeID uint64) (*MVCCTransaction, error) {
 	startTS := tm.clock.Now()
@@ -133,12 +147,11 @@ func (tm *MVCCTransactionManager) BeginTransaction(nodeID uint64) (*MVCCTransact
 // Used by coordinator replication to ensure consistent txn_id across cluster
 func (tm *MVCCTransactionManager) BeginTransactionWithID(txnID, nodeID uint64, startTS hlc.Timestamp) (*MVCCTransaction, error) {
 	txn := &MVCCTransaction{
-		ID:           txnID,
-		NodeID:       nodeID,
-		StartTS:      startTS,
-		Status:       TxnStatusPending,
-		Statements:   make([]protocol.Statement, 0),
-		WriteIntents: make(map[string]*WriteIntent),
+		ID:         txnID,
+		NodeID:     nodeID,
+		StartTS:    startTS,
+		Status:     TxnStatusPending,
+		Statements: make([]protocol.Statement, 0),
 	}
 
 	// Persist transaction record to MetaStore
@@ -168,6 +181,7 @@ func (tm *MVCCTransactionManager) AddStatement(txn *MVCCTransaction, stmt protoc
 
 // WriteIntent creates a write intent for a row
 // This is the CRITICAL part: write intents act as distributed locks
+// Intents are stored ONLY in MetaStore (not in memory) for durability
 func (tm *MVCCTransactionManager) WriteIntent(txn *MVCCTransaction, tableName, rowKey string,
 	stmt protocol.Statement, dataSnapshot []byte) error {
 
@@ -178,18 +192,7 @@ func (tm *MVCCTransactionManager) WriteIntent(txn *MVCCTransaction, tableName, r
 		return fmt.Errorf("transaction %d is not pending", txn.ID)
 	}
 
-	// Create the write intent
-	intent := &WriteIntent{
-		TableName:    tableName,
-		RowKey:       rowKey,
-		TxnID:        txn.ID,
-		Timestamp:    txn.StartTS,
-		Operation:    statementTypeToOperation(stmt.Type),
-		SQLStatement: stmt.SQL,
-		DataSnapshot: dataSnapshot,
-	}
-
-	// Persist the intent via MetaStore
+	// Persist the intent directly to MetaStore (durable storage)
 	err := tm.metaStore.WriteIntent(txn.ID, tableName, rowKey,
 		statementTypeToOperation(stmt.Type), stmt.SQL, dataSnapshot, txn.StartTS, txn.NodeID)
 
@@ -209,9 +212,6 @@ func (tm *MVCCTransactionManager) WriteIntent(txn *MVCCTransaction, tableName, r
 					if updateErr != nil {
 						return fmt.Errorf("failed to update write intent: %w", updateErr)
 					}
-					// Store in transaction's intent map
-					key := tableName + ":" + rowKey
-					txn.WriteIntents[key] = intent
 					return nil
 				}
 
@@ -222,10 +222,6 @@ func (tm *MVCCTransactionManager) WriteIntent(txn *MVCCTransaction, tableName, r
 		}
 		return fmt.Errorf("failed to persist write intent: %w", err)
 	}
-
-	// Store in transaction's intent map
-	key := tableName + ":" + rowKey
-	txn.WriteIntents[key] = intent
 
 	return nil
 }
@@ -244,14 +240,9 @@ func statementTypeToOperation(st protocol.StatementType) string {
 	}
 }
 
-// cleanupIntent removes a stale write intent
-func (tm *MVCCTransactionManager) cleanupIntent(intent *WriteIntent) error {
-	return tm.metaStore.DeleteIntent(intent.TableName, intent.RowKey, intent.TxnID)
-}
-
 // CommitTransaction commits the transaction using 2PC
-// Phase 1: Validate all write intents still held
-// Phase 2: Get commit timestamp, mark as COMMITTED, async cleanup
+// Phase 1: Validate all write intents still held (fetched from MetaStore)
+// Phase 2: Get commit timestamp, mark as COMMITTED, cleanup intents
 func (tm *MVCCTransactionManager) CommitTransaction(txn *MVCCTransaction) error {
 	txn.mu.Lock()
 	defer txn.mu.Unlock()
@@ -260,9 +251,15 @@ func (tm *MVCCTransactionManager) CommitTransaction(txn *MVCCTransaction) error 
 		return fmt.Errorf("transaction %d is not pending", txn.ID)
 	}
 
-	// Phase 1: Validate all write intents
-	for _, intent := range txn.WriteIntents {
-		valid, err := tm.validateIntent(intent, txn.ID)
+	// Fetch intents from MetaStore (single source of truth)
+	intents, err := tm.metaStore.GetIntentsByTxn(txn.ID)
+	if err != nil {
+		return fmt.Errorf("failed to fetch write intents: %w", err)
+	}
+
+	// Phase 1: Validate all write intents are still held by this transaction
+	for _, intent := range intents {
+		valid, err := tm.metaStore.ValidateIntent(intent.TableName, intent.RowKey, txn.ID)
 		if err != nil {
 			return fmt.Errorf("failed to validate intent: %w", err)
 		}
@@ -336,10 +333,10 @@ func (tm *MVCCTransactionManager) CommitTransaction(txn *MVCCTransaction) error 
 	txn.Status = TxnStatusCommitted
 
 	// Transaction is now COMMITTED
-	// SYNCHRONOUS cleanup: Remove write intents immediately to avoid blocking other transactions
-	// The async MVCC version creation is secondary and can be deferred
-	for _, intent := range txn.WriteIntents {
-		tm.cleanupIntent(intent)
+	// SYNCHRONOUS cleanup: Remove ALL write intents by txn_id immediately
+	// This is more reliable than iterating in-memory and ensures cleanup
+	if err := tm.metaStore.DeleteIntentsByTxn(txn.ID); err != nil {
+		log.Warn().Err(err).Uint64("txn_id", txn.ID).Msg("Failed to cleanup intents after commit")
 	}
 
 	// Remove from active transactions
@@ -348,21 +345,17 @@ func (tm *MVCCTransactionManager) CommitTransaction(txn *MVCCTransaction) error 
 	tm.mu.Unlock()
 
 	// Async: Create MVCC versions for read history (non-blocking)
-	go tm.createMVCCVersionsAsync(txn)
+	// Pass the intents we already fetched
+	go tm.createMVCCVersionsAsync(txn, intents)
 
 	return nil
 }
 
-// validateIntent checks if the intent is still held by this transaction
-func (tm *MVCCTransactionManager) validateIntent(intent *WriteIntent, txnID uint64) (bool, error) {
-	return tm.metaStore.ValidateIntent(intent.TableName, intent.RowKey, txnID)
-}
-
 // createMVCCVersionsAsync creates MVCC version records for committed data (for read history)
 // This is non-critical and can be done asynchronously
-func (tm *MVCCTransactionManager) createMVCCVersionsAsync(txn *MVCCTransaction) {
+func (tm *MVCCTransactionManager) createMVCCVersionsAsync(txn *MVCCTransaction, intents []*WriteIntentRecord) {
 	// Convert each write intent to MVCC version for read history
-	for _, intent := range txn.WriteIntents {
+	for _, intent := range intents {
 		err := tm.metaStore.CreateMVCCVersion(intent.TableName, intent.RowKey,
 			txn.CommitTS, txn.NodeID, txn.ID, intent.Operation, intent.DataSnapshot)
 		if err != nil {
@@ -521,25 +514,37 @@ func (tm *MVCCTransactionManager) cleanupStaleTransactions() (int, error) {
 
 // cleanupOldTransactionRecords removes old COMMITTED/ABORTED transaction records
 // with GC safe point coordination to prevent deleting logs needed by lagging peers
+// Uses belt-and-suspenders: both txn_id from anti-entropy and seq_num from gossip watermark
 func (tm *MVCCTransactionManager) cleanupOldTransactionRecords() (int, error) {
-	// Get GC safe point from peer replication tracking
+	// Get GC safe points from both mechanisms
 	tm.mu.RLock()
 	getMinAppliedFn := tm.getMinAppliedTxnID
+	getWatermarkFn := tm.getClusterMinWatermark
 	dbName := tm.databaseName
 	tm.mu.RUnlock()
 
 	var minAppliedTxnID uint64 = 0
+	var minAppliedSeqNum uint64 = 0
+
 	// Skip replication tracking for system database (it's not replicated)
-	if getMinAppliedFn != nil && dbName != "" && dbName != "__marmot_system" {
-		minTxnID, err := getMinAppliedFn(dbName)
-		if err == nil {
-			minAppliedTxnID = minTxnID
-		} else {
-			log.Warn().Err(err).Str("database", dbName).Msg("GC: Failed to get min applied txn_id, proceeding with time-based GC only")
+	if dbName != "" && dbName != "__marmot_system" {
+		// Get min applied txn_id from anti-entropy (if available)
+		if getMinAppliedFn != nil {
+			minTxnID, err := getMinAppliedFn(dbName)
+			if err == nil {
+				minAppliedTxnID = minTxnID
+			} else {
+				log.Warn().Err(err).Str("database", dbName).Msg("GC: Failed to get min applied txn_id")
+			}
+		}
+
+		// Get cluster min watermark from gossip (if available)
+		if getWatermarkFn != nil {
+			minAppliedSeqNum = getWatermarkFn()
 		}
 	}
 
-	count, err := tm.metaStore.CleanupOldTransactionRecords(tm.gcMinRetention, tm.gcMaxRetention, minAppliedTxnID)
+	count, err := tm.metaStore.CleanupOldTransactionRecords(tm.gcMinRetention, tm.gcMaxRetention, minAppliedTxnID, minAppliedSeqNum)
 	if err != nil {
 		return 0, err
 	}
@@ -548,6 +553,8 @@ func (tm *MVCCTransactionManager) cleanupOldTransactionRecords() (int, error) {
 		log.Info().
 			Str("database", dbName).
 			Int("deleted_records", count).
+			Uint64("min_txn_id", minAppliedTxnID).
+			Uint64("min_seq_num", minAppliedSeqNum).
 			Msg("GC: Cleaned up old transaction records")
 	}
 

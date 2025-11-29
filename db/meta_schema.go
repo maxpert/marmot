@@ -16,6 +16,7 @@ const (
 	CREATE TABLE IF NOT EXISTS __marmot__txn_records (
 		txn_id INTEGER PRIMARY KEY,
 		node_id INTEGER NOT NULL,
+		seq_num INTEGER, -- Monotonic sequence number for gap detection
 		status TEXT NOT NULL, -- PENDING, COMMITTED, ABORTED
 		start_ts_wall INTEGER NOT NULL,
 		start_ts_logical INTEGER NOT NULL,
@@ -32,6 +33,15 @@ const (
 	CREATE INDEX IF NOT EXISTS idx_txn_status ON __marmot__txn_records(status);
 	CREATE INDEX IF NOT EXISTS idx_txn_heartbeat ON __marmot__txn_records(last_heartbeat);
 	CREATE INDEX IF NOT EXISTS idx_txn_commit_ts ON __marmot__txn_records(commit_ts_wall, commit_ts_logical);
+	CREATE INDEX IF NOT EXISTS idx_txn_seq_num ON __marmot__txn_records(seq_num);
+	`
+
+	// MetaCreateNodeSequencesTable tracks per-node sequence counters for gap-free replication
+	MetaCreateNodeSequencesTable = `
+	CREATE TABLE IF NOT EXISTS __marmot__node_sequences (
+		node_id INTEGER PRIMARY KEY,
+		last_seq_num INTEGER NOT NULL DEFAULT 0
+	);
 	`
 
 	// MetaCreateWriteIntentsTable stores provisional writes (intents)
@@ -144,6 +154,7 @@ const (
 func MetaSchemas() []string {
 	return []string{
 		MetaCreateTransactionRecordsTable,
+		MetaCreateNodeSequencesTable,
 		MetaCreateWriteIntentsTable,
 		MetaCreateMVCCVersionsTable,
 		MetaCreateMetadataTable,
@@ -151,5 +162,18 @@ func MetaSchemas() []string {
 		MetaCreateSchemaVersionTable,
 		MetaCreateDDLLockTable,
 		MetaCreateIntentEntriesTable,
+	}
+}
+
+// MetaMigrations returns migration statements for existing databases
+// These should be run when opening an existing meta database
+func MetaMigrations() []string {
+	return []string{
+		// Add seq_num column if it doesn't exist
+		`ALTER TABLE __marmot__txn_records ADD COLUMN seq_num INTEGER`,
+		// Create node_sequences table if it doesn't exist
+		MetaCreateNodeSequencesTable,
+		// Create index on seq_num if it doesn't exist
+		`CREATE INDEX IF NOT EXISTS idx_txn_seq_num ON __marmot__txn_records(seq_num)`,
 	}
 }

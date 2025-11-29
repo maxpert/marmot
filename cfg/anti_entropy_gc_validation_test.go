@@ -131,6 +131,9 @@ func TestValidate_AntiEntropyGCAlignment(t *testing.T) {
 					KeepaliveTimeoutSeconds: 3,
 					MaxRetries:              3,
 					RetryBackoffMS:          100,
+					ConnectionPoolSize:      4,
+					PoolIdleTimeoutSeconds:  60,
+					PoolMaxLifetimeSeconds:  300,
 				},
 				Coordinator: CoordinatorConfiguration{
 					PrepareTimeoutMS: 2000,

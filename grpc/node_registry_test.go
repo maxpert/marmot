@@ -788,3 +788,106 @@ func TestNodeRegistry_GetMembershipInfo(t *testing.T) {
 		t.Error("Node 2 not found in membership info")
 	}
 }
+
+// =======================
+// WATERMARK PROTOCOL TESTS
+// =======================
+
+func TestNodeRegistry_UpdateLocalWatermark(t *testing.T) {
+	nr := NewNodeRegistry(1, "localhost:8081")
+
+	// Initial watermark should be 0
+	if wm := nr.GetLocalWatermark(); wm != 0 {
+		t.Errorf("Expected initial watermark 0, got %d", wm)
+	}
+
+	// Update watermark
+	nr.UpdateLocalWatermark(100)
+	if wm := nr.GetLocalWatermark(); wm != 100 {
+		t.Errorf("Expected watermark 100, got %d", wm)
+	}
+
+	// Update to higher value
+	nr.UpdateLocalWatermark(200)
+	if wm := nr.GetLocalWatermark(); wm != 200 {
+		t.Errorf("Expected watermark 200, got %d", wm)
+	}
+
+	// Update to lower value should be ignored (watermarks only advance)
+	nr.UpdateLocalWatermark(150)
+	if wm := nr.GetLocalWatermark(); wm != 200 {
+		t.Errorf("Watermark should not decrease, expected 200, got %d", wm)
+	}
+}
+
+func TestNodeRegistry_GetClusterMinWatermark(t *testing.T) {
+	nr := NewNodeRegistry(1, "localhost:8081")
+
+	// Set local watermark
+	nr.UpdateLocalWatermark(100)
+
+	// Add other nodes with different watermarks
+	nr.Add(&NodeState{NodeId: 2, Address: "localhost:8082", Status: NodeStatus_ALIVE, MinAppliedSeq: 50})
+	nr.Add(&NodeState{NodeId: 3, Address: "localhost:8083", Status: NodeStatus_ALIVE, MinAppliedSeq: 75})
+
+	// Minimum should be 50 (node 2)
+	min := nr.GetClusterMinWatermark()
+	if min != 50 {
+		t.Errorf("Expected min watermark 50, got %d", min)
+	}
+
+	// Add a dead node with lower watermark - should not affect minimum
+	nr.Add(&NodeState{NodeId: 4, Address: "localhost:8084", Status: NodeStatus_DEAD, MinAppliedSeq: 10})
+
+	// Minimum should still be 50 (dead nodes excluded)
+	min = nr.GetClusterMinWatermark()
+	if min != 50 {
+		t.Errorf("Expected min watermark 50 (dead excluded), got %d", min)
+	}
+}
+
+func TestNodeRegistry_GetClusterMinWatermark_SingleNode(t *testing.T) {
+	nr := NewNodeRegistry(1, "localhost:8081")
+	nr.UpdateLocalWatermark(500)
+
+	// Single node cluster, min should be local watermark
+	min := nr.GetClusterMinWatermark()
+	if min != 500 {
+		t.Errorf("Expected min watermark 500, got %d", min)
+	}
+}
+
+func TestNodeRegistry_WatermarkGossipPropagation(t *testing.T) {
+	nr := NewNodeRegistry(1, "localhost:8081")
+
+	// Add a node
+	nr.Add(&NodeState{NodeId: 2, Address: "localhost:8082", Status: NodeStatus_ALIVE, MinAppliedSeq: 100})
+
+	// Simulate receiving gossip update with new watermark
+	nr.Update(&NodeState{
+		NodeId:        2,
+		Address:       "localhost:8082",
+		Status:        NodeStatus_ALIVE,
+		Incarnation:   1,
+		MinAppliedSeq: 200, // Updated watermark
+	})
+
+	// Verify watermark updated
+	node, _ := nr.Get(2)
+	if node.MinAppliedSeq != 200 {
+		t.Errorf("Expected watermark 200 after gossip, got %d", node.MinAppliedSeq)
+	}
+}
+
+func TestNodeRegistry_CopyNodeStateIncludesWatermark(t *testing.T) {
+	nr := NewNodeRegistry(1, "localhost:8081")
+	nr.UpdateLocalWatermark(999)
+
+	// Get returns a copy
+	node, _ := nr.Get(1)
+
+	// Verify watermark is included in copy
+	if node.MinAppliedSeq != 999 {
+		t.Errorf("Expected watermark 999 in copy, got %d", node.MinAppliedSeq)
+	}
+}

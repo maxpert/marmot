@@ -349,8 +349,10 @@ type NodeState struct {
 	// Schema versions per database (for DDL drift detection)
 	// key = database_name, value = schema_version
 	DatabaseSchemaVersions map[string]uint64 `protobuf:"bytes,5,rep,name=database_schema_versions,json=databaseSchemaVersions,proto3" json:"database_schema_versions,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"varint,2,opt,name=value"`
-	unknownFields          protoimpl.UnknownFields
-	sizeCache              protoimpl.SizeCache
+	// Minimum applied sequence number (watermark for GC coordination)
+	MinAppliedSeq uint64 `protobuf:"varint,6,opt,name=min_applied_seq,json=minAppliedSeq,proto3" json:"min_applied_seq,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *NodeState) Reset() {
@@ -416,6 +418,13 @@ func (x *NodeState) GetDatabaseSchemaVersions() map[string]uint64 {
 		return x.DatabaseSchemaVersions
 	}
 	return nil
+}
+
+func (x *NodeState) GetMinAppliedSeq() uint64 {
+	if x != nil {
+		return x.MinAppliedSeq
+	}
+	return 0
 }
 
 type JoinRequest struct {
@@ -1338,7 +1347,8 @@ type StreamRequest struct {
 	state            protoimpl.MessageState `protogen:"open.v1"`
 	FromTxnId        uint64                 `protobuf:"varint,1,opt,name=from_txn_id,json=fromTxnId,proto3" json:"from_txn_id,omitempty"`
 	RequestingNodeId uint64                 `protobuf:"varint,2,opt,name=requesting_node_id,json=requestingNodeId,proto3" json:"requesting_node_id,omitempty"`
-	Database         string                 `protobuf:"bytes,3,opt,name=database,proto3" json:"database,omitempty"` // Optional: filter by database, empty = all
+	Database         string                 `protobuf:"bytes,3,opt,name=database,proto3" json:"database,omitempty"`                          // Optional: filter by database, empty = all
+	FromSeqNum       uint64                 `protobuf:"varint,4,opt,name=from_seq_num,json=fromSeqNum,proto3" json:"from_seq_num,omitempty"` // Optional: request by sequence number (preferred for gap detection)
 	unknownFields    protoimpl.UnknownFields
 	sizeCache        protoimpl.SizeCache
 }
@@ -1394,6 +1404,13 @@ func (x *StreamRequest) GetDatabase() string {
 	return ""
 }
 
+func (x *StreamRequest) GetFromSeqNum() uint64 {
+	if x != nil {
+		return x.FromSeqNum
+	}
+	return 0
+}
+
 type ChangeEvent struct {
 	state                 protoimpl.MessageState `protogen:"open.v1"`
 	TxnId                 uint64                 `protobuf:"varint,1,opt,name=txn_id,json=txnId,proto3" json:"txn_id,omitempty"`
@@ -1401,6 +1418,7 @@ type ChangeEvent struct {
 	Timestamp             *HLC                   `protobuf:"bytes,3,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
 	Database              string                 `protobuf:"bytes,4,opt,name=database,proto3" json:"database,omitempty"`                                                           // Target database for these changes
 	RequiredSchemaVersion uint64                 `protobuf:"varint,5,opt,name=required_schema_version,json=requiredSchemaVersion,proto3" json:"required_schema_version,omitempty"` // Minimum schema version required for this transaction
+	SeqNum                uint64                 `protobuf:"varint,6,opt,name=seq_num,json=seqNum,proto3" json:"seq_num,omitempty"`                                                // Monotonic sequence number for gap detection
 	unknownFields         protoimpl.UnknownFields
 	sizeCache             protoimpl.SizeCache
 }
@@ -1466,6 +1484,13 @@ func (x *ChangeEvent) GetDatabase() string {
 func (x *ChangeEvent) GetRequiredSchemaVersion() uint64 {
 	if x != nil {
 		return x.RequiredSchemaVersion
+	}
+	return 0
+}
+
+func (x *ChangeEvent) GetSeqNum() uint64 {
+	if x != nil {
+		return x.SeqNum
 	}
 	return 0
 }
@@ -1575,6 +1600,7 @@ type DatabaseReplicationState struct {
 	SyncStatus           string                 `protobuf:"bytes,5,opt,name=sync_status,json=syncStatus,proto3" json:"sync_status,omitempty"`                         // SYNCED, CATCHING_UP, FAILED
 	CurrentMaxTxnId      uint64                 `protobuf:"varint,6,opt,name=current_max_txn_id,json=currentMaxTxnId,proto3" json:"current_max_txn_id,omitempty"`     // Latest txn_id in this database
 	CommittedTxnCount    int64                  `protobuf:"varint,7,opt,name=committed_txn_count,json=committedTxnCount,proto3" json:"committed_txn_count,omitempty"` // Number of committed transactions (for row count comparison)
+	MaxSeqNum            uint64                 `protobuf:"varint,8,opt,name=max_seq_num,json=maxSeqNum,proto3" json:"max_seq_num,omitempty"`                         // Maximum sequence number for gap detection
 	unknownFields        protoimpl.UnknownFields
 	sizeCache            protoimpl.SizeCache
 }
@@ -1654,6 +1680,13 @@ func (x *DatabaseReplicationState) GetCurrentMaxTxnId() uint64 {
 func (x *DatabaseReplicationState) GetCommittedTxnCount() int64 {
 	if x != nil {
 		return x.CommittedTxnCount
+	}
+	return 0
+}
+
+func (x *DatabaseReplicationState) GetMaxSeqNum() uint64 {
+	if x != nil {
+		return x.MaxSeqNum
 	}
 	return 0
 }
@@ -2075,13 +2108,14 @@ const file_grpc_marmot_proto_rawDesc = "" +
 	"\x05nodes\x18\x02 \x03(\v2\x14.marmot.v2.NodeStateR\x05nodes\x12 \n" +
 	"\vincarnation\x18\x03 \x01(\x04R\vincarnation\"<\n" +
 	"\x0eGossipResponse\x12*\n" +
-	"\x05nodes\x18\x01 \x03(\v2\x14.marmot.v2.NodeStateR\x05nodes\"\xc6\x02\n" +
+	"\x05nodes\x18\x01 \x03(\v2\x14.marmot.v2.NodeStateR\x05nodes\"\xee\x02\n" +
 	"\tNodeState\x12\x17\n" +
 	"\anode_id\x18\x01 \x01(\x04R\x06nodeId\x12\x18\n" +
 	"\aaddress\x18\x02 \x01(\tR\aaddress\x12-\n" +
 	"\x06status\x18\x03 \x01(\x0e2\x15.marmot.v2.NodeStatusR\x06status\x12 \n" +
 	"\vincarnation\x18\x04 \x01(\x04R\vincarnation\x12j\n" +
-	"\x18database_schema_versions\x18\x05 \x03(\v20.marmot.v2.NodeState.DatabaseSchemaVersionsEntryR\x16databaseSchemaVersions\x1aI\n" +
+	"\x18database_schema_versions\x18\x05 \x03(\v20.marmot.v2.NodeState.DatabaseSchemaVersionsEntryR\x16databaseSchemaVersions\x12&\n" +
+	"\x0fmin_applied_seq\x18\x06 \x01(\x04R\rminAppliedSeq\x1aI\n" +
 	"\x1bDatabaseSchemaVersionsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\x04R\x05value:\x028\x01\"@\n" +
@@ -2165,11 +2199,13 @@ const file_grpc_marmot_proto_rawDesc = "" +
 	"\acolumns\x18\x01 \x03(\v2\x1b.marmot.v2.Row.ColumnsEntryR\acolumns\x1a:\n" +
 	"\fColumnsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\fR\x05value:\x028\x01\"y\n" +
+	"\x05value\x18\x02 \x01(\fR\x05value:\x028\x01\"\x9b\x01\n" +
 	"\rStreamRequest\x12\x1e\n" +
 	"\vfrom_txn_id\x18\x01 \x01(\x04R\tfromTxnId\x12,\n" +
 	"\x12requesting_node_id\x18\x02 \x01(\x04R\x10requestingNodeId\x12\x1a\n" +
-	"\bdatabase\x18\x03 \x01(\tR\bdatabase\"\xdc\x01\n" +
+	"\bdatabase\x18\x03 \x01(\tR\bdatabase\x12 \n" +
+	"\ffrom_seq_num\x18\x04 \x01(\x04R\n" +
+	"fromSeqNum\"\xf5\x01\n" +
 	"\vChangeEvent\x12\x15\n" +
 	"\x06txn_id\x18\x01 \x01(\x04R\x05txnId\x124\n" +
 	"\n" +
@@ -2177,12 +2213,13 @@ const file_grpc_marmot_proto_rawDesc = "" +
 	"statements\x12,\n" +
 	"\ttimestamp\x18\x03 \x01(\v2\x0e.marmot.v2.HLCR\ttimestamp\x12\x1a\n" +
 	"\bdatabase\x18\x04 \x01(\tR\bdatabase\x126\n" +
-	"\x17required_schema_version\x18\x05 \x01(\x04R\x15requiredSchemaVersion\"c\n" +
+	"\x17required_schema_version\x18\x05 \x01(\x04R\x15requiredSchemaVersion\x12\x17\n" +
+	"\aseq_num\x18\x06 \x01(\x04R\x06seqNum\"c\n" +
 	"\x17ReplicationStateRequest\x12,\n" +
 	"\x12requesting_node_id\x18\x01 \x01(\x04R\x10requestingNodeId\x12\x1a\n" +
 	"\bdatabase\x18\x02 \x01(\tR\bdatabase\"W\n" +
 	"\x18ReplicationStateResponse\x12;\n" +
-	"\x06states\x18\x01 \x03(\v2#.marmot.v2.DatabaseReplicationStateR\x06states\"\xd8\x02\n" +
+	"\x06states\x18\x01 \x03(\v2#.marmot.v2.DatabaseReplicationStateR\x06states\"\xf8\x02\n" +
 	"\x18DatabaseReplicationState\x12#\n" +
 	"\rdatabase_name\x18\x01 \x01(\tR\fdatabaseName\x12-\n" +
 	"\x13last_applied_txn_id\x18\x02 \x01(\x04R\x10lastAppliedTxnId\x12D\n" +
@@ -2191,7 +2228,8 @@ const file_grpc_marmot_proto_rawDesc = "" +
 	"\vsync_status\x18\x05 \x01(\tR\n" +
 	"syncStatus\x12+\n" +
 	"\x12current_max_txn_id\x18\x06 \x01(\x04R\x0fcurrentMaxTxnId\x12.\n" +
-	"\x13committed_txn_count\x18\a \x01(\x03R\x11committedTxnCount\"C\n" +
+	"\x13committed_txn_count\x18\a \x01(\x03R\x11committedTxnCount\x12\x1e\n" +
+	"\vmax_seq_num\x18\b \x01(\x04R\tmaxSeqNum\"C\n" +
 	"\x13SnapshotInfoRequest\x12,\n" +
 	"\x12requesting_node_id\x18\x01 \x01(\x04R\x10requestingNodeId\"\xfa\x01\n" +
 	"\x14SnapshotInfoResponse\x12&\n" +

@@ -32,6 +32,10 @@ func NewClock(nodeID uint64) *Clock {
 	}
 }
 
+// MaxLogical is the maximum value for logical counter before overflow
+// 16 bits = 65535
+const MaxLogical = LogicalMask
+
 // Now generates a new timestamp for a local event
 func (c *Clock) Now() Timestamp {
 	c.mu.Lock()
@@ -50,6 +54,20 @@ func (c *Clock) Now() Timestamp {
 	if currentMS > c.lastMS {
 		c.lastMS = currentMS
 		c.logical = 0
+	}
+
+	// Overflow protection: if we've exhausted logical counter for this millisecond,
+	// spin until the next millisecond. This prevents txn_id collisions.
+	for c.logical >= MaxLogical {
+		time.Sleep(100 * time.Microsecond)
+		now := time.Now().UnixNano()
+		nowMS := now / 1_000_000
+		if nowMS > c.lastMS {
+			c.wallTime = now
+			c.lastMS = nowMS
+			c.logical = 0
+			break
+		}
 	}
 
 	c.logical++
@@ -108,6 +126,19 @@ func (c *Clock) Update(remote Timestamp) Timestamp {
 
 	c.wallTime = maxWall
 	c.lastMS = maxWallMS
+
+	// Overflow protection: if logical counter exceeds max, wait for next millisecond
+	for c.logical >= MaxLogical {
+		time.Sleep(100 * time.Microsecond)
+		now := time.Now().UnixNano()
+		nowMS := now / 1_000_000
+		if nowMS > c.lastMS {
+			c.wallTime = now
+			c.lastMS = nowMS
+			c.logical = 1 // Start at 1 since we're generating a timestamp
+			break
+		}
+	}
 
 	return Timestamp{
 		WallTime: c.wallTime,

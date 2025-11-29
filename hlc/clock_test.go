@@ -266,13 +266,77 @@ func TestClock_UpdateConcurrent(t *testing.T) {
 func TestClock_LogicalOverflow(t *testing.T) {
 	clock := NewClock(1)
 
-	// Manually set logical clock high
-	clock.logical = 2147483647 // Max int32
+	// Set logical counter to max value minus 2
+	clock.mu.Lock()
+	clock.logical = int32(MaxLogical - 2) // Two below max
+	clock.mu.Unlock()
 
-	// This should still work (will overflow but that's Go's defined behavior)
+	// Generate timestamp - should work, resulting in logical = MaxLogical-1
+	ts1 := clock.Now()
+	if ts1.NodeID != 1 {
+		t.Error("Clock should function with high logical value")
+	}
+
+	// The logical counter should be at MaxLogical-1 (65534)
+	clock.mu.Lock()
+	logical := clock.logical
+	clock.mu.Unlock()
+
+	// 65534 is still valid and doesn't trigger overflow
+	if logical >= int32(MaxLogical) {
+		t.Errorf("Logical counter %d should be below MaxLogical %d after first call", logical, MaxLogical)
+	}
+
+	// Generate another timestamp - should hit max but still be valid (65535)
+	ts2 := clock.Now()
+	if ts2.NodeID != 1 {
+		t.Error("Clock should function at max logical value")
+	}
+
+	// After this, the next call would trigger overflow protection
+	clock.mu.Lock()
+	logical = clock.logical
+	clock.mu.Unlock()
+
+	// 65535 (MaxLogical) is the highest valid value
+	if logical > int32(MaxLogical) {
+		t.Errorf("Logical counter %d should not exceed MaxLogical %d", logical, MaxLogical)
+	}
+}
+
+func TestClock_OverflowProtectionWaitsForNextMillisecond(t *testing.T) {
+	clock := NewClock(1)
+
+	// Set logical counter at max
+	clock.mu.Lock()
+	clock.logical = int32(MaxLogical)
+	oldMS := clock.lastMS
+	clock.mu.Unlock()
+
+	// Generate timestamp - should wait for next millisecond
+	start := time.Now()
 	ts := clock.Now()
+	elapsed := time.Since(start)
+
+	// Should have waited at least a bit
 	if ts.NodeID != 1 {
-		t.Error("Clock should still function after logical overflow")
+		t.Error("Clock should function after waiting")
+	}
+
+	// Check that logical was reset (new millisecond)
+	clock.mu.Lock()
+	newLogical := clock.logical
+	newMS := clock.lastMS
+	clock.mu.Unlock()
+
+	// Either we're in a new millisecond, or we already advanced by test timing
+	if newMS == oldMS && newLogical >= int32(MaxLogical) {
+		t.Errorf("Overflow protection failed: logical=%d, ms unchanged", newLogical)
+	}
+
+	// Should have completed relatively quickly (within 10ms)
+	if elapsed > 10*time.Millisecond {
+		t.Logf("Note: overflow wait took %v (expected < 1ms in fast path)", elapsed)
 	}
 }
 

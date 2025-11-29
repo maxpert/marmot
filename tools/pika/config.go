@@ -13,8 +13,8 @@ type Config struct {
 	Table    string
 
 	// Load options
-	Records     int
-	CreateTable bool
+	Records      int
+	CreateTable  bool
 	DropExisting bool
 
 	// Run options
