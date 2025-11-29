@@ -108,7 +108,7 @@ echo "✓ Configuration created"
 if [ ! -f "$REPO_ROOT/marmot-v2" ]; then
     echo "Building marmot-v2..."
     cd "$REPO_ROOT"
-    go build -o marmot-v2 .
+    go build -tags sqlite_preupdate_hook -o marmot-v2 .
     echo "✓ Build complete"
 fi
 

@@ -23,6 +23,7 @@ build/
 *.pem
 marmot
 marmot-v2
+pika
 dist/
 
 # NPM Stuff

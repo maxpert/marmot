@@ -63,7 +63,7 @@ install_ycsb() {
 build_marmot() {
     echo -e "${YELLOW}[2/6] Building Marmot...${NC}"
     cd "$REPO_ROOT"
-    go build -o marmot-v2 .
+    go build -tags sqlite_preupdate_hook -o marmot-v2 .
     echo -e "${GREEN}  Built successfully${NC}"
 }
 
