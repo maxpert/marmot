@@ -1,0 +1,223 @@
+package main
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"math/rand"
+	"strings"
+	"sync/atomic"
+)
+
+type OpType int
+
+const (
+	OpRead OpType = iota
+	OpUpdate
+	OpInsert
+	OpDelete
+	OpUpsert
+)
+
+func (o OpType) String() string {
+	switch o {
+	case OpRead:
+		return "READ"
+	case OpUpdate:
+		return "UPDATE"
+	case OpInsert:
+		return "INSERT"
+	case OpDelete:
+		return "DELETE"
+	case OpUpsert:
+		return "UPSERT"
+	default:
+		return "UNKNOWN"
+	}
+}
+
+// KeyGenerator generates sequential keys for uniform distribution.
+type KeyGenerator struct {
+	prefix   string
+	counter  uint64
+	maxKey   uint64 // Max key for reads/updates (existing rows)
+	rng      *rand.Rand
+}
+
+// NewKeyGenerator creates a key generator.
+func NewKeyGenerator(prefix string, existingRows int64, seed int64) *KeyGenerator {
+	return &KeyGenerator{
+		prefix: prefix,
+		maxKey: uint64(existingRows),
+		rng:    rand.New(rand.NewSource(seed)),
+	}
+}
+
+// NextInsertKey generates a new key for inserts.
+func (g *KeyGenerator) NextInsertKey() string {
+	n := atomic.AddUint64(&g.counter, 1)
+	return fmt.Sprintf("%s_%012d", g.prefix, g.maxKey+n)
+}
+
+// RandomExistingKey returns a random key from existing rows.
+func (g *KeyGenerator) RandomExistingKey() string {
+	if g.maxKey == 0 {
+		return g.NextInsertKey() // No existing rows, generate new
+	}
+	n := uint64(g.rng.Int63n(int64(g.maxKey))) + 1
+	return fmt.Sprintf("%s_%012d", g.prefix, n)
+}
+
+// UpdateMaxKey updates the max key after inserts.
+func (g *KeyGenerator) UpdateMaxKey(delta int64) {
+	atomic.AddUint64(&g.maxKey, uint64(delta))
+}
+
+// Operation represents a single database operation.
+type Operation struct {
+	Type  OpType
+	Key   string
+	Value string
+}
+
+// OpSelector selects operations based on workload distribution.
+type OpSelector struct {
+	dist       WorkloadDistribution
+	thresholds [5]int // Cumulative thresholds for each op type
+	rng        *rand.Rand
+}
+
+// NewOpSelector creates an operation selector.
+func NewOpSelector(dist WorkloadDistribution, seed int64) *OpSelector {
+	s := &OpSelector{
+		dist: dist,
+		rng:  rand.New(rand.NewSource(seed)),
+	}
+
+	// Build cumulative thresholds
+	s.thresholds[0] = dist.Read
+	s.thresholds[1] = s.thresholds[0] + dist.Update
+	s.thresholds[2] = s.thresholds[1] + dist.Insert
+	s.thresholds[3] = s.thresholds[2] + dist.Delete
+	s.thresholds[4] = s.thresholds[3] + dist.Upsert
+
+	return s
+}
+
+// Select returns a random operation type based on distribution.
+func (s *OpSelector) Select() OpType {
+	r := s.rng.Intn(100)
+
+	if r < s.thresholds[0] {
+		return OpRead
+	}
+	if r < s.thresholds[1] {
+		return OpUpdate
+	}
+	if r < s.thresholds[2] {
+		return OpInsert
+	}
+	if r < s.thresholds[3] {
+		return OpDelete
+	}
+	return OpUpsert
+}
+
+// generateFieldValue generates a random value for a field.
+func generateFieldValue(rng *rand.Rand) string {
+	const chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	const length = 100
+	b := make([]byte, length)
+	for i := range b {
+		b[i] = chars[rng.Intn(len(chars))]
+	}
+	return string(b)
+}
+
+// ExecuteOp executes a single operation.
+func ExecuteOp(ctx context.Context, db *sql.DB, table string, op Operation) error {
+	switch op.Type {
+	case OpRead:
+		return executeRead(ctx, db, table, op.Key)
+	case OpUpdate:
+		return executeUpdate(ctx, db, table, op.Key, op.Value)
+	case OpInsert:
+		return executeInsert(ctx, db, table, op.Key, op.Value)
+	case OpDelete:
+		return executeDelete(ctx, db, table, op.Key)
+	case OpUpsert:
+		return executeUpsert(ctx, db, table, op.Key, op.Value)
+	default:
+		return fmt.Errorf("unknown operation type: %v", op.Type)
+	}
+}
+
+func executeRead(ctx context.Context, db *sql.DB, table, key string) error {
+	row := db.QueryRowContext(ctx,
+		fmt.Sprintf("SELECT field0, field1, field2, field3, field4, field5, field6, field7, field8, field9 FROM %s WHERE id = ?", table),
+		key)
+
+	var f0, f1, f2, f3, f4, f5, f6, f7, f8, f9 sql.NullString
+	err := row.Scan(&f0, &f1, &f2, &f3, &f4, &f5, &f6, &f7, &f8, &f9)
+	if err == sql.ErrNoRows {
+		// Not finding a row is not an error for benchmark purposes
+		return nil
+	}
+	return err
+}
+
+func executeUpdate(ctx context.Context, db *sql.DB, table, key, value string) error {
+	_, err := db.ExecContext(ctx,
+		fmt.Sprintf("UPDATE %s SET field0 = ? WHERE id = ?", table),
+		value, key)
+	return err
+}
+
+func executeInsert(ctx context.Context, db *sql.DB, table, key, value string) error {
+	_, err := db.ExecContext(ctx,
+		fmt.Sprintf("INSERT INTO %s (id, field0, field1, field2, field3, field4, field5, field6, field7, field8, field9) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", table),
+		key, value, value, value, value, value, value, value, value, value, value)
+	return err
+}
+
+func executeDelete(ctx context.Context, db *sql.DB, table, key string) error {
+	_, err := db.ExecContext(ctx,
+		fmt.Sprintf("DELETE FROM %s WHERE id = ?", table),
+		key)
+	return err
+}
+
+func executeUpsert(ctx context.Context, db *sql.DB, table, key, value string) error {
+	// Use INSERT OR REPLACE for SQLite compatibility
+	_, err := db.ExecContext(ctx,
+		fmt.Sprintf("INSERT OR REPLACE INTO %s (id, field0, field1, field2, field3, field4, field5, field6, field7, field8, field9) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", table),
+		key, value, value, value, value, value, value, value, value, value, value)
+	return err
+}
+
+// IsRetryableError checks if an error is retryable.
+func IsRetryableError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	errStr := strings.ToLower(err.Error())
+
+	// MySQL error codes
+	if strings.Contains(errStr, "1213") { // Deadlock
+		return true
+	}
+	if strings.Contains(errStr, "1205") { // Lock wait timeout
+		return true
+	}
+
+	// Marmot conflict errors
+	if strings.Contains(errStr, "conflict") {
+		return true
+	}
+	if strings.Contains(errStr, "retry") {
+		return true
+	}
+
+	return false
+}
