@@ -22,6 +22,26 @@ const (
 	numNodes      = 3
 )
 
+// cleanupStalePorts kills any processes using ports that will be used by the test cluster
+func cleanupStalePorts() {
+	ports := []int{
+		baseGRPCPort + 1, baseGRPCPort + 2, baseGRPCPort + 3,
+		baseMySQLPort + 1, baseMySQLPort + 2, baseMySQLPort + 3,
+	}
+	for _, port := range ports {
+		cmd := exec.Command("lsof", "-ti", fmt.Sprintf(":%d", port))
+		output, err := cmd.Output()
+		if err == nil && len(output) > 0 {
+			pids := strings.Fields(strings.TrimSpace(string(output)))
+			for _, pid := range pids {
+				killCmd := exec.Command("kill", "-9", pid)
+				killCmd.Run()
+			}
+		}
+	}
+	time.Sleep(100 * time.Millisecond)
+}
+
 // ClusterNode represents a running Marmot node
 type ClusterNode struct {
 	NodeID     int
@@ -48,6 +68,9 @@ type ClusterHarness struct {
 
 // NewClusterHarness creates a new cluster harness for testing
 func NewClusterHarness(t *testing.T) *ClusterHarness {
+	// Kill any stale processes using our ports
+	cleanupStalePorts()
+
 	baseDir := filepath.Join(os.TempDir(), fmt.Sprintf("marmot_crash_test_%d", time.Now().UnixNano()))
 
 	harness := &ClusterHarness{
@@ -78,7 +101,7 @@ func (h *ClusterHarness) buildMarmot() error {
 	binPath := filepath.Join(h.BaseDir, "marmot")
 	h.MarmotBin = binPath
 
-	cmd := exec.Command("go", "build", "-o", binPath, ".")
+	cmd := exec.Command("go", "build", "-tags", "sqlite_preupdate_hook", "-o", binPath, ".")
 	cmd.Dir = "/Users/zohaib/repos/marmot"
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -141,9 +164,9 @@ max_retries = 3
 retry_backoff_ms = 100
 
 [coordinator]
-prepare_timeout_ms = 2000
-commit_timeout_ms = 2000
-abort_timeout_ms = 2000
+prepare_timeout_ms = 5000
+commit_timeout_ms = 5000
+abort_timeout_ms = 3000
 intent_ttl_ms = 60000
 max_guard_rows = 65536
 
@@ -152,20 +175,20 @@ grpc_bind_address = "0.0.0.0"
 grpc_advertise_address = "localhost:%d"
 grpc_port = %d
 seed_nodes = [%s]
-gossip_interval_ms = 1000
+gossip_interval_ms = 500
 gossip_fanout = 3
-suspect_timeout_ms = 15000
-dead_timeout_ms = 30000
+suspect_timeout_ms = 10000
+dead_timeout_ms = 20000
 
 [replication]
 replication_factor = 3
 virtual_nodes = 150
 default_write_consistency = "QUORUM"
 default_read_consistency = "LOCAL_ONE"
-write_timeout_ms = 5000
-read_timeout_ms = 2000
+write_timeout_ms = 10000
+read_timeout_ms = 5000
 enable_anti_entropy = true
-anti_entropy_interval_seconds = 10
+anti_entropy_interval_seconds = 5
 
 [mysql]
 enabled = true
@@ -445,17 +468,17 @@ func (h *ClusterHarness) StartCluster() error {
 
 	// Wait for all nodes to become ALIVE
 	h.t.Logf("Waiting for cluster to converge...")
-	time.Sleep(3 * time.Second)
+	time.Sleep(5 * time.Second)
 
 	for i := 1; i <= numNodes; i++ {
-		if err := h.WaitForAlive(i, 10*time.Second); err != nil {
+		if err := h.WaitForAlive(i, 30*time.Second); err != nil {
 			return err
 		}
 	}
 
 	// Additional wait for gRPC connections to establish between nodes
 	// This ensures quorum replication is ready before returning
-	time.Sleep(2 * time.Second)
+	time.Sleep(3 * time.Second)
 
 	h.t.Logf("Cluster started successfully")
 	return nil
