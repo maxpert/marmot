@@ -1,16 +1,17 @@
 package db
 
 import (
-	"database/sql"
+	"path/filepath"
+	"strings"
 	"time"
 
+	"github.com/maxpert/marmot/cfg"
 	"github.com/maxpert/marmot/hlc"
 )
 
 // MetaStore provides transactional metadata storage separate from user data.
-// Each user database has its own MetaStore backed by a separate SQLite file.
-// This separation allows user data writes and metadata writes to happen in parallel,
-// avoiding the single-writer bottleneck in SQLite.
+// Each user database has its own MetaStore backed by BadgerDB.
+// This separation allows user data writes and metadata writes to happen in parallel.
 type MetaStore interface {
 	// Transaction lifecycle
 	BeginTransaction(txnID, nodeID uint64, startTS hlc.Timestamp) error
@@ -25,17 +26,20 @@ type MetaStore interface {
 	ValidateIntent(tableName, rowKey string, expectedTxnID uint64) (bool, error)
 	DeleteIntent(tableName, rowKey string, txnID uint64) error
 	DeleteIntentsByTxn(txnID uint64) error
+	MarkIntentsForCleanup(txnID uint64) error // Fast path: mark intents as ready for overwrite
 	GetIntentsByTxn(txnID uint64) ([]*WriteIntentRecord, error)
 	GetIntent(tableName, rowKey string) (*WriteIntentRecord, error)
 
 	// MVCC versions
 	CreateMVCCVersion(tableName, rowKey string, ts hlc.Timestamp, nodeID, txnID uint64, op string, data []byte) error
 	GetLatestVersion(tableName, rowKey string) (*MVCCVersionRecord, error)
+	GetMVCCVersionCount(tableName, rowKey string) (int, error)
 
 	// Replication state
 	GetReplicationState(peerNodeID uint64, dbName string) (*ReplicationStateRecord, error)
 	UpdateReplicationState(peerNodeID uint64, dbName string, lastTxnID uint64, lastTS hlc.Timestamp) error
 	GetMinAppliedTxnID(dbName string) (uint64, error)
+	GetAllReplicationStates() ([]*ReplicationStateRecord, error)
 
 	// Sequence numbers for gap-free replication
 	GetNextSeqNum(nodeID uint64) (uint64, error)
@@ -58,10 +62,16 @@ type MetaStore interface {
 	CleanupOldTransactionRecords(minRetention, maxRetention time.Duration, minAppliedTxnID, minAppliedSeqNum uint64) (int, error)
 	CleanupOldMVCCVersions(keepVersions int) (int, error)
 
+	// Aggregation queries for anti-entropy
+	GetMaxCommittedTxnID() (uint64, error)
+	GetCommittedTxnCount() (int64, error)
+
+	// Streaming for anti-entropy delta sync
+	StreamCommittedTransactions(fromTxnID uint64, callback func(*TransactionRecord) error) error
+
 	// Lifecycle
 	Close() error
-	WriteDB() *sql.DB
-	ReadDB() *sql.DB
+	Checkpoint() error // No-op for BadgerDB, kept for interface compatibility
 }
 
 // TransactionRecord represents a transaction record in meta store
@@ -84,16 +94,17 @@ type TransactionRecord struct {
 
 // WriteIntentRecord represents a write intent in meta store
 type WriteIntentRecord struct {
-	TableName    string
-	RowKey       string
-	TxnID        uint64
-	TSWall       int64
-	TSLogical    int32
-	NodeID       uint64
-	Operation    string
-	SQLStatement string
-	DataSnapshot []byte
-	CreatedAt    int64
+	TableName        string
+	RowKey           string
+	TxnID            uint64
+	TSWall           int64
+	TSLogical        int32
+	NodeID           uint64
+	Operation        string
+	SQLStatement     string
+	DataSnapshot     []byte
+	CreatedAt        int64
+	MarkedForCleanup bool // Set to true when txn commits/aborts - allows immediate overwrite
 }
 
 // MVCCVersionRecord represents an MVCC version in meta store
@@ -130,3 +141,31 @@ const (
 	MetaSyncStatusCatchingUp = "CATCHING_UP"
 	MetaSyncStatusFailed     = "FAILED"
 )
+
+// NewMetaStore creates a BadgerDB MetaStore.
+// basePath is the path to the user database (e.g., "/data/mydb.db").
+// Creates {basePath}_meta.badger/ directory
+func NewMetaStore(basePath string) (MetaStore, error) {
+	metaPath := strings.TrimSuffix(basePath, ".db") + "_meta.badger"
+
+	// Ensure directory path is absolute if config is available
+	config := cfg.Config
+	if config != nil && !filepath.IsAbs(metaPath) {
+		metaPath = filepath.Join(config.DataDir, metaPath)
+	}
+
+	// Get options from config or use defaults
+	opts := BadgerMetaStoreOptions{
+		SyncWrites:    false, // Async writes for performance (group commit handles durability)
+		NumCompactors: 2,
+		ValueLogGC:    true,
+	}
+
+	if config != nil {
+		opts.SyncWrites = config.MetaStore.Badger.SyncWrites
+		opts.NumCompactors = config.MetaStore.Badger.NumCompactors
+		opts.ValueLogGC = config.MetaStore.Badger.ValueLogGC
+	}
+
+	return NewBadgerMetaStore(metaPath, opts)
+}

@@ -1,8 +1,16 @@
 package db
 
+// Operation constants for intent entries
+// These are used across multiple files and must be available regardless of build tags
+const (
+	OpInsertInt uint8 = 0
+	OpUpdateInt uint8 = 1
+	OpDeleteInt uint8 = 2
+)
+
 // MetaStore Schema Design for Marmot v2.0
 //
-// All metadata tables are stored in a separate database file (user_db_meta.db)
+// All metadata is stored in a separate BadgerDB instance (user_db_meta.badger/)
 // to avoid writer contention with user data writes.
 //
 // SQLite allows only ONE writer per database file. By separating metadata:
