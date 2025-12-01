@@ -120,19 +120,14 @@ func ParseStatement(sql string) Statement {
 		Type:      mapQueryTypeToProtocolType(ctx.StatementType),
 		TableName: ctx.TableName,
 		Database:  ctx.Database,
-		// Use CDC-extracted row key from context (extracted before transpilation)
-		RowKey: ctx.CDCRowKey,
 		Error: func() string {
 			if ctx.ValidationErr != nil {
 				return ctx.ValidationErr.Error()
 			}
 			return ""
 		}(),
-		// Populate CDC data from context (extracted in pipeline before transpilation)
-		OldValues: ctx.CDCOldValues,
-		NewValues: ctx.CDCNewValues,
-		// Multi-row CDC data (for expanding multi-row INSERTs)
-		CDCRows: convertCDCRows(ctx.CDCRows),
+		// CDC fields (RowKey, OldValues, NewValues) are populated later by
+		// handler.go after preupdate hooks capture row data
 		// INFORMATION_SCHEMA filter values extracted from WHERE clause
 		ISFilter: InformationSchemaFilter{
 			SchemaName: ctx.ISFilter.SchemaName,
@@ -156,21 +151,6 @@ func mapQueryTypeToProtocolType(qt query.StatementType) StatementType {
 	// query.StatementReplace = 1, protocol.StatementReplace = 1
 	// etc.
 	return StatementType(qt)
-}
-
-// convertCDCRows converts query.CDCRow slice to protocol.CDCRow slice
-func convertCDCRows(rows []*query.CDCRow) []*CDCRow {
-	if len(rows) == 0 {
-		return nil
-	}
-	result := make([]*CDCRow, len(rows))
-	for i, r := range rows {
-		result[i] = &CDCRow{
-			OldValues: r.OldValues,
-			NewValues: r.NewValues,
-		}
-	}
-	return result
 }
 
 // NormalizeSQLForSQLite converts MySQL-style SQL to SQLite-compatible SQL

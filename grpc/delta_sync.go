@@ -299,13 +299,14 @@ func (ds *DeltaSyncClient) applyChangeEvent(ctx context.Context, event *ChangeEv
 		}
 	}
 
-	// Convert to TransactionRequest
+	// Convert to TransactionRequest using REPLAY phase
+	// REPLAY bypasses 2PC state tracking since these transactions are already committed on source
 	txnReq := &TransactionRequest{
 		TxnId:        event.TxnId,
-		SourceNodeId: 0, // This is a replicated transaction, not from a specific source
+		SourceNodeId: event.Timestamp.NodeId, // Use original source node ID
 		Statements:   event.Statements,
 		Timestamp:    event.Timestamp,
-		Phase:        TransactionPhase_COMMIT, // Already committed on source
+		Phase:        TransactionPhase_REPLAY, // Use REPLAY for anti-entropy catch-up
 		Consistency:  ConsistencyLevel_CONSISTENCY_ONE,
 		Database:     database,
 	}

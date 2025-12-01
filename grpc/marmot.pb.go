@@ -82,6 +82,7 @@ const (
 	TransactionPhase_PREPARE TransactionPhase = 0 // Phase 1: Create write intents
 	TransactionPhase_COMMIT  TransactionPhase = 1 // Phase 2: Commit transaction
 	TransactionPhase_ABORT   TransactionPhase = 2 // Abort: Rollback transaction
+	TransactionPhase_REPLAY  TransactionPhase = 3 // Anti-entropy replay: Apply already-committed transaction directly
 )
 
 // Enum value maps for TransactionPhase.
@@ -90,11 +91,13 @@ var (
 		0: "PREPARE",
 		1: "COMMIT",
 		2: "ABORT",
+		3: "REPLAY",
 	}
 	TransactionPhase_value = map[string]int32{
 		"PREPARE": 0,
 		"COMMIT":  1,
 		"ABORT":   2,
+		"REPLAY":  3,
 	}
 )
 
@@ -2267,12 +2270,14 @@ const file_grpc_marmot_proto_rawDesc = "" +
 	"\aSUSPECT\x10\x01\x12\b\n" +
 	"\x04DEAD\x10\x02\x12\v\n" +
 	"\aJOINING\x10\x03\x12\v\n" +
-	"\aREMOVED\x10\x04*6\n" +
+	"\aREMOVED\x10\x04*B\n" +
 	"\x10TransactionPhase\x12\v\n" +
 	"\aPREPARE\x10\x00\x12\n" +
 	"\n" +
 	"\x06COMMIT\x10\x01\x12\t\n" +
-	"\x05ABORT\x10\x02*T\n" +
+	"\x05ABORT\x10\x02\x12\n" +
+	"\n" +
+	"\x06REPLAY\x10\x03*T\n" +
 	"\x10ConsistencyLevel\x12\x13\n" +
 	"\x0fCONSISTENCY_ONE\x10\x00\x12\x16\n" +
 	"\x12CONSISTENCY_QUORUM\x10\x01\x12\x13\n" +

@@ -19,9 +19,15 @@ func TestSanitizeSnapshotFilename(t *testing.T) {
 			shouldError: false,
 		},
 		{
-			name:        "system meta database",
-			filename:    "__marmot_system_meta.db",
-			expected:    "__marmot_system_meta.db",
+			name:        "system meta badger vlog",
+			filename:    "__marmot_system_meta.badger/000001.vlog",
+			expected:    "__marmot_system_meta.badger/000001.vlog",
+			shouldError: false,
+		},
+		{
+			name:        "system meta badger manifest",
+			filename:    "__marmot_system_meta.badger/MANIFEST",
+			expected:    "__marmot_system_meta.badger/MANIFEST",
 			shouldError: false,
 		},
 		{
@@ -31,9 +37,15 @@ func TestSanitizeSnapshotFilename(t *testing.T) {
 			shouldError: false,
 		},
 		{
-			name:        "user meta database in databases dir",
-			filename:    "databases/marmot_meta.db",
-			expected:    "databases/marmot_meta.db",
+			name:        "user meta badger vlog",
+			filename:    "databases/marmot_meta.badger/000001.vlog",
+			expected:    "databases/marmot_meta.badger/000001.vlog",
+			shouldError: false,
+		},
+		{
+			name:        "user meta badger manifest",
+			filename:    "databases/marmot_meta.badger/MANIFEST",
+			expected:    "databases/marmot_meta.badger/MANIFEST",
 			shouldError: false,
 		},
 		{
@@ -136,15 +148,18 @@ func TestIsValidSnapshotPath(t *testing.T) {
 		expected bool
 	}{
 		{"system database", "__marmot_system.db", true},
-		{"system meta database", "__marmot_system_meta.db", true},
+		{"system meta badger vlog", "__marmot_system_meta.badger/000001.vlog", true},
+		{"system meta badger manifest", "__marmot_system_meta.badger/MANIFEST", true},
 		{"user database", "databases/marmot.db", true},
-		{"user meta database", "databases/marmot_meta.db", true},
+		{"user meta badger vlog", "databases/marmot_meta.badger/000001.vlog", true},
+		{"user meta badger manifest", "databases/marmot_meta.badger/MANIFEST", true},
 		{"user database other name", "databases/test.db", true},
 		{"nested db", "databases/subdir/test.db", false},
 		{"root db", "marmot.db", false},
 		{"wrong extension", "databases/marmot.txt", false},
 		{"no extension", "databases/marmot", false},
 		{"wrong dir", "data/marmot.db", false},
+		{"nested badger file", "databases/foo_meta.badger/subdir/MANIFEST", false},
 	}
 
 	for _, tt := range tests {

@@ -135,6 +135,7 @@ enum TransactionPhase {
   PREPARE = 0;  // Phase 1: Create write intents
   COMMIT = 1;   // Phase 2: Commit transaction
   ABORT = 2;    // Abort: Rollback transaction
+  REPLAY = 3;   // Anti-entropy replay: Apply already-committed transaction directly
 }
 
 enum ConsistencyLevel {

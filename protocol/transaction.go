@@ -135,42 +135,31 @@ type InformationSchemaFilter struct {
 	ColumnName string // From COLUMN_NAME = 'x'
 }
 
-// CDCRow represents a single row's CDC data for multi-row INSERT support
-type CDCRow struct {
-	OldValues map[string][]byte `json:"OldValues"` // Before image (for UPDATE/DELETE)
-	NewValues map[string][]byte `json:"NewValues"` // After image (for INSERT/UPDATE/REPLACE)
-}
-
 // Statement represents a single SQL statement
 type Statement struct {
-	SQL       string        `json:"SQL"`
-	Type      StatementType `json:"Type"`
-	TableName string        `json:"TableName"`
-	Database  string        `json:"Database"` // Target database name
-	RowKey    string        `json:"RowKey"`   // Primary key value extracted during parsing (for MVCC conflict detection)
-	Error     string        `json:"Error"`    // Error message if Type is StatementUnsupported
+	SQL       string
+	Type      StatementType
+	TableName string
+	Database  string // Target database name
+	RowKey    string // Primary key value for MVCC conflict detection
+	Error     string // Error message if Type is StatementUnsupported
 
 	// CDC: Row-level change data (for DML operations)
-	// Populated after local execution, sent to replicas instead of SQL
-	OldValues map[string][]byte `json:"OldValues"` // Before image (for UPDATE/DELETE)
-	NewValues map[string][]byte `json:"NewValues"` // After image (for INSERT/UPDATE/REPLACE)
-
-	// CDCRows holds ALL rows from multi-row INSERT statements
-	// For single-row DML or UPDATE/DELETE, this contains one element
-	// The coordinator expands multi-row INSERTs into multiple statements
-	CDCRows []*CDCRow `json:"CDCRows,omitempty"`
+	// Populated by preupdate hooks after local execution, sent to replicas instead of SQL
+	OldValues map[string][]byte // Before image (for UPDATE/DELETE)
+	NewValues map[string][]byte // After image (for INSERT/UPDATE/REPLACE)
 
 	// ISFilter holds extracted WHERE clause values for INFORMATION_SCHEMA queries
-	ISFilter InformationSchemaFilter `json:"ISFilter,omitempty"`
+	ISFilter InformationSchemaFilter
 
 	// ISTableType identifies which INFORMATION_SCHEMA table (TABLES, COLUMNS, etc.)
-	ISTableType InformationSchemaTableType `json:"ISTableType,omitempty"`
+	ISTableType InformationSchemaTableType
 
 	// VirtualTableType identifies which Marmot virtual table (MARMOT_CLUSTER_NODES, etc.)
-	VirtualTableType VirtualTableType `json:"VirtualTableType,omitempty"`
+	VirtualTableType VirtualTableType
 
 	// SystemVarNames lists system variables referenced (e.g., ["VERSION", "SQL_MODE", "DATABASE()"])
-	SystemVarNames []string `json:"SystemVarNames,omitempty"`
+	SystemVarNames []string
 }
 
 // Transaction represents a buffered transaction

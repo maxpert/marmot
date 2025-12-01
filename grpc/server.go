@@ -380,7 +380,6 @@ func (s *Server) StreamChanges(req *StreamRequest, stream MarmotService_StreamCh
 			continue
 		}
 
-		// Query committed transactions after from_txn_id with statements
 		// Use MetaStore for transaction records (they're stored in meta database)
 		metaStore := mdb.GetMetaStore()
 		if metaStore == nil {
@@ -388,33 +387,11 @@ func (s *Server) StreamChanges(req *StreamRequest, stream MarmotService_StreamCh
 			continue
 		}
 
-		rows, err := metaStore.ReadDB().Query(`
-			SELECT txn_id, COALESCE(seq_num, 0), commit_ts_wall, commit_ts_logical,
-			       COALESCE(statements_json, '[]'), COALESCE(database_name, '')
-			FROM __marmot__txn_records
-			WHERE status = 'COMMITTED' AND txn_id > ?
-			ORDER BY seq_num, txn_id
-		`, req.FromTxnId)
-		if err != nil {
-			log.Warn().Err(err).Str("database", dbName).Msg("Failed to query transactions")
-			continue
-		}
-
-		for rows.Next() {
-			var txnID uint64
-			var seqNum uint64
-			var commitWall int64
-			var commitLogical int32
-			var statementsJSON string
-			var databaseName string
-
-			if err := rows.Scan(&txnID, &seqNum, &commitWall, &commitLogical, &statementsJSON, &databaseName); err != nil {
-				log.Warn().Err(err).Msg("Failed to scan transaction")
-				continue
-			}
-
+		// Stream committed transactions using the interface method
+		err = metaStore.StreamCommittedTransactions(req.FromTxnId, func(rec *db.TransactionRecord) error {
 			// Parse statements from msgpack - must include CDC data (NewValues, OldValues, RowKey)
 			var statements []*Statement
+			statementsJSON := string(rec.StatementsJSON)
 			if statementsJSON != "" && statementsJSON != "[]" {
 				var rawStatements []struct {
 					SQL       string            `msgpack:"SQL"`
@@ -425,8 +402,8 @@ func (s *Server) StreamChanges(req *StreamRequest, stream MarmotService_StreamCh
 					OldValues map[string][]byte `msgpack:"OldValues"`
 					NewValues map[string][]byte `msgpack:"NewValues"`
 				}
-				if err := msgpack.Unmarshal([]byte(statementsJSON), &rawStatements); err != nil {
-					log.Warn().Err(err).Uint64("txn_id", txnID).Msg("Failed to parse statements msgpack")
+				if err := msgpack.Unmarshal(rec.StatementsJSON, &rawStatements); err != nil {
+					log.Warn().Err(err).Uint64("txn_id", rec.TxnID).Msg("Failed to parse statements msgpack")
 				} else {
 					for _, s := range rawStatements {
 						stmt := &Statement{
@@ -452,7 +429,7 @@ func (s *Server) StreamChanges(req *StreamRequest, stream MarmotService_StreamCh
 								},
 							}
 							log.Debug().
-								Uint64("txn_id", txnID).
+								Uint64("txn_id", rec.TxnID).
 								Str("table", s.TableName).
 								Str("row_key", s.RowKey).
 								Int("new_values", len(s.NewValues)).
@@ -466,7 +443,7 @@ func (s *Server) StreamChanges(req *StreamRequest, stream MarmotService_StreamCh
 								},
 							}
 							log.Debug().
-								Uint64("txn_id", txnID).
+								Uint64("txn_id", rec.TxnID).
 								Str("sql_prefix", func() string {
 									if len(s.SQL) > 50 {
 										return s.SQL[:50]
@@ -482,22 +459,22 @@ func (s *Server) StreamChanges(req *StreamRequest, stream MarmotService_StreamCh
 			}
 
 			event := &ChangeEvent{
-				TxnId:  txnID,
-				SeqNum: seqNum,
+				TxnId:  rec.TxnID,
+				SeqNum: rec.SeqNum,
 				Timestamp: &HLC{
-					WallTime: commitWall,
-					Logical:  commitLogical,
+					WallTime: rec.CommitTSWall,
+					Logical:  rec.CommitTSLogical,
 				},
 				Statements: statements,
-				Database:   databaseName,
+				Database:   rec.DatabaseName,
 			}
 
-			if err := stream.Send(event); err != nil {
-				rows.Close()
-				return fmt.Errorf("failed to send change event: %w", err)
-			}
+			return stream.Send(event)
+		})
+		if err != nil {
+			log.Warn().Err(err).Str("database", dbName).Msg("Failed to stream transactions")
+			continue
 		}
-		rows.Close()
 	}
 
 	log.Info().

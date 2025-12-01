@@ -319,8 +319,7 @@ func TestMySQLInsertVariations(t *testing.T) {
 			name:        "INSERT without columns",
 			sql:         "INSERT INTO users VALUES (1, 'Alice', 'alice@example.com')",
 			wantType:    StatementInsert,
-			shouldParse: false,
-			limitation:  "MARMOT CDC: INSERT must have explicit column list for CDC tracking",
+			shouldParse: true, // CDC validation moved to runtime hooks
 		},
 		{
 			name:        "INSERT multiple rows",
@@ -337,20 +336,18 @@ func TestMySQLInsertVariations(t *testing.T) {
 			shouldParse: true,
 		},
 
-		// INSERT ... SELECT - CDC LIMITATION
+		// INSERT ... SELECT - now supported (CDC via runtime hooks)
 		{
 			name:        "INSERT SELECT",
 			sql:         "INSERT INTO archive SELECT * FROM users WHERE status = 'inactive'",
 			wantType:    StatementInsert,
-			shouldParse: false,
-			limitation:  "MARMOT CDC: INSERT ... SELECT not supported for CDC",
+			shouldParse: true,
 		},
 		{
 			name:        "INSERT SELECT with columns",
 			sql:         "INSERT INTO summary (user_id, total) SELECT user_id, SUM(amount) FROM orders GROUP BY user_id",
 			wantType:    StatementInsert,
-			shouldParse: false,
-			limitation:  "MARMOT CDC: INSERT ... SELECT not supported for CDC",
+			shouldParse: true,
 		},
 
 		// INSERT ... ON DUPLICATE KEY UPDATE - VITESS LIMITATION
@@ -434,15 +431,13 @@ func TestMySQLReplaceStatement(t *testing.T) {
 			name:        "REPLACE without columns",
 			sql:         "REPLACE INTO users VALUES (1, 'A'), (2, 'B'), (3, 'C')",
 			wantType:    StatementReplace,
-			shouldParse: false,
-			limitation:  "MARMOT CDC: REPLACE must have explicit column list for CDC tracking",
+			shouldParse: true, // CDC validation moved to runtime hooks
 		},
 		{
 			name:        "REPLACE SELECT",
 			sql:         "REPLACE INTO archive SELECT * FROM users WHERE status = 'inactive'",
 			wantType:    StatementReplace,
-			shouldParse: false,
-			limitation:  "MARMOT CDC: REPLACE ... SELECT not supported for CDC",
+			shouldParse: true, // CDC via runtime hooks
 		},
 		{
 			name:        "REPLACE with SET syntax",
@@ -514,8 +509,7 @@ func TestMySQLUpdateVariations(t *testing.T) {
 			name:        "UPDATE with subquery in WHERE",
 			sql:         "UPDATE users SET status = 'premium' WHERE id IN (SELECT user_id FROM orders WHERE total > 1000)",
 			wantType:    StatementUpdate,
-			shouldParse: false,
-			limitation:  "MARMOT CDC: IN subquery in WHERE - cannot extract single PK value",
+			shouldParse: true, // CDC validation moved to runtime hooks
 		},
 
 		// UPDATE with JOIN - VITESS LIMITATION
@@ -613,22 +607,20 @@ func TestMySQLDeleteVariations(t *testing.T) {
 			shouldParse: true,
 		},
 
-		// DELETE without WHERE - CDC LIMITATION
+		// DELETE without WHERE - now supported (CDC via runtime hooks)
 		{
 			name:        "DELETE all rows",
 			sql:         "DELETE FROM temp_table",
 			wantType:    StatementDelete,
-			shouldParse: false,
-			limitation:  "MARMOT CDC: DELETE without WHERE not supported (unsafe multi-row delete)",
+			shouldParse: true, // CDC validation moved to runtime hooks
 		},
 
-		// DELETE with subquery - CDC LIMITATION
+		// DELETE with subquery - now supported (CDC via runtime hooks)
 		{
 			name:        "DELETE with IN subquery",
 			sql:         "DELETE FROM users WHERE id IN (SELECT user_id FROM banned_users)",
 			wantType:    StatementDelete,
-			shouldParse: false,
-			limitation:  "MARMOT CDC: IN subquery in WHERE - cannot extract single PK value",
+			shouldParse: true, // CDC validation moved to runtime hooks
 		},
 
 		// DELETE with USING - VITESS LIMITATION
@@ -640,13 +632,13 @@ func TestMySQLDeleteVariations(t *testing.T) {
 			limitation:  "VITESS: DELETE with USING syntax not supported",
 		},
 
-		// DELETE with JOIN - CDC LIMITATION (no WHERE extractable)
+		// DELETE with JOIN - VITESS LIMITATION
 		{
 			name:        "DELETE with JOIN",
 			sql:         "DELETE u FROM users u JOIN banned_users b ON u.id = b.user_id",
 			wantType:    StatementDelete,
 			shouldParse: false,
-			limitation:  "MARMOT CDC: DELETE without WHERE not supported (multi-table delete)",
+			limitation:  "VITESS: DELETE with JOIN syntax not supported",
 		},
 
 		// DELETE multi-table - VITESS LIMITATION

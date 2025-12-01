@@ -78,15 +78,29 @@ func isValidSnapshotPath(path string) bool {
 	if path == "__marmot_system.db" {
 		return true
 	}
-	// System meta database at root
-	if path == "__marmot_system_meta.db" {
-		return true
+	// System meta database (BadgerDB directory files) at root
+	if strings.HasPrefix(path, "__marmot_system_meta.badger"+string(filepath.Separator)) {
+		// Valid BadgerDB file patterns
+		relPath := strings.TrimPrefix(path, "__marmot_system_meta.badger"+string(filepath.Separator))
+		if !strings.Contains(relPath, string(filepath.Separator)) {
+			return true
+		}
 	}
-	// User databases and meta databases in databases/ subdirectory
+	// User databases (.db files) in databases/ subdirectory
 	if strings.HasPrefix(path, "databases"+string(filepath.Separator)) && strings.HasSuffix(path, ".db") {
 		// Ensure no additional directory traversal within databases/
 		relPath := strings.TrimPrefix(path, "databases"+string(filepath.Separator))
 		if !strings.Contains(relPath, string(filepath.Separator)) {
+			return true
+		}
+	}
+	// User meta databases (BadgerDB directory files) in databases/ subdirectory
+	if strings.HasPrefix(path, "databases"+string(filepath.Separator)) && strings.Contains(path, "_meta.badger"+string(filepath.Separator)) {
+		// Pattern: databases/{name}_meta.badger/{file}
+		// Ensure exactly 2 path components after databases/
+		relPath := strings.TrimPrefix(path, "databases"+string(filepath.Separator))
+		parts := strings.Split(relPath, string(filepath.Separator))
+		if len(parts) == 2 && strings.HasSuffix(parts[0], "_meta.badger") {
 			return true
 		}
 	}
@@ -376,6 +390,13 @@ func (c *CatchUpClient) applySnapshot(ctx context.Context, client MarmotServiceC
 		file, exists := openFiles[sanitizedFilename]
 		if !exists {
 			filePath := filepath.Join(c.dataDir, sanitizedFilename)
+
+			// Ensure parent directory exists (needed for BadgerDB subdirectories)
+			if dir := filepath.Dir(filePath); dir != "." {
+				if err := os.MkdirAll(dir, 0755); err != nil {
+					return fmt.Errorf("failed to create directory %s: %w", dir, err)
+				}
+			}
 
 			// Remove existing file if present
 			os.Remove(filePath)
