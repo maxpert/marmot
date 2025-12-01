@@ -98,9 +98,9 @@ func (w *Worker) generateOp(opType OpType) Operation {
 	var key string
 	switch opType {
 	case OpInsert:
-		key = w.keyGen.NextInsertKey()
+		key = w.keyGen.NextInsertKey(w.rng)
 	default:
-		key = w.keyGen.RandomExistingKey()
+		key = w.keyGen.RandomExistingKey(w.rng)
 	}
 
 	return Operation{
@@ -185,7 +185,7 @@ func executeLoad(ctx context.Context, cfg *Config) error {
 	}
 
 	stats := NewStats()
-	keyGen := NewKeyGenerator("rec", existingRows, time.Now().UnixNano(), 0) // No overlap for load
+	keyGen := NewKeyGenerator("rec", existingRows, 0) // No overlap for load
 
 	// Distribute records across workers
 	recordsPerWorker := cfg.Records / cfg.Threads
@@ -269,7 +269,7 @@ func executeRun(ctx context.Context, cfg *Config) error {
 	fmt.Printf("Existing rows: %d\n\n", rowCount)
 
 	stats := NewStats()
-	keyGen := NewKeyGenerator("rec", rowCount, time.Now().UnixNano(), cfg.InsertOverlap)
+	keyGen := NewKeyGenerator("rec", rowCount, cfg.InsertOverlap)
 
 	// Create operation channel
 	opsChan := make(chan struct{}, cfg.Threads*10)

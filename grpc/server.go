@@ -231,13 +231,8 @@ func (s *Server) Gossip(ctx context.Context, req *GossipRequest) (*GossipRespons
 		s.registry.Update(nodeState)
 	}
 
-	// Update lastSeen for the source node after Update() to ensure
-	// the node exists in registry (it should be in req.Nodes)
-	s.registry.mu.Lock()
-	if _, exists := s.registry.nodes[req.SourceNodeId]; exists {
-		s.registry.lastSeen[req.SourceNodeId] = time.Now()
-	}
-	s.registry.mu.Unlock()
+	// Treat gossip as implicit heartbeat from source node
+	s.registry.TouchLastSeen(req.SourceNodeId)
 
 	// Return our view of the cluster
 	nodes := s.registry.GetAll()
@@ -305,6 +300,11 @@ func (s *Server) Join(ctx context.Context, req *JoinRequest) (*JoinResponse, err
 
 // Ping handles health check requests
 func (s *Server) Ping(ctx context.Context, req *PingRequest) (*PingResponse, error) {
+	// Treat ping as implicit heartbeat from source node
+	if req.SourceNodeId != 0 {
+		s.registry.TouchLastSeen(req.SourceNodeId)
+	}
+
 	// Return actual node status from registry, not hardcoded ALIVE
 	node, exists := s.registry.Get(s.nodeID)
 	status := NodeStatus_ALIVE // Default to ALIVE if not found
@@ -324,6 +324,11 @@ func (s *Server) Ping(ctx context.Context, req *PingRequest) (*PingResponse, err
 
 // ReplicateTransaction handles transaction replication (Phase 5 - WIRED UP)
 func (s *Server) ReplicateTransaction(ctx context.Context, req *TransactionRequest) (*TransactionResponse, error) {
+	// Treat replication as implicit heartbeat from source node
+	if req.SourceNodeId != 0 {
+		s.registry.TouchLastSeen(req.SourceNodeId)
+	}
+
 	s.mu.RLock()
 	handler := s.replicationHandler
 	s.mu.RUnlock()
@@ -350,6 +355,11 @@ func (s *Server) Read(ctx context.Context, req *ReadRequest) (*ReadResponse, err
 // StreamChanges handles change streaming for catch-up
 // Streams committed transactions from a given txn_id for delta sync
 func (s *Server) StreamChanges(req *StreamRequest, stream MarmotService_StreamChangesServer) error {
+	// Treat stream request as implicit heartbeat from requesting node
+	if req.RequestingNodeId != 0 {
+		s.registry.TouchLastSeen(req.RequestingNodeId)
+	}
+
 	s.mu.RLock()
 	dbManager := s.dbManager
 	s.mu.RUnlock()

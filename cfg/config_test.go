@@ -43,9 +43,6 @@ func TestValidate_ValidConfig(t *testing.T) {
 			KeepaliveTimeoutSeconds: 3,
 			MaxRetries:              3,
 			RetryBackoffMS:          100,
-			ConnectionPoolSize:      4,
-			PoolIdleTimeoutSeconds:  60,
-			PoolMaxLifetimeSeconds:  300,
 		},
 		Coordinator: CoordinatorConfiguration{
 			PrepareTimeoutMS: 2000,
@@ -436,9 +433,6 @@ func TestReplicaConfigValidation_ValidConfig(t *testing.T) {
 			KeepaliveTimeoutSeconds: 3,
 			MaxRetries:              3,
 			RetryBackoffMS:          100,
-			ConnectionPoolSize:      4,
-			PoolIdleTimeoutSeconds:  60,
-			PoolMaxLifetimeSeconds:  300,
 		},
 		Coordinator: CoordinatorConfiguration{
 			PrepareTimeoutMS: 2000,

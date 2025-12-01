@@ -37,32 +37,32 @@ func (o OpType) String() string {
 }
 
 // KeyGenerator generates sequential keys for uniform distribution.
+// Thread-safe: uses atomic operations for counter/maxKey, caller provides rng.
 type KeyGenerator struct {
 	prefix        string
 	counter       uint64
 	maxKey        uint64  // Max key for reads/updates (existing rows)
 	insertOverlap float64 // % of inserts that target existing keys (0-100)
-	rng           *rand.Rand
 }
 
 // NewKeyGenerator creates a key generator.
-func NewKeyGenerator(prefix string, existingRows int64, seed int64, insertOverlap float64) *KeyGenerator {
+func NewKeyGenerator(prefix string, existingRows int64, insertOverlap float64) *KeyGenerator {
 	return &KeyGenerator{
 		prefix:        prefix,
 		maxKey:        uint64(existingRows),
 		insertOverlap: insertOverlap,
-		rng:           rand.New(rand.NewSource(seed)),
 	}
 }
 
 // NextInsertKey generates a key for inserts.
 // With insertOverlap > 0, some inserts will target existing keys (causing conflicts).
-func (g *KeyGenerator) NextInsertKey() string {
+// rng must be provided by caller (each worker has its own thread-local rng).
+func (g *KeyGenerator) NextInsertKey(rng *rand.Rand) string {
 	max := atomic.LoadUint64(&g.maxKey)
 	// Check if this insert should overlap with existing keys
-	if g.insertOverlap > 0 && max > 0 && g.rng.Float64()*100 < g.insertOverlap {
+	if g.insertOverlap > 0 && max > 0 && rng.Float64()*100 < g.insertOverlap {
 		// Return an existing key (will cause UNIQUE constraint conflict)
-		n := uint64(g.rng.Int63n(int64(max))) + 1
+		n := uint64(rng.Int63n(int64(max))) + 1
 		return fmt.Sprintf("%s_%012d", g.prefix, n)
 	}
 	// Generate a new unique key
@@ -71,12 +71,13 @@ func (g *KeyGenerator) NextInsertKey() string {
 }
 
 // RandomExistingKey returns a random key from existing rows.
-func (g *KeyGenerator) RandomExistingKey() string {
+// rng must be provided by caller (each worker has its own thread-local rng).
+func (g *KeyGenerator) RandomExistingKey(rng *rand.Rand) string {
 	max := atomic.LoadUint64(&g.maxKey)
 	if max == 0 {
-		return g.NextInsertKey() // No existing rows, generate new
+		return g.NextInsertKey(rng) // No existing rows, generate new
 	}
-	n := uint64(g.rng.Int63n(int64(max))) + 1
+	n := uint64(rng.Int63n(int64(max))) + 1
 	return fmt.Sprintf("%s_%012d", g.prefix, n)
 }
 

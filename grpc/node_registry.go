@@ -431,6 +431,17 @@ func (nr *NodeRegistry) MarkAlive(nodeID uint64) {
 	}
 }
 
+// TouchLastSeen updates the lastSeen timestamp for a node without changing state.
+// Call this when receiving any message from a peer to treat it as implicit heartbeat.
+// This reduces heartbeat traffic when nodes are actively communicating.
+func (nr *NodeRegistry) TouchLastSeen(nodeID uint64) {
+	nr.mu.Lock()
+	if _, exists := nr.nodes[nodeID]; exists {
+		nr.lastSeen[nodeID] = time.Now()
+	}
+	nr.mu.Unlock()
+}
+
 // UpdateSchemaVersions updates the schema versions for the local node
 // This is called when DDL operations complete
 func (nr *NodeRegistry) UpdateSchemaVersions(versions map[string]uint64) {

@@ -156,9 +156,6 @@ type GRPCClientConfiguration struct {
 	KeepaliveTimeoutSeconds int `toml:"keepalive_timeout_seconds"` // Keepalive ping timeout
 	MaxRetries              int `toml:"max_retries"`               // Max retry attempts
 	RetryBackoffMS          int `toml:"retry_backoff_ms"`          // Retry backoff duration
-	ConnectionPoolSize      int `toml:"connection_pool_size"`      // Number of connections per peer (default: 4)
-	PoolIdleTimeoutSeconds  int `toml:"pool_idle_timeout_seconds"` // Idle connection timeout (default: 60)
-	PoolMaxLifetimeSeconds  int `toml:"pool_max_lifetime_seconds"` // Max connection lifetime (default: 300)
 }
 
 // CoordinatorConfiguration controls transaction coordinator behavior
@@ -296,13 +293,10 @@ var Config = &Configuration{
 	},
 
 	GRPCClient: GRPCClientConfiguration{
-		KeepaliveTimeSeconds:    10,   // Send keepalive ping every 10s
-		KeepaliveTimeoutSeconds: 3,    // Timeout keepalive after 3s
-		MaxRetries:              3,    // Retry failed requests up to 3 times
-		RetryBackoffMS:          100,  // 100ms backoff between retries
-		ConnectionPoolSize:      4,    // 4 connections per peer
-		PoolIdleTimeoutSeconds:  60,   // 60s idle timeout
-		PoolMaxLifetimeSeconds:  3600, // 1 hour max lifetime
+		KeepaliveTimeSeconds:    10,  // Send keepalive ping every 10s
+		KeepaliveTimeoutSeconds: 3,   // Timeout keepalive after 3s
+		MaxRetries:              3,   // Retry failed requests up to 3 times
+		RetryBackoffMS:          100, // 100ms backoff between retries
 	},
 
 	Coordinator: CoordinatorConfiguration{
@@ -510,18 +504,6 @@ func Validate() error {
 
 	if Config.GRPCClient.RetryBackoffMS < 0 {
 		return fmt.Errorf("gRPC retry backoff must be >= 0")
-	}
-
-	if Config.GRPCClient.ConnectionPoolSize < 1 {
-		return fmt.Errorf("gRPC connection pool size must be >= 1")
-	}
-
-	if Config.GRPCClient.PoolIdleTimeoutSeconds < 0 {
-		return fmt.Errorf("gRPC pool idle timeout must be >= 0")
-	}
-
-	if Config.GRPCClient.PoolMaxLifetimeSeconds < 0 {
-		return fmt.Errorf("gRPC pool max lifetime must be >= 0")
 	}
 
 	// Validate coordinator configuration

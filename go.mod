@@ -11,7 +11,6 @@ require (
 	github.com/go-sql-driver/mysql v1.7.2-0.20231213112541-0004702b931d
 	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/mattn/go-sqlite3 v1.14.18
-	github.com/processout/grpc-go-pool v1.2.1
 	github.com/prometheus/client_golang v1.23.2
 	github.com/rqlite/sql v0.0.0-20251114131613-ef07423e7137
 	github.com/rs/zerolog v1.31.0
