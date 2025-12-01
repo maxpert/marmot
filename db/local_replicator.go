@@ -8,6 +8,7 @@ import (
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/protocol"
 	"github.com/rs/zerolog/log"
+	"github.com/vmihailenco/msgpack/v5"
 )
 
 // LocalReplicator implements coordinator.Replicator for local application
@@ -114,13 +115,18 @@ func (lr *LocalReplicator) handlePrepare(ctx context.Context, req *coordinator.R
 	}
 
 	txnMgr := mvccDB.GetTransactionManager()
+	metaStore := mvccDB.GetMetaStore()
+
 	// Use coordinator's txn_id directly to avoid ID collision race conditions
 	txn, err := txnMgr.BeginTransactionWithID(req.TxnID, req.NodeID, req.StartTS)
 	if err != nil {
 		return &coordinator.ReplicationResponse{Success: false, Error: err.Error()}, nil
 	}
 
+	var stmtSeq uint64 = 0
 	for _, stmt := range req.Statements {
+		stmtSeq++
+
 		if err := txnMgr.AddStatement(txn, stmt); err != nil {
 			txnMgr.AbortTransaction(txn)
 			return &coordinator.ReplicationResponse{Success: false, Error: err.Error()}, nil
@@ -138,15 +144,52 @@ func (lr *LocalReplicator) handlePrepare(ctx context.Context, req *coordinator.R
 				continue
 			}
 
-			// For UPDATE/DELETE without rowKey, use SQL hash as fallback
-			sql := stmt.SQL
-			if sql == "" {
-				sql = "unknown"
+			// For UPDATE/DELETE without rowKey, skip write intent creation.
+			// RowKey MUST come from CDC hooks (preupdate) which extract actual PK values.
+			// SQL-derived fallback was catastrophically broken - it made ALL updates
+			// on the same table conflict because they share the same SQL prefix.
+			// MVCC commit will detect conflicts at row level when applying changes.
+			if stmt.Type == protocol.StatementUpdate || stmt.Type == protocol.StatementDelete {
+				log.Debug().
+					Str("table", stmt.TableName).
+					Int("stmt_type", int(stmt.Type)).
+					Msg("LOCAL REPLICATOR: Empty RowKey for UPDATE/DELETE - CDC will provide it during commit")
+				continue
 			}
-			log.Warn().
-				Str("sql", sql).
-				Msg("Empty RowKey for non-INSERT - using SQL-derived identifier")
-			rowKey = fmt.Sprintf("%x", []byte(sql)[:min(16, len(sql))])
+
+			// For DDL statements, create write intent using table name as row key
+			// This ensures DDL SQL gets stored and executed during commit phase
+			if stmt.Type == protocol.StatementDDL {
+				ddlRowKey := fmt.Sprintf("__ddl__%s", stmt.TableName)
+				snapshotData := map[string]interface{}{
+					"type":      stmt.Type,
+					"timestamp": req.StartTS.WallTime,
+					"sql":       stmt.SQL,
+				}
+				dataSnapshot, serErr := SerializeData(snapshotData)
+				if serErr != nil {
+					txnMgr.AbortTransaction(txn)
+					return &coordinator.ReplicationResponse{Success: false, Error: fmt.Sprintf("failed to serialize DDL data: %v", serErr)}, nil
+				}
+
+				if err := txnMgr.WriteIntent(txn, "__marmot__ddl_ops", ddlRowKey, stmt, dataSnapshot); err != nil {
+					txnMgr.AbortTransaction(txn)
+					return &coordinator.ReplicationResponse{
+						Success:          false,
+						Error:            fmt.Sprintf("DDL conflict: %v", err),
+						ConflictDetected: true,
+						ConflictDetails:  err.Error(),
+					}, nil
+				}
+				log.Debug().
+					Str("table", stmt.TableName).
+					Str("ddl_row_key", ddlRowKey).
+					Msg("LOCAL REPLICATOR: Created write intent for DDL statement")
+				continue
+			}
+
+			// For other statement types without rowKey, skip write intent
+			continue
 		}
 
 		// Serialize data snapshot (CDC data if available, otherwise SQL)
@@ -178,9 +221,53 @@ func (lr *LocalReplicator) handlePrepare(ctx context.Context, req *coordinator.R
 				ConflictDetails:  err.Error(),
 			}, nil
 		}
+
+		// CRITICAL: Write CDC intent entry so CommitTransaction can replay it
+		// This stores the actual row data (NewValues/OldValues) for later application to SQLite
+		if len(stmt.NewValues) > 0 || len(stmt.OldValues) > 0 {
+			// Serialize OldValues and NewValues as msgpack
+			var oldVals, newVals []byte
+			if len(stmt.OldValues) > 0 {
+				oldVals, _ = msgpack.Marshal(stmt.OldValues)
+			}
+			if len(stmt.NewValues) > 0 {
+				newVals, _ = msgpack.Marshal(stmt.NewValues)
+			}
+
+			// Convert statement type to operation code
+			op := statementTypeToOpCode(stmt.Type)
+
+			err := metaStore.WriteIntentEntry(req.TxnID, stmtSeq, op, stmt.TableName, rowKey, oldVals, newVals)
+			if err != nil {
+				log.Error().Err(err).
+					Uint64("txn_id", req.TxnID).
+					Str("table", stmt.TableName).
+					Str("row_key", rowKey).
+					Msg("Failed to write CDC intent entry")
+				txnMgr.AbortTransaction(txn)
+				return &coordinator.ReplicationResponse{
+					Success: false,
+					Error:   fmt.Sprintf("failed to write CDC entry: %v", err),
+				}, nil
+			}
+		}
 	}
 
 	return &coordinator.ReplicationResponse{Success: true}, nil
+}
+
+// statementTypeToOpCode converts protocol.StatementType to uint8 operation code
+func statementTypeToOpCode(st protocol.StatementType) uint8 {
+	switch st {
+	case protocol.StatementInsert, protocol.StatementReplace:
+		return OpInsertInt
+	case protocol.StatementUpdate:
+		return OpUpdateInt
+	case protocol.StatementDelete:
+		return OpDeleteInt
+	default:
+		return OpInsertInt
+	}
 }
 
 func (lr *LocalReplicator) handleCommit(ctx context.Context, req *coordinator.ReplicationRequest) (*coordinator.ReplicationResponse, error) {
