@@ -10,6 +10,7 @@ import (
 	"github.com/maxpert/marmot/cfg"
 	"github.com/maxpert/marmot/db"
 	"github.com/maxpert/marmot/hlc"
+	"github.com/maxpert/marmot/telemetry"
 	"github.com/rs/zerolog/log"
 )
 
@@ -217,8 +218,14 @@ func (ae *AntiEntropyService) runStartupSync() {
 
 // performAntiEntropy performs a single anti-entropy round
 func (ae *AntiEntropyService) performAntiEntropy() {
+	roundStart := time.Now()
+	telemetry.AntiEntropyRoundsTotal.Inc()
+
 	ctx, cancel := context.WithTimeout(context.Background(), ae.interval)
 	defer cancel()
+	defer func() {
+		telemetry.AntiEntropyDurationSeconds.Observe(time.Since(roundStart).Seconds())
+	}()
 
 	log.Debug().Msg("Starting anti-entropy round")
 
@@ -556,16 +563,22 @@ func (ae *AntiEntropyService) syncPeerDatabase(ctx context.Context, peer *NodeSt
 					// Try snapshot instead
 					if ae.snapshotFunc != nil {
 						if snapErr := ae.snapshotFunc(ctx, peer.NodeId, peer.Address, database); snapErr != nil {
+							telemetry.AntiEntropySyncsTotal.With("snapshot", "failed").Inc()
 							return fmt.Errorf("delta sync failed with gap (transactions GC'd) and snapshot fallback failed: %w", snapErr)
 						}
+						telemetry.AntiEntropySyncsTotal.With("snapshot", "success").Inc()
 						return nil
 					}
+					telemetry.AntiEntropySyncsTotal.With("delta", "failed").Inc()
 					return fmt.Errorf("delta sync failed with gap (transactions GC'd) but snapshot function not configured: %w", err)
 				}
 				// Other errors - fail normally
+				telemetry.AntiEntropySyncsTotal.With("delta", "failed").Inc()
 				return fmt.Errorf("delta sync failed: %w", err)
 			}
 
+			telemetry.AntiEntropySyncsTotal.With("delta", "success").Inc()
+			telemetry.DeltaSyncTxnsTotal.Add(float64(result.TxnsApplied))
 			log.Debug().
 				Uint64("peer_node", peer.NodeId).
 				Str("database", database).
@@ -581,8 +594,10 @@ func (ae *AntiEntropyService) syncPeerDatabase(ctx context.Context, peer *NodeSt
 
 			if ae.snapshotFunc != nil {
 				if err := ae.snapshotFunc(ctx, peer.NodeId, peer.Address, database); err != nil {
+					telemetry.AntiEntropySyncsTotal.With("snapshot", "failed").Inc()
 					return fmt.Errorf("snapshot transfer failed: %w", err)
 				}
+				telemetry.AntiEntropySyncsTotal.With("snapshot", "success").Inc()
 			} else {
 				log.Warn().Msg("Snapshot function not configured, skipping snapshot transfer")
 			}

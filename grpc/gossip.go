@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/maxpert/marmot/telemetry"
 	"github.com/rs/zerolog/log"
 )
 
@@ -116,6 +117,7 @@ func (gp *GossipProtocol) gossipLoop(config GossipConfig) {
 
 // doGossipRound performs one round of gossip
 func (gp *GossipProtocol) doGossipRound() {
+	telemetry.GossipRoundsTotal.Inc()
 	peers := gp.selectRandomPeers(gp.fanout)
 	if len(peers) == 0 {
 		// Log registry state when no peers found - helps debug membership issues
@@ -244,8 +246,10 @@ func (gp *GossipProtocol) sendGossip(peer *NodeState, req *GossipRequest) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
+	telemetry.GossipMessagesTotal.With("sent").Inc()
 	resp, err := gp.client.SendGossip(ctx, peer.NodeId, req)
 	if err != nil {
+		telemetry.GossipFailuresTotal.Inc()
 		log.Debug().
 			Err(err).
 			Uint64("node_id", gp.nodeID).
@@ -260,6 +264,7 @@ func (gp *GossipProtocol) sendGossip(peer *NodeState, req *GossipRequest) {
 		return
 	}
 
+	telemetry.GossipMessagesTotal.With("received").Inc()
 	log.Debug().
 		Uint64("node_id", gp.nodeID).
 		Uint64("peer", peer.NodeId).
@@ -401,6 +406,7 @@ func (gp *GossipProtocol) JoinCluster(seedAddresses []string, advertiseAddress s
 		}
 
 		if err != nil {
+			telemetry.ClusterJoinTotal.With("failed").Inc()
 			log.Debug().
 				Err(err).
 				Uint64("node_id", gp.nodeID).
@@ -411,6 +417,7 @@ func (gp *GossipProtocol) JoinCluster(seedAddresses []string, advertiseAddress s
 		}
 
 		if !resp.Success {
+			telemetry.ClusterJoinTotal.With("rejected").Inc()
 			log.Debug().
 				Uint64("node_id", gp.nodeID).
 				Str("address", addr).
@@ -419,6 +426,7 @@ func (gp *GossipProtocol) JoinCluster(seedAddresses []string, advertiseAddress s
 			continue
 		}
 
+		telemetry.ClusterJoinTotal.With("success").Inc()
 		log.Debug().
 			Uint64("node_id", gp.nodeID).
 			Int("cluster_nodes_count", len(resp.ClusterNodes)).

@@ -5,6 +5,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/maxpert/marmot/telemetry"
 	"github.com/rs/zerolog/log"
 )
 
@@ -284,6 +285,9 @@ func (nr *NodeRegistry) transitionState(nodeID uint64, newStatus NodeStatus, rea
 	node.Status = newStatus
 	node.Incarnation++ // Increment to propagate via gossip
 
+	// Record state transition metric
+	telemetry.NodeStateTransitionsTotal.With(oldStatus.String(), newStatus.String()).Inc()
+
 	log.Warn().
 		Uint64("node_id", nodeID).
 		Str("old_status", oldStatus.String()).
@@ -291,6 +295,9 @@ func (nr *NodeRegistry) transitionState(nodeID uint64, newStatus NodeStatus, rea
 		Uint64("incarnation", node.Incarnation).
 		Str("reason", reason).
 		Msg("Node state transition")
+
+	// Update cluster node gauges after transition
+	nr.updateClusterMetricsLocked()
 }
 
 // MarkSuspect marks a node as suspect
@@ -628,6 +635,31 @@ func (nr *NodeRegistry) GetMembershipInfo() []MemberInfo {
 		})
 	}
 	return members
+}
+
+// updateClusterMetricsLocked updates cluster node gauges
+// Must be called with mu held
+func (nr *NodeRegistry) updateClusterMetricsLocked() {
+	counts := make(map[NodeStatus]int)
+	for _, node := range nr.nodes {
+		counts[node.Status]++
+	}
+
+	telemetry.ClusterNodes.With("ALIVE").Set(float64(counts[NodeStatus_ALIVE]))
+	telemetry.ClusterNodes.With("SUSPECT").Set(float64(counts[NodeStatus_SUSPECT]))
+	telemetry.ClusterNodes.With("DEAD").Set(float64(counts[NodeStatus_DEAD]))
+	telemetry.ClusterNodes.With("JOINING").Set(float64(counts[NodeStatus_JOINING]))
+	telemetry.ClusterNodes.With("REMOVED").Set(float64(counts[NodeStatus_REMOVED]))
+
+	// Update quorum available
+	aliveCount := counts[NodeStatus_ALIVE]
+	totalMembership := len(nr.nodes) - counts[NodeStatus_REMOVED]
+	quorumSize := (totalMembership / 2) + 1
+	if aliveCount >= quorumSize {
+		telemetry.ClusterQuorumAvailable.Set(1)
+	} else {
+		telemetry.ClusterQuorumAvailable.Set(0)
+	}
 }
 
 // QuorumInfo returns quorum calculation information

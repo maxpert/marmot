@@ -13,6 +13,7 @@ import (
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/protocol"
 	"github.com/maxpert/marmot/protocol/handlers"
+	"github.com/maxpert/marmot/telemetry"
 	"github.com/rs/zerolog/log"
 )
 
@@ -249,6 +250,8 @@ func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, qu
 }
 
 func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, consistency protocol.ConsistencyLevel) (*protocol.ResultSet, error) {
+	queryStart := time.Now()
+
 	// Generate txnID using Percolator/TiDB pattern: (physical_ms << 18) | logical
 	// This guarantees uniqueness by keeping physical and logical in separate bit ranges
 	startTS := h.clock.Now()
@@ -275,6 +278,8 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, consistency
 		// Acquire cluster-wide DDL lock for this database
 		_, err := h.ddlLockMgr.AcquireLock(stmt.Database, h.nodeID, uint64(txnID), startTS)
 		if err != nil {
+			telemetry.QueriesTotal.With("ddl", "failed").Inc()
+			telemetry.QueryDurationSeconds.With("ddl").Observe(time.Since(queryStart).Seconds())
 			return nil, fmt.Errorf("failed to acquire DDL lock: %w", err)
 		}
 		// Release lock when done (even if transaction fails)
@@ -327,6 +332,8 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, consistency
 				// Statement-based fallback uses raw SQL which fails on duplicate keys
 				// Return error to client so they can retry
 				log.Warn().Err(err).Msg("DML execution with CDC hooks failed - client should retry")
+				telemetry.QueriesTotal.With("dml", "failed").Inc()
+				telemetry.QueryDurationSeconds.With("dml").Observe(time.Since(queryStart).Seconds())
 				return nil, fmt.Errorf("DML execution failed: %w", err)
 			}
 			rowsAffected = pendingExec.GetTotalRowCount()
@@ -411,6 +418,12 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, consistency
 
 	err := h.writeCoord.WriteTransaction(ctx, txn)
 	if err != nil {
+		queryType := "dml"
+		if isDDL {
+			queryType = "ddl"
+		}
+		telemetry.QueriesTotal.With(queryType, "failed").Inc()
+		telemetry.QueryDurationSeconds.With(queryType).Observe(time.Since(queryStart).Seconds())
 		return nil, err
 	}
 	// Success - coordinator committed via CDC replay in WriteTransaction
@@ -440,12 +453,23 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, consistency
 		}
 	}
 
+	// Record success metrics
+	queryType := "dml"
+	if isDDL {
+		queryType = "ddl"
+	}
+	telemetry.QueriesTotal.With(queryType, "success").Inc()
+	telemetry.QueryDurationSeconds.With(queryType).Observe(time.Since(queryStart).Seconds())
+	telemetry.RowsAffected.Observe(float64(rowsAffected))
+
 	return &protocol.ResultSet{
 		RowsAffected: rowsAffected,
 	}, nil
 }
 
 func (h *CoordinatorHandler) handleRead(stmt protocol.Statement, consistency protocol.ConsistencyLevel) (*protocol.ResultSet, error) {
+	queryStart := time.Now()
+
 	req := &ReadRequest{
 		Query:       stmt.SQL,
 		SnapshotTS:  h.clock.Now(),
@@ -465,6 +489,8 @@ func (h *CoordinatorHandler) handleRead(stmt protocol.Statement, consistency pro
 			Str("table", stmt.TableName).
 			Str("sql", stmt.SQL).
 			Msg("Returning error to client: read transaction failed")
+		telemetry.QueriesTotal.With("select", "failed").Inc()
+		telemetry.QueryDurationSeconds.With("select").Observe(time.Since(queryStart).Seconds())
 		return nil, err
 	}
 
@@ -475,6 +501,8 @@ func (h *CoordinatorHandler) handleRead(stmt protocol.Statement, consistency pro
 			Str("table", stmt.TableName).
 			Str("sql", stmt.SQL).
 			Msg("Returning error to client: read transaction unsuccessful")
+		telemetry.QueriesTotal.With("select", "failed").Inc()
+		telemetry.QueryDurationSeconds.With("select").Observe(time.Since(queryStart).Seconds())
 		return nil, fmt.Errorf("%s", resp.Error)
 	}
 
@@ -517,6 +545,11 @@ func (h *CoordinatorHandler) handleRead(stmt protocol.Statement, consistency pro
 			rs.Rows = append(rs.Rows, row)
 		}
 	}
+
+	// Record success metrics
+	telemetry.QueriesTotal.With("select", "success").Inc()
+	telemetry.QueryDurationSeconds.With("select").Observe(time.Since(queryStart).Seconds())
+	telemetry.RowsReturned.Observe(float64(len(rs.Rows)))
 
 	return rs, nil
 }

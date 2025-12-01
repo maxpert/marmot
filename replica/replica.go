@@ -111,6 +111,7 @@ func (r *Replica) SetConnected(connected bool) {
 func Run() {
 	log.Debug().Msg("Initializing telemetry")
 	telemetry.InitializeTelemetry()
+	telemetry.InitMetrics()
 
 	// Create replica instance
 	replica := NewReplica(

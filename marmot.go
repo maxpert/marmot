@@ -80,6 +80,7 @@ func main() {
 
 	log.Debug().Msg("Initializing telemetry")
 	telemetry.InitializeTelemetry()
+	telemetry.InitMetrics()
 
 	// Phase 1: Initialize gRPC server with gossip
 	log.Info().Msg("Initializing gRPC server")

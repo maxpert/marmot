@@ -8,6 +8,7 @@ import (
 	"github.com/maxpert/marmot/cfg"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/protocol"
+	"github.com/maxpert/marmot/telemetry"
 	"github.com/rs/zerolog/log"
 )
 
@@ -118,6 +119,10 @@ func NewWriteCoordinator(nodeID uint64, nodeProvider NodeProvider, replicator Re
 // - Background replication continues to stragglers
 // - Dead nodes catch up via snapshot + delta logs when they rejoin
 func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transaction) error {
+	txnStart := time.Now()
+	telemetry.ActiveTransactions.Inc()
+	defer telemetry.ActiveTransactions.Dec()
+
 	log.Trace().
 		Uint64("txn_id", txn.ID).
 		Int("stmt_count", len(txn.Statements)).
@@ -183,10 +188,16 @@ func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transacti
 
 	// Execute prepare phase on all nodes (including self) - single attempt, no retry
 	// All nodes now participate uniformly - no skipLocalReplication
+	prepStart := time.Now()
 	prepResponses, conflictErr := wc.executePreparePhase(ctx, txn, prepReq, otherNodes, false)
+	telemetry.TwoPhasePrepareSeconds.Observe(time.Since(prepStart).Seconds())
+	telemetry.TwoPhaseQuorumAcks.With("prepare").Observe(float64(len(prepResponses)))
 
 	if conflictErr != nil {
 		// Write-write conflict detected - abort and signal client to retry
+		telemetry.WriteConflictsTotal.With("mutation_guard").Inc()
+		telemetry.TxnTotal.With("write", "conflict").Inc()
+		telemetry.TxnDurationSeconds.With("write").Observe(time.Since(txnStart).Seconds())
 		log.Debug().
 			Uint64("txn_id", txn.ID).
 			Err(conflictErr).
@@ -199,6 +210,8 @@ func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transacti
 	// Check if quorum was achieved
 	totalAcks := len(prepResponses)
 	if totalAcks < requiredQuorum {
+		telemetry.TxnTotal.With("write", "failed").Inc()
+		telemetry.TxnDurationSeconds.With("write").Observe(time.Since(txnStart).Seconds())
 		log.Warn().
 			Uint64("txn_id", txn.ID).
 			Int("total_acks", totalAcks).
@@ -218,6 +231,7 @@ func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transacti
 	// Quorum of write intents created successfully with no conflicts.
 	// Commit locally FIRST, then broadcast to others.
 	// This ensures coordinator never tells others to commit something it couldn't commit itself.
+	commitStart := time.Now()
 	log.Debug().
 		Uint64("txn_id", txn.ID).
 		Int("prepared_nodes", len(prepResponses)).
@@ -301,6 +315,8 @@ func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transacti
 	}
 
 	totalCommitAcks := len(commitResponses)
+	telemetry.TwoPhaseCommitSeconds.Observe(time.Since(commitStart).Seconds())
+	telemetry.TwoPhaseQuorumAcks.With("commit").Observe(float64(totalCommitAcks))
 
 	// Commit phase also requires quorum for durability guarantees.
 	// If commit quorum fails, transaction is partially committed -
@@ -327,10 +343,14 @@ func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transacti
 				}(nodeID)
 			}
 		}
+		telemetry.TxnTotal.With("write", "failed").Inc()
+		telemetry.TxnDurationSeconds.With("write").Observe(time.Since(txnStart).Seconds())
 		return fmt.Errorf("commit quorum degraded: got %d acks, expected %d (aborted uncommitted nodes)",
 			totalCommitAcks, requiredQuorum)
 	}
 
+	telemetry.TxnTotal.With("write", "success").Inc()
+	telemetry.TxnDurationSeconds.With("write").Observe(time.Since(txnStart).Seconds())
 	return nil
 }
 

@@ -9,6 +9,7 @@ import (
 	"github.com/maxpert/marmot/db"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/protocol"
+	"github.com/maxpert/marmot/telemetry"
 	"github.com/rs/zerolog/log"
 	"github.com/vmihailenco/msgpack/v5"
 )
@@ -72,6 +73,7 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 	if len(req.MutationGuards) > 0 && rh.guardRegistry != nil {
 		conflictResult := rh.checkMutationGuardConflicts(req)
 		if conflictResult.HasConflict {
+			telemetry.ReplicationRequestsTotal.With("prepare", "conflict").Inc()
 			return &TransactionResponse{
 				Success:          false,
 				ErrorMessage:     conflictResult.Details,
@@ -400,6 +402,7 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 	}
 
 	// Success! Write intents created
+	telemetry.ReplicationRequestsTotal.With("prepare", "success").Inc()
 	return &TransactionResponse{
 		Success: true,
 		AppliedAt: &HLC{
@@ -554,6 +557,7 @@ func (rh *ReplicationHandler) handleCommit(ctx context.Context, req *Transaction
 		if metaStore != nil {
 			metaStore.DeleteIntentsByTxn(req.TxnId)
 		}
+		telemetry.ReplicationRequestsTotal.With("commit", "failed").Inc()
 		return &TransactionResponse{
 			Success:      false,
 			ErrorMessage: fmt.Sprintf("failed to commit: %v", err),
@@ -565,6 +569,7 @@ func (rh *ReplicationHandler) handleCommit(ctx context.Context, req *Transaction
 		rh.guardRegistry.Remove(req.TxnId)
 	}
 
+	telemetry.ReplicationRequestsTotal.With("commit", "success").Inc()
 	return &TransactionResponse{
 		Success: true,
 		AppliedAt: &HLC{
@@ -752,6 +757,7 @@ func (rh *ReplicationHandler) handleReplay(ctx context.Context, req *Transaction
 		Int("statements", len(req.Statements)).
 		Msg("handleReplay: transaction applied successfully")
 
+	telemetry.ReplicationRequestsTotal.With("replay", "success").Inc()
 	return &TransactionResponse{
 		Success: true,
 		AppliedAt: &HLC{
