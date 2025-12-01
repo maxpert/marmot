@@ -16,26 +16,35 @@ import (
 func TestMVCCSchemaCreation(t *testing.T) {
 	testDB := setupTestDBWithMeta(t)
 
-	// Verify transaction records table in meta store
-	var count int
-	err := testDB.MetaStore.ReadDB().QueryRow("SELECT COUNT(*) FROM __marmot__txn_records").Scan(&count)
+	// Verify MetaStore is functional by checking it can perform basic operations
+	// This works with any backend (SQLite or BadgerDB)
+
+	// Verify we can query committed transaction count
+	count, err := testDB.MetaStore.GetCommittedTxnCount()
 	if err != nil {
-		t.Fatalf("Transaction records table not created: %v", err)
+		t.Fatalf("GetCommittedTxnCount failed: %v", err)
+	}
+	// Should be 0 initially
+	if count != 0 {
+		t.Logf("Initial committed txn count: %d", count)
 	}
 
-	// Verify write intents table in meta store
-	err = testDB.MetaStore.ReadDB().QueryRow("SELECT COUNT(*) FROM __marmot__write_intents").Scan(&count)
+	// Verify we can query max seq num
+	_, err = testDB.MetaStore.GetMaxSeqNum()
 	if err != nil {
-		t.Fatalf("Write intents table not created: %v", err)
+		t.Fatalf("GetMaxSeqNum failed: %v", err)
 	}
 
-	// Verify MVCC versions table in meta store
-	err = testDB.MetaStore.ReadDB().QueryRow("SELECT COUNT(*) FROM __marmot__mvcc_versions").Scan(&count)
+	// Verify we can query pending transactions
+	pending, err := testDB.MetaStore.GetPendingTransactions()
 	if err != nil {
-		t.Fatalf("MVCC versions table not created: %v", err)
+		t.Fatalf("GetPendingTransactions failed: %v", err)
+	}
+	if len(pending) != 0 {
+		t.Logf("Initial pending txn count: %d", len(pending))
 	}
 
-	t.Log("✓ All MVCC tables created successfully in MetaStore")
+	t.Log("✓ MetaStore schema initialized and functional")
 }
 
 // TestUserTableTransparency tests that user tables are stored transparently

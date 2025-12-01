@@ -16,15 +16,19 @@ import (
 // createMutationGuardTestMetaStore creates a MetaStore for mutation guard tests
 func createMutationGuardTestMetaStore(t *testing.T, dbPath string) MetaStore {
 	t.Helper()
-	metaPath := dbPath + "_meta.db"
-	os.Remove(metaPath)
-	metaStore, err := NewSQLiteMetaStore(metaPath, 5000)
+	metaPath := dbPath + "_meta.badger"
+	os.RemoveAll(metaPath)
+	metaStore, err := NewBadgerMetaStore(metaPath, BadgerMetaStoreOptions{
+		SyncWrites:    false, // Faster for tests
+		NumCompactors: 2,
+		ValueLogGC:    false,
+	})
 	if err != nil {
 		t.Fatalf("Failed to create test meta store: %v", err)
 	}
 	t.Cleanup(func() {
 		metaStore.Close()
-		os.Remove(metaPath)
+		os.RemoveAll(metaPath)
 	})
 	return metaStore
 }

@@ -34,6 +34,9 @@ type Config struct {
 	Retry      bool
 	MaxRetries int
 
+	// Key generation
+	InsertOverlap float64 // % of inserts that target existing keys (for conflict testing)
+
 	// Derived
 	hostList []string
 }

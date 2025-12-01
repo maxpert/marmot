@@ -15,11 +15,15 @@ import (
 func createTestMVCCDatabase(t *testing.T, dbPath string) (*MVCCDatabase, MetaStore) {
 	t.Helper()
 
-	metaPath := dbPath + "_meta.db"
+	metaPath := dbPath + "_meta.badger"
 	os.Remove(dbPath)
-	os.Remove(metaPath)
+	os.RemoveAll(metaPath)
 
-	metaStore, err := NewSQLiteMetaStore(metaPath, 5000)
+	metaStore, err := NewBadgerMetaStore(metaPath, BadgerMetaStoreOptions{
+		SyncWrites:    false, // Faster for tests
+		NumCompactors: 2,
+		ValueLogGC:    false,
+	})
 	if err != nil {
 		t.Fatalf("Failed to create MetaStore: %v", err)
 	}
@@ -35,9 +39,7 @@ func createTestMVCCDatabase(t *testing.T, dbPath string) (*MVCCDatabase, MetaSto
 		mdb.Close()
 		metaStore.Close()
 		os.Remove(dbPath)
-		os.Remove(metaPath)
-		os.Remove(metaPath + "-wal")
-		os.Remove(metaPath + "-shm")
+		os.RemoveAll(metaPath)
 	})
 
 	return mdb, metaStore
@@ -48,23 +50,30 @@ func TestMVCCDatabase_Creation(t *testing.T) {
 	mdb, metaStore := createTestMVCCDatabase(t, dbPath)
 	_ = mdb
 
-	// Verify MVCC tables exist in MetaStore
-	tables := []string{
-		"__marmot__txn_records",
-		"__marmot__write_intents",
-		"__marmot__mvcc_versions",
-		"__marmot__metadata",
+	// Verify MetaStore is functional by testing basic operations
+	// This works with any backend (SQLite or BadgerDB)
+
+	// Test GetCommittedTxnCount
+	count, err := metaStore.GetCommittedTxnCount()
+	if err != nil {
+		t.Fatalf("GetCommittedTxnCount failed: %v", err)
+	}
+	t.Logf("Initial committed txn count: %d", count)
+
+	// Test GetPendingTransactions
+	pending, err := metaStore.GetPendingTransactions()
+	if err != nil {
+		t.Fatalf("GetPendingTransactions failed: %v", err)
+	}
+	t.Logf("Initial pending txn count: %d", len(pending))
+
+	// Test GetMaxSeqNum
+	_, err = metaStore.GetMaxSeqNum()
+	if err != nil {
+		t.Fatalf("GetMaxSeqNum failed: %v", err)
 	}
 
-	for _, table := range tables {
-		var name string
-		err := metaStore.ReadDB().QueryRow("SELECT name FROM sqlite_master WHERE type='table' AND name=?", table).Scan(&name)
-		if err != nil {
-			t.Fatalf("MVCC table %s not found in MetaStore: %v", table, err)
-		}
-	}
-
-	t.Log("✓ MVCC database created with all system tables in MetaStore")
+	t.Log("✓ MVCC database created with functional MetaStore")
 }
 
 func TestMVCCDatabase_SimpleTransaction(t *testing.T) {
@@ -98,8 +107,7 @@ func TestMVCCDatabase_SimpleTransaction(t *testing.T) {
 	}
 
 	// Verify transaction was recorded in MetaStore
-	var count int
-	err = metaStore.ReadDB().QueryRow("SELECT COUNT(*) FROM __marmot__txn_records WHERE status = ?", TxnStatusCommitted).Scan(&count)
+	count, err := metaStore.GetCommittedTxnCount()
 	if err != nil {
 		t.Fatalf("Failed to query txn records: %v", err)
 	}
@@ -357,28 +365,34 @@ func TestMVCCDatabase_TransactionLifecycle(t *testing.T) {
 	t.Logf("✓ Transaction %d committed (commit_ts: %d)", txn.ID, txn.CommitTS.WallTime)
 
 	// Verify transaction status in MetaStore
-	var status string
-	err = metaStore.ReadDB().QueryRow("SELECT status FROM __marmot__txn_records WHERE txn_id = ?", txn.ID).Scan(&status)
+	rec, err := metaStore.GetTransaction(txn.ID)
 	if err != nil {
 		t.Fatalf("Failed to query transaction status: %v", err)
 	}
-
-	if status != TxnStatusCommitted {
-		t.Fatalf("Expected status %s, got %s", TxnStatusCommitted, status)
+	if rec == nil {
+		t.Fatalf("Transaction record not found for txn_id=%d", txn.ID)
 	}
 
-	t.Logf("✓ Transaction record shows status: %s", status)
+	if rec.Status != MetaTxnStatusCommitted {
+		t.Fatalf("Expected status %s, got %s", MetaTxnStatusCommitted, rec.Status)
+	}
+
+	t.Logf("✓ Transaction record shows status: %s", rec.Status)
 }
 
 // TestMVCCDatabase_Close verifies that Close() properly stops GC and closes all connections
 func TestMVCCDatabase_Close(t *testing.T) {
 	dbPath := "/tmp/test_mvcc_close.db"
-	metaPath := dbPath + "_meta.db"
+	metaPath := dbPath + "_meta.badger"
 	os.Remove(dbPath)
-	os.Remove(metaPath)
+	os.RemoveAll(metaPath)
 
 	// Create MetaStore
-	metaStore, err := NewSQLiteMetaStore(metaPath, 5000)
+	metaStore, err := NewBadgerMetaStore(metaPath, BadgerMetaStoreOptions{
+		SyncWrites:    false,
+		NumCompactors: 2,
+		ValueLogGC:    false,
+	})
 	if err != nil {
 		t.Fatalf("Failed to create MetaStore: %v", err)
 	}
@@ -417,19 +431,21 @@ func TestMVCCDatabase_Close(t *testing.T) {
 
 	// Cleanup
 	os.Remove(dbPath)
-	os.Remove(metaPath)
-	os.Remove(metaPath + "-wal")
-	os.Remove(metaPath + "-shm")
+	os.RemoveAll(metaPath)
 }
 
 // TestMVCCDatabase_CloseMultipleTimes verifies that Close() is safe to call multiple times
 func TestMVCCDatabase_CloseMultipleTimes(t *testing.T) {
 	dbPath := "/tmp/test_mvcc_close_multi.db"
-	metaPath := dbPath + "_meta.db"
+	metaPath := dbPath + "_meta.badger"
 	os.Remove(dbPath)
-	os.Remove(metaPath)
+	os.RemoveAll(metaPath)
 
-	metaStore, err := NewSQLiteMetaStore(metaPath, 5000)
+	metaStore, err := NewBadgerMetaStore(metaPath, BadgerMetaStoreOptions{
+		SyncWrites:    false,
+		NumCompactors: 2,
+		ValueLogGC:    false,
+	})
 	if err != nil {
 		t.Fatalf("Failed to create MetaStore: %v", err)
 	}
@@ -464,7 +480,5 @@ func TestMVCCDatabase_CloseMultipleTimes(t *testing.T) {
 	t.Log("✓ StopGarbageCollection is safe to call multiple times")
 
 	os.Remove(dbPath)
-	os.Remove(metaPath)
-	os.Remove(metaPath + "-wal")
-	os.Remove(metaPath + "-shm")
+	os.RemoveAll(metaPath)
 }

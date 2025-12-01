@@ -42,6 +42,10 @@ sleep 1
 echo "Cleaning up old data..."
 rm -rf /tmp/marmot-node-*
 
+echo "Building new bits..."
+go build -tags sqlite_preupdate_hook -o marmot-v2 .
+
+echo "=========================="
 # Create database for initial data (will be replicated to all nodes)
 create_db() {
     local db_file="$1"
@@ -73,14 +77,6 @@ mkdir -p /tmp/marmot-node-1 /tmp/marmot-node-2 /tmp/marmot-node-3
 create_db /tmp/marmot-node-1/marmot.db
 create_db /tmp/marmot-node-2/marmot.db
 create_db /tmp/marmot-node-3/marmot.db
-
-# Build marmot-v2 if needed
-if [ ! -f "$REPO_ROOT/marmot-v2" ]; then
-    echo "Building marmot-v2..."
-    cd "$REPO_ROOT"
-    go build -tags sqlite_preupdate_hook -o marmot-v2 .
-    echo "✓ Build complete"
-fi
 
 # Cleanup function
 cleanup() {

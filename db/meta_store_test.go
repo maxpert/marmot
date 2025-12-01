@@ -12,14 +12,18 @@ import (
 	"github.com/maxpert/marmot/hlc"
 )
 
-func createTestMetaStore(t *testing.T) (*SQLiteMetaStore, func()) {
+func createTestMetaStore(t *testing.T) (*BadgerMetaStore, func()) {
 	tmpDir, err := os.MkdirTemp("", "metastore_test")
 	if err != nil {
 		t.Fatalf("failed to create temp dir: %v", err)
 	}
 
-	metaPath := filepath.Join(tmpDir, "test_meta.db")
-	store, err := NewSQLiteMetaStore(metaPath, 5000)
+	metaPath := filepath.Join(tmpDir, "test_meta.badger")
+	store, err := NewBadgerMetaStore(metaPath, BadgerMetaStoreOptions{
+		SyncWrites:    false, // Faster for tests
+		NumCompactors: 2,
+		ValueLogGC:    false,
+	})
 	if err != nil {
 		os.RemoveAll(tmpDir)
 		t.Fatalf("failed to create meta store: %v", err)
@@ -394,17 +398,16 @@ func TestMetaStoreGCStaleTransactions(t *testing.T) {
 	oldTxnID := oldTS.ToTxnID()
 	store.BeginTransaction(oldTxnID, 1, oldTS)
 
-	// Manually set old heartbeat
-	store.writeDB.Exec(`UPDATE __marmot__txn_records SET last_heartbeat = ? WHERE txn_id = ?`,
-		time.Now().Add(-2*time.Hour).UnixNano(), oldTxnID)
+	// Wait to ensure the transaction ages
+	time.Sleep(50 * time.Millisecond)
 
 	// Create recent transaction
 	newTS := clock.Now()
 	newTxnID := newTS.ToTxnID()
 	store.BeginTransaction(newTxnID, 1, newTS)
 
-	// GC with 1 hour timeout
-	cleaned, err := store.CleanupStaleTransactions(1 * time.Hour)
+	// GC with very short timeout (10ms) - old transaction should be cleaned
+	cleaned, err := store.CleanupStaleTransactions(10 * time.Millisecond)
 	if err != nil {
 		t.Fatalf("CleanupStaleTransactions failed: %v", err)
 	}
@@ -418,7 +421,7 @@ func TestMetaStoreGCStaleTransactions(t *testing.T) {
 		t.Error("Old transaction should be cleaned up")
 	}
 
-	// New transaction should still exist
+	// New transaction should still exist (we just created it)
 	rec, _ = store.GetTransaction(newTxnID)
 	if rec == nil {
 		t.Error("New transaction should still exist")
@@ -429,8 +432,12 @@ func BenchmarkMetaStoreWriteIntent(b *testing.B) {
 	tmpDir, _ := os.MkdirTemp("", "metastore_bench")
 	defer os.RemoveAll(tmpDir)
 
-	metaPath := filepath.Join(tmpDir, "bench_meta.db")
-	store, _ := NewSQLiteMetaStore(metaPath, 5000)
+	metaPath := filepath.Join(tmpDir, "bench_meta.badger")
+	store, _ := NewBadgerMetaStore(metaPath, BadgerMetaStoreOptions{
+		SyncWrites:    false,
+		NumCompactors: 2,
+		ValueLogGC:    false,
+	})
 	defer store.Close()
 
 	clock := hlc.NewClock(1)
@@ -449,8 +456,12 @@ func BenchmarkMetaStoreBeginCommit(b *testing.B) {
 	tmpDir, _ := os.MkdirTemp("", "metastore_bench")
 	defer os.RemoveAll(tmpDir)
 
-	metaPath := filepath.Join(tmpDir, "bench_meta.db")
-	store, _ := NewSQLiteMetaStore(metaPath, 5000)
+	metaPath := filepath.Join(tmpDir, "bench_meta.badger")
+	store, _ := NewBadgerMetaStore(metaPath, BadgerMetaStoreOptions{
+		SyncWrites:    false,
+		NumCompactors: 2,
+		ValueLogGC:    false,
+	})
 	defer store.Close()
 
 	clock := hlc.NewClock(1)

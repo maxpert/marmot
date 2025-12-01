@@ -185,7 +185,7 @@ func executeLoad(ctx context.Context, cfg *Config) error {
 	}
 
 	stats := NewStats()
-	keyGen := NewKeyGenerator("rec", existingRows, time.Now().UnixNano())
+	keyGen := NewKeyGenerator("rec", existingRows, time.Now().UnixNano(), 0) // No overlap for load
 
 	// Distribute records across workers
 	recordsPerWorker := cfg.Records / cfg.Threads
@@ -269,7 +269,7 @@ func executeRun(ctx context.Context, cfg *Config) error {
 	fmt.Printf("Existing rows: %d\n\n", rowCount)
 
 	stats := NewStats()
-	keyGen := NewKeyGenerator("rec", rowCount, time.Now().UnixNano())
+	keyGen := NewKeyGenerator("rec", rowCount, time.Now().UnixNano(), cfg.InsertOverlap)
 
 	// Create operation channel
 	opsChan := make(chan struct{}, cfg.Threads*10)

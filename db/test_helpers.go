@@ -26,7 +26,8 @@ func isWriteWriteConflict(err error) bool {
 	errStr := err.Error()
 	return strings.Contains(errStr, "write-write conflict") ||
 		strings.Contains(errStr, "locked by transaction") ||
-		strings.Contains(errStr, "write conflict")
+		strings.Contains(errStr, "write conflict") ||
+		strings.Contains(errStr, "Transaction Conflict") // BadgerDB conflict
 }
 
 // testDBWithMetaStore holds both the user DB and MetaStore for testing
@@ -55,7 +56,7 @@ func setupTestDBWithMeta(t *testing.T) *testDBWithMetaStore {
 	return openTestDBWithMeta(t, dbPath)
 }
 
-// openTestDBWithMeta opens an existing path with both user DB and MetaStore
+// openTestDBWithMeta opens an existing path with both user DB and MetaStore (BadgerDB)
 func openTestDBWithMeta(t *testing.T, dbPath string) *testDBWithMetaStore {
 	t.Helper()
 
@@ -64,8 +65,12 @@ func openTestDBWithMeta(t *testing.T, dbPath string) *testDBWithMetaStore {
 		t.Fatalf("Failed to open database: %v", err)
 	}
 
-	metaPath := dbPath + "_meta.db"
-	metaStore, err := NewSQLiteMetaStore(metaPath, 5000)
+	metaPath := strings.TrimSuffix(dbPath, ".db") + "_meta.badger"
+	metaStore, err := NewBadgerMetaStore(metaPath, BadgerMetaStoreOptions{
+		SyncWrites:    false, // Faster for tests
+		NumCompactors: 2,
+		ValueLogGC:    false, // Disable for tests
+	})
 	if err != nil {
 		db.Close()
 		t.Fatalf("Failed to create meta store: %v", err)
@@ -81,9 +86,7 @@ func openTestDBWithMeta(t *testing.T, dbPath string) *testDBWithMetaStore {
 	t.Cleanup(func() {
 		result.Close()
 		os.Remove(dbPath)
-		os.Remove(metaPath)
-		os.Remove(metaPath + "-wal")
-		os.Remove(metaPath + "-shm")
+		os.RemoveAll(metaPath)
 	})
 
 	return result
@@ -133,9 +136,7 @@ func verifyTransactionStatusMeta(t *testing.T, ms MetaStore, txnID uint64, expec
 // countMVCCVersionsMeta returns the number of MVCC versions for a given table and row using MetaStore
 func countMVCCVersionsMeta(t *testing.T, ms MetaStore, tableName, rowKey string) int {
 	t.Helper()
-	var count int
-	err := ms.ReadDB().QueryRow("SELECT COUNT(*) FROM __marmot__mvcc_versions WHERE table_name = ? AND row_key = ?",
-		tableName, rowKey).Scan(&count)
+	count, err := ms.GetMVCCVersionCount(tableName, rowKey)
 	if err != nil {
 		t.Fatalf("Failed to count MVCC versions: %v", err)
 	}

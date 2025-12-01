@@ -147,6 +147,7 @@ func runBenchmark(args []string) {
 	fs.IntVar(&cfg.UpsertPct, "upsert-pct", -1, "Upsert percentage (overrides workload)")
 	fs.BoolVar(&cfg.Retry, "retry", true, "Enable retry on conflict/deadlock")
 	fs.IntVar(&cfg.MaxRetries, "max-retries", 3, "Maximum retry attempts")
+	fs.Float64Var(&cfg.InsertOverlap, "insert-overlap", 0, "% of inserts targeting existing keys (0-100, for conflict testing)")
 
 	if err := fs.Parse(args); err != nil {
 		fmt.Fprintf(os.Stderr, "Error parsing flags: %v\n", err)
