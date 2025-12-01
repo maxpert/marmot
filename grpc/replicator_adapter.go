@@ -7,7 +7,6 @@ import (
 	"github.com/maxpert/marmot/coordinator"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/protocol"
-	"github.com/rs/zerolog/log"
 )
 
 // GRPCReplicator implements coordinator.Replicator using gRPC client
@@ -91,16 +90,6 @@ func convertStatementsToProto(stmts []protocol.Statement, database string) []*St
 			}
 		} else {
 			// DDL or DML without CDC data: send SQL
-			log.Debug().
-				Str("sql_prefix", func() string {
-					if len(stmt.SQL) > 50 {
-						return stmt.SQL[:50]
-					}
-					return stmt.SQL
-				}()).
-				Bool("is_ddl", !isDML).
-				Msg("Sending SQL to remote node (DDL or DML fallback)")
-
 			protoStmt.Payload = &Statement_DdlChange{
 				DdlChange: &DDLChange{
 					Sql: stmt.SQL,

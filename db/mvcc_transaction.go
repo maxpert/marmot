@@ -307,6 +307,8 @@ func (tm *MVCCTransactionManager) calculateCommitTS(startTS hlc.Timestamp) hlc.T
 }
 
 // applyDataChanges applies CDC entries or DDL statements from intents.
+// CRITICAL: Also rebuilds txn.Statements from persistent storage for serialization
+// in finalizeCommit. Without this, anti-entropy delta sync has no data to stream.
 func (tm *MVCCTransactionManager) applyDataChanges(txn *MVCCTransaction, intents []*WriteIntentRecord) error {
 	cdcEntries, err := tm.metaStore.GetIntentEntries(txn.ID)
 	if err != nil {
@@ -324,6 +326,15 @@ func (tm *MVCCTransactionManager) applyDataChanges(txn *MVCCTransaction, intents
 		return err
 	}
 
+	// Rebuild txn.Statements from CDC entries for persistence in TransactionRecord.
+	// This is CRITICAL for anti-entropy: StreamChanges reads SerializedStatements to send
+	// CDC data to lagging nodes. Without this, delta sync receives empty statements.
+	txn.Statements = tm.rebuildStatementsFromCDC(cdcEntries, intents)
+	log.Debug().
+		Uint64("txn_id", txn.ID).
+		Int("rebuilt_statements", len(txn.Statements)).
+		Msg("applyDataChanges: rebuilt statements for TransactionRecord")
+
 	// Apply DDL statements if no CDC entries
 	if len(cdcEntries) == 0 && len(intents) > 0 {
 		if err := tm.applyDDLIntents(txn.ID, intents); err != nil {
@@ -332,6 +343,58 @@ func (tm *MVCCTransactionManager) applyDataChanges(txn *MVCCTransaction, intents
 	}
 
 	return nil
+}
+
+// rebuildStatementsFromCDC reconstructs protocol.Statement slice from CDC entries
+// and DDL intents. This data is serialized to TransactionRecord.SerializedStatements
+// for anti-entropy streaming to lagging nodes.
+func (tm *MVCCTransactionManager) rebuildStatementsFromCDC(cdcEntries []*IntentEntry, intents []*WriteIntentRecord) []protocol.Statement {
+	statements := make([]protocol.Statement, 0, len(cdcEntries)+len(intents))
+
+	log.Debug().
+		Int("cdc_entries", len(cdcEntries)).
+		Int("intents", len(intents)).
+		Msg("rebuildStatementsFromCDC: starting rebuild")
+
+	// Add DML statements from CDC entries
+	for _, entry := range cdcEntries {
+		stmt := protocol.Statement{
+			TableName: entry.Table,
+			RowKey:    entry.RowKey,
+			OldValues: entry.OldValues,
+			NewValues: entry.NewValues,
+			Type:      opCodeToStatementType(entry.Operation),
+		}
+		log.Debug().
+			Str("table", entry.Table).
+			Str("row_key", entry.RowKey).
+			Int("old_values", len(entry.OldValues)).
+			Int("new_values", len(entry.NewValues)).
+			Int("stmt_type", int(stmt.Type)).
+			Msg("rebuildStatementsFromCDC: added DML statement")
+		statements = append(statements, stmt)
+	}
+
+	// Add DDL statements from intents (only if no CDC entries - DDL-only transactions)
+	if len(cdcEntries) == 0 {
+		for _, intent := range intents {
+			// Skip non-DDL intents and database operations
+			if intent.TableName == TableDatabaseOperations {
+				continue
+			}
+			if intent.SQLStatement == "" {
+				continue
+			}
+			stmt := protocol.Statement{
+				TableName: intent.TableName,
+				SQL:       intent.SQLStatement,
+				Type:      protocol.StatementDDL,
+			}
+			statements = append(statements, stmt)
+		}
+	}
+
+	return statements
 }
 
 // applyCDCEntries applies CDC data entries to SQLite.
@@ -364,11 +427,7 @@ func (tm *MVCCTransactionManager) applyDDLIntents(txnID uint64, intents []*Write
 			return fmt.Errorf("failed to execute DDL statement: %w", err)
 		}
 
-		sqlPreview := intent.SQLStatement
-		if len(sqlPreview) > 50 {
-			sqlPreview = sqlPreview[:50]
-		}
-		log.Debug().Uint64("txn_id", txnID).Str("sql", sqlPreview).Msg("CommitTransaction: DDL SQL exec complete")
+		log.Debug().Uint64("txn_id", txnID).Str("table", intent.TableName).Msg("DDL statement executed")
 	}
 	return nil
 }

@@ -135,13 +135,21 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 			if stmtType == protocol.StatementDropDatabase {
 				opName = db.OpNameDropDatabase
 			}
-			snapshotData := map[string]interface{}{
-				"type":          int(stmt.Type),
-				"timestamp":     req.Timestamp.WallTime,
-				"database_name": stmt.Database,
-				"operation":     opName,
+			snapshotData := db.DatabaseOperationSnapshot{
+				Type:         int(stmt.Type),
+				Timestamp:    req.Timestamp.WallTime,
+				DatabaseName: stmt.Database,
+				Operation:    opName,
 			}
-			dataSnapshot, _ := db.SerializeData(snapshotData)
+			dataSnapshot, err := db.SerializeData(snapshotData)
+			if err != nil {
+				log.Error().Err(err).Str("database", stmt.Database).Msg("Failed to serialize database operation snapshot")
+				txnMgr.AbortTransaction(txn)
+				return &TransactionResponse{
+					Success:      false,
+					ErrorMessage: fmt.Sprintf("failed to serialize snapshot: %v", err),
+				}, nil
+			}
 
 			err = txnMgr.WriteIntent(txn, db.TableDatabaseOperations, rowKey, internalStmt, dataSnapshot)
 			if err != nil {
@@ -270,7 +278,15 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 					"timestamp": req.Timestamp.WallTime,
 					"sql":       stmt.GetSQL(),
 				}
-				dataSnapshot, _ := db.SerializeData(snapshotData)
+				dataSnapshot, serErr := db.SerializeData(snapshotData)
+				if serErr != nil {
+					log.Error().Err(serErr).Str("table", stmt.TableName).Msg("Failed to serialize DDL snapshot")
+					txnMgr.AbortTransaction(txn)
+					return &TransactionResponse{
+						Success:      false,
+						ErrorMessage: fmt.Sprintf("failed to serialize DDL snapshot: %v", serErr),
+					}, nil
+				}
 
 				err := txnMgr.WriteIntent(txn, db.TableDDLOps, ddlRowKey, internalStmt, dataSnapshot)
 				if err != nil {
@@ -305,7 +321,15 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 		} else {
 			snapshotData["sql"] = stmt.GetSQL()
 		}
-		dataSnapshot, _ := db.SerializeData(snapshotData)
+		dataSnapshot, serErr := db.SerializeData(snapshotData)
+		if serErr != nil {
+			log.Error().Err(serErr).Str("table", stmt.TableName).Msg("Failed to serialize snapshot")
+			txnMgr.AbortTransaction(txn)
+			return &TransactionResponse{
+				Success:      false,
+				ErrorMessage: fmt.Sprintf("failed to serialize snapshot: %v", serErr),
+			}, nil
+		}
 
 		err := txnMgr.WriteIntent(txn, stmt.TableName, rowKey, internalStmt, dataSnapshot)
 		if err != nil {
@@ -327,10 +351,28 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 			// Serialize OldValues and NewValues as msgpack
 			var oldVals, newVals []byte
 			if len(rowChange.OldValues) > 0 {
-				oldVals, _ = msgpack.Marshal(rowChange.OldValues)
+				var err error
+				oldVals, err = msgpack.Marshal(rowChange.OldValues)
+				if err != nil {
+					log.Error().Err(err).Str("table", stmt.TableName).Msg("Failed to marshal OldValues")
+					txnMgr.AbortTransaction(txn)
+					return &TransactionResponse{
+						Success:      false,
+						ErrorMessage: fmt.Sprintf("failed to serialize old values: %v", err),
+					}, nil
+				}
 			}
 			if len(rowChange.NewValues) > 0 {
-				newVals, _ = msgpack.Marshal(rowChange.NewValues)
+				var err error
+				newVals, err = msgpack.Marshal(rowChange.NewValues)
+				if err != nil {
+					log.Error().Err(err).Str("table", stmt.TableName).Msg("Failed to marshal NewValues")
+					txnMgr.AbortTransaction(txn)
+					return &TransactionResponse{
+						Success:      false,
+						ErrorMessage: fmt.Sprintf("failed to serialize new values: %v", err),
+					}, nil
+				}
 			}
 
 			// Convert statement type to operation code
@@ -385,64 +427,79 @@ func (rh *ReplicationHandler) handleCommit(ctx context.Context, req *Transaction
 		systemTxnMgr := systemDB.GetTransactionManager()
 		systemTxn := systemTxnMgr.GetTransaction(req.TxnId)
 
-		if systemTxn != nil && len(systemTxn.Statements) > 0 {
-			stmt := systemTxn.Statements[0]
+		if systemTxn != nil {
+			// GetTransaction returns empty Statements, so we check intents instead
+			// Intents are persisted during prepare phase and contain operation details
+			metaStore := systemDB.GetMetaStore()
+			intents, intentErr := metaStore.GetIntentsByTxn(req.TxnId)
+			if intentErr == nil && len(intents) > 0 {
+				// Check if any intent is for database operations
+				for _, intent := range intents {
+					if intent.TableName == db.TableDatabaseOperations {
+						// Found a database operation - extract details from DataSnapshot
+						var snapshotData db.DatabaseOperationSnapshot
+						if err := db.DeserializeData(intent.DataSnapshot, &snapshotData); err != nil {
+							log.Error().Err(err).Uint64("txn_id", req.TxnId).Msg("Failed to deserialize DB op snapshot")
+							continue
+						}
 
-			// Check if it's a database operation
-			if stmt.Type == protocol.StatementCreateDatabase || stmt.Type == protocol.StatementDropDatabase {
-				// Execute the database operation BEFORE committing the transaction
-				var dbOpErr error
-				if stmt.Type == protocol.StatementCreateDatabase {
-					log.Info().Str("database", stmt.Database).Uint64("node_id", rh.nodeID).Msg("Executing CREATE DATABASE in commit phase")
-					dbOpErr = rh.dbMgr.CreateDatabase(stmt.Database)
-				} else {
-					log.Info().Str("database", stmt.Database).Uint64("node_id", rh.nodeID).Msg("Executing DROP DATABASE in commit phase")
-					dbOpErr = rh.dbMgr.DropDatabase(stmt.Database)
-				}
+						opName := snapshotData.Operation
+						if opName == "" {
+							log.Error().Uint64("txn_id", req.TxnId).Msg("Missing operation in DB op snapshot")
+							continue
+						}
+						dbName := intent.RowKey // Row key is the database name
 
-				if dbOpErr != nil {
-					opName := db.OpNameCreateDatabase
-					if stmt.Type == protocol.StatementDropDatabase {
-						opName = db.OpNameDropDatabase
+						// Execute the database operation BEFORE committing the transaction
+						var dbOpErr error
+						if opName == db.OpNameCreateDatabase {
+							log.Info().Str("database", dbName).Uint64("node_id", rh.nodeID).Msg("Executing CREATE DATABASE in commit phase")
+							dbOpErr = rh.dbMgr.CreateDatabase(dbName)
+						} else if opName == db.OpNameDropDatabase {
+							log.Info().Str("database", dbName).Uint64("node_id", rh.nodeID).Msg("Executing DROP DATABASE in commit phase")
+							dbOpErr = rh.dbMgr.DropDatabase(dbName)
+						} else {
+							log.Error().Str("operation", opName).Uint64("txn_id", req.TxnId).Msg("Unknown database operation")
+							continue
+						}
+
+						if dbOpErr != nil {
+							log.Error().Err(dbOpErr).Str("database", dbName).Str("operation", opName).Msg("Database operation failed in commit phase")
+							systemTxnMgr.AbortTransaction(systemTxn)
+							return &TransactionResponse{
+								Success:      false,
+								ErrorMessage: fmt.Sprintf("database operation failed: %v", dbOpErr),
+							}, nil
+						}
+
+						// Now commit the transaction to mark it as completed
+						if err := systemTxnMgr.CommitTransaction(systemTxn); err != nil {
+							// Database operation succeeded but transaction commit failed
+							// This is not ideal but the operation is done
+							log.Warn().Err(err).Str("database", dbName).Msg("Database operation succeeded but transaction commit failed")
+						}
+
+						log.Info().
+							Str("database", dbName).
+							Str("operation", opName).
+							Uint64("node_id", rh.nodeID).
+							Msg("Database operation committed successfully")
+
+						// Remove MutationGuards after successful database operation commit
+						if rh.guardRegistry != nil {
+							rh.guardRegistry.Remove(req.TxnId)
+						}
+
+						return &TransactionResponse{
+							Success: true,
+							AppliedAt: &HLC{
+								WallTime: rh.clock.Now().WallTime,
+								Logical:  rh.clock.Now().Logical,
+								NodeId:   rh.nodeID,
+							},
+						}, nil
 					}
-					log.Error().Err(dbOpErr).Str("database", stmt.Database).Str("operation", opName).Msg("Database operation failed in commit phase")
-					systemTxnMgr.AbortTransaction(systemTxn)
-					return &TransactionResponse{
-						Success:      false,
-						ErrorMessage: fmt.Sprintf("database operation failed: %v", dbOpErr),
-					}, nil
 				}
-
-				// Now commit the transaction to mark it as completed
-				if err := systemTxnMgr.CommitTransaction(systemTxn); err != nil {
-					// Database operation succeeded but transaction commit failed
-					// This is not ideal but the operation is done
-					log.Warn().Err(err).Str("database", stmt.Database).Msg("Database operation succeeded but transaction commit failed")
-				}
-
-				opName := db.OpNameCreateDatabase
-				if stmt.Type == protocol.StatementDropDatabase {
-					opName = db.OpNameDropDatabase
-				}
-				log.Info().
-					Str("database", stmt.Database).
-					Str("operation", opName).
-					Uint64("node_id", rh.nodeID).
-					Msg("Database operation committed successfully")
-
-				// Remove MutationGuards after successful database operation commit
-				if rh.guardRegistry != nil {
-					rh.guardRegistry.Remove(req.TxnId)
-				}
-
-				return &TransactionResponse{
-					Success: true,
-					AppliedAt: &HLC{
-						WallTime: rh.clock.Now().WallTime,
-						Logical:  rh.clock.Now().Logical,
-						NodeId:   rh.nodeID,
-					},
-				}, nil
 			}
 		}
 	}
@@ -665,6 +722,30 @@ func (rh *ReplicationHandler) handleReplay(ctx context.Context, req *Transaction
 		}, nil
 	}
 
+	// Store TransactionRecord in MetaStore so GetCommittedTxnCount/GetMaxTxnID return correct values.
+	// Without this, anti-entropy keeps thinking we're behind because these metrics read from BadgerDB.
+	metaStore := dbInstance.GetMetaStore()
+	if metaStore != nil {
+		commitTS := hlc.Timestamp{
+			WallTime: req.Timestamp.WallTime,
+			Logical:  req.Timestamp.Logical,
+			NodeID:   req.Timestamp.NodeId,
+		}
+
+		// Convert gRPC statements to protocol.Statement and serialize for storage.
+		// This is CRITICAL: if this node later becomes a delta sync source, it needs
+		// to have the statement data to stream to other lagging nodes.
+		serializedStatements := rh.serializeReplayStatements(req.Statements, dbName)
+
+		if err := metaStore.StoreReplayedTransaction(req.TxnId, req.Timestamp.NodeId, commitTS, serializedStatements, dbName); err != nil {
+			// Log but don't fail - data is already in SQLite
+			log.Warn().
+				Err(err).
+				Uint64("txn_id", req.TxnId).
+				Msg("handleReplay: failed to store transaction record in MetaStore")
+		}
+	}
+
 	log.Debug().
 		Uint64("txn_id", req.TxnId).
 		Str("database", dbName).
@@ -767,6 +848,46 @@ func (rh *ReplicationHandler) applyReplayCDCDelete(tx *sql.Tx, tableName string,
 	// Fallback: use row key (assumes single PK column named 'id')
 	_, err := tx.Exec(fmt.Sprintf("DELETE FROM %s WHERE id = ?", tableName), rowKey)
 	return err
+}
+
+// serializeReplayStatements converts gRPC Statement slice to protocol.Statement slice
+// and serializes them with msgpack for storage in TransactionRecord.SerializedStatements.
+// This ensures replayed transactions can be streamed to other lagging nodes.
+func (rh *ReplicationHandler) serializeReplayStatements(stmts []*Statement, dbName string) []byte {
+	if len(stmts) == 0 {
+		return nil
+	}
+
+	protoStmts := make([]protocol.Statement, 0, len(stmts))
+	for _, stmt := range stmts {
+		protoStmt := protocol.Statement{
+			Type:      protocol.StatementType(stmt.Type),
+			TableName: stmt.TableName,
+			Database:  dbName,
+		}
+
+		// Extract CDC data from RowChange payload
+		if rowChange := stmt.GetRowChange(); rowChange != nil {
+			protoStmt.RowKey = rowChange.RowKey
+			protoStmt.OldValues = rowChange.OldValues
+			protoStmt.NewValues = rowChange.NewValues
+		}
+
+		// Extract SQL from DDL payload
+		if ddl := stmt.GetDdlChange(); ddl != nil {
+			protoStmt.SQL = ddl.Sql
+		}
+
+		protoStmts = append(protoStmts, protoStmt)
+	}
+
+	data, err := msgpack.Marshal(protoStmts)
+	if err != nil {
+		log.Error().Err(err).Int("statement_count", len(protoStmts)).Msg("serializeReplayStatements: failed to marshal - anti-entropy may not work for this transaction")
+		return nil
+	}
+
+	return data
 }
 
 // HandleRead handles incoming read requests with MVCC snapshot isolation

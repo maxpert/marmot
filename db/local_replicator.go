@@ -80,11 +80,11 @@ func (lr *LocalReplicator) handlePrepare(ctx context.Context, req *coordinator.R
 			if stmt.Type == protocol.StatementDropDatabase {
 				opName = OpNameDropDatabase
 			}
-			snapshotData := map[string]interface{}{
-				"type":          stmt.Type,
-				"timestamp":     req.StartTS.WallTime,
-				"database_name": stmt.Database,
-				"operation":     opName,
+			snapshotData := DatabaseOperationSnapshot{
+				Type:         int(stmt.Type),
+				Timestamp:    req.StartTS.WallTime,
+				DatabaseName: stmt.Database,
+				Operation:    opName,
 			}
 			dataSnapshot, err := SerializeData(snapshotData)
 			if err != nil {
@@ -228,10 +228,28 @@ func (lr *LocalReplicator) handlePrepare(ctx context.Context, req *coordinator.R
 			// Serialize OldValues and NewValues as msgpack
 			var oldVals, newVals []byte
 			if len(stmt.OldValues) > 0 {
-				oldVals, _ = msgpack.Marshal(stmt.OldValues)
+				var err error
+				oldVals, err = msgpack.Marshal(stmt.OldValues)
+				if err != nil {
+					log.Error().Err(err).Str("table", stmt.TableName).Msg("Failed to marshal OldValues")
+					txnMgr.AbortTransaction(txn)
+					return &coordinator.ReplicationResponse{
+						Success: false,
+						Error:   fmt.Sprintf("failed to serialize old values: %v", err),
+					}, nil
+				}
 			}
 			if len(stmt.NewValues) > 0 {
-				newVals, _ = msgpack.Marshal(stmt.NewValues)
+				var err error
+				newVals, err = msgpack.Marshal(stmt.NewValues)
+				if err != nil {
+					log.Error().Err(err).Str("table", stmt.TableName).Msg("Failed to marshal NewValues")
+					txnMgr.AbortTransaction(txn)
+					return &coordinator.ReplicationResponse{
+						Success: false,
+						Error:   fmt.Sprintf("failed to serialize new values: %v", err),
+					}, nil
+				}
 			}
 
 			// Convert statement type to operation code
@@ -265,55 +283,70 @@ func (lr *LocalReplicator) handleCommit(ctx context.Context, req *coordinator.Re
 		systemTxnMgr := systemDB.GetTransactionManager()
 		systemTxn := systemTxnMgr.GetTransaction(req.TxnID)
 
-		if systemTxn != nil && len(systemTxn.Statements) > 0 {
-			stmt := systemTxn.Statements[0]
+		if systemTxn != nil {
+			// GetTransaction returns empty Statements, so we check intents instead
+			// Intents are persisted during prepare phase and contain operation details
+			metaStore := systemDB.GetMetaStore()
+			intents, intentErr := metaStore.GetIntentsByTxn(req.TxnID)
+			if intentErr == nil && len(intents) > 0 {
+				// Check if any intent is for database operations
+				for _, intent := range intents {
+					if intent.TableName == TableDatabaseOperations {
+						// Found a database operation - extract details from DataSnapshot
+						var snapshotData DatabaseOperationSnapshot
+						if err := DeserializeData(intent.DataSnapshot, &snapshotData); err != nil {
+							log.Error().Err(err).Uint64("txn_id", req.TxnID).Msg("Failed to deserialize DB op snapshot")
+							continue
+						}
 
-			// Check if it's a database operation
-			if stmt.Type == protocol.StatementCreateDatabase || stmt.Type == protocol.StatementDropDatabase {
-				// Execute the database operation BEFORE committing the transaction
-				dbMgr, ok := lr.dbMgr.(*DatabaseManager)
-				if !ok {
-					systemTxnMgr.AbortTransaction(systemTxn)
-					return &coordinator.ReplicationResponse{Success: false, Error: "database manager does not support database operations"}, nil
-				}
+						opName := snapshotData.Operation
+						if opName == "" {
+							log.Error().Uint64("txn_id", req.TxnID).Msg("Missing operation in DB op snapshot")
+							continue
+						}
+						dbName := intent.RowKey // Row key is the database name
 
-				var dbOpErr error
-				if stmt.Type == protocol.StatementCreateDatabase {
-					log.Info().Str("database", stmt.Database).Uint64("node_id", lr.nodeID).Msg("Executing CREATE DATABASE in commit phase")
-					dbOpErr = dbMgr.CreateDatabase(stmt.Database)
-				} else {
-					log.Info().Str("database", stmt.Database).Uint64("node_id", lr.nodeID).Msg("Executing DROP DATABASE in commit phase")
-					dbOpErr = dbMgr.DropDatabase(stmt.Database)
-				}
+						// Execute the database operation BEFORE committing the transaction
+						dbMgr, ok := lr.dbMgr.(*DatabaseManager)
+						if !ok {
+							systemTxnMgr.AbortTransaction(systemTxn)
+							return &coordinator.ReplicationResponse{Success: false, Error: "database manager does not support database operations"}, nil
+						}
 
-				if dbOpErr != nil {
-					opName := OpNameCreateDatabase
-					if stmt.Type == protocol.StatementDropDatabase {
-						opName = OpNameDropDatabase
+						var dbOpErr error
+						if opName == OpNameCreateDatabase {
+							log.Info().Str("database", dbName).Uint64("node_id", lr.nodeID).Msg("Executing CREATE DATABASE in commit phase")
+							dbOpErr = dbMgr.CreateDatabase(dbName)
+						} else if opName == OpNameDropDatabase {
+							log.Info().Str("database", dbName).Uint64("node_id", lr.nodeID).Msg("Executing DROP DATABASE in commit phase")
+							dbOpErr = dbMgr.DropDatabase(dbName)
+						} else {
+							log.Error().Str("operation", opName).Uint64("txn_id", req.TxnID).Msg("Unknown database operation")
+							continue
+						}
+
+						if dbOpErr != nil {
+							log.Error().Err(dbOpErr).Str("database", dbName).Str("operation", opName).Msg("Database operation failed in commit phase")
+							systemTxnMgr.AbortTransaction(systemTxn)
+							return &coordinator.ReplicationResponse{Success: false, Error: fmt.Sprintf("database operation failed: %v", dbOpErr)}, nil
+						}
+
+						// Now commit the transaction to mark it as completed
+						if err := systemTxnMgr.CommitTransaction(systemTxn); err != nil {
+							// Database operation succeeded but transaction commit failed
+							// This is not ideal but the operation is done
+							log.Warn().Err(err).Str("database", dbName).Msg("Database operation succeeded but transaction commit failed")
+						}
+
+						log.Info().
+							Str("database", dbName).
+							Str("operation", opName).
+							Uint64("node_id", lr.nodeID).
+							Msg("Database operation committed successfully")
+
+						return &coordinator.ReplicationResponse{Success: true}, nil
 					}
-					log.Error().Err(dbOpErr).Str("database", stmt.Database).Str("operation", opName).Msg("Database operation failed in commit phase")
-					systemTxnMgr.AbortTransaction(systemTxn)
-					return &coordinator.ReplicationResponse{Success: false, Error: fmt.Sprintf("database operation failed: %v", dbOpErr)}, nil
 				}
-
-				// Now commit the transaction to mark it as completed
-				if err := systemTxnMgr.CommitTransaction(systemTxn); err != nil {
-					// Database operation succeeded but transaction commit failed
-					// This is not ideal but the operation is done
-					log.Warn().Err(err).Str("database", stmt.Database).Msg("Database operation succeeded but transaction commit failed")
-				}
-
-				opName := OpNameCreateDatabase
-				if stmt.Type == protocol.StatementDropDatabase {
-					opName = OpNameDropDatabase
-				}
-				log.Info().
-					Str("database", stmt.Database).
-					Str("operation", opName).
-					Uint64("node_id", lr.nodeID).
-					Msg("Database operation committed successfully")
-
-				return &coordinator.ReplicationResponse{Success: true}, nil
 			}
 		}
 	}

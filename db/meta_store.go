@@ -21,6 +21,11 @@ type MetaStore interface {
 	GetPendingTransactions() ([]*TransactionRecord, error)
 	Heartbeat(txnID uint64) error
 
+	// StoreReplayedTransaction inserts a fully-committed transaction record directly.
+	// Used by delta sync to record transactions that were replayed from other nodes.
+	// Unlike CommitTransaction, this doesn't require a prior BeginTransaction call.
+	StoreReplayedTransaction(txnID, nodeID uint64, commitTS hlc.Timestamp, statements []byte, dbName string) error
+
 	// Write intents (distributed locks)
 	WriteIntent(txnID uint64, tableName, rowKey, op, sqlStmt string, data []byte, ts hlc.Timestamp, nodeID uint64) error
 	ValidateIntent(tableName, rowKey string, expectedTxnID uint64) (bool, error)
@@ -76,20 +81,20 @@ type MetaStore interface {
 
 // TransactionRecord represents a transaction record in meta store
 type TransactionRecord struct {
-	TxnID           uint64
-	NodeID          uint64
-	SeqNum          uint64 // Monotonic sequence for gap detection
-	Status          string
-	StartTSWall     int64
-	StartTSLogical  int32
-	CommitTSWall    int64
-	CommitTSLogical int32
-	CreatedAt       int64
-	CommittedAt     int64
-	LastHeartbeat   int64
-	TablesInvolved  string
-	StatementsJSON  []byte
-	DatabaseName    string
+	TxnID                uint64
+	NodeID               uint64
+	SeqNum               uint64 // Monotonic sequence for gap detection
+	Status               string
+	StartTSWall          int64
+	StartTSLogical       int32
+	CommitTSWall         int64
+	CommitTSLogical      int32
+	CreatedAt            int64
+	CommittedAt          int64
+	LastHeartbeat        int64
+	TablesInvolved       string
+	SerializedStatements []byte
+	DatabaseName         string
 }
 
 // WriteIntentRecord represents a write intent in meta store

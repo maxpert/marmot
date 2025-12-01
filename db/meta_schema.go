@@ -23,6 +23,16 @@ const (
 // DDL row key prefix for DDL operations in write intents
 const DDLRowKeyPrefix = "__ddl__"
 
+// DatabaseOperationSnapshot is a typed struct for CREATE/DROP DATABASE intents.
+// Using a struct with msgpack tags ensures correct serialization/deserialization
+// instead of relying on map[string]interface{} which can return []byte for strings.
+type DatabaseOperationSnapshot struct {
+	Type         int    `msgpack:"type"`
+	Timestamp    int64  `msgpack:"timestamp"`
+	DatabaseName string `msgpack:"database_name"`
+	Operation    string `msgpack:"operation"`
+}
+
 // StatementTypeToOpCode converts protocol.StatementType to uint8 operation code
 // This is the canonical implementation used across packages
 // StatementType values: Insert=0, Replace=1, Update=2, Delete=3

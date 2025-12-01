@@ -422,7 +422,7 @@ func (s *BadgerMetaStore) CommitTransaction(txnID uint64, commitTS hlc.Timestamp
 		rec.CommitTSWall = commitTS.WallTime
 		rec.CommitTSLogical = commitTS.Logical
 		rec.CommittedAt = time.Now().UnixNano()
-		rec.StatementsJSON = statements
+		rec.SerializedStatements = statements
 		rec.DatabaseName = dbName
 		rec.SeqNum = seqNum
 
@@ -441,6 +441,56 @@ func (s *BadgerMetaStore) CommitTransaction(txnID uint64, commitTS hlc.Timestamp
 			return err
 		}
 
+		// Add to sequence index
+		return txn.Set(txnSeqKey(seqNum, txnID), nil)
+	})
+}
+
+// StoreReplayedTransaction inserts a fully-committed transaction record directly.
+// Used by delta sync to record transactions that were replayed from other nodes.
+// Unlike CommitTransaction, this doesn't require a prior BeginTransaction call.
+func (s *BadgerMetaStore) StoreReplayedTransaction(txnID, nodeID uint64, commitTS hlc.Timestamp, statements []byte, dbName string) error {
+	log.Debug().
+		Uint64("txn_id", txnID).
+		Uint64("node_id", nodeID).
+		Int64("commit_ts", commitTS.WallTime).
+		Str("database", dbName).
+		Int("statements_len", len(statements)).
+		Msg("StoreReplayedTransaction: storing replayed transaction")
+
+	// Get sequence number using contention-free Sequence API
+	seqNum, err := s.GetNextSeqNum(nodeID)
+	if err != nil {
+		return fmt.Errorf("failed to get next seq_num: %w", err)
+	}
+
+	now := time.Now().UnixNano()
+	rec := TransactionRecord{
+		TxnID:                txnID,
+		NodeID:               nodeID,
+		SeqNum:               seqNum,
+		Status:               MetaTxnStatusCommitted,
+		StartTSWall:          commitTS.WallTime, // Use commit TS as start for replayed txns
+		StartTSLogical:       commitTS.Logical,
+		CommitTSWall:         commitTS.WallTime,
+		CommitTSLogical:      commitTS.Logical,
+		CreatedAt:            now,
+		CommittedAt:          now,
+		LastHeartbeat:        now,
+		SerializedStatements: statements,
+		DatabaseName:         dbName,
+	}
+
+	data, err := msgpack.Marshal(rec)
+	if err != nil {
+		return fmt.Errorf("failed to serialize transaction record: %w", err)
+	}
+
+	return s.db.Update(func(txn *badger.Txn) error {
+		// Store transaction record (use SetEntry with TTL for eventual cleanup)
+		if err := txn.Set(txnKey(txnID), data); err != nil {
+			return err
+		}
 		// Add to sequence index
 		return txn.Set(txnSeqKey(seqNum, txnID), nil)
 	})
@@ -1328,10 +1378,16 @@ func (s *BadgerMetaStore) WriteIntentEntry(txnID, seq uint64, op uint8, table, r
 
 	// Store oldVals and newVals as msgpack
 	if oldVals != nil {
-		msgpack.Unmarshal(oldVals, &entry.OldValues)
+		if err := msgpack.Unmarshal(oldVals, &entry.OldValues); err != nil {
+			log.Error().Err(err).Uint64("txn_id", txnID).Str("table", table).Msg("Failed to unmarshal OldValues")
+			return fmt.Errorf("failed to unmarshal old values: %w", err)
+		}
 	}
 	if newVals != nil {
-		msgpack.Unmarshal(newVals, &entry.NewValues)
+		if err := msgpack.Unmarshal(newVals, &entry.NewValues); err != nil {
+			log.Error().Err(err).Uint64("txn_id", txnID).Str("table", table).Msg("Failed to unmarshal NewValues")
+			return fmt.Errorf("failed to unmarshal new values: %w", err)
+		}
 	}
 
 	log.Debug().

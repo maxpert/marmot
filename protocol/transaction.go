@@ -137,17 +137,17 @@ type InformationSchemaFilter struct {
 
 // Statement represents a single SQL statement
 type Statement struct {
-	SQL       string
-	Type      StatementType
-	TableName string
-	Database  string // Target database name
-	RowKey    string // Primary key value for MVCC conflict detection
-	Error     string // Error message if Type is StatementUnsupported
+	SQL       string        `msgpack:"SQL"`
+	Type      StatementType `msgpack:"Type"`
+	TableName string        `msgpack:"TableName"`
+	Database  string        `msgpack:"Database"` // Target database name
+	RowKey    string        `msgpack:"RowKey"`   // Primary key value for MVCC conflict detection
+	Error     string        `msgpack:"Error"`    // Error message if Type is StatementUnsupported
 
 	// CDC: Row-level change data (for DML operations)
 	// Populated by preupdate hooks after local execution, sent to replicas instead of SQL
-	OldValues map[string][]byte // Before image (for UPDATE/DELETE)
-	NewValues map[string][]byte // After image (for INSERT/UPDATE/REPLACE)
+	OldValues map[string][]byte `msgpack:"OldValues"` // Before image (for UPDATE/DELETE)
+	NewValues map[string][]byte `msgpack:"NewValues"` // After image (for INSERT/UPDATE/REPLACE)
 
 	// ISFilter holds extracted WHERE clause values for INFORMATION_SCHEMA queries
 	ISFilter InformationSchemaFilter

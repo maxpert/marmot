@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/maxpert/marmot/hlc"
+	"github.com/vmihailenco/msgpack/v5"
 )
 
 func createTestMetaStore(t *testing.T) (*BadgerMetaStore, func()) {
@@ -347,12 +348,18 @@ func TestMetaStoreIntentEntries(t *testing.T) {
 
 	txnID := uint64(12345)
 
+	// Prepare msgpack-encoded values
+	aliceVals := map[string]interface{}{"name": "alice"}
+	bobVals := map[string]interface{}{"name": "bob"}
+	aliceBytes, _ := msgpack.Marshal(aliceVals)
+	bobBytes, _ := msgpack.Marshal(bobVals)
+
 	// Write entries
-	err := store.WriteIntentEntry(txnID, 1, 0, "users", "user:1", nil, []byte(`{"name":"alice"}`))
+	err := store.WriteIntentEntry(txnID, 1, 0, "users", "user:1", nil, aliceBytes)
 	if err != nil {
 		t.Fatalf("WriteIntentEntry failed: %v", err)
 	}
-	err = store.WriteIntentEntry(txnID, 2, 1, "users", "user:1", []byte(`{"name":"alice"}`), []byte(`{"name":"bob"}`))
+	err = store.WriteIntentEntry(txnID, 2, 1, "users", "user:1", aliceBytes, bobBytes)
 	if err != nil {
 		t.Fatalf("WriteIntentEntry failed: %v", err)
 	}

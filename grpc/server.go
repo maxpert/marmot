@@ -391,8 +391,7 @@ func (s *Server) StreamChanges(req *StreamRequest, stream MarmotService_StreamCh
 		err = metaStore.StreamCommittedTransactions(req.FromTxnId, func(rec *db.TransactionRecord) error {
 			// Parse statements from msgpack - must include CDC data (NewValues, OldValues, RowKey)
 			var statements []*Statement
-			statementsJSON := string(rec.StatementsJSON)
-			if statementsJSON != "" && statementsJSON != "[]" {
+			if len(rec.SerializedStatements) > 0 {
 				var rawStatements []struct {
 					SQL       string            `msgpack:"SQL"`
 					Type      int               `msgpack:"Type"`
@@ -402,7 +401,7 @@ func (s *Server) StreamChanges(req *StreamRequest, stream MarmotService_StreamCh
 					OldValues map[string][]byte `msgpack:"OldValues"`
 					NewValues map[string][]byte `msgpack:"NewValues"`
 				}
-				if err := msgpack.Unmarshal(rec.StatementsJSON, &rawStatements); err != nil {
+				if err := msgpack.Unmarshal(rec.SerializedStatements, &rawStatements); err != nil {
 					log.Warn().Err(err).Uint64("txn_id", rec.TxnID).Msg("Failed to parse statements msgpack")
 				} else {
 					for _, s := range rawStatements {
