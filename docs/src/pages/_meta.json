@@ -7,6 +7,7 @@
   "compatibility": "Compatibility",
   "sql-reference": "SQL Reference",
   "operations": "Operations",
+  "metrics": "Prometheus Metrics",
   "reference": "Reference",
   "demo": "Demo"
 }

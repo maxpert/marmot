@@ -1,0 +1,141 @@
+---
+title: Prometheus Metrics
+---
+
+# Prometheus Metrics
+
+Marmot exposes Prometheus metrics for monitoring cluster health, replication performance, and query processing. All metrics use the `marmot_v2` namespace and include a `node_id` label for multi-node visibility.
+
+## Enabling Metrics
+
+```toml
+[prometheus]
+enabled = true  # Metrics served on gRPC port at /metrics endpoint
+```
+
+**Accessing Metrics:**
+```bash
+curl http://localhost:8080/metrics
+```
+
+## Cluster Health Metrics
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `marmot_v2_cluster_nodes` | Gauge | `status` | Number of nodes in cluster by status (ALIVE, SUSPECT, DEAD, JOINING, REMOVED) |
+| `marmot_v2_cluster_quorum_available` | Gauge | - | Whether quorum is achievable (1=yes, 0=no) |
+| `marmot_v2_gossip_rounds_total` | Counter | - | Total number of gossip rounds executed |
+| `marmot_v2_gossip_messages_total` | Counter | `direction` | Total gossip messages by direction (sent, received) |
+| `marmot_v2_gossip_failures_total` | Counter | - | Total failed gossip send attempts |
+| `marmot_v2_node_state_transitions_total` | Counter | `from`, `to` | Node state transitions (e.g., ALIVE to SUSPECT) |
+| `marmot_v2_cluster_join_total` | Counter | `result` | Cluster join attempts by result (success, failed) |
+
+## Transaction Metrics (2PC)
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `marmot_v2_txn_total` | Counter | `type`, `result` | Total transactions by type (write, read) and result (success, failed, conflict) |
+| `marmot_v2_txn_duration_seconds` | Histogram | `type` | Transaction duration in seconds |
+| `marmot_v2_twophase_prepare_seconds` | Histogram | - | 2PC prepare phase duration in seconds |
+| `marmot_v2_twophase_commit_seconds` | Histogram | - | 2PC commit phase duration in seconds |
+| `marmot_v2_twophase_quorum_acks` | Histogram | `phase` | Number of quorum acknowledgments received per phase |
+| `marmot_v2_write_conflicts_total` | Counter | `type` | Write conflicts by type (mvcc, mutation_guard) |
+| `marmot_v2_replication_requests_total` | Counter | `phase`, `result` | Replication requests by phase (prepare, commit, replay) and result |
+| `marmot_v2_active_transactions` | Gauge | - | Number of currently active transactions |
+
+## Query Processing Metrics
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `marmot_v2_queries_total` | Counter | `type`, `result` | Total queries by type (select, insert, update, delete, ddl) and result |
+| `marmot_v2_query_duration_seconds` | Histogram | `type` | Query duration in seconds |
+| `marmot_v2_rows_affected` | Histogram | - | Number of rows affected per write query |
+| `marmot_v2_rows_returned` | Histogram | - | Number of rows returned per read query |
+| `marmot_v2_mysql_connections` | Gauge | - | Number of active MySQL protocol connections |
+| `marmot_v2_ddl_operations_total` | Counter | `result` | DDL operations by result (success, failed) |
+| `marmot_v2_ddl_lock_wait_seconds` | Histogram | - | Time waiting for DDL lock in seconds |
+
+## Anti-Entropy Metrics
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `marmot_v2_antientropy_rounds_total` | Counter | - | Total anti-entropy rounds executed |
+| `marmot_v2_antientropy_syncs_total` | Counter | `type`, `result` | Anti-entropy syncs by type (delta, snapshot) and result |
+| `marmot_v2_antientropy_duration_seconds` | Histogram | - | Anti-entropy round duration in seconds |
+| `marmot_v2_replication_lag_txns` | Gauge | `peer` | Transaction lag behind peer |
+| `marmot_v2_delta_sync_txns_total` | Counter | - | Total transactions applied via delta sync |
+
+## Histogram Buckets
+
+Different metrics use histogram buckets optimized for their expected latency profiles:
+
+**Write Transaction Buckets** (for distributed writes with network + consensus):
+```
+5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2.5s, 5s, 10s
+```
+
+**Read Transaction Buckets** (for local SQLite reads):
+```
+0.1ms, 0.5ms, 1ms, 5ms, 10ms, 25ms, 50ms, 100ms, 250ms
+```
+
+**2PC Phase Buckets** (for prepare/commit latencies):
+```
+1ms, 5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2.5s
+```
+
+**Sync Buckets** (for anti-entropy and background sync):
+```
+100ms, 500ms, 1s, 2.5s, 5s, 10s, 30s, 60s
+```
+
+## Prometheus Scrape Configuration
+
+```yaml
+scrape_configs:
+  - job_name: 'marmot'
+    static_configs:
+      - targets: ['node1:8080', 'node2:8080', 'node3:8080']
+    scrape_interval: 15s
+```
+
+## Example Queries
+
+**Cluster health:**
+```promql
+# Check if all nodes are alive
+sum(marmot_v2_cluster_nodes{status="ALIVE"}) by (node_id)
+
+# Quorum availability across cluster
+min(marmot_v2_cluster_quorum_available)
+```
+
+**Transaction performance:**
+```promql
+# Write transaction p99 latency
+histogram_quantile(0.99, rate(marmot_v2_txn_duration_seconds_bucket{type="write"}[5m]))
+
+# Transaction success rate
+sum(rate(marmot_v2_txn_total{result="success"}[5m])) / sum(rate(marmot_v2_txn_total[5m]))
+```
+
+**2PC performance:**
+```promql
+# Prepare phase p95 latency
+histogram_quantile(0.95, rate(marmot_v2_twophase_prepare_seconds_bucket[5m]))
+
+# Commit phase p95 latency
+histogram_quantile(0.95, rate(marmot_v2_twophase_commit_seconds_bucket[5m]))
+```
+
+**Conflict detection:**
+```promql
+# Write conflicts per minute
+sum(rate(marmot_v2_write_conflicts_total[1m])) by (type)
+```
+
+**Replication lag:**
+```promql
+# Max replication lag across all peers
+max(marmot_v2_replication_lag_txns) by (node_id)
+```
