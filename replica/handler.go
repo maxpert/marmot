@@ -13,9 +13,6 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-// SystemDatabaseName is the name of the internal Marmot system database
-const SystemDatabaseName = "__marmot_system"
-
 // ReadOnlyHandler implements protocol.ConnectionHandler for read-only replicas
 // It rejects all mutations and executes reads locally
 type ReadOnlyHandler struct {
@@ -31,7 +28,7 @@ func NewReadOnlyHandler(dbManager *db.DatabaseManager, clock *hlc.Clock, replica
 		dbManager: dbManager,
 		clock:     clock,
 		replica:   replica,
-		metadata:  handlers.NewMetadataHandler(dbManager, SystemDatabaseName),
+		metadata:  handlers.NewMetadataHandler(dbManager, db.SystemDatabaseName),
 	}
 }
 

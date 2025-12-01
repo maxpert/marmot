@@ -55,7 +55,7 @@ func (lr *LocalReplicator) handlePrepare(ctx context.Context, req *coordinator.R
 
 		if stmt.Type == protocol.StatementCreateDatabase || stmt.Type == protocol.StatementDropDatabase {
 			// Use system database for transaction management
-			systemDB, err := lr.dbMgr.GetDatabase("__marmot_system")
+			systemDB, err := lr.dbMgr.GetDatabase(SystemDatabaseName)
 			if err != nil {
 				return &coordinator.ReplicationResponse{Success: false, Error: fmt.Sprintf("system database not found: %v", err)}, nil
 			}
@@ -76,9 +76,9 @@ func (lr *LocalReplicator) handlePrepare(ctx context.Context, req *coordinator.R
 			// Create write intent for database operation
 			// Use database name as the row key
 			rowKey := stmt.Database
-			opName := "CREATE_DATABASE"
+			opName := OpNameCreateDatabase
 			if stmt.Type == protocol.StatementDropDatabase {
-				opName = "DROP_DATABASE"
+				opName = OpNameDropDatabase
 			}
 			snapshotData := map[string]interface{}{
 				"type":          stmt.Type,
@@ -91,7 +91,7 @@ func (lr *LocalReplicator) handlePrepare(ctx context.Context, req *coordinator.R
 				return &coordinator.ReplicationResponse{Success: false, Error: fmt.Sprintf("failed to serialize data: %v", err)}, nil
 			}
 
-			err = txnMgr.WriteIntent(txn, "__marmot__database_operations", rowKey, stmt, dataSnapshot)
+			err = txnMgr.WriteIntent(txn, TableDatabaseOperations, rowKey, stmt, dataSnapshot)
 			if err != nil {
 				txnMgr.AbortTransaction(txn)
 				return &coordinator.ReplicationResponse{Success: false, Error: fmt.Sprintf("write conflict: %v", err)}, nil
@@ -160,7 +160,7 @@ func (lr *LocalReplicator) handlePrepare(ctx context.Context, req *coordinator.R
 			// For DDL statements, create write intent using table name as row key
 			// This ensures DDL SQL gets stored and executed during commit phase
 			if stmt.Type == protocol.StatementDDL {
-				ddlRowKey := fmt.Sprintf("__ddl__%s", stmt.TableName)
+				ddlRowKey := DDLRowKeyPrefix + stmt.TableName
 				snapshotData := map[string]interface{}{
 					"type":      stmt.Type,
 					"timestamp": req.StartTS.WallTime,
@@ -172,7 +172,7 @@ func (lr *LocalReplicator) handlePrepare(ctx context.Context, req *coordinator.R
 					return &coordinator.ReplicationResponse{Success: false, Error: fmt.Sprintf("failed to serialize DDL data: %v", serErr)}, nil
 				}
 
-				if err := txnMgr.WriteIntent(txn, "__marmot__ddl_ops", ddlRowKey, stmt, dataSnapshot); err != nil {
+				if err := txnMgr.WriteIntent(txn, TableDDLOps, ddlRowKey, stmt, dataSnapshot); err != nil {
 					txnMgr.AbortTransaction(txn)
 					return &coordinator.ReplicationResponse{
 						Success:          false,
@@ -235,7 +235,7 @@ func (lr *LocalReplicator) handlePrepare(ctx context.Context, req *coordinator.R
 			}
 
 			// Convert statement type to operation code
-			op := statementTypeToOpCode(stmt.Type)
+			op := StatementTypeToOpCode(int(stmt.Type))
 
 			err := metaStore.WriteIntentEntry(req.TxnID, stmtSeq, op, stmt.TableName, rowKey, oldVals, newVals)
 			if err != nil {
@@ -256,24 +256,10 @@ func (lr *LocalReplicator) handlePrepare(ctx context.Context, req *coordinator.R
 	return &coordinator.ReplicationResponse{Success: true}, nil
 }
 
-// statementTypeToOpCode converts protocol.StatementType to uint8 operation code
-func statementTypeToOpCode(st protocol.StatementType) uint8 {
-	switch st {
-	case protocol.StatementInsert, protocol.StatementReplace:
-		return OpInsertInt
-	case protocol.StatementUpdate:
-		return OpUpdateInt
-	case protocol.StatementDelete:
-		return OpDeleteInt
-	default:
-		return OpInsertInt
-	}
-}
-
 func (lr *LocalReplicator) handleCommit(ctx context.Context, req *coordinator.ReplicationRequest) (*coordinator.ReplicationResponse, error) {
 	// Check if this is a database operation (CREATE/DROP DATABASE)
 	// These are tracked in the system database
-	systemDB, err := lr.dbMgr.GetDatabase("__marmot_system")
+	systemDB, err := lr.dbMgr.GetDatabase(SystemDatabaseName)
 	if err == nil {
 		// Try to find transaction in system database first
 		systemTxnMgr := systemDB.GetTransactionManager()
@@ -301,9 +287,9 @@ func (lr *LocalReplicator) handleCommit(ctx context.Context, req *coordinator.Re
 				}
 
 				if dbOpErr != nil {
-					opName := "CREATE_DATABASE"
+					opName := OpNameCreateDatabase
 					if stmt.Type == protocol.StatementDropDatabase {
-						opName = "DROP_DATABASE"
+						opName = OpNameDropDatabase
 					}
 					log.Error().Err(dbOpErr).Str("database", stmt.Database).Str("operation", opName).Msg("Database operation failed in commit phase")
 					systemTxnMgr.AbortTransaction(systemTxn)
@@ -317,9 +303,9 @@ func (lr *LocalReplicator) handleCommit(ctx context.Context, req *coordinator.Re
 					log.Warn().Err(err).Str("database", stmt.Database).Msg("Database operation succeeded but transaction commit failed")
 				}
 
-				opName := "CREATE_DATABASE"
+				opName := OpNameCreateDatabase
 				if stmt.Type == protocol.StatementDropDatabase {
-					opName = "DROP_DATABASE"
+					opName = OpNameDropDatabase
 				}
 				log.Info().
 					Str("database", stmt.Database).
@@ -353,7 +339,7 @@ func (lr *LocalReplicator) handleCommit(ctx context.Context, req *coordinator.Re
 
 func (lr *LocalReplicator) handleAbort(ctx context.Context, req *coordinator.ReplicationRequest) (*coordinator.ReplicationResponse, error) {
 	// Check system database first for database operations
-	systemDB, err := lr.dbMgr.GetDatabase("__marmot_system")
+	systemDB, err := lr.dbMgr.GetDatabase(SystemDatabaseName)
 	if err == nil {
 		systemTxnMgr := systemDB.GetTransactionManager()
 		systemTxn := systemTxnMgr.GetTransaction(req.TxnID)

@@ -250,36 +250,64 @@ func (tm *MVCCTransactionManager) CommitTransaction(txn *MVCCTransaction) error 
 		return fmt.Errorf("transaction %d is not pending", txn.ID)
 	}
 
-	// Fetch intents from MetaStore (single source of truth)
-	intents, err := tm.metaStore.GetIntentsByTxn(txn.ID)
+	// Phase 1: Fetch and validate intents
+	intents, err := tm.validateIntents(txn)
 	if err != nil {
-		return fmt.Errorf("failed to fetch write intents: %w", err)
+		return err
 	}
 
-	// Phase 1: Validate all write intents are still held by this transaction
+	// Phase 2: Calculate commit timestamp
+	txn.CommitTS = tm.calculateCommitTS(txn.StartTS)
+
+	// Phase 3: Apply data changes (CDC entries or DDL)
+	if err := tm.applyDataChanges(txn, intents); err != nil {
+		return err
+	}
+
+	// Phase 4: Finalize commit in MetaStore
+	if err := tm.finalizeCommit(txn); err != nil {
+		return err
+	}
+
+	// Phase 5: Cleanup (non-critical, synchronous to prevent goroutine explosion)
+	tm.cleanupAfterCommit(txn, intents)
+
+	return nil
+}
+
+// validateIntents fetches and validates all write intents for the transaction.
+func (tm *MVCCTransactionManager) validateIntents(txn *MVCCTransaction) ([]*WriteIntentRecord, error) {
+	intents, err := tm.metaStore.GetIntentsByTxn(txn.ID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch write intents: %w", err)
+	}
+
 	for _, intent := range intents {
 		valid, err := tm.metaStore.ValidateIntent(intent.TableName, intent.RowKey, txn.ID)
 		if err != nil {
-			return fmt.Errorf("failed to validate intent: %w", err)
+			return nil, fmt.Errorf("failed to validate intent: %w", err)
 		}
 		if !valid {
-			// Intent was stolen/removed - abort
-			return fmt.Errorf("write intent lost for %s:%s - transaction aborted",
+			return nil, fmt.Errorf("write intent lost for %s:%s - transaction aborted",
 				intent.TableName, intent.RowKey)
 		}
 	}
 
-	// Phase 2: Get commit timestamp (must be > start_ts)
+	return intents, nil
+}
+
+// calculateCommitTS determines the commit timestamp (must be > start_ts).
+func (tm *MVCCTransactionManager) calculateCommitTS(startTS hlc.Timestamp) hlc.Timestamp {
 	commitTS := tm.clock.Now()
-	if hlc.Compare(commitTS, txn.StartTS) <= 0 {
-		// Clock hasn't advanced - force it
-		commitTS = tm.clock.Update(txn.StartTS)
+	if hlc.Compare(commitTS, startTS) <= 0 {
+		commitTS = tm.clock.Update(startTS)
 		commitTS.Logical++
 	}
+	return commitTS
+}
 
-	txn.CommitTS = commitTS
-
-	// Load CDC intent entries from MetaStore (this is the source of truth for DML data)
+// applyDataChanges applies CDC entries or DDL statements from intents.
+func (tm *MVCCTransactionManager) applyDataChanges(txn *MVCCTransaction, intents []*WriteIntentRecord) error {
 	cdcEntries, err := tm.metaStore.GetIntentEntries(txn.ID)
 	if err != nil {
 		return fmt.Errorf("failed to load CDC entries: %w", err)
@@ -289,21 +317,26 @@ func (tm *MVCCTransactionManager) CommitTransaction(txn *MVCCTransaction) error 
 		Uint64("txn_id", txn.ID).
 		Int("cdc_entries", len(cdcEntries)).
 		Int("intents", len(intents)).
-		Msg("CommitTransaction: applying CDC data from MetaStore")
+		Msg("CommitTransaction: applying data changes")
 
-	// Apply CDC entries from MetaStore
-	for i, entry := range cdcEntries {
-		log.Debug().
-			Uint64("txn_id", txn.ID).
-			Int("entry_idx", i).
-			Uint8("op", entry.Operation).
-			Str("table", entry.Table).
-			Str("row_key", entry.RowKey).
-			Int("new_values", len(entry.NewValues)).
-			Int("old_values", len(entry.OldValues)).
-			Msg("CommitTransaction: processing CDC entry")
+	// Apply CDC entries (DML operations)
+	if err := tm.applyCDCEntries(txn.ID, cdcEntries); err != nil {
+		return err
+	}
 
-		// Build statement from CDC entry
+	// Apply DDL statements if no CDC entries
+	if len(cdcEntries) == 0 && len(intents) > 0 {
+		if err := tm.applyDDLIntents(txn.ID, intents); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// applyCDCEntries applies CDC data entries to SQLite.
+func (tm *MVCCTransactionManager) applyCDCEntries(txnID uint64, entries []*IntentEntry) error {
+	for _, entry := range entries {
 		stmt := protocol.Statement{
 			TableName: entry.Table,
 			RowKey:    entry.RowKey,
@@ -312,88 +345,71 @@ func (tm *MVCCTransactionManager) CommitTransaction(txn *MVCCTransaction) error 
 			Type:      opCodeToStatementType(entry.Operation),
 		}
 
-		// Write CDC data to SQLite
 		if err := tm.writeCDCData(stmt); err != nil {
 			return fmt.Errorf("failed to write CDC data for %s: %w", entry.Table, err)
 		}
-		log.Debug().Uint64("txn_id", txn.ID).Str("table", entry.Table).Msg("CommitTransaction: CDC write complete")
 	}
+	return nil
+}
 
-	// For DDL operations (no CDC entries), execute SQL from write intents
-	// DDL statements store their SQL in the WriteIntentRecord.SQLStatement field
-	if len(cdcEntries) == 0 && len(intents) > 0 {
-		for _, intent := range intents {
-			// Skip database operations tracked in __marmot__database_operations
-			if intent.TableName == "__marmot__database_operations" {
-				continue
-			}
-			// DDL operations tracked in __marmot__ddl_ops - execute their SQL
-			if intent.TableName == "__marmot__ddl_ops" {
-				if intent.SQLStatement != "" {
-					if _, err := tm.db.Exec(intent.SQLStatement); err != nil {
-						return fmt.Errorf("failed to execute DDL statement: %w", err)
-					}
-					sqlPreview := intent.SQLStatement
-					if len(sqlPreview) > 50 {
-						sqlPreview = sqlPreview[:50]
-					}
-					log.Debug().Uint64("txn_id", txn.ID).Str("sql", sqlPreview).Msg("CommitTransaction: DDL SQL exec complete")
-				}
-				continue
-			}
-			// Other DDL: Execute SQL from intent
-			if intent.SQLStatement != "" {
-				if _, err := tm.db.Exec(intent.SQLStatement); err != nil {
-					return fmt.Errorf("failed to execute DDL statement: %w", err)
-				}
-				sqlPreview := intent.SQLStatement
-				if len(sqlPreview) > 50 {
-					sqlPreview = sqlPreview[:50]
-				}
-				log.Debug().Uint64("txn_id", txn.ID).Str("sql", sqlPreview).Msg("CommitTransaction: DDL SQL exec complete")
-			}
+// applyDDLIntents executes DDL statements from write intents.
+func (tm *MVCCTransactionManager) applyDDLIntents(txnID uint64, intents []*WriteIntentRecord) error {
+	for _, intent := range intents {
+		// Skip database operations and intents without SQL
+		if intent.TableName == TableDatabaseOperations || intent.SQLStatement == "" {
+			continue
 		}
-	}
 
-	// Serialize statements for delta sync replication (empty for CDC-only transactions)
+		if _, err := tm.db.Exec(intent.SQLStatement); err != nil {
+			return fmt.Errorf("failed to execute DDL statement: %w", err)
+		}
+
+		sqlPreview := intent.SQLStatement
+		if len(sqlPreview) > 50 {
+			sqlPreview = sqlPreview[:50]
+		}
+		log.Debug().Uint64("txn_id", txnID).Str("sql", sqlPreview).Msg("CommitTransaction: DDL SQL exec complete")
+	}
+	return nil
+}
+
+// finalizeCommit marks the transaction as committed in MetaStore.
+func (tm *MVCCTransactionManager) finalizeCommit(txn *MVCCTransaction) error {
 	statementsJSON, err := msgpack.Marshal(txn.Statements)
 	if err != nil {
 		return fmt.Errorf("failed to serialize statements: %w", err)
 	}
 
-	// Determine database name from first statement
 	dbName := ""
 	if len(txn.Statements) > 0 {
 		dbName = txn.Statements[0].Database
 	}
 
-	// Mark transaction as COMMITTED in MetaStore
-	if err := tm.metaStore.CommitTransaction(txn.ID, commitTS, statementsJSON, dbName); err != nil {
+	if err := tm.metaStore.CommitTransaction(txn.ID, txn.CommitTS, statementsJSON, dbName); err != nil {
 		return fmt.Errorf("failed to mark transaction as committed: %w", err)
 	}
 
 	txn.Status = TxnStatusCommitted
+	return nil
+}
 
-	// Transaction is now COMMITTED - cleanup synchronously to prevent goroutine explosion
-	// under high load. Mark intents first (fast path - allows immediate overwrite).
+// cleanupAfterCommit performs synchronous cleanup to prevent goroutine explosion.
+func (tm *MVCCTransactionManager) cleanupAfterCommit(txn *MVCCTransaction, intents []*WriteIntentRecord) {
+	// Mark intents for cleanup first (fast path - allows immediate overwrite)
 	if err := tm.metaStore.MarkIntentsForCleanup(txn.ID); err != nil {
 		log.Warn().Err(err).Uint64("txn_id", txn.ID).Msg("Failed to mark intents for cleanup")
 	}
 
-	// Sync: Create MVCC versions (non-critical but keeps history consistent)
+	// Create MVCC versions (non-critical but keeps history consistent)
 	tm.createMVCCVersions(txn, intents)
 
-	// Sync: Delete intents and CDC entries
-	// This prevents goroutine explosion under high load which was causing
-	// MetaStore batch channel saturation and QPS drops to 0.
+	// Delete intents and CDC entries
 	if err := tm.metaStore.DeleteIntentsByTxn(txn.ID); err != nil {
 		log.Warn().Err(err).Uint64("txn_id", txn.ID).Msg("Failed to cleanup intents after commit")
 	}
 	if err := tm.metaStore.DeleteIntentEntries(txn.ID); err != nil {
 		log.Warn().Err(err).Uint64("txn_id", txn.ID).Msg("Failed to cleanup CDC entries after commit")
 	}
-
-	return nil
 }
 
 // opCodeToStatementType converts operation code back to protocol.StatementType
@@ -622,7 +638,7 @@ func (tm *MVCCTransactionManager) cleanupOldTransactionRecords() (int, error) {
 	var minAppliedSeqNum uint64 = 0
 
 	// Skip replication tracking for system database (it's not replicated)
-	if dbName != "" && dbName != "__marmot_system" {
+	if dbName != "" && dbName != SystemDatabaseName {
 		// Get min applied txn_id from anti-entropy (if available)
 		if getMinAppliedFn != nil {
 			minTxnID, err := getMinAppliedFn(dbName)

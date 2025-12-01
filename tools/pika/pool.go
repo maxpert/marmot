@@ -3,10 +3,15 @@ package main
 import (
 	"database/sql"
 	"fmt"
+	"regexp"
 	"sync/atomic"
 
 	_ "github.com/go-sql-driver/mysql"
 )
+
+// validTableName validates table names to prevent SQL injection.
+// Only allows alphanumeric characters and underscores, starting with a letter or underscore.
+var validTableName = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
 
 // Pool manages connections across multiple cluster nodes with round-robin distribution.
 type Pool struct {
@@ -85,6 +90,10 @@ func (p *Pool) Close() error {
 // CreateTable creates the benchmark table on the first host.
 // DDL replicates to other nodes via Marmot.
 func (p *Pool) CreateTable(table string, dropExisting bool) error {
+	if !validTableName.MatchString(table) {
+		return fmt.Errorf("invalid table name: %s (must be alphanumeric with underscores, starting with letter or underscore)", table)
+	}
+
 	db := p.dbs[0]
 
 	if dropExisting {
@@ -116,6 +125,9 @@ func (p *Pool) CreateTable(table string, dropExisting bool) error {
 
 // GetRowCount returns the number of rows in the table.
 func (p *Pool) GetRowCount(table string) (int64, error) {
+	if !validTableName.MatchString(table) {
+		return 0, fmt.Errorf("invalid table name: %s", table)
+	}
 	var count int64
 	err := p.dbs[0].QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s", table)).Scan(&count)
 	return count, err

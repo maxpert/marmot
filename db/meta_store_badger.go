@@ -581,118 +581,158 @@ func (s *BadgerMetaStore) WriteIntent(txnID uint64, tableName, rowKey, op, sqlSt
 	key := intentKey(tableName, rowKey)
 
 	return s.db.Update(func(txn *badger.Txn) error {
-		// Check if intent already exists
-		item, err := txn.Get(key)
-		if err == nil {
-			var existing WriteIntentRecord
-			err = item.Value(func(val []byte) error {
-				return msgpack.Unmarshal(val, &existing)
-			})
-			if err != nil {
-				return err
+		// Check if intent already exists and handle conflicts
+		if err := s.handleExistingIntent(txn, key, txnID, tableName, rowKey, op, sqlStmt, data); err != nil {
+			if err == errIntentUpdated {
+				return nil // Same-txn update handled
 			}
-
-			if existing.TxnID == txnID {
-				// Same transaction - update intent
-				existing.Operation = op
-				existing.SQLStatement = sqlStmt
-				existing.DataSnapshot = data
-				existing.CreatedAt = time.Now().UnixNano()
-				newData, err := msgpack.Marshal(&existing)
-				if err != nil {
-					return err
-				}
-				return txn.Set(key, newData)
-			}
-
-			// Check if existing intent is marked for cleanup (committed/aborted)
-			if existing.MarkedForCleanup {
-				// Safe to overwrite - delete old secondary index first
-				txn.Delete(intentByTxnKey(existing.TxnID, tableName, rowKey))
-				// Fall through to create new intent
-			} else {
-				// Check if the conflicting transaction is already committed or stale
-				// This handles orphaned intents from failed/aborted transactions
-				conflictTxnRec, _ := s.getTransactionInTxn(txn, existing.TxnID)
-
-				canOverwrite := false
-				if conflictTxnRec == nil {
-					// Transaction record doesn't exist - orphaned intent, clean it up
-					log.Debug().
-						Uint64("orphan_txn_id", existing.TxnID).
-						Str("table", tableName).
-						Str("row_key", rowKey).
-						Msg("Cleaning up orphaned intent (no transaction record)")
-					canOverwrite = true
-				} else if conflictTxnRec.Status == MetaTxnStatusCommitted {
-					// Transaction already committed - safe to overwrite stale intent
-					canOverwrite = true
-				} else if conflictTxnRec.Status == MetaTxnStatusAborted {
-					// Transaction was aborted - clean up orphaned intent
-					log.Debug().
-						Uint64("aborted_txn_id", existing.TxnID).
-						Str("table", tableName).
-						Str("row_key", rowKey).
-						Msg("Cleaning up intent from aborted transaction")
-					canOverwrite = true
-				} else {
-					// Check if transaction is stale (no heartbeat for > 10 seconds)
-					// Default heartbeat timeout is 10 seconds
-					heartbeatTimeout := int64(10 * time.Second)
-					if cfg.Config != nil && cfg.Config.MVCC.HeartbeatTimeoutSeconds > 0 {
-						heartbeatTimeout = int64(time.Duration(cfg.Config.MVCC.HeartbeatTimeoutSeconds) * time.Second)
-					}
-					timeSinceHeartbeat := time.Now().UnixNano() - conflictTxnRec.LastHeartbeat
-					if timeSinceHeartbeat > heartbeatTimeout {
-						log.Debug().
-							Uint64("stale_txn_id", existing.TxnID).
-							Str("table", tableName).
-							Str("row_key", rowKey).
-							Int64("heartbeat_age_ms", timeSinceHeartbeat/1e6).
-							Msg("Cleaning up stale intent (heartbeat timeout)")
-						canOverwrite = true
-					}
-				}
-
-				if canOverwrite {
-					txn.Delete(intentByTxnKey(existing.TxnID, tableName, rowKey))
-					// Fall through to create new intent
-				} else {
-					// Active intent from different transaction - write-write conflict
-					return fmt.Errorf("write-write conflict: row %s:%s locked by transaction %d (current txn: %d)",
-						tableName, rowKey, existing.TxnID, txnID)
-				}
-			}
-		} else if err != badger.ErrKeyNotFound {
 			return err
 		}
 
 		// Create new intent
-		rec := &WriteIntentRecord{
-			TableName:    tableName,
-			RowKey:       rowKey,
-			TxnID:        txnID,
-			TSWall:       ts.WallTime,
-			TSLogical:    ts.Logical,
-			NodeID:       nodeID,
-			Operation:    op,
-			SQLStatement: sqlStmt,
-			DataSnapshot: data,
-			CreatedAt:    time.Now().UnixNano(),
-		}
-		recData, err := msgpack.Marshal(rec)
+		return s.createIntent(txn, key, txnID, tableName, rowKey, op, sqlStmt, data, ts, nodeID)
+	})
+}
+
+// errIntentUpdated is a sentinel error indicating same-txn intent was updated
+var errIntentUpdated = fmt.Errorf("intent updated")
+
+// handleExistingIntent checks for existing intents and resolves conflicts.
+// Returns nil if we can create a new intent, errIntentUpdated if same-txn update was done,
+// or an error for conflicts.
+func (s *BadgerMetaStore) handleExistingIntent(txn *badger.Txn, key []byte, txnID uint64, tableName, rowKey, op, sqlStmt string, data []byte) error {
+	item, err := txn.Get(key)
+	if err == badger.ErrKeyNotFound {
+		return nil // No existing intent, proceed with creation
+	}
+	if err != nil {
+		return err
+	}
+
+	var existing WriteIntentRecord
+	if err := item.Value(func(val []byte) error {
+		return msgpack.Unmarshal(val, &existing)
+	}); err != nil {
+		return err
+	}
+
+	// Same transaction - update intent in place
+	if existing.TxnID == txnID {
+		existing.Operation = op
+		existing.SQLStatement = sqlStmt
+		existing.DataSnapshot = data
+		existing.CreatedAt = time.Now().UnixNano()
+		newData, err := msgpack.Marshal(&existing)
 		if err != nil {
 			return err
 		}
-
-		// Set primary intent
-		if err := txn.Set(key, recData); err != nil {
+		if err := txn.Set(key, newData); err != nil {
 			return err
 		}
+		return errIntentUpdated
+	}
 
-		// Set secondary index for txn lookup
-		return txn.Set(intentByTxnKey(txnID, tableName, rowKey), nil)
-	})
+	// Different transaction - check if we can overwrite
+	if err := s.resolveIntentConflict(txn, &existing, txnID, tableName, rowKey); err != nil {
+		return err
+	}
+
+	return nil // Conflict resolved, proceed with new intent creation
+}
+
+// resolveIntentConflict handles conflict with existing intent from different transaction.
+// Returns nil if conflict resolved (can overwrite), or error if active conflict.
+func (s *BadgerMetaStore) resolveIntentConflict(txn *badger.Txn, existing *WriteIntentRecord, txnID uint64, tableName, rowKey string) error {
+	// Marked for cleanup - safe to overwrite
+	if existing.MarkedForCleanup {
+		txn.Delete(intentByTxnKey(existing.TxnID, tableName, rowKey))
+		return nil
+	}
+
+	// Check conflicting transaction status
+	conflictTxnRec, _ := s.getTransactionInTxn(txn, existing.TxnID)
+
+	canOverwrite := false
+	switch {
+	case conflictTxnRec == nil:
+		// Transaction record doesn't exist - orphaned intent
+		log.Debug().
+			Uint64("orphan_txn_id", existing.TxnID).
+			Str("table", tableName).
+			Str("row_key", rowKey).
+			Msg("Cleaning up orphaned intent (no transaction record)")
+		canOverwrite = true
+
+	case conflictTxnRec.Status == MetaTxnStatusCommitted:
+		canOverwrite = true
+
+	case conflictTxnRec.Status == MetaTxnStatusAborted:
+		log.Debug().
+			Uint64("aborted_txn_id", existing.TxnID).
+			Str("table", tableName).
+			Str("row_key", rowKey).
+			Msg("Cleaning up intent from aborted transaction")
+		canOverwrite = true
+
+	default:
+		// Check heartbeat timeout
+		canOverwrite = s.isIntentStale(conflictTxnRec, existing.TxnID, tableName, rowKey)
+	}
+
+	if !canOverwrite {
+		return fmt.Errorf("write-write conflict: row %s:%s locked by transaction %d (current txn: %d)",
+			tableName, rowKey, existing.TxnID, txnID)
+	}
+
+	txn.Delete(intentByTxnKey(existing.TxnID, tableName, rowKey))
+	return nil
+}
+
+// isIntentStale checks if a transaction's intent is stale due to heartbeat timeout.
+func (s *BadgerMetaStore) isIntentStale(txnRec *TransactionRecord, txnID uint64, tableName, rowKey string) bool {
+	heartbeatTimeout := int64(10 * time.Second)
+	if cfg.Config != nil && cfg.Config.MVCC.HeartbeatTimeoutSeconds > 0 {
+		heartbeatTimeout = int64(time.Duration(cfg.Config.MVCC.HeartbeatTimeoutSeconds) * time.Second)
+	}
+
+	timeSinceHeartbeat := time.Now().UnixNano() - txnRec.LastHeartbeat
+	if timeSinceHeartbeat > heartbeatTimeout {
+		log.Debug().
+			Uint64("stale_txn_id", txnID).
+			Str("table", tableName).
+			Str("row_key", rowKey).
+			Int64("heartbeat_age_ms", timeSinceHeartbeat/1e6).
+			Msg("Cleaning up stale intent (heartbeat timeout)")
+		return true
+	}
+	return false
+}
+
+// createIntent creates a new write intent with its secondary index.
+func (s *BadgerMetaStore) createIntent(txn *badger.Txn, key []byte, txnID uint64, tableName, rowKey, op, sqlStmt string, data []byte, ts hlc.Timestamp, nodeID uint64) error {
+	rec := &WriteIntentRecord{
+		TableName:    tableName,
+		RowKey:       rowKey,
+		TxnID:        txnID,
+		TSWall:       ts.WallTime,
+		TSLogical:    ts.Logical,
+		NodeID:       nodeID,
+		Operation:    op,
+		SQLStatement: sqlStmt,
+		DataSnapshot: data,
+		CreatedAt:    time.Now().UnixNano(),
+	}
+
+	recData, err := msgpack.Marshal(rec)
+	if err != nil {
+		return err
+	}
+
+	if err := txn.Set(key, recData); err != nil {
+		return err
+	}
+
+	return txn.Set(intentByTxnKey(txnID, tableName, rowKey), nil)
 }
 
 // ValidateIntent checks if the intent is still held by the expected transaction

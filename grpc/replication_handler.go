@@ -89,7 +89,7 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 
 		if stmtType == protocol.StatementCreateDatabase || stmtType == protocol.StatementDropDatabase {
 			// Use system database for transaction management
-			systemDB, err := rh.dbMgr.GetDatabase("__marmot_system")
+			systemDB, err := rh.dbMgr.GetDatabase(db.SystemDatabaseName)
 			if err != nil {
 				return &TransactionResponse{
 					Success:      false,
@@ -131,9 +131,9 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 
 			// Create write intent for database operation
 			rowKey := stmt.Database
-			opName := "CREATE_DATABASE"
+			opName := db.OpNameCreateDatabase
 			if stmtType == protocol.StatementDropDatabase {
-				opName = "DROP_DATABASE"
+				opName = db.OpNameDropDatabase
 			}
 			snapshotData := map[string]interface{}{
 				"type":          int(stmt.Type),
@@ -143,7 +143,7 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 			}
 			dataSnapshot, _ := db.SerializeData(snapshotData)
 
-			err = txnMgr.WriteIntent(txn, "__marmot__database_operations", rowKey, internalStmt, dataSnapshot)
+			err = txnMgr.WriteIntent(txn, db.TableDatabaseOperations, rowKey, internalStmt, dataSnapshot)
 			if err != nil {
 				txnMgr.AbortTransaction(txn)
 				return &TransactionResponse{
@@ -264,7 +264,7 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 			// For DDL statements, create write intent using table name as row key
 			// This ensures DDL SQL gets stored and executed during commit phase
 			if internalStmt.Type == protocol.StatementDDL {
-				ddlRowKey := fmt.Sprintf("__ddl__%s", stmt.TableName)
+				ddlRowKey := db.DDLRowKeyPrefix + stmt.TableName
 				snapshotData := map[string]interface{}{
 					"type":      stmt.Type.String(),
 					"timestamp": req.Timestamp.WallTime,
@@ -272,7 +272,7 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 				}
 				dataSnapshot, _ := db.SerializeData(snapshotData)
 
-				err := txnMgr.WriteIntent(txn, "__marmot__ddl_ops", ddlRowKey, internalStmt, dataSnapshot)
+				err := txnMgr.WriteIntent(txn, db.TableDDLOps, ddlRowKey, internalStmt, dataSnapshot)
 				if err != nil {
 					txnMgr.AbortTransaction(txn)
 					return &TransactionResponse{
@@ -334,7 +334,7 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 			}
 
 			// Convert statement type to operation code
-			op := statementTypeToOp(internalStmt.Type)
+			op := db.StatementTypeToOpCode(int(internalStmt.Type))
 
 			err := metaStore.WriteIntentEntry(req.TxnId, stmtSeq, op, stmt.TableName, rowKey, oldVals, newVals)
 			if err != nil {
@@ -379,7 +379,7 @@ func (rh *ReplicationHandler) handleCommit(ctx context.Context, req *Transaction
 
 	// Check if this is a database operation (CREATE/DROP DATABASE)
 	// These are tracked in the system database
-	systemDB, err := rh.dbMgr.GetDatabase("__marmot_system")
+	systemDB, err := rh.dbMgr.GetDatabase(db.SystemDatabaseName)
 	if err == nil {
 		// Try to find transaction in system database first
 		systemTxnMgr := systemDB.GetTransactionManager()
@@ -401,9 +401,9 @@ func (rh *ReplicationHandler) handleCommit(ctx context.Context, req *Transaction
 				}
 
 				if dbOpErr != nil {
-					opName := "CREATE_DATABASE"
+					opName := db.OpNameCreateDatabase
 					if stmt.Type == protocol.StatementDropDatabase {
-						opName = "DROP_DATABASE"
+						opName = db.OpNameDropDatabase
 					}
 					log.Error().Err(dbOpErr).Str("database", stmt.Database).Str("operation", opName).Msg("Database operation failed in commit phase")
 					systemTxnMgr.AbortTransaction(systemTxn)
@@ -420,9 +420,9 @@ func (rh *ReplicationHandler) handleCommit(ctx context.Context, req *Transaction
 					log.Warn().Err(err).Str("database", stmt.Database).Msg("Database operation succeeded but transaction commit failed")
 				}
 
-				opName := "CREATE_DATABASE"
+				opName := db.OpNameCreateDatabase
 				if stmt.Type == protocol.StatementDropDatabase {
-					opName = "DROP_DATABASE"
+					opName = db.OpNameDropDatabase
 				}
 				log.Info().
 					Str("database", stmt.Database).
@@ -526,7 +526,7 @@ func (rh *ReplicationHandler) handleAbort(ctx context.Context, req *TransactionR
 	}
 
 	// Check system database first for database operations
-	systemDB, err := rh.dbMgr.GetDatabase("__marmot_system")
+	systemDB, err := rh.dbMgr.GetDatabase(db.SystemDatabaseName)
 	if err == nil {
 		systemTxnMgr := systemDB.GetTransactionManager()
 		systemTxn := systemTxnMgr.GetTransaction(req.TxnId)
@@ -881,13 +881,6 @@ func convertStatementType(st StatementType) protocol.StatementType {
 	}
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
 // checkMutationGuardConflicts checks for conflicts using MutationGuard hash list.
 // Uses exact hash set intersection - no false positives.
 func (rh *ReplicationHandler) checkMutationGuardConflicts(req *TransactionRequest) ConflictResult {
@@ -954,26 +947,5 @@ func (rh *ReplicationHandler) registerMutationGuards(req *TransactionRequest) {
 				Int("key_count", len(keySet)).
 				Msg("Failed to register MutationGuard")
 		}
-	}
-}
-
-// statementTypeToOp converts protocol.StatementType to uint8 operation code
-// These codes match the SQLite preupdate hook operations
-func statementTypeToOp(st protocol.StatementType) uint8 {
-	const (
-		OpInsertInt uint8 = 0
-		OpUpdateInt uint8 = 1
-		OpDeleteInt uint8 = 2
-	)
-
-	switch st {
-	case protocol.StatementInsert, protocol.StatementReplace:
-		return OpInsertInt
-	case protocol.StatementUpdate:
-		return OpUpdateInt
-	case protocol.StatementDelete:
-		return OpDeleteInt
-	default:
-		return OpInsertInt
 	}
 }

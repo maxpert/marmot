@@ -58,23 +58,25 @@ func NewKeyGenerator(prefix string, existingRows int64, seed int64, insertOverla
 // NextInsertKey generates a key for inserts.
 // With insertOverlap > 0, some inserts will target existing keys (causing conflicts).
 func (g *KeyGenerator) NextInsertKey() string {
+	max := atomic.LoadUint64(&g.maxKey)
 	// Check if this insert should overlap with existing keys
-	if g.insertOverlap > 0 && g.maxKey > 0 && g.rng.Float64()*100 < g.insertOverlap {
+	if g.insertOverlap > 0 && max > 0 && g.rng.Float64()*100 < g.insertOverlap {
 		// Return an existing key (will cause UNIQUE constraint conflict)
-		n := uint64(g.rng.Int63n(int64(g.maxKey))) + 1
+		n := uint64(g.rng.Int63n(int64(max))) + 1
 		return fmt.Sprintf("%s_%012d", g.prefix, n)
 	}
 	// Generate a new unique key
 	n := atomic.AddUint64(&g.counter, 1)
-	return fmt.Sprintf("%s_%012d", g.prefix, g.maxKey+n)
+	return fmt.Sprintf("%s_%012d", g.prefix, max+n)
 }
 
 // RandomExistingKey returns a random key from existing rows.
 func (g *KeyGenerator) RandomExistingKey() string {
-	if g.maxKey == 0 {
+	max := atomic.LoadUint64(&g.maxKey)
+	if max == 0 {
 		return g.NextInsertKey() // No existing rows, generate new
 	}
-	n := uint64(g.rng.Int63n(int64(g.maxKey))) + 1
+	n := uint64(g.rng.Int63n(int64(max))) + 1
 	return fmt.Sprintf("%s_%012d", g.prefix, n)
 }
 

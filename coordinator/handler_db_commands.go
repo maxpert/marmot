@@ -7,6 +7,7 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
+// SystemDatabaseName must match db.SystemDatabaseName (avoid import cycle)
 const SystemDatabaseName = "__marmot_system"
 
 var ErrSystemDatabaseProtected = errors.New("cannot drop system database")
