@@ -17,12 +17,8 @@ import (
 	"github.com/vmihailenco/msgpack/v5"
 )
 
-// Operation constants for intent entries
-const (
-	OpInsertInt uint8 = 0
-	OpUpdateInt uint8 = 1
-	OpDeleteInt uint8 = 2
-)
+// OpInsertInt, OpUpdateInt, OpDeleteInt are defined in meta_schema.go
+// to be available regardless of build tags
 
 // SchemaCache provides thread-safe caching of table schemas.
 // Schemas are preloaded before transactions to avoid DB queries during hook callbacks.

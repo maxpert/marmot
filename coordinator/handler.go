@@ -3,7 +3,6 @@ package coordinator
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 	"reflect"
 	"sort"
@@ -33,11 +32,19 @@ type MVCCDatabaseProvider interface {
 	ExecuteLocalWithHooks(ctx context.Context, txnID uint64, statements []protocol.Statement) (PendingExecution, error)
 }
 
+// CDCEntry holds CDC data captured by preupdate hooks
+type CDCEntry struct {
+	RowKey    string
+	OldValues map[string][]byte
+	NewValues map[string][]byte
+}
+
 // PendingExecution represents a locally executed transaction waiting for quorum
 type PendingExecution interface {
 	GetRowCounts() map[string]int64
 	GetTotalRowCount() int64
 	GetKeyHashes(maxRows int) map[string][]uint64
+	GetCDCEntries() []CDCEntry
 	Commit() error
 	Rollback() error
 	// FlushIntentLog is a no-op with SQLite-backed intent storage (WAL handles durability).
@@ -216,55 +223,6 @@ func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, qu
 		stmt.Database = session.CurrentDatabase
 	}
 
-	// Generate row key for DML statements with CDC data
-	// This must happen here (coordinator layer) because:
-	// 1. CDC extraction has already populated NewValues/OldValues
-	// 2. We have database context available
-	// 3. Row key is needed for MVCC write intents (distributed locking)
-	if protocol.IsMutation(stmt) && stmt.RowKey == "" {
-		// Only generate for DML operations that have CDC data
-		if protocol.IsDML(stmt) && (len(stmt.NewValues) > 0 || len(stmt.OldValues) > 0) {
-			// Get database connection to access schema
-			sqlDB, err := h.dbManager.GetDatabaseConnection(stmt.Database)
-			if err != nil {
-				return nil, fmt.Errorf("failed to get database for row key generation: %w", err)
-			}
-
-			// Create schema provider and get table schema
-			schemaProvider := protocol.NewSchemaProvider(sqlDB)
-			schema, err := schemaProvider.GetTableSchema(stmt.TableName)
-			if err != nil {
-				return nil, fmt.Errorf("failed to get schema for table %s: %w", stmt.TableName, err)
-			}
-
-			// Generate row key from CDC values
-			// For INSERT/UPDATE: use NewValues
-			// For DELETE: use OldValues
-			var rowKey string
-			if len(stmt.NewValues) > 0 {
-				rowKey, err = protocol.GenerateRowKey(schema, stmt.NewValues)
-			} else {
-				rowKey, err = protocol.GenerateRowKey(schema, stmt.OldValues)
-			}
-
-			if err != nil {
-				// For INSERT statements with auto-increment PKs, the PK column
-				// is not present in CDC values. This is expected - these INSERTs
-				// don't need write intent tracking since auto-generated PKs are unique.
-				if errors.Is(err, protocol.ErrMissingPrimaryKey) && stmt.Type == protocol.StatementInsert {
-					// Leave rowKey empty - no write intent needed for auto-increment INSERT
-					log.Trace().
-						Str("table", stmt.TableName).
-						Msg("INSERT with auto-increment PK - skipping write intent")
-				} else {
-					return nil, fmt.Errorf("failed to generate row key for %s.%s: %w", stmt.Database, stmt.TableName, err)
-				}
-			} else {
-				stmt.RowKey = rowKey
-			}
-		}
-	}
-
 	// Check for consistency hint
 	consistency, _ := protocol.ExtractConsistencyHint(query)
 
@@ -338,9 +296,8 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, consistency
 		}
 	}
 
-	// Expand multi-row INSERTs into multiple statements
-	// Each row gets its own statement with its own CDC data
-	statements := h.expandMultiRowInsert(stmt)
+	// Single statement array for now - hooks will populate CDC data
+	statements := []protocol.Statement{stmt}
 
 	// For DML operations, try to execute locally with hooks to capture affected rows
 	// This enables MutationGuard-based conflict detection for multi-row operations
@@ -366,16 +323,48 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, consistency
 
 			if err != nil {
 				cancel() // Only cancel on error
-				log.Warn().Err(err).Msg("Failed to execute with hooks, falling back to statement-based")
-				pendingExec = nil
-				cancelHookCtx = nil
-			} else {
-				rowsAffected = pendingExec.GetTotalRowCount()
+				// DML requires CDC hooks for idempotent replication (INSERT OR REPLACE)
+				// Statement-based fallback uses raw SQL which fails on duplicate keys
+				// Return error to client so they can retry
+				log.Warn().Err(err).Msg("DML execution with CDC hooks failed - client should retry")
+				return nil, fmt.Errorf("DML execution failed: %w", err)
+			}
+			rowsAffected = pendingExec.GetTotalRowCount()
+
+			// Transfer hook-captured CDC data to statements for replication
+			// Hooks capture actual row data; AST parsing can't handle parameterized queries
+			cdcEntries := pendingExec.GetCDCEntries()
+			if len(statements) == 1 && len(cdcEntries) > 0 {
+				// For UPSERT (INSERT OR REPLACE) on existing rows, SQLite fires 2 hooks:
+				// - DELETE (OldValues filled, NewValues empty)
+				// - INSERT (OldValues empty, NewValues filled)
+				// Merge all entries to get both OldValues and NewValues
+				mergedOldValues := make(map[string][]byte)
+				mergedNewValues := make(map[string][]byte)
+				var rowKey string
+
+				for _, e := range cdcEntries {
+					if rowKey == "" {
+						rowKey = e.RowKey
+					}
+					for k, v := range e.OldValues {
+						mergedOldValues[k] = v
+					}
+					for k, v := range e.NewValues {
+						mergedNewValues[k] = v
+					}
+				}
+
+				statements[0].RowKey = rowKey
+				statements[0].OldValues = mergedOldValues
+				statements[0].NewValues = mergedNewValues
 			}
 		}
 	}
 
 	// Build transaction for replication
+	// LocalExecutionDone is always false - coordinator commits via CDC replay like remotes
+	// This is the new unified commit path that avoids hookDB/writeDB deadlock
 	txn := &Transaction{
 		ID:                    uint64(txnID),
 		NodeID:                h.nodeID,
@@ -384,7 +373,7 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, consistency
 		WriteConsistency:      consistency,
 		Database:              stmt.Database,
 		RequiredSchemaVersion: schemaVersion,
-		LocalExecutionDone:    pendingExec != nil, // Skip local replication if already executed
+		LocalExecutionDone:    false, // Coordinator commits via CDC replay, same as remotes
 	}
 
 	// If we have pending execution with multiple rows, build MutationGuards
@@ -413,32 +402,19 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, consistency
 	ctx, cancel := context.WithTimeout(context.Background(), getWriteTimeout())
 	defer cancel()
 
-	err := h.writeCoord.WriteTransaction(ctx, txn)
-
-	// Handle pending execution commit/rollback based on quorum result
-	if pendingExec != nil {
-		if err != nil {
-			// Quorum failed - rollback local execution
-			if rollbackErr := pendingExec.Rollback(); rollbackErr != nil {
-				log.Error().Err(rollbackErr).Msg("Failed to rollback local execution after quorum failure")
-			}
-			if cancelHookCtx != nil {
-				cancelHookCtx()
-			}
-			return nil, err
-		}
-		// Quorum succeeded - commit local execution
-		if commitErr := pendingExec.Commit(); commitErr != nil {
-			log.Error().Err(commitErr).Msg("Failed to commit local execution after quorum success")
-			// Note: Quorum already succeeded, so other nodes have the data
-			// This is an inconsistency that should be handled by anti-entropy
-		}
+	// Cancel hook context when done (safe even if nil)
+	defer func() {
 		if cancelHookCtx != nil {
 			cancelHookCtx()
 		}
-	} else if err != nil {
+	}()
+
+	err := h.writeCoord.WriteTransaction(ctx, txn)
+	if err != nil {
 		return nil, err
 	}
+	// Success - coordinator committed via CDC replay in WriteTransaction
+	// No pendingExec.Commit() needed - hookDB was already rolled back
 
 	// If DDL succeeded, increment schema version
 	if isDDL && h.schemaVersionMgr != nil {
@@ -797,66 +773,6 @@ func (h *CoordinatorHandler) handleRollback(session *protocol.ConnectionSession)
 		Msg("ROLLBACK: Discarded buffered statements")
 
 	return nil, nil // OK response
-}
-
-// expandMultiRowInsert expands a multi-row INSERT statement into multiple single-row statements
-// Each row gets its own statement with its own CDC data for proper replication
-// For non-INSERT statements or single-row INSERTs, returns the original statement
-func (h *CoordinatorHandler) expandMultiRowInsert(stmt protocol.Statement) []protocol.Statement {
-	// Only expand for INSERT/REPLACE statements with multiple CDC rows
-	if (stmt.Type != protocol.StatementInsert && stmt.Type != protocol.StatementReplace) ||
-		len(stmt.CDCRows) <= 1 {
-		// Single row or non-INSERT - return as-is
-		return []protocol.Statement{stmt}
-	}
-
-	// Get schema for row key generation
-	var schemaProvider *protocol.SchemaProvider
-	if sqlDB, err := h.dbManager.GetDatabaseConnection(stmt.Database); err == nil {
-		schemaProvider = protocol.NewSchemaProvider(sqlDB)
-	}
-
-	var schema *protocol.TableSchema
-	if schemaProvider != nil {
-		schema, _ = schemaProvider.GetTableSchema(stmt.TableName)
-	}
-
-	// Expand into multiple statements
-	statements := make([]protocol.Statement, len(stmt.CDCRows))
-	for i, cdcRow := range stmt.CDCRows {
-		// Create a new statement for each row with its own CDC data
-		expandedStmt := protocol.Statement{
-			SQL:              stmt.SQL, // Same SQL (will be ignored on replicas, CDC data used instead)
-			Type:             stmt.Type,
-			TableName:        stmt.TableName,
-			Database:         stmt.Database,
-			Error:            stmt.Error,
-			OldValues:        cdcRow.OldValues,
-			NewValues:        cdcRow.NewValues,
-			CDCRows:          nil, // Single row doesn't need CDCRows
-			ISFilter:         stmt.ISFilter,
-			ISTableType:      stmt.ISTableType,
-			VirtualTableType: stmt.VirtualTableType,
-			SystemVarNames:   stmt.SystemVarNames,
-		}
-
-		// Generate row key for this statement
-		if schema != nil && len(cdcRow.NewValues) > 0 {
-			if rowKey, err := protocol.GenerateRowKey(schema, cdcRow.NewValues); err == nil {
-				expandedStmt.RowKey = rowKey
-			}
-		}
-
-		statements[i] = expandedStmt
-	}
-
-	log.Debug().
-		Int("original_rows", len(stmt.CDCRows)).
-		Int("expanded_stmts", len(statements)).
-		Str("table", stmt.TableName).
-		Msg("Expanded multi-row INSERT into multiple statements")
-
-	return statements
 }
 
 // bufferStatement adds a mutation to the active transaction buffer

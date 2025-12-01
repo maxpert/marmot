@@ -12,7 +12,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/maxpert/marmot/cfg"
 	"github.com/maxpert/marmot/coordinator"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/rs/zerolog/log"
@@ -85,13 +84,7 @@ func (dm *DatabaseManager) initSystemDatabase() error {
 	systemDBPath := filepath.Join(dm.dataDir, SystemDatabaseName+".db")
 
 	// Create MetaStore for system database (for CREATE/DROP DATABASE transactions)
-	metaPath := strings.TrimSuffix(systemDBPath, ".db") + "_meta.db"
-	busyTimeoutMS := 50000 // 50 seconds
-	if cfg.Config != nil {
-		busyTimeoutMS = cfg.Config.MVCC.LockWaitTimeoutSeconds * 1000
-	}
-
-	metaStore, err := NewSQLiteMetaStore(metaPath, busyTimeoutMS)
+	metaStore, err := NewMetaStore(systemDBPath)
 	if err != nil {
 		return fmt.Errorf("failed to create system meta store: %w", err)
 	}
@@ -157,16 +150,10 @@ func (dm *DatabaseManager) loadDatabases() error {
 }
 
 // openDatabase opens a database and adds it to the registry
-// Creates a MetaStore for the database (stored in dbname_meta.db)
+// Creates a MetaStore for the database (stored in dbname_meta.badger/)
 func (dm *DatabaseManager) openDatabase(name, path string) error {
 	// Create MetaStore for this database
-	metaPath := strings.TrimSuffix(path, ".db") + "_meta.db"
-	busyTimeoutMS := 50000 // 50 seconds
-	if cfg.Config != nil {
-		busyTimeoutMS = cfg.Config.MVCC.LockWaitTimeoutSeconds * 1000
-	}
-
-	metaStore, err := NewSQLiteMetaStore(metaPath, busyTimeoutMS)
+	metaStore, err := NewMetaStore(path)
 	if err != nil {
 		return fmt.Errorf("failed to create meta store for %s: %w", name, err)
 	}
@@ -227,13 +214,7 @@ func (dm *DatabaseManager) CreateDatabase(name string) error {
 	fullPath := filepath.Join(dm.dataDir, dbPath)
 
 	// Create MetaStore for this database
-	metaPath := strings.TrimSuffix(fullPath, ".db") + "_meta.db"
-	busyTimeoutMS := 50000 // 50 seconds
-	if cfg.Config != nil {
-		busyTimeoutMS = cfg.Config.MVCC.LockWaitTimeoutSeconds * 1000
-	}
-
-	metaStore, err := NewSQLiteMetaStore(metaPath, busyTimeoutMS)
+	metaStore, err := NewMetaStore(fullPath)
 	if err != nil {
 		return fmt.Errorf("failed to create meta store: %w", err)
 	}
@@ -241,7 +222,7 @@ func (dm *DatabaseManager) CreateDatabase(name string) error {
 	db, err := NewMVCCDatabase(fullPath, dm.nodeID, dm.clock, metaStore)
 	if err != nil {
 		metaStore.Close()
-		os.Remove(metaPath)
+		cleanupMetaStoreFiles(fullPath)
 		return fmt.Errorf("failed to create database file: %w", err)
 	}
 
@@ -258,7 +239,7 @@ func (dm *DatabaseManager) CreateDatabase(name string) error {
 		db.Close()
 		metaStore.Close()
 		os.Remove(fullPath)
-		os.Remove(metaPath)
+		cleanupMetaStoreFiles(fullPath)
 		return fmt.Errorf("failed to register database in system: %w", err)
 	}
 
@@ -319,11 +300,9 @@ func (dm *DatabaseManager) DropDatabase(name string) error {
 	os.Remove(fullPath + "-wal")
 	os.Remove(fullPath + "-shm")
 
-	// Delete meta database files
-	metaPath := strings.TrimSuffix(fullPath, ".db") + "_meta.db"
-	os.Remove(metaPath)
-	os.Remove(metaPath + "-wal")
-	os.Remove(metaPath + "-shm")
+	// Delete meta database directory (BadgerDB)
+	metaPath := strings.TrimSuffix(fullPath, ".db") + "_meta.badger"
+	os.RemoveAll(metaPath)
 
 	log.Info().Str("name", name).Msg("Database dropped")
 	return nil
@@ -438,13 +417,7 @@ func (dm *DatabaseManager) ReopenDatabase(name string) error {
 
 	// Create MetaStore for this database
 	fullPath := filepath.Join(dm.dataDir, dbPath)
-	metaPath := strings.TrimSuffix(fullPath, ".db") + "_meta.db"
-	busyTimeoutMS := 50000 // 50 seconds
-	if cfg.Config != nil {
-		busyTimeoutMS = cfg.Config.MVCC.LockWaitTimeoutSeconds * 1000
-	}
-
-	metaStore, err := NewSQLiteMetaStore(metaPath, busyTimeoutMS)
+	metaStore, err := NewMetaStore(fullPath)
 	if err != nil {
 		dm.mu.Unlock()
 		return fmt.Errorf("failed to create meta store for %s: %w", name, err)
@@ -592,13 +565,7 @@ func (dm *DatabaseManager) ImportExistingDatabases(importDir string) (int, error
 		copyFile(srcPath+"-shm", dstPath+"-shm")
 
 		// Create MetaStore for this imported database
-		metaPath := strings.TrimSuffix(dstPath, ".db") + "_meta.db"
-		busyTimeoutMS := 50000 // 50 seconds
-		if cfg.Config != nil {
-			busyTimeoutMS = cfg.Config.MVCC.LockWaitTimeoutSeconds * 1000
-		}
-
-		metaStore, err := NewSQLiteMetaStore(metaPath, busyTimeoutMS)
+		metaStore, err := NewMetaStore(dstPath)
 		if err != nil {
 			log.Warn().Err(err).Str("name", dbName).Msg("Failed to create meta store for imported database")
 			os.Remove(dstPath)
@@ -611,7 +578,7 @@ func (dm *DatabaseManager) ImportExistingDatabases(importDir string) (int, error
 			log.Warn().Err(err).Str("name", dbName).Msg("Failed to open imported database")
 			metaStore.Close()
 			os.Remove(dstPath)
-			os.Remove(metaPath)
+			cleanupMetaStoreFiles(dstPath)
 			continue
 		}
 
@@ -657,6 +624,12 @@ func copyFile(src, dst string) error {
 	return err
 }
 
+// cleanupMetaStoreFiles removes MetaStore directory for a database.
+func cleanupMetaStoreFiles(dbPath string) {
+	basePath := strings.TrimSuffix(dbPath, ".db")
+	os.RemoveAll(basePath + "_meta.badger")
+}
+
 // SnapshotInfo contains information about a database file for snapshot transfer
 type SnapshotInfo struct {
 	Name     string // Database name (e.g., "marmot", "__marmot_system")
@@ -679,6 +652,44 @@ func calculateFileSHA256(path string) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// collectBadgerDirSnapshots collects SnapshotInfo for all files in a BadgerDB directory
+func collectBadgerDirSnapshots(dirPath, baseName, relativeDir string) []SnapshotInfo {
+	var snapshots []SnapshotInfo
+
+	entries, err := os.ReadDir(dirPath)
+	if err != nil {
+		log.Warn().Err(err).Str("path", dirPath).Msg("Failed to read BadgerDB directory")
+		return snapshots
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue // Skip subdirectories
+		}
+
+		filePath := filepath.Join(dirPath, entry.Name())
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+
+		sha256Hash, err := calculateFileSHA256(filePath)
+		if err != nil {
+			continue
+		}
+
+		snapshots = append(snapshots, SnapshotInfo{
+			Name:     baseName + "_meta/" + entry.Name(),
+			Filename: filepath.Join(relativeDir, baseName+"_meta.badger", entry.Name()),
+			FullPath: filePath,
+			Size:     info.Size(),
+			SHA256:   sha256Hash,
+		})
+	}
+
+	return snapshots
 }
 
 // TakeSnapshot checkpoints all databases and returns their file information
@@ -713,32 +724,17 @@ func (dm *DatabaseManager) TakeSnapshot() ([]SnapshotInfo, uint64, error) {
 		SHA256:   systemSHA256,
 	})
 
-	// Checkpoint and include system database meta DB
+	// Checkpoint and include system database meta DB (BadgerDB directory)
 	systemMetaStore := dm.systemDB.GetMetaStore()
 	if systemMetaStore != nil {
 		// Checkpoint meta DB
-		if _, err := systemMetaStore.WriteDB().Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+		if err := systemMetaStore.Checkpoint(); err != nil {
 			log.Warn().Err(err).Msg("Failed to checkpoint system meta database")
 		}
 
-		systemMetaPath := filepath.Join(dm.dataDir, SystemDatabaseName+"_meta.db")
-		metaInfo, err := os.Stat(systemMetaPath)
-		if err == nil {
-			metaSHA256, err := calculateFileSHA256(systemMetaPath)
-			if err == nil {
-				snapshots = append(snapshots, SnapshotInfo{
-					Name:     SystemDatabaseName + "_meta",
-					Filename: SystemDatabaseName + "_meta.db",
-					FullPath: systemMetaPath,
-					Size:     metaInfo.Size(),
-					SHA256:   metaSHA256,
-				})
-			} else {
-				log.Warn().Err(err).Msg("Failed to hash system meta database")
-			}
-		} else {
-			log.Warn().Err(err).Msg("Failed to stat system meta database")
-		}
+		systemMetaPath := filepath.Join(dm.dataDir, SystemDatabaseName+"_meta.badger")
+		metaSnapshots := collectBadgerDirSnapshots(systemMetaPath, SystemDatabaseName, "")
+		snapshots = append(snapshots, metaSnapshots...)
 	}
 
 	// Checkpoint and get info for all user databases and their meta DBs
@@ -774,28 +770,17 @@ func (dm *DatabaseManager) TakeSnapshot() ([]SnapshotInfo, uint64, error) {
 			SHA256:   dbSHA256,
 		})
 
-		// Checkpoint and include meta DB for this database
+		// Checkpoint and include meta DB for this database (BadgerDB directory)
 		metaStore := db.GetMetaStore()
 		if metaStore != nil {
 			// Checkpoint meta DB
-			if _, err := metaStore.WriteDB().Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+			if err := metaStore.Checkpoint(); err != nil {
 				log.Warn().Err(err).Str("database", name).Msg("Failed to checkpoint meta database")
 			}
 
-			metaPath := filepath.Join(dm.dataDir, "databases", name+"_meta.db")
-			metaInfo, err := os.Stat(metaPath)
-			if err == nil {
-				metaSHA256, err := calculateFileSHA256(metaPath)
-				if err == nil {
-					snapshots = append(snapshots, SnapshotInfo{
-						Name:     name + "_meta",
-						Filename: filepath.Join("databases", name+"_meta.db"),
-						FullPath: metaPath,
-						Size:     metaInfo.Size(),
-						SHA256:   metaSHA256,
-					})
-				}
-			}
+			metaPath := filepath.Join(dm.dataDir, "databases", name+"_meta.badger")
+			metaSnapshots := collectBadgerDirSnapshots(metaPath, name, "databases")
+			snapshots = append(snapshots, metaSnapshots...)
 		}
 	}
 
@@ -832,12 +817,7 @@ func (dm *DatabaseManager) GetMaxCommittedTxnID() (uint64, error) {
 		if metaStore == nil {
 			continue // System DB has no MetaStore
 		}
-		var dbMax uint64
-		err := metaStore.ReadDB().QueryRow(`
-			SELECT COALESCE(MAX(txn_id), 0)
-			FROM __marmot__txn_records
-			WHERE status = 'COMMITTED'
-		`).Scan(&dbMax)
+		dbMax, err := metaStore.GetMaxCommittedTxnID()
 		if err != nil {
 			log.Warn().Err(err).Str("database", name).Msg("Failed to get max txn_id")
 			continue
@@ -938,25 +918,22 @@ func (dm *DatabaseManager) GetAllReplicationStates() ([]ReplicationState, error)
 			continue // System DB has no MetaStore
 		}
 
-		rows, err := metaStore.ReadDB().Query(`
-			SELECT peer_node_id, database_name, last_applied_txn_id, last_applied_ts_wall,
-			       last_applied_ts_logical, last_sync_time, sync_status
-			FROM __marmot__replication_state
-		`)
+		states, err := metaStore.GetAllReplicationStates()
 		if err != nil {
 			continue
 		}
 
-		for rows.Next() {
-			var s ReplicationState
-			if err := rows.Scan(&s.PeerNodeID, &s.DatabaseName, &s.LastAppliedTxnID, &s.LastAppliedTSWall,
-				&s.LastAppliedTSLog, &s.LastSyncTime, &s.SyncStatus); err != nil {
-				rows.Close()
-				return nil, err
-			}
-			allStates = append(allStates, s)
+		for _, rec := range states {
+			allStates = append(allStates, ReplicationState{
+				PeerNodeID:        rec.PeerNodeID,
+				DatabaseName:      rec.DatabaseName,
+				LastAppliedTxnID:  rec.LastAppliedTxnID,
+				LastAppliedTSWall: rec.LastAppliedTSWall,
+				LastAppliedTSLog:  rec.LastAppliedTSLogical,
+				LastSyncTime:      rec.LastSyncTime,
+				SyncStatus:        rec.SyncStatus,
+			})
 		}
-		rows.Close()
 	}
 
 	return allStates, nil
@@ -998,14 +975,7 @@ func (dm *DatabaseManager) GetMaxTxnID(database string) (uint64, error) {
 		return 0, nil // System DB has no transaction records
 	}
 
-	var maxTxnID uint64
-	err := metaStore.ReadDB().QueryRow(`
-		SELECT COALESCE(MAX(txn_id), 0)
-		FROM __marmot__txn_records
-		WHERE status = 'COMMITTED'
-	`).Scan(&maxTxnID)
-
-	return maxTxnID, err
+	return metaStore.GetMaxCommittedTxnID()
 }
 
 // GetCommittedTxnCount returns the count of committed transactions in a database
@@ -1024,14 +994,7 @@ func (dm *DatabaseManager) GetCommittedTxnCount(database string) (int64, error) 
 		return 0, nil // System DB has no transaction records
 	}
 
-	var count int64
-	err := metaStore.ReadDB().QueryRow(`
-		SELECT COUNT(*)
-		FROM __marmot__txn_records
-		WHERE status = 'COMMITTED'
-	`).Scan(&count)
-
-	return count, err
+	return metaStore.GetCommittedTxnCount()
 }
 
 // GetMaxSeqNum returns the maximum sequence number in a database

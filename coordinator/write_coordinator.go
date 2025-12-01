@@ -181,10 +181,9 @@ func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transacti
 		MutationGuards:        txn.MutationGuards,
 	}
 
-	skipLocalReplication := txn.LocalExecutionDone
-
-	// Execute prepare phase - single attempt, no retry
-	prepResponses, conflictErr := wc.executePreparePhase(ctx, txn, prepReq, otherNodes, skipLocalReplication)
+	// Execute prepare phase on all nodes (including self) - single attempt, no retry
+	// All nodes now participate uniformly - no skipLocalReplication
+	prepResponses, conflictErr := wc.executePreparePhase(ctx, txn, prepReq, otherNodes, false)
 
 	if conflictErr != nil {
 		// Write-write conflict detected - abort and signal client to retry
@@ -195,14 +194,6 @@ func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transacti
 		wc.abortTransaction(ctx, aliveNodes, txn.ID, txn.Database)
 		// Return MySQL 1213 (ER_LOCK_DEADLOCK) - standard signal for client retry
 		return protocol.ErrDeadlock()
-	}
-
-	// If local execution already done, count self as an ACK
-	if skipLocalReplication {
-		if prepResponses == nil {
-			prepResponses = make(map[uint64]*ReplicationResponse)
-		}
-		prepResponses[wc.nodeID] = &ReplicationResponse{Success: true}
 	}
 
 	// Check if quorum was achieved
@@ -224,9 +215,14 @@ func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transacti
 	// ====================
 	// PHASE 2: COMMIT
 	// ====================
-	// Quorum of write intents created successfully with no conflicts
-	// Commit to quorum nodes (excluding self if local execution done) and return success
-	// Background replication continues to remaining nodes via anti-entropy
+	// Quorum of write intents created successfully with no conflicts.
+	// Commit locally FIRST, then broadcast to others.
+	// This ensures coordinator never tells others to commit something it couldn't commit itself.
+	log.Debug().
+		Uint64("txn_id", txn.ID).
+		Int("prepared_nodes", len(prepResponses)).
+		Msg("PREPARE phase complete, starting COMMIT")
+
 	commitReq := &ReplicationRequest{
 		TxnID:    txn.ID,
 		Phase:    PhaseCommit,
@@ -235,43 +231,59 @@ func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transacti
 		Database: txn.Database,
 	}
 
-	// Count nodes to commit (exclude self if local execution already done)
-	commitNodes := 0
+	commitResponses := make(map[uint64]*ReplicationResponse)
+
+	// COMMIT LOCALLY FIRST - coordinator must succeed before telling others to commit
+	// This is standard 2PC behavior: coordinator commits first, then broadcasts
+	if _, selfPrepared := prepResponses[wc.nodeID]; selfPrepared {
+		log.Debug().
+			Uint64("txn_id", txn.ID).
+			Msg("Committing locally first (coordinator)")
+		localResp, localErr := wc.localReplicator.ReplicateTransaction(ctx, wc.nodeID, commitReq)
+		if localErr != nil || localResp == nil || !localResp.Success {
+			errMsg := ""
+			if localResp != nil {
+				errMsg = localResp.Error
+			}
+			log.Error().Err(localErr).Str("resp_error", errMsg).Msg("Local commit failed - aborting transaction")
+			wc.abortTransaction(ctx, aliveNodes, txn.ID, txn.Database)
+			return fmt.Errorf("local commit failed: %v", localErr)
+		}
+		commitResponses[wc.nodeID] = localResp
+	}
+
+	// Now broadcast COMMIT to other prepared nodes
+	otherPreparedNodes := 0
 	for nodeID := range prepResponses {
-		if nodeID != wc.nodeID || !skipLocalReplication {
-			commitNodes++
+		if nodeID != wc.nodeID {
+			otherPreparedNodes++
 		}
 	}
 
-	// Send commit to all prepared nodes (excluding self if local execution done)
-	commitChan := make(chan response, commitNodes)
+	commitChan := make(chan response, otherPreparedNodes)
 	for nodeID := range prepResponses {
-		// Skip local commit if local execution already done - pendingExec.Commit() handles it
-		if nodeID == wc.nodeID && skipLocalReplication {
-			continue
+		if nodeID == wc.nodeID {
+			continue // Already committed locally
 		}
+		log.Debug().
+			Uint64("txn_id", txn.ID).
+			Uint64("target_node", nodeID).
+			Msg("sending COMMIT to node")
 		go func(nid uint64) {
-			var resp *ReplicationResponse
-			var err error
-			if nid == wc.nodeID {
-				resp, err = wc.localReplicator.ReplicateTransaction(ctx, nid, commitReq)
-			} else {
-				resp, err = wc.replicator.ReplicateTransaction(ctx, nid, commitReq)
-			}
+			// CRITICAL: Use a detached context with its own timeout for COMMIT.
+			// The parent context may be cancelled after quorum is achieved,
+			// but we still need to complete COMMIT to all prepared nodes.
+			// This prevents "transaction not found" errors on nodes that
+			// prepared but didn't receive COMMIT before context cancellation.
+			commitCtx, commitCancel := context.WithTimeout(context.Background(), wc.timeout)
+			defer commitCancel()
+			resp, err := wc.replicator.ReplicateTransaction(commitCtx, nid, commitReq)
 			commitChan <- response{nodeID: nid, resp: resp, err: err}
 		}(nodeID)
 	}
 
-	// Wait for QUORUM commits only (not all prepared nodes)
-	commitResponses := make(map[uint64]*ReplicationResponse)
-
-	// If local execution done, count self as committed (will be committed by pendingExec.Commit())
-	if skipLocalReplication {
-		commitResponses[wc.nodeID] = &ReplicationResponse{Success: true}
-	}
-
 	// Collect commit responses until quorum achieved or all responses received
-	for i := 0; i < commitNodes && len(commitResponses) < requiredQuorum; i++ {
+	for i := 0; i < otherPreparedNodes && len(commitResponses) < requiredQuorum; i++ {
 		select {
 		case r := <-commitChan:
 			if r.err == nil && r.resp != nil && r.resp.Success {
@@ -292,9 +304,30 @@ func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transacti
 
 	// Commit phase also requires quorum for durability guarantees.
 	// If commit quorum fails, transaction is partially committed -
-	// anti-entropy will eventually repair stragglers.
+	// send ABORT to prepared nodes that didn't commit to clean up intents.
 	if totalCommitAcks < requiredQuorum {
-		return fmt.Errorf("commit quorum degraded: got %d acks, expected %d (will be repaired by anti-entropy)",
+		// Send ABORT to prepared nodes that didn't commit to cleanup orphaned intents
+		for nodeID := range prepResponses {
+			if _, committed := commitResponses[nodeID]; !committed {
+				log.Debug().
+					Uint64("txn_id", txn.ID).
+					Uint64("node_id", nodeID).
+					Msg("sending ABORT to cleanup uncommitted prepared node")
+				go func(nid uint64) {
+					abortReq := &ReplicationRequest{
+						TxnID:    txn.ID,
+						Phase:    PhaseAbort,
+						Database: txn.Database,
+					}
+					if nid == wc.nodeID {
+						wc.localReplicator.ReplicateTransaction(ctx, nid, abortReq)
+					} else {
+						wc.replicator.ReplicateTransaction(ctx, nid, abortReq)
+					}
+				}(nodeID)
+			}
+		}
+		return fmt.Errorf("commit quorum degraded: got %d acks, expected %d (aborted uncommitted nodes)",
 			totalCommitAcks, requiredQuorum)
 	}
 

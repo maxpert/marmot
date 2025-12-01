@@ -23,6 +23,8 @@ const (
 	SnapshotLocal  SnapshotStoreType = "local"  // Local file system
 )
 
+// BadgerDB is the only metadata storage backend
+
 // S3Configuration for S3-compatible storage backends
 type S3Configuration struct {
 	Endpoint     string `toml:"endpoint"`
@@ -129,6 +131,18 @@ type MVCCConfiguration struct {
 	LockWaitTimeoutSeconds  int `toml:"lock_wait_timeout_seconds"` // How long to wait for locks (MySQL: innodb_lock_wait_timeout)
 }
 
+// BadgerConfiguration controls BadgerDB-specific settings
+type BadgerConfiguration struct {
+	SyncWrites    bool `toml:"sync_writes"`    // Sync writes to disk (true for durability)
+	NumCompactors int  `toml:"num_compactors"` // Number of compaction workers
+	ValueLogGC    bool `toml:"value_log_gc"`   // Enable value log garbage collection
+}
+
+// MetaStoreConfiguration controls metadata storage (BadgerDB)
+type MetaStoreConfiguration struct {
+	Badger BadgerConfiguration `toml:"badger"` // BadgerDB settings
+}
+
 // ConnectionPoolConfiguration controls database connection pooling
 type ConnectionPoolConfiguration struct {
 	PoolSize           int `toml:"pool_size"`             // Number of connections in pool
@@ -188,6 +202,7 @@ type Configuration struct {
 	Cluster        ClusterConfiguration        `toml:"cluster"`
 	Replication    ReplicationConfiguration    `toml:"replication"`
 	MVCC           MVCCConfiguration           `toml:"mvcc"`
+	MetaStore      MetaStoreConfiguration      `toml:"metastore"`
 	ConnectionPool ConnectionPoolConfiguration `toml:"connection_pool"`
 	GRPCClient     GRPCClientConfiguration     `toml:"grpc_client"`
 	Coordinator    CoordinatorConfiguration    `toml:"coordinator"`
@@ -264,6 +279,14 @@ var Config = &Configuration{
 		VersionRetentionCount:   10, // Keep last 10 MVCC versions per row
 		ConflictWindowSeconds:   10, // 10 second window for LWW conflict resolution
 		LockWaitTimeoutSeconds:  50, // MySQL default: innodb_lock_wait_timeout
+	},
+
+	MetaStore: MetaStoreConfiguration{
+		Badger: BadgerConfiguration{
+			SyncWrites:    false, // Async writes for performance (group commit handles durability)
+			NumCompactors: 2,     // 2 compaction workers
+			ValueLogGC:    true,  // Enable value log GC
+		},
 	},
 
 	ConnectionPool: ConnectionPoolConfiguration{
@@ -452,6 +475,11 @@ func Validate() error {
 
 	if Config.MVCC.ConflictWindowSeconds < 0 {
 		return fmt.Errorf("MVCC conflict window must be >= 0")
+	}
+
+	// Set MetaStore BadgerDB defaults if not configured
+	if Config.MetaStore.Badger.NumCompactors < 1 {
+		Config.MetaStore.Badger.NumCompactors = 2 // Default to 2 compactors
 	}
 
 	// Validate connection pool configuration

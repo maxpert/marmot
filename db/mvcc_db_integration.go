@@ -24,10 +24,12 @@ var _ coordinator.PendingExecution = (*PendingLocalExecution)(nil)
 // SQLite WAL mode allows ONE writer + MANY concurrent readers.
 // We maintain separate connection pools:
 // - writeDB: Single connection for all writes (SQLite limitation)
+// - hookDB: Single connection for CDC hook capture (separate from writeDB to avoid deadlock)
 // - readDB: Multiple connections for concurrent reads (pool_size from config)
 // - metaStore: Separate MetaStore for transaction metadata (separate file)
 type MVCCDatabase struct {
 	writeDB       *sql.DB   // Write connection (pool size=1, _txlock=immediate)
+	hookDB        *sql.DB   // Hook connection for CDC capture (pool size=1, released before 2PC)
 	readDB        *sql.DB   // Read connection pool (pool size from config)
 	metaStore     MetaStore // Separate metadata storage (transaction records, intents, etc.)
 	txnMgr        *MVCCTransactionManager
@@ -50,6 +52,21 @@ func NewMVCCDatabase(dbPath string, nodeID uint64, clock *hlc.Clock, metaStore M
 	poolCfg := cfg.Config.ConnectionPool
 	isMemoryDB := strings.Contains(dbPath, ":memory:")
 
+	var writeDB, hookDB, readDB *sql.DB
+
+	// Helper to close all opened connections on error
+	closeAll := func() {
+		if writeDB != nil {
+			writeDB.Close()
+		}
+		if hookDB != nil {
+			hookDB.Close()
+		}
+		if readDB != nil {
+			readDB.Close()
+		}
+	}
+
 	// === WRITE CONNECTION ===
 	// Single connection for all writes (SQLite allows only one writer at a time)
 	// Uses _txlock=immediate to acquire write lock at BEGIN, avoiding deadlocks
@@ -62,7 +79,8 @@ func NewMVCCDatabase(dbPath string, nodeID uint64, clock *hlc.Clock, metaStore M
 		}
 	}
 
-	writeDB, err := sql.Open("sqlite3", writeDSN)
+	var err error
+	writeDB, err = sql.Open("sqlite3", writeDSN)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open write database: %w", err)
 	}
@@ -71,6 +89,20 @@ func NewMVCCDatabase(dbPath string, nodeID uint64, clock *hlc.Clock, metaStore M
 	writeDB.SetMaxOpenConns(1)
 	writeDB.SetMaxIdleConns(1)
 	writeDB.SetConnMaxLifetime(0) // Keep connection alive forever
+
+	// === HOOK CONNECTION (for CDC capture) ===
+	// Separate connection for preupdate hooks to capture CDC data.
+	// This connection is acquired during ExecuteLocalWithHooks, captures CDC,
+	// then releases BEFORE 2PC broadcast - avoiding deadlock with incoming commits.
+	hookDSN := writeDSN // Same settings as write connection
+	hookDB, err = sql.Open("sqlite3", hookDSN)
+	if err != nil {
+		closeAll()
+		return nil, fmt.Errorf("failed to open hook database: %w", err)
+	}
+	hookDB.SetMaxOpenConns(1)
+	hookDB.SetMaxIdleConns(1)
+	hookDB.SetConnMaxLifetime(0)
 
 	// === READ CONNECTION POOL ===
 	// Multiple connections for concurrent reads (WAL mode supports this)
@@ -85,9 +117,9 @@ func NewMVCCDatabase(dbPath string, nodeID uint64, clock *hlc.Clock, metaStore M
 		}
 	}
 
-	readDB, err := sql.Open("sqlite3", readDSN)
+	readDB, err = sql.Open("sqlite3", readDSN)
 	if err != nil {
-		writeDB.Close()
+		closeAll()
 		return nil, fmt.Errorf("failed to open read database: %w", err)
 	}
 
@@ -101,44 +133,27 @@ func NewMVCCDatabase(dbPath string, nodeID uint64, clock *hlc.Clock, metaStore M
 		readDB.SetConnMaxIdleTime(time.Duration(poolCfg.MaxIdleTimeSeconds) * time.Second)
 	}
 
-	// Configure both connections with optimal SQLite settings
-	for _, db := range []*sql.DB{writeDB, readDB} {
+	// Configure all connections with optimal SQLite settings
+	for _, db := range []*sql.DB{writeDB, hookDB, readDB} {
 		if !isMemoryDB {
-			_, err = db.Exec("PRAGMA journal_mode=WAL")
-			if err != nil {
-				writeDB.Close()
-				readDB.Close()
+			if _, err = db.Exec("PRAGMA journal_mode=WAL"); err != nil {
+				closeAll()
 				return nil, fmt.Errorf("failed to enable WAL mode: %w", err)
 			}
-
-			_, err = db.Exec(fmt.Sprintf("PRAGMA busy_timeout=%d", busyTimeoutMS))
-			if err != nil {
-				writeDB.Close()
-				readDB.Close()
+			if _, err = db.Exec(fmt.Sprintf("PRAGMA busy_timeout=%d", busyTimeoutMS)); err != nil {
+				closeAll()
 				return nil, fmt.Errorf("failed to set busy timeout: %w", err)
 			}
-
-			// PRAGMA synchronous=NORMAL is safe with WAL mode
-			_, err = db.Exec("PRAGMA synchronous=NORMAL")
-			if err != nil {
-				writeDB.Close()
-				readDB.Close()
+			if _, err = db.Exec("PRAGMA synchronous=NORMAL"); err != nil {
+				closeAll()
 				return nil, fmt.Errorf("failed to set synchronous mode: %w", err)
 			}
-
-			// Increase cache size for better performance (64MB)
-			_, err = db.Exec("PRAGMA cache_size=-64000")
-			if err != nil {
-				writeDB.Close()
-				readDB.Close()
+			if _, err = db.Exec("PRAGMA cache_size=-64000"); err != nil {
+				closeAll()
 				return nil, fmt.Errorf("failed to set cache size: %w", err)
 			}
-
-			// Store temp tables in memory
-			_, err = db.Exec("PRAGMA temp_store=MEMORY")
-			if err != nil {
-				writeDB.Close()
-				readDB.Close()
+			if _, err = db.Exec("PRAGMA temp_store=MEMORY"); err != nil {
+				closeAll()
 				return nil, fmt.Errorf("failed to set temp store: %w", err)
 			}
 		}
@@ -146,8 +161,7 @@ func NewMVCCDatabase(dbPath string, nodeID uint64, clock *hlc.Clock, metaStore M
 
 	// Initialize MVCC schema (using write connection)
 	if err := initializeMVCCSchema(writeDB); err != nil {
-		writeDB.Close()
-		readDB.Close()
+		closeAll()
 		return nil, fmt.Errorf("failed to initialize MVCC schema: %w", err)
 	}
 
@@ -160,6 +174,7 @@ func NewMVCCDatabase(dbPath string, nodeID uint64, clock *hlc.Clock, metaStore M
 
 	return &MVCCDatabase{
 		writeDB:       writeDB,
+		hookDB:        hookDB,
 		readDB:        readDB,
 		metaStore:     metaStore,
 		txnMgr:        txnMgr,
@@ -216,6 +231,11 @@ func (mdb *MVCCDatabase) Close() error {
 			errs = append(errs, err)
 		}
 	}
+	if mdb.hookDB != nil {
+		if err := mdb.hookDB.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
 	if mdb.readDB != nil {
 		if err := mdb.readDB.Close(); err != nil {
 			errs = append(errs, err)
@@ -248,6 +268,74 @@ func (mdb *MVCCDatabase) GetMetaStore() MetaStore {
 type PendingLocalExecution struct {
 	session *EphemeralHookSession // Ephemeral session (owns its connection)
 	db      *MVCCDatabase
+}
+
+// CompletedLocalExecution represents a CDC capture that's already been rolled back.
+// Used by the new hookDB flow where we capture CDC then release the connection
+// BEFORE 2PC broadcast. Commit/Rollback are no-ops.
+type CompletedLocalExecution struct {
+	cdcEntries []*IntentEntry
+	rowCounts  map[string]int64
+	keyHashes  map[string][]uint64
+	db         *MVCCDatabase
+}
+
+// Ensure CompletedLocalExecution implements coordinator.PendingExecution
+var _ coordinator.PendingExecution = (*CompletedLocalExecution)(nil)
+
+// GetRowCounts returns the number of affected rows per table
+func (c *CompletedLocalExecution) GetRowCounts() map[string]int64 {
+	return c.rowCounts
+}
+
+// GetTotalRowCount returns total rows affected across all tables
+func (c *CompletedLocalExecution) GetTotalRowCount() int64 {
+	var total int64
+	for _, count := range c.rowCounts {
+		total += count
+	}
+	return total
+}
+
+// GetKeyHashes returns XXH64 hashes of affected row keys per table
+func (c *CompletedLocalExecution) GetKeyHashes(maxRows int) map[string][]uint64 {
+	return c.keyHashes
+}
+
+// Commit is a no-op - hookDB was already rolled back, actual commit via CDC replay
+func (c *CompletedLocalExecution) Commit() error {
+	return nil
+}
+
+// Rollback is a no-op - hookDB was already rolled back
+func (c *CompletedLocalExecution) Rollback() error {
+	return nil
+}
+
+// GetIntentEntries returns CDC entries captured from hooks
+func (c *CompletedLocalExecution) GetIntentEntries() ([]*IntentEntry, error) {
+	return c.cdcEntries, nil
+}
+
+// GetCDCEntries returns CDC data for replication
+func (c *CompletedLocalExecution) GetCDCEntries() []coordinator.CDCEntry {
+	if len(c.cdcEntries) == 0 {
+		return nil
+	}
+	result := make([]coordinator.CDCEntry, len(c.cdcEntries))
+	for i, e := range c.cdcEntries {
+		result[i] = coordinator.CDCEntry{
+			RowKey:    e.RowKey,
+			OldValues: e.OldValues,
+			NewValues: e.NewValues,
+		}
+	}
+	return result
+}
+
+// FlushIntentLog is a no-op - CDC data already persisted in MetaStore
+func (c *CompletedLocalExecution) FlushIntentLog() error {
+	return nil
 }
 
 // GetRowCounts returns the number of affected rows per table
@@ -302,6 +390,26 @@ func (p *PendingLocalExecution) GetIntentEntries() ([]*IntentEntry, error) {
 	return p.session.GetIntentEntries()
 }
 
+// GetCDCEntries returns CDC data captured by hooks for replication
+func (p *PendingLocalExecution) GetCDCEntries() []coordinator.CDCEntry {
+	if p.session == nil {
+		return nil
+	}
+	entries, err := p.session.GetIntentEntries()
+	if err != nil || len(entries) == 0 {
+		return nil
+	}
+	result := make([]coordinator.CDCEntry, len(entries))
+	for i, e := range entries {
+		result[i] = coordinator.CDCEntry{
+			RowKey:    e.RowKey,
+			OldValues: e.OldValues,
+			NewValues: e.NewValues,
+		}
+	}
+	return result
+}
+
 // FlushIntentLog is a no-op with SQLite-backed intent storage.
 // SQLite WAL mode handles durability automatically.
 // Kept for API compatibility.
@@ -312,16 +420,20 @@ func (p *PendingLocalExecution) FlushIntentLog() error {
 	return p.session.FlushIntentLog()
 }
 
-// ExecuteLocalWithHooks executes SQL locally with preupdate hooks capturing changes.
-// Returns a PendingExecution that holds the transaction open.
-// Caller MUST call Commit() or Rollback() on the result.
+// ExecuteLocalWithHooks executes SQL locally with preupdate hooks capturing CDC data.
+// Returns a PendingExecution with captured CDC entries. The hookDB transaction is
+// ALREADY ROLLED BACK - no Commit/Rollback needed from caller.
 //
 // This implements the coordinator flow:
-// 1. Create ephemeral session with dedicated connection
+// 1. Create ephemeral session with hookDB (separate from writeDB)
 // 2. Register hooks and preload schemas
-// 3. BEGIN TRANSACTION locally
-// 4. Execute mutation commands (hooks capture affected rows)
-// 5. Return without commit - caller decides based on quorum result
+// 3. BEGIN TRANSACTION on hookDB
+// 4. Execute mutation commands (hooks capture affected rows to MetaStore)
+// 5. ROLLBACK hookDB immediately (release connection BEFORE 2PC)
+// 6. Return CDC entries - actual commit happens via uniform CDC replay path
+//
+// This design avoids deadlock: hookDB is released before 2PC broadcast,
+// so incoming COMMIT from other coordinators can acquire writeDB.
 func (mdb *MVCCDatabase) ExecuteLocalWithHooks(ctx context.Context, txnID uint64, statements []protocol.Statement) (coordinator.PendingExecution, error) {
 	// Extract table names from statements
 	tables := make([]string, 0)
@@ -335,19 +447,19 @@ func (mdb *MVCCDatabase) ExecuteLocalWithHooks(ctx context.Context, txnID uint64
 		}
 	}
 
-	// Create ephemeral session with dedicated write connection
-	session, err := StartEphemeralSession(ctx, mdb.writeDB, mdb.metaStore, mdb.schemaCache, txnID, tables)
+	// Create ephemeral session with hookDB (NOT writeDB - avoids deadlock)
+	session, err := StartEphemeralSession(ctx, mdb.hookDB, mdb.metaStore, mdb.schemaCache, txnID, tables)
 	if err != nil {
 		return nil, fmt.Errorf("failed to start session: %w", err)
 	}
 
-	// Begin transaction on the session's connection
+	// Begin transaction on hookDB
 	if err := session.BeginTx(ctx); err != nil {
 		session.Rollback()
 		return nil, fmt.Errorf("failed to begin transaction: %w", err)
 	}
 
-	// Execute each statement
+	// Execute each statement - hooks capture CDC to MetaStore
 	for _, stmt := range statements {
 		if err := session.ExecContext(ctx, stmt.SQL); err != nil {
 			session.Rollback()
@@ -355,10 +467,24 @@ func (mdb *MVCCDatabase) ExecuteLocalWithHooks(ctx context.Context, txnID uint64
 		}
 	}
 
-	// Return pending execution - transaction held open
-	return &PendingLocalExecution{
-		session: session,
-		db:      mdb,
+	// Get CDC entries and row counts BEFORE rollback
+	cdcEntries, _ := session.GetIntentEntries()
+	rowCounts := session.GetRowCounts()
+	keyHashes := session.GetKeyHashes(1000) // Get key hashes for MutationGuard
+
+	// ROLLBACK hookDB immediately - release connection BEFORE 2PC
+	// CDC data is already persisted in MetaStore, so we don't lose anything
+	if err := session.Rollback(); err != nil {
+		return nil, fmt.Errorf("failed to rollback hook session: %w", err)
+	}
+
+	// Return completed execution with captured CDC data
+	// Commit/Rollback are no-ops since session is already closed
+	return &CompletedLocalExecution{
+		cdcEntries: cdcEntries,
+		rowCounts:  rowCounts,
+		keyHashes:  keyHashes,
+		db:         mdb,
 	}, nil
 }
 

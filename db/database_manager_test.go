@@ -3,6 +3,7 @@ package db
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -452,13 +453,23 @@ func TestTakeSnapshotIncludesMetaStores(t *testing.T) {
 		t.Logf("Snapshot: %s (path: %s)", snap.Name, snap.Filename)
 	}
 
+	// Helper to check if any snapshot name has given prefix
+	hasMetaPrefix := func(prefix string) bool {
+		for name := range snapshotNames {
+			if strings.HasPrefix(name, prefix+"_meta/") {
+				return true
+			}
+		}
+		return false
+	}
+
 	// Verify system database is included
 	if !snapshotNames[SystemDatabaseName] {
 		t.Error("System database not found in snapshots")
 	}
 
-	// Verify system meta database is included
-	if !snapshotNames[SystemDatabaseName+"_meta"] {
+	// Verify system meta database is included (BadgerDB directory files)
+	if !hasMetaPrefix(SystemDatabaseName) {
 		t.Error("System meta database not found in snapshots")
 	}
 
@@ -467,8 +478,8 @@ func TestTakeSnapshotIncludesMetaStores(t *testing.T) {
 		t.Error("Default database not found in snapshots")
 	}
 
-	// Verify default meta database is included
-	if !snapshotNames[DefaultDatabaseName+"_meta"] {
+	// Verify default meta database is included (BadgerDB directory files)
+	if !hasMetaPrefix(DefaultDatabaseName) {
 		t.Error("Default meta database not found in snapshots")
 	}
 
@@ -477,8 +488,8 @@ func TestTakeSnapshotIncludesMetaStores(t *testing.T) {
 		t.Error("testdb not found in snapshots")
 	}
 
-	// Verify testdb meta database is included
-	if !snapshotNames["testdb_meta"] {
+	// Verify testdb meta database is included (BadgerDB directory files)
+	if !hasMetaPrefix("testdb") {
 		t.Error("testdb meta database not found in snapshots")
 	}
 
