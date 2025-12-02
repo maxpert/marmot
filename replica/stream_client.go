@@ -727,13 +727,9 @@ func (s *StreamClient) getLocalMaxTxnIDs() (map[string]uint64, error) {
 			continue
 		}
 
-		var maxTxnID uint64
-		row := mdb.GetDB().QueryRow(`
-			SELECT COALESCE(MAX(txn_id), 0)
-			FROM __marmot__txn_records
-			WHERE status = 'COMMITTED'
-		`)
-		if err := row.Scan(&maxTxnID); err == nil {
+		// Use MetaStore to get max committed txn ID
+		maxTxnID, err := mdb.GetMetaStore().GetMaxCommittedTxnID()
+		if err == nil {
 			result[dbName] = maxTxnID
 		}
 	}

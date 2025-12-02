@@ -78,7 +78,6 @@ func (p *Pipeline) Process(ctx *QueryContext) error {
 	return nil
 }
 
-
 func setExecutionFlags(ctx *QueryContext) {
 	switch ctx.StatementType {
 	case StatementInsert, StatementReplace, StatementUpdate, StatementDelete,
@@ -116,4 +115,3 @@ func stripDatabaseQualifiers(ctx *QueryContext) {
 
 	ctx.TranspiledSQL = sqlparser.String(ctx.AST)
 }
-

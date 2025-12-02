@@ -13,9 +13,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/maxpert/marmot/cfg"
-
 	_ "github.com/mattn/go-sqlite3" // SQLite driver
+	"github.com/maxpert/marmot/cfg"
+	"github.com/maxpert/marmot/db"
 	"github.com/rs/zerolog/log"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -524,32 +524,30 @@ func (c *CatchUpClient) GetLocalMaxTxnID(ctx context.Context) (map[string]uint64
 	return result, nil
 }
 
-// getMaxTxnIDFromDB queries the maximum transaction ID from a database file
+// getMaxTxnIDFromDB queries the maximum transaction ID from a database's MetaStore
 func (c *CatchUpClient) getMaxTxnIDFromDB(dbPath string) (uint64, error) {
-	// Check if database file exists
-	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+	// MetaStore path is {dbPath without .db}_meta.badger
+	metaPath := strings.TrimSuffix(dbPath, ".db") + "_meta.badger"
+
+	// Check if MetaStore directory exists
+	if _, err := os.Stat(metaPath); os.IsNotExist(err) {
 		return 0, nil
 	}
 
-	// Open database with WAL mode and busy timeout to avoid conflicts
-	// Use config timeout (in seconds) converted to milliseconds
-	busyTimeoutMS := cfg.Config.MVCC.LockWaitTimeoutSeconds * 1000
-	dsn := fmt.Sprintf("%s?_journal_mode=WAL&_busy_timeout=%d&mode=ro", dbPath, busyTimeoutMS)
-	db, err := sql.Open("sqlite3", dsn)
+	// Open a temporary BadgerMetaStore (read-only)
+	metaStore, err := db.NewBadgerMetaStore(metaPath, db.BadgerMetaStoreOptions{
+		SyncWrites:    false,
+		NumCompactors: 1,
+		ValueLogGC:    false,
+	})
 	if err != nil {
-		return 0, fmt.Errorf("failed to open database: %w", err)
+		return 0, nil // MetaStore might not be initialized yet
 	}
-	defer db.Close()
+	defer metaStore.Close()
 
-	var maxTxnID uint64
-	err = db.QueryRow(`
-		SELECT COALESCE(MAX(txn_id), 0)
-		FROM __marmot__txn_records
-		WHERE status = 'COMMITTED'
-	`).Scan(&maxTxnID)
+	maxTxnID, err := metaStore.GetMaxCommittedTxnID()
 	if err != nil {
-		// Table might not exist yet
-		return 0, nil
+		return 0, nil // No committed transactions yet
 	}
 
 	return maxTxnID, nil

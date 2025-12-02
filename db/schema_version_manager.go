@@ -1,7 +1,6 @@
 package db
 
 import (
-	"database/sql"
 	"fmt"
 	"sync"
 	"time"
@@ -12,17 +11,17 @@ import (
 // SchemaVersionManager tracks and manages schema versions per database
 // Enables QUORUM-based DDL replication with automatic catch-up
 type SchemaVersionManager struct {
-	db *sql.DB
-	mu sync.RWMutex
+	metaStore MetaStore
+	mu        sync.RWMutex
 	// Cache of schema versions per database
 	versions map[string]uint64
 }
 
 // NewSchemaVersionManager creates a new schema version manager
-func NewSchemaVersionManager(db *sql.DB) *SchemaVersionManager {
+func NewSchemaVersionManager(metaStore MetaStore) *SchemaVersionManager {
 	return &SchemaVersionManager{
-		db:       db,
-		versions: make(map[string]uint64),
+		metaStore: metaStore,
+		versions:  make(map[string]uint64),
 	}
 }
 
@@ -35,7 +34,7 @@ func (svm *SchemaVersionManager) GetSchemaVersion(database string) (uint64, erro
 	}
 	svm.mu.RUnlock()
 
-	// Not in cache, query database
+	// Not in cache, query MetaStore
 	svm.mu.Lock()
 	defer svm.mu.Unlock()
 
@@ -44,30 +43,13 @@ func (svm *SchemaVersionManager) GetSchemaVersion(database string) (uint64, erro
 		return version, nil
 	}
 
-	var version uint64
-	err := svm.db.QueryRow(`
-		SELECT schema_version
-		FROM __marmot__schema_versions
-		WHERE database_name = ?
-	`, database).Scan(&version)
-
-	if err == sql.ErrNoRows {
-		// Initialize schema version for new database
-		version = 0
-		_, err = svm.db.Exec(`
-			INSERT OR IGNORE INTO __marmot__schema_versions
-			(database_name, schema_version, updated_at)
-			VALUES (?, ?, ?)
-		`, database, version, time.Now().UnixNano())
-		if err != nil {
-			return 0, fmt.Errorf("failed to initialize schema version: %w", err)
-		}
-	} else if err != nil {
+	version, err := svm.metaStore.GetSchemaVersion(database)
+	if err != nil {
 		return 0, fmt.Errorf("failed to get schema version: %w", err)
 	}
 
-	svm.versions[database] = version
-	return version, nil
+	svm.versions[database] = uint64(version)
+	return uint64(version), nil
 }
 
 // IncrementSchemaVersion increments the schema version after a DDL operation
@@ -76,45 +58,31 @@ func (svm *SchemaVersionManager) IncrementSchemaVersion(database string, ddlSQL 
 	svm.mu.Lock()
 	defer svm.mu.Unlock()
 
-	// Get current version
-	var currentVersion uint64
-	err := svm.db.QueryRow(`
-		SELECT schema_version
-		FROM __marmot__schema_versions
-		WHERE database_name = ?
-	`, database).Scan(&currentVersion)
-
-	if err == sql.ErrNoRows {
-		// Initialize if not exists
-		currentVersion = 0
-	} else if err != nil {
+	// Get current version from MetaStore
+	currentVersion, err := svm.metaStore.GetSchemaVersion(database)
+	if err != nil {
 		return 0, fmt.Errorf("failed to get current schema version: %w", err)
 	}
 
 	newVersion := currentVersion + 1
 
-	// Update schema version
-	_, err = svm.db.Exec(`
-		INSERT OR REPLACE INTO __marmot__schema_versions
-		(database_name, schema_version, last_ddl_sql, last_ddl_txn_id, updated_at)
-		VALUES (?, ?, ?, ?, ?)
-	`, database, newVersion, ddlSQL, txnID, time.Now().UnixNano())
-
+	// Update schema version in MetaStore
+	err = svm.metaStore.UpdateSchemaVersion(database, newVersion, ddlSQL, txnID)
 	if err != nil {
 		return 0, fmt.Errorf("failed to increment schema version: %w", err)
 	}
 
 	// Update cache
-	svm.versions[database] = newVersion
+	svm.versions[database] = uint64(newVersion)
 
 	log.Info().
 		Str("database", database).
-		Uint64("old_version", currentVersion).
-		Uint64("new_version", newVersion).
+		Int64("old_version", currentVersion).
+		Int64("new_version", newVersion).
 		Uint64("txn_id", txnID).
 		Msg("Schema version incremented")
 
-	return newVersion, nil
+	return uint64(newVersion), nil
 }
 
 // SetSchemaVersion explicitly sets the schema version (used during catch-up)
@@ -122,12 +90,7 @@ func (svm *SchemaVersionManager) SetSchemaVersion(database string, version uint6
 	svm.mu.Lock()
 	defer svm.mu.Unlock()
 
-	_, err := svm.db.Exec(`
-		INSERT OR REPLACE INTO __marmot__schema_versions
-		(database_name, schema_version, last_ddl_sql, last_ddl_txn_id, updated_at)
-		VALUES (?, ?, ?, ?, ?)
-	`, database, version, ddlSQL, txnID, time.Now().UnixNano())
-
+	err := svm.metaStore.UpdateSchemaVersion(database, int64(version), ddlSQL, txnID)
 	if err != nil {
 		return fmt.Errorf("failed to set schema version: %w", err)
 	}
@@ -176,31 +139,22 @@ func (svm *SchemaVersionManager) WaitForSchemaVersion(database string, targetVer
 // GetAllSchemaVersions returns a map of all database schema versions
 // Used by gossip protocol to exchange schema version info
 func (svm *SchemaVersionManager) GetAllSchemaVersions() (map[string]uint64, error) {
-	svm.mu.RLock()
-	defer svm.mu.RUnlock()
+	svm.mu.Lock()
+	defer svm.mu.Unlock()
 
-	rows, err := svm.db.Query(`
-		SELECT database_name, schema_version
-		FROM __marmot__schema_versions
-	`)
+	versions, err := svm.metaStore.GetAllSchemaVersions()
 	if err != nil {
 		return nil, fmt.Errorf("failed to query schema versions: %w", err)
 	}
-	defer rows.Close()
 
-	versions := make(map[string]uint64)
-	for rows.Next() {
-		var database string
-		var version uint64
-		if err := rows.Scan(&database, &version); err != nil {
-			return nil, fmt.Errorf("failed to scan schema version: %w", err)
-		}
-		versions[database] = version
+	result := make(map[string]uint64)
+	for dbName, version := range versions {
+		result[dbName] = uint64(version)
 		// Update cache
-		svm.versions[database] = version
+		svm.versions[dbName] = uint64(version)
 	}
 
-	return versions, nil
+	return result, nil
 }
 
 // InvalidateCache clears the cached schema versions

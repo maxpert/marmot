@@ -203,13 +203,13 @@ func main() {
 
 	log.Info().Msg("Database Manager and replication handlers initialized")
 
-	// Initialize schema version manager using system database (needed for delta sync)
+	// Initialize schema version manager using system database's MetaStore (needed for delta sync)
 	systemDB, err := dbMgr.GetDatabase(db.SystemDatabaseName)
 	if err != nil {
 		log.Fatal().Err(err).Msg("Failed to get system database for schema versioning")
 		return
 	}
-	schemaVersionMgr := db.NewSchemaVersionManager(systemDB.GetDB())
+	schemaVersionMgr := db.NewSchemaVersionManager(systemDB.GetMetaStore())
 
 	// Phase 6: Setup anti-entropy service for catching up lagging nodes
 	log.Info().Msg("Setting up anti-entropy service")
