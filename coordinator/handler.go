@@ -146,8 +146,21 @@ func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, qu
 		Str("query", query).
 		Msg("Handling query")
 
+	// Build schema lookup function for auto-increment ID injection
+	var schemaLookup protocol.SchemaLookupFunc
+	if session.CurrentDatabase != "" {
+		db, err := h.dbManager.GetDatabaseConnection(session.CurrentDatabase)
+		if err == nil && db != nil {
+			sp := protocol.NewSchemaProvider(db)
+			schemaLookup = func(table string) string {
+				col, _ := sp.GetAutoIncrementColumn(table)
+				return col
+			}
+		}
+	}
+
 	// Parse first - all routing decisions based on parsed Statement
-	stmt := protocol.ParseStatement(query)
+	stmt := protocol.ParseStatementWithSchema(query, schemaLookup)
 
 	// Handle system variable queries (@@version, DATABASE(), etc.)
 	if stmt.Type == protocol.StatementSystemVariable {

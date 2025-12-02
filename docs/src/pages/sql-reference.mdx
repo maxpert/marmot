@@ -816,7 +816,7 @@ WHERE TABLE_SCHEMA = 'mydb' AND TABLE_NAME = 'users';
 | `INT UNSIGNED` | `INTEGER` | UNSIGNED removed |
 | `VARCHAR(n)` | `TEXT` | Length constraint removed |
 | `DATETIME` | `TEXT` | Date stored as ISO string |
-| `AUTO_INCREMENT` | `AUTOINCREMENT` | Keyword changed |
+| `INT AUTO_INCREMENT` | `BIGINT` | Promoted to 64-bit for HLC IDs |
 | `BOOLEAN` | `INTEGER` | Type changed |
 | `HIGH_PRIORITY` | (removed) | MySQL-only hint |
 | `SQL_NO_CACHE` | (removed) | MySQL-only hint |

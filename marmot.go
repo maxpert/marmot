@@ -13,6 +13,7 @@ import (
 	"github.com/maxpert/marmot/db"
 	marmotgrpc "github.com/maxpert/marmot/grpc"
 	"github.com/maxpert/marmot/hlc"
+	"github.com/maxpert/marmot/id"
 	"github.com/maxpert/marmot/protocol"
 	"github.com/maxpert/marmot/replica"
 	"github.com/maxpert/marmot/telemetry"
@@ -322,10 +323,12 @@ func main() {
 		registryAdapter,
 	)
 
-	// Initialize query pipeline with configured values
+	// Initialize query pipeline with configured values and ID generator
+	idGen := id.NewHLCGenerator(clock)
 	if err := protocol.InitializePipeline(
 		cfg.Config.QueryPipeline.TranspilerCacheSize,
 		cfg.Config.QueryPipeline.ValidatorPoolSize,
+		idGen,
 	); err != nil {
 		log.Fatal().Err(err).Msg("Failed to initialize query pipeline")
 		return

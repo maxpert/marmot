@@ -14,10 +14,11 @@ import (
 
 // TableSchema represents the schema of a table
 type TableSchema struct {
-	TableName     string
-	PrimaryKeys   []string // Column names that form the primary key
-	SchemaVersion uint64   // Version from table metadata
-	ColumnTypes   map[string]string
+	TableName        string
+	PrimaryKeys      []string // Column names that form the primary key
+	SchemaVersion    uint64   // Version from table metadata
+	ColumnTypes      map[string]string
+	AutoIncrementCol string // Column name if single INTEGER PRIMARY KEY (SQLite rowid alias)
 }
 
 // SchemaProvider queries table schema information from SQLite
@@ -102,6 +103,18 @@ func (sp *SchemaProvider) GetTableSchema(tableName string) (*TableSchema, error)
 
 	if len(schema.PrimaryKeys) == 0 {
 		return nil, fmt.Errorf("table %s has no primary key", tableName)
+	}
+
+	// Detect auto-increment: single INTEGER or BIGINT PRIMARY KEY
+	// - INTEGER PRIMARY KEY: SQLite rowid alias (native auto-increment)
+	// - BIGINT PRIMARY KEY: Marmot's transformed auto-increment columns
+	//   (INT AUTO_INCREMENT is transformed to BIGINT by IntToBigintRule for 64-bit HLC IDs)
+	if len(pkColumns) == 1 {
+		pkName := pkColumns[0].name
+		pkType := strings.ToUpper(schema.ColumnTypes[pkName])
+		if pkType == "INTEGER" || pkType == "BIGINT" {
+			schema.AutoIncrementCol = pkName
+		}
 	}
 
 	// Get schema version from table metadata if available
@@ -222,4 +235,15 @@ func ValidateRowKey(schema *TableSchema, rowKey string, expectedVersion uint64) 
 	}
 
 	return nil
+}
+
+// GetAutoIncrementColumn returns the auto-increment column name for a table.
+// Returns empty string if the table has no auto-increment column.
+// A table has auto-increment if it has exactly one primary key column of type INTEGER.
+func (sp *SchemaProvider) GetAutoIncrementColumn(tableName string) (string, error) {
+	schema, err := sp.GetTableSchema(tableName)
+	if err != nil {
+		return "", err
+	}
+	return schema.AutoIncrementCol, nil
 }

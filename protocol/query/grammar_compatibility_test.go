@@ -16,7 +16,7 @@ import (
 
 // TestMySQLSelectModifiers tests MySQL-specific SELECT modifiers
 func TestMySQLSelectModifiers(t *testing.T) {
-	pipeline, err := NewPipeline(100, 4)
+	pipeline, err := NewPipeline(100, 4, nil)
 	if err != nil {
 		t.Fatalf("failed to create pipeline: %v", err)
 	}
@@ -120,7 +120,7 @@ func TestMySQLSelectModifiers(t *testing.T) {
 
 // TestMySQLJoinTypes tests all JOIN type variations - ALL SUPPORTED
 func TestMySQLJoinTypes(t *testing.T) {
-	pipeline, err := NewPipeline(100, 4)
+	pipeline, err := NewPipeline(100, 4, nil)
 	if err != nil {
 		t.Fatalf("failed to create pipeline: %v", err)
 	}
@@ -180,7 +180,7 @@ func TestMySQLJoinTypes(t *testing.T) {
 
 // TestMySQLSetOperations tests UNION, INTERSECT, EXCEPT
 func TestMySQLSetOperations(t *testing.T) {
-	pipeline, err := NewPipeline(100, 4)
+	pipeline, err := NewPipeline(100, 4, nil)
 	if err != nil {
 		t.Fatalf("failed to create pipeline: %v", err)
 	}
@@ -296,7 +296,7 @@ func TestMySQLSetOperations(t *testing.T) {
 
 // TestMySQLInsertVariations tests all INSERT statement variations
 func TestMySQLInsertVariations(t *testing.T) {
-	pipeline, err := NewPipeline(100, 4)
+	pipeline, err := NewPipeline(100, 4, nil)
 	if err != nil {
 		t.Fatalf("failed to create pipeline: %v", err)
 	}
@@ -409,7 +409,7 @@ func TestMySQLInsertVariations(t *testing.T) {
 
 // TestMySQLReplaceStatement tests REPLACE INTO variations
 func TestMySQLReplaceStatement(t *testing.T) {
-	pipeline, err := NewPipeline(100, 4)
+	pipeline, err := NewPipeline(100, 4, nil)
 	if err != nil {
 		t.Fatalf("failed to create pipeline: %v", err)
 	}
@@ -472,7 +472,7 @@ func TestMySQLReplaceStatement(t *testing.T) {
 
 // TestMySQLUpdateVariations tests UPDATE statement variations
 func TestMySQLUpdateVariations(t *testing.T) {
-	pipeline, err := NewPipeline(100, 4)
+	pipeline, err := NewPipeline(100, 4, nil)
 	if err != nil {
 		t.Fatalf("failed to create pipeline: %v", err)
 	}
@@ -587,7 +587,7 @@ func TestMySQLUpdateVariations(t *testing.T) {
 
 // TestMySQLDeleteVariations tests DELETE statement variations
 func TestMySQLDeleteVariations(t *testing.T) {
-	pipeline, err := NewPipeline(100, 4)
+	pipeline, err := NewPipeline(100, 4, nil)
 	if err != nil {
 		t.Fatalf("failed to create pipeline: %v", err)
 	}
@@ -700,7 +700,7 @@ func TestMySQLDeleteVariations(t *testing.T) {
 
 // TestMySQLWindowFunctions tests window function variations - MOSTLY SUPPORTED
 func TestMySQLWindowFunctions(t *testing.T) {
-	pipeline, err := NewPipeline(100, 4)
+	pipeline, err := NewPipeline(100, 4, nil)
 	if err != nil {
 		t.Fatalf("failed to create pipeline: %v", err)
 	}
@@ -779,7 +779,7 @@ func TestMySQLWindowFunctions(t *testing.T) {
 
 // TestMySQLCTEVariations tests Common Table Expression variations - ALL SUPPORTED
 func TestMySQLCTEVariations(t *testing.T) {
-	pipeline, err := NewPipeline(100, 4)
+	pipeline, err := NewPipeline(100, 4, nil)
 	if err != nil {
 		t.Fatalf("failed to create pipeline: %v", err)
 	}
@@ -829,7 +829,7 @@ func TestMySQLCTEVariations(t *testing.T) {
 
 // TestMySQLLockingClauses tests FOR UPDATE, FOR SHARE, etc.
 func TestMySQLLockingClauses(t *testing.T) {
-	pipeline, err := NewPipeline(100, 4)
+	pipeline, err := NewPipeline(100, 4, nil)
 	if err != nil {
 		t.Fatalf("failed to create pipeline: %v", err)
 	}
@@ -891,7 +891,7 @@ func TestMySQLLockingClauses(t *testing.T) {
 
 // TestMySQLSubqueries tests various subquery patterns
 func TestMySQLSubqueries(t *testing.T) {
-	pipeline, err := NewPipeline(100, 4)
+	pipeline, err := NewPipeline(100, 4, nil)
 	if err != nil {
 		t.Fatalf("failed to create pipeline: %v", err)
 	}
@@ -967,7 +967,7 @@ func TestMySQLSubqueries(t *testing.T) {
 
 // TestMySQLGroupByHaving tests GROUP BY and HAVING variations
 func TestMySQLGroupByHaving(t *testing.T) {
-	pipeline, err := NewPipeline(100, 4)
+	pipeline, err := NewPipeline(100, 4, nil)
 	if err != nil {
 		t.Fatalf("failed to create pipeline: %v", err)
 	}
@@ -1024,7 +1024,7 @@ func TestMySQLGroupByHaving(t *testing.T) {
 
 // TestMySQLLimitOffset tests LIMIT and OFFSET variations - ALL SUPPORTED
 func TestMySQLLimitOffset(t *testing.T) {
-	pipeline, err := NewPipeline(100, 4)
+	pipeline, err := NewPipeline(100, 4, nil)
 	if err != nil {
 		t.Fatalf("failed to create pipeline: %v", err)
 	}
@@ -1087,7 +1087,7 @@ func TestMySQLLimitOffset(t *testing.T) {
 
 // TestMySQLDDLStatements tests DDL statement variations - ALL SUPPORTED
 func TestMySQLDDLStatements(t *testing.T) {
-	pipeline, err := NewPipeline(100, 4)
+	pipeline, err := NewPipeline(100, 4, nil)
 	if err != nil {
 		t.Fatalf("failed to create pipeline: %v", err)
 	}
@@ -1161,7 +1161,7 @@ func TestMySQLDDLStatements(t *testing.T) {
 
 // TestMySQLIndexHints tests USE/FORCE/IGNORE INDEX hints
 func TestMySQLIndexHints(t *testing.T) {
-	pipeline, err := NewPipeline(100, 4)
+	pipeline, err := NewPipeline(100, 4, nil)
 	if err != nil {
 		t.Fatalf("failed to create pipeline: %v", err)
 	}

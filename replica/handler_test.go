@@ -10,8 +10,8 @@ import (
 )
 
 func init() {
-	// Initialize query pipeline for tests
-	if err := protocol.InitializePipeline(10000, 8); err != nil {
+	// Initialize query pipeline for tests (nil ID generator - read-only)
+	if err := protocol.InitializePipeline(10000, 8, nil); err != nil {
 		panic("Failed to initialize pipeline: " + err.Error())
 	}
 }

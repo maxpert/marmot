@@ -190,7 +190,7 @@ func TestDetectInformationSchemaTable(t *testing.T) {
 }
 
 func TestComplexQueries(t *testing.T) {
-	pipeline, err := NewPipeline(100, 4)
+	pipeline, err := NewPipeline(100, 4, nil)
 	if err != nil {
 		t.Fatalf("failed to create pipeline: %v", err)
 	}

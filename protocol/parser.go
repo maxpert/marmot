@@ -4,6 +4,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/maxpert/marmot/id"
 	"github.com/maxpert/marmot/protocol/query"
 	"github.com/rs/zerolog/log"
 )
@@ -91,16 +92,29 @@ var (
 
 var globalPipeline *query.Pipeline
 
-func InitializePipeline(cacheSize, poolSize int) error {
+// InitializePipeline initializes the global query processing pipeline.
+// idGen is optional - if nil, auto-increment ID injection is disabled.
+func InitializePipeline(cacheSize, poolSize int, idGen id.Generator) error {
 	var err error
-	globalPipeline, err = query.NewPipeline(cacheSize, poolSize)
+	globalPipeline, err = query.NewPipeline(cacheSize, poolSize, idGen)
 	return err
 }
 
-// ParseStatement analyzes a SQL statement and returns its type and metadata
-// Now uses the new clean layered architecture with caching
+// SchemaLookupFunc returns the auto-increment column name for a table, or empty string if none.
+type SchemaLookupFunc func(table string) string
+
+// ParseStatement analyzes a SQL statement and returns its type and metadata.
+// This version does not perform auto-increment ID injection.
 func ParseStatement(sql string) Statement {
+	return ParseStatementWithSchema(sql, nil)
+}
+
+// ParseStatementWithSchema analyzes a SQL statement with schema-based ID injection.
+// If schemaLookup is provided, INSERT statements missing auto-increment columns
+// will have HLC-based IDs injected.
+func ParseStatementWithSchema(sql string, schemaLookup SchemaLookupFunc) Statement {
 	ctx := query.NewContext(sql, nil)
+	ctx.SchemaLookup = schemaLookup
 
 	if err := globalPipeline.Process(ctx); err != nil {
 		// Log parsing failures for debugging

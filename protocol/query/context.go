@@ -123,6 +123,10 @@ type QueryContext struct {
 	ExecutionErr error
 	RowsAffected int64
 	ResultSet    interface{}
+
+	// SchemaLookup returns the auto-increment column name for a table, or empty string if none.
+	// This is set by the handler before processing to enable schema-based ID injection.
+	SchemaLookup func(table string) string
 }
 
 func NewContext(sql string, params []interface{}) *QueryContext {

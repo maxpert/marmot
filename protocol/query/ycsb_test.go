@@ -6,7 +6,7 @@ import (
 
 // TestYCSB_LoadPhase tests YCSB load phase query patterns
 func TestYCSB_LoadPhase(t *testing.T) {
-	pipeline, err := NewPipeline(1000, 4)
+	pipeline, err := NewPipeline(1000, 4, nil)
 	if err != nil {
 		t.Fatalf("Failed to create pipeline: %v", err)
 	}
@@ -55,7 +55,7 @@ func TestYCSB_LoadPhase(t *testing.T) {
 
 // TestYCSB_ReadWorkload tests YCSB read workload patterns
 func TestYCSB_ReadWorkload(t *testing.T) {
-	pipeline, err := NewPipeline(1000, 4)
+	pipeline, err := NewPipeline(1000, 4, nil)
 	if err != nil {
 		t.Fatalf("Failed to create pipeline: %v", err)
 	}
@@ -112,7 +112,7 @@ func TestYCSB_ReadWorkload(t *testing.T) {
 
 // TestYCSB_UpdateWorkload tests YCSB update workload patterns
 func TestYCSB_UpdateWorkload(t *testing.T) {
-	pipeline, err := NewPipeline(1000, 4)
+	pipeline, err := NewPipeline(1000, 4, nil)
 	if err != nil {
 		t.Fatalf("Failed to create pipeline: %v", err)
 	}
@@ -164,7 +164,7 @@ func TestYCSB_UpdateWorkload(t *testing.T) {
 
 // TestYCSB_DeleteWorkload tests YCSB delete workload patterns (if used)
 func TestYCSB_DeleteWorkload(t *testing.T) {
-	pipeline, err := NewPipeline(1000, 4)
+	pipeline, err := NewPipeline(1000, 4, nil)
 	if err != nil {
 		t.Fatalf("Failed to create pipeline: %v", err)
 	}
@@ -202,7 +202,7 @@ func TestYCSB_DeleteWorkload(t *testing.T) {
 
 // TestYCSB_ScanWorkload tests YCSB scan workload patterns
 func TestYCSB_ScanWorkload(t *testing.T) {
-	pipeline, err := NewPipeline(1000, 4)
+	pipeline, err := NewPipeline(1000, 4, nil)
 	if err != nil {
 		t.Fatalf("Failed to create pipeline: %v", err)
 	}
@@ -245,7 +245,7 @@ func TestYCSB_ScanWorkload(t *testing.T) {
 
 // TestYCSB_ComplexScenarios tests complex query patterns YCSB might generate
 func TestYCSB_ComplexScenarios(t *testing.T) {
-	pipeline, err := NewPipeline(1000, 4)
+	pipeline, err := NewPipeline(1000, 4, nil)
 	if err != nil {
 		t.Fatalf("Failed to create pipeline: %v", err)
 	}
@@ -293,7 +293,7 @@ func TestYCSB_ComplexScenarios(t *testing.T) {
 
 // TestYCSB_PreparedStatementParameters tests parameter binding for YCSB workloads
 func TestYCSB_PreparedStatementParameters(t *testing.T) {
-	pipeline, err := NewPipeline(1000, 4)
+	pipeline, err := NewPipeline(1000, 4, nil)
 	if err != nil {
 		t.Fatalf("Failed to create pipeline: %v", err)
 	}
@@ -345,7 +345,7 @@ func TestYCSB_PreparedStatementParameters(t *testing.T) {
 
 // TestYCSB_TableCreation tests YCSB table creation DDL
 func TestYCSB_TableCreation(t *testing.T) {
-	pipeline, err := NewPipeline(1000, 4)
+	pipeline, err := NewPipeline(1000, 4, nil)
 	if err != nil {
 		t.Fatalf("Failed to create pipeline: %v", err)
 	}
@@ -381,7 +381,7 @@ func TestYCSB_TableCreation(t *testing.T) {
 
 // TestYCSB_CacheEffectiveness tests that repeated queries hit the cache
 func TestYCSB_CacheEffectiveness(t *testing.T) {
-	pipeline, err := NewPipeline(1000, 4)
+	pipeline, err := NewPipeline(1000, 4, nil)
 	if err != nil {
 		t.Fatalf("Failed to create pipeline: %v", err)
 	}
@@ -416,7 +416,7 @@ func TestYCSB_CacheEffectiveness(t *testing.T) {
 // TestDDL_BothDialects tests that DDL statements are properly classified and have table name extracted
 // DDL uses SQL-based replication (no row-level CDC), so we verify proper classification
 func TestDDL_BothDialects(t *testing.T) {
-	pipeline, err := NewPipeline(1000, 4)
+	pipeline, err := NewPipeline(1000, 4, nil)
 	if err != nil {
 		t.Fatalf("Failed to create pipeline: %v", err)
 	}

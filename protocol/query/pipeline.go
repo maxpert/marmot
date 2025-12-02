@@ -1,6 +1,7 @@
 package query
 
 import (
+	"github.com/maxpert/marmot/id"
 	"vitess.io/vitess/go/vt/sqlparser"
 )
 
@@ -10,13 +11,15 @@ type Pipeline struct {
 	validator  *Validator
 }
 
-func NewPipeline(cacheSize, validatorPoolSize int) (*Pipeline, error) {
+// NewPipeline creates a new query processing pipeline.
+// idGen is optional - if nil, auto-increment ID injection is disabled.
+func NewPipeline(cacheSize, validatorPoolSize int, idGen id.Generator) (*Pipeline, error) {
 	p, err := NewVitessParser()
 	if err != nil {
 		return nil, err
 	}
 
-	t, err := NewTranspiler(cacheSize)
+	t, err := NewTranspiler(cacheSize, idGen)
 	if err != nil {
 		return nil, err
 	}
@@ -75,6 +78,7 @@ func (p *Pipeline) Process(ctx *QueryContext) error {
 	return nil
 }
 
+
 func setExecutionFlags(ctx *QueryContext) {
 	switch ctx.StatementType {
 	case StatementInsert, StatementReplace, StatementUpdate, StatementDelete,
@@ -112,3 +116,4 @@ func stripDatabaseQualifiers(ctx *QueryContext) {
 
 	ctx.TranspiledSQL = sqlparser.String(ctx.AST)
 }
+

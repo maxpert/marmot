@@ -316,6 +316,67 @@ Marmot v2 includes an automatic anti-entropy system that continuously monitors a
 - **Eventually Consistent**: Rows may sync out of order. `SERIALIZABLE` transaction assumptions may not hold across nodes.
 - **Concurrent DDL**: Avoid running concurrent DDL operations on the same database from multiple nodes (protected by cluster-wide lock with 30s lease).
 
+## Compatibility
+
+### AUTO_INCREMENT and Integer Types
+
+> **IMPORTANT: Marmot automatically converts `INT AUTO_INCREMENT` to `BIGINT`**
+>
+> This is a **breaking change** from standard MySQL/SQLite behavior. Marmot does not respect 32-bit `INT` for auto-increment columns - they are automatically promoted to `BIGINT` to support distributed ID generation.
+
+**Why?**
+
+In a distributed, leaderless system, each node must generate unique IDs independently without coordination. Marmot uses HLC-based (Hybrid Logical Clock) 64-bit IDs to ensure:
+
+1. **Global Uniqueness**: IDs are unique across all nodes without central coordination
+2. **Monotonicity**: IDs increase over time (within each node)
+3. **No Collisions**: Unlike auto-increment sequences, HLC IDs cannot collide between nodes
+
+**How It Works:**
+
+1. **DDL Transformation**: When you create a table with `AUTO_INCREMENT`:
+   ```sql
+   CREATE TABLE users (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(100))
+   -- Becomes internally:
+   CREATE TABLE users (id BIGINT PRIMARY KEY, name TEXT)
+   ```
+
+2. **DML ID Injection**: When inserting with `0` or `NULL` for an auto-increment column:
+   ```sql
+   INSERT INTO users (id, name) VALUES (0, 'alice')
+   -- Becomes internally:
+   INSERT INTO users (id, name) VALUES (7318624812345678901, 'alice')
+   ```
+
+3. **Explicit IDs Preserved**: If you provide an explicit non-zero ID, it is used as-is:
+   ```sql
+   INSERT INTO users (id, name) VALUES (12345, 'bob')
+   -- Remains:
+   INSERT INTO users (id, name) VALUES (12345, 'bob')
+   ```
+
+**Important Considerations:**
+
+| Aspect | Behavior |
+|--------|----------|
+| **ID Range** | 64-bit (up to 9.2 quintillion) instead of 32-bit (4.2 billion) |
+| **ID Format** | HLC-based, not sequential integers |
+| **SQLite ROWID** | Not used - Marmot manages IDs explicitly |
+| **Client Libraries** | Ensure your client handles `BIGINT` correctly (some JSON serializers may lose precision) |
+| **Existing Data** | Migrate existing `INT` columns to `BIGINT` before enabling Marmot |
+
+**Schema-Based Detection:**
+
+Marmot automatically detects auto-increment columns by querying SQLite schema directly. A column is considered auto-increment if:
+
+- It is a single-column `INTEGER PRIMARY KEY` (SQLite rowid alias), or
+- It is a single-column `BIGINT PRIMARY KEY` (Marmot's transformed columns)
+
+This means:
+- **No registration required** - columns are detected from schema at runtime
+- **Works across restarts** - no need to re-execute DDL statements
+- **Works with existing databases** - tables created directly on SQLite work too
+
 ## Configuration
 
 Marmot v2 uses a TOML configuration file (default: `config.toml`). All settings have sensible defaults.
