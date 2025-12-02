@@ -87,14 +87,14 @@ func (p *Pool) Close() error {
 	return lastErr
 }
 
-// CreateTable creates the benchmark table on the first host.
+// CreateTable creates the benchmark table using round-robin node selection.
 // DDL replicates to other nodes via Marmot.
 func (p *Pool) CreateTable(table string, dropExisting bool) error {
 	if !validTableName.MatchString(table) {
 		return fmt.Errorf("invalid table name: %s (must be alphanumeric with underscores, starting with letter or underscore)", table)
 	}
 
-	db := p.dbs[0]
+	db := p.Get() // Use round-robin instead of always first node
 
 	if dropExisting {
 		if _, err := db.Exec(fmt.Sprintf("DROP TABLE IF EXISTS %s", table)); err != nil {
@@ -123,12 +123,12 @@ func (p *Pool) CreateTable(table string, dropExisting bool) error {
 	return nil
 }
 
-// GetRowCount returns the number of rows in the table.
+// GetRowCount returns the number of rows in the table using round-robin.
 func (p *Pool) GetRowCount(table string) (int64, error) {
 	if !validTableName.MatchString(table) {
 		return 0, fmt.Errorf("invalid table name: %s", table)
 	}
 	var count int64
-	err := p.dbs[0].QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s", table)).Scan(&count)
+	err := p.Get().QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s", table)).Scan(&count)
 	return count, err
 }

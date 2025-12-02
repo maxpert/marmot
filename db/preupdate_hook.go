@@ -14,11 +14,19 @@ import (
 
 	"github.com/mattn/go-sqlite3"
 	"github.com/maxpert/marmot/protocol/filter"
-	"github.com/vmihailenco/msgpack/v5"
 )
 
 // OpInsertInt, OpUpdateInt, OpDeleteInt are defined in meta_schema.go
 // to be available regardless of build tags
+
+// interfacePtrPool pools *interface{} values to reduce allocations in hookCallback.
+// Each row modification needs N pointers where N = column count.
+var interfacePtrPool = sync.Pool{
+	New: func() interface{} {
+		v := new(interface{})
+		return v
+	},
+}
 
 // SchemaCache provides thread-safe caching of table schemas.
 // Schemas are preloaded before transactions to avoid DB queries during hook callbacks.
@@ -277,13 +285,26 @@ func (s *EphemeralHookSession) hookCallback(data sqlite3.SQLitePreUpdateData) {
 	// Get column count
 	colCount := data.Count()
 
-	// Prepare destinations for column values
+	// Prepare destinations for column values using pooled pointers
 	oldDest := make([]interface{}, colCount)
 	newDest := make([]interface{}, colCount)
 	for i := 0; i < colCount; i++ {
-		oldDest[i] = new(interface{})
-		newDest[i] = new(interface{})
+		oldDest[i] = interfacePtrPool.Get().(*interface{})
+		newDest[i] = interfacePtrPool.Get().(*interface{})
 	}
+	// Defer returning pointers to pool
+	defer func() {
+		for i := 0; i < colCount; i++ {
+			if p, ok := oldDest[i].(*interface{}); ok {
+				*p = nil // Clear before returning
+				interfacePtrPool.Put(p)
+			}
+			if p, ok := newDest[i].(*interface{}); ok {
+				*p = nil // Clear before returning
+				interfacePtrPool.Put(p)
+			}
+		}
+	}()
 
 	var operation uint8
 	var oldValues, newValues map[string][]byte
@@ -343,13 +364,13 @@ func (s *EphemeralHookSession) hookCallback(data sqlite3.SQLitePreUpdateData) {
 		s.collectors[data.TableName].AddRowKey(rowKey)
 	}
 
-	// Serialize values to msgpack
+	// Serialize values to msgpack using pooled encoder
 	var oldMsgpack, newMsgpack []byte
 	if oldValues != nil {
-		oldMsgpack, _ = msgpack.Marshal(oldValues)
+		oldMsgpack, _ = MarshalMsgpack(oldValues)
 	}
 	if newValues != nil {
-		newMsgpack, _ = msgpack.Marshal(newValues)
+		newMsgpack, _ = MarshalMsgpack(newValues)
 	}
 
 	// Increment sequence
@@ -379,11 +400,12 @@ func (s *EphemeralHookSession) buildValueMap(columns []string, values []interfac
 
 // serializeValue converts a value to msgpack bytes for CDC replication.
 // Msgpack preserves type information (int64 stays int64, not float64).
+// Uses pooled encoder to reduce allocations on hot path.
 func (s *EphemeralHookSession) serializeValue(v interface{}) []byte {
 	if v == nil {
 		return nil
 	}
-	data, _ := msgpack.Marshal(v)
+	data, _ := MarshalMsgpack(v)
 	return data
 }
 

@@ -128,6 +128,32 @@ max_idle_time_seconds = 10
 max_lifetime_seconds = 300
 
 # ==============================================================================
+# METASTORE (BadgerDB)
+# ==============================================================================
+
+[metastore.badger]
+# Sync writes to disk (false = async for better performance)
+sync_writes = false
+
+# Number of compaction workers
+num_compactors = 2
+
+# Enable value log garbage collection
+value_log_gc = true
+
+# Block cache size in MB (default: 64, BadgerDB default: 256)
+# Reduces memory ~192MB vs BadgerDB default
+block_cache_size_mb = 64
+
+# MemTable size in MB (default: 32, BadgerDB default: 64)
+# Reduces memory ~32MB vs BadgerDB default
+memtable_size_mb = 32
+
+# Number of MemTables (default: 2, BadgerDB default: 5)
+# Reduces memory ~192MB vs BadgerDB default
+num_memtables = 2
+
+# ==============================================================================
 # GRPC CLIENT
 # ==============================================================================
 

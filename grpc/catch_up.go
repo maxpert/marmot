@@ -534,11 +534,14 @@ func (c *CatchUpClient) getMaxTxnIDFromDB(dbPath string) (uint64, error) {
 		return 0, nil
 	}
 
-	// Open a temporary BadgerMetaStore (read-only)
+	// Open a temporary BadgerMetaStore (read-only, minimal memory)
 	metaStore, err := db.NewBadgerMetaStore(metaPath, db.BadgerMetaStoreOptions{
-		SyncWrites:    false,
-		NumCompactors: 1,
-		ValueLogGC:    false,
+		SyncWrites:     false,
+		NumCompactors:  1,
+		ValueLogGC:     false,
+		BlockCacheMB:   16, // Minimal for read-only lookup
+		MemTableSizeMB: 16, // Minimal for read-only lookup
+		NumMemTables:   1,  // Minimal for read-only lookup
 	})
 	if err != nil {
 		return 0, nil // MetaStore might not be initialized yet

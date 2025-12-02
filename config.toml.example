@@ -148,20 +148,17 @@ num_compactors = 2
 # Enable value log garbage collection
 value_log_gc = true
 
-# Block cache size in MB (default: 256)
-# Caches SST table blocks in memory for faster reads
-# Reduce to 64 for low-memory environments (~200MB savings per node)
-block_cache_size_mb = 256
+# Block cache size in MB (default: 64, BadgerDB default: 256)
+# Sidecar-optimized: reduces memory ~192MB vs BadgerDB default
+block_cache_size_mb = 64
 
-# MemTable size in MB (default: 64)
-# In-memory buffer for writes before flushing to disk
-# Reduce to 32 for low-memory environments (~64MB savings per node)
-memtable_size_mb = 64
+# MemTable size in MB (default: 32, BadgerDB default: 64)
+# Sidecar-optimized: reduces memory ~32MB vs BadgerDB default
+memtable_size_mb = 32
 
-# Number of memtables to keep (default: 5)
-# Higher values buffer more writes but use more memory (N * memtable_size)
-# Reduce to 2 for low-memory environments (~192MB savings per node)
-num_memtables = 5
+# Number of MemTables (default: 2, BadgerDB default: 5)
+# Sidecar-optimized: reduces memory ~192MB vs BadgerDB default
+num_memtables = 2
 
 # ==============================================================================
 # CONNECTION POOL

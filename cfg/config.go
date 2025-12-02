@@ -133,9 +133,12 @@ type MVCCConfiguration struct {
 
 // BadgerConfiguration controls BadgerDB-specific settings
 type BadgerConfiguration struct {
-	SyncWrites    bool `toml:"sync_writes"`    // Sync writes to disk (true for durability)
-	NumCompactors int  `toml:"num_compactors"` // Number of compaction workers
-	ValueLogGC    bool `toml:"value_log_gc"`   // Enable value log garbage collection
+	SyncWrites     bool  `toml:"sync_writes"`         // Sync writes to disk (true for durability)
+	NumCompactors  int   `toml:"num_compactors"`      // Number of compaction workers
+	ValueLogGC     bool  `toml:"value_log_gc"`        // Enable value log garbage collection
+	BlockCacheMB   int64 `toml:"block_cache_size_mb"` // Block cache size in MB (default: 64, BadgerDB default: 256)
+	MemTableSizeMB int64 `toml:"memtable_size_mb"`    // MemTable size in MB (default: 32, BadgerDB default: 64)
+	NumMemTables   int   `toml:"num_memtables"`       // Number of MemTables (default: 2, BadgerDB default: 5)
 }
 
 // MetaStoreConfiguration controls metadata storage (BadgerDB)
@@ -280,9 +283,12 @@ var Config = &Configuration{
 
 	MetaStore: MetaStoreConfiguration{
 		Badger: BadgerConfiguration{
-			SyncWrites:    false, // Async writes for performance (group commit handles durability)
-			NumCompactors: 2,     // 2 compaction workers
-			ValueLogGC:    true,  // Enable value log GC
+			SyncWrites:     false, // Async writes for performance (group commit handles durability)
+			NumCompactors:  2,     // 2 compaction workers
+			ValueLogGC:     true,  // Enable value log GC
+			BlockCacheMB:   64,    // 64MB block cache (BadgerDB default: 256MB)
+			MemTableSizeMB: 32,    // 32MB memtable (BadgerDB default: 64MB)
+			NumMemTables:   2,     // 2 memtables (BadgerDB default: 5)
 		},
 	},
 

@@ -55,6 +55,9 @@ type BadgerMetaStore struct {
 	// Sequence generators for per-node sequence numbers (contention-free)
 	sequences map[uint64]*badger.Sequence
 	seqMu     sync.Mutex
+
+	// Persistent counters for O(1) lookups (avoids full table scans)
+	counters *PersistentCounter
 }
 
 // Ensure BadgerMetaStore implements MetaStore
@@ -62,17 +65,23 @@ var _ MetaStore = (*BadgerMetaStore)(nil)
 
 // BadgerMetaStoreOptions configures BadgerDB
 type BadgerMetaStoreOptions struct {
-	SyncWrites    bool
-	NumCompactors int
-	ValueLogGC    bool
+	SyncWrites     bool
+	NumCompactors  int
+	ValueLogGC     bool
+	BlockCacheMB   int64 // Block cache size in MB (0 = use default 64MB)
+	MemTableSizeMB int64 // MemTable size in MB (0 = use default 32MB)
+	NumMemTables   int   // Number of MemTables (0 = use default 2)
 }
 
-// DefaultBadgerOptions returns default BadgerDB options
+// DefaultBadgerOptions returns default BadgerDB options tuned for sidecar usage
 func DefaultBadgerOptions() BadgerMetaStoreOptions {
 	return BadgerMetaStoreOptions{
-		SyncWrites:    true,
-		NumCompactors: 2,
-		ValueLogGC:    true,
+		SyncWrites:     true,
+		NumCompactors:  2,
+		ValueLogGC:     true,
+		BlockCacheMB:   64, // 64MB (BadgerDB default: 256MB)
+		MemTableSizeMB: 32, // 32MB (BadgerDB default: 64MB)
+		NumMemTables:   2,  // 2 (BadgerDB default: 5)
 	}
 }
 
@@ -82,6 +91,25 @@ func NewBadgerMetaStore(path string, opts BadgerMetaStoreOptions) (*BadgerMetaSt
 	badgerOpts.SyncWrites = opts.SyncWrites
 	badgerOpts.NumCompactors = opts.NumCompactors
 	badgerOpts.Logger = nil // Disable badger's default logging
+
+	// Memory tuning for sidecar usage (defaults save ~400MB vs BadgerDB defaults)
+	blockCache := int64(64 << 20) // 64MB default
+	if opts.BlockCacheMB > 0 {
+		blockCache = opts.BlockCacheMB << 20
+	}
+	badgerOpts.BlockCacheSize = blockCache
+
+	memTableSize := int64(32 << 20) // 32MB default
+	if opts.MemTableSizeMB > 0 {
+		memTableSize = opts.MemTableSizeMB << 20
+	}
+	badgerOpts.MemTableSize = memTableSize
+
+	numMemTables := 2 // 2 default
+	if opts.NumMemTables > 0 {
+		numMemTables = opts.NumMemTables
+	}
+	badgerOpts.NumMemtables = numMemTables
 
 	db, err := badger.Open(badgerOpts)
 	if err != nil {
@@ -94,6 +122,7 @@ func NewBadgerMetaStore(path string, opts BadgerMetaStoreOptions) (*BadgerMetaSt
 		batchCh:   make(chan *batchOp, batchChannelSize),
 		stopBatch: make(chan struct{}),
 		sequences: make(map[uint64]*badger.Sequence),
+		counters:  NewPersistentCounter(db, "/meta/", 10), // Small cache for counter keys
 	}
 
 	// Start batch writer goroutine
@@ -442,7 +471,16 @@ func (s *BadgerMetaStore) CommitTransaction(txnID uint64, commitTS hlc.Timestamp
 		}
 
 		// Add to sequence index
-		return txn.Set(txnSeqKey(seqNum, txnID), nil)
+		if err := txn.Set(txnSeqKey(seqNum, txnID), nil); err != nil {
+			return err
+		}
+
+		// Update commit counters (O(1) lookups via PersistentCounter)
+		if _, err := s.counters.UpdateMaxInTxn(txn, "max_committed_txn_id", int64(txnID)); err != nil {
+			return err
+		}
+		_, err = s.counters.IncInTxn(txn, "committed_txn_count", 1)
+		return err
 	})
 }
 
@@ -492,7 +530,15 @@ func (s *BadgerMetaStore) StoreReplayedTransaction(txnID, nodeID uint64, commitT
 			return err
 		}
 		// Add to sequence index
-		return txn.Set(txnSeqKey(seqNum, txnID), nil)
+		if err := txn.Set(txnSeqKey(seqNum, txnID), nil); err != nil {
+			return err
+		}
+		// Update commit counters (O(1) lookups via PersistentCounter)
+		if _, err := s.counters.UpdateMaxInTxn(txn, "max_committed_txn_id", int64(txnID)); err != nil {
+			return err
+		}
+		_, err = s.counters.IncInTxn(txn, "committed_txn_count", 1)
+		return err
 	})
 }
 
@@ -1636,6 +1682,7 @@ func (s *BadgerMetaStore) CleanupOldTransactionRecords(minRetention, maxRetentio
 	minRetentionCutoff := now.Add(-minRetention).UnixNano()
 	maxRetentionCutoff := now.Add(-maxRetention).UnixNano()
 	deleted := 0
+	committedDeleted := 0 // Track committed transactions for counter update
 
 	prefix := []byte(prefixTxn)
 	var keysToDelete [][]byte
@@ -1689,6 +1736,9 @@ func (s *BadgerMetaStore) CleanupOldTransactionRecords(minRetention, maxRetentio
 				if rec.SeqNum > 0 {
 					seqKeysToDelete = append(seqKeysToDelete, txnSeqKey(rec.SeqNum, rec.TxnID))
 				}
+				if rec.Status == MetaTxnStatusCommitted {
+					committedDeleted++
+				}
 			}
 		}
 		return nil
@@ -1715,46 +1765,81 @@ func (s *BadgerMetaStore) CleanupOldTransactionRecords(minRetention, maxRetentio
 		return 0, err
 	}
 
+	// Decrement committed transaction counter via PersistentCounter
+	if committedDeleted > 0 {
+		if _, err := s.counters.Dec("committed_txn_count", int64(committedDeleted)); err != nil {
+			log.Warn().Err(err).Int("count", committedDeleted).Msg("MetaStore GC: Failed to decrement counter")
+		}
+	}
+
 	if deleted > 0 {
-		log.Info().Int("deleted_records", deleted).Msg("MetaStore GC: Cleaned up old transaction records")
+		log.Info().Int("deleted_records", deleted).Int("committed_deleted", committedDeleted).Msg("MetaStore GC: Cleaned up old transaction records")
 	}
 
 	return deleted, nil
 }
 
-// CleanupOldMVCCVersions removes old MVCC versions, keeping the latest N versions per row
+// CleanupOldMVCCVersions removes old MVCC versions, keeping the latest N versions per row.
+// Uses stream-based processing to avoid loading all versions into memory.
+// Keys are sorted as /mvcc/{tableName}/{rowKey}/{timestamp}, so we process one row at a time.
 func (s *BadgerMetaStore) CleanupOldMVCCVersions(keepVersions int) (int, error) {
-	type versionKey struct {
-		key []byte
-		ts  int64
-	}
-
-	// Group versions by (table, rowKey)
-	groups := make(map[string][]versionKey)
 	prefix := []byte(prefixMVCC)
+	prefixLen := len(prefixMVCC)
+
+	wb := s.db.NewWriteBatch()
+	defer wb.Cancel()
+
+	deleted := 0
+	var currentRowPrefix string
+	var currentRowKeys [][]byte // Keys for current row, sorted by timestamp ascending (older first)
 
 	err := s.db.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
+		opts.PrefetchValues = false // Only need keys, not values
 		opts.Prefix = prefix
 		it := txn.NewIterator(opts)
 		defer it.Close()
 
 		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
-			item := it.Item()
-			var rec MVCCVersionRecord
-			err := item.Value(func(val []byte) error {
-				return msgpack.Unmarshal(val, &rec)
-			})
-			if err != nil {
+			key := it.Item().KeyCopy(nil)
+			keyStr := string(key)
+
+			// Parse row prefix: /mvcc/{tableName}/{rowKey}/
+			rowPrefix := extractMVCCRowPrefix(keyStr, prefixLen)
+			if rowPrefix == "" {
 				continue
 			}
 
-			groupKey := fmt.Sprintf("%s/%s", rec.TableName, rec.RowKey)
-			groups[groupKey] = append(groups[groupKey], versionKey{
-				key: append([]byte{}, item.Key()...),
-				ts:  rec.TSWall,
-			})
+			if rowPrefix != currentRowPrefix {
+				// New row - process previous row's versions
+				if len(currentRowKeys) > keepVersions {
+					// Keys sorted ascending by timestamp (older first)
+					// Keep last N (newest), delete first (len - keepVersions) entries
+					deleteCount := len(currentRowKeys) - keepVersions
+					for i := 0; i < deleteCount; i++ {
+						if err := wb.Delete(currentRowKeys[i]); err == nil {
+							deleted++
+						}
+					}
+				}
+				// Start new row
+				currentRowPrefix = rowPrefix
+				currentRowKeys = currentRowKeys[:0] // Reuse slice
+			}
+
+			currentRowKeys = append(currentRowKeys, key)
 		}
+
+		// Process final row
+		if len(currentRowKeys) > keepVersions {
+			deleteCount := len(currentRowKeys) - keepVersions
+			for i := 0; i < deleteCount; i++ {
+				if err := wb.Delete(currentRowKeys[i]); err == nil {
+					deleted++
+				}
+			}
+		}
+
 		return nil
 	})
 
@@ -1762,46 +1847,37 @@ func (s *BadgerMetaStore) CleanupOldMVCCVersions(keepVersions int) (int, error) 
 		return 0, err
 	}
 
-	// For each group, sort by timestamp (desc) and mark older versions for deletion
-	var keysToDelete [][]byte
-	for _, versions := range groups {
-		if len(versions) <= keepVersions {
-			continue
-		}
-		// Sort by timestamp descending
-		sort.Slice(versions, func(i, j int) bool {
-			return versions[i].ts > versions[j].ts
-		})
-		// Mark versions beyond keepVersions for deletion
-		for i := keepVersions; i < len(versions); i++ {
-			keysToDelete = append(keysToDelete, versions[i].key)
-		}
-	}
-
-	if len(keysToDelete) == 0 {
+	if deleted == 0 {
 		return 0, nil
-	}
-
-	// Use WriteBatch for bulk deletes - 7x faster than db.Update()
-	wb := s.db.NewWriteBatch()
-	defer wb.Cancel()
-
-	deleted := 0
-	for _, key := range keysToDelete {
-		if err := wb.Delete(key); err == nil {
-			deleted++
-		}
 	}
 
 	if err := wb.Flush(); err != nil {
 		return 0, err
 	}
 
-	if deleted > 0 {
-		log.Info().Int("deleted_versions", deleted).Msg("MetaStore GC: Cleaned up old MVCC versions")
-	}
-
+	log.Info().Int("deleted_versions", deleted).Msg("MetaStore GC: Cleaned up old MVCC versions")
 	return deleted, nil
+}
+
+// extractMVCCRowPrefix extracts the row prefix from an MVCC key.
+// Key format: /mvcc/{tableName}/{rowKey}/{timestamp}
+// Returns: /mvcc/{tableName}/{rowKey}/ or empty string on error
+func extractMVCCRowPrefix(key string, prefixLen int) string {
+	// Find position after tableName (first / after prefix)
+	idx1 := strings.Index(key[prefixLen:], "/")
+	if idx1 < 0 {
+		return ""
+	}
+	idx1 += prefixLen
+
+	// Find position after rowKey (second / after prefix)
+	idx2 := strings.Index(key[idx1+1:], "/")
+	if idx2 < 0 {
+		return ""
+	}
+	idx2 += idx1 + 1
+
+	return key[:idx2+1]
 }
 
 // seqBandwidth is the number of sequence numbers to pre-allocate at once
@@ -1880,64 +1956,16 @@ func (s *BadgerMetaStore) GetMinAppliedSeqNum(dbName string) (uint64, error) {
 	return s.GetMinAppliedTxnID(dbName)
 }
 
-// GetMaxCommittedTxnID returns the maximum committed transaction ID
+// GetMaxCommittedTxnID returns the maximum committed transaction ID.
+// Uses O(1) counter lookup instead of full table scan.
 func (s *BadgerMetaStore) GetMaxCommittedTxnID() (uint64, error) {
-	var maxTxnID uint64
-	prefix := []byte(prefixTxn)
-
-	err := s.db.View(func(txn *badger.Txn) error {
-		opts := badger.DefaultIteratorOptions
-		opts.Prefix = prefix
-		it := txn.NewIterator(opts)
-		defer it.Close()
-
-		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
-			var rec TransactionRecord
-			err := it.Item().Value(func(val []byte) error {
-				return msgpack.Unmarshal(val, &rec)
-			})
-			if err != nil {
-				continue
-			}
-
-			if rec.Status == MetaTxnStatusCommitted && rec.TxnID > maxTxnID {
-				maxTxnID = rec.TxnID
-			}
-		}
-		return nil
-	})
-
-	return maxTxnID, err
+	return s.counters.LoadUint64("max_committed_txn_id")
 }
 
-// GetCommittedTxnCount returns the count of committed transactions
+// GetCommittedTxnCount returns the count of committed transactions.
+// Uses O(1) counter lookup instead of full table scan.
 func (s *BadgerMetaStore) GetCommittedTxnCount() (int64, error) {
-	var count int64
-	prefix := []byte(prefixTxn)
-
-	err := s.db.View(func(txn *badger.Txn) error {
-		opts := badger.DefaultIteratorOptions
-		opts.Prefix = prefix
-		it := txn.NewIterator(opts)
-		defer it.Close()
-
-		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
-			var rec TransactionRecord
-			err := it.Item().Value(func(val []byte) error {
-				return msgpack.Unmarshal(val, &rec)
-			})
-			if err != nil {
-				continue
-			}
-
-			if rec.Status == MetaTxnStatusCommitted {
-				count++
-			}
-		}
-		return nil
-	})
-
-	return count, err
+	return s.counters.Load("committed_txn_count")
 }
 
 // StreamCommittedTransactions streams committed transactions after fromTxnID
