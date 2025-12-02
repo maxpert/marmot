@@ -11,8 +11,6 @@ import (
 	"github.com/maxpert/marmot/coordinator"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/protocol"
-
-	rqlitesql "github.com/rqlite/sql"
 )
 
 // Ensure PendingLocalExecution implements coordinator.PendingExecution
@@ -558,26 +556,7 @@ func (mdb *MVCCDatabase) ExecuteQuery(ctx context.Context, query string, args ..
 // Uses rqlite/sql AST parser for proper SQL analysis
 // Uses the read connection pool for concurrent read access
 func (mdb *MVCCDatabase) ExecuteMVCCRead(ctx context.Context, query string, args ...interface{}) ([]string, []map[string]interface{}, error) {
-	snapshotTS := mdb.clock.Now()
-
-	// Parse SELECT with rqlite/sql parser for MVCC optimization
-	tableName, pkValue := parseSelectForMVCC(query, args)
-	if tableName != "" && pkValue != "" {
-		// Use ReadWithWriteIntentCheck for PK lookups (uses read connection)
-		row, err := coordinator.ReadWithWriteIntentCheck(mdb.readDB, snapshotTS, tableName, pkValue)
-		if err != nil {
-			return nil, nil, err
-		}
-
-		if _, ok := row["_no_version"]; ok {
-			// Fallback to standard read
-		} else {
-			// Found MVCC version but deserialization not implemented, falling back
-		}
-	}
-
-	// Fallback to standard read (Snapshot Isolation via SQLite WAL)
-	// Uses read connection pool for concurrent reads
+	// SQLite WAL mode provides snapshot isolation at connection level
 	rows, err := mdb.readDB.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, nil, err
@@ -611,76 +590,6 @@ func (mdb *MVCCDatabase) ExecuteMVCCRead(ctx context.Context, query string, args
 		results = append(results, rowMap)
 	}
 	return columns, results, nil
-}
-
-// parseSelectForMVCC parses a SELECT query using rqlite/sql AST
-// Returns (tableName, pkValue) if this is a simple PK lookup, otherwise ("", "")
-func parseSelectForMVCC(query string, args []interface{}) (string, string) {
-	parser := rqlitesql.NewParser(strings.NewReader(query))
-	stmt, err := parser.ParseStatement()
-	if err != nil {
-		return "", ""
-	}
-
-	sel, ok := stmt.(*rqlitesql.SelectStatement)
-	if !ok {
-		return "", ""
-	}
-
-	// Extract table name from FROM clause
-	tableName := ""
-	if sel.Source != nil {
-		tableName = rqlitesql.SourceName(sel.Source)
-	}
-	if tableName == "" {
-		return "", ""
-	}
-
-	// Check for simple WHERE clause with equality on single column (potential PK)
-	if sel.WhereExpr == nil {
-		return "", ""
-	}
-
-	pkValue := extractPKFromWhere(sel.WhereExpr, args)
-	if pkValue == "" {
-		return "", ""
-	}
-
-	return tableName, pkValue
-}
-
-// extractPKFromWhere extracts the PK value from a WHERE expression
-// Only handles simple cases: WHERE col = value or WHERE col = ?
-func extractPKFromWhere(whereExpr rqlitesql.Expr, args []interface{}) string {
-	if whereExpr == nil {
-		return ""
-	}
-
-	// Check for binary expression (col = value)
-	binExpr, ok := whereExpr.(*rqlitesql.BinaryExpr)
-	if !ok {
-		return ""
-	}
-
-	// Must be equality
-	if binExpr.Op != rqlitesql.EQ {
-		return ""
-	}
-
-	// Extract value from right side
-	switch v := binExpr.Y.(type) {
-	case *rqlitesql.StringLit:
-		return v.Value
-	case *rqlitesql.NumberLit:
-		return v.Value
-	case *rqlitesql.BindExpr:
-		// Parameter placeholder - use first arg
-		if len(args) > 0 {
-			return fmt.Sprintf("%v", args[0])
-		}
-	}
-
-	return ""
 }
 
 // ExecuteQueryRow executes a single-row query with MVCC snapshot isolation

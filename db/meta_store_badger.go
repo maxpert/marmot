@@ -1270,6 +1270,39 @@ func (s *BadgerMetaStore) UpdateSchemaVersion(dbName string, version int64, ddlS
 	})
 }
 
+// GetAllSchemaVersions returns all schema versions indexed by database name
+func (s *BadgerMetaStore) GetAllSchemaVersions() (map[string]int64, error) {
+	versions := make(map[string]int64)
+	prefix := []byte(prefixSchema)
+
+	err := s.db.View(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.Prefix = prefix
+		it := txn.NewIterator(opts)
+		defer it.Close()
+
+		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+			item := it.Item()
+			key := item.Key()
+
+			// Extract dbName from key: "/schema/{dbName}"
+			dbName := string(key[len(prefix):])
+
+			var rec schemaVersionRecord
+			err := item.Value(func(val []byte) error {
+				return msgpack.Unmarshal(val, &rec)
+			})
+			if err != nil {
+				continue // Skip corrupted entries
+			}
+			versions[dbName] = rec.Version
+		}
+		return nil
+	})
+
+	return versions, err
+}
+
 // ddlLockRecord is internal storage for DDL locks
 type ddlLockRecord struct {
 	NodeID    uint64

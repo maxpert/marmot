@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -272,16 +273,17 @@ func TestDDLIdempotencyRewriter(t *testing.T) {
 
 // TestSchemaVersionManager validates schema version tracking per database
 func TestSchemaVersionManager(t *testing.T) {
-	// Create system database for schema version tracking
-	systemDB, err := sql.Open("sqlite3", ":memory:")
+	// Create temp directory for BadgerDB
+	tmpDir, err := os.MkdirTemp("", "schema-version-test-*")
 	require.NoError(t, err)
-	defer systemDB.Close()
+	defer os.RemoveAll(tmpDir)
 
-	// Initialize schema version table
-	_, err = systemDB.Exec(db.CreateSchemaVersionTable)
+	// Create BadgerMetaStore
+	metaStore, err := db.NewBadgerMetaStore(tmpDir, db.DefaultBadgerOptions())
 	require.NoError(t, err)
+	defer metaStore.Close()
 
-	svm := db.NewSchemaVersionManager(systemDB)
+	svm := db.NewSchemaVersionManager(metaStore)
 
 	// Test: Initial version is 0
 	t.Run("Initial version is 0", func(t *testing.T) {
@@ -432,15 +434,17 @@ func TestDDLReplicationBasic(t *testing.T) {
 	// Setup test infrastructure
 	dbMgr := NewDDLMockDatabaseManager()
 
-	// Create system database for schema version tracking
-	systemDB, err := sql.Open("sqlite3", ":memory:")
+	// Create temp directory for BadgerDB
+	tmpDir, err := os.MkdirTemp("", "ddl-replication-test-*")
 	require.NoError(t, err)
-	defer systemDB.Close()
+	defer os.RemoveAll(tmpDir)
 
-	_, err = systemDB.Exec(db.CreateSchemaVersionTable)
+	// Create BadgerMetaStore
+	metaStore, err := db.NewBadgerMetaStore(tmpDir, db.DefaultBadgerOptions())
 	require.NoError(t, err)
+	defer metaStore.Close()
 
-	svm := db.NewSchemaVersionManager(systemDB)
+	svm := db.NewSchemaVersionManager(metaStore)
 	lockMgr := coordinator.NewDDLLockManager(5 * time.Second)
 
 	// Create test database
@@ -527,14 +531,17 @@ func TestDDLWithConcurrentDML(t *testing.T) {
 	// Setup test infrastructure
 	dbMgr := NewDDLMockDatabaseManager()
 
-	systemDB, err := sql.Open("sqlite3", ":memory:")
+	// Create temp directory for BadgerDB
+	tmpDir, err := os.MkdirTemp("", "ddl-concurrent-dml-test-*")
 	require.NoError(t, err)
-	defer systemDB.Close()
+	defer os.RemoveAll(tmpDir)
 
-	_, err = systemDB.Exec(db.CreateSchemaVersionTable)
+	// Create BadgerMetaStore
+	metaStore, err := db.NewBadgerMetaStore(tmpDir, db.DefaultBadgerOptions())
 	require.NoError(t, err)
+	defer metaStore.Close()
 
-	svm := db.NewSchemaVersionManager(systemDB)
+	svm := db.NewSchemaVersionManager(metaStore)
 	lockMgr := coordinator.NewDDLLockManager(5 * time.Second)
 
 	err = dbMgr.CreateDatabase("testdb")

@@ -54,6 +54,7 @@ type MetaStore interface {
 	// Schema/DDL
 	GetSchemaVersion(dbName string) (int64, error)
 	UpdateSchemaVersion(dbName string, version int64, ddlSQL string, txnID uint64) error
+	GetAllSchemaVersions() (map[string]int64, error)
 	TryAcquireDDLLock(dbName string, nodeID uint64, leaseDuration time.Duration) (bool, error)
 	ReleaseDDLLock(dbName string, nodeID uint64) error
 
