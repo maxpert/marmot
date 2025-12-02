@@ -72,6 +72,15 @@ bind_address = "0.0.0.0"
 port = 3309
 max_connections = 100
 
+# Low-memory BadgerDB settings for local development
+[metastore.badger]
+sync_writes = false
+num_compactors = 2
+value_log_gc = true
+block_cache_size_mb = 64   # Reduced from 256 (saves ~200MB)
+memtable_size_mb = 32      # Reduced from 64 (saves ~64MB)
+num_memtables = 2          # Reduced from 5 (saves ~192MB)
+
 [logging]
 verbose = true
 format = "console"

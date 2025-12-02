@@ -32,6 +32,9 @@ version_retention_count = 10
 # Time window for Last-Write-Wins conflict resolution (seconds)
 conflict_window_seconds = 10
 
+# Lock wait timeout (seconds) - matches MySQL innodb_lock_wait_timeout
+lock_wait_timeout_seconds = 50
+
 # ==============================================================================
 # CLUSTER MEMBERSHIP
 # ==============================================================================
@@ -52,6 +55,10 @@ grpc_port = 8080
 # Example: ["node1.example.com:8080", "node2.example.com:8080"]
 seed_nodes = []
 
+# PSK for cluster authentication (or set MARMOT_CLUSTER_SECRET env var)
+# Leave empty to disable authentication
+cluster_secret = ""
+
 # Gossip protocol interval (milliseconds)
 gossip_interval_ms = 1000
 
@@ -63,6 +70,17 @@ suspect_timeout_ms = 5000
 
 # Time before declaring suspect node as dead (milliseconds)
 dead_timeout_ms = 10000
+
+# Node promotion settings (JOINING -> ALIVE state transition)
+[cluster.promotion]
+check_interval_seconds = 2      # How often to check for promotion
+min_healthy_duration_sec = 3    # Must be healthy for this long before promotion
+require_all_databases = true    # All databases must exist before promotion
+
+# Backpressure settings for snapshot streaming
+[cluster.backpressure]
+max_queue_depth = 1000          # Max apply queue depth before pausing
+check_interval_ms = 100         # How often to check queue depth
 
 # ==============================================================================
 # REPLICATION
@@ -108,11 +126,42 @@ delta_sync_threshold_seconds = 3600
 
 # Minimum GC retention (hours)
 # Transaction logs kept for at least this long to support replication catch-up
-gc_min_retention_hours = 1
+# MUST be >= delta_sync_threshold_seconds in hours
+gc_min_retention_hours = 2
 
 # Maximum GC retention (hours)
 # Force GC after this duration even if peers lagging (prevents unbounded growth)
-gc_max_retention_hours = 4
+# Should be at least 2x delta_sync_threshold_seconds in hours (or 0 for unlimited)
+gc_max_retention_hours = 24
+
+# ==============================================================================
+# METADATA STORAGE (BadgerDB)
+# ==============================================================================
+
+[metastore.badger]
+# Sync writes to disk (true for durability, false for performance)
+sync_writes = false
+
+# Number of compaction workers
+num_compactors = 2
+
+# Enable value log garbage collection
+value_log_gc = true
+
+# Block cache size in MB (default: 256)
+# Caches SST table blocks in memory for faster reads
+# Reduce to 64 for low-memory environments (~200MB savings per node)
+block_cache_size_mb = 256
+
+# MemTable size in MB (default: 64)
+# In-memory buffer for writes before flushing to disk
+# Reduce to 32 for low-memory environments (~64MB savings per node)
+memtable_size_mb = 64
+
+# Number of memtables to keep (default: 5)
+# Higher values buffer more writes but use more memory (N * memtable_size)
+# Reduce to 2 for low-memory environments (~192MB savings per node)
+num_memtables = 5
 
 # ==============================================================================
 # CONNECTION POOL
@@ -159,6 +208,34 @@ commit_timeout_ms = 2000
 # Timeout for 2PC abort phase (milliseconds)
 abort_timeout_ms = 2000
 
+# TTL for MutationGuard intents (milliseconds)
+intent_ttl_ms = 30000
+
+# Max rows for MutationGuard hash list (~512KB at 64K rows)
+max_guard_rows = 65536
+
+# ==============================================================================
+# DDL REPLICATION
+# ==============================================================================
+
+[ddl]
+# DDL lock lease duration (seconds)
+lock_lease_seconds = 30
+
+# Automatically rewrite DDL for idempotency (IF NOT EXISTS, IF EXISTS)
+enable_idempotent = true
+
+# ==============================================================================
+# QUERY PIPELINE
+# ==============================================================================
+
+[query_pipeline]
+# LRU cache size for transpiled queries
+transpiler_cache_size = 10000
+
+# SQLite connection pool size for validation
+validator_pool_size = 8
+
 # ==============================================================================
 # MYSQL PROTOCOL SERVER
 # ==============================================================================
@@ -177,14 +254,14 @@ port = 3306
 max_connections = 1000
 
 # ==============================================================================
-# SNAPSHOT (Not yet implemented)
+# SNAPSHOT (Streaming recovery for new/lagging nodes)
 # ==============================================================================
 
 [snapshot]
-# Enable periodic snapshots
-enabled = false
+# Enable snapshot streaming
+enabled = true
 
-# Snapshot interval (seconds)
+# Snapshot interval (seconds) - for periodic snapshots
 interval_seconds = 300
 
 # Snapshot storage type: peer, s3, webdav, sftp, local
@@ -198,6 +275,32 @@ parallel_chunks = 5
 
 # Number of changes before triggering full snapshot
 incremental_threshold = 10000
+
+# ==============================================================================
+# READ-ONLY REPLICA MODE
+# ==============================================================================
+
+[replica]
+# Enable read-only replica mode (follows a single master)
+# When enabled, the node does NOT join the cluster - it only follows the master
+enabled = false
+
+# Master node gRPC address (required when enabled)
+# Example: "master.example.com:8080"
+master_address = ""
+
+# Initial reconnect interval (seconds)
+reconnect_interval_seconds = 5
+
+# Maximum reconnect backoff (seconds)
+reconnect_max_backoff_seconds = 30
+
+# Timeout for initial snapshot sync (minutes)
+initial_sync_timeout_minutes = 30
+
+# PSK for authenticating with master (or set MARMOT_REPLICA_SECRET env var)
+# Required when replica mode is enabled
+secret = ""
 
 # ==============================================================================
 # LOGGING
@@ -216,10 +319,5 @@ format = "console"
 
 [prometheus]
 # Enable Prometheus metrics endpoint
-enabled = false
-
-# Address to bind metrics server
-address = "0.0.0.0"
-
-# Prometheus metrics port
-port = 9090
+# Metrics are served on the gRPC port at /metrics (no separate port needed)
+enabled = true

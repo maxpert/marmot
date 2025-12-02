@@ -84,6 +84,9 @@ conflict_window_seconds = 10     # Window for LWW conflict resolution
 [logging]
 verbose = true
 format = "console"
+
+[prometheus]
+enabled = true
 EOF
 
 # Find or build marmot-v2 binary

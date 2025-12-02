@@ -65,12 +65,11 @@ suspect_timeout_ms = 5000
 dead_timeout_ms = 10000
 
 [replication]
-replication_factor = 1
-virtual_nodes = 150
 default_write_consistency = "LOCAL_ONE"
 default_read_consistency = "LOCAL_ONE"
 write_timeout_ms = 5000
 read_timeout_ms = 2000
+enable_anti_entropy = false
 
 [connection_pool]
 pool_size = 4
@@ -99,7 +98,7 @@ verbose = true
 format = "console"
 
 [prometheus]
-enabled = false
+enabled = true
 TOML
 
 echo "✓ Configuration created"
