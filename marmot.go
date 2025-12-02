@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"time"
 
 	"github.com/maxpert/marmot/cfg"
@@ -162,12 +161,6 @@ func main() {
 				// We store the decision for later use
 			}
 		}
-	}
-
-	// Migrate legacy single-database layout if present (marmot.db -> databases/marmot.db)
-	legacyDBPath := filepath.Join(cfg.Config.DataDir, "marmot.db")
-	if err := db.MigrateFromLegacy(legacyDBPath, cfg.Config.DataDir, cfg.Config.NodeID, clock); err != nil {
-		log.Warn().Err(err).Msg("Legacy database migration failed")
 	}
 
 	dbMgr, err := db.NewDatabaseManager(cfg.Config.DataDir, cfg.Config.NodeID, clock)

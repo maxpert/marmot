@@ -461,36 +461,6 @@ func (dm *DatabaseManager) ReopenDatabase(name string) error {
 	return nil
 }
 
-// MigrateFromLegacy migrates from single database to multi-database structure
-func MigrateFromLegacy(oldDBPath, newDataDir string, nodeID uint64, clock *hlc.Clock) error {
-	// Check if old database exists
-	if _, err := os.Stat(oldDBPath); os.IsNotExist(err) {
-		// No migration needed
-		return nil
-	}
-
-	log.Info().Str("from", oldDBPath).Str("to", newDataDir).Msg("Migrating from legacy database")
-
-	// Create new structure
-	dbDir := filepath.Join(newDataDir, "databases")
-	if err := os.MkdirAll(dbDir, 0755); err != nil {
-		return fmt.Errorf("failed to create databases directory: %w", err)
-	}
-
-	// Move old database to new location
-	newPath := filepath.Join(dbDir, DefaultDatabaseName+".db")
-	if err := os.Rename(oldDBPath, newPath); err != nil {
-		return fmt.Errorf("failed to move database: %w", err)
-	}
-
-	// Move WAL and SHM files if they exist
-	os.Rename(oldDBPath+"-wal", newPath+"-wal")
-	os.Rename(oldDBPath+"-shm", newPath+"-shm")
-
-	log.Info().Msg("Legacy database migration completed")
-	return nil
-}
-
 // ImportExistingDatabases scans a directory for existing SQLite .db files
 // and imports them into the database manager. This is used on first startup
 // of a seed node to make existing databases available.

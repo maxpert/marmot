@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -122,12 +121,6 @@ func Run() {
 
 	// Initialize HLC clock
 	replica.clock = hlc.NewClock(cfg.Config.NodeID)
-
-	// Migrate legacy single-database layout if present
-	legacyDBPath := filepath.Join(cfg.Config.DataDir, "marmot.db")
-	if err := db.MigrateFromLegacy(legacyDBPath, cfg.Config.DataDir, cfg.Config.NodeID, replica.clock); err != nil {
-		log.Warn().Err(err).Msg("Legacy database migration failed")
-	}
 
 	// Initialize database manager
 	log.Info().Msg("Initializing database manager")

@@ -368,68 +368,6 @@ func TestDatabaseIsolation(t *testing.T) {
 	}
 }
 
-func TestMigrateFromLegacy(t *testing.T) {
-	tmpDir := t.TempDir()
-	clock := hlc.NewClock(1)
-
-	// Create legacy database
-	legacyPath := filepath.Join(tmpDir, "old_marmot.db")
-	legacyDB, err := NewMVCCDatabase(legacyPath, 1, clock, nil)
-	if err != nil {
-		t.Fatalf("Failed to create legacy database: %v", err)
-	}
-
-	// Insert some data
-	_, err = legacyDB.GetDB().Exec("CREATE TABLE legacy_test (id INTEGER PRIMARY KEY)")
-	if err != nil {
-		t.Fatalf("Failed to create table in legacy database: %v", err)
-	}
-
-	_, err = legacyDB.GetDB().Exec("INSERT INTO legacy_test (id) VALUES (1)")
-	if err != nil {
-		t.Fatalf("Failed to insert data in legacy database: %v", err)
-	}
-
-	legacyDB.Close()
-
-	// Create new data directory
-	newDataDir := filepath.Join(tmpDir, "new_data")
-
-	// Migrate
-	err = MigrateFromLegacy(legacyPath, newDataDir, 1, clock)
-	if err != nil {
-		t.Fatalf("Migration failed: %v", err)
-	}
-
-	// Verify legacy file was moved
-	if _, err := os.Stat(legacyPath); !os.IsNotExist(err) {
-		t.Error("Legacy database file still exists after migration")
-	}
-
-	// Create DatabaseManager with new directory
-	dm, err := NewDatabaseManager(newDataDir, 1, clock)
-	if err != nil {
-		t.Fatalf("Failed to create DatabaseManager after migration: %v", err)
-	}
-	defer dm.Close()
-
-	// Verify default database has migrated data
-	db, err := dm.GetDatabase(DefaultDatabaseName)
-	if err != nil {
-		t.Fatalf("Failed to get default database: %v", err)
-	}
-
-	var count int
-	err = db.GetDB().QueryRow("SELECT COUNT(*) FROM legacy_test").Scan(&count)
-	if err != nil {
-		t.Fatalf("Failed to query migrated data: %v", err)
-	}
-
-	if count != 1 {
-		t.Errorf("Expected 1 row in migrated table, got %d", count)
-	}
-}
-
 // TestTakeSnapshotIncludesMetaStores verifies that TakeSnapshot includes all meta databases
 func TestTakeSnapshotIncludesMetaStores(t *testing.T) {
 	dm, _ := setupTestDatabaseManager(t)

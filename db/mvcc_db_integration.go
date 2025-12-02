@@ -159,12 +159,6 @@ func NewMVCCDatabase(dbPath string, nodeID uint64, clock *hlc.Clock, metaStore M
 		}
 	}
 
-	// Initialize MVCC schema (using write connection)
-	if err := initializeMVCCSchema(writeDB); err != nil {
-		closeAll()
-		return nil, fmt.Errorf("failed to initialize MVCC schema: %w", err)
-	}
-
 	// Create transaction manager (uses write connection + MetaStore)
 	txnMgr := NewMVCCTransactionManager(writeDB, metaStore, clock)
 
@@ -706,27 +700,6 @@ func (mdb *MVCCDatabase) ExecuteQueryRow(ctx context.Context, query string, args
 // Uses the write connection for data modifications
 func (mdb *MVCCDatabase) Exec(ctx context.Context, query string, args ...interface{}) (sql.Result, error) {
 	return mdb.writeDB.ExecContext(ctx, query, args...)
-}
-
-// initializeMVCCSchema creates all MVCC system tables
-func initializeMVCCSchema(db *sql.DB) error {
-	schemas := []string{
-		CreateTransactionRecordsTable,
-		CreateWriteIntentsTable,
-		CreateMVCCVersionsTable,
-		CreateMetadataTable,
-		CreateReplicationStateTable,
-		CreateSchemaVersionTable,
-		CreateDDLLockTable,
-	}
-
-	for _, schema := range schemas {
-		if _, err := db.Exec(schema); err != nil {
-			return fmt.Errorf("failed to create schema: %w", err)
-		}
-	}
-
-	return nil
 }
 
 // extractRowKeyFromStatement extracts row key from statement
