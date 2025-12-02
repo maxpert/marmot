@@ -30,14 +30,31 @@ func reportProgress(ctx context.Context, stats *Stats, workload string) {
 			// Calculate cumulative throughput
 			cumThroughput := float64(currentTotal) / elapsed.Seconds()
 
-			fmt.Printf("[%5.0fs] ops/sec: %6d | total: %8d | errors: %4d | retries: %4d | throughput: %.1f ops/sec\n",
-				elapsed.Seconds(),
-				opsSec,
-				currentTotal,
-				snapshot.Errors,
-				snapshot.Retries,
-				cumThroughput,
-			)
+			// Build output with optional tx stats
+			if snapshot.TxCount > 0 {
+				txSec := snapshot.TxCount - lastSnapshot.TxCount
+				cumTxThroughput := float64(snapshot.TxCount) / elapsed.Seconds()
+				fmt.Printf("[%5.0fs] ops/sec: %6d | tx/sec: %5d | total: %8d | tx: %6d | errors: %4d | retries: %4d | throughput: %.1f ops/sec | %.1f tx/sec\n",
+					elapsed.Seconds(),
+					opsSec,
+					txSec,
+					currentTotal,
+					snapshot.TxCount,
+					snapshot.Errors+snapshot.TxErrors,
+					snapshot.Retries+snapshot.TxRetries,
+					cumThroughput,
+					cumTxThroughput,
+				)
+			} else {
+				fmt.Printf("[%5.0fs] ops/sec: %6d | total: %8d | errors: %4d | retries: %4d | throughput: %.1f ops/sec\n",
+					elapsed.Seconds(),
+					opsSec,
+					currentTotal,
+					snapshot.Errors,
+					snapshot.Retries,
+					cumThroughput,
+				)
+			}
 
 			lastSnapshot = snapshot
 		}

@@ -55,6 +55,7 @@ Load Options:
   --table         Table name (default: benchmarks)
   --records       Number of records to load (default: 10000)
   --threads       Number of concurrent threads (default: 10)
+  --batch-size    Operations per transaction (default: 1 = no batching)
   --create-table  Create table before loading (default: true)
   --drop-existing Drop existing table before creating (default: false)
 
@@ -71,6 +72,7 @@ Run Options:
   --insert-pct    Insert percentage (overrides workload default)
   --delete-pct    Delete percentage (overrides workload default)
   --upsert-pct    Upsert percentage (overrides workload default)
+  --batch-size    Operations per transaction (default: 1 = no batching)
   --retry         Enable retry on conflict/deadlock (default: true)
   --max-retries   Maximum retry attempts (default: 3)
 
@@ -90,6 +92,7 @@ func runLoad(args []string) {
 	fs.StringVar(&cfg.Table, "table", "benchmarks", "Table name")
 	fs.IntVar(&cfg.Records, "records", 10000, "Number of records to load")
 	fs.IntVar(&cfg.Threads, "threads", 10, "Number of concurrent threads")
+	fs.IntVar(&cfg.BatchSize, "batch-size", 1, "Operations per transaction (1 = no batching)")
 	fs.BoolVar(&cfg.CreateTable, "create-table", true, "Create table before loading")
 	fs.BoolVar(&cfg.DropExisting, "drop-existing", false, "Drop existing table before creating")
 
@@ -145,6 +148,7 @@ func runBenchmark(args []string) {
 	fs.IntVar(&cfg.InsertPct, "insert-pct", -1, "Insert percentage (overrides workload)")
 	fs.IntVar(&cfg.DeletePct, "delete-pct", -1, "Delete percentage (overrides workload)")
 	fs.IntVar(&cfg.UpsertPct, "upsert-pct", -1, "Upsert percentage (overrides workload)")
+	fs.IntVar(&cfg.BatchSize, "batch-size", 1, "Operations per transaction (1 = no batching)")
 	fs.BoolVar(&cfg.Retry, "retry", true, "Enable retry on conflict/deadlock")
 	fs.IntVar(&cfg.MaxRetries, "max-retries", 3, "Maximum retry attempts")
 	fs.Float64Var(&cfg.InsertOverlap, "insert-overlap", 0, "% of inserts targeting existing keys (0-100, for conflict testing)")

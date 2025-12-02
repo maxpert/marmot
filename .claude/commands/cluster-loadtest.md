@@ -5,8 +5,9 @@ Run a full cluster load test cycle: start cluster, run load, verify replication.
 ## Parameters
 - **rows**: Number of records to load (default: 100000)
 - **workload**: Workload type - "insert" for INSERT-only, "mixed" for R/U/I/D (default: insert)
-- **threads**: Number of concurrent threads (default: 20)
+- **threads**: Number of concurrent threads (default: 16)
 - **timeout**: Time limit for the test (default: 60s)
+- **batch-size**: Operations per transaction (default: 1 = no batching)
 
 ## Instructions
 
@@ -38,6 +39,7 @@ Based on the **workload** parameter:
   --table benchmarks \
   --records $rows \
   --threads $threads \
+  --batch-size $batch-size \
   --time-limit $timeout \
   --create-table \
   --drop-existing
@@ -57,6 +59,7 @@ if [ "$count" -lt 1000 ]; then
     --table benchmarks \
     --records $rows \
     --threads $threads \
+    --batch-size $batch-size \
     --create-table \
     --drop-existing
 fi
@@ -67,6 +70,7 @@ fi
   --database marmot \
   --table benchmarks \
   --threads $threads \
+  --batch-size $batch-size \
   --time-limit $timeout \
   --workload mixed
 ```
@@ -83,6 +87,7 @@ done
 ### 5. Report Results
 Summarize:
 - Total throughput (ops/sec)
+- Transaction throughput (tx/sec) if batching enabled
 - Error/retry counts
 - Latency percentiles (P50, P90, P99)
 - Replication verification (all nodes have same row count)

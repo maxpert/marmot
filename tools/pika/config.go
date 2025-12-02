@@ -37,6 +37,9 @@ type Config struct {
 	// Key generation
 	InsertOverlap float64 // % of inserts that target existing keys (for conflict testing)
 
+	// Batching
+	BatchSize int // Number of operations per transaction (1 = no batching)
+
 	// Derived
 	hostList []string
 }
@@ -76,6 +79,10 @@ func (c *Config) Validate() error {
 
 	if c.MaxRetries < 0 {
 		return fmt.Errorf("max-retries must be non-negative")
+	}
+
+	if c.BatchSize < 1 {
+		c.BatchSize = 1
 	}
 
 	// Validate workload type

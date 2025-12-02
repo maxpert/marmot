@@ -18,11 +18,12 @@ type Worker struct {
 	stats      *Stats
 	retry      bool
 	maxRetries int
+	batchSize  int
 	rng        *rand.Rand
 }
 
 // NewWorker creates a new worker.
-func NewWorker(id int, pool *Pool, table string, keyGen *KeyGenerator, opSelector *OpSelector, stats *Stats, retry bool, maxRetries int) *Worker {
+func NewWorker(id int, pool *Pool, table string, keyGen *KeyGenerator, opSelector *OpSelector, stats *Stats, retry bool, maxRetries int, batchSize int) *Worker {
 	return &Worker{
 		id:         id,
 		pool:       pool,
@@ -32,6 +33,7 @@ func NewWorker(id int, pool *Pool, table string, keyGen *KeyGenerator, opSelecto
 		stats:      stats,
 		retry:      retry,
 		maxRetries: maxRetries,
+		batchSize:  batchSize,
 		rng:        rand.New(rand.NewSource(time.Now().UnixNano() + int64(id))),
 	}
 }
@@ -40,25 +42,57 @@ func NewWorker(id int, pool *Pool, table string, keyGen *KeyGenerator, opSelecto
 func (w *Worker) RunLoad(ctx context.Context, startKey, endKey int, wg *sync.WaitGroup) {
 	defer wg.Done()
 
+	if w.batchSize <= 1 {
+		// No batching - execute inserts one by one
+		for i := startKey; i < endKey; i++ {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
+			key := fmt.Sprintf("rec_%012d", i)
+			value := generateFieldValue(w.rng)
+
+			start := time.Now()
+			err := w.executeWithRetry(ctx, Operation{Type: OpInsert, Key: key, Value: value})
+			latency := time.Since(start)
+
+			if err != nil {
+				w.stats.RecordError(OpInsert)
+			} else {
+				w.stats.RecordOp(OpInsert, latency)
+			}
+		}
+		return
+	}
+
+	// Batch mode - collect inserts and execute as transactions
+	batch := make([]Operation, 0, w.batchSize)
 	for i := startKey; i < endKey; i++ {
 		select {
 		case <-ctx.Done():
+			// Execute remaining batch before exit
+			if len(batch) > 0 {
+				w.executeBatchWithRetry(ctx, batch)
+			}
 			return
 		default:
 		}
 
 		key := fmt.Sprintf("rec_%012d", i)
 		value := generateFieldValue(w.rng)
+		batch = append(batch, Operation{Type: OpInsert, Key: key, Value: value})
 
-		start := time.Now()
-		err := w.executeWithRetry(ctx, Operation{Type: OpInsert, Key: key, Value: value})
-		latency := time.Since(start)
-
-		if err != nil {
-			w.stats.RecordError(OpInsert)
-		} else {
-			w.stats.RecordOp(OpInsert, latency)
+		if len(batch) >= w.batchSize {
+			w.executeBatchWithRetry(ctx, batch)
+			batch = batch[:0]
 		}
+	}
+
+	// Execute remaining batch
+	if len(batch) > 0 {
+		w.executeBatchWithRetry(ctx, batch)
 	}
 }
 
@@ -66,29 +100,62 @@ func (w *Worker) RunLoad(ctx context.Context, startKey, endKey int, wg *sync.Wai
 func (w *Worker) RunBenchmark(ctx context.Context, opsChan <-chan struct{}, wg *sync.WaitGroup) {
 	defer wg.Done()
 
+	if w.batchSize <= 1 {
+		// No batching - execute operations one by one
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case _, ok := <-opsChan:
+				if !ok {
+					return
+				}
+
+				opType := w.opSelector.Select()
+				op := w.generateOp(opType)
+
+				start := time.Now()
+				err := w.executeWithRetry(ctx, op)
+				latency := time.Since(start)
+
+				if err != nil {
+					w.stats.RecordError(opType)
+				} else {
+					w.stats.RecordOp(opType, latency)
+					if opType == OpInsert {
+						w.keyGen.UpdateMaxKey(1)
+					}
+				}
+			}
+		}
+	}
+
+	// Batch mode - collect operations and execute as transactions
+	batch := make([]Operation, 0, w.batchSize)
 	for {
 		select {
 		case <-ctx.Done():
+			// Execute remaining batch before exit
+			if len(batch) > 0 {
+				w.executeBatchWithRetry(ctx, batch)
+			}
 			return
 		case _, ok := <-opsChan:
 			if !ok {
+				// Channel closed, execute remaining batch
+				if len(batch) > 0 {
+					w.executeBatchWithRetry(ctx, batch)
+				}
 				return
 			}
 
 			opType := w.opSelector.Select()
 			op := w.generateOp(opType)
+			batch = append(batch, op)
 
-			start := time.Now()
-			err := w.executeWithRetry(ctx, op)
-			latency := time.Since(start)
-
-			if err != nil {
-				w.stats.RecordError(opType)
-			} else {
-				w.stats.RecordOp(opType, latency)
-				if opType == OpInsert {
-					w.keyGen.UpdateMaxKey(1)
-				}
+			if len(batch) >= w.batchSize {
+				w.executeBatchWithRetry(ctx, batch)
+				batch = batch[:0]
 			}
 		}
 	}
@@ -141,6 +208,79 @@ func (w *Worker) executeWithRetry(ctx context.Context, op Operation) error {
 	return lastErr
 }
 
+// executeBatchWithRetry executes a batch of operations as a transaction with retry.
+func (w *Worker) executeBatchWithRetry(ctx context.Context, batch []Operation) {
+	var lastErr error
+	maxAttempts := 1
+	if w.retry {
+		maxAttempts = w.maxRetries + 1
+	}
+
+	start := time.Now()
+	insertCount := 0
+	for _, op := range batch {
+		if op.Type == OpInsert {
+			insertCount++
+		}
+	}
+
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			// Exponential backoff with jitter
+			backoff := time.Duration(1<<uint(attempt-1)) * 10 * time.Millisecond
+			jitter := time.Duration(w.rng.Int63n(int64(backoff / 2)))
+			time.Sleep(backoff + jitter)
+			w.stats.RecordTxRetry()
+		}
+
+		err := w.executeBatch(ctx, batch)
+		if err == nil {
+			latency := time.Since(start)
+			// Record success for each operation in the batch
+			for _, op := range batch {
+				w.stats.RecordOp(op.Type, latency/time.Duration(len(batch)))
+			}
+			w.stats.RecordTx(latency)
+			// Update max key for inserts
+			if insertCount > 0 {
+				w.keyGen.UpdateMaxKey(int64(insertCount))
+			}
+			return
+		}
+
+		lastErr = err
+
+		if !IsRetryableError(err) {
+			break
+		}
+	}
+
+	// Record errors for each operation in the failed batch
+	for _, op := range batch {
+		w.stats.RecordError(op.Type)
+	}
+	w.stats.RecordTxError()
+	_ = lastErr // Error logged via stats
+}
+
+// executeBatch executes a batch of operations within a transaction.
+func (w *Worker) executeBatch(ctx context.Context, batch []Operation) error {
+	db := w.pool.Get()
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+
+	for _, op := range batch {
+		if err := ExecuteOp(ctx, tx, w.table, op); err != nil {
+			tx.Rollback()
+			return err
+		}
+	}
+
+	return tx.Commit()
+}
+
 // executeLoad runs the load phase.
 func executeLoad(ctx context.Context, cfg *Config) error {
 	fmt.Println("╔══════════════════════════════════════════════════════╗")
@@ -153,6 +293,7 @@ func executeLoad(ctx context.Context, cfg *Config) error {
 	fmt.Printf("Table:       %s\n", cfg.Table)
 	fmt.Printf("Records:     %d\n", cfg.Records)
 	fmt.Printf("Threads:     %d\n", cfg.Threads)
+	fmt.Printf("BatchSize:   %d\n", cfg.BatchSize)
 	fmt.Printf("CreateTable: %v\n", cfg.CreateTable)
 	fmt.Printf("DropExisting: %v\n", cfg.DropExisting)
 	fmt.Println()
@@ -210,7 +351,7 @@ func executeLoad(ctx context.Context, cfg *Config) error {
 		}
 
 		opSelector := NewOpSelector(WorkloadDistribution{Insert: 100}, time.Now().UnixNano()+int64(i))
-		worker := NewWorker(i, pool, cfg.Table, keyGen, opSelector, stats, true, 3)
+		worker := NewWorker(i, pool, cfg.Table, keyGen, opSelector, stats, true, 3, cfg.BatchSize)
 		go worker.RunLoad(ctx, startKey, endKey, &wg)
 	}
 
@@ -250,6 +391,7 @@ func executeRun(ctx context.Context, cfg *Config) error {
 		fmt.Printf("Duration:    %s\n", cfg.Duration)
 	}
 	fmt.Printf("Threads:     %d\n", cfg.Threads)
+	fmt.Printf("BatchSize:   %d\n", cfg.BatchSize)
 	fmt.Printf("Retry:       %v (max: %d)\n", cfg.Retry, cfg.MaxRetries)
 	fmt.Println()
 
@@ -281,7 +423,7 @@ func executeRun(ctx context.Context, cfg *Config) error {
 	for i := 0; i < cfg.Threads; i++ {
 		wg.Add(1)
 		opSelector := NewOpSelector(dist, time.Now().UnixNano()+int64(i))
-		worker := NewWorker(i, pool, cfg.Table, keyGen, opSelector, stats, cfg.Retry, cfg.MaxRetries)
+		worker := NewWorker(i, pool, cfg.Table, keyGen, opSelector, stats, cfg.Retry, cfg.MaxRetries, cfg.BatchSize)
 		go worker.RunBenchmark(ctx, opsChan, &wg)
 	}
 

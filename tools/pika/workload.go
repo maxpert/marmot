@@ -93,6 +93,13 @@ type Operation struct {
 	Value string
 }
 
+// Executor is the interface for executing SQL statements.
+// Both *sql.DB and *sql.Tx implement this interface.
+type Executor interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
 // OpSelector selects operations based on workload distribution.
 type OpSelector struct {
 	dist       WorkloadDistribution
@@ -147,26 +154,26 @@ func generateFieldValue(rng *rand.Rand) string {
 	return string(b)
 }
 
-// ExecuteOp executes a single operation.
-func ExecuteOp(ctx context.Context, db *sql.DB, table string, op Operation) error {
+// ExecuteOp executes a single operation using the given executor.
+func ExecuteOp(ctx context.Context, exec Executor, table string, op Operation) error {
 	switch op.Type {
 	case OpRead:
-		return executeRead(ctx, db, table, op.Key)
+		return executeRead(ctx, exec, table, op.Key)
 	case OpUpdate:
-		return executeUpdate(ctx, db, table, op.Key, op.Value)
+		return executeUpdate(ctx, exec, table, op.Key, op.Value)
 	case OpInsert:
-		return executeInsert(ctx, db, table, op.Key, op.Value)
+		return executeInsert(ctx, exec, table, op.Key, op.Value)
 	case OpDelete:
-		return executeDelete(ctx, db, table, op.Key)
+		return executeDelete(ctx, exec, table, op.Key)
 	case OpUpsert:
-		return executeUpsert(ctx, db, table, op.Key, op.Value)
+		return executeUpsert(ctx, exec, table, op.Key, op.Value)
 	default:
 		return fmt.Errorf("unknown operation type: %v", op.Type)
 	}
 }
 
-func executeRead(ctx context.Context, db *sql.DB, table, key string) error {
-	row := db.QueryRowContext(ctx,
+func executeRead(ctx context.Context, exec Executor, table, key string) error {
+	row := exec.QueryRowContext(ctx,
 		fmt.Sprintf("SELECT field0, field1, field2, field3, field4, field5, field6, field7, field8, field9 FROM %s WHERE id = ?", table),
 		key)
 
@@ -179,30 +186,30 @@ func executeRead(ctx context.Context, db *sql.DB, table, key string) error {
 	return err
 }
 
-func executeUpdate(ctx context.Context, db *sql.DB, table, key, value string) error {
-	_, err := db.ExecContext(ctx,
+func executeUpdate(ctx context.Context, exec Executor, table, key, value string) error {
+	_, err := exec.ExecContext(ctx,
 		fmt.Sprintf("UPDATE %s SET field0 = ? WHERE id = ?", table),
 		value, key)
 	return err
 }
 
-func executeInsert(ctx context.Context, db *sql.DB, table, key, value string) error {
-	_, err := db.ExecContext(ctx,
+func executeInsert(ctx context.Context, exec Executor, table, key, value string) error {
+	_, err := exec.ExecContext(ctx,
 		fmt.Sprintf("INSERT INTO %s (id, field0, field1, field2, field3, field4, field5, field6, field7, field8, field9) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", table),
 		key, value, value, value, value, value, value, value, value, value, value)
 	return err
 }
 
-func executeDelete(ctx context.Context, db *sql.DB, table, key string) error {
-	_, err := db.ExecContext(ctx,
+func executeDelete(ctx context.Context, exec Executor, table, key string) error {
+	_, err := exec.ExecContext(ctx,
 		fmt.Sprintf("DELETE FROM %s WHERE id = ?", table),
 		key)
 	return err
 }
 
-func executeUpsert(ctx context.Context, db *sql.DB, table, key, value string) error {
+func executeUpsert(ctx context.Context, exec Executor, table, key, value string) error {
 	// Use INSERT OR REPLACE for SQLite compatibility
-	_, err := db.ExecContext(ctx,
+	_, err := exec.ExecContext(ctx,
 		fmt.Sprintf("INSERT OR REPLACE INTO %s (id, field0, field1, field2, field3, field4, field5, field6, field7, field8, field9) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", table),
 		key, value, value, value, value, value, value, value, value, value, value)
 	return err

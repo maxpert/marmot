@@ -27,6 +27,11 @@ type Stats struct {
 	// Retry counter
 	retries uint64
 
+	// Transaction counters (for batch mode)
+	txCount   uint64
+	txErrors  uint64
+	txRetries uint64
+
 	// Latency tracking (microseconds)
 	mu        sync.Mutex
 	latencies []int64
@@ -79,6 +84,39 @@ func (s *Stats) RecordError(opType OpType) {
 // RecordRetry records a retry attempt.
 func (s *Stats) RecordRetry() {
 	atomic.AddUint64(&s.retries, 1)
+}
+
+// RecordTx records a successful transaction.
+func (s *Stats) RecordTx(latency time.Duration) {
+	atomic.AddUint64(&s.txCount, 1)
+	s.mu.Lock()
+	s.latencies = append(s.latencies, latency.Microseconds())
+	s.mu.Unlock()
+}
+
+// RecordTxError records a failed transaction.
+func (s *Stats) RecordTxError() {
+	atomic.AddUint64(&s.txErrors, 1)
+}
+
+// RecordTxRetry records a transaction retry attempt.
+func (s *Stats) RecordTxRetry() {
+	atomic.AddUint64(&s.txRetries, 1)
+}
+
+// TotalTx returns total transactions.
+func (s *Stats) TotalTx() uint64 {
+	return atomic.LoadUint64(&s.txCount)
+}
+
+// TotalTxErrors returns total transaction errors.
+func (s *Stats) TotalTxErrors() uint64 {
+	return atomic.LoadUint64(&s.txErrors)
+}
+
+// TxRetries returns transaction retry count.
+func (s *Stats) TxRetries() uint64 {
+	return atomic.LoadUint64(&s.txRetries)
 }
 
 // TotalOps returns total successful operations.
@@ -162,6 +200,9 @@ type Snapshot struct {
 	UpsertOps uint64
 	Errors    uint64
 	Retries   uint64
+	TxCount   uint64
+	TxErrors  uint64
+	TxRetries uint64
 }
 
 // GetSnapshot returns current stats snapshot.
@@ -174,6 +215,9 @@ func (s *Stats) GetSnapshot() Snapshot {
 		UpsertOps: atomic.LoadUint64(&s.upsertOps),
 		Errors:    s.TotalErrors(),
 		Retries:   atomic.LoadUint64(&s.retries),
+		TxCount:   atomic.LoadUint64(&s.txCount),
+		TxErrors:  atomic.LoadUint64(&s.txErrors),
+		TxRetries: atomic.LoadUint64(&s.txRetries),
 	}
 }
 
@@ -182,12 +226,19 @@ func (s *Stats) PrintFinal(elapsed time.Duration) {
 	totalOps := s.TotalOps()
 	totalErrors := s.TotalErrors()
 	retries := s.Retries()
+	totalTx := s.TotalTx()
+	txErrors := s.TotalTxErrors()
+	txRetries := s.TxRetries()
 
 	throughput := float64(totalOps) / elapsed.Seconds()
 
 	fmt.Println()
 	fmt.Printf("Total time:    %.2fs\n", elapsed.Seconds())
 	fmt.Printf("Throughput:    %.2f ops/sec\n", throughput)
+	if totalTx > 0 {
+		txThroughput := float64(totalTx) / elapsed.Seconds()
+		fmt.Printf("TX Throughput: %.2f tx/sec\n", txThroughput)
+	}
 	fmt.Println()
 
 	fmt.Println("Operations:")
@@ -198,6 +249,14 @@ func (s *Stats) PrintFinal(elapsed time.Duration) {
 	fmt.Printf("  UPSERT: %d\n", atomic.LoadUint64(&s.upsertOps))
 	fmt.Printf("  TOTAL:  %d\n", totalOps)
 	fmt.Println()
+
+	if totalTx > 0 {
+		fmt.Println("Transactions:")
+		fmt.Printf("  Total:   %d\n", totalTx)
+		fmt.Printf("  Errors:  %d\n", txErrors)
+		fmt.Printf("  Retries: %d\n", txRetries)
+		fmt.Println()
+	}
 
 	if totalErrors > 0 || retries > 0 {
 		fmt.Println("Errors/Retries:")
