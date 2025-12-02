@@ -350,11 +350,11 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 		if stmt.HasCDCData() {
 			rowChange := stmt.GetRowChange()
 
-			// Serialize OldValues and NewValues as msgpack
+			// Serialize OldValues and NewValues as msgpack using pooled encoder
 			var oldVals, newVals []byte
 			if len(rowChange.OldValues) > 0 {
 				var err error
-				oldVals, err = msgpack.Marshal(rowChange.OldValues)
+				oldVals, err = protocol.MarshalMsgpack(rowChange.OldValues)
 				if err != nil {
 					log.Error().Err(err).Str("table", stmt.TableName).Msg("Failed to marshal OldValues")
 					txnMgr.AbortTransaction(txn)
@@ -366,7 +366,7 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 			}
 			if len(rowChange.NewValues) > 0 {
 				var err error
-				newVals, err = msgpack.Marshal(rowChange.NewValues)
+				newVals, err = protocol.MarshalMsgpack(rowChange.NewValues)
 				if err != nil {
 					log.Error().Err(err).Str("table", stmt.TableName).Msg("Failed to marshal NewValues")
 					txnMgr.AbortTransaction(txn)
@@ -887,7 +887,7 @@ func (rh *ReplicationHandler) serializeReplayStatements(stmts []*Statement, dbNa
 		protoStmts = append(protoStmts, protoStmt)
 	}
 
-	data, err := msgpack.Marshal(protoStmts)
+	data, err := protocol.MarshalMsgpack(protoStmts)
 	if err != nil {
 		log.Error().Err(err).Int("statement_count", len(protoStmts)).Msg("serializeReplayStatements: failed to marshal - anti-entropy may not work for this transaction")
 		return nil

@@ -8,7 +8,6 @@ import (
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/protocol"
 	"github.com/rs/zerolog/log"
-	"github.com/vmihailenco/msgpack/v5"
 )
 
 // LocalReplicator implements coordinator.Replicator for local application
@@ -225,11 +224,11 @@ func (lr *LocalReplicator) handlePrepare(ctx context.Context, req *coordinator.R
 		// CRITICAL: Write CDC intent entry so CommitTransaction can replay it
 		// This stores the actual row data (NewValues/OldValues) for later application to SQLite
 		if len(stmt.NewValues) > 0 || len(stmt.OldValues) > 0 {
-			// Serialize OldValues and NewValues as msgpack
+			// Serialize OldValues and NewValues as msgpack using pooled encoder
 			var oldVals, newVals []byte
 			if len(stmt.OldValues) > 0 {
 				var err error
-				oldVals, err = msgpack.Marshal(stmt.OldValues)
+				oldVals, err = MarshalMsgpack(stmt.OldValues)
 				if err != nil {
 					log.Error().Err(err).Str("table", stmt.TableName).Msg("Failed to marshal OldValues")
 					txnMgr.AbortTransaction(txn)
@@ -241,7 +240,7 @@ func (lr *LocalReplicator) handlePrepare(ctx context.Context, req *coordinator.R
 			}
 			if len(stmt.NewValues) > 0 {
 				var err error
-				newVals, err = msgpack.Marshal(stmt.NewValues)
+				newVals, err = MarshalMsgpack(stmt.NewValues)
 				if err != nil {
 					log.Error().Err(err).Str("table", stmt.TableName).Msg("Failed to marshal NewValues")
 					txnMgr.AbortTransaction(txn)

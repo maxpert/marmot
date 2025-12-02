@@ -482,3 +482,201 @@ func BenchmarkMetaStoreBeginCommit(b *testing.B) {
 		store.CommitTransaction(txnID, commitTS, nil, "testdb")
 	}
 }
+
+func TestExtractMVCCRowPrefix(t *testing.T) {
+	prefixLen := len("/mvcc/")
+
+	tests := []struct {
+		key      string
+		expected string
+	}{
+		{"/mvcc/users/user:1/0000000000000001000000010000000000000001", "/mvcc/users/user:1/"},
+		{"/mvcc/orders/order:123/0000000000000002000000020000000000000002", "/mvcc/orders/order:123/"},
+		{"/mvcc/t/r/ts", "/mvcc/t/r/"},
+		{"/mvcc/table-with-dash/row-key/ts", "/mvcc/table-with-dash/row-key/"},
+		{"/mvcc/bad", ""},           // Missing rowKey and timestamp
+		{"/mvcc/table/", ""},        // Missing rowKey
+		{"/mvcc/table/row", ""},     // Missing timestamp
+	}
+
+	for _, tc := range tests {
+		result := extractMVCCRowPrefix(tc.key, prefixLen)
+		if result != tc.expected {
+			t.Errorf("extractMVCCRowPrefix(%q) = %q, expected %q", tc.key, result, tc.expected)
+		}
+	}
+}
+
+func TestCleanupOldMVCCVersions_Basic(t *testing.T) {
+	store, cleanup := createTestMetaStore(t)
+	defer cleanup()
+
+	clock := hlc.NewClock(1)
+
+	// Create 5 versions for row1
+	for i := 0; i < 5; i++ {
+		ts := clock.Now()
+		err := store.CreateMVCCVersion("users", "user:1", ts, 1, uint64(100+i), "UPDATE", []byte(`{"v":`+string(rune('0'+i))+`}`))
+		if err != nil {
+			t.Fatalf("CreateMVCCVersion failed: %v", err)
+		}
+	}
+
+	// Create 3 versions for row2
+	for i := 0; i < 3; i++ {
+		ts := clock.Now()
+		err := store.CreateMVCCVersion("users", "user:2", ts, 1, uint64(200+i), "UPDATE", nil)
+		if err != nil {
+			t.Fatalf("CreateMVCCVersion failed: %v", err)
+		}
+	}
+
+	// Keep 2 versions - should delete 3 from row1, 1 from row2
+	deleted, err := store.CleanupOldMVCCVersions(2)
+	if err != nil {
+		t.Fatalf("CleanupOldMVCCVersions failed: %v", err)
+	}
+	if deleted != 4 {
+		t.Errorf("Expected 4 deleted, got %d", deleted)
+	}
+
+	// Verify row1 has 2 versions (latest two)
+	ver, err := store.GetLatestVersion("users", "user:1")
+	if err != nil {
+		t.Fatalf("GetLatestVersion failed: %v", err)
+	}
+	if ver == nil {
+		t.Fatal("Latest version should exist")
+	}
+	if ver.TxnID != 104 {
+		t.Errorf("Expected latest version txnID 104, got %d", ver.TxnID)
+	}
+}
+
+func TestCleanupOldMVCCVersions_KeepsNewest(t *testing.T) {
+	store, cleanup := createTestMetaStore(t)
+	defer cleanup()
+
+	clock := hlc.NewClock(1)
+
+	// Create 10 versions - timestamps increase
+	for i := 0; i < 10; i++ {
+		ts := clock.Now()
+		err := store.CreateMVCCVersion("test", "row:1", ts, 1, uint64(i+1), "UPDATE", nil)
+		if err != nil {
+			t.Fatalf("CreateMVCCVersion failed: %v", err)
+		}
+	}
+
+	// Keep 3 versions
+	deleted, err := store.CleanupOldMVCCVersions(3)
+	if err != nil {
+		t.Fatalf("CleanupOldMVCCVersions failed: %v", err)
+	}
+	if deleted != 7 {
+		t.Errorf("Expected 7 deleted, got %d", deleted)
+	}
+
+	// Latest version should be txnID 10 (newest)
+	ver, err := store.GetLatestVersion("test", "row:1")
+	if err != nil {
+		t.Fatalf("GetLatestVersion failed: %v", err)
+	}
+	if ver.TxnID != 10 {
+		t.Errorf("Expected txnID 10, got %d", ver.TxnID)
+	}
+}
+
+func TestCleanupOldMVCCVersions_NoDelete(t *testing.T) {
+	store, cleanup := createTestMetaStore(t)
+	defer cleanup()
+
+	clock := hlc.NewClock(1)
+
+	// Create 2 versions
+	for i := 0; i < 2; i++ {
+		ts := clock.Now()
+		store.CreateMVCCVersion("test", "row:1", ts, 1, uint64(i+1), "UPDATE", nil)
+	}
+
+	// Keep 5 versions - nothing should be deleted
+	deleted, err := store.CleanupOldMVCCVersions(5)
+	if err != nil {
+		t.Fatalf("CleanupOldMVCCVersions failed: %v", err)
+	}
+	if deleted != 0 {
+		t.Errorf("Expected 0 deleted, got %d", deleted)
+	}
+}
+
+func TestCleanupOldMVCCVersions_MultipleRows(t *testing.T) {
+	store, cleanup := createTestMetaStore(t)
+	defer cleanup()
+
+	clock := hlc.NewClock(1)
+
+	// Create versions for multiple tables and rows
+	tables := []string{"users", "orders", "items"}
+	rows := []string{"row:1", "row:2", "row:3"}
+
+	for _, table := range tables {
+		for _, row := range rows {
+			for i := 0; i < 5; i++ {
+				ts := clock.Now()
+				store.CreateMVCCVersion(table, row, ts, 1, uint64(i+1), "UPDATE", nil)
+			}
+		}
+	}
+
+	// Keep 2 versions per row - should delete 3 * 3 * 3 = 27 versions
+	deleted, err := store.CleanupOldMVCCVersions(2)
+	if err != nil {
+		t.Fatalf("CleanupOldMVCCVersions failed: %v", err)
+	}
+	// 9 rows * (5 - 2) = 27 deleted
+	if deleted != 27 {
+		t.Errorf("Expected 27 deleted, got %d", deleted)
+	}
+}
+
+func TestCleanupOldMVCCVersions_Empty(t *testing.T) {
+	store, cleanup := createTestMetaStore(t)
+	defer cleanup()
+
+	// No versions - should return 0
+	deleted, err := store.CleanupOldMVCCVersions(2)
+	if err != nil {
+		t.Fatalf("CleanupOldMVCCVersions failed: %v", err)
+	}
+	if deleted != 0 {
+		t.Errorf("Expected 0 deleted, got %d", deleted)
+	}
+}
+
+func BenchmarkCleanupOldMVCCVersions(b *testing.B) {
+	tmpDir, _ := os.MkdirTemp("", "metastore_bench")
+	defer os.RemoveAll(tmpDir)
+
+	metaPath := filepath.Join(tmpDir, "bench_meta.badger")
+	store, _ := NewBadgerMetaStore(metaPath, BadgerMetaStoreOptions{
+		SyncWrites:    false,
+		NumCompactors: 2,
+		ValueLogGC:    false,
+	})
+	defer store.Close()
+
+	clock := hlc.NewClock(1)
+
+	// Create 1000 rows with 10 versions each
+	for row := 0; row < 1000; row++ {
+		for ver := 0; ver < 10; ver++ {
+			ts := clock.Now()
+			store.CreateMVCCVersion("bench", "row:"+string(rune(row)), ts, 1, uint64(ver+1), "UPDATE", nil)
+		}
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		store.CleanupOldMVCCVersions(5)
+	}
+}

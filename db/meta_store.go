@@ -160,17 +160,29 @@ func NewMetaStore(basePath string) (MetaStore, error) {
 		metaPath = filepath.Join(config.DataDir, metaPath)
 	}
 
-	// Get options from config or use defaults
+	// Get options from config or use sidecar-optimized defaults
 	opts := BadgerMetaStoreOptions{
-		SyncWrites:    false, // Async writes for performance (group commit handles durability)
-		NumCompactors: 2,
-		ValueLogGC:    true,
+		SyncWrites:     false, // Async writes for performance (group commit handles durability)
+		NumCompactors:  2,
+		ValueLogGC:     true,
+		BlockCacheMB:   64, // 64MB (saves ~192MB vs BadgerDB default 256MB)
+		MemTableSizeMB: 32, // 32MB (saves ~32MB vs BadgerDB default 64MB)
+		NumMemTables:   2,  // 2 (saves ~192MB vs BadgerDB default 5)
 	}
 
 	if config != nil {
 		opts.SyncWrites = config.MetaStore.Badger.SyncWrites
 		opts.NumCompactors = config.MetaStore.Badger.NumCompactors
 		opts.ValueLogGC = config.MetaStore.Badger.ValueLogGC
+		if config.MetaStore.Badger.BlockCacheMB > 0 {
+			opts.BlockCacheMB = config.MetaStore.Badger.BlockCacheMB
+		}
+		if config.MetaStore.Badger.MemTableSizeMB > 0 {
+			opts.MemTableSizeMB = config.MetaStore.Badger.MemTableSizeMB
+		}
+		if config.MetaStore.Badger.NumMemTables > 0 {
+			opts.NumMemTables = config.MetaStore.Badger.NumMemTables
+		}
 	}
 
 	return NewBadgerMetaStore(metaPath, opts)
