@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cespare/xxhash/v2"
 	"github.com/cockroachdb/pebble"
 	"github.com/maxpert/marmot/cfg"
 	"github.com/maxpert/marmot/hlc"
@@ -39,6 +40,9 @@ const (
 	pebbleBatchChannelSize = 1000                 // Channel buffer size
 )
 
+// Sharded lock for WriteIntent serialization (prevents TOCTOU race)
+const intentLockShards = 256
+
 // pebbleBatchOp represents a batched write operation
 type pebbleBatchOp struct {
 	fn     func(batch *pebble.Batch) error
@@ -65,10 +69,19 @@ type PebbleMetaStore struct {
 
 	// Persistent counters for O(1) lookups
 	counters *PebbleCounter
+
+	// Sharded locks for WriteIntent serialization (prevents TOCTOU race)
+	intentLocks [intentLockShards]sync.Mutex
 }
 
 // Ensure PebbleMetaStore implements MetaStore
 var _ MetaStore = (*PebbleMetaStore)(nil)
+
+// intentLockFor returns the sharded mutex for a given table+rowKey
+func (s *PebbleMetaStore) intentLockFor(tableName, rowKey string) *sync.Mutex {
+	key := tableName + ":" + rowKey
+	return &s.intentLocks[xxhash.Sum64String(key)%intentLockShards]
+}
 
 // PebbleMetaStoreOptions configures Pebble
 type PebbleMetaStoreOptions struct {
@@ -709,6 +722,11 @@ func (s *PebbleMetaStore) Heartbeat(txnID uint64) error {
 
 // WriteIntent creates a write intent (distributed lock)
 func (s *PebbleMetaStore) WriteIntent(txnID uint64, tableName, rowKey, op, sqlStmt string, data []byte, ts hlc.Timestamp, nodeID uint64) error {
+	// Acquire sharded lock to serialize concurrent writes to same row (prevents TOCTOU race)
+	mu := s.intentLockFor(tableName, rowKey)
+	mu.Lock()
+	defer mu.Unlock()
+
 	key := pebbleIntentKey(tableName, rowKey)
 
 	batch := s.db.NewBatch()

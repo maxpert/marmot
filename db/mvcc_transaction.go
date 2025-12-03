@@ -416,10 +416,13 @@ func (tm *MVCCTransactionManager) applyCDCEntries(txnID uint64, entries []*Inten
 }
 
 // applyDDLIntents executes DDL statements from write intents.
+// Only processes intents written to TableDDLOps (__marmot__ddl_ops).
+// DML intents are handled via CDC entries in applyCDCEntries.
 func (tm *MVCCTransactionManager) applyDDLIntents(txnID uint64, intents []*WriteIntentRecord) error {
 	for _, intent := range intents {
-		// Skip database operations and intents without SQL
-		if intent.TableName == TableDatabaseOperations || intent.SQLStatement == "" {
+		// Only process DDL intents (stored in __marmot__ddl_ops table)
+		// Skip database operations, regular DML intents, and intents without SQL
+		if intent.TableName != TableDDLOps || intent.SQLStatement == "" {
 			continue
 		}
 
@@ -427,7 +430,7 @@ func (tm *MVCCTransactionManager) applyDDLIntents(txnID uint64, intents []*Write
 			return fmt.Errorf("failed to execute DDL statement: %w", err)
 		}
 
-		log.Debug().Uint64("txn_id", txnID).Str("table", intent.TableName).Msg("DDL statement executed")
+		log.Debug().Uint64("txn_id", txnID).Str("sql", intent.SQLStatement).Msg("DDL statement executed")
 	}
 	return nil
 }

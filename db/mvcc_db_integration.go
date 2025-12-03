@@ -299,8 +299,21 @@ func (c *CompletedLocalExecution) GetTotalRowCount() int64 {
 }
 
 // GetKeyHashes returns XXH64 hashes of affected row keys per table
+// Returns nil for tables that exceed maxRows (signals MVCC fallback)
 func (c *CompletedLocalExecution) GetKeyHashes(maxRows int) map[string][]uint64 {
-	return c.keyHashes
+	if maxRows <= 0 {
+		return c.keyHashes
+	}
+	result := make(map[string][]uint64, len(c.keyHashes))
+	for table, hashes := range c.keyHashes {
+		rowCount := c.rowCounts[table]
+		if rowCount > int64(maxRows) {
+			result[table] = nil
+			continue
+		}
+		result[table] = hashes
+	}
+	return result
 }
 
 // Commit applies CDC entries to persist data captured during hooks
