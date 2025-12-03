@@ -255,6 +255,15 @@ func (mdb *MVCCDatabase) GetMetaStore() MetaStore {
 	return mdb.metaStore
 }
 
+// ApplyCDCEntries applies CDC data entries to SQLite.
+// Used by CompletedLocalExecution.Commit() to persist data captured during hooks.
+func (mdb *MVCCDatabase) ApplyCDCEntries(entries []*IntentEntry) error {
+	if mdb.txnMgr == nil {
+		return fmt.Errorf("transaction manager not initialized")
+	}
+	return mdb.txnMgr.applyCDCEntries(0, entries)
+}
+
 // PendingLocalExecution represents a locally executed transaction waiting for quorum
 // The SQLite transaction is held open until Commit or Rollback is called
 type PendingLocalExecution struct {
@@ -294,9 +303,12 @@ func (c *CompletedLocalExecution) GetKeyHashes(maxRows int) map[string][]uint64 
 	return c.keyHashes
 }
 
-// Commit is a no-op - hookDB was already rolled back, actual commit via CDC replay
+// Commit applies CDC entries to persist data captured during hooks
 func (c *CompletedLocalExecution) Commit() error {
-	return nil
+	if c.db == nil || len(c.cdcEntries) == 0 {
+		return nil
+	}
+	return c.db.ApplyCDCEntries(c.cdcEntries)
 }
 
 // Rollback is a no-op - hookDB was already rolled back
