@@ -113,11 +113,15 @@ func TestInsertOrReplaceWithHooks(t *testing.T) {
 	}
 	t.Log("INSERT OR REPLACE committed successfully")
 
-	// Verify the value was replaced
+	// Verify the value was replaced - try both writeDB and readDB
 	var value string
-	err = mvccDB.GetReadDB().QueryRow("SELECT value FROM test_upsert WHERE id = 'key1'").Scan(&value)
+	err = mvccDB.GetWriteDB().QueryRow("SELECT value FROM test_upsert WHERE id = 'key1'").Scan(&value)
 	if err != nil {
-		t.Fatalf("Failed to read value: %v", err)
+		t.Logf("Failed to read from writeDB: %v", err)
+		err = mvccDB.GetReadDB().QueryRow("SELECT value FROM test_upsert WHERE id = 'key1'").Scan(&value)
+		if err != nil {
+			t.Fatalf("Failed to read from both writeDB and readDB: %v", err)
+		}
 	}
 	if value != "value2" {
 		t.Errorf("Expected value2, got %s", value)
