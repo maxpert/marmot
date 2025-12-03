@@ -728,7 +728,7 @@ func (rh *ReplicationHandler) handleReplay(ctx context.Context, req *Transaction
 	}
 
 	// Store TransactionRecord in MetaStore so GetCommittedTxnCount/GetMaxTxnID return correct values.
-	// Without this, anti-entropy keeps thinking we're behind because these metrics read from BadgerDB.
+	// Without this, anti-entropy keeps thinking we're behind because these metrics read from PebbleDB.
 	metaStore := dbInstance.GetMetaStore()
 	if metaStore != nil {
 		commitTS := hlc.Timestamp{

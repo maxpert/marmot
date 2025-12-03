@@ -273,13 +273,13 @@ func TestDDLIdempotencyRewriter(t *testing.T) {
 
 // TestSchemaVersionManager validates schema version tracking per database
 func TestSchemaVersionManager(t *testing.T) {
-	// Create temp directory for BadgerDB
+	// Create temp directory for PebbleDB
 	tmpDir, err := os.MkdirTemp("", "schema-version-test-*")
 	require.NoError(t, err)
 	defer os.RemoveAll(tmpDir)
 
-	// Create BadgerMetaStore
-	metaStore, err := db.NewBadgerMetaStore(tmpDir, db.DefaultBadgerOptions())
+	// Create PebbleMetaStore
+	metaStore, err := db.NewPebbleMetaStore(tmpDir, db.DefaultPebbleOptions())
 	require.NoError(t, err)
 	defer metaStore.Close()
 
@@ -434,13 +434,13 @@ func TestDDLReplicationBasic(t *testing.T) {
 	// Setup test infrastructure
 	dbMgr := NewDDLMockDatabaseManager()
 
-	// Create temp directory for BadgerDB
+	// Create temp directory for PebbleDB
 	tmpDir, err := os.MkdirTemp("", "ddl-replication-test-*")
 	require.NoError(t, err)
 	defer os.RemoveAll(tmpDir)
 
-	// Create BadgerMetaStore
-	metaStore, err := db.NewBadgerMetaStore(tmpDir, db.DefaultBadgerOptions())
+	// Create PebbleMetaStore
+	metaStore, err := db.NewPebbleMetaStore(tmpDir, db.DefaultPebbleOptions())
 	require.NoError(t, err)
 	defer metaStore.Close()
 
@@ -531,13 +531,13 @@ func TestDDLWithConcurrentDML(t *testing.T) {
 	// Setup test infrastructure
 	dbMgr := NewDDLMockDatabaseManager()
 
-	// Create temp directory for BadgerDB
+	// Create temp directory for PebbleDB
 	tmpDir, err := os.MkdirTemp("", "ddl-concurrent-dml-test-*")
 	require.NoError(t, err)
 	defer os.RemoveAll(tmpDir)
 
-	// Create BadgerMetaStore
-	metaStore, err := db.NewBadgerMetaStore(tmpDir, db.DefaultBadgerOptions())
+	// Create PebbleMetaStore
+	metaStore, err := db.NewPebbleMetaStore(tmpDir, db.DefaultPebbleOptions())
 	require.NoError(t, err)
 	defer metaStore.Close()
 

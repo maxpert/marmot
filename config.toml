@@ -128,30 +128,28 @@ max_idle_time_seconds = 10
 max_lifetime_seconds = 300
 
 # ==============================================================================
-# METASTORE (BadgerDB)
+# METASTORE (PebbleDB) - CockroachDB-tested defaults
 # ==============================================================================
 
-[metastore.badger]
-# Sync writes to disk (false = async for better performance)
-sync_writes = false
+[metastore]
+# Block cache size in MB (default: 64)
+cache_size_mb = 64
 
-# Number of compaction workers
-num_compactors = 2
+# MemTable size in MB (default: 64, CockroachDB-style)
+memtable_size_mb = 64
 
-# Enable value log garbage collection
-value_log_gc = true
+# Number of MemTables (default: 2)
+memtable_count = 2
 
-# Block cache size in MB (default: 64, BadgerDB default: 256)
-# Reduces memory ~192MB vs BadgerDB default
-block_cache_size_mb = 64
+# L0 compaction trigger threshold (default: 500, CockroachDB-style)
+l0_compaction_threshold = 500
 
-# MemTable size in MB (default: 32, BadgerDB default: 64)
-# Reduces memory ~32MB vs BadgerDB default
-memtable_size_mb = 32
+# L0 stop writes threshold (default: 1000, CockroachDB-style)
+l0_stop_writes = 1000
 
-# Number of MemTables (default: 2, BadgerDB default: 5)
-# Reduces memory ~192MB vs BadgerDB default
-num_memtables = 2
+# WAL sync settings for durability
+wal_bytes_per_sync_kb = 512
+wal_sync_interval_ms = 10
 
 # ==============================================================================
 # GRPC CLIENT

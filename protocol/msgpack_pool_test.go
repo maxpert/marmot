@@ -102,7 +102,7 @@ func BenchmarkMarshalMsgpack(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		MarshalMsgpack(data)
+		_, _ = MarshalMsgpack(data)
 	}
 }
 
@@ -118,7 +118,7 @@ func BenchmarkMarshalMsgpack_Parallel(b *testing.B) {
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			MarshalMsgpack(data)
+			_, _ = MarshalMsgpack(data)
 		}
 	})
 }

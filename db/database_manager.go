@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/maxpert/marmot/cfg"
 	"github.com/maxpert/marmot/coordinator"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/rs/zerolog/log"
@@ -35,6 +36,10 @@ type DatabaseManager struct {
 	dataDir   string
 	nodeID    uint64
 	clock     *hlc.Clock
+
+	// WAL checkpoint goroutine
+	stopCheckpoint chan struct{}
+	checkpointWg   sync.WaitGroup
 }
 
 // DatabaseMetadata represents database registry information
@@ -47,10 +52,11 @@ type DatabaseMetadata struct {
 // NewDatabaseManager creates a new database manager
 func NewDatabaseManager(dataDir string, nodeID uint64, clock *hlc.Clock) (*DatabaseManager, error) {
 	dm := &DatabaseManager{
-		databases: make(map[string]*MVCCDatabase),
-		dataDir:   dataDir,
-		nodeID:    nodeID,
-		clock:     clock,
+		databases:      make(map[string]*MVCCDatabase),
+		dataDir:        dataDir,
+		nodeID:         nodeID,
+		clock:          clock,
+		stopCheckpoint: make(chan struct{}),
 	}
 
 	// Create databases directory if it doesn't exist
@@ -72,6 +78,12 @@ func NewDatabaseManager(dataDir string, nodeID uint64, clock *hlc.Clock) (*Datab
 	// Ensure default database exists
 	if err := dm.ensureDefaultDatabase(); err != nil {
 		return nil, fmt.Errorf("failed to ensure default database: %w", err)
+	}
+
+	// Start periodic WAL checkpoint if configured
+	if cfg.Config != nil && cfg.Config.MetaStore.WALSyncIntervalMS > 0 {
+		dm.checkpointWg.Add(1)
+		go dm.runPeriodicCheckpoint()
 	}
 
 	log.Info().Int("count", len(dm.databases)).Msg("DatabaseManager initialized")
@@ -150,7 +162,7 @@ func (dm *DatabaseManager) loadDatabases() error {
 }
 
 // openDatabase opens a database and adds it to the registry
-// Creates a MetaStore for the database (stored in dbname_meta.badger/)
+// Creates a MetaStore for the database (stored in dbname_meta.pebble/)
 func (dm *DatabaseManager) openDatabase(name, path string) error {
 	// Create MetaStore for this database
 	metaStore, err := NewMetaStore(path)
@@ -300,8 +312,8 @@ func (dm *DatabaseManager) DropDatabase(name string) error {
 	os.Remove(fullPath + "-wal")
 	os.Remove(fullPath + "-shm")
 
-	// Delete meta database directory (BadgerDB)
-	metaPath := strings.TrimSuffix(fullPath, ".db") + "_meta.badger"
+	// Delete meta database directory (PebbleDB)
+	metaPath := strings.TrimSuffix(fullPath, ".db") + "_meta.pebble"
 	os.RemoveAll(metaPath)
 
 	log.Info().Str("name", name).Msg("Database dropped")
@@ -367,6 +379,12 @@ func (dm *DatabaseManager) GetSystemDatabase() *MVCCDatabase {
 
 // Close closes all databases
 func (dm *DatabaseManager) Close() error {
+	// Stop checkpoint goroutine first (outside lock to avoid deadlock)
+	if dm.stopCheckpoint != nil {
+		close(dm.stopCheckpoint)
+		dm.checkpointWg.Wait()
+	}
+
 	dm.mu.Lock()
 	defer dm.mu.Unlock()
 
@@ -597,7 +615,7 @@ func copyFile(src, dst string) error {
 // cleanupMetaStoreFiles removes MetaStore directory for a database.
 func cleanupMetaStoreFiles(dbPath string) {
 	basePath := strings.TrimSuffix(dbPath, ".db")
-	os.RemoveAll(basePath + "_meta.badger")
+	os.RemoveAll(basePath + "_meta.pebble")
 }
 
 // SnapshotInfo contains information about a database file for snapshot transfer
@@ -622,44 +640,6 @@ func calculateFileSHA256(path string) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
-}
-
-// collectBadgerDirSnapshots collects SnapshotInfo for all files in a BadgerDB directory
-func collectBadgerDirSnapshots(dirPath, baseName, relativeDir string) []SnapshotInfo {
-	var snapshots []SnapshotInfo
-
-	entries, err := os.ReadDir(dirPath)
-	if err != nil {
-		log.Warn().Err(err).Str("path", dirPath).Msg("Failed to read BadgerDB directory")
-		return snapshots
-	}
-
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue // Skip subdirectories
-		}
-
-		filePath := filepath.Join(dirPath, entry.Name())
-		info, err := entry.Info()
-		if err != nil {
-			continue
-		}
-
-		sha256Hash, err := calculateFileSHA256(filePath)
-		if err != nil {
-			continue
-		}
-
-		snapshots = append(snapshots, SnapshotInfo{
-			Name:     baseName + "_meta/" + entry.Name(),
-			Filename: filepath.Join(relativeDir, baseName+"_meta.badger", entry.Name()),
-			FullPath: filePath,
-			Size:     info.Size(),
-			SHA256:   sha256Hash,
-		})
-	}
-
-	return snapshots
 }
 
 // TakeSnapshot checkpoints all databases and returns their file information
@@ -694,20 +674,12 @@ func (dm *DatabaseManager) TakeSnapshot() ([]SnapshotInfo, uint64, error) {
 		SHA256:   systemSHA256,
 	})
 
-	// Checkpoint and include system database meta DB (BadgerDB directory)
-	systemMetaStore := dm.systemDB.GetMetaStore()
-	if systemMetaStore != nil {
-		// Checkpoint meta DB
-		if err := systemMetaStore.Checkpoint(); err != nil {
-			log.Warn().Err(err).Msg("Failed to checkpoint system meta database")
-		}
+	// NOTE: MetaStore (PebbleDB) is NOT included in snapshots.
+	// MetaStore files change constantly due to WAL rotation and compaction,
+	// causing race conditions during snapshot streaming.
+	// After snapshot restore, fresh MetaStore is created automatically.
 
-		systemMetaPath := filepath.Join(dm.dataDir, SystemDatabaseName+"_meta.badger")
-		metaSnapshots := collectBadgerDirSnapshots(systemMetaPath, SystemDatabaseName, "")
-		snapshots = append(snapshots, metaSnapshots...)
-	}
-
-	// Checkpoint and get info for all user databases and their meta DBs
+	// Checkpoint and get info for all user databases (SQLite .db files only)
 	for name, db := range dm.databases {
 		// Skip system database (already handled above)
 		if name == SystemDatabaseName {
@@ -739,19 +711,7 @@ func (dm *DatabaseManager) TakeSnapshot() ([]SnapshotInfo, uint64, error) {
 			Size:     info.Size(),
 			SHA256:   dbSHA256,
 		})
-
-		// Checkpoint and include meta DB for this database (BadgerDB directory)
-		metaStore := db.GetMetaStore()
-		if metaStore != nil {
-			// Checkpoint meta DB
-			if err := metaStore.Checkpoint(); err != nil {
-				log.Warn().Err(err).Str("database", name).Msg("Failed to checkpoint meta database")
-			}
-
-			metaPath := filepath.Join(dm.dataDir, "databases", name+"_meta.badger")
-			metaSnapshots := collectBadgerDirSnapshots(metaPath, name, "databases")
-			snapshots = append(snapshots, metaSnapshots...)
-		}
+		// MetaStore (PebbleDB) is NOT included - see note above
 	}
 
 	// Get max committed transaction ID
@@ -772,6 +732,45 @@ func (dm *DatabaseManager) TakeSnapshot() ([]SnapshotInfo, uint64, error) {
 func (dm *DatabaseManager) checkpointDatabase(db *MVCCDatabase) error {
 	_, err := db.GetDB().Exec("PRAGMA wal_checkpoint(TRUNCATE)")
 	return err
+}
+
+// runPeriodicCheckpoint runs PASSIVE checkpoint on all databases periodically
+func (dm *DatabaseManager) runPeriodicCheckpoint() {
+	defer dm.checkpointWg.Done()
+
+	interval := time.Duration(cfg.Config.MetaStore.WALSyncIntervalMS) * time.Millisecond
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	log.Info().Dur("interval", interval).Msg("WAL checkpoint goroutine started")
+
+	for {
+		select {
+		case <-dm.stopCheckpoint:
+			log.Info().Msg("WAL checkpoint goroutine stopped")
+			return
+		case <-ticker.C:
+			dm.doPassiveCheckpoint()
+		}
+	}
+}
+
+// doPassiveCheckpoint runs PASSIVE checkpoint on all databases (non-blocking)
+func (dm *DatabaseManager) doPassiveCheckpoint() {
+	dm.mu.RLock()
+	databases := make([]*MVCCDatabase, 0, len(dm.databases))
+	for _, db := range dm.databases {
+		databases = append(databases, db)
+	}
+	dm.mu.RUnlock()
+
+	for _, db := range databases {
+		// PASSIVE checkpoint doesn't block writers
+		_, err := db.GetDB().Exec("PRAGMA wal_checkpoint(PASSIVE)")
+		if err != nil {
+			log.Warn().Err(err).Msg("PASSIVE checkpoint failed")
+		}
+	}
 }
 
 // GetMaxCommittedTxnID returns the highest committed transaction ID across all databases

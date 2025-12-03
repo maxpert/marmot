@@ -49,7 +49,7 @@ type MinAppliedTxnIDFunc func(database string) (uint64, error)
 type ClusterMinWatermarkFunc func() uint64
 
 // MVCCTransactionManager manages MVCC transactions
-// All transaction state is stored in MetaStore (BadgerDB) - no in-memory caching
+// All transaction state is stored in MetaStore (PebbleDB) - no in-memory caching
 type MVCCTransactionManager struct {
 	db                     *sql.DB   // User database for data operations
 	metaStore              MetaStore // MetaStore for transaction metadata
@@ -843,7 +843,7 @@ func (tm *MVCCTransactionManager) writeCDCData(stmt protocol.Statement) error {
 	case protocol.StatementInsert, protocol.StatementReplace:
 		return tm.writeCDCInsert(stmt.TableName, stmt.NewValues)
 	case protocol.StatementUpdate:
-		return tm.writeCDCUpdate(stmt.TableName, stmt.RowKey, stmt.NewValues)
+		return tm.writeCDCUpdate(stmt.TableName, stmt.OldValues, stmt.NewValues)
 	case protocol.StatementDelete:
 		return tm.writeCDCDelete(stmt.TableName, stmt.RowKey, stmt.OldValues)
 	default:
@@ -854,6 +854,7 @@ func (tm *MVCCTransactionManager) writeCDCData(stmt protocol.Statement) error {
 // writeCDCInsert performs INSERT OR REPLACE using CDC row data
 func (tm *MVCCTransactionManager) writeCDCInsert(tableName string, newValues map[string][]byte) error {
 	if len(newValues) == 0 {
+		log.Debug().Str("table", tableName).Msg("writeCDCInsert: no values to insert")
 		return fmt.Errorf("no values to insert")
 	}
 
@@ -867,10 +868,14 @@ func (tm *MVCCTransactionManager) writeCDCInsert(tableName string, newValues map
 		columns = append(columns, col)
 		placeholders = append(placeholders, "?")
 
-		// Deserialize value from JSON
+		// Deserialize value from msgpack
 		var value interface{}
 		if err := msgpack.Unmarshal(newValues[col], &value); err != nil {
 			return fmt.Errorf("failed to deserialize value for column %s: %w", col, err)
+		}
+		// Convert []byte to string for text columns (msgpack deserializes strings as []byte)
+		if b, ok := value.([]byte); ok {
+			value = string(b)
 		}
 		values = append(values, value)
 	}
@@ -885,7 +890,8 @@ func (tm *MVCCTransactionManager) writeCDCInsert(tableName string, newValues map
 }
 
 // writeCDCUpdate performs UPDATE using CDC row data
-func (tm *MVCCTransactionManager) writeCDCUpdate(tableName string, rowKey string, newValues map[string][]byte) error {
+// Uses oldValues for WHERE clause (to find existing row) and newValues for SET clause
+func (tm *MVCCTransactionManager) writeCDCUpdate(tableName string, oldValues, newValues map[string][]byte) error {
 	if len(newValues) == 0 {
 		return fmt.Errorf("no values to update")
 	}
@@ -896,50 +902,50 @@ func (tm *MVCCTransactionManager) writeCDCUpdate(tableName string, rowKey string
 		return fmt.Errorf("failed to get schema for table %s: %w", tableName, err)
 	}
 
-	// Build UPDATE statement with SET clause
+	// Build UPDATE statement with SET clause using newValues
 	setClauses := make([]string, 0, len(newValues))
 	values := make([]interface{}, 0, len(newValues)+len(schema.PrimaryKeys))
 
 	for col, valBytes := range newValues {
-		// Skip PK columns in SET clause (they're in WHERE clause)
-		isPK := false
-		for _, pkCol := range schema.PrimaryKeys {
-			if col == pkCol {
-				isPK = true
-				break
-			}
-		}
-		if isPK {
-			continue
-		}
-
 		setClauses = append(setClauses, fmt.Sprintf("%s = ?", col))
 
-		// Deserialize value from JSON
+		// Deserialize value from msgpack
 		var value interface{}
 		if err := msgpack.Unmarshal(valBytes, &value); err != nil {
 			return fmt.Errorf("failed to deserialize value for column %s: %w", col, err)
 		}
+		// Convert []byte to string (msgpack deserializes strings as []byte)
+		if b, ok := value.([]byte); ok {
+			value = string(b)
+		}
 		values = append(values, value)
 	}
 
-	// Build WHERE clause using primary key columns
-	// For both single and composite PK: extract PK values from newValues
-	// (newValues contains both SET columns and PK columns from WHERE clause)
+	// Build WHERE clause using primary key columns from oldValues
+	// This is critical for PK changes: we need the OLD PK to find the row
 	whereClauses := make([]string, 0, len(schema.PrimaryKeys))
 
 	for _, pkCol := range schema.PrimaryKeys {
-		pkValue, ok := newValues[pkCol]
+		// Use oldValues for WHERE clause if available, fallback to newValues
+		pkBytes, ok := oldValues[pkCol]
 		if !ok {
-			return fmt.Errorf("primary key column %s not found in CDC data", pkCol)
+			// Fallback to newValues if oldValues doesn't have PK (shouldn't happen for UPDATEs)
+			pkBytes, ok = newValues[pkCol]
+			if !ok {
+				return fmt.Errorf("primary key column %s not found in CDC data", pkCol)
+			}
 		}
 
 		whereClauses = append(whereClauses, fmt.Sprintf("%s = ?", pkCol))
 
-		// Deserialize PK value
+		// Deserialize PK value from msgpack
 		var value interface{}
-		if err := msgpack.Unmarshal(pkValue, &value); err != nil {
+		if err := msgpack.Unmarshal(pkBytes, &value); err != nil {
 			return fmt.Errorf("failed to deserialize PK value for column %s: %w", pkCol, err)
+		}
+		// Convert []byte to string (msgpack deserializes strings as []byte)
+		if b, ok := value.([]byte); ok {
+			value = string(b)
 		}
 		values = append(values, value)
 	}
@@ -983,10 +989,14 @@ func (tm *MVCCTransactionManager) writeCDCDelete(tableName string, rowKey string
 
 			whereClauses = append(whereClauses, fmt.Sprintf("%s = ?", pkCol))
 
-			// Deserialize PK value
+			// Deserialize PK value from msgpack
 			var value interface{}
 			if err := msgpack.Unmarshal(pkValue, &value); err != nil {
 				return fmt.Errorf("failed to deserialize PK value for column %s: %w", pkCol, err)
+			}
+			// Convert []byte to string (msgpack deserializes strings as []byte)
+			if b, ok := value.([]byte); ok {
+				value = string(b)
 			}
 			values = append(values, value)
 		}

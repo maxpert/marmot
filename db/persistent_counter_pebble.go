@@ -4,49 +4,49 @@ import (
 	"encoding/binary"
 	"sync"
 
-	"github.com/dgraph-io/badger/v4"
+	"github.com/cockroachdb/pebble"
 )
 
-// PersistentCounter provides thread-safe, write-through cached counters backed by BadgerDB.
+// PebbleCounter provides thread-safe, write-through cached counters backed by Pebble.
 // Counters are loaded on first access and cached in memory. All writes are persisted immediately.
-type PersistentCounter struct {
-	db     *badger.DB
+type PebbleCounter struct {
+	db     *pebble.DB
 	prefix string
 
 	mu       sync.RWMutex
-	counters map[string]*counterEntry
+	counters map[string]*pebbleCounterEntry
 	lruOrder []string // Simple LRU tracking
 	maxSize  int      // Max cached counters
 }
 
-type counterEntry struct {
+type pebbleCounterEntry struct {
 	mu    sync.Mutex
 	value int64
 }
 
-// NewPersistentCounter creates a new persistent counter with LRU cache.
-// prefix is prepended to all counter names for namespacing in BadgerDB.
+// NewPebbleCounter creates a new persistent counter with LRU cache.
+// prefix is prepended to all counter names for namespacing.
 // maxCached limits memory usage (0 = unlimited).
-func NewPersistentCounter(db *badger.DB, prefix string, maxCached int) *PersistentCounter {
+func NewPebbleCounter(db *pebble.DB, prefix string, maxCached int) *PebbleCounter {
 	if maxCached <= 0 {
 		maxCached = 1000 // Default max
 	}
-	return &PersistentCounter{
+	return &PebbleCounter{
 		db:       db,
 		prefix:   prefix,
-		counters: make(map[string]*counterEntry),
+		counters: make(map[string]*pebbleCounterEntry),
 		lruOrder: make([]string, 0, maxCached),
 		maxSize:  maxCached,
 	}
 }
 
-// key returns the BadgerDB key for a counter name
-func (pc *PersistentCounter) key(name string) []byte {
+// key returns the Pebble key for a counter name
+func (pc *PebbleCounter) key(name string) []byte {
 	return []byte(pc.prefix + name)
 }
 
-// getOrLoad gets counter from cache or loads from BadgerDB
-func (pc *PersistentCounter) getOrLoad(name string) (*counterEntry, error) {
+// getOrLoad gets counter from cache or loads from Pebble
+func (pc *PebbleCounter) getOrLoad(name string) (*pebbleCounterEntry, error) {
 	// Fast path: check cache with read lock
 	pc.mu.RLock()
 	entry, exists := pc.counters[name]
@@ -65,33 +65,25 @@ func (pc *PersistentCounter) getOrLoad(name string) (*counterEntry, error) {
 		return entry, nil
 	}
 
-	// Load from BadgerDB
+	// Load from Pebble
 	var value int64
-	err := pc.db.View(func(txn *badger.Txn) error {
-		item, err := txn.Get(pc.key(name))
-		if err == badger.ErrKeyNotFound {
-			return nil // Default to 0
+	val, closer, err := pc.db.Get(pc.key(name))
+	if err == nil {
+		if len(val) >= 8 {
+			value = int64(binary.BigEndian.Uint64(val))
 		}
-		if err != nil {
-			return err
-		}
-		return item.Value(func(val []byte) error {
-			if len(val) >= 8 {
-				value = int64(binary.BigEndian.Uint64(val))
-			}
-			return nil
-		})
-	})
-	if err != nil {
+		closer.Close()
+	} else if err != pebble.ErrNotFound {
 		return nil, err
 	}
+	// ErrNotFound is fine - default to 0
 
 	// Evict if at capacity (simple LRU)
 	if len(pc.counters) >= pc.maxSize && pc.maxSize > 0 {
 		pc.evictOldest()
 	}
 
-	entry = &counterEntry{value: value}
+	entry = &pebbleCounterEntry{value: value}
 	pc.counters[name] = entry
 	pc.lruOrder = append(pc.lruOrder, name)
 
@@ -99,7 +91,7 @@ func (pc *PersistentCounter) getOrLoad(name string) (*counterEntry, error) {
 }
 
 // evictOldest removes the oldest cached counter (must hold write lock)
-func (pc *PersistentCounter) evictOldest() {
+func (pc *PebbleCounter) evictOldest() {
 	if len(pc.lruOrder) == 0 {
 		return
 	}
@@ -108,24 +100,15 @@ func (pc *PersistentCounter) evictOldest() {
 	delete(pc.counters, oldest)
 }
 
-// persist writes the counter value to BadgerDB
-func (pc *PersistentCounter) persist(name string, value int64) error {
+// persist writes the counter value to Pebble
+func (pc *PebbleCounter) persist(name string, value int64) error {
 	buf := make([]byte, 8)
 	binary.BigEndian.PutUint64(buf, uint64(value))
-	return pc.db.Update(func(txn *badger.Txn) error {
-		return txn.Set(pc.key(name), buf)
-	})
-}
-
-// persistInTxn writes the counter value within an existing transaction
-func (pc *PersistentCounter) persistInTxn(txn *badger.Txn, name string, value int64) error {
-	buf := make([]byte, 8)
-	binary.BigEndian.PutUint64(buf, uint64(value))
-	return txn.Set(pc.key(name), buf)
+	return pc.db.Set(pc.key(name), buf, pebble.NoSync)
 }
 
 // Load returns the current value of a counter
-func (pc *PersistentCounter) Load(name string) (int64, error) {
+func (pc *PebbleCounter) Load(name string) (int64, error) {
 	entry, err := pc.getOrLoad(name)
 	if err != nil {
 		return 0, err
@@ -137,7 +120,7 @@ func (pc *PersistentCounter) Load(name string) (int64, error) {
 }
 
 // Store sets a counter to a specific value (write-through)
-func (pc *PersistentCounter) Store(name string, value int64) error {
+func (pc *PebbleCounter) Store(name string, value int64) error {
 	entry, err := pc.getOrLoad(name)
 	if err != nil {
 		return err
@@ -154,7 +137,7 @@ func (pc *PersistentCounter) Store(name string, value int64) error {
 }
 
 // Inc atomically increments a counter by delta and returns the new value (write-through)
-func (pc *PersistentCounter) Inc(name string, delta int64) (int64, error) {
+func (pc *PebbleCounter) Inc(name string, delta int64) (int64, error) {
 	entry, err := pc.getOrLoad(name)
 	if err != nil {
 		return 0, err
@@ -173,7 +156,7 @@ func (pc *PersistentCounter) Inc(name string, delta int64) (int64, error) {
 
 // Dec atomically decrements a counter by delta and returns the new value (write-through)
 // Value is clamped to 0 (won't go negative)
-func (pc *PersistentCounter) Dec(name string, delta int64) (int64, error) {
+func (pc *PebbleCounter) Dec(name string, delta int64) (int64, error) {
 	entry, err := pc.getOrLoad(name)
 	if err != nil {
 		return 0, err
@@ -194,7 +177,7 @@ func (pc *PersistentCounter) Dec(name string, delta int64) (int64, error) {
 }
 
 // UpdateMax atomically updates the counter to max(current, value) and returns the new value
-func (pc *PersistentCounter) UpdateMax(name string, value int64) (int64, error) {
+func (pc *PebbleCounter) UpdateMax(name string, value int64) (int64, error) {
 	entry, err := pc.getOrLoad(name)
 	if err != nil {
 		return 0, err
@@ -212,32 +195,34 @@ func (pc *PersistentCounter) UpdateMax(name string, value int64) (int64, error) 
 	return entry.value, nil
 }
 
-// IncInTxn increments counter within an existing BadgerDB transaction.
-// Updates cache after txn commits (caller must ensure txn succeeds).
+// IncInBatch increments counter within an existing Pebble batch.
+// Updates cache immediately (caller must ensure batch succeeds).
 // Returns the new value.
-func (pc *PersistentCounter) IncInTxn(txn *badger.Txn, name string, delta int64) (int64, error) {
+func (pc *PebbleCounter) IncInBatch(batch *pebble.Batch, name string, delta int64) error {
 	entry, err := pc.getOrLoad(name)
 	if err != nil {
-		return 0, err
+		return err
 	}
 
 	entry.mu.Lock()
 	defer entry.mu.Unlock()
 
 	newValue := entry.value + delta
-	if err := pc.persistInTxn(txn, name, newValue); err != nil {
-		return entry.value, err
+	buf := make([]byte, 8)
+	binary.BigEndian.PutUint64(buf, uint64(newValue))
+	if err := batch.Set(pc.key(name), buf, nil); err != nil {
+		return err
 	}
 	entry.value = newValue
-	return newValue, nil
+	return nil
 }
 
-// DecInTxn decrements counter within an existing BadgerDB transaction.
+// DecInBatch decrements counter within an existing Pebble batch.
 // Value is clamped to 0. Returns the new value.
-func (pc *PersistentCounter) DecInTxn(txn *badger.Txn, name string, delta int64) (int64, error) {
+func (pc *PebbleCounter) DecInBatch(batch *pebble.Batch, name string, delta int64) error {
 	entry, err := pc.getOrLoad(name)
 	if err != nil {
-		return 0, err
+		return err
 	}
 
 	entry.mu.Lock()
@@ -247,35 +232,39 @@ func (pc *PersistentCounter) DecInTxn(txn *badger.Txn, name string, delta int64)
 	if newValue < 0 {
 		newValue = 0
 	}
-	if err := pc.persistInTxn(txn, name, newValue); err != nil {
-		return entry.value, err
+	buf := make([]byte, 8)
+	binary.BigEndian.PutUint64(buf, uint64(newValue))
+	if err := batch.Set(pc.key(name), buf, nil); err != nil {
+		return err
 	}
 	entry.value = newValue
-	return newValue, nil
+	return nil
 }
 
-// UpdateMaxInTxn updates counter to max(current, value) within an existing transaction.
+// UpdateMaxInBatch updates counter to max(current, value) within an existing batch.
 // Returns the new value.
-func (pc *PersistentCounter) UpdateMaxInTxn(txn *badger.Txn, name string, value int64) (int64, error) {
+func (pc *PebbleCounter) UpdateMaxInBatch(batch *pebble.Batch, name string, value int64) error {
 	entry, err := pc.getOrLoad(name)
 	if err != nil {
-		return 0, err
+		return err
 	}
 
 	entry.mu.Lock()
 	defer entry.mu.Unlock()
 
 	if value > entry.value {
-		if err := pc.persistInTxn(txn, name, value); err != nil {
-			return entry.value, err
+		buf := make([]byte, 8)
+		binary.BigEndian.PutUint64(buf, uint64(value))
+		if err := batch.Set(pc.key(name), buf, nil); err != nil {
+			return err
 		}
 		entry.value = value
 	}
-	return entry.value, nil
+	return nil
 }
 
 // LoadUint64 returns the current value as uint64 (convenience method)
-func (pc *PersistentCounter) LoadUint64(name string) (uint64, error) {
+func (pc *PebbleCounter) LoadUint64(name string) (uint64, error) {
 	v, err := pc.Load(name)
 	if err != nil {
 		return 0, err
@@ -284,7 +273,7 @@ func (pc *PersistentCounter) LoadUint64(name string) (uint64, error) {
 }
 
 // Invalidate removes a counter from cache (forces reload on next access)
-func (pc *PersistentCounter) Invalidate(name string) {
+func (pc *PebbleCounter) Invalidate(name string) {
 	pc.mu.Lock()
 	defer pc.mu.Unlock()
 	delete(pc.counters, name)
@@ -298,9 +287,9 @@ func (pc *PersistentCounter) Invalidate(name string) {
 }
 
 // Clear removes all counters from cache
-func (pc *PersistentCounter) Clear() {
+func (pc *PebbleCounter) Clear() {
 	pc.mu.Lock()
 	defer pc.mu.Unlock()
-	pc.counters = make(map[string]*counterEntry)
+	pc.counters = make(map[string]*pebbleCounterEntry)
 	pc.lruOrder = pc.lruOrder[:0]
 }

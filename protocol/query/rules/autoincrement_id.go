@@ -109,9 +109,8 @@ func (r *AutoIncrementIDRule) ApplyAST(stmt sqlparser.Statement, schemaLookup Sc
 	if colIdx < 0 {
 		// Column missing from INSERT - add column and values
 		insert.Columns = append(insert.Columns, sqlparser.NewIdentifierCI(autoIncCol))
-		colIdx = len(insert.Columns) - 1
 
-		// Add generated ID to each row
+		// Add generated ID to each row (appended to match new column)
 		for i := range rows {
 			newID := r.generator.NextID()
 			rows[i] = append(rows[i], sqlparser.NewIntLiteral(strconv.FormatUint(newID, 10)))

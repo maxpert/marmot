@@ -15,14 +15,16 @@ import (
 func createTestMVCCDatabase(t *testing.T, dbPath string) (*MVCCDatabase, MetaStore) {
 	t.Helper()
 
-	metaPath := dbPath + "_meta.badger"
+	metaPath := dbPath + "_meta.pebble"
 	os.Remove(dbPath)
 	os.RemoveAll(metaPath)
 
-	metaStore, err := NewBadgerMetaStore(metaPath, BadgerMetaStoreOptions{
-		SyncWrites:    false, // Faster for tests
-		NumCompactors: 2,
-		ValueLogGC:    false,
+	metaStore, err := NewPebbleMetaStore(metaPath, PebbleMetaStoreOptions{
+		CacheSizeMB:           16,
+		MemTableSizeMB:        8,
+		MemTableCount:         2,
+		L0CompactionThreshold: 4,
+		L0StopWrites:          12,
 	})
 	if err != nil {
 		t.Fatalf("Failed to create MetaStore: %v", err)
@@ -51,7 +53,7 @@ func TestMVCCDatabase_Creation(t *testing.T) {
 	_ = mdb
 
 	// Verify MetaStore is functional by testing basic operations
-	// This works with any backend (SQLite or BadgerDB)
+	// Verify MetaStore is functional (PebbleDB backend)
 
 	// Test GetCommittedTxnCount
 	count, err := metaStore.GetCommittedTxnCount()
@@ -383,15 +385,17 @@ func TestMVCCDatabase_TransactionLifecycle(t *testing.T) {
 // TestMVCCDatabase_Close verifies that Close() properly stops GC and closes all connections
 func TestMVCCDatabase_Close(t *testing.T) {
 	dbPath := "/tmp/test_mvcc_close.db"
-	metaPath := dbPath + "_meta.badger"
+	metaPath := dbPath + "_meta.pebble"
 	os.Remove(dbPath)
 	os.RemoveAll(metaPath)
 
 	// Create MetaStore
-	metaStore, err := NewBadgerMetaStore(metaPath, BadgerMetaStoreOptions{
-		SyncWrites:    false,
-		NumCompactors: 2,
-		ValueLogGC:    false,
+	metaStore, err := NewPebbleMetaStore(metaPath, PebbleMetaStoreOptions{
+		CacheSizeMB:           16,
+		MemTableSizeMB:        8,
+		MemTableCount:         2,
+		L0CompactionThreshold: 4,
+		L0StopWrites:          12,
 	})
 	if err != nil {
 		t.Fatalf("Failed to create MetaStore: %v", err)
@@ -437,14 +441,16 @@ func TestMVCCDatabase_Close(t *testing.T) {
 // TestMVCCDatabase_CloseMultipleTimes verifies that Close() is safe to call multiple times
 func TestMVCCDatabase_CloseMultipleTimes(t *testing.T) {
 	dbPath := "/tmp/test_mvcc_close_multi.db"
-	metaPath := dbPath + "_meta.badger"
+	metaPath := dbPath + "_meta.pebble"
 	os.Remove(dbPath)
 	os.RemoveAll(metaPath)
 
-	metaStore, err := NewBadgerMetaStore(metaPath, BadgerMetaStoreOptions{
-		SyncWrites:    false,
-		NumCompactors: 2,
-		ValueLogGC:    false,
+	metaStore, err := NewPebbleMetaStore(metaPath, PebbleMetaStoreOptions{
+		CacheSizeMB:           16,
+		MemTableSizeMB:        8,
+		MemTableCount:         2,
+		L0CompactionThreshold: 4,
+		L0StopWrites:          12,
 	})
 	if err != nil {
 		t.Fatalf("Failed to create MetaStore: %v", err)

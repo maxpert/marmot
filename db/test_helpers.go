@@ -26,8 +26,7 @@ func isWriteWriteConflict(err error) bool {
 	errStr := err.Error()
 	return strings.Contains(errStr, "write-write conflict") ||
 		strings.Contains(errStr, "locked by transaction") ||
-		strings.Contains(errStr, "write conflict") ||
-		strings.Contains(errStr, "Transaction Conflict") // BadgerDB conflict
+		strings.Contains(errStr, "write conflict")
 }
 
 // testDBWithMetaStore holds both the user DB and MetaStore for testing
@@ -56,7 +55,7 @@ func setupTestDBWithMeta(t *testing.T) *testDBWithMetaStore {
 	return openTestDBWithMeta(t, dbPath)
 }
 
-// openTestDBWithMeta opens an existing path with both user DB and MetaStore (BadgerDB)
+// openTestDBWithMeta opens an existing path with both user DB and MetaStore (PebbleDB)
 func openTestDBWithMeta(t *testing.T, dbPath string) *testDBWithMetaStore {
 	t.Helper()
 
@@ -65,11 +64,13 @@ func openTestDBWithMeta(t *testing.T, dbPath string) *testDBWithMetaStore {
 		t.Fatalf("Failed to open database: %v", err)
 	}
 
-	metaPath := strings.TrimSuffix(dbPath, ".db") + "_meta.badger"
-	metaStore, err := NewBadgerMetaStore(metaPath, BadgerMetaStoreOptions{
-		SyncWrites:    false, // Faster for tests
-		NumCompactors: 2,
-		ValueLogGC:    false, // Disable for tests
+	metaPath := strings.TrimSuffix(dbPath, ".db") + "_meta.pebble"
+	metaStore, err := NewPebbleMetaStore(metaPath, PebbleMetaStoreOptions{
+		CacheSizeMB:           16, // Smaller for tests
+		MemTableSizeMB:        8,
+		MemTableCount:         2,
+		L0CompactionThreshold: 4,
+		L0StopWrites:          12,
 	})
 	if err != nil {
 		db.Close()

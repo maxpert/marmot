@@ -16,12 +16,14 @@ import (
 // createMutationGuardTestMetaStore creates a MetaStore for mutation guard tests
 func createMutationGuardTestMetaStore(t *testing.T, dbPath string) MetaStore {
 	t.Helper()
-	metaPath := dbPath + "_meta.badger"
+	metaPath := dbPath + "_meta.pebble"
 	os.RemoveAll(metaPath)
-	metaStore, err := NewBadgerMetaStore(metaPath, BadgerMetaStoreOptions{
-		SyncWrites:    false, // Faster for tests
-		NumCompactors: 2,
-		ValueLogGC:    false,
+	metaStore, err := NewPebbleMetaStore(metaPath, PebbleMetaStoreOptions{
+		CacheSizeMB:           16,
+		MemTableSizeMB:        8,
+		MemTableCount:         2,
+		L0CompactionThreshold: 4,
+		L0StopWrites:          12,
 	})
 	if err != nil {
 		t.Fatalf("Failed to create test meta store: %v", err)

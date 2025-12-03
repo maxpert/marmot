@@ -4,6 +4,8 @@ import (
 	"testing"
 )
 
+// TestSanitizeSnapshotFilename tests path sanitization for snapshot files.
+// NOTE: MetaStore (PebbleDB) paths are no longer valid - only SQLite .db files.
 func TestSanitizeSnapshotFilename(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -11,23 +13,11 @@ func TestSanitizeSnapshotFilename(t *testing.T) {
 		expected    string
 		shouldError bool
 	}{
-		// Valid cases
+		// Valid cases - only SQLite .db files
 		{
 			name:        "system database",
 			filename:    "__marmot_system.db",
 			expected:    "__marmot_system.db",
-			shouldError: false,
-		},
-		{
-			name:        "system meta badger vlog",
-			filename:    "__marmot_system_meta.badger/000001.vlog",
-			expected:    "__marmot_system_meta.badger/000001.vlog",
-			shouldError: false,
-		},
-		{
-			name:        "system meta badger manifest",
-			filename:    "__marmot_system_meta.badger/MANIFEST",
-			expected:    "__marmot_system_meta.badger/MANIFEST",
 			shouldError: false,
 		},
 		{
@@ -37,22 +27,32 @@ func TestSanitizeSnapshotFilename(t *testing.T) {
 			shouldError: false,
 		},
 		{
-			name:        "user meta badger vlog",
-			filename:    "databases/marmot_meta.badger/000001.vlog",
-			expected:    "databases/marmot_meta.badger/000001.vlog",
-			shouldError: false,
-		},
-		{
-			name:        "user meta badger manifest",
-			filename:    "databases/marmot_meta.badger/MANIFEST",
-			expected:    "databases/marmot_meta.badger/MANIFEST",
-			shouldError: false,
-		},
-		{
 			name:        "user database with different name",
 			filename:    "databases/myapp.db",
 			expected:    "databases/myapp.db",
 			shouldError: false,
+		},
+
+		// PebbleDB paths are now INVALID (not included in snapshots)
+		{
+			name:        "system meta pebble sst - now invalid",
+			filename:    "__marmot_system_meta.pebble/000001.sst",
+			shouldError: true,
+		},
+		{
+			name:        "system meta pebble manifest - now invalid",
+			filename:    "__marmot_system_meta.pebble/MANIFEST",
+			shouldError: true,
+		},
+		{
+			name:        "user meta pebble sst - now invalid",
+			filename:    "databases/marmot_meta.pebble/000001.sst",
+			shouldError: true,
+		},
+		{
+			name:        "user meta pebble manifest - now invalid",
+			filename:    "databases/marmot_meta.pebble/MANIFEST",
+			shouldError: true,
 		},
 
 		// Path traversal attacks
@@ -141,25 +141,32 @@ func TestSanitizeSnapshotFilename(t *testing.T) {
 	}
 }
 
+// TestIsValidSnapshotPath tests path validation for snapshot files.
+// NOTE: MetaStore (PebbleDB) paths are no longer valid - only SQLite .db files.
 func TestIsValidSnapshotPath(t *testing.T) {
 	tests := []struct {
 		name     string
 		path     string
 		expected bool
 	}{
+		// Valid paths - only SQLite .db files
 		{"system database", "__marmot_system.db", true},
-		{"system meta badger vlog", "__marmot_system_meta.badger/000001.vlog", true},
-		{"system meta badger manifest", "__marmot_system_meta.badger/MANIFEST", true},
 		{"user database", "databases/marmot.db", true},
-		{"user meta badger vlog", "databases/marmot_meta.badger/000001.vlog", true},
-		{"user meta badger manifest", "databases/marmot_meta.badger/MANIFEST", true},
 		{"user database other name", "databases/test.db", true},
+
+		// PebbleDB paths are now INVALID
+		{"system meta pebble sst - now invalid", "__marmot_system_meta.pebble/000001.sst", false},
+		{"system meta pebble manifest - now invalid", "__marmot_system_meta.pebble/MANIFEST", false},
+		{"user meta pebble sst - now invalid", "databases/marmot_meta.pebble/000001.sst", false},
+		{"user meta pebble manifest - now invalid", "databases/marmot_meta.pebble/MANIFEST", false},
+		{"nested pebble file", "databases/foo_meta.pebble/subdir/MANIFEST", false},
+
+		// Other invalid paths
 		{"nested db", "databases/subdir/test.db", false},
 		{"root db", "marmot.db", false},
 		{"wrong extension", "databases/marmot.txt", false},
 		{"no extension", "databases/marmot", false},
 		{"wrong dir", "data/marmot.db", false},
-		{"nested badger file", "databases/foo_meta.badger/subdir/MANIFEST", false},
 	}
 
 	for _, tt := range tests {

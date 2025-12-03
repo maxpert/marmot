@@ -73,34 +73,19 @@ func sanitizeSnapshotFilename(filename string) (string, error) {
 }
 
 // isValidSnapshotPath checks if the path matches expected snapshot file patterns
+// NOTE: Only SQLite .db files are included in snapshots.
+// MetaStore (PebbleDB) directories are NOT included due to race conditions
+// from WAL rotation and compaction during snapshot streaming.
 func isValidSnapshotPath(path string) bool {
 	// System database at root
 	if path == "__marmot_system.db" {
 		return true
-	}
-	// System meta database (BadgerDB directory files) at root
-	if strings.HasPrefix(path, "__marmot_system_meta.badger"+string(filepath.Separator)) {
-		// Valid BadgerDB file patterns
-		relPath := strings.TrimPrefix(path, "__marmot_system_meta.badger"+string(filepath.Separator))
-		if !strings.Contains(relPath, string(filepath.Separator)) {
-			return true
-		}
 	}
 	// User databases (.db files) in databases/ subdirectory
 	if strings.HasPrefix(path, "databases"+string(filepath.Separator)) && strings.HasSuffix(path, ".db") {
 		// Ensure no additional directory traversal within databases/
 		relPath := strings.TrimPrefix(path, "databases"+string(filepath.Separator))
 		if !strings.Contains(relPath, string(filepath.Separator)) {
-			return true
-		}
-	}
-	// User meta databases (BadgerDB directory files) in databases/ subdirectory
-	if strings.HasPrefix(path, "databases"+string(filepath.Separator)) && strings.Contains(path, "_meta.badger"+string(filepath.Separator)) {
-		// Pattern: databases/{name}_meta.badger/{file}
-		// Ensure exactly 2 path components after databases/
-		relPath := strings.TrimPrefix(path, "databases"+string(filepath.Separator))
-		parts := strings.Split(relPath, string(filepath.Separator))
-		if len(parts) == 2 && strings.HasSuffix(parts[0], "_meta.badger") {
 			return true
 		}
 	}
@@ -391,7 +376,7 @@ func (c *CatchUpClient) applySnapshot(ctx context.Context, client MarmotServiceC
 		if !exists {
 			filePath := filepath.Join(c.dataDir, sanitizedFilename)
 
-			// Ensure parent directory exists (needed for BadgerDB subdirectories)
+			// Ensure parent directory exists (e.g., databases/ subdirectory)
 			if dir := filepath.Dir(filePath); dir != "." {
 				if err := os.MkdirAll(dir, 0755); err != nil {
 					return fmt.Errorf("failed to create directory %s: %w", dir, err)
@@ -526,22 +511,21 @@ func (c *CatchUpClient) GetLocalMaxTxnID(ctx context.Context) (map[string]uint64
 
 // getMaxTxnIDFromDB queries the maximum transaction ID from a database's MetaStore
 func (c *CatchUpClient) getMaxTxnIDFromDB(dbPath string) (uint64, error) {
-	// MetaStore path is {dbPath without .db}_meta.badger
-	metaPath := strings.TrimSuffix(dbPath, ".db") + "_meta.badger"
+	// MetaStore path is {dbPath without .db}_meta.pebble
+	metaPath := strings.TrimSuffix(dbPath, ".db") + "_meta.pebble"
 
 	// Check if MetaStore directory exists
 	if _, err := os.Stat(metaPath); os.IsNotExist(err) {
 		return 0, nil
 	}
 
-	// Open a temporary BadgerMetaStore (read-only, minimal memory)
-	metaStore, err := db.NewBadgerMetaStore(metaPath, db.BadgerMetaStoreOptions{
-		SyncWrites:     false,
-		NumCompactors:  1,
-		ValueLogGC:     false,
-		BlockCacheMB:   16, // Minimal for read-only lookup
-		MemTableSizeMB: 16, // Minimal for read-only lookup
-		NumMemTables:   1,  // Minimal for read-only lookup
+	// Open a temporary PebbleMetaStore (read-only, minimal memory)
+	metaStore, err := db.NewPebbleMetaStore(metaPath, db.PebbleMetaStoreOptions{
+		CacheSizeMB:           16, // Minimal for read-only lookup
+		MemTableSizeMB:        16,
+		MemTableCount:         1,
+		L0CompactionThreshold: 4,
+		L0StopWrites:          12,
 	})
 	if err != nil {
 		return 0, nil // MetaStore might not be initialized yet
