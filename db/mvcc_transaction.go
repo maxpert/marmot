@@ -399,6 +399,10 @@ func (tm *MVCCTransactionManager) rebuildStatementsFromCDC(cdcEntries []*IntentE
 
 // applyCDCEntries applies CDC data entries to SQLite.
 func (tm *MVCCTransactionManager) applyCDCEntries(txnID uint64, entries []*IntentEntry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+
 	for _, entry := range entries {
 		stmt := protocol.Statement{
 			TableName: entry.Table,
