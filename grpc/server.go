@@ -17,9 +17,9 @@ import (
 
 	"github.com/maxpert/marmot/cfg"
 	"github.com/maxpert/marmot/db"
+	"github.com/maxpert/marmot/encoding"
 	"github.com/rs/zerolog/log"
 	"github.com/soheilhy/cmux"
-	"github.com/vmihailenco/msgpack/v5"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/reflection"
@@ -411,7 +411,7 @@ func (s *Server) StreamChanges(req *StreamRequest, stream MarmotService_StreamCh
 					OldValues map[string][]byte `msgpack:"OldValues"`
 					NewValues map[string][]byte `msgpack:"NewValues"`
 				}
-				if err := msgpack.Unmarshal(rec.SerializedStatements, &rawStatements); err != nil {
+				if err := encoding.Unmarshal(rec.SerializedStatements, &rawStatements); err != nil {
 					log.Warn().Err(err).Uint64("txn_id", rec.TxnID).Msg("Failed to parse statements msgpack")
 				} else {
 					for _, s := range rawStatements {

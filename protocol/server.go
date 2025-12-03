@@ -258,7 +258,7 @@ func (s *MySQLServer) handleConnection(conn net.Conn) {
 			dbName := string(payload[1:])
 			session.CurrentDatabase = dbName
 			log.Debug().Uint64("conn_id", session.ConnID).Str("database", dbName).Msg("Changed database")
-			s.writeOK(conn, 1, 0)
+			_ = s.writeOK(conn, 1, 0)
 		case 0x03: // COM_QUERY
 			query := string(payload[1:])
 			s.processQuery(conn, session, query)
@@ -278,12 +278,12 @@ func (s *MySQLServer) handleConnection(conn net.Conn) {
 			}
 			// COM_STMT_CLOSE doesn't send a response
 		case 0x0E: // COM_PING
-			s.writeOK(conn, 1, 0)
+			_ = s.writeOK(conn, 1, 0)
 		case 0x01: // COM_QUIT
 			return
 		default:
 			log.Warn().Hex("cmd", []byte{cmd}).Msg("Unsupported command")
-			s.writeError(conn, 1, 1047, "Unknown command")
+			_ = s.writeError(conn, 1, 1047, "Unknown command")
 		}
 	}
 }
@@ -294,7 +294,7 @@ func (s *MySQLServer) processQuery(conn net.Conn, session *ConnectionSession, qu
 
 	rs, err := s.handler.HandleQuery(session, query)
 	if err != nil {
-		s.writeMySQLErr(conn, 1, err)
+		_ = s.writeMySQLErr(conn, 1, err)
 		return
 	}
 
@@ -304,12 +304,12 @@ func (s *MySQLServer) processQuery(conn net.Conn, session *ConnectionSession, qu
 		if rs != nil {
 			rowsAffected = rs.RowsAffected
 		}
-		s.writeOK(conn, 1, rowsAffected)
+		_ = s.writeOK(conn, 1, rowsAffected)
 		return
 	}
 
 	// Send Result Set
-	s.writeResultSet(conn, 1, rs)
+	_ = s.writeResultSet(conn, 1, rs)
 }
 
 // --- Packet Writing Helpers ---
@@ -328,7 +328,7 @@ func (s *MySQLServer) writeHandshake(w io.Writer) error {
 	buf.WriteString("5.7.0-Marmot-V2\x00")
 
 	// Connection ID
-	binary.Write(buf, binary.LittleEndian, uint32(1))
+	_ = binary.Write(buf, binary.LittleEndian, uint32(1))
 
 	// Auth plugin data part 1 (8 bytes)
 	buf.WriteString("12345678")
@@ -339,17 +339,17 @@ func (s *MySQLServer) writeHandshake(w io.Writer) error {
 	// Capability flags (lower 2 bytes)
 	// CLIENT_PROTOCOL_41 (0x200) | CLIENT_SECURE_CONNECTION (0x8000) | CLIENT_PLUGIN_AUTH (0x80000 - in upper bytes)
 	// Lower 16 bits: 0xa200 = CLIENT_LONG_PASSWORD (0x0001) | CLIENT_PROTOCOL_41 (0x0200) | CLIENT_SECURE_CONNECTION (0x8000) | CLIENT_TRANSACTIONS (0x2000)
-	binary.Write(buf, binary.LittleEndian, uint16(0xa201))
+	_ = binary.Write(buf, binary.LittleEndian, uint16(0xa201))
 
 	// Character set (utf8_general_ci = 33)
 	buf.WriteByte(33)
 
 	// Status flags
-	binary.Write(buf, binary.LittleEndian, uint16(2))
+	_ = binary.Write(buf, binary.LittleEndian, uint16(2))
 
 	// Capability flags (upper 2 bytes)
 	// CLIENT_PLUGIN_AUTH (0x80000) = bit 19, which is bit 3 in upper 16 bits = 0x0008
-	binary.Write(buf, binary.LittleEndian, uint16(0x0008))
+	_ = binary.Write(buf, binary.LittleEndian, uint16(0x0008))
 
 	// Auth plugin data length
 	buf.WriteByte(21) // 8 + 13
@@ -375,9 +375,9 @@ func (s *MySQLServer) writeOK(w io.Writer, seq byte, rowsAffected int64) error {
 	// Last insert ID (length-encoded integer)
 	buf.Write(packLengthEncodedInt(0))
 	// Status flags
-	binary.Write(buf, binary.LittleEndian, uint16(0x0002)) // SERVER_STATUS_AUTOCOMMIT
+	_ = binary.Write(buf, binary.LittleEndian, uint16(0x0002)) // SERVER_STATUS_AUTOCOMMIT
 	// Warnings
-	binary.Write(buf, binary.LittleEndian, uint16(0))
+	_ = binary.Write(buf, binary.LittleEndian, uint16(0))
 	return s.writePacket(w, seq, buf.Bytes())
 }
 
@@ -389,7 +389,7 @@ func (s *MySQLServer) writeErrorWithState(w io.Writer, seq byte, code uint16, sq
 	buf := getBuffer()
 	defer putBuffer(buf)
 	buf.WriteByte(0xFF) // Error packet header
-	binary.Write(buf, binary.LittleEndian, code)
+	_ = binary.Write(buf, binary.LittleEndian, code)
 	buf.WriteByte('#')
 	buf.WriteString(sqlState)
 	buf.WriteString(msg)
@@ -426,13 +426,13 @@ func (s *MySQLServer) writeResultSet(w io.Writer, seq byte, rs *ResultSet) error
 		writeLenEncString(colBuf, col.Name) // Name
 		writeLenEncString(colBuf, col.Name) // Org Name
 
-		colBuf.WriteByte(0x0c)                                  // Length of fixed fields
-		binary.Write(colBuf, binary.LittleEndian, uint16(33))   // Charset
-		binary.Write(colBuf, binary.LittleEndian, uint32(1024)) // Length
-		colBuf.WriteByte(col.Type)                              // Type
-		binary.Write(colBuf, binary.LittleEndian, uint16(0))    // Flags
-		colBuf.WriteByte(0)                                     // Decimals
-		colBuf.Write([]byte{0, 0})                              // Filler
+		colBuf.WriteByte(0x0c)                                      // Length of fixed fields
+		_ = binary.Write(colBuf, binary.LittleEndian, uint16(33))   // Charset
+		_ = binary.Write(colBuf, binary.LittleEndian, uint32(1024)) // Length
+		colBuf.WriteByte(col.Type)                                  // Type
+		_ = binary.Write(colBuf, binary.LittleEndian, uint16(0))    // Flags
+		colBuf.WriteByte(0)                                         // Decimals
+		colBuf.Write([]byte{0, 0})                                  // Filler
 
 		if err := s.writePacket(w, seq, colBuf.Bytes()); err != nil {
 			return err
@@ -491,13 +491,13 @@ func (s *MySQLServer) writeBinaryResultSet(w io.Writer, seq byte, rs *ResultSet)
 		writeLenEncString(colBuf, col.Name) // Name
 		writeLenEncString(colBuf, col.Name) // Org Name
 
-		colBuf.WriteByte(0x0c)                                  // Length of fixed fields
-		binary.Write(colBuf, binary.LittleEndian, uint16(33))   // Charset
-		binary.Write(colBuf, binary.LittleEndian, uint32(1024)) // Length
-		colBuf.WriteByte(col.Type)                              // Type
-		binary.Write(colBuf, binary.LittleEndian, uint16(0))    // Flags
-		colBuf.WriteByte(0)                                     // Decimals
-		colBuf.Write([]byte{0, 0})                              // Filler
+		colBuf.WriteByte(0x0c)                                      // Length of fixed fields
+		_ = binary.Write(colBuf, binary.LittleEndian, uint16(33))   // Charset
+		_ = binary.Write(colBuf, binary.LittleEndian, uint32(1024)) // Length
+		colBuf.WriteByte(col.Type)                                  // Type
+		_ = binary.Write(colBuf, binary.LittleEndian, uint16(0))    // Flags
+		colBuf.WriteByte(0)                                         // Decimals
+		colBuf.Write([]byte{0, 0})                                  // Filler
 
 		if err := s.writePacket(w, seq, colBuf.Bytes()); err != nil {
 			return err
@@ -737,7 +737,7 @@ func (s *MySQLServer) handleStmtPrepare(conn net.Conn, session *ConnectionSessio
 			Str("query", sql).
 			Err(err).
 			Msg("Failed to process SQL in PREPARE")
-		s.writeError(conn, 1, 1064, err.Error())
+		_ = s.writeError(conn, 1, 1064, err.Error())
 		return
 	}
 
@@ -751,7 +751,7 @@ func (s *MySQLServer) handleStmtPrepare(conn net.Conn, session *ConnectionSessio
 			Str("query", sql).
 			Str("error", errorMsg).
 			Msg("Invalid SQL in PREPARE")
-		s.writeError(conn, 1, 1064, errorMsg)
+		_ = s.writeError(conn, 1, 1064, errorMsg)
 		return
 	}
 
@@ -784,21 +784,21 @@ func (s *MySQLServer) handleStmtPrepare(conn net.Conn, session *ConnectionSessio
 	buf.WriteByte(0x00)
 
 	// Statement ID
-	binary.Write(buf, binary.LittleEndian, stmtID)
+	_ = binary.Write(buf, binary.LittleEndian, stmtID)
 
 	// Number of columns (0 for INSERT/UPDATE/DELETE, >0 for SELECT)
-	binary.Write(buf, binary.LittleEndian, uint16(0))
+	_ = binary.Write(buf, binary.LittleEndian, uint16(0))
 
 	// Number of parameters
-	binary.Write(buf, binary.LittleEndian, paramCount)
+	_ = binary.Write(buf, binary.LittleEndian, paramCount)
 
 	// Filler
 	buf.WriteByte(0x00)
 
 	// Warning count
-	binary.Write(buf, binary.LittleEndian, uint16(0))
+	_ = binary.Write(buf, binary.LittleEndian, uint16(0))
 
-	s.writePacket(conn, 1, buf.Bytes())
+	_ = s.writePacket(conn, 1, buf.Bytes())
 
 	// Send parameter definitions if params > 0
 	// This is required by the MySQL protocol
@@ -814,26 +814,26 @@ func (s *MySQLServer) handleStmtPrepare(conn net.Conn, session *ConnectionSessio
 			writeLenEncString(paramDefBuf, "")
 			writeLenEncString(paramDefBuf, "?")
 			writeLenEncString(paramDefBuf, "")
-			paramDefBuf.WriteByte(0x0c)                                // length of fixed fields
-			binary.Write(paramDefBuf, binary.LittleEndian, uint16(63)) // charset (binary)
-			binary.Write(paramDefBuf, binary.LittleEndian, uint32(0))  // length
-			paramDefBuf.WriteByte(0xFD)                                // type (VAR_STRING)
-			binary.Write(paramDefBuf, binary.LittleEndian, uint16(0))  // flags
-			paramDefBuf.WriteByte(0x00)                                // decimals
-			binary.Write(paramDefBuf, binary.LittleEndian, uint16(0))  // filler
+			paramDefBuf.WriteByte(0x0c)                                    // length of fixed fields
+			_ = binary.Write(paramDefBuf, binary.LittleEndian, uint16(63)) // charset (binary)
+			_ = binary.Write(paramDefBuf, binary.LittleEndian, uint32(0))  // length
+			paramDefBuf.WriteByte(0xFD)                                    // type (VAR_STRING)
+			_ = binary.Write(paramDefBuf, binary.LittleEndian, uint16(0))  // flags
+			paramDefBuf.WriteByte(0x00)                                    // decimals
+			_ = binary.Write(paramDefBuf, binary.LittleEndian, uint16(0))  // filler
 
-			s.writePacket(conn, seqNum, paramDefBuf.Bytes())
+			_ = s.writePacket(conn, seqNum, paramDefBuf.Bytes())
 			seqNum++
 		}
 
 		// Send EOF packet after parameters
-		s.writePacket(conn, seqNum, []byte{0xFE, 0, 0, 0x02, 0})
+		_ = s.writePacket(conn, seqNum, []byte{0xFE, 0, 0, 0x02, 0})
 	}
 }
 
 func (s *MySQLServer) handleStmtExecute(conn net.Conn, session *ConnectionSession, payload []byte) {
 	if len(payload) < 9 {
-		s.writeError(conn, 1, 1064, "Invalid COM_STMT_EXECUTE packet")
+		_ = s.writeError(conn, 1, 1064, "Invalid COM_STMT_EXECUTE packet")
 		return
 	}
 
@@ -846,7 +846,7 @@ func (s *MySQLServer) handleStmtExecute(conn net.Conn, session *ConnectionSessio
 	session.preparedStmtLock.Unlock()
 
 	if !ok {
-		s.writeError(conn, 1, 1243, fmt.Sprintf("Unknown statement ID: %d", stmtID))
+		_ = s.writeError(conn, 1, 1243, fmt.Sprintf("Unknown statement ID: %d", stmtID))
 		return
 	}
 
@@ -862,7 +862,7 @@ func (s *MySQLServer) handleStmtExecute(conn net.Conn, session *ConnectionSessio
 		// Parse NULL bitmap and new-params-bound-flag
 		nullBitmapLen := (int(stmt.ParamCount) + 7) / 8
 		if len(payload) < 9+nullBitmapLen+1 {
-			s.writeError(conn, 1, 1064, "Invalid parameter data")
+			_ = s.writeError(conn, 1, 1064, "Invalid parameter data")
 			return
 		}
 
@@ -876,7 +876,7 @@ func (s *MySQLServer) handleStmtExecute(conn net.Conn, session *ConnectionSessio
 		if newParamsBoundFlag == 1 {
 			// New types provided - parse and cache them
 			if len(payload) < offset+int(stmt.ParamCount)*2 {
-				s.writeError(conn, 1, 1064, "Invalid parameter types")
+				_ = s.writeError(conn, 1, 1064, "Invalid parameter types")
 				return
 			}
 			paramTypes = make([]byte, int(stmt.ParamCount)*2)
@@ -908,7 +908,7 @@ func (s *MySQLServer) handleStmtExecute(conn net.Conn, session *ConnectionSessio
 				var err error
 				offset, val, err = parseParamValue(payload, offset, paramType)
 				if err != nil {
-					s.writeError(conn, 1, 1064, fmt.Sprintf("Failed to parse parameter %d: %v", i, err))
+					_ = s.writeError(conn, 1, 1064, fmt.Sprintf("Failed to parse parameter %d: %v", i, err))
 					return
 				}
 				params[i] = val
@@ -934,7 +934,7 @@ func (s *MySQLServer) handleStmtExecute(conn net.Conn, session *ConnectionSessio
 	// Execute query
 	rs, err := s.handler.HandleQuery(session, finalQuery)
 	if err != nil {
-		s.writeMySQLErr(conn, 1, err)
+		_ = s.writeMySQLErr(conn, 1, err)
 		return
 	}
 
@@ -955,10 +955,10 @@ func (s *MySQLServer) handleStmtExecute(conn net.Conn, session *ConnectionSessio
 	if isSelect {
 		// Write binary result set for SELECT queries
 		if rs != nil {
-			s.writeBinaryResultSet(conn, 1, rs)
+			_ = s.writeBinaryResultSet(conn, 1, rs)
 		} else {
 			// Empty result set
-			s.writeBinaryResultSet(conn, 1, &ResultSet{Columns: []ColumnDef{}, Rows: [][]interface{}{}})
+			_ = s.writeBinaryResultSet(conn, 1, &ResultSet{Columns: []ColumnDef{}, Rows: [][]interface{}{}})
 		}
 	} else {
 		// Write OK packet for DML queries
@@ -966,7 +966,7 @@ func (s *MySQLServer) handleStmtExecute(conn net.Conn, session *ConnectionSessio
 		if rs != nil {
 			rowsAffected = rs.RowsAffected
 		}
-		s.writeOK(conn, 1, rowsAffected)
+		_ = s.writeOK(conn, 1, rowsAffected)
 	}
 }
 

@@ -216,9 +216,10 @@ func (dm *DatabaseManager) CreateDatabase(name string) error {
 	dm.mu.Lock()
 	defer dm.mu.Unlock()
 
-	// Check if database already exists
+	// Check if database already exists - return success for idempotency (IF NOT EXISTS semantics)
 	if _, exists := dm.databases[name]; exists {
-		return fmt.Errorf("database %s already exists", name)
+		log.Debug().Str("database", name).Msg("Database already exists, returning success")
+		return nil
 	}
 
 	// Create database file

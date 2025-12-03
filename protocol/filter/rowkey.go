@@ -109,7 +109,7 @@ func HashRowKeyXXH64(rowKey string) uint64 {
 // HashPrimaryKeyXXH64 creates a uint64 hash from table name and primary key values.
 func HashPrimaryKeyXXH64(table string, pkValues map[string][]byte) uint64 {
 	h := xxhash.New()
-	h.Write([]byte(table))
+	_, _ = h.Write([]byte(table))
 
 	// Sort keys for deterministic hashing
 	keys := make([]string, 0, len(pkValues))
@@ -119,8 +119,8 @@ func HashPrimaryKeyXXH64(table string, pkValues map[string][]byte) uint64 {
 	sortStrings(keys)
 
 	for _, k := range keys {
-		h.Write([]byte(k))
-		h.Write(pkValues[k])
+		_, _ = h.Write([]byte(k))
+		_, _ = h.Write(pkValues[k])
 	}
 
 	return h.Sum64()

@@ -8,8 +8,8 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/maxpert/marmot/encoding"
 	"github.com/maxpert/marmot/protocol/filter"
-	"github.com/vmihailenco/msgpack/v5"
 )
 
 // TableSchema represents the schema of a table
@@ -200,7 +200,7 @@ func GenerateRowKey(schema *TableSchema, values map[string][]byte) (string, erro
 func extractStringValue(pkValue []byte) string {
 	// Try to unmarshal as msgpack string first
 	var val string
-	if err := msgpack.Unmarshal(pkValue, &val); err != nil {
+	if err := encoding.Unmarshal(pkValue, &val); err != nil {
 		// If not msgpack, use raw bytes as string
 		val = string(pkValue)
 	}
@@ -216,7 +216,7 @@ func isZeroValue(val []byte) bool {
 	}
 	// Try to unmarshal as msgpack string first
 	var s string
-	if err := msgpack.Unmarshal(val, &s); err != nil {
+	if err := encoding.Unmarshal(val, &s); err != nil {
 		// If not msgpack, use raw bytes as string
 		s = string(val)
 	}

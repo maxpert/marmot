@@ -10,9 +10,9 @@ import (
 
 	"github.com/maxpert/marmot/cfg"
 	"github.com/maxpert/marmot/db"
+	"github.com/maxpert/marmot/encoding"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/rs/zerolog/log"
-	"github.com/vmihailenco/msgpack/v5"
 )
 
 // DeltaSyncClient handles incremental replication catch-up
@@ -415,7 +415,7 @@ func (ds *DeltaSyncClient) applyCDCInsert(tx *sql.Tx, tableName string, newValue
 		placeholders = append(placeholders, "?")
 
 		var value interface{}
-		if err := msgpack.Unmarshal(newValues[col], &value); err != nil {
+		if err := encoding.Unmarshal(newValues[col], &value); err != nil {
 			return fmt.Errorf("failed to deserialize value for column %s: %w", col, err)
 		}
 		values = append(values, value)
@@ -460,7 +460,7 @@ func (ds *DeltaSyncClient) applyCDCDelete(tx *sql.Tx, tableName string, rowKey s
 		for col, valBytes := range oldValues {
 			whereClauses = append(whereClauses, fmt.Sprintf("%s = ?", col))
 			var value interface{}
-			if err := msgpack.Unmarshal(valBytes, &value); err != nil {
+			if err := encoding.Unmarshal(valBytes, &value); err != nil {
 				return fmt.Errorf("failed to deserialize value for column %s: %w", col, err)
 			}
 			values = append(values, value)

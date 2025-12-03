@@ -94,7 +94,7 @@ func TestCreateDatabase(t *testing.T) {
 	}
 }
 
-func TestCreateDatabaseDuplicate(t *testing.T) {
+func TestCreateDatabaseIdempotent(t *testing.T) {
 	dm, _ := setupTestDatabaseManager(t)
 	defer dm.Close()
 
@@ -104,10 +104,22 @@ func TestCreateDatabaseDuplicate(t *testing.T) {
 		t.Fatalf("Failed to create database: %v", err)
 	}
 
-	// Try to create again
+	// Try to create again - should succeed (idempotent)
 	err = dm.CreateDatabase("testdb")
-	if err == nil {
-		t.Error("Expected error when creating duplicate database")
+	if err != nil {
+		t.Errorf("Expected success for idempotent create, got error: %v", err)
+	}
+
+	// Verify only one database exists
+	databases := dm.ListDatabases()
+	count := 0
+	for _, name := range databases {
+		if name == "testdb" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Errorf("Expected exactly 1 testdb, found %d", count)
 	}
 }
 

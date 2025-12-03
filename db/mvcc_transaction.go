@@ -8,10 +8,10 @@ import (
 	"time"
 
 	"github.com/maxpert/marmot/cfg"
+	"github.com/maxpert/marmot/encoding"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/protocol"
 	"github.com/rs/zerolog/log"
-	"github.com/vmihailenco/msgpack/v5"
 )
 
 // MVCCTransaction represents a transaction with MVCC support
@@ -441,7 +441,7 @@ func (tm *MVCCTransactionManager) applyDDLIntents(txnID uint64, intents []*Write
 
 // finalizeCommit marks the transaction as committed in MetaStore.
 func (tm *MVCCTransactionManager) finalizeCommit(txn *MVCCTransaction) error {
-	statementsJSON, err := msgpack.Marshal(txn.Statements)
+	statementsJSON, err := encoding.Marshal(txn.Statements)
 	if err != nil {
 		return fmt.Errorf("failed to serialize statements: %w", err)
 	}
@@ -745,12 +745,12 @@ func (tm *MVCCTransactionManager) cleanupOldMVCCVersions(keepVersions int) (int,
 
 // SerializeData helper for data snapshots
 func SerializeData(data interface{}) ([]byte, error) {
-	return msgpack.Marshal(data)
+	return encoding.Marshal(data)
 }
 
 // DeserializeData helper for data snapshots
 func DeserializeData(data []byte, v interface{}) error {
-	return msgpack.Unmarshal(data, v)
+	return encoding.Unmarshal(data, v)
 }
 
 // =======================
@@ -861,7 +861,6 @@ func (tm *MVCCTransactionManager) writeCDCData(stmt protocol.Statement) error {
 // writeCDCInsert performs INSERT OR REPLACE using CDC row data
 func (tm *MVCCTransactionManager) writeCDCInsert(tableName string, newValues map[string][]byte) error {
 	if len(newValues) == 0 {
-		log.Debug().Str("table", tableName).Msg("writeCDCInsert: no values to insert")
 		return fmt.Errorf("no values to insert")
 	}
 
@@ -870,29 +869,23 @@ func (tm *MVCCTransactionManager) writeCDCInsert(tableName string, newValues map
 	placeholders := make([]string, 0, len(newValues))
 	values := make([]interface{}, 0, len(newValues))
 
-	// Collect columns (order doesn't matter for INSERT OR REPLACE with all columns)
 	for col := range newValues {
 		columns = append(columns, col)
 		placeholders = append(placeholders, "?")
 
-		// Deserialize value from msgpack
 		var value interface{}
-		if err := msgpack.Unmarshal(newValues[col], &value); err != nil {
+		if err := encoding.Unmarshal(newValues[col], &value); err != nil {
 			return fmt.Errorf("failed to deserialize value for column %s: %w", col, err)
-		}
-		// Convert []byte to string for text columns (msgpack deserializes strings as []byte)
-		if b, ok := value.([]byte); ok {
-			value = string(b)
 		}
 		values = append(values, value)
 	}
 
-	sql := fmt.Sprintf("INSERT OR REPLACE INTO %s (%s) VALUES (%s)",
+	sqlStmt := fmt.Sprintf("INSERT OR REPLACE INTO %s (%s) VALUES (%s)",
 		tableName,
 		strings.Join(columns, ", "),
 		strings.Join(placeholders, ", "))
 
-	_, err := tm.db.Exec(sql, values...)
+	_, err := tm.db.Exec(sqlStmt, values...)
 	return err
 }
 
@@ -916,14 +909,9 @@ func (tm *MVCCTransactionManager) writeCDCUpdate(tableName string, oldValues, ne
 	for col, valBytes := range newValues {
 		setClauses = append(setClauses, fmt.Sprintf("%s = ?", col))
 
-		// Deserialize value from msgpack
 		var value interface{}
-		if err := msgpack.Unmarshal(valBytes, &value); err != nil {
+		if err := encoding.Unmarshal(valBytes, &value); err != nil {
 			return fmt.Errorf("failed to deserialize value for column %s: %w", col, err)
-		}
-		// Convert []byte to string (msgpack deserializes strings as []byte)
-		if b, ok := value.([]byte); ok {
-			value = string(b)
 		}
 		values = append(values, value)
 	}
@@ -945,14 +933,9 @@ func (tm *MVCCTransactionManager) writeCDCUpdate(tableName string, oldValues, ne
 
 		whereClauses = append(whereClauses, fmt.Sprintf("%s = ?", pkCol))
 
-		// Deserialize PK value from msgpack
 		var value interface{}
-		if err := msgpack.Unmarshal(pkBytes, &value); err != nil {
+		if err := encoding.Unmarshal(pkBytes, &value); err != nil {
 			return fmt.Errorf("failed to deserialize PK value for column %s: %w", pkCol, err)
-		}
-		// Convert []byte to string (msgpack deserializes strings as []byte)
-		if b, ok := value.([]byte); ok {
-			value = string(b)
 		}
 		values = append(values, value)
 	}
@@ -996,14 +979,9 @@ func (tm *MVCCTransactionManager) writeCDCDelete(tableName string, rowKey string
 
 			whereClauses = append(whereClauses, fmt.Sprintf("%s = ?", pkCol))
 
-			// Deserialize PK value from msgpack
 			var value interface{}
-			if err := msgpack.Unmarshal(pkValue, &value); err != nil {
+			if err := encoding.Unmarshal(pkValue, &value); err != nil {
 				return fmt.Errorf("failed to deserialize PK value for column %s: %w", pkCol, err)
-			}
-			// Convert []byte to string (msgpack deserializes strings as []byte)
-			if b, ok := value.([]byte); ok {
-				value = string(b)
 			}
 			values = append(values, value)
 		}

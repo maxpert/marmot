@@ -9,9 +9,9 @@ import (
 
 	"github.com/maxpert/marmot/cfg"
 	"github.com/maxpert/marmot/db"
+	"github.com/maxpert/marmot/encoding"
 	marmotgrpc "github.com/maxpert/marmot/grpc"
 	"github.com/maxpert/marmot/hlc"
-	"github.com/vmihailenco/msgpack/v5"
 )
 
 // setupStreamClientTest creates test environment
@@ -586,7 +586,7 @@ func TestApplyCDCDelete_NoKeyOrValues(t *testing.T) {
 
 // Helper to msgpack marshal values
 func msgpackMarshal(v interface{}) []byte {
-	data, _ := msgpack.Marshal(v)
+	data, _ := encoding.Marshal(v)
 	return data
 }
 

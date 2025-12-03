@@ -142,7 +142,7 @@ func TestParser_SQLiteExecution_Updates(t *testing.T) {
 	defer db.Close()
 
 	// Insert test data
-	db.Exec("INSERT INTO users (id, name, email, status) VALUES (1, 'alice', 'a@ex.com', 'active'), (2, 'bob', 'b@ex.com', 'inactive')")
+	_, _ = db.Exec("INSERT INTO users (id, name, email, status) VALUES (1, 'alice', 'a@ex.com', 'active'), (2, 'bob', 'b@ex.com', 'inactive')")
 
 	tests := []struct {
 		name       string
@@ -154,7 +154,7 @@ func TestParser_SQLiteExecution_Updates(t *testing.T) {
 			mysqlQuery: "UPDATE users SET status = 'inactive' WHERE id = 1",
 			verifyFunc: func(t *testing.T, db *sql.DB) {
 				var status string
-				db.QueryRow("SELECT status FROM users WHERE id = 1").Scan(&status)
+				_ = db.QueryRow("SELECT status FROM users WHERE id = 1").Scan(&status)
 				if status != "inactive" {
 					t.Errorf("Expected status='inactive', got '%s'", status)
 				}
@@ -165,7 +165,7 @@ func TestParser_SQLiteExecution_Updates(t *testing.T) {
 			mysqlQuery: "UPDATE mydb.users SET email = 'newemail@ex.com' WHERE id = 2",
 			verifyFunc: func(t *testing.T, db *sql.DB) {
 				var email string
-				db.QueryRow("SELECT email FROM users WHERE id = 2").Scan(&email)
+				_ = db.QueryRow("SELECT email FROM users WHERE id = 2").Scan(&email)
 				if email != "newemail@ex.com" {
 					t.Errorf("Expected new email, got '%s'", email)
 				}
@@ -176,7 +176,7 @@ func TestParser_SQLiteExecution_Updates(t *testing.T) {
 			mysqlQuery: "/*+ CONSISTENCY(ALL) */ UPDATE users SET status = 'active' WHERE status = 'inactive'",
 			verifyFunc: func(t *testing.T, db *sql.DB) {
 				var count int
-				db.QueryRow("SELECT COUNT(*) FROM users WHERE status = 'active'").Scan(&count)
+				_ = db.QueryRow("SELECT COUNT(*) FROM users WHERE status = 'active'").Scan(&count)
 				if count != 2 {
 					t.Errorf("Expected 2 active users, got %d", count)
 				}

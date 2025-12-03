@@ -13,6 +13,7 @@ type enhancedMockReplicator struct {
 	mu                  sync.RWMutex
 	calls               []ReplicationCall
 	responses           map[uint64]*ReplicationResponse // For SetNodeResponse compatibility
+	commitResponses     map[uint64]*ReplicationResponse // Phase-specific: COMMIT only responses
 	conflicts           map[uint64]map[uint64]string    // nodeID -> txnID -> conflictMsg
 	persistentConflicts map[uint64]string               // nodeID -> conflictMsg (applies to ALL txns)
 	delays              map[uint64]time.Duration        // txnID -> delay
@@ -33,6 +34,7 @@ func newMockReplicator() *enhancedMockReplicator {
 	return &enhancedMockReplicator{
 		calls:               make([]ReplicationCall, 0),
 		responses:           make(map[uint64]*ReplicationResponse),
+		commitResponses:     make(map[uint64]*ReplicationResponse),
 		conflicts:           make(map[uint64]map[uint64]string),
 		persistentConflicts: make(map[uint64]string),
 		delays:              make(map[uint64]time.Duration),
@@ -52,6 +54,14 @@ func (m *enhancedMockReplicator) ReplicateTransaction(ctx context.Context, nodeI
 		Request: req,
 		Success: true,
 	})
+
+	// Check for phase-specific COMMIT response first
+	if req.Phase == PhaseCommit {
+		if resp, exists := m.commitResponses[nodeID]; exists {
+			m.mu.Unlock()
+			return resp, nil
+		}
+	}
 
 	// Check for pre-configured response (for backward compatibility with SetNodeResponse)
 	if resp, exists := m.responses[nodeID]; exists {
@@ -128,6 +138,13 @@ func (m *enhancedMockReplicator) SetNodeResponse(nodeID uint64, resp *Replicatio
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.responses[nodeID] = resp
+}
+
+// SetNodeCommitResponse sets a response for COMMIT phase only (PREPARE still succeeds)
+func (m *enhancedMockReplicator) SetNodeCommitResponse(nodeID uint64, resp *ReplicationResponse) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.commitResponses[nodeID] = resp
 }
 
 // SetConflict configures a conflict for a specific node and transaction

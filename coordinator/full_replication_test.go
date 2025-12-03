@@ -333,6 +333,133 @@ func containsAt(s, substr string) bool {
 	return false
 }
 
+// TestCommitQuorumFailure_CoordinatorDoesNotCommit verifies that if remote commit
+// quorum fails, the coordinator does NOT commit locally. This prevents data inconsistency
+// where only the coordinator has committed data.
+func TestCommitQuorumFailure_CoordinatorDoesNotCommit(t *testing.T) {
+	// Setup: 3-node cluster (quorum = 2)
+	nodes := []uint64{1, 2, 3}
+	nodeProvider := newMockNodeProvider(nodes)
+	clock := hlc.NewClock(1)
+
+	// Create separate replicators for remote and local
+	// Remote replicator: PREPARE succeeds, COMMIT fails
+	remoteReplicator := newMockReplicator()
+	remoteReplicator.SetNodeCommitResponse(2, &ReplicationResponse{Success: false, Error: "commit timeout"})
+	remoteReplicator.SetNodeCommitResponse(3, &ReplicationResponse{Success: false, Error: "commit timeout"})
+
+	// Local replicator: tracks if local commit was attempted
+	localReplicator := newMockReplicator()
+
+	coordinator := NewWriteCoordinator(
+		1, // node 1 is coordinator
+		nodeProvider,
+		remoteReplicator,
+		localReplicator,
+		1*time.Second,
+		clock,
+	)
+
+	txn := &Transaction{
+		ID:     1,
+		NodeID: 1,
+		Statements: []protocol.Statement{
+			{
+				SQL:       "INSERT INTO users VALUES (1, 'Alice')",
+				Type:      protocol.StatementInsert,
+				TableName: "users",
+			},
+		},
+		StartTS:          hlc.Timestamp{WallTime: 1000, Logical: 0, NodeID: 1},
+		WriteConsistency: protocol.ConsistencyQuorum,
+	}
+
+	ctx := context.Background()
+	err := coordinator.WriteTransaction(ctx, txn)
+
+	// Should FAIL - remote commit quorum not achieved
+	if err == nil {
+		t.Fatal("Expected write to fail when remote commit quorum not achieved, but it succeeded")
+	}
+
+	if !contains(err.Error(), "commit quorum not achieved") {
+		t.Errorf("Expected 'commit quorum not achieved' error, got: %v", err)
+	}
+
+	// Verify local commit was NOT attempted (critical check)
+	localCalls := localReplicator.GetCalls()
+	for _, call := range localCalls {
+		if call.Request.Phase == PhaseCommit {
+			t.Error("CRITICAL: Local commit was attempted despite remote quorum failure - this causes data inconsistency!")
+		}
+	}
+
+	t.Log("Success: Coordinator did not commit locally when remote quorum failed")
+}
+
+// TestCommitQuorumSuccess_PartialRemoteFailure verifies that if at least (quorum-1)
+// remote nodes commit, the coordinator commits locally and transaction succeeds.
+func TestCommitQuorumSuccess_PartialRemoteFailure(t *testing.T) {
+	// Setup: 3-node cluster (quorum = 2)
+	// With coordinator, we need (quorum-1) = 1 remote ACK
+	nodes := []uint64{1, 2, 3}
+	nodeProvider := newMockNodeProvider(nodes)
+	clock := hlc.NewClock(1)
+
+	// Remote replicator: node 2 succeeds, node 3 fails
+	remoteReplicator := newMockReplicator()
+	remoteReplicator.SetNodeCommitResponse(3, &ReplicationResponse{Success: false, Error: "commit timeout"})
+
+	// Local replicator
+	localReplicator := newMockReplicator()
+
+	coordinator := NewWriteCoordinator(
+		1, // node 1 is coordinator
+		nodeProvider,
+		remoteReplicator,
+		localReplicator,
+		1*time.Second,
+		clock,
+	)
+
+	txn := &Transaction{
+		ID:     2,
+		NodeID: 1,
+		Statements: []protocol.Statement{
+			{
+				SQL:       "INSERT INTO users VALUES (2, 'Bob')",
+				Type:      protocol.StatementInsert,
+				TableName: "users",
+			},
+		},
+		StartTS:          hlc.Timestamp{WallTime: 2000, Logical: 0, NodeID: 1},
+		WriteConsistency: protocol.ConsistencyQuorum,
+	}
+
+	ctx := context.Background()
+	err := coordinator.WriteTransaction(ctx, txn)
+
+	// Should SUCCEED - node 2 + coordinator = quorum of 2
+	if err != nil {
+		t.Fatalf("Expected write to succeed with partial remote failure, got error: %v", err)
+	}
+
+	// Verify local commit WAS attempted
+	localCalls := localReplicator.GetCalls()
+	hasLocalCommit := false
+	for _, call := range localCalls {
+		if call.Request.Phase == PhaseCommit {
+			hasLocalCommit = true
+			break
+		}
+	}
+	if !hasLocalCommit {
+		t.Error("Expected local commit to be attempted after remote quorum achieved")
+	}
+
+	t.Log("Success: Coordinator committed locally after remote quorum achieved")
+}
+
 // TestSplitBrainPrevention verifies that quorum is calculated from total membership
 // to prevent split-brain scenarios. In a 6-node cluster split 3x3, neither partition
 // should be able to achieve quorum (which requires 4 acks based on total membership of 6).

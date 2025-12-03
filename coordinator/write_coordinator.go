@@ -229,8 +229,9 @@ func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transacti
 	// PHASE 2: COMMIT
 	// ====================
 	// Quorum of write intents created successfully with no conflicts.
-	// Commit locally FIRST, then broadcast to others.
-	// This ensures coordinator never tells others to commit something it couldn't commit itself.
+	// CRITICAL: Commit to REMOTE nodes first, wait for quorum-1 ACKs, then commit locally.
+	// This ensures if remote quorum fails, coordinator hasn't committed yet (clean abort).
+	// After PREPARE ACK, commit MUST succeed (nodes promised they can commit).
 	commitStart := time.Now()
 	log.Debug().
 		Uint64("txn_id", txn.ID).
@@ -247,26 +248,7 @@ func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transacti
 
 	commitResponses := make(map[uint64]*ReplicationResponse)
 
-	// COMMIT LOCALLY FIRST - coordinator must succeed before telling others to commit
-	// This is standard 2PC behavior: coordinator commits first, then broadcasts
-	if _, selfPrepared := prepResponses[wc.nodeID]; selfPrepared {
-		log.Debug().
-			Uint64("txn_id", txn.ID).
-			Msg("Committing locally first (coordinator)")
-		localResp, localErr := wc.localReplicator.ReplicateTransaction(ctx, wc.nodeID, commitReq)
-		if localErr != nil || localResp == nil || !localResp.Success {
-			errMsg := ""
-			if localResp != nil {
-				errMsg = localResp.Error
-			}
-			log.Error().Err(localErr).Str("resp_error", errMsg).Msg("Local commit failed - aborting transaction")
-			wc.abortTransaction(ctx, aliveNodes, txn.ID, txn.Database)
-			return fmt.Errorf("local commit failed: %v", localErr)
-		}
-		commitResponses[wc.nodeID] = localResp
-	}
-
-	// Now broadcast COMMIT to other prepared nodes
+	// Count other prepared nodes (excluding self)
 	otherPreparedNodes := 0
 	for nodeID := range prepResponses {
 		if nodeID != wc.nodeID {
@@ -274,21 +256,26 @@ func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transacti
 		}
 	}
 
+	// Calculate how many remote ACKs we need before committing locally
+	// We need (quorum - 1) from remotes, then local commit gives us quorum
+	_, selfPrepared := prepResponses[wc.nodeID]
+	remoteQuorumNeeded := requiredQuorum
+	if selfPrepared {
+		remoteQuorumNeeded = requiredQuorum - 1 // We'll add local commit after
+	}
+
+	// STEP 1: Send COMMIT to remote nodes first
 	commitChan := make(chan response, otherPreparedNodes)
 	for nodeID := range prepResponses {
 		if nodeID == wc.nodeID {
-			continue // Already committed locally
+			continue // Don't commit locally yet
 		}
 		log.Debug().
 			Uint64("txn_id", txn.ID).
 			Uint64("target_node", nodeID).
-			Msg("sending COMMIT to node")
+			Msg("sending COMMIT to remote node")
 		go func(nid uint64) {
-			// CRITICAL: Use a detached context with its own timeout for COMMIT.
-			// The parent context may be cancelled after quorum is achieved,
-			// but we still need to complete COMMIT to all prepared nodes.
-			// This prevents "transaction not found" errors on nodes that
-			// prepared but didn't receive COMMIT before context cancellation.
+			// Use detached context - remote commits should complete even if parent cancelled
 			commitCtx, commitCancel := context.WithTimeout(context.Background(), wc.timeout)
 			defer commitCancel()
 			resp, err := wc.replicator.ReplicateTransaction(commitCtx, nid, commitReq)
@@ -296,58 +283,93 @@ func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transacti
 		}(nodeID)
 	}
 
-	// Collect commit responses until quorum achieved or all responses received
-	for i := 0; i < otherPreparedNodes && len(commitResponses) < requiredQuorum; i++ {
+	// STEP 2: Collect remote commit responses until we have enough for quorum
+	remoteAcks := 0
+	for i := 0; i < otherPreparedNodes; i++ {
 		select {
 		case r := <-commitChan:
 			if r.err == nil && r.resp != nil && r.resp.Success {
 				commitResponses[r.nodeID] = r.resp
+				remoteAcks++
+				log.Debug().
+					Uint64("txn_id", txn.ID).
+					Uint64("node_id", r.nodeID).
+					Int("remote_acks", remoteAcks).
+					Int("needed", remoteQuorumNeeded).
+					Msg("Remote commit ACK received")
 			} else {
 				errMsg := ""
 				if r.resp != nil {
 					errMsg = r.resp.Error
 				}
-				log.Error().Err(r.err).Uint64("node_id", r.nodeID).Str("resp_error", errMsg).Msg("Commit failed")
+				log.Error().Err(r.err).Uint64("node_id", r.nodeID).Str("resp_error", errMsg).Msg("Remote commit failed")
 			}
 		case <-time.After(wc.timeout):
-			log.Warn().Msg("Commit response timed out. Will be repaired by anti-entropy.")
+			log.Warn().
+				Uint64("txn_id", txn.ID).
+				Int("remote_acks", remoteAcks).
+				Int("needed", remoteQuorumNeeded).
+				Msg("Commit response timed out waiting for remote nodes")
 		}
+
+		// Check if we have enough remote ACKs to proceed with local commit
+		if remoteAcks >= remoteQuorumNeeded {
+			break
+		}
+	}
+
+	// STEP 3: Check if we got enough remote ACKs
+	if remoteAcks < remoteQuorumNeeded {
+		// Remote quorum not achieved - abort ALL (including self, which hasn't committed yet)
+		log.Warn().
+			Uint64("txn_id", txn.ID).
+			Int("remote_acks", remoteAcks).
+			Int("needed", remoteQuorumNeeded).
+			Msg("Remote commit quorum not achieved - aborting transaction")
+
+		wc.abortTransaction(ctx, aliveNodes, txn.ID, txn.Database)
+		telemetry.TxnTotal.With("write", "failed").Inc()
+		telemetry.TxnDurationSeconds.With("write").Observe(time.Since(txnStart).Seconds())
+		return fmt.Errorf("commit quorum not achieved: got %d remote acks, need %d", remoteAcks, remoteQuorumNeeded)
+	}
+
+	// STEP 4: Remote quorum achieved - now commit locally
+	// This MUST succeed since we already PREPARED locally (we promised we can commit)
+	if selfPrepared {
+		log.Debug().
+			Uint64("txn_id", txn.ID).
+			Int("remote_acks", remoteAcks).
+			Msg("Remote quorum achieved, committing locally")
+		localResp, localErr := wc.localReplicator.ReplicateTransaction(ctx, wc.nodeID, commitReq)
+		if localErr != nil || localResp == nil || !localResp.Success {
+			// This should NEVER happen - we PREPARED successfully, commit must succeed
+			// If it does fail, we have a serious bug in PREPARE phase
+			errMsg := ""
+			if localResp != nil {
+				errMsg = localResp.Error
+			}
+			log.Error().
+				Err(localErr).
+				Str("resp_error", errMsg).
+				Uint64("txn_id", txn.ID).
+				Msg("CRITICAL: Local commit failed after remote quorum achieved - this indicates a bug in PREPARE")
+			// Don't abort remotes - they already committed. Return error but data is partially committed.
+			telemetry.TxnTotal.With("write", "failed").Inc()
+			telemetry.TxnDurationSeconds.With("write").Observe(time.Since(txnStart).Seconds())
+			return fmt.Errorf("local commit failed after remote quorum: %v", localErr)
+		}
+		commitResponses[wc.nodeID] = localResp
 	}
 
 	totalCommitAcks := len(commitResponses)
 	telemetry.TwoPhaseCommitSeconds.Observe(time.Since(commitStart).Seconds())
 	telemetry.TwoPhaseQuorumAcks.With("commit").Observe(float64(totalCommitAcks))
 
-	// Commit phase also requires quorum for durability guarantees.
-	// If commit quorum fails, transaction is partially committed -
-	// send ABORT to prepared nodes that didn't commit to clean up intents.
-	if totalCommitAcks < requiredQuorum {
-		// Send ABORT to prepared nodes that didn't commit to cleanup orphaned intents
-		for nodeID := range prepResponses {
-			if _, committed := commitResponses[nodeID]; !committed {
-				log.Debug().
-					Uint64("txn_id", txn.ID).
-					Uint64("node_id", nodeID).
-					Msg("sending ABORT to cleanup uncommitted prepared node")
-				go func(nid uint64) {
-					abortReq := &ReplicationRequest{
-						TxnID:    txn.ID,
-						Phase:    PhaseAbort,
-						Database: txn.Database,
-					}
-					if nid == wc.nodeID {
-						wc.localReplicator.ReplicateTransaction(ctx, nid, abortReq)
-					} else {
-						wc.replicator.ReplicateTransaction(ctx, nid, abortReq)
-					}
-				}(nodeID)
-			}
-		}
-		telemetry.TxnTotal.With("write", "failed").Inc()
-		telemetry.TxnDurationSeconds.With("write").Observe(time.Since(txnStart).Seconds())
-		return fmt.Errorf("commit quorum degraded: got %d acks, expected %d (aborted uncommitted nodes)",
-			totalCommitAcks, requiredQuorum)
-	}
+	log.Debug().
+		Uint64("txn_id", txn.ID).
+		Int("total_acks", totalCommitAcks).
+		Int("required", requiredQuorum).
+		Msg("COMMIT phase complete")
 
 	telemetry.TxnTotal.With("write", "success").Inc()
 	telemetry.TxnDurationSeconds.With("write").Observe(time.Since(txnStart).Seconds())

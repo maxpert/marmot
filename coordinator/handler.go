@@ -238,10 +238,19 @@ func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, qu
 	}
 
 	// Check for consistency hint
-	consistency, _ := protocol.ExtractConsistencyHint(query)
+	consistency, found := protocol.ExtractConsistencyHint(query)
 
 	isMutation := protocol.IsMutation(stmt)
 	inTransaction := session.InTransaction()
+
+	// Use configured default if no hint specified (different defaults for reads vs writes)
+	if !found {
+		if isMutation {
+			consistency, _ = protocol.ParseConsistencyLevel(cfg.Config.Replication.DefaultWriteConsist)
+		} else {
+			consistency, _ = protocol.ParseConsistencyLevel(cfg.Config.Replication.DefaultReadConsist)
+		}
+	}
 
 	log.Trace().
 		Int("stmt_type", int(stmt.Type)).
@@ -736,15 +745,77 @@ func (h *CoordinatorHandler) handleCommit(session *protocol.ConnectionSession) (
 		Int("stmt_count", len(txnState.Statements)).
 		Msg("COMMIT: Executing batched transaction via 2PC")
 
-	// Create 2PC transaction with ALL accumulated statements
+	// Execute DML statements with hooks to capture CDC data
+	// This is required for 2PC replication - without CDC data, intents cannot be created
+	enrichedStatements := make([]protocol.Statement, 0, len(txnState.Statements))
+	var totalRowsAffected int64
+
+	hookTimeout := 50 * time.Second
+	if cfg.Config != nil && cfg.Config.MVCC.LockWaitTimeoutSeconds > 0 {
+		hookTimeout = time.Duration(cfg.Config.MVCC.LockWaitTimeoutSeconds) * time.Second
+	}
+
+	for _, stmt := range txnState.Statements {
+		if protocol.IsDML(stmt) && stmt.Database != "" {
+			mvccDB, err := h.dbManager.GetMVCCDatabase(stmt.Database)
+			if err != nil {
+				session.EndTransaction()
+				h.recentTxnIDs.Delete(txnState.TxnID)
+				return nil, fmt.Errorf("failed to get database %s: %w", stmt.Database, err)
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), hookTimeout)
+			pendingExec, err := mvccDB.ExecuteLocalWithHooks(ctx, txnState.TxnID, []protocol.Statement{stmt})
+			if err != nil {
+				cancel()
+				session.EndTransaction()
+				h.recentTxnIDs.Delete(txnState.TxnID)
+				return nil, fmt.Errorf("DML execution failed: %w", err)
+			}
+			cancel()
+
+			totalRowsAffected += pendingExec.GetTotalRowCount()
+
+			// Extract CDC data and merge into statement
+			cdcEntries := pendingExec.GetCDCEntries()
+			if len(cdcEntries) > 0 {
+				// For UPSERT (INSERT OR REPLACE) on existing rows, SQLite fires 2 hooks:
+				// - DELETE (OldValues filled, NewValues empty)
+				// - INSERT (OldValues empty, NewValues filled)
+				// Merge all entries to get both OldValues and NewValues
+				mergedOldValues := make(map[string][]byte)
+				mergedNewValues := make(map[string][]byte)
+				var rowKey string
+
+				for _, e := range cdcEntries {
+					if rowKey == "" {
+						rowKey = e.RowKey
+					}
+					for k, v := range e.OldValues {
+						mergedOldValues[k] = v
+					}
+					for k, v := range e.NewValues {
+						mergedNewValues[k] = v
+					}
+				}
+
+				stmt.RowKey = rowKey
+				stmt.OldValues = mergedOldValues
+				stmt.NewValues = mergedNewValues
+			}
+		}
+		enrichedStatements = append(enrichedStatements, stmt)
+	}
+
+	// Create 2PC transaction with CDC-enriched statements
 	txn := &Transaction{
 		ID:                    txnState.TxnID,
 		NodeID:                h.nodeID,
-		Statements:            txnState.Statements,
+		Statements:            enrichedStatements,
 		StartTS:               txnState.StartTS,
 		WriteConsistency:      protocol.ConsistencyQuorum, // Default to quorum for explicit transactions
 		Database:              txnState.Database,
-		RequiredSchemaVersion: 0, // Will be set by handleMutation if needed
+		RequiredSchemaVersion: 0,
 	}
 
 	// Get schema version if schema manager is available
@@ -780,11 +851,12 @@ func (h *CoordinatorHandler) handleCommit(session *protocol.ConnectionSession) (
 	log.Debug().
 		Uint64("conn_id", session.ConnID).
 		Uint64("txn_id", txnState.TxnID).
-		Int("stmt_count", len(txnState.Statements)).
+		Int("stmt_count", len(enrichedStatements)).
+		Int64("rows_affected", totalRowsAffected).
 		Msg("COMMIT: Transaction committed successfully")
 
 	return &protocol.ResultSet{
-		RowsAffected: int64(len(txnState.Statements)),
+		RowsAffected: totalRowsAffected,
 	}, nil
 }
 

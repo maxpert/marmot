@@ -12,9 +12,9 @@ import (
 	"github.com/cespare/xxhash/v2"
 	"github.com/cockroachdb/pebble"
 	"github.com/maxpert/marmot/cfg"
+	"github.com/maxpert/marmot/encoding"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/rs/zerolog/log"
-	"github.com/vmihailenco/msgpack/v5"
 )
 
 // Key prefixes for Pebble (same as BadgerDB, sorted for efficient iteration)
@@ -466,7 +466,7 @@ func (s *PebbleMetaStore) BeginTransaction(txnID, nodeID uint64, startTS hlc.Tim
 		LastHeartbeat:  time.Now().UnixNano(),
 	}
 
-	data, err := msgpack.Marshal(rec)
+	data, err := encoding.Marshal(rec)
 	if err != nil {
 		return fmt.Errorf("failed to marshal transaction record: %w", err)
 	}
@@ -505,7 +505,7 @@ func (s *PebbleMetaStore) CommitTransaction(txnID uint64, commitTS hlc.Timestamp
 	}
 
 	var rec TransactionRecord
-	if err := msgpack.Unmarshal(recData, &rec); err != nil {
+	if err := encoding.Unmarshal(recData, &rec); err != nil {
 		return err
 	}
 
@@ -524,7 +524,7 @@ func (s *PebbleMetaStore) CommitTransaction(txnID uint64, commitTS hlc.Timestamp
 	rec.DatabaseName = dbName
 	rec.SeqNum = seqNum
 
-	data, err := msgpack.Marshal(&rec)
+	data, err := encoding.Marshal(&rec)
 	if err != nil {
 		return err
 	}
@@ -591,7 +591,7 @@ func (s *PebbleMetaStore) StoreReplayedTransaction(txnID, nodeID uint64, commitT
 		DatabaseName:         dbName,
 	}
 
-	data, err := msgpack.Marshal(rec)
+	data, err := encoding.Marshal(rec)
 	if err != nil {
 		return fmt.Errorf("failed to serialize transaction record: %w", err)
 	}
@@ -627,7 +627,7 @@ func (s *PebbleMetaStore) AbortTransaction(txnID uint64) error {
 	}
 
 	var rec TransactionRecord
-	if err := msgpack.Unmarshal(recData, &rec); err != nil {
+	if err := encoding.Unmarshal(recData, &rec); err != nil {
 		return err
 	}
 
@@ -663,7 +663,7 @@ func (s *PebbleMetaStore) GetTransaction(txnID uint64) (*TransactionRecord, erro
 	defer closer.Close()
 
 	rec := &TransactionRecord{}
-	if err := msgpack.Unmarshal(val, rec); err != nil {
+	if err := encoding.Unmarshal(val, rec); err != nil {
 		return nil, err
 	}
 	return rec, nil
@@ -705,12 +705,12 @@ func (s *PebbleMetaStore) Heartbeat(txnID uint64) error {
 	}
 
 	var rec TransactionRecord
-	if err := msgpack.Unmarshal(recData, &rec); err != nil {
+	if err := encoding.Unmarshal(recData, &rec); err != nil {
 		return err
 	}
 
 	rec.LastHeartbeat = time.Now().UnixNano()
-	data, err := msgpack.Marshal(&rec)
+	data, err := encoding.Marshal(&rec)
 	if err != nil {
 		return err
 	}
@@ -738,7 +738,7 @@ func (s *PebbleMetaStore) WriteIntent(txnID uint64, tableName, rowKey, op, sqlSt
 		defer closer.Close()
 
 		var existing WriteIntentRecord
-		if err := msgpack.Unmarshal(existingData, &existing); err != nil {
+		if err := encoding.Unmarshal(existingData, &existing); err != nil {
 			return err
 		}
 
@@ -748,7 +748,7 @@ func (s *PebbleMetaStore) WriteIntent(txnID uint64, tableName, rowKey, op, sqlSt
 			existing.SQLStatement = sqlStmt
 			existing.DataSnapshot = data
 			existing.CreatedAt = time.Now().UnixNano()
-			newData, err := msgpack.Marshal(&existing)
+			newData, err := encoding.Marshal(&existing)
 			if err != nil {
 				return err
 			}
@@ -779,7 +779,7 @@ func (s *PebbleMetaStore) WriteIntent(txnID uint64, tableName, rowKey, op, sqlSt
 		CreatedAt:    time.Now().UnixNano(),
 	}
 
-	recData, err := msgpack.Marshal(rec)
+	recData, err := encoding.Marshal(rec)
 	if err != nil {
 		return err
 	}
@@ -869,7 +869,7 @@ func (s *PebbleMetaStore) ValidateIntent(tableName, rowKey string, expectedTxnID
 	defer closer.Close()
 
 	var rec WriteIntentRecord
-	if err := msgpack.Unmarshal(val, &rec); err != nil {
+	if err := encoding.Unmarshal(val, &rec); err != nil {
 		return false, err
 	}
 
@@ -890,7 +890,7 @@ func (s *PebbleMetaStore) DeleteIntent(tableName, rowKey string, txnID uint64) e
 	}
 
 	var rec WriteIntentRecord
-	if err := msgpack.Unmarshal(val, &rec); err != nil {
+	if err := encoding.Unmarshal(val, &rec); err != nil {
 		closer.Close()
 		return err
 	}
@@ -1011,14 +1011,14 @@ func (s *PebbleMetaStore) MarkIntentsForCleanup(txnID uint64) error {
 		}
 
 		var rec WriteIntentRecord
-		if err := msgpack.Unmarshal(val, &rec); err != nil {
+		if err := encoding.Unmarshal(val, &rec); err != nil {
 			closer.Close()
 			return err
 		}
 		closer.Close()
 
 		rec.MarkedForCleanup = true
-		data, err := msgpack.Marshal(&rec)
+		data, err := encoding.Marshal(&rec)
 		if err != nil {
 			return err
 		}
@@ -1062,7 +1062,7 @@ func (s *PebbleMetaStore) GetIntentsByTxn(txnID uint64) ([]*WriteIntentRecord, e
 		}
 
 		intent := &WriteIntentRecord{}
-		if err := msgpack.Unmarshal(val, intent); err == nil && intent.TxnID == txnID {
+		if err := encoding.Unmarshal(val, intent); err == nil && intent.TxnID == txnID {
 			intents = append(intents, intent)
 		}
 		closer.Close()
@@ -1083,7 +1083,7 @@ func (s *PebbleMetaStore) GetIntent(tableName, rowKey string) (*WriteIntentRecor
 	defer closer.Close()
 
 	intent := &WriteIntentRecord{}
-	if err := msgpack.Unmarshal(val, intent); err != nil {
+	if err := encoding.Unmarshal(val, intent); err != nil {
 		return nil, err
 	}
 	return intent, nil
@@ -1103,7 +1103,7 @@ func (s *PebbleMetaStore) CreateMVCCVersion(tableName, rowKey string, ts hlc.Tim
 		CreatedAt:    time.Now().UnixNano(),
 	}
 
-	recData, err := msgpack.Marshal(rec)
+	recData, err := encoding.Marshal(rec)
 	if err != nil {
 		return err
 	}
@@ -1137,7 +1137,7 @@ func (s *PebbleMetaStore) GetLatestVersion(tableName, rowKey string) (*MVCCVersi
 	}
 
 	latest := &MVCCVersionRecord{}
-	if err := msgpack.Unmarshal(val, latest); err != nil {
+	if err := encoding.Unmarshal(val, latest); err != nil {
 		return nil, err
 	}
 
@@ -1177,7 +1177,7 @@ func (s *PebbleMetaStore) GetReplicationState(peerNodeID uint64, dbName string) 
 	defer closer.Close()
 
 	state := &ReplicationStateRecord{}
-	if err := msgpack.Unmarshal(val, state); err != nil {
+	if err := encoding.Unmarshal(val, state); err != nil {
 		return nil, err
 	}
 	return state, nil
@@ -1195,7 +1195,7 @@ func (s *PebbleMetaStore) UpdateReplicationState(peerNodeID uint64, dbName strin
 		SyncStatus:           MetaSyncStatusSynced,
 	}
 
-	data, err := msgpack.Marshal(state)
+	data, err := encoding.Marshal(state)
 	if err != nil {
 		return err
 	}
@@ -1225,7 +1225,7 @@ func (s *PebbleMetaStore) GetMinAppliedTxnID(dbName string) (uint64, error) {
 		}
 
 		var state ReplicationStateRecord
-		if err := msgpack.Unmarshal(val, &state); err != nil {
+		if err := encoding.Unmarshal(val, &state); err != nil {
 			continue
 		}
 
@@ -1267,7 +1267,7 @@ func (s *PebbleMetaStore) GetAllReplicationStates() ([]*ReplicationStateRecord, 
 		}
 
 		state := &ReplicationStateRecord{}
-		if err := msgpack.Unmarshal(val, state); err != nil {
+		if err := encoding.Unmarshal(val, state); err != nil {
 			continue
 		}
 		states = append(states, state)
@@ -1296,7 +1296,7 @@ func (s *PebbleMetaStore) GetSchemaVersion(dbName string) (int64, error) {
 	defer closer.Close()
 
 	var rec pebbleSchemaVersionRecord
-	if err := msgpack.Unmarshal(val, &rec); err != nil {
+	if err := encoding.Unmarshal(val, &rec); err != nil {
 		return 0, err
 	}
 	return rec.Version, nil
@@ -1311,7 +1311,7 @@ func (s *PebbleMetaStore) UpdateSchemaVersion(dbName string, version int64, ddlS
 		UpdatedAt: time.Now().UnixNano(),
 	}
 
-	data, err := msgpack.Marshal(rec)
+	data, err := encoding.Marshal(rec)
 	if err != nil {
 		return err
 	}
@@ -1343,7 +1343,7 @@ func (s *PebbleMetaStore) GetAllSchemaVersions() (map[string]int64, error) {
 		}
 
 		var rec pebbleSchemaVersionRecord
-		if err := msgpack.Unmarshal(val, &rec); err != nil {
+		if err := encoding.Unmarshal(val, &rec); err != nil {
 			continue
 		}
 		versions[dbName] = rec.Version
@@ -1373,7 +1373,7 @@ func (s *PebbleMetaStore) TryAcquireDDLLock(dbName string, nodeID uint64, leaseD
 			LockedAt:  now,
 			ExpiresAt: expiresAt,
 		}
-		data, err := msgpack.Marshal(rec)
+		data, err := encoding.Marshal(rec)
 		if err != nil {
 			return false, err
 		}
@@ -1386,7 +1386,7 @@ func (s *PebbleMetaStore) TryAcquireDDLLock(dbName string, nodeID uint64, leaseD
 
 	// Lock exists - check if expired
 	var rec pebbleDdlLockRecord
-	if err := msgpack.Unmarshal(val, &rec); err != nil {
+	if err := encoding.Unmarshal(val, &rec); err != nil {
 		return false, err
 	}
 
@@ -1397,7 +1397,7 @@ func (s *PebbleMetaStore) TryAcquireDDLLock(dbName string, nodeID uint64, leaseD
 			LockedAt:  now,
 			ExpiresAt: expiresAt,
 		}
-		data, err := msgpack.Marshal(newRec)
+		data, err := encoding.Marshal(newRec)
 		if err != nil {
 			return false, err
 		}
@@ -1422,7 +1422,7 @@ func (s *PebbleMetaStore) ReleaseDDLLock(dbName string, nodeID uint64) error {
 	defer closer.Close()
 
 	var rec pebbleDdlLockRecord
-	if err := msgpack.Unmarshal(val, &rec); err != nil {
+	if err := encoding.Unmarshal(val, &rec); err != nil {
 		return err
 	}
 
@@ -1446,13 +1446,13 @@ func (s *PebbleMetaStore) WriteIntentEntry(txnID, seq uint64, op uint8, table, r
 
 	// Store oldVals and newVals as msgpack
 	if oldVals != nil {
-		if err := msgpack.Unmarshal(oldVals, &entry.OldValues); err != nil {
+		if err := encoding.Unmarshal(oldVals, &entry.OldValues); err != nil {
 			log.Error().Err(err).Uint64("txn_id", txnID).Str("table", table).Msg("Failed to unmarshal OldValues")
 			return fmt.Errorf("failed to unmarshal old values: %w", err)
 		}
 	}
 	if newVals != nil {
-		if err := msgpack.Unmarshal(newVals, &entry.NewValues); err != nil {
+		if err := encoding.Unmarshal(newVals, &entry.NewValues); err != nil {
 			log.Error().Err(err).Uint64("txn_id", txnID).Str("table", table).Msg("Failed to unmarshal NewValues")
 			return fmt.Errorf("failed to unmarshal new values: %w", err)
 		}
@@ -1470,7 +1470,7 @@ func (s *PebbleMetaStore) WriteIntentEntry(txnID, seq uint64, op uint8, table, r
 		Int("new_values_count", len(entry.NewValues)).
 		Msg("CDC: WriteIntentEntry")
 
-	data, err := msgpack.Marshal(entry)
+	data, err := encoding.Marshal(entry)
 	if err != nil {
 		return err
 	}
@@ -1501,7 +1501,7 @@ func (s *PebbleMetaStore) GetIntentEntries(txnID uint64) ([]*IntentEntry, error)
 		}
 
 		entry := &IntentEntry{}
-		if err := msgpack.Unmarshal(val, entry); err != nil {
+		if err := encoding.Unmarshal(val, entry); err != nil {
 			continue
 		}
 		entries = append(entries, entry)
@@ -1599,6 +1599,13 @@ func (s *PebbleMetaStore) CleanupStaleTransactions(timeout time.Duration) (int, 
 
 		if rec.LastHeartbeat < cutoff {
 			staleTxnIDs = append(staleTxnIDs, txnID)
+			ageMs := (time.Now().UnixNano() - rec.LastHeartbeat) / 1e6
+			log.Warn().
+				Uint64("txn_id", txnID).
+				Str("status", rec.Status).
+				Int64("age_ms", ageMs).
+				Int64("timeout_ms", timeout.Milliseconds()).
+				Msg("GC: Found stale PENDING transaction - WILL BE CLEANED UP")
 		}
 	}
 	if err := iter.Close(); err != nil {
@@ -1607,6 +1614,9 @@ func (s *PebbleMetaStore) CleanupStaleTransactions(timeout time.Duration) (int, 
 
 	// Delete stale transactions and their intents (best-effort cleanup)
 	for _, txnID := range staleTxnIDs {
+		log.Warn().
+			Uint64("txn_id", txnID).
+			Msg("GC: Aborting and deleting stale transaction")
 		_ = s.AbortTransaction(txnID)
 		_ = s.DeleteIntentsByTxn(txnID)
 		_ = s.DeleteIntentEntries(txnID)
@@ -1632,7 +1642,7 @@ func (s *PebbleMetaStore) CleanupStaleTransactions(timeout time.Duration) (int, 
 		}
 
 		var rec WriteIntentRecord
-		if err := msgpack.Unmarshal(val, &rec); err != nil {
+		if err := encoding.Unmarshal(val, &rec); err != nil {
 			continue
 		}
 
@@ -1701,7 +1711,7 @@ func (s *PebbleMetaStore) CleanupOldTransactionRecords(minRetention, maxRetentio
 		}
 
 		var rec TransactionRecord
-		if err := msgpack.Unmarshal(val, &rec); err != nil {
+		if err := encoding.Unmarshal(val, &rec); err != nil {
 			continue
 		}
 

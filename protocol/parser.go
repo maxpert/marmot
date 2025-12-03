@@ -198,12 +198,12 @@ func extractTableName(sql, pattern string) string {
 func ExtractConsistencyHint(sql string) (ConsistencyLevel, bool) {
 	matches := consistencyHintPattern.FindStringSubmatch(sql)
 	if len(matches) < 2 {
-		return ConsistencyLocalOne, false
+		return ConsistencyQuorum, false // Fallback, caller should use config default
 	}
 
 	level, err := ParseConsistencyLevel(strings.ToUpper(matches[1]))
 	if err != nil {
-		return ConsistencyLocalOne, false
+		return ConsistencyQuorum, false // Fallback, caller should use config default
 	}
 
 	return level, true

@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/vmihailenco/msgpack/v5"
+	"github.com/maxpert/marmot/encoding"
 )
 
 // TestRowKeyCompatibility verifies that GenerateRowKey produces the same format
@@ -186,9 +186,9 @@ func TestRowKeyMsgpackValues(t *testing.T) {
 	}
 
 	// msgpack-encoded string "123"
-	encoded, err := msgpack.Marshal("123")
+	encoded, err := encoding.Marshal("123")
 	if err != nil {
-		t.Fatalf("msgpack.Marshal failed: %v", err)
+		t.Fatalf("encoding.Marshal failed: %v", err)
 	}
 	values := map[string][]byte{
 		"id": encoded,
@@ -210,7 +210,7 @@ func TestRowKeyMsgpackValues(t *testing.T) {
 // MySQL semantics: INSERT with id=0 means "use next auto-increment value"
 func TestRowKeyZeroValueAsAutoIncrement(t *testing.T) {
 	// msgpack-encoded "0"
-	msgpackZero, _ := msgpack.Marshal("0")
+	msgpackZero, _ := encoding.Marshal("0")
 
 	tests := []struct {
 		name  string

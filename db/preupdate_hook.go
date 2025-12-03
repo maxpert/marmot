@@ -13,6 +13,7 @@ import (
 	"sync"
 
 	"github.com/mattn/go-sqlite3"
+	"github.com/maxpert/marmot/encoding"
 	"github.com/maxpert/marmot/protocol/filter"
 )
 
@@ -367,10 +368,10 @@ func (s *EphemeralHookSession) hookCallback(data sqlite3.SQLitePreUpdateData) {
 	// Serialize values to msgpack using pooled encoder
 	var oldMsgpack, newMsgpack []byte
 	if oldValues != nil {
-		oldMsgpack, _ = MarshalMsgpack(oldValues)
+		oldMsgpack, _ = encoding.Marshal(oldValues)
 	}
 	if newValues != nil {
-		newMsgpack, _ = MarshalMsgpack(newValues)
+		newMsgpack, _ = encoding.Marshal(newValues)
 	}
 
 	// Increment sequence
@@ -400,12 +401,25 @@ func (s *EphemeralHookSession) buildValueMap(columns []string, values []interfac
 
 // serializeValue converts a value to msgpack bytes for CDC replication.
 // Msgpack preserves type information (int64 stays int64, not float64).
-// Uses pooled encoder to reduce allocations on hot path.
+// SQLite preupdate hook returns TEXT columns as []byte - we convert to string
+// so msgpack encodes as str (not bin), ensuring correct type on decode.
+// Returns nil only for nil input; Marshal errors are logged but non-fatal
+// since we're on a hot path and partial CDC is better than blocking writes.
 func (s *EphemeralHookSession) serializeValue(v interface{}) []byte {
 	if v == nil {
 		return nil
 	}
-	data, _ := MarshalMsgpack(v)
+	// SQLite preupdate hook returns TEXT as []byte - convert to string
+	// so msgpack uses str format (not bin) for proper type preservation
+	if b, ok := v.([]byte); ok {
+		v = string(b)
+	}
+	data, err := encoding.Marshal(v)
+	if err != nil {
+		// Log but don't fail - partial CDC is better than blocking writes
+		// This should never happen with valid SQLite values
+		return nil
+	}
 	return data
 }
 

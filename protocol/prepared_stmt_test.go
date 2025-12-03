@@ -283,7 +283,7 @@ func BenchmarkParseParamValue_LONGLONG(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		parseParamValue(payload, 0, 0x08)
+		_, _, _ = parseParamValue(payload, 0, 0x08)
 	}
 }
 

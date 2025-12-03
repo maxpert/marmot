@@ -7,11 +7,11 @@ import (
 	"strings"
 
 	"github.com/maxpert/marmot/db"
+	"github.com/maxpert/marmot/encoding"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/protocol"
 	"github.com/maxpert/marmot/telemetry"
 	"github.com/rs/zerolog/log"
-	"github.com/vmihailenco/msgpack/v5"
 )
 
 // ReplicationHandler handles transaction replication with MVCC
@@ -354,7 +354,7 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 			var oldVals, newVals []byte
 			if len(rowChange.OldValues) > 0 {
 				var err error
-				oldVals, err = protocol.MarshalMsgpack(rowChange.OldValues)
+				oldVals, err = encoding.Marshal(rowChange.OldValues)
 				if err != nil {
 					log.Error().Err(err).Str("table", stmt.TableName).Msg("Failed to marshal OldValues")
 					txnMgr.AbortTransaction(txn)
@@ -366,7 +366,7 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 			}
 			if len(rowChange.NewValues) > 0 {
 				var err error
-				newVals, err = protocol.MarshalMsgpack(rowChange.NewValues)
+				newVals, err = encoding.Marshal(rowChange.NewValues)
 				if err != nil {
 					log.Error().Err(err).Str("table", stmt.TableName).Msg("Failed to marshal NewValues")
 					txnMgr.AbortTransaction(txn)
@@ -532,11 +532,11 @@ func (rh *ReplicationHandler) handleCommit(ctx context.Context, req *Transaction
 		// 1. Prepare succeeded but transaction was removed from memory (timeout/GC)
 		// 2. Different node is receiving the commit request
 		// 3. Race condition between prepare and commit
-		log.Warn().
+		log.Error().
 			Uint64("node_id", rh.nodeID).
 			Uint64("txn_id", req.TxnId).
 			Str("database", dbName).
-			Msg("handleCommit: transaction not found in memory")
+			Msg("REMOTE COMMIT FAILED: transaction not found - possibly GC'd")
 		metaStore := dbInstance.GetMetaStore()
 		if metaStore != nil {
 			if err := metaStore.DeleteIntentsByTxn(req.TxnId); err != nil {
@@ -802,7 +802,7 @@ func (rh *ReplicationHandler) applyReplayCDCInsert(tx *sql.Tx, tableName string,
 		placeholders = append(placeholders, "?")
 
 		var value interface{}
-		if err := msgpack.Unmarshal(newValues[col], &value); err != nil {
+		if err := encoding.Unmarshal(newValues[col], &value); err != nil {
 			return fmt.Errorf("failed to deserialize value for column %s: %w", col, err)
 		}
 		values = append(values, value)
@@ -837,7 +837,7 @@ func (rh *ReplicationHandler) applyReplayCDCDelete(tx *sql.Tx, tableName string,
 		for col, valBytes := range oldValues {
 			whereClauses = append(whereClauses, fmt.Sprintf("%s = ?", col))
 			var value interface{}
-			if err := msgpack.Unmarshal(valBytes, &value); err != nil {
+			if err := encoding.Unmarshal(valBytes, &value); err != nil {
 				return fmt.Errorf("failed to deserialize value for column %s: %w", col, err)
 			}
 			values = append(values, value)
@@ -887,7 +887,7 @@ func (rh *ReplicationHandler) serializeReplayStatements(stmts []*Statement, dbNa
 		protoStmts = append(protoStmts, protoStmt)
 	}
 
-	data, err := protocol.MarshalMsgpack(protoStmts)
+	data, err := encoding.Marshal(protoStmts)
 	if err != nil {
 		log.Error().Err(err).Int("statement_count", len(protoStmts)).Msg("serializeReplayStatements: failed to marshal - anti-entropy may not work for this transaction")
 		return nil

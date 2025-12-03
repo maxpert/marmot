@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/maxpert/marmot/coordinator"
+	"github.com/maxpert/marmot/encoding"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/protocol"
 	"github.com/rs/zerolog/log"
@@ -228,7 +229,7 @@ func (lr *LocalReplicator) handlePrepare(ctx context.Context, req *coordinator.R
 			var oldVals, newVals []byte
 			if len(stmt.OldValues) > 0 {
 				var err error
-				oldVals, err = MarshalMsgpack(stmt.OldValues)
+				oldVals, err = encoding.Marshal(stmt.OldValues)
 				if err != nil {
 					log.Error().Err(err).Str("table", stmt.TableName).Msg("Failed to marshal OldValues")
 					txnMgr.AbortTransaction(txn)
@@ -240,7 +241,7 @@ func (lr *LocalReplicator) handlePrepare(ctx context.Context, req *coordinator.R
 			}
 			if len(stmt.NewValues) > 0 {
 				var err error
-				newVals, err = MarshalMsgpack(stmt.NewValues)
+				newVals, err = encoding.Marshal(stmt.NewValues)
 				if err != nil {
 					log.Error().Err(err).Str("table", stmt.TableName).Msg("Failed to marshal NewValues")
 					txnMgr.AbortTransaction(txn)
@@ -359,6 +360,11 @@ func (lr *LocalReplicator) handleCommit(ctx context.Context, req *coordinator.Re
 	txnMgr := mvccDB.GetTransactionManager()
 	txn := txnMgr.GetTransaction(req.TxnID)
 	if txn == nil {
+		log.Error().
+			Uint64("txn_id", req.TxnID).
+			Uint64("node_id", lr.nodeID).
+			Str("database", req.Database).
+			Msg("COMMIT FAILED: Transaction not found - possibly GC'd or never prepared")
 		return &coordinator.ReplicationResponse{Success: false, Error: "transaction not found"}, nil
 	}
 
