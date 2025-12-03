@@ -10,7 +10,7 @@ import (
 )
 
 // MetaStore provides transactional metadata storage separate from user data.
-// Each user database has its own MetaStore backed by BadgerDB.
+// Each user database has its own MetaStore backed by PebbleDB.
 // This separation allows user data writes and metadata writes to happen in parallel.
 type MetaStore interface {
 	// Transaction lifecycle
@@ -77,7 +77,7 @@ type MetaStore interface {
 
 	// Lifecycle
 	Close() error
-	Checkpoint() error // No-op for BadgerDB, kept for interface compatibility
+	Checkpoint() error // Triggers PebbleDB checkpoint for consistency
 }
 
 // TransactionRecord represents a transaction record in meta store
@@ -148,42 +148,16 @@ const (
 	MetaSyncStatusFailed     = "FAILED"
 )
 
-// NewMetaStore creates a BadgerDB MetaStore.
+// NewMetaStore creates a PebbleDB-backed MetaStore.
 // basePath is the path to the user database (e.g., "/data/mydb.db").
-// Creates {basePath}_meta.badger/ directory
+// Creates {basePath}_meta.pebble/ directory
 func NewMetaStore(basePath string) (MetaStore, error) {
-	metaPath := strings.TrimSuffix(basePath, ".db") + "_meta.badger"
+	metaPath := strings.TrimSuffix(basePath, ".db") + "_meta.pebble"
 
-	// Ensure directory path is absolute if config is available
-	config := cfg.Config
-	if config != nil && !filepath.IsAbs(metaPath) {
-		metaPath = filepath.Join(config.DataDir, metaPath)
+	if cfg.Config != nil && !filepath.IsAbs(metaPath) {
+		metaPath = filepath.Join(cfg.Config.DataDir, metaPath)
 	}
 
-	// Get options from config or use sidecar-optimized defaults
-	opts := BadgerMetaStoreOptions{
-		SyncWrites:     false, // Async writes for performance (group commit handles durability)
-		NumCompactors:  2,
-		ValueLogGC:     true,
-		BlockCacheMB:   64, // 64MB (saves ~192MB vs BadgerDB default 256MB)
-		MemTableSizeMB: 32, // 32MB (saves ~32MB vs BadgerDB default 64MB)
-		NumMemTables:   2,  // 2 (saves ~192MB vs BadgerDB default 5)
-	}
-
-	if config != nil {
-		opts.SyncWrites = config.MetaStore.Badger.SyncWrites
-		opts.NumCompactors = config.MetaStore.Badger.NumCompactors
-		opts.ValueLogGC = config.MetaStore.Badger.ValueLogGC
-		if config.MetaStore.Badger.BlockCacheMB > 0 {
-			opts.BlockCacheMB = config.MetaStore.Badger.BlockCacheMB
-		}
-		if config.MetaStore.Badger.MemTableSizeMB > 0 {
-			opts.MemTableSizeMB = config.MetaStore.Badger.MemTableSizeMB
-		}
-		if config.MetaStore.Badger.NumMemTables > 0 {
-			opts.NumMemTables = config.MetaStore.Badger.NumMemTables
-		}
-	}
-
-	return NewBadgerMetaStore(metaPath, opts)
+	// Use DefaultPebbleOptions() which reads from cfg.Config
+	return NewPebbleMetaStore(metaPath, DefaultPebbleOptions())
 }

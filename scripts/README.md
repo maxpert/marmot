@@ -10,6 +10,10 @@ This directory contains benchmarking tools to measure Marmot's performance.
 
 # Full comparison benchmark (15-20 minutes)
 ./scripts/benchmark-ycsb.sh
+
+# Alternative: Pika (built-in benchmark tool)
+./tools/pika/pika load --hosts "127.0.0.1:3307,127.0.0.1:3308,127.0.0.1:3309" --records 10000
+./tools/pika/pika run --hosts "127.0.0.1:3307,127.0.0.1:3308,127.0.0.1:3309" --workload mixed --time-limit 60s
 ```
 
 ## Scripts
@@ -254,8 +258,30 @@ Add to your CI pipeline:
 
 ---
 
+## Pika - Built-in Benchmark Tool
+
+For a simpler alternative to go-ycsb, use [Pika](../tools/pika/README.md):
+
+```bash
+# Build pika
+cd tools/pika && go build -o pika . && cd ../..
+
+# Load and run
+./tools/pika/pika load --hosts "127.0.0.1:3307,127.0.0.1:3308,127.0.0.1:3309" --records 10000 --create-table
+./tools/pika/pika run --hosts "127.0.0.1:3307,127.0.0.1:3308,127.0.0.1:3309" --workload mixed --time-limit 60s
+```
+
+**Benefits over go-ycsb:**
+- No external dependencies
+- Built specifically for Marmot
+- Supports conflict testing (`--insert-overlap`)
+- Simpler configuration
+
+---
+
 ## References
 
+- **Pika**: [tools/pika/README.md](../tools/pika/README.md)
 - **go-ycsb**: https://github.com/pingcap/go-ycsb
 - **YCSB Workloads**: https://github.com/brianfrankcooper/YCSB/wiki/Core-Workloads
 - **TiDB Benchmarks**: https://docs.pingcap.com/tidb/stable/benchmark-tidb-using-ch

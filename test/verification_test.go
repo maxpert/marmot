@@ -83,7 +83,7 @@ func TestMySQLServerIntegration(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := tmpDir + "/test.db"
 
-	// Create MetaStore using factory (supports SQLite or BadgerDB based on config)
+	// Create MetaStore using factory (PebbleDB)
 	metaStore, err := db.NewMetaStore(dbPath)
 	require.NoError(t, err)
 	defer metaStore.Close()

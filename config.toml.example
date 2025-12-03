@@ -135,30 +135,36 @@ gc_min_retention_hours = 2
 gc_max_retention_hours = 24
 
 # ==============================================================================
-# METADATA STORAGE (BadgerDB)
+# METADATA STORAGE (PebbleDB)
+# Uses CockroachDB-tested defaults for high throughput
 # ==============================================================================
 
-[metastore.badger]
-# Sync writes to disk (true for durability, false for performance)
-sync_writes = false
+[metastore]
+# Block cache size in MB (default: 64)
+cache_size_mb = 64
 
-# Number of compaction workers
-num_compactors = 2
+# MemTable size in MB (default: 64, CockroachDB-style)
+memtable_size_mb = 64
 
-# Enable value log garbage collection
-value_log_gc = true
+# Number of MemTables (default: 2)
+memtable_count = 2
 
-# Block cache size in MB (default: 64, BadgerDB default: 256)
-# Sidecar-optimized: reduces memory ~192MB vs BadgerDB default
-block_cache_size_mb = 64
+# L0 compaction trigger threshold (default: 500, CockroachDB-style)
+# Higher values reduce write latency at cost of read amplification
+l0_compaction_threshold = 500
 
-# MemTable size in MB (default: 32, BadgerDB default: 64)
-# Sidecar-optimized: reduces memory ~32MB vs BadgerDB default
-memtable_size_mb = 32
+# L0 stop writes threshold (default: 1000, CockroachDB-style)
+# When L0 files exceed this, writes stall until compaction catches up
+l0_stop_writes = 1000
 
-# Number of MemTables (default: 2, BadgerDB default: 5)
-# Sidecar-optimized: reduces memory ~192MB vs BadgerDB default
-num_memtables = 2
+# WAL sync every N KB (default: 512KB)
+# Controls background WAL sync frequency for durability
+wal_bytes_per_sync_kb = 512
+
+# Periodic WAL checkpoint interval in milliseconds (default: 10ms)
+# Also triggers SQLite WAL checkpoint for consistency
+# Set to 0 to disable periodic checkpoints
+wal_sync_interval_ms = 10
 
 # ==============================================================================
 # CONNECTION POOL

@@ -49,7 +49,7 @@ type MinAppliedTxnIDFunc func(database string) (uint64, error)
 type ClusterMinWatermarkFunc func() uint64
 
 // MVCCTransactionManager manages MVCC transactions
-// All transaction state is stored in MetaStore (BadgerDB) - no in-memory caching
+// All transaction state is stored in MetaStore (PebbleDB) - no in-memory caching
 type MVCCTransactionManager struct {
 	db                     *sql.DB   // User database for data operations
 	metaStore              MetaStore // MetaStore for transaction metadata

@@ -17,7 +17,7 @@ func TestMVCCSchemaCreation(t *testing.T) {
 	testDB := setupTestDBWithMeta(t)
 
 	// Verify MetaStore is functional by checking it can perform basic operations
-	// This works with any backend (SQLite or BadgerDB)
+	// PebbleDB backend for MetaStore
 
 	// Verify we can query committed transaction count
 	count, err := testDB.MetaStore.GetCommittedTxnCount()

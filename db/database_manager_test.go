@@ -368,8 +368,9 @@ func TestDatabaseIsolation(t *testing.T) {
 	}
 }
 
-// TestTakeSnapshotIncludesMetaStores verifies that TakeSnapshot includes all meta databases
-func TestTakeSnapshotIncludesMetaStores(t *testing.T) {
+// TestTakeSnapshotExcludesMetaStores verifies that TakeSnapshot includes only SQLite .db files
+// MetaStore (PebbleDB) is NOT included to avoid race conditions from WAL rotation/compaction.
+func TestTakeSnapshotExcludesMetaStores(t *testing.T) {
 	dm, _ := setupTestDatabaseManager(t)
 	defer dm.Close()
 
@@ -391,7 +392,7 @@ func TestTakeSnapshotIncludesMetaStores(t *testing.T) {
 		t.Logf("Snapshot: %s (path: %s)", snap.Name, snap.Filename)
 	}
 
-	// Helper to check if any snapshot name has given prefix
+	// Helper to check if any snapshot name has given prefix (for meta stores)
 	hasMetaPrefix := func(prefix string) bool {
 		for name := range snapshotNames {
 			if strings.HasPrefix(name, prefix+"_meta/") {
@@ -406,9 +407,9 @@ func TestTakeSnapshotIncludesMetaStores(t *testing.T) {
 		t.Error("System database not found in snapshots")
 	}
 
-	// Verify system meta database is included (BadgerDB directory files)
-	if !hasMetaPrefix(SystemDatabaseName) {
-		t.Error("System meta database not found in snapshots")
+	// Verify system meta database is NOT included (PebbleDB causes race conditions)
+	if hasMetaPrefix(SystemDatabaseName) {
+		t.Error("System meta database should NOT be in snapshots")
 	}
 
 	// Verify default database is included
@@ -416,9 +417,9 @@ func TestTakeSnapshotIncludesMetaStores(t *testing.T) {
 		t.Error("Default database not found in snapshots")
 	}
 
-	// Verify default meta database is included (BadgerDB directory files)
-	if !hasMetaPrefix(DefaultDatabaseName) {
-		t.Error("Default meta database not found in snapshots")
+	// Verify default meta database is NOT included
+	if hasMetaPrefix(DefaultDatabaseName) {
+		t.Error("Default meta database should NOT be in snapshots")
 	}
 
 	// Verify testdb is included
@@ -426,12 +427,17 @@ func TestTakeSnapshotIncludesMetaStores(t *testing.T) {
 		t.Error("testdb not found in snapshots")
 	}
 
-	// Verify testdb meta database is included (BadgerDB directory files)
-	if !hasMetaPrefix("testdb") {
-		t.Error("testdb meta database not found in snapshots")
+	// Verify testdb meta database is NOT included
+	if hasMetaPrefix("testdb") {
+		t.Error("testdb meta database should NOT be in snapshots")
 	}
 
-	t.Logf("✓ TakeSnapshot includes all databases and their meta stores")
+	// Verify only .db files are in snapshot (3 databases)
+	if len(snapshots) != 3 {
+		t.Errorf("Expected 3 snapshots (system, marmot, testdb), got %d", len(snapshots))
+	}
+
+	t.Logf("✓ TakeSnapshot includes only SQLite .db files, excludes MetaStore")
 }
 
 // TestGetReplicationStateNilHandling verifies that GetReplicationState handles nil correctly

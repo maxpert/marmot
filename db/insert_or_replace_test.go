@@ -23,7 +23,7 @@ func TestInsertOrReplaceWithHooks(t *testing.T) {
 
 	// Create MetaStore
 	os.MkdirAll(metaPath, 0755)
-	metaStore, err := NewBadgerMetaStore(metaPath, DefaultBadgerOptions())
+	metaStore, err := NewPebbleMetaStore(metaPath, DefaultPebbleOptions())
 	if err != nil {
 		t.Fatalf("Failed to create meta store: %v", err)
 	}
@@ -132,7 +132,7 @@ func TestInsertOrReplaceNewRow(t *testing.T) {
 	metaPath := filepath.Join(tmpDir, "meta")
 
 	os.MkdirAll(metaPath, 0755)
-	metaStore, err := NewBadgerMetaStore(metaPath, DefaultBadgerOptions())
+	metaStore, err := NewPebbleMetaStore(metaPath, DefaultPebbleOptions())
 	if err != nil {
 		t.Fatalf("Failed to create meta store: %v", err)
 	}

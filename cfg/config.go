@@ -23,8 +23,6 @@ const (
 	SnapshotLocal  SnapshotStoreType = "local"  // Local file system
 )
 
-// BadgerDB is the only metadata storage backend
-
 // S3Configuration for S3-compatible storage backends
 type S3Configuration struct {
 	Endpoint     string `toml:"endpoint"`
@@ -131,19 +129,15 @@ type MVCCConfiguration struct {
 	LockWaitTimeoutSeconds  int `toml:"lock_wait_timeout_seconds"` // How long to wait for locks (MySQL: innodb_lock_wait_timeout)
 }
 
-// BadgerConfiguration controls BadgerDB-specific settings
-type BadgerConfiguration struct {
-	SyncWrites     bool  `toml:"sync_writes"`         // Sync writes to disk (true for durability)
-	NumCompactors  int   `toml:"num_compactors"`      // Number of compaction workers
-	ValueLogGC     bool  `toml:"value_log_gc"`        // Enable value log garbage collection
-	BlockCacheMB   int64 `toml:"block_cache_size_mb"` // Block cache size in MB (default: 64, BadgerDB default: 256)
-	MemTableSizeMB int64 `toml:"memtable_size_mb"`    // MemTable size in MB (default: 32, BadgerDB default: 64)
-	NumMemTables   int   `toml:"num_memtables"`       // Number of MemTables (default: 2, BadgerDB default: 5)
-}
-
-// MetaStoreConfiguration controls metadata storage (BadgerDB)
+// MetaStoreConfiguration controls PebbleDB metadata storage
 type MetaStoreConfiguration struct {
-	Badger BadgerConfiguration `toml:"badger"` // BadgerDB settings
+	CacheSizeMB           int64 `toml:"cache_size_mb"`           // Block cache size in MB (default: 64)
+	MemTableSizeMB        int64 `toml:"memtable_size_mb"`        // MemTable size in MB (default: 32)
+	MemTableCount         int   `toml:"memtable_count"`          // Number of MemTables (default: 2)
+	L0CompactionThreshold int   `toml:"l0_compaction_threshold"` // L0 compaction trigger (default: 4)
+	L0StopWrites          int   `toml:"l0_stop_writes"`          // L0 stop writes trigger (default: 12)
+	WALBytesPerSyncKB     int   `toml:"wal_bytes_per_sync_kb"`   // Background WAL sync every N KB (default: 512, 0=disabled)
+	WALSyncIntervalMS     int   `toml:"wal_sync_interval_ms"`    // Periodic WAL sync interval for Pebble+SQLite (default: 0=disabled)
 }
 
 // ConnectionPoolConfiguration controls database connection pooling
@@ -282,14 +276,13 @@ var Config = &Configuration{
 	},
 
 	MetaStore: MetaStoreConfiguration{
-		Badger: BadgerConfiguration{
-			SyncWrites:     false, // Async writes for performance (group commit handles durability)
-			NumCompactors:  2,     // 2 compaction workers
-			ValueLogGC:     true,  // Enable value log GC
-			BlockCacheMB:   64,    // 64MB block cache (BadgerDB default: 256MB)
-			MemTableSizeMB: 32,    // 32MB memtable (BadgerDB default: 64MB)
-			NumMemTables:   2,     // 2 memtables (BadgerDB default: 5)
-		},
+		CacheSizeMB:           64,   // 64MB block cache
+		MemTableSizeMB:        64,   // 64MB memtable (CockroachDB-style)
+		MemTableCount:         2,    // 2 memtables
+		L0CompactionThreshold: 500,  // CockroachDB default
+		L0StopWrites:          1000, // CockroachDB default
+		WALBytesPerSyncKB:     512,  // 512KB (CockroachDB default)
+		WALSyncIntervalMS:     10,   // 10ms periodic sync for Pebble+SQLite
 	},
 
 	ConnectionPool: ConnectionPoolConfiguration{
@@ -477,10 +470,26 @@ func Validate() error {
 		return fmt.Errorf("MVCC conflict window must be >= 0")
 	}
 
-	// Set MetaStore BadgerDB defaults if not configured
-	if Config.MetaStore.Badger.NumCompactors < 1 {
-		Config.MetaStore.Badger.NumCompactors = 2 // Default to 2 compactors
+	// Set MetaStore (PebbleDB) defaults if not configured
+	if Config.MetaStore.CacheSizeMB < 1 {
+		Config.MetaStore.CacheSizeMB = 64
 	}
+	if Config.MetaStore.MemTableSizeMB < 1 {
+		Config.MetaStore.MemTableSizeMB = 32
+	}
+	if Config.MetaStore.MemTableCount < 1 {
+		Config.MetaStore.MemTableCount = 2
+	}
+	if Config.MetaStore.L0CompactionThreshold < 1 {
+		Config.MetaStore.L0CompactionThreshold = 500 // CockroachDB default
+	}
+	if Config.MetaStore.L0StopWrites < 1 {
+		Config.MetaStore.L0StopWrites = 1000 // CockroachDB default
+	}
+	if Config.MetaStore.WALBytesPerSyncKB == 0 {
+		Config.MetaStore.WALBytesPerSyncKB = 512 // 512KB like CockroachDB
+	}
+	// WALMinSyncIntervalMS=0 is valid (no delay)
 
 	// Validate connection pool configuration
 	if Config.ConnectionPool.PoolSize < 1 {
