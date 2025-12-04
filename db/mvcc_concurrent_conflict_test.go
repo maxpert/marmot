@@ -48,7 +48,7 @@ func TestConcurrentWriteIntentConflicts(t *testing.T) {
 			data := map[string]interface{}{"balance": workerID * 100}
 			dataBytes, _ := SerializeData(data)
 
-			err = tm.WriteIntent(txn, "users", "1", stmt, dataBytes)
+			err = tm.WriteIntent(txn, IntentTypeDML, "users", "1", stmt, dataBytes)
 			if err != nil {
 				tm.AbortTransaction(txn)
 				results <- err // Write-write conflict expected
@@ -147,7 +147,7 @@ func TestHighContentionHotspot(t *testing.T) {
 			data := map[string]interface{}{"balance": 110}
 			dataBytes, _ := SerializeData(data)
 
-			err = tm.WriteIntent(txn, "users", fmt.Sprintf("%d", rowID), stmt, dataBytes)
+			err = tm.WriteIntent(txn, IntentTypeDML, "users", fmt.Sprintf("%d", rowID), stmt, dataBytes)
 			if err != nil {
 				tm.AbortTransaction(txn)
 				results <- err
@@ -239,7 +239,7 @@ func TestSerializableSnapshotIsolation(t *testing.T) {
 		data := map[string]interface{}{"balance": 150}
 		dataBytes, _ := SerializeData(data)
 
-		err = tm.WriteIntent(txn1, "users", "1", stmt, dataBytes)
+		err = tm.WriteIntent(txn1, IntentTypeDML, "users", "1", stmt, dataBytes)
 		if err != nil {
 			tm.AbortTransaction(txn1)
 			results <- err
@@ -273,7 +273,7 @@ func TestSerializableSnapshotIsolation(t *testing.T) {
 		data := map[string]interface{}{"balance": 200}
 		dataBytes, _ := SerializeData(data)
 
-		err = tm.WriteIntent(txn2, "users", "2", stmt, dataBytes)
+		err = tm.WriteIntent(txn2, IntentTypeDML, "users", "2", stmt, dataBytes)
 		if err != nil {
 			tm.AbortTransaction(txn2)
 			results <- err
@@ -329,7 +329,7 @@ func TestWriteIntentLifecycle(t *testing.T) {
 	data := map[string]interface{}{"balance": 200}
 	dataBytes, _ := SerializeData(data)
 
-	err = tm.WriteIntent(txn, "users", "1", stmt, dataBytes)
+	err = tm.WriteIntent(txn, IntentTypeDML, "users", "1", stmt, dataBytes)
 	assertNoError(t, err, "WriteIntent failed")
 
 	t.Log("✓ Write intent created")
@@ -393,7 +393,7 @@ func TestTransactionAbortCleanup(t *testing.T) {
 	data := map[string]interface{}{"balance": 200}
 	dataBytes, _ := SerializeData(data)
 
-	err = tm.WriteIntent(txn, "users", "1", stmt, dataBytes)
+	err = tm.WriteIntent(txn, IntentTypeDML, "users", "1", stmt, dataBytes)
 	assertNoError(t, err, "WriteIntent failed")
 
 	// Verify intent exists in MetaStore

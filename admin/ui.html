@@ -1,0 +1,640 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Marmot Admin Dashboard</title>
+    <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+    <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+    <style>
+        .loading-spinner {
+            border: 3px solid rgba(0, 0, 0, 0.1);
+            border-left-color: #4f46e5;
+            border-radius: 50%;
+            width: 20px;
+            height: 20px;
+            animation: spin 1s linear infinite;
+            display: inline-block;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        [x-cloak] { display: none !important; }
+    </style>
+</head>
+<body class="bg-gray-100">
+    <div x-data="adminApp()" x-init="init()" x-cloak class="min-h-screen">
+        <!-- Login Screen -->
+        <template x-if="!authenticated">
+            <div class="min-h-screen flex items-center justify-center bg-gray-50 py-12 px-4 sm:px-6 lg:px-8">
+                <div class="max-w-md w-full space-y-8">
+                    <div>
+                        <h2 class="mt-6 text-center text-3xl font-extrabold text-gray-900">Marmot Admin Dashboard</h2>
+                        <p class="mt-2 text-center text-sm text-gray-600">Enter your Pre-Shared Key to access the admin panel</p>
+                    </div>
+                    <form class="mt-8 space-y-6" @submit.prevent="login">
+                        <div class="rounded-md shadow-sm -space-y-px">
+                            <input type="password" x-model="psk" class="appearance-none rounded relative block w-full px-3 py-2 border border-gray-300 placeholder-gray-500 text-gray-900 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm" placeholder="Pre-Shared Key (leave empty if not required)">
+                        </div>
+                        <div x-show="loginError" class="text-red-500 text-sm text-center" x-text="loginError"></div>
+                        <button type="submit" :disabled="loggingIn" class="group relative w-full flex justify-center py-2 px-4 border border-transparent text-sm font-medium rounded-md text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 disabled:opacity-50">
+                            <span x-show="loggingIn" class="loading-spinner mr-2"></span>
+                            <span x-text="loggingIn ? 'Authenticating...' : 'Sign in'"></span>
+                        </button>
+                    </form>
+                </div>
+            </div>
+        </template>
+
+        <!-- Main Dashboard -->
+        <template x-if="authenticated">
+            <div class="min-h-screen">
+                <!-- Navigation -->
+                <nav class="bg-indigo-800">
+                    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+                        <div class="flex items-center justify-between h-16">
+                            <div class="flex items-center">
+                                <div class="flex-shrink-0 text-white font-bold text-xl">Marmot Admin</div>
+                                <div class="hidden md:block ml-10">
+                                    <div class="flex items-baseline space-x-4">
+                                        <template x-for="tab in ['overview', 'cluster', 'transactions', 'intents', 'mvcc']" :key="tab">
+                                            <button @click="setActiveTab(tab)" 
+                                                :class="activeTab === tab ? 'bg-indigo-700 text-white' : 'text-indigo-300 hover:bg-indigo-700 hover:text-white'"
+                                                class="px-3 py-2 rounded-md text-sm font-medium capitalize" x-text="tab"></button>
+                                        </template>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="flex items-center space-x-4">
+                                <span class="text-white text-sm">
+                                    Database:
+                                    <select x-model="selectedDatabase" @change="loadStats()" class="bg-indigo-700 text-white rounded px-2 py-1 ml-1">
+                                        <template x-for="db in databases" :key="db">
+                                            <option :value="db" x-text="db"></option>
+                                        </template>
+                                    </select>
+                                </span>
+                                <button @click="logout" class="text-indigo-200 hover:text-white text-sm">Logout</button>
+                            </div>
+                        </div>
+                    </div>
+                </nav>
+
+                <!-- Main Content -->
+                <main class="max-w-7xl mx-auto py-6 sm:px-6 lg:px-8">
+                    <!-- Overview Tab -->
+                    <div x-show="activeTab === 'overview'" class="px-4 py-6 sm:px-0">
+                        <div class="grid grid-cols-1 gap-6 sm:grid-cols-2 lg:grid-cols-4">
+                            <template x-for="card in [
+                                {label: 'Max Committed Txn ID', value: stats.max_committed_txn_id, color: 'indigo'},
+                                {label: 'Committed Transactions', value: stats.committed_txn_count, color: 'green'},
+                                {label: 'Pending Transactions', value: stats.pending_txns, color: 'yellow'},
+                                {label: 'Intent Filter Size', value: stats.intent_filter_size, color: 'purple'}
+                            ]" :key="card.label">
+                                <div class="bg-white overflow-hidden shadow rounded-lg">
+                                    <div class="px-4 py-5 sm:p-6">
+                                        <div class="flex items-center">
+                                            <div :class="'bg-' + card.color + '-500'" class="flex-shrink-0 rounded-md p-3">
+                                                <svg class="h-6 w-6 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                                                </svg>
+                                            </div>
+                                            <div class="ml-5 w-0 flex-1">
+                                                <dt class="text-sm font-medium text-gray-500 truncate" x-text="card.label"></dt>
+                                                <dd class="text-2xl font-semibold text-gray-900" x-text="formatNumber(card.value)"></dd>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </template>
+                        </div>
+
+                        <div class="mt-8 bg-white shadow overflow-hidden sm:rounded-lg">
+                            <div class="px-4 py-5 sm:px-6">
+                                <h3 class="text-lg leading-6 font-medium text-gray-900">System Health</h3>
+                            </div>
+                            <div class="border-t border-gray-200 px-4 py-5">
+                                <dl class="divide-y divide-gray-200">
+                                    <div class="py-4 grid grid-cols-3 gap-4">
+                                        <dt class="text-sm font-medium text-gray-500">Status</dt>
+                                        <dd class="col-span-2">
+                                            <span class="inline-flex items-center px-3 py-1 rounded-full text-sm font-medium bg-green-100 text-green-800">Healthy</span>
+                                        </dd>
+                                    </div>
+                                    <div class="py-4 grid grid-cols-3 gap-4">
+                                        <dt class="text-sm font-medium text-gray-500">Max Sequence Number</dt>
+                                        <dd class="col-span-2 text-sm text-gray-900" x-text="formatNumber(stats.max_seq_num)"></dd>
+                                    </div>
+                                </dl>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Cluster Tab -->
+                    <div x-show="activeTab === 'cluster'" class="px-4 py-6 sm:px-0">
+                        <div class="bg-white shadow overflow-hidden sm:rounded-lg">
+                            <div class="px-4 py-5 sm:px-6">
+                                <h3 class="text-lg leading-6 font-medium text-gray-900">Cluster Members</h3>
+                            </div>
+                            <div class="border-t border-gray-200">
+                                <table class="min-w-full divide-y divide-gray-200">
+                                    <thead class="bg-gray-50">
+                                        <tr>
+                                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Node ID</th>
+                                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Address</th>
+                                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Status</th>
+                                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Incarnation</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody class="bg-white divide-y divide-gray-200">
+                                        <template x-for="member in clusterMembers" :key="member.node_id">
+                                            <tr @click="showDetail('Node ' + member.node_id, member)" class="cursor-pointer hover:bg-gray-50">
+                                                <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900" x-text="member.node_id"></td>
+                                                <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500" x-text="member.address"></td>
+                                                <td class="px-6 py-4 whitespace-nowrap">
+                                                    <span class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full"
+                                                          :class="{
+                                                            'bg-green-100 text-green-800': member.status === 'ALIVE',
+                                                            'bg-yellow-100 text-yellow-800': member.status === 'JOINING',
+                                                            'bg-red-100 text-red-800': member.status === 'DEAD',
+                                                            'bg-gray-100 text-gray-800': member.status === 'REMOVED'
+                                                          }" x-text="member.status"></span>
+                                                </td>
+                                                <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500" x-text="member.incarnation"></td>
+                                            </tr>
+                                        </template>
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Transactions Tab -->
+                    <div x-show="activeTab === 'transactions'" class="px-4 py-6 sm:px-0">
+                        <div class="bg-white shadow overflow-hidden sm:rounded-lg">
+                            <div class="px-4 py-5 sm:px-6">
+                                <h3 class="text-lg leading-6 font-medium text-gray-900">Transaction Data</h3>
+                                <div class="mt-2 flex space-x-4">
+                                    <button @click="loadTransactions('pending')" class="px-3 py-2 text-sm font-medium rounded-md text-white bg-indigo-600 hover:bg-indigo-700">Pending</button>
+                                    <button @click="loadTransactions('committed')" class="px-3 py-2 text-sm font-medium rounded-md text-gray-700 bg-white border border-gray-300 hover:bg-gray-50">Committed</button>
+                                </div>
+                            </div>
+                            <div class="border-t border-gray-200">
+                                <div x-show="loading" class="flex justify-center items-center py-12">
+                                    <div class="loading-spinner"></div>
+                                </div>
+                                <template x-if="!loading && transactions.length > 0">
+                                    <table class="min-w-full divide-y divide-gray-200">
+                                        <thead class="bg-gray-50">
+                                            <tr>
+                                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Txn ID</th>
+                                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Node ID</th>
+                                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Status</th>
+                                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Created At</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody class="bg-white divide-y divide-gray-200">
+                                            <template x-for="(txn, idx) in transactions" :key="txn.txn_id + '-' + idx">
+                                                <tr @click="showDetail('Transaction ' + txn.txn_id, txn)" class="cursor-pointer hover:bg-gray-50">
+                                                    <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900" x-text="txn.txn_id"></td>
+                                                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500" x-text="txn.node_id"></td>
+                                                    <td class="px-6 py-4 whitespace-nowrap">
+                                                        <span class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full"
+                                                              :class="{
+                                                                'bg-yellow-100 text-yellow-800': txn.status === 'PENDING',
+                                                                'bg-green-100 text-green-800': txn.status === 'COMMITTED',
+                                                                'bg-red-100 text-red-800': txn.status === 'ABORTED'
+                                                              }" x-text="txn.status"></span>
+                                                    </td>
+                                                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500" x-text="txn.created_at || 'N/A'"></td>
+                                                </tr>
+                                            </template>
+                                        </tbody>
+                                    </table>
+                                </template>
+                                <div x-show="!loading && transactions.length === 0" class="text-center py-12">
+                                    <p class="text-gray-500">No transactions found</p>
+                                </div>
+                                <div x-show="!loading && transactionsHasMore" class="px-6 py-4 border-t border-gray-200">
+                                    <button @click="loadMoreTransactions()" :disabled="loadingMore" class="w-full px-4 py-2 text-sm font-medium text-indigo-600 bg-indigo-50 rounded-md hover:bg-indigo-100 disabled:opacity-50 flex items-center justify-center">
+                                        <span x-show="loadingMore" class="loading-spinner mr-2"></span>
+                                        <span x-text="loadingMore ? 'Loading...' : 'Load More'"></span>
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Intents Tab -->
+                    <div x-show="activeTab === 'intents'" class="px-4 py-6 sm:px-0">
+                        <div class="bg-white shadow overflow-hidden sm:rounded-lg">
+                            <div class="px-4 py-5 sm:px-6">
+                                <h3 class="text-lg leading-6 font-medium text-gray-900">Write Intents</h3>
+                                <div class="mt-2 flex space-x-4">
+                                    <input type="text" x-model="intentTableFilter" placeholder="Table name (e.g. benchmarks)..." class="block w-full pl-3 pr-10 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm">
+                                    <button @click="loadIntents()" class="px-4 py-2 text-sm font-medium rounded-md text-white bg-indigo-600 hover:bg-indigo-700">Search</button>
+                                </div>
+                            </div>
+                            <div class="border-t border-gray-200">
+                                <div x-show="loading" class="flex justify-center items-center py-12">
+                                    <div class="loading-spinner"></div>
+                                </div>
+                                <template x-if="!loading && intents.length > 0">
+                                    <table class="min-w-full divide-y divide-gray-200">
+                                        <thead class="bg-gray-50">
+                                            <tr>
+                                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Table</th>
+                                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Row Key</th>
+                                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Txn ID</th>
+                                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Operation</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody class="bg-white divide-y divide-gray-200">
+                                            <template x-for="(intent, idx) in intents" :key="intent.table_name + ':' + intent.row_key + '-' + idx">
+                                                <tr @click="showDetail('Intent: ' + intent.table_name + '/' + intent.row_key, intent)" class="cursor-pointer hover:bg-gray-50">
+                                                    <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900" x-text="intent.table_name"></td>
+                                                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500" x-text="intent.row_key"></td>
+                                                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500" x-text="intent.txn_id"></td>
+                                                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500" x-text="intent.operation"></td>
+                                                </tr>
+                                            </template>
+                                        </tbody>
+                                    </table>
+                                </template>
+                                <div x-show="!loading && intents.length === 0" class="text-center py-12">
+                                    <p class="text-gray-500">No intents found</p>
+                                </div>
+                                <div x-show="!loading && intentsHasMore" class="px-6 py-4 border-t border-gray-200">
+                                    <button @click="loadMoreIntents()" :disabled="loadingMore" class="w-full px-4 py-2 text-sm font-medium text-indigo-600 bg-indigo-50 rounded-md hover:bg-indigo-100 disabled:opacity-50 flex items-center justify-center">
+                                        <span x-show="loadingMore" class="loading-spinner mr-2"></span>
+                                        <span x-text="loadingMore ? 'Loading...' : 'Load More'"></span>
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- MVCC Tab -->
+                    <div x-show="activeTab === 'mvcc'" class="px-4 py-6 sm:px-0">
+                        <div class="bg-white shadow overflow-hidden sm:rounded-lg">
+                            <div class="px-4 py-5 sm:px-6">
+                                <h3 class="text-lg leading-6 font-medium text-gray-900">MVCC Versions</h3>
+                                <div class="mt-2 flex space-x-4">
+                                    <input type="text" x-model="mvccTableFilter" placeholder="Table name..." class="block w-full pl-3 pr-10 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm">
+                                    <input type="text" x-model="mvccRowKeyFilter" placeholder="Row key..." class="block w-full pl-3 pr-10 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm">
+                                    <button @click="loadMVCCVersions()" class="px-4 py-2 text-sm font-medium rounded-md text-white bg-indigo-600 hover:bg-indigo-700">Search</button>
+                                </div>
+                            </div>
+                            <div class="border-t border-gray-200">
+                                <div x-show="loading" class="flex justify-center items-center py-12">
+                                    <div class="loading-spinner"></div>
+                                </div>
+                                <template x-if="!loading && mvccVersions.length > 0">
+                                    <table class="min-w-full divide-y divide-gray-200">
+                                        <thead class="bg-gray-50">
+                                            <tr>
+                                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Table</th>
+                                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Row Key</th>
+                                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Timestamp</th>
+                                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Txn ID</th>
+                                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Operation</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody class="bg-white divide-y divide-gray-200">
+                                            <template x-for="(version, idx) in mvccVersions" :key="version.ts_wall + '-' + idx">
+                                                <tr @click="showDetail('MVCC Version: ' + version.table_name + '/' + version.row_key, version)" class="cursor-pointer hover:bg-gray-50">
+                                                    <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900" x-text="version.table_name"></td>
+                                                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500" x-text="version.row_key"></td>
+                                                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500" x-text="formatTimestamp(version.ts_wall)"></td>
+                                                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500" x-text="version.txn_id"></td>
+                                                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500" x-text="version.operation"></td>
+                                                </tr>
+                                            </template>
+                                        </tbody>
+                                    </table>
+                                </template>
+                                <div x-show="!loading && mvccVersions.length === 0" class="text-center py-12">
+                                    <p class="text-gray-500">No MVCC versions found. Enter table and row key to search.</p>
+                                </div>
+                                <div x-show="!loading && mvccHasMore" class="px-6 py-4 border-t border-gray-200">
+                                    <button @click="loadMoreMVCC()" :disabled="loadingMore" class="w-full px-4 py-2 text-sm font-medium text-indigo-600 bg-indigo-50 rounded-md hover:bg-indigo-100 disabled:opacity-50 flex items-center justify-center">
+                                        <span x-show="loadingMore" class="loading-spinner mr-2"></span>
+                                        <span x-text="loadingMore ? 'Loading...' : 'Load More'"></span>
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </main>
+
+                <!-- Detail Modal (inside authenticated block) -->
+                <template x-if="showDetailModal">
+                    <div class="fixed inset-0 z-50 overflow-y-auto" @keydown.escape.window="closeDetail()">
+                        <div class="flex items-center justify-center min-h-screen px-4 pt-4 pb-20 text-center sm:p-0">
+                            <div class="fixed inset-0 bg-gray-500 bg-opacity-75 transition-opacity" @click="closeDetail()"></div>
+                            <div class="inline-block align-bottom bg-white rounded-lg text-left overflow-hidden shadow-xl transform transition-all sm:my-8 sm:align-middle sm:max-w-3xl sm:w-full">
+                                <div class="bg-white px-4 pt-5 pb-4 sm:p-6 sm:pb-4">
+                                    <div class="flex justify-between items-center mb-4">
+                                        <h3 class="text-lg font-medium text-gray-900" x-text="detailTitle"></h3>
+                                        <button @click="closeDetail()" class="text-gray-400 hover:text-gray-600">
+                                            <svg class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+                                            </svg>
+                                        </button>
+                                    </div>
+                                    <pre class="bg-gray-800 text-green-400 p-4 rounded-lg overflow-auto max-h-96 text-sm font-mono" x-text="formatJSON(detailData)"></pre>
+                                </div>
+                                <div class="bg-gray-50 px-4 py-3 sm:px-6 sm:flex sm:flex-row-reverse">
+                                    <button @click="closeDetail()" class="w-full inline-flex justify-center rounded-md border border-gray-300 shadow-sm px-4 py-2 bg-white text-base font-medium text-gray-700 hover:bg-gray-50 sm:ml-3 sm:w-auto sm:text-sm">Close</button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </template>
+            </div>
+        </template>
+    </div>
+
+    <script>
+        function adminApp() {
+            return {
+                // Auth state
+                authenticated: false,
+                psk: '',
+                loggingIn: false,
+                loginError: '',
+                
+                // UI state
+                activeTab: 'overview',
+                selectedDatabase: 'marmot',
+                databases: ['marmot'],
+                loading: false,
+                
+                // Data
+                stats: { max_committed_txn_id: 0, committed_txn_count: 0, pending_txns: 0, intent_filter_size: 0, max_seq_num: 0 },
+                clusterMembers: [],
+                transactions: [],
+                intents: [],
+                mvccVersions: [],
+                
+                // Filters
+                intentTableFilter: '',
+                mvccTableFilter: '',
+                mvccRowKeyFilter: '',
+                
+                // Detail modal
+                showDetailModal: false,
+                detailTitle: '',
+                detailData: null,
+                
+                // Pagination
+                transactionsHasMore: false,
+                transactionsLastKey: '',
+                transactionsType: 'pending',
+                intentsHasMore: false,
+                intentsLastKey: '',
+                mvccHasMore: false,
+                mvccLastKey: '',
+                loadingMore: false,
+                
+                init() {
+                    const savedPsk = localStorage.getItem('marmot_psk');
+                    if (savedPsk) {
+                        this.psk = savedPsk;
+                        this.authenticated = true;
+                        this.loadData();
+                    }
+                },
+                
+                getHeaders() {
+                    return this.psk ? { 'X-Marmot-Secret': this.psk } : {};
+                },
+                
+                async login() {
+                    this.loggingIn = true;
+                    this.loginError = '';
+                    
+                    try {
+                        const response = await fetch('/admin/cluster/members', {
+                            headers: this.getHeaders()
+                        });
+                        
+                        if (response.ok) {
+                            this.authenticated = true;
+                            if (this.psk) {
+                                localStorage.setItem('marmot_psk', this.psk);
+                            } else {
+                                localStorage.removeItem('marmot_psk');
+                            }
+                            await this.loadData();
+                        } else {
+                            this.loginError = 'Invalid Pre-Shared Key';
+                        }
+                    } catch (error) {
+                        this.loginError = 'Authentication failed';
+                    } finally {
+                        this.loggingIn = false;
+                    }
+                },
+                
+                logout() {
+                    this.authenticated = false;
+                    this.psk = '';
+                    localStorage.removeItem('marmot_psk');
+                },
+                
+                setActiveTab(tab) {
+                    this.activeTab = tab;
+                    if (tab === 'cluster') this.loadClusterMembers();
+                    else if (tab === 'transactions') this.loadTransactions('pending');
+                    else if (tab === 'intents') this.loadIntents();
+                    else if (tab === 'mvcc') this.mvccVersions = [];
+                    else if (tab === 'overview') this.loadStats();
+                },
+                
+                async loadData() {
+                    await Promise.all([this.loadStats(), this.loadClusterMembers()]);
+                },
+                
+                async loadStats() {
+                    try {
+                        const response = await fetch(`/admin/${this.selectedDatabase}/metadata/stats`, {
+                            headers: this.getHeaders()
+                        });
+                        if (response.ok) {
+                            const data = await response.json();
+                            this.stats = data.data || this.stats;
+                        }
+                    } catch (error) {
+                        console.error('Failed to load stats:', error);
+                    }
+                },
+                
+                async loadClusterMembers() {
+                    try {
+                        const response = await fetch('/admin/cluster/members', {
+                            headers: this.getHeaders()
+                        });
+                        if (response.ok) {
+                            const data = await response.json();
+                            this.clusterMembers = data.data || [];
+                        }
+                    } catch (error) {
+                        console.error('Failed to load cluster members:', error);
+                    }
+                },
+                
+                async loadTransactions(type, append = false) {
+                    if (append) {
+                        this.loadingMore = true;
+                    } else {
+                        this.loading = true;
+                        this.transactionsType = type;
+                        this.transactionsLastKey = '';
+                    }
+                    try {
+                        let url = `/admin/${this.selectedDatabase}/metadata/transactions/${type}`;
+                        if (append && this.transactionsLastKey) {
+                            url += `?from=${this.transactionsLastKey}`;
+                        }
+                        const response = await fetch(url, {
+                            headers: this.getHeaders()
+                        });
+                        if (response.ok) {
+                            const data = await response.json();
+                            const newData = Array.isArray(data.data) ? data.data : [];
+                            if (append) {
+                                this.transactions = [...this.transactions, ...newData];
+                            } else {
+                                this.transactions = newData;
+                            }
+                            this.transactionsHasMore = data.has_more || false;
+                            this.transactionsLastKey = data.last_key || '';
+                        } else {
+                            if (!append) this.transactions = [];
+                        }
+                    } catch (error) {
+                        console.error('Failed to load transactions:', error);
+                        if (!append) this.transactions = [];
+                    } finally {
+                        this.loading = false;
+                        this.loadingMore = false;
+                    }
+                },
+                
+                loadMoreTransactions() {
+                    this.loadTransactions(this.transactionsType, true);
+                },
+                
+                async loadIntents(append = false) {
+                    if (append) {
+                        this.loadingMore = true;
+                    } else {
+                        this.loading = true;
+                        this.intentsLastKey = '';
+                    }
+                    try {
+                        const table = this.intentTableFilter || 'benchmarks';
+                        let url = `/admin/${this.selectedDatabase}/metadata/intents/table/${table}`;
+                        if (append && this.intentsLastKey) {
+                            url += `?from=${this.intentsLastKey}`;
+                        }
+                        const response = await fetch(url, {
+                            headers: this.getHeaders()
+                        });
+                        if (response.ok) {
+                            const data = await response.json();
+                            const newData = Array.isArray(data.data) ? data.data : [];
+                            if (append) {
+                                this.intents = [...this.intents, ...newData];
+                            } else {
+                                this.intents = newData;
+                            }
+                            this.intentsHasMore = data.has_more || false;
+                            this.intentsLastKey = data.last_key || '';
+                        } else {
+                            if (!append) this.intents = [];
+                        }
+                    } catch (error) {
+                        console.error('Failed to load intents:', error);
+                        if (!append) this.intents = [];
+                    } finally {
+                        this.loading = false;
+                        this.loadingMore = false;
+                    }
+                },
+                
+                loadMoreIntents() {
+                    this.loadIntents(true);
+                },
+                
+                async loadMVCCVersions(append = false) {
+                    if (!this.mvccTableFilter || !this.mvccRowKeyFilter) return;
+                    if (append) {
+                        this.loadingMore = true;
+                    } else {
+                        this.loading = true;
+                        this.mvccLastKey = '';
+                    }
+                    try {
+                        const encodedRowKey = encodeURIComponent(this.mvccRowKeyFilter);
+                        let url = `/admin/${this.selectedDatabase}/metadata/mvcc/${this.mvccTableFilter}/${encodedRowKey}/history`;
+                        if (append && this.mvccLastKey) {
+                            url += `?from=${encodeURIComponent(this.mvccLastKey)}`;
+                        }
+                        const response = await fetch(url, {
+                            headers: this.getHeaders()
+                        });
+                        if (response.ok) {
+                            const data = await response.json();
+                            const newData = Array.isArray(data.data) ? data.data : [];
+                            if (append) {
+                                this.mvccVersions = [...this.mvccVersions, ...newData];
+                            } else {
+                                this.mvccVersions = newData;
+                            }
+                            this.mvccHasMore = data.has_more || false;
+                            this.mvccLastKey = data.last_key || '';
+                        } else {
+                            if (!append) this.mvccVersions = [];
+                        }
+                    } catch (error) {
+                        console.error('Failed to load MVCC versions:', error);
+                        if (!append) this.mvccVersions = [];
+                    } finally {
+                        this.loading = false;
+                        this.loadingMore = false;
+                    }
+                },
+                
+                loadMoreMVCC() {
+                    this.loadMVCCVersions(true);
+                },
+                
+                formatNumber(num) {
+                    if (num === undefined || num === null) return '0';
+                    return num.toLocaleString();
+                },
+                
+                formatTimestamp(timestamp) {
+                    if (!timestamp) return 'N/A';
+                    return new Date(timestamp / 1000000).toISOString();
+                },
+                
+                showDetail(title, data) {
+                    this.detailTitle = title;
+                    this.detailData = data;
+                    this.showDetailModal = true;
+                },
+                
+                closeDetail() {
+                    this.showDetailModal = false;
+                    this.detailData = null;
+                },
+                
+                formatJSON(data) {
+                    return JSON.stringify(data, null, 2);
+                }
+            };
+        }
+    </script>
+</body>
+</html>

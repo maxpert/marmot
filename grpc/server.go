@@ -3,19 +3,15 @@ package grpc
 import (
 	"context"
 	"crypto/md5"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/pprof"
 	"os"
-	"strconv"
-	"strings"
 	"sync"
 	"time"
 
-	"github.com/maxpert/marmot/cfg"
 	"github.com/maxpert/marmot/db"
 	"github.com/maxpert/marmot/encoding"
 	"github.com/rs/zerolog/log"
@@ -32,14 +28,13 @@ const (
 
 // Server implements the gRPC server for Marmot
 type Server struct {
-	UnimplementedMarmotServiceServer
-
 	nodeID   uint64
 	address  string
 	port     int
 	server   *grpc.Server
 	listener net.Listener
 	mux      cmux.CMux
+	httpMux  *http.ServeMux // HTTP mux for admin endpoints
 
 	// Components
 	gossip             *GossipProtocol
@@ -49,6 +44,8 @@ type Server struct {
 	metricsHandler     http.Handler
 
 	mu sync.RWMutex
+
+	UnimplementedMarmotServiceServer
 }
 
 // ServerConfig holds configuration for the gRPC server
@@ -65,6 +62,7 @@ func NewServer(config ServerConfig) (*Server, error) {
 		nodeID:  config.NodeID,
 		address: config.Address,
 		port:    config.Port,
+		httpMux: http.NewServeMux(),
 	}
 
 	// Initialize components with advertise address
@@ -162,8 +160,8 @@ func (s *Server) Start() error {
 	// Match gRPC requests (everything else)
 	grpcListener := s.mux.Match(cmux.Any())
 
-	// Start HTTP server for pprof (and optionally metrics)
-	httpMux := http.NewServeMux()
+	// Use the pre-created HTTP mux
+	httpMux := s.httpMux
 
 	// Register pprof handlers for profiling
 	httpMux.HandleFunc("/debug/pprof/", pprof.Index)
@@ -178,11 +176,7 @@ func (s *Server) Start() error {
 		log.Info().Msg("Metrics endpoint enabled at /metrics")
 	}
 
-	// Register admin endpoints for cluster membership management
-	httpMux.HandleFunc("/admin/cluster/members", s.handleClusterMembers)
-	httpMux.HandleFunc("/admin/cluster/remove/", s.handleClusterRemove)
-	httpMux.HandleFunc("/admin/cluster/allow/", s.handleClusterAllow)
-	log.Info().Msg("Admin endpoints enabled at /admin/cluster/*")
+	// Admin endpoints will be registered externally to avoid import cycles
 
 	httpServer := &http.Server{
 		Handler: httpMux,
@@ -724,9 +718,29 @@ func (s *Server) GetNodeRegistry() *NodeRegistry {
 	return s.registry
 }
 
+// GetRegistry returns the node registry (alias for GetNodeRegistry)
+func (s *Server) GetRegistry() *NodeRegistry {
+	return s.registry
+}
+
 // GetGossipProtocol returns the gossip protocol instance
 func (s *Server) GetGossipProtocol() *GossipProtocol {
 	return s.gossip
+}
+
+// GetNodeID returns the local node ID
+func (s *Server) GetNodeID() uint64 {
+	return s.nodeID
+}
+
+// GetDatabaseManager returns the database manager
+func (s *Server) GetDatabaseManager() *db.DatabaseManager {
+	return s.dbManager
+}
+
+// GetHTTPMux returns the HTTP mux for registering additional routes
+func (s *Server) GetHTTPMux() *http.ServeMux {
+	return s.httpMux
 }
 
 // SetReplicationHandler sets the replication handler for transaction processing
@@ -889,147 +903,4 @@ func (s *Server) GetLatestTxnIDs(ctx context.Context, req *LatestTxnIDsRequest) 
 	return &LatestTxnIDsResponse{
 		DatabaseTxnIds: txnIDs,
 	}, nil
-}
-
-// =======================
-// ADMIN HTTP HANDLERS
-// =======================
-
-// checkAdminAuth validates PSK authentication for admin endpoints
-// Returns true if authenticated, false otherwise (and writes error response)
-func (s *Server) checkAdminAuth(w http.ResponseWriter, r *http.Request) bool {
-	secret := cfg.GetClusterSecret()
-
-	// If no secret configured, admin endpoints are disabled
-	if secret == "" {
-		http.Error(w, "admin endpoints disabled: cluster_secret not configured", http.StatusForbidden)
-		return false
-	}
-
-	// Check X-Marmot-Secret header
-	providedSecret := r.Header.Get("X-Marmot-Secret")
-	if providedSecret == "" {
-		http.Error(w, "missing X-Marmot-Secret header", http.StatusUnauthorized)
-		return false
-	}
-
-	if providedSecret != secret {
-		http.Error(w, "invalid secret", http.StatusUnauthorized)
-		return false
-	}
-
-	return true
-}
-
-// handleClusterMembers handles GET /admin/cluster/members
-// Returns current cluster membership information
-func (s *Server) handleClusterMembers(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	if !s.checkAdminAuth(w, r) {
-		return
-	}
-
-	members := s.registry.GetMembershipInfo()
-	totalMembership, aliveCount, quorumSize := s.registry.QuorumInfo()
-
-	response := map[string]interface{}{
-		"members":          members,
-		"total_membership": totalMembership,
-		"alive_count":      aliveCount,
-		"quorum_size":      quorumSize,
-		"local_node_id":    s.nodeID,
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
-}
-
-// handleClusterRemove handles POST /admin/cluster/remove/{node_id}
-// Removes a node from cluster membership
-func (s *Server) handleClusterRemove(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	if !s.checkAdminAuth(w, r) {
-		return
-	}
-
-	// Parse node_id from URL path
-	path := strings.TrimPrefix(r.URL.Path, "/admin/cluster/remove/")
-	nodeID, err := strconv.ParseUint(path, 10, 64)
-	if err != nil {
-		http.Error(w, "invalid node_id: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	// Mark node as removed
-	if err := s.registry.MarkRemoved(nodeID); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	// Trigger immediate gossip to propagate removal
-	if s.gossip != nil {
-		s.gossip.BroadcastImmediate()
-	}
-
-	// Return updated membership
-	totalMembership, aliveCount, quorumSize := s.registry.QuorumInfo()
-
-	response := map[string]interface{}{
-		"success":          true,
-		"message":          fmt.Sprintf("node %d marked as REMOVED", nodeID),
-		"total_membership": totalMembership,
-		"alive_count":      aliveCount,
-		"quorum_size":      quorumSize,
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
-}
-
-// handleClusterAllow handles POST /admin/cluster/allow/{node_id}
-// Allows a removed node to rejoin the cluster
-func (s *Server) handleClusterAllow(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	if !s.checkAdminAuth(w, r) {
-		return
-	}
-
-	// Parse node_id from URL path
-	path := strings.TrimPrefix(r.URL.Path, "/admin/cluster/allow/")
-	nodeID, err := strconv.ParseUint(path, 10, 64)
-	if err != nil {
-		http.Error(w, "invalid node_id: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	// Allow node to rejoin
-	if err := s.registry.AllowRejoin(nodeID); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	// Trigger immediate gossip to propagate change
-	if s.gossip != nil {
-		s.gossip.BroadcastImmediate()
-	}
-
-	response := map[string]interface{}{
-		"success": true,
-		"message": fmt.Sprintf("node %d allowed to rejoin cluster", nodeID),
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
 }

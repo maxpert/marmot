@@ -33,8 +33,15 @@ yarn-error.log
 yarn-debug.log
 
 CLAUDE.md
-V2-Plan.md
 AGENTS.md
+QWEN.md
 .claude/
 .opencode/
 .mcp.json
+marmot-test
+marmot-v2-test
+pika-test
+.gocache/
+test-config.toml
+test-config-no-secret.toml
+marmot-data/

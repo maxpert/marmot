@@ -847,7 +847,7 @@ func (dm *DatabaseManager) GetReplicationState(peerNodeID uint64, database strin
 		LastAppliedTSWall: rec.LastAppliedTSWall,
 		LastAppliedTSLog:  rec.LastAppliedTSLogical,
 		LastSyncTime:      rec.LastSyncTime,
-		SyncStatus:        rec.SyncStatus,
+		SyncStatus:        rec.SyncStatus.String(),
 	}, nil
 }
 
@@ -901,7 +901,7 @@ func (dm *DatabaseManager) GetAllReplicationStates() ([]ReplicationState, error)
 				LastAppliedTSWall: rec.LastAppliedTSWall,
 				LastAppliedTSLog:  rec.LastAppliedTSLogical,
 				LastSyncTime:      rec.LastSyncTime,
-				SyncStatus:        rec.SyncStatus,
+				SyncStatus:        rec.SyncStatus.String(),
 			})
 		}
 	}

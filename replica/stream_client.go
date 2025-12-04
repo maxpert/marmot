@@ -584,7 +584,7 @@ func (s *StreamClient) applySnapshot(ctx context.Context, snapshotInfo *marmotgr
 func (s *StreamClient) applyChangeEvent(ctx context.Context, event *marmotgrpc.ChangeEvent) error {
 	database := event.Database
 	if database == "" {
-		database = "marmot"
+		return fmt.Errorf("change event %d missing database name", event.TxnId)
 	}
 
 	mdb, err := s.dbManager.GetDatabase(database)

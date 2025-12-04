@@ -533,7 +533,7 @@ func (mdb *MVCCDatabase) ExecuteTransaction(ctx context.Context, statements []pr
 			return fmt.Errorf("failed to serialize data: %w", serErr)
 		}
 
-		err := mdb.txnMgr.WriteIntent(txn, stmt.TableName, rowKey, stmt, dataSnapshot)
+		err := mdb.txnMgr.WriteIntent(txn, IntentTypeDML, stmt.TableName, rowKey, stmt, dataSnapshot)
 		if err != nil {
 			mdb.txnMgr.AbortTransaction(txn)
 			return fmt.Errorf("write conflict: %w", err)

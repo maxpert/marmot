@@ -8,6 +8,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/maxpert/marmot/admin"
 	"github.com/maxpert/marmot/cfg"
 	"github.com/maxpert/marmot/coordinator"
 	"github.com/maxpert/marmot/db"
@@ -170,6 +171,10 @@ func main() {
 		return
 	}
 	defer dbMgr.Close()
+
+	// Register admin HTTP endpoints under /admin
+	adminHandlers := admin.NewAdminHandlers(grpcServer, dbMgr)
+	admin.RegisterRoutes(grpcServer.GetHTTPMux(), adminHandlers)
 
 	// If starting as seed node (no seeds configured), import existing databases from data_dir
 	if !isJoiningCluster {

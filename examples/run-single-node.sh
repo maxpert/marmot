@@ -103,13 +103,8 @@ TOML
 
 echo "✓ Configuration created"
 
-# Build marmot-v2 if needed
-if [ ! -f "$REPO_ROOT/marmot-v2" ]; then
-    echo "Building marmot-v2..."
-    cd "$REPO_ROOT"
-    go build -tags sqlite_preupdate_hook -o marmot-v2 .
-    echo "✓ Build complete"
-fi
+ go build -tags sqlite_preupdate_hook -o marmot-v2 .
+echo "✓ Build complete"
 
 # Cleanup function
 cleanup() {
@@ -118,6 +113,7 @@ cleanup() {
     kill "$pid" 2>/dev/null || true
     echo "✓ Stopped"
 }
+
 trap cleanup EXIT
 
 echo ""

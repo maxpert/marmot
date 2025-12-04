@@ -583,6 +583,61 @@ scrape_configs:
 
 See `config.toml` for complete configuration reference with detailed comments.
 
+## Benchmarks
+
+Performance benchmarks on a local development machine (Apple M-series, 3-node cluster, single machine):
+
+### Test Configuration
+
+| Parameter | Value |
+|-----------|-------|
+| Nodes | 3 (ports 3307, 3308, 3309) |
+| Threads | 16 |
+| Batch Size | 10 ops/transaction |
+| Consistency | QUORUM |
+
+### Load Phase (INSERT-only)
+
+| Metric | Value |
+|--------|-------|
+| Throughput | **4,175 ops/sec** |
+| TX Throughput | **417 tx/sec** |
+| Records Loaded | 200,000 |
+| Errors | 0 |
+
+### Mixed Workload
+
+| Metric | Value |
+|--------|-------|
+| Throughput | **3,370 ops/sec** |
+| TX Throughput | **337 tx/sec** |
+| Duration | 120 seconds |
+| Total Operations | 404,930 |
+| Errors | 0 |
+| Retries | 37 (0.09%) |
+
+**Operation Distribution:**
+- READ: 20%
+- UPDATE: 30%
+- INSERT: 35%
+- DELETE: 5%
+- UPSERT: 10%
+
+### Latency (Mixed Workload)
+
+| Percentile | Latency |
+|------------|---------|
+| P50 | 4.3ms |
+| P90 | 14.0ms |
+| P95 | 36.8ms |
+| P99 | 85.1ms |
+
+### Replication Verification
+
+All 3 nodes maintained identical row counts (346,684 rows) throughout the test, confirming consistent replication.
+
+> **Note**: These benchmarks are from a local development machine with all nodes on the same host. Production deployments across multiple machines will have different characteristics based on network latency.
+
 ## FAQs & Community
 
  - For FAQs visit [this page](https://maxpert.github.io/marmot/intro#faq)

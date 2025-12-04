@@ -176,7 +176,7 @@ func TestWriteIntentCreation(t *testing.T) {
 	}
 	dataBytes, _ := SerializeData(data)
 
-	err = tm.WriteIntent(txn, "users", "1", stmt, dataBytes)
+	err = tm.WriteIntent(txn, IntentTypeDML, "users", "1", stmt, dataBytes)
 	if err != nil {
 		t.Fatalf("Failed to create write intent: %v", err)
 	}
@@ -223,7 +223,7 @@ func TestWriteWriteConflictDetection(t *testing.T) {
 	data := map[string]interface{}{"balance": 100}
 	dataBytes, _ := SerializeData(data)
 
-	err = tm.WriteIntent(txn1, "users", "1", stmt, dataBytes)
+	err = tm.WriteIntent(txn1, IntentTypeDML, "users", "1", stmt, dataBytes)
 	if err != nil {
 		t.Fatalf("Failed to create write intent for txn1: %v", err)
 	}
@@ -245,7 +245,7 @@ func TestWriteWriteConflictDetection(t *testing.T) {
 	data2 := map[string]interface{}{"balance": 200}
 	dataBytes2, _ := SerializeData(data2)
 
-	err = tm.WriteIntent(txn2, "users", "1", stmt2, dataBytes2)
+	err = tm.WriteIntent(txn2, IntentTypeDML, "users", "1", stmt2, dataBytes2)
 	if err == nil {
 		t.Fatal("Expected write-write conflict error, got nil")
 	}
@@ -292,7 +292,7 @@ func TestConcurrentTransactionsOnDifferentRows(t *testing.T) {
 		data := map[string]interface{}{"id": 1, "name": "Alice", "balance": 100}
 		dataBytes, _ := SerializeData(data)
 
-		err = tm.WriteIntent(txn, "users", "1", stmt, dataBytes)
+		err = tm.WriteIntent(txn, IntentTypeDML, "users", "1", stmt, dataBytes)
 		if err != nil {
 			errors <- err
 			return
@@ -329,7 +329,7 @@ func TestConcurrentTransactionsOnDifferentRows(t *testing.T) {
 		data := map[string]interface{}{"id": 2, "name": "Bob", "balance": 200}
 		dataBytes, _ := SerializeData(data)
 
-		err = tm.WriteIntent(txn, "users", "2", stmt, dataBytes)
+		err = tm.WriteIntent(txn, IntentTypeDML, "users", "2", stmt, dataBytes)
 		if err != nil {
 			errors <- err
 			return
@@ -378,7 +378,7 @@ func TestTransactionAbort(t *testing.T) {
 	data := map[string]interface{}{"id": 1, "name": "Alice", "balance": 100}
 	dataBytes, _ := SerializeData(data)
 
-	err = tm.WriteIntent(txn, "users", "1", stmt, dataBytes)
+	err = tm.WriteIntent(txn, IntentTypeDML, "users", "1", stmt, dataBytes)
 	if err != nil {
 		t.Fatalf("Failed to create write intent: %v", err)
 	}

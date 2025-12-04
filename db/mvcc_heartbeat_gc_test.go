@@ -78,7 +78,7 @@ func TestHeartbeatKeepsTransactionAlive(t *testing.T) {
 	data := map[string]interface{}{"balance": 200}
 	dataBytes, _ := SerializeData(data)
 
-	err = tm.WriteIntent(txn, "users", "1", stmt, dataBytes)
+	err = tm.WriteIntent(txn, IntentTypeDML, "users", "1", stmt, dataBytes)
 	assertNoError(t, err, "WriteIntent failed")
 
 	t.Log("✓ Transaction created with write intent")
@@ -155,7 +155,7 @@ func TestStaleTransactionCleanup(t *testing.T) {
 	data := map[string]interface{}{"balance": 200}
 	dataBytes, _ := SerializeData(data)
 
-	err = tm.WriteIntent(txn, "users", "1", stmt, dataBytes)
+	err = tm.WriteIntent(txn, IntentTypeDML, "users", "1", stmt, dataBytes)
 	assertNoError(t, err, "WriteIntent failed")
 
 	t.Log("✓ Transaction created with write intent")
@@ -210,7 +210,7 @@ func TestOldTransactionRecordCleanup(t *testing.T) {
 	data := map[string]interface{}{"balance": 200}
 	dataBytes, _ := SerializeData(data)
 
-	err = tm.WriteIntent(txn, "users", "1", stmt, dataBytes)
+	err = tm.WriteIntent(txn, IntentTypeDML, "users", "1", stmt, dataBytes)
 	assertNoError(t, err, "WriteIntent failed")
 
 	err = tm.CommitTransaction(txn)
@@ -261,7 +261,7 @@ func TestOldMVCCVersionCleanup(t *testing.T) {
 		data := map[string]interface{}{"balance": 100 + (i * 10)}
 		dataBytes, _ := SerializeData(data)
 
-		err = tm.WriteIntent(txn, "users", "1", stmt, dataBytes)
+		err = tm.WriteIntent(txn, IntentTypeDML, "users", "1", stmt, dataBytes)
 		assertNoError(t, err, "WriteIntent failed")
 
 		err = tm.CommitTransaction(txn)
@@ -320,7 +320,7 @@ func TestGarbageCollectionIntegration(t *testing.T) {
 	data := map[string]interface{}{"balance": 200}
 	dataBytes, _ := SerializeData(data)
 
-	err = tm.WriteIntent(staleTxn, "users", "1", stmt, dataBytes)
+	err = tm.WriteIntent(staleTxn, IntentTypeDML, "users", "1", stmt, dataBytes)
 	assertNoError(t, err, "WriteIntent failed")
 
 	// Create an active transaction with heartbeat
@@ -336,7 +336,7 @@ func TestGarbageCollectionIntegration(t *testing.T) {
 	data2 := map[string]interface{}{"balance": 300}
 	dataBytes2, _ := SerializeData(data2)
 
-	err = tm.WriteIntent(activeTxn, "users", "2", stmt2, dataBytes2)
+	err = tm.WriteIntent(activeTxn, IntentTypeDML, "users", "2", stmt2, dataBytes2)
 	assertNoError(t, err, "WriteIntent failed")
 
 	// Keep active transaction alive with heartbeats
