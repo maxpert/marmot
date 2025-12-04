@@ -211,12 +211,6 @@ commit_timeout_ms = 2000
 # Timeout for 2PC abort phase (milliseconds)
 abort_timeout_ms = 2000
 
-# TTL for MutationGuard intents (milliseconds)
-intent_ttl_ms = 30000
-
-# Max rows for MutationGuard hash list (~512KB at 64K rows)
-max_guard_rows = 65536
-
 # ==============================================================================
 # DDL REPLICATION
 # ==============================================================================

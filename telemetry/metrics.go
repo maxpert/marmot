@@ -59,8 +59,20 @@ var (
 	// TwoPhaseQuorumAcks measures number of acks received per phase
 	TwoPhaseQuorumAcks HistogramVec = noopHistogramVec{}
 
-	// WriteConflictsTotal counts write conflicts by type (mvcc, mutation_guard)
+	// WriteConflictsTotal counts write conflicts by type (mvcc, intent) and path (fast, slow)
 	WriteConflictsTotal CounterVec = noopCounterVec{}
+
+	// IntentFilterChecks counts intent filter checks by result (fast_path, slow_path_miss, slow_path_conflict)
+	IntentFilterChecks CounterVec = noopCounterVec{}
+
+	// IntentFilterSize tracks current number of entries in the intent filter
+	IntentFilterSize Gauge = NoopStat{}
+
+	// IntentFilterFalsePositives counts false positives (slow path found no conflict)
+	IntentFilterFalsePositives Counter = NoopStat{}
+
+	// IntentFilterTxnCount tracks number of transactions with active intents
+	IntentFilterTxnCount Gauge = NoopStat{}
 
 	// ReplicationRequestsTotal counts replication requests by phase and result
 	ReplicationRequestsTotal CounterVec = noopCounterVec{}
@@ -178,8 +190,25 @@ func InitMetrics() {
 	)
 	WriteConflictsTotal = NewCounterVec(
 		"write_conflicts_total",
-		"Write conflicts by type",
-		[]string{"type"},
+		"Write conflicts by type and path",
+		[]string{"type", "path"},
+	)
+	IntentFilterChecks = NewCounterVec(
+		"intent_filter_checks_total",
+		"Intent filter checks by result",
+		[]string{"result"},
+	)
+	IntentFilterSize = NewGauge(
+		"intent_filter_size",
+		"Current number of entries in intent filter",
+	)
+	IntentFilterFalsePositives = NewCounter(
+		"intent_filter_false_positives_total",
+		"Intent filter false positives (slow path found no conflict)",
+	)
+	IntentFilterTxnCount = NewGauge(
+		"intent_filter_txn_count",
+		"Number of transactions with active intents in filter",
 	)
 	ReplicationRequestsTotal = NewCounterVec(
 		"replication_requests_total",

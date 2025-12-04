@@ -182,15 +182,6 @@ commit_timeout_ms = 2000
 # Timeout for 2PC abort phase (milliseconds)
 abort_timeout_ms = 2000
 
-# TTL for MutationGuard intents (milliseconds)
-# Guards expire after this time if coordinator crashes
-intent_ttl_ms = 60000
-
-# Maximum rows per transaction for MutationGuard hash lists
-# Transactions exceeding this use MVCC fallback for conflict detection
-# Default: 65536 (64K rows, ~512KB payload)
-max_guard_rows = 65536
-
 # ==============================================================================
 # DDL REPLICATION
 # ==============================================================================

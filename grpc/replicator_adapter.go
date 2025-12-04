@@ -34,9 +34,8 @@ func (gr *GRPCReplicator) ReplicateTransaction(ctx context.Context, nodeID uint6
 			Logical:  req.StartTS.Logical,
 			NodeId:   req.StartTS.NodeID,
 		},
-		Phase:          convertPhaseToProto(req.Phase),
-		Database:       req.Database,
-		MutationGuards: convertMutationGuardsToProto(req.MutationGuards),
+		Phase:    convertPhaseToProto(req.Phase),
+		Database: req.Database,
 	}
 
 	// Call gRPC client
@@ -145,20 +144,4 @@ func convertTimestampToHLC(ts hlc.Timestamp) *HLC {
 		Logical:  ts.Logical,
 		NodeId:   ts.NodeID,
 	}
-}
-
-// convertMutationGuardsToProto converts coordinator.MutationGuard map to gRPC MutationGuard map
-func convertMutationGuardsToProto(guards map[string]*coordinator.MutationGuard) map[string]*MutationGuard {
-	if guards == nil {
-		return nil
-	}
-
-	result := make(map[string]*MutationGuard, len(guards))
-	for table, guard := range guards {
-		result[table] = &MutationGuard{
-			KeyHashes:        guard.KeyHashes,
-			ExpectedRowCount: guard.ExpectedRowCount,
-		}
-	}
-	return result
 }

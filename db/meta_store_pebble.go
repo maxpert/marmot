@@ -14,6 +14,7 @@ import (
 	"github.com/maxpert/marmot/cfg"
 	"github.com/maxpert/marmot/encoding"
 	"github.com/maxpert/marmot/hlc"
+	"github.com/maxpert/marmot/telemetry"
 	"github.com/rs/zerolog/log"
 )
 
@@ -72,6 +73,9 @@ type PebbleMetaStore struct {
 
 	// Sharded locks for WriteIntent serialization (prevents TOCTOU race)
 	intentLocks [intentLockShards]sync.Mutex
+
+	// Cuckoo filter for fast-path intent conflict detection
+	intentFilter *IntentFilter
 }
 
 // Ensure PebbleMetaStore implements MetaStore
@@ -81,6 +85,53 @@ var _ MetaStore = (*PebbleMetaStore)(nil)
 func (s *PebbleMetaStore) intentLockFor(tableName, rowKey string) *sync.Mutex {
 	key := tableName + ":" + rowKey
 	return &s.intentLocks[xxhash.Sum64String(key)%intentLockShards]
+}
+
+// GetIntentFilter returns the Cuckoo filter for fast-path conflict detection.
+func (s *PebbleMetaStore) GetIntentFilter() *IntentFilter {
+	return s.intentFilter
+}
+
+// rebuildIntentFilter scans all existing intents and populates the filter.
+// Called on startup to restore filter state after crash/restart.
+func (s *PebbleMetaStore) rebuildIntentFilter() error {
+	prefix := []byte(pebblePrefixIntent)
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: prefix,
+		UpperBound: prefixUpperBound(prefix),
+	})
+	if err != nil {
+		return err
+	}
+	defer iter.Close()
+
+	count := 0
+	for iter.SeekGE(prefix); iter.Valid(); iter.Next() {
+		val, err := iter.ValueAndErr()
+		if err != nil {
+			continue
+		}
+
+		var rec WriteIntentRecord
+		if err := encoding.Unmarshal(val, &rec); err != nil {
+			continue
+		}
+
+		// Skip intents marked for cleanup
+		if rec.MarkedForCleanup {
+			continue
+		}
+
+		tbHash := ComputeIntentHash(rec.TableName, rec.RowKey)
+		s.intentFilter.Add(rec.TxnID, tbHash)
+		count++
+	}
+
+	if count > 0 {
+		log.Info().Int("intents", count).Msg("Rebuilt intent filter from existing intents")
+	}
+
+	return nil
 }
 
 // PebbleMetaStoreOptions configures Pebble
@@ -163,15 +214,22 @@ func NewPebbleMetaStore(path string, opts PebbleMetaStoreOptions) (*PebbleMetaSt
 	}
 
 	store := &PebbleMetaStore{
-		db:        db,
-		path:      path,
-		batchCh:   make(chan *pebbleBatchOp, pebbleBatchChannelSize),
-		stopBatch: make(chan struct{}),
-		sequences: make(map[uint64]*AtomicSequence),
+		db:           db,
+		path:         path,
+		batchCh:      make(chan *pebbleBatchOp, pebbleBatchChannelSize),
+		stopBatch:    make(chan struct{}),
+		sequences:    make(map[uint64]*AtomicSequence),
+		intentFilter: NewIntentFilter(),
 	}
 
 	// Initialize persistent counters
 	store.counters = NewPebbleCounter(db, pebblePrefixCounter, 10)
+
+	// Rebuild intent filter from existing intents (for crash recovery)
+	if err := store.rebuildIntentFilter(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to rebuild intent filter: %w", err)
+	}
 
 	// Start batch writer goroutine
 	store.batchWg.Add(1)
@@ -727,6 +785,61 @@ func (s *PebbleMetaStore) WriteIntent(txnID uint64, tableName, rowKey, op, sqlSt
 	mu.Lock()
 	defer mu.Unlock()
 
+	tbHash := ComputeIntentHash(tableName, rowKey)
+
+	// Fast path: Cuckoo filter miss = definitely no conflict
+	if s.intentFilter != nil && !s.intentFilter.Check(tbHash) {
+		telemetry.IntentFilterChecks.With("fast_path").Inc()
+		return s.writeIntentFastPath(txnID, tableName, rowKey, op, sqlStmt, data, ts, nodeID, tbHash)
+	}
+
+	// Slow path: Filter hit (or no filter) - check Pebble
+	return s.writeIntentSlowPath(txnID, tableName, rowKey, op, sqlStmt, data, ts, nodeID, tbHash)
+}
+
+// writeIntentFastPath writes intent without Pebble conflict check (filter miss).
+func (s *PebbleMetaStore) writeIntentFastPath(txnID uint64, tableName, rowKey, op, sqlStmt string, data []byte, ts hlc.Timestamp, nodeID uint64, tbHash uint64) error {
+	key := pebbleIntentKey(tableName, rowKey)
+
+	rec := &WriteIntentRecord{
+		TableName:    tableName,
+		RowKey:       rowKey,
+		TxnID:        txnID,
+		TSWall:       ts.WallTime,
+		TSLogical:    ts.Logical,
+		NodeID:       nodeID,
+		Operation:    op,
+		SQLStatement: sqlStmt,
+		DataSnapshot: data,
+		CreatedAt:    time.Now().UnixNano(),
+	}
+
+	recData, err := encoding.Marshal(rec)
+	if err != nil {
+		return err
+	}
+
+	batch := s.db.NewBatch()
+	defer batch.Close()
+
+	if err := batch.Set(key, recData, nil); err != nil {
+		return err
+	}
+	if err := batch.Set(pebbleIntentByTxnKey(txnID, tableName, rowKey), nil, nil); err != nil {
+		return err
+	}
+
+	if err := batch.Commit(pebble.NoSync); err != nil {
+		return err
+	}
+
+	// Add to filter after successful write
+	s.intentFilter.Add(txnID, tbHash)
+	return nil
+}
+
+// writeIntentSlowPath writes intent with Pebble conflict check (filter hit).
+func (s *PebbleMetaStore) writeIntentSlowPath(txnID uint64, tableName, rowKey, op, sqlStmt string, data []byte, ts hlc.Timestamp, nodeID uint64, tbHash uint64) error {
 	key := pebbleIntentKey(tableName, rowKey)
 
 	batch := s.db.NewBatch()
@@ -744,6 +857,7 @@ func (s *PebbleMetaStore) WriteIntent(txnID uint64, tableName, rowKey, op, sqlSt
 
 		// Same transaction - update intent in place
 		if existing.TxnID == txnID {
+			telemetry.IntentFilterChecks.With("slow_path_same_txn").Inc()
 			existing.Operation = op
 			existing.SQLStatement = sqlStmt
 			existing.DataSnapshot = data
@@ -752,17 +866,21 @@ func (s *PebbleMetaStore) WriteIntent(txnID uint64, tableName, rowKey, op, sqlSt
 			if err != nil {
 				return err
 			}
-			// NoSync: Same-txn intent update happens before PREPARE batch.
-			// The final PREPARE (WriteIntent batch commit) will sync.
 			return s.db.Set(key, newData, pebble.NoSync)
 		}
 
 		// Different transaction - check if we can overwrite
+		telemetry.IntentFilterChecks.With("slow_path_conflict").Inc()
 		if err := s.resolveIntentConflictPebble(batch, &existing, txnID, tableName, rowKey); err != nil {
+			telemetry.WriteConflictsTotal.With("intent", "slow").Inc()
 			return err
 		}
 	} else if err != pebble.ErrNotFound {
 		return err
+	} else {
+		// Filter hit but no intent in Pebble = false positive
+		telemetry.IntentFilterChecks.With("slow_path_miss").Inc()
+		telemetry.IntentFilterFalsePositives.Inc()
 	}
 
 	// Create new intent
@@ -791,10 +909,16 @@ func (s *PebbleMetaStore) WriteIntent(txnID uint64, tableName, rowKey, op, sqlSt
 		return err
 	}
 
-	// NoSync: WriteIntent (PREPARE) doesn't need immediate durability.
-	// CommitTransaction Sync will flush all pending writes including intents.
-	// If crash before COMMIT, transaction never happened - losing intent is fine.
-	return batch.Commit(pebble.NoSync)
+	if err := batch.Commit(pebble.NoSync); err != nil {
+		return err
+	}
+
+	// Add to filter after successful write
+	if s.intentFilter != nil {
+		s.intentFilter.Add(txnID, tbHash)
+	}
+
+	return nil
 }
 
 // resolveIntentConflictPebble handles conflict with existing intent from different transaction
@@ -802,6 +926,11 @@ func (s *PebbleMetaStore) resolveIntentConflictPebble(batch *pebble.Batch, exist
 	// Marked for cleanup - safe to overwrite
 	if existing.MarkedForCleanup {
 		_ = batch.Delete(pebbleIntentByTxnKey(existing.TxnID, tableName, rowKey), nil)
+		// Clean up filter for the old transaction's intent
+		if s.intentFilter != nil {
+			tbHash := ComputeIntentHash(tableName, rowKey)
+			s.intentFilter.RemoveHash(existing.TxnID, tbHash)
+		}
 		return nil
 	}
 
@@ -854,6 +983,13 @@ func (s *PebbleMetaStore) resolveIntentConflictPebble(batch *pebble.Batch, exist
 	}
 
 	_ = batch.Delete(pebbleIntentByTxnKey(existing.TxnID, tableName, rowKey), nil)
+
+	// Clean up filter for the overwritten transaction's intent
+	if s.intentFilter != nil {
+		tbHash := ComputeIntentHash(tableName, rowKey)
+		s.intentFilter.RemoveHash(existing.TxnID, tbHash)
+	}
+
 	return nil
 }
 
@@ -911,7 +1047,17 @@ func (s *PebbleMetaStore) DeleteIntent(tableName, rowKey string, txnID uint64) e
 	}
 
 	// NoSync: ResolveIntent is cleanup after commit. Idempotent.
-	return batch.Commit(pebble.NoSync)
+	if err := batch.Commit(pebble.NoSync); err != nil {
+		return err
+	}
+
+	// Sync intent filter after successful Pebble delete
+	if s.intentFilter != nil {
+		tbHash := ComputeIntentHash(tableName, rowKey)
+		s.intentFilter.RemoveHash(txnID, tbHash)
+	}
+
+	return nil
 }
 
 // DeleteIntentsByTxn removes all write intents for a transaction
@@ -963,7 +1109,16 @@ func (s *PebbleMetaStore) DeleteIntentsByTxn(txnID uint64) error {
 
 	// NoSync: Intent cleanup is idempotent. If crash occurs, intents remain
 	// (transaction is already committed) and will be cleaned up on next GC.
-	return batch.Commit(pebble.NoSync)
+	if err := batch.Commit(pebble.NoSync); err != nil {
+		return err
+	}
+
+	// Sync intent filter after successful Pebble delete
+	if s.intentFilter != nil {
+		s.intentFilter.Remove(txnID)
+	}
+
+	return nil
 }
 
 // MarkIntentsForCleanup marks all intents for a transaction as ready for overwrite
@@ -1624,7 +1779,13 @@ func (s *PebbleMetaStore) CleanupStaleTransactions(timeout time.Duration) (int, 
 	}
 
 	// Phase 2: Clean orphaned intents
-	var orphanedKeys [][]byte
+	type orphanedIntent struct {
+		key    []byte
+		txnID  uint64
+		table  string
+		rowKey string
+	}
+	var orphanedIntents []orphanedIntent
 	intentPrefix := []byte(pebblePrefixIntent)
 
 	iter, err = s.db.NewIter(&pebble.IterOptions{
@@ -1656,18 +1817,28 @@ func (s *PebbleMetaStore) CleanupStaleTransactions(timeout time.Duration) (int, 
 		if txnRec == nil {
 			key := make([]byte, len(iter.Key()))
 			copy(key, iter.Key())
-			orphanedKeys = append(orphanedKeys, key)
+			orphanedIntents = append(orphanedIntents, orphanedIntent{
+				key:    key,
+				txnID:  rec.TxnID,
+				table:  rec.TableName,
+				rowKey: rec.RowKey,
+			})
 		}
 	}
 	if err := iter.Close(); err != nil {
 		return cleaned, err
 	}
 
-	// Delete orphaned intents (best-effort cleanup)
-	if len(orphanedKeys) > 0 {
+	// Delete orphaned intents and clean up IntentFilter
+	if len(orphanedIntents) > 0 {
 		batch := s.db.NewBatch()
-		for _, key := range orphanedKeys {
-			_ = batch.Delete(key, nil)
+		for _, orphan := range orphanedIntents {
+			_ = batch.Delete(orphan.key, nil)
+			// Remove from IntentFilter to prevent false positives
+			if s.intentFilter != nil {
+				tbHash := ComputeIntentHash(orphan.table, orphan.rowKey)
+				s.intentFilter.RemoveHash(orphan.txnID, tbHash)
+			}
 			cleaned++
 		}
 		_ = batch.Commit(pebble.NoSync)
@@ -1677,7 +1848,7 @@ func (s *PebbleMetaStore) CleanupStaleTransactions(timeout time.Duration) (int, 
 	if cleaned > 0 {
 		log.Info().
 			Int("stale_txns", len(staleTxnIDs)).
-			Int("orphaned_intents", len(orphanedKeys)).
+			Int("orphaned_intents", len(orphanedIntents)).
 			Msg("MetaStore GC: Cleaned up stale transactions and orphaned intents")
 	}
 

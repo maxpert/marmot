@@ -489,8 +489,7 @@ func (s *EphemeralHookSession) GetRowCounts() map[string]int64 {
 }
 
 // GetKeyHashes returns XXH64 hashes of affected row keys per table.
-// Used for MutationGuard hash list conflict detection.
-// Returns nil for tables exceeding maxRows to let MVCC handle conflicts.
+// Returns nil for tables exceeding maxRows.
 func (s *EphemeralHookSession) GetKeyHashes(maxRows int) map[string][]uint64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()

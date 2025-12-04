@@ -39,7 +39,11 @@ curl http://localhost:8080/metrics
 | `marmot_v2_twophase_prepare_seconds` | Histogram | - | 2PC prepare phase duration in seconds |
 | `marmot_v2_twophase_commit_seconds` | Histogram | - | 2PC commit phase duration in seconds |
 | `marmot_v2_twophase_quorum_acks` | Histogram | `phase` | Number of quorum acknowledgments received per phase |
-| `marmot_v2_write_conflicts_total` | Counter | `type` | Write conflicts by type (mvcc, mutation_guard) |
+| `marmot_v2_write_conflicts_total` | Counter | `type`, `path` | Write conflicts by type (mvcc, intent) and detection path (fast, slow) |
+| `marmot_v2_intent_filter_checks_total` | Counter | `result` | Intent filter checks by result (fast_path, slow_path_miss, slow_path_conflict) |
+| `marmot_v2_intent_filter_size` | Gauge | - | Current number of entries in the Cuckoo filter |
+| `marmot_v2_intent_filter_false_positives_total` | Counter | - | Intent filter false positives (slow path found no conflict) |
+| `marmot_v2_intent_filter_txn_count` | Gauge | - | Number of transactions with active intents in filter |
 | `marmot_v2_replication_requests_total` | Counter | `phase`, `result` | Replication requests by phase (prepare, commit, replay) and result |
 | `marmot_v2_active_transactions` | Gauge | - | Number of currently active transactions |
 

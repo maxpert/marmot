@@ -374,8 +374,7 @@ func (p *PendingLocalExecution) GetTotalRowCount() int64 {
 }
 
 // GetKeyHashes returns XXH64 hashes of affected row keys per table.
-// Used for MutationGuard hash list conflict detection.
-// Returns nil for tables exceeding maxRows to let MVCC handle conflicts.
+// Returns nil for tables exceeding maxRows.
 func (p *PendingLocalExecution) GetKeyHashes(maxRows int) map[string][]uint64 {
 	if p.session == nil {
 		return nil
@@ -487,7 +486,7 @@ func (mdb *MVCCDatabase) ExecuteLocalWithHooks(ctx context.Context, txnID uint64
 	// Get CDC entries and row counts BEFORE rollback
 	cdcEntries, _ := session.GetIntentEntries()
 	rowCounts := session.GetRowCounts()
-	keyHashes := session.GetKeyHashes(1000) // Get key hashes for MutationGuard
+	keyHashes := session.GetKeyHashes(1000) // For interface compatibility
 
 	// ROLLBACK hookDB immediately - release connection BEFORE 2PC
 	// CDC data is already persisted in MetaStore, so we don't lose anything

@@ -34,6 +34,7 @@ type MetaStore interface {
 	MarkIntentsForCleanup(txnID uint64) error // Fast path: mark intents as ready for overwrite
 	GetIntentsByTxn(txnID uint64) ([]*WriteIntentRecord, error)
 	GetIntent(tableName, rowKey string) (*WriteIntentRecord, error)
+	GetIntentFilter() *IntentFilter // Cuckoo filter for fast-path conflict detection
 
 	// MVCC versions
 	CreateMVCCVersion(tableName, rowKey string, ts hlc.Timestamp, nodeID, txnID uint64, op string, data []byte) error
