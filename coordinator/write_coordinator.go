@@ -46,19 +46,9 @@ type Transaction struct {
 	ReadConsistency       protocol.ConsistencyLevel
 	Database              string // Target database name
 	RequiredSchemaVersion uint64 // Minimum schema version required to execute this transaction
-	// MutationGuards holds per-table hash lists for conflict detection
-	// Key is table name, value is XXH64 hash list + expected row count
-	MutationGuards map[string]*MutationGuard
 	// LocalExecutionDone indicates that local execution was already performed
 	// (e.g., via ExecuteLocalWithHooks). Skip local replication in WriteTransaction.
 	LocalExecutionDone bool
-}
-
-// MutationGuard contains hash list data for conflict detection
-// Uses XXH64 hashes for exact conflict detection (no false positives)
-type MutationGuard struct {
-	KeyHashes        []uint64 // XXH64 hashes of affected row keys
-	ExpectedRowCount int64
 }
 
 // ReplicationRequest is sent to replica nodes
@@ -73,8 +63,6 @@ type ReplicationRequest struct {
 	Database string
 	// Minimum schema version required to execute this transaction
 	RequiredSchemaVersion uint64
-	// MutationGuards for conflict detection (MutationGuard protocol)
-	MutationGuards map[string]*MutationGuard
 }
 
 // ReplicationPhase indicates which phase of 2PC
@@ -171,7 +159,7 @@ func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transacti
 	// ====================
 	// PHASE 1: PREPARE (Create Write Intents)
 	// ====================
-	// Single-attempt prepare with MutationGuard conflict detection.
+	// Single-attempt prepare with intent-based conflict detection.
 	// On conflict: abort and return MySQL 1213 to client for retry.
 	// No internal retry - client handles retry at application level.
 
@@ -183,7 +171,6 @@ func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transacti
 		Phase:                 PhasePrep,
 		Database:              txn.Database,
 		RequiredSchemaVersion: txn.RequiredSchemaVersion,
-		MutationGuards:        txn.MutationGuards,
 	}
 
 	// Execute prepare phase on all nodes (including self) - single attempt, no retry
@@ -195,7 +182,7 @@ func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transacti
 
 	if conflictErr != nil {
 		// Write-write conflict detected - abort and signal client to retry
-		telemetry.WriteConflictsTotal.With("mutation_guard").Inc()
+		telemetry.WriteConflictsTotal.With("intent", "slow").Inc()
 		telemetry.TxnTotal.With("write", "conflict").Inc()
 		telemetry.TxnDurationSeconds.With("write").Observe(time.Since(txnStart).Seconds())
 		log.Debug().

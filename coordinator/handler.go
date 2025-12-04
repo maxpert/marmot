@@ -327,7 +327,7 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, consistency
 	statements := []protocol.Statement{stmt}
 
 	// For DML operations, try to execute locally with hooks to capture affected rows
-	// This enables MutationGuard-based conflict detection for multi-row operations
+	// This captures CDC data for intent-based conflict detection via write intents
 	var pendingExec PendingExecution
 	var rowsAffected int64 = 1
 
@@ -403,29 +403,6 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, consistency
 		Database:              stmt.Database,
 		RequiredSchemaVersion: schemaVersion,
 		LocalExecutionDone:    false, // Coordinator commits via CDC replay, same as remotes
-	}
-
-	// If we have pending execution with multiple rows, build MutationGuards
-	if pendingExec != nil && rowsAffected > 1 {
-		// FlushIntentLog is a no-op with SQLite-backed storage (WAL handles durability)
-		// Kept for backwards compatibility
-		_ = pendingExec.FlushIntentLog()
-
-		// Get hash lists for conflict detection
-		// maxRows controls the threshold - tables exceeding this use MVCC fallback
-		maxRows := cfg.Config.Coordinator.MaxGuardRows
-		keyHashes := pendingExec.GetKeyHashes(maxRows)
-		rowCounts := pendingExec.GetRowCounts()
-
-		if len(keyHashes) > 0 {
-			txn.MutationGuards = make(map[string]*MutationGuard)
-			for table, hashes := range keyHashes {
-				txn.MutationGuards[table] = &MutationGuard{
-					KeyHashes:        hashes, // nil if exceeds maxRows (MVCC fallback)
-					ExpectedRowCount: rowCounts[table],
-				}
-			}
-		}
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), getWriteTimeout())

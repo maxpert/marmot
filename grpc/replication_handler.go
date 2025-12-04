@@ -16,19 +16,17 @@ import (
 
 // ReplicationHandler handles transaction replication with MVCC
 type ReplicationHandler struct {
-	nodeID        uint64
-	dbMgr         *db.DatabaseManager
-	clock         *hlc.Clock
-	guardRegistry *GuardRegistry
+	nodeID uint64
+	dbMgr  *db.DatabaseManager
+	clock  *hlc.Clock
 }
 
 // NewReplicationHandler creates a new replication handler
-func NewReplicationHandler(nodeID uint64, dbMgr *db.DatabaseManager, clock *hlc.Clock, guardRegistry *GuardRegistry) *ReplicationHandler {
+func NewReplicationHandler(nodeID uint64, dbMgr *db.DatabaseManager, clock *hlc.Clock) *ReplicationHandler {
 	return &ReplicationHandler{
-		nodeID:        nodeID,
-		dbMgr:         dbMgr,
-		clock:         clock,
-		guardRegistry: guardRegistry,
+		nodeID: nodeID,
+		dbMgr:  dbMgr,
+		clock:  clock,
 	}
 }
 
@@ -66,22 +64,7 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 		Uint64("node_id", rh.nodeID).
 		Str("database", req.Database).
 		Int("num_statements", len(req.Statements)).
-		Int("num_guards", len(req.MutationGuards)).
 		Msg("handlePrepare called")
-
-	// Check MutationGuards for conflicts before processing statements
-	if len(req.MutationGuards) > 0 && rh.guardRegistry != nil {
-		conflictResult := rh.checkMutationGuardConflicts(req)
-		if conflictResult.HasConflict {
-			telemetry.ReplicationRequestsTotal.With("prepare", "conflict").Inc()
-			return &TransactionResponse{
-				Success:          false,
-				ErrorMessage:     conflictResult.Details,
-				ConflictDetected: true,
-				ConflictDetails:  conflictResult.Details,
-			}, nil
-		}
-	}
 
 	// Handle CREATE DATABASE and DROP DATABASE using system database for transaction tracking
 	// These operations need 2PC but don't have a user database to track the transaction in
@@ -396,11 +379,6 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 		}
 	}
 
-	// Register MutationGuards after successful prepare
-	if len(req.MutationGuards) > 0 {
-		rh.registerMutationGuards(req)
-	}
-
 	// Success! Write intents created
 	telemetry.ReplicationRequestsTotal.With("prepare", "success").Inc()
 	return &TransactionResponse{
@@ -488,11 +466,6 @@ func (rh *ReplicationHandler) handleCommit(ctx context.Context, req *Transaction
 							Uint64("node_id", rh.nodeID).
 							Msg("Database operation committed successfully")
 
-						// Remove MutationGuards after successful database operation commit
-						if rh.guardRegistry != nil {
-							rh.guardRegistry.Remove(req.TxnId)
-						}
-
 						return &TransactionResponse{
 							Success: true,
 							AppliedAt: &HLC{
@@ -564,11 +537,6 @@ func (rh *ReplicationHandler) handleCommit(ctx context.Context, req *Transaction
 		}, nil
 	}
 
-	// Remove MutationGuards after successful commit
-	if rh.guardRegistry != nil {
-		rh.guardRegistry.Remove(req.TxnId)
-	}
-
 	telemetry.ReplicationRequestsTotal.With("commit", "success").Inc()
 	return &TransactionResponse{
 		Success: true,
@@ -582,10 +550,6 @@ func (rh *ReplicationHandler) handleCommit(ctx context.Context, req *Transaction
 
 // handleAbort processes abort: Rollback transaction
 func (rh *ReplicationHandler) handleAbort(ctx context.Context, req *TransactionRequest) (*TransactionResponse, error) {
-	// Always remove MutationGuards on abort (idempotent)
-	if rh.guardRegistry != nil {
-		rh.guardRegistry.Remove(req.TxnId)
-	}
 
 	// Check system database first for database operations
 	systemDB, err := rh.dbMgr.GetDatabase(db.SystemDatabaseName)
@@ -1005,74 +969,5 @@ func convertStatementType(st StatementType) protocol.StatementType {
 		return protocol.StatementDropDatabase
 	default:
 		return protocol.StatementInsert // Default to insert
-	}
-}
-
-// checkMutationGuardConflicts checks for conflicts using MutationGuard hash list.
-// Uses exact hash set intersection - no false positives.
-func (rh *ReplicationHandler) checkMutationGuardConflicts(req *TransactionRequest) ConflictResult {
-	for table, guard := range req.MutationGuards {
-		// Convert hash slice to KeySet for O(1) lookup
-		keySet := KeySetFromSlice(guard.KeyHashes)
-
-		// Build active guard for conflict check
-		activeGuard := &ActiveGuard{
-			TxnID:  req.TxnId,
-			Table:  table,
-			KeySet: keySet,
-			Timestamp: hlc.Timestamp{
-				WallTime: req.Timestamp.WallTime,
-				Logical:  req.Timestamp.Logical,
-				NodeID:   req.Timestamp.NodeId,
-			},
-			RowCount: guard.ExpectedRowCount,
-		}
-
-		// Check for conflicts with existing guards
-		result := rh.guardRegistry.CheckConflict(activeGuard)
-		if result.HasConflict {
-			log.Debug().
-				Uint64("txn_id", req.TxnId).
-				Uint64("conflicting_txn", result.ConflictingTxn).
-				Str("table", table).
-				Bool("should_wait", result.ShouldWait).
-				Int("key_count", len(keySet)).
-				Msg("MutationGuard conflict detected")
-			return result
-		}
-	}
-
-	return ConflictResult{HasConflict: false}
-}
-
-// registerMutationGuards registers guards after successful prepare
-func (rh *ReplicationHandler) registerMutationGuards(req *TransactionRequest) {
-	if rh.guardRegistry == nil {
-		return
-	}
-
-	for table, guard := range req.MutationGuards {
-		// Convert hash slice to KeySet for O(1) lookup
-		keySet := KeySetFromSlice(guard.KeyHashes)
-
-		activeGuard := &ActiveGuard{
-			TxnID:  req.TxnId,
-			Table:  table,
-			KeySet: keySet,
-			Timestamp: hlc.Timestamp{
-				WallTime: req.Timestamp.WallTime,
-				Logical:  req.Timestamp.Logical,
-				NodeID:   req.Timestamp.NodeId,
-			},
-			RowCount: guard.ExpectedRowCount,
-		}
-
-		if err := rh.guardRegistry.Register(activeGuard); err != nil {
-			log.Warn().Err(err).
-				Uint64("txn_id", req.TxnId).
-				Str("table", table).
-				Int("key_count", len(keySet)).
-				Msg("Failed to register MutationGuard")
-		}
 	}
 }
