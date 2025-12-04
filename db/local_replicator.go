@@ -76,22 +76,22 @@ func (lr *LocalReplicator) handlePrepare(ctx context.Context, req *coordinator.R
 			// Create write intent for database operation
 			// Use database name as the row key
 			rowKey := stmt.Database
-			opName := OpNameCreateDatabase
+			dbOp := DatabaseOpCreate
 			if stmt.Type == protocol.StatementDropDatabase {
-				opName = OpNameDropDatabase
+				dbOp = DatabaseOpDrop
 			}
 			snapshotData := DatabaseOperationSnapshot{
 				Type:         int(stmt.Type),
 				Timestamp:    req.StartTS.WallTime,
 				DatabaseName: stmt.Database,
-				Operation:    opName,
+				Operation:    dbOp,
 			}
 			dataSnapshot, err := SerializeData(snapshotData)
 			if err != nil {
 				return &coordinator.ReplicationResponse{Success: false, Error: fmt.Sprintf("failed to serialize data: %v", err)}, nil
 			}
 
-			err = txnMgr.WriteIntent(txn, TableDatabaseOperations, rowKey, stmt, dataSnapshot)
+			err = txnMgr.WriteIntent(txn, IntentTypeDatabaseOp, "", rowKey, stmt, dataSnapshot)
 			if err != nil {
 				txnMgr.AbortTransaction(txn)
 				return &coordinator.ReplicationResponse{Success: false, Error: fmt.Sprintf("write conflict: %v", err)}, nil
@@ -99,7 +99,7 @@ func (lr *LocalReplicator) handlePrepare(ctx context.Context, req *coordinator.R
 
 			log.Info().
 				Str("database", stmt.Database).
-				Str("operation", opName).
+				Str("operation", dbOp.String()).
 				Uint64("node_id", lr.nodeID).
 				Uint64("txn_id", req.TxnID).
 				Msg("Database operation prepared (intent created)")
@@ -160,11 +160,12 @@ func (lr *LocalReplicator) handlePrepare(ctx context.Context, req *coordinator.R
 			// For DDL statements, create write intent using table name as row key
 			// This ensures DDL SQL gets stored and executed during commit phase
 			if stmt.Type == protocol.StatementDDL {
-				ddlRowKey := DDLRowKeyPrefix + stmt.TableName
-				snapshotData := map[string]interface{}{
-					"type":      stmt.Type,
-					"timestamp": req.StartTS.WallTime,
-					"sql":       stmt.SQL,
+				ddlRowKey := stmt.TableName
+				snapshotData := DDLSnapshot{
+					Type:      int(stmt.Type),
+					Timestamp: req.StartTS.WallTime,
+					SQL:       stmt.SQL,
+					TableName: stmt.TableName,
 				}
 				dataSnapshot, serErr := SerializeData(snapshotData)
 				if serErr != nil {
@@ -172,7 +173,7 @@ func (lr *LocalReplicator) handlePrepare(ctx context.Context, req *coordinator.R
 					return &coordinator.ReplicationResponse{Success: false, Error: fmt.Sprintf("failed to serialize DDL data: %v", serErr)}, nil
 				}
 
-				if err := txnMgr.WriteIntent(txn, TableDDLOps, ddlRowKey, stmt, dataSnapshot); err != nil {
+				if err := txnMgr.WriteIntent(txn, IntentTypeDDL, stmt.TableName, ddlRowKey, stmt, dataSnapshot); err != nil {
 					txnMgr.AbortTransaction(txn)
 					return &coordinator.ReplicationResponse{
 						Success:          false,
@@ -212,7 +213,7 @@ func (lr *LocalReplicator) handlePrepare(ctx context.Context, req *coordinator.R
 			return &coordinator.ReplicationResponse{Success: false, Error: fmt.Sprintf("failed to serialize data: %v", serErr)}, nil
 		}
 
-		if err := txnMgr.WriteIntent(txn, stmt.TableName, rowKey, stmt, dataSnapshot); err != nil {
+		if err := txnMgr.WriteIntent(txn, IntentTypeDML, stmt.TableName, rowKey, stmt, dataSnapshot); err != nil {
 			txnMgr.AbortTransaction(txn)
 			return &coordinator.ReplicationResponse{
 				Success:          false,
@@ -253,7 +254,7 @@ func (lr *LocalReplicator) handlePrepare(ctx context.Context, req *coordinator.R
 			}
 
 			// Convert statement type to operation code
-			op := StatementTypeToOpCode(int(stmt.Type))
+			op := uint8(StatementTypeToOpType(int(stmt.Type)))
 
 			err := metaStore.WriteIntentEntry(req.TxnID, stmtSeq, op, stmt.TableName, rowKey, oldVals, newVals)
 			if err != nil {
@@ -291,7 +292,7 @@ func (lr *LocalReplicator) handleCommit(ctx context.Context, req *coordinator.Re
 			if intentErr == nil && len(intents) > 0 {
 				// Check if any intent is for database operations
 				for _, intent := range intents {
-					if intent.TableName == TableDatabaseOperations {
+					if intent.IntentType == IntentTypeDatabaseOp {
 						// Found a database operation - extract details from DataSnapshot
 						var snapshotData DatabaseOperationSnapshot
 						if err := DeserializeData(intent.DataSnapshot, &snapshotData); err != nil {
@@ -299,11 +300,7 @@ func (lr *LocalReplicator) handleCommit(ctx context.Context, req *coordinator.Re
 							continue
 						}
 
-						opName := snapshotData.Operation
-						if opName == "" {
-							log.Error().Uint64("txn_id", req.TxnID).Msg("Missing operation in DB op snapshot")
-							continue
-						}
+						dbOp := snapshotData.Operation
 						dbName := intent.RowKey // Row key is the database name
 
 						// Execute the database operation BEFORE committing the transaction
@@ -314,19 +311,20 @@ func (lr *LocalReplicator) handleCommit(ctx context.Context, req *coordinator.Re
 						}
 
 						var dbOpErr error
-						if opName == OpNameCreateDatabase {
+						switch dbOp {
+						case DatabaseOpCreate:
 							log.Info().Str("database", dbName).Uint64("node_id", lr.nodeID).Msg("Executing CREATE DATABASE in commit phase")
 							dbOpErr = dbMgr.CreateDatabase(dbName)
-						} else if opName == OpNameDropDatabase {
+						case DatabaseOpDrop:
 							log.Info().Str("database", dbName).Uint64("node_id", lr.nodeID).Msg("Executing DROP DATABASE in commit phase")
 							dbOpErr = dbMgr.DropDatabase(dbName)
-						} else {
-							log.Error().Str("operation", opName).Uint64("txn_id", req.TxnID).Msg("Unknown database operation")
+						default:
+							log.Error().Str("operation", dbOp.String()).Uint64("txn_id", req.TxnID).Msg("Unknown database operation")
 							continue
 						}
 
 						if dbOpErr != nil {
-							log.Error().Err(dbOpErr).Str("database", dbName).Str("operation", opName).Msg("Database operation failed in commit phase")
+							log.Error().Err(dbOpErr).Str("database", dbName).Str("operation", dbOp.String()).Msg("Database operation failed in commit phase")
 							systemTxnMgr.AbortTransaction(systemTxn)
 							return &coordinator.ReplicationResponse{Success: false, Error: fmt.Sprintf("database operation failed: %v", dbOpErr)}, nil
 						}
@@ -340,7 +338,7 @@ func (lr *LocalReplicator) handleCommit(ctx context.Context, req *coordinator.Re
 
 						log.Info().
 							Str("database", dbName).
-							Str("operation", opName).
+							Str("operation", dbOp.String()).
 							Uint64("node_id", lr.nodeID).
 							Msg("Database operation committed successfully")
 

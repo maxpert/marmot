@@ -2,21 +2,20 @@ package replica
 
 import (
 	"context"
-	"crypto/md5"
 	"database/sql"
 	"fmt"
 	"io"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/maxpert/marmot/cfg"
 	"github.com/maxpert/marmot/db"
+	"github.com/maxpert/marmot/db/snapshot"
 	"github.com/maxpert/marmot/encoding"
 	marmotgrpc "github.com/maxpert/marmot/grpc"
 	"github.com/maxpert/marmot/hlc"
+	"github.com/maxpert/marmot/protocol"
 
 	"github.com/rs/zerolog/log"
 	"google.golang.org/grpc"
@@ -37,6 +36,9 @@ type StreamClient struct {
 
 	lastTxnID map[string]uint64 // per-database last applied txn_id
 	mu        sync.RWMutex
+
+	// snapshotInProgress prevents concurrent snapshot apply and change events
+	snapshotMu sync.RWMutex
 
 	reconnectInterval time.Duration
 	maxBackoff        time.Duration
@@ -61,59 +63,6 @@ func NewStreamClient(masterAddr string, nodeID uint64, dbManager *db.DatabaseMan
 		ctx:               ctx,
 		cancel:            cancel,
 	}
-}
-
-// sanitizeSnapshotFilename validates and sanitizes a filename from snapshot stream.
-// Returns error if filename contains path traversal or absolute paths.
-// This prevents malicious masters from writing files outside the data directory.
-func sanitizeSnapshotFilename(filename string) (string, error) {
-	if filename == "" {
-		return "", fmt.Errorf("empty filename")
-	}
-
-	// Reject absolute paths
-	if filepath.IsAbs(filename) {
-		return "", fmt.Errorf("absolute path not allowed: %s", filename)
-	}
-
-	// Clean the path and check for traversal
-	cleaned := filepath.Clean(filename)
-
-	// Reject if cleaned path starts with ..
-	if strings.HasPrefix(cleaned, "..") {
-		return "", fmt.Errorf("path traversal not allowed: %s", filename)
-	}
-
-	// Reject if path contains .. anywhere after cleaning
-	for _, part := range strings.Split(cleaned, string(filepath.Separator)) {
-		if part == ".." {
-			return "", fmt.Errorf("path traversal not allowed: %s", filename)
-		}
-	}
-
-	// Only allow specific patterns for snapshot files
-	if !isValidSnapshotPath(cleaned) {
-		return "", fmt.Errorf("invalid snapshot filename pattern: %s", filename)
-	}
-
-	return cleaned, nil
-}
-
-// isValidSnapshotPath checks if the path matches expected snapshot file patterns
-func isValidSnapshotPath(path string) bool {
-	// System database at root
-	if path == "__marmot_system.db" {
-		return true
-	}
-	// User databases in databases/ subdirectory
-	if strings.HasPrefix(path, "databases"+string(filepath.Separator)) && strings.HasSuffix(path, ".db") {
-		// Ensure no additional directory traversal within databases/
-		relPath := strings.TrimPrefix(path, "databases"+string(filepath.Separator))
-		if !strings.Contains(relPath, string(filepath.Separator)) {
-			return true
-		}
-	}
-	return false
 }
 
 // Bootstrap performs initial sync from master
@@ -177,32 +126,30 @@ func (s *StreamClient) Bootstrap(ctx context.Context) error {
 	}
 
 	if needsSnapshot {
-		// Download full snapshot
 		if err := s.downloadSnapshot(ctx); err != nil {
 			return fmt.Errorf("snapshot download failed: %w", err)
 		}
-
-		// Get updated local txn IDs after snapshot
-		localTxnIDs, _ = s.getLocalMaxTxnIDs()
+		// downloadSnapshot already sets s.lastTxnID with snapshot txn IDs
 	} else if len(deltaDatabases) > 0 {
-		// Perform delta sync for databases that are slightly behind
 		for _, dbName := range deltaDatabases {
-			fromTxnID := localTxnIDs[dbName]
-			if err := s.deltaSync(ctx, dbName, fromTxnID); err != nil {
-				log.Warn().Err(err).Str("database", dbName).Msg("Delta sync failed, will try again during streaming")
+			if err := s.deltaSync(ctx, dbName, localTxnIDs[dbName]); err != nil {
+				log.Warn().Err(err).Str("database", dbName).Msg("Delta sync failed, will retry during streaming")
 			}
 		}
-
-		// Update local txn IDs
-		localTxnIDs, _ = s.getLocalMaxTxnIDs()
+		// Update lastTxnID from MetaStore after delta sync
+		s.mu.Lock()
+		s.lastTxnID, _ = s.getLocalMaxTxnIDs()
+		s.mu.Unlock()
+	} else {
+		// No sync needed, just set lastTxnID from current state
+		s.mu.Lock()
+		s.lastTxnID = localTxnIDs
+		s.mu.Unlock()
 	}
 
-	// Store last txn IDs
-	s.mu.Lock()
-	s.lastTxnID = localTxnIDs
-	s.mu.Unlock()
-
-	log.Info().Interface("last_txn_ids", localTxnIDs).Msg("Bootstrap completed")
+	s.mu.RLock()
+	log.Info().Interface("last_txn_ids", s.lastTxnID).Msg("Bootstrap completed")
+	s.mu.RUnlock()
 	return nil
 }
 
@@ -479,7 +426,22 @@ func (s *StreamClient) downloadSnapshot(ctx context.Context) error {
 		Msg("Received snapshot info")
 
 	// Stream and apply snapshot
-	return s.applySnapshot(ctx, snapshotInfo)
+	if err := s.applySnapshot(ctx, snapshotInfo); err != nil {
+		return err
+	}
+
+	// Update lastTxnID for all databases in snapshot to prevent re-downloading
+	s.mu.Lock()
+	for _, dbInfo := range snapshotInfo.Databases {
+		s.lastTxnID[dbInfo.Name] = snapshotInfo.SnapshotTxnId
+		log.Debug().
+			Str("database", dbInfo.Name).
+			Uint64("snapshot_txn_id", snapshotInfo.SnapshotTxnId).
+			Msg("Updated lastTxnID after snapshot")
+	}
+	s.mu.Unlock()
+
+	return nil
 }
 
 // downloadSnapshotForDatabase downloads snapshot for a specific database
@@ -491,15 +453,17 @@ func (s *StreamClient) downloadSnapshotForDatabase(ctx context.Context, dbName s
 	return s.downloadSnapshot(ctx)
 }
 
-// applySnapshot applies a snapshot from the master
+// applySnapshot applies a snapshot from the master.
+// Uses the unified snapshot.Restorer for atomic download and apply.
+// The Restorer handles:
+// 1. Download to temp directory
+// 2. Verify integrity (SHA256)
+// 3. Acquire locks and swap files
+// 4. Reopen connections
 func (s *StreamClient) applySnapshot(ctx context.Context, snapshotInfo *marmotgrpc.SnapshotInfoResponse) error {
-	// Ensure databases directory exists
-	dbsDir := filepath.Join(cfg.Config.DataDir, "databases")
-	if err := os.MkdirAll(dbsDir, 0755); err != nil {
-		return fmt.Errorf("failed to create databases directory: %w", err)
-	}
+	log.Info().Msg("Applying snapshot using unified restorer")
 
-	// Stream snapshot chunks
+	// Stream snapshot from master
 	stream, err := s.client.StreamSnapshot(ctx, &marmotgrpc.SnapshotRequest{
 		RequestingNodeId: s.nodeID,
 	})
@@ -507,84 +471,96 @@ func (s *StreamClient) applySnapshot(ctx context.Context, snapshotInfo *marmotgr
 		return fmt.Errorf("failed to start snapshot stream: %w", err)
 	}
 
-	// Track open files
-	openFiles := make(map[string]*os.File)
-	defer func() {
-		for _, f := range openFiles {
-			f.Close()
-		}
-	}()
+	// Convert gRPC DatabaseFileInfo to snapshot.DatabaseFileInfo
+	files := make([]snapshot.DatabaseFileInfo, 0, len(snapshotInfo.Databases))
+	for _, dbInfo := range snapshotInfo.Databases {
+		files = append(files, snapshot.DatabaseFileInfo{
+			Name:           dbInfo.Name,
+			Filename:       dbInfo.Filename,
+			SizeBytes:      dbInfo.SizeBytes,
+			SHA256Checksum: dbInfo.Sha256Checksum,
+		})
+	}
 
-	totalChunks := int32(0)
-	for {
-		chunk, err := stream.Recv()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return fmt.Errorf("snapshot stream error: %w", err)
-		}
+	// Create adapter for gRPC stream
+	adapter := &replicaSnapshotStreamAdapter{stream: stream}
 
-		// Verify checksum
-		actualChecksum := fmt.Sprintf("%x", md5.Sum(chunk.Data))
-		if actualChecksum != chunk.Checksum {
-			return fmt.Errorf("checksum mismatch for chunk %d of %s", chunk.ChunkIndex, chunk.Filename)
-		}
+	// Wrap dbManager as ConnectionManager for the Restorer
+	connMgr := &dbManagerConnectionAdapter{dbManager: s.dbManager}
 
-		// Sanitize filename to prevent path traversal attacks
-		sanitizedFilename, err := sanitizeSnapshotFilename(chunk.Filename)
-		if err != nil {
-			return fmt.Errorf("invalid snapshot filename: %w", err)
-		}
+	// Acquire snapshot lock before restore (to block change event processing)
+	s.snapshotMu.Lock()
+	defer s.snapshotMu.Unlock()
 
-		// Get or create file
-		file, exists := openFiles[sanitizedFilename]
-		if !exists {
-			// Determine target path
-			targetPath := filepath.Join(dbsDir, sanitizedFilename)
+	// Use snapshot.Restorer for atomic download and apply
+	restorer := snapshot.NewRestorer(cfg.Config.DataDir, connMgr)
 
-			// Backup existing file if any
-			if _, err := os.Stat(targetPath); err == nil {
-				backupPath := targetPath + ".backup"
-				os.Rename(targetPath, backupPath)
-			}
-
-			// Create new file
-			file, err = os.Create(targetPath)
-			if err != nil {
-				return fmt.Errorf("failed to create file %s: %w", targetPath, err)
-			}
-			openFiles[sanitizedFilename] = file
-		}
-
-		// Write chunk
-		if _, err := file.Write(chunk.Data); err != nil {
-			return fmt.Errorf("failed to write chunk: %w", err)
-		}
-
-		totalChunks++
-
-		// Close file if last chunk for this file
-		if chunk.IsLastForFile {
-			file.Close()
-			delete(openFiles, sanitizedFilename)
-			log.Info().Str("file", sanitizedFilename).Msg("Completed receiving file")
-		}
+	if err := restorer.RestoreFromStream(adapter, files); err != nil {
+		return fmt.Errorf("snapshot restore failed: %w", err)
 	}
 
 	log.Info().
-		Int32("total_chunks", totalChunks).
 		Uint64("snapshot_txn_id", snapshotInfo.SnapshotTxnId).
-		Msg("Snapshot applied successfully")
+		Msg("Snapshot applied successfully via unified restorer")
 
 	return nil
 }
 
+// replicaSnapshotStreamAdapter adapts MarmotService_StreamSnapshotClient to snapshot.ChunkReceiver
+type replicaSnapshotStreamAdapter struct {
+	stream marmotgrpc.MarmotService_StreamSnapshotClient
+}
+
+func (a *replicaSnapshotStreamAdapter) Recv() (*snapshot.Chunk, error) {
+	chunk, err := a.stream.Recv()
+	if err != nil {
+		return nil, err // Passes through io.EOF
+	}
+
+	return &snapshot.Chunk{
+		Filename:      chunk.GetFilename(),
+		ChunkIndex:    chunk.GetChunkIndex(),
+		TotalChunks:   chunk.GetTotalChunks(),
+		Data:          chunk.GetData(),
+		MD5Checksum:   chunk.GetChecksum(),
+		IsLastForFile: chunk.GetIsLastForFile(),
+	}, nil
+}
+
+// dbManagerConnectionAdapter adapts db.DatabaseManager to snapshot.ConnectionManager
+type dbManagerConnectionAdapter struct {
+	dbManager *db.DatabaseManager
+}
+
+func (a *dbManagerConnectionAdapter) CloseDatabaseConnections(name string) error {
+	return a.dbManager.CloseDatabaseConnections(name)
+}
+
+func (a *dbManagerConnectionAdapter) OpenDatabaseConnections(name string) error {
+	return a.dbManager.OpenDatabaseConnections(name)
+}
+
 // applyChangeEvent applies a single change event
+// Acquires read lock on snapshotMu to prevent concurrent execution with snapshot apply
 func (s *StreamClient) applyChangeEvent(ctx context.Context, event *marmotgrpc.ChangeEvent) error {
+	// Block if snapshot is in progress
+	s.snapshotMu.RLock()
+	defer s.snapshotMu.RUnlock()
+
 	database := event.Database
 	if database == "" {
-		database = "marmot"
+		return fmt.Errorf("change event %d missing database name", event.TxnId)
+	}
+
+	// Check first statement for database-level operations (these are always single-statement events)
+	if len(event.Statements) > 0 {
+		stmt := event.Statements[0]
+		switch stmt.Type {
+		case marmotgrpc.StatementType_CREATE_DATABASE:
+			return s.applyCreateDatabase(stmt, database)
+		case marmotgrpc.StatementType_DROP_DATABASE:
+			return s.applyDropDatabase(stmt, database)
+		}
 	}
 
 	mdb, err := s.dbManager.GetDatabase(database)
@@ -592,46 +568,89 @@ func (s *StreamClient) applyChangeEvent(ctx context.Context, event *marmotgrpc.C
 		return fmt.Errorf("database %s not found: %w", database, err)
 	}
 
-	// Execute in transaction
-	tx, err := mdb.GetDB().BeginTx(ctx, nil)
+	// Check if connections are available (they may be closed during snapshot)
+	sqlDB := mdb.GetDB()
+	if sqlDB == nil {
+		return fmt.Errorf("database %s connections are closed", database)
+	}
+
+	tx, err := sqlDB.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer tx.Rollback()
 
 	for _, stmt := range event.Statements {
-		// Check for CDC data
-		if rowChange := stmt.GetRowChange(); rowChange != nil && (len(rowChange.NewValues) > 0 || len(rowChange.OldValues) > 0) {
-			if err := s.applyCDCStatement(tx, stmt); err != nil {
-				return fmt.Errorf("failed to apply CDC statement: %w", err)
-			}
-			continue
-		}
-
-		// Check for DDL
-		if ddlChange := stmt.GetDdlChange(); ddlChange != nil && ddlChange.Sql != "" {
-			if _, err := tx.ExecContext(ctx, ddlChange.Sql); err != nil {
-				return fmt.Errorf("failed to execute DDL: %w", err)
-			}
-			continue
-		}
-
-		// Fallback to SQL (shouldn't reach here for proper CDC)
-		sqlStr := stmt.GetSQL()
-		if sqlStr == "" {
-			log.Warn().
-				Str("table", stmt.TableName).
-				Int32("type", int32(stmt.Type)).
-				Msg("Statement has no SQL and no CDC data, skipping")
-			continue
-		}
-
-		if _, err := tx.ExecContext(ctx, sqlStr); err != nil {
-			return fmt.Errorf("failed to execute SQL: %w", err)
+		if err := s.applyStatement(ctx, tx, stmt); err != nil {
+			return err
 		}
 	}
 
 	return tx.Commit()
+}
+
+// applyCreateDatabase handles CREATE DATABASE replication
+func (s *StreamClient) applyCreateDatabase(stmt *marmotgrpc.Statement, fallbackDB string) error {
+	dbName := stmt.Database
+	if dbName == "" {
+		dbName = fallbackDB
+	}
+	err := s.dbManager.CreateDatabase(dbName)
+	if err == nil {
+		log.Info().Str("database", dbName).Msg("Created database via replication")
+		return nil
+	}
+	// Idempotent: database may already exist from previous replay
+	if strings.Contains(err.Error(), "already exists") {
+		return nil
+	}
+	return fmt.Errorf("failed to create database %s: %w", dbName, err)
+}
+
+// applyDropDatabase handles DROP DATABASE replication
+func (s *StreamClient) applyDropDatabase(stmt *marmotgrpc.Statement, fallbackDB string) error {
+	dbName := stmt.Database
+	if dbName == "" {
+		dbName = fallbackDB
+	}
+	err := s.dbManager.DropDatabase(dbName)
+	if err == nil {
+		log.Info().Str("database", dbName).Msg("Dropped database via replication")
+		return nil
+	}
+	// Idempotent: database may not exist from previous replay
+	if strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "does not exist") {
+		return nil
+	}
+	return fmt.Errorf("failed to drop database %s: %w", dbName, err)
+}
+
+// applyStatement applies a single statement within a transaction
+func (s *StreamClient) applyStatement(ctx context.Context, tx *sql.Tx, stmt *marmotgrpc.Statement) error {
+	// CDC path: row-level changes
+	if rowChange := stmt.GetRowChange(); rowChange != nil && (len(rowChange.NewValues) > 0 || len(rowChange.OldValues) > 0) {
+		return s.applyCDCStatement(tx, stmt)
+	}
+
+	// DDL path: schema changes with idempotency rewriting
+	if ddlChange := stmt.GetDdlChange(); ddlChange != nil && ddlChange.Sql != "" {
+		idempotentSQL := protocol.RewriteDDLForIdempotency(ddlChange.Sql)
+		if _, err := tx.ExecContext(ctx, idempotentSQL); err != nil {
+			return fmt.Errorf("DDL failed: %w", err)
+		}
+		return nil
+	}
+
+	// Fallback: raw SQL (legacy path, shouldn't reach here for proper CDC)
+	if sqlStr := stmt.GetSQL(); sqlStr != "" {
+		if _, err := tx.ExecContext(ctx, sqlStr); err != nil {
+			return fmt.Errorf("SQL failed: %w", err)
+		}
+		return nil
+	}
+
+	log.Warn().Str("table", stmt.TableName).Int32("type", int32(stmt.Type)).Msg("Empty statement, skipping")
+	return nil
 }
 
 // applyCDCStatement applies a CDC statement

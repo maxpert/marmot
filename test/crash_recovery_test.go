@@ -440,24 +440,21 @@ func (h *ClusterHarness) getRowCount(nodeID int, tableName string) int {
 	return count
 }
 
-// ClusterMembersResponse represents the cluster membership API response
-type ClusterMembersResponse struct {
-	Members         []ClusterMember `json:"members"`
-	TotalMembership int             `json:"total_membership"`
-	AliveCount      int             `json:"alive_count"`
-	QuorumSize      int             `json:"quorum_size"`
-	LocalNodeID     uint64          `json:"local_node_id"`
-}
-
 // ClusterMember represents a node in the cluster membership response
 type ClusterMember struct {
-	NodeID  uint64 `json:"node_id"`
-	Address string `json:"address"`
-	Status  string `json:"status"`
+	NodeID      uint64 `json:"node_id"`
+	Address     string `json:"address"`
+	Status      string `json:"status"`
+	Incarnation uint64 `json:"incarnation"`
+}
+
+// AdminAPIResponse wraps the admin API response format
+type AdminAPIResponse struct {
+	Data []ClusterMember `json:"data"`
 }
 
 // getClusterStatus fetches cluster status from a node's admin API
-func (h *ClusterHarness) getClusterStatus(nodeID int) (*ClusterMembersResponse, error) {
+func (h *ClusterHarness) getClusterStatus(nodeID int) ([]ClusterMember, error) {
 	node := h.Nodes[nodeID-1]
 	url := fmt.Sprintf("http://localhost:%d/admin/cluster/members", node.GRPCPort)
 
@@ -479,12 +476,12 @@ func (h *ClusterHarness) getClusterStatus(nodeID int) (*ClusterMembersResponse, 
 		return nil, fmt.Errorf("status %d: %s", resp.StatusCode, string(body))
 	}
 
-	var status ClusterMembersResponse
-	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
+	var apiResp AdminAPIResponse
+	if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
 		return nil, err
 	}
 
-	return &status, nil
+	return apiResp.Data, nil
 }
 
 // WaitForClusterConvergence waits for all nodes to be ALIVE according to cluster membership
@@ -492,20 +489,34 @@ func (h *ClusterHarness) WaitForClusterConvergence(timeout time.Duration) error 
 	h.t.Logf("Waiting for cluster to converge (all nodes ALIVE)...")
 
 	deadline := time.Now().Add(timeout)
+	errorLogged := false
 	for time.Now().Before(deadline) {
 		// Check from node 1's perspective
-		status, err := h.getClusterStatus(1)
+		members, err := h.getClusterStatus(1)
 		if err != nil {
+			if !errorLogged {
+				h.t.Logf("Error getting cluster status (will retry): %v", err)
+				errorLogged = true
+			}
 			time.Sleep(500 * time.Millisecond)
 			continue
 		}
+		errorLogged = false
 
-		if status.AliveCount >= numNodes {
-			h.t.Logf("Cluster converged: %d nodes ALIVE", status.AliveCount)
+		// Count ALIVE nodes
+		aliveCount := 0
+		for _, m := range members {
+			if m.Status == "ALIVE" {
+				aliveCount++
+			}
+		}
+
+		if aliveCount >= numNodes {
+			h.t.Logf("Cluster converged: %d nodes ALIVE", aliveCount)
 			return nil
 		}
 
-		h.t.Logf("Cluster not yet converged: %d/%d nodes ALIVE", status.AliveCount, numNodes)
+		h.t.Logf("Cluster not yet converged: %d/%d nodes ALIVE", aliveCount, numNodes)
 		time.Sleep(1 * time.Second)
 	}
 

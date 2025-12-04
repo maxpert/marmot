@@ -23,21 +23,9 @@ type MVCCTransaction struct {
 	NodeID     uint64
 	StartTS    hlc.Timestamp
 	CommitTS   hlc.Timestamp
-	Status     string
+	Status     TxnStatus
 	Statements []protocol.Statement
 	mu         sync.RWMutex
-}
-
-// WriteIntent represents a provisional write (intent)
-// Acts as both a lock and a provisional value
-type WriteIntent struct {
-	TableName    string
-	RowKey       string
-	TxnID        uint64
-	Timestamp    hlc.Timestamp
-	Operation    string
-	SQLStatement string
-	DataSnapshot []byte
 }
 
 // MinAppliedTxnIDFunc returns the minimum last_applied_txn_id across all peers for a database
@@ -180,7 +168,7 @@ func (tm *MVCCTransactionManager) AddStatement(txn *MVCCTransaction, stmt protoc
 // WriteIntent creates a write intent for a row
 // This is the CRITICAL part: write intents act as distributed locks
 // Intents are stored ONLY in MetaStore (not in memory) for durability
-func (tm *MVCCTransactionManager) WriteIntent(txn *MVCCTransaction, tableName, rowKey string,
+func (tm *MVCCTransactionManager) WriteIntent(txn *MVCCTransaction, intentType IntentType, tableName, rowKey string,
 	stmt protocol.Statement, dataSnapshot []byte) error {
 
 	txn.mu.Lock()
@@ -190,9 +178,11 @@ func (tm *MVCCTransactionManager) WriteIntent(txn *MVCCTransaction, tableName, r
 		return fmt.Errorf("transaction %d is not pending", txn.ID)
 	}
 
+	op := StatementTypeToOpType(int(stmt.Type))
+
 	// Persist the intent directly to MetaStore (durable storage)
-	err := tm.metaStore.WriteIntent(txn.ID, tableName, rowKey,
-		statementTypeToOperation(stmt.Type), stmt.SQL, dataSnapshot, txn.StartTS, txn.NodeID)
+	err := tm.metaStore.WriteIntent(txn.ID, intentType, tableName, rowKey,
+		op, stmt.SQL, dataSnapshot, txn.StartTS, txn.NodeID)
 
 	if err != nil {
 		// Check if this is a write-write conflict
@@ -205,8 +195,8 @@ func (tm *MVCCTransactionManager) WriteIntent(txn *MVCCTransaction, tableName, r
 				if existingIntent.TxnID == txn.ID {
 					// Delete and re-insert to update
 					tm.metaStore.DeleteIntent(tableName, rowKey, txn.ID)
-					updateErr := tm.metaStore.WriteIntent(txn.ID, tableName, rowKey,
-						statementTypeToOperation(stmt.Type), stmt.SQL, dataSnapshot, txn.StartTS, txn.NodeID)
+					updateErr := tm.metaStore.WriteIntent(txn.ID, intentType, tableName, rowKey,
+						op, stmt.SQL, dataSnapshot, txn.StartTS, txn.NodeID)
 					if updateErr != nil {
 						return fmt.Errorf("failed to update write intent: %w", updateErr)
 					}
@@ -222,20 +212,6 @@ func (tm *MVCCTransactionManager) WriteIntent(txn *MVCCTransaction, tableName, r
 	}
 
 	return nil
-}
-
-// statementTypeToOperation converts protocol.StatementType to operation string
-func statementTypeToOperation(st protocol.StatementType) string {
-	switch st {
-	case protocol.StatementInsert, protocol.StatementReplace:
-		return OpInsert
-	case protocol.StatementUpdate:
-		return OpUpdate
-	case protocol.StatementDelete:
-		return OpDelete
-	default:
-		return "UNKNOWN"
-	}
 }
 
 // CommitTransaction commits the transaction using 2PC
@@ -378,11 +354,8 @@ func (tm *MVCCTransactionManager) rebuildStatementsFromCDC(cdcEntries []*IntentE
 	// Add DDL statements from intents (only if no CDC entries - DDL-only transactions)
 	if len(cdcEntries) == 0 {
 		for _, intent := range intents {
-			// Skip non-DDL intents and database operations
-			if intent.TableName == TableDatabaseOperations {
-				continue
-			}
-			if intent.SQLStatement == "" {
+			// Only process DDL intents with SQL statements
+			if intent.IntentType != IntentTypeDDL || intent.SQLStatement == "" {
 				continue
 			}
 			stmt := protocol.Statement{
@@ -420,13 +393,12 @@ func (tm *MVCCTransactionManager) applyCDCEntries(txnID uint64, entries []*Inten
 }
 
 // applyDDLIntents executes DDL statements from write intents.
-// Only processes intents written to TableDDLOps (__marmot__ddl_ops).
+// Only processes intents with IntentType == IntentTypeDDL.
 // DML intents are handled via CDC entries in applyCDCEntries.
 func (tm *MVCCTransactionManager) applyDDLIntents(txnID uint64, intents []*WriteIntentRecord) error {
 	for _, intent := range intents {
-		// Only process DDL intents (stored in __marmot__ddl_ops table)
-		// Skip database operations, regular DML intents, and intents without SQL
-		if intent.TableName != TableDDLOps || intent.SQLStatement == "" {
+		// Only process DDL intents with SQL statements
+		if intent.IntentType != IntentTypeDDL || intent.SQLStatement == "" {
 			continue
 		}
 
@@ -446,12 +418,31 @@ func (tm *MVCCTransactionManager) finalizeCommit(txn *MVCCTransaction) error {
 		return fmt.Errorf("failed to serialize statements: %w", err)
 	}
 
+	// Get database name from statement or fall back to transaction manager's database
 	dbName := ""
-	if len(txn.Statements) > 0 {
+	if len(txn.Statements) > 0 && txn.Statements[0].Database != "" {
 		dbName = txn.Statements[0].Database
 	}
+	if dbName == "" {
+		tm.mu.RLock()
+		dbName = tm.databaseName
+		tm.mu.RUnlock()
+	}
 
-	if err := tm.metaStore.CommitTransaction(txn.ID, txn.CommitTS, statementsJSON, dbName); err != nil {
+	// Collect unique table names from statements
+	tableSet := make(map[string]struct{})
+	for _, stmt := range txn.Statements {
+		if stmt.TableName != "" {
+			tableSet[stmt.TableName] = struct{}{}
+		}
+	}
+	tables := make([]string, 0, len(tableSet))
+	for t := range tableSet {
+		tables = append(tables, t)
+	}
+	tablesInvolved := strings.Join(tables, ",")
+
+	if err := tm.metaStore.CommitTransaction(txn.ID, txn.CommitTS, statementsJSON, dbName, tablesInvolved); err != nil {
 		return fmt.Errorf("failed to mark transaction as committed: %w", err)
 	}
 
@@ -478,14 +469,14 @@ func (tm *MVCCTransactionManager) cleanupAfterCommit(txn *MVCCTransaction, inten
 	}
 }
 
-// opCodeToStatementType converts operation code back to protocol.StatementType
+// opCodeToStatementType converts OpType back to protocol.StatementType
 func opCodeToStatementType(op uint8) protocol.StatementType {
-	switch op {
-	case OpInsertInt:
+	switch OpType(op) {
+	case OpTypeInsert, OpTypeReplace:
 		return protocol.StatementInsert
-	case OpUpdateInt:
+	case OpTypeUpdate:
 		return protocol.StatementUpdate
-	case OpDeleteInt:
+	case OpTypeDelete:
 		return protocol.StatementDelete
 	default:
 		return protocol.StatementInsert
@@ -813,7 +804,7 @@ func (tm *MVCCTransactionManager) applyDeltaChange(tableName, rowKey, sqlStmt st
 	}
 
 	// Record MVCC version in MetaStore
-	err = tm.metaStore.CreateMVCCVersion(tableName, rowKey, ts, ts.NodeID, txnID, "DELTA", nil)
+	err = tm.metaStore.CreateMVCCVersion(tableName, rowKey, ts, ts.NodeID, txnID, OpTypeDelta, nil)
 	if err != nil {
 		return false, fmt.Errorf("failed to record MVCC version: %w", err)
 	}

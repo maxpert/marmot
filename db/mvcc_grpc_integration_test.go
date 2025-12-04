@@ -150,7 +150,7 @@ func TestMVCCDatabase_ConflictDetection(t *testing.T) {
 	}
 
 	dataSnapshot, _ := SerializeData(map[string]interface{}{"balance": 100})
-	err = mdb.GetTransactionManager().WriteIntent(txn1, "users", "1", stmt1, dataSnapshot)
+	err = mdb.GetTransactionManager().WriteIntent(txn1, IntentTypeDML, "users", "1", stmt1, dataSnapshot)
 	if err != nil {
 		t.Fatalf("Failed to create write intent: %v", err)
 	}
@@ -170,7 +170,7 @@ func TestMVCCDatabase_ConflictDetection(t *testing.T) {
 	}
 
 	dataSnapshot2, _ := SerializeData(map[string]interface{}{"balance": 200})
-	err = mdb.GetTransactionManager().WriteIntent(txn2, "users", "1", stmt2, dataSnapshot2)
+	err = mdb.GetTransactionManager().WriteIntent(txn2, IntentTypeDML, "users", "1", stmt2, dataSnapshot2)
 	if err == nil {
 		t.Fatal("Expected conflict error, got nil")
 	}
@@ -350,7 +350,7 @@ func TestMVCCDatabase_TransactionLifecycle(t *testing.T) {
 
 	// Create write intent
 	dataSnapshot, _ := SerializeData(map[string]interface{}{"balance": 100})
-	err = mdb.GetTransactionManager().WriteIntent(txn, "users", "1", stmt, dataSnapshot)
+	err = mdb.GetTransactionManager().WriteIntent(txn, IntentTypeDML, "users", "1", stmt, dataSnapshot)
 	if err != nil {
 		t.Fatalf("Failed to create write intent: %v", err)
 	}
@@ -375,8 +375,8 @@ func TestMVCCDatabase_TransactionLifecycle(t *testing.T) {
 		t.Fatalf("Transaction record not found for txn_id=%d", txn.ID)
 	}
 
-	if rec.Status != MetaTxnStatusCommitted {
-		t.Fatalf("Expected status %s, got %s", MetaTxnStatusCommitted, rec.Status)
+	if rec.Status != TxnStatusCommitted {
+		t.Fatalf("Expected status %s, got %s", TxnStatusCommitted, rec.Status)
 	}
 
 	t.Logf("✓ Transaction record shows status: %s", rec.Status)

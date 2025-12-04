@@ -1,6 +1,7 @@
 package db
 
 import (
+	"errors"
 	"path/filepath"
 	"strings"
 	"time"
@@ -9,13 +10,16 @@ import (
 	"github.com/maxpert/marmot/hlc"
 )
 
+// ErrStopIteration signals scan callbacks to stop iteration without error
+var ErrStopIteration = errors.New("stop iteration")
+
 // MetaStore provides transactional metadata storage separate from user data.
 // Each user database has its own MetaStore backed by PebbleDB.
 // This separation allows user data writes and metadata writes to happen in parallel.
 type MetaStore interface {
 	// Transaction lifecycle
 	BeginTransaction(txnID, nodeID uint64, startTS hlc.Timestamp) error
-	CommitTransaction(txnID uint64, commitTS hlc.Timestamp, statements []byte, dbName string) error
+	CommitTransaction(txnID uint64, commitTS hlc.Timestamp, statements []byte, dbName, tablesInvolved string) error
 	AbortTransaction(txnID uint64) error
 	GetTransaction(txnID uint64) (*TransactionRecord, error)
 	GetPendingTransactions() ([]*TransactionRecord, error)
@@ -27,7 +31,7 @@ type MetaStore interface {
 	StoreReplayedTransaction(txnID, nodeID uint64, commitTS hlc.Timestamp, statements []byte, dbName string) error
 
 	// Write intents (distributed locks)
-	WriteIntent(txnID uint64, tableName, rowKey, op, sqlStmt string, data []byte, ts hlc.Timestamp, nodeID uint64) error
+	WriteIntent(txnID uint64, intentType IntentType, tableName, rowKey string, op OpType, sqlStmt string, data []byte, ts hlc.Timestamp, nodeID uint64) error
 	ValidateIntent(tableName, rowKey string, expectedTxnID uint64) (bool, error)
 	DeleteIntent(tableName, rowKey string, txnID uint64) error
 	DeleteIntentsByTxn(txnID uint64) error
@@ -37,7 +41,7 @@ type MetaStore interface {
 	GetIntentFilter() *IntentFilter // Cuckoo filter for fast-path conflict detection
 
 	// MVCC versions
-	CreateMVCCVersion(tableName, rowKey string, ts hlc.Timestamp, nodeID, txnID uint64, op string, data []byte) error
+	CreateMVCCVersion(tableName, rowKey string, ts hlc.Timestamp, nodeID, txnID uint64, op OpType, data []byte) error
 	GetLatestVersion(tableName, rowKey string) (*MVCCVersionRecord, error)
 	GetMVCCVersionCount(tableName, rowKey string) (int, error)
 
@@ -76,6 +80,11 @@ type MetaStore interface {
 	// Streaming for anti-entropy delta sync
 	StreamCommittedTransactions(fromTxnID uint64, callback func(*TransactionRecord) error) error
 
+	// ScanTransactions iterates transactions from fromTxnID.
+	// If descending is true, scans from newest to oldest.
+	// Callback returns nil to continue, ErrStopIteration to stop, or other error to abort.
+	ScanTransactions(fromTxnID uint64, descending bool, callback func(*TransactionRecord) error) error
+
 	// Lifecycle
 	Close() error
 	Checkpoint() error // Triggers PebbleDB checkpoint for consistency
@@ -86,7 +95,7 @@ type TransactionRecord struct {
 	TxnID                uint64
 	NodeID               uint64
 	SeqNum               uint64 // Monotonic sequence for gap detection
-	Status               string
+	Status               TxnStatus
 	StartTSWall          int64
 	StartTSLogical       int32
 	CommitTSWall         int64
@@ -101,13 +110,14 @@ type TransactionRecord struct {
 
 // WriteIntentRecord represents a write intent in meta store
 type WriteIntentRecord struct {
+	IntentType       IntentType // Type discriminator: DML, DDL, or DatabaseOp
 	TableName        string
 	RowKey           string
 	TxnID            uint64
 	TSWall           int64
 	TSLogical        int32
 	NodeID           uint64
-	Operation        string
+	Operation        OpType
 	SQLStatement     string
 	DataSnapshot     []byte
 	CreatedAt        int64
@@ -122,7 +132,7 @@ type MVCCVersionRecord struct {
 	TSLogical    int32
 	NodeID       uint64
 	TxnID        uint64
-	Operation    string
+	Operation    OpType
 	DataSnapshot []byte
 	CreatedAt    int64
 }
@@ -135,19 +145,8 @@ type ReplicationStateRecord struct {
 	LastAppliedTSWall    int64
 	LastAppliedTSLogical int32
 	LastSyncTime         int64
-	SyncStatus           string
+	SyncStatus           SyncStatus
 }
-
-// MetaStore status constants
-const (
-	MetaTxnStatusPending   = "PENDING"
-	MetaTxnStatusCommitted = "COMMITTED"
-	MetaTxnStatusAborted   = "ABORTED"
-
-	MetaSyncStatusSynced     = "SYNCED"
-	MetaSyncStatusCatchingUp = "CATCHING_UP"
-	MetaSyncStatusFailed     = "FAILED"
-)
 
 // NewMetaStore creates a PebbleDB-backed MetaStore.
 // basePath is the path to the user database (e.g., "/data/mydb.db").

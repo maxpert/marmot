@@ -314,7 +314,7 @@ func (s *EphemeralHookSession) hookCallback(data sqlite3.SQLitePreUpdateData) {
 	// Determine operation type and capture values
 	switch data.Op {
 	case sqlite3.SQLITE_INSERT:
-		operation = OpInsertInt
+		operation = uint8(OpTypeInsert)
 		if err := data.New(newDest...); err == nil {
 			newValues = s.buildValueMap(schema.columns, newDest)
 		}
@@ -322,7 +322,7 @@ func (s *EphemeralHookSession) hookCallback(data sqlite3.SQLitePreUpdateData) {
 		rowKey = s.serializePK(data.TableName, schema, pkValues)
 
 	case sqlite3.SQLITE_UPDATE:
-		operation = OpUpdateInt
+		operation = uint8(OpTypeUpdate)
 		if err := data.Old(oldDest...); err == nil {
 			oldValues = s.buildValueMap(schema.columns, oldDest)
 		}
@@ -346,7 +346,7 @@ func (s *EphemeralHookSession) hookCallback(data sqlite3.SQLitePreUpdateData) {
 		}
 
 	case sqlite3.SQLITE_DELETE:
-		operation = OpDeleteInt
+		operation = uint8(OpTypeDelete)
 		if err := data.Old(oldDest...); err == nil {
 			oldValues = s.buildValueMap(schema.columns, oldDest)
 		}

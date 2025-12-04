@@ -107,7 +107,7 @@ func verifyWriteIntentsClearedMeta(t *testing.T, ms MetaStore, txnID uint64) {
 
 // verifyTransactionStatusMeta checks the status of a transaction using MetaStore
 // Note: Aborted transactions are deleted rather than marked with ABORTED status
-func verifyTransactionStatusMeta(t *testing.T, ms MetaStore, txnID uint64, expectedStatus string) {
+func verifyTransactionStatusMeta(t *testing.T, ms MetaStore, txnID uint64, expectedStatus TxnStatus) {
 	t.Helper()
 	txnRecord, err := ms.GetTransaction(txnID)
 
@@ -118,7 +118,7 @@ func verifyTransactionStatusMeta(t *testing.T, ms MetaStore, txnID uint64, expec
 			return
 		}
 		if err == nil {
-			t.Errorf("Expected transaction %d to be deleted (aborted), but found status %s", txnID, txnRecord.Status)
+			t.Errorf("Expected transaction %d to be deleted (aborted), but found status %s", txnID, txnRecord.Status.String())
 			return
 		}
 	}
@@ -130,7 +130,7 @@ func verifyTransactionStatusMeta(t *testing.T, ms MetaStore, txnID uint64, expec
 		t.Fatalf("Transaction %d not found", txnID)
 	}
 	if txnRecord.Status != expectedStatus {
-		t.Errorf("Expected transaction %d status %s, got %s", txnID, expectedStatus, txnRecord.Status)
+		t.Errorf("Expected transaction %d status %s, got %s", txnID, expectedStatus.String(), txnRecord.Status.String())
 	}
 }
 

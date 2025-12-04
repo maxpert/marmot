@@ -268,10 +268,10 @@ func (ds *DeltaSyncClient) SyncAllDatabasesFromPeer(ctx context.Context, peerNod
 
 // applyChangeEvent applies a single change event to the local database
 func (ds *DeltaSyncClient) applyChangeEvent(ctx context.Context, event *ChangeEvent) error {
-	// Determine target database
+	// Determine target database - database name is required
 	database := event.Database
 	if database == "" {
-		database = "marmot" // Default database
+		return fmt.Errorf("change event %d missing database name", event.TxnId)
 	}
 
 	// Schema version validation: Check if we need to catch up DDL first

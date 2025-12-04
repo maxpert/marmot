@@ -61,13 +61,13 @@ func TestPebbleMetaStoreTransactionLifecycle(t *testing.T) {
 	if rec == nil {
 		t.Fatal("Transaction not found")
 	}
-	if rec.Status != MetaTxnStatusPending {
-		t.Errorf("Expected status PENDING, got %s", rec.Status)
+	if rec.Status != TxnStatusPending {
+		t.Errorf("Expected status PENDING, got %s", rec.Status.String())
 	}
 
 	// Commit transaction
 	commitTS := clock.Now()
-	err = store.CommitTransaction(txnID, commitTS, []byte(`[{"sql":"INSERT INTO t VALUES(1)"}]`), "testdb")
+	err = store.CommitTransaction(txnID, commitTS, []byte(`[{"sql":"INSERT INTO t VALUES(1)"}]`), "testdb", "t")
 	if err != nil {
 		t.Fatalf("CommitTransaction failed: %v", err)
 	}
@@ -77,8 +77,8 @@ func TestPebbleMetaStoreTransactionLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetTransaction failed: %v", err)
 	}
-	if rec.Status != MetaTxnStatusCommitted {
-		t.Errorf("Expected status COMMITTED, got %s", rec.Status)
+	if rec.Status != TxnStatusCommitted {
+		t.Errorf("Expected status COMMITTED, got %s", rec.Status.String())
 	}
 	if rec.DatabaseName != "testdb" {
 		t.Errorf("Expected database 'testdb', got '%s'", rec.DatabaseName)
@@ -123,7 +123,7 @@ func TestPebbleMetaStoreWriteIntents(t *testing.T) {
 	store.BeginTransaction(txnID, 1, startTS)
 
 	// Write intent
-	err := store.WriteIntent(txnID, "users", "user:1", "INSERT", "INSERT INTO users VALUES(1,'alice')", nil, startTS, 1)
+	err := store.WriteIntent(txnID, IntentTypeDML, "users", "user:1", OpTypeInsert, "INSERT INTO users VALUES(1,'alice')", nil, startTS, 1)
 	if err != nil {
 		t.Fatalf("WriteIntent failed: %v", err)
 	}
@@ -145,8 +145,8 @@ func TestPebbleMetaStoreWriteIntents(t *testing.T) {
 	if intent == nil {
 		t.Fatal("Intent not found")
 	}
-	if intent.Operation != "INSERT" {
-		t.Errorf("Expected operation INSERT, got %s", intent.Operation)
+	if intent.Operation != OpTypeInsert {
+		t.Errorf("Expected operation INSERT, got %s", intent.Operation.String())
 	}
 
 	// Validate with wrong txn_id
@@ -187,13 +187,13 @@ func TestPebbleMetaStoreWriteIntentConflict(t *testing.T) {
 	store.BeginTransaction(txnID2, 1, startTS2)
 
 	// First intent succeeds
-	err := store.WriteIntent(txnID1, "users", "user:1", "INSERT", "INSERT INTO users VALUES(1)", nil, startTS1, 1)
+	err := store.WriteIntent(txnID1, IntentTypeDML, "users", "user:1", OpTypeInsert, "INSERT INTO users VALUES(1)", nil, startTS1, 1)
 	if err != nil {
 		t.Fatalf("First WriteIntent failed: %v", err)
 	}
 
 	// Second intent on same row should fail with conflict
-	err = store.WriteIntent(txnID2, "users", "user:1", "UPDATE", "UPDATE users SET name='bob' WHERE id=1", nil, startTS2, 1)
+	err = store.WriteIntent(txnID2, IntentTypeDML, "users", "user:1", OpTypeUpdate, "UPDATE users SET name='bob' WHERE id=1", nil, startTS2, 1)
 	if err == nil {
 		t.Fatal("Expected write-write conflict error")
 	}
@@ -212,9 +212,9 @@ func TestPebbleMetaStoreMVCCVersions(t *testing.T) {
 	ts3 := clock.Now()
 
 	// Create multiple versions
-	store.CreateMVCCVersion("users", "user:1", ts1, 1, 100, "INSERT", []byte(`{"name":"alice"}`))
-	store.CreateMVCCVersion("users", "user:1", ts2, 1, 101, "UPDATE", []byte(`{"name":"alice2"}`))
-	store.CreateMVCCVersion("users", "user:1", ts3, 1, 102, "UPDATE", []byte(`{"name":"alice3"}`))
+	store.CreateMVCCVersion("users", "user:1", ts1, 1, 100, OpTypeInsert, []byte(`{"name":"alice"}`))
+	store.CreateMVCCVersion("users", "user:1", ts2, 1, 101, OpTypeUpdate, []byte(`{"name":"alice2"}`))
+	store.CreateMVCCVersion("users", "user:1", ts3, 1, 102, OpTypeUpdate, []byte(`{"name":"alice3"}`))
 
 	// Get latest version
 	latest, err := store.GetLatestVersion("users", "user:1")
@@ -370,7 +370,7 @@ func TestPebbleMetaStoreCommitCounters(t *testing.T) {
 
 	// Begin and commit
 	store.BeginTransaction(txnID, 1, startTS)
-	store.CommitTransaction(txnID, clock.Now(), nil, "testdb")
+	store.CommitTransaction(txnID, clock.Now(), nil, "testdb", "")
 
 	// Count should increase
 	count, _ = store.GetCommittedTxnCount()
@@ -477,7 +477,7 @@ func TestPebbleMetaStoreCleanupOldMVCCVersions(t *testing.T) {
 	// Create 5 versions
 	for i := 0; i < 5; i++ {
 		ts := clock.Now()
-		store.CreateMVCCVersion("users", "user:1", ts, 1, uint64(100+i), "UPDATE", nil)
+		store.CreateMVCCVersion("users", "user:1", ts, 1, uint64(100+i), OpTypeUpdate, nil)
 	}
 
 	count, _ := store.GetMVCCVersionCount("users", "user:1")
@@ -512,7 +512,7 @@ func TestPebbleMetaStoreDeleteIntentsByTxn(t *testing.T) {
 
 	// Create multiple intents
 	for i := 0; i < 5; i++ {
-		err := store.WriteIntent(txnID, "users", "user:"+string(rune('0'+i)), "INSERT", "", nil, startTS, 1)
+		err := store.WriteIntent(txnID, IntentTypeDML, "users", "user:"+string(rune('0'+i)), OpTypeInsert, "", nil, startTS, 1)
 		if err != nil {
 			t.Fatalf("WriteIntent failed: %v", err)
 		}
@@ -559,8 +559,8 @@ func TestPebbleMetaStoreStoreReplayedTransaction(t *testing.T) {
 	if rec == nil {
 		t.Fatal("Transaction not found")
 	}
-	if rec.Status != MetaTxnStatusCommitted {
-		t.Errorf("Expected COMMITTED, got %s", rec.Status)
+	if rec.Status != TxnStatusCommitted {
+		t.Errorf("Expected COMMITTED, got %s", rec.Status.String())
 	}
 	if rec.NodeID != nodeID {
 		t.Errorf("Expected nodeID %d, got %d", nodeID, rec.NodeID)
@@ -581,7 +581,7 @@ func TestPebbleMetaStoreStreamCommittedTransactions(t *testing.T) {
 		txnIDs = append(txnIDs, txnID)
 
 		store.BeginTransaction(txnID, 1, startTS)
-		store.CommitTransaction(txnID, clock.Now(), nil, "testdb")
+		store.CommitTransaction(txnID, clock.Now(), nil, "testdb", "")
 	}
 
 	// Stream all (from 0)

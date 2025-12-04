@@ -1,63 +1,147 @@
 package db
 
-// Transaction status constants
+// IntentType distinguishes different kinds of write intents
+type IntentType uint8
+
 const (
-	TxnStatusPending   = "PENDING"
-	TxnStatusCommitted = "COMMITTED"
-	TxnStatusAborted   = "ABORTED"
+	IntentTypeDML        IntentType = 0 // Regular row operations (INSERT/UPDATE/DELETE)
+	IntentTypeDDL        IntentType = 1 // Schema operations (CREATE/ALTER/DROP TABLE)
+	IntentTypeDatabaseOp IntentType = 2 // Database operations (CREATE/DROP DATABASE)
 )
 
-// Operation type constants (string form)
-const (
-	OpInsert = "INSERT"
-	OpUpdate = "UPDATE"
-	OpDelete = "DELETE"
-)
-
-// Operation constants for intent entries (uint8 form)
-const (
-	OpInsertInt uint8 = 0
-	OpUpdateInt uint8 = 1
-	OpDeleteInt uint8 = 2
-)
-
-// Internal table names for special operations
-const (
-	TableDatabaseOperations = "__marmot__database_operations"
-	TableDDLOps             = "__marmot__ddl_ops"
-)
-
-// Database operation names for CREATE/DROP DATABASE
-const (
-	OpNameCreateDatabase = "CREATE_DATABASE"
-	OpNameDropDatabase   = "DROP_DATABASE"
-)
-
-// DDL row key prefix for DDL operations in write intents
-const DDLRowKeyPrefix = "__ddl__"
-
-// DatabaseOperationSnapshot is a typed struct for CREATE/DROP DATABASE intents.
-// Using a struct with msgpack tags ensures correct serialization/deserialization
-// instead of relying on map[string]interface{} which can return []byte for strings.
-type DatabaseOperationSnapshot struct {
-	Type         int    `msgpack:"type"`
-	Timestamp    int64  `msgpack:"timestamp"`
-	DatabaseName string `msgpack:"database_name"`
-	Operation    string `msgpack:"operation"`
+func (t IntentType) String() string {
+	switch t {
+	case IntentTypeDML:
+		return "DML"
+	case IntentTypeDDL:
+		return "DDL"
+	case IntentTypeDatabaseOp:
+		return "DATABASE_OP"
+	default:
+		return "UNKNOWN"
+	}
 }
 
-// StatementTypeToOpCode converts protocol.StatementType to uint8 operation code
-// This is the canonical implementation used across packages
-// StatementType values: Insert=0, Replace=1, Update=2, Delete=3
-func StatementTypeToOpCode(stmtType int) uint8 {
-	switch stmtType {
-	case 0, 1: // StatementInsert, StatementReplace
-		return OpInsertInt
-	case 2: // StatementUpdate
-		return OpUpdateInt
-	case 3: // StatementDelete
-		return OpDeleteInt
+// OpType represents the type of data operation
+type OpType uint8
+
+const (
+	OpTypeInsert  OpType = 0
+	OpTypeReplace OpType = 1
+	OpTypeUpdate  OpType = 2
+	OpTypeDelete  OpType = 3
+	OpTypeDelta   OpType = 4 // Used for LWW delta sync operations
+)
+
+func (o OpType) String() string {
+	switch o {
+	case OpTypeInsert:
+		return "INSERT"
+	case OpTypeReplace:
+		return "REPLACE"
+	case OpTypeUpdate:
+		return "UPDATE"
+	case OpTypeDelete:
+		return "DELETE"
+	case OpTypeDelta:
+		return "DELTA"
 	default:
-		return OpInsertInt
+		return "UNKNOWN"
+	}
+}
+
+// TxnStatus represents transaction state
+type TxnStatus uint8
+
+const (
+	TxnStatusPending   TxnStatus = 0
+	TxnStatusCommitted TxnStatus = 1
+	TxnStatusAborted   TxnStatus = 2
+)
+
+func (s TxnStatus) String() string {
+	switch s {
+	case TxnStatusPending:
+		return "PENDING"
+	case TxnStatusCommitted:
+		return "COMMITTED"
+	case TxnStatusAborted:
+		return "ABORTED"
+	default:
+		return "UNKNOWN"
+	}
+}
+
+// SyncStatus represents replication sync state
+type SyncStatus uint8
+
+const (
+	SyncStatusSynced     SyncStatus = 0
+	SyncStatusCatchingUp SyncStatus = 1
+	SyncStatusFailed     SyncStatus = 2
+)
+
+func (s SyncStatus) String() string {
+	switch s {
+	case SyncStatusSynced:
+		return "SYNCED"
+	case SyncStatusCatchingUp:
+		return "CATCHING_UP"
+	case SyncStatusFailed:
+		return "FAILED"
+	default:
+		return "UNKNOWN"
+	}
+}
+
+// DatabaseOpType represents CREATE/DROP DATABASE operations
+type DatabaseOpType uint8
+
+const (
+	DatabaseOpCreate DatabaseOpType = 0
+	DatabaseOpDrop   DatabaseOpType = 1
+)
+
+func (o DatabaseOpType) String() string {
+	switch o {
+	case DatabaseOpCreate:
+		return "CREATE_DATABASE"
+	case DatabaseOpDrop:
+		return "DROP_DATABASE"
+	default:
+		return "UNKNOWN"
+	}
+}
+
+// DatabaseOperationSnapshot is a typed struct for CREATE/DROP DATABASE intents
+type DatabaseOperationSnapshot struct {
+	Type         int            `msgpack:"type"`
+	Timestamp    int64          `msgpack:"timestamp"`
+	DatabaseName string         `msgpack:"database_name"`
+	Operation    DatabaseOpType `msgpack:"operation"`
+}
+
+// DDLSnapshot is a typed struct for DDL operation intents
+type DDLSnapshot struct {
+	Type      int    `msgpack:"type"`
+	Timestamp int64  `msgpack:"timestamp"`
+	SQL       string `msgpack:"sql"`
+	TableName string `msgpack:"table_name"`
+}
+
+// StatementTypeToOpType converts protocol.StatementType to OpType
+// StatementType values: Insert=0, Replace=1, Update=2, Delete=3
+func StatementTypeToOpType(stmtType int) OpType {
+	switch stmtType {
+	case 0:
+		return OpTypeInsert
+	case 1:
+		return OpTypeReplace
+	case 2:
+		return OpTypeUpdate
+	case 3:
+		return OpTypeDelete
+	default:
+		return OpTypeInsert
 	}
 }

@@ -480,6 +480,67 @@ func (dm *DatabaseManager) ReopenDatabase(name string) error {
 	return nil
 }
 
+// CloseDatabaseConnections closes SQLite connections for a database.
+// Used by replicas BEFORE snapshot file replacement. Must call OpenDatabaseConnections after.
+func (dm *DatabaseManager) CloseDatabaseConnections(name string) error {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+
+	mdb, exists := dm.databases[name]
+	if !exists {
+		return fmt.Errorf("database %s does not exist", name)
+	}
+
+	mdb.CloseSQLiteConnections()
+	log.Info().Str("database", name).Msg("Closed SQLite connections for snapshot apply")
+	return nil
+}
+
+// OpenDatabaseConnections opens SQLite connections for a database.
+// Used by replicas AFTER snapshot file replacement.
+func (dm *DatabaseManager) OpenDatabaseConnections(name string) error {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+
+	mdb, exists := dm.databases[name]
+	if !exists {
+		return fmt.Errorf("database %s does not exist", name)
+	}
+
+	// Get database path
+	var dbPath string
+	err := dm.systemDB.GetDB().QueryRow(
+		"SELECT path FROM __marmot_databases WHERE name = ?", name,
+	).Scan(&dbPath)
+	if err != nil {
+		return fmt.Errorf("failed to get database path: %w", err)
+	}
+
+	fullPath := filepath.Join(dm.dataDir, dbPath)
+	if err := mdb.OpenSQLiteConnections(fullPath); err != nil {
+		return fmt.Errorf("failed to open connections for %s: %w", name, err)
+	}
+
+	log.Info().Str("database", name).Str("path", fullPath).Msg("Opened SQLite connections after snapshot apply")
+	return nil
+}
+
+// GetDatabasePath returns the full path to a database file.
+func (dm *DatabaseManager) GetDatabasePath(name string) (string, error) {
+	dm.mu.RLock()
+	defer dm.mu.RUnlock()
+
+	var dbPath string
+	err := dm.systemDB.GetDB().QueryRow(
+		"SELECT path FROM __marmot_databases WHERE name = ?", name,
+	).Scan(&dbPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to get database path: %w", err)
+	}
+
+	return filepath.Join(dm.dataDir, dbPath), nil
+}
+
 // ImportExistingDatabases scans a directory for existing SQLite .db files
 // and imports them into the database manager. This is used on first startup
 // of a seed node to make existing databases available.
@@ -595,7 +656,7 @@ func (dm *DatabaseManager) ImportExistingDatabases(importDir string) (int, error
 	return imported, nil
 }
 
-// copyFile copies a file from src to dst
+// copyFile copies a file from src to dst with fsync for durability
 func copyFile(src, dst string) error {
 	srcFile, err := os.Open(src)
 	if err != nil {
@@ -609,8 +670,10 @@ func copyFile(src, dst string) error {
 	}
 	defer dstFile.Close()
 
-	_, err = io.Copy(dstFile, srcFile)
-	return err
+	if _, err = io.Copy(dstFile, srcFile); err != nil {
+		return err
+	}
+	return dstFile.Sync()
 }
 
 // cleanupMetaStoreFiles removes MetaStore directory for a database.
@@ -735,6 +798,112 @@ func (dm *DatabaseManager) checkpointDatabase(db *MVCCDatabase) error {
 	return err
 }
 
+// TakeSnapshotToDir creates an atomic snapshot copy in the specified directory.
+// This method:
+// 1. Acquires write lock to block all writes
+// 2. Checkpoints all databases (TRUNCATE mode)
+// 3. Copies all database files to the target directory
+// 4. Releases write lock
+//
+// The caller should stream from the target directory and clean it up when done.
+// This ensures snapshot consistency since files are copied atomically under lock.
+func (dm *DatabaseManager) TakeSnapshotToDir(targetDir string) ([]SnapshotInfo, uint64, error) {
+	// Create target directory structure
+	if err := os.MkdirAll(targetDir, 0755); err != nil {
+		return nil, 0, fmt.Errorf("failed to create snapshot directory: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Join(targetDir, "databases"), 0755); err != nil {
+		return nil, 0, fmt.Errorf("failed to create databases directory: %w", err)
+	}
+
+	// Acquire write lock to block all concurrent writes
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+
+	var snapshots []SnapshotInfo
+
+	// Checkpoint and copy system database
+	systemDBPath := filepath.Join(dm.dataDir, SystemDatabaseName+".db")
+	systemTargetPath := filepath.Join(targetDir, SystemDatabaseName+".db")
+
+	if err := dm.checkpointDatabase(dm.systemDB); err != nil {
+		return nil, 0, fmt.Errorf("failed to checkpoint system database: %w", err)
+	}
+
+	if err := copyFile(systemDBPath, systemTargetPath); err != nil {
+		return nil, 0, fmt.Errorf("failed to copy system database: %w", err)
+	}
+
+	info, err := os.Stat(systemTargetPath)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to stat system database copy: %w", err)
+	}
+
+	systemSHA256, err := calculateFileSHA256(systemTargetPath)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to hash system database: %w", err)
+	}
+
+	snapshots = append(snapshots, SnapshotInfo{
+		Name:     SystemDatabaseName,
+		Filename: SystemDatabaseName + ".db",
+		FullPath: systemTargetPath,
+		Size:     info.Size(),
+		SHA256:   systemSHA256,
+	})
+
+	// Checkpoint and copy all user databases
+	for name, db := range dm.databases {
+		if name == SystemDatabaseName {
+			continue
+		}
+
+		if err := dm.checkpointDatabase(db); err != nil {
+			log.Warn().Err(err).Str("database", name).Msg("Failed to checkpoint database")
+			continue
+		}
+
+		srcPath := filepath.Join(dm.dataDir, "databases", name+".db")
+		dstPath := filepath.Join(targetDir, "databases", name+".db")
+
+		if err := copyFile(srcPath, dstPath); err != nil {
+			log.Warn().Err(err).Str("database", name).Msg("Failed to copy database")
+			continue
+		}
+
+		info, err := os.Stat(dstPath)
+		if err != nil {
+			log.Warn().Err(err).Str("database", name).Msg("Failed to stat database copy")
+			continue
+		}
+
+		dbSHA256, err := calculateFileSHA256(dstPath)
+		if err != nil {
+			log.Warn().Err(err).Str("database", name).Msg("Failed to hash database")
+			continue
+		}
+
+		snapshots = append(snapshots, SnapshotInfo{
+			Name:     name,
+			Filename: filepath.Join("databases", name+".db"),
+			FullPath: dstPath,
+			Size:     info.Size(),
+			SHA256:   dbSHA256,
+		})
+	}
+
+	// Get max committed transaction ID (without lock since we already hold it)
+	maxTxnID := dm.getMaxCommittedTxnIDLocked()
+
+	log.Info().
+		Int("databases", len(snapshots)).
+		Uint64("max_txn_id", maxTxnID).
+		Str("target_dir", targetDir).
+		Msg("Snapshot copied to directory")
+
+	return snapshots, maxTxnID, nil
+}
+
 // runPeriodicCheckpoint runs PASSIVE checkpoint on all databases periodically
 func (dm *DatabaseManager) runPeriodicCheckpoint() {
 	defer dm.checkpointWg.Done()
@@ -766,8 +935,13 @@ func (dm *DatabaseManager) doPassiveCheckpoint() {
 	dm.mu.RUnlock()
 
 	for _, db := range databases {
+		// Skip if database connections are closed (e.g., during snapshot apply)
+		sqlDB := db.GetDB()
+		if sqlDB == nil {
+			continue
+		}
 		// PASSIVE checkpoint doesn't block writers
-		_, err := db.GetDB().Exec("PRAGMA wal_checkpoint(PASSIVE)")
+		_, err := sqlDB.Exec("PRAGMA wal_checkpoint(PASSIVE)")
 		if err != nil {
 			log.Warn().Err(err).Msg("PASSIVE checkpoint failed")
 		}
@@ -778,7 +952,12 @@ func (dm *DatabaseManager) doPassiveCheckpoint() {
 func (dm *DatabaseManager) GetMaxCommittedTxnID() (uint64, error) {
 	dm.mu.RLock()
 	defer dm.mu.RUnlock()
+	return dm.getMaxCommittedTxnIDLocked(), nil
+}
 
+// getMaxCommittedTxnIDLocked returns the max committed txn ID without acquiring lock.
+// Caller must hold dm.mu (read or write).
+func (dm *DatabaseManager) getMaxCommittedTxnIDLocked() uint64 {
 	var maxTxnID uint64
 
 	// Check all user databases via their MetaStores
@@ -797,7 +976,7 @@ func (dm *DatabaseManager) GetMaxCommittedTxnID() (uint64, error) {
 		}
 	}
 
-	return maxTxnID, nil
+	return maxTxnID
 }
 
 // GetDataDir returns the data directory path
@@ -847,7 +1026,7 @@ func (dm *DatabaseManager) GetReplicationState(peerNodeID uint64, database strin
 		LastAppliedTSWall: rec.LastAppliedTSWall,
 		LastAppliedTSLog:  rec.LastAppliedTSLogical,
 		LastSyncTime:      rec.LastSyncTime,
-		SyncStatus:        rec.SyncStatus,
+		SyncStatus:        rec.SyncStatus.String(),
 	}, nil
 }
 
@@ -901,7 +1080,7 @@ func (dm *DatabaseManager) GetAllReplicationStates() ([]ReplicationState, error)
 				LastAppliedTSWall: rec.LastAppliedTSWall,
 				LastAppliedTSLog:  rec.LastAppliedTSLogical,
 				LastSyncTime:      rec.LastSyncTime,
-				SyncStatus:        rec.SyncStatus,
+				SyncStatus:        rec.SyncStatus.String(),
 			})
 		}
 	}

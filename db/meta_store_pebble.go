@@ -517,7 +517,7 @@ func (s *PebbleMetaStore) BeginTransaction(txnID, nodeID uint64, startTS hlc.Tim
 	rec := &TransactionRecord{
 		TxnID:          txnID,
 		NodeID:         nodeID,
-		Status:         MetaTxnStatusPending,
+		Status:         TxnStatusPending,
 		StartTSWall:    startTS.WallTime,
 		StartTSLogical: startTS.Logical,
 		CreatedAt:      time.Now().UnixNano(),
@@ -545,7 +545,7 @@ func (s *PebbleMetaStore) BeginTransaction(txnID, nodeID uint64, startTS hlc.Tim
 }
 
 // CommitTransaction marks a transaction as COMMITTED
-func (s *PebbleMetaStore) CommitTransaction(txnID uint64, commitTS hlc.Timestamp, statements []byte, dbName string) error {
+func (s *PebbleMetaStore) CommitTransaction(txnID uint64, commitTS hlc.Timestamp, statements []byte, dbName, tablesInvolved string) error {
 	log.Debug().
 		Uint64("txn_id", txnID).
 		Int64("commit_ts", commitTS.WallTime).
@@ -574,12 +574,13 @@ func (s *PebbleMetaStore) CommitTransaction(txnID uint64, commitTS hlc.Timestamp
 	}
 
 	// Step 3: Update transaction record
-	rec.Status = MetaTxnStatusCommitted
+	rec.Status = TxnStatusCommitted
 	rec.CommitTSWall = commitTS.WallTime
 	rec.CommitTSLogical = commitTS.Logical
 	rec.CommittedAt = time.Now().UnixNano()
 	rec.SerializedStatements = statements
 	rec.DatabaseName = dbName
+	rec.TablesInvolved = tablesInvolved
 	rec.SeqNum = seqNum
 
 	data, err := encoding.Marshal(&rec)
@@ -637,7 +638,7 @@ func (s *PebbleMetaStore) StoreReplayedTransaction(txnID, nodeID uint64, commitT
 		TxnID:                txnID,
 		NodeID:               nodeID,
 		SeqNum:               seqNum,
-		Status:               MetaTxnStatusCommitted,
+		Status:               TxnStatusCommitted,
 		StartTSWall:          commitTS.WallTime,
 		StartTSLogical:       commitTS.Logical,
 		CommitTSWall:         commitTS.WallTime,
@@ -747,7 +748,7 @@ func (s *PebbleMetaStore) GetPendingTransactions() ([]*TransactionRecord, error)
 		_, _ = fmt.Sscanf(keyStr[len(pebblePrefixTxnPending):], "%016x", &txnID)
 
 		rec, err := s.GetTransaction(txnID)
-		if err == nil && rec != nil && rec.Status == MetaTxnStatusPending {
+		if err == nil && rec != nil && rec.Status == TxnStatusPending {
 			records = append(records, rec)
 		}
 	}
@@ -779,7 +780,7 @@ func (s *PebbleMetaStore) Heartbeat(txnID uint64) error {
 }
 
 // WriteIntent creates a write intent (distributed lock)
-func (s *PebbleMetaStore) WriteIntent(txnID uint64, tableName, rowKey, op, sqlStmt string, data []byte, ts hlc.Timestamp, nodeID uint64) error {
+func (s *PebbleMetaStore) WriteIntent(txnID uint64, intentType IntentType, tableName, rowKey string, op OpType, sqlStmt string, data []byte, ts hlc.Timestamp, nodeID uint64) error {
 	// Acquire sharded lock to serialize concurrent writes to same row (prevents TOCTOU race)
 	mu := s.intentLockFor(tableName, rowKey)
 	mu.Lock()
@@ -790,18 +791,19 @@ func (s *PebbleMetaStore) WriteIntent(txnID uint64, tableName, rowKey, op, sqlSt
 	// Fast path: Cuckoo filter miss = definitely no conflict
 	if s.intentFilter != nil && !s.intentFilter.Check(tbHash) {
 		telemetry.IntentFilterChecks.With("fast_path").Inc()
-		return s.writeIntentFastPath(txnID, tableName, rowKey, op, sqlStmt, data, ts, nodeID, tbHash)
+		return s.writeIntentFastPath(txnID, intentType, tableName, rowKey, op, sqlStmt, data, ts, nodeID, tbHash)
 	}
 
 	// Slow path: Filter hit (or no filter) - check Pebble
-	return s.writeIntentSlowPath(txnID, tableName, rowKey, op, sqlStmt, data, ts, nodeID, tbHash)
+	return s.writeIntentSlowPath(txnID, intentType, tableName, rowKey, op, sqlStmt, data, ts, nodeID, tbHash)
 }
 
 // writeIntentFastPath writes intent without Pebble conflict check (filter miss).
-func (s *PebbleMetaStore) writeIntentFastPath(txnID uint64, tableName, rowKey, op, sqlStmt string, data []byte, ts hlc.Timestamp, nodeID uint64, tbHash uint64) error {
+func (s *PebbleMetaStore) writeIntentFastPath(txnID uint64, intentType IntentType, tableName, rowKey string, op OpType, sqlStmt string, data []byte, ts hlc.Timestamp, nodeID uint64, tbHash uint64) error {
 	key := pebbleIntentKey(tableName, rowKey)
 
 	rec := &WriteIntentRecord{
+		IntentType:   intentType,
 		TableName:    tableName,
 		RowKey:       rowKey,
 		TxnID:        txnID,
@@ -839,7 +841,7 @@ func (s *PebbleMetaStore) writeIntentFastPath(txnID uint64, tableName, rowKey, o
 }
 
 // writeIntentSlowPath writes intent with Pebble conflict check (filter hit).
-func (s *PebbleMetaStore) writeIntentSlowPath(txnID uint64, tableName, rowKey, op, sqlStmt string, data []byte, ts hlc.Timestamp, nodeID uint64, tbHash uint64) error {
+func (s *PebbleMetaStore) writeIntentSlowPath(txnID uint64, intentType IntentType, tableName, rowKey string, op OpType, sqlStmt string, data []byte, ts hlc.Timestamp, nodeID uint64, tbHash uint64) error {
 	key := pebbleIntentKey(tableName, rowKey)
 
 	batch := s.db.NewBatch()
@@ -885,6 +887,7 @@ func (s *PebbleMetaStore) writeIntentSlowPath(txnID uint64, tableName, rowKey, o
 
 	// Create new intent
 	rec := &WriteIntentRecord{
+		IntentType:   intentType,
 		TableName:    tableName,
 		RowKey:       rowKey,
 		TxnID:        txnID,
@@ -947,10 +950,10 @@ func (s *PebbleMetaStore) resolveIntentConflictPebble(batch *pebble.Batch, exist
 			Msg("Cleaning up orphaned intent (no transaction record)")
 		canOverwrite = true
 
-	case conflictTxnRec.Status == MetaTxnStatusCommitted:
+	case conflictTxnRec.Status == TxnStatusCommitted:
 		canOverwrite = true
 
-	case conflictTxnRec.Status == MetaTxnStatusAborted:
+	case conflictTxnRec.Status == TxnStatusAborted:
 		log.Debug().
 			Uint64("aborted_txn_id", existing.TxnID).
 			Str("table", tableName).
@@ -1245,7 +1248,7 @@ func (s *PebbleMetaStore) GetIntent(tableName, rowKey string) (*WriteIntentRecor
 }
 
 // CreateMVCCVersion creates an MVCC version record
-func (s *PebbleMetaStore) CreateMVCCVersion(tableName, rowKey string, ts hlc.Timestamp, nodeID, txnID uint64, op string, data []byte) error {
+func (s *PebbleMetaStore) CreateMVCCVersion(tableName, rowKey string, ts hlc.Timestamp, nodeID, txnID uint64, op OpType, data []byte) error {
 	rec := &MVCCVersionRecord{
 		TableName:    tableName,
 		RowKey:       rowKey,
@@ -1347,7 +1350,7 @@ func (s *PebbleMetaStore) UpdateReplicationState(peerNodeID uint64, dbName strin
 		LastAppliedTSWall:    lastTS.WallTime,
 		LastAppliedTSLogical: lastTS.Logical,
 		LastSyncTime:         time.Now().UnixNano(),
-		SyncStatus:           MetaSyncStatusSynced,
+		SyncStatus:           SyncStatusSynced,
 	}
 
 	data, err := encoding.Marshal(state)
@@ -1757,7 +1760,7 @@ func (s *PebbleMetaStore) CleanupStaleTransactions(timeout time.Duration) (int, 
 			ageMs := (time.Now().UnixNano() - rec.LastHeartbeat) / 1e6
 			log.Warn().
 				Uint64("txn_id", txnID).
-				Str("status", rec.Status).
+				Str("status", rec.Status.String()).
 				Int64("age_ms", ageMs).
 				Int64("timeout_ms", timeout.Milliseconds()).
 				Msg("GC: Found stale PENDING transaction - WILL BE CLEANED UP")
@@ -1887,7 +1890,7 @@ func (s *PebbleMetaStore) CleanupOldTransactionRecords(minRetention, maxRetentio
 		}
 
 		// Only clean COMMITTED or ABORTED
-		if rec.Status != MetaTxnStatusCommitted && rec.Status != MetaTxnStatusAborted {
+		if rec.Status != TxnStatusCommitted && rec.Status != TxnStatusAborted {
 			continue
 		}
 
@@ -1918,7 +1921,7 @@ func (s *PebbleMetaStore) CleanupOldTransactionRecords(minRetention, maxRetentio
 			if rec.SeqNum > 0 {
 				seqKeysToDelete = append(seqKeysToDelete, pebbleTxnSeqKey(rec.SeqNum, rec.TxnID))
 			}
-			if rec.Status == MetaTxnStatusCommitted {
+			if rec.Status == TxnStatusCommitted {
 				committedDeleted++
 			}
 		}
@@ -2126,8 +2129,20 @@ func (s *PebbleMetaStore) GetCommittedTxnCount() (int64, error) {
 	return s.counters.Load("committed_txn_count")
 }
 
-// StreamCommittedTransactions streams committed transactions after fromTxnID
+// StreamCommittedTransactions streams committed transactions after fromTxnID (ascending order)
 func (s *PebbleMetaStore) StreamCommittedTransactions(fromTxnID uint64, callback func(*TransactionRecord) error) error {
+	return s.ScanTransactions(fromTxnID, false, func(rec *TransactionRecord) error {
+		if rec.Status != TxnStatusCommitted {
+			return nil // skip non-committed
+		}
+		return callback(rec)
+	})
+}
+
+// ScanTransactions iterates transactions from fromTxnID.
+// If descending is true, scans from newest to oldest.
+// Callback returns nil to continue, ErrStopIteration to stop, or other error to abort.
+func (s *PebbleMetaStore) ScanTransactions(fromTxnID uint64, descending bool, callback func(*TransactionRecord) error) error {
 	prefix := []byte(pebblePrefixTxnSeq)
 
 	iter, err := s.db.NewIter(&pebble.IterOptions{
@@ -2139,32 +2154,58 @@ func (s *PebbleMetaStore) StreamCommittedTransactions(fromTxnID uint64, callback
 	}
 	defer iter.Close()
 
-	for iter.SeekGE(prefix); iter.Valid(); iter.Next() {
+	// Choose iteration direction
+	var valid func() bool
+	var advance func() bool
+	if descending {
+		// Start from end, go backwards
+		valid = func() bool { return iter.Valid() }
+		advance = func() bool { return iter.Prev() }
+		iter.SeekLT(prefixUpperBound(prefix))
+	} else {
+		// Start from beginning, go forwards
+		valid = func() bool { return iter.Valid() }
+		advance = func() bool { return iter.Next() }
+		iter.SeekGE(prefix)
+	}
+
+	for valid() {
 		keyStr := string(iter.Key())
 		parts := strings.Split(keyStr[len(pebblePrefixTxnSeq):], "/")
 		if len(parts) != 2 {
+			advance()
 			continue
 		}
 
 		var txnID uint64
 		_, _ = fmt.Sscanf(parts[1], "%016x", &txnID)
 
-		if txnID <= fromTxnID {
-			continue
+		// Filter by fromTxnID based on direction
+		if descending {
+			if fromTxnID > 0 && txnID >= fromTxnID {
+				advance()
+				continue
+			}
+		} else {
+			if txnID <= fromTxnID {
+				advance()
+				continue
+			}
 		}
 
 		rec, err := s.GetTransaction(txnID)
 		if err != nil || rec == nil {
-			continue
-		}
-
-		if rec.Status != MetaTxnStatusCommitted {
+			advance()
 			continue
 		}
 
 		if err := callback(rec); err != nil {
+			if err == ErrStopIteration {
+				return nil
+			}
 			return err
 		}
+		advance()
 	}
 
 	return iter.Error()

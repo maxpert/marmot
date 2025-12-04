@@ -1,0 +1,55 @@
+# Marmot v2.0 - Read-Only Replica 2A
+# Follows Node 2 (master)
+
+node_id = 102
+data_dir = "/tmp/marmot-cluster/replica-2a"
+
+[replica]
+enabled = true
+master_address = "localhost:8082"
+secret = "cluster-secret-key"
+reconnect_interval_seconds = 5
+reconnect_max_backoff_seconds = 30
+initial_sync_timeout_minutes = 30
+
+[mvcc]
+gc_interval_seconds = 30
+gc_retention_hours = 1
+heartbeat_timeout_seconds = 10
+version_retention_count = 10
+conflict_window_seconds = 10
+
+[cluster]
+grpc_bind_address = "0.0.0.0"
+grpc_port = 8092
+
+[connection_pool]
+pool_size = 4
+max_idle_time_seconds = 10
+max_lifetime_seconds = 300
+
+[query_pipeline]
+transpiler_cache_size = 10000
+validator_pool_size = 8
+
+[mysql]
+enabled = true
+bind_address = "0.0.0.0"
+port = 3318
+max_connections = 100
+
+[metastore]
+cache_size_mb = 64
+memtable_size_mb = 64
+memtable_count = 2
+l0_compaction_threshold = 500
+l0_stop_writes = 1000
+wal_bytes_per_sync_kb = 512
+wal_sync_interval_ms = 10
+
+[logging]
+verbose = true
+format = "console"
+
+[prometheus]
+enabled = true

@@ -116,15 +116,15 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 
 			// Create write intent for database operation
 			rowKey := stmt.Database
-			opName := db.OpNameCreateDatabase
+			dbOp := db.DatabaseOpCreate
 			if stmtType == protocol.StatementDropDatabase {
-				opName = db.OpNameDropDatabase
+				dbOp = db.DatabaseOpDrop
 			}
 			snapshotData := db.DatabaseOperationSnapshot{
 				Type:         int(stmt.Type),
 				Timestamp:    req.Timestamp.WallTime,
 				DatabaseName: stmt.Database,
-				Operation:    opName,
+				Operation:    dbOp,
 			}
 			dataSnapshot, err := db.SerializeData(snapshotData)
 			if err != nil {
@@ -136,7 +136,7 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 				}, nil
 			}
 
-			err = txnMgr.WriteIntent(txn, db.TableDatabaseOperations, rowKey, internalStmt, dataSnapshot)
+			err = txnMgr.WriteIntent(txn, db.IntentTypeDatabaseOp, "", rowKey, internalStmt, dataSnapshot)
 			if err != nil {
 				txnMgr.AbortTransaction(txn)
 				return &TransactionResponse{
@@ -149,7 +149,7 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 
 			log.Info().
 				Str("database", stmt.Database).
-				Str("operation", opName).
+				Str("operation", dbOp.String()).
 				Uint64("node_id", rh.nodeID).
 				Uint64("txn_id", req.TxnId).
 				Msg("Database operation prepared (intent created)")
@@ -165,10 +165,13 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 		}
 	}
 
-	// Get the target database from request
+	// Get the target database from request - database name is required
 	dbName := req.Database
 	if dbName == "" {
-		dbName = db.DefaultDatabaseName
+		return &TransactionResponse{
+			Success:      false,
+			ErrorMessage: "database name is required in transaction request",
+		}, nil
 	}
 
 	// Get database instance
@@ -257,11 +260,12 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 			// For DDL statements, create write intent using table name as row key
 			// This ensures DDL SQL gets stored and executed during commit phase
 			if internalStmt.Type == protocol.StatementDDL {
-				ddlRowKey := db.DDLRowKeyPrefix + stmt.TableName
-				snapshotData := map[string]interface{}{
-					"type":      stmt.Type.String(),
-					"timestamp": req.Timestamp.WallTime,
-					"sql":       stmt.GetSQL(),
+				ddlRowKey := stmt.TableName
+				snapshotData := db.DDLSnapshot{
+					Type:      int(internalStmt.Type),
+					Timestamp: req.Timestamp.WallTime,
+					SQL:       stmt.GetSQL(),
+					TableName: stmt.TableName,
 				}
 				dataSnapshot, serErr := db.SerializeData(snapshotData)
 				if serErr != nil {
@@ -273,7 +277,7 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 					}, nil
 				}
 
-				err := txnMgr.WriteIntent(txn, db.TableDDLOps, ddlRowKey, internalStmt, dataSnapshot)
+				err := txnMgr.WriteIntent(txn, db.IntentTypeDDL, stmt.TableName, ddlRowKey, internalStmt, dataSnapshot)
 				if err != nil {
 					txnMgr.AbortTransaction(txn)
 					return &TransactionResponse{
@@ -316,7 +320,7 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 			}, nil
 		}
 
-		err := txnMgr.WriteIntent(txn, stmt.TableName, rowKey, internalStmt, dataSnapshot)
+		err := txnMgr.WriteIntent(txn, db.IntentTypeDML, stmt.TableName, rowKey, internalStmt, dataSnapshot)
 		if err != nil {
 			// Write-write conflict detected!
 			txnMgr.AbortTransaction(txn)
@@ -361,7 +365,7 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 			}
 
 			// Convert statement type to operation code
-			op := db.StatementTypeToOpCode(int(internalStmt.Type))
+			op := uint8(db.StatementTypeToOpType(int(internalStmt.Type)))
 
 			err := metaStore.WriteIntentEntry(req.TxnId, stmtSeq, op, stmt.TableName, rowKey, oldVals, newVals)
 			if err != nil {
@@ -416,7 +420,7 @@ func (rh *ReplicationHandler) handleCommit(ctx context.Context, req *Transaction
 			if intentErr == nil && len(intents) > 0 {
 				// Check if any intent is for database operations
 				for _, intent := range intents {
-					if intent.TableName == db.TableDatabaseOperations {
+					if intent.IntentType == db.IntentTypeDatabaseOp {
 						// Found a database operation - extract details from DataSnapshot
 						var snapshotData db.DatabaseOperationSnapshot
 						if err := db.DeserializeData(intent.DataSnapshot, &snapshotData); err != nil {
@@ -424,28 +428,25 @@ func (rh *ReplicationHandler) handleCommit(ctx context.Context, req *Transaction
 							continue
 						}
 
-						opName := snapshotData.Operation
-						if opName == "" {
-							log.Error().Uint64("txn_id", req.TxnId).Msg("Missing operation in DB op snapshot")
-							continue
-						}
+						dbOp := snapshotData.Operation
 						dbName := intent.RowKey // Row key is the database name
 
 						// Execute the database operation BEFORE committing the transaction
 						var dbOpErr error
-						if opName == db.OpNameCreateDatabase {
+						switch dbOp {
+						case db.DatabaseOpCreate:
 							log.Info().Str("database", dbName).Uint64("node_id", rh.nodeID).Msg("Executing CREATE DATABASE in commit phase")
 							dbOpErr = rh.dbMgr.CreateDatabase(dbName)
-						} else if opName == db.OpNameDropDatabase {
+						case db.DatabaseOpDrop:
 							log.Info().Str("database", dbName).Uint64("node_id", rh.nodeID).Msg("Executing DROP DATABASE in commit phase")
 							dbOpErr = rh.dbMgr.DropDatabase(dbName)
-						} else {
-							log.Error().Str("operation", opName).Uint64("txn_id", req.TxnId).Msg("Unknown database operation")
+						default:
+							log.Error().Str("operation", dbOp.String()).Uint64("txn_id", req.TxnId).Msg("Unknown database operation")
 							continue
 						}
 
 						if dbOpErr != nil {
-							log.Error().Err(dbOpErr).Str("database", dbName).Str("operation", opName).Msg("Database operation failed in commit phase")
+							log.Error().Err(dbOpErr).Str("database", dbName).Str("operation", dbOp.String()).Msg("Database operation failed in commit phase")
 							systemTxnMgr.AbortTransaction(systemTxn)
 							return &TransactionResponse{
 								Success:      false,
@@ -462,7 +463,7 @@ func (rh *ReplicationHandler) handleCommit(ctx context.Context, req *Transaction
 
 						log.Info().
 							Str("database", dbName).
-							Str("operation", opName).
+							Str("operation", dbOp.String()).
 							Uint64("node_id", rh.nodeID).
 							Msg("Database operation committed successfully")
 
@@ -480,10 +481,13 @@ func (rh *ReplicationHandler) handleCommit(ctx context.Context, req *Transaction
 		}
 	}
 
-	// Regular operation - get user database
+	// Regular operation - get user database (database name is required)
 	dbName := req.Database
 	if dbName == "" {
-		dbName = db.DefaultDatabaseName
+		return &TransactionResponse{
+			Success:      false,
+			ErrorMessage: "database name is required in commit request",
+		}, nil
 	}
 
 	// Get database instance
@@ -564,18 +568,21 @@ func (rh *ReplicationHandler) handleAbort(ctx context.Context, req *TransactionR
 		}
 	}
 
-	// Try user database
+	// Try user database (database name is required)
 	dbName := req.Database
 	if dbName == "" {
-		dbName = db.DefaultDatabaseName
+		return &TransactionResponse{
+			Success:      false,
+			ErrorMessage: "database name is required in abort request",
+		}, nil
 	}
 
 	// Get database instance
 	dbInstance, err := rh.dbMgr.GetDatabase(dbName)
 	if err != nil {
-		// Database not found - but if it's the default "marmot" database,
-		// we should still try to clean up any orphaned intents that might exist
-		// in the system database's meta store
+		// Database not found - transaction may have been for a dropped database
+		// Return success since there's nothing to abort
+		log.Warn().Str("database", dbName).Uint64("txn_id", req.TxnId).Msg("Abort: database not found, assuming already cleaned up")
 		return &TransactionResponse{Success: true}, nil
 	}
 
@@ -625,10 +632,13 @@ func (rh *ReplicationHandler) handleReplay(ctx context.Context, req *Transaction
 		Int("num_statements", len(req.Statements)).
 		Msg("handleReplay called - applying already-committed transaction")
 
-	// Get the target database from request
+	// Get the target database from request (database name is required)
 	dbName := req.Database
 	if dbName == "" {
-		dbName = db.DefaultDatabaseName
+		return &TransactionResponse{
+			Success:      false,
+			ErrorMessage: "database name is required in replay request",
+		}, nil
 	}
 
 	// Get database instance
@@ -870,10 +880,16 @@ func (rh *ReplicationHandler) HandleRead(ctx context.Context, req *ReadRequest) 
 	}
 	rh.clock.Update(snapshotTS)
 
-	// Get the target database from request
+	// Get the target database from request (database name is required)
 	dbName := req.Database
 	if dbName == "" {
-		dbName = db.DefaultDatabaseName
+		return &ReadResponse{
+			Timestamp: &HLC{
+				WallTime: rh.clock.Now().WallTime,
+				Logical:  rh.clock.Now().Logical,
+				NodeId:   rh.nodeID,
+			},
+		}, fmt.Errorf("database name is required in read request")
 	}
 
 	// Get database instance

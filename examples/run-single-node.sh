@@ -23,24 +23,6 @@ rm -rf /tmp/marmot-single
 # Create data directory
 mkdir -p /tmp/marmot-single
 
-# Create initial database with sample data
-echo "Creating sample database..."
-cat <<EOF | sqlite3 /tmp/marmot-single/marmot.db
-DROP TABLE IF EXISTS Books;
-CREATE TABLE Books (
-    id INTEGER PRIMARY KEY,
-    title TEXT NOT NULL,
-    author TEXT NOT NULL,
-    publication_year INTEGER
-);
-INSERT INTO Books (title, author, publication_year)
-VALUES
-('The Hitchhiker''s Guide to the Galaxy', 'Douglas Adams', 1979),
-('The Lord of the Rings', 'J.R.R. Tolkien', 1954),
-('Harry Potter and the Sorcerer''s Stone', 'J.K. Rowling', 1997);
-EOF
-echo "✓ Sample database created"
-
 # Create config
 cat > /tmp/marmot-single/config.toml <<'TOML'
 # Marmot v2.0 - Single Node Configuration
@@ -103,13 +85,8 @@ TOML
 
 echo "✓ Configuration created"
 
-# Build marmot-v2 if needed
-if [ ! -f "$REPO_ROOT/marmot-v2" ]; then
-    echo "Building marmot-v2..."
-    cd "$REPO_ROOT"
-    go build -tags sqlite_preupdate_hook -o marmot-v2 .
-    echo "✓ Build complete"
-fi
+ go build -tags sqlite_preupdate_hook -o marmot-v2 .
+echo "✓ Build complete"
 
 # Cleanup function
 cleanup() {
@@ -118,6 +95,7 @@ cleanup() {
     kill "$pid" 2>/dev/null || true
     echo "✓ Stopped"
 }
+
 trap cleanup EXIT
 
 echo ""
@@ -141,8 +119,9 @@ echo "Connect via MySQL:"
 echo "  mysql -h 127.0.0.1 -P 3306 -u root"
 echo ""
 echo "Example queries:"
-echo "  SELECT * FROM Books;"
-echo "  INSERT INTO Books (title, author, publication_year) VALUES ('New Book', 'Author', 2024);"
+echo "  CREATE TABLE marmot.users (id INT PRIMARY KEY, name TEXT);"
+echo "  INSERT INTO marmot.users (id, name) VALUES (1, 'Alice');"
+echo "  SELECT * FROM marmot.users;"
 echo ""
 echo "Logs:"
 echo "  tail -f /tmp/marmot-single/marmot.log"
