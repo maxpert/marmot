@@ -2129,8 +2129,20 @@ func (s *PebbleMetaStore) GetCommittedTxnCount() (int64, error) {
 	return s.counters.Load("committed_txn_count")
 }
 
-// StreamCommittedTransactions streams committed transactions after fromTxnID
+// StreamCommittedTransactions streams committed transactions after fromTxnID (ascending order)
 func (s *PebbleMetaStore) StreamCommittedTransactions(fromTxnID uint64, callback func(*TransactionRecord) error) error {
+	return s.ScanTransactions(fromTxnID, false, func(rec *TransactionRecord) error {
+		if rec.Status != TxnStatusCommitted {
+			return nil // skip non-committed
+		}
+		return callback(rec)
+	})
+}
+
+// ScanTransactions iterates transactions from fromTxnID.
+// If descending is true, scans from newest to oldest.
+// Callback returns nil to continue, ErrStopIteration to stop, or other error to abort.
+func (s *PebbleMetaStore) ScanTransactions(fromTxnID uint64, descending bool, callback func(*TransactionRecord) error) error {
 	prefix := []byte(pebblePrefixTxnSeq)
 
 	iter, err := s.db.NewIter(&pebble.IterOptions{
@@ -2142,32 +2154,58 @@ func (s *PebbleMetaStore) StreamCommittedTransactions(fromTxnID uint64, callback
 	}
 	defer iter.Close()
 
-	for iter.SeekGE(prefix); iter.Valid(); iter.Next() {
+	// Choose iteration direction
+	var valid func() bool
+	var advance func() bool
+	if descending {
+		// Start from end, go backwards
+		valid = func() bool { return iter.Valid() }
+		advance = func() bool { return iter.Prev() }
+		iter.SeekLT(prefixUpperBound(prefix))
+	} else {
+		// Start from beginning, go forwards
+		valid = func() bool { return iter.Valid() }
+		advance = func() bool { return iter.Next() }
+		iter.SeekGE(prefix)
+	}
+
+	for valid() {
 		keyStr := string(iter.Key())
 		parts := strings.Split(keyStr[len(pebblePrefixTxnSeq):], "/")
 		if len(parts) != 2 {
+			advance()
 			continue
 		}
 
 		var txnID uint64
 		_, _ = fmt.Sscanf(parts[1], "%016x", &txnID)
 
-		if txnID <= fromTxnID {
-			continue
+		// Filter by fromTxnID based on direction
+		if descending {
+			if fromTxnID > 0 && txnID >= fromTxnID {
+				advance()
+				continue
+			}
+		} else {
+			if txnID <= fromTxnID {
+				advance()
+				continue
+			}
 		}
 
 		rec, err := s.GetTransaction(txnID)
 		if err != nil || rec == nil {
-			continue
-		}
-
-		if rec.Status != TxnStatusCommitted {
+			advance()
 			continue
 		}
 
 		if err := callback(rec); err != nil {
+			if err == ErrStopIteration {
+				return nil
+			}
 			return err
 		}
+		advance()
 	}
 
 	return iter.Error()

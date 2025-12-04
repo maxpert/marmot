@@ -250,6 +250,122 @@ func (mdb *MVCCDatabase) GetSchemaCache() *SchemaCache {
 	return mdb.schemaCache
 }
 
+// CloseSQLiteConnections closes all SQLite connections synchronously.
+// This MUST be called BEFORE replacing database files during snapshot apply.
+// After file replacement, call OpenSQLiteConnections to create new connections.
+// Note: This does NOT touch MetaStore (PebbleDB) - only SQLite connections.
+func (mdb *MVCCDatabase) CloseSQLiteConnections() {
+	if mdb.writeDB != nil {
+		mdb.writeDB.Close()
+		mdb.writeDB = nil
+	}
+	if mdb.hookDB != nil {
+		mdb.hookDB.Close()
+		mdb.hookDB = nil
+	}
+	if mdb.readDB != nil {
+		mdb.readDB.Close()
+		mdb.readDB = nil
+	}
+}
+
+// OpenSQLiteConnections opens new SQLite connections to the database file.
+// This MUST be called AFTER database files have been replaced during snapshot apply.
+// Note: This does NOT touch MetaStore (PebbleDB) - only SQLite connections.
+func (mdb *MVCCDatabase) OpenSQLiteConnections(dbPath string) error {
+	busyTimeoutMS := cfg.Config.MVCC.LockWaitTimeoutSeconds * 1000
+	poolCfg := cfg.Config.ConnectionPool
+
+	// Open write connection
+	writeDSN := fmt.Sprintf("%s?_journal_mode=WAL&_busy_timeout=%d&_txlock=immediate", dbPath, busyTimeoutMS)
+	writeDB, err := sql.Open("sqlite3", writeDSN)
+	if err != nil {
+		return fmt.Errorf("failed to open write connection: %w", err)
+	}
+	writeDB.SetMaxOpenConns(1)
+	writeDB.SetMaxIdleConns(1)
+	writeDB.SetConnMaxLifetime(0)
+
+	// Verify connection works
+	if err := writeDB.Ping(); err != nil {
+		writeDB.Close()
+		return fmt.Errorf("failed to ping write connection: %w", err)
+	}
+
+	// Open hook connection
+	hookDB, err := sql.Open("sqlite3", writeDSN)
+	if err != nil {
+		writeDB.Close()
+		return fmt.Errorf("failed to open hook connection: %w", err)
+	}
+	hookDB.SetMaxOpenConns(1)
+	hookDB.SetMaxIdleConns(1)
+	hookDB.SetConnMaxLifetime(0)
+
+	// Open read connection pool
+	readDSN := fmt.Sprintf("%s?_journal_mode=WAL&_busy_timeout=%d", dbPath, busyTimeoutMS)
+	readDB, err := sql.Open("sqlite3", readDSN)
+	if err != nil {
+		writeDB.Close()
+		hookDB.Close()
+		return fmt.Errorf("failed to open read connection: %w", err)
+	}
+	readDB.SetMaxOpenConns(poolCfg.PoolSize)
+	readDB.SetMaxIdleConns(poolCfg.PoolSize)
+	if poolCfg.MaxLifetimeSeconds > 0 {
+		readDB.SetConnMaxLifetime(time.Duration(poolCfg.MaxLifetimeSeconds) * time.Second)
+	}
+	if poolCfg.MaxIdleTimeSeconds > 0 {
+		readDB.SetConnMaxIdleTime(time.Duration(poolCfg.MaxIdleTimeSeconds) * time.Second)
+	}
+
+	// Apply SQLite pragmas
+	for _, db := range []*sql.DB{writeDB, hookDB, readDB} {
+		if _, err = db.Exec("PRAGMA journal_mode=WAL"); err != nil {
+			writeDB.Close()
+			hookDB.Close()
+			readDB.Close()
+			return fmt.Errorf("failed to enable WAL mode: %w", err)
+		}
+		if _, err = db.Exec(fmt.Sprintf("PRAGMA busy_timeout=%d", busyTimeoutMS)); err != nil {
+			writeDB.Close()
+			hookDB.Close()
+			readDB.Close()
+			return fmt.Errorf("failed to set busy timeout: %w", err)
+		}
+		if _, err = db.Exec("PRAGMA synchronous=NORMAL"); err != nil {
+			writeDB.Close()
+			hookDB.Close()
+			readDB.Close()
+			return fmt.Errorf("failed to set synchronous mode: %w", err)
+		}
+		if _, err = db.Exec("PRAGMA cache_size=-64000"); err != nil {
+			writeDB.Close()
+			hookDB.Close()
+			readDB.Close()
+			return fmt.Errorf("failed to set cache size: %w", err)
+		}
+		if _, err = db.Exec("PRAGMA temp_store=MEMORY"); err != nil {
+			writeDB.Close()
+			hookDB.Close()
+			readDB.Close()
+			return fmt.Errorf("failed to set temp store: %w", err)
+		}
+	}
+
+	// Assign connections
+	mdb.writeDB = writeDB
+	mdb.hookDB = hookDB
+	mdb.readDB = readDB
+
+	// Invalidate schema cache since tables may have changed
+	if mdb.schemaCache != nil {
+		mdb.schemaCache.InvalidateAll()
+	}
+
+	return nil
+}
+
 // GetMetaStore returns the MetaStore for transaction metadata
 func (mdb *MVCCDatabase) GetMetaStore() MetaStore {
 	return mdb.metaStore

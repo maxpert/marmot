@@ -1,6 +1,7 @@
 package db
 
 import (
+	"errors"
 	"path/filepath"
 	"strings"
 	"time"
@@ -8,6 +9,9 @@ import (
 	"github.com/maxpert/marmot/cfg"
 	"github.com/maxpert/marmot/hlc"
 )
+
+// ErrStopIteration signals scan callbacks to stop iteration without error
+var ErrStopIteration = errors.New("stop iteration")
 
 // MetaStore provides transactional metadata storage separate from user data.
 // Each user database has its own MetaStore backed by PebbleDB.
@@ -75,6 +79,11 @@ type MetaStore interface {
 
 	// Streaming for anti-entropy delta sync
 	StreamCommittedTransactions(fromTxnID uint64, callback func(*TransactionRecord) error) error
+
+	// ScanTransactions iterates transactions from fromTxnID.
+	// If descending is true, scans from newest to oldest.
+	// Callback returns nil to continue, ErrStopIteration to stop, or other error to abort.
+	ScanTransactions(fromTxnID uint64, descending bool, callback func(*TransactionRecord) error) error
 
 	// Lifecycle
 	Close() error

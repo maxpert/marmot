@@ -346,8 +346,96 @@ func (s *Server) Read(ctx context.Context, req *ReadRequest) (*ReadResponse, err
 	return &ReadResponse{}, nil
 }
 
-// StreamChanges handles change streaming for catch-up
-// Streams committed transactions from a given txn_id for delta sync
+// Polling interval for live transaction streaming
+const liveStreamPollInterval = 500 * time.Millisecond
+
+// sendChangeEvent converts a TransactionRecord to ChangeEvent and sends it on the stream.
+// Handles both CDC (Change Data Capture) path with row data and DDL path with SQL statements.
+func (s *Server) sendChangeEvent(rec *db.TransactionRecord, stream MarmotService_StreamChangesServer) error {
+	// Parse statements from msgpack - must include CDC data (NewValues, OldValues, RowKey)
+	var statements []*Statement
+	if len(rec.SerializedStatements) > 0 {
+		var rawStatements []struct {
+			SQL       string            `msgpack:"SQL"`
+			Type      int               `msgpack:"Type"`
+			TableName string            `msgpack:"TableName"`
+			Database  string            `msgpack:"Database"`
+			RowKey    string            `msgpack:"RowKey"`
+			OldValues map[string][]byte `msgpack:"OldValues"`
+			NewValues map[string][]byte `msgpack:"NewValues"`
+		}
+		if err := encoding.Unmarshal(rec.SerializedStatements, &rawStatements); err != nil {
+			log.Warn().Err(err).Uint64("txn_id", rec.TxnID).Msg("Failed to parse statements msgpack")
+		} else {
+			for _, s := range rawStatements {
+				stmt := &Statement{
+					Type:      StatementType(s.Type),
+					TableName: s.TableName,
+					Database:  s.Database,
+				}
+
+				// For DML with CDC data, use RowChange payload
+				// For DDL or DML without CDC, use DdlChange payload with SQL
+				isDML := s.Type == int(StatementType_INSERT) ||
+					s.Type == int(StatementType_UPDATE) ||
+					s.Type == int(StatementType_DELETE) ||
+					s.Type == int(StatementType_REPLACE)
+
+				if isDML && (len(s.NewValues) > 0 || len(s.OldValues) > 0) {
+					// CDC path: send row data
+					stmt.Payload = &Statement_RowChange{
+						RowChange: &RowChange{
+							RowKey:    s.RowKey,
+							OldValues: s.OldValues,
+							NewValues: s.NewValues,
+						},
+					}
+					log.Debug().
+						Uint64("txn_id", rec.TxnID).
+						Str("table", s.TableName).
+						Str("row_key", s.RowKey).
+						Int("new_values", len(s.NewValues)).
+						Int("old_values", len(s.OldValues)).
+						Msg("STREAM: Sending CDC data for anti-entropy")
+				} else {
+					// DDL or DML without CDC: send SQL
+					stmt.Payload = &Statement_DdlChange{
+						DdlChange: &DDLChange{
+							Sql: s.SQL,
+						},
+					}
+					log.Debug().
+						Uint64("txn_id", rec.TxnID).
+						Str("sql_prefix", func() string {
+							if len(s.SQL) > 50 {
+								return s.SQL[:50]
+							}
+							return s.SQL
+						}()).
+						Msg("STREAM: Sending SQL for anti-entropy")
+				}
+
+				statements = append(statements, stmt)
+			}
+		}
+	}
+
+	event := &ChangeEvent{
+		TxnId:  rec.TxnID,
+		SeqNum: rec.SeqNum,
+		Timestamp: &HLC{
+			WallTime: rec.CommitTSWall,
+			Logical:  rec.CommitTSLogical,
+		},
+		Statements: statements,
+		Database:   rec.DatabaseName,
+	}
+
+	return stream.Send(event)
+}
+
+// StreamChanges handles change streaming for catch-up.
+// Streams committed transactions from a given txn_id for delta sync, then keeps stream alive for live updates.
 func (s *Server) StreamChanges(req *StreamRequest, stream MarmotService_StreamChangesServer) error {
 	// Treat stream request as implicit heartbeat from requesting node
 	if req.RequestingNodeId != 0 {
@@ -376,7 +464,30 @@ func (s *Server) StreamChanges(req *StreamRequest, stream MarmotService_StreamCh
 		databases = dbManager.ListDatabases()
 	}
 
-	// Stream changes from each database
+	// Track last sent transaction ID per database
+	lastSentTxn := make(map[string]uint64)
+
+	// Phase 1: Stream historical transactions (catch-up)
+	if err := s.streamHistoricalTransactions(dbManager, databases, req.FromTxnId, stream, lastSentTxn); err != nil {
+		return err
+	}
+
+	log.Info().
+		Uint64("from_txn_id", req.FromTxnId).
+		Msg("Historical transactions streamed, entering live streaming mode")
+
+	// Phase 2: Keep stream alive and poll for new transactions
+	return s.pollForNewTransactions(dbManager, databases, stream, lastSentTxn, req.RequestingNodeId)
+}
+
+// streamHistoricalTransactions streams all historical transactions for initial catch-up
+func (s *Server) streamHistoricalTransactions(
+	dbManager *db.DatabaseManager,
+	databases []string,
+	fromTxnId uint64,
+	stream MarmotService_StreamChangesServer,
+	lastSentTxn map[string]uint64,
+) error {
 	for _, dbName := range databases {
 		mdb, err := dbManager.GetDatabase(dbName)
 		if err != nil {
@@ -384,107 +495,79 @@ func (s *Server) StreamChanges(req *StreamRequest, stream MarmotService_StreamCh
 			continue
 		}
 
-		// Use MetaStore for transaction records (they're stored in meta database)
 		metaStore := mdb.GetMetaStore()
 		if metaStore == nil {
 			log.Warn().Str("database", dbName).Msg("MetaStore not available for streaming")
 			continue
 		}
 
-		// Stream committed transactions using the interface method
-		err = metaStore.StreamCommittedTransactions(req.FromTxnId, func(rec *db.TransactionRecord) error {
-			// Parse statements from msgpack - must include CDC data (NewValues, OldValues, RowKey)
-			var statements []*Statement
-			if len(rec.SerializedStatements) > 0 {
-				var rawStatements []struct {
-					SQL       string            `msgpack:"SQL"`
-					Type      int               `msgpack:"Type"`
-					TableName string            `msgpack:"TableName"`
-					Database  string            `msgpack:"Database"`
-					RowKey    string            `msgpack:"RowKey"`
-					OldValues map[string][]byte `msgpack:"OldValues"`
-					NewValues map[string][]byte `msgpack:"NewValues"`
-				}
-				if err := encoding.Unmarshal(rec.SerializedStatements, &rawStatements); err != nil {
-					log.Warn().Err(err).Uint64("txn_id", rec.TxnID).Msg("Failed to parse statements msgpack")
-				} else {
-					for _, s := range rawStatements {
-						stmt := &Statement{
-							Type:      StatementType(s.Type),
-							TableName: s.TableName,
-							Database:  s.Database,
-						}
-
-						// For DML with CDC data, use RowChange payload
-						// For DDL or DML without CDC, use DdlChange payload with SQL
-						isDML := s.Type == int(StatementType_INSERT) ||
-							s.Type == int(StatementType_UPDATE) ||
-							s.Type == int(StatementType_DELETE) ||
-							s.Type == int(StatementType_REPLACE)
-
-						if isDML && (len(s.NewValues) > 0 || len(s.OldValues) > 0) {
-							// CDC path: send row data
-							stmt.Payload = &Statement_RowChange{
-								RowChange: &RowChange{
-									RowKey:    s.RowKey,
-									OldValues: s.OldValues,
-									NewValues: s.NewValues,
-								},
-							}
-							log.Debug().
-								Uint64("txn_id", rec.TxnID).
-								Str("table", s.TableName).
-								Str("row_key", s.RowKey).
-								Int("new_values", len(s.NewValues)).
-								Int("old_values", len(s.OldValues)).
-								Msg("STREAM: Sending CDC data for anti-entropy")
-						} else {
-							// DDL or DML without CDC: send SQL
-							stmt.Payload = &Statement_DdlChange{
-								DdlChange: &DDLChange{
-									Sql: s.SQL,
-								},
-							}
-							log.Debug().
-								Uint64("txn_id", rec.TxnID).
-								Str("sql_prefix", func() string {
-									if len(s.SQL) > 50 {
-										return s.SQL[:50]
-									}
-									return s.SQL
-								}()).
-								Msg("STREAM: Sending SQL for anti-entropy")
-						}
-
-						statements = append(statements, stmt)
-					}
-				}
+		// Stream historical transactions
+		lastSentTxn[dbName] = fromTxnId
+		err = metaStore.StreamCommittedTransactions(fromTxnId, func(rec *db.TransactionRecord) error {
+			if err := s.sendChangeEvent(rec, stream); err != nil {
+				return err
 			}
-
-			event := &ChangeEvent{
-				TxnId:  rec.TxnID,
-				SeqNum: rec.SeqNum,
-				Timestamp: &HLC{
-					WallTime: rec.CommitTSWall,
-					Logical:  rec.CommitTSLogical,
-				},
-				Statements: statements,
-				Database:   rec.DatabaseName,
-			}
-
-			return stream.Send(event)
+			lastSentTxn[dbName] = rec.TxnID
+			return nil
 		})
 		if err != nil {
 			log.Warn().Err(err).Str("database", dbName).Msg("Failed to stream transactions")
 			continue
 		}
 	}
-
-	log.Info().
-		Uint64("from_txn_id", req.FromTxnId).
-		Msg("Change stream completed")
-
 	return nil
+}
+
+// pollForNewTransactions keeps stream alive and polls for new transactions
+func (s *Server) pollForNewTransactions(
+	dbManager *db.DatabaseManager,
+	databases []string,
+	stream MarmotService_StreamChangesServer,
+	lastSentTxn map[string]uint64,
+	requestingNodeId uint64,
+) error {
+	ticker := time.NewTicker(liveStreamPollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-stream.Context().Done():
+			// Client disconnected
+			log.Info().
+				Uint64("requesting_node", requestingNodeId).
+				Msg("Change stream client disconnected")
+			return stream.Context().Err()
+		case <-ticker.C:
+			// Poll for new transactions
+			for _, dbName := range databases {
+				mdb, err := dbManager.GetDatabase(dbName)
+				if err != nil {
+					continue
+				}
+
+				metaStore := mdb.GetMetaStore()
+				if metaStore == nil {
+					continue
+				}
+
+				fromTxn := lastSentTxn[dbName]
+				err = metaStore.StreamCommittedTransactions(fromTxn, func(rec *db.TransactionRecord) error {
+					// Skip already sent transaction
+					if rec.TxnID <= fromTxn {
+						return nil
+					}
+					if err := s.sendChangeEvent(rec, stream); err != nil {
+						return err
+					}
+					lastSentTxn[dbName] = rec.TxnID
+					return nil
+				})
+				if err != nil {
+					log.Warn().Err(err).Str("database", dbName).Msg("Failed to poll transactions")
+				}
+			}
+		}
+	}
 }
 
 // GetReplicationState returns current replication state for anti-entropy
@@ -583,7 +666,9 @@ func (s *Server) GetReplicationState(ctx context.Context, req *ReplicationStateR
 // SNAPSHOT METHODS
 // =======================
 
-// GetSnapshotInfo returns snapshot metadata for bootstrap
+// GetSnapshotInfo returns snapshot metadata for bootstrap.
+// NOTE: This returns estimated info. The actual snapshot is taken atomically
+// during StreamSnapshot to ensure consistency.
 func (s *Server) GetSnapshotInfo(ctx context.Context, req *SnapshotInfoRequest) (*SnapshotInfoResponse, error) {
 	s.mu.RLock()
 	dbManager := s.dbManager
@@ -597,13 +682,14 @@ func (s *Server) GetSnapshotInfo(ctx context.Context, req *SnapshotInfoRequest) 
 		Uint64("requesting_node", req.RequestingNodeId).
 		Msg("Snapshot info requested")
 
-	// Take snapshot (checkpoints all databases)
+	// Use TakeSnapshot for metadata estimation only
+	// The actual atomic snapshot is taken in StreamSnapshot
 	snapshots, maxTxnID, err := dbManager.TakeSnapshot()
 	if err != nil {
-		return nil, fmt.Errorf("failed to take snapshot: %w", err)
+		return nil, fmt.Errorf("failed to get snapshot info: %w", err)
 	}
 
-	// Calculate total size and chunks
+	// Calculate total size and chunks (estimates)
 	var totalSize int64
 	var dbInfos []*DatabaseFileInfo
 	for _, snap := range snapshots {
@@ -626,10 +712,15 @@ func (s *Server) GetSnapshotInfo(ctx context.Context, req *SnapshotInfoRequest) 
 	}, nil
 }
 
-// StreamSnapshot streams snapshot chunks to requesting node
+// StreamSnapshot streams snapshot chunks to requesting node.
+// Uses atomic snapshot: copies files to temp dir under write lock, then streams from temp.
 func (s *Server) StreamSnapshot(req *SnapshotRequest, stream MarmotService_StreamSnapshotServer) error {
 	s.mu.RLock()
 	dbManager := s.dbManager
+	dataDir := ""
+	if dbManager != nil {
+		dataDir = dbManager.GetDataDir()
+	}
 	s.mu.RUnlock()
 
 	if dbManager == nil {
@@ -640,11 +731,24 @@ func (s *Server) StreamSnapshot(req *SnapshotRequest, stream MarmotService_Strea
 		Uint64("requesting_node", req.RequestingNodeId).
 		Msg("Starting snapshot stream")
 
-	// Take snapshot
-	snapshots, _, err := dbManager.TakeSnapshot()
+	// Create temp directory for atomic snapshot
+	tempDir, err := os.MkdirTemp(dataDir, "snapshot-export-")
+	if err != nil {
+		return fmt.Errorf("failed to create temp directory: %w", err)
+	}
+	defer os.RemoveAll(tempDir) // Clean up temp dir when done
+
+	// Take atomic snapshot to temp directory (blocks writes briefly)
+	snapshots, maxTxnID, err := dbManager.TakeSnapshotToDir(tempDir)
 	if err != nil {
 		return fmt.Errorf("failed to take snapshot: %w", err)
 	}
+
+	log.Info().
+		Uint64("requesting_node", req.RequestingNodeId).
+		Uint64("snapshot_txn_id", maxTxnID).
+		Int("databases", len(snapshots)).
+		Msg("Atomic snapshot created, streaming files")
 
 	// Calculate total chunks across all files
 	var totalChunks int32
@@ -658,7 +762,7 @@ func (s *Server) StreamSnapshot(req *SnapshotRequest, stream MarmotService_Strea
 
 	chunkIndex := int32(0)
 
-	// Stream each database file
+	// Stream each database file from temp directory
 	for _, snap := range snapshots {
 		file, err := os.Open(snap.FullPath)
 		if err != nil {
@@ -708,6 +812,7 @@ func (s *Server) StreamSnapshot(req *SnapshotRequest, stream MarmotService_Strea
 	log.Info().
 		Uint64("requesting_node", req.RequestingNodeId).
 		Int32("total_chunks", totalChunks).
+		Uint64("snapshot_txn_id", maxTxnID).
 		Msg("Snapshot stream completed")
 
 	return nil

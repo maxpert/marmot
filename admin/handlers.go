@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/maxpert/marmot/db"
+	"github.com/maxpert/marmot/encoding"
 	"github.com/maxpert/marmot/grpc"
 	"github.com/rs/zerolog/log"
 )
@@ -252,4 +253,49 @@ func parsePeerNodeID(peerIDStr string) (uint64, error) {
 	}
 
 	return peerID, nil
+}
+
+// decodeStatements deserializes msgpack-encoded statements to JSON-friendly format
+func decodeStatements(data []byte) []map[string]interface{} {
+	if len(data) == 0 {
+		return nil
+	}
+
+	var rawStatements []struct {
+		SQL       string            `msgpack:"SQL"`
+		Type      int               `msgpack:"Type"`
+		TableName string            `msgpack:"TableName"`
+		Database  string            `msgpack:"Database"`
+		RowKey    string            `msgpack:"RowKey"`
+		OldValues map[string][]byte `msgpack:"OldValues"`
+		NewValues map[string][]byte `msgpack:"NewValues"`
+	}
+
+	if err := encoding.Unmarshal(data, &rawStatements); err != nil {
+		return nil
+	}
+
+	result := make([]map[string]interface{}, 0, len(rawStatements))
+	for _, s := range rawStatements {
+		stmt := map[string]interface{}{
+			"type":       s.Type,
+			"table_name": s.TableName,
+			"database":   s.Database,
+		}
+		if s.SQL != "" {
+			stmt["sql"] = s.SQL
+		}
+		if s.RowKey != "" {
+			stmt["row_key"] = s.RowKey
+		}
+		if len(s.OldValues) > 0 {
+			stmt["old_values"] = encodeBase64Map(s.OldValues)
+		}
+		if len(s.NewValues) > 0 {
+			stmt["new_values"] = encodeBase64Map(s.NewValues)
+		}
+		result = append(result, stmt)
+	}
+
+	return result
 }

@@ -52,20 +52,20 @@ func (h *AdminHandlers) handleTransaction(w http.ResponseWriter, r *http.Request
 
 	// Convert to JSON response format
 	response := map[string]interface{}{
-		"txn_id":                rec.TxnID,
-		"node_id":               rec.NodeID,
-		"seq_num":               rec.SeqNum,
-		"status":                rec.Status,
-		"start_ts_wall":         rec.StartTSWall,
-		"start_ts_logical":      rec.StartTSLogical,
-		"commit_ts_wall":        rec.CommitTSWall,
-		"commit_ts_logical":     rec.CommitTSLogical,
-		"created_at":            formatTimestamp(rec.CreatedAt),
-		"committed_at":          formatTimestamp(rec.CommittedAt),
-		"last_heartbeat":        formatTimestamp(rec.LastHeartbeat),
-		"tables_involved":       rec.TablesInvolved,
-		"serialized_statements": encodeBase64(rec.SerializedStatements),
-		"database_name":         rec.DatabaseName,
+		"txn_id":            rec.TxnID,
+		"node_id":           rec.NodeID,
+		"seq_num":           rec.SeqNum,
+		"status":            rec.Status,
+		"start_ts_wall":     rec.StartTSWall,
+		"start_ts_logical":  rec.StartTSLogical,
+		"commit_ts_wall":    rec.CommitTSWall,
+		"commit_ts_logical": rec.CommitTSLogical,
+		"created_at":        formatTimestamp(rec.CreatedAt),
+		"committed_at":      formatTimestamp(rec.CommittedAt),
+		"last_heartbeat":    formatTimestamp(rec.LastHeartbeat),
+		"tables_involved":   rec.TablesInvolved,
+		"statements":        decodeStatements(rec.SerializedStatements),
+		"database_name":     rec.DatabaseName,
 	}
 
 	writeJSONResponse(w, response, false, "")
@@ -97,7 +97,7 @@ func (h *AdminHandlers) handlePendingTransactions(w http.ResponseWriter, r *http
 	writeJSONResponse(w, response, false, "")
 }
 
-// handleCommittedTransactions returns committed transactions with pagination
+// handleCommittedTransactions returns committed transactions with pagination (newest first)
 func (h *AdminHandlers) handleCommittedTransactions(w http.ResponseWriter, r *http.Request, metaStore db.MetaStore) {
 	limit, err := parseLimit(r)
 	if err != nil {
@@ -105,51 +105,51 @@ func (h *AdminHandlers) handleCommittedTransactions(w http.ResponseWriter, r *ht
 		return
 	}
 
-	from := parseFrom(r)
+	// Parse cursor for pagination (txn_id to start before)
+	var fromTxnID uint64
+	if from := parseFrom(r); from != "" {
+		fromTxnID, _ = strconv.ParseUint(from, 10, 64)
+	}
+
 	var response []map[string]interface{}
 	var lastKey string
-	var hasMore bool
-	count := 0
+	hasMore := false
 
-	// Stream committed transactions
-	err = metaStore.StreamCommittedTransactions(0, func(rec *db.TransactionRecord) error {
-		// Skip until we reach the from key
-		if from != "" {
-			fromTxnID, parseErr := strconv.ParseUint(from, 10, 64)
-			if parseErr == nil && rec.TxnID <= fromTxnID {
-				return nil
-			}
+	// Scan transactions in descending order (newest first)
+	err = metaStore.ScanTransactions(fromTxnID, true, func(rec *db.TransactionRecord) error {
+		// Only include committed transactions
+		if rec.Status != db.TxnStatusCommitted {
+			return nil
 		}
 
-		if count >= limit {
-			lastKey = fmt.Sprintf("%d", rec.TxnID)
+		if len(response) >= limit {
 			hasMore = true
-			return nil // Stop iteration
+			return db.ErrStopIteration
 		}
 
 		item := map[string]interface{}{
-			"txn_id":                rec.TxnID,
-			"node_id":               rec.NodeID,
-			"seq_num":               rec.SeqNum,
-			"status":                rec.Status,
-			"start_ts_wall":         rec.StartTSWall,
-			"start_ts_logical":      rec.StartTSLogical,
-			"commit_ts_wall":        rec.CommitTSWall,
-			"commit_ts_logical":     rec.CommitTSLogical,
-			"created_at":            formatTimestamp(rec.CreatedAt),
-			"committed_at":          formatTimestamp(rec.CommittedAt),
-			"last_heartbeat":        formatTimestamp(rec.LastHeartbeat),
-			"tables_involved":       rec.TablesInvolved,
-			"serialized_statements": encodeBase64(rec.SerializedStatements),
-			"database_name":         rec.DatabaseName,
+			"txn_id":            rec.TxnID,
+			"node_id":           rec.NodeID,
+			"seq_num":           rec.SeqNum,
+			"status":            rec.Status,
+			"start_ts_wall":     rec.StartTSWall,
+			"start_ts_logical":  rec.StartTSLogical,
+			"commit_ts_wall":    rec.CommitTSWall,
+			"commit_ts_logical": rec.CommitTSLogical,
+			"created_at":        formatTimestamp(rec.CreatedAt),
+			"committed_at":      formatTimestamp(rec.CommittedAt),
+			"last_heartbeat":    formatTimestamp(rec.LastHeartbeat),
+			"tables_involved":   rec.TablesInvolved,
+			"statements":        decodeStatements(rec.SerializedStatements),
+			"database_name":     rec.DatabaseName,
 		}
 		response = append(response, item)
-		count++
+		lastKey = fmt.Sprintf("%d", rec.TxnID)
 		return nil
 	})
 
 	if err != nil {
-		writeErrorResponse(w, http.StatusInternalServerError, fmt.Sprintf("failed to stream transactions: %v", err))
+		writeErrorResponse(w, http.StatusInternalServerError, fmt.Sprintf("failed to scan transactions: %v", err))
 		return
 	}
 
