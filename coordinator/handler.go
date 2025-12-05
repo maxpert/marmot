@@ -341,8 +341,8 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, consistency
 		if err == nil {
 			// Use configured lock wait timeout for hook execution (default 50s like MySQL innodb_lock_wait_timeout)
 			hookTimeout := 50 * time.Second
-			if cfg.Config != nil && cfg.Config.MVCC.LockWaitTimeoutSeconds > 0 {
-				hookTimeout = time.Duration(cfg.Config.MVCC.LockWaitTimeoutSeconds) * time.Second
+			if cfg.Config != nil && cfg.Config.Transaction.LockWaitTimeoutSeconds > 0 {
+				hookTimeout = time.Duration(cfg.Config.Transaction.LockWaitTimeoutSeconds) * time.Second
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), hookTimeout)
 			cancelHookCtx = cancel // Store for later - DO NOT call yet
@@ -728,8 +728,8 @@ func (h *CoordinatorHandler) handleCommit(session *protocol.ConnectionSession) (
 	var totalRowsAffected int64
 
 	hookTimeout := 50 * time.Second
-	if cfg.Config != nil && cfg.Config.MVCC.LockWaitTimeoutSeconds > 0 {
-		hookTimeout = time.Duration(cfg.Config.MVCC.LockWaitTimeoutSeconds) * time.Second
+	if cfg.Config != nil && cfg.Config.Transaction.LockWaitTimeoutSeconds > 0 {
+		hookTimeout = time.Duration(cfg.Config.Transaction.LockWaitTimeoutSeconds) * time.Second
 	}
 
 	for _, stmt := range txnState.Statements {

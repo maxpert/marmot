@@ -105,7 +105,7 @@ Pre-configured TOML files for each node:
 - `node-3-config.toml` - Node 3 (ports 8083/3309)
 
 Each config includes:
-- ✅ MVCC settings (garbage collection, conflict resolution)
+- ✅ Transaction settings (garbage collection, conflict resolution)
 - ✅ Cluster settings (gossip, seed nodes, timeouts)
 - ✅ Replication settings (QUORUM consistency)
 - ✅ MySQL protocol server

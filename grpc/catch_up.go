@@ -317,7 +317,7 @@ func (c *CatchUpClient) GetLocalMaxTxnID(ctx context.Context) (map[string]uint64
 
 	// Open system database with WAL mode and busy timeout to avoid conflicts
 	// Use config timeout (in seconds) converted to milliseconds
-	busyTimeoutMS := cfg.Config.MVCC.LockWaitTimeoutSeconds * 1000
+	busyTimeoutMS := cfg.Config.Transaction.LockWaitTimeoutSeconds * 1000
 	dsn := fmt.Sprintf("%s?_journal_mode=WAL&_busy_timeout=%d&mode=ro", systemDBPath, busyTimeoutMS)
 	systemDB, err := sql.Open("sqlite3", dsn)
 	if err != nil {

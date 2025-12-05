@@ -95,7 +95,7 @@ func TestTransactionLifecycle(t *testing.T) {
 	testDB := setupTestDBWithMeta(t)
 
 	clock := hlc.NewClock(1)
-	tm := NewMVCCTransactionManager(testDB.DB, testDB.MetaStore, clock)
+	tm := NewTransactionManager(testDB.DB, testDB.MetaStore, clock)
 
 	// Create user table
 	createUserTable(t, testDB.DB)
@@ -152,7 +152,7 @@ func TestWriteIntentCreation(t *testing.T) {
 	testDB := setupTestDBWithMeta(t)
 
 	clock := hlc.NewClock(1)
-	tm := NewMVCCTransactionManager(testDB.DB, testDB.MetaStore, clock)
+	tm := NewTransactionManager(testDB.DB, testDB.MetaStore, clock)
 
 	createUserTable(t, testDB.DB)
 
@@ -204,7 +204,7 @@ func TestWriteWriteConflictDetection(t *testing.T) {
 	testDB := setupTestDBWithMeta(t)
 
 	clock := hlc.NewClock(1)
-	tm := NewMVCCTransactionManager(testDB.DB, testDB.MetaStore, clock)
+	tm := NewTransactionManager(testDB.DB, testDB.MetaStore, clock)
 
 	createUserTable(t, testDB.DB)
 
@@ -265,7 +265,7 @@ func TestConcurrentTransactionsOnDifferentRows(t *testing.T) {
 	testDB := setupTestDBWithMeta(t)
 
 	clock := hlc.NewClock(1)
-	tm := NewMVCCTransactionManager(testDB.DB, testDB.MetaStore, clock)
+	tm := NewTransactionManager(testDB.DB, testDB.MetaStore, clock)
 
 	createUserTable(t, testDB.DB)
 
@@ -358,7 +358,7 @@ func TestTransactionAbort(t *testing.T) {
 	testDB := setupTestDBWithMeta(t)
 
 	clock := hlc.NewClock(1)
-	tm := NewMVCCTransactionManager(testDB.DB, testDB.MetaStore, clock)
+	tm := NewTransactionManager(testDB.DB, testDB.MetaStore, clock)
 
 	createUserTable(t, testDB.DB)
 

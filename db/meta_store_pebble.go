@@ -24,7 +24,6 @@ const (
 	pebblePrefixTxnPending  = "/txn_idx/pend/" // /txn_idx/pend/{txnID:016x}
 	pebblePrefixTxnSeq      = "/txn_idx/seq/"  // /txn_idx/seq/{seqNum:016x}/{txnID:016x}
 	pebblePrefixIntent      = "/intent/"       // /intent/{tableName}/{rowKey}
-	pebblePrefixMVCC        = "/mvcc/"         // /mvcc/{tableName}/{rowKey}/{wallTime:016x}{logical:08x}{nodeID:016x}
 	pebblePrefixCDC         = "/cdc/"          // /cdc/{txnID:016x}/{seq:08x}
 	pebblePrefixRepl        = "/repl/"         // /repl/{peerNodeID:016x}/{dbName}
 	pebblePrefixSchema      = "/schema/"       // /schema/{dbName}
@@ -449,14 +448,6 @@ func pebbleIntentKey(tableName, rowKey string) []byte {
 
 func pebbleIntentByTxnKey(txnID uint64, tableName, rowKey string) []byte {
 	return []byte(fmt.Sprintf("%s%016x/%s/%s", pebblePrefixIntentByTxn, txnID, tableName, rowKey))
-}
-
-func pebbleMvccKey(tableName, rowKey string, ts hlc.Timestamp, nodeID uint64) []byte {
-	return []byte(fmt.Sprintf("%s%s/%s/%016x%08x%016x", pebblePrefixMVCC, tableName, rowKey, ts.WallTime, ts.Logical, nodeID))
-}
-
-func pebbleMvccPrefix(tableName, rowKey string) []byte {
-	return []byte(fmt.Sprintf("%s%s/%s/", pebblePrefixMVCC, tableName, rowKey))
 }
 
 func pebbleCdcKey(txnID, seq uint64) []byte {
@@ -964,8 +955,8 @@ func (s *PebbleMetaStore) resolveIntentConflictPebble(batch *pebble.Batch, exist
 	default:
 		// Check heartbeat timeout
 		heartbeatTimeout := int64(10 * time.Second)
-		if cfg.Config != nil && cfg.Config.MVCC.HeartbeatTimeoutSeconds > 0 {
-			heartbeatTimeout = int64(time.Duration(cfg.Config.MVCC.HeartbeatTimeoutSeconds) * time.Second)
+		if cfg.Config != nil && cfg.Config.Transaction.HeartbeatTimeoutSeconds > 0 {
+			heartbeatTimeout = int64(time.Duration(cfg.Config.Transaction.HeartbeatTimeoutSeconds) * time.Second)
 		}
 
 		timeSinceHeartbeat := time.Now().UnixNano() - conflictTxnRec.LastHeartbeat
@@ -1245,82 +1236,6 @@ func (s *PebbleMetaStore) GetIntent(tableName, rowKey string) (*WriteIntentRecor
 		return nil, err
 	}
 	return intent, nil
-}
-
-// CreateMVCCVersion creates an MVCC version record
-func (s *PebbleMetaStore) CreateMVCCVersion(tableName, rowKey string, ts hlc.Timestamp, nodeID, txnID uint64, op OpType, data []byte) error {
-	rec := &MVCCVersionRecord{
-		TableName:    tableName,
-		RowKey:       rowKey,
-		TSWall:       ts.WallTime,
-		TSLogical:    ts.Logical,
-		NodeID:       nodeID,
-		TxnID:        txnID,
-		Operation:    op,
-		DataSnapshot: data,
-		CreatedAt:    time.Now().UnixNano(),
-	}
-
-	recData, err := encoding.Marshal(rec)
-	if err != nil {
-		return err
-	}
-
-	// NoSync: MVCC versions are historical records for conflict detection.
-	// Transaction is already committed - MVCC can be recreated if needed.
-	return s.db.Set(pebbleMvccKey(tableName, rowKey, ts, nodeID), recData, pebble.NoSync)
-}
-
-// GetLatestVersion retrieves the latest MVCC version for a row
-func (s *PebbleMetaStore) GetLatestVersion(tableName, rowKey string) (*MVCCVersionRecord, error) {
-	prefix := pebbleMvccPrefix(tableName, rowKey)
-
-	iter, err := s.db.NewIter(&pebble.IterOptions{
-		LowerBound: prefix,
-		UpperBound: prefixUpperBound(prefix),
-	})
-	if err != nil {
-		return nil, err
-	}
-	defer iter.Close()
-
-	// Go to last key in range
-	if !iter.Last() {
-		return nil, iter.Error()
-	}
-
-	val, err := iter.ValueAndErr()
-	if err != nil {
-		return nil, err
-	}
-
-	latest := &MVCCVersionRecord{}
-	if err := encoding.Unmarshal(val, latest); err != nil {
-		return nil, err
-	}
-
-	return latest, nil
-}
-
-// GetMVCCVersionCount returns the number of MVCC versions for a row
-func (s *PebbleMetaStore) GetMVCCVersionCount(tableName, rowKey string) (int, error) {
-	count := 0
-	prefix := pebbleMvccPrefix(tableName, rowKey)
-
-	iter, err := s.db.NewIter(&pebble.IterOptions{
-		LowerBound: prefix,
-		UpperBound: prefixUpperBound(prefix),
-	})
-	if err != nil {
-		return 0, err
-	}
-	defer iter.Close()
-
-	for iter.SeekGE(prefix); iter.Valid(); iter.Next() {
-		count++
-	}
-
-	return count, iter.Error()
 }
 
 // GetReplicationState retrieves replication state for a peer
@@ -1962,97 +1877,6 @@ func (s *PebbleMetaStore) CleanupOldTransactionRecords(minRetention, maxRetentio
 	}
 
 	return deleted, nil
-}
-
-// CleanupOldMVCCVersions removes old MVCC versions, keeping the latest N versions per row
-func (s *PebbleMetaStore) CleanupOldMVCCVersions(keepVersions int) (int, error) {
-	prefix := []byte(pebblePrefixMVCC)
-	prefixLen := len(pebblePrefixMVCC)
-
-	batch := s.db.NewBatch()
-	defer batch.Close()
-
-	deleted := 0
-	var currentRowPrefix string
-	var currentRowKeys [][]byte
-
-	iter, err := s.db.NewIter(&pebble.IterOptions{
-		LowerBound: prefix,
-		UpperBound: prefixUpperBound(prefix),
-	})
-	if err != nil {
-		return 0, err
-	}
-	defer iter.Close()
-
-	for iter.SeekGE(prefix); iter.Valid(); iter.Next() {
-		key := make([]byte, len(iter.Key()))
-		copy(key, iter.Key())
-		keyStr := string(key)
-
-		rowPrefix := pebbleExtractMVCCRowPrefix(keyStr, prefixLen)
-		if rowPrefix == "" {
-			continue
-		}
-
-		if rowPrefix != currentRowPrefix {
-			// Process previous row's versions
-			if len(currentRowKeys) > keepVersions {
-				deleteCount := len(currentRowKeys) - keepVersions
-				for i := 0; i < deleteCount; i++ {
-					if err := batch.Delete(currentRowKeys[i], nil); err == nil {
-						deleted++
-					}
-				}
-			}
-			currentRowPrefix = rowPrefix
-			currentRowKeys = currentRowKeys[:0]
-		}
-
-		currentRowKeys = append(currentRowKeys, key)
-	}
-
-	// Process final row
-	if len(currentRowKeys) > keepVersions {
-		deleteCount := len(currentRowKeys) - keepVersions
-		for i := 0; i < deleteCount; i++ {
-			if err := batch.Delete(currentRowKeys[i], nil); err == nil {
-				deleted++
-			}
-		}
-	}
-
-	if err := iter.Error(); err != nil {
-		return 0, err
-	}
-
-	if deleted == 0 {
-		return 0, nil
-	}
-
-	if err := batch.Commit(pebble.NoSync); err != nil {
-		return 0, err
-	}
-
-	log.Info().Int("deleted_versions", deleted).Msg("MetaStore GC: Cleaned up old MVCC versions")
-	return deleted, nil
-}
-
-// pebbleExtractMVCCRowPrefix extracts the row prefix from an MVCC key
-func pebbleExtractMVCCRowPrefix(key string, prefixLen int) string {
-	idx1 := strings.Index(key[prefixLen:], "/")
-	if idx1 < 0 {
-		return ""
-	}
-	idx1 += prefixLen
-
-	idx2 := strings.Index(key[idx1+1:], "/")
-	if idx2 < 0 {
-		return ""
-	}
-	idx2 += idx1 + 1
-
-	return key[:idx2+1]
 }
 
 // GetNextSeqNum returns the next sequence number for a node

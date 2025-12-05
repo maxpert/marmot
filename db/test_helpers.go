@@ -133,13 +133,3 @@ func verifyTransactionStatusMeta(t *testing.T, ms MetaStore, txnID uint64, expec
 		t.Errorf("Expected transaction %d status %s, got %s", txnID, expectedStatus.String(), txnRecord.Status.String())
 	}
 }
-
-// countMVCCVersionsMeta returns the number of MVCC versions for a given table and row using MetaStore
-func countMVCCVersionsMeta(t *testing.T, ms MetaStore, tableName, rowKey string) int {
-	t.Helper()
-	count, err := ms.GetMVCCVersionCount(tableName, rowKey)
-	if err != nil {
-		t.Fatalf("Failed to count MVCC versions: %v", err)
-	}
-	return count
-}

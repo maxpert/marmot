@@ -18,7 +18,7 @@ func TestConcurrentWriteIntentConflicts(t *testing.T) {
 	testDB := setupTestDBWithMeta(t)
 
 	clock := hlc.NewClock(1)
-	tm := NewMVCCTransactionManager(testDB.DB, testDB.MetaStore, clock)
+	tm := NewTransactionManager(testDB.DB, testDB.MetaStore, clock)
 
 	createUserTable(t, testDB.DB)
 
@@ -104,7 +104,7 @@ func TestHighContentionHotspot(t *testing.T) {
 	testDB := setupTestDBWithMeta(t)
 
 	clock := hlc.NewClock(1)
-	tm := NewMVCCTransactionManager(testDB.DB, testDB.MetaStore, clock)
+	tm := NewTransactionManager(testDB.DB, testDB.MetaStore, clock)
 
 	createUserTable(t, testDB.DB)
 
@@ -208,7 +208,7 @@ func TestSerializableSnapshotIsolation(t *testing.T) {
 	testDB := setupTestDBWithMeta(t)
 
 	clock := hlc.NewClock(1)
-	tm := NewMVCCTransactionManager(testDB.DB, testDB.MetaStore, clock)
+	tm := NewTransactionManager(testDB.DB, testDB.MetaStore, clock)
 
 	createUserTable(t, testDB.DB)
 
@@ -311,7 +311,7 @@ func TestWriteIntentLifecycle(t *testing.T) {
 	testDB := setupTestDBWithMeta(t)
 
 	clock := hlc.NewClock(1)
-	tm := NewMVCCTransactionManager(testDB.DB, testDB.MetaStore, clock)
+	tm := NewTransactionManager(testDB.DB, testDB.MetaStore, clock)
 
 	createUserTable(t, testDB.DB)
 
@@ -357,14 +357,6 @@ func TestWriteIntentLifecycle(t *testing.T) {
 	verifyWriteIntentsClearedMeta(t, testDB.MetaStore, txn.ID)
 	t.Log("✓ Write intent cleaned up")
 
-	// Verify MVCC version was created in MetaStore
-	versionCount := countMVCCVersionsMeta(t, testDB.MetaStore, "users", "1")
-	if versionCount != 1 {
-		t.Errorf("Expected 1 MVCC version, found %d", versionCount)
-	}
-
-	t.Log("✓ MVCC version created")
-
 	// Verify transaction status is COMMITTED in MetaStore
 	verifyTransactionStatusMeta(t, testDB.MetaStore, txn.ID, TxnStatusCommitted)
 	t.Log("✓ Transaction status is COMMITTED")
@@ -375,7 +367,7 @@ func TestTransactionAbortCleanup(t *testing.T) {
 	testDB := setupTestDBWithMeta(t)
 
 	clock := hlc.NewClock(1)
-	tm := NewMVCCTransactionManager(testDB.DB, testDB.MetaStore, clock)
+	tm := NewTransactionManager(testDB.DB, testDB.MetaStore, clock)
 
 	createUserTable(t, testDB.DB)
 
@@ -416,14 +408,6 @@ func TestTransactionAbortCleanup(t *testing.T) {
 	// Verify write intents are cleaned up in MetaStore
 	verifyWriteIntentsClearedMeta(t, testDB.MetaStore, txn.ID)
 	t.Log("✓ Write intents cleaned up")
-
-	// Verify no MVCC version was created in MetaStore
-	versionCount := countMVCCVersionsMeta(t, testDB.MetaStore, "users", "1")
-	if versionCount != 0 {
-		t.Errorf("Expected 0 MVCC versions after abort, found %d", versionCount)
-	}
-
-	t.Log("✓ No MVCC version created (correct for aborted transaction)")
 
 	// Verify transaction status is ABORTED in MetaStore
 	verifyTransactionStatusMeta(t, testDB.MetaStore, txn.ID, TxnStatusAborted)
