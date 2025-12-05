@@ -6,12 +6,12 @@
 
 ## What & Why?
 
-Marmot v2 is a leaderless, distributed SQLite replication system built on a gossip-based protocol with MVCC (Multi-Version Concurrency Control) and eventual consistency.
+Marmot v2 is a leaderless, distributed SQLite replication system built on a gossip-based protocol with distributed transactions and eventual consistency.
 
 **Key Features:**
 - **Leaderless Architecture**: No single point of failure - any node can accept writes
 - **MySQL Protocol Compatible**: Connect with any MySQL client (DBeaver, MySQL Workbench, mysql CLI)
-- **MVCC Transactions**: Snapshot isolation with conflict detection and resolution
+- **Distributed Transactions**: Percolator-style write intents with conflict detection
 - **Multi-Database Support**: Create and manage multiple databases per cluster
 - **DDL Replication**: Distributed schema changes with automatic idempotency and cluster-wide locking
 - **Production-Ready SQL Parser**: Powered by rqlite/sql AST parser for MySQL→SQLite transpilation
@@ -388,18 +388,16 @@ node_id = 0  # 0 = auto-generate
 data_dir = "./marmot-data"
 ```
 
-### MVCC Transaction Manager
+### Transaction Manager
 
 ```toml
-[mvcc]
-gc_interval_seconds = 30        # Garbage collection interval
-gc_retention_hours = 1          # Deprecated: Use replication.gc_min_retention_hours instead
+[transaction]
 heartbeat_timeout_seconds = 10  # Transaction timeout without heartbeat
-version_retention_count = 10    # MVCC versions to keep per row
-conflict_window_seconds = 10    # LWW conflict resolution window
+conflict_window_seconds = 10    # Conflict resolution window
+lock_wait_timeout_seconds = 50  # Lock wait timeout (MySQL: innodb_lock_wait_timeout)
 ```
 
-**Note**: GC retention is now managed by the replication configuration to coordinate with anti-entropy. The `gc_retention_hours` setting is deprecated in favor of `replication.gc_min_retention_hours` and `replication.gc_max_retention_hours`.
+**Note**: Transaction log garbage collection is managed by the replication configuration to coordinate with anti-entropy. See `replication.gc_min_retention_hours` and `replication.gc_max_retention_hours`.
 
 ### Connection Pool
 

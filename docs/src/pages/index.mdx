@@ -8,12 +8,12 @@ import { Hero } from "../components/Hero.tsx";
 
 ## What & Why?
 
-Marmot v2 is a leaderless, distributed SQLite replication system built on a gossip-based protocol with MVCC (Multi-Version Concurrency Control) and eventual consistency.
+Marmot v2 is a leaderless, distributed SQLite replication system built on a gossip-based protocol with distributed transactions and eventual consistency.
 
 **Key Features:**
 - **Leaderless Architecture**: No single point of failure - any node can accept writes
 - **MySQL Protocol Compatible**: Connect with any MySQL client (DBeaver, MySQL Workbench, mysql CLI)
-- **MVCC Transactions**: Snapshot isolation with conflict detection and resolution
+- **Distributed Transactions**: Percolator-style write intents with conflict detection
 - **Multi-Database Support**: Create and manage multiple databases per cluster
 - **DDL Replication**: Distributed schema changes with automatic idempotency and cluster-wide locking
 - **Production-Ready SQL Parser**: Powered by rqlite/sql AST parser for MySQL→SQLite transpilation
