@@ -30,7 +30,7 @@ type MVCCDatabase struct {
 	hookDB        *sql.DB   // Hook connection for CDC capture (pool size=1, released before 2PC)
 	readDB        *sql.DB   // Read connection pool (pool size from config)
 	metaStore     MetaStore // Separate metadata storage (transaction records, intents, etc.)
-	txnMgr        *MVCCTransactionManager
+	txnMgr        *TransactionManager
 	clock         *hlc.Clock
 	nodeID        uint64
 	replicationFn ReplicationFunc
@@ -40,13 +40,13 @@ type MVCCDatabase struct {
 
 // ReplicationFunc is called to replicate transactions to other nodes
 // This is injected from the coordinator layer
-type ReplicationFunc func(ctx context.Context, txn *MVCCTransaction) error
+type ReplicationFunc func(ctx context.Context, txn *Transaction) error
 
 // NewMVCCDatabase creates a new MVCC-enabled database
 // metaStore is the MetaStore for storing transaction metadata (intent entries, txn records, etc.)
 func NewMVCCDatabase(dbPath string, nodeID uint64, clock *hlc.Clock, metaStore MetaStore) (*MVCCDatabase, error) {
 	// Get timeout from config (LockWaitTimeoutSeconds is in seconds, SQLite needs milliseconds)
-	busyTimeoutMS := cfg.Config.MVCC.LockWaitTimeoutSeconds * 1000
+	busyTimeoutMS := cfg.Config.Transaction.LockWaitTimeoutSeconds * 1000
 	poolCfg := cfg.Config.ConnectionPool
 	isMemoryDB := strings.Contains(dbPath, ":memory:")
 
@@ -158,7 +158,7 @@ func NewMVCCDatabase(dbPath string, nodeID uint64, clock *hlc.Clock, metaStore M
 	}
 
 	// Create transaction manager (uses write connection + MetaStore)
-	txnMgr := NewMVCCTransactionManager(writeDB, metaStore, clock)
+	txnMgr := NewTransactionManager(writeDB, metaStore, clock)
 
 	// Create commit batcher for SQLite-level batching (uses write connection)
 	commitBatcher := NewCommitBatcher(writeDB, 20, 2*time.Millisecond)
@@ -199,7 +199,7 @@ func (mdb *MVCCDatabase) GetReadDB() *sql.DB {
 }
 
 // GetTransactionManager returns the MVCC transaction manager
-func (mdb *MVCCDatabase) GetTransactionManager() *MVCCTransactionManager {
+func (mdb *MVCCDatabase) GetTransactionManager() *TransactionManager {
 	return mdb.txnMgr
 }
 
@@ -273,7 +273,7 @@ func (mdb *MVCCDatabase) CloseSQLiteConnections() {
 // This MUST be called AFTER database files have been replaced during snapshot apply.
 // Note: This does NOT touch MetaStore (PebbleDB) - only SQLite connections.
 func (mdb *MVCCDatabase) OpenSQLiteConnections(dbPath string) error {
-	busyTimeoutMS := cfg.Config.MVCC.LockWaitTimeoutSeconds * 1000
+	busyTimeoutMS := cfg.Config.Transaction.LockWaitTimeoutSeconds * 1000
 	poolCfg := cfg.Config.ConnectionPool
 
 	// Open write connection

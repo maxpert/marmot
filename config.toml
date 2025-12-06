@@ -1,5 +1,5 @@
 # Marmot v2.0 Configuration
-# Leaderless SQLite Replication with MVCC
+# Leaderless SQLite Replication
 
 # ==============================================================================
 # NODE IDENTITY
@@ -13,24 +13,18 @@ node_id = 0
 data_dir = "./marmot-data"
 
 # ==============================================================================
-# MVCC (Multi-Version Concurrency Control)
+# TRANSACTION MANAGER
 # ==============================================================================
 
-[mvcc]
-# Garbage collection interval (seconds)
-gc_interval_seconds = 30
-
-# How long to retain old transaction records (hours)
-gc_retention_hours = 2
-
+[transaction]
 # Transaction timeout without heartbeat (seconds)
 heartbeat_timeout_seconds = 10
 
-# Number of MVCC versions to keep per row
-version_retention_count = 10
-
 # Time window for Last-Write-Wins conflict resolution (seconds)
 conflict_window_seconds = 10
+
+# Lock wait timeout (seconds) - matches MySQL innodb_lock_wait_timeout
+lock_wait_timeout_seconds = 50
 
 # ==============================================================================
 # CLUSTER MEMBERSHIP

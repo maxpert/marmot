@@ -36,7 +36,7 @@ func NewLockWaiter() *LockWaiter {
 // WaitForLock waits for a conflicting transaction to release its lock
 // Returns nil if lock is released, or MySQLError if timeout
 func (lw *LockWaiter) WaitForLock(ctx context.Context, conflictingTxnID uint64) error {
-	timeout := time.Duration(cfg.Config.MVCC.LockWaitTimeoutSeconds) * time.Second
+	timeout := time.Duration(cfg.Config.Transaction.LockWaitTimeoutSeconds) * time.Second
 	deadline := time.Now().Add(timeout)
 	start := time.Now()
 

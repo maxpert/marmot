@@ -40,11 +40,6 @@ type MetaStore interface {
 	GetIntent(tableName, rowKey string) (*WriteIntentRecord, error)
 	GetIntentFilter() *IntentFilter // Cuckoo filter for fast-path conflict detection
 
-	// MVCC versions
-	CreateMVCCVersion(tableName, rowKey string, ts hlc.Timestamp, nodeID, txnID uint64, op OpType, data []byte) error
-	GetLatestVersion(tableName, rowKey string) (*MVCCVersionRecord, error)
-	GetMVCCVersionCount(tableName, rowKey string) (int, error)
-
 	// Replication state
 	GetReplicationState(peerNodeID uint64, dbName string) (*ReplicationStateRecord, error)
 	UpdateReplicationState(peerNodeID uint64, dbName string, lastTxnID uint64, lastTS hlc.Timestamp) error
@@ -71,7 +66,6 @@ type MetaStore interface {
 	// GC
 	CleanupStaleTransactions(timeout time.Duration) (int, error)
 	CleanupOldTransactionRecords(minRetention, maxRetention time.Duration, minAppliedTxnID, minAppliedSeqNum uint64) (int, error)
-	CleanupOldMVCCVersions(keepVersions int) (int, error)
 
 	// Aggregation queries for anti-entropy
 	GetMaxCommittedTxnID() (uint64, error)
@@ -122,19 +116,6 @@ type WriteIntentRecord struct {
 	DataSnapshot     []byte
 	CreatedAt        int64
 	MarkedForCleanup bool // Set to true when txn commits/aborts - allows immediate overwrite
-}
-
-// MVCCVersionRecord represents an MVCC version in meta store
-type MVCCVersionRecord struct {
-	TableName    string
-	RowKey       string
-	TSWall       int64
-	TSLogical    int32
-	NodeID       uint64
-	TxnID        uint64
-	Operation    OpType
-	DataSnapshot []byte
-	CreatedAt    int64
 }
 
 // ReplicationStateRecord represents replication state for a peer

@@ -14,11 +14,11 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-// MVCCTransaction represents a transaction with MVCC support
-// Implements Percolator-style distributed transactions
+// Transaction represents a distributed transaction
+// Implements Percolator-style distributed transactions with write intents
 // Note: Write intents are stored ONLY in MetaStore (not in memory) for durability
 // and to ensure cleanup happens correctly even after crashes or partial failures.
-type MVCCTransaction struct {
+type Transaction struct {
 	ID         uint64
 	NodeID     uint64
 	StartTS    hlc.Timestamp
@@ -36,9 +36,9 @@ type MinAppliedTxnIDFunc func(database string) (uint64, error)
 // Used for GC coordination via gossip protocol (no extra RPC calls needed)
 type ClusterMinWatermarkFunc func() uint64
 
-// MVCCTransactionManager manages MVCC transactions
+// TransactionManager manages distributed transactions
 // All transaction state is stored in MetaStore (PebbleDB) - no in-memory caching
-type MVCCTransactionManager struct {
+type TransactionManager struct {
 	db                     *sql.DB   // User database for data operations
 	metaStore              MetaStore // MetaStore for transaction metadata
 	clock                  *hlc.Clock
@@ -56,8 +56,8 @@ type MVCCTransactionManager struct {
 	getClusterMinWatermark ClusterMinWatermarkFunc // Callback for GC via gossip watermark
 }
 
-// NewMVCCTransactionManager creates a new transaction manager
-func NewMVCCTransactionManager(db *sql.DB, metaStore MetaStore, clock *hlc.Clock) *MVCCTransactionManager {
+// NewTransactionManager creates a new transaction manager
+func NewTransactionManager(db *sql.DB, metaStore MetaStore, clock *hlc.Clock) *TransactionManager {
 	// Import config values (with fallback to defaults if config not loaded)
 	gcInterval := 30 * time.Second
 	gcThreshold := 1 * time.Hour
@@ -67,14 +67,12 @@ func NewMVCCTransactionManager(db *sql.DB, metaStore MetaStore, clock *hlc.Clock
 
 	// Try to use config values if available
 	if cfg.Config != nil {
-		gcInterval = time.Duration(cfg.Config.MVCC.GCIntervalSeconds) * time.Second
-		gcThreshold = time.Duration(cfg.Config.MVCC.GCRetentionHours) * time.Hour
-		heartbeatTimeout = time.Duration(cfg.Config.MVCC.HeartbeatTimeoutSeconds) * time.Second
+		heartbeatTimeout = time.Duration(cfg.Config.Transaction.HeartbeatTimeoutSeconds) * time.Second
 		gcMinRetention = time.Duration(cfg.Config.Replication.GCMinRetentionHours) * time.Hour
 		gcMaxRetention = time.Duration(cfg.Config.Replication.GCMaxRetentionHours) * time.Hour
 	}
 
-	tm := &MVCCTransactionManager{
+	tm := &TransactionManager{
 		db:               db,
 		metaStore:        metaStore,
 		clock:            clock,
@@ -97,7 +95,7 @@ func NewMVCCTransactionManager(db *sql.DB, metaStore MetaStore, clock *hlc.Clock
 
 // SetDatabaseName sets the database name for this transaction manager
 // Used for GC coordination across peers
-func (tm *MVCCTransactionManager) SetDatabaseName(name string) {
+func (tm *TransactionManager) SetDatabaseName(name string) {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 	tm.databaseName = name
@@ -105,7 +103,7 @@ func (tm *MVCCTransactionManager) SetDatabaseName(name string) {
 
 // SetMinAppliedTxnIDFunc sets the callback for querying minimum applied txn_id across peers
 // Used for GC safe point calculation
-func (tm *MVCCTransactionManager) SetMinAppliedTxnIDFunc(fn MinAppliedTxnIDFunc) {
+func (tm *TransactionManager) SetMinAppliedTxnIDFunc(fn MinAppliedTxnIDFunc) {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 	tm.getMinAppliedTxnID = fn
@@ -113,14 +111,14 @@ func (tm *MVCCTransactionManager) SetMinAppliedTxnIDFunc(fn MinAppliedTxnIDFunc)
 
 // SetClusterMinWatermarkFunc sets the callback for getting cluster minimum watermark
 // This is obtained from the gossip protocol without extra RPC calls
-func (tm *MVCCTransactionManager) SetClusterMinWatermarkFunc(fn ClusterMinWatermarkFunc) {
+func (tm *TransactionManager) SetClusterMinWatermarkFunc(fn ClusterMinWatermarkFunc) {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 	tm.getClusterMinWatermark = fn
 }
 
-// BeginTransaction starts a new MVCC transaction with auto-generated ID
-func (tm *MVCCTransactionManager) BeginTransaction(nodeID uint64) (*MVCCTransaction, error) {
+// BeginTransaction starts a new distributed transaction with auto-generated ID
+func (tm *TransactionManager) BeginTransaction(nodeID uint64) (*Transaction, error) {
 	startTS := tm.clock.Now()
 
 	// Generate unique transaction ID using Percolator/TiDB pattern: (physical_ms << 18) | logical
@@ -130,10 +128,10 @@ func (tm *MVCCTransactionManager) BeginTransaction(nodeID uint64) (*MVCCTransact
 	return tm.BeginTransactionWithID(txnID, nodeID, startTS)
 }
 
-// BeginTransactionWithID starts an MVCC transaction with a specific ID
+// BeginTransactionWithID starts a distributed transaction with a specific ID
 // Used by coordinator replication to ensure consistent txn_id across cluster
 // Transaction state is persisted to MetaStore only - no in-memory caching
-func (tm *MVCCTransactionManager) BeginTransactionWithID(txnID, nodeID uint64, startTS hlc.Timestamp) (*MVCCTransaction, error) {
+func (tm *TransactionManager) BeginTransactionWithID(txnID, nodeID uint64, startTS hlc.Timestamp) (*Transaction, error) {
 	// Persist transaction record to MetaStore
 	if err := tm.metaStore.BeginTransaction(txnID, nodeID, startTS); err != nil {
 		return nil, fmt.Errorf("failed to create transaction record: %w", err)
@@ -141,7 +139,7 @@ func (tm *MVCCTransactionManager) BeginTransactionWithID(txnID, nodeID uint64, s
 
 	// Return a transient object for use during this request
 	// Actual state is in MetaStore
-	txn := &MVCCTransaction{
+	txn := &Transaction{
 		ID:         txnID,
 		NodeID:     nodeID,
 		StartTS:    startTS,
@@ -153,7 +151,7 @@ func (tm *MVCCTransactionManager) BeginTransactionWithID(txnID, nodeID uint64, s
 }
 
 // AddStatement adds a statement to the transaction buffer
-func (tm *MVCCTransactionManager) AddStatement(txn *MVCCTransaction, stmt protocol.Statement) error {
+func (tm *TransactionManager) AddStatement(txn *Transaction, stmt protocol.Statement) error {
 	txn.mu.Lock()
 	defer txn.mu.Unlock()
 
@@ -168,7 +166,7 @@ func (tm *MVCCTransactionManager) AddStatement(txn *MVCCTransaction, stmt protoc
 // WriteIntent creates a write intent for a row
 // This is the CRITICAL part: write intents act as distributed locks
 // Intents are stored ONLY in MetaStore (not in memory) for durability
-func (tm *MVCCTransactionManager) WriteIntent(txn *MVCCTransaction, intentType IntentType, tableName, rowKey string,
+func (tm *TransactionManager) WriteIntent(txn *Transaction, intentType IntentType, tableName, rowKey string,
 	stmt protocol.Statement, dataSnapshot []byte) error {
 
 	txn.mu.Lock()
@@ -218,7 +216,7 @@ func (tm *MVCCTransactionManager) WriteIntent(txn *MVCCTransaction, intentType I
 // Phase 1: Validate all write intents still held (fetched from MetaStore)
 // Phase 2: Get commit timestamp, apply CDC data, mark as COMMITTED, cleanup intents
 // All data is loaded from MetaStore - no in-memory caching
-func (tm *MVCCTransactionManager) CommitTransaction(txn *MVCCTransaction) error {
+func (tm *TransactionManager) CommitTransaction(txn *Transaction) error {
 	txn.mu.Lock()
 	defer txn.mu.Unlock()
 
@@ -252,7 +250,7 @@ func (tm *MVCCTransactionManager) CommitTransaction(txn *MVCCTransaction) error 
 }
 
 // validateIntents fetches and validates all write intents for the transaction.
-func (tm *MVCCTransactionManager) validateIntents(txn *MVCCTransaction) ([]*WriteIntentRecord, error) {
+func (tm *TransactionManager) validateIntents(txn *Transaction) ([]*WriteIntentRecord, error) {
 	intents, err := tm.metaStore.GetIntentsByTxn(txn.ID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch write intents: %w", err)
@@ -273,7 +271,7 @@ func (tm *MVCCTransactionManager) validateIntents(txn *MVCCTransaction) ([]*Writ
 }
 
 // calculateCommitTS determines the commit timestamp (must be > start_ts).
-func (tm *MVCCTransactionManager) calculateCommitTS(startTS hlc.Timestamp) hlc.Timestamp {
+func (tm *TransactionManager) calculateCommitTS(startTS hlc.Timestamp) hlc.Timestamp {
 	commitTS := tm.clock.Now()
 	if hlc.Compare(commitTS, startTS) <= 0 {
 		commitTS = tm.clock.Update(startTS)
@@ -285,7 +283,7 @@ func (tm *MVCCTransactionManager) calculateCommitTS(startTS hlc.Timestamp) hlc.T
 // applyDataChanges applies CDC entries or DDL statements from intents.
 // CRITICAL: Also rebuilds txn.Statements from persistent storage for serialization
 // in finalizeCommit. Without this, anti-entropy delta sync has no data to stream.
-func (tm *MVCCTransactionManager) applyDataChanges(txn *MVCCTransaction, intents []*WriteIntentRecord) error {
+func (tm *TransactionManager) applyDataChanges(txn *Transaction, intents []*WriteIntentRecord) error {
 	cdcEntries, err := tm.metaStore.GetIntentEntries(txn.ID)
 	if err != nil {
 		return fmt.Errorf("failed to load CDC entries: %w", err)
@@ -324,7 +322,7 @@ func (tm *MVCCTransactionManager) applyDataChanges(txn *MVCCTransaction, intents
 // rebuildStatementsFromCDC reconstructs protocol.Statement slice from CDC entries
 // and DDL intents. This data is serialized to TransactionRecord.SerializedStatements
 // for anti-entropy streaming to lagging nodes.
-func (tm *MVCCTransactionManager) rebuildStatementsFromCDC(cdcEntries []*IntentEntry, intents []*WriteIntentRecord) []protocol.Statement {
+func (tm *TransactionManager) rebuildStatementsFromCDC(cdcEntries []*IntentEntry, intents []*WriteIntentRecord) []protocol.Statement {
 	statements := make([]protocol.Statement, 0, len(cdcEntries)+len(intents))
 
 	log.Debug().
@@ -371,7 +369,7 @@ func (tm *MVCCTransactionManager) rebuildStatementsFromCDC(cdcEntries []*IntentE
 }
 
 // applyCDCEntries applies CDC data entries to SQLite.
-func (tm *MVCCTransactionManager) applyCDCEntries(txnID uint64, entries []*IntentEntry) error {
+func (tm *TransactionManager) applyCDCEntries(txnID uint64, entries []*IntentEntry) error {
 	if len(entries) == 0 {
 		return nil
 	}
@@ -395,7 +393,7 @@ func (tm *MVCCTransactionManager) applyCDCEntries(txnID uint64, entries []*Inten
 // applyDDLIntents executes DDL statements from write intents.
 // Only processes intents with IntentType == IntentTypeDDL.
 // DML intents are handled via CDC entries in applyCDCEntries.
-func (tm *MVCCTransactionManager) applyDDLIntents(txnID uint64, intents []*WriteIntentRecord) error {
+func (tm *TransactionManager) applyDDLIntents(txnID uint64, intents []*WriteIntentRecord) error {
 	for _, intent := range intents {
 		// Only process DDL intents with SQL statements
 		if intent.IntentType != IntentTypeDDL || intent.SQLStatement == "" {
@@ -412,7 +410,7 @@ func (tm *MVCCTransactionManager) applyDDLIntents(txnID uint64, intents []*Write
 }
 
 // finalizeCommit marks the transaction as committed in MetaStore.
-func (tm *MVCCTransactionManager) finalizeCommit(txn *MVCCTransaction) error {
+func (tm *TransactionManager) finalizeCommit(txn *Transaction) error {
 	statementsJSON, err := encoding.Marshal(txn.Statements)
 	if err != nil {
 		return fmt.Errorf("failed to serialize statements: %w", err)
@@ -451,14 +449,11 @@ func (tm *MVCCTransactionManager) finalizeCommit(txn *MVCCTransaction) error {
 }
 
 // cleanupAfterCommit performs synchronous cleanup to prevent goroutine explosion.
-func (tm *MVCCTransactionManager) cleanupAfterCommit(txn *MVCCTransaction, intents []*WriteIntentRecord) {
+func (tm *TransactionManager) cleanupAfterCommit(txn *Transaction, intents []*WriteIntentRecord) {
 	// Mark intents for cleanup first (fast path - allows immediate overwrite)
 	if err := tm.metaStore.MarkIntentsForCleanup(txn.ID); err != nil {
 		log.Warn().Err(err).Uint64("txn_id", txn.ID).Msg("Failed to mark intents for cleanup")
 	}
-
-	// Create MVCC versions (non-critical but keeps history consistent)
-	tm.createMVCCVersions(txn, intents)
 
 	// Delete intents and CDC entries
 	if err := tm.metaStore.DeleteIntentsByTxn(txn.ID); err != nil {
@@ -483,22 +478,8 @@ func opCodeToStatementType(op uint8) protocol.StatementType {
 	}
 }
 
-// createMVCCVersions creates MVCC version records for committed data (for read history)
-// Non-critical but keeps history consistent for LWW conflict resolution
-func (tm *MVCCTransactionManager) createMVCCVersions(txn *MVCCTransaction, intents []*WriteIntentRecord) {
-	// Convert each write intent to MVCC version for read history
-	for _, intent := range intents {
-		err := tm.metaStore.CreateMVCCVersion(intent.TableName, intent.RowKey,
-			txn.CommitTS, txn.NodeID, txn.ID, intent.Operation, intent.DataSnapshot)
-		if err != nil {
-			// Log error but continue - this is async and non-critical
-			log.Error().Err(err).Uint64("txn_id", txn.ID).Msg("Failed to create MVCC version")
-		}
-	}
-}
-
 // AbortTransaction aborts the transaction and cleans up write intents
-func (tm *MVCCTransactionManager) AbortTransaction(txn *MVCCTransaction) error {
+func (tm *TransactionManager) AbortTransaction(txn *Transaction) error {
 	txn.mu.Lock()
 	defer txn.mu.Unlock()
 
@@ -524,7 +505,7 @@ func (tm *MVCCTransactionManager) AbortTransaction(txn *MVCCTransaction) error {
 
 // GetTransaction retrieves a transaction by ID from MetaStore
 // Returns nil if transaction doesn't exist or is not PENDING
-func (tm *MVCCTransactionManager) GetTransaction(txnID uint64) *MVCCTransaction {
+func (tm *TransactionManager) GetTransaction(txnID uint64) *Transaction {
 	rec, err := tm.metaStore.GetTransaction(txnID)
 	if err != nil || rec == nil {
 		return nil
@@ -535,8 +516,8 @@ func (tm *MVCCTransactionManager) GetTransaction(txnID uint64) *MVCCTransaction 
 		return nil
 	}
 
-	// Reconstruct MVCCTransaction from MetaStore record
-	txn := &MVCCTransaction{
+	// Reconstruct Transaction from MetaStore record
+	txn := &Transaction{
 		ID:     rec.TxnID,
 		NodeID: rec.NodeID,
 		StartTS: hlc.Timestamp{
@@ -553,7 +534,7 @@ func (tm *MVCCTransactionManager) GetTransaction(txnID uint64) *MVCCTransaction 
 
 // Heartbeat updates the last_heartbeat timestamp for a transaction
 // This keeps long-running transactions alive and prevents them from being garbage collected
-func (tm *MVCCTransactionManager) Heartbeat(txn *MVCCTransaction) error {
+func (tm *TransactionManager) Heartbeat(txn *Transaction) error {
 	txn.mu.Lock()
 	defer txn.mu.Unlock()
 
@@ -565,7 +546,7 @@ func (tm *MVCCTransactionManager) Heartbeat(txn *MVCCTransaction) error {
 }
 
 // StartGarbageCollection starts the background garbage collection goroutine
-func (tm *MVCCTransactionManager) StartGarbageCollection() {
+func (tm *TransactionManager) StartGarbageCollection() {
 	tm.mu.Lock()
 	if tm.gcRunning {
 		tm.mu.Unlock()
@@ -580,7 +561,7 @@ func (tm *MVCCTransactionManager) StartGarbageCollection() {
 
 // StopGarbageCollection stops the background garbage collection.
 // Safe to call multiple times.
-func (tm *MVCCTransactionManager) StopGarbageCollection() {
+func (tm *TransactionManager) StopGarbageCollection() {
 	tm.mu.Lock()
 	if !tm.gcRunning {
 		tm.mu.Unlock()
@@ -599,7 +580,7 @@ func (tm *MVCCTransactionManager) StopGarbageCollection() {
 }
 
 // gcLoop runs the garbage collection loop
-func (tm *MVCCTransactionManager) gcLoop() {
+func (tm *TransactionManager) gcLoop() {
 	ticker := time.NewTicker(tm.gcInterval)
 	defer ticker.Stop()
 
@@ -616,7 +597,7 @@ func (tm *MVCCTransactionManager) gcLoop() {
 // runGarbageCollection performs garbage collection in two phases:
 // Phase 1 (Critical): Cleanup stale transactions and orphaned intents - always runs
 // Phase 2 (Background): Cleanup old records and MVCC versions - skipped under load
-func (tm *MVCCTransactionManager) runGarbageCollection() {
+func (tm *TransactionManager) runGarbageCollection() {
 	// ====================
 	// PHASE 1: CRITICAL - Always runs
 	// ====================
@@ -634,7 +615,7 @@ func (tm *MVCCTransactionManager) runGarbageCollection() {
 	// ====================
 	// PHASE 2: BACKGROUND - Skipped under load
 	// ====================
-	// Cleanup old transaction records and MVCC versions.
+	// Cleanup old transaction records.
 	// This is non-critical and can be deferred when system is busy.
 	if tm.isMetaStoreBusy() {
 		log.Debug().Msg("GC Phase 2: Skipping - MetaStore under load")
@@ -647,27 +628,16 @@ func (tm *MVCCTransactionManager) runGarbageCollection() {
 		log.Error().Err(err).Msg("GC Phase 2: Failed to cleanup old transaction records")
 	}
 
-	// Clean up old MVCC versions (keep last N versions per row)
-	keepVersions := 10 // Default
-	if cfg.Config != nil {
-		keepVersions = cfg.Config.MVCC.VersionRetentionCount
-	}
-	oldVersionCount, err := tm.cleanupOldMVCCVersions(keepVersions)
-	if err != nil {
-		log.Error().Err(err).Msg("GC Phase 2: Failed to cleanup old MVCC versions")
-	}
-
-	if oldTxnCount > 0 || oldVersionCount > 0 {
+	if oldTxnCount > 0 {
 		log.Info().
 			Int("old_txn_records", oldTxnCount).
-			Int("old_mvcc_versions", oldVersionCount).
 			Msg("GC Phase 2: Cleaned up old data")
 	}
 }
 
 // isMetaStoreBusy checks if MetaStore batch channel is under pressure
 // Returns true if we should skip non-critical GC work
-func (tm *MVCCTransactionManager) isMetaStoreBusy() bool {
+func (tm *TransactionManager) isMetaStoreBusy() bool {
 	// Check if MetaStore supports load detection
 	if loadChecker, ok := tm.metaStore.(interface{ IsBusy() bool }); ok {
 		return loadChecker.IsBusy()
@@ -676,14 +646,14 @@ func (tm *MVCCTransactionManager) isMetaStoreBusy() bool {
 }
 
 // cleanupStaleTransactions aborts transactions that haven't had a heartbeat within the timeout
-func (tm *MVCCTransactionManager) cleanupStaleTransactions() (int, error) {
+func (tm *TransactionManager) cleanupStaleTransactions() (int, error) {
 	return tm.metaStore.CleanupStaleTransactions(tm.heartbeatTimeout)
 }
 
 // cleanupOldTransactionRecords removes old COMMITTED/ABORTED transaction records
 // with GC safe point coordination to prevent deleting logs needed by lagging peers
 // Uses belt-and-suspenders: both txn_id from anti-entropy and seq_num from gossip watermark
-func (tm *MVCCTransactionManager) cleanupOldTransactionRecords() (int, error) {
+func (tm *TransactionManager) cleanupOldTransactionRecords() (int, error) {
 	// Get GC safe points from both mechanisms
 	tm.mu.RLock()
 	getMinAppliedFn := tm.getMinAppliedTxnID
@@ -729,11 +699,6 @@ func (tm *MVCCTransactionManager) cleanupOldTransactionRecords() (int, error) {
 	return count, nil
 }
 
-// cleanupOldMVCCVersions removes old MVCC versions, keeping the latest N versions per row
-func (tm *MVCCTransactionManager) cleanupOldMVCCVersions(keepVersions int) (int, error) {
-	return tm.metaStore.CleanupOldMVCCVersions(keepVersions)
-}
-
 // SerializeData helper for data snapshots
 func SerializeData(data interface{}) ([]byte, error) {
 	return encoding.Marshal(data)
@@ -744,99 +709,9 @@ func DeserializeData(data []byte, v interface{}) error {
 	return encoding.Unmarshal(data, v)
 }
 
-// =======================
-// LWW CONFLICT RESOLUTION
-// =======================
-
-// ApplyDeltaWithLWW applies a delta change using Last-Writer-Wins based on HLC timestamps
-// This is used during partition healing to merge divergent writes
-// Returns: applied (bool), error
-func (tm *MVCCTransactionManager) ApplyDeltaWithLWW(tableName, rowKey string, sqlStmt string,
-	incomingTS hlc.Timestamp, txnID uint64) (bool, error) {
-
-	// Check the latest MVCC version for this row via MetaStore
-	existing, err := tm.metaStore.GetLatestVersion(tableName, rowKey)
-	if err != nil {
-		return false, fmt.Errorf("failed to check existing version: %w", err)
-	}
-
-	if existing == nil {
-		// No existing version - apply the change
-		return tm.applyDeltaChange(tableName, rowKey, sqlStmt, incomingTS, txnID)
-	}
-
-	existingTS := hlc.Timestamp{
-		WallTime: existing.TSWall,
-		Logical:  existing.TSLogical,
-		NodeID:   existing.NodeID,
-	}
-
-	// LWW: Compare timestamps
-	cmp := hlc.Compare(incomingTS, existingTS)
-	if cmp > 0 {
-		// Incoming is newer - apply the change
-		return tm.applyDeltaChange(tableName, rowKey, sqlStmt, incomingTS, txnID)
-	}
-	if cmp == 0 && incomingTS.NodeID > existingTS.NodeID {
-		// Tie-breaker: higher node ID wins
-		return tm.applyDeltaChange(tableName, rowKey, sqlStmt, incomingTS, txnID)
-	}
-
-	// Existing version is newer or same - skip
-	log.Debug().
-		Str("table", tableName).
-		Str("row", rowKey).
-		Int64("incoming_wall", incomingTS.WallTime).
-		Int64("existing_wall", existing.TSWall).
-		Msg("LWW: Skipping older delta change")
-	return false, nil
-}
-
-// applyDeltaChange executes the SQL and records the MVCC version
-func (tm *MVCCTransactionManager) applyDeltaChange(tableName, rowKey, sqlStmt string,
-	ts hlc.Timestamp, txnID uint64) (bool, error) {
-
-	// Execute the SQL statement on the user database
-	_, err := tm.db.Exec(sqlStmt)
-	if err != nil {
-		// Log but don't fail - row might not exist for UPDATE/DELETE
-		log.Debug().Err(err).Str("sql", sqlStmt).Msg("Delta change execution failed")
-	}
-
-	// Record MVCC version in MetaStore
-	err = tm.metaStore.CreateMVCCVersion(tableName, rowKey, ts, ts.NodeID, txnID, OpTypeDelta, nil)
-	if err != nil {
-		return false, fmt.Errorf("failed to record MVCC version: %w", err)
-	}
-
-	log.Debug().
-		Str("table", tableName).
-		Str("row", rowKey).
-		Int64("ts_wall", ts.WallTime).
-		Msg("LWW: Applied delta change")
-	return true, nil
-}
-
-// GetLatestVersion returns the latest MVCC version timestamp for a row
-func (tm *MVCCTransactionManager) GetLatestVersion(tableName, rowKey string) (*hlc.Timestamp, error) {
-	rec, err := tm.metaStore.GetLatestVersion(tableName, rowKey)
-	if err != nil {
-		return nil, err
-	}
-	if rec == nil {
-		return nil, nil
-	}
-
-	return &hlc.Timestamp{
-		WallTime: rec.TSWall,
-		Logical:  rec.TSLogical,
-		NodeID:   rec.NodeID,
-	}, nil
-}
-
 // writeCDCData writes CDC row data directly to the base table
 // This is the core CDC implementation - replicas receive row data, not SQL
-func (tm *MVCCTransactionManager) writeCDCData(stmt protocol.Statement) error {
+func (tm *TransactionManager) writeCDCData(stmt protocol.Statement) error {
 	switch stmt.Type {
 	case protocol.StatementInsert, protocol.StatementReplace:
 		return tm.writeCDCInsert(stmt.TableName, stmt.NewValues)
@@ -850,7 +725,7 @@ func (tm *MVCCTransactionManager) writeCDCData(stmt protocol.Statement) error {
 }
 
 // writeCDCInsert performs INSERT OR REPLACE using CDC row data
-func (tm *MVCCTransactionManager) writeCDCInsert(tableName string, newValues map[string][]byte) error {
+func (tm *TransactionManager) writeCDCInsert(tableName string, newValues map[string][]byte) error {
 	if len(newValues) == 0 {
 		return fmt.Errorf("no values to insert")
 	}
@@ -882,7 +757,7 @@ func (tm *MVCCTransactionManager) writeCDCInsert(tableName string, newValues map
 
 // writeCDCUpdate performs UPDATE using CDC row data
 // Uses oldValues for WHERE clause (to find existing row) and newValues for SET clause
-func (tm *MVCCTransactionManager) writeCDCUpdate(tableName string, oldValues, newValues map[string][]byte) error {
+func (tm *TransactionManager) writeCDCUpdate(tableName string, oldValues, newValues map[string][]byte) error {
 	if len(newValues) == 0 {
 		return fmt.Errorf("no values to update")
 	}
@@ -941,7 +816,7 @@ func (tm *MVCCTransactionManager) writeCDCUpdate(tableName string, oldValues, ne
 }
 
 // writeCDCDelete performs DELETE using CDC row data
-func (tm *MVCCTransactionManager) writeCDCDelete(tableName string, rowKey string, oldValues map[string][]byte) error {
+func (tm *TransactionManager) writeCDCDelete(tableName string, rowKey string, oldValues map[string][]byte) error {
 	if rowKey == "" {
 		return fmt.Errorf("empty row key for delete")
 	}

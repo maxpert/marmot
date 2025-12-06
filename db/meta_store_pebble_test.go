@@ -202,42 +202,6 @@ func TestPebbleMetaStoreWriteIntentConflict(t *testing.T) {
 	}
 }
 
-func TestPebbleMetaStoreMVCCVersions(t *testing.T) {
-	store, cleanup := createTestPebbleMetaStore(t)
-	defer cleanup()
-
-	clock := hlc.NewClock(1)
-	ts1 := clock.Now()
-	ts2 := clock.Now()
-	ts3 := clock.Now()
-
-	// Create multiple versions
-	store.CreateMVCCVersion("users", "user:1", ts1, 1, 100, OpTypeInsert, []byte(`{"name":"alice"}`))
-	store.CreateMVCCVersion("users", "user:1", ts2, 1, 101, OpTypeUpdate, []byte(`{"name":"alice2"}`))
-	store.CreateMVCCVersion("users", "user:1", ts3, 1, 102, OpTypeUpdate, []byte(`{"name":"alice3"}`))
-
-	// Get latest version
-	latest, err := store.GetLatestVersion("users", "user:1")
-	if err != nil {
-		t.Fatalf("GetLatestVersion failed: %v", err)
-	}
-	if latest == nil {
-		t.Fatal("Latest version not found")
-	}
-	if latest.TSWall != ts3.WallTime {
-		t.Errorf("Expected latest ts %d, got %d", ts3.WallTime, latest.TSWall)
-	}
-
-	// Count versions
-	count, err := store.GetMVCCVersionCount("users", "user:1")
-	if err != nil {
-		t.Fatalf("GetMVCCVersionCount failed: %v", err)
-	}
-	if count != 3 {
-		t.Errorf("Expected 3 versions, got %d", count)
-	}
-}
-
 func TestPebbleMetaStoreReplicationState(t *testing.T) {
 	store, cleanup := createTestPebbleMetaStore(t)
 	defer cleanup()
@@ -465,38 +429,6 @@ func TestPebbleMetaStoreDDLLock(t *testing.T) {
 	}
 	if !acquired {
 		t.Error("Second node should acquire lock after release")
-	}
-}
-
-func TestPebbleMetaStoreCleanupOldMVCCVersions(t *testing.T) {
-	store, cleanup := createTestPebbleMetaStore(t)
-	defer cleanup()
-
-	clock := hlc.NewClock(1)
-
-	// Create 5 versions
-	for i := 0; i < 5; i++ {
-		ts := clock.Now()
-		store.CreateMVCCVersion("users", "user:1", ts, 1, uint64(100+i), OpTypeUpdate, nil)
-	}
-
-	count, _ := store.GetMVCCVersionCount("users", "user:1")
-	if count != 5 {
-		t.Fatalf("Expected 5 versions, got %d", count)
-	}
-
-	// Keep only 2 versions
-	deleted, err := store.CleanupOldMVCCVersions(2)
-	if err != nil {
-		t.Fatalf("CleanupOldMVCCVersions failed: %v", err)
-	}
-	if deleted != 3 {
-		t.Errorf("Expected 3 deleted, got %d", deleted)
-	}
-
-	count, _ = store.GetMVCCVersionCount("users", "user:1")
-	if count != 2 {
-		t.Errorf("Expected 2 versions after cleanup, got %d", count)
 	}
 }
 

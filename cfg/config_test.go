@@ -26,11 +26,8 @@ func TestValidate_ValidConfig(t *testing.T) {
 			DefaultWriteConsist: "QUORUM",
 			DefaultReadConsist:  "LOCAL_ONE",
 		},
-		MVCC: MVCCConfiguration{
-			GCIntervalSeconds:       30,
-			GCRetentionHours:        1,
+		Transaction: TransactionConfiguration{
 			HeartbeatTimeoutSeconds: 10,
-			VersionRetentionCount:   10,
 			ConflictWindowSeconds:   10,
 		},
 		ConnectionPool: ConnectionPoolConfiguration{
@@ -415,11 +412,8 @@ func TestReplicaConfigValidation_ValidConfig(t *testing.T) {
 			DefaultWriteConsist: "QUORUM",
 			DefaultReadConsist:  "LOCAL_ONE",
 		},
-		MVCC: MVCCConfiguration{
-			GCIntervalSeconds:       30,
-			GCRetentionHours:        1,
+		Transaction: TransactionConfiguration{
 			HeartbeatTimeoutSeconds: 10,
-			VersionRetentionCount:   10,
 			ConflictWindowSeconds:   10,
 		},
 		ConnectionPool: ConnectionPoolConfiguration{

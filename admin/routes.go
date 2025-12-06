@@ -46,11 +46,6 @@ func RegisterRoutes(mux *http.ServeMux, handlers *AdminHandlers) {
 		r.Get("/intents/range", handlers.wrapWithMeta(handlers.handleIntentRange))
 		r.Get("/intents/{table}/{rowKey}", handlers.intentByKey)
 
-		// MVCC
-		r.Get("/mvcc/{table}/{rowKey}/latest", handlers.mvccLatest)
-		r.Get("/mvcc/{table}/{rowKey}/history", handlers.mvccHistory)
-		r.Get("/mvcc/{table}/{rowKey}/count", handlers.mvccCount)
-
 		// CDC
 		r.Get("/cdc/entries/{txnID}", handlers.cdcEntries)
 		r.Get("/cdc/range", handlers.wrapWithMeta(handlers.handleCDCRange))
@@ -158,43 +153,6 @@ func (h *AdminHandlers) intentByKey(w http.ResponseWriter, r *http.Request) {
 	table := chi.URLParam(r, "table")
 	rowKey := chi.URLParam(r, "rowKey")
 	h.handleIntent(w, r, metaStore, table, rowKey)
-}
-
-// MVCC handlers
-func (h *AdminHandlers) mvccLatest(w http.ResponseWriter, r *http.Request) {
-	database := chi.URLParam(r, "database")
-	metaStore, err := h.getMetaStore(database)
-	if err != nil {
-		writeErrorResponse(w, http.StatusNotFound, err.Error())
-		return
-	}
-	table := chi.URLParam(r, "table")
-	rowKey := chi.URLParam(r, "rowKey")
-	h.handleMVCCVersion(w, r, metaStore, table, rowKey)
-}
-
-func (h *AdminHandlers) mvccHistory(w http.ResponseWriter, r *http.Request) {
-	database := chi.URLParam(r, "database")
-	metaStore, err := h.getMetaStore(database)
-	if err != nil {
-		writeErrorResponse(w, http.StatusNotFound, err.Error())
-		return
-	}
-	table := chi.URLParam(r, "table")
-	rowKey := chi.URLParam(r, "rowKey")
-	h.handleMVCCHistory(w, r, metaStore, table, rowKey)
-}
-
-func (h *AdminHandlers) mvccCount(w http.ResponseWriter, r *http.Request) {
-	database := chi.URLParam(r, "database")
-	metaStore, err := h.getMetaStore(database)
-	if err != nil {
-		writeErrorResponse(w, http.StatusNotFound, err.Error())
-		return
-	}
-	table := chi.URLParam(r, "table")
-	rowKey := chi.URLParam(r, "rowKey")
-	h.handleMVCCVersionCount(w, r, metaStore, table, rowKey)
 }
 
 // CDC handlers

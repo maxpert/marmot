@@ -13,18 +13,16 @@ node_id = 0  # 0 = auto-generate
 data_dir = "./marmot-data"
 ```
 
-## MVCC Transaction Manager
+## Transaction Manager
 
 ```toml
-[mvcc]
-gc_interval_seconds = 30        # Garbage collection interval
-gc_retention_hours = 1          # Deprecated: Use replication.gc_min_retention_hours instead
+[transaction]
 heartbeat_timeout_seconds = 10  # Transaction timeout without heartbeat
-version_retention_count = 10    # MVCC versions to keep per row
-conflict_window_seconds = 10    # LWW conflict resolution window
+conflict_window_seconds = 10    # Conflict resolution window
+lock_wait_timeout_seconds = 50  # Lock wait timeout (MySQL: innodb_lock_wait_timeout)
 ```
 
-**Note**: GC retention is now managed by the replication configuration to coordinate with anti-entropy. The `gc_retention_hours` setting is deprecated in favor of `replication.gc_min_retention_hours` and `replication.gc_max_retention_hours`.
+**Note**: Transaction log garbage collection is managed by the replication configuration to coordinate with anti-entropy. See `replication.gc_min_retention_hours` and `replication.gc_max_retention_hours`.
 
 ## Connection Pool
 

@@ -8,8 +8,10 @@ require (
 	github.com/cockroachdb/pebble v1.1.5
 	github.com/denisbrodbeck/machineid v1.0.1
 	github.com/doug-martin/goqu/v9 v9.18.0
+	github.com/go-chi/chi/v5 v5.2.3
 	github.com/go-sql-driver/mysql v1.7.2-0.20231213112541-0004702b931d
 	github.com/hashicorp/golang-lru/v2 v2.0.7
+	github.com/linvon/cuckoo-filter v0.4.0
 	github.com/mattn/go-sqlite3 v1.14.18
 	github.com/prometheus/client_golang v1.23.2
 	github.com/rqlite/sql v0.0.0-20251114131613-ef07423e7137
@@ -34,7 +36,6 @@ require (
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
 	github.com/dgryski/go-metro v0.0.0-20200812162917-85c65e2d0165 // indirect
 	github.com/getsentry/sentry-go v0.27.0 // indirect
-	github.com/go-chi/chi/v5 v5.2.3 // indirect
 	github.com/gogo/protobuf v1.3.2 // indirect
 	github.com/golang/glog v1.2.5 // indirect
 	github.com/golang/snappy v1.0.0 // indirect
@@ -42,7 +43,6 @@ require (
 	github.com/kr/pretty v0.3.1 // indirect
 	github.com/kr/text v0.2.0 // indirect
 	github.com/lib/pq v1.10.4 // indirect
-	github.com/linvon/cuckoo-filter v0.4.0 // indirect
 	github.com/mattn/go-colorable v0.1.14 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect

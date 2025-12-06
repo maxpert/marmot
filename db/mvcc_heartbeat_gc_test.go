@@ -14,7 +14,7 @@ func TestHeartbeat(t *testing.T) {
 	testDB := setupTestDBWithMeta(t)
 
 	clock := hlc.NewClock(1)
-	tm := NewMVCCTransactionManager(testDB.DB, testDB.MetaStore, clock)
+	tm := NewTransactionManager(testDB.DB, testDB.MetaStore, clock)
 	defer tm.StopGarbageCollection()
 
 	// Begin transaction
@@ -57,7 +57,7 @@ func TestHeartbeatKeepsTransactionAlive(t *testing.T) {
 	clock := hlc.NewClock(1)
 
 	// Create transaction manager with very short timeout for faster testing
-	tm := NewMVCCTransactionManager(testDB.DB, testDB.MetaStore, clock)
+	tm := NewTransactionManager(testDB.DB, testDB.MetaStore, clock)
 	tm.heartbeatTimeout = 200 * time.Millisecond // Short timeout for testing
 	tm.StartGarbageCollection()
 	defer tm.StopGarbageCollection()
@@ -134,7 +134,7 @@ func TestStaleTransactionCleanup(t *testing.T) {
 	clock := hlc.NewClock(1)
 
 	// Create transaction manager with short timeout
-	tm := NewMVCCTransactionManager(testDB.DB, testDB.MetaStore, clock)
+	tm := NewTransactionManager(testDB.DB, testDB.MetaStore, clock)
 	tm.heartbeatTimeout = 100 * time.Millisecond
 	tm.StartGarbageCollection()
 	defer tm.StopGarbageCollection()
@@ -192,7 +192,7 @@ func TestOldTransactionRecordCleanup(t *testing.T) {
 	testDB := setupTestDBWithMeta(t)
 
 	clock := hlc.NewClock(1)
-	tm := NewMVCCTransactionManager(testDB.DB, testDB.MetaStore, clock)
+	tm := NewTransactionManager(testDB.DB, testDB.MetaStore, clock)
 	defer tm.StopGarbageCollection()
 
 	createUserTable(t, testDB.DB)
@@ -239,7 +239,7 @@ func TestOldMVCCVersionCleanup(t *testing.T) {
 	testDB := setupTestDBWithMeta(t)
 
 	clock := hlc.NewClock(1)
-	tm := NewMVCCTransactionManager(testDB.DB, testDB.MetaStore, clock)
+	tm := NewTransactionManager(testDB.DB, testDB.MetaStore, clock)
 	defer tm.StopGarbageCollection()
 
 	createUserTable(t, testDB.DB)
@@ -271,27 +271,19 @@ func TestOldMVCCVersionCleanup(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 
-	t.Log("✓ Created 15 MVCC versions for users:1")
+	t.Log("✓ Created 15 transactions for users:1")
 
-	// Verify we have 15 versions in MetaStore
-	versionCount := countMVCCVersionsMeta(t, testDB.MetaStore, "users", "1")
-	if versionCount != 15 {
-		t.Errorf("Expected 15 versions, found %d", versionCount)
+	// Verify latest value
+	var balance int
+	err := testDB.DB.QueryRow("SELECT balance FROM users WHERE id = 1").Scan(&balance)
+	assertNoError(t, err, "Failed to query final balance")
+
+	expectedBalance := 100 + (14 * 10) // Last transaction
+	if balance != expectedBalance {
+		t.Errorf("Expected final balance %d, got %d", expectedBalance, balance)
 	}
 
-	// Run GC to keep only last 10 versions
-	cleanedCount, err := tm.cleanupOldMVCCVersions(10)
-	assertNoError(t, err, "cleanupOldMVCCVersions failed")
-
-	t.Logf("GC cleaned up %d old MVCC versions", cleanedCount)
-
-	// Verify only 10 versions remain in MetaStore
-	versionCount = countMVCCVersionsMeta(t, testDB.MetaStore, "users", "1")
-	if versionCount != 10 {
-		t.Errorf("Expected 10 versions after GC, found %d", versionCount)
-	}
-
-	t.Log("✓ Old MVCC versions cleaned up, keeping last 10")
+	t.Log("✓ Transaction history verified")
 }
 
 // TestGarbageCollectionIntegration tests the full GC lifecycle
@@ -300,7 +292,7 @@ func TestGarbageCollectionIntegration(t *testing.T) {
 
 	clock := hlc.NewClock(1)
 
-	tm := NewMVCCTransactionManager(testDB.DB, testDB.MetaStore, clock)
+	tm := NewTransactionManager(testDB.DB, testDB.MetaStore, clock)
 	tm.heartbeatTimeout = 100 * time.Millisecond
 	tm.StartGarbageCollection()
 	defer tm.StopGarbageCollection()

@@ -119,12 +119,9 @@ type PrometheusConfiguration struct {
 	Enabled bool `toml:"enabled"`
 }
 
-// MVCCConfiguration controls MVCC transaction manager behavior
-type MVCCConfiguration struct {
-	GCIntervalSeconds       int `toml:"gc_interval_seconds"`       // How often to run garbage collection
-	GCRetentionHours        int `toml:"gc_retention_hours"`        // How long to keep old transaction records
+// TransactionConfiguration controls transaction manager behavior
+type TransactionConfiguration struct {
 	HeartbeatTimeoutSeconds int `toml:"heartbeat_timeout_seconds"` // Transaction timeout without heartbeat
-	VersionRetentionCount   int `toml:"version_retention_count"`   // How many MVCC versions to keep per row
 	ConflictWindowSeconds   int `toml:"conflict_window_seconds"`   // LWW conflict resolution window
 	LockWaitTimeoutSeconds  int `toml:"lock_wait_timeout_seconds"` // How long to wait for locks (MySQL: innodb_lock_wait_timeout)
 }
@@ -193,7 +190,7 @@ type Configuration struct {
 	Snapshot       SnapshotConfiguration       `toml:"snapshot"`
 	Cluster        ClusterConfiguration        `toml:"cluster"`
 	Replication    ReplicationConfiguration    `toml:"replication"`
-	MVCC           MVCCConfiguration           `toml:"mvcc"`
+	Transaction    TransactionConfiguration    `toml:"transaction"`
 	MetaStore      MetaStoreConfiguration      `toml:"metastore"`
 	ConnectionPool ConnectionPoolConfiguration `toml:"connection_pool"`
 	GRPCClient     GRPCClientConfiguration     `toml:"grpc_client"`
@@ -264,11 +261,8 @@ var Config = &Configuration{
 		GCMaxRetentionHours:       24,    // 24 hours - 24x delta threshold (like Cassandra's 10-day gc_grace)
 	},
 
-	MVCC: MVCCConfiguration{
-		GCIntervalSeconds:       30, // Run GC every 30 seconds
-		GCRetentionHours:        1,  // Keep transaction records for 1 hour
+	Transaction: TransactionConfiguration{
 		HeartbeatTimeoutSeconds: 10, // Timeout transactions after 10s without heartbeat
-		VersionRetentionCount:   10, // Keep last 10 MVCC versions per row
 		ConflictWindowSeconds:   10, // 10 second window for LWW conflict resolution
 		LockWaitTimeoutSeconds:  50, // MySQL default: innodb_lock_wait_timeout
 	},
@@ -445,25 +439,18 @@ func Validate() error {
 		return fmt.Errorf("invalid read consistency: %s", Config.Replication.DefaultReadConsist)
 	}
 
-	// Validate MVCC configuration
-	if Config.MVCC.GCIntervalSeconds < 1 {
-		return fmt.Errorf("MVCC GC interval must be >= 1 second")
+	// Validate transaction configuration
+	if Config.Transaction.HeartbeatTimeoutSeconds < 1 {
+		return fmt.Errorf("transaction heartbeat timeout must be >= 1 second")
 	}
 
-	if Config.MVCC.GCRetentionHours < 0 {
-		return fmt.Errorf("MVCC GC retention hours must be >= 0")
+	if Config.Transaction.ConflictWindowSeconds < 0 {
+		return fmt.Errorf("transaction conflict window must be >= 0")
 	}
 
-	if Config.MVCC.HeartbeatTimeoutSeconds < 1 {
-		return fmt.Errorf("MVCC heartbeat timeout must be >= 1 second")
-	}
-
-	if Config.MVCC.VersionRetentionCount < 1 {
-		return fmt.Errorf("MVCC version retention count must be >= 1")
-	}
-
-	if Config.MVCC.ConflictWindowSeconds < 0 {
-		return fmt.Errorf("MVCC conflict window must be >= 0")
+	// Set LockWaitTimeoutSeconds default if not configured
+	if Config.Transaction.LockWaitTimeoutSeconds == 0 {
+		Config.Transaction.LockWaitTimeoutSeconds = 50 // MySQL default: innodb_lock_wait_timeout
 	}
 
 	// Set MetaStore (PebbleDB) defaults if not configured

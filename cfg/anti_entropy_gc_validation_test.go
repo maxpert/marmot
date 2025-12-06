@@ -114,11 +114,8 @@ func TestValidate_AntiEntropyGCAlignment(t *testing.T) {
 					GCMinRetentionHours:       tt.gcMinRetentionHours,
 					GCMaxRetentionHours:       tt.gcMaxRetentionHours,
 				},
-				MVCC: MVCCConfiguration{
-					GCIntervalSeconds:       30,
-					GCRetentionHours:        1,
+				Transaction: TransactionConfiguration{
 					HeartbeatTimeoutSeconds: 10,
-					VersionRetentionCount:   10,
 					ConflictWindowSeconds:   10,
 				},
 				ConnectionPool: ConnectionPoolConfiguration{
