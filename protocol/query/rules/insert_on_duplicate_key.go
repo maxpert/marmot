@@ -1,3 +1,9 @@
+// Package rules implements MySQL to SQLite transpilation rules.
+//
+// Each rule transforms MySQL-specific syntax to SQLite-compatible equivalents:
+//   - InsertOnDuplicateKeyRule: ON DUPLICATE KEY UPDATE → ON CONFLICT DO UPDATE
+//   - DeleteWithJoinRule: DELETE with JOIN → rowid-based subquery DELETE
+//   - UpdateWithJoinRule: UPDATE with JOIN → correlated subquery UPDATE
 package rules
 
 import (

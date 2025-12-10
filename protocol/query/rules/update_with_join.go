@@ -137,7 +137,7 @@ func (r *UpdateWithJoinRule) buildSetClause(exprs sqlparser.UpdateExprs, targetT
 		colName := expr.Name.Name.String()
 
 		if r.needsSubquery(expr.Expr, targetAlias) {
-			subquery := r.buildCorrelatedSubquery(expr.Expr, tableExprs, where, targetAlias)
+			subquery := r.buildCorrelatedSubquery(expr.Expr, tableExprs, where, targetAlias, targetTable)
 			setParts = append(setParts, fmt.Sprintf("%s = (%s)", colName, subquery))
 		} else {
 			setParts = append(setParts, fmt.Sprintf("%s = %s", colName, sqlparser.String(expr.Expr)))
@@ -164,7 +164,7 @@ func (r *UpdateWithJoinRule) needsSubquery(expr sqlparser.Expr, targetAlias stri
 	return hasOtherTable
 }
 
-func (r *UpdateWithJoinRule) buildCorrelatedSubquery(expr sqlparser.Expr, tableExprs sqlparser.TableExprs, where *sqlparser.Where, targetAlias string) string {
+func (r *UpdateWithJoinRule) buildCorrelatedSubquery(expr sqlparser.Expr, tableExprs sqlparser.TableExprs, where *sqlparser.Where, targetAlias, targetTable string) string {
 	var sb strings.Builder
 
 	sb.WriteString("SELECT ")
@@ -185,7 +185,6 @@ func (r *UpdateWithJoinRule) buildCorrelatedSubquery(expr sqlparser.Expr, tableE
 		sb.WriteString(" AND ")
 	}
 
-	targetTable, _, _ := r.extractTargetTable(&sqlparser.Update{TableExprs: tableExprs})
 	sb.WriteString(targetAlias)
 	sb.WriteString(".rowid = ")
 	sb.WriteString(targetTable)
