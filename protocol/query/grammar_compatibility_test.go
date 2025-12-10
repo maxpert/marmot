@@ -350,13 +350,12 @@ func TestMySQLInsertVariations(t *testing.T) {
 			shouldParse: true,
 		},
 
-		// INSERT ... ON DUPLICATE KEY UPDATE - VITESS LIMITATION
+		// INSERT ... ON DUPLICATE KEY UPDATE - Now supported via transpiler rule
 		{
 			name:        "INSERT ON DUPLICATE KEY UPDATE",
 			sql:         "INSERT INTO users (id, name, count) VALUES (1, 'Alice', 1) ON DUPLICATE KEY UPDATE count = count + 1",
 			wantType:    StatementInsert,
-			shouldParse: false,
-			limitation:  "VITESS: ON DUPLICATE KEY UPDATE not supported",
+			shouldParse: true,
 		},
 
 		// INSERT with modifiers - VITESS LIMITATION
@@ -512,13 +511,12 @@ func TestMySQLUpdateVariations(t *testing.T) {
 			shouldParse: true, // CDC validation moved to runtime hooks
 		},
 
-		// UPDATE with JOIN - VITESS LIMITATION
+		// UPDATE with JOIN - Supported via UpdateWithJoinRule
 		{
 			name:        "UPDATE with INNER JOIN",
 			sql:         "UPDATE users u INNER JOIN orders o ON u.id = o.user_id SET u.last_order = o.created_at WHERE o.status = 'completed'",
 			wantType:    StatementUpdate,
-			shouldParse: false,
-			limitation:  "VITESS: UPDATE with JOIN syntax not supported",
+			shouldParse: true,
 		},
 		{
 			name:        "UPDATE multi-table",
@@ -632,13 +630,12 @@ func TestMySQLDeleteVariations(t *testing.T) {
 			limitation:  "VITESS: DELETE with USING syntax not supported",
 		},
 
-		// DELETE with JOIN - VITESS LIMITATION
+		// DELETE with JOIN - TRANSPILED (Vitess doesn't support, but we transform it)
 		{
 			name:        "DELETE with JOIN",
 			sql:         "DELETE u FROM users u JOIN banned_users b ON u.id = b.user_id",
 			wantType:    StatementDelete,
-			shouldParse: false,
-			limitation:  "VITESS: DELETE with JOIN syntax not supported",
+			shouldParse: true,
 		},
 
 		// DELETE multi-table - VITESS LIMITATION

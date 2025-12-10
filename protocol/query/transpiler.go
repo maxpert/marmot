@@ -34,9 +34,12 @@ func NewTranspiler(cacheSize int, idGen id.Generator) (*Transpiler, error) {
 	ruleSet := RuleSet{
 		&rules.IntToBigintRule{}, // Priority 4: Transform INT AUTO_INCREMENT → BIGINT
 		&rules.CreateTableRule{},
+		&rules.InsertOnDuplicateKeyRule{}, // Priority 6: Transform ON DUPLICATE KEY UPDATE → ON CONFLICT DO UPDATE
 		&rules.TransactionSyntaxRule{},
 		&rules.InsertIgnoreRule{},
 		&rules.ReplaceIntoRule{},
+		&rules.DeleteWithJoinRule{}, // Priority 12: Transform DELETE with JOIN → DELETE with subquery
+		&rules.UpdateWithJoinRule{}, // Priority 13: Transform UPDATE with JOIN → UPDATE with subquery
 		&rules.IndexHintsRule{},
 		&rules.SelectModifiersRule{},
 		&rules.LockingRule{},
