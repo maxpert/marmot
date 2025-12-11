@@ -27,7 +27,10 @@ usage() {
     echo -e "${BOLD}Commands:${NC}"
     echo "  up        Start the WordPress + Marmot stack (default)"
     echo "  down      Stop and remove all containers and volumes"
+    echo "  reset     Full reset: remove containers, volumes, and images"
     echo "  logs      Show logs from all containers"
+    echo "  debug     Show WordPress PHP debug.log"
+    echo "  debug-f   Tail WordPress PHP debug.log (follow)"
     echo "  status    Show container status"
     echo "  help      Show this help message"
     echo ""
@@ -89,9 +92,29 @@ stop_stack() {
     echo -e "${GREEN}Stack stopped and cleaned up successfully${NC}"
 }
 
+reset_stack() {
+    print_banner
+    check_docker
+    echo -e "${YELLOW}Full reset: removing containers, volumes, and local images...${NC}"
+    docker compose down -v --rmi local 2>/dev/null || true
+    echo -e "${GREEN}Full reset complete. Next 'up' will rebuild from scratch.${NC}"
+}
+
 show_logs() {
     check_docker
     docker compose logs -f
+}
+
+show_debug_log() {
+    check_docker
+    echo -e "${BOLD}WordPress PHP Debug Log:${NC}"
+    docker exec wordpress cat /var/www/html/wp-content/debug.log 2>/dev/null || echo -e "${YELLOW}No debug.log yet (will appear after first PHP error)${NC}"
+}
+
+tail_debug_log() {
+    check_docker
+    echo -e "${BOLD}Tailing WordPress PHP Debug Log (Ctrl+C to stop):${NC}"
+    docker exec wordpress tail -f /var/www/html/wp-content/debug.log 2>/dev/null || echo -e "${YELLOW}No debug.log yet${NC}"
 }
 
 show_status() {
@@ -156,8 +179,17 @@ case "${1:-up}" in
     down|stop)
         stop_stack
         ;;
+    reset)
+        reset_stack
+        ;;
     logs)
         show_logs
+        ;;
+    debug)
+        show_debug_log
+        ;;
+    debug-f)
+        tail_debug_log
         ;;
     status)
         show_status

@@ -208,6 +208,11 @@ port = 3307
 # Maximum concurrent MySQL connections
 max_connections = 1000
 
+# Auto-increment ID generation mode
+# "compact" (default) = 53-bit IDs safe for JavaScript (Number.MAX_SAFE_INTEGER)
+# "extended" = 64-bit HLC-based IDs for maximum uniqueness
+auto_id_mode = "compact"
+
 # ==============================================================================
 # SNAPSHOT (Not yet implemented)
 # ==============================================================================

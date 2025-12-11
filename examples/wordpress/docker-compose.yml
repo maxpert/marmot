@@ -50,8 +50,12 @@ services:
       WORDPRESS_DB_NAME: wordpress
       WORDPRESS_DEBUG: 1
       WORDPRESS_CONFIG_EXTRA: |
+        define('WP_DEBUG', true);
         define('WP_DEBUG_LOG', true);
         define('WP_DEBUG_DISPLAY', true);
+        define('SCRIPT_DEBUG', true);
+        @ini_set('display_errors', 1);
+        @ini_set('error_reporting', E_ALL);
     volumes:
       - wordpress-data:/var/www/html
     networks:

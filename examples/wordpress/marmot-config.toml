@@ -52,6 +52,7 @@ enabled = true
 bind_address = "0.0.0.0"
 port = 3316
 max_connections = 100
+auto_id_mode = "compact"
 
 [metastore]
 cache_size_mb = 64
