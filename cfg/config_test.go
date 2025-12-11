@@ -105,6 +105,31 @@ func TestValidate_InvalidMySQLPort(t *testing.T) {
 	}
 }
 
+func TestValidate_InvalidAutoIDMode(t *testing.T) {
+	original := Config
+	defer func() { Config = original }()
+
+	Config = &Configuration{
+		Cluster: ClusterConfiguration{
+			GRPCPort: 8080,
+		},
+		MySQL: MySQLConfiguration{
+			Enabled:    true,
+			Port:       3306,
+			AutoIDMode: "invalid",
+		},
+		Replication: ReplicationConfiguration{
+			DefaultWriteConsist: "QUORUM",
+			DefaultReadConsist:  "LOCAL_ONE",
+		},
+	}
+
+	err := Validate()
+	if err == nil {
+		t.Error("Expected error for invalid auto_id_mode")
+	}
+}
+
 func TestValidate_InvalidWriteConsistency(t *testing.T) {
 	original := Config
 	defer func() { Config = original }()

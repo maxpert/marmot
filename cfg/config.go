@@ -105,6 +105,7 @@ type MySQLConfiguration struct {
 	BindAddress    string `toml:"bind_address"`
 	Port           int    `toml:"port"`
 	MaxConnections int    `toml:"max_connections"`
+	AutoIDMode     string `toml:"auto_id_mode"` // "compact" (default, 53-bit) or "extended" (64-bit)
 }
 
 // LoggingConfiguration controls logging behavior
@@ -306,6 +307,7 @@ var Config = &Configuration{
 		BindAddress:    "0.0.0.0",
 		Port:           3306,
 		MaxConnections: 1000,
+		AutoIDMode:     "compact", // Default to compact 53-bit IDs
 	},
 
 	Logging: LoggingConfiguration{
@@ -423,6 +425,11 @@ func Validate() error {
 
 	if Config.MySQL.Enabled && (Config.MySQL.Port < 1 || Config.MySQL.Port > 65535) {
 		return fmt.Errorf("invalid MySQL port: %d", Config.MySQL.Port)
+	}
+
+	// Validate auto_id_mode
+	if Config.MySQL.AutoIDMode != "" && Config.MySQL.AutoIDMode != "compact" && Config.MySQL.AutoIDMode != "extended" {
+		return fmt.Errorf("invalid auto_id_mode: %q (must be \"compact\" or \"extended\")", Config.MySQL.AutoIDMode)
 	}
 
 	// Validate consistency levels

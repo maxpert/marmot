@@ -320,7 +320,14 @@ func main() {
 	)
 
 	// Initialize query pipeline with configured values and ID generator
-	idGen := id.NewHLCGenerator(clock)
+	var idGen id.Generator
+	if cfg.Config.MySQL.AutoIDMode == "extended" {
+		log.Info().Msg("Using extended 64-bit ID generation")
+		idGen = id.NewHLCGenerator(clock)
+	} else {
+		log.Info().Msg("Using compact 53-bit ID generation")
+		idGen = id.NewCompactGenerator(cfg.Config.NodeID)
+	}
 	if err := protocol.InitializePipeline(
 		cfg.Config.QueryPipeline.TranspilerCacheSize,
 		cfg.Config.QueryPipeline.ValidatorPoolSize,
