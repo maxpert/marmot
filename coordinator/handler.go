@@ -44,6 +44,46 @@ type CDCEntry struct {
 	NewValues map[string][]byte
 }
 
+// CDCMergeResult holds merged CDC data from preupdate hooks.
+type CDCMergeResult struct {
+	TableName string
+	RowKey    string
+	OldValues map[string][]byte
+	NewValues map[string][]byte
+}
+
+// MergeCDCEntries merges CDC entries captured by preupdate hooks.
+// For UPSERT (INSERT OR REPLACE), SQLite fires DELETE then INSERT hooks.
+// This function combines them to get complete old/new values.
+//
+// CRITICAL CONTRACT:
+//   - TableName is ALWAYS extracted from entries (hooks capture it)
+//   - Never rely on parsed SQL for TableName with CDC data
+//   - See TestMergeCDCEntries_TableNameRequired for enforcement
+func MergeCDCEntries(entries []CDCEntry) CDCMergeResult {
+	result := CDCMergeResult{
+		OldValues: make(map[string][]byte),
+		NewValues: make(map[string][]byte),
+	}
+
+	for _, e := range entries {
+		if result.RowKey == "" {
+			result.RowKey = e.RowKey
+		}
+		if result.TableName == "" {
+			result.TableName = e.Table
+		}
+		for k, v := range e.OldValues {
+			result.OldValues[k] = v
+		}
+		for k, v := range e.NewValues {
+			result.NewValues[k] = v
+		}
+	}
+
+	return result
+}
+
 // PendingExecution represents a locally executed transaction waiting for quorum
 type PendingExecution interface {
 	GetRowCounts() map[string]int64
@@ -375,29 +415,16 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, consistency
 			// Hooks capture actual row data; AST parsing can't handle parameterized queries
 			cdcEntries := pendingExec.GetCDCEntries()
 			if len(statements) == 1 && len(cdcEntries) > 0 {
-				// For UPSERT (INSERT OR REPLACE) on existing rows, SQLite fires 2 hooks:
-				// - DELETE (OldValues filled, NewValues empty)
-				// - INSERT (OldValues empty, NewValues filled)
-				// Merge all entries to get both OldValues and NewValues
-				mergedOldValues := make(map[string][]byte)
-				mergedNewValues := make(map[string][]byte)
-				var rowKey string
+				// CRITICAL: Use MergeCDCEntries to ensure TableName is always extracted.
+				// TableName comes from CDC hooks - AST parsing cannot reliably extract it.
+				merged := MergeCDCEntries(cdcEntries)
 
-				for _, e := range cdcEntries {
-					if rowKey == "" {
-						rowKey = e.RowKey
-					}
-					for k, v := range e.OldValues {
-						mergedOldValues[k] = v
-					}
-					for k, v := range e.NewValues {
-						mergedNewValues[k] = v
-					}
+				if statements[0].TableName == "" && merged.TableName != "" {
+					statements[0].TableName = merged.TableName
 				}
-
-				statements[0].RowKey = rowKey
-				statements[0].OldValues = mergedOldValues
-				statements[0].NewValues = mergedNewValues
+				statements[0].RowKey = merged.RowKey
+				statements[0].OldValues = merged.OldValues
+				statements[0].NewValues = merged.NewValues
 			}
 		}
 	}
@@ -835,37 +862,15 @@ func (h *CoordinatorHandler) handleCommit(session *protocol.ConnectionSession) (
 			// Extract CDC data and merge into statement
 			cdcEntries := pendingExec.GetCDCEntries()
 			if len(cdcEntries) > 0 {
-				// For UPSERT (INSERT OR REPLACE) on existing rows, SQLite fires 2 hooks:
-				// - DELETE (OldValues filled, NewValues empty)
-				// - INSERT (OldValues empty, NewValues filled)
-				// Merge all entries to get both OldValues and NewValues
-				mergedOldValues := make(map[string][]byte)
-				mergedNewValues := make(map[string][]byte)
-				var rowKey string
-				var tableName string
+				// CRITICAL: Use MergeCDCEntries to ensure TableName is always extracted.
+				merged := MergeCDCEntries(cdcEntries)
 
-				for _, e := range cdcEntries {
-					if rowKey == "" {
-						rowKey = e.RowKey
-					}
-					if tableName == "" {
-						tableName = e.Table
-					}
-					for k, v := range e.OldValues {
-						mergedOldValues[k] = v
-					}
-					for k, v := range e.NewValues {
-						mergedNewValues[k] = v
-					}
+				if stmt.TableName == "" && merged.TableName != "" {
+					stmt.TableName = merged.TableName
 				}
-
-				// Copy TableName from CDC if stmt doesn't have it (SQLite dialect bypass)
-				if stmt.TableName == "" && tableName != "" {
-					stmt.TableName = tableName
-				}
-				stmt.RowKey = rowKey
-				stmt.OldValues = mergedOldValues
-				stmt.NewValues = mergedNewValues
+				stmt.RowKey = merged.RowKey
+				stmt.OldValues = merged.OldValues
+				stmt.NewValues = merged.NewValues
 			}
 		}
 		enrichedStatements = append(enrichedStatements, stmt)
