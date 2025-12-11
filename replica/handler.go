@@ -151,6 +151,7 @@ func (h *ReadOnlyHandler) handleSystemQuery(session *protocol.ConnectionSession,
 		VersionComment: "Marmot Read-Only Replica",
 		ConnID:         session.ConnID,
 		CurrentDB:      session.CurrentDatabase,
+		FoundRowsCount: session.FoundRowsCount.Load(),
 	}
 	return handlers.HandleSystemVariableQuery(stmt, config)
 }

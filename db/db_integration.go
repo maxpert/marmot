@@ -16,8 +16,8 @@ import (
 // Ensure PendingLocalExecution implements coordinator.PendingExecution
 var _ coordinator.PendingExecution = (*PendingLocalExecution)(nil)
 
-// MVCCDatabase wraps a SQL database with MVCC transaction support
-// This is the main integration point between application layer and MVCC storage
+// MVCCDatabase wraps a SQL database with distributed transaction support
+// This is the main integration point between application layer and transactional storage
 //
 // SQLite WAL mode allows ONE writer + MANY concurrent readers.
 // We maintain separate connection pools:
@@ -42,7 +42,7 @@ type MVCCDatabase struct {
 // This is injected from the coordinator layer
 type ReplicationFunc func(ctx context.Context, txn *Transaction) error
 
-// NewMVCCDatabase creates a new MVCC-enabled database
+// NewMVCCDatabase creates a new transaction-enabled database
 // metaStore is the MetaStore for storing transaction metadata (intent entries, txn records, etc.)
 func NewMVCCDatabase(dbPath string, nodeID uint64, clock *hlc.Clock, metaStore MetaStore) (*MVCCDatabase, error) {
 	// Get timeout from config (LockWaitTimeoutSeconds is in seconds, SQLite needs milliseconds)
@@ -78,7 +78,7 @@ func NewMVCCDatabase(dbPath string, nodeID uint64, clock *hlc.Clock, metaStore M
 	}
 
 	var err error
-	writeDB, err = sql.Open("sqlite3", writeDSN)
+	writeDB, err = sql.Open(SQLiteDriverName, writeDSN)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open write database: %w", err)
 	}
@@ -93,7 +93,7 @@ func NewMVCCDatabase(dbPath string, nodeID uint64, clock *hlc.Clock, metaStore M
 	// This connection is acquired during ExecuteLocalWithHooks, captures CDC,
 	// then releases BEFORE 2PC broadcast - avoiding deadlock with incoming commits.
 	hookDSN := writeDSN // Same settings as write connection
-	hookDB, err = sql.Open("sqlite3", hookDSN)
+	hookDB, err = sql.Open(SQLiteDriverName, hookDSN)
 	if err != nil {
 		closeAll()
 		return nil, fmt.Errorf("failed to open hook database: %w", err)
@@ -115,7 +115,7 @@ func NewMVCCDatabase(dbPath string, nodeID uint64, clock *hlc.Clock, metaStore M
 		}
 	}
 
-	readDB, err = sql.Open("sqlite3", readDSN)
+	readDB, err = sql.Open(SQLiteDriverName, readDSN)
 	if err != nil {
 		closeAll()
 		return nil, fmt.Errorf("failed to open read database: %w", err)
@@ -198,7 +198,7 @@ func (mdb *MVCCDatabase) GetReadDB() *sql.DB {
 	return mdb.readDB
 }
 
-// GetTransactionManager returns the MVCC transaction manager
+// GetTransactionManager returns the transaction manager
 func (mdb *MVCCDatabase) GetTransactionManager() *TransactionManager {
 	return mdb.txnMgr
 }
@@ -278,7 +278,7 @@ func (mdb *MVCCDatabase) OpenSQLiteConnections(dbPath string) error {
 
 	// Open write connection
 	writeDSN := fmt.Sprintf("%s?_journal_mode=WAL&_busy_timeout=%d&_txlock=immediate", dbPath, busyTimeoutMS)
-	writeDB, err := sql.Open("sqlite3", writeDSN)
+	writeDB, err := sql.Open(SQLiteDriverName, writeDSN)
 	if err != nil {
 		return fmt.Errorf("failed to open write connection: %w", err)
 	}
@@ -293,7 +293,7 @@ func (mdb *MVCCDatabase) OpenSQLiteConnections(dbPath string) error {
 	}
 
 	// Open hook connection
-	hookDB, err := sql.Open("sqlite3", writeDSN)
+	hookDB, err := sql.Open(SQLiteDriverName, writeDSN)
 	if err != nil {
 		writeDB.Close()
 		return fmt.Errorf("failed to open hook connection: %w", err)
@@ -304,7 +304,7 @@ func (mdb *MVCCDatabase) OpenSQLiteConnections(dbPath string) error {
 
 	// Open read connection pool
 	readDSN := fmt.Sprintf("%s?_journal_mode=WAL&_busy_timeout=%d", dbPath, busyTimeoutMS)
-	readDB, err := sql.Open("sqlite3", readDSN)
+	readDB, err := sql.Open(SQLiteDriverName, readDSN)
 	if err != nil {
 		writeDB.Close()
 		hookDB.Close()
@@ -415,7 +415,7 @@ func (c *CompletedLocalExecution) GetTotalRowCount() int64 {
 }
 
 // GetKeyHashes returns XXH64 hashes of affected row keys per table
-// Returns nil for tables that exceed maxRows (signals MVCC fallback)
+// Returns nil for tables that exceed maxRows (signals fallback to full table scan)
 func (c *CompletedLocalExecution) GetKeyHashes(maxRows int) map[string][]uint64 {
 	if maxRows <= 0 {
 		return c.keyHashes
@@ -587,14 +587,14 @@ func (mdb *MVCCDatabase) ExecuteLocalWithHooks(ctx context.Context, txnID uint64
 
 	// Begin transaction on hookDB
 	if err := session.BeginTx(ctx); err != nil {
-		session.Rollback()
+		_ = session.Rollback()
 		return nil, fmt.Errorf("failed to begin transaction: %w", err)
 	}
 
 	// Execute each statement - hooks capture CDC to MetaStore
 	for _, stmt := range statements {
 		if err := session.ExecContext(ctx, stmt.SQL); err != nil {
-			session.Rollback()
+			_ = session.Rollback()
 			return nil, fmt.Errorf("failed to execute statement: %w", err)
 		}
 	}
@@ -620,7 +620,7 @@ func (mdb *MVCCDatabase) ExecuteLocalWithHooks(ctx context.Context, txnID uint64
 	}, nil
 }
 
-// ExecuteTransaction executes a transaction with MVCC semantics
+// ExecuteTransaction executes a transaction with distributed transaction semantics
 // This is the main entry point for application-level transactions
 func (mdb *MVCCDatabase) ExecuteTransaction(ctx context.Context, statements []protocol.Statement) error {
 	// Begin transaction
@@ -632,7 +632,7 @@ func (mdb *MVCCDatabase) ExecuteTransaction(ctx context.Context, statements []pr
 	// Add all statements
 	for _, stmt := range statements {
 		if err := mdb.txnMgr.AddStatement(txn, stmt); err != nil {
-			mdb.txnMgr.AbortTransaction(txn)
+			_ = mdb.txnMgr.AbortTransaction(txn)
 			return fmt.Errorf("failed to add statement: %w", err)
 		}
 
@@ -645,13 +645,13 @@ func (mdb *MVCCDatabase) ExecuteTransaction(ctx context.Context, statements []pr
 			"timestamp": txn.StartTS.WallTime,
 		})
 		if serErr != nil {
-			mdb.txnMgr.AbortTransaction(txn)
+			_ = mdb.txnMgr.AbortTransaction(txn)
 			return fmt.Errorf("failed to serialize data: %w", serErr)
 		}
 
 		err := mdb.txnMgr.WriteIntent(txn, IntentTypeDML, stmt.TableName, rowKey, stmt, dataSnapshot)
 		if err != nil {
-			mdb.txnMgr.AbortTransaction(txn)
+			_ = mdb.txnMgr.AbortTransaction(txn)
 			return fmt.Errorf("write conflict: %w", err)
 		}
 	}
@@ -659,21 +659,21 @@ func (mdb *MVCCDatabase) ExecuteTransaction(ctx context.Context, statements []pr
 	// Replicate to other nodes if replication is configured
 	if mdb.replicationFn != nil {
 		if err := mdb.replicationFn(ctx, txn); err != nil {
-			mdb.txnMgr.AbortTransaction(txn)
+			_ = mdb.txnMgr.AbortTransaction(txn)
 			return fmt.Errorf("replication failed: %w", err)
 		}
 	}
 
 	// Commit transaction
 	if err := mdb.txnMgr.CommitTransaction(txn); err != nil {
-		mdb.txnMgr.AbortTransaction(txn)
+		_ = mdb.txnMgr.AbortTransaction(txn)
 		return fmt.Errorf("failed to commit: %w", err)
 	}
 
 	return nil
 }
 
-// ExecuteQuery executes a read query with MVCC snapshot isolation
+// ExecuteQuery executes a read query with snapshot isolation
 // Uses the read connection pool for concurrent read access
 func (mdb *MVCCDatabase) ExecuteQuery(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error) {
 	// Get current snapshot timestamp
@@ -687,12 +687,12 @@ func (mdb *MVCCDatabase) ExecuteQuery(ctx context.Context, query string, args ..
 	}
 
 	// Note: snapshotTS is captured but SQLite's WAL mode provides snapshot isolation
-	// at the transaction level. For full MVCC with write intents, use ExecuteMVCCRead.
+	// at the transaction level. For full transaction support with write intents, use ExecuteMVCCRead.
 	_ = snapshotTS
 	return rows, nil
 }
 
-// ExecuteMVCCRead executes a read query with full MVCC support
+// ExecuteMVCCRead executes a read query with full transactional support
 // Uses rqlite/sql AST parser for proper SQL analysis
 // Uses the read connection pool for concurrent read access
 func (mdb *MVCCDatabase) ExecuteMVCCRead(ctx context.Context, query string, args ...interface{}) ([]string, []map[string]interface{}, error) {
@@ -732,13 +732,13 @@ func (mdb *MVCCDatabase) ExecuteMVCCRead(ctx context.Context, query string, args
 	return columns, results, nil
 }
 
-// ExecuteQueryRow executes a single-row query with MVCC snapshot isolation
+// ExecuteQueryRow executes a single-row query with snapshot isolation
 // Uses the read connection pool for concurrent read access
 func (mdb *MVCCDatabase) ExecuteQueryRow(ctx context.Context, query string, args ...interface{}) *sql.Row {
 	// Get current snapshot timestamp
 	// Note: SQLite's WAL mode provides snapshot isolation at transaction level.
-	// For structured queries requiring full MVCC with write intent checking,
-	// use ExecuteMVCCRead instead which handles version resolution.
+	// For structured queries requiring full transaction support with write intent checking,
+	// use ExecuteMVCCRead instead.
 	snapshotTS := mdb.clock.Now()
 	_ = snapshotTS
 

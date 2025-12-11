@@ -11,7 +11,7 @@ import (
 	"github.com/maxpert/marmot/protocol"
 )
 
-// Helper to create MVCCDatabase with MetaStore for testing
+// Helper to create database with MetaStore for testing
 func createTestMVCCDatabase(t *testing.T, dbPath string) (*MVCCDatabase, MetaStore) {
 	t.Helper()
 
@@ -34,7 +34,7 @@ func createTestMVCCDatabase(t *testing.T, dbPath string) (*MVCCDatabase, MetaSto
 	mdb, err := NewMVCCDatabase(dbPath, 1, clock, metaStore)
 	if err != nil {
 		metaStore.Close()
-		t.Fatalf("Failed to create MVCC database: %v", err)
+		t.Fatalf("Failed to create database: %v", err)
 	}
 
 	t.Cleanup(func() {
@@ -75,7 +75,7 @@ func TestMVCCDatabase_Creation(t *testing.T) {
 		t.Fatalf("GetMaxSeqNum failed: %v", err)
 	}
 
-	t.Log("✓ MVCC database created with functional MetaStore")
+	t.Log("✓ Database created with functional MetaStore")
 }
 
 func TestMVCCDatabase_SimpleTransaction(t *testing.T) {
@@ -178,8 +178,8 @@ func TestMVCCDatabase_ConflictDetection(t *testing.T) {
 	t.Logf("✓ Conflict detected: %v", err)
 
 	// Cleanup
-	mdb.GetTransactionManager().AbortTransaction(txn1)
-	mdb.GetTransactionManager().AbortTransaction(txn2)
+	_ = mdb.GetTransactionManager().AbortTransaction(txn1)
+	_ = mdb.GetTransactionManager().AbortTransaction(txn2)
 }
 
 func TestMVCCDatabase_Query(t *testing.T) {
@@ -251,7 +251,7 @@ func TestMVCCDatabase_GetTransaction(t *testing.T) {
 	t.Logf("✓ Transaction %d retrieved successfully", txn.ID)
 
 	// Abort transaction
-	mdb.GetTransactionManager().AbortTransaction(txn)
+	_ = mdb.GetTransactionManager().AbortTransaction(txn)
 
 	// Verify transaction is removed from active set
 	retrievedTxn = mdb.GetTransactionManager().GetTransaction(txn.ID)
@@ -406,7 +406,7 @@ func TestMVCCDatabase_Close(t *testing.T) {
 	mdb, err := NewMVCCDatabase(dbPath, 1, clock, metaStore)
 	if err != nil {
 		metaStore.Close()
-		t.Fatalf("Failed to create MVCC database: %v", err)
+		t.Fatalf("Failed to create database: %v", err)
 	}
 
 	// Start GC to verify it gets stopped
@@ -460,7 +460,7 @@ func TestMVCCDatabase_CloseMultipleTimes(t *testing.T) {
 	mdb, err := NewMVCCDatabase(dbPath, 1, clock, metaStore)
 	if err != nil {
 		metaStore.Close()
-		t.Fatalf("Failed to create MVCC database: %v", err)
+		t.Fatalf("Failed to create database: %v", err)
 	}
 
 	// Start GC

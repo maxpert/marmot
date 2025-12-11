@@ -94,7 +94,7 @@ func TestTransaction_AddStatement(t *testing.T) {
 	}
 
 	// Try adding after commit
-	txn.Commit()
+	_ = txn.Commit()
 	err = txn.AddStatement(stmt)
 	if err == nil {
 		t.Error("Should not be able to add statement after commit")
@@ -127,7 +127,7 @@ func TestTransaction_Rollback(t *testing.T) {
 		SQL:  "INSERT INTO users VALUES (1, 'Alice')",
 		Type: StatementInsert,
 	}
-	txn.AddStatement(stmt)
+	_ = txn.AddStatement(stmt)
 
 	err := txn.Rollback()
 	if err != nil {
@@ -178,7 +178,7 @@ func TestTransaction_HasWrites(t *testing.T) {
 	}
 
 	// Add SELECT statement
-	txn.AddStatement(Statement{
+	_ = txn.AddStatement(Statement{
 		SQL:  "SELECT * FROM users",
 		Type: StatementSelect,
 	})
@@ -188,7 +188,7 @@ func TestTransaction_HasWrites(t *testing.T) {
 	}
 
 	// Add INSERT statement
-	txn.AddStatement(Statement{
+	_ = txn.AddStatement(Statement{
 		SQL:  "INSERT INTO users VALUES (1, 'Alice')",
 		Type: StatementInsert,
 	})
@@ -204,8 +204,8 @@ func TestTransaction_GetStatements(t *testing.T) {
 	stmt1 := Statement{SQL: "INSERT INTO users VALUES (1, 'Alice')", Type: StatementInsert}
 	stmt2 := Statement{SQL: "UPDATE users SET name = 'Bob'", Type: StatementUpdate}
 
-	txn.AddStatement(stmt1)
-	txn.AddStatement(stmt2)
+	_ = txn.AddStatement(stmt1)
+	_ = txn.AddStatement(stmt2)
 
 	stmts := txn.GetStatements()
 
@@ -233,7 +233,7 @@ func TestTransaction_ConcurrentAccess(t *testing.T) {
 					SQL:  "INSERT INTO users VALUES (?, ?)",
 					Type: StatementInsert,
 				}
-				txn.AddStatement(stmt)
+				_ = txn.AddStatement(stmt)
 			}
 			done <- true
 		}(i)
@@ -259,7 +259,7 @@ func BenchmarkTransaction_AddStatement(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		txn.AddStatement(stmt)
+		_ = txn.AddStatement(stmt)
 	}
 }
 
@@ -268,7 +268,7 @@ func BenchmarkTransaction_GetStatements(b *testing.B) {
 
 	// Pre-populate
 	for i := 0; i < 100; i++ {
-		txn.AddStatement(Statement{
+		_ = txn.AddStatement(Statement{
 			SQL:  "INSERT INTO users VALUES (?, ?)",
 			Type: StatementInsert,
 		})

@@ -208,6 +208,13 @@ func classifyStatement(ctx *QueryContext, stmt sqlparser.Statement) {
 	case *sqlparser.UnlockTables:
 		ctx.StatementType = StatementLock
 
+	case *sqlparser.ExplainTab:
+		ctx.StatementType = StatementShowColumns
+		ctx.TableName = parsed.Table.Name.String()
+		if parsed.Table.Qualifier.NotEmpty() {
+			ctx.Database = parsed.Table.Qualifier.String()
+		}
+
 	case *sqlparser.Union:
 		// Union queries - check left side for special detection
 		// System vars/virtual tables in unions are rare edge cases
@@ -288,7 +295,8 @@ func extractVarsFromExpr(expr sqlparser.Expr) []string {
 		if funcName == "DATABASE" || funcName == "SCHEMA" ||
 			funcName == "VERSION" || funcName == "USER" ||
 			funcName == "CURRENT_USER" || funcName == "SESSION_USER" ||
-			funcName == "SYSTEM_USER" || funcName == "CONNECTION_ID" {
+			funcName == "SYSTEM_USER" || funcName == "CONNECTION_ID" ||
+			funcName == "FOUND_ROWS" {
 			vars = append(vars, funcName+"()")
 		}
 	case *sqlparser.BinaryExpr:

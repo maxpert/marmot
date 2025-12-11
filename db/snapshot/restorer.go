@@ -205,7 +205,9 @@ func (r *Restorer) processChunk(chunk *Chunk, tempDir string, openFiles map[stri
 
 	// Close file if this is the last chunk
 	if chunk.IsLastForFile {
-		file.Sync() // Ensure data is flushed
+		if err := file.Sync(); err != nil {
+			return 0, false, fmt.Errorf("failed to sync file: %w", err)
+		}
 		file.Close()
 		delete(openFiles, sanitizedFilename)
 		log.Debug().Str("file", sanitizedFilename).Msg("Finished downloading file")

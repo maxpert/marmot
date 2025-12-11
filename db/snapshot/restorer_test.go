@@ -72,19 +72,6 @@ func calculateSHA256(content []byte) string {
 	return hex.EncodeToString(h[:])
 }
 
-func calculateFileSHA256CreateTempFile(t *testing.T, content []byte) (string, string) {
-	t.Helper()
-	tmpFile := filepath.Join(t.TempDir(), "temp.db")
-	if err := os.WriteFile(tmpFile, content, 0644); err != nil {
-		t.Fatalf("failed to write temp file: %v", err)
-	}
-	hash, err := CalculateFileSHA256(tmpFile)
-	if err != nil {
-		t.Fatalf("failed to calculate hash: %v", err)
-	}
-	return hash, tmpFile
-}
-
 func TestRestorer_NewRestorer(t *testing.T) {
 	r := NewRestorer("/tmp/test", nil)
 	if r.dataDir != "/tmp/test" {
@@ -478,15 +465,15 @@ func TestRestorer_RemovesOldWALAndSHM(t *testing.T) {
 
 	// Create existing db files with WAL and SHM
 	dbDir := filepath.Join(tmpDir, "databases")
-	os.MkdirAll(dbDir, 0755)
+	_ = os.MkdirAll(dbDir, 0755)
 
 	dbFile := filepath.Join(dbDir, "test.db")
 	walFile := filepath.Join(dbDir, "test.db-wal")
 	shmFile := filepath.Join(dbDir, "test.db-shm")
 
-	os.WriteFile(dbFile, []byte("old content"), 0644)
-	os.WriteFile(walFile, []byte("old wal"), 0644)
-	os.WriteFile(shmFile, []byte("old shm"), 0644)
+	_ = os.WriteFile(dbFile, []byte("old content"), 0644)
+	_ = os.WriteFile(walFile, []byte("old wal"), 0644)
+	_ = os.WriteFile(shmFile, []byte("old shm"), 0644)
 
 	r := NewRestorer(tmpDir, nil)
 

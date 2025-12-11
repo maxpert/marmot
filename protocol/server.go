@@ -9,6 +9,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/protocol/query"
@@ -65,6 +66,12 @@ type ConnectionSession struct {
 	// Transaction state for explicit BEGIN/COMMIT
 	activeTxn   *SessionTransaction
 	activeTxnMu sync.Mutex
+
+	// FoundRowsCount stores the value returned by FOUND_ROWS().
+	// Updated after every SELECT:
+	// - With SQL_CALC_FOUND_ROWS: total rows without LIMIT (from COUNT(*) OVER())
+	// - Without hint: number of rows returned
+	FoundRowsCount atomic.Int64
 }
 
 // InTransaction returns true if session has an active explicit transaction

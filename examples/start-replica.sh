@@ -94,7 +94,6 @@ default_read_consistency = "LOCAL_ONE"
 gc_interval_seconds = 30
 gc_retention_hours = 1
 heartbeat_timeout_seconds = 10
-version_retention_count = 10
 conflict_window_seconds = 10
 
 [logging]

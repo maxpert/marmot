@@ -243,9 +243,9 @@ func TestListDatabases(t *testing.T) {
 	}
 
 	// Create more databases
-	dm.CreateDatabase("db1")
-	dm.CreateDatabase("db2")
-	dm.CreateDatabase("db3")
+	_ = dm.CreateDatabase("db1")
+	_ = dm.CreateDatabase("db2")
+	_ = dm.CreateDatabase("db3")
 
 	dbs = dm.ListDatabases()
 	if len(dbs) != 4 {
@@ -276,8 +276,8 @@ func TestDatabasePersistence(t *testing.T) {
 		t.Fatalf("Failed to create DatabaseManager: %v", err)
 	}
 
-	dm1.CreateDatabase("persistent1")
-	dm1.CreateDatabase("persistent2")
+	_ = dm1.CreateDatabase("persistent1")
+	_ = dm1.CreateDatabase("persistent2")
 
 	dbs1 := dm1.ListDatabases()
 	dm1.Close()
@@ -345,8 +345,8 @@ func TestDatabaseIsolation(t *testing.T) {
 	defer dm.Close()
 
 	// Create two databases
-	dm.CreateDatabase("db1")
-	dm.CreateDatabase("db2")
+	_ = dm.CreateDatabase("db1")
+	_ = dm.CreateDatabase("db2")
 
 	db1, _ := dm.GetDatabase("db1")
 	db2, _ := dm.GetDatabase("db2")

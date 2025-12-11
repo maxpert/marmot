@@ -94,9 +94,10 @@ var globalPipeline *query.Pipeline
 
 // InitializePipeline initializes the global query processing pipeline.
 // idGen is optional - if nil, auto-increment ID injection is disabled.
+// Note: poolSize parameter is deprecated (validator removed) and ignored.
 func InitializePipeline(cacheSize, poolSize int, idGen id.Generator) error {
 	var err error
-	globalPipeline, err = query.NewPipeline(cacheSize, poolSize, idGen)
+	globalPipeline, err = query.NewPipeline(cacheSize, idGen)
 	return err
 }
 
@@ -155,6 +156,63 @@ func ParseStatementWithSchema(sql string, schemaLookup SchemaLookupFunc) Stateme
 	}
 
 	return stmt
+}
+
+// ParseStatementsWithSchema parses a SQL statement and returns all transpiled statements.
+// For DDL that generates multiple statements (e.g., CREATE TABLE with KEY definitions),
+// each generated statement becomes a separate Statement in the slice.
+// These should be added to the same transaction for atomic execution.
+func ParseStatementsWithSchema(sql string, schemaLookup SchemaLookupFunc) []Statement {
+	ctx := query.NewContext(sql, nil)
+	ctx.SchemaLookup = schemaLookup
+
+	if err := globalPipeline.Process(ctx); err != nil {
+		log.Debug().
+			Err(err).
+			Str("sql_prefix", truncateSQLForLog(sql, 80)).
+			Msg("PARSE: Pipeline processing failed")
+		return []Statement{{
+			SQL:   sql,
+			Type:  StatementUnsupported,
+			Error: err.Error(),
+		}}
+	}
+
+	// If there are no transpiled statements, return single statement
+	if len(ctx.TranspiledStatements) == 0 {
+		return []Statement{buildStatement(*ctx, ctx.TranspiledSQL)}
+	}
+
+	// Create a Statement for each transpiled statement
+	stmts := make([]Statement, 0, len(ctx.TranspiledStatements))
+	for _, ts := range ctx.TranspiledStatements {
+		stmts = append(stmts, buildStatement(*ctx, ts.SQL))
+	}
+	return stmts
+}
+
+// buildStatement creates a Statement from context with specified SQL
+func buildStatement(ctx query.QueryContext, sql string) Statement {
+	return Statement{
+		SQL:       sql,
+		Type:      mapQueryTypeToProtocolType(ctx.StatementType),
+		TableName: ctx.TableName,
+		Database:  ctx.Database,
+		Error: func() string {
+			if ctx.ValidationErr != nil {
+				return ctx.ValidationErr.Error()
+			}
+			return ""
+		}(),
+		ISFilter: InformationSchemaFilter{
+			SchemaName: ctx.ISFilter.SchemaName,
+			TableName:  ctx.ISFilter.TableName,
+			ColumnName: ctx.ISFilter.ColumnName,
+		},
+		ISTableType:      InformationSchemaTableType(ctx.ISTableType),
+		VirtualTableType: VirtualTableType(ctx.VirtualTableType),
+		SystemVarNames:   ctx.SystemVarNames,
+	}
 }
 
 // mapQueryTypeToProtocolType converts query.StatementType to protocol.StatementType

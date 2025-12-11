@@ -9,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3" // SQLite driver
 	"github.com/maxpert/marmot/cfg"
 	"github.com/maxpert/marmot/db"
 	"github.com/maxpert/marmot/db/snapshot"
@@ -319,7 +318,7 @@ func (c *CatchUpClient) GetLocalMaxTxnID(ctx context.Context) (map[string]uint64
 	// Use config timeout (in seconds) converted to milliseconds
 	busyTimeoutMS := cfg.Config.Transaction.LockWaitTimeoutSeconds * 1000
 	dsn := fmt.Sprintf("%s?_journal_mode=WAL&_busy_timeout=%d&mode=ro", systemDBPath, busyTimeoutMS)
-	systemDB, err := sql.Open("sqlite3", dsn)
+	systemDB, err := sql.Open(db.SQLiteDriverName, dsn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open system database: %w", err)
 	}

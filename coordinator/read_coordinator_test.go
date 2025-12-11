@@ -157,14 +157,14 @@ func TestLocalSnapshotRead(t *testing.T) {
 	os.Remove(dbPath)
 	defer os.Remove(dbPath)
 
-	db, err := sql.Open("sqlite3", dbPath)
+	testDB, err := sql.Open("sqlite3", dbPath)
 	if err != nil {
 		t.Fatalf("Failed to open database: %v", err)
 	}
-	defer db.Close()
+	defer testDB.Close()
 
 	// Create test table
-	_, err = db.Exec(`
+	_, err = testDB.Exec(`
 		CREATE TABLE users (
 			id INTEGER PRIMARY KEY,
 			name TEXT,
@@ -177,7 +177,7 @@ func TestLocalSnapshotRead(t *testing.T) {
 	}
 
 	// Insert test data
-	_, err = db.Exec(`INSERT INTO users (id, name, email, balance) VALUES (?, ?, ?, ?)`,
+	_, err = testDB.Exec(`INSERT INTO users (id, name, email, balance) VALUES (?, ?, ?, ?)`,
 		1, "Alice", "alice@example.com", 100)
 	if err != nil {
 		t.Fatalf("Failed to insert data: %v", err)
@@ -187,7 +187,7 @@ func TestLocalSnapshotRead(t *testing.T) {
 	snapshotTS := clock.Now()
 
 	// Execute snapshot read
-	resp, err := LocalSnapshotRead(db, snapshotTS, "users",
+	resp, err := LocalSnapshotRead(testDB, snapshotTS, "users",
 		"SELECT id, name, email, balance FROM users WHERE id = ?",
 		[]interface{}{1})
 
@@ -217,14 +217,14 @@ func TestLocalSnapshotRead_NoRows(t *testing.T) {
 	os.Remove(dbPath)
 	defer os.Remove(dbPath)
 
-	db, err := sql.Open("sqlite3", dbPath)
+	testDB, err := sql.Open("sqlite3", dbPath)
 	if err != nil {
 		t.Fatalf("Failed to open database: %v", err)
 	}
-	defer db.Close()
+	defer testDB.Close()
 
 	// Create test table (empty)
-	_, err = db.Exec(`
+	_, err = testDB.Exec(`
 		CREATE TABLE users (
 			id INTEGER PRIMARY KEY,
 			name TEXT,
@@ -240,7 +240,7 @@ func TestLocalSnapshotRead_NoRows(t *testing.T) {
 	snapshotTS := clock.Now()
 
 	// Execute snapshot read on empty table
-	resp, err := LocalSnapshotRead(db, snapshotTS, "users",
+	resp, err := LocalSnapshotRead(testDB, snapshotTS, "users",
 		"SELECT id, name, email, balance FROM users WHERE id = ?",
 		[]interface{}{999})
 

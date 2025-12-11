@@ -1,0 +1,65 @@
+services:
+  marmot:
+    build:
+      context: ../..
+      dockerfile: examples/wordpress/Dockerfile
+    container_name: marmot
+    ports:
+      - "3307:3307"
+      - "8081:8081"
+    volumes:
+      - ./marmot-config.toml:/app/config.toml:ro
+      - marmot-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8081/metrics"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - marmot-net
+
+  init-db:
+    image: mysql:8.4
+    container_name: init-db
+    depends_on:
+      marmot:
+        condition: service_healthy
+    entrypoint:
+      [
+        "sh",
+        "-c",
+        "mysql -h marmot -P 3307 -u root -e 'CREATE DATABASE IF NOT EXISTS wordpress;'",
+      ]
+    networks:
+      - marmot-net
+    restart: "no"
+
+  wordpress:
+    image: wordpress:latest
+    container_name: wordpress
+    depends_on:
+      init-db:
+        condition: service_completed_successfully
+    ports:
+      - "8080:80"
+    environment:
+      WORDPRESS_DB_HOST: marmot:3307
+      WORDPRESS_DB_USER: root
+      WORDPRESS_DB_PASSWORD: ""
+      WORDPRESS_DB_NAME: wordpress
+      WORDPRESS_DEBUG: 1
+      WORDPRESS_CONFIG_EXTRA: |
+        define('WP_DEBUG_LOG', true);
+        define('WP_DEBUG_DISPLAY', true);
+    volumes:
+      - wordpress-data:/var/www/html
+    networks:
+      - marmot-net
+
+volumes:
+  marmot-data:
+  wordpress-data:
+
+networks:
+  marmot-net:
+    driver: bridge

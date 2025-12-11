@@ -12,6 +12,7 @@ type SystemVarConfig struct {
 	VersionComment string // e.g., "Marmot" or "Marmot Read-Only Replica"
 	ConnID         uint64 // Session connection ID
 	CurrentDB      string // Current database name
+	FoundRowsCount int64  // Number of rows found by last SELECT (for FOUND_ROWS())
 }
 
 // HandleSystemVariableQuery handles system variable queries using parsed Statement
@@ -143,6 +144,8 @@ func getSystemVariableValueByName(varName string, config SystemVarConfig) interf
 		return config.ConnID
 	case "USER()", "CURRENT_USER()", "SESSION_USER()", "SYSTEM_USER()":
 		return "root@localhost"
+	case "FOUND_ROWS()":
+		return config.FoundRowsCount
 	default:
 		// Unknown variable - return empty string
 		return ""

@@ -610,9 +610,13 @@ func (dm *DatabaseManager) ImportExistingDatabases(importDir string) (int, error
 			continue
 		}
 
-		// Copy WAL and SHM files if they exist
-		copyFile(srcPath+"-wal", dstPath+"-wal")
-		copyFile(srcPath+"-shm", dstPath+"-shm")
+		// Copy WAL and SHM files if they exist (ignore errors if files don't exist)
+		if err := copyFile(srcPath+"-wal", dstPath+"-wal"); err != nil && !os.IsNotExist(err) {
+			log.Warn().Err(err).Str("name", dbName).Msg("Failed to copy WAL file")
+		}
+		if err := copyFile(srcPath+"-shm", dstPath+"-shm"); err != nil && !os.IsNotExist(err) {
+			log.Warn().Err(err).Str("name", dbName).Msg("Failed to copy SHM file")
+		}
 
 		// Create MetaStore for this imported database
 		metaStore, err := NewMetaStore(dstPath)

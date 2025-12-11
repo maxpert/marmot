@@ -145,8 +145,8 @@ func (f *IntentFilter) TxnCount() int {
 // Combines table name and row key to avoid cross-table collisions.
 func ComputeIntentHash(table, rowKey string) uint64 {
 	h := xxhash.New()
-	h.WriteString(table)
-	h.WriteString(":")
-	h.WriteString(rowKey)
+	_, _ = h.WriteString(table)
+	_, _ = h.WriteString(":")
+	_, _ = h.WriteString(rowKey)
 	return h.Sum64()
 }

@@ -4,8 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"math"
 	"reflect"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -13,6 +15,7 @@ import (
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/protocol"
 	"github.com/maxpert/marmot/protocol/handlers"
+	"github.com/maxpert/marmot/protocol/query/transform"
 	"github.com/maxpert/marmot/telemetry"
 	"github.com/rs/zerolog/log"
 )
@@ -268,7 +271,13 @@ func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, qu
 		return h.handleMutation(stmt, consistency)
 	}
 
-	return h.handleRead(stmt, consistency)
+	rs, err := h.handleRead(stmt, consistency)
+	if err != nil {
+		return nil, err
+	}
+	// Update session.FoundRowsCount for FOUND_ROWS() support
+	h.processFoundRowsResult(session, rs)
+	return rs, nil
 }
 
 func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, consistency protocol.ConsistencyLevel) (*protocol.ResultSet, error) {
@@ -553,12 +562,69 @@ func (h *CoordinatorHandler) handleRead(stmt protocol.Statement, consistency pro
 	return rs, nil
 }
 
+// processFoundRowsResult handles FOUND_ROWS() support by:
+// 1. Detecting __marmot_found_rows column (from SQL_CALC_FOUND_ROWS transformation)
+// 2. Extracting the count value and storing in session.FoundRowsCount
+// 3. Stripping the internal column from the result
+// 4. For regular SELECTs, storing len(rows) as FoundRowsCount
+func (h *CoordinatorHandler) processFoundRowsResult(session *protocol.ConnectionSession, rs *protocol.ResultSet) {
+	if rs == nil {
+		return
+	}
+
+	// Check for __marmot_found_rows column (appended by SQL_CALC_FOUND_ROWS transformation)
+	foundRowsColIdx := -1
+	for i, col := range rs.Columns {
+		if col.Name == transform.FoundRowsColumnName {
+			foundRowsColIdx = i
+			break
+		}
+	}
+
+	if foundRowsColIdx >= 0 && len(rs.Rows) > 0 {
+		// Extract count from first row's __marmot_found_rows column
+		if val := rs.Rows[0][foundRowsColIdx]; val != nil {
+			switch v := val.(type) {
+			case int64:
+				session.FoundRowsCount.Store(v)
+			case int:
+				session.FoundRowsCount.Store(int64(v))
+			case float64:
+				// Check for overflow before converting
+				if v > float64(math.MaxInt64) || v < float64(math.MinInt64) {
+					session.FoundRowsCount.Store(0)
+				} else {
+				session.FoundRowsCount.Store(int64(v))
+				}
+			case string:
+				if parsed, err := strconv.ParseInt(v, 10, 64); err == nil {
+					session.FoundRowsCount.Store(parsed)
+				}
+			case []byte:
+				if parsed, err := strconv.ParseInt(string(v), 10, 64); err == nil {
+					session.FoundRowsCount.Store(parsed)
+				}
+			}
+		}
+
+		// Strip the __marmot_found_rows column from results
+		rs.Columns = append(rs.Columns[:foundRowsColIdx], rs.Columns[foundRowsColIdx+1:]...)
+		for i := range rs.Rows {
+			rs.Rows[i] = append(rs.Rows[i][:foundRowsColIdx], rs.Rows[i][foundRowsColIdx+1:]...)
+		}
+	} else {
+		// Regular SELECT: store row count as FOUND_ROWS() value
+		session.FoundRowsCount.Store(int64(len(rs.Rows)))
+	}
+}
+
 func (h *CoordinatorHandler) handleSystemQuery(session *protocol.ConnectionSession, stmt protocol.Statement) (*protocol.ResultSet, error) {
 	config := handlers.SystemVarConfig{
 		ReadOnly:       false,
 		VersionComment: "Marmot",
 		ConnID:         session.ConnID,
 		CurrentDB:      session.CurrentDatabase,
+		FoundRowsCount: session.FoundRowsCount.Load(),
 	}
 	return handlers.HandleSystemVariableQuery(stmt, config)
 }

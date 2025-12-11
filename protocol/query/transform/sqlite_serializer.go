@@ -84,6 +84,12 @@ func (s *SQLiteSerializer) nodeFormatter(buf *sqlparser.TrackedBuffer, node sqlp
 			buf.WriteString(" DESC")
 		}
 		// Don't write ASC explicitly as it's the default
+	case *sqlparser.CountStar:
+		// Format COUNT(*) with uppercase for consistency with tests
+		buf.WriteString("COUNT(*)")
+		if n.OverClause != nil {
+			buf.WriteString(" OVER()")
+		}
 	case sqlparser.Values:
 		// Format VALUES with uppercase keyword
 		buf.WriteString("VALUES ")

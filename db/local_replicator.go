@@ -2,6 +2,8 @@ package db
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 
 	"github.com/maxpert/marmot/coordinator"
@@ -69,7 +71,7 @@ func (lr *LocalReplicator) handlePrepare(ctx context.Context, req *coordinator.R
 
 			// Add statement to transaction
 			if err := txnMgr.AddStatement(txn, stmt); err != nil {
-				txnMgr.AbortTransaction(txn)
+				_ = txnMgr.AbortTransaction(txn)
 				return &coordinator.ReplicationResponse{Success: false, Error: fmt.Sprintf("failed to add statement: %v", err)}, nil
 			}
 
@@ -93,7 +95,7 @@ func (lr *LocalReplicator) handlePrepare(ctx context.Context, req *coordinator.R
 
 			err = txnMgr.WriteIntent(txn, IntentTypeDatabaseOp, "", rowKey, stmt, dataSnapshot)
 			if err != nil {
-				txnMgr.AbortTransaction(txn)
+				_ = txnMgr.AbortTransaction(txn)
 				return &coordinator.ReplicationResponse{Success: false, Error: fmt.Sprintf("write conflict: %v", err)}, nil
 			}
 
@@ -128,7 +130,7 @@ func (lr *LocalReplicator) handlePrepare(ctx context.Context, req *coordinator.R
 		stmtSeq++
 
 		if err := txnMgr.AddStatement(txn, stmt); err != nil {
-			txnMgr.AbortTransaction(txn)
+			_ = txnMgr.AbortTransaction(txn)
 			return &coordinator.ReplicationResponse{Success: false, Error: err.Error()}, nil
 		}
 
@@ -157,10 +159,14 @@ func (lr *LocalReplicator) handlePrepare(ctx context.Context, req *coordinator.R
 				continue
 			}
 
-			// For DDL statements, create write intent using table name as row key
-			// This ensures DDL SQL gets stored and executed during commit phase
+			// For DDL statements, create write intent using table name + SQL hash as row key
+			// This ensures each DDL SQL gets stored uniquely and executed during commit phase
+			// Multiple DDL statements for same table (e.g., CREATE TABLE, CREATE INDEX) need unique keys
 			if stmt.Type == protocol.StatementDDL {
-				ddlRowKey := stmt.TableName
+				// Use table name + hash of SQL to create unique rowKey for each DDL statement
+				hash := sha256.Sum256([]byte(stmt.SQL))
+				ddlRowKey := stmt.TableName + ":" + hex.EncodeToString(hash[:8])
+
 				snapshotData := DDLSnapshot{
 					Type:      int(stmt.Type),
 					Timestamp: req.StartTS.WallTime,
@@ -169,12 +175,12 @@ func (lr *LocalReplicator) handlePrepare(ctx context.Context, req *coordinator.R
 				}
 				dataSnapshot, serErr := SerializeData(snapshotData)
 				if serErr != nil {
-					txnMgr.AbortTransaction(txn)
+					_ = txnMgr.AbortTransaction(txn)
 					return &coordinator.ReplicationResponse{Success: false, Error: fmt.Sprintf("failed to serialize DDL data: %v", serErr)}, nil
 				}
 
 				if err := txnMgr.WriteIntent(txn, IntentTypeDDL, stmt.TableName, ddlRowKey, stmt, dataSnapshot); err != nil {
-					txnMgr.AbortTransaction(txn)
+					_ = txnMgr.AbortTransaction(txn)
 					return &coordinator.ReplicationResponse{
 						Success:          false,
 						Error:            fmt.Sprintf("DDL conflict: %v", err),
@@ -209,12 +215,12 @@ func (lr *LocalReplicator) handlePrepare(ctx context.Context, req *coordinator.R
 		}
 		dataSnapshot, serErr := SerializeData(snapshotData)
 		if serErr != nil {
-			txnMgr.AbortTransaction(txn)
+			_ = txnMgr.AbortTransaction(txn)
 			return &coordinator.ReplicationResponse{Success: false, Error: fmt.Sprintf("failed to serialize data: %v", serErr)}, nil
 		}
 
 		if err := txnMgr.WriteIntent(txn, IntentTypeDML, stmt.TableName, rowKey, stmt, dataSnapshot); err != nil {
-			txnMgr.AbortTransaction(txn)
+			_ = txnMgr.AbortTransaction(txn)
 			return &coordinator.ReplicationResponse{
 				Success:          false,
 				Error:            err.Error(),
@@ -233,7 +239,7 @@ func (lr *LocalReplicator) handlePrepare(ctx context.Context, req *coordinator.R
 				oldVals, err = encoding.Marshal(stmt.OldValues)
 				if err != nil {
 					log.Error().Err(err).Str("table", stmt.TableName).Msg("Failed to marshal OldValues")
-					txnMgr.AbortTransaction(txn)
+					_ = txnMgr.AbortTransaction(txn)
 					return &coordinator.ReplicationResponse{
 						Success: false,
 						Error:   fmt.Sprintf("failed to serialize old values: %v", err),
@@ -245,7 +251,7 @@ func (lr *LocalReplicator) handlePrepare(ctx context.Context, req *coordinator.R
 				newVals, err = encoding.Marshal(stmt.NewValues)
 				if err != nil {
 					log.Error().Err(err).Str("table", stmt.TableName).Msg("Failed to marshal NewValues")
-					txnMgr.AbortTransaction(txn)
+					_ = txnMgr.AbortTransaction(txn)
 					return &coordinator.ReplicationResponse{
 						Success: false,
 						Error:   fmt.Sprintf("failed to serialize new values: %v", err),
@@ -263,7 +269,7 @@ func (lr *LocalReplicator) handlePrepare(ctx context.Context, req *coordinator.R
 					Str("table", stmt.TableName).
 					Str("row_key", rowKey).
 					Msg("Failed to write CDC intent entry")
-				txnMgr.AbortTransaction(txn)
+				_ = txnMgr.AbortTransaction(txn)
 				return &coordinator.ReplicationResponse{
 					Success: false,
 					Error:   fmt.Sprintf("failed to write CDC entry: %v", err),
@@ -306,7 +312,7 @@ func (lr *LocalReplicator) handleCommit(ctx context.Context, req *coordinator.Re
 						// Execute the database operation BEFORE committing the transaction
 						dbMgr, ok := lr.dbMgr.(*DatabaseManager)
 						if !ok {
-							systemTxnMgr.AbortTransaction(systemTxn)
+							_ = systemTxnMgr.AbortTransaction(systemTxn)
 							return &coordinator.ReplicationResponse{Success: false, Error: "database manager does not support database operations"}, nil
 						}
 
@@ -325,7 +331,7 @@ func (lr *LocalReplicator) handleCommit(ctx context.Context, req *coordinator.Re
 
 						if dbOpErr != nil {
 							log.Error().Err(dbOpErr).Str("database", dbName).Str("operation", dbOp.String()).Msg("Database operation failed in commit phase")
-							systemTxnMgr.AbortTransaction(systemTxn)
+							_ = systemTxnMgr.AbortTransaction(systemTxn)
 							return &coordinator.ReplicationResponse{Success: false, Error: fmt.Sprintf("database operation failed: %v", dbOpErr)}, nil
 						}
 

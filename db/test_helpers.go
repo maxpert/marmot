@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-// Test helper functions for MVCC testing
+// Test helper functions for transaction testing
 
 // assertNoError verifies no error occurred
 func assertNoError(t *testing.T, err error, msg string) {
@@ -59,7 +59,7 @@ func setupTestDBWithMeta(t *testing.T) *testDBWithMetaStore {
 func openTestDBWithMeta(t *testing.T, dbPath string) *testDBWithMetaStore {
 	t.Helper()
 
-	db, err := sql.Open("sqlite3", dbPath)
+	db, err := sql.Open(SQLiteDriverName, dbPath)
 	if err != nil {
 		t.Fatalf("Failed to open database: %v", err)
 	}

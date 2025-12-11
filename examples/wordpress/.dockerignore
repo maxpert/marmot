@@ -1,0 +1,27 @@
+# Build artifacts
+marmot-v2
+*.test
+dist/
+
+# Data directories
+/tmp/
+*.db
+*.db-shm
+*.db-wal
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Git
+.git/
+.gitignore
+
+# Docs
+*.md
+docs/
+
+# Examples data (not needed in build)
+examples/wordpress/marmot-data/
+examples/wordpress/wordpress-data/

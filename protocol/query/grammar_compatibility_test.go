@@ -16,7 +16,7 @@ import (
 
 // TestMySQLSelectModifiers tests MySQL-specific SELECT modifiers
 func TestMySQLSelectModifiers(t *testing.T) {
-	pipeline, err := NewPipeline(100, 4, nil)
+	pipeline, err := NewPipeline(100, nil)
 	if err != nil {
 		t.Fatalf("failed to create pipeline: %v", err)
 	}
@@ -86,13 +86,12 @@ func TestMySQLSelectModifiers(t *testing.T) {
 			shouldParse: true,
 		},
 
-		// STRAIGHT_JOIN - VITESS PARSER LIMITATION
+		// STRAIGHT_JOIN - NOW SUPPORTED
 		{
 			name:        "SELECT STRAIGHT_JOIN",
 			sql:         "SELECT STRAIGHT_JOIN u.name, o.total FROM users u JOIN orders o ON u.id = o.user_id",
 			wantType:    StatementSelect,
-			shouldParse: false,
-			limitation:  "VITESS: STRAIGHT_JOIN hint not supported",
+			shouldParse: true,
 		},
 	}
 
@@ -120,7 +119,7 @@ func TestMySQLSelectModifiers(t *testing.T) {
 
 // TestMySQLJoinTypes tests all JOIN type variations - ALL SUPPORTED
 func TestMySQLJoinTypes(t *testing.T) {
-	pipeline, err := NewPipeline(100, 4, nil)
+	pipeline, err := NewPipeline(100, nil)
 	if err != nil {
 		t.Fatalf("failed to create pipeline: %v", err)
 	}
@@ -180,7 +179,7 @@ func TestMySQLJoinTypes(t *testing.T) {
 
 // TestMySQLSetOperations tests UNION, INTERSECT, EXCEPT
 func TestMySQLSetOperations(t *testing.T) {
-	pipeline, err := NewPipeline(100, 4, nil)
+	pipeline, err := NewPipeline(100, nil)
 	if err != nil {
 		t.Fatalf("failed to create pipeline: %v", err)
 	}
@@ -209,8 +208,7 @@ func TestMySQLSetOperations(t *testing.T) {
 			name:        "UNION DISTINCT",
 			sql:         "SELECT id FROM t1 UNION DISTINCT SELECT id FROM t2",
 			wantType:    StatementSelect,
-			shouldParse: false,
-			limitation:  "VITESS: UNION DISTINCT explicit keyword not supported (UNION implies DISTINCT)",
+			shouldParse: true,
 		},
 		{
 			name:        "multiple UNIONs",
@@ -222,15 +220,13 @@ func TestMySQLSetOperations(t *testing.T) {
 			name:        "UNION with parenthesized ORDER BY",
 			sql:         "(SELECT id, name FROM users) UNION (SELECT id, name FROM admins) ORDER BY name",
 			wantType:    StatementSelect,
-			shouldParse: false,
-			limitation:  "VITESS: Parenthesized union members with trailing ORDER BY not supported",
+			shouldParse: true,
 		},
 		{
 			name:        "UNION with parenthesized LIMIT",
 			sql:         "(SELECT id FROM users LIMIT 5) UNION (SELECT id FROM admins LIMIT 5)",
 			wantType:    StatementSelect,
-			shouldParse: false,
-			limitation:  "VITESS: Parenthesized union members not supported",
+			shouldParse: true,
 		},
 		{
 			name:        "UNION with global ORDER BY and LIMIT",
@@ -296,7 +292,7 @@ func TestMySQLSetOperations(t *testing.T) {
 
 // TestMySQLInsertVariations tests all INSERT statement variations
 func TestMySQLInsertVariations(t *testing.T) {
-	pipeline, err := NewPipeline(100, 4, nil)
+	pipeline, err := NewPipeline(100, nil)
 	if err != nil {
 		t.Fatalf("failed to create pipeline: %v", err)
 	}
@@ -374,13 +370,12 @@ func TestMySQLInsertVariations(t *testing.T) {
 			limitation:  "VITESS: INSERT DELAYED not supported (deprecated in MySQL 5.6+)",
 		},
 
-		// INSERT with SET syntax - VITESS LIMITATION
+		// INSERT with SET syntax - NOW SUPPORTED
 		{
 			name:        "INSERT SET",
 			sql:         "INSERT INTO users SET id = 1, name = 'Alice', email = 'alice@example.com'",
 			wantType:    StatementInsert,
-			shouldParse: false,
-			limitation:  "VITESS: INSERT ... SET syntax not supported",
+			shouldParse: true,
 		},
 	}
 
@@ -408,7 +403,7 @@ func TestMySQLInsertVariations(t *testing.T) {
 
 // TestMySQLReplaceStatement tests REPLACE INTO variations
 func TestMySQLReplaceStatement(t *testing.T) {
-	pipeline, err := NewPipeline(100, 4, nil)
+	pipeline, err := NewPipeline(100, nil)
 	if err != nil {
 		t.Fatalf("failed to create pipeline: %v", err)
 	}
@@ -442,8 +437,7 @@ func TestMySQLReplaceStatement(t *testing.T) {
 			name:        "REPLACE with SET syntax",
 			sql:         "REPLACE INTO users SET id = 1, name = 'Alice'",
 			wantType:    StatementReplace,
-			shouldParse: false,
-			limitation:  "VITESS: REPLACE ... SET syntax not supported",
+			shouldParse: true,
 		},
 	}
 
@@ -471,7 +465,7 @@ func TestMySQLReplaceStatement(t *testing.T) {
 
 // TestMySQLUpdateVariations tests UPDATE statement variations
 func TestMySQLUpdateVariations(t *testing.T) {
-	pipeline, err := NewPipeline(100, 4, nil)
+	pipeline, err := NewPipeline(100, nil)
 	if err != nil {
 		t.Fatalf("failed to create pipeline: %v", err)
 	}
@@ -522,26 +516,23 @@ func TestMySQLUpdateVariations(t *testing.T) {
 			name:        "UPDATE multi-table",
 			sql:         "UPDATE users, orders SET users.order_count = users.order_count + 1 WHERE users.id = orders.user_id",
 			wantType:    StatementUpdate,
-			shouldParse: false,
-			limitation:  "VITESS: Multi-table UPDATE not supported",
+			shouldParse: true,
 		},
 
-		// UPDATE without WHERE - CDC LIMITATION
+		// UPDATE without WHERE - NOW SUPPORTED
 		{
 			name:        "UPDATE without WHERE",
 			sql:         "UPDATE users SET status = 'inactive' ORDER BY last_login",
 			wantType:    StatementUpdate,
-			shouldParse: false,
-			limitation:  "MARMOT CDC: UPDATE without WHERE not supported (unsafe multi-row update)",
+			shouldParse: true,
 		},
 
-		// UPDATE with LIMIT - VITESS LIMITATION
+		// UPDATE with LIMIT - NOW SUPPORTED
 		{
 			name:        "UPDATE with LIMIT",
 			sql:         "UPDATE users SET status = 'processed' WHERE status = 'pending' LIMIT 100",
 			wantType:    StatementUpdate,
-			shouldParse: false,
-			limitation:  "VITESS: UPDATE with LIMIT not supported",
+			shouldParse: true,
 		},
 
 		// UPDATE with modifiers - VITESS LIMITATION
@@ -556,8 +547,7 @@ func TestMySQLUpdateVariations(t *testing.T) {
 			name:        "UPDATE IGNORE",
 			sql:         "UPDATE IGNORE users SET email = 'duplicate@example.com' WHERE id = 1",
 			wantType:    StatementUpdate,
-			shouldParse: false,
-			limitation:  "VITESS: UPDATE IGNORE not supported",
+			shouldParse: true,
 		},
 	}
 
@@ -585,7 +575,7 @@ func TestMySQLUpdateVariations(t *testing.T) {
 
 // TestMySQLDeleteVariations tests DELETE statement variations
 func TestMySQLDeleteVariations(t *testing.T) {
-	pipeline, err := NewPipeline(100, 4, nil)
+	pipeline, err := NewPipeline(100, nil)
 	if err != nil {
 		t.Fatalf("failed to create pipeline: %v", err)
 	}
@@ -621,16 +611,16 @@ func TestMySQLDeleteVariations(t *testing.T) {
 			shouldParse: true, // CDC validation moved to runtime hooks
 		},
 
-		// DELETE with USING - VITESS LIMITATION
+		// DELETE with USING - NOT SUPPORTED (multi-table)
 		{
 			name:        "DELETE with USING",
 			sql:         "DELETE FROM users USING users, banned_users WHERE users.id = banned_users.user_id",
 			wantType:    StatementDelete,
 			shouldParse: false,
-			limitation:  "VITESS: DELETE with USING syntax not supported",
+			limitation:  "MARMOT: DELETE from multiple tables not supported",
 		},
 
-		// DELETE with JOIN - TRANSPILED (Vitess doesn't support, but we transform it)
+		// DELETE with JOIN - TRANSPILED
 		{
 			name:        "DELETE with JOIN",
 			sql:         "DELETE u FROM users u JOIN banned_users b ON u.id = b.user_id",
@@ -638,22 +628,20 @@ func TestMySQLDeleteVariations(t *testing.T) {
 			shouldParse: true,
 		},
 
-		// DELETE multi-table - VITESS LIMITATION
+		// DELETE multi-table - NOW SUPPORTED (transpiled to separate DELETE statements)
 		{
 			name:        "DELETE multi-table",
 			sql:         "DELETE users, orders FROM users JOIN orders ON users.id = orders.user_id WHERE users.status = 'spam'",
 			wantType:    StatementDelete,
-			shouldParse: false,
-			limitation:  "VITESS: Multi-table DELETE not supported",
+			shouldParse: true,
 		},
 
-		// DELETE with ORDER BY+LIMIT - VITESS LIMITATION
+		// DELETE with ORDER BY+LIMIT - NOW SUPPORTED
 		{
 			name:        "DELETE with ORDER BY and LIMIT",
 			sql:         "DELETE FROM logs WHERE level = 'debug' ORDER BY created_at LIMIT 10000",
 			wantType:    StatementDelete,
-			shouldParse: false,
-			limitation:  "VITESS: DELETE with ORDER BY + LIMIT not supported",
+			shouldParse: true,
 		},
 
 		// DELETE with modifiers - VITESS LIMITATION
@@ -668,8 +656,7 @@ func TestMySQLDeleteVariations(t *testing.T) {
 			name:        "DELETE IGNORE",
 			sql:         "DELETE IGNORE FROM users WHERE id = 1",
 			wantType:    StatementDelete,
-			shouldParse: false,
-			limitation:  "VITESS: DELETE IGNORE not supported",
+			shouldParse: true,
 		},
 	}
 
@@ -697,7 +684,7 @@ func TestMySQLDeleteVariations(t *testing.T) {
 
 // TestMySQLWindowFunctions tests window function variations - MOSTLY SUPPORTED
 func TestMySQLWindowFunctions(t *testing.T) {
-	pipeline, err := NewPipeline(100, 4, nil)
+	pipeline, err := NewPipeline(100, nil)
 	if err != nil {
 		t.Fatalf("failed to create pipeline: %v", err)
 	}
@@ -738,8 +725,7 @@ func TestMySQLWindowFunctions(t *testing.T) {
 		{
 			name:        "RANGE BETWEEN with INTERVAL",
 			sql:         "SELECT id, SUM(amount) OVER (ORDER BY date RANGE BETWEEN INTERVAL 7 DAY PRECEDING AND CURRENT ROW) as week_sum FROM data",
-			shouldParse: false,
-			limitation:  "VITESS: RANGE BETWEEN with INTERVAL expression not supported",
+			shouldParse: true,
 		},
 
 		// Named windows - PARTIALLY SUPPORTED
@@ -776,7 +762,7 @@ func TestMySQLWindowFunctions(t *testing.T) {
 
 // TestMySQLCTEVariations tests Common Table Expression variations - ALL SUPPORTED
 func TestMySQLCTEVariations(t *testing.T) {
-	pipeline, err := NewPipeline(100, 4, nil)
+	pipeline, err := NewPipeline(100, nil)
 	if err != nil {
 		t.Fatalf("failed to create pipeline: %v", err)
 	}
@@ -826,7 +812,7 @@ func TestMySQLCTEVariations(t *testing.T) {
 
 // TestMySQLLockingClauses tests FOR UPDATE, FOR SHARE, etc.
 func TestMySQLLockingClauses(t *testing.T) {
-	pipeline, err := NewPipeline(100, 4, nil)
+	pipeline, err := NewPipeline(100, nil)
 	if err != nil {
 		t.Fatalf("failed to create pipeline: %v", err)
 	}
@@ -848,8 +834,7 @@ func TestMySQLLockingClauses(t *testing.T) {
 		{
 			name:        "FOR UPDATE NOWAIT",
 			sql:         "SELECT * FROM users WHERE id = 1 FOR UPDATE NOWAIT",
-			shouldParse: false,
-			limitation:  "VITESS: FOR UPDATE NOWAIT not supported",
+			shouldParse: true,
 		},
 		{
 			name:        "FOR UPDATE SKIP LOCKED",
@@ -858,12 +843,11 @@ func TestMySQLLockingClauses(t *testing.T) {
 			limitation:  "VITESS: FOR UPDATE SKIP LOCKED not supported",
 		},
 
-		// FOR SHARE - MOSTLY UNSUPPORTED
+		// FOR SHARE - NOW SUPPORTED
 		{
 			name:        "FOR SHARE",
 			sql:         "SELECT * FROM users WHERE id = 1 FOR SHARE",
-			shouldParse: false,
-			limitation:  "VITESS: FOR SHARE not supported (use LOCK IN SHARE MODE)",
+			shouldParse: true,
 		},
 		{"LOCK IN SHARE MODE", "SELECT * FROM users WHERE id = 1 LOCK IN SHARE MODE", true, ""},
 	}
@@ -888,7 +872,7 @@ func TestMySQLLockingClauses(t *testing.T) {
 
 // TestMySQLSubqueries tests various subquery patterns
 func TestMySQLSubqueries(t *testing.T) {
-	pipeline, err := NewPipeline(100, 4, nil)
+	pipeline, err := NewPipeline(100, nil)
 	if err != nil {
 		t.Fatalf("failed to create pipeline: %v", err)
 	}
@@ -911,24 +895,21 @@ func TestMySQLSubqueries(t *testing.T) {
 		{"EXISTS", "SELECT * FROM users u WHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id)", true, ""},
 		{"NOT EXISTS", "SELECT * FROM users u WHERE NOT EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id)", true, ""},
 
-		// ANY/SOME/ALL subqueries - VITESS LIMITATION
+		// ANY/SOME/ALL subqueries - NOW SUPPORTED
 		{
 			name:        "ANY subquery",
 			sql:         "SELECT * FROM products WHERE price > ANY (SELECT price FROM products WHERE category = 'electronics')",
-			shouldParse: false,
-			limitation:  "VITESS: ANY comparison subquery not supported",
+			shouldParse: true,
 		},
 		{
 			name:        "SOME subquery",
 			sql:         "SELECT * FROM products WHERE price > SOME (SELECT price FROM products WHERE category = 'electronics')",
-			shouldParse: false,
-			limitation:  "VITESS: SOME comparison subquery not supported",
+			shouldParse: true,
 		},
 		{
 			name:        "ALL subquery",
 			sql:         "SELECT * FROM products WHERE price > ALL (SELECT price FROM products WHERE category = 'books')",
-			shouldParse: false,
-			limitation:  "VITESS: ALL comparison subquery not supported",
+			shouldParse: true,
 		},
 
 		// Derived tables (FROM subqueries) - SUPPORTED
@@ -964,7 +945,7 @@ func TestMySQLSubqueries(t *testing.T) {
 
 // TestMySQLGroupByHaving tests GROUP BY and HAVING variations
 func TestMySQLGroupByHaving(t *testing.T) {
-	pipeline, err := NewPipeline(100, 4, nil)
+	pipeline, err := NewPipeline(100, nil)
 	if err != nil {
 		t.Fatalf("failed to create pipeline: %v", err)
 	}
@@ -987,12 +968,11 @@ func TestMySQLGroupByHaving(t *testing.T) {
 		{"HAVING with aggregate function", "SELECT user_id, SUM(amount) as total FROM orders GROUP BY user_id HAVING SUM(amount) > 1000", true, ""},
 		{"HAVING with multiple conditions", "SELECT category, AVG(price) as avg_price, COUNT(*) as cnt FROM products GROUP BY category HAVING AVG(price) > 50 AND COUNT(*) >= 10", true, ""},
 
-		// WITH ROLLUP - VITESS LIMITATION
+		// WITH ROLLUP - NOW SUPPORTED
 		{
 			name:        "GROUP BY WITH ROLLUP",
 			sql:         "SELECT year, quarter, SUM(sales) FROM revenue GROUP BY year, quarter WITH ROLLUP",
-			shouldParse: false,
-			limitation:  "VITESS: WITH ROLLUP not supported",
+			shouldParse: true,
 		},
 
 		// Multiple aggregate functions - SUPPORTED
@@ -1021,7 +1001,7 @@ func TestMySQLGroupByHaving(t *testing.T) {
 
 // TestMySQLLimitOffset tests LIMIT and OFFSET variations - ALL SUPPORTED
 func TestMySQLLimitOffset(t *testing.T) {
-	pipeline, err := NewPipeline(100, 4, nil)
+	pipeline, err := NewPipeline(100, nil)
 	if err != nil {
 		t.Fatalf("failed to create pipeline: %v", err)
 	}
@@ -1084,7 +1064,7 @@ func TestMySQLLimitOffset(t *testing.T) {
 
 // TestMySQLDDLStatements tests DDL statement variations - ALL SUPPORTED
 func TestMySQLDDLStatements(t *testing.T) {
-	pipeline, err := NewPipeline(100, 4, nil)
+	pipeline, err := NewPipeline(100, nil)
 	if err != nil {
 		t.Fatalf("failed to create pipeline: %v", err)
 	}
@@ -1158,7 +1138,7 @@ func TestMySQLDDLStatements(t *testing.T) {
 
 // TestMySQLIndexHints tests USE/FORCE/IGNORE INDEX hints
 func TestMySQLIndexHints(t *testing.T) {
-	pipeline, err := NewPipeline(100, 4, nil)
+	pipeline, err := NewPipeline(100, nil)
 	if err != nil {
 		t.Fatalf("failed to create pipeline: %v", err)
 	}
@@ -1173,30 +1153,27 @@ func TestMySQLIndexHints(t *testing.T) {
 		{"USE INDEX", "SELECT * FROM users USE INDEX (idx_name) WHERE name = 'Alice'", true, ""},
 		{"USE INDEX multiple", "SELECT * FROM users USE INDEX (idx_name, idx_email) WHERE name = 'Alice'", true, ""},
 
-		// USE INDEX FOR - VITESS LIMITATION
+		// USE INDEX FOR - NOW SUPPORTED
 		{
 			name:        "USE INDEX FOR JOIN",
 			sql:         "SELECT * FROM users USE INDEX FOR JOIN (idx_id) WHERE id > 100",
-			shouldParse: false,
-			limitation:  "VITESS: USE INDEX FOR JOIN|ORDER BY|GROUP BY not supported",
+			shouldParse: true,
 		},
 
-		// FORCE INDEX - PARTIALLY SUPPORTED
+		// FORCE INDEX - SUPPORTED
 		{"FORCE INDEX", "SELECT * FROM users FORCE INDEX (idx_name) WHERE name LIKE 'A%'", true, ""},
 		{
 			name:        "FORCE INDEX FOR ORDER BY",
 			sql:         "SELECT * FROM users FORCE INDEX FOR ORDER BY (idx_created) ORDER BY created_at",
-			shouldParse: false,
-			limitation:  "VITESS: FORCE INDEX FOR ORDER BY not supported",
+			shouldParse: true,
 		},
 
-		// IGNORE INDEX - PARTIALLY SUPPORTED
+		// IGNORE INDEX - SUPPORTED
 		{"IGNORE INDEX", "SELECT * FROM users IGNORE INDEX (idx_name) WHERE name = 'Alice'", true, ""},
 		{
 			name:        "IGNORE INDEX FOR GROUP BY",
 			sql:         "SELECT category, COUNT(*) FROM products IGNORE INDEX FOR GROUP BY (idx_cat) GROUP BY category",
-			shouldParse: false,
-			limitation:  "VITESS: IGNORE INDEX FOR GROUP BY not supported",
+			shouldParse: true,
 		},
 
 		// Combined - SUPPORTED

@@ -1,7 +1,9 @@
 package db
 
 import (
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -12,7 +14,7 @@ import (
 	"github.com/maxpert/marmot/protocol"
 )
 
-// TestMVCCSchemaCreation tests that MVCC schema is created properly in MetaStore
+// TestMVCCSchemaCreation tests that transaction metadata schema is created properly in MetaStore
 func TestMVCCSchemaCreation(t *testing.T) {
 	testDB := setupTestDBWithMeta(t)
 
@@ -64,7 +66,7 @@ func TestUserTableTransparency(t *testing.T) {
 		t.Fatalf("Failed to create user table: %v", err)
 	}
 
-	// Insert data directly (bypassing MVCC for now - just testing transparency)
+	// Insert data directly (bypassing transaction manager for now - just testing transparency)
 	_, err = testDB.DB.Exec("INSERT INTO users (id, name, email, balance) VALUES (?, ?, ?, ?)",
 		1, "Alice", "alice@example.com", 100)
 	if err != nil {
@@ -196,7 +198,7 @@ func TestWriteIntentCreation(t *testing.T) {
 	t.Logf("✓ Write intent persisted in MetaStore")
 
 	// Cleanup
-	tm.AbortTransaction(txn)
+	_ = tm.AbortTransaction(txn)
 }
 
 // TestWriteWriteConflictDetection tests that write-write conflicts are detected
@@ -256,11 +258,11 @@ func TestWriteWriteConflictDetection(t *testing.T) {
 	}
 
 	// Cleanup
-	tm.AbortTransaction(txn1)
-	tm.AbortTransaction(txn2)
+	_ = tm.AbortTransaction(txn1)
+	_ = tm.AbortTransaction(txn2)
 }
 
-// TestConcurrentTransactionsOnDifferentRows tests MVCC isolation
+// TestConcurrentTransactionsOnDifferentRows tests transaction isolation
 func TestConcurrentTransactionsOnDifferentRows(t *testing.T) {
 	testDB := setupTestDBWithMeta(t)
 
@@ -413,8 +415,8 @@ func TestExternalSQLiteReadability(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "test.db")
 
-	// Open user DB directly (no MVCC schema needed in user DB)
-	db, err := sql.Open("sqlite3", dbPath)
+	// Open user DB directly (no transaction metadata schema needed in user DB)
+	db, err := sql.Open(SQLiteDriverName, dbPath)
 	if err != nil {
 		t.Fatalf("Failed to open database: %v", err)
 	}
@@ -436,7 +438,7 @@ func TestExternalSQLiteReadability(t *testing.T) {
 	db.Close()
 
 	// Open database with a separate connection (simulating external tool)
-	externalDB, err := sql.Open("sqlite3", dbPath)
+	externalDB, err := sql.Open(SQLiteDriverName, dbPath)
 	if err != nil {
 		t.Fatalf("Failed to open DB with external connection: %v", err)
 	}
@@ -484,9 +486,118 @@ func TestExternalSQLiteReadability(t *testing.T) {
 			users[1].name, users[1].balance)
 	}
 
-	t.Log("✓ External SQLite tool can read user data transparently (no MVCC tables in user DB)")
+	t.Log("✓ External SQLite tool can read user data transparently (no transaction metadata tables in user DB)")
 	t.Logf("  - User 1: %s (balance: %d)", users[0].name, users[0].balance)
 	t.Logf("  - User 2: %s (balance: %d)", users[1].name, users[1].balance)
+}
+
+// TestDDLExecutionOrder tests that multiple DDL statements in a transaction
+// execute in the correct order (e.g., CREATE TABLE before CREATE INDEX)
+func TestDDLExecutionOrder(t *testing.T) {
+	testDB := setupTestDBWithMeta(t)
+
+	clock := hlc.NewClock(1)
+	tm := NewTransactionManager(testDB.DB, testDB.MetaStore, clock)
+
+	// Begin transaction
+	txn, err := tm.BeginTransaction(1)
+	if err != nil {
+		t.Fatalf("Failed to begin transaction: %v", err)
+	}
+
+	// Simulate WordPress-style CREATE TABLE with multiple DDL statements
+	// These must execute in order: CREATE TABLE first, then CREATE INDEX
+	ddlStatements := []string{
+		`CREATE TABLE wp_options (
+			option_id INTEGER PRIMARY KEY AUTOINCREMENT,
+			option_name TEXT NOT NULL UNIQUE,
+			option_value TEXT,
+			autoload TEXT DEFAULT 'yes'
+		)`,
+		`CREATE UNIQUE INDEX option_name ON wp_options (option_name)`,
+		`CREATE INDEX autoload ON wp_options (autoload)`,
+	}
+
+	// Add DDL statements as write intents with small time delays to ensure different CreatedAt
+	for i, sql := range ddlStatements {
+		stmt := protocol.Statement{
+			SQL:       sql,
+			Type:      protocol.StatementDDL,
+			TableName: "wp_options",
+		}
+
+		// Use table name + hash of SQL to create unique rowKey for each DDL statement
+		hash := sha256.Sum256([]byte(stmt.SQL))
+		ddlRowKey := stmt.TableName + ":" + hex.EncodeToString(hash[:8])
+
+		snapshotData := DDLSnapshot{
+			Type:      int(stmt.Type),
+			Timestamp: time.Now().UnixNano(),
+			SQL:       stmt.SQL,
+			TableName: stmt.TableName,
+		}
+		dataSnapshot, _ := SerializeData(snapshotData)
+
+		// Add small delay to ensure different CreatedAt timestamps
+		if i > 0 {
+			time.Sleep(2 * time.Millisecond)
+		}
+
+		err = tm.WriteIntent(txn, IntentTypeDDL, stmt.TableName, ddlRowKey, stmt, dataSnapshot)
+		if err != nil {
+			_ = tm.AbortTransaction(txn)
+			t.Fatalf("Failed to create write intent for DDL statement %d: %v", i, err)
+		}
+
+		truncatedSQL := sql
+		if len(sql) > 50 {
+			truncatedSQL = sql[:50] + "..."
+		}
+		t.Logf("✓ Created write intent for DDL statement %d: %s", i+1, truncatedSQL)
+	}
+
+	// Commit transaction - this should execute DDL statements in order
+	err = tm.CommitTransaction(txn)
+	if err != nil {
+		t.Fatalf("Failed to commit transaction with DDL statements: %v", err)
+	}
+
+	t.Logf("✓ Transaction committed - all DDL statements executed in order")
+
+	// Verify table was created successfully
+	var count int
+	err = testDB.DB.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='wp_options'").Scan(&count)
+	if err != nil {
+		t.Fatalf("Failed to query sqlite_master: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("Expected wp_options table to exist, but it doesn't")
+	}
+
+	t.Logf("✓ Table wp_options created successfully")
+
+	// Verify indexes were created
+	rows, err := testDB.DB.Query("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='wp_options' ORDER BY name")
+	if err != nil {
+		t.Fatalf("Failed to query indexes: %v", err)
+	}
+	defer rows.Close()
+
+	indexes := []string{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatalf("Failed to scan index name: %v", err)
+		}
+		indexes = append(indexes, name)
+	}
+
+	// Should have at least 2 indexes (autoload and option_name)
+	if len(indexes) < 2 {
+		t.Fatalf("Expected at least 2 indexes on wp_options, got %d: %v", len(indexes), indexes)
+	}
+
+	t.Logf("✓ All indexes created successfully: %v", indexes)
 }
 
 // Helper functions

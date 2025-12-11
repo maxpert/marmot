@@ -50,7 +50,7 @@ func TestConcurrentWriteIntentConflicts(t *testing.T) {
 
 			err = tm.WriteIntent(txn, IntentTypeDML, "users", "1", stmt, dataBytes)
 			if err != nil {
-				tm.AbortTransaction(txn)
+				_ = tm.AbortTransaction(txn)
 				results <- err // Write-write conflict expected
 				return
 			}
@@ -149,7 +149,7 @@ func TestHighContentionHotspot(t *testing.T) {
 
 			err = tm.WriteIntent(txn, IntentTypeDML, "users", fmt.Sprintf("%d", rowID), stmt, dataBytes)
 			if err != nil {
-				tm.AbortTransaction(txn)
+				_ = tm.AbortTransaction(txn)
 				results <- err
 				return
 			}
@@ -213,8 +213,8 @@ func TestSerializableSnapshotIsolation(t *testing.T) {
 	createUserTable(t, testDB.DB)
 
 	// Insert initial data
-	testDB.DB.Exec("INSERT INTO users (id, name, balance) VALUES (1, 'Alice', 100)")
-	testDB.DB.Exec("INSERT INTO users (id, name, balance) VALUES (2, 'Bob', 100)")
+	_, _ = testDB.DB.Exec("INSERT INTO users (id, name, balance) VALUES (1, 'Alice', 100)")
+	_, _ = testDB.DB.Exec("INSERT INTO users (id, name, balance) VALUES (2, 'Bob', 100)")
 
 	var wg sync.WaitGroup
 	results := make(chan error, 2)
@@ -241,7 +241,7 @@ func TestSerializableSnapshotIsolation(t *testing.T) {
 
 		err = tm.WriteIntent(txn1, IntentTypeDML, "users", "1", stmt, dataBytes)
 		if err != nil {
-			tm.AbortTransaction(txn1)
+			_ = tm.AbortTransaction(txn1)
 			results <- err
 			return
 		}
@@ -275,7 +275,7 @@ func TestSerializableSnapshotIsolation(t *testing.T) {
 
 		err = tm.WriteIntent(txn2, IntentTypeDML, "users", "2", stmt, dataBytes)
 		if err != nil {
-			tm.AbortTransaction(txn2)
+			_ = tm.AbortTransaction(txn2)
 			results <- err
 			return
 		}
@@ -303,7 +303,7 @@ func TestSerializableSnapshotIsolation(t *testing.T) {
 		t.Fatalf("Expected both transactions to succeed, got %d errors", errorCount)
 	}
 
-	t.Log("✓ Both transactions succeeded on different rows (MVCC isolation works)")
+	t.Log("✓ Both transactions succeeded on different rows (transaction isolation works)")
 }
 
 // TestWriteIntentLifecycle tests the full lifecycle of a write intent

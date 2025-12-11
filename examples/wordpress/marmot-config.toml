@@ -1,0 +1,70 @@
+# Marmot v2.0 - WordPress Single Node Configuration
+
+node_id = 1
+data_dir = "/data"
+
+[transaction]
+heartbeat_timeout_seconds = 10
+conflict_window_seconds = 10
+lock_wait_timeout_seconds = 50
+
+[cluster]
+grpc_bind_address = "0.0.0.0"
+grpc_advertise_address = "marmot:8081"
+grpc_port = 8081
+seed_nodes = []
+gossip_interval_ms = 1000
+gossip_fanout = 2
+suspect_timeout_ms = 5000
+dead_timeout_ms = 10000
+
+[replication]
+default_write_consistency = "LOCAL_ONE"
+default_read_consistency = "LOCAL_ONE"
+write_timeout_ms = 300000
+read_timeout_ms = 2000
+enable_anti_entropy = false
+gc_min_retention_hours = 2
+gc_max_retention_hours = 24
+
+[connection_pool]
+pool_size = 4
+max_idle_time_seconds = 10
+max_lifetime_seconds = 300
+
+[grpc_client]
+keepalive_time_seconds = 10
+keepalive_timeout_seconds = 3
+max_retries = 3
+retry_backoff_ms = 100
+
+[coordinator]
+prepare_timeout_ms = 120000
+commit_timeout_ms = 120000
+abort_timeout_ms = 2000
+
+[query_pipeline]
+transpiler_cache_size = 10000
+validator_pool_size = 8
+
+[mysql]
+enabled = true
+bind_address = "0.0.0.0"
+port = 3307
+max_connections = 100
+
+[metastore]
+cache_size_mb = 64
+memtable_size_mb = 64
+memtable_count = 2
+l0_compaction_threshold = 500
+l0_stop_writes = 1000
+wal_bytes_per_sync_kb = 512
+wal_sync_interval_ms = 10
+
+[logging]
+verbose = true
+format = "console"
+
+[prometheus]
+enabled = true

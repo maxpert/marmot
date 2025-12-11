@@ -1,7 +1,6 @@
 package protocol
 
 import (
-	"database/sql"
 	"testing"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -61,10 +60,7 @@ func TestSchemaProvider_AutoIncrementDetection(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			// Create in-memory SQLite database
-			db, err := sql.Open("sqlite3", ":memory:")
-			if err != nil {
-				t.Fatalf("failed to open database: %v", err)
-			}
+			db := openTestDB(t, ":memory:")
 			defer db.Close()
 
 			// Create the table
@@ -87,10 +83,7 @@ func TestSchemaProvider_AutoIncrementDetection(t *testing.T) {
 }
 
 func TestSchemaProvider_GetAutoIncrementColumn(t *testing.T) {
-	db, err := sql.Open("sqlite3", ":memory:")
-	if err != nil {
-		t.Fatalf("failed to open database: %v", err)
-	}
+	db := openTestDB(t, ":memory:")
 	defer db.Close()
 
 	// Create tables with different PK types
@@ -129,10 +122,7 @@ func TestSchemaProvider_GetAutoIncrementColumn(t *testing.T) {
 }
 
 func TestTableSchema_AutoIncrementCol_InSchemaVersion(t *testing.T) {
-	db, err := sql.Open("sqlite3", ":memory:")
-	if err != nil {
-		t.Fatalf("failed to open database: %v", err)
-	}
+	db := openTestDB(t, ":memory:")
 	defer db.Close()
 
 	// Create two tables with same structure except INTEGER vs BIGINT PK

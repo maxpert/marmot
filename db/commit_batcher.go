@@ -141,7 +141,9 @@ func (cb *CommitBatcher) flushBatch() {
 
 	// Commit or rollback
 	if commitErr != nil {
-		tx.Rollback()
+		if rbErr := tx.Rollback(); rbErr != nil {
+			log.Error().Err(rbErr).Msg("Failed to rollback batch transaction")
+		}
 		// Fail all requests
 		for _, req := range batch {
 			req.resultCh <- commitErr

@@ -124,7 +124,7 @@ func TestHeartbeatKeepsTransactionAlive(t *testing.T) {
 	t.Log("✓ Transaction kept alive by regular heartbeats")
 
 	// Clean up
-	tm.AbortTransaction(txn)
+	_ = tm.AbortTransaction(txn)
 }
 
 // TestStaleTransactionCleanup tests that GC aborts transactions without heartbeat
@@ -234,58 +234,6 @@ func TestOldTransactionRecordCleanup(t *testing.T) {
 	t.Log("✓ Old transaction record cleanup mechanism works")
 }
 
-// TestOldMVCCVersionCleanup tests that GC keeps only the last N versions per row
-func TestOldMVCCVersionCleanup(t *testing.T) {
-	testDB := setupTestDBWithMeta(t)
-
-	clock := hlc.NewClock(1)
-	tm := NewTransactionManager(testDB.DB, testDB.MetaStore, clock)
-	defer tm.StopGarbageCollection()
-
-	createUserTable(t, testDB.DB)
-
-	// Insert initial row
-	testDB.DB.Exec("INSERT INTO users (id, name, balance) VALUES (1, 'Alice', 100)")
-
-	// Create 15 versions of the same row
-	for i := 0; i < 15; i++ {
-		txn, err := tm.BeginTransaction(uint64(i + 1))
-		assertNoError(t, err, "BeginTransaction failed")
-
-		stmt := protocol.Statement{
-			SQL:       "UPDATE users SET balance = ? WHERE id = 1",
-			Type:      protocol.StatementUpdate,
-			TableName: "users",
-		}
-
-		data := map[string]interface{}{"balance": 100 + (i * 10)}
-		dataBytes, _ := SerializeData(data)
-
-		err = tm.WriteIntent(txn, IntentTypeDML, "users", "1", stmt, dataBytes)
-		assertNoError(t, err, "WriteIntent failed")
-
-		err = tm.CommitTransaction(txn)
-		assertNoError(t, err, "CommitTransaction failed")
-
-		// Wait for async finalization
-		time.Sleep(50 * time.Millisecond)
-	}
-
-	t.Log("✓ Created 15 transactions for users:1")
-
-	// Verify latest value
-	var balance int
-	err := testDB.DB.QueryRow("SELECT balance FROM users WHERE id = 1").Scan(&balance)
-	assertNoError(t, err, "Failed to query final balance")
-
-	expectedBalance := 100 + (14 * 10) // Last transaction
-	if balance != expectedBalance {
-		t.Errorf("Expected final balance %d, got %d", expectedBalance, balance)
-	}
-
-	t.Log("✓ Transaction history verified")
-}
-
 // TestGarbageCollectionIntegration tests the full GC lifecycle
 func TestGarbageCollectionIntegration(t *testing.T) {
 	testDB := setupTestDBWithMeta(t)
@@ -339,7 +287,7 @@ func TestGarbageCollectionIntegration(t *testing.T) {
 		for {
 			select {
 			case <-ticker.C:
-				tm.Heartbeat(activeTxn)
+				_ = tm.Heartbeat(activeTxn)
 			case <-stopHeartbeat:
 				return
 			}
@@ -365,5 +313,5 @@ func TestGarbageCollectionIntegration(t *testing.T) {
 	t.Log("✓ GC correctly distinguished stale vs active transactions")
 
 	// Clean up
-	tm.CommitTransaction(activeTxn)
+	_ = tm.CommitTransaction(activeTxn)
 }

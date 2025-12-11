@@ -78,7 +78,6 @@ gc_max_retention_hours = 24  # Force delete after 24 hours
 gc_interval_seconds = 30         # Run GC every 30 seconds
 gc_retention_hours = 1           # Minimum age for GC consideration
 heartbeat_timeout_seconds = 10   # Timeout for transaction heartbeats
-version_retention_count = 10     # Keep last 10 MVCC versions per row
 conflict_window_seconds = 10     # Window for LWW conflict resolution
 
 [logging]

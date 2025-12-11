@@ -9,10 +9,7 @@ import (
 
 // setupTestDB creates an in-memory SQLite database with test schema
 func setupTestDB(t *testing.T) *sql.DB {
-	db, err := sql.Open("sqlite3", ":memory:")
-	if err != nil {
-		t.Fatalf("Failed to open SQLite: %v", err)
-	}
+	db := openTestDB(t, ":memory:")
 
 	// Create comprehensive test schema
 	schema := `
@@ -65,7 +62,7 @@ func setupTestDB(t *testing.T) *sql.DB {
 		);
 	`
 
-	_, err = db.Exec(schema)
+	_, err := db.Exec(schema)
 	if err != nil {
 		t.Fatalf("Failed to create schema: %v", err)
 	}

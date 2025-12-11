@@ -2,7 +2,9 @@ package grpc
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"strings"
 
@@ -257,10 +259,14 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 				continue
 			}
 
-			// For DDL statements, create write intent using table name as row key
-			// This ensures DDL SQL gets stored and executed during commit phase
+			// For DDL statements, create write intent using table name + SQL hash as row key
+			// This ensures each DDL SQL gets stored uniquely and executed during commit phase
+			// Multiple DDL statements for same table (e.g., CREATE TABLE, CREATE INDEX) need unique keys
 			if internalStmt.Type == protocol.StatementDDL {
-				ddlRowKey := stmt.TableName
+				// Use table name + hash of SQL to create unique rowKey for each DDL statement
+				hash := sha256.Sum256([]byte(stmt.GetSQL()))
+				ddlRowKey := stmt.TableName + ":" + hex.EncodeToString(hash[:8])
+
 				snapshotData := db.DDLSnapshot{
 					Type:      int(internalStmt.Type),
 					Timestamp: req.Timestamp.WallTime,

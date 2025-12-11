@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
 	"github.com/maxpert/marmot/coordinator"
 	"github.com/maxpert/marmot/db"
 	"github.com/maxpert/marmot/hlc"
@@ -56,7 +55,7 @@ func (m *DDLMockDatabaseManager) CreateDatabase(name string) error {
 	}
 
 	// Create in-memory SQLite database
-	sqlDB, err := sql.Open("sqlite3", ":memory:")
+	sqlDB, err := sql.Open("sqlite3_marmot", ":memory:")
 	if err != nil {
 		return err
 	}
@@ -616,7 +615,7 @@ func TestDDLWithConcurrentDML(t *testing.T) {
 // TestDDLReplayAfterFailure validates idempotent DDL replay
 func TestDDLReplayAfterFailure(t *testing.T) {
 	// Create in-memory database for testing
-	testDB, err := sql.Open("sqlite3", ":memory:")
+	testDB, err := sql.Open("sqlite3_marmot", ":memory:")
 	require.NoError(t, err)
 	defer testDB.Close()
 

@@ -3,10 +3,12 @@ package query
 import (
 	"strings"
 
+	"github.com/maxpert/marmot/protocol/query/transform"
 	rqlitesql "github.com/rqlite/sql"
 	"vitess.io/vitess/go/vt/sqlparser"
 )
 
+// Dialect represents the SQL dialect of a query (MySQL or SQLite).
 type Dialect int
 
 const (
@@ -15,6 +17,7 @@ const (
 	DialectSQLite
 )
 
+// Transformation records a transformation rule that was applied to a query.
 type Transformation struct {
 	Rule   string
 	Method string
@@ -22,6 +25,7 @@ type Transformation struct {
 	After  string
 }
 
+// StatementType categorizes SQL statements for execution routing and validation.
 type StatementType int
 
 const (
@@ -52,13 +56,11 @@ const (
 	StatementShowTableStatus
 	StatementInformationSchema
 	StatementUnsupported
-
-	// New statement types to eliminate pre-parse string matching
 	StatementSystemVariable // SELECT @@version, SELECT DATABASE(), etc.
 	StatementVirtualTable   // SELECT * FROM MARMOT_CLUSTER_NODES, etc.
 )
 
-// InformationSchemaTableType identifies which INFORMATION_SCHEMA table is being queried
+// InformationSchemaTableType identifies which INFORMATION_SCHEMA table is being queried.
 type InformationSchemaTableType int
 
 const (
@@ -69,7 +71,7 @@ const (
 	ISTableStatistics                            // INFORMATION_SCHEMA.STATISTICS
 )
 
-// VirtualTableType identifies which Marmot virtual table is being queried
+// VirtualTableType identifies which Marmot virtual table is being queried.
 type VirtualTableType int
 
 const (
@@ -77,13 +79,14 @@ const (
 	VirtualTableClusterNodes                  // MARMOT_CLUSTER_NODES or MARMOT.CLUSTER_NODES
 )
 
-// InformationSchemaFilter holds extracted WHERE clause values for INFORMATION_SCHEMA queries
+// InformationSchemaFilter holds extracted WHERE clause values for INFORMATION_SCHEMA queries.
 type InformationSchemaFilter struct {
 	SchemaName string // From TABLE_SCHEMA = 'x' or SCHEMA_NAME = 'x'
 	TableName  string // From TABLE_NAME = 'x'
 	ColumnName string // From COLUMN_NAME = 'x'
 }
 
+// QueryContext holds all state for processing a single query through the pipeline.
 type QueryContext struct {
 	OriginalSQL string
 	Parameters  []interface{}
@@ -97,9 +100,10 @@ type QueryContext struct {
 	SourceDialect  Dialect
 	NeedsTranspile bool
 
-	TranspiledSQL   string
-	Transformations []Transformation
-	WasCached       bool
+	TranspiledSQL        string                          // Primary transpiled statement (backwards compat)
+	TranspiledStatements []transform.TranspiledStatement // All statements (main + additional like CREATE INDEX)
+	Transformations      []Transformation
+	WasCached            bool
 
 	IsValid       bool
 	ValidationErr error
@@ -120,6 +124,10 @@ type QueryContext struct {
 	// System variable metadata (for @@var and DATABASE() queries)
 	SystemVarNames []string // List of system variables referenced (e.g., ["version", "sql_mode"])
 
+	// HasFoundRowsCalc indicates SQL_CALC_FOUND_ROWS was in the original query
+	// and COUNT(*) OVER() was appended. Execution layer should extract the count.
+	HasFoundRowsCalc bool
+
 	ExecutionErr error
 	RowsAffected int64
 	ResultSet    interface{}
@@ -127,8 +135,14 @@ type QueryContext struct {
 	// SchemaLookup returns the auto-increment column name for a table, or empty string if none.
 	// This is set by the handler before processing to enable schema-based ID injection.
 	SchemaLookup func(table string) string
+
+	// SchemaProvider returns full schema info for conflict target detection and ID injection.
+	// Takes (database, table) and returns SchemaInfo or nil.
+	SchemaProvider transform.SchemaProvider
 }
 
+// NewContext creates a new QueryContext for the given SQL and parameters.
+// It automatically detects the SQL dialect and sets the NeedsTranspile flag.
 func NewContext(sql string, params []interface{}) *QueryContext {
 	ctx := &QueryContext{
 		OriginalSQL: sql,
@@ -141,6 +155,8 @@ func NewContext(sql string, params []interface{}) *QueryContext {
 	return ctx
 }
 
+// detectDialect analyzes SQL to determine if it's SQLite or MySQL dialect.
+// It strips comments and looks for dialect-specific keywords and syntax patterns.
 func detectDialect(sql string) Dialect {
 	upper := strings.ToUpper(strings.TrimSpace(sql))
 

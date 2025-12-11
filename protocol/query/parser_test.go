@@ -190,7 +190,7 @@ func TestDetectInformationSchemaTable(t *testing.T) {
 }
 
 func TestComplexQueries(t *testing.T) {
-	pipeline, err := NewPipeline(100, 4, nil)
+	pipeline, err := NewPipeline(100, nil)
 	if err != nil {
 		t.Fatalf("failed to create pipeline: %v", err)
 	}
@@ -443,6 +443,61 @@ func TestExtractInformationSchemaFilter(t *testing.T) {
 			}
 			if filter.ColumnName != tt.wantColumnName {
 				t.Errorf("ColumnName = %q, want %q", filter.ColumnName, tt.wantColumnName)
+			}
+		})
+	}
+}
+
+func TestExplainTableStatement(t *testing.T) {
+	parser := sqlparser.NewTestParser()
+
+	tests := []struct {
+		name          string
+		sql           string
+		wantType      StatementType
+		wantTableName string
+		wantDatabase  string
+	}{
+		{
+			name:          "EXPLAIN users",
+			sql:           "EXPLAIN users",
+			wantType:      StatementShowColumns,
+			wantTableName: "users",
+		},
+		{
+			name:          "EXPLAIN mydb.users",
+			sql:           "EXPLAIN mydb.users",
+			wantType:      StatementShowColumns,
+			wantTableName: "users",
+			wantDatabase:  "mydb",
+		},
+		{
+			name:          "EXPLAIN products",
+			sql:           "EXPLAIN products",
+			wantType:      StatementShowColumns,
+			wantTableName: "products",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stmt, err := parser.Parse(tt.sql)
+			if err != nil {
+				t.Fatalf("failed to parse SQL: %v", err)
+			}
+
+			ctx := &QueryContext{}
+			classifyStatement(ctx, stmt)
+			extractMetadata(ctx, stmt)
+
+			if ctx.StatementType != tt.wantType {
+				t.Errorf("StatementType = %d, want %d", ctx.StatementType, tt.wantType)
+			}
+			if ctx.TableName != tt.wantTableName {
+				t.Errorf("TableName = %q, want %q", ctx.TableName, tt.wantTableName)
+			}
+			if ctx.Database != tt.wantDatabase {
+				t.Errorf("Database = %q, want %q", ctx.Database, tt.wantDatabase)
 			}
 		})
 	}

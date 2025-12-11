@@ -25,7 +25,7 @@ func mockSchemaLookup(tableColumns map[string]string) func(string) string {
 func TestPipelineAutoIncrementIDInjection(t *testing.T) {
 	// Use mock ID generator
 	idGen := &mockIDGenerator{}
-	pipeline, err := NewPipeline(1000, 100, idGen)
+	pipeline, err := NewPipeline(1000, idGen)
 	if err != nil {
 		t.Fatalf("Failed to create pipeline: %v", err)
 	}
@@ -77,7 +77,7 @@ func TestPipelineAutoIncrementIDInjection(t *testing.T) {
 
 func TestPipelineAutoIncrementIDInjection_NullValue(t *testing.T) {
 	idGen := &mockIDGenerator{}
-	pipeline, err := NewPipeline(1000, 100, idGen)
+	pipeline, err := NewPipeline(1000, idGen)
 	if err != nil {
 		t.Fatalf("Failed to create pipeline: %v", err)
 	}
@@ -111,7 +111,7 @@ func TestPipelineAutoIncrementIDInjection_NoGenerator(t *testing.T) {
 	ctx := NewContext(sql, nil)
 
 	// No ID generator - should not modify the 0
-	pipeline, err := NewPipeline(1000, 100, nil)
+	pipeline, err := NewPipeline(1000, nil)
 	if err != nil {
 		t.Fatalf("Failed to create pipeline: %v", err)
 	}
@@ -131,7 +131,7 @@ func TestPipelineAutoIncrementIDInjection_NoGenerator(t *testing.T) {
 
 func TestPipelineAutoIncrementIDInjection_ExplicitID(t *testing.T) {
 	idGen := &mockIDGenerator{}
-	pipeline, err := NewPipeline(1000, 100, idGen)
+	pipeline, err := NewPipeline(1000, idGen)
 	if err != nil {
 		t.Fatalf("Failed to create pipeline: %v", err)
 	}
@@ -161,7 +161,7 @@ func TestPipelineAutoIncrementIDInjection_ExplicitID(t *testing.T) {
 
 func TestPipelineAutoIncrementIDInjection_MultiRow(t *testing.T) {
 	idGen := &mockIDGenerator{}
-	pipeline, err := NewPipeline(1000, 100, idGen)
+	pipeline, err := NewPipeline(1000, idGen)
 	if err != nil {
 		t.Fatalf("Failed to create pipeline: %v", err)
 	}
@@ -196,7 +196,7 @@ func TestPipelineAutoIncrementIDInjection_MultiRow(t *testing.T) {
 
 func TestPipelineAutoIncrementIDInjection_UnregisteredTable(t *testing.T) {
 	idGen := &mockIDGenerator{}
-	pipeline, err := NewPipeline(1000, 100, idGen)
+	pipeline, err := NewPipeline(1000, idGen)
 	if err != nil {
 		t.Fatalf("Failed to create pipeline: %v", err)
 	}
@@ -221,7 +221,7 @@ func TestPipelineAutoIncrementIDInjection_UnregisteredTable(t *testing.T) {
 
 func TestPipelineAutoIncrementIDInjection_CacheBypassForIDInjection(t *testing.T) {
 	idGen := &mockIDGenerator{}
-	pipeline, err := NewPipeline(1000, 100, idGen)
+	pipeline, err := NewPipeline(1000, idGen)
 	if err != nil {
 		t.Fatalf("Failed to create pipeline: %v", err)
 	}
@@ -268,7 +268,7 @@ func TestPipelineAutoIncrementIDInjection_CacheBypassForIDInjection(t *testing.T
 
 func TestPipelineAutoIncrementIDInjection_InsertIgnoreWithPatternTransform(t *testing.T) {
 	idGen := &mockIDGenerator{}
-	pipeline, err := NewPipeline(1000, 100, idGen)
+	pipeline, err := NewPipeline(1000, idGen)
 	if err != nil {
 		t.Fatalf("Failed to create pipeline: %v", err)
 	}

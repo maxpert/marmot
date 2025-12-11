@@ -3,6 +3,7 @@ package db
 import (
 	"database/sql"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -192,7 +193,7 @@ func (tm *TransactionManager) WriteIntent(txn *Transaction, intentType IntentTyp
 				// This happens when DELETE then INSERT on same row in same txn
 				if existingIntent.TxnID == txn.ID {
 					// Delete and re-insert to update
-					tm.metaStore.DeleteIntent(tableName, rowKey, txn.ID)
+					_ = tm.metaStore.DeleteIntent(tableName, rowKey, txn.ID)
 					updateErr := tm.metaStore.WriteIntent(txn.ID, intentType, tableName, rowKey,
 						op, stmt.SQL, dataSnapshot, txn.StartTS, txn.NodeID)
 					if updateErr != nil {
@@ -351,11 +352,20 @@ func (tm *TransactionManager) rebuildStatementsFromCDC(cdcEntries []*IntentEntry
 
 	// Add DDL statements from intents (only if no CDC entries - DDL-only transactions)
 	if len(cdcEntries) == 0 {
+		// Filter and sort DDL intents by CreatedAt to preserve execution order
+		ddlIntents := make([]*WriteIntentRecord, 0, len(intents))
 		for _, intent := range intents {
-			// Only process DDL intents with SQL statements
-			if intent.IntentType != IntentTypeDDL || intent.SQLStatement == "" {
-				continue
+			if intent.IntentType == IntentTypeDDL && intent.SQLStatement != "" {
+				ddlIntents = append(ddlIntents, intent)
 			}
+		}
+
+		// Sort by CreatedAt to ensure CREATE TABLE comes before CREATE INDEX, etc.
+		sort.Slice(ddlIntents, func(i, j int) bool {
+			return ddlIntents[i].CreatedAt < ddlIntents[j].CreatedAt
+		})
+
+		for _, intent := range ddlIntents {
 			stmt := protocol.Statement{
 				TableName: intent.TableName,
 				SQL:       intent.SQLStatement,
@@ -393,13 +403,25 @@ func (tm *TransactionManager) applyCDCEntries(txnID uint64, entries []*IntentEnt
 // applyDDLIntents executes DDL statements from write intents.
 // Only processes intents with IntentType == IntentTypeDDL.
 // DML intents are handled via CDC entries in applyCDCEntries.
+// CRITICAL: DDL statements must be executed in the order they were added to the transaction.
+// For example, CREATE TABLE must execute before CREATE INDEX on that table.
 func (tm *TransactionManager) applyDDLIntents(txnID uint64, intents []*WriteIntentRecord) error {
+	// Filter DDL intents
+	ddlIntents := make([]*WriteIntentRecord, 0, len(intents))
 	for _, intent := range intents {
-		// Only process DDL intents with SQL statements
-		if intent.IntentType != IntentTypeDDL || intent.SQLStatement == "" {
-			continue
+		if intent.IntentType == IntentTypeDDL && intent.SQLStatement != "" {
+			ddlIntents = append(ddlIntents, intent)
 		}
+	}
 
+	// Sort DDL intents by CreatedAt timestamp to preserve execution order
+	// This ensures CREATE TABLE executes before CREATE INDEX, etc.
+	sort.Slice(ddlIntents, func(i, j int) bool {
+		return ddlIntents[i].CreatedAt < ddlIntents[j].CreatedAt
+	})
+
+	// Execute DDL statements in order
+	for _, intent := range ddlIntents {
 		if _, err := tm.db.Exec(intent.SQLStatement); err != nil {
 			return fmt.Errorf("failed to execute DDL statement: %w", err)
 		}
@@ -495,10 +517,10 @@ func (tm *TransactionManager) AbortTransaction(txn *Transaction) error {
 	txn.Status = TxnStatusAborted
 
 	// Clean up all write intents via MetaStore
-	tm.metaStore.DeleteIntentsByTxn(txn.ID)
+	_ = tm.metaStore.DeleteIntentsByTxn(txn.ID)
 
 	// Clean up CDC intent entries
-	tm.metaStore.DeleteIntentEntries(txn.ID)
+	_ = tm.metaStore.DeleteIntentEntries(txn.ID)
 
 	return nil
 }
@@ -596,7 +618,7 @@ func (tm *TransactionManager) gcLoop() {
 
 // runGarbageCollection performs garbage collection in two phases:
 // Phase 1 (Critical): Cleanup stale transactions and orphaned intents - always runs
-// Phase 2 (Background): Cleanup old records and MVCC versions - skipped under load
+// Phase 2 (Background): Cleanup old transaction records - skipped under load
 func (tm *TransactionManager) runGarbageCollection() {
 	// ====================
 	// PHASE 1: CRITICAL - Always runs
