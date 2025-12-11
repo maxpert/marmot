@@ -72,6 +72,10 @@ type ConnectionSession struct {
 	// - With SQL_CALC_FOUND_ROWS: total rows without LIMIT (from COUNT(*) OVER())
 	// - Without hint: number of rows returned
 	FoundRowsCount atomic.Int64
+
+	// LastInsertId stores the value returned by LAST_INSERT_ID().
+	// Updated after INSERT statements that generate auto-increment IDs.
+	LastInsertId atomic.Int64
 }
 
 // InTransaction returns true if session has an active explicit transaction
@@ -136,6 +140,7 @@ type ResultSet struct {
 	Columns      []ColumnDef
 	Rows         [][]interface{}
 	RowsAffected int64
+	LastInsertId int64
 }
 
 // ColumnDef represents a column definition
@@ -229,14 +234,29 @@ func (s *MySQLServer) handleConnection(conn net.Conn) {
 		return
 	}
 
-	// 2. Read Handshake Response
-	if _, err := s.readPacket(conn); err != nil {
+	// 2. Read Handshake Response and extract database if provided
+	handshakeResp, err := s.readPacket(conn)
+	if err != nil {
 		log.Error().Err(err).Msg("Failed to read handshake response")
 		return
 	}
 
+	// Parse handshake response to extract database name and other info
+	if handshake, err := ParseHandshakeResponse(handshakeResp); err == nil {
+		if handshake.Database != "" {
+			session.CurrentDatabase = handshake.Database
+			log.Debug().
+				Uint64("conn_id", session.ConnID).
+				Str("database", handshake.Database).
+				Str("user", handshake.Username).
+				Msg("Initial database from handshake")
+		}
+	} else {
+		log.Warn().Err(err).Uint64("conn_id", session.ConnID).Msg("Failed to parse handshake response")
+	}
+
 	// 3. Send OK Packet (Authentication successful)
-	if err := s.writeOK(conn, 2, 0); err != nil {
+	if err := s.writeOK(conn, 2, 0, 0); err != nil {
 		log.Error().Err(err).Msg("Failed to write OK packet")
 		return
 	}
@@ -265,7 +285,7 @@ func (s *MySQLServer) handleConnection(conn net.Conn) {
 			dbName := string(payload[1:])
 			session.CurrentDatabase = dbName
 			log.Debug().Uint64("conn_id", session.ConnID).Str("database", dbName).Msg("Changed database")
-			_ = s.writeOK(conn, 1, 0)
+			_ = s.writeOK(conn, 1, 0, 0)
 		case 0x03: // COM_QUERY
 			query := string(payload[1:])
 			s.processQuery(conn, session, query)
@@ -285,7 +305,7 @@ func (s *MySQLServer) handleConnection(conn net.Conn) {
 			}
 			// COM_STMT_CLOSE doesn't send a response
 		case 0x0E: // COM_PING
-			_ = s.writeOK(conn, 1, 0)
+			_ = s.writeOK(conn, 1, 0, 0)
 		case 0x01: // COM_QUIT
 			return
 		default:
@@ -308,10 +328,15 @@ func (s *MySQLServer) processQuery(conn net.Conn, session *ConnectionSession, qu
 	if rs == nil || (len(rs.Columns) == 0 && len(rs.Rows) == 0) {
 		// OK response for non-SELECT (INSERT/UPDATE/DELETE/etc)
 		rowsAffected := int64(0)
+		lastInsertId := int64(0)
 		if rs != nil {
 			rowsAffected = rs.RowsAffected
+			lastInsertId = rs.LastInsertId
+			if lastInsertId != 0 {
+				session.LastInsertId.Store(lastInsertId)
+			}
 		}
-		_ = s.writeOK(conn, 1, rowsAffected)
+		_ = s.writeOK(conn, 1, rowsAffected, lastInsertId)
 		return
 	}
 
@@ -344,9 +369,10 @@ func (s *MySQLServer) writeHandshake(w io.Writer) error {
 	buf.WriteByte(0)
 
 	// Capability flags (lower 2 bytes)
-	// CLIENT_PROTOCOL_41 (0x200) | CLIENT_SECURE_CONNECTION (0x8000) | CLIENT_PLUGIN_AUTH (0x80000 - in upper bytes)
-	// Lower 16 bits: 0xa200 = CLIENT_LONG_PASSWORD (0x0001) | CLIENT_PROTOCOL_41 (0x0200) | CLIENT_SECURE_CONNECTION (0x8000) | CLIENT_TRANSACTIONS (0x2000)
-	_ = binary.Write(buf, binary.LittleEndian, uint16(0xa201))
+	// CLIENT_LONG_PASSWORD (0x0001) | CLIENT_CONNECT_WITH_DB (0x0008) | CLIENT_PROTOCOL_41 (0x0200) |
+	// CLIENT_TRANSACTIONS (0x2000) | CLIENT_SECURE_CONNECTION (0x8000)
+	// Lower 16 bits: 0xa209 = 0x0001 | 0x0008 | 0x0200 | 0x2000 | 0x8000
+	_ = binary.Write(buf, binary.LittleEndian, uint16(0xa209))
 
 	// Character set (utf8_general_ci = 33)
 	buf.WriteByte(33)
@@ -373,14 +399,14 @@ func (s *MySQLServer) writeHandshake(w io.Writer) error {
 	return s.writePacket(w, 0, buf.Bytes())
 }
 
-func (s *MySQLServer) writeOK(w io.Writer, seq byte, rowsAffected int64) error {
+func (s *MySQLServer) writeOK(w io.Writer, seq byte, rowsAffected, lastInsertId int64) error {
 	buf := getBuffer()
 	defer putBuffer(buf)
 	buf.WriteByte(0x00) // OK packet header
 	// Affected rows (length-encoded integer)
 	buf.Write(packLengthEncodedInt(uint64(rowsAffected)))
 	// Last insert ID (length-encoded integer)
-	buf.Write(packLengthEncodedInt(0))
+	buf.Write(packLengthEncodedInt(uint64(lastInsertId)))
 	// Status flags
 	_ = binary.Write(buf, binary.LittleEndian, uint16(0x0002)) // SERVER_STATUS_AUTOCOMMIT
 	// Warnings
@@ -974,10 +1000,15 @@ func (s *MySQLServer) handleStmtExecute(conn net.Conn, session *ConnectionSessio
 	} else {
 		// Write OK packet for DML queries
 		rowsAffected := int64(0)
+		lastInsertId := int64(0)
 		if rs != nil {
 			rowsAffected = rs.RowsAffected
+			lastInsertId = rs.LastInsertId
+			if lastInsertId != 0 {
+				session.LastInsertId.Store(lastInsertId)
+			}
 		}
-		_ = s.writeOK(conn, 1, rowsAffected)
+		_ = s.writeOK(conn, 1, rowsAffected, lastInsertId)
 	}
 }
 

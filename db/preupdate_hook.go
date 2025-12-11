@@ -126,14 +126,15 @@ func loadSchema(conn *sqlite3.SQLiteConn, tableName string) (*tableSchema, error
 // The connection is held open for the duration of the session and closed on Commit/Rollback.
 // CDC entries are stored in the per-database MetaStore's __marmot__intent_entries table.
 type EphemeralHookSession struct {
-	conn        *sql.Conn                           // Dedicated user DB connection (closed on end)
-	tx          *sql.Tx                             // Active transaction on user DB
-	metaStore   MetaStore                           // MetaStore for intent entry storage
-	txnID       uint64                              // Transaction ID for intent entries
-	seq         uint64                              // Sequence counter for entries
-	collectors  map[string]*filter.KeyHashCollector // table -> key hash collector
-	schemaCache *SchemaCache                        // Shared schema cache
-	mu          sync.Mutex
+	conn         *sql.Conn                           // Dedicated user DB connection (closed on end)
+	tx           *sql.Tx                             // Active transaction on user DB
+	metaStore    MetaStore                           // MetaStore for intent entry storage
+	txnID        uint64                              // Transaction ID for intent entries
+	seq          uint64                              // Sequence counter for entries
+	collectors   map[string]*filter.KeyHashCollector // table -> key hash collector
+	schemaCache  *SchemaCache                        // Shared schema cache
+	lastInsertId int64                               // Last insert ID from most recent insert
+	mu           sync.Mutex
 }
 
 // StartEphemeralSession creates a new CDC capture session with a dedicated connection.
@@ -200,8 +201,15 @@ func (s *EphemeralHookSession) ExecContext(ctx context.Context, query string) er
 	if s.tx == nil {
 		return fmt.Errorf("no active transaction")
 	}
-	_, err := s.tx.ExecContext(ctx, query)
-	return err
+	result, err := s.tx.ExecContext(ctx, query)
+	if err != nil {
+		return err
+	}
+	// Capture last insert ID (ignore error - not all statements produce one)
+	if id, err := result.LastInsertId(); err == nil && id != 0 {
+		s.lastInsertId = id
+	}
+	return nil
 }
 
 // Commit commits the transaction and closes the connection.
@@ -529,4 +537,9 @@ func (s *EphemeralHookSession) GetIntentEntries() ([]*IntentEntry, error) {
 // GetTxnID returns the transaction ID for this session
 func (s *EphemeralHookSession) GetTxnID() uint64 {
 	return s.txnID
+}
+
+// GetLastInsertId returns the last insert ID from the most recent insert
+func (s *EphemeralHookSession) GetLastInsertId() int64 {
+	return s.lastInsertId
 }

@@ -13,6 +13,7 @@ type SystemVarConfig struct {
 	ConnID         uint64 // Session connection ID
 	CurrentDB      string // Current database name
 	FoundRowsCount int64  // Number of rows found by last SELECT (for FOUND_ROWS())
+	LastInsertId   int64  // Last auto-generated ID from INSERT (for LAST_INSERT_ID())
 }
 
 // HandleSystemVariableQuery handles system variable queries using parsed Statement
@@ -146,6 +147,8 @@ func getSystemVariableValueByName(varName string, config SystemVarConfig) interf
 		return "root@localhost"
 	case "FOUND_ROWS()":
 		return config.FoundRowsCount
+	case "LAST_INSERT_ID()":
+		return config.LastInsertId
 	default:
 		// Unknown variable - return empty string
 		return ""

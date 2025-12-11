@@ -296,7 +296,7 @@ func extractVarsFromExpr(expr sqlparser.Expr) []string {
 			funcName == "VERSION" || funcName == "USER" ||
 			funcName == "CURRENT_USER" || funcName == "SESSION_USER" ||
 			funcName == "SYSTEM_USER" || funcName == "CONNECTION_ID" ||
-			funcName == "FOUND_ROWS" {
+			funcName == "FOUND_ROWS" || funcName == "LAST_INSERT_ID" {
 			vars = append(vars, funcName+"()")
 		}
 	case *sqlparser.BinaryExpr:

@@ -152,6 +152,7 @@ func (h *ReadOnlyHandler) handleSystemQuery(session *protocol.ConnectionSession,
 		ConnID:         session.ConnID,
 		CurrentDB:      session.CurrentDatabase,
 		FoundRowsCount: session.FoundRowsCount.Load(),
+		LastInsertId:   session.LastInsertId.Load(),
 	}
 	return handlers.HandleSystemVariableQuery(stmt, config)
 }

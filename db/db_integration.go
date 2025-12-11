@@ -391,10 +391,11 @@ type PendingLocalExecution struct {
 // Used by the new hookDB flow where we capture CDC then release the connection
 // BEFORE 2PC broadcast. Commit/Rollback are no-ops.
 type CompletedLocalExecution struct {
-	cdcEntries []*IntentEntry
-	rowCounts  map[string]int64
-	keyHashes  map[string][]uint64
-	db         *MVCCDatabase
+	cdcEntries   []*IntentEntry
+	rowCounts    map[string]int64
+	keyHashes    map[string][]uint64
+	lastInsertId int64
+	db           *MVCCDatabase
 }
 
 // Ensure CompletedLocalExecution implements coordinator.PendingExecution
@@ -470,6 +471,11 @@ func (c *CompletedLocalExecution) GetCDCEntries() []coordinator.CDCEntry {
 // FlushIntentLog is a no-op - CDC data already persisted in MetaStore
 func (c *CompletedLocalExecution) FlushIntentLog() error {
 	return nil
+}
+
+// GetLastInsertId returns the last insert ID from the most recent insert
+func (c *CompletedLocalExecution) GetLastInsertId() int64 {
+	return c.lastInsertId
 }
 
 // GetRowCounts returns the number of affected rows per table
@@ -554,6 +560,14 @@ func (p *PendingLocalExecution) FlushIntentLog() error {
 	return p.session.FlushIntentLog()
 }
 
+// GetLastInsertId returns the last insert ID from the most recent insert
+func (p *PendingLocalExecution) GetLastInsertId() int64 {
+	if p.session == nil {
+		return 0
+	}
+	return p.session.GetLastInsertId()
+}
+
 // ExecuteLocalWithHooks executes SQL locally with preupdate hooks capturing CDC data.
 // Returns a PendingExecution with captured CDC entries. The hookDB transaction is
 // ALREADY ROLLED BACK - no Commit/Rollback needed from caller.
@@ -601,10 +615,11 @@ func (mdb *MVCCDatabase) ExecuteLocalWithHooks(ctx context.Context, txnID uint64
 		}
 	}
 
-	// Get CDC entries and row counts BEFORE rollback
+	// Get CDC entries, row counts, and last insert ID BEFORE rollback
 	cdcEntries, _ := session.GetIntentEntries()
 	rowCounts := session.GetRowCounts()
 	keyHashes := session.GetKeyHashes(1000) // For interface compatibility
+	lastInsertId := session.GetLastInsertId()
 
 	// ROLLBACK hookDB immediately - release connection BEFORE 2PC
 	// CDC data is already persisted in MetaStore, so we don't lose anything
@@ -615,10 +630,11 @@ func (mdb *MVCCDatabase) ExecuteLocalWithHooks(ctx context.Context, txnID uint64
 	// Return completed execution with captured CDC data
 	// Commit/Rollback are no-ops since session is already closed
 	return &CompletedLocalExecution{
-		cdcEntries: cdcEntries,
-		rowCounts:  rowCounts,
-		keyHashes:  keyHashes,
-		db:         mdb,
+		cdcEntries:   cdcEntries,
+		rowCounts:    rowCounts,
+		keyHashes:    keyHashes,
+		lastInsertId: lastInsertId,
+		db:           mdb,
 	}, nil
 }
 

@@ -48,6 +48,7 @@ type CDCEntry struct {
 type PendingExecution interface {
 	GetRowCounts() map[string]int64
 	GetTotalRowCount() int64
+	GetLastInsertId() int64
 	GetKeyHashes(maxRows int) map[string][]uint64
 	GetCDCEntries() []CDCEntry
 	Commit() error
@@ -471,9 +472,19 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, consistency
 	telemetry.QueryDurationSeconds.With(queryType).Observe(time.Since(queryStart).Seconds())
 	telemetry.RowsAffected.Observe(float64(rowsAffected))
 
-	return &protocol.ResultSet{
+	rs := &protocol.ResultSet{
 		RowsAffected: rowsAffected,
-	}, nil
+	}
+
+	// Only set LastInsertId for INSERT/REPLACE operations (MySQL compliance)
+	// UPDATE and DELETE do NOT update LAST_INSERT_ID
+	if stmt.Type == protocol.StatementInsert || stmt.Type == protocol.StatementReplace {
+		if pendingExec != nil {
+			rs.LastInsertId = pendingExec.GetLastInsertId()
+		}
+	}
+
+	return rs, nil
 }
 
 func (h *CoordinatorHandler) handleRead(stmt protocol.Statement, consistency protocol.ConsistencyLevel) (*protocol.ResultSet, error) {
@@ -595,7 +606,7 @@ func (h *CoordinatorHandler) processFoundRowsResult(session *protocol.Connection
 				if v > float64(math.MaxInt64) || v < float64(math.MinInt64) {
 					session.FoundRowsCount.Store(0)
 				} else {
-				session.FoundRowsCount.Store(int64(v))
+					session.FoundRowsCount.Store(int64(v))
 				}
 			case string:
 				if parsed, err := strconv.ParseInt(v, 10, 64); err == nil {
@@ -626,6 +637,7 @@ func (h *CoordinatorHandler) handleSystemQuery(session *protocol.ConnectionSessi
 		ConnID:         session.ConnID,
 		CurrentDB:      session.CurrentDatabase,
 		FoundRowsCount: session.FoundRowsCount.Load(),
+		LastInsertId:   session.LastInsertId.Load(),
 	}
 	return handlers.HandleSystemVariableQuery(stmt, config)
 }

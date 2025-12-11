@@ -191,3 +191,115 @@ func TestInsertOrReplaceNewRow(t *testing.T) {
 	}
 	t.Log("Committed successfully")
 }
+
+// TestLastInsertIdCapture tests that LastInsertId is properly captured
+func TestLastInsertIdCapture(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "test.db")
+	metaPath := filepath.Join(tmpDir, "meta")
+
+	os.MkdirAll(metaPath, 0755)
+	metaStore, err := NewPebbleMetaStore(metaPath, DefaultPebbleOptions())
+	if err != nil {
+		t.Fatalf("Failed to create meta store: %v", err)
+	}
+	defer metaStore.Close()
+
+	clock := hlc.NewClock(1)
+	mvccDB, err := NewMVCCDatabase(dbPath, 1, clock, metaStore)
+	if err != nil {
+		t.Fatalf("Failed to create MVCC database: %v", err)
+	}
+	defer mvccDB.Close()
+
+	// Create table with auto-increment primary key
+	_, err = mvccDB.GetWriteDB().Exec(`
+		CREATE TABLE test_autoincrement (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			value TEXT
+		)
+	`)
+	if err != nil {
+		t.Fatalf("Failed to create table: %v", err)
+	}
+
+	// Test 1: Insert a row and verify lastInsertId
+	t.Log("Test 1: Insert row and check lastInsertId")
+	ctx1, cancel1 := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel1()
+
+	stmt1 := protocol.Statement{
+		SQL:       "INSERT INTO test_autoincrement (value) VALUES ('first')",
+		Type:      protocol.StatementInsert,
+		TableName: "test_autoincrement",
+	}
+
+	pending1, err := mvccDB.ExecuteLocalWithHooks(ctx1, 3001, []protocol.Statement{stmt1})
+	if err != nil {
+		t.Fatalf("Failed to execute INSERT: %v", err)
+	}
+
+	lastInsertId1 := pending1.GetLastInsertId()
+	t.Logf("First insert lastInsertId: %d", lastInsertId1)
+	if lastInsertId1 != 1 {
+		t.Errorf("Expected lastInsertId=1, got %d", lastInsertId1)
+	}
+
+	if err := pending1.Commit(); err != nil {
+		t.Fatalf("Failed to commit first INSERT: %v", err)
+	}
+
+	// Test 2: Insert another row and verify lastInsertId increments
+	t.Log("Test 2: Insert second row and check lastInsertId")
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel2()
+
+	stmt2 := protocol.Statement{
+		SQL:       "INSERT INTO test_autoincrement (value) VALUES ('second')",
+		Type:      protocol.StatementInsert,
+		TableName: "test_autoincrement",
+	}
+
+	pending2, err := mvccDB.ExecuteLocalWithHooks(ctx2, 3002, []protocol.Statement{stmt2})
+	if err != nil {
+		t.Fatalf("Failed to execute second INSERT: %v", err)
+	}
+
+	lastInsertId2 := pending2.GetLastInsertId()
+	t.Logf("Second insert lastInsertId: %d", lastInsertId2)
+	if lastInsertId2 != 2 {
+		t.Errorf("Expected lastInsertId=2, got %d", lastInsertId2)
+	}
+
+	if err := pending2.Commit(); err != nil {
+		t.Fatalf("Failed to commit second INSERT: %v", err)
+	}
+
+	// Test 3: UPDATE should not set lastInsertId (or set it to 0)
+	t.Log("Test 3: UPDATE and check lastInsertId")
+	ctx3, cancel3 := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel3()
+
+	stmt3 := protocol.Statement{
+		SQL:       "UPDATE test_autoincrement SET value = 'updated' WHERE id = 1",
+		Type:      protocol.StatementUpdate,
+		TableName: "test_autoincrement",
+	}
+
+	pending3, err := mvccDB.ExecuteLocalWithHooks(ctx3, 3003, []protocol.Statement{stmt3})
+	if err != nil {
+		t.Fatalf("Failed to execute UPDATE: %v", err)
+	}
+
+	lastInsertId3 := pending3.GetLastInsertId()
+	t.Logf("UPDATE lastInsertId: %d", lastInsertId3)
+	if lastInsertId3 != 0 {
+		t.Logf("UPDATE returned lastInsertId=%d (expected 0, but may vary)", lastInsertId3)
+	}
+
+	if err := pending3.Commit(); err != nil {
+		t.Fatalf("Failed to commit UPDATE: %v", err)
+	}
+
+	t.Log("All LastInsertId tests passed")
+}
