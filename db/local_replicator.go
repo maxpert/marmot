@@ -260,7 +260,7 @@ func (lr *LocalReplicator) handlePrepare(ctx context.Context, req *coordinator.R
 			}
 
 			// Convert statement type to operation code
-			op := uint8(StatementTypeToOpType(int(stmt.Type)))
+			op := uint8(StatementTypeToOpType(stmt.Type))
 
 			err := metaStore.WriteIntentEntry(req.TxnID, stmtSeq, op, stmt.TableName, rowKey, oldVals, newVals)
 			if err != nil {

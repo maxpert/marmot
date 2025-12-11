@@ -371,7 +371,7 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 			}
 
 			// Convert statement type to operation code
-			op := uint8(db.StatementTypeToOpType(int(internalStmt.Type)))
+			op := uint8(db.StatementTypeToOpType(internalStmt.Type))
 
 			err := metaStore.WriteIntentEntry(req.TxnId, stmtSeq, op, stmt.TableName, rowKey, oldVals, newVals)
 			if err != nil {

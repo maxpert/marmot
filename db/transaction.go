@@ -177,7 +177,7 @@ func (tm *TransactionManager) WriteIntent(txn *Transaction, intentType IntentTyp
 		return fmt.Errorf("transaction %d is not pending", txn.ID)
 	}
 
-	op := StatementTypeToOpType(int(stmt.Type))
+	op := StatementTypeToOpType(stmt.Type)
 
 	// Persist the intent directly to MetaStore (durable storage)
 	err := tm.metaStore.WriteIntent(txn.ID, intentType, tableName, rowKey,

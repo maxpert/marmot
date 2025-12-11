@@ -220,13 +220,9 @@ func buildStatement(ctx query.QueryContext, sql string) Statement {
 	return stmt
 }
 
-// mapQueryTypeToProtocolType converts query.StatementType to protocol.StatementType
-// These two enums have the same constant names but live in different packages
+// mapQueryTypeToProtocolType converts query.StatementType to protocol.StatementType.
+// Both enums use iota starting with Unknown=0, Insert=1, Replace=2, etc.
 func mapQueryTypeToProtocolType(qt query.StatementType) StatementType {
-	// Both enums are defined in the same order with the same names
-	// query.StatementInsert = 0, protocol.StatementInsert = 0
-	// query.StatementReplace = 1, protocol.StatementReplace = 1
-	// etc.
 	return StatementType(qt)
 }
 

@@ -1,5 +1,7 @@
 package db
 
+import "github.com/maxpert/marmot/protocol"
+
 // IntentType distinguishes different kinds of write intents
 type IntentType uint8
 
@@ -129,17 +131,17 @@ type DDLSnapshot struct {
 	TableName string `msgpack:"table_name"`
 }
 
-// StatementTypeToOpType converts protocol.StatementType to OpType
-// StatementType values: Insert=0, Replace=1, Update=2, Delete=3
-func StatementTypeToOpType(stmtType int) OpType {
+// StatementTypeToOpType converts protocol.StatementType to OpType.
+// Uses typed enum constants for compile-time safety.
+func StatementTypeToOpType(stmtType protocol.StatementType) OpType {
 	switch stmtType {
-	case 0:
+	case protocol.StatementInsert:
 		return OpTypeInsert
-	case 1:
+	case protocol.StatementReplace:
 		return OpTypeReplace
-	case 2:
+	case protocol.StatementUpdate:
 		return OpTypeUpdate
-	case 3:
+	case protocol.StatementDelete:
 		return OpTypeDelete
 	default:
 		return OpTypeInsert
