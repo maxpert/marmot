@@ -204,7 +204,10 @@ func (s *EphemeralHookSession) ExecContext(ctx context.Context, query string) er
 	return err
 }
 
-// Commit commits the transaction and closes the connection
+// Commit commits the transaction and closes the connection.
+// Note: CDC intent entries are NOT deleted here. They persist in MetaStore until
+// the distributed transaction completes (commit or abort). Cleanup happens in
+// TransactionManager.cleanupAfterCommit() or cleanupAfterAbort().
 func (s *EphemeralHookSession) Commit() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -217,13 +220,15 @@ func (s *EphemeralHookSession) Commit() error {
 	// Unregister hook and close connection
 	s.cleanup()
 
-	// Delete intent entries from MetaStore (fast indexed delete)
-	s.metaStore.DeleteIntentEntries(s.txnID)
-
 	return txErr
 }
 
-// Rollback aborts the transaction and closes the connection
+// Rollback aborts the hookDB transaction and closes the connection.
+// Note: CDC intent entries are NOT deleted here. They persist in MetaStore until
+// the distributed transaction completes. This is intentional because Rollback()
+// is called in executeStatements() to release the hookDB connection BEFORE 2PC,
+// but the CDC data is still needed for applyDataChanges() during commit phase.
+// Cleanup happens in TransactionManager.cleanupAfterCommit() or cleanupAfterAbort().
 func (s *EphemeralHookSession) Rollback() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -235,9 +240,6 @@ func (s *EphemeralHookSession) Rollback() error {
 
 	// Unregister hook and close connection
 	s.cleanup()
-
-	// Delete intent entries from MetaStore
-	s.metaStore.DeleteIntentEntries(s.txnID)
 
 	return txErr
 }
