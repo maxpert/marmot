@@ -65,26 +65,24 @@ func NewTranspiler(cacheSize int, idGen id.Generator) (*Transpiler, error) {
 // Transpile converts a MySQL query to SQLite by applying transformation rules in priority order.
 // It checks the cache first (if no ID injection is needed) and stores results for future use.
 func (t *Transpiler) Transpile(ctx *QueryContext) error {
-	if !ctx.NeedsTranspile {
-		ctx.TranspiledSQL = ctx.OriginalSQL
-		ctx.TranspiledStatements = []transform.TranspiledStatement{{SQL: ctx.OriginalSQL, Params: ctx.Parameters}}
-		return nil
-	}
-
 	// Check if this statement needs ID injection
 	needsIDInjection := t.autoIncRule != nil && ctx.SchemaLookup != nil &&
-		t.autoIncRule.NeedsIDInjection(ctx.AST, ctx.SchemaLookup)
+		t.autoIncRule.NeedsIDInjection(ctx.MySQLState.AST, ctx.SchemaLookup)
 
 	if !needsIDInjection {
 		// Safe to use cache
-		cacheKey := hashSQL(ctx.OriginalSQL)
+		cacheKey := hashSQL(ctx.Input.SQL)
 		if cached, ok := t.cache.Get(cacheKey); ok {
-			if len(cached.Statements) > 0 {
-				ctx.TranspiledSQL = cached.Statements[0].SQL
+			// Convert transform.TranspiledStatement to query.TranspiledStatement
+			ctx.Output.Statements = make([]TranspiledStatement, len(cached.Statements))
+			for i, ts := range cached.Statements {
+				ctx.Output.Statements[i] = TranspiledStatement{
+					SQL:    ts.SQL,
+					Params: ts.Params,
+				}
 			}
-			ctx.TranspiledStatements = append([]transform.TranspiledStatement{}, cached.Statements...)
-			ctx.Transformations = append([]Transformation{}, cached.Transformations...)
-			ctx.WasCached = true
+			ctx.MySQLState.Transformations = append([]Transformation{}, cached.Transformations...)
+			ctx.MySQLState.WasCached = true
 			return nil
 		}
 	}
@@ -97,7 +95,7 @@ func (t *Transpiler) Transpile(ctx *QueryContext) error {
 	t.serializer.Reset()
 
 	// Apply ID injection FIRST if needed
-	ast := ctx.AST
+	ast := ctx.MySQLState.AST
 	if needsIDInjection {
 		newAST, applied, err := t.autoIncRule.ApplyAST(ast, ctx.SchemaLookup)
 		if err == nil && applied {
@@ -112,7 +110,7 @@ func (t *Transpiler) Transpile(ctx *QueryContext) error {
 
 	// Apply transform rules in priority order
 	for _, rule := range t.transformRules {
-		results, err := rule.Transform(ast, ctx.Parameters, ctx.SchemaProvider, ctx.Database, t.serializer)
+		results, err := rule.Transform(ast, ctx.Input.Parameters, ctx.SchemaProvider, ctx.Output.Database, t.serializer)
 		if errors.Is(err, transform.ErrRuleNotApplicable) {
 			continue
 		}
@@ -131,7 +129,7 @@ func (t *Transpiler) Transpile(ctx *QueryContext) error {
 	// If no rules applied, serialize original AST
 	if len(transpiledStatements) == 0 {
 		sql := t.serializer.Serialize(ast)
-		transpiledStatements = []transform.TranspiledStatement{{SQL: sql, Params: ctx.Parameters}}
+		transpiledStatements = []transform.TranspiledStatement{{SQL: sql, Params: ctx.Input.Parameters}}
 
 		// Collect any indexes extracted by serializer (for KEY definitions in CREATE TABLE)
 		if indexes := t.serializer.ExtractedIndexes(); len(indexes) > 0 {
@@ -141,14 +139,20 @@ func (t *Transpiler) Transpile(ctx *QueryContext) error {
 		}
 	}
 
-	ctx.TranspiledSQL = transpiledStatements[0].SQL
-	ctx.TranspiledStatements = transpiledStatements
-	ctx.AST = ast
-	ctx.Transformations = transformations
+	// Convert transform.TranspiledStatement to query.TranspiledStatement
+	ctx.Output.Statements = make([]TranspiledStatement, len(transpiledStatements))
+	for i, ts := range transpiledStatements {
+		ctx.Output.Statements[i] = TranspiledStatement{
+			SQL:    ts.SQL,
+			Params: ts.Params,
+		}
+	}
+	ctx.MySQLState.AST = ast
+	ctx.MySQLState.Transformations = transformations
 
 	// Only cache if no ID injection was needed
 	if !needsIDInjection {
-		cacheKey := hashSQL(ctx.OriginalSQL)
+		cacheKey := hashSQL(ctx.Input.SQL)
 		t.cache.Add(cacheKey, CachedTranspilation{
 			Statements:      transpiledStatements,
 			Transformations: transformations,

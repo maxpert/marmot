@@ -53,8 +53,11 @@ func ParseConsistencyLevel(s string) (ConsistencyLevel, error) {
 type StatementType int
 
 const (
+	// Unknown - not yet classified (zero value)
+	StatementUnknown StatementType = iota
+
 	// DML - Data Manipulation
-	StatementInsert StatementType = iota
+	StatementInsert
 	StatementReplace
 	StatementUpdate
 	StatementDelete

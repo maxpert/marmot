@@ -38,16 +38,21 @@ func TestYCSB_LoadPhase(t *testing.T) {
 				t.Fatalf("Pipeline processing failed: %v", err)
 			}
 
-			if ctx.TranspiledSQL != tt.expected {
-				t.Errorf("Transpilation mismatch\nGot:      %s\nExpected: %s", ctx.TranspiledSQL, tt.expected)
+			transpiledSQL := ""
+			if len(ctx.Output.Statements) > 0 {
+				transpiledSQL = ctx.Output.Statements[0].SQL
 			}
 
-			if !ctx.IsValid {
-				t.Errorf("Query validation failed: %v", ctx.ValidationErr)
+			if transpiledSQL != tt.expected {
+				t.Errorf("Transpilation mismatch\nGot:      %s\nExpected: %s", transpiledSQL, tt.expected)
 			}
 
-			if ctx.StatementType != StatementInsert {
-				t.Errorf("Expected INSERT statement type, got %d", ctx.StatementType)
+			if !ctx.Output.IsValid {
+				t.Errorf("Query validation failed: %v", ctx.Output.ValidationErr)
+			}
+
+			if ctx.Output.StatementType != StatementInsert {
+				t.Errorf("Expected INSERT statement type, got %d", ctx.Output.StatementType)
 			}
 		})
 	}
@@ -95,15 +100,20 @@ func TestYCSB_ReadWorkload(t *testing.T) {
 				t.Fatalf("Pipeline processing failed: %v", err)
 			}
 
-			if ctx.TranspiledSQL != tt.expected {
-				t.Errorf("Transpilation mismatch\nGot:      %s\nExpected: %s", ctx.TranspiledSQL, tt.expected)
+			transpiledSQL := ""
+			if len(ctx.Output.Statements) > 0 {
+				transpiledSQL = ctx.Output.Statements[0].SQL
 			}
 
-			if ctx.StatementType != StatementSelect {
-				t.Errorf("Expected SELECT statement type, got %d", ctx.StatementType)
+			if transpiledSQL != tt.expected {
+				t.Errorf("Transpilation mismatch\nGot:      %s\nExpected: %s", transpiledSQL, tt.expected)
 			}
 
-			if !ctx.IsReadOnly {
+			if ctx.Output.StatementType != StatementSelect {
+				t.Errorf("Expected SELECT statement type, got %d", ctx.Output.StatementType)
+			}
+
+			if !ctx.Output.StatementType.IsReadOnly() {
 				t.Errorf("Expected read-only query")
 			}
 		})
@@ -147,15 +157,20 @@ func TestYCSB_UpdateWorkload(t *testing.T) {
 				t.Fatalf("Pipeline processing failed: %v", err)
 			}
 
-			if ctx.TranspiledSQL != tt.expected {
-				t.Errorf("Transpilation mismatch\nGot:      %s\nExpected: %s", ctx.TranspiledSQL, tt.expected)
+			transpiledSQL := ""
+			if len(ctx.Output.Statements) > 0 {
+				transpiledSQL = ctx.Output.Statements[0].SQL
 			}
 
-			if ctx.StatementType != StatementUpdate {
-				t.Errorf("Expected UPDATE statement type, got %d", ctx.StatementType)
+			if transpiledSQL != tt.expected {
+				t.Errorf("Transpilation mismatch\nGot:      %s\nExpected: %s", transpiledSQL, tt.expected)
 			}
 
-			if !ctx.IsMutation {
+			if ctx.Output.StatementType != StatementUpdate {
+				t.Errorf("Expected UPDATE statement type, got %d", ctx.Output.StatementType)
+			}
+
+			if !ctx.Output.StatementType.IsMutation() {
 				t.Errorf("Expected mutation query")
 			}
 		})
@@ -189,12 +204,17 @@ func TestYCSB_DeleteWorkload(t *testing.T) {
 				t.Fatalf("Pipeline processing failed: %v", err)
 			}
 
-			if ctx.TranspiledSQL != tt.expected {
-				t.Errorf("Transpilation mismatch\nGot:      %s\nExpected: %s", ctx.TranspiledSQL, tt.expected)
+			transpiledSQL := ""
+			if len(ctx.Output.Statements) > 0 {
+				transpiledSQL = ctx.Output.Statements[0].SQL
 			}
 
-			if ctx.StatementType != StatementDelete {
-				t.Errorf("Expected DELETE statement type, got %d", ctx.StatementType)
+			if transpiledSQL != tt.expected {
+				t.Errorf("Transpilation mismatch\nGot:      %s\nExpected: %s", transpiledSQL, tt.expected)
+			}
+
+			if ctx.Output.StatementType != StatementDelete {
+				t.Errorf("Expected DELETE statement type, got %d", ctx.Output.StatementType)
 			}
 		})
 	}
@@ -232,12 +252,17 @@ func TestYCSB_ScanWorkload(t *testing.T) {
 				t.Fatalf("Pipeline processing failed: %v", err)
 			}
 
-			if ctx.TranspiledSQL != tt.expected {
-				t.Errorf("Transpilation mismatch\nGot:      %s\nExpected: %s", ctx.TranspiledSQL, tt.expected)
+			transpiledSQL := ""
+			if len(ctx.Output.Statements) > 0 {
+				transpiledSQL = ctx.Output.Statements[0].SQL
 			}
 
-			if ctx.StatementType != StatementSelect {
-				t.Errorf("Expected SELECT statement type, got %d", ctx.StatementType)
+			if transpiledSQL != tt.expected {
+				t.Errorf("Transpilation mismatch\nGot:      %s\nExpected: %s", transpiledSQL, tt.expected)
+			}
+
+			if ctx.Output.StatementType != StatementSelect {
+				t.Errorf("Expected SELECT statement type, got %d", ctx.Output.StatementType)
 			}
 		})
 	}
@@ -280,12 +305,17 @@ func TestYCSB_ComplexScenarios(t *testing.T) {
 				t.Fatalf("Pipeline processing failed: %v", err)
 			}
 
-			if ctx.TranspiledSQL != tt.expected {
-				t.Errorf("Transpilation mismatch\nGot:      %s\nExpected: %s", ctx.TranspiledSQL, tt.expected)
+			transpiledSQL := ""
+			if len(ctx.Output.Statements) > 0 {
+				transpiledSQL = ctx.Output.Statements[0].SQL
 			}
 
-			if !ctx.IsValid {
-				t.Errorf("Query validation failed: %v", ctx.ValidationErr)
+			if transpiledSQL != tt.expected {
+				t.Errorf("Transpilation mismatch\nGot:      %s\nExpected: %s", transpiledSQL, tt.expected)
+			}
+
+			if !ctx.Output.IsValid {
+				t.Errorf("Query validation failed: %v", ctx.Output.ValidationErr)
 			}
 		})
 	}
@@ -328,16 +358,21 @@ func TestYCSB_PreparedStatementParameters(t *testing.T) {
 				t.Fatalf("Pipeline processing failed: %v", err)
 			}
 
+			transpiledSQL := ""
+			if len(ctx.Output.Statements) > 0 {
+				transpiledSQL = ctx.Output.Statements[0].SQL
+			}
+
 			// Count ? placeholders in transpiled SQL
 			paramCount := 0
-			for _, ch := range ctx.TranspiledSQL {
+			for _, ch := range transpiledSQL {
 				if ch == '?' {
 					paramCount++
 				}
 			}
 
 			if paramCount != tt.expectedParams {
-				t.Errorf("Expected %d parameters, found %d in: %s", tt.expectedParams, paramCount, ctx.TranspiledSQL)
+				t.Errorf("Expected %d parameters, found %d in: %s", tt.expectedParams, paramCount, transpiledSQL)
 			}
 		})
 	}
@@ -370,12 +405,8 @@ func TestYCSB_TableCreation(t *testing.T) {
 		t.Fatalf("Pipeline processing failed: %v", err)
 	}
 
-	if ctx.StatementType != StatementDDL {
-		t.Errorf("Expected DDL statement type, got %d", ctx.StatementType)
-	}
-
-	if ctx.TableName != "usertable" {
-		t.Errorf("Expected table name 'usertable', got '%s'", ctx.TableName)
+	if ctx.Output.StatementType != StatementDDL {
+		t.Errorf("Expected DDL statement type, got %d", ctx.Output.StatementType)
 	}
 }
 
@@ -394,7 +425,7 @@ func TestYCSB_CacheEffectiveness(t *testing.T) {
 	if err := pipeline.Process(ctx1); err != nil {
 		t.Fatalf("First pipeline processing failed: %v", err)
 	}
-	if ctx1.WasCached {
+	if ctx1.MySQLState != nil && ctx1.MySQLState.WasCached {
 		t.Error("First execution should not be cached")
 	}
 
@@ -403,13 +434,21 @@ func TestYCSB_CacheEffectiveness(t *testing.T) {
 	if err := pipeline.Process(ctx2); err != nil {
 		t.Fatalf("Second pipeline processing failed: %v", err)
 	}
-	if !ctx2.WasCached {
+	if ctx2.MySQLState == nil || !ctx2.MySQLState.WasCached {
 		t.Error("Second execution should be cached")
 	}
 
 	// Verify results are identical
-	if ctx1.TranspiledSQL != ctx2.TranspiledSQL {
-		t.Errorf("Cached result differs from original\nOriginal: %s\nCached:   %s", ctx1.TranspiledSQL, ctx2.TranspiledSQL)
+	sql1 := ""
+	if len(ctx1.Output.Statements) > 0 {
+		sql1 = ctx1.Output.Statements[0].SQL
+	}
+	sql2 := ""
+	if len(ctx2.Output.Statements) > 0 {
+		sql2 = ctx2.Output.Statements[0].SQL
+	}
+	if sql1 != sql2 {
+		t.Errorf("Cached result differs from original\nOriginal: %s\nCached:   %s", sql1, sql2)
 	}
 }
 
@@ -475,16 +514,12 @@ func TestDDL_BothDialects(t *testing.T) {
 				t.Fatalf("Pipeline processing failed: %v", err)
 			}
 
-			if ctx.StatementType != tt.expectedType {
-				t.Errorf("StatementType mismatch: got %d, want %d", ctx.StatementType, tt.expectedType)
+			if ctx.Output.StatementType != tt.expectedType {
+				t.Errorf("StatementType mismatch: got %d, want %d", ctx.Output.StatementType, tt.expectedType)
 			}
 
-			if tt.expectedTableName != "" && ctx.TableName != tt.expectedTableName {
-				t.Errorf("TableName mismatch: got %s, want %s", ctx.TableName, tt.expectedTableName)
-			}
-
-			if ctx.IsMutation != tt.expectMutation {
-				t.Errorf("IsMutation mismatch: got %v, want %v", ctx.IsMutation, tt.expectMutation)
+			if ctx.Output.StatementType.IsMutation() != tt.expectMutation {
+				t.Errorf("IsMutation mismatch: got %v, want %v", ctx.Output.StatementType.IsMutation(), tt.expectMutation)
 			}
 		})
 	}

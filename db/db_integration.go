@@ -458,6 +458,7 @@ func (c *CompletedLocalExecution) GetCDCEntries() []coordinator.CDCEntry {
 	result := make([]coordinator.CDCEntry, len(c.cdcEntries))
 	for i, e := range c.cdcEntries {
 		result[i] = coordinator.CDCEntry{
+			Table:     e.Table,
 			RowKey:    e.RowKey,
 			OldValues: e.OldValues,
 			NewValues: e.NewValues,
@@ -534,6 +535,7 @@ func (p *PendingLocalExecution) GetCDCEntries() []coordinator.CDCEntry {
 	result := make([]coordinator.CDCEntry, len(entries))
 	for i, e := range entries {
 		result[i] = coordinator.CDCEntry{
+			Table:     e.Table,
 			RowKey:    e.RowKey,
 			OldValues: e.OldValues,
 			NewValues: e.NewValues,

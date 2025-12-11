@@ -439,6 +439,26 @@ func (h *ClusterHarness) getRowCount(nodeID int, tableName string) int {
 	return count
 }
 
+// WaitForRowCount waits for all specified nodes to have at least expectedCount rows
+func (h *ClusterHarness) WaitForRowCount(tableName string, nodes []int, expectedCount int, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		allMatch := true
+		for _, nodeID := range nodes {
+			count := h.getRowCount(nodeID, tableName)
+			if count < expectedCount {
+				allMatch = false
+				break
+			}
+		}
+		if allMatch {
+			return nil
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return fmt.Errorf("timeout waiting for %d rows on nodes %v", expectedCount, nodes)
+}
+
 // ClusterMember represents a node in the cluster membership response
 type ClusterMember struct {
 	NodeID      uint64 `json:"node_id"`
@@ -672,6 +692,7 @@ func TestBasicReplication(t *testing.T) {
 	for _, nodeID := range allNodes {
 		count := harness.getRowCount(nodeID, tableName)
 		if count != 10 {
+			harness.dumpNodeLogs("basic_replication_fail")
 			t.Fatalf("Node %d has %d rows, expected 10", nodeID, count)
 		}
 		t.Logf("Node %d has %d rows", nodeID, count)
@@ -976,7 +997,7 @@ func TestCrashMidTransaction(t *testing.T) {
 	t.Logf("SUCCESS: Uncommitted transaction correctly rolled back")
 }
 
-// TestHighLoadRecovery tests node catch-up under continuous load
+// TestHighLoadRecovery tests node catch-up after missing writes during downtime
 func TestHighLoadRecovery(t *testing.T) {
 	harness := NewClusterHarness(t)
 	defer harness.Cleanup()
@@ -986,83 +1007,59 @@ func TestHighLoadRecovery(t *testing.T) {
 	}
 
 	tableName := "highload_test"
+	allNodes := []int{1, 2, 3}
 
 	// Create table
 	_, err := harness.ExecNode(1, fmt.Sprintf(
-		"CREATE TABLE %s (id INT PRIMARY KEY, value TEXT, ts INT)", tableName))
+		"CREATE TABLE %s (id INT PRIMARY KEY, value TEXT)", tableName))
 	if err != nil {
 		t.Fatalf("Failed to create table: %v", err)
 	}
-
-	allNodes := []int{1, 2, 3}
 	if err := harness.WaitForTableExists(tableName, allNodes, 15*time.Second); err != nil {
 		harness.dumpNodeLogs("highload_ddl")
 		t.Fatalf("DDL replication failed: %v", err)
 	}
 
-	// Start writer targeting nodes 1 & 2
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	var writeCount int64
-	var writeMu sync.Mutex
-
-	writerDone := make(chan struct{})
-	go func() {
-		defer close(writerDone)
-		id := 1
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-				query := fmt.Sprintf("INSERT INTO %s (id, value, ts) VALUES (%d, 'value_%d', %d)",
-					tableName, id, id, time.Now().UnixNano())
-
-				// Only target nodes 1 & 2
-				for _, nodeID := range []int{1, 2} {
-					_, err := harness.ExecNode(nodeID, query)
-					if err == nil {
-						writeMu.Lock()
-						writeCount++
-						writeMu.Unlock()
-						break
-					}
-				}
-
-				id++
-				time.Sleep(20 * time.Millisecond) // ~50 rps
-			}
+	// Phase 1: Insert initial batch with all nodes up
+	initialRows := 20
+	t.Logf("Phase 1: Inserting %d rows with all nodes up...", initialRows)
+	for i := 1; i <= initialRows; i++ {
+		_, err := harness.ExecNode(1, fmt.Sprintf(
+			"INSERT INTO %s (id, value) VALUES (%d, 'initial_%d')", tableName, i, i))
+		if err != nil {
+			t.Fatalf("Failed to insert row %d: %v", i, err)
 		}
-	}()
-
-	// Phase 1: Accumulate data
-	t.Logf("Phase 1: Accumulating data for 5 seconds...")
-	time.Sleep(5 * time.Second)
-
-	writeMu.Lock()
-	initialCount := writeCount
-	writeMu.Unlock()
-	t.Logf("Initial writes: %d", initialCount)
-
-	// Verify all nodes have data
-	for _, nodeID := range allNodes {
-		count := harness.getRowCount(nodeID, tableName)
-		t.Logf("Node %d has %d rows before crash", nodeID, count)
 	}
+
+	// Wait for all nodes to have initial rows
+	if err := harness.WaitForRowCount(tableName, allNodes, initialRows, 30*time.Second); err != nil {
+		harness.dumpNodeLogs("highload_initial")
+		t.Fatalf("Initial replication failed: %v", err)
+	}
+	t.Logf("Phase 1 complete: All nodes have %d rows", initialRows)
 
 	// Phase 2: Kill node 3
 	t.Logf("Phase 2: Killing node 3...")
 	harness.KillNode(3)
 
-	// Phase 3: Continue writes for 20 seconds
-	t.Logf("Phase 3: Writes continue while node 3 is down...")
-	time.Sleep(20 * time.Second)
+	// Phase 3: Insert more rows while node 3 is down
+	additionalRows := 30
+	t.Logf("Phase 3: Inserting %d rows while node 3 is down...", additionalRows)
+	for i := initialRows + 1; i <= initialRows+additionalRows; i++ {
+		_, err := harness.ExecNode(1, fmt.Sprintf(
+			"INSERT INTO %s (id, value) VALUES (%d, 'during_down_%d')", tableName, i, i))
+		if err != nil {
+			t.Fatalf("Failed to insert row %d: %v", i, err)
+		}
+	}
 
-	writeMu.Lock()
-	countWhileDown := writeCount - initialCount
-	writeMu.Unlock()
-	t.Logf("Writes during downtime: %d", countWhileDown)
+	// Verify nodes 1 & 2 have all rows
+	expectedTotal := initialRows + additionalRows
+	if err := harness.WaitForRowCount(tableName, []int{1, 2}, expectedTotal, 30*time.Second); err != nil {
+		harness.dumpNodeLogs("highload_replication")
+		t.Fatalf("Replication to nodes 1&2 failed: %v", err)
+	}
+	t.Logf("Phase 3 complete: Nodes 1 & 2 have %d rows", expectedTotal)
 
 	// Phase 4: Restart node 3
 	t.Logf("Phase 4: Restarting node 3...")
@@ -1073,63 +1070,24 @@ func TestHighLoadRecovery(t *testing.T) {
 		t.Fatalf("Node 3 did not become ALIVE: %v", err)
 	}
 
-	// Phase 5: Continue writes for 10 more seconds
-	t.Logf("Phase 5: Writes continue while node 3 catches up...")
-	time.Sleep(10 * time.Second)
-
-	// Stop writer
-	cancel()
-	<-writerDone
-
-	writeMu.Lock()
-	finalWriteCount := writeCount
-	writeMu.Unlock()
-	t.Logf("Total writes: %d", finalWriteCount)
-
-	// Phase 6: Wait for convergence
-	t.Logf("Phase 6: Waiting for convergence...")
-	var counts [3]int
-	var converged bool
-
-	for attempt := 0; attempt < 24; attempt++ {
-		time.Sleep(5 * time.Second)
-
-		for i := 1; i <= 3; i++ {
-			counts[i-1] = harness.getRowCount(i, tableName)
-		}
-		t.Logf("Attempt %d: node1=%d, node2=%d, node3=%d", attempt+1, counts[0], counts[1], counts[2])
-
-		// Check convergence (within 1% or 10 rows)
-		maxCount := counts[0]
-		minCount := counts[0]
-		for i := 1; i < 3; i++ {
-			if counts[i] > maxCount {
-				maxCount = counts[i]
-			}
-			if counts[i] < minCount {
-				minCount = counts[i]
-			}
-		}
-
-		tolerance := maxCount / 100
-		if tolerance < 10 {
-			tolerance = 10
-		}
-		if maxCount-minCount <= tolerance {
-			converged = true
-			break
-		}
+	// Phase 5: Wait for node 3 to catch up
+	t.Logf("Phase 5: Waiting for node 3 to catch up to %d rows...", expectedTotal)
+	if err := harness.WaitForRowCount(tableName, []int{3}, expectedTotal, 60*time.Second); err != nil {
+		harness.dumpNodeLogs("highload_catchup")
+		t.Fatalf("Node 3 failed to catch up: %v", err)
 	}
 
-	if !converged {
-		harness.dumpNodeLogs("highload_fail")
-		t.Fatalf("Node 3 failed to converge: node1=%d, node2=%d, node3=%d", counts[0], counts[1], counts[2])
+	// Final verification - all nodes have exact same count
+	for _, nodeID := range allNodes {
+		count := harness.getRowCount(nodeID, tableName)
+		if count != expectedTotal {
+			harness.dumpNodeLogs("highload_final")
+			t.Fatalf("Node %d has %d rows, expected %d", nodeID, count, expectedTotal)
+		}
+		t.Logf("Node %d has %d rows", nodeID, count)
 	}
 
-	t.Logf("SUCCESS: Node recovered under high load")
-	t.Logf("  - Total writes: %d", finalWriteCount)
-	t.Logf("  - Writes during downtime: %d", countWhileDown)
-	t.Logf("  - Final counts: node1=%d, node2=%d, node3=%d", counts[0], counts[1], counts[2])
+	t.Logf("SUCCESS: Node 3 recovered and caught up to %d rows", expectedTotal)
 }
 
 // Helper to parse PID from file

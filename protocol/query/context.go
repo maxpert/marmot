@@ -4,7 +4,6 @@ import (
 	"strings"
 
 	"github.com/maxpert/marmot/protocol/query/transform"
-	rqlitesql "github.com/rqlite/sql"
 	"vitess.io/vitess/go/vt/sqlparser"
 )
 
@@ -29,7 +28,8 @@ type Transformation struct {
 type StatementType int
 
 const (
-	StatementInsert StatementType = iota
+	StatementUnknown StatementType = iota // 0 - means not yet classified
+	StatementInsert
 	StatementReplace
 	StatementUpdate
 	StatementDelete
@@ -86,71 +86,94 @@ type InformationSchemaFilter struct {
 	ColumnName string // From COLUMN_NAME = 'x'
 }
 
-// QueryContext holds all state for processing a single query through the pipeline.
-type QueryContext struct {
-	OriginalSQL string
-	Parameters  []interface{}
+// QueryInput holds the input parameters for a query.
+type QueryInput struct {
+	SQL        string
+	Parameters []interface{}
+	Dialect    Dialect
+}
 
-	AST           sqlparser.Statement // Vitess AST (for MySQL dialect)
-	SQLiteAST     rqlitesql.Statement // rqlite AST (for SQLite dialect)
+// QueryOutput holds the results of query processing.
+type QueryOutput struct {
+	Statements    []TranspiledStatement
 	StatementType StatementType
-	TableName     string
 	Database      string
-
-	SourceDialect  Dialect
-	NeedsTranspile bool
-
-	TranspiledSQL        string                          // Primary transpiled statement (backwards compat)
-	TranspiledStatements []transform.TranspiledStatement // All statements (main + additional like CREATE INDEX)
-	Transformations      []Transformation
-	WasCached            bool
-
 	IsValid       bool
 	ValidationErr error
+}
 
-	IsMutation      bool
-	IsReadOnly      bool
+// TranspiledStatement represents a single transpiled SQL statement with parameters.
+type TranspiledStatement struct {
+	SQL             string
+	Params          []interface{}
 	RequiresPrepare bool
+}
 
-	// InformationSchema filter values extracted from WHERE clause (for INFORMATION_SCHEMA queries)
-	ISFilter InformationSchemaFilter
-
-	// InformationSchema table type (which table is being queried)
-	ISTableType InformationSchemaTableType
-
-	// Virtual table type (for MARMOT_* virtual tables)
+// MySQLParseState holds MySQL-specific parsing state and metadata.
+type MySQLParseState struct {
+	AST              sqlparser.Statement
+	Transformations  []Transformation
+	WasCached        bool
+	ISTableType      InformationSchemaTableType
+	ISFilter         InformationSchemaFilter
 	VirtualTableType VirtualTableType
+	SystemVarNames   []string
+	// TableName extracted from SQL for:
+	// - Metadata queries (SHOW COLUMNS, SHOW CREATE TABLE, etc.)
+	// - DML queries (INSERT, UPDATE, DELETE) for CDC schema preloading
+	TableName string
+}
 
-	// System variable metadata (for @@var and DATABASE() queries)
-	SystemVarNames []string // List of system variables referenced (e.g., ["version", "sql_mode"])
-
-	// HasFoundRowsCalc indicates SQL_CALC_FOUND_ROWS was in the original query
-	// and COUNT(*) OVER() was appended. Execution layer should extract the count.
-	HasFoundRowsCalc bool
-
-	ExecutionErr error
-	RowsAffected int64
-	ResultSet    interface{}
-
-	// SchemaLookup returns the auto-increment column name for a table, or empty string if none.
-	// This is set by the handler before processing to enable schema-based ID injection.
-	SchemaLookup func(table string) string
-
-	// SchemaProvider returns full schema info for conflict target detection and ID injection.
-	// Takes (database, table) and returns SchemaInfo or nil.
+// QueryContext holds all state for processing a single query through the pipeline.
+type QueryContext struct {
+	Input          QueryInput
+	Output         QueryOutput
+	MySQLState     *MySQLParseState // nil for SQLite dialect
+	SchemaLookup   func(table string) string
 	SchemaProvider transform.SchemaProvider
 }
 
+// IsMutation returns true if the statement type is a mutation operation.
+func (t StatementType) IsMutation() bool {
+	switch t {
+	case StatementInsert, StatementReplace, StatementUpdate, StatementDelete,
+		StatementLoadData, StatementDDL, StatementDCL, StatementAdmin,
+		StatementCreateDatabase, StatementDropDatabase:
+		return true
+	}
+	return false
+}
+
+// IsReadOnly returns true if the statement type is read-only.
+func (t StatementType) IsReadOnly() bool {
+	switch t {
+	case StatementSelect, StatementShowDatabases, StatementShowTables,
+		StatementShowColumns, StatementShowCreateTable, StatementShowIndexes,
+		StatementShowTableStatus, StatementInformationSchema:
+		return true
+	}
+	return false
+}
+
 // NewContext creates a new QueryContext for the given SQL and parameters.
-// It automatically detects the SQL dialect and sets the NeedsTranspile flag.
+// It automatically detects the SQL dialect.
 func NewContext(sql string, params []interface{}) *QueryContext {
+	dialect := detectDialect(sql)
 	ctx := &QueryContext{
-		OriginalSQL: sql,
-		Parameters:  params,
+		Input: QueryInput{
+			SQL:        sql,
+			Parameters: params,
+			Dialect:    dialect,
+		},
+		Output: QueryOutput{
+			Statements: []TranspiledStatement{},
+		},
 	}
 
-	ctx.SourceDialect = detectDialect(sql)
-	ctx.NeedsTranspile = (ctx.SourceDialect == DialectMySQL)
+	// Initialize MySQLState only for MySQL dialect
+	if dialect == DialectMySQL {
+		ctx.MySQLState = &MySQLParseState{}
+	}
 
 	return ctx
 }

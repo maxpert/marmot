@@ -336,15 +336,15 @@ func TestComplexQueries(t *testing.T) {
 				t.Fatalf("pipeline.Process failed: %v", err)
 			}
 
-			if ctx.StatementType != tt.wantType {
-				t.Errorf("StatementType = %d, want %d", ctx.StatementType, tt.wantType)
+			if ctx.Output.StatementType != tt.wantType {
+				t.Errorf("StatementType = %d, want %d", ctx.Output.StatementType, tt.wantType)
 			}
 
-			if len(tt.wantSysVars) > 0 {
-				if len(ctx.SystemVarNames) != len(tt.wantSysVars) {
-					t.Errorf("SystemVarNames count = %d, want %d: got=%v", len(ctx.SystemVarNames), len(tt.wantSysVars), ctx.SystemVarNames)
+			if len(tt.wantSysVars) > 0 && ctx.MySQLState != nil {
+				if len(ctx.MySQLState.SystemVarNames) != len(tt.wantSysVars) {
+					t.Errorf("SystemVarNames count = %d, want %d: got=%v", len(ctx.MySQLState.SystemVarNames), len(tt.wantSysVars), ctx.MySQLState.SystemVarNames)
 				} else {
-					for i, v := range ctx.SystemVarNames {
+					for i, v := range ctx.MySQLState.SystemVarNames {
 						if v != tt.wantSysVars[i] {
 							t.Errorf("SystemVarNames[%d] = %q, want %q", i, v, tt.wantSysVars[i])
 						}
@@ -352,15 +352,15 @@ func TestComplexQueries(t *testing.T) {
 				}
 			}
 
-			if tt.wantVirtualTable != VirtualTableUnknown {
-				if ctx.VirtualTableType != tt.wantVirtualTable {
-					t.Errorf("VirtualTableType = %d, want %d", ctx.VirtualTableType, tt.wantVirtualTable)
+			if tt.wantVirtualTable != VirtualTableUnknown && ctx.MySQLState != nil {
+				if ctx.MySQLState.VirtualTableType != tt.wantVirtualTable {
+					t.Errorf("VirtualTableType = %d, want %d", ctx.MySQLState.VirtualTableType, tt.wantVirtualTable)
 				}
 			}
 
-			if tt.wantISTableType != ISTableUnknown {
-				if ctx.ISTableType != tt.wantISTableType {
-					t.Errorf("ISTableType = %d, want %d", ctx.ISTableType, tt.wantISTableType)
+			if tt.wantISTableType != ISTableUnknown && ctx.MySQLState != nil {
+				if ctx.MySQLState.ISTableType != tt.wantISTableType {
+					t.Errorf("ISTableType = %d, want %d", ctx.MySQLState.ISTableType, tt.wantISTableType)
 				}
 			}
 		})
@@ -486,18 +486,18 @@ func TestExplainTableStatement(t *testing.T) {
 				t.Fatalf("failed to parse SQL: %v", err)
 			}
 
-			ctx := &QueryContext{}
+			ctx := &QueryContext{
+				Output:     QueryOutput{},
+				MySQLState: &MySQLParseState{},
+			}
 			classifyStatement(ctx, stmt)
 			extractMetadata(ctx, stmt)
 
-			if ctx.StatementType != tt.wantType {
-				t.Errorf("StatementType = %d, want %d", ctx.StatementType, tt.wantType)
+			if ctx.Output.StatementType != tt.wantType {
+				t.Errorf("StatementType = %d, want %d", ctx.Output.StatementType, tt.wantType)
 			}
-			if ctx.TableName != tt.wantTableName {
-				t.Errorf("TableName = %q, want %q", ctx.TableName, tt.wantTableName)
-			}
-			if ctx.Database != tt.wantDatabase {
-				t.Errorf("Database = %q, want %q", ctx.Database, tt.wantDatabase)
+			if ctx.Output.Database != tt.wantDatabase {
+				t.Errorf("Database = %q, want %q", ctx.Output.Database, tt.wantDatabase)
 			}
 		})
 	}

@@ -163,6 +163,19 @@ func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transacti
 	// On conflict: abort and return MySQL 1213 to client for retry.
 	// No internal retry - client handles retry at application level.
 
+	// Validate statements have required fields for CDC replication
+	for i, stmt := range txn.Statements {
+		hasCDCData := len(stmt.OldValues) > 0 || len(stmt.NewValues) > 0
+		if hasCDCData && stmt.TableName == "" {
+			log.Error().
+				Uint64("txn_id", txn.ID).
+				Int("stmt_index", i).
+				Str("sql", stmt.SQL).
+				Msg("CRITICAL: CDC statement missing TableName - this would fail on remote nodes")
+			return fmt.Errorf("CDC statement missing TableName (stmt %d)", i)
+		}
+	}
+
 	prepReq := &ReplicationRequest{
 		TxnID:                 txn.ID,
 		NodeID:                wc.nodeID,

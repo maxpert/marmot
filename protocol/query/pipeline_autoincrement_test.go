@@ -22,6 +22,28 @@ func mockSchemaLookup(tableColumns map[string]string) func(string) string {
 	}
 }
 
+
+func getTranspiledSQL(ctx *QueryContext) string {
+	if len(ctx.Output.Statements) > 0 {
+		return ctx.Output.Statements[0].SQL
+	}
+	return ""
+}
+
+func getTransformations(ctx *QueryContext) []Transformation {
+	if ctx.MySQLState != nil {
+		return ctx.MySQLState.Transformations
+	}
+	return nil
+}
+
+func getWasCached(ctx *QueryContext) bool {
+	if ctx.MySQLState != nil {
+		return ctx.MySQLState.WasCached
+	}
+	return false
+}
+
 func TestPipelineAutoIncrementIDInjection(t *testing.T) {
 	// Use mock ID generator
 	idGen := &mockIDGenerator{}
@@ -40,11 +62,11 @@ func TestPipelineAutoIncrementIDInjection(t *testing.T) {
 	ctx := NewContext(sql, nil)
 	ctx.SchemaLookup = schemaLookup
 
-	if ctx.SourceDialect != DialectMySQL {
-		t.Errorf("Expected DialectMySQL, got %v", ctx.SourceDialect)
+	if ctx.Input.Dialect != DialectMySQL {
+		t.Errorf("Expected DialectMySQL, got %v", ctx.Input.Dialect)
 	}
 
-	if !ctx.NeedsTranspile {
+	if !(ctx.Input.Dialect == DialectMySQL) {
 		t.Errorf("Expected NeedsTranspile to be true")
 	}
 
@@ -53,25 +75,25 @@ func TestPipelineAutoIncrementIDInjection(t *testing.T) {
 		t.Fatalf("Pipeline error: %v", err)
 	}
 
-	t.Logf("Original SQL: %s", ctx.OriginalSQL)
-	t.Logf("Transpiled SQL: %s", ctx.TranspiledSQL)
-	t.Logf("Transformations: %+v", ctx.Transformations)
+	t.Logf("Original SQL: %s", ctx.Input.SQL)
+	t.Logf("Transpiled SQL: %s", getTranspiledSQL(ctx))
+	t.Logf("Transformations: %+v", getTransformations(ctx))
 
 	// The transpiled SQL should contain the generated ID (1) instead of 0
-	if !strings.Contains(ctx.TranspiledSQL, "(1, 1,") {
-		t.Errorf("Expected transpiled SQL to contain generated ID '1', got: %s", ctx.TranspiledSQL)
+	if !strings.Contains(getTranspiledSQL(ctx), "(1, 1,") {
+		t.Errorf("Expected transpiled SQL to contain generated ID '1', got: %s", getTranspiledSQL(ctx))
 	}
 
 	// Should have AutoIncrementID transformation
 	found := false
-	for _, tr := range ctx.Transformations {
+	for _, tr := range getTransformations(ctx) {
 		if tr.Rule == "AutoIncrementID" {
 			found = true
 			break
 		}
 	}
 	if !found {
-		t.Errorf("Expected AutoIncrementID transformation, got: %+v", ctx.Transformations)
+		t.Errorf("Expected AutoIncrementID transformation, got: %+v", getTransformations(ctx))
 	}
 }
 
@@ -97,11 +119,11 @@ func TestPipelineAutoIncrementIDInjection_NullValue(t *testing.T) {
 		t.Fatalf("Pipeline error: %v", err)
 	}
 
-	t.Logf("Transpiled SQL: %s", ctx.TranspiledSQL)
+	t.Logf("Transpiled SQL: %s", getTranspiledSQL(ctx))
 
 	// The NULL should be replaced with generated ID
-	if strings.Contains(strings.ToLower(ctx.TranspiledSQL), "null") {
-		t.Errorf("Expected NULL to be replaced with ID, got: %s", ctx.TranspiledSQL)
+	if strings.Contains(strings.ToLower(getTranspiledSQL(ctx)), "null") {
+		t.Errorf("Expected NULL to be replaced with ID, got: %s", getTranspiledSQL(ctx))
 	}
 }
 
@@ -121,11 +143,11 @@ func TestPipelineAutoIncrementIDInjection_NoGenerator(t *testing.T) {
 		t.Fatalf("Pipeline error: %v", err)
 	}
 
-	t.Logf("Transpiled SQL: %s", ctx.TranspiledSQL)
+	t.Logf("Transpiled SQL: %s", getTranspiledSQL(ctx))
 
 	// Without ID generator, the 0 should remain as 0
-	if !strings.Contains(ctx.TranspiledSQL, "(0, 1,") {
-		t.Errorf("Expected 0 to remain unchanged without ID generator, got: %s", ctx.TranspiledSQL)
+	if !strings.Contains(getTranspiledSQL(ctx), "(0, 1,") {
+		t.Errorf("Expected 0 to remain unchanged without ID generator, got: %s", getTranspiledSQL(ctx))
 	}
 }
 
@@ -151,11 +173,11 @@ func TestPipelineAutoIncrementIDInjection_ExplicitID(t *testing.T) {
 		t.Fatalf("Pipeline error: %v", err)
 	}
 
-	t.Logf("Transpiled SQL: %s", ctx.TranspiledSQL)
+	t.Logf("Transpiled SQL: %s", getTranspiledSQL(ctx))
 
 	// The explicit ID 12345 should remain unchanged
-	if !strings.Contains(ctx.TranspiledSQL, "12345") {
-		t.Errorf("Expected explicit ID 12345 to remain unchanged, got: %s", ctx.TranspiledSQL)
+	if !strings.Contains(getTranspiledSQL(ctx), "12345") {
+		t.Errorf("Expected explicit ID 12345 to remain unchanged, got: %s", getTranspiledSQL(ctx))
 	}
 }
 
@@ -180,17 +202,17 @@ func TestPipelineAutoIncrementIDInjection_MultiRow(t *testing.T) {
 		t.Fatalf("Pipeline error: %v", err)
 	}
 
-	t.Logf("Transpiled SQL: %s", ctx.TranspiledSQL)
+	t.Logf("Transpiled SQL: %s", getTranspiledSQL(ctx))
 
 	// First two rows should have generated IDs (1, 2), third row keeps explicit 100
-	if !strings.Contains(ctx.TranspiledSQL, "(1, 'alice')") {
-		t.Errorf("Expected first row to have ID 1, got: %s", ctx.TranspiledSQL)
+	if !strings.Contains(getTranspiledSQL(ctx), "(1, 'alice')") {
+		t.Errorf("Expected first row to have ID 1, got: %s", getTranspiledSQL(ctx))
 	}
-	if !strings.Contains(ctx.TranspiledSQL, "(2, 'bob')") {
-		t.Errorf("Expected second row to have ID 2, got: %s", ctx.TranspiledSQL)
+	if !strings.Contains(getTranspiledSQL(ctx), "(2, 'bob')") {
+		t.Errorf("Expected second row to have ID 2, got: %s", getTranspiledSQL(ctx))
 	}
-	if !strings.Contains(ctx.TranspiledSQL, "(100, 'charlie')") {
-		t.Errorf("Expected third row to keep explicit ID 100, got: %s", ctx.TranspiledSQL)
+	if !strings.Contains(getTranspiledSQL(ctx), "(100, 'charlie')") {
+		t.Errorf("Expected third row to keep explicit ID 100, got: %s", getTranspiledSQL(ctx))
 	}
 }
 
@@ -211,11 +233,11 @@ func TestPipelineAutoIncrementIDInjection_UnregisteredTable(t *testing.T) {
 		t.Fatalf("Pipeline error: %v", err)
 	}
 
-	t.Logf("Transpiled SQL: %s", ctx.TranspiledSQL)
+	t.Logf("Transpiled SQL: %s", getTranspiledSQL(ctx))
 
 	// Without schema lookup, the 0 should remain as 0
-	if !strings.Contains(ctx.TranspiledSQL, "(0, 'test')") {
-		t.Errorf("Expected 0 to remain unchanged for unregistered table, got: %s", ctx.TranspiledSQL)
+	if !strings.Contains(getTranspiledSQL(ctx), "(0, 'test')") {
+		t.Errorf("Expected 0 to remain unchanged for unregistered table, got: %s", getTranspiledSQL(ctx))
 	}
 }
 
@@ -246,22 +268,22 @@ func TestPipelineAutoIncrementIDInjection_CacheBypassForIDInjection(t *testing.T
 		t.Fatalf("Pipeline error (second): %v", err)
 	}
 
-	t.Logf("First transpiled SQL: %s", ctx1.TranspiledSQL)
-	t.Logf("Second transpiled SQL: %s", ctx2.TranspiledSQL)
+	t.Logf("First transpiled SQL: %s", getTranspiledSQL(ctx1))
+	t.Logf("Second transpiled SQL: %s", getTranspiledSQL(ctx2))
 
 	// First should get ID 1, second should get ID 2
-	if !strings.Contains(ctx1.TranspiledSQL, "(1, 'test')") {
-		t.Errorf("Expected first query to have ID 1, got: %s", ctx1.TranspiledSQL)
+	if !strings.Contains(getTranspiledSQL(ctx1), "(1, 'test')") {
+		t.Errorf("Expected first query to have ID 1, got: %s", getTranspiledSQL(ctx1))
 	}
-	if !strings.Contains(ctx2.TranspiledSQL, "(2, 'test')") {
-		t.Errorf("Expected second query to have ID 2, got: %s", ctx2.TranspiledSQL)
+	if !strings.Contains(getTranspiledSQL(ctx2), "(2, 'test')") {
+		t.Errorf("Expected second query to have ID 2, got: %s", getTranspiledSQL(ctx2))
 	}
 
 	// Neither should be cached (ID injection bypasses cache)
-	if ctx1.WasCached {
+	if getWasCached(ctx1) {
 		t.Errorf("First query should not be cached")
 	}
-	if ctx2.WasCached {
+	if getWasCached(ctx2) {
 		t.Errorf("Second query should not be cached")
 	}
 }
@@ -288,15 +310,15 @@ func TestPipelineAutoIncrementIDInjection_InsertIgnoreWithPatternTransform(t *te
 		t.Fatalf("Pipeline error: %v", err)
 	}
 
-	t.Logf("Transpiled SQL: %s", ctx.TranspiledSQL)
+	t.Logf("Transpiled SQL: %s", getTranspiledSQL(ctx))
 
 	// Should have generated ID
-	if !strings.Contains(ctx.TranspiledSQL, "(1, 'test')") {
-		t.Errorf("Expected ID to be injected, got: %s", ctx.TranspiledSQL)
+	if !strings.Contains(getTranspiledSQL(ctx), "(1, 'test')") {
+		t.Errorf("Expected ID to be injected, got: %s", getTranspiledSQL(ctx))
 	}
 
 	// Should have INSERT OR IGNORE (pattern transformation from InsertIgnoreRule)
-	if !strings.Contains(strings.ToUpper(ctx.TranspiledSQL), "INSERT OR IGNORE") {
-		t.Errorf("Expected INSERT OR IGNORE transformation, got: %s", ctx.TranspiledSQL)
+	if !strings.Contains(strings.ToUpper(getTranspiledSQL(ctx)), "INSERT OR IGNORE") {
+		t.Errorf("Expected INSERT OR IGNORE transformation, got: %s", getTranspiledSQL(ctx))
 	}
 }

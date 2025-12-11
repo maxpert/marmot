@@ -75,7 +75,11 @@ func TestDetectFoundRowsFunction(t *testing.T) {
 
 			// Check if FOUND_ROWS() was detected
 			hasFoundRows := false
-			for _, varName := range ctx.SystemVarNames {
+			var sysVarNames []string
+			if ctx.MySQLState != nil {
+				sysVarNames = ctx.MySQLState.SystemVarNames
+			}
+			for _, varName := range sysVarNames {
 				if varName == "FOUND_ROWS()" {
 					hasFoundRows = true
 					break
@@ -83,16 +87,16 @@ func TestDetectFoundRowsFunction(t *testing.T) {
 			}
 
 			if tt.shouldDetect && !hasFoundRows {
-				t.Errorf("Expected FOUND_ROWS() to be detected in SystemVarNames, got: %v", ctx.SystemVarNames)
+				t.Errorf("Expected FOUND_ROWS() to be detected in SystemVarNames, got: %v", sysVarNames)
 			}
 
 			if !tt.shouldDetect && hasFoundRows {
-				t.Errorf("FOUND_ROWS() should not be detected, but found in SystemVarNames: %v", ctx.SystemVarNames)
+				t.Errorf("FOUND_ROWS() should not be detected, but found in SystemVarNames: %v", sysVarNames)
 			}
 
 			// If FOUND_ROWS() is detected, statement type should be StatementSystemVariable
-			if hasFoundRows && ctx.StatementType != query.StatementSystemVariable {
-				t.Errorf("StatementType = %d, want StatementSystemVariable (%d)", ctx.StatementType, query.StatementSystemVariable)
+			if hasFoundRows && ctx.Output.StatementType != query.StatementSystemVariable {
+				t.Errorf("StatementType = %d, want StatementSystemVariable (%d)", ctx.Output.StatementType, query.StatementSystemVariable)
 			}
 		})
 	}
@@ -171,7 +175,11 @@ func TestFoundRowsHandlerBehavior(t *testing.T) {
 
 			// Verify FOUND_ROWS() is detected as system variable
 			hasFoundRows := false
-			for _, varName := range ctx.SystemVarNames {
+			var sysVarNames []string
+			if ctx.MySQLState != nil {
+				sysVarNames = ctx.MySQLState.SystemVarNames
+			}
+			for _, varName := range sysVarNames {
 				if varName == "FOUND_ROWS()" {
 					hasFoundRows = true
 					break
@@ -179,11 +187,11 @@ func TestFoundRowsHandlerBehavior(t *testing.T) {
 			}
 
 			if !hasFoundRows {
-				t.Errorf("FOUND_ROWS() not detected in SystemVarNames: %v", ctx.SystemVarNames)
+				t.Errorf("FOUND_ROWS() not detected in SystemVarNames: %v", sysVarNames)
 			}
 
-			if ctx.StatementType != query.StatementSystemVariable {
-				t.Errorf("StatementType = %d, want StatementSystemVariable (%d)", ctx.StatementType, query.StatementSystemVariable)
+			if ctx.Output.StatementType != query.StatementSystemVariable {
+				t.Errorf("StatementType = %d, want StatementSystemVariable (%d)", ctx.Output.StatementType, query.StatementSystemVariable)
 			}
 
 			// Handler implementation will be tested here once implemented
@@ -252,7 +260,11 @@ func TestFoundRowsEdgeCases(t *testing.T) {
 
 			// Verify FOUND_ROWS() is detected
 			hasFoundRows := false
-			for _, varName := range ctx.SystemVarNames {
+			var sysVarNames []string
+			if ctx.MySQLState != nil {
+				sysVarNames = ctx.MySQLState.SystemVarNames
+			}
+			for _, varName := range sysVarNames {
 				if varName == "FOUND_ROWS()" {
 					hasFoundRows = true
 					break
@@ -317,7 +329,11 @@ func TestFoundRowsMixedQueries(t *testing.T) {
 			}
 
 			hasFoundRows := false
-			for _, varName := range ctx.SystemVarNames {
+			var sysVarNames []string
+			if ctx.MySQLState != nil {
+				sysVarNames = ctx.MySQLState.SystemVarNames
+			}
+			for _, varName := range sysVarNames {
 				if varName == "FOUND_ROWS()" {
 					hasFoundRows = true
 					break
@@ -385,7 +401,11 @@ func TestFoundRowsResultSetFormat(t *testing.T) {
 
 			// Verify detection
 			hasFoundRows := false
-			for _, varName := range ctx.SystemVarNames {
+			var sysVarNames []string
+			if ctx.MySQLState != nil {
+				sysVarNames = ctx.MySQLState.SystemVarNames
+			}
+			for _, varName := range sysVarNames {
 				if varName == "FOUND_ROWS()" {
 					hasFoundRows = true
 					break

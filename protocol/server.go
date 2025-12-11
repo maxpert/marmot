@@ -736,7 +736,6 @@ func writeLenEncString(buf *bytes.Buffer, s string) {
 
 func (s *MySQLServer) handleStmtPrepare(conn net.Conn, session *ConnectionSession, sql string) {
 	ctx := query.NewContext(sql, nil)
-	ctx.RequiresPrepare = true
 
 	if err := globalPipeline.Process(ctx); err != nil {
 		log.Debug().
@@ -748,10 +747,10 @@ func (s *MySQLServer) handleStmtPrepare(conn net.Conn, session *ConnectionSessio
 		return
 	}
 
-	if !ctx.IsValid {
+	if !ctx.Output.IsValid {
 		errorMsg := "You have an error in your SQL syntax"
-		if ctx.ValidationErr != nil {
-			errorMsg = ctx.ValidationErr.Error()
+		if ctx.Output.ValidationErr != nil {
+			errorMsg = ctx.Output.ValidationErr.Error()
 		}
 		log.Debug().
 			Uint64("conn_id", session.ConnID).
@@ -762,16 +761,21 @@ func (s *MySQLServer) handleStmtPrepare(conn net.Conn, session *ConnectionSessio
 		return
 	}
 
-	paramCount := uint16(countPlaceholders(ctx.TranspiledSQL))
+	transpiledSQL := ""
+	if len(ctx.Output.Statements) > 0 {
+		transpiledSQL = ctx.Output.Statements[0].SQL
+	}
+
+	paramCount := uint16(countPlaceholders(transpiledSQL))
 
 	session.preparedStmtLock.Lock()
 	stmtID := session.nextStmtID
 	session.nextStmtID++
 	session.preparedStmts[stmtID] = &PreparedStatement{
 		ID:           stmtID,
-		Query:        ctx.TranspiledSQL,
+		Query:        transpiledSQL,
 		ParamCount:   paramCount,
-		OriginalType: StatementType(ctx.StatementType),
+		OriginalType: StatementType(ctx.Output.StatementType),
 		Context:      ctx,
 	}
 	session.preparedStmtLock.Unlock()

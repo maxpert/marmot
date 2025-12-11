@@ -17,6 +17,14 @@ func truncateSQLForLog(sql string, n int) string {
 	return sql[:n] + "..."
 }
 
+// errorString returns the error message if err is non-nil, empty string otherwise.
+func errorString(err error) string {
+	if err != nil {
+		return err.Error()
+	}
+	return ""
+}
+
 var (
 	// Consistency hint pattern: /*+ CONSISTENCY(LEVEL) */
 	consistencyHintPattern = regexp.MustCompile(`(?i)/\*\+\s*CONSISTENCY\s*\(\s*(\w+)\s*\)\s*\*/`)
@@ -130,29 +138,30 @@ func ParseStatementWithSchema(sql string, schemaLookup SchemaLookupFunc) Stateme
 		}
 	}
 
+	// Extract transpiled SQL from first statement
+	transpiledSQL := ""
+	if len(ctx.Output.Statements) > 0 {
+		transpiledSQL = ctx.Output.Statements[0].SQL
+	}
+
 	stmt := Statement{
-		SQL:       ctx.TranspiledSQL,
-		Type:      mapQueryTypeToProtocolType(ctx.StatementType),
-		TableName: ctx.TableName,
-		Database:  ctx.Database,
-		Error: func() string {
-			if ctx.ValidationErr != nil {
-				return ctx.ValidationErr.Error()
-			}
-			return ""
-		}(),
-		// CDC fields (RowKey, OldValues, NewValues) are populated later by
-		// handler.go after preupdate hooks capture row data
-		// INFORMATION_SCHEMA filter values extracted from WHERE clause
-		ISFilter: InformationSchemaFilter{
-			SchemaName: ctx.ISFilter.SchemaName,
-			TableName:  ctx.ISFilter.TableName,
-			ColumnName: ctx.ISFilter.ColumnName,
-		},
-		// New fields to eliminate pre-parse string matching in handlers
-		ISTableType:      InformationSchemaTableType(ctx.ISTableType),
-		VirtualTableType: VirtualTableType(ctx.VirtualTableType),
-		SystemVarNames:   ctx.SystemVarNames,
+		SQL:      transpiledSQL,
+		Type:     mapQueryTypeToProtocolType(ctx.Output.StatementType),
+		Database: ctx.Output.Database,
+		Error:    errorString(ctx.Output.ValidationErr),
+	}
+
+	// Extract MySQL-specific metadata (if available)
+	if ctx.MySQLState != nil {
+		stmt.TableName = ctx.MySQLState.TableName
+		stmt.ISFilter = InformationSchemaFilter{
+			SchemaName: ctx.MySQLState.ISFilter.SchemaName,
+			TableName:  ctx.MySQLState.ISFilter.TableName,
+			ColumnName: ctx.MySQLState.ISFilter.ColumnName,
+		}
+		stmt.ISTableType = InformationSchemaTableType(ctx.MySQLState.ISTableType)
+		stmt.VirtualTableType = VirtualTableType(ctx.MySQLState.VirtualTableType)
+		stmt.SystemVarNames = ctx.MySQLState.SystemVarNames
 	}
 
 	return stmt
@@ -178,14 +187,9 @@ func ParseStatementsWithSchema(sql string, schemaLookup SchemaLookupFunc) []Stat
 		}}
 	}
 
-	// If there are no transpiled statements, return single statement
-	if len(ctx.TranspiledStatements) == 0 {
-		return []Statement{buildStatement(*ctx, ctx.TranspiledSQL)}
-	}
-
 	// Create a Statement for each transpiled statement
-	stmts := make([]Statement, 0, len(ctx.TranspiledStatements))
-	for _, ts := range ctx.TranspiledStatements {
+	stmts := make([]Statement, 0, len(ctx.Output.Statements))
+	for _, ts := range ctx.Output.Statements {
 		stmts = append(stmts, buildStatement(*ctx, ts.SQL))
 	}
 	return stmts
@@ -193,26 +197,27 @@ func ParseStatementsWithSchema(sql string, schemaLookup SchemaLookupFunc) []Stat
 
 // buildStatement creates a Statement from context with specified SQL
 func buildStatement(ctx query.QueryContext, sql string) Statement {
-	return Statement{
-		SQL:       sql,
-		Type:      mapQueryTypeToProtocolType(ctx.StatementType),
-		TableName: ctx.TableName,
-		Database:  ctx.Database,
-		Error: func() string {
-			if ctx.ValidationErr != nil {
-				return ctx.ValidationErr.Error()
-			}
-			return ""
-		}(),
-		ISFilter: InformationSchemaFilter{
-			SchemaName: ctx.ISFilter.SchemaName,
-			TableName:  ctx.ISFilter.TableName,
-			ColumnName: ctx.ISFilter.ColumnName,
-		},
-		ISTableType:      InformationSchemaTableType(ctx.ISTableType),
-		VirtualTableType: VirtualTableType(ctx.VirtualTableType),
-		SystemVarNames:   ctx.SystemVarNames,
+	stmt := Statement{
+		SQL:      sql,
+		Type:     mapQueryTypeToProtocolType(ctx.Output.StatementType),
+		Database: ctx.Output.Database,
+		Error:    errorString(ctx.Output.ValidationErr),
 	}
+
+	// Extract MySQL-specific metadata (if available)
+	if ctx.MySQLState != nil {
+		stmt.TableName = ctx.MySQLState.TableName
+		stmt.ISFilter = InformationSchemaFilter{
+			SchemaName: ctx.MySQLState.ISFilter.SchemaName,
+			TableName:  ctx.MySQLState.ISFilter.TableName,
+			ColumnName: ctx.MySQLState.ISFilter.ColumnName,
+		}
+		stmt.ISTableType = InformationSchemaTableType(ctx.MySQLState.ISTableType)
+		stmt.VirtualTableType = VirtualTableType(ctx.MySQLState.VirtualTableType)
+		stmt.SystemVarNames = ctx.MySQLState.SystemVarNames
+	}
+
+	return stmt
 }
 
 // mapQueryTypeToProtocolType converts query.StatementType to protocol.StatementType

@@ -105,8 +105,8 @@ func TestMySQLSelectModifiers(t *testing.T) {
 					t.Errorf("expected parsing to succeed, got error: %v", err)
 					return
 				}
-				if ctx.StatementType != tt.wantType {
-					t.Errorf("StatementType = %d, want %d", ctx.StatementType, tt.wantType)
+				if ctx.Output.StatementType != tt.wantType {
+					t.Errorf("StatementType = %d, want %d", ctx.Output.StatementType, tt.wantType)
 				}
 			} else {
 				if err == nil {
@@ -278,8 +278,8 @@ func TestMySQLSetOperations(t *testing.T) {
 					t.Errorf("expected parsing to succeed, got error: %v", err)
 					return
 				}
-				if ctx.StatementType != tt.wantType {
-					t.Errorf("StatementType = %d, want %d", ctx.StatementType, tt.wantType)
+				if ctx.Output.StatementType != tt.wantType {
+					t.Errorf("StatementType = %d, want %d", ctx.Output.StatementType, tt.wantType)
 				}
 			} else {
 				if err == nil {
@@ -389,8 +389,8 @@ func TestMySQLInsertVariations(t *testing.T) {
 					t.Errorf("expected parsing to succeed, got error: %v", err)
 					return
 				}
-				if ctx.StatementType != tt.wantType {
-					t.Errorf("StatementType = %d, want %d", ctx.StatementType, tt.wantType)
+				if ctx.Output.StatementType != tt.wantType {
+					t.Errorf("StatementType = %d, want %d", ctx.Output.StatementType, tt.wantType)
 				}
 			} else {
 				if err == nil {
@@ -451,8 +451,8 @@ func TestMySQLReplaceStatement(t *testing.T) {
 					t.Errorf("expected parsing to succeed, got error: %v", err)
 					return
 				}
-				if ctx.StatementType != tt.wantType {
-					t.Errorf("StatementType = %d, want %d", ctx.StatementType, tt.wantType)
+				if ctx.Output.StatementType != tt.wantType {
+					t.Errorf("StatementType = %d, want %d", ctx.Output.StatementType, tt.wantType)
 				}
 			} else {
 				if err == nil {
@@ -561,8 +561,8 @@ func TestMySQLUpdateVariations(t *testing.T) {
 					t.Errorf("expected parsing to succeed, got error: %v", err)
 					return
 				}
-				if ctx.StatementType != tt.wantType {
-					t.Errorf("StatementType = %d, want %d", ctx.StatementType, tt.wantType)
+				if ctx.Output.StatementType != tt.wantType {
+					t.Errorf("StatementType = %d, want %d", ctx.Output.StatementType, tt.wantType)
 				}
 			} else {
 				if err == nil {
@@ -670,8 +670,8 @@ func TestMySQLDeleteVariations(t *testing.T) {
 					t.Errorf("expected parsing to succeed, got error: %v", err)
 					return
 				}
-				if ctx.StatementType != tt.wantType {
-					t.Errorf("StatementType = %d, want %d", ctx.StatementType, tt.wantType)
+				if ctx.Output.StatementType != tt.wantType {
+					t.Errorf("StatementType = %d, want %d", ctx.Output.StatementType, tt.wantType)
 				}
 			} else {
 				if err == nil {
@@ -1050,8 +1050,14 @@ func TestMySQLLimitOffset(t *testing.T) {
 					return
 				}
 
-				if tt.checkTranspilation && ctx.TranspiledSQL != tt.wantTranspiledSQL {
-					t.Errorf("TranspiledSQL = %q, want %q", ctx.TranspiledSQL, tt.wantTranspiledSQL)
+				if tt.checkTranspilation {
+					transpiledSQL := ""
+					if len(ctx.Output.Statements) > 0 {
+						transpiledSQL = ctx.Output.Statements[0].SQL
+					}
+					if transpiledSQL != tt.wantTranspiledSQL {
+						t.Errorf("TranspiledSQL = %q, want %q", transpiledSQL, tt.wantTranspiledSQL)
+					}
 				}
 			} else {
 				if err == nil {
@@ -1124,8 +1130,8 @@ func TestMySQLDDLStatements(t *testing.T) {
 					t.Errorf("expected parsing to succeed, got error: %v", err)
 					return
 				}
-				if ctx.StatementType != tt.wantType {
-					t.Errorf("StatementType = %d, want %d", ctx.StatementType, tt.wantType)
+				if ctx.Output.StatementType != tt.wantType {
+					t.Errorf("StatementType = %d, want %d", ctx.Output.StatementType, tt.wantType)
 				}
 			} else {
 				if err == nil {

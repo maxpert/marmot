@@ -38,6 +38,7 @@ type MVCCDatabaseProvider interface {
 
 // CDCEntry holds CDC data captured by preupdate hooks
 type CDCEntry struct {
+	Table     string
 	RowKey    string
 	OldValues map[string][]byte
 	NewValues map[string][]byte
@@ -829,10 +830,14 @@ func (h *CoordinatorHandler) handleCommit(session *protocol.ConnectionSession) (
 				mergedOldValues := make(map[string][]byte)
 				mergedNewValues := make(map[string][]byte)
 				var rowKey string
+				var tableName string
 
 				for _, e := range cdcEntries {
 					if rowKey == "" {
 						rowKey = e.RowKey
+					}
+					if tableName == "" {
+						tableName = e.Table
 					}
 					for k, v := range e.OldValues {
 						mergedOldValues[k] = v
@@ -842,6 +847,10 @@ func (h *CoordinatorHandler) handleCommit(session *protocol.ConnectionSession) (
 					}
 				}
 
+				// Copy TableName from CDC if stmt doesn't have it (SQLite dialect bypass)
+				if stmt.TableName == "" && tableName != "" {
+					stmt.TableName = tableName
+				}
 				stmt.RowKey = rowKey
 				stmt.OldValues = mergedOldValues
 				stmt.NewValues = mergedNewValues

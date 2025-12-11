@@ -14,7 +14,6 @@ require (
 	github.com/linvon/cuckoo-filter v0.4.0
 	github.com/mattn/go-sqlite3 v1.14.18
 	github.com/prometheus/client_golang v1.23.2
-	github.com/rqlite/sql v0.0.0-20251114131613-ef07423e7137
 	github.com/rs/zerolog v1.31.0
 	github.com/soheilhy/cmux v0.1.5
 	github.com/stretchr/testify v1.11.1

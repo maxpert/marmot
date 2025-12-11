@@ -1,6 +1,7 @@
 package query
 
 import (
+	"fmt"
 	"regexp"
 	"strings"
 
@@ -46,14 +47,18 @@ func NewVitessParser() (*VitessParser, error) {
 }
 
 func (p *VitessParser) Parse(ctx *QueryContext) error {
+	if ctx.MySQLState == nil {
+		return fmt.Errorf("VitessParser.Parse requires MySQL dialect context")
+	}
+
 	classifyByPattern(ctx)
 
-	stmt, err := p.parser.Parse(ctx.OriginalSQL)
+	stmt, err := p.parser.Parse(ctx.Input.SQL)
 	if err != nil {
 		return err
 	}
 
-	ctx.AST = stmt
+	ctx.MySQLState.AST = stmt
 	classifyStatement(ctx, stmt)
 	extractMetadata(ctx, stmt)
 
@@ -61,186 +66,181 @@ func (p *VitessParser) Parse(ctx *QueryContext) error {
 }
 
 func classifyByPattern(ctx *QueryContext) {
-	sql := ctx.OriginalSQL
+	sql := ctx.Input.SQL
 
 	if savepointPattern.MatchString(sql) || releaseSavepointPattern.MatchString(sql) {
-		ctx.StatementType = StatementSavepoint
+		ctx.Output.StatementType = StatementSavepoint
 		return
 	}
 
 	if setTransactionPattern.MatchString(sql) {
-		ctx.StatementType = StatementBegin
+		ctx.Output.StatementType = StatementBegin
 		return
 	}
 
 	if xaStartPattern.MatchString(sql) || xaEndPattern.MatchString(sql) ||
 		xaPreparePattern.MatchString(sql) || xaCommitPattern.MatchString(sql) ||
 		xaRollbackPattern.MatchString(sql) || xaRecoverPattern.MatchString(sql) {
-		ctx.StatementType = StatementXA
+		ctx.Output.StatementType = StatementXA
 		return
 	}
 
 	if lockInstancePattern.MatchString(sql) || unlockInstancePattern.MatchString(sql) {
-		ctx.StatementType = StatementLock
+		ctx.Output.StatementType = StatementLock
 		return
 	}
 
 	if installPluginPattern.MatchString(sql) || uninstallPluginPattern.MatchString(sql) ||
 		installComponentPattern.MatchString(sql) || uninstallComponentPattern.MatchString(sql) {
-		ctx.StatementType = StatementAdmin
+		ctx.Output.StatementType = StatementAdmin
 		return
 	}
 
 	if loadXMLPattern.MatchString(sql) {
-		ctx.StatementType = StatementLoadData
+		ctx.Output.StatementType = StatementLoadData
 		return
 	}
 
 	if insertDelayedPattern.MatchString(sql) {
-		ctx.StatementType = StatementInsert
-		tablePattern := regexp.MustCompile(`(?i)INSERT\s+(DELAYED|LOW_PRIORITY|HIGH_PRIORITY)\s+INTO\s+(\w+)`)
-		if matches := tablePattern.FindStringSubmatch(sql); len(matches) > 2 {
-			ctx.TableName = matches[2]
-		}
+		ctx.Output.StatementType = StatementInsert
 		return
 	}
 
 	if matches := insertOrPattern.FindStringSubmatch(sql); len(matches) > 0 {
 		if len(matches) > 1 && strings.ToUpper(matches[1]) == "REPLACE" {
-			ctx.StatementType = StatementReplace
+			ctx.Output.StatementType = StatementReplace
 		} else {
-			ctx.StatementType = StatementInsert
+			ctx.Output.StatementType = StatementInsert
 		}
 		return
 	}
 }
 
 func classifyStatement(ctx *QueryContext, stmt sqlparser.Statement) {
-	if ctx.StatementType != 0 {
+	if ctx.Output.StatementType != StatementUnknown {
 		return
 	}
 
 	switch parsed := stmt.(type) {
 	case *sqlparser.Insert:
 		if parsed.Action == sqlparser.ReplaceAct {
-			ctx.StatementType = StatementReplace
+			ctx.Output.StatementType = StatementReplace
 		} else {
-			ctx.StatementType = StatementInsert
+			ctx.Output.StatementType = StatementInsert
 		}
 
 	case *sqlparser.Update:
-		ctx.StatementType = StatementUpdate
+		ctx.Output.StatementType = StatementUpdate
 
 	case *sqlparser.Delete:
-		ctx.StatementType = StatementDelete
+		ctx.Output.StatementType = StatementDelete
 
 	case *sqlparser.Select:
-		ctx.StatementType = StatementSelect
+		ctx.Output.StatementType = StatementSelect
 		// Check for system variables (@@var, DATABASE()) - these take priority
 		if sysVars := extractSystemVariables(parsed); len(sysVars) > 0 {
-			ctx.StatementType = StatementSystemVariable
-			ctx.SystemVarNames = sysVars
+			ctx.Output.StatementType = StatementSystemVariable
+			ctx.MySQLState.SystemVarNames = sysVars
 		} else if vtType := detectVirtualTable(parsed); vtType != VirtualTableUnknown {
 			// Check for Marmot virtual tables
-			ctx.StatementType = StatementVirtualTable
-			ctx.VirtualTableType = vtType
+			ctx.Output.StatementType = StatementVirtualTable
+			ctx.MySQLState.VirtualTableType = vtType
 		} else if isTableType := detectInformationSchemaTable(parsed); isTableType != ISTableUnknown {
 			// Check for INFORMATION_SCHEMA queries
-			ctx.StatementType = StatementInformationSchema
-			ctx.ISTableType = isTableType
-			ctx.ISFilter = extractInformationSchemaFilter(parsed)
+			ctx.Output.StatementType = StatementInformationSchema
+			ctx.MySQLState.ISTableType = isTableType
+			ctx.MySQLState.ISFilter = extractInformationSchemaFilter(parsed)
 		}
 
 	case *sqlparser.CreateTable:
-		ctx.StatementType = StatementDDL
+		ctx.Output.StatementType = StatementDDL
 
 	case *sqlparser.AlterTable:
-		ctx.StatementType = StatementDDL
+		ctx.Output.StatementType = StatementDDL
 
 	case *sqlparser.DropTable:
-		ctx.StatementType = StatementDDL
+		ctx.Output.StatementType = StatementDDL
 
 	case *sqlparser.CreateDatabase:
-		ctx.StatementType = StatementCreateDatabase
+		ctx.Output.StatementType = StatementCreateDatabase
 
 	case *sqlparser.DropDatabase:
-		ctx.StatementType = StatementDropDatabase
+		ctx.Output.StatementType = StatementDropDatabase
 
 	case *sqlparser.AlterDatabase:
-		ctx.StatementType = StatementDDL
+		ctx.Output.StatementType = StatementDDL
 
 	case *sqlparser.RenameTable:
-		ctx.StatementType = StatementDDL
+		ctx.Output.StatementType = StatementDDL
 
 	case sqlparser.DDLStatement:
-		ctx.StatementType = StatementDDL
+		ctx.Output.StatementType = StatementDDL
 
 	case *sqlparser.Show:
 		classifyShowStatement(ctx, parsed)
 
 	case *sqlparser.Use:
-		ctx.StatementType = StatementUseDatabase
+		ctx.Output.StatementType = StatementUseDatabase
 
 	case *sqlparser.Begin:
-		ctx.StatementType = StatementBegin
+		ctx.Output.StatementType = StatementBegin
 
 	case *sqlparser.Commit:
-		ctx.StatementType = StatementCommit
+		ctx.Output.StatementType = StatementCommit
 
 	case *sqlparser.Rollback:
-		ctx.StatementType = StatementRollback
+		ctx.Output.StatementType = StatementRollback
 
 	case *sqlparser.Savepoint:
-		ctx.StatementType = StatementSavepoint
+		ctx.Output.StatementType = StatementSavepoint
 
 	case *sqlparser.Set:
-		ctx.StatementType = StatementSet
+		ctx.Output.StatementType = StatementSet
 
 	case *sqlparser.Load:
-		ctx.StatementType = StatementLoadData
+		ctx.Output.StatementType = StatementLoadData
 
 	case *sqlparser.OtherAdmin:
-		ctx.StatementType = StatementAdmin
+		ctx.Output.StatementType = StatementAdmin
 
 	case *sqlparser.LockTables:
-		ctx.StatementType = StatementLock
+		ctx.Output.StatementType = StatementLock
 
 	case *sqlparser.UnlockTables:
-		ctx.StatementType = StatementLock
+		ctx.Output.StatementType = StatementLock
 
 	case *sqlparser.ExplainTab:
-		ctx.StatementType = StatementShowColumns
-		ctx.TableName = parsed.Table.Name.String()
+		ctx.Output.StatementType = StatementShowColumns
 		if parsed.Table.Qualifier.NotEmpty() {
-			ctx.Database = parsed.Table.Qualifier.String()
+			ctx.Output.Database = parsed.Table.Qualifier.String()
 		}
 
 	case *sqlparser.Union:
 		// Union queries - check left side for special detection
 		// System vars/virtual tables in unions are rare edge cases
 		// Default to regular SELECT for unions
-		ctx.StatementType = StatementSelect
+		ctx.Output.StatementType = StatementSelect
 		// Check if left side is a special query type
 		if leftSelect, ok := parsed.Left.(*sqlparser.Select); ok {
 			if sysVars := extractSystemVariables(leftSelect); len(sysVars) > 0 {
-				ctx.StatementType = StatementSystemVariable
-				ctx.SystemVarNames = sysVars
+				ctx.Output.StatementType = StatementSystemVariable
+				ctx.MySQLState.SystemVarNames = sysVars
 				// Also check right side for additional system vars
 				if rightSelect, ok := parsed.Right.(*sqlparser.Select); ok {
-					ctx.SystemVarNames = append(ctx.SystemVarNames, extractSystemVariables(rightSelect)...)
+					ctx.MySQLState.SystemVarNames = append(ctx.MySQLState.SystemVarNames, extractSystemVariables(rightSelect)...)
 				}
 			} else if vtType := detectVirtualTable(leftSelect); vtType != VirtualTableUnknown {
-				ctx.StatementType = StatementVirtualTable
-				ctx.VirtualTableType = vtType
+				ctx.Output.StatementType = StatementVirtualTable
+				ctx.MySQLState.VirtualTableType = vtType
 			} else if isTableType := detectInformationSchemaTable(leftSelect); isTableType != ISTableUnknown {
-				ctx.StatementType = StatementInformationSchema
-				ctx.ISTableType = isTableType
-				ctx.ISFilter = extractInformationSchemaFilter(leftSelect)
+				ctx.Output.StatementType = StatementInformationSchema
+				ctx.MySQLState.ISTableType = isTableType
+				ctx.MySQLState.ISFilter = extractInformationSchemaFilter(leftSelect)
 			}
 		}
 
 	default:
-		ctx.StatementType = StatementSelect
+		ctx.Output.StatementType = StatementSelect
 	}
 }
 
@@ -248,22 +248,22 @@ func classifyShowStatement(ctx *QueryContext, parsed *sqlparser.Show) {
 	if showBasic, ok := parsed.Internal.(*sqlparser.ShowBasic); ok {
 		switch showBasic.Command {
 		case sqlparser.Database:
-			ctx.StatementType = StatementShowDatabases
+			ctx.Output.StatementType = StatementShowDatabases
 		case sqlparser.Table:
-			ctx.StatementType = StatementShowTables
+			ctx.Output.StatementType = StatementShowTables
 		case sqlparser.Column:
-			ctx.StatementType = StatementShowColumns
+			ctx.Output.StatementType = StatementShowColumns
 		case sqlparser.Index:
-			ctx.StatementType = StatementShowIndexes
+			ctx.Output.StatementType = StatementShowIndexes
 		case sqlparser.TableStatus:
-			ctx.StatementType = StatementShowTableStatus
+			ctx.Output.StatementType = StatementShowTableStatus
 		default:
-			ctx.StatementType = StatementSelect
+			ctx.Output.StatementType = StatementSelect
 		}
 	} else if _, ok := parsed.Internal.(*sqlparser.ShowCreate); ok {
-		ctx.StatementType = StatementShowCreateTable
+		ctx.Output.StatementType = StatementShowCreateTable
 	} else {
-		ctx.StatementType = StatementSelect
+		ctx.Output.StatementType = StatementSelect
 	}
 }
 
@@ -440,9 +440,9 @@ func extractMetadata(ctx *QueryContext, stmt sqlparser.Statement) {
 	case *sqlparser.Insert:
 		if parsed.Table != nil {
 			if tn, ok := parsed.Table.Expr.(sqlparser.TableName); ok {
-				ctx.TableName = tn.Name.String()
+				ctx.MySQLState.TableName = tn.Name.String()
 				if tn.Qualifier.NotEmpty() {
-					ctx.Database = tn.Qualifier.String()
+					ctx.Output.Database = tn.Qualifier.String()
 				}
 			}
 		}
@@ -451,9 +451,9 @@ func extractMetadata(ctx *QueryContext, stmt sqlparser.Statement) {
 		if len(parsed.TableExprs) > 0 {
 			if aliased, ok := parsed.TableExprs[0].(*sqlparser.AliasedTableExpr); ok {
 				if tn, ok := aliased.Expr.(sqlparser.TableName); ok {
-					ctx.TableName = tn.Name.String()
+					ctx.MySQLState.TableName = tn.Name.String()
 					if tn.Qualifier.NotEmpty() {
-						ctx.Database = tn.Qualifier.String()
+						ctx.Output.Database = tn.Qualifier.String()
 					}
 				}
 			}
@@ -463,9 +463,9 @@ func extractMetadata(ctx *QueryContext, stmt sqlparser.Statement) {
 		if len(parsed.TableExprs) > 0 {
 			if aliased, ok := parsed.TableExprs[0].(*sqlparser.AliasedTableExpr); ok {
 				if tn, ok := aliased.Expr.(sqlparser.TableName); ok {
-					ctx.TableName = tn.Name.String()
+					ctx.MySQLState.TableName = tn.Name.String()
 					if tn.Qualifier.NotEmpty() {
-						ctx.Database = tn.Qualifier.String()
+						ctx.Output.Database = tn.Qualifier.String()
 					}
 				}
 			}
@@ -473,58 +473,50 @@ func extractMetadata(ctx *QueryContext, stmt sqlparser.Statement) {
 
 	case *sqlparser.Select:
 		if len(parsed.From) > 0 {
-			db, table := extractDatabaseFromTableExpr(parsed.From[0])
+			db, _ := extractDatabaseFromTableExpr(parsed.From[0])
 			if db != "" {
-				ctx.Database = db
-			}
-			if table != "" {
-				ctx.TableName = table
+				ctx.Output.Database = db
 			}
 		}
 
 	case *sqlparser.CreateTable:
-		ctx.TableName = parsed.Table.Name.String()
 		if parsed.Table.Qualifier.NotEmpty() {
-			ctx.Database = parsed.Table.Qualifier.String()
+			ctx.Output.Database = parsed.Table.Qualifier.String()
 		}
 
 	case *sqlparser.AlterTable:
-		ctx.TableName = parsed.Table.Name.String()
 		if parsed.Table.Qualifier.NotEmpty() {
-			ctx.Database = parsed.Table.Qualifier.String()
+			ctx.Output.Database = parsed.Table.Qualifier.String()
 		}
 
 	case *sqlparser.DropTable:
 		if len(parsed.FromTables) > 0 {
-			ctx.TableName = parsed.FromTables[0].Name.String()
 			if parsed.FromTables[0].Qualifier.NotEmpty() {
-				ctx.Database = parsed.FromTables[0].Qualifier.String()
+				ctx.Output.Database = parsed.FromTables[0].Qualifier.String()
 			}
 		}
 
 	case *sqlparser.CreateDatabase:
-		ctx.Database = parsed.DBName.String()
+		ctx.Output.Database = parsed.DBName.String()
 
 	case *sqlparser.DropDatabase:
-		ctx.Database = parsed.DBName.String()
+		ctx.Output.Database = parsed.DBName.String()
 
 	case *sqlparser.AlterDatabase:
-		ctx.Database = parsed.DBName.String()
+		ctx.Output.Database = parsed.DBName.String()
 
 	case *sqlparser.RenameTable:
 		if len(parsed.TablePairs) > 0 {
-			ctx.TableName = parsed.TablePairs[0].FromTable.Name.String()
 			if parsed.TablePairs[0].FromTable.Qualifier.NotEmpty() {
-				ctx.Database = parsed.TablePairs[0].FromTable.Qualifier.String()
+				ctx.Output.Database = parsed.TablePairs[0].FromTable.Qualifier.String()
 			}
 		}
 
 	case sqlparser.DDLStatement:
 		table := parsed.GetTable()
 		if !table.IsEmpty() {
-			ctx.TableName = table.Name.String()
 			if table.Qualifier.NotEmpty() {
-				ctx.Database = table.Qualifier.String()
+				ctx.Output.Database = table.Qualifier.String()
 			}
 		}
 
@@ -532,26 +524,26 @@ func extractMetadata(ctx *QueryContext, stmt sqlparser.Statement) {
 		extractShowMetadata(ctx, parsed)
 
 	case *sqlparser.Use:
-		ctx.Database = parsed.DBName.String()
+		ctx.Output.Database = parsed.DBName.String()
 	}
 }
 
 func extractShowMetadata(ctx *QueryContext, parsed *sqlparser.Show) {
 	if showBasic, ok := parsed.Internal.(*sqlparser.ShowBasic); ok {
 		if showBasic.DbName.NotEmpty() {
-			ctx.Database = showBasic.DbName.String()
+			ctx.Output.Database = showBasic.DbName.String()
 		}
 		if !showBasic.Tbl.IsEmpty() {
-			ctx.TableName = showBasic.Tbl.Name.String()
+			ctx.MySQLState.TableName = showBasic.Tbl.Name.String()
 			if showBasic.Tbl.Qualifier.NotEmpty() {
-				ctx.Database = showBasic.Tbl.Qualifier.String()
+				ctx.Output.Database = showBasic.Tbl.Qualifier.String()
 			}
 		}
 	} else if showCreate, ok := parsed.Internal.(*sqlparser.ShowCreate); ok {
 		if !showCreate.Op.IsEmpty() {
-			ctx.TableName = showCreate.Op.Name.String()
+			ctx.MySQLState.TableName = showCreate.Op.Name.String()
 			if showCreate.Op.Qualifier.NotEmpty() {
-				ctx.Database = showCreate.Op.Qualifier.String()
+				ctx.Output.Database = showCreate.Op.Qualifier.String()
 			}
 		}
 	}
