@@ -24,8 +24,8 @@ COPY --from=builder /build/marmot-v2 /app/marmot-v2
 
 RUN mkdir -p /data
 
-# 3307 = MySQL protocol, 8081 = gRPC
-EXPOSE 3307 8081
+# 3316 = MySQL protocol, 8090 = gRPC/metrics
+EXPOSE 3316 8090
 
 ENTRYPOINT ["/app/marmot-v2"]
 CMD ["-config", "/app/config.toml"]

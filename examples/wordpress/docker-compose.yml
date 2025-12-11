@@ -3,15 +3,16 @@ services:
     build:
       context: ../..
       dockerfile: examples/wordpress/Dockerfile
-    container_name: marmot
+    container_name: marmot-wordpress
     ports:
-      - "3307:3307"
-      - "8081:8081"
+      - "3316:3316"
+    expose:
+      - "8090"
     volumes:
       - ./marmot-config.toml:/app/config.toml:ro
       - marmot-data:/data
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8081/metrics"]
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8090/metrics"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -20,7 +21,7 @@ services:
 
   init-db:
     image: mysql:8.4
-    container_name: init-db
+    container_name: marmot-wordpress-init
     depends_on:
       marmot:
         condition: service_healthy
@@ -28,7 +29,7 @@ services:
       [
         "sh",
         "-c",
-        "mysql -h marmot -P 3307 -u root -e 'CREATE DATABASE IF NOT EXISTS wordpress;'",
+        "mysql -h marmot -P 3316 -u root -e 'CREATE DATABASE IF NOT EXISTS wordpress;'",
       ]
     networks:
       - marmot-net
@@ -43,7 +44,7 @@ services:
     ports:
       - "8080:80"
     environment:
-      WORDPRESS_DB_HOST: marmot:3307
+      WORDPRESS_DB_HOST: marmot:3316
       WORDPRESS_DB_USER: root
       WORDPRESS_DB_PASSWORD: ""
       WORDPRESS_DB_NAME: wordpress

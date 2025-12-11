@@ -10,8 +10,8 @@ lock_wait_timeout_seconds = 50
 
 [cluster]
 grpc_bind_address = "0.0.0.0"
-grpc_advertise_address = "marmot:8081"
-grpc_port = 8081
+grpc_advertise_address = "marmot:8090"
+grpc_port = 8090
 seed_nodes = []
 gossip_interval_ms = 1000
 gossip_fanout = 2
@@ -50,7 +50,7 @@ validator_pool_size = 8
 [mysql]
 enabled = true
 bind_address = "0.0.0.0"
-port = 3307
+port = 3316
 max_connections = 100
 
 [metastore]
