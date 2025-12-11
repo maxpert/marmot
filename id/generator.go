@@ -33,7 +33,7 @@ func (g *HLCGenerator) NextID() uint64 {
 
 // Compact ID format constants (53-bit)
 const (
-	CompactEpoch     int64 = 1735689600000 // Jan 1, 2025 00:00:00 UTC in ms
+	CompactEpoch     int64 = 1735776000000 // Jan 2, 2025 00:00:00 UTC in ms
 	CompactSeqBits         = 6
 	CompactNodeBits        = 6
 	CompactSeqMax          = (1 << CompactSeqBits) - 1        // 63

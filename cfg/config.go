@@ -5,84 +5,30 @@ import (
 	"fmt"
 	"hash/fnv"
 	"os"
-	"path"
 
 	"github.com/BurntSushi/toml"
 	"github.com/denisbrodbeck/machineid"
 	"github.com/rs/zerolog/log"
 )
 
-// SnapshotStoreType defines where snapshots are stored
-type SnapshotStoreType string
-
-const (
-	SnapshotPeer   SnapshotStoreType = "peer"   // Transfer via gRPC from peers
-	SnapshotS3     SnapshotStoreType = "s3"     // S3-compatible storage
-	SnapshotWebDAV SnapshotStoreType = "webdav" // WebDAV storage
-	SnapshotSFTP   SnapshotStoreType = "sftp"   // SFTP storage
-	SnapshotLocal  SnapshotStoreType = "local"  // Local file system
-)
-
-// S3Configuration for S3-compatible storage backends
-type S3Configuration struct {
-	Endpoint     string `toml:"endpoint"`
-	AccessKey    string `toml:"access_key"`
-	SecretKey    string `toml:"secret"`
-	SessionToken string `toml:"session_token"`
-	Bucket       string `toml:"bucket"`
-	Path         string `toml:"path"`
-	UseSSL       bool   `toml:"use_ssl"`
-}
-
-// WebDAVConfiguration for WebDAV storage
-type WebDAVConfiguration struct {
-	URL string `toml:"url"`
-}
-
-// SFTPConfiguration for SFTP storage
-type SFTPConfiguration struct {
-	URL string `toml:"url"`
-}
-
-// SnapshotConfiguration controls snapshot behavior
-type SnapshotConfiguration struct {
-	Enabled         bool                `toml:"enabled"`
-	IntervalSeconds int                 `toml:"interval_seconds"`
-	StoreType       SnapshotStoreType   `toml:"store"`
-	ChunkSizeMB     int                 `toml:"chunk_size_mb"`
-	ParallelChunks  int                 `toml:"parallel_chunks"`
-	IncThreshold    int                 `toml:"incremental_threshold"` // Changes before full snapshot
-	S3              S3Configuration     `toml:"s3"`
-	WebDAV          WebDAVConfiguration `toml:"webdav"`
-	SFTP            SFTPConfiguration   `toml:"sftp"`
-}
-
 // PromotionConfiguration controls JOINING → ALIVE promotion
 type PromotionConfiguration struct {
-	CheckIntervalSeconds  int  `toml:"check_interval_seconds"`   // How often to check for promotion
-	MinHealthyDurationSec int  `toml:"min_healthy_duration_sec"` // Must be healthy for this long before promotion
-	RequireAllDatabases   bool `toml:"require_all_databases"`    // All databases must exist before promotion
-}
-
-// BackpressureConfiguration controls snapshot streaming backpressure
-type BackpressureConfiguration struct {
-	MaxQueueDepth   int `toml:"max_queue_depth"`   // Max apply queue depth before pausing
-	CheckIntervalMS int `toml:"check_interval_ms"` // How often to check queue depth
+	CheckIntervalSeconds  int `toml:"check_interval_seconds"`   // How often to check for promotion
+	MinHealthyDurationSec int `toml:"min_healthy_duration_sec"` // Must be healthy for this long before promotion
 }
 
 // ClusterConfiguration controls cluster membership and communication
 type ClusterConfiguration struct {
-	GRPCBindAddress      string                    `toml:"grpc_bind_address"`
-	GRPCAdvertiseAddress string                    `toml:"grpc_advertise_address"` // Address other nodes use to connect (defaults to hostname:port)
-	GRPCPort             int                       `toml:"grpc_port"`
-	SeedNodes            []string                  `toml:"seed_nodes"`
-	ClusterSecret        string                    `toml:"cluster_secret"` // PSK for cluster authentication (env: MARMOT_CLUSTER_SECRET)
-	GossipIntervalMS     int                       `toml:"gossip_interval_ms"`
-	GossipFanout         int                       `toml:"gossip_fanout"`
-	SuspectTimeoutMS     int                       `toml:"suspect_timeout_ms"`
-	DeadTimeoutMS        int                       `toml:"dead_timeout_ms"`
-	Promotion            PromotionConfiguration    `toml:"promotion"`
-	Backpressure         BackpressureConfiguration `toml:"backpressure"`
+	GRPCBindAddress      string                 `toml:"grpc_bind_address"`
+	GRPCAdvertiseAddress string                 `toml:"grpc_advertise_address"` // Address other nodes use to connect (defaults to hostname:port)
+	GRPCPort             int                    `toml:"grpc_port"`
+	SeedNodes            []string               `toml:"seed_nodes"`
+	ClusterSecret        string                 `toml:"cluster_secret"` // PSK for cluster authentication (env: MARMOT_CLUSTER_SECRET)
+	GossipIntervalMS     int                    `toml:"gossip_interval_ms"`
+	GossipFanout         int                    `toml:"gossip_fanout"`
+	SuspectTimeoutMS     int                    `toml:"suspect_timeout_ms"`
+	DeadTimeoutMS        int                    `toml:"dead_timeout_ms"`
+	Promotion            PromotionConfiguration `toml:"promotion"`
 }
 
 // ReplicationConfiguration controls replication behavior
@@ -188,7 +134,6 @@ type Configuration struct {
 	NodeID  uint64 `toml:"node_id"`
 	DataDir string `toml:"data_dir"`
 
-	Snapshot       SnapshotConfiguration       `toml:"snapshot"`
 	Cluster        ClusterConfiguration        `toml:"cluster"`
 	Replication    ReplicationConfiguration    `toml:"replication"`
 	Transaction    TransactionConfiguration    `toml:"transaction"`
@@ -218,18 +163,6 @@ var Config = &Configuration{
 	NodeID:  0, // Auto-generate
 	DataDir: "./marmot-data",
 
-	Snapshot: SnapshotConfiguration{
-		Enabled:         true,
-		IntervalSeconds: 300, // 5 minutes
-		StoreType:       SnapshotPeer,
-		ChunkSizeMB:     5,
-		ParallelChunks:  5,
-		IncThreshold:    10000,
-		S3:              S3Configuration{},
-		WebDAV:          WebDAVConfiguration{},
-		SFTP:            SFTPConfiguration{},
-	},
-
 	Cluster: ClusterConfiguration{
 		GRPCBindAddress:  "0.0.0.0",
 		GRPCPort:         8080,
@@ -239,13 +172,8 @@ var Config = &Configuration{
 		SuspectTimeoutMS: 5000,
 		DeadTimeoutMS:    10000,
 		Promotion: PromotionConfiguration{
-			CheckIntervalSeconds:  2,    // Check every 2 seconds
-			MinHealthyDurationSec: 3,    // Must be healthy for 3 seconds
-			RequireAllDatabases:   true, // Require all databases synced
-		},
-		Backpressure: BackpressureConfiguration{
-			MaxQueueDepth:   1000, // Max 1000 items in apply queue
-			CheckIntervalMS: 100,  // Check every 100ms
+			CheckIntervalSeconds:  2, // Check every 2 seconds
+			MinHealthyDurationSec: 3, // Must be healthy for 3 seconds
 		},
 	},
 
@@ -605,11 +533,6 @@ func Validate() error {
 	return nil
 }
 
-// GetSeqMapPath returns the path to the sequence map file (legacy, may remove)
-func GetSeqMapPath() string {
-	return path.Join(Config.DataDir, "seq-map.cbor")
-}
-
 // IsClusterAuthEnabled returns true if cluster authentication is configured
 func IsClusterAuthEnabled() bool {
 	return Config.Cluster.ClusterSecret != ""
@@ -628,9 +551,4 @@ func IsReplicaMode() bool {
 // GetReplicaSecret returns the replica secret for PSK authentication with master
 func GetReplicaSecret() string {
 	return Config.Replica.Secret
-}
-
-// IsReplicaAuthEnabled returns true if replica authentication is configured
-func IsReplicaAuthEnabled() bool {
-	return Config.Replica.Secret != ""
 }
