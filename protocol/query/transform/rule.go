@@ -25,6 +25,10 @@ type TranspiledStatement struct {
 // ErrRuleNotApplicable indicates rule doesn't apply to this statement type
 var ErrRuleNotApplicable = errors.New("rule not applicable")
 
+// FoundRowsColumnName is the internal column name used for SQL_CALC_FOUND_ROWS support.
+// The execution layer looks for this column to extract the total row count.
+const FoundRowsColumnName = "__marmot_found_rows"
+
 // SchemaInfo provides table schema information needed for transpilation.
 // Used for ON CONFLICT target detection and AUTO_INCREMENT ID injection.
 type SchemaInfo struct {

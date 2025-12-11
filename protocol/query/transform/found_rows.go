@@ -6,10 +6,6 @@ import (
 	"vitess.io/vitess/go/vt/sqlparser"
 )
 
-// FoundRowsColumnName is the internal column name used for SQL_CALC_FOUND_ROWS support.
-// The execution layer looks for this column to extract the total row count.
-const FoundRowsColumnName = "__marmot_found_rows"
-
 // SQLCalcFoundRowsRule transforms MySQL SQL_CALC_FOUND_ROWS hint for SQLite compatibility.
 //
 // Key transformations:
