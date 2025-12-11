@@ -6,13 +6,14 @@ import (
 	"vitess.io/vitess/go/vt/sqlparser"
 )
 
-// CreateTableRule extracts non-primary KEY/INDEX definitions from CREATE TABLE
+// CreateTableRule extracts non-primary, non-unique KEY/INDEX definitions from CREATE TABLE
 // into separate CREATE INDEX statements.
 //
 // MySQL allows KEY/INDEX definitions inline in CREATE TABLE, but SQLite prefers
 // separate CREATE INDEX statements. This rule:
 //   - Keeps PRIMARY KEY definitions in the CREATE TABLE
-//   - Extracts KEY/INDEX definitions and returns them as separate CREATE INDEX statements
+//   - Keeps UNIQUE KEY definitions in the CREATE TABLE (converted to CONSTRAINT by serializer)
+//   - Extracts regular KEY/INDEX definitions and returns them as separate CREATE INDEX statements
 //   - Strips column length specifications: KEY idx (col(191)) → col
 //   - Skips FULLTEXT/SPATIAL indexes (passed through to serializer)
 type CreateTableRule struct {
@@ -90,6 +91,11 @@ func (r *CreateTableRule) shouldExtractIndex(idx *sqlparser.IndexDefinition) boo
 	}
 
 	if info.Type == sqlparser.IndexTypeFullText || info.Type == sqlparser.IndexTypeSpatial {
+		return false
+	}
+
+	// Keep UNIQUE indexes inline (don't extract them)
+	if info.IsUnique() {
 		return false
 	}
 

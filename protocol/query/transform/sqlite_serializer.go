@@ -42,6 +42,8 @@ func (s *SQLiteSerializer) nodeFormatter(buf *sqlparser.TrackedBuffer, node sqlp
 		s.formatUpdate(buf, n)
 	case *sqlparser.Delete:
 		s.formatDelete(buf, n)
+	case *sqlparser.IndexDefinition:
+		s.formatIndexDefinition(buf, n)
 	case *sqlparser.Argument:
 		// Convert named parameters (:v1) to positional (?)
 		buf.WriteString("?")
@@ -103,6 +105,38 @@ func (s *SQLiteSerializer) nodeFormatter(buf *sqlparser.TrackedBuffer, node sqlp
 		// Use default Vitess formatting for all other nodes
 		node.Format(buf)
 	}
+}
+
+// formatIndexDefinition converts MySQL UNIQUE KEY syntax to SQLite CONSTRAINT UNIQUE syntax
+func (s *SQLiteSerializer) formatIndexDefinition(buf *sqlparser.TrackedBuffer, n *sqlparser.IndexDefinition) {
+	if n.Info == nil {
+		n.Format(buf)
+		return
+	}
+
+	// Don't modify PRIMARY KEY - use default formatting
+	if n.Info.Type == sqlparser.IndexTypePrimary {
+		n.Format(buf)
+		return
+	}
+
+	// Convert UNIQUE KEY to CONSTRAINT ... UNIQUE for SQLite compatibility
+	if n.Info.IsUnique() {
+		buf.WriteString("CONSTRAINT ")
+		buf.Myprintf("%v", n.Info.Name)
+		buf.WriteString(" UNIQUE (")
+		for i, col := range n.Columns {
+			if i > 0 {
+				buf.WriteString(", ")
+			}
+			buf.Myprintf("%v", col.Column)
+		}
+		buf.WriteString(")")
+		return
+	}
+
+	// For all other index types, use default formatting
+	n.Format(buf)
 }
 
 // formatInsert handles INSERT statement conversion

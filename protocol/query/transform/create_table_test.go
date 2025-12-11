@@ -50,27 +50,17 @@ func TestCreateTableRule_ExtractIndexes(t *testing.T) {
 			},
 		},
 		{
-			name: "extract UNIQUE KEY",
+			name: "keep UNIQUE KEY inline",
 			input: `CREATE TABLE t (
 				id INT PRIMARY KEY,
 				email VARCHAR(100),
 				UNIQUE KEY email_idx (email)
 			)`,
-			wantApplicable:     true,
-			wantStatementCount: 2,
-			checkStatements: func(stmts []TranspiledStatement) error {
-				if len(stmts) != 2 {
-					t.Errorf("expected 2 statements, got %d", len(stmts))
-				}
-				expected := "CREATE UNIQUE INDEX IF NOT EXISTS email_idx ON t (email)"
-				if stmts[1].SQL != expected {
-					t.Errorf("index statement = %q, want %q", stmts[1].SQL, expected)
-				}
-				return nil
-			},
+			wantApplicable:     false,
+			wantStatementCount: 0,
 		},
 		{
-			name: "extract multiple indexes",
+			name: "extract regular KEY, keep UNIQUE KEY inline",
 			input: `CREATE TABLE t (
 				id INT PRIMARY KEY,
 				name VARCHAR(100),
@@ -79,10 +69,19 @@ func TestCreateTableRule_ExtractIndexes(t *testing.T) {
 				UNIQUE KEY email_idx (email)
 			)`,
 			wantApplicable:     true,
-			wantStatementCount: 3,
+			wantStatementCount: 2,
 			checkStatements: func(stmts []TranspiledStatement) error {
-				if len(stmts) != 3 {
-					t.Errorf("expected 3 statements, got %d", len(stmts))
+				if len(stmts) != 2 {
+					t.Errorf("expected 2 statements, got %d", len(stmts))
+				}
+				// First statement should be CREATE TABLE with UNIQUE KEY still in it
+				if !strings.Contains(strings.ToLower(stmts[0].SQL), "unique") {
+					t.Errorf("CREATE TABLE should contain UNIQUE constraint, got: %q", stmts[0].SQL)
+				}
+				// Second statement should be CREATE INDEX for regular key
+				expected := "CREATE INDEX IF NOT EXISTS name_idx ON t (name)"
+				if stmts[1].SQL != expected {
+					t.Errorf("index statement = %q, want %q", stmts[1].SQL, expected)
 				}
 				return nil
 			},
@@ -171,8 +170,9 @@ func TestCreateTableRule_ExtractIndexes(t *testing.T) {
 				for _, idx := range create.TableSpec.Indexes {
 					if idx.Info != nil && idx.Info.Type != sqlparser.IndexTypePrimary &&
 						idx.Info.Type != sqlparser.IndexTypeFullText &&
-						idx.Info.Type != sqlparser.IndexTypeSpatial {
-						t.Errorf("non-primary index %q should have been extracted", idx.Info.Name.String())
+						idx.Info.Type != sqlparser.IndexTypeSpatial &&
+						!idx.Info.IsUnique() {
+						t.Errorf("non-unique index %q should have been extracted", idx.Info.Name.String())
 					}
 				}
 			} else {
@@ -208,20 +208,52 @@ func TestCreateTableRule_MultipleTransforms(t *testing.T) {
 	input2 := "CREATE TABLE t2 (id INT PRIMARY KEY, email VARCHAR(100), UNIQUE KEY email_idx (email))"
 	stmt2, _ := sqlparser.NewTestParser().Parse(input2)
 	results2, err := rule.Transform(stmt2, nil, nil, "", &SQLiteSerializer{})
+
+	// UNIQUE KEY should not be extracted, so rule should not apply
+	if err != ErrRuleNotApplicable {
+		t.Fatalf("expected ErrRuleNotApplicable for UNIQUE KEY only table, got: %v", err)
+	}
+
+	if results2 != nil {
+		t.Errorf("expected nil results for UNIQUE KEY only table, got %d statements", len(results2))
+	}
+}
+
+func TestCreateTableRule_UniqueConstraintFormat(t *testing.T) {
+	input := `CREATE TABLE t (
+		id INT PRIMARY KEY,
+		email VARCHAR(100),
+		UNIQUE KEY email_idx (email)
+	)`
+
+	stmt, err := sqlparser.NewTestParser().Parse(input)
 	if err != nil {
-		t.Fatalf("Transform failed: %v", err)
+		t.Fatalf("failed to parse SQL: %v", err)
 	}
 
-	if results2 == nil {
-		t.Fatal("expected second transform to be applied")
+	rule := &CreateTableRule{}
+	_, err = rule.Transform(stmt, nil, nil, "", &SQLiteSerializer{})
+
+	// Should not be applicable since UNIQUE indexes are not extracted
+	if err != ErrRuleNotApplicable {
+		t.Fatalf("expected ErrRuleNotApplicable, got: %v", err)
 	}
 
-	if len(results2) != 2 {
-		t.Fatalf("expected 2 statements after second transform, got %d", len(results2))
-	}
+	// Now test that the serializer properly formats UNIQUE as CONSTRAINT
+	create := stmt.(*sqlparser.CreateTable)
+	serializer := &SQLiteSerializer{}
+	sql := serializer.Serialize(create)
 
-	if results2[1].SQL != "CREATE UNIQUE INDEX IF NOT EXISTS email_idx ON t2 (email)" {
-		t.Errorf("unexpected statement from second transform: %q", results2[1].SQL)
+	// Should contain CONSTRAINT ... UNIQUE, not UNIQUE KEY
+	lowerSQL := strings.ToLower(sql)
+	if !strings.Contains(lowerSQL, "constraint") {
+		t.Errorf("serialized SQL should contain CONSTRAINT, got: %q", sql)
+	}
+	if !strings.Contains(lowerSQL, "unique") {
+		t.Errorf("serialized SQL should contain UNIQUE, got: %q", sql)
+	}
+	if strings.Contains(lowerSQL, "key") && strings.Contains(lowerSQL, "unique key") {
+		t.Errorf("serialized SQL should not contain 'UNIQUE KEY', got: %q", sql)
 	}
 }
 
@@ -258,7 +290,9 @@ func TestCreateTableRule_StripTableOptions(t *testing.T) {
 			input: `CREATE TABLE users (
 				id BIGINT PRIMARY KEY,
 				email VARCHAR(255),
-				UNIQUE KEY email_idx (email)
+				name VARCHAR(100),
+				UNIQUE KEY email_idx (email),
+				KEY name_idx (name)
 			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci ROW_FORMAT=DYNAMIC`,
 			wantApplicable: true,
 			checkOutput: func(t *testing.T, sql string) {
@@ -446,9 +480,9 @@ func TestCreateTableRule_CombinedOptionsAndWidths(t *testing.T) {
 		t.Fatalf("Transform failed: %v", err)
 	}
 
-	// Should have 3 statements: CREATE TABLE + 2 indexes
-	if len(results) != 3 {
-		t.Fatalf("expected 3 statements, got %d", len(results))
+	// Should have 2 statements: CREATE TABLE (with UNIQUE inline) + 1 regular index
+	if len(results) != 2 {
+		t.Fatalf("expected 2 statements, got %d", len(results))
 	}
 
 	mainSQL := results[0].SQL
@@ -475,11 +509,13 @@ func TestCreateTableRule_CombinedOptionsAndWidths(t *testing.T) {
 		t.Errorf("CREATE TABLE should preserve VARCHAR(50), got: %q", mainSQL)
 	}
 
-	// Check indexes are extracted
-	if results[1].SQL != "CREATE UNIQUE INDEX IF NOT EXISTS username_idx ON users (username)" {
-		t.Errorf("unexpected index statement: %q", results[1].SQL)
+	// Check UNIQUE constraint is kept in CREATE TABLE
+	if !strings.Contains(lowerSQL, "constraint") || !strings.Contains(lowerSQL, "unique") {
+		t.Errorf("CREATE TABLE should contain UNIQUE constraint inline, got: %q", mainSQL)
 	}
-	if results[2].SQL != "CREATE INDEX IF NOT EXISTS created_idx ON users (created_at)" {
-		t.Errorf("unexpected index statement: %q", results[2].SQL)
+
+	// Check only regular index is extracted
+	if results[1].SQL != "CREATE INDEX IF NOT EXISTS created_idx ON users (created_at)" {
+		t.Errorf("unexpected index statement: %q", results[1].SQL)
 	}
 }
