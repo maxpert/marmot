@@ -757,6 +757,25 @@ SELECT @@version AS ver, @@sql_mode AS mode;
 SELECT DATABASE() AS db, @@autocommit AS auto;
 ```
 
+### MySQL Compatibility Functions
+
+| Function | Support | Notes |
+|----------|---------|-------|
+| `LAST_INSERT_ID()` | ✅ Full | Returns last auto-generated ID for the session |
+| `FOUND_ROWS()` | ✅ Full | Returns row count from previous SELECT (without LIMIT) |
+
+```sql
+-- LAST_INSERT_ID: Get the auto-generated ID from the last INSERT
+INSERT INTO users (name, email) VALUES ('Alice', 'alice@example.com');
+SELECT LAST_INSERT_ID();  -- Returns the generated ID
+
+-- FOUND_ROWS: Get total matching rows (useful with LIMIT)
+SELECT SQL_CALC_FOUND_ROWS * FROM users WHERE active = 1 LIMIT 10;
+SELECT FOUND_ROWS();  -- Returns total count without LIMIT
+```
+
+**Note:** `SQL_CALC_FOUND_ROWS` hint is parsed and removed during transpilation. `FOUND_ROWS()` returns the actual count from the previous query.
+
 ---
 
 ## Virtual Tables
@@ -816,7 +835,7 @@ WHERE TABLE_SCHEMA = 'mydb' AND TABLE_NAME = 'users';
 | `INT UNSIGNED` | `INTEGER` | UNSIGNED removed |
 | `VARCHAR(n)` | `TEXT` | Length constraint removed |
 | `DATETIME` | `TEXT` | Date stored as ISO string |
-| `INT AUTO_INCREMENT` | `BIGINT` | Promoted to 64-bit for HLC IDs |
+| `INT AUTO_INCREMENT` | `BIGINT` | Auto-generated distributed IDs (see Auto ID Mode) |
 | `BOOLEAN` | `INTEGER` | Type changed |
 | `HIGH_PRIORITY` | (removed) | MySQL-only hint |
 | `SQL_NO_CACHE` | (removed) | MySQL-only hint |

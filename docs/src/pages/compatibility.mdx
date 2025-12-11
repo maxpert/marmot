@@ -96,6 +96,29 @@ mysql -h localhost -P 3306 -u root
 mysql://root@localhost:3306/marmot
 ```
 
+## MySQL Compatibility Functions
+
+Marmot supports key MySQL functions for application compatibility:
+
+| Function | Support | Notes |
+|----------|---------|-------|
+| `LAST_INSERT_ID()` | ✅ Full | Returns last auto-generated ID for current session |
+| `FOUND_ROWS()` | ✅ Full | Returns row count from previous SELECT |
+| `NOW()` | ✅ Full | Transpiled to `datetime('now')` |
+| `CURDATE()` | ✅ Full | Transpiled to `date('now')` |
+| `UNIX_TIMESTAMP()` | ✅ Full | Transpiled to `strftime('%s', 'now')` |
+
+### Auto-Increment ID Generation
+
+Marmot generates unique distributed IDs for `AUTO_INCREMENT` columns. Two modes are available:
+
+| Mode | Bits | Max Value | Use Case |
+|------|------|-----------|----------|
+| `compact` (default) | 53 | 9,007,199,254,740,991 | All clients, including JavaScript |
+| `extended` | 64 | 18,446,744,073,709,551,615 | Native 64-bit clients only |
+
+Configure via `[mysql].auto_id_mode` in config. The compact mode uses: 41 bits timestamp + 6 bits node ID + 6 bits sequence.
+
 ## Limitations
 
 - **Selective Table Watching**: All tables in a database are replicated. Selective table replication is not supported.
