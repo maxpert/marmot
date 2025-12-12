@@ -20,18 +20,19 @@ import (
 
 // Key prefixes for Pebble (same as BadgerDB, sorted for efficient iteration)
 const (
-	pebblePrefixTxn         = "/txn/"          // /txn/{txnID:016x}
-	pebblePrefixTxnPending  = "/txn_idx/pend/" // /txn_idx/pend/{txnID:016x}
-	pebblePrefixTxnSeq      = "/txn_idx/seq/"  // /txn_idx/seq/{seqNum:016x}/{txnID:016x}
-	pebblePrefixIntent      = "/intent/"       // /intent/{tableName}/{rowKey}
-	pebblePrefixCDC         = "/cdc/"          // /cdc/{txnID:016x}/{seq:08x}
-	pebblePrefixRepl        = "/repl/"         // /repl/{peerNodeID:016x}/{dbName}
-	pebblePrefixSchema      = "/schema/"       // /schema/{dbName}
-	pebblePrefixDDLLock     = "/ddl/"          // /ddl/{dbName}
-	pebblePrefixSeq         = "/seq/"          // /seq/{name}
-	pebblePrefixIntentByTxn = "/intent_txn/"   // /intent_txn/{txnID:016x}/{tableName}/{rowKey}
-	pebblePrefixCounter     = "/meta/"         // /meta/{counterName}
-	pebblePrefixCDCActive   = "/cdc/active/"   // /cdc/active/{tableName}/{rowKey|__ddl__}
+	pebblePrefixTxn         = "/txn/"           // /txn/{txnID:016x}
+	pebblePrefixTxnPending  = "/txn_idx/pend/"  // /txn_idx/pend/{txnID:016x}
+	pebblePrefixTxnSeq      = "/txn_idx/seq/"   // /txn_idx/seq/{seqNum:016x}/{txnID:016x}
+	pebblePrefixIntent      = "/intent/"        // /intent/{tableName}/{rowKey}
+	pebblePrefixCDC         = "/cdc/"           // /cdc/{txnID:016x}/{seq:08x}
+	pebblePrefixRepl        = "/repl/"          // /repl/{peerNodeID:016x}/{dbName}
+	pebblePrefixSchema      = "/schema/"        // /schema/{dbName}
+	pebblePrefixDDLLock     = "/ddl/"           // /ddl/{dbName}
+	pebblePrefixSeq         = "/seq/"           // /seq/{name}
+	pebblePrefixIntentByTxn = "/intent_txn/"    // /intent_txn/{txnID:016x}/{tableName}/{rowKey}
+	pebblePrefixCounter     = "/meta/"          // /meta/{counterName}
+	pebblePrefixCDCActive   = "/cdc/active/"    // /cdc/active/{tableName}/{rowKey|__ddl__}
+	pebblePrefixCDCTxnLocks = "/cdc/txn_locks/" // /cdc/txn_locks/{txnID:016x}/{tableName}/{rowKey}
 
 	pebbleCDCDDLKeyMarker = "__ddl__" // Sentinel key for DDL locks
 )
@@ -231,6 +232,12 @@ func NewPebbleMetaStore(path string, opts PebbleMetaStoreOptions) (*PebbleMetaSt
 	if err := store.rebuildIntentFilter(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("failed to rebuild intent filter: %w", err)
+	}
+
+	// Clear any stale CDC locks from previous crash (CDC locks are ephemeral)
+	if err := store.clearAllCDCLocks(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to clear stale CDC locks: %w", err)
 	}
 
 	// Start batch writer goroutine
@@ -487,6 +494,18 @@ func pebbleCDCActiveDDLKey(tableName string) []byte {
 
 func pebbleCDCActiveTablePrefix(tableName string) []byte {
 	return []byte(fmt.Sprintf("%s%s/", pebblePrefixCDCActive, tableName))
+}
+
+// pebbleCDCTxnLockKey returns the reverse index key for a CDC row lock
+// Format: /cdc/txn_locks/{txnID:016x}/{tableName}/{rowKey}
+func pebbleCDCTxnLockKey(txnID uint64, tableName, rowKey string) []byte {
+	return []byte(fmt.Sprintf("%s%016x/%s/%s", pebblePrefixCDCTxnLocks, txnID, tableName, rowKey))
+}
+
+// pebbleCDCTxnLockPrefix returns the prefix for all locks held by a transaction
+// Format: /cdc/txn_locks/{txnID:016x}/
+func pebbleCDCTxnLockPrefix(txnID uint64) []byte {
+	return []byte(fmt.Sprintf("%s%016x/", pebblePrefixCDCTxnLocks, txnID))
 }
 
 // prefixUpperBound returns prefix + 0xFF... for range iteration
@@ -1708,6 +1727,7 @@ func (s *PebbleMetaStore) CleanupStaleTransactions(timeout time.Duration) (int, 
 		_ = s.AbortTransaction(txnID)
 		_ = s.DeleteIntentsByTxn(txnID)
 		_ = s.DeleteIntentEntries(txnID)
+		_ = s.ReleaseCDCRowLocksByTxn(txnID)
 		cleaned++
 	}
 
@@ -2077,9 +2097,25 @@ func (s *PebbleMetaStore) AcquireCDCRowLock(txnID uint64, tableName, rowKey stri
 	}
 
 	// No lock exists or same txn - acquire/update it
+	// Write both forward and reverse index in batch
 	buf := make([]byte, 8)
 	binary.BigEndian.PutUint64(buf, txnID)
-	return s.db.Set(key, buf, pebble.NoSync)
+
+	batch := s.db.NewBatch()
+	defer batch.Close()
+
+	// Forward index: /cdc/active/{table}/{rowKey} → txnID
+	if err := batch.Set(key, buf, nil); err != nil {
+		return err
+	}
+
+	// Reverse index: /cdc/txn_locks/{txnID}/{table}/{rowKey} → empty
+	reverseKey := pebbleCDCTxnLockKey(txnID, tableName, rowKey)
+	if err := batch.Set(reverseKey, nil, nil); err != nil {
+		return err
+	}
+
+	return batch.Commit(pebble.NoSync)
 }
 
 // ReleaseCDCRowLock releases a row-level lock if held by the specified txnID.
@@ -2095,23 +2131,39 @@ func (s *PebbleMetaStore) ReleaseCDCRowLock(tableName, rowKey string, txnID uint
 	if err != nil {
 		return err
 	}
-	defer closer.Close()
 
+	var existingTxnID uint64
 	if len(val) >= 8 {
-		existingTxnID := binary.BigEndian.Uint64(val)
+		existingTxnID = binary.BigEndian.Uint64(val)
 		if existingTxnID != txnID {
+			closer.Close()
 			return nil // Lock held by different txn - don't release
 		}
 	}
+	closer.Close()
 
-	return s.db.Delete(key, pebble.NoSync)
+	// Delete both forward and reverse index
+	batch := s.db.NewBatch()
+	defer batch.Close()
+
+	// Forward index
+	if err := batch.Delete(key, nil); err != nil {
+		return err
+	}
+
+	// Reverse index
+	reverseKey := pebbleCDCTxnLockKey(txnID, tableName, rowKey)
+	if err := batch.Delete(reverseKey, nil); err != nil {
+		return err
+	}
+
+	return batch.Commit(pebble.NoSync)
 }
 
 // ReleaseCDCRowLocksByTxn releases all row locks held by the specified transaction.
-// Uses batch delete for efficiency.
+// Uses reverse index for O(m) complexity where m = locks held by txn.
 func (s *PebbleMetaStore) ReleaseCDCRowLocksByTxn(txnID uint64) error {
-	prefix := []byte(pebblePrefixCDCActive)
-	var keysToDelete [][]byte
+	prefix := pebbleCDCTxnLockPrefix(txnID)
 
 	iter, err := s.db.NewIter(&pebble.IterOptions{
 		LowerBound: prefix,
@@ -2121,34 +2173,42 @@ func (s *PebbleMetaStore) ReleaseCDCRowLocksByTxn(txnID uint64) error {
 		return err
 	}
 
-	for iter.SeekGE(prefix); iter.Valid(); iter.Next() {
-		val, err := iter.ValueAndErr()
-		if err != nil {
-			continue
-		}
-
-		if len(val) >= 8 {
-			lockTxnID := binary.BigEndian.Uint64(val)
-			if lockTxnID == txnID {
-				key := make([]byte, len(iter.Key()))
-				copy(key, iter.Key())
-				keysToDelete = append(keysToDelete, key)
-			}
-		}
-	}
-	if err := iter.Close(); err != nil {
-		return err
-	}
-
-	if len(keysToDelete) == 0 {
-		return nil
-	}
-
 	batch := s.db.NewBatch()
 	defer batch.Close()
 
-	for _, key := range keysToDelete {
-		_ = batch.Delete(key, nil)
+	// Compute prefix length once (prefix is /cdc/txn_locks/{txnID:016x}/)
+	prefixLen := len(prefix)
+
+	// Iterate over reverse index entries for this txn
+	for iter.SeekGE(prefix); iter.Valid(); iter.Next() {
+		// Parse table/rowKey from reverse key: /cdc/txn_locks/{txnID}/{table}/{rowKey}
+		keyStr := string(iter.Key())
+		suffix := keyStr[prefixLen:]
+
+		// Find first slash to separate table from rowKey
+		slashIdx := strings.Index(suffix, "/")
+		if slashIdx == -1 {
+			continue // Malformed key, skip
+		}
+		tableName := suffix[:slashIdx]
+		rowKey := suffix[slashIdx+1:]
+
+		// Delete forward index key
+		forwardKey := pebbleCDCActiveRowKey(tableName, rowKey)
+		if err := batch.Delete(forwardKey, nil); err != nil {
+			iter.Close()
+			return err
+		}
+
+		// Delete reverse index key
+		if err := batch.Delete(iter.Key(), nil); err != nil {
+			iter.Close()
+			return err
+		}
+	}
+
+	if err := iter.Close(); err != nil {
+		return err
 	}
 
 	return batch.Commit(pebble.NoSync)
@@ -2217,10 +2277,25 @@ func (s *PebbleMetaStore) AcquireCDCTableDDLLock(txnID uint64, tableName string)
 		return err
 	}
 
-	// Acquire DDL lock
+	// Acquire DDL lock - write both forward and reverse index
 	buf := make([]byte, 8)
 	binary.BigEndian.PutUint64(buf, txnID)
-	return s.db.Set(key, buf, pebble.NoSync)
+
+	batch := s.db.NewBatch()
+	defer batch.Close()
+
+	// Forward index
+	if err := batch.Set(key, buf, nil); err != nil {
+		return err
+	}
+
+	// Reverse index (DDL uses __ddl__ as rowKey)
+	reverseKey := pebbleCDCTxnLockKey(txnID, tableName, pebbleCDCDDLKeyMarker)
+	if err := batch.Set(reverseKey, nil, nil); err != nil {
+		return err
+	}
+
+	return batch.Commit(pebble.NoSync)
 }
 
 // ReleaseCDCTableDDLLock releases a table-level DDL lock if held by the specified txnID.
@@ -2236,16 +2311,33 @@ func (s *PebbleMetaStore) ReleaseCDCTableDDLLock(tableName string, txnID uint64)
 	if err != nil {
 		return err
 	}
-	defer closer.Close()
 
+	var existingTxnID uint64
 	if len(val) >= 8 {
-		existingTxnID := binary.BigEndian.Uint64(val)
+		existingTxnID = binary.BigEndian.Uint64(val)
 		if existingTxnID != txnID {
+			closer.Close()
 			return nil // Lock held by different txn - don't release
 		}
 	}
+	closer.Close()
 
-	return s.db.Delete(key, pebble.NoSync)
+	// Delete both forward and reverse index
+	batch := s.db.NewBatch()
+	defer batch.Close()
+
+	// Forward index
+	if err := batch.Delete(key, nil); err != nil {
+		return err
+	}
+
+	// Reverse index
+	reverseKey := pebbleCDCTxnLockKey(txnID, tableName, pebbleCDCDDLKeyMarker)
+	if err := batch.Delete(reverseKey, nil); err != nil {
+		return err
+	}
+
+	return batch.Commit(pebble.NoSync)
 }
 
 // HasCDCRowLocksForTable checks if any row-level locks exist for a table (excluding DDL lock).
@@ -2293,4 +2385,58 @@ func (s *PebbleMetaStore) GetCDCTableDDLLock(tableName string) (uint64, error) {
 		return binary.BigEndian.Uint64(val), nil
 	}
 	return 0, nil
+}
+
+// clearAllCDCLocks deletes all CDC locks (both forward and reverse index).
+// Called on startup since CDC locks should never survive process restart.
+// Any surviving lock is from a crashed transaction and is invalid.
+func (s *PebbleMetaStore) clearAllCDCLocks() error {
+	batch := s.db.NewBatch()
+	defer batch.Close()
+
+	// Delete all forward locks: /cdc/active/*
+	activePrefix := []byte(pebblePrefixCDCActive)
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: activePrefix,
+		UpperBound: prefixUpperBound(activePrefix),
+	})
+	if err != nil {
+		return err
+	}
+
+	for iter.SeekGE(activePrefix); iter.Valid(); iter.Next() {
+		key := make([]byte, len(iter.Key()))
+		copy(key, iter.Key())
+		if err := batch.Delete(key, nil); err != nil {
+			iter.Close()
+			return err
+		}
+	}
+	if err := iter.Close(); err != nil {
+		return err
+	}
+
+	// Delete all reverse locks: /cdc/txn_locks/*
+	txnLocksPrefix := []byte(pebblePrefixCDCTxnLocks)
+	iter, err = s.db.NewIter(&pebble.IterOptions{
+		LowerBound: txnLocksPrefix,
+		UpperBound: prefixUpperBound(txnLocksPrefix),
+	})
+	if err != nil {
+		return err
+	}
+
+	for iter.SeekGE(txnLocksPrefix); iter.Valid(); iter.Next() {
+		key := make([]byte, len(iter.Key()))
+		copy(key, iter.Key())
+		if err := batch.Delete(key, nil); err != nil {
+			iter.Close()
+			return err
+		}
+	}
+	if err := iter.Close(); err != nil {
+		return err
+	}
+
+	return batch.Commit(pebble.NoSync)
 }
