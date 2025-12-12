@@ -31,6 +31,9 @@ const (
 	pebblePrefixSeq         = "/seq/"          // /seq/{name}
 	pebblePrefixIntentByTxn = "/intent_txn/"   // /intent_txn/{txnID:016x}/{tableName}/{rowKey}
 	pebblePrefixCounter     = "/meta/"         // /meta/{counterName}
+	pebblePrefixCDCActive   = "/cdc/active/"   // /cdc/active/{tableName}/{rowKey|__ddl__}
+
+	pebbleCDCDDLKeyMarker = "__ddl__" // Sentinel key for DDL locks
 )
 
 // Group commit configuration (same as BadgerDB)
@@ -472,6 +475,18 @@ func pebbleDdlLockKey(dbName string) []byte {
 
 func pebbleSeqKey(nodeID uint64) []byte {
 	return []byte(fmt.Sprintf("%s%016x", pebblePrefixSeq, nodeID))
+}
+
+func pebbleCDCActiveRowKey(tableName, rowKey string) []byte {
+	return []byte(fmt.Sprintf("%s%s/%s", pebblePrefixCDCActive, tableName, rowKey))
+}
+
+func pebbleCDCActiveDDLKey(tableName string) []byte {
+	return []byte(fmt.Sprintf("%s%s/%s", pebblePrefixCDCActive, tableName, pebbleCDCDDLKeyMarker))
+}
+
+func pebbleCDCActiveTablePrefix(tableName string) []byte {
+	return []byte(fmt.Sprintf("%s%s/", pebblePrefixCDCActive, tableName))
 }
 
 // prefixUpperBound returns prefix + 0xFF... for range iteration
@@ -2033,4 +2048,249 @@ func (s *PebbleMetaStore) ScanTransactions(fromTxnID uint64, descending bool, ca
 	}
 
 	return iter.Error()
+}
+
+// AcquireCDCRowLock attempts to acquire a row-level lock for CDC conflict detection.
+// Returns ErrCDCRowLocked if the row is already locked by a different transaction.
+// Same transaction can re-acquire (idempotent).
+func (s *PebbleMetaStore) AcquireCDCRowLock(txnID uint64, tableName, rowKey string) error {
+	key := pebbleCDCActiveRowKey(tableName, rowKey)
+
+	// Check if lock exists
+	val, closer, err := s.db.Get(key)
+	if err == nil {
+		defer closer.Close()
+		if len(val) >= 8 {
+			existingTxnID := binary.BigEndian.Uint64(val)
+			if existingTxnID != txnID {
+				return ErrCDCRowLocked{
+					Table:     tableName,
+					RowKey:    rowKey,
+					HeldByTxn: existingTxnID,
+				}
+			}
+			// Same txn - idempotent re-acquire
+			return nil
+		}
+	} else if err != pebble.ErrNotFound {
+		return err
+	}
+
+	// No lock exists or same txn - acquire/update it
+	buf := make([]byte, 8)
+	binary.BigEndian.PutUint64(buf, txnID)
+	return s.db.Set(key, buf, pebble.NoSync)
+}
+
+// ReleaseCDCRowLock releases a row-level lock if held by the specified txnID.
+// Idempotent - no error if already released.
+func (s *PebbleMetaStore) ReleaseCDCRowLock(tableName, rowKey string, txnID uint64) error {
+	key := pebbleCDCActiveRowKey(tableName, rowKey)
+
+	// Check if lock exists and belongs to this txn
+	val, closer, err := s.db.Get(key)
+	if err == pebble.ErrNotFound {
+		return nil // Already released
+	}
+	if err != nil {
+		return err
+	}
+	defer closer.Close()
+
+	if len(val) >= 8 {
+		existingTxnID := binary.BigEndian.Uint64(val)
+		if existingTxnID != txnID {
+			return nil // Lock held by different txn - don't release
+		}
+	}
+
+	return s.db.Delete(key, pebble.NoSync)
+}
+
+// ReleaseCDCRowLocksByTxn releases all row locks held by the specified transaction.
+// Uses batch delete for efficiency.
+func (s *PebbleMetaStore) ReleaseCDCRowLocksByTxn(txnID uint64) error {
+	prefix := []byte(pebblePrefixCDCActive)
+	var keysToDelete [][]byte
+
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: prefix,
+		UpperBound: prefixUpperBound(prefix),
+	})
+	if err != nil {
+		return err
+	}
+
+	for iter.SeekGE(prefix); iter.Valid(); iter.Next() {
+		val, err := iter.ValueAndErr()
+		if err != nil {
+			continue
+		}
+
+		if len(val) >= 8 {
+			lockTxnID := binary.BigEndian.Uint64(val)
+			if lockTxnID == txnID {
+				key := make([]byte, len(iter.Key()))
+				copy(key, iter.Key())
+				keysToDelete = append(keysToDelete, key)
+			}
+		}
+	}
+	if err := iter.Close(); err != nil {
+		return err
+	}
+
+	if len(keysToDelete) == 0 {
+		return nil
+	}
+
+	batch := s.db.NewBatch()
+	defer batch.Close()
+
+	for _, key := range keysToDelete {
+		_ = batch.Delete(key, nil)
+	}
+
+	return batch.Commit(pebble.NoSync)
+}
+
+// GetCDCRowLock returns the transaction ID holding the lock, or 0 if no lock exists.
+func (s *PebbleMetaStore) GetCDCRowLock(tableName, rowKey string) (uint64, error) {
+	key := pebbleCDCActiveRowKey(tableName, rowKey)
+
+	val, closer, err := s.db.Get(key)
+	if err == pebble.ErrNotFound {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	defer closer.Close()
+
+	if len(val) >= 8 {
+		return binary.BigEndian.Uint64(val), nil
+	}
+	return 0, nil
+}
+
+// AcquireCDCTableDDLLock attempts to acquire a table-level DDL lock.
+// Returns ErrCDCDMLInProgress if any DML row locks exist for the table.
+// Returns ErrCDCRowLocked if DDL lock already held by different transaction.
+//
+// NOTE: There is a TOCTOU race between checking HasCDCRowLocksForTable and
+// acquiring the DDL lock. This means DDL and DML operations could theoretically
+// overlap in a small window. In practice, this is mitigated by:
+// 1. The coordinator acquiring write intents before CDC capture
+// 2. The short duration of the window (microseconds)
+// 3. The retry mechanism on conflict (MySQL 1213 deadlock error)
+// A fully atomic implementation would require Pebble transactions.
+func (s *PebbleMetaStore) AcquireCDCTableDDLLock(txnID uint64, tableName string) error {
+	// First check if any DML is in progress
+	hasDML, err := s.HasCDCRowLocksForTable(tableName)
+	if err != nil {
+		return err
+	}
+	if hasDML {
+		return ErrCDCDMLInProgress{Table: tableName}
+	}
+
+	// Check if DDL lock exists
+	key := pebbleCDCActiveDDLKey(tableName)
+	val, closer, err := s.db.Get(key)
+	if err == nil {
+		defer closer.Close()
+		if len(val) >= 8 {
+			existingTxnID := binary.BigEndian.Uint64(val)
+			if existingTxnID != txnID {
+				// DDL lock is stored as a special row with "__ddl__" key
+				// This allows us to reuse ErrCDCRowLocked for consistency
+				return ErrCDCRowLocked{
+					Table:     tableName,
+					RowKey:    pebbleCDCDDLKeyMarker, // Sentinel value indicating DDL lock
+					HeldByTxn: existingTxnID,
+				}
+			}
+			// Same txn - idempotent re-acquire
+			return nil
+		}
+	} else if err != pebble.ErrNotFound {
+		return err
+	}
+
+	// Acquire DDL lock
+	buf := make([]byte, 8)
+	binary.BigEndian.PutUint64(buf, txnID)
+	return s.db.Set(key, buf, pebble.NoSync)
+}
+
+// ReleaseCDCTableDDLLock releases a table-level DDL lock if held by the specified txnID.
+// Idempotent - no error if already released.
+func (s *PebbleMetaStore) ReleaseCDCTableDDLLock(tableName string, txnID uint64) error {
+	key := pebbleCDCActiveDDLKey(tableName)
+
+	// Check if lock exists and belongs to this txn
+	val, closer, err := s.db.Get(key)
+	if err == pebble.ErrNotFound {
+		return nil // Already released
+	}
+	if err != nil {
+		return err
+	}
+	defer closer.Close()
+
+	if len(val) >= 8 {
+		existingTxnID := binary.BigEndian.Uint64(val)
+		if existingTxnID != txnID {
+			return nil // Lock held by different txn - don't release
+		}
+	}
+
+	return s.db.Delete(key, pebble.NoSync)
+}
+
+// HasCDCRowLocksForTable checks if any row-level locks exist for a table (excluding DDL lock).
+// Returns true if any DML is in progress on this table.
+func (s *PebbleMetaStore) HasCDCRowLocksForTable(tableName string) (bool, error) {
+	prefix := pebbleCDCActiveTablePrefix(tableName)
+	ddlKey := pebbleCDCActiveDDLKey(tableName)
+
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: prefix,
+		UpperBound: prefixUpperBound(prefix),
+	})
+	if err != nil {
+		return false, err
+	}
+	defer iter.Close()
+
+	for iter.SeekGE(prefix); iter.Valid(); iter.Next() {
+		key := iter.Key()
+		// Skip the DDL lock key
+		if string(key) == string(ddlKey) {
+			continue
+		}
+		// Found a non-DDL lock
+		return true, nil
+	}
+
+	return false, iter.Error()
+}
+
+// GetCDCTableDDLLock returns the transaction ID holding the DDL lock, or 0 if no lock exists.
+func (s *PebbleMetaStore) GetCDCTableDDLLock(tableName string) (uint64, error) {
+	key := pebbleCDCActiveDDLKey(tableName)
+
+	val, closer, err := s.db.Get(key)
+	if err == pebble.ErrNotFound {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	defer closer.Close()
+
+	if len(val) >= 8 {
+		return binary.BigEndian.Uint64(val), nil
+	}
+	return 0, nil
 }

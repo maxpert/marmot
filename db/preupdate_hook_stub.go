@@ -114,3 +114,12 @@ func (s *EphemeralHookSession) GetTxnID() uint64 {
 func (s *EphemeralHookSession) GetLastInsertId() int64 {
 	return 0
 }
+
+// GetConflictError returns nil (stub - no CDC in stub mode)
+func (s *EphemeralHookSession) GetConflictError() error {
+	return nil
+}
+
+// ClearConflictError is a no-op (stub)
+func (s *EphemeralHookSession) ClearConflictError() {
+}

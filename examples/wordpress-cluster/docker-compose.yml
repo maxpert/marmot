@@ -1,0 +1,174 @@
+services:
+  # === MARMOT CLUSTER (3 nodes) ===
+  marmot-1:
+    build:
+      context: ../..
+      dockerfile: examples/wordpress/Dockerfile
+    container_name: marmot-wp-1
+    ports:
+      - "9191:9191"
+    expose:
+      - "9181"
+    volumes:
+      - ./marmot-1-config.toml:/app/config.toml:ro
+      - marmot-1-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9181/metrics"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - marmot-cluster-net
+
+  marmot-2:
+    build:
+      context: ../..
+      dockerfile: examples/wordpress/Dockerfile
+    container_name: marmot-wp-2
+    depends_on:
+      marmot-1:
+        condition: service_healthy
+    ports:
+      - "9192:9192"
+    expose:
+      - "9182"
+    volumes:
+      - ./marmot-2-config.toml:/app/config.toml:ro
+      - marmot-2-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9182/metrics"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - marmot-cluster-net
+
+  marmot-3:
+    build:
+      context: ../..
+      dockerfile: examples/wordpress/Dockerfile
+    container_name: marmot-wp-3
+    depends_on:
+      marmot-2:
+        condition: service_healthy
+    ports:
+      - "9193:9193"
+    expose:
+      - "9183"
+    volumes:
+      - ./marmot-3-config.toml:/app/config.toml:ro
+      - marmot-3-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9183/metrics"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - marmot-cluster-net
+
+  # === DATABASE INIT (runs once against node 1) ===
+  init-db:
+    image: mysql:8.4
+    container_name: marmot-wp-cluster-init
+    depends_on:
+      marmot-3:
+        condition: service_healthy
+    entrypoint:
+      [
+        "sh",
+        "-c",
+        "mysql -h marmot-1 -P 9191 -u root -e 'CREATE DATABASE IF NOT EXISTS wordpress;'",
+      ]
+    networks:
+      - marmot-cluster-net
+    restart: "no"
+
+  # === WORDPRESS CLUSTER (3 nodes) ===
+  # Each WordPress needs its own volume to avoid extraction conflicts
+  # Media uploads won't sync (use S3/NFS in production)
+  wordpress-1:
+    image: wordpress:latest
+    container_name: wordpress-1
+    depends_on:
+      init-db:
+        condition: service_completed_successfully
+    ports:
+      - "9101:80"
+    environment:
+      WORDPRESS_DB_HOST: marmot-1:9191
+      WORDPRESS_DB_USER: root
+      WORDPRESS_DB_PASSWORD: ""
+      WORDPRESS_DB_NAME: wordpress
+      WORDPRESS_DEBUG: 1
+      WORDPRESS_CONFIG_EXTRA: |
+        define('WP_DEBUG', true);
+        define('WP_DEBUG_LOG', true);
+        define('WP_DEBUG_DISPLAY', true);
+        define('WP_HOME', 'http://localhost:9101');
+        define('WP_SITEURL', 'http://localhost:9101');
+    volumes:
+      - wordpress-1-data:/var/www/html
+    networks:
+      - marmot-cluster-net
+
+  wordpress-2:
+    image: wordpress:latest
+    container_name: wordpress-2
+    depends_on:
+      init-db:
+        condition: service_completed_successfully
+    ports:
+      - "9102:80"
+    environment:
+      WORDPRESS_DB_HOST: marmot-2:9192
+      WORDPRESS_DB_USER: root
+      WORDPRESS_DB_PASSWORD: ""
+      WORDPRESS_DB_NAME: wordpress
+      WORDPRESS_DEBUG: 1
+      WORDPRESS_CONFIG_EXTRA: |
+        define('WP_DEBUG', true);
+        define('WP_DEBUG_LOG', true);
+        define('WP_DEBUG_DISPLAY', true);
+        define('WP_HOME', 'http://localhost:9102');
+        define('WP_SITEURL', 'http://localhost:9102');
+    volumes:
+      - wordpress-2-data:/var/www/html
+    networks:
+      - marmot-cluster-net
+
+  wordpress-3:
+    image: wordpress:latest
+    container_name: wordpress-3
+    depends_on:
+      init-db:
+        condition: service_completed_successfully
+    ports:
+      - "9103:80"
+    environment:
+      WORDPRESS_DB_HOST: marmot-3:9193
+      WORDPRESS_DB_USER: root
+      WORDPRESS_DB_PASSWORD: ""
+      WORDPRESS_DB_NAME: wordpress
+      WORDPRESS_DEBUG: 1
+      WORDPRESS_CONFIG_EXTRA: |
+        define('WP_DEBUG', true);
+        define('WP_DEBUG_LOG', true);
+        define('WP_DEBUG_DISPLAY', true);
+        define('WP_HOME', 'http://localhost:9103');
+        define('WP_SITEURL', 'http://localhost:9103');
+    volumes:
+      - wordpress-3-data:/var/www/html
+    networks:
+      - marmot-cluster-net
+
+volumes:
+  marmot-1-data:
+  marmot-2-data:
+  marmot-3-data:
+  wordpress-1-data:
+  wordpress-2-data:
+  wordpress-3-data:
+
+networks:
+  marmot-cluster-net:
+    driver: bridge

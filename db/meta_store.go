@@ -63,6 +63,17 @@ type MetaStore interface {
 	GetIntentEntries(txnID uint64) ([]*IntentEntry, error)
 	DeleteIntentEntries(txnID uint64) error
 
+	// CDC active locks for conflict detection
+	AcquireCDCRowLock(txnID uint64, tableName, rowKey string) error
+	ReleaseCDCRowLock(tableName, rowKey string, txnID uint64) error
+	ReleaseCDCRowLocksByTxn(txnID uint64) error
+	GetCDCRowLock(tableName, rowKey string) (uint64, error) // Returns txnID or 0 if no lock
+
+	AcquireCDCTableDDLLock(txnID uint64, tableName string) error
+	ReleaseCDCTableDDLLock(tableName string, txnID uint64) error
+	HasCDCRowLocksForTable(tableName string) (bool, error) // For DDL to check if DML in progress
+	GetCDCTableDDLLock(tableName string) (uint64, error)   // Returns txnID or 0 if no lock
+
 	// GC
 	CleanupStaleTransactions(timeout time.Duration) (int, error)
 	CleanupOldTransactionRecords(minRetention, maxRetention time.Duration, minAppliedTxnID, minAppliedSeqNum uint64) (int, error)

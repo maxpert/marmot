@@ -15,6 +15,7 @@ import (
 	"github.com/mattn/go-sqlite3"
 	"github.com/maxpert/marmot/encoding"
 	"github.com/maxpert/marmot/protocol/filter"
+	"github.com/rs/zerolog/log"
 )
 
 // OpInsertInt, OpUpdateInt, OpDeleteInt are defined in meta_schema.go
@@ -135,6 +136,9 @@ type EphemeralHookSession struct {
 	schemaCache  *SchemaCache                        // Shared schema cache
 	lastInsertId int64                               // Last insert ID from most recent insert
 	mu           sync.Mutex
+
+	// CDC conflict detection
+	conflictError error // Set if conflict detected during hook
 }
 
 // StartEphemeralSession creates a new CDC capture session with a dedicated connection.
@@ -205,6 +209,12 @@ func (s *EphemeralHookSession) ExecContext(ctx context.Context, query string) er
 	if err != nil {
 		return err
 	}
+
+	// Check for CDC conflict errors that occurred during hook callback
+	if conflictErr := s.GetConflictError(); conflictErr != nil {
+		return conflictErr
+	}
+
 	// Capture last insert ID (ignore error - not all statements produce one)
 	if id, err := result.LastInsertId(); err == nil && id != 0 {
 		s.lastInsertId = id
@@ -263,6 +273,13 @@ func (s *EphemeralHookSession) FlushIntentLog() error {
 func (s *EphemeralHookSession) cleanup() {
 	if s.conn == nil {
 		return
+	}
+
+	// Release all CDC row locks held by this transaction
+	if s.metaStore != nil && s.txnID != 0 {
+		if err := s.metaStore.ReleaseCDCRowLocksByTxn(s.txnID); err != nil {
+			log.Error().Err(err).Uint64("txn_id", s.txnID).Msg("Failed to release CDC row locks during cleanup")
+		}
 	}
 
 	// Unregister hook inside Raw() callback
@@ -373,6 +390,18 @@ func (s *EphemeralHookSession) hookCallback(data sqlite3.SQLitePreUpdateData) {
 			s.collectors[data.TableName] = filter.NewKeyHashCollector()
 		}
 		s.collectors[data.TableName].AddRowKey(rowKey)
+	}
+
+	// CDC conflict detection: check for DDL lock and acquire row lock
+	if ddlTxn, err := s.metaStore.GetCDCTableDDLLock(data.TableName); err == nil && ddlTxn != 0 && ddlTxn != s.txnID {
+		s.conflictError = ErrCDCTableDDLInProgress{Table: data.TableName, HeldByTxn: ddlTxn}
+		return
+	}
+
+	// Acquire row lock
+	if err := s.metaStore.AcquireCDCRowLock(s.txnID, data.TableName, rowKey); err != nil {
+		s.conflictError = err
+		return
 	}
 
 	// Serialize values to msgpack using pooled encoder
@@ -542,4 +571,19 @@ func (s *EphemeralHookSession) GetTxnID() uint64 {
 // GetLastInsertId returns the last insert ID from the most recent insert
 func (s *EphemeralHookSession) GetLastInsertId() int64 {
 	return s.lastInsertId
+}
+
+// GetConflictError returns any conflict error that occurred during CDC capture.
+// Caller should check this after executing statements to detect row conflicts.
+func (s *EphemeralHookSession) GetConflictError() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.conflictError
+}
+
+// ClearConflictError clears the conflict error (for retry scenarios)
+func (s *EphemeralHookSession) ClearConflictError() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.conflictError = nil
 }

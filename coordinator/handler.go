@@ -414,17 +414,27 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, consistency
 			// Transfer hook-captured CDC data to statements for replication
 			// Hooks capture actual row data; AST parsing can't handle parameterized queries
 			cdcEntries := pendingExec.GetCDCEntries()
-			if len(statements) == 1 && len(cdcEntries) > 0 {
-				// CRITICAL: Use MergeCDCEntries to ensure TableName is always extracted.
-				// TableName comes from CDC hooks - AST parsing cannot reliably extract it.
-				merged := MergeCDCEntries(cdcEntries)
-
-				if statements[0].TableName == "" && merged.TableName != "" {
-					statements[0].TableName = merged.TableName
+			if len(cdcEntries) > 0 {
+				// Process through CDC pipeline - produces N statements for N unique rows
+				config := DefaultCDCPipelineConfig()
+				result, err := ProcessCDCEntries(cdcEntries, config)
+				if err != nil {
+					if cancelHookCtx != nil {
+						cancelHookCtx()
+					}
+					telemetry.QueriesTotal.With("dml", "failed").Inc()
+					telemetry.QueryDurationSeconds.With("dml").Observe(time.Since(queryStart).Seconds())
+					return nil, fmt.Errorf("CDC pipeline failed: %w", err)
 				}
-				statements[0].RowKey = merged.RowKey
-				statements[0].OldValues = merged.OldValues
-				statements[0].NewValues = merged.NewValues
+
+				// Replace single statement with expanded statements from CDC
+				if len(result.Statements) > 0 {
+					// Keep original SQL in first statement for debugging
+					result.Statements[0].SQL = stmt.SQL
+					result.Statements[0].Type = stmt.Type
+					result.Statements[0].Database = stmt.Database
+					statements = result.Statements
+				}
 			}
 		}
 	}
@@ -859,21 +869,31 @@ func (h *CoordinatorHandler) handleCommit(session *protocol.ConnectionSession) (
 
 			totalRowsAffected += pendingExec.GetTotalRowCount()
 
-			// Extract CDC data and merge into statement
+			// Extract CDC data and process through pipeline
 			cdcEntries := pendingExec.GetCDCEntries()
 			if len(cdcEntries) > 0 {
-				// CRITICAL: Use MergeCDCEntries to ensure TableName is always extracted.
-				merged := MergeCDCEntries(cdcEntries)
-
-				if stmt.TableName == "" && merged.TableName != "" {
-					stmt.TableName = merged.TableName
+				// Process through CDC pipeline
+				config := DefaultCDCPipelineConfig()
+				result, err := ProcessCDCEntries(cdcEntries, config)
+				if err != nil {
+					session.EndTransaction()
+					h.recentTxnIDs.Delete(txnState.TxnID)
+					return nil, fmt.Errorf("CDC pipeline failed: %w", err)
 				}
-				stmt.RowKey = merged.RowKey
-				stmt.OldValues = merged.OldValues
-				stmt.NewValues = merged.NewValues
+
+				// Add processed statements (multiple rows become multiple statements)
+				for _, cdcStmt := range result.Statements {
+					cdcStmt.SQL = stmt.SQL
+					cdcStmt.Type = stmt.Type
+					cdcStmt.Database = stmt.Database
+					enrichedStatements = append(enrichedStatements, cdcStmt)
+				}
+			} else {
+				enrichedStatements = append(enrichedStatements, stmt)
 			}
+		} else {
+			enrichedStatements = append(enrichedStatements, stmt)
 		}
-		enrichedStatements = append(enrichedStatements, stmt)
 	}
 
 	// Create 2PC transaction with CDC-enriched statements
