@@ -813,6 +813,13 @@ func (s *PebbleMetaStore) WriteIntent(txnID uint64, intentType IntentType, table
 	mu.Lock()
 	defer mu.Unlock()
 
+	// Update heartbeat to prevent GC from killing active transactions during 2PC
+	// This is critical: WriteIntent can block waiting for locks, and without heartbeat
+	// updates, GC may incorrectly clean up transactions that are actively being processed
+	if err := s.Heartbeat(txnID); err != nil {
+		log.Warn().Err(err).Uint64("txn_id", txnID).Msg("Failed to update heartbeat during write")
+	}
+
 	tbHash := ComputeIntentHash(tableName, intentKey)
 
 	// Fast path: Cuckoo filter miss = definitely no conflict
@@ -1544,6 +1551,11 @@ func (s *PebbleMetaStore) ReleaseDDLLock(dbName string, nodeID uint64) error {
 
 // WriteIntentEntry writes a CDC intent entry
 func (s *PebbleMetaStore) WriteIntentEntry(txnID, seq uint64, op uint8, table, intentKey string, oldVals, newVals []byte) error {
+	// Update heartbeat to prevent GC from killing active transactions during 2PC
+	if err := s.Heartbeat(txnID); err != nil {
+		log.Warn().Err(err).Uint64("txn_id", txnID).Msg("Failed to update heartbeat during write")
+	}
+
 	entry := &IntentEntry{
 		TxnID:     txnID,
 		Seq:       seq,
@@ -1706,14 +1718,19 @@ func (s *PebbleMetaStore) CleanupStaleTransactions(timeout time.Duration) (int, 
 			continue
 		}
 
+		nowNs := time.Now().UnixNano()
+		ageMs := (nowNs - rec.LastHeartbeat) / 1e6
 		if rec.LastHeartbeat < cutoff {
 			staleTxnIDs = append(staleTxnIDs, txnID)
-			ageMs := (time.Now().UnixNano() - rec.LastHeartbeat) / 1e6
 			log.Warn().
 				Uint64("txn_id", txnID).
 				Str("status", rec.Status.String()).
 				Int64("age_ms", ageMs).
 				Int64("timeout_ms", timeout.Milliseconds()).
+				Int64("now_ns", nowNs).
+				Int64("cutoff_ns", cutoff).
+				Int64("last_heartbeat_ns", rec.LastHeartbeat).
+				Int64("created_at_ns", rec.CreatedAt).
 				Msg("GC: Found stale PENDING transaction - WILL BE CLEANED UP")
 		}
 	}
@@ -2180,6 +2197,7 @@ func (s *PebbleMetaStore) ReleaseCDCRowLocksByTxn(txnID uint64) error {
 
 	// Compute prefix length once (prefix is /cdc/txn_locks/{txnID:016x}/)
 	prefixLen := len(prefix)
+	lockCount := 0
 
 	// Iterate over reverse index entries for this txn
 	for iter.SeekGE(prefix); iter.Valid(); iter.Next() {
@@ -2207,6 +2225,14 @@ func (s *PebbleMetaStore) ReleaseCDCRowLocksByTxn(txnID uint64) error {
 			iter.Close()
 			return err
 		}
+		lockCount++
+	}
+
+	if lockCount > 0 {
+		log.Debug().
+			Uint64("txn_id", txnID).
+			Int("locks_released", lockCount).
+			Msg("CDC: Released row locks for transaction")
 	}
 
 	if err := iter.Close(); err != nil {
@@ -2253,6 +2279,10 @@ func (s *PebbleMetaStore) AcquireCDCTableDDLLock(txnID uint64, tableName string)
 		return err
 	}
 	if hasDML {
+		log.Debug().
+			Uint64("txn_id", txnID).
+			Str("table", tableName).
+			Msg("CDC: DDL blocked - DML row locks exist on table")
 		return ErrCDCDMLInProgress{Table: tableName}
 	}
 
@@ -2264,6 +2294,11 @@ func (s *PebbleMetaStore) AcquireCDCTableDDLLock(txnID uint64, tableName string)
 		if len(val) >= 8 {
 			existingTxnID := binary.BigEndian.Uint64(val)
 			if existingTxnID != txnID {
+				log.Debug().
+					Uint64("txn_id", txnID).
+					Uint64("blocked_by_txn", existingTxnID).
+					Str("table", tableName).
+					Msg("CDC: DDL table-level lock conflict - blocked by another DDL transaction")
 				// DDL lock is stored as a special row with "__ddl__" key
 				// This allows us to reuse ErrCDCRowLocked for consistency
 				return ErrCDCRowLocked{

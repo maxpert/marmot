@@ -379,6 +379,15 @@ func (mdb *ReplicatedDatabase) GetMetaStore() MetaStore {
 	return mdb.metaStore
 }
 
+// GetCachedTableSchema returns the cached schema for a table.
+// This uses the in-memory schema cache and does NOT query SQLite.
+func (mdb *ReplicatedDatabase) GetCachedTableSchema(tableName string) (*TableSchema, error) {
+	if mdb.schemaCache == nil {
+		return nil, fmt.Errorf("schema cache not initialized")
+	}
+	return mdb.schemaCache.GetSchemaFor(tableName)
+}
+
 // ApplyCDCEntries applies CDC data entries to SQLite.
 // Used by CompletedLocalExecution.Commit() to persist data captured during hooks.
 func (mdb *ReplicatedDatabase) ApplyCDCEntries(entries []*IntentEntry) error {

@@ -141,9 +141,9 @@ func loadSchema(conn *sqlite3.SQLiteConn, tableName string) (*TableSchema, error
 	defer rows.Close()
 
 	schema := &TableSchema{
-		Columns:   make([]string, 0),
+		Columns:     make([]string, 0),
 		PrimaryKeys: make([]string, 0),
-		PKIndices: make([]int, 0),
+		PKIndices:   make([]int, 0),
 	}
 
 	// table_info returns: cid, name, type, notnull, dflt_value, pk
@@ -447,6 +447,11 @@ func (s *EphemeralHookSession) hookCallback(data sqlite3.SQLitePreUpdateData) {
 
 	// CDC conflict detection: check for DDL lock and acquire row lock
 	if ddlTxn, err := s.metaStore.GetCDCTableDDLLock(data.TableName); err == nil && ddlTxn != 0 && ddlTxn != s.txnID {
+		log.Debug().
+			Uint64("txn_id", s.txnID).
+			Uint64("ddl_txn", ddlTxn).
+			Str("table", data.TableName).
+			Msg("CDC: DML blocked - DDL table lock exists")
 		s.conflictError = ErrCDCTableDDLInProgress{Table: data.TableName, HeldByTxn: ddlTxn}
 		return
 	}

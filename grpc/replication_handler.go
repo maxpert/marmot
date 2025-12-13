@@ -575,6 +575,22 @@ func (rh *ReplicationHandler) handleCommit(ctx context.Context, req *Transaction
 		}, nil
 	}
 
+	// Increment schema version for DDL transactions (followers must track schema changes)
+	if rh.schemaVersionMgr != nil {
+		for _, stmt := range txn.Statements {
+			if stmt.Type == protocol.StatementDDL {
+				_, verErr := rh.schemaVersionMgr.IncrementSchemaVersion(dbName, stmt.SQL, txn.ID)
+				if verErr != nil {
+					log.Error().Err(verErr).
+						Str("database", dbName).
+						Uint64("txn_id", txn.ID).
+						Msg("Failed to increment schema version after DDL replication")
+				}
+				break // Only increment once per transaction
+			}
+		}
+	}
+
 	telemetry.ReplicationRequestsTotal.With("commit", "success").Inc()
 	return &TransactionResponse{
 		Success: true,
@@ -832,17 +848,16 @@ func (rh *ReplicationHandler) applyReplayCDCUpdate(tx *sql.Tx, dbName, tableName
 		return fmt.Errorf("no values to update")
 	}
 
-	// Get database instance to access schema
+	// Get database instance to access cached schema
 	dbInstance, err := rh.dbMgr.GetDatabase(dbName)
 	if err != nil {
 		return fmt.Errorf("failed to get database %s: %w", dbName, err)
 	}
 
-	// Create schema provider to get table schema
-	schemaProvider := protocol.NewSchemaProvider(dbInstance.GetDB())
-	schema, err := schemaProvider.GetTableSchema(tableName)
+	// Use cached schema - does NOT query SQLite
+	schema, err := dbInstance.GetCachedTableSchema(tableName)
 	if err != nil {
-		return fmt.Errorf("failed to get schema for table %s: %w", tableName, err)
+		return fmt.Errorf("failed to get cached schema for table %s: %w", tableName, err)
 	}
 
 	if len(schema.PrimaryKeys) == 0 {
@@ -910,17 +925,16 @@ func (rh *ReplicationHandler) applyReplayCDCDelete(tx *sql.Tx, dbName string, ta
 		return fmt.Errorf("no old values for delete")
 	}
 
-	// Get database instance to access schema
+	// Get database instance to access cached schema
 	dbInstance, err := rh.dbMgr.GetDatabase(dbName)
 	if err != nil {
 		return fmt.Errorf("failed to get database %s: %w", dbName, err)
 	}
 
-	// Create schema provider to get table schema
-	schemaProvider := protocol.NewSchemaProvider(dbInstance.GetDB())
-	schema, err := schemaProvider.GetTableSchema(tableName)
+	// Use cached schema - does NOT query SQLite
+	schema, err := dbInstance.GetCachedTableSchema(tableName)
 	if err != nil {
-		return fmt.Errorf("failed to get schema for table %s: %w", tableName, err)
+		return fmt.Errorf("failed to get cached schema for table %s: %w", tableName, err)
 	}
 
 	// Build WHERE clause using primary key columns from oldValues

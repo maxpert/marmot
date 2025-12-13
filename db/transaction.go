@@ -291,12 +291,6 @@ func (tm *TransactionManager) applyDataChanges(txn *Transaction, intents []*Writ
 		return fmt.Errorf("failed to load CDC entries: %w", err)
 	}
 
-	log.Debug().
-		Uint64("txn_id", txn.ID).
-		Int("cdc_entries", len(cdcEntries)).
-		Int("intents", len(intents)).
-		Msg("CommitTransaction: applying data changes")
-
 	// Apply CDC entries (DML operations)
 	if err := tm.applyCDCEntries(txn.ID, cdcEntries); err != nil {
 		return err
@@ -306,10 +300,6 @@ func (tm *TransactionManager) applyDataChanges(txn *Transaction, intents []*Writ
 	// This is CRITICAL for anti-entropy: StreamChanges reads SerializedStatements to send
 	// CDC data to lagging nodes. Without this, delta sync receives empty statements.
 	txn.Statements = tm.rebuildStatementsFromCDC(cdcEntries, intents)
-	log.Debug().
-		Uint64("txn_id", txn.ID).
-		Int("rebuilt_statements", len(txn.Statements)).
-		Msg("applyDataChanges: rebuilt statements for TransactionRecord")
 
 	// Apply DDL statements if no CDC entries
 	if len(cdcEntries) == 0 && len(intents) > 0 {
@@ -327,11 +317,6 @@ func (tm *TransactionManager) applyDataChanges(txn *Transaction, intents []*Writ
 func (tm *TransactionManager) rebuildStatementsFromCDC(cdcEntries []*IntentEntry, intents []*WriteIntentRecord) []protocol.Statement {
 	statements := make([]protocol.Statement, 0, len(cdcEntries)+len(intents))
 
-	log.Debug().
-		Int("cdc_entries", len(cdcEntries)).
-		Int("intents", len(intents)).
-		Msg("rebuildStatementsFromCDC: starting rebuild")
-
 	// Add DML statements from CDC entries
 	for _, entry := range cdcEntries {
 		stmt := protocol.Statement{
@@ -341,13 +326,6 @@ func (tm *TransactionManager) rebuildStatementsFromCDC(cdcEntries []*IntentEntry
 			NewValues: entry.NewValues,
 			Type:      opCodeToStatementType(entry.Operation),
 		}
-		log.Debug().
-			Str("table", entry.Table).
-			Str("intent_key", entry.IntentKey).
-			Int("old_values", len(entry.OldValues)).
-			Int("new_values", len(entry.NewValues)).
-			Int("stmt_type", int(stmt.Type)).
-			Msg("rebuildStatementsFromCDC: added DML statement")
 		statements = append(statements, stmt)
 	}
 

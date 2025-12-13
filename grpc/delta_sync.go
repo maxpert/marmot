@@ -438,19 +438,18 @@ func (ds *DeltaSyncClient) applyCDCUpdate(tx *sql.Tx, database, tableName string
 		return fmt.Errorf("no values to update")
 	}
 
-	// Get table schema to build proper WHERE clause
-	schema, err := ds.dbManager.GetTableSchema(database, tableName)
+	// Get cached table schema - does NOT query SQLite
+	dbInstance, err := ds.dbManager.GetDatabase(database)
 	if err != nil {
-		return fmt.Errorf("failed to get schema for table %s: %w", tableName, err)
+		return fmt.Errorf("failed to get database %s: %w", database, err)
+	}
+	schema, err := dbInstance.GetCachedTableSchema(tableName)
+	if err != nil {
+		return fmt.Errorf("failed to get cached schema for table %s: %w", tableName, err)
 	}
 
-	// Extract primary key column names from schema
-	var primaryKeys []string
-	for _, col := range schema.Columns {
-		if col.IsPK {
-			primaryKeys = append(primaryKeys, col.Name)
-		}
-	}
+	// Get primary keys directly from cached schema
+	primaryKeys := schema.PrimaryKeys
 
 	if len(primaryKeys) == 0 {
 		return fmt.Errorf("no primary key columns found for table %s", tableName)
@@ -517,19 +516,18 @@ func (ds *DeltaSyncClient) applyCDCDelete(tx *sql.Tx, database string, tableName
 		return fmt.Errorf("empty old values for delete")
 	}
 
-	// Get table schema to build proper WHERE clause
-	schema, err := ds.dbManager.GetTableSchema(database, tableName)
+	// Get cached table schema - does NOT query SQLite
+	dbInstance, err := ds.dbManager.GetDatabase(database)
 	if err != nil {
-		return fmt.Errorf("failed to get schema for table %s: %w", tableName, err)
+		return fmt.Errorf("failed to get database %s: %w", database, err)
+	}
+	schema, err := dbInstance.GetCachedTableSchema(tableName)
+	if err != nil {
+		return fmt.Errorf("failed to get cached schema for table %s: %w", tableName, err)
 	}
 
-	// Extract primary key column names from schema
-	var primaryKeys []string
-	for _, col := range schema.Columns {
-		if col.IsPK {
-			primaryKeys = append(primaryKeys, col.Name)
-		}
-	}
+	// Get primary keys directly from cached schema
+	primaryKeys := schema.PrimaryKeys
 
 	if len(primaryKeys) == 0 {
 		return fmt.Errorf("no primary key columns found for table %s", tableName)
