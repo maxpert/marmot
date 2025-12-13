@@ -910,6 +910,207 @@ func TestPipeline_ValidationDisabled(t *testing.T) {
 	}
 }
 
+// TestMergeGroup_InsertThenUpdate_BecomesInsert tests INSERT followed by UPDATE
+// on the same row - should produce a single INSERT with final values
+func TestMergeGroup_InsertThenUpdate_BecomesInsert(t *testing.T) {
+	entries := []CDCEntry{
+		// INSERT
+		{
+			Table:     "users",
+			IntentKey: "1",
+			OldValues: make(map[string][]byte),
+			NewValues: map[string][]byte{
+				"id":   []byte("1"),
+				"name": []byte("Alice"),
+			},
+		},
+		// UPDATE
+		{
+			Table:     "users",
+			IntentKey: "1",
+			OldValues: map[string][]byte{
+				"id":   []byte("1"),
+				"name": []byte("Alice"),
+			},
+			NewValues: map[string][]byte{
+				"id":   []byte("1"),
+				"name": []byte("Alice Updated"),
+			},
+		},
+	}
+
+	merged, wasDropped := MergeGroup(entries)
+
+	if wasDropped {
+		t.Fatal("INSERT->UPDATE should not be dropped")
+	}
+	if merged == nil {
+		t.Fatal("Merged entry should not be nil")
+	}
+
+	// Verify it's an INSERT (empty OldValues, has NewValues)
+	if len(merged.OldValues) != 0 {
+		t.Errorf("OldValues should be empty for INSERT, got %d entries", len(merged.OldValues))
+	}
+	if len(merged.NewValues) == 0 {
+		t.Error("NewValues should not be empty")
+	}
+
+	// Verify final values from UPDATE
+	if string(merged.NewValues["name"]) != "Alice Updated" {
+		t.Errorf("NewValues[name] = %q, want %q (from UPDATE)", merged.NewValues["name"], "Alice Updated")
+	}
+
+	// Verify statement type is INSERT
+	stmt := ConvertToStatement(*merged)
+	if stmt.Type != protocol.StatementInsert {
+		t.Errorf("Statement type = %v, want StatementInsert", stmt.Type)
+	}
+}
+
+// TestMergeGroup_InsertUpdateUpdate_BecomesInsert tests INSERT followed by multiple UPDATEs
+// Should produce a single INSERT with final values from last UPDATE
+func TestMergeGroup_InsertUpdateUpdate_BecomesInsert(t *testing.T) {
+	entries := []CDCEntry{
+		// INSERT
+		{
+			Table:     "users",
+			IntentKey: "1",
+			OldValues: make(map[string][]byte),
+			NewValues: map[string][]byte{
+				"id":   []byte("1"),
+				"name": []byte("v1"),
+			},
+		},
+		// UPDATE 1
+		{
+			Table:     "users",
+			IntentKey: "1",
+			OldValues: map[string][]byte{
+				"id":   []byte("1"),
+				"name": []byte("v1"),
+			},
+			NewValues: map[string][]byte{
+				"id":   []byte("1"),
+				"name": []byte("v2"),
+			},
+		},
+		// UPDATE 2
+		{
+			Table:     "users",
+			IntentKey: "1",
+			OldValues: map[string][]byte{
+				"id":   []byte("1"),
+				"name": []byte("v2"),
+			},
+			NewValues: map[string][]byte{
+				"id":   []byte("1"),
+				"name": []byte("v3"),
+			},
+		},
+	}
+
+	merged, wasDropped := MergeGroup(entries)
+
+	if wasDropped {
+		t.Fatal("INSERT->UPDATE->UPDATE should not be dropped")
+	}
+	if merged == nil {
+		t.Fatal("Merged entry should not be nil")
+	}
+
+	// Verify it's an INSERT
+	if len(merged.OldValues) != 0 {
+		t.Errorf("OldValues should be empty for INSERT, got %d entries", len(merged.OldValues))
+	}
+
+	// Verify final values from last UPDATE
+	if string(merged.NewValues["name"]) != "v3" {
+		t.Errorf("NewValues[name] = %q, want %q (from last UPDATE)", merged.NewValues["name"], "v3")
+	}
+
+	// Verify statement type is INSERT
+	stmt := ConvertToStatement(*merged)
+	if stmt.Type != protocol.StatementInsert {
+		t.Errorf("Statement type = %v, want StatementInsert", stmt.Type)
+	}
+}
+
+// TestPipeline_InsertThenUpdate_ProducesInsert tests full pipeline with INSERT->UPDATE
+// Verifies the result contains INSERT statement with correct values
+func TestPipeline_InsertThenUpdate_ProducesInsert(t *testing.T) {
+	entries := []CDCEntry{
+		// INSERT
+		{
+			Table:     "users",
+			IntentKey: "1",
+			OldValues: make(map[string][]byte),
+			NewValues: map[string][]byte{
+				"id":    []byte("1"),
+				"name":  []byte("Alice"),
+				"email": []byte("alice@example.com"),
+			},
+		},
+		// UPDATE
+		{
+			Table:     "users",
+			IntentKey: "1",
+			OldValues: map[string][]byte{
+				"id":    []byte("1"),
+				"name":  []byte("Alice"),
+				"email": []byte("alice@example.com"),
+			},
+			NewValues: map[string][]byte{
+				"id":    []byte("1"),
+				"name":  []byte("Alice Smith"),
+				"email": []byte("alice.smith@example.com"),
+			},
+		},
+	}
+
+	config := CDCPipelineConfig{ValidateEntries: true}
+	result, err := ProcessCDCEntries(entries, config)
+
+	if err != nil {
+		t.Fatalf("ProcessCDCEntries failed: %v", err)
+	}
+
+	// Should produce exactly 1 statement
+	if len(result.Statements) != 1 {
+		t.Fatalf("Expected 1 statement, got %d", len(result.Statements))
+	}
+
+	stmt := result.Statements[0]
+
+	// CRITICAL: Must be INSERT, not UPDATE
+	if stmt.Type != protocol.StatementInsert {
+		t.Errorf("Statement type = %v, want StatementInsert (row didn't exist before transaction)", stmt.Type)
+	}
+
+	// Verify empty OldValues
+	if len(stmt.OldValues) != 0 {
+		t.Errorf("OldValues should be empty for INSERT, got %d entries", len(stmt.OldValues))
+	}
+
+	// Verify final values from UPDATE
+	if string(stmt.NewValues["name"]) != "Alice Smith" {
+		t.Errorf("NewValues[name] = %q, want %q (from UPDATE)", stmt.NewValues["name"], "Alice Smith")
+	}
+	if string(stmt.NewValues["email"]) != "alice.smith@example.com" {
+		t.Errorf("NewValues[email] = %q, want %q (from UPDATE)", stmt.NewValues["email"], "alice.smith@example.com")
+	}
+
+	if result.TotalEntries != 2 {
+		t.Errorf("TotalEntries = %d, want 2", result.TotalEntries)
+	}
+	if result.MergedCount != 1 {
+		t.Errorf("MergedCount = %d, want 1", result.MergedCount)
+	}
+	if result.DroppedCount != 0 {
+		t.Errorf("DroppedCount = %d, want 0", result.DroppedCount)
+	}
+}
+
 func BenchmarkProcessCDCEntries_1000Rows(b *testing.B) {
 	entries := make([]CDCEntry, 1000)
 	for i := 0; i < 1000; i++ {

@@ -382,8 +382,9 @@ func TestCommitQuorumFailure_CoordinatorDoesNotCommit(t *testing.T) {
 		t.Fatal("Expected write to fail when remote commit quorum not achieved, but it succeeded")
 	}
 
-	if !contains(err.Error(), "commit quorum not achieved") {
-		t.Errorf("Expected 'commit quorum not achieved' error, got: %v", err)
+	// After fix: error message should indicate "partial commit" (more accurate than "quorum not achieved")
+	if !contains(err.Error(), "partial commit") && !contains(err.Error(), "commit quorum not achieved") {
+		t.Errorf("Expected 'partial commit' or 'commit quorum not achieved' error, got: %v", err)
 	}
 
 	// Verify local commit was NOT attempted (critical check)
@@ -509,4 +510,233 @@ func TestSplitBrainPrevention(t *testing.T) {
 	}
 
 	t.Logf("Split-brain prevention working: %v", err)
+}
+
+// TestNoAbortAfterCommitSent verifies that if some nodes commit but quorum fails,
+// we don't call abort on nodes that already committed. This is critical because
+// abort RPC on an already-committed node returns success without rollback.
+func TestNoAbortAfterCommitSent(t *testing.T) {
+	// Setup: 5-node cluster (quorum = 3, so remoteQuorumNeeded = 2)
+	nodes := []uint64{1, 2, 3, 4, 5}
+	nodeProvider := newMockNodeProvider(nodes)
+	clock := hlc.NewClock(1)
+
+	// Remote replicator: only node 2 commits successfully, rest fail during commit
+	// This simulates the scenario where COMMIT was sent to all, but only one ACKed
+	// remoteQuorumNeeded = 2, but we only get 1 ACK
+	remoteReplicator := newMockReplicator()
+	remoteReplicator.SetNodeCommitResponse(2, &ReplicationResponse{Success: true})
+	remoteReplicator.SetNodeCommitResponse(3, &ReplicationResponse{Success: false, Error: "commit timeout"})
+	remoteReplicator.SetNodeCommitResponse(4, &ReplicationResponse{Success: false, Error: "commit timeout"})
+	remoteReplicator.SetNodeCommitResponse(5, &ReplicationResponse{Success: false, Error: "commit timeout"})
+
+	// Local replicator: tracks calls
+	localReplicator := newMockReplicator()
+
+	coordinator := NewWriteCoordinator(
+		1,
+		nodeProvider,
+		remoteReplicator,
+		localReplicator,
+		100*time.Millisecond, // Short timeout to speed up test
+		clock,
+	)
+
+	txn := &Transaction{
+		ID:     1,
+		NodeID: 1,
+		Statements: []protocol.Statement{
+			{
+				SQL:       "INSERT INTO users VALUES (1, 'Alice')",
+				Type:      protocol.StatementInsert,
+				TableName: "users",
+			},
+		},
+		StartTS:          hlc.Timestamp{WallTime: 1000, Logical: 0, NodeID: 1},
+		WriteConsistency: protocol.ConsistencyQuorum,
+	}
+
+	ctx := context.Background()
+	err := coordinator.WriteTransaction(ctx, txn)
+
+	// Should FAIL - only 1 remote ACK (node 2), need 2 remote ACKs
+	if err == nil {
+		t.Fatal("Expected write to fail when remote commit quorum not achieved, but it succeeded")
+	}
+
+	// Verify error message indicates partial commit (not "quorum not achieved")
+	if !contains(err.Error(), "partial commit") {
+		t.Errorf("Expected 'partial commit' error message, got: %v", err)
+	}
+
+	// CRITICAL CHECK: Verify that abortTransaction was NOT called after COMMIT phase started
+	// Check all replicator calls - there should be NO abort calls
+	remoteCalls := remoteReplicator.GetCalls()
+	localCalls := localReplicator.GetCalls()
+
+	for _, call := range remoteCalls {
+		if call.Request.Phase == PhaseAbort {
+			t.Errorf("CRITICAL BUG: Abort was sent to remote node %d after COMMIT phase started - this can cause partial commits!",
+				call.NodeID)
+		}
+	}
+
+	for _, call := range localCalls {
+		if call.Request.Phase == PhaseAbort {
+			t.Error("CRITICAL BUG: Abort was sent to local node after COMMIT phase started - this can cause partial commits!")
+		}
+	}
+
+	t.Log("Success: No abort calls after COMMIT phase started (correct behavior for partial commit)")
+}
+
+// TestLocalPrepareMustSucceed verifies that if local prepare fails but remote quorum
+// succeeds, we abort and return error (not success). The coordinator MUST participate.
+func TestLocalPrepareMustSucceed(t *testing.T) {
+	// Setup: 3-node cluster (quorum = 2)
+	nodes := []uint64{1, 2, 3}
+	nodeProvider := newMockNodeProvider(nodes)
+	clock := hlc.NewClock(1)
+
+	// Remote replicator: nodes 2 and 3 prepare successfully
+	remoteReplicator := newMockReplicator()
+
+	// Local replicator: PREPARE fails
+	localReplicator := newMockReplicator()
+	localReplicator.SetNodeResponse(1, &ReplicationResponse{Success: false, Error: "local prepare failed"})
+
+	coordinator := NewWriteCoordinator(
+		1,
+		nodeProvider,
+		remoteReplicator,
+		localReplicator,
+		1*time.Second,
+		clock,
+	)
+
+	txn := &Transaction{
+		ID:     1,
+		NodeID: 1,
+		Statements: []protocol.Statement{
+			{
+				SQL:       "INSERT INTO users VALUES (1, 'Alice')",
+				Type:      protocol.StatementInsert,
+				TableName: "users",
+			},
+		},
+		StartTS:          hlc.Timestamp{WallTime: 1000, Logical: 0, NodeID: 1},
+		WriteConsistency: protocol.ConsistencyQuorum,
+	}
+
+	ctx := context.Background()
+	err := coordinator.WriteTransaction(ctx, txn)
+
+	// Should FAIL - coordinator must participate
+	if err == nil {
+		t.Fatal("Expected write to fail when coordinator prepare fails, but it succeeded")
+	}
+
+	// Verify error message indicates coordinator must participate
+	if !contains(err.Error(), "coordinator must participate") {
+		t.Errorf("Expected 'coordinator must participate' error message, got: %v", err)
+	}
+
+	// Wait for abort goroutines to complete (abortTransaction spawns goroutines)
+	time.Sleep(50 * time.Millisecond)
+
+	// Verify that abort was called (correct behavior - we're still in PREPARE phase)
+	remoteCalls := remoteReplicator.GetCalls()
+	hasAbort := false
+	for _, call := range remoteCalls {
+		if call.Request.Phase == PhaseAbort {
+			hasAbort = true
+			break
+		}
+	}
+
+	if !hasAbort {
+		t.Error("Expected abort to be called after prepare phase failure")
+	}
+
+	// CRITICAL CHECK: Verify NO commit was attempted (locally or remotely)
+	for _, call := range remoteCalls {
+		if call.Request.Phase == PhaseCommit {
+			t.Error("CRITICAL BUG: Commit was attempted despite coordinator prepare failure!")
+		}
+	}
+
+	localCalls := localReplicator.GetCalls()
+	for _, call := range localCalls {
+		if call.Request.Phase == PhaseCommit {
+			t.Error("CRITICAL BUG: Local commit was attempted despite local prepare failure!")
+		}
+	}
+
+	t.Log("Success: Coordinator prepare failure aborted transaction before commit phase")
+}
+
+// TestPartialCommitErrorMessage verifies error message clearly indicates partial commit scenario
+func TestPartialCommitErrorMessage(t *testing.T) {
+	// Setup: 5-node cluster (quorum = 3)
+	nodes := []uint64{1, 2, 3, 4, 5}
+	nodeProvider := newMockNodeProvider(nodes)
+	clock := hlc.NewClock(1)
+
+	// Remote replicator: only node 2 commits, nodes 3,4,5 fail during commit
+	remoteReplicator := newMockReplicator()
+	remoteReplicator.SetNodeCommitResponse(2, &ReplicationResponse{Success: true})
+	remoteReplicator.SetNodeCommitResponse(3, &ReplicationResponse{Success: false, Error: "timeout"})
+	remoteReplicator.SetNodeCommitResponse(4, &ReplicationResponse{Success: false, Error: "timeout"})
+	remoteReplicator.SetNodeCommitResponse(5, &ReplicationResponse{Success: false, Error: "timeout"})
+
+	localReplicator := newMockReplicator()
+
+	coordinator := NewWriteCoordinator(
+		1,
+		nodeProvider,
+		remoteReplicator,
+		localReplicator,
+		100*time.Millisecond,
+		clock,
+	)
+
+	txn := &Transaction{
+		ID:     1,
+		NodeID: 1,
+		Statements: []protocol.Statement{
+			{
+				SQL:       "INSERT INTO users VALUES (1, 'Alice')",
+				Type:      protocol.StatementInsert,
+				TableName: "users",
+			},
+		},
+		StartTS:          hlc.Timestamp{WallTime: 1000, Logical: 0, NodeID: 1},
+		WriteConsistency: protocol.ConsistencyQuorum,
+	}
+
+	ctx := context.Background()
+	err := coordinator.WriteTransaction(ctx, txn)
+
+	// Should FAIL - need 2 remote ACKs (quorum-1), got only 1
+	if err == nil {
+		t.Fatal("Expected write to fail, but it succeeded")
+	}
+
+	// Verify error message clearly indicates partial commit
+	errMsg := err.Error()
+	if !contains(errMsg, "partial commit") {
+		t.Errorf("Expected 'partial commit' in error message, got: %v", err)
+	}
+
+	// Verify error message includes useful details
+	if !contains(errMsg, "some nodes may have committed") {
+		t.Errorf("Expected 'some nodes may have committed' in error message, got: %v", err)
+	}
+
+	// Verify specific numbers are mentioned
+	if !contains(errMsg, "got 1") && !contains(errMsg, "needed 2") {
+		t.Logf("Warning: Error message doesn't include specific ACK counts: %v", err)
+	}
+
+	t.Logf("Success: Error message clearly indicates partial commit scenario: %v", err)
 }

@@ -225,6 +225,22 @@ func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transacti
 			totalAcks, requiredQuorum, totalMembership, aliveCount)
 	}
 
+	// CRITICAL: Verify coordinator participated in PREPARE phase
+	// The coordinator MUST be part of the quorum for correctness
+	_, selfPrepared := prepResponses[wc.nodeID]
+	if !selfPrepared {
+		telemetry.TxnTotal.With("write", "failed").Inc()
+		telemetry.TxnDurationSeconds.With("write").Observe(time.Since(txnStart).Seconds())
+		log.Error().
+			Uint64("txn_id", txn.ID).
+			Int("total_acks", totalAcks).
+			Int("required_quorum", requiredQuorum).
+			Msg("Coordinator PREPARE failed - coordinator must participate - aborting transaction")
+
+		wc.abortTransaction(ctx, aliveNodes, txn.ID, txn.Database)
+		return fmt.Errorf("coordinator must participate: local prepare failed")
+	}
+
 	// ====================
 	// PHASE 2: COMMIT
 	// ====================
@@ -258,11 +274,8 @@ func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transacti
 
 	// Calculate how many remote ACKs we need before committing locally
 	// We need (quorum - 1) from remotes, then local commit gives us quorum
-	_, selfPrepared := prepResponses[wc.nodeID]
-	remoteQuorumNeeded := requiredQuorum
-	if selfPrepared {
-		remoteQuorumNeeded = requiredQuorum - 1 // We'll add local commit after
-	}
+	// Note: selfPrepared is guaranteed to be true at this point (checked above)
+	remoteQuorumNeeded := requiredQuorum - 1 // We'll add local commit after
 
 	// STEP 1: Send COMMIT to remote nodes first
 	commitChan := make(chan response, otherPreparedNodes)
@@ -320,46 +333,54 @@ func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transacti
 
 	// STEP 3: Check if we got enough remote ACKs
 	if remoteAcks < remoteQuorumNeeded {
-		// Remote quorum not achieved - abort ALL (including self, which hasn't committed yet)
-		log.Warn().
+		// CRITICAL BUG FIX: DO NOT abort after COMMIT phase has started!
+		// Some nodes may have already committed. Aborting them is incorrect because:
+		// 1. After successful PREPARE, nodes promised to commit
+		// 2. Once they commit, their transaction state is cleaned up (txn=nil)
+		// 3. Abort RPC on an already-committed node returns success without rollback
+		// 4. This leads to partial commits and data inconsistency
+		//
+		// Correct behavior: Return error indicating partial commit.
+		// The anti-entropy/recovery system will eventually resolve this inconsistency.
+		log.Error().
 			Uint64("txn_id", txn.ID).
 			Int("remote_acks", remoteAcks).
 			Int("needed", remoteQuorumNeeded).
-			Msg("Remote commit quorum not achieved - aborting transaction")
+			Int("remote_commits", len(commitResponses)).
+			Msg("CRITICAL: Remote commit quorum not achieved - partial commit occurred")
 
-		wc.abortTransaction(ctx, aliveNodes, txn.ID, txn.Database)
 		telemetry.TxnTotal.With("write", "failed").Inc()
 		telemetry.TxnDurationSeconds.With("write").Observe(time.Since(txnStart).Seconds())
-		return fmt.Errorf("commit quorum not achieved: got %d remote acks, need %d", remoteAcks, remoteQuorumNeeded)
+		return fmt.Errorf("partial commit: got %d remote commit acks, needed %d (some nodes may have committed)",
+			remoteAcks, remoteQuorumNeeded)
 	}
 
 	// STEP 4: Remote quorum achieved - now commit locally
 	// This MUST succeed since we already PREPARED locally (we promised we can commit)
-	if selfPrepared {
-		log.Debug().
-			Uint64("txn_id", txn.ID).
-			Int("remote_acks", remoteAcks).
-			Msg("Remote quorum achieved, committing locally")
-		localResp, localErr := wc.localReplicator.ReplicateTransaction(ctx, wc.nodeID, commitReq)
-		if localErr != nil || localResp == nil || !localResp.Success {
-			// This should NEVER happen - we PREPARED successfully, commit must succeed
-			// If it does fail, we have a serious bug in PREPARE phase
-			errMsg := ""
-			if localResp != nil {
-				errMsg = localResp.Error
-			}
-			log.Error().
-				Err(localErr).
-				Str("resp_error", errMsg).
-				Uint64("txn_id", txn.ID).
-				Msg("CRITICAL: Local commit failed after remote quorum achieved - this indicates a bug in PREPARE")
-			// Don't abort remotes - they already committed. Return error but data is partially committed.
-			telemetry.TxnTotal.With("write", "failed").Inc()
-			telemetry.TxnDurationSeconds.With("write").Observe(time.Since(txnStart).Seconds())
-			return fmt.Errorf("local commit failed after remote quorum: %v", localErr)
+	// Note: selfPrepared is guaranteed to be true at this point (checked after PREPARE phase)
+	log.Debug().
+		Uint64("txn_id", txn.ID).
+		Int("remote_acks", remoteAcks).
+		Msg("Remote quorum achieved, committing locally")
+	localResp, localErr := wc.localReplicator.ReplicateTransaction(ctx, wc.nodeID, commitReq)
+	if localErr != nil || localResp == nil || !localResp.Success {
+		// This should NEVER happen - we PREPARED successfully, commit must succeed
+		// If it does fail, we have a serious bug in PREPARE phase
+		errMsg := ""
+		if localResp != nil {
+			errMsg = localResp.Error
 		}
-		commitResponses[wc.nodeID] = localResp
+		log.Error().
+			Err(localErr).
+			Str("resp_error", errMsg).
+			Uint64("txn_id", txn.ID).
+			Msg("CRITICAL: Local commit failed after remote quorum achieved - this indicates a bug in PREPARE")
+		// CRITICAL: Don't abort remotes - they already committed. Return error but data is partially committed.
+		telemetry.TxnTotal.With("write", "failed").Inc()
+		telemetry.TxnDurationSeconds.With("write").Observe(time.Since(txnStart).Seconds())
+		return fmt.Errorf("partial commit: local commit failed after remote quorum (bug in PREPARE): %v", localErr)
 	}
+	commitResponses[wc.nodeID] = localResp
 
 	totalCommitAcks := len(commitResponses)
 	telemetry.TwoPhaseCommitSeconds.Observe(time.Since(commitStart).Seconds())

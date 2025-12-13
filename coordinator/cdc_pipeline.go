@@ -132,6 +132,18 @@ func MergeGroup(entries []CDCEntry) (*CDCEntry, bool) {
 		return merged, false
 	}
 
+	// INSERT → UPDATE: Keep as INSERT with final values
+	// Row didn't exist before transaction, should exist with final values after
+	if !firstHasOld && firstHasNew && lastHasOld && lastHasNew {
+		merged := &CDCEntry{
+			Table:     first.Table,
+			IntentKey: first.IntentKey,
+			OldValues: make(map[string][]byte),
+			NewValues: last.NewValues,
+		}
+		return merged, false
+	}
+
 	// Default: Use standard merge logic (OldValues from all, NewValues from all)
 	merged := &CDCEntry{
 		Table:     first.Table,
