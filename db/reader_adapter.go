@@ -18,10 +18,10 @@ func NewLocalReader(dbMgr DatabaseProvider) *LocalReader {
 	}
 }
 
-// ReadSnapshot executes a read query on the local database with MVCC snapshot isolation
+// ReadSnapshot executes a read query on the local database with snapshot isolation
 func (r *LocalReader) ReadSnapshot(ctx context.Context, nodeID uint64, req *coordinator.ReadRequest) (*coordinator.ReadResponse, error) {
 	// Get database
-	mvccDB, err := r.dbMgr.GetDatabase(req.Database)
+	replicatedDB, err := r.dbMgr.GetDatabase(req.Database)
 	if err != nil {
 		return &coordinator.ReadResponse{
 			Success: false,
@@ -29,8 +29,8 @@ func (r *LocalReader) ReadSnapshot(ctx context.Context, nodeID uint64, req *coor
 		}, nil
 	}
 
-	// Execute MVCC read
-	columns, rows, err := mvccDB.ExecuteMVCCRead(ctx, req.Query, req.Args...)
+	// Execute snapshot read
+	columns, rows, err := replicatedDB.ExecuteSnapshotRead(ctx, req.Query, req.Args...)
 	if err != nil {
 		return &coordinator.ReadResponse{
 			Success: false,

@@ -111,13 +111,13 @@ func (lr *LocalReplicator) handlePrepare(ctx context.Context, req *coordinator.R
 	}
 
 	// Get database
-	mvccDB, err := lr.dbMgr.GetDatabase(req.Database)
+	replicatedDB, err := lr.dbMgr.GetDatabase(req.Database)
 	if err != nil {
 		return &coordinator.ReplicationResponse{Success: false, Error: fmt.Sprintf("database not found: %s", req.Database)}, nil
 	}
 
-	txnMgr := mvccDB.GetTransactionManager()
-	metaStore := mvccDB.GetMetaStore()
+	txnMgr := replicatedDB.GetTransactionManager()
+	metaStore := replicatedDB.GetMetaStore()
 
 	// Use coordinator's txn_id directly to avoid ID collision race conditions
 	txn, err := txnMgr.BeginTransactionWithID(req.TxnID, req.NodeID, req.StartTS)
@@ -356,12 +356,12 @@ func (lr *LocalReplicator) handleCommit(ctx context.Context, req *coordinator.Re
 	}
 
 	// Regular operation - get user database
-	mvccDB, err := lr.dbMgr.GetDatabase(req.Database)
+	replicatedDB, err := lr.dbMgr.GetDatabase(req.Database)
 	if err != nil {
 		return &coordinator.ReplicationResponse{Success: false, Error: fmt.Sprintf("database not found: %s", req.Database)}, nil
 	}
 
-	txnMgr := mvccDB.GetTransactionManager()
+	txnMgr := replicatedDB.GetTransactionManager()
 	txn := txnMgr.GetTransaction(req.TxnID)
 	if txn == nil {
 		log.Error().
@@ -394,13 +394,13 @@ func (lr *LocalReplicator) handleAbort(ctx context.Context, req *coordinator.Rep
 	}
 
 	// Try user database
-	mvccDB, err := lr.dbMgr.GetDatabase(req.Database)
+	replicatedDB, err := lr.dbMgr.GetDatabase(req.Database)
 	if err != nil {
 		// If database doesn't exist, consider abort successful
 		return &coordinator.ReplicationResponse{Success: true}, nil
 	}
 
-	txnMgr := mvccDB.GetTransactionManager()
+	txnMgr := replicatedDB.GetTransactionManager()
 	txn := txnMgr.GetTransaction(req.TxnID)
 	if txn == nil {
 		return &coordinator.ReplicationResponse{Success: true}, nil

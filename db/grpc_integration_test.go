@@ -48,7 +48,7 @@ func createTestReplicatedDatabase(t *testing.T, dbPath string) (*ReplicatedDatab
 }
 
 func TestReplicatedDatabase_Creation(t *testing.T) {
-	dbPath := "/tmp/test_mvcc_db.db"
+	dbPath := "/tmp/test_replicated_db.db"
 	mdb, metaStore := createTestReplicatedDatabase(t, dbPath)
 	_ = mdb
 
@@ -384,7 +384,7 @@ func TestReplicatedDatabase_TransactionLifecycle(t *testing.T) {
 
 // TestReplicatedDatabase_Close verifies that Close() properly stops GC and closes all connections
 func TestReplicatedDatabase_Close(t *testing.T) {
-	dbPath := "/tmp/test_mvcc_close.db"
+	dbPath := "/tmp/test_replicated_close.db"
 	metaPath := dbPath + "_meta.pebble"
 	os.Remove(dbPath)
 	os.RemoveAll(metaPath)
@@ -440,7 +440,7 @@ func TestReplicatedDatabase_Close(t *testing.T) {
 
 // TestReplicatedDatabase_CloseMultipleTimes verifies that Close() is safe to call multiple times
 func TestReplicatedDatabase_CloseMultipleTimes(t *testing.T) {
-	dbPath := "/tmp/test_mvcc_close_multi.db"
+	dbPath := "/tmp/test_replicated_close_multi.db"
 	metaPath := dbPath + "_meta.pebble"
 	os.Remove(dbPath)
 	os.RemoveAll(metaPath)

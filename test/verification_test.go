@@ -40,13 +40,13 @@ func (m *MockReplicator) ReplicateTransaction(ctx context.Context, nodeID uint64
 	return &coordinator.ReplicationResponse{Success: true}, nil
 }
 
-// TestDatabaseManager wraps a single MVCC database for testing
+// TestDatabaseManager wraps a single replicated database for testing
 type TestDatabaseManager struct {
 	db *db.ReplicatedDatabase
 }
 
-func NewTestDatabaseManager(mvccDB *db.ReplicatedDatabase) *TestDatabaseManager {
-	return &TestDatabaseManager{db: mvccDB}
+func NewTestDatabaseManager(replicatedDB *db.ReplicatedDatabase) *TestDatabaseManager {
+	return &TestDatabaseManager{db: replicatedDB}
 }
 
 func (tdm *TestDatabaseManager) GetDatabase(name string) (*db.ReplicatedDatabase, error) {
@@ -89,16 +89,16 @@ func TestMySQLServerIntegration(t *testing.T) {
 	defer metaStore.Close()
 
 	clock := hlc.NewClock(1)
-	mvccDB, err := db.NewReplicatedDatabase(dbPath, 1, clock, metaStore)
+	replicatedDB, err := db.NewReplicatedDatabase(dbPath, 1, clock, metaStore)
 	require.NoError(t, err)
-	defer mvccDB.Close()
+	defer replicatedDB.Close()
 
 	// Setup Coordinators
 	nodeProvider := &MockNodeProvider{nodes: []uint64{1}}
 	replicator := &MockReplicator{}
 
 	// Wrap in test database manager
-	dbMgr := NewTestDatabaseManager(mvccDB)
+	dbMgr := NewTestDatabaseManager(replicatedDB)
 
 	localReplicator := db.NewLocalReplicator(1, dbMgr, clock)
 	writeCoord := coordinator.NewWriteCoordinator(1, nodeProvider, replicator, localReplicator, time.Second, clock)
@@ -164,7 +164,7 @@ func TestMySQLServerIntegration(t *testing.T) {
 	}
 	assert.True(t, found, "Expected to find row")
 
-	// Test MVCC Read (Implicit via ExecuteMVCCRead)
-	// We can't easily verify internal MVCC state here without exposing it,
+	// Test snapshot read (Implicit via ExecuteSnapshotRead)
+	// We can't easily verify internal snapshot state here without exposing it,
 	// but success means the read path is working.
 }

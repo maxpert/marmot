@@ -702,15 +702,15 @@ func (mdb *ReplicatedDatabase) ExecuteQuery(ctx context.Context, query string, a
 	}
 
 	// Note: snapshotTS is captured but SQLite's WAL mode provides snapshot isolation
-	// at the transaction level. For full transaction support with write intents, use ExecuteMVCCRead.
+	// at the transaction level. For full transaction support with write intents, use ExecuteSnapshotRead.
 	_ = snapshotTS
 	return rows, nil
 }
 
-// ExecuteMVCCRead executes a read query with full transactional support
+// ExecuteSnapshotRead executes a read query with full transactional support
 // Uses rqlite/sql AST parser for proper SQL analysis
 // Uses the read connection pool for concurrent read access
-func (mdb *ReplicatedDatabase) ExecuteMVCCRead(ctx context.Context, query string, args ...interface{}) ([]string, []map[string]interface{}, error) {
+func (mdb *ReplicatedDatabase) ExecuteSnapshotRead(ctx context.Context, query string, args ...interface{}) ([]string, []map[string]interface{}, error) {
 	// SQLite WAL mode provides snapshot isolation at connection level
 	rows, err := mdb.readDB.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -753,7 +753,7 @@ func (mdb *ReplicatedDatabase) ExecuteQueryRow(ctx context.Context, query string
 	// Get current snapshot timestamp
 	// Note: SQLite's WAL mode provides snapshot isolation at transaction level.
 	// For structured queries requiring full transaction support with write intent checking,
-	// use ExecuteMVCCRead instead.
+	// use ExecuteSnapshotRead instead.
 	snapshotTS := mdb.clock.Now()
 	_ = snapshotTS
 

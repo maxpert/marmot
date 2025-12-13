@@ -337,11 +337,11 @@ func (dm *DatabaseManager) GetDatabase(name string) (*ReplicatedDatabase, error)
 
 // GetDatabaseConnection returns the *sql.DB for a database
 func (dm *DatabaseManager) GetDatabaseConnection(name string) (*sql.DB, error) {
-	mvccDB, err := dm.GetDatabase(name)
+	replicatedDB, err := dm.GetDatabase(name)
 	if err != nil {
 		return nil, err
 	}
-	return mvccDB.GetDB(), nil
+	return replicatedDB.GetDB(), nil
 }
 
 // GetReplicatedDatabase returns the ReplicatedDatabase as coordinator.ReplicatedDatabaseProvider

@@ -411,7 +411,7 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, consistency
 	var cancelHookCtx context.CancelFunc
 
 	if protocol.IsDML(stmt) && stmt.Database != "" {
-		mvccDB, err := h.dbManager.GetReplicatedDatabase(stmt.Database)
+		replicatedDB, err := h.dbManager.GetReplicatedDatabase(stmt.Database)
 		if err == nil {
 			// Use configured lock wait timeout for hook execution (default 50s like MySQL innodb_lock_wait_timeout)
 			hookTimeout := 50 * time.Second
@@ -420,7 +420,7 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, consistency
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), hookTimeout)
 			cancelHookCtx = cancel // Store for later - DO NOT call yet
-			pendingExec, err = mvccDB.ExecuteLocalWithHooks(ctx, uint64(txnID), statements)
+			pendingExec, err = replicatedDB.ExecuteLocalWithHooks(ctx, uint64(txnID), statements)
 
 			if err != nil {
 				cancel() // Only cancel on error
@@ -884,7 +884,7 @@ func (h *CoordinatorHandler) handleCommit(session *protocol.ConnectionSession) (
 
 	for _, stmt := range txnState.Statements {
 		if protocol.IsDML(stmt) && stmt.Database != "" {
-			mvccDB, err := h.dbManager.GetReplicatedDatabase(stmt.Database)
+			replicatedDB, err := h.dbManager.GetReplicatedDatabase(stmt.Database)
 			if err != nil {
 				session.EndTransaction()
 				h.recentTxnIDs.Delete(txnState.TxnID)
@@ -892,7 +892,7 @@ func (h *CoordinatorHandler) handleCommit(session *protocol.ConnectionSession) (
 			}
 
 			ctx, cancel := context.WithTimeout(context.Background(), hookTimeout)
-			pendingExec, err := mvccDB.ExecuteLocalWithHooks(ctx, txnState.TxnID, []protocol.Statement{stmt})
+			pendingExec, err := replicatedDB.ExecuteLocalWithHooks(ctx, txnState.TxnID, []protocol.Statement{stmt})
 			if err != nil {
 				cancel()
 				session.EndTransaction()

@@ -32,15 +32,15 @@ func TestInsertOrReplaceWithHooks(t *testing.T) {
 	// Create clock
 	clock := hlc.NewClock(1)
 
-	// Create MVCC database
-	mvccDB, err := NewReplicatedDatabase(dbPath, 1, clock, metaStore)
+	// Create replicated database
+	replicatedDB, err := NewReplicatedDatabase(dbPath, 1, clock, metaStore)
 	if err != nil {
-		t.Fatalf("Failed to create MVCC database: %v", err)
+		t.Fatalf("Failed to create replicated database: %v", err)
 	}
-	defer mvccDB.Close()
+	defer replicatedDB.Close()
 
 	// Create test table
-	_, err = mvccDB.GetWriteDB().Exec(`
+	_, err = replicatedDB.GetWriteDB().Exec(`
 		CREATE TABLE test_upsert (
 			id VARCHAR(64) PRIMARY KEY,
 			value TEXT
@@ -53,7 +53,7 @@ func TestInsertOrReplaceWithHooks(t *testing.T) {
 	t.Log("Table created successfully")
 
 	// Reload schema after DDL
-	if err := mvccDB.ReloadSchema(); err != nil {
+	if err := replicatedDB.ReloadSchema(); err != nil {
 		t.Fatalf("Failed to reload schema: %v", err)
 	}
 
@@ -68,7 +68,7 @@ func TestInsertOrReplaceWithHooks(t *testing.T) {
 		TableName: "test_upsert",
 	}
 
-	pending1, err := mvccDB.ExecuteLocalWithHooks(ctx, 1001, []protocol.Statement{stmt1})
+	pending1, err := replicatedDB.ExecuteLocalWithHooks(ctx, 1001, []protocol.Statement{stmt1})
 	if err != nil {
 		t.Fatalf("Failed to execute INSERT: %v", err)
 	}
@@ -98,7 +98,7 @@ func TestInsertOrReplaceWithHooks(t *testing.T) {
 
 	t.Log("About to call ExecuteLocalWithHooks for INSERT OR REPLACE...")
 	start := time.Now()
-	pending2, err := mvccDB.ExecuteLocalWithHooks(ctx2, 1002, []protocol.Statement{stmt2})
+	pending2, err := replicatedDB.ExecuteLocalWithHooks(ctx2, 1002, []protocol.Statement{stmt2})
 	elapsed := time.Since(start)
 	t.Logf("ExecuteLocalWithHooks returned after %v", elapsed)
 
@@ -120,10 +120,10 @@ func TestInsertOrReplaceWithHooks(t *testing.T) {
 
 	// Verify the value was replaced - try both writeDB and readDB
 	var value string
-	err = mvccDB.GetWriteDB().QueryRow("SELECT value FROM test_upsert WHERE id = 'key1'").Scan(&value)
+	err = replicatedDB.GetWriteDB().QueryRow("SELECT value FROM test_upsert WHERE id = 'key1'").Scan(&value)
 	if err != nil {
 		t.Logf("Failed to read from writeDB: %v", err)
-		err = mvccDB.GetReadDB().QueryRow("SELECT value FROM test_upsert WHERE id = 'key1'").Scan(&value)
+		err = replicatedDB.GetReadDB().QueryRow("SELECT value FROM test_upsert WHERE id = 'key1'").Scan(&value)
 		if err != nil {
 			t.Fatalf("Failed to read from both writeDB and readDB: %v", err)
 		}
@@ -148,13 +148,13 @@ func TestInsertOrReplaceNewRow(t *testing.T) {
 	defer metaStore.Close()
 
 	clock := hlc.NewClock(1)
-	mvccDB, err := NewReplicatedDatabase(dbPath, 1, clock, metaStore)
+	replicatedDB, err := NewReplicatedDatabase(dbPath, 1, clock, metaStore)
 	if err != nil {
-		t.Fatalf("Failed to create MVCC database: %v", err)
+		t.Fatalf("Failed to create replicated database: %v", err)
 	}
-	defer mvccDB.Close()
+	defer replicatedDB.Close()
 
-	_, err = mvccDB.GetWriteDB().Exec(`
+	_, err = replicatedDB.GetWriteDB().Exec(`
 		CREATE TABLE test_upsert2 (
 			id VARCHAR(64) PRIMARY KEY,
 			value TEXT
@@ -177,7 +177,7 @@ func TestInsertOrReplaceNewRow(t *testing.T) {
 
 	t.Log("About to call ExecuteLocalWithHooks...")
 	start := time.Now()
-	pending, err := mvccDB.ExecuteLocalWithHooks(ctx, 2001, []protocol.Statement{stmt})
+	pending, err := replicatedDB.ExecuteLocalWithHooks(ctx, 2001, []protocol.Statement{stmt})
 	elapsed := time.Since(start)
 	t.Logf("ExecuteLocalWithHooks returned after %v", elapsed)
 
@@ -211,14 +211,14 @@ func TestLastInsertIdCapture(t *testing.T) {
 	defer metaStore.Close()
 
 	clock := hlc.NewClock(1)
-	mvccDB, err := NewReplicatedDatabase(dbPath, 1, clock, metaStore)
+	replicatedDB, err := NewReplicatedDatabase(dbPath, 1, clock, metaStore)
 	if err != nil {
-		t.Fatalf("Failed to create MVCC database: %v", err)
+		t.Fatalf("Failed to create replicated database: %v", err)
 	}
-	defer mvccDB.Close()
+	defer replicatedDB.Close()
 
 	// Create table with auto-increment primary key
-	_, err = mvccDB.GetWriteDB().Exec(`
+	_, err = replicatedDB.GetWriteDB().Exec(`
 		CREATE TABLE test_autoincrement (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			value TEXT
@@ -229,7 +229,7 @@ func TestLastInsertIdCapture(t *testing.T) {
 	}
 
 	// Reload schema after DDL
-	if err := mvccDB.ReloadSchema(); err != nil {
+	if err := replicatedDB.ReloadSchema(); err != nil {
 		t.Fatalf("Failed to reload schema: %v", err)
 	}
 
@@ -244,7 +244,7 @@ func TestLastInsertIdCapture(t *testing.T) {
 		TableName: "test_autoincrement",
 	}
 
-	pending1, err := mvccDB.ExecuteLocalWithHooks(ctx1, 3001, []protocol.Statement{stmt1})
+	pending1, err := replicatedDB.ExecuteLocalWithHooks(ctx1, 3001, []protocol.Statement{stmt1})
 	if err != nil {
 		t.Fatalf("Failed to execute INSERT: %v", err)
 	}
@@ -270,7 +270,7 @@ func TestLastInsertIdCapture(t *testing.T) {
 		TableName: "test_autoincrement",
 	}
 
-	pending2, err := mvccDB.ExecuteLocalWithHooks(ctx2, 3002, []protocol.Statement{stmt2})
+	pending2, err := replicatedDB.ExecuteLocalWithHooks(ctx2, 3002, []protocol.Statement{stmt2})
 	if err != nil {
 		t.Fatalf("Failed to execute second INSERT: %v", err)
 	}
@@ -296,7 +296,7 @@ func TestLastInsertIdCapture(t *testing.T) {
 		TableName: "test_autoincrement",
 	}
 
-	pending3, err := mvccDB.ExecuteLocalWithHooks(ctx3, 3003, []protocol.Statement{stmt3})
+	pending3, err := replicatedDB.ExecuteLocalWithHooks(ctx3, 3003, []protocol.Statement{stmt3})
 	if err != nil {
 		t.Fatalf("Failed to execute UPDATE: %v", err)
 	}

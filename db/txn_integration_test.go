@@ -14,8 +14,8 @@ import (
 	"github.com/maxpert/marmot/protocol"
 )
 
-// TestMVCCSchemaCreation tests that transaction metadata schema is created properly in MetaStore
-func TestMVCCSchemaCreation(t *testing.T) {
+// TestTransactionSchemaCreation tests that transaction metadata schema is created properly in MetaStore
+func TestTransactionSchemaCreation(t *testing.T) {
 	testDB := setupTestDBWithMeta(t)
 
 	// Verify MetaStore is functional by checking it can perform basic operations
