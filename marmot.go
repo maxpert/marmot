@@ -237,26 +237,28 @@ func main() {
 		}
 	}
 
-	// Phase 5: Wire up replication handlers
-	log.Info().Msg("Wiring up replication handlers")
-
-	replicationHandler := marmotgrpc.NewReplicationHandler(
-		cfg.Config.NodeID,
-		dbMgr,
-		clock,
-	)
-	grpcServer.SetReplicationHandler(replicationHandler)
-	grpcServer.SetDatabaseManager(dbMgr)
-
-	log.Info().Msg("Database Manager and replication handlers initialized")
-
-	// Initialize schema version manager using system database's MetaStore (needed for delta sync)
+	// Phase 5: Initialize schema version manager using system database's MetaStore
+	log.Info().Msg("Initializing schema version manager")
 	systemDB, err := dbMgr.GetDatabase(db.SystemDatabaseName)
 	if err != nil {
 		log.Fatal().Err(err).Msg("Failed to get system database for schema versioning")
 		return
 	}
 	schemaVersionMgr := db.NewSchemaVersionManager(systemDB.GetMetaStore())
+
+	// Wire up replication handlers
+	log.Info().Msg("Wiring up replication handlers")
+
+	replicationHandler := marmotgrpc.NewReplicationHandler(
+		cfg.Config.NodeID,
+		dbMgr,
+		clock,
+		schemaVersionMgr,
+	)
+	grpcServer.SetReplicationHandler(replicationHandler)
+	grpcServer.SetDatabaseManager(dbMgr)
+
+	log.Info().Msg("Database Manager and replication handlers initialized")
 
 	// Phase 6: Setup anti-entropy service for catching up lagging nodes
 	log.Info().Msg("Setting up anti-entropy service")

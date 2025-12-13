@@ -109,6 +109,8 @@ message TransactionRequest {
   string database = 7;
   // Field 8 reserved (was: mutation_guards - removed in favor of IntentFilter)
   reserved 8;
+  // Minimum schema version required to execute this transaction
+  uint64 required_schema_version = 9;
 }
 
 enum TransactionPhase {

@@ -34,8 +34,9 @@ func (gr *GRPCReplicator) ReplicateTransaction(ctx context.Context, nodeID uint6
 			Logical:  req.StartTS.Logical,
 			NodeId:   req.StartTS.NodeID,
 		},
-		Phase:    convertPhaseToProto(req.Phase),
-		Database: req.Database,
+		Phase:                 convertPhaseToProto(req.Phase),
+		Database:              req.Database,
+		RequiredSchemaVersion: req.RequiredSchemaVersion,
 	}
 
 	// Call gRPC client

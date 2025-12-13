@@ -18,17 +18,19 @@ import (
 
 // ReplicationHandler handles transaction replication with MVCC
 type ReplicationHandler struct {
-	nodeID uint64
-	dbMgr  *db.DatabaseManager
-	clock  *hlc.Clock
+	nodeID           uint64
+	dbMgr            *db.DatabaseManager
+	clock            *hlc.Clock
+	schemaVersionMgr *db.SchemaVersionManager
 }
 
 // NewReplicationHandler creates a new replication handler
-func NewReplicationHandler(nodeID uint64, dbMgr *db.DatabaseManager, clock *hlc.Clock) *ReplicationHandler {
+func NewReplicationHandler(nodeID uint64, dbMgr *db.DatabaseManager, clock *hlc.Clock, schemaVersionMgr *db.SchemaVersionManager) *ReplicationHandler {
 	return &ReplicationHandler{
-		nodeID: nodeID,
-		dbMgr:  dbMgr,
-		clock:  clock,
+		nodeID:           nodeID,
+		dbMgr:            dbMgr,
+		clock:            clock,
+		schemaVersionMgr: schemaVersionMgr,
 	}
 }
 
@@ -183,6 +185,25 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 			Success:      false,
 			ErrorMessage: fmt.Sprintf("database %s not found: %v", dbName, err),
 		}, nil
+	}
+
+	// Check schema version compatibility
+	if rh.schemaVersionMgr != nil && req.RequiredSchemaVersion > 0 {
+		localVersion, err := rh.schemaVersionMgr.GetSchemaVersion(dbName)
+		if err != nil {
+			log.Warn().Err(err).Str("database", dbName).Msg("Failed to get local schema version during prepare")
+		} else if localVersion < req.RequiredSchemaVersion {
+			log.Error().
+				Str("database", dbName).
+				Uint64("local_version", localVersion).
+				Uint64("required_version", req.RequiredSchemaVersion).
+				Uint64("txn_id", req.TxnId).
+				Msg("Schema version mismatch: local version is behind required version")
+			return &TransactionResponse{
+				Success:      false,
+				ErrorMessage: fmt.Sprintf("schema version mismatch: local version %d < required version %d", localVersion, req.RequiredSchemaVersion),
+			}, nil
+		}
 	}
 
 	txnMgr := dbInstance.GetTransactionManager()

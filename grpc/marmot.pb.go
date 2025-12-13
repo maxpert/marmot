@@ -642,9 +642,11 @@ type TransactionRequest struct {
 	// Consistency level
 	Consistency ConsistencyLevel `protobuf:"varint,6,opt,name=consistency,proto3,enum=marmot.v2.ConsistencyLevel" json:"consistency,omitempty"`
 	// Target database name
-	Database      string `protobuf:"bytes,7,opt,name=database,proto3" json:"database,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Database string `protobuf:"bytes,7,opt,name=database,proto3" json:"database,omitempty"`
+	// Minimum schema version required to execute this transaction
+	RequiredSchemaVersion uint64 `protobuf:"varint,9,opt,name=required_schema_version,json=requiredSchemaVersion,proto3" json:"required_schema_version,omitempty"`
+	unknownFields         protoimpl.UnknownFields
+	sizeCache             protoimpl.SizeCache
 }
 
 func (x *TransactionRequest) Reset() {
@@ -724,6 +726,13 @@ func (x *TransactionRequest) GetDatabase() string {
 		return x.Database
 	}
 	return ""
+}
+
+func (x *TransactionRequest) GetRequiredSchemaVersion() uint64 {
+	if x != nil {
+		return x.RequiredSchemaVersion
+	}
+	return 0
 }
 
 // Statement represents either a DML row change or a DDL schema change
@@ -2056,7 +2065,7 @@ const file_grpc_marmot_proto_rawDesc = "" +
 	"\x0esource_node_id\x18\x01 \x01(\x04R\fsourceNodeId\"V\n" +
 	"\fPingResponse\x12\x17\n" +
 	"\anode_id\x18\x01 \x01(\x04R\x06nodeId\x12-\n" +
-	"\x06status\x18\x02 \x01(\x0e2\x15.marmot.v2.NodeStatusR\x06status\"\xc9\x02\n" +
+	"\x06status\x18\x02 \x01(\x0e2\x15.marmot.v2.NodeStatusR\x06status\"\x81\x03\n" +
 	"\x12TransactionRequest\x12\x15\n" +
 	"\x06txn_id\x18\x01 \x01(\x04R\x05txnId\x12$\n" +
 	"\x0esource_node_id\x18\x02 \x01(\x04R\fsourceNodeId\x124\n" +
@@ -2066,7 +2075,8 @@ const file_grpc_marmot_proto_rawDesc = "" +
 	"\ttimestamp\x18\x04 \x01(\v2\x0e.marmot.v2.HLCR\ttimestamp\x121\n" +
 	"\x05phase\x18\x05 \x01(\x0e2\x1b.marmot.v2.TransactionPhaseR\x05phase\x12=\n" +
 	"\vconsistency\x18\x06 \x01(\x0e2\x1b.marmot.v2.ConsistencyLevelR\vconsistency\x12\x1a\n" +
-	"\bdatabase\x18\a \x01(\tR\bdatabaseJ\x04\b\b\x10\t\"\xed\x01\n" +
+	"\bdatabase\x18\a \x01(\tR\bdatabase\x126\n" +
+	"\x17required_schema_version\x18\t \x01(\x04R\x15requiredSchemaVersionJ\x04\b\b\x10\t\"\xed\x01\n" +
 	"\tStatement\x12,\n" +
 	"\x04type\x18\x01 \x01(\x0e2\x18.marmot.v2.StatementTypeR\x04type\x12\x1d\n" +
 	"\n" +

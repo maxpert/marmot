@@ -29,9 +29,6 @@ const (
 	FULL_SNAPSHOT
 )
 
-// DeltaSyncThreshold - If behind by more than this many transactions, use snapshot
-const DeltaSyncThreshold = 1000
-
 // CatchUpClient handles the client-side of node catch-up
 type CatchUpClient struct {
 	nodeID    uint64
@@ -112,7 +109,7 @@ func (c *CatchUpClient) CatchUp(ctx context.Context) (uint64, error) {
 		Msg("Starting catch-up process")
 
 	// Find a seed node to catch up from
-	seedAddr, err := c.findAvailableSeed(ctx)
+	_, seedAddr, err := c.findAvailableSeed(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("no available seed node: %w", err)
 	}
@@ -166,25 +163,34 @@ func (c *CatchUpClient) CatchUp(ctx context.Context) (uint64, error) {
 }
 
 // findAvailableSeed finds an available seed node to catch up from
-func (c *CatchUpClient) findAvailableSeed(ctx context.Context) (string, error) {
+// Returns (nodeID, address, error). For seed addresses not in registry, nodeID will be 0.
+func (c *CatchUpClient) findAvailableSeed(ctx context.Context) (uint64, string, error) {
 	// Try configured seed addresses first
+	// Note: Seed addresses may not be in registry yet, so node ID may be unknown (0)
 	for _, addr := range c.seedAddrs {
 		if c.checkNodeAvailable(ctx, addr) {
-			return addr, nil
+			// Try to find node ID from registry
+			for _, node := range c.registry.GetAlive() {
+				if node.Address == addr {
+					return node.NodeId, addr, nil
+				}
+			}
+			// Seed not in registry yet - return 0 for node ID
+			return 0, addr, nil
 		}
 	}
 
-	// Try nodes from registry
+	// Try nodes from registry (these always have node IDs)
 	for _, node := range c.registry.GetAlive() {
 		if node.NodeId == c.nodeID {
 			continue // Skip self
 		}
 		if c.checkNodeAvailable(ctx, node.Address) {
-			return node.Address, nil
+			return node.NodeId, node.Address, nil
 		}
 	}
 
-	return "", fmt.Errorf("no available seed nodes")
+	return 0, "", fmt.Errorf("no available seed nodes")
 }
 
 // checkNodeAvailable checks if a node is available for catch-up
@@ -416,6 +422,7 @@ func (c *CatchUpClient) GetPeerMaxTxnIDs(ctx context.Context, peerAddr string) (
 // CatchUpDecision contains the strategy and sync information
 type CatchUpDecision struct {
 	Strategy       CatchUpStrategy
+	PeerNodeID     uint64
 	PeerAddr       string
 	DatabaseDeltas map[string]DeltaInfo // Per-database sync info
 }
@@ -443,10 +450,11 @@ func (c *CatchUpClient) DetermineCatchUpStrategy(ctx context.Context) (*CatchUpD
 	}
 
 	// Step 2: Find an available seed node
-	seedAddr, err := c.findAvailableSeed(ctx)
+	seedNodeID, seedAddr, err := c.findAvailableSeed(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("no available seed node: %w", err)
 	}
+	decision.PeerNodeID = seedNodeID
 	decision.PeerAddr = seedAddr
 
 	// Step 3: Get peer transaction IDs
@@ -508,12 +516,12 @@ func (c *CatchUpClient) DetermineCatchUpStrategy(ctx context.Context) (*CatchUpD
 	if totalTxnsBehind == 0 {
 		decision.Strategy = NO_CATCHUP
 		log.Info().Msg("Node is up to date - no catch-up needed")
-	} else if maxDeltaForAnyDB > DeltaSyncThreshold {
+	} else if maxDeltaForAnyDB > uint64(cfg.Config.Replication.DeltaSyncThresholdTxns) {
 		// Any database is too far behind - use snapshot
 		decision.Strategy = FULL_SNAPSHOT
 		log.Info().
 			Uint64("max_delta", maxDeltaForAnyDB).
-			Uint64("threshold", DeltaSyncThreshold).
+			Int("threshold", cfg.Config.Replication.DeltaSyncThresholdTxns).
 			Msg("Delta too large for any database - full snapshot required")
 	} else {
 		// Small delta - use incremental sync
@@ -555,7 +563,7 @@ func (c *CatchUpClient) PerformDeltaSync(ctx context.Context, decision *CatchUpD
 		// Use existing DeltaSyncClient to sync from peer
 		result, err := deltaSyncClient.SyncFromPeer(
 			ctx,
-			0, // peerNodeID will be determined by address
+			decision.PeerNodeID,
 			decision.PeerAddr,
 			dbName,
 			deltaInfo.LocalTxnID,
