@@ -167,7 +167,7 @@ func (tm *TransactionManager) AddStatement(txn *Transaction, stmt protocol.State
 // WriteIntent creates a write intent for a row
 // This is the CRITICAL part: write intents act as distributed locks
 // Intents are stored ONLY in MetaStore (not in memory) for durability
-func (tm *TransactionManager) WriteIntent(txn *Transaction, intentType IntentType, tableName, rowKey string,
+func (tm *TransactionManager) WriteIntent(txn *Transaction, intentType IntentType, tableName, intentKey string,
 	stmt protocol.Statement, dataSnapshot []byte) error {
 
 	txn.mu.Lock()
@@ -180,21 +180,21 @@ func (tm *TransactionManager) WriteIntent(txn *Transaction, intentType IntentTyp
 	op := StatementTypeToOpType(stmt.Type)
 
 	// Persist the intent directly to MetaStore (durable storage)
-	err := tm.metaStore.WriteIntent(txn.ID, intentType, tableName, rowKey,
+	err := tm.metaStore.WriteIntent(txn.ID, intentType, tableName, intentKey,
 		op, stmt.SQL, dataSnapshot, txn.StartTS, txn.NodeID)
 
 	if err != nil {
 		// Check if this is a write-write conflict
 		if strings.Contains(err.Error(), "UNIQUE constraint failed") || strings.Contains(err.Error(), "PRIMARY KEY constraint failed") {
 			// Query to get the conflicting transaction
-			existingIntent, queryErr := tm.metaStore.GetIntent(tableName, rowKey)
+			existingIntent, queryErr := tm.metaStore.GetIntent(tableName, intentKey)
 			if queryErr == nil && existingIntent != nil {
 				// If same transaction already has intent on this row, update it
 				// This happens when DELETE then INSERT on same row in same txn
 				if existingIntent.TxnID == txn.ID {
 					// Delete and re-insert to update
-					_ = tm.metaStore.DeleteIntent(tableName, rowKey, txn.ID)
-					updateErr := tm.metaStore.WriteIntent(txn.ID, intentType, tableName, rowKey,
+					_ = tm.metaStore.DeleteIntent(tableName, intentKey, txn.ID)
+					updateErr := tm.metaStore.WriteIntent(txn.ID, intentType, tableName, intentKey,
 						op, stmt.SQL, dataSnapshot, txn.StartTS, txn.NodeID)
 					if updateErr != nil {
 						return fmt.Errorf("failed to update write intent: %w", updateErr)
@@ -204,7 +204,7 @@ func (tm *TransactionManager) WriteIntent(txn *Transaction, intentType IntentTyp
 
 				// Write-write conflict detected - return error for client to retry
 				return fmt.Errorf("write-write conflict: row %s:%s locked by transaction %d (current txn: %d)",
-					tableName, rowKey, existingIntent.TxnID, txn.ID)
+					tableName, intentKey, existingIntent.TxnID, txn.ID)
 			}
 		}
 		return fmt.Errorf("failed to persist write intent: %w", err)
@@ -258,13 +258,13 @@ func (tm *TransactionManager) validateIntents(txn *Transaction) ([]*WriteIntentR
 	}
 
 	for _, intent := range intents {
-		valid, err := tm.metaStore.ValidateIntent(intent.TableName, intent.RowKey, txn.ID)
+		valid, err := tm.metaStore.ValidateIntent(intent.TableName, intent.IntentKey, txn.ID)
 		if err != nil {
 			return nil, fmt.Errorf("failed to validate intent: %w", err)
 		}
 		if !valid {
 			return nil, fmt.Errorf("write intent lost for %s:%s - transaction aborted",
-				intent.TableName, intent.RowKey)
+				intent.TableName, intent.IntentKey)
 		}
 	}
 
@@ -335,14 +335,14 @@ func (tm *TransactionManager) rebuildStatementsFromCDC(cdcEntries []*IntentEntry
 	for _, entry := range cdcEntries {
 		stmt := protocol.Statement{
 			TableName: entry.Table,
-			RowKey:    entry.RowKey,
+			IntentKey: entry.IntentKey,
 			OldValues: entry.OldValues,
 			NewValues: entry.NewValues,
 			Type:      opCodeToStatementType(entry.Operation),
 		}
 		log.Debug().
 			Str("table", entry.Table).
-			Str("row_key", entry.RowKey).
+			Str("intent_key", entry.IntentKey).
 			Int("old_values", len(entry.OldValues)).
 			Int("new_values", len(entry.NewValues)).
 			Int("stmt_type", int(stmt.Type)).
@@ -387,7 +387,7 @@ func (tm *TransactionManager) applyCDCEntries(txnID uint64, entries []*IntentEnt
 	for _, entry := range entries {
 		stmt := protocol.Statement{
 			TableName: entry.Table,
-			RowKey:    entry.RowKey,
+			IntentKey: entry.IntentKey,
 			OldValues: entry.OldValues,
 			NewValues: entry.NewValues,
 			Type:      opCodeToStatementType(entry.Operation),
@@ -740,7 +740,7 @@ func (tm *TransactionManager) writeCDCData(stmt protocol.Statement) error {
 	case protocol.StatementUpdate:
 		return tm.writeCDCUpdate(stmt.TableName, stmt.OldValues, stmt.NewValues)
 	case protocol.StatementDelete:
-		return tm.writeCDCDelete(stmt.TableName, stmt.RowKey, stmt.OldValues)
+		return tm.writeCDCDelete(stmt.TableName, stmt.IntentKey, stmt.OldValues)
 	default:
 		return fmt.Errorf("unsupported statement type for CDC: %v", stmt.Type)
 	}
@@ -838,9 +838,9 @@ func (tm *TransactionManager) writeCDCUpdate(tableName string, oldValues, newVal
 }
 
 // writeCDCDelete performs DELETE using CDC row data
-func (tm *TransactionManager) writeCDCDelete(tableName string, rowKey string, oldValues map[string][]byte) error {
-	if rowKey == "" {
-		return fmt.Errorf("empty row key for delete")
+func (tm *TransactionManager) writeCDCDelete(tableName string, intentKey string, oldValues map[string][]byte) error {
+	if len(oldValues) == 0 {
+		return fmt.Errorf("empty old values for delete")
 	}
 
 	// Get table schema to build proper WHERE clause
@@ -849,30 +849,25 @@ func (tm *TransactionManager) writeCDCDelete(tableName string, rowKey string, ol
 		return fmt.Errorf("failed to get schema for table %s: %w", tableName, err)
 	}
 
-	// Build WHERE clause using primary key columns
+	// Build WHERE clause using primary key columns from oldValues
+	// NOTE: Always extract PK values from oldValues, not from intentKey.
+	// intentKey is in format "table:value" which includes the table prefix.
 	whereClauses := make([]string, 0, len(schema.PrimaryKeys))
 	values := make([]interface{}, 0, len(schema.PrimaryKeys))
 
-	if len(schema.PrimaryKeys) == 1 {
-		// Single PK: row key is the value directly
-		whereClauses = append(whereClauses, fmt.Sprintf("%s = ?", schema.PrimaryKeys[0]))
-		values = append(values, rowKey)
-	} else {
-		// Composite PK: extract PK values from oldValues
-		for _, pkCol := range schema.PrimaryKeys {
-			pkValue, ok := oldValues[pkCol]
-			if !ok {
-				return fmt.Errorf("primary key column %s not found in CDC old values", pkCol)
-			}
-
-			whereClauses = append(whereClauses, fmt.Sprintf("%s = ?", pkCol))
-
-			var value interface{}
-			if err := encoding.Unmarshal(pkValue, &value); err != nil {
-				return fmt.Errorf("failed to deserialize PK value for column %s: %w", pkCol, err)
-			}
-			values = append(values, value)
+	for _, pkCol := range schema.PrimaryKeys {
+		pkValue, ok := oldValues[pkCol]
+		if !ok {
+			return fmt.Errorf("primary key column %s not found in CDC old values", pkCol)
 		}
+
+		whereClauses = append(whereClauses, fmt.Sprintf("%s = ?", pkCol))
+
+		var value interface{}
+		if err := encoding.Unmarshal(pkValue, &value); err != nil {
+			return fmt.Errorf("failed to deserialize PK value for column %s: %w", pkCol, err)
+		}
+		values = append(values, value)
 	}
 
 	sql := fmt.Sprintf("DELETE FROM %s WHERE %s",

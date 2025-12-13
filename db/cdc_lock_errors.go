@@ -4,15 +4,15 @@ import "fmt"
 
 // ErrCDCRowLocked is returned when trying to lock a row already locked by another transaction.
 // This error indicates a write-write conflict in the CDC replication system.
-// When RowKey is "__ddl__", it indicates a DDL lock conflict.
+// When IntentKey is "__ddl__", it indicates a DDL lock conflict.
 type ErrCDCRowLocked struct {
 	Table     string
-	RowKey    string
+	IntentKey string
 	HeldByTxn uint64
 }
 
 func (e ErrCDCRowLocked) Error() string {
-	return fmt.Sprintf("CDC row lock conflict: %s:%s held by txn %d", e.Table, e.RowKey, e.HeldByTxn)
+	return fmt.Sprintf("CDC row lock conflict: %s:%s held by txn %d", e.Table, e.IntentKey, e.HeldByTxn)
 }
 
 // ErrCDCTableDDLInProgress is returned when DML attempts to write to a table

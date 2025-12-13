@@ -8,9 +8,9 @@ import (
 	"github.com/cespare/xxhash/v2"
 )
 
-// NullSentinel is used to represent NULL values in row keys.
+// NullSentinel is used to represent NULL values in intent keys.
 // Using a value that cannot appear in base64 encoding for safety.
-// This must be consistent across all row key generation paths.
+// This must be consistent across all intent key generation paths.
 const NullSentinel = "\x00NULL\x00"
 
 // IsSimpleNumeric checks if the value is a simple numeric string
@@ -35,7 +35,7 @@ func IsSimpleNumeric(v []byte) bool {
 	return true
 }
 
-// SerializeRowKey creates a deterministic row key from table name and PK values.
+// SerializeIntentKey creates a deterministic intent key from table name and PK values.
 // This is the canonical implementation used by both hook-based and AST-based paths.
 //
 // Formats:
@@ -47,7 +47,7 @@ func IsSimpleNumeric(v []byte) bool {
 //   - table: table name
 //   - pkColumns: ordered list of PK column names (will be sorted alphabetically)
 //   - pkValues: map of column name to serialized value bytes
-func SerializeRowKey(table string, pkColumns []string, pkValues map[string][]byte) string {
+func SerializeIntentKey(table string, pkColumns []string, pkValues map[string][]byte) string {
 	if len(pkColumns) == 0 {
 		return ""
 	}
@@ -101,9 +101,9 @@ func sortStrings(s []string) {
 	}
 }
 
-// HashRowKeyXXH64 creates a uint64 hash from a row key string using XXH64.
-func HashRowKeyXXH64(rowKey string) uint64 {
-	return xxhash.Sum64String(rowKey)
+// HashIntentKeyXXH64 creates a uint64 hash from an intent key string using XXH64.
+func HashIntentKeyXXH64(intentKey string) uint64 {
+	return xxhash.Sum64String(intentKey)
 }
 
 // HashPrimaryKeyXXH64 creates a uint64 hash from table name and primary key values.
@@ -126,7 +126,7 @@ func HashPrimaryKeyXXH64(table string, pkValues map[string][]byte) uint64 {
 	return h.Sum64()
 }
 
-// KeyHashCollector collects XXH64 hashes of row keys for conflict detection.
+// KeyHashCollector collects XXH64 hashes of intent keys for conflict detection.
 // Stores only unique hashes for O(1) intersection checking.
 type KeyHashCollector struct {
 	keys map[uint64]struct{}
@@ -139,9 +139,9 @@ func NewKeyHashCollector() *KeyHashCollector {
 	}
 }
 
-// AddRowKey hashes and adds a row key string.
-func (c *KeyHashCollector) AddRowKey(rowKey string) {
-	c.keys[HashRowKeyXXH64(rowKey)] = struct{}{}
+// AddIntentKey hashes and adds an intent key string.
+func (c *KeyHashCollector) AddIntentKey(intentKey string) {
+	c.keys[HashIntentKeyXXH64(intentKey)] = struct{}{}
 }
 
 // Count returns the number of unique keys.

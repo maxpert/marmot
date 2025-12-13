@@ -16,12 +16,36 @@ import (
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/id"
 	"github.com/maxpert/marmot/protocol"
+	"github.com/maxpert/marmot/publisher"
 	"github.com/maxpert/marmot/replica"
 	"github.com/maxpert/marmot/telemetry"
+
+	// Register CDC sink and transformer factories via init()
+	_ "github.com/maxpert/marmot/publisher/sink"
+	_ "github.com/maxpert/marmot/publisher/transformer"
 
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 )
+
+// publisherAdapter adapts publisher.Registry to coordinator.PublisherRegistry interface
+type publisherAdapter struct {
+	registry *publisher.Registry
+}
+
+func (p *publisherAdapter) AppendGeneric(txnID uint64, database string, entries []coordinator.GenericCDCEntry, commitTSNanos int64, nodeID uint64) error {
+	// Convert coordinator.GenericCDCEntry to publisher.GenericCDCEntry
+	pubEntries := make([]publisher.GenericCDCEntry, len(entries))
+	for i, e := range entries {
+		pubEntries[i] = publisher.GenericCDCEntry{
+			Table:     e.Table,
+			IntentKey: e.IntentKey,
+			OldValues: e.OldValues,
+			NewValues: e.NewValues,
+		}
+	}
+	return p.registry.AppendGeneric(txnID, database, pubEntries, commitTSNanos, nodeID)
+}
 
 func main() {
 	flag.Parse()
@@ -172,6 +196,33 @@ func main() {
 	}
 	defer dbMgr.Close()
 
+	// Initialize CDC Publisher if enabled
+	var publisherRegistry *publisher.Registry
+	if cfg.Config.Publisher.Enabled {
+		log.Info().Msg("Initializing CDC Publisher")
+
+		publisherRegistry, err = publisher.NewRegistry(publisher.RegistryConfig{
+			DataDir:     cfg.Config.DataDir,
+			DBManager:   dbMgr,
+			SinkConfigs: cfg.Config.Publisher.Sinks,
+		})
+		if err != nil {
+			log.Fatal().Err(err).Msg("Failed to initialize CDC Publisher")
+			return
+		}
+
+		// Start publisher
+		if err := publisherRegistry.Start(); err != nil {
+			log.Fatal().Err(err).Msg("Failed to start publisher")
+			return
+		}
+		defer publisherRegistry.Stop()
+
+		log.Info().
+			Int("sinks", len(cfg.Config.Publisher.Sinks)).
+			Msg("CDC Publisher initialized")
+	}
+
 	// Register admin HTTP endpoints under /admin
 	adminHandlers := admin.NewAdminHandlers(grpcServer, dbMgr)
 	admin.RegisterRoutes(grpcServer.GetHTTPMux(), adminHandlers)
@@ -318,6 +369,13 @@ func main() {
 		schemaVersionMgr,
 		registryAdapter,
 	)
+
+	// Set publisher registry if enabled
+	if publisherRegistry != nil {
+		// Create adapter to bridge type mismatch between coordinator and publisher packages
+		adapter := &publisherAdapter{registry: publisherRegistry}
+		handler.SetPublisherRegistry(adapter)
+	}
 
 	// Initialize query pipeline with configured values and ID generator
 	var idGen id.Generator

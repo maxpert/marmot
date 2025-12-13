@@ -39,7 +39,7 @@ type MVCCDatabaseProvider interface {
 // CDCEntry holds CDC data captured by preupdate hooks
 type CDCEntry struct {
 	Table     string
-	RowKey    string
+	IntentKey string
 	OldValues map[string][]byte
 	NewValues map[string][]byte
 }
@@ -47,7 +47,7 @@ type CDCEntry struct {
 // CDCMergeResult holds merged CDC data from preupdate hooks.
 type CDCMergeResult struct {
 	TableName string
-	RowKey    string
+	IntentKey string
 	OldValues map[string][]byte
 	NewValues map[string][]byte
 }
@@ -67,8 +67,8 @@ func MergeCDCEntries(entries []CDCEntry) CDCMergeResult {
 	}
 
 	for _, e := range entries {
-		if result.RowKey == "" {
-			result.RowKey = e.RowKey
+		if result.IntentKey == "" {
+			result.IntentKey = e.IntentKey
 		}
 		if result.TableName == "" {
 			result.TableName = e.Table
@@ -153,19 +153,35 @@ func (s NodeStatus) String() string {
 	}
 }
 
+// PublisherRegistry interface to avoid import cycle
+// Accepts GenericCDCEntry slice for conversion to publisher.CDCEvent
+type PublisherRegistry interface {
+	AppendGeneric(txnID uint64, database string, entries []GenericCDCEntry, commitTSNanos int64, nodeID uint64) error
+}
+
+// GenericCDCEntry represents a CDC entry in generic form to avoid import cycle
+type GenericCDCEntry struct {
+	Table     string
+	IntentKey string
+	OldValues map[string][]byte
+	NewValues map[string][]byte
+}
+
 // CoordinatorHandler implements protocol.ConnectionHandler
 // It routes queries to the appropriate coordinator (Read or Write)
 type CoordinatorHandler struct {
-	nodeID           uint64
-	writeCoord       *WriteCoordinator
-	readCoord        *ReadCoordinator
-	clock            *hlc.Clock
-	dbManager        DatabaseManager
-	ddlLockMgr       *DDLLockManager
-	schemaVersionMgr SchemaVersionManager
-	nodeRegistry     NodeRegistry
-	metadata         *handlers.MetadataHandler
-	recentTxnIDs     sync.Map // txn_id -> conn_id for duplicate detection
+	nodeID            uint64
+	writeCoord        *WriteCoordinator
+	readCoord         *ReadCoordinator
+	clock             *hlc.Clock
+	dbManager         DatabaseManager
+	ddlLockMgr        *DDLLockManager
+	schemaVersionMgr  SchemaVersionManager
+	nodeRegistry      NodeRegistry
+	metadata          *handlers.MetadataHandler
+	recentTxnIDs      sync.Map // txn_id -> conn_id for duplicate detection
+	publisherRegistry PublisherRegistry
+	publisherMu       sync.RWMutex
 }
 
 // NewCoordinatorHandler creates a new handler
@@ -181,6 +197,13 @@ func NewCoordinatorHandler(nodeID uint64, writeCoord *WriteCoordinator, readCoor
 		nodeRegistry:     nodeRegistry,
 		metadata:         handlers.NewMetadataHandler(dbManager, SystemDatabaseName),
 	}
+}
+
+// SetPublisherRegistry sets the CDC publisher registry
+func (h *CoordinatorHandler) SetPublisherRegistry(registry PublisherRegistry) {
+	h.publisherMu.Lock()
+	defer h.publisherMu.Unlock()
+	h.publisherRegistry = registry
 }
 
 // HandleQuery processes a SQL query
@@ -475,6 +498,16 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, consistency
 	}
 	// Success - coordinator committed via CDC replay in WriteTransaction
 	// No pendingExec.Commit() needed - hookDB was already rolled back
+
+	// Publish CDC events if publisher is enabled and we have CDC entries
+	if pendingExec != nil {
+		cdcEntries := pendingExec.GetCDCEntries()
+		if len(cdcEntries) > 0 {
+			// Calculate commit timestamp (same as what was used in WriteTransaction)
+			commitTS := h.clock.Now()
+			h.publishCDCEvents(uint64(txnID), stmt.Database, cdcEntries, commitTS)
+		}
+	}
 
 	// If DDL succeeded, increment schema version
 	if isDDL && h.schemaVersionMgr != nil {
@@ -842,6 +875,7 @@ func (h *CoordinatorHandler) handleCommit(session *protocol.ConnectionSession) (
 	// This is required for 2PC replication - without CDC data, intents cannot be created
 	enrichedStatements := make([]protocol.Statement, 0, len(txnState.Statements))
 	var totalRowsAffected int64
+	allCDCEntries := make([]CDCEntry, 0) // Collect all CDC entries for publishing
 
 	hookTimeout := 50 * time.Second
 	if cfg.Config != nil && cfg.Config.Transaction.LockWaitTimeoutSeconds > 0 {
@@ -872,6 +906,9 @@ func (h *CoordinatorHandler) handleCommit(session *protocol.ConnectionSession) (
 			// Extract CDC data and process through pipeline
 			cdcEntries := pendingExec.GetCDCEntries()
 			if len(cdcEntries) > 0 {
+				// Collect CDC entries for publishing
+				allCDCEntries = append(allCDCEntries, cdcEntries...)
+
 				// Process through CDC pipeline
 				config := DefaultCDCPipelineConfig()
 				result, err := ProcessCDCEntries(cdcEntries, config)
@@ -935,6 +972,12 @@ func (h *CoordinatorHandler) handleCommit(session *protocol.ConnectionSession) (
 			Int("stmt_count", len(txnState.Statements)).
 			Msg("COMMIT: 2PC failed")
 		return nil, err
+	}
+
+	// Publish CDC events if publisher is enabled and we have CDC entries
+	if len(allCDCEntries) > 0 {
+		commitTS := h.clock.Now()
+		h.publishCDCEvents(txnState.TxnID, txnState.Database, allCDCEntries, commitTS)
 	}
 
 	log.Debug().
@@ -1003,4 +1046,42 @@ func (h *CoordinatorHandler) bufferStatement(session *protocol.ConnectionSession
 	return &protocol.ResultSet{
 		RowsAffected: 1,
 	}, nil
+}
+
+// publishCDCEvents publishes CDC events to the publisher registry if enabled
+func (h *CoordinatorHandler) publishCDCEvents(txnID uint64, database string, cdcEntries []CDCEntry, commitTS hlc.Timestamp) {
+	h.publisherMu.RLock()
+	registry := h.publisherRegistry
+	h.publisherMu.RUnlock()
+
+	if registry == nil || len(cdcEntries) == 0 {
+		return
+	}
+
+	// Convert coordinator.CDCEntry to GenericCDCEntry
+	genericEntries := make([]GenericCDCEntry, 0, len(cdcEntries))
+	for _, entry := range cdcEntries {
+		genericEntries = append(genericEntries, GenericCDCEntry{
+			Table:     entry.Table,
+			IntentKey: entry.IntentKey,
+			OldValues: entry.OldValues,
+			NewValues: entry.NewValues,
+		})
+	}
+
+	// Call registry's AppendGeneric which does the conversion internally
+	if err := registry.AppendGeneric(txnID, database, genericEntries, commitTS.WallTime, h.nodeID); err != nil {
+		log.Error().Err(err).
+			Uint64("txn_id", txnID).
+			Str("database", database).
+			Int("entries", len(genericEntries)).
+			Msg("Failed to append CDC events to publish log")
+		// Don't fail the transaction - just log the error
+	} else {
+		log.Debug().
+			Uint64("txn_id", txnID).
+			Str("database", database).
+			Int("entries", len(genericEntries)).
+			Msg("Published CDC events")
+	}
 }

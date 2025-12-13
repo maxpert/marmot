@@ -82,7 +82,7 @@ func convertStatementsToProto(stmts []protocol.Statement, database string) []*St
 			// CDC path: send row data instead of SQL
 			protoStmt.Payload = &Statement_RowChange{
 				RowChange: &RowChange{
-					RowKey:    stmt.RowKey,
+					IntentKey: stmt.IntentKey,
 					OldValues: stmt.OldValues,
 					NewValues: stmt.NewValues,
 				},

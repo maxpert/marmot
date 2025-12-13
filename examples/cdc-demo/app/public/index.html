@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Marmot CDC Demo - TODO App</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: system-ui, sans-serif; background: #1a1a1a; color: #eee; height: 100vh; display: flex; flex-direction: column; }
+
+    .app { flex: 1; display: flex; flex-direction: column; max-width: 600px; margin: 0 auto; width: 100%; padding: 1rem; }
+    h1 { font-size: 1.5rem; margin-bottom: 1rem; color: #3b82f6; }
+
+    .add-form { display: flex; gap: 0.5rem; margin-bottom: 1rem; }
+    .add-form input { flex: 1; padding: 0.75rem; background: #2a2a2a; border: 1px solid #444; color: #eee; border-radius: 4px; }
+    .add-form button { padding: 0.75rem 1.5rem; background: #3b82f6; border: none; color: white; cursor: pointer; border-radius: 4px; }
+    .add-form button.danger { background: #ef4444; }
+
+    .todos { flex: 1; overflow-y: auto; }
+    .todo { display: flex; align-items: center; gap: 0.75rem; padding: 0.75rem; background: #2a2a2a; margin-bottom: 0.5rem; border-radius: 4px; }
+    .todo.done .todo-text { text-decoration: line-through; color: #666; }
+    .todo input[type="checkbox"] { width: 20px; height: 20px; cursor: pointer; }
+    .todo-text { flex: 1; }
+    .todo-text[contenteditable]:focus { outline: 1px solid #3b82f6; padding: 2px; }
+    .todo button { background: none; border: none; color: #666; cursor: pointer; padding: 4px 8px; }
+    .todo button:hover { color: #ef4444; }
+
+    .cdc-panel { height: 200px; background: #0d0d0d; border-top: 1px solid #333; display: flex; flex-direction: column; }
+    .cdc-header { padding: 0.5rem 1rem; background: #111; border-bottom: 1px solid #333; font-size: 0.8rem; display: flex; justify-content: space-between; }
+    .cdc-header .status { color: #22c55e; }
+    .cdc-logs { flex: 1; overflow-y: auto; padding: 0.5rem; font-family: monospace; font-size: 0.75rem; }
+    .log { padding: 0.25rem 0.5rem; border-left: 2px solid #444; margin-bottom: 0.25rem; white-space: pre-wrap; word-break: break-all; }
+    .log.c { border-color: #22c55e; }
+    .log.u { border-color: #f59e0b; }
+    .log.d { border-color: #ef4444; }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <h1>TODO List</h1>
+    <form class="add-form" onsubmit="addTodo(event)">
+      <input type="text" id="new-todo" placeholder="What needs to be done?" autofocus />
+      <button type="submit">Add</button>
+      <button type="button" class="danger" onclick="clearAll()">Clear All</button>
+    </form>
+    <div class="todos" id="todos"></div>
+  </div>
+
+  <div class="cdc-panel">
+    <div class="cdc-header">
+      <span>CDC Events (Raw Debezium)</span>
+      <span class="status" id="status">Connecting...</span>
+    </div>
+    <div class="cdc-logs" id="logs"></div>
+  </div>
+
+  <script>
+    let ws;
+
+    function connectWS() {
+      ws = new WebSocket(`${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/ws`);
+      ws.onopen = () => document.getElementById('status').textContent = 'Connected';
+      ws.onclose = () => { document.getElementById('status').textContent = 'Reconnecting...'; setTimeout(connectWS, 2000); };
+      ws.onmessage = (e) => {
+        const data = JSON.parse(e.data);
+        const logs = document.getElementById('logs');
+        const div = document.createElement('div');
+        div.className = 'log ' + (data.op || '');
+        div.textContent = data.raw;
+        logs.insertBefore(div, logs.firstChild);
+        while (logs.children.length > 100) logs.removeChild(logs.lastChild);
+      };
+    }
+
+    async function loadTodos() {
+      const res = await fetch('/api/todos');
+      const todos = await res.json();
+      const container = document.getElementById('todos');
+      container.innerHTML = todos.map(t => `
+        <div class="todo ${t.done ? 'done' : ''}" data-id="${t.id}">
+          <input type="checkbox" ${t.done ? 'checked' : ''} onchange="toggleTodo(${t.id}, this.checked)" />
+          <span class="todo-text" contenteditable onblur="updateTodo(${t.id}, this.textContent)">${escapeHtml(t.text)}</span>
+          <button onclick="deleteTodo(${t.id})">✕</button>
+        </div>
+      `).join('');
+    }
+
+    async function addTodo(e) {
+      e.preventDefault();
+      const input = document.getElementById('new-todo');
+      if (!input.value.trim()) return;
+      await fetch('/api/todos', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({text: input.value}) });
+      input.value = '';
+      loadTodos();
+    }
+
+    async function toggleTodo(id, done) {
+      await fetch(`/api/todos/${id}`, { method: 'PATCH', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({done}) });
+      loadTodos();
+    }
+
+    async function updateTodo(id, text) {
+      await fetch(`/api/todos/${id}`, { method: 'PATCH', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({text}) });
+    }
+
+    async function deleteTodo(id) {
+      await fetch(`/api/todos/${id}`, { method: 'DELETE' });
+      loadTodos();
+    }
+
+    async function clearAll() {
+      await fetch('/api/todos', { method: 'DELETE' });
+      loadTodos();
+    }
+
+    function escapeHtml(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+
+    connectWS();
+    loadTodos();
+  </script>
+</body>
+</html>

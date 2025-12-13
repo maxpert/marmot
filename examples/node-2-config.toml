@@ -85,3 +85,20 @@ format = "console"
 [prometheus]
 # Metrics served on gRPC port at http://localhost:8082/metrics
 enabled = true
+
+# CDC Publisher - Stream changes to external systems (Kafka, NATS)
+# Events follow Debezium specification: https://debezium.io/
+[publisher]
+enabled = false  # Set to true to enable CDC publishing
+
+# Example Kafka sink configuration (uncomment to enable):
+# [[publisher.sinks]]
+# name = "kafka-main"
+# type = "kafka"
+# format = "debezium"
+# brokers = ["localhost:9092"]
+# topic_prefix = "marmot.cdc"
+# filter_tables = ["*"]
+# filter_databases = ["*"]
+# batch_size = 100
+# poll_interval_ms = 10

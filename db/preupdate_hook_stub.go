@@ -94,7 +94,7 @@ type IntentEntry struct {
 	Seq       uint64
 	Operation uint8
 	Table     string
-	RowKey    string
+	IntentKey string
 	OldValues map[string][]byte
 	NewValues map[string][]byte
 	CreatedAt int64

@@ -352,7 +352,7 @@ const liveStreamPollInterval = 500 * time.Millisecond
 // sendChangeEvent converts a TransactionRecord to ChangeEvent and sends it on the stream.
 // Handles both CDC (Change Data Capture) path with row data and DDL path with SQL statements.
 func (s *Server) sendChangeEvent(rec *db.TransactionRecord, stream MarmotService_StreamChangesServer) error {
-	// Parse statements from msgpack - must include CDC data (NewValues, OldValues, RowKey)
+	// Parse statements from msgpack - must include CDC data (NewValues, OldValues, IntentKey)
 	var statements []*Statement
 	if len(rec.SerializedStatements) > 0 {
 		var rawStatements []struct {
@@ -360,7 +360,7 @@ func (s *Server) sendChangeEvent(rec *db.TransactionRecord, stream MarmotService
 			Type      int               `msgpack:"Type"`
 			TableName string            `msgpack:"TableName"`
 			Database  string            `msgpack:"Database"`
-			RowKey    string            `msgpack:"RowKey"`
+			IntentKey string            `msgpack:"IntentKey"`
 			OldValues map[string][]byte `msgpack:"OldValues"`
 			NewValues map[string][]byte `msgpack:"NewValues"`
 		}
@@ -385,7 +385,7 @@ func (s *Server) sendChangeEvent(rec *db.TransactionRecord, stream MarmotService
 					// CDC path: send row data
 					stmt.Payload = &Statement_RowChange{
 						RowChange: &RowChange{
-							RowKey:    s.RowKey,
+							IntentKey: s.IntentKey,
 							OldValues: s.OldValues,
 							NewValues: s.NewValues,
 						},
@@ -393,7 +393,7 @@ func (s *Server) sendChangeEvent(rec *db.TransactionRecord, stream MarmotService
 					log.Debug().
 						Uint64("txn_id", rec.TxnID).
 						Str("table", s.TableName).
-						Str("row_key", s.RowKey).
+						Str("intent_key", s.IntentKey).
 						Int("new_values", len(s.NewValues)).
 						Int("old_values", len(s.OldValues)).
 						Msg("STREAM: Sending CDC data for anti-entropy")

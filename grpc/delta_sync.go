@@ -341,12 +341,12 @@ func (ds *DeltaSyncClient) applyChangeEvent(ctx context.Context, event *ChangeEv
 		// Check for CDC data (RowChange payload)
 		if rowChange := stmt.GetRowChange(); rowChange != nil && (len(rowChange.NewValues) > 0 || len(rowChange.OldValues) > 0) {
 			// CDC path: apply row data directly
-			if err := ds.applyCDCStatement(tx, stmt); err != nil {
+			if err := ds.applyCDCStatement(tx, database, stmt); err != nil {
 				return fmt.Errorf("failed to apply CDC statement: %w", err)
 			}
 			log.Debug().
 				Str("table", stmt.TableName).
-				Str("row_key", rowChange.RowKey).
+				Str("intent_key", rowChange.IntentKey).
 				Int("new_values", len(rowChange.NewValues)).
 				Int("old_values", len(rowChange.OldValues)).
 				Msg("DELTA-SYNC: Applied CDC data")
@@ -382,7 +382,7 @@ func (ds *DeltaSyncClient) applyChangeEvent(ctx context.Context, event *ChangeEv
 }
 
 // applyCDCStatement applies a CDC statement to the database
-func (ds *DeltaSyncClient) applyCDCStatement(tx *sql.Tx, stmt *Statement) error {
+func (ds *DeltaSyncClient) applyCDCStatement(tx *sql.Tx, database string, stmt *Statement) error {
 	rowChange := stmt.GetRowChange()
 	if rowChange == nil {
 		return fmt.Errorf("no row change data")
@@ -392,9 +392,9 @@ func (ds *DeltaSyncClient) applyCDCStatement(tx *sql.Tx, stmt *Statement) error 
 	case StatementType_INSERT, StatementType_REPLACE:
 		return ds.applyCDCInsert(tx, stmt.TableName, rowChange.NewValues)
 	case StatementType_UPDATE:
-		return ds.applyCDCUpdate(tx, stmt.TableName, rowChange.RowKey, rowChange.NewValues)
+		return ds.applyCDCUpdate(tx, stmt.TableName, rowChange.NewValues)
 	case StatementType_DELETE:
-		return ds.applyCDCDelete(tx, stmt.TableName, rowChange.RowKey, rowChange.OldValues)
+		return ds.applyCDCDelete(tx, database, stmt.TableName, rowChange.OldValues)
 	default:
 		return fmt.Errorf("unsupported statement type for CDC: %v", stmt.Type)
 	}
@@ -431,7 +431,7 @@ func (ds *DeltaSyncClient) applyCDCInsert(tx *sql.Tx, tableName string, newValue
 }
 
 // applyCDCUpdate performs UPDATE using CDC row data
-func (ds *DeltaSyncClient) applyCDCUpdate(tx *sql.Tx, tableName string, rowKey string, newValues map[string][]byte) error {
+func (ds *DeltaSyncClient) applyCDCUpdate(tx *sql.Tx, tableName string, newValues map[string][]byte) error {
 	if len(newValues) == 0 {
 		return fmt.Errorf("no values to update")
 	}
@@ -442,40 +442,53 @@ func (ds *DeltaSyncClient) applyCDCUpdate(tx *sql.Tx, tableName string, rowKey s
 }
 
 // applyCDCDelete performs DELETE using CDC row data
-func (ds *DeltaSyncClient) applyCDCDelete(tx *sql.Tx, tableName string, rowKey string, oldValues map[string][]byte) error {
-	// Use row key to identify primary key
-	// For single-column PK, rowKey is the value
-	// For compound PK, rowKey is col1:val1|col2:val2
-
-	if rowKey == "" && len(oldValues) == 0 {
-		return fmt.Errorf("no row key or old values for delete")
+func (ds *DeltaSyncClient) applyCDCDelete(tx *sql.Tx, database string, tableName string, oldValues map[string][]byte) error {
+	if len(oldValues) == 0 {
+		return fmt.Errorf("empty old values for delete")
 	}
 
-	// If we have old values, extract PK columns and build WHERE clause
-	if len(oldValues) > 0 {
-		// Use all columns as WHERE clause (safe but may be slower)
-		whereClauses := make([]string, 0, len(oldValues))
-		values := make([]interface{}, 0, len(oldValues))
+	// Get table schema to build proper WHERE clause
+	schema, err := ds.dbManager.GetTableSchema(database, tableName)
+	if err != nil {
+		return fmt.Errorf("failed to get schema for table %s: %w", tableName, err)
+	}
 
-		for col, valBytes := range oldValues {
-			whereClauses = append(whereClauses, fmt.Sprintf("%s = ?", col))
-			var value interface{}
-			if err := encoding.Unmarshal(valBytes, &value); err != nil {
-				return fmt.Errorf("failed to deserialize value for column %s: %w", col, err)
-			}
-			values = append(values, value)
+	// Extract primary key column names from schema
+	var primaryKeys []string
+	for _, col := range schema.Columns {
+		if col.IsPK {
+			primaryKeys = append(primaryKeys, col.Name)
+		}
+	}
+
+	if len(primaryKeys) == 0 {
+		return fmt.Errorf("no primary key columns found for table %s", tableName)
+	}
+
+	// Build WHERE clause using primary key columns from oldValues
+	whereClauses := make([]string, 0, len(primaryKeys))
+	values := make([]interface{}, 0, len(primaryKeys))
+
+	for _, pkCol := range primaryKeys {
+		pkValue, ok := oldValues[pkCol]
+		if !ok {
+			return fmt.Errorf("primary key column %s not found in CDC old values", pkCol)
 		}
 
-		sqlStmt := fmt.Sprintf("DELETE FROM %s WHERE %s",
-			tableName,
-			strings.Join(whereClauses, " AND "))
+		whereClauses = append(whereClauses, fmt.Sprintf("%s = ?", pkCol))
 
-		_, err := tx.Exec(sqlStmt, values...)
-		return err
+		var value interface{}
+		if err := encoding.Unmarshal(pkValue, &value); err != nil {
+			return fmt.Errorf("failed to deserialize PK value for column %s: %w", pkCol, err)
+		}
+		values = append(values, value)
 	}
 
-	// Fallback: use row key (assumes single PK column named 'id')
-	_, err := tx.Exec(fmt.Sprintf("DELETE FROM %s WHERE id = ?", tableName), rowKey)
+	sqlStmt := fmt.Sprintf("DELETE FROM %s WHERE %s",
+		tableName,
+		strings.Join(whereClauses, " AND "))
+
+	_, err = tx.Exec(sqlStmt, values...)
 	return err
 }
 

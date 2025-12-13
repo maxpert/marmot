@@ -4,16 +4,16 @@ import (
 	"testing"
 )
 
-func TestHashRowKeyXXH64(t *testing.T) {
+func TestHashIntentKeyXXH64(t *testing.T) {
 	// Same key should produce same hash
-	h1 := HashRowKeyXXH64("test_key_123")
-	h2 := HashRowKeyXXH64("test_key_123")
+	h1 := HashIntentKeyXXH64("test_key_123")
+	h2 := HashIntentKeyXXH64("test_key_123")
 	if h1 != h2 {
 		t.Error("Same key should produce same hash")
 	}
 
 	// Different keys should produce different hashes
-	h3 := HashRowKeyXXH64("test_key_456")
+	h3 := HashIntentKeyXXH64("test_key_456")
 	if h1 == h3 {
 		t.Error("Different keys should produce different hashes")
 	}
@@ -43,17 +43,17 @@ func TestHashPrimaryKeyXXH64(t *testing.T) {
 func TestKeyHashCollector(t *testing.T) {
 	c := NewKeyHashCollector()
 
-	// Add row keys
-	c.AddRowKey("row_key_1")
-	c.AddRowKey("row_key_2")
-	c.AddRowKey("row_key_3")
+	// Add intent keys
+	c.AddIntentKey("intent_key_1")
+	c.AddIntentKey("intent_key_2")
+	c.AddIntentKey("intent_key_3")
 
 	if c.Count() != 3 {
 		t.Errorf("Expected count 3, got %d", c.Count())
 	}
 
 	// Adding duplicate should not increase count
-	c.AddRowKey("row_key_1")
+	c.AddIntentKey("intent_key_1")
 	if c.Count() != 3 {
 		t.Errorf("Expected count 3 after duplicate, got %d", c.Count())
 	}
@@ -70,36 +70,36 @@ func TestKeyHashCollector(t *testing.T) {
 		keySet[k] = struct{}{}
 	}
 
-	h1 := HashRowKeyXXH64("row_key_1")
-	h2 := HashRowKeyXXH64("row_key_2")
-	h3 := HashRowKeyXXH64("row_key_3")
+	h1 := HashIntentKeyXXH64("intent_key_1")
+	h2 := HashIntentKeyXXH64("intent_key_2")
+	h3 := HashIntentKeyXXH64("intent_key_3")
 
 	if _, ok := keySet[h1]; !ok {
-		t.Error("Missing hash for row_key_1")
+		t.Error("Missing hash for intent_key_1")
 	}
 	if _, ok := keySet[h2]; !ok {
-		t.Error("Missing hash for row_key_2")
+		t.Error("Missing hash for intent_key_2")
 	}
 	if _, ok := keySet[h3]; !ok {
-		t.Error("Missing hash for row_key_3")
+		t.Error("Missing hash for intent_key_3")
 	}
 }
 
-func TestSerializeRowKey(t *testing.T) {
+func TestSerializeIntentKey(t *testing.T) {
 	// Single numeric PK
-	key1 := SerializeRowKey("users", []string{"id"}, map[string][]byte{"id": []byte("123")})
+	key1 := SerializeIntentKey("users", []string{"id"}, map[string][]byte{"id": []byte("123")})
 	if key1 != "users:123" {
 		t.Errorf("Expected users:123, got %s", key1)
 	}
 
 	// Single non-numeric PK (should use base64)
-	key2 := SerializeRowKey("users", []string{"id"}, map[string][]byte{"id": []byte("abc:def")})
+	key2 := SerializeIntentKey("users", []string{"id"}, map[string][]byte{"id": []byte("abc:def")})
 	if key2 != "users:b64:YWJjOmRlZg" {
 		t.Errorf("Expected users:b64:YWJjOmRlZg, got %s", key2)
 	}
 
 	// Composite PK
-	key3 := SerializeRowKey("orders", []string{"user_id", "order_id"},
+	key3 := SerializeIntentKey("orders", []string{"user_id", "order_id"},
 		map[string][]byte{"user_id": []byte("1"), "order_id": []byte("100")})
 	// Columns sorted alphabetically: order_id, user_id
 	expected := "orders:c:MTAw:MQ" // base64(100):base64(1)
@@ -108,18 +108,18 @@ func TestSerializeRowKey(t *testing.T) {
 	}
 }
 
-func BenchmarkHashRowKeyXXH64(b *testing.B) {
+func BenchmarkHashIntentKeyXXH64(b *testing.B) {
 	key := "user:12345:profile"
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		HashRowKeyXXH64(key)
+		HashIntentKeyXXH64(key)
 	}
 }
 
-func BenchmarkKeyHashCollector_AddRowKey(b *testing.B) {
+func BenchmarkKeyHashCollector_AddIntentKey(b *testing.B) {
 	c := NewKeyHashCollector()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		c.AddRowKey("row_key_" + string(rune(i%1000)))
+		c.AddIntentKey("intent_key_" + string(rune(i%1000)))
 	}
 }

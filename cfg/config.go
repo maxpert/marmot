@@ -129,6 +129,29 @@ type ReplicaConfiguration struct {
 	Secret                 string `toml:"secret"`                        // PSK for authenticating with master (env: MARMOT_REPLICA_SECRET)
 }
 
+// PublisherConfiguration configures the CDC publishing system
+type PublisherConfiguration struct {
+	Enabled bool                `toml:"enabled"` // Enable CDC publishing
+	Sinks   []SinkConfiguration `toml:"sinks"`   // List of sink configurations
+}
+
+// SinkConfiguration configures a single CDC sink
+type SinkConfiguration struct {
+	Name            string   `toml:"name"`             // Unique sink name
+	Type            string   `toml:"type"`             // "kafka" or "nats"
+	Format          string   `toml:"format"`           // "debezium"
+	Brokers         []string `toml:"brokers"`          // Kafka broker addresses
+	NatsURL         string   `toml:"nats_url"`         // NATS server URL (e.g., "nats://localhost:4222")
+	TopicPrefix     string   `toml:"topic_prefix"`     // Topic prefix (e.g., "marmot.cdc")
+	FilterTables    []string `toml:"filter_tables"`    // Glob patterns for tables
+	FilterDatabases []string `toml:"filter_databases"` // Glob patterns for databases
+	BatchSize       int      `toml:"batch_size"`       // Events per poll (default: 100)
+	PollIntervalMS  int      `toml:"poll_interval_ms"` // Poll interval (default: 10)
+	RetryInitialMS  int      `toml:"retry_initial_ms"` // Initial retry delay (default: 100)
+	RetryMaxMS      int      `toml:"retry_max_ms"`     // Max retry delay (default: 30000)
+	RetryMultiplier float64  `toml:"retry_multiplier"` // Backoff multiplier (default: 2.0)
+}
+
 // Configuration is the main configuration structure
 type Configuration struct {
 	NodeID  uint64 `toml:"node_id"`
@@ -147,6 +170,7 @@ type Configuration struct {
 	Logging        LoggingConfiguration        `toml:"logging"`
 	Prometheus     PrometheusConfiguration     `toml:"prometheus"`
 	Replica        ReplicaConfiguration        `toml:"replica"`
+	Publisher      PublisherConfiguration      `toml:"publisher"`
 }
 
 // Command line flags
@@ -254,6 +278,11 @@ var Config = &Configuration{
 		ReconnectMaxBackoffSec: 30,
 		InitialSyncTimeoutMin:  30,
 	},
+
+	Publisher: PublisherConfiguration{
+		Enabled: false,
+		Sinks:   []SinkConfiguration{},
+	},
 }
 
 // Load loads configuration from file and applies CLI overrides
@@ -312,12 +341,61 @@ func Load(configPath string) error {
 		Config.QueryPipeline.ValidatorPoolSize = 8
 	}
 
+	// Set publisher defaults
+	setPublisherDefaults()
+
 	// Ensure data directory exists
 	if err := os.MkdirAll(Config.DataDir, 0755); err != nil {
 		return fmt.Errorf("failed to create data directory: %w", err)
 	}
 
 	return nil
+}
+
+// setPublisherDefaults applies default values to publisher configuration
+func setPublisherDefaults() {
+	if !Config.Publisher.Enabled {
+		return
+	}
+
+	for i := range Config.Publisher.Sinks {
+		sink := &Config.Publisher.Sinks[i]
+
+		// Set BatchSize default
+		if sink.BatchSize <= 0 {
+			sink.BatchSize = 100
+		}
+
+		// Set PollIntervalMS default
+		if sink.PollIntervalMS <= 0 {
+			sink.PollIntervalMS = 10
+		}
+
+		// Set RetryInitialMS default
+		if sink.RetryInitialMS <= 0 {
+			sink.RetryInitialMS = 100
+		}
+
+		// Set RetryMaxMS default
+		if sink.RetryMaxMS <= 0 {
+			sink.RetryMaxMS = 30000
+		}
+
+		// Set RetryMultiplier default
+		if sink.RetryMultiplier <= 0 {
+			sink.RetryMultiplier = 2.0
+		}
+
+		// Set FilterTables default
+		if len(sink.FilterTables) == 0 {
+			sink.FilterTables = []string{"*"}
+		}
+
+		// Set FilterDatabases default
+		if len(sink.FilterDatabases) == 0 {
+			sink.FilterDatabases = []string{"*"}
+		}
+	}
 }
 
 // generateNodeID creates a unique node ID based on machine ID
@@ -527,6 +605,54 @@ func Validate() error {
 
 		if Config.Replica.InitialSyncTimeoutMin < 1 {
 			return fmt.Errorf("replica.initial_sync_timeout_minutes must be >= 1")
+		}
+	}
+
+	// Validate publisher configuration
+	if Config.Publisher.Enabled {
+		// At least one sink must be configured
+		if len(Config.Publisher.Sinks) == 0 {
+			return fmt.Errorf("publisher.enabled=true requires at least one sink to be configured")
+		}
+
+		// Track sink names for uniqueness validation
+		sinkNames := make(map[string]bool)
+
+		for i, sink := range Config.Publisher.Sinks {
+			// Each sink must have unique non-empty Name
+			if sink.Name == "" {
+				return fmt.Errorf("publisher.sinks[%d].name cannot be empty", i)
+			}
+
+			if sinkNames[sink.Name] {
+				return fmt.Errorf("publisher.sinks[%d].name=%q is not unique - sink names must be unique", i, sink.Name)
+			}
+			sinkNames[sink.Name] = true
+
+			// Type must be "kafka" or "nats"
+			if sink.Type != "kafka" && sink.Type != "nats" {
+				return fmt.Errorf("publisher.sinks[%d].type=%q is invalid - must be \"kafka\" or \"nats\"", i, sink.Type)
+			}
+
+			// Format must be "debezium" for now
+			if sink.Format != "debezium" {
+				return fmt.Errorf("publisher.sinks[%d].format=%q is invalid - only \"debezium\" is supported", i, sink.Format)
+			}
+
+			// Brokers must not be empty for kafka type
+			if sink.Type == "kafka" && len(sink.Brokers) == 0 {
+				return fmt.Errorf("publisher.sinks[%d].brokers cannot be empty for type \"kafka\"", i)
+			}
+
+			// NatsURL must not be empty for nats type
+			if sink.Type == "nats" && sink.NatsURL == "" {
+				return fmt.Errorf("publisher.sinks[%d].nats_url cannot be empty for type \"nats\"", i)
+			}
+
+			// TopicPrefix must not be empty
+			if sink.TopicPrefix == "" {
+				return fmt.Errorf("publisher.sinks[%d].topic_prefix cannot be empty", i)
+			}
 		}
 	}
 

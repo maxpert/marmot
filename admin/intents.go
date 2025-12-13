@@ -56,7 +56,7 @@ func (h *AdminHandlers) handleIntents(w http.ResponseWriter, r *http.Request, da
 	case "range":
 		h.handleIntentRange(w, r, metaStore)
 	default:
-		// Check if it's table/rowKey pattern
+		// Check if it's table/intentKey pattern
 		if remainder != "" {
 			h.handleIntent(w, r, metaStore, action, remainder)
 		} else {
@@ -66,8 +66,8 @@ func (h *AdminHandlers) handleIntents(w http.ResponseWriter, r *http.Request, da
 }
 
 // handleIntent returns a specific write intent
-func (h *AdminHandlers) handleIntent(w http.ResponseWriter, r *http.Request, metaStore db.MetaStore, table, rowKey string) {
-	rec, err := metaStore.GetIntent(table, rowKey)
+func (h *AdminHandlers) handleIntent(w http.ResponseWriter, r *http.Request, metaStore db.MetaStore, table, intentKey string) {
+	rec, err := metaStore.GetIntent(table, intentKey)
 	if err != nil {
 		writeErrorResponse(w, http.StatusInternalServerError, fmt.Sprintf("failed to get intent: %v", err))
 		return
@@ -80,7 +80,7 @@ func (h *AdminHandlers) handleIntent(w http.ResponseWriter, r *http.Request, met
 
 	response := map[string]interface{}{
 		"table_name":         rec.TableName,
-		"row_key":            rec.RowKey,
+		"intent_key":         rec.IntentKey,
 		"txn_id":             rec.TxnID,
 		"ts_wall":            rec.TSWall,
 		"ts_logical":         rec.TSLogical,
@@ -115,7 +115,7 @@ func (h *AdminHandlers) handleIntentsByTxn(w http.ResponseWriter, r *http.Reques
 	for _, rec := range records {
 		item := map[string]interface{}{
 			"table_name":         rec.TableName,
-			"row_key":            rec.RowKey,
+			"intent_key":         rec.IntentKey,
 			"txn_id":             rec.TxnID,
 			"ts_wall":            rec.TSWall,
 			"ts_logical":         rec.TSLogical,

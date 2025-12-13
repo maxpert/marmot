@@ -8,10 +8,10 @@ import (
 	"github.com/maxpert/marmot/encoding"
 )
 
-// TestRowKeyCompatibility verifies that GenerateRowKey produces the same format
+// TestIntentKeyCompatibility verifies that GenerateIntentKey produces the same format
 // as db/preupdate_hook.go serializePK. This is critical for conflict detection
 // to work correctly across both paths.
-func TestRowKeyCompatibility(t *testing.T) {
+func TestIntentKeyCompatibility(t *testing.T) {
 	tests := []struct {
 		name        string
 		tableName   string
@@ -101,26 +101,26 @@ func TestRowKeyCompatibility(t *testing.T) {
 				PrimaryKeys: tt.primaryKeys,
 			}
 
-			rowKey, err := GenerateRowKey(schema, tt.values)
+			intentKey, err := GenerateIntentKey(schema, tt.values)
 			if tt.expectError {
 				if err == nil {
-					t.Errorf("Expected error but got row key: %q", rowKey)
+					t.Errorf("Expected error but got intent key: %q", intentKey)
 				}
 				return
 			}
 			if err != nil {
-				t.Fatalf("GenerateRowKey failed: %v", err)
+				t.Fatalf("GenerateIntentKey failed: %v", err)
 			}
 
-			if rowKey != tt.expectedKey {
-				t.Errorf("Row key mismatch:\n  got:      %q\n  expected: %q", rowKey, tt.expectedKey)
+			if intentKey != tt.expectedKey {
+				t.Errorf("Intent key mismatch:\n  got:      %q\n  expected: %q", intentKey, tt.expectedKey)
 			}
 		})
 	}
 }
 
-// TestRowKeyNoCollision verifies that potentially colliding keys produce different row keys
-func TestRowKeyNoCollision(t *testing.T) {
+// TestIntentKeyNoCollision verifies that potentially colliding keys produce different intent keys
+func TestIntentKeyNoCollision(t *testing.T) {
 	schema := &TableSchema{
 		TableName:   "test",
 		PrimaryKeys: []string{"a", "b"},
@@ -130,14 +130,14 @@ func TestRowKeyNoCollision(t *testing.T) {
 	values1 := map[string][]byte{"a": []byte("x:y"), "b": []byte("z")}
 	values2 := map[string][]byte{"a": []byte("x"), "b": []byte("y:z")}
 
-	key1, err := GenerateRowKey(schema, values1)
+	key1, err := GenerateIntentKey(schema, values1)
 	if err != nil {
-		t.Fatalf("GenerateRowKey failed: %v", err)
+		t.Fatalf("GenerateIntentKey failed: %v", err)
 	}
 
-	key2, err := GenerateRowKey(schema, values2)
+	key2, err := GenerateIntentKey(schema, values2)
 	if err != nil {
-		t.Fatalf("GenerateRowKey failed: %v", err)
+		t.Fatalf("GenerateIntentKey failed: %v", err)
 	}
 
 	if key1 == key2 {
@@ -148,8 +148,8 @@ func TestRowKeyNoCollision(t *testing.T) {
 		"x:y", "z", key1, "x", "y:z", key2)
 }
 
-// TestRowKeyDeterminism verifies that the same input always produces the same output
-func TestRowKeyDeterminism(t *testing.T) {
+// TestIntentKeyDeterminism verifies that the same input always produces the same output
+func TestIntentKeyDeterminism(t *testing.T) {
 	schema := &TableSchema{
 		TableName:   "test",
 		PrimaryKeys: []string{"id", "name"},
@@ -163,9 +163,9 @@ func TestRowKeyDeterminism(t *testing.T) {
 	// Generate key multiple times
 	var keys []string
 	for i := 0; i < 100; i++ {
-		key, err := GenerateRowKey(schema, values)
+		key, err := GenerateIntentKey(schema, values)
 		if err != nil {
-			t.Fatalf("GenerateRowKey failed: %v", err)
+			t.Fatalf("GenerateIntentKey failed: %v", err)
 		}
 		keys = append(keys, key)
 	}
@@ -178,8 +178,8 @@ func TestRowKeyDeterminism(t *testing.T) {
 	}
 }
 
-// TestRowKeyMsgpackValues verifies handling of msgpack-encoded values
-func TestRowKeyMsgpackValues(t *testing.T) {
+// TestIntentKeyMsgpackValues verifies handling of msgpack-encoded values
+func TestIntentKeyMsgpackValues(t *testing.T) {
 	schema := &TableSchema{
 		TableName:   "msgpack_test",
 		PrimaryKeys: []string{"id"},
@@ -194,21 +194,21 @@ func TestRowKeyMsgpackValues(t *testing.T) {
 		"id": encoded,
 	}
 
-	key, err := GenerateRowKey(schema, values)
+	key, err := GenerateIntentKey(schema, values)
 	if err != nil {
-		t.Fatalf("GenerateRowKey failed: %v", err)
+		t.Fatalf("GenerateIntentKey failed: %v", err)
 	}
 
 	// Should extract the string value from msgpack
 	expected := "msgpack_test:123"
 	if key != expected {
-		t.Errorf("Row key mismatch:\n  got:      %q\n  expected: %q", key, expected)
+		t.Errorf("Intent key mismatch:\n  got:      %q\n  expected: %q", key, expected)
 	}
 }
 
-// TestRowKeyZeroValueAsAutoIncrement verifies that id=0 is treated as auto-increment
+// TestIntentKeyZeroValueAsAutoIncrement verifies that id=0 is treated as auto-increment
 // MySQL semantics: INSERT with id=0 means "use next auto-increment value"
-func TestRowKeyZeroValueAsAutoIncrement(t *testing.T) {
+func TestIntentKeyZeroValueAsAutoIncrement(t *testing.T) {
 	// msgpack-encoded "0"
 	msgpackZero, _ := encoding.Marshal("0")
 
@@ -229,7 +229,7 @@ func TestRowKeyZeroValueAsAutoIncrement(t *testing.T) {
 
 			values := map[string][]byte{"id": tt.value}
 
-			_, err := GenerateRowKey(schema, values)
+			_, err := GenerateIntentKey(schema, values)
 			if err != ErrMissingPrimaryKey {
 				t.Errorf("Expected ErrMissingPrimaryKey for id=%q, got: %v", tt.value, err)
 			}
@@ -237,8 +237,8 @@ func TestRowKeyZeroValueAsAutoIncrement(t *testing.T) {
 	}
 }
 
-// TestRowKeySpecialCharacters verifies handling of various special characters
-func TestRowKeySpecialCharacters(t *testing.T) {
+// TestIntentKeySpecialCharacters verifies handling of various special characters
+func TestIntentKeySpecialCharacters(t *testing.T) {
 	tests := []struct {
 		name  string
 		value string
@@ -262,9 +262,9 @@ func TestRowKeySpecialCharacters(t *testing.T) {
 
 			values := map[string][]byte{"id": []byte(tt.value)}
 
-			key, err := GenerateRowKey(schema, values)
+			key, err := GenerateIntentKey(schema, values)
 			if err != nil {
-				t.Fatalf("GenerateRowKey failed for %q: %v", tt.value, err)
+				t.Fatalf("GenerateIntentKey failed for %q: %v", tt.value, err)
 			}
 
 			// Key should contain table name and be non-empty
@@ -305,9 +305,9 @@ func TestCompositeKeyColumnOrdering(t *testing.T) {
 		"c": []byte("3"),
 	}
 
-	key1, _ := GenerateRowKey(schema1, values)
-	key2, _ := GenerateRowKey(schema2, values)
-	key3, _ := GenerateRowKey(schema3, values)
+	key1, _ := GenerateIntentKey(schema1, values)
+	key2, _ := GenerateIntentKey(schema2, values)
+	key3, _ := GenerateIntentKey(schema3, values)
 
 	// All should produce the same key (columns sorted alphabetically)
 	if key1 != key2 || key2 != key3 {

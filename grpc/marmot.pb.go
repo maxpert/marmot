@@ -840,12 +840,12 @@ func (*Statement_DdlChange) isStatement_Payload() {}
 // Follows MySQL binlog row format and TiDB TiCDC approach
 type RowChange struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Primary key value for MVCC conflict detection
-	RowKey string `protobuf:"bytes,1,opt,name=row_key,json=rowKey,proto3" json:"row_key,omitempty"`
+	// Composite identifier for intent/lock identification (NOT actual row primary key)
+	IntentKey string `protobuf:"bytes,1,opt,name=intent_key,json=intentKey,proto3" json:"intent_key,omitempty"`
 	// Row images (before/after values)
 	// - INSERT: only new_values populated
 	// - UPDATE: both old_values and new_values populated (for conflict detection)
-	// - DELETE: only old_values populated (or just row_key is sufficient)
+	// - DELETE: only old_values populated (or just intent_key is sufficient)
 	// - REPLACE: old_values for conflict check, new_values for data
 	OldValues     map[string][]byte `protobuf:"bytes,2,rep,name=old_values,json=oldValues,proto3" json:"old_values,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"` // Column name -> serialized value (before image)
 	NewValues     map[string][]byte `protobuf:"bytes,3,rep,name=new_values,json=newValues,proto3" json:"new_values,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"` // Column name -> serialized value (after image)
@@ -883,9 +883,9 @@ func (*RowChange) Descriptor() ([]byte, []int) {
 	return file_grpc_marmot_proto_rawDescGZIP(), []int{9}
 }
 
-func (x *RowChange) GetRowKey() string {
+func (x *RowChange) GetIntentKey() string {
 	if x != nil {
-		return x.RowKey
+		return x.IntentKey
 	}
 	return ""
 }
@@ -2076,9 +2076,10 @@ const file_grpc_marmot_proto_rawDesc = "" +
 	"row_change\x18\x04 \x01(\v2\x14.marmot.v2.RowChangeH\x00R\trowChange\x125\n" +
 	"\n" +
 	"ddl_change\x18\x05 \x01(\v2\x14.marmot.v2.DDLChangeH\x00R\tddlChangeB\t\n" +
-	"\apayload\"\xa8\x02\n" +
-	"\tRowChange\x12\x17\n" +
-	"\arow_key\x18\x01 \x01(\tR\x06rowKey\x12B\n" +
+	"\apayload\"\xae\x02\n" +
+	"\tRowChange\x12\x1d\n" +
+	"\n" +
+	"intent_key\x18\x01 \x01(\tR\tintentKey\x12B\n" +
 	"\n" +
 	"old_values\x18\x02 \x03(\v2#.marmot.v2.RowChange.OldValuesEntryR\toldValues\x12B\n" +
 	"\n" +

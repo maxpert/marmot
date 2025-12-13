@@ -23,16 +23,16 @@ const (
 	pebblePrefixTxn         = "/txn/"           // /txn/{txnID:016x}
 	pebblePrefixTxnPending  = "/txn_idx/pend/"  // /txn_idx/pend/{txnID:016x}
 	pebblePrefixTxnSeq      = "/txn_idx/seq/"   // /txn_idx/seq/{seqNum:016x}/{txnID:016x}
-	pebblePrefixIntent      = "/intent/"        // /intent/{tableName}/{rowKey}
+	pebblePrefixIntent      = "/intent/"        // /intent/{tableName}/{intentKey}
 	pebblePrefixCDC         = "/cdc/"           // /cdc/{txnID:016x}/{seq:08x}
 	pebblePrefixRepl        = "/repl/"          // /repl/{peerNodeID:016x}/{dbName}
 	pebblePrefixSchema      = "/schema/"        // /schema/{dbName}
 	pebblePrefixDDLLock     = "/ddl/"           // /ddl/{dbName}
 	pebblePrefixSeq         = "/seq/"           // /seq/{name}
-	pebblePrefixIntentByTxn = "/intent_txn/"    // /intent_txn/{txnID:016x}/{tableName}/{rowKey}
+	pebblePrefixIntentByTxn = "/intent_txn/"    // /intent_txn/{txnID:016x}/{tableName}/{intentKey}
 	pebblePrefixCounter     = "/meta/"          // /meta/{counterName}
-	pebblePrefixCDCActive   = "/cdc/active/"    // /cdc/active/{tableName}/{rowKey|__ddl__}
-	pebblePrefixCDCTxnLocks = "/cdc/txn_locks/" // /cdc/txn_locks/{txnID:016x}/{tableName}/{rowKey}
+	pebblePrefixCDCActive   = "/cdc/active/"    // /cdc/active/{tableName}/{intentKey|__ddl__}
+	pebblePrefixCDCTxnLocks = "/cdc/txn_locks/" // /cdc/txn_locks/{txnID:016x}/{tableName}/{intentKey}
 
 	pebbleCDCDDLKeyMarker = "__ddl__" // Sentinel key for DDL locks
 )
@@ -84,9 +84,9 @@ type PebbleMetaStore struct {
 // Ensure PebbleMetaStore implements MetaStore
 var _ MetaStore = (*PebbleMetaStore)(nil)
 
-// intentLockFor returns the sharded mutex for a given table+rowKey
-func (s *PebbleMetaStore) intentLockFor(tableName, rowKey string) *sync.Mutex {
-	key := tableName + ":" + rowKey
+// intentLockFor returns the sharded mutex for a given table+intentKey
+func (s *PebbleMetaStore) intentLockFor(tableName, intentKey string) *sync.Mutex {
+	key := tableName + ":" + intentKey
 	return &s.intentLocks[xxhash.Sum64String(key)%intentLockShards]
 }
 
@@ -125,7 +125,7 @@ func (s *PebbleMetaStore) rebuildIntentFilter() error {
 			continue
 		}
 
-		tbHash := ComputeIntentHash(rec.TableName, rec.RowKey)
+		tbHash := ComputeIntentHash(rec.TableName, rec.IntentKey)
 		s.intentFilter.Add(rec.TxnID, tbHash)
 		count++
 	}
@@ -452,12 +452,12 @@ func pebbleTxnSeqKey(seqNum, txnID uint64) []byte {
 	return []byte(fmt.Sprintf("%s%016x/%016x", pebblePrefixTxnSeq, seqNum, txnID))
 }
 
-func pebbleIntentKey(tableName, rowKey string) []byte {
-	return []byte(fmt.Sprintf("%s%s/%s", pebblePrefixIntent, tableName, rowKey))
+func pebbleIntentKey(tableName, intentKey string) []byte {
+	return []byte(fmt.Sprintf("%s%s/%s", pebblePrefixIntent, tableName, intentKey))
 }
 
-func pebbleIntentByTxnKey(txnID uint64, tableName, rowKey string) []byte {
-	return []byte(fmt.Sprintf("%s%016x/%s/%s", pebblePrefixIntentByTxn, txnID, tableName, rowKey))
+func pebbleIntentByTxnKey(txnID uint64, tableName, intentKey string) []byte {
+	return []byte(fmt.Sprintf("%s%016x/%s/%s", pebblePrefixIntentByTxn, txnID, tableName, intentKey))
 }
 
 func pebbleCdcKey(txnID, seq uint64) []byte {
@@ -484,8 +484,8 @@ func pebbleSeqKey(nodeID uint64) []byte {
 	return []byte(fmt.Sprintf("%s%016x", pebblePrefixSeq, nodeID))
 }
 
-func pebbleCDCActiveRowKey(tableName, rowKey string) []byte {
-	return []byte(fmt.Sprintf("%s%s/%s", pebblePrefixCDCActive, tableName, rowKey))
+func pebbleCDCActiveIntentKey(tableName, intentKey string) []byte {
+	return []byte(fmt.Sprintf("%s%s/%s", pebblePrefixCDCActive, tableName, intentKey))
 }
 
 func pebbleCDCActiveDDLKey(tableName string) []byte {
@@ -497,9 +497,9 @@ func pebbleCDCActiveTablePrefix(tableName string) []byte {
 }
 
 // pebbleCDCTxnLockKey returns the reverse index key for a CDC row lock
-// Format: /cdc/txn_locks/{txnID:016x}/{tableName}/{rowKey}
-func pebbleCDCTxnLockKey(txnID uint64, tableName, rowKey string) []byte {
-	return []byte(fmt.Sprintf("%s%016x/%s/%s", pebblePrefixCDCTxnLocks, txnID, tableName, rowKey))
+// Format: /cdc/txn_locks/{txnID:016x}/{tableName}/{intentKey}
+func pebbleCDCTxnLockKey(txnID uint64, tableName, intentKey string) []byte {
+	return []byte(fmt.Sprintf("%s%016x/%s/%s", pebblePrefixCDCTxnLocks, txnID, tableName, intentKey))
 }
 
 // pebbleCDCTxnLockPrefix returns the prefix for all locks held by a transaction
@@ -805,32 +805,32 @@ func (s *PebbleMetaStore) Heartbeat(txnID uint64) error {
 }
 
 // WriteIntent creates a write intent (distributed lock)
-func (s *PebbleMetaStore) WriteIntent(txnID uint64, intentType IntentType, tableName, rowKey string, op OpType, sqlStmt string, data []byte, ts hlc.Timestamp, nodeID uint64) error {
+func (s *PebbleMetaStore) WriteIntent(txnID uint64, intentType IntentType, tableName, intentKey string, op OpType, sqlStmt string, data []byte, ts hlc.Timestamp, nodeID uint64) error {
 	// Acquire sharded lock to serialize concurrent writes to same row (prevents TOCTOU race)
-	mu := s.intentLockFor(tableName, rowKey)
+	mu := s.intentLockFor(tableName, intentKey)
 	mu.Lock()
 	defer mu.Unlock()
 
-	tbHash := ComputeIntentHash(tableName, rowKey)
+	tbHash := ComputeIntentHash(tableName, intentKey)
 
 	// Fast path: Cuckoo filter miss = definitely no conflict
 	if s.intentFilter != nil && !s.intentFilter.Check(tbHash) {
 		telemetry.IntentFilterChecks.With("fast_path").Inc()
-		return s.writeIntentFastPath(txnID, intentType, tableName, rowKey, op, sqlStmt, data, ts, nodeID, tbHash)
+		return s.writeIntentFastPath(txnID, intentType, tableName, intentKey, op, sqlStmt, data, ts, nodeID, tbHash)
 	}
 
 	// Slow path: Filter hit (or no filter) - check Pebble
-	return s.writeIntentSlowPath(txnID, intentType, tableName, rowKey, op, sqlStmt, data, ts, nodeID, tbHash)
+	return s.writeIntentSlowPath(txnID, intentType, tableName, intentKey, op, sqlStmt, data, ts, nodeID, tbHash)
 }
 
 // writeIntentFastPath writes intent without Pebble conflict check (filter miss).
-func (s *PebbleMetaStore) writeIntentFastPath(txnID uint64, intentType IntentType, tableName, rowKey string, op OpType, sqlStmt string, data []byte, ts hlc.Timestamp, nodeID uint64, tbHash uint64) error {
-	key := pebbleIntentKey(tableName, rowKey)
+func (s *PebbleMetaStore) writeIntentFastPath(txnID uint64, intentType IntentType, tableName, intentKey string, op OpType, sqlStmt string, data []byte, ts hlc.Timestamp, nodeID uint64, tbHash uint64) error {
+	key := pebbleIntentKey(tableName, intentKey)
 
 	rec := &WriteIntentRecord{
 		IntentType:   intentType,
 		TableName:    tableName,
-		RowKey:       rowKey,
+		IntentKey:    intentKey,
 		TxnID:        txnID,
 		TSWall:       ts.WallTime,
 		TSLogical:    ts.Logical,
@@ -852,7 +852,7 @@ func (s *PebbleMetaStore) writeIntentFastPath(txnID uint64, intentType IntentTyp
 	if err := batch.Set(key, recData, nil); err != nil {
 		return err
 	}
-	if err := batch.Set(pebbleIntentByTxnKey(txnID, tableName, rowKey), nil, nil); err != nil {
+	if err := batch.Set(pebbleIntentByTxnKey(txnID, tableName, intentKey), nil, nil); err != nil {
 		return err
 	}
 
@@ -866,8 +866,8 @@ func (s *PebbleMetaStore) writeIntentFastPath(txnID uint64, intentType IntentTyp
 }
 
 // writeIntentSlowPath writes intent with Pebble conflict check (filter hit).
-func (s *PebbleMetaStore) writeIntentSlowPath(txnID uint64, intentType IntentType, tableName, rowKey string, op OpType, sqlStmt string, data []byte, ts hlc.Timestamp, nodeID uint64, tbHash uint64) error {
-	key := pebbleIntentKey(tableName, rowKey)
+func (s *PebbleMetaStore) writeIntentSlowPath(txnID uint64, intentType IntentType, tableName, intentKey string, op OpType, sqlStmt string, data []byte, ts hlc.Timestamp, nodeID uint64, tbHash uint64) error {
+	key := pebbleIntentKey(tableName, intentKey)
 
 	batch := s.db.NewBatch()
 	defer batch.Close()
@@ -898,7 +898,7 @@ func (s *PebbleMetaStore) writeIntentSlowPath(txnID uint64, intentType IntentTyp
 
 		// Different transaction - check if we can overwrite
 		telemetry.IntentFilterChecks.With("slow_path_conflict").Inc()
-		if err := s.resolveIntentConflictPebble(batch, &existing, txnID, tableName, rowKey); err != nil {
+		if err := s.resolveIntentConflictPebble(batch, &existing, txnID, tableName, intentKey); err != nil {
 			telemetry.WriteConflictsTotal.With("intent", "slow").Inc()
 			return err
 		}
@@ -914,7 +914,7 @@ func (s *PebbleMetaStore) writeIntentSlowPath(txnID uint64, intentType IntentTyp
 	rec := &WriteIntentRecord{
 		IntentType:   intentType,
 		TableName:    tableName,
-		RowKey:       rowKey,
+		IntentKey:    intentKey,
 		TxnID:        txnID,
 		TSWall:       ts.WallTime,
 		TSLogical:    ts.Logical,
@@ -933,7 +933,7 @@ func (s *PebbleMetaStore) writeIntentSlowPath(txnID uint64, intentType IntentTyp
 	if err := batch.Set(key, recData, nil); err != nil {
 		return err
 	}
-	if err := batch.Set(pebbleIntentByTxnKey(txnID, tableName, rowKey), nil, nil); err != nil {
+	if err := batch.Set(pebbleIntentByTxnKey(txnID, tableName, intentKey), nil, nil); err != nil {
 		return err
 	}
 
@@ -950,13 +950,13 @@ func (s *PebbleMetaStore) writeIntentSlowPath(txnID uint64, intentType IntentTyp
 }
 
 // resolveIntentConflictPebble handles conflict with existing intent from different transaction
-func (s *PebbleMetaStore) resolveIntentConflictPebble(batch *pebble.Batch, existing *WriteIntentRecord, txnID uint64, tableName, rowKey string) error {
+func (s *PebbleMetaStore) resolveIntentConflictPebble(batch *pebble.Batch, existing *WriteIntentRecord, txnID uint64, tableName, intentKey string) error {
 	// Marked for cleanup - safe to overwrite
 	if existing.MarkedForCleanup {
-		_ = batch.Delete(pebbleIntentByTxnKey(existing.TxnID, tableName, rowKey), nil)
+		_ = batch.Delete(pebbleIntentByTxnKey(existing.TxnID, tableName, intentKey), nil)
 		// Clean up filter for the old transaction's intent
 		if s.intentFilter != nil {
-			tbHash := ComputeIntentHash(tableName, rowKey)
+			tbHash := ComputeIntentHash(tableName, intentKey)
 			s.intentFilter.RemoveHash(existing.TxnID, tbHash)
 		}
 		return nil
@@ -971,7 +971,7 @@ func (s *PebbleMetaStore) resolveIntentConflictPebble(batch *pebble.Batch, exist
 		log.Debug().
 			Uint64("orphan_txn_id", existing.TxnID).
 			Str("table", tableName).
-			Str("row_key", rowKey).
+			Str("intent_key", intentKey).
 			Msg("Cleaning up orphaned intent (no transaction record)")
 		canOverwrite = true
 
@@ -982,7 +982,7 @@ func (s *PebbleMetaStore) resolveIntentConflictPebble(batch *pebble.Batch, exist
 		log.Debug().
 			Uint64("aborted_txn_id", existing.TxnID).
 			Str("table", tableName).
-			Str("row_key", rowKey).
+			Str("intent_key", intentKey).
 			Msg("Cleaning up intent from aborted transaction")
 		canOverwrite = true
 
@@ -998,7 +998,7 @@ func (s *PebbleMetaStore) resolveIntentConflictPebble(batch *pebble.Batch, exist
 			log.Debug().
 				Uint64("stale_txn_id", existing.TxnID).
 				Str("table", tableName).
-				Str("row_key", rowKey).
+				Str("intent_key", intentKey).
 				Int64("heartbeat_age_ms", timeSinceHeartbeat/1e6).
 				Msg("Cleaning up stale intent (heartbeat timeout)")
 			canOverwrite = true
@@ -1007,14 +1007,14 @@ func (s *PebbleMetaStore) resolveIntentConflictPebble(batch *pebble.Batch, exist
 
 	if !canOverwrite {
 		return fmt.Errorf("write-write conflict: row %s:%s locked by transaction %d (current txn: %d)",
-			tableName, rowKey, existing.TxnID, txnID)
+			tableName, intentKey, existing.TxnID, txnID)
 	}
 
-	_ = batch.Delete(pebbleIntentByTxnKey(existing.TxnID, tableName, rowKey), nil)
+	_ = batch.Delete(pebbleIntentByTxnKey(existing.TxnID, tableName, intentKey), nil)
 
 	// Clean up filter for the overwritten transaction's intent
 	if s.intentFilter != nil {
-		tbHash := ComputeIntentHash(tableName, rowKey)
+		tbHash := ComputeIntentHash(tableName, intentKey)
 		s.intentFilter.RemoveHash(existing.TxnID, tbHash)
 	}
 
@@ -1022,8 +1022,8 @@ func (s *PebbleMetaStore) resolveIntentConflictPebble(batch *pebble.Batch, exist
 }
 
 // ValidateIntent checks if the intent is still held by the expected transaction
-func (s *PebbleMetaStore) ValidateIntent(tableName, rowKey string, expectedTxnID uint64) (bool, error) {
-	val, closer, err := s.db.Get(pebbleIntentKey(tableName, rowKey))
+func (s *PebbleMetaStore) ValidateIntent(tableName, intentKey string, expectedTxnID uint64) (bool, error) {
+	val, closer, err := s.db.Get(pebbleIntentKey(tableName, intentKey))
 	if err == pebble.ErrNotFound {
 		return false, nil
 	}
@@ -1041,8 +1041,8 @@ func (s *PebbleMetaStore) ValidateIntent(tableName, rowKey string, expectedTxnID
 }
 
 // DeleteIntent removes a specific write intent
-func (s *PebbleMetaStore) DeleteIntent(tableName, rowKey string, txnID uint64) error {
-	key := pebbleIntentKey(tableName, rowKey)
+func (s *PebbleMetaStore) DeleteIntent(tableName, intentKey string, txnID uint64) error {
+	key := pebbleIntentKey(tableName, intentKey)
 
 	// Verify the intent belongs to this transaction
 	val, closer, err := s.db.Get(key)
@@ -1070,7 +1070,7 @@ func (s *PebbleMetaStore) DeleteIntent(tableName, rowKey string, txnID uint64) e
 	if err := batch.Delete(key, nil); err != nil {
 		return err
 	}
-	if err := batch.Delete(pebbleIntentByTxnKey(txnID, tableName, rowKey), nil); err != nil {
+	if err := batch.Delete(pebbleIntentByTxnKey(txnID, tableName, intentKey), nil); err != nil {
 		return err
 	}
 
@@ -1081,7 +1081,7 @@ func (s *PebbleMetaStore) DeleteIntent(tableName, rowKey string, txnID uint64) e
 
 	// Sync intent filter after successful Pebble delete
 	if s.intentFilter != nil {
-		tbHash := ComputeIntentHash(tableName, rowKey)
+		tbHash := ComputeIntentHash(tableName, intentKey)
 		s.intentFilter.RemoveHash(txnID, tbHash)
 	}
 
@@ -1109,7 +1109,7 @@ func (s *PebbleMetaStore) DeleteIntentsByTxn(txnID uint64) error {
 		copy(indexKey, iter.Key())
 		indexKeys = append(indexKeys, indexKey)
 
-		// Parse table/rowKey from index key
+		// Parse table/intentKey from index key
 		keyStr := string(indexKey)
 		suffix := keyStr[len(fmt.Sprintf("%s%016x/", pebblePrefixIntentByTxn, txnID)):]
 		parts := strings.SplitN(suffix, "/", 2)
@@ -1255,8 +1255,8 @@ func (s *PebbleMetaStore) GetIntentsByTxn(txnID uint64) ([]*WriteIntentRecord, e
 }
 
 // GetIntent retrieves a specific write intent
-func (s *PebbleMetaStore) GetIntent(tableName, rowKey string) (*WriteIntentRecord, error) {
-	val, closer, err := s.db.Get(pebbleIntentKey(tableName, rowKey))
+func (s *PebbleMetaStore) GetIntent(tableName, intentKey string) (*WriteIntentRecord, error) {
+	val, closer, err := s.db.Get(pebbleIntentKey(tableName, intentKey))
 	if err == pebble.ErrNotFound {
 		return nil, nil
 	}
@@ -1541,13 +1541,13 @@ func (s *PebbleMetaStore) ReleaseDDLLock(dbName string, nodeID uint64) error {
 }
 
 // WriteIntentEntry writes a CDC intent entry
-func (s *PebbleMetaStore) WriteIntentEntry(txnID, seq uint64, op uint8, table, rowKey string, oldVals, newVals []byte) error {
+func (s *PebbleMetaStore) WriteIntentEntry(txnID, seq uint64, op uint8, table, intentKey string, oldVals, newVals []byte) error {
 	entry := &IntentEntry{
 		TxnID:     txnID,
 		Seq:       seq,
 		Operation: op,
 		Table:     table,
-		RowKey:    rowKey,
+		IntentKey: intentKey,
 		CreatedAt: time.Now().UnixNano(),
 	}
 
@@ -1570,7 +1570,7 @@ func (s *PebbleMetaStore) WriteIntentEntry(txnID, seq uint64, op uint8, table, r
 		Uint64("seq", seq).
 		Uint8("op", op).
 		Str("table", table).
-		Str("row_key", rowKey).
+		Str("intent_key", intentKey).
 		Int("old_vals_len", len(oldVals)).
 		Int("new_vals_len", len(newVals)).
 		Int("old_values_count", len(entry.OldValues)).
@@ -1733,10 +1733,10 @@ func (s *PebbleMetaStore) CleanupStaleTransactions(timeout time.Duration) (int, 
 
 	// Phase 2: Clean orphaned intents
 	type orphanedIntent struct {
-		key    []byte
-		txnID  uint64
-		table  string
-		rowKey string
+		key       []byte
+		txnID     uint64
+		table     string
+		intentKey string
 	}
 	var orphanedIntents []orphanedIntent
 	intentPrefix := []byte(pebblePrefixIntent)
@@ -1771,10 +1771,10 @@ func (s *PebbleMetaStore) CleanupStaleTransactions(timeout time.Duration) (int, 
 			key := make([]byte, len(iter.Key()))
 			copy(key, iter.Key())
 			orphanedIntents = append(orphanedIntents, orphanedIntent{
-				key:    key,
-				txnID:  rec.TxnID,
-				table:  rec.TableName,
-				rowKey: rec.RowKey,
+				key:       key,
+				txnID:     rec.TxnID,
+				table:     rec.TableName,
+				intentKey: rec.IntentKey,
 			})
 		}
 	}
@@ -1789,7 +1789,7 @@ func (s *PebbleMetaStore) CleanupStaleTransactions(timeout time.Duration) (int, 
 			_ = batch.Delete(orphan.key, nil)
 			// Remove from IntentFilter to prevent false positives
 			if s.intentFilter != nil {
-				tbHash := ComputeIntentHash(orphan.table, orphan.rowKey)
+				tbHash := ComputeIntentHash(orphan.table, orphan.intentKey)
 				s.intentFilter.RemoveHash(orphan.txnID, tbHash)
 			}
 			cleaned++
@@ -2073,8 +2073,8 @@ func (s *PebbleMetaStore) ScanTransactions(fromTxnID uint64, descending bool, ca
 // AcquireCDCRowLock attempts to acquire a row-level lock for CDC conflict detection.
 // Returns ErrCDCRowLocked if the row is already locked by a different transaction.
 // Same transaction can re-acquire (idempotent).
-func (s *PebbleMetaStore) AcquireCDCRowLock(txnID uint64, tableName, rowKey string) error {
-	key := pebbleCDCActiveRowKey(tableName, rowKey)
+func (s *PebbleMetaStore) AcquireCDCRowLock(txnID uint64, tableName, intentKey string) error {
+	key := pebbleCDCActiveIntentKey(tableName, intentKey)
 
 	// Check if lock exists
 	val, closer, err := s.db.Get(key)
@@ -2085,7 +2085,7 @@ func (s *PebbleMetaStore) AcquireCDCRowLock(txnID uint64, tableName, rowKey stri
 			if existingTxnID != txnID {
 				return ErrCDCRowLocked{
 					Table:     tableName,
-					RowKey:    rowKey,
+					IntentKey: intentKey,
 					HeldByTxn: existingTxnID,
 				}
 			}
@@ -2104,13 +2104,13 @@ func (s *PebbleMetaStore) AcquireCDCRowLock(txnID uint64, tableName, rowKey stri
 	batch := s.db.NewBatch()
 	defer batch.Close()
 
-	// Forward index: /cdc/active/{table}/{rowKey} → txnID
+	// Forward index: /cdc/active/{table}/{intentKey} → txnID
 	if err := batch.Set(key, buf, nil); err != nil {
 		return err
 	}
 
-	// Reverse index: /cdc/txn_locks/{txnID}/{table}/{rowKey} → empty
-	reverseKey := pebbleCDCTxnLockKey(txnID, tableName, rowKey)
+	// Reverse index: /cdc/txn_locks/{txnID}/{table}/{intentKey} → empty
+	reverseKey := pebbleCDCTxnLockKey(txnID, tableName, intentKey)
 	if err := batch.Set(reverseKey, nil, nil); err != nil {
 		return err
 	}
@@ -2120,8 +2120,8 @@ func (s *PebbleMetaStore) AcquireCDCRowLock(txnID uint64, tableName, rowKey stri
 
 // ReleaseCDCRowLock releases a row-level lock if held by the specified txnID.
 // Idempotent - no error if already released.
-func (s *PebbleMetaStore) ReleaseCDCRowLock(tableName, rowKey string, txnID uint64) error {
-	key := pebbleCDCActiveRowKey(tableName, rowKey)
+func (s *PebbleMetaStore) ReleaseCDCRowLock(tableName, intentKey string, txnID uint64) error {
+	key := pebbleCDCActiveIntentKey(tableName, intentKey)
 
 	// Check if lock exists and belongs to this txn
 	val, closer, err := s.db.Get(key)
@@ -2152,7 +2152,7 @@ func (s *PebbleMetaStore) ReleaseCDCRowLock(tableName, rowKey string, txnID uint
 	}
 
 	// Reverse index
-	reverseKey := pebbleCDCTxnLockKey(txnID, tableName, rowKey)
+	reverseKey := pebbleCDCTxnLockKey(txnID, tableName, intentKey)
 	if err := batch.Delete(reverseKey, nil); err != nil {
 		return err
 	}
@@ -2181,20 +2181,20 @@ func (s *PebbleMetaStore) ReleaseCDCRowLocksByTxn(txnID uint64) error {
 
 	// Iterate over reverse index entries for this txn
 	for iter.SeekGE(prefix); iter.Valid(); iter.Next() {
-		// Parse table/rowKey from reverse key: /cdc/txn_locks/{txnID}/{table}/{rowKey}
+		// Parse table/intentKey from reverse key: /cdc/txn_locks/{txnID}/{table}/{intentKey}
 		keyStr := string(iter.Key())
 		suffix := keyStr[prefixLen:]
 
-		// Find first slash to separate table from rowKey
+		// Find first slash to separate table from intentKey
 		slashIdx := strings.Index(suffix, "/")
 		if slashIdx == -1 {
 			continue // Malformed key, skip
 		}
 		tableName := suffix[:slashIdx]
-		rowKey := suffix[slashIdx+1:]
+		intentKey := suffix[slashIdx+1:]
 
 		// Delete forward index key
-		forwardKey := pebbleCDCActiveRowKey(tableName, rowKey)
+		forwardKey := pebbleCDCActiveIntentKey(tableName, intentKey)
 		if err := batch.Delete(forwardKey, nil); err != nil {
 			iter.Close()
 			return err
@@ -2215,8 +2215,8 @@ func (s *PebbleMetaStore) ReleaseCDCRowLocksByTxn(txnID uint64) error {
 }
 
 // GetCDCRowLock returns the transaction ID holding the lock, or 0 if no lock exists.
-func (s *PebbleMetaStore) GetCDCRowLock(tableName, rowKey string) (uint64, error) {
-	key := pebbleCDCActiveRowKey(tableName, rowKey)
+func (s *PebbleMetaStore) GetCDCRowLock(tableName, intentKey string) (uint64, error) {
+	key := pebbleCDCActiveIntentKey(tableName, intentKey)
 
 	val, closer, err := s.db.Get(key)
 	if err == pebble.ErrNotFound {
@@ -2266,7 +2266,7 @@ func (s *PebbleMetaStore) AcquireCDCTableDDLLock(txnID uint64, tableName string)
 				// This allows us to reuse ErrCDCRowLocked for consistency
 				return ErrCDCRowLocked{
 					Table:     tableName,
-					RowKey:    pebbleCDCDDLKeyMarker, // Sentinel value indicating DDL lock
+					IntentKey: pebbleCDCDDLKeyMarker, // Sentinel value indicating DDL lock
 					HeldByTxn: existingTxnID,
 				}
 			}
@@ -2289,7 +2289,7 @@ func (s *PebbleMetaStore) AcquireCDCTableDDLLock(txnID uint64, tableName string)
 		return err
 	}
 
-	// Reverse index (DDL uses __ddl__ as rowKey)
+	// Reverse index (DDL uses __ddl__ as intentKey)
 	reverseKey := pebbleCDCTxnLockKey(txnID, tableName, pebbleCDCDDLKeyMarker)
 	if err := batch.Set(reverseKey, nil, nil); err != nil {
 		return err

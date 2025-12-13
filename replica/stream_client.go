@@ -666,7 +666,7 @@ func (s *StreamClient) applyCDCStatement(tx *sql.Tx, stmt *marmotgrpc.Statement)
 	case marmotgrpc.StatementType_UPDATE:
 		return s.applyCDCInsert(tx, stmt.TableName, rowChange.NewValues) // Use INSERT OR REPLACE
 	case marmotgrpc.StatementType_DELETE:
-		return s.applyCDCDelete(tx, stmt.TableName, rowChange.RowKey, rowChange.OldValues)
+		return s.applyCDCDelete(tx, stmt.TableName, rowChange.OldValues)
 	default:
 		return fmt.Errorf("unsupported statement type: %v", stmt.Type)
 	}
@@ -702,36 +702,44 @@ func (s *StreamClient) applyCDCInsert(tx *sql.Tx, tableName string, newValues ma
 	return err
 }
 
-// applyCDCDelete performs DELETE
-func (s *StreamClient) applyCDCDelete(tx *sql.Tx, tableName string, rowKey string, oldValues map[string][]byte) error {
-	if len(oldValues) == 0 && rowKey == "" {
-		return fmt.Errorf("no row key or old values for delete")
+// applyCDCDelete performs DELETE using primary key columns from schema
+func (s *StreamClient) applyCDCDelete(tx *sql.Tx, tableName string, oldValues map[string][]byte) error {
+	if len(oldValues) == 0 {
+		return fmt.Errorf("no old values for delete")
 	}
 
-	if len(oldValues) > 0 {
-		// Use all old values as WHERE clause
-		whereClauses := make([]string, 0, len(oldValues))
-		values := make([]interface{}, 0, len(oldValues))
+	// Get table schema to build proper WHERE clause
+	// Use transaction for schema queries to avoid connection pool conflicts
+	schemaProvider := protocol.NewSchemaProviderFromQuerier(tx)
+	schema, err := schemaProvider.GetTableSchema(tableName)
+	if err != nil {
+		return fmt.Errorf("failed to get schema for table %s: %w", tableName, err)
+	}
 
-		for col, valBytes := range oldValues {
-			whereClauses = append(whereClauses, fmt.Sprintf("%s = ?", col))
-			var value interface{}
-			if err := encoding.Unmarshal(valBytes, &value); err != nil {
-				return fmt.Errorf("failed to deserialize value for column %s: %w", col, err)
-			}
-			values = append(values, value)
+	// Build WHERE clause using primary key columns from oldValues
+	whereClauses := make([]string, 0, len(schema.PrimaryKeys))
+	values := make([]interface{}, 0, len(schema.PrimaryKeys))
+
+	for _, pkCol := range schema.PrimaryKeys {
+		pkValue, ok := oldValues[pkCol]
+		if !ok {
+			return fmt.Errorf("primary key column %s not found in CDC old values", pkCol)
 		}
 
-		sqlStmt := fmt.Sprintf("DELETE FROM %s WHERE %s",
-			tableName,
-			strings.Join(whereClauses, " AND "))
+		whereClauses = append(whereClauses, fmt.Sprintf("%s = ?", pkCol))
 
-		_, err := tx.Exec(sqlStmt, values...)
-		return err
+		var value interface{}
+		if err := encoding.Unmarshal(pkValue, &value); err != nil {
+			return fmt.Errorf("failed to deserialize PK value for column %s: %w", pkCol, err)
+		}
+		values = append(values, value)
 	}
 
-	// Fallback: use row key
-	_, err := tx.Exec(fmt.Sprintf("DELETE FROM %s WHERE id = ?", tableName), rowKey)
+	sqlStmt := fmt.Sprintf("DELETE FROM %s WHERE %s",
+		tableName,
+		strings.Join(whereClauses, " AND "))
+
+	_, err = tx.Exec(sqlStmt, values...)
 	return err
 }
 

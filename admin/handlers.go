@@ -266,7 +266,7 @@ func decodeStatements(data []byte) []map[string]interface{} {
 		Type      int               `msgpack:"Type"`
 		TableName string            `msgpack:"TableName"`
 		Database  string            `msgpack:"Database"`
-		RowKey    string            `msgpack:"RowKey"`
+		IntentKey string            `msgpack:"IntentKey"`
 		OldValues map[string][]byte `msgpack:"OldValues"`
 		NewValues map[string][]byte `msgpack:"NewValues"`
 	}
@@ -285,8 +285,8 @@ func decodeStatements(data []byte) []map[string]interface{} {
 		if s.SQL != "" {
 			stmt["sql"] = s.SQL
 		}
-		if s.RowKey != "" {
-			stmt["row_key"] = s.RowKey
+		if s.IntentKey != "" {
+			stmt["intent_key"] = s.IntentKey
 		}
 		if len(s.OldValues) > 0 {
 			stmt["old_values"] = encodeBase64Map(s.OldValues)

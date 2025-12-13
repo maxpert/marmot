@@ -25,7 +25,7 @@ var hashBufPool = sync.Pool{
 // IntentFilter provides fast-path conflict detection using a Cuckoo filter.
 //
 // Design:
-//   - Hash = XXH64(table:rowKey) for each intent
+//   - Hash = XXH64(table:intentKey) for each intent
 //   - Filter MISS = definitely no conflict → fast path (batch write)
 //   - Filter HIT = maybe conflict → slow path (Pebble lookup)
 //   - FP rate ~2.3×10⁻¹⁰ with 32-bit fingerprint
@@ -142,11 +142,11 @@ func (f *IntentFilter) TxnCount() int {
 }
 
 // ComputeIntentHash computes the hash for conflict detection.
-// Combines table name and row key to avoid cross-table collisions.
-func ComputeIntentHash(table, rowKey string) uint64 {
+// Combines table name and intent key to avoid cross-table collisions.
+func ComputeIntentHash(table, intentKey string) uint64 {
 	h := xxhash.New()
 	_, _ = h.WriteString(table)
 	_, _ = h.WriteString(":")
-	_, _ = h.WriteString(rowKey)
+	_, _ = h.WriteString(intentKey)
 	return h.Sum64()
 }

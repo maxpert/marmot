@@ -42,8 +42,8 @@ func ValidateCDCEntry(entry CDCEntry) error {
 		return fmt.Errorf("TableName is required for all CDC entries")
 	}
 
-	if entry.RowKey == "" {
-		return fmt.Errorf("RowKey is required for all CDC operations")
+	if entry.IntentKey == "" {
+		return fmt.Errorf("IntentKey is required for all CDC operations")
 	}
 
 	hasOldValues := len(entry.OldValues) > 0
@@ -56,16 +56,16 @@ func ValidateCDCEntry(entry CDCEntry) error {
 	return nil
 }
 
-// GroupByRowKey groups CDC entries by "table:rowKey" key while preserving order
-func GroupByRowKey(entries []CDCEntry) map[string][]CDCEntry {
+// GroupByIntentKey groups CDC entries by "table:intentKey" key while preserving order
+func GroupByIntentKey(entries []CDCEntry) map[string][]CDCEntry {
 	groups := make(map[string][]CDCEntry)
 
 	for _, entry := range entries {
 		var sb strings.Builder
-		sb.Grow(len(entry.Table) + 1 + len(entry.RowKey))
+		sb.Grow(len(entry.Table) + 1 + len(entry.IntentKey))
 		sb.WriteString(entry.Table)
 		sb.WriteByte(':')
-		sb.WriteString(entry.RowKey)
+		sb.WriteString(entry.IntentKey)
 		key := sb.String()
 		groups[key] = append(groups[key], entry)
 	}
@@ -103,7 +103,7 @@ func MergeGroup(entries []CDCEntry) (*CDCEntry, bool) {
 	if firstHasOld && !firstHasNew && !lastHasOld && lastHasNew {
 		merged := &CDCEntry{
 			Table:     first.Table,
-			RowKey:    first.RowKey,
+			IntentKey: first.IntentKey,
 			OldValues: first.OldValues,
 			NewValues: last.NewValues,
 		}
@@ -114,7 +114,7 @@ func MergeGroup(entries []CDCEntry) (*CDCEntry, bool) {
 	if firstHasOld && firstHasNew && lastHasOld && lastHasNew {
 		merged := &CDCEntry{
 			Table:     first.Table,
-			RowKey:    first.RowKey,
+			IntentKey: first.IntentKey,
 			OldValues: first.OldValues,
 			NewValues: last.NewValues,
 		}
@@ -125,7 +125,7 @@ func MergeGroup(entries []CDCEntry) (*CDCEntry, bool) {
 	if firstHasOld && firstHasNew && lastHasOld && !lastHasNew {
 		merged := &CDCEntry{
 			Table:     first.Table,
-			RowKey:    first.RowKey,
+			IntentKey: first.IntentKey,
 			OldValues: first.OldValues,
 			NewValues: make(map[string][]byte),
 		}
@@ -135,7 +135,7 @@ func MergeGroup(entries []CDCEntry) (*CDCEntry, bool) {
 	// Default: Use standard merge logic (OldValues from all, NewValues from all)
 	merged := &CDCEntry{
 		Table:     first.Table,
-		RowKey:    first.RowKey,
+		IntentKey: first.IntentKey,
 		OldValues: make(map[string][]byte),
 		NewValues: make(map[string][]byte),
 	}
@@ -171,7 +171,7 @@ func ConvertToStatement(entry CDCEntry) protocol.Statement {
 	return protocol.Statement{
 		Type:      stmtType,
 		TableName: entry.Table,
-		RowKey:    entry.RowKey,
+		IntentKey: entry.IntentKey,
 		OldValues: entry.OldValues,
 		NewValues: entry.NewValues,
 	}
@@ -194,14 +194,14 @@ func ProcessCDCEntries(entries []CDCEntry, config CDCPipelineConfig) (*CDCPipeli
 	if config.ValidateEntries {
 		for i, entry := range entries {
 			if err := ValidateCDCEntry(entry); err != nil {
-				return nil, fmt.Errorf("validation failed for entry %d (table=%s, rowKey=%s): %w",
-					i, entry.Table, entry.RowKey, err)
+				return nil, fmt.Errorf("validation failed for entry %d (table=%s, intentKey=%s): %w",
+					i, entry.Table, entry.IntentKey, err)
 			}
 		}
 	}
 
-	// Group by row key
-	groups := GroupByRowKey(entries)
+	// Group by intent key
+	groups := GroupByIntentKey(entries)
 
 	// Sort group keys for deterministic output
 	keys := make([]string, 0, len(groups))

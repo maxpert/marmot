@@ -526,9 +526,9 @@ func TestDDLExecutionOrder(t *testing.T) {
 			TableName: "wp_options",
 		}
 
-		// Use table name + hash of SQL to create unique rowKey for each DDL statement
+		// Use table name + hash of SQL to create unique intentKey for each DDL statement
 		hash := sha256.Sum256([]byte(stmt.SQL))
-		ddlRowKey := stmt.TableName + ":" + hex.EncodeToString(hash[:8])
+		ddlIntentKey := stmt.TableName + ":" + hex.EncodeToString(hash[:8])
 
 		snapshotData := DDLSnapshot{
 			Type:      int(stmt.Type),
@@ -543,7 +543,7 @@ func TestDDLExecutionOrder(t *testing.T) {
 			time.Sleep(2 * time.Millisecond)
 		}
 
-		err = tm.WriteIntent(txn, IntentTypeDDL, stmt.TableName, ddlRowKey, stmt, dataSnapshot)
+		err = tm.WriteIntent(txn, IntentTypeDDL, stmt.TableName, ddlIntentKey, stmt, dataSnapshot)
 		if err != nil {
 			_ = tm.AbortTransaction(txn)
 			t.Fatalf("Failed to create write intent for DDL statement %d: %v", i, err)

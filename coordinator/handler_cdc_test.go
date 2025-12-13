@@ -7,14 +7,14 @@ import (
 )
 
 // TestHandlerCDCPipeline_MultipleRows verifies that multiple CDC entries
-// with different row keys produce multiple statements (NOT collapsed into one)
+// with different intent keys produce multiple statements (NOT collapsed into one)
 func TestHandlerCDCPipeline_MultipleRows(t *testing.T) {
 	// Create 100 CDC entries for different rows
 	entries := make([]CDCEntry, 100)
 	for i := 0; i < 100; i++ {
 		entries[i] = CDCEntry{
 			Table:     "wp_posts",
-			RowKey:    string(rune('A' + (i % 26))), // A-Z cycling
+			IntentKey: string(rune('A' + (i % 26))), // A-Z cycling
 			OldValues: nil,
 			NewValues: map[string][]byte{
 				"id":      []byte{byte(i)},
@@ -31,10 +31,10 @@ func TestHandlerCDCPipeline_MultipleRows(t *testing.T) {
 		t.Fatalf("ProcessCDCEntries failed: %v", err)
 	}
 
-	// Verify we get statements for unique row keys (26 unique: A-Z)
+	// Verify we get statements for unique intent keys (26 unique: A-Z)
 	expectedCount := 26
 	if len(result.Statements) != expectedCount {
-		t.Errorf("Expected %d statements (unique row keys), got %d", expectedCount, len(result.Statements))
+		t.Errorf("Expected %d statements (unique intent keys), got %d", expectedCount, len(result.Statements))
 	}
 
 	// Verify all statements are INSERT type
@@ -57,8 +57,8 @@ func TestHandlerCDCPipeline_SameRowMerges(t *testing.T) {
 	// Create CDC entries: DELETE row1, INSERT row1 (UPSERT pattern)
 	entries := []CDCEntry{
 		{
-			Table:  "users",
-			RowKey: "1",
+			Table:     "users",
+			IntentKey: "1",
 			OldValues: map[string][]byte{
 				"id":   []byte("1"),
 				"name": []byte("old_name"),
@@ -67,7 +67,7 @@ func TestHandlerCDCPipeline_SameRowMerges(t *testing.T) {
 		},
 		{
 			Table:     "users",
-			RowKey:    "1",
+			IntentKey: "1",
 			OldValues: nil,
 			NewValues: map[string][]byte{
 				"id":   []byte("1"),
@@ -96,8 +96,8 @@ func TestHandlerCDCPipeline_SameRowMerges(t *testing.T) {
 	if stmt.TableName != "users" {
 		t.Errorf("TableName = %q, want %q", stmt.TableName, "users")
 	}
-	if stmt.RowKey != "1" {
-		t.Errorf("RowKey = %q, want %q", stmt.RowKey, "1")
+	if stmt.IntentKey != "1" {
+		t.Errorf("IntentKey = %q, want %q", stmt.IntentKey, "1")
 	}
 
 	// Verify OldValues from DELETE
@@ -123,15 +123,15 @@ func TestHandlerCDCPipeline_InsertDeleteCancelsOut(t *testing.T) {
 	entries := []CDCEntry{
 		{
 			Table:     "temp_table",
-			RowKey:    "99",
+			IntentKey: "99",
 			OldValues: nil,
 			NewValues: map[string][]byte{
 				"id": []byte("99"),
 			}, // INSERT
 		},
 		{
-			Table:  "temp_table",
-			RowKey: "99",
+			Table:     "temp_table",
+			IntentKey: "99",
 			OldValues: map[string][]byte{
 				"id": []byte("99"),
 			},
@@ -177,34 +177,34 @@ func TestHandlerCDCPipeline_MixedOperations(t *testing.T) {
 		// Row 1: Simple INSERT
 		{
 			Table:     "products",
-			RowKey:    "1",
+			IntentKey: "1",
 			OldValues: nil,
 			NewValues: map[string][]byte{"name": []byte("Product A")},
 		},
 		// Row 2: UPSERT (DELETE + INSERT)
 		{
 			Table:     "products",
-			RowKey:    "2",
+			IntentKey: "2",
 			OldValues: map[string][]byte{"name": []byte("Old Product B")},
 			NewValues: nil,
 		},
 		{
 			Table:     "products",
-			RowKey:    "2",
+			IntentKey: "2",
 			OldValues: nil,
 			NewValues: map[string][]byte{"name": []byte("New Product B")},
 		},
 		// Row 3: UPDATE
 		{
 			Table:     "products",
-			RowKey:    "3",
+			IntentKey: "3",
 			OldValues: map[string][]byte{"name": []byte("Product C v1")},
 			NewValues: map[string][]byte{"name": []byte("Product C v2")},
 		},
 		// Row 4: DELETE
 		{
 			Table:     "products",
-			RowKey:    "4",
+			IntentKey: "4",
 			OldValues: map[string][]byte{"name": []byte("Product D")},
 			NewValues: nil,
 		},

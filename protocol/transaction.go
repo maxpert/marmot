@@ -143,9 +143,9 @@ type Statement struct {
 	SQL       string        `msgpack:"SQL"`
 	Type      StatementType `msgpack:"Type"`
 	TableName string        `msgpack:"TableName"`
-	Database  string        `msgpack:"Database"` // Target database name
-	RowKey    string        `msgpack:"RowKey"`   // Primary key value for MVCC conflict detection
-	Error     string        `msgpack:"Error"`    // Error message if Type is StatementUnsupported
+	Database  string        `msgpack:"Database"`  // Target database name
+	IntentKey string        `msgpack:"IntentKey"` // Intent key for MVCC conflict detection
+	Error     string        `msgpack:"Error"`     // Error message if Type is StatementUnsupported
 
 	// CDC: Row-level change data (for DML operations)
 	// Populated by preupdate hooks after local execution, sent to replicas instead of SQL

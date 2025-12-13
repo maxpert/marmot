@@ -111,7 +111,7 @@ func TestLocalReplicator_PrepareWithCDC(t *testing.T) {
 				Type:      protocol.StatementInsert,
 				Database:  "testdb",
 				TableName: "users",
-				RowKey:    "users:1",
+				IntentKey: "users:1",
 				SQL:       "INSERT INTO users (id, name) VALUES (1, 'test')",
 				NewValues: map[string][]byte{
 					"id":   []byte("1"),
@@ -148,8 +148,8 @@ func TestLocalReplicator_PrepareWithCDC(t *testing.T) {
 	if entries[0].Table != "users" {
 		t.Errorf("Expected table 'users', got '%s'", entries[0].Table)
 	}
-	if entries[0].RowKey != "users:1" {
-		t.Errorf("Expected row key 'users:1', got '%s'", entries[0].RowKey)
+	if entries[0].IntentKey != "users:1" {
+		t.Errorf("Expected intent key 'users:1', got '%s'", entries[0].IntentKey)
 	}
 }
 
@@ -235,7 +235,7 @@ func TestLocalReplicator_AbortCleanup(t *testing.T) {
 				Type:      protocol.StatementInsert,
 				Database:  "abortdb",
 				TableName: "items",
-				RowKey:    "items:1",
+				IntentKey: "items:1",
 				SQL:       "INSERT INTO items (id, val) VALUES (1, 'test')",
 				NewValues: map[string][]byte{
 					"id":  []byte("1"),
@@ -320,7 +320,7 @@ func TestLocalReplicator_ConflictDetection(t *testing.T) {
 				Type:      protocol.StatementUpdate,
 				Database:  "conflictdb",
 				TableName: "data",
-				RowKey:    "data:1",
+				IntentKey: "data:1",
 				SQL:       "UPDATE data SET value = 'a' WHERE id = 1",
 				OldValues: map[string][]byte{"id": []byte("1"), "value": []byte("old")},
 				NewValues: map[string][]byte{"id": []byte("1"), "value": []byte("a")},
@@ -348,7 +348,7 @@ func TestLocalReplicator_ConflictDetection(t *testing.T) {
 				Type:      protocol.StatementUpdate,
 				Database:  "conflictdb",
 				TableName: "data",
-				RowKey:    "data:1",
+				IntentKey: "data:1",
 				SQL:       "UPDATE data SET value = 'b' WHERE id = 1",
 				OldValues: map[string][]byte{"id": []byte("1"), "value": []byte("old")},
 				NewValues: map[string][]byte{"id": []byte("1"), "value": []byte("b")},

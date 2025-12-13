@@ -21,17 +21,30 @@ type TableSchema struct {
 	AutoIncrementCol string // Column name if single INTEGER PRIMARY KEY (SQLite rowid alias)
 }
 
+// Querier is an interface for database query operations.
+// Both *sql.DB and *sql.Tx implement this interface.
+type Querier interface {
+	Query(query string, args ...interface{}) (*sql.Rows, error)
+}
+
 // SchemaProvider queries table schema information from SQLite
 // SQLite already caches this information, so we don't need our own cache
 type SchemaProvider struct {
-	db *sql.DB
-	mu sync.RWMutex
+	querier Querier
+	mu      sync.RWMutex
 }
 
-// NewSchemaProvider creates a new schema provider
+// NewSchemaProvider creates a new schema provider from *sql.DB
 func NewSchemaProvider(db *sql.DB) *SchemaProvider {
 	return &SchemaProvider{
-		db: db,
+		querier: db,
+	}
+}
+
+// NewSchemaProviderFromQuerier creates a schema provider from any Querier
+func NewSchemaProviderFromQuerier(q Querier) *SchemaProvider {
+	return &SchemaProvider{
+		querier: q,
 	}
 }
 
@@ -41,13 +54,13 @@ func (sp *SchemaProvider) GetTableSchema(tableName string) (*TableSchema, error)
 	sp.mu.RLock()
 	defer sp.mu.RUnlock()
 
-	if sp.db == nil {
+	if sp.querier == nil {
 		return nil, fmt.Errorf("database connection is nil")
 	}
 
 	// Query PRAGMA table_info to get column information
 	// This includes primary key information (pk column indicates PK order)
-	rows, err := sp.db.Query(fmt.Sprintf("PRAGMA table_info(%s)", tableName))
+	rows, err := sp.querier.Query(fmt.Sprintf("PRAGMA table_info(%s)", tableName))
 	if err != nil {
 		return nil, fmt.Errorf("failed to query table info: %w", err)
 	}
@@ -157,14 +170,14 @@ func (sp *SchemaProvider) calculateSchemaVersion(schema *TableSchema) uint64 {
 // This typically happens for INSERT statements with auto-increment PKs
 var ErrMissingPrimaryKey = fmt.Errorf("primary key columns not present in values")
 
-// GenerateRowKey generates a deterministic row key from primary key values.
+// GenerateIntentKey generates a deterministic intent key from primary key values.
 // This is used by the AST-based path where values may be JSON-encoded.
-// Delegates to filter.SerializeRowKey after extracting JSON values.
+// Delegates to filter.SerializeIntentKey after extracting JSON values.
 //
 // Returns ErrMissingPrimaryKey if any PK column is not present in values,
 // or if the PK value is "0" (MySQL auto-increment placeholder).
 // This is expected for INSERT statements with auto-increment PKs.
-func GenerateRowKey(schema *TableSchema, values map[string][]byte) (string, error) {
+func GenerateIntentKey(schema *TableSchema, values map[string][]byte) (string, error) {
 	if len(schema.PrimaryKeys) == 0 {
 		return "", fmt.Errorf("no primary keys defined for table %s", schema.TableName)
 	}
@@ -193,7 +206,7 @@ func GenerateRowKey(schema *TableSchema, values map[string][]byte) (string, erro
 		processedValues[col] = []byte(extractStringValue(val))
 	}
 
-	return filter.SerializeRowKey(schema.TableName, schema.PrimaryKeys, processedValues), nil
+	return filter.SerializeIntentKey(schema.TableName, schema.PrimaryKeys, processedValues), nil
 }
 
 // extractStringValue extracts a string from a byte slice, handling msgpack encoding
@@ -223,15 +236,15 @@ func isZeroValue(val []byte) bool {
 	return s == "0"
 }
 
-// ValidateRowKey validates that a row key matches expected schema version
-func ValidateRowKey(schema *TableSchema, rowKey string, expectedVersion uint64) error {
+// ValidateIntentKey validates that an intent key matches expected schema version
+func ValidateIntentKey(schema *TableSchema, intentKey string, expectedVersion uint64) error {
 	if schema.SchemaVersion != expectedVersion {
 		return fmt.Errorf("schema version mismatch: have %d, expected %d",
 			schema.SchemaVersion, expectedVersion)
 	}
 
-	if rowKey == "" {
-		return fmt.Errorf("empty row key")
+	if intentKey == "" {
+		return fmt.Errorf("empty intent key")
 	}
 
 	return nil

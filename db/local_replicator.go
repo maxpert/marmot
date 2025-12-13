@@ -76,8 +76,8 @@ func (lr *LocalReplicator) handlePrepare(ctx context.Context, req *coordinator.R
 			}
 
 			// Create write intent for database operation
-			// Use database name as the row key
-			rowKey := stmt.Database
+			// Use database name as the intent key
+			dbIntentKey := stmt.Database
 			dbOp := DatabaseOpCreate
 			if stmt.Type == protocol.StatementDropDatabase {
 				dbOp = DatabaseOpDrop
@@ -93,7 +93,7 @@ func (lr *LocalReplicator) handlePrepare(ctx context.Context, req *coordinator.R
 				return &coordinator.ReplicationResponse{Success: false, Error: fmt.Sprintf("failed to serialize data: %v", err)}, nil
 			}
 
-			err = txnMgr.WriteIntent(txn, IntentTypeDatabaseOp, "", rowKey, stmt, dataSnapshot)
+			err = txnMgr.WriteIntent(txn, IntentTypeDatabaseOp, "", dbIntentKey, stmt, dataSnapshot)
 			if err != nil {
 				_ = txnMgr.AbortTransaction(txn)
 				return &coordinator.ReplicationResponse{Success: false, Error: fmt.Sprintf("write conflict: %v", err)}, nil
@@ -134,9 +134,9 @@ func (lr *LocalReplicator) handlePrepare(ctx context.Context, req *coordinator.R
 			return &coordinator.ReplicationResponse{Success: false, Error: err.Error()}, nil
 		}
 
-		// Use pre-extracted row key from statement
-		rowKey := stmt.RowKey
-		if rowKey == "" {
+		// Use pre-extracted intent key from statement
+		intentKey := stmt.IntentKey
+		if intentKey == "" {
 			// For INSERT statements without explicit PK (auto-increment),
 			// skip write intent creation - no row-level conflict possible
 			if stmt.Type == protocol.StatementInsert {
@@ -146,8 +146,8 @@ func (lr *LocalReplicator) handlePrepare(ctx context.Context, req *coordinator.R
 				continue
 			}
 
-			// For UPDATE/DELETE without rowKey, skip write intent creation.
-			// RowKey MUST come from CDC hooks (preupdate) which extract actual PK values.
+			// For UPDATE/DELETE without intentKey, skip write intent creation.
+			// IntentKey MUST come from CDC hooks (preupdate) which extract actual PK values.
 			// SQL-derived fallback was catastrophically broken - it made ALL updates
 			// on the same table conflict because they share the same SQL prefix.
 			// MVCC commit will detect conflicts at row level when applying changes.
@@ -155,17 +155,17 @@ func (lr *LocalReplicator) handlePrepare(ctx context.Context, req *coordinator.R
 				log.Debug().
 					Str("table", stmt.TableName).
 					Int("stmt_type", int(stmt.Type)).
-					Msg("LOCAL REPLICATOR: Empty RowKey for UPDATE/DELETE - CDC will provide it during commit")
+					Msg("LOCAL REPLICATOR: Empty IntentKey for UPDATE/DELETE - CDC will provide it during commit")
 				continue
 			}
 
-			// For DDL statements, create write intent using table name + SQL hash as row key
+			// For DDL statements, create write intent using table name + SQL hash as intent key
 			// This ensures each DDL SQL gets stored uniquely and executed during commit phase
 			// Multiple DDL statements for same table (e.g., CREATE TABLE, CREATE INDEX) need unique keys
 			if stmt.Type == protocol.StatementDDL {
-				// Use table name + hash of SQL to create unique rowKey for each DDL statement
+				// Use table name + hash of SQL to create unique intentKey for each DDL statement
 				hash := sha256.Sum256([]byte(stmt.SQL))
-				ddlRowKey := stmt.TableName + ":" + hex.EncodeToString(hash[:8])
+				ddlIntentKey := stmt.TableName + ":" + hex.EncodeToString(hash[:8])
 
 				snapshotData := DDLSnapshot{
 					Type:      int(stmt.Type),
@@ -179,7 +179,7 @@ func (lr *LocalReplicator) handlePrepare(ctx context.Context, req *coordinator.R
 					return &coordinator.ReplicationResponse{Success: false, Error: fmt.Sprintf("failed to serialize DDL data: %v", serErr)}, nil
 				}
 
-				if err := txnMgr.WriteIntent(txn, IntentTypeDDL, stmt.TableName, ddlRowKey, stmt, dataSnapshot); err != nil {
+				if err := txnMgr.WriteIntent(txn, IntentTypeDDL, stmt.TableName, ddlIntentKey, stmt, dataSnapshot); err != nil {
 					_ = txnMgr.AbortTransaction(txn)
 					return &coordinator.ReplicationResponse{
 						Success:          false,
@@ -190,12 +190,12 @@ func (lr *LocalReplicator) handlePrepare(ctx context.Context, req *coordinator.R
 				}
 				log.Debug().
 					Str("table", stmt.TableName).
-					Str("ddl_row_key", ddlRowKey).
+					Str("ddl_intent_key", ddlIntentKey).
 					Msg("LOCAL REPLICATOR: Created write intent for DDL statement")
 				continue
 			}
 
-			// For other statement types without rowKey, skip write intent
+			// For other statement types without intentKey, skip write intent
 			continue
 		}
 
@@ -219,7 +219,7 @@ func (lr *LocalReplicator) handlePrepare(ctx context.Context, req *coordinator.R
 			return &coordinator.ReplicationResponse{Success: false, Error: fmt.Sprintf("failed to serialize data: %v", serErr)}, nil
 		}
 
-		if err := txnMgr.WriteIntent(txn, IntentTypeDML, stmt.TableName, rowKey, stmt, dataSnapshot); err != nil {
+		if err := txnMgr.WriteIntent(txn, IntentTypeDML, stmt.TableName, intentKey, stmt, dataSnapshot); err != nil {
 			_ = txnMgr.AbortTransaction(txn)
 			return &coordinator.ReplicationResponse{
 				Success:          false,
@@ -262,12 +262,12 @@ func (lr *LocalReplicator) handlePrepare(ctx context.Context, req *coordinator.R
 			// Convert statement type to operation code
 			op := uint8(StatementTypeToOpType(stmt.Type))
 
-			err := metaStore.WriteIntentEntry(req.TxnID, stmtSeq, op, stmt.TableName, rowKey, oldVals, newVals)
+			err := metaStore.WriteIntentEntry(req.TxnID, stmtSeq, op, stmt.TableName, intentKey, oldVals, newVals)
 			if err != nil {
 				log.Error().Err(err).
 					Uint64("txn_id", req.TxnID).
 					Str("table", stmt.TableName).
-					Str("row_key", rowKey).
+					Str("intent_key", intentKey).
 					Msg("Failed to write CDC intent entry")
 				_ = txnMgr.AbortTransaction(txn)
 				return &coordinator.ReplicationResponse{
@@ -307,7 +307,7 @@ func (lr *LocalReplicator) handleCommit(ctx context.Context, req *coordinator.Re
 						}
 
 						dbOp := snapshotData.Operation
-						dbName := intent.RowKey // Row key is the database name
+						dbName := intent.IntentKey // Row key is the database name
 
 						// Execute the database operation BEFORE committing the transaction
 						dbMgr, ok := lr.dbMgr.(*DatabaseManager)

@@ -228,7 +228,7 @@ func TestStreamClient_ApplyCDCDelete(t *testing.T) {
 		"email": msgpackMarshal("alice@example.com"),
 	}
 
-	err = client.applyCDCDelete(tx, "users", "", oldValues)
+	err = client.applyCDCDelete(tx, "users", oldValues)
 	if err != nil {
 		tx.Rollback()
 		t.Fatalf("applyCDCDelete failed: %v", err)
@@ -250,8 +250,8 @@ func TestStreamClient_ApplyCDCDelete(t *testing.T) {
 	}
 }
 
-// TestStreamClient_ApplyCDCDeleteByRowKey tests CDC delete by row key
-func TestStreamClient_ApplyCDCDeleteByRowKey(t *testing.T) {
+// TestStreamClient_ApplyCDCDeleteWithOldValues tests CDC delete using oldValues for PK extraction
+func TestStreamClient_ApplyCDCDeleteWithOldValues(t *testing.T) {
 	dbMgr, clock, _, cleanup := setupStreamClientTest(t)
 	defer cleanup()
 
@@ -279,16 +279,21 @@ func TestStreamClient_ApplyCDCDeleteByRowKey(t *testing.T) {
 
 	client := NewStreamClient("localhost:8080", 1, dbMgr, clock, nil)
 
-	// Test DELETE by row key
+	// Test DELETE with oldValues (correct CDC pattern)
 	tx, err := sqlDB.BeginTx(context.Background(), nil)
 	if err != nil {
 		t.Fatalf("Failed to begin transaction: %v", err)
 	}
 
-	err = client.applyCDCDelete(tx, "users", "42", nil)
+	oldValues := map[string][]byte{
+		"id":   msgpackMarshal(42),
+		"name": msgpackMarshal("Bob"),
+	}
+
+	err = client.applyCDCDelete(tx, "users", oldValues)
 	if err != nil {
 		tx.Rollback()
-		t.Fatalf("applyCDCDelete by rowKey failed: %v", err)
+		t.Fatalf("applyCDCDelete failed: %v", err)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -577,10 +582,10 @@ func TestApplyCDCDelete_NoKeyOrValues(t *testing.T) {
 	tx, _ := sqlDB.BeginTx(context.Background(), nil)
 	defer tx.Rollback()
 
-	// No row key or old values should return error
-	err = client.applyCDCDelete(tx, "users", "", nil)
+	// No old values should return error
+	err = client.applyCDCDelete(tx, "users", nil)
 	if err == nil {
-		t.Error("Expected error for delete with no key or values")
+		t.Error("Expected error for delete with no old values")
 	}
 }
 

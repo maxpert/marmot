@@ -147,6 +147,96 @@ For UPDATE and DELETE operations, Marmot automatically extracts row keys:
 - Falls back to ROWID for tables without explicit primary key
 - Handles composite primary keys correctly
 
+## CDC Publisher
+
+Marmot can publish CDC events to external messaging systems, enabling real-time data pipelines, analytics, and event-driven architectures. Events follow the **[Debezium](https://debezium.io/) specification** for maximum compatibility with existing CDC tooling.
+
+### Features
+
+- **Debezium-Compatible Format**: Events conform to the [Debezium event structure](https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-events), compatible with Kafka Connect, Flink, Spark, and other CDC consumers
+- **Multi-Sink Support**: Publish to multiple destinations simultaneously (Kafka, NATS)
+- **Glob-Based Filtering**: Filter which tables and databases to publish
+- **Automatic Retry**: Exponential backoff with configurable limits
+- **Persistent Cursors**: Survives restarts without losing position
+
+### Configuration
+
+```toml
+[publisher]
+enabled = true
+
+[[publisher.sinks]]
+name = "kafka-main"
+type = "kafka"                    # "kafka" or "nats"
+format = "debezium"               # Debezium-compatible JSON format
+brokers = ["localhost:9092"]      # Kafka broker addresses
+topic_prefix = "marmot.cdc"       # Topics: {prefix}.{database}.{table}
+filter_tables = ["*"]             # Glob patterns (e.g., "users", "order_*")
+filter_databases = ["*"]          # Glob patterns (e.g., "prod_*")
+batch_size = 100                  # Events per poll cycle
+poll_interval_ms = 10             # Polling interval
+
+# NATS sink example
+[[publisher.sinks]]
+name = "nats-events"
+type = "nats"
+format = "debezium"
+nats_url = "nats://localhost:4222"
+topic_prefix = "marmot.cdc"
+filter_tables = ["*"]
+filter_databases = ["*"]
+```
+
+### Event Format
+
+Events follow the [Debezium envelope structure](https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-change-events-value):
+
+```json
+{
+  "schema": { ... },
+  "payload": {
+    "before": null,
+    "after": {"id": 1, "name": "alice", "email": "alice@example.com"},
+    "source": {
+      "version": "2.0.0",
+      "connector": "marmot",
+      "name": "marmot",
+      "ts_ms": 1702500000000,
+      "db": "myapp",
+      "table": "users"
+    },
+    "op": "c",
+    "ts_ms": 1702500000000
+  }
+}
+```
+
+**Operation Types** (per [Debezium spec](https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-create-events)):
+| Operation | `op` | `before` | `after` |
+|-----------|------|----------|---------|
+| INSERT | `c` (create) | `null` | row data |
+| UPDATE | `u` (update) | old row | new row |
+| DELETE | `d` (delete) | old row | `null` |
+
+### Topic Naming
+
+Topics follow the pattern: `{topic_prefix}.{database}.{table}`
+
+Examples:
+- `marmot.cdc.myapp.users`
+- `marmot.cdc.myapp.orders`
+- `marmot.cdc.analytics.events`
+
+### Use Cases
+
+- **Real-Time Analytics**: Stream changes to data warehouses (Snowflake, BigQuery, ClickHouse)
+- **Event-Driven Microservices**: Trigger actions on data changes
+- **Cache Invalidation**: Keep caches in sync with database changes
+- **Audit Logging**: Capture all changes for compliance
+- **Search Indexing**: Keep Elasticsearch/Algolia in sync
+
+For more details, see the [Integrations documentation](https://maxpert.github.io/marmot/integrations).
+
 ## SQL Statement Compatibility
 
 Marmot supports a wide range of MySQL/SQLite statements through its MySQL protocol server. The following table shows compatibility for different statement types:
@@ -551,6 +641,29 @@ bind_address = "0.0.0.0"
 port = 3306
 max_connections = 1000
 ```
+
+### CDC Publisher
+
+```toml
+[publisher]
+enabled = false  # Enable CDC publishing to external systems
+
+[[publisher.sinks]]
+name = "kafka-main"              # Unique sink name
+type = "kafka"                   # "kafka" or "nats"
+format = "debezium"              # Debezium-compatible JSON (only option)
+brokers = ["localhost:9092"]     # Kafka broker addresses
+topic_prefix = "marmot.cdc"      # Topic pattern: {prefix}.{db}.{table}
+filter_tables = ["*"]            # Glob patterns for table filtering
+filter_databases = ["*"]         # Glob patterns for database filtering
+batch_size = 100                 # Events to read per poll cycle
+poll_interval_ms = 10            # Polling interval (default: 10ms)
+retry_initial_ms = 100           # Initial retry delay on failure
+retry_max_ms = 30000             # Max retry delay (30 seconds)
+retry_multiplier = 2.0           # Exponential backoff multiplier
+```
+
+See the [Integrations documentation](https://maxpert.github.io/marmot/integrations) for details on event format, Kafka/NATS configuration, and use cases.
 
 ### Logging
 

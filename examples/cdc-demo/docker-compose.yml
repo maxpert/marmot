@@ -1,0 +1,42 @@
+services:
+  nats:
+    image: nats:latest
+    container_name: cdc-nats
+    command: ["-js"]
+    ports:
+      - "4222:4222"
+    healthcheck:
+      test: ["CMD", "nats-server", "--help"]
+      interval: 2s
+      timeout: 2s
+      retries: 3
+
+  marmot:
+    build:
+      context: ../..
+      dockerfile: examples/cdc-demo/Dockerfile
+    container_name: cdc-marmot
+    depends_on:
+      nats:
+        condition: service_healthy
+    ports:
+      - "3306:3306"
+    volumes:
+      - marmot-data:/data
+      - ./config.toml:/app/config.toml:ro
+
+  app:
+    build: ./app
+    container_name: cdc-app
+    depends_on:
+      - marmot
+      - nats
+    ports:
+      - "3000:3000"
+    environment:
+      - MYSQL_HOST=marmot
+      - MYSQL_PORT=3306
+      - NATS_URL=nats://nats:4222
+
+volumes:
+  marmot-data:

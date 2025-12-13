@@ -1,0 +1,21 @@
+node_id = 1
+seq_map_path = "/data"
+db_path = "/data/app.db"
+
+[mysql]
+enabled = true
+bind = "0.0.0.0:3306"
+
+[publisher]
+enabled = true
+
+[[publisher.sinks]]
+name = "nats-cdc"
+type = "nats"
+format = "debezium"
+nats_url = "nats://nats:4222"
+topic_prefix = "cdc"
+filter_tables = ["*"]
+filter_databases = ["*"]
+batch_size = 1
+poll_interval_ms = 50

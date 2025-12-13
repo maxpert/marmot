@@ -336,7 +336,7 @@ func (s *EphemeralHookSession) hookCallback(data sqlite3.SQLitePreUpdateData) {
 
 	var operation uint8
 	var oldValues, newValues map[string][]byte
-	var rowKey string
+	var intentKey string
 
 	// Determine operation type and capture values
 	switch data.Op {
@@ -346,7 +346,7 @@ func (s *EphemeralHookSession) hookCallback(data sqlite3.SQLitePreUpdateData) {
 			newValues = s.buildValueMap(schema.columns, newDest)
 		}
 		pkValues := s.extractPKValuesFromDest(schema, newDest, data.NewRowID)
-		rowKey = s.serializePK(data.TableName, schema, pkValues)
+		intentKey = s.serializePK(data.TableName, schema, pkValues)
 
 	case sqlite3.SQLITE_UPDATE:
 		operation = uint8(OpTypeUpdate)
@@ -361,15 +361,15 @@ func (s *EphemeralHookSession) hookCallback(data sqlite3.SQLitePreUpdateData) {
 		newPK := s.extractPKValuesFromDest(schema, newDest, data.NewRowID)
 		oldKey := s.serializePK(data.TableName, schema, oldPK)
 		newKey := s.serializePK(data.TableName, schema, newPK)
-		rowKey = newKey
+		intentKey = newKey
 
 		// Ensure collector exists for this table
 		if _, ok := s.collectors[data.TableName]; !ok {
 			s.collectors[data.TableName] = filter.NewKeyHashCollector()
 		}
-		s.collectors[data.TableName].AddRowKey(oldKey)
+		s.collectors[data.TableName].AddIntentKey(oldKey)
 		if oldKey != newKey {
-			s.collectors[data.TableName].AddRowKey(newKey)
+			s.collectors[data.TableName].AddIntentKey(newKey)
 		}
 
 	case sqlite3.SQLITE_DELETE:
@@ -378,7 +378,7 @@ func (s *EphemeralHookSession) hookCallback(data sqlite3.SQLitePreUpdateData) {
 			oldValues = s.buildValueMap(schema.columns, oldDest)
 		}
 		pkValues := s.extractPKValuesFromDest(schema, oldDest, data.OldRowID)
-		rowKey = s.serializePK(data.TableName, schema, pkValues)
+		intentKey = s.serializePK(data.TableName, schema, pkValues)
 
 	default:
 		return
@@ -389,7 +389,7 @@ func (s *EphemeralHookSession) hookCallback(data sqlite3.SQLitePreUpdateData) {
 		if _, ok := s.collectors[data.TableName]; !ok {
 			s.collectors[data.TableName] = filter.NewKeyHashCollector()
 		}
-		s.collectors[data.TableName].AddRowKey(rowKey)
+		s.collectors[data.TableName].AddIntentKey(intentKey)
 	}
 
 	// CDC conflict detection: check for DDL lock and acquire row lock
@@ -399,7 +399,7 @@ func (s *EphemeralHookSession) hookCallback(data sqlite3.SQLitePreUpdateData) {
 	}
 
 	// Acquire row lock
-	if err := s.metaStore.AcquireCDCRowLock(s.txnID, data.TableName, rowKey); err != nil {
+	if err := s.metaStore.AcquireCDCRowLock(s.txnID, data.TableName, intentKey); err != nil {
 		s.conflictError = err
 		return
 	}
@@ -417,7 +417,7 @@ func (s *EphemeralHookSession) hookCallback(data sqlite3.SQLitePreUpdateData) {
 	s.seq++
 
 	// Write to MetaStore (separate database file, so this is safe during hook)
-	s.metaStore.WriteIntentEntry(s.txnID, s.seq, operation, data.TableName, rowKey, oldMsgpack, newMsgpack)
+	s.metaStore.WriteIntentEntry(s.txnID, s.seq, operation, data.TableName, intentKey, oldMsgpack, newMsgpack)
 }
 
 // buildValueMap converts column values to a map
@@ -463,7 +463,7 @@ func (s *EphemeralHookSession) serializeValue(v interface{}) []byte {
 }
 
 // extractPKValuesFromDest extracts primary key values from a destination slice.
-// PK values are converted to string representation for row key generation,
+// PK values are converted to string representation for intent key generation,
 // ensuring compatibility with AST-based path which uses string values.
 func (s *EphemeralHookSession) extractPKValuesFromDest(schema *tableSchema, dest []interface{}, rowID int64) map[string][]byte {
 	pkValues := make(map[string][]byte)
@@ -479,7 +479,7 @@ func (s *EphemeralHookSession) extractPKValuesFromDest(schema *tableSchema, dest
 				val = *ptr
 			}
 			if val != nil {
-				// Convert to string representation for row key compatibility
+				// Convert to string representation for intent key compatibility
 				// This ensures hook and AST paths produce identical keys
 				pkValues[colName] = pkValueToBytes(val)
 			}
@@ -490,7 +490,7 @@ func (s *EphemeralHookSession) extractPKValuesFromDest(schema *tableSchema, dest
 }
 
 // pkValueToBytes converts a primary key value to its string byte representation.
-// Used for row key generation where values must match AST-based path format.
+// Used for intent key generation where values must match AST-based path format.
 func pkValueToBytes(v interface{}) []byte {
 	switch val := v.(type) {
 	case int64:
@@ -512,7 +512,7 @@ func pkValueToBytes(v interface{}) []byte {
 
 // serializePK creates a deterministic string key from PK values
 func (s *EphemeralHookSession) serializePK(table string, schema *tableSchema, pkValues map[string][]byte) string {
-	return filter.SerializeRowKey(table, schema.pkColumns, pkValues)
+	return filter.SerializeIntentKey(table, schema.pkColumns, pkValues)
 }
 
 // GetRowCounts returns the number of affected rows per table
@@ -527,7 +527,7 @@ func (s *EphemeralHookSession) GetRowCounts() map[string]int64 {
 	return counts
 }
 
-// GetKeyHashes returns XXH64 hashes of affected row keys per table.
+// GetKeyHashes returns XXH64 hashes of affected intent keys per table.
 // Returns nil for tables exceeding maxRows.
 func (s *EphemeralHookSession) GetKeyHashes(maxRows int) map[string][]uint64 {
 	s.mu.Lock()
@@ -552,7 +552,7 @@ type IntentEntry struct {
 	Seq       uint64
 	Operation uint8
 	Table     string
-	RowKey    string
+	IntentKey string
 	OldValues map[string][]byte
 	NewValues map[string][]byte
 	CreatedAt int64

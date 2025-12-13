@@ -44,7 +44,7 @@ func RegisterRoutes(mux *http.ServeMux, handlers *AdminHandlers) {
 		r.Get("/intents/table/{table}", handlers.intentsByTable)
 		r.Get("/intents/txn/{txnID}", handlers.intentsByTxn)
 		r.Get("/intents/range", handlers.wrapWithMeta(handlers.handleIntentRange))
-		r.Get("/intents/{table}/{rowKey}", handlers.intentByKey)
+		r.Get("/intents/{table}/{intentKey}", handlers.intentByKey)
 
 		// CDC
 		r.Get("/cdc/entries/{txnID}", handlers.cdcEntries)
@@ -151,8 +151,8 @@ func (h *AdminHandlers) intentByKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	table := chi.URLParam(r, "table")
-	rowKey := chi.URLParam(r, "rowKey")
-	h.handleIntent(w, r, metaStore, table, rowKey)
+	intentKey := chi.URLParam(r, "intentKey")
+	h.handleIntent(w, r, metaStore, table, intentKey)
 }
 
 // CDC handlers

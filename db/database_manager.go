@@ -15,6 +15,7 @@ import (
 	"github.com/maxpert/marmot/cfg"
 	"github.com/maxpert/marmot/coordinator"
 	"github.com/maxpert/marmot/hlc"
+	"github.com/maxpert/marmot/publisher"
 	"github.com/rs/zerolog/log"
 )
 
@@ -1129,6 +1130,45 @@ func (dm *DatabaseManager) GetMaxTxnID(database string) (uint64, error) {
 	}
 
 	return metaStore.GetMaxCommittedTxnID()
+}
+
+// GetTableSchema returns the schema for a table in a database
+// Used by CDC Publisher to transform events to Debezium format
+func (dm *DatabaseManager) GetTableSchema(database, table string) (publisher.TableSchema, error) {
+	db, err := dm.GetDatabase(database)
+	if err != nil {
+		return publisher.TableSchema{}, err
+	}
+
+	// Query PRAGMA table_info
+	rows, err := db.GetDB().Query(fmt.Sprintf("PRAGMA table_info(%s)", table))
+	if err != nil {
+		return publisher.TableSchema{}, fmt.Errorf("failed to query table info: %w", err)
+	}
+	defer rows.Close()
+
+	var schema publisher.TableSchema
+	for rows.Next() {
+		var cid int
+		var name, colType string
+		var notNull, pk int
+		var dfltValue any
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &dfltValue, &pk); err != nil {
+			return publisher.TableSchema{}, fmt.Errorf("failed to scan column info: %w", err)
+		}
+		schema.Columns = append(schema.Columns, publisher.ColumnInfo{
+			Name:     name,
+			Type:     colType,
+			Nullable: notNull == 0,
+			IsPK:     pk > 0,
+		})
+	}
+
+	if err := rows.Err(); err != nil {
+		return publisher.TableSchema{}, fmt.Errorf("error iterating column info: %w", err)
+	}
+
+	return schema, nil
 }
 
 // GetCommittedTxnCount returns the count of committed transactions in a database

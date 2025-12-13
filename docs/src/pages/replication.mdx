@@ -131,7 +131,7 @@ gRPC ReplicateTransaction (parallel to both):
     Seq: 1,
     Operation: UPDATE,
     Table: "users",
-    RowKey: "users:1",
+    IntentKey: "users:1",
     OldValues: {"id": [0x01], "email": [...], "name": [...], "balance": [0x64]},  // 100
     NewValues: {"id": [0x01], "email": [...], "name": [...], "balance": [0x4B]}   // 75
   }]
@@ -239,7 +239,7 @@ Execute on dedicated hookDB connection
   ↓
 Preupdate hook fires BEFORE each row modification
   ↓
-Extract: table, rowKey, oldValues, newValues
+Extract: table, intentKey, oldValues, newValues
   ↓
 Serialize to msgpack (type-preserving)
   ↓
@@ -256,13 +256,13 @@ type IntentEntry struct {
     Seq       uint64              // Sequence within transaction
     Operation uint8               // INSERT=0, REPLACE=1, UPDATE=2, DELETE=3
     Table     string              // Table name
-    RowKey    string              // Serialized primary key
+    IntentKey string              // Serialized primary key
     OldValues map[string][]byte   // Before image (msgpack per column)
     NewValues map[string][]byte   // After image (msgpack per column)
 }
 ```
 
-### Row Key Format
+### Intent Key Format
 
 **Single PK**: `"table:value"` or `"table:b64:base64_value"`
 
@@ -293,7 +293,7 @@ Value (IntentEntry):
   Seq:       1,
   Operation: 2,                    // UPDATE
   Table:     "users",
-  RowKey:    "users:1",            // Single PK format
+  IntentKey: "users:1",            // Single PK format
   OldValues: {
     "id":      0x91 0x01,          // msgpack fixint: 1
     "email":   0xB1 "alice@example.com",  // msgpack fixstr
@@ -330,7 +330,7 @@ CDC Entry:
 {
   Operation: 0,                    // INSERT
   Table:     "users",
-  RowKey:    "users:3",
+  IntentKey: "users:3",
   OldValues: {},                   // Empty for INSERT
   NewValues: {
     "id": 3, "email": "carol@example.com", "name": "Carol", "balance": 200
@@ -348,7 +348,7 @@ CDC Entry:
 {
   Operation: 3,                    // DELETE
   Table:     "users",
-  RowKey:    "users:2",
+  IntentKey: "users:2",
   OldValues: {
     "id": 2, "email": "bob@example.com", "name": "Bob", "balance": 50
   },
@@ -372,10 +372,10 @@ UPDATE order_items SET quantity = 5 WHERE order_id = 100 AND item_id = 42;
 ```
 
 ```
-RowKey Format: "order_items:c:MTAw:NDI="
-               ^table       ^composite marker
-                             ^base64(order_id=100):base64(item_id=42)
-               (columns sorted alphabetically: item_id, order_id)
+IntentKey Format: "order_items:c:MTAw:NDI="
+                  ^table       ^composite marker
+                                ^base64(order_id=100):base64(item_id=42)
+                  (columns sorted alphabetically: item_id, order_id)
 ```
 
 ---
@@ -387,13 +387,13 @@ RowKey Format: "order_items:c:MTAw:NDI="
 Write intents are **distributed locks** stored in MetaStore:
 
 ```
-Key:   /intent/{tableName}/{rowKey}
+Key:   /intent/{tableName}/{intentKey}
 Value: WriteIntentRecord {
     TxnID, NodeID, StartTS, IntentType,
     Statement, DataSnapshot, MarkedForCleanup
 }
 
-Index: /intent_txn/{txnID}/{tableName}/{rowKey}  // For cleanup
+Index: /intent_txn/{txnID}/{tableName}/{intentKey}  // For cleanup
 ```
 
 ### Cuckoo Filter Fast Path
@@ -411,9 +411,9 @@ A **Cuckoo filter** provides O(1) conflict detection:
 **Conflict check flow**:
 
 ```
-WriteIntent(table, rowKey)
+WriteIntent(table, intentKey)
   ↓
-hash = XXH64(table + ":" + rowKey)
+hash = XXH64(table + ":" + intentKey)
   ↓
 filter.Check(hash)
   │
@@ -434,8 +434,8 @@ filter.Check(hash)
 256 sharded mutexes prevent TOCTOU races:
 
 ```go
-func intentLockFor(table, rowKey string) *sync.Mutex {
-    return &intentLocks[xxhash.Sum64String(table+":"+rowKey) % 256]
+func intentLockFor(table, intentKey string) *sync.Mutex {
+    return &intentLocks[xxhash.Sum64String(table+":"+intentKey) % 256]
 }
 ```
 
@@ -558,8 +558,8 @@ data_dir/
 | `/txn/{txnID}` | Transaction records (status, timestamps, statements) |
 | `/txn_idx/pend/{txnID}` | Pending transaction index |
 | `/txn_idx/seq/{seqNum}/{txnID}` | Sequence-ordered index (gap detection) |
-| `/intent/{table}/{rowKey}` | Write intents |
-| `/intent_txn/{txnID}/{table}/{rowKey}` | Intent index by transaction |
+| `/intent/{table}/{intentKey}` | Write intents |
+| `/intent_txn/{txnID}/{table}/{intentKey}` | Intent index by transaction |
 | `/cdc/{txnID}/{seq}` | CDC intent entries |
 | `/repl/{peerID}/{dbName}` | Replication state per peer |
 | `/schema/{dbName}` | Schema version counter |
@@ -1375,7 +1375,7 @@ This section traces our `UPDATE users SET balance = 75 WHERE id = 1` through the
 │    ↓                                                                        │
 │  CDC Entry created:                                                         │
 │    Key: /cdc/0x0001A2B3C4D50001/1                                           │
-│    Value: {Op: UPDATE, Table: "users", RowKey: "users:1",                   │
+│    Value: {Op: UPDATE, Table: "users", IntentKey: "users:1",                │
 │            OldValues: {balance: 100}, NewValues: {balance: 75}}             │
 │                                                                              │
 │  T2: WRITE INTENT CREATION                                                   │
@@ -1521,3 +1521,10 @@ dead_timeout_ms = 10000
 | `grpc/delta_sync.go` | Incremental catch-up |
 | `grpc/gossip.go` | SWIM protocol, membership |
 | `hlc/clock.go` | Hybrid Logical Clock |
+| `publisher/` | CDC publishing system |
+
+---
+
+## Next Steps
+
+- [Integrations](/integrations) - CDC publishing to Kafka, NATS, and external systems

@@ -148,7 +148,7 @@ func TestIntentFilter_RemoveNonExistent(t *testing.T) {
 func TestIntentFilter_CrossTableCollision(t *testing.T) {
 	f := NewIntentFilter()
 
-	// Different tables, same row key should NOT collide
+	// Different tables, same intent key should NOT collide
 	h1 := ComputeIntentHash("users", "1")
 	h2 := ComputeIntentHash("orders", "1")
 

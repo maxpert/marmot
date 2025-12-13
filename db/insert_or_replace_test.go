@@ -72,7 +72,7 @@ func TestInsertOrReplaceWithHooks(t *testing.T) {
 	entries1 := pending1.GetCDCEntries()
 	t.Logf("INSERT captured %d CDC entries", len(entries1))
 	for _, e := range entries1 {
-		t.Logf("  Entry: rowKey=%s oldVals=%d newVals=%d", e.RowKey, len(e.OldValues), len(e.NewValues))
+		t.Logf("  Entry: intentKey=%s oldVals=%d newVals=%d", e.IntentKey, len(e.OldValues), len(e.NewValues))
 	}
 
 	if err := pending1.Commit(); err != nil {
@@ -105,7 +105,7 @@ func TestInsertOrReplaceWithHooks(t *testing.T) {
 	entries2 := pending2.GetCDCEntries()
 	t.Logf("INSERT OR REPLACE captured %d CDC entries", len(entries2))
 	for _, e := range entries2 {
-		t.Logf("  Entry: rowKey=%s oldVals=%d newVals=%d", e.RowKey, len(e.OldValues), len(e.NewValues))
+		t.Logf("  Entry: intentKey=%s oldVals=%d newVals=%d", e.IntentKey, len(e.OldValues), len(e.NewValues))
 	}
 
 	if err := pending2.Commit(); err != nil {
@@ -183,7 +183,7 @@ func TestInsertOrReplaceNewRow(t *testing.T) {
 	entries := pending.GetCDCEntries()
 	t.Logf("Captured %d CDC entries", len(entries))
 	for _, e := range entries {
-		t.Logf("  Entry: rowKey=%s oldVals=%d newVals=%d", e.RowKey, len(e.OldValues), len(e.NewValues))
+		t.Logf("  Entry: intentKey=%s oldVals=%d newVals=%d", e.IntentKey, len(e.OldValues), len(e.NewValues))
 	}
 
 	if err := pending.Commit(); err != nil {

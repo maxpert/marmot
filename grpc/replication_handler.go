@@ -117,7 +117,7 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 			}
 
 			// Create write intent for database operation
-			rowKey := stmt.Database
+			intentKey := stmt.Database
 			dbOp := db.DatabaseOpCreate
 			if stmtType == protocol.StatementDropDatabase {
 				dbOp = db.DatabaseOpDrop
@@ -138,7 +138,7 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 				}, nil
 			}
 
-			err = txnMgr.WriteIntent(txn, db.IntentTypeDatabaseOp, "", rowKey, internalStmt, dataSnapshot)
+			err = txnMgr.WriteIntent(txn, db.IntentTypeDatabaseOp, "", intentKey, internalStmt, dataSnapshot)
 			if err != nil {
 				txnMgr.AbortTransaction(txn)
 				return &TransactionResponse{
@@ -215,7 +215,7 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 			Type:      convertStatementType(stmt.Type),
 			TableName: stmt.TableName,
 			Database:  stmt.Database,
-			RowKey:    stmt.GetRowKey(),
+			IntentKey: stmt.GetIntentKey(),
 		}
 
 		// If CDC data is present, populate it
@@ -233,12 +233,12 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 			}, nil
 		}
 
-		// Use pre-extracted row key from protobuf message
-		// The row key was extracted by the coordinator's CDC hooks during local execution
-		rowKey := stmt.GetRowKey()
+		// Use pre-extracted intent key from protobuf message
+		// The intent key was extracted by the coordinator's CDC hooks during local execution
+		intentKey := stmt.GetIntentKey()
 		skipWriteIntent := false
 
-		if rowKey == "" {
+		if intentKey == "" {
 			// For INSERT statements without explicit PK (auto-increment),
 			// skip write intent creation - no row-level conflict possible
 			if internalStmt.Type == protocol.StatementInsert {
@@ -247,8 +247,8 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 					Msg("GRPC: INSERT with auto-increment PK - skipping write intent")
 				skipWriteIntent = true
 			} else if internalStmt.Type == protocol.StatementUpdate || internalStmt.Type == protocol.StatementDelete {
-				// For UPDATE/DELETE without rowKey, skip write intent creation.
-				// RowKey MUST come from CDC hooks (preupdate) which extract actual PK values.
+				// For UPDATE/DELETE without intentKey, skip write intent creation.
+				// IntentKey MUST come from CDC hooks (preupdate) which extract actual PK values.
 				// SQL-derived fallback was catastrophically broken - it made ALL updates
 				// on the same table conflict because they share the same SQL prefix.
 				// MVCC commit will detect conflicts at row level when applying changes.
@@ -256,15 +256,15 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 				log.Debug().
 					Str("table", stmt.TableName).
 					Str("stmt_type", stmt.Type.String()).
-					Msg("GRPC: Empty RowKey for UPDATE/DELETE - skipping write intent but storing CDC")
+					Msg("GRPC: Empty IntentKey for UPDATE/DELETE - skipping write intent but storing CDC")
 				skipWriteIntent = true
 			} else if internalStmt.Type == protocol.StatementDDL {
-				// For DDL statements, create write intent using table name + SQL hash as row key
+				// For DDL statements, create write intent using table name + SQL hash as intent key
 				// This ensures each DDL SQL gets stored uniquely and executed during commit phase
 				// Multiple DDL statements for same table (e.g., CREATE TABLE, CREATE INDEX) need unique keys
-				// Use table name + hash of SQL to create unique rowKey for each DDL statement
+				// Use table name + hash of SQL to create unique intentKey for each DDL statement
 				hash := sha256.Sum256([]byte(stmt.GetSQL()))
-				ddlRowKey := stmt.TableName + ":" + hex.EncodeToString(hash[:8])
+				ddlIntentKey := stmt.TableName + ":" + hex.EncodeToString(hash[:8])
 
 				snapshotData := db.DDLSnapshot{
 					Type:      int(internalStmt.Type),
@@ -282,7 +282,7 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 					}, nil
 				}
 
-				err := txnMgr.WriteIntent(txn, db.IntentTypeDDL, stmt.TableName, ddlRowKey, internalStmt, dataSnapshot)
+				err := txnMgr.WriteIntent(txn, db.IntentTypeDDL, stmt.TableName, ddlIntentKey, internalStmt, dataSnapshot)
 				if err != nil {
 					txnMgr.AbortTransaction(txn)
 					return &TransactionResponse{
@@ -294,11 +294,11 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 				}
 				log.Debug().
 					Str("table", stmt.TableName).
-					Str("ddl_row_key", ddlRowKey).
+					Str("ddl_intent_key", ddlIntentKey).
 					Msg("GRPC: Created write intent for DDL statement")
 				continue
 			} else {
-				// For other statement types without rowKey, skip entirely
+				// For other statement types without intentKey, skip entirely
 				continue
 			}
 		}
@@ -326,7 +326,7 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 				}, nil
 			}
 
-			err := txnMgr.WriteIntent(txn, db.IntentTypeDML, stmt.TableName, rowKey, internalStmt, dataSnapshot)
+			err := txnMgr.WriteIntent(txn, db.IntentTypeDML, stmt.TableName, intentKey, internalStmt, dataSnapshot)
 			if err != nil {
 				// Write-write conflict detected!
 				txnMgr.AbortTransaction(txn)
@@ -341,7 +341,7 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 
 		// CRITICAL: Write CDC intent entry so CommitTransaction can replay it
 		// This stores the actual row data (NewValues/OldValues) for later application to SQLite
-		// This MUST happen even if write intent was skipped (for UPDATE/DELETE without rowKey)
+		// This MUST happen even if write intent was skipped (for UPDATE/DELETE without intentKey)
 		if stmt.HasCDCData() {
 			rowChange := stmt.GetRowChange()
 
@@ -375,13 +375,13 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 			// Convert statement type to operation code
 			op := uint8(db.StatementTypeToOpType(internalStmt.Type))
 
-			// Use rowKey if available, otherwise use empty string (CDC will still work)
-			err := metaStore.WriteIntentEntry(req.TxnId, stmtSeq, op, stmt.TableName, rowKey, oldVals, newVals)
+			// Use intentKey if available, otherwise use empty string (CDC will still work)
+			err := metaStore.WriteIntentEntry(req.TxnId, stmtSeq, op, stmt.TableName, intentKey, oldVals, newVals)
 			if err != nil {
 				log.Error().Err(err).
 					Uint64("txn_id", req.TxnId).
 					Str("table", stmt.TableName).
-					Str("row_key", rowKey).
+					Str("intent_key", intentKey).
 					Msg("Failed to write CDC intent entry")
 				txnMgr.AbortTransaction(txn)
 				return &TransactionResponse{
@@ -438,7 +438,7 @@ func (rh *ReplicationHandler) handleCommit(ctx context.Context, req *Transaction
 						}
 
 						dbOp := snapshotData.Operation
-						dbName := intent.RowKey // Row key is the database name
+						dbName := intent.IntentKey // Intent key is the database name
 
 						// Execute the database operation BEFORE committing the transaction
 						var dbOpErr error
@@ -675,7 +675,7 @@ func (rh *ReplicationHandler) handleReplay(ctx context.Context, req *Transaction
 		// Check for CDC data (RowChange payload)
 		if rowChange := stmt.GetRowChange(); rowChange != nil && (len(rowChange.NewValues) > 0 || len(rowChange.OldValues) > 0) {
 			// CDC path: apply row data directly
-			if err := rh.applyReplayCDCStatement(tx, stmt); err != nil {
+			if err := rh.applyReplayCDCStatement(tx, dbName, stmt); err != nil {
 				return &TransactionResponse{
 					Success:      false,
 					ErrorMessage: fmt.Sprintf("failed to apply CDC statement: %v", err),
@@ -752,7 +752,7 @@ func (rh *ReplicationHandler) handleReplay(ctx context.Context, req *Transaction
 }
 
 // applyReplayCDCStatement applies a CDC statement during replay
-func (rh *ReplicationHandler) applyReplayCDCStatement(tx *sql.Tx, stmt *Statement) error {
+func (rh *ReplicationHandler) applyReplayCDCStatement(tx *sql.Tx, dbName string, stmt *Statement) error {
 	rowChange := stmt.GetRowChange()
 	if rowChange == nil {
 		return fmt.Errorf("no row change data")
@@ -764,7 +764,7 @@ func (rh *ReplicationHandler) applyReplayCDCStatement(tx *sql.Tx, stmt *Statemen
 	case StatementType_UPDATE:
 		return rh.applyReplayCDCUpdate(tx, stmt.TableName, rowChange.NewValues)
 	case StatementType_DELETE:
-		return rh.applyReplayCDCDelete(tx, stmt.TableName, rowChange.RowKey, rowChange.OldValues)
+		return rh.applyReplayCDCDelete(tx, dbName, stmt.TableName, rowChange.OldValues)
 	default:
 		return fmt.Errorf("unsupported statement type for CDC replay: %v", stmt.Type)
 	}
@@ -807,35 +807,49 @@ func (rh *ReplicationHandler) applyReplayCDCUpdate(tx *sql.Tx, tableName string,
 }
 
 // applyReplayCDCDelete performs DELETE using CDC row data
-func (rh *ReplicationHandler) applyReplayCDCDelete(tx *sql.Tx, tableName string, rowKey string, oldValues map[string][]byte) error {
-	if rowKey == "" && len(oldValues) == 0 {
-		return fmt.Errorf("no row key or old values for delete")
+func (rh *ReplicationHandler) applyReplayCDCDelete(tx *sql.Tx, dbName string, tableName string, oldValues map[string][]byte) error {
+	if len(oldValues) == 0 {
+		return fmt.Errorf("no old values for delete")
 	}
 
-	// If we have old values, use them to build WHERE clause
-	if len(oldValues) > 0 {
-		whereClauses := make([]string, 0, len(oldValues))
-		values := make([]interface{}, 0, len(oldValues))
+	// Get database instance to access schema
+	dbInstance, err := rh.dbMgr.GetDatabase(dbName)
+	if err != nil {
+		return fmt.Errorf("failed to get database %s: %w", dbName, err)
+	}
 
-		for col, valBytes := range oldValues {
-			whereClauses = append(whereClauses, fmt.Sprintf("%s = ?", col))
-			var value interface{}
-			if err := encoding.Unmarshal(valBytes, &value); err != nil {
-				return fmt.Errorf("failed to deserialize value for column %s: %w", col, err)
-			}
-			values = append(values, value)
+	// Create schema provider to get table schema
+	schemaProvider := protocol.NewSchemaProvider(dbInstance.GetDB())
+	schema, err := schemaProvider.GetTableSchema(tableName)
+	if err != nil {
+		return fmt.Errorf("failed to get schema for table %s: %w", tableName, err)
+	}
+
+	// Build WHERE clause using primary key columns from oldValues
+	// Extract each PK value from oldValues and unmarshal
+	whereClauses := make([]string, 0, len(schema.PrimaryKeys))
+	values := make([]interface{}, 0, len(schema.PrimaryKeys))
+
+	for _, pkCol := range schema.PrimaryKeys {
+		pkValue, ok := oldValues[pkCol]
+		if !ok {
+			return fmt.Errorf("primary key column %s not found in CDC old values", pkCol)
 		}
 
-		sqlStmt := fmt.Sprintf("DELETE FROM %s WHERE %s",
-			tableName,
-			strings.Join(whereClauses, " AND "))
+		whereClauses = append(whereClauses, fmt.Sprintf("%s = ?", pkCol))
 
-		_, err := tx.Exec(sqlStmt, values...)
-		return err
+		var value interface{}
+		if err := encoding.Unmarshal(pkValue, &value); err != nil {
+			return fmt.Errorf("failed to deserialize PK value for column %s: %w", pkCol, err)
+		}
+		values = append(values, value)
 	}
 
-	// Fallback: use row key (assumes single PK column named 'id')
-	_, err := tx.Exec(fmt.Sprintf("DELETE FROM %s WHERE id = ?", tableName), rowKey)
+	sqlStmt := fmt.Sprintf("DELETE FROM %s WHERE %s",
+		tableName,
+		strings.Join(whereClauses, " AND "))
+
+	_, err = tx.Exec(sqlStmt, values...)
 	return err
 }
 
@@ -857,7 +871,7 @@ func (rh *ReplicationHandler) serializeReplayStatements(stmts []*Statement, dbNa
 
 		// Extract CDC data from RowChange payload
 		if rowChange := stmt.GetRowChange(); rowChange != nil {
-			protoStmt.RowKey = rowChange.RowKey
+			protoStmt.IntentKey = rowChange.IntentKey
 			protoStmt.OldValues = rowChange.OldValues
 			protoStmt.NewValues = rowChange.NewValues
 		}

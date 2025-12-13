@@ -52,7 +52,7 @@ func (h *AdminHandlers) handleCDCByTxn(w http.ResponseWriter, r *http.Request, m
 			"seq":        entry.Seq,
 			"operation":  entry.Operation,
 			"table":      entry.Table,
-			"row_key":    entry.RowKey,
+			"intent_key": entry.IntentKey,
 			"old_values": encodeBase64Map(entry.OldValues),
 			"new_values": encodeBase64Map(entry.NewValues),
 			"created_at": formatTimestamp(entry.CreatedAt),

@@ -31,13 +31,13 @@ type MetaStore interface {
 	StoreReplayedTransaction(txnID, nodeID uint64, commitTS hlc.Timestamp, statements []byte, dbName string) error
 
 	// Write intents (distributed locks)
-	WriteIntent(txnID uint64, intentType IntentType, tableName, rowKey string, op OpType, sqlStmt string, data []byte, ts hlc.Timestamp, nodeID uint64) error
-	ValidateIntent(tableName, rowKey string, expectedTxnID uint64) (bool, error)
-	DeleteIntent(tableName, rowKey string, txnID uint64) error
+	WriteIntent(txnID uint64, intentType IntentType, tableName, intentKey string, op OpType, sqlStmt string, data []byte, ts hlc.Timestamp, nodeID uint64) error
+	ValidateIntent(tableName, intentKey string, expectedTxnID uint64) (bool, error)
+	DeleteIntent(tableName, intentKey string, txnID uint64) error
 	DeleteIntentsByTxn(txnID uint64) error
 	MarkIntentsForCleanup(txnID uint64) error // Fast path: mark intents as ready for overwrite
 	GetIntentsByTxn(txnID uint64) ([]*WriteIntentRecord, error)
-	GetIntent(tableName, rowKey string) (*WriteIntentRecord, error)
+	GetIntent(tableName, intentKey string) (*WriteIntentRecord, error)
 	GetIntentFilter() *IntentFilter // Cuckoo filter for fast-path conflict detection
 
 	// Replication state
@@ -59,15 +59,15 @@ type MetaStore interface {
 	ReleaseDDLLock(dbName string, nodeID uint64) error
 
 	// CDC intent entries
-	WriteIntentEntry(txnID, seq uint64, op uint8, table, rowKey string, oldVals, newVals []byte) error
+	WriteIntentEntry(txnID, seq uint64, op uint8, table, intentKey string, oldVals, newVals []byte) error
 	GetIntentEntries(txnID uint64) ([]*IntentEntry, error)
 	DeleteIntentEntries(txnID uint64) error
 
 	// CDC active locks for conflict detection
-	AcquireCDCRowLock(txnID uint64, tableName, rowKey string) error
-	ReleaseCDCRowLock(tableName, rowKey string, txnID uint64) error
+	AcquireCDCRowLock(txnID uint64, tableName, intentKey string) error
+	ReleaseCDCRowLock(tableName, intentKey string, txnID uint64) error
 	ReleaseCDCRowLocksByTxn(txnID uint64) error
-	GetCDCRowLock(tableName, rowKey string) (uint64, error) // Returns txnID or 0 if no lock
+	GetCDCRowLock(tableName, intentKey string) (uint64, error) // Returns txnID or 0 if no lock
 
 	AcquireCDCTableDDLLock(txnID uint64, tableName string) error
 	ReleaseCDCTableDDLLock(tableName string, txnID uint64) error
@@ -117,7 +117,7 @@ type TransactionRecord struct {
 type WriteIntentRecord struct {
 	IntentType       IntentType // Type discriminator: DML, DDL, or DatabaseOp
 	TableName        string
-	RowKey           string
+	IntentKey        string
 	TxnID            uint64
 	TSWall           int64
 	TSLogical        int32

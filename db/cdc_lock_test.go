@@ -13,23 +13,23 @@ func TestCDCRowLock_AcquireRelease(t *testing.T) {
 
 	txnID := uint64(100)
 	table := "users"
-	rowKey := "user:1"
+	intentKey := "user:1"
 
 	// Acquire lock
-	err := store.AcquireCDCRowLock(txnID, table, rowKey)
+	err := store.AcquireCDCRowLock(txnID, table, intentKey)
 	require.NoError(t, err)
 
 	// Verify lock is held
-	lockTxnID, err := store.GetCDCRowLock(table, rowKey)
+	lockTxnID, err := store.GetCDCRowLock(table, intentKey)
 	require.NoError(t, err)
 	assert.Equal(t, txnID, lockTxnID)
 
 	// Release lock
-	err = store.ReleaseCDCRowLock(table, rowKey, txnID)
+	err = store.ReleaseCDCRowLock(table, intentKey, txnID)
 	require.NoError(t, err)
 
 	// Verify lock is released
-	lockTxnID, err = store.GetCDCRowLock(table, rowKey)
+	lockTxnID, err = store.GetCDCRowLock(table, intentKey)
 	require.NoError(t, err)
 	assert.Equal(t, uint64(0), lockTxnID)
 }
@@ -40,18 +40,18 @@ func TestCDCRowLock_SameTxnReacquire(t *testing.T) {
 
 	txnID := uint64(100)
 	table := "users"
-	rowKey := "user:1"
+	intentKey := "user:1"
 
 	// Acquire lock first time
-	err := store.AcquireCDCRowLock(txnID, table, rowKey)
+	err := store.AcquireCDCRowLock(txnID, table, intentKey)
 	require.NoError(t, err)
 
 	// Same txn re-acquires - should succeed (idempotent)
-	err = store.AcquireCDCRowLock(txnID, table, rowKey)
+	err = store.AcquireCDCRowLock(txnID, table, intentKey)
 	require.NoError(t, err)
 
 	// Verify still held by same txn
-	lockTxnID, err := store.GetCDCRowLock(table, rowKey)
+	lockTxnID, err := store.GetCDCRowLock(table, intentKey)
 	require.NoError(t, err)
 	assert.Equal(t, txnID, lockTxnID)
 }
@@ -63,31 +63,31 @@ func TestCDCRowLock_ConflictDifferentTxn(t *testing.T) {
 	txn1 := uint64(100)
 	txn2 := uint64(200)
 	table := "users"
-	rowKey := "user:1"
+	intentKey := "user:1"
 
 	// Txn1 acquires lock
-	err := store.AcquireCDCRowLock(txn1, table, rowKey)
+	err := store.AcquireCDCRowLock(txn1, table, intentKey)
 	require.NoError(t, err)
 
 	// Txn2 tries to acquire same lock - should fail
-	err = store.AcquireCDCRowLock(txn2, table, rowKey)
+	err = store.AcquireCDCRowLock(txn2, table, intentKey)
 	require.Error(t, err)
 
 	var cdcErr ErrCDCRowLocked
 	require.ErrorAs(t, err, &cdcErr)
 	assert.Equal(t, table, cdcErr.Table)
-	assert.Equal(t, rowKey, cdcErr.RowKey)
+	assert.Equal(t, intentKey, cdcErr.IntentKey)
 	assert.Equal(t, txn1, cdcErr.HeldByTxn)
 
 	// Release txn1 lock
-	err = store.ReleaseCDCRowLock(table, rowKey, txn1)
+	err = store.ReleaseCDCRowLock(table, intentKey, txn1)
 	require.NoError(t, err)
 
 	// Now txn2 can acquire
-	err = store.AcquireCDCRowLock(txn2, table, rowKey)
+	err = store.AcquireCDCRowLock(txn2, table, intentKey)
 	require.NoError(t, err)
 
-	lockTxnID, err := store.GetCDCRowLock(table, rowKey)
+	lockTxnID, err := store.GetCDCRowLock(table, intentKey)
 	require.NoError(t, err)
 	assert.Equal(t, txn2, lockTxnID)
 }
@@ -101,14 +101,14 @@ func TestCDCRowLock_ReleaseBulkByTxn(t *testing.T) {
 
 	// Acquire locks on multiple rows
 	rows := []string{"user:1", "user:2", "user:3"}
-	for _, rowKey := range rows {
-		err := store.AcquireCDCRowLock(txnID, table, rowKey)
+	for _, intentKey := range rows {
+		err := store.AcquireCDCRowLock(txnID, table, intentKey)
 		require.NoError(t, err)
 	}
 
 	// Verify all locks held
-	for _, rowKey := range rows {
-		lockTxnID, err := store.GetCDCRowLock(table, rowKey)
+	for _, intentKey := range rows {
+		lockTxnID, err := store.GetCDCRowLock(table, intentKey)
 		require.NoError(t, err)
 		assert.Equal(t, txnID, lockTxnID)
 	}
@@ -118,8 +118,8 @@ func TestCDCRowLock_ReleaseBulkByTxn(t *testing.T) {
 	require.NoError(t, err)
 
 	// Verify all locks released
-	for _, rowKey := range rows {
-		lockTxnID, err := store.GetCDCRowLock(table, rowKey)
+	for _, intentKey := range rows {
+		lockTxnID, err := store.GetCDCRowLock(table, intentKey)
 		require.NoError(t, err)
 		assert.Equal(t, uint64(0), lockTxnID)
 	}
@@ -133,22 +133,22 @@ func TestCDCRowLock_DifferentTables(t *testing.T) {
 	txn2 := uint64(200)
 	table1 := "users"
 	table2 := "orders"
-	rowKey := "row:1"
+	intentKey := "row:1"
 
 	// Txn1 locks row in table1
-	err := store.AcquireCDCRowLock(txn1, table1, rowKey)
+	err := store.AcquireCDCRowLock(txn1, table1, intentKey)
 	require.NoError(t, err)
 
-	// Txn2 locks same rowKey in table2 - should succeed (different tables)
-	err = store.AcquireCDCRowLock(txn2, table2, rowKey)
+	// Txn2 locks same intentKey in table2 - should succeed (different tables)
+	err = store.AcquireCDCRowLock(txn2, table2, intentKey)
 	require.NoError(t, err)
 
 	// Verify both locks held
-	lockTxnID1, err := store.GetCDCRowLock(table1, rowKey)
+	lockTxnID1, err := store.GetCDCRowLock(table1, intentKey)
 	require.NoError(t, err)
 	assert.Equal(t, txn1, lockTxnID1)
 
-	lockTxnID2, err := store.GetCDCRowLock(table2, rowKey)
+	lockTxnID2, err := store.GetCDCRowLock(table2, intentKey)
 	require.NoError(t, err)
 	assert.Equal(t, txn2, lockTxnID2)
 }
@@ -214,10 +214,10 @@ func TestCDCDDLLock_BlockedByDML(t *testing.T) {
 	dmlTxn := uint64(100)
 	ddlTxn := uint64(200)
 	table := "users"
-	rowKey := "user:1"
+	intentKey := "user:1"
 
 	// DML txn acquires row lock
-	err := store.AcquireCDCRowLock(dmlTxn, table, rowKey)
+	err := store.AcquireCDCRowLock(dmlTxn, table, intentKey)
 	require.NoError(t, err)
 
 	// DDL txn tries to acquire DDL lock - should fail (DML in progress)
@@ -229,7 +229,7 @@ func TestCDCDDLLock_BlockedByDML(t *testing.T) {
 	assert.Equal(t, table, dmlErr.Table)
 
 	// Release DML lock
-	err = store.ReleaseCDCRowLock(table, rowKey, dmlTxn)
+	err = store.ReleaseCDCRowLock(table, intentKey, dmlTxn)
 	require.NoError(t, err)
 
 	// Now DDL can acquire
@@ -248,7 +248,7 @@ func TestCDCDDLLock_CheckBeforeRowLock(t *testing.T) {
 	ddlTxn := uint64(100)
 	dmlTxn := uint64(200)
 	table := "users"
-	rowKey := "user:1"
+	intentKey := "user:1"
 
 	// DDL txn acquires DDL lock
 	err := store.AcquireCDCTableDDLLock(ddlTxn, table)
@@ -271,7 +271,7 @@ func TestCDCDDLLock_CheckBeforeRowLock(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, uint64(0), lockTxnID)
 
-	err = store.AcquireCDCRowLock(dmlTxn, table, rowKey)
+	err = store.AcquireCDCRowLock(dmlTxn, table, intentKey)
 	require.NoError(t, err)
 }
 
@@ -284,14 +284,14 @@ func TestCDCRowLock_MultipleRowsSameTxn(t *testing.T) {
 
 	// Acquire locks on multiple rows with same txn
 	rows := []string{"user:1", "user:2", "user:3", "user:4", "user:5"}
-	for _, rowKey := range rows {
-		err := store.AcquireCDCRowLock(txnID, table, rowKey)
+	for _, intentKey := range rows {
+		err := store.AcquireCDCRowLock(txnID, table, intentKey)
 		require.NoError(t, err)
 	}
 
 	// Verify all locks held by same txn
-	for _, rowKey := range rows {
-		lockTxnID, err := store.GetCDCRowLock(table, rowKey)
+	for _, intentKey := range rows {
+		lockTxnID, err := store.GetCDCRowLock(table, intentKey)
 		require.NoError(t, err)
 		assert.Equal(t, txnID, lockTxnID)
 	}
@@ -301,8 +301,8 @@ func TestCDCRowLock_MultipleRowsSameTxn(t *testing.T) {
 	require.NoError(t, err)
 
 	// Verify all released
-	for _, rowKey := range rows {
-		lockTxnID, err := store.GetCDCRowLock(table, rowKey)
+	for _, intentKey := range rows {
+		lockTxnID, err := store.GetCDCRowLock(table, intentKey)
 		require.NoError(t, err)
 		assert.Equal(t, uint64(0), lockTxnID)
 	}
@@ -314,18 +314,18 @@ func TestCDCRowLock_IdempotentRelease(t *testing.T) {
 
 	txnID := uint64(100)
 	table := "users"
-	rowKey := "user:1"
+	intentKey := "user:1"
 
 	// Acquire lock
-	err := store.AcquireCDCRowLock(txnID, table, rowKey)
+	err := store.AcquireCDCRowLock(txnID, table, intentKey)
 	require.NoError(t, err)
 
 	// Release lock
-	err = store.ReleaseCDCRowLock(table, rowKey, txnID)
+	err = store.ReleaseCDCRowLock(table, intentKey, txnID)
 	require.NoError(t, err)
 
 	// Release again - should be idempotent (no error)
-	err = store.ReleaseCDCRowLock(table, rowKey, txnID)
+	err = store.ReleaseCDCRowLock(table, intentKey, txnID)
 	require.NoError(t, err)
 
 	// Release by txn - should also be idempotent
@@ -360,18 +360,18 @@ func TestCDCRowLock_WrongTxnCannotRelease(t *testing.T) {
 	txn1 := uint64(100)
 	txn2 := uint64(200)
 	table := "users"
-	rowKey := "user:1"
+	intentKey := "user:1"
 
 	// Txn1 acquires lock
-	err := store.AcquireCDCRowLock(txn1, table, rowKey)
+	err := store.AcquireCDCRowLock(txn1, table, intentKey)
 	require.NoError(t, err)
 
 	// Txn2 tries to release - should be no-op (lock still held by txn1)
-	err = store.ReleaseCDCRowLock(table, rowKey, txn2)
+	err = store.ReleaseCDCRowLock(table, intentKey, txn2)
 	require.NoError(t, err)
 
 	// Verify lock still held by txn1
-	lockTxnID, err := store.GetCDCRowLock(table, rowKey)
+	lockTxnID, err := store.GetCDCRowLock(table, intentKey)
 	require.NoError(t, err)
 	assert.Equal(t, txn1, lockTxnID)
 }
@@ -404,7 +404,7 @@ func TestCDCRowLock_HasCDCRowLocksForTable(t *testing.T) {
 
 	txnID := uint64(100)
 	table := "users"
-	rowKey := "user:1"
+	intentKey := "user:1"
 
 	// Initially no locks
 	hasLocks, err := store.HasCDCRowLocksForTable(table)
@@ -412,7 +412,7 @@ func TestCDCRowLock_HasCDCRowLocksForTable(t *testing.T) {
 	assert.False(t, hasLocks)
 
 	// Acquire row lock
-	err = store.AcquireCDCRowLock(txnID, table, rowKey)
+	err = store.AcquireCDCRowLock(txnID, table, intentKey)
 	require.NoError(t, err)
 
 	// Now has locks
@@ -421,7 +421,7 @@ func TestCDCRowLock_HasCDCRowLocksForTable(t *testing.T) {
 	assert.True(t, hasLocks)
 
 	// Release lock
-	err = store.ReleaseCDCRowLock(table, rowKey, txnID)
+	err = store.ReleaseCDCRowLock(table, intentKey, txnID)
 	require.NoError(t, err)
 
 	// No locks again
@@ -459,9 +459,9 @@ func TestCDCRowLock_MultipleTxnsMultipleTables(t *testing.T) {
 	txn3 := uint64(300)
 
 	locks := []struct {
-		txnID  uint64
-		table  string
-		rowKey string
+		txnID     uint64
+		table     string
+		intentKey string
 	}{
 		{txn1, "users", "row:1"},
 		{txn1, "orders", "row:1"},
@@ -472,13 +472,13 @@ func TestCDCRowLock_MultipleTxnsMultipleTables(t *testing.T) {
 
 	// Acquire all locks
 	for _, lock := range locks {
-		err := store.AcquireCDCRowLock(lock.txnID, lock.table, lock.rowKey)
+		err := store.AcquireCDCRowLock(lock.txnID, lock.table, lock.intentKey)
 		require.NoError(t, err)
 	}
 
 	// Verify all locks
 	for _, lock := range locks {
-		lockTxnID, err := store.GetCDCRowLock(lock.table, lock.rowKey)
+		lockTxnID, err := store.GetCDCRowLock(lock.table, lock.intentKey)
 		require.NoError(t, err)
 		assert.Equal(t, lock.txnID, lockTxnID)
 	}

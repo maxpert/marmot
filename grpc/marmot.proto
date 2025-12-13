@@ -141,13 +141,13 @@ message Statement {
 // Row-level change data (DML operations)
 // Follows MySQL binlog row format and TiDB TiCDC approach
 message RowChange {
-  // Primary key value for MVCC conflict detection
-  string row_key = 1;
+  // Composite identifier for intent/lock identification (NOT actual row primary key)
+  string intent_key = 1;
 
   // Row images (before/after values)
   // - INSERT: only new_values populated
   // - UPDATE: both old_values and new_values populated (for conflict detection)
-  // - DELETE: only old_values populated (or just row_key is sufficient)
+  // - DELETE: only old_values populated (or just intent_key is sufficient)
   // - REPLACE: old_values for conflict check, new_values for data
   map<string, bytes> old_values = 2;  // Column name -> serialized value (before image)
   map<string, bytes> new_values = 3;  // Column name -> serialized value (after image)

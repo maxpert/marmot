@@ -12,7 +12,7 @@ func TestPipeline_SingleInsert(t *testing.T) {
 	entries := []CDCEntry{
 		{
 			Table:     "users",
-			RowKey:    "1",
+			IntentKey: "1",
 			OldValues: nil,
 			NewValues: map[string][]byte{
 				"id":   []byte("1"),
@@ -47,8 +47,8 @@ func TestPipeline_SingleInsert(t *testing.T) {
 	if stmt.TableName != "users" {
 		t.Errorf("TableName = %q, want %q", stmt.TableName, "users")
 	}
-	if stmt.RowKey != "1" {
-		t.Errorf("RowKey = %q, want %q", stmt.RowKey, "1")
+	if stmt.IntentKey != "1" {
+		t.Errorf("IntentKey = %q, want %q", stmt.IntentKey, "1")
 	}
 	if len(stmt.OldValues) != 0 {
 		t.Errorf("OldValues should be empty for INSERT, got %d entries", len(stmt.OldValues))
@@ -62,8 +62,8 @@ func TestPipeline_SingleInsert(t *testing.T) {
 func TestPipeline_SingleUpdate(t *testing.T) {
 	entries := []CDCEntry{
 		{
-			Table:  "users",
-			RowKey: "1",
+			Table:     "users",
+			IntentKey: "1",
 			OldValues: map[string][]byte{
 				"id":   []byte("1"),
 				"name": []byte("Alice"),
@@ -110,8 +110,8 @@ func TestPipeline_SingleUpdate(t *testing.T) {
 func TestPipeline_SingleDelete(t *testing.T) {
 	entries := []CDCEntry{
 		{
-			Table:  "users",
-			RowKey: "1",
+			Table:     "users",
+			IntentKey: "1",
 			OldValues: map[string][]byte{
 				"id":   []byte("1"),
 				"name": []byte("Alice"),
@@ -146,18 +146,18 @@ func TestPipeline_SingleDelete(t *testing.T) {
 }
 
 // TestPipeline_MultiRowInsert_100Rows tests the WordPress scenario:
-// 100 INSERT entries with different row keys should produce 100 statements
+// 100 INSERT entries with different intent keys should produce 100 statements
 func TestPipeline_MultiRowInsert_100Rows(t *testing.T) {
 	entries := make([]CDCEntry, 100)
 	for i := 0; i < 100; i++ {
-		rowKey := string(rune('A' + (i % 26))) // A-Z cycling
+		intentKey := string(rune('A' + (i % 26))) // A-Z cycling
 		entries[i] = CDCEntry{
 			Table:     "wp_posts",
-			RowKey:    rowKey,
+			IntentKey: intentKey,
 			OldValues: nil,
 			NewValues: map[string][]byte{
-				"id":    []byte(rowKey),
-				"title": []byte("Post " + rowKey),
+				"id":    []byte(intentKey),
+				"title": []byte("Post " + intentKey),
 			},
 		}
 	}
@@ -169,11 +169,11 @@ func TestPipeline_MultiRowInsert_100Rows(t *testing.T) {
 		t.Fatalf("ProcessCDCEntries failed: %v", err)
 	}
 
-	// Each unique row key produces one statement
+	// Each unique intent key produces one statement
 	// Since we cycle through 26 unique keys (A-Z), we expect 26 statements
-	expectedStatements := 26 // Because we cycle A-Z (26 unique row keys)
+	expectedStatements := 26 // Because we cycle A-Z (26 unique intent keys)
 	if len(result.Statements) != expectedStatements {
-		t.Errorf("Expected %d statements (26 unique row keys from 100 entries), got %d",
+		t.Errorf("Expected %d statements (26 unique intent keys from 100 entries), got %d",
 			expectedStatements, len(result.Statements))
 	}
 
@@ -192,25 +192,25 @@ func TestPipeline_MultiRowInsert_100Rows(t *testing.T) {
 	}
 }
 
-// TestPipeline_MultiRowInsert_PreservesAllRows verifies that different row keys
+// TestPipeline_MultiRowInsert_PreservesAllRows verifies that different intent keys
 // are all preserved (not merged together)
 func TestPipeline_MultiRowInsert_PreservesAllRows(t *testing.T) {
 	entries := []CDCEntry{
 		{
 			Table:     "users",
-			RowKey:    "1",
+			IntentKey: "1",
 			OldValues: nil,
 			NewValues: map[string][]byte{"id": []byte("1"), "name": []byte("Alice")},
 		},
 		{
 			Table:     "users",
-			RowKey:    "2",
+			IntentKey: "2",
 			OldValues: nil,
 			NewValues: map[string][]byte{"id": []byte("2"), "name": []byte("Bob")},
 		},
 		{
 			Table:     "users",
-			RowKey:    "3",
+			IntentKey: "3",
 			OldValues: nil,
 			NewValues: map[string][]byte{"id": []byte("3"), "name": []byte("Charlie")},
 		},
@@ -236,29 +236,29 @@ func TestPipeline_MultiRowInsert_PreservesAllRows(t *testing.T) {
 	}
 
 	// Verify each row is preserved
-	rowKeysSeen := make(map[string]bool)
+	intentKeysSeen := make(map[string]bool)
 	for _, stmt := range result.Statements {
-		rowKeysSeen[stmt.RowKey] = true
+		intentKeysSeen[stmt.IntentKey] = true
 	}
-	if !rowKeysSeen["1"] || !rowKeysSeen["2"] || !rowKeysSeen["3"] {
-		t.Errorf("Not all row keys preserved. Seen: %v", rowKeysSeen)
+	if !intentKeysSeen["1"] || !intentKeysSeen["2"] || !intentKeysSeen["3"] {
+		t.Errorf("Not all intent keys preserved. Seen: %v", intentKeysSeen)
 	}
 }
 
-// TestPipeline_MultiRowInsert_UniqueRowKeys verifies that each unique row key
+// TestPipeline_MultiRowInsert_UniqueIntentKeys verifies that each unique intent key
 // produces exactly one statement, even with 100 entries
-func TestPipeline_MultiRowInsert_UniqueRowKeys(t *testing.T) {
-	// Create 100 entries for 100 unique row keys
+func TestPipeline_MultiRowInsert_UniqueIntentKeys(t *testing.T) {
+	// Create 100 entries for 100 unique intent keys
 	entries := make([]CDCEntry, 100)
 	for i := 0; i < 100; i++ {
-		rowKey := string(rune(i)) // Unique row key for each
+		intentKey := string(rune(i)) // Unique intent key for each
 		entries[i] = CDCEntry{
 			Table:     "products",
-			RowKey:    rowKey,
+			IntentKey: intentKey,
 			OldValues: nil,
 			NewValues: map[string][]byte{
-				"id":   []byte(rowKey),
-				"name": []byte("Product " + rowKey),
+				"id":   []byte(intentKey),
+				"name": []byte("Product " + intentKey),
 			},
 		}
 	}
@@ -270,9 +270,9 @@ func TestPipeline_MultiRowInsert_UniqueRowKeys(t *testing.T) {
 		t.Fatalf("ProcessCDCEntries failed: %v", err)
 	}
 
-	// 100 unique row keys = 100 statements
+	// 100 unique intent keys = 100 statements
 	if len(result.Statements) != 100 {
-		t.Errorf("Expected 100 statements (100 unique row keys), got %d", len(result.Statements))
+		t.Errorf("Expected 100 statements (100 unique intent keys), got %d", len(result.Statements))
 	}
 	if result.TotalEntries != 100 {
 		t.Errorf("TotalEntries = %d, want 100", result.TotalEntries)
@@ -286,8 +286,8 @@ func TestPipeline_Upsert_DeleteThenInsert_MergedToUpdate(t *testing.T) {
 	entries := []CDCEntry{
 		// DELETE hook fires first
 		{
-			Table:  "users",
-			RowKey: "1",
+			Table:     "users",
+			IntentKey: "1",
 			OldValues: map[string][]byte{
 				"id":   []byte("1"),
 				"name": []byte("old_name"),
@@ -297,7 +297,7 @@ func TestPipeline_Upsert_DeleteThenInsert_MergedToUpdate(t *testing.T) {
 		// INSERT hook fires second
 		{
 			Table:     "users",
-			RowKey:    "1",
+			IntentKey: "1",
 			OldValues: nil,
 			NewValues: map[string][]byte{
 				"id":   []byte("1"),
@@ -351,8 +351,8 @@ func TestPipeline_Upsert_DeleteThenInsert_MergedToUpdate(t *testing.T) {
 func TestPipeline_Upsert_PreservesOldValues_FromDelete(t *testing.T) {
 	entries := []CDCEntry{
 		{
-			Table:  "products",
-			RowKey: "42",
+			Table:     "products",
+			IntentKey: "42",
 			OldValues: map[string][]byte{
 				"id":    []byte("42"),
 				"price": []byte("9.99"),
@@ -362,7 +362,7 @@ func TestPipeline_Upsert_PreservesOldValues_FromDelete(t *testing.T) {
 		},
 		{
 			Table:     "products",
-			RowKey:    "42",
+			IntentKey: "42",
 			OldValues: nil,
 			NewValues: map[string][]byte{
 				"id":    []byte("42"),
@@ -396,8 +396,8 @@ func TestPipeline_Upsert_PreservesOldValues_FromDelete(t *testing.T) {
 func TestPipeline_Upsert_PreservesNewValues_FromInsert(t *testing.T) {
 	entries := []CDCEntry{
 		{
-			Table:  "products",
-			RowKey: "42",
+			Table:     "products",
+			IntentKey: "42",
 			OldValues: map[string][]byte{
 				"id":    []byte("42"),
 				"price": []byte("9.99"),
@@ -406,7 +406,7 @@ func TestPipeline_Upsert_PreservesNewValues_FromInsert(t *testing.T) {
 		},
 		{
 			Table:     "products",
-			RowKey:    "42",
+			IntentKey: "42",
 			OldValues: nil,
 			NewValues: map[string][]byte{
 				"id":    []byte("42"),
@@ -438,7 +438,7 @@ func TestPipeline_InsertThenDelete_CancelsOut(t *testing.T) {
 		// INSERT
 		{
 			Table:     "users",
-			RowKey:    "1",
+			IntentKey: "1",
 			OldValues: nil,
 			NewValues: map[string][]byte{
 				"id":   []byte("1"),
@@ -447,8 +447,8 @@ func TestPipeline_InsertThenDelete_CancelsOut(t *testing.T) {
 		},
 		// DELETE
 		{
-			Table:  "users",
-			RowKey: "1",
+			Table:     "users",
+			IntentKey: "1",
 			OldValues: map[string][]byte{
 				"id":   []byte("1"),
 				"name": []byte("temp"),
@@ -482,8 +482,8 @@ func TestPipeline_UpdateThenUpdate_MergesValues(t *testing.T) {
 	entries := []CDCEntry{
 		// First UPDATE
 		{
-			Table:  "users",
-			RowKey: "1",
+			Table:     "users",
+			IntentKey: "1",
 			OldValues: map[string][]byte{
 				"id":   []byte("1"),
 				"name": []byte("v1"),
@@ -495,8 +495,8 @@ func TestPipeline_UpdateThenUpdate_MergesValues(t *testing.T) {
 		},
 		// Second UPDATE
 		{
-			Table:  "users",
-			RowKey: "1",
+			Table:     "users",
+			IntentKey: "1",
 			OldValues: map[string][]byte{
 				"id":   []byte("1"),
 				"name": []byte("v2"),
@@ -544,8 +544,8 @@ func TestPipeline_UpdateThenDelete_BecomesDelete(t *testing.T) {
 	entries := []CDCEntry{
 		// UPDATE
 		{
-			Table:  "users",
-			RowKey: "1",
+			Table:     "users",
+			IntentKey: "1",
 			OldValues: map[string][]byte{
 				"id":   []byte("1"),
 				"name": []byte("original"),
@@ -557,8 +557,8 @@ func TestPipeline_UpdateThenDelete_BecomesDelete(t *testing.T) {
 		},
 		// DELETE
 		{
-			Table:  "users",
-			RowKey: "1",
+			Table:     "users",
+			IntentKey: "1",
 			OldValues: map[string][]byte{
 				"id":   []byte("1"),
 				"name": []byte("updated"),
@@ -598,7 +598,7 @@ func TestPipeline_Validation_EmptyTableName_Fails(t *testing.T) {
 	entries := []CDCEntry{
 		{
 			Table:     "", // Empty table name
-			RowKey:    "1",
+			IntentKey: "1",
 			OldValues: nil,
 			NewValues: map[string][]byte{"id": []byte("1")},
 		},
@@ -656,7 +656,7 @@ func TestPipeline_NilOldValues_Handled(t *testing.T) {
 	entries := []CDCEntry{
 		{
 			Table:     "users",
-			RowKey:    "1",
+			IntentKey: "1",
 			OldValues: nil,
 			NewValues: map[string][]byte{"id": []byte("1"), "name": []byte("Alice")},
 		},
@@ -683,7 +683,7 @@ func TestPipeline_NilNewValues_Handled(t *testing.T) {
 	entries := []CDCEntry{
 		{
 			Table:     "users",
-			RowKey:    "1",
+			IntentKey: "1",
 			OldValues: map[string][]byte{"id": []byte("1"), "name": []byte("Alice")},
 			NewValues: nil,
 		},
@@ -711,19 +711,19 @@ func TestPipeline_MixedTables(t *testing.T) {
 	entries := []CDCEntry{
 		{
 			Table:     "users",
-			RowKey:    "1",
+			IntentKey: "1",
 			OldValues: nil,
 			NewValues: map[string][]byte{"id": []byte("1")},
 		},
 		{
 			Table:     "products",
-			RowKey:    "1",
+			IntentKey: "1",
 			OldValues: nil,
 			NewValues: map[string][]byte{"id": []byte("1")},
 		},
 		{
 			Table:     "users",
-			RowKey:    "2",
+			IntentKey: "2",
 			OldValues: nil,
 			NewValues: map[string][]byte{"id": []byte("2")},
 		},
@@ -736,9 +736,9 @@ func TestPipeline_MixedTables(t *testing.T) {
 		t.Fatalf("ProcessCDCEntries failed: %v", err)
 	}
 
-	// 3 different (table, rowKey) combinations = 3 statements
+	// 3 different (table, intentKey) combinations = 3 statements
 	if len(result.Statements) != 3 {
-		t.Fatalf("Expected 3 statements (3 unique table:rowKey), got %d", len(result.Statements))
+		t.Fatalf("Expected 3 statements (3 unique table:intentKey), got %d", len(result.Statements))
 	}
 
 	// Verify tables are preserved
@@ -755,19 +755,19 @@ func TestPipeline_MixedTables(t *testing.T) {
 	}
 }
 
-// TestPipeline_SameRowKey_DifferentTables tests that same RowKey in different
-// tables are NOT merged (grouping is by table+rowKey)
-func TestPipeline_SameRowKey_DifferentTables(t *testing.T) {
+// TestPipeline_SameIntentKey_DifferentTables tests that same IntentKey in different
+// tables are NOT merged (grouping is by table+intentKey)
+func TestPipeline_SameIntentKey_DifferentTables(t *testing.T) {
 	entries := []CDCEntry{
 		{
 			Table:     "users",
-			RowKey:    "1",
+			IntentKey: "1",
 			OldValues: nil,
 			NewValues: map[string][]byte{"id": []byte("1"), "name": []byte("Alice")},
 		},
 		{
 			Table:     "products",
-			RowKey:    "1", // Same row key, different table
+			IntentKey: "1", // Same intent key, different table
 			OldValues: nil,
 			NewValues: map[string][]byte{"id": []byte("1"), "name": []byte("Widget")},
 		},
@@ -801,46 +801,46 @@ func TestPipeline_ComplexSequence(t *testing.T) {
 		// Row 1: INSERT
 		{
 			Table:     "users",
-			RowKey:    "1",
+			IntentKey: "1",
 			OldValues: nil,
 			NewValues: map[string][]byte{"id": []byte("1"), "name": []byte("Alice")},
 		},
 		// Row 2: UPSERT (DELETE + INSERT)
 		{
 			Table:     "users",
-			RowKey:    "2",
+			IntentKey: "2",
 			OldValues: map[string][]byte{"id": []byte("2"), "name": []byte("old")},
 			NewValues: nil,
 		},
 		{
 			Table:     "users",
-			RowKey:    "2",
+			IntentKey: "2",
 			OldValues: nil,
 			NewValues: map[string][]byte{"id": []byte("2"), "name": []byte("new")},
 		},
 		// Row 3: INSERT then DELETE (cancel out)
 		{
 			Table:     "users",
-			RowKey:    "3",
+			IntentKey: "3",
 			OldValues: nil,
 			NewValues: map[string][]byte{"id": []byte("3"), "name": []byte("temp")},
 		},
 		{
 			Table:     "users",
-			RowKey:    "3",
+			IntentKey: "3",
 			OldValues: map[string][]byte{"id": []byte("3"), "name": []byte("temp")},
 			NewValues: nil,
 		},
 		// Row 4: UPDATE then DELETE
 		{
 			Table:     "users",
-			RowKey:    "4",
+			IntentKey: "4",
 			OldValues: map[string][]byte{"id": []byte("4"), "name": []byte("v1")},
 			NewValues: map[string][]byte{"id": []byte("4"), "name": []byte("v2")},
 		},
 		{
 			Table:     "users",
-			RowKey:    "4",
+			IntentKey: "4",
 			OldValues: map[string][]byte{"id": []byte("4"), "name": []byte("v2")},
 			NewValues: nil,
 		},
@@ -871,22 +871,22 @@ func TestPipeline_ComplexSequence(t *testing.T) {
 	}
 
 	// Verify statement types
-	stmtsByRowKey := make(map[string]protocol.StatementType)
+	stmtsByIntentKey := make(map[string]protocol.StatementType)
 	for _, stmt := range result.Statements {
-		stmtsByRowKey[stmt.RowKey] = stmt.Type
+		stmtsByIntentKey[stmt.IntentKey] = stmt.Type
 	}
 
-	if stmtsByRowKey["1"] != protocol.StatementInsert {
-		t.Errorf("Row 1 should be INSERT, got %v", stmtsByRowKey["1"])
+	if stmtsByIntentKey["1"] != protocol.StatementInsert {
+		t.Errorf("Row 1 should be INSERT, got %v", stmtsByIntentKey["1"])
 	}
-	if stmtsByRowKey["2"] != protocol.StatementUpdate {
-		t.Errorf("Row 2 should be UPDATE (UPSERT), got %v", stmtsByRowKey["2"])
+	if stmtsByIntentKey["2"] != protocol.StatementUpdate {
+		t.Errorf("Row 2 should be UPDATE (UPSERT), got %v", stmtsByIntentKey["2"])
 	}
-	if _, exists := stmtsByRowKey["3"]; exists {
-		t.Errorf("Row 3 should be cancelled (not present), but found %v", stmtsByRowKey["3"])
+	if _, exists := stmtsByIntentKey["3"]; exists {
+		t.Errorf("Row 3 should be cancelled (not present), but found %v", stmtsByIntentKey["3"])
 	}
-	if stmtsByRowKey["4"] != protocol.StatementDelete {
-		t.Errorf("Row 4 should be DELETE, got %v", stmtsByRowKey["4"])
+	if stmtsByIntentKey["4"] != protocol.StatementDelete {
+		t.Errorf("Row 4 should be DELETE, got %v", stmtsByIntentKey["4"])
 	}
 }
 
@@ -895,7 +895,7 @@ func TestPipeline_ValidationDisabled(t *testing.T) {
 	entries := []CDCEntry{
 		{
 			Table:     "", // Would fail validation
-			RowKey:    "1",
+			IntentKey: "1",
 			OldValues: nil,
 			NewValues: map[string][]byte{"id": []byte("1")},
 		},
@@ -915,7 +915,7 @@ func BenchmarkProcessCDCEntries_1000Rows(b *testing.B) {
 	for i := 0; i < 1000; i++ {
 		entries[i] = CDCEntry{
 			Table:     "test",
-			RowKey:    strconv.Itoa(i),
+			IntentKey: strconv.Itoa(i),
 			NewValues: map[string][]byte{"id": []byte(strconv.Itoa(i))},
 		}
 	}

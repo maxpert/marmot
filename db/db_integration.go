@@ -415,7 +415,7 @@ func (c *CompletedLocalExecution) GetTotalRowCount() int64 {
 	return total
 }
 
-// GetKeyHashes returns XXH64 hashes of affected row keys per table
+// GetKeyHashes returns XXH64 hashes of affected intent keys per table
 // Returns nil for tables that exceed maxRows (signals fallback to full table scan)
 func (c *CompletedLocalExecution) GetKeyHashes(maxRows int) map[string][]uint64 {
 	if maxRows <= 0 {
@@ -460,7 +460,7 @@ func (c *CompletedLocalExecution) GetCDCEntries() []coordinator.CDCEntry {
 	for i, e := range c.cdcEntries {
 		result[i] = coordinator.CDCEntry{
 			Table:     e.Table,
-			RowKey:    e.RowKey,
+			IntentKey: e.IntentKey,
 			OldValues: e.OldValues,
 			NewValues: e.NewValues,
 		}
@@ -496,7 +496,7 @@ func (p *PendingLocalExecution) GetTotalRowCount() int64 {
 	return total
 }
 
-// GetKeyHashes returns XXH64 hashes of affected row keys per table.
+// GetKeyHashes returns XXH64 hashes of affected intent keys per table.
 // Returns nil for tables exceeding maxRows.
 func (p *PendingLocalExecution) GetKeyHashes(maxRows int) map[string][]uint64 {
 	if p.session == nil {
@@ -542,7 +542,7 @@ func (p *PendingLocalExecution) GetCDCEntries() []coordinator.CDCEntry {
 	for i, e := range entries {
 		result[i] = coordinator.CDCEntry{
 			Table:     e.Table,
-			RowKey:    e.RowKey,
+			IntentKey: e.IntentKey,
 			OldValues: e.OldValues,
 			NewValues: e.NewValues,
 		}
@@ -655,8 +655,8 @@ func (mdb *MVCCDatabase) ExecuteTransaction(ctx context.Context, statements []pr
 		}
 
 		// Create write intent for each statement
-		// Extract row key (simplified - would need proper SQL parsing)
-		rowKey := extractRowKeyFromStatement(stmt)
+		// Extract intent key (simplified - would need proper SQL parsing)
+		intentKey := extractIntentKeyFromStatement(stmt)
 		dataSnapshot, serErr := SerializeData(map[string]interface{}{
 			"sql":       stmt.SQL,
 			"type":      stmt.Type,
@@ -667,7 +667,7 @@ func (mdb *MVCCDatabase) ExecuteTransaction(ctx context.Context, statements []pr
 			return fmt.Errorf("failed to serialize data: %w", serErr)
 		}
 
-		err := mdb.txnMgr.WriteIntent(txn, IntentTypeDML, stmt.TableName, rowKey, stmt, dataSnapshot)
+		err := mdb.txnMgr.WriteIntent(txn, IntentTypeDML, stmt.TableName, intentKey, stmt, dataSnapshot)
 		if err != nil {
 			_ = mdb.txnMgr.AbortTransaction(txn)
 			return fmt.Errorf("write conflict: %w", err)
@@ -769,13 +769,13 @@ func (mdb *MVCCDatabase) Exec(ctx context.Context, query string, args ...interfa
 	return mdb.writeDB.ExecContext(ctx, query, args...)
 }
 
-// extractRowKeyFromStatement extracts row key from statement
-// The row key is extracted during parsing from the original MySQL AST,
+// extractIntentKeyFromStatement extracts intent key from statement
+// The intent key is extracted during parsing from the original MySQL AST,
 // so we just use the pre-extracted value from the Statement struct
-func extractRowKeyFromStatement(stmt protocol.Statement) string {
-	// If RowKey was extracted during parsing, use it
-	if stmt.RowKey != "" {
-		return stmt.RowKey
+func extractIntentKeyFromStatement(stmt protocol.Statement) string {
+	// If IntentKey was extracted during parsing, use it
+	if stmt.IntentKey != "" {
+		return stmt.IntentKey
 	}
 
 	// Fallback: use hash of SQL (this should rarely happen)
