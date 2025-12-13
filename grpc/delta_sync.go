@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"time"
 
@@ -392,7 +393,7 @@ func (ds *DeltaSyncClient) applyCDCStatement(tx *sql.Tx, database string, stmt *
 	case StatementType_INSERT, StatementType_REPLACE:
 		return ds.applyCDCInsert(tx, stmt.TableName, rowChange.NewValues)
 	case StatementType_UPDATE:
-		return ds.applyCDCUpdate(tx, stmt.TableName, rowChange.NewValues)
+		return ds.applyCDCUpdate(tx, database, stmt.TableName, rowChange.OldValues, rowChange.NewValues)
 	case StatementType_DELETE:
 		return ds.applyCDCDelete(tx, database, stmt.TableName, rowChange.OldValues)
 	default:
@@ -431,14 +432,83 @@ func (ds *DeltaSyncClient) applyCDCInsert(tx *sql.Tx, tableName string, newValue
 }
 
 // applyCDCUpdate performs UPDATE using CDC row data
-func (ds *DeltaSyncClient) applyCDCUpdate(tx *sql.Tx, tableName string, newValues map[string][]byte) error {
+// Uses oldValues for WHERE clause (to find existing row) and newValues for SET clause
+func (ds *DeltaSyncClient) applyCDCUpdate(tx *sql.Tx, database, tableName string, oldValues, newValues map[string][]byte) error {
 	if len(newValues) == 0 {
 		return fmt.Errorf("no values to update")
 	}
 
-	// For simplicity, convert UPDATE to INSERT OR REPLACE (upsert semantics)
-	// This works because we have all the column values in CDC
-	return ds.applyCDCInsert(tx, tableName, newValues)
+	// Get table schema to build proper WHERE clause
+	schema, err := ds.dbManager.GetTableSchema(database, tableName)
+	if err != nil {
+		return fmt.Errorf("failed to get schema for table %s: %w", tableName, err)
+	}
+
+	// Extract primary key column names from schema
+	var primaryKeys []string
+	for _, col := range schema.Columns {
+		if col.IsPK {
+			primaryKeys = append(primaryKeys, col.Name)
+		}
+	}
+
+	if len(primaryKeys) == 0 {
+		return fmt.Errorf("no primary key columns found for table %s", tableName)
+	}
+
+	// Build UPDATE statement with SET clause using newValues
+	// Sort columns for deterministic SQL generation
+	columns := make([]string, 0, len(newValues))
+	for col := range newValues {
+		columns = append(columns, col)
+	}
+	sort.Strings(columns)
+
+	setClauses := make([]string, 0, len(newValues))
+	values := make([]interface{}, 0, len(newValues)+len(primaryKeys))
+
+	for _, col := range columns {
+		valBytes := newValues[col]
+		setClauses = append(setClauses, fmt.Sprintf("%s = ?", col))
+
+		var value interface{}
+		if err := encoding.Unmarshal(valBytes, &value); err != nil {
+			return fmt.Errorf("failed to deserialize value for column %s: %w", col, err)
+		}
+		values = append(values, value)
+	}
+
+	// Build WHERE clause using primary key columns from oldValues
+	// This is critical for PK changes: we need the OLD PK to find the row
+	whereClauses := make([]string, 0, len(primaryKeys))
+
+	for _, pkCol := range primaryKeys {
+		// Use oldValues for WHERE clause if available, fallback to newValues
+		pkBytes, ok := oldValues[pkCol]
+		if !ok {
+			// Fallback to newValues if oldValues doesn't have PK (shouldn't happen for UPDATEs)
+			pkBytes, ok = newValues[pkCol]
+			if !ok {
+				return fmt.Errorf("primary key column %s not found in CDC data", pkCol)
+			}
+		}
+
+		whereClauses = append(whereClauses, fmt.Sprintf("%s = ?", pkCol))
+
+		var value interface{}
+		if err := encoding.Unmarshal(pkBytes, &value); err != nil {
+			return fmt.Errorf("failed to deserialize PK value for column %s: %w", pkCol, err)
+		}
+		values = append(values, value)
+	}
+
+	sqlStmt := fmt.Sprintf("UPDATE %s SET %s WHERE %s",
+		tableName,
+		strings.Join(setClauses, ", "),
+		strings.Join(whereClauses, " AND "))
+
+	_, err = tx.Exec(sqlStmt, values...)
+	return err
 }
 
 // applyCDCDelete performs DELETE using CDC row data

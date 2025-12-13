@@ -427,8 +427,9 @@ func (s *Server) sendChangeEvent(rec *db.TransactionRecord, stream MarmotService
 			WallTime: rec.CommitTSWall,
 			Logical:  rec.CommitTSLogical,
 		},
-		Statements: statements,
-		Database:   rec.DatabaseName,
+		Statements:            statements,
+		Database:              rec.DatabaseName,
+		RequiredSchemaVersion: rec.RequiredSchemaVersion,
 	}
 
 	return stream.Send(event)

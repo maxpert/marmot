@@ -19,7 +19,7 @@ var ErrStopIteration = errors.New("stop iteration")
 type MetaStore interface {
 	// Transaction lifecycle
 	BeginTransaction(txnID, nodeID uint64, startTS hlc.Timestamp) error
-	CommitTransaction(txnID uint64, commitTS hlc.Timestamp, statements []byte, dbName, tablesInvolved string) error
+	CommitTransaction(txnID uint64, commitTS hlc.Timestamp, statements []byte, dbName, tablesInvolved string, requiredSchemaVersion uint64) error
 	AbortTransaction(txnID uint64) error
 	GetTransaction(txnID uint64) (*TransactionRecord, error)
 	GetPendingTransactions() ([]*TransactionRecord, error)
@@ -97,20 +97,21 @@ type MetaStore interface {
 
 // TransactionRecord represents a transaction record in meta store
 type TransactionRecord struct {
-	TxnID                uint64
-	NodeID               uint64
-	SeqNum               uint64 // Monotonic sequence for gap detection
-	Status               TxnStatus
-	StartTSWall          int64
-	StartTSLogical       int32
-	CommitTSWall         int64
-	CommitTSLogical      int32
-	CreatedAt            int64
-	CommittedAt          int64
-	LastHeartbeat        int64
-	TablesInvolved       string
-	SerializedStatements []byte
-	DatabaseName         string
+	TxnID                 uint64
+	NodeID                uint64
+	SeqNum                uint64 // Monotonic sequence for gap detection
+	Status                TxnStatus
+	StartTSWall           int64
+	StartTSLogical        int32
+	CommitTSWall          int64
+	CommitTSLogical       int32
+	CreatedAt             int64
+	CommittedAt           int64
+	LastHeartbeat         int64
+	TablesInvolved        string
+	SerializedStatements  []byte
+	DatabaseName          string
+	RequiredSchemaVersion uint64 // Minimum schema version required for this transaction
 }
 
 // WriteIntentRecord represents a write intent in meta store

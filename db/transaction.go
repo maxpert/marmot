@@ -20,13 +20,14 @@ import (
 // Note: Write intents are stored ONLY in MetaStore (not in memory) for durability
 // and to ensure cleanup happens correctly even after crashes or partial failures.
 type Transaction struct {
-	ID         uint64
-	NodeID     uint64
-	StartTS    hlc.Timestamp
-	CommitTS   hlc.Timestamp
-	Status     TxnStatus
-	Statements []protocol.Statement
-	mu         sync.RWMutex
+	ID                    uint64
+	NodeID                uint64
+	StartTS               hlc.Timestamp
+	CommitTS              hlc.Timestamp
+	Status                TxnStatus
+	Statements            []protocol.Statement
+	RequiredSchemaVersion uint64 // Minimum schema version required for this transaction
+	mu                    sync.RWMutex
 }
 
 // MinAppliedTxnIDFunc returns the minimum last_applied_txn_id across all peers for a database
@@ -470,7 +471,7 @@ func (tm *TransactionManager) finalizeCommit(txn *Transaction) error {
 	}
 	tablesInvolved := strings.Join(tables, ",")
 
-	if err := tm.metaStore.CommitTransaction(txn.ID, txn.CommitTS, statementsJSON, dbName, tablesInvolved); err != nil {
+	if err := tm.metaStore.CommitTransaction(txn.ID, txn.CommitTS, statementsJSON, dbName, tablesInvolved, txn.RequiredSchemaVersion); err != nil {
 		return fmt.Errorf("failed to mark transaction as committed: %w", err)
 	}
 

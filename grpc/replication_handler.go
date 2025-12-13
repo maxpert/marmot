@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/maxpert/marmot/db"
@@ -221,6 +222,9 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 			ErrorMessage: fmt.Sprintf("failed to begin transaction: %v", err),
 		}, nil
 	}
+
+	// Set required schema version on transaction for persistence
+	txn.RequiredSchemaVersion = req.RequiredSchemaVersion
 
 	// Get MetaStore for writing CDC intent entries
 	metaStore := dbInstance.GetMetaStore()
@@ -783,7 +787,7 @@ func (rh *ReplicationHandler) applyReplayCDCStatement(tx *sql.Tx, dbName string,
 	case StatementType_INSERT, StatementType_REPLACE:
 		return rh.applyReplayCDCInsert(tx, stmt.TableName, rowChange.NewValues)
 	case StatementType_UPDATE:
-		return rh.applyReplayCDCUpdate(tx, stmt.TableName, rowChange.NewValues)
+		return rh.applyReplayCDCUpdate(tx, dbName, stmt.TableName, rowChange.OldValues, rowChange.NewValues)
 	case StatementType_DELETE:
 		return rh.applyReplayCDCDelete(tx, dbName, stmt.TableName, rowChange.OldValues)
 	default:
@@ -821,10 +825,83 @@ func (rh *ReplicationHandler) applyReplayCDCInsert(tx *sql.Tx, tableName string,
 	return err
 }
 
-// applyReplayCDCUpdate performs UPDATE using CDC row data (upsert semantics)
-func (rh *ReplicationHandler) applyReplayCDCUpdate(tx *sql.Tx, tableName string, newValues map[string][]byte) error {
-	// Convert UPDATE to INSERT OR REPLACE (upsert semantics)
-	return rh.applyReplayCDCInsert(tx, tableName, newValues)
+// applyReplayCDCUpdate performs UPDATE using CDC row data
+// Uses oldValues for WHERE clause (to find existing row) and newValues for SET clause
+func (rh *ReplicationHandler) applyReplayCDCUpdate(tx *sql.Tx, dbName, tableName string, oldValues, newValues map[string][]byte) error {
+	if len(newValues) == 0 {
+		return fmt.Errorf("no values to update")
+	}
+
+	// Get database instance to access schema
+	dbInstance, err := rh.dbMgr.GetDatabase(dbName)
+	if err != nil {
+		return fmt.Errorf("failed to get database %s: %w", dbName, err)
+	}
+
+	// Create schema provider to get table schema
+	schemaProvider := protocol.NewSchemaProvider(dbInstance.GetDB())
+	schema, err := schemaProvider.GetTableSchema(tableName)
+	if err != nil {
+		return fmt.Errorf("failed to get schema for table %s: %w", tableName, err)
+	}
+
+	if len(schema.PrimaryKeys) == 0 {
+		return fmt.Errorf("no primary key columns found for table %s", tableName)
+	}
+
+	// Build UPDATE statement with SET clause using newValues
+	// Sort columns for deterministic SQL generation
+	columns := make([]string, 0, len(newValues))
+	for col := range newValues {
+		columns = append(columns, col)
+	}
+	sort.Strings(columns)
+
+	setClauses := make([]string, 0, len(newValues))
+	values := make([]interface{}, 0, len(newValues)+len(schema.PrimaryKeys))
+
+	for _, col := range columns {
+		valBytes := newValues[col]
+		setClauses = append(setClauses, fmt.Sprintf("%s = ?", col))
+
+		var value interface{}
+		if err := encoding.Unmarshal(valBytes, &value); err != nil {
+			return fmt.Errorf("failed to deserialize value for column %s: %w", col, err)
+		}
+		values = append(values, value)
+	}
+
+	// Build WHERE clause using primary key columns from oldValues
+	// This is critical for PK changes: we need the OLD PK to find the row
+	whereClauses := make([]string, 0, len(schema.PrimaryKeys))
+
+	for _, pkCol := range schema.PrimaryKeys {
+		// Use oldValues for WHERE clause if available, fallback to newValues
+		pkBytes, ok := oldValues[pkCol]
+		if !ok {
+			// Fallback to newValues if oldValues doesn't have PK (shouldn't happen for UPDATEs)
+			pkBytes, ok = newValues[pkCol]
+			if !ok {
+				return fmt.Errorf("primary key column %s not found in CDC data", pkCol)
+			}
+		}
+
+		whereClauses = append(whereClauses, fmt.Sprintf("%s = ?", pkCol))
+
+		var value interface{}
+		if err := encoding.Unmarshal(pkBytes, &value); err != nil {
+			return fmt.Errorf("failed to deserialize PK value for column %s: %w", pkCol, err)
+		}
+		values = append(values, value)
+	}
+
+	sqlStmt := fmt.Sprintf("UPDATE %s SET %s WHERE %s",
+		tableName,
+		strings.Join(setClauses, ", "),
+		strings.Join(whereClauses, " AND "))
+
+	_, err = tx.Exec(sqlStmt, values...)
+	return err
 }
 
 // applyReplayCDCDelete performs DELETE using CDC row data

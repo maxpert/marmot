@@ -570,12 +570,13 @@ func (s *PebbleMetaStore) BeginTransaction(txnID, nodeID uint64, startTS hlc.Tim
 }
 
 // CommitTransaction marks a transaction as COMMITTED
-func (s *PebbleMetaStore) CommitTransaction(txnID uint64, commitTS hlc.Timestamp, statements []byte, dbName, tablesInvolved string) error {
+func (s *PebbleMetaStore) CommitTransaction(txnID uint64, commitTS hlc.Timestamp, statements []byte, dbName, tablesInvolved string, requiredSchemaVersion uint64) error {
 	log.Debug().
 		Uint64("txn_id", txnID).
 		Int64("commit_ts", commitTS.WallTime).
 		Str("database", dbName).
 		Int("statements_len", len(statements)).
+		Uint64("required_schema_version", requiredSchemaVersion).
 		Msg("CDC: CommitTransaction")
 
 	// Step 1: Read nodeID from transaction record
@@ -607,6 +608,7 @@ func (s *PebbleMetaStore) CommitTransaction(txnID uint64, commitTS hlc.Timestamp
 	rec.DatabaseName = dbName
 	rec.TablesInvolved = tablesInvolved
 	rec.SeqNum = seqNum
+	rec.RequiredSchemaVersion = requiredSchemaVersion
 
 	data, err := encoding.Marshal(&rec)
 	if err != nil {
