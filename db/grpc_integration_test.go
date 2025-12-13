@@ -12,7 +12,7 @@ import (
 )
 
 // Helper to create database with MetaStore for testing
-func createTestMVCCDatabase(t *testing.T, dbPath string) (*MVCCDatabase, MetaStore) {
+func createTestReplicatedDatabase(t *testing.T, dbPath string) (*ReplicatedDatabase, MetaStore) {
 	t.Helper()
 
 	metaPath := dbPath + "_meta.pebble"
@@ -31,7 +31,7 @@ func createTestMVCCDatabase(t *testing.T, dbPath string) (*MVCCDatabase, MetaSto
 	}
 
 	clock := hlc.NewClock(1)
-	mdb, err := NewMVCCDatabase(dbPath, 1, clock, metaStore)
+	mdb, err := NewReplicatedDatabase(dbPath, 1, clock, metaStore)
 	if err != nil {
 		metaStore.Close()
 		t.Fatalf("Failed to create database: %v", err)
@@ -47,9 +47,9 @@ func createTestMVCCDatabase(t *testing.T, dbPath string) (*MVCCDatabase, MetaSto
 	return mdb, metaStore
 }
 
-func TestMVCCDatabase_Creation(t *testing.T) {
+func TestReplicatedDatabase_Creation(t *testing.T) {
 	dbPath := "/tmp/test_mvcc_db.db"
-	mdb, metaStore := createTestMVCCDatabase(t, dbPath)
+	mdb, metaStore := createTestReplicatedDatabase(t, dbPath)
 	_ = mdb
 
 	// Verify MetaStore is functional by testing basic operations
@@ -78,9 +78,9 @@ func TestMVCCDatabase_Creation(t *testing.T) {
 	t.Log("✓ Database created with functional MetaStore")
 }
 
-func TestMVCCDatabase_SimpleTransaction(t *testing.T) {
+func TestReplicatedDatabase_SimpleTransaction(t *testing.T) {
 	dbPath := "/tmp/test_simple_txn.db"
-	mdb, metaStore := createTestMVCCDatabase(t, dbPath)
+	mdb, metaStore := createTestReplicatedDatabase(t, dbPath)
 
 	// Create user table
 	_, err := mdb.Exec(context.Background(), `
@@ -121,9 +121,9 @@ func TestMVCCDatabase_SimpleTransaction(t *testing.T) {
 	t.Log("✓ Simple transaction executed and committed successfully")
 }
 
-func TestMVCCDatabase_ConflictDetection(t *testing.T) {
+func TestReplicatedDatabase_ConflictDetection(t *testing.T) {
 	dbPath := "/tmp/test_conflict.db"
-	mdb, _ := createTestMVCCDatabase(t, dbPath)
+	mdb, _ := createTestReplicatedDatabase(t, dbPath)
 
 	// Create user table
 	_, err := mdb.Exec(context.Background(), `
@@ -182,9 +182,9 @@ func TestMVCCDatabase_ConflictDetection(t *testing.T) {
 	_ = mdb.GetTransactionManager().AbortTransaction(txn2)
 }
 
-func TestMVCCDatabase_Query(t *testing.T) {
+func TestReplicatedDatabase_Query(t *testing.T) {
 	dbPath := "/tmp/test_query.db"
-	mdb, _ := createTestMVCCDatabase(t, dbPath)
+	mdb, _ := createTestReplicatedDatabase(t, dbPath)
 
 	// Create and populate table
 	_, err := mdb.Exec(context.Background(), `
@@ -228,9 +228,9 @@ func TestMVCCDatabase_Query(t *testing.T) {
 	t.Logf("✓ Query executed successfully: id=%d, name=%s, balance=%d", id, name, balance)
 }
 
-func TestMVCCDatabase_GetTransaction(t *testing.T) {
+func TestReplicatedDatabase_GetTransaction(t *testing.T) {
 	dbPath := "/tmp/test_get_txn.db"
-	mdb, _ := createTestMVCCDatabase(t, dbPath)
+	mdb, _ := createTestReplicatedDatabase(t, dbPath)
 
 	// Begin transaction
 	txn, err := mdb.GetTransactionManager().BeginTransaction(1)
@@ -262,9 +262,9 @@ func TestMVCCDatabase_GetTransaction(t *testing.T) {
 	t.Log("✓ Transaction removed from active set after abort")
 }
 
-func TestMVCCDatabase_ConcurrentReads(t *testing.T) {
+func TestReplicatedDatabase_ConcurrentReads(t *testing.T) {
 	dbPath := "/tmp/test_concurrent_reads.db"
-	mdb, _ := createTestMVCCDatabase(t, dbPath)
+	mdb, _ := createTestReplicatedDatabase(t, dbPath)
 
 	// Create and populate table
 	_, err := mdb.Exec(context.Background(), `
@@ -313,9 +313,9 @@ func TestMVCCDatabase_ConcurrentReads(t *testing.T) {
 	t.Log("✓ 10 concurrent reads executed successfully")
 }
 
-func TestMVCCDatabase_TransactionLifecycle(t *testing.T) {
+func TestReplicatedDatabase_TransactionLifecycle(t *testing.T) {
 	dbPath := "/tmp/test_txn_lifecycle.db"
-	mdb, metaStore := createTestMVCCDatabase(t, dbPath)
+	mdb, metaStore := createTestReplicatedDatabase(t, dbPath)
 
 	// Create table
 	_, err := mdb.Exec(context.Background(), `
@@ -382,8 +382,8 @@ func TestMVCCDatabase_TransactionLifecycle(t *testing.T) {
 	t.Logf("✓ Transaction record shows status: %s", rec.Status)
 }
 
-// TestMVCCDatabase_Close verifies that Close() properly stops GC and closes all connections
-func TestMVCCDatabase_Close(t *testing.T) {
+// TestReplicatedDatabase_Close verifies that Close() properly stops GC and closes all connections
+func TestReplicatedDatabase_Close(t *testing.T) {
 	dbPath := "/tmp/test_mvcc_close.db"
 	metaPath := dbPath + "_meta.pebble"
 	os.Remove(dbPath)
@@ -401,9 +401,9 @@ func TestMVCCDatabase_Close(t *testing.T) {
 		t.Fatalf("Failed to create MetaStore: %v", err)
 	}
 
-	// Create MVCCDatabase
+	// Create ReplicatedDatabase
 	clock := hlc.NewClock(1)
-	mdb, err := NewMVCCDatabase(dbPath, 1, clock, metaStore)
+	mdb, err := NewReplicatedDatabase(dbPath, 1, clock, metaStore)
 	if err != nil {
 		metaStore.Close()
 		t.Fatalf("Failed to create database: %v", err)
@@ -431,15 +431,15 @@ func TestMVCCDatabase_Close(t *testing.T) {
 		t.Error("GC should be stopped after Close()")
 	}
 
-	t.Log("✓ MVCCDatabase.Close() properly stops GC and closes connections")
+	t.Log("✓ ReplicatedDatabase.Close() properly stops GC and closes connections")
 
 	// Cleanup
 	os.Remove(dbPath)
 	os.RemoveAll(metaPath)
 }
 
-// TestMVCCDatabase_CloseMultipleTimes verifies that Close() is safe to call multiple times
-func TestMVCCDatabase_CloseMultipleTimes(t *testing.T) {
+// TestReplicatedDatabase_CloseMultipleTimes verifies that Close() is safe to call multiple times
+func TestReplicatedDatabase_CloseMultipleTimes(t *testing.T) {
 	dbPath := "/tmp/test_mvcc_close_multi.db"
 	metaPath := dbPath + "_meta.pebble"
 	os.Remove(dbPath)
@@ -457,7 +457,7 @@ func TestMVCCDatabase_CloseMultipleTimes(t *testing.T) {
 	}
 
 	clock := hlc.NewClock(1)
-	mdb, err := NewMVCCDatabase(dbPath, 1, clock, metaStore)
+	mdb, err := NewReplicatedDatabase(dbPath, 1, clock, metaStore)
 	if err != nil {
 		metaStore.Close()
 		t.Fatalf("Failed to create database: %v", err)

@@ -26,7 +26,8 @@ func isWriteWriteConflict(err error) bool {
 	errStr := err.Error()
 	return strings.Contains(errStr, "write-write conflict") ||
 		strings.Contains(errStr, "locked by transaction") ||
-		strings.Contains(errStr, "write conflict")
+		strings.Contains(errStr, "write conflict") ||
+		strings.Contains(errStr, "write intent lost")
 }
 
 // testDBWithMetaStore holds both the user DB and MetaStore for testing

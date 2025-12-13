@@ -18,7 +18,7 @@ func TestConcurrentWriteIntentConflicts(t *testing.T) {
 	testDB := setupTestDBWithMeta(t)
 
 	clock := hlc.NewClock(1)
-	tm := NewTransactionManager(testDB.DB, testDB.MetaStore, clock)
+	tm := NewTransactionManager(testDB.DB, testDB.MetaStore, clock, NewSchemaCache())
 
 	createUserTable(t, testDB.DB)
 
@@ -104,7 +104,7 @@ func TestHighContentionHotspot(t *testing.T) {
 	testDB := setupTestDBWithMeta(t)
 
 	clock := hlc.NewClock(1)
-	tm := NewTransactionManager(testDB.DB, testDB.MetaStore, clock)
+	tm := NewTransactionManager(testDB.DB, testDB.MetaStore, clock, NewSchemaCache())
 
 	createUserTable(t, testDB.DB)
 
@@ -208,7 +208,7 @@ func TestSerializableSnapshotIsolation(t *testing.T) {
 	testDB := setupTestDBWithMeta(t)
 
 	clock := hlc.NewClock(1)
-	tm := NewTransactionManager(testDB.DB, testDB.MetaStore, clock)
+	tm := NewTransactionManager(testDB.DB, testDB.MetaStore, clock, NewSchemaCache())
 
 	createUserTable(t, testDB.DB)
 
@@ -311,7 +311,7 @@ func TestWriteIntentLifecycle(t *testing.T) {
 	testDB := setupTestDBWithMeta(t)
 
 	clock := hlc.NewClock(1)
-	tm := NewTransactionManager(testDB.DB, testDB.MetaStore, clock)
+	tm := NewTransactionManager(testDB.DB, testDB.MetaStore, clock, NewSchemaCache())
 
 	createUserTable(t, testDB.DB)
 
@@ -367,7 +367,7 @@ func TestTransactionAbortCleanup(t *testing.T) {
 	testDB := setupTestDBWithMeta(t)
 
 	clock := hlc.NewClock(1)
-	tm := NewTransactionManager(testDB.DB, testDB.MetaStore, clock)
+	tm := NewTransactionManager(testDB.DB, testDB.MetaStore, clock, NewSchemaCache())
 
 	createUserTable(t, testDB.DB)
 

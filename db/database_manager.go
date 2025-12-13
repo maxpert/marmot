@@ -26,14 +26,14 @@ const (
 
 // DatabaseProvider interface for accessing databases
 type DatabaseProvider interface {
-	GetDatabase(name string) (*MVCCDatabase, error)
+	GetDatabase(name string) (*ReplicatedDatabase, error)
 }
 
 // DatabaseManager manages multiple MVCC databases
 type DatabaseManager struct {
 	mu        sync.RWMutex
-	databases map[string]*MVCCDatabase
-	systemDB  *MVCCDatabase
+	databases map[string]*ReplicatedDatabase
+	systemDB  *ReplicatedDatabase
 	dataDir   string
 	nodeID    uint64
 	clock     *hlc.Clock
@@ -53,7 +53,7 @@ type DatabaseMetadata struct {
 // NewDatabaseManager creates a new database manager
 func NewDatabaseManager(dataDir string, nodeID uint64, clock *hlc.Clock) (*DatabaseManager, error) {
 	dm := &DatabaseManager{
-		databases:      make(map[string]*MVCCDatabase),
+		databases:      make(map[string]*ReplicatedDatabase),
 		dataDir:        dataDir,
 		nodeID:         nodeID,
 		clock:          clock,
@@ -102,7 +102,7 @@ func (dm *DatabaseManager) initSystemDatabase() error {
 		return fmt.Errorf("failed to create system meta store: %w", err)
 	}
 
-	systemDB, err := NewMVCCDatabase(systemDBPath, dm.nodeID, dm.clock, metaStore)
+	systemDB, err := NewReplicatedDatabase(systemDBPath, dm.nodeID, dm.clock, metaStore)
 	if err != nil {
 		metaStore.Close()
 		return fmt.Errorf("failed to create system database: %w", err)
@@ -171,7 +171,7 @@ func (dm *DatabaseManager) openDatabase(name, path string) error {
 		return fmt.Errorf("failed to create meta store for %s: %w", name, err)
 	}
 
-	db, err := NewMVCCDatabase(path, dm.nodeID, dm.clock, metaStore)
+	db, err := NewReplicatedDatabase(path, dm.nodeID, dm.clock, metaStore)
 	if err != nil {
 		metaStore.Close()
 		return fmt.Errorf("failed to open database %s: %w", name, err)
@@ -186,7 +186,7 @@ func (dm *DatabaseManager) openDatabase(name, path string) error {
 
 // wireGCCoordination sets up GC safe point tracking for a database
 // This ensures transaction logs are retained until all peers have applied them
-func (dm *DatabaseManager) wireGCCoordination(mdb *MVCCDatabase, dbName string) {
+func (dm *DatabaseManager) wireGCCoordination(mdb *ReplicatedDatabase, dbName string) {
 	txnMgr := mdb.GetTransactionManager()
 	txnMgr.SetDatabaseName(dbName)
 	txnMgr.SetMinAppliedTxnIDFunc(dm.GetMinAppliedTxnID)
@@ -233,7 +233,7 @@ func (dm *DatabaseManager) CreateDatabase(name string) error {
 		return fmt.Errorf("failed to create meta store: %w", err)
 	}
 
-	db, err := NewMVCCDatabase(fullPath, dm.nodeID, dm.clock, metaStore)
+	db, err := NewReplicatedDatabase(fullPath, dm.nodeID, dm.clock, metaStore)
 	if err != nil {
 		metaStore.Close()
 		cleanupMetaStoreFiles(fullPath)
@@ -323,7 +323,7 @@ func (dm *DatabaseManager) DropDatabase(name string) error {
 }
 
 // GetDatabase returns a database by name
-func (dm *DatabaseManager) GetDatabase(name string) (*MVCCDatabase, error) {
+func (dm *DatabaseManager) GetDatabase(name string) (*ReplicatedDatabase, error) {
 	dm.mu.RLock()
 	defer dm.mu.RUnlock()
 
@@ -344,8 +344,8 @@ func (dm *DatabaseManager) GetDatabaseConnection(name string) (*sql.DB, error) {
 	return mvccDB.GetDB(), nil
 }
 
-// GetMVCCDatabase returns the MVCCDatabase as coordinator.MVCCDatabaseProvider
-func (dm *DatabaseManager) GetMVCCDatabase(name string) (coordinator.MVCCDatabaseProvider, error) {
+// GetReplicatedDatabase returns the ReplicatedDatabase as coordinator.ReplicatedDatabaseProvider
+func (dm *DatabaseManager) GetReplicatedDatabase(name string) (coordinator.ReplicatedDatabaseProvider, error) {
 	return dm.GetDatabase(name)
 }
 
@@ -375,7 +375,7 @@ func (dm *DatabaseManager) ListDatabases() []string {
 }
 
 // GetSystemDatabase returns the system database
-func (dm *DatabaseManager) GetSystemDatabase() *MVCCDatabase {
+func (dm *DatabaseManager) GetSystemDatabase() *ReplicatedDatabase {
 	return dm.systemDB
 }
 
@@ -444,7 +444,7 @@ func (dm *DatabaseManager) ReopenDatabase(name string) error {
 	}
 
 	// Create new database connection FIRST (before closing old one)
-	newDB, err := NewMVCCDatabase(fullPath, dm.nodeID, dm.clock, metaStore)
+	newDB, err := NewReplicatedDatabase(fullPath, dm.nodeID, dm.clock, metaStore)
 	if err != nil {
 		metaStore.Close()
 		dm.mu.Unlock()
@@ -628,7 +628,7 @@ func (dm *DatabaseManager) ImportExistingDatabases(importDir string) (int, error
 		}
 
 		// Open and register the database
-		db, err := NewMVCCDatabase(dstPath, dm.nodeID, dm.clock, metaStore)
+		db, err := NewReplicatedDatabase(dstPath, dm.nodeID, dm.clock, metaStore)
 		if err != nil {
 			log.Warn().Err(err).Str("name", dbName).Msg("Failed to open imported database")
 			metaStore.Close()
@@ -798,7 +798,7 @@ func (dm *DatabaseManager) TakeSnapshot() ([]SnapshotInfo, uint64, error) {
 }
 
 // checkpointDatabase forces a WAL checkpoint to ensure data is in the main database file
-func (dm *DatabaseManager) checkpointDatabase(db *MVCCDatabase) error {
+func (dm *DatabaseManager) checkpointDatabase(db *ReplicatedDatabase) error {
 	_, err := db.GetDB().Exec("PRAGMA wal_checkpoint(TRUNCATE)")
 	return err
 }
@@ -933,7 +933,7 @@ func (dm *DatabaseManager) runPeriodicCheckpoint() {
 // doPassiveCheckpoint runs PASSIVE checkpoint on all databases (non-blocking)
 func (dm *DatabaseManager) doPassiveCheckpoint() {
 	dm.mu.RLock()
-	databases := make([]*MVCCDatabase, 0, len(dm.databases))
+	databases := make([]*ReplicatedDatabase, 0, len(dm.databases))
 	for _, db := range dm.databases {
 		databases = append(databases, db)
 	}

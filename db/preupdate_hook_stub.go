@@ -7,49 +7,55 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"sync"
 )
 
 var ErrPreupdateHookNotEnabled = errors.New("preupdate hook requires build tag: sqlite_preupdate_hook")
 
+// TableSchema represents a lightweight schema for CDC hooks (stub).
+type TableSchema struct {
+	Columns     []string
+	PrimaryKeys []string
+	PKIndices   []int
+}
+
 // SchemaCache is a stub when preupdate hook is not enabled
 type SchemaCache struct {
 	mu    sync.RWMutex
-	cache map[string]*tableSchema
-}
-
-type tableSchema struct {
-	columns   []string
-	pkColumns []string
-	pkIndices []int
+	cache map[string]*TableSchema
 }
 
 // NewSchemaCache creates a stub schema cache
 func NewSchemaCache() *SchemaCache {
 	return &SchemaCache{
-		cache: make(map[string]*tableSchema),
+		cache: make(map[string]*TableSchema),
 	}
 }
 
-// Get returns nil (stub)
-func (c *SchemaCache) Get(tableName string) *tableSchema {
-	return nil
+// GetSchemaFor returns an error indicating preupdate hooks are not enabled
+func (c *SchemaCache) GetSchemaFor(tableName string) (*TableSchema, error) {
+	return nil, ErrPreupdateHookNotEnabled
 }
 
-// Set is a no-op (stub)
-func (c *SchemaCache) Set(tableName string, schema *tableSchema) {}
+// Reload returns an error indicating preupdate hooks are not enabled
+func (c *SchemaCache) Reload(conn interface{}) error {
+	return ErrPreupdateHookNotEnabled
+}
 
-// Invalidate is a no-op (stub)
-func (c *SchemaCache) Invalidate(tableName string) {}
+// Clear is a no-op (stub)
+func (c *SchemaCache) Clear() {}
 
-// InvalidateAll is a no-op (stub)
-func (c *SchemaCache) InvalidateAll() {}
+// LoadTable returns an error indicating preupdate hooks are not enabled
+func (c *SchemaCache) LoadTable(conn interface{}, tableName string) error {
+	return fmt.Errorf("cannot load table %s: %w", tableName, ErrPreupdateHookNotEnabled)
+}
 
 // EphemeralHookSession is a stub when preupdate hook is not enabled
 type EphemeralHookSession struct{}
 
 // StartEphemeralSession returns an error when preupdate hook is not enabled
-func StartEphemeralSession(ctx context.Context, userDB *sql.DB, metaStore MetaStore, schemaCache *SchemaCache, txnID uint64, tables []string) (*EphemeralHookSession, error) {
+func StartEphemeralSession(ctx context.Context, userDB *sql.DB, metaStore MetaStore, schemaCache *SchemaCache, txnID uint64) (*EphemeralHookSession, error) {
 	return nil, ErrPreupdateHookNotEnabled
 }
 

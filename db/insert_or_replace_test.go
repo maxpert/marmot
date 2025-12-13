@@ -33,7 +33,7 @@ func TestInsertOrReplaceWithHooks(t *testing.T) {
 	clock := hlc.NewClock(1)
 
 	// Create MVCC database
-	mvccDB, err := NewMVCCDatabase(dbPath, 1, clock, metaStore)
+	mvccDB, err := NewReplicatedDatabase(dbPath, 1, clock, metaStore)
 	if err != nil {
 		t.Fatalf("Failed to create MVCC database: %v", err)
 	}
@@ -51,6 +51,11 @@ func TestInsertOrReplaceWithHooks(t *testing.T) {
 	}
 
 	t.Log("Table created successfully")
+
+	// Reload schema after DDL
+	if err := mvccDB.ReloadSchema(); err != nil {
+		t.Fatalf("Failed to reload schema: %v", err)
+	}
 
 	// Step 1: Insert a row
 	t.Log("Step 1: Inserting initial row")
@@ -143,7 +148,7 @@ func TestInsertOrReplaceNewRow(t *testing.T) {
 	defer metaStore.Close()
 
 	clock := hlc.NewClock(1)
-	mvccDB, err := NewMVCCDatabase(dbPath, 1, clock, metaStore)
+	mvccDB, err := NewReplicatedDatabase(dbPath, 1, clock, metaStore)
 	if err != nil {
 		t.Fatalf("Failed to create MVCC database: %v", err)
 	}
@@ -206,7 +211,7 @@ func TestLastInsertIdCapture(t *testing.T) {
 	defer metaStore.Close()
 
 	clock := hlc.NewClock(1)
-	mvccDB, err := NewMVCCDatabase(dbPath, 1, clock, metaStore)
+	mvccDB, err := NewReplicatedDatabase(dbPath, 1, clock, metaStore)
 	if err != nil {
 		t.Fatalf("Failed to create MVCC database: %v", err)
 	}
@@ -221,6 +226,11 @@ func TestLastInsertIdCapture(t *testing.T) {
 	`)
 	if err != nil {
 		t.Fatalf("Failed to create table: %v", err)
+	}
+
+	// Reload schema after DDL
+	if err := mvccDB.ReloadSchema(); err != nil {
+		t.Fatalf("Failed to reload schema: %v", err)
 	}
 
 	// Test 1: Insert a row and verify lastInsertId

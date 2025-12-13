@@ -42,14 +42,14 @@ func (m *MockReplicator) ReplicateTransaction(ctx context.Context, nodeID uint64
 
 // TestDatabaseManager wraps a single MVCC database for testing
 type TestDatabaseManager struct {
-	db *db.MVCCDatabase
+	db *db.ReplicatedDatabase
 }
 
-func NewTestDatabaseManager(mvccDB *db.MVCCDatabase) *TestDatabaseManager {
+func NewTestDatabaseManager(mvccDB *db.ReplicatedDatabase) *TestDatabaseManager {
 	return &TestDatabaseManager{db: mvccDB}
 }
 
-func (tdm *TestDatabaseManager) GetDatabase(name string) (*db.MVCCDatabase, error) {
+func (tdm *TestDatabaseManager) GetDatabase(name string) (*db.ReplicatedDatabase, error) {
 	// For testing, always return the single database regardless of name
 	return tdm.db, nil
 }
@@ -74,7 +74,7 @@ func (tdm *TestDatabaseManager) GetDatabaseConnection(name string) (*sql.DB, err
 	return tdm.db.GetDB(), nil
 }
 
-func (tdm *TestDatabaseManager) GetMVCCDatabase(name string) (coordinator.MVCCDatabaseProvider, error) {
+func (tdm *TestDatabaseManager) GetReplicatedDatabase(name string) (coordinator.ReplicatedDatabaseProvider, error) {
 	return tdm.db, nil
 }
 
@@ -89,7 +89,7 @@ func TestMySQLServerIntegration(t *testing.T) {
 	defer metaStore.Close()
 
 	clock := hlc.NewClock(1)
-	mvccDB, err := db.NewMVCCDatabase(dbPath, 1, clock, metaStore)
+	mvccDB, err := db.NewReplicatedDatabase(dbPath, 1, clock, metaStore)
 	require.NoError(t, err)
 	defer mvccDB.Close()
 

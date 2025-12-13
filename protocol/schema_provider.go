@@ -12,7 +12,11 @@ import (
 	"github.com/maxpert/marmot/protocol/filter"
 )
 
-// TableSchema represents the schema of a table
+// TableSchema represents the schema of a table for SQL transpilation and intent key generation.
+// This is different from db.TableSchema which is optimized for CDC preupdate hooks.
+//
+// NOTE: For new code, prefer using db.SchemaCache for accessing table schemas.
+// SchemaProvider is kept for backward compatibility with existing code that uses SQL queries.
 type TableSchema struct {
 	TableName        string
 	PrimaryKeys      []string // Column names that form the primary key
@@ -27,29 +31,39 @@ type Querier interface {
 	Query(query string, args ...interface{}) (*sql.Rows, error)
 }
 
-// SchemaProvider queries table schema information from SQLite
-// SQLite already caches this information, so we don't need our own cache
+// SchemaProvider queries table schema information from SQLite.
+// SQLite already caches this information, so we don't need our own cache.
+//
+// DEPRECATED: New code should use db.SchemaCache instead, which provides
+// efficient schema caching for CDC operations. SchemaProvider is kept for
+// backward compatibility with code that needs to query schemas via SQL.
 type SchemaProvider struct {
 	querier Querier
 	mu      sync.RWMutex
 }
 
-// NewSchemaProvider creates a new schema provider from *sql.DB
+// NewSchemaProvider creates a new schema provider from *sql.DB.
+//
+// DEPRECATED: Use db.SchemaCache for new code.
 func NewSchemaProvider(db *sql.DB) *SchemaProvider {
 	return &SchemaProvider{
 		querier: db,
 	}
 }
 
-// NewSchemaProviderFromQuerier creates a schema provider from any Querier
+// NewSchemaProviderFromQuerier creates a schema provider from any Querier.
+//
+// DEPRECATED: Use db.SchemaCache for new code.
 func NewSchemaProviderFromQuerier(q Querier) *SchemaProvider {
 	return &SchemaProvider{
 		querier: q,
 	}
 }
 
-// GetTableSchema queries SQLite for table schema
-// This is fast because SQLite caches schema information internally
+// GetTableSchema queries SQLite for table schema.
+// This is fast because SQLite caches schema information internally.
+//
+// DEPRECATED: Use db.SchemaCache.GetSchemaFor() for new code.
 func (sp *SchemaProvider) GetTableSchema(tableName string) (*TableSchema, error) {
 	sp.mu.RLock()
 	defer sp.mu.RUnlock()
@@ -137,8 +151,8 @@ func (sp *SchemaProvider) GetTableSchema(tableName string) (*TableSchema, error)
 	return schema, nil
 }
 
-// calculateSchemaVersion creates a deterministic version number from schema
-// This ensures all nodes agree on schema version
+// calculateSchemaVersion creates a deterministic version number from schema.
+// This ensures all nodes agree on schema version.
 func (sp *SchemaProvider) calculateSchemaVersion(schema *TableSchema) uint64 {
 	// Create a deterministic string representation of schema
 	var b strings.Builder

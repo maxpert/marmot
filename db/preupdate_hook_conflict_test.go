@@ -6,10 +6,12 @@ package db
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 
+	"github.com/mattn/go-sqlite3"
 	_ "github.com/mattn/go-sqlite3"
 )
 
@@ -56,6 +58,33 @@ func setupConflictTestDBs(t *testing.T) (userDB *sql.DB, metaStore MetaStore, cl
 	return userDB, metaStore, cleanup
 }
 
+// loadSchemasForTables loads table schemas into the cache using the DB connection
+func loadSchemasForTables(t *testing.T, userDB *sql.DB, schemaCache *SchemaCache, tables ...string) {
+	conn, err := userDB.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("failed to get connection: %v", err)
+	}
+	defer conn.Close()
+
+	err = conn.Raw(func(driverConn interface{}) error {
+		sqliteConn, ok := driverConn.(*sqlite3.SQLiteConn)
+		if !ok {
+			return fmt.Errorf("unexpected driver connection type")
+		}
+
+		for _, table := range tables {
+			if err := schemaCache.LoadTable(sqliteConn, table); err != nil {
+				return fmt.Errorf("failed to load schema for %s: %w", table, err)
+			}
+		}
+		return nil
+	})
+
+	if err != nil {
+		t.Fatalf("failed to load schemas: %v", err)
+	}
+}
+
 // TestHookSession_RowConflict verifies that the CDC row lock mechanism works correctly
 // by testing the lock acquisition and conflict detection using direct MetaStore API.
 func TestHookSession_RowConflict(t *testing.T) {
@@ -77,8 +106,11 @@ func TestHookSession_RowConflict(t *testing.T) {
 	ctx := context.Background()
 	schemaCache := NewSchemaCache()
 
+	// Pre-load schemas for test tables
+	loadSchemasForTables(t, userDB, schemaCache, "users")
+
 	// Session 1: Start transaction and modify row 1
-	session1, err := StartEphemeralSession(ctx, userDB, metaStore, schemaCache, 1001, []string{"users"})
+	session1, err := StartEphemeralSession(ctx, userDB, metaStore, schemaCache, 1001)
 	if err != nil {
 		t.Fatalf("failed to start session1: %v", err)
 	}
@@ -146,8 +178,11 @@ func TestHookSession_DifferentRowsNoConflict(t *testing.T) {
 	ctx := context.Background()
 	schemaCache := NewSchemaCache()
 
+	// Pre-load schemas for test tables
+	loadSchemasForTables(t, userDB, schemaCache, "users")
+
 	// Single session: Modify different rows - should not conflict with itself
-	session1, err := StartEphemeralSession(ctx, userDB, metaStore, schemaCache, 2001, []string{"users"})
+	session1, err := StartEphemeralSession(ctx, userDB, metaStore, schemaCache, 2001)
 	if err != nil {
 		t.Fatalf("failed to start session1: %v", err)
 	}
@@ -219,7 +254,10 @@ func TestHookSession_DifferentTablesNoConflict(t *testing.T) {
 	schemaCache := NewSchemaCache()
 
 	// Single session: Modify both tables - should not conflict
-	session1, err := StartEphemeralSession(ctx, userDB, metaStore, schemaCache, 3001, []string{"users", "posts"})
+	session1, err := StartEphemeralSession(ctx, userDB, metaStore, schemaCache, 3001)
+
+	// Pre-load schemas for test tables
+	loadSchemasForTables(t, userDB, schemaCache, "users", "posts")
 	if err != nil {
 		t.Fatalf("failed to start session1: %v", err)
 	}
@@ -275,10 +313,13 @@ func TestHookSession_CleanupReleasesLocks(t *testing.T) {
 	schemaCache := NewSchemaCache()
 
 	// Session 1: Acquire lock on row 1
-	session1, err := StartEphemeralSession(ctx, userDB, metaStore, schemaCache, 4001, []string{"users"})
+	session1, err := StartEphemeralSession(ctx, userDB, metaStore, schemaCache, 4001)
 	if err != nil {
 		t.Fatalf("failed to start session1: %v", err)
 	}
+
+	// Pre-load schemas for test tables
+	loadSchemasForTables(t, userDB, schemaCache, "users")
 
 	if err := session1.BeginTx(ctx); err != nil {
 		t.Fatalf("failed to begin tx in session1: %v", err)
@@ -294,7 +335,7 @@ func TestHookSession_CleanupReleasesLocks(t *testing.T) {
 	}
 
 	// Session 2: Should be able to acquire lock on same row now
-	session2, err := StartEphemeralSession(ctx, userDB, metaStore, schemaCache, 4002, []string{"users"})
+	session2, err := StartEphemeralSession(ctx, userDB, metaStore, schemaCache, 4002)
 	if err != nil {
 		t.Fatalf("failed to start session2: %v", err)
 	}
@@ -342,7 +383,10 @@ func TestHookSession_DDLBlocksDML(t *testing.T) {
 	defer metaStore.ReleaseCDCTableDDLLock("users", 5001)
 
 	// Session 1: Try to modify row in locked table (different txn)
-	session1, err := StartEphemeralSession(ctx, userDB, metaStore, schemaCache, 5002, []string{"users"})
+	session1, err := StartEphemeralSession(ctx, userDB, metaStore, schemaCache, 5002)
+
+	// Pre-load schemas for test tables
+	loadSchemasForTables(t, userDB, schemaCache, "users")
 	if err != nil {
 		t.Fatalf("failed to start session1: %v", err)
 	}
@@ -389,7 +433,7 @@ func TestHookSession_SameTxnNoConflict(t *testing.T) {
 	schemaCache := NewSchemaCache()
 
 	// Session 1: Update same row multiple times in same transaction
-	session1, err := StartEphemeralSession(ctx, userDB, metaStore, schemaCache, 6001, []string{"users"})
+	session1, err := StartEphemeralSession(ctx, userDB, metaStore, schemaCache, 6001)
 	if err != nil {
 		t.Fatalf("failed to start session1: %v", err)
 	}
@@ -399,6 +443,9 @@ func TestHookSession_SameTxnNoConflict(t *testing.T) {
 		t.Fatalf("failed to begin tx in session1: %v", err)
 	}
 
+
+	// Pre-load schemas for test tables
+	loadSchemasForTables(t, userDB, schemaCache, "users")
 	// First update
 	if err := session1.ExecContext(ctx, "UPDATE users SET name = 'alice2' WHERE id = 1"); err != nil {
 		t.Fatalf("session1 first update failed: %v", err)
@@ -439,8 +486,11 @@ func TestHookSession_InsertDeleteSameSession(t *testing.T) {
 	ctx := context.Background()
 	schemaCache := NewSchemaCache()
 
+	// Pre-load schemas for test tables
+	loadSchemasForTables(t, userDB, schemaCache, "users")
+
 	// Session 1: Perform multiple operations
-	session1, err := StartEphemeralSession(ctx, userDB, metaStore, schemaCache, 7001, []string{"users"})
+	session1, err := StartEphemeralSession(ctx, userDB, metaStore, schemaCache, 7001)
 	if err != nil {
 		t.Fatalf("failed to start session1: %v", err)
 	}

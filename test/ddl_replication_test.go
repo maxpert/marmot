@@ -86,7 +86,7 @@ func (m *DDLMockDatabaseManager) GetDatabaseConnection(name string) (*sql.DB, er
 	return sqlDB, nil
 }
 
-func (m *DDLMockDatabaseManager) GetMVCCDatabase(name string) (coordinator.MVCCDatabaseProvider, error) {
+func (m *DDLMockDatabaseManager) GetReplicatedDatabase(name string) (coordinator.ReplicatedDatabaseProvider, error) {
 	// Not implemented in DDL mock
 	return nil, fmt.Errorf("not implemented in DDL mock")
 }

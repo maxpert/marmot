@@ -16,7 +16,7 @@ import (
 // Ensure PendingLocalExecution implements coordinator.PendingExecution
 var _ coordinator.PendingExecution = (*PendingLocalExecution)(nil)
 
-// MVCCDatabase wraps a SQL database with distributed transaction support
+// ReplicatedDatabase wraps a SQL database with distributed transaction support
 // This is the main integration point between application layer and transactional storage
 //
 // SQLite WAL mode allows ONE writer + MANY concurrent readers.
@@ -25,7 +25,7 @@ var _ coordinator.PendingExecution = (*PendingLocalExecution)(nil)
 // - hookDB: Single connection for CDC hook capture (separate from writeDB to avoid deadlock)
 // - readDB: Multiple connections for concurrent reads (pool_size from config)
 // - metaStore: Separate MetaStore for transaction metadata (separate file)
-type MVCCDatabase struct {
+type ReplicatedDatabase struct {
 	writeDB       *sql.DB   // Write connection (pool size=1, _txlock=immediate)
 	hookDB        *sql.DB   // Hook connection for CDC capture (pool size=1, released before 2PC)
 	readDB        *sql.DB   // Read connection pool (pool size from config)
@@ -42,9 +42,9 @@ type MVCCDatabase struct {
 // This is injected from the coordinator layer
 type ReplicationFunc func(ctx context.Context, txn *Transaction) error
 
-// NewMVCCDatabase creates a new transaction-enabled database
+// NewReplicatedDatabase creates a new transaction-enabled database
 // metaStore is the MetaStore for storing transaction metadata (intent entries, txn records, etc.)
-func NewMVCCDatabase(dbPath string, nodeID uint64, clock *hlc.Clock, metaStore MetaStore) (*MVCCDatabase, error) {
+func NewReplicatedDatabase(dbPath string, nodeID uint64, clock *hlc.Clock, metaStore MetaStore) (*ReplicatedDatabase, error) {
 	// Get timeout from config (LockWaitTimeoutSeconds is in seconds, SQLite needs milliseconds)
 	busyTimeoutMS := cfg.Config.Transaction.LockWaitTimeoutSeconds * 1000
 	poolCfg := cfg.Config.ConnectionPool
@@ -157,14 +157,17 @@ func NewMVCCDatabase(dbPath string, nodeID uint64, clock *hlc.Clock, metaStore M
 		}
 	}
 
-	// Create transaction manager (uses write connection + MetaStore)
-	txnMgr := NewTransactionManager(writeDB, metaStore, clock)
+	// Create schema cache (shared by TransactionManager and preupdate hooks)
+	schemaCache := NewSchemaCache()
+
+	// Create transaction manager (uses write connection + MetaStore + schema cache)
+	txnMgr := NewTransactionManager(writeDB, metaStore, clock, schemaCache)
 
 	// Create commit batcher for SQLite-level batching (uses write connection)
 	commitBatcher := NewCommitBatcher(writeDB, 20, 2*time.Millisecond)
 	commitBatcher.Start()
 
-	return &MVCCDatabase{
+	return &ReplicatedDatabase{
 		writeDB:       writeDB,
 		hookDB:        hookDB,
 		readDB:        readDB,
@@ -173,44 +176,44 @@ func NewMVCCDatabase(dbPath string, nodeID uint64, clock *hlc.Clock, metaStore M
 		clock:         clock,
 		nodeID:        nodeID,
 		commitBatcher: commitBatcher,
-		schemaCache:   NewSchemaCache(),
+		schemaCache:   schemaCache,
 	}, nil
 }
 
 // SetReplicationFunc sets the replication function
-func (mdb *MVCCDatabase) SetReplicationFunc(fn ReplicationFunc) {
+func (mdb *ReplicatedDatabase) SetReplicationFunc(fn ReplicationFunc) {
 	mdb.replicationFn = fn
 }
 
 // GetDB returns the write database handle (for backwards compatibility)
 // Prefer GetWriteDB() or GetReadDB() for explicit connection selection
-func (mdb *MVCCDatabase) GetDB() *sql.DB {
+func (mdb *ReplicatedDatabase) GetDB() *sql.DB {
 	return mdb.writeDB
 }
 
 // GetWriteDB returns the dedicated write connection (pool size=1)
-func (mdb *MVCCDatabase) GetWriteDB() *sql.DB {
+func (mdb *ReplicatedDatabase) GetWriteDB() *sql.DB {
 	return mdb.writeDB
 }
 
 // GetReadDB returns the read connection pool (pool size from config)
-func (mdb *MVCCDatabase) GetReadDB() *sql.DB {
+func (mdb *ReplicatedDatabase) GetReadDB() *sql.DB {
 	return mdb.readDB
 }
 
 // GetTransactionManager returns the transaction manager
-func (mdb *MVCCDatabase) GetTransactionManager() *TransactionManager {
+func (mdb *ReplicatedDatabase) GetTransactionManager() *TransactionManager {
 	return mdb.txnMgr
 }
 
 // GetClock returns the HLC clock
-func (mdb *MVCCDatabase) GetClock() *hlc.Clock {
+func (mdb *ReplicatedDatabase) GetClock() *hlc.Clock {
 	return mdb.clock
 }
 
 // Close closes the database connections, MetaStore, and stops GC.
 // Order is important: stop GC first, then close connections.
-func (mdb *MVCCDatabase) Close() error {
+func (mdb *ReplicatedDatabase) Close() error {
 	// Stop GC goroutine first to prevent it from accessing closed connections
 	if mdb.txnMgr != nil {
 		mdb.txnMgr.StopGarbageCollection()
@@ -245,16 +248,11 @@ func (mdb *MVCCDatabase) Close() error {
 	return nil
 }
 
-// GetSchemaCache returns the shared schema cache for preupdate hooks
-func (mdb *MVCCDatabase) GetSchemaCache() *SchemaCache {
-	return mdb.schemaCache
-}
-
 // CloseSQLiteConnections closes all SQLite connections synchronously.
 // This MUST be called BEFORE replacing database files during snapshot apply.
 // After file replacement, call OpenSQLiteConnections to create new connections.
 // Note: This does NOT touch MetaStore (PebbleDB) - only SQLite connections.
-func (mdb *MVCCDatabase) CloseSQLiteConnections() {
+func (mdb *ReplicatedDatabase) CloseSQLiteConnections() {
 	if mdb.writeDB != nil {
 		mdb.writeDB.Close()
 		mdb.writeDB = nil
@@ -272,7 +270,7 @@ func (mdb *MVCCDatabase) CloseSQLiteConnections() {
 // OpenSQLiteConnections opens new SQLite connections to the database file.
 // This MUST be called AFTER database files have been replaced during snapshot apply.
 // Note: This does NOT touch MetaStore (PebbleDB) - only SQLite connections.
-func (mdb *MVCCDatabase) OpenSQLiteConnections(dbPath string) error {
+func (mdb *ReplicatedDatabase) OpenSQLiteConnections(dbPath string) error {
 	busyTimeoutMS := cfg.Config.Transaction.LockWaitTimeoutSeconds * 1000
 	poolCfg := cfg.Config.ConnectionPool
 
@@ -358,22 +356,32 @@ func (mdb *MVCCDatabase) OpenSQLiteConnections(dbPath string) error {
 	mdb.hookDB = hookDB
 	mdb.readDB = readDB
 
-	// Invalidate schema cache since tables may have changed
+	// Reload schema after opening new connections (replaces Clear + manual reload)
+	// This ensures schema cache is populated before any CDC operations
 	if mdb.schemaCache != nil {
-		mdb.schemaCache.InvalidateAll()
+		if err := mdb.ReloadSchema(); err != nil {
+			// On reload failure, clean up and return error
+			writeDB.Close()
+			hookDB.Close()
+			readDB.Close()
+			mdb.writeDB = nil
+			mdb.hookDB = nil
+			mdb.readDB = nil
+			return fmt.Errorf("failed to reload schema: %w", err)
+		}
 	}
 
 	return nil
 }
 
 // GetMetaStore returns the MetaStore for transaction metadata
-func (mdb *MVCCDatabase) GetMetaStore() MetaStore {
+func (mdb *ReplicatedDatabase) GetMetaStore() MetaStore {
 	return mdb.metaStore
 }
 
 // ApplyCDCEntries applies CDC data entries to SQLite.
 // Used by CompletedLocalExecution.Commit() to persist data captured during hooks.
-func (mdb *MVCCDatabase) ApplyCDCEntries(entries []*IntentEntry) error {
+func (mdb *ReplicatedDatabase) ApplyCDCEntries(entries []*IntentEntry) error {
 	if mdb.txnMgr == nil {
 		return fmt.Errorf("transaction manager not initialized")
 	}
@@ -384,7 +392,7 @@ func (mdb *MVCCDatabase) ApplyCDCEntries(entries []*IntentEntry) error {
 // The SQLite transaction is held open until Commit or Rollback is called
 type PendingLocalExecution struct {
 	session *EphemeralHookSession // Ephemeral session (owns its connection)
-	db      *MVCCDatabase
+	db      *ReplicatedDatabase
 }
 
 // CompletedLocalExecution represents a CDC capture that's already been rolled back.
@@ -395,7 +403,7 @@ type CompletedLocalExecution struct {
 	rowCounts    map[string]int64
 	keyHashes    map[string][]uint64
 	lastInsertId int64
-	db           *MVCCDatabase
+	db           *ReplicatedDatabase
 }
 
 // Ensure CompletedLocalExecution implements coordinator.PendingExecution
@@ -582,21 +590,10 @@ func (p *PendingLocalExecution) GetLastInsertId() int64 {
 //
 // This design avoids deadlock: hookDB is released before 2PC broadcast,
 // so incoming COMMIT from other coordinators can acquire writeDB.
-func (mdb *MVCCDatabase) ExecuteLocalWithHooks(ctx context.Context, txnID uint64, statements []protocol.Statement) (coordinator.PendingExecution, error) {
-	// Extract table names from statements
-	tables := make([]string, 0)
-	seen := make(map[string]struct{})
-	for _, stmt := range statements {
-		if stmt.TableName != "" {
-			if _, ok := seen[stmt.TableName]; !ok {
-				tables = append(tables, stmt.TableName)
-				seen[stmt.TableName] = struct{}{}
-			}
-		}
-	}
-
+func (mdb *ReplicatedDatabase) ExecuteLocalWithHooks(ctx context.Context, txnID uint64, statements []protocol.Statement) (coordinator.PendingExecution, error) {
 	// Create ephemeral session with hookDB (NOT writeDB - avoids deadlock)
-	session, err := StartEphemeralSession(ctx, mdb.hookDB, mdb.metaStore, mdb.schemaCache, txnID, tables)
+	// SchemaCache must be pre-populated via ReloadSchema() before calling this
+	session, err := StartEphemeralSession(ctx, mdb.hookDB, mdb.metaStore, mdb.schemaCache, txnID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to start session: %w", err)
 	}
@@ -640,7 +637,7 @@ func (mdb *MVCCDatabase) ExecuteLocalWithHooks(ctx context.Context, txnID uint64
 
 // ExecuteTransaction executes a transaction with distributed transaction semantics
 // This is the main entry point for application-level transactions
-func (mdb *MVCCDatabase) ExecuteTransaction(ctx context.Context, statements []protocol.Statement) error {
+func (mdb *ReplicatedDatabase) ExecuteTransaction(ctx context.Context, statements []protocol.Statement) error {
 	// Begin transaction
 	txn, err := mdb.txnMgr.BeginTransaction(mdb.nodeID)
 	if err != nil {
@@ -693,7 +690,7 @@ func (mdb *MVCCDatabase) ExecuteTransaction(ctx context.Context, statements []pr
 
 // ExecuteQuery executes a read query with snapshot isolation
 // Uses the read connection pool for concurrent read access
-func (mdb *MVCCDatabase) ExecuteQuery(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error) {
+func (mdb *ReplicatedDatabase) ExecuteQuery(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error) {
 	// Get current snapshot timestamp
 	snapshotTS := mdb.clock.Now()
 
@@ -713,7 +710,7 @@ func (mdb *MVCCDatabase) ExecuteQuery(ctx context.Context, query string, args ..
 // ExecuteMVCCRead executes a read query with full transactional support
 // Uses rqlite/sql AST parser for proper SQL analysis
 // Uses the read connection pool for concurrent read access
-func (mdb *MVCCDatabase) ExecuteMVCCRead(ctx context.Context, query string, args ...interface{}) ([]string, []map[string]interface{}, error) {
+func (mdb *ReplicatedDatabase) ExecuteMVCCRead(ctx context.Context, query string, args ...interface{}) ([]string, []map[string]interface{}, error) {
 	// SQLite WAL mode provides snapshot isolation at connection level
 	rows, err := mdb.readDB.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -752,7 +749,7 @@ func (mdb *MVCCDatabase) ExecuteMVCCRead(ctx context.Context, query string, args
 
 // ExecuteQueryRow executes a single-row query with snapshot isolation
 // Uses the read connection pool for concurrent read access
-func (mdb *MVCCDatabase) ExecuteQueryRow(ctx context.Context, query string, args ...interface{}) *sql.Row {
+func (mdb *ReplicatedDatabase) ExecuteQueryRow(ctx context.Context, query string, args ...interface{}) *sql.Row {
 	// Get current snapshot timestamp
 	// Note: SQLite's WAL mode provides snapshot isolation at transaction level.
 	// For structured queries requiring full transaction support with write intent checking,
@@ -765,7 +762,7 @@ func (mdb *MVCCDatabase) ExecuteQueryRow(ctx context.Context, query string, args
 
 // Exec executes a statement (for DDL and non-transactional operations)
 // Uses the write connection for data modifications
-func (mdb *MVCCDatabase) Exec(ctx context.Context, query string, args ...interface{}) (sql.Result, error) {
+func (mdb *ReplicatedDatabase) Exec(ctx context.Context, query string, args ...interface{}) (sql.Result, error) {
 	return mdb.writeDB.ExecContext(ctx, query, args...)
 }
 

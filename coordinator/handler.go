@@ -27,12 +27,12 @@ type DatabaseManager interface {
 	CreateDatabase(name string) error
 	DropDatabase(name string) error
 	GetDatabaseConnection(name string) (*sql.DB, error)
-	// GetMVCCDatabase returns the MVCCDatabase for executing with hooks
-	GetMVCCDatabase(name string) (MVCCDatabaseProvider, error)
+	// GetReplicatedDatabase returns the ReplicatedDatabase for executing with hooks
+	GetReplicatedDatabase(name string) (ReplicatedDatabaseProvider, error)
 }
 
-// MVCCDatabaseProvider provides access to MVCC database operations
-type MVCCDatabaseProvider interface {
+// ReplicatedDatabaseProvider provides access to replicated database operations
+type ReplicatedDatabaseProvider interface {
 	ExecuteLocalWithHooks(ctx context.Context, txnID uint64, statements []protocol.Statement) (PendingExecution, error)
 }
 
@@ -411,7 +411,7 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, consistency
 	var cancelHookCtx context.CancelFunc
 
 	if protocol.IsDML(stmt) && stmt.Database != "" {
-		mvccDB, err := h.dbManager.GetMVCCDatabase(stmt.Database)
+		mvccDB, err := h.dbManager.GetReplicatedDatabase(stmt.Database)
 		if err == nil {
 			// Use configured lock wait timeout for hook execution (default 50s like MySQL innodb_lock_wait_timeout)
 			hookTimeout := 50 * time.Second
@@ -884,7 +884,7 @@ func (h *CoordinatorHandler) handleCommit(session *protocol.ConnectionSession) (
 
 	for _, stmt := range txnState.Statements {
 		if protocol.IsDML(stmt) && stmt.Database != "" {
-			mvccDB, err := h.dbManager.GetMVCCDatabase(stmt.Database)
+			mvccDB, err := h.dbManager.GetReplicatedDatabase(stmt.Database)
 			if err != nil {
 				session.EndTransaction()
 				h.recentTxnIDs.Delete(txnState.TxnID)

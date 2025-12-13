@@ -43,7 +43,7 @@ type TransactionManager struct {
 	db                     *sql.DB   // User database for data operations
 	metaStore              MetaStore // MetaStore for transaction metadata
 	clock                  *hlc.Clock
-	schemaProvider         *protocol.SchemaProvider // Schema provider for table metadata
+	schemaCache            *SchemaCache // Schema cache for table metadata
 	mu                     sync.RWMutex
 	gcInterval             time.Duration
 	gcThreshold            time.Duration
@@ -58,7 +58,7 @@ type TransactionManager struct {
 }
 
 // NewTransactionManager creates a new transaction manager
-func NewTransactionManager(db *sql.DB, metaStore MetaStore, clock *hlc.Clock) *TransactionManager {
+func NewTransactionManager(db *sql.DB, metaStore MetaStore, clock *hlc.Clock, schemaCache *SchemaCache) *TransactionManager {
 	// Import config values (with fallback to defaults if config not loaded)
 	gcInterval := 30 * time.Second
 	gcThreshold := 1 * time.Hour
@@ -77,7 +77,7 @@ func NewTransactionManager(db *sql.DB, metaStore MetaStore, clock *hlc.Clock) *T
 		db:               db,
 		metaStore:        metaStore,
 		clock:            clock,
-		schemaProvider:   protocol.NewSchemaProvider(db),
+		schemaCache:      schemaCache,
 		gcInterval:       gcInterval,
 		gcThreshold:      gcThreshold,
 		gcMinRetention:   gcMinRetention,
@@ -428,6 +428,14 @@ func (tm *TransactionManager) applyDDLIntents(txnID uint64, intents []*WriteInte
 
 		log.Debug().Uint64("txn_id", txnID).Str("sql", intent.SQLStatement).Msg("DDL statement executed")
 	}
+
+	// Reload schema cache after DDL operations
+	if len(ddlIntents) > 0 && tm.schemaCache != nil {
+		if err := tm.reloadSchemaCache(); err != nil {
+			log.Warn().Err(err).Uint64("txn_id", txnID).Msg("Failed to reload schema cache after DDL")
+		}
+	}
+
 	return nil
 }
 
@@ -784,8 +792,12 @@ func (tm *TransactionManager) writeCDCUpdate(tableName string, oldValues, newVal
 		return fmt.Errorf("no values to update")
 	}
 
+	if tm.schemaCache == nil {
+		return fmt.Errorf("schema cache not initialized")
+	}
+
 	// Get table schema to build proper WHERE clause
-	schema, err := tm.schemaProvider.GetTableSchema(tableName)
+	schema, err := tm.schemaCache.GetSchemaFor(tableName)
 	if err != nil {
 		return fmt.Errorf("failed to get schema for table %s: %w", tableName, err)
 	}
@@ -843,8 +855,12 @@ func (tm *TransactionManager) writeCDCDelete(tableName string, intentKey string,
 		return fmt.Errorf("empty old values for delete")
 	}
 
+	if tm.schemaCache == nil {
+		return fmt.Errorf("schema cache not initialized")
+	}
+
 	// Get table schema to build proper WHERE clause
-	schema, err := tm.schemaProvider.GetTableSchema(tableName)
+	schema, err := tm.schemaCache.GetSchemaFor(tableName)
 	if err != nil {
 		return fmt.Errorf("failed to get schema for table %s: %w", tableName, err)
 	}

@@ -30,66 +30,120 @@ var interfacePtrPool = sync.Pool{
 	},
 }
 
-// SchemaCache provides thread-safe caching of table schemas.
-// Schemas are preloaded before transactions to avoid DB queries during hook callbacks.
-type SchemaCache struct {
-	mu    sync.RWMutex
-	cache map[string]*tableSchema
+// TableSchema represents a lightweight schema for CDC hooks.
+// Contains only the minimal information needed for preupdate hook callbacks.
+type TableSchema struct {
+	Columns     []string
+	PrimaryKeys []string
+	PKIndices   []int
 }
 
-type tableSchema struct {
-	columns   []string
-	pkColumns []string
-	pkIndices []int
+// SchemaCache provides thread-safe caching of table schemas.
+// Schemas are loaded from DB via Reload() and accessed via GetSchemaFor().
+type SchemaCache struct {
+	mu    sync.RWMutex
+	cache map[string]*TableSchema
 }
 
 // NewSchemaCache creates a new schema cache
 func NewSchemaCache() *SchemaCache {
 	return &SchemaCache{
-		cache: make(map[string]*tableSchema),
+		cache: make(map[string]*TableSchema),
 	}
 }
 
-// Get retrieves a cached schema (nil if not cached)
-func (c *SchemaCache) Get(tableName string) *tableSchema {
+// GetSchemaFor returns the cached schema for a table.
+// Returns error if schema is not cached.
+func (c *SchemaCache) GetSchemaFor(tableName string) (*TableSchema, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.cache[tableName]
+
+	schema, ok := c.cache[tableName]
+	if !ok {
+		return nil, fmt.Errorf("schema not cached for table %s", tableName)
+	}
+	return schema, nil
 }
 
-// Set stores a schema in the cache
-func (c *SchemaCache) Set(tableName string, schema *tableSchema) {
+// Reload reloads all table schemas from the database connection.
+// This should be called after DDL operations or snapshot apply.
+func (c *SchemaCache) Reload(conn *sqlite3.SQLiteConn) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	// Get list of all user tables (exclude internal tables)
+	rows, err := conn.Query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE '__marmot%'", nil)
+	if err != nil {
+		return fmt.Errorf("failed to query tables: %w", err)
+	}
+	defer rows.Close()
+
+	var tableNames []string
+	dest := make([]driver.Value, 1)
+	for {
+		if err := rows.Next(dest); err != nil {
+			if err == io.EOF {
+				break
+			}
+			return fmt.Errorf("failed to read table names: %w", err)
+		}
+		if name, ok := dest[0].(string); ok {
+			tableNames = append(tableNames, name)
+		}
+	}
+
+	// Load schema for each table
+	newCache := make(map[string]*TableSchema)
+	for _, tableName := range tableNames {
+		schema, err := loadSchema(conn, tableName)
+		if err != nil {
+			log.Warn().Err(err).Str("table", tableName).Msg("Failed to load schema during reload")
+			continue
+		}
+		newCache[tableName] = schema
+	}
+
+	// Replace cache atomically
+	c.cache = newCache
+	log.Debug().Int("tables", len(newCache)).Msg("SchemaCache reloaded")
+	return nil
+}
+
+// Clear clears all cached schemas.
+// Used when database connections are closed or invalid.
+func (c *SchemaCache) Clear() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cache = make(map[string]*TableSchema)
+}
+
+// LoadTable loads schema for a single table into the cache.
+// Used by tests and for on-demand schema loading.
+func (c *SchemaCache) LoadTable(conn *sqlite3.SQLiteConn, tableName string) error {
+	schema, err := loadSchema(conn, tableName)
+	if err != nil {
+		return err
+	}
+
+	c.mu.Lock()
 	c.cache[tableName] = schema
-}
+	c.mu.Unlock()
 
-// Invalidate removes a table from the cache (call after DDL)
-func (c *SchemaCache) Invalidate(tableName string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	delete(c.cache, tableName)
-}
-
-// InvalidateAll clears the entire cache
-func (c *SchemaCache) InvalidateAll() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.cache = make(map[string]*tableSchema)
+	return nil
 }
 
 // loadSchema fetches schema from DB using the raw SQLite connection
-func loadSchema(conn *sqlite3.SQLiteConn, tableName string) (*tableSchema, error) {
+func loadSchema(conn *sqlite3.SQLiteConn, tableName string) (*TableSchema, error) {
 	rows, err := conn.Query(fmt.Sprintf("PRAGMA table_info(%s)", tableName), nil)
 	if err != nil {
 		return nil, fmt.Errorf("query table_info: %w", err)
 	}
 	defer rows.Close()
 
-	schema := &tableSchema{
-		columns:   make([]string, 0),
-		pkColumns: make([]string, 0),
-		pkIndices: make([]int, 0),
+	schema := &TableSchema{
+		Columns:   make([]string, 0),
+		PrimaryKeys: make([]string, 0),
+		PKIndices: make([]int, 0),
 	}
 
 	// table_info returns: cid, name, type, notnull, dflt_value, pk
@@ -106,18 +160,18 @@ func loadSchema(conn *sqlite3.SQLiteConn, tableName string) (*tableSchema, error
 		name, _ := dest[1].(string)
 		pk, _ := dest[5].(int64)
 
-		schema.columns = append(schema.columns, name)
+		schema.Columns = append(schema.Columns, name)
 		if pk > 0 {
-			schema.pkColumns = append(schema.pkColumns, name)
-			schema.pkIndices = append(schema.pkIndices, colIndex)
+			schema.PrimaryKeys = append(schema.PrimaryKeys, name)
+			schema.PKIndices = append(schema.PKIndices, colIndex)
 		}
 		colIndex++
 	}
 
 	// If no PK columns found, assume rowid is the PK
-	if len(schema.pkColumns) == 0 {
-		schema.pkColumns = []string{"rowid"}
-		schema.pkIndices = []int{-1} // -1 indicates rowid
+	if len(schema.PrimaryKeys) == 0 {
+		schema.PrimaryKeys = []string{"rowid"}
+		schema.PKIndices = []int{-1} // -1 indicates rowid
 	}
 
 	return schema, nil
@@ -144,7 +198,11 @@ type EphemeralHookSession struct {
 // StartEphemeralSession creates a new CDC capture session with a dedicated connection.
 // The session owns the connection and will close it when done.
 // CDC entries are written to the per-database MetaStore during hooks.
-func StartEphemeralSession(ctx context.Context, userDB *sql.DB, metaStore MetaStore, schemaCache *SchemaCache, txnID uint64, tables []string) (*EphemeralHookSession, error) {
+//
+// IMPORTANT: SchemaCache must be pre-populated for all tables that will be accessed.
+// If a table's schema is not in the cache, its changes will be silently skipped.
+// Call ReplicatedDatabase.ReloadSchema() before starting the session to ensure schemas are loaded.
+func StartEphemeralSession(ctx context.Context, userDB *sql.DB, metaStore MetaStore, schemaCache *SchemaCache, txnID uint64) (*EphemeralHookSession, error) {
 	// Get a dedicated connection for this session
 	conn, err := userDB.Conn(ctx)
 	if err != nil {
@@ -160,22 +218,11 @@ func StartEphemeralSession(ctx context.Context, userDB *sql.DB, metaStore MetaSt
 		schemaCache: schemaCache,
 	}
 
-	// Register hook and preload schemas inside Raw() callback
+	// Register preupdate hook inside Raw() callback
 	err = conn.Raw(func(driverConn interface{}) error {
 		sqliteConn, ok := driverConn.(*sqlite3.SQLiteConn)
 		if !ok {
 			return fmt.Errorf("unexpected driver connection type: %T", driverConn)
-		}
-
-		// Preload schemas for affected tables
-		for _, tableName := range tables {
-			if schemaCache.Get(tableName) == nil {
-				schema, err := loadSchema(sqliteConn, tableName)
-				if err != nil {
-					return fmt.Errorf("failed to load schema for %s: %w", tableName, err)
-				}
-				schemaCache.Set(tableName, schema)
-			}
 		}
 
 		// Register the preupdate hook
@@ -295,20 +342,26 @@ func (s *EphemeralHookSession) cleanup() {
 }
 
 // hookCallback is called by SQLite before each row modification
+// NOTE: This is called from within SQLite's transaction processing,
+// so we cannot call back into the database connection (would deadlock).
 func (s *EphemeralHookSession) hookCallback(data sqlite3.SQLitePreUpdateData) {
 	// Skip internal tables
 	if strings.HasPrefix(data.TableName, "__marmot") {
 		return
 	}
 
+	// Get table schema from cache
+	// NOTE: We cannot load on-demand here because we're inside a hook callback.
+	// The schema MUST be pre-populated via Reload() or the table will be skipped.
+	schema, err := s.schemaCache.GetSchemaFor(data.TableName)
+	if err != nil {
+		// Schema not in cache - skip this table
+		// This is expected for tables that weren't pre-loaded
+		return
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	// Get table schema from cache
-	schema := s.schemaCache.Get(data.TableName)
-	if schema == nil {
-		return // Schema not preloaded - skip
-	}
 
 	// Get column count
 	colCount := data.Count()
@@ -343,7 +396,7 @@ func (s *EphemeralHookSession) hookCallback(data sqlite3.SQLitePreUpdateData) {
 	case sqlite3.SQLITE_INSERT:
 		operation = uint8(OpTypeInsert)
 		if err := data.New(newDest...); err == nil {
-			newValues = s.buildValueMap(schema.columns, newDest)
+			newValues = s.buildValueMap(schema.Columns, newDest)
 		}
 		pkValues := s.extractPKValuesFromDest(schema, newDest, data.NewRowID)
 		intentKey = s.serializePK(data.TableName, schema, pkValues)
@@ -351,10 +404,10 @@ func (s *EphemeralHookSession) hookCallback(data sqlite3.SQLitePreUpdateData) {
 	case sqlite3.SQLITE_UPDATE:
 		operation = uint8(OpTypeUpdate)
 		if err := data.Old(oldDest...); err == nil {
-			oldValues = s.buildValueMap(schema.columns, oldDest)
+			oldValues = s.buildValueMap(schema.Columns, oldDest)
 		}
 		if err := data.New(newDest...); err == nil {
-			newValues = s.buildValueMap(schema.columns, newDest)
+			newValues = s.buildValueMap(schema.Columns, newDest)
 		}
 		// Track both old and new PK for updates
 		oldPK := s.extractPKValuesFromDest(schema, oldDest, data.OldRowID)
@@ -375,7 +428,7 @@ func (s *EphemeralHookSession) hookCallback(data sqlite3.SQLitePreUpdateData) {
 	case sqlite3.SQLITE_DELETE:
 		operation = uint8(OpTypeDelete)
 		if err := data.Old(oldDest...); err == nil {
-			oldValues = s.buildValueMap(schema.columns, oldDest)
+			oldValues = s.buildValueMap(schema.Columns, oldDest)
 		}
 		pkValues := s.extractPKValuesFromDest(schema, oldDest, data.OldRowID)
 		intentKey = s.serializePK(data.TableName, schema, pkValues)
@@ -465,11 +518,11 @@ func (s *EphemeralHookSession) serializeValue(v interface{}) []byte {
 // extractPKValuesFromDest extracts primary key values from a destination slice.
 // PK values are converted to string representation for intent key generation,
 // ensuring compatibility with AST-based path which uses string values.
-func (s *EphemeralHookSession) extractPKValuesFromDest(schema *tableSchema, dest []interface{}, rowID int64) map[string][]byte {
+func (s *EphemeralHookSession) extractPKValuesFromDest(schema *TableSchema, dest []interface{}, rowID int64) map[string][]byte {
 	pkValues := make(map[string][]byte)
 
-	for i, idx := range schema.pkIndices {
-		colName := schema.pkColumns[i]
+	for i, idx := range schema.PKIndices {
+		colName := schema.PrimaryKeys[i]
 		if idx == -1 {
 			// rowid case
 			pkValues[colName] = []byte(fmt.Sprintf("%d", rowID))
@@ -511,8 +564,8 @@ func pkValueToBytes(v interface{}) []byte {
 }
 
 // serializePK creates a deterministic string key from PK values
-func (s *EphemeralHookSession) serializePK(table string, schema *tableSchema, pkValues map[string][]byte) string {
-	return filter.SerializeIntentKey(table, schema.pkColumns, pkValues)
+func (s *EphemeralHookSession) serializePK(table string, schema *TableSchema, pkValues map[string][]byte) string {
+	return filter.SerializeIntentKey(table, schema.PrimaryKeys, pkValues)
 }
 
 // GetRowCounts returns the number of affected rows per table

@@ -14,7 +14,7 @@ func TestHeartbeat(t *testing.T) {
 	testDB := setupTestDBWithMeta(t)
 
 	clock := hlc.NewClock(1)
-	tm := NewTransactionManager(testDB.DB, testDB.MetaStore, clock)
+	tm := NewTransactionManager(testDB.DB, testDB.MetaStore, clock, NewSchemaCache())
 	defer tm.StopGarbageCollection()
 
 	// Begin transaction
@@ -57,7 +57,7 @@ func TestHeartbeatKeepsTransactionAlive(t *testing.T) {
 	clock := hlc.NewClock(1)
 
 	// Create transaction manager with very short timeout for faster testing
-	tm := NewTransactionManager(testDB.DB, testDB.MetaStore, clock)
+	tm := NewTransactionManager(testDB.DB, testDB.MetaStore, clock, NewSchemaCache())
 	tm.heartbeatTimeout = 200 * time.Millisecond // Short timeout for testing
 	tm.StartGarbageCollection()
 	defer tm.StopGarbageCollection()
@@ -134,7 +134,7 @@ func TestStaleTransactionCleanup(t *testing.T) {
 	clock := hlc.NewClock(1)
 
 	// Create transaction manager with short timeout
-	tm := NewTransactionManager(testDB.DB, testDB.MetaStore, clock)
+	tm := NewTransactionManager(testDB.DB, testDB.MetaStore, clock, NewSchemaCache())
 	tm.heartbeatTimeout = 100 * time.Millisecond
 	tm.StartGarbageCollection()
 	defer tm.StopGarbageCollection()
@@ -192,7 +192,7 @@ func TestOldTransactionRecordCleanup(t *testing.T) {
 	testDB := setupTestDBWithMeta(t)
 
 	clock := hlc.NewClock(1)
-	tm := NewTransactionManager(testDB.DB, testDB.MetaStore, clock)
+	tm := NewTransactionManager(testDB.DB, testDB.MetaStore, clock, NewSchemaCache())
 	defer tm.StopGarbageCollection()
 
 	createUserTable(t, testDB.DB)
@@ -240,7 +240,7 @@ func TestGarbageCollectionIntegration(t *testing.T) {
 
 	clock := hlc.NewClock(1)
 
-	tm := NewTransactionManager(testDB.DB, testDB.MetaStore, clock)
+	tm := NewTransactionManager(testDB.DB, testDB.MetaStore, clock, NewSchemaCache())
 	tm.heartbeatTimeout = 100 * time.Millisecond
 	tm.StartGarbageCollection()
 	defer tm.StopGarbageCollection()
