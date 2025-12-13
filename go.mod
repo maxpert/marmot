@@ -14,8 +14,10 @@ require (
 	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/linvon/cuckoo-filter v0.4.0
 	github.com/mattn/go-sqlite3 v1.14.18
+	github.com/nats-io/nats.go v1.47.0
 	github.com/prometheus/client_golang v1.23.2
 	github.com/rs/zerolog v1.31.0
+	github.com/segmentio/kafka-go v0.4.49
 	github.com/soheilhy/cmux v0.1.5
 	github.com/stretchr/testify v1.11.1
 	github.com/vmihailenco/msgpack/v5 v5.4.1
@@ -47,7 +49,6 @@ require (
 	github.com/mattn/go-colorable v0.1.14 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
-	github.com/nats-io/nats.go v1.47.0 // indirect
 	github.com/nats-io/nkeys v0.4.11 // indirect
 	github.com/nats-io/nuid v1.0.1 // indirect
 	github.com/pierrec/lz4/v4 v4.1.15 // indirect
@@ -59,7 +60,6 @@ require (
 	github.com/prometheus/common v0.66.1 // indirect
 	github.com/prometheus/procfs v0.17.0 // indirect
 	github.com/rogpeppe/go-internal v1.14.1 // indirect
-	github.com/segmentio/kafka-go v0.4.49 // indirect
 	github.com/spf13/pflag v1.0.10 // indirect
 	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
 	go.yaml.in/yaml/v2 v2.4.3 // indirect
