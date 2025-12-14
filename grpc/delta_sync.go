@@ -12,6 +12,7 @@ import (
 	"github.com/maxpert/marmot/cfg"
 	"github.com/maxpert/marmot/db"
 	"github.com/maxpert/marmot/encoding"
+	pb "github.com/maxpert/marmot/grpc/common"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/rs/zerolog/log"
 )
@@ -390,11 +391,11 @@ func (ds *DeltaSyncClient) applyCDCStatement(tx *sql.Tx, database string, stmt *
 	}
 
 	switch stmt.Type {
-	case StatementType_INSERT, StatementType_REPLACE:
+	case pb.StatementType_INSERT, pb.StatementType_REPLACE:
 		return ds.applyCDCInsert(tx, stmt.TableName, rowChange.NewValues)
-	case StatementType_UPDATE:
+	case pb.StatementType_UPDATE:
 		return ds.applyCDCUpdate(tx, database, stmt.TableName, rowChange.OldValues, rowChange.NewValues)
-	case StatementType_DELETE:
+	case pb.StatementType_DELETE:
 		return ds.applyCDCDelete(tx, database, stmt.TableName, rowChange.OldValues)
 	default:
 		return fmt.Errorf("unsupported statement type for CDC: %v", stmt.Type)

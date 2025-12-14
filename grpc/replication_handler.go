@@ -9,8 +9,10 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/maxpert/marmot/common"
 	"github.com/maxpert/marmot/db"
 	"github.com/maxpert/marmot/encoding"
+	pb "github.com/maxpert/marmot/grpc/common"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/protocol"
 	"github.com/maxpert/marmot/telemetry"
@@ -75,7 +77,7 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 	// These operations need 2PC but don't have a user database to track the transaction in
 	if len(req.Statements) == 1 {
 		stmt := req.Statements[0]
-		stmtType := convertStatementType(stmt.Type)
+		stmtType := common.MustFromWireType(stmt.Type)
 
 		if stmtType == protocol.StatementCreateDatabase || stmtType == protocol.StatementDropDatabase {
 			// Use system database for transaction management
@@ -237,7 +239,7 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 		// Convert proto statement to internal format
 		internalStmt := protocol.Statement{
 			SQL:       stmt.GetSQL(),
-			Type:      convertStatementType(stmt.Type),
+			Type:      common.MustFromWireType(stmt.Type),
 			TableName: stmt.TableName,
 			Database:  stmt.Database,
 			IntentKey: stmt.GetIntentKey(),
@@ -800,11 +802,11 @@ func (rh *ReplicationHandler) applyReplayCDCStatement(tx *sql.Tx, dbName string,
 	}
 
 	switch stmt.Type {
-	case StatementType_INSERT, StatementType_REPLACE:
+	case pb.StatementType_INSERT, pb.StatementType_REPLACE:
 		return rh.applyReplayCDCInsert(tx, stmt.TableName, rowChange.NewValues)
-	case StatementType_UPDATE:
+	case pb.StatementType_UPDATE:
 		return rh.applyReplayCDCUpdate(tx, dbName, stmt.TableName, rowChange.OldValues, rowChange.NewValues)
-	case StatementType_DELETE:
+	case pb.StatementType_DELETE:
 		return rh.applyReplayCDCDelete(tx, dbName, stmt.TableName, rowChange.OldValues)
 	default:
 		return fmt.Errorf("unsupported statement type for CDC replay: %v", stmt.Type)
@@ -976,7 +978,7 @@ func (rh *ReplicationHandler) serializeReplayStatements(stmts []*Statement, dbNa
 	protoStmts := make([]protocol.Statement, 0, len(stmts))
 	for _, stmt := range stmts {
 		protoStmt := protocol.Statement{
-			Type:      MustFromProtoStatementType(stmt.Type),
+			Type:      common.MustFromWireType(stmt.Type),
 			TableName: stmt.TableName,
 			Database:  dbName,
 		}
@@ -1098,10 +1100,4 @@ func (rh *ReplicationHandler) HandleRead(ctx context.Context, req *ReadRequest) 
 			NodeId:   rh.nodeID,
 		},
 	}, nil
-}
-
-// Helper functions
-
-func convertStatementType(st StatementType) protocol.StatementCode {
-	return MustFromProtoStatementType(st)
 }

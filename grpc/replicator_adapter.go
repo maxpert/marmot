@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/maxpert/marmot/common"
 	"github.com/maxpert/marmot/coordinator"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/protocol"
@@ -66,8 +67,12 @@ func convertStatementsToProto(stmts []protocol.Statement, database string) []*St
 			stmtDB = database
 		}
 
+		grpcType, ok := common.ToWireType(stmt.Type)
+		if !ok {
+			panic("convertStatementsToProto: unknown statement type")
+		}
 		protoStmt := &Statement{
-			Type:      convertStatementTypeToProto(stmt.Type),
+			Type:      grpcType,
 			TableName: stmt.TableName,
 			Database:  stmtDB,
 		}
@@ -102,15 +107,8 @@ func convertStatementsToProto(stmts []protocol.Statement, database string) []*St
 	return protoStmts
 }
 
-// convertStatementTypeToProto converts protocol.StatementCode to gRPC StatementType
-func convertStatementTypeToProto(stmtType protocol.StatementCode) StatementType {
-	if st, ok := ToProtoStatementType(stmtType); ok {
-		return st
-	}
-	return StatementType_INSERT // default for unknown
-}
-
-// convertPhaseToProto converts coordinator.ReplicationPhase to gRPC TransactionPhase
+// convertPhaseToProto converts coordinator.ReplicationPhase to gRPC TransactionPhase.
+// Panics on unknown phase - internal consistency error.
 func convertPhaseToProto(phase coordinator.ReplicationPhase) TransactionPhase {
 	switch phase {
 	case coordinator.PhasePrep:
@@ -120,7 +118,7 @@ func convertPhaseToProto(phase coordinator.ReplicationPhase) TransactionPhase {
 	case coordinator.PhaseAbort:
 		return TransactionPhase_ABORT
 	default:
-		return TransactionPhase_PREPARE
+		panic(fmt.Sprintf("convertPhaseToProto: unknown replication phase %d", phase))
 	}
 }
 

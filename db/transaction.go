@@ -178,7 +178,13 @@ func (tm *TransactionManager) WriteIntent(txn *Transaction, intentType IntentTyp
 		return fmt.Errorf("transaction %d is not pending", txn.ID)
 	}
 
-	op := StatementTypeToOpType(stmt.Type)
+	// Only DML intents need OpType conversion - DDL uses SQL statement directly
+	var op OpType
+	if intentType == IntentTypeDML {
+		op = StatementTypeToOpType(stmt.Type)
+	} else {
+		op = OpTypeInsert // Placeholder for non-DML intents (DDL uses SQLStatement field)
+	}
 
 	// Persist the intent directly to MetaStore (durable storage)
 	err := tm.metaStore.WriteIntent(txn.ID, intentType, tableName, intentKey,
@@ -473,7 +479,8 @@ func (tm *TransactionManager) cleanupAfterCommit(txn *Transaction, intents []*Wr
 	}
 }
 
-// opCodeToStatementType converts OpType back to protocol.StatementCode
+// opCodeToStatementType converts OpType back to protocol.StatementCode.
+// Panics on unknown type - internal data corruption should not be silently ignored.
 func opCodeToStatementType(op uint8) protocol.StatementCode {
 	switch OpType(op) {
 	case OpTypeInsert, OpTypeReplace:
@@ -483,7 +490,7 @@ func opCodeToStatementType(op uint8) protocol.StatementCode {
 	case OpTypeDelete:
 		return protocol.StatementDelete
 	default:
-		return protocol.StatementInsert
+		panic(fmt.Sprintf("opCodeToStatementType: unknown OpType %d", op))
 	}
 }
 

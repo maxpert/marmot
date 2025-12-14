@@ -7,6 +7,7 @@
 package grpc
 
 import (
+	common "github.com/maxpert/marmot/grpc/common"
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	reflect "reflect"
@@ -175,67 +176,6 @@ func (x ConsistencyLevel) Number() protoreflect.EnumNumber {
 // Deprecated: Use ConsistencyLevel.Descriptor instead.
 func (ConsistencyLevel) EnumDescriptor() ([]byte, []int) {
 	return file_grpc_marmot_proto_rawDescGZIP(), []int{2}
-}
-
-type StatementType int32
-
-const (
-	StatementType_INSERT          StatementType = 0
-	StatementType_UPDATE          StatementType = 1
-	StatementType_DELETE          StatementType = 2
-	StatementType_REPLACE         StatementType = 3
-	StatementType_DDL             StatementType = 4
-	StatementType_CREATE_DATABASE StatementType = 5
-	StatementType_DROP_DATABASE   StatementType = 6
-)
-
-// Enum value maps for StatementType.
-var (
-	StatementType_name = map[int32]string{
-		0: "INSERT",
-		1: "UPDATE",
-		2: "DELETE",
-		3: "REPLACE",
-		4: "DDL",
-		5: "CREATE_DATABASE",
-		6: "DROP_DATABASE",
-	}
-	StatementType_value = map[string]int32{
-		"INSERT":          0,
-		"UPDATE":          1,
-		"DELETE":          2,
-		"REPLACE":         3,
-		"DDL":             4,
-		"CREATE_DATABASE": 5,
-		"DROP_DATABASE":   6,
-	}
-)
-
-func (x StatementType) Enum() *StatementType {
-	p := new(StatementType)
-	*p = x
-	return p
-}
-
-func (x StatementType) String() string {
-	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
-}
-
-func (StatementType) Descriptor() protoreflect.EnumDescriptor {
-	return file_grpc_marmot_proto_enumTypes[3].Descriptor()
-}
-
-func (StatementType) Type() protoreflect.EnumType {
-	return &file_grpc_marmot_proto_enumTypes[3]
-}
-
-func (x StatementType) Number() protoreflect.EnumNumber {
-	return protoreflect.EnumNumber(x)
-}
-
-// Deprecated: Use StatementType.Descriptor instead.
-func (StatementType) EnumDescriptor() ([]byte, []int) {
-	return file_grpc_marmot_proto_rawDescGZIP(), []int{3}
 }
 
 // ===== GOSSIP MESSAGES =====
@@ -739,7 +679,7 @@ func (x *TransactionRequest) GetRequiredSchemaVersion() uint64 {
 // Following industry standard CDC approach (MySQL binlog, TiDB TiCDC, CockroachDB)
 type Statement struct {
 	state     protoimpl.MessageState `protogen:"open.v1"`
-	Type      StatementType          `protobuf:"varint,1,opt,name=type,proto3,enum=marmot.v2.StatementType" json:"type,omitempty"`
+	Type      common.StatementType   `protobuf:"varint,1,opt,name=type,proto3,enum=marmot.common.StatementType" json:"type,omitempty"`
 	TableName string                 `protobuf:"bytes,2,opt,name=table_name,json=tableName,proto3" json:"table_name,omitempty"`
 	Database  string                 `protobuf:"bytes,3,opt,name=database,proto3" json:"database,omitempty"` // Target database name (required)
 	// Use oneof to clearly separate DML (row changes) from DDL (schema changes)
@@ -783,11 +723,11 @@ func (*Statement) Descriptor() ([]byte, []int) {
 	return file_grpc_marmot_proto_rawDescGZIP(), []int{8}
 }
 
-func (x *Statement) GetType() StatementType {
+func (x *Statement) GetType() common.StatementType {
 	if x != nil {
 		return x.Type
 	}
-	return StatementType_INSERT
+	return common.StatementType(0)
 }
 
 func (x *Statement) GetTableName() string {
@@ -2038,7 +1978,7 @@ var File_grpc_marmot_proto protoreflect.FileDescriptor
 
 const file_grpc_marmot_proto_rawDesc = "" +
 	"\n" +
-	"\x11grpc/marmot.proto\x12\tmarmot.v2\"\x83\x01\n" +
+	"\x11grpc/marmot.proto\x12\tmarmot.v2\x1a\x1fgrpc/common/marmot_common.proto\"\x83\x01\n" +
 	"\rGossipRequest\x12$\n" +
 	"\x0esource_node_id\x18\x01 \x01(\x04R\fsourceNodeId\x12*\n" +
 	"\x05nodes\x18\x02 \x03(\v2\x14.marmot.v2.NodeStateR\x05nodes\x12 \n" +
@@ -2076,9 +2016,9 @@ const file_grpc_marmot_proto_rawDesc = "" +
 	"\x05phase\x18\x05 \x01(\x0e2\x1b.marmot.v2.TransactionPhaseR\x05phase\x12=\n" +
 	"\vconsistency\x18\x06 \x01(\x0e2\x1b.marmot.v2.ConsistencyLevelR\vconsistency\x12\x1a\n" +
 	"\bdatabase\x18\a \x01(\tR\bdatabase\x126\n" +
-	"\x17required_schema_version\x18\t \x01(\x04R\x15requiredSchemaVersionJ\x04\b\b\x10\t\"\xed\x01\n" +
-	"\tStatement\x12,\n" +
-	"\x04type\x18\x01 \x01(\x0e2\x18.marmot.v2.StatementTypeR\x04type\x12\x1d\n" +
+	"\x17required_schema_version\x18\t \x01(\x04R\x15requiredSchemaVersionJ\x04\b\b\x10\t\"\xf1\x01\n" +
+	"\tStatement\x120\n" +
+	"\x04type\x18\x01 \x01(\x0e2\x1c.marmot.common.StatementTypeR\x04type\x12\x1d\n" +
 	"\n" +
 	"table_name\x18\x02 \x01(\tR\ttableName\x12\x1a\n" +
 	"\bdatabase\x18\x03 \x01(\tR\bdatabase\x125\n" +
@@ -2208,18 +2148,7 @@ const file_grpc_marmot_proto_rawDesc = "" +
 	"\x10ConsistencyLevel\x12\x13\n" +
 	"\x0fCONSISTENCY_ONE\x10\x00\x12\x16\n" +
 	"\x12CONSISTENCY_QUORUM\x10\x01\x12\x13\n" +
-	"\x0fCONSISTENCY_ALL\x10\x02*q\n" +
-	"\rStatementType\x12\n" +
-	"\n" +
-	"\x06INSERT\x10\x00\x12\n" +
-	"\n" +
-	"\x06UPDATE\x10\x01\x12\n" +
-	"\n" +
-	"\x06DELETE\x10\x02\x12\v\n" +
-	"\aREPLACE\x10\x03\x12\a\n" +
-	"\x03DDL\x10\x04\x12\x13\n" +
-	"\x0fCREATE_DATABASE\x10\x05\x12\x11\n" +
-	"\rDROP_DATABASE\x10\x062\xe7\x05\n" +
+	"\x0fCONSISTENCY_ALL\x10\x022\xe7\x05\n" +
 	"\rMarmotService\x12=\n" +
 	"\x06Gossip\x12\x18.marmot.v2.GossipRequest\x1a\x19.marmot.v2.GossipResponse\x127\n" +
 	"\x04Join\x12\x16.marmot.v2.JoinRequest\x1a\x17.marmot.v2.JoinResponse\x127\n" +
@@ -2244,96 +2173,96 @@ func file_grpc_marmot_proto_rawDescGZIP() []byte {
 	return file_grpc_marmot_proto_rawDescData
 }
 
-var file_grpc_marmot_proto_enumTypes = make([]protoimpl.EnumInfo, 4)
+var file_grpc_marmot_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
 var file_grpc_marmot_proto_msgTypes = make([]protoimpl.MessageInfo, 33)
 var file_grpc_marmot_proto_goTypes = []any{
 	(NodeStatus)(0),                  // 0: marmot.v2.NodeStatus
 	(TransactionPhase)(0),            // 1: marmot.v2.TransactionPhase
 	(ConsistencyLevel)(0),            // 2: marmot.v2.ConsistencyLevel
-	(StatementType)(0),               // 3: marmot.v2.StatementType
-	(*GossipRequest)(nil),            // 4: marmot.v2.GossipRequest
-	(*GossipResponse)(nil),           // 5: marmot.v2.GossipResponse
-	(*NodeState)(nil),                // 6: marmot.v2.NodeState
-	(*JoinRequest)(nil),              // 7: marmot.v2.JoinRequest
-	(*JoinResponse)(nil),             // 8: marmot.v2.JoinResponse
-	(*PingRequest)(nil),              // 9: marmot.v2.PingRequest
-	(*PingResponse)(nil),             // 10: marmot.v2.PingResponse
-	(*TransactionRequest)(nil),       // 11: marmot.v2.TransactionRequest
-	(*Statement)(nil),                // 12: marmot.v2.Statement
-	(*RowChange)(nil),                // 13: marmot.v2.RowChange
-	(*DDLChange)(nil),                // 14: marmot.v2.DDLChange
-	(*HLC)(nil),                      // 15: marmot.v2.HLC
-	(*TransactionResponse)(nil),      // 16: marmot.v2.TransactionResponse
-	(*ReadRequest)(nil),              // 17: marmot.v2.ReadRequest
-	(*ReadResponse)(nil),             // 18: marmot.v2.ReadResponse
-	(*Row)(nil),                      // 19: marmot.v2.Row
-	(*StreamRequest)(nil),            // 20: marmot.v2.StreamRequest
-	(*ChangeEvent)(nil),              // 21: marmot.v2.ChangeEvent
-	(*ReplicationStateRequest)(nil),  // 22: marmot.v2.ReplicationStateRequest
-	(*ReplicationStateResponse)(nil), // 23: marmot.v2.ReplicationStateResponse
-	(*DatabaseReplicationState)(nil), // 24: marmot.v2.DatabaseReplicationState
-	(*SnapshotInfoRequest)(nil),      // 25: marmot.v2.SnapshotInfoRequest
-	(*SnapshotInfoResponse)(nil),     // 26: marmot.v2.SnapshotInfoResponse
-	(*DatabaseFileInfo)(nil),         // 27: marmot.v2.DatabaseFileInfo
-	(*SnapshotRequest)(nil),          // 28: marmot.v2.SnapshotRequest
-	(*SnapshotChunk)(nil),            // 29: marmot.v2.SnapshotChunk
-	(*LatestTxnIDsRequest)(nil),      // 30: marmot.v2.LatestTxnIDsRequest
-	(*LatestTxnIDsResponse)(nil),     // 31: marmot.v2.LatestTxnIDsResponse
-	nil,                              // 32: marmot.v2.NodeState.DatabaseSchemaVersionsEntry
-	nil,                              // 33: marmot.v2.RowChange.OldValuesEntry
-	nil,                              // 34: marmot.v2.RowChange.NewValuesEntry
-	nil,                              // 35: marmot.v2.Row.ColumnsEntry
-	nil,                              // 36: marmot.v2.LatestTxnIDsResponse.DatabaseTxnIdsEntry
+	(*GossipRequest)(nil),            // 3: marmot.v2.GossipRequest
+	(*GossipResponse)(nil),           // 4: marmot.v2.GossipResponse
+	(*NodeState)(nil),                // 5: marmot.v2.NodeState
+	(*JoinRequest)(nil),              // 6: marmot.v2.JoinRequest
+	(*JoinResponse)(nil),             // 7: marmot.v2.JoinResponse
+	(*PingRequest)(nil),              // 8: marmot.v2.PingRequest
+	(*PingResponse)(nil),             // 9: marmot.v2.PingResponse
+	(*TransactionRequest)(nil),       // 10: marmot.v2.TransactionRequest
+	(*Statement)(nil),                // 11: marmot.v2.Statement
+	(*RowChange)(nil),                // 12: marmot.v2.RowChange
+	(*DDLChange)(nil),                // 13: marmot.v2.DDLChange
+	(*HLC)(nil),                      // 14: marmot.v2.HLC
+	(*TransactionResponse)(nil),      // 15: marmot.v2.TransactionResponse
+	(*ReadRequest)(nil),              // 16: marmot.v2.ReadRequest
+	(*ReadResponse)(nil),             // 17: marmot.v2.ReadResponse
+	(*Row)(nil),                      // 18: marmot.v2.Row
+	(*StreamRequest)(nil),            // 19: marmot.v2.StreamRequest
+	(*ChangeEvent)(nil),              // 20: marmot.v2.ChangeEvent
+	(*ReplicationStateRequest)(nil),  // 21: marmot.v2.ReplicationStateRequest
+	(*ReplicationStateResponse)(nil), // 22: marmot.v2.ReplicationStateResponse
+	(*DatabaseReplicationState)(nil), // 23: marmot.v2.DatabaseReplicationState
+	(*SnapshotInfoRequest)(nil),      // 24: marmot.v2.SnapshotInfoRequest
+	(*SnapshotInfoResponse)(nil),     // 25: marmot.v2.SnapshotInfoResponse
+	(*DatabaseFileInfo)(nil),         // 26: marmot.v2.DatabaseFileInfo
+	(*SnapshotRequest)(nil),          // 27: marmot.v2.SnapshotRequest
+	(*SnapshotChunk)(nil),            // 28: marmot.v2.SnapshotChunk
+	(*LatestTxnIDsRequest)(nil),      // 29: marmot.v2.LatestTxnIDsRequest
+	(*LatestTxnIDsResponse)(nil),     // 30: marmot.v2.LatestTxnIDsResponse
+	nil,                              // 31: marmot.v2.NodeState.DatabaseSchemaVersionsEntry
+	nil,                              // 32: marmot.v2.RowChange.OldValuesEntry
+	nil,                              // 33: marmot.v2.RowChange.NewValuesEntry
+	nil,                              // 34: marmot.v2.Row.ColumnsEntry
+	nil,                              // 35: marmot.v2.LatestTxnIDsResponse.DatabaseTxnIdsEntry
+	(common.StatementType)(0),        // 36: marmot.common.StatementType
 }
 var file_grpc_marmot_proto_depIdxs = []int32{
-	6,  // 0: marmot.v2.GossipRequest.nodes:type_name -> marmot.v2.NodeState
-	6,  // 1: marmot.v2.GossipResponse.nodes:type_name -> marmot.v2.NodeState
+	5,  // 0: marmot.v2.GossipRequest.nodes:type_name -> marmot.v2.NodeState
+	5,  // 1: marmot.v2.GossipResponse.nodes:type_name -> marmot.v2.NodeState
 	0,  // 2: marmot.v2.NodeState.status:type_name -> marmot.v2.NodeStatus
-	32, // 3: marmot.v2.NodeState.database_schema_versions:type_name -> marmot.v2.NodeState.DatabaseSchemaVersionsEntry
-	6,  // 4: marmot.v2.JoinResponse.cluster_nodes:type_name -> marmot.v2.NodeState
+	31, // 3: marmot.v2.NodeState.database_schema_versions:type_name -> marmot.v2.NodeState.DatabaseSchemaVersionsEntry
+	5,  // 4: marmot.v2.JoinResponse.cluster_nodes:type_name -> marmot.v2.NodeState
 	0,  // 5: marmot.v2.PingResponse.status:type_name -> marmot.v2.NodeStatus
-	12, // 6: marmot.v2.TransactionRequest.statements:type_name -> marmot.v2.Statement
-	15, // 7: marmot.v2.TransactionRequest.timestamp:type_name -> marmot.v2.HLC
+	11, // 6: marmot.v2.TransactionRequest.statements:type_name -> marmot.v2.Statement
+	14, // 7: marmot.v2.TransactionRequest.timestamp:type_name -> marmot.v2.HLC
 	1,  // 8: marmot.v2.TransactionRequest.phase:type_name -> marmot.v2.TransactionPhase
 	2,  // 9: marmot.v2.TransactionRequest.consistency:type_name -> marmot.v2.ConsistencyLevel
-	3,  // 10: marmot.v2.Statement.type:type_name -> marmot.v2.StatementType
-	13, // 11: marmot.v2.Statement.row_change:type_name -> marmot.v2.RowChange
-	14, // 12: marmot.v2.Statement.ddl_change:type_name -> marmot.v2.DDLChange
-	33, // 13: marmot.v2.RowChange.old_values:type_name -> marmot.v2.RowChange.OldValuesEntry
-	34, // 14: marmot.v2.RowChange.new_values:type_name -> marmot.v2.RowChange.NewValuesEntry
-	15, // 15: marmot.v2.TransactionResponse.applied_at:type_name -> marmot.v2.HLC
-	15, // 16: marmot.v2.ReadRequest.snapshot_ts:type_name -> marmot.v2.HLC
+	36, // 10: marmot.v2.Statement.type:type_name -> marmot.common.StatementType
+	12, // 11: marmot.v2.Statement.row_change:type_name -> marmot.v2.RowChange
+	13, // 12: marmot.v2.Statement.ddl_change:type_name -> marmot.v2.DDLChange
+	32, // 13: marmot.v2.RowChange.old_values:type_name -> marmot.v2.RowChange.OldValuesEntry
+	33, // 14: marmot.v2.RowChange.new_values:type_name -> marmot.v2.RowChange.NewValuesEntry
+	14, // 15: marmot.v2.TransactionResponse.applied_at:type_name -> marmot.v2.HLC
+	14, // 16: marmot.v2.ReadRequest.snapshot_ts:type_name -> marmot.v2.HLC
 	2,  // 17: marmot.v2.ReadRequest.consistency:type_name -> marmot.v2.ConsistencyLevel
-	19, // 18: marmot.v2.ReadResponse.rows:type_name -> marmot.v2.Row
-	15, // 19: marmot.v2.ReadResponse.timestamp:type_name -> marmot.v2.HLC
-	35, // 20: marmot.v2.Row.columns:type_name -> marmot.v2.Row.ColumnsEntry
-	12, // 21: marmot.v2.ChangeEvent.statements:type_name -> marmot.v2.Statement
-	15, // 22: marmot.v2.ChangeEvent.timestamp:type_name -> marmot.v2.HLC
-	24, // 23: marmot.v2.ReplicationStateResponse.states:type_name -> marmot.v2.DatabaseReplicationState
-	15, // 24: marmot.v2.DatabaseReplicationState.last_applied_timestamp:type_name -> marmot.v2.HLC
-	15, // 25: marmot.v2.SnapshotInfoResponse.timestamp:type_name -> marmot.v2.HLC
-	27, // 26: marmot.v2.SnapshotInfoResponse.databases:type_name -> marmot.v2.DatabaseFileInfo
-	36, // 27: marmot.v2.LatestTxnIDsResponse.database_txn_ids:type_name -> marmot.v2.LatestTxnIDsResponse.DatabaseTxnIdsEntry
-	4,  // 28: marmot.v2.MarmotService.Gossip:input_type -> marmot.v2.GossipRequest
-	7,  // 29: marmot.v2.MarmotService.Join:input_type -> marmot.v2.JoinRequest
-	9,  // 30: marmot.v2.MarmotService.Ping:input_type -> marmot.v2.PingRequest
-	11, // 31: marmot.v2.MarmotService.ReplicateTransaction:input_type -> marmot.v2.TransactionRequest
-	17, // 32: marmot.v2.MarmotService.Read:input_type -> marmot.v2.ReadRequest
-	20, // 33: marmot.v2.MarmotService.StreamChanges:input_type -> marmot.v2.StreamRequest
-	22, // 34: marmot.v2.MarmotService.GetReplicationState:input_type -> marmot.v2.ReplicationStateRequest
-	25, // 35: marmot.v2.MarmotService.GetSnapshotInfo:input_type -> marmot.v2.SnapshotInfoRequest
-	28, // 36: marmot.v2.MarmotService.StreamSnapshot:input_type -> marmot.v2.SnapshotRequest
-	30, // 37: marmot.v2.MarmotService.GetLatestTxnIDs:input_type -> marmot.v2.LatestTxnIDsRequest
-	5,  // 38: marmot.v2.MarmotService.Gossip:output_type -> marmot.v2.GossipResponse
-	8,  // 39: marmot.v2.MarmotService.Join:output_type -> marmot.v2.JoinResponse
-	10, // 40: marmot.v2.MarmotService.Ping:output_type -> marmot.v2.PingResponse
-	16, // 41: marmot.v2.MarmotService.ReplicateTransaction:output_type -> marmot.v2.TransactionResponse
-	18, // 42: marmot.v2.MarmotService.Read:output_type -> marmot.v2.ReadResponse
-	21, // 43: marmot.v2.MarmotService.StreamChanges:output_type -> marmot.v2.ChangeEvent
-	23, // 44: marmot.v2.MarmotService.GetReplicationState:output_type -> marmot.v2.ReplicationStateResponse
-	26, // 45: marmot.v2.MarmotService.GetSnapshotInfo:output_type -> marmot.v2.SnapshotInfoResponse
-	29, // 46: marmot.v2.MarmotService.StreamSnapshot:output_type -> marmot.v2.SnapshotChunk
-	31, // 47: marmot.v2.MarmotService.GetLatestTxnIDs:output_type -> marmot.v2.LatestTxnIDsResponse
+	18, // 18: marmot.v2.ReadResponse.rows:type_name -> marmot.v2.Row
+	14, // 19: marmot.v2.ReadResponse.timestamp:type_name -> marmot.v2.HLC
+	34, // 20: marmot.v2.Row.columns:type_name -> marmot.v2.Row.ColumnsEntry
+	11, // 21: marmot.v2.ChangeEvent.statements:type_name -> marmot.v2.Statement
+	14, // 22: marmot.v2.ChangeEvent.timestamp:type_name -> marmot.v2.HLC
+	23, // 23: marmot.v2.ReplicationStateResponse.states:type_name -> marmot.v2.DatabaseReplicationState
+	14, // 24: marmot.v2.DatabaseReplicationState.last_applied_timestamp:type_name -> marmot.v2.HLC
+	14, // 25: marmot.v2.SnapshotInfoResponse.timestamp:type_name -> marmot.v2.HLC
+	26, // 26: marmot.v2.SnapshotInfoResponse.databases:type_name -> marmot.v2.DatabaseFileInfo
+	35, // 27: marmot.v2.LatestTxnIDsResponse.database_txn_ids:type_name -> marmot.v2.LatestTxnIDsResponse.DatabaseTxnIdsEntry
+	3,  // 28: marmot.v2.MarmotService.Gossip:input_type -> marmot.v2.GossipRequest
+	6,  // 29: marmot.v2.MarmotService.Join:input_type -> marmot.v2.JoinRequest
+	8,  // 30: marmot.v2.MarmotService.Ping:input_type -> marmot.v2.PingRequest
+	10, // 31: marmot.v2.MarmotService.ReplicateTransaction:input_type -> marmot.v2.TransactionRequest
+	16, // 32: marmot.v2.MarmotService.Read:input_type -> marmot.v2.ReadRequest
+	19, // 33: marmot.v2.MarmotService.StreamChanges:input_type -> marmot.v2.StreamRequest
+	21, // 34: marmot.v2.MarmotService.GetReplicationState:input_type -> marmot.v2.ReplicationStateRequest
+	24, // 35: marmot.v2.MarmotService.GetSnapshotInfo:input_type -> marmot.v2.SnapshotInfoRequest
+	27, // 36: marmot.v2.MarmotService.StreamSnapshot:input_type -> marmot.v2.SnapshotRequest
+	29, // 37: marmot.v2.MarmotService.GetLatestTxnIDs:input_type -> marmot.v2.LatestTxnIDsRequest
+	4,  // 38: marmot.v2.MarmotService.Gossip:output_type -> marmot.v2.GossipResponse
+	7,  // 39: marmot.v2.MarmotService.Join:output_type -> marmot.v2.JoinResponse
+	9,  // 40: marmot.v2.MarmotService.Ping:output_type -> marmot.v2.PingResponse
+	15, // 41: marmot.v2.MarmotService.ReplicateTransaction:output_type -> marmot.v2.TransactionResponse
+	17, // 42: marmot.v2.MarmotService.Read:output_type -> marmot.v2.ReadResponse
+	20, // 43: marmot.v2.MarmotService.StreamChanges:output_type -> marmot.v2.ChangeEvent
+	22, // 44: marmot.v2.MarmotService.GetReplicationState:output_type -> marmot.v2.ReplicationStateResponse
+	25, // 45: marmot.v2.MarmotService.GetSnapshotInfo:output_type -> marmot.v2.SnapshotInfoResponse
+	28, // 46: marmot.v2.MarmotService.StreamSnapshot:output_type -> marmot.v2.SnapshotChunk
+	30, // 47: marmot.v2.MarmotService.GetLatestTxnIDs:output_type -> marmot.v2.LatestTxnIDsResponse
 	38, // [38:48] is the sub-list for method output_type
 	28, // [28:38] is the sub-list for method input_type
 	28, // [28:28] is the sub-list for extension type_name
@@ -2355,7 +2284,7 @@ func file_grpc_marmot_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_grpc_marmot_proto_rawDesc), len(file_grpc_marmot_proto_rawDesc)),
-			NumEnums:      4,
+			NumEnums:      3,
 			NumMessages:   33,
 			NumExtensions: 0,
 			NumServices:   1,

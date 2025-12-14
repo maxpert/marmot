@@ -11,6 +11,7 @@ import (
 	"github.com/maxpert/marmot/db"
 	"github.com/maxpert/marmot/encoding"
 	marmotgrpc "github.com/maxpert/marmot/grpc"
+	pb "github.com/maxpert/marmot/grpc/common"
 	"github.com/maxpert/marmot/hlc"
 )
 
@@ -342,7 +343,7 @@ func TestStreamClient_ApplyChangeEvent(t *testing.T) {
 		Statements: []*marmotgrpc.Statement{
 			{
 				TableName: "events",
-				Type:      marmotgrpc.StatementType_INSERT,
+				Type:      pb.StatementType_INSERT,
 				Payload: &marmotgrpc.Statement_RowChange{
 					RowChange: &marmotgrpc.RowChange{
 						NewValues: map[string][]byte{
@@ -392,7 +393,7 @@ func TestStreamClient_ApplyChangeEvent_DDL(t *testing.T) {
 		Database: "testdb",
 		Statements: []*marmotgrpc.Statement{
 			{
-				Type: marmotgrpc.StatementType_DDL,
+				Type: pb.StatementType_DDL,
 				Payload: &marmotgrpc.Statement_DdlChange{
 					DdlChange: &marmotgrpc.DDLChange{
 						Sql: "CREATE TABLE new_table (id INTEGER PRIMARY KEY, value TEXT)",
@@ -647,7 +648,7 @@ func BenchmarkStreamClient_ApplyChangeEvent(b *testing.B) {
 			Statements: []*marmotgrpc.Statement{
 				{
 					TableName: "events",
-					Type:      marmotgrpc.StatementType_INSERT,
+					Type:      pb.StatementType_INSERT,
 					Payload: &marmotgrpc.Statement_RowChange{
 						RowChange: &marmotgrpc.RowChange{
 							NewValues: map[string][]byte{

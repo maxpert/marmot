@@ -1,6 +1,7 @@
 package db
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/maxpert/marmot/protocol"
@@ -35,11 +36,6 @@ func TestStatementTypeToOpType(t *testing.T) {
 			input:    protocol.StatementDelete,
 			expected: OpTypeDelete,
 		},
-		{
-			name:     "Unknown defaults to OpTypeInsert",
-			input:    protocol.StatementUnknown,
-			expected: OpTypeInsert,
-		},
 	}
 
 	for _, tt := range tests {
@@ -49,6 +45,28 @@ func TestStatementTypeToOpType(t *testing.T) {
 				t.Errorf("StatementTypeToOpType(%v) = %v (%s), want %v (%s)",
 					tt.input, got, got.String(), tt.expected, tt.expected.String())
 			}
+		})
+	}
+}
+
+// TestStatementTypeToOpTypePanicsOnUnsupported verifies that non-DML statement types panic.
+func TestStatementTypeToOpTypePanicsOnUnsupported(t *testing.T) {
+	unsupportedTypes := []protocol.StatementCode{
+		protocol.StatementUnknown,
+		protocol.StatementDDL,
+		protocol.StatementCreateDatabase,
+		protocol.StatementDropDatabase,
+	}
+
+	for _, stmtType := range unsupportedTypes {
+		stmtType := stmtType // capture for closure
+		t.Run(fmt.Sprintf("StatementCode_%d", stmtType), func(t *testing.T) {
+			defer func() {
+				if r := recover(); r == nil {
+					t.Errorf("StatementTypeToOpType(%d) should panic but didn't", stmtType)
+				}
+			}()
+			StatementTypeToOpType(stmtType)
 		})
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/maxpert/marmot/common"
 	"github.com/maxpert/marmot/hlc"
 )
 
@@ -49,67 +50,41 @@ func ParseConsistencyLevel(s string) (ConsistencyLevel, error) {
 	}
 }
 
-// StatementCode represents the type of SQL statement
-type StatementCode int
+// StatementCode is an alias for common.StatementCode to maintain backward compatibility
+type StatementCode = common.StatementCode
 
+// Statement code constants - aliased from common package for backward compatibility
 const (
-	// Unknown - not yet classified (zero value)
-	StatementUnknown StatementCode = iota
-
-	// DML - Data Manipulation
-	StatementInsert
-	StatementReplace
-	StatementUpdate
-	StatementDelete
-	StatementLoadData
-
-	// DDL - Data Definition
-	StatementDDL
-
-	// DCL - Data Control Language (user/privilege management)
-	StatementDCL
-
-	// Transaction Control
-	StatementBegin
-	StatementCommit
-	StatementRollback
-	StatementSavepoint
-
-	// XA Transaction
-	StatementXA
-
-	// Locking
-	StatementLock
-
-	// Query
-	StatementSelect
-
-	// Administrative
-	StatementAdmin
-
-	// Session variables (no-op)
-	StatementSet
-
-	// Database Management
-	StatementShowDatabases
-	StatementUseDatabase
-	StatementCreateDatabase
-	StatementDropDatabase
-
-	// Metadata Queries (for DBeaver compatibility)
-	StatementShowTables
-	StatementShowColumns
-	StatementShowCreateTable
-	StatementShowIndexes
-	StatementShowTableStatus
-	StatementInformationSchema
-
-	// Unsupported - invalid syntax or incompatible statement
-	StatementUnsupported
-
-	// New statement types to eliminate pre-parse string matching
-	StatementSystemVariable // SELECT @@version, SELECT DATABASE(), etc.
-	StatementVirtualTable   // SELECT * FROM MARMOT_CLUSTER_NODES, etc.
+	StatementUnknown            = common.StatementUnknown
+	StatementInsert             = common.StatementInsert
+	StatementReplace            = common.StatementReplace
+	StatementUpdate             = common.StatementUpdate
+	StatementDelete             = common.StatementDelete
+	StatementLoadData           = common.StatementLoadData
+	StatementDDL                = common.StatementDDL
+	StatementDCL                = common.StatementDCL
+	StatementBegin              = common.StatementBegin
+	StatementCommit             = common.StatementCommit
+	StatementRollback           = common.StatementRollback
+	StatementSavepoint          = common.StatementSavepoint
+	StatementXA                 = common.StatementXA
+	StatementLock               = common.StatementLock
+	StatementSelect             = common.StatementSelect
+	StatementAdmin              = common.StatementAdmin
+	StatementSet                = common.StatementSet
+	StatementShowDatabases      = common.StatementShowDatabases
+	StatementUseDatabase        = common.StatementUseDatabase
+	StatementCreateDatabase     = common.StatementCreateDatabase
+	StatementDropDatabase       = common.StatementDropDatabase
+	StatementShowTables         = common.StatementShowTables
+	StatementShowColumns        = common.StatementShowColumns
+	StatementShowCreateTable    = common.StatementShowCreateTable
+	StatementShowIndexes        = common.StatementShowIndexes
+	StatementShowTableStatus    = common.StatementShowTableStatus
+	StatementInformationSchema  = common.StatementInformationSchema
+	StatementUnsupported        = common.StatementUnsupported
+	StatementSystemVariable     = common.StatementSystemVariable
+	StatementVirtualTable       = common.StatementVirtualTable
 )
 
 // InformationSchemaTableType identifies which INFORMATION_SCHEMA table is being queried

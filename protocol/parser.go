@@ -146,7 +146,7 @@ func ParseStatementWithSchema(sql string, schemaLookup SchemaLookupFunc) Stateme
 
 	stmt := Statement{
 		SQL:      transpiledSQL,
-		Type:     mapQueryTypeToProtocolType(ctx.Output.StatementType),
+		Type:     ctx.Output.StatementType,
 		Database: ctx.Output.Database,
 		Error:    errorString(ctx.Output.ValidationErr),
 	}
@@ -199,7 +199,7 @@ func ParseStatementsWithSchema(sql string, schemaLookup SchemaLookupFunc) []Stat
 func buildStatement(ctx query.QueryContext, sql string) Statement {
 	stmt := Statement{
 		SQL:      sql,
-		Type:     mapQueryTypeToProtocolType(ctx.Output.StatementType),
+		Type:     ctx.Output.StatementType,
 		Database: ctx.Output.Database,
 		Error:    errorString(ctx.Output.ValidationErr),
 	}
@@ -220,11 +220,6 @@ func buildStatement(ctx query.QueryContext, sql string) Statement {
 	return stmt
 }
 
-// mapQueryTypeToProtocolType converts query.StatementCode to protocol.StatementCode.
-// Both enums use iota starting with Unknown=0, Insert=1, Replace=2, etc.
-func mapQueryTypeToProtocolType(qt query.StatementCode) StatementCode {
-	return StatementCode(qt)
-}
 
 // NormalizeSQLForSQLite converts MySQL-style SQL to SQLite-compatible SQL
 // This is the central place for all MySQL -> SQLite transformations
