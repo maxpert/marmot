@@ -1164,17 +1164,17 @@ func readLengthEncodedInt(b []byte) (uint64, int) {
 	switch b[0] {
 	case 0xFC:
 		if len(b) < 3 {
-			return 0, 1
+			return 0, 0
 		}
 		return uint64(binary.LittleEndian.Uint16(b[1:3])), 3
 	case 0xFD:
 		if len(b) < 4 {
-			return 0, 1
+			return 0, 0
 		}
 		return uint64(binary.LittleEndian.Uint32(b[1:4])), 4
 	case 0xFE:
 		if len(b) < 9 {
-			return 0, 1
+			return 0, 0
 		}
 		return binary.LittleEndian.Uint64(b[1:9]), 9
 	default:

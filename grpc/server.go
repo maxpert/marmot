@@ -391,13 +391,15 @@ func (s *Server) sendChangeEvent(rec *db.TransactionRecord, stream MarmotService
 						NewValues: ps.NewValues,
 					},
 				}
-				log.Debug().
-					Uint64("txn_id", rec.TxnID).
-					Str("table", ps.TableName).
-					Str("intent_key", ps.IntentKey).
-					Int("new_values", len(ps.NewValues)).
-					Int("old_values", len(ps.OldValues)).
-					Msg("STREAM: Sending CDC data for anti-entropy")
+				if log.Debug().Enabled() {
+					log.Debug().
+						Uint64("txn_id", rec.TxnID).
+						Str("table", ps.TableName).
+						Str("intent_key", ps.IntentKey).
+						Int("new_values", len(ps.NewValues)).
+						Int("old_values", len(ps.OldValues)).
+						Msg("STREAM: Sending CDC data for anti-entropy")
+				}
 			} else {
 				// DDL or DML without CDC: send SQL
 				stmt.Payload = &Statement_DdlChange{
@@ -405,15 +407,17 @@ func (s *Server) sendChangeEvent(rec *db.TransactionRecord, stream MarmotService
 						Sql: ps.SQL,
 					},
 				}
-				log.Debug().
-					Uint64("txn_id", rec.TxnID).
-					Str("sql_prefix", func() string {
-						if len(ps.SQL) > 50 {
-							return ps.SQL[:50]
-						}
-						return ps.SQL
-					}()).
-					Msg("STREAM: Sending SQL for anti-entropy")
+				if log.Debug().Enabled() {
+					log.Debug().
+						Uint64("txn_id", rec.TxnID).
+						Str("sql_prefix", func() string {
+							if len(ps.SQL) > 50 {
+								return ps.SQL[:50]
+							}
+							return ps.SQL
+						}()).
+						Msg("STREAM: Sending SQL for anti-entropy")
+				}
 			}
 
 			statements = append(statements, stmt)

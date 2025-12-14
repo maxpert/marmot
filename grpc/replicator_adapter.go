@@ -25,11 +25,15 @@ func NewGRPCReplicator(client *Client) coordinator.Replicator {
 
 // ReplicateTransaction implements coordinator.Replicator
 func (gr *GRPCReplicator) ReplicateTransaction(ctx context.Context, nodeID uint64, req *coordinator.ReplicationRequest) (*coordinator.ReplicationResponse, error) {
+	statements, err := convertStatementsToProto(req.Statements, req.Database)
+	if err != nil {
+		return nil, err
+	}
 	// Convert coordinator.ReplicationRequest to gRPC TransactionRequest
 	grpcReq := &TransactionRequest{
 		TxnId:        req.TxnID,
 		SourceNodeId: req.NodeID,
-		Statements:   convertStatementsToProto(req.Statements, req.Database),
+		Statements:   statements,
 		Timestamp: &HLC{
 			WallTime: req.StartTS.WallTime,
 			Logical:  req.StartTS.Logical,
@@ -58,7 +62,7 @@ func (gr *GRPCReplicator) ReplicateTransaction(ctx context.Context, nodeID uint6
 }
 
 // convertStatementsToProto converts protocol.Statement to gRPC Statement with CDC
-func convertStatementsToProto(stmts []protocol.Statement, database string) []*Statement {
+func convertStatementsToProto(stmts []protocol.Statement, database string) ([]*Statement, error) {
 	protoStmts := make([]*Statement, len(stmts))
 	for i, stmt := range stmts {
 		// Use statement's database if set, otherwise use the transaction's database
@@ -69,7 +73,7 @@ func convertStatementsToProto(stmts []protocol.Statement, database string) []*St
 
 		grpcType, ok := common.ToWireType(stmt.Type)
 		if !ok {
-			panic("convertStatementsToProto: unknown statement type")
+			return nil, fmt.Errorf("convertStatementsToProto: unknown statement type %v", stmt.Type)
 		}
 		protoStmt := &Statement{
 			Type:      grpcType,
@@ -104,7 +108,8 @@ func convertStatementsToProto(stmts []protocol.Statement, database string) []*St
 
 		protoStmts[i] = protoStmt
 	}
-	return protoStmts
+
+	return protoStmts, nil
 }
 
 // convertPhaseToProto converts coordinator.ReplicationPhase to gRPC TransactionPhase.
