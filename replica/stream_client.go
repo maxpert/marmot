@@ -14,6 +14,7 @@ import (
 	"github.com/maxpert/marmot/db/snapshot"
 	"github.com/maxpert/marmot/encoding"
 	marmotgrpc "github.com/maxpert/marmot/grpc"
+	pb "github.com/maxpert/marmot/grpc/common"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/protocol"
 
@@ -556,9 +557,9 @@ func (s *StreamClient) applyChangeEvent(ctx context.Context, event *marmotgrpc.C
 	if len(event.Statements) > 0 {
 		stmt := event.Statements[0]
 		switch stmt.Type {
-		case marmotgrpc.StatementType_CREATE_DATABASE:
+		case pb.StatementType_CREATE_DATABASE:
 			return s.applyCreateDatabase(stmt, database)
-		case marmotgrpc.StatementType_DROP_DATABASE:
+		case pb.StatementType_DROP_DATABASE:
 			return s.applyDropDatabase(stmt, database)
 		}
 	}
@@ -661,11 +662,11 @@ func (s *StreamClient) applyCDCStatement(tx *sql.Tx, stmt *marmotgrpc.Statement)
 	}
 
 	switch stmt.Type {
-	case marmotgrpc.StatementType_INSERT, marmotgrpc.StatementType_REPLACE:
+	case pb.StatementType_INSERT, pb.StatementType_REPLACE:
 		return s.applyCDCInsert(tx, stmt.TableName, rowChange.NewValues)
-	case marmotgrpc.StatementType_UPDATE:
+	case pb.StatementType_UPDATE:
 		return s.applyCDCInsert(tx, stmt.TableName, rowChange.NewValues) // Use INSERT OR REPLACE
-	case marmotgrpc.StatementType_DELETE:
+	case pb.StatementType_DELETE:
 		return s.applyCDCDelete(tx, stmt.TableName, rowChange.OldValues)
 	default:
 		return fmt.Errorf("unsupported statement type: %v", stmt.Type)

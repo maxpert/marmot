@@ -464,8 +464,18 @@ func (c *CatchUpClient) DetermineCatchUpStrategy(ctx context.Context) (*CatchUpD
 	}
 
 	// Step 4: Compare local vs peer state
-	if len(localTxnIDs) == 0 && len(peerTxnIDs) > 0 {
-		// We have no data, peer has data - need full snapshot
+	// Check if peer has any actual data (non-zero txn IDs)
+	// A peer with {"marmot": 0} has no data, just an empty database
+	var peerHasData bool
+	for _, txnID := range peerTxnIDs {
+		if txnID > 0 {
+			peerHasData = true
+			break
+		}
+	}
+
+	if len(localTxnIDs) == 0 && peerHasData {
+		// We have no data, peer has actual data - need full snapshot
 		decision.Strategy = FULL_SNAPSHOT
 		log.Info().
 			Str("peer", seedAddr).
@@ -473,8 +483,8 @@ func (c *CatchUpClient) DetermineCatchUpStrategy(ctx context.Context) (*CatchUpD
 		return decision, nil
 	}
 
-	if len(peerTxnIDs) == 0 {
-		// Peer has no data - we're up to date (or we're the first node)
+	if !peerHasData {
+		// Peer has no actual data - we're up to date (or we're the first node)
 		decision.Strategy = NO_CATCHUP
 		log.Info().Msg("Peer has no data - no catch-up needed")
 		return decision, nil

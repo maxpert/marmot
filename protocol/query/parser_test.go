@@ -198,7 +198,7 @@ func TestComplexQueries(t *testing.T) {
 	tests := []struct {
 		name             string
 		sql              string
-		wantType         StatementType
+		wantType         StatementCode
 		wantSysVars      []string
 		wantVirtualTable VirtualTableType
 		wantISTableType  InformationSchemaTableType
@@ -337,7 +337,7 @@ func TestComplexQueries(t *testing.T) {
 			}
 
 			if ctx.Output.StatementType != tt.wantType {
-				t.Errorf("StatementType = %d, want %d", ctx.Output.StatementType, tt.wantType)
+				t.Errorf("StatementCode = %d, want %d", ctx.Output.StatementType, tt.wantType)
 			}
 
 			if len(tt.wantSysVars) > 0 && ctx.MySQLState != nil {
@@ -454,7 +454,7 @@ func TestExplainTableStatement(t *testing.T) {
 	tests := []struct {
 		name          string
 		sql           string
-		wantType      StatementType
+		wantType      StatementCode
 		wantTableName string
 		wantDatabase  string
 	}{
@@ -494,7 +494,7 @@ func TestExplainTableStatement(t *testing.T) {
 			extractMetadata(ctx, stmt)
 
 			if ctx.Output.StatementType != tt.wantType {
-				t.Errorf("StatementType = %d, want %d", ctx.Output.StatementType, tt.wantType)
+				t.Errorf("StatementCode = %d, want %d", ctx.Output.StatementType, tt.wantType)
 			}
 			if ctx.Output.Database != tt.wantDatabase {
 				t.Errorf("Database = %q, want %q", ctx.Output.Database, tt.wantDatabase)

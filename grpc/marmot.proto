@@ -1,6 +1,8 @@
 syntax = "proto3";
 package marmot.v2;
 
+import "grpc/common/marmot_common.proto";
+
 option go_package = "github.com/maxpert/marmot/grpc";
 
 // Single gRPC service for all peer communication
@@ -129,7 +131,7 @@ enum ConsistencyLevel {
 // Statement represents either a DML row change or a DDL schema change
 // Following industry standard CDC approach (MySQL binlog, TiDB TiCDC, CockroachDB)
 message Statement {
-  StatementType type = 1;
+  marmot.common.StatementType type = 1;
   string table_name = 2;
   string database = 3;  // Target database name (required)
 
@@ -161,15 +163,6 @@ message DDLChange {
   string sql = 1;  // Transpiled SQLite DDL statement
 }
 
-enum StatementType {
-  INSERT = 0;
-  UPDATE = 1;
-  DELETE = 2;
-  REPLACE = 3;
-  DDL = 4;
-  CREATE_DATABASE = 5;
-  DROP_DATABASE = 6;
-}
 
 message HLC {
   int64 wall_time = 1;

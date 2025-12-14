@@ -151,67 +151,6 @@ func TestParseParamValue_NULL(t *testing.T) {
 	}
 }
 
-func TestBuildQueryWithParams(t *testing.T) {
-	tests := []struct {
-		name   string
-		query  string
-		params []interface{}
-		want   string
-	}{
-		{
-			name:   "Single int param",
-			query:  "SELECT * FROM users WHERE id = ?",
-			params: []interface{}{int64(42)},
-			want:   "SELECT * FROM users WHERE id = 42",
-		},
-		{
-			name:   "Single string param",
-			query:  "SELECT * FROM users WHERE name = ?",
-			params: []interface{}{"Alice"},
-			want:   "SELECT * FROM users WHERE name = 'Alice'",
-		},
-		{
-			name:   "Multiple params",
-			query:  "INSERT INTO users (id, name, age) VALUES (?, ?, ?)",
-			params: []interface{}{int64(1), "Bob", int64(30)},
-			want:   "INSERT INTO users (id, name, age) VALUES (1, 'Bob', 30)",
-		},
-		{
-			name:   "NULL param",
-			query:  "UPDATE users SET email = ? WHERE id = ?",
-			params: []interface{}{nil, int64(1)},
-			want:   "UPDATE users SET email = NULL WHERE id = 1",
-		},
-		{
-			name:   "String with quotes",
-			query:  "SELECT * FROM users WHERE bio = ?",
-			params: []interface{}{"He said \"hello\""},
-			want:   "SELECT * FROM users WHERE bio = 'He said \\\"hello\\\"'",
-		},
-		{
-			name:   "Float param",
-			query:  "UPDATE products SET price = ? WHERE id = ?",
-			params: []interface{}{float64(19.99), int64(5)},
-			want:   "UPDATE products SET price = 19.990000 WHERE id = 5",
-		},
-		{
-			name:   "Question mark in string literal should be preserved",
-			query:  "SELECT * FROM faq WHERE question = '?' AND id = ?",
-			params: []interface{}{int64(1)},
-			want:   "SELECT * FROM faq WHERE question = '?' AND id = 1",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := buildQueryWithParams(tt.query, tt.params)
-			if got != tt.want {
-				t.Errorf("buildQueryWithParams() = %q, want %q", got, tt.want)
-			}
-		})
-	}
-}
-
 func TestCountPlaceholders(t *testing.T) {
 	tests := []struct {
 		query string
@@ -259,21 +198,6 @@ func TestPreparedStatement_ParamTypesCaching(t *testing.T) {
 	cachedType := stmt.ParamTypes[0]
 	if cachedType != 0x08 {
 		t.Errorf("Cached param type should be 0x08 (LONGLONG), got %02x", cachedType)
-	}
-}
-
-func BenchmarkBuildQueryWithParams(b *testing.B) {
-	query := "INSERT INTO sbtest1 (id, k, c, pad) VALUES (?, ?, ?, ?)"
-	params := []interface{}{
-		int64(12345),
-		int64(67890),
-		"00000000000000000000000000000000",
-		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-	}
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		buildQueryWithParams(query, params)
 	}
 }
 

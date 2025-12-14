@@ -3,6 +3,7 @@ package query
 import (
 	"strings"
 
+	"github.com/maxpert/marmot/common"
 	"github.com/maxpert/marmot/protocol/query/transform"
 	"vitess.io/vitess/go/vt/sqlparser"
 )
@@ -24,40 +25,42 @@ type Transformation struct {
 	After  string
 }
 
-// StatementType categorizes SQL statements for execution routing and validation.
-type StatementType int
+// StatementCode categorizes SQL statements for execution routing and validation.
+// Type alias to common.StatementCode for backward compatibility.
+type StatementCode = common.StatementCode
 
+// Const aliases for backward compatibility with existing code.
 const (
-	StatementUnknown StatementType = iota // 0 - means not yet classified
-	StatementInsert
-	StatementReplace
-	StatementUpdate
-	StatementDelete
-	StatementLoadData
-	StatementDDL
-	StatementDCL
-	StatementBegin
-	StatementCommit
-	StatementRollback
-	StatementSavepoint
-	StatementXA
-	StatementLock
-	StatementSelect
-	StatementAdmin
-	StatementSet
-	StatementShowDatabases
-	StatementUseDatabase
-	StatementCreateDatabase
-	StatementDropDatabase
-	StatementShowTables
-	StatementShowColumns
-	StatementShowCreateTable
-	StatementShowIndexes
-	StatementShowTableStatus
-	StatementInformationSchema
-	StatementUnsupported
-	StatementSystemVariable // SELECT @@version, SELECT DATABASE(), etc.
-	StatementVirtualTable   // SELECT * FROM MARMOT_CLUSTER_NODES, etc.
+	StatementUnknown         = common.StatementUnknown
+	StatementInsert          = common.StatementInsert
+	StatementReplace         = common.StatementReplace
+	StatementUpdate          = common.StatementUpdate
+	StatementDelete          = common.StatementDelete
+	StatementLoadData        = common.StatementLoadData
+	StatementDDL             = common.StatementDDL
+	StatementDCL             = common.StatementDCL
+	StatementBegin           = common.StatementBegin
+	StatementCommit          = common.StatementCommit
+	StatementRollback        = common.StatementRollback
+	StatementSavepoint       = common.StatementSavepoint
+	StatementXA              = common.StatementXA
+	StatementLock            = common.StatementLock
+	StatementSelect          = common.StatementSelect
+	StatementAdmin           = common.StatementAdmin
+	StatementSet             = common.StatementSet
+	StatementShowDatabases   = common.StatementShowDatabases
+	StatementUseDatabase     = common.StatementUseDatabase
+	StatementCreateDatabase  = common.StatementCreateDatabase
+	StatementDropDatabase    = common.StatementDropDatabase
+	StatementShowTables      = common.StatementShowTables
+	StatementShowColumns     = common.StatementShowColumns
+	StatementShowCreateTable = common.StatementShowCreateTable
+	StatementShowIndexes     = common.StatementShowIndexes
+	StatementShowTableStatus = common.StatementShowTableStatus
+	StatementInformationSchema = common.StatementInformationSchema
+	StatementUnsupported     = common.StatementUnsupported
+	StatementSystemVariable  = common.StatementSystemVariable
+	StatementVirtualTable    = common.StatementVirtualTable
 )
 
 // InformationSchemaTableType identifies which INFORMATION_SCHEMA table is being queried.
@@ -96,7 +99,7 @@ type QueryInput struct {
 // QueryOutput holds the results of query processing.
 type QueryOutput struct {
 	Statements    []TranspiledStatement
-	StatementType StatementType
+	StatementType StatementCode
 	Database      string
 	IsValid       bool
 	ValidationErr error
@@ -131,28 +134,6 @@ type QueryContext struct {
 	MySQLState     *MySQLParseState // nil for SQLite dialect
 	SchemaLookup   func(table string) string
 	SchemaProvider transform.SchemaProvider
-}
-
-// IsMutation returns true if the statement type is a mutation operation.
-func (t StatementType) IsMutation() bool {
-	switch t {
-	case StatementInsert, StatementReplace, StatementUpdate, StatementDelete,
-		StatementLoadData, StatementDDL, StatementDCL, StatementAdmin,
-		StatementCreateDatabase, StatementDropDatabase:
-		return true
-	}
-	return false
-}
-
-// IsReadOnly returns true if the statement type is read-only.
-func (t StatementType) IsReadOnly() bool {
-	switch t {
-	case StatementSelect, StatementShowDatabases, StatementShowTables,
-		StatementShowColumns, StatementShowCreateTable, StatementShowIndexes,
-		StatementShowTableStatus, StatementInformationSchema:
-		return true
-	}
-	return false
 }
 
 // NewContext creates a new QueryContext for the given SQL and parameters.

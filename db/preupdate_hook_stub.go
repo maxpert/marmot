@@ -35,7 +35,7 @@ func NewSchemaCache() *SchemaCache {
 
 // GetSchemaFor returns an error indicating preupdate hooks are not enabled
 func (c *SchemaCache) GetSchemaFor(tableName string) (*TableSchema, error) {
-	return nil, ErrPreupdateHookNotEnabled
+	return nil, ErrSchemaCacheMiss{Table: tableName}
 }
 
 // Reload returns an error indicating preupdate hooks are not enabled
@@ -65,7 +65,7 @@ func (s *EphemeralHookSession) BeginTx(ctx context.Context) error {
 }
 
 // ExecContext returns an error (stub)
-func (s *EphemeralHookSession) ExecContext(ctx context.Context, query string) error {
+func (s *EphemeralHookSession) ExecContext(ctx context.Context, query string, args ...interface{}) error {
 	return ErrPreupdateHookNotEnabled
 }
 

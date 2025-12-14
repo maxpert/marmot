@@ -178,7 +178,13 @@ func (tm *TransactionManager) WriteIntent(txn *Transaction, intentType IntentTyp
 		return fmt.Errorf("transaction %d is not pending", txn.ID)
 	}
 
-	op := StatementTypeToOpType(stmt.Type)
+	// Only DML intents need OpType conversion - DDL uses SQL statement directly
+	var op OpType
+	if intentType == IntentTypeDML {
+		op = StatementTypeToOpType(stmt.Type)
+	} else {
+		op = OpTypeInsert // Placeholder for non-DML intents (DDL uses SQLStatement field)
+	}
 
 	// Persist the intent directly to MetaStore (durable storage)
 	err := tm.metaStore.WriteIntent(txn.ID, intentType, tableName, intentKey,
@@ -473,8 +479,9 @@ func (tm *TransactionManager) cleanupAfterCommit(txn *Transaction, intents []*Wr
 	}
 }
 
-// opCodeToStatementType converts OpType back to protocol.StatementType
-func opCodeToStatementType(op uint8) protocol.StatementType {
+// opCodeToStatementType converts OpType back to protocol.StatementCode.
+// Panics on unknown type - internal data corruption should not be silently ignored.
+func opCodeToStatementType(op uint8) protocol.StatementCode {
 	switch OpType(op) {
 	case OpTypeInsert, OpTypeReplace:
 		return protocol.StatementInsert
@@ -483,7 +490,7 @@ func opCodeToStatementType(op uint8) protocol.StatementType {
 	case OpTypeDelete:
 		return protocol.StatementDelete
 	default:
-		return protocol.StatementInsert
+		panic(fmt.Sprintf("opCodeToStatementType: unknown OpType %d", op))
 	}
 }
 
@@ -778,7 +785,20 @@ func (tm *TransactionManager) writeCDCUpdate(tableName string, oldValues, newVal
 	// Get table schema to build proper WHERE clause
 	schema, err := tm.schemaCache.GetSchemaFor(tableName)
 	if err != nil {
-		return fmt.Errorf("failed to get schema for table %s: %w", tableName, err)
+		// Try to reload schema cache if table not found
+		if _, ok := err.(ErrSchemaCacheMiss); ok {
+			log.Warn().Str("table", tableName).Msg("Schema not cached during UPDATE replay, attempting reload")
+			if reloadErr := tm.reloadSchemaCache(); reloadErr != nil {
+				return fmt.Errorf("failed to reload schema: %w", reloadErr)
+			}
+			// Retry schema lookup
+			schema, err = tm.schemaCache.GetSchemaFor(tableName)
+			if err != nil {
+				return fmt.Errorf("failed to get schema for table %s after reload: %w", tableName, err)
+			}
+		} else {
+			return fmt.Errorf("failed to get schema for table %s: %w", tableName, err)
+		}
 	}
 
 	// Build UPDATE statement with SET clause using newValues
@@ -841,7 +861,20 @@ func (tm *TransactionManager) writeCDCDelete(tableName string, intentKey string,
 	// Get table schema to build proper WHERE clause
 	schema, err := tm.schemaCache.GetSchemaFor(tableName)
 	if err != nil {
-		return fmt.Errorf("failed to get schema for table %s: %w", tableName, err)
+		// Try to reload schema cache if table not found
+		if _, ok := err.(ErrSchemaCacheMiss); ok {
+			log.Warn().Str("table", tableName).Msg("Schema not cached during DELETE replay, attempting reload")
+			if reloadErr := tm.reloadSchemaCache(); reloadErr != nil {
+				return fmt.Errorf("failed to reload schema: %w", reloadErr)
+			}
+			// Retry schema lookup
+			schema, err = tm.schemaCache.GetSchemaFor(tableName)
+			if err != nil {
+				return fmt.Errorf("failed to get schema for table %s after reload: %w", tableName, err)
+			}
+		} else {
+			return fmt.Errorf("failed to get schema for table %s: %w", tableName, err)
+		}
 	}
 
 	// Build WHERE clause using primary key columns from oldValues

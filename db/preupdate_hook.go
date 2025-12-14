@@ -60,7 +60,7 @@ func (c *SchemaCache) GetSchemaFor(tableName string) (*TableSchema, error) {
 
 	schema, ok := c.cache[tableName]
 	if !ok {
-		return nil, fmt.Errorf("schema not cached for table %s", tableName)
+		return nil, ErrSchemaCacheMiss{Table: tableName}
 	}
 	return schema, nil
 }
@@ -248,11 +248,11 @@ func (s *EphemeralHookSession) BeginTx(ctx context.Context) error {
 }
 
 // ExecContext executes a statement within the session's transaction
-func (s *EphemeralHookSession) ExecContext(ctx context.Context, query string) error {
+func (s *EphemeralHookSession) ExecContext(ctx context.Context, query string, args ...interface{}) error {
 	if s.tx == nil {
 		return fmt.Errorf("no active transaction")
 	}
-	result, err := s.tx.ExecContext(ctx, query)
+	result, err := s.tx.ExecContext(ctx, query, args...)
 	if err != nil {
 		return err
 	}
@@ -355,8 +355,12 @@ func (s *EphemeralHookSession) hookCallback(data sqlite3.SQLitePreUpdateData) {
 	// The schema MUST be pre-populated via Reload() or the table will be skipped.
 	schema, err := s.schemaCache.GetSchemaFor(data.TableName)
 	if err != nil {
-		// Schema not in cache - skip this table
-		// This is expected for tables that weren't pre-loaded
+		// Schema not in cache - this is a critical issue that will cause replication to fail
+		// Set conflict error so caller knows to reload schema
+		if _, ok := err.(ErrSchemaCacheMiss); ok {
+			log.Warn().Str("table", data.TableName).Msg("CDC: schema not cached - changes will be lost")
+			s.conflictError = err
+		}
 		return
 	}
 

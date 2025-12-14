@@ -464,7 +464,7 @@ func TestDDL_BothDialects(t *testing.T) {
 	tests := []struct {
 		name              string
 		query             string
-		expectedType      StatementType
+		expectedType      StatementCode
 		expectedTableName string
 		expectMutation    bool
 	}{
@@ -515,7 +515,7 @@ func TestDDL_BothDialects(t *testing.T) {
 			}
 
 			if ctx.Output.StatementType != tt.expectedType {
-				t.Errorf("StatementType mismatch: got %d, want %d", ctx.Output.StatementType, tt.expectedType)
+				t.Errorf("StatementCode mismatch: got %d, want %d", ctx.Output.StatementType, tt.expectedType)
 			}
 
 			if ctx.Output.StatementType.IsMutation() != tt.expectMutation {

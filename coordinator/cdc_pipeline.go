@@ -169,7 +169,7 @@ func ConvertToStatement(entry CDCEntry) protocol.Statement {
 	hasOldValues := len(entry.OldValues) > 0
 	hasNewValues := len(entry.NewValues) > 0
 
-	var stmtType protocol.StatementType
+	var stmtType protocol.StatementCode
 	if hasOldValues && hasNewValues {
 		stmtType = protocol.StatementUpdate
 	} else if hasNewValues {

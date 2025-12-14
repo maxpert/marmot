@@ -167,7 +167,7 @@ func NewReplicatedDatabase(dbPath string, nodeID uint64, clock *hlc.Clock, metaS
 	commitBatcher := NewCommitBatcher(writeDB, 20, 2*time.Millisecond)
 	commitBatcher.Start()
 
-	return &ReplicatedDatabase{
+	mdb := &ReplicatedDatabase{
 		writeDB:       writeDB,
 		hookDB:        hookDB,
 		readDB:        readDB,
@@ -177,7 +177,16 @@ func NewReplicatedDatabase(dbPath string, nodeID uint64, clock *hlc.Clock, metaS
 		nodeID:        nodeID,
 		commitBatcher: commitBatcher,
 		schemaCache:   schemaCache,
-	}, nil
+	}
+
+	// Load schema cache with existing tables (required for CDC preupdate hooks)
+	if err := mdb.ReloadSchema(); err != nil {
+		closeAll()
+		commitBatcher.Stop()
+		return nil, fmt.Errorf("failed to reload schema cache: %w", err)
+	}
+
+	return mdb, nil
 }
 
 // SetReplicationFunc sets the replication function
@@ -599,7 +608,7 @@ func (p *PendingLocalExecution) GetLastInsertId() int64 {
 //
 // This design avoids deadlock: hookDB is released before 2PC broadcast,
 // so incoming COMMIT from other coordinators can acquire writeDB.
-func (mdb *ReplicatedDatabase) ExecuteLocalWithHooks(ctx context.Context, txnID uint64, statements []protocol.Statement) (coordinator.PendingExecution, error) {
+func (mdb *ReplicatedDatabase) ExecuteLocalWithHooks(ctx context.Context, txnID uint64, requests []coordinator.ExecutionRequest) (coordinator.PendingExecution, error) {
 	// Create ephemeral session with hookDB (NOT writeDB - avoids deadlock)
 	// SchemaCache must be pre-populated via ReloadSchema() before calling this
 	session, err := StartEphemeralSession(ctx, mdb.hookDB, mdb.metaStore, mdb.schemaCache, txnID)
@@ -614,8 +623,8 @@ func (mdb *ReplicatedDatabase) ExecuteLocalWithHooks(ctx context.Context, txnID 
 	}
 
 	// Execute each statement - hooks capture CDC to MetaStore
-	for _, stmt := range statements {
-		if err := session.ExecContext(ctx, stmt.SQL); err != nil {
+	for _, req := range requests {
+		if err := session.ExecContext(ctx, req.SQL, req.Params...); err != nil {
 			_ = session.Rollback()
 			return nil, fmt.Errorf("failed to execute statement: %w", err)
 		}

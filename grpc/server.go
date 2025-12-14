@@ -12,8 +12,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/maxpert/marmot/common"
 	"github.com/maxpert/marmot/db"
 	"github.com/maxpert/marmot/encoding"
+	"github.com/maxpert/marmot/protocol"
 	"github.com/rs/zerolog/log"
 	"github.com/soheilhy/cmux"
 	"google.golang.org/grpc"
@@ -352,71 +354,73 @@ const liveStreamPollInterval = 500 * time.Millisecond
 // sendChangeEvent converts a TransactionRecord to ChangeEvent and sends it on the stream.
 // Handles both CDC (Change Data Capture) path with row data and DDL path with SQL statements.
 func (s *Server) sendChangeEvent(rec *db.TransactionRecord, stream MarmotService_StreamChangesServer) error {
-	// Parse statements from msgpack - must include CDC data (NewValues, OldValues, IntentKey)
+	// Parse statements from msgpack using protocol.Statement (the canonical type)
 	var statements []*Statement
 	if len(rec.SerializedStatements) > 0 {
-		var rawStatements []struct {
-			SQL       string            `msgpack:"SQL"`
-			Type      int               `msgpack:"Type"`
-			TableName string            `msgpack:"TableName"`
-			Database  string            `msgpack:"Database"`
-			IntentKey string            `msgpack:"IntentKey"`
-			OldValues map[string][]byte `msgpack:"OldValues"`
-			NewValues map[string][]byte `msgpack:"NewValues"`
+		var protoStatements []protocol.Statement
+		if err := encoding.Unmarshal(rec.SerializedStatements, &protoStatements); err != nil {
+			return fmt.Errorf("failed to parse statements msgpack for txn %d: %w", rec.TxnID, err)
 		}
-		if err := encoding.Unmarshal(rec.SerializedStatements, &rawStatements); err != nil {
-			log.Warn().Err(err).Uint64("txn_id", rec.TxnID).Msg("Failed to parse statements msgpack")
-		} else {
-			for _, s := range rawStatements {
-				stmt := &Statement{
-					Type:      StatementType(s.Type),
-					TableName: s.TableName,
-					Database:  s.Database,
+
+		for _, ps := range protoStatements {
+			// Convert protocol.StatementCode to pb.StatementType at gRPC boundary
+			grpcType, ok := common.ToWireType(ps.Type)
+			if !ok {
+				return fmt.Errorf("unknown statement type %d in txn %d: cannot convert to wire format", ps.Type, rec.TxnID)
+			}
+
+			stmt := &Statement{
+				Type:      grpcType,
+				TableName: ps.TableName,
+				Database:  ps.Database,
+			}
+
+			// For DML with CDC data, use RowChange payload
+			// For DDL or DML without CDC, use DdlChange payload with SQL
+			isDML := ps.Type == protocol.StatementInsert ||
+				ps.Type == protocol.StatementUpdate ||
+				ps.Type == protocol.StatementDelete ||
+				ps.Type == protocol.StatementReplace
+
+			if isDML && (len(ps.NewValues) > 0 || len(ps.OldValues) > 0) {
+				// CDC path: send row data
+				stmt.Payload = &Statement_RowChange{
+					RowChange: &RowChange{
+						IntentKey: ps.IntentKey,
+						OldValues: ps.OldValues,
+						NewValues: ps.NewValues,
+					},
 				}
-
-				// For DML with CDC data, use RowChange payload
-				// For DDL or DML without CDC, use DdlChange payload with SQL
-				isDML := s.Type == int(StatementType_INSERT) ||
-					s.Type == int(StatementType_UPDATE) ||
-					s.Type == int(StatementType_DELETE) ||
-					s.Type == int(StatementType_REPLACE)
-
-				if isDML && (len(s.NewValues) > 0 || len(s.OldValues) > 0) {
-					// CDC path: send row data
-					stmt.Payload = &Statement_RowChange{
-						RowChange: &RowChange{
-							IntentKey: s.IntentKey,
-							OldValues: s.OldValues,
-							NewValues: s.NewValues,
-						},
-					}
+				if log.Debug().Enabled() {
 					log.Debug().
 						Uint64("txn_id", rec.TxnID).
-						Str("table", s.TableName).
-						Str("intent_key", s.IntentKey).
-						Int("new_values", len(s.NewValues)).
-						Int("old_values", len(s.OldValues)).
+						Str("table", ps.TableName).
+						Str("intent_key", ps.IntentKey).
+						Int("new_values", len(ps.NewValues)).
+						Int("old_values", len(ps.OldValues)).
 						Msg("STREAM: Sending CDC data for anti-entropy")
-				} else {
-					// DDL or DML without CDC: send SQL
-					stmt.Payload = &Statement_DdlChange{
-						DdlChange: &DDLChange{
-							Sql: s.SQL,
-						},
-					}
+				}
+			} else {
+				// DDL or DML without CDC: send SQL
+				stmt.Payload = &Statement_DdlChange{
+					DdlChange: &DDLChange{
+						Sql: ps.SQL,
+					},
+				}
+				if log.Debug().Enabled() {
 					log.Debug().
 						Uint64("txn_id", rec.TxnID).
 						Str("sql_prefix", func() string {
-							if len(s.SQL) > 50 {
-								return s.SQL[:50]
+							if len(ps.SQL) > 50 {
+								return ps.SQL[:50]
 							}
-							return s.SQL
+							return ps.SQL
 						}()).
 						Msg("STREAM: Sending SQL for anti-entropy")
 				}
-
-				statements = append(statements, stmt)
 			}
+
+			statements = append(statements, stmt)
 		}
 	}
 

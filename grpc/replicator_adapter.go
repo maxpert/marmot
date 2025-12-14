@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/maxpert/marmot/common"
 	"github.com/maxpert/marmot/coordinator"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/protocol"
@@ -24,11 +25,15 @@ func NewGRPCReplicator(client *Client) coordinator.Replicator {
 
 // ReplicateTransaction implements coordinator.Replicator
 func (gr *GRPCReplicator) ReplicateTransaction(ctx context.Context, nodeID uint64, req *coordinator.ReplicationRequest) (*coordinator.ReplicationResponse, error) {
+	statements, err := convertStatementsToProto(req.Statements, req.Database)
+	if err != nil {
+		return nil, err
+	}
 	// Convert coordinator.ReplicationRequest to gRPC TransactionRequest
 	grpcReq := &TransactionRequest{
 		TxnId:        req.TxnID,
 		SourceNodeId: req.NodeID,
-		Statements:   convertStatementsToProto(req.Statements, req.Database),
+		Statements:   statements,
 		Timestamp: &HLC{
 			WallTime: req.StartTS.WallTime,
 			Logical:  req.StartTS.Logical,
@@ -57,7 +62,7 @@ func (gr *GRPCReplicator) ReplicateTransaction(ctx context.Context, nodeID uint6
 }
 
 // convertStatementsToProto converts protocol.Statement to gRPC Statement with CDC
-func convertStatementsToProto(stmts []protocol.Statement, database string) []*Statement {
+func convertStatementsToProto(stmts []protocol.Statement, database string) ([]*Statement, error) {
 	protoStmts := make([]*Statement, len(stmts))
 	for i, stmt := range stmts {
 		// Use statement's database if set, otherwise use the transaction's database
@@ -66,8 +71,12 @@ func convertStatementsToProto(stmts []protocol.Statement, database string) []*St
 			stmtDB = database
 		}
 
+		grpcType, ok := common.ToWireType(stmt.Type)
+		if !ok {
+			return nil, fmt.Errorf("convertStatementsToProto: unknown statement type %v", stmt.Type)
+		}
 		protoStmt := &Statement{
-			Type:      convertStatementTypeToProto(stmt.Type),
+			Type:      grpcType,
 			TableName: stmt.TableName,
 			Database:  stmtDB,
 		}
@@ -99,32 +108,12 @@ func convertStatementsToProto(stmts []protocol.Statement, database string) []*St
 
 		protoStmts[i] = protoStmt
 	}
-	return protoStmts
+
+	return protoStmts, nil
 }
 
-// convertStatementTypeToProto converts protocol.StatementType to gRPC StatementType
-func convertStatementTypeToProto(stmtType protocol.StatementType) StatementType {
-	switch stmtType {
-	case protocol.StatementInsert:
-		return StatementType_INSERT
-	case protocol.StatementUpdate:
-		return StatementType_UPDATE
-	case protocol.StatementDelete:
-		return StatementType_DELETE
-	case protocol.StatementReplace:
-		return StatementType_REPLACE
-	case protocol.StatementDDL:
-		return StatementType_DDL
-	case protocol.StatementCreateDatabase:
-		return StatementType_CREATE_DATABASE
-	case protocol.StatementDropDatabase:
-		return StatementType_DROP_DATABASE
-	default:
-		return StatementType_INSERT
-	}
-}
-
-// convertPhaseToProto converts coordinator.ReplicationPhase to gRPC TransactionPhase
+// convertPhaseToProto converts coordinator.ReplicationPhase to gRPC TransactionPhase.
+// Panics on unknown phase - internal consistency error.
 func convertPhaseToProto(phase coordinator.ReplicationPhase) TransactionPhase {
 	switch phase {
 	case coordinator.PhasePrep:
@@ -134,7 +123,7 @@ func convertPhaseToProto(phase coordinator.ReplicationPhase) TransactionPhase {
 	case coordinator.PhaseAbort:
 		return TransactionPhase_ABORT
 	default:
-		return TransactionPhase_PREPARE
+		panic(fmt.Sprintf("convertPhaseToProto: unknown replication phase %d", phase))
 	}
 }
 

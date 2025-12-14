@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+package marmot.common;
+
+option go_package = "github.com/maxpert/marmot/grpc/common";
+
+// StatementType represents the type of SQL statement on the wire.
+// This is the ONLY definition - used by all gRPC messages.
+enum StatementType {
+  INSERT = 0;
+  UPDATE = 1;
+  DELETE = 2;
+  REPLACE = 3;
+  DDL = 4;
+  CREATE_DATABASE = 5;
+  DROP_DATABASE = 6;
+}

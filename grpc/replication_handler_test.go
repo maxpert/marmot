@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/maxpert/marmot/db"
+	pb "github.com/maxpert/marmot/grpc/common"
 	"github.com/maxpert/marmot/hlc"
 )
 
@@ -60,7 +61,7 @@ func TestSchemaVersionRejection(t *testing.T) {
 		RequiredSchemaVersion: 10, // Greater than local version (5)
 		Statements: []*Statement{
 			{
-				Type:      StatementType_INSERT,
+				Type:      pb.StatementType_INSERT,
 				TableName: "test_table",
 				Database:  testDB,
 				Payload: &Statement_RowChange{

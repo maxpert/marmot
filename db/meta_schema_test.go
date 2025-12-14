@@ -1,18 +1,19 @@
 package db
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/maxpert/marmot/protocol"
 )
 
-// TestStatementTypeToOpType verifies the mapping between protocol.StatementType and OpType.
+// TestStatementTypeToOpType verifies the mapping between protocol.StatementCode and OpType.
 // This test is critical for preventing enum mismatch bugs where UPDATE was incorrectly
 // mapped to DELETE due to off-by-one errors in magic number constants.
 func TestStatementTypeToOpType(t *testing.T) {
 	tests := []struct {
 		name     string
-		input    protocol.StatementType
+		input    protocol.StatementCode
 		expected OpType
 	}{
 		{
@@ -35,11 +36,6 @@ func TestStatementTypeToOpType(t *testing.T) {
 			input:    protocol.StatementDelete,
 			expected: OpTypeDelete,
 		},
-		{
-			name:     "Unknown defaults to OpTypeInsert",
-			input:    protocol.StatementUnknown,
-			expected: OpTypeInsert,
-		},
 	}
 
 	for _, tt := range tests {
@@ -53,7 +49,29 @@ func TestStatementTypeToOpType(t *testing.T) {
 	}
 }
 
-// TestStatementTypeEnumValues verifies the actual numeric values of protocol.StatementType.
+// TestStatementTypeToOpTypePanicsOnUnsupported verifies that non-DML statement types panic.
+func TestStatementTypeToOpTypePanicsOnUnsupported(t *testing.T) {
+	unsupportedTypes := []protocol.StatementCode{
+		protocol.StatementUnknown,
+		protocol.StatementDDL,
+		protocol.StatementCreateDatabase,
+		protocol.StatementDropDatabase,
+	}
+
+	for _, stmtType := range unsupportedTypes {
+		stmtType := stmtType // capture for closure
+		t.Run(fmt.Sprintf("StatementCode_%d", stmtType), func(t *testing.T) {
+			defer func() {
+				if r := recover(); r == nil {
+					t.Errorf("StatementTypeToOpType(%d) should panic but didn't", stmtType)
+				}
+			}()
+			StatementTypeToOpType(stmtType)
+		})
+	}
+}
+
+// TestStatementTypeEnumValues verifies the actual numeric values of protocol.StatementCode.
 // This catches bugs where someone changes the enum order or adds new values in the middle.
 func TestStatementTypeEnumValues(t *testing.T) {
 	// These are the canonical values. If they change, something is wrong.
