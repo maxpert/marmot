@@ -1112,12 +1112,10 @@ func parseParamValue(payload []byte, offset int, paramType byte) (int, interface
 		return offset + 8, math.Float64frombits(bits), nil
 
 	case MYSQL_TYPE_STRING, MYSQL_TYPE_VAR_STRING, MYSQL_TYPE_VARCHAR,
-		MYSQL_TYPE_BLOB, MYSQL_TYPE_TINY_BLOB, MYSQL_TYPE_MEDIUM_BLOB, MYSQL_TYPE_LONG_BLOB,
 		MYSQL_TYPE_DECIMAL, MYSQL_TYPE_NEWDECIMAL,
-		MYSQL_TYPE_BIT, MYSQL_TYPE_ENUM, MYSQL_TYPE_SET,
-		MYSQL_TYPE_DATE, MYSQL_TYPE_DATETIME, MYSQL_TYPE_TIMESTAMP, MYSQL_TYPE_TIME,
-		MYSQL_TYPE_GEOMETRY:
-		// All these types use length-encoded string format
+		MYSQL_TYPE_ENUM, MYSQL_TYPE_SET,
+		MYSQL_TYPE_DATE, MYSQL_TYPE_DATETIME, MYSQL_TYPE_TIMESTAMP, MYSQL_TYPE_TIME:
+		// Text types - return as string for proper SQLite TEXT comparison
 		length, n := readLengthEncodedInt(payload[offset:])
 		if n == 0 {
 			return offset, nil, fmt.Errorf("failed to read length")
@@ -1126,7 +1124,20 @@ func parseParamValue(payload []byte, offset int, paramType byte) (int, interface
 		if len(payload) < offset+int(length) {
 			return offset, nil, fmt.Errorf("not enough data for string (need %d, have %d)", length, len(payload)-offset)
 		}
-		// Return as []byte to preserve binary data
+		data := payload[offset : offset+int(length)]
+		return offset + int(length), string(data), nil
+
+	case MYSQL_TYPE_BLOB, MYSQL_TYPE_TINY_BLOB, MYSQL_TYPE_MEDIUM_BLOB, MYSQL_TYPE_LONG_BLOB,
+		MYSQL_TYPE_BIT, MYSQL_TYPE_GEOMETRY:
+		// Binary types - return as []byte to preserve binary data
+		length, n := readLengthEncodedInt(payload[offset:])
+		if n == 0 {
+			return offset, nil, fmt.Errorf("failed to read length")
+		}
+		offset += n
+		if len(payload) < offset+int(length) {
+			return offset, nil, fmt.Errorf("not enough data for blob (need %d, have %d)", length, len(payload)-offset)
+		}
 		data := payload[offset : offset+int(length)]
 		return offset + int(length), data, nil
 
@@ -1170,4 +1181,3 @@ func readLengthEncodedInt(b []byte) (uint64, int) {
 		return uint64(b[0]), 1
 	}
 }
-
