@@ -493,7 +493,7 @@ func TestDDLReplicationBasic(t *testing.T) {
 	// Test: CREATE TABLE DDL
 	t.Run("CREATE TABLE DDL", func(t *testing.T) {
 		// Execute DDL
-		result, err := handler.HandleQuery(session, "CREATE TABLE users (id INT PRIMARY KEY, name TEXT)")
+		result, err := handler.HandleQuery(session, "CREATE TABLE users (id INT PRIMARY KEY, name TEXT)", nil)
 		require.NoError(t, err)
 		require.NotNil(t, result)
 		require.Equal(t, int64(1), result.RowsAffected)
@@ -509,14 +509,14 @@ func TestDDLReplicationBasic(t *testing.T) {
 
 	// Test: Multiple DDL statements increment version
 	t.Run("Multiple DDL statements", func(t *testing.T) {
-		_, err := handler.HandleQuery(session, "CREATE INDEX idx_name ON users(name)")
+		_, err := handler.HandleQuery(session, "CREATE INDEX idx_name ON users(name)", nil)
 		require.NoError(t, err)
 
 		version, err := svm.GetSchemaVersion("testdb")
 		require.NoError(t, err)
 		require.Equal(t, uint64(2), version)
 
-		_, err = handler.HandleQuery(session, "ALTER TABLE users ADD COLUMN email TEXT")
+		_, err = handler.HandleQuery(session, "ALTER TABLE users ADD COLUMN email TEXT", nil)
 		require.NoError(t, err)
 
 		version, err = svm.GetSchemaVersion("testdb")
@@ -584,7 +584,7 @@ func TestDDLWithConcurrentDML(t *testing.T) {
 	}
 
 	// Step 1: Create table (DDL)
-	_, err = handler.HandleQuery(session, "CREATE TABLE products (id INT PRIMARY KEY, name TEXT)")
+	_, err = handler.HandleQuery(session, "CREATE TABLE products (id INT PRIMARY KEY, name TEXT)", nil)
 	require.NoError(t, err)
 
 	version, err := svm.GetSchemaVersion("testdb")
@@ -597,7 +597,7 @@ func TestDDLWithConcurrentDML(t *testing.T) {
 	require.Equal(t, protocol.StatementInsert, stmt.Type, "should be DML")
 
 	// Step 3: Alter table (DDL)
-	_, err = handler.HandleQuery(session, "ALTER TABLE products ADD COLUMN price REAL")
+	_, err = handler.HandleQuery(session, "ALTER TABLE products ADD COLUMN price REAL", nil)
 	require.NoError(t, err)
 
 	version, err = svm.GetSchemaVersion("testdb")

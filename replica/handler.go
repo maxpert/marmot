@@ -33,15 +33,15 @@ func NewReadOnlyHandler(dbManager *db.DatabaseManager, clock *hlc.Clock, replica
 }
 
 // HandleQuery processes a SQL query (read-only)
-func (h *ReadOnlyHandler) HandleQuery(session *protocol.ConnectionSession, query string) (*protocol.ResultSet, error) {
+func (h *ReadOnlyHandler) HandleQuery(session *protocol.ConnectionSession, sql string, params []interface{}) (*protocol.ResultSet, error) {
 	log.Debug().
 		Uint64("conn_id", session.ConnID).
 		Str("database", session.CurrentDatabase).
-		Str("query", query).
+		Str("query", sql).
 		Msg("Handling query (read-only)")
 
 	// Parse first - all routing decisions based on parsed Statement
-	stmt := protocol.ParseStatement(query)
+	stmt := protocol.ParseStatement(sql)
 
 	// Handle system variable queries (@@version, DATABASE(), etc.)
 	if stmt.Type == protocol.StatementSystemVariable {
@@ -141,7 +141,7 @@ func (h *ReadOnlyHandler) HandleQuery(session *protocol.ConnectionSession, query
 	}
 
 	// Execute read locally
-	return h.executeLocalRead(stmt)
+	return h.executeLocalRead(stmt, params)
 }
 
 // handleSystemQuery handles MySQL system variable queries
@@ -158,7 +158,7 @@ func (h *ReadOnlyHandler) handleSystemQuery(session *protocol.ConnectionSession,
 }
 
 // executeLocalRead executes a read query locally
-func (h *ReadOnlyHandler) executeLocalRead(stmt protocol.Statement) (*protocol.ResultSet, error) {
+func (h *ReadOnlyHandler) executeLocalRead(stmt protocol.Statement, params []interface{}) (*protocol.ResultSet, error) {
 	if stmt.Database == "" {
 		return nil, fmt.Errorf("ERROR 1046 (3D000): No database selected")
 	}
@@ -171,7 +171,7 @@ func (h *ReadOnlyHandler) executeLocalRead(stmt protocol.Statement) (*protocol.R
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	rows, err := sqlDB.QueryContext(ctx, stmt.SQL)
+	rows, err := sqlDB.QueryContext(ctx, stmt.SQL, params...)
 	if err != nil {
 		return nil, err
 	}

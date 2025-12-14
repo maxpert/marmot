@@ -33,7 +33,7 @@ type DatabaseManager interface {
 
 // ReplicatedDatabaseProvider provides access to replicated database operations
 type ReplicatedDatabaseProvider interface {
-	ExecuteLocalWithHooks(ctx context.Context, txnID uint64, statements []protocol.Statement) (PendingExecution, error)
+	ExecuteLocalWithHooks(ctx context.Context, txnID uint64, requests []ExecutionRequest) (PendingExecution, error)
 }
 
 // CDCEntry holds CDC data captured by preupdate hooks
@@ -42,6 +42,12 @@ type CDCEntry struct {
 	IntentKey string
 	OldValues map[string][]byte
 	NewValues map[string][]byte
+}
+
+// ExecutionRequest for local-only execution - never replicated
+type ExecutionRequest struct {
+	SQL    string
+	Params []interface{}
 }
 
 // CDCMergeResult holds merged CDC data from preupdate hooks.
@@ -207,11 +213,11 @@ func (h *CoordinatorHandler) SetPublisherRegistry(registry PublisherRegistry) {
 }
 
 // HandleQuery processes a SQL query
-func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, query string) (*protocol.ResultSet, error) {
+func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, sql string, params []interface{}) (*protocol.ResultSet, error) {
 	log.Trace().
 		Uint64("conn_id", session.ConnID).
 		Str("database", session.CurrentDatabase).
-		Str("query", query).
+		Str("query", sql).
 		Msg("Handling query")
 
 	// Build schema lookup function for auto-increment ID injection
@@ -228,7 +234,7 @@ func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, qu
 	}
 
 	// Parse first - all routing decisions based on parsed Statement
-	stmt := protocol.ParseStatementWithSchema(query, schemaLookup)
+	stmt := protocol.ParseStatementWithSchema(sql, schemaLookup)
 
 	// Handle system variable queries (@@version, DATABASE(), etc.)
 	if stmt.Type == protocol.StatementSystemVariable {
@@ -306,7 +312,7 @@ func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, qu
 	}
 
 	// Check for consistency hint
-	consistency, found := protocol.ExtractConsistencyHint(query)
+	consistency, found := protocol.ExtractConsistencyHint(sql)
 
 	isMutation := protocol.IsMutation(stmt)
 	inTransaction := session.InTransaction()
@@ -333,10 +339,10 @@ func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, qu
 
 	// Normal path - immediate execution (for YCSB and auto-commit clients)
 	if isMutation {
-		return h.handleMutation(stmt, consistency)
+		return h.handleMutation(stmt, params, consistency)
 	}
 
-	rs, err := h.handleRead(stmt, consistency)
+	rs, err := h.handleRead(stmt, params, consistency)
 	if err != nil {
 		return nil, err
 	}
@@ -345,7 +351,7 @@ func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, qu
 	return rs, nil
 }
 
-func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, consistency protocol.ConsistencyLevel) (*protocol.ResultSet, error) {
+func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, params []interface{}, consistency protocol.ConsistencyLevel) (*protocol.ResultSet, error) {
 	queryStart := time.Now()
 
 	// Generate txnID using Percolator/TiDB pattern: (physical_ms << 18) | logical
@@ -420,7 +426,8 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, consistency
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), hookTimeout)
 			cancelHookCtx = cancel // Store for later - DO NOT call yet
-			pendingExec, err = replicatedDB.ExecuteLocalWithHooks(ctx, uint64(txnID), statements)
+			req := ExecutionRequest{SQL: stmt.SQL, Params: params}
+			pendingExec, err = replicatedDB.ExecuteLocalWithHooks(ctx, uint64(txnID), []ExecutionRequest{req})
 
 			if err != nil {
 				cancel() // Only cancel on error
@@ -557,11 +564,12 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, consistency
 	return rs, nil
 }
 
-func (h *CoordinatorHandler) handleRead(stmt protocol.Statement, consistency protocol.ConsistencyLevel) (*protocol.ResultSet, error) {
+func (h *CoordinatorHandler) handleRead(stmt protocol.Statement, params []interface{}, consistency protocol.ConsistencyLevel) (*protocol.ResultSet, error) {
 	queryStart := time.Now()
 
 	req := &ReadRequest{
 		Query:       stmt.SQL,
+		Args:        params,
 		SnapshotTS:  h.clock.Now(),
 		Consistency: consistency,
 		TableName:   stmt.TableName,
@@ -892,7 +900,8 @@ func (h *CoordinatorHandler) handleCommit(session *protocol.ConnectionSession) (
 			}
 
 			ctx, cancel := context.WithTimeout(context.Background(), hookTimeout)
-			pendingExec, err := replicatedDB.ExecuteLocalWithHooks(ctx, txnState.TxnID, []protocol.Statement{stmt})
+			req := ExecutionRequest{SQL: stmt.SQL, Params: nil}
+			pendingExec, err := replicatedDB.ExecuteLocalWithHooks(ctx, txnState.TxnID, []ExecutionRequest{req})
 			if err != nil {
 				cancel()
 				session.EndTransaction()

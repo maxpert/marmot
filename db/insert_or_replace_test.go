@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/maxpert/marmot/coordinator"
 	"github.com/maxpert/marmot/hlc"
-	"github.com/maxpert/marmot/protocol"
 )
 
 // TestInsertOrReplaceWithHooks tests INSERT OR REPLACE behavior with CDC hooks
@@ -62,13 +62,11 @@ func TestInsertOrReplaceWithHooks(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	stmt1 := protocol.Statement{
-		SQL:       "INSERT INTO test_upsert (id, value) VALUES ('key1', 'value1')",
-		Type:      protocol.StatementInsert,
-		TableName: "test_upsert",
+	req1 := coordinator.ExecutionRequest{
+		SQL: "INSERT INTO test_upsert (id, value) VALUES ('key1', 'value1')",
 	}
 
-	pending1, err := replicatedDB.ExecuteLocalWithHooks(ctx, 1001, []protocol.Statement{stmt1})
+	pending1, err := replicatedDB.ExecuteLocalWithHooks(ctx, 1001, []coordinator.ExecutionRequest{req1})
 	if err != nil {
 		t.Fatalf("Failed to execute INSERT: %v", err)
 	}
@@ -90,15 +88,13 @@ func TestInsertOrReplaceWithHooks(t *testing.T) {
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel2()
 
-	stmt2 := protocol.Statement{
-		SQL:       "INSERT OR REPLACE INTO test_upsert (id, value) VALUES ('key1', 'value2')",
-		Type:      protocol.StatementReplace,
-		TableName: "test_upsert",
+	req2 := coordinator.ExecutionRequest{
+		SQL: "INSERT OR REPLACE INTO test_upsert (id, value) VALUES ('key1', 'value2')",
 	}
 
 	t.Log("About to call ExecuteLocalWithHooks for INSERT OR REPLACE...")
 	start := time.Now()
-	pending2, err := replicatedDB.ExecuteLocalWithHooks(ctx2, 1002, []protocol.Statement{stmt2})
+	pending2, err := replicatedDB.ExecuteLocalWithHooks(ctx2, 1002, []coordinator.ExecutionRequest{req2})
 	elapsed := time.Since(start)
 	t.Logf("ExecuteLocalWithHooks returned after %v", elapsed)
 
@@ -174,15 +170,13 @@ func TestInsertOrReplaceNewRow(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	stmt := protocol.Statement{
-		SQL:       "INSERT OR REPLACE INTO test_upsert2 (id, value) VALUES ('newkey', 'newvalue')",
-		Type:      protocol.StatementReplace,
-		TableName: "test_upsert2",
+	req := coordinator.ExecutionRequest{
+		SQL: "INSERT OR REPLACE INTO test_upsert2 (id, value) VALUES ('newkey', 'newvalue')",
 	}
 
 	t.Log("About to call ExecuteLocalWithHooks...")
 	start := time.Now()
-	pending, err := replicatedDB.ExecuteLocalWithHooks(ctx, 2001, []protocol.Statement{stmt})
+	pending, err := replicatedDB.ExecuteLocalWithHooks(ctx, 2001, []coordinator.ExecutionRequest{req})
 	elapsed := time.Since(start)
 	t.Logf("ExecuteLocalWithHooks returned after %v", elapsed)
 
@@ -243,13 +237,11 @@ func TestLastInsertIdCapture(t *testing.T) {
 	ctx1, cancel1 := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel1()
 
-	stmt1 := protocol.Statement{
-		SQL:       "INSERT INTO test_autoincrement (value) VALUES ('first')",
-		Type:      protocol.StatementInsert,
-		TableName: "test_autoincrement",
+	req1 := coordinator.ExecutionRequest{
+		SQL: "INSERT INTO test_autoincrement (value) VALUES ('first')",
 	}
 
-	pending1, err := replicatedDB.ExecuteLocalWithHooks(ctx1, 3001, []protocol.Statement{stmt1})
+	pending1, err := replicatedDB.ExecuteLocalWithHooks(ctx1, 3001, []coordinator.ExecutionRequest{req1})
 	if err != nil {
 		t.Fatalf("Failed to execute INSERT: %v", err)
 	}
@@ -269,13 +261,11 @@ func TestLastInsertIdCapture(t *testing.T) {
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel2()
 
-	stmt2 := protocol.Statement{
-		SQL:       "INSERT INTO test_autoincrement (value) VALUES ('second')",
-		Type:      protocol.StatementInsert,
-		TableName: "test_autoincrement",
+	req2 := coordinator.ExecutionRequest{
+		SQL: "INSERT INTO test_autoincrement (value) VALUES ('second')",
 	}
 
-	pending2, err := replicatedDB.ExecuteLocalWithHooks(ctx2, 3002, []protocol.Statement{stmt2})
+	pending2, err := replicatedDB.ExecuteLocalWithHooks(ctx2, 3002, []coordinator.ExecutionRequest{req2})
 	if err != nil {
 		t.Fatalf("Failed to execute second INSERT: %v", err)
 	}
@@ -295,13 +285,11 @@ func TestLastInsertIdCapture(t *testing.T) {
 	ctx3, cancel3 := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel3()
 
-	stmt3 := protocol.Statement{
-		SQL:       "UPDATE test_autoincrement SET value = 'updated' WHERE id = 1",
-		Type:      protocol.StatementUpdate,
-		TableName: "test_autoincrement",
+	req3 := coordinator.ExecutionRequest{
+		SQL: "UPDATE test_autoincrement SET value = 'updated' WHERE id = 1",
 	}
 
-	pending3, err := replicatedDB.ExecuteLocalWithHooks(ctx3, 3003, []protocol.Statement{stmt3})
+	pending3, err := replicatedDB.ExecuteLocalWithHooks(ctx3, 3003, []coordinator.ExecutionRequest{req3})
 	if err != nil {
 		t.Fatalf("Failed to execute UPDATE: %v", err)
 	}

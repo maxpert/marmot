@@ -85,7 +85,7 @@ func TestHandler_RejectInsert(t *testing.T) {
 		CurrentDatabase: "testdb",
 	}
 
-	_, err := handler.HandleQuery(session, "INSERT INTO users (name, email) VALUES ('Bob', 'bob@test.com')")
+	_, err := handler.HandleQuery(session, "INSERT INTO users (name, email) VALUES ('Bob', 'bob@test.com')", nil)
 	if err == nil {
 		t.Fatal("Expected error for INSERT on read-only replica, got nil")
 	}
@@ -110,7 +110,7 @@ func TestHandler_RejectUpdate(t *testing.T) {
 		CurrentDatabase: "testdb",
 	}
 
-	_, err := handler.HandleQuery(session, "UPDATE users SET name = 'Updated' WHERE id = 1")
+	_, err := handler.HandleQuery(session, "UPDATE users SET name = 'Updated' WHERE id = 1", nil)
 	if err == nil {
 		t.Fatal("Expected error for UPDATE on read-only replica, got nil")
 	}
@@ -135,7 +135,7 @@ func TestHandler_RejectDelete(t *testing.T) {
 		CurrentDatabase: "testdb",
 	}
 
-	_, err := handler.HandleQuery(session, "DELETE FROM users WHERE id = 1")
+	_, err := handler.HandleQuery(session, "DELETE FROM users WHERE id = 1", nil)
 	if err == nil {
 		t.Fatal("Expected error for DELETE on read-only replica, got nil")
 	}
@@ -168,7 +168,7 @@ func TestHandler_RejectDDL(t *testing.T) {
 	}
 
 	for _, stmt := range ddlStatements {
-		_, err := handler.HandleQuery(session, stmt)
+		_, err := handler.HandleQuery(session, stmt, nil)
 		if err == nil {
 			t.Errorf("Expected error for '%s' on read-only replica, got nil", stmt)
 			continue
@@ -196,7 +196,7 @@ func TestHandler_AllowSelect(t *testing.T) {
 		CurrentDatabase: "testdb",
 	}
 
-	result, err := handler.HandleQuery(session, "SELECT * FROM users WHERE id = 1")
+	result, err := handler.HandleQuery(session, "SELECT * FROM users WHERE id = 1", nil)
 	if err != nil {
 		t.Fatalf("Expected SELECT to succeed, got error: %v", err)
 	}
@@ -220,7 +220,7 @@ func TestHandler_AllowSelectCount(t *testing.T) {
 		CurrentDatabase: "testdb",
 	}
 
-	result, err := handler.HandleQuery(session, "SELECT COUNT(*) FROM users")
+	result, err := handler.HandleQuery(session, "SELECT COUNT(*) FROM users", nil)
 	if err != nil {
 		t.Fatalf("Expected SELECT COUNT to succeed, got error: %v", err)
 	}
@@ -244,7 +244,7 @@ func TestHandler_AllowBegin(t *testing.T) {
 		CurrentDatabase: "testdb",
 	}
 
-	_, err := handler.HandleQuery(session, "BEGIN")
+	_, err := handler.HandleQuery(session, "BEGIN", nil)
 	if err != nil {
 		t.Fatalf("Expected BEGIN to succeed on read-only replica, got error: %v", err)
 	}
@@ -260,7 +260,7 @@ func TestHandler_AllowCommit(t *testing.T) {
 		CurrentDatabase: "testdb",
 	}
 
-	_, err := handler.HandleQuery(session, "COMMIT")
+	_, err := handler.HandleQuery(session, "COMMIT", nil)
 	if err != nil {
 		t.Fatalf("Expected COMMIT to succeed on read-only replica, got error: %v", err)
 	}
@@ -276,7 +276,7 @@ func TestHandler_AllowRollback(t *testing.T) {
 		CurrentDatabase: "testdb",
 	}
 
-	_, err := handler.HandleQuery(session, "ROLLBACK")
+	_, err := handler.HandleQuery(session, "ROLLBACK", nil)
 	if err != nil {
 		t.Fatalf("Expected ROLLBACK to succeed on read-only replica, got error: %v", err)
 	}
@@ -291,7 +291,7 @@ func TestHandler_ShowDatabases(t *testing.T) {
 		ConnID: 1,
 	}
 
-	result, err := handler.HandleQuery(session, "SHOW DATABASES")
+	result, err := handler.HandleQuery(session, "SHOW DATABASES", nil)
 	if err != nil {
 		t.Fatalf("Expected SHOW DATABASES to succeed, got error: %v", err)
 	}
@@ -316,7 +316,7 @@ func TestHandler_ShowTables(t *testing.T) {
 		CurrentDatabase: "testdb",
 	}
 
-	result, err := handler.HandleQuery(session, "SHOW TABLES")
+	result, err := handler.HandleQuery(session, "SHOW TABLES", nil)
 	if err != nil {
 		t.Fatalf("Expected SHOW TABLES to succeed, got error: %v", err)
 	}
@@ -348,7 +348,7 @@ func TestHandler_UseDatabase(t *testing.T) {
 		CurrentDatabase: "",
 	}
 
-	_, err := handler.HandleQuery(session, "USE testdb")
+	_, err := handler.HandleQuery(session, "USE testdb", nil)
 	if err != nil {
 		t.Fatalf("Expected USE testdb to succeed, got error: %v", err)
 	}
@@ -368,7 +368,7 @@ func TestHandler_UseDatabase_NonExistent(t *testing.T) {
 		CurrentDatabase: "",
 	}
 
-	_, err := handler.HandleQuery(session, "USE nonexistent")
+	_, err := handler.HandleQuery(session, "USE nonexistent", nil)
 	if err == nil {
 		t.Fatal("Expected error for USE with non-existent database, got nil")
 	}
@@ -395,7 +395,7 @@ func TestHandler_SystemVariables_ReadOnly(t *testing.T) {
 	}
 
 	for _, tc := range tests {
-		result, err := handler.HandleQuery(session, tc.query)
+		result, err := handler.HandleQuery(session, tc.query, nil)
 		if err != nil {
 			t.Errorf("Expected '%s' to succeed, got error: %v", tc.query, err)
 			continue
@@ -422,7 +422,7 @@ func TestHandler_SystemVariables_Version(t *testing.T) {
 		CurrentDatabase: "testdb",
 	}
 
-	result, err := handler.HandleQuery(session, "SELECT @@VERSION")
+	result, err := handler.HandleQuery(session, "SELECT @@VERSION", nil)
 	if err != nil {
 		t.Fatalf("Expected SELECT @@VERSION to succeed, got error: %v", err)
 	}
@@ -447,7 +447,7 @@ func TestHandler_ShowColumns(t *testing.T) {
 		CurrentDatabase: "testdb",
 	}
 
-	result, err := handler.HandleQuery(session, "SHOW COLUMNS FROM users")
+	result, err := handler.HandleQuery(session, "SHOW COLUMNS FROM users", nil)
 	if err != nil {
 		t.Fatalf("Expected SHOW COLUMNS to succeed, got error: %v", err)
 	}
@@ -472,7 +472,7 @@ func TestHandler_Set_NoOp(t *testing.T) {
 		CurrentDatabase: "testdb",
 	}
 
-	_, err := handler.HandleQuery(session, "SET autocommit = 1")
+	_, err := handler.HandleQuery(session, "SET autocommit = 1", nil)
 	if err != nil {
 		t.Fatalf("Expected SET to be a no-op, got error: %v", err)
 	}
@@ -488,7 +488,7 @@ func TestHandler_NoDatabaseSelected(t *testing.T) {
 		CurrentDatabase: "", // No database selected
 	}
 
-	_, err := handler.HandleQuery(session, "SELECT * FROM users")
+	_, err := handler.HandleQuery(session, "SELECT * FROM users", nil)
 	if err == nil {
 		t.Fatal("Expected error when no database selected, got nil")
 	}
@@ -551,7 +551,7 @@ func BenchmarkHandler_Select(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		handler.HandleQuery(session, "SELECT * FROM users WHERE id = 1")
+		handler.HandleQuery(session, "SELECT * FROM users WHERE id = 1", nil)
 	}
 }
 
@@ -579,6 +579,6 @@ func BenchmarkHandler_RejectMutation(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		handler.HandleQuery(session, "INSERT INTO users (name) VALUES ('test')")
+		handler.HandleQuery(session, "INSERT INTO users (name) VALUES ('test')", nil)
 	}
 }

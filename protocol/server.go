@@ -7,7 +7,6 @@ import (
 	"io"
 	"math"
 	"net"
-	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -132,7 +131,7 @@ type PreparedStatement struct {
 
 // ConnectionHandler defines the interface for handling MySQL commands
 type ConnectionHandler interface {
-	HandleQuery(session *ConnectionSession, query string) (*ResultSet, error)
+	HandleQuery(session *ConnectionSession, sql string, params []interface{}) (*ResultSet, error)
 }
 
 // ResultSet represents a MySQL result set
@@ -319,7 +318,7 @@ func (s *MySQLServer) processQuery(conn net.Conn, session *ConnectionSession, qu
 	// Parse first to check validity (optional, but good for sanity)
 	// For now, we pass directly to handler which will use the parser/coordinator
 
-	rs, err := s.handler.HandleQuery(session, query)
+	rs, err := s.handler.HandleQuery(session, query, nil)
 	if err != nil {
 		_ = s.writeMySQLErr(conn, 1, err)
 		return
@@ -953,14 +952,11 @@ func (s *MySQLServer) handleStmtExecute(conn net.Conn, session *ConnectionSessio
 		}
 	}
 
-	// Build final query by replacing ? with actual values
-	// Note: stmt.Query is already transpiled to SQLite syntax
-	finalQuery := buildQueryWithParams(stmt.Query, params)
-
 	log.Debug().
 		Uint64("conn_id", session.ConnID).
 		Uint32("stmt_id", stmtID).
-		Str("query", finalQuery).
+		Str("query", stmt.Query).
+		Int("param_count", len(params)).
 		Msg("Executing prepared statement")
 
 	// Execute the query directly (it's already transpiled SQLite syntax)
@@ -968,8 +964,8 @@ func (s *MySQLServer) handleStmtExecute(conn net.Conn, session *ConnectionSessio
 	// Use the original statement type we stored during PREPARE
 	isSelect := stmt.OriginalType == StatementSelect
 
-	// Execute query
-	rs, err := s.handler.HandleQuery(session, finalQuery)
+	// Execute query with params passed to handler (no string interpolation!)
+	rs, err := s.handler.HandleQuery(session, stmt.Query, params)
 	if err != nil {
 		_ = s.writeMySQLErr(conn, 1, err)
 		return
@@ -1175,102 +1171,3 @@ func readLengthEncodedInt(b []byte) (uint64, int) {
 	}
 }
 
-func buildQueryWithParams(query string, params []interface{}) string {
-	result := ""
-	paramIdx := 0
-	inString := false
-	escapeNext := false
-
-	for _, ch := range query {
-		if escapeNext {
-			result += string(ch)
-			escapeNext = false
-			continue
-		}
-
-		if ch == '\\' {
-			result += string(ch)
-			escapeNext = true
-			continue
-		}
-
-		if ch == '\'' {
-			inString = !inString
-			result += string(ch)
-			continue
-		}
-
-		if !inString && ch == '?' {
-			if paramIdx < len(params) {
-				result += formatParam(params[paramIdx])
-				paramIdx++
-			} else {
-				result += "?"
-			}
-		} else {
-			result += string(ch)
-		}
-	}
-
-	return result
-}
-
-func formatParam(param interface{}) string {
-	if param == nil {
-		return "NULL"
-	}
-
-	switch v := param.(type) {
-	case string:
-		return "'" + escapeString(v) + "'"
-	case []byte:
-		// Binary data needs to be escaped properly
-		return "'" + escapeString(string(v)) + "'"
-	case int8, int16, int32, int64, int:
-		return fmt.Sprintf("%d", v)
-	case uint8, uint16, uint32, uint64, uint:
-		return fmt.Sprintf("%d", v)
-	case float32:
-		return fmt.Sprintf("%f", v)
-	case float64:
-		return fmt.Sprintf("%f", v)
-	case bool:
-		if v {
-			return "1"
-		}
-		return "0"
-	default:
-		// Fallback: convert to string and escape
-		return "'" + escapeString(fmt.Sprintf("%v", v)) + "'"
-	}
-}
-
-func escapeString(s string) string {
-	var escaped strings.Builder
-	escaped.Grow(len(s))
-
-	for _, ch := range s {
-		switch ch {
-		case '\x00':
-			escaped.WriteString("\\0")
-		case '\'':
-			escaped.WriteString("''")
-		case '"':
-			escaped.WriteString("\\\"")
-		case '\b':
-			escaped.WriteString("\\b")
-		case '\n':
-			escaped.WriteString("\\n")
-		case '\r':
-			escaped.WriteString("\\r")
-		case '\t':
-			escaped.WriteString("\\t")
-		case '\\':
-			escaped.WriteString("\\\\")
-		default:
-			escaped.WriteRune(ch)
-		}
-	}
-
-	return escaped.String()
-}

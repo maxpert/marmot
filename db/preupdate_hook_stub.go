@@ -65,7 +65,7 @@ func (s *EphemeralHookSession) BeginTx(ctx context.Context) error {
 }
 
 // ExecContext returns an error (stub)
-func (s *EphemeralHookSession) ExecContext(ctx context.Context, query string) error {
+func (s *EphemeralHookSession) ExecContext(ctx context.Context, query string, args ...interface{}) error {
 	return ErrPreupdateHookNotEnabled
 }
 

@@ -248,11 +248,11 @@ func (s *EphemeralHookSession) BeginTx(ctx context.Context) error {
 }
 
 // ExecContext executes a statement within the session's transaction
-func (s *EphemeralHookSession) ExecContext(ctx context.Context, query string) error {
+func (s *EphemeralHookSession) ExecContext(ctx context.Context, query string, args ...interface{}) error {
 	if s.tx == nil {
 		return fmt.Errorf("no active transaction")
 	}
-	result, err := s.tx.ExecContext(ctx, query)
+	result, err := s.tx.ExecContext(ctx, query, args...)
 	if err != nil {
 		return err
 	}
