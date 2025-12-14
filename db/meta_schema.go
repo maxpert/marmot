@@ -131,9 +131,9 @@ type DDLSnapshot struct {
 	TableName string `msgpack:"table_name"`
 }
 
-// StatementTypeToOpType converts protocol.StatementType to OpType.
+// StatementTypeToOpType converts protocol.StatementCode to OpType.
 // Uses typed enum constants for compile-time safety.
-func StatementTypeToOpType(stmtType protocol.StatementType) OpType {
+func StatementTypeToOpType(stmtType protocol.StatementCode) OpType {
 	switch stmtType {
 	case protocol.StatementInsert:
 		return OpTypeInsert

@@ -375,7 +375,7 @@ func ParseStatementVitess(sql string) Statement {
 		return stmt
 	}
 
-	// Map Vitess AST to StatementType and extract metadata FIRST
+	// Map Vitess AST to StatementCode and extract metadata FIRST
 	switch parsed := parsed.(type) {
 	case *sqlparser.Insert:
 		if parsed.Action == sqlparser.ReplaceAct {

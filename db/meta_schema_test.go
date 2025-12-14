@@ -6,13 +6,13 @@ import (
 	"github.com/maxpert/marmot/protocol"
 )
 
-// TestStatementTypeToOpType verifies the mapping between protocol.StatementType and OpType.
+// TestStatementTypeToOpType verifies the mapping between protocol.StatementCode and OpType.
 // This test is critical for preventing enum mismatch bugs where UPDATE was incorrectly
 // mapped to DELETE due to off-by-one errors in magic number constants.
 func TestStatementTypeToOpType(t *testing.T) {
 	tests := []struct {
 		name     string
-		input    protocol.StatementType
+		input    protocol.StatementCode
 		expected OpType
 	}{
 		{
@@ -53,7 +53,7 @@ func TestStatementTypeToOpType(t *testing.T) {
 	}
 }
 
-// TestStatementTypeEnumValues verifies the actual numeric values of protocol.StatementType.
+// TestStatementTypeEnumValues verifies the actual numeric values of protocol.StatementCode.
 // This catches bugs where someone changes the enum order or adds new values in the middle.
 func TestStatementTypeEnumValues(t *testing.T) {
 	// These are the canonical values. If they change, something is wrong.

@@ -24,11 +24,11 @@ type Transformation struct {
 	After  string
 }
 
-// StatementType categorizes SQL statements for execution routing and validation.
-type StatementType int
+// StatementCode categorizes SQL statements for execution routing and validation.
+type StatementCode int
 
 const (
-	StatementUnknown StatementType = iota // 0 - means not yet classified
+	StatementUnknown StatementCode = iota // 0 - means not yet classified
 	StatementInsert
 	StatementReplace
 	StatementUpdate
@@ -96,7 +96,7 @@ type QueryInput struct {
 // QueryOutput holds the results of query processing.
 type QueryOutput struct {
 	Statements    []TranspiledStatement
-	StatementType StatementType
+	StatementType StatementCode
 	Database      string
 	IsValid       bool
 	ValidationErr error
@@ -134,7 +134,7 @@ type QueryContext struct {
 }
 
 // IsMutation returns true if the statement type is a mutation operation.
-func (t StatementType) IsMutation() bool {
+func (t StatementCode) IsMutation() bool {
 	switch t {
 	case StatementInsert, StatementReplace, StatementUpdate, StatementDelete,
 		StatementLoadData, StatementDDL, StatementDCL, StatementAdmin,
@@ -145,7 +145,7 @@ func (t StatementType) IsMutation() bool {
 }
 
 // IsReadOnly returns true if the statement type is read-only.
-func (t StatementType) IsReadOnly() bool {
+func (t StatementCode) IsReadOnly() bool {
 	switch t {
 	case StatementSelect, StatementShowDatabases, StatementShowTables,
 		StatementShowColumns, StatementShowCreateTable, StatementShowIndexes,

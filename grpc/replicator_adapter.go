@@ -102,26 +102,12 @@ func convertStatementsToProto(stmts []protocol.Statement, database string) []*St
 	return protoStmts
 }
 
-// convertStatementTypeToProto converts protocol.StatementType to gRPC StatementType
-func convertStatementTypeToProto(stmtType protocol.StatementType) StatementType {
-	switch stmtType {
-	case protocol.StatementInsert:
-		return StatementType_INSERT
-	case protocol.StatementUpdate:
-		return StatementType_UPDATE
-	case protocol.StatementDelete:
-		return StatementType_DELETE
-	case protocol.StatementReplace:
-		return StatementType_REPLACE
-	case protocol.StatementDDL:
-		return StatementType_DDL
-	case protocol.StatementCreateDatabase:
-		return StatementType_CREATE_DATABASE
-	case protocol.StatementDropDatabase:
-		return StatementType_DROP_DATABASE
-	default:
-		return StatementType_INSERT
+// convertStatementTypeToProto converts protocol.StatementCode to gRPC StatementType
+func convertStatementTypeToProto(stmtType protocol.StatementCode) StatementType {
+	if st, ok := ToProtoStatementType(stmtType); ok {
+		return st
 	}
+	return StatementType_INSERT // default for unknown
 }
 
 // convertPhaseToProto converts coordinator.ReplicationPhase to gRPC TransactionPhase

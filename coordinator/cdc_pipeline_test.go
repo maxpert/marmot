@@ -871,7 +871,7 @@ func TestPipeline_ComplexSequence(t *testing.T) {
 	}
 
 	// Verify statement types
-	stmtsByIntentKey := make(map[string]protocol.StatementType)
+	stmtsByIntentKey := make(map[string]protocol.StatementCode)
 	for _, stmt := range result.Statements {
 		stmtsByIntentKey[stmt.IntentKey] = stmt.Type
 	}

@@ -115,7 +115,7 @@ func TestDDLStatementDetection(t *testing.T) {
 		name     string
 		sql      string
 		isDDL    bool
-		stmtType protocol.StatementType
+		stmtType protocol.StatementCode
 	}{
 		// DDL statements
 		{

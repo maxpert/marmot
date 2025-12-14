@@ -473,8 +473,8 @@ func (tm *TransactionManager) cleanupAfterCommit(txn *Transaction, intents []*Wr
 	}
 }
 
-// opCodeToStatementType converts OpType back to protocol.StatementType
-func opCodeToStatementType(op uint8) protocol.StatementType {
+// opCodeToStatementType converts OpType back to protocol.StatementCode
+func opCodeToStatementType(op uint8) protocol.StatementCode {
 	switch OpType(op) {
 	case OpTypeInsert, OpTypeReplace:
 		return protocol.StatementInsert

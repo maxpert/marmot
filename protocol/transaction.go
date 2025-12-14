@@ -49,12 +49,12 @@ func ParseConsistencyLevel(s string) (ConsistencyLevel, error) {
 	}
 }
 
-// StatementType represents the type of SQL statement
-type StatementType int
+// StatementCode represents the type of SQL statement
+type StatementCode int
 
 const (
 	// Unknown - not yet classified (zero value)
-	StatementUnknown StatementType = iota
+	StatementUnknown StatementCode = iota
 
 	// DML - Data Manipulation
 	StatementInsert
@@ -141,7 +141,7 @@ type InformationSchemaFilter struct {
 // Statement represents a single SQL statement
 type Statement struct {
 	SQL       string        `msgpack:"SQL"`
-	Type      StatementType `msgpack:"Type"`
+	Type      StatementCode `msgpack:"Type"`
 	TableName string        `msgpack:"TableName"`
 	Database  string        `msgpack:"Database"`  // Target database name
 	IntentKey string        `msgpack:"IntentKey"` // Intent key for MVCC conflict detection

@@ -223,7 +223,7 @@ func TestHandlerCDCPipeline_MixedOperations(t *testing.T) {
 	}
 
 	// Verify statement types
-	expectedTypes := []protocol.StatementType{
+	expectedTypes := []protocol.StatementCode{
 		protocol.StatementInsert, // Row 1: INSERT
 		protocol.StatementUpdate, // Row 2: UPSERT merged to UPDATE
 		protocol.StatementUpdate, // Row 3: UPDATE

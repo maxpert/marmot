@@ -24,7 +24,7 @@ func TestMySQLSelectModifiers(t *testing.T) {
 	tests := []struct {
 		name        string
 		sql         string
-		wantType    StatementType
+		wantType    StatementCode
 		shouldParse bool
 		limitation  string // Document why it fails
 	}{
@@ -106,7 +106,7 @@ func TestMySQLSelectModifiers(t *testing.T) {
 					return
 				}
 				if ctx.Output.StatementType != tt.wantType {
-					t.Errorf("StatementType = %d, want %d", ctx.Output.StatementType, tt.wantType)
+					t.Errorf("StatementCode = %d, want %d", ctx.Output.StatementType, tt.wantType)
 				}
 			} else {
 				if err == nil {
@@ -187,7 +187,7 @@ func TestMySQLSetOperations(t *testing.T) {
 	tests := []struct {
 		name        string
 		sql         string
-		wantType    StatementType
+		wantType    StatementCode
 		shouldParse bool
 		limitation  string
 	}{
@@ -279,7 +279,7 @@ func TestMySQLSetOperations(t *testing.T) {
 					return
 				}
 				if ctx.Output.StatementType != tt.wantType {
-					t.Errorf("StatementType = %d, want %d", ctx.Output.StatementType, tt.wantType)
+					t.Errorf("StatementCode = %d, want %d", ctx.Output.StatementType, tt.wantType)
 				}
 			} else {
 				if err == nil {
@@ -300,7 +300,7 @@ func TestMySQLInsertVariations(t *testing.T) {
 	tests := []struct {
 		name        string
 		sql         string
-		wantType    StatementType
+		wantType    StatementCode
 		shouldParse bool
 		limitation  string
 	}{
@@ -390,7 +390,7 @@ func TestMySQLInsertVariations(t *testing.T) {
 					return
 				}
 				if ctx.Output.StatementType != tt.wantType {
-					t.Errorf("StatementType = %d, want %d", ctx.Output.StatementType, tt.wantType)
+					t.Errorf("StatementCode = %d, want %d", ctx.Output.StatementType, tt.wantType)
 				}
 			} else {
 				if err == nil {
@@ -411,7 +411,7 @@ func TestMySQLReplaceStatement(t *testing.T) {
 	tests := []struct {
 		name        string
 		sql         string
-		wantType    StatementType
+		wantType    StatementCode
 		shouldParse bool
 		limitation  string
 	}{
@@ -452,7 +452,7 @@ func TestMySQLReplaceStatement(t *testing.T) {
 					return
 				}
 				if ctx.Output.StatementType != tt.wantType {
-					t.Errorf("StatementType = %d, want %d", ctx.Output.StatementType, tt.wantType)
+					t.Errorf("StatementCode = %d, want %d", ctx.Output.StatementType, tt.wantType)
 				}
 			} else {
 				if err == nil {
@@ -473,7 +473,7 @@ func TestMySQLUpdateVariations(t *testing.T) {
 	tests := []struct {
 		name        string
 		sql         string
-		wantType    StatementType
+		wantType    StatementCode
 		shouldParse bool
 		limitation  string
 	}{
@@ -562,7 +562,7 @@ func TestMySQLUpdateVariations(t *testing.T) {
 					return
 				}
 				if ctx.Output.StatementType != tt.wantType {
-					t.Errorf("StatementType = %d, want %d", ctx.Output.StatementType, tt.wantType)
+					t.Errorf("StatementCode = %d, want %d", ctx.Output.StatementType, tt.wantType)
 				}
 			} else {
 				if err == nil {
@@ -583,7 +583,7 @@ func TestMySQLDeleteVariations(t *testing.T) {
 	tests := []struct {
 		name        string
 		sql         string
-		wantType    StatementType
+		wantType    StatementCode
 		shouldParse bool
 		limitation  string
 	}{
@@ -671,7 +671,7 @@ func TestMySQLDeleteVariations(t *testing.T) {
 					return
 				}
 				if ctx.Output.StatementType != tt.wantType {
-					t.Errorf("StatementType = %d, want %d", ctx.Output.StatementType, tt.wantType)
+					t.Errorf("StatementCode = %d, want %d", ctx.Output.StatementType, tt.wantType)
 				}
 			} else {
 				if err == nil {
@@ -1078,7 +1078,7 @@ func TestMySQLDDLStatements(t *testing.T) {
 	tests := []struct {
 		name        string
 		sql         string
-		wantType    StatementType
+		wantType    StatementCode
 		shouldParse bool
 	}{
 		// CREATE TABLE
@@ -1131,7 +1131,7 @@ func TestMySQLDDLStatements(t *testing.T) {
 					return
 				}
 				if ctx.Output.StatementType != tt.wantType {
-					t.Errorf("StatementType = %d, want %d", ctx.Output.StatementType, tt.wantType)
+					t.Errorf("StatementCode = %d, want %d", ctx.Output.StatementType, tt.wantType)
 				}
 			} else {
 				if err == nil {

@@ -220,10 +220,10 @@ func buildStatement(ctx query.QueryContext, sql string) Statement {
 	return stmt
 }
 
-// mapQueryTypeToProtocolType converts query.StatementType to protocol.StatementType.
+// mapQueryTypeToProtocolType converts query.StatementCode to protocol.StatementCode.
 // Both enums use iota starting with Unknown=0, Insert=1, Replace=2, etc.
-func mapQueryTypeToProtocolType(qt query.StatementType) StatementType {
-	return StatementType(qt)
+func mapQueryTypeToProtocolType(qt query.StatementCode) StatementCode {
+	return StatementCode(qt)
 }
 
 // NormalizeSQLForSQLite converts MySQL-style SQL to SQLite-compatible SQL

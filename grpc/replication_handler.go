@@ -976,7 +976,7 @@ func (rh *ReplicationHandler) serializeReplayStatements(stmts []*Statement, dbNa
 	protoStmts := make([]protocol.Statement, 0, len(stmts))
 	for _, stmt := range stmts {
 		protoStmt := protocol.Statement{
-			Type:      protocol.StatementType(stmt.Type),
+			Type:      MustFromProtoStatementType(stmt.Type),
 			TableName: stmt.TableName,
 			Database:  dbName,
 		}
@@ -1102,23 +1102,6 @@ func (rh *ReplicationHandler) HandleRead(ctx context.Context, req *ReadRequest) 
 
 // Helper functions
 
-func convertStatementType(st StatementType) protocol.StatementType {
-	switch st {
-	case StatementType_INSERT:
-		return protocol.StatementInsert
-	case StatementType_UPDATE:
-		return protocol.StatementUpdate
-	case StatementType_DELETE:
-		return protocol.StatementDelete
-	case StatementType_REPLACE:
-		return protocol.StatementReplace
-	case StatementType_DDL:
-		return protocol.StatementDDL
-	case StatementType_CREATE_DATABASE:
-		return protocol.StatementCreateDatabase
-	case StatementType_DROP_DATABASE:
-		return protocol.StatementDropDatabase
-	default:
-		return protocol.StatementInsert // Default to insert
-	}
+func convertStatementType(st StatementType) protocol.StatementCode {
+	return MustFromProtoStatementType(st)
 }

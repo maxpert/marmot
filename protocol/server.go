@@ -125,7 +125,7 @@ type PreparedStatement struct {
 	Query        string
 	ParamCount   uint16
 	ParamTypes   []byte // Cached parameter types for subsequent executions
-	OriginalType StatementType
+	OriginalType StatementCode
 	Context      *query.QueryContext
 }
 
@@ -800,7 +800,7 @@ func (s *MySQLServer) handleStmtPrepare(conn net.Conn, session *ConnectionSessio
 		ID:           stmtID,
 		Query:        transpiledSQL,
 		ParamCount:   paramCount,
-		OriginalType: StatementType(ctx.Output.StatementType),
+		OriginalType: StatementCode(ctx.Output.StatementType),
 		Context:      ctx,
 	}
 	session.preparedStmtLock.Unlock()
