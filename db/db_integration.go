@@ -167,7 +167,7 @@ func NewReplicatedDatabase(dbPath string, nodeID uint64, clock *hlc.Clock, metaS
 	commitBatcher := NewCommitBatcher(writeDB, 20, 2*time.Millisecond)
 	commitBatcher.Start()
 
-	return &ReplicatedDatabase{
+	mdb := &ReplicatedDatabase{
 		writeDB:       writeDB,
 		hookDB:        hookDB,
 		readDB:        readDB,
@@ -177,7 +177,16 @@ func NewReplicatedDatabase(dbPath string, nodeID uint64, clock *hlc.Clock, metaS
 		nodeID:        nodeID,
 		commitBatcher: commitBatcher,
 		schemaCache:   schemaCache,
-	}, nil
+	}
+
+	// Load schema cache with existing tables (required for CDC preupdate hooks)
+	if err := mdb.ReloadSchema(); err != nil {
+		closeAll()
+		commitBatcher.Stop()
+		return nil, fmt.Errorf("failed to reload schema cache: %w", err)
+	}
+
+	return mdb, nil
 }
 
 // SetReplicationFunc sets the replication function

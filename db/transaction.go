@@ -778,7 +778,20 @@ func (tm *TransactionManager) writeCDCUpdate(tableName string, oldValues, newVal
 	// Get table schema to build proper WHERE clause
 	schema, err := tm.schemaCache.GetSchemaFor(tableName)
 	if err != nil {
-		return fmt.Errorf("failed to get schema for table %s: %w", tableName, err)
+		// Try to reload schema cache if table not found
+		if _, ok := err.(ErrSchemaCacheMiss); ok {
+			log.Warn().Str("table", tableName).Msg("Schema not cached during UPDATE replay, attempting reload")
+			if reloadErr := tm.reloadSchemaCache(); reloadErr != nil {
+				return fmt.Errorf("failed to reload schema: %w", reloadErr)
+			}
+			// Retry schema lookup
+			schema, err = tm.schemaCache.GetSchemaFor(tableName)
+			if err != nil {
+				return fmt.Errorf("failed to get schema for table %s after reload: %w", tableName, err)
+			}
+		} else {
+			return fmt.Errorf("failed to get schema for table %s: %w", tableName, err)
+		}
 	}
 
 	// Build UPDATE statement with SET clause using newValues
@@ -841,7 +854,20 @@ func (tm *TransactionManager) writeCDCDelete(tableName string, intentKey string,
 	// Get table schema to build proper WHERE clause
 	schema, err := tm.schemaCache.GetSchemaFor(tableName)
 	if err != nil {
-		return fmt.Errorf("failed to get schema for table %s: %w", tableName, err)
+		// Try to reload schema cache if table not found
+		if _, ok := err.(ErrSchemaCacheMiss); ok {
+			log.Warn().Str("table", tableName).Msg("Schema not cached during DELETE replay, attempting reload")
+			if reloadErr := tm.reloadSchemaCache(); reloadErr != nil {
+				return fmt.Errorf("failed to reload schema: %w", reloadErr)
+			}
+			// Retry schema lookup
+			schema, err = tm.schemaCache.GetSchemaFor(tableName)
+			if err != nil {
+				return fmt.Errorf("failed to get schema for table %s after reload: %w", tableName, err)
+			}
+		} else {
+			return fmt.Errorf("failed to get schema for table %s: %w", tableName, err)
+		}
 	}
 
 	// Build WHERE clause using primary key columns from oldValues

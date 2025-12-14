@@ -164,6 +164,11 @@ func TestInsertOrReplaceNewRow(t *testing.T) {
 		t.Fatalf("Failed to create table: %v", err)
 	}
 
+	// Reload schema cache after DDL
+	if err := replicatedDB.ReloadSchema(); err != nil {
+		t.Fatalf("Failed to reload schema: %v", err)
+	}
+
 	// INSERT OR REPLACE on NEW key (row doesn't exist)
 	t.Log("Testing INSERT OR REPLACE on non-existent key")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

@@ -227,8 +227,14 @@ func main() {
 	adminHandlers := admin.NewAdminHandlers(grpcServer, dbMgr)
 	admin.RegisterRoutes(grpcServer.GetHTTPMux(), adminHandlers)
 
-	// If starting as seed node (no seeds configured), import existing databases from data_dir
-	if !isJoiningCluster {
+	// Import existing databases from data_dir if:
+	// 1. Starting as seed node (no seeds configured), OR
+	// 2. Joining cluster but no catch-up needed (peer has no data), OR
+	// 3. Joining cluster but catch-up determination failed (anti-entropy will reconcile)
+	shouldImport := !isJoiningCluster ||
+		catchUpDecision == nil || // catch-up determination failed
+		catchUpDecision.Strategy == marmotgrpc.NO_CATCHUP
+	if shouldImport {
 		imported, err := dbMgr.ImportExistingDatabases(cfg.Config.DataDir)
 		if err != nil {
 			log.Warn().Err(err).Msg("Failed to import existing databases")

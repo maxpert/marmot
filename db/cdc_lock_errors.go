@@ -35,3 +35,13 @@ type ErrCDCDMLInProgress struct {
 func (e ErrCDCDMLInProgress) Error() string {
 	return fmt.Sprintf("CDC DML lock conflict: table %s has DML in progress", e.Table)
 }
+
+// ErrSchemaCacheMiss is returned when a table's schema is not found in the cache.
+// This typically means the schema cache needs to be reloaded.
+type ErrSchemaCacheMiss struct {
+	Table string
+}
+
+func (e ErrSchemaCacheMiss) Error() string {
+	return fmt.Sprintf("schema cache miss for table %s", e.Table)
+}

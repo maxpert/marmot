@@ -596,10 +596,19 @@ func (dm *DatabaseManager) ImportExistingDatabases(importDir string) (int, error
 		// Extract database name (remove .db suffix)
 		dbName := strings.TrimSuffix(name, ".db")
 
-		// Skip if already exists
-		if _, exists := dm.databases[dbName]; exists {
-			log.Debug().Str("name", dbName).Msg("Database already exists, skipping import")
-			continue
+		// Check if database already exists
+		if existingDB, exists := dm.databases[dbName]; exists {
+			// Check if existing database is empty (no user tables)
+			// If so, we can replace it with the imported version
+			srcPath := filepath.Join(importDir, name)
+			if !dm.shouldReplaceWithImport(existingDB, srcPath) {
+				log.Debug().Str("name", dbName).Msg("Database already exists with data, skipping import")
+				continue
+			}
+			// Close existing empty database before replacing
+			log.Info().Str("name", dbName).Msg("Replacing empty database with imported version")
+			existingDB.Close()
+			delete(dm.databases, dbName)
 		}
 
 		// Copy database file to databases directory
@@ -659,6 +668,42 @@ func (dm *DatabaseManager) ImportExistingDatabases(importDir string) (int, error
 	}
 
 	return imported, nil
+}
+
+// shouldReplaceWithImport checks if an existing database should be replaced with an imported version.
+// Returns true if the existing database is empty (no user tables) and the source has tables.
+func (dm *DatabaseManager) shouldReplaceWithImport(existingDB *ReplicatedDatabase, srcPath string) bool {
+	// Check if existing database has any user tables
+	rows, err := existingDB.GetDB().Query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+	if err != nil {
+		log.Debug().Err(err).Msg("Failed to get existing tables, not replacing")
+		return false
+	}
+	hasExistingTables := rows.Next()
+	rows.Close()
+
+	if hasExistingTables {
+		// Existing database has data, don't replace
+		return false
+	}
+
+	// Existing is empty, check if source has tables
+	srcDB, err := sql.Open(SQLiteDriverName, srcPath+"?mode=ro")
+	if err != nil {
+		log.Debug().Err(err).Msg("Failed to open source database")
+		return false
+	}
+	defer srcDB.Close()
+
+	rows, err = srcDB.Query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+	if err != nil {
+		log.Debug().Err(err).Msg("Failed to query source tables")
+		return false
+	}
+	defer rows.Close()
+
+	hasSourceTables := rows.Next()
+	return hasSourceTables
 }
 
 // copyFile copies a file from src to dst with fsync for durability
