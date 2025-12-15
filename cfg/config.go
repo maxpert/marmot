@@ -234,7 +234,7 @@ var Config = &Configuration{
 	},
 
 	MetaStore: MetaStoreConfiguration{
-		CacheSizeMB:           64,   // 64MB block cache
+		CacheSizeMB:           128,  // 128MB block cache (reduce Pebble disk reads)
 		MemTableSizeMB:        64,   // 64MB memtable (CockroachDB-style)
 		MemTableCount:         2,    // 2 memtables
 		L0CompactionThreshold: 500,  // CockroachDB default
@@ -276,7 +276,7 @@ var Config = &Configuration{
 
 	Logging: LoggingConfiguration{
 		Verbose: false,
-		Format:  "console",
+		Format:  "json", // Use "json" for production (21% faster than "console")
 	},
 
 	Prometheus: PrometheusConfiguration{

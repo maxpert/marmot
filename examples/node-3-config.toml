@@ -70,7 +70,7 @@ auto_id_mode = "compact"
 
 # PebbleDB metastore (CockroachDB-tested defaults)
 [metastore]
-cache_size_mb = 64
+cache_size_mb = 128
 memtable_size_mb = 64
 memtable_count = 2
 l0_compaction_threshold = 500
@@ -78,8 +78,8 @@ l0_stop_writes = 1000
 wal_bytes_per_sync_kb = 512
 
 [logging]
-verbose = true
-format = "console"
+verbose = false
+format = "json"
 
 [prometheus]
 # Metrics served on gRPC port at http://localhost:8083/metrics
