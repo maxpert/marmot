@@ -170,6 +170,10 @@ func NewReplicatedDatabase(dbPath string, nodeID uint64, clock *hlc.Clock, metaS
 			dbPath,
 			cfg.Config.BatchCommit.MaxBatchSize,
 			time.Duration(cfg.Config.BatchCommit.MaxWaitMS)*time.Millisecond,
+			cfg.Config.BatchCommit.CheckpointEnabled,
+			cfg.Config.BatchCommit.CheckpointPassiveThreshMB,
+			cfg.Config.BatchCommit.CheckpointRestartThreshMB,
+			cfg.Config.BatchCommit.AllowDynamicBatchSize,
 		)
 		if err := batchCommitter.Start(); err != nil {
 			closeAll()

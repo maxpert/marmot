@@ -89,6 +89,10 @@ enabled = true
 enabled = true
 max_batch_size = 100
 max_wait_ms = 1
+checkpoint_enabled = true
+checkpoint_passive_thresh_mb = 4.0
+checkpoint_restart_thresh_mb = 16.0
+allow_dynamic_batch_size = true
 
 # CDC Publisher - Stream changes to external systems (Kafka, NATS)
 # Events follow Debezium specification: https://debezium.io/

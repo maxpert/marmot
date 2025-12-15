@@ -95,6 +95,12 @@ type BatchCommitConfiguration struct {
 	Enabled      bool `toml:"enabled"`        // Enable batch committing (default: true)
 	MaxBatchSize int  `toml:"max_batch_size"` // Max transactions per batch (default: 512)
 	MaxWaitMS    int  `toml:"max_wait_ms"`    // Max wait before flush in ms (default: 2)
+
+	// Adaptive checkpoint configuration for WAL management
+	CheckpointEnabled         bool    `toml:"checkpoint_enabled"`           // Enable automatic checkpointing (default: true)
+	CheckpointPassiveThreshMB float64 `toml:"checkpoint_passive_thresh_mb"` // PASSIVE checkpoint threshold in MB (default: 4.0)
+	CheckpointRestartThreshMB float64 `toml:"checkpoint_restart_thresh_mb"` // RESTART checkpoint threshold in MB (default: 16.0)
+	AllowDynamicBatchSize     bool    `toml:"allow_dynamic_batch_size"`     // Allow dynamic batch size adjustment (default: true)
 }
 
 // GRPCClientConfiguration controls gRPC client behavior
@@ -291,9 +297,13 @@ var Config = &Configuration{
 	},
 
 	BatchCommit: BatchCommitConfiguration{
-		Enabled:      true,
-		MaxBatchSize: 100,
-		MaxWaitMS:    2,
+		Enabled:                   true,
+		MaxBatchSize:              100,
+		MaxWaitMS:                 2,
+		CheckpointEnabled:         true,
+		CheckpointPassiveThreshMB: 4.0,
+		CheckpointRestartThreshMB: 16.0,
+		AllowDynamicBatchSize:     true,
 	},
 }
 
