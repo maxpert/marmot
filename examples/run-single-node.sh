@@ -25,16 +25,15 @@ mkdir -p /tmp/marmot-single
 
 # Create config
 cat > /tmp/marmot-single/config.toml <<'TOML'
-# Marmot v2.0 - Single Node Configuration
+# Marmot v2.0 - Single Node Configuration (Optimized for Benchmarks)
 
 node_id = 1
 data_dir = "/tmp/marmot-single"
 
-[mvcc]
-gc_interval_seconds = 30
-gc_retention_hours = 1
+[transaction]
 heartbeat_timeout_seconds = 10
 conflict_window_seconds = 10
+lock_wait_timeout_seconds = 50
 
 [cluster]
 grpc_bind_address = "0.0.0.0"
@@ -48,9 +47,11 @@ dead_timeout_ms = 10000
 [replication]
 default_write_consistency = "LOCAL_ONE"
 default_read_consistency = "LOCAL_ONE"
-write_timeout_ms = 5000
+write_timeout_ms = 300000
 read_timeout_ms = 2000
 enable_anti_entropy = false
+gc_min_retention_hours = 2
+gc_max_retention_hours = 24
 
 [connection_pool]
 pool_size = 4
@@ -64,22 +65,44 @@ max_retries = 3
 retry_backoff_ms = 100
 
 [coordinator]
-prepare_timeout_ms = 2000
-commit_timeout_ms = 2000
+prepare_timeout_ms = 120000
+commit_timeout_ms = 120000
 abort_timeout_ms = 2000
+
+[query_pipeline]
+transpiler_cache_size = 10000
+validator_pool_size = 8
 
 [mysql]
 enabled = true
 bind_address = "0.0.0.0"
 port = 3306
 max_connections = 100
+auto_id_mode = "compact"
+
+[metastore]
+cache_size_mb = 128
+memtable_size_mb = 64
+memtable_count = 2
+l0_compaction_threshold = 500
+l0_stop_writes = 1000
+wal_bytes_per_sync_kb = 512
 
 [logging]
-verbose = true
-format = "console"
+verbose = false
+format = "json"
 
 [prometheus]
 enabled = true
+
+[batch_commit]
+enabled = true
+max_batch_size = 100
+max_wait_ms = 1
+checkpoint_enabled = true
+checkpoint_passive_thresh_mb = 4.0
+checkpoint_restart_thresh_mb = 16.0
+allow_dynamic_batch_size = true
 TOML
 
 echo "✓ Configuration created"
