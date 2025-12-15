@@ -55,36 +55,36 @@ type StatementCode = common.StatementCode
 
 // Statement code constants - aliased from common package for backward compatibility
 const (
-	StatementUnknown            = common.StatementUnknown
-	StatementInsert             = common.StatementInsert
-	StatementReplace            = common.StatementReplace
-	StatementUpdate             = common.StatementUpdate
-	StatementDelete             = common.StatementDelete
-	StatementLoadData           = common.StatementLoadData
-	StatementDDL                = common.StatementDDL
-	StatementDCL                = common.StatementDCL
-	StatementBegin              = common.StatementBegin
-	StatementCommit             = common.StatementCommit
-	StatementRollback           = common.StatementRollback
-	StatementSavepoint          = common.StatementSavepoint
-	StatementXA                 = common.StatementXA
-	StatementLock               = common.StatementLock
-	StatementSelect             = common.StatementSelect
-	StatementAdmin              = common.StatementAdmin
-	StatementSet                = common.StatementSet
-	StatementShowDatabases      = common.StatementShowDatabases
-	StatementUseDatabase        = common.StatementUseDatabase
-	StatementCreateDatabase     = common.StatementCreateDatabase
-	StatementDropDatabase       = common.StatementDropDatabase
-	StatementShowTables         = common.StatementShowTables
-	StatementShowColumns        = common.StatementShowColumns
-	StatementShowCreateTable    = common.StatementShowCreateTable
-	StatementShowIndexes        = common.StatementShowIndexes
-	StatementShowTableStatus    = common.StatementShowTableStatus
-	StatementInformationSchema  = common.StatementInformationSchema
-	StatementUnsupported        = common.StatementUnsupported
-	StatementSystemVariable     = common.StatementSystemVariable
-	StatementVirtualTable       = common.StatementVirtualTable
+	StatementUnknown           = common.StatementUnknown
+	StatementInsert            = common.StatementInsert
+	StatementReplace           = common.StatementReplace
+	StatementUpdate            = common.StatementUpdate
+	StatementDelete            = common.StatementDelete
+	StatementLoadData          = common.StatementLoadData
+	StatementDDL               = common.StatementDDL
+	StatementDCL               = common.StatementDCL
+	StatementBegin             = common.StatementBegin
+	StatementCommit            = common.StatementCommit
+	StatementRollback          = common.StatementRollback
+	StatementSavepoint         = common.StatementSavepoint
+	StatementXA                = common.StatementXA
+	StatementLock              = common.StatementLock
+	StatementSelect            = common.StatementSelect
+	StatementAdmin             = common.StatementAdmin
+	StatementSet               = common.StatementSet
+	StatementShowDatabases     = common.StatementShowDatabases
+	StatementUseDatabase       = common.StatementUseDatabase
+	StatementCreateDatabase    = common.StatementCreateDatabase
+	StatementDropDatabase      = common.StatementDropDatabase
+	StatementShowTables        = common.StatementShowTables
+	StatementShowColumns       = common.StatementShowColumns
+	StatementShowCreateTable   = common.StatementShowCreateTable
+	StatementShowIndexes       = common.StatementShowIndexes
+	StatementShowTableStatus   = common.StatementShowTableStatus
+	StatementInformationSchema = common.StatementInformationSchema
+	StatementUnsupported       = common.StatementUnsupported
+	StatementSystemVariable    = common.StatementSystemVariable
+	StatementVirtualTable      = common.StatementVirtualTable
 )
 
 // InformationSchemaTableType identifies which INFORMATION_SCHEMA table is being queried

@@ -81,7 +81,6 @@ func (p *Pipeline) Process(ctx *QueryContext) error {
 	return nil
 }
 
-
 // stripDatabaseQualifiers removes database name qualifiers from table references.
 // SQLite doesn't support database qualifiers in the same way as MySQL.
 func stripDatabaseQualifiers(ctx *QueryContext) {

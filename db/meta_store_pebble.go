@@ -165,7 +165,7 @@ func DefaultPebbleOptions() PebbleMetaStoreOptions {
 		MemTableSizeMB:        ms.MemTableSizeMB,
 		MemTableCount:         ms.MemTableCount,
 		WALBytesPerSync:       ms.WALBytesPerSyncKB * 1024,
-		WALMinSyncInterval:    time.Duration(ms.WALSyncIntervalMS) * time.Millisecond,
+		WALMinSyncInterval:    0, // Use Pebble's default
 		L0CompactionThreshold: ms.L0CompactionThreshold,
 		L0StopWrites:          ms.L0StopWrites,
 		MaxConcurrentCompact:  3,

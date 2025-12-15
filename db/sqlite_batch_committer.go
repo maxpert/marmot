@@ -14,7 +14,36 @@ import (
 	"github.com/maxpert/marmot/encoding"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/protocol"
+	"github.com/maxpert/marmot/telemetry"
 )
+
+// Package-level metrics (registered once)
+var (
+	batchCommitterMetricsOnce   sync.Once
+	batchCommitterFlushCounter  telemetry.CounterVec
+	batchCommitterBatchSizeHist telemetry.Histogram
+	batchCommitterFlushDurHist  telemetry.Histogram
+)
+
+func initBatchCommitterMetrics() {
+	batchCommitterMetricsOnce.Do(func() {
+		batchCommitterFlushCounter = telemetry.NewCounterVec(
+			"batch_committer_flushes_total",
+			"Total number of batch flushes by trigger reason",
+			[]string{"trigger"},
+		)
+		batchCommitterBatchSizeHist = telemetry.NewHistogramWithBuckets(
+			"batch_committer_batch_size",
+			"Number of transactions per batch flush",
+			[]float64{1, 5, 10, 25, 50, 100, 200, 500},
+		)
+		batchCommitterFlushDurHist = telemetry.NewHistogramWithBuckets(
+			"batch_committer_flush_duration_ms",
+			"Time taken to flush a batch in milliseconds",
+			[]float64{0.1, 0.5, 1, 2, 5, 10, 25, 50, 100},
+		)
+	})
+}
 
 type pendingCommit struct {
 	cdcEntries []*IntentEntry
@@ -33,17 +62,20 @@ type SQLiteBatchCommitter struct {
 	maxBatchSize int
 	maxWaitTime  time.Duration
 
+	flushCh chan struct{} // Signal immediate flush when batch full
 	stopCh  chan struct{}
 	stopped atomic.Bool
 	wg      sync.WaitGroup
 }
 
 func NewSQLiteBatchCommitter(dbPath string, maxBatchSize int, maxWaitTime time.Duration) *SQLiteBatchCommitter {
+	initBatchCommitterMetrics()
 	return &SQLiteBatchCommitter{
 		dbPath:       dbPath,
 		pending:      make(map[uint64]*pendingCommit),
 		maxBatchSize: maxBatchSize,
 		maxWaitTime:  maxWaitTime,
+		flushCh:      make(chan struct{}, 1),
 		stopCh:       make(chan struct{}),
 	}
 }
@@ -92,7 +124,7 @@ func (bc *SQLiteBatchCommitter) openOptimizedConnection() (*sql.DB, error) {
 		"PRAGMA temp_store = MEMORY",           // Temp tables in RAM
 		"PRAGMA mmap_size = 268435456",         // 256MB memory-mapped I/O
 		"PRAGMA journal_mode = WAL",            // WAL mode for concurrent reads
-		"PRAGMA wal_autocheckpoint = 10000",    // ~40MB WAL before checkpoint (batch more writes)
+		"PRAGMA wal_autocheckpoint = 1000",     // ~4MB WAL before checkpoint (smaller = faster checkpoints)
 		"PRAGMA journal_size_limit = 67108864", // 64MB max WAL size after checkpoint
 	}
 
@@ -127,7 +159,16 @@ func (bc *SQLiteBatchCommitter) Enqueue(txnID uint64, commitTS hlc.Timestamp, cd
 		stmts:      stmts,
 		promise:    p,
 	}
+	shouldFlush := len(bc.pending) >= bc.maxBatchSize
 	bc.mu.Unlock()
+
+	// Signal immediate flush if batch is full
+	if shouldFlush {
+		select {
+		case bc.flushCh <- struct{}{}:
+		default: // Don't block if flush already pending
+		}
+	}
 
 	return p.Future()
 }
@@ -141,15 +182,17 @@ func (bc *SQLiteBatchCommitter) flushLoop() {
 	for {
 		select {
 		case <-ticker.C:
-			bc.tryFlush()
+			bc.tryFlush("timer")
+		case <-bc.flushCh:
+			bc.tryFlush("size")
 		case <-bc.stopCh:
-			bc.tryFlush()
+			bc.tryFlush("stop")
 			return
 		}
 	}
 }
 
-func (bc *SQLiteBatchCommitter) tryFlush() {
+func (bc *SQLiteBatchCommitter) tryFlush(trigger string) {
 	bc.mu.Lock()
 	if len(bc.pending) == 0 {
 		bc.mu.Unlock()
@@ -159,7 +202,7 @@ func (bc *SQLiteBatchCommitter) tryFlush() {
 	bc.pending = make(map[uint64]*pendingCommit)
 	bc.mu.Unlock()
 
-	bc.flush(batch)
+	bc.flush(batch, trigger)
 }
 
 func (bc *SQLiteBatchCommitter) getSchemaCache(conn *sql.Conn) (*SchemaCache, error) {
@@ -177,7 +220,17 @@ func (bc *SQLiteBatchCommitter) getSchemaCache(conn *sql.Conn) (*SchemaCache, er
 	return cache, nil
 }
 
-func (bc *SQLiteBatchCommitter) flush(batch map[uint64]*pendingCommit) {
+func (bc *SQLiteBatchCommitter) flush(batch map[uint64]*pendingCommit, trigger string) {
+	start := time.Now()
+	batchSize := len(batch)
+
+	// Record metrics at end
+	defer func() {
+		batchCommitterFlushCounter.With(trigger).Inc()
+		batchCommitterBatchSizeHist.Observe(float64(batchSize))
+		batchCommitterFlushDurHist.Observe(float64(time.Since(start).Milliseconds()))
+	}()
+
 	conn, err := bc.db.Conn(context.Background())
 	if err != nil {
 		for _, pc := range batch {

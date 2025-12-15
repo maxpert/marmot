@@ -443,7 +443,6 @@ func TestHookSession_SameTxnNoConflict(t *testing.T) {
 		t.Fatalf("failed to begin tx in session1: %v", err)
 	}
 
-
 	// Pre-load schemas for test tables
 	loadSchemasForTables(t, userDB, schemaCache, "users")
 	// First update

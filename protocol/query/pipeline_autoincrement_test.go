@@ -22,7 +22,6 @@ func mockSchemaLookup(tableColumns map[string]string) func(string) string {
 	}
 }
 
-
 func getTranspiledSQL(ctx *QueryContext) string {
 	if len(ctx.Output.Statements) > 0 {
 		return ctx.Output.Statements[0].SQL

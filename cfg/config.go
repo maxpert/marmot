@@ -81,7 +81,6 @@ type MetaStoreConfiguration struct {
 	L0CompactionThreshold int   `toml:"l0_compaction_threshold"` // L0 compaction trigger (default: 4)
 	L0StopWrites          int   `toml:"l0_stop_writes"`          // L0 stop writes trigger (default: 12)
 	WALBytesPerSyncKB     int   `toml:"wal_bytes_per_sync_kb"`   // Background WAL sync every N KB (default: 512, 0=disabled)
-	WALSyncIntervalMS     int   `toml:"wal_sync_interval_ms"`    // Periodic WAL sync interval for Pebble+SQLite (default: 0=disabled)
 }
 
 // ConnectionPoolConfiguration controls database connection pooling
@@ -235,7 +234,6 @@ var Config = &Configuration{
 		L0CompactionThreshold: 500,  // CockroachDB default
 		L0StopWrites:          1000, // CockroachDB default
 		WALBytesPerSyncKB:     512,  // 512KB (CockroachDB default)
-		WALSyncIntervalMS:     10,   // 10ms periodic sync for Pebble+SQLite
 	},
 
 	ConnectionPool: ConnectionPoolConfiguration{
@@ -294,7 +292,7 @@ var Config = &Configuration{
 
 	BatchCommit: BatchCommitConfiguration{
 		Enabled:      true,
-		MaxBatchSize: 512,
+		MaxBatchSize: 100,
 		MaxWaitMS:    2,
 	},
 }

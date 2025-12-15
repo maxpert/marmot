@@ -12,7 +12,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/maxpert/marmot/cfg"
 	"github.com/maxpert/marmot/coordinator"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/publisher"
@@ -37,10 +36,6 @@ type DatabaseManager struct {
 	dataDir   string
 	nodeID    uint64
 	clock     *hlc.Clock
-
-	// WAL checkpoint goroutine
-	stopCheckpoint chan struct{}
-	checkpointWg   sync.WaitGroup
 }
 
 // DatabaseMetadata represents database registry information
@@ -53,11 +48,10 @@ type DatabaseMetadata struct {
 // NewDatabaseManager creates a new database manager
 func NewDatabaseManager(dataDir string, nodeID uint64, clock *hlc.Clock) (*DatabaseManager, error) {
 	dm := &DatabaseManager{
-		databases:      make(map[string]*ReplicatedDatabase),
-		dataDir:        dataDir,
-		nodeID:         nodeID,
-		clock:          clock,
-		stopCheckpoint: make(chan struct{}),
+		databases: make(map[string]*ReplicatedDatabase),
+		dataDir:   dataDir,
+		nodeID:    nodeID,
+		clock:     clock,
 	}
 
 	// Create databases directory if it doesn't exist
@@ -79,12 +73,6 @@ func NewDatabaseManager(dataDir string, nodeID uint64, clock *hlc.Clock) (*Datab
 	// Ensure default database exists
 	if err := dm.ensureDefaultDatabase(); err != nil {
 		return nil, fmt.Errorf("failed to ensure default database: %w", err)
-	}
-
-	// Start periodic WAL checkpoint if configured
-	if cfg.Config != nil && cfg.Config.MetaStore.WALSyncIntervalMS > 0 {
-		dm.checkpointWg.Add(1)
-		go dm.runPeriodicCheckpoint()
 	}
 
 	log.Info().Int("count", len(dm.databases)).Msg("DatabaseManager initialized")
@@ -381,12 +369,6 @@ func (dm *DatabaseManager) GetSystemDatabase() *ReplicatedDatabase {
 
 // Close closes all databases
 func (dm *DatabaseManager) Close() error {
-	// Stop checkpoint goroutine first (outside lock to avoid deadlock)
-	if dm.stopCheckpoint != nil {
-		close(dm.stopCheckpoint)
-		dm.checkpointWg.Wait()
-	}
-
 	dm.mu.Lock()
 	defer dm.mu.Unlock()
 
@@ -952,50 +934,6 @@ func (dm *DatabaseManager) TakeSnapshotToDir(targetDir string) ([]SnapshotInfo, 
 		Msg("Snapshot copied to directory")
 
 	return snapshots, maxTxnID, nil
-}
-
-// runPeriodicCheckpoint runs PASSIVE checkpoint on all databases periodically
-func (dm *DatabaseManager) runPeriodicCheckpoint() {
-	defer dm.checkpointWg.Done()
-
-	interval := time.Duration(cfg.Config.MetaStore.WALSyncIntervalMS) * time.Millisecond
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	log.Info().Dur("interval", interval).Msg("WAL checkpoint goroutine started")
-
-	for {
-		select {
-		case <-dm.stopCheckpoint:
-			log.Info().Msg("WAL checkpoint goroutine stopped")
-			return
-		case <-ticker.C:
-			dm.doPassiveCheckpoint()
-		}
-	}
-}
-
-// doPassiveCheckpoint runs PASSIVE checkpoint on all databases (non-blocking)
-func (dm *DatabaseManager) doPassiveCheckpoint() {
-	dm.mu.RLock()
-	databases := make([]*ReplicatedDatabase, 0, len(dm.databases))
-	for _, db := range dm.databases {
-		databases = append(databases, db)
-	}
-	dm.mu.RUnlock()
-
-	for _, db := range databases {
-		// Skip if database connections are closed (e.g., during snapshot apply)
-		sqlDB := db.GetDB()
-		if sqlDB == nil {
-			continue
-		}
-		// PASSIVE checkpoint doesn't block writers
-		_, err := sqlDB.Exec("PRAGMA wal_checkpoint(PASSIVE)")
-		if err != nil {
-			log.Warn().Err(err).Msg("PASSIVE checkpoint failed")
-		}
-	}
 }
 
 // GetMaxCommittedTxnID returns the highest committed transaction ID across all databases
