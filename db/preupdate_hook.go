@@ -132,6 +132,14 @@ func (c *SchemaCache) LoadTable(conn *sqlite3.SQLiteConn, tableName string) erro
 	return nil
 }
 
+// Update directly updates the cache with a schema.
+// Used by tests for manual schema setup.
+func (c *SchemaCache) Update(tableName string, schema *TableSchema) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cache[tableName] = schema
+}
+
 // loadSchema fetches schema from DB using the raw SQLite connection
 func loadSchema(conn *sqlite3.SQLiteConn, tableName string) (*TableSchema, error) {
 	rows, err := conn.Query(fmt.Sprintf("PRAGMA table_info(%s)", tableName), nil)

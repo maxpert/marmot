@@ -91,6 +91,13 @@ type ConnectionPoolConfiguration struct {
 	MaxLifetimeSeconds int `toml:"max_lifetime_seconds"`  // Max lifetime of a connection
 }
 
+// BatchCommitConfiguration controls SQLite write batching for improved throughput
+type BatchCommitConfiguration struct {
+	Enabled      bool `toml:"enabled"`        // Enable batch committing (default: true)
+	MaxBatchSize int  `toml:"max_batch_size"` // Max transactions per batch (default: 512)
+	MaxWaitMS    int  `toml:"max_wait_ms"`    // Max wait before flush in ms (default: 2)
+}
+
 // GRPCClientConfiguration controls gRPC client behavior
 type GRPCClientConfiguration struct {
 	KeepaliveTimeSeconds    int `toml:"keepalive_time_seconds"`    // Keepalive ping interval
@@ -171,6 +178,7 @@ type Configuration struct {
 	Prometheus     PrometheusConfiguration     `toml:"prometheus"`
 	Replica        ReplicaConfiguration        `toml:"replica"`
 	Publisher      PublisherConfiguration      `toml:"publisher"`
+	BatchCommit    BatchCommitConfiguration    `toml:"batch_commit"`
 }
 
 // Command line flags
@@ -282,6 +290,12 @@ var Config = &Configuration{
 	Publisher: PublisherConfiguration{
 		Enabled: false,
 		Sinks:   []SinkConfiguration{},
+	},
+
+	BatchCommit: BatchCommitConfiguration{
+		Enabled:      true,
+		MaxBatchSize: 512,
+		MaxWaitMS:    2,
 	},
 }
 

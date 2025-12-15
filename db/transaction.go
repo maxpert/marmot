@@ -56,6 +56,7 @@ type TransactionManager struct {
 	databaseName           string                  // Name of database this manager manages
 	getMinAppliedTxnID     MinAppliedTxnIDFunc     // Callback for GC coordination
 	getClusterMinWatermark ClusterMinWatermarkFunc // Callback for GC via gossip watermark
+	batchCommitter         *SQLiteBatchCommitter   // SQLite write batcher (nil if disabled)
 }
 
 // NewTransactionManager creates a new transaction manager
@@ -117,6 +118,26 @@ func (tm *TransactionManager) SetClusterMinWatermarkFunc(fn ClusterMinWatermarkF
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 	tm.getClusterMinWatermark = fn
+}
+
+// hasDDLIntents returns true if any intent is DDL type
+func (tm *TransactionManager) hasDDLIntents(intents []*WriteIntentRecord) bool {
+	for _, intent := range intents {
+		if intent.IntentType == IntentTypeDDL {
+			return true
+		}
+	}
+	return false
+}
+
+// batchCommitEnabled returns true if batch committing is enabled and configured
+func (tm *TransactionManager) batchCommitEnabled() bool {
+	return tm.batchCommitter != nil
+}
+
+// SetBatchCommitter sets the batch committer (called by ReplicatedDatabase)
+func (tm *TransactionManager) SetBatchCommitter(bc *SQLiteBatchCommitter) {
+	tm.batchCommitter = bc
 }
 
 // BeginTransaction starts a new distributed transaction with auto-generated ID
@@ -241,9 +262,28 @@ func (tm *TransactionManager) CommitTransaction(txn *Transaction) error {
 	// Phase 2: Calculate commit timestamp
 	txn.CommitTS = tm.calculateCommitTS(txn.StartTS)
 
-	// Phase 3: Apply data changes (CDC entries or DDL)
-	if err := tm.applyDataChanges(txn, intents); err != nil {
-		return err
+	// Phase 3: Apply data changes
+	// DDL transactions or batch-disabled: immediate execution
+	// DML transactions with batching: route through SQLiteBatchCommitter
+	if tm.hasDDLIntents(intents) || !tm.batchCommitEnabled() {
+		if err := tm.applyDataChanges(txn, intents); err != nil {
+			return err
+		}
+	} else {
+		// DML: batch through SQLiteBatchCommitter
+		cdcEntries, err := tm.metaStore.GetIntentEntries(txn.ID)
+		if err != nil {
+			return fmt.Errorf("failed to load CDC entries for batch: %w", err)
+		}
+
+		// Rebuild statements for anti-entropy (needed by finalizeCommit)
+		txn.Statements = tm.rebuildStatementsFromCDC(cdcEntries, intents)
+
+		// Enqueue and wait for batch to apply CDC to SQLite
+		fut := tm.batchCommitter.Enqueue(txn.ID, txn.CommitTS, cdcEntries, txn.Statements)
+		if _, err := fut.Get(); err != nil {
+			return fmt.Errorf("batch commit failed: %w", err)
+		}
 	}
 
 	// Phase 4: Finalize commit in MetaStore
