@@ -26,16 +26,16 @@ var _ coordinator.PendingExecution = (*PendingLocalExecution)(nil)
 // - readDB: Multiple connections for concurrent reads (pool_size from config)
 // - metaStore: Separate MetaStore for transaction metadata (separate file)
 type ReplicatedDatabase struct {
-	writeDB       *sql.DB   // Write connection (pool size=1, _txlock=immediate)
-	hookDB        *sql.DB   // Hook connection for CDC capture (pool size=1, released before 2PC)
-	readDB        *sql.DB   // Read connection pool (pool size from config)
-	metaStore     MetaStore // Separate metadata storage (transaction records, intents, etc.)
-	txnMgr        *TransactionManager
-	clock         *hlc.Clock
-	nodeID        uint64
-	replicationFn ReplicationFunc
-	commitBatcher *CommitBatcher
-	schemaCache   *SchemaCache // Shared schema cache for preupdate hooks
+	writeDB        *sql.DB   // Write connection (pool size=1, _txlock=immediate)
+	hookDB         *sql.DB   // Hook connection for CDC capture (pool size=1, released before 2PC)
+	readDB         *sql.DB   // Read connection pool (pool size from config)
+	metaStore      MetaStore // Separate metadata storage (transaction records, intents, etc.)
+	txnMgr         *TransactionManager
+	clock          *hlc.Clock
+	nodeID         uint64
+	replicationFn  ReplicationFunc
+	batchCommitter *SQLiteBatchCommitter
+	schemaCache    *SchemaCache // Shared schema cache for preupdate hooks
 }
 
 // ReplicationFunc is called to replicate transactions to other nodes
@@ -163,26 +163,47 @@ func NewReplicatedDatabase(dbPath string, nodeID uint64, clock *hlc.Clock, metaS
 	// Create transaction manager (uses write connection + MetaStore + schema cache)
 	txnMgr := NewTransactionManager(writeDB, metaStore, clock, schemaCache)
 
-	// Create commit batcher for SQLite-level batching (uses write connection)
-	commitBatcher := NewCommitBatcher(writeDB, 20, 2*time.Millisecond)
-	commitBatcher.Start()
+	// Create batch committer for SQLite-level batching (opens its own optimized connection)
+	var batchCommitter *SQLiteBatchCommitter
+	if cfg.Config.BatchCommit.Enabled {
+		batchCommitter = NewSQLiteBatchCommitter(
+			dbPath,
+			cfg.Config.BatchCommit.MaxBatchSize,
+			time.Duration(cfg.Config.BatchCommit.MaxWaitMS)*time.Millisecond,
+			cfg.Config.BatchCommit.CheckpointEnabled,
+			cfg.Config.BatchCommit.CheckpointPassiveThreshMB,
+			cfg.Config.BatchCommit.CheckpointRestartThreshMB,
+			cfg.Config.BatchCommit.AllowDynamicBatchSize,
+		)
+		if err := batchCommitter.Start(); err != nil {
+			closeAll()
+			return nil, fmt.Errorf("failed to start batch committer: %w", err)
+		}
+	}
 
 	mdb := &ReplicatedDatabase{
-		writeDB:       writeDB,
-		hookDB:        hookDB,
-		readDB:        readDB,
-		metaStore:     metaStore,
-		txnMgr:        txnMgr,
-		clock:         clock,
-		nodeID:        nodeID,
-		commitBatcher: commitBatcher,
-		schemaCache:   schemaCache,
+		writeDB:        writeDB,
+		hookDB:         hookDB,
+		readDB:         readDB,
+		metaStore:      metaStore,
+		txnMgr:         txnMgr,
+		clock:          clock,
+		nodeID:         nodeID,
+		batchCommitter: batchCommitter,
+		schemaCache:    schemaCache,
+	}
+
+	// Wire batch committer to transaction manager
+	if batchCommitter != nil {
+		txnMgr.SetBatchCommitter(batchCommitter)
 	}
 
 	// Load schema cache with existing tables (required for CDC preupdate hooks)
 	if err := mdb.ReloadSchema(); err != nil {
 		closeAll()
-		commitBatcher.Stop()
+		if batchCommitter != nil {
+			batchCommitter.Stop()
+		}
 		return nil, fmt.Errorf("failed to reload schema cache: %w", err)
 	}
 
@@ -226,6 +247,11 @@ func (mdb *ReplicatedDatabase) Close() error {
 	// Stop GC goroutine first to prevent it from accessing closed connections
 	if mdb.txnMgr != nil {
 		mdb.txnMgr.StopGarbageCollection()
+	}
+
+	// Stop batch committer (flushes pending)
+	if mdb.batchCommitter != nil {
+		mdb.batchCommitter.Stop()
 	}
 
 	var errs []error

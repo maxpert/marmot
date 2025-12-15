@@ -220,7 +220,6 @@ func buildStatement(ctx query.QueryContext, sql string) Statement {
 	return stmt
 }
 
-
 // NormalizeSQLForSQLite converts MySQL-style SQL to SQLite-compatible SQL
 // This is the central place for all MySQL -> SQLite transformations
 func NormalizeSQLForSQLite(sql string) string {

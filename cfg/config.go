@@ -81,7 +81,6 @@ type MetaStoreConfiguration struct {
 	L0CompactionThreshold int   `toml:"l0_compaction_threshold"` // L0 compaction trigger (default: 4)
 	L0StopWrites          int   `toml:"l0_stop_writes"`          // L0 stop writes trigger (default: 12)
 	WALBytesPerSyncKB     int   `toml:"wal_bytes_per_sync_kb"`   // Background WAL sync every N KB (default: 512, 0=disabled)
-	WALSyncIntervalMS     int   `toml:"wal_sync_interval_ms"`    // Periodic WAL sync interval for Pebble+SQLite (default: 0=disabled)
 }
 
 // ConnectionPoolConfiguration controls database connection pooling
@@ -89,6 +88,19 @@ type ConnectionPoolConfiguration struct {
 	PoolSize           int `toml:"pool_size"`             // Number of connections in pool
 	MaxIdleTimeSeconds int `toml:"max_idle_time_seconds"` // Max time connection can be idle
 	MaxLifetimeSeconds int `toml:"max_lifetime_seconds"`  // Max lifetime of a connection
+}
+
+// BatchCommitConfiguration controls SQLite write batching for improved throughput
+type BatchCommitConfiguration struct {
+	Enabled      bool `toml:"enabled"`        // Enable batch committing (default: true)
+	MaxBatchSize int  `toml:"max_batch_size"` // Max transactions per batch (default: 512)
+	MaxWaitMS    int  `toml:"max_wait_ms"`    // Max wait before flush in ms (default: 2)
+
+	// Adaptive checkpoint configuration for WAL management
+	CheckpointEnabled         bool    `toml:"checkpoint_enabled"`           // Enable automatic checkpointing (default: true)
+	CheckpointPassiveThreshMB float64 `toml:"checkpoint_passive_thresh_mb"` // PASSIVE checkpoint threshold in MB (default: 4.0)
+	CheckpointRestartThreshMB float64 `toml:"checkpoint_restart_thresh_mb"` // RESTART checkpoint threshold in MB (default: 16.0)
+	AllowDynamicBatchSize     bool    `toml:"allow_dynamic_batch_size"`     // Allow dynamic batch size adjustment (default: true)
 }
 
 // GRPCClientConfiguration controls gRPC client behavior
@@ -171,6 +183,7 @@ type Configuration struct {
 	Prometheus     PrometheusConfiguration     `toml:"prometheus"`
 	Replica        ReplicaConfiguration        `toml:"replica"`
 	Publisher      PublisherConfiguration      `toml:"publisher"`
+	BatchCommit    BatchCommitConfiguration    `toml:"batch_commit"`
 }
 
 // Command line flags
@@ -221,13 +234,12 @@ var Config = &Configuration{
 	},
 
 	MetaStore: MetaStoreConfiguration{
-		CacheSizeMB:           64,   // 64MB block cache
+		CacheSizeMB:           128,  // 128MB block cache (reduce Pebble disk reads)
 		MemTableSizeMB:        64,   // 64MB memtable (CockroachDB-style)
 		MemTableCount:         2,    // 2 memtables
 		L0CompactionThreshold: 500,  // CockroachDB default
 		L0StopWrites:          1000, // CockroachDB default
 		WALBytesPerSyncKB:     512,  // 512KB (CockroachDB default)
-		WALSyncIntervalMS:     10,   // 10ms periodic sync for Pebble+SQLite
 	},
 
 	ConnectionPool: ConnectionPoolConfiguration{
@@ -264,7 +276,7 @@ var Config = &Configuration{
 
 	Logging: LoggingConfiguration{
 		Verbose: false,
-		Format:  "console",
+		Format:  "json", // Use "json" for production (21% faster than "console")
 	},
 
 	Prometheus: PrometheusConfiguration{
@@ -282,6 +294,16 @@ var Config = &Configuration{
 	Publisher: PublisherConfiguration{
 		Enabled: false,
 		Sinks:   []SinkConfiguration{},
+	},
+
+	BatchCommit: BatchCommitConfiguration{
+		Enabled:                   true,
+		MaxBatchSize:              100,
+		MaxWaitMS:                 2,
+		CheckpointEnabled:         true,
+		CheckpointPassiveThreshMB: 4.0,
+		CheckpointRestartThreshMB: 16.0,
+		AllowDynamicBatchSize:     true,
 	},
 }
 

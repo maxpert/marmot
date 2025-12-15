@@ -70,21 +70,29 @@ auto_id_mode = "compact"
 
 # PebbleDB metastore (CockroachDB-tested defaults)
 [metastore]
-cache_size_mb = 64
+cache_size_mb = 128
 memtable_size_mb = 64
 memtable_count = 2
 l0_compaction_threshold = 500
 l0_stop_writes = 1000
 wal_bytes_per_sync_kb = 512
-wal_sync_interval_ms = 10
 
 [logging]
-verbose = true
-format = "console"
+verbose = false
+format = "json"
 
 [prometheus]
 # Metrics served on gRPC port at http://localhost:8082/metrics
 enabled = true
+
+[batch_commit]
+enabled = true
+max_batch_size = 100
+max_wait_ms = 1
+checkpoint_enabled = true
+checkpoint_passive_thresh_mb = 4.0
+checkpoint_restart_thresh_mb = 16.0
+allow_dynamic_batch_size = true
 
 # CDC Publisher - Stream changes to external systems (Kafka, NATS)
 # Events follow Debezium specification: https://debezium.io/
