@@ -129,7 +129,7 @@ func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transacti
 
 	log.Trace().
 		Uint64("txn_id", txn.ID).
-		Int("alive_nodes", len(cluster.AliveNodes)).
+		Int("target_nodes", len(cluster.AliveNodes)).
 		Int("total_membership", cluster.TotalMembership).
 		Msg("2PC: Cluster state")
 

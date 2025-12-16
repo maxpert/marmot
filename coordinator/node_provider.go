@@ -4,7 +4,7 @@ package coordinator
 // This interface is used for full database replication where ALL nodes
 // receive ALL writes (unlike partitioned replication which uses consistent hashing).
 type NodeProvider interface {
-	// GetAliveNodes returns all currently alive nodes in the cluster (replication targets)
+	// GetAliveNodes returns all ALIVE nodes for replication
 	GetAliveNodes() ([]uint64, error)
 
 	// GetClusterSize returns the total number of alive nodes (replication targets)

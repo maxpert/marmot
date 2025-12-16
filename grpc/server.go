@@ -953,6 +953,7 @@ func (s *Server) RunPromotionChecker(ctx context.Context, checkInterval time.Dur
 func (s *Server) checkPromotionCriteria() bool {
 	s.mu.RLock()
 	dbManager := s.dbManager
+	replicationHandler := s.replicationHandler
 	s.mu.RUnlock()
 
 	if dbManager == nil {
@@ -968,7 +969,71 @@ func (s *Server) checkPromotionCriteria() bool {
 
 	// Check that we have at least one database
 	localDatabases := dbManager.ListDatabases()
-	return len(localDatabases) > 0
+	if len(localDatabases) == 0 {
+		return false
+	}
+
+	// Verify schema versions match or exceed all ALIVE peers
+	// This prevents premature promotion before DDL replication completes
+	if replicationHandler == nil {
+		return false
+	}
+
+	localSchemaVersions, err := replicationHandler.GetAllSchemaVersions()
+	if err != nil {
+		log.Warn().Err(err).Msg("Failed to get local schema versions for promotion check")
+		return false
+	}
+
+	// Build a set of local database names for quick lookup
+	localDBSet := make(map[string]bool)
+	for _, dbName := range localDatabases {
+		localDBSet[dbName] = true
+	}
+
+	// Check each ALIVE peer's schema versions
+	for _, peer := range aliveNodes {
+		peerSchemaVersions := peer.DatabaseSchemaVersions
+		if peerSchemaVersions == nil {
+			continue
+		}
+
+		// For each database the peer has, check if our schema is at least as recent
+		for dbName, peerVersion := range peerSchemaVersions {
+			// Skip system database - it's not subject to DDL replication
+			if dbName == db.SystemDatabaseName {
+				continue
+			}
+
+			localVersion, hasSchemaEntry := localSchemaVersions[dbName]
+			hasLocalDB := localDBSet[dbName]
+
+			if !hasLocalDB {
+				// Peer has a database we don't have yet - we'll get it via replication
+				// This is acceptable, continue checking
+				continue
+			}
+
+			// If we have the database locally but no schema version entry,
+			// treat it as version 0 (fresh database, no DDL applied yet)
+			if !hasSchemaEntry {
+				localVersion = 0
+			}
+
+			// If peer has higher schema version, we're behind on DDL
+			if localVersion < peerVersion {
+				log.Debug().
+					Str("database", dbName).
+					Uint64("local_version", localVersion).
+					Uint64("peer_version", peerVersion).
+					Uint64("peer_id", peer.NodeId).
+					Msg("Schema version behind peer, delaying promotion")
+				return false
+			}
+		}
+	}
+
+	return true
 }
 
 // =======================

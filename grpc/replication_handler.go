@@ -637,3 +637,12 @@ func (rh *ReplicationHandler) HandleRead(ctx context.Context, req *ReadRequest) 
 		},
 	}, nil
 }
+
+// GetAllSchemaVersions returns local schema versions for all databases
+// Used by promotion checker to verify schema matches cluster before promoting to ALIVE
+func (rh *ReplicationHandler) GetAllSchemaVersions() (map[string]uint64, error) {
+	if rh.schemaVersionMgr == nil {
+		return nil, nil
+	}
+	return rh.schemaVersionMgr.GetAllSchemaVersions()
+}

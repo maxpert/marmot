@@ -316,6 +316,7 @@ func main() {
 		deltaSync,
 		clock,
 		snapshotFunc,
+		schemaVersionMgr,
 	)
 
 	// Start anti-entropy service

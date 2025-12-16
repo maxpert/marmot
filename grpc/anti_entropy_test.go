@@ -1,6 +1,8 @@
 package grpc
 
 import (
+	"context"
+	"os"
 	"testing"
 	"time"
 )
@@ -191,5 +193,270 @@ func TestLastSyncTimeZeroHandling(t *testing.T) {
 	// 2 hours exceeds 1 hour threshold, should use snapshot
 	if ae.shouldUseDeltaSync(100, timeLag) {
 		t.Error("2 hour time lag should trigger snapshot with 1 hour threshold")
+	}
+}
+
+// TestFindBestPeerForDatabase_SkipsOlderSchema tests that peers with older schema are skipped
+func TestFindBestPeerForDatabase_SkipsOlderSchema(t *testing.T) {
+	tmpDir, dbMgr, schemaVersionMgr := setupTestEnvironment(t, "test_anti_entropy_skip_older")
+	defer os.RemoveAll(tmpDir)
+	defer dbMgr.Close()
+
+	err := dbMgr.CreateDatabase("marmot")
+	if err != nil {
+		t.Fatalf("Failed to create database: %v", err)
+	}
+
+	err = schemaVersionMgr.SetSchemaVersion("marmot", 2, "CREATE TABLE test (id INT)", 1)
+	if err != nil {
+		t.Fatalf("Failed to set local schema version: %v", err)
+	}
+
+	registry := NewNodeRegistry(1, "localhost:8081")
+	client := NewClient(1)
+
+	ae := &AntiEntropyService{
+		nodeID:           1,
+		registry:         registry,
+		client:           client,
+		dbManager:        dbMgr,
+		schemaVersionMgr: schemaVersionMgr,
+	}
+
+	peerWithOlderSchema := &NodeState{
+		NodeId:      2,
+		Address:     "peer:8082",
+		Status:      NodeStatus_ALIVE,
+		Incarnation: 1,
+		DatabaseSchemaVersions: map[string]uint64{
+			"marmot": 0,
+		},
+	}
+
+	aliveNodes := []*NodeState{peerWithOlderSchema}
+	ctx := context.Background()
+
+	result := ae.findBestPeerForDatabase(ctx, aliveNodes, "marmot")
+
+	if result != nil {
+		t.Errorf("Expected nil (no valid peer), got peer with ID %d", result.NodeId)
+	}
+}
+
+// TestFindBestPeerForDatabase_AcceptsSameSchema tests that peers with same schema are considered
+func TestFindBestPeerForDatabase_AcceptsSameSchema(t *testing.T) {
+	tmpDir, dbMgr, schemaVersionMgr := setupTestEnvironment(t, "test_anti_entropy_same_schema")
+	defer os.RemoveAll(tmpDir)
+	defer dbMgr.Close()
+
+	err := dbMgr.CreateDatabase("marmot")
+	if err != nil {
+		t.Fatalf("Failed to create database: %v", err)
+	}
+
+	err = schemaVersionMgr.SetSchemaVersion("marmot", 2, "CREATE TABLE test (id INT)", 1)
+	if err != nil {
+		t.Fatalf("Failed to set local schema version: %v", err)
+	}
+
+	registry := NewNodeRegistry(1, "localhost:8081")
+	client := NewClient(1)
+
+	ae := &AntiEntropyService{
+		nodeID:           1,
+		registry:         registry,
+		client:           client,
+		dbManager:        dbMgr,
+		schemaVersionMgr: schemaVersionMgr,
+	}
+
+	peerWithSameSchema := &NodeState{
+		NodeId:      2,
+		Address:     "peer:8082",
+		Status:      NodeStatus_ALIVE,
+		Incarnation: 1,
+		DatabaseSchemaVersions: map[string]uint64{
+			"marmot": 2,
+		},
+	}
+
+	aliveNodes := []*NodeState{peerWithSameSchema}
+	ctx := context.Background()
+
+	result := ae.findBestPeerForDatabase(ctx, aliveNodes, "marmot")
+
+	if result != nil && result.NodeId != 2 {
+		t.Errorf("Expected peer ID 2 or nil (no replication state), got %v", result)
+	}
+}
+
+// TestFindBestPeerForDatabase_AcceptsNewerSchema tests that peers with newer schema are considered
+func TestFindBestPeerForDatabase_AcceptsNewerSchema(t *testing.T) {
+	tmpDir, dbMgr, schemaVersionMgr := setupTestEnvironment(t, "test_anti_entropy_newer_schema")
+	defer os.RemoveAll(tmpDir)
+	defer dbMgr.Close()
+
+	err := dbMgr.CreateDatabase("marmot")
+	if err != nil {
+		t.Fatalf("Failed to create database: %v", err)
+	}
+
+	err = schemaVersionMgr.SetSchemaVersion("marmot", 2, "CREATE TABLE test (id INT)", 1)
+	if err != nil {
+		t.Fatalf("Failed to set local schema version: %v", err)
+	}
+
+	registry := NewNodeRegistry(1, "localhost:8081")
+	client := NewClient(1)
+
+	ae := &AntiEntropyService{
+		nodeID:           1,
+		registry:         registry,
+		client:           client,
+		dbManager:        dbMgr,
+		schemaVersionMgr: schemaVersionMgr,
+	}
+
+	peerWithNewerSchema := &NodeState{
+		NodeId:      2,
+		Address:     "peer:8082",
+		Status:      NodeStatus_ALIVE,
+		Incarnation: 1,
+		DatabaseSchemaVersions: map[string]uint64{
+			"marmot": 5,
+		},
+	}
+
+	aliveNodes := []*NodeState{peerWithNewerSchema}
+	ctx := context.Background()
+
+	result := ae.findBestPeerForDatabase(ctx, aliveNodes, "marmot")
+
+	if result != nil && result.NodeId != 2 {
+		t.Errorf("Expected peer ID 2 or nil (no replication state), got %v", result)
+	}
+}
+
+// TestFindBestPeerForDatabase_AllPeersOlderSchema tests that nil is returned when all peers are behind
+func TestFindBestPeerForDatabase_AllPeersOlderSchema(t *testing.T) {
+	tmpDir, dbMgr, schemaVersionMgr := setupTestEnvironment(t, "test_anti_entropy_all_older")
+	defer os.RemoveAll(tmpDir)
+	defer dbMgr.Close()
+
+	err := dbMgr.CreateDatabase("marmot")
+	if err != nil {
+		t.Fatalf("Failed to create database: %v", err)
+	}
+
+	err = schemaVersionMgr.SetSchemaVersion("marmot", 5, "CREATE TABLE test (id INT)", 1)
+	if err != nil {
+		t.Fatalf("Failed to set local schema version: %v", err)
+	}
+
+	registry := NewNodeRegistry(1, "localhost:8081")
+	client := NewClient(1)
+
+	ae := &AntiEntropyService{
+		nodeID:           1,
+		registry:         registry,
+		client:           client,
+		dbManager:        dbMgr,
+		schemaVersionMgr: schemaVersionMgr,
+	}
+
+	peer1 := &NodeState{
+		NodeId:      2,
+		Address:     "peer1:8082",
+		Status:      NodeStatus_ALIVE,
+		Incarnation: 1,
+		DatabaseSchemaVersions: map[string]uint64{
+			"marmot": 2,
+		},
+	}
+
+	peer2 := &NodeState{
+		NodeId:      3,
+		Address:     "peer2:8083",
+		Status:      NodeStatus_ALIVE,
+		Incarnation: 1,
+		DatabaseSchemaVersions: map[string]uint64{
+			"marmot": 4,
+		},
+	}
+
+	aliveNodes := []*NodeState{peer1, peer2}
+	ctx := context.Background()
+
+	result := ae.findBestPeerForDatabase(ctx, aliveNodes, "marmot")
+
+	if result != nil {
+		t.Errorf("Expected nil (all peers have older schema), got peer with ID %d", result.NodeId)
+	}
+}
+
+// TestAntiEntropy_PeerSelectionWithMixedSchemaVersions tests peer selection with mixed schema versions
+func TestAntiEntropy_PeerSelectionWithMixedSchemaVersions(t *testing.T) {
+	tmpDir, dbMgr, schemaVersionMgr := setupTestEnvironment(t, "test_anti_entropy_mixed_schema")
+	defer os.RemoveAll(tmpDir)
+	defer dbMgr.Close()
+
+	err := dbMgr.CreateDatabase("marmot")
+	if err != nil {
+		t.Fatalf("Failed to create database: %v", err)
+	}
+
+	err = schemaVersionMgr.SetSchemaVersion("marmot", 2, "CREATE TABLE test (id INT)", 1)
+	if err != nil {
+		t.Fatalf("Failed to set local schema version: %v", err)
+	}
+
+	registry := NewNodeRegistry(1, "localhost:8081")
+	client := NewClient(1)
+
+	ae := &AntiEntropyService{
+		nodeID:           1,
+		registry:         registry,
+		client:           client,
+		dbManager:        dbMgr,
+		schemaVersionMgr: schemaVersionMgr,
+	}
+
+	peerOlder := &NodeState{
+		NodeId:      2,
+		Address:     "peer_old:8082",
+		Status:      NodeStatus_ALIVE,
+		Incarnation: 1,
+		DatabaseSchemaVersions: map[string]uint64{
+			"marmot": 0,
+		},
+	}
+
+	peerSame := &NodeState{
+		NodeId:      3,
+		Address:     "peer_same:8083",
+		Status:      NodeStatus_ALIVE,
+		Incarnation: 1,
+		DatabaseSchemaVersions: map[string]uint64{
+			"marmot": 2,
+		},
+	}
+
+	peerNewer := &NodeState{
+		NodeId:      4,
+		Address:     "peer_new:8084",
+		Status:      NodeStatus_ALIVE,
+		Incarnation: 1,
+		DatabaseSchemaVersions: map[string]uint64{
+			"marmot": 3,
+		},
+	}
+
+	aliveNodes := []*NodeState{peerOlder, peerSame, peerNewer}
+	ctx := context.Background()
+
+	result := ae.findBestPeerForDatabase(ctx, aliveNodes, "marmot")
+
+	if result != nil && result.NodeId == 2 {
+		t.Errorf("Should not select peer with older schema (ID 2), got peer ID %d", result.NodeId)
 	}
 }

@@ -20,7 +20,7 @@ type ClusterState struct {
 	RequiredQuorum int
 }
 
-// GetClusterState retrieves the current cluster state and validates the consistency level.
+// GetClusterState retrieves the current cluster state for DML operations.
 // It returns a ClusterState with alive nodes, total membership, and required quorum size.
 //
 // CRITICAL: Uses TOTAL membership for quorum calculation, not just alive nodes.
@@ -28,7 +28,7 @@ type ClusterState struct {
 // clusterSize=3 and achieve quorum=2 if we only counted alive nodes. By using total
 // membership, quorum=4 and neither partition can write/read with quorum.
 func GetClusterState(nodeProvider NodeProvider, consistency protocol.ConsistencyLevel) (*ClusterState, error) {
-	// Get all alive nodes from cluster (these are the replication/read targets)
+	// Get all alive nodes for replication
 	aliveNodes, err := nodeProvider.GetAliveNodes()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get alive nodes: %w", err)
@@ -56,3 +56,4 @@ func GetClusterState(nodeProvider NodeProvider, consistency protocol.Consistency
 		RequiredQuorum:  requiredQuorum,
 	}, nil
 }
+
