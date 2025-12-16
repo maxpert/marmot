@@ -79,28 +79,12 @@ func NewReadCoordinator(nodeID uint64, nodeProvider NodeProvider, reader Reader,
 // - QUORUM: Read from majority of nodes to ensure consistency
 // - ALL: Read from all alive nodes
 func (rc *ReadCoordinator) ReadTransaction(ctx context.Context, req *ReadRequest) (*ReadResponse, error) {
-	// Get all alive nodes from cluster (these are the read targets)
-	aliveNodes, err := rc.nodeProvider.GetAliveNodes()
+	// Get cluster state with validated consistency level and quorum requirements
+	cluster, err := GetClusterState(rc.nodeProvider, req.Consistency)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get alive nodes: %w", err)
+		return nil, err
 	}
-
-	aliveCount := len(aliveNodes)
-	if aliveCount == 0 {
-		return nil, fmt.Errorf("no alive nodes in cluster")
-	}
-
-	// CRITICAL: Use TOTAL membership for quorum calculation, not just alive nodes.
-	// This prevents split-brain reads from returning inconsistent data.
-	totalMembership := rc.nodeProvider.GetTotalMembershipSize()
-
-	// Validate consistency level against total membership
-	if err := ValidateConsistencyLevel(req.Consistency, totalMembership); err != nil {
-		return nil, fmt.Errorf("invalid read consistency: %w", err)
-	}
-
-	// Calculate required quorum based on TOTAL membership (split-brain protection)
-	requiredQuorum := QuorumSize(req.Consistency, totalMembership)
+	aliveCount := len(cluster.AliveNodes)
 
 	// For LOCAL_ONE, read from self (coordinator node)
 	if req.Consistency == protocol.ConsistencyLocalOne {
@@ -123,7 +107,7 @@ func (rc *ReadCoordinator) ReadTransaction(ctx context.Context, req *ReadRequest
 		}
 
 		// Try other nodes
-		for _, nodeID := range aliveNodes {
+		for _, nodeID := range cluster.AliveNodes {
 			if nodeID == rc.nodeID {
 				continue // Already tried self
 			}
@@ -139,15 +123,20 @@ func (rc *ReadCoordinator) ReadTransaction(ctx context.Context, req *ReadRequest
 	}
 
 	// For QUORUM/ALL, read from multiple nodes
-	responses, err := rc.readFromNodes(ctx, aliveNodes, req)
+	responses, err := rc.readFromNodes(ctx, cluster.AliveNodes, req)
 	if err != nil {
 		return nil, fmt.Errorf("read failed: %w", err)
 	}
 
 	// Check if quorum was achieved
-	if len(responses) < requiredQuorum {
-		return nil, fmt.Errorf("read quorum not achieved: got %d responses, need %d (majority of %d total members, %d alive)",
-			len(responses), requiredQuorum, totalMembership, aliveCount)
+	if len(responses) < cluster.RequiredQuorum {
+		return nil, &QuorumNotAchievedError{
+			Phase:           "read",
+			AcksReceived:    len(responses),
+			QuorumRequired:  cluster.RequiredQuorum,
+			TotalMembership: cluster.TotalMembership,
+			AliveNodes:      aliveCount,
+		}
 	}
 
 	// Return first successful response
