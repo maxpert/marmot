@@ -4,9 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/maxpert/marmot/encoding"
 	"github.com/maxpert/marmot/publisher"
 	"github.com/maxpert/marmot/publisher/transformer"
-	"github.com/vmihailenco/msgpack/v5"
 )
 
 func ExampleDebeziumTransformer() {
@@ -211,7 +211,7 @@ func ExampleDebeziumTransformer_Tombstone() {
 
 // Helper function to marshal data with msgpack
 func mustMarshal(v interface{}) []byte {
-	data, err := msgpack.Marshal(v)
+	data, err := encoding.Marshal(v)
 	if err != nil {
 		panic(err)
 	}

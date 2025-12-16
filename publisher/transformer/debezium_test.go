@@ -4,10 +4,10 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/maxpert/marmot/encoding"
 	"github.com/maxpert/marmot/publisher"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/vmihailenco/msgpack/v5"
 )
 
 func TestDebeziumTransformer_Transform_Insert(t *testing.T) {
@@ -521,7 +521,7 @@ func TestDebeziumTransformer_MultipleTablesSchema(t *testing.T) {
 
 // Helper function to marshal data with msgpack
 func mustMarshalMsgpack(v interface{}) []byte {
-	data, err := msgpack.Marshal(v)
+	data, err := encoding.Marshal(v)
 	if err != nil {
 		panic(err)
 	}

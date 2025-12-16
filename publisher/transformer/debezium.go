@@ -8,9 +8,9 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/maxpert/marmot/encoding"
 	"github.com/maxpert/marmot/publisher"
 	"github.com/rs/zerolog/log"
-	"github.com/vmihailenco/msgpack/v5"
 )
 
 func init() {
@@ -149,7 +149,7 @@ func (d *DebeziumTransformer) decodeRowData(data map[string][]byte) (map[string]
 	result := make(map[string]interface{}, len(data))
 	for colName, msgpackData := range data {
 		var val interface{}
-		if err := msgpack.Unmarshal(msgpackData, &val); err != nil {
+		if err := encoding.Unmarshal(msgpackData, &val); err != nil {
 			return nil, fmt.Errorf("failed to decode column %s: %w", colName, err)
 		}
 		result[colName] = val
