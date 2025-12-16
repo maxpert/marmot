@@ -107,7 +107,7 @@ func NewWriteCoordinator(nodeID uint64, nodeProvider NodeProvider, replicator Re
 // - Background replication continues to stragglers
 // - Dead nodes catch up via snapshot + delta logs when they rejoin
 func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transaction) error {
-	txnStart := time.Now()
+	metrics := NewTxnMetrics("write")
 	telemetry.ActiveTransactions.Inc()
 	defer telemetry.ActiveTransactions.Dec()
 
@@ -116,54 +116,49 @@ func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transacti
 		Int("stmt_count", len(txn.Statements)).
 		Msg("2PC: WriteTransaction started")
 
-	// Get all alive nodes for full replication (these are the replication targets)
-	aliveNodes, err := wc.nodeProvider.GetAliveNodes()
+	// 1. Validate statements
+	if err := wc.validateStatements(txn); err != nil {
+		return metrics.RecordFailure("failed", err)
+	}
+
+	// 2. Get cluster state
+	cluster, err := GetClusterState(wc.nodeProvider, txn.WriteConsistency)
 	if err != nil {
-		return fmt.Errorf("failed to get alive nodes: %w", err)
+		return metrics.RecordFailure("failed", err)
 	}
-
-	aliveCount := len(aliveNodes)
-	if aliveCount == 0 {
-		return fmt.Errorf("no alive nodes in cluster")
-	}
-
-	// CRITICAL: Use TOTAL membership for quorum calculation, not just alive nodes.
-	// This prevents split-brain: in a 6-node cluster split 3x3, each partition
-	// would see clusterSize=3 and achieve quorum=2 if we only counted alive nodes.
-	// By using total membership, quorum=4 and neither partition can write.
-	totalMembership := wc.nodeProvider.GetTotalMembershipSize()
 
 	log.Trace().
 		Uint64("txn_id", txn.ID).
-		Int("alive_nodes", aliveCount).
-		Int("total_membership", totalMembership).
+		Int("alive_nodes", len(cluster.AliveNodes)).
+		Int("total_membership", cluster.TotalMembership).
 		Msg("2PC: Cluster state")
-
-	// Validate consistency level against total membership (not just alive)
-	if err := ValidateConsistencyLevel(txn.WriteConsistency, totalMembership); err != nil {
-		return fmt.Errorf("invalid write consistency: %w", err)
-	}
-
-	// Calculate required quorum based on TOTAL membership (split-brain protection)
-	requiredQuorum := QuorumSize(txn.WriteConsistency, totalMembership)
 
 	// Separate other nodes from self for replication
 	// Self will be handled separately (we're the coordinator)
-	otherNodes := make([]uint64, 0, aliveCount-1)
-	for _, nodeID := range aliveNodes {
+	otherNodes := make([]uint64, 0, len(cluster.AliveNodes)-1)
+	for _, nodeID := range cluster.AliveNodes {
 		if nodeID != wc.nodeID {
 			otherNodes = append(otherNodes, nodeID)
 		}
 	}
 
-	// ====================
-	// PHASE 1: PREPARE (Create Write Intents)
-	// ====================
-	// Single-attempt prepare with intent-based conflict detection.
-	// On conflict: abort and return MySQL 1213 to client for retry.
-	// No internal retry - client handles retry at application level.
+	// 3. Prepare phase
+	prepResponses, err := wc.runPreparePhase(ctx, txn, cluster, otherNodes)
+	if err != nil {
+		wc.abortTransaction(ctx, cluster.AliveNodes, txn.ID, txn.Database)
+		return metrics.RecordFailure(wc.classifyPrepareError(err), err)
+	}
 
-	// Validate statements have required fields for CDC replication
+	// 4. Commit phase - remote-first commit to prevent coordinator-only commits
+	if err := wc.runCommitPhase(ctx, txn, cluster, prepResponses); err != nil {
+		return metrics.RecordFailure("failed", err)
+	}
+
+	return metrics.RecordSuccess()
+}
+
+// validateStatements validates that all CDC statements have required fields for replication
+func (wc *WriteCoordinator) validateStatements(txn *Transaction) error {
 	for i, stmt := range txn.Statements {
 		hasCDCData := len(stmt.OldValues) > 0 || len(stmt.NewValues) > 0
 		if hasCDCData && stmt.TableName == "" {
@@ -175,8 +170,12 @@ func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transacti
 			return fmt.Errorf("CDC statement missing TableName (stmt %d)", i)
 		}
 	}
+	return nil
+}
 
-	prepReq := &ReplicationRequest{
+// buildPrepareRequest creates a ReplicationRequest for the prepare phase
+func (wc *WriteCoordinator) buildPrepareRequest(txn *Transaction) *ReplicationRequest {
+	return &ReplicationRequest{
 		TxnID:                 txn.ID,
 		NodeID:                wc.nodeID,
 		Statements:            txn.Statements,
@@ -185,6 +184,23 @@ func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transacti
 		Database:              txn.Database,
 		RequiredSchemaVersion: txn.RequiredSchemaVersion,
 	}
+}
+
+// buildCommitRequest creates a ReplicationRequest for the commit phase
+func (wc *WriteCoordinator) buildCommitRequest(txn *Transaction) *ReplicationRequest {
+	return &ReplicationRequest{
+		TxnID:      txn.ID,
+		Phase:      PhaseCommit,
+		StartTS:    txn.StartTS,
+		NodeID:     wc.nodeID,
+		Database:   txn.Database,
+		Statements: txn.Statements, // Include statements for schema version tracking
+	}
+}
+
+// runPreparePhase executes the prepare phase and validates quorum requirements
+func (wc *WriteCoordinator) runPreparePhase(ctx context.Context, txn *Transaction, cluster *ClusterState, otherNodes []uint64) (map[uint64]*ReplicationResponse, error) {
+	prepReq := wc.buildPrepareRequest(txn)
 
 	// Execute prepare phase on all nodes (including self) - single attempt, no retry
 	// All nodes now participate uniformly - no skipLocalReplication
@@ -196,106 +212,86 @@ func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transacti
 	if conflictErr != nil {
 		// Write-write conflict detected - abort and signal client to retry
 		telemetry.WriteConflictsTotal.With("intent", "slow").Inc()
-		telemetry.TxnTotal.With("write", "conflict").Inc()
-		telemetry.TxnDurationSeconds.With("write").Observe(time.Since(txnStart).Seconds())
 		log.Debug().
 			Uint64("txn_id", txn.ID).
 			Err(conflictErr).
 			Msg("Conflict detected - aborting transaction, client should retry")
-		wc.abortTransaction(ctx, aliveNodes, txn.ID, txn.Database)
 		// Return MySQL 1213 (ER_LOCK_DEADLOCK) - standard signal for client retry
-		return protocol.ErrDeadlock()
+		return nil, protocol.ErrDeadlock()
 	}
 
 	// Check if quorum was achieved
 	totalAcks := len(prepResponses)
-	if totalAcks < requiredQuorum {
-		telemetry.TxnTotal.With("write", "failed").Inc()
-		telemetry.TxnDurationSeconds.With("write").Observe(time.Since(txnStart).Seconds())
+	if totalAcks < cluster.RequiredQuorum {
 		log.Warn().
 			Uint64("txn_id", txn.ID).
 			Int("total_acks", totalAcks).
-			Int("required_quorum", requiredQuorum).
-			Int("total_membership", totalMembership).
-			Int("alive_nodes", aliveCount).
+			Int("required_quorum", cluster.RequiredQuorum).
+			Int("total_membership", cluster.TotalMembership).
+			Int("alive_nodes", len(cluster.AliveNodes)).
 			Msg("Prepare quorum not achieved - aborting transaction")
 
-		wc.abortTransaction(ctx, aliveNodes, txn.ID, txn.Database)
-		return fmt.Errorf("prepare quorum not achieved: got %d acks, need %d (majority of %d total members, %d alive)",
-			totalAcks, requiredQuorum, totalMembership, aliveCount)
+		return nil, &QuorumNotAchievedError{
+			Phase:           "prepare",
+			AcksReceived:    totalAcks,
+			QuorumRequired:  cluster.RequiredQuorum,
+			TotalMembership: cluster.TotalMembership,
+			AliveNodes:      len(cluster.AliveNodes),
+			IsRemoteQuorum:  false,
+		}
 	}
 
 	// CRITICAL: Verify coordinator participated in PREPARE phase
 	// The coordinator MUST be part of the quorum for correctness
 	_, selfPrepared := prepResponses[wc.nodeID]
 	if !selfPrepared {
-		telemetry.TxnTotal.With("write", "failed").Inc()
-		telemetry.TxnDurationSeconds.With("write").Observe(time.Since(txnStart).Seconds())
 		log.Error().
 			Uint64("txn_id", txn.ID).
 			Int("total_acks", totalAcks).
-			Int("required_quorum", requiredQuorum).
+			Int("required_quorum", cluster.RequiredQuorum).
 			Msg("Coordinator PREPARE failed - coordinator must participate - aborting transaction")
 
-		wc.abortTransaction(ctx, aliveNodes, txn.ID, txn.Database)
-		return fmt.Errorf("coordinator must participate: local prepare failed")
+		return nil, &CoordinatorNotParticipatedError{TxnID: txn.ID}
 	}
 
-	// ====================
-	// PHASE 2: COMMIT
-	// ====================
-	// Quorum of write intents created successfully with no conflicts.
-	// CRITICAL: Commit to REMOTE nodes first, wait for quorum-1 ACKs, then commit locally.
-	// This ensures if remote quorum fails, coordinator hasn't committed yet (clean abort).
-	// After PREPARE ACK, commit MUST succeed (nodes promised they can commit).
-	commitStart := time.Now()
-	log.Debug().
-		Uint64("txn_id", txn.ID).
-		Int("prepared_nodes", len(prepResponses)).
-		Msg("PREPARE phase complete, starting COMMIT")
+	return prepResponses, nil
+}
 
-	commitReq := &ReplicationRequest{
-		TxnID:      txn.ID,
-		Phase:      PhaseCommit,
-		StartTS:    txn.StartTS,
-		NodeID:     wc.nodeID,
-		Database:   txn.Database,
-		Statements: txn.Statements, // Include statements for schema version tracking
-	}
-
-	commitResponses := make(map[uint64]*ReplicationResponse)
-
+// sendRemoteCommits launches goroutines to send commit requests to remote nodes
+func (wc *WriteCoordinator) sendRemoteCommits(ctx context.Context, preparedNodes map[uint64]*ReplicationResponse, req *ReplicationRequest, txnID uint64) chan response {
 	// Count other prepared nodes (excluding self)
 	otherPreparedNodes := 0
-	for nodeID := range prepResponses {
+	for nodeID := range preparedNodes {
 		if nodeID != wc.nodeID {
 			otherPreparedNodes++
 		}
 	}
 
-	// Calculate how many remote ACKs we need before committing locally
-	// We need (quorum - 1) from remotes, then local commit gives us quorum
-	// Note: selfPrepared is guaranteed to be true at this point (checked above)
-	remoteQuorumNeeded := requiredQuorum - 1 // We'll add local commit after
-
 	// STEP 1: Send COMMIT to remote nodes first
 	commitChan := make(chan response, otherPreparedNodes)
-	for nodeID := range prepResponses {
+	for nodeID := range preparedNodes {
 		if nodeID == wc.nodeID {
 			continue // Don't commit locally yet
 		}
 		log.Debug().
-			Uint64("txn_id", txn.ID).
+			Uint64("txn_id", txnID).
 			Uint64("target_node", nodeID).
 			Msg("sending COMMIT to remote node")
 		go func(nid uint64) {
 			// Use detached context - remote commits should complete even if parent cancelled
 			commitCtx, commitCancel := context.WithTimeout(context.Background(), wc.timeout)
 			defer commitCancel()
-			resp, err := wc.replicator.ReplicateTransaction(commitCtx, nid, commitReq)
+			resp, err := wc.replicator.ReplicateTransaction(commitCtx, nid, req)
 			commitChan <- response{nodeID: nid, resp: resp, err: err}
 		}(nodeID)
 	}
+
+	return commitChan
+}
+
+// waitForRemoteQuorum collects remote commit responses until quorum is achieved or timeout
+func (wc *WriteCoordinator) waitForRemoteQuorum(commitChan chan response, otherPreparedNodes int, remoteQuorumNeeded int, txnID uint64) (map[uint64]*ReplicationResponse, int) {
+	commitResponses := make(map[uint64]*ReplicationResponse)
 
 	// STEP 2: Collect remote commit responses until we have enough for quorum
 	remoteAcks := 0
@@ -306,7 +302,7 @@ func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transacti
 				commitResponses[r.nodeID] = r.resp
 				remoteAcks++
 				log.Debug().
-					Uint64("txn_id", txn.ID).
+					Uint64("txn_id", txnID).
 					Uint64("node_id", r.nodeID).
 					Int("remote_acks", remoteAcks).
 					Int("needed", remoteQuorumNeeded).
@@ -320,7 +316,7 @@ func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transacti
 			}
 		case <-time.After(wc.timeout):
 			log.Warn().
-				Uint64("txn_id", txn.ID).
+				Uint64("txn_id", txnID).
 				Int("remote_acks", remoteAcks).
 				Int("needed", remoteQuorumNeeded).
 				Msg("Commit response timed out waiting for remote nodes")
@@ -331,6 +327,75 @@ func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transacti
 			break
 		}
 	}
+
+	return commitResponses, remoteAcks
+}
+
+// commitLocalAfterRemoteQuorum commits the transaction locally after remote quorum is achieved
+func (wc *WriteCoordinator) commitLocalAfterRemoteQuorum(ctx context.Context, req *ReplicationRequest, txnID uint64) (*ReplicationResponse, error) {
+	// STEP 4: Remote quorum achieved - now commit locally
+	// This MUST succeed since we already PREPARED locally (we promised we can commit)
+	// Note: selfPrepared is guaranteed to be true at this point (checked after PREPARE phase)
+	log.Debug().
+		Uint64("txn_id", txnID).
+		Msg("Remote quorum achieved, committing locally")
+
+	localResp, localErr := wc.localReplicator.ReplicateTransaction(ctx, wc.nodeID, req)
+	if localErr != nil || localResp == nil || !localResp.Success {
+		// This should NEVER happen - we PREPARED successfully, commit must succeed
+		// If it does fail, we have a serious bug in PREPARE phase
+		errMsg := ""
+		if localResp != nil {
+			errMsg = localResp.Error
+		}
+		log.Error().
+			Err(localErr).
+			Str("resp_error", errMsg).
+			Uint64("txn_id", txnID).
+			Msg("CRITICAL: Local commit failed after remote quorum achieved - this indicates a bug in PREPARE")
+		// CRITICAL: Don't abort remotes - they already committed. Return error but data is partially committed.
+		return nil, &PartialCommitError{
+			IsLocal:    true,
+			LocalError: localErr,
+		}
+	}
+
+	return localResp, nil
+}
+
+// runCommitPhase orchestrates the commit phase of 2PC.
+// Quorum of write intents created successfully with no conflicts.
+//
+// CRITICAL: Commit to REMOTE nodes first, wait for quorum-1 ACKs, then commit locally.
+// This ensures if remote quorum fails, coordinator hasn't committed yet (clean abort).
+// After PREPARE ACK, commit MUST succeed (nodes promised they can commit).
+func (wc *WriteCoordinator) runCommitPhase(ctx context.Context, txn *Transaction, cluster *ClusterState, prepResponses map[uint64]*ReplicationResponse) error {
+	commitStart := time.Now()
+	log.Debug().
+		Uint64("txn_id", txn.ID).
+		Int("prepared_nodes", len(prepResponses)).
+		Msg("PREPARE phase complete, starting COMMIT")
+
+	commitReq := wc.buildCommitRequest(txn)
+
+	// Count other prepared nodes (excluding self)
+	otherPreparedNodes := 0
+	for nodeID := range prepResponses {
+		if nodeID != wc.nodeID {
+			otherPreparedNodes++
+		}
+	}
+
+	// Calculate how many remote ACKs we need before committing locally
+	// We need (quorum - 1) from remotes, then local commit gives us quorum
+	// Note: selfPrepared is guaranteed to be true at this point (checked above)
+	remoteQuorumNeeded := cluster.RequiredQuorum - 1 // We'll add local commit after
+
+	// Send commit requests to remote nodes
+	commitChan := wc.sendRemoteCommits(ctx, prepResponses, commitReq, txn.ID)
+
+	// Wait for remote quorum
+	commitResponses, remoteAcks := wc.waitForRemoteQuorum(commitChan, otherPreparedNodes, remoteQuorumNeeded, txn.ID)
 
 	// STEP 3: Check if we got enough remote ACKs
 	if remoteAcks < remoteQuorumNeeded {
@@ -350,36 +415,17 @@ func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transacti
 			Int("remote_commits", len(commitResponses)).
 			Msg("CRITICAL: Remote commit quorum not achieved - partial commit occurred")
 
-		telemetry.TxnTotal.With("write", "failed").Inc()
-		telemetry.TxnDurationSeconds.With("write").Observe(time.Since(txnStart).Seconds())
-		return fmt.Errorf("partial commit: got %d remote commit acks, needed %d (some nodes may have committed)",
-			remoteAcks, remoteQuorumNeeded)
+		return &PartialCommitError{
+			IsLocal:            false,
+			RemoteAcks:         remoteAcks,
+			RemoteQuorumNeeded: remoteQuorumNeeded,
+		}
 	}
 
-	// STEP 4: Remote quorum achieved - now commit locally
-	// This MUST succeed since we already PREPARED locally (we promised we can commit)
-	// Note: selfPrepared is guaranteed to be true at this point (checked after PREPARE phase)
-	log.Debug().
-		Uint64("txn_id", txn.ID).
-		Int("remote_acks", remoteAcks).
-		Msg("Remote quorum achieved, committing locally")
-	localResp, localErr := wc.localReplicator.ReplicateTransaction(ctx, wc.nodeID, commitReq)
-	if localErr != nil || localResp == nil || !localResp.Success {
-		// This should NEVER happen - we PREPARED successfully, commit must succeed
-		// If it does fail, we have a serious bug in PREPARE phase
-		errMsg := ""
-		if localResp != nil {
-			errMsg = localResp.Error
-		}
-		log.Error().
-			Err(localErr).
-			Str("resp_error", errMsg).
-			Uint64("txn_id", txn.ID).
-			Msg("CRITICAL: Local commit failed after remote quorum achieved - this indicates a bug in PREPARE")
-		// CRITICAL: Don't abort remotes - they already committed. Return error but data is partially committed.
-		telemetry.TxnTotal.With("write", "failed").Inc()
-		telemetry.TxnDurationSeconds.With("write").Observe(time.Since(txnStart).Seconds())
-		return fmt.Errorf("partial commit: local commit failed after remote quorum (bug in PREPARE): %v", localErr)
+	// Commit locally after remote quorum
+	localResp, err := wc.commitLocalAfterRemoteQuorum(ctx, commitReq, txn.ID)
+	if err != nil {
+		return err
 	}
 	commitResponses[wc.nodeID] = localResp
 
@@ -390,12 +436,19 @@ func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transacti
 	log.Debug().
 		Uint64("txn_id", txn.ID).
 		Int("total_acks", totalCommitAcks).
-		Int("required", requiredQuorum).
+		Int("required", cluster.RequiredQuorum).
 		Msg("COMMIT phase complete")
 
-	telemetry.TxnTotal.With("write", "success").Inc()
-	telemetry.TxnDurationSeconds.With("write").Observe(time.Since(txnStart).Seconds())
 	return nil
+}
+
+// classifyPrepareError classifies the prepare phase error for telemetry
+func (wc *WriteCoordinator) classifyPrepareError(err error) string {
+	// Check if this is a deadlock error (MySQL code 1213)
+	if mysqlErr, ok := err.(*protocol.MySQLError); ok && mysqlErr.Code == 1213 {
+		return "conflict"
+	}
+	return "failed"
 }
 
 // abortTransaction sends abort message to all replica nodes
@@ -416,10 +469,14 @@ func (wc *WriteCoordinator) abortTransaction(ctx context.Context, nodeIDs []uint
 		go func(nid uint64) {
 			ctx, cancel := context.WithTimeout(context.Background(), abortTimeout)
 			defer cancel()
+			// Best-effort abort: errors are intentionally ignored because:
+			// 1. Abort is fire-and-forget - we cannot recover from abort failures
+			// 2. Nodes that don't receive abort will eventually timeout their prepared state
+			// 3. Anti-entropy will resolve any inconsistencies
 			if nid == wc.nodeID {
-				wc.localReplicator.ReplicateTransaction(ctx, nid, abortReq)
+				_, _ = wc.localReplicator.ReplicateTransaction(ctx, nid, abortReq)
 			} else {
-				wc.replicator.ReplicateTransaction(ctx, nid, abortReq)
+				_, _ = wc.replicator.ReplicateTransaction(ctx, nid, abortReq)
 			}
 		}(nodeID)
 	}
