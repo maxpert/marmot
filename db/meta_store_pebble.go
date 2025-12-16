@@ -4,7 +4,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"sort"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -18,21 +17,23 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-// Key prefixes for Pebble (same as BadgerDB, sorted for efficient iteration)
+// Key prefixes for Pebble - uses binary encoding for numeric IDs (8 bytes per uint64)
+// and 2-byte length prefix for tableName to avoid delimiter issues with binary data
 const (
-	pebblePrefixTxn         = "/txn/"           // /txn/{txnID:016x}
-	pebblePrefixTxnPending  = "/txn_idx/pend/"  // /txn_idx/pend/{txnID:016x}
-	pebblePrefixTxnSeq      = "/txn_idx/seq/"   // /txn_idx/seq/{seqNum:016x}/{txnID:016x}
-	pebblePrefixIntent      = "/intent/"        // /intent/{tableName}/{intentKey}
-	pebblePrefixCDC         = "/cdc/"           // /cdc/{txnID:016x}/{seq:08x}
-	pebblePrefixRepl        = "/repl/"          // /repl/{peerNodeID:016x}/{dbName}
+	pebblePrefixTxn         = "/txn/"           // /txn/{8 bytes txnID}
+	pebblePrefixTxnPending  = "/txn_idx/pend/"  // /txn_idx/pend/{8 bytes txnID}
+	pebblePrefixTxnSeq      = "/txn_idx/seq/"   // /txn_idx/seq/{8 bytes seqNum}{8 bytes txnID}
+	pebblePrefixIntent      = "/intent/"        // /intent/{2 bytes tableNameLen}{tableName}{intentKey}
+	pebblePrefixCDC         = "/cdc/"           // /cdc/{8 bytes txnID}{8 bytes seq}
+	pebblePrefixCDCRaw      = "/cdc/raw/"       // /cdc/raw/{8 bytes txnID}{8 bytes seq}
+	pebblePrefixRepl        = "/repl/"          // /repl/{8 bytes peerNodeID}/{dbName}
 	pebblePrefixSchema      = "/schema/"        // /schema/{dbName}
 	pebblePrefixDDLLock     = "/ddl/"           // /ddl/{dbName}
-	pebblePrefixSeq         = "/seq/"           // /seq/{name}
-	pebblePrefixIntentByTxn = "/intent_txn/"    // /intent_txn/{txnID:016x}/{tableName}/{intentKey}
+	pebblePrefixSeq         = "/seq/"           // /seq/{8 bytes nodeID}
+	pebblePrefixIntentByTxn = "/intent_txn/"    // /intent_txn/{8 bytes txnID}{2 bytes tableNameLen}{tableName}{intentKey}
 	pebblePrefixCounter     = "/meta/"          // /meta/{counterName}
-	pebblePrefixCDCActive   = "/cdc/active/"    // /cdc/active/{tableName}/{intentKey|__ddl__}
-	pebblePrefixCDCTxnLocks = "/cdc/txn_locks/" // /cdc/txn_locks/{txnID:016x}/{tableName}/{intentKey}
+	pebblePrefixCDCActive   = "/cdc/active/"    // /cdc/active/{2 bytes tableNameLen}{tableName}{intentKey|__ddl__}
+	pebblePrefixCDCTxnLocks = "/cdc/txn_locks/" // /cdc/txn_locks/{8 bytes txnID}{2 bytes tableNameLen}{tableName}{intentKey}
 
 	pebbleCDCDDLKeyMarker = "__ddl__" // Sentinel key for DDL locks
 )
@@ -140,20 +141,21 @@ func (s *PebbleMetaStore) rebuildIntentFilter() error {
 // PebbleMetaStoreOptions configures Pebble
 type PebbleMetaStoreOptions struct {
 	// Memory settings (explicit, no mmap surprise)
-	CacheSizeMB    int64 // Block cache size (default: 64MB)
-	MemTableSizeMB int64 // Write buffer size (default: 32MB)
+	CacheSizeMB    int64 // Block cache size (default: 128MB)
+	MemTableSizeMB int64 // Write buffer size (default: 64MB)
 	MemTableCount  int   // Number of memtables (default: 2)
 
 	// Write optimization
 	WALDir             string        // Separate WAL directory (optional)
 	DisableWAL         bool          // Only for testing!
 	WALBytesPerSync    int           // Sync WAL every N bytes (default: 512KB)
-	WALMinSyncInterval time.Duration // Min delay between syncs (default: 0)
+	WALMinSyncInterval time.Duration // Min delay between syncs for group commit (default: 2ms)
 
 	// Compaction (CockroachDB-tested defaults from cfg.Config)
-	L0CompactionThreshold int // L0 files before compaction
-	L0StopWrites          int // L0 files to pause writes
-	MaxConcurrentCompact  int // Parallel compactors (default: 3)
+	L0CompactionThreshold int   // L0 files before compaction
+	L0StopWrites          int   // L0 files to pause writes
+	MaxConcurrentCompact  int   // Parallel compactors (default: 3)
+	LBaseMaxBytes         int64 // Base level compaction target (default: 64MB)
 }
 
 // DefaultPebbleOptions returns Pebble options from cfg.Config.MetaStore.
@@ -165,10 +167,10 @@ func DefaultPebbleOptions() PebbleMetaStoreOptions {
 		MemTableSizeMB:        ms.MemTableSizeMB,
 		MemTableCount:         ms.MemTableCount,
 		WALBytesPerSync:       ms.WALBytesPerSyncKB * 1024,
-		WALMinSyncInterval:    0, // Use Pebble's default
 		L0CompactionThreshold: ms.L0CompactionThreshold,
 		L0StopWrites:          ms.L0StopWrites,
 		MaxConcurrentCompact:  3,
+		LBaseMaxBytes:         64 << 20, // 64MB base level target
 	}
 }
 
@@ -203,6 +205,11 @@ func NewPebbleMetaStore(path string, opts PebbleMetaStoreOptions) (*PebbleMetaSt
 		L0StopWritesThreshold:       opts.L0StopWrites,
 		MaxConcurrentCompactions:    func() int { return opts.MaxConcurrentCompact },
 		Logger:                      &pebbleLogger{},
+	}
+
+	// LBaseMaxBytes controls base level (L1) compaction target
+	if opts.LBaseMaxBytes > 0 {
+		pebbleOpts.LBaseMaxBytes = opts.LBaseMaxBytes
 	}
 
 	// WALMinSyncInterval enables group commit batching (like CockroachDB)
@@ -438,74 +445,219 @@ func (s *AtomicSequence) Close() error {
 // seqBandwidth is the number of sequence numbers to pre-allocate at once
 const pebbleSeqBandwidth = 1000
 
-// Key helper functions
+// Key helper functions - use binary encoding for uint64 (8 bytes vs 16 hex chars)
+// Big-endian preserves lexicographic sort order for range scans
 
 func pebbleTxnKey(txnID uint64) []byte {
-	return []byte(fmt.Sprintf("%s%016x", pebblePrefixTxn, txnID))
+	key := make([]byte, len(pebblePrefixTxn)+8)
+	copy(key, pebblePrefixTxn)
+	binary.BigEndian.PutUint64(key[len(pebblePrefixTxn):], txnID)
+	return key
 }
 
 func pebbleTxnPendingKey(txnID uint64) []byte {
-	return []byte(fmt.Sprintf("%s%016x", pebblePrefixTxnPending, txnID))
+	key := make([]byte, len(pebblePrefixTxnPending)+8)
+	copy(key, pebblePrefixTxnPending)
+	binary.BigEndian.PutUint64(key[len(pebblePrefixTxnPending):], txnID)
+	return key
 }
 
 func pebbleTxnSeqKey(seqNum, txnID uint64) []byte {
-	return []byte(fmt.Sprintf("%s%016x/%016x", pebblePrefixTxnSeq, seqNum, txnID))
+	key := make([]byte, len(pebblePrefixTxnSeq)+16)
+	copy(key, pebblePrefixTxnSeq)
+	binary.BigEndian.PutUint64(key[len(pebblePrefixTxnSeq):], seqNum)
+	binary.BigEndian.PutUint64(key[len(pebblePrefixTxnSeq)+8:], txnID)
+	return key
 }
 
+// pebbleIntentKey uses 2-byte length prefix for tableName (intentKey can contain any bytes)
 func pebbleIntentKey(tableName, intentKey string) []byte {
-	return []byte(fmt.Sprintf("%s%s/%s", pebblePrefixIntent, tableName, intentKey))
+	key := make([]byte, len(pebblePrefixIntent)+2+len(tableName)+len(intentKey))
+	n := copy(key, pebblePrefixIntent)
+	binary.BigEndian.PutUint16(key[n:], uint16(len(tableName)))
+	n += 2
+	n += copy(key[n:], tableName)
+	copy(key[n:], intentKey)
+	return key
 }
 
+// parseIntentKey extracts tableName and intentKey from an intent key
+func parseIntentKey(key []byte) (tableName, intentKey string, ok bool) {
+	offset := len(pebblePrefixIntent)
+	if len(key) < offset+2 {
+		return "", "", false
+	}
+	tableNameLen := int(binary.BigEndian.Uint16(key[offset:]))
+	offset += 2
+	if len(key) < offset+tableNameLen {
+		return "", "", false
+	}
+	tableName = string(key[offset : offset+tableNameLen])
+	intentKey = string(key[offset+tableNameLen:])
+	return tableName, intentKey, true
+}
+
+// pebbleIntentByTxnKey uses 2-byte length prefix for tableName
 func pebbleIntentByTxnKey(txnID uint64, tableName, intentKey string) []byte {
-	return []byte(fmt.Sprintf("%s%016x/%s/%s", pebblePrefixIntentByTxn, txnID, tableName, intentKey))
+	key := make([]byte, len(pebblePrefixIntentByTxn)+8+2+len(tableName)+len(intentKey))
+	n := copy(key, pebblePrefixIntentByTxn)
+	binary.BigEndian.PutUint64(key[n:], txnID)
+	n += 8
+	binary.BigEndian.PutUint16(key[n:], uint16(len(tableName)))
+	n += 2
+	n += copy(key[n:], tableName)
+	copy(key[n:], intentKey)
+	return key
+}
+
+func pebbleIntentByTxnPrefix(txnID uint64) []byte {
+	key := make([]byte, len(pebblePrefixIntentByTxn)+8)
+	copy(key, pebblePrefixIntentByTxn)
+	binary.BigEndian.PutUint64(key[len(pebblePrefixIntentByTxn):], txnID)
+	return key
+}
+
+// parseIntentByTxnKey extracts tableName and intentKey from an intentByTxn index key
+func parseIntentByTxnKey(key []byte, prefixLen int) (tableName, intentKey string, ok bool) {
+	offset := prefixLen
+	if len(key) < offset+2 {
+		return "", "", false
+	}
+	tableNameLen := int(binary.BigEndian.Uint16(key[offset:]))
+	offset += 2
+	if len(key) < offset+tableNameLen {
+		return "", "", false
+	}
+	tableName = string(key[offset : offset+tableNameLen])
+	intentKey = string(key[offset+tableNameLen:])
+	return tableName, intentKey, true
 }
 
 func pebbleCdcKey(txnID, seq uint64) []byte {
-	return []byte(fmt.Sprintf("%s%016x/%08x", pebblePrefixCDC, txnID, seq))
+	key := make([]byte, len(pebblePrefixCDC)+16)
+	copy(key, pebblePrefixCDC)
+	binary.BigEndian.PutUint64(key[len(pebblePrefixCDC):], txnID)
+	binary.BigEndian.PutUint64(key[len(pebblePrefixCDC)+8:], seq)
+	return key
 }
 
 func pebbleCdcPrefix(txnID uint64) []byte {
-	return []byte(fmt.Sprintf("%s%016x/", pebblePrefixCDC, txnID))
+	key := make([]byte, len(pebblePrefixCDC)+8)
+	copy(key, pebblePrefixCDC)
+	binary.BigEndian.PutUint64(key[len(pebblePrefixCDC):], txnID)
+	return key
+}
+
+func pebbleCdcRawKey(txnID, seq uint64) []byte {
+	key := make([]byte, len(pebblePrefixCDCRaw)+16)
+	copy(key, pebblePrefixCDCRaw)
+	binary.BigEndian.PutUint64(key[len(pebblePrefixCDCRaw):], txnID)
+	binary.BigEndian.PutUint64(key[len(pebblePrefixCDCRaw)+8:], seq)
+	return key
+}
+
+func pebbleCdcRawPrefix(txnID uint64) []byte {
+	key := make([]byte, len(pebblePrefixCDCRaw)+8)
+	copy(key, pebblePrefixCDCRaw)
+	binary.BigEndian.PutUint64(key[len(pebblePrefixCDCRaw):], txnID)
+	return key
 }
 
 func pebbleReplKey(peerNodeID uint64, dbName string) []byte {
-	return []byte(fmt.Sprintf("%s%016x/%s", pebblePrefixRepl, peerNodeID, dbName))
+	key := make([]byte, len(pebblePrefixRepl)+8+1+len(dbName))
+	n := copy(key, pebblePrefixRepl)
+	binary.BigEndian.PutUint64(key[n:], peerNodeID)
+	n += 8
+	key[n] = '/'
+	copy(key[n+1:], dbName)
+	return key
 }
 
 func pebbleSchemaKey(dbName string) []byte {
-	return []byte(fmt.Sprintf("%s%s", pebblePrefixSchema, dbName))
+	key := make([]byte, len(pebblePrefixSchema)+len(dbName))
+	copy(key, pebblePrefixSchema)
+	copy(key[len(pebblePrefixSchema):], dbName)
+	return key
 }
 
 func pebbleDdlLockKey(dbName string) []byte {
-	return []byte(fmt.Sprintf("%s%s", pebblePrefixDDLLock, dbName))
+	key := make([]byte, len(pebblePrefixDDLLock)+len(dbName))
+	copy(key, pebblePrefixDDLLock)
+	copy(key[len(pebblePrefixDDLLock):], dbName)
+	return key
 }
 
 func pebbleSeqKey(nodeID uint64) []byte {
-	return []byte(fmt.Sprintf("%s%016x", pebblePrefixSeq, nodeID))
+	key := make([]byte, len(pebblePrefixSeq)+8)
+	copy(key, pebblePrefixSeq)
+	binary.BigEndian.PutUint64(key[len(pebblePrefixSeq):], nodeID)
+	return key
 }
 
+// pebbleCDCActiveIntentKey uses 2-byte length prefix for tableName
 func pebbleCDCActiveIntentKey(tableName, intentKey string) []byte {
-	return []byte(fmt.Sprintf("%s%s/%s", pebblePrefixCDCActive, tableName, intentKey))
+	key := make([]byte, len(pebblePrefixCDCActive)+2+len(tableName)+len(intentKey))
+	n := copy(key, pebblePrefixCDCActive)
+	binary.BigEndian.PutUint16(key[n:], uint16(len(tableName)))
+	n += 2
+	n += copy(key[n:], tableName)
+	copy(key[n:], intentKey)
+	return key
 }
 
 func pebbleCDCActiveDDLKey(tableName string) []byte {
-	return []byte(fmt.Sprintf("%s%s/%s", pebblePrefixCDCActive, tableName, pebbleCDCDDLKeyMarker))
+	key := make([]byte, len(pebblePrefixCDCActive)+2+len(tableName)+len(pebbleCDCDDLKeyMarker))
+	n := copy(key, pebblePrefixCDCActive)
+	binary.BigEndian.PutUint16(key[n:], uint16(len(tableName)))
+	n += 2
+	n += copy(key[n:], tableName)
+	copy(key[n:], pebbleCDCDDLKeyMarker)
+	return key
 }
 
 func pebbleCDCActiveTablePrefix(tableName string) []byte {
-	return []byte(fmt.Sprintf("%s%s/", pebblePrefixCDCActive, tableName))
+	key := make([]byte, len(pebblePrefixCDCActive)+2+len(tableName))
+	n := copy(key, pebblePrefixCDCActive)
+	binary.BigEndian.PutUint16(key[n:], uint16(len(tableName)))
+	n += 2
+	copy(key[n:], tableName)
+	return key
 }
 
-// pebbleCDCTxnLockKey returns the reverse index key for a CDC row lock
-// Format: /cdc/txn_locks/{txnID:016x}/{tableName}/{intentKey}
+// pebbleCDCTxnLockKey uses 2-byte length prefix for tableName
 func pebbleCDCTxnLockKey(txnID uint64, tableName, intentKey string) []byte {
-	return []byte(fmt.Sprintf("%s%016x/%s/%s", pebblePrefixCDCTxnLocks, txnID, tableName, intentKey))
+	key := make([]byte, len(pebblePrefixCDCTxnLocks)+8+2+len(tableName)+len(intentKey))
+	n := copy(key, pebblePrefixCDCTxnLocks)
+	binary.BigEndian.PutUint64(key[n:], txnID)
+	n += 8
+	binary.BigEndian.PutUint16(key[n:], uint16(len(tableName)))
+	n += 2
+	n += copy(key[n:], tableName)
+	copy(key[n:], intentKey)
+	return key
 }
 
-// pebbleCDCTxnLockPrefix returns the prefix for all locks held by a transaction
-// Format: /cdc/txn_locks/{txnID:016x}/
 func pebbleCDCTxnLockPrefix(txnID uint64) []byte {
-	return []byte(fmt.Sprintf("%s%016x/", pebblePrefixCDCTxnLocks, txnID))
+	key := make([]byte, len(pebblePrefixCDCTxnLocks)+8)
+	copy(key, pebblePrefixCDCTxnLocks)
+	binary.BigEndian.PutUint64(key[len(pebblePrefixCDCTxnLocks):], txnID)
+	return key
+}
+
+// parseCDCTxnLockKey extracts tableName and intentKey from a CDC txn lock key
+func parseCDCTxnLockKey(key []byte, prefixLen int) (tableName, intentKey string, ok bool) {
+	offset := prefixLen
+	if len(key) < offset+2 {
+		return "", "", false
+	}
+	tableNameLen := int(binary.BigEndian.Uint16(key[offset:]))
+	offset += 2
+	if len(key) < offset+tableNameLen {
+		return "", "", false
+	}
+	tableName = string(key[offset : offset+tableNameLen])
+	intentKey = string(key[offset+tableNameLen:])
+	return tableName, intentKey, true
 }
 
 // prefixUpperBound returns prefix + 0xFF... for range iteration
@@ -770,9 +922,11 @@ func (s *PebbleMetaStore) GetPendingTransactions() ([]*TransactionRecord, error)
 	defer iter.Close()
 
 	for iter.SeekGE(prefix); iter.Valid(); iter.Next() {
-		keyStr := string(iter.Key())
-		var txnID uint64
-		_, _ = fmt.Sscanf(keyStr[len(pebblePrefixTxnPending):], "%016x", &txnID)
+		key := iter.Key()
+		if len(key) < len(pebblePrefixTxnPending)+8 {
+			continue
+		}
+		txnID := binary.BigEndian.Uint64(key[len(pebblePrefixTxnPending):])
 
 		rec, err := s.GetTransaction(txnID)
 		if err == nil && rec != nil && rec.Status == TxnStatusPending {
@@ -812,13 +966,6 @@ func (s *PebbleMetaStore) WriteIntent(txnID uint64, intentType IntentType, table
 	mu := s.intentLockFor(tableName, intentKey)
 	mu.Lock()
 	defer mu.Unlock()
-
-	// Update heartbeat to prevent GC from killing active transactions during 2PC
-	// This is critical: WriteIntent can block waiting for locks, and without heartbeat
-	// updates, GC may incorrectly clean up transactions that are actively being processed
-	if err := s.Heartbeat(txnID); err != nil {
-		log.Warn().Err(err).Uint64("txn_id", txnID).Msg("Failed to update heartbeat during write")
-	}
 
 	tbHash := ComputeIntentHash(tableName, intentKey)
 
@@ -1099,7 +1246,7 @@ func (s *PebbleMetaStore) DeleteIntent(tableName, intentKey string, txnID uint64
 
 // DeleteIntentsByTxn removes all write intents for a transaction
 func (s *PebbleMetaStore) DeleteIntentsByTxn(txnID uint64) error {
-	prefix := []byte(fmt.Sprintf("%s%016x/", pebblePrefixIntentByTxn, txnID))
+	prefix := pebbleIntentByTxnPrefix(txnID)
 
 	// Collect keys to delete
 	var primaryKeys [][]byte
@@ -1118,12 +1265,10 @@ func (s *PebbleMetaStore) DeleteIntentsByTxn(txnID uint64) error {
 		copy(indexKey, iter.Key())
 		indexKeys = append(indexKeys, indexKey)
 
-		// Parse table/intentKey from index key
-		keyStr := string(indexKey)
-		suffix := keyStr[len(fmt.Sprintf("%s%016x/", pebblePrefixIntentByTxn, txnID)):]
-		parts := strings.SplitN(suffix, "/", 2)
-		if len(parts) == 2 {
-			primaryKeys = append(primaryKeys, pebbleIntentKey(parts[0], parts[1]))
+		// Parse table/intentKey from index key using length-prefixed format
+		tableName, intentKey, ok := parseIntentByTxnKey(indexKey, len(prefix))
+		if ok {
+			primaryKeys = append(primaryKeys, pebbleIntentKey(tableName, intentKey))
 		}
 	}
 	if err := iter.Close(); err != nil {
@@ -1160,7 +1305,7 @@ func (s *PebbleMetaStore) DeleteIntentsByTxn(txnID uint64) error {
 
 // MarkIntentsForCleanup marks all intents for a transaction as ready for overwrite
 func (s *PebbleMetaStore) MarkIntentsForCleanup(txnID uint64) error {
-	prefix := []byte(fmt.Sprintf("%s%016x/", pebblePrefixIntentByTxn, txnID))
+	prefix := pebbleIntentByTxnPrefix(txnID)
 
 	// Collect primary intent keys
 	var primaryKeys [][]byte
@@ -1174,11 +1319,9 @@ func (s *PebbleMetaStore) MarkIntentsForCleanup(txnID uint64) error {
 	}
 
 	for iter.SeekGE(prefix); iter.Valid(); iter.Next() {
-		keyStr := string(iter.Key())
-		suffix := keyStr[len(fmt.Sprintf("%s%016x/", pebblePrefixIntentByTxn, txnID)):]
-		parts := strings.SplitN(suffix, "/", 2)
-		if len(parts) == 2 {
-			primaryKeys = append(primaryKeys, pebbleIntentKey(parts[0], parts[1]))
+		tableName, intentKey, ok := parseIntentByTxnKey(iter.Key(), len(prefix))
+		if ok {
+			primaryKeys = append(primaryKeys, pebbleIntentKey(tableName, intentKey))
 		}
 	}
 	if err := iter.Close(); err != nil {
@@ -1227,7 +1370,7 @@ func (s *PebbleMetaStore) MarkIntentsForCleanup(txnID uint64) error {
 // GetIntentsByTxn retrieves all write intents for a transaction
 func (s *PebbleMetaStore) GetIntentsByTxn(txnID uint64) ([]*WriteIntentRecord, error) {
 	var intents []*WriteIntentRecord
-	prefix := []byte(fmt.Sprintf("%s%016x/", pebblePrefixIntentByTxn, txnID))
+	prefix := pebbleIntentByTxnPrefix(txnID)
 
 	iter, err := s.db.NewIter(&pebble.IterOptions{
 		LowerBound: prefix,
@@ -1239,15 +1382,13 @@ func (s *PebbleMetaStore) GetIntentsByTxn(txnID uint64) ([]*WriteIntentRecord, e
 	defer iter.Close()
 
 	for iter.SeekGE(prefix); iter.Valid(); iter.Next() {
-		keyStr := string(iter.Key())
-		suffix := keyStr[len(fmt.Sprintf("%s%016x/", pebblePrefixIntentByTxn, txnID)):]
-		parts := strings.SplitN(suffix, "/", 2)
-		if len(parts) != 2 {
+		tableName, intentKey, ok := parseIntentByTxnKey(iter.Key(), len(prefix))
+		if !ok {
 			continue
 		}
 
 		// Fetch primary intent
-		primaryKey := pebbleIntentKey(parts[0], parts[1])
+		primaryKey := pebbleIntentKey(tableName, intentKey)
 		val, closer, err := s.db.Get(primaryKey)
 		if err != nil {
 			continue
@@ -1551,11 +1692,6 @@ func (s *PebbleMetaStore) ReleaseDDLLock(dbName string, nodeID uint64) error {
 
 // WriteIntentEntry writes a CDC intent entry
 func (s *PebbleMetaStore) WriteIntentEntry(txnID, seq uint64, op uint8, table, intentKey string, oldVals, newVals []byte) error {
-	// Update heartbeat to prevent GC from killing active transactions during 2PC
-	if err := s.Heartbeat(txnID); err != nil {
-		log.Warn().Err(err).Uint64("txn_id", txnID).Msg("Failed to update heartbeat during write")
-	}
-
 	entry := &IntentEntry{
 		TxnID:     txnID,
 		Seq:       seq,
@@ -1691,6 +1827,148 @@ func (s *PebbleMetaStore) DeleteIntentEntries(txnID uint64) error {
 	return batch.Commit(pebble.NoSync)
 }
 
+// WriteCapturedRow stores a raw captured row during hook callback.
+// This is the fast path - just store bytes with minimal processing.
+// Data is pre-serialized by the caller (CapturedRow msgpack).
+func (s *PebbleMetaStore) WriteCapturedRow(txnID, seq uint64, data []byte) error {
+	key := pebbleCdcRawKey(txnID, seq)
+	return s.db.Set(key, data, pebble.NoSync)
+}
+
+// pebbleCapturedRowCursor implements CapturedRowCursor for Pebble
+type pebbleCapturedRowCursor struct {
+	iter    *pebble.Iterator
+	txnID   uint64
+	started bool
+	seq     uint64
+	data    []byte
+	err     error
+}
+
+// Next advances to the next row
+func (c *pebbleCapturedRowCursor) Next() bool {
+	if c.err != nil || c.iter == nil {
+		return false
+	}
+
+	if !c.started {
+		c.started = true
+		if !c.iter.First() {
+			c.err = c.iter.Error()
+			return false
+		}
+	} else {
+		if !c.iter.Next() {
+			c.err = c.iter.Error()
+			return false
+		}
+	}
+
+	if !c.iter.Valid() {
+		return false
+	}
+
+	// Extract seq from key (binary format): prefix + 8 bytes txnID + 8 bytes seq
+	key := c.iter.Key()
+	expectedLen := len(pebblePrefixCDCRaw) + 16
+	if len(key) < expectedLen {
+		// Skip malformed keys
+		return c.Next()
+	}
+	c.seq = binary.BigEndian.Uint64(key[len(pebblePrefixCDCRaw)+8:])
+
+	val, err := c.iter.ValueAndErr()
+	if err != nil {
+		c.err = err
+		return false
+	}
+
+	// Copy data since iter.Value() is only valid until Next()
+	c.data = make([]byte, len(val))
+	copy(c.data, val)
+
+	return true
+}
+
+// Row returns current row's seq and data
+func (c *pebbleCapturedRowCursor) Row() (uint64, []byte) {
+	return c.seq, c.data
+}
+
+// Err returns any iteration error
+func (c *pebbleCapturedRowCursor) Err() error {
+	return c.err
+}
+
+// Close releases the iterator
+func (c *pebbleCapturedRowCursor) Close() error {
+	if c.iter != nil {
+		return c.iter.Close()
+	}
+	return nil
+}
+
+// IterateCapturedRows returns a cursor over raw captured rows for a transaction.
+func (s *PebbleMetaStore) IterateCapturedRows(txnID uint64) (CapturedRowCursor, error) {
+	prefix := pebbleCdcRawPrefix(txnID)
+
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: prefix,
+		UpperBound: prefixUpperBound(prefix),
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return &pebbleCapturedRowCursor{
+		iter:  iter,
+		txnID: txnID,
+	}, nil
+}
+
+// DeleteCapturedRow deletes a single captured row after processing.
+func (s *PebbleMetaStore) DeleteCapturedRow(txnID, seq uint64) error {
+	key := pebbleCdcRawKey(txnID, seq)
+	return s.db.Delete(key, pebble.NoSync)
+}
+
+// DeleteCapturedRows deletes all raw captured rows for a transaction.
+// Called after ProcessCapturedRows completes.
+func (s *PebbleMetaStore) DeleteCapturedRows(txnID uint64) error {
+	prefix := pebbleCdcRawPrefix(txnID)
+	var keys [][]byte
+
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: prefix,
+		UpperBound: prefixUpperBound(prefix),
+	})
+	if err != nil {
+		return err
+	}
+
+	for iter.SeekGE(prefix); iter.Valid(); iter.Next() {
+		key := make([]byte, len(iter.Key()))
+		copy(key, iter.Key())
+		keys = append(keys, key)
+	}
+	if err := iter.Close(); err != nil {
+		return err
+	}
+
+	if len(keys) == 0 {
+		return nil
+	}
+
+	batch := s.db.NewBatch()
+	defer batch.Close()
+
+	for _, key := range keys {
+		_ = batch.Delete(key, nil)
+	}
+
+	return batch.Commit(pebble.NoSync)
+}
+
 // CleanupStaleTransactions aborts transactions that haven't had a heartbeat within the timeout
 func (s *PebbleMetaStore) CleanupStaleTransactions(timeout time.Duration) (int, error) {
 	// Check if store is closed - return early to avoid pebble: closed panic
@@ -1714,9 +1992,11 @@ func (s *PebbleMetaStore) CleanupStaleTransactions(timeout time.Duration) (int, 
 	}
 
 	for iter.SeekGE(prefix); iter.Valid(); iter.Next() {
-		keyStr := string(iter.Key())
-		var txnID uint64
-		_, _ = fmt.Sscanf(keyStr[len(pebblePrefixTxnPending):], "%016x", &txnID)
+		key := iter.Key()
+		if len(key) < len(pebblePrefixTxnPending)+8 {
+			continue
+		}
+		txnID := binary.BigEndian.Uint64(key[len(pebblePrefixTxnPending):])
 
 		rec, err := s.GetTransaction(txnID)
 		if err != nil || rec == nil {
@@ -1989,12 +2269,11 @@ func (s *PebbleMetaStore) GetMaxSeqNum() (uint64, error) {
 	}
 	defer iter.Close()
 
-	// Go to last key in range
+	// Go to last key in range (key format: prefix + 8 bytes seqNum + 8 bytes txnID)
 	if iter.Last() {
-		keyStr := string(iter.Key())
-		parts := strings.Split(keyStr[len(pebblePrefixTxnSeq):], "/")
-		if len(parts) >= 1 {
-			_, _ = fmt.Sscanf(parts[0], "%016x", &maxSeq)
+		key := iter.Key()
+		if len(key) >= len(pebblePrefixTxnSeq)+8 {
+			maxSeq = binary.BigEndian.Uint64(key[len(pebblePrefixTxnSeq):])
 		}
 	}
 
@@ -2058,15 +2337,14 @@ func (s *PebbleMetaStore) ScanTransactions(fromTxnID uint64, descending bool, ca
 	}
 
 	for valid() {
-		keyStr := string(iter.Key())
-		parts := strings.Split(keyStr[len(pebblePrefixTxnSeq):], "/")
-		if len(parts) != 2 {
+		key := iter.Key()
+		// Key format: prefix + 8 bytes seqNum + 8 bytes txnID
+		if len(key) < len(pebblePrefixTxnSeq)+16 {
 			advance()
 			continue
 		}
 
-		var txnID uint64
-		_, _ = fmt.Sscanf(parts[1], "%016x", &txnID)
+		txnID := binary.BigEndian.Uint64(key[len(pebblePrefixTxnSeq)+8:])
 
 		// Filter by fromTxnID based on direction
 		if descending {
@@ -2103,6 +2381,11 @@ func (s *PebbleMetaStore) ScanTransactions(fromTxnID uint64, descending bool, ca
 // Returns ErrCDCRowLocked if the row is already locked by a different transaction.
 // Same transaction can re-acquire (idempotent).
 func (s *PebbleMetaStore) AcquireCDCRowLock(txnID uint64, tableName, intentKey string) error {
+	// Sharded lock prevents TOCTOU race between check and write
+	mu := s.intentLockFor(tableName, intentKey)
+	mu.Lock()
+	defer mu.Unlock()
+
 	key := pebbleCDCActiveIntentKey(tableName, intentKey)
 
 	// Check if lock exists
@@ -2125,8 +2408,7 @@ func (s *PebbleMetaStore) AcquireCDCRowLock(txnID uint64, tableName, intentKey s
 		return err
 	}
 
-	// No lock exists or same txn - acquire/update it
-	// Write both forward and reverse index in batch
+	// No lock exists - acquire it
 	buf := make([]byte, 8)
 	binary.BigEndian.PutUint64(buf, txnID)
 
@@ -2150,6 +2432,11 @@ func (s *PebbleMetaStore) AcquireCDCRowLock(txnID uint64, tableName, intentKey s
 // ReleaseCDCRowLock releases a row-level lock if held by the specified txnID.
 // Idempotent - no error if already released.
 func (s *PebbleMetaStore) ReleaseCDCRowLock(tableName, intentKey string, txnID uint64) error {
+	// Sharded lock prevents TOCTOU race between check and delete
+	mu := s.intentLockFor(tableName, intentKey)
+	mu.Lock()
+	defer mu.Unlock()
+
 	key := pebbleCDCActiveIntentKey(tableName, intentKey)
 
 	// Check if lock exists and belongs to this txn
@@ -2161,9 +2448,8 @@ func (s *PebbleMetaStore) ReleaseCDCRowLock(tableName, intentKey string, txnID u
 		return err
 	}
 
-	var existingTxnID uint64
 	if len(val) >= 8 {
-		existingTxnID = binary.BigEndian.Uint64(val)
+		existingTxnID := binary.BigEndian.Uint64(val)
 		if existingTxnID != txnID {
 			closer.Close()
 			return nil // Lock held by different txn - don't release
@@ -2175,12 +2461,10 @@ func (s *PebbleMetaStore) ReleaseCDCRowLock(tableName, intentKey string, txnID u
 	batch := s.db.NewBatch()
 	defer batch.Close()
 
-	// Forward index
 	if err := batch.Delete(key, nil); err != nil {
 		return err
 	}
 
-	// Reverse index
 	reverseKey := pebbleCDCTxnLockKey(txnID, tableName, intentKey)
 	if err := batch.Delete(reverseKey, nil); err != nil {
 		return err
@@ -2205,23 +2489,15 @@ func (s *PebbleMetaStore) ReleaseCDCRowLocksByTxn(txnID uint64) error {
 	batch := s.db.NewBatch()
 	defer batch.Close()
 
-	// Compute prefix length once (prefix is /cdc/txn_locks/{txnID:016x}/)
-	prefixLen := len(prefix)
 	lockCount := 0
 
 	// Iterate over reverse index entries for this txn
 	for iter.SeekGE(prefix); iter.Valid(); iter.Next() {
-		// Parse table/intentKey from reverse key: /cdc/txn_locks/{txnID}/{table}/{intentKey}
-		keyStr := string(iter.Key())
-		suffix := keyStr[prefixLen:]
-
-		// Find first slash to separate table from intentKey
-		slashIdx := strings.Index(suffix, "/")
-		if slashIdx == -1 {
+		// Parse table/intentKey from reverse key using length-prefixed format
+		tableName, intentKey, ok := parseCDCTxnLockKey(iter.Key(), len(prefix))
+		if !ok {
 			continue // Malformed key, skip
 		}
-		tableName := suffix[:slashIdx]
-		intentKey := suffix[slashIdx+1:]
 
 		// Delete forward index key
 		forwardKey := pebbleCDCActiveIntentKey(tableName, intentKey)

@@ -417,15 +417,32 @@ func (dm *DatabaseManager) ReopenDatabase(name string) error {
 		return fmt.Errorf("failed to get database path: %w", err)
 	}
 
-	// Create MetaStore for this database
 	fullPath := filepath.Join(dm.dataDir, dbPath)
+
+	// Get old MetaStore and close it FIRST to release PebbleDB lock
+	// This must happen before creating the new MetaStore
+	oldMetaStore := oldDB.GetMetaStore()
+
+	// Close old database and MetaStore synchronously (we hold the mutex, so no new queries can start)
+	log.Info().Str("name", name).Msg("Closing old database for snapshot reload")
+	if err := oldDB.Close(); err != nil {
+		log.Warn().Err(err).Str("name", name).Msg("Error closing old database connection")
+	}
+	if oldMetaStore != nil {
+		if err := oldMetaStore.Close(); err != nil {
+			dm.mu.Unlock()
+			return fmt.Errorf("failed to close old meta store for %s: %w", name, err)
+		}
+	}
+
+	// Now create new MetaStore (PebbleDB lock is released)
 	metaStore, err := NewMetaStore(fullPath)
 	if err != nil {
 		dm.mu.Unlock()
 		return fmt.Errorf("failed to create meta store for %s: %w", name, err)
 	}
 
-	// Create new database connection FIRST (before closing old one)
+	// Create new database connection
 	newDB, err := NewReplicatedDatabase(fullPath, dm.nodeID, dm.clock, metaStore)
 	if err != nil {
 		metaStore.Close()
@@ -436,29 +453,11 @@ func (dm *DatabaseManager) ReopenDatabase(name string) error {
 	// Wire up GC coordination for new connection
 	dm.wireGCCoordination(newDB, name)
 
-	// Get old MetaStore before swap
-	oldMetaStore := oldDB.GetMetaStore()
-
 	// Atomically swap in the new connection
 	dm.databases[name] = newDB
 	dm.mu.Unlock()
 
 	log.Info().Str("name", name).Msg("Database connection swapped after snapshot")
-
-	// Close old database in background after delay to let in-flight queries complete
-	// Most SQLite queries complete within 5 seconds (busy_timeout is 50s but that's worst case)
-	go func() {
-		time.Sleep(5 * time.Second)
-		log.Info().Str("name", name).Msg("Closing old database connection after swap delay")
-		if err := oldDB.Close(); err != nil {
-			log.Warn().Err(err).Str("name", name).Msg("Error closing old database connection")
-		}
-		if oldMetaStore != nil {
-			if err := oldMetaStore.Close(); err != nil {
-				log.Warn().Err(err).Str("name", name).Msg("Error closing old meta store")
-			}
-		}
-	}()
 
 	return nil
 }

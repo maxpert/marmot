@@ -6,9 +6,7 @@ package db
 import (
 	"context"
 	"database/sql"
-	"database/sql/driver"
 	"fmt"
-	"io"
 	"strings"
 	"sync"
 
@@ -18,190 +16,52 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-// OpInsertInt, OpUpdateInt, OpDeleteInt are defined in meta_schema.go
-// to be available regardless of build tags
+// =============================================================================
+// Types
+// =============================================================================
 
-// interfacePtrPool pools *interface{} values to reduce allocations in hookCallback.
-// Each row modification needs N pointers where N = column count.
-var interfacePtrPool = sync.Pool{
-	New: func() interface{} {
-		v := new(interface{})
-		return v
-	},
-}
-
-// TableSchema represents a lightweight schema for CDC hooks.
-// Contains only the minimal information needed for preupdate hook callbacks.
-type TableSchema struct {
-	Columns     []string
-	PrimaryKeys []string
-	PKIndices   []int
-}
-
-// SchemaCache provides thread-safe caching of table schemas.
-// Schemas are loaded from DB via Reload() and accessed via GetSchemaFor().
-type SchemaCache struct {
-	mu    sync.RWMutex
-	cache map[string]*TableSchema
-}
-
-// NewSchemaCache creates a new schema cache
-func NewSchemaCache() *SchemaCache {
-	return &SchemaCache{
-		cache: make(map[string]*TableSchema),
-	}
-}
-
-// GetSchemaFor returns the cached schema for a table.
-// Returns error if schema is not cached.
-func (c *SchemaCache) GetSchemaFor(tableName string) (*TableSchema, error) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	schema, ok := c.cache[tableName]
-	if !ok {
-		return nil, ErrSchemaCacheMiss{Table: tableName}
-	}
-	return schema, nil
-}
-
-// Reload reloads all table schemas from the database connection.
-// This should be called after DDL operations or snapshot apply.
-func (c *SchemaCache) Reload(conn *sqlite3.SQLiteConn) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	// Get list of all user tables (exclude internal tables)
-	rows, err := conn.Query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE '__marmot%'", nil)
-	if err != nil {
-		return fmt.Errorf("failed to query tables: %w", err)
-	}
-	defer rows.Close()
-
-	var tableNames []string
-	dest := make([]driver.Value, 1)
-	for {
-		if err := rows.Next(dest); err != nil {
-			if err == io.EOF {
-				break
-			}
-			return fmt.Errorf("failed to read table names: %w", err)
-		}
-		if name, ok := dest[0].(string); ok {
-			tableNames = append(tableNames, name)
-		}
-	}
-
-	// Load schema for each table
-	newCache := make(map[string]*TableSchema)
-	for _, tableName := range tableNames {
-		schema, err := loadSchema(conn, tableName)
-		if err != nil {
-			log.Warn().Err(err).Str("table", tableName).Msg("Failed to load schema during reload")
-			continue
-		}
-		newCache[tableName] = schema
-	}
-
-	// Replace cache atomically
-	c.cache = newCache
-	log.Debug().Int("tables", len(newCache)).Msg("SchemaCache reloaded")
-	return nil
-}
-
-// Clear clears all cached schemas.
-// Used when database connections are closed or invalid.
-func (c *SchemaCache) Clear() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.cache = make(map[string]*TableSchema)
-}
-
-// LoadTable loads schema for a single table into the cache.
-// Used by tests and for on-demand schema loading.
-func (c *SchemaCache) LoadTable(conn *sqlite3.SQLiteConn, tableName string) error {
-	schema, err := loadSchema(conn, tableName)
-	if err != nil {
-		return err
-	}
-
-	c.mu.Lock()
-	c.cache[tableName] = schema
-	c.mu.Unlock()
-
-	return nil
-}
-
-// Update directly updates the cache with a schema.
-// Used by tests for manual schema setup.
-func (c *SchemaCache) Update(tableName string, schema *TableSchema) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.cache[tableName] = schema
-}
-
-// loadSchema fetches schema from DB using the raw SQLite connection
-func loadSchema(conn *sqlite3.SQLiteConn, tableName string) (*TableSchema, error) {
-	rows, err := conn.Query(fmt.Sprintf("PRAGMA table_info(%s)", tableName), nil)
-	if err != nil {
-		return nil, fmt.Errorf("query table_info: %w", err)
-	}
-	defer rows.Close()
-
-	schema := &TableSchema{
-		Columns:     make([]string, 0),
-		PrimaryKeys: make([]string, 0),
-		PKIndices:   make([]int, 0),
-	}
-
-	// table_info returns: cid, name, type, notnull, dflt_value, pk
-	dest := make([]driver.Value, 6)
-	colIndex := 0
-	for {
-		if err := rows.Next(dest); err != nil {
-			if err == io.EOF {
-				break
-			}
-			return nil, fmt.Errorf("read table_info row: %w", err)
-		}
-
-		name, _ := dest[1].(string)
-		pk, _ := dest[5].(int64)
-
-		schema.Columns = append(schema.Columns, name)
-		if pk > 0 {
-			schema.PrimaryKeys = append(schema.PrimaryKeys, name)
-			schema.PKIndices = append(schema.PKIndices, colIndex)
-		}
-		colIndex++
-	}
-
-	// If no PK columns found, assume rowid is the PK
-	if len(schema.PrimaryKeys) == 0 {
-		schema.PrimaryKeys = []string{"rowid"}
-		schema.PKIndices = []int{-1} // -1 indicates rowid
-	}
-
-	return schema, nil
+// CapturedRow stores raw row data captured during hookCallback.
+// This is a raw copy of sqlite3.SQLitePreUpdateData - no processing.
+type CapturedRow struct {
+	Table     string        `msgpack:"t"`
+	Op        int           `msgpack:"o"` // Raw sqlite3 op (18=INSERT, 23=UPDATE, 9=DELETE)
+	OldRowID  int64         `msgpack:"or"`
+	NewRowID  int64         `msgpack:"nr"`
+	OldValues []interface{} `msgpack:"ov,omitempty"`
+	NewValues []interface{} `msgpack:"nv,omitempty"`
 }
 
 // EphemeralHookSession represents a CDC capture session with its own dedicated connection.
 // The connection is held open for the duration of the session and closed on Commit/Rollback.
 // CDC entries are stored in the per-database MetaStore's __marmot__intent_entries table.
 type EphemeralHookSession struct {
-	conn         *sql.Conn                           // Dedicated user DB connection (closed on end)
-	tx           *sql.Tx                             // Active transaction on user DB
-	metaStore    MetaStore                           // MetaStore for intent entry storage
-	txnID        uint64                              // Transaction ID for intent entries
-	seq          uint64                              // Sequence counter for entries
-	collectors   map[string]*filter.KeyHashCollector // table -> key hash collector
-	schemaCache  *SchemaCache                        // Shared schema cache
-	lastInsertId int64                               // Last insert ID from most recent insert
+	conn         *sql.Conn    // Dedicated user DB connection (closed on end)
+	tx           *sql.Tx      // Active transaction on user DB
+	metaStore    MetaStore    // MetaStore for intent entry storage
+	txnID        uint64       // Transaction ID for intent entries
+	seq          uint64       // Sequence counter for entries
+	schemaCache  *SchemaCache // Shared schema cache
+	lastInsertId int64        // Last insert ID from most recent insert
 	mu           sync.Mutex
 
-	// CDC conflict detection
 	conflictError error // Set if conflict detected during hook
 }
+
+// IntentEntry represents a CDC entry stored in the system database
+type IntentEntry struct {
+	TxnID     uint64
+	Seq       uint64
+	Operation uint8
+	Table     string
+	IntentKey string
+	OldValues map[string][]byte
+	NewValues map[string][]byte
+	CreatedAt int64
+}
+
+// =============================================================================
+// Constructor
+// =============================================================================
 
 // StartEphemeralSession creates a new CDC capture session with a dedicated connection.
 // The session owns the connection and will close it when done.
@@ -211,7 +71,6 @@ type EphemeralHookSession struct {
 // If a table's schema is not in the cache, its changes will be silently skipped.
 // Call ReplicatedDatabase.ReloadSchema() before starting the session to ensure schemas are loaded.
 func StartEphemeralSession(ctx context.Context, userDB *sql.DB, metaStore MetaStore, schemaCache *SchemaCache, txnID uint64) (*EphemeralHookSession, error) {
-	// Get a dedicated connection for this session
 	conn, err := userDB.Conn(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get connection: %w", err)
@@ -222,18 +81,14 @@ func StartEphemeralSession(ctx context.Context, userDB *sql.DB, metaStore MetaSt
 		metaStore:   metaStore,
 		txnID:       txnID,
 		seq:         0,
-		collectors:  make(map[string]*filter.KeyHashCollector),
 		schemaCache: schemaCache,
 	}
 
-	// Register preupdate hook inside Raw() callback
 	err = conn.Raw(func(driverConn interface{}) error {
 		sqliteConn, ok := driverConn.(*sqlite3.SQLiteConn)
 		if !ok {
 			return fmt.Errorf("unexpected driver connection type: %T", driverConn)
 		}
-
-		// Register the preupdate hook
 		sqliteConn.RegisterPreUpdateHook(session.hookCallback)
 		return nil
 	})
@@ -244,6 +99,10 @@ func StartEphemeralSession(ctx context.Context, userDB *sql.DB, metaStore MetaSt
 
 	return session, nil
 }
+
+// =============================================================================
+// EphemeralHookSession methods
+// =============================================================================
 
 // BeginTx starts a transaction on the session's connection
 func (s *EphemeralHookSession) BeginTx(ctx context.Context) error {
@@ -265,12 +124,10 @@ func (s *EphemeralHookSession) ExecContext(ctx context.Context, query string, ar
 		return err
 	}
 
-	// Check for CDC conflict errors that occurred during hook callback
 	if conflictErr := s.GetConflictError(); conflictErr != nil {
 		return conflictErr
 	}
 
-	// Capture last insert ID (ignore error - not all statements produce one)
 	if id, err := result.LastInsertId(); err == nil && id != 0 {
 		s.lastInsertId = id
 	}
@@ -290,17 +147,17 @@ func (s *EphemeralHookSession) Commit() error {
 		txErr = s.tx.Commit()
 	}
 
-	// Unregister hook and close connection
 	s.cleanup()
-
 	return txErr
 }
 
-// Rollback aborts the hookDB transaction and closes the connection.
-// Note: CDC intent entries are NOT deleted here. They persist in MetaStore until
-// the distributed transaction completes. This is intentional because Rollback()
-// is called in executeStatements() to release the hookDB connection BEFORE 2PC,
-// but the CDC data is still needed for applyDataChanges() during commit phase.
+// Rollback aborts the hookDB transaction, processes captured rows, and closes the connection.
+// Flow:
+// 1. Rollback SQLite transaction (releases SQLite write lock)
+// 2. ProcessCapturedRows (converts raw captures to IntentEntries)
+// 3. cleanup() releases row locks and closes connection
+//
+// CDC intent entries persist in MetaStore until the distributed transaction completes.
 // Cleanup happens in TransactionManager.cleanupAfterCommit() or cleanupAfterAbort().
 func (s *EphemeralHookSession) Rollback() error {
 	s.mu.Lock()
@@ -311,321 +168,49 @@ func (s *EphemeralHookSession) Rollback() error {
 		txErr = s.tx.Rollback()
 	}
 
-	// Unregister hook and close connection
-	s.cleanup()
+	if processErr := s.ProcessCapturedRows(); processErr != nil {
+		log.Error().Err(processErr).Uint64("txn_id", s.txnID).Msg("Failed to process captured rows")
+	}
 
+	s.cleanup()
 	return txErr
 }
 
-// FlushIntentLog is a no-op for SQLite-based storage.
-// SQLite WAL mode handles durability automatically.
-// Kept for API compatibility.
-func (s *EphemeralHookSession) FlushIntentLog() error {
-	return nil
-}
-
-// cleanup unregisters the hook and closes the connection
-func (s *EphemeralHookSession) cleanup() {
-	if s.conn == nil {
-		return
-	}
-
-	// Release all CDC row locks held by this transaction
-	if s.metaStore != nil && s.txnID != 0 {
-		if err := s.metaStore.ReleaseCDCRowLocksByTxn(s.txnID); err != nil {
-			log.Error().Err(err).Uint64("txn_id", s.txnID).Msg("Failed to release CDC row locks during cleanup")
-		}
-	}
-
-	// Unregister hook inside Raw() callback
-	s.conn.Raw(func(driverConn interface{}) error {
-		if sqliteConn, ok := driverConn.(*sqlite3.SQLiteConn); ok {
-			sqliteConn.RegisterPreUpdateHook(nil)
-		}
-		return nil
-	})
-
-	s.conn.Close()
-	s.conn = nil
-}
-
-// hookCallback is called by SQLite before each row modification
-// NOTE: This is called from within SQLite's transaction processing,
-// so we cannot call back into the database connection (would deadlock).
-func (s *EphemeralHookSession) hookCallback(data sqlite3.SQLitePreUpdateData) {
-	// Skip internal tables
-	if strings.HasPrefix(data.TableName, "__marmot") {
-		return
-	}
-
-	// Get table schema from cache
-	// NOTE: We cannot load on-demand here because we're inside a hook callback.
-	// The schema MUST be pre-populated via Reload() or the table will be skipped.
-	schema, err := s.schemaCache.GetSchemaFor(data.TableName)
+// ProcessCapturedRows iterates raw captured rows from Pebble, processes each one, and cleans up.
+// Called AFTER transaction rollback when SQLite lock is released.
+// All schema lookup, conflict detection, and lock acquisition happens here.
+func (s *EphemeralHookSession) ProcessCapturedRows() error {
+	cursor, err := s.metaStore.IterateCapturedRows(s.txnID)
 	if err != nil {
-		// Schema not in cache - this is a critical issue that will cause replication to fail
-		// Set conflict error so caller knows to reload schema
-		if _, ok := err.(ErrSchemaCacheMiss); ok {
-			log.Warn().Str("table", data.TableName).Msg("CDC: schema not cached - changes will be lost")
+		return fmt.Errorf("failed to iterate captured rows: %w", err)
+	}
+	defer cursor.Close()
+
+	var intentSeq uint64
+	for cursor.Next() {
+		rawSeq, data := cursor.Row()
+
+		var row CapturedRow
+		if err := encoding.Unmarshal(data, &row); err != nil {
+			return fmt.Errorf("failed to unmarshal captured row: %w", err)
+		}
+
+		intentSeq++
+		if err := s.processSingleRow(&row, intentSeq); err != nil {
 			s.conflictError = err
-		}
-		return
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	// Get column count
-	colCount := data.Count()
-
-	// Prepare destinations for column values using pooled pointers
-	oldDest := make([]interface{}, colCount)
-	newDest := make([]interface{}, colCount)
-	for i := 0; i < colCount; i++ {
-		oldDest[i] = interfacePtrPool.Get().(*interface{})
-		newDest[i] = interfacePtrPool.Get().(*interface{})
-	}
-	// Defer returning pointers to pool
-	defer func() {
-		for i := 0; i < colCount; i++ {
-			if p, ok := oldDest[i].(*interface{}); ok {
-				*p = nil // Clear before returning
-				interfacePtrPool.Put(p)
-			}
-			if p, ok := newDest[i].(*interface{}); ok {
-				*p = nil // Clear before returning
-				interfacePtrPool.Put(p)
-			}
-		}
-	}()
-
-	var operation uint8
-	var oldValues, newValues map[string][]byte
-	var intentKey string
-
-	// Determine operation type and capture values
-	switch data.Op {
-	case sqlite3.SQLITE_INSERT:
-		operation = uint8(OpTypeInsert)
-		if err := data.New(newDest...); err == nil {
-			newValues = s.buildValueMap(schema.Columns, newDest)
-		}
-		pkValues := s.extractPKValuesFromDest(schema, newDest, data.NewRowID)
-		intentKey = s.serializePK(data.TableName, schema, pkValues)
-
-	case sqlite3.SQLITE_UPDATE:
-		operation = uint8(OpTypeUpdate)
-		if err := data.Old(oldDest...); err == nil {
-			oldValues = s.buildValueMap(schema.Columns, oldDest)
-		}
-		if err := data.New(newDest...); err == nil {
-			newValues = s.buildValueMap(schema.Columns, newDest)
-		}
-		// Track both old and new PK for updates
-		oldPK := s.extractPKValuesFromDest(schema, oldDest, data.OldRowID)
-		newPK := s.extractPKValuesFromDest(schema, newDest, data.NewRowID)
-		oldKey := s.serializePK(data.TableName, schema, oldPK)
-		newKey := s.serializePK(data.TableName, schema, newPK)
-		intentKey = newKey
-
-		// Ensure collector exists for this table
-		if _, ok := s.collectors[data.TableName]; !ok {
-			s.collectors[data.TableName] = filter.NewKeyHashCollector()
-		}
-		s.collectors[data.TableName].AddIntentKey(oldKey)
-		if oldKey != newKey {
-			s.collectors[data.TableName].AddIntentKey(newKey)
+			return err
 		}
 
-	case sqlite3.SQLITE_DELETE:
-		operation = uint8(OpTypeDelete)
-		if err := data.Old(oldDest...); err == nil {
-			oldValues = s.buildValueMap(schema.Columns, oldDest)
-		}
-		pkValues := s.extractPKValuesFromDest(schema, oldDest, data.OldRowID)
-		intentKey = s.serializePK(data.TableName, schema, pkValues)
-
-	default:
-		return
-	}
-
-	// Ensure collector exists for this table (for non-UPDATE operations)
-	if data.Op != sqlite3.SQLITE_UPDATE {
-		if _, ok := s.collectors[data.TableName]; !ok {
-			s.collectors[data.TableName] = filter.NewKeyHashCollector()
-		}
-		s.collectors[data.TableName].AddIntentKey(intentKey)
-	}
-
-	// CDC conflict detection: check for DDL lock and acquire row lock
-	if ddlTxn, err := s.metaStore.GetCDCTableDDLLock(data.TableName); err == nil && ddlTxn != 0 && ddlTxn != s.txnID {
-		log.Debug().
-			Uint64("txn_id", s.txnID).
-			Uint64("ddl_txn", ddlTxn).
-			Str("table", data.TableName).
-			Msg("CDC: DML blocked - DDL table lock exists")
-		s.conflictError = ErrCDCTableDDLInProgress{Table: data.TableName, HeldByTxn: ddlTxn}
-		return
-	}
-
-	// Acquire row lock
-	if err := s.metaStore.AcquireCDCRowLock(s.txnID, data.TableName, intentKey); err != nil {
-		s.conflictError = err
-		return
-	}
-
-	// Serialize values to msgpack using pooled encoder
-	var oldMsgpack, newMsgpack []byte
-	if oldValues != nil {
-		oldMsgpack, _ = encoding.Marshal(oldValues)
-	}
-	if newValues != nil {
-		newMsgpack, _ = encoding.Marshal(newValues)
-	}
-
-	// Increment sequence
-	s.seq++
-
-	// Write to MetaStore (separate database file, so this is safe during hook)
-	s.metaStore.WriteIntentEntry(s.txnID, s.seq, operation, data.TableName, intentKey, oldMsgpack, newMsgpack)
-}
-
-// buildValueMap converts column values to a map
-func (s *EphemeralHookSession) buildValueMap(columns []string, values []interface{}) map[string][]byte {
-	result := make(map[string][]byte, len(columns))
-	for i, col := range columns {
-		if i >= len(values) {
-			break
-		}
-		val := values[i]
-		if ptr, ok := val.(*interface{}); ok {
-			val = *ptr
-		}
-		if val != nil {
-			result[col] = s.serializeValue(val)
-		}
-	}
-	return result
-}
-
-// serializeValue converts a value to msgpack bytes for CDC replication.
-// Msgpack preserves type information (int64 stays int64, not float64).
-// SQLite preupdate hook returns TEXT columns as []byte - we convert to string
-// so msgpack encodes as str (not bin), ensuring correct type on decode.
-// Returns nil only for nil input; Marshal errors are logged but non-fatal
-// since we're on a hot path and partial CDC is better than blocking writes.
-func (s *EphemeralHookSession) serializeValue(v interface{}) []byte {
-	if v == nil {
-		return nil
-	}
-	// SQLite preupdate hook returns TEXT as []byte - convert to string
-	// so msgpack uses str format (not bin) for proper type preservation
-	if b, ok := v.([]byte); ok {
-		v = string(b)
-	}
-	data, err := encoding.Marshal(v)
-	if err != nil {
-		// Log but don't fail - partial CDC is better than blocking writes
-		// This should never happen with valid SQLite values
-		return nil
-	}
-	return data
-}
-
-// extractPKValuesFromDest extracts primary key values from a destination slice.
-// PK values are converted to string representation for intent key generation,
-// ensuring compatibility with AST-based path which uses string values.
-func (s *EphemeralHookSession) extractPKValuesFromDest(schema *TableSchema, dest []interface{}, rowID int64) map[string][]byte {
-	pkValues := make(map[string][]byte)
-
-	for i, idx := range schema.PKIndices {
-		colName := schema.PrimaryKeys[i]
-		if idx == -1 {
-			// rowid case
-			pkValues[colName] = []byte(fmt.Sprintf("%d", rowID))
-		} else if idx < len(dest) {
-			val := dest[idx]
-			if ptr, ok := val.(*interface{}); ok {
-				val = *ptr
-			}
-			if val != nil {
-				// Convert to string representation for intent key compatibility
-				// This ensures hook and AST paths produce identical keys
-				pkValues[colName] = pkValueToBytes(val)
-			}
+		if err := s.metaStore.DeleteCapturedRow(s.txnID, rawSeq); err != nil {
+			return fmt.Errorf("failed to delete captured row: %w", err)
 		}
 	}
 
-	return pkValues
-}
-
-// pkValueToBytes converts a primary key value to its string byte representation.
-// Used for intent key generation where values must match AST-based path format.
-func pkValueToBytes(v interface{}) []byte {
-	switch val := v.(type) {
-	case int64:
-		return []byte(fmt.Sprintf("%d", val))
-	case float64:
-		// Check if float is actually an integer
-		if val == float64(int64(val)) {
-			return []byte(fmt.Sprintf("%d", int64(val)))
-		}
-		return []byte(fmt.Sprintf("%v", val))
-	case string:
-		return []byte(val)
-	case []byte:
-		return val
-	default:
-		return []byte(fmt.Sprintf("%v", val))
+	if err := cursor.Err(); err != nil {
+		return fmt.Errorf("cursor error: %w", err)
 	}
-}
 
-// serializePK creates a deterministic string key from PK values
-func (s *EphemeralHookSession) serializePK(table string, schema *TableSchema, pkValues map[string][]byte) string {
-	return filter.SerializeIntentKey(table, schema.PrimaryKeys, pkValues)
-}
-
-// GetRowCounts returns the number of affected rows per table
-func (s *EphemeralHookSession) GetRowCounts() map[string]int64 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	counts := make(map[string]int64)
-	for table, collector := range s.collectors {
-		counts[table] = int64(collector.Count())
-	}
-	return counts
-}
-
-// GetKeyHashes returns XXH64 hashes of affected intent keys per table.
-// Returns nil for tables exceeding maxRows.
-func (s *EphemeralHookSession) GetKeyHashes(maxRows int) map[string][]uint64 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	hashes := make(map[string][]uint64)
-	for table, collector := range s.collectors {
-		count := collector.Count()
-		if maxRows > 0 && count > maxRows {
-			// Exceeds max - return empty slice to signal MVCC fallback
-			hashes[table] = nil
-			continue
-		}
-		hashes[table] = collector.Keys()
-	}
-	return hashes
-}
-
-// IntentEntry represents a CDC entry stored in the system database
-type IntentEntry struct {
-	TxnID     uint64
-	Seq       uint64
-	Operation uint8
-	Table     string
-	IntentKey string
-	OldValues map[string][]byte
-	NewValues map[string][]byte
-	CreatedAt int64
+	return nil
 }
 
 // GetIntentEntries reads all intent entries for this session from the MetaStore
@@ -656,4 +241,174 @@ func (s *EphemeralHookSession) ClearConflictError() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.conflictError = nil
+}
+
+// cleanup unregisters the hook and closes the connection
+func (s *EphemeralHookSession) cleanup() {
+	if s.conn == nil {
+		return
+	}
+
+	if s.metaStore != nil && s.txnID != 0 {
+		if err := s.metaStore.ReleaseCDCRowLocksByTxn(s.txnID); err != nil {
+			log.Error().Err(err).Uint64("txn_id", s.txnID).Msg("Failed to release CDC row locks during cleanup")
+		}
+	}
+
+	s.conn.Raw(func(driverConn interface{}) error {
+		if sqliteConn, ok := driverConn.(*sqlite3.SQLiteConn); ok {
+			sqliteConn.RegisterPreUpdateHook(nil)
+		}
+		return nil
+	})
+
+	s.conn.Close()
+	s.conn = nil
+}
+
+// hookCallback is called by SQLite before each row modification.
+// BRAIN DEAD: raw copy of sqlite3.SQLitePreUpdateData to Pebble.
+func (s *EphemeralHookSession) hookCallback(data sqlite3.SQLitePreUpdateData) {
+	if strings.HasPrefix(data.TableName, "__marmot") {
+		return
+	}
+
+	colCount := data.Count()
+	row := CapturedRow{
+		Table:    data.TableName,
+		Op:       data.Op,
+		OldRowID: data.OldRowID,
+		NewRowID: data.NewRowID,
+	}
+
+	oldVals := make([]interface{}, colCount)
+	if data.Old(oldVals...) == nil {
+		row.OldValues = oldVals
+	}
+	newVals := make([]interface{}, colCount)
+	if data.New(newVals...) == nil {
+		row.NewValues = newVals
+	}
+
+	s.mu.Lock()
+	s.seq++
+	seq := s.seq
+	s.mu.Unlock()
+
+	rowData, _ := encoding.Marshal(&row)
+	s.metaStore.WriteCapturedRow(s.txnID, seq, rowData)
+}
+
+// =============================================================================
+// Utility functions
+// =============================================================================
+
+// processSingleRow processes one captured row: DDL check, schema lookup, lock acquisition, IntentEntry write.
+func (s *EphemeralHookSession) processSingleRow(row *CapturedRow, seq uint64) error {
+	// Fail fast if table has DDL lock from another transaction
+	if ddlTxn, err := s.metaStore.GetCDCTableDDLLock(row.Table); err == nil && ddlTxn != 0 && ddlTxn != s.txnID {
+		return ErrCDCTableDDLInProgress{Table: row.Table, HeldByTxn: ddlTxn}
+	}
+
+	var opType uint8
+	switch row.Op {
+	case sqlite3.SQLITE_INSERT:
+		opType = uint8(OpTypeInsert)
+	case sqlite3.SQLITE_UPDATE:
+		opType = uint8(OpTypeUpdate)
+	case sqlite3.SQLITE_DELETE:
+		opType = uint8(OpTypeDelete)
+	default:
+		return fmt.Errorf("unknown op type: %d", row.Op)
+	}
+
+	schema, err := s.schemaCache.GetSchemaFor(row.Table)
+	if err != nil {
+		return fmt.Errorf("schema not found for table %s: %w", row.Table, err)
+	}
+
+	var intentKey string
+	switch row.Op {
+	case sqlite3.SQLITE_INSERT, sqlite3.SQLITE_UPDATE:
+		pkValues := extractPKFromValues(schema, row.NewValues, row.NewRowID)
+		intentKey = filter.SerializeIntentKey(row.Table, schema.PrimaryKeys, pkValues)
+	case sqlite3.SQLITE_DELETE:
+		pkValues := extractPKFromValues(schema, row.OldValues, row.OldRowID)
+		intentKey = filter.SerializeIntentKey(row.Table, schema.PrimaryKeys, pkValues)
+	}
+
+	if err := s.metaStore.AcquireCDCRowLock(s.txnID, row.Table, intentKey); err != nil {
+		return err
+	}
+
+	var oldMsgpack, newMsgpack []byte
+	if row.OldValues != nil {
+		oldVals := encodeValuesWithSchema(schema.Columns, row.OldValues)
+		oldMsgpack, _ = encoding.Marshal(oldVals)
+	}
+	if row.NewValues != nil {
+		newVals := encodeValuesWithSchema(schema.Columns, row.NewValues)
+		newMsgpack, _ = encoding.Marshal(newVals)
+	}
+
+	return s.metaStore.WriteIntentEntry(s.txnID, seq, opType, row.Table, intentKey, oldMsgpack, newMsgpack)
+}
+
+// extractPKFromValues extracts PK values from raw values slice using schema indices.
+func extractPKFromValues(schema *TableSchema, values []interface{}, rowID int64) map[string][]byte {
+	pkValues := make(map[string][]byte)
+	for i, idx := range schema.PKIndices {
+		colName := schema.PrimaryKeys[i]
+		if idx == -1 {
+			pkValues[colName] = []byte(fmt.Sprintf("%d", rowID))
+		} else if idx < len(values) && values[idx] != nil {
+			pkValues[colName] = pkValueToBytes(values[idx])
+		}
+	}
+	return pkValues
+}
+
+// encodeValuesWithSchema converts []interface{} to map[string][]byte using schema column names.
+func encodeValuesWithSchema(columns []string, values []interface{}) map[string][]byte {
+	result := make(map[string][]byte, len(columns))
+	for i, col := range columns {
+		if i < len(values) && values[i] != nil {
+			if encoded := encodeValue(values[i]); encoded != nil {
+				result[col] = encoded
+			}
+		}
+	}
+	return result
+}
+
+// encodeValue encodes a single value to msgpack bytes.
+func encodeValue(v interface{}) []byte {
+	if v == nil {
+		return nil
+	}
+	data, err := encoding.Marshal(v)
+	if err != nil {
+		return nil
+	}
+	return data
+}
+
+// pkValueToBytes converts a primary key value to its string byte representation.
+// Used for intent key generation where values must match AST-based path format.
+func pkValueToBytes(v interface{}) []byte {
+	switch val := v.(type) {
+	case int64:
+		return []byte(fmt.Sprintf("%d", val))
+	case float64:
+		if val == float64(int64(val)) {
+			return []byte(fmt.Sprintf("%d", int64(val)))
+		}
+		return []byte(fmt.Sprintf("%v", val))
+	case string:
+		return []byte(val)
+	case []byte:
+		return val
+	default:
+		return []byte(fmt.Sprintf("%v", val))
+	}
 }

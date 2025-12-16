@@ -92,16 +92,11 @@ func MergeCDCEntries(entries []CDCEntry) CDCMergeResult {
 
 // PendingExecution represents a locally executed transaction waiting for quorum
 type PendingExecution interface {
-	GetRowCounts() map[string]int64
 	GetTotalRowCount() int64
 	GetLastInsertId() int64
-	GetKeyHashes(maxRows int) map[string][]uint64
 	GetCDCEntries() []CDCEntry
 	Commit() error
 	Rollback() error
-	// FlushIntentLog is a no-op with SQLite-backed intent storage (WAL handles durability).
-	// Kept for API compatibility.
-	FlushIntentLog() error
 }
 
 // SchemaVersionManager interface to avoid import cycles

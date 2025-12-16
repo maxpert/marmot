@@ -79,21 +79,6 @@ func (s *EphemeralHookSession) Rollback() error {
 	return ErrPreupdateHookNotEnabled
 }
 
-// FlushIntentLog returns nil (stub - no intent log without preupdate hooks)
-func (s *EphemeralHookSession) FlushIntentLog() error {
-	return nil
-}
-
-// GetRowCounts returns nil (stub)
-func (s *EphemeralHookSession) GetRowCounts() map[string]int64 {
-	return nil
-}
-
-// GetKeyHashes returns nil (stub)
-func (s *EphemeralHookSession) GetKeyHashes(maxRows int) map[string][]uint64 {
-	return nil
-}
-
 // IntentEntry represents a CDC entry (stub)
 type IntentEntry struct {
 	TxnID     uint64

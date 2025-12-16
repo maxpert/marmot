@@ -13,6 +13,20 @@ import (
 // ErrStopIteration signals scan callbacks to stop iteration without error
 var ErrStopIteration = errors.New("stop iteration")
 
+// CapturedRowCursor iterates over raw captured rows for a transaction.
+// Must call Close() when done to release resources.
+type CapturedRowCursor interface {
+	// Next advances to the next row. Returns false when iteration is complete.
+	Next() bool
+	// Row returns the current row's sequence number and data.
+	// Only valid after Next() returns true.
+	Row() (seq uint64, data []byte)
+	// Err returns any error encountered during iteration.
+	Err() error
+	// Close releases resources held by the cursor.
+	Close() error
+}
+
 // MetaStore provides transactional metadata storage separate from user data.
 // Each user database has its own MetaStore backed by PebbleDB.
 // This separation allows user data writes and metadata writes to happen in parallel.
@@ -58,10 +72,16 @@ type MetaStore interface {
 	TryAcquireDDLLock(dbName string, nodeID uint64, leaseDuration time.Duration) (bool, error)
 	ReleaseDDLLock(dbName string, nodeID uint64) error
 
-	// CDC intent entries
+	// CDC intent entries (final processed format)
 	WriteIntentEntry(txnID, seq uint64, op uint8, table, intentKey string, oldVals, newVals []byte) error
 	GetIntentEntries(txnID uint64) ([]*IntentEntry, error)
 	DeleteIntentEntries(txnID uint64) error
+
+	// CDC raw capture (fast path during hook - stores raw values without per-value encoding)
+	WriteCapturedRow(txnID, seq uint64, data []byte) error
+	IterateCapturedRows(txnID uint64) (CapturedRowCursor, error)
+	DeleteCapturedRow(txnID, seq uint64) error
+	DeleteCapturedRows(txnID uint64) error
 
 	// CDC active locks for conflict detection
 	AcquireCDCRowLock(txnID uint64, tableName, intentKey string) error

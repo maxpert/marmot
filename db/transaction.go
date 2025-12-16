@@ -772,8 +772,8 @@ func (tm *TransactionManager) writeCDCInsert(tableName string, newValues map[str
 		columns = append(columns, col)
 		placeholders = append(placeholders, "?")
 
-		var value interface{}
-		if err := encoding.Unmarshal(newValues[col], &value); err != nil {
+		value, err := unmarshalCDCValue(newValues[col])
+		if err != nil {
 			return fmt.Errorf("failed to deserialize value for column %s: %w", col, err)
 		}
 		values = append(values, value)
@@ -786,6 +786,20 @@ func (tm *TransactionManager) writeCDCInsert(tableName string, newValues map[str
 
 	_, err := tm.db.Exec(sqlStmt, values...)
 	return err
+}
+
+// unmarshalCDCValue deserializes a msgpack-encoded value and converts []byte to string.
+// SQLite returns TEXT values as []byte from preupdate hooks, so we convert back for proper type affinity.
+func unmarshalCDCValue(data []byte) (interface{}, error) {
+	var value interface{}
+	if err := encoding.Unmarshal(data, &value); err != nil {
+		return nil, err
+	}
+	// Convert []byte to string - SQLite returns TEXT as []byte from preupdate hooks
+	if b, ok := value.([]byte); ok {
+		return string(b), nil
+	}
+	return value, nil
 }
 
 // writeCDCUpdate performs UPDATE using CDC row data
@@ -825,8 +839,8 @@ func (tm *TransactionManager) writeCDCUpdate(tableName string, oldValues, newVal
 	for col, valBytes := range newValues {
 		setClauses = append(setClauses, fmt.Sprintf("%s = ?", col))
 
-		var value interface{}
-		if err := encoding.Unmarshal(valBytes, &value); err != nil {
+		value, err := unmarshalCDCValue(valBytes)
+		if err != nil {
 			return fmt.Errorf("failed to deserialize value for column %s: %w", col, err)
 		}
 		values = append(values, value)
@@ -849,8 +863,8 @@ func (tm *TransactionManager) writeCDCUpdate(tableName string, oldValues, newVal
 
 		whereClauses = append(whereClauses, fmt.Sprintf("%s = ?", pkCol))
 
-		var value interface{}
-		if err := encoding.Unmarshal(pkBytes, &value); err != nil {
+		value, err := unmarshalCDCValue(pkBytes)
+		if err != nil {
 			return fmt.Errorf("failed to deserialize PK value for column %s: %w", pkCol, err)
 		}
 		values = append(values, value)
@@ -908,8 +922,8 @@ func (tm *TransactionManager) writeCDCDelete(tableName string, intentKey string,
 
 		whereClauses = append(whereClauses, fmt.Sprintf("%s = ?", pkCol))
 
-		var value interface{}
-		if err := encoding.Unmarshal(pkValue, &value); err != nil {
+		value, err := unmarshalCDCValue(pkValue)
+		if err != nil {
 			return fmt.Errorf("failed to deserialize PK value for column %s: %w", pkCol, err)
 		}
 		values = append(values, value)

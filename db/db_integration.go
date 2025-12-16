@@ -444,8 +444,6 @@ type PendingLocalExecution struct {
 // BEFORE 2PC broadcast. Commit/Rollback are no-ops.
 type CompletedLocalExecution struct {
 	cdcEntries   []*IntentEntry
-	rowCounts    map[string]int64
-	keyHashes    map[string][]uint64
 	lastInsertId int64
 	db           *ReplicatedDatabase
 }
@@ -453,36 +451,9 @@ type CompletedLocalExecution struct {
 // Ensure CompletedLocalExecution implements coordinator.PendingExecution
 var _ coordinator.PendingExecution = (*CompletedLocalExecution)(nil)
 
-// GetRowCounts returns the number of affected rows per table
-func (c *CompletedLocalExecution) GetRowCounts() map[string]int64 {
-	return c.rowCounts
-}
-
-// GetTotalRowCount returns total rows affected across all tables
+// GetTotalRowCount returns count of CDC entries.
 func (c *CompletedLocalExecution) GetTotalRowCount() int64 {
-	var total int64
-	for _, count := range c.rowCounts {
-		total += count
-	}
-	return total
-}
-
-// GetKeyHashes returns XXH64 hashes of affected intent keys per table
-// Returns nil for tables that exceed maxRows (signals fallback to full table scan)
-func (c *CompletedLocalExecution) GetKeyHashes(maxRows int) map[string][]uint64 {
-	if maxRows <= 0 {
-		return c.keyHashes
-	}
-	result := make(map[string][]uint64, len(c.keyHashes))
-	for table, hashes := range c.keyHashes {
-		rowCount := c.rowCounts[table]
-		if rowCount > int64(maxRows) {
-			result[table] = nil
-			continue
-		}
-		result[table] = hashes
-	}
-	return result
+	return int64(len(c.cdcEntries))
 }
 
 // Commit applies CDC entries to persist data captured during hooks
@@ -520,41 +491,15 @@ func (c *CompletedLocalExecution) GetCDCEntries() []coordinator.CDCEntry {
 	return result
 }
 
-// FlushIntentLog is a no-op - CDC data already persisted in MetaStore
-func (c *CompletedLocalExecution) FlushIntentLog() error {
-	return nil
-}
-
 // GetLastInsertId returns the last insert ID from the most recent insert
 func (c *CompletedLocalExecution) GetLastInsertId() int64 {
 	return c.lastInsertId
 }
 
-// GetRowCounts returns the number of affected rows per table
-func (p *PendingLocalExecution) GetRowCounts() map[string]int64 {
-	if p.session == nil {
-		return nil
-	}
-	return p.session.GetRowCounts()
-}
-
-// GetTotalRowCount returns total rows affected across all tables
+// GetTotalRowCount returns count from CDC entries.
 func (p *PendingLocalExecution) GetTotalRowCount() int64 {
-	counts := p.GetRowCounts()
-	var total int64
-	for _, count := range counts {
-		total += count
-	}
-	return total
-}
-
-// GetKeyHashes returns XXH64 hashes of affected intent keys per table.
-// Returns nil for tables exceeding maxRows.
-func (p *PendingLocalExecution) GetKeyHashes(maxRows int) map[string][]uint64 {
-	if p.session == nil {
-		return nil
-	}
-	return p.session.GetKeyHashes(maxRows)
+	entries := p.GetCDCEntries()
+	return int64(len(entries))
 }
 
 // Commit finalizes the local transaction
@@ -602,16 +547,6 @@ func (p *PendingLocalExecution) GetCDCEntries() []coordinator.CDCEntry {
 	return result
 }
 
-// FlushIntentLog is a no-op with SQLite-backed intent storage.
-// SQLite WAL mode handles durability automatically.
-// Kept for API compatibility.
-func (p *PendingLocalExecution) FlushIntentLog() error {
-	if p.session == nil {
-		return nil
-	}
-	return p.session.FlushIntentLog()
-}
-
 // GetLastInsertId returns the last insert ID from the most recent insert
 func (p *PendingLocalExecution) GetLastInsertId() int64 {
 	if p.session == nil {
@@ -648,7 +583,7 @@ func (mdb *ReplicatedDatabase) ExecuteLocalWithHooks(ctx context.Context, txnID 
 		return nil, fmt.Errorf("failed to begin transaction: %w", err)
 	}
 
-	// Execute each statement - hooks capture CDC to MetaStore
+	// Execute each statement - hooks capture raw CDC data to Pebble
 	for _, req := range requests {
 		if err := session.ExecContext(ctx, req.SQL, req.Params...); err != nil {
 			_ = session.Rollback()
@@ -656,24 +591,21 @@ func (mdb *ReplicatedDatabase) ExecuteLocalWithHooks(ctx context.Context, txnID 
 		}
 	}
 
-	// Get CDC entries, row counts, and last insert ID BEFORE rollback
-	cdcEntries, _ := session.GetIntentEntries()
-	rowCounts := session.GetRowCounts()
-	keyHashes := session.GetKeyHashes(1000) // For interface compatibility
+	// Get last insert ID BEFORE rollback (available immediately)
 	lastInsertId := session.GetLastInsertId()
 
-	// ROLLBACK hookDB immediately - release connection BEFORE 2PC
-	// CDC data is already persisted in MetaStore, so we don't lose anything
+	// ROLLBACK hookDB - this also calls ProcessCapturedRows which converts
+	// raw captured data to IntentEntries
 	if err := session.Rollback(); err != nil {
 		return nil, fmt.Errorf("failed to rollback hook session: %w", err)
 	}
 
+	// Get CDC entries AFTER rollback - ProcessCapturedRows has now created IntentEntries
+	cdcEntries, _ := mdb.metaStore.GetIntentEntries(txnID)
+
 	// Return completed execution with captured CDC data
-	// Commit/Rollback are no-ops since session is already closed
 	return &CompletedLocalExecution{
 		cdcEntries:   cdcEntries,
-		rowCounts:    rowCounts,
-		keyHashes:    keyHashes,
 		lastInsertId: lastInsertId,
 		db:           mdb,
 	}, nil
