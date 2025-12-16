@@ -2,9 +2,7 @@ package grpc
 
 import (
 	"context"
-	"crypto/sha256"
 	"database/sql"
-	"encoding/hex"
 	"fmt"
 	"sort"
 	"strings"
@@ -25,6 +23,7 @@ type ReplicationHandler struct {
 	dbMgr            *db.DatabaseManager
 	clock            *hlc.Clock
 	schemaVersionMgr *db.SchemaVersionManager
+	engine           *db.ReplicationEngine
 }
 
 // NewReplicationHandler creates a new replication handler
@@ -34,6 +33,7 @@ func NewReplicationHandler(nodeID uint64, dbMgr *db.DatabaseManager, clock *hlc.
 		dbMgr:            dbMgr,
 		clock:            clock,
 		schemaVersionMgr: schemaVersionMgr,
+		engine:           db.NewReplicationEngine(nodeID, dbMgr, clock),
 	}
 }
 
@@ -67,176 +67,31 @@ func (rh *ReplicationHandler) HandleReplicateTransaction(ctx context.Context, re
 
 // handlePrepare processes Phase 1 of 2PC: Create write intents
 func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *TransactionRequest) (*TransactionResponse, error) {
-	log.Debug().
-		Uint64("node_id", rh.nodeID).
-		Str("database", req.Database).
-		Int("num_statements", len(req.Statements)).
-		Msg("handlePrepare called")
-
-	// Handle CREATE DATABASE and DROP DATABASE using system database for transaction tracking
-	// These operations need 2PC but don't have a user database to track the transaction in
-	if len(req.Statements) == 1 {
-		stmt := req.Statements[0]
-		stmtType := common.MustFromWireType(stmt.Type)
-
-		if stmtType == protocol.StatementCreateDatabase || stmtType == protocol.StatementDropDatabase {
-			// Use system database for transaction management
-			systemDB, err := rh.dbMgr.GetDatabase(db.SystemDatabaseName)
-			if err != nil {
-				return &TransactionResponse{
-					Success:      false,
-					ErrorMessage: fmt.Sprintf("system database not found: %v", err),
-				}, nil
-			}
-
-			txnMgr := systemDB.GetTransactionManager()
-			// Use coordinator's txn_id directly to avoid ID collision race conditions
-			startTS := hlc.Timestamp{
-				WallTime: req.Timestamp.WallTime,
-				Logical:  req.Timestamp.Logical,
-				NodeID:   req.Timestamp.NodeId,
-			}
-			txn, err := txnMgr.BeginTransactionWithID(req.TxnId, req.SourceNodeId, startTS)
-			if err != nil {
-				return &TransactionResponse{
-					Success:      false,
-					ErrorMessage: fmt.Sprintf("failed to begin transaction: %v", err),
-				}, nil
-			}
-
-			// Convert proto statement to internal format
-			internalStmt := protocol.Statement{
-				SQL:       stmt.GetSQL(),
-				Type:      stmtType,
-				TableName: stmt.TableName,
-				Database:  stmt.Database,
-			}
-
-			// Add statement to transaction
-			if err := txnMgr.AddStatement(txn, internalStmt); err != nil {
-				txnMgr.AbortTransaction(txn)
-				return &TransactionResponse{
-					Success:      false,
-					ErrorMessage: fmt.Sprintf("failed to add statement: %v", err),
-				}, nil
-			}
-
-			// Create write intent for database operation
-			intentKey := stmt.Database
-			dbOp := db.DatabaseOpCreate
-			if stmtType == protocol.StatementDropDatabase {
-				dbOp = db.DatabaseOpDrop
-			}
-			snapshotData := db.DatabaseOperationSnapshot{
-				Type:         int(stmt.Type),
-				Timestamp:    req.Timestamp.WallTime,
-				DatabaseName: stmt.Database,
-				Operation:    dbOp,
-			}
-			dataSnapshot, err := db.SerializeData(snapshotData)
-			if err != nil {
-				log.Error().Err(err).Str("database", stmt.Database).Msg("Failed to serialize database operation snapshot")
-				txnMgr.AbortTransaction(txn)
-				return &TransactionResponse{
-					Success:      false,
-					ErrorMessage: fmt.Sprintf("failed to serialize snapshot: %v", err),
-				}, nil
-			}
-
-			err = txnMgr.WriteIntent(txn, db.IntentTypeDatabaseOp, "", intentKey, internalStmt, dataSnapshot)
-			if err != nil {
-				txnMgr.AbortTransaction(txn)
-				return &TransactionResponse{
-					Success:          false,
-					ErrorMessage:     fmt.Sprintf("write conflict: %v", err),
-					ConflictDetected: true,
-					ConflictDetails:  err.Error(),
-				}, nil
-			}
-
-			log.Info().
-				Str("database", stmt.Database).
-				Str("operation", dbOp.String()).
-				Uint64("node_id", rh.nodeID).
-				Uint64("txn_id", req.TxnId).
-				Msg("Database operation prepared (intent created)")
-
-			return &TransactionResponse{
-				Success: true,
-				AppliedAt: &HLC{
-					WallTime: rh.clock.Now().WallTime,
-					Logical:  rh.clock.Now().Logical,
-					NodeId:   rh.nodeID,
-				},
-			}, nil
-		}
-	}
-
-	// Get the target database from request - database name is required
-	dbName := req.Database
-	if dbName == "" {
-		return &TransactionResponse{
-			Success:      false,
-			ErrorMessage: "database name is required in transaction request",
-		}, nil
-	}
-
-	// Get database instance
-	dbInstance, err := rh.dbMgr.GetDatabase(dbName)
-	if err != nil {
-		return &TransactionResponse{
-			Success:      false,
-			ErrorMessage: fmt.Sprintf("database %s not found: %v", dbName, err),
-		}, nil
-	}
-
-	// Check schema version compatibility
+	// Schema version validation - MUST happen before engine call
 	if rh.schemaVersionMgr != nil && req.RequiredSchemaVersion > 0 {
-		localVersion, err := rh.schemaVersionMgr.GetSchemaVersion(dbName)
-		if err != nil {
-			log.Warn().Err(err).Str("database", dbName).Msg("Failed to get local schema version during prepare")
-		} else if localVersion < req.RequiredSchemaVersion {
-			log.Error().
-				Str("database", dbName).
-				Uint64("local_version", localVersion).
-				Uint64("required_version", req.RequiredSchemaVersion).
-				Uint64("txn_id", req.TxnId).
-				Msg("Schema version mismatch: local version is behind required version")
-			return &TransactionResponse{
-				Success:      false,
-				ErrorMessage: fmt.Sprintf("schema version mismatch: local version %d < required version %d", localVersion, req.RequiredSchemaVersion),
-			}, nil
+		dbName := req.Database
+		if dbName != "" && dbName != db.SystemDatabaseName {
+			localVersion, err := rh.schemaVersionMgr.GetSchemaVersion(dbName)
+			if err != nil {
+				log.Warn().Err(err).Str("database", dbName).Msg("Failed to get local schema version during prepare")
+			} else if localVersion < req.RequiredSchemaVersion {
+				log.Error().
+					Str("database", dbName).
+					Uint64("local_version", localVersion).
+					Uint64("required_version", req.RequiredSchemaVersion).
+					Uint64("txn_id", req.TxnId).
+					Msg("Schema version mismatch: local version is behind required version")
+				return &TransactionResponse{
+					Success:      false,
+					ErrorMessage: fmt.Sprintf("schema version mismatch: local version %d < required version %d", localVersion, req.RequiredSchemaVersion),
+				}, nil
+			}
 		}
 	}
 
-	txnMgr := dbInstance.GetTransactionManager()
-
-	// Use coordinator's txn_id directly to avoid ID collision race conditions
-	startTS := hlc.Timestamp{
-		WallTime: req.Timestamp.WallTime,
-		Logical:  req.Timestamp.Logical,
-		NodeID:   req.Timestamp.NodeId,
-	}
-	txn, err := txnMgr.BeginTransactionWithID(req.TxnId, req.SourceNodeId, startTS)
-	if err != nil {
-		return &TransactionResponse{
-			Success:      false,
-			ErrorMessage: fmt.Sprintf("failed to begin transaction: %v", err),
-		}, nil
-	}
-
-	// Set required schema version on transaction for persistence
-	txn.RequiredSchemaVersion = req.RequiredSchemaVersion
-
-	// Get MetaStore for writing CDC intent entries
-	metaStore := dbInstance.GetMetaStore()
-
-	// Process each statement and create write intents
-	var stmtSeq uint64 = 0
+	// Convert proto statements to internal format
+	statements := make([]protocol.Statement, 0, len(req.Statements))
 	for _, stmt := range req.Statements {
-		stmtSeq++
-
-		// Convert proto statement to internal format
 		internalStmt := protocol.Statement{
 			SQL:       stmt.GetSQL(),
 			Type:      common.MustFromWireType(stmt.Type),
@@ -244,183 +99,91 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 			Database:  stmt.Database,
 			IntentKey: stmt.GetIntentKey(),
 		}
-
-		// If CDC data is present, populate it
 		if rowChange := stmt.GetRowChange(); rowChange != nil {
 			internalStmt.OldValues = rowChange.OldValues
 			internalStmt.NewValues = rowChange.NewValues
 		}
+		statements = append(statements, internalStmt)
+	}
 
-		// Add statement to transaction
-		if err := txnMgr.AddStatement(txn, internalStmt); err != nil {
-			txnMgr.AbortTransaction(txn)
-			return &TransactionResponse{
-				Success:      false,
-				ErrorMessage: fmt.Sprintf("failed to add statement: %v", err),
-			}, nil
+	// Build engine request
+	startTS := hlc.Timestamp{
+		WallTime: req.Timestamp.WallTime,
+		Logical:  req.Timestamp.Logical,
+		NodeID:   req.Timestamp.NodeId,
+	}
+	engineReq := &db.PrepareRequest{
+		TxnID:      req.TxnId,
+		NodeID:     req.SourceNodeId,
+		StartTS:    startTS,
+		Database:   req.Database,
+		Statements: statements,
+	}
+
+	// Call engine
+	result := rh.engine.Prepare(ctx, engineReq)
+
+	// Convert to gRPC response
+	resp := &TransactionResponse{
+		Success:          result.Success,
+		ErrorMessage:     result.Error,
+		ConflictDetected: result.ConflictDetected,
+		ConflictDetails:  result.ConflictDetails,
+	}
+	if result.Success {
+		resp.AppliedAt = &HLC{
+			WallTime: rh.clock.Now().WallTime,
+			Logical:  rh.clock.Now().Logical,
+			NodeId:   rh.nodeID,
 		}
+		telemetry.ReplicationRequestsTotal.With("prepare", "success").Inc()
+	}
+	return resp, nil
+}
 
-		// Use pre-extracted intent key from protobuf message
-		// The intent key was extracted by the coordinator's CDC hooks during local execution
-		intentKey := stmt.GetIntentKey()
-		skipWriteIntent := false
-
-		if intentKey == "" {
-			// For INSERT statements without explicit PK (auto-increment),
-			// skip write intent creation - no row-level conflict possible
-			if internalStmt.Type == protocol.StatementInsert {
-				log.Trace().
-					Str("table", stmt.TableName).
-					Msg("GRPC: INSERT with auto-increment PK - skipping write intent")
-				skipWriteIntent = true
-			} else if internalStmt.Type == protocol.StatementUpdate || internalStmt.Type == protocol.StatementDelete {
-				// For UPDATE/DELETE without intentKey, skip write intent creation.
-				// IntentKey MUST come from CDC hooks (preupdate) which extract actual PK values.
-				// SQL-derived fallback was catastrophically broken - it made ALL updates
-				// on the same table conflict because they share the same SQL prefix.
-				// MVCC commit will detect conflicts at row level when applying changes.
-				// NOTE: We still need to write CDC intent entries for replication!
-				log.Debug().
-					Str("table", stmt.TableName).
-					Str("stmt_type", stmt.Type.String()).
-					Msg("GRPC: Empty IntentKey for UPDATE/DELETE - skipping write intent but storing CDC")
-				skipWriteIntent = true
-			} else if internalStmt.Type == protocol.StatementDDL {
-				// For DDL statements, create write intent using table name + SQL hash as intent key
-				// This ensures each DDL SQL gets stored uniquely and executed during commit phase
-				// Multiple DDL statements for same table (e.g., CREATE TABLE, CREATE INDEX) need unique keys
-				// Use table name + hash of SQL to create unique intentKey for each DDL statement
-				hash := sha256.Sum256([]byte(stmt.GetSQL()))
-				ddlIntentKey := stmt.TableName + ":" + hex.EncodeToString(hash[:8])
-
-				snapshotData := db.DDLSnapshot{
-					Type:      int(internalStmt.Type),
-					Timestamp: req.Timestamp.WallTime,
-					SQL:       stmt.GetSQL(),
-					TableName: stmt.TableName,
+// handleCommit processes Phase 2 of 2PC: Commit transaction
+func (rh *ReplicationHandler) handleCommit(ctx context.Context, req *TransactionRequest) (*TransactionResponse, error) {
+	// Check if this transaction contains DDL statements BEFORE committing
+	// (transaction is removed from memory after commit, so we can't check afterwards)
+	hasDDL := false
+	var ddlSQL string
+	if rh.schemaVersionMgr != nil && req.Database != "" && len(req.Statements) > 0 {
+		for _, stmt := range req.Statements {
+			stmtType := common.MustFromWireType(stmt.Type)
+			if stmtType == protocol.StatementDDL {
+				hasDDL = true
+				if ddl := stmt.GetDdlChange(); ddl != nil {
+					ddlSQL = ddl.Sql
 				}
-				dataSnapshot, serErr := db.SerializeData(snapshotData)
-				if serErr != nil {
-					log.Error().Err(serErr).Str("table", stmt.TableName).Msg("Failed to serialize DDL snapshot")
-					txnMgr.AbortTransaction(txn)
-					return &TransactionResponse{
-						Success:      false,
-						ErrorMessage: fmt.Sprintf("failed to serialize DDL snapshot: %v", serErr),
-					}, nil
-				}
-
-				err := txnMgr.WriteIntent(txn, db.IntentTypeDDL, stmt.TableName, ddlIntentKey, internalStmt, dataSnapshot)
-				if err != nil {
-					txnMgr.AbortTransaction(txn)
-					return &TransactionResponse{
-						Success:          false,
-						ErrorMessage:     fmt.Sprintf("DDL conflict: %v", err),
-						ConflictDetected: true,
-						ConflictDetails:  err.Error(),
-					}, nil
-				}
-				log.Debug().
-					Str("table", stmt.TableName).
-					Str("ddl_intent_key", ddlIntentKey).
-					Msg("GRPC: Created write intent for DDL statement")
-				continue
-			} else {
-				// For other statement types without intentKey, skip entirely
-				continue
-			}
-		}
-
-		if !skipWriteIntent {
-			// Serialize data snapshot (CDC data if available, otherwise SQL)
-			snapshotData := map[string]interface{}{
-				"type":      stmt.Type.String(),
-				"timestamp": req.Timestamp.WallTime,
-			}
-			if stmt.HasCDCData() {
-				snapshotData["cdc_data"] = true
-				snapshotData["old_values_count"] = len(stmt.GetRowChange().OldValues)
-				snapshotData["new_values_count"] = len(stmt.GetRowChange().NewValues)
-			} else {
-				snapshotData["sql"] = stmt.GetSQL()
-			}
-			dataSnapshot, serErr := db.SerializeData(snapshotData)
-			if serErr != nil {
-				log.Error().Err(serErr).Str("table", stmt.TableName).Msg("Failed to serialize snapshot")
-				txnMgr.AbortTransaction(txn)
-				return &TransactionResponse{
-					Success:      false,
-					ErrorMessage: fmt.Sprintf("failed to serialize snapshot: %v", serErr),
-				}, nil
-			}
-
-			err := txnMgr.WriteIntent(txn, db.IntentTypeDML, stmt.TableName, intentKey, internalStmt, dataSnapshot)
-			if err != nil {
-				// Write-write conflict detected!
-				txnMgr.AbortTransaction(txn)
-				return &TransactionResponse{
-					Success:          false,
-					ErrorMessage:     fmt.Sprintf("write conflict: %v", err),
-					ConflictDetected: true,
-					ConflictDetails:  err.Error(),
-				}, nil
-			}
-		}
-
-		// CRITICAL: Write CDC intent entry so CommitTransaction can replay it
-		// This stores the actual row data (NewValues/OldValues) for later application to SQLite
-		// This MUST happen even if write intent was skipped (for UPDATE/DELETE without intentKey)
-		if stmt.HasCDCData() {
-			rowChange := stmt.GetRowChange()
-
-			// Serialize OldValues and NewValues as msgpack using pooled encoder
-			var oldVals, newVals []byte
-			if len(rowChange.OldValues) > 0 {
-				var err error
-				oldVals, err = encoding.Marshal(rowChange.OldValues)
-				if err != nil {
-					log.Error().Err(err).Str("table", stmt.TableName).Msg("Failed to marshal OldValues")
-					txnMgr.AbortTransaction(txn)
-					return &TransactionResponse{
-						Success:      false,
-						ErrorMessage: fmt.Sprintf("failed to serialize old values: %v", err),
-					}, nil
-				}
-			}
-			if len(rowChange.NewValues) > 0 {
-				var err error
-				newVals, err = encoding.Marshal(rowChange.NewValues)
-				if err != nil {
-					log.Error().Err(err).Str("table", stmt.TableName).Msg("Failed to marshal NewValues")
-					txnMgr.AbortTransaction(txn)
-					return &TransactionResponse{
-						Success:      false,
-						ErrorMessage: fmt.Sprintf("failed to serialize new values: %v", err),
-					}, nil
-				}
-			}
-
-			// Convert statement type to operation code
-			op := uint8(db.StatementTypeToOpType(internalStmt.Type))
-
-			// Use intentKey if available, otherwise use empty string (CDC will still work)
-			err := metaStore.WriteIntentEntry(req.TxnId, stmtSeq, op, stmt.TableName, intentKey, oldVals, newVals)
-			if err != nil {
-				log.Error().Err(err).
-					Uint64("txn_id", req.TxnId).
-					Str("table", stmt.TableName).
-					Str("intent_key", intentKey).
-					Msg("Failed to write CDC intent entry")
-				txnMgr.AbortTransaction(txn)
-				return &TransactionResponse{
-					Success:      false,
-					ErrorMessage: fmt.Sprintf("failed to write CDC entry: %v", err),
-				}, nil
+				break
 			}
 		}
 	}
 
-	// Success! Write intents created
-	telemetry.ReplicationRequestsTotal.With("prepare", "success").Inc()
+	engineReq := &db.CommitRequest{
+		TxnID:    req.TxnId,
+		Database: req.Database,
+	}
+
+	result := rh.engine.Commit(ctx, engineReq)
+
+	if !result.Success {
+		telemetry.ReplicationRequestsTotal.With("commit", "failed").Inc()
+		return &TransactionResponse{
+			Success:      false,
+			ErrorMessage: result.Error,
+		}, nil
+	}
+
+	// Schema version increment for DDL transactions (MUST happen after successful commit)
+	if hasDDL && ddlSQL != "" {
+		_, verErr := rh.schemaVersionMgr.IncrementSchemaVersion(req.Database, ddlSQL, req.TxnId)
+		if verErr != nil {
+			log.Error().Err(verErr).Str("database", req.Database).Uint64("txn_id", req.TxnId).Msg("Failed to increment schema version after DDL replication")
+		}
+	}
+
+	telemetry.ReplicationRequestsTotal.With("commit", "success").Inc()
 	return &TransactionResponse{
 		Success: true,
 		AppliedAt: &HLC{
@@ -431,245 +194,18 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 	}, nil
 }
 
-// handleCommit processes Phase 2 of 2PC: Commit transaction
-func (rh *ReplicationHandler) handleCommit(ctx context.Context, req *TransactionRequest) (*TransactionResponse, error) {
-	log.Debug().
-		Uint64("node_id", rh.nodeID).
-		Str("database", req.Database).
-		Uint64("txn_id", req.TxnId).
-		Uint64("source_node", req.SourceNodeId).
-		Msg("handleCommit called")
-
-	// Check if this is a database operation (CREATE/DROP DATABASE)
-	// These are tracked in the system database
-	systemDB, err := rh.dbMgr.GetDatabase(db.SystemDatabaseName)
-	if err == nil {
-		// Try to find transaction in system database first
-		systemTxnMgr := systemDB.GetTransactionManager()
-		systemTxn := systemTxnMgr.GetTransaction(req.TxnId)
-
-		if systemTxn != nil {
-			// GetTransaction returns empty Statements, so we check intents instead
-			// Intents are persisted during prepare phase and contain operation details
-			metaStore := systemDB.GetMetaStore()
-			intents, intentErr := metaStore.GetIntentsByTxn(req.TxnId)
-			if intentErr == nil && len(intents) > 0 {
-				// Check if any intent is for database operations
-				for _, intent := range intents {
-					if intent.IntentType == db.IntentTypeDatabaseOp {
-						// Found a database operation - extract details from DataSnapshot
-						var snapshotData db.DatabaseOperationSnapshot
-						if err := db.DeserializeData(intent.DataSnapshot, &snapshotData); err != nil {
-							log.Error().Err(err).Uint64("txn_id", req.TxnId).Msg("Failed to deserialize DB op snapshot")
-							continue
-						}
-
-						dbOp := snapshotData.Operation
-						dbName := intent.IntentKey // Intent key is the database name
-
-						// Execute the database operation BEFORE committing the transaction
-						var dbOpErr error
-						switch dbOp {
-						case db.DatabaseOpCreate:
-							log.Info().Str("database", dbName).Uint64("node_id", rh.nodeID).Msg("Executing CREATE DATABASE in commit phase")
-							dbOpErr = rh.dbMgr.CreateDatabase(dbName)
-						case db.DatabaseOpDrop:
-							log.Info().Str("database", dbName).Uint64("node_id", rh.nodeID).Msg("Executing DROP DATABASE in commit phase")
-							dbOpErr = rh.dbMgr.DropDatabase(dbName)
-						default:
-							log.Error().Str("operation", dbOp.String()).Uint64("txn_id", req.TxnId).Msg("Unknown database operation")
-							continue
-						}
-
-						if dbOpErr != nil {
-							log.Error().Err(dbOpErr).Str("database", dbName).Str("operation", dbOp.String()).Msg("Database operation failed in commit phase")
-							systemTxnMgr.AbortTransaction(systemTxn)
-							return &TransactionResponse{
-								Success:      false,
-								ErrorMessage: fmt.Sprintf("database operation failed: %v", dbOpErr),
-							}, nil
-						}
-
-						// Now commit the transaction to mark it as completed
-						if err := systemTxnMgr.CommitTransaction(systemTxn); err != nil {
-							// Database operation succeeded but transaction commit failed
-							// This is not ideal but the operation is done
-							log.Warn().Err(err).Str("database", dbName).Msg("Database operation succeeded but transaction commit failed")
-						}
-
-						log.Info().
-							Str("database", dbName).
-							Str("operation", dbOp.String()).
-							Uint64("node_id", rh.nodeID).
-							Msg("Database operation committed successfully")
-
-						return &TransactionResponse{
-							Success: true,
-							AppliedAt: &HLC{
-								WallTime: rh.clock.Now().WallTime,
-								Logical:  rh.clock.Now().Logical,
-								NodeId:   rh.nodeID,
-							},
-						}, nil
-					}
-				}
-			}
-		}
-	}
-
-	// Regular operation - get user database (database name is required)
-	dbName := req.Database
-	if dbName == "" {
-		return &TransactionResponse{
-			Success:      false,
-			ErrorMessage: "database name is required in commit request",
-		}, nil
-	}
-
-	// Get database instance
-	dbInstance, err := rh.dbMgr.GetDatabase(dbName)
-	if err != nil {
-		return &TransactionResponse{
-			Success:      false,
-			ErrorMessage: fmt.Sprintf("database %s not found: %v", dbName, err),
-		}, nil
-	}
-
-	txnMgr := dbInstance.GetTransactionManager()
-
-	// Retrieve transaction from active transactions
-	txn := txnMgr.GetTransaction(req.TxnId)
-	if txn == nil {
-		// Transaction not found in memory - clean up any orphaned intents
-		// This can happen if:
-		// 1. Prepare succeeded but transaction was removed from memory (timeout/GC)
-		// 2. Different node is receiving the commit request
-		// 3. Race condition between prepare and commit
-		log.Error().
-			Uint64("node_id", rh.nodeID).
-			Uint64("txn_id", req.TxnId).
-			Str("database", dbName).
-			Msg("REMOTE COMMIT FAILED: transaction not found - possibly GC'd")
-		metaStore := dbInstance.GetMetaStore()
-		if metaStore != nil {
-			if err := metaStore.DeleteIntentsByTxn(req.TxnId); err != nil {
-				log.Warn().Err(err).Uint64("txn_id", req.TxnId).Msg("Failed to cleanup orphaned intents during commit")
-			}
-		}
-		return &TransactionResponse{
-			Success:      false,
-			ErrorMessage: fmt.Sprintf("transaction %d not found", req.TxnId),
-		}, nil
-	}
-
-	// Commit the transaction
-	err = txnMgr.CommitTransaction(txn)
-	if err != nil {
-		// Commit failed - clean up intents to avoid blocking future transactions
-		metaStore := dbInstance.GetMetaStore()
-		if metaStore != nil {
-			metaStore.DeleteIntentsByTxn(req.TxnId)
-		}
-		telemetry.ReplicationRequestsTotal.With("commit", "failed").Inc()
-		return &TransactionResponse{
-			Success:      false,
-			ErrorMessage: fmt.Sprintf("failed to commit: %v", err),
-		}, nil
-	}
-
-	// Increment schema version for DDL transactions (followers must track schema changes)
-	if rh.schemaVersionMgr != nil {
-		for _, stmt := range txn.Statements {
-			if stmt.Type == protocol.StatementDDL {
-				_, verErr := rh.schemaVersionMgr.IncrementSchemaVersion(dbName, stmt.SQL, txn.ID)
-				if verErr != nil {
-					log.Error().Err(verErr).
-						Str("database", dbName).
-						Uint64("txn_id", txn.ID).
-						Msg("Failed to increment schema version after DDL replication")
-				}
-				break // Only increment once per transaction
-			}
-		}
-	}
-
-	telemetry.ReplicationRequestsTotal.With("commit", "success").Inc()
-	return &TransactionResponse{
-		Success: true,
-		AppliedAt: &HLC{
-			WallTime: txn.CommitTS.WallTime,
-			Logical:  txn.CommitTS.Logical,
-			NodeId:   rh.nodeID,
-		},
-	}, nil
-}
-
 // handleAbort processes abort: Rollback transaction
 func (rh *ReplicationHandler) handleAbort(ctx context.Context, req *TransactionRequest) (*TransactionResponse, error) {
-
-	// Check system database first for database operations
-	systemDB, err := rh.dbMgr.GetDatabase(db.SystemDatabaseName)
-	if err == nil {
-		systemTxnMgr := systemDB.GetTransactionManager()
-		systemTxn := systemTxnMgr.GetTransaction(req.TxnId)
-		if systemTxn != nil {
-			if err := systemTxnMgr.AbortTransaction(systemTxn); err != nil {
-				log.Warn().Err(err).Uint64("txn_id", req.TxnId).Msg("Failed to abort system database transaction")
-			}
-			return &TransactionResponse{Success: true}, nil
-		}
+	engineReq := &db.AbortRequest{
+		TxnID:    req.TxnId,
+		Database: req.Database,
 	}
 
-	// Try user database (database name is required)
-	dbName := req.Database
-	if dbName == "" {
-		return &TransactionResponse{
-			Success:      false,
-			ErrorMessage: "database name is required in abort request",
-		}, nil
-	}
-
-	// Get database instance
-	dbInstance, err := rh.dbMgr.GetDatabase(dbName)
-	if err != nil {
-		// Database not found - transaction may have been for a dropped database
-		// Return success since there's nothing to abort
-		log.Warn().Str("database", dbName).Uint64("txn_id", req.TxnId).Msg("Abort: database not found, assuming already cleaned up")
-		return &TransactionResponse{Success: true}, nil
-	}
-
-	txnMgr := dbInstance.GetTransactionManager()
-
-	// Retrieve transaction from active transactions
-	txn := txnMgr.GetTransaction(req.TxnId)
-	if txn == nil {
-		// Transaction not found in memory - but write intents may still exist in DB!
-		// Always clean up intents by txn_id to handle:
-		// 1. Race conditions where abort arrives before/after prepare
-		// 2. Partial failures where some nodes have intents but txn was removed from memory
-		// 3. Client disconnects mid-transaction
-		metaStore := dbInstance.GetMetaStore()
-		if metaStore != nil {
-			if err := metaStore.DeleteIntentsByTxn(req.TxnId); err != nil {
-				log.Warn().Err(err).Uint64("txn_id", req.TxnId).Msg("Failed to cleanup orphaned intents during abort")
-			}
-		}
-		return &TransactionResponse{
-			Success: true, // Idempotent - abort of non-existent txn is success
-		}, nil
-	}
-
-	// Abort the transaction
-	err = txnMgr.AbortTransaction(txn)
-	if err != nil {
-		return &TransactionResponse{
-			Success:      false,
-			ErrorMessage: fmt.Sprintf("failed to abort: %v", err),
-		}, nil
-	}
+	result := rh.engine.Abort(ctx, engineReq)
 
 	return &TransactionResponse{
-		Success: true,
+		Success:      result.Success,
+		ErrorMessage: result.Error,
 	}, nil
 }
 

@@ -1693,6 +1693,11 @@ func (s *PebbleMetaStore) DeleteIntentEntries(txnID uint64) error {
 
 // CleanupStaleTransactions aborts transactions that haven't had a heartbeat within the timeout
 func (s *PebbleMetaStore) CleanupStaleTransactions(timeout time.Duration) (int, error) {
+	// Check if store is closed - return early to avoid pebble: closed panic
+	if s.closed.Load() {
+		return 0, nil
+	}
+
 	cutoff := time.Now().Add(-timeout).UnixNano()
 	cleaned := 0
 
@@ -1829,6 +1834,11 @@ func (s *PebbleMetaStore) CleanupStaleTransactions(timeout time.Duration) (int, 
 
 // CleanupOldTransactionRecords removes old COMMITTED/ABORTED transaction records
 func (s *PebbleMetaStore) CleanupOldTransactionRecords(minRetention, maxRetention time.Duration, minAppliedTxnID, minAppliedSeqNum uint64) (int, error) {
+	// Check if store is closed - return early to avoid pebble: closed panic
+	if s.closed.Load() {
+		return 0, nil
+	}
+
 	now := time.Now()
 	minRetentionCutoff := now.Add(-minRetention).UnixNano()
 	maxRetentionCutoff := now.Add(-maxRetention).UnixNano()

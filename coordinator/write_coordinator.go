@@ -255,11 +255,12 @@ func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transacti
 		Msg("PREPARE phase complete, starting COMMIT")
 
 	commitReq := &ReplicationRequest{
-		TxnID:    txn.ID,
-		Phase:    PhaseCommit,
-		StartTS:  txn.StartTS,
-		NodeID:   wc.nodeID,
-		Database: txn.Database,
+		TxnID:      txn.ID,
+		Phase:      PhaseCommit,
+		StartTS:    txn.StartTS,
+		NodeID:     wc.nodeID,
+		Database:   txn.Database,
+		Statements: txn.Statements, // Include statements for schema version tracking
 	}
 
 	commitResponses := make(map[uint64]*ReplicationResponse)

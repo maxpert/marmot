@@ -212,29 +212,6 @@ func (tm *TransactionManager) WriteIntent(txn *Transaction, intentType IntentTyp
 		op, stmt.SQL, dataSnapshot, txn.StartTS, txn.NodeID)
 
 	if err != nil {
-		// Check if this is a write-write conflict
-		if strings.Contains(err.Error(), "UNIQUE constraint failed") || strings.Contains(err.Error(), "PRIMARY KEY constraint failed") {
-			// Query to get the conflicting transaction
-			existingIntent, queryErr := tm.metaStore.GetIntent(tableName, intentKey)
-			if queryErr == nil && existingIntent != nil {
-				// If same transaction already has intent on this row, update it
-				// This happens when DELETE then INSERT on same row in same txn
-				if existingIntent.TxnID == txn.ID {
-					// Delete and re-insert to update
-					_ = tm.metaStore.DeleteIntent(tableName, intentKey, txn.ID)
-					updateErr := tm.metaStore.WriteIntent(txn.ID, intentType, tableName, intentKey,
-						op, stmt.SQL, dataSnapshot, txn.StartTS, txn.NodeID)
-					if updateErr != nil {
-						return fmt.Errorf("failed to update write intent: %w", updateErr)
-					}
-					return nil
-				}
-
-				// Write-write conflict detected - return error for client to retry
-				return fmt.Errorf("write-write conflict: row %s:%s locked by transaction %d (current txn: %d)",
-					tableName, intentKey, existingIntent.TxnID, txn.ID)
-			}
-		}
 		return fmt.Errorf("failed to persist write intent: %w", err)
 	}
 
