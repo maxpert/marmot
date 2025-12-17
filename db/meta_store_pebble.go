@@ -34,6 +34,10 @@ const (
 	pebblePrefixCounter     = "/meta/"          // /meta/{counterName}
 	pebblePrefixCDCActive   = "/cdc/active/"    // /cdc/active/{2 bytes tableNameLen}{tableName}{intentKey|__ddl__}
 	pebblePrefixCDCTxnLocks = "/cdc/txn_locks/" // /cdc/txn_locks/{8 bytes txnID}{2 bytes tableNameLen}{tableName}{intentKey}
+	pebblePrefixGCIntent    = "/gc/intent/"     // /gc/intent/{2 bytes tableNameLen}{tableName}{intentKey}
+	pebblePrefixTxnCommit   = "/txn_commit/"    // /txn_commit/{8 bytes txnID}
+	pebblePrefixTxnStatus   = "/txn_status/"    // /txn_status/{8 bytes txnID}
+	pebblePrefixTxnHbeat    = "/txn_heartbeat/" // /txn_heartbeat/{8 bytes txnID}
 
 	pebbleCDCDDLKeyMarker = "__ddl__" // Sentinel key for DDL locks
 )
@@ -111,6 +115,21 @@ func (s *PebbleMetaStore) rebuildIntentFilter() error {
 
 	count := 0
 	for iter.SeekGE(prefix); iter.Valid(); iter.Next() {
+		// Parse table/intentKey from the intent key
+		key := iter.Key()
+		tableName, intentKey, ok := parseIntentKey(key)
+		if !ok {
+			continue
+		}
+
+		// Check if GC marker exists
+		gcKey := pebbleGCIntentKey(tableName, intentKey)
+		_, gcCloser, gcErr := s.db.Get(gcKey)
+		if gcErr == nil {
+			gcCloser.Close()
+			continue // Skip - marked for cleanup
+		}
+
 		val, err := iter.ValueAndErr()
 		if err != nil {
 			continue
@@ -121,7 +140,7 @@ func (s *PebbleMetaStore) rebuildIntentFilter() error {
 			continue
 		}
 
-		// Skip intents marked for cleanup
+		// Also check legacy MarkedForCleanup field for backward compatibility
 		if rec.MarkedForCleanup {
 			continue
 		}
@@ -470,6 +489,27 @@ func pebbleTxnSeqKey(seqNum, txnID uint64) []byte {
 	return key
 }
 
+func pebbleTxnCommitKey(txnID uint64) []byte {
+	key := make([]byte, len(pebblePrefixTxnCommit)+8)
+	copy(key, pebblePrefixTxnCommit)
+	binary.BigEndian.PutUint64(key[len(pebblePrefixTxnCommit):], txnID)
+	return key
+}
+
+func pebbleTxnStatusKey(txnID uint64) []byte {
+	key := make([]byte, len(pebblePrefixTxnStatus)+8)
+	copy(key, pebblePrefixTxnStatus)
+	binary.BigEndian.PutUint64(key[len(pebblePrefixTxnStatus):], txnID)
+	return key
+}
+
+func pebbleTxnHeartbeatKey(txnID uint64) []byte {
+	key := make([]byte, len(pebblePrefixTxnHbeat)+8)
+	copy(key, pebblePrefixTxnHbeat)
+	binary.BigEndian.PutUint64(key[len(pebblePrefixTxnHbeat):], txnID)
+	return key
+}
+
 // pebbleIntentKey uses 2-byte length prefix for tableName (intentKey can contain any bytes)
 func pebbleIntentKey(tableName, intentKey string) []byte {
 	key := make([]byte, len(pebblePrefixIntent)+2+len(tableName)+len(intentKey))
@@ -644,6 +684,18 @@ func pebbleCDCTxnLockPrefix(txnID uint64) []byte {
 	return key
 }
 
+// pebbleGCIntentKey creates a GC marker key for an intent (presence key, empty value)
+func pebbleGCIntentKey(tableName, intentKey string) []byte {
+	tableNameBytes := []byte(tableName)
+	intentKeyBytes := []byte(intentKey)
+	key := make([]byte, len(pebblePrefixGCIntent)+2+len(tableNameBytes)+len(intentKeyBytes))
+	copy(key, pebblePrefixGCIntent)
+	binary.BigEndian.PutUint16(key[len(pebblePrefixGCIntent):], uint16(len(tableNameBytes)))
+	copy(key[len(pebblePrefixGCIntent)+2:], tableNameBytes)
+	copy(key[len(pebblePrefixGCIntent)+2+len(tableNameBytes):], intentKeyBytes)
+	return key
+}
+
 // parseCDCTxnLockKey extracts tableName and intentKey from a CDC txn lock key
 func parseCDCTxnLockKey(key []byte, prefixLen int) (tableName, intentKey string, ok bool) {
 	offset := prefixLen
@@ -683,6 +735,46 @@ func (s *PebbleMetaStore) getValueCopy(key []byte) ([]byte, error) {
 	return result, nil
 }
 
+// readHeartbeat reads raw 8-byte timestamp from heartbeat key
+func (s *PebbleMetaStore) readHeartbeat(txnID uint64) (int64, error) {
+	val, closer, err := s.db.Get(pebbleTxnHeartbeatKey(txnID))
+	if err != nil {
+		return 0, err
+	}
+	defer closer.Close()
+	if len(val) != 8 {
+		return 0, fmt.Errorf("invalid heartbeat length: %d", len(val))
+	}
+	return int64(binary.BigEndian.Uint64(val)), nil
+}
+
+// writeHeartbeat writes raw 8-byte timestamp
+func (s *PebbleMetaStore) writeHeartbeat(txnID uint64, ts int64) error {
+	var buf [8]byte
+	binary.BigEndian.PutUint64(buf[:], uint64(ts))
+	return s.db.Set(pebbleTxnHeartbeatKey(txnID), buf[:], pebble.NoSync)
+}
+
+// writeHeartbeatInBatch writes heartbeat as part of a batch
+func (s *PebbleMetaStore) writeHeartbeatInBatch(batch *pebble.Batch, txnID uint64, ts int64) error {
+	var buf [8]byte
+	binary.BigEndian.PutUint64(buf[:], uint64(ts))
+	return batch.Set(pebbleTxnHeartbeatKey(txnID), buf[:], nil)
+}
+
+// readTxnStatus reads 1-byte status from status key
+func (s *PebbleMetaStore) readTxnStatus(txnID uint64) (TxnStatus, error) {
+	val, closer, err := s.db.Get(pebbleTxnStatusKey(txnID))
+	if err != nil {
+		return 0, err
+	}
+	defer closer.Close()
+	if len(val) != 1 {
+		return 0, fmt.Errorf("invalid status length: %d", len(val))
+	}
+	return TxnStatus(val[0]), nil
+}
+
 // BeginTransaction creates a new transaction record with PENDING status
 func (s *PebbleMetaStore) BeginTransaction(txnID, nodeID uint64, startTS hlc.Timestamp) error {
 	log.Debug().
@@ -691,27 +783,42 @@ func (s *PebbleMetaStore) BeginTransaction(txnID, nodeID uint64, startTS hlc.Tim
 		Int64("start_ts", startTS.WallTime).
 		Msg("CDC: BeginTransaction")
 
-	rec := &TransactionRecord{
+	now := time.Now().UnixNano()
+
+	// Create immutable record (written once, never modified)
+	immutable := &TxnImmutableRecord{
 		TxnID:          txnID,
 		NodeID:         nodeID,
-		Status:         TxnStatusPending,
 		StartTSWall:    startTS.WallTime,
 		StartTSLogical: startTS.Logical,
-		CreatedAt:      time.Now().UnixNano(),
-		LastHeartbeat:  time.Now().UnixNano(),
+		CreatedAt:      now,
 	}
 
-	data, err := encoding.Marshal(rec)
+	data, err := encoding.Marshal(immutable)
 	if err != nil {
-		return fmt.Errorf("failed to marshal transaction record: %w", err)
+		return fmt.Errorf("failed to marshal immutable record: %w", err)
 	}
 
 	batch := s.db.NewBatch()
 	defer batch.Close()
 
+	// Write immutable record to /txn/{txnID}
 	if err := batch.Set(pebbleTxnKey(txnID), data, nil); err != nil {
 		return err
 	}
+
+	// Write status byte to /txn_status/{txnID}
+	statusBuf := []byte{byte(TxnStatusPending)}
+	if err := batch.Set(pebbleTxnStatusKey(txnID), statusBuf, nil); err != nil {
+		return err
+	}
+
+	// Write heartbeat to /txn_heartbeat/{txnID}
+	if err := s.writeHeartbeatInBatch(batch, txnID, now); err != nil {
+		return err
+	}
+
+	// Write pending index
 	if err := batch.Set(pebbleTxnPendingKey(txnID), nil, nil); err != nil {
 		return err
 	}
@@ -731,8 +838,8 @@ func (s *PebbleMetaStore) CommitTransaction(txnID uint64, commitTS hlc.Timestamp
 		Uint64("required_schema_version", requiredSchemaVersion).
 		Msg("CDC: CommitTransaction")
 
-	// Step 1: Read nodeID from transaction record
-	recData, err := s.getValueCopy(pebbleTxnKey(txnID))
+	// Step 1: Read ONLY immutable record to get NodeID
+	immutableData, err := s.getValueCopy(pebbleTxnKey(txnID))
 	if err == pebble.ErrNotFound {
 		return fmt.Errorf("transaction %d not found", txnID)
 	}
@@ -740,29 +847,32 @@ func (s *PebbleMetaStore) CommitTransaction(txnID uint64, commitTS hlc.Timestamp
 		return err
 	}
 
-	var rec TransactionRecord
-	if err := encoding.Unmarshal(recData, &rec); err != nil {
+	var immutable TxnImmutableRecord
+	if err := encoding.Unmarshal(immutableData, &immutable); err != nil {
 		return err
 	}
 
 	// Step 2: Get sequence number using contention-free Sequence API
-	seqNum, err := s.GetNextSeqNum(rec.NodeID)
+	seqNum, err := s.GetNextSeqNum(immutable.NodeID)
 	if err != nil {
 		return fmt.Errorf("failed to get next seq_num: %w", err)
 	}
 
-	// Step 3: Update transaction record
-	rec.Status = TxnStatusCommitted
-	rec.CommitTSWall = commitTS.WallTime
-	rec.CommitTSLogical = commitTS.Logical
-	rec.CommittedAt = time.Now().UnixNano()
-	rec.SerializedStatements = statements
-	rec.DatabaseName = dbName
-	rec.TablesInvolved = tablesInvolved
-	rec.SeqNum = seqNum
-	rec.RequiredSchemaVersion = requiredSchemaVersion
+	now := time.Now().UnixNano()
 
-	data, err := encoding.Marshal(&rec)
+	// Step 3: Create commit record (NEW key, not update)
+	commit := &TxnCommitRecord{
+		SeqNum:                seqNum,
+		CommitTSWall:          commitTS.WallTime,
+		CommitTSLogical:       commitTS.Logical,
+		CommittedAt:           now,
+		TablesInvolved:        tablesInvolved,
+		SerializedStatements:  statements,
+		DatabaseName:          dbName,
+		RequiredSchemaVersion: requiredSchemaVersion,
+	}
+
+	data, err := encoding.Marshal(commit)
 	if err != nil {
 		return err
 	}
@@ -770,8 +880,19 @@ func (s *PebbleMetaStore) CommitTransaction(txnID uint64, commitTS hlc.Timestamp
 	batch := s.db.NewBatch()
 	defer batch.Close()
 
-	// Update transaction record
-	if err := batch.Set(pebbleTxnKey(txnID), data, nil); err != nil {
+	// Write TxnCommitRecord to /txn_commit/{txnID}
+	if err := batch.Set(pebbleTxnCommitKey(txnID), data, nil); err != nil {
+		return err
+	}
+
+	// Write status byte (TxnStatusCommitted)
+	statusBuf := []byte{byte(TxnStatusCommitted)}
+	if err := batch.Set(pebbleTxnStatusKey(txnID), statusBuf, nil); err != nil {
+		return err
+	}
+
+	// Update heartbeat
+	if err := s.writeHeartbeatInBatch(batch, txnID, now); err != nil {
 		return err
 	}
 
@@ -813,33 +934,63 @@ func (s *PebbleMetaStore) StoreReplayedTransaction(txnID, nodeID uint64, commitT
 	}
 
 	now := time.Now().UnixNano()
-	rec := TransactionRecord{
-		TxnID:                txnID,
-		NodeID:               nodeID,
-		SeqNum:               seqNum,
-		Status:               TxnStatusCommitted,
-		StartTSWall:          commitTS.WallTime,
-		StartTSLogical:       commitTS.Logical,
-		CommitTSWall:         commitTS.WallTime,
-		CommitTSLogical:      commitTS.Logical,
-		CreatedAt:            now,
-		CommittedAt:          now,
-		LastHeartbeat:        now,
-		SerializedStatements: statements,
-		DatabaseName:         dbName,
+
+	// Create immutable record
+	immutable := &TxnImmutableRecord{
+		TxnID:          txnID,
+		NodeID:         nodeID,
+		StartTSWall:    commitTS.WallTime,
+		StartTSLogical: commitTS.Logical,
+		CreatedAt:      now,
 	}
 
-	data, err := encoding.Marshal(rec)
+	immutableData, err := encoding.Marshal(immutable)
 	if err != nil {
-		return fmt.Errorf("failed to serialize transaction record: %w", err)
+		return fmt.Errorf("failed to serialize immutable record: %w", err)
+	}
+
+	// Create commit record
+	commit := &TxnCommitRecord{
+		SeqNum:                seqNum,
+		CommitTSWall:          commitTS.WallTime,
+		CommitTSLogical:       commitTS.Logical,
+		CommittedAt:           now,
+		TablesInvolved:        "",
+		SerializedStatements:  statements,
+		DatabaseName:          dbName,
+		RequiredSchemaVersion: 0,
+	}
+
+	commitData, err := encoding.Marshal(commit)
+	if err != nil {
+		return fmt.Errorf("failed to serialize commit record: %w", err)
 	}
 
 	batch := s.db.NewBatch()
 	defer batch.Close()
 
-	if err := batch.Set(pebbleTxnKey(txnID), data, nil); err != nil {
+	// Write TxnImmutableRecord to /txn/{txnID}
+	if err := batch.Set(pebbleTxnKey(txnID), immutableData, nil); err != nil {
 		return err
 	}
+
+	// Write TxnCommitRecord to /txn_commit/{txnID}
+	if err := batch.Set(pebbleTxnCommitKey(txnID), commitData, nil); err != nil {
+		return err
+	}
+
+	// Write status byte (TxnStatusCommitted)
+	statusBuf := []byte{byte(TxnStatusCommitted)}
+	if err := batch.Set(pebbleTxnStatusKey(txnID), statusBuf, nil); err != nil {
+		return err
+	}
+
+	// Write heartbeat
+	if err := s.writeHeartbeatInBatch(batch, txnID, now); err != nil {
+		return err
+	}
+
+	// Add to sequence index
 	if err := batch.Set(pebbleTxnSeqKey(seqNum, txnID), nil, nil); err != nil {
 		return err
 	}
@@ -855,8 +1006,8 @@ func (s *PebbleMetaStore) StoreReplayedTransaction(txnID, nodeID uint64, commitT
 
 // AbortTransaction deletes a transaction record
 func (s *PebbleMetaStore) AbortTransaction(txnID uint64) error {
-	// Get existing record to find seq_num if committed
-	recData, err := s.getValueCopy(pebbleTxnKey(txnID))
+	// Read status first (1-byte read, no unmarshal)
+	status, err := s.readTxnStatus(txnID)
 	if err == pebble.ErrNotFound {
 		return nil // Already deleted
 	}
@@ -864,25 +1015,39 @@ func (s *PebbleMetaStore) AbortTransaction(txnID uint64) error {
 		return err
 	}
 
-	var rec TransactionRecord
-	if err := encoding.Unmarshal(recData, &rec); err != nil {
-		return err
+	var seqNum uint64
+	// If committed, read commit record to get SeqNum for cleanup
+	if status == TxnStatusCommitted {
+		commitData, err := s.getValueCopy(pebbleTxnCommitKey(txnID))
+		if err != nil && err != pebble.ErrNotFound {
+			return err
+		}
+		if err == nil {
+			var commit TxnCommitRecord
+			if err := encoding.Unmarshal(commitData, &commit); err != nil {
+				return err
+			}
+			seqNum = commit.SeqNum
+		}
 	}
 
 	batch := s.db.NewBatch()
 	defer batch.Close()
 
-	// Delete transaction record
+	// Delete all keys: /txn/, /txn_commit/, /txn_status/, /txn_heartbeat/
 	if err := batch.Delete(pebbleTxnKey(txnID), nil); err != nil {
 		return err
 	}
+	_ = batch.Delete(pebbleTxnCommitKey(txnID), nil)
+	_ = batch.Delete(pebbleTxnStatusKey(txnID), nil)
+	_ = batch.Delete(pebbleTxnHeartbeatKey(txnID), nil)
 
 	// Remove from pending index (best-effort cleanup)
 	_ = batch.Delete(pebbleTxnPendingKey(txnID), nil)
 
 	// Remove from sequence index if it had one (best-effort cleanup)
-	if rec.SeqNum > 0 {
-		_ = batch.Delete(pebbleTxnSeqKey(rec.SeqNum, txnID), nil)
+	if seqNum > 0 {
+		_ = batch.Delete(pebbleTxnSeqKey(seqNum, txnID), nil)
 	}
 
 	// NoSync: AbortTransaction is cleanup. Idempotent - can be redone.
@@ -890,8 +1055,10 @@ func (s *PebbleMetaStore) AbortTransaction(txnID uint64) error {
 }
 
 // GetTransaction retrieves a transaction record by ID
+// Reconstructs TransactionRecord from split keys for backward compatibility
 func (s *PebbleMetaStore) GetTransaction(txnID uint64) (*TransactionRecord, error) {
-	val, closer, err := s.db.Get(pebbleTxnKey(txnID))
+	// Read TxnImmutableRecord from /txn/
+	immutableVal, closer, err := s.db.Get(pebbleTxnKey(txnID))
 	if err == pebble.ErrNotFound {
 		return nil, nil
 	}
@@ -900,10 +1067,56 @@ func (s *PebbleMetaStore) GetTransaction(txnID uint64) (*TransactionRecord, erro
 	}
 	defer closer.Close()
 
-	rec := &TransactionRecord{}
-	if err := encoding.Unmarshal(val, rec); err != nil {
+	var immutable TxnImmutableRecord
+	if err := encoding.Unmarshal(immutableVal, &immutable); err != nil {
 		return nil, err
 	}
+
+	// Read status from /txn_status/
+	status, err := s.readTxnStatus(txnID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Read heartbeat from /txn_heartbeat/
+	heartbeat, err := s.readHeartbeat(txnID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Reconstruct TransactionRecord
+	rec := &TransactionRecord{
+		TxnID:          immutable.TxnID,
+		NodeID:         immutable.NodeID,
+		Status:         status,
+		StartTSWall:    immutable.StartTSWall,
+		StartTSLogical: immutable.StartTSLogical,
+		CreatedAt:      immutable.CreatedAt,
+		LastHeartbeat:  heartbeat,
+	}
+
+	// If status == Committed, read TxnCommitRecord from /txn_commit/
+	if status == TxnStatusCommitted {
+		commitData, err := s.getValueCopy(pebbleTxnCommitKey(txnID))
+		if err != nil && err != pebble.ErrNotFound {
+			return nil, err
+		}
+		if err == nil {
+			var commit TxnCommitRecord
+			if err := encoding.Unmarshal(commitData, &commit); err != nil {
+				return nil, err
+			}
+			rec.SeqNum = commit.SeqNum
+			rec.CommitTSWall = commit.CommitTSWall
+			rec.CommitTSLogical = commit.CommitTSLogical
+			rec.CommittedAt = commit.CommittedAt
+			rec.TablesInvolved = commit.TablesInvolved
+			rec.SerializedStatements = commit.SerializedStatements
+			rec.DatabaseName = commit.DatabaseName
+			rec.RequiredSchemaVersion = commit.RequiredSchemaVersion
+		}
+	}
+
 	return rec, nil
 }
 
@@ -939,25 +1152,7 @@ func (s *PebbleMetaStore) GetPendingTransactions() ([]*TransactionRecord, error)
 
 // Heartbeat updates the last_heartbeat timestamp
 func (s *PebbleMetaStore) Heartbeat(txnID uint64) error {
-	recData, err := s.getValueCopy(pebbleTxnKey(txnID))
-	if err != nil {
-		return err
-	}
-
-	var rec TransactionRecord
-	if err := encoding.Unmarshal(recData, &rec); err != nil {
-		return err
-	}
-
-	rec.LastHeartbeat = time.Now().UnixNano()
-	data, err := encoding.Marshal(&rec)
-	if err != nil {
-		return err
-	}
-
-	// NoSync: SaveTransaction happens before PREPARE.
-	// If crash before PREPARE (WriteIntent), transaction never existed.
-	return s.db.Set(pebbleTxnKey(txnID), data, pebble.NoSync)
+	return s.writeHeartbeat(txnID, time.Now().UnixNano())
 }
 
 // WriteIntent creates a write intent (distributed lock)
@@ -1018,6 +1213,10 @@ func (s *PebbleMetaStore) writeIntentFastPath(txnID uint64, intentType IntentTyp
 
 	// Add to filter after successful write
 	s.intentFilter.Add(txnID, tbHash)
+
+	// Refresh heartbeat - transaction is active
+	_ = s.writeHeartbeat(txnID, time.Now().UnixNano())
+
 	return nil
 }
 
@@ -1031,7 +1230,64 @@ func (s *PebbleMetaStore) writeIntentSlowPath(txnID uint64, intentType IntentTyp
 	// Check if intent already exists
 	existingData, closer, err := s.db.Get(key)
 	if err == nil {
-		defer closer.Close()
+		// CHECK GC MARKER FIRST - before expensive unmarshal
+		gcKey := pebbleGCIntentKey(tableName, intentKey)
+		_, gcCloser, gcErr := s.db.Get(gcKey)
+		if gcErr == nil {
+			// GC marker exists - intent is marked for cleanup, can overwrite
+			gcCloser.Close()
+			closer.Close()
+
+			// Delete GC marker and write new intent
+			if err := batch.Delete(gcKey, nil); err != nil {
+				return err
+			}
+
+			// Write new intent (same as fast path but in batch)
+			rec := &WriteIntentRecord{
+				IntentType:   intentType,
+				TableName:    tableName,
+				IntentKey:    intentKey,
+				TxnID:        txnID,
+				TSWall:       ts.WallTime,
+				TSLogical:    ts.Logical,
+				NodeID:       nodeID,
+				Operation:    op,
+				SQLStatement: sqlStmt,
+				DataSnapshot: data,
+				CreatedAt:    time.Now().UnixNano(),
+			}
+			recData, err := encoding.Marshal(rec)
+			if err != nil {
+				return err
+			}
+			if err := batch.Set(key, recData, nil); err != nil {
+				return err
+			}
+			if err := batch.Set(pebbleIntentByTxnKey(txnID, tableName, intentKey), nil, nil); err != nil {
+				return err
+			}
+			if err := batch.Commit(pebble.NoSync); err != nil {
+				return err
+			}
+
+			// Update filter
+			if s.intentFilter != nil {
+				s.intentFilter.Add(txnID, tbHash)
+			}
+
+			// Refresh heartbeat - transaction is active
+			_ = s.writeHeartbeat(txnID, time.Now().UnixNano())
+
+			return nil
+		}
+		if gcErr != pebble.ErrNotFound {
+			closer.Close()
+			return gcErr
+		}
+
+		// No GC marker - proceed with existing conflict resolution
+		closer.Close()
 
 		var existing WriteIntentRecord
 		if err := encoding.Unmarshal(existingData, &existing); err != nil {
@@ -1049,7 +1305,14 @@ func (s *PebbleMetaStore) writeIntentSlowPath(txnID uint64, intentType IntentTyp
 			if err != nil {
 				return err
 			}
-			return s.db.Set(key, newData, pebble.NoSync)
+			if err := s.db.Set(key, newData, pebble.NoSync); err != nil {
+				return err
+			}
+
+			// Refresh heartbeat - transaction is active
+			_ = s.writeHeartbeat(txnID, time.Now().UnixNano())
+
+			return nil
 		}
 
 		// Different transaction - check if we can overwrite
@@ -1102,6 +1365,9 @@ func (s *PebbleMetaStore) writeIntentSlowPath(txnID uint64, intentType IntentTyp
 		s.intentFilter.Add(txnID, tbHash)
 	}
 
+	// Refresh heartbeat - transaction is active
+	_ = s.writeHeartbeat(txnID, time.Now().UnixNano())
+
 	return nil
 }
 
@@ -1149,7 +1415,14 @@ func (s *PebbleMetaStore) resolveIntentConflictPebble(batch *pebble.Batch, exist
 			heartbeatTimeout = int64(time.Duration(cfg.Config.Transaction.HeartbeatTimeoutSeconds) * time.Second)
 		}
 
-		timeSinceHeartbeat := time.Now().UnixNano() - conflictTxnRec.LastHeartbeat
+		// Try to read heartbeat from new optimized key first
+		heartbeat, err := s.readHeartbeat(existing.TxnID)
+		if err != nil {
+			// Fall back to TransactionRecord for backward compatibility
+			heartbeat = conflictTxnRec.LastHeartbeat
+		}
+
+		timeSinceHeartbeat := time.Now().UnixNano() - heartbeat
 		if timeSinceHeartbeat > heartbeatTimeout {
 			log.Debug().
 				Uint64("stale_txn_id", existing.TxnID).
@@ -1251,6 +1524,8 @@ func (s *PebbleMetaStore) DeleteIntentsByTxn(txnID uint64) error {
 	// Collect keys to delete
 	var primaryKeys [][]byte
 	var indexKeys [][]byte
+	var tableNames []string
+	var intentKeys []string
 
 	iter, err := s.db.NewIter(&pebble.IterOptions{
 		LowerBound: prefix,
@@ -1269,6 +1544,8 @@ func (s *PebbleMetaStore) DeleteIntentsByTxn(txnID uint64) error {
 		tableName, intentKey, ok := parseIntentByTxnKey(indexKey, len(prefix))
 		if ok {
 			primaryKeys = append(primaryKeys, pebbleIntentKey(tableName, intentKey))
+			tableNames = append(tableNames, tableName)
+			intentKeys = append(intentKeys, intentKey)
 		}
 	}
 	if err := iter.Close(); err != nil {
@@ -1287,6 +1564,11 @@ func (s *PebbleMetaStore) DeleteIntentsByTxn(txnID uint64) error {
 	}
 	for _, key := range indexKeys {
 		_ = batch.Delete(key, nil)
+	}
+	// Delete GC markers
+	for i := 0; i < len(tableNames); i++ {
+		gcKey := pebbleGCIntentKey(tableNames[i], intentKeys[i])
+		_ = batch.Delete(gcKey, nil)
 	}
 
 	// NoSync: Intent cleanup is idempotent. If crash occurs, intents remain
@@ -1307,9 +1589,6 @@ func (s *PebbleMetaStore) DeleteIntentsByTxn(txnID uint64) error {
 func (s *PebbleMetaStore) MarkIntentsForCleanup(txnID uint64) error {
 	prefix := pebbleIntentByTxnPrefix(txnID)
 
-	// Collect primary intent keys
-	var primaryKeys [][]byte
-
 	iter, err := s.db.NewIter(&pebble.IterOptions{
 		LowerBound: prefix,
 		UpperBound: prefixUpperBound(prefix),
@@ -1317,49 +1596,31 @@ func (s *PebbleMetaStore) MarkIntentsForCleanup(txnID uint64) error {
 	if err != nil {
 		return err
 	}
+	defer iter.Close()
 
-	for iter.SeekGE(prefix); iter.Valid(); iter.Next() {
-		tableName, intentKey, ok := parseIntentByTxnKey(iter.Key(), len(prefix))
-		if ok {
-			primaryKeys = append(primaryKeys, pebbleIntentKey(tableName, intentKey))
-		}
-	}
-	if err := iter.Close(); err != nil {
-		return err
-	}
-
-	if len(primaryKeys) == 0 {
-		return nil
-	}
-
-	// Mark each intent for cleanup
 	batch := s.db.NewBatch()
 	defer batch.Close()
 
-	for _, key := range primaryKeys {
-		val, closer, err := s.db.Get(key)
-		if err == pebble.ErrNotFound {
+	count := 0
+	for iter.SeekGE(prefix); iter.Valid(); iter.Next() {
+		tableName, intentKey, ok := parseIntentByTxnKey(iter.Key(), len(prefix))
+		if !ok {
 			continue
 		}
-		if err != nil {
+		// Write GC marker (empty value = presence key)
+		gcKey := pebbleGCIntentKey(tableName, intentKey)
+		if err := batch.Set(gcKey, nil, nil); err != nil {
 			return err
 		}
+		count++
+	}
 
-		var rec WriteIntentRecord
-		if err := encoding.Unmarshal(val, &rec); err != nil {
-			closer.Close()
-			return err
-		}
-		closer.Close()
+	if err := iter.Error(); err != nil {
+		return err
+	}
 
-		rec.MarkedForCleanup = true
-		data, err := encoding.Marshal(&rec)
-		if err != nil {
-			return err
-		}
-		if err := batch.Set(key, data, nil); err != nil {
-			return err
-		}
+	if count == 0 {
+		return nil
 	}
 
 	// NoSync: Cleanup marking is idempotent. If crash occurs, intents remain
@@ -1998,24 +2259,29 @@ func (s *PebbleMetaStore) CleanupStaleTransactions(timeout time.Duration) (int, 
 		}
 		txnID := binary.BigEndian.Uint64(key[len(pebblePrefixTxnPending):])
 
-		rec, err := s.GetTransaction(txnID)
-		if err != nil || rec == nil {
-			continue
+		// Try to read heartbeat from new optimized key first
+		heartbeat, err := s.readHeartbeat(txnID)
+		if err != nil {
+			// If heartbeat key doesn't exist but txn exists, it's a legacy record
+			// Fall back to GetTransaction for backward compatibility during migration
+			rec, err := s.GetTransaction(txnID)
+			if err != nil || rec == nil {
+				continue
+			}
+			heartbeat = rec.LastHeartbeat
 		}
 
 		nowNs := time.Now().UnixNano()
-		ageMs := (nowNs - rec.LastHeartbeat) / 1e6
-		if rec.LastHeartbeat < cutoff {
+		ageMs := (nowNs - heartbeat) / 1e6
+		if heartbeat < cutoff {
 			staleTxnIDs = append(staleTxnIDs, txnID)
 			log.Warn().
 				Uint64("txn_id", txnID).
-				Str("status", rec.Status.String()).
 				Int64("age_ms", ageMs).
 				Int64("timeout_ms", timeout.Milliseconds()).
 				Int64("now_ns", nowNs).
 				Int64("cutoff_ns", cutoff).
-				Int64("last_heartbeat_ns", rec.LastHeartbeat).
-				Int64("created_at_ns", rec.CreatedAt).
+				Int64("last_heartbeat_ns", heartbeat).
 				Msg("GC: Found stale PENDING transaction - WILL BE CLEANED UP")
 		}
 	}

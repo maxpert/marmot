@@ -134,6 +134,27 @@ type TransactionRecord struct {
 	RequiredSchemaVersion uint64 // Minimum schema version required for this transaction
 }
 
+// TxnImmutableRecord contains fields set once at transaction start (never modified)
+type TxnImmutableRecord struct {
+	TxnID          uint64
+	NodeID         uint64
+	StartTSWall    int64
+	StartTSLogical int32
+	CreatedAt      int64
+}
+
+// TxnCommitRecord contains commit-time data (written once at commit, never modified)
+type TxnCommitRecord struct {
+	SeqNum                uint64
+	CommitTSWall          int64
+	CommitTSLogical       int32
+	CommittedAt           int64
+	TablesInvolved        string
+	SerializedStatements  []byte
+	DatabaseName          string
+	RequiredSchemaVersion uint64
+}
+
 // WriteIntentRecord represents a write intent in meta store
 type WriteIntentRecord struct {
 	IntentType       IntentType // Type discriminator: DML, DDL, or DatabaseOp
