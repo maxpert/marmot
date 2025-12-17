@@ -151,11 +151,15 @@ func (s *EphemeralHookSession) Commit() error {
 	return txErr
 }
 
-// Rollback aborts the hookDB transaction, processes captured rows, and closes the connection.
+// Rollback aborts the hookDB transaction, processes captured rows, and releases resources.
 // Flow:
 // 1. Rollback SQLite transaction (releases SQLite write lock)
-// 2. ProcessCapturedRows (converts raw captures to IntentEntries)
-// 3. cleanup() releases row locks and closes connection
+// 2. Release hookDB connection immediately (minimize connection hold time)
+// 3. ProcessCapturedRows (converts raw captures to IntentEntries) - uses only Pebble
+// 4. Release row locks
+//
+// CRITICAL: hookDB connection is released BEFORE ProcessCapturedRows to avoid blocking
+// other transactions during Pebble operations (which can be slow on cold start).
 //
 // CDC intent entries persist in MetaStore until the distributed transaction completes.
 // Cleanup happens in TransactionManager.cleanupAfterCommit() or cleanupAfterAbort().
@@ -168,11 +172,14 @@ func (s *EphemeralHookSession) Rollback() error {
 		txErr = s.tx.Rollback()
 	}
 
+	// Release hookDB connection ASAP - ProcessCapturedRows only needs Pebble
+	s.releaseConnection()
+
 	if processErr := s.ProcessCapturedRows(); processErr != nil {
 		log.Error().Err(processErr).Uint64("txn_id", s.txnID).Msg("Failed to process captured rows")
 	}
 
-	s.cleanup()
+	s.releaseRowLocks()
 	return txErr
 }
 
@@ -243,16 +250,12 @@ func (s *EphemeralHookSession) ClearConflictError() {
 	s.conflictError = nil
 }
 
-// cleanup unregisters the hook and closes the connection
-func (s *EphemeralHookSession) cleanup() {
+// releaseConnection unregisters the hook and closes the SQLite connection.
+// This releases the hookDB connection back to the pool ASAP.
+// Called before ProcessCapturedRows to minimize hookDB hold time.
+func (s *EphemeralHookSession) releaseConnection() {
 	if s.conn == nil {
 		return
-	}
-
-	if s.metaStore != nil && s.txnID != 0 {
-		if err := s.metaStore.ReleaseCDCRowLocksByTxn(s.txnID); err != nil {
-			log.Error().Err(err).Uint64("txn_id", s.txnID).Msg("Failed to release CDC row locks during cleanup")
-		}
 	}
 
 	s.conn.Raw(func(driverConn interface{}) error {
@@ -264,6 +267,22 @@ func (s *EphemeralHookSession) cleanup() {
 
 	s.conn.Close()
 	s.conn = nil
+}
+
+// releaseRowLocks releases CDC row locks after processing is complete.
+// Called after ProcessCapturedRows - row locks are only needed during capture.
+func (s *EphemeralHookSession) releaseRowLocks() {
+	if s.metaStore != nil && s.txnID != 0 {
+		if err := s.metaStore.ReleaseCDCRowLocksByTxn(s.txnID); err != nil {
+			log.Error().Err(err).Uint64("txn_id", s.txnID).Msg("Failed to release CDC row locks")
+		}
+	}
+}
+
+// cleanup releases all resources. Safe to call multiple times.
+func (s *EphemeralHookSession) cleanup() {
+	s.releaseConnection()
+	s.releaseRowLocks()
 }
 
 // hookCallback is called by SQLite before each row modification.

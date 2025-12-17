@@ -805,16 +805,17 @@ func (s *PebbleMetaStore) BeginTransaction(txnID, nodeID uint64, startTS hlc.Tim
 		CreatedAt:      now,
 	}
 
-	data, err := encoding.Marshal(immutable)
+	native, err := encoding.MarshalNative(immutable)
 	if err != nil {
 		return fmt.Errorf("failed to marshal immutable record: %w", err)
 	}
+	defer native.Dispose()
 
 	batch := s.db.NewBatch()
 	defer batch.Close()
 
 	// Write immutable record to /txn/{txnID}
-	if err := batch.Set(pebbleTxnKey(txnID), data, nil); err != nil {
+	if err := batch.Set(pebbleTxnKey(txnID), native.Bytes(), nil); err != nil {
 		return err
 	}
 
@@ -883,16 +884,17 @@ func (s *PebbleMetaStore) CommitTransaction(txnID uint64, commitTS hlc.Timestamp
 		RequiredSchemaVersion: requiredSchemaVersion,
 	}
 
-	data, err := encoding.Marshal(commit)
+	native, err := encoding.MarshalNative(commit)
 	if err != nil {
 		return err
 	}
+	defer native.Dispose()
 
 	batch := s.db.NewBatch()
 	defer batch.Close()
 
 	// Write TxnCommitRecord to /txn_commit/{txnID}
-	if err := batch.Set(pebbleTxnCommitKey(txnID), data, nil); err != nil {
+	if err := batch.Set(pebbleTxnCommitKey(txnID), native.Bytes(), nil); err != nil {
 		return err
 	}
 
@@ -955,10 +957,11 @@ func (s *PebbleMetaStore) StoreReplayedTransaction(txnID, nodeID uint64, commitT
 		CreatedAt:      now,
 	}
 
-	immutableData, err := encoding.Marshal(immutable)
+	nativeImmutable, err := encoding.MarshalNative(immutable)
 	if err != nil {
 		return fmt.Errorf("failed to serialize immutable record: %w", err)
 	}
+	defer nativeImmutable.Dispose()
 
 	// Create commit record
 	commit := &TxnCommitRecord{
@@ -972,21 +975,22 @@ func (s *PebbleMetaStore) StoreReplayedTransaction(txnID, nodeID uint64, commitT
 		RequiredSchemaVersion: 0,
 	}
 
-	commitData, err := encoding.Marshal(commit)
+	nativeCommit, err := encoding.MarshalNative(commit)
 	if err != nil {
 		return fmt.Errorf("failed to serialize commit record: %w", err)
 	}
+	defer nativeCommit.Dispose()
 
 	batch := s.db.NewBatch()
 	defer batch.Close()
 
 	// Write TxnImmutableRecord to /txn/{txnID}
-	if err := batch.Set(pebbleTxnKey(txnID), immutableData, nil); err != nil {
+	if err := batch.Set(pebbleTxnKey(txnID), nativeImmutable.Bytes(), nil); err != nil {
 		return err
 	}
 
 	// Write TxnCommitRecord to /txn_commit/{txnID}
-	if err := batch.Set(pebbleTxnCommitKey(txnID), commitData, nil); err != nil {
+	if err := batch.Set(pebbleTxnCommitKey(txnID), nativeCommit.Bytes(), nil); err != nil {
 		return err
 	}
 
@@ -1203,15 +1207,16 @@ func (s *PebbleMetaStore) writeIntentFastPath(txnID uint64, intentType IntentTyp
 		CreatedAt:    time.Now().UnixNano(),
 	}
 
-	recData, err := encoding.Marshal(rec)
+	native, err := encoding.MarshalNative(rec)
 	if err != nil {
 		return err
 	}
+	defer native.Dispose()
 
 	batch := s.db.NewBatch()
 	defer batch.Close()
 
-	if err := batch.Set(key, recData, nil); err != nil {
+	if err := batch.Set(key, native.Bytes(), nil); err != nil {
 		return err
 	}
 	if err := batch.Set(pebbleIntentByTxnKey(txnID, tableName, intentKey), nil, nil); err != nil {
@@ -1268,11 +1273,12 @@ func (s *PebbleMetaStore) writeIntentSlowPath(txnID uint64, intentType IntentTyp
 				DataSnapshot: data,
 				CreatedAt:    time.Now().UnixNano(),
 			}
-			recData, err := encoding.Marshal(rec)
+			native, err := encoding.MarshalNative(rec)
 			if err != nil {
 				return err
 			}
-			if err := batch.Set(key, recData, nil); err != nil {
+			defer native.Dispose()
+			if err := batch.Set(key, native.Bytes(), nil); err != nil {
 				return err
 			}
 			if err := batch.Set(pebbleIntentByTxnKey(txnID, tableName, intentKey), nil, nil); err != nil {
@@ -1312,11 +1318,12 @@ func (s *PebbleMetaStore) writeIntentSlowPath(txnID uint64, intentType IntentTyp
 			existing.SQLStatement = sqlStmt
 			existing.DataSnapshot = data
 			existing.CreatedAt = time.Now().UnixNano()
-			newData, err := encoding.Marshal(&existing)
+			native, err := encoding.MarshalNative(&existing)
 			if err != nil {
 				return err
 			}
-			if err := s.db.Set(key, newData, pebble.NoSync); err != nil {
+			defer native.Dispose()
+			if err := s.db.Set(key, native.Bytes(), pebble.NoSync); err != nil {
 				return err
 			}
 
@@ -1355,12 +1362,13 @@ func (s *PebbleMetaStore) writeIntentSlowPath(txnID uint64, intentType IntentTyp
 		CreatedAt:    time.Now().UnixNano(),
 	}
 
-	recData, err := encoding.Marshal(rec)
+	native, err := encoding.MarshalNative(rec)
 	if err != nil {
 		return err
 	}
+	defer native.Dispose()
 
-	if err := batch.Set(key, recData, nil); err != nil {
+	if err := batch.Set(key, native.Bytes(), nil); err != nil {
 		return err
 	}
 	if err := batch.Set(pebbleIntentByTxnKey(txnID, tableName, intentKey), nil, nil); err != nil {
@@ -2097,14 +2105,15 @@ func (s *PebbleMetaStore) WriteIntentEntry(txnID, seq uint64, op uint8, table, i
 		Int("new_values_count", len(entry.NewValues)).
 		Msg("CDC: WriteIntentEntry")
 
-	data, err := encoding.Marshal(entry)
+	native, err := encoding.MarshalNative(entry)
 	if err != nil {
 		return err
 	}
+	defer native.Dispose()
 
 	// NoSync: CDC entries are protected by WriteIntent (PREPARE).
 	// If crash occurs, intent exists and CDC can be recovered or transaction aborted.
-	return s.db.Set(pebbleCdcKey(txnID, seq), data, pebble.NoSync)
+	return s.db.Set(pebbleCdcKey(txnID, seq), native.Bytes(), pebble.NoSync)
 }
 
 // GetIntentEntries retrieves CDC intent entries for a transaction
