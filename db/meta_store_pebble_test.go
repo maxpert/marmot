@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/maxpert/marmot/encoding"
 	"github.com/maxpert/marmot/hlc"
 )
 
@@ -246,8 +245,8 @@ func TestPebbleMetaStoreCDCIntentEntries(t *testing.T) {
 	txnID := uint64(12345)
 
 	// Write CDC entries - the correct format is map[string][]byte
-	oldVals, _ := encoding.Marshal(map[string][]byte{"id": {0, 0, 0, 1}, "name": []byte("alice")})
-	newVals, _ := encoding.Marshal(map[string][]byte{"id": {0, 0, 0, 1}, "name": []byte("bob")})
+	oldVals := map[string][]byte{"id": {0, 0, 0, 1}, "name": []byte("alice")}
+	newVals := map[string][]byte{"id": {0, 0, 0, 1}, "name": []byte("bob")}
 
 	err := store.WriteIntentEntry(txnID, 1, 1, "users", "user:1", oldVals, newVals)
 	if err != nil {

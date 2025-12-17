@@ -482,17 +482,8 @@ func (tm *TransactionManager) finalizeCommit(txn *Transaction) error {
 
 // cleanupAfterCommit performs synchronous cleanup to prevent goroutine explosion.
 func (tm *TransactionManager) cleanupAfterCommit(txn *Transaction, intents []*WriteIntentRecord) {
-	// Mark intents for cleanup first (fast path - allows immediate overwrite)
-	if err := tm.metaStore.MarkIntentsForCleanup(txn.ID); err != nil {
-		log.Warn().Err(err).Uint64("txn_id", txn.ID).Msg("Failed to mark intents for cleanup")
-	}
-
-	// Delete intents and CDC entries
-	if err := tm.metaStore.DeleteIntentsByTxn(txn.ID); err != nil {
-		log.Warn().Err(err).Uint64("txn_id", txn.ID).Msg("Failed to cleanup intents after commit")
-	}
-	if err := tm.metaStore.DeleteIntentEntries(txn.ID); err != nil {
-		log.Warn().Err(err).Uint64("txn_id", txn.ID).Msg("Failed to cleanup CDC entries after commit")
+	if err := tm.metaStore.CleanupAfterCommit(txn.ID); err != nil {
+		log.Warn().Err(err).Uint64("txn_id", txn.ID).Msg("Failed to cleanup after commit")
 	}
 }
 

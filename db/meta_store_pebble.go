@@ -10,6 +10,7 @@ import (
 
 	"github.com/cespare/xxhash/v2"
 	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/bloom"
 	"github.com/maxpert/marmot/cfg"
 	"github.com/maxpert/marmot/encoding"
 	"github.com/maxpert/marmot/hlc"
@@ -224,6 +225,16 @@ func NewPebbleMetaStore(path string, opts PebbleMetaStoreOptions) (*PebbleMetaSt
 		L0StopWritesThreshold:       opts.L0StopWrites,
 		MaxConcurrentCompactions:    func() int { return opts.MaxConcurrentCompact },
 		Logger:                      &pebbleLogger{},
+		// Bloom filters for faster point lookups (10 bits per key)
+		Levels: []pebble.LevelOptions{
+			{FilterPolicy: bloom.FilterPolicy(10)},
+			{FilterPolicy: bloom.FilterPolicy(10)},
+			{FilterPolicy: bloom.FilterPolicy(10)},
+			{FilterPolicy: bloom.FilterPolicy(10)},
+			{FilterPolicy: bloom.FilterPolicy(10)},
+			{FilterPolicy: bloom.FilterPolicy(10)},
+			{FilterPolicy: bloom.FilterPolicy(10)},
+		},
 	}
 
 	// LBaseMaxBytes controls base level (L1) compaction target
@@ -1628,6 +1639,118 @@ func (s *PebbleMetaStore) MarkIntentsForCleanup(txnID uint64) error {
 	return batch.Commit(pebble.NoSync)
 }
 
+// CleanupAfterCommit performs all cleanup operations for a committed transaction.
+// Phase 1: Writes GC markers (must commit first for safety - other txns check these)
+// Phase 2: Deletes all intents and CDC entries in a single batch
+// This consolidates MarkIntentsForCleanup + DeleteIntentsByTxn + DeleteIntentEntries
+func (s *PebbleMetaStore) CleanupAfterCommit(txnID uint64) error {
+	// Phase 1: Write GC markers first (MUST be visible before deletions)
+	// Other transactions check GC markers to know if they can overwrite an intent.
+	// If we delete the intent before the GC marker is visible, we have a race condition.
+	if err := s.MarkIntentsForCleanup(txnID); err != nil {
+		return err
+	}
+
+	// Phase 2: Single batch for ALL deletions
+	prefix := pebbleIntentByTxnPrefix(txnID)
+
+	// Collect intent data for filter removal and GC key deletion
+	var primaryKeys [][]byte
+	var indexKeys [][]byte
+	var tableNames []string
+	var intentKeys []string
+
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: prefix,
+		UpperBound: prefixUpperBound(prefix),
+	})
+	if err != nil {
+		return err
+	}
+
+	for iter.SeekGE(prefix); iter.Valid(); iter.Next() {
+		indexKey := make([]byte, len(iter.Key()))
+		copy(indexKey, iter.Key())
+		indexKeys = append(indexKeys, indexKey)
+
+		tableName, intentKey, ok := parseIntentByTxnKey(indexKey, len(prefix))
+		if ok {
+			primaryKeys = append(primaryKeys, pebbleIntentKey(tableName, intentKey))
+			tableNames = append(tableNames, tableName)
+			intentKeys = append(intentKeys, intentKey)
+		}
+	}
+
+	if err := iter.Close(); err != nil {
+		return err
+	}
+
+	// Collect CDC entry keys
+	cdcPrefix := pebbleCdcPrefix(txnID)
+	var cdcKeys [][]byte
+
+	cdcIter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: cdcPrefix,
+		UpperBound: prefixUpperBound(cdcPrefix),
+	})
+	if err != nil {
+		return err
+	}
+
+	for cdcIter.SeekGE(cdcPrefix); cdcIter.Valid(); cdcIter.Next() {
+		key := make([]byte, len(cdcIter.Key()))
+		copy(key, cdcIter.Key())
+		cdcKeys = append(cdcKeys, key)
+	}
+
+	if err := cdcIter.Close(); err != nil {
+		return err
+	}
+
+	// Early return if nothing to delete
+	if len(primaryKeys) == 0 && len(cdcKeys) == 0 {
+		return nil
+	}
+
+	// Single batch for all deletions
+	batch := s.db.NewBatch()
+	defer batch.Close()
+
+	// Delete primary intent keys
+	for _, key := range primaryKeys {
+		_ = batch.Delete(key, nil)
+	}
+
+	// Delete intent index keys
+	for _, key := range indexKeys {
+		_ = batch.Delete(key, nil)
+	}
+
+	// Delete GC markers
+	for i := 0; i < len(tableNames); i++ {
+		gcKey := pebbleGCIntentKey(tableNames[i], intentKeys[i])
+		_ = batch.Delete(gcKey, nil)
+	}
+
+	// Delete CDC entries
+	for _, key := range cdcKeys {
+		_ = batch.Delete(key, nil)
+	}
+
+	// NoSync: Intent cleanup is idempotent. If crash occurs, intents remain
+	// (transaction is already committed) and will be cleaned up on next GC.
+	if err := batch.Commit(pebble.NoSync); err != nil {
+		return err
+	}
+
+	// Sync intent filter after successful Pebble delete
+	if s.intentFilter != nil {
+		s.intentFilter.Remove(txnID)
+	}
+
+	return nil
+}
+
 // GetIntentsByTxn retrieves all write intents for a transaction
 func (s *PebbleMetaStore) GetIntentsByTxn(txnID uint64) ([]*WriteIntentRecord, error) {
 	var intents []*WriteIntentRecord
@@ -1952,28 +2075,16 @@ func (s *PebbleMetaStore) ReleaseDDLLock(dbName string, nodeID uint64) error {
 }
 
 // WriteIntentEntry writes a CDC intent entry
-func (s *PebbleMetaStore) WriteIntentEntry(txnID, seq uint64, op uint8, table, intentKey string, oldVals, newVals []byte) error {
+func (s *PebbleMetaStore) WriteIntentEntry(txnID, seq uint64, op uint8, table, intentKey string, oldVals, newVals map[string][]byte) error {
 	entry := &IntentEntry{
 		TxnID:     txnID,
 		Seq:       seq,
 		Operation: op,
 		Table:     table,
 		IntentKey: intentKey,
+		OldValues: oldVals,
+		NewValues: newVals,
 		CreatedAt: time.Now().UnixNano(),
-	}
-
-	// Store oldVals and newVals as msgpack
-	if oldVals != nil {
-		if err := encoding.Unmarshal(oldVals, &entry.OldValues); err != nil {
-			log.Error().Err(err).Uint64("txn_id", txnID).Str("table", table).Msg("Failed to unmarshal OldValues")
-			return fmt.Errorf("failed to unmarshal old values: %w", err)
-		}
-	}
-	if newVals != nil {
-		if err := encoding.Unmarshal(newVals, &entry.NewValues); err != nil {
-			log.Error().Err(err).Uint64("txn_id", txnID).Str("table", table).Msg("Failed to unmarshal NewValues")
-			return fmt.Errorf("failed to unmarshal new values: %w", err)
-		}
 	}
 
 	log.Debug().
@@ -1982,8 +2093,6 @@ func (s *PebbleMetaStore) WriteIntentEntry(txnID, seq uint64, op uint8, table, i
 		Uint8("op", op).
 		Str("table", table).
 		Str("intent_key", intentKey).
-		Int("old_vals_len", len(oldVals)).
-		Int("new_vals_len", len(newVals)).
 		Int("old_values_count", len(entry.OldValues)).
 		Int("new_values_count", len(entry.NewValues)).
 		Msg("CDC: WriteIntentEntry")

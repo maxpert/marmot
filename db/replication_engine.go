@@ -7,7 +7,6 @@ import (
 	"fmt"
 
 	"github.com/maxpert/marmot/coordinator"
-	"github.com/maxpert/marmot/encoding"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/protocol"
 	"github.com/rs/zerolog/log"
@@ -270,30 +269,12 @@ func (re *ReplicationEngine) createDMLIntent(txnMgr *TransactionManager, metaSto
 	}
 
 	if len(stmt.NewValues) > 0 || len(stmt.OldValues) > 0 {
-		var oldVals, newVals []byte
+		var oldVals, newVals map[string][]byte
 		if len(stmt.OldValues) > 0 {
-			var err error
-			oldVals, err = encoding.Marshal(stmt.OldValues)
-			if err != nil {
-				log.Error().Err(err).Str("table", stmt.TableName).Msg("Failed to marshal OldValues")
-				_ = txnMgr.AbortTransaction(txn)
-				return &PrepareResult{
-					Success: false,
-					Error:   fmt.Sprintf("failed to serialize old values: %v", err),
-				}
-			}
+			oldVals = stmt.OldValues
 		}
 		if len(stmt.NewValues) > 0 {
-			var err error
-			newVals, err = encoding.Marshal(stmt.NewValues)
-			if err != nil {
-				log.Error().Err(err).Str("table", stmt.TableName).Msg("Failed to marshal NewValues")
-				_ = txnMgr.AbortTransaction(txn)
-				return &PrepareResult{
-					Success: false,
-					Error:   fmt.Sprintf("failed to serialize new values: %v", err),
-				}
-			}
+			newVals = stmt.NewValues
 		}
 
 		op := uint8(StatementTypeToOpType(stmt.Type))

@@ -341,17 +341,15 @@ func (s *EphemeralHookSession) processSingleRow(row *CapturedRow, seq uint64) er
 		return err
 	}
 
-	var oldMsgpack, newMsgpack []byte
+	var oldVals, newVals map[string][]byte
 	if row.OldValues != nil {
-		oldVals := encodeValuesWithSchema(schema.Columns, row.OldValues)
-		oldMsgpack, _ = encoding.Marshal(oldVals)
+		oldVals = encodeValuesWithSchema(schema.Columns, row.OldValues)
 	}
 	if row.NewValues != nil {
-		newVals := encodeValuesWithSchema(schema.Columns, row.NewValues)
-		newMsgpack, _ = encoding.Marshal(newVals)
+		newVals = encodeValuesWithSchema(schema.Columns, row.NewValues)
 	}
 
-	return s.metaStore.WriteIntentEntry(s.txnID, seq, opType, row.Table, intentKey, oldMsgpack, newMsgpack)
+	return s.metaStore.WriteIntentEntry(s.txnID, seq, opType, row.Table, intentKey, oldVals, newVals)
 }
 
 // extractPKFromValues extracts PK values from raw values slice using schema indices.
