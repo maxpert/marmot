@@ -7,7 +7,7 @@ import (
 	"sync/atomic"
 	"unsafe"
 
-	"github.com/mxmauro/go-mimalloc"
+	"github.com/maxpert/marmot/pkg/mimalloc"
 )
 
 // NativeBytes represents memory allocated outside the Go heap.
