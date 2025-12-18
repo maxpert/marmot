@@ -698,50 +698,33 @@ func DeserializeData(data []byte, v interface{}) error {
 	return encoding.Unmarshal(data, v)
 }
 
-// writeCDCData writes CDC row data directly to the base table
-// This is the core CDC implementation - replicas receive row data, not SQL
+// schemaCacheAdapter adapts SchemaCache to CDCSchemaProvider interface
+type schemaCacheAdapter struct {
+	cache *SchemaCache
+}
+
+func (s *schemaCacheAdapter) GetPrimaryKeys(tableName string) ([]string, error) {
+	schema, err := s.cache.GetSchemaFor(tableName)
+	if err != nil {
+		return nil, err
+	}
+	return schema.PrimaryKeys, nil
+}
+
+// writeCDCData writes CDC row data directly to the base table using unified CDC applier
 func (tm *TransactionManager) writeCDCData(stmt protocol.Statement) error {
+	schemaAdapter := &schemaCacheAdapter{cache: tm.schemaCache}
+
 	switch stmt.Type {
 	case protocol.StatementInsert, protocol.StatementReplace:
-		return tm.writeCDCInsert(stmt.TableName, stmt.NewValues)
+		return ApplyCDCInsert(tm.db, stmt.TableName, stmt.NewValues)
 	case protocol.StatementUpdate:
-		return tm.writeCDCUpdate(stmt.TableName, stmt.OldValues, stmt.NewValues)
+		return ApplyCDCUpdate(tm.db, schemaAdapter, stmt.TableName, stmt.OldValues, stmt.NewValues)
 	case protocol.StatementDelete:
-		return tm.writeCDCDelete(stmt.TableName, stmt.IntentKey, stmt.OldValues)
+		return ApplyCDCDelete(tm.db, schemaAdapter, stmt.TableName, stmt.OldValues)
 	default:
 		return fmt.Errorf("unsupported statement type for CDC: %v", stmt.Type)
 	}
-}
-
-// writeCDCInsert performs INSERT OR REPLACE using CDC row data
-func (tm *TransactionManager) writeCDCInsert(tableName string, newValues map[string][]byte) error {
-	if len(newValues) == 0 {
-		return fmt.Errorf("no values to insert")
-	}
-
-	// Build INSERT OR REPLACE statement
-	columns := make([]string, 0, len(newValues))
-	placeholders := make([]string, 0, len(newValues))
-	values := make([]interface{}, 0, len(newValues))
-
-	for col := range newValues {
-		columns = append(columns, col)
-		placeholders = append(placeholders, "?")
-
-		value, err := unmarshalCDCValue(newValues[col])
-		if err != nil {
-			return fmt.Errorf("failed to deserialize value for column %s: %w", col, err)
-		}
-		values = append(values, value)
-	}
-
-	sqlStmt := fmt.Sprintf("INSERT OR REPLACE INTO %s (%s) VALUES (%s)",
-		tableName,
-		strings.Join(columns, ", "),
-		strings.Join(placeholders, ", "))
-
-	_, err := tm.db.Exec(sqlStmt, values...)
-	return err
 }
 
 // unmarshalCDCValue deserializes a msgpack-encoded value and converts []byte to string.
@@ -756,139 +739,4 @@ func unmarshalCDCValue(data []byte) (interface{}, error) {
 		return string(b), nil
 	}
 	return value, nil
-}
-
-// writeCDCUpdate performs UPDATE using CDC row data
-// Uses oldValues for WHERE clause (to find existing row) and newValues for SET clause
-func (tm *TransactionManager) writeCDCUpdate(tableName string, oldValues, newValues map[string][]byte) error {
-	if len(newValues) == 0 {
-		return fmt.Errorf("no values to update")
-	}
-
-	if tm.schemaCache == nil {
-		return fmt.Errorf("schema cache not initialized")
-	}
-
-	// Get table schema to build proper WHERE clause
-	schema, err := tm.schemaCache.GetSchemaFor(tableName)
-	if err != nil {
-		// Try to reload schema cache if table not found
-		if _, ok := err.(ErrSchemaCacheMiss); ok {
-			log.Warn().Str("table", tableName).Msg("Schema not cached during UPDATE replay, attempting reload")
-			if reloadErr := tm.reloadSchemaCache(); reloadErr != nil {
-				return fmt.Errorf("failed to reload schema: %w", reloadErr)
-			}
-			// Retry schema lookup
-			schema, err = tm.schemaCache.GetSchemaFor(tableName)
-			if err != nil {
-				return fmt.Errorf("failed to get schema for table %s after reload: %w", tableName, err)
-			}
-		} else {
-			return fmt.Errorf("failed to get schema for table %s: %w", tableName, err)
-		}
-	}
-
-	// Build UPDATE statement with SET clause using newValues
-	setClauses := make([]string, 0, len(newValues))
-	values := make([]interface{}, 0, len(newValues)+len(schema.PrimaryKeys))
-
-	for col, valBytes := range newValues {
-		setClauses = append(setClauses, fmt.Sprintf("%s = ?", col))
-
-		value, err := unmarshalCDCValue(valBytes)
-		if err != nil {
-			return fmt.Errorf("failed to deserialize value for column %s: %w", col, err)
-		}
-		values = append(values, value)
-	}
-
-	// Build WHERE clause using primary key columns from oldValues
-	// This is critical for PK changes: we need the OLD PK to find the row
-	whereClauses := make([]string, 0, len(schema.PrimaryKeys))
-
-	for _, pkCol := range schema.PrimaryKeys {
-		// Use oldValues for WHERE clause if available, fallback to newValues
-		pkBytes, ok := oldValues[pkCol]
-		if !ok {
-			// Fallback to newValues if oldValues doesn't have PK (shouldn't happen for UPDATEs)
-			pkBytes, ok = newValues[pkCol]
-			if !ok {
-				return fmt.Errorf("primary key column %s not found in CDC data", pkCol)
-			}
-		}
-
-		whereClauses = append(whereClauses, fmt.Sprintf("%s = ?", pkCol))
-
-		value, err := unmarshalCDCValue(pkBytes)
-		if err != nil {
-			return fmt.Errorf("failed to deserialize PK value for column %s: %w", pkCol, err)
-		}
-		values = append(values, value)
-	}
-
-	sql := fmt.Sprintf("UPDATE %s SET %s WHERE %s",
-		tableName,
-		strings.Join(setClauses, ", "),
-		strings.Join(whereClauses, " AND "))
-
-	_, err = tm.db.Exec(sql, values...)
-	return err
-}
-
-// writeCDCDelete performs DELETE using CDC row data
-func (tm *TransactionManager) writeCDCDelete(tableName string, intentKey string, oldValues map[string][]byte) error {
-	if len(oldValues) == 0 {
-		return fmt.Errorf("empty old values for delete")
-	}
-
-	if tm.schemaCache == nil {
-		return fmt.Errorf("schema cache not initialized")
-	}
-
-	// Get table schema to build proper WHERE clause
-	schema, err := tm.schemaCache.GetSchemaFor(tableName)
-	if err != nil {
-		// Try to reload schema cache if table not found
-		if _, ok := err.(ErrSchemaCacheMiss); ok {
-			log.Warn().Str("table", tableName).Msg("Schema not cached during DELETE replay, attempting reload")
-			if reloadErr := tm.reloadSchemaCache(); reloadErr != nil {
-				return fmt.Errorf("failed to reload schema: %w", reloadErr)
-			}
-			// Retry schema lookup
-			schema, err = tm.schemaCache.GetSchemaFor(tableName)
-			if err != nil {
-				return fmt.Errorf("failed to get schema for table %s after reload: %w", tableName, err)
-			}
-		} else {
-			return fmt.Errorf("failed to get schema for table %s: %w", tableName, err)
-		}
-	}
-
-	// Build WHERE clause using primary key columns from oldValues
-	// NOTE: Always extract PK values from oldValues, not from intentKey.
-	// intentKey is in format "table:value" which includes the table prefix.
-	whereClauses := make([]string, 0, len(schema.PrimaryKeys))
-	values := make([]interface{}, 0, len(schema.PrimaryKeys))
-
-	for _, pkCol := range schema.PrimaryKeys {
-		pkValue, ok := oldValues[pkCol]
-		if !ok {
-			return fmt.Errorf("primary key column %s not found in CDC old values", pkCol)
-		}
-
-		whereClauses = append(whereClauses, fmt.Sprintf("%s = ?", pkCol))
-
-		value, err := unmarshalCDCValue(pkValue)
-		if err != nil {
-			return fmt.Errorf("failed to deserialize PK value for column %s: %w", pkCol, err)
-		}
-		values = append(values, value)
-	}
-
-	sql := fmt.Sprintf("DELETE FROM %s WHERE %s",
-		tableName,
-		strings.Join(whereClauses, " AND "))
-
-	_, err = tm.db.Exec(sql, values...)
-	return err
 }
