@@ -11,13 +11,6 @@ type TxnState struct {
 	RowCount       uint32
 }
 
-// IntentMeta represents lightweight intent metadata for distributed lock tracking.
-// Intents prevent conflicting concurrent operations on the same row.
-type IntentMeta struct {
-	TxnID     uint64
-	Timestamp int64
-}
-
 // TransactionStore manages in-memory transaction state for active transactions.
 // This interface provides fast lookups and updates without disk I/O overhead.
 type TransactionStore interface {
@@ -46,30 +39,6 @@ type TransactionStore interface {
 
 	// CountPending returns the number of pending transactions.
 	CountPending() int
-}
-
-// IntentStore manages distributed locks (intents) for transaction isolation.
-// Each intent represents a pending write operation on a specific row.
-type IntentStore interface {
-	// Add registers an intent for a transaction on a specific table row.
-	// Returns error if an intent already exists for this key.
-	Add(txnID uint64, table, intentKey string, meta *IntentMeta) error
-
-	// Get retrieves intent metadata for a table row. Returns false if no intent exists.
-	Get(table, intentKey string) (*IntentMeta, bool)
-
-	// Remove deletes an intent for a specific table row.
-	Remove(table, intentKey string)
-
-	// RangeByTxn iterates over all intents belonging to a transaction.
-	// Iterator returns true to continue, false to stop.
-	RangeByTxn(txnID uint64, fn func(table, intentKey string) bool)
-
-	// RemoveByTxn removes all intents belonging to a transaction.
-	RemoveByTxn(txnID uint64)
-
-	// CountByTxn returns the number of intents held by a transaction.
-	CountByTxn(txnID uint64) int
 }
 
 // CDCLockStore manages row-level locks for CDC replication.

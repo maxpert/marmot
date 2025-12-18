@@ -1039,8 +1039,8 @@ func (h *CoordinatorHandler) bufferStatement(session *protocol.ConnectionSession
 // publishCDCEvents publishes CDC events to the publisher registry if enabled
 func (h *CoordinatorHandler) publishCDCEvents(txnID uint64, database string, cdcEntries []common.CDCEntry, commitTS hlc.Timestamp) {
 	h.publisherMu.RLock()
+	defer h.publisherMu.RUnlock()
 	registry := h.publisherRegistry
-	h.publisherMu.RUnlock()
 
 	if registry == nil || len(cdcEntries) == 0 {
 		return

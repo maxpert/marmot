@@ -56,4 +56,3 @@ func GetClusterState(nodeProvider NodeProvider, consistency protocol.Consistency
 		RequiredQuorum:  requiredQuorum,
 	}, nil
 }
-

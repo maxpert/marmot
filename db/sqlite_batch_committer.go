@@ -19,6 +19,10 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
+const (
+	batchCommitTimeout = 30 * time.Second
+)
+
 // Package-level metrics (registered once)
 var (
 	batchCommitterMetricsOnce   sync.Once
@@ -306,7 +310,10 @@ func (bc *SQLiteBatchCommitter) flush(batch map[uint64]*pendingCommit, trigger s
 		batchCommitterFlushDurHist.Observe(float64(time.Since(start).Milliseconds()))
 	}()
 
-	conn, err := bc.db.Conn(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), batchCommitTimeout)
+	defer cancel()
+
+	conn, err := bc.db.Conn(ctx)
 	if err != nil {
 		for _, pc := range batch {
 			pc.promise.Set(nil, err)
@@ -315,7 +322,7 @@ func (bc *SQLiteBatchCommitter) flush(batch map[uint64]*pendingCommit, trigger s
 	}
 	defer conn.Close()
 
-	tx, err := conn.BeginTx(context.Background(), nil)
+	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
 		for _, pc := range batch {
 			pc.promise.Set(nil, err)

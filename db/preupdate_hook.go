@@ -20,17 +20,6 @@ import (
 // Types
 // =============================================================================
 
-// CapturedRow stores raw row data captured during hookCallback.
-// This is a raw copy of sqlite3.SQLitePreUpdateData - no processing.
-type CapturedRow struct {
-	Table     string        `msgpack:"t"`
-	Op        int           `msgpack:"o"` // Raw sqlite3 op (18=INSERT, 23=UPDATE, 9=DELETE)
-	OldRowID  int64         `msgpack:"or"`
-	NewRowID  int64         `msgpack:"nr"`
-	OldValues []interface{} `msgpack:"ov,omitempty"`
-	NewValues []interface{} `msgpack:"nv,omitempty"`
-}
-
 // EphemeralHookSession represents a CDC capture session with its own dedicated connection.
 // The connection is held open for the duration of the session and closed on Commit/Rollback.
 // CDC entries are stored in the per-database MetaStore's __marmot__intent_entries table.

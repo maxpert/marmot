@@ -500,7 +500,6 @@ func (rh *ReplicationHandler) applyReplayCDCDelete(tx *sql.Tx, dbName string, ta
 	return err
 }
 
-
 // HandleRead handles incoming read requests with MVCC snapshot isolation
 func (rh *ReplicationHandler) HandleRead(ctx context.Context, req *ReadRequest) (*ReadResponse, error) {
 	// Update local clock with incoming timestamp

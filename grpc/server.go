@@ -739,43 +739,49 @@ func (s *Server) StreamSnapshot(req *SnapshotRequest, stream MarmotService_Strea
 			return fmt.Errorf("failed to open %s: %w", snap.Filename, err)
 		}
 
-		buf := make([]byte, SnapshotChunkSize)
-		for {
-			n, err := file.Read(buf)
-			if err == io.EOF {
-				break
+		// Use closure to ensure defer works per-iteration
+		err = func() error {
+			defer file.Close()
+
+			buf := make([]byte, SnapshotChunkSize)
+			for {
+				n, err := file.Read(buf)
+				if err == io.EOF {
+					break
+				}
+				if err != nil {
+					return fmt.Errorf("failed to read %s: %w", snap.Filename, err)
+				}
+
+				// Calculate checksum
+				checksum := fmt.Sprintf("%x", md5.Sum(buf[:n]))
+
+				// Check if this is the last chunk for this file
+				pos, _ := file.Seek(0, io.SeekCurrent)
+				info, _ := file.Stat()
+				isLastForFile := pos >= info.Size()
+
+				chunk := &SnapshotChunk{
+					ChunkIndex:    chunkIndex,
+					TotalChunks:   totalChunks,
+					Data:          buf[:n],
+					Checksum:      checksum,
+					Filename:      snap.Filename,
+					IsLastForFile: isLastForFile,
+				}
+
+				if err := stream.Send(chunk); err != nil {
+					return fmt.Errorf("failed to send chunk: %w", err)
+				}
+
+				chunkIndex++
 			}
-			if err != nil {
-				file.Close()
-				return fmt.Errorf("failed to read %s: %w", snap.Filename, err)
-			}
-
-			// Calculate checksum
-			checksum := fmt.Sprintf("%x", md5.Sum(buf[:n]))
-
-			// Check if this is the last chunk for this file
-			pos, _ := file.Seek(0, io.SeekCurrent)
-			info, _ := file.Stat()
-			isLastForFile := pos >= info.Size()
-
-			chunk := &SnapshotChunk{
-				ChunkIndex:    chunkIndex,
-				TotalChunks:   totalChunks,
-				Data:          buf[:n],
-				Checksum:      checksum,
-				Filename:      snap.Filename,
-				IsLastForFile: isLastForFile,
-			}
-
-			if err := stream.Send(chunk); err != nil {
-				file.Close()
-				return fmt.Errorf("failed to send chunk: %w", err)
-			}
-
-			chunkIndex++
+			return nil
+		}()
+		if err != nil {
+			return err
 		}
 
-		file.Close()
 		log.Debug().Str("file", snap.Filename).Msg("Finished streaming file")
 	}
 
