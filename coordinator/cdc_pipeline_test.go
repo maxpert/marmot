@@ -4,12 +4,13 @@ import (
 	"strconv"
 	"testing"
 
+	"github.com/maxpert/marmot/common"
 	"github.com/maxpert/marmot/protocol"
 )
 
 // TestPipeline_SingleInsert tests processing a single INSERT operation
 func TestPipeline_SingleInsert(t *testing.T) {
-	entries := []CDCEntry{
+	entries := []common.CDCEntry{
 		{
 			Table:     "users",
 			IntentKey: "1",
@@ -60,7 +61,7 @@ func TestPipeline_SingleInsert(t *testing.T) {
 
 // TestPipeline_SingleUpdate tests processing a single UPDATE operation
 func TestPipeline_SingleUpdate(t *testing.T) {
-	entries := []CDCEntry{
+	entries := []common.CDCEntry{
 		{
 			Table:     "users",
 			IntentKey: "1",
@@ -108,7 +109,7 @@ func TestPipeline_SingleUpdate(t *testing.T) {
 
 // TestPipeline_SingleDelete tests processing a single DELETE operation
 func TestPipeline_SingleDelete(t *testing.T) {
-	entries := []CDCEntry{
+	entries := []common.CDCEntry{
 		{
 			Table:     "users",
 			IntentKey: "1",
@@ -148,10 +149,10 @@ func TestPipeline_SingleDelete(t *testing.T) {
 // TestPipeline_MultiRowInsert_100Rows tests the WordPress scenario:
 // 100 INSERT entries with different intent keys should produce 100 statements
 func TestPipeline_MultiRowInsert_100Rows(t *testing.T) {
-	entries := make([]CDCEntry, 100)
+	entries := make([]common.CDCEntry, 100)
 	for i := 0; i < 100; i++ {
 		intentKey := string(rune('A' + (i % 26))) // A-Z cycling
-		entries[i] = CDCEntry{
+		entries[i] = common.CDCEntry{
 			Table:     "wp_posts",
 			IntentKey: intentKey,
 			OldValues: nil,
@@ -195,7 +196,7 @@ func TestPipeline_MultiRowInsert_100Rows(t *testing.T) {
 // TestPipeline_MultiRowInsert_PreservesAllRows verifies that different intent keys
 // are all preserved (not merged together)
 func TestPipeline_MultiRowInsert_PreservesAllRows(t *testing.T) {
-	entries := []CDCEntry{
+	entries := []common.CDCEntry{
 		{
 			Table:     "users",
 			IntentKey: "1",
@@ -249,10 +250,10 @@ func TestPipeline_MultiRowInsert_PreservesAllRows(t *testing.T) {
 // produces exactly one statement, even with 100 entries
 func TestPipeline_MultiRowInsert_UniqueIntentKeys(t *testing.T) {
 	// Create 100 entries for 100 unique intent keys
-	entries := make([]CDCEntry, 100)
+	entries := make([]common.CDCEntry, 100)
 	for i := 0; i < 100; i++ {
 		intentKey := string(rune(i)) // Unique intent key for each
-		entries[i] = CDCEntry{
+		entries[i] = common.CDCEntry{
 			Table:     "products",
 			IntentKey: intentKey,
 			OldValues: nil,
@@ -283,7 +284,7 @@ func TestPipeline_MultiRowInsert_UniqueIntentKeys(t *testing.T) {
 // SQLite fires DELETE then INSERT for UPSERT on existing row
 // Pipeline must merge them into a single UPDATE statement
 func TestPipeline_Upsert_DeleteThenInsert_MergedToUpdate(t *testing.T) {
-	entries := []CDCEntry{
+	entries := []common.CDCEntry{
 		// DELETE hook fires first
 		{
 			Table:     "users",
@@ -349,7 +350,7 @@ func TestPipeline_Upsert_DeleteThenInsert_MergedToUpdate(t *testing.T) {
 // TestPipeline_Upsert_PreservesOldValues_FromDelete verifies that
 // OldValues in the merged UPDATE come from the DELETE hook
 func TestPipeline_Upsert_PreservesOldValues_FromDelete(t *testing.T) {
-	entries := []CDCEntry{
+	entries := []common.CDCEntry{
 		{
 			Table:     "products",
 			IntentKey: "42",
@@ -394,7 +395,7 @@ func TestPipeline_Upsert_PreservesOldValues_FromDelete(t *testing.T) {
 // TestPipeline_Upsert_PreservesNewValues_FromInsert verifies that
 // NewValues in the merged UPDATE come from the INSERT hook
 func TestPipeline_Upsert_PreservesNewValues_FromInsert(t *testing.T) {
-	entries := []CDCEntry{
+	entries := []common.CDCEntry{
 		{
 			Table:     "products",
 			IntentKey: "42",
@@ -434,7 +435,7 @@ func TestPipeline_Upsert_PreservesNewValues_FromInsert(t *testing.T) {
 // TestPipeline_InsertThenDelete_CancelsOut tests INSERT followed by DELETE
 // on same row - should cancel out and be dropped
 func TestPipeline_InsertThenDelete_CancelsOut(t *testing.T) {
-	entries := []CDCEntry{
+	entries := []common.CDCEntry{
 		// INSERT
 		{
 			Table:     "users",
@@ -479,7 +480,7 @@ func TestPipeline_InsertThenDelete_CancelsOut(t *testing.T) {
 // TestPipeline_UpdateThenUpdate_MergesValues tests multiple UPDATEs
 // on the same row - OldValues from first, NewValues from last
 func TestPipeline_UpdateThenUpdate_MergesValues(t *testing.T) {
-	entries := []CDCEntry{
+	entries := []common.CDCEntry{
 		// First UPDATE
 		{
 			Table:     "users",
@@ -541,7 +542,7 @@ func TestPipeline_UpdateThenUpdate_MergesValues(t *testing.T) {
 // TestPipeline_UpdateThenDelete_BecomesDelete tests UPDATE followed by DELETE
 // Should become a DELETE with OldValues from the original UPDATE
 func TestPipeline_UpdateThenDelete_BecomesDelete(t *testing.T) {
-	entries := []CDCEntry{
+	entries := []common.CDCEntry{
 		// UPDATE
 		{
 			Table:     "users",
@@ -595,7 +596,7 @@ func TestPipeline_UpdateThenDelete_BecomesDelete(t *testing.T) {
 // TestPipeline_Validation_EmptyTableName_Fails tests that validation
 // fails if any entry has an empty TableName
 func TestPipeline_Validation_EmptyTableName_Fails(t *testing.T) {
-	entries := []CDCEntry{
+	entries := []common.CDCEntry{
 		{
 			Table:     "", // Empty table name
 			IntentKey: "1",
@@ -616,7 +617,7 @@ func TestPipeline_Validation_EmptyTableName_Fails(t *testing.T) {
 // produces empty result without error
 func TestPipeline_Validation_EmptyInput_ReturnsEmpty(t *testing.T) {
 	config := CDCPipelineConfig{ValidateEntries: true}
-	result, err := ProcessCDCEntries([]CDCEntry{}, config)
+	result, err := ProcessCDCEntries([]common.CDCEntry{}, config)
 
 	if err != nil {
 		t.Fatalf("Empty input should not error, got: %v", err)
@@ -653,7 +654,7 @@ func TestPipeline_Validation_NilInput_ReturnsEmpty(t *testing.T) {
 
 // TestPipeline_NilOldValues_Handled tests that nil OldValues are handled correctly
 func TestPipeline_NilOldValues_Handled(t *testing.T) {
-	entries := []CDCEntry{
+	entries := []common.CDCEntry{
 		{
 			Table:     "users",
 			IntentKey: "1",
@@ -680,7 +681,7 @@ func TestPipeline_NilOldValues_Handled(t *testing.T) {
 
 // TestPipeline_NilNewValues_Handled tests that nil NewValues are handled correctly
 func TestPipeline_NilNewValues_Handled(t *testing.T) {
-	entries := []CDCEntry{
+	entries := []common.CDCEntry{
 		{
 			Table:     "users",
 			IntentKey: "1",
@@ -708,7 +709,7 @@ func TestPipeline_NilNewValues_Handled(t *testing.T) {
 // TestPipeline_MixedTables tests that entries from different tables
 // are processed independently
 func TestPipeline_MixedTables(t *testing.T) {
-	entries := []CDCEntry{
+	entries := []common.CDCEntry{
 		{
 			Table:     "users",
 			IntentKey: "1",
@@ -758,7 +759,7 @@ func TestPipeline_MixedTables(t *testing.T) {
 // TestPipeline_SameIntentKey_DifferentTables tests that same IntentKey in different
 // tables are NOT merged (grouping is by table+intentKey)
 func TestPipeline_SameIntentKey_DifferentTables(t *testing.T) {
-	entries := []CDCEntry{
+	entries := []common.CDCEntry{
 		{
 			Table:     "users",
 			IntentKey: "1",
@@ -797,7 +798,7 @@ func TestPipeline_SameIntentKey_DifferentTables(t *testing.T) {
 
 // TestPipeline_ComplexSequence tests a complex sequence of operations
 func TestPipeline_ComplexSequence(t *testing.T) {
-	entries := []CDCEntry{
+	entries := []common.CDCEntry{
 		// Row 1: INSERT
 		{
 			Table:     "users",
@@ -892,7 +893,7 @@ func TestPipeline_ComplexSequence(t *testing.T) {
 
 // TestPipeline_ValidationDisabled tests that validation can be disabled
 func TestPipeline_ValidationDisabled(t *testing.T) {
-	entries := []CDCEntry{
+	entries := []common.CDCEntry{
 		{
 			Table:     "", // Would fail validation
 			IntentKey: "1",
@@ -913,7 +914,7 @@ func TestPipeline_ValidationDisabled(t *testing.T) {
 // TestMergeGroup_InsertThenUpdate_BecomesInsert tests INSERT followed by UPDATE
 // on the same row - should produce a single INSERT with final values
 func TestMergeGroup_InsertThenUpdate_BecomesInsert(t *testing.T) {
-	entries := []CDCEntry{
+	entries := []common.CDCEntry{
 		// INSERT
 		{
 			Table:     "users",
@@ -971,7 +972,7 @@ func TestMergeGroup_InsertThenUpdate_BecomesInsert(t *testing.T) {
 // TestMergeGroup_InsertUpdateUpdate_BecomesInsert tests INSERT followed by multiple UPDATEs
 // Should produce a single INSERT with final values from last UPDATE
 func TestMergeGroup_InsertUpdateUpdate_BecomesInsert(t *testing.T) {
-	entries := []CDCEntry{
+	entries := []common.CDCEntry{
 		// INSERT
 		{
 			Table:     "users",
@@ -1039,7 +1040,7 @@ func TestMergeGroup_InsertUpdateUpdate_BecomesInsert(t *testing.T) {
 // TestPipeline_InsertThenUpdate_ProducesInsert tests full pipeline with INSERT->UPDATE
 // Verifies the result contains INSERT statement with correct values
 func TestPipeline_InsertThenUpdate_ProducesInsert(t *testing.T) {
-	entries := []CDCEntry{
+	entries := []common.CDCEntry{
 		// INSERT
 		{
 			Table:     "users",
@@ -1112,9 +1113,9 @@ func TestPipeline_InsertThenUpdate_ProducesInsert(t *testing.T) {
 }
 
 func BenchmarkProcessCDCEntries_1000Rows(b *testing.B) {
-	entries := make([]CDCEntry, 1000)
+	entries := make([]common.CDCEntry, 1000)
 	for i := 0; i < 1000; i++ {
-		entries[i] = CDCEntry{
+		entries[i] = common.CDCEntry{
 			Table:     "test",
 			IntentKey: strconv.Itoa(i),
 			NewValues: map[string][]byte{"id": []byte(strconv.Itoa(i))},

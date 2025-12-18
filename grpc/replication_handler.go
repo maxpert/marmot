@@ -299,12 +299,9 @@ func (rh *ReplicationHandler) handleReplay(ctx context.Context, req *Transaction
 			NodeID:   req.Timestamp.NodeId,
 		}
 
-		// Convert gRPC statements to protocol.Statement and serialize for storage.
-		// This is CRITICAL: if this node later becomes a delta sync source, it needs
-		// to have the statement data to stream to other lagging nodes.
-		serializedStatements := rh.serializeReplayStatements(req.Statements, dbName)
+		rowCount := uint32(len(req.Statements))
 
-		if err := metaStore.StoreReplayedTransaction(req.TxnId, req.Timestamp.NodeId, commitTS, serializedStatements, dbName); err != nil {
+		if err := metaStore.StoreReplayedTransaction(req.TxnId, req.Timestamp.NodeId, commitTS, dbName, rowCount); err != nil {
 			// Log but don't fail - data is already in SQLite
 			log.Warn().
 				Err(err).
@@ -503,45 +500,6 @@ func (rh *ReplicationHandler) applyReplayCDCDelete(tx *sql.Tx, dbName string, ta
 	return err
 }
 
-// serializeReplayStatements converts gRPC Statement slice to protocol.Statement slice
-// and serializes them with msgpack for storage in TransactionRecord.SerializedStatements.
-// This ensures replayed transactions can be streamed to other lagging nodes.
-func (rh *ReplicationHandler) serializeReplayStatements(stmts []*Statement, dbName string) []byte {
-	if len(stmts) == 0 {
-		return nil
-	}
-
-	protoStmts := make([]protocol.Statement, 0, len(stmts))
-	for _, stmt := range stmts {
-		protoStmt := protocol.Statement{
-			Type:      common.MustFromWireType(stmt.Type),
-			TableName: stmt.TableName,
-			Database:  dbName,
-		}
-
-		// Extract CDC data from RowChange payload
-		if rowChange := stmt.GetRowChange(); rowChange != nil {
-			protoStmt.IntentKey = rowChange.IntentKey
-			protoStmt.OldValues = rowChange.OldValues
-			protoStmt.NewValues = rowChange.NewValues
-		}
-
-		// Extract SQL from DDL payload
-		if ddl := stmt.GetDdlChange(); ddl != nil {
-			protoStmt.SQL = ddl.Sql
-		}
-
-		protoStmts = append(protoStmts, protoStmt)
-	}
-
-	data, err := encoding.Marshal(protoStmts)
-	if err != nil {
-		log.Error().Err(err).Int("statement_count", len(protoStmts)).Msg("serializeReplayStatements: failed to marshal - anti-entropy may not work for this transaction")
-		return nil
-	}
-
-	return data
-}
 
 // HandleRead handles incoming read requests with MVCC snapshot isolation
 func (rh *ReplicationHandler) HandleRead(ctx context.Context, req *ReadRequest) (*ReadResponse, error) {

@@ -1,0 +1,29 @@
+package db
+
+import (
+	"github.com/maxpert/marmot/encoding"
+)
+
+// EncodedCapturedRow stores schema-encoded row data at capture time.
+// All column values are msgpack-encoded when the row is captured.
+type EncodedCapturedRow struct {
+	Table     string            `msgpack:"t"`
+	Op        uint8             `msgpack:"o"`
+	IntentKey string            `msgpack:"k"`
+	OldValues map[string][]byte `msgpack:"ov,omitempty"`
+	NewValues map[string][]byte `msgpack:"nv,omitempty"`
+}
+
+// EncodeRow serializes an EncodedCapturedRow to msgpack bytes.
+func EncodeRow(row *EncodedCapturedRow) ([]byte, error) {
+	return encoding.Marshal(row)
+}
+
+// DecodeRow deserializes msgpack bytes to an EncodedCapturedRow.
+func DecodeRow(data []byte) (*EncodedCapturedRow, error) {
+	var row EncodedCapturedRow
+	if err := encoding.Unmarshal(data, &row); err != nil {
+		return nil, err
+	}
+	return &row, nil
+}

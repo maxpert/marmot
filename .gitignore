@@ -45,3 +45,4 @@ pika-test
 test-config.toml
 test-config-no-secret.toml
 marmot-data/
+plan/

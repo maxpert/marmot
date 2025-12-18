@@ -4,6 +4,7 @@
 package db
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -14,6 +15,19 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// encodeValues encodes a map of column values to msgpack-encoded bytes
+func encodeValues(values map[string]interface{}) (map[string][]byte, error) {
+	encoded := make(map[string][]byte, len(values))
+	for key, val := range values {
+		data, err := encoding.Marshal(val)
+		if err != nil {
+			return nil, err
+		}
+		encoded[key] = data
+	}
+	return encoded, nil
+}
 
 func TestProcessRows_InsertGeneratesIntentKey(t *testing.T) {
 	tmpDir := t.TempDir()
@@ -39,13 +53,18 @@ func TestProcessRows_InsertGeneratesIntentKey(t *testing.T) {
 	replicatedDB.ReloadSchema()
 
 	txnID := uint64(1001)
-	capturedRow := CapturedRow{
+	newVals, err := encodeValues(map[string]interface{}{
+		"id":   int64(1),
+		"name": "alice",
+	})
+	require.NoError(t, err)
+	encodedRow := EncodedCapturedRow{
 		Table:     "users",
-		Op:        sqlite3.SQLITE_INSERT,
-		NewRowID:  1,
-		NewValues: []interface{}{int64(1), "alice"},
+		Op:        uint8(OpTypeInsert),
+		IntentKey: "users:1",
+		NewValues: newVals,
 	}
-	rowData, err := encoding.Marshal(&capturedRow)
+	rowData, err := encoding.Marshal(&encodedRow)
 	require.NoError(t, err)
 	err = metaStore.WriteCapturedRow(txnID, 1, rowData)
 	require.NoError(t, err)
@@ -56,10 +75,7 @@ func TestProcessRows_InsertGeneratesIntentKey(t *testing.T) {
 		schemaCache: replicatedDB.schemaCache,
 	}
 
-	err = session.ProcessCapturedRows()
-	require.NoError(t, err)
-
-	entries, err := metaStore.GetIntentEntries(txnID)
+	entries, err := session.GetIntentEntries()
 	require.NoError(t, err)
 	require.Len(t, entries, 1)
 	assert.Equal(t, "users", entries[0].Table)
@@ -91,15 +107,24 @@ func TestProcessRows_UpdateGeneratesIntentKey(t *testing.T) {
 	replicatedDB.ReloadSchema()
 
 	txnID := uint64(1002)
-	capturedRow := CapturedRow{
+	oldVals, err := encodeValues(map[string]interface{}{
+		"id":   int64(1),
+		"name": "alice",
+	})
+	require.NoError(t, err)
+	newVals, err := encodeValues(map[string]interface{}{
+		"id":   int64(1),
+		"name": "alice_updated",
+	})
+	require.NoError(t, err)
+	encodedRow := EncodedCapturedRow{
 		Table:     "users",
-		Op:        sqlite3.SQLITE_UPDATE,
-		OldRowID:  1,
-		NewRowID:  1,
-		OldValues: []interface{}{int64(1), "alice"},
-		NewValues: []interface{}{int64(1), "alice_updated"},
+		Op:        uint8(OpTypeUpdate),
+		IntentKey: "users:1",
+		OldValues: oldVals,
+		NewValues: newVals,
 	}
-	rowData, err := encoding.Marshal(&capturedRow)
+	rowData, err := encoding.Marshal(&encodedRow)
 	require.NoError(t, err)
 	err = metaStore.WriteCapturedRow(txnID, 1, rowData)
 	require.NoError(t, err)
@@ -110,10 +135,7 @@ func TestProcessRows_UpdateGeneratesIntentKey(t *testing.T) {
 		schemaCache: replicatedDB.schemaCache,
 	}
 
-	err = session.ProcessCapturedRows()
-	require.NoError(t, err)
-
-	entries, err := metaStore.GetIntentEntries(txnID)
+	entries, err := session.GetIntentEntries()
 	require.NoError(t, err)
 	require.Len(t, entries, 1)
 	assert.Equal(t, uint8(OpTypeUpdate), entries[0].Operation)
@@ -145,13 +167,18 @@ func TestProcessRows_DeleteGeneratesIntentKey(t *testing.T) {
 	replicatedDB.ReloadSchema()
 
 	txnID := uint64(1003)
-	capturedRow := CapturedRow{
+	oldVals, err := encodeValues(map[string]interface{}{
+		"id":   int64(1),
+		"name": "alice",
+	})
+	require.NoError(t, err)
+	encodedRow := EncodedCapturedRow{
 		Table:     "users",
-		Op:        sqlite3.SQLITE_DELETE,
-		OldRowID:  1,
-		OldValues: []interface{}{int64(1), "alice"},
+		Op:        uint8(OpTypeDelete),
+		IntentKey: "users:1",
+		OldValues: oldVals,
 	}
-	rowData, err := encoding.Marshal(&capturedRow)
+	rowData, err := encoding.Marshal(&encodedRow)
 	require.NoError(t, err)
 	err = metaStore.WriteCapturedRow(txnID, 1, rowData)
 	require.NoError(t, err)
@@ -162,10 +189,7 @@ func TestProcessRows_DeleteGeneratesIntentKey(t *testing.T) {
 		schemaCache: replicatedDB.schemaCache,
 	}
 
-	err = session.ProcessCapturedRows()
-	require.NoError(t, err)
-
-	entries, err := metaStore.GetIntentEntries(txnID)
+	entries, err := session.GetIntentEntries()
 	require.NoError(t, err)
 	require.Len(t, entries, 1)
 	assert.Equal(t, uint8(OpTypeDelete), entries[0].Operation)
@@ -197,13 +221,18 @@ func TestProcessRows_LockAcquired(t *testing.T) {
 	replicatedDB.ReloadSchema()
 
 	txnID := uint64(1004)
-	capturedRow := CapturedRow{
+	newVals, err := encodeValues(map[string]interface{}{
+		"id":   int64(1),
+		"name": "alice",
+	})
+	require.NoError(t, err)
+	encodedRow := EncodedCapturedRow{
 		Table:     "users",
-		Op:        sqlite3.SQLITE_INSERT,
-		NewRowID:  1,
-		NewValues: []interface{}{int64(1), "alice"},
+		Op:        uint8(OpTypeInsert),
+		IntentKey: "users:1",
+		NewValues: newVals,
 	}
-	rowData, err := encoding.Marshal(&capturedRow)
+	rowData, err := encoding.Marshal(&encodedRow)
 	require.NoError(t, err)
 	err = metaStore.WriteCapturedRow(txnID, 1, rowData)
 	require.NoError(t, err)
@@ -214,15 +243,12 @@ func TestProcessRows_LockAcquired(t *testing.T) {
 		schemaCache: replicatedDB.schemaCache,
 	}
 
+	// ProcessCapturedRows acquires locks
 	err = session.ProcessCapturedRows()
 	require.NoError(t, err)
 
-	entries, err := metaStore.GetIntentEntries(txnID)
-	require.NoError(t, err)
-	require.Len(t, entries, 1)
-
-	intentKey := entries[0].IntentKey
-	lockTxnID, err := metaStore.GetCDCRowLock("users", intentKey)
+	// Now check that the lock was acquired
+	lockTxnID, err := metaStore.GetCDCRowLock("users", "users:1")
 	require.NoError(t, err)
 	assert.Equal(t, txnID, lockTxnID, "Row lock should be held by the transaction")
 }
@@ -251,13 +277,18 @@ func TestProcessRows_ConflictDetected(t *testing.T) {
 	replicatedDB.ReloadSchema()
 
 	txn1 := uint64(1005)
-	capturedRow1 := CapturedRow{
+	newVals1, err := encodeValues(map[string]interface{}{
+		"id":   int64(1),
+		"name": "alice",
+	})
+	require.NoError(t, err)
+	encodedRow1 := EncodedCapturedRow{
 		Table:     "users",
 		Op:        sqlite3.SQLITE_INSERT,
-		NewRowID:  1,
-		NewValues: []interface{}{int64(1), "alice"},
+		IntentKey: "users:1",
+		NewValues: newVals1,
 	}
-	rowData1, err := encoding.Marshal(&capturedRow1)
+	rowData1, err := encoding.Marshal(&encodedRow1)
 	require.NoError(t, err)
 	err = metaStore.WriteCapturedRow(txn1, 1, rowData1)
 	require.NoError(t, err)
@@ -272,15 +303,24 @@ func TestProcessRows_ConflictDetected(t *testing.T) {
 	require.NoError(t, err)
 
 	txn2 := uint64(1006)
-	capturedRow2 := CapturedRow{
+	oldVals2, err := encodeValues(map[string]interface{}{
+		"id":   int64(1),
+		"name": "alice",
+	})
+	require.NoError(t, err)
+	newVals2, err := encodeValues(map[string]interface{}{
+		"id":   int64(1),
+		"name": "bob",
+	})
+	require.NoError(t, err)
+	encodedRow2 := EncodedCapturedRow{
 		Table:     "users",
 		Op:        sqlite3.SQLITE_UPDATE,
-		OldRowID:  1,
-		NewRowID:  1,
-		OldValues: []interface{}{int64(1), "alice"},
-		NewValues: []interface{}{int64(1), "bob"},
+		IntentKey: "users:1",
+		OldValues: oldVals2,
+		NewValues: newVals2,
 	}
-	rowData2, err := encoding.Marshal(&capturedRow2)
+	rowData2, err := encoding.Marshal(&encodedRow2)
 	require.NoError(t, err)
 	err = metaStore.WriteCapturedRow(txn2, 1, rowData2)
 	require.NoError(t, err)
@@ -324,13 +364,18 @@ func TestProcessRows_NoConflictDifferentRows(t *testing.T) {
 	replicatedDB.ReloadSchema()
 
 	txn1 := uint64(1007)
-	capturedRow1 := CapturedRow{
+	newVals1, err := encodeValues(map[string]interface{}{
+		"id":   int64(1),
+		"name": "alice",
+	})
+	require.NoError(t, err)
+	encodedRow1 := EncodedCapturedRow{
 		Table:     "users",
-		Op:        sqlite3.SQLITE_INSERT,
-		NewRowID:  1,
-		NewValues: []interface{}{int64(1), "alice"},
+		Op:        uint8(OpTypeInsert),
+		IntentKey: "users:1",
+		NewValues: newVals1,
 	}
-	rowData1, err := encoding.Marshal(&capturedRow1)
+	rowData1, err := encoding.Marshal(&encodedRow1)
 	require.NoError(t, err)
 	err = metaStore.WriteCapturedRow(txn1, 1, rowData1)
 	require.NoError(t, err)
@@ -345,13 +390,18 @@ func TestProcessRows_NoConflictDifferentRows(t *testing.T) {
 	require.NoError(t, err)
 
 	txn2 := uint64(1008)
-	capturedRow2 := CapturedRow{
+	newVals2, err := encodeValues(map[string]interface{}{
+		"id":   int64(2),
+		"name": "bob",
+	})
+	require.NoError(t, err)
+	encodedRow2 := EncodedCapturedRow{
 		Table:     "users",
-		Op:        sqlite3.SQLITE_INSERT,
-		NewRowID:  2,
-		NewValues: []interface{}{int64(2), "bob"},
+		Op:        uint8(OpTypeInsert),
+		IntentKey: "users:2",
+		NewValues: newVals2,
 	}
-	rowData2, err := encoding.Marshal(&capturedRow2)
+	rowData2, err := encoding.Marshal(&encodedRow2)
 	require.NoError(t, err)
 	err = metaStore.WriteCapturedRow(txn2, 1, rowData2)
 	require.NoError(t, err)
@@ -402,13 +452,18 @@ func TestProcessRows_NoConflictDifferentTables(t *testing.T) {
 	replicatedDB.ReloadSchema()
 
 	txn1 := uint64(1009)
-	capturedRow1 := CapturedRow{
+	newVals1, err := encodeValues(map[string]interface{}{
+		"id":   int64(1),
+		"name": "alice",
+	})
+	require.NoError(t, err)
+	encodedRow1 := EncodedCapturedRow{
 		Table:     "table_a",
-		Op:        sqlite3.SQLITE_INSERT,
-		NewRowID:  1,
-		NewValues: []interface{}{int64(1), "alice"},
+		Op:        uint8(OpTypeInsert),
+		IntentKey: "table_a:1",
+		NewValues: newVals1,
 	}
-	rowData1, err := encoding.Marshal(&capturedRow1)
+	rowData1, err := encoding.Marshal(&encodedRow1)
 	require.NoError(t, err)
 	err = metaStore.WriteCapturedRow(txn1, 1, rowData1)
 	require.NoError(t, err)
@@ -423,13 +478,18 @@ func TestProcessRows_NoConflictDifferentTables(t *testing.T) {
 	require.NoError(t, err)
 
 	txn2 := uint64(1010)
-	capturedRow2 := CapturedRow{
+	newVals2, err := encodeValues(map[string]interface{}{
+		"id":   int64(1),
+		"name": "bob",
+	})
+	require.NoError(t, err)
+	encodedRow2 := EncodedCapturedRow{
 		Table:     "table_b",
-		Op:        sqlite3.SQLITE_INSERT,
-		NewRowID:  1,
-		NewValues: []interface{}{int64(1), "bob"},
+		Op:        uint8(OpTypeInsert),
+		IntentKey: "table_b:1",
+		NewValues: newVals2,
 	}
-	rowData2, err := encoding.Marshal(&capturedRow2)
+	rowData2, err := encoding.Marshal(&encodedRow2)
 	require.NoError(t, err)
 	err = metaStore.WriteCapturedRow(txn2, 1, rowData2)
 	require.NoError(t, err)
@@ -468,13 +528,19 @@ func TestProcessRows_CDCEntriesGenerated(t *testing.T) {
 	replicatedDB.ReloadSchema()
 
 	txnID := uint64(1011)
-	capturedRow := CapturedRow{
+	newVals, err := encodeValues(map[string]interface{}{
+		"id":    int64(1),
+		"name":  "alice",
+		"email": "alice@example.com",
+	})
+	require.NoError(t, err)
+	encodedRow := EncodedCapturedRow{
 		Table:     "users",
-		Op:        sqlite3.SQLITE_INSERT,
-		NewRowID:  1,
-		NewValues: []interface{}{int64(1), "alice", "alice@example.com"},
+		Op:        uint8(OpTypeInsert),
+		IntentKey: "users:1",
+		NewValues: newVals,
 	}
-	rowData, err := encoding.Marshal(&capturedRow)
+	rowData, err := encoding.Marshal(&encodedRow)
 	require.NoError(t, err)
 	err = metaStore.WriteCapturedRow(txnID, 1, rowData)
 	require.NoError(t, err)
@@ -485,10 +551,7 @@ func TestProcessRows_CDCEntriesGenerated(t *testing.T) {
 		schemaCache: replicatedDB.schemaCache,
 	}
 
-	err = session.ProcessCapturedRows()
-	require.NoError(t, err)
-
-	entries, err := metaStore.GetIntentEntries(txnID)
+	entries, err := session.GetIntentEntries()
 	require.NoError(t, err)
 	require.Len(t, entries, 1)
 
@@ -536,29 +599,29 @@ func TestProcessRows_MultipleRowsProcessed(t *testing.T) {
 
 	txnID := uint64(1012)
 
-	rows := []CapturedRow{
-		{
-			Table:     "users",
-			Op:        sqlite3.SQLITE_INSERT,
-			NewRowID:  1,
-			NewValues: []interface{}{int64(1), "alice"},
-		},
-		{
-			Table:     "users",
-			Op:        sqlite3.SQLITE_INSERT,
-			NewRowID:  2,
-			NewValues: []interface{}{int64(2), "bob"},
-		},
-		{
-			Table:     "users",
-			Op:        sqlite3.SQLITE_INSERT,
-			NewRowID:  3,
-			NewValues: []interface{}{int64(3), "charlie"},
-		},
+	// Create test rows using EncodedCapturedRow format
+	testCases := []struct {
+		id   int64
+		name string
+	}{
+		{1, "alice"},
+		{2, "bob"},
+		{3, "charlie"},
 	}
 
-	for i, row := range rows {
-		rowData, err := encoding.Marshal(&row)
+	for i, tc := range testCases {
+		newVals, err := encodeValues(map[string]interface{}{
+			"id":   tc.id,
+			"name": tc.name,
+		})
+		require.NoError(t, err)
+		encodedRow := EncodedCapturedRow{
+			Table:     "users",
+			Op:        uint8(OpTypeInsert),
+			IntentKey: fmt.Sprintf("users:%d", tc.id),
+			NewValues: newVals,
+		}
+		rowData, err := encoding.Marshal(&encodedRow)
 		require.NoError(t, err)
 		err = metaStore.WriteCapturedRow(txnID, uint64(i+1), rowData)
 		require.NoError(t, err)
@@ -570,10 +633,7 @@ func TestProcessRows_MultipleRowsProcessed(t *testing.T) {
 		schemaCache: replicatedDB.schemaCache,
 	}
 
-	err = session.ProcessCapturedRows()
-	require.NoError(t, err)
-
-	entries, err := metaStore.GetIntentEntries(txnID)
+	entries, err := session.GetIntentEntries()
 	require.NoError(t, err)
 	require.Len(t, entries, 3, "All three rows should be processed")
 
@@ -588,7 +648,7 @@ func TestProcessRows_MultipleRowsProcessed(t *testing.T) {
 	assert.Len(t, intentKeys, 3, "Each row should have a unique intent key")
 }
 
-func TestProcessRows_CapturedRowsCleanedUp(t *testing.T) {
+func TestProcessRows_CapturedRowsRetained(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "test.db")
 	metaPath := filepath.Join(tmpDir, "meta")
@@ -612,13 +672,18 @@ func TestProcessRows_CapturedRowsCleanedUp(t *testing.T) {
 	replicatedDB.ReloadSchema()
 
 	txnID := uint64(1013)
-	capturedRow := CapturedRow{
+	newVals, err := encodeValues(map[string]interface{}{
+		"id":   int64(1),
+		"name": "alice",
+	})
+	require.NoError(t, err)
+	encodedRow := EncodedCapturedRow{
 		Table:     "users",
-		Op:        sqlite3.SQLITE_INSERT,
-		NewRowID:  1,
-		NewValues: []interface{}{int64(1), "alice"},
+		Op:        uint8(OpTypeInsert),
+		IntentKey: "users:1",
+		NewValues: newVals,
 	}
-	rowData, err := encoding.Marshal(&capturedRow)
+	rowData, err := encoding.Marshal(&encodedRow)
 	require.NoError(t, err)
 	err = metaStore.WriteCapturedRow(txnID, 1, rowData)
 	require.NoError(t, err)
@@ -639,7 +704,7 @@ func TestProcessRows_CapturedRowsCleanedUp(t *testing.T) {
 
 	cursor, err = metaStore.IterateCapturedRows(txnID)
 	require.NoError(t, err)
-	require.False(t, cursor.Next(), "Captured rows should be cleaned up after processing")
+	require.True(t, cursor.Next(), "Captured rows should be retained for replication until GC")
 	cursor.Close()
 }
 
@@ -663,13 +728,18 @@ func TestProcessRows_SchemaNotFoundSkipsRow(t *testing.T) {
 	defer replicatedDB.Close()
 
 	txnID := uint64(1014)
-	capturedRow := CapturedRow{
+	newVals, err := encodeValues(map[string]interface{}{
+		"id":   int64(1),
+		"name": "alice",
+	})
+	require.NoError(t, err)
+	encodedRow := EncodedCapturedRow{
 		Table:     "nonexistent_table",
-		Op:        sqlite3.SQLITE_INSERT,
-		NewRowID:  1,
-		NewValues: []interface{}{int64(1), "alice"},
+		Op:        uint8(OpTypeInsert),
+		IntentKey: "nonexistent_table:1",
+		NewValues: newVals,
 	}
-	rowData, err := encoding.Marshal(&capturedRow)
+	rowData, err := encoding.Marshal(&encodedRow)
 	require.NoError(t, err)
 	err = metaStore.WriteCapturedRow(txnID, 1, rowData)
 	require.NoError(t, err)
@@ -681,8 +751,12 @@ func TestProcessRows_SchemaNotFoundSkipsRow(t *testing.T) {
 	}
 
 	err = session.ProcessCapturedRows()
-	require.Error(t, err, "Schema not found should cause error")
-	require.Contains(t, err.Error(), "schema not found")
+	require.NoError(t, err, "ProcessCapturedRows should succeed - schema check happens at capture time")
+
+	cursor, err := metaStore.IterateCapturedRows(txnID)
+	require.NoError(t, err)
+	require.True(t, cursor.Next(), "Captured row should still be accessible after ProcessCapturedRows")
+	cursor.Close()
 }
 
 func TestProcessRows_CompositeKeyIntentGeneration(t *testing.T) {
@@ -709,13 +783,19 @@ func TestProcessRows_CompositeKeyIntentGeneration(t *testing.T) {
 	replicatedDB.ReloadSchema()
 
 	txnID := uint64(1015)
-	capturedRow := CapturedRow{
+	newVals, err := encodeValues(map[string]interface{}{
+		"user_id":  int64(42),
+		"order_id": int64(100),
+		"amount":   99.99,
+	})
+	require.NoError(t, err)
+	encodedRow := EncodedCapturedRow{
 		Table:     "orders",
-		Op:        sqlite3.SQLITE_INSERT,
-		NewRowID:  1,
-		NewValues: []interface{}{int64(42), int64(100), 99.99},
+		Op:        uint8(OpTypeInsert),
+		IntentKey: "orders:42:100",
+		NewValues: newVals,
 	}
-	rowData, err := encoding.Marshal(&capturedRow)
+	rowData, err := encoding.Marshal(&encodedRow)
 	require.NoError(t, err)
 	err = metaStore.WriteCapturedRow(txnID, 1, rowData)
 	require.NoError(t, err)
@@ -726,10 +806,7 @@ func TestProcessRows_CompositeKeyIntentGeneration(t *testing.T) {
 		schemaCache: replicatedDB.schemaCache,
 	}
 
-	err = session.ProcessCapturedRows()
-	require.NoError(t, err)
-
-	entries, err := metaStore.GetIntentEntries(txnID)
+	entries, err := session.GetIntentEntries()
 	require.NoError(t, err)
 	require.Len(t, entries, 1)
 
@@ -761,13 +838,17 @@ func TestProcessRows_RowIDBasedPK(t *testing.T) {
 	replicatedDB.ReloadSchema()
 
 	txnID := uint64(1016)
-	capturedRow := CapturedRow{
+	newVals, err := encodeValues(map[string]interface{}{
+		"content": "My important note",
+	})
+	require.NoError(t, err)
+	encodedRow := EncodedCapturedRow{
 		Table:     "notes",
-		Op:        sqlite3.SQLITE_INSERT,
-		NewRowID:  42,
-		NewValues: []interface{}{"My important note"},
+		Op:        uint8(OpTypeInsert),
+		IntentKey: "notes:42",
+		NewValues: newVals,
 	}
-	rowData, err := encoding.Marshal(&capturedRow)
+	rowData, err := encoding.Marshal(&encodedRow)
 	require.NoError(t, err)
 	err = metaStore.WriteCapturedRow(txnID, 1, rowData)
 	require.NoError(t, err)
@@ -778,10 +859,7 @@ func TestProcessRows_RowIDBasedPK(t *testing.T) {
 		schemaCache: replicatedDB.schemaCache,
 	}
 
-	err = session.ProcessCapturedRows()
-	require.NoError(t, err)
-
-	entries, err := metaStore.GetIntentEntries(txnID)
+	entries, err := session.GetIntentEntries()
 	require.NoError(t, err)
 	require.Len(t, entries, 1)
 

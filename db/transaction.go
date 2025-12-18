@@ -306,8 +306,6 @@ func (tm *TransactionManager) calculateCommitTS(startTS hlc.Timestamp) hlc.Times
 }
 
 // applyDataChanges applies CDC entries or DDL statements from intents.
-// CRITICAL: Also rebuilds txn.Statements from persistent storage for serialization
-// in finalizeCommit. Without this, anti-entropy delta sync has no data to stream.
 func (tm *TransactionManager) applyDataChanges(txn *Transaction, intents []*WriteIntentRecord) error {
 	cdcEntries, err := tm.metaStore.GetIntentEntries(txn.ID)
 	if err != nil {
@@ -319,9 +317,7 @@ func (tm *TransactionManager) applyDataChanges(txn *Transaction, intents []*Writ
 		return err
 	}
 
-	// Rebuild txn.Statements from CDC entries for persistence in TransactionRecord.
-	// This is CRITICAL for anti-entropy: StreamChanges reads SerializedStatements to send
-	// CDC data to lagging nodes. Without this, delta sync receives empty statements.
+	// Rebuild txn.Statements from CDC entries
 	txn.Statements = tm.rebuildStatementsFromCDC(cdcEntries, intents)
 
 	// Apply DDL statements if no CDC entries
@@ -335,8 +331,7 @@ func (tm *TransactionManager) applyDataChanges(txn *Transaction, intents []*Writ
 }
 
 // rebuildStatementsFromCDC reconstructs protocol.Statement slice from CDC entries
-// and DDL intents. This data is serialized to TransactionRecord.SerializedStatements
-// for anti-entropy streaming to lagging nodes.
+// and DDL intents for in-memory transaction tracking.
 func (tm *TransactionManager) rebuildStatementsFromCDC(cdcEntries []*IntentEntry, intents []*WriteIntentRecord) []protocol.Statement {
 	statements := make([]protocol.Statement, 0, len(cdcEntries)+len(intents))
 
@@ -347,7 +342,7 @@ func (tm *TransactionManager) rebuildStatementsFromCDC(cdcEntries []*IntentEntry
 			IntentKey: entry.IntentKey,
 			OldValues: entry.OldValues,
 			NewValues: entry.NewValues,
-			Type:      opCodeToStatementType(entry.Operation),
+			Type:      OpTypeToStatementType(OpType(entry.Operation)),
 		}
 		statements = append(statements, stmt)
 	}
@@ -392,7 +387,7 @@ func (tm *TransactionManager) applyCDCEntries(txnID uint64, entries []*IntentEnt
 			IntentKey: entry.IntentKey,
 			OldValues: entry.OldValues,
 			NewValues: entry.NewValues,
-			Type:      opCodeToStatementType(entry.Operation),
+			Type:      OpTypeToStatementType(OpType(entry.Operation)),
 		}
 
 		if err := tm.writeCDCData(stmt); err != nil {
@@ -443,10 +438,8 @@ func (tm *TransactionManager) applyDDLIntents(txnID uint64, intents []*WriteInte
 
 // finalizeCommit marks the transaction as committed in MetaStore.
 func (tm *TransactionManager) finalizeCommit(txn *Transaction) error {
-	statementsJSON, err := encoding.Marshal(txn.Statements)
-	if err != nil {
-		return fmt.Errorf("failed to serialize statements: %w", err)
-	}
+	// Count rows instead of serializing statements
+	rowCount := uint32(len(txn.Statements))
 
 	// Get database name from statement or fall back to transaction manager's database
 	dbName := ""
@@ -472,7 +465,8 @@ func (tm *TransactionManager) finalizeCommit(txn *Transaction) error {
 	}
 	tablesInvolved := strings.Join(tables, ",")
 
-	if err := tm.metaStore.CommitTransaction(txn.ID, txn.CommitTS, statementsJSON, dbName, tablesInvolved, txn.RequiredSchemaVersion); err != nil {
+	// Pass empty statements and rowCount to CommitTransaction
+	if err := tm.metaStore.CommitTransaction(txn.ID, txn.CommitTS, nil, dbName, tablesInvolved, txn.RequiredSchemaVersion, rowCount); err != nil {
 		return fmt.Errorf("failed to mark transaction as committed: %w", err)
 	}
 
@@ -484,21 +478,6 @@ func (tm *TransactionManager) finalizeCommit(txn *Transaction) error {
 func (tm *TransactionManager) cleanupAfterCommit(txn *Transaction, intents []*WriteIntentRecord) {
 	if err := tm.metaStore.CleanupAfterCommit(txn.ID); err != nil {
 		log.Warn().Err(err).Uint64("txn_id", txn.ID).Msg("Failed to cleanup after commit")
-	}
-}
-
-// opCodeToStatementType converts OpType back to protocol.StatementCode.
-// Panics on unknown type - internal data corruption should not be silently ignored.
-func opCodeToStatementType(op uint8) protocol.StatementCode {
-	switch OpType(op) {
-	case OpTypeInsert, OpTypeReplace:
-		return protocol.StatementInsert
-	case OpTypeUpdate:
-		return protocol.StatementUpdate
-	case OpTypeDelete:
-		return protocol.StatementDelete
-	default:
-		panic(fmt.Sprintf("opCodeToStatementType: unknown OpType %d", op))
 	}
 }
 

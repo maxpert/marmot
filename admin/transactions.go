@@ -64,7 +64,6 @@ func (h *AdminHandlers) handleTransaction(w http.ResponseWriter, r *http.Request
 		"committed_at":      formatTimestamp(rec.CommittedAt),
 		"last_heartbeat":    formatTimestamp(rec.LastHeartbeat),
 		"tables_involved":   rec.TablesInvolved,
-		"statements":        decodeStatements(rec.SerializedStatements),
 		"database_name":     rec.DatabaseName,
 	}
 
@@ -140,7 +139,6 @@ func (h *AdminHandlers) handleCommittedTransactions(w http.ResponseWriter, r *ht
 			"committed_at":      formatTimestamp(rec.CommittedAt),
 			"last_heartbeat":    formatTimestamp(rec.LastHeartbeat),
 			"tables_involved":   rec.TablesInvolved,
-			"statements":        decodeStatements(rec.SerializedStatements),
 			"database_name":     rec.DatabaseName,
 		}
 		response = append(response, item)

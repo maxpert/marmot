@@ -10,25 +10,11 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/mattn/go-sqlite3"
 	"github.com/maxpert/marmot/encoding"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
-
-// assertTextEqual handles TEXT values that may be []byte or string from SQLite
-func assertTextEqual(t *testing.T, expected string, actual interface{}) {
-	t.Helper()
-	switch v := actual.(type) {
-	case string:
-		assert.Equal(t, expected, v)
-	case []byte:
-		assert.Equal(t, expected, string(v))
-	default:
-		t.Errorf("expected string or []byte, got %T", actual)
-	}
-}
 
 // TestHookCapture_Insert verifies INSERT captures NewValues, NewRowID
 func TestHookCapture_Insert(t *testing.T) {
@@ -68,15 +54,15 @@ func TestHookCapture_Insert(t *testing.T) {
 	require.NoError(t, err)
 
 	// Verify capture WITHOUT calling ProcessCapturedRows
-	var captured []CapturedRow
+	var captured []*EncodedCapturedRow
 	cursor, err := metaStore.IterateCapturedRows(txnID)
 	require.NoError(t, err)
 	defer cursor.Close()
 
 	for cursor.Next() {
 		_, data := cursor.Row()
-		var row CapturedRow
-		require.NoError(t, encoding.Unmarshal(data, &row))
+		row, err := DecodeRow(data)
+		require.NoError(t, err)
 		captured = append(captured, row)
 	}
 	require.NoError(t, cursor.Err())
@@ -84,16 +70,24 @@ func TestHookCapture_Insert(t *testing.T) {
 	// Assert
 	require.Len(t, captured, 1)
 	assert.Equal(t, "test", captured[0].Table)
-	assert.Equal(t, sqlite3.SQLITE_INSERT, captured[0].Op)
-	assert.NotEqual(t, int64(0), captured[0].NewRowID)
+	assert.Equal(t, uint8(OpTypeInsert), captured[0].Op)
 	assert.Nil(t, captured[0].OldValues)
 	require.NotNil(t, captured[0].NewValues)
 	assert.Len(t, captured[0].NewValues, 3) // 3 columns
+	assert.NotEmpty(t, captured[0].IntentKey)
 
-	// Verify values (TEXT may be []byte or string from SQLite)
-	assert.Equal(t, int64(1), captured[0].NewValues[0])
-	assertTextEqual(t, "alice", captured[0].NewValues[1])
-	assert.Equal(t, int64(100), captured[0].NewValues[2])
+	// Verify values are encoded
+	var idVal int64
+	require.NoError(t, encoding.Unmarshal(captured[0].NewValues["id"], &idVal))
+	assert.Equal(t, int64(1), idVal)
+
+	var nameVal string
+	require.NoError(t, encoding.Unmarshal(captured[0].NewValues["name"], &nameVal))
+	assert.Equal(t, "alice", nameVal)
+
+	var valueVal int64
+	require.NoError(t, encoding.Unmarshal(captured[0].NewValues["value"], &valueVal))
+	assert.Equal(t, int64(100), valueVal)
 }
 
 // TestHookCapture_Update verifies UPDATE captures both OldValues and NewValues
@@ -134,15 +128,15 @@ func TestHookCapture_Update(t *testing.T) {
 	require.NoError(t, err)
 
 	// Verify capture
-	var captured []CapturedRow
+	var captured []*EncodedCapturedRow
 	cursor, err := metaStore.IterateCapturedRows(txnID)
 	require.NoError(t, err)
 	defer cursor.Close()
 
 	for cursor.Next() {
 		_, data := cursor.Row()
-		var row CapturedRow
-		require.NoError(t, encoding.Unmarshal(data, &row))
+		row, err := DecodeRow(data)
+		require.NoError(t, err)
 		captured = append(captured, row)
 	}
 	require.NoError(t, cursor.Err())
@@ -150,23 +144,34 @@ func TestHookCapture_Update(t *testing.T) {
 	// Assert
 	require.Len(t, captured, 1)
 	assert.Equal(t, "test", captured[0].Table)
-	assert.Equal(t, sqlite3.SQLITE_UPDATE, captured[0].Op)
-	assert.NotEqual(t, int64(0), captured[0].OldRowID)
-	assert.NotEqual(t, int64(0), captured[0].NewRowID)
+	assert.Equal(t, uint8(OpTypeUpdate), captured[0].Op)
+	assert.NotEmpty(t, captured[0].IntentKey)
 
 	// Verify OldValues
 	require.NotNil(t, captured[0].OldValues)
 	assert.Len(t, captured[0].OldValues, 3)
-	assert.Equal(t, int64(1), captured[0].OldValues[0])
-	assertTextEqual(t, "alice", captured[0].OldValues[1])
-	assert.Equal(t, int64(100), captured[0].OldValues[2])
+
+	var oldID, oldValue int64
+	var oldName string
+	require.NoError(t, encoding.Unmarshal(captured[0].OldValues["id"], &oldID))
+	require.NoError(t, encoding.Unmarshal(captured[0].OldValues["name"], &oldName))
+	require.NoError(t, encoding.Unmarshal(captured[0].OldValues["value"], &oldValue))
+	assert.Equal(t, int64(1), oldID)
+	assert.Equal(t, "alice", oldName)
+	assert.Equal(t, int64(100), oldValue)
 
 	// Verify NewValues
 	require.NotNil(t, captured[0].NewValues)
 	assert.Len(t, captured[0].NewValues, 3)
-	assert.Equal(t, int64(1), captured[0].NewValues[0])
-	assertTextEqual(t, "bob", captured[0].NewValues[1])
-	assert.Equal(t, int64(200), captured[0].NewValues[2])
+
+	var newID, newValue int64
+	var newName string
+	require.NoError(t, encoding.Unmarshal(captured[0].NewValues["id"], &newID))
+	require.NoError(t, encoding.Unmarshal(captured[0].NewValues["name"], &newName))
+	require.NoError(t, encoding.Unmarshal(captured[0].NewValues["value"], &newValue))
+	assert.Equal(t, int64(1), newID)
+	assert.Equal(t, "bob", newName)
+	assert.Equal(t, int64(200), newValue)
 }
 
 // TestHookCapture_Delete verifies DELETE captures OldValues only
@@ -207,15 +212,15 @@ func TestHookCapture_Delete(t *testing.T) {
 	require.NoError(t, err)
 
 	// Verify capture
-	var captured []CapturedRow
+	var captured []*EncodedCapturedRow
 	cursor, err := metaStore.IterateCapturedRows(txnID)
 	require.NoError(t, err)
 	defer cursor.Close()
 
 	for cursor.Next() {
 		_, data := cursor.Row()
-		var row CapturedRow
-		require.NoError(t, encoding.Unmarshal(data, &row))
+		row, err := DecodeRow(data)
+		require.NoError(t, err)
 		captured = append(captured, row)
 	}
 	require.NoError(t, cursor.Err())
@@ -223,16 +228,22 @@ func TestHookCapture_Delete(t *testing.T) {
 	// Assert
 	require.Len(t, captured, 1)
 	assert.Equal(t, "test", captured[0].Table)
-	assert.Equal(t, sqlite3.SQLITE_DELETE, captured[0].Op)
-	assert.NotEqual(t, int64(0), captured[0].OldRowID)
+	assert.Equal(t, uint8(OpTypeDelete), captured[0].Op)
+	assert.NotEmpty(t, captured[0].IntentKey)
 	assert.Nil(t, captured[0].NewValues)
 
 	// Verify OldValues
 	require.NotNil(t, captured[0].OldValues)
 	assert.Len(t, captured[0].OldValues, 3)
-	assert.Equal(t, int64(1), captured[0].OldValues[0])
-	assertTextEqual(t, "alice", captured[0].OldValues[1])
-	assert.Equal(t, int64(100), captured[0].OldValues[2])
+
+	var oldID, oldValue int64
+	var oldName string
+	require.NoError(t, encoding.Unmarshal(captured[0].OldValues["id"], &oldID))
+	require.NoError(t, encoding.Unmarshal(captured[0].OldValues["name"], &oldName))
+	require.NoError(t, encoding.Unmarshal(captured[0].OldValues["value"], &oldValue))
+	assert.Equal(t, int64(1), oldID)
+	assert.Equal(t, "alice", oldName)
+	assert.Equal(t, int64(100), oldValue)
 }
 
 // TestHookCapture_SkipsInternalTables verifies __marmot* tables are NOT captured
@@ -277,15 +288,15 @@ func TestHookCapture_SkipsInternalTables(t *testing.T) {
 	require.NoError(t, err)
 
 	// Verify only user table was captured
-	var captured []CapturedRow
+	var captured []*EncodedCapturedRow
 	cursor, err := metaStore.IterateCapturedRows(txnID)
 	require.NoError(t, err)
 	defer cursor.Close()
 
 	for cursor.Next() {
 		_, data := cursor.Row()
-		var row CapturedRow
-		require.NoError(t, encoding.Unmarshal(data, &row))
+		row, err := DecodeRow(data)
+		require.NoError(t, err)
 		captured = append(captured, row)
 	}
 	require.NoError(t, cursor.Err())
@@ -343,30 +354,48 @@ func TestHookCapture_AllColumnTypes(t *testing.T) {
 	require.NoError(t, err)
 
 	// Verify capture
-	var captured []CapturedRow
+	var captured []*EncodedCapturedRow
 	cursor, err := metaStore.IterateCapturedRows(txnID)
 	require.NoError(t, err)
 	defer cursor.Close()
 
 	for cursor.Next() {
 		_, data := cursor.Row()
-		var row CapturedRow
-		require.NoError(t, encoding.Unmarshal(data, &row))
+		row, err := DecodeRow(data)
+		require.NoError(t, err)
 		captured = append(captured, row)
 	}
 	require.NoError(t, cursor.Err())
 
 	require.Len(t, captured, 1)
 	require.NotNil(t, captured[0].NewValues)
-	assert.Len(t, captured[0].NewValues, 6)
+	// NULL values are not included in the encoded map, so we have 5 not 6
+	assert.Len(t, captured[0].NewValues, 5)
 
-	// Verify types
-	assert.Equal(t, int64(1), captured[0].NewValues[0])                       // INTEGER
-	assertTextEqual(t, "hello", captured[0].NewValues[1])                     // TEXT
-	assert.Equal(t, int64(42), captured[0].NewValues[2])                      // INTEGER
-	assert.InDelta(t, 3.14, captured[0].NewValues[3], 0.01)                   // REAL
-	assert.Equal(t, []byte{0xDE, 0xAD, 0xBE, 0xEF}, captured[0].NewValues[4]) // BLOB
-	assert.Nil(t, captured[0].NewValues[5])                                   // NULL
+	// Verify types - values are now msgpack encoded
+	var id int64
+	require.NoError(t, encoding.Unmarshal(captured[0].NewValues["id"], &id))
+	assert.Equal(t, int64(1), id)
+
+	var text string
+	require.NoError(t, encoding.Unmarshal(captured[0].NewValues["text_col"], &text))
+	assert.Equal(t, "hello", text)
+
+	var intCol int64
+	require.NoError(t, encoding.Unmarshal(captured[0].NewValues["int_col"], &intCol))
+	assert.Equal(t, int64(42), intCol)
+
+	var realCol float64
+	require.NoError(t, encoding.Unmarshal(captured[0].NewValues["real_col"], &realCol))
+	assert.InDelta(t, 3.14, realCol, 0.01)
+
+	var blobCol []byte
+	require.NoError(t, encoding.Unmarshal(captured[0].NewValues["blob_col"], &blobCol))
+	assert.Equal(t, []byte{0xDE, 0xAD, 0xBE, 0xEF}, blobCol)
+
+	// NULL columns are not included in the map
+	_, hasNullCol := captured[0].NewValues["null_col"]
+	assert.False(t, hasNullCol)
 }
 
 // TestHookCapture_MultipleOperations verifies multiple ops have correct sequence
@@ -408,7 +437,7 @@ func TestHookCapture_MultipleOperations(t *testing.T) {
 	require.NoError(t, session.ExecContext(ctx, "DELETE FROM test WHERE id = 2"))
 
 	// Verify captures
-	var captured []CapturedRow
+	var captured []*EncodedCapturedRow
 	var sequences []uint64
 	cursor, err := metaStore.IterateCapturedRows(txnID)
 	require.NoError(t, err)
@@ -417,8 +446,8 @@ func TestHookCapture_MultipleOperations(t *testing.T) {
 	for cursor.Next() {
 		seq, data := cursor.Row()
 		sequences = append(sequences, seq)
-		var row CapturedRow
-		require.NoError(t, encoding.Unmarshal(data, &row))
+		row, err := DecodeRow(data)
+		require.NoError(t, err)
 		captured = append(captured, row)
 	}
 	require.NoError(t, cursor.Err())
@@ -432,9 +461,9 @@ func TestHookCapture_MultipleOperations(t *testing.T) {
 	assert.Equal(t, uint64(3), sequences[2])
 
 	// Verify operation types
-	assert.Equal(t, sqlite3.SQLITE_INSERT, captured[0].Op)
-	assert.Equal(t, sqlite3.SQLITE_UPDATE, captured[1].Op)
-	assert.Equal(t, sqlite3.SQLITE_DELETE, captured[2].Op)
+	assert.Equal(t, uint8(OpTypeInsert), captured[0].Op)
+	assert.Equal(t, uint8(OpTypeUpdate), captured[1].Op)
+	assert.Equal(t, uint8(OpTypeDelete), captured[2].Op)
 }
 
 // TestHookCapture_ValuesRetrievable verifies data can be read back correctly
@@ -485,15 +514,15 @@ func TestHookCapture_ValuesRetrievable(t *testing.T) {
 	}
 
 	// Read back and verify all data
-	var captured []CapturedRow
+	var captured []*EncodedCapturedRow
 	cursor, err := metaStore.IterateCapturedRows(txnID)
 	require.NoError(t, err)
 	defer cursor.Close()
 
 	for cursor.Next() {
 		_, data := cursor.Row()
-		var row CapturedRow
-		require.NoError(t, encoding.Unmarshal(data, &row))
+		row, err := DecodeRow(data)
+		require.NoError(t, err)
 		captured = append(captured, row)
 	}
 	require.NoError(t, cursor.Err())
@@ -504,9 +533,17 @@ func TestHookCapture_ValuesRetrievable(t *testing.T) {
 	for i, td := range testData {
 		require.NotNil(t, captured[i].NewValues)
 		assert.Len(t, captured[i].NewValues, 3)
-		assert.Equal(t, td.id, captured[i].NewValues[0])
-		assertTextEqual(t, td.name, captured[i].NewValues[1])
-		assert.InDelta(t, td.score, captured[i].NewValues[2], 0.01)
+
+		var id int64
+		var name string
+		var score float64
+		require.NoError(t, encoding.Unmarshal(captured[i].NewValues["id"], &id))
+		require.NoError(t, encoding.Unmarshal(captured[i].NewValues["name"], &name))
+		require.NoError(t, encoding.Unmarshal(captured[i].NewValues["score"], &score))
+
+		assert.Equal(t, td.id, id)
+		assert.Equal(t, td.name, name)
+		assert.InDelta(t, td.score, score, 0.01)
 	}
 }
 
@@ -541,26 +578,26 @@ func TestHookCapture_NoSchemaCache(t *testing.T) {
 
 	require.NoError(t, session.BeginTx(ctx))
 
-	// Insert (hook should still capture even without schema)
+	// Insert (schema was reloaded during StartEphemeralSession, so it should capture)
 	err = session.ExecContext(ctx, "INSERT INTO test (id, name) VALUES (1, 'alice')")
 	require.NoError(t, err)
 
-	// Verify data was captured
-	var captured []CapturedRow
+	// Verify data was captured (schema reloaded during session start)
+	var captured []*EncodedCapturedRow
 	cursor, err := metaStore.IterateCapturedRows(txnID)
 	require.NoError(t, err)
 	defer cursor.Close()
 
 	for cursor.Next() {
 		_, data := cursor.Row()
-		var row CapturedRow
-		require.NoError(t, encoding.Unmarshal(data, &row))
+		row, err := DecodeRow(data)
+		require.NoError(t, err)
 		captured = append(captured, row)
 	}
 	require.NoError(t, cursor.Err())
 
-	// Hook captures raw data regardless of schema cache
+	// Hook captures data because StartEphemeralSession reloads schema from connection
 	require.Len(t, captured, 1)
 	assert.Equal(t, "test", captured[0].Table)
-	assert.Equal(t, sqlite3.SQLITE_INSERT, captured[0].Op)
+	assert.Equal(t, uint8(OpTypeInsert), captured[0].Op)
 }

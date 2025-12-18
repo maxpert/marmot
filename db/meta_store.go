@@ -8,6 +8,7 @@ import (
 
 	"github.com/maxpert/marmot/cfg"
 	"github.com/maxpert/marmot/hlc"
+	"github.com/rs/zerolog/log"
 )
 
 // ErrStopIteration signals scan callbacks to stop iteration without error
@@ -33,7 +34,7 @@ type CapturedRowCursor interface {
 type MetaStore interface {
 	// Transaction lifecycle
 	BeginTransaction(txnID, nodeID uint64, startTS hlc.Timestamp) error
-	CommitTransaction(txnID uint64, commitTS hlc.Timestamp, statements []byte, dbName, tablesInvolved string, requiredSchemaVersion uint64) error
+	CommitTransaction(txnID uint64, commitTS hlc.Timestamp, statements []byte, dbName, tablesInvolved string, requiredSchemaVersion uint64, rowCount uint32) error
 	AbortTransaction(txnID uint64) error
 	GetTransaction(txnID uint64) (*TransactionRecord, error)
 	GetPendingTransactions() ([]*TransactionRecord, error)
@@ -42,7 +43,7 @@ type MetaStore interface {
 	// StoreReplayedTransaction inserts a fully-committed transaction record directly.
 	// Used by delta sync to record transactions that were replayed from other nodes.
 	// Unlike CommitTransaction, this doesn't require a prior BeginTransaction call.
-	StoreReplayedTransaction(txnID, nodeID uint64, commitTS hlc.Timestamp, statements []byte, dbName string) error
+	StoreReplayedTransaction(txnID, nodeID uint64, commitTS hlc.Timestamp, dbName string, rowCount uint32) error
 
 	// Write intents (distributed locks)
 	WriteIntent(txnID uint64, intentType IntentType, tableName, intentKey string, op OpType, sqlStmt string, data []byte, ts hlc.Timestamp, nodeID uint64) error
@@ -130,7 +131,6 @@ type TransactionRecord struct {
 	CommittedAt           int64
 	LastHeartbeat         int64
 	TablesInvolved        string
-	SerializedStatements  []byte
 	DatabaseName          string
 	RequiredSchemaVersion uint64 // Minimum schema version required for this transaction
 }
@@ -151,9 +151,9 @@ type TxnCommitRecord struct {
 	CommitTSLogical       int32
 	CommittedAt           int64
 	TablesInvolved        string
-	SerializedStatements  []byte
 	DatabaseName          string
 	RequiredSchemaVersion uint64
+	RowCount              uint32 // Number of captured rows for this transaction
 }
 
 // WriteIntentRecord represents a write intent in meta store
@@ -183,7 +183,7 @@ type ReplicationStateRecord struct {
 	SyncStatus           SyncStatus
 }
 
-// NewMetaStore creates a PebbleDB-backed MetaStore.
+// NewMetaStore creates a MemoryMetaStore (which wraps PebbleMetaStore).
 // basePath is the path to the user database (e.g., "/data/mydb.db").
 // Creates {basePath}_meta.pebble/ directory
 func NewMetaStore(basePath string) (MetaStore, error) {
@@ -193,6 +193,20 @@ func NewMetaStore(basePath string) (MetaStore, error) {
 		metaPath = filepath.Join(cfg.Config.DataDir, metaPath)
 	}
 
-	// Use DefaultPebbleOptions() which reads from cfg.Config
-	return NewPebbleMetaStore(metaPath, DefaultPebbleOptions())
+	// Create PebbleMetaStore
+	pebble, err := NewPebbleMetaStore(metaPath, DefaultPebbleOptions())
+	if err != nil {
+		return nil, err
+	}
+
+	// Wrap with MemoryMetaStore for transitionary state optimization
+	memStore := NewMemoryMetaStore(pebble)
+
+	// Clean up orphaned CDC data from crashed transactions
+	if err := memStore.ReconstructFromPebble(); err != nil {
+		// Log warning but don't fail startup - orphaned data is just wasted space
+		log.Warn().Err(err).Msg("Failed to reconstruct from Pebble at startup")
+	}
+
+	return memStore, nil
 }

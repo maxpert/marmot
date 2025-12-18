@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/maxpert/marmot/common"
 	"github.com/maxpert/marmot/protocol"
 	"github.com/rs/zerolog/log"
 )
@@ -37,7 +38,7 @@ type CDCPipelineResult struct {
 }
 
 // ValidateCDCEntry validates a single CDC entry for required fields
-func ValidateCDCEntry(entry CDCEntry) error {
+func ValidateCDCEntry(entry common.CDCEntry) error {
 	if entry.Table == "" {
 		return fmt.Errorf("TableName is required for all CDC entries")
 	}
@@ -57,8 +58,8 @@ func ValidateCDCEntry(entry CDCEntry) error {
 }
 
 // GroupByIntentKey groups CDC entries by "table:intentKey" key while preserving order
-func GroupByIntentKey(entries []CDCEntry) map[string][]CDCEntry {
-	groups := make(map[string][]CDCEntry)
+func GroupByIntentKey(entries []common.CDCEntry) map[string][]common.CDCEntry {
+	groups := make(map[string][]common.CDCEntry)
 
 	for _, entry := range entries {
 		var sb strings.Builder
@@ -75,7 +76,7 @@ func GroupByIntentKey(entries []CDCEntry) map[string][]CDCEntry {
 
 // MergeGroup merges a sequence of CDC entries for the same row key
 // Returns (merged entry, wasDropped)
-func MergeGroup(entries []CDCEntry) (*CDCEntry, bool) {
+func MergeGroup(entries []common.CDCEntry) (*common.CDCEntry, bool) {
 	if len(entries) == 0 {
 		return nil, false
 	}
@@ -101,7 +102,7 @@ func MergeGroup(entries []CDCEntry) (*CDCEntry, bool) {
 	// DELETE → INSERT: UPSERT becomes UPDATE
 	// OldValues from DELETE, NewValues from INSERT
 	if firstHasOld && !firstHasNew && !lastHasOld && lastHasNew {
-		merged := &CDCEntry{
+		merged := &common.CDCEntry{
 			Table:     first.Table,
 			IntentKey: first.IntentKey,
 			OldValues: first.OldValues,
@@ -112,7 +113,7 @@ func MergeGroup(entries []CDCEntry) (*CDCEntry, bool) {
 
 	// UPDATE → UPDATE: OldValues from FIRST, NewValues from LAST
 	if firstHasOld && firstHasNew && lastHasOld && lastHasNew {
-		merged := &CDCEntry{
+		merged := &common.CDCEntry{
 			Table:     first.Table,
 			IntentKey: first.IntentKey,
 			OldValues: first.OldValues,
@@ -123,7 +124,7 @@ func MergeGroup(entries []CDCEntry) (*CDCEntry, bool) {
 
 	// UPDATE → DELETE: Becomes DELETE with OldValues from first UPDATE
 	if firstHasOld && firstHasNew && lastHasOld && !lastHasNew {
-		merged := &CDCEntry{
+		merged := &common.CDCEntry{
 			Table:     first.Table,
 			IntentKey: first.IntentKey,
 			OldValues: first.OldValues,
@@ -135,7 +136,7 @@ func MergeGroup(entries []CDCEntry) (*CDCEntry, bool) {
 	// INSERT → UPDATE: Keep as INSERT with final values
 	// Row didn't exist before transaction, should exist with final values after
 	if !firstHasOld && firstHasNew && lastHasOld && lastHasNew {
-		merged := &CDCEntry{
+		merged := &common.CDCEntry{
 			Table:     first.Table,
 			IntentKey: first.IntentKey,
 			OldValues: make(map[string][]byte),
@@ -145,7 +146,7 @@ func MergeGroup(entries []CDCEntry) (*CDCEntry, bool) {
 	}
 
 	// Default: Use standard merge logic (OldValues from all, NewValues from all)
-	merged := &CDCEntry{
+	merged := &common.CDCEntry{
 		Table:     first.Table,
 		IntentKey: first.IntentKey,
 		OldValues: make(map[string][]byte),
@@ -164,8 +165,8 @@ func MergeGroup(entries []CDCEntry) (*CDCEntry, bool) {
 	return merged, false
 }
 
-// ConvertToStatement converts a CDCEntry to protocol.Statement
-func ConvertToStatement(entry CDCEntry) protocol.Statement {
+// ConvertToStatement converts a common.CDCEntry to protocol.Statement
+func ConvertToStatement(entry common.CDCEntry) protocol.Statement {
 	hasOldValues := len(entry.OldValues) > 0
 	hasNewValues := len(entry.NewValues) > 0
 
@@ -190,7 +191,7 @@ func ConvertToStatement(entry CDCEntry) protocol.Statement {
 }
 
 // ProcessCDCEntries is the main orchestrator for CDC pipeline processing
-func ProcessCDCEntries(entries []CDCEntry, config CDCPipelineConfig) (*CDCPipelineResult, error) {
+func ProcessCDCEntries(entries []common.CDCEntry, config CDCPipelineConfig) (*CDCPipelineResult, error) {
 	result := &CDCPipelineResult{
 		Statements:   make([]protocol.Statement, 0),
 		TotalEntries: len(entries),

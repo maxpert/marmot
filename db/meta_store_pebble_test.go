@@ -66,7 +66,7 @@ func TestPebbleMetaStoreTransactionLifecycle(t *testing.T) {
 
 	// Commit transaction
 	commitTS := clock.Now()
-	err = store.CommitTransaction(txnID, commitTS, []byte(`[{"sql":"INSERT INTO t VALUES(1)"}]`), "testdb", "t", 0)
+	err = store.CommitTransaction(txnID, commitTS, []byte(`[{"sql":"INSERT INTO t VALUES(1)"}]`), "testdb", "t", 0, 1)
 	if err != nil {
 		t.Fatalf("CommitTransaction failed: %v", err)
 	}
@@ -333,7 +333,7 @@ func TestPebbleMetaStoreCommitCounters(t *testing.T) {
 
 	// Begin and commit
 	store.BeginTransaction(txnID, 1, startTS)
-	store.CommitTransaction(txnID, clock.Now(), nil, "testdb", "", 0)
+	store.CommitTransaction(txnID, clock.Now(), nil, "testdb", "", 0, 0)
 
 	// Count should increase
 	count, _ = store.GetCommittedTxnCount()
@@ -465,7 +465,7 @@ func TestPebbleMetaStoreStoreReplayedTransaction(t *testing.T) {
 	nodeID := uint64(2)
 
 	// Store a replayed transaction (no prior BeginTransaction)
-	err := store.StoreReplayedTransaction(txnID, nodeID, commitTS, []byte(`[{"sql":"INSERT"}]`), "testdb")
+	err := store.StoreReplayedTransaction(txnID, nodeID, commitTS, "testdb", 1)
 	if err != nil {
 		t.Fatalf("StoreReplayedTransaction failed: %v", err)
 	}
@@ -500,7 +500,7 @@ func TestPebbleMetaStoreStreamCommittedTransactions(t *testing.T) {
 		txnIDs = append(txnIDs, txnID)
 
 		store.BeginTransaction(txnID, 1, startTS)
-		store.CommitTransaction(txnID, clock.Now(), nil, "testdb", "", 0)
+		store.CommitTransaction(txnID, clock.Now(), nil, "testdb", "", 0, 0)
 	}
 
 	// Stream all (from 0)

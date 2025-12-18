@@ -47,6 +47,10 @@ const (
 const intentLockShards = 256
 
 // PebbleMetaStore implements MetaStore using Pebble
+// TransactionGetter is a function type for looking up transaction records.
+// Used to allow MemoryMetaStore to inject its own transaction lookup during conflict resolution.
+type TransactionGetter func(txnID uint64) (*TransactionRecord, error)
+
 type PebbleMetaStore struct {
 	db   *pebble.DB
 	path string
@@ -66,6 +70,9 @@ type PebbleMetaStore struct {
 
 	// Cuckoo filter for fast-path intent conflict detection
 	intentFilter *IntentFilter
+
+	// Optional transaction getter for conflict resolution (set by MemoryMetaStore wrapper)
+	txnGetter TransactionGetter
 }
 
 // Ensure PebbleMetaStore implements MetaStore
@@ -80,6 +87,12 @@ func (s *PebbleMetaStore) intentLockFor(tableName, intentKey string) *sync.Mutex
 // GetIntentFilter returns the Cuckoo filter for fast-path conflict detection.
 func (s *PebbleMetaStore) GetIntentFilter() *IntentFilter {
 	return s.intentFilter
+}
+
+// SetTransactionGetter sets a custom transaction getter for conflict resolution.
+// This allows MemoryMetaStore to inject its GetTransaction which reads from memory.
+func (s *PebbleMetaStore) SetTransactionGetter(getter TransactionGetter) {
+	s.txnGetter = getter
 }
 
 // rebuildIntentFilter scans all existing intents and populates the filter.
@@ -669,6 +682,92 @@ func (s *PebbleMetaStore) readTxnStatus(txnID uint64) (TxnStatus, error) {
 	return TxnStatus(val[0]), nil
 }
 
+// writeImmutableTxnRecord writes the immutable transaction record to /txn/{txnID}.
+// Used by MemoryMetaStore to write durable data while keeping status/heartbeat in memory.
+func (s *PebbleMetaStore) writeImmutableTxnRecord(txnID, nodeID uint64, startTS hlc.Timestamp) error {
+	now := time.Now().UnixNano()
+
+	immutable := &TxnImmutableRecord{
+		TxnID:          txnID,
+		NodeID:         nodeID,
+		StartTSWall:    startTS.WallTime,
+		StartTSLogical: startTS.Logical,
+		CreatedAt:      now,
+	}
+
+	native, err := encoding.MarshalNative(immutable)
+	if err != nil {
+		return fmt.Errorf("failed to marshal immutable record: %w", err)
+	}
+	defer native.Dispose()
+
+	return s.db.Set(pebbleTxnKey(txnID), native.Bytes(), pebble.NoSync)
+}
+
+// readImmutableTxnRecord reads the immutable transaction record from /txn/{txnID}.
+func (s *PebbleMetaStore) readImmutableTxnRecord(txnID uint64) (*TxnImmutableRecord, error) {
+	val, closer, err := s.db.Get(pebbleTxnKey(txnID))
+	if err == pebble.ErrNotFound {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer closer.Close()
+
+	var immutable TxnImmutableRecord
+	if err := encoding.Unmarshal(val, &immutable); err != nil {
+		return nil, err
+	}
+
+	return &immutable, nil
+}
+
+// readCommitRecord reads the commit record from /txn_commit/{txnID}.
+func (s *PebbleMetaStore) readCommitRecord(txnID uint64) (*TxnCommitRecord, error) {
+	val, closer, err := s.db.Get(pebbleTxnCommitKey(txnID))
+	if err == pebble.ErrNotFound {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer closer.Close()
+
+	var commit TxnCommitRecord
+	if err := encoding.Unmarshal(val, &commit); err != nil {
+		return nil, err
+	}
+
+	return &commit, nil
+}
+
+// deleteTransactionKeys deletes transaction records from Pebble.
+// Used by MemoryMetaStore which manages status/heartbeat in memory.
+func (s *PebbleMetaStore) deleteTransactionKeys(txnID uint64, isCommitted bool) error {
+	batch := s.db.NewBatch()
+	defer batch.Close()
+
+	// Delete immutable record
+	if err := batch.Delete(pebbleTxnKey(txnID), nil); err != nil {
+		return err
+	}
+
+	// Delete commit record if exists
+	_ = batch.Delete(pebbleTxnCommitKey(txnID), nil)
+
+	// If committed, try to remove from sequence index
+	if isCommitted {
+		// Try to read commit record to get seqNum before deleting
+		commit, err := s.readCommitRecord(txnID)
+		if err == nil && commit != nil {
+			_ = batch.Delete(pebbleTxnSeqKey(commit.SeqNum, txnID), nil)
+		}
+	}
+
+	return batch.Commit(pebble.NoSync)
+}
+
 // BeginTransaction creates a new transaction record with PENDING status
 func (s *PebbleMetaStore) BeginTransaction(txnID, nodeID uint64, startTS hlc.Timestamp) error {
 	log.Debug().
@@ -724,12 +823,12 @@ func (s *PebbleMetaStore) BeginTransaction(txnID, nodeID uint64, startTS hlc.Tim
 }
 
 // CommitTransaction marks a transaction as COMMITTED
-func (s *PebbleMetaStore) CommitTransaction(txnID uint64, commitTS hlc.Timestamp, statements []byte, dbName, tablesInvolved string, requiredSchemaVersion uint64) error {
+func (s *PebbleMetaStore) CommitTransaction(txnID uint64, commitTS hlc.Timestamp, statements []byte, dbName, tablesInvolved string, requiredSchemaVersion uint64, rowCount uint32) error {
 	log.Debug().
 		Uint64("txn_id", txnID).
 		Int64("commit_ts", commitTS.WallTime).
 		Str("database", dbName).
-		Int("statements_len", len(statements)).
+		Uint32("row_count", rowCount).
 		Uint64("required_schema_version", requiredSchemaVersion).
 		Msg("CDC: CommitTransaction")
 
@@ -762,9 +861,9 @@ func (s *PebbleMetaStore) CommitTransaction(txnID uint64, commitTS hlc.Timestamp
 		CommitTSLogical:       commitTS.Logical,
 		CommittedAt:           now,
 		TablesInvolved:        tablesInvolved,
-		SerializedStatements:  statements,
 		DatabaseName:          dbName,
 		RequiredSchemaVersion: requiredSchemaVersion,
+		RowCount:              rowCount,
 	}
 
 	native, err := encoding.MarshalNative(commit)
@@ -814,13 +913,13 @@ func (s *PebbleMetaStore) CommitTransaction(txnID uint64, commitTS hlc.Timestamp
 }
 
 // StoreReplayedTransaction inserts a fully-committed transaction record directly.
-func (s *PebbleMetaStore) StoreReplayedTransaction(txnID, nodeID uint64, commitTS hlc.Timestamp, statements []byte, dbName string) error {
+func (s *PebbleMetaStore) StoreReplayedTransaction(txnID, nodeID uint64, commitTS hlc.Timestamp, dbName string, rowCount uint32) error {
 	log.Debug().
 		Uint64("txn_id", txnID).
 		Uint64("node_id", nodeID).
 		Int64("commit_ts", commitTS.WallTime).
 		Str("database", dbName).
-		Int("statements_len", len(statements)).
+		Uint32("row_count", rowCount).
 		Msg("StoreReplayedTransaction: storing replayed transaction")
 
 	// Get sequence number
@@ -853,9 +952,9 @@ func (s *PebbleMetaStore) StoreReplayedTransaction(txnID, nodeID uint64, commitT
 		CommitTSLogical:       commitTS.Logical,
 		CommittedAt:           now,
 		TablesInvolved:        "",
-		SerializedStatements:  statements,
 		DatabaseName:          dbName,
 		RequiredSchemaVersion: 0,
+		RowCount:              rowCount,
 	}
 
 	nativeCommit, err := encoding.MarshalNative(commit)
@@ -1009,7 +1108,6 @@ func (s *PebbleMetaStore) GetTransaction(txnID uint64) (*TransactionRecord, erro
 			rec.CommitTSLogical = commit.CommitTSLogical
 			rec.CommittedAt = commit.CommittedAt
 			rec.TablesInvolved = commit.TablesInvolved
-			rec.SerializedStatements = commit.SerializedStatements
 			rec.DatabaseName = commit.DatabaseName
 			rec.RequiredSchemaVersion = commit.RequiredSchemaVersion
 		}
@@ -1287,7 +1385,12 @@ func (s *PebbleMetaStore) resolveIntentConflictPebble(batch *pebble.Batch, exist
 	}
 
 	// Check conflicting transaction status
-	conflictTxnRec, _ := s.GetTransaction(existing.TxnID)
+	// Use custom txnGetter if set (allows MemoryMetaStore to inject its GetTransaction)
+	getTxn := s.GetTransaction
+	if s.txnGetter != nil {
+		getTxn = s.txnGetter
+	}
+	conflictTxnRec, _ := getTxn(existing.TxnID)
 
 	canOverwrite := false
 	switch {
@@ -1598,31 +1701,8 @@ func (s *PebbleMetaStore) CleanupAfterCommit(txnID uint64) error {
 		return err
 	}
 
-	// Collect CDC raw captured row keys (/cdc/raw/{txnID}/*)
-	// These may remain if ProcessCapturedRows failed partway through
-	cdcRawPrefix := pebbleCdcRawPrefix(txnID)
-	var cdcRawKeys [][]byte
-
-	cdcRawIter, err := s.db.NewIter(&pebble.IterOptions{
-		LowerBound: cdcRawPrefix,
-		UpperBound: prefixUpperBound(cdcRawPrefix),
-	})
-	if err != nil {
-		return err
-	}
-
-	for cdcRawIter.SeekGE(cdcRawPrefix); cdcRawIter.Valid(); cdcRawIter.Next() {
-		key := make([]byte, len(cdcRawIter.Key()))
-		copy(key, cdcRawIter.Key())
-		cdcRawKeys = append(cdcRawKeys, key)
-	}
-
-	if err := cdcRawIter.Close(); err != nil {
-		return err
-	}
-
 	// Early return if nothing to delete
-	if len(primaryKeys) == 0 && len(cdcKeys) == 0 && len(cdcRawKeys) == 0 {
+	if len(primaryKeys) == 0 && len(cdcKeys) == 0 {
 		return nil
 	}
 
@@ -1648,11 +1728,6 @@ func (s *PebbleMetaStore) CleanupAfterCommit(txnID uint64) error {
 
 	// Delete CDC entries
 	for _, key := range cdcKeys {
-		_ = batch.Delete(key, nil)
-	}
-
-	// Delete CDC raw captured rows
-	for _, key := range cdcRawKeys {
 		_ = batch.Delete(key, nil)
 	}
 
@@ -1993,17 +2068,15 @@ func (s *PebbleMetaStore) ReleaseDDLLock(dbName string, nodeID uint64) error {
 	return s.db.Delete(key, pebble.NoSync)
 }
 
-// WriteIntentEntry writes a CDC intent entry
+// WriteIntentEntry writes a CDC intent entry using the unified EncodedCapturedRow format
 func (s *PebbleMetaStore) WriteIntentEntry(txnID, seq uint64, op uint8, table, intentKey string, oldVals, newVals map[string][]byte) error {
-	entry := &IntentEntry{
-		TxnID:     txnID,
-		Seq:       seq,
-		Operation: op,
+	// Create EncodedCapturedRow for unified storage format (same as WriteCapturedRow)
+	row := &EncodedCapturedRow{
 		Table:     table,
+		Op:        op,
 		IntentKey: intentKey,
 		OldValues: oldVals,
 		NewValues: newVals,
-		CreatedAt: time.Now().UnixNano(),
 	}
 
 	log.Debug().
@@ -2012,25 +2085,26 @@ func (s *PebbleMetaStore) WriteIntentEntry(txnID, seq uint64, op uint8, table, i
 		Uint8("op", op).
 		Str("table", table).
 		Str("intent_key", intentKey).
-		Int("old_values_count", len(entry.OldValues)).
-		Int("new_values_count", len(entry.NewValues)).
+		Int("old_values_count", len(oldVals)).
+		Int("new_values_count", len(newVals)).
 		Msg("CDC: WriteIntentEntry")
 
-	native, err := encoding.MarshalNative(entry)
+	data, err := EncodeRow(row)
 	if err != nil {
 		return err
 	}
-	defer native.Dispose()
 
+	// Write to /cdc/raw/ for unified access with hookCallback path
 	// NoSync: CDC entries are protected by WriteIntent (PREPARE).
 	// If crash occurs, intent exists and CDC can be recovered or transaction aborted.
-	return s.db.Set(pebbleCdcKey(txnID, seq), native.Bytes(), pebble.NoSync)
+	return s.db.Set(pebbleCdcRawKey(txnID, seq), data, pebble.NoSync)
 }
 
-// GetIntentEntries retrieves CDC intent entries for a transaction
+// GetIntentEntries retrieves CDC intent entries for a transaction.
+// Reads from /cdc/raw/ and converts EncodedCapturedRow to IntentEntry format.
 func (s *PebbleMetaStore) GetIntentEntries(txnID uint64) ([]*IntentEntry, error) {
 	var entries []*IntentEntry
-	prefix := pebbleCdcPrefix(txnID)
+	prefix := pebbleCdcRawPrefix(txnID)
 
 	iter, err := s.db.NewIter(&pebble.IterOptions{
 		LowerBound: prefix,
@@ -2041,17 +2115,36 @@ func (s *PebbleMetaStore) GetIntentEntries(txnID uint64) ([]*IntentEntry, error)
 	}
 	defer iter.Close()
 
+	var seq uint64
 	for iter.SeekGE(prefix); iter.Valid(); iter.Next() {
+		key := iter.Key()
 		val, err := iter.ValueAndErr()
 		if err != nil {
 			continue
 		}
 
-		entry := &IntentEntry{}
-		if err := encoding.Unmarshal(val, entry); err != nil {
+		// Extract sequence from key (/cdc/raw/{8 bytes txnID}{8 bytes seq})
+		expectedLen := len(pebblePrefixCDCRaw) + 16
+		if len(key) >= expectedLen {
+			seq = binary.BigEndian.Uint64(key[len(pebblePrefixCDCRaw)+8:])
+		}
+
+		// Decode EncodedCapturedRow
+		row, err := DecodeRow(val)
+		if err != nil {
 			continue
 		}
-		entries = append(entries, entry)
+
+		// Convert to IntentEntry format
+		entries = append(entries, &IntentEntry{
+			TxnID:     txnID,
+			Seq:       seq,
+			Operation: row.Op,
+			Table:     row.Table,
+			IntentKey: row.IntentKey,
+			OldValues: row.OldValues,
+			NewValues: row.NewValues,
+		})
 	}
 
 	if err := iter.Error(); err != nil {
@@ -2082,7 +2175,7 @@ func (s *PebbleMetaStore) GetIntentEntries(txnID uint64) ([]*IntentEntry, error)
 
 // DeleteIntentEntries deletes CDC intent entries for a transaction
 func (s *PebbleMetaStore) DeleteIntentEntries(txnID uint64) error {
-	prefix := pebbleCdcPrefix(txnID)
+	prefix := pebbleCdcRawPrefix(txnID)
 	var keys [][]byte
 
 	iter, err := s.db.NewIter(&pebble.IterOptions{
@@ -2259,6 +2352,48 @@ func (s *PebbleMetaStore) DeleteCapturedRows(txnID uint64) error {
 	return batch.Commit(pebble.NoSync)
 }
 
+// findOrphanedCDCRawTxnIDs finds transaction IDs that have /cdc/raw/ data but no /txn_commit/ record.
+// These are orphaned transactions from crashes that never completed commit.
+func (s *PebbleMetaStore) findOrphanedCDCRawTxnIDs() ([]uint64, error) {
+	prefix := []byte(pebblePrefixCDCRaw)
+
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: prefix,
+		UpperBound: prefixUpperBound(prefix),
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer iter.Close()
+
+	seenTxnIDs := make(map[uint64]bool)
+
+	for iter.SeekGE(prefix); iter.Valid(); iter.Next() {
+		key := iter.Key()
+		if len(key) < len(pebblePrefixCDCRaw)+8 {
+			continue
+		}
+		txnID := binary.BigEndian.Uint64(key[len(pebblePrefixCDCRaw):])
+		seenTxnIDs[txnID] = true
+	}
+
+	if err := iter.Error(); err != nil {
+		return nil, err
+	}
+
+	var orphaned []uint64
+	for txnID := range seenTxnIDs {
+		_, closer, err := s.db.Get(pebbleTxnCommitKey(txnID))
+		if err == pebble.ErrNotFound {
+			orphaned = append(orphaned, txnID)
+		} else if err == nil {
+			closer.Close()
+		}
+	}
+
+	return orphaned, nil
+}
+
 // CleanupStaleTransactions aborts transactions that haven't had a heartbeat within the timeout
 func (s *PebbleMetaStore) CleanupStaleTransactions(timeout time.Duration) (int, error) {
 	// Check if store is closed - return early to avoid pebble: closed panic
@@ -2423,6 +2558,7 @@ func (s *PebbleMetaStore) CleanupOldTransactionRecords(minRetention, maxRetentio
 	prefix := []byte(pebblePrefixTxn)
 	var keysToDelete [][]byte
 	var seqKeysToDelete [][]byte
+	var txnIDsToClean []uint64
 
 	iter, err := s.db.NewIter(&pebble.IterOptions{
 		LowerBound: prefix,
@@ -2477,6 +2613,7 @@ func (s *PebbleMetaStore) CleanupOldTransactionRecords(minRetention, maxRetentio
 			}
 			if rec.Status == TxnStatusCommitted {
 				committedDeleted++
+				txnIDsToClean = append(txnIDsToClean, rec.TxnID)
 			}
 		}
 	}
@@ -2502,6 +2639,13 @@ func (s *PebbleMetaStore) CleanupOldTransactionRecords(minRetention, maxRetentio
 
 	if err := batch.Commit(pebble.NoSync); err != nil {
 		return 0, err
+	}
+
+	// Clean up CDC raw captured rows for deleted committed transactions
+	for _, txnID := range txnIDsToClean {
+		if err := s.DeleteCapturedRows(txnID); err != nil {
+			log.Debug().Err(err).Uint64("txn_id", txnID).Msg("MetaStore GC: Failed to delete CDC raw rows")
+		}
 	}
 
 	// Decrement committed transaction counter
@@ -2597,6 +2741,7 @@ func (s *PebbleMetaStore) StreamCommittedTransactions(fromTxnID uint64, callback
 		if rec.Status != TxnStatusCommitted {
 			return nil // skip non-committed
 		}
+
 		return callback(rec)
 	})
 }

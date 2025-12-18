@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/maxpert/marmot/cfg"
+	"github.com/maxpert/marmot/common"
 	"github.com/maxpert/marmot/coordinator"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/protocol"
@@ -475,13 +476,13 @@ func (c *CompletedLocalExecution) GetIntentEntries() ([]*IntentEntry, error) {
 }
 
 // GetCDCEntries returns CDC data for replication
-func (c *CompletedLocalExecution) GetCDCEntries() []coordinator.CDCEntry {
+func (c *CompletedLocalExecution) GetCDCEntries() []common.CDCEntry {
 	if len(c.cdcEntries) == 0 {
 		return nil
 	}
-	result := make([]coordinator.CDCEntry, len(c.cdcEntries))
+	result := make([]common.CDCEntry, len(c.cdcEntries))
 	for i, e := range c.cdcEntries {
-		result[i] = coordinator.CDCEntry{
+		result[i] = common.CDCEntry{
 			Table:     e.Table,
 			IntentKey: e.IntentKey,
 			OldValues: e.OldValues,
@@ -527,7 +528,7 @@ func (p *PendingLocalExecution) GetIntentEntries() ([]*IntentEntry, error) {
 }
 
 // GetCDCEntries returns CDC data captured by hooks for replication
-func (p *PendingLocalExecution) GetCDCEntries() []coordinator.CDCEntry {
+func (p *PendingLocalExecution) GetCDCEntries() []common.CDCEntry {
 	if p.session == nil {
 		return nil
 	}
@@ -535,9 +536,9 @@ func (p *PendingLocalExecution) GetCDCEntries() []coordinator.CDCEntry {
 	if err != nil || len(entries) == 0 {
 		return nil
 	}
-	result := make([]coordinator.CDCEntry, len(entries))
+	result := make([]common.CDCEntry, len(entries))
 	for i, e := range entries {
-		result[i] = coordinator.CDCEntry{
+		result[i] = common.CDCEntry{
 			Table:     e.Table,
 			IntentKey: e.IntentKey,
 			OldValues: e.OldValues,

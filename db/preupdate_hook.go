@@ -76,6 +76,22 @@ func StartEphemeralSession(ctx context.Context, userDB *sql.DB, metaStore MetaSt
 		return nil, fmt.Errorf("failed to get connection: %w", err)
 	}
 
+	// Ensure schema cache is fresh before CDC capture
+	err = conn.Raw(func(driverConn interface{}) error {
+		sqliteConn, ok := driverConn.(*sqlite3.SQLiteConn)
+		if !ok {
+			return fmt.Errorf("unexpected driver connection type: %T", driverConn)
+		}
+		if err := schemaCache.Reload(sqliteConn); err != nil {
+			return fmt.Errorf("failed to reload schemas: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+
 	session := &EphemeralHookSession{
 		conn:        conn,
 		metaStore:   metaStore,
@@ -183,9 +199,9 @@ func (s *EphemeralHookSession) Rollback() error {
 	return txErr
 }
 
-// ProcessCapturedRows iterates raw captured rows from Pebble, processes each one, and cleans up.
+// ProcessCapturedRows iterates encoded captured rows from Pebble and acquires locks.
 // Called AFTER transaction rollback when SQLite lock is released.
-// All schema lookup, conflict detection, and lock acquisition happens here.
+// Encoding happens in hookCallback, so this only does lock acquisition and conflict detection.
 func (s *EphemeralHookSession) ProcessCapturedRows() error {
 	cursor, err := s.metaStore.IterateCapturedRows(s.txnID)
 	if err != nil {
@@ -193,36 +209,62 @@ func (s *EphemeralHookSession) ProcessCapturedRows() error {
 	}
 	defer cursor.Close()
 
-	var intentSeq uint64
 	for cursor.Next() {
 		rawSeq, data := cursor.Row()
 
-		var row CapturedRow
-		if err := encoding.Unmarshal(data, &row); err != nil {
-			return fmt.Errorf("failed to unmarshal captured row: %w", err)
+		row, err := DecodeRow(data)
+		if err != nil {
+			return fmt.Errorf("failed to decode captured row: %w", err)
 		}
 
-		intentSeq++
-		if err := s.processSingleRow(&row, intentSeq); err != nil {
+		// Check DDL lock conflict
+		if ddlTxn, err := s.metaStore.GetCDCTableDDLLock(row.Table); err == nil && ddlTxn != 0 && ddlTxn != s.txnID {
+			s.conflictError = ErrCDCTableDDLInProgress{Table: row.Table, HeldByTxn: ddlTxn}
+			return s.conflictError
+		}
+
+		// Acquire row lock
+		if err := s.metaStore.AcquireCDCRowLock(s.txnID, row.Table, row.IntentKey); err != nil {
 			s.conflictError = err
 			return err
 		}
 
-		if err := s.metaStore.DeleteCapturedRow(s.txnID, rawSeq); err != nil {
-			return fmt.Errorf("failed to delete captured row: %w", err)
-		}
+		// Note: Do NOT delete captured rows here. They are retained for:
+		// 1. GetIntentEntries reads them for replication preparation
+		// 2. StreamCommittedTransactions reads them for delta sync
+		// 3. CleanupOldTransactionRecords deletes them at GC time
+		_ = rawSeq // Silence unused warning
 	}
 
-	if err := cursor.Err(); err != nil {
-		return fmt.Errorf("cursor error: %w", err)
-	}
-
-	return nil
+	return cursor.Err()
 }
 
-// GetIntentEntries reads all intent entries for this session from the MetaStore
+// GetIntentEntries reads all intent entries for this session from captured rows
 func (s *EphemeralHookSession) GetIntentEntries() ([]*IntentEntry, error) {
-	return s.metaStore.GetIntentEntries(s.txnID)
+	cursor, err := s.metaStore.IterateCapturedRows(s.txnID)
+	if err != nil {
+		return nil, err
+	}
+	defer cursor.Close()
+
+	var entries []*IntentEntry
+	for cursor.Next() {
+		seq, data := cursor.Row()
+		row, err := DecodeRow(data)
+		if err != nil {
+			continue
+		}
+		entries = append(entries, &IntentEntry{
+			TxnID:     s.txnID,
+			Seq:       seq,
+			Operation: row.Op,
+			Table:     row.Table,
+			IntentKey: row.IntentKey,
+			OldValues: row.OldValues,
+			NewValues: row.NewValues,
+		})
+	}
+	return entries, cursor.Err()
 }
 
 // GetTxnID returns the transaction ID for this session
@@ -286,51 +328,21 @@ func (s *EphemeralHookSession) cleanup() {
 }
 
 // hookCallback is called by SQLite before each row modification.
-// BRAIN DEAD: raw copy of sqlite3.SQLitePreUpdateData to Pebble.
+// Encodes row data immediately with schema instead of deferring to ProcessCapturedRows.
 func (s *EphemeralHookSession) hookCallback(data sqlite3.SQLitePreUpdateData) {
 	if strings.HasPrefix(data.TableName, "__marmot") {
 		return
 	}
 
-	colCount := data.Count()
-	row := CapturedRow{
-		Table:    data.TableName,
-		Op:       data.Op,
-		OldRowID: data.OldRowID,
-		NewRowID: data.NewRowID,
+	// Get schema - skip if not cached (DDL operations)
+	schema, err := s.schemaCache.GetSchemaFor(data.TableName)
+	if err != nil {
+		return // Table not in schema cache, skip CDC
 	}
 
-	oldVals := make([]interface{}, colCount)
-	if data.Old(oldVals...) == nil {
-		row.OldValues = oldVals
-	}
-	newVals := make([]interface{}, colCount)
-	if data.New(newVals...) == nil {
-		row.NewValues = newVals
-	}
-
-	s.mu.Lock()
-	s.seq++
-	seq := s.seq
-	s.mu.Unlock()
-
-	rowData, _ := encoding.Marshal(&row)
-	s.metaStore.WriteCapturedRow(s.txnID, seq, rowData)
-}
-
-// =============================================================================
-// Utility functions
-// =============================================================================
-
-// processSingleRow processes one captured row: DDL check, schema lookup, lock acquisition, IntentEntry write.
-func (s *EphemeralHookSession) processSingleRow(row *CapturedRow, seq uint64) error {
-	// Fail fast if table has DDL lock from another transaction
-	if ddlTxn, err := s.metaStore.GetCDCTableDDLLock(row.Table); err == nil && ddlTxn != 0 && ddlTxn != s.txnID {
-		return ErrCDCTableDDLInProgress{Table: row.Table, HeldByTxn: ddlTxn}
-	}
-
+	// Determine operation type
 	var opType uint8
-	switch row.Op {
+	switch data.Op {
 	case sqlite3.SQLITE_INSERT:
 		opType = uint8(OpTypeInsert)
 	case sqlite3.SQLITE_UPDATE:
@@ -338,38 +350,55 @@ func (s *EphemeralHookSession) processSingleRow(row *CapturedRow, seq uint64) er
 	case sqlite3.SQLITE_DELETE:
 		opType = uint8(OpTypeDelete)
 	default:
-		return fmt.Errorf("unknown op type: %d", row.Op)
+		return // Unknown op
 	}
 
-	schema, err := s.schemaCache.GetSchemaFor(row.Table)
-	if err != nil {
-		return fmt.Errorf("schema not found for table %s: %w", row.Table, err)
-	}
+	colCount := data.Count()
 
-	var intentKey string
-	switch row.Op {
-	case sqlite3.SQLITE_INSERT, sqlite3.SQLITE_UPDATE:
-		pkValues := extractPKFromValues(schema, row.NewValues, row.NewRowID)
-		intentKey = filter.SerializeIntentKey(row.Table, schema.PrimaryKeys, pkValues)
-	case sqlite3.SQLITE_DELETE:
-		pkValues := extractPKFromValues(schema, row.OldValues, row.OldRowID)
-		intentKey = filter.SerializeIntentKey(row.Table, schema.PrimaryKeys, pkValues)
-	}
-
-	if err := s.metaStore.AcquireCDCRowLock(s.txnID, row.Table, intentKey); err != nil {
-		return err
-	}
-
+	// Extract old/new values
 	var oldVals, newVals map[string][]byte
-	if row.OldValues != nil {
-		oldVals = encodeValuesWithSchema(schema.Columns, row.OldValues)
-	}
-	if row.NewValues != nil {
-		newVals = encodeValuesWithSchema(schema.Columns, row.NewValues)
+	var intentKey string
+
+	if data.Op == sqlite3.SQLITE_DELETE || data.Op == sqlite3.SQLITE_UPDATE {
+		rawOld := make([]interface{}, colCount)
+		if data.Old(rawOld...) == nil {
+			oldVals = encodeValuesWithSchema(schema.Columns, rawOld)
+			if data.Op == sqlite3.SQLITE_DELETE {
+				pkValues := extractPKFromValues(schema, rawOld, data.OldRowID)
+				intentKey = filter.SerializeIntentKey(data.TableName, schema.PrimaryKeys, pkValues)
+			}
+		}
 	}
 
-	return s.metaStore.WriteIntentEntry(s.txnID, seq, opType, row.Table, intentKey, oldVals, newVals)
+	if data.Op == sqlite3.SQLITE_INSERT || data.Op == sqlite3.SQLITE_UPDATE {
+		rawNew := make([]interface{}, colCount)
+		if data.New(rawNew...) == nil {
+			newVals = encodeValuesWithSchema(schema.Columns, rawNew)
+			pkValues := extractPKFromValues(schema, rawNew, data.NewRowID)
+			intentKey = filter.SerializeIntentKey(data.TableName, schema.PrimaryKeys, pkValues)
+		}
+	}
+
+	row := &EncodedCapturedRow{
+		Table:     data.TableName,
+		Op:        opType,
+		IntentKey: intentKey,
+		OldValues: oldVals,
+		NewValues: newVals,
+	}
+
+	s.mu.Lock()
+	s.seq++
+	seq := s.seq
+	s.mu.Unlock()
+
+	rowData, _ := EncodeRow(row)
+	s.metaStore.WriteCapturedRow(s.txnID, seq, rowData)
 }
+
+// =============================================================================
+// Utility functions
+// =============================================================================
 
 // extractPKFromValues extracts PK values from raw values slice using schema indices.
 func extractPKFromValues(schema *TableSchema, values []interface{}, rowID int64) map[string][]byte {

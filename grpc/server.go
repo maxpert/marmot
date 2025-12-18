@@ -14,8 +14,6 @@ import (
 
 	"github.com/maxpert/marmot/common"
 	"github.com/maxpert/marmot/db"
-	"github.com/maxpert/marmot/encoding"
-	"github.com/maxpert/marmot/protocol"
 	"github.com/rs/zerolog/log"
 	"github.com/soheilhy/cmux"
 	"google.golang.org/grpc"
@@ -353,73 +351,40 @@ const liveStreamPollInterval = 500 * time.Millisecond
 
 // sendChangeEvent converts a TransactionRecord to ChangeEvent and sends it on the stream.
 // Handles both CDC (Change Data Capture) path with row data and DDL path with SQL statements.
-func (s *Server) sendChangeEvent(rec *db.TransactionRecord, stream MarmotService_StreamChangesServer) error {
-	// Parse statements from msgpack using protocol.Statement (the canonical type)
+// Reads CDC entries from MetaStore for the transaction and converts them to Statement objects.
+func (s *Server) sendChangeEvent(rec *db.TransactionRecord, metaStore db.MetaStore, stream MarmotService_StreamChangesServer) error {
+	// Build statements from CDC entries in MetaStore
 	var statements []*Statement
-	if len(rec.SerializedStatements) > 0 {
-		var protoStatements []protocol.Statement
-		if err := encoding.Unmarshal(rec.SerializedStatements, &protoStatements); err != nil {
-			return fmt.Errorf("failed to parse statements msgpack for txn %d: %w", rec.TxnID, err)
-		}
 
-		for _, ps := range protoStatements {
-			// Convert protocol.StatementCode to pb.StatementType at gRPC boundary
-			grpcType, ok := common.ToWireType(ps.Type)
-			if !ok {
-				return fmt.Errorf("unknown statement type %d in txn %d: cannot convert to wire format", ps.Type, rec.TxnID)
+	cursor, err := metaStore.IterateCapturedRows(rec.TxnID)
+	if err != nil {
+		log.Warn().Err(err).Uint64("txn_id", rec.TxnID).Msg("Failed to iterate captured rows for streaming")
+	} else {
+		defer cursor.Close()
+		for cursor.Next() {
+			_, data := cursor.Row()
+			row, err := db.DecodeRow(data)
+			if err != nil {
+				log.Warn().Err(err).Uint64("txn_id", rec.TxnID).Msg("Failed to decode captured row")
+				continue
 			}
+
+			// Convert OpType to wire StatementType
+			stmtCode := db.OpTypeToStatementType(db.OpType(row.Op))
+			wireType := common.MustToWireType(stmtCode)
 
 			stmt := &Statement{
-				Type:      grpcType,
-				TableName: ps.TableName,
-				Database:  ps.Database,
-			}
-
-			// For DML with CDC data, use RowChange payload
-			// For DDL or DML without CDC, use DdlChange payload with SQL
-			isDML := ps.Type == protocol.StatementInsert ||
-				ps.Type == protocol.StatementUpdate ||
-				ps.Type == protocol.StatementDelete ||
-				ps.Type == protocol.StatementReplace
-
-			if isDML && (len(ps.NewValues) > 0 || len(ps.OldValues) > 0) {
-				// CDC path: send row data
-				stmt.Payload = &Statement_RowChange{
+				Type:      wireType,
+				TableName: row.Table,
+				Database:  rec.DatabaseName,
+				Payload: &Statement_RowChange{
 					RowChange: &RowChange{
-						IntentKey: ps.IntentKey,
-						OldValues: ps.OldValues,
-						NewValues: ps.NewValues,
+						IntentKey: row.IntentKey,
+						OldValues: row.OldValues,
+						NewValues: row.NewValues,
 					},
-				}
-				if log.Debug().Enabled() {
-					log.Debug().
-						Uint64("txn_id", rec.TxnID).
-						Str("table", ps.TableName).
-						Str("intent_key", ps.IntentKey).
-						Int("new_values", len(ps.NewValues)).
-						Int("old_values", len(ps.OldValues)).
-						Msg("STREAM: Sending CDC data for anti-entropy")
-				}
-			} else {
-				// DDL or DML without CDC: send SQL
-				stmt.Payload = &Statement_DdlChange{
-					DdlChange: &DDLChange{
-						Sql: ps.SQL,
-					},
-				}
-				if log.Debug().Enabled() {
-					log.Debug().
-						Uint64("txn_id", rec.TxnID).
-						Str("sql_prefix", func() string {
-							if len(ps.SQL) > 50 {
-								return ps.SQL[:50]
-							}
-							return ps.SQL
-						}()).
-						Msg("STREAM: Sending SQL for anti-entropy")
-				}
+				},
 			}
-
 			statements = append(statements, stmt)
 		}
 	}
@@ -509,7 +474,7 @@ func (s *Server) streamHistoricalTransactions(
 		// Stream historical transactions
 		lastSentTxn[dbName] = fromTxnId
 		err = metaStore.StreamCommittedTransactions(fromTxnId, func(rec *db.TransactionRecord) error {
-			if err := s.sendChangeEvent(rec, stream); err != nil {
+			if err := s.sendChangeEvent(rec, metaStore, stream); err != nil {
 				return err
 			}
 			lastSentTxn[dbName] = rec.TxnID
@@ -561,7 +526,7 @@ func (s *Server) pollForNewTransactions(
 					if rec.TxnID <= fromTxn {
 						return nil
 					}
-					if err := s.sendChangeEvent(rec, stream); err != nil {
+					if err := s.sendChangeEvent(rec, metaStore, stream); err != nil {
 						return err
 					}
 					lastSentTxn[dbName] = rec.TxnID
