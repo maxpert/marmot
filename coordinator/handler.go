@@ -30,6 +30,9 @@ type DatabaseManager interface {
 	GetDatabaseConnection(name string) (*sql.DB, error)
 	// GetReplicatedDatabase returns the ReplicatedDatabase for executing with hooks
 	GetReplicatedDatabase(name string) (ReplicatedDatabaseProvider, error)
+	// GetAutoIncrementColumn returns the auto-increment column name for a table.
+	// Uses cached schema - does NOT query SQLite PRAGMA.
+	GetAutoIncrementColumn(database, table string) (string, error)
 }
 
 // ReplicatedDatabaseProvider provides access to replicated database operations
@@ -199,16 +202,17 @@ func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, sq
 		Str("query", sql).
 		Msg("Handling query")
 
-	// Build schema lookup function for auto-increment ID injection
+	// Build schema lookup function for auto-increment ID injection.
+	// Uses cached schema via DatabaseManager - does NOT query SQLite PRAGMA.
 	var schemaLookup protocol.SchemaLookupFunc
 	if session.CurrentDatabase != "" {
-		db, err := h.dbManager.GetDatabaseConnection(session.CurrentDatabase)
-		if err == nil && db != nil {
-			sp := protocol.NewSchemaProvider(db)
-			schemaLookup = func(table string) string {
-				col, _ := sp.GetAutoIncrementColumn(table)
-				return col
+		dbName := session.CurrentDatabase
+		schemaLookup = func(table string) string {
+			col, err := h.dbManager.GetAutoIncrementColumn(dbName, table)
+			if err != nil {
+				return ""
 			}
+			return col
 		}
 	}
 

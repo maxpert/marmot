@@ -39,6 +39,19 @@ func setupStreamClientTest(t *testing.T) (*db.DatabaseManager, *hlc.Clock, strin
 	return dbMgr, clock, tmpDir, cleanup
 }
 
+// testSchemaAdapter provides PK info for tests using cached schema
+type testSchemaAdapter struct {
+	mdb *db.ReplicatedDatabase
+}
+
+func (a *testSchemaAdapter) GetPrimaryKeys(tableName string) ([]string, error) {
+	schema, err := a.mdb.GetCachedTableSchema(tableName)
+	if err != nil {
+		return nil, err
+	}
+	return schema.PrimaryKeys, nil
+}
+
 // TestNewStreamClient tests client creation
 func TestNewStreamClient(t *testing.T) {
 	dbMgr, clock, _, cleanup := setupStreamClientTest(t)
@@ -66,7 +79,7 @@ func TestNewStreamClient(t *testing.T) {
 
 // TestStreamClient_ApplyCDCInsert tests CDC insert application
 func TestStreamClient_ApplyCDCInsert(t *testing.T) {
-	dbMgr, clock, _, cleanup := setupStreamClientTest(t)
+	dbMgr, _, _, cleanup := setupStreamClientTest(t)
 	defer cleanup()
 
 	// Create test database and table
@@ -86,9 +99,7 @@ func TestStreamClient_ApplyCDCInsert(t *testing.T) {
 		t.Fatalf("Failed to create table: %v", err)
 	}
 
-	client := NewStreamClient("localhost:8080", 1, dbMgr, clock, nil)
-
-	// Test INSERT
+	// Test INSERT using unified CDC applier
 	tx, err := sqlDB.BeginTx(context.Background(), nil)
 	if err != nil {
 		t.Fatalf("Failed to begin transaction: %v", err)
@@ -100,10 +111,10 @@ func TestStreamClient_ApplyCDCInsert(t *testing.T) {
 		"email": msgpackMarshal("alice@example.com"),
 	}
 
-	err = client.applyCDCInsert(tx, "users", newValues)
+	err = db.ApplyCDCInsert(tx, "users", newValues)
 	if err != nil {
 		tx.Rollback()
-		t.Fatalf("applyCDCInsert failed: %v", err)
+		t.Fatalf("ApplyCDCInsert failed: %v", err)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -125,7 +136,7 @@ func TestStreamClient_ApplyCDCInsert(t *testing.T) {
 
 // TestStreamClient_ApplyCDCUpdate tests CDC update via INSERT OR REPLACE
 func TestStreamClient_ApplyCDCUpdate(t *testing.T) {
-	dbMgr, clock, _, cleanup := setupStreamClientTest(t)
+	dbMgr, _, _, cleanup := setupStreamClientTest(t)
 	defer cleanup()
 
 	// Create test database and table with initial data
@@ -151,9 +162,7 @@ func TestStreamClient_ApplyCDCUpdate(t *testing.T) {
 		t.Fatalf("Failed to insert initial data: %v", err)
 	}
 
-	client := NewStreamClient("localhost:8080", 1, dbMgr, clock, nil)
-
-	// Test UPDATE via INSERT OR REPLACE
+	// Test UPDATE via INSERT OR REPLACE using unified CDC applier
 	tx, err := sqlDB.BeginTx(context.Background(), nil)
 	if err != nil {
 		t.Fatalf("Failed to begin transaction: %v", err)
@@ -165,10 +174,10 @@ func TestStreamClient_ApplyCDCUpdate(t *testing.T) {
 		"email": msgpackMarshal("alice@new.com"),
 	}
 
-	err = client.applyCDCInsert(tx, "users", newValues)
+	err = db.ApplyCDCInsert(tx, "users", newValues)
 	if err != nil {
 		tx.Rollback()
-		t.Fatalf("applyCDCInsert (update) failed: %v", err)
+		t.Fatalf("ApplyCDCInsert (update) failed: %v", err)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -189,7 +198,7 @@ func TestStreamClient_ApplyCDCUpdate(t *testing.T) {
 
 // TestStreamClient_ApplyCDCDelete tests CDC delete application
 func TestStreamClient_ApplyCDCDelete(t *testing.T) {
-	dbMgr, clock, _, cleanup := setupStreamClientTest(t)
+	dbMgr, _, _, cleanup := setupStreamClientTest(t)
 	defer cleanup()
 
 	// Create test database and table with initial data
@@ -209,15 +218,20 @@ func TestStreamClient_ApplyCDCDelete(t *testing.T) {
 		t.Fatalf("Failed to create table: %v", err)
 	}
 
+	// Reload schema cache after DDL
+	if err := mdb.ReloadSchema(); err != nil {
+		t.Fatalf("Failed to reload schema: %v", err)
+	}
+
 	// Insert initial data
 	_, err = sqlDB.Exec(`INSERT INTO users (id, name, email) VALUES (1, 'Alice', 'alice@example.com')`)
 	if err != nil {
 		t.Fatalf("Failed to insert initial data: %v", err)
 	}
 
-	client := NewStreamClient("localhost:8080", 1, dbMgr, clock, nil)
+	// Test DELETE using unified CDC applier with schema adapter
+	schemaAdapter := &testSchemaAdapter{mdb: mdb}
 
-	// Test DELETE
 	tx, err := sqlDB.BeginTx(context.Background(), nil)
 	if err != nil {
 		t.Fatalf("Failed to begin transaction: %v", err)
@@ -229,10 +243,10 @@ func TestStreamClient_ApplyCDCDelete(t *testing.T) {
 		"email": msgpackMarshal("alice@example.com"),
 	}
 
-	err = client.applyCDCDelete(tx, "users", oldValues)
+	err = db.ApplyCDCDelete(tx, schemaAdapter, "users", oldValues)
 	if err != nil {
 		tx.Rollback()
-		t.Fatalf("applyCDCDelete failed: %v", err)
+		t.Fatalf("ApplyCDCDelete failed: %v", err)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -253,7 +267,7 @@ func TestStreamClient_ApplyCDCDelete(t *testing.T) {
 
 // TestStreamClient_ApplyCDCDeleteWithOldValues tests CDC delete using oldValues for PK extraction
 func TestStreamClient_ApplyCDCDeleteWithOldValues(t *testing.T) {
-	dbMgr, clock, _, cleanup := setupStreamClientTest(t)
+	dbMgr, _, _, cleanup := setupStreamClientTest(t)
 	defer cleanup()
 
 	// Create test database and table with initial data
@@ -272,15 +286,20 @@ func TestStreamClient_ApplyCDCDeleteWithOldValues(t *testing.T) {
 		t.Fatalf("Failed to create table: %v", err)
 	}
 
+	// Reload schema cache after DDL
+	if err := mdb.ReloadSchema(); err != nil {
+		t.Fatalf("Failed to reload schema: %v", err)
+	}
+
 	// Insert initial data
 	_, err = sqlDB.Exec(`INSERT INTO users (id, name) VALUES (42, 'Bob')`)
 	if err != nil {
 		t.Fatalf("Failed to insert initial data: %v", err)
 	}
 
-	client := NewStreamClient("localhost:8080", 1, dbMgr, clock, nil)
+	// Test DELETE with oldValues using unified CDC applier
+	schemaAdapter := &testSchemaAdapter{mdb: mdb}
 
-	// Test DELETE with oldValues (correct CDC pattern)
 	tx, err := sqlDB.BeginTx(context.Background(), nil)
 	if err != nil {
 		t.Fatalf("Failed to begin transaction: %v", err)
@@ -291,10 +310,10 @@ func TestStreamClient_ApplyCDCDeleteWithOldValues(t *testing.T) {
 		"name": msgpackMarshal("Bob"),
 	}
 
-	err = client.applyCDCDelete(tx, "users", oldValues)
+	err = db.ApplyCDCDelete(tx, schemaAdapter, "users", oldValues)
 	if err != nil {
 		tx.Rollback()
-		t.Fatalf("applyCDCDelete failed: %v", err)
+		t.Fatalf("ApplyCDCDelete failed: %v", err)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -532,7 +551,7 @@ func TestStreamClient_ReconnectConfig(t *testing.T) {
 
 // TestApplyCDCInsert_EmptyValues tests error handling
 func TestApplyCDCInsert_EmptyValues(t *testing.T) {
-	dbMgr, clock, _, cleanup := setupStreamClientTest(t)
+	dbMgr, _, _, cleanup := setupStreamClientTest(t)
 	defer cleanup()
 
 	// Create test database
@@ -548,13 +567,11 @@ func TestApplyCDCInsert_EmptyValues(t *testing.T) {
 		t.Fatalf("Failed to create table: %v", err)
 	}
 
-	client := NewStreamClient("localhost:8080", 1, dbMgr, clock, nil)
-
 	tx, _ := sqlDB.BeginTx(context.Background(), nil)
 	defer tx.Rollback()
 
 	// Empty values should return error
-	err = client.applyCDCInsert(tx, "users", map[string][]byte{})
+	err = db.ApplyCDCInsert(tx, "users", map[string][]byte{})
 	if err == nil {
 		t.Error("Expected error for empty values")
 	}
@@ -562,7 +579,7 @@ func TestApplyCDCInsert_EmptyValues(t *testing.T) {
 
 // TestApplyCDCDelete_NoKeyOrValues tests error handling
 func TestApplyCDCDelete_NoKeyOrValues(t *testing.T) {
-	dbMgr, clock, _, cleanup := setupStreamClientTest(t)
+	dbMgr, _, _, cleanup := setupStreamClientTest(t)
 	defer cleanup()
 
 	// Create test database
@@ -578,13 +595,13 @@ func TestApplyCDCDelete_NoKeyOrValues(t *testing.T) {
 		t.Fatalf("Failed to create table: %v", err)
 	}
 
-	client := NewStreamClient("localhost:8080", 1, dbMgr, clock, nil)
+	schemaAdapter := &testSchemaAdapter{mdb: mdb}
 
 	tx, _ := sqlDB.BeginTx(context.Background(), nil)
 	defer tx.Rollback()
 
 	// No old values should return error
-	err = client.applyCDCDelete(tx, "users", nil)
+	err = db.ApplyCDCDelete(tx, schemaAdapter, "users", nil)
 	if err == nil {
 		t.Error("Expected error for delete with no old values")
 	}
@@ -596,7 +613,7 @@ func msgpackMarshal(v interface{}) []byte {
 	return data
 }
 
-// Benchmark CDC insert
+// Benchmark CDC insert using unified applier
 func BenchmarkStreamClient_ApplyCDCInsert(b *testing.B) {
 	tmpDir, _ := os.MkdirTemp("", "marmot-stream-bench-*")
 	defer os.RemoveAll(tmpDir)
@@ -610,8 +627,6 @@ func BenchmarkStreamClient_ApplyCDCInsert(b *testing.B) {
 	sqlDB := mdb.GetDB()
 	sqlDB.Exec(`CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)`)
 
-	client := NewStreamClient("localhost:8080", 1, dbMgr, clock, nil)
-
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		tx, _ := sqlDB.BeginTx(context.Background(), nil)
@@ -619,7 +634,7 @@ func BenchmarkStreamClient_ApplyCDCInsert(b *testing.B) {
 			"id":   msgpackMarshal(i),
 			"name": msgpackMarshal("test"),
 		}
-		client.applyCDCInsert(tx, "users", newValues)
+		db.ApplyCDCInsert(tx, "users", newValues)
 		tx.Commit()
 	}
 }

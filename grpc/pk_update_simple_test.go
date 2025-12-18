@@ -3,11 +3,11 @@ package grpc
 import (
 	"database/sql"
 	"fmt"
+	"sort"
 	"strings"
 	"testing"
 
 	"github.com/maxpert/marmot/encoding"
-	"github.com/maxpert/marmot/protocol"
 
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -47,10 +47,10 @@ func TestApplyReplayCDCUpdateWithPKChange_Simple(t *testing.T) {
 	}
 
 	// Build proper UPDATE statement manually (simulating what applyReplayCDCUpdate should do)
-	schemaProvider := protocol.NewSchemaProvider(db)
-	schema, err := schemaProvider.GetTableSchema("users")
+	// Get primary keys from PRAGMA table_info
+	primaryKeys, err := getPrimaryKeysFromPragma(db, "users")
 	if err != nil {
-		t.Fatalf("Failed to get schema: %v", err)
+		t.Fatalf("Failed to get primary keys: %v", err)
 	}
 
 	// Build SET clause from newValues
@@ -68,7 +68,7 @@ func TestApplyReplayCDCUpdateWithPKChange_Simple(t *testing.T) {
 	// Build WHERE clause from oldValues using PK columns
 	whereClauses := []string{}
 	whereValues := []interface{}{}
-	for _, pkCol := range schema.PrimaryKeys {
+	for _, pkCol := range primaryKeys {
 		pkBytes, ok := oldValues[pkCol]
 		if !ok {
 			t.Fatalf("PK column %s not found in oldValues", pkCol)
@@ -127,4 +127,45 @@ func mustMarshal(v interface{}) []byte {
 		panic(fmt.Sprintf("Failed to marshal value %v: %v", v, err))
 	}
 	return data
+}
+
+// getPrimaryKeysFromPragma extracts primary key column names from PRAGMA table_info
+func getPrimaryKeysFromPragma(db *sql.DB, tableName string) ([]string, error) {
+	rows, err := db.Query(fmt.Sprintf("PRAGMA table_info(%s)", tableName))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	type pkCol struct {
+		name  string
+		order int
+	}
+	var pkCols []pkCol
+
+	for rows.Next() {
+		var cid int
+		var name, colType string
+		var notNull int
+		var dfltValue sql.NullString
+		var pk int
+
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &dfltValue, &pk); err != nil {
+			return nil, err
+		}
+		if pk > 0 {
+			pkCols = append(pkCols, pkCol{name: name, order: pk})
+		}
+	}
+
+	// Sort by PK order
+	sort.Slice(pkCols, func(i, j int) bool {
+		return pkCols[i].order < pkCols[j].order
+	})
+
+	pks := make([]string, len(pkCols))
+	for i, col := range pkCols {
+		pks[i] = col.name
+	}
+	return pks, rows.Err()
 }

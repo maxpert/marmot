@@ -12,7 +12,6 @@ import (
 	"github.com/maxpert/marmot/cfg"
 	"github.com/maxpert/marmot/db"
 	"github.com/maxpert/marmot/db/snapshot"
-	"github.com/maxpert/marmot/encoding"
 	marmotgrpc "github.com/maxpert/marmot/grpc"
 	pb "github.com/maxpert/marmot/grpc/common"
 	"github.com/maxpert/marmot/hlc"
@@ -582,7 +581,7 @@ func (s *StreamClient) applyChangeEvent(ctx context.Context, event *marmotgrpc.C
 	defer tx.Rollback()
 
 	for _, stmt := range event.Statements {
-		if err := s.applyStatement(ctx, tx, stmt); err != nil {
+		if err := s.applyStatement(ctx, tx, mdb, stmt); err != nil {
 			return err
 		}
 	}
@@ -627,10 +626,10 @@ func (s *StreamClient) applyDropDatabase(stmt *marmotgrpc.Statement, fallbackDB 
 }
 
 // applyStatement applies a single statement within a transaction
-func (s *StreamClient) applyStatement(ctx context.Context, tx *sql.Tx, stmt *marmotgrpc.Statement) error {
+func (s *StreamClient) applyStatement(ctx context.Context, tx *sql.Tx, mdb *db.ReplicatedDatabase, stmt *marmotgrpc.Statement) error {
 	// CDC path: row-level changes
 	if rowChange := stmt.GetRowChange(); rowChange != nil && (len(rowChange.NewValues) > 0 || len(rowChange.OldValues) > 0) {
-		return s.applyCDCStatement(tx, stmt)
+		return s.applyCDCStatement(tx, mdb, stmt)
 	}
 
 	// DDL path: schema changes with idempotency rewriting
@@ -654,94 +653,40 @@ func (s *StreamClient) applyStatement(ctx context.Context, tx *sql.Tx, stmt *mar
 	return nil
 }
 
-// applyCDCStatement applies a CDC statement
-func (s *StreamClient) applyCDCStatement(tx *sql.Tx, stmt *marmotgrpc.Statement) error {
+// applyCDCStatement applies a CDC statement using unified CDC applier.
+// Uses cached schema from mdb - does NOT query SQLite PRAGMA.
+func (s *StreamClient) applyCDCStatement(tx *sql.Tx, mdb *db.ReplicatedDatabase, stmt *marmotgrpc.Statement) error {
 	rowChange := stmt.GetRowChange()
 	if rowChange == nil {
 		return fmt.Errorf("no row change data")
 	}
 
+	// Create schema adapter for PK lookups using cached schema
+	schemaAdapter := &streamClientSchemaAdapter{mdb: mdb}
+
 	switch stmt.Type {
 	case pb.StatementType_INSERT, pb.StatementType_REPLACE:
-		return s.applyCDCInsert(tx, stmt.TableName, rowChange.NewValues)
+		return db.ApplyCDCInsert(tx, stmt.TableName, rowChange.NewValues)
 	case pb.StatementType_UPDATE:
-		return s.applyCDCInsert(tx, stmt.TableName, rowChange.NewValues) // Use INSERT OR REPLACE
+		return db.ApplyCDCUpdate(tx, schemaAdapter, stmt.TableName, rowChange.OldValues, rowChange.NewValues)
 	case pb.StatementType_DELETE:
-		return s.applyCDCDelete(tx, stmt.TableName, rowChange.OldValues)
+		return db.ApplyCDCDelete(tx, schemaAdapter, stmt.TableName, rowChange.OldValues)
 	default:
 		return fmt.Errorf("unsupported statement type: %v", stmt.Type)
 	}
 }
 
-// applyCDCInsert performs INSERT OR REPLACE
-func (s *StreamClient) applyCDCInsert(tx *sql.Tx, tableName string, newValues map[string][]byte) error {
-	if len(newValues) == 0 {
-		return fmt.Errorf("no values to insert")
-	}
-
-	columns := make([]string, 0, len(newValues))
-	placeholders := make([]string, 0, len(newValues))
-	values := make([]interface{}, 0, len(newValues))
-
-	for col := range newValues {
-		columns = append(columns, col)
-		placeholders = append(placeholders, "?")
-
-		var value interface{}
-		if err := encoding.Unmarshal(newValues[col], &value); err != nil {
-			return fmt.Errorf("failed to deserialize value for column %s: %w", col, err)
-		}
-		values = append(values, value)
-	}
-
-	sqlStmt := fmt.Sprintf("INSERT OR REPLACE INTO %s (%s) VALUES (%s)",
-		tableName,
-		strings.Join(columns, ", "),
-		strings.Join(placeholders, ", "))
-
-	_, err := tx.Exec(sqlStmt, values...)
-	return err
+// streamClientSchemaAdapter adapts ReplicatedDatabase schema access to db.CDCSchemaProvider
+type streamClientSchemaAdapter struct {
+	mdb *db.ReplicatedDatabase
 }
 
-// applyCDCDelete performs DELETE using primary key columns from schema
-func (s *StreamClient) applyCDCDelete(tx *sql.Tx, tableName string, oldValues map[string][]byte) error {
-	if len(oldValues) == 0 {
-		return fmt.Errorf("no old values for delete")
-	}
-
-	// Get table schema to build proper WHERE clause
-	// Use transaction for schema queries to avoid connection pool conflicts
-	schemaProvider := protocol.NewSchemaProviderFromQuerier(tx)
-	schema, err := schemaProvider.GetTableSchema(tableName)
+func (a *streamClientSchemaAdapter) GetPrimaryKeys(tableName string) ([]string, error) {
+	schema, err := a.mdb.GetCachedTableSchema(tableName)
 	if err != nil {
-		return fmt.Errorf("failed to get schema for table %s: %w", tableName, err)
+		return nil, fmt.Errorf("schema not cached for table %s: %w", tableName, err)
 	}
-
-	// Build WHERE clause using primary key columns from oldValues
-	whereClauses := make([]string, 0, len(schema.PrimaryKeys))
-	values := make([]interface{}, 0, len(schema.PrimaryKeys))
-
-	for _, pkCol := range schema.PrimaryKeys {
-		pkValue, ok := oldValues[pkCol]
-		if !ok {
-			return fmt.Errorf("primary key column %s not found in CDC old values", pkCol)
-		}
-
-		whereClauses = append(whereClauses, fmt.Sprintf("%s = ?", pkCol))
-
-		var value interface{}
-		if err := encoding.Unmarshal(pkValue, &value); err != nil {
-			return fmt.Errorf("failed to deserialize PK value for column %s: %w", pkCol, err)
-		}
-		values = append(values, value)
-	}
-
-	sqlStmt := fmt.Sprintf("DELETE FROM %s WHERE %s",
-		tableName,
-		strings.Join(whereClauses, " AND "))
-
-	_, err = tx.Exec(sqlStmt, values...)
-	return err
+	return schema.PrimaryKeys, nil
 }
 
 // getLocalMaxTxnIDs returns the max committed txn_id for each database

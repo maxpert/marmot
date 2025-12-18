@@ -1114,43 +1114,38 @@ func (dm *DatabaseManager) GetMaxTxnID(database string) (uint64, error) {
 	return metaStore.GetMaxCommittedTxnID()
 }
 
-// GetTableSchema returns the schema for a table in a database
-// Used by CDC Publisher to transform events to Debezium format
+// GetTableSchema returns the schema for a table in a database.
+// Uses cached schema from SchemaCache - does NOT query SQLite.
+// Used by CDC Publisher to transform events to Debezium format.
 func (dm *DatabaseManager) GetTableSchema(database, table string) (publisher.TableSchema, error) {
 	db, err := dm.GetDatabase(database)
 	if err != nil {
 		return publisher.TableSchema{}, err
 	}
 
-	// Query PRAGMA table_info
-	rows, err := db.GetDB().Query(fmt.Sprintf("PRAGMA table_info(%s)", table))
+	schema, err := db.GetCachedTableSchema(table)
 	if err != nil {
-		return publisher.TableSchema{}, fmt.Errorf("failed to query table info: %w", err)
-	}
-	defer rows.Close()
-
-	var schema publisher.TableSchema
-	for rows.Next() {
-		var cid int
-		var name, colType string
-		var notNull, pk int
-		var dfltValue any
-		if err := rows.Scan(&cid, &name, &colType, &notNull, &dfltValue, &pk); err != nil {
-			return publisher.TableSchema{}, fmt.Errorf("failed to scan column info: %w", err)
-		}
-		schema.Columns = append(schema.Columns, publisher.ColumnInfo{
-			Name:     name,
-			Type:     colType,
-			Nullable: notNull == 0,
-			IsPK:     pk > 0,
-		})
+		return publisher.TableSchema{}, fmt.Errorf("schema not cached for table %s: %w", table, err)
 	}
 
-	if err := rows.Err(); err != nil {
-		return publisher.TableSchema{}, fmt.Errorf("error iterating column info: %w", err)
+	return schema.ToPublisherSchema(), nil
+}
+
+// GetAutoIncrementColumn returns the auto-increment column name for a table.
+// Uses cached schema - does NOT query SQLite PRAGMA.
+// Returns empty string if no auto-increment column exists.
+func (dm *DatabaseManager) GetAutoIncrementColumn(database, table string) (string, error) {
+	db, err := dm.GetDatabase(database)
+	if err != nil {
+		return "", err
 	}
 
-	return schema, nil
+	schema, err := db.GetCachedTableSchema(table)
+	if err != nil {
+		return "", fmt.Errorf("schema not cached for table %s: %w", table, err)
+	}
+
+	return schema.GetAutoIncrementCol(), nil
 }
 
 // GetCommittedTxnCount returns the count of committed transactions in a database

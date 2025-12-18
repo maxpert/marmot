@@ -7,18 +7,38 @@ import (
 	"database/sql/driver"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 
 	"github.com/mattn/go-sqlite3"
 	"github.com/rs/zerolog/log"
 )
 
-// TableSchema represents a lightweight schema for CDC hooks.
-// Contains only the minimal information needed for preupdate hook callbacks.
+// TableSchema represents complete table metadata for Marmot.
+// This is the CANONICAL schema type - all packages should use this or adapters.
+//
+// HOT PATH FIELDS (used by preupdate hook - must be fast):
+//   - Columns: Column names for value encoding
+//   - PrimaryKeys: PK column names for intent key generation
+//   - PKIndices: Indices into Columns for PKs (-1 for rowid)
+//
+// COLD PATH FIELDS (used by CDC publisher, SQL transpilation):
+//   - FullColumns: Complete column metadata including types
+//   - TableName: Table name for schema version calculation
+//   - AutoIncrementCol: Single INTEGER PK column (rowid alias)
+//
+// DO NOT create alternative schema types in other packages.
+// Use view methods (ToPublisherSchema, GetColumnTypes) or adapters.
 type TableSchema struct {
-	Columns     []string
-	PrimaryKeys []string
-	PKIndices   []int
+	// Hot path fields - preupdate hook performance critical
+	Columns     []string // Column names in declaration order
+	PrimaryKeys []string // PK column names in PK order
+	PKIndices   []int    // Indices into Columns for PKs (-1 for rowid)
+
+	// Cold path fields - populated for CDC publisher, transpilation
+	FullColumns      []ColumnSchema // Full column metadata
+	TableName        string         // Table name (for version calculation)
+	AutoIncrementCol string         // Single INTEGER PK column (empty if none)
 }
 
 // SchemaCache provides thread-safe caching of table schemas.
@@ -120,7 +140,14 @@ func (c *SchemaCache) Update(tableName string, schema *TableSchema) {
 	c.cache[tableName] = schema
 }
 
-// loadSchema fetches schema from DB using the raw SQLite connection
+// loadSchema fetches schema from DB using the raw SQLite connection.
+// Extracts ALL 6 columns from PRAGMA table_info:
+//   - cid: column index
+//   - name: column name
+//   - type: column type affinity
+//   - notnull: 1 if NOT NULL constraint
+//   - dflt_value: default value (ignored)
+//   - pk: primary key order (1-based, 0 if not PK)
 func loadSchema(conn *sqlite3.SQLiteConn, tableName string) (*TableSchema, error) {
 	rows, err := conn.Query(fmt.Sprintf("PRAGMA table_info(%s)", tableName), nil)
 	if err != nil {
@@ -129,10 +156,20 @@ func loadSchema(conn *sqlite3.SQLiteConn, tableName string) (*TableSchema, error
 	defer rows.Close()
 
 	schema := &TableSchema{
+		TableName:   tableName,
 		Columns:     make([]string, 0),
 		PrimaryKeys: make([]string, 0),
 		PKIndices:   make([]int, 0),
+		FullColumns: make([]ColumnSchema, 0),
 	}
+
+	// Track PK columns with their order for proper sorting
+	type pkInfo struct {
+		name  string
+		order int
+		index int // column index
+	}
+	var pkColumns []pkInfo
 
 	dest := make([]driver.Value, 6)
 	colIndex := 0
@@ -144,20 +181,71 @@ func loadSchema(conn *sqlite3.SQLiteConn, tableName string) (*TableSchema, error
 			return nil, fmt.Errorf("read table_info row: %w", err)
 		}
 
+		// Extract all 6 PRAGMA columns
 		name, _ := dest[1].(string)
+		colType, _ := dest[2].(string)
+		notNull, _ := dest[3].(int64)
 		pk, _ := dest[5].(int64)
 
+		// Hot path fields
 		schema.Columns = append(schema.Columns, name)
+
+		// Cold path fields - full column metadata
+		col := ColumnSchema{
+			Name:     name,
+			Type:     colType,
+			Nullable: notNull == 0,
+			IsPK:     pk > 0,
+			PKOrder:  int(pk),
+		}
+		schema.FullColumns = append(schema.FullColumns, col)
+
+		// Track PK columns for sorting
 		if pk > 0 {
-			schema.PrimaryKeys = append(schema.PrimaryKeys, name)
-			schema.PKIndices = append(schema.PKIndices, colIndex)
+			pkColumns = append(pkColumns, pkInfo{
+				name:  name,
+				order: int(pk),
+				index: colIndex,
+			})
 		}
 		colIndex++
 	}
 
+	// Sort PKs by their order in composite key
+	if len(pkColumns) > 0 {
+		for i := 0; i < len(pkColumns)-1; i++ {
+			for j := i + 1; j < len(pkColumns); j++ {
+				if pkColumns[i].order > pkColumns[j].order {
+					pkColumns[i], pkColumns[j] = pkColumns[j], pkColumns[i]
+				}
+			}
+		}
+		for _, pk := range pkColumns {
+			schema.PrimaryKeys = append(schema.PrimaryKeys, pk.name)
+			schema.PKIndices = append(schema.PKIndices, pk.index)
+		}
+	}
+
+	// Handle tables with no explicit PK (use rowid)
 	if len(schema.PrimaryKeys) == 0 {
 		schema.PrimaryKeys = []string{"rowid"}
 		schema.PKIndices = []int{-1}
+	}
+
+	// Detect auto-increment: single INTEGER PRIMARY KEY = rowid alias
+	if len(pkColumns) == 1 {
+		pkName := pkColumns[0].name
+		for _, col := range schema.FullColumns {
+			if col.Name == pkName {
+				// INTEGER PRIMARY KEY is SQLite's rowid alias (auto-increment)
+				// Also accept BIGINT for Marmot's transformed auto-increment columns
+				upperType := strings.ToUpper(col.Type)
+				if upperType == "INTEGER" || upperType == "BIGINT" {
+					schema.AutoIncrementCol = pkName
+				}
+				break
+			}
+		}
 	}
 
 	return schema, nil
