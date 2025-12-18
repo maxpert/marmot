@@ -524,6 +524,9 @@ func (tm *TransactionManager) AbortTransaction(txn *Transaction) error {
 	// Clean up CDC intent entries
 	_ = tm.metaStore.DeleteIntentEntries(txn.ID)
 
+	// Clean up raw captured rows (from hook callback)
+	_ = tm.metaStore.DeleteCapturedRows(txn.ID)
+
 	return nil
 }
 
@@ -637,15 +640,8 @@ func (tm *TransactionManager) runGarbageCollection() {
 	}
 
 	// ====================
-	// PHASE 2: BACKGROUND - Skipped under load
+	// PHASE 2: BACKGROUND
 	// ====================
-	// Cleanup old transaction records.
-	// This is non-critical and can be deferred when system is busy.
-	if tm.isMetaStoreBusy() {
-		log.Debug().Msg("GC Phase 2: Skipping - MetaStore under load")
-		return
-	}
-
 	// Clean up old committed/aborted transaction records
 	oldTxnCount, err := tm.cleanupOldTransactionRecords()
 	if err != nil {
@@ -657,16 +653,6 @@ func (tm *TransactionManager) runGarbageCollection() {
 			Int("old_txn_records", oldTxnCount).
 			Msg("GC Phase 2: Cleaned up old data")
 	}
-}
-
-// isMetaStoreBusy checks if MetaStore batch channel is under pressure
-// Returns true if we should skip non-critical GC work
-func (tm *TransactionManager) isMetaStoreBusy() bool {
-	// Check if MetaStore supports load detection
-	if loadChecker, ok := tm.metaStore.(interface{ IsBusy() bool }); ok {
-		return loadChecker.IsBusy()
-	}
-	return false
 }
 
 // cleanupStaleTransactions aborts transactions that haven't had a heartbeat within the timeout

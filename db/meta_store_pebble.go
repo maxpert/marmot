@@ -43,32 +43,13 @@ const (
 	pebbleCDCDDLKeyMarker = "__ddl__" // Sentinel key for DDL locks
 )
 
-// Group commit configuration (same as BadgerDB)
-const (
-	pebbleBatchMaxSize     = 100                  // Max operations per batch
-	pebbleBatchMaxWait     = 2 * time.Millisecond // Max time to wait for batch
-	pebbleBatchChannelSize = 1000                 // Channel buffer size
-)
-
 // Sharded lock for WriteIntent serialization (prevents TOCTOU race)
 const intentLockShards = 256
-
-// pebbleBatchOp represents a batched write operation
-type pebbleBatchOp struct {
-	fn     func(batch *pebble.Batch) error
-	result chan error
-}
 
 // PebbleMetaStore implements MetaStore using Pebble
 type PebbleMetaStore struct {
 	db   *pebble.DB
 	path string
-
-	// Batch writer
-	batchCh     chan *pebbleBatchOp
-	stopBatch   chan struct{}
-	batchWg     sync.WaitGroup
-	batchClosed atomic.Bool
 
 	// Idempotent close
 	closed atomic.Bool
@@ -256,8 +237,6 @@ func NewPebbleMetaStore(path string, opts PebbleMetaStoreOptions) (*PebbleMetaSt
 	store := &PebbleMetaStore{
 		db:           db,
 		path:         path,
-		batchCh:      make(chan *pebbleBatchOp, pebbleBatchChannelSize),
-		stopBatch:    make(chan struct{}),
 		sequences:    make(map[uint64]*AtomicSequence),
 		intentFilter: NewIntentFilter(),
 	}
@@ -277,86 +256,7 @@ func NewPebbleMetaStore(path string, opts PebbleMetaStoreOptions) (*PebbleMetaSt
 		return nil, fmt.Errorf("failed to clear stale CDC locks: %w", err)
 	}
 
-	// Start batch writer goroutine
-	store.batchWg.Add(1)
-	go store.batchWriter()
-
 	return store, nil
-}
-
-// batchWriter runs in a goroutine and batches write operations
-func (s *PebbleMetaStore) batchWriter() {
-	defer s.batchWg.Done()
-
-	ops := make([]*pebbleBatchOp, 0, pebbleBatchMaxSize)
-	timer := time.NewTimer(pebbleBatchMaxWait)
-	timer.Stop()
-	timerRunning := false
-
-	flush := func() {
-		if len(ops) == 0 {
-			return
-		}
-
-		batch := s.db.NewBatch()
-		defer batch.Close()
-
-		// Execute all ops in the batch
-		for _, op := range ops {
-			if opErr := op.fn(batch); opErr != nil {
-				op.result <- opErr
-			}
-		}
-
-		// Commit with sync
-		commitErr := batch.Commit(pebble.NoSync)
-
-		// Notify all ops of completion
-		for _, op := range ops {
-			select {
-			case <-op.result:
-				// Already sent error above
-			default:
-				op.result <- commitErr
-			}
-		}
-
-		ops = ops[:0]
-		if timerRunning {
-			timer.Stop()
-			timerRunning = false
-		}
-	}
-
-	for {
-		select {
-		case op := <-s.batchCh:
-			ops = append(ops, op)
-
-			if len(ops) >= pebbleBatchMaxSize {
-				flush()
-			} else if !timerRunning {
-				timer.Reset(pebbleBatchMaxWait)
-				timerRunning = true
-			}
-
-		case <-timer.C:
-			timerRunning = false
-			flush()
-
-		case <-s.stopBatch:
-			// Drain remaining ops
-			for {
-				select {
-				case op := <-s.batchCh:
-					ops = append(ops, op)
-				default:
-					flush()
-					return
-				}
-			}
-		}
-	}
 }
 
 // Close closes the Pebble DB (idempotent - safe to call multiple times)
@@ -365,14 +265,6 @@ func (s *PebbleMetaStore) Close() error {
 	if s.closed.Swap(true) {
 		return nil // Already closed
 	}
-
-	// Stop batch writer
-	if !s.batchClosed.Swap(true) {
-		close(s.stopBatch)
-	}
-
-	// Wait for batch writer to finish
-	s.batchWg.Wait()
 
 	// Release all sequence generators (persist final values)
 	s.seqMu.Lock()
@@ -388,15 +280,6 @@ func (s *PebbleMetaStore) Close() error {
 // Checkpoint is a no-op for Pebble (no WAL checkpoint like SQLite)
 func (s *PebbleMetaStore) Checkpoint() error {
 	return nil
-}
-
-// IsBusy returns true if the batch channel is over 50% full.
-// Used by GC to skip non-critical Phase 2 work under load.
-func (s *PebbleMetaStore) IsBusy() bool {
-	if s.batchClosed.Load() {
-		return false
-	}
-	return len(s.batchCh) > pebbleBatchChannelSize/2
 }
 
 // AtomicSequence provides contention-free sequence number generation.
@@ -1693,7 +1576,7 @@ func (s *PebbleMetaStore) CleanupAfterCommit(txnID uint64) error {
 		return err
 	}
 
-	// Collect CDC entry keys
+	// Collect CDC entry keys (/cdc/{txnID}/*)
 	cdcPrefix := pebbleCdcPrefix(txnID)
 	var cdcKeys [][]byte
 
@@ -1715,8 +1598,31 @@ func (s *PebbleMetaStore) CleanupAfterCommit(txnID uint64) error {
 		return err
 	}
 
+	// Collect CDC raw captured row keys (/cdc/raw/{txnID}/*)
+	// These may remain if ProcessCapturedRows failed partway through
+	cdcRawPrefix := pebbleCdcRawPrefix(txnID)
+	var cdcRawKeys [][]byte
+
+	cdcRawIter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: cdcRawPrefix,
+		UpperBound: prefixUpperBound(cdcRawPrefix),
+	})
+	if err != nil {
+		return err
+	}
+
+	for cdcRawIter.SeekGE(cdcRawPrefix); cdcRawIter.Valid(); cdcRawIter.Next() {
+		key := make([]byte, len(cdcRawIter.Key()))
+		copy(key, cdcRawIter.Key())
+		cdcRawKeys = append(cdcRawKeys, key)
+	}
+
+	if err := cdcRawIter.Close(); err != nil {
+		return err
+	}
+
 	// Early return if nothing to delete
-	if len(primaryKeys) == 0 && len(cdcKeys) == 0 {
+	if len(primaryKeys) == 0 && len(cdcKeys) == 0 && len(cdcRawKeys) == 0 {
 		return nil
 	}
 
@@ -1742,6 +1648,11 @@ func (s *PebbleMetaStore) CleanupAfterCommit(txnID uint64) error {
 
 	// Delete CDC entries
 	for _, key := range cdcKeys {
+		_ = batch.Delete(key, nil)
+	}
+
+	// Delete CDC raw captured rows
+	for _, key := range cdcRawKeys {
 		_ = batch.Delete(key, nil)
 	}
 

@@ -347,18 +347,6 @@ func TestPebbleMetaStoreCommitCounters(t *testing.T) {
 	}
 }
 
-func TestPebbleMetaStoreIsBusy(t *testing.T) {
-	store, cleanup := createTestPebbleMetaStore(t)
-	defer cleanup()
-
-	// Initially not busy
-	if store.IsBusy() {
-		t.Error("Store should not be busy initially")
-	}
-
-	// Close will be called by cleanup - no need to test after close
-}
-
 func TestPebbleMetaStoreSchemaVersion(t *testing.T) {
 	store, cleanup := createTestPebbleMetaStore(t)
 	defer cleanup()
