@@ -4,10 +4,12 @@
 package encoding
 
 import (
+	"bytes"
 	"sync/atomic"
 	"unsafe"
 
 	"github.com/maxpert/marmot/pkg/mimalloc"
+	"github.com/vmihailenco/msgpack/v5"
 )
 
 // NativeBytes represents memory allocated outside the Go heap.
@@ -41,51 +43,42 @@ type nativeArena struct {
 // MarshalNative marshals a value to msgpack format using native memory allocation.
 // The returned NativeBytes must be explicitly disposed when no longer needed.
 func MarshalNative(v interface{}) (NativeBytes, error) {
-	entry := encoderPool.Get().(*encoderPoolEntry)
-	entry.buf.Reset()
+	var buf bytes.Buffer
+	enc := msgpack.NewEncoder(&buf)
 
-	if err := entry.enc.Encode(v); err != nil {
-		encoderPool.Put(entry)
+	if err := enc.Encode(v); err != nil {
 		return nil, err
 	}
 
-	size := entry.buf.Len()
+	size := buf.Len()
 	ptr := mimalloc.Malloc(uintptr(size))
 	if ptr == nil {
-		encoderPool.Put(entry)
 		return nil, &MarshalError{msg: "mimalloc allocation failed"}
 	}
 
-	slice := unsafe.Slice((*byte)(ptr), size)
-	copy(slice, entry.buf.Bytes())
-	encoderPool.Put(entry)
+	dst := unsafe.Slice((*byte)(ptr), size)
+	copy(dst, buf.Bytes())
 
-	return &nativeBytes{
-		ptr: ptr,
-		len: size,
-	}, nil
+	return &nativeBytes{ptr: ptr, len: size}, nil
 }
 
 // MarshalToArena marshals a value to msgpack format using arena memory allocation.
 // The returned slice is valid until the arena is destroyed.
 func MarshalToArena(arena NativeArena, v interface{}) ([]byte, error) {
-	entry := encoderPool.Get().(*encoderPoolEntry)
-	entry.buf.Reset()
+	var buf bytes.Buffer
+	enc := msgpack.NewEncoder(&buf)
 
-	if err := entry.enc.Encode(v); err != nil {
-		encoderPool.Put(entry)
+	if err := enc.Encode(v); err != nil {
 		return nil, err
 	}
 
-	size := entry.buf.Len()
+	size := buf.Len()
 	slice := arena.Alloc(size)
 	if slice == nil {
-		encoderPool.Put(entry)
 		return nil, &MarshalError{msg: "arena allocation failed"}
 	}
 
-	copy(slice, entry.buf.Bytes())
-	encoderPool.Put(entry)
+	copy(slice, buf.Bytes())
 
 	return slice, nil
 }
