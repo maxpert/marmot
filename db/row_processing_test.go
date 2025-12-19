@@ -61,7 +61,7 @@ func TestProcessRows_InsertGeneratesIntentKey(t *testing.T) {
 	encodedRow := EncodedCapturedRow{
 		Table:     "users",
 		Op:        uint8(OpTypeInsert),
-		IntentKey: "users:1",
+		IntentKey: []byte("users:1"),
 		NewValues: newVals,
 	}
 	rowData, err := encoding.Marshal(&encodedRow)
@@ -79,8 +79,8 @@ func TestProcessRows_InsertGeneratesIntentKey(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, entries, 1)
 	assert.Equal(t, "users", entries[0].Table)
-	assert.Contains(t, entries[0].IntentKey, "users")
-	assert.Contains(t, entries[0].IntentKey, "1")
+	assert.Contains(t, string(entries[0].IntentKey), "users")
+	assert.Contains(t, string(entries[0].IntentKey), "1")
 }
 
 func TestProcessRows_UpdateGeneratesIntentKey(t *testing.T) {
@@ -120,7 +120,7 @@ func TestProcessRows_UpdateGeneratesIntentKey(t *testing.T) {
 	encodedRow := EncodedCapturedRow{
 		Table:     "users",
 		Op:        uint8(OpTypeUpdate),
-		IntentKey: "users:1",
+		IntentKey: []byte("users:1"),
 		OldValues: oldVals,
 		NewValues: newVals,
 	}
@@ -139,8 +139,8 @@ func TestProcessRows_UpdateGeneratesIntentKey(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, entries, 1)
 	assert.Equal(t, uint8(OpTypeUpdate), entries[0].Operation)
-	assert.Contains(t, entries[0].IntentKey, "users")
-	assert.Contains(t, entries[0].IntentKey, "1")
+	assert.Contains(t, string(entries[0].IntentKey), "users")
+	assert.Contains(t, string(entries[0].IntentKey), "1")
 }
 
 func TestProcessRows_DeleteGeneratesIntentKey(t *testing.T) {
@@ -175,7 +175,7 @@ func TestProcessRows_DeleteGeneratesIntentKey(t *testing.T) {
 	encodedRow := EncodedCapturedRow{
 		Table:     "users",
 		Op:        uint8(OpTypeDelete),
-		IntentKey: "users:1",
+		IntentKey: []byte("users:1"),
 		OldValues: oldVals,
 	}
 	rowData, err := encoding.Marshal(&encodedRow)
@@ -193,8 +193,8 @@ func TestProcessRows_DeleteGeneratesIntentKey(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, entries, 1)
 	assert.Equal(t, uint8(OpTypeDelete), entries[0].Operation)
-	assert.Contains(t, entries[0].IntentKey, "users")
-	assert.Contains(t, entries[0].IntentKey, "1")
+	assert.Contains(t, string(entries[0].IntentKey), "users")
+	assert.Contains(t, string(entries[0].IntentKey), "1")
 }
 
 func TestProcessRows_LockAcquired(t *testing.T) {
@@ -229,7 +229,7 @@ func TestProcessRows_LockAcquired(t *testing.T) {
 	encodedRow := EncodedCapturedRow{
 		Table:     "users",
 		Op:        uint8(OpTypeInsert),
-		IntentKey: "users:1",
+		IntentKey: []byte("users:1"),
 		NewValues: newVals,
 	}
 	rowData, err := encoding.Marshal(&encodedRow)
@@ -285,7 +285,7 @@ func TestProcessRows_ConflictDetected(t *testing.T) {
 	encodedRow1 := EncodedCapturedRow{
 		Table:     "users",
 		Op:        sqlite3.SQLITE_INSERT,
-		IntentKey: "users:1",
+		IntentKey: []byte("users:1"),
 		NewValues: newVals1,
 	}
 	rowData1, err := encoding.Marshal(&encodedRow1)
@@ -316,7 +316,7 @@ func TestProcessRows_ConflictDetected(t *testing.T) {
 	encodedRow2 := EncodedCapturedRow{
 		Table:     "users",
 		Op:        sqlite3.SQLITE_UPDATE,
-		IntentKey: "users:1",
+		IntentKey: []byte("users:1"),
 		OldValues: oldVals2,
 		NewValues: newVals2,
 	}
@@ -372,7 +372,7 @@ func TestProcessRows_NoConflictDifferentRows(t *testing.T) {
 	encodedRow1 := EncodedCapturedRow{
 		Table:     "users",
 		Op:        uint8(OpTypeInsert),
-		IntentKey: "users:1",
+		IntentKey: []byte("users:1"),
 		NewValues: newVals1,
 	}
 	rowData1, err := encoding.Marshal(&encodedRow1)
@@ -398,7 +398,7 @@ func TestProcessRows_NoConflictDifferentRows(t *testing.T) {
 	encodedRow2 := EncodedCapturedRow{
 		Table:     "users",
 		Op:        uint8(OpTypeInsert),
-		IntentKey: "users:2",
+		IntentKey: []byte("users:2"),
 		NewValues: newVals2,
 	}
 	rowData2, err := encoding.Marshal(&encodedRow2)
@@ -460,7 +460,7 @@ func TestProcessRows_NoConflictDifferentTables(t *testing.T) {
 	encodedRow1 := EncodedCapturedRow{
 		Table:     "table_a",
 		Op:        uint8(OpTypeInsert),
-		IntentKey: "table_a:1",
+		IntentKey: []byte("table_a:1"),
 		NewValues: newVals1,
 	}
 	rowData1, err := encoding.Marshal(&encodedRow1)
@@ -486,7 +486,7 @@ func TestProcessRows_NoConflictDifferentTables(t *testing.T) {
 	encodedRow2 := EncodedCapturedRow{
 		Table:     "table_b",
 		Op:        uint8(OpTypeInsert),
-		IntentKey: "table_b:1",
+		IntentKey: []byte("table_b:1"),
 		NewValues: newVals2,
 	}
 	rowData2, err := encoding.Marshal(&encodedRow2)
@@ -537,7 +537,7 @@ func TestProcessRows_CDCEntriesGenerated(t *testing.T) {
 	encodedRow := EncodedCapturedRow{
 		Table:     "users",
 		Op:        uint8(OpTypeInsert),
-		IntentKey: "users:1",
+		IntentKey: []byte("users:1"),
 		NewValues: newVals,
 	}
 	rowData, err := encoding.Marshal(&encodedRow)
@@ -618,7 +618,7 @@ func TestProcessRows_MultipleRowsProcessed(t *testing.T) {
 		encodedRow := EncodedCapturedRow{
 			Table:     "users",
 			Op:        uint8(OpTypeInsert),
-			IntentKey: fmt.Sprintf("users:%d", tc.id),
+			IntentKey: []byte(fmt.Sprintf("users:%d", tc.id)),
 			NewValues: newVals,
 		}
 		rowData, err := encoding.Marshal(&encodedRow)
@@ -642,7 +642,7 @@ func TestProcessRows_MultipleRowsProcessed(t *testing.T) {
 		assert.Equal(t, "users", entry.Table)
 		assert.Equal(t, uint8(OpTypeInsert), entry.Operation)
 		assert.NotEmpty(t, entry.IntentKey)
-		intentKeys[entry.IntentKey] = true
+		intentKeys[string(entry.IntentKey)] = true
 	}
 
 	assert.Len(t, intentKeys, 3, "Each row should have a unique intent key")
@@ -680,7 +680,7 @@ func TestProcessRows_CapturedRowsRetained(t *testing.T) {
 	encodedRow := EncodedCapturedRow{
 		Table:     "users",
 		Op:        uint8(OpTypeInsert),
-		IntentKey: "users:1",
+		IntentKey: []byte("users:1"),
 		NewValues: newVals,
 	}
 	rowData, err := encoding.Marshal(&encodedRow)
@@ -736,7 +736,7 @@ func TestProcessRows_SchemaNotFoundSkipsRow(t *testing.T) {
 	encodedRow := EncodedCapturedRow{
 		Table:     "nonexistent_table",
 		Op:        uint8(OpTypeInsert),
-		IntentKey: "nonexistent_table:1",
+		IntentKey: []byte("nonexistent_table:1"),
 		NewValues: newVals,
 	}
 	rowData, err := encoding.Marshal(&encodedRow)
@@ -792,7 +792,7 @@ func TestProcessRows_CompositeKeyIntentGeneration(t *testing.T) {
 	encodedRow := EncodedCapturedRow{
 		Table:     "orders",
 		Op:        uint8(OpTypeInsert),
-		IntentKey: "orders:42:100",
+		IntentKey: []byte("orders:42:100"),
 		NewValues: newVals,
 	}
 	rowData, err := encoding.Marshal(&encodedRow)
@@ -810,7 +810,7 @@ func TestProcessRows_CompositeKeyIntentGeneration(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, entries, 1)
 
-	assert.Contains(t, entries[0].IntentKey, "orders", "Intent key should contain table name")
+	assert.Contains(t, string(entries[0].IntentKey), "orders", "Intent key should contain table name")
 	assert.NotEmpty(t, entries[0].IntentKey, "Intent key should be non-empty")
 }
 
@@ -845,7 +845,7 @@ func TestProcessRows_RowIDBasedPK(t *testing.T) {
 	encodedRow := EncodedCapturedRow{
 		Table:     "notes",
 		Op:        uint8(OpTypeInsert),
-		IntentKey: "notes:42",
+		IntentKey: []byte("notes:42"),
 		NewValues: newVals,
 	}
 	rowData, err := encoding.Marshal(&encodedRow)
@@ -863,6 +863,6 @@ func TestProcessRows_RowIDBasedPK(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, entries, 1)
 
-	assert.Contains(t, entries[0].IntentKey, "42", "Intent key should contain rowid value")
-	assert.Contains(t, entries[0].IntentKey, "notes")
+	assert.Contains(t, string(entries[0].IntentKey), "42", "Intent key should contain rowid value")
+	assert.Contains(t, string(entries[0].IntentKey), "notes")
 }

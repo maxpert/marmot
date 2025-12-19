@@ -2,13 +2,12 @@ package db
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 
 	"github.com/maxpert/marmot/coordinator"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/protocol"
+	"github.com/maxpert/marmot/protocol/filter"
 	"github.com/rs/zerolog/log"
 )
 
@@ -110,7 +109,7 @@ func (re *ReplicationEngine) prepareDatabaseOperation(req *PrepareRequest) *Prep
 		return &PrepareResult{Success: false, Error: fmt.Sprintf("failed to add statement: %v", err)}
 	}
 
-	dbIntentKey := stmt.Database
+	dbIntentKey := filter.EncodeDBOpIntentKey(stmt.Database)
 	dbOp := DatabaseOpCreate
 	if stmt.Type == protocol.StatementDropDatabase {
 		dbOp = DatabaseOpDrop
@@ -127,7 +126,7 @@ func (re *ReplicationEngine) prepareDatabaseOperation(req *PrepareRequest) *Prep
 		return &PrepareResult{Success: false, Error: fmt.Sprintf("failed to serialize data: %v", err)}
 	}
 
-	err = txnMgr.WriteIntent(txn, IntentTypeDatabaseOp, "", dbIntentKey, stmt, dataSnapshot)
+	err = txnMgr.WriteIntent(txn, IntentTypeDatabaseOp, "", string(dbIntentKey), stmt, dataSnapshot)
 	if err != nil {
 		_ = txnMgr.AbortTransaction(txn)
 		return &PrepareResult{Success: false, Error: fmt.Sprintf("write conflict: %v", err)}
@@ -178,7 +177,7 @@ func (re *ReplicationEngine) processStatement(txn *Transaction, txnMgr *Transact
 	}
 
 	intentKey := stmt.IntentKey
-	if intentKey == "" {
+	if len(intentKey) == 0 {
 		if stmt.Type == protocol.StatementInsert {
 			log.Trace().
 				Str("table", stmt.TableName).
@@ -201,13 +200,12 @@ func (re *ReplicationEngine) processStatement(txn *Transaction, txnMgr *Transact
 		return nil
 	}
 
-	return re.createDMLIntent(txnMgr, metaStore, txn, stmt, intentKey, req, stmtSeq)
+	return re.createDMLIntent(txnMgr, metaStore, txn, stmt, string(intentKey), req, stmtSeq)
 }
 
 // createDDLIntent creates a write intent for DDL statements
 func (re *ReplicationEngine) createDDLIntent(txnMgr *TransactionManager, txn *Transaction, stmt protocol.Statement, startTS hlc.Timestamp) *PrepareResult {
-	hash := sha256.Sum256([]byte(stmt.SQL))
-	ddlIntentKey := stmt.TableName + ":" + hex.EncodeToString(hash[:8])
+	ddlIntentKey := filter.EncodeDDLIntentKey(stmt.TableName)
 
 	snapshotData := DDLSnapshot{
 		Type:      int(stmt.Type),
@@ -221,7 +219,7 @@ func (re *ReplicationEngine) createDDLIntent(txnMgr *TransactionManager, txn *Tr
 		return &PrepareResult{Success: false, Error: fmt.Sprintf("failed to serialize DDL data: %v", serErr)}
 	}
 
-	if err := txnMgr.WriteIntent(txn, IntentTypeDDL, stmt.TableName, ddlIntentKey, stmt, dataSnapshot); err != nil {
+	if err := txnMgr.WriteIntent(txn, IntentTypeDDL, stmt.TableName, string(ddlIntentKey), stmt, dataSnapshot); err != nil {
 		_ = txnMgr.AbortTransaction(txn)
 		return &PrepareResult{
 			Success:          false,
@@ -233,7 +231,7 @@ func (re *ReplicationEngine) createDDLIntent(txnMgr *TransactionManager, txn *Tr
 
 	log.Debug().
 		Str("table", stmt.TableName).
-		Str("ddl_intent_key", ddlIntentKey).
+		Str("ddl_intent_key", string(ddlIntentKey)).
 		Msg("Created write intent for DDL statement")
 
 	return nil
@@ -324,7 +322,7 @@ func (re *ReplicationEngine) Commit(ctx context.Context, req *CommitRequest) *Co
 						}
 
 						dbOp := snapshotData.Operation
-						dbName := intent.IntentKey // Row key is the database name
+						dbName := snapshotData.DatabaseName
 
 						// Execute the database operation BEFORE committing the transaction
 						dbMgr, ok := re.dbMgr.(*DatabaseManager)

@@ -6,6 +6,7 @@ import (
 
 	"github.com/cespare/xxhash/v2"
 	cuckoo "github.com/linvon/cuckoo-filter"
+	"github.com/maxpert/marmot/protocol/filter"
 	"github.com/maxpert/marmot/telemetry"
 )
 
@@ -149,4 +150,10 @@ func ComputeIntentHash(table, intentKey string) uint64 {
 	_, _ = h.WriteString(":")
 	_, _ = h.WriteString(intentKey)
 	return h.Sum64()
+}
+
+// ComputeIntentHashBinary computes hash for binary intent keys.
+// Binary intent keys already contain table prefix, so no extra hashing needed.
+func ComputeIntentHashBinary(intentKey []byte) uint64 {
+	return filter.HashBinaryIntentKey(intentKey)
 }

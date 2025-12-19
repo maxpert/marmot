@@ -66,7 +66,7 @@ func TestSchemaVersionRejection(t *testing.T) {
 				Database:  testDB,
 				Payload: &Statement_RowChange{
 					RowChange: &RowChange{
-						IntentKey: "test_key_4",
+						IntentKey: []byte("test_key_4"),
 						NewValues: map[string][]byte{"id": []byte("4")},
 					},
 				},

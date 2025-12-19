@@ -11,6 +11,7 @@ import (
 	"sync"
 
 	"github.com/mattn/go-sqlite3"
+	"github.com/maxpert/marmot/protocol/filter"
 	"github.com/rs/zerolog/log"
 )
 
@@ -31,9 +32,10 @@ import (
 // Use view methods (ToPublisherSchema, GetColumnTypes) or adapters.
 type TableSchema struct {
 	// Hot path fields - preupdate hook performance critical
-	Columns     []string // Column names in declaration order
-	PrimaryKeys []string // PK column names in PK order
-	PKIndices   []int    // Indices into Columns for PKs (-1 for rowid)
+	Columns         []string // Column names in declaration order
+	PrimaryKeys     []string // PK column names in PK order
+	PKIndices       []int    // Indices into Columns for PKs (-1 for rowid)
+	IntentKeyPrefix []byte   // Precomputed: version(1) + uvarint(tableLen) + table
 
 	// Cold path fields - populated for CDC publisher, transpilation
 	FullColumns      []ColumnSchema // Full column metadata
@@ -247,6 +249,9 @@ func loadSchema(conn *sqlite3.SQLiteConn, tableName string) (*TableSchema, error
 			}
 		}
 	}
+
+	// Build precomputed intent key prefix for binary encoding
+	schema.IntentKeyPrefix = filter.BuildIntentKeyPrefix(tableName)
 
 	return schema, nil
 }

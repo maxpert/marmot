@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/maxpert/marmot/db"
+	"github.com/maxpert/marmot/protocol/filter"
 )
 
 // handleIntents handles intent-related endpoints
@@ -80,7 +81,7 @@ func (h *AdminHandlers) handleIntent(w http.ResponseWriter, r *http.Request, met
 
 	response := map[string]interface{}{
 		"table_name":         rec.TableName,
-		"intent_key":         rec.IntentKey,
+		"intent_key":         filter.IntentKeyToBase64(rec.IntentKey),
 		"txn_id":             rec.TxnID,
 		"ts_wall":            rec.TSWall,
 		"ts_logical":         rec.TSLogical,
@@ -115,7 +116,7 @@ func (h *AdminHandlers) handleIntentsByTxn(w http.ResponseWriter, r *http.Reques
 	for _, rec := range records {
 		item := map[string]interface{}{
 			"table_name":         rec.TableName,
-			"intent_key":         rec.IntentKey,
+			"intent_key":         filter.IntentKeyToBase64(rec.IntentKey),
 			"txn_id":             rec.TxnID,
 			"ts_wall":            rec.TSWall,
 			"ts_logical":         rec.TSLogical,

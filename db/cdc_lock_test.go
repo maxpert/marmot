@@ -76,7 +76,7 @@ func TestCDCRowLock_ConflictDifferentTxn(t *testing.T) {
 	var cdcErr ErrCDCRowLocked
 	require.ErrorAs(t, err, &cdcErr)
 	assert.Equal(t, table, cdcErr.Table)
-	assert.Equal(t, intentKey, cdcErr.IntentKey)
+	assert.Equal(t, []byte(intentKey), cdcErr.IntentKey)
 	assert.Equal(t, txn1, cdcErr.HeldByTxn)
 
 	// Release txn1 lock

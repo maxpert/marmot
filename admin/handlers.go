@@ -253,4 +253,3 @@ func parsePeerNodeID(peerIDStr string) (uint64, error) {
 
 	return peerID, nil
 }
-

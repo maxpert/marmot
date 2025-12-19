@@ -282,13 +282,13 @@ func (tm *TransactionManager) validateIntents(txn *Transaction) ([]*WriteIntentR
 	}
 
 	for _, intent := range intents {
-		valid, err := tm.metaStore.ValidateIntent(intent.TableName, intent.IntentKey, txn.ID)
+		valid, err := tm.metaStore.ValidateIntent(intent.TableName, string(intent.IntentKey), txn.ID)
 		if err != nil {
 			return nil, fmt.Errorf("failed to validate intent: %w", err)
 		}
 		if !valid {
 			return nil, fmt.Errorf("write intent lost for %s:%s - transaction aborted",
-				intent.TableName, intent.IntentKey)
+				intent.TableName, string(intent.IntentKey))
 		}
 	}
 

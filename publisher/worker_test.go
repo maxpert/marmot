@@ -174,7 +174,7 @@ func TestWorker_NormalProcessing(t *testing.T) {
 			Database:  "testdb",
 			Table:     "users",
 			Operation: OpInsert,
-			IntentKey: "user:1",
+			IntentKey: []byte("user:1"),
 			After:     map[string][]byte{"id": []byte("1"), "name": []byte("Alice")},
 			CommitTS:  time.Now().UnixMilli(),
 			NodeID:    100,
@@ -184,7 +184,7 @@ func TestWorker_NormalProcessing(t *testing.T) {
 			Database:  "testdb",
 			Table:     "users",
 			Operation: OpUpdate,
-			IntentKey: "user:1",
+			IntentKey: []byte("user:1"),
 			Before:    map[string][]byte{"id": []byte("1"), "name": []byte("Alice")},
 			After:     map[string][]byte{"id": []byte("1"), "name": []byte("Bob")},
 			CommitTS:  time.Now().UnixMilli(),
@@ -235,8 +235,9 @@ func TestWorker_NormalProcessing(t *testing.T) {
 	if published[0].topic != "marmot.cdc.testdb.users" {
 		t.Errorf("expected topic 'marmot.cdc.testdb.users', got '%s'", published[0].topic)
 	}
-	if published[0].key != "user:1" {
-		t.Errorf("expected key 'user:1', got '%s'", published[0].key)
+	// IntentKey []byte("user:1") → base64url "dXNlcjox"
+	if published[0].key != "dXNlcjox" {
+		t.Errorf("expected key 'dXNlcjox', got '%s'", published[0].key)
 	}
 
 	// Verify cursor was advanced
@@ -262,7 +263,7 @@ func TestWorker_FilterSkipping(t *testing.T) {
 			Database:  "testdb",
 			Table:     "users",
 			Operation: OpInsert,
-			IntentKey: "user:1",
+			IntentKey: []byte("user:1"),
 			After:     map[string][]byte{"id": []byte("1")},
 			CommitTS:  time.Now().UnixMilli(),
 			NodeID:    100,
@@ -272,7 +273,7 @@ func TestWorker_FilterSkipping(t *testing.T) {
 			Database:  "testdb",
 			Table:     "products", // This will be filtered
 			Operation: OpInsert,
-			IntentKey: "product:1",
+			IntentKey: []byte("product:1"),
 			After:     map[string][]byte{"id": []byte("1")},
 			CommitTS:  time.Now().UnixMilli(),
 			NodeID:    100,
@@ -282,7 +283,7 @@ func TestWorker_FilterSkipping(t *testing.T) {
 			Database:  "testdb",
 			Table:     "users",
 			Operation: OpInsert,
-			IntentKey: "user:2",
+			IntentKey: []byte("user:2"),
 			After:     map[string][]byte{"id": []byte("2")},
 			CommitTS:  time.Now().UnixMilli(),
 			NodeID:    100,
@@ -357,7 +358,7 @@ func TestWorker_RetryOnFailure(t *testing.T) {
 			Database:  "testdb",
 			Table:     "users",
 			Operation: OpInsert,
-			IntentKey: "user:1",
+			IntentKey: []byte("user:1"),
 			After:     map[string][]byte{"id": []byte("1")},
 			CommitTS:  time.Now().UnixMilli(),
 			NodeID:    100,
@@ -474,7 +475,7 @@ func TestWorker_DeleteWithTombstone(t *testing.T) {
 			Database:  "testdb",
 			Table:     "users",
 			Operation: OpDelete,
-			IntentKey: "user:1",
+			IntentKey: []byte("user:1"),
 			Before:    map[string][]byte{"id": []byte("1"), "name": []byte("Alice")},
 			CommitTS:  time.Now().UnixMilli(),
 			NodeID:    100,
@@ -524,18 +525,20 @@ func TestWorker_DeleteWithTombstone(t *testing.T) {
 	if published[0].topic != "marmot.cdc.testdb.users" {
 		t.Errorf("expected topic 'marmot.cdc.testdb.users', got '%s'", published[0].topic)
 	}
-	if published[0].key != "user:1" {
-		t.Errorf("expected key 'user:1', got '%s'", published[0].key)
+	// IntentKey []byte("user:1") → base64url "dXNlcjox"
+	if published[0].key != "dXNlcjox" {
+		t.Errorf("expected key 'dXNlcjox', got '%s'", published[0].key)
 	}
 
 	// Second should be tombstone
 	if published[1].topic != "marmot.cdc.testdb.users" {
 		t.Errorf("expected topic 'marmot.cdc.testdb.users', got '%s'", published[1].topic)
 	}
-	if published[1].key != "user:1" {
-		t.Errorf("expected key 'user:1', got '%s'", published[1].key)
+	if published[1].key != "dXNlcjox" {
+		t.Errorf("expected key 'dXNlcjox', got '%s'", published[1].key)
 	}
-	if string(published[1].value) != "tombstone:user:1" {
+	// Tombstone uses the base64url encoded key
+	if string(published[1].value) != "tombstone:dXNlcjox" {
 		t.Errorf("expected tombstone value, got '%s'", string(published[1].value))
 	}
 }

@@ -15,7 +15,7 @@ func TestCDCEventMsgpackSerialization(t *testing.T) {
 		Database:  "test_db",
 		Table:     "users",
 		Operation: OpInsert,
-		IntentKey: "user:123",
+		IntentKey: []byte("user:123"),
 		Before:    nil,
 		After: map[string][]byte{
 			"id":   []byte("123"),
@@ -64,7 +64,7 @@ func TestCDCEventUpdateOperation(t *testing.T) {
 		Database:  "db",
 		Table:     "tbl",
 		Operation: OpUpdate,
-		IntentKey: "key:1",
+		IntentKey: []byte("key:1"),
 		Before: map[string][]byte{
 			"status": []byte("active"),
 		},
@@ -94,7 +94,7 @@ func TestCDCEventDeleteOperation(t *testing.T) {
 		Database:  "db",
 		Table:     "tbl",
 		Operation: OpDelete,
-		IntentKey: "key:1",
+		IntentKey: []byte("key:1"),
 		Before: map[string][]byte{
 			"id": []byte("1"),
 		},
@@ -140,7 +140,7 @@ func TestCDCEventEmptyMaps(t *testing.T) {
 		Database:  "db",
 		Table:     "tbl",
 		Operation: OpInsert,
-		IntentKey: "key",
+		IntentKey: []byte("key"),
 		Before:    make(map[string][]byte),
 		After:     make(map[string][]byte),
 		CommitTS:  1000,

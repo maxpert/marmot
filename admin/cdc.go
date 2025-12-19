@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/maxpert/marmot/db"
+	"github.com/maxpert/marmot/protocol/filter"
 )
 
 // handleCDC handles CDC-related endpoints
@@ -52,7 +53,7 @@ func (h *AdminHandlers) handleCDCByTxn(w http.ResponseWriter, r *http.Request, m
 			"seq":        entry.Seq,
 			"operation":  entry.Operation,
 			"table":      entry.Table,
-			"intent_key": entry.IntentKey,
+			"intent_key": filter.IntentKeyToBase64(entry.IntentKey),
 			"old_values": encodeBase64Map(entry.OldValues),
 			"new_values": encodeBase64Map(entry.NewValues),
 			"created_at": formatTimestamp(entry.CreatedAt),

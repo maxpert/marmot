@@ -6,14 +6,25 @@ import (
 
 	"github.com/maxpert/marmot/common"
 	"github.com/maxpert/marmot/protocol"
+	"github.com/maxpert/marmot/protocol/filter"
 )
+
+// makeIntentKey creates a binary intent key for testing.
+// For string PKs, pass the PK value as a string.
+func makeIntentKey(table string, pkValue string) []byte {
+	prefix := filter.BuildIntentKeyPrefix(table)
+	pkValues := []filter.TypedPKValue{
+		{Type: filter.PKTypeString, Value: []byte(pkValue)},
+	}
+	return filter.EncodeIntentKeyWithPrefix(prefix, pkValues)
+}
 
 // TestPipeline_SingleInsert tests processing a single INSERT operation
 func TestPipeline_SingleInsert(t *testing.T) {
 	entries := []common.CDCEntry{
 		{
 			Table:     "users",
-			IntentKey: "1",
+			IntentKey: []byte("1"),
 			OldValues: nil,
 			NewValues: map[string][]byte{
 				"id":   []byte("1"),
@@ -48,7 +59,7 @@ func TestPipeline_SingleInsert(t *testing.T) {
 	if stmt.TableName != "users" {
 		t.Errorf("TableName = %q, want %q", stmt.TableName, "users")
 	}
-	if stmt.IntentKey != "1" {
+	if string(stmt.IntentKey) != "1" {
 		t.Errorf("IntentKey = %q, want %q", stmt.IntentKey, "1")
 	}
 	if len(stmt.OldValues) != 0 {
@@ -64,7 +75,7 @@ func TestPipeline_SingleUpdate(t *testing.T) {
 	entries := []common.CDCEntry{
 		{
 			Table:     "users",
-			IntentKey: "1",
+			IntentKey: []byte("1"),
 			OldValues: map[string][]byte{
 				"id":   []byte("1"),
 				"name": []byte("Alice"),
@@ -112,7 +123,7 @@ func TestPipeline_SingleDelete(t *testing.T) {
 	entries := []common.CDCEntry{
 		{
 			Table:     "users",
-			IntentKey: "1",
+			IntentKey: []byte("1"),
 			OldValues: map[string][]byte{
 				"id":   []byte("1"),
 				"name": []byte("Alice"),
@@ -154,7 +165,7 @@ func TestPipeline_MultiRowInsert_100Rows(t *testing.T) {
 		intentKey := string(rune('A' + (i % 26))) // A-Z cycling
 		entries[i] = common.CDCEntry{
 			Table:     "wp_posts",
-			IntentKey: intentKey,
+			IntentKey: []byte(intentKey),
 			OldValues: nil,
 			NewValues: map[string][]byte{
 				"id":    []byte(intentKey),
@@ -199,19 +210,19 @@ func TestPipeline_MultiRowInsert_PreservesAllRows(t *testing.T) {
 	entries := []common.CDCEntry{
 		{
 			Table:     "users",
-			IntentKey: "1",
+			IntentKey: []byte("1"),
 			OldValues: nil,
 			NewValues: map[string][]byte{"id": []byte("1"), "name": []byte("Alice")},
 		},
 		{
 			Table:     "users",
-			IntentKey: "2",
+			IntentKey: []byte("2"),
 			OldValues: nil,
 			NewValues: map[string][]byte{"id": []byte("2"), "name": []byte("Bob")},
 		},
 		{
 			Table:     "users",
-			IntentKey: "3",
+			IntentKey: []byte("3"),
 			OldValues: nil,
 			NewValues: map[string][]byte{"id": []byte("3"), "name": []byte("Charlie")},
 		},
@@ -239,7 +250,7 @@ func TestPipeline_MultiRowInsert_PreservesAllRows(t *testing.T) {
 	// Verify each row is preserved
 	intentKeysSeen := make(map[string]bool)
 	for _, stmt := range result.Statements {
-		intentKeysSeen[stmt.IntentKey] = true
+		intentKeysSeen[string(stmt.IntentKey)] = true
 	}
 	if !intentKeysSeen["1"] || !intentKeysSeen["2"] || !intentKeysSeen["3"] {
 		t.Errorf("Not all intent keys preserved. Seen: %v", intentKeysSeen)
@@ -255,7 +266,7 @@ func TestPipeline_MultiRowInsert_UniqueIntentKeys(t *testing.T) {
 		intentKey := string(rune(i)) // Unique intent key for each
 		entries[i] = common.CDCEntry{
 			Table:     "products",
-			IntentKey: intentKey,
+			IntentKey: []byte(intentKey),
 			OldValues: nil,
 			NewValues: map[string][]byte{
 				"id":   []byte(intentKey),
@@ -288,7 +299,7 @@ func TestPipeline_Upsert_DeleteThenInsert_MergedToUpdate(t *testing.T) {
 		// DELETE hook fires first
 		{
 			Table:     "users",
-			IntentKey: "1",
+			IntentKey: []byte("1"),
 			OldValues: map[string][]byte{
 				"id":   []byte("1"),
 				"name": []byte("old_name"),
@@ -298,7 +309,7 @@ func TestPipeline_Upsert_DeleteThenInsert_MergedToUpdate(t *testing.T) {
 		// INSERT hook fires second
 		{
 			Table:     "users",
-			IntentKey: "1",
+			IntentKey: []byte("1"),
 			OldValues: nil,
 			NewValues: map[string][]byte{
 				"id":   []byte("1"),
@@ -353,7 +364,7 @@ func TestPipeline_Upsert_PreservesOldValues_FromDelete(t *testing.T) {
 	entries := []common.CDCEntry{
 		{
 			Table:     "products",
-			IntentKey: "42",
+			IntentKey: []byte("42"),
 			OldValues: map[string][]byte{
 				"id":    []byte("42"),
 				"price": []byte("9.99"),
@@ -363,7 +374,7 @@ func TestPipeline_Upsert_PreservesOldValues_FromDelete(t *testing.T) {
 		},
 		{
 			Table:     "products",
-			IntentKey: "42",
+			IntentKey: []byte("42"),
 			OldValues: nil,
 			NewValues: map[string][]byte{
 				"id":    []byte("42"),
@@ -398,7 +409,7 @@ func TestPipeline_Upsert_PreservesNewValues_FromInsert(t *testing.T) {
 	entries := []common.CDCEntry{
 		{
 			Table:     "products",
-			IntentKey: "42",
+			IntentKey: []byte("42"),
 			OldValues: map[string][]byte{
 				"id":    []byte("42"),
 				"price": []byte("9.99"),
@@ -407,7 +418,7 @@ func TestPipeline_Upsert_PreservesNewValues_FromInsert(t *testing.T) {
 		},
 		{
 			Table:     "products",
-			IntentKey: "42",
+			IntentKey: []byte("42"),
 			OldValues: nil,
 			NewValues: map[string][]byte{
 				"id":    []byte("42"),
@@ -439,7 +450,7 @@ func TestPipeline_InsertThenDelete_CancelsOut(t *testing.T) {
 		// INSERT
 		{
 			Table:     "users",
-			IntentKey: "1",
+			IntentKey: []byte("1"),
 			OldValues: nil,
 			NewValues: map[string][]byte{
 				"id":   []byte("1"),
@@ -449,7 +460,7 @@ func TestPipeline_InsertThenDelete_CancelsOut(t *testing.T) {
 		// DELETE
 		{
 			Table:     "users",
-			IntentKey: "1",
+			IntentKey: []byte("1"),
 			OldValues: map[string][]byte{
 				"id":   []byte("1"),
 				"name": []byte("temp"),
@@ -484,7 +495,7 @@ func TestPipeline_UpdateThenUpdate_MergesValues(t *testing.T) {
 		// First UPDATE
 		{
 			Table:     "users",
-			IntentKey: "1",
+			IntentKey: []byte("1"),
 			OldValues: map[string][]byte{
 				"id":   []byte("1"),
 				"name": []byte("v1"),
@@ -497,7 +508,7 @@ func TestPipeline_UpdateThenUpdate_MergesValues(t *testing.T) {
 		// Second UPDATE
 		{
 			Table:     "users",
-			IntentKey: "1",
+			IntentKey: []byte("1"),
 			OldValues: map[string][]byte{
 				"id":   []byte("1"),
 				"name": []byte("v2"),
@@ -546,7 +557,7 @@ func TestPipeline_UpdateThenDelete_BecomesDelete(t *testing.T) {
 		// UPDATE
 		{
 			Table:     "users",
-			IntentKey: "1",
+			IntentKey: []byte("1"),
 			OldValues: map[string][]byte{
 				"id":   []byte("1"),
 				"name": []byte("original"),
@@ -559,7 +570,7 @@ func TestPipeline_UpdateThenDelete_BecomesDelete(t *testing.T) {
 		// DELETE
 		{
 			Table:     "users",
-			IntentKey: "1",
+			IntentKey: []byte("1"),
 			OldValues: map[string][]byte{
 				"id":   []byte("1"),
 				"name": []byte("updated"),
@@ -599,7 +610,7 @@ func TestPipeline_Validation_EmptyTableName_Fails(t *testing.T) {
 	entries := []common.CDCEntry{
 		{
 			Table:     "", // Empty table name
-			IntentKey: "1",
+			IntentKey: []byte("1"),
 			OldValues: nil,
 			NewValues: map[string][]byte{"id": []byte("1")},
 		},
@@ -657,7 +668,7 @@ func TestPipeline_NilOldValues_Handled(t *testing.T) {
 	entries := []common.CDCEntry{
 		{
 			Table:     "users",
-			IntentKey: "1",
+			IntentKey: []byte("1"),
 			OldValues: nil,
 			NewValues: map[string][]byte{"id": []byte("1"), "name": []byte("Alice")},
 		},
@@ -684,7 +695,7 @@ func TestPipeline_NilNewValues_Handled(t *testing.T) {
 	entries := []common.CDCEntry{
 		{
 			Table:     "users",
-			IntentKey: "1",
+			IntentKey: []byte("1"),
 			OldValues: map[string][]byte{"id": []byte("1"), "name": []byte("Alice")},
 			NewValues: nil,
 		},
@@ -712,19 +723,19 @@ func TestPipeline_MixedTables(t *testing.T) {
 	entries := []common.CDCEntry{
 		{
 			Table:     "users",
-			IntentKey: "1",
+			IntentKey: makeIntentKey("users", "1"),
 			OldValues: nil,
 			NewValues: map[string][]byte{"id": []byte("1")},
 		},
 		{
 			Table:     "products",
-			IntentKey: "1",
+			IntentKey: makeIntentKey("products", "1"),
 			OldValues: nil,
 			NewValues: map[string][]byte{"id": []byte("1")},
 		},
 		{
 			Table:     "users",
-			IntentKey: "2",
+			IntentKey: makeIntentKey("users", "2"),
 			OldValues: nil,
 			NewValues: map[string][]byte{"id": []byte("2")},
 		},
@@ -762,13 +773,13 @@ func TestPipeline_SameIntentKey_DifferentTables(t *testing.T) {
 	entries := []common.CDCEntry{
 		{
 			Table:     "users",
-			IntentKey: "1",
+			IntentKey: makeIntentKey("users", "1"),
 			OldValues: nil,
 			NewValues: map[string][]byte{"id": []byte("1"), "name": []byte("Alice")},
 		},
 		{
 			Table:     "products",
-			IntentKey: "1", // Same intent key, different table
+			IntentKey: makeIntentKey("products", "1"), // Same PK value, different table
 			OldValues: nil,
 			NewValues: map[string][]byte{"id": []byte("1"), "name": []byte("Widget")},
 		},
@@ -802,46 +813,46 @@ func TestPipeline_ComplexSequence(t *testing.T) {
 		// Row 1: INSERT
 		{
 			Table:     "users",
-			IntentKey: "1",
+			IntentKey: []byte("1"),
 			OldValues: nil,
 			NewValues: map[string][]byte{"id": []byte("1"), "name": []byte("Alice")},
 		},
 		// Row 2: UPSERT (DELETE + INSERT)
 		{
 			Table:     "users",
-			IntentKey: "2",
+			IntentKey: []byte("2"),
 			OldValues: map[string][]byte{"id": []byte("2"), "name": []byte("old")},
 			NewValues: nil,
 		},
 		{
 			Table:     "users",
-			IntentKey: "2",
+			IntentKey: []byte("2"),
 			OldValues: nil,
 			NewValues: map[string][]byte{"id": []byte("2"), "name": []byte("new")},
 		},
 		// Row 3: INSERT then DELETE (cancel out)
 		{
 			Table:     "users",
-			IntentKey: "3",
+			IntentKey: []byte("3"),
 			OldValues: nil,
 			NewValues: map[string][]byte{"id": []byte("3"), "name": []byte("temp")},
 		},
 		{
 			Table:     "users",
-			IntentKey: "3",
+			IntentKey: []byte("3"),
 			OldValues: map[string][]byte{"id": []byte("3"), "name": []byte("temp")},
 			NewValues: nil,
 		},
 		// Row 4: UPDATE then DELETE
 		{
 			Table:     "users",
-			IntentKey: "4",
+			IntentKey: []byte("4"),
 			OldValues: map[string][]byte{"id": []byte("4"), "name": []byte("v1")},
 			NewValues: map[string][]byte{"id": []byte("4"), "name": []byte("v2")},
 		},
 		{
 			Table:     "users",
-			IntentKey: "4",
+			IntentKey: []byte("4"),
 			OldValues: map[string][]byte{"id": []byte("4"), "name": []byte("v2")},
 			NewValues: nil,
 		},
@@ -874,7 +885,7 @@ func TestPipeline_ComplexSequence(t *testing.T) {
 	// Verify statement types
 	stmtsByIntentKey := make(map[string]protocol.StatementCode)
 	for _, stmt := range result.Statements {
-		stmtsByIntentKey[stmt.IntentKey] = stmt.Type
+		stmtsByIntentKey[string(stmt.IntentKey)] = stmt.Type
 	}
 
 	if stmtsByIntentKey["1"] != protocol.StatementInsert {
@@ -896,7 +907,7 @@ func TestPipeline_ValidationDisabled(t *testing.T) {
 	entries := []common.CDCEntry{
 		{
 			Table:     "", // Would fail validation
-			IntentKey: "1",
+			IntentKey: []byte("1"),
 			OldValues: nil,
 			NewValues: map[string][]byte{"id": []byte("1")},
 		},
@@ -918,7 +929,7 @@ func TestMergeGroup_InsertThenUpdate_BecomesInsert(t *testing.T) {
 		// INSERT
 		{
 			Table:     "users",
-			IntentKey: "1",
+			IntentKey: []byte("1"),
 			OldValues: make(map[string][]byte),
 			NewValues: map[string][]byte{
 				"id":   []byte("1"),
@@ -928,7 +939,7 @@ func TestMergeGroup_InsertThenUpdate_BecomesInsert(t *testing.T) {
 		// UPDATE
 		{
 			Table:     "users",
-			IntentKey: "1",
+			IntentKey: []byte("1"),
 			OldValues: map[string][]byte{
 				"id":   []byte("1"),
 				"name": []byte("Alice"),
@@ -976,7 +987,7 @@ func TestMergeGroup_InsertUpdateUpdate_BecomesInsert(t *testing.T) {
 		// INSERT
 		{
 			Table:     "users",
-			IntentKey: "1",
+			IntentKey: []byte("1"),
 			OldValues: make(map[string][]byte),
 			NewValues: map[string][]byte{
 				"id":   []byte("1"),
@@ -986,7 +997,7 @@ func TestMergeGroup_InsertUpdateUpdate_BecomesInsert(t *testing.T) {
 		// UPDATE 1
 		{
 			Table:     "users",
-			IntentKey: "1",
+			IntentKey: []byte("1"),
 			OldValues: map[string][]byte{
 				"id":   []byte("1"),
 				"name": []byte("v1"),
@@ -999,7 +1010,7 @@ func TestMergeGroup_InsertUpdateUpdate_BecomesInsert(t *testing.T) {
 		// UPDATE 2
 		{
 			Table:     "users",
-			IntentKey: "1",
+			IntentKey: []byte("1"),
 			OldValues: map[string][]byte{
 				"id":   []byte("1"),
 				"name": []byte("v2"),
@@ -1044,7 +1055,7 @@ func TestPipeline_InsertThenUpdate_ProducesInsert(t *testing.T) {
 		// INSERT
 		{
 			Table:     "users",
-			IntentKey: "1",
+			IntentKey: []byte("1"),
 			OldValues: make(map[string][]byte),
 			NewValues: map[string][]byte{
 				"id":    []byte("1"),
@@ -1055,7 +1066,7 @@ func TestPipeline_InsertThenUpdate_ProducesInsert(t *testing.T) {
 		// UPDATE
 		{
 			Table:     "users",
-			IntentKey: "1",
+			IntentKey: []byte("1"),
 			OldValues: map[string][]byte{
 				"id":    []byte("1"),
 				"name":  []byte("Alice"),
@@ -1117,7 +1128,7 @@ func BenchmarkProcessCDCEntries_1000Rows(b *testing.B) {
 	for i := 0; i < 1000; i++ {
 		entries[i] = common.CDCEntry{
 			Table:     "test",
-			IntentKey: strconv.Itoa(i),
+			IntentKey: []byte(strconv.Itoa(i)),
 			NewValues: map[string][]byte{"id": []byte(strconv.Itoa(i))},
 		}
 	}

@@ -2,12 +2,11 @@ package db
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"testing"
 
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/protocol"
+	"github.com/maxpert/marmot/protocol/filter"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -77,9 +76,8 @@ func TestReplicationEngine_PrepareWithDDL(t *testing.T) {
 	assert.Equal(t, IntentTypeDDL, intent.IntentType)
 	assert.Equal(t, "users", intent.TableName)
 
-	// Verify intent key uses SQL hash
-	hash := sha256.Sum256([]byte(req.Statements[0].SQL))
-	expectedKey := "users:" + hex.EncodeToString(hash[:8])
+	// Verify intent key uses binary DDL format
+	expectedKey := filter.EncodeDDLIntentKey("users")
 	assert.Equal(t, expectedKey, intent.IntentKey)
 
 	// Verify DDL snapshot data
@@ -120,7 +118,7 @@ func TestReplicationEngine_PrepareWithCDC(t *testing.T) {
 			{
 				Type:      protocol.StatementInsert,
 				TableName: "users",
-				IntentKey: "users:1",
+				IntentKey: []byte("users:1"),
 				SQL:       "INSERT INTO users (id, name) VALUES (1, 'alice')",
 				NewValues: map[string][]byte{
 					"id":   []byte("1"),
@@ -130,7 +128,7 @@ func TestReplicationEngine_PrepareWithCDC(t *testing.T) {
 			{
 				Type:      protocol.StatementUpdate,
 				TableName: "users",
-				IntentKey: "users:2",
+				IntentKey: []byte("users:2"),
 				SQL:       "UPDATE users SET name = 'bob_updated' WHERE id = 2",
 				OldValues: map[string][]byte{
 					"id":   []byte("2"),
@@ -144,7 +142,7 @@ func TestReplicationEngine_PrepareWithCDC(t *testing.T) {
 			{
 				Type:      protocol.StatementDelete,
 				TableName: "users",
-				IntentKey: "users:3",
+				IntentKey: []byte("users:3"),
 				SQL:       "DELETE FROM users WHERE id = 3",
 				OldValues: map[string][]byte{
 					"id":   []byte("3"),
@@ -173,7 +171,7 @@ func TestReplicationEngine_PrepareWithCDC(t *testing.T) {
 
 	// Verify first entry (INSERT)
 	assert.Equal(t, "users", entries[0].Table)
-	assert.Equal(t, "users:1", entries[0].IntentKey)
+	assert.Equal(t, "users:1", string(entries[0].IntentKey))
 	assert.Equal(t, uint8(OpTypeInsert), entries[0].Operation)
 
 	// Verify NewValues (already deserialized by MetaStore)
@@ -236,7 +234,8 @@ func TestReplicationEngine_PrepareWithDatabaseOps(t *testing.T) {
 	// Verify intent details
 	intent := intents[0]
 	assert.Equal(t, IntentTypeDatabaseOp, intent.IntentType)
-	assert.Equal(t, "newdb", intent.IntentKey)
+	expectedKey := filter.EncodeDBOpIntentKey("newdb")
+	assert.Equal(t, expectedKey, intent.IntentKey)
 
 	// Verify DatabaseOperationSnapshot
 	var snapshot DatabaseOperationSnapshot
@@ -302,7 +301,7 @@ func TestReplicationEngine_PrepareConflictDetection(t *testing.T) {
 			{
 				Type:      protocol.StatementUpdate,
 				TableName: "items",
-				IntentKey: "items:1",
+				IntentKey: []byte("items:1"),
 				SQL:       "UPDATE items SET value = 'a' WHERE id = 1",
 				OldValues: map[string][]byte{"id": []byte("1"), "value": []byte("old")},
 				NewValues: map[string][]byte{"id": []byte("1"), "value": []byte("a")},
@@ -323,7 +322,7 @@ func TestReplicationEngine_PrepareConflictDetection(t *testing.T) {
 			{
 				Type:      protocol.StatementUpdate,
 				TableName: "items",
-				IntentKey: "items:1",
+				IntentKey: []byte("items:1"),
 				SQL:       "UPDATE items SET value = 'b' WHERE id = 1",
 				OldValues: map[string][]byte{"id": []byte("1"), "value": []byte("old")},
 				NewValues: map[string][]byte{"id": []byte("1"), "value": []byte("b")},
@@ -367,7 +366,7 @@ func TestReplicationEngine_PrepareAutoIncrementInsert(t *testing.T) {
 			{
 				Type:      protocol.StatementInsert,
 				TableName: "items",
-				IntentKey: "", // Empty - auto-increment
+				IntentKey: []byte(""), // Empty - auto-increment
 				SQL:       "INSERT INTO items (value) VALUES ('test')",
 			},
 		},
@@ -419,7 +418,7 @@ func TestReplicationEngine_PrepareUpdateWithoutIntentKey(t *testing.T) {
 			{
 				Type:      protocol.StatementUpdate,
 				TableName: "data",
-				IntentKey: "", // Empty - must come from CDC preupdate hooks
+				IntentKey: []byte(""), // Empty - must come from CDC preupdate hooks
 				SQL:       "UPDATE data SET val = 'new' WHERE id = 1",
 				OldValues: map[string][]byte{"id": []byte("1"), "val": []byte("old")},
 				NewValues: map[string][]byte{"id": []byte("1"), "val": []byte("new")},
@@ -616,7 +615,7 @@ func TestReplicationEngine_AbortSuccess(t *testing.T) {
 			{
 				Type:      protocol.StatementInsert,
 				TableName: "items",
-				IntentKey: "items:1",
+				IntentKey: []byte("items:1"),
 				SQL:       "INSERT INTO items (id, value) VALUES (1, 'test')",
 				NewValues: map[string][]byte{
 					"id":    []byte("1"),
@@ -683,7 +682,7 @@ func TestReplicationEngine_AbortDatabaseNotFound(t *testing.T) {
 	require.Empty(t, result.Error)
 }
 
-// TestReplicationEngine_PrepareMultipleDDL verifies multiple DDL statements
+// TestReplicationEngine_PrepareMultipleDDL verifies multiple DDL statements on different tables
 func TestReplicationEngine_PrepareMultipleDDL(t *testing.T) {
 	engine, dm, cleanup := setupTestReplicationEngine(t)
 	defer cleanup()
@@ -698,7 +697,7 @@ func TestReplicationEngine_PrepareMultipleDDL(t *testing.T) {
 	ctx := context.Background()
 	startTS := hlc.Timestamp{WallTime: 10000, Logical: 1}
 
-	// Prepare multiple DDL statements for same table
+	// Prepare multiple DDL statements for different tables
 	req := &PrepareRequest{
 		TxnID:    1012,
 		NodeID:   1,
@@ -707,13 +706,13 @@ func TestReplicationEngine_PrepareMultipleDDL(t *testing.T) {
 		Statements: []protocol.Statement{
 			{
 				Type:      protocol.StatementDDL,
-				SQL:       "CREATE TABLE test (id INTEGER PRIMARY KEY)",
-				TableName: "test",
+				SQL:       "CREATE TABLE users (id INTEGER PRIMARY KEY)",
+				TableName: "users",
 			},
 			{
 				Type:      protocol.StatementDDL,
-				SQL:       "CREATE INDEX idx_test ON test (id)",
-				TableName: "test",
+				SQL:       "CREATE TABLE posts (id INTEGER PRIMARY KEY)",
+				TableName: "posts",
 			},
 		},
 	}
@@ -729,10 +728,12 @@ func TestReplicationEngine_PrepareMultipleDDL(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, intents, 2, "Should have 2 intents for 2 DDL statements")
 
-	// Verify intent keys are different (SQL hash makes them unique)
+	// Verify intent keys are different (different tables)
 	assert.NotEqual(t, intents[0].IntentKey, intents[1].IntentKey, "Intent keys should be unique")
-	assert.Contains(t, intents[0].IntentKey, "test:", "Intent key should contain table name")
-	assert.Contains(t, intents[1].IntentKey, "test:", "Intent key should contain table name")
+	expectedKey1 := filter.EncodeDDLIntentKey("users")
+	expectedKey2 := filter.EncodeDDLIntentKey("posts")
+	assert.Contains(t, [][]byte{expectedKey1, expectedKey2}, intents[0].IntentKey, "Intent key should match table")
+	assert.Contains(t, [][]byte{expectedKey1, expectedKey2}, intents[1].IntentKey, "Intent key should match table")
 }
 
 // TestReplicationEngine_ClockUpdate verifies clock update during prepare

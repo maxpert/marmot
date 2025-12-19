@@ -140,7 +140,7 @@ func (s *PebbleMetaStore) rebuildIntentFilter() error {
 			continue
 		}
 
-		tbHash := ComputeIntentHash(rec.TableName, rec.IntentKey)
+		tbHash := ComputeIntentHash(rec.TableName, string(rec.IntentKey))
 		s.intentFilter.Add(rec.TxnID, tbHash)
 		count++
 	}
@@ -1177,7 +1177,7 @@ func (s *PebbleMetaStore) writeIntentFastPath(txnID uint64, intentType IntentTyp
 	rec := &WriteIntentRecord{
 		IntentType:   intentType,
 		TableName:    tableName,
-		IntentKey:    intentKey,
+		IntentKey:    []byte(intentKey),
 		TxnID:        txnID,
 		TSWall:       ts.WallTime,
 		TSLogical:    ts.Logical,
@@ -1244,7 +1244,7 @@ func (s *PebbleMetaStore) writeIntentSlowPath(txnID uint64, intentType IntentTyp
 			rec := &WriteIntentRecord{
 				IntentType:   intentType,
 				TableName:    tableName,
-				IntentKey:    intentKey,
+				IntentKey:    []byte(intentKey),
 				TxnID:        txnID,
 				TSWall:       ts.WallTime,
 				TSLogical:    ts.Logical,
@@ -1332,7 +1332,7 @@ func (s *PebbleMetaStore) writeIntentSlowPath(txnID uint64, intentType IntentTyp
 	rec := &WriteIntentRecord{
 		IntentType:   intentType,
 		TableName:    tableName,
-		IntentKey:    intentKey,
+		IntentKey:    []byte(intentKey),
 		TxnID:        txnID,
 		TSWall:       ts.WallTime,
 		TSLogical:    ts.Logical,
@@ -2074,7 +2074,7 @@ func (s *PebbleMetaStore) WriteIntentEntry(txnID, seq uint64, op uint8, table, i
 	row := &EncodedCapturedRow{
 		Table:     table,
 		Op:        op,
-		IntentKey: intentKey,
+		IntentKey: []byte(intentKey),
 		OldValues: oldVals,
 		NewValues: newVals,
 	}
@@ -2508,7 +2508,7 @@ func (s *PebbleMetaStore) CleanupStaleTransactions(timeout time.Duration) (int, 
 				key:       key,
 				txnID:     rec.TxnID,
 				table:     rec.TableName,
-				intentKey: rec.IntentKey,
+				intentKey: string(rec.IntentKey),
 			})
 		}
 	}
@@ -2837,7 +2837,7 @@ func (s *PebbleMetaStore) AcquireCDCRowLock(txnID uint64, tableName, intentKey s
 			if existingTxnID != txnID {
 				return ErrCDCRowLocked{
 					Table:     tableName,
-					IntentKey: intentKey,
+					IntentKey: []byte(intentKey),
 					HeldByTxn: existingTxnID,
 				}
 			}
@@ -3029,7 +3029,7 @@ func (s *PebbleMetaStore) AcquireCDCTableDDLLock(txnID uint64, tableName string)
 				// This allows us to reuse ErrCDCRowLocked for consistency
 				return ErrCDCRowLocked{
 					Table:     tableName,
-					IntentKey: pebbleCDCDDLKeyMarker, // Sentinel value indicating DDL lock
+					IntentKey: []byte(pebbleCDCDDLKeyMarker), // Sentinel value indicating DDL lock
 					HeldByTxn: existingTxnID,
 				}
 			}

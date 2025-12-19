@@ -182,10 +182,9 @@ func TestMemoryMetaStore_CommitTransaction(t *testing.T) {
 	err = store.CommitTransaction(txnID, commitTS, statements, "testdb", "table1,table2", 42, 1)
 	require.NoError(t, err)
 
-	// Verify status updated in memory
-	state, found := store.txnStore.Get(txnID)
-	require.True(t, found)
-	require.Equal(t, TxnStatusCommitted, state.Status)
+	// Verify transaction is removed from memory (committed txns don't need to stay in memory)
+	_, found := store.txnStore.Get(txnID)
+	require.False(t, found, "Committed transaction should be removed from memory")
 
 	// Verify commit record in Pebble
 	commit, err := store.pebble.readCommitRecord(txnID)
@@ -442,10 +441,9 @@ func TestMemoryMetaStore_MemoryVsPebbleIsolation(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, commit)
 
-	// But status is still only in memory
-	state, found = store.txnStore.Get(txnID)
-	require.True(t, found)
-	require.Equal(t, TxnStatusCommitted, state.Status)
+	// Verify transaction is removed from memory after commit
+	_, found = store.txnStore.Get(txnID)
+	require.False(t, found, "Committed transaction should be removed from memory")
 }
 
 func TestReconstructFromPebble_CleansOrphanedCDCRaw(t *testing.T) {

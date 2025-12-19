@@ -9,7 +9,7 @@ import (
 type EncodedCapturedRow struct {
 	Table     string            `msgpack:"t"`
 	Op        uint8             `msgpack:"o"`
-	IntentKey string            `msgpack:"k"`
+	IntentKey []byte            `msgpack:"k"`
 	OldValues map[string][]byte `msgpack:"ov,omitempty"`
 	NewValues map[string][]byte `msgpack:"nv,omitempty"`
 }

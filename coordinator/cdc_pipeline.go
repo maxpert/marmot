@@ -3,7 +3,6 @@ package coordinator
 import (
 	"fmt"
 	"sort"
-	"strings"
 
 	"github.com/maxpert/marmot/common"
 	"github.com/maxpert/marmot/protocol"
@@ -43,7 +42,7 @@ func ValidateCDCEntry(entry common.CDCEntry) error {
 		return fmt.Errorf("TableName is required for all CDC entries")
 	}
 
-	if entry.IntentKey == "" {
+	if len(entry.IntentKey) == 0 {
 		return fmt.Errorf("IntentKey is required for all CDC operations")
 	}
 
@@ -57,17 +56,13 @@ func ValidateCDCEntry(entry common.CDCEntry) error {
 	return nil
 }
 
-// GroupByIntentKey groups CDC entries by "table:intentKey" key while preserving order
+// GroupByIntentKey groups CDC entries by intent key.
+// Binary intent keys already contain table prefix, so direct conversion is safe.
 func GroupByIntentKey(entries []common.CDCEntry) map[string][]common.CDCEntry {
 	groups := make(map[string][]common.CDCEntry)
 
 	for _, entry := range entries {
-		var sb strings.Builder
-		sb.Grow(len(entry.Table) + 1 + len(entry.IntentKey))
-		sb.WriteString(entry.Table)
-		sb.WriteByte(':')
-		sb.WriteString(entry.IntentKey)
-		key := sb.String()
+		key := string(entry.IntentKey)
 		groups[key] = append(groups[key], entry)
 	}
 

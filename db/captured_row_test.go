@@ -17,7 +17,7 @@ func TestEncodedCapturedRow_RoundtripSerialization(t *testing.T) {
 			row: &EncodedCapturedRow{
 				Table:     "users",
 				Op:        uint8(OpTypeInsert),
-				IntentKey: "users/id=1",
+				IntentKey: []byte("users/id=1"),
 				NewValues: map[string][]byte{
 					"id":   []byte("1"),
 					"name": []byte("Alice"),
@@ -30,7 +30,7 @@ func TestEncodedCapturedRow_RoundtripSerialization(t *testing.T) {
 			row: &EncodedCapturedRow{
 				Table:     "products",
 				Op:        uint8(OpTypeUpdate),
-				IntentKey: "products/id=42",
+				IntentKey: []byte("products/id=42"),
 				OldValues: map[string][]byte{
 					"id":    []byte("42"),
 					"price": []byte("99.99"),
@@ -48,7 +48,7 @@ func TestEncodedCapturedRow_RoundtripSerialization(t *testing.T) {
 			row: &EncodedCapturedRow{
 				Table:     "orders",
 				Op:        uint8(OpTypeDelete),
-				IntentKey: "orders/id=100",
+				IntentKey: []byte("orders/id=100"),
 				OldValues: map[string][]byte{
 					"id":     []byte("100"),
 					"total":  []byte("250.00"),
@@ -61,7 +61,7 @@ func TestEncodedCapturedRow_RoundtripSerialization(t *testing.T) {
 			row: &EncodedCapturedRow{
 				Table:     "empty_table",
 				Op:        uint8(OpTypeInsert),
-				IntentKey: "empty_table/id=1",
+				IntentKey: []byte("empty_table/id=1"),
 			},
 		},
 		{
@@ -69,7 +69,7 @@ func TestEncodedCapturedRow_RoundtripSerialization(t *testing.T) {
 			row: &EncodedCapturedRow{
 				Table:     "nil_table",
 				Op:        uint8(OpTypeDelete),
-				IntentKey: "nil_table/id=1",
+				IntentKey: []byte("nil_table/id=1"),
 				OldValues: nil,
 				NewValues: nil,
 			},
@@ -111,7 +111,7 @@ func TestEncodedCapturedRow_AllOpTypes(t *testing.T) {
 			row := &EncodedCapturedRow{
 				Table:     "test_table",
 				Op:        uint8(tt.op),
-				IntentKey: "test_table/id=1",
+				IntentKey: []byte("test_table/id=1"),
 				NewValues: map[string][]byte{
 					"id": []byte("1"),
 				},
@@ -154,7 +154,7 @@ func TestEncodedCapturedRow_LargeValues(t *testing.T) {
 	row := &EncodedCapturedRow{
 		Table:     "large_table",
 		Op:        uint8(OpTypeInsert),
-		IntentKey: "large_table/id=1",
+		IntentKey: []byte("large_table/id=1"),
 		NewValues: map[string][]byte{
 			"id":   []byte("1"),
 			"blob": largeValue,
@@ -174,7 +174,7 @@ func BenchmarkEncodeRow(b *testing.B) {
 	row := &EncodedCapturedRow{
 		Table:     "users",
 		Op:        uint8(OpTypeUpdate),
-		IntentKey: "users/id=1",
+		IntentKey: []byte("users/id=1"),
 		OldValues: map[string][]byte{
 			"id":    []byte("1"),
 			"name":  []byte("Alice"),
@@ -202,7 +202,7 @@ func BenchmarkDecodeRow(b *testing.B) {
 	row := &EncodedCapturedRow{
 		Table:     "users",
 		Op:        uint8(OpTypeUpdate),
-		IntentKey: "users/id=1",
+		IntentKey: []byte("users/id=1"),
 		OldValues: map[string][]byte{
 			"id":    []byte("1"),
 			"name":  []byte("Alice"),
@@ -235,7 +235,7 @@ func BenchmarkEncodeDecodeRow(b *testing.B) {
 	row := &EncodedCapturedRow{
 		Table:     "users",
 		Op:        uint8(OpTypeUpdate),
-		IntentKey: "users/id=1",
+		IntentKey: []byte("users/id=1"),
 		OldValues: map[string][]byte{
 			"id":    []byte("1"),
 			"name":  []byte("Alice"),

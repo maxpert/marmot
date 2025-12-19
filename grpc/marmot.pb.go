@@ -790,7 +790,8 @@ func (*Statement_DdlChange) isStatement_Payload() {}
 type RowChange struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Composite identifier for intent/lock identification (NOT actual row primary key)
-	IntentKey string `protobuf:"bytes,1,opt,name=intent_key,json=intentKey,proto3" json:"intent_key,omitempty"`
+	// Binary format: version(1) + uvarint(tableLen) + table + uvarint(pkCount) + [type(1) + value]...
+	IntentKey []byte `protobuf:"bytes,1,opt,name=intent_key,json=intentKey,proto3" json:"intent_key,omitempty"`
 	// Row images (before/after values)
 	// - INSERT: only new_values populated
 	// - UPDATE: both old_values and new_values populated (for conflict detection)
@@ -832,11 +833,11 @@ func (*RowChange) Descriptor() ([]byte, []int) {
 	return file_grpc_marmot_proto_rawDescGZIP(), []int{9}
 }
 
-func (x *RowChange) GetIntentKey() string {
+func (x *RowChange) GetIntentKey() []byte {
 	if x != nil {
 		return x.IntentKey
 	}
-	return ""
+	return nil
 }
 
 func (x *RowChange) GetOldValues() map[string][]byte {
@@ -2029,7 +2030,7 @@ const file_grpc_marmot_proto_rawDesc = "" +
 	"\apayload\"\xae\x02\n" +
 	"\tRowChange\x12\x1d\n" +
 	"\n" +
-	"intent_key\x18\x01 \x01(\tR\tintentKey\x12B\n" +
+	"intent_key\x18\x01 \x01(\fR\tintentKey\x12B\n" +
 	"\n" +
 	"old_values\x18\x02 \x03(\v2#.marmot.v2.RowChange.OldValuesEntryR\toldValues\x12B\n" +
 	"\n" +

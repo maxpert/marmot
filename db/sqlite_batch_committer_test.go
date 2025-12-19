@@ -61,7 +61,7 @@ func makeIntentEntry(table string, op OpType, id int, name string, value int) *I
 	entry := &IntentEntry{
 		Table:     table,
 		Operation: uint8(op),
-		IntentKey: fmt.Sprintf("%d", id),
+		IntentKey: []byte(fmt.Sprintf("%d", id)),
 	}
 
 	if op != OpTypeDelete {
@@ -233,7 +233,7 @@ func TestBatchCommitter_UpdateOperation(t *testing.T) {
 	updateEntry := &IntentEntry{
 		Table:     "test_table",
 		Operation: uint8(OpTypeUpdate),
-		IntentKey: "1",
+		IntentKey: []byte("1"),
 		OldValues: map[string][]byte{
 			"id":    mustMarshal(1),
 			"name":  mustMarshal("original"),
@@ -273,7 +273,7 @@ func TestBatchCommitter_DeleteOperation(t *testing.T) {
 	deleteEntry := &IntentEntry{
 		Table:     "test_table",
 		Operation: uint8(OpTypeDelete),
-		IntentKey: "1",
+		IntentKey: []byte("1"),
 		OldValues: map[string][]byte{
 			"id":    mustMarshal(1),
 			"name":  mustMarshal("to_delete"),
@@ -307,7 +307,7 @@ func TestBatchCommitter_ReplaceOperation(t *testing.T) {
 	replaceEntry := &IntentEntry{
 		Table:     "test_table",
 		Operation: uint8(OpTypeReplace),
-		IntentKey: "1",
+		IntentKey: []byte("1"),
 		NewValues: map[string][]byte{
 			"id":    mustMarshal(1),
 			"name":  mustMarshal("replaced"),
@@ -360,7 +360,7 @@ func TestBatchCommitter_ErrorHandling(t *testing.T) {
 	badEntry := &IntentEntry{
 		Table:     "nonexistent_table",
 		Operation: uint8(OpTypeInsert),
-		IntentKey: "1",
+		IntentKey: []byte("1"),
 		NewValues: map[string][]byte{
 			"id": mustMarshal(1),
 		},

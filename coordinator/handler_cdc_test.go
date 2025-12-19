@@ -15,7 +15,7 @@ func TestHandlerCDCPipeline_MultipleRows(t *testing.T) {
 	for i := 0; i < 100; i++ {
 		entries[i] = common.CDCEntry{
 			Table:     "wp_posts",
-			IntentKey: string(rune('A' + (i % 26))), // A-Z cycling
+			IntentKey: []byte(string(rune('A' + (i % 26)))), // A-Z cycling
 			OldValues: nil,
 			NewValues: map[string][]byte{
 				"id":      []byte{byte(i)},
@@ -59,7 +59,7 @@ func TestHandlerCDCPipeline_SameRowMerges(t *testing.T) {
 	entries := []common.CDCEntry{
 		{
 			Table:     "users",
-			IntentKey: "1",
+			IntentKey: []byte("1"),
 			OldValues: map[string][]byte{
 				"id":   []byte("1"),
 				"name": []byte("old_name"),
@@ -68,7 +68,7 @@ func TestHandlerCDCPipeline_SameRowMerges(t *testing.T) {
 		},
 		{
 			Table:     "users",
-			IntentKey: "1",
+			IntentKey: []byte("1"),
 			OldValues: nil,
 			NewValues: map[string][]byte{
 				"id":   []byte("1"),
@@ -97,7 +97,7 @@ func TestHandlerCDCPipeline_SameRowMerges(t *testing.T) {
 	if stmt.TableName != "users" {
 		t.Errorf("TableName = %q, want %q", stmt.TableName, "users")
 	}
-	if stmt.IntentKey != "1" {
+	if string(stmt.IntentKey) != "1" {
 		t.Errorf("IntentKey = %q, want %q", stmt.IntentKey, "1")
 	}
 
@@ -124,7 +124,7 @@ func TestHandlerCDCPipeline_InsertDeleteCancelsOut(t *testing.T) {
 	entries := []common.CDCEntry{
 		{
 			Table:     "temp_table",
-			IntentKey: "99",
+			IntentKey: []byte("99"),
 			OldValues: nil,
 			NewValues: map[string][]byte{
 				"id": []byte("99"),
@@ -132,7 +132,7 @@ func TestHandlerCDCPipeline_InsertDeleteCancelsOut(t *testing.T) {
 		},
 		{
 			Table:     "temp_table",
-			IntentKey: "99",
+			IntentKey: []byte("99"),
 			OldValues: map[string][]byte{
 				"id": []byte("99"),
 			},
@@ -178,34 +178,34 @@ func TestHandlerCDCPipeline_MixedOperations(t *testing.T) {
 		// Row 1: Simple INSERT
 		{
 			Table:     "products",
-			IntentKey: "1",
+			IntentKey: []byte("1"),
 			OldValues: nil,
 			NewValues: map[string][]byte{"name": []byte("Product A")},
 		},
 		// Row 2: UPSERT (DELETE + INSERT)
 		{
 			Table:     "products",
-			IntentKey: "2",
+			IntentKey: []byte("2"),
 			OldValues: map[string][]byte{"name": []byte("Old Product B")},
 			NewValues: nil,
 		},
 		{
 			Table:     "products",
-			IntentKey: "2",
+			IntentKey: []byte("2"),
 			OldValues: nil,
 			NewValues: map[string][]byte{"name": []byte("New Product B")},
 		},
 		// Row 3: UPDATE
 		{
 			Table:     "products",
-			IntentKey: "3",
+			IntentKey: []byte("3"),
 			OldValues: map[string][]byte{"name": []byte("Product C v1")},
 			NewValues: map[string][]byte{"name": []byte("Product C v2")},
 		},
 		// Row 4: DELETE
 		{
 			Table:     "products",
-			IntentKey: "4",
+			IntentKey: []byte("4"),
 			OldValues: map[string][]byte{"name": []byte("Product D")},
 			NewValues: nil,
 		},

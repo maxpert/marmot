@@ -146,7 +146,8 @@ message Statement {
 // Follows MySQL binlog row format and TiDB TiCDC approach
 message RowChange {
   // Composite identifier for intent/lock identification (NOT actual row primary key)
-  string intent_key = 1;
+  // Binary format: version(1) + uvarint(tableLen) + table + uvarint(pkCount) + [type(1) + value]...
+  bytes intent_key = 1;
 
   // Row images (before/after values)
   // - INSERT: only new_values populated

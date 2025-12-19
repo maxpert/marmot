@@ -2,12 +2,12 @@ package grpc
 
 // Helper functions to access Statement data regardless of payload type (CDC vs SQL)
 
-// GetIntentKey extracts intent key from either RowChange or falls back to empty
-func (stmt *Statement) GetIntentKey() string {
+// GetIntentKey extracts intent key from either RowChange or falls back to nil
+func (stmt *Statement) GetIntentKey() []byte {
 	if rowChange := stmt.GetRowChange(); rowChange != nil {
 		return rowChange.IntentKey
 	}
-	return ""
+	return nil
 }
 
 // GetSQL extracts SQL from DDLChange or returns empty if it's a RowChange

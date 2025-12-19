@@ -37,7 +37,7 @@ func TestPublishLogAppendAndRead(t *testing.T) {
 			Database:  "db1",
 			Table:     "users",
 			Operation: OpInsert,
-			IntentKey: "user:1",
+			IntentKey: []byte("user:1"),
 			After:     map[string][]byte{"id": []byte("1")},
 			CommitTS:  1000,
 			NodeID:    1,
@@ -47,7 +47,7 @@ func TestPublishLogAppendAndRead(t *testing.T) {
 			Database:  "db1",
 			Table:     "users",
 			Operation: OpUpdate,
-			IntentKey: "user:2",
+			IntentKey: []byte("user:2"),
 			Before:    map[string][]byte{"status": []byte("active")},
 			After:     map[string][]byte{"status": []byte("inactive")},
 			CommitTS:  2000,
@@ -93,7 +93,7 @@ func TestPublishLogReadWithLimit(t *testing.T) {
 			Database:  "db",
 			Table:     "tbl",
 			Operation: OpInsert,
-			IntentKey: string(rune('a' + i)),
+			IntentKey: []byte(string(rune('a' + i))),
 			CommitTS:  int64(1000 * (i + 1)),
 			NodeID:    1,
 		}
@@ -183,9 +183,9 @@ func TestPublishLogSequenceNumberPersistence(t *testing.T) {
 	require.NoError(t, err)
 
 	events := []CDCEvent{
-		{TxnID: 1, Database: "db", Table: "t", Operation: OpInsert, IntentKey: "k1", CommitTS: 1, NodeID: 1},
-		{TxnID: 2, Database: "db", Table: "t", Operation: OpInsert, IntentKey: "k2", CommitTS: 2, NodeID: 1},
-		{TxnID: 3, Database: "db", Table: "t", Operation: OpInsert, IntentKey: "k3", CommitTS: 3, NodeID: 1},
+		{TxnID: 1, Database: "db", Table: "t", Operation: OpInsert, IntentKey: []byte("k1"), CommitTS: 1, NodeID: 1},
+		{TxnID: 2, Database: "db", Table: "t", Operation: OpInsert, IntentKey: []byte("k2"), CommitTS: 2, NodeID: 1},
+		{TxnID: 3, Database: "db", Table: "t", Operation: OpInsert, IntentKey: []byte("k3"), CommitTS: 3, NodeID: 1},
 	}
 	err = pl1.Append(events)
 	require.NoError(t, err)
@@ -199,7 +199,7 @@ func TestPublishLogSequenceNumberPersistence(t *testing.T) {
 	defer pl2.Close()
 
 	moreEvents := []CDCEvent{
-		{TxnID: 4, Database: "db", Table: "t", Operation: OpInsert, IntentKey: "k4", CommitTS: 4, NodeID: 1},
+		{TxnID: 4, Database: "db", Table: "t", Operation: OpInsert, IntentKey: []byte("k4"), CommitTS: 4, NodeID: 1},
 	}
 	err = pl2.Append(moreEvents)
 	require.NoError(t, err)
@@ -245,7 +245,7 @@ func TestPublishLogCleanup(t *testing.T) {
 			Database:  "db",
 			Table:     "tbl",
 			Operation: OpInsert,
-			IntentKey: string(rune('a' + (i % 26))),
+			IntentKey: []byte(string(rune('a' + (i % 26)))),
 			CommitTS:  int64(i + 1),
 			NodeID:    1,
 		}
@@ -288,7 +288,7 @@ func TestPublishLogMultipleSinks(t *testing.T) {
 			Database:  "db",
 			Table:     "tbl",
 			Operation: OpInsert,
-			IntentKey: "key",
+			IntentKey: []byte("key"),
 			CommitTS:  int64(i + 1),
 			NodeID:    1,
 		}
@@ -331,7 +331,7 @@ func TestPublishLogConcurrentReads(t *testing.T) {
 			Database:  "db",
 			Table:     "tbl",
 			Operation: OpInsert,
-			IntentKey: "key",
+			IntentKey: []byte("key"),
 			CommitTS:  int64(i + 1),
 			NodeID:    1,
 		}
@@ -409,7 +409,7 @@ func BenchmarkPublishLogAppend(b *testing.B) {
 		Database:  "db",
 		Table:     "tbl",
 		Operation: OpInsert,
-		IntentKey: "key",
+		IntentKey: []byte("key"),
 		After:     map[string][]byte{"id": []byte("1")},
 		CommitTS:  1000,
 		NodeID:    1,
@@ -436,7 +436,7 @@ func BenchmarkPublishLogRead(b *testing.B) {
 			Database:  "db",
 			Table:     "tbl",
 			Operation: OpInsert,
-			IntentKey: "key",
+			IntentKey: []byte("key"),
 			CommitTS:  int64(i + 1),
 			NodeID:    1,
 		}

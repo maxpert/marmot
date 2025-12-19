@@ -160,7 +160,7 @@ type TxnCommitRecord struct {
 type WriteIntentRecord struct {
 	IntentType       IntentType // Type discriminator: DML, DDL, or DatabaseOp
 	TableName        string
-	IntentKey        string
+	IntentKey        []byte
 	TxnID            uint64
 	TSWall           int64
 	TSLogical        int32

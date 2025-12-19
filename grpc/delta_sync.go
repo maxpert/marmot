@@ -356,7 +356,7 @@ func (ds *DeltaSyncClient) applyChangeEvent(ctx context.Context, event *ChangeEv
 			}
 			log.Debug().
 				Str("table", stmt.TableName).
-				Str("intent_key", rowChange.IntentKey).
+				Hex("intent_key", rowChange.IntentKey).
 				Int("new_values", len(rowChange.NewValues)).
 				Int("old_values", len(rowChange.OldValues)).
 				Msg("DELTA-SYNC: Applied CDC data")

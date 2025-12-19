@@ -49,7 +49,7 @@ type ExecutionRequest struct {
 // CDCMergeResult holds merged CDC data from preupdate hooks.
 type CDCMergeResult struct {
 	TableName string
-	IntentKey string
+	IntentKey []byte
 	OldValues map[string][]byte
 	NewValues map[string][]byte
 }
@@ -69,7 +69,7 @@ func MergeCDCEntries(entries []common.CDCEntry) CDCMergeResult {
 	}
 
 	for _, e := range entries {
-		if result.IntentKey == "" {
+		if len(result.IntentKey) == 0 {
 			result.IntentKey = e.IntentKey
 		}
 		if result.TableName == "" {

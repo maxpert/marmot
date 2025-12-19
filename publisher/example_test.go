@@ -30,7 +30,7 @@ func ExamplePublishLog() {
 			Database:  "mydb",
 			Table:     "users",
 			Operation: publisher.OpInsert,
-			IntentKey: "user:1",
+			IntentKey: []byte("user:1"),
 			After: map[string][]byte{
 				"id":   []byte("1"),
 				"name": []byte("Alice"),
@@ -43,7 +43,7 @@ func ExamplePublishLog() {
 			Database:  "mydb",
 			Table:     "users",
 			Operation: publisher.OpUpdate,
-			IntentKey: "user:1",
+			IntentKey: []byte("user:1"),
 			Before: map[string][]byte{
 				"name": []byte("Alice"),
 			},
@@ -120,7 +120,7 @@ func ExampleCDCEvent_operations() {
 		Database:  "db",
 		Table:     "users",
 		Operation: publisher.OpInsert,
-		IntentKey: "1",
+		IntentKey: []byte("1"),
 		Before:    nil, // INSERT has no before values
 		After: map[string][]byte{
 			"id":   []byte("1"),
@@ -139,7 +139,7 @@ func ExampleCDCEvent_operations() {
 		Database:  "db",
 		Table:     "users",
 		Operation: publisher.OpUpdate,
-		IntentKey: "1",
+		IntentKey: []byte("1"),
 		Before: map[string][]byte{
 			"name": []byte("Alice"),
 		},
@@ -159,7 +159,7 @@ func ExampleCDCEvent_operations() {
 		Database:  "db",
 		Table:     "users",
 		Operation: publisher.OpDelete,
-		IntentKey: "1",
+		IntentKey: []byte("1"),
 		Before: map[string][]byte{
 			"id":   []byte("1"),
 			"name": []byte("Alice Smith"),

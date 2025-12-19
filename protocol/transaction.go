@@ -119,7 +119,7 @@ type Statement struct {
 	Type      StatementCode `msgpack:"Type"`
 	TableName string        `msgpack:"TableName"`
 	Database  string        `msgpack:"Database"`  // Target database name
-	IntentKey string        `msgpack:"IntentKey"` // Intent key for MVCC conflict detection
+	IntentKey []byte        `msgpack:"IntentKey"` // Intent key for MVCC conflict detection (binary format)
 	Error     string        `msgpack:"Error"`     // Error message if Type is StatementUnsupported
 
 	// CDC: Row-level change data (for DML operations)

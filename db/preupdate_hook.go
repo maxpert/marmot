@@ -43,7 +43,7 @@ type IntentEntry struct {
 	Seq       uint64
 	Operation uint8
 	Table     string
-	IntentKey string
+	IntentKey []byte
 	OldValues map[string][]byte
 	NewValues map[string][]byte
 	CreatedAt int64
@@ -214,7 +214,7 @@ func (s *EphemeralHookSession) ProcessCapturedRows() error {
 		}
 
 		// Acquire row lock
-		if err := s.metaStore.AcquireCDCRowLock(s.txnID, row.Table, row.IntentKey); err != nil {
+		if err := s.metaStore.AcquireCDCRowLock(s.txnID, row.Table, string(row.IntentKey)); err != nil {
 			s.conflictError = err
 			return err
 		}
@@ -348,7 +348,7 @@ func (s *EphemeralHookSession) hookCallback(data sqlite3.SQLitePreUpdateData) {
 
 	// Extract old/new values
 	var oldVals, newVals map[string][]byte
-	var intentKey string
+	var intentKey []byte
 
 	if data.Op == sqlite3.SQLITE_DELETE || data.Op == sqlite3.SQLITE_UPDATE {
 		rawOld := make([]interface{}, colCount)
@@ -356,7 +356,7 @@ func (s *EphemeralHookSession) hookCallback(data sqlite3.SQLitePreUpdateData) {
 			oldVals = encodeValuesWithSchema(schema.Columns, rawOld)
 			if data.Op == sqlite3.SQLITE_DELETE {
 				pkValues := extractPKFromValues(schema, rawOld, data.OldRowID)
-				intentKey = filter.SerializeIntentKey(data.TableName, schema.PrimaryKeys, pkValues)
+				intentKey = filter.EncodeIntentKeyWithPrefix(schema.IntentKeyPrefix, pkValues)
 			}
 		}
 	}
@@ -366,7 +366,7 @@ func (s *EphemeralHookSession) hookCallback(data sqlite3.SQLitePreUpdateData) {
 		if data.New(rawNew...) == nil {
 			newVals = encodeValuesWithSchema(schema.Columns, rawNew)
 			pkValues := extractPKFromValues(schema, rawNew, data.NewRowID)
-			intentKey = filter.SerializeIntentKey(data.TableName, schema.PrimaryKeys, pkValues)
+			intentKey = filter.EncodeIntentKeyWithPrefix(schema.IntentKeyPrefix, pkValues)
 		}
 	}
 
@@ -397,14 +397,21 @@ func (s *EphemeralHookSession) hookCallback(data sqlite3.SQLitePreUpdateData) {
 // =============================================================================
 
 // extractPKFromValues extracts PK values from raw values slice using schema indices.
-func extractPKFromValues(schema *TableSchema, values []interface{}, rowID int64) map[string][]byte {
-	pkValues := make(map[string][]byte)
+// Returns typed PK values in PK declaration order for binary encoding.
+func extractPKFromValues(schema *TableSchema, values []interface{}, rowID int64) []filter.TypedPKValue {
+	pkValues := make([]filter.TypedPKValue, len(schema.PKIndices))
 	for i, idx := range schema.PKIndices {
-		colName := schema.PrimaryKeys[i]
 		if idx == -1 {
-			pkValues[colName] = []byte(fmt.Sprintf("%d", rowID))
+			// rowid: always int64
+			pkValues[i] = filter.TypedPKValue{
+				Type:  filter.PKTypeInt64,
+				Value: filter.EncodeInt64(rowID),
+			}
 		} else if idx < len(values) && values[idx] != nil {
-			pkValues[colName] = pkValueToBytes(values[idx])
+			pkValues[i] = valueToTypedPK(values[idx])
+		} else {
+			// NULL PK value
+			pkValues[i] = filter.TypedPKValue{Type: filter.PKTypeNull}
 		}
 	}
 	return pkValues
@@ -435,22 +442,35 @@ func encodeValue(v interface{}) []byte {
 	return data
 }
 
-// pkValueToBytes converts a primary key value to its string byte representation.
-// Used for intent key generation where values must match AST-based path format.
-func pkValueToBytes(v interface{}) []byte {
+// valueToTypedPK converts a raw SQLite value to a typed PK value for binary encoding.
+// Returns appropriate type tag and encoded value bytes.
+func valueToTypedPK(v interface{}) filter.TypedPKValue {
 	switch val := v.(type) {
 	case int64:
-		return []byte(fmt.Sprintf("%d", val))
-	case float64:
-		if val == float64(int64(val)) {
-			return []byte(fmt.Sprintf("%d", int64(val)))
+		return filter.TypedPKValue{
+			Type:  filter.PKTypeInt64,
+			Value: filter.EncodeInt64(val),
 		}
-		return []byte(fmt.Sprintf("%v", val))
+	case float64:
+		return filter.TypedPKValue{
+			Type:  filter.PKTypeFloat64,
+			Value: filter.EncodeFloat64(val),
+		}
 	case string:
-		return []byte(val)
+		return filter.TypedPKValue{
+			Type:  filter.PKTypeString,
+			Value: []byte(val),
+		}
 	case []byte:
-		return val
+		return filter.TypedPKValue{
+			Type:  filter.PKTypeBytes,
+			Value: val,
+		}
 	default:
-		return []byte(fmt.Sprintf("%v", val))
+		// Fallback: convert to string
+		return filter.TypedPKValue{
+			Type:  filter.PKTypeString,
+			Value: []byte(fmt.Sprintf("%v", val)),
+		}
 	}
 }

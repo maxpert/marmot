@@ -1,6 +1,7 @@
 package publisher
 
 import (
+	"encoding/base64"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -139,6 +140,12 @@ func findEarliestEntry(pubLog *PublishLog) (uint64, error) {
 	return events[0].SeqNum - 1, nil
 }
 
+// intentKeyForSink converts a binary intent key to a string for sink compatibility
+// Uses base64url encoding (URL-safe, no padding) for compact representation
+func intentKeyForSink(key []byte) string {
+	return base64.RawURLEncoding.EncodeToString(key)
+}
+
 // Start starts the worker goroutine
 func (w *Worker) Start() {
 	w.lifecycleMu.Lock()
@@ -259,15 +266,18 @@ func (w *Worker) processEvent(event CDCEvent) error {
 	// Build topic name
 	topic := w.buildTopic(event.Database, event.Table)
 
+	// Convert binary intent key to string for sink compatibility
+	intentKey := intentKeyForSink(event.IntentKey)
+
 	// Publish with retry
-	if err := w.publishWithRetry(topic, event.IntentKey, data); err != nil {
+	if err := w.publishWithRetry(topic, intentKey, data); err != nil {
 		return err
 	}
 
 	// For DELETE operations, also send tombstone
 	if event.Operation == OpDelete {
-		tombstone := w.config.Transformer.Tombstone(event.IntentKey)
-		if err := w.publishWithRetry(topic, event.IntentKey, tombstone); err != nil {
+		tombstone := w.config.Transformer.Tombstone(intentKey)
+		if err := w.publishWithRetry(topic, intentKey, tombstone); err != nil {
 			return err
 		}
 	}

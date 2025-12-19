@@ -14,7 +14,7 @@ type CDCEvent struct {
 	Database  string            `msgpack:"db"`     // Database name
 	Table     string            `msgpack:"tbl"`    // Table name
 	Operation uint8             `msgpack:"op"`     // 0=INSERT, 1=UPDATE, 2=DELETE
-	IntentKey string            `msgpack:"key"`    // Intent tracking key
+	IntentKey []byte            `msgpack:"key"`    // Intent tracking key (binary format)
 	Before    map[string][]byte `msgpack:"before"` // Old values (msgpack encoded)
 	After     map[string][]byte `msgpack:"after"`  // New values (msgpack encoded)
 	CommitTS  int64             `msgpack:"ts"`     // Commit timestamp (unix ms)

@@ -748,8 +748,8 @@ func (mdb *ReplicatedDatabase) Exec(ctx context.Context, query string, args ...i
 // so we just use the pre-extracted value from the Statement struct
 func extractIntentKeyFromStatement(stmt protocol.Statement) string {
 	// If IntentKey was extracted during parsing, use it
-	if stmt.IntentKey != "" {
-		return stmt.IntentKey
+	if len(stmt.IntentKey) > 0 {
+		return string(stmt.IntentKey)
 	}
 
 	// Fallback: use hash of SQL (this should rarely happen)

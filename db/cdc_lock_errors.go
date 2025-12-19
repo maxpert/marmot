@@ -1,18 +1,22 @@
 package db
 
-import "fmt"
+import (
+	"encoding/base64"
+	"fmt"
+)
 
 // ErrCDCRowLocked is returned when trying to lock a row already locked by another transaction.
 // This error indicates a write-write conflict in the CDC replication system.
-// When IntentKey is "__ddl__", it indicates a DDL lock conflict.
+// When IntentKey is empty and Table is set, it indicates a DDL lock conflict.
 type ErrCDCRowLocked struct {
 	Table     string
-	IntentKey string
+	IntentKey []byte
 	HeldByTxn uint64
 }
 
 func (e ErrCDCRowLocked) Error() string {
-	return fmt.Sprintf("CDC row lock conflict: %s:%s held by txn %d", e.Table, e.IntentKey, e.HeldByTxn)
+	keyStr := base64.RawURLEncoding.EncodeToString(e.IntentKey)
+	return fmt.Sprintf("CDC row lock conflict: %s:%s held by txn %d", e.Table, keyStr, e.HeldByTxn)
 }
 
 // ErrCDCTableDDLInProgress is returned when DML attempts to write to a table
