@@ -140,8 +140,10 @@ func (m *MemoryMetaStore) CommitTransaction(txnID uint64, commitTS hlc.Timestamp
 		return err
 	}
 
-	// Update memory status to committed
+	// Update memory status to committed and remove from memory
+	// (committed transactions are stored in Pebble for catch-up, not needed in memory)
 	m.txnStore.UpdateStatus(txnID, TxnStatusCommitted)
+	m.txnStore.Remove(txnID)
 
 	return nil
 }

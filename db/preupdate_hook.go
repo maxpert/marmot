@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/mattn/go-sqlite3"
 	"github.com/maxpert/marmot/encoding"
@@ -326,7 +327,8 @@ func (s *EphemeralHookSession) hookCallback(data sqlite3.SQLitePreUpdateData) {
 	// Get schema - skip if not cached (DDL operations)
 	schema, err := s.schemaCache.GetSchemaFor(data.TableName)
 	if err != nil {
-		return // Table not in schema cache, skip CDC
+		log.Warn().Err(err).Uint64("txn_id", s.txnID).Str("table", data.TableName).Msg("hookCallback: schema not found, skipping CDC")
+		return
 	}
 
 	// Determine operation type
@@ -376,13 +378,18 @@ func (s *EphemeralHookSession) hookCallback(data sqlite3.SQLitePreUpdateData) {
 		NewValues: newVals,
 	}
 
-	s.mu.Lock()
-	s.seq++
-	seq := s.seq
-	s.mu.Unlock()
+	seq := atomic.AddUint64(&s.seq, 1)
 
-	rowData, _ := EncodeRow(row)
-	s.metaStore.WriteCapturedRow(s.txnID, seq, rowData)
+	nativeData, err := encoding.MarshalNative(row)
+	if err != nil {
+		log.Warn().Err(err).Uint64("txn_id", s.txnID).Str("table", row.Table).Msg("hookCallback: failed to marshal row")
+		return
+	}
+	defer nativeData.Dispose()
+
+	if err := s.metaStore.WriteCapturedRow(s.txnID, seq, nativeData.Bytes()); err != nil {
+		log.Warn().Err(err).Uint64("txn_id", s.txnID).Uint64("seq", seq).Str("table", row.Table).Msg("hookCallback: failed to write captured row")
+	}
 }
 
 // =============================================================================
