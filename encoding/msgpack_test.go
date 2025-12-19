@@ -123,9 +123,9 @@ func TestUnmarshal_MapWithStrings(t *testing.T) {
 }
 
 func TestUnmarshal_MixedTypes(t *testing.T) {
-	// msgpack wire formats:
+	// With UseLooseInterfaceDecoding(true):
 	// - Go string → msgpack str → decoded as Go string
-	// - Go []byte → msgpack bin → decoded as Go []byte
+	// - Go []byte → msgpack bin → decoded as Go string (loose decoding converts bin to string)
 	tests := []struct {
 		name    string
 		input   interface{}
@@ -141,21 +141,22 @@ func TestUnmarshal_MixedTypes(t *testing.T) {
 			},
 		},
 		{
-			name:  "bytes_stay_bytes",
+			name:  "bytes_become_string",
 			input: []byte{0x00, 0x01, 0x02, 0xFF},
 			checkFn: func(t *testing.T, result interface{}) {
-				b, ok := result.([]byte)
+				// With UseLooseInterfaceDecoding, []byte becomes string
+				s, ok := result.(string)
 				if !ok {
-					t.Fatalf("Expected []byte, got %T", result)
+					t.Fatalf("Expected string (loose decoding), got %T", result)
 				}
-				expected := []byte{0x00, 0x01, 0x02, 0xFF}
-				if len(b) != len(expected) {
-					t.Errorf("Length mismatch")
+				expected := string([]byte{0x00, 0x01, 0x02, 0xFF})
+				if s != expected {
+					t.Errorf("Content mismatch")
 				}
 			},
 		},
 		{
-			name: "map_preserves_types",
+			name: "map_with_loose_decoding",
 			input: map[string]interface{}{
 				"text_field": "this is text",
 				"bin_field":  []byte{0xDE, 0xAD},
@@ -171,8 +172,9 @@ func TestUnmarshal_MixedTypes(t *testing.T) {
 				if v, ok := m["text_field"].(string); !ok || v != "this is text" {
 					t.Errorf("text_field: got %T %v", m["text_field"], m["text_field"])
 				}
-				if _, ok := m["bin_field"].([]byte); !ok {
-					t.Errorf("bin_field: got %T, want []byte", m["bin_field"])
+				// With loose decoding, bin_field becomes string
+				if _, ok := m["bin_field"].(string); !ok {
+					t.Errorf("bin_field: got %T, want string (loose decoding)", m["bin_field"])
 				}
 				if v, ok := m["id"].(string); !ok || v != "rec_000000013049" {
 					t.Errorf("id: got %T %v", m["id"], m["id"])

@@ -366,13 +366,13 @@ func TestPublishLogInvalidPath(t *testing.T) {
 func TestFormatPubLogKey(t *testing.T) {
 	tests := []struct {
 		seq      uint64
-		expected string
+		expected []byte
 	}{
-		{0, "/publog/0000000000000000"},
-		{1, "/publog/0000000000000001"},
-		{255, "/publog/00000000000000ff"},
-		{65535, "/publog/000000000000ffff"},
-		{0xFFFFFFFFFFFFFFFF, "/publog/ffffffffffffffff"},
+		{0, []byte("/publog/\x00\x00\x00\x00\x00\x00\x00\x00")},
+		{1, []byte("/publog/\x00\x00\x00\x00\x00\x00\x00\x01")},
+		{255, []byte("/publog/\x00\x00\x00\x00\x00\x00\x00\xff")},
+		{65535, []byte("/publog/\x00\x00\x00\x00\x00\x00\xff\xff")},
+		{0xFFFFFFFFFFFFFFFF, []byte("/publog/\xff\xff\xff\xff\xff\xff\xff\xff")},
 	}
 
 	for _, tt := range tests {

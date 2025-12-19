@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/maxpert/marmot/cfg"
+	"github.com/maxpert/marmot/common"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/protocol"
 	"github.com/maxpert/marmot/protocol/handlers"
@@ -29,19 +30,14 @@ type DatabaseManager interface {
 	GetDatabaseConnection(name string) (*sql.DB, error)
 	// GetReplicatedDatabase returns the ReplicatedDatabase for executing with hooks
 	GetReplicatedDatabase(name string) (ReplicatedDatabaseProvider, error)
+	// GetAutoIncrementColumn returns the auto-increment column name for a table.
+	// Uses cached schema - does NOT query SQLite PRAGMA.
+	GetAutoIncrementColumn(database, table string) (string, error)
 }
 
 // ReplicatedDatabaseProvider provides access to replicated database operations
 type ReplicatedDatabaseProvider interface {
 	ExecuteLocalWithHooks(ctx context.Context, txnID uint64, requests []ExecutionRequest) (PendingExecution, error)
-}
-
-// CDCEntry holds CDC data captured by preupdate hooks
-type CDCEntry struct {
-	Table     string
-	IntentKey string
-	OldValues map[string][]byte
-	NewValues map[string][]byte
 }
 
 // ExecutionRequest for local-only execution - never replicated
@@ -66,7 +62,7 @@ type CDCMergeResult struct {
 //   - TableName is ALWAYS extracted from entries (hooks capture it)
 //   - Never rely on parsed SQL for TableName with CDC data
 //   - See TestMergeCDCEntries_TableNameRequired for enforcement
-func MergeCDCEntries(entries []CDCEntry) CDCMergeResult {
+func MergeCDCEntries(entries []common.CDCEntry) CDCMergeResult {
 	result := CDCMergeResult{
 		OldValues: make(map[string][]byte),
 		NewValues: make(map[string][]byte),
@@ -92,16 +88,11 @@ func MergeCDCEntries(entries []CDCEntry) CDCMergeResult {
 
 // PendingExecution represents a locally executed transaction waiting for quorum
 type PendingExecution interface {
-	GetRowCounts() map[string]int64
 	GetTotalRowCount() int64
 	GetLastInsertId() int64
-	GetKeyHashes(maxRows int) map[string][]uint64
-	GetCDCEntries() []CDCEntry
+	GetCDCEntries() []common.CDCEntry
 	Commit() error
 	Rollback() error
-	// FlushIntentLog is a no-op with SQLite-backed intent storage (WAL handles durability).
-	// Kept for API compatibility.
-	FlushIntentLog() error
 }
 
 // SchemaVersionManager interface to avoid import cycles
@@ -160,17 +151,8 @@ func (s NodeStatus) String() string {
 }
 
 // PublisherRegistry interface to avoid import cycle
-// Accepts GenericCDCEntry slice for conversion to publisher.CDCEvent
 type PublisherRegistry interface {
-	AppendGeneric(txnID uint64, database string, entries []GenericCDCEntry, commitTSNanos int64, nodeID uint64) error
-}
-
-// GenericCDCEntry represents a CDC entry in generic form to avoid import cycle
-type GenericCDCEntry struct {
-	Table     string
-	IntentKey string
-	OldValues map[string][]byte
-	NewValues map[string][]byte
+	AppendCDC(txnID uint64, database string, entries []common.CDCEntry, commitTSNanos int64, nodeID uint64) error
 }
 
 // CoordinatorHandler implements protocol.ConnectionHandler
@@ -220,16 +202,17 @@ func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, sq
 		Str("query", sql).
 		Msg("Handling query")
 
-	// Build schema lookup function for auto-increment ID injection
+	// Build schema lookup function for auto-increment ID injection.
+	// Uses cached schema via DatabaseManager - does NOT query SQLite PRAGMA.
 	var schemaLookup protocol.SchemaLookupFunc
 	if session.CurrentDatabase != "" {
-		db, err := h.dbManager.GetDatabaseConnection(session.CurrentDatabase)
-		if err == nil && db != nil {
-			sp := protocol.NewSchemaProvider(db)
-			schemaLookup = func(table string) string {
-				col, _ := sp.GetAutoIncrementColumn(table)
-				return col
+		dbName := session.CurrentDatabase
+		schemaLookup = func(table string) string {
+			col, err := h.dbManager.GetAutoIncrementColumn(dbName, table)
+			if err != nil {
+				return ""
 			}
+			return col
 		}
 	}
 
@@ -883,7 +866,7 @@ func (h *CoordinatorHandler) handleCommit(session *protocol.ConnectionSession) (
 	// This is required for 2PC replication - without CDC data, intents cannot be created
 	enrichedStatements := make([]protocol.Statement, 0, len(txnState.Statements))
 	var totalRowsAffected int64
-	allCDCEntries := make([]CDCEntry, 0) // Collect all CDC entries for publishing
+	allCDCEntries := make([]common.CDCEntry, 0) // Collect all CDC entries for publishing
 
 	hookTimeout := 50 * time.Second
 	if cfg.Config != nil && cfg.Config.Transaction.LockWaitTimeoutSeconds > 0 {
@@ -1058,39 +1041,27 @@ func (h *CoordinatorHandler) bufferStatement(session *protocol.ConnectionSession
 }
 
 // publishCDCEvents publishes CDC events to the publisher registry if enabled
-func (h *CoordinatorHandler) publishCDCEvents(txnID uint64, database string, cdcEntries []CDCEntry, commitTS hlc.Timestamp) {
+func (h *CoordinatorHandler) publishCDCEvents(txnID uint64, database string, cdcEntries []common.CDCEntry, commitTS hlc.Timestamp) {
 	h.publisherMu.RLock()
+	defer h.publisherMu.RUnlock()
 	registry := h.publisherRegistry
-	h.publisherMu.RUnlock()
 
 	if registry == nil || len(cdcEntries) == 0 {
 		return
 	}
 
-	// Convert coordinator.CDCEntry to GenericCDCEntry
-	genericEntries := make([]GenericCDCEntry, 0, len(cdcEntries))
-	for _, entry := range cdcEntries {
-		genericEntries = append(genericEntries, GenericCDCEntry{
-			Table:     entry.Table,
-			IntentKey: entry.IntentKey,
-			OldValues: entry.OldValues,
-			NewValues: entry.NewValues,
-		})
-	}
-
-	// Call registry's AppendGeneric which does the conversion internally
-	if err := registry.AppendGeneric(txnID, database, genericEntries, commitTS.WallTime, h.nodeID); err != nil {
+	if err := registry.AppendCDC(txnID, database, cdcEntries, commitTS.WallTime, h.nodeID); err != nil {
 		log.Error().Err(err).
 			Uint64("txn_id", txnID).
 			Str("database", database).
-			Int("entries", len(genericEntries)).
+			Int("entries", len(cdcEntries)).
 			Msg("Failed to append CDC events to publish log")
 		// Don't fail the transaction - just log the error
 	} else {
 		log.Debug().
 			Uint64("txn_id", txnID).
 			Str("database", database).
-			Int("entries", len(genericEntries)).
+			Int("entries", len(cdcEntries)).
 			Msg("Published CDC events")
 	}
 }

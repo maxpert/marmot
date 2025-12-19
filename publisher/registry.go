@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/maxpert/marmot/cfg"
+	"github.com/maxpert/marmot/common"
 	"github.com/rs/zerolog/log"
 )
 
@@ -198,15 +199,13 @@ func (r *Registry) Append(events []CDCEvent) error {
 	return r.log.Append(events)
 }
 
-// AppendGeneric converts generic CDC entries and appends them to the publish log
-// This method exists to avoid import cycles with the coordinator package
+// AppendCDC converts CDC entries and appends them to the publish log
 // Note: PublishLog.Append is thread-safe (uses Pebble DB which handles concurrency)
-func (r *Registry) AppendGeneric(txnID uint64, database string, entries []GenericCDCEntry, commitTSNanos int64, nodeID uint64) error {
+func (r *Registry) AppendCDC(txnID uint64, database string, entries []common.CDCEntry, commitTSNanos int64, nodeID uint64) error {
 	if !r.running.Load() {
 		return fmt.Errorf("registry not running")
 	}
 
-	// Convert GenericCDCEntry to CDCEvent
 	events := ConvertToCDCEvents(txnID, database, entries, commitTSNanos, nodeID)
 	if len(events) == 0 {
 		return nil

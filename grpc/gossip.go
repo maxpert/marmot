@@ -256,11 +256,9 @@ func (gp *GossipProtocol) sendGossip(peer *NodeState, req *GossipRequest) {
 			Uint64("peer", peer.NodeId).
 			Str("peer_status", peer.Status.String()).
 			Msg("GOSSIP: SendGossip FAILED")
-		// Only mark suspect for non-DEAD nodes
-		// DEAD nodes are already in worst state
-		if peer.Status != NodeStatus_DEAD {
-			gp.registry.MarkSuspect(peer.NodeId)
-		}
+		// Don't immediately mark suspect - let time-based CheckTimeouts handle it
+		// Immediate marking causes flapping when transient failures occur
+		// CheckTimeouts will mark SUSPECT after 15s of no contact (suspectTimeout)
 		return
 	}
 

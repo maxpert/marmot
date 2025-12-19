@@ -2,13 +2,15 @@ package coordinator
 
 import (
 	"testing"
+
+	"github.com/maxpert/marmot/common"
 )
 
 // TestMergeCDCEntries_TableNameRequired is a CRITICAL test.
 // It exists because commit 28cfab9 fixed handleCommit but forgot handleMutation.
 // This test MUST fail if anyone removes TableName extraction from MergeCDCEntries.
 func TestMergeCDCEntries_TableNameRequired(t *testing.T) {
-	entries := []CDCEntry{
+	entries := []common.CDCEntry{
 		{Table: "users", IntentKey: "1", NewValues: map[string][]byte{"id": {1}}},
 	}
 	result := MergeCDCEntries(entries)
@@ -25,7 +27,7 @@ func TestMergeCDCEntries_TableNameRequired(t *testing.T) {
 
 func TestMergeCDCEntries_MergesUpsertHooks(t *testing.T) {
 	// SQLite fires DELETE then INSERT for UPSERT on existing row
-	entries := []CDCEntry{
+	entries := []common.CDCEntry{
 		{Table: "users", IntentKey: "1", OldValues: map[string][]byte{"name": []byte("old")}, NewValues: nil},
 		{Table: "users", IntentKey: "1", OldValues: nil, NewValues: map[string][]byte{"name": []byte("new")}},
 	}
@@ -63,7 +65,7 @@ func TestMergeCDCEntries_EmptyEntries(t *testing.T) {
 }
 
 func TestMergeCDCEntries_SingleInsert(t *testing.T) {
-	entries := []CDCEntry{
+	entries := []common.CDCEntry{
 		{
 			Table:     "products",
 			IntentKey: "42",
@@ -92,7 +94,7 @@ func TestMergeCDCEntries_SingleInsert(t *testing.T) {
 }
 
 func TestMergeCDCEntries_SingleDelete(t *testing.T) {
-	entries := []CDCEntry{
+	entries := []common.CDCEntry{
 		{
 			Table:     "products",
 			IntentKey: "42",

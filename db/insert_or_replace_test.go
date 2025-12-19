@@ -114,15 +114,11 @@ func TestInsertOrReplaceWithHooks(t *testing.T) {
 	}
 	t.Log("INSERT OR REPLACE committed successfully")
 
-	// Verify the value was replaced - try both writeDB and readDB
+	// Verify the value was replaced
 	var value string
 	err = replicatedDB.GetWriteDB().QueryRow("SELECT value FROM test_upsert WHERE id = 'key1'").Scan(&value)
 	if err != nil {
-		t.Logf("Failed to read from writeDB: %v", err)
-		err = replicatedDB.GetReadDB().QueryRow("SELECT value FROM test_upsert WHERE id = 'key1'").Scan(&value)
-		if err != nil {
-			t.Fatalf("Failed to read from both writeDB and readDB: %v", err)
-		}
+		t.Fatalf("Failed to read value: %v", err)
 	}
 	if value != "value2" {
 		t.Errorf("Expected value2, got %s", value)

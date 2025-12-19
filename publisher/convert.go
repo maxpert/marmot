@@ -1,16 +1,9 @@
 package publisher
 
-// ConvertCDCEntry converts a generic CDC entry map to CDCEvent
-// This avoids import cycles by accepting a flexible input type
-type GenericCDCEntry struct {
-	Table     string
-	IntentKey string
-	OldValues map[string][]byte
-	NewValues map[string][]byte
-}
+import "github.com/maxpert/marmot/common"
 
-// ConvertToCDCEvents converts generic CDC entries to publisher.CDCEvent format
-func ConvertToCDCEvents(txnID uint64, database string, entries []GenericCDCEntry, commitTSNanos int64, nodeID uint64) []CDCEvent {
+// ConvertToCDCEvents converts common.CDCEntry to publisher.CDCEvent format
+func ConvertToCDCEvents(txnID uint64, database string, entries []common.CDCEntry, commitTSNanos int64, nodeID uint64) []CDCEvent {
 	events := make([]CDCEvent, 0, len(entries))
 	commitTSMillis := commitTSNanos / 1_000_000 // Convert nanoseconds to milliseconds
 

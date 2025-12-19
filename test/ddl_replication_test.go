@@ -91,6 +91,11 @@ func (m *DDLMockDatabaseManager) GetReplicatedDatabase(name string) (coordinator
 	return nil, fmt.Errorf("not implemented in DDL mock")
 }
 
+func (m *DDLMockDatabaseManager) GetAutoIncrementColumn(database, table string) (string, error) {
+	// Not implemented in DDL mock - return empty
+	return "", nil
+}
+
 // DDLMockReader implements coordinator.Reader for testing
 type DDLMockReader struct{}
 

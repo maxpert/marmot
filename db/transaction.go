@@ -306,8 +306,6 @@ func (tm *TransactionManager) calculateCommitTS(startTS hlc.Timestamp) hlc.Times
 }
 
 // applyDataChanges applies CDC entries or DDL statements from intents.
-// CRITICAL: Also rebuilds txn.Statements from persistent storage for serialization
-// in finalizeCommit. Without this, anti-entropy delta sync has no data to stream.
 func (tm *TransactionManager) applyDataChanges(txn *Transaction, intents []*WriteIntentRecord) error {
 	cdcEntries, err := tm.metaStore.GetIntentEntries(txn.ID)
 	if err != nil {
@@ -319,9 +317,7 @@ func (tm *TransactionManager) applyDataChanges(txn *Transaction, intents []*Writ
 		return err
 	}
 
-	// Rebuild txn.Statements from CDC entries for persistence in TransactionRecord.
-	// This is CRITICAL for anti-entropy: StreamChanges reads SerializedStatements to send
-	// CDC data to lagging nodes. Without this, delta sync receives empty statements.
+	// Rebuild txn.Statements from CDC entries
 	txn.Statements = tm.rebuildStatementsFromCDC(cdcEntries, intents)
 
 	// Apply DDL statements if no CDC entries
@@ -335,8 +331,7 @@ func (tm *TransactionManager) applyDataChanges(txn *Transaction, intents []*Writ
 }
 
 // rebuildStatementsFromCDC reconstructs protocol.Statement slice from CDC entries
-// and DDL intents. This data is serialized to TransactionRecord.SerializedStatements
-// for anti-entropy streaming to lagging nodes.
+// and DDL intents for in-memory transaction tracking.
 func (tm *TransactionManager) rebuildStatementsFromCDC(cdcEntries []*IntentEntry, intents []*WriteIntentRecord) []protocol.Statement {
 	statements := make([]protocol.Statement, 0, len(cdcEntries)+len(intents))
 
@@ -347,7 +342,7 @@ func (tm *TransactionManager) rebuildStatementsFromCDC(cdcEntries []*IntentEntry
 			IntentKey: entry.IntentKey,
 			OldValues: entry.OldValues,
 			NewValues: entry.NewValues,
-			Type:      opCodeToStatementType(entry.Operation),
+			Type:      OpTypeToStatementType(OpType(entry.Operation)),
 		}
 		statements = append(statements, stmt)
 	}
@@ -392,7 +387,7 @@ func (tm *TransactionManager) applyCDCEntries(txnID uint64, entries []*IntentEnt
 			IntentKey: entry.IntentKey,
 			OldValues: entry.OldValues,
 			NewValues: entry.NewValues,
-			Type:      opCodeToStatementType(entry.Operation),
+			Type:      OpTypeToStatementType(OpType(entry.Operation)),
 		}
 
 		if err := tm.writeCDCData(stmt); err != nil {
@@ -443,10 +438,8 @@ func (tm *TransactionManager) applyDDLIntents(txnID uint64, intents []*WriteInte
 
 // finalizeCommit marks the transaction as committed in MetaStore.
 func (tm *TransactionManager) finalizeCommit(txn *Transaction) error {
-	statementsJSON, err := encoding.Marshal(txn.Statements)
-	if err != nil {
-		return fmt.Errorf("failed to serialize statements: %w", err)
-	}
+	// Count rows instead of serializing statements
+	rowCount := uint32(len(txn.Statements))
 
 	// Get database name from statement or fall back to transaction manager's database
 	dbName := ""
@@ -472,7 +465,8 @@ func (tm *TransactionManager) finalizeCommit(txn *Transaction) error {
 	}
 	tablesInvolved := strings.Join(tables, ",")
 
-	if err := tm.metaStore.CommitTransaction(txn.ID, txn.CommitTS, statementsJSON, dbName, tablesInvolved, txn.RequiredSchemaVersion); err != nil {
+	// Pass empty statements and rowCount to CommitTransaction
+	if err := tm.metaStore.CommitTransaction(txn.ID, txn.CommitTS, nil, dbName, tablesInvolved, txn.RequiredSchemaVersion, rowCount); err != nil {
 		return fmt.Errorf("failed to mark transaction as committed: %w", err)
 	}
 
@@ -482,32 +476,8 @@ func (tm *TransactionManager) finalizeCommit(txn *Transaction) error {
 
 // cleanupAfterCommit performs synchronous cleanup to prevent goroutine explosion.
 func (tm *TransactionManager) cleanupAfterCommit(txn *Transaction, intents []*WriteIntentRecord) {
-	// Mark intents for cleanup first (fast path - allows immediate overwrite)
-	if err := tm.metaStore.MarkIntentsForCleanup(txn.ID); err != nil {
-		log.Warn().Err(err).Uint64("txn_id", txn.ID).Msg("Failed to mark intents for cleanup")
-	}
-
-	// Delete intents and CDC entries
-	if err := tm.metaStore.DeleteIntentsByTxn(txn.ID); err != nil {
-		log.Warn().Err(err).Uint64("txn_id", txn.ID).Msg("Failed to cleanup intents after commit")
-	}
-	if err := tm.metaStore.DeleteIntentEntries(txn.ID); err != nil {
-		log.Warn().Err(err).Uint64("txn_id", txn.ID).Msg("Failed to cleanup CDC entries after commit")
-	}
-}
-
-// opCodeToStatementType converts OpType back to protocol.StatementCode.
-// Panics on unknown type - internal data corruption should not be silently ignored.
-func opCodeToStatementType(op uint8) protocol.StatementCode {
-	switch OpType(op) {
-	case OpTypeInsert, OpTypeReplace:
-		return protocol.StatementInsert
-	case OpTypeUpdate:
-		return protocol.StatementUpdate
-	case OpTypeDelete:
-		return protocol.StatementDelete
-	default:
-		panic(fmt.Sprintf("opCodeToStatementType: unknown OpType %d", op))
+	if err := tm.metaStore.CleanupAfterCommit(txn.ID); err != nil {
+		log.Warn().Err(err).Uint64("txn_id", txn.ID).Msg("Failed to cleanup after commit")
 	}
 }
 
@@ -532,6 +502,9 @@ func (tm *TransactionManager) AbortTransaction(txn *Transaction) error {
 
 	// Clean up CDC intent entries
 	_ = tm.metaStore.DeleteIntentEntries(txn.ID)
+
+	// Clean up raw captured rows (from hook callback)
+	_ = tm.metaStore.DeleteCapturedRows(txn.ID)
 
 	return nil
 }
@@ -646,15 +619,8 @@ func (tm *TransactionManager) runGarbageCollection() {
 	}
 
 	// ====================
-	// PHASE 2: BACKGROUND - Skipped under load
+	// PHASE 2: BACKGROUND
 	// ====================
-	// Cleanup old transaction records.
-	// This is non-critical and can be deferred when system is busy.
-	if tm.isMetaStoreBusy() {
-		log.Debug().Msg("GC Phase 2: Skipping - MetaStore under load")
-		return
-	}
-
 	// Clean up old committed/aborted transaction records
 	oldTxnCount, err := tm.cleanupOldTransactionRecords()
 	if err != nil {
@@ -666,16 +632,6 @@ func (tm *TransactionManager) runGarbageCollection() {
 			Int("old_txn_records", oldTxnCount).
 			Msg("GC Phase 2: Cleaned up old data")
 	}
-}
-
-// isMetaStoreBusy checks if MetaStore batch channel is under pressure
-// Returns true if we should skip non-critical GC work
-func (tm *TransactionManager) isMetaStoreBusy() bool {
-	// Check if MetaStore supports load detection
-	if loadChecker, ok := tm.metaStore.(interface{ IsBusy() bool }); ok {
-		return loadChecker.IsBusy()
-	}
-	return false
 }
 
 // cleanupStaleTransactions aborts transactions that haven't had a heartbeat within the timeout
@@ -742,183 +698,45 @@ func DeserializeData(data []byte, v interface{}) error {
 	return encoding.Unmarshal(data, v)
 }
 
-// writeCDCData writes CDC row data directly to the base table
-// This is the core CDC implementation - replicas receive row data, not SQL
+// schemaCacheAdapter adapts SchemaCache to CDCSchemaProvider interface
+type schemaCacheAdapter struct {
+	cache *SchemaCache
+}
+
+func (s *schemaCacheAdapter) GetPrimaryKeys(tableName string) ([]string, error) {
+	schema, err := s.cache.GetSchemaFor(tableName)
+	if err != nil {
+		return nil, err
+	}
+	return schema.PrimaryKeys, nil
+}
+
+// writeCDCData writes CDC row data directly to the base table using unified CDC applier
 func (tm *TransactionManager) writeCDCData(stmt protocol.Statement) error {
+	schemaAdapter := &schemaCacheAdapter{cache: tm.schemaCache}
+
 	switch stmt.Type {
 	case protocol.StatementInsert, protocol.StatementReplace:
-		return tm.writeCDCInsert(stmt.TableName, stmt.NewValues)
+		return ApplyCDCInsert(tm.db, stmt.TableName, stmt.NewValues)
 	case protocol.StatementUpdate:
-		return tm.writeCDCUpdate(stmt.TableName, stmt.OldValues, stmt.NewValues)
+		return ApplyCDCUpdate(tm.db, schemaAdapter, stmt.TableName, stmt.OldValues, stmt.NewValues)
 	case protocol.StatementDelete:
-		return tm.writeCDCDelete(stmt.TableName, stmt.IntentKey, stmt.OldValues)
+		return ApplyCDCDelete(tm.db, schemaAdapter, stmt.TableName, stmt.OldValues)
 	default:
 		return fmt.Errorf("unsupported statement type for CDC: %v", stmt.Type)
 	}
 }
 
-// writeCDCInsert performs INSERT OR REPLACE using CDC row data
-func (tm *TransactionManager) writeCDCInsert(tableName string, newValues map[string][]byte) error {
-	if len(newValues) == 0 {
-		return fmt.Errorf("no values to insert")
+// unmarshalCDCValue deserializes a msgpack-encoded value and converts []byte to string.
+// SQLite returns TEXT values as []byte from preupdate hooks, so we convert back for proper type affinity.
+func unmarshalCDCValue(data []byte) (interface{}, error) {
+	var value interface{}
+	if err := encoding.Unmarshal(data, &value); err != nil {
+		return nil, err
 	}
-
-	// Build INSERT OR REPLACE statement
-	columns := make([]string, 0, len(newValues))
-	placeholders := make([]string, 0, len(newValues))
-	values := make([]interface{}, 0, len(newValues))
-
-	for col := range newValues {
-		columns = append(columns, col)
-		placeholders = append(placeholders, "?")
-
-		var value interface{}
-		if err := encoding.Unmarshal(newValues[col], &value); err != nil {
-			return fmt.Errorf("failed to deserialize value for column %s: %w", col, err)
-		}
-		values = append(values, value)
+	// Convert []byte to string - SQLite returns TEXT as []byte from preupdate hooks
+	if b, ok := value.([]byte); ok {
+		return string(b), nil
 	}
-
-	sqlStmt := fmt.Sprintf("INSERT OR REPLACE INTO %s (%s) VALUES (%s)",
-		tableName,
-		strings.Join(columns, ", "),
-		strings.Join(placeholders, ", "))
-
-	_, err := tm.db.Exec(sqlStmt, values...)
-	return err
-}
-
-// writeCDCUpdate performs UPDATE using CDC row data
-// Uses oldValues for WHERE clause (to find existing row) and newValues for SET clause
-func (tm *TransactionManager) writeCDCUpdate(tableName string, oldValues, newValues map[string][]byte) error {
-	if len(newValues) == 0 {
-		return fmt.Errorf("no values to update")
-	}
-
-	if tm.schemaCache == nil {
-		return fmt.Errorf("schema cache not initialized")
-	}
-
-	// Get table schema to build proper WHERE clause
-	schema, err := tm.schemaCache.GetSchemaFor(tableName)
-	if err != nil {
-		// Try to reload schema cache if table not found
-		if _, ok := err.(ErrSchemaCacheMiss); ok {
-			log.Warn().Str("table", tableName).Msg("Schema not cached during UPDATE replay, attempting reload")
-			if reloadErr := tm.reloadSchemaCache(); reloadErr != nil {
-				return fmt.Errorf("failed to reload schema: %w", reloadErr)
-			}
-			// Retry schema lookup
-			schema, err = tm.schemaCache.GetSchemaFor(tableName)
-			if err != nil {
-				return fmt.Errorf("failed to get schema for table %s after reload: %w", tableName, err)
-			}
-		} else {
-			return fmt.Errorf("failed to get schema for table %s: %w", tableName, err)
-		}
-	}
-
-	// Build UPDATE statement with SET clause using newValues
-	setClauses := make([]string, 0, len(newValues))
-	values := make([]interface{}, 0, len(newValues)+len(schema.PrimaryKeys))
-
-	for col, valBytes := range newValues {
-		setClauses = append(setClauses, fmt.Sprintf("%s = ?", col))
-
-		var value interface{}
-		if err := encoding.Unmarshal(valBytes, &value); err != nil {
-			return fmt.Errorf("failed to deserialize value for column %s: %w", col, err)
-		}
-		values = append(values, value)
-	}
-
-	// Build WHERE clause using primary key columns from oldValues
-	// This is critical for PK changes: we need the OLD PK to find the row
-	whereClauses := make([]string, 0, len(schema.PrimaryKeys))
-
-	for _, pkCol := range schema.PrimaryKeys {
-		// Use oldValues for WHERE clause if available, fallback to newValues
-		pkBytes, ok := oldValues[pkCol]
-		if !ok {
-			// Fallback to newValues if oldValues doesn't have PK (shouldn't happen for UPDATEs)
-			pkBytes, ok = newValues[pkCol]
-			if !ok {
-				return fmt.Errorf("primary key column %s not found in CDC data", pkCol)
-			}
-		}
-
-		whereClauses = append(whereClauses, fmt.Sprintf("%s = ?", pkCol))
-
-		var value interface{}
-		if err := encoding.Unmarshal(pkBytes, &value); err != nil {
-			return fmt.Errorf("failed to deserialize PK value for column %s: %w", pkCol, err)
-		}
-		values = append(values, value)
-	}
-
-	sql := fmt.Sprintf("UPDATE %s SET %s WHERE %s",
-		tableName,
-		strings.Join(setClauses, ", "),
-		strings.Join(whereClauses, " AND "))
-
-	_, err = tm.db.Exec(sql, values...)
-	return err
-}
-
-// writeCDCDelete performs DELETE using CDC row data
-func (tm *TransactionManager) writeCDCDelete(tableName string, intentKey string, oldValues map[string][]byte) error {
-	if len(oldValues) == 0 {
-		return fmt.Errorf("empty old values for delete")
-	}
-
-	if tm.schemaCache == nil {
-		return fmt.Errorf("schema cache not initialized")
-	}
-
-	// Get table schema to build proper WHERE clause
-	schema, err := tm.schemaCache.GetSchemaFor(tableName)
-	if err != nil {
-		// Try to reload schema cache if table not found
-		if _, ok := err.(ErrSchemaCacheMiss); ok {
-			log.Warn().Str("table", tableName).Msg("Schema not cached during DELETE replay, attempting reload")
-			if reloadErr := tm.reloadSchemaCache(); reloadErr != nil {
-				return fmt.Errorf("failed to reload schema: %w", reloadErr)
-			}
-			// Retry schema lookup
-			schema, err = tm.schemaCache.GetSchemaFor(tableName)
-			if err != nil {
-				return fmt.Errorf("failed to get schema for table %s after reload: %w", tableName, err)
-			}
-		} else {
-			return fmt.Errorf("failed to get schema for table %s: %w", tableName, err)
-		}
-	}
-
-	// Build WHERE clause using primary key columns from oldValues
-	// NOTE: Always extract PK values from oldValues, not from intentKey.
-	// intentKey is in format "table:value" which includes the table prefix.
-	whereClauses := make([]string, 0, len(schema.PrimaryKeys))
-	values := make([]interface{}, 0, len(schema.PrimaryKeys))
-
-	for _, pkCol := range schema.PrimaryKeys {
-		pkValue, ok := oldValues[pkCol]
-		if !ok {
-			return fmt.Errorf("primary key column %s not found in CDC old values", pkCol)
-		}
-
-		whereClauses = append(whereClauses, fmt.Sprintf("%s = ?", pkCol))
-
-		var value interface{}
-		if err := encoding.Unmarshal(pkValue, &value); err != nil {
-			return fmt.Errorf("failed to deserialize PK value for column %s: %w", pkCol, err)
-		}
-		values = append(values, value)
-	}
-
-	sql := fmt.Sprintf("DELETE FROM %s WHERE %s",
-		tableName,
-		strings.Join(whereClauses, " AND "))
-
-	_, err = tm.db.Exec(sql, values...)
-	return err
+	return value, nil
 }

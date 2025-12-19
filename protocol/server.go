@@ -793,17 +793,20 @@ func (s *MySQLServer) handleStmtPrepare(conn net.Conn, session *ConnectionSessio
 
 	paramCount := uint16(countPlaceholders(transpiledSQL))
 
-	session.preparedStmtLock.Lock()
-	stmtID := session.nextStmtID
-	session.nextStmtID++
-	session.preparedStmts[stmtID] = &PreparedStatement{
-		ID:           stmtID,
-		Query:        transpiledSQL,
-		ParamCount:   paramCount,
-		OriginalType: StatementCode(ctx.Output.StatementType),
-		Context:      ctx,
-	}
-	session.preparedStmtLock.Unlock()
+	var stmtID uint32
+	func() {
+		session.preparedStmtLock.Lock()
+		defer session.preparedStmtLock.Unlock()
+		stmtID = session.nextStmtID
+		session.nextStmtID++
+		session.preparedStmts[stmtID] = &PreparedStatement{
+			ID:           stmtID,
+			Query:        transpiledSQL,
+			ParamCount:   paramCount,
+			OriginalType: StatementCode(ctx.Output.StatementType),
+			Context:      ctx,
+		}
+	}()
 
 	log.Debug().
 		Uint64("conn_id", session.ConnID).
@@ -877,9 +880,13 @@ func (s *MySQLServer) handleStmtExecute(conn net.Conn, session *ConnectionSessio
 	stmtID := binary.LittleEndian.Uint32(payload[0:4])
 
 	// Get prepared statement
-	session.preparedStmtLock.Lock()
-	stmt, ok := session.preparedStmts[stmtID]
-	session.preparedStmtLock.Unlock()
+	var stmt *PreparedStatement
+	var ok bool
+	func() {
+		session.preparedStmtLock.Lock()
+		defer session.preparedStmtLock.Unlock()
+		stmt, ok = session.preparedStmts[stmtID]
+	}()
 
 	if !ok {
 		_ = s.writeError(conn, 1, 1243, fmt.Sprintf("Unknown statement ID: %d", stmtID))
@@ -920,9 +927,11 @@ func (s *MySQLServer) handleStmtExecute(conn net.Conn, session *ConnectionSessio
 			offset += int(stmt.ParamCount) * 2
 
 			// Cache param types for subsequent executions
-			session.preparedStmtLock.Lock()
-			stmt.ParamTypes = paramTypes
-			session.preparedStmtLock.Unlock()
+			func() {
+				session.preparedStmtLock.Lock()
+				defer session.preparedStmtLock.Unlock()
+				stmt.ParamTypes = paramTypes
+			}()
 		} else {
 			// Use cached param types
 			paramTypes = stmt.ParamTypes

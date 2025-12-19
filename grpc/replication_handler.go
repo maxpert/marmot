@@ -2,14 +2,10 @@ package grpc
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
-	"sort"
-	"strings"
 
 	"github.com/maxpert/marmot/common"
 	"github.com/maxpert/marmot/db"
-	"github.com/maxpert/marmot/encoding"
 	pb "github.com/maxpert/marmot/grpc/common"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/protocol"
@@ -250,11 +246,25 @@ func (rh *ReplicationHandler) handleReplay(ctx context.Context, req *Transaction
 	}
 	defer tx.Rollback()
 
+	// Create schema adapter for CDC operations
+	schemaAdapter := &replicationSchemaAdapter{dbMgr: rh.dbMgr, dbName: dbName}
+
 	for _, stmt := range req.Statements {
 		// Check for CDC data (RowChange payload)
 		if rowChange := stmt.GetRowChange(); rowChange != nil && (len(rowChange.NewValues) > 0 || len(rowChange.OldValues) > 0) {
-			// CDC path: apply row data directly
-			if err := rh.applyReplayCDCStatement(tx, dbName, stmt); err != nil {
+			// CDC path: apply row data directly using unified applier
+			var err error
+			switch stmt.Type {
+			case pb.StatementType_INSERT, pb.StatementType_REPLACE:
+				err = db.ApplyCDCInsert(tx, stmt.TableName, rowChange.NewValues)
+			case pb.StatementType_UPDATE:
+				err = db.ApplyCDCUpdate(tx, schemaAdapter, stmt.TableName, rowChange.OldValues, rowChange.NewValues)
+			case pb.StatementType_DELETE:
+				err = db.ApplyCDCDelete(tx, schemaAdapter, stmt.TableName, rowChange.OldValues)
+			default:
+				err = fmt.Errorf("unsupported statement type for CDC replay: %v", stmt.Type)
+			}
+			if err != nil {
 				return &TransactionResponse{
 					Success:      false,
 					ErrorMessage: fmt.Sprintf("failed to apply CDC statement: %v", err),
@@ -299,12 +309,9 @@ func (rh *ReplicationHandler) handleReplay(ctx context.Context, req *Transaction
 			NodeID:   req.Timestamp.NodeId,
 		}
 
-		// Convert gRPC statements to protocol.Statement and serialize for storage.
-		// This is CRITICAL: if this node later becomes a delta sync source, it needs
-		// to have the statement data to stream to other lagging nodes.
-		serializedStatements := rh.serializeReplayStatements(req.Statements, dbName)
+		rowCount := uint32(len(req.Statements))
 
-		if err := metaStore.StoreReplayedTransaction(req.TxnId, req.Timestamp.NodeId, commitTS, serializedStatements, dbName); err != nil {
+		if err := metaStore.StoreReplayedTransaction(req.TxnId, req.Timestamp.NodeId, commitTS, dbName, rowCount); err != nil {
 			// Log but don't fail - data is already in SQLite
 			log.Warn().
 				Err(err).
@@ -330,217 +337,22 @@ func (rh *ReplicationHandler) handleReplay(ctx context.Context, req *Transaction
 	}, nil
 }
 
-// applyReplayCDCStatement applies a CDC statement during replay
-func (rh *ReplicationHandler) applyReplayCDCStatement(tx *sql.Tx, dbName string, stmt *Statement) error {
-	rowChange := stmt.GetRowChange()
-	if rowChange == nil {
-		return fmt.Errorf("no row change data")
-	}
-
-	switch stmt.Type {
-	case pb.StatementType_INSERT, pb.StatementType_REPLACE:
-		return rh.applyReplayCDCInsert(tx, stmt.TableName, rowChange.NewValues)
-	case pb.StatementType_UPDATE:
-		return rh.applyReplayCDCUpdate(tx, dbName, stmt.TableName, rowChange.OldValues, rowChange.NewValues)
-	case pb.StatementType_DELETE:
-		return rh.applyReplayCDCDelete(tx, dbName, stmt.TableName, rowChange.OldValues)
-	default:
-		return fmt.Errorf("unsupported statement type for CDC replay: %v", stmt.Type)
-	}
+// replicationSchemaAdapter adapts DatabaseManager schema access to CDCSchemaProvider
+type replicationSchemaAdapter struct {
+	dbMgr  *db.DatabaseManager
+	dbName string
 }
 
-// applyReplayCDCInsert performs INSERT OR REPLACE using CDC row data
-func (rh *ReplicationHandler) applyReplayCDCInsert(tx *sql.Tx, tableName string, newValues map[string][]byte) error {
-	if len(newValues) == 0 {
-		return fmt.Errorf("no values to insert")
-	}
-
-	columns := make([]string, 0, len(newValues))
-	placeholders := make([]string, 0, len(newValues))
-	values := make([]interface{}, 0, len(newValues))
-
-	for col := range newValues {
-		columns = append(columns, col)
-		placeholders = append(placeholders, "?")
-
-		var value interface{}
-		if err := encoding.Unmarshal(newValues[col], &value); err != nil {
-			return fmt.Errorf("failed to deserialize value for column %s: %w", col, err)
-		}
-		values = append(values, value)
-	}
-
-	sqlStmt := fmt.Sprintf("INSERT OR REPLACE INTO %s (%s) VALUES (%s)",
-		tableName,
-		strings.Join(columns, ", "),
-		strings.Join(placeholders, ", "))
-
-	_, err := tx.Exec(sqlStmt, values...)
-	return err
-}
-
-// applyReplayCDCUpdate performs UPDATE using CDC row data
-// Uses oldValues for WHERE clause (to find existing row) and newValues for SET clause
-func (rh *ReplicationHandler) applyReplayCDCUpdate(tx *sql.Tx, dbName, tableName string, oldValues, newValues map[string][]byte) error {
-	if len(newValues) == 0 {
-		return fmt.Errorf("no values to update")
-	}
-
-	// Get database instance to access cached schema
-	dbInstance, err := rh.dbMgr.GetDatabase(dbName)
+func (a *replicationSchemaAdapter) GetPrimaryKeys(tableName string) ([]string, error) {
+	dbInstance, err := a.dbMgr.GetDatabase(a.dbName)
 	if err != nil {
-		return fmt.Errorf("failed to get database %s: %w", dbName, err)
+		return nil, fmt.Errorf("database %s not found: %w", a.dbName, err)
 	}
-
-	// Use cached schema - does NOT query SQLite
 	schema, err := dbInstance.GetCachedTableSchema(tableName)
 	if err != nil {
-		return fmt.Errorf("failed to get cached schema for table %s: %w", tableName, err)
+		return nil, fmt.Errorf("schema not found for table %s: %w", tableName, err)
 	}
-
-	if len(schema.PrimaryKeys) == 0 {
-		return fmt.Errorf("no primary key columns found for table %s", tableName)
-	}
-
-	// Build UPDATE statement with SET clause using newValues
-	// Sort columns for deterministic SQL generation
-	columns := make([]string, 0, len(newValues))
-	for col := range newValues {
-		columns = append(columns, col)
-	}
-	sort.Strings(columns)
-
-	setClauses := make([]string, 0, len(newValues))
-	values := make([]interface{}, 0, len(newValues)+len(schema.PrimaryKeys))
-
-	for _, col := range columns {
-		valBytes := newValues[col]
-		setClauses = append(setClauses, fmt.Sprintf("%s = ?", col))
-
-		var value interface{}
-		if err := encoding.Unmarshal(valBytes, &value); err != nil {
-			return fmt.Errorf("failed to deserialize value for column %s: %w", col, err)
-		}
-		values = append(values, value)
-	}
-
-	// Build WHERE clause using primary key columns from oldValues
-	// This is critical for PK changes: we need the OLD PK to find the row
-	whereClauses := make([]string, 0, len(schema.PrimaryKeys))
-
-	for _, pkCol := range schema.PrimaryKeys {
-		// Use oldValues for WHERE clause if available, fallback to newValues
-		pkBytes, ok := oldValues[pkCol]
-		if !ok {
-			// Fallback to newValues if oldValues doesn't have PK (shouldn't happen for UPDATEs)
-			pkBytes, ok = newValues[pkCol]
-			if !ok {
-				return fmt.Errorf("primary key column %s not found in CDC data", pkCol)
-			}
-		}
-
-		whereClauses = append(whereClauses, fmt.Sprintf("%s = ?", pkCol))
-
-		var value interface{}
-		if err := encoding.Unmarshal(pkBytes, &value); err != nil {
-			return fmt.Errorf("failed to deserialize PK value for column %s: %w", pkCol, err)
-		}
-		values = append(values, value)
-	}
-
-	sqlStmt := fmt.Sprintf("UPDATE %s SET %s WHERE %s",
-		tableName,
-		strings.Join(setClauses, ", "),
-		strings.Join(whereClauses, " AND "))
-
-	_, err = tx.Exec(sqlStmt, values...)
-	return err
-}
-
-// applyReplayCDCDelete performs DELETE using CDC row data
-func (rh *ReplicationHandler) applyReplayCDCDelete(tx *sql.Tx, dbName string, tableName string, oldValues map[string][]byte) error {
-	if len(oldValues) == 0 {
-		return fmt.Errorf("no old values for delete")
-	}
-
-	// Get database instance to access cached schema
-	dbInstance, err := rh.dbMgr.GetDatabase(dbName)
-	if err != nil {
-		return fmt.Errorf("failed to get database %s: %w", dbName, err)
-	}
-
-	// Use cached schema - does NOT query SQLite
-	schema, err := dbInstance.GetCachedTableSchema(tableName)
-	if err != nil {
-		return fmt.Errorf("failed to get cached schema for table %s: %w", tableName, err)
-	}
-
-	// Build WHERE clause using primary key columns from oldValues
-	// Extract each PK value from oldValues and unmarshal
-	whereClauses := make([]string, 0, len(schema.PrimaryKeys))
-	values := make([]interface{}, 0, len(schema.PrimaryKeys))
-
-	for _, pkCol := range schema.PrimaryKeys {
-		pkValue, ok := oldValues[pkCol]
-		if !ok {
-			return fmt.Errorf("primary key column %s not found in CDC old values", pkCol)
-		}
-
-		whereClauses = append(whereClauses, fmt.Sprintf("%s = ?", pkCol))
-
-		var value interface{}
-		if err := encoding.Unmarshal(pkValue, &value); err != nil {
-			return fmt.Errorf("failed to deserialize PK value for column %s: %w", pkCol, err)
-		}
-		values = append(values, value)
-	}
-
-	sqlStmt := fmt.Sprintf("DELETE FROM %s WHERE %s",
-		tableName,
-		strings.Join(whereClauses, " AND "))
-
-	_, err = tx.Exec(sqlStmt, values...)
-	return err
-}
-
-// serializeReplayStatements converts gRPC Statement slice to protocol.Statement slice
-// and serializes them with msgpack for storage in TransactionRecord.SerializedStatements.
-// This ensures replayed transactions can be streamed to other lagging nodes.
-func (rh *ReplicationHandler) serializeReplayStatements(stmts []*Statement, dbName string) []byte {
-	if len(stmts) == 0 {
-		return nil
-	}
-
-	protoStmts := make([]protocol.Statement, 0, len(stmts))
-	for _, stmt := range stmts {
-		protoStmt := protocol.Statement{
-			Type:      common.MustFromWireType(stmt.Type),
-			TableName: stmt.TableName,
-			Database:  dbName,
-		}
-
-		// Extract CDC data from RowChange payload
-		if rowChange := stmt.GetRowChange(); rowChange != nil {
-			protoStmt.IntentKey = rowChange.IntentKey
-			protoStmt.OldValues = rowChange.OldValues
-			protoStmt.NewValues = rowChange.NewValues
-		}
-
-		// Extract SQL from DDL payload
-		if ddl := stmt.GetDdlChange(); ddl != nil {
-			protoStmt.SQL = ddl.Sql
-		}
-
-		protoStmts = append(protoStmts, protoStmt)
-	}
-
-	data, err := encoding.Marshal(protoStmts)
-	if err != nil {
-		log.Error().Err(err).Int("statement_count", len(protoStmts)).Msg("serializeReplayStatements: failed to marshal - anti-entropy may not work for this transaction")
-		return nil
-	}
-
-	return data
+	return schema.PrimaryKeys, nil
 }
 
 // HandleRead handles incoming read requests with MVCC snapshot isolation
@@ -636,4 +448,13 @@ func (rh *ReplicationHandler) HandleRead(ctx context.Context, req *ReadRequest) 
 			NodeId:   rh.nodeID,
 		},
 	}, nil
+}
+
+// GetAllSchemaVersions returns local schema versions for all databases
+// Used by promotion checker to verify schema matches cluster before promoting to ALIVE
+func (rh *ReplicationHandler) GetAllSchemaVersions() (map[string]uint64, error) {
+	if rh.schemaVersionMgr == nil {
+		return nil, nil
+	}
+	return rh.schemaVersionMgr.GetAllSchemaVersions()
 }

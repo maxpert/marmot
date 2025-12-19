@@ -417,15 +417,32 @@ func (dm *DatabaseManager) ReopenDatabase(name string) error {
 		return fmt.Errorf("failed to get database path: %w", err)
 	}
 
-	// Create MetaStore for this database
 	fullPath := filepath.Join(dm.dataDir, dbPath)
+
+	// Get old MetaStore and close it FIRST to release PebbleDB lock
+	// This must happen before creating the new MetaStore
+	oldMetaStore := oldDB.GetMetaStore()
+
+	// Close old database and MetaStore synchronously (we hold the mutex, so no new queries can start)
+	log.Info().Str("name", name).Msg("Closing old database for snapshot reload")
+	if err := oldDB.Close(); err != nil {
+		log.Warn().Err(err).Str("name", name).Msg("Error closing old database connection")
+	}
+	if oldMetaStore != nil {
+		if err := oldMetaStore.Close(); err != nil {
+			dm.mu.Unlock()
+			return fmt.Errorf("failed to close old meta store for %s: %w", name, err)
+		}
+	}
+
+	// Now create new MetaStore (PebbleDB lock is released)
 	metaStore, err := NewMetaStore(fullPath)
 	if err != nil {
 		dm.mu.Unlock()
 		return fmt.Errorf("failed to create meta store for %s: %w", name, err)
 	}
 
-	// Create new database connection FIRST (before closing old one)
+	// Create new database connection
 	newDB, err := NewReplicatedDatabase(fullPath, dm.nodeID, dm.clock, metaStore)
 	if err != nil {
 		metaStore.Close()
@@ -436,29 +453,11 @@ func (dm *DatabaseManager) ReopenDatabase(name string) error {
 	// Wire up GC coordination for new connection
 	dm.wireGCCoordination(newDB, name)
 
-	// Get old MetaStore before swap
-	oldMetaStore := oldDB.GetMetaStore()
-
 	// Atomically swap in the new connection
 	dm.databases[name] = newDB
 	dm.mu.Unlock()
 
 	log.Info().Str("name", name).Msg("Database connection swapped after snapshot")
-
-	// Close old database in background after delay to let in-flight queries complete
-	// Most SQLite queries complete within 5 seconds (busy_timeout is 50s but that's worst case)
-	go func() {
-		time.Sleep(5 * time.Second)
-		log.Info().Str("name", name).Msg("Closing old database connection after swap delay")
-		if err := oldDB.Close(); err != nil {
-			log.Warn().Err(err).Str("name", name).Msg("Error closing old database connection")
-		}
-		if oldMetaStore != nil {
-			if err := oldMetaStore.Close(); err != nil {
-				log.Warn().Err(err).Str("name", name).Msg("Error closing old meta store")
-			}
-		}
-	}()
 
 	return nil
 }
@@ -1115,43 +1114,38 @@ func (dm *DatabaseManager) GetMaxTxnID(database string) (uint64, error) {
 	return metaStore.GetMaxCommittedTxnID()
 }
 
-// GetTableSchema returns the schema for a table in a database
-// Used by CDC Publisher to transform events to Debezium format
+// GetTableSchema returns the schema for a table in a database.
+// Uses cached schema from SchemaCache - does NOT query SQLite.
+// Used by CDC Publisher to transform events to Debezium format.
 func (dm *DatabaseManager) GetTableSchema(database, table string) (publisher.TableSchema, error) {
 	db, err := dm.GetDatabase(database)
 	if err != nil {
 		return publisher.TableSchema{}, err
 	}
 
-	// Query PRAGMA table_info
-	rows, err := db.GetDB().Query(fmt.Sprintf("PRAGMA table_info(%s)", table))
+	schema, err := db.GetCachedTableSchema(table)
 	if err != nil {
-		return publisher.TableSchema{}, fmt.Errorf("failed to query table info: %w", err)
-	}
-	defer rows.Close()
-
-	var schema publisher.TableSchema
-	for rows.Next() {
-		var cid int
-		var name, colType string
-		var notNull, pk int
-		var dfltValue any
-		if err := rows.Scan(&cid, &name, &colType, &notNull, &dfltValue, &pk); err != nil {
-			return publisher.TableSchema{}, fmt.Errorf("failed to scan column info: %w", err)
-		}
-		schema.Columns = append(schema.Columns, publisher.ColumnInfo{
-			Name:     name,
-			Type:     colType,
-			Nullable: notNull == 0,
-			IsPK:     pk > 0,
-		})
+		return publisher.TableSchema{}, fmt.Errorf("schema not cached for table %s: %w", table, err)
 	}
 
-	if err := rows.Err(); err != nil {
-		return publisher.TableSchema{}, fmt.Errorf("error iterating column info: %w", err)
+	return schema.ToPublisherSchema(), nil
+}
+
+// GetAutoIncrementColumn returns the auto-increment column name for a table.
+// Uses cached schema - does NOT query SQLite PRAGMA.
+// Returns empty string if no auto-increment column exists.
+func (dm *DatabaseManager) GetAutoIncrementColumn(database, table string) (string, error) {
+	db, err := dm.GetDatabase(database)
+	if err != nil {
+		return "", err
 	}
 
-	return schema, nil
+	schema, err := db.GetCachedTableSchema(table)
+	if err != nil {
+		return "", fmt.Errorf("schema not cached for table %s: %w", table, err)
+	}
+
+	return schema.GetAutoIncrementCol(), nil
 }
 
 // GetCommittedTxnCount returns the count of committed transactions in a database

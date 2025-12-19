@@ -328,6 +328,7 @@ func startNode(t *testing.T, node *testNode, seedNodes []string) {
 		return nil
 	}
 
+	schemaVersionMgr = db.NewSchemaVersionManager(systemDB.GetMetaStore())
 	node.antiEntropy = marmotgrpc.NewAntiEntropyServiceFromConfig(
 		node.nodeID,
 		grpcServer.GetNodeRegistry(),
@@ -336,6 +337,7 @@ func startNode(t *testing.T, node *testNode, seedNodes []string) {
 		node.deltaSync,
 		node.clock,
 		snapshotFunc,
+		schemaVersionMgr,
 	)
 	node.antiEntropy.Start()
 

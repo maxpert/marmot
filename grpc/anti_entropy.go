@@ -17,13 +17,14 @@ import (
 // AntiEntropyService manages background anti-entropy process
 // It periodically checks for lagging peers and brings them up to date
 type AntiEntropyService struct {
-	nodeID       uint64
-	registry     *NodeRegistry
-	client       *Client
-	dbManager    *db.DatabaseManager
-	deltaSync    *DeltaSyncClient
-	clock        *hlc.Clock
-	snapshotFunc SnapshotTransferFunc
+	nodeID           uint64
+	registry         *NodeRegistry
+	client           *Client
+	dbManager        *db.DatabaseManager
+	deltaSync        *DeltaSyncClient
+	clock            *hlc.Clock
+	snapshotFunc     SnapshotTransferFunc
+	schemaVersionMgr *db.SchemaVersionManager
 
 	// Configuration
 	interval              time.Duration
@@ -50,6 +51,7 @@ type AntiEntropyConfig struct {
 	DeltaSync             *DeltaSyncClient
 	Clock                 *hlc.Clock
 	SnapshotFunc          SnapshotTransferFunc
+	SchemaVersionMgr      *db.SchemaVersionManager
 	Interval              time.Duration
 	DeltaThresholdTxns    int
 	DeltaThresholdSeconds int
@@ -66,6 +68,7 @@ func NewAntiEntropyService(config AntiEntropyConfig) *AntiEntropyService {
 		deltaSync:             config.DeltaSync,
 		clock:                 config.Clock,
 		snapshotFunc:          config.SnapshotFunc,
+		schemaVersionMgr:      config.SchemaVersionMgr,
 		interval:              config.Interval,
 		deltaThresholdTxns:    config.DeltaThresholdTxns,
 		deltaThresholdSeconds: config.DeltaThresholdSeconds,
@@ -83,6 +86,7 @@ func NewAntiEntropyServiceFromConfig(
 	deltaSync *DeltaSyncClient,
 	clock *hlc.Clock,
 	snapshotFunc SnapshotTransferFunc,
+	schemaVersionMgr *db.SchemaVersionManager,
 ) *AntiEntropyService {
 	config := cfg.Config.Replication
 
@@ -94,6 +98,7 @@ func NewAntiEntropyServiceFromConfig(
 		DeltaSync:             deltaSync,
 		Clock:                 clock,
 		SnapshotFunc:          snapshotFunc,
+		SchemaVersionMgr:      schemaVersionMgr,
 		Interval:              time.Duration(config.AntiEntropyIntervalS) * time.Second,
 		DeltaThresholdTxns:    config.DeltaSyncThresholdTxns,
 		DeltaThresholdSeconds: config.DeltaSyncThresholdSeconds,
@@ -288,6 +293,7 @@ func (ae *AntiEntropyService) performAntiEntropy() {
 // Uses two criteria:
 // 1. Higher max_txn_id indicates more recent transactions
 // 2. Higher committed_txn_count indicates more data (tiebreaker when max_txn_id is the same)
+// CRITICAL: Skips peers with older schema versions to prevent data loss from DDL changes
 // Returns nil if we're already up to date with all peers
 func (ae *AntiEntropyService) findBestPeerForDatabase(ctx context.Context, aliveNodes []*NodeState, database string) *NodeState {
 	localMaxTxnID, err := ae.dbManager.GetMaxTxnID(database)
@@ -302,11 +308,21 @@ func (ae *AntiEntropyService) findBestPeerForDatabase(ctx context.Context, alive
 		localTxnCount = 0
 	}
 
+	var localSchemaVersion uint64 = 0
+	if ae.schemaVersionMgr != nil {
+		localSchemaVersion, err = ae.schemaVersionMgr.GetSchemaVersion(database)
+		if err != nil {
+			log.Warn().Err(err).Str("database", database).Msg("Failed to get local schema version, treating as 0")
+			localSchemaVersion = 0
+		}
+	}
+
 	log.Debug().
 		Uint64("node_id", ae.nodeID).
 		Str("database", database).
 		Uint64("local_max_txn", localMaxTxnID).
 		Int64("local_txn_count", localTxnCount).
+		Uint64("local_schema_version", localSchemaVersion).
 		Int("peers_to_check", len(aliveNodes)).
 		Msg("ANTI-ENTROPY: Comparing with peers")
 
@@ -315,6 +331,24 @@ func (ae *AntiEntropyService) findBestPeerForDatabase(ctx context.Context, alive
 	var bestTxnCount int64 = localTxnCount
 
 	for _, peer := range aliveNodes {
+		peerSchemaVersion := uint64(0)
+		if peer.DatabaseSchemaVersions != nil {
+			if version, exists := peer.DatabaseSchemaVersions[database]; exists {
+				peerSchemaVersion = version
+			}
+		}
+
+		if peerSchemaVersion < localSchemaVersion {
+			log.Debug().
+				Uint64("node_id", ae.nodeID).
+				Uint64("peer_node", peer.NodeId).
+				Str("database", database).
+				Uint64("local_schema_version", localSchemaVersion).
+				Uint64("peer_schema_version", peerSchemaVersion).
+				Msg("ANTI-ENTROPY: Skipping peer with older schema version")
+			continue
+		}
+
 		client, err := ae.client.GetClientByAddress(peer.Address)
 		if err != nil {
 			log.Debug().
@@ -352,6 +386,7 @@ func (ae *AntiEntropyService) findBestPeerForDatabase(ctx context.Context, alive
 				Str("state_db", state.DatabaseName).
 				Uint64("peer_max_txn", peerMaxTxn).
 				Int64("peer_txn_count", peerTxnCount).
+				Uint64("peer_schema_version", peerSchemaVersion).
 				Uint64("best_max_txn", bestMaxTxnID).
 				Int64("best_txn_count", bestTxnCount).
 				Msg("ANTI-ENTROPY: Checking peer state")

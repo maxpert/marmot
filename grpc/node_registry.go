@@ -397,16 +397,16 @@ func (nr *NodeRegistry) CountAlive() int {
 	return count
 }
 
-// GetReplicationEligible returns nodes eligible for replication (ALIVE only, excludes JOINING)
-// JOINING nodes are catching up and should not receive write replication yet
+// GetReplicationEligible returns nodes eligible for DML replication (ALIVE only, excludes JOINING)
+// JOINING nodes are catching up and should not receive DML replication yet
 func (nr *NodeRegistry) GetReplicationEligible() []*NodeState {
 	nr.mu.RLock()
 	defer nr.mu.RUnlock()
 
 	nodes := make([]*NodeState, 0)
 	for _, node := range nr.nodes {
-		// Only ALIVE nodes participate in replication
-		// JOINING nodes are syncing and shouldn't receive writes
+		// Only ALIVE nodes participate in DML replication
+		// JOINING nodes are syncing and shouldn't receive DML writes
 		if node.Status == NodeStatus_ALIVE {
 			nodes = append(nodes, copyNodeState(node))
 		}

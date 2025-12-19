@@ -12,11 +12,14 @@ import (
 
 	"github.com/jizhuozhi/go-future"
 	"github.com/mattn/go-sqlite3"
-	"github.com/maxpert/marmot/encoding"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/protocol"
 	"github.com/maxpert/marmot/telemetry"
 	"github.com/rs/zerolog/log"
+)
+
+const (
+	batchCommitTimeout = 30 * time.Second
 )
 
 // Package-level metrics (registered once)
@@ -306,7 +309,10 @@ func (bc *SQLiteBatchCommitter) flush(batch map[uint64]*pendingCommit, trigger s
 		batchCommitterFlushDurHist.Observe(float64(time.Since(start).Milliseconds()))
 	}()
 
-	conn, err := bc.db.Conn(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), batchCommitTimeout)
+	defer cancel()
+
+	conn, err := bc.db.Conn(ctx)
 	if err != nil {
 		for _, pc := range batch {
 			pc.promise.Set(nil, err)
@@ -315,7 +321,7 @@ func (bc *SQLiteBatchCommitter) flush(batch map[uint64]*pendingCommit, trigger s
 	}
 	defer conn.Close()
 
-	tx, err := conn.BeginTx(context.Background(), nil)
+	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
 		for _, pc := range batch {
 			pc.promise.Set(nil, err)
@@ -333,10 +339,25 @@ func (bc *SQLiteBatchCommitter) flush(batch map[uint64]*pendingCommit, trigger s
 		return
 	}
 
+	// Create schema adapter for the unified applier
+	schemaAdapter := &schemaCacheAdapter{cache: schemaCache}
+
 	// Apply all CDC entries
 	for _, pc := range batch {
 		for _, entry := range pc.cdcEntries {
-			if err := bc.writeCDCDataToTx(tx, schemaCache, entry); err != nil {
+			opType := OpType(entry.Operation)
+			var err error
+			switch opType {
+			case OpTypeInsert, OpTypeReplace:
+				err = ApplyCDCInsert(tx, entry.Table, entry.NewValues)
+			case OpTypeUpdate:
+				err = ApplyCDCUpdate(tx, schemaAdapter, entry.Table, entry.OldValues, entry.NewValues)
+			case OpTypeDelete:
+				err = ApplyCDCDelete(tx, schemaAdapter, entry.Table, entry.OldValues)
+			default:
+				err = fmt.Errorf("unsupported operation type for CDC: %v", opType)
+			}
+			if err != nil {
 				pc.err = err
 				break
 			}
@@ -364,138 +385,6 @@ func (bc *SQLiteBatchCommitter) flush(batch map[uint64]*pendingCommit, trigger s
 	for _, pc := range batch {
 		pc.promise.Set(nil, pc.err)
 	}
-}
-
-func (bc *SQLiteBatchCommitter) writeCDCDataToTx(tx *sql.Tx, schemaCache *SchemaCache, entry *IntentEntry) error {
-	opType := OpType(entry.Operation)
-
-	switch opType {
-	case OpTypeInsert, OpTypeReplace:
-		return bc.writeCDCInsertToTx(tx, entry.Table, entry.NewValues)
-	case OpTypeUpdate:
-		return bc.writeCDCUpdateToTx(tx, schemaCache, entry.Table, entry.OldValues, entry.NewValues)
-	case OpTypeDelete:
-		return bc.writeCDCDeleteToTx(tx, schemaCache, entry.Table, entry.OldValues)
-	default:
-		return fmt.Errorf("unsupported operation type for CDC: %v", opType)
-	}
-}
-
-func (bc *SQLiteBatchCommitter) writeCDCInsertToTx(tx *sql.Tx, tableName string, newValues map[string][]byte) error {
-	if len(newValues) == 0 {
-		return fmt.Errorf("no values to insert")
-	}
-
-	columns := make([]string, 0, len(newValues))
-	placeholders := make([]string, 0, len(newValues))
-	values := make([]interface{}, 0, len(newValues))
-
-	for col := range newValues {
-		columns = append(columns, col)
-		placeholders = append(placeholders, "?")
-
-		var value interface{}
-		if err := encoding.Unmarshal(newValues[col], &value); err != nil {
-			return fmt.Errorf("failed to deserialize value for column %s: %w", col, err)
-		}
-		values = append(values, value)
-	}
-
-	sqlStmt := fmt.Sprintf("INSERT OR REPLACE INTO %s (%s) VALUES (%s)",
-		tableName,
-		strings.Join(columns, ", "),
-		strings.Join(placeholders, ", "))
-
-	_, err := tx.Exec(sqlStmt, values...)
-	return err
-}
-
-func (bc *SQLiteBatchCommitter) writeCDCUpdateToTx(tx *sql.Tx, schemaCache *SchemaCache, tableName string, oldValues, newValues map[string][]byte) error {
-	if len(newValues) == 0 {
-		return fmt.Errorf("no values to update")
-	}
-
-	schema, err := schemaCache.GetSchemaFor(tableName)
-	if err != nil {
-		return fmt.Errorf("schema not found for table %s: %w", tableName, err)
-	}
-
-	setClauses := make([]string, 0, len(newValues))
-	values := make([]interface{}, 0, len(newValues)+len(schema.PrimaryKeys))
-
-	for col, valBytes := range newValues {
-		setClauses = append(setClauses, fmt.Sprintf("%s = ?", col))
-
-		var value interface{}
-		if err := encoding.Unmarshal(valBytes, &value); err != nil {
-			return fmt.Errorf("failed to deserialize value for column %s: %w", col, err)
-		}
-		values = append(values, value)
-	}
-
-	whereClauses := make([]string, 0, len(schema.PrimaryKeys))
-
-	for _, pkCol := range schema.PrimaryKeys {
-		pkBytes, ok := oldValues[pkCol]
-		if !ok {
-			pkBytes, ok = newValues[pkCol]
-			if !ok {
-				return fmt.Errorf("primary key column %s not found in CDC data", pkCol)
-			}
-		}
-
-		whereClauses = append(whereClauses, fmt.Sprintf("%s = ?", pkCol))
-
-		var value interface{}
-		if err := encoding.Unmarshal(pkBytes, &value); err != nil {
-			return fmt.Errorf("failed to deserialize PK value for column %s: %w", pkCol, err)
-		}
-		values = append(values, value)
-	}
-
-	sqlStmt := fmt.Sprintf("UPDATE %s SET %s WHERE %s",
-		tableName,
-		strings.Join(setClauses, ", "),
-		strings.Join(whereClauses, " AND "))
-
-	_, err = tx.Exec(sqlStmt, values...)
-	return err
-}
-
-func (bc *SQLiteBatchCommitter) writeCDCDeleteToTx(tx *sql.Tx, schemaCache *SchemaCache, tableName string, oldValues map[string][]byte) error {
-	if len(oldValues) == 0 {
-		return fmt.Errorf("empty old values for delete")
-	}
-
-	schema, err := schemaCache.GetSchemaFor(tableName)
-	if err != nil {
-		return fmt.Errorf("schema not found for table %s: %w", tableName, err)
-	}
-
-	whereClauses := make([]string, 0, len(schema.PrimaryKeys))
-	values := make([]interface{}, 0, len(schema.PrimaryKeys))
-
-	for _, pkCol := range schema.PrimaryKeys {
-		pkValue, ok := oldValues[pkCol]
-		if !ok {
-			return fmt.Errorf("primary key column %s not found in CDC old values", pkCol)
-		}
-
-		whereClauses = append(whereClauses, fmt.Sprintf("%s = ?", pkCol))
-
-		var value interface{}
-		if err := encoding.Unmarshal(pkValue, &value); err != nil {
-			return fmt.Errorf("failed to deserialize PK value for column %s: %w", pkCol, err)
-		}
-		values = append(values, value)
-	}
-
-	sqlStmt := fmt.Sprintf("DELETE FROM %s WHERE %s",
-		tableName,
-		strings.Join(whereClauses, " AND "))
-
-	_, err = tx.Exec(sqlStmt, values...)
-	return err
 }
 
 // checkWALSize returns WAL file size in MB, or 0.0 if not exists/error.

@@ -48,12 +48,12 @@ type WorkerConfig struct {
 
 // Worker polls the PublishLog and publishes events to a sink
 type Worker struct {
-	config   WorkerConfig
-	cursor   uint64        // Current position
-	stopCh   chan struct{} // Stop signal
-	doneCh   chan struct{} // Done signal
-	running  atomic.Bool
-	stopOnce sync.Once // Ensures Stop() is called only once
+	config      WorkerConfig
+	cursor      uint64        // Current position
+	stopCh      chan struct{} // Stop signal
+	doneCh      chan struct{} // Done signal
+	running     atomic.Bool
+	lifecycleMu sync.Mutex // Protects Start/Stop lifecycle operations
 }
 
 // NewWorker creates a new CDC publisher worker
@@ -141,14 +141,16 @@ func findEarliestEntry(pubLog *PublishLog) (uint64, error) {
 
 // Start starts the worker goroutine
 func (w *Worker) Start() {
-	if !w.running.CompareAndSwap(false, true) {
+	w.lifecycleMu.Lock()
+	defer w.lifecycleMu.Unlock()
+
+	if w.running.Load() {
 		return // Already running
 	}
 
-	// Recreate channels if they were closed by a previous Stop()
+	w.running.Store(true)
 	w.stopCh = make(chan struct{})
 	w.doneCh = make(chan struct{})
-	w.stopOnce = sync.Once{}
 
 	log.Info().
 		Str("worker", w.config.Name).
@@ -160,18 +162,18 @@ func (w *Worker) Start() {
 
 // Stop stops the worker gracefully
 func (w *Worker) Stop() {
+	w.lifecycleMu.Lock()
+	defer w.lifecycleMu.Unlock()
+
 	if !w.running.Load() {
 		return // Not running
 	}
 
 	log.Info().Str("worker", w.config.Name).Msg("Stopping CDC publisher worker")
 
-	// Ensure Stop() logic runs only once to avoid double-close panic
-	w.stopOnce.Do(func() {
-		close(w.stopCh)
-		<-w.doneCh // Wait for goroutine to finish
-		w.running.Store(false)
-	})
+	close(w.stopCh)
+	<-w.doneCh // Wait for goroutine to finish
+	w.running.Store(false)
 
 	log.Info().Str("worker", w.config.Name).Msg("CDC publisher worker stopped")
 }
@@ -179,7 +181,6 @@ func (w *Worker) Stop() {
 // pollLoop is the main worker loop
 func (w *Worker) pollLoop() {
 	defer close(w.doneCh)
-	defer w.running.Store(false)
 
 	for {
 		select {

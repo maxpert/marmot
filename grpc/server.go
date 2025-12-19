@@ -14,8 +14,6 @@ import (
 
 	"github.com/maxpert/marmot/common"
 	"github.com/maxpert/marmot/db"
-	"github.com/maxpert/marmot/encoding"
-	"github.com/maxpert/marmot/protocol"
 	"github.com/rs/zerolog/log"
 	"github.com/soheilhy/cmux"
 	"google.golang.org/grpc"
@@ -353,73 +351,40 @@ const liveStreamPollInterval = 500 * time.Millisecond
 
 // sendChangeEvent converts a TransactionRecord to ChangeEvent and sends it on the stream.
 // Handles both CDC (Change Data Capture) path with row data and DDL path with SQL statements.
-func (s *Server) sendChangeEvent(rec *db.TransactionRecord, stream MarmotService_StreamChangesServer) error {
-	// Parse statements from msgpack using protocol.Statement (the canonical type)
+// Reads CDC entries from MetaStore for the transaction and converts them to Statement objects.
+func (s *Server) sendChangeEvent(rec *db.TransactionRecord, metaStore db.MetaStore, stream MarmotService_StreamChangesServer) error {
+	// Build statements from CDC entries in MetaStore
 	var statements []*Statement
-	if len(rec.SerializedStatements) > 0 {
-		var protoStatements []protocol.Statement
-		if err := encoding.Unmarshal(rec.SerializedStatements, &protoStatements); err != nil {
-			return fmt.Errorf("failed to parse statements msgpack for txn %d: %w", rec.TxnID, err)
-		}
 
-		for _, ps := range protoStatements {
-			// Convert protocol.StatementCode to pb.StatementType at gRPC boundary
-			grpcType, ok := common.ToWireType(ps.Type)
-			if !ok {
-				return fmt.Errorf("unknown statement type %d in txn %d: cannot convert to wire format", ps.Type, rec.TxnID)
+	cursor, err := metaStore.IterateCapturedRows(rec.TxnID)
+	if err != nil {
+		log.Warn().Err(err).Uint64("txn_id", rec.TxnID).Msg("Failed to iterate captured rows for streaming")
+	} else {
+		defer cursor.Close()
+		for cursor.Next() {
+			_, data := cursor.Row()
+			row, err := db.DecodeRow(data)
+			if err != nil {
+				log.Warn().Err(err).Uint64("txn_id", rec.TxnID).Msg("Failed to decode captured row")
+				continue
 			}
+
+			// Convert OpType to wire StatementType
+			stmtCode := db.OpTypeToStatementType(db.OpType(row.Op))
+			wireType := common.MustToWireType(stmtCode)
 
 			stmt := &Statement{
-				Type:      grpcType,
-				TableName: ps.TableName,
-				Database:  ps.Database,
-			}
-
-			// For DML with CDC data, use RowChange payload
-			// For DDL or DML without CDC, use DdlChange payload with SQL
-			isDML := ps.Type == protocol.StatementInsert ||
-				ps.Type == protocol.StatementUpdate ||
-				ps.Type == protocol.StatementDelete ||
-				ps.Type == protocol.StatementReplace
-
-			if isDML && (len(ps.NewValues) > 0 || len(ps.OldValues) > 0) {
-				// CDC path: send row data
-				stmt.Payload = &Statement_RowChange{
+				Type:      wireType,
+				TableName: row.Table,
+				Database:  rec.DatabaseName,
+				Payload: &Statement_RowChange{
 					RowChange: &RowChange{
-						IntentKey: ps.IntentKey,
-						OldValues: ps.OldValues,
-						NewValues: ps.NewValues,
+						IntentKey: row.IntentKey,
+						OldValues: row.OldValues,
+						NewValues: row.NewValues,
 					},
-				}
-				if log.Debug().Enabled() {
-					log.Debug().
-						Uint64("txn_id", rec.TxnID).
-						Str("table", ps.TableName).
-						Str("intent_key", ps.IntentKey).
-						Int("new_values", len(ps.NewValues)).
-						Int("old_values", len(ps.OldValues)).
-						Msg("STREAM: Sending CDC data for anti-entropy")
-				}
-			} else {
-				// DDL or DML without CDC: send SQL
-				stmt.Payload = &Statement_DdlChange{
-					DdlChange: &DDLChange{
-						Sql: ps.SQL,
-					},
-				}
-				if log.Debug().Enabled() {
-					log.Debug().
-						Uint64("txn_id", rec.TxnID).
-						Str("sql_prefix", func() string {
-							if len(ps.SQL) > 50 {
-								return ps.SQL[:50]
-							}
-							return ps.SQL
-						}()).
-						Msg("STREAM: Sending SQL for anti-entropy")
-				}
+				},
 			}
-
 			statements = append(statements, stmt)
 		}
 	}
@@ -509,7 +474,7 @@ func (s *Server) streamHistoricalTransactions(
 		// Stream historical transactions
 		lastSentTxn[dbName] = fromTxnId
 		err = metaStore.StreamCommittedTransactions(fromTxnId, func(rec *db.TransactionRecord) error {
-			if err := s.sendChangeEvent(rec, stream); err != nil {
+			if err := s.sendChangeEvent(rec, metaStore, stream); err != nil {
 				return err
 			}
 			lastSentTxn[dbName] = rec.TxnID
@@ -561,7 +526,7 @@ func (s *Server) pollForNewTransactions(
 					if rec.TxnID <= fromTxn {
 						return nil
 					}
-					if err := s.sendChangeEvent(rec, stream); err != nil {
+					if err := s.sendChangeEvent(rec, metaStore, stream); err != nil {
 						return err
 					}
 					lastSentTxn[dbName] = rec.TxnID
@@ -774,43 +739,49 @@ func (s *Server) StreamSnapshot(req *SnapshotRequest, stream MarmotService_Strea
 			return fmt.Errorf("failed to open %s: %w", snap.Filename, err)
 		}
 
-		buf := make([]byte, SnapshotChunkSize)
-		for {
-			n, err := file.Read(buf)
-			if err == io.EOF {
-				break
+		// Use closure to ensure defer works per-iteration
+		err = func() error {
+			defer file.Close()
+
+			buf := make([]byte, SnapshotChunkSize)
+			for {
+				n, err := file.Read(buf)
+				if err == io.EOF {
+					break
+				}
+				if err != nil {
+					return fmt.Errorf("failed to read %s: %w", snap.Filename, err)
+				}
+
+				// Calculate checksum
+				checksum := fmt.Sprintf("%x", md5.Sum(buf[:n]))
+
+				// Check if this is the last chunk for this file
+				pos, _ := file.Seek(0, io.SeekCurrent)
+				info, _ := file.Stat()
+				isLastForFile := pos >= info.Size()
+
+				chunk := &SnapshotChunk{
+					ChunkIndex:    chunkIndex,
+					TotalChunks:   totalChunks,
+					Data:          buf[:n],
+					Checksum:      checksum,
+					Filename:      snap.Filename,
+					IsLastForFile: isLastForFile,
+				}
+
+				if err := stream.Send(chunk); err != nil {
+					return fmt.Errorf("failed to send chunk: %w", err)
+				}
+
+				chunkIndex++
 			}
-			if err != nil {
-				file.Close()
-				return fmt.Errorf("failed to read %s: %w", snap.Filename, err)
-			}
-
-			// Calculate checksum
-			checksum := fmt.Sprintf("%x", md5.Sum(buf[:n]))
-
-			// Check if this is the last chunk for this file
-			pos, _ := file.Seek(0, io.SeekCurrent)
-			info, _ := file.Stat()
-			isLastForFile := pos >= info.Size()
-
-			chunk := &SnapshotChunk{
-				ChunkIndex:    chunkIndex,
-				TotalChunks:   totalChunks,
-				Data:          buf[:n],
-				Checksum:      checksum,
-				Filename:      snap.Filename,
-				IsLastForFile: isLastForFile,
-			}
-
-			if err := stream.Send(chunk); err != nil {
-				file.Close()
-				return fmt.Errorf("failed to send chunk: %w", err)
-			}
-
-			chunkIndex++
+			return nil
+		}()
+		if err != nil {
+			return err
 		}
 
-		file.Close()
 		log.Debug().Str("file", snap.Filename).Msg("Finished streaming file")
 	}
 
@@ -953,6 +924,7 @@ func (s *Server) RunPromotionChecker(ctx context.Context, checkInterval time.Dur
 func (s *Server) checkPromotionCriteria() bool {
 	s.mu.RLock()
 	dbManager := s.dbManager
+	replicationHandler := s.replicationHandler
 	s.mu.RUnlock()
 
 	if dbManager == nil {
@@ -968,7 +940,71 @@ func (s *Server) checkPromotionCriteria() bool {
 
 	// Check that we have at least one database
 	localDatabases := dbManager.ListDatabases()
-	return len(localDatabases) > 0
+	if len(localDatabases) == 0 {
+		return false
+	}
+
+	// Verify schema versions match or exceed all ALIVE peers
+	// This prevents premature promotion before DDL replication completes
+	if replicationHandler == nil {
+		return false
+	}
+
+	localSchemaVersions, err := replicationHandler.GetAllSchemaVersions()
+	if err != nil {
+		log.Warn().Err(err).Msg("Failed to get local schema versions for promotion check")
+		return false
+	}
+
+	// Build a set of local database names for quick lookup
+	localDBSet := make(map[string]bool)
+	for _, dbName := range localDatabases {
+		localDBSet[dbName] = true
+	}
+
+	// Check each ALIVE peer's schema versions
+	for _, peer := range aliveNodes {
+		peerSchemaVersions := peer.DatabaseSchemaVersions
+		if peerSchemaVersions == nil {
+			continue
+		}
+
+		// For each database the peer has, check if our schema is at least as recent
+		for dbName, peerVersion := range peerSchemaVersions {
+			// Skip system database - it's not subject to DDL replication
+			if dbName == db.SystemDatabaseName {
+				continue
+			}
+
+			localVersion, hasSchemaEntry := localSchemaVersions[dbName]
+			hasLocalDB := localDBSet[dbName]
+
+			if !hasLocalDB {
+				// Peer has a database we don't have yet - we'll get it via replication
+				// This is acceptable, continue checking
+				continue
+			}
+
+			// If we have the database locally but no schema version entry,
+			// treat it as version 0 (fresh database, no DDL applied yet)
+			if !hasSchemaEntry {
+				localVersion = 0
+			}
+
+			// If peer has higher schema version, we're behind on DDL
+			if localVersion < peerVersion {
+				log.Debug().
+					Str("database", dbName).
+					Uint64("local_version", localVersion).
+					Uint64("peer_version", peerVersion).
+					Uint64("peer_id", peer.NodeId).
+					Msg("Schema version behind peer, delaying promotion")
+				return false
+			}
+		}
+	}
+
+	return true
 }
 
 // =======================

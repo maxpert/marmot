@@ -14,7 +14,7 @@ import (
 
 // Key prefixes for Pebble storage
 const (
-	prefixPubLog    = "/publog/"    // /publog/{16-digit-zero-padded-seq}
+	prefixPubLog    = "/publog/"    // /publog/{8-byte-binary-seq}
 	prefixPubCursor = "/pubcursor/" // /pubcursor/{sinkName}
 	prefixPubSeq    = "/pubseq"     // /pubseq -> uint64 (next sequence)
 )
@@ -187,9 +187,9 @@ func (pl *PublishLog) Append(events []CDCEvent) error {
 			return fmt.Errorf("failed to marshal event: %w", err)
 		}
 
-		// Key: /publog/{16-digit-zero-padded-seq}
+		// Key: /publog/{8-byte-binary-seq}
 		key := formatPubLogKey(localSeq)
-		if err := batch.Set([]byte(key), val, pebble.Sync); err != nil {
+		if err := batch.Set(key, val, pebble.Sync); err != nil {
 			return fmt.Errorf("failed to write event: %w", err)
 		}
 	}
@@ -227,7 +227,7 @@ func (pl *PublishLog) ReadFrom(cursor uint64, limit int) ([]CDCEvent, error) {
 	prefix := []byte(prefixPubLog)
 
 	iter, err := pl.db.NewIter(&pebble.IterOptions{
-		LowerBound: []byte(startKey),
+		LowerBound: startKey,
 		UpperBound: prefixUpperBound(prefix),
 	})
 	if err != nil {
@@ -236,7 +236,7 @@ func (pl *PublishLog) ReadFrom(cursor uint64, limit int) ([]CDCEvent, error) {
 	defer iter.Close()
 
 	events := make([]CDCEvent, 0, limit)
-	for iter.SeekGE([]byte(startKey)); iter.Valid() && len(events) < limit; iter.Next() {
+	for iter.SeekGE(startKey); iter.Valid() && len(events) < limit; iter.Next() {
 		val, err := iter.ValueAndErr()
 		if err != nil {
 			return nil, err
@@ -367,7 +367,7 @@ func (pl *PublishLog) cleanup() {
 
 	// Delete all entries with seq < minCursor
 	startKey := []byte(prefixPubLog)
-	endKey := []byte(formatPubLogKey(minCursor))
+	endKey := formatPubLogKey(minCursor)
 
 	if err := pl.db.DeleteRange(startKey, endKey, pebble.Sync); err != nil {
 		log.Warn().Err(err).Uint64("min_cursor", minCursor).Msg("Failed to cleanup publish log")
@@ -401,9 +401,12 @@ func (pl *PublishLog) Close() error {
 	return nil
 }
 
-// formatPubLogKey formats a sequence number as a 16-digit zero-padded key
-func formatPubLogKey(seq uint64) string {
-	return fmt.Sprintf("%s%016x", prefixPubLog, seq)
+// formatPubLogKey formats a sequence number as binary key (prefix + 8 bytes)
+func formatPubLogKey(seq uint64) []byte {
+	key := make([]byte, len(prefixPubLog)+8)
+	copy(key, prefixPubLog)
+	binary.BigEndian.PutUint64(key[len(prefixPubLog):], seq)
+	return key
 }
 
 // prefixUpperBound returns the upper bound for a prefix scan

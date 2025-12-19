@@ -78,6 +78,14 @@ func (tdm *TestDatabaseManager) GetReplicatedDatabase(name string) (coordinator.
 	return tdm.db, nil
 }
 
+func (tdm *TestDatabaseManager) GetAutoIncrementColumn(database, table string) (string, error) {
+	schema, err := tdm.db.GetCachedTableSchema(table)
+	if err != nil {
+		return "", err
+	}
+	return schema.GetAutoIncrementCol(), nil
+}
+
 func TestMySQLServerIntegration(t *testing.T) {
 	// Setup temporary DB with MetaStore
 	tmpDir := t.TempDir()

@@ -2,16 +2,12 @@ package grpc
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"io"
-	"sort"
-	"strings"
 	"time"
 
 	"github.com/maxpert/marmot/cfg"
 	"github.com/maxpert/marmot/db"
-	"github.com/maxpert/marmot/encoding"
 	pb "github.com/maxpert/marmot/grpc/common"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/rs/zerolog/log"
@@ -342,8 +338,20 @@ func (ds *DeltaSyncClient) applyChangeEvent(ctx context.Context, event *ChangeEv
 	for _, stmt := range event.Statements {
 		// Check for CDC data (RowChange payload)
 		if rowChange := stmt.GetRowChange(); rowChange != nil && (len(rowChange.NewValues) > 0 || len(rowChange.OldValues) > 0) {
-			// CDC path: apply row data directly
-			if err := ds.applyCDCStatement(tx, database, stmt); err != nil {
+			// CDC path: apply row data directly using unified applier
+			schemaAdapter := &deltaSyncSchemaAdapter{dbMgr: ds.dbManager, dbName: database}
+			var err error
+			switch stmt.Type {
+			case pb.StatementType_INSERT, pb.StatementType_REPLACE:
+				err = db.ApplyCDCInsert(tx, stmt.TableName, rowChange.NewValues)
+			case pb.StatementType_UPDATE:
+				err = db.ApplyCDCUpdate(tx, schemaAdapter, stmt.TableName, rowChange.OldValues, rowChange.NewValues)
+			case pb.StatementType_DELETE:
+				err = db.ApplyCDCDelete(tx, schemaAdapter, stmt.TableName, rowChange.OldValues)
+			default:
+				err = fmt.Errorf("unsupported statement type for CDC: %v", stmt.Type)
+			}
+			if err != nil {
 				return fmt.Errorf("failed to apply CDC statement: %w", err)
 			}
 			log.Debug().
@@ -383,182 +391,22 @@ func (ds *DeltaSyncClient) applyChangeEvent(ctx context.Context, event *ChangeEv
 	return nil
 }
 
-// applyCDCStatement applies a CDC statement to the database
-func (ds *DeltaSyncClient) applyCDCStatement(tx *sql.Tx, database string, stmt *Statement) error {
-	rowChange := stmt.GetRowChange()
-	if rowChange == nil {
-		return fmt.Errorf("no row change data")
-	}
-
-	switch stmt.Type {
-	case pb.StatementType_INSERT, pb.StatementType_REPLACE:
-		return ds.applyCDCInsert(tx, stmt.TableName, rowChange.NewValues)
-	case pb.StatementType_UPDATE:
-		return ds.applyCDCUpdate(tx, database, stmt.TableName, rowChange.OldValues, rowChange.NewValues)
-	case pb.StatementType_DELETE:
-		return ds.applyCDCDelete(tx, database, stmt.TableName, rowChange.OldValues)
-	default:
-		return fmt.Errorf("unsupported statement type for CDC: %v", stmt.Type)
-	}
+// deltaSyncSchemaAdapter adapts DatabaseManager schema access to CDCSchemaProvider
+type deltaSyncSchemaAdapter struct {
+	dbMgr  *db.DatabaseManager
+	dbName string
 }
 
-// applyCDCInsert performs INSERT OR REPLACE using CDC row data
-func (ds *DeltaSyncClient) applyCDCInsert(tx *sql.Tx, tableName string, newValues map[string][]byte) error {
-	if len(newValues) == 0 {
-		return fmt.Errorf("no values to insert")
-	}
-
-	columns := make([]string, 0, len(newValues))
-	placeholders := make([]string, 0, len(newValues))
-	values := make([]interface{}, 0, len(newValues))
-
-	for col := range newValues {
-		columns = append(columns, col)
-		placeholders = append(placeholders, "?")
-
-		var value interface{}
-		if err := encoding.Unmarshal(newValues[col], &value); err != nil {
-			return fmt.Errorf("failed to deserialize value for column %s: %w", col, err)
-		}
-		values = append(values, value)
-	}
-
-	sqlStmt := fmt.Sprintf("INSERT OR REPLACE INTO %s (%s) VALUES (%s)",
-		tableName,
-		strings.Join(columns, ", "),
-		strings.Join(placeholders, ", "))
-
-	_, err := tx.Exec(sqlStmt, values...)
-	return err
-}
-
-// applyCDCUpdate performs UPDATE using CDC row data
-// Uses oldValues for WHERE clause (to find existing row) and newValues for SET clause
-func (ds *DeltaSyncClient) applyCDCUpdate(tx *sql.Tx, database, tableName string, oldValues, newValues map[string][]byte) error {
-	if len(newValues) == 0 {
-		return fmt.Errorf("no values to update")
-	}
-
-	// Get cached table schema - does NOT query SQLite
-	dbInstance, err := ds.dbManager.GetDatabase(database)
+func (a *deltaSyncSchemaAdapter) GetPrimaryKeys(tableName string) ([]string, error) {
+	dbInstance, err := a.dbMgr.GetDatabase(a.dbName)
 	if err != nil {
-		return fmt.Errorf("failed to get database %s: %w", database, err)
+		return nil, fmt.Errorf("database %s not found: %w", a.dbName, err)
 	}
 	schema, err := dbInstance.GetCachedTableSchema(tableName)
 	if err != nil {
-		return fmt.Errorf("failed to get cached schema for table %s: %w", tableName, err)
+		return nil, fmt.Errorf("schema not found for table %s: %w", tableName, err)
 	}
-
-	// Get primary keys directly from cached schema
-	primaryKeys := schema.PrimaryKeys
-
-	if len(primaryKeys) == 0 {
-		return fmt.Errorf("no primary key columns found for table %s", tableName)
-	}
-
-	// Build UPDATE statement with SET clause using newValues
-	// Sort columns for deterministic SQL generation
-	columns := make([]string, 0, len(newValues))
-	for col := range newValues {
-		columns = append(columns, col)
-	}
-	sort.Strings(columns)
-
-	setClauses := make([]string, 0, len(newValues))
-	values := make([]interface{}, 0, len(newValues)+len(primaryKeys))
-
-	for _, col := range columns {
-		valBytes := newValues[col]
-		setClauses = append(setClauses, fmt.Sprintf("%s = ?", col))
-
-		var value interface{}
-		if err := encoding.Unmarshal(valBytes, &value); err != nil {
-			return fmt.Errorf("failed to deserialize value for column %s: %w", col, err)
-		}
-		values = append(values, value)
-	}
-
-	// Build WHERE clause using primary key columns from oldValues
-	// This is critical for PK changes: we need the OLD PK to find the row
-	whereClauses := make([]string, 0, len(primaryKeys))
-
-	for _, pkCol := range primaryKeys {
-		// Use oldValues for WHERE clause if available, fallback to newValues
-		pkBytes, ok := oldValues[pkCol]
-		if !ok {
-			// Fallback to newValues if oldValues doesn't have PK (shouldn't happen for UPDATEs)
-			pkBytes, ok = newValues[pkCol]
-			if !ok {
-				return fmt.Errorf("primary key column %s not found in CDC data", pkCol)
-			}
-		}
-
-		whereClauses = append(whereClauses, fmt.Sprintf("%s = ?", pkCol))
-
-		var value interface{}
-		if err := encoding.Unmarshal(pkBytes, &value); err != nil {
-			return fmt.Errorf("failed to deserialize PK value for column %s: %w", pkCol, err)
-		}
-		values = append(values, value)
-	}
-
-	sqlStmt := fmt.Sprintf("UPDATE %s SET %s WHERE %s",
-		tableName,
-		strings.Join(setClauses, ", "),
-		strings.Join(whereClauses, " AND "))
-
-	_, err = tx.Exec(sqlStmt, values...)
-	return err
-}
-
-// applyCDCDelete performs DELETE using CDC row data
-func (ds *DeltaSyncClient) applyCDCDelete(tx *sql.Tx, database string, tableName string, oldValues map[string][]byte) error {
-	if len(oldValues) == 0 {
-		return fmt.Errorf("empty old values for delete")
-	}
-
-	// Get cached table schema - does NOT query SQLite
-	dbInstance, err := ds.dbManager.GetDatabase(database)
-	if err != nil {
-		return fmt.Errorf("failed to get database %s: %w", database, err)
-	}
-	schema, err := dbInstance.GetCachedTableSchema(tableName)
-	if err != nil {
-		return fmt.Errorf("failed to get cached schema for table %s: %w", tableName, err)
-	}
-
-	// Get primary keys directly from cached schema
-	primaryKeys := schema.PrimaryKeys
-
-	if len(primaryKeys) == 0 {
-		return fmt.Errorf("no primary key columns found for table %s", tableName)
-	}
-
-	// Build WHERE clause using primary key columns from oldValues
-	whereClauses := make([]string, 0, len(primaryKeys))
-	values := make([]interface{}, 0, len(primaryKeys))
-
-	for _, pkCol := range primaryKeys {
-		pkValue, ok := oldValues[pkCol]
-		if !ok {
-			return fmt.Errorf("primary key column %s not found in CDC old values", pkCol)
-		}
-
-		whereClauses = append(whereClauses, fmt.Sprintf("%s = ?", pkCol))
-
-		var value interface{}
-		if err := encoding.Unmarshal(pkValue, &value); err != nil {
-			return fmt.Errorf("failed to deserialize PK value for column %s: %w", pkCol, err)
-		}
-		values = append(values, value)
-	}
-
-	sqlStmt := fmt.Sprintf("DELETE FROM %s WHERE %s",
-		tableName,
-		strings.Join(whereClauses, " AND "))
-
-	_, err = tx.Exec(sqlStmt, values...)
-	return err
+	return schema.PrimaryKeys, nil
 }
 
 // GetPeerReplicationLag queries a peer to get its current replication state

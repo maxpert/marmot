@@ -578,7 +578,6 @@ type TransactionRecord struct {
     CommitTSWall         int64
     CommitTSLogical      int32
     LastHeartbeat        int64       // Stale detection
-    SerializedStatements []byte      // Msgpack for anti-entropy
     DatabaseName         string
 }
 ```

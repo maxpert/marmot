@@ -49,6 +49,64 @@ func TestStatementTypeToOpType(t *testing.T) {
 	}
 }
 
+// TestOpTypeToStatementType verifies the reverse mapping from OpType to protocol.StatementCode.
+func TestOpTypeToStatementType(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    OpType
+		expected protocol.StatementCode
+	}{
+		{"OpTypeInsert maps to StatementInsert", OpTypeInsert, protocol.StatementInsert},
+		{"OpTypeReplace maps to StatementReplace", OpTypeReplace, protocol.StatementReplace},
+		{"OpTypeUpdate maps to StatementUpdate", OpTypeUpdate, protocol.StatementUpdate},
+		{"OpTypeDelete maps to StatementDelete", OpTypeDelete, protocol.StatementDelete},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := OpTypeToStatementType(tt.input)
+			if got != tt.expected {
+				t.Errorf("OpTypeToStatementType(%v) = %v, want %v", tt.input, got, tt.expected)
+			}
+		})
+	}
+}
+
+// TestOpTypeToStatementTypePanicsOnUnsupported verifies that non-DML op types panic.
+func TestOpTypeToStatementTypePanicsOnUnsupported(t *testing.T) {
+	unsupportedTypes := []OpType{OpTypeDelta, OpType(99)}
+
+	for _, opType := range unsupportedTypes {
+		opType := opType
+		t.Run(fmt.Sprintf("OpType_%d", opType), func(t *testing.T) {
+			defer func() {
+				if r := recover(); r == nil {
+					t.Errorf("OpTypeToStatementType(%d) should panic but didn't", opType)
+				}
+			}()
+			OpTypeToStatementType(opType)
+		})
+	}
+}
+
+// TestRoundTripConversion verifies bidirectional conversion consistency.
+func TestRoundTripConversion(t *testing.T) {
+	dmlTypes := []protocol.StatementCode{
+		protocol.StatementInsert,
+		protocol.StatementReplace,
+		protocol.StatementUpdate,
+		protocol.StatementDelete,
+	}
+
+	for _, stmtType := range dmlTypes {
+		opType := StatementTypeToOpType(stmtType)
+		roundTrip := OpTypeToStatementType(opType)
+		if roundTrip != stmtType {
+			t.Errorf("Round trip failed: %v -> %v -> %v", stmtType, opType, roundTrip)
+		}
+	}
+}
+
 // TestStatementTypeToOpTypePanicsOnUnsupported verifies that non-DML statement types panic.
 func TestStatementTypeToOpTypePanicsOnUnsupported(t *testing.T) {
 	unsupportedTypes := []protocol.StatementCode{

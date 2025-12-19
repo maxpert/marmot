@@ -3,6 +3,7 @@ package coordinator
 import (
 	"testing"
 
+	"github.com/maxpert/marmot/common"
 	"github.com/maxpert/marmot/protocol"
 )
 
@@ -10,9 +11,9 @@ import (
 // with different intent keys produce multiple statements (NOT collapsed into one)
 func TestHandlerCDCPipeline_MultipleRows(t *testing.T) {
 	// Create 100 CDC entries for different rows
-	entries := make([]CDCEntry, 100)
+	entries := make([]common.CDCEntry, 100)
 	for i := 0; i < 100; i++ {
-		entries[i] = CDCEntry{
+		entries[i] = common.CDCEntry{
 			Table:     "wp_posts",
 			IntentKey: string(rune('A' + (i % 26))), // A-Z cycling
 			OldValues: nil,
@@ -55,7 +56,7 @@ func TestHandlerCDCPipeline_MultipleRows(t *testing.T) {
 // on the same row are correctly merged
 func TestHandlerCDCPipeline_SameRowMerges(t *testing.T) {
 	// Create CDC entries: DELETE row1, INSERT row1 (UPSERT pattern)
-	entries := []CDCEntry{
+	entries := []common.CDCEntry{
 		{
 			Table:     "users",
 			IntentKey: "1",
@@ -120,7 +121,7 @@ func TestHandlerCDCPipeline_SameRowMerges(t *testing.T) {
 // TestHandlerCDCPipeline_InsertDeleteCancelsOut verifies that
 // INSERT followed by DELETE on the same row cancels out
 func TestHandlerCDCPipeline_InsertDeleteCancelsOut(t *testing.T) {
-	entries := []CDCEntry{
+	entries := []common.CDCEntry{
 		{
 			Table:     "temp_table",
 			IntentKey: "99",
@@ -160,7 +161,7 @@ func TestHandlerCDCPipeline_InsertDeleteCancelsOut(t *testing.T) {
 // TestHandlerCDCPipeline_EmptyEntries verifies empty input produces empty output
 func TestHandlerCDCPipeline_EmptyEntries(t *testing.T) {
 	config := DefaultCDCPipelineConfig()
-	result, err := ProcessCDCEntries([]CDCEntry{}, config)
+	result, err := ProcessCDCEntries([]common.CDCEntry{}, config)
 
 	if err != nil {
 		t.Fatalf("Empty entries should not error: %v", err)
@@ -173,7 +174,7 @@ func TestHandlerCDCPipeline_EmptyEntries(t *testing.T) {
 
 // TestHandlerCDCPipeline_MixedOperations tests a realistic mix of operations
 func TestHandlerCDCPipeline_MixedOperations(t *testing.T) {
-	entries := []CDCEntry{
+	entries := []common.CDCEntry{
 		// Row 1: Simple INSERT
 		{
 			Table:     "products",

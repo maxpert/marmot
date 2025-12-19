@@ -75,11 +75,11 @@ type TransactionConfiguration struct {
 
 // MetaStoreConfiguration controls PebbleDB metadata storage
 type MetaStoreConfiguration struct {
-	CacheSizeMB           int64 `toml:"cache_size_mb"`           // Block cache size in MB (default: 64)
-	MemTableSizeMB        int64 `toml:"memtable_size_mb"`        // MemTable size in MB (default: 32)
+	CacheSizeMB           int64 `toml:"cache_size_mb"`           // Block cache size in MB (default: 128)
+	MemTableSizeMB        int64 `toml:"memtable_size_mb"`        // MemTable size in MB (default: 64)
 	MemTableCount         int   `toml:"memtable_count"`          // Number of MemTables (default: 2)
-	L0CompactionThreshold int   `toml:"l0_compaction_threshold"` // L0 compaction trigger (default: 4)
-	L0StopWrites          int   `toml:"l0_stop_writes"`          // L0 stop writes trigger (default: 12)
+	L0CompactionThreshold int   `toml:"l0_compaction_threshold"` // L0 compaction trigger (default: 500)
+	L0StopWrites          int   `toml:"l0_stop_writes"`          // L0 stop writes trigger (default: 1000)
 	WALBytesPerSyncKB     int   `toml:"wal_bytes_per_sync_kb"`   // Background WAL sync every N KB (default: 512, 0=disabled)
 }
 
@@ -507,7 +507,6 @@ func Validate() error {
 	if Config.MetaStore.WALBytesPerSyncKB == 0 {
 		Config.MetaStore.WALBytesPerSyncKB = 512 // 512KB like CockroachDB
 	}
-	// WALMinSyncIntervalMS=0 is valid (no delay)
 
 	// Validate connection pool configuration
 	if Config.ConnectionPool.PoolSize < 1 {

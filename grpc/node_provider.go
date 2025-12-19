@@ -17,8 +17,7 @@ func NewGossipNodeProvider(registry *NodeRegistry) coordinator.NodeProvider {
 	}
 }
 
-// GetAliveNodes returns all nodes eligible for replication (ALIVE only, excludes JOINING)
-// JOINING nodes are catching up and should not receive write replication yet
+// GetAliveNodes returns all ALIVE nodes for replication
 func (gnp *GossipNodeProvider) GetAliveNodes() ([]uint64, error) {
 	allNodes := gnp.registry.GetReplicationEligible()
 	nodeIDs := make([]uint64, 0, len(allNodes))

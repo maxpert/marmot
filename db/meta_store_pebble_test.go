@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/maxpert/marmot/encoding"
 	"github.com/maxpert/marmot/hlc"
 )
 
@@ -67,7 +66,7 @@ func TestPebbleMetaStoreTransactionLifecycle(t *testing.T) {
 
 	// Commit transaction
 	commitTS := clock.Now()
-	err = store.CommitTransaction(txnID, commitTS, []byte(`[{"sql":"INSERT INTO t VALUES(1)"}]`), "testdb", "t", 0)
+	err = store.CommitTransaction(txnID, commitTS, []byte(`[{"sql":"INSERT INTO t VALUES(1)"}]`), "testdb", "t", 0, 1)
 	if err != nil {
 		t.Fatalf("CommitTransaction failed: %v", err)
 	}
@@ -246,8 +245,8 @@ func TestPebbleMetaStoreCDCIntentEntries(t *testing.T) {
 	txnID := uint64(12345)
 
 	// Write CDC entries - the correct format is map[string][]byte
-	oldVals, _ := encoding.Marshal(map[string][]byte{"id": {0, 0, 0, 1}, "name": []byte("alice")})
-	newVals, _ := encoding.Marshal(map[string][]byte{"id": {0, 0, 0, 1}, "name": []byte("bob")})
+	oldVals := map[string][]byte{"id": {0, 0, 0, 1}, "name": []byte("alice")}
+	newVals := map[string][]byte{"id": {0, 0, 0, 1}, "name": []byte("bob")}
 
 	err := store.WriteIntentEntry(txnID, 1, 1, "users", "user:1", oldVals, newVals)
 	if err != nil {
@@ -334,7 +333,7 @@ func TestPebbleMetaStoreCommitCounters(t *testing.T) {
 
 	// Begin and commit
 	store.BeginTransaction(txnID, 1, startTS)
-	store.CommitTransaction(txnID, clock.Now(), nil, "testdb", "", 0)
+	store.CommitTransaction(txnID, clock.Now(), nil, "testdb", "", 0, 0)
 
 	// Count should increase
 	count, _ = store.GetCommittedTxnCount()
@@ -346,18 +345,6 @@ func TestPebbleMetaStoreCommitCounters(t *testing.T) {
 	if maxTxnID != txnID {
 		t.Errorf("Expected max txn_id %d, got %d", txnID, maxTxnID)
 	}
-}
-
-func TestPebbleMetaStoreIsBusy(t *testing.T) {
-	store, cleanup := createTestPebbleMetaStore(t)
-	defer cleanup()
-
-	// Initially not busy
-	if store.IsBusy() {
-		t.Error("Store should not be busy initially")
-	}
-
-	// Close will be called by cleanup - no need to test after close
 }
 
 func TestPebbleMetaStoreSchemaVersion(t *testing.T) {
@@ -478,7 +465,7 @@ func TestPebbleMetaStoreStoreReplayedTransaction(t *testing.T) {
 	nodeID := uint64(2)
 
 	// Store a replayed transaction (no prior BeginTransaction)
-	err := store.StoreReplayedTransaction(txnID, nodeID, commitTS, []byte(`[{"sql":"INSERT"}]`), "testdb")
+	err := store.StoreReplayedTransaction(txnID, nodeID, commitTS, "testdb", 1)
 	if err != nil {
 		t.Fatalf("StoreReplayedTransaction failed: %v", err)
 	}
@@ -513,7 +500,7 @@ func TestPebbleMetaStoreStreamCommittedTransactions(t *testing.T) {
 		txnIDs = append(txnIDs, txnID)
 
 		store.BeginTransaction(txnID, 1, startTS)
-		store.CommitTransaction(txnID, clock.Now(), nil, "testdb", "", 0)
+		store.CommitTransaction(txnID, clock.Now(), nil, "testdb", "", 0, 0)
 	}
 
 	// Stream all (from 0)

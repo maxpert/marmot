@@ -10,6 +10,7 @@ import (
 
 	"github.com/maxpert/marmot/admin"
 	"github.com/maxpert/marmot/cfg"
+	"github.com/maxpert/marmot/common"
 	"github.com/maxpert/marmot/coordinator"
 	"github.com/maxpert/marmot/db"
 	marmotgrpc "github.com/maxpert/marmot/grpc"
@@ -33,18 +34,8 @@ type publisherAdapter struct {
 	registry *publisher.Registry
 }
 
-func (p *publisherAdapter) AppendGeneric(txnID uint64, database string, entries []coordinator.GenericCDCEntry, commitTSNanos int64, nodeID uint64) error {
-	// Convert coordinator.GenericCDCEntry to publisher.GenericCDCEntry
-	pubEntries := make([]publisher.GenericCDCEntry, len(entries))
-	for i, e := range entries {
-		pubEntries[i] = publisher.GenericCDCEntry{
-			Table:     e.Table,
-			IntentKey: e.IntentKey,
-			OldValues: e.OldValues,
-			NewValues: e.NewValues,
-		}
-	}
-	return p.registry.AppendGeneric(txnID, database, pubEntries, commitTSNanos, nodeID)
+func (p *publisherAdapter) AppendCDC(txnID uint64, database string, entries []common.CDCEntry, commitTSNanos int64, nodeID uint64) error {
+	return p.registry.AppendCDC(txnID, database, entries, commitTSNanos, nodeID)
 }
 
 func main() {
@@ -316,6 +307,7 @@ func main() {
 		deltaSync,
 		clock,
 		snapshotFunc,
+		schemaVersionMgr,
 	)
 
 	// Start anti-entropy service

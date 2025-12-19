@@ -151,3 +151,20 @@ func StatementTypeToOpType(stmtType protocol.StatementCode) OpType {
 		panic(fmt.Sprintf("StatementTypeToOpType: unsupported statement type %d (only DML types are supported)", stmtType))
 	}
 }
+
+// OpTypeToStatementType converts OpType to protocol.StatementCode.
+// Panics on unknown/unsupported op type - only DML operations have statement types.
+func OpTypeToStatementType(op OpType) protocol.StatementCode {
+	switch op {
+	case OpTypeInsert:
+		return protocol.StatementInsert
+	case OpTypeReplace:
+		return protocol.StatementReplace
+	case OpTypeUpdate:
+		return protocol.StatementUpdate
+	case OpTypeDelete:
+		return protocol.StatementDelete
+	default:
+		panic(fmt.Sprintf("OpTypeToStatementType: unsupported op type %d (only DML types are supported)", op))
+	}
+}
