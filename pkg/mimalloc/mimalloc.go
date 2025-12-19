@@ -7,6 +7,7 @@ package mimalloc
 
 /*
 #cgo CFLAGS: -I${SRCDIR}/c/include -I${SRCDIR}/c/src -DMI_MALLOC_OVERRIDE=0
+#cgo arm LDFLAGS: -latomic
 #include "c/src/static.c"
 */
 import "C"
