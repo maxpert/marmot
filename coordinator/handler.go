@@ -424,30 +424,17 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, params []in
 			}
 			rowsAffected = pendingExec.GetTotalRowCount()
 
-			// Transfer hook-captured CDC data to statements for replication
-			// Hooks capture actual row data; AST parsing can't handle parameterized queries
+			// Convert CDC entries directly to statements for replication
 			cdcEntries := pendingExec.GetCDCEntries()
 			if len(cdcEntries) > 0 {
-				// Process through CDC pipeline - produces N statements for N unique rows
-				config := DefaultCDCPipelineConfig()
-				result, err := ProcessCDCEntries(cdcEntries, config)
-				if err != nil {
-					if cancelHookCtx != nil {
-						cancelHookCtx()
-					}
-					telemetry.QueriesTotal.With("dml", "failed").Inc()
-					telemetry.QueryDurationSeconds.With("dml").Observe(time.Since(queryStart).Seconds())
-					return nil, fmt.Errorf("CDC pipeline failed: %w", err)
+				statements = make([]protocol.Statement, len(cdcEntries))
+				for i, entry := range cdcEntries {
+					statements[i] = ConvertToStatement(entry)
 				}
-
-				// Replace single statement with expanded statements from CDC
-				if len(result.Statements) > 0 {
-					// Keep original SQL in first statement for debugging
-					result.Statements[0].SQL = stmt.SQL
-					result.Statements[0].Type = stmt.Type
-					result.Statements[0].Database = stmt.Database
-					statements = result.Statements
-				}
+				// Keep original SQL in first statement for debugging
+				statements[0].SQL = stmt.SQL
+				statements[0].Type = stmt.Type
+				statements[0].Database = stmt.Database
 			}
 		}
 	}
@@ -895,23 +882,12 @@ func (h *CoordinatorHandler) handleCommit(session *protocol.ConnectionSession) (
 
 			totalRowsAffected += pendingExec.GetTotalRowCount()
 
-			// Extract CDC data and process through pipeline
+			// Convert CDC entries directly to statements
 			cdcEntries := pendingExec.GetCDCEntries()
 			if len(cdcEntries) > 0 {
-				// Collect CDC entries for publishing
 				allCDCEntries = append(allCDCEntries, cdcEntries...)
-
-				// Process through CDC pipeline
-				config := DefaultCDCPipelineConfig()
-				result, err := ProcessCDCEntries(cdcEntries, config)
-				if err != nil {
-					session.EndTransaction()
-					h.recentTxnIDs.Delete(txnState.TxnID)
-					return nil, fmt.Errorf("CDC pipeline failed: %w", err)
-				}
-
-				// Add processed statements (multiple rows become multiple statements)
-				for _, cdcStmt := range result.Statements {
+				for _, entry := range cdcEntries {
+					cdcStmt := ConvertToStatement(entry)
 					cdcStmt.SQL = stmt.SQL
 					cdcStmt.Type = stmt.Type
 					cdcStmt.Database = stmt.Database
