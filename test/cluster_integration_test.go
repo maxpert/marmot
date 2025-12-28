@@ -380,6 +380,8 @@ func startNode(t *testing.T, node *testNode, seedNodes []string) {
 
 	mysqlServer := protocol.NewMySQLServer(
 		fmt.Sprintf("127.0.0.1:%d", node.mysqlPort),
+		"",
+		0,
 		handler,
 	)
 	require.NoError(t, mysqlServer.Start(), "Failed to start MySQL server for node %d", node.nodeID)

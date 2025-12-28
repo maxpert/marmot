@@ -51,7 +51,9 @@ type MySQLConfiguration struct {
 	BindAddress    string `toml:"bind_address"`
 	Port           int    `toml:"port"`
 	MaxConnections int    `toml:"max_connections"`
-	AutoIDMode     string `toml:"auto_id_mode"` // "compact" (default, 53-bit) or "extended" (64-bit)
+	AutoIDMode     string `toml:"auto_id_mode"`     // "compact" (default, 53-bit) or "extended" (64-bit)
+	UnixSocket     string `toml:"unix_socket"`      // Path to Unix socket (empty = disabled)
+	UnixSocketPerm int    `toml:"unix_socket_perm"` // Permissions, default 0660
 }
 
 // LoggingConfiguration controls logging behavior
@@ -272,6 +274,7 @@ var Config = &Configuration{
 		Port:           3306,
 		MaxConnections: 1000,
 		AutoIDMode:     "compact", // Default to compact 53-bit IDs
+		UnixSocketPerm: 0660,
 	},
 
 	Logging: LoggingConfiguration{

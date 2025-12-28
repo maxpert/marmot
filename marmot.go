@@ -396,8 +396,14 @@ func main() {
 	}
 
 	// Create and start MySQL server
+	var unixSocketPerm os.FileMode = 0660
+	if cfg.Config.MySQL.UnixSocketPerm != 0 {
+		unixSocketPerm = os.FileMode(cfg.Config.MySQL.UnixSocketPerm)
+	}
 	mysqlServer := protocol.NewMySQLServer(
 		fmt.Sprintf("%s:%d", cfg.Config.MySQL.BindAddress, cfg.Config.MySQL.Port),
+		cfg.Config.MySQL.UnixSocket,
+		unixSocketPerm,
 		handler,
 	)
 

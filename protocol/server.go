@@ -7,6 +7,7 @@ import (
 	"io"
 	"math"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 
@@ -36,13 +37,15 @@ func putBuffer(buf *bytes.Buffer) {
 
 // MySQLServer implements a basic MySQL protocol server
 type MySQLServer struct {
-	address    string
-	listener   net.Listener
-	quit       chan struct{}
-	wg         sync.WaitGroup
-	handler    ConnectionHandler
-	connIDGen  uint64
-	connIDLock sync.Mutex
+	tcpAddress     string
+	unixSocket     string
+	unixSocketPerm os.FileMode
+	listeners      []net.Listener
+	quit           chan struct{}
+	wg             sync.WaitGroup
+	handler        ConnectionHandler
+	connIDGen      uint64
+	connIDLock     sync.Mutex
 }
 
 // SessionTransaction holds transaction state for explicit BEGIN/COMMIT
@@ -149,26 +152,59 @@ type ColumnDef struct {
 }
 
 // NewMySQLServer creates a new MySQL server
-func NewMySQLServer(address string, handler ConnectionHandler) *MySQLServer {
+func NewMySQLServer(tcpAddress, unixSocket string, unixSocketPerm os.FileMode, handler ConnectionHandler) *MySQLServer {
 	return &MySQLServer{
-		address: address,
-		quit:    make(chan struct{}),
-		handler: handler,
+		tcpAddress:     tcpAddress,
+		unixSocket:     unixSocket,
+		unixSocketPerm: unixSocketPerm,
+		quit:           make(chan struct{}),
+		handler:        handler,
 	}
 }
 
 // Start starts the MySQL server
 func (s *MySQLServer) Start() error {
-	listener, err := net.Listen("tcp", s.address)
+	// Create TCP listener (always)
+	tcpListener, err := net.Listen("tcp", s.tcpAddress)
 	if err != nil {
 		return err
 	}
-	s.listener = listener
+	s.listeners = append(s.listeners, tcpListener)
+	log.Info().Str("address", s.tcpAddress).Msg("MySQL server TCP listener started")
 
-	log.Info().Str("address", s.address).Msg("MySQL server started")
+	// Create Unix socket listener if configured
+	if s.unixSocket != "" {
+		// Remove stale socket file if it exists
+		if err := os.Remove(s.unixSocket); err != nil && !os.IsNotExist(err) {
+			tcpListener.Close()
+			return fmt.Errorf("failed to remove stale socket file: %w", err)
+		}
 
-	s.wg.Add(1)
-	go s.acceptLoop()
+		unixListener, err := net.Listen("unix", s.unixSocket)
+		if err != nil {
+			tcpListener.Close()
+			return fmt.Errorf("failed to create unix socket listener: %w", err)
+		}
+
+		// Set permissions on socket file
+		if err := os.Chmod(s.unixSocket, s.unixSocketPerm); err != nil {
+			tcpListener.Close()
+			unixListener.Close()
+			return fmt.Errorf("failed to set socket permissions: %w", err)
+		}
+
+		s.listeners = append(s.listeners, unixListener)
+		log.Info().
+			Str("socket", s.unixSocket).
+			Str("permissions", fmt.Sprintf("%04o", s.unixSocketPerm)).
+			Msg("MySQL server Unix socket listener started")
+	}
+
+	// Start accept loop for each listener
+	for _, listener := range s.listeners {
+		s.wg.Add(1)
+		go s.acceptLoop(listener)
+	}
 
 	return nil
 }
@@ -176,10 +212,19 @@ func (s *MySQLServer) Start() error {
 // Stop stops the MySQL server
 func (s *MySQLServer) Stop() {
 	close(s.quit)
-	if s.listener != nil {
-		s.listener.Close()
+	for _, listener := range s.listeners {
+		if listener != nil {
+			listener.Close()
+		}
 	}
 	s.wg.Wait()
+
+	// Cleanup Unix socket file if configured
+	if s.unixSocket != "" {
+		if err := os.Remove(s.unixSocket); err != nil && !os.IsNotExist(err) {
+			log.Warn().Err(err).Str("socket", s.unixSocket).Msg("Failed to remove Unix socket file")
+		}
+	}
 }
 
 // nextConnID generates a unique connection ID
@@ -190,11 +235,11 @@ func (s *MySQLServer) nextConnID() uint64 {
 	return s.connIDGen
 }
 
-func (s *MySQLServer) acceptLoop() {
+func (s *MySQLServer) acceptLoop(listener net.Listener) {
 	defer s.wg.Done()
 
 	for {
-		conn, err := s.listener.Accept()
+		conn, err := listener.Accept()
 		if err != nil {
 			select {
 			case <-s.quit:

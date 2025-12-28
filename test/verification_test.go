@@ -119,7 +119,7 @@ func TestMySQLServerIntegration(t *testing.T) {
 
 	// Setup Server
 	port := 3307 // Use non-standard port
-	server := protocol.NewMySQLServer(fmt.Sprintf("127.0.0.1:%d", port), handler)
+	server := protocol.NewMySQLServer(fmt.Sprintf("127.0.0.1:%d", port), "", 0, handler)
 
 	err = server.Start()
 	require.NoError(t, err)
