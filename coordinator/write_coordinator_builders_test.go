@@ -294,7 +294,7 @@ func TestBuildCommitRequest_PhaseIsAlwaysCommit(t *testing.T) {
 	}
 }
 
-func TestBuildCommitRequest_StatementsIncluded(t *testing.T) {
+func TestBuildCommitRequest_StatementsExcluded(t *testing.T) {
 	wc := createTestCoordinator(1)
 	stmts := CreateCDCStatements(5, "users")
 	txn := NewTxnBuilder().
@@ -303,14 +303,9 @@ func TestBuildCommitRequest_StatementsIncluded(t *testing.T) {
 
 	req := wc.buildCommitRequest(txn)
 
-	if len(req.Statements) != 5 {
-		t.Errorf("expected 5 statements, got %d", len(req.Statements))
-	}
-
-	for i := 0; i < 5; i++ {
-		if req.Statements[i].TableName != "users" {
-			t.Errorf("statement %d: TableName got %s, want users", i, req.Statements[i].TableName)
-		}
+	// Statements should be nil or empty in commit request (payload reduction optimization)
+	if len(req.Statements) != 0 {
+		t.Errorf("expected 0 statements in commit request, got %d", len(req.Statements))
 	}
 }
 

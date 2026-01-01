@@ -46,6 +46,7 @@ type CommitRequest struct {
 type CommitResult struct {
 	Success bool
 	Error   string
+	DDLSQL  string // SQL for DDL statements (if any)
 }
 
 // AbortRequest contains parameters for the abort phase
@@ -391,7 +392,19 @@ func (re *ReplicationEngine) Commit(ctx context.Context, req *CommitRequest) *Co
 		return &CommitResult{Success: false, Error: err.Error()}
 	}
 
-	return &CommitResult{Success: true}
+	// Extract DDL SQL from committed statements (populated during CommitTransaction)
+	var ddlSQL string
+	for _, stmt := range txn.Statements {
+		if stmt.Type == protocol.StatementDDL {
+			ddlSQL = stmt.SQL
+			break
+		}
+	}
+
+	return &CommitResult{
+		Success: true,
+		DDLSQL:  ddlSQL,
+	}
 }
 
 // Abort handles the abort phase of 2PC replication

@@ -194,7 +194,7 @@ func (wc *WriteCoordinator) buildCommitRequest(txn *Transaction) *ReplicationReq
 		StartTS:    txn.StartTS,
 		NodeID:     wc.nodeID,
 		Database:   txn.Database,
-		Statements: txn.Statements, // Include statements for schema version tracking
+		Statements: nil, // Statements are already persisted in intents, not needed for commit
 	}
 }
 

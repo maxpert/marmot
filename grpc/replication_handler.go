@@ -139,23 +139,6 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 
 // handleCommit processes Phase 2 of 2PC: Commit transaction
 func (rh *ReplicationHandler) handleCommit(ctx context.Context, req *TransactionRequest) (*TransactionResponse, error) {
-	// Check if this transaction contains DDL statements BEFORE committing
-	// (transaction is removed from memory after commit, so we can't check afterwards)
-	hasDDL := false
-	var ddlSQL string
-	if rh.schemaVersionMgr != nil && req.Database != "" && len(req.Statements) > 0 {
-		for _, stmt := range req.Statements {
-			stmtType := common.MustFromWireType(stmt.Type)
-			if stmtType == protocol.StatementDDL {
-				hasDDL = true
-				if ddl := stmt.GetDdlChange(); ddl != nil {
-					ddlSQL = ddl.Sql
-				}
-				break
-			}
-		}
-	}
-
 	engineReq := &db.CommitRequest{
 		TxnID:    req.TxnId,
 		Database: req.Database,
@@ -172,8 +155,9 @@ func (rh *ReplicationHandler) handleCommit(ctx context.Context, req *Transaction
 	}
 
 	// Schema version increment for DDL transactions (MUST happen after successful commit)
-	if hasDDL && ddlSQL != "" {
-		_, verErr := rh.schemaVersionMgr.IncrementSchemaVersion(req.Database, ddlSQL, req.TxnId)
+	// DDL information is returned by the engine (extracted from committed intents)
+	if rh.schemaVersionMgr != nil && result.DDLSQL != "" {
+		_, verErr := rh.schemaVersionMgr.IncrementSchemaVersion(req.Database, result.DDLSQL, req.TxnId)
 		if verErr != nil {
 			log.Error().Err(verErr).Str("database", req.Database).Uint64("txn_id", req.TxnId).Msg("Failed to increment schema version after DDL replication")
 		}
