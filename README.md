@@ -355,18 +355,20 @@ Deploy Marmot as a lightweight regional replica alongside Lambda functions:
 
 ### Read-Only Regional Replicas
 
-Scale reads globally with replica mode:
+Scale reads globally with replica mode and transparent failover:
 
 ```toml
 [replica]
 enabled = true
-master_address = "central-cluster:8080"
-reconnect_interval_seconds = 5
+follow_addresses = ["central-cluster-1:8080", "central-cluster-2:8080", "central-cluster-3:8080"]
+discovery_interval_seconds = 30
+failover_timeout_seconds = 60
 ```
 
-- Follows master via streaming replication
+- Discovers cluster nodes automatically via `GetClusterNodes` RPC
+- Transparent failover when current source becomes unavailable
 - Zero cluster participation overhead
-- Auto-reconnect on network issues
+- Auto-reconnect with exponential backoff
 
 ### Hybrid: Edge Reads, Central Writes
 
@@ -747,16 +749,24 @@ See the [Operations documentation](https://maxpert.github.io/marmot/operations) 
 
 ### Replica Mode
 
-For read-only replicas that follow a master node without participating in the cluster:
+For read-only replicas that follow cluster nodes with transparent failover:
 
 ```toml
 [replica]
-enabled = true                       # Enable read-only replica mode
-master_address = "master:8080"       # Master node gRPC address
-reconnect_interval_seconds = 5       # Reconnect delay on disconnect
+enabled = true                           # Enable read-only replica mode
+follow_addresses = ["node1:8080", "node2:8080", "node3:8080"]  # Seed nodes for discovery
+secret = "replica-secret"                # PSK for authentication (required)
+discovery_interval_seconds = 30          # How often to poll for cluster membership
+failover_timeout_seconds = 60            # Max time to find alive node during failover
+reconnect_interval_seconds = 5           # Reconnect delay on disconnect
 ```
 
-**Note:** Replica mode is mutually exclusive with cluster mode. A replica receives all data via streaming replication but cannot accept writes.
+You can also specify follow addresses via CLI:
+```bash
+./marmot --config=replica.toml --follow-addresses=node1:8080,node2:8080,node3:8080
+```
+
+**Note:** Replica mode is mutually exclusive with cluster mode. A replica receives all data via streaming replication but cannot accept writes. It automatically discovers cluster nodes and fails over to another node if the current source becomes unavailable.
 
 ### Replication
 
