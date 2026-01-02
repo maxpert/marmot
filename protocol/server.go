@@ -418,8 +418,8 @@ func (s *MySQLServer) writeHandshake(w io.Writer) error {
 	// Lower 16 bits: 0xa209 = 0x0001 | 0x0008 | 0x0200 | 0x2000 | 0x8000
 	_ = binary.Write(buf, binary.LittleEndian, uint16(0xa209))
 
-	// Character set (utf8_general_ci = 33)
-	buf.WriteByte(33)
+	// Character set (utf8mb4_general_ci = 45, supports full 4-byte UTF-8 including emojis)
+	buf.WriteByte(45)
 
 	// Status flags
 	_ = binary.Write(buf, binary.LittleEndian, uint16(2))
@@ -504,7 +504,7 @@ func (s *MySQLServer) writeResultSet(w io.Writer, seq byte, rs *ResultSet) error
 		writeLenEncString(colBuf, col.Name) // Org Name
 
 		colBuf.WriteByte(0x0c)                                      // Length of fixed fields
-		_ = binary.Write(colBuf, binary.LittleEndian, uint16(33))   // Charset
+		_ = binary.Write(colBuf, binary.LittleEndian, uint16(45))   // Charset (utf8mb4_general_ci)
 		_ = binary.Write(colBuf, binary.LittleEndian, uint32(1024)) // Length
 		colBuf.WriteByte(col.Type)                                  // Type
 		_ = binary.Write(colBuf, binary.LittleEndian, uint16(0))    // Flags
@@ -569,7 +569,7 @@ func (s *MySQLServer) writeBinaryResultSet(w io.Writer, seq byte, rs *ResultSet)
 		writeLenEncString(colBuf, col.Name) // Org Name
 
 		colBuf.WriteByte(0x0c)                                      // Length of fixed fields
-		_ = binary.Write(colBuf, binary.LittleEndian, uint16(33))   // Charset
+		_ = binary.Write(colBuf, binary.LittleEndian, uint16(45))   // Charset (utf8mb4_general_ci)
 		_ = binary.Write(colBuf, binary.LittleEndian, uint32(1024)) // Length
 		colBuf.WriteByte(col.Type)                                  // Type
 		_ = binary.Write(colBuf, binary.LittleEndian, uint16(0))    // Flags

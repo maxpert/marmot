@@ -1,0 +1,16 @@
+{
+  "name": "marmot-correctness-test",
+  "version": "1.0.0",
+  "description": "Correctness verification tests for Marmot distributed SQLite",
+  "scripts": {
+    "collect": "bun run collect-bluesky-posts.ts",
+    "test": "bun run correctness-test.ts",
+    "test:load": "bun run correctness-test.ts --load"
+  },
+  "dependencies": {
+    "mysql2": "^3.11.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  }
+}

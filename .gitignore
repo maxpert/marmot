@@ -31,6 +31,10 @@ node_modules/
 npm-debug.log
 yarn-error.log
 yarn-debug.log
+bun.lockb
+
+# Correctness test data
+examples/correctness-test/bluesky-posts.json
 
 CLAUDE.md
 AGENTS.md
