@@ -11,11 +11,49 @@ Marmot v2 is a leaderless, distributed SQLite replication system built on a goss
 **Key Features:**
 - **Leaderless Architecture**: No single point of failure - any node can accept writes
 - **MySQL Protocol Compatible**: Connect with any MySQL client (DBeaver, MySQL Workbench, mysql CLI)
+- **WordPress Compatible**: Full MySQL function support for running distributed WordPress
 - **Distributed Transactions**: Percolator-style write intents with conflict detection
 - **Multi-Database Support**: Create and manage multiple databases per cluster
 - **DDL Replication**: Distributed schema changes with automatic idempotency and cluster-wide locking
 - **Production-Ready SQL Parser**: Powered by rqlite/sql AST parser for MySQL→SQLite transpilation
 - **CDC-Based Replication**: Row-level change data capture for consistent replication
+
+## Why Marmot?
+
+### The Problem with Traditional Replication
+
+MySQL active-active requires careful setup of replication, conflict avoidance, and monitoring. Failover needs manual intervention. Split-brain scenarios demand operational expertise. This complexity doesn't scale to edge deployments.
+
+### Marmot's Approach
+
+- **Zero operational overhead**: Automatic recovery from split-brain via eventual consistency + anti-entropy
+- **No leader election**: Any node accepts writes, no failover coordination needed
+- **Direct SQLite access**: Clients can read the local SQLite file directly for maximum performance
+- **Tunable consistency**: Choose ONE/QUORUM/ALL per your latency vs durability needs
+
+### Why MySQL Protocol?
+
+- Ecosystem compatibility - existing drivers, ORMs, GUI tools work out-of-box
+- Battle-tested wire protocol implementations
+- Run real applications like WordPress without modification
+
+### Ideal Use Cases
+
+Marmot excels at **read-heavy edge scenarios**:
+
+| Use Case | How Marmot Helps |
+|----------|------------------|
+| **Distributed WordPress** | Multi-region WordPress with replicated database |
+| **Lambda/Edge sidecars** | Lightweight regional SQLite replicas, local reads |
+| **Edge vector databases** | Distributed embeddings with local query |
+| **Regional config servers** | Fast local config reads, replicated writes |
+| **Product catalogs** | Geo-distributed catalog data, eventual sync |
+
+### When to Consider Alternatives
+
+- **Strong serializability required** → CockroachDB, Spanner
+- **Single-region high-throughput** → PostgreSQL, MySQL directly
+- **Large datasets (>100GB)** → Sharded solutions
 
 ## Quick Start
 
@@ -55,8 +93,64 @@ mysql --protocol=TCP -h localhost -P 3308 -u root
 pkill -f marmot-v2
 ```
 
-## Stargazers over time
-[![Stargazers over time](https://starchart.cc/maxpert/marmot.svg?variant=adaptive)](https://starchart.cc/maxpert/marmot)
+## WordPress Support
+
+Marmot can run **distributed WordPress** with full database replication across nodes. Each WordPress instance connects to its local Marmot node, and all database changes replicate automatically.
+
+### MySQL Compatibility for WordPress
+
+Marmot implements MySQL functions required by WordPress:
+
+| Category | Functions |
+|----------|-----------|
+| **Date/Time** | NOW, CURDATE, DATE_FORMAT, UNIX_TIMESTAMP, DATEDIFF, YEAR, MONTH, DAY, etc. |
+| **String** | CONCAT_WS, SUBSTRING_INDEX, FIND_IN_SET, LPAD, RPAD, etc. |
+| **Math/Hash** | RAND, MD5, SHA1, SHA2, POW, etc. |
+| **DML** | ON DUPLICATE KEY UPDATE (transformed to SQLite ON CONFLICT) |
+
+### Quick Start: 3-Node WordPress Cluster
+
+```bash
+cd examples/wordpress-cluster
+./run.sh up
+```
+
+This starts:
+- **3 Marmot nodes** with QUORUM write consistency
+- **3 WordPress instances** each connected to its local Marmot node
+
+```
+┌─────────────┐  ┌─────────────┐  ┌─────────────┐
+│ WordPress-1 │  │ WordPress-2 │  │ WordPress-3 │
+│ :9101       │  │ :9102       │  │ :9103       │
+└──────┬──────┘  └──────┬──────┘  └──────┬──────┘
+       ▼                ▼                ▼
+┌─────────────┐  ┌─────────────┐  ┌─────────────┐
+│  Marmot-1   │◄─┤  Marmot-2   │◄─┤  Marmot-3   │
+│ MySQL: 9191 │  │ MySQL: 9192 │  │ MySQL: 9193 │
+└─────────────┘  └─────────────┘  └─────────────┘
+       └──────────────┴──────────────┘
+              QUORUM Replication
+```
+
+**Test it:**
+1. Open http://localhost:9101 - complete WordPress installation
+2. Open http://localhost:9102 or http://localhost:9103
+3. See your content replicated across all nodes!
+
+**Commands:**
+```bash
+./run.sh status   # Check cluster health
+./run.sh logs-m   # Marmot logs only
+./run.sh logs-wp  # WordPress logs only
+./run.sh down     # Stop cluster
+```
+
+### Production Considerations for WordPress
+
+- **Media uploads**: Use S3/NFS for shared media storage (files not replicated by Marmot)
+- **Sessions**: Use Redis or database sessions for sticky-session-free load balancing
+- **Caching**: Each node can use local object cache (Redis/Memcached per region)
 
 ## Architecture
 
@@ -76,6 +170,19 @@ Marmot v2 uses a fundamentally different architecture from other SQLite replicat
 3. **Cluster Membership**: SWIM-style gossip with failure detection
 4. **Data Replication**: Full database replication - all nodes receive all data
 5. **DDL Replication**: Cluster-wide schema changes with automatic idempotency
+
+## Comparison with Alternatives
+
+| Aspect | Marmot | MySQL Active-Active | rqlite/dqlite | TiDB |
+|--------|--------|---------------------|---------------|------|
+| **Leader** | None | None (but complex) | Yes (Raft) | Yes (Raft) |
+| **Failover** | Automatic | Manual intervention | Automatic | Automatic |
+| **Split-brain recovery** | Automatic (anti-entropy) | Manual | N/A (leader-based) | N/A |
+| **Consistency** | Tunable (ONE/QUORUM/ALL) | Serializable | Strong | Strong |
+| **Direct file read** | ✅ SQLite file | ❌ | ❌ | ❌ |
+| **JS-safe AUTO_INCREMENT** | ✅ Compact mode (53-bit) | N/A | N/A | ❌ 64-bit breaks JS |
+| **Edge-friendly** | ✅ Lightweight | ❌ Heavy | ⚠️ Moderate | ❌ Heavy |
+| **Operational complexity** | Low | High | Low | High |
 
 ## DDL Replication
 
@@ -236,6 +343,36 @@ Examples:
 - **Search Indexing**: Keep Elasticsearch/Algolia in sync
 
 For more details, see the [Integrations documentation](https://maxpert.github.io/marmot/integrations).
+
+## Edge Deployment Patterns
+
+### Lambda Sidecar
+
+Deploy Marmot as a lightweight regional replica alongside Lambda functions:
+- Local SQLite reads (sub-ms latency)
+- Writes replicate to cluster
+- No cold-start database connections
+
+### Read-Only Regional Replicas
+
+Scale reads globally with replica mode:
+
+```toml
+[replica]
+enabled = true
+master_address = "central-cluster:8080"
+reconnect_interval_seconds = 5
+```
+
+- Follows master via streaming replication
+- Zero cluster participation overhead
+- Auto-reconnect on network issues
+
+### Hybrid: Edge Reads, Central Writes
+
+- Deploy full cluster in central region
+- Deploy read replicas at edge locations
+- Application routes writes to central, reads to local replica
 
 ## SQL Statement Compatibility
 
@@ -406,23 +543,63 @@ Marmot v2 includes an automatic anti-entropy system that continuously monitors a
 - **Eventually Consistent**: Rows may sync out of order. `SERIALIZABLE` transaction assumptions may not hold across nodes.
 - **Concurrent DDL**: Avoid running concurrent DDL operations on the same database from multiple nodes (protected by cluster-wide lock with 30s lease).
 
-## Compatibility
+## Auto-Increment & ID Generation
 
-### AUTO_INCREMENT and Integer Types
+### The Problem with Distributed IDs
 
-> **IMPORTANT: Marmot automatically converts `INT AUTO_INCREMENT` to `BIGINT`**
->
-> This is a **breaking change** from standard MySQL/SQLite behavior. Marmot does not respect 32-bit `INT` for auto-increment columns - they are automatically promoted to `BIGINT` to support distributed ID generation.
+Distributed databases need globally unique IDs, but traditional solutions cause problems:
 
-**Why?**
+| Solution | Issue |
+|----------|-------|
+| **UUID** | 128-bit, poor index performance, not sortable |
+| **Snowflake/HLC 64-bit** | Exceeds JavaScript's `Number.MAX_SAFE_INTEGER` (2^53-1) |
+| **TiDB AUTO_INCREMENT** | Returns 64-bit IDs that **break JavaScript clients** silently |
 
-In a distributed, leaderless system, each node must generate unique IDs independently without coordination. Marmot uses HLC-based (Hybrid Logical Clock) 64-bit IDs to ensure:
+**The JavaScript Problem:**
 
-1. **Global Uniqueness**: IDs are unique across all nodes without central coordination
-2. **Monotonicity**: IDs increase over time (within each node)
-3. **No Collisions**: Unlike auto-increment sequences, HLC IDs cannot collide between nodes
+```javascript
+// 64-bit ID from TiDB or other distributed DBs
+const id = 7318624812345678901;
+console.log(id);  // 7318624812345679000 - WRONG! Precision lost!
 
-**How It Works:**
+// JSON parsing also breaks
+JSON.parse('{"id": 7318624812345678901}');  // {id: 7318624812345679000}
+```
+
+TiDB's answer? "Use strings." But that breaks ORMs, existing application code, and type safety.
+
+### Marmot's Solution: Compact ID Mode
+
+Marmot offers **two ID generation modes** to solve this:
+
+| Mode | Bits | Range | Use Case |
+|------|------|-------|----------|
+| `extended` | 64-bit | Full HLC timestamp | New systems, non-JS clients |
+| `compact` | 53-bit | JS-safe integers | **Legacy systems, JavaScript, REST APIs** |
+
+```toml
+[mysql]
+auto_id_mode = "compact"  # Safe for JavaScript (default)
+# auto_id_mode = "extended"  # Full 64-bit for new systems
+```
+
+**Compact Mode Guarantees:**
+- IDs stay under `Number.MAX_SAFE_INTEGER` (9,007,199,254,740,991)
+- Still globally unique across all nodes
+- Still monotonically increasing (per node)
+- No silent precision loss in JSON/JavaScript
+- Works with existing ORMs expecting integer IDs
+
+**With Marmot compact mode:**
+```javascript
+const id = 4503599627370496;
+console.log(id);  // 4503599627370496 - Correct!
+JSON.parse('{"id": 4503599627370496}');  // {id: 4503599627370496} - Correct!
+```
+
+### How Auto-Increment Works
+
+> **Note:** Marmot automatically converts `INT AUTO_INCREMENT` to `BIGINT` to support distributed ID generation.
 
 1. **DDL Transformation**: When you create a table with `AUTO_INCREMENT`:
    ```sql
@@ -434,38 +611,19 @@ In a distributed, leaderless system, each node must generate unique IDs independ
 2. **DML ID Injection**: When inserting with `0` or `NULL` for an auto-increment column:
    ```sql
    INSERT INTO users (id, name) VALUES (0, 'alice')
-   -- Becomes internally:
-   INSERT INTO users (id, name) VALUES (7318624812345678901, 'alice')
+   -- Becomes internally (compact mode):
+   INSERT INTO users (id, name) VALUES (4503599627370496, 'alice')
    ```
 
-3. **Explicit IDs Preserved**: If you provide an explicit non-zero ID, it is used as-is:
-   ```sql
-   INSERT INTO users (id, name) VALUES (12345, 'bob')
-   -- Remains:
-   INSERT INTO users (id, name) VALUES (12345, 'bob')
-   ```
-
-**Important Considerations:**
-
-| Aspect | Behavior |
-|--------|----------|
-| **ID Range** | 64-bit (up to 9.2 quintillion) instead of 32-bit (4.2 billion) |
-| **ID Format** | HLC-based, not sequential integers |
-| **SQLite ROWID** | Not used - Marmot manages IDs explicitly |
-| **Client Libraries** | Ensure your client handles `BIGINT` correctly (some JSON serializers may lose precision) |
-| **Existing Data** | Migrate existing `INT` columns to `BIGINT` before enabling Marmot |
+3. **Explicit IDs Preserved**: If you provide an explicit non-zero ID, it is used as-is.
 
 **Schema-Based Detection:**
 
-Marmot automatically detects auto-increment columns by querying SQLite schema directly. A column is considered auto-increment if:
+Marmot automatically detects auto-increment columns by querying SQLite schema directly:
+- Single-column `INTEGER PRIMARY KEY` (SQLite rowid alias)
+- Single-column `BIGINT PRIMARY KEY` (Marmot's transformed columns)
 
-- It is a single-column `INTEGER PRIMARY KEY` (SQLite rowid alias), or
-- It is a single-column `BIGINT PRIMARY KEY` (Marmot's transformed columns)
-
-This means:
-- **No registration required** - columns are detected from schema at runtime
-- **Works across restarts** - no need to re-execute DDL statements
-- **Works with existing databases** - tables created directly on SQLite work too
+No registration required - columns are detected from schema at runtime, works across restarts, and works with existing databases.
 
 ## Configuration
 
@@ -587,6 +745,19 @@ curl -X POST -H "X-Marmot-Secret: your-secret" http://localhost:8080/admin/clust
 
 See the [Operations documentation](https://maxpert.github.io/marmot/operations) for detailed usage and examples.
 
+### Replica Mode
+
+For read-only replicas that follow a master node without participating in the cluster:
+
+```toml
+[replica]
+enabled = true                       # Enable read-only replica mode
+master_address = "master:8080"       # Master node gRPC address
+reconnect_interval_seconds = 5       # Reconnect delay on disconnect
+```
+
+**Note:** Replica mode is mutually exclusive with cluster mode. A replica receives all data via streaming replication but cannot accept writes.
+
 ### Replication
 
 ```toml
@@ -640,6 +811,14 @@ enabled = true
 bind_address = "0.0.0.0"
 port = 3306
 max_connections = 1000
+unix_socket = ""              # Unix socket path (empty = disabled)
+unix_socket_perm = 0660       # Socket file permissions
+auto_id_mode = "compact"      # "compact" (53-bit, JS-safe) or "extended" (64-bit)
+```
+
+**Unix Socket Connection** (lower latency than TCP):
+```bash
+mysql --socket=/tmp/marmot/mysql.sock -u root
 ```
 
 ### CDC Publisher
@@ -747,7 +926,28 @@ Performance benchmarks on a local development machine (Apple M-series, 3-node cl
 
 All 3 nodes maintained identical row counts (346,684 rows) throughout the test, confirming consistent replication.
 
-> **Note**: These benchmarks are from a local development machine with all nodes on the same host. Production deployments across multiple machines will have different characteristics based on network latency.
+> **Note**: These benchmarks are from a local development machine with all nodes on the same host. Production deployments across multiple machines will have different characteristics based on network latency. Expect P99 latencies of 50-200ms for cross-region QUORUM writes.
+
+## Backup & Disaster Recovery
+
+### Option 1: Litestream (Recommended)
+
+Marmot's SQLite files are standard WAL-mode databases, compatible with [Litestream](https://litestream.io/):
+
+```bash
+litestream replicate /path/to/marmot-data/*.db s3://bucket/backup
+```
+
+### Option 2: CDC to External Storage
+
+Enable CDC publisher to stream changes to Kafka/NATS, then archive to your preferred storage.
+
+### Option 3: Filesystem Snapshots
+
+Since Marmot uses SQLite with WAL mode, you can safely snapshot the data directory during operation.
+
+## Stargazers over time
+[![Stargazers over time](https://starchart.cc/maxpert/marmot.svg?variant=adaptive)](https://starchart.cc/maxpert/marmot)
 
 ## FAQs & Community
 
