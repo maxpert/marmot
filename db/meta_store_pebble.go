@@ -24,6 +24,7 @@ const (
 	pebblePrefixTxn         = "/txn/"           // /txn/{8 bytes txnID}
 	pebblePrefixTxnPending  = "/txn_idx/pend/"  // /txn_idx/pend/{8 bytes txnID}
 	pebblePrefixTxnSeq      = "/txn_idx/seq/"   // /txn_idx/seq/{8 bytes seqNum}{8 bytes txnID}
+	pebblePrefixTxnByID     = "/txn_idx/txnid/" // /txn_idx/txnid/{8 bytes txnID} - primary index for streaming
 	pebblePrefixIntent      = "/intent/"        // /intent/{2 bytes tableNameLen}{tableName}{intentKey}
 	pebblePrefixCDC         = "/cdc/"           // /cdc/{8 bytes txnID}{8 bytes seq}
 	pebblePrefixCDCRaw      = "/cdc/raw/"       // /cdc/raw/{8 bytes txnID}{8 bytes seq}
@@ -393,6 +394,15 @@ func pebbleTxnSeqKey(seqNum, txnID uint64) []byte {
 	copy(key, pebblePrefixTxnSeq)
 	binary.BigEndian.PutUint64(key[len(pebblePrefixTxnSeq):], seqNum)
 	binary.BigEndian.PutUint64(key[len(pebblePrefixTxnSeq)+8:], txnID)
+	return key
+}
+
+// pebbleTxnByIDKey creates the TxnID-ordered index key for streaming.
+// This is the primary index for ScanTransactions to ensure TxnID ordering.
+func pebbleTxnByIDKey(txnID uint64) []byte {
+	key := make([]byte, len(pebblePrefixTxnByID)+8)
+	copy(key, pebblePrefixTxnByID)
+	binary.BigEndian.PutUint64(key[len(pebblePrefixTxnByID):], txnID)
 	return key
 }
 
@@ -896,8 +906,13 @@ func (s *PebbleMetaStore) CommitTransaction(txnID uint64, commitTS hlc.Timestamp
 		return err
 	}
 
-	// Add to sequence index
+	// Add to sequence index (kept for backward compatibility and GC)
 	if err := batch.Set(pebbleTxnSeqKey(seqNum, txnID), nil, nil); err != nil {
+		return err
+	}
+
+	// Add to TxnID index (primary index for streaming - ensures TxnID ordering)
+	if err := batch.Set(pebbleTxnByIDKey(txnID), nil, nil); err != nil {
 		return err
 	}
 
@@ -987,10 +1002,16 @@ func (s *PebbleMetaStore) StoreReplayedTransaction(txnID, nodeID uint64, commitT
 		return err
 	}
 
-	// Add to sequence index
+	// Add to sequence index (kept for backward compatibility and GC)
 	if err := batch.Set(pebbleTxnSeqKey(seqNum, txnID), nil, nil); err != nil {
 		return err
 	}
+
+	// Add to TxnID index (primary index for streaming - ensures TxnID ordering)
+	if err := batch.Set(pebbleTxnByIDKey(txnID), nil, nil); err != nil {
+		return err
+	}
+
 	if err := s.counters.UpdateMaxInBatch(batch, "max_committed_txn_id", int64(txnID)); err != nil {
 		return err
 	}
@@ -2746,58 +2767,60 @@ func (s *PebbleMetaStore) StreamCommittedTransactions(fromTxnID uint64, callback
 	})
 }
 
-// ScanTransactions iterates transactions from fromTxnID.
+// ScanTransactions iterates transactions from fromTxnID in TxnID order.
 // If descending is true, scans from newest to oldest.
 // Callback returns nil to continue, ErrStopIteration to stop, or other error to abort.
 func (s *PebbleMetaStore) ScanTransactions(fromTxnID uint64, descending bool, callback func(*TransactionRecord) error) error {
-	prefix := []byte(pebblePrefixTxnSeq)
+	prefix := []byte(pebblePrefixTxnByID)
 
-	iter, err := s.db.NewIter(&pebble.IterOptions{
-		LowerBound: prefix,
-		UpperBound: prefixUpperBound(prefix),
-	})
+	var iterOpts pebble.IterOptions
+	if descending {
+		// For descending, we want txnID < fromTxnID (or all if fromTxnID == 0)
+		iterOpts = pebble.IterOptions{
+			LowerBound: prefix,
+			UpperBound: prefixUpperBound(prefix),
+		}
+	} else {
+		// For ascending from fromTxnID, start at fromTxnID+1
+		startKey := pebbleTxnByIDKey(fromTxnID + 1)
+		iterOpts = pebble.IterOptions{
+			LowerBound: startKey,
+			UpperBound: prefixUpperBound(prefix),
+		}
+	}
+
+	iter, err := s.db.NewIter(&iterOpts)
 	if err != nil {
 		return err
 	}
 	defer iter.Close()
 
 	// Choose iteration direction
-	var valid func() bool
 	var advance func() bool
 	if descending {
-		// Start from end, go backwards
-		valid = func() bool { return iter.Valid() }
 		advance = func() bool { return iter.Prev() }
-		iter.SeekLT(prefixUpperBound(prefix))
+		if fromTxnID > 0 {
+			// SeekLT to position just before fromTxnID
+			iter.SeekLT(pebbleTxnByIDKey(fromTxnID))
+		} else {
+			// Start from end
+			iter.SeekLT(prefixUpperBound(prefix))
+		}
 	} else {
-		// Start from beginning, go forwards
-		valid = func() bool { return iter.Valid() }
 		advance = func() bool { return iter.Next() }
-		iter.SeekGE(prefix)
+		iter.First()
 	}
 
-	for valid() {
+	prefixLen := len(pebblePrefixTxnByID)
+	for iter.Valid() {
 		key := iter.Key()
-		// Key format: prefix + 8 bytes seqNum + 8 bytes txnID
-		if len(key) < len(pebblePrefixTxnSeq)+16 {
+		// Key format: prefix + 8 bytes txnID
+		if len(key) < prefixLen+8 {
 			advance()
 			continue
 		}
 
-		txnID := binary.BigEndian.Uint64(key[len(pebblePrefixTxnSeq)+8:])
-
-		// Filter by fromTxnID based on direction
-		if descending {
-			if fromTxnID > 0 && txnID >= fromTxnID {
-				advance()
-				continue
-			}
-		} else {
-			if txnID <= fromTxnID {
-				advance()
-				continue
-			}
-		}
+		txnID := binary.BigEndian.Uint64(key[prefixLen:])
 
 		rec, err := s.GetTransaction(txnID)
 		if err != nil || rec == nil {
