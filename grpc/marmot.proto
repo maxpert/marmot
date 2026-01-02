@@ -45,6 +45,10 @@ service MarmotService {
   // Get latest transaction IDs per database (for delta sync detection)
   rpc GetLatestTxnIDs(LatestTxnIDsRequest)
       returns (LatestTxnIDsResponse);
+
+  // GetClusterNodes returns cluster membership for readonly replicas.
+  // Read-only - does not modify cluster state.
+  rpc GetClusterNodes(GetClusterNodesRequest) returns (GetClusterNodesResponse);
 }
 
 // ===== GOSSIP MESSAGES =====
@@ -278,4 +282,11 @@ message LatestTxnIDsRequest {
 message LatestTxnIDsResponse {
   // Map of database name to latest committed txn_id
   map<string, uint64> database_txn_ids = 1;
+}
+
+// ===== CLUSTER NODES =====
+message GetClusterNodesRequest {}
+
+message GetClusterNodesResponse {
+  repeated NodeState nodes = 1;
 }

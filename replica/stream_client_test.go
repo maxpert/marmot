@@ -58,14 +58,15 @@ func TestNewStreamClient(t *testing.T) {
 	defer cleanup()
 
 	replica := &Replica{}
-	client := NewStreamClient("localhost:8080", 1, dbMgr, clock, replica)
+	followAddrs := []string{"localhost:8080", "localhost:8081"}
+	client := NewStreamClient(followAddrs, 1, dbMgr, clock, replica)
 
 	if client == nil {
 		t.Fatal("Expected client to be created, got nil")
 	}
 
-	if client.masterAddr != "localhost:8080" {
-		t.Errorf("Expected masterAddr localhost:8080, got %s", client.masterAddr)
+	if client.currentAddr != "localhost:8080" {
+		t.Errorf("Expected currentAddr localhost:8080, got %s", client.currentAddr)
 	}
 
 	if client.nodeID != 1 {
@@ -74,6 +75,10 @@ func TestNewStreamClient(t *testing.T) {
 
 	if client.lastTxnID == nil {
 		t.Error("Expected lastTxnID map to be initialized")
+	}
+
+	if len(client.clusterNodes) != 2 {
+		t.Errorf("Expected 2 cluster nodes, got %d", len(client.clusterNodes))
 	}
 }
 
@@ -353,7 +358,7 @@ func TestStreamClient_ApplyChangeEvent(t *testing.T) {
 		t.Fatalf("Failed to create table: %v", err)
 	}
 
-	client := NewStreamClient("localhost:8080", 1, dbMgr, clock, nil)
+	client := NewStreamClient([]string{"localhost:8080"}, 1, dbMgr, clock, nil)
 
 	// Create a change event with CDC data
 	event := &marmotgrpc.ChangeEvent{
@@ -404,7 +409,7 @@ func TestStreamClient_ApplyChangeEvent_DDL(t *testing.T) {
 		t.Fatalf("Failed to create database: %v", err)
 	}
 
-	client := NewStreamClient("localhost:8080", 1, dbMgr, clock, nil)
+	client := NewStreamClient([]string{"localhost:8080"}, 1, dbMgr, clock, nil)
 
 	// Create a DDL change event
 	event := &marmotgrpc.ChangeEvent{
@@ -448,7 +453,7 @@ func TestStreamClient_GetLocalMaxTxnIDs(t *testing.T) {
 	dbMgr, clock, _, cleanup := setupStreamClientTest(t)
 	defer cleanup()
 
-	client := NewStreamClient("localhost:8080", 1, dbMgr, clock, nil)
+	client := NewStreamClient([]string{"localhost:8080"}, 1, dbMgr, clock, nil)
 
 	// Get local txn IDs (should be empty/zero for new databases)
 	txnIDs, err := client.getLocalMaxTxnIDs()
@@ -468,7 +473,7 @@ func TestStreamClient_Stop(t *testing.T) {
 	defer cleanup()
 
 	replica := &Replica{}
-	client := NewStreamClient("localhost:8080", 1, dbMgr, clock, replica)
+	client := NewStreamClient([]string{"localhost:8080"}, 1, dbMgr, clock, replica)
 
 	// Start a goroutine that will be stopped
 	done := make(chan bool)
@@ -500,7 +505,7 @@ func TestStreamClient_LastTxnIDTracking(t *testing.T) {
 	dbMgr, clock, _, cleanup := setupStreamClientTest(t)
 	defer cleanup()
 
-	client := NewStreamClient("localhost:8080", 1, dbMgr, clock, nil)
+	client := NewStreamClient([]string{"localhost:8080"}, 1, dbMgr, clock, nil)
 
 	// Initially empty
 	client.mu.RLock()
@@ -538,7 +543,7 @@ func TestStreamClient_ReconnectConfig(t *testing.T) {
 	cfg.Config.Replica.ReconnectIntervalSec = 10
 	cfg.Config.Replica.ReconnectMaxBackoffSec = 60
 
-	client := NewStreamClient("localhost:8080", 1, dbMgr, clock, nil)
+	client := NewStreamClient([]string{"localhost:8080"}, 1, dbMgr, clock, nil)
 
 	if client.reconnectInterval != 10*time.Second {
 		t.Errorf("Expected reconnectInterval=10s, got %v", client.reconnectInterval)
@@ -653,7 +658,7 @@ func BenchmarkStreamClient_ApplyChangeEvent(b *testing.B) {
 	sqlDB := mdb.GetDB()
 	sqlDB.Exec(`CREATE TABLE events (id INTEGER PRIMARY KEY, data TEXT)`)
 
-	client := NewStreamClient("localhost:8080", 1, dbMgr, clock, nil)
+	client := NewStreamClient([]string{"localhost:8080"}, 1, dbMgr, clock, nil)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -676,6 +681,143 @@ func BenchmarkStreamClient_ApplyChangeEvent(b *testing.B) {
 			},
 		}
 		client.applyChangeEvent(context.Background(), event)
+	}
+}
+
+// TestSelectAliveNode_FiltersDeadNodes tests that dead nodes are excluded from selection
+func TestSelectAliveNode_FiltersDeadNodes(t *testing.T) {
+	dbMgr, clock, _, cleanup := setupStreamClientTest(t)
+	defer cleanup()
+
+	replica := &Replica{}
+	followAddrs := []string{"node1:8080", "node2:8080", "node3:8080"}
+	client := NewStreamClient(followAddrs, 1, dbMgr, clock, replica)
+
+	// Populate cluster nodes with mixed states
+	client.clusterMu.Lock()
+	client.clusterNodes = map[uint64]*marmotgrpc.NodeState{
+		100: {NodeId: 100, Address: "node1:8080", Status: marmotgrpc.NodeStatus_ALIVE, Incarnation: 1},
+		200: {NodeId: 200, Address: "node2:8080", Status: marmotgrpc.NodeStatus_DEAD, Incarnation: 1},
+		300: {NodeId: 300, Address: "node3:8080", Status: marmotgrpc.NodeStatus_ALIVE, Incarnation: 1},
+	}
+	client.currentAddr = "node1:8080"
+	client.clusterMu.Unlock()
+
+	// selectAliveNode should only return node3 (node1 is current, node2 is dead)
+	addr, nodeID, err := client.selectAliveNode()
+	if err != nil {
+		t.Fatalf("selectAliveNode failed: %v", err)
+	}
+
+	if addr != "node3:8080" {
+		t.Errorf("Expected node3:8080, got %s", addr)
+	}
+	if nodeID != 300 {
+		t.Errorf("Expected nodeID 300, got %d", nodeID)
+	}
+}
+
+// TestSelectAliveNode_SkipsCurrentNode tests that current node is excluded from selection
+func TestSelectAliveNode_SkipsCurrentNode(t *testing.T) {
+	dbMgr, clock, _, cleanup := setupStreamClientTest(t)
+	defer cleanup()
+
+	replica := &Replica{}
+	followAddrs := []string{"node1:8080", "node2:8080"}
+	client := NewStreamClient(followAddrs, 1, dbMgr, clock, replica)
+
+	// Only one alive node (current)
+	client.clusterMu.Lock()
+	client.clusterNodes = map[uint64]*marmotgrpc.NodeState{
+		100: {NodeId: 100, Address: "node1:8080", Status: marmotgrpc.NodeStatus_ALIVE, Incarnation: 1},
+	}
+	client.currentAddr = "node1:8080"
+	client.clusterMu.Unlock()
+
+	// Should return error - no alive nodes other than current
+	_, _, err := client.selectAliveNode()
+	if err == nil {
+		t.Error("Expected error when no alive nodes available")
+	}
+}
+
+// TestMergeClusterView_UpdatesOnHigherIncarnation tests cluster view merging
+func TestMergeClusterView_UpdatesOnHigherIncarnation(t *testing.T) {
+	dbMgr, clock, _, cleanup := setupStreamClientTest(t)
+	defer cleanup()
+
+	replica := &Replica{}
+	followAddrs := []string{"node1:8080"}
+	client := NewStreamClient(followAddrs, 1, dbMgr, clock, replica)
+
+	// Initial cluster state
+	client.clusterMu.Lock()
+	client.clusterNodes = map[uint64]*marmotgrpc.NodeState{
+		100: {NodeId: 100, Address: "node1:8080", Status: marmotgrpc.NodeStatus_ALIVE, Incarnation: 1},
+	}
+	client.clusterMu.Unlock()
+
+	// Merge with higher incarnation
+	newNodes := []*marmotgrpc.NodeState{
+		{NodeId: 100, Address: "node1:8080", Status: marmotgrpc.NodeStatus_SUSPECT, Incarnation: 2},
+		{NodeId: 200, Address: "node2:8080", Status: marmotgrpc.NodeStatus_ALIVE, Incarnation: 1},
+	}
+	client.mergeClusterView(newNodes)
+
+	// Verify node 100 was updated
+	client.clusterMu.RLock()
+	defer client.clusterMu.RUnlock()
+
+	node100 := client.clusterNodes[100]
+	if node100.Incarnation != 2 {
+		t.Errorf("Expected incarnation 2, got %d", node100.Incarnation)
+	}
+	if node100.Status != marmotgrpc.NodeStatus_SUSPECT {
+		t.Errorf("Expected status SUSPECT, got %v", node100.Status)
+	}
+
+	// Verify node 200 was added
+	node200 := client.clusterNodes[200]
+	if node200 == nil {
+		t.Fatal("Expected node 200 to be added")
+	}
+	if node200.Address != "node2:8080" {
+		t.Errorf("Expected address node2:8080, got %s", node200.Address)
+	}
+}
+
+// TestMergeClusterView_IgnoresLowerIncarnation tests that lower incarnations are ignored
+func TestMergeClusterView_IgnoresLowerIncarnation(t *testing.T) {
+	dbMgr, clock, _, cleanup := setupStreamClientTest(t)
+	defer cleanup()
+
+	replica := &Replica{}
+	followAddrs := []string{"node1:8080"}
+	client := NewStreamClient(followAddrs, 1, dbMgr, clock, replica)
+
+	// Initial cluster state with higher incarnation
+	client.clusterMu.Lock()
+	client.clusterNodes = map[uint64]*marmotgrpc.NodeState{
+		100: {NodeId: 100, Address: "node1:8080", Status: marmotgrpc.NodeStatus_ALIVE, Incarnation: 5},
+	}
+	client.clusterMu.Unlock()
+
+	// Try to merge with lower incarnation
+	newNodes := []*marmotgrpc.NodeState{
+		{NodeId: 100, Address: "node1:8080", Status: marmotgrpc.NodeStatus_DEAD, Incarnation: 3},
+	}
+	client.mergeClusterView(newNodes)
+
+	// Verify node 100 was NOT updated
+	client.clusterMu.RLock()
+	defer client.clusterMu.RUnlock()
+
+	node100 := client.clusterNodes[100]
+	if node100.Incarnation != 5 {
+		t.Errorf("Expected incarnation to remain 5, got %d", node100.Incarnation)
+	}
+	if node100.Status != marmotgrpc.NodeStatus_ALIVE {
+		t.Errorf("Expected status to remain ALIVE, got %v", node100.Status)
 	}
 }
 

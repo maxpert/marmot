@@ -362,7 +362,7 @@ func TestReplicaConfigDefaults(t *testing.T) {
 	}
 }
 
-func TestReplicaConfigValidation_MissingMasterAddress(t *testing.T) {
+func TestReplicaConfigValidation_MissingFollowAddresses(t *testing.T) {
 	original := Config
 	defer func() { Config = original }()
 
@@ -379,14 +379,15 @@ func TestReplicaConfigValidation_MissingMasterAddress(t *testing.T) {
 			DefaultReadConsist:  "LOCAL_ONE",
 		},
 		Replica: ReplicaConfiguration{
-			Enabled:       true,
-			MasterAddress: "", // Missing
+			Enabled:         true,
+			FollowAddresses: []string{}, // Missing
+			Secret:          "test-secret",
 		},
 	}
 
 	err := Validate()
 	if err == nil {
-		t.Error("Expected error for missing master_address when replica enabled")
+		t.Error("Expected error for missing follow_addresses when replica enabled")
 	}
 }
 
@@ -408,8 +409,9 @@ func TestReplicaConfigValidation_MutuallyExclusiveWithSeedNodes(t *testing.T) {
 			DefaultReadConsist:  "LOCAL_ONE",
 		},
 		Replica: ReplicaConfiguration{
-			Enabled:       true,
-			MasterAddress: "master:8080",
+			Enabled:         true,
+			FollowAddresses: []string{"master:8080"},
+			Secret:          "test-secret",
 		},
 	}
 
@@ -459,7 +461,9 @@ func TestReplicaConfigValidation_ValidConfig(t *testing.T) {
 		},
 		Replica: ReplicaConfiguration{
 			Enabled:                true,
-			MasterAddress:          "master:8080",
+			FollowAddresses:        []string{"master1:8080", "master2:8080"},
+			DiscoveryIntervalSec:   30,
+			FailoverTimeoutSec:     60,
 			ReconnectIntervalSec:   5,
 			ReconnectMaxBackoffSec: 30,
 			InitialSyncTimeoutMin:  30,
@@ -495,5 +499,102 @@ func TestIsReplicaMode(t *testing.T) {
 	}
 	if !IsReplicaMode() {
 		t.Error("Expected IsReplicaMode()=true when enabled")
+	}
+}
+
+func TestReplicaConfig_CLIOverridesFollowAddresses(t *testing.T) {
+	original := Config
+	defer func() { Config = original }()
+
+	// Set up CLI flag
+	*FollowAddrsFlag = "node1:8080,node2:8080,node3:8080"
+	defer func() {
+		*FollowAddrsFlag = ""
+	}()
+
+	// Reset config
+	Config = &Configuration{
+		DataDir: "./test-data",
+		Cluster: ClusterConfiguration{
+			GRPCPort: 8080,
+		},
+		Replica: ReplicaConfiguration{
+			FollowAddresses: []string{},
+		},
+	}
+
+	err := Load("")
+	if err != nil {
+		t.Errorf("Expected no error, got: %v", err)
+	}
+
+	// Verify CLI override was applied
+	expectedAddrs := []string{"node1:8080", "node2:8080", "node3:8080"}
+	if len(Config.Replica.FollowAddresses) != len(expectedAddrs) {
+		t.Errorf("Expected %d addresses, got %d", len(expectedAddrs), len(Config.Replica.FollowAddresses))
+	}
+
+	for i, addr := range expectedAddrs {
+		if i >= len(Config.Replica.FollowAddresses) || Config.Replica.FollowAddresses[i] != addr {
+			t.Errorf("Expected address[%d] to be %s, got %s", i, addr, Config.Replica.FollowAddresses[i])
+		}
+	}
+}
+
+func TestReplicaConfig_ValidationRequiresFollowAddresses(t *testing.T) {
+	original := Config
+	defer func() { Config = original }()
+
+	// Test 1: Empty follow_addresses should fail
+	Config = &Configuration{
+		Cluster: ClusterConfiguration{
+			GRPCPort: 8080,
+		},
+		MySQL: MySQLConfiguration{
+			Enabled: true,
+			Port:    3306,
+		},
+		Replication: ReplicationConfiguration{
+			DefaultWriteConsist: "QUORUM",
+			DefaultReadConsist:  "LOCAL_ONE",
+		},
+		Transaction: TransactionConfiguration{
+			HeartbeatTimeoutSeconds: 10,
+		},
+		ConnectionPool: ConnectionPoolConfiguration{
+			PoolSize: 4,
+		},
+		GRPCClient: GRPCClientConfiguration{
+			KeepaliveTimeSeconds:    10,
+			KeepaliveTimeoutSeconds: 3,
+		},
+		Coordinator: CoordinatorConfiguration{
+			PrepareTimeoutMS: 2000,
+			CommitTimeoutMS:  2000,
+			AbortTimeoutMS:   2000,
+		},
+		Replica: ReplicaConfiguration{
+			Enabled:         true,
+			FollowAddresses: []string{},
+			Secret:          "test-secret",
+		},
+	}
+
+	err := Validate()
+	if err == nil {
+		t.Error("Expected validation error for empty follow_addresses")
+	}
+
+	// Test 2: Valid follow_addresses should pass
+	Config.Replica.FollowAddresses = []string{"node1:8080", "node2:8080"}
+	Config.Replica.DiscoveryIntervalSec = 30
+	Config.Replica.FailoverTimeoutSec = 60
+	Config.Replica.ReconnectIntervalSec = 5
+	Config.Replica.ReconnectMaxBackoffSec = 30
+	Config.Replica.InitialSyncTimeoutMin = 30
+
+	err = Validate()
+	if err != nil {
+		t.Errorf("Expected no validation error with valid follow_addresses, got: %v", err)
 	}
 }

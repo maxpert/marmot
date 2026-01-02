@@ -1,23 +1,23 @@
 #!/bin/bash
 #
-# Start a read-only replica that streams from a master cluster
+# Start a read-only replica that streams from cluster nodes with transparent failover
 #
-# Usage: ./start-replica.sh <replica_id> <master_address> [secret]
+# Usage: ./start-replica.sh <replica_id> <follow_addresses> [secret]
 #
 # Example:
 #   # Start master cluster first (in another terminal) with a cluster secret:
 #   MARMOT_CLUSTER_SECRET=my-secret ./examples/start-seed.sh
 #
 #   # Start replica 1 (must use same secret as master):
-#   ./start-replica.sh 1 localhost:8081 my-secret
+#   ./start-replica.sh 1 "localhost:8081,localhost:8082,localhost:8083" my-secret
 #
 #   # Or set via environment:
-#   MARMOT_REPLICA_SECRET=my-secret ./start-replica.sh 1 localhost:8081
+#   MARMOT_REPLICA_SECRET=my-secret ./start-replica.sh 1 "localhost:8081,localhost:8082"
 
 set -e
 
 REPLICA_ID=${1:-1}
-MASTER_ADDR=${2:-"localhost:8081"}
+FOLLOW_ADDRS=${2:-"localhost:8081"}
 REPLICA_SECRET=${3:-${MARMOT_REPLICA_SECRET:-""}}
 
 # Calculate ports based on replica ID
@@ -33,19 +33,22 @@ CONFIG_FILE="/tmp/marmot-replica-${REPLICA_ID}.toml"
 
 if [ -z "${REPLICA_SECRET}" ]; then
     echo "ERROR: Replica secret is required for PSK authentication"
-    echo "Usage: ./start-replica.sh <replica_id> <master_address> <secret>"
-    echo "   or: MARMOT_REPLICA_SECRET=<secret> ./start-replica.sh <replica_id> <master_address>"
+    echo "Usage: ./start-replica.sh <replica_id> <follow_addresses> <secret>"
+    echo "   or: MARMOT_REPLICA_SECRET=<secret> ./start-replica.sh <replica_id> <follow_addresses>"
     exit 1
 fi
 
+# Convert comma-separated addresses to TOML array format
+FOLLOW_ADDRS_TOML=$(echo "${FOLLOW_ADDRS}" | sed 's/,/", "/g' | sed 's/^/["/' | sed 's/$/"]/')
+
 echo "=== Marmot Read-Only Replica ==="
-echo "Replica ID:    ${REPLICA_ID}"
-echo "Master:        ${MASTER_ADDR}"
-echo "MySQL Port:    ${MYSQL_PORT}"
-echo "gRPC Port:     ${GRPC_PORT}"
-echo "Data Dir:      ${DATA_DIR}"
-echo "Config:        ${CONFIG_FILE}"
-echo "Auth:          PSK enabled"
+echo "Replica ID:       ${REPLICA_ID}"
+echo "Follow Addresses: ${FOLLOW_ADDRS}"
+echo "MySQL Port:       ${MYSQL_PORT}"
+echo "gRPC Port:        ${GRPC_PORT}"
+echo "Data Dir:         ${DATA_DIR}"
+echo "Config:           ${CONFIG_FILE}"
+echo "Auth:             PSK enabled"
 echo ""
 
 # Kill any existing processes on our ports
@@ -80,8 +83,10 @@ port = ${MYSQL_PORT}
 
 [replica]
 enabled = true
-master_address = "${MASTER_ADDR}"
+follow_addresses = ${FOLLOW_ADDRS_TOML}
 secret = "${REPLICA_SECRET}"
+discovery_interval_seconds = 30
+failover_timeout_seconds = 60
 reconnect_interval_seconds = 5
 reconnect_max_backoff_seconds = 30
 initial_sync_timeout_minutes = 30
@@ -125,6 +130,7 @@ echo "Starting Marmot replica ${REPLICA_ID}..."
 echo "Connect with: mysql -h localhost -P ${MYSQL_PORT} -u root"
 echo ""
 echo "NOTE: This is a READ-ONLY replica. Writes will be rejected."
+echo "      The replica will automatically failover to other nodes if disconnected."
 echo ""
 
 exec ${MARMOT_BIN} --config "${CONFIG_FILE}"

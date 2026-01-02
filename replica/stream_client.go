@@ -4,7 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"hash/fnv"
 	"io"
+	"math/rand"
 	"strings"
 	"sync"
 	"time"
@@ -25,11 +27,10 @@ import (
 
 // StreamClient manages the change stream from the master node
 type StreamClient struct {
-	masterAddr string
-	nodeID     uint64
-	dbManager  *db.DatabaseManager
-	clock      *hlc.Clock
-	replica    *Replica
+	nodeID    uint64
+	dbManager *db.DatabaseManager
+	clock     *hlc.Clock
+	replica   *Replica
 
 	conn   *grpc.ClientConn
 	client marmotgrpc.MarmotServiceClient
@@ -40,6 +41,16 @@ type StreamClient struct {
 	// snapshotInProgress prevents concurrent snapshot apply and change events
 	snapshotMu sync.RWMutex
 
+	// Cluster awareness
+	clusterMu     sync.RWMutex
+	clusterNodes  map[uint64]*marmotgrpc.NodeState // All known nodes
+	currentNodeID uint64                           // Node we're streaming from
+	currentAddr   string                           // Address of current node
+
+	// Discovery
+	discoveryCtx    context.Context
+	discoveryCancel context.CancelFunc
+
 	reconnectInterval time.Duration
 	maxBackoff        time.Duration
 
@@ -49,15 +60,37 @@ type StreamClient struct {
 }
 
 // NewStreamClient creates a new stream client
-func NewStreamClient(masterAddr string, nodeID uint64, dbManager *db.DatabaseManager, clock *hlc.Clock, replica *Replica) *StreamClient {
+func NewStreamClient(followAddrs []string, nodeID uint64, dbManager *db.DatabaseManager, clock *hlc.Clock, replica *Replica) *StreamClient {
 	ctx, cancel := context.WithCancel(context.Background())
+	discoveryCtx, discoveryCancel := context.WithCancel(context.Background())
+
+	// Initialize cluster nodes from follow addresses
+	clusterNodes := make(map[uint64]*marmotgrpc.NodeState)
+	for _, addr := range followAddrs {
+		// Use address hash as temporary ID until we discover real node IDs
+		tempID := hashAddress(addr)
+		clusterNodes[tempID] = &marmotgrpc.NodeState{
+			NodeId:  tempID,
+			Address: addr,
+			Status:  marmotgrpc.NodeStatus_ALIVE,
+		}
+	}
+
+	var currentAddr string
+	if len(followAddrs) > 0 {
+		currentAddr = followAddrs[0]
+	}
+
 	return &StreamClient{
-		masterAddr:        masterAddr,
 		nodeID:            nodeID,
 		dbManager:         dbManager,
 		clock:             clock,
 		replica:           replica,
 		lastTxnID:         make(map[string]uint64),
+		clusterNodes:      clusterNodes,
+		currentAddr:       currentAddr,
+		discoveryCtx:      discoveryCtx,
+		discoveryCancel:   discoveryCancel,
 		reconnectInterval: time.Duration(cfg.Config.Replica.ReconnectIntervalSec) * time.Second,
 		maxBackoff:        time.Duration(cfg.Config.Replica.ReconnectMaxBackoffSec) * time.Second,
 		ctx:               ctx,
@@ -65,9 +98,16 @@ func NewStreamClient(masterAddr string, nodeID uint64, dbManager *db.DatabaseMan
 	}
 }
 
+// hashAddress creates a temporary node ID from an address
+func hashAddress(addr string) uint64 {
+	h := fnv.New64a()
+	h.Write([]byte(addr))
+	return h.Sum64()
+}
+
 // Bootstrap performs initial sync from master
 func (s *StreamClient) Bootstrap(ctx context.Context) error {
-	log.Info().Str("master", s.masterAddr).Msg("Connecting to master for bootstrap")
+	log.Info().Str("master", s.currentAddr).Msg("Connecting to master for bootstrap")
 
 	// Connect to master
 	if err := s.connect(ctx); err != nil {
@@ -157,6 +197,10 @@ func (s *StreamClient) Bootstrap(ctx context.Context) error {
 func (s *StreamClient) Start(ctx context.Context) {
 	s.wg.Add(1)
 	defer s.wg.Done()
+	defer s.discoveryCancel()
+
+	// Start discovery loop in background
+	go s.startDiscoveryLoop()
 
 	backoff := s.reconnectInterval
 
@@ -177,17 +221,21 @@ func (s *StreamClient) Start(ctx context.Context) {
 			s.replica.SetState(StateReconnecting)
 			s.replica.SetConnected(false)
 
-			select {
-			case <-time.After(backoff):
-			case <-ctx.Done():
-				return
-			case <-s.ctx.Done():
-				return
-			}
+			// Try failover instead of just backing off
+			if err := s.failover(); err != nil {
+				log.Warn().Err(err).Msg("Failover failed, backing off")
+				select {
+				case <-time.After(backoff):
+				case <-ctx.Done():
+					return
+				case <-s.ctx.Done():
+					return
+				}
 
-			// Exponential backoff
-			backoff = min(backoff*2, s.maxBackoff)
-			continue
+				// Exponential backoff
+				backoff = min(backoff*2, s.maxBackoff)
+				continue
+			}
 		}
 
 		// Reset backoff on successful connection
@@ -195,7 +243,7 @@ func (s *StreamClient) Start(ctx context.Context) {
 		s.replica.SetConnected(true)
 		s.replica.SetState(StateStreaming)
 
-		log.Info().Str("master", s.masterAddr).Msg("Connected to master, starting change stream")
+		log.Info().Str("master", s.currentAddr).Msg("Connected to master, starting change stream")
 
 		// Stream changes
 		if err := s.streamChanges(ctx); err != nil {
@@ -235,7 +283,7 @@ func (s *StreamClient) connect(ctx context.Context) error {
 	dialCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	conn, err := grpc.DialContext(dialCtx, s.masterAddr,
+	conn, err := grpc.DialContext(dialCtx, s.currentAddr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithBlock(),
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{
@@ -257,7 +305,7 @@ func (s *StreamClient) connect(ctx context.Context) error {
 	s.conn = conn
 	s.client = marmotgrpc.NewMarmotServiceClient(conn)
 
-	log.Info().Str("master", s.masterAddr).Msg("Connected to master with PSK authentication")
+	log.Info().Str("master", s.currentAddr).Msg("Connected to master with PSK authentication")
 	return nil
 }
 
@@ -732,4 +780,178 @@ func min(a, b time.Duration) time.Duration {
 		return a
 	}
 	return b
+}
+
+// startDiscoveryLoop periodically queries cluster nodes for membership updates
+func (s *StreamClient) startDiscoveryLoop() {
+	interval := time.Duration(cfg.Config.Replica.DiscoveryIntervalSec) * time.Second
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.discoveryCtx.Done():
+			return
+		case <-ticker.C:
+			s.discoverClusterNodes()
+		}
+	}
+}
+
+// discoverClusterNodes queries a subset of nodes for cluster membership
+func (s *StreamClient) discoverClusterNodes() {
+	s.clusterMu.RLock()
+	addrs := make([]string, 0, len(s.clusterNodes))
+	for _, node := range s.clusterNodes {
+		if node.Status != marmotgrpc.NodeStatus_DEAD &&
+			node.Status != marmotgrpc.NodeStatus_REMOVED {
+			addrs = append(addrs, node.Address)
+		}
+	}
+	s.clusterMu.RUnlock()
+
+	// Query subset of nodes (max 3) to avoid flooding
+	if len(addrs) > 3 {
+		rand.Shuffle(len(addrs), func(i, j int) { addrs[i], addrs[j] = addrs[j], addrs[i] })
+		addrs = addrs[:3]
+	}
+
+	for _, addr := range addrs {
+		ctx, cancel := context.WithTimeout(s.discoveryCtx, 5*time.Second)
+		nodes, err := s.queryClusterNodes(ctx, addr)
+		cancel()
+
+		if err != nil {
+			log.Debug().Err(err).Str("addr", addr).Msg("Discovery query failed")
+			continue
+		}
+
+		s.mergeClusterView(nodes)
+	}
+}
+
+// queryClusterNodes queries a single node for cluster membership
+func (s *StreamClient) queryClusterNodes(ctx context.Context, addr string) ([]*marmotgrpc.NodeState, error) {
+	// Create temporary connection for discovery
+	conn, err := s.dialWithPSK(ctx, addr)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	client := marmotgrpc.NewMarmotServiceClient(conn)
+	resp, err := client.GetClusterNodes(ctx, &marmotgrpc.GetClusterNodesRequest{})
+	if err != nil {
+		return nil, err
+	}
+	return resp.Nodes, nil
+}
+
+// dialWithPSK creates a gRPC connection with PSK authentication
+func (s *StreamClient) dialWithPSK(ctx context.Context, addr string) (*grpc.ClientConn, error) {
+	replicaSecret := cfg.GetReplicaSecret()
+	if replicaSecret == "" {
+		return nil, fmt.Errorf("replica.secret is required for connecting to cluster")
+	}
+
+	keepaliveTime := time.Duration(cfg.Config.GRPCClient.KeepaliveTimeSeconds) * time.Second
+	keepaliveTimeout := time.Duration(cfg.Config.GRPCClient.KeepaliveTimeoutSeconds) * time.Second
+
+	conn, err := grpc.DialContext(ctx, addr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithBlock(),
+		grpc.WithKeepaliveParams(keepalive.ClientParameters{
+			Time:                keepaliveTime,
+			Timeout:             keepaliveTimeout,
+			PermitWithoutStream: true,
+		}),
+		grpc.WithDefaultCallOptions(
+			grpc.MaxCallRecvMsgSize(100*1024*1024),
+			grpc.MaxCallSendMsgSize(100*1024*1024),
+		),
+		grpc.WithChainUnaryInterceptor(marmotgrpc.UnaryClientInterceptorWithSecret(replicaSecret)),
+		grpc.WithChainStreamInterceptor(marmotgrpc.StreamClientInterceptorWithSecret(replicaSecret)),
+	)
+	return conn, err
+}
+
+// mergeClusterView merges discovered nodes into local cluster view
+func (s *StreamClient) mergeClusterView(nodes []*marmotgrpc.NodeState) {
+	s.clusterMu.Lock()
+	defer s.clusterMu.Unlock()
+
+	for _, node := range nodes {
+		existing, ok := s.clusterNodes[node.NodeId]
+		if !ok || node.Incarnation > existing.Incarnation {
+			s.clusterNodes[node.NodeId] = node
+
+			// Remove temp entry if we now have real node ID
+			for id, n := range s.clusterNodes {
+				if n.Address == node.Address && id != node.NodeId {
+					delete(s.clusterNodes, id)
+					break
+				}
+			}
+		}
+	}
+}
+
+// selectAliveNode selects a random alive node (excluding current node)
+func (s *StreamClient) selectAliveNode() (string, uint64, error) {
+	s.clusterMu.RLock()
+	defer s.clusterMu.RUnlock()
+
+	var candidates []*marmotgrpc.NodeState
+	for _, node := range s.clusterNodes {
+		if node.Status == marmotgrpc.NodeStatus_ALIVE && node.Address != s.currentAddr {
+			candidates = append(candidates, node)
+		}
+	}
+
+	if len(candidates) == 0 {
+		return "", 0, fmt.Errorf("no alive nodes available")
+	}
+
+	// Random selection for load distribution
+	selected := candidates[rand.Intn(len(candidates))]
+	return selected.Address, selected.NodeId, nil
+}
+
+// failover attempts to connect to a different alive node
+func (s *StreamClient) failover() error {
+	deadline := time.Now().Add(time.Duration(cfg.Config.Replica.FailoverTimeoutSec) * time.Second)
+
+	for time.Now().Before(deadline) {
+		// Refresh cluster view
+		s.discoverClusterNodes()
+
+		addr, nodeID, err := s.selectAliveNode()
+		if err != nil {
+			log.Debug().Err(err).Msg("No alive nodes, retrying...")
+			time.Sleep(time.Second)
+			continue
+		}
+
+		log.Info().
+			Str("from", s.currentAddr).
+			Str("to", addr).
+			Uint64("node_id", nodeID).
+			Msg("Attempting failover")
+
+		s.currentAddr = addr
+		if err := s.connect(s.ctx); err != nil {
+			// Mark as potentially unhealthy
+			s.clusterMu.Lock()
+			if node, ok := s.clusterNodes[nodeID]; ok {
+				node.Status = marmotgrpc.NodeStatus_SUSPECT
+			}
+			s.clusterMu.Unlock()
+			continue
+		}
+
+		s.currentNodeID = nodeID
+		return nil
+	}
+
+	return fmt.Errorf("failover timeout after %ds", cfg.Config.Replica.FailoverTimeoutSec)
 }

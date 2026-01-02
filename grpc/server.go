@@ -1050,3 +1050,8 @@ func (s *Server) GetLatestTxnIDs(ctx context.Context, req *LatestTxnIDsRequest) 
 		DatabaseTxnIds: txnIDs,
 	}, nil
 }
+
+// GetClusterNodes returns cluster membership for readonly replicas
+func (s *Server) GetClusterNodes(ctx context.Context, req *GetClusterNodesRequest) (*GetClusterNodesResponse, error) {
+	return &GetClusterNodesResponse{Nodes: s.registry.GetAll()}, nil
+}

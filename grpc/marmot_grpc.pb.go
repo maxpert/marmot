@@ -29,6 +29,7 @@ const (
 	MarmotService_GetSnapshotInfo_FullMethodName      = "/marmot.v2.MarmotService/GetSnapshotInfo"
 	MarmotService_StreamSnapshot_FullMethodName       = "/marmot.v2.MarmotService/StreamSnapshot"
 	MarmotService_GetLatestTxnIDs_FullMethodName      = "/marmot.v2.MarmotService/GetLatestTxnIDs"
+	MarmotService_GetClusterNodes_FullMethodName      = "/marmot.v2.MarmotService/GetClusterNodes"
 )
 
 // MarmotServiceClient is the client API for MarmotService service.
@@ -60,6 +61,9 @@ type MarmotServiceClient interface {
 	StreamSnapshot(ctx context.Context, in *SnapshotRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[SnapshotChunk], error)
 	// Get latest transaction IDs per database (for delta sync detection)
 	GetLatestTxnIDs(ctx context.Context, in *LatestTxnIDsRequest, opts ...grpc.CallOption) (*LatestTxnIDsResponse, error)
+	// GetClusterNodes returns cluster membership for readonly replicas.
+	// Read-only - does not modify cluster state.
+	GetClusterNodes(ctx context.Context, in *GetClusterNodesRequest, opts ...grpc.CallOption) (*GetClusterNodesResponse, error)
 }
 
 type marmotServiceClient struct {
@@ -188,6 +192,16 @@ func (c *marmotServiceClient) GetLatestTxnIDs(ctx context.Context, in *LatestTxn
 	return out, nil
 }
 
+func (c *marmotServiceClient) GetClusterNodes(ctx context.Context, in *GetClusterNodesRequest, opts ...grpc.CallOption) (*GetClusterNodesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetClusterNodesResponse)
+	err := c.cc.Invoke(ctx, MarmotService_GetClusterNodes_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // MarmotServiceServer is the server API for MarmotService service.
 // All implementations must embed UnimplementedMarmotServiceServer
 // for forward compatibility.
@@ -217,6 +231,9 @@ type MarmotServiceServer interface {
 	StreamSnapshot(*SnapshotRequest, grpc.ServerStreamingServer[SnapshotChunk]) error
 	// Get latest transaction IDs per database (for delta sync detection)
 	GetLatestTxnIDs(context.Context, *LatestTxnIDsRequest) (*LatestTxnIDsResponse, error)
+	// GetClusterNodes returns cluster membership for readonly replicas.
+	// Read-only - does not modify cluster state.
+	GetClusterNodes(context.Context, *GetClusterNodesRequest) (*GetClusterNodesResponse, error)
 	mustEmbedUnimplementedMarmotServiceServer()
 }
 
@@ -256,6 +273,9 @@ func (UnimplementedMarmotServiceServer) StreamSnapshot(*SnapshotRequest, grpc.Se
 }
 func (UnimplementedMarmotServiceServer) GetLatestTxnIDs(context.Context, *LatestTxnIDsRequest) (*LatestTxnIDsResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetLatestTxnIDs not implemented")
+}
+func (UnimplementedMarmotServiceServer) GetClusterNodes(context.Context, *GetClusterNodesRequest) (*GetClusterNodesResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetClusterNodes not implemented")
 }
 func (UnimplementedMarmotServiceServer) mustEmbedUnimplementedMarmotServiceServer() {}
 func (UnimplementedMarmotServiceServer) testEmbeddedByValue()                       {}
@@ -444,6 +464,24 @@ func _MarmotService_GetLatestTxnIDs_Handler(srv interface{}, ctx context.Context
 	return interceptor(ctx, in, info, handler)
 }
 
+func _MarmotService_GetClusterNodes_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetClusterNodesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MarmotServiceServer).GetClusterNodes(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: MarmotService_GetClusterNodes_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MarmotServiceServer).GetClusterNodes(ctx, req.(*GetClusterNodesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // MarmotService_ServiceDesc is the grpc.ServiceDesc for MarmotService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -482,6 +520,10 @@ var MarmotService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetLatestTxnIDs",
 			Handler:    _MarmotService_GetLatestTxnIDs_Handler,
+		},
+		{
+			MethodName: "GetClusterNodes",
+			Handler:    _MarmotService_GetClusterNodes_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

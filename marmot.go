@@ -73,8 +73,8 @@ func main() {
 	if cfg.IsReplicaMode() {
 		log.Info().Msg("Marmot v2.0 - Read-Only Replica Mode")
 		log.Info().
-			Str("master_address", cfg.Config.Replica.MasterAddress).
-			Msg("Following master node")
+			Strs("follow_addresses", cfg.Config.Replica.FollowAddresses).
+			Msg("Following cluster nodes")
 
 		// Warn if cluster authentication is not configured
 		if !cfg.IsClusterAuthEnabled() {

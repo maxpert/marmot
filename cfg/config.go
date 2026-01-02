@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"os"
+	"strings"
 
 	"github.com/BurntSushi/toml"
 	"github.com/denisbrodbeck/machineid"
@@ -133,14 +134,16 @@ type QueryPipelineConfiguration struct {
 }
 
 // ReplicaConfiguration controls read-only replica mode
-// When enabled, the node follows a single master without joining the cluster
+// When enabled, the node follows seed nodes for discovery without joining the cluster
 type ReplicaConfiguration struct {
-	Enabled                bool   `toml:"enabled"`                       // Enable read-only replica mode
-	MasterAddress          string `toml:"master_address"`                // Master node gRPC address (required when enabled)
-	ReconnectIntervalSec   int    `toml:"reconnect_interval_seconds"`    // Initial reconnect interval (default: 5)
-	ReconnectMaxBackoffSec int    `toml:"reconnect_max_backoff_seconds"` // Max reconnect backoff (default: 30)
-	InitialSyncTimeoutMin  int    `toml:"initial_sync_timeout_minutes"`  // Timeout for initial snapshot (default: 30)
-	Secret                 string `toml:"secret"`                        // PSK for authenticating with master (env: MARMOT_REPLICA_SECRET)
+	Enabled                bool     `toml:"enabled"`                       // Enable read-only replica mode
+	FollowAddresses        []string `toml:"follow_addresses"`              // Seed nodes for discovery (required when enabled)
+	Secret                 string   `toml:"secret"`                        // PSK for authenticating with cluster (env: MARMOT_REPLICA_SECRET)
+	DiscoveryIntervalSec   int      `toml:"discovery_interval_seconds"`    // Discovery interval (default: 30)
+	FailoverTimeoutSec     int      `toml:"failover_timeout_seconds"`      // Failover timeout (default: 60)
+	ReconnectIntervalSec   int      `toml:"reconnect_interval_seconds"`    // Initial reconnect interval (default: 5)
+	ReconnectMaxBackoffSec int      `toml:"reconnect_max_backoff_seconds"` // Max reconnect backoff (default: 30)
+	InitialSyncTimeoutMin  int      `toml:"initial_sync_timeout_minutes"`  // Timeout for initial snapshot (default: 30)
 }
 
 // PublisherConfiguration configures the CDC publishing system
@@ -190,11 +193,12 @@ type Configuration struct {
 
 // Command line flags
 var (
-	ConfigPathFlag = flag.String("config", "config.toml", "Path to configuration file")
-	DataDirFlag    = flag.String("data-dir", "", "Data directory (overrides config)")
-	NodeIDFlag     = flag.Uint64("node-id", 0, "Node ID (overrides config, 0=auto)")
-	GRPCPortFlag   = flag.Int("grpc-port", 0, "gRPC port (overrides config)")
-	MySQLPortFlag  = flag.Int("mysql-port", 0, "MySQL port (overrides config)")
+	ConfigPathFlag  = flag.String("config", "config.toml", "Path to configuration file")
+	DataDirFlag     = flag.String("data-dir", "", "Data directory (overrides config)")
+	NodeIDFlag      = flag.Uint64("node-id", 0, "Node ID (overrides config, 0=auto)")
+	GRPCPortFlag    = flag.Int("grpc-port", 0, "gRPC port (overrides config)")
+	MySQLPortFlag   = flag.Int("mysql-port", 0, "MySQL port (overrides config)")
+	FollowAddrsFlag = flag.String("follow-addresses", "", "Comma-separated addresses for replica mode")
 )
 
 // Default configuration
@@ -288,7 +292,9 @@ var Config = &Configuration{
 
 	Replica: ReplicaConfiguration{
 		Enabled:                false,
-		MasterAddress:          "",
+		FollowAddresses:        []string{},
+		DiscoveryIntervalSec:   30,
+		FailoverTimeoutSec:     60,
 		ReconnectIntervalSec:   5,
 		ReconnectMaxBackoffSec: 30,
 		InitialSyncTimeoutMin:  30,
@@ -336,6 +342,9 @@ func Load(configPath string) error {
 	}
 	if *MySQLPortFlag != 0 {
 		Config.MySQL.Port = *MySQLPortFlag
+	}
+	if *FollowAddrsFlag != "" {
+		Config.Replica.FollowAddresses = strings.Split(*FollowAddrsFlag, ",")
 	}
 
 	// Environment variable override for cluster secret (takes precedence over config)
@@ -603,9 +612,9 @@ func Validate() error {
 
 	// Validate replica configuration
 	if Config.Replica.Enabled {
-		// Master address is required
-		if Config.Replica.MasterAddress == "" {
-			return fmt.Errorf("replica.master_address is required when replica mode is enabled")
+		// Follow addresses are required
+		if len(Config.Replica.FollowAddresses) == 0 {
+			return fmt.Errorf("replica.follow_addresses is required when replica mode is enabled")
 		}
 
 		// Replica secret is required for authentication
@@ -616,6 +625,16 @@ func Validate() error {
 		// Replica mode and cluster mode are mutually exclusive
 		if len(Config.Cluster.SeedNodes) > 0 {
 			return fmt.Errorf("replica mode cannot be used with cluster seed_nodes - replicas do not join the cluster")
+		}
+
+		// Validate discovery interval
+		if Config.Replica.DiscoveryIntervalSec < 1 {
+			return fmt.Errorf("replica.discovery_interval_seconds must be >= 1")
+		}
+
+		// Validate failover timeout
+		if Config.Replica.FailoverTimeoutSec < 1 {
+			return fmt.Errorf("replica.failover_timeout_seconds must be >= 1")
 		}
 
 		// Validate reconnect intervals

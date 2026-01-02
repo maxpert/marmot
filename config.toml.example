@@ -269,13 +269,20 @@ incremental_threshold = 10000
 # ==============================================================================
 
 [replica]
-# Enable read-only replica mode (follows a single master)
-# When enabled, the node does NOT join the cluster - it only follows the master
+# Enable read-only replica mode (follows cluster nodes with transparent failover)
+# When enabled, the node does NOT join the cluster - it only streams changes
 enabled = false
 
-# Master node gRPC address (required when enabled)
-# Example: "master.example.com:8080"
-master_address = ""
+# Seed nodes for cluster discovery (required when enabled)
+# The replica will discover other nodes and failover automatically
+# Example: ["node1:8080", "node2:8080", "node3:8080"]
+follow_addresses = []
+
+# Discovery interval - how often to poll for cluster membership (seconds)
+discovery_interval_seconds = 30
+
+# Failover timeout - max time to find an alive node during failover (seconds)
+failover_timeout_seconds = 60
 
 # Initial reconnect interval (seconds)
 reconnect_interval_seconds = 5
@@ -286,7 +293,7 @@ reconnect_max_backoff_seconds = 30
 # Timeout for initial snapshot sync (minutes)
 initial_sync_timeout_minutes = 30
 
-# PSK for authenticating with master (or set MARMOT_REPLICA_SECRET env var)
+# PSK for authenticating with cluster (or set MARMOT_REPLICA_SECRET env var)
 # Required when replica mode is enabled
 secret = ""
 

@@ -51,7 +51,6 @@ func (s ReplicaState) String() string {
 
 // Replica is the main read-only replica orchestrator
 type Replica struct {
-	masterAddr   string
 	nodeID       uint64
 	dataDir      string
 	dbManager    *db.DatabaseManager
@@ -67,14 +66,13 @@ type Replica struct {
 }
 
 // NewReplica creates a new replica instance
-func NewReplica(masterAddr string, nodeID uint64, dataDir string) *Replica {
+func NewReplica(nodeID uint64, dataDir string) *Replica {
 	ctx, cancel := context.WithCancel(context.Background())
 	r := &Replica{
-		masterAddr: masterAddr,
-		nodeID:     nodeID,
-		dataDir:    dataDir,
-		ctx:        ctx,
-		cancel:     cancel,
+		nodeID:  nodeID,
+		dataDir: dataDir,
+		ctx:     ctx,
+		cancel:  cancel,
 	}
 	r.state.Store(int32(StateInitializing))
 	return r
@@ -114,7 +112,6 @@ func Run() {
 
 	// Create replica instance
 	replica := NewReplica(
-		cfg.Config.Replica.MasterAddress,
 		cfg.Config.NodeID,
 		cfg.Config.DataDir,
 	)
@@ -135,7 +132,7 @@ func Run() {
 	// Initialize stream client
 	log.Info().Msg("Initializing stream client")
 	replica.streamClient = NewStreamClient(
-		replica.masterAddr,
+		cfg.Config.Replica.FollowAddresses,
 		replica.nodeID,
 		dbMgr,
 		replica.clock,
@@ -196,7 +193,7 @@ func Run() {
 
 	log.Info().
 		Uint64("node_id", cfg.Config.NodeID).
-		Str("master", cfg.Config.Replica.MasterAddress).
+		Strs("follow_addresses", cfg.Config.Replica.FollowAddresses).
 		Int("mysql_port", cfg.Config.MySQL.Port).
 		Str("data_dir", cfg.Config.DataDir).
 		Msg("Read-only replica is operational")

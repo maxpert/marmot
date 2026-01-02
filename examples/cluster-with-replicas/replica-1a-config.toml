@@ -1,13 +1,15 @@
 # Marmot v2.0 - Read-Only Replica 1A
-# Follows Node 1 (master)
+# Follows cluster nodes for transparent failover
 
 node_id = 101
 data_dir = "/tmp/marmot-cluster/replica-1a"
 
 [replica]
 enabled = true
-master_address = "localhost:8081"
+follow_addresses = ["localhost:8081", "localhost:8082", "localhost:8083"]
 secret = "cluster-secret-key"
+discovery_interval_seconds = 30
+failover_timeout_seconds = 60
 reconnect_interval_seconds = 5
 reconnect_max_backoff_seconds = 30
 initial_sync_timeout_minutes = 30
