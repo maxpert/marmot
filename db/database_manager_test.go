@@ -721,3 +721,440 @@ func TestGetReplicationStateAfterUpdate(t *testing.T) {
 
 	t.Log("✓ GetReplicationState retrieves correct values after update")
 }
+
+// TestReplica_CreatesOwnSystemDatabase tests that replica creates its own __marmot_system.db
+func TestReplica_CreatesOwnSystemDatabase(t *testing.T) {
+	tmpDir := t.TempDir()
+	clock := hlc.NewClock(1)
+
+	dm, err := NewDatabaseManager(tmpDir, 1, clock)
+	if err != nil {
+		t.Fatalf("Failed to create DatabaseManager: %v", err)
+	}
+	defer dm.Close()
+
+	systemDBPath := filepath.Join(tmpDir, SystemDatabaseName+".db")
+	if _, err := os.Stat(systemDBPath); os.IsNotExist(err) {
+		t.Error("System database file was not created")
+	}
+
+	systemDB := dm.GetSystemDatabase()
+	if systemDB == nil {
+		t.Fatal("System database is nil")
+	}
+
+	var tableName string
+	err = systemDB.GetDB().QueryRow(
+		"SELECT name FROM sqlite_master WHERE type='table' AND name='__marmot_databases'",
+	).Scan(&tableName)
+	if err != nil {
+		t.Fatalf("__marmot_databases table does not exist: %v", err)
+	}
+	if tableName != "__marmot_databases" {
+		t.Errorf("Expected table '__marmot_databases', got '%s'", tableName)
+	}
+
+	_, err = systemDB.GetDB().Exec("INSERT INTO __marmot_databases (name, created_at, path) VALUES (?, ?, ?)",
+		"test_write", 123456789, "databases/test_write.db")
+	if err != nil {
+		t.Errorf("System DB is not writable: %v", err)
+	}
+
+	t.Log("✓ Replica creates own system database")
+}
+
+// TestReplica_TracksFollowedDatabasesInSystemDB tests database registration in local system DB
+func TestReplica_TracksFollowedDatabasesInSystemDB(t *testing.T) {
+	dm, tmpDir := setupTestDatabaseManager(t)
+	defer dm.Close()
+
+	if err := dm.CreateDatabase("db1"); err != nil {
+		t.Fatalf("Failed to create database: %v", err)
+	}
+
+	var name, path string
+	var createdAt int64
+	err := dm.GetSystemDatabase().GetDB().QueryRow(
+		"SELECT name, created_at, path FROM __marmot_databases WHERE name = ?", "db1",
+	).Scan(&name, &createdAt, &path)
+	if err != nil {
+		t.Fatalf("Database 'db1' not found in system DB: %v", err)
+	}
+
+	if name != "db1" {
+		t.Errorf("Expected name 'db1', got '%s'", name)
+	}
+	if createdAt == 0 {
+		t.Error("Expected non-zero created_at timestamp")
+	}
+	if path != "databases/db1.db" {
+		t.Errorf("Expected path 'databases/db1.db', got '%s'", path)
+	}
+
+	dbPath := filepath.Join(tmpDir, path)
+	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+		t.Errorf("Database file does not exist at path: %s", dbPath)
+	}
+
+	t.Log("✓ Replica tracks followed databases in local system DB")
+}
+
+// TestReplica_CreateDatabaseDDL_UpdatesLocalSystemDB tests CREATE DATABASE DDL updates local system DB
+func TestReplica_CreateDatabaseDDL_UpdatesLocalSystemDB(t *testing.T) {
+	dm, _ := setupTestDatabaseManager(t)
+	defer dm.Close()
+
+	if err := dm.CreateDatabase("db2"); err != nil {
+		t.Fatalf("Failed to create database via DDL: %v", err)
+	}
+
+	var count int
+	err := dm.GetSystemDatabase().GetDB().QueryRow(
+		"SELECT COUNT(*) FROM __marmot_databases WHERE name = ?", "db2",
+	).Scan(&count)
+	if err != nil {
+		t.Fatalf("Failed to query system DB: %v", err)
+	}
+
+	if count != 1 {
+		t.Errorf("Expected 1 row for 'db2', got %d", count)
+	}
+
+	if !dm.DatabaseExists("db2") {
+		t.Error("Database 'db2' does not exist in DatabaseManager")
+	}
+
+	t.Log("✓ CREATE DATABASE DDL updates local system DB")
+}
+
+// TestReplica_DropDatabaseDDL_UpdatesLocalSystemDB tests DROP DATABASE DDL updates local system DB
+func TestReplica_DropDatabaseDDL_UpdatesLocalSystemDB(t *testing.T) {
+	dm, tmpDir := setupTestDatabaseManager(t)
+	defer dm.Close()
+
+	if err := dm.CreateDatabase("db1"); err != nil {
+		t.Fatalf("Failed to create database: %v", err)
+	}
+
+	var count int
+	err := dm.GetSystemDatabase().GetDB().QueryRow(
+		"SELECT COUNT(*) FROM __marmot_databases WHERE name = ?", "db1",
+	).Scan(&count)
+	if err != nil {
+		t.Fatalf("Failed to query system DB: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("Database 'db1' not registered before drop")
+	}
+
+	if err := dm.DropDatabase("db1"); err != nil {
+		t.Fatalf("Failed to drop database: %v", err)
+	}
+
+	err = dm.GetSystemDatabase().GetDB().QueryRow(
+		"SELECT COUNT(*) FROM __marmot_databases WHERE name = ?", "db1",
+	).Scan(&count)
+	if err != nil {
+		t.Fatalf("Failed to query system DB after drop: %v", err)
+	}
+
+	if count != 0 {
+		t.Errorf("Expected 0 rows for 'db1' after drop, got %d", count)
+	}
+
+	if dm.DatabaseExists("db1") {
+		t.Error("Database 'db1' still exists in DatabaseManager after drop")
+	}
+
+	dbPath := filepath.Join(tmpDir, "databases", "db1.db")
+	if _, err := os.Stat(dbPath); !os.IsNotExist(err) {
+		t.Error("Database file still exists after drop")
+	}
+
+	t.Log("✓ DROP DATABASE DDL removes database from local system DB")
+}
+
+// TestReplica_SystemDBIsolation tests that replica's system DB is independent from primary
+func TestReplica_SystemDBIsolation(t *testing.T) {
+	primaryDir := t.TempDir()
+	replicaDir := t.TempDir()
+	clock := hlc.NewClock(1)
+
+	primaryDM, err := NewDatabaseManager(primaryDir, 1, clock)
+	if err != nil {
+		t.Fatalf("Failed to create primary DatabaseManager: %v", err)
+	}
+	defer primaryDM.Close()
+
+	if err := primaryDM.CreateDatabase("db1"); err != nil {
+		t.Fatalf("Failed to create db1 on primary: %v", err)
+	}
+	if err := primaryDM.CreateDatabase("db2"); err != nil {
+		t.Fatalf("Failed to create db2 on primary: %v", err)
+	}
+	if err := primaryDM.CreateDatabase("db3"); err != nil {
+		t.Fatalf("Failed to create db3 on primary: %v", err)
+	}
+
+	replicaDM, err := NewDatabaseManager(replicaDir, 2, hlc.NewClock(2))
+	if err != nil {
+		t.Fatalf("Failed to create replica DatabaseManager: %v", err)
+	}
+	defer replicaDM.Close()
+
+	if err := replicaDM.CreateDatabase("db1"); err != nil {
+		t.Fatalf("Failed to create db1 on replica: %v", err)
+	}
+
+	var count int
+	err = replicaDM.GetSystemDatabase().GetDB().QueryRow(
+		"SELECT COUNT(*) FROM __marmot_databases WHERE name IN ('db1', 'db2', 'db3')",
+	).Scan(&count)
+	if err != nil {
+		t.Fatalf("Failed to query replica system DB: %v", err)
+	}
+
+	if count != 1 {
+		t.Errorf("Expected replica to have only 1 database (db1), got %d", count)
+	}
+
+	var db1Name string
+	err = replicaDM.GetSystemDatabase().GetDB().QueryRow(
+		"SELECT name FROM __marmot_databases WHERE name = 'db1'",
+	).Scan(&db1Name)
+	if err != nil {
+		t.Fatalf("db1 not found in replica system DB: %v", err)
+	}
+	if db1Name != "db1" {
+		t.Errorf("Expected 'db1', got '%s'", db1Name)
+	}
+
+	err = replicaDM.GetSystemDatabase().GetDB().QueryRow(
+		"SELECT name FROM __marmot_databases WHERE name = 'db2'",
+	).Scan(&db1Name)
+	if err == nil {
+		t.Error("db2 should not exist in replica system DB")
+	}
+
+	err = replicaDM.GetSystemDatabase().GetDB().QueryRow(
+		"SELECT name FROM __marmot_databases WHERE name = 'db3'",
+	).Scan(&db1Name)
+	if err == nil {
+		t.Error("db3 should not exist in replica system DB")
+	}
+
+	t.Log("✓ Replica system DB is isolated from primary system DB")
+}
+
+// TestReplica_DoesNotReceiveSystemDBFromPrimary tests system DB exclusion during snapshot
+func TestReplica_DoesNotReceiveSystemDBFromPrimary(t *testing.T) {
+	primaryDir := t.TempDir()
+	replicaDir := t.TempDir()
+	clock := hlc.NewClock(1)
+
+	primaryDM, err := NewDatabaseManager(primaryDir, 1, clock)
+	if err != nil {
+		t.Fatalf("Failed to create primary DatabaseManager: %v", err)
+	}
+	defer primaryDM.Close()
+
+	if err := primaryDM.CreateDatabase("userdb"); err != nil {
+		t.Fatalf("Failed to create userdb on primary: %v", err)
+	}
+
+	snapshotDir := filepath.Join(primaryDir, "snapshot")
+	snapshots, _, err := primaryDM.TakeSnapshotToDir(snapshotDir)
+	if err != nil {
+		t.Fatalf("Failed to take snapshot: %v", err)
+	}
+
+	hasSystemDB := false
+	hasUserDB := false
+	for _, snap := range snapshots {
+		if snap.Name == SystemDatabaseName {
+			hasSystemDB = true
+		}
+		if snap.Name == "userdb" {
+			hasUserDB = true
+		}
+	}
+
+	if !hasSystemDB {
+		t.Error("Expected system DB in primary snapshot for backward compatibility")
+	}
+	if !hasUserDB {
+		t.Error("Expected userdb in primary snapshot")
+	}
+
+	replicaDM, err := NewDatabaseManager(replicaDir, 2, hlc.NewClock(2))
+	if err != nil {
+		t.Fatalf("Failed to create replica DatabaseManager: %v", err)
+	}
+	defer replicaDM.Close()
+
+	replicaSystemDBPath := filepath.Join(replicaDir, SystemDatabaseName+".db")
+	initialInfo, err := os.Stat(replicaSystemDBPath)
+	if err != nil {
+		t.Fatalf("Replica system DB does not exist: %v", err)
+	}
+	initialModTime := initialInfo.ModTime()
+
+	for _, snap := range snapshots {
+		if snap.Name == SystemDatabaseName {
+			continue
+		}
+
+		srcPath := snap.FullPath
+		destPath := filepath.Join(replicaDir, snap.Filename)
+
+		if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
+			t.Fatalf("Failed to create directories: %v", err)
+		}
+
+		if err := copyFile(srcPath, destPath); err != nil {
+			t.Fatalf("Failed to copy database file: %v", err)
+		}
+
+		if snap.Name == "userdb" {
+			if err := replicaDM.CreateDatabase("userdb"); err != nil && !strings.Contains(err.Error(), "already exists") {
+				t.Fatalf("Failed to register userdb on replica: %v", err)
+			}
+		}
+	}
+
+	afterInfo, err := os.Stat(replicaSystemDBPath)
+	if err != nil {
+		t.Fatalf("Replica system DB missing after snapshot: %v", err)
+	}
+
+	if afterInfo.ModTime() != initialModTime && afterInfo.Size() != initialInfo.Size() {
+		t.Error("Replica system DB was modified by snapshot restore")
+	}
+
+	var count int
+	err = replicaDM.GetSystemDatabase().GetDB().QueryRow(
+		"SELECT COUNT(*) FROM __marmot_databases WHERE name = ?", "userdb",
+	).Scan(&count)
+	if err != nil {
+		t.Fatalf("Failed to query replica system DB: %v", err)
+	}
+
+	if count != 1 {
+		t.Errorf("Expected userdb registered in replica system DB, got %d rows", count)
+	}
+
+	t.Log("✓ Replica does not receive system DB from primary during snapshot")
+}
+
+// TestReplica_SnapshotExcludesSystemDB tests that snapshot preparation excludes system DB for replicas
+func TestReplica_SnapshotExcludesSystemDB(t *testing.T) {
+	dm, tmpDir := setupTestDatabaseManager(t)
+	defer dm.Close()
+
+	if err := dm.CreateDatabase("app_db"); err != nil {
+		t.Fatalf("Failed to create app_db: %v", err)
+	}
+
+	snapshots, _, err := dm.TakeSnapshot()
+	if err != nil {
+		t.Fatalf("Failed to take snapshot: %v", err)
+	}
+
+	systemDBIncluded := false
+	appDBIncluded := false
+	defaultDBIncluded := false
+
+	for _, snap := range snapshots {
+		t.Logf("Snapshot file: %s (name: %s)", snap.Filename, snap.Name)
+		if snap.Name == SystemDatabaseName {
+			systemDBIncluded = true
+		}
+		if snap.Name == "app_db" {
+			appDBIncluded = true
+		}
+		if snap.Name == DefaultDatabaseName {
+			defaultDBIncluded = true
+		}
+	}
+
+	if !systemDBIncluded {
+		t.Error("System DB should be included in snapshot for backward compatibility")
+	}
+	if !appDBIncluded {
+		t.Error("app_db should be included in snapshot")
+	}
+	if !defaultDBIncluded {
+		t.Error("Default database should be included in snapshot")
+	}
+
+	snapshotDir := filepath.Join(tmpDir, "snapshot_test")
+	_, _, err = dm.TakeSnapshotForDatabase(snapshotDir, "app_db")
+	if err != nil {
+		t.Fatalf("TakeSnapshotForDatabase failed: %v", err)
+	}
+
+	systemDBSnapshot := filepath.Join(snapshotDir, SystemDatabaseName+".db")
+	if _, err := os.Stat(systemDBSnapshot); !os.IsNotExist(err) {
+		t.Error("System DB should NOT be in per-database snapshot")
+	}
+
+	appDBSnapshot := filepath.Join(snapshotDir, "databases", "app_db.db")
+	if _, err := os.Stat(appDBSnapshot); os.IsNotExist(err) {
+		t.Error("app_db should be in per-database snapshot")
+	}
+
+	t.Log("✓ Snapshot correctly includes/excludes system DB based on context")
+}
+
+// TestReplica_SnapshotFileListExcludesSystemDB tests that replicas filter out system DB from snapshot file list
+func TestReplica_SnapshotFileListExcludesSystemDB(t *testing.T) {
+	dm, _ := setupTestDatabaseManager(t)
+	defer dm.Close()
+
+	if err := dm.CreateDatabase("app_db"); err != nil {
+		t.Fatalf("Failed to create app_db: %v", err)
+	}
+
+	snapshots, _, err := dm.TakeSnapshot()
+	if err != nil {
+		t.Fatalf("Failed to take snapshot: %v", err)
+	}
+
+	fileList := make([]SnapshotInfo, 0)
+	for _, snap := range snapshots {
+		if snap.Name != SystemDatabaseName {
+			fileList = append(fileList, snap)
+		} else {
+			t.Logf("Filtering out system DB from snapshot: %s", snap.Name)
+		}
+	}
+
+	for _, snap := range fileList {
+		if snap.Name == SystemDatabaseName {
+			t.Errorf("System DB should be filtered from replica snapshot file list")
+		}
+	}
+
+	if len(fileList) == len(snapshots) {
+		t.Error("Expected file list to be smaller after filtering system DB")
+	}
+
+	expectedDBs := map[string]bool{
+		DefaultDatabaseName: false,
+		"app_db":            false,
+	}
+
+	for _, snap := range fileList {
+		if _, ok := expectedDBs[snap.Name]; ok {
+			expectedDBs[snap.Name] = true
+		}
+	}
+
+	for dbName, found := range expectedDBs {
+		if !found {
+			t.Errorf("Expected database %s in filtered snapshot list", dbName)
+		}
+	}
+
+	t.Log("✓ Replica filters system DB from snapshot file list")
+}

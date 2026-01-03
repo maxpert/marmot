@@ -63,6 +63,7 @@ require (
 	github.com/prometheus/procfs v0.17.0 // indirect
 	github.com/rogpeppe/go-internal v1.14.1 // indirect
 	github.com/spf13/pflag v1.0.10 // indirect
+	github.com/stretchr/objx v0.5.2 // indirect
 	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
 	go.yaml.in/yaml/v2 v2.4.3 // indirect
 	golang.org/x/crypto v0.43.0 // indirect
