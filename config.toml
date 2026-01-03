@@ -214,6 +214,51 @@ max_connections = 1000
 auto_id_mode = "compact"
 
 # ==============================================================================
+# REPLICA MODE (Read-Only Replicas)
+# ==============================================================================
+
+# [replica]
+# # Enable read-only replica mode (mutually exclusive with cluster mode)
+# enabled = false
+#
+# # Seed nodes to follow for replication (required when enabled)
+# # Example: ["node1:8080", "node2:8080", "node3:8080"]
+# follow_addresses = []
+#
+# # PSK for authenticating with cluster (required when enabled)
+# # Can also be set via MARMOT_REPLICA_SECRET environment variable (takes precedence)
+# secret = ""
+#
+# # Filter which databases to replicate (empty = all databases)
+# # Supports exact names and glob patterns: ["myapp", "prod_*", "staging_*"]
+# # System database (__marmot_system) is never replicated
+# replicate_databases = []
+#
+# # Database discovery: poll for new databases (seconds)
+# database_discovery_interval_seconds = 10
+#
+# # Cluster discovery: poll for cluster membership updates (seconds)
+# discovery_interval_seconds = 30
+#
+# # Failover: max time to find alive node during failover (seconds)
+# failover_timeout_seconds = 60
+#
+# # Reconnect: initial delay after disconnect (seconds)
+# reconnect_interval_seconds = 5
+#
+# # Reconnect: maximum backoff delay (seconds)
+# reconnect_max_backoff_seconds = 30
+#
+# # Initial sync: timeout for snapshot download (minutes)
+# initial_sync_timeout_minutes = 30
+#
+# # Snapshot: number of parallel database downloads
+# snapshot_concurrency = 3
+#
+# # Snapshot: cache TTL to avoid redundant snapshot creation (seconds)
+# snapshot_cache_ttl_seconds = 30
+
+# ==============================================================================
 # SNAPSHOT (Not yet implemented)
 # ==============================================================================
 

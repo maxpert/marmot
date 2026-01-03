@@ -361,12 +361,20 @@ Scale reads globally with replica mode and transparent failover:
 [replica]
 enabled = true
 follow_addresses = ["central-cluster-1:8080", "central-cluster-2:8080", "central-cluster-3:8080"]
-discovery_interval_seconds = 30
-failover_timeout_seconds = 60
+replicate_databases = []                    # Filter databases (empty = all, supports glob patterns)
+database_discovery_interval_seconds = 10    # Poll for new databases (default: 10)
+discovery_interval_seconds = 30             # Poll for cluster membership (default: 30)
+failover_timeout_seconds = 60               # Failover timeout (default: 60)
+snapshot_concurrency = 3                    # Parallel snapshot downloads (default: 3)
+snapshot_cache_ttl_seconds = 30             # Snapshot cache TTL (default: 30)
 ```
 
 - Discovers cluster nodes automatically via `GetClusterNodes` RPC
 - Transparent failover when current source becomes unavailable
+- Automatic discovery of new databases with configurable polling
+- Per-database selective replication with glob pattern support
+- Parallel snapshot downloads with configurable concurrency
+- Snapshot caching for performance optimization
 - Zero cluster participation overhead
 - Auto-reconnect with exponential backoff
 
@@ -753,18 +761,58 @@ For read-only replicas that follow cluster nodes with transparent failover:
 
 ```toml
 [replica]
-enabled = true                           # Enable read-only replica mode
+enabled = true                                   # Enable read-only replica mode
 follow_addresses = ["node1:8080", "node2:8080", "node3:8080"]  # Seed nodes for discovery
-secret = "replica-secret"                # PSK for authentication (required)
-discovery_interval_seconds = 30          # How often to poll for cluster membership
-failover_timeout_seconds = 60            # Max time to find alive node during failover
-reconnect_interval_seconds = 5           # Reconnect delay on disconnect
+secret = "replica-secret"                        # PSK for authentication (required)
+replicate_databases = []                         # Filter databases (empty = all, supports glob patterns like "prod_*")
+database_discovery_interval_seconds = 10         # Poll for new databases (default: 10)
+discovery_interval_seconds = 30                  # Poll for cluster membership (default: 30)
+failover_timeout_seconds = 60                    # Max time to find alive node during failover (default: 60)
+reconnect_interval_seconds = 5                   # Reconnect delay on disconnect (default: 5)
+reconnect_max_backoff_seconds = 30               # Max reconnect backoff (default: 30)
+initial_sync_timeout_minutes = 30                # Timeout for initial snapshot (default: 30)
+snapshot_concurrency = 3                         # Parallel snapshot downloads (default: 3)
+snapshot_cache_ttl_seconds = 30                  # Snapshot cache TTL in seconds (default: 30)
 ```
 
 You can also specify follow addresses via CLI:
 ```bash
 ./marmot --config=replica.toml --follow-addresses=node1:8080,node2:8080,node3:8080
 ```
+
+**Per-Database Selective Replication:**
+
+Control which databases are replicated using the `replicate_databases` filter:
+
+```toml
+[replica]
+# Replicate only specific databases
+replicate_databases = ["myapp", "analytics"]
+
+# Replicate databases matching glob patterns
+replicate_databases = ["prod_*", "staging_*"]
+
+# Replicate all databases (default)
+replicate_databases = []
+```
+
+The system database (`__marmot_system`) is never replicated - each replica maintains its own independent system database.
+
+**Snapshot Caching:**
+
+Replicas use an LRU cache to avoid redundant snapshot creation:
+- Cache TTL controlled by `snapshot_cache_ttl_seconds` (default: 30 seconds)
+- Cached snapshots served from temp storage until expiration
+- Background cleanup runs automatically
+- Improves performance when multiple replicas bootstrap simultaneously
+
+**Parallel Snapshot Downloads:**
+
+Control download concurrency with `snapshot_concurrency`:
+- Downloads multiple database snapshots in parallel (default: 3)
+- Uses worker pool pattern to limit resource usage
+- Partial failure handling: continues even if some databases fail
+- Failed databases retry in background with exponential backoff
 
 **Note:** Replica mode is mutually exclusive with cluster mode. A replica receives all data via streaming replication but cannot accept writes. It automatically discovers cluster nodes and fails over to another node if the current source becomes unavailable.
 
