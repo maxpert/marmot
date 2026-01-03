@@ -846,6 +846,20 @@ func (s *Server) StreamSnapshot(req *SnapshotRequest, stream MarmotService_Strea
 		defer os.RemoveAll(tempDir)
 	}
 
+	// Filter out system database when serving replicas
+	// Replicas maintain their own independent system DB
+	filteredSnapshots := make([]db.SnapshotInfo, 0, len(snapshots))
+	for _, snap := range snapshots {
+		if snap.Name == db.SystemDatabaseName {
+			log.Debug().
+				Str("database", snap.Name).
+				Msg("Excluding system database from replica snapshot")
+			continue
+		}
+		filteredSnapshots = append(filteredSnapshots, snap)
+	}
+	snapshots = filteredSnapshots
+
 	log.Info().
 		Uint64("requesting_node", req.RequestingNodeId).
 		Uint64("snapshot_txn_id", maxTxnID).

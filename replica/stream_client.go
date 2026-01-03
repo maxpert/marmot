@@ -418,8 +418,9 @@ func (s *StreamClient) Start(ctx context.Context) {
 	defer s.wg.Done()
 	defer s.discoveryCancel()
 
-	// Start discovery loop in background
+	// Start discovery loops in background
 	go s.startDiscoveryLoop()
+	go s.startDatabaseDiscoveryLoop(ctx)
 
 	backoff := s.reconnectInterval
 
