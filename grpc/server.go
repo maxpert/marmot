@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/pprof"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -662,11 +663,27 @@ func (s *Server) GetSnapshotInfo(ctx context.Context, req *SnapshotInfoRequest) 
 	// Calculate total size and chunks (estimates)
 	var totalSize int64
 	var dbInfos []*DatabaseFileInfo
+	dbMetadata := make([]*DatabaseSnapshotMetadata, 0, len(snapshots))
+
 	for _, snap := range snapshots {
 		totalSize += snap.Size
 		dbInfos = append(dbInfos, &DatabaseFileInfo{
 			Name:           snap.Name,
 			Filename:       snap.Filename,
+			SizeBytes:      snap.Size,
+			Sha256Checksum: snap.SHA256,
+		})
+
+		// Get per-database txn ID
+		txnID, err := dbManager.GetMaxTxnID(snap.Name)
+		if err != nil {
+			log.Warn().Err(err).Str("database", snap.Name).Msg("Failed to get max txn ID")
+			txnID = 0
+		}
+
+		dbMetadata = append(dbMetadata, &DatabaseSnapshotMetadata{
+			DatabaseName:   snap.Name,
+			SnapshotTxnId:  txnID,
 			SizeBytes:      snap.Size,
 			Sha256Checksum: snap.SHA256,
 		})
@@ -679,6 +696,7 @@ func (s *Server) GetSnapshotInfo(ctx context.Context, req *SnapshotInfoRequest) 
 		SnapshotSizeBytes: totalSize,
 		TotalChunks:       totalChunks,
 		Databases:         dbInfos,
+		DatabaseMetadata:  dbMetadata,
 	}, nil
 }
 
@@ -699,6 +717,7 @@ func (s *Server) StreamSnapshot(req *SnapshotRequest, stream MarmotService_Strea
 
 	log.Info().
 		Uint64("requesting_node", req.RequestingNodeId).
+		Str("database", req.Database).
 		Msg("Starting snapshot stream")
 
 	// Create temp directory for atomic snapshot
@@ -708,10 +727,35 @@ func (s *Server) StreamSnapshot(req *SnapshotRequest, stream MarmotService_Strea
 	}
 	defer os.RemoveAll(tempDir) // Clean up temp dir when done
 
-	// Take atomic snapshot to temp directory (blocks writes briefly)
-	snapshots, maxTxnID, err := dbManager.TakeSnapshotToDir(tempDir)
-	if err != nil {
-		return fmt.Errorf("failed to take snapshot: %w", err)
+	var snapshots []db.SnapshotInfo
+	var maxTxnID uint64
+
+	if req.Database != "" {
+		// Single database snapshot
+		snapshot, txnID, err := dbManager.TakeSnapshotForDatabase(tempDir, req.Database)
+		if err != nil {
+			return fmt.Errorf("failed to snapshot database %s: %w", req.Database, err)
+		}
+		snapshots = []db.SnapshotInfo{snapshot}
+		maxTxnID = txnID
+
+		log.Info().
+			Str("database", req.Database).
+			Uint64("snapshot_txn_id", txnID).
+			Msg("Single database snapshot created")
+
+	} else {
+		// All databases snapshot (backward compatible)
+		var err error
+		snapshots, maxTxnID, err = dbManager.TakeSnapshotToDir(tempDir)
+		if err != nil {
+			return fmt.Errorf("failed to take snapshot: %w", err)
+		}
+
+		log.Info().
+			Int("databases", len(snapshots)).
+			Uint64("snapshot_txn_id", maxTxnID).
+			Msg("Full snapshot created")
 	}
 
 	log.Info().
@@ -1027,6 +1071,7 @@ func (s *Server) GetLatestTxnIDs(ctx context.Context, req *LatestTxnIDsRequest) 
 		Msg("Latest transaction IDs requested")
 
 	txnIDs := make(map[string]uint64)
+	dbInfoList := make([]*DatabaseInfo, 0, len(dbManager.ListDatabases()))
 
 	// Get all databases
 	databases := dbManager.ListDatabases()
@@ -1039,6 +1084,23 @@ func (s *Server) GetLatestTxnIDs(ctx context.Context, req *LatestTxnIDsRequest) 
 			continue
 		}
 		txnIDs[dbName] = maxTxnID
+
+		// Get database size and created_at
+		dbPath := filepath.Join(dbManager.GetDataDir(), "databases", dbName+".db")
+		var sizeBytes int64
+		var createdAt int64
+
+		if info, err := os.Stat(dbPath); err == nil {
+			sizeBytes = info.Size()
+			createdAt = info.ModTime().Unix()
+		}
+
+		dbInfoList = append(dbInfoList, &DatabaseInfo{
+			Name:      dbName,
+			MaxTxnId:  maxTxnID,
+			SizeBytes: sizeBytes,
+			CreatedAt: createdAt,
+		})
 	}
 
 	log.Debug().
@@ -1048,6 +1110,7 @@ func (s *Server) GetLatestTxnIDs(ctx context.Context, req *LatestTxnIDsRequest) 
 
 	return &LatestTxnIDsResponse{
 		DatabaseTxnIds: txnIDs,
+		DatabaseInfo:   dbInfoList,
 	}, nil
 }
 

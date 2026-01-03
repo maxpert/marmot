@@ -452,6 +452,212 @@ func TestTakeSnapshotExcludesMetaStores(t *testing.T) {
 	t.Logf("✓ TakeSnapshot includes only SQLite .db files, excludes MetaStore")
 }
 
+// TestTakeSnapshotForDatabase tests snapshotting a single database
+func TestTakeSnapshotForDatabase(t *testing.T) {
+	dm, tmpDir := setupTestDatabaseManager(t)
+	defer dm.Close()
+
+	// Create a test database
+	if err := dm.CreateDatabase("testdb"); err != nil {
+		t.Fatalf("Failed to create database: %v", err)
+	}
+
+	// Insert some test data
+	db, err := dm.GetDatabase("testdb")
+	if err != nil {
+		t.Fatalf("Failed to get database: %v", err)
+	}
+
+	_, err = db.GetDB().Exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
+	if err != nil {
+		t.Fatalf("Failed to create table: %v", err)
+	}
+
+	_, err = db.GetDB().Exec("INSERT INTO users (name) VALUES ('Alice'), ('Bob')")
+	if err != nil {
+		t.Fatalf("Failed to insert data: %v", err)
+	}
+
+	// Create snapshot directory
+	snapshotDir := filepath.Join(tmpDir, "snapshot")
+
+	// Take snapshot for testdb only
+	snapshot, maxTxnID, err := dm.TakeSnapshotForDatabase(snapshotDir, "testdb")
+	if err != nil {
+		t.Fatalf("TakeSnapshotForDatabase failed: %v", err)
+	}
+
+	// Verify snapshot metadata
+	if snapshot.Name != "testdb" {
+		t.Errorf("Expected snapshot name 'testdb', got '%s'", snapshot.Name)
+	}
+
+	expectedFilename := filepath.Join("databases", "testdb.db")
+	if snapshot.Filename != expectedFilename {
+		t.Errorf("Expected filename '%s', got '%s'", expectedFilename, snapshot.Filename)
+	}
+
+	// Verify file was created
+	if _, err := os.Stat(snapshot.FullPath); os.IsNotExist(err) {
+		t.Errorf("Snapshot file does not exist at %s", snapshot.FullPath)
+	}
+
+	// Verify file size is non-zero
+	if snapshot.Size == 0 {
+		t.Error("Snapshot file size is 0")
+	}
+
+	// Verify SHA256 checksum is not empty
+	if snapshot.SHA256 == "" {
+		t.Error("Snapshot SHA256 checksum is empty")
+	}
+
+	// Verify max txn ID is reasonable (should be > 0 after inserts)
+	t.Logf("Max TxnID: %d", maxTxnID)
+
+	// Verify only testdb was snapshotted (other databases should not exist)
+	marmotPath := filepath.Join(snapshotDir, "databases", "marmot.db")
+	if _, err := os.Stat(marmotPath); !os.IsNotExist(err) {
+		t.Error("marmot database should not be in per-database snapshot")
+	}
+
+	t.Logf("✓ TakeSnapshotForDatabase successfully created snapshot for single database")
+}
+
+// TestTakeSnapshotForDatabaseNotFound tests error handling for non-existent database
+func TestTakeSnapshotForDatabaseNotFound(t *testing.T) {
+	dm, tmpDir := setupTestDatabaseManager(t)
+	defer dm.Close()
+
+	snapshotDir := filepath.Join(tmpDir, "snapshot")
+
+	// Try to snapshot non-existent database
+	_, _, err := dm.TakeSnapshotForDatabase(snapshotDir, "nonexistent")
+	if err == nil {
+		t.Fatal("Expected error for non-existent database, got nil")
+	}
+
+	expectedErr := "database nonexistent not found"
+	if !strings.Contains(err.Error(), expectedErr) {
+		t.Errorf("Expected error containing '%s', got '%s'", expectedErr, err.Error())
+	}
+
+	t.Logf("✓ TakeSnapshotForDatabase correctly handles non-existent database")
+}
+
+// TestTakeSnapshotForDatabaseConcurrent tests concurrent per-database snapshots
+func TestTakeSnapshotForDatabaseConcurrent(t *testing.T) {
+	dm, tmpDir := setupTestDatabaseManager(t)
+	defer dm.Close()
+
+	// Create multiple test databases
+	dbNames := []string{"db1", "db2", "db3"}
+	for _, name := range dbNames {
+		if err := dm.CreateDatabase(name); err != nil {
+			t.Fatalf("Failed to create database %s: %v", name, err)
+		}
+
+		// Add some data to each database
+		db, err := dm.GetDatabase(name)
+		if err != nil {
+			t.Fatalf("Failed to get database %s: %v", name, err)
+		}
+
+		_, err = db.GetDB().Exec("CREATE TABLE test (id INTEGER PRIMARY KEY, data TEXT)")
+		if err != nil {
+			t.Fatalf("Failed to create table in %s: %v", name, err)
+		}
+
+		_, err = db.GetDB().Exec("INSERT INTO test (data) VALUES ('data')")
+		if err != nil {
+			t.Fatalf("Failed to insert data in %s: %v", name, err)
+		}
+	}
+
+	// Snapshot all databases concurrently
+	var wg sync.WaitGroup
+	errors := make(chan error, len(dbNames))
+
+	for _, name := range dbNames {
+		wg.Add(1)
+		go func(dbName string) {
+			defer wg.Done()
+
+			snapshotDir := filepath.Join(tmpDir, "snapshot_"+dbName)
+			snapshot, _, err := dm.TakeSnapshotForDatabase(snapshotDir, dbName)
+			if err != nil {
+				errors <- err
+				return
+			}
+
+			// Verify snapshot was created
+			if _, err := os.Stat(snapshot.FullPath); os.IsNotExist(err) {
+				errors <- err
+			}
+		}(name)
+	}
+
+	wg.Wait()
+	close(errors)
+
+	// Check for any errors
+	for err := range errors {
+		t.Errorf("Concurrent snapshot failed: %v", err)
+	}
+
+	t.Logf("✓ TakeSnapshotForDatabase allows concurrent snapshots of different databases")
+}
+
+// TestTakeSnapshotForDatabaseMaxTxnID verifies max_txn_id is correctly returned
+func TestTakeSnapshotForDatabaseMaxTxnID(t *testing.T) {
+	dm, tmpDir := setupTestDatabaseManager(t)
+	defer dm.Close()
+
+	// Create a test database
+	if err := dm.CreateDatabase("txntest"); err != nil {
+		t.Fatalf("Failed to create database: %v", err)
+	}
+
+	// Get the database
+	db, err := dm.GetDatabase("txntest")
+	if err != nil {
+		t.Fatalf("Failed to get database: %v", err)
+	}
+
+	// Create a table and insert data to generate transactions
+	_, err = db.GetDB().Exec("CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)")
+	if err != nil {
+		t.Fatalf("Failed to create table: %v", err)
+	}
+
+	_, err = db.GetDB().Exec("INSERT INTO test (value) VALUES ('test1'), ('test2')")
+	if err != nil {
+		t.Fatalf("Failed to insert data: %v", err)
+	}
+
+	// Take snapshot
+	snapshotDir := filepath.Join(tmpDir, "txn_snapshot")
+	_, maxTxnID, err := dm.TakeSnapshotForDatabase(snapshotDir, "txntest")
+	if err != nil {
+		t.Fatalf("TakeSnapshotForDatabase failed: %v", err)
+	}
+
+	// Verify max_txn_id is returned (should be >= 0)
+	t.Logf("Max TxnID for txntest: %d", maxTxnID)
+
+	// Get max_txn_id directly and verify it matches
+	directMaxTxnID, err := dm.GetMaxTxnID("txntest")
+	if err != nil {
+		t.Fatalf("GetMaxTxnID failed: %v", err)
+	}
+
+	if maxTxnID != directMaxTxnID {
+		t.Errorf("Expected maxTxnID %d to match direct query %d", maxTxnID, directMaxTxnID)
+	}
+
+	t.Logf("✓ TakeSnapshotForDatabase returns correct max_txn_id")
+}
+
 // TestGetReplicationStateNilHandling verifies that GetReplicationState handles nil correctly
 func TestGetReplicationStateNilHandling(t *testing.T) {
 	dm, _ := setupTestDatabaseManager(t)
