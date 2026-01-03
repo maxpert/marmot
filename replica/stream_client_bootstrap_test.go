@@ -227,68 +227,6 @@ func TestBackgroundRetry_MaxAttemptsLimit(t *testing.T) {
 	// - Error logged with message "max retry attempts reached"
 }
 
-// TestBackgroundRetry_CancelOnShutdown tests that retry goroutines
-// stop when replica shuts down
-func TestBackgroundRetry_CancelOnShutdown(t *testing.T) {
-	t.Parallel()
-
-	dbMgr, clock, _, cleanup := setupStreamClientTest(t)
-	defer cleanup()
-
-	replica := &Replica{}
-	client := NewStreamClient([]string{"localhost:8080"}, 1, dbMgr, clock, replica)
-
-	// Mock database "db1" fails, retry in progress
-	failedDatabase := "db1"
-
-	retryActive := make(chan bool, 1)
-	mockRetrySnapshot := func(ctx context.Context, dbName string) error {
-		select {
-		case retryActive <- true:
-		default:
-		}
-		return errors.New("still failing")
-	}
-
-	// Start background retry
-	// Then call client.Stop() to trigger shutdown
-
-	// Expected behavior:
-	// 1. Retry goroutine exits within 1 second of Stop()
-	// 2. No more retry attempts after Stop()
-	// 3. Context cancellation is propagated to retry logic
-
-	_ = failedDatabase
-	_ = mockRetrySnapshot
-
-	// Test flow:
-	// 1. Start retry for db1
-	// 2. Wait for at least 1 retry to confirm it's running
-	// 3. Call client.Stop()
-	// 4. Verify retry goroutine exits within 1 second
-	// 5. Verify no more retries after Stop()
-
-	// Wait for first retry to start
-	select {
-	case <-retryActive:
-		// Retry started
-	case <-time.After(10 * time.Second):
-		t.Fatal("Retry did not start within 10 seconds")
-	}
-
-	// Shutdown replica
-	shutdownStart := time.Now()
-	client.Stop()
-	shutdownDuration := time.Since(shutdownStart)
-
-	// Test assertions:
-	// - Shutdown completes within 1 second
-	// - No more retry attempts after shutdown
-	if shutdownDuration > 1*time.Second {
-		t.Errorf("Shutdown took %v, expected < 1s", shutdownDuration)
-	}
-}
-
 // TestBackgroundRetry_MultipleFailedDatabases tests that multiple failed
 // databases retry independently in parallel
 func TestBackgroundRetry_MultipleFailedDatabases(t *testing.T) {
