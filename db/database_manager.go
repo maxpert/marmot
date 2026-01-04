@@ -935,6 +935,87 @@ func (dm *DatabaseManager) TakeSnapshotToDir(targetDir string) ([]SnapshotInfo, 
 	return snapshots, maxTxnID, nil
 }
 
+// TakeSnapshotForDatabase creates a snapshot for a single database.
+// Unlike TakeSnapshotToDir which snapshots all databases atomically, this method
+// snapshots only the specified database using a read lock, allowing concurrent
+// per-database snapshots.
+//
+// Parameters:
+//   - targetDir: Directory where the snapshot will be created
+//   - dbName: Name of the database to snapshot
+//
+// Returns:
+//   - SnapshotInfo: Metadata about the snapshot
+//   - uint64: Max transaction ID for this database at snapshot time
+//   - error: Any error encountered during snapshot
+func (dm *DatabaseManager) TakeSnapshotForDatabase(
+	targetDir string,
+	dbName string,
+) (SnapshotInfo, uint64, error) {
+	// Acquire read lock (allows concurrent per-DB snapshots)
+	dm.mu.RLock()
+	defer dm.mu.RUnlock()
+
+	// Get database handle
+	db, exists := dm.databases[dbName]
+	if !exists {
+		return SnapshotInfo{}, 0, fmt.Errorf("database %s not found", dbName)
+	}
+
+	// Checkpoint the database (PRAGMA wal_checkpoint(TRUNCATE))
+	if err := dm.checkpointDatabase(db); err != nil {
+		return SnapshotInfo{}, 0, fmt.Errorf("failed to checkpoint database %s: %w", dbName, err)
+	}
+
+	// Copy .db file to target directory
+	srcPath := filepath.Join(dm.dataDir, "databases", dbName+".db")
+	destPath := filepath.Join(targetDir, "databases", dbName+".db")
+
+	// Create target databases directory if needed
+	if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
+		return SnapshotInfo{}, 0, fmt.Errorf("failed to create target directory: %w", err)
+	}
+
+	// Copy file with fsync
+	if err := copyFile(srcPath, destPath); err != nil {
+		return SnapshotInfo{}, 0, fmt.Errorf("failed to copy database file: %w", err)
+	}
+
+	// Get file info
+	info, err := os.Stat(destPath)
+	if err != nil {
+		return SnapshotInfo{}, 0, fmt.Errorf("failed to stat copied file: %w", err)
+	}
+
+	// Calculate SHA256 checksum
+	sha256, err := calculateFileSHA256(destPath)
+	if err != nil {
+		return SnapshotInfo{}, 0, fmt.Errorf("failed to calculate checksum: %w", err)
+	}
+
+	// Get max txn ID for this specific database
+	maxTxnID, err := dm.GetMaxTxnID(dbName)
+	if err != nil {
+		return SnapshotInfo{}, 0, fmt.Errorf("failed to get max txn id: %w", err)
+	}
+
+	snapshot := SnapshotInfo{
+		Name:     dbName,
+		Filename: filepath.Join("databases", dbName+".db"),
+		FullPath: destPath,
+		Size:     info.Size(),
+		SHA256:   sha256,
+	}
+
+	log.Info().
+		Str("database", dbName).
+		Int64("size", info.Size()).
+		Uint64("max_txn_id", maxTxnID).
+		Msg("Database snapshot created")
+
+	return snapshot, maxTxnID, nil
+}
+
 // GetMaxCommittedTxnID returns the highest committed transaction ID across all databases
 func (dm *DatabaseManager) GetMaxCommittedTxnID() (uint64, error) {
 	dm.mu.RLock()

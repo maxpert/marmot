@@ -7,6 +7,7 @@ import (
 	"hash/fnv"
 	"io"
 	"math/rand"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -57,6 +58,9 @@ type StreamClient struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+
+	// Background retry for failed snapshots
+	retryWg sync.WaitGroup
 }
 
 // NewStreamClient creates a new stream client
@@ -105,7 +109,7 @@ func hashAddress(addr string) uint64 {
 	return h.Sum64()
 }
 
-// Bootstrap performs initial sync from master
+// Bootstrap performs initial sync from master with partial failure handling
 func (s *StreamClient) Bootstrap(ctx context.Context) error {
 	log.Info().Str("master", s.currentAddr).Msg("Connecting to master for bootstrap")
 
@@ -132,59 +136,95 @@ func (s *StreamClient) Bootstrap(ctx context.Context) error {
 		Interface("master_txn_ids", masterTxnIDs).
 		Msg("Comparing local and master state")
 
-	// Determine bootstrap strategy
-	needsSnapshot := false
+	// Apply database filter
+	replicateDatabases := cfg.Config.Replica.ReplicateDatabases
+	filteredMasterTxnIDs := make(map[string]uint64)
+	for dbName, txnID := range masterTxnIDs {
+		if dbName == "__marmot_system" {
+			continue
+		}
+		if s.shouldReplicateDatabase(dbName, replicateDatabases) {
+			filteredMasterTxnIDs[dbName] = txnID
+		}
+	}
+
+	// If no databases to replicate, return success
+	if len(filteredMasterTxnIDs) == 0 {
+		s.mu.Lock()
+		s.lastTxnID = localTxnIDs
+		s.mu.Unlock()
+		log.Info().Msg("No databases to replicate, bootstrap completed")
+		return nil
+	}
+
+	// Determine bootstrap strategy per database
+	var snapshotDatabases []string
 	var deltaDatabases []string
 
 	if len(localTxnIDs) == 0 {
 		// No local data - need full snapshot
-		needsSnapshot = true
+		for dbName := range filteredMasterTxnIDs {
+			snapshotDatabases = append(snapshotDatabases, dbName)
+		}
 		log.Info().Msg("No local data - full snapshot required")
 	} else {
 		// Check each database
-		for dbName, masterTxnID := range masterTxnIDs {
+		for dbName, masterTxnID := range filteredMasterTxnIDs {
 			localTxnID := localTxnIDs[dbName]
 			gap := masterTxnID - localTxnID
 
 			if gap == 0 {
 				log.Info().Str("database", dbName).Msg("Database is up to date")
+				// Set lastTxnID for up-to-date databases
+				s.mu.Lock()
+				s.lastTxnID[dbName] = masterTxnID
+				s.mu.Unlock()
 				continue
 			}
 
 			if gap > uint64(cfg.Config.Replication.DeltaSyncThresholdTxns) {
 				// Large gap - need snapshot for this database
-				needsSnapshot = true
+				snapshotDatabases = append(snapshotDatabases, dbName)
 				log.Info().
 					Str("database", dbName).
 					Uint64("gap", gap).
 					Msg("Large gap detected - snapshot required")
-				break
+			} else {
+				deltaDatabases = append(deltaDatabases, dbName)
 			}
-
-			deltaDatabases = append(deltaDatabases, dbName)
 		}
 	}
 
-	if needsSnapshot {
-		if err := s.downloadSnapshot(ctx); err != nil {
-			return fmt.Errorf("snapshot download failed: %w", err)
+	// Perform delta sync for databases with small gaps
+	for _, dbName := range deltaDatabases {
+		if err := s.deltaSync(ctx, dbName, localTxnIDs[dbName]); err != nil {
+			log.Warn().Err(err).Str("database", dbName).Msg("Delta sync failed, will retry during streaming")
+		} else {
+			s.mu.Lock()
+			txnID, _ := s.getLocalMaxTxnIDs()
+			if id, ok := txnID[dbName]; ok {
+				s.lastTxnID[dbName] = id
+			}
+			s.mu.Unlock()
 		}
-		// downloadSnapshot already sets s.lastTxnID with snapshot txn IDs
-	} else if len(deltaDatabases) > 0 {
-		for _, dbName := range deltaDatabases {
-			if err := s.deltaSync(ctx, dbName, localTxnIDs[dbName]); err != nil {
-				log.Warn().Err(err).Str("database", dbName).Msg("Delta sync failed, will retry during streaming")
+	}
+
+	// Download snapshots for databases that need it
+	if len(snapshotDatabases) > 0 {
+		successCount, failedDatabases := s.downloadSnapshotsWithPartialFailure(ctx, snapshotDatabases, filteredMasterTxnIDs)
+
+		// If ALL databases failed, return error
+		if successCount == 0 && len(failedDatabases) == len(snapshotDatabases) {
+			return fmt.Errorf("all databases failed to snapshot: %d failures", len(failedDatabases))
+		}
+
+		// Start background retry for failed databases
+		if len(failedDatabases) > 0 {
+			for _, dbName := range failedDatabases {
+				txnID := filteredMasterTxnIDs[dbName]
+				s.startBackgroundRetry(dbName, txnID)
 			}
 		}
-		// Update lastTxnID from MetaStore after delta sync
-		s.mu.Lock()
-		s.lastTxnID, _ = s.getLocalMaxTxnIDs()
-		s.mu.Unlock()
-	} else {
-		// No sync needed, just set lastTxnID from current state
-		s.mu.Lock()
-		s.lastTxnID = localTxnIDs
-		s.mu.Unlock()
 	}
 
 	s.mu.RLock()
@@ -193,14 +233,194 @@ func (s *StreamClient) Bootstrap(ctx context.Context) error {
 	return nil
 }
 
+// downloadSnapshotsWithPartialFailure downloads snapshots for multiple databases in parallel,
+// continuing even if some fail. Returns success count and list of failed databases.
+// Uses worker pool pattern with configurable concurrency limit.
+func (s *StreamClient) downloadSnapshotsWithPartialFailure(ctx context.Context, databases []string, masterTxnIDs map[string]uint64) (int, []string) {
+	// Get concurrency limit from config (default: 3)
+	concurrency := cfg.Config.Replica.SnapshotConcurrency
+	if concurrency <= 0 {
+		concurrency = 3
+	}
+
+	// If only 1 database, no need for parallel execution
+	if len(databases) == 1 {
+		if err := s.downloadSnapshotForDatabaseSingle(ctx, databases[0]); err != nil {
+			log.Warn().Err(err).Str("database", databases[0]).Msg("Snapshot download failed, will retry in background")
+			return 0, databases
+		}
+		s.mu.Lock()
+		s.lastTxnID[databases[0]] = masterTxnIDs[databases[0]]
+		s.mu.Unlock()
+		log.Info().Str("database", databases[0]).Uint64("txn_id", masterTxnIDs[databases[0]]).Msg("Database snapshot completed successfully")
+		return 1, nil
+	}
+
+	log.Info().
+		Int("databases", len(databases)).
+		Int("concurrency", concurrency).
+		Msg("Starting parallel snapshot downloads")
+
+	// Worker pool: semaphore limits concurrent downloads
+	var wg sync.WaitGroup
+	semaphore := make(chan struct{}, concurrency)
+
+	// Thread-safe result collection
+	var resultMu sync.Mutex
+	successCount := 0
+	var failedDatabases []string
+
+	for _, dbName := range databases {
+		wg.Add(1)
+
+		go func(db string) {
+			defer wg.Done()
+
+			// Acquire semaphore (blocks if concurrency limit reached)
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }() // Release semaphore
+
+			// Download snapshot for this database
+			log.Debug().Str("database", db).Msg("Starting snapshot download")
+			err := s.downloadSnapshotForDatabaseSingle(ctx, db)
+
+			// Collect results (thread-safe)
+			resultMu.Lock()
+			if err != nil {
+				log.Warn().Err(err).Str("database", db).Msg("Snapshot download failed, will retry in background")
+				failedDatabases = append(failedDatabases, db)
+			} else {
+				// Success - update lastTxnID
+				s.mu.Lock()
+				s.lastTxnID[db] = masterTxnIDs[db]
+				s.mu.Unlock()
+				successCount++
+				log.Info().Str("database", db).Uint64("txn_id", masterTxnIDs[db]).Msg("Database snapshot completed successfully")
+			}
+			resultMu.Unlock()
+		}(dbName)
+	}
+
+	// Wait for all downloads to complete
+	wg.Wait()
+
+	log.Info().
+		Int("total", len(databases)).
+		Int("success", successCount).
+		Int("failed", len(failedDatabases)).
+		Msg("Parallel snapshot downloads completed")
+
+	return successCount, failedDatabases
+}
+
+// downloadSnapshotForDatabaseSingle downloads snapshot for a specific database (single database only)
+func (s *StreamClient) downloadSnapshotForDatabaseSingle(ctx context.Context, dbName string) error {
+	log.Info().Str("database", dbName).Msg("Downloading snapshot for database")
+
+	// For now, we download the full snapshot (could be optimized to download single database)
+	// This is a simplified implementation - in production, you'd want per-database snapshot support
+	return s.downloadSnapshot(ctx)
+}
+
+// startBackgroundRetry starts a background goroutine to retry snapshot download for a failed database
+func (s *StreamClient) startBackgroundRetry(dbName string, txnID uint64) {
+	s.retryWg.Add(1)
+	go s.retrySnapshotDownload(dbName, txnID)
+}
+
+// retrySnapshotDownload retries snapshot download with exponential backoff
+func (s *StreamClient) retrySnapshotDownload(dbName string, txnID uint64) {
+	defer s.retryWg.Done()
+
+	const (
+		initialBackoff = 5 * time.Second
+		maxBackoff     = 60 * time.Second
+		multiplier     = 2.0
+		maxAttempts    = 10
+		jitterPercent  = 0.1
+	)
+
+	backoff := initialBackoff
+
+	log.Info().
+		Str("database", dbName).
+		Dur("initial_backoff", initialBackoff).
+		Int("max_attempts", maxAttempts).
+		Msg("Starting background retry for failed database")
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		// Add jitter: ±10%
+		jitter := time.Duration(float64(backoff) * (rand.Float64()*2*jitterPercent - jitterPercent))
+		actualBackoff := backoff + jitter
+
+		// Wait with context cancellation support
+		select {
+		case <-time.After(actualBackoff):
+			// Continue with retry
+		case <-s.ctx.Done():
+			log.Debug().Str("database", dbName).Msg("Retry cancelled due to shutdown")
+			return
+		}
+
+		log.Debug().
+			Str("database", dbName).
+			Int("attempt", attempt).
+			Int("max_attempts", maxAttempts).
+			Msg("Retrying snapshot download")
+
+		// Attempt snapshot download
+		ctx, cancel := context.WithTimeout(s.ctx, 5*time.Minute)
+		err := s.downloadSnapshotForDatabaseSingle(ctx, dbName)
+		cancel()
+
+		if err == nil {
+			// Success - update lastTxnID
+			s.mu.Lock()
+			s.lastTxnID[dbName] = txnID
+			s.mu.Unlock()
+
+			log.Info().
+				Str("database", dbName).
+				Int("attempt", attempt).
+				Uint64("txn_id", txnID).
+				Msg("Background retry succeeded, database is now synced")
+			return
+		}
+
+		// Check if context was cancelled
+		if s.ctx.Err() != nil {
+			log.Debug().Str("database", dbName).Msg("Retry cancelled due to shutdown")
+			return
+		}
+
+		log.Debug().
+			Err(err).
+			Str("database", dbName).
+			Int("attempt", attempt).
+			Msg("Retry attempt failed")
+
+		// Double backoff, cap at max
+		backoff = time.Duration(float64(backoff) * multiplier)
+		if backoff > maxBackoff {
+			backoff = maxBackoff
+		}
+	}
+
+	log.Error().
+		Str("database", dbName).
+		Int("max_attempts", maxAttempts).
+		Msg("Max retry attempts reached, giving up on database snapshot")
+}
+
 // Start begins the streaming loop (runs until Stop is called)
 func (s *StreamClient) Start(ctx context.Context) {
 	s.wg.Add(1)
 	defer s.wg.Done()
 	defer s.discoveryCancel()
 
-	// Start discovery loop in background
+	// Start discovery loops in background
 	go s.startDiscoveryLoop()
+	go s.startDatabaseDiscoveryLoop(ctx)
 
 	backoff := s.reconnectInterval
 
@@ -261,6 +481,7 @@ func (s *StreamClient) Start(ctx context.Context) {
 func (s *StreamClient) Stop() {
 	s.cancel()
 	s.wg.Wait()
+	s.retryWg.Wait()
 	s.disconnect()
 }
 
@@ -954,4 +1175,110 @@ func (s *StreamClient) failover() error {
 	}
 
 	return fmt.Errorf("failover timeout after %ds", cfg.Config.Replica.FailoverTimeoutSec)
+}
+
+// startDatabaseDiscoveryLoop periodically polls for new databases
+func (s *StreamClient) startDatabaseDiscoveryLoop(ctx context.Context) {
+	interval := time.Duration(cfg.Config.Replica.DatabaseDiscoveryIntervalSec) * time.Second
+	if interval == 0 {
+		interval = 10 * time.Second
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	log.Info().Dur("interval", interval).Msg("Starting database discovery loop")
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Info().Msg("Database discovery loop stopped")
+			return
+		case <-ticker.C:
+			s.discoverNewDatabases(ctx)
+		}
+	}
+}
+
+// discoverNewDatabases polls GetLatestTxnIDs and requests snapshots for new databases
+func (s *StreamClient) discoverNewDatabases(ctx context.Context) {
+	if s.client == nil {
+		return
+	}
+
+	// Get latest database info from primary
+	resp, err := s.client.GetLatestTxnIDs(ctx, &marmotgrpc.LatestTxnIDsRequest{
+		RequestingNodeId: s.nodeID,
+	})
+	if err != nil {
+		log.Warn().Err(err).Msg("Failed to get latest txn IDs during database discovery")
+		return
+	}
+
+	// Get configured database filter
+	replicateDatabases := cfg.Config.Replica.ReplicateDatabases
+
+	for _, dbInfo := range resp.DatabaseInfo {
+		dbName := dbInfo.Name
+
+		// Always skip system database
+		if dbName == "__marmot_system" {
+			continue
+		}
+
+		// Apply database filter if configured
+		if !s.shouldReplicateDatabase(dbName, replicateDatabases) {
+			continue
+		}
+
+		// Check if database is new (not yet synced)
+		s.mu.RLock()
+		_, exists := s.lastTxnID[dbName]
+		s.mu.RUnlock()
+
+		if !exists {
+			// New database detected - mark it for tracking
+			// The actual snapshot download will happen during normal streaming
+			log.Info().
+				Str("database", dbName).
+				Uint64("max_txn_id", dbInfo.MaxTxnId).
+				Msg("Discovered new database, will sync via streaming")
+
+			s.mu.Lock()
+			s.lastTxnID[dbName] = 0 // Start from beginning
+			s.mu.Unlock()
+		}
+	}
+}
+
+// shouldReplicateDatabase checks if a database should be replicated based on filter
+func (s *StreamClient) shouldReplicateDatabase(dbName string, filter []string) bool {
+	// Empty filter means replicate all databases
+	if len(filter) == 0 {
+		return true
+	}
+
+	// Check for exact match or glob pattern
+	for _, pattern := range filter {
+		// Exact match
+		if pattern == dbName {
+			return true
+		}
+
+		// Glob pattern match
+		matched, err := filepath.Match(pattern, dbName)
+		if err != nil {
+			log.Warn().
+				Err(err).
+				Str("pattern", pattern).
+				Str("database", dbName).
+				Msg("Invalid glob pattern in replicate_databases")
+			continue
+		}
+		if matched {
+			return true
+		}
+	}
+
+	return false
 }

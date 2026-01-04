@@ -247,11 +247,12 @@ message SnapshotInfoRequest {
 }
 
 message SnapshotInfoResponse {
-  uint64 snapshot_txn_id = 1;
+  uint64 snapshot_txn_id = 1;  // Keep for backward compatibility
   int64 snapshot_size_bytes = 2;
   int32 total_chunks = 3;
   HLC timestamp = 4;
   repeated DatabaseFileInfo databases = 5;
+  repeated DatabaseSnapshotMetadata database_metadata = 6;  // Per-database metadata
 }
 
 message DatabaseFileInfo {
@@ -261,8 +262,17 @@ message DatabaseFileInfo {
   string sha256_checksum = 4;  // SHA256 hex digest for integrity verification
 }
 
+// Per-database snapshot metadata
+message DatabaseSnapshotMetadata {
+  string database_name = 1;
+  uint64 snapshot_txn_id = 2;      // Per-database CDC offset
+  int64 size_bytes = 3;
+  string sha256_checksum = 4;
+}
+
 message SnapshotRequest {
   uint64 requesting_node_id = 1;
+  string database = 2;  // Optional database filter, empty = all databases
 }
 
 message SnapshotChunk {
@@ -279,9 +289,16 @@ message LatestTxnIDsRequest {
   uint64 requesting_node_id = 1;
 }
 
+message DatabaseInfo {
+  string name = 1;
+  uint64 max_txn_id = 2;
+  int64 size_bytes = 3;
+  int64 created_at = 4;
+}
+
 message LatestTxnIDsResponse {
-  // Map of database name to latest committed txn_id
-  map<string, uint64> database_txn_ids = 1;
+  map<string, uint64> database_txn_ids = 1;  // Keep for backward compatibility
+  repeated DatabaseInfo database_info = 2;   // Detailed database info
 }
 
 // ===== CLUSTER NODES =====

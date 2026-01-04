@@ -8,11 +8,15 @@ data_dir = "/tmp/marmot-cluster/replica-2a"
 enabled = true
 follow_addresses = ["localhost:8082", "localhost:8081", "localhost:8083"]
 secret = "cluster-secret-key"
-discovery_interval_seconds = 30
-failover_timeout_seconds = 60
-reconnect_interval_seconds = 5
-reconnect_max_backoff_seconds = 30
-initial_sync_timeout_minutes = 30
+replicate_databases = []                     # Empty = replicate all databases
+database_discovery_interval_seconds = 10     # Poll for new databases every 10s
+discovery_interval_seconds = 30              # Poll for cluster membership every 30s
+failover_timeout_seconds = 60                # Max time to find alive node during failover
+reconnect_interval_seconds = 5               # Initial reconnect delay
+reconnect_max_backoff_seconds = 30           # Max reconnect backoff
+initial_sync_timeout_minutes = 30            # Timeout for initial snapshot download
+snapshot_concurrency = 3                     # Parallel snapshot downloads
+snapshot_cache_ttl_seconds = 30              # Snapshot cache TTL
 
 [transaction]
 heartbeat_timeout_seconds = 10

@@ -138,12 +138,17 @@ type QueryPipelineConfiguration struct {
 type ReplicaConfiguration struct {
 	Enabled                bool     `toml:"enabled"`                       // Enable read-only replica mode
 	FollowAddresses        []string `toml:"follow_addresses"`              // Seed nodes for discovery (required when enabled)
+	ReplicateDatabases     []string `toml:"replicate_databases"`           // Filter databases, empty = all
 	Secret                 string   `toml:"secret"`                        // PSK for authenticating with cluster (env: MARMOT_REPLICA_SECRET)
 	DiscoveryIntervalSec   int      `toml:"discovery_interval_seconds"`    // Discovery interval (default: 30)
 	FailoverTimeoutSec     int      `toml:"failover_timeout_seconds"`      // Failover timeout (default: 60)
 	ReconnectIntervalSec   int      `toml:"reconnect_interval_seconds"`    // Initial reconnect interval (default: 5)
 	ReconnectMaxBackoffSec int      `toml:"reconnect_max_backoff_seconds"` // Max reconnect backoff (default: 30)
 	InitialSyncTimeoutMin  int      `toml:"initial_sync_timeout_minutes"`  // Timeout for initial snapshot (default: 30)
+
+	DatabaseDiscoveryIntervalSec int `toml:"database_discovery_interval_seconds"` // Database discovery interval (default: 10)
+	SnapshotConcurrency          int `toml:"snapshot_concurrency"`                // Snapshot concurrency (default: 3)
+	SnapshotCacheTTLSec          int `toml:"snapshot_cache_ttl_seconds"`          // Snapshot cache TTL (default: 30)
 }
 
 // PublisherConfiguration configures the CDC publishing system
@@ -648,6 +653,26 @@ func Validate() error {
 
 		if Config.Replica.InitialSyncTimeoutMin < 1 {
 			return fmt.Errorf("replica.initial_sync_timeout_minutes must be >= 1")
+		}
+
+		// Set defaults for new fields
+		if Config.Replica.DatabaseDiscoveryIntervalSec <= 0 {
+			Config.Replica.DatabaseDiscoveryIntervalSec = 10
+		}
+
+		if Config.Replica.SnapshotConcurrency <= 0 {
+			Config.Replica.SnapshotConcurrency = 3
+		}
+
+		if Config.Replica.SnapshotCacheTTLSec <= 0 {
+			Config.Replica.SnapshotCacheTTLSec = 30
+		}
+
+		// Validate replicate_databases (cannot include system DB)
+		for _, dbName := range Config.Replica.ReplicateDatabases {
+			if dbName == "__marmot_system" {
+				return fmt.Errorf("cannot explicitly replicate system database in replicate_databases")
+			}
 		}
 	}
 
