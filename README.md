@@ -173,16 +173,16 @@ Marmot v2 uses a fundamentally different architecture from other SQLite replicat
 
 ## Comparison with Alternatives
 
-| Aspect | Marmot | MySQL Active-Active | rqlite/dqlite | TiDB |
-|--------|--------|---------------------|---------------|------|
-| **Leader** | None | None (but complex) | Yes (Raft) | Yes (Raft) |
-| **Failover** | Automatic | Manual intervention | Automatic | Automatic |
-| **Split-brain recovery** | Automatic (anti-entropy) | Manual | N/A (leader-based) | N/A |
-| **Consistency** | Tunable (ONE/QUORUM/ALL) | Serializable | Strong | Strong |
-| **Direct file read** | ✅ SQLite file | ❌ | ❌ | ❌ |
+| Aspect | Marmot | MySQL Active-Active | rqlite | dqlite | TiDB |
+|--------|--------|---------------------|--------|-------|------|
+| **Leader** | None | None (but complex) | Yes (Raft) | Yes (Raft) | Yes (Raft) |
+| **Failover** | Automatic | Manual intervention | Automatic | Automatic | Automatic |
+| **Split-brain recovery** | Automatic (anti-entropy) | Manual | N/A (leader-based) | N/A (leader-based) | N/A |
+| **Consistency** | Tunable (ONE/QUORUM/ALL) | Serializable | Tunabale (ONE/QUORUM/Linearizable) | Strong | Strong |
+| **Direct file read** | ✅ SQLite file | ❌ | ✅ SQLite file | ❌ | ❌ |
 | **JS-safe AUTO_INCREMENT** | ✅ Compact mode (53-bit) | N/A | N/A | ❌ 64-bit breaks JS |
-| **Edge-friendly** | ✅ Lightweight | ❌ Heavy | ⚠️ Moderate | ❌ Heavy |
-| **Operational complexity** | Low | High | Low | High |
+| **Edge-friendly** | ✅ Lightweight | ❌ Heavy | ✅ Lightweight | ⚠️ Moderate | ❌ Heavy |
+| **Operational complexity** | Low | High | Low | Low | High |
 
 ## DDL Replication
 
