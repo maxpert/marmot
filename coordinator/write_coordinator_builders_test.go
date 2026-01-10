@@ -294,7 +294,7 @@ func TestBuildCommitRequest_PhaseIsAlwaysCommit(t *testing.T) {
 	}
 }
 
-func TestBuildCommitRequest_StatementsExcluded(t *testing.T) {
+func TestBuildCommitRequest_StatementsIncluded(t *testing.T) {
 	wc := createTestCoordinator(1)
 	stmts := CreateCDCStatements(5, "users")
 	txn := NewTxnBuilder().
@@ -303,9 +303,16 @@ func TestBuildCommitRequest_StatementsExcluded(t *testing.T) {
 
 	req := wc.buildCommitRequest(txn)
 
-	// Statements should be nil or empty in commit request (payload reduction optimization)
-	if len(req.Statements) != 0 {
-		t.Errorf("expected 0 statements in commit request, got %d", len(req.Statements))
+	// Statements with full CDC data should be included in COMMIT request (deferred from PREPARE)
+	if len(req.Statements) != 5 {
+		t.Errorf("expected 5 statements in commit request, got %d", len(req.Statements))
+	}
+
+	// Verify CDC data is present
+	for i, stmt := range req.Statements {
+		if len(stmt.NewValues) == 0 {
+			t.Errorf("statement %d: expected NewValues, got empty", i)
+		}
 	}
 }
 

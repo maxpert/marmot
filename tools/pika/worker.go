@@ -59,7 +59,8 @@ func (w *Worker) RunLoad(ctx context.Context, startKey, endKey int, wg *sync.Wai
 			latency := time.Since(start)
 
 			if err != nil {
-				w.stats.RecordError(OpInsert)
+				errCat := ClassifyError(err)
+				w.stats.RecordCategorizedError(OpInsert, errCat, err.Error())
 			} else {
 				w.stats.RecordOp(OpInsert, latency)
 			}
@@ -119,7 +120,8 @@ func (w *Worker) RunBenchmark(ctx context.Context, opsChan <-chan struct{}, wg *
 				latency := time.Since(start)
 
 				if err != nil {
-					w.stats.RecordError(opType)
+					errCat := ClassifyError(err)
+					w.stats.RecordCategorizedError(opType, errCat, err.Error())
 				} else {
 					w.stats.RecordOp(opType, latency)
 					if opType == OpInsert {
@@ -256,11 +258,15 @@ func (w *Worker) executeBatchWithRetry(ctx context.Context, batch []Operation) {
 	}
 
 	// Record errors for each operation in the failed batch
+	errCat := ClassifyError(lastErr)
+	errMsg := ""
+	if lastErr != nil {
+		errMsg = lastErr.Error()
+	}
 	for _, op := range batch {
-		w.stats.RecordError(op.Type)
+		w.stats.RecordCategorizedError(op.Type, errCat, errMsg)
 	}
 	w.stats.RecordTxError()
-	_ = lastErr // Error logged via stats
 }
 
 // executeBatch executes a batch of operations within a transaction.
@@ -445,10 +451,11 @@ func executeRun(ctx context.Context, cfg *Config) error {
 			}
 		}
 	} else {
+	opsLoop:
 		for i := 0; i < cfg.Operations; i++ {
 			select {
 			case <-ctx.Done():
-				break
+				break opsLoop
 			case opsChan <- struct{}{}:
 			}
 		}

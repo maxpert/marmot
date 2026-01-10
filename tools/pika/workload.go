@@ -215,6 +215,74 @@ func executeUpsert(ctx context.Context, exec Executor, table, key, value string)
 	return err
 }
 
+// ErrorCategory classifies errors for better diagnostics.
+type ErrorCategory int
+
+const (
+	ErrCatConflict   ErrorCategory = iota // Marmot conflicts ("conflict" in error)
+	ErrCatConstraint                      // UNIQUE constraint, foreign key ("constraint", "duplicate", "1062")
+	ErrCatTimeout                         // Lock timeout, query timeout ("timeout", "1205")
+	ErrCatConnection                      // Network/connection errors ("connection", "refused", "reset")
+	ErrCatUnknown                         // Everything else
+)
+
+func (e ErrorCategory) String() string {
+	switch e {
+	case ErrCatConflict:
+		return "Conflicts"
+	case ErrCatConstraint:
+		return "Constraints"
+	case ErrCatTimeout:
+		return "Timeouts"
+	case ErrCatConnection:
+		return "Connections"
+	default:
+		return "Unknown"
+	}
+}
+
+// ClassifyError returns the error category based on error message.
+func ClassifyError(err error) ErrorCategory {
+	if err == nil {
+		return ErrCatUnknown
+	}
+
+	errStr := strings.ToLower(err.Error())
+
+	// Marmot conflicts and replication failures
+	// 1213 = Marmot's write-write conflict signal (mimics MySQL deadlock)
+	if strings.Contains(errStr, "conflict") ||
+		strings.Contains(errStr, "partial commit") ||
+		strings.Contains(errStr, "1213") ||
+		strings.Contains(errStr, "deadlock") {
+		return ErrCatConflict
+	}
+
+	// Constraint violations
+	if strings.Contains(errStr, "constraint") ||
+		strings.Contains(errStr, "duplicate") ||
+		strings.Contains(errStr, "1062") { // MySQL duplicate entry
+		return ErrCatConstraint
+	}
+
+	// Timeout/lock errors
+	if strings.Contains(errStr, "timeout") ||
+		strings.Contains(errStr, "1205") { // MySQL lock wait timeout
+		return ErrCatTimeout
+	}
+
+	// Connection errors
+	if strings.Contains(errStr, "connection") ||
+		strings.Contains(errStr, "refused") ||
+		strings.Contains(errStr, "reset") ||
+		strings.Contains(errStr, "broken pipe") ||
+		strings.Contains(errStr, "eof") {
+		return ErrCatConnection
+	}
+
+	return ErrCatUnknown
+}
+
 // IsRetryableError checks if an error is retryable.
 func IsRetryableError(err error) bool {
 	if err == nil {

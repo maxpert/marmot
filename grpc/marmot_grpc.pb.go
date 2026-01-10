@@ -30,6 +30,7 @@ const (
 	MarmotService_StreamSnapshot_FullMethodName       = "/marmot.v2.MarmotService/StreamSnapshot"
 	MarmotService_GetLatestTxnIDs_FullMethodName      = "/marmot.v2.MarmotService/GetLatestTxnIDs"
 	MarmotService_GetClusterNodes_FullMethodName      = "/marmot.v2.MarmotService/GetClusterNodes"
+	MarmotService_TransactionStream_FullMethodName    = "/marmot.v2.MarmotService/TransactionStream"
 )
 
 // MarmotServiceClient is the client API for MarmotService service.
@@ -64,6 +65,10 @@ type MarmotServiceClient interface {
 	// GetClusterNodes returns cluster membership for readonly replicas.
 	// Read-only - does not modify cluster state.
 	GetClusterNodes(ctx context.Context, in *GetClusterNodesRequest, opts ...grpc.CallOption) (*GetClusterNodesResponse, error)
+	// ===== CDC STREAMING =====
+	// Client-streaming RPC for large CDC payloads (≥128KB)
+	// Sends TransactionChunks followed by TransactionCommit
+	TransactionStream(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[TransactionStreamMessage, TransactionResponse], error)
 }
 
 type marmotServiceClient struct {
@@ -202,6 +207,19 @@ func (c *marmotServiceClient) GetClusterNodes(ctx context.Context, in *GetCluste
 	return out, nil
 }
 
+func (c *marmotServiceClient) TransactionStream(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[TransactionStreamMessage, TransactionResponse], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &MarmotService_ServiceDesc.Streams[2], MarmotService_TransactionStream_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[TransactionStreamMessage, TransactionResponse]{ClientStream: stream}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type MarmotService_TransactionStreamClient = grpc.ClientStreamingClient[TransactionStreamMessage, TransactionResponse]
+
 // MarmotServiceServer is the server API for MarmotService service.
 // All implementations must embed UnimplementedMarmotServiceServer
 // for forward compatibility.
@@ -234,6 +252,10 @@ type MarmotServiceServer interface {
 	// GetClusterNodes returns cluster membership for readonly replicas.
 	// Read-only - does not modify cluster state.
 	GetClusterNodes(context.Context, *GetClusterNodesRequest) (*GetClusterNodesResponse, error)
+	// ===== CDC STREAMING =====
+	// Client-streaming RPC for large CDC payloads (≥128KB)
+	// Sends TransactionChunks followed by TransactionCommit
+	TransactionStream(grpc.ClientStreamingServer[TransactionStreamMessage, TransactionResponse]) error
 	mustEmbedUnimplementedMarmotServiceServer()
 }
 
@@ -276,6 +298,9 @@ func (UnimplementedMarmotServiceServer) GetLatestTxnIDs(context.Context, *Latest
 }
 func (UnimplementedMarmotServiceServer) GetClusterNodes(context.Context, *GetClusterNodesRequest) (*GetClusterNodesResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetClusterNodes not implemented")
+}
+func (UnimplementedMarmotServiceServer) TransactionStream(grpc.ClientStreamingServer[TransactionStreamMessage, TransactionResponse]) error {
+	return status.Errorf(codes.Unimplemented, "method TransactionStream not implemented")
 }
 func (UnimplementedMarmotServiceServer) mustEmbedUnimplementedMarmotServiceServer() {}
 func (UnimplementedMarmotServiceServer) testEmbeddedByValue()                       {}
@@ -482,6 +507,13 @@ func _MarmotService_GetClusterNodes_Handler(srv interface{}, ctx context.Context
 	return interceptor(ctx, in, info, handler)
 }
 
+func _MarmotService_TransactionStream_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(MarmotServiceServer).TransactionStream(&grpc.GenericServerStream[TransactionStreamMessage, TransactionResponse]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type MarmotService_TransactionStreamServer = grpc.ClientStreamingServer[TransactionStreamMessage, TransactionResponse]
+
 // MarmotService_ServiceDesc is the grpc.ServiceDesc for MarmotService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -536,6 +568,11 @@ var MarmotService_ServiceDesc = grpc.ServiceDesc{
 			StreamName:    "StreamSnapshot",
 			Handler:       _MarmotService_StreamSnapshot_Handler,
 			ServerStreams: true,
+		},
+		{
+			StreamName:    "TransactionStream",
+			Handler:       _MarmotService_TransactionStream_Handler,
+			ClientStreams: true,
 		},
 	},
 	Metadata: "grpc/marmot.proto",

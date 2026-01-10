@@ -38,8 +38,9 @@ type PrepareResult struct {
 
 // CommitRequest contains parameters for the commit phase
 type CommitRequest struct {
-	TxnID    uint64
-	Database string
+	TxnID      uint64
+	Database   string
+	Statements []protocol.Statement // CDC data deferred from PREPARE phase
 }
 
 // CommitResult contains the result of the commit phase
@@ -238,19 +239,15 @@ func (re *ReplicationEngine) createDDLIntent(txnMgr *TransactionManager, txn *Tr
 	return nil
 }
 
-// createDMLIntent creates a write intent and CDC entry for DML statements
-func (re *ReplicationEngine) createDMLIntent(txnMgr *TransactionManager, metaStore MetaStore, txn *Transaction, stmt protocol.Statement, intentKey string, req *PrepareRequest, stmtSeq uint64) *PrepareResult {
+// createDMLIntent creates a write intent for DML statements (conflict detection only).
+// CDC data is NOT stored during PREPARE - it's deferred to COMMIT phase.
+func (re *ReplicationEngine) createDMLIntent(txnMgr *TransactionManager, _ MetaStore, txn *Transaction, stmt protocol.Statement, intentKey string, req *PrepareRequest, _ uint64) *PrepareResult {
 	snapshotData := map[string]interface{}{
 		"type":      stmt.Type,
 		"timestamp": req.StartTS.WallTime,
 	}
-	if len(stmt.NewValues) > 0 || len(stmt.OldValues) > 0 {
-		snapshotData["cdc_data"] = true
-		snapshotData["old_values_count"] = len(stmt.OldValues)
-		snapshotData["new_values_count"] = len(stmt.NewValues)
-	} else {
-		snapshotData["sql"] = stmt.SQL
-	}
+	// Note: CDC data (OldValues/NewValues) is NOT included in PREPARE
+	// It will be sent in COMMIT phase
 	dataSnapshot, serErr := SerializeData(snapshotData)
 	if serErr != nil {
 		_ = txnMgr.AbortTransaction(txn)
@@ -267,31 +264,8 @@ func (re *ReplicationEngine) createDMLIntent(txnMgr *TransactionManager, metaSto
 		}
 	}
 
-	if len(stmt.NewValues) > 0 || len(stmt.OldValues) > 0 {
-		var oldVals, newVals map[string][]byte
-		if len(stmt.OldValues) > 0 {
-			oldVals = stmt.OldValues
-		}
-		if len(stmt.NewValues) > 0 {
-			newVals = stmt.NewValues
-		}
-
-		op := uint8(StatementTypeToOpType(stmt.Type))
-
-		err := metaStore.WriteIntentEntry(req.TxnID, stmtSeq, op, stmt.TableName, intentKey, oldVals, newVals)
-		if err != nil {
-			log.Error().Err(err).
-				Uint64("txn_id", req.TxnID).
-				Str("table", stmt.TableName).
-				Str("intent_key", intentKey).
-				Msg("Failed to write CDC intent entry")
-			_ = txnMgr.AbortTransaction(txn)
-			return &PrepareResult{
-				Success: false,
-				Error:   fmt.Sprintf("failed to write CDC entry: %v", err),
-			}
-		}
-	}
+	// CDC data (WriteIntentEntry) is NOT written during PREPARE
+	// It will be stored during COMMIT phase when full CDC payload arrives
 
 	return nil
 }
@@ -378,6 +352,8 @@ func (re *ReplicationEngine) Commit(ctx context.Context, req *CommitRequest) *Co
 	}
 
 	txnMgr := replicatedDB.GetTransactionManager()
+	metaStore := replicatedDB.GetMetaStore()
+
 	txn := txnMgr.GetTransaction(req.TxnID)
 	if txn == nil {
 		log.Error().
@@ -386,6 +362,29 @@ func (re *ReplicationEngine) Commit(ctx context.Context, req *CommitRequest) *Co
 			Str("database", req.Database).
 			Msg("COMMIT FAILED: Transaction not found - possibly GC'd or never prepared")
 		return &CommitResult{Success: false, Error: "transaction not found"}
+	}
+
+	// Store CDC data from COMMIT request to PebbleDB (deferred from PREPARE phase)
+	// This must happen BEFORE CommitTransaction which reads from /cdc/raw/
+	var stmtSeq uint64 = 0
+	for _, stmt := range req.Statements {
+		if len(stmt.OldValues) > 0 || len(stmt.NewValues) > 0 {
+			stmtSeq++
+			op := uint8(StatementTypeToOpType(stmt.Type))
+			intentKey := string(stmt.IntentKey)
+
+			err := metaStore.WriteIntentEntry(req.TxnID, stmtSeq, op,
+				stmt.TableName, intentKey, stmt.OldValues, stmt.NewValues)
+			if err != nil {
+				log.Error().Err(err).
+					Uint64("txn_id", req.TxnID).
+					Str("table", stmt.TableName).
+					Str("intent_key", intentKey).
+					Msg("Failed to write CDC intent entry during COMMIT")
+				_ = txnMgr.AbortTransaction(txn)
+				return &CommitResult{Success: false, Error: fmt.Sprintf("failed to write CDC entry: %v", err)}
+			}
+		}
 	}
 
 	if err := txnMgr.CommitTransaction(txn); err != nil {

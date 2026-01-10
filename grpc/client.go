@@ -240,3 +240,96 @@ func (c *Client) RegisterTestConnection(nodeID uint64, conn *grpc.ClientConn) {
 	defer c.mu.Unlock()
 	c.conns[nodeID] = conn
 }
+
+// estimateStatementSize estimates the byte size of a statement's CDC payload
+func estimateStatementSize(stmt *Statement) int {
+	size := len(stmt.TableName)
+	if rc := stmt.GetRowChange(); rc != nil {
+		size += len(rc.IntentKey)
+		for _, v := range rc.OldValues {
+			size += len(v)
+		}
+		for _, v := range rc.NewValues {
+			size += len(v)
+		}
+	}
+	return size
+}
+
+// TransactionStream sends a large transaction using client-streaming RPC.
+// Chunks statements by size and sends them followed by a commit message.
+// chunkSize specifies the maximum byte size for each chunk.
+func (c *Client) TransactionStream(
+	ctx context.Context,
+	nodeID uint64,
+	txnID uint64,
+	database string,
+	statements []*Statement,
+	chunkSize int,
+	timestamp *HLC,
+	sourceNodeID uint64,
+) (*TransactionResponse, error) {
+	conn, err := c.getConn(nodeID)
+	if err != nil {
+		return nil, err
+	}
+
+	client := NewMarmotServiceClient(conn)
+	stream, err := client.TransactionStream(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create transaction stream: %w", err)
+	}
+
+	// Send statements in size-based chunks
+	chunkIndex := uint32(0)
+	i := 0
+	for i < len(statements) {
+		// Accumulate statements until size would exceed chunkSize
+		currentSize := 0
+		chunkStart := i
+		for i < len(statements) {
+			stmtSize := estimateStatementSize(statements[i])
+			// If single statement exceeds chunkSize, send it as its own chunk
+			if currentSize > 0 && currentSize+stmtSize > chunkSize {
+				break
+			}
+			currentSize += stmtSize
+			i++
+		}
+
+		chunkMsg := &TransactionStreamMessage{
+			Payload: &TransactionStreamMessage_Chunk{
+				Chunk: &TransactionChunk{
+					TxnId:      txnID,
+					Database:   database,
+					Statements: statements[chunkStart:i],
+					ChunkIndex: chunkIndex,
+				},
+			},
+		}
+
+		if err := stream.Send(chunkMsg); err != nil {
+			return nil, fmt.Errorf("failed to send chunk %d: %w", chunkIndex, err)
+		}
+		chunkIndex++
+	}
+
+	// Send commit message
+	commitMsg := &TransactionStreamMessage{
+		Payload: &TransactionStreamMessage_Commit{
+			Commit: &TransactionCommit{
+				TxnId:        txnID,
+				Database:     database,
+				Timestamp:    timestamp,
+				SourceNodeId: sourceNodeID,
+			},
+		},
+	}
+
+	if err := stream.Send(commitMsg); err != nil {
+		return nil, fmt.Errorf("failed to send commit: %w", err)
+	}
+
+	// Close and receive response
+	return stream.CloseAndRecv()
+}

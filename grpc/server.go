@@ -15,17 +15,13 @@ import (
 
 	"github.com/maxpert/marmot/cfg"
 	"github.com/maxpert/marmot/common"
+	"github.com/maxpert/marmot/coordinator"
 	"github.com/maxpert/marmot/db"
 	"github.com/rs/zerolog/log"
 	"github.com/soheilhy/cmux"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/reflection"
-)
-
-const (
-	// SnapshotChunkSize is the size of each snapshot chunk (4MB)
-	SnapshotChunkSize = 4 * 1024 * 1024
 )
 
 // snapshotCacheEntry represents a cached snapshot for a database
@@ -707,7 +703,8 @@ func (s *Server) GetSnapshotInfo(ctx context.Context, req *SnapshotInfoRequest) 
 		})
 	}
 
-	totalChunks := int32((totalSize + SnapshotChunkSize - 1) / SnapshotChunkSize)
+	chunkSize := coordinator.GetStreamChunkSize()
+	totalChunks := int32((totalSize + int64(chunkSize) - 1) / int64(chunkSize))
 
 	return &SnapshotInfoResponse{
 		SnapshotTxnId:     maxTxnID,
@@ -866,10 +863,13 @@ func (s *Server) StreamSnapshot(req *SnapshotRequest, stream MarmotService_Strea
 		Int("databases", len(snapshots)).
 		Msg("Atomic snapshot created, streaming files")
 
+	// Get configured chunk size
+	chunkSize := coordinator.GetStreamChunkSize()
+
 	// Calculate total chunks across all files
 	var totalChunks int32
 	for _, snap := range snapshots {
-		fileChunks := int32((snap.Size + SnapshotChunkSize - 1) / SnapshotChunkSize)
+		fileChunks := int32((snap.Size + int64(chunkSize) - 1) / int64(chunkSize))
 		if fileChunks == 0 {
 			fileChunks = 1 // At least one chunk for empty files
 		}
@@ -889,7 +889,7 @@ func (s *Server) StreamSnapshot(req *SnapshotRequest, stream MarmotService_Strea
 		err = func() error {
 			defer file.Close()
 
-			buf := make([]byte, SnapshotChunkSize)
+			buf := make([]byte, chunkSize)
 			for {
 				n, err := file.Read(buf)
 				if err == io.EOF {
@@ -1279,4 +1279,189 @@ func (s *Server) GetLatestTxnIDs(ctx context.Context, req *LatestTxnIDsRequest) 
 // GetClusterNodes returns cluster membership for readonly replicas
 func (s *Server) GetClusterNodes(ctx context.Context, req *GetClusterNodesRequest) (*GetClusterNodesResponse, error) {
 	return &GetClusterNodesResponse{Nodes: s.registry.GetAll()}, nil
+}
+
+// TransactionStream handles streaming CDC payloads for large transactions (>=128KB).
+// Client streams TransactionChunk messages containing CDC data, followed by a
+// TransactionCommit message to finalize. This avoids single large RPC payloads.
+func (s *Server) TransactionStream(stream grpc.ClientStreamingServer[TransactionStreamMessage, TransactionResponse]) error {
+	s.mu.RLock()
+	dbManager := s.dbManager
+	s.mu.RUnlock()
+
+	if dbManager == nil {
+		return stream.SendAndClose(&TransactionResponse{
+			Success:      false,
+			ErrorMessage: "database manager not initialized",
+		})
+	}
+
+	var txnID uint64
+	var database string
+	var sourceNodeID uint64
+	var stmtSeq uint64
+
+	// Track metadata for commit
+	var metaStore db.MetaStore
+	var txnMgr *db.TransactionManager
+
+	for {
+		msg, err := stream.Recv()
+		if err == io.EOF {
+			return stream.SendAndClose(&TransactionResponse{
+				Success:      false,
+				ErrorMessage: "stream ended without commit message",
+			})
+		}
+		if err != nil {
+			log.Error().Err(err).Msg("TransactionStream receive error")
+			return err
+		}
+
+		switch payload := msg.GetPayload().(type) {
+		case *TransactionStreamMessage_Chunk:
+			chunk := payload.Chunk
+			if chunk == nil {
+				continue
+			}
+
+			// First chunk establishes transaction context
+			if txnID == 0 {
+				txnID = chunk.TxnId
+				database = chunk.Database
+
+				dbInstance, err := dbManager.GetDatabase(database)
+				if err != nil {
+					return stream.SendAndClose(&TransactionResponse{
+						Success:      false,
+						ErrorMessage: fmt.Sprintf("database %s not found: %v", database, err),
+					})
+				}
+				metaStore = dbInstance.GetMetaStore()
+				txnMgr = dbInstance.GetTransactionManager()
+			} else if chunk.TxnId != txnID {
+				return stream.SendAndClose(&TransactionResponse{
+					Success:      false,
+					ErrorMessage: fmt.Sprintf("txn_id mismatch: expected %d, got %d", txnID, chunk.TxnId),
+				})
+			}
+
+			// Process each statement in the chunk
+			for _, stmt := range chunk.Statements {
+				stmtSeq++
+				rowChange := stmt.GetRowChange()
+				if rowChange == nil {
+					// DDL statements don't use WriteIntentEntry - they're handled separately
+					continue
+				}
+
+				// Convert wire type to internal OpType
+				stmtCode := common.MustFromWireType(stmt.Type)
+				op := db.StatementTypeToOpType(stmtCode)
+
+				// Store CDC entry to PebbleDB via metaStore
+				err := metaStore.WriteIntentEntry(
+					txnID,
+					stmtSeq,
+					uint8(op),
+					stmt.TableName,
+					string(rowChange.IntentKey),
+					rowChange.OldValues,
+					rowChange.NewValues,
+				)
+				if err != nil {
+					log.Error().Err(err).
+						Uint64("txn_id", txnID).
+						Uint64("seq", stmtSeq).
+						Str("table", stmt.TableName).
+						Msg("Failed to write CDC intent entry during stream")
+					return stream.SendAndClose(&TransactionResponse{
+						Success:      false,
+						ErrorMessage: fmt.Sprintf("failed to store CDC entry: %v", err),
+					})
+				}
+			}
+
+		case *TransactionStreamMessage_Commit:
+			commit := payload.Commit
+			if commit == nil {
+				return stream.SendAndClose(&TransactionResponse{
+					Success:      false,
+					ErrorMessage: "received empty commit message",
+				})
+			}
+
+			// Validate txn_id matches
+			if txnID != 0 && commit.TxnId != txnID {
+				return stream.SendAndClose(&TransactionResponse{
+					Success:      false,
+					ErrorMessage: fmt.Sprintf("commit txn_id mismatch: expected %d, got %d", txnID, commit.TxnId),
+				})
+			}
+
+			// Handle case where commit comes without prior chunks (empty transaction)
+			if txnID == 0 {
+				txnID = commit.TxnId
+				database = commit.Database
+
+				dbInstance, err := dbManager.GetDatabase(database)
+				if err != nil {
+					return stream.SendAndClose(&TransactionResponse{
+						Success:      false,
+						ErrorMessage: fmt.Sprintf("database %s not found: %v", database, err),
+					})
+				}
+				metaStore = dbInstance.GetMetaStore()
+				txnMgr = dbInstance.GetTransactionManager()
+			}
+
+			sourceNodeID = commit.SourceNodeId
+
+			// Touch heartbeat for source node
+			if sourceNodeID != 0 {
+				s.registry.TouchLastSeen(sourceNodeID)
+			}
+
+			// Get the pending transaction from TransactionManager
+			txn := txnMgr.GetTransaction(txnID)
+			if txn == nil {
+				log.Warn().
+					Uint64("txn_id", txnID).
+					Str("database", database).
+					Msg("TransactionStream commit: transaction not found")
+				return stream.SendAndClose(&TransactionResponse{
+					Success:      false,
+					ErrorMessage: fmt.Sprintf("transaction %d not found", txnID),
+				})
+			}
+
+			// Commit the transaction
+			if err := txnMgr.CommitTransaction(txn); err != nil {
+				log.Error().Err(err).
+					Uint64("txn_id", txnID).
+					Str("database", database).
+					Msg("TransactionStream commit failed")
+				return stream.SendAndClose(&TransactionResponse{
+					Success:      false,
+					ErrorMessage: fmt.Sprintf("commit failed: %v", err),
+				})
+			}
+
+			log.Debug().
+				Uint64("txn_id", txnID).
+				Str("database", database).
+				Uint64("statements", stmtSeq).
+				Msg("TransactionStream committed successfully")
+
+			return stream.SendAndClose(&TransactionResponse{
+				Success: true,
+			})
+
+		default:
+			return stream.SendAndClose(&TransactionResponse{
+				Success:      false,
+				ErrorMessage: "unknown message payload type",
+			})
+		}
+	}
 }

@@ -8,6 +8,8 @@ import (
 	"time"
 )
 
+const maxSampleErrors = 3
+
 // Stats tracks benchmark statistics using atomic operations.
 type Stats struct {
 	// Counters per operation type
@@ -23,6 +25,17 @@ type Stats struct {
 	insertErrors uint64
 	deleteErrors uint64
 	upsertErrors uint64
+
+	// Error counters per category
+	conflictErrors   uint64
+	constraintErrors uint64
+	timeoutErrors    uint64
+	connectionErrors uint64
+	unknownErrors    uint64
+
+	// Sample error messages per category (first N unique)
+	sampleErrorsMu sync.Mutex
+	sampleErrors   map[ErrorCategory][]string
 
 	// Retry counter
 	retries uint64
@@ -40,7 +53,8 @@ type Stats struct {
 // NewStats creates a new stats tracker.
 func NewStats() *Stats {
 	return &Stats{
-		latencies: make([]int64, 0, 100000),
+		latencies:    make([]int64, 0, 100000),
+		sampleErrors: make(map[ErrorCategory][]string),
 	}
 }
 
@@ -79,6 +93,44 @@ func (s *Stats) RecordError(opType OpType) {
 	case OpUpsert:
 		atomic.AddUint64(&s.upsertErrors, 1)
 	}
+}
+
+// RecordCategorizedError records a failed operation with error categorization.
+func (s *Stats) RecordCategorizedError(opType OpType, errCat ErrorCategory, errMsg string) {
+	// Record per-operation error (backwards compatibility)
+	s.RecordError(opType)
+
+	// Record per-category error
+	switch errCat {
+	case ErrCatConflict:
+		atomic.AddUint64(&s.conflictErrors, 1)
+	case ErrCatConstraint:
+		atomic.AddUint64(&s.constraintErrors, 1)
+	case ErrCatTimeout:
+		atomic.AddUint64(&s.timeoutErrors, 1)
+	case ErrCatConnection:
+		atomic.AddUint64(&s.connectionErrors, 1)
+	default:
+		atomic.AddUint64(&s.unknownErrors, 1)
+	}
+
+	// Record sample error message
+	s.sampleErrorsMu.Lock()
+	samples := s.sampleErrors[errCat]
+	if len(samples) < maxSampleErrors {
+		// Check if this error message is unique
+		isUnique := true
+		for _, existing := range samples {
+			if existing == errMsg {
+				isUnique = false
+				break
+			}
+		}
+		if isUnique {
+			s.sampleErrors[errCat] = append(samples, errMsg)
+		}
+	}
+	s.sampleErrorsMu.Unlock()
 }
 
 // RecordRetry records a retry attempt.
@@ -221,6 +273,59 @@ func (s *Stats) GetSnapshot() Snapshot {
 	}
 }
 
+// printErrorCategories prints error category breakdown and sample messages.
+func (s *Stats) printErrorCategories() {
+	conflictErrs := atomic.LoadUint64(&s.conflictErrors)
+	constraintErrs := atomic.LoadUint64(&s.constraintErrors)
+	timeoutErrs := atomic.LoadUint64(&s.timeoutErrors)
+	connectionErrs := atomic.LoadUint64(&s.connectionErrors)
+	unknownErrs := atomic.LoadUint64(&s.unknownErrors)
+
+	// Only print if we have categorized errors
+	if conflictErrs+constraintErrs+timeoutErrs+connectionErrs+unknownErrs == 0 {
+		return
+	}
+
+	fmt.Println("Error Categories:")
+	fmt.Printf("  Conflicts:    %d (expected in distributed writes)\n", conflictErrs)
+	fmt.Printf("  Constraints:  %d (UNIQUE violations)\n", constraintErrs)
+	fmt.Printf("  Timeouts:     %d\n", timeoutErrs)
+	fmt.Printf("  Connections:  %d\n", connectionErrs)
+	fmt.Printf("  Unknown:      %d\n", unknownErrs)
+	fmt.Println()
+
+	// Print sample errors
+	s.sampleErrorsMu.Lock()
+	defer s.sampleErrorsMu.Unlock()
+
+	hasSamples := false
+	for _, samples := range s.sampleErrors {
+		if len(samples) > 0 {
+			hasSamples = true
+			break
+		}
+	}
+
+	if !hasSamples {
+		return
+	}
+
+	fmt.Println("Sample Errors (first 3 per category):")
+
+	// Print in consistent order
+	categories := []ErrorCategory{ErrCatConflict, ErrCatConstraint, ErrCatTimeout, ErrCatConnection, ErrCatUnknown}
+	for _, cat := range categories {
+		samples := s.sampleErrors[cat]
+		if len(samples) > 0 {
+			fmt.Printf("  %s:\n", cat.String())
+			for _, msg := range samples {
+				fmt.Printf("    - %q\n", msg)
+			}
+		}
+	}
+	fmt.Println()
+}
+
 // PrintFinal prints final statistics.
 func (s *Stats) PrintFinal(elapsed time.Duration) {
 	totalOps := s.TotalOps()
@@ -278,6 +383,9 @@ func (s *Stats) PrintFinal(elapsed time.Duration) {
 		fmt.Printf("  Total errors:  %d\n", totalErrors)
 		fmt.Printf("  Retries:       %d\n", retries)
 		fmt.Println()
+
+		// Print error categories
+		s.printErrorCategories()
 	}
 
 	min, max, avg := s.GetLatencyStats()
