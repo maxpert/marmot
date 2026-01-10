@@ -26,6 +26,8 @@ func main() {
 		runLoad(args)
 	case "run":
 		runBenchmark(args)
+	case "verify":
+		runVerify(args)
 	case "version":
 		fmt.Printf("pika version %s\n", version)
 	case "help", "-h", "--help":
@@ -46,6 +48,7 @@ Usage:
 Commands:
   load      Load initial data into the database
   run       Run benchmark workload
+  verify    Verify cluster consistency across nodes
   version   Print version
   help      Show this help
 
@@ -75,10 +78,22 @@ Run Options:
   --batch-size    Operations per transaction (default: 1 = no batching)
   --retry         Enable retry on conflict/deadlock (default: true)
   --max-retries   Maximum retry attempts (default: 3)
+  --verify        Run cluster verification after benchmark (default: false)
+  --verify-delay  Delay before verification for replication (default: 5s)
+  --verify-samples Number of rows to verify (default: 100)
+  --verify-timeout Verification query timeout (default: 30s)
+
+Verify Options:
+  --hosts         Comma-separated host:port pairs (requires at least 2)
+  --database      Database name (default: marmot)
+  --table         Table name (default: benchmarks)
+  --samples       Number of random rows to verify (default: 100)
+  --timeout       Timeout for verification queries (default: 30s)
 
 Examples:
   pika load --hosts=127.0.0.1:3307,127.0.0.1:3308 --records=10000 --create-table
-  pika run --hosts=127.0.0.1:3307,127.0.0.1:3308 --workload=mixed --operations=50000`)
+  pika run --hosts=127.0.0.1:3307,127.0.0.1:3308 --workload=mixed --operations=50000
+  pika verify --hosts=127.0.0.1:3307,127.0.0.1:3308,127.0.0.1:3309 --samples=100`)
 }
 
 func runLoad(args []string) {
@@ -152,6 +167,10 @@ func runBenchmark(args []string) {
 	fs.BoolVar(&cfg.Retry, "retry", true, "Enable retry on conflict/deadlock")
 	fs.IntVar(&cfg.MaxRetries, "max-retries", 3, "Maximum retry attempts")
 	fs.Float64Var(&cfg.InsertOverlap, "insert-overlap", 0, "% of inserts targeting existing keys (0-100, for conflict testing)")
+	fs.BoolVar(&cfg.Verify, "verify", false, "Run cluster verification after benchmark")
+	fs.DurationVar(&cfg.VerifyDelay, "verify-delay", 5*time.Second, "Delay before verification to allow replication")
+	fs.IntVar(&cfg.VerifySamples, "verify-samples", 100, "Number of random rows to verify")
+	fs.DurationVar(&cfg.VerifyTimeout, "verify-timeout", 30*time.Second, "Timeout for verification queries")
 
 	if err := fs.Parse(args); err != nil {
 		fmt.Fprintf(os.Stderr, "Error parsing flags: %v\n", err)
@@ -183,6 +202,67 @@ func runBenchmark(args []string) {
 
 	if err := executeRun(ctx, cfg); err != nil {
 		fmt.Fprintf(os.Stderr, "Benchmark failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Run verification if enabled
+	if cfg.Verify {
+		hosts := cfg.HostList()
+		if len(hosts) < 2 {
+			fmt.Fprintf(os.Stderr, "Verification requires at least 2 hosts\n")
+			os.Exit(1)
+		}
+
+		fmt.Printf("\nWaiting %s for replication to settle...\n", cfg.VerifyDelay)
+		time.Sleep(cfg.VerifyDelay)
+
+		// Create fresh context for verification
+		verifyCtx, verifyCancel := context.WithCancel(context.Background())
+		defer verifyCancel()
+
+		if err := executeVerify(verifyCtx, cfg); err != nil {
+			fmt.Fprintf(os.Stderr, "Verification failed: %v\n", err)
+			os.Exit(1)
+		}
+	}
+}
+
+func runVerify(args []string) {
+	cfg := &Config{
+		Threads: 1, // Default for verify to pass validation
+	}
+	fs := flag.NewFlagSet("verify", flag.ExitOnError)
+
+	fs.StringVar(&cfg.Hosts, "hosts", "127.0.0.1:3307,127.0.0.1:3308", "Comma-separated host:port pairs")
+	fs.StringVar(&cfg.Database, "database", "marmot", "Database name")
+	fs.StringVar(&cfg.Table, "table", "benchmarks", "Table name")
+	fs.IntVar(&cfg.VerifySamples, "samples", 100, "Number of random rows to verify")
+	fs.DurationVar(&cfg.VerifyTimeout, "timeout", 30*time.Second, "Timeout for verification queries")
+
+	if err := fs.Parse(args); err != nil {
+		fmt.Fprintf(os.Stderr, "Error parsing flags: %v\n", err)
+		os.Exit(1)
+	}
+
+	if err := cfg.Validate(); err != nil {
+		fmt.Fprintf(os.Stderr, "Invalid configuration: %v\n", err)
+		os.Exit(1)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Handle interrupt
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		fmt.Println("\nInterrupted, shutting down...")
+		cancel()
+	}()
+
+	if err := executeVerify(ctx, cfg); err != nil {
+		fmt.Fprintf(os.Stderr, "Verify failed: %v\n", err)
 		os.Exit(1)
 	}
 }

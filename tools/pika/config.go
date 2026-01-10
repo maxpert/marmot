@@ -40,6 +40,12 @@ type Config struct {
 	// Batching
 	BatchSize int // Number of operations per transaction (1 = no batching)
 
+	// Verify options
+	Verify        bool          // Run verification after benchmark (for run command)
+	VerifyDelay   time.Duration // Delay before verification to allow replication (default: 5s)
+	VerifySamples int           // Number of random rows to verify (default: 100)
+	VerifyTimeout time.Duration // Timeout for verification queries
+
 	// Derived
 	hostList []string
 }
