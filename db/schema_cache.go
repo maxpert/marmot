@@ -11,6 +11,7 @@ import (
 	"sync"
 
 	"github.com/mattn/go-sqlite3"
+	"github.com/maxpert/marmot/protocol/determinism"
 	"github.com/maxpert/marmot/protocol/filter"
 	"github.com/rs/zerolog/log"
 )
@@ -41,6 +42,10 @@ type TableSchema struct {
 	FullColumns      []ColumnSchema // Full column metadata
 	TableName        string         // Table name (for version calculation)
 	AutoIncrementCol string         // Single INTEGER PK column (empty if none)
+
+	// For determinism checking - cold path
+	CreateSQL string   // Original CREATE TABLE statement from sqlite_master
+	Triggers  []string // CREATE TRIGGER statements affecting this table
 }
 
 // SchemaCache provides thread-safe caching of table schemas.
@@ -104,6 +109,27 @@ func (c *SchemaCache) Reload(conn *sqlite3.SQLiteConn) error {
 			continue
 		}
 		newCache[tableName] = schema
+	}
+
+	// Query triggers for each table
+	for tableName, schema := range newCache {
+		triggerRows, err := conn.Query(
+			"SELECT sql FROM sqlite_master WHERE type='trigger' AND tbl_name=?",
+			[]driver.Value{tableName})
+		if err != nil {
+			continue
+		}
+
+		dest := make([]driver.Value, 1)
+		for {
+			if err := triggerRows.Next(dest); err != nil {
+				break
+			}
+			if sqlText, ok := dest[0].(string); ok && sqlText != "" {
+				schema.Triggers = append(schema.Triggers, sqlText)
+			}
+		}
+		triggerRows.Close()
 	}
 
 	c.cache = newCache
@@ -253,5 +279,37 @@ func loadSchema(conn *sqlite3.SQLiteConn, tableName string) (*TableSchema, error
 	// Build precomputed intent key prefix for binary encoding
 	schema.IntentKeyPrefix = filter.BuildIntentKeyPrefix(tableName)
 
+	// Query CREATE TABLE statement from sqlite_master for determinism checking
+	createRows, err := conn.Query(
+		"SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+		[]driver.Value{tableName})
+	if err == nil {
+		defer createRows.Close()
+		dest := make([]driver.Value, 1)
+		if createRows.Next(dest) == nil {
+			if sqlText, ok := dest[0].(string); ok {
+				schema.CreateSQL = sqlText
+			}
+		}
+	}
+
 	return schema, nil
+}
+
+// BuildDeterminismSchema creates a determinism.Schema from cached table metadata.
+// This is used for checking if DML statements are deterministic before execution.
+func (c *SchemaCache) BuildDeterminismSchema() *determinism.Schema {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	schema := determinism.NewSchema()
+	for _, tableSchema := range c.cache {
+		if tableSchema.CreateSQL != "" {
+			schema.AddTable(tableSchema.CreateSQL)
+		}
+		for _, triggerSQL := range tableSchema.Triggers {
+			schema.AddTrigger(triggerSQL)
+		}
+	}
+	return schema
 }

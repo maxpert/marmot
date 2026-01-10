@@ -18,6 +18,7 @@ require (
 	github.com/nats-io/nats.go v1.47.0
 	github.com/prometheus/client_golang v1.23.2
 	github.com/puzpuzpuz/xsync/v3 v3.5.1
+	github.com/rqlite/sql v0.0.0-20241111133259-a4122fabb196
 	github.com/rs/zerolog v1.31.0
 	github.com/segmentio/kafka-go v0.4.49
 	github.com/soheilhy/cmux v0.1.5

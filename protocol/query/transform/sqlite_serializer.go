@@ -92,6 +92,26 @@ func (s *SQLiteSerializer) nodeFormatter(buf *sqlparser.TrackedBuffer, node sqlp
 		if n.OverClause != nil {
 			buf.WriteString(" OVER()")
 		}
+	case sqlparser.IdentifierCS:
+		// Output identifier without backticks - SQLite standard SQL doesn't need them
+		buf.WriteString(n.String())
+	case sqlparser.IdentifierCI:
+		// Output identifier without backticks - SQLite standard SQL doesn't need them
+		buf.WriteString(n.String())
+	case sqlparser.TableName:
+		// Output table name without backticks
+		if n.Qualifier.NotEmpty() {
+			buf.WriteString(n.Qualifier.String())
+			buf.WriteString(".")
+		}
+		buf.WriteString(n.Name.String())
+	case *sqlparser.ColName:
+		// Output column name without backticks
+		if n.Qualifier.NonEmpty() {
+			buf.WriteString(n.Qualifier.Name.String())
+			buf.WriteString(".")
+		}
+		buf.WriteString(n.Name.String())
 	case sqlparser.Values:
 		// Format VALUES with uppercase keyword
 		buf.WriteString("VALUES ")

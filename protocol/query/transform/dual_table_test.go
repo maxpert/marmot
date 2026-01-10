@@ -56,7 +56,7 @@ func TestDualTableRule_Transform(t *testing.T) {
 			name:         "SELECT 'test' AS value FROM dual",
 			input:        "SELECT 'test' AS value FROM dual",
 			wantModified: true,
-			wantSQL:      "SELECT 'test' as `value`",
+			wantSQL:      "SELECT 'test' as value",
 		},
 		{
 			name:         "SELECT * FROM users (not dual)",
