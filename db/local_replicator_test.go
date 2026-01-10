@@ -77,6 +77,8 @@ func TestLocalReplicator_PrepareWithDDL(t *testing.T) {
 	}
 }
 
+// TestLocalReplicator_PrepareWithCDC verifies that PREPARE creates write intents but does NOT store CDC
+// CDC data is deferred to COMMIT phase for bandwidth optimization
 func TestLocalReplicator_PrepareWithCDC(t *testing.T) {
 	replicator, dm, cleanup := setupTestLocalReplicator(t)
 	defer cleanup()
@@ -100,6 +102,8 @@ func TestLocalReplicator_PrepareWithCDC(t *testing.T) {
 	ctx := context.Background()
 	startTS := hlc.Timestamp{WallTime: 1000, Logical: 1}
 
+	// PREPARE request - in new design CDC data is stripped by coordinator
+	// but we test that even if present, it's NOT stored
 	req := &coordinator.ReplicationRequest{
 		TxnID:    2,
 		NodeID:   1,
@@ -136,20 +140,23 @@ func TestLocalReplicator_PrepareWithCDC(t *testing.T) {
 		t.Fatal("Transaction should exist after prepare")
 	}
 
-	// Verify intent entry was written via MetaStore
+	// Verify write intents created (for conflict detection)
 	metaStore := testDB.GetMetaStore()
+	intents, err := metaStore.GetIntentsByTxn(2)
+	if err != nil {
+		t.Fatalf("Failed to get intents: %v", err)
+	}
+	if len(intents) != 1 {
+		t.Fatalf("Expected 1 write intent, got %d", len(intents))
+	}
+
+	// Verify CDC intent entries are NOT stored during PREPARE (deferred to COMMIT)
 	entries, err := metaStore.GetIntentEntries(2)
 	if err != nil {
 		t.Fatalf("Failed to get intent entries: %v", err)
 	}
-	if len(entries) != 1 {
-		t.Fatalf("Expected 1 intent entry, got %d", len(entries))
-	}
-	if entries[0].Table != "users" {
-		t.Errorf("Expected table 'users', got '%s'", entries[0].Table)
-	}
-	if string(entries[0].IntentKey) != "users:1" {
-		t.Errorf("Expected intent key 'users:1', got '%s'", entries[0].IntentKey)
+	if len(entries) != 0 {
+		t.Fatalf("CDC entries should NOT be stored during PREPARE - got %d entries (deferred to COMMIT)", len(entries))
 	}
 }
 

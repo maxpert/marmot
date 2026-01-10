@@ -4,12 +4,23 @@ import (
 	"context"
 	"testing"
 
+	"github.com/maxpert/marmot/encoding"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/protocol"
 	"github.com/maxpert/marmot/protocol/filter"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// encodeTestValues encodes a map of column values to msgpack-encoded bytes for testing
+func encodeTestValues(values map[string]interface{}) map[string][]byte {
+	encoded := make(map[string][]byte, len(values))
+	for key, val := range values {
+		data, _ := encoding.Marshal(val)
+		encoded[key] = data
+	}
+	return encoded
+}
 
 // setupTestReplicationEngine creates a test DatabaseManager and ReplicationEngine
 func setupTestReplicationEngine(t *testing.T) (*ReplicationEngine, *DatabaseManager, func()) {
@@ -90,7 +101,8 @@ func TestReplicationEngine_PrepareWithDDL(t *testing.T) {
 	assert.Equal(t, startTS.WallTime, snapshot.Timestamp)
 }
 
-// TestReplicationEngine_PrepareWithCDC verifies CDC data handling
+// TestReplicationEngine_PrepareWithCDC verifies PREPARE creates write intents but does NOT store CDC
+// CDC data is deferred to COMMIT phase for bandwidth optimization
 func TestReplicationEngine_PrepareWithCDC(t *testing.T) {
 	engine, dm, cleanup := setupTestReplicationEngine(t)
 	defer cleanup()
@@ -108,7 +120,8 @@ func TestReplicationEngine_PrepareWithCDC(t *testing.T) {
 	ctx := context.Background()
 	startTS := hlc.Timestamp{WallTime: 2000, Logical: 1}
 
-	// Prepare statements with CDC data
+	// PREPARE phase only sends metadata (no CDC data in new design)
+	// CDC data (OldValues/NewValues) is stripped by coordinator and sent in COMMIT
 	req := &PrepareRequest{
 		TxnID:    1002,
 		NodeID:   1,
@@ -120,6 +133,8 @@ func TestReplicationEngine_PrepareWithCDC(t *testing.T) {
 				TableName: "users",
 				IntentKey: []byte("users:1"),
 				SQL:       "INSERT INTO users (id, name) VALUES (1, 'alice')",
+				// Note: NewValues would be nil in actual PREPARE (stripped by coordinator)
+				// But we still test that they're NOT stored
 				NewValues: map[string][]byte{
 					"id":   []byte("1"),
 					"name": []byte("alice"),
@@ -158,35 +173,101 @@ func TestReplicationEngine_PrepareWithCDC(t *testing.T) {
 	require.True(t, result.Success)
 	require.Empty(t, result.Error)
 
-	// Verify write intents created
+	// Verify write intents created (for conflict detection)
 	metaStore := db.GetMetaStore()
 	intents, err := metaStore.GetIntentsByTxn(1002)
 	require.NoError(t, err)
-	require.Len(t, intents, 3, "Should have 3 write intents")
+	require.Len(t, intents, 3, "Should have 3 write intents for conflict detection")
 
-	// Verify CDC intent entries stored
+	// Verify CDC intent entries are NOT stored during PREPARE (deferred to COMMIT)
 	entries, err := metaStore.GetIntentEntries(1002)
 	require.NoError(t, err)
-	require.Len(t, entries, 3, "Should have 3 CDC entries")
+	require.Len(t, entries, 0, "CDC entries should NOT be stored during PREPARE - deferred to COMMIT")
+}
 
-	// Verify first entry (INSERT)
-	assert.Equal(t, "users", entries[0].Table)
-	assert.Equal(t, "users:1", string(entries[0].IntentKey))
-	assert.Equal(t, uint8(OpTypeInsert), entries[0].Operation)
+// TestReplicationEngine_DeferredCDCFlow tests the full PREPARE → COMMIT flow with deferred CDC
+func TestReplicationEngine_DeferredCDCFlow(t *testing.T) {
+	engine, dm, cleanup := setupTestReplicationEngine(t)
+	defer cleanup()
 
-	// Verify NewValues (already deserialized by MetaStore)
-	require.NotNil(t, entries[0].NewValues)
-	assert.Equal(t, []byte("1"), entries[0].NewValues["id"])
-	assert.Equal(t, []byte("alice"), entries[0].NewValues["name"])
+	// Create test database and table
+	err := dm.CreateDatabase("testdb")
+	require.NoError(t, err)
 
-	// Verify second entry (UPDATE)
-	assert.Equal(t, uint8(OpTypeUpdate), entries[1].Operation)
-	require.NotNil(t, entries[1].OldValues)
-	assert.Equal(t, []byte("bob"), entries[1].OldValues["name"])
+	db, err := dm.GetDatabase("testdb")
+	require.NoError(t, err)
 
-	// Verify third entry (DELETE)
-	assert.Equal(t, uint8(OpTypeDelete), entries[2].Operation)
-	assert.NotEmpty(t, entries[2].OldValues)
+	_, err = db.GetDB().Exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	startTS := hlc.Timestamp{WallTime: 3000, Logical: 1}
+
+	// PREPARE phase - only metadata, no CDC data
+	prepareReq := &PrepareRequest{
+		TxnID:    1099,
+		NodeID:   1,
+		StartTS:  startTS,
+		Database: "testdb",
+		Statements: []protocol.Statement{
+			{
+				Type:      protocol.StatementInsert,
+				TableName: "users",
+				IntentKey: []byte("users:1"),
+				// In real flow, OldValues/NewValues would be nil here (stripped by coordinator)
+			},
+		},
+	}
+
+	prepResult := engine.Prepare(ctx, prepareReq)
+	require.True(t, prepResult.Success, "PREPARE should succeed")
+
+	// Verify write intent created but NO CDC entries
+	metaStore := db.GetMetaStore()
+	intents, err := metaStore.GetIntentsByTxn(1099)
+	require.NoError(t, err)
+	require.Len(t, intents, 1, "Should have 1 write intent")
+
+	entries, err := metaStore.GetIntentEntries(1099)
+	require.NoError(t, err)
+	require.Len(t, entries, 0, "NO CDC entries during PREPARE")
+
+	// COMMIT phase - includes CDC data (msgpack-encoded values)
+	commitReq := &CommitRequest{
+		TxnID:    1099,
+		Database: "testdb",
+		Statements: []protocol.Statement{
+			{
+				Type:      protocol.StatementInsert,
+				TableName: "users",
+				IntentKey: []byte("users:1"),
+				NewValues: encodeTestValues(map[string]interface{}{
+					"id":   int64(1),
+					"name": "alice",
+				}),
+			},
+		},
+	}
+
+	commitResult := engine.Commit(ctx, commitReq)
+	require.True(t, commitResult.Success, "COMMIT should succeed: %s", commitResult.Error)
+
+	// Verify CDC was applied (entries should be cleaned up after commit, but data should be in SQLite)
+	rows, err := db.GetDB().Query("SELECT id, name FROM users")
+	require.NoError(t, err)
+	defer rows.Close()
+
+	var count int
+	for rows.Next() {
+		var id int
+		var name string
+		err := rows.Scan(&id, &name)
+		require.NoError(t, err)
+		assert.Equal(t, 1, id)
+		assert.Equal(t, "alice", name)
+		count++
+	}
+	assert.Equal(t, 1, count, "Should have 1 row in users table")
 }
 
 // TestReplicationEngine_PrepareWithDatabaseOps verifies database operation handling

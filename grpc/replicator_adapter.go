@@ -10,14 +10,17 @@ import (
 	"github.com/maxpert/marmot/protocol"
 )
 
-// GRPCReplicator implements coordinator.Replicator using gRPC client
-// It adapts between coordinator types and gRPC protobuf types
+// GRPCReplicator implements coordinator.Replicator and coordinator.StreamReplicator
+// using gRPC client. It adapts between coordinator types and gRPC protobuf types.
 type GRPCReplicator struct {
 	client *Client
 }
 
+// Compile-time interface check
+var _ coordinator.StreamReplicator = (*GRPCReplicator)(nil)
+
 // NewGRPCReplicator creates a new gRPC replicator adapter
-func NewGRPCReplicator(client *Client) coordinator.Replicator {
+func NewGRPCReplicator(client *Client) *GRPCReplicator {
 	return &GRPCReplicator{
 		client: client,
 	}
@@ -134,4 +137,31 @@ func convertTimestampToHLC(ts hlc.Timestamp) *HLC {
 		Logical:  ts.Logical,
 		NodeId:   ts.NodeID,
 	}
+}
+
+// StreamReplicateTransaction implements coordinator.StreamReplicator.
+// Uses gRPC streaming for large CDC payloads (≥128KB).
+func (gr *GRPCReplicator) StreamReplicateTransaction(ctx context.Context, nodeID uint64, req *coordinator.ReplicationRequest) (*coordinator.ReplicationResponse, error) {
+	statements, err := convertStatementsToProto(req.Statements, req.Database)
+	if err != nil {
+		return nil, err
+	}
+
+	timestamp := convertTimestampToHLC(req.StartTS)
+
+	// Call streaming client
+	grpcResp, err := gr.client.TransactionStream(ctx, nodeID, req.TxnID, req.Database, statements, timestamp, req.NodeID)
+	if err != nil {
+		return nil, fmt.Errorf("streaming gRPC call failed: %w", err)
+	}
+
+	// Convert gRPC TransactionResponse to coordinator.ReplicationResponse
+	resp := &coordinator.ReplicationResponse{
+		Success:          grpcResp.Success,
+		Error:            grpcResp.ErrorMessage,
+		ConflictDetected: grpcResp.ConflictDetected,
+		ConflictDetails:  grpcResp.ConflictDetails,
+	}
+
+	return resp, nil
 }

@@ -35,6 +35,15 @@ type Replicator interface {
 	ReplicateTransaction(ctx context.Context, nodeID uint64, req *ReplicationRequest) (*ReplicationResponse, error)
 }
 
+// StreamReplicator extends Replicator with streaming capability for large payloads
+type StreamReplicator interface {
+	Replicator
+	StreamReplicateTransaction(ctx context.Context, nodeID uint64, req *ReplicationRequest) (*ReplicationResponse, error)
+}
+
+// CDCStreamThreshold is the payload size threshold for using streaming (128KB)
+const CDCStreamThreshold = 128 * 1024
+
 // Transaction represents a distributed transaction
 type Transaction struct {
 	ID                    uint64
@@ -173,12 +182,26 @@ func (wc *WriteCoordinator) validateStatements(txn *Transaction) error {
 	return nil
 }
 
-// buildPrepareRequest creates a ReplicationRequest for the prepare phase
+// buildPrepareRequest creates a ReplicationRequest for the prepare phase.
+// CDC data (OldValues/NewValues) is stripped - only metadata for conflict detection.
 func (wc *WriteCoordinator) buildPrepareRequest(txn *Transaction) *ReplicationRequest {
+	// Strip CDC data from statements - only send metadata for PREPARE
+	prepareStmts := make([]protocol.Statement, len(txn.Statements))
+	for i, stmt := range txn.Statements {
+		prepareStmts[i] = protocol.Statement{
+			Type:      stmt.Type,
+			TableName: stmt.TableName,
+			Database:  stmt.Database,
+			IntentKey: stmt.IntentKey,
+			SQL:       stmt.SQL, // Keep SQL for DDL statements
+			// OldValues: nil - NOT sent in PREPARE
+			// NewValues: nil - NOT sent in PREPARE
+		}
+	}
 	return &ReplicationRequest{
 		TxnID:                 txn.ID,
 		NodeID:                wc.nodeID,
-		Statements:            txn.Statements,
+		Statements:            prepareStmts,
 		StartTS:               txn.StartTS,
 		Phase:                 PhasePrep,
 		Database:              txn.Database,
@@ -186,7 +209,8 @@ func (wc *WriteCoordinator) buildPrepareRequest(txn *Transaction) *ReplicationRe
 	}
 }
 
-// buildCommitRequest creates a ReplicationRequest for the commit phase
+// buildCommitRequest creates a ReplicationRequest for the commit phase.
+// CDC data (OldValues/NewValues) is included - deferred from PREPARE phase.
 func (wc *WriteCoordinator) buildCommitRequest(txn *Transaction) *ReplicationRequest {
 	return &ReplicationRequest{
 		TxnID:      txn.ID,
@@ -194,8 +218,25 @@ func (wc *WriteCoordinator) buildCommitRequest(txn *Transaction) *ReplicationReq
 		StartTS:    txn.StartTS,
 		NodeID:     wc.nodeID,
 		Database:   txn.Database,
-		Statements: nil, // Statements are already persisted in intents, not needed for commit
+		Statements: txn.Statements, // Full CDC data included in COMMIT
 	}
+}
+
+// estimateCDCPayloadSize estimates the CDC payload size for a transaction.
+// Used to decide between regular RPC and streaming for large payloads.
+func estimateCDCPayloadSize(statements []protocol.Statement) int {
+	var size int
+	for _, stmt := range statements {
+		for _, v := range stmt.OldValues {
+			size += len(v)
+		}
+		for _, v := range stmt.NewValues {
+			size += len(v)
+		}
+		size += len(stmt.IntentKey)
+		size += len(stmt.TableName)
+	}
+	return size
 }
 
 // runPreparePhase executes the prepare phase and validates quorum requirements
@@ -257,14 +298,28 @@ func (wc *WriteCoordinator) runPreparePhase(ctx context.Context, txn *Transactio
 	return prepResponses, nil
 }
 
-// sendRemoteCommits launches goroutines to send commit requests to remote nodes
-func (wc *WriteCoordinator) sendRemoteCommits(ctx context.Context, preparedNodes map[uint64]*ReplicationResponse, req *ReplicationRequest, txnID uint64) chan response {
+// sendRemoteCommits launches goroutines to send commit requests to remote nodes.
+// Uses streaming for large payloads (≥128KB) if the replicator supports it.
+func (wc *WriteCoordinator) sendRemoteCommits(_ context.Context, preparedNodes map[uint64]*ReplicationResponse, req *ReplicationRequest, txnID uint64) chan response {
 	// Count other prepared nodes (excluding self)
 	otherPreparedNodes := 0
 	for nodeID := range preparedNodes {
 		if nodeID != wc.nodeID {
 			otherPreparedNodes++
 		}
+	}
+
+	// Check if we should use streaming for large payloads
+	payloadSize := estimateCDCPayloadSize(req.Statements)
+	useStreaming := payloadSize >= CDCStreamThreshold
+	streamReplicator, hasStreaming := wc.replicator.(StreamReplicator)
+
+	if useStreaming && hasStreaming {
+		log.Debug().
+			Uint64("txn_id", txnID).
+			Int("payload_size", payloadSize).
+			Int("threshold", CDCStreamThreshold).
+			Msg("Using streaming for large CDC payload")
 	}
 
 	// STEP 1: Send COMMIT to remote nodes first
@@ -281,7 +336,14 @@ func (wc *WriteCoordinator) sendRemoteCommits(ctx context.Context, preparedNodes
 			// Use detached context - remote commits should complete even if parent cancelled
 			commitCtx, commitCancel := context.WithTimeout(context.Background(), wc.timeout)
 			defer commitCancel()
-			resp, err := wc.replicator.ReplicateTransaction(commitCtx, nid, req)
+
+			var resp *ReplicationResponse
+			var err error
+			if useStreaming && hasStreaming {
+				resp, err = streamReplicator.StreamReplicateTransaction(commitCtx, nid, req)
+			} else {
+				resp, err = wc.replicator.ReplicateTransaction(commitCtx, nid, req)
+			}
 			commitChan <- response{nodeID: nid, resp: resp, err: err}
 		}(nodeID)
 	}

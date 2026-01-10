@@ -240,3 +240,71 @@ func (c *Client) RegisterTestConnection(nodeID uint64, conn *grpc.ClientConn) {
 	defer c.mu.Unlock()
 	c.conns[nodeID] = conn
 }
+
+// statementsPerChunk defines how many statements to send per chunk
+const statementsPerChunk = 50
+
+// TransactionStream sends a large transaction using client-streaming RPC.
+// Chunks statements and sends them followed by a commit message.
+func (c *Client) TransactionStream(
+	ctx context.Context,
+	nodeID uint64,
+	txnID uint64,
+	database string,
+	statements []*Statement,
+	timestamp *HLC,
+	sourceNodeID uint64,
+) (*TransactionResponse, error) {
+	conn, err := c.getConn(nodeID)
+	if err != nil {
+		return nil, err
+	}
+
+	client := NewMarmotServiceClient(conn)
+	stream, err := client.TransactionStream(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create transaction stream: %w", err)
+	}
+
+	// Send statements in chunks
+	for i := 0; i < len(statements); i += statementsPerChunk {
+		end := i + statementsPerChunk
+		if end > len(statements) {
+			end = len(statements)
+		}
+
+		chunkMsg := &TransactionStreamMessage{
+			Payload: &TransactionStreamMessage_Chunk{
+				Chunk: &TransactionChunk{
+					TxnId:      txnID,
+					Database:   database,
+					Statements: statements[i:end],
+					ChunkIndex: uint32(i / statementsPerChunk),
+				},
+			},
+		}
+
+		if err := stream.Send(chunkMsg); err != nil {
+			return nil, fmt.Errorf("failed to send chunk %d: %w", i/statementsPerChunk, err)
+		}
+	}
+
+	// Send commit message
+	commitMsg := &TransactionStreamMessage{
+		Payload: &TransactionStreamMessage_Commit{
+			Commit: &TransactionCommit{
+				TxnId:        txnID,
+				Database:     database,
+				Timestamp:    timestamp,
+				SourceNodeId: sourceNodeID,
+			},
+		},
+	}
+
+	if err := stream.Send(commitMsg); err != nil {
+		return nil, fmt.Errorf("failed to send commit: %w", err)
+	}
+
+	// Close and receive response
+	return stream.CloseAndRecv()
+}

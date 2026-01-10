@@ -139,9 +139,27 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 
 // handleCommit processes Phase 2 of 2PC: Commit transaction
 func (rh *ReplicationHandler) handleCommit(ctx context.Context, req *TransactionRequest) (*TransactionResponse, error) {
+	// Convert proto statements to internal format (CDC data deferred from PREPARE)
+	statements := make([]protocol.Statement, 0, len(req.Statements))
+	for _, stmt := range req.Statements {
+		internalStmt := protocol.Statement{
+			SQL:       stmt.GetSQL(),
+			Type:      common.MustFromWireType(stmt.Type),
+			TableName: stmt.TableName,
+			Database:  stmt.Database,
+			IntentKey: stmt.GetIntentKey(),
+		}
+		if rowChange := stmt.GetRowChange(); rowChange != nil {
+			internalStmt.OldValues = rowChange.OldValues
+			internalStmt.NewValues = rowChange.NewValues
+		}
+		statements = append(statements, internalStmt)
+	}
+
 	engineReq := &db.CommitRequest{
-		TxnID:    req.TxnId,
-		Database: req.Database,
+		TxnID:      req.TxnId,
+		Database:   req.Database,
+		Statements: statements, // CDC data deferred from PREPARE phase
 	}
 
 	result := rh.engine.Commit(ctx, engineReq)

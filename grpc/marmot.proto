@@ -49,6 +49,11 @@ service MarmotService {
   // GetClusterNodes returns cluster membership for readonly replicas.
   // Read-only - does not modify cluster state.
   rpc GetClusterNodes(GetClusterNodesRequest) returns (GetClusterNodesResponse);
+
+  // ===== CDC STREAMING =====
+  // Client-streaming RPC for large CDC payloads (≥128KB)
+  // Sends TransactionChunks followed by TransactionCommit
+  rpc TransactionStream(stream TransactionStreamMessage) returns (TransactionResponse);
 }
 
 // ===== GOSSIP MESSAGES =====
@@ -306,4 +311,29 @@ message GetClusterNodesRequest {}
 
 message GetClusterNodesResponse {
   repeated NodeState nodes = 1;
+}
+
+// ===== CDC STREAMING MESSAGES =====
+// Chunk of CDC data for streaming large transactions
+message TransactionChunk {
+  uint64 txn_id = 1;
+  string database = 2;
+  repeated Statement statements = 3;
+  uint32 chunk_index = 4;
+}
+
+// Final commit signal for streaming
+message TransactionCommit {
+  uint64 txn_id = 1;
+  string database = 2;
+  HLC timestamp = 3;
+  uint64 source_node_id = 4;
+}
+
+// Wrapper for streaming (oneof for chunk vs commit)
+message TransactionStreamMessage {
+  oneof payload {
+    TransactionChunk chunk = 1;
+    TransactionCommit commit = 2;
+  }
 }
