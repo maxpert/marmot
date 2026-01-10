@@ -424,6 +424,13 @@ func (mdb *ReplicatedDatabase) GetCachedTableSchema(tableName string) (*TableSch
 	return mdb.schemaCache.GetSchemaFor(tableName)
 }
 
+// GetSchemaCache returns the schema cache for building determinism schemas.
+// Used by coordinator to check if DML statements are deterministic.
+// Returns interface{} to avoid import cycles with coordinator package.
+func (mdb *ReplicatedDatabase) GetSchemaCache() interface{} {
+	return mdb.schemaCache
+}
+
 // ApplyCDCEntries applies CDC data entries to SQLite.
 // Used by CompletedLocalExecution.Commit() to persist data captured during hooks.
 func (mdb *ReplicatedDatabase) ApplyCDCEntries(entries []*IntentEntry) error {

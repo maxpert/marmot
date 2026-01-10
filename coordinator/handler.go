@@ -15,6 +15,7 @@ import (
 	"github.com/maxpert/marmot/common"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/protocol"
+	"github.com/maxpert/marmot/protocol/determinism"
 	"github.com/maxpert/marmot/protocol/handlers"
 	"github.com/maxpert/marmot/protocol/query/transform"
 	"github.com/maxpert/marmot/telemetry"
@@ -38,6 +39,7 @@ type DatabaseManager interface {
 // ReplicatedDatabaseProvider provides access to replicated database operations
 type ReplicatedDatabaseProvider interface {
 	ExecuteLocalWithHooks(ctx context.Context, txnID uint64, requests []ExecutionRequest) (PendingExecution, error)
+	GetSchemaCache() interface{} // Returns *SchemaCache (using interface{} to avoid import cycle)
 }
 
 // ExecutionRequest for local-only execution - never replicated
@@ -293,6 +295,9 @@ func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, sq
 	if stmt.Database == "" {
 		stmt.Database = session.CurrentDatabase
 	}
+
+	// Check determinism for DML statements before execution
+	h.checkDeterminism(stmt)
 
 	// Check for consistency hint
 	consistency, found := protocol.ExtractConsistencyHint(sql)
@@ -1039,5 +1044,40 @@ func (h *CoordinatorHandler) publishCDCEvents(txnID uint64, database string, cdc
 			Str("database", database).
 			Int("entries", len(cdcEntries)).
 			Msg("Published CDC events")
+	}
+}
+
+// checkDeterminism checks if a DML statement is deterministic and logs if not.
+func (h *CoordinatorHandler) checkDeterminism(stmt protocol.Statement) {
+	if !protocol.IsDML(stmt) || stmt.Database == "" {
+		return
+	}
+
+	replicatedDB, err := h.dbManager.GetReplicatedDatabase(stmt.Database)
+	if err != nil {
+		return
+	}
+
+	schemaCacheIface := replicatedDB.GetSchemaCache()
+	if schemaCacheIface == nil {
+		return
+	}
+
+	type schemaCacheProvider interface {
+		BuildDeterminismSchema() *determinism.Schema
+	}
+
+	schemaCache, ok := schemaCacheIface.(schemaCacheProvider)
+	if !ok {
+		return
+	}
+
+	detSchema := schemaCache.BuildDeterminismSchema()
+	result := determinism.CheckSQLWithSchema(stmt.SQL, detSchema)
+	if !result.IsDeterministic {
+		log.Debug().
+			Str("sql", stmt.SQL).
+			Str("reason", result.Reason).
+			Msg("Non-deterministic DML detected")
 	}
 }
