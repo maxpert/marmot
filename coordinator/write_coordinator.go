@@ -41,8 +41,17 @@ type StreamReplicator interface {
 	StreamReplicateTransaction(ctx context.Context, nodeID uint64, req *ReplicationRequest) (*ReplicationResponse, error)
 }
 
-// CDCStreamThreshold is the payload size threshold for using streaming (128KB)
-const CDCStreamThreshold = 128 * 1024
+// CDCStreamThresholdDefault is the default payload size threshold for streaming (1MB)
+const CDCStreamThresholdDefault = 1024 * 1024
+
+// GetCDCStreamThreshold returns the configured CDC streaming threshold in bytes.
+// Falls back to CDCStreamThresholdDefault (1MB) if not configured.
+func GetCDCStreamThreshold() int {
+	if cfg.Config != nil && cfg.Config.Replication.CDCStreamThresholdKB > 0 {
+		return cfg.Config.Replication.CDCStreamThresholdKB * 1024
+	}
+	return CDCStreamThresholdDefault
+}
 
 // Transaction represents a distributed transaction
 type Transaction struct {
@@ -311,14 +320,15 @@ func (wc *WriteCoordinator) sendRemoteCommits(_ context.Context, preparedNodes m
 
 	// Check if we should use streaming for large payloads
 	payloadSize := estimateCDCPayloadSize(req.Statements)
-	useStreaming := payloadSize >= CDCStreamThreshold
+	streamThreshold := GetCDCStreamThreshold()
+	useStreaming := payloadSize >= streamThreshold
 	streamReplicator, hasStreaming := wc.replicator.(StreamReplicator)
 
 	if useStreaming && hasStreaming {
 		log.Debug().
 			Uint64("txn_id", txnID).
 			Int("payload_size", payloadSize).
-			Int("threshold", CDCStreamThreshold).
+			Int("threshold", streamThreshold).
 			Msg("Using streaming for large CDC payload")
 	}
 

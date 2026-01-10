@@ -44,6 +44,7 @@ type ReplicationConfiguration struct {
 	DeltaSyncThresholdSeconds int    `toml:"delta_sync_threshold_seconds"`
 	GCMinRetentionHours       int    `toml:"gc_min_retention_hours"`
 	GCMaxRetentionHours       int    `toml:"gc_max_retention_hours"`
+	CDCStreamThresholdKB      int    `toml:"cdc_stream_threshold_kb"` // Threshold in KB for using streaming RPC (default: 1024 = 1MB)
 }
 
 // MySQLConfiguration for MySQL wire protocol server
@@ -236,6 +237,7 @@ var Config = &Configuration{
 		DeltaSyncThresholdSeconds: 3600,  // 1 hour - trigger snapshot after this (like Cassandra's daily repair)
 		GCMinRetentionHours:       2,     // 2 hours - MUST be >= 2x delta threshold (safety margin)
 		GCMaxRetentionHours:       24,    // 24 hours - 24x delta threshold (like Cassandra's 10-day gc_grace)
+		CDCStreamThresholdKB:      1024,  // 1MB - use streaming for CDC payloads >= this size
 	},
 
 	Transaction: TransactionConfiguration{
