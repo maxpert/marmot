@@ -181,15 +181,15 @@ func TestEstimateCDCPayloadSize(t *testing.T) {
 	}
 }
 
-func TestCDCStreamThresholdDefault(t *testing.T) {
-	// Verify default threshold is 1MB
-	assert.Equal(t, 1024*1024, CDCStreamThresholdDefault)
+func TestStreamChunkSizeDefault(t *testing.T) {
+	// Verify default chunk size is 1MB
+	assert.Equal(t, 1024*1024, StreamChunkSizeDefault)
 }
 
-func TestGetCDCStreamThreshold_Default(t *testing.T) {
+func TestGetStreamChunkSize_Default(t *testing.T) {
 	// Without config, should return default (1MB)
-	threshold := GetCDCStreamThreshold()
-	assert.Equal(t, CDCStreamThresholdDefault, threshold)
+	threshold := GetStreamChunkSize()
+	assert.Equal(t, StreamChunkSizeDefault, threshold)
 }
 
 func TestEstimateCDCPayloadSize_LargePayload(t *testing.T) {
@@ -211,5 +211,5 @@ func TestEstimateCDCPayloadSize_LargePayload(t *testing.T) {
 	}
 
 	size := estimateCDCPayloadSize(stmts)
-	assert.GreaterOrEqual(t, size, GetCDCStreamThreshold(), "Large payload should exceed streaming threshold")
+	assert.GreaterOrEqual(t, size, GetStreamChunkSize(), "Large payload should exceed streaming threshold")
 }

@@ -15,17 +15,13 @@ import (
 
 	"github.com/maxpert/marmot/cfg"
 	"github.com/maxpert/marmot/common"
+	"github.com/maxpert/marmot/coordinator"
 	"github.com/maxpert/marmot/db"
 	"github.com/rs/zerolog/log"
 	"github.com/soheilhy/cmux"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/reflection"
-)
-
-const (
-	// SnapshotChunkSize is the size of each snapshot chunk (4MB)
-	SnapshotChunkSize = 4 * 1024 * 1024
 )
 
 // snapshotCacheEntry represents a cached snapshot for a database
@@ -707,7 +703,8 @@ func (s *Server) GetSnapshotInfo(ctx context.Context, req *SnapshotInfoRequest) 
 		})
 	}
 
-	totalChunks := int32((totalSize + SnapshotChunkSize - 1) / SnapshotChunkSize)
+	chunkSize := coordinator.GetStreamChunkSize()
+	totalChunks := int32((totalSize + int64(chunkSize) - 1) / int64(chunkSize))
 
 	return &SnapshotInfoResponse{
 		SnapshotTxnId:     maxTxnID,
@@ -866,10 +863,13 @@ func (s *Server) StreamSnapshot(req *SnapshotRequest, stream MarmotService_Strea
 		Int("databases", len(snapshots)).
 		Msg("Atomic snapshot created, streaming files")
 
+	// Get configured chunk size
+	chunkSize := coordinator.GetStreamChunkSize()
+
 	// Calculate total chunks across all files
 	var totalChunks int32
 	for _, snap := range snapshots {
-		fileChunks := int32((snap.Size + SnapshotChunkSize - 1) / SnapshotChunkSize)
+		fileChunks := int32((snap.Size + int64(chunkSize) - 1) / int64(chunkSize))
 		if fileChunks == 0 {
 			fileChunks = 1 // At least one chunk for empty files
 		}
@@ -889,7 +889,7 @@ func (s *Server) StreamSnapshot(req *SnapshotRequest, stream MarmotService_Strea
 		err = func() error {
 			defer file.Close()
 
-			buf := make([]byte, SnapshotChunkSize)
+			buf := make([]byte, chunkSize)
 			for {
 				n, err := file.Read(buf)
 				if err == io.EOF {

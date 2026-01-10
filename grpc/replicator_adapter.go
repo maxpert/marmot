@@ -149,8 +149,9 @@ func (gr *GRPCReplicator) StreamReplicateTransaction(ctx context.Context, nodeID
 
 	timestamp := convertTimestampToHLC(req.StartTS)
 
-	// Call streaming client
-	grpcResp, err := gr.client.TransactionStream(ctx, nodeID, req.TxnID, req.Database, statements, timestamp, req.NodeID)
+	// Call streaming client with configured chunk size
+	chunkSize := coordinator.GetStreamChunkSize()
+	grpcResp, err := gr.client.TransactionStream(ctx, nodeID, req.TxnID, req.Database, statements, chunkSize, timestamp, req.NodeID)
 	if err != nil {
 		return nil, fmt.Errorf("streaming gRPC call failed: %w", err)
 	}

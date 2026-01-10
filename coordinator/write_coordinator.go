@@ -41,16 +41,16 @@ type StreamReplicator interface {
 	StreamReplicateTransaction(ctx context.Context, nodeID uint64, req *ReplicationRequest) (*ReplicationResponse, error)
 }
 
-// CDCStreamThresholdDefault is the default payload size threshold for streaming (1MB)
-const CDCStreamThresholdDefault = 1024 * 1024
+// StreamChunkSizeDefault is the default payload size for streaming chunks (1MB)
+const StreamChunkSizeDefault = 1024 * 1024
 
-// GetCDCStreamThreshold returns the configured CDC streaming threshold in bytes.
-// Falls back to CDCStreamThresholdDefault (1MB) if not configured.
-func GetCDCStreamThreshold() int {
-	if cfg.Config != nil && cfg.Config.Replication.CDCStreamThresholdKB > 0 {
-		return cfg.Config.Replication.CDCStreamThresholdKB * 1024
+// GetStreamChunkSize returns the configured streaming chunk size in bytes.
+// Falls back to StreamChunkSizeDefault (1MB) if not configured.
+func GetStreamChunkSize() int {
+	if cfg.Config != nil && cfg.Config.Replication.StreamChunkSizeKB > 0 {
+		return cfg.Config.Replication.StreamChunkSizeKB * 1024
 	}
-	return CDCStreamThresholdDefault
+	return StreamChunkSizeDefault
 }
 
 // Transaction represents a distributed transaction
@@ -320,7 +320,7 @@ func (wc *WriteCoordinator) sendRemoteCommits(_ context.Context, preparedNodes m
 
 	// Check if we should use streaming for large payloads
 	payloadSize := estimateCDCPayloadSize(req.Statements)
-	streamThreshold := GetCDCStreamThreshold()
+	streamThreshold := GetStreamChunkSize()
 	useStreaming := payloadSize >= streamThreshold
 	streamReplicator, hasStreaming := wc.replicator.(StreamReplicator)
 
@@ -329,7 +329,7 @@ func (wc *WriteCoordinator) sendRemoteCommits(_ context.Context, preparedNodes m
 			Uint64("txn_id", txnID).
 			Int("payload_size", payloadSize).
 			Int("threshold", streamThreshold).
-			Msg("Using streaming for large CDC payload")
+			Msg("Using streaming for large payload")
 	}
 
 	// STEP 1: Send COMMIT to remote nodes first
