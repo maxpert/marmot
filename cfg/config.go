@@ -59,6 +59,7 @@ type ObjectStoreConfiguration struct {
 type SnapshotConfiguration struct {
 	Enable    bool                     `toml:"enabled"`
 	Interval  uint32                   `toml:"interval"`
+	LeaderTTL uint32                   `toml:"leader_ttl"` // Leader election TTL in milliseconds (default: 30000)
 	StoreType SnapshotStoreType        `toml:"store"`
 	Nats      ObjectStoreConfiguration `toml:"nats"`
 	S3        S3Configuration          `toml:"s3"`

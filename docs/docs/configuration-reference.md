@@ -73,6 +73,11 @@ store = "nats"
 # If there was a snapshot saved within interval range due to log threshold triggers, 
 # then new snapshot won't be saved
 interval = 3600000
+
+# Leader election TTL in milliseconds (optional, default: 30000)
+# Used when multiple nodes have publish=true to coordinate who uploads snapshots
+# Only one node will be elected as the snapshot leader at a time
+leader_ttl = 30000
 ```
 
 ## NATS Configuration

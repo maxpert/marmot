@@ -144,6 +144,12 @@ func main() {
 		}
 	}
 
+	// Start snapshot leader election for publisher nodes
+	if cfg.Config.Snapshot.Enable && cfg.Config.Publish {
+		replicator.StartSnapshotLeader()
+		defer replicator.StopSnapshotLeader()
+	}
+
 	log.Info().Msg("Listing tables to watch...")
 	tableNames, err := db.GetAllDBTables(cfg.Config.DBPath)
 	if err != nil {
@@ -208,8 +214,11 @@ func main() {
 			log.Info().Msg("No more events to process, initiating shutdown")
 			ctxSt.Cancel()
 			if cfg.Config.Snapshot.Enable && cfg.Config.Publish {
-				log.Info().Msg("Saving snapshot before going to sleep")
-				replicator.ForceSaveSnapshot()
+				// Stop leader election and save final snapshot if we're the leader
+				if replicator.IsSnapshotLeader() {
+					log.Info().Msg("Saving snapshot before going to sleep")
+					replicator.ForceSaveSnapshot()
+				}
 			}
 
 			os.Exit(0)

@@ -60,3 +60,67 @@ The process involves:
 3. **Cleaning Up**: Removing HarmonyLite-specific tables and triggers for a clean snapshot
 4. **Optimizing**: Running `VACUUM` to optimize storage
 5. **Storing**: Uploading the snapshot to the configured storage backend
+
+## Leader Election for Snapshot Uploads
+
+When multiple nodes have `publish=true`, HarmonyLite uses **leader election** to ensure only one node uploads snapshots at a time. This prevents race conditions and redundant uploads.
+
+### Why Leader Election?
+
+Without coordination, multiple publisher nodes could:
+- Upload snapshots concurrently to the same path
+- Overwrite each other's snapshots (last-write-wins)
+- Cause potential corruption on non-atomic storage backends
+
+### How It Works
+
+Leader election uses the **NATS KeyValue store** with a lease-based mechanism:
+
+```mermaid
+sequenceDiagram
+    participant Node1
+    participant Node2
+    participant NATS KV
+    participant Storage
+
+    Node1->>NATS KV: Acquire lease (snapshot-leader)
+    NATS KV-->>Node1: Success (Leader)
+    
+    Node2->>NATS KV: Acquire lease (snapshot-leader)
+    NATS KV-->>Node2: Denied (lease held)
+    
+    loop Every heartbeat_interval
+        Node1->>NATS KV: Renew lease
+    end
+    
+    Node1->>Storage: Upload snapshot
+    
+    Note over Node1: Node1 crashes
+    Note over NATS KV: Lease expires after leader_ttl
+    
+    Node2->>NATS KV: Acquire lease (snapshot-leader)
+    NATS KV-->>Node2: Success (New Leader)
+    Node2->>Storage: Upload snapshot
+```
+
+### Configuration
+
+```toml
+[snapshot]
+enabled = true
+interval = 60000          # Snapshot interval in ms
+leader_ttl = 30000        # Leader lease TTL in ms (default: 30000)
+```
+
+- **`leader_ttl`**: How long a leader's lease is valid. If the leader fails to renew within this time, another node can take over.
+- **Heartbeat interval**: Automatically set to `leader_ttl / 3` to ensure timely renewal.
+
+### Failover Behavior
+
+1. **Normal operation**: The leader uploads snapshots at the configured interval
+2. **Leader goes down**: The lease expires after `leader_ttl` milliseconds
+3. **New leader elected**: Another publisher node acquires the lease
+4. **Snapshot uploads resume**: The new leader continues uploading snapshots
+
+> [!TIP]
+> For production deployments with high availability requirements, set `publish=true` on multiple nodes. The leader election ensures only one uploads at a time, with automatic failover if the leader fails.

@@ -20,3 +20,8 @@ format = "console"
 [prometheus]
 enable = true
 bind = "0.0.0.0:3012"
+
+[snapshot]
+enabled = true
+interval = 60000  # Save snapshot every 60 seconds
+leader_ttl = 30000  # Leader election TTL in milliseconds

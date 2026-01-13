@@ -26,11 +26,12 @@ type Replicator struct {
 	compressionEnabled bool
 	lastSnapshot       time.Time
 
-	client    *nats.Conn
-	repState  *replicationState
-	metaStore *replicatorMetaStore
-	snapshot  snapshot.NatsSnapshot
-	streamMap map[uint64]nats.JetStreamContext
+	client         *nats.Conn
+	repState       *replicationState
+	metaStore      *replicatorMetaStore
+	snapshot       snapshot.NatsSnapshot
+	streamMap      map[uint64]nats.JetStreamContext
+	snapshotLeader *SnapshotLeader
 }
 
 func NewReplicator(
@@ -111,17 +112,24 @@ func NewReplicator(
 		return nil, err
 	}
 
+	// Initialize snapshot leader election for publisher nodes
+	var snapshotLeader *SnapshotLeader
+	if cfg.Config.Publish && cfg.Config.Snapshot.Enable {
+		snapshotLeader = NewSnapshotLeader(nodeID, metaStore, GetLeaderTTL())
+	}
+
 	return &Replicator{
 		client:             nc,
 		nodeID:             nodeID,
 		compressionEnabled: compress,
 		lastSnapshot:       time.Time{},
 
-		shards:    shards,
-		streamMap: streamMap,
-		snapshot:  snapshot,
-		repState:  repState,
-		metaStore: metaStore,
+		shards:         shards,
+		streamMap:      streamMap,
+		snapshot:       snapshot,
+		repState:       repState,
+		metaStore:      metaStore,
+		snapshotLeader: snapshotLeader,
 	}, nil
 }
 
@@ -247,6 +255,12 @@ func (r *Replicator) LastSaveSnapshotTime() time.Time {
 }
 
 func (r *Replicator) SaveSnapshot() {
+	// Check if this node is the snapshot leader
+	if r.snapshotLeader != nil && !r.snapshotLeader.IsLeader() {
+		log.Debug().Msg("Not the snapshot leader, skipping snapshot save")
+		return
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -296,6 +310,30 @@ func (r *Replicator) ReloadCertificates() error {
 	}
 
 	return nil
+}
+
+// StartSnapshotLeader starts the snapshot leader election loop.
+// This should be called after the replicator is created for publisher nodes.
+func (r *Replicator) StartSnapshotLeader() {
+	if r.snapshotLeader != nil {
+		r.snapshotLeader.Start()
+	}
+}
+
+// StopSnapshotLeader stops the snapshot leader election loop.
+// This should be called during graceful shutdown.
+func (r *Replicator) StopSnapshotLeader() {
+	if r.snapshotLeader != nil {
+		r.snapshotLeader.Stop()
+	}
+}
+
+// IsSnapshotLeader returns true if this node is the snapshot leader.
+func (r *Replicator) IsSnapshotLeader() bool {
+	if r.snapshotLeader != nil {
+		return r.snapshotLeader.IsLeader()
+	}
+	return true // If no leader election, assume this node is the leader
 }
 
 func (r *Replicator) invokeListener(callback func(payload []byte) error, msg *nats.Msg) error {
