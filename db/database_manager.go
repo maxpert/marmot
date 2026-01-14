@@ -175,18 +175,21 @@ func (dm *DatabaseManager) openDatabase(name, path string) error {
 
 // wireGCCoordination sets up GC safe point tracking for a database
 // This ensures transaction logs are retained until all peers have applied them
+//
+// NOTE: This function must NOT acquire dm.mu as it is called from contexts
+// that already hold the write lock (CreateDatabase, ReopenDatabase, etc.)
+// or during single-threaded initialization. Reading refreshReplicationStates
+// is safe because the caller either has exclusive access via write lock
+// or we're in initialization before any concurrent access is possible.
 func (dm *DatabaseManager) wireGCCoordination(mdb *ReplicatedDatabase, dbName string) {
 	txnMgr := mdb.GetTransactionManager()
 	txnMgr.SetDatabaseName(dbName)
 	txnMgr.SetMinAppliedTxnIDFunc(dm.GetMinAppliedTxnID)
 
 	// Wire refresh function if available (set via SetRefreshReplicationStatesFunc)
-	dm.mu.RLock()
-	refreshFn := dm.refreshReplicationStates
-	dm.mu.RUnlock()
-
-	if refreshFn != nil {
-		txnMgr.SetRefreshReplicationStatesFunc(refreshFn)
+	// No lock needed: caller either holds write lock or we're in init
+	if dm.refreshReplicationStates != nil {
+		txnMgr.SetRefreshReplicationStatesFunc(dm.refreshReplicationStates)
 	}
 }
 
