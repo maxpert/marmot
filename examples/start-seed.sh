@@ -66,7 +66,8 @@ read_timeout_ms = 2000
 
 # Anti-Entropy: Background healing for eventual consistency
 enable_anti_entropy = true
-anti_entropy_interval_seconds = 60      # Run anti-entropy every 60 seconds
+anti_entropy_interval_seconds = 30      # Run anti-entropy every 30 seconds
+gc_interval_seconds = 60                # GC interval (MUST be >= anti_entropy_interval)
 delta_sync_threshold_transactions = 10000  # Use delta sync if lag < 10K txns
 delta_sync_threshold_seconds = 3600     # Use snapshot if lag > 1 hour
 
@@ -74,9 +75,7 @@ delta_sync_threshold_seconds = 3600     # Use snapshot if lag > 1 hour
 gc_min_retention_hours = 2   # Minimum 2 hours (must be >= delta threshold)
 gc_max_retention_hours = 24  # Force delete after 24 hours
 
-[mvcc]
-gc_interval_seconds = 30         # Run GC every 30 seconds
-gc_retention_hours = 1           # Minimum age for GC consideration
+[transaction]
 heartbeat_timeout_seconds = 10   # Timeout for transaction heartbeats
 conflict_window_seconds = 10     # Window for LWW conflict resolution
 

@@ -310,6 +310,10 @@ func main() {
 		schemaVersionMgr,
 	)
 
+	// Wire anti-entropy refresh to DatabaseManager for GC watermark freshness
+	// This ensures GC queries fresh peer states before making deletion decisions
+	dbMgr.SetRefreshReplicationStatesFunc(antiEntropy.RefreshPeerReplicationStates)
+
 	// Start anti-entropy service
 	antiEntropy.Start()
 	defer antiEntropy.Stop()

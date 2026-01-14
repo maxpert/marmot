@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"sort"
@@ -38,31 +39,36 @@ type MinAppliedTxnIDFunc func(database string) (uint64, error)
 // Used for GC coordination via gossip protocol (no extra RPC calls needed)
 type ClusterMinWatermarkFunc func() uint64
 
+// RefreshReplicationStatesFunc refreshes peer replication states before GC decisions
+// This queries all alive peers and updates local state, ensuring fresh watermarks
+type RefreshReplicationStatesFunc func(ctx context.Context) error
+
 // TransactionManager manages distributed transactions
 // All transaction state is stored in MetaStore (PebbleDB) - no in-memory caching
 type TransactionManager struct {
-	db                     *sql.DB   // User database for data operations
-	metaStore              MetaStore // MetaStore for transaction metadata
-	clock                  *hlc.Clock
-	schemaCache            *SchemaCache // Schema cache for table metadata
-	mu                     sync.RWMutex
-	gcInterval             time.Duration
-	gcThreshold            time.Duration
-	gcMinRetention         time.Duration // Minimum retention for replication
-	gcMaxRetention         time.Duration // Force GC after this duration
-	heartbeatTimeout       time.Duration
-	stopGC                 chan struct{}
-	gcRunning              bool
-	databaseName           string                  // Name of database this manager manages
-	getMinAppliedTxnID     MinAppliedTxnIDFunc     // Callback for GC coordination
-	getClusterMinWatermark ClusterMinWatermarkFunc // Callback for GC via gossip watermark
-	batchCommitter         *SQLiteBatchCommitter   // SQLite write batcher (nil if disabled)
+	db                       *sql.DB   // User database for data operations
+	metaStore                MetaStore // MetaStore for transaction metadata
+	clock                    *hlc.Clock
+	schemaCache              *SchemaCache // Schema cache for table metadata
+	mu                       sync.RWMutex
+	gcInterval               time.Duration
+	gcThreshold              time.Duration
+	gcMinRetention           time.Duration // Minimum retention for replication
+	gcMaxRetention           time.Duration // Force GC after this duration
+	heartbeatTimeout         time.Duration
+	stopGC                   chan struct{}
+	gcRunning                bool
+	databaseName             string                       // Name of database this manager manages
+	getMinAppliedTxnID       MinAppliedTxnIDFunc          // Callback for GC coordination
+	getClusterMinWatermark   ClusterMinWatermarkFunc      // Callback for GC via gossip watermark
+	refreshReplicationStates RefreshReplicationStatesFunc // Callback to refresh watermarks before GC
+	batchCommitter           *SQLiteBatchCommitter        // SQLite write batcher (nil if disabled)
 }
 
 // NewTransactionManager creates a new transaction manager
 func NewTransactionManager(db *sql.DB, metaStore MetaStore, clock *hlc.Clock, schemaCache *SchemaCache) *TransactionManager {
 	// Import config values (with fallback to defaults if config not loaded)
-	gcInterval := 30 * time.Second
+	gcInterval := 60 * time.Second // Default: 60s (MUST be >= anti-entropy interval for fresh watermarks)
 	gcThreshold := 1 * time.Hour
 	gcMinRetention := 1 * time.Hour
 	gcMaxRetention := 4 * time.Hour
@@ -73,6 +79,7 @@ func NewTransactionManager(db *sql.DB, metaStore MetaStore, clock *hlc.Clock, sc
 		heartbeatTimeout = time.Duration(cfg.Config.Transaction.HeartbeatTimeoutSeconds) * time.Second
 		gcMinRetention = time.Duration(cfg.Config.Replication.GCMinRetentionHours) * time.Hour
 		gcMaxRetention = time.Duration(cfg.Config.Replication.GCMaxRetentionHours) * time.Hour
+		gcInterval = time.Duration(cfg.Config.Replication.GCIntervalS) * time.Second
 	}
 
 	tm := &TransactionManager{
@@ -118,6 +125,14 @@ func (tm *TransactionManager) SetClusterMinWatermarkFunc(fn ClusterMinWatermarkF
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 	tm.getClusterMinWatermark = fn
+}
+
+// SetRefreshReplicationStatesFunc sets the callback for refreshing peer replication states
+// This is called before GC Phase 2 to ensure watermarks are fresh before deletion decisions
+func (tm *TransactionManager) SetRefreshReplicationStatesFunc(fn RefreshReplicationStatesFunc) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	tm.refreshReplicationStates = fn
 }
 
 // hasDDLIntents returns true if any intent is DDL type
@@ -643,8 +658,9 @@ func (tm *TransactionManager) cleanupStaleTransactions() (int, error) {
 // with GC safe point coordination to prevent deleting logs needed by lagging peers
 // Uses belt-and-suspenders: both txn_id from anti-entropy and seq_num from gossip watermark
 func (tm *TransactionManager) cleanupOldTransactionRecords() (int, error) {
-	// Get GC safe points from both mechanisms
+	// Get callbacks under lock
 	tm.mu.RLock()
+	refreshFn := tm.refreshReplicationStates
 	getMinAppliedFn := tm.getMinAppliedTxnID
 	getWatermarkFn := tm.getClusterMinWatermark
 	dbName := tm.databaseName
@@ -655,7 +671,19 @@ func (tm *TransactionManager) cleanupOldTransactionRecords() (int, error) {
 
 	// Skip replication tracking for system database (it's not replicated)
 	if dbName != "" && dbName != SystemDatabaseName {
-		// Get min applied txn_id from anti-entropy (if available)
+		// CRITICAL: Refresh peer replication states BEFORE getting watermarks
+		// This ensures we have fresh data before making GC deletion decisions
+		if refreshFn != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			if err := refreshFn(ctx); err != nil {
+				// Log warning but continue with potentially stale data
+				// The retention windows provide safety margin
+				log.Warn().Err(err).Str("database", dbName).Msg("GC: Failed to refresh replication states, using cached watermarks")
+			}
+			cancel()
+		}
+
+		// Get min applied txn_id from anti-entropy (now refreshed)
 		if getMinAppliedFn != nil {
 			minTxnID, err := getMinAppliedFn(dbName)
 			if err == nil {

@@ -506,7 +506,7 @@ Marmot handles various failure and recovery scenarios automatically:
 
 Marmot v2 includes an automatic anti-entropy system that continuously monitors and repairs replication lag across the cluster:
 
-1. **Lag Detection**: Every 60 seconds (configurable), each node queries peers for their replication state
+1. **Lag Detection**: Every 30 seconds (configurable), each node queries peers for their replication state
 2. **Smart Recovery Decision**:
    - **Delta Sync** if lag < 10,000 transactions AND < 1 hour: Streams missed transactions incrementally
    - **Snapshot Transfer** if lag exceeds thresholds: Full database file transfer for efficiency
@@ -830,11 +830,13 @@ read_timeout_ms = 2000                    # Read operation timeout
 # - Uses delta sync for small lags, snapshot for large lags
 # - Includes gap detection to prevent incomplete data after GC
 enable_anti_entropy = true                 # Enable automatic catch-up for lagging nodes
-anti_entropy_interval_seconds = 60         # How often to check for lag (default: 60s)
+anti_entropy_interval_seconds = 30         # How often to check for lag (default: 30s)
+gc_interval_seconds = 60                   # GC interval (MUST be >= anti_entropy_interval)
 delta_sync_threshold_transactions = 10000  # Delta sync if lag < 10K txns
 delta_sync_threshold_seconds = 3600        # Snapshot if lag > 1 hour
 
 # Garbage Collection: Reclaim disk space by deleting old transaction records
+# - gc_interval must be >= anti_entropy_interval (validated at startup)
 # - gc_min must be >= delta_sync_threshold (validated at startup)
 # - gc_max should be >= 2x delta_sync_threshold (recommended)
 # - Set gc_max = 0 for unlimited retention
@@ -843,8 +845,8 @@ gc_max_retention_hours = 24  # Force delete after 24 hours
 ```
 
 **Anti-Entropy Tuning:**
-- **Small clusters (2-3 nodes)**: Use default settings (60s interval)
-- **Large clusters (5+ nodes)**: Consider increasing interval to 120-180s to reduce network overhead
+- **Small clusters (2-3 nodes)**: Use default settings (30s AE, 60s GC)
+- **Large clusters (5+ nodes)**: Consider increasing AE interval to 60-120s and GC to 2x that value
 - **High write throughput**: Increase `delta_sync_threshold_transactions` to 50000+
 - **Long-running clusters**: Keep `gc_max_retention_hours` at 24+ to handle extended outages
 

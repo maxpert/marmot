@@ -87,8 +87,14 @@ read_timeout_ms = 2000
 enable_anti_entropy = true
 
 # Anti-entropy sync interval (seconds)
-# How often to check for and repair replication lag (default: 60 = 1 minute)
-anti_entropy_interval_seconds = 60
+# How often to check for and repair replication lag
+# Lower values = fresher watermarks for GC, but more network overhead
+anti_entropy_interval_seconds = 30
+
+# GC interval (seconds)
+# How often garbage collection runs to clean up old transaction records
+# MUST be >= anti_entropy_interval_seconds to ensure fresh watermarks before GC
+gc_interval_seconds = 60
 
 # Delta sync threshold (transactions)
 # If a node lags by more than this many transactions, use snapshot instead of delta sync

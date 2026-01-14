@@ -675,3 +675,91 @@ func (ae *AntiEntropyService) GetStats() map[string]interface{} {
 		"delta_threshold_seconds": ae.deltaThresholdSeconds,
 	}
 }
+
+// RefreshPeerReplicationStates queries all alive peers for their replication state
+// and updates local state. This ensures GC has fresh watermarks before making decisions.
+// Called by GC before Phase 2 to prevent data loss from stale watermarks.
+func (ae *AntiEntropyService) RefreshPeerReplicationStates(ctx context.Context) error {
+	if !ae.enabled {
+		return nil
+	}
+
+	// Get all ALIVE nodes from registry
+	nodes := ae.registry.GetAll()
+	var alivePeers []*NodeState
+	for _, node := range nodes {
+		if node.Status == NodeStatus_ALIVE && node.NodeId != ae.nodeID {
+			alivePeers = append(alivePeers, node)
+		}
+	}
+
+	if len(alivePeers) == 0 {
+		// No peers to query - single node cluster
+		return nil
+	}
+
+	// Get all databases to query
+	databases := ae.dbManager.ListDatabases()
+	if len(databases) == 0 {
+		return nil
+	}
+
+	var refreshErrors []string
+
+	// Query each peer for their replication state
+	for _, peer := range alivePeers {
+		client, err := ae.client.GetClientByAddress(peer.Address)
+		if err != nil {
+			refreshErrors = append(refreshErrors, fmt.Sprintf("peer %d: connection failed", peer.NodeId))
+			continue
+		}
+
+		for _, dbName := range databases {
+			resp, err := client.GetReplicationState(ctx, &ReplicationStateRequest{
+				RequestingNodeId: ae.nodeID,
+				Database:         dbName,
+			})
+			if err != nil {
+				refreshErrors = append(refreshErrors, fmt.Sprintf("peer %d db %s: %v", peer.NodeId, dbName, err))
+				continue
+			}
+
+			// Update local state with peer's current max txn_id
+			for _, state := range resp.States {
+				if state.DatabaseName != dbName {
+					continue
+				}
+
+				// Store the peer's current max txn_id as their replication state
+				// This is what we track for GC safe point calculation
+				repState := &db.ReplicationState{
+					PeerNodeID:        peer.NodeId,
+					DatabaseName:      dbName,
+					LastAppliedTxnID:  state.CurrentMaxTxnId,
+					LastAppliedTSWall: ae.clock.Now().WallTime,
+					LastAppliedTSLog:  0,
+					LastSyncTime:      time.Now().UnixNano(),
+					SyncStatus:        "REFRESHED",
+				}
+
+				if err := ae.dbManager.UpdateReplicationState(repState); err != nil {
+					log.Warn().
+						Err(err).
+						Uint64("peer_node", peer.NodeId).
+						Str("database", dbName).
+						Msg("Failed to update replication state during refresh")
+				}
+			}
+		}
+	}
+
+	if len(refreshErrors) > 0 {
+		// Log but don't fail - we may have partial success
+		log.Warn().
+			Strs("errors", refreshErrors).
+			Int("peer_count", len(alivePeers)).
+			Msg("Some peers failed during replication state refresh")
+	}
+
+	return nil
+}

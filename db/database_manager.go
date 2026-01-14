@@ -30,12 +30,13 @@ type DatabaseProvider interface {
 
 // DatabaseManager manages multiple MVCC databases
 type DatabaseManager struct {
-	mu        sync.RWMutex
-	databases map[string]*ReplicatedDatabase
-	systemDB  *ReplicatedDatabase
-	dataDir   string
-	nodeID    uint64
-	clock     *hlc.Clock
+	mu                       sync.RWMutex
+	databases                map[string]*ReplicatedDatabase
+	systemDB                 *ReplicatedDatabase
+	dataDir                  string
+	nodeID                   uint64
+	clock                    *hlc.Clock
+	refreshReplicationStates RefreshReplicationStatesFunc // Callback to refresh peer states before GC
 }
 
 // DatabaseMetadata represents database registry information
@@ -178,6 +179,33 @@ func (dm *DatabaseManager) wireGCCoordination(mdb *ReplicatedDatabase, dbName st
 	txnMgr := mdb.GetTransactionManager()
 	txnMgr.SetDatabaseName(dbName)
 	txnMgr.SetMinAppliedTxnIDFunc(dm.GetMinAppliedTxnID)
+
+	// Wire refresh function if available (set via SetRefreshReplicationStatesFunc)
+	dm.mu.RLock()
+	refreshFn := dm.refreshReplicationStates
+	dm.mu.RUnlock()
+
+	if refreshFn != nil {
+		txnMgr.SetRefreshReplicationStatesFunc(refreshFn)
+	}
+}
+
+// SetRefreshReplicationStatesFunc sets the callback for refreshing peer replication states
+// This is called by GC before Phase 2 to ensure fresh watermarks before deletion decisions
+// The callback is wired to all existing and future TransactionManagers
+func (dm *DatabaseManager) SetRefreshReplicationStatesFunc(fn RefreshReplicationStatesFunc) {
+	dm.mu.Lock()
+	dm.refreshReplicationStates = fn
+	dm.mu.Unlock()
+
+	// Wire to all existing databases
+	dm.mu.RLock()
+	defer dm.mu.RUnlock()
+
+	for _, mdb := range dm.databases {
+		txnMgr := mdb.GetTransactionManager()
+		txnMgr.SetRefreshReplicationStatesFunc(fn)
+	}
 }
 
 // ensureDefaultDatabase ensures the default database exists

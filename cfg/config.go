@@ -40,6 +40,7 @@ type ReplicationConfiguration struct {
 	ReadTimeoutMS             int    `toml:"read_timeout_ms"`
 	EnableAntiEntropy         bool   `toml:"enable_anti_entropy"`
 	AntiEntropyIntervalS      int    `toml:"anti_entropy_interval_seconds"`
+	GCIntervalS               int    `toml:"gc_interval_seconds"` // GC interval - MUST be >= anti_entropy_interval_seconds
 	DeltaSyncThresholdTxns    int    `toml:"delta_sync_threshold_transactions"`
 	DeltaSyncThresholdSeconds int    `toml:"delta_sync_threshold_seconds"`
 	GCMinRetentionHours       int    `toml:"gc_min_retention_hours"`
@@ -232,7 +233,8 @@ var Config = &Configuration{
 		WriteTimeoutMS:            5000,
 		ReadTimeoutMS:             2000,
 		EnableAntiEntropy:         true,
-		AntiEntropyIntervalS:      60,    // 1 minute - continuous background healing (like Riak's 15s)
+		AntiEntropyIntervalS:      30,    // 30s - frequent watermark updates (was 60s, flipped for GC safety)
+		GCIntervalS:               60,    // 60s - MUST be >= AntiEntropyIntervalS for fresh watermarks before GC
 		DeltaSyncThresholdTxns:    10000, // Trigger snapshot if lag > 10k transactions
 		DeltaSyncThresholdSeconds: 3600,  // 1 hour - trigger snapshot after this (like Cassandra's daily repair)
 		GCMinRetentionHours:       2,     // 2 hours - MUST be >= 2x delta threshold (safety margin)
@@ -614,6 +616,20 @@ func Validate() error {
 					Config.Replication.GCMaxRetentionHours,
 				)
 			}
+		}
+
+		// Rule 4: GC interval MUST be >= AE interval for watermark freshness
+		// GC queries watermarks that are updated by AE - if GC runs more often than AE,
+		// it makes decisions based on stale watermarks which can cause data loss
+		if Config.Replication.GCIntervalS < Config.Replication.AntiEntropyIntervalS {
+			return fmt.Errorf(
+				"gc_interval_seconds (%d) must be >= anti_entropy_interval_seconds (%d). "+
+					"GC must not run more frequently than anti-entropy to ensure fresh watermarks before GC decisions. "+
+					"Recommendation: set gc_interval_seconds to at least %d",
+				Config.Replication.GCIntervalS,
+				Config.Replication.AntiEntropyIntervalS,
+				Config.Replication.AntiEntropyIntervalS,
+			)
 		}
 	}
 
