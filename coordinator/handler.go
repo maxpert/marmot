@@ -438,7 +438,6 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, params []in
 				}
 				// Keep original SQL in first statement for debugging
 				statements[0].SQL = stmt.SQL
-				statements[0].Type = stmt.Type
 				statements[0].Database = stmt.Database
 			}
 		}
@@ -894,7 +893,6 @@ func (h *CoordinatorHandler) handleCommit(session *protocol.ConnectionSession) (
 				for _, entry := range cdcEntries {
 					cdcStmt := ConvertToStatement(entry)
 					cdcStmt.SQL = stmt.SQL
-					cdcStmt.Type = stmt.Type
 					cdcStmt.Database = stmt.Database
 					enrichedStatements = append(enrichedStatements, cdcStmt)
 				}
