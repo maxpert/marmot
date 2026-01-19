@@ -327,7 +327,7 @@ func (tm *TransactionManager) applyDataChanges(txn *Transaction, intents []*Writ
 		return fmt.Errorf("failed to load CDC entries: %w", err)
 	}
 
-	// Apply CDC entries (DML operations)
+	// Apply CDC entries (DML operations) - batched in single SQLite transaction
 	if err := tm.applyCDCEntries(txn.ID, cdcEntries); err != nil {
 		return err
 	}
@@ -390,24 +390,40 @@ func (tm *TransactionManager) rebuildStatementsFromCDC(cdcEntries []*IntentEntry
 	return statements
 }
 
-// applyCDCEntries applies CDC data entries to SQLite.
+// applyCDCEntries applies CDC data entries to SQLite within a single transaction.
 func (tm *TransactionManager) applyCDCEntries(txnID uint64, entries []*IntentEntry) error {
 	if len(entries) == 0 {
 		return nil
 	}
 
-	for _, entry := range entries {
-		stmt := protocol.Statement{
-			TableName: entry.Table,
-			IntentKey: entry.IntentKey,
-			OldValues: entry.OldValues,
-			NewValues: entry.NewValues,
-			Type:      OpTypeToStatementType(OpType(entry.Operation)),
-		}
+	// Begin SQLite transaction to batch all DML writes
+	tx, err := tm.db.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin SQLite transaction: %w", err)
+	}
+	defer tx.Rollback()
 
-		if err := tm.writeCDCData(stmt); err != nil {
+	schemaAdapter := &schemaCacheAdapter{cache: tm.schemaCache}
+
+	for _, entry := range entries {
+		var err error
+		switch OpType(entry.Operation) {
+		case OpTypeInsert, OpTypeReplace:
+			err = ApplyCDCInsert(tx, entry.Table, entry.NewValues)
+		case OpTypeUpdate:
+			err = ApplyCDCUpdate(tx, schemaAdapter, entry.Table, entry.OldValues, entry.NewValues)
+		case OpTypeDelete:
+			err = ApplyCDCDelete(tx, schemaAdapter, entry.Table, entry.OldValues)
+		default:
+			err = fmt.Errorf("unsupported operation type: %v", entry.Operation)
+		}
+		if err != nil {
 			return fmt.Errorf("failed to write CDC data for %s: %w", entry.Table, err)
 		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit CDC transaction: %w", err)
 	}
 	return nil
 }
@@ -737,22 +753,6 @@ func (s *schemaCacheAdapter) GetPrimaryKeys(tableName string) ([]string, error) 
 		return nil, err
 	}
 	return schema.PrimaryKeys, nil
-}
-
-// writeCDCData writes CDC row data directly to the base table using unified CDC applier
-func (tm *TransactionManager) writeCDCData(stmt protocol.Statement) error {
-	schemaAdapter := &schemaCacheAdapter{cache: tm.schemaCache}
-
-	switch stmt.Type {
-	case protocol.StatementInsert, protocol.StatementReplace:
-		return ApplyCDCInsert(tm.db, stmt.TableName, stmt.NewValues)
-	case protocol.StatementUpdate:
-		return ApplyCDCUpdate(tm.db, schemaAdapter, stmt.TableName, stmt.OldValues, stmt.NewValues)
-	case protocol.StatementDelete:
-		return ApplyCDCDelete(tm.db, schemaAdapter, stmt.TableName, stmt.OldValues)
-	default:
-		return fmt.Errorf("unsupported statement type for CDC: %v", stmt.Type)
-	}
 }
 
 // unmarshalCDCValue deserializes a msgpack-encoded value and converts []byte to string.
