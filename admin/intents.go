@@ -82,15 +82,14 @@ func (h *AdminHandlers) handleIntent(w http.ResponseWriter, r *http.Request, met
 	response := map[string]interface{}{
 		"table_name":         rec.TableName,
 		"intent_key":         filter.IntentKeyToBase64(rec.IntentKey),
-		"txn_id":             rec.TxnID,
-		"ts_wall":            rec.TSWall,
-		"ts_logical":         rec.TSLogical,
-		"node_id":            rec.NodeID,
-		"operation":          rec.Operation,
-		"sql_statement":      rec.SQLStatement,
-		"data_snapshot":      encodeBase64(rec.DataSnapshot),
-		"created_at":         formatTimestamp(rec.CreatedAt),
-		"marked_for_cleanup": rec.MarkedForCleanup,
+		"txn_id":        rec.TxnID,
+		"ts_wall":       rec.TSWall,
+		"ts_logical":    rec.TSLogical,
+		"node_id":       rec.NodeID,
+		"operation":     rec.Operation,
+		"sql_statement": rec.SQLStatement,
+		"data_snapshot": encodeBase64(rec.DataSnapshot),
+		"created_at":    formatTimestamp(rec.CreatedAt),
 	}
 
 	writeJSONResponse(w, response, false, "")
@@ -115,17 +114,16 @@ func (h *AdminHandlers) handleIntentsByTxn(w http.ResponseWriter, r *http.Reques
 	var response []map[string]interface{}
 	for _, rec := range records {
 		item := map[string]interface{}{
-			"table_name":         rec.TableName,
-			"intent_key":         filter.IntentKeyToBase64(rec.IntentKey),
-			"txn_id":             rec.TxnID,
-			"ts_wall":            rec.TSWall,
-			"ts_logical":         rec.TSLogical,
-			"node_id":            rec.NodeID,
-			"operation":          rec.Operation,
-			"sql_statement":      rec.SQLStatement,
-			"data_snapshot":      encodeBase64(rec.DataSnapshot),
-			"created_at":         formatTimestamp(rec.CreatedAt),
-			"marked_for_cleanup": rec.MarkedForCleanup,
+			"table_name":    rec.TableName,
+			"intent_key":    filter.IntentKeyToBase64(rec.IntentKey),
+			"txn_id":        rec.TxnID,
+			"ts_wall":       rec.TSWall,
+			"ts_logical":    rec.TSLogical,
+			"node_id":       rec.NodeID,
+			"operation":     rec.Operation,
+			"sql_statement": rec.SQLStatement,
+			"data_snapshot": encodeBase64(rec.DataSnapshot),
+			"created_at":    formatTimestamp(rec.CreatedAt),
 		}
 		response = append(response, item)
 	}

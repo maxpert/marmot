@@ -131,18 +131,13 @@ func (s *PebbleMetaStore) rebuildIntentFilter() error {
 			continue
 		}
 
-		var rec WriteIntentRecord
-		if err := encoding.Unmarshal(val, &rec); err != nil {
+		var lock IntentLock
+		if err := encoding.Unmarshal(val, &lock); err != nil {
 			continue
 		}
 
-		// Also check legacy MarkedForCleanup field for backward compatibility
-		if rec.MarkedForCleanup {
-			continue
-		}
-
-		tbHash := ComputeIntentHash(rec.TableName, string(rec.IntentKey))
-		s.intentFilter.Add(rec.TxnID, tbHash)
+		tbHash := ComputeIntentHash(tableName, intentKey)
+		s.intentFilter.Add(lock.TxnID, tbHash)
 		count++
 	}
 
@@ -1193,8 +1188,15 @@ func (s *PebbleMetaStore) WriteIntent(txnID uint64, intentType IntentType, table
 
 // writeIntentFastPath writes intent without Pebble conflict check (filter miss).
 func (s *PebbleMetaStore) writeIntentFastPath(txnID uint64, intentType IntentType, tableName, intentKey string, op OpType, sqlStmt string, data []byte, ts hlc.Timestamp, nodeID uint64, tbHash uint64) error {
-	key := pebbleIntentKey(tableName, intentKey)
+	// Lightweight lock for /intent/{table}/{key}
+	lock := &IntentLock{TxnID: txnID}
+	lockBytes, err := encoding.MarshalNative(lock)
+	if err != nil {
+		return err
+	}
+	defer lockBytes.Dispose()
 
+	// Full record for /intent_by_txn/{txnID}/{table}/{key}
 	rec := &WriteIntentRecord{
 		IntentType:   intentType,
 		TableName:    tableName,
@@ -1208,20 +1210,19 @@ func (s *PebbleMetaStore) writeIntentFastPath(txnID uint64, intentType IntentTyp
 		DataSnapshot: data,
 		CreatedAt:    time.Now().UnixNano(),
 	}
-
-	native, err := encoding.MarshalNative(rec)
+	recBytes, err := encoding.MarshalNative(rec)
 	if err != nil {
 		return err
 	}
-	defer native.Dispose()
+	defer recBytes.Dispose()
 
 	batch := s.db.NewBatch()
 	defer batch.Close()
 
-	if err := batch.Set(key, native.Bytes(), nil); err != nil {
+	if err := batch.Set(pebbleIntentKey(tableName, intentKey), lockBytes.Bytes(), nil); err != nil {
 		return err
 	}
-	if err := batch.Set(pebbleIntentByTxnKey(txnID, tableName, intentKey), nil, nil); err != nil {
+	if err := batch.Set(pebbleIntentByTxnKey(txnID, tableName, intentKey), recBytes.Bytes(), nil); err != nil {
 		return err
 	}
 
@@ -1240,13 +1241,13 @@ func (s *PebbleMetaStore) writeIntentFastPath(txnID uint64, intentType IntentTyp
 
 // writeIntentSlowPath writes intent with Pebble conflict check (filter hit).
 func (s *PebbleMetaStore) writeIntentSlowPath(txnID uint64, intentType IntentType, tableName, intentKey string, op OpType, sqlStmt string, data []byte, ts hlc.Timestamp, nodeID uint64, tbHash uint64) error {
-	key := pebbleIntentKey(tableName, intentKey)
+	lockKey := pebbleIntentKey(tableName, intentKey)
 
 	batch := s.db.NewBatch()
 	defer batch.Close()
 
-	// Check if intent already exists
-	existingData, closer, err := s.db.Get(key)
+	// Check if lock already exists
+	existingData, closer, err := s.db.Get(lockKey)
 	if err == nil {
 		// CHECK GC MARKER FIRST - before expensive unmarshal
 		gcKey := pebbleGCIntentKey(tableName, intentKey)
@@ -1256,90 +1257,60 @@ func (s *PebbleMetaStore) writeIntentSlowPath(txnID uint64, intentType IntentTyp
 			gcCloser.Close()
 			closer.Close()
 
-			// Delete GC marker and write new intent
+			// Delete GC marker - fall through to write new intent
 			if err := batch.Delete(gcKey, nil); err != nil {
 				return err
 			}
-
-			// Write new intent (same as fast path but in batch)
-			rec := &WriteIntentRecord{
-				IntentType:   intentType,
-				TableName:    tableName,
-				IntentKey:    []byte(intentKey),
-				TxnID:        txnID,
-				TSWall:       ts.WallTime,
-				TSLogical:    ts.Logical,
-				NodeID:       nodeID,
-				Operation:    op,
-				SQLStatement: sqlStmt,
-				DataSnapshot: data,
-				CreatedAt:    time.Now().UnixNano(),
-			}
-			native, err := encoding.MarshalNative(rec)
-			if err != nil {
-				return err
-			}
-			defer native.Dispose()
-			if err := batch.Set(key, native.Bytes(), nil); err != nil {
-				return err
-			}
-			if err := batch.Set(pebbleIntentByTxnKey(txnID, tableName, intentKey), nil, nil); err != nil {
-				return err
-			}
-			if err := batch.Commit(pebble.NoSync); err != nil {
-				return err
-			}
-
-			// Update filter
-			if s.intentFilter != nil {
-				s.intentFilter.Add(txnID, tbHash)
-			}
-
-			// Refresh heartbeat - transaction is active
-			_ = s.writeHeartbeat(txnID, time.Now().UnixNano())
-
-			return nil
-		}
-		if gcErr != pebble.ErrNotFound {
+		} else if gcErr != pebble.ErrNotFound {
 			closer.Close()
 			return gcErr
-		}
+		} else {
+			// No GC marker - check lock ownership
+			closer.Close()
 
-		// No GC marker - proceed with existing conflict resolution
-		closer.Close()
-
-		var existing WriteIntentRecord
-		if err := encoding.Unmarshal(existingData, &existing); err != nil {
-			return err
-		}
-
-		// Same transaction - update intent in place
-		if existing.TxnID == txnID {
-			telemetry.IntentFilterChecks.With("slow_path_same_txn").Inc()
-			existing.Operation = op
-			existing.SQLStatement = sqlStmt
-			existing.DataSnapshot = data
-			existing.CreatedAt = time.Now().UnixNano()
-			native, err := encoding.MarshalNative(&existing)
-			if err != nil {
-				return err
-			}
-			defer native.Dispose()
-			if err := s.db.Set(key, native.Bytes(), pebble.NoSync); err != nil {
+			var existingLock IntentLock
+			if err := encoding.Unmarshal(existingData, &existingLock); err != nil {
 				return err
 			}
 
-			// Refresh heartbeat - transaction is active
-			_ = s.writeHeartbeat(txnID, time.Now().UnixNano())
+			if existingLock.TxnID == txnID {
+				// Same transaction - update full record in /intent_by_txn/ only
+				telemetry.IntentFilterChecks.With("slow_path_same_txn").Inc()
 
-			return nil
-		}
+				rec := &WriteIntentRecord{
+					IntentType:   intentType,
+					TableName:    tableName,
+					IntentKey:    []byte(intentKey),
+					TxnID:        txnID,
+					TSWall:       ts.WallTime,
+					TSLogical:    ts.Logical,
+					NodeID:       nodeID,
+					Operation:    op,
+					SQLStatement: sqlStmt,
+					DataSnapshot: data,
+					CreatedAt:    time.Now().UnixNano(),
+				}
+				recBytes, err := encoding.MarshalNative(rec)
+				if err != nil {
+					return err
+				}
+				defer recBytes.Dispose()
 
-		// Different transaction - check if we can overwrite
-		telemetry.IntentFilterChecks.With("slow_path_conflict").Inc()
-		if err := s.resolveIntentConflictPebble(batch, &existing, txnID, tableName, intentKey); err != nil {
-			telemetry.WriteConflictsTotal.With("intent", "slow").Inc()
-			return err
+				if err := s.db.Set(pebbleIntentByTxnKey(txnID, tableName, intentKey), recBytes.Bytes(), pebble.NoSync); err != nil {
+					return err
+				}
+
+				// Refresh heartbeat - transaction is active
+				_ = s.writeHeartbeat(txnID, time.Now().UnixNano())
+				return nil
+			}
+
+			// Different transaction - check if we can overwrite
+			telemetry.IntentFilterChecks.With("slow_path_conflict").Inc()
+			if err := s.resolveIntentConflictPebble(batch, existingLock.TxnID, txnID, tableName, intentKey); err != nil {
+				telemetry.WriteConflictsTotal.With("intent", "slow").Inc()
+				return err
+			}
 		}
 	} else if err != pebble.ErrNotFound {
 		return err
@@ -1349,7 +1320,14 @@ func (s *PebbleMetaStore) writeIntentSlowPath(txnID uint64, intentType IntentTyp
 		telemetry.IntentFilterFalsePositives.Inc()
 	}
 
-	// Create new intent
+	// Create new intent - write lock to /intent/, full record to /intent_by_txn/
+	lock := &IntentLock{TxnID: txnID}
+	lockBytes, err := encoding.MarshalNative(lock)
+	if err != nil {
+		return err
+	}
+	defer lockBytes.Dispose()
+
 	rec := &WriteIntentRecord{
 		IntentType:   intentType,
 		TableName:    tableName,
@@ -1363,17 +1341,16 @@ func (s *PebbleMetaStore) writeIntentSlowPath(txnID uint64, intentType IntentTyp
 		DataSnapshot: data,
 		CreatedAt:    time.Now().UnixNano(),
 	}
-
-	native, err := encoding.MarshalNative(rec)
+	recBytes, err := encoding.MarshalNative(rec)
 	if err != nil {
 		return err
 	}
-	defer native.Dispose()
+	defer recBytes.Dispose()
 
-	if err := batch.Set(key, native.Bytes(), nil); err != nil {
+	if err := batch.Set(lockKey, lockBytes.Bytes(), nil); err != nil {
 		return err
 	}
-	if err := batch.Set(pebbleIntentByTxnKey(txnID, tableName, intentKey), nil, nil); err != nil {
+	if err := batch.Set(pebbleIntentByTxnKey(txnID, tableName, intentKey), recBytes.Bytes(), nil); err != nil {
 		return err
 	}
 
@@ -1392,32 +1369,22 @@ func (s *PebbleMetaStore) writeIntentSlowPath(txnID uint64, intentType IntentTyp
 	return nil
 }
 
-// resolveIntentConflictPebble handles conflict with existing intent from different transaction
-func (s *PebbleMetaStore) resolveIntentConflictPebble(batch *pebble.Batch, existing *WriteIntentRecord, txnID uint64, tableName, intentKey string) error {
-	// Marked for cleanup - safe to overwrite
-	if existing.MarkedForCleanup {
-		_ = batch.Delete(pebbleIntentByTxnKey(existing.TxnID, tableName, intentKey), nil)
-		// Clean up filter for the old transaction's intent
-		if s.intentFilter != nil {
-			tbHash := ComputeIntentHash(tableName, intentKey)
-			s.intentFilter.RemoveHash(existing.TxnID, tbHash)
-		}
-		return nil
-	}
-
+// resolveIntentConflictPebble handles conflict with existing intent from different transaction.
+// Called after GC marker check - if GC marker exists, caller handles overwrite directly.
+func (s *PebbleMetaStore) resolveIntentConflictPebble(batch *pebble.Batch, existingTxnID, txnID uint64, tableName, intentKey string) error {
 	// Check conflicting transaction status
 	// Use custom txnGetter if set (allows MemoryMetaStore to inject its GetTransaction)
 	getTxn := s.GetTransaction
 	if s.txnGetter != nil {
 		getTxn = s.txnGetter
 	}
-	conflictTxnRec, _ := getTxn(existing.TxnID)
+	conflictTxnRec, _ := getTxn(existingTxnID)
 
 	canOverwrite := false
 	switch {
 	case conflictTxnRec == nil:
 		log.Debug().
-			Uint64("orphan_txn_id", existing.TxnID).
+			Uint64("orphan_txn_id", existingTxnID).
 			Str("table", tableName).
 			Str("intent_key", intentKey).
 			Msg("Cleaning up orphaned intent (no transaction record)")
@@ -1428,7 +1395,7 @@ func (s *PebbleMetaStore) resolveIntentConflictPebble(batch *pebble.Batch, exist
 
 	case conflictTxnRec.Status == TxnStatusAborted:
 		log.Debug().
-			Uint64("aborted_txn_id", existing.TxnID).
+			Uint64("aborted_txn_id", existingTxnID).
 			Str("table", tableName).
 			Str("intent_key", intentKey).
 			Msg("Cleaning up intent from aborted transaction")
@@ -1442,7 +1409,7 @@ func (s *PebbleMetaStore) resolveIntentConflictPebble(batch *pebble.Batch, exist
 		}
 
 		// Try to read heartbeat from new optimized key first
-		heartbeat, err := s.readHeartbeat(existing.TxnID)
+		heartbeat, err := s.readHeartbeat(existingTxnID)
 		if err != nil {
 			// Fall back to TransactionRecord for backward compatibility
 			heartbeat = conflictTxnRec.LastHeartbeat
@@ -1451,7 +1418,7 @@ func (s *PebbleMetaStore) resolveIntentConflictPebble(batch *pebble.Batch, exist
 		timeSinceHeartbeat := time.Now().UnixNano() - heartbeat
 		if timeSinceHeartbeat > heartbeatTimeout {
 			log.Debug().
-				Uint64("stale_txn_id", existing.TxnID).
+				Uint64("stale_txn_id", existingTxnID).
 				Str("table", tableName).
 				Str("intent_key", intentKey).
 				Int64("heartbeat_age_ms", timeSinceHeartbeat/1e6).
@@ -1462,15 +1429,15 @@ func (s *PebbleMetaStore) resolveIntentConflictPebble(batch *pebble.Batch, exist
 
 	if !canOverwrite {
 		return fmt.Errorf("write-write conflict: row %s:%s locked by transaction %d (current txn: %d)",
-			tableName, intentKey, existing.TxnID, txnID)
+			tableName, intentKey, existingTxnID, txnID)
 	}
 
-	_ = batch.Delete(pebbleIntentByTxnKey(existing.TxnID, tableName, intentKey), nil)
+	_ = batch.Delete(pebbleIntentByTxnKey(existingTxnID, tableName, intentKey), nil)
 
 	// Clean up filter for the overwritten transaction's intent
 	if s.intentFilter != nil {
 		tbHash := ComputeIntentHash(tableName, intentKey)
-		s.intentFilter.RemoveHash(existing.TxnID, tbHash)
+		s.intentFilter.RemoveHash(existingTxnID, tbHash)
 	}
 
 	return nil
@@ -1487,20 +1454,20 @@ func (s *PebbleMetaStore) ValidateIntent(tableName, intentKey string, expectedTx
 	}
 	defer closer.Close()
 
-	var rec WriteIntentRecord
-	if err := encoding.Unmarshal(val, &rec); err != nil {
+	var lock IntentLock
+	if err := encoding.Unmarshal(val, &lock); err != nil {
 		return false, err
 	}
 
-	return rec.TxnID == expectedTxnID, nil
+	return lock.TxnID == expectedTxnID, nil
 }
 
 // DeleteIntent removes a specific write intent
 func (s *PebbleMetaStore) DeleteIntent(tableName, intentKey string, txnID uint64) error {
-	key := pebbleIntentKey(tableName, intentKey)
+	lockKey := pebbleIntentKey(tableName, intentKey)
 
 	// Verify the intent belongs to this transaction
-	val, closer, err := s.db.Get(key)
+	val, closer, err := s.db.Get(lockKey)
 	if err == pebble.ErrNotFound {
 		return nil
 	}
@@ -1508,21 +1475,21 @@ func (s *PebbleMetaStore) DeleteIntent(tableName, intentKey string, txnID uint64
 		return err
 	}
 
-	var rec WriteIntentRecord
-	if err := encoding.Unmarshal(val, &rec); err != nil {
+	var lock IntentLock
+	if err := encoding.Unmarshal(val, &lock); err != nil {
 		closer.Close()
 		return err
 	}
 	closer.Close()
 
-	if rec.TxnID != txnID {
+	if lock.TxnID != txnID {
 		return nil // Intent belongs to different transaction
 	}
 
 	batch := s.db.NewBatch()
 	defer batch.Close()
 
-	if err := batch.Delete(key, nil); err != nil {
+	if err := batch.Delete(lockKey, nil); err != nil {
 		return err
 	}
 	if err := batch.Delete(pebbleIntentByTxnKey(txnID, tableName, intentKey), nil); err != nil {
@@ -1781,41 +1748,51 @@ func (s *PebbleMetaStore) GetIntentsByTxn(txnID uint64) ([]*WriteIntentRecord, e
 	defer iter.Close()
 
 	for iter.SeekGE(prefix); iter.Valid(); iter.Next() {
-		tableName, intentKey, ok := parseIntentByTxnKey(iter.Key(), len(prefix))
-		if !ok {
-			continue
-		}
-
-		// Fetch primary intent
-		primaryKey := pebbleIntentKey(tableName, intentKey)
-		val, closer, err := s.db.Get(primaryKey)
+		// Full record is stored inline in /intent_by_txn/ - no random seeks needed
+		val, err := iter.ValueAndErr()
 		if err != nil {
 			continue
 		}
 
 		intent := &WriteIntentRecord{}
-		if err := encoding.Unmarshal(val, intent); err == nil && intent.TxnID == txnID {
+		if err := encoding.Unmarshal(val, intent); err == nil {
 			intents = append(intents, intent)
 		}
-		closer.Close()
 	}
 
 	return intents, iter.Error()
 }
 
-// GetIntent retrieves a specific write intent
+// GetIntent retrieves a specific write intent (two-step lookup for admin API)
 func (s *PebbleMetaStore) GetIntent(tableName, intentKey string) (*WriteIntentRecord, error) {
-	val, closer, err := s.db.Get(pebbleIntentKey(tableName, intentKey))
+	// Step 1: Get lock to find TxnID
+	lockVal, lockCloser, err := s.db.Get(pebbleIntentKey(tableName, intentKey))
 	if err == pebble.ErrNotFound {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	defer closer.Close()
+
+	var lock IntentLock
+	if err := encoding.Unmarshal(lockVal, &lock); err != nil {
+		lockCloser.Close()
+		return nil, err
+	}
+	lockCloser.Close()
+
+	// Step 2: Get full record from /intent_by_txn/
+	recVal, recCloser, err := s.db.Get(pebbleIntentByTxnKey(lock.TxnID, tableName, intentKey))
+	if err == pebble.ErrNotFound {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer recCloser.Close()
 
 	intent := &WriteIntentRecord{}
-	if err := encoding.Unmarshal(val, intent); err != nil {
+	if err := encoding.Unmarshal(recVal, intent); err != nil {
 		return nil, err
 	}
 	return intent, nil

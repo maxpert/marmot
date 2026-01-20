@@ -158,18 +158,23 @@ type TxnCommitRecord struct {
 
 // WriteIntentRecord represents a write intent in meta store
 type WriteIntentRecord struct {
-	IntentType       IntentType // Type discriminator: DML, DDL, or DatabaseOp
-	TableName        string
-	IntentKey        []byte
-	TxnID            uint64
-	TSWall           int64
-	TSLogical        int32
-	NodeID           uint64
-	Operation        OpType
-	SQLStatement     string
-	DataSnapshot     []byte
-	CreatedAt        int64
-	MarkedForCleanup bool // Set to true when txn commits/aborts - allows immediate overwrite
+	IntentType   IntentType // Type discriminator: DML, DDL, or DatabaseOp
+	TableName    string
+	IntentKey    []byte
+	TxnID        uint64
+	TSWall       int64
+	TSLogical    int32
+	NodeID       uint64
+	Operation    OpType
+	SQLStatement string
+	DataSnapshot []byte
+	CreatedAt    int64
+}
+
+// IntentLock is a lightweight lock stored at /intent/{table}/{key}.
+// Contains only fields needed for lock validation - full data is in /intent_by_txn/.
+type IntentLock struct {
+	TxnID uint64
 }
 
 // ReplicationStateRecord represents replication state for a peer
