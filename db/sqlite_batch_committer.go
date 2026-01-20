@@ -283,6 +283,21 @@ func (bc *SQLiteBatchCommitter) tryFlush(trigger string) {
 	bc.flush(batch, trigger)
 }
 
+// Flush synchronously flushes all pending DML transactions.
+// Used as a barrier before DDL to ensure all DML commits first.
+func (bc *SQLiteBatchCommitter) Flush() {
+	bc.mu.Lock()
+	if len(bc.pending) == 0 {
+		bc.mu.Unlock()
+		return
+	}
+	batch := bc.pending
+	bc.pending = make(map[uint64]*pendingCommit)
+	bc.mu.Unlock()
+
+	bc.flush(batch, "ddl_barrier")
+}
+
 func (bc *SQLiteBatchCommitter) getSchemaCache(conn *sql.Conn) (*SchemaCache, error) {
 	cache := NewSchemaCache()
 	err := conn.Raw(func(driverConn interface{}) error {

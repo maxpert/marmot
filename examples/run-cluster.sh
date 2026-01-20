@@ -171,8 +171,8 @@ enabled = true
 
 [batch_commit]
 enabled = true
-max_batch_size = 5000
-max_wait_ms = 2
+max_batch_size = 350
+max_wait_ms = 10
 EOF
     echo "$config_file"
 }

@@ -98,8 +98,8 @@ type ConnectionPoolConfiguration struct {
 // BatchCommitConfiguration controls SQLite write batching for improved throughput
 type BatchCommitConfiguration struct {
 	Enabled      bool `toml:"enabled"`        // Enable batch committing (default: true)
-	MaxBatchSize int  `toml:"max_batch_size"` // Max transactions per batch (default: 512)
-	MaxWaitMS    int  `toml:"max_wait_ms"`    // Max wait before flush in ms (default: 2)
+	MaxBatchSize int  `toml:"max_batch_size"` // Max transactions per batch (default: 128)
+	MaxWaitMS    int  `toml:"max_wait_ms"`    // Max wait before flush in ms (default: 10)
 
 	// Adaptive checkpoint configuration for WAL management
 	CheckpointEnabled         bool    `toml:"checkpoint_enabled"`           // Enable automatic checkpointing (default: true)
@@ -316,8 +316,8 @@ var Config = &Configuration{
 
 	BatchCommit: BatchCommitConfiguration{
 		Enabled:                   true,
-		MaxBatchSize:              100,
-		MaxWaitMS:                 2,
+		MaxBatchSize:              128,
+		MaxWaitMS:                 10,
 		CheckpointEnabled:         true,
 		CheckpointPassiveThreshMB: 4.0,
 		CheckpointRestartThreshMB: 16.0,

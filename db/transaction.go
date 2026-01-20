@@ -135,15 +135,6 @@ func (tm *TransactionManager) SetRefreshReplicationStatesFunc(fn RefreshReplicat
 	tm.refreshReplicationStates = fn
 }
 
-// hasDDLIntents returns true if any intent is DDL type
-func (tm *TransactionManager) hasDDLIntents(intents []*WriteIntentRecord) bool {
-	for _, intent := range intents {
-		if intent.IntentType == IntentTypeDDL {
-			return true
-		}
-	}
-	return false
-}
 
 // batchCommitEnabled returns true if batch committing is enabled and configured
 func (tm *TransactionManager) batchCommitEnabled() bool {
@@ -233,10 +224,9 @@ func (tm *TransactionManager) WriteIntent(txn *Transaction, intentType IntentTyp
 	return nil
 }
 
-// CommitTransaction commits the transaction using 2PC
-// Phase 1: Validate all write intents still held (fetched from MetaStore)
-// Phase 2: Get commit timestamp, apply CDC data, mark as COMMITTED, cleanup intents
-// All data is loaded from MetaStore - no in-memory caching
+// CommitTransaction commits the transaction.
+// DML: Get CDC entries → apply via batch committer → cleanup
+// DDL: Flush pending DML → get intents → apply DDL → cleanup
 func (tm *TransactionManager) CommitTransaction(txn *Transaction) error {
 	txn.mu.Lock()
 	defer txn.mu.Unlock()
@@ -245,70 +235,56 @@ func (tm *TransactionManager) CommitTransaction(txn *Transaction) error {
 		return fmt.Errorf("transaction %d is not pending", txn.ID)
 	}
 
-	// Phase 1: Fetch and validate intents
-	intents, err := tm.validateIntents(txn)
+	// Get CDC entries - determines DML vs DDL path
+	cdcEntries, err := tm.metaStore.GetIntentEntries(txn.ID)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to load CDC entries: %w", err)
 	}
 
-	// Phase 2: Calculate commit timestamp
+	// Calculate commit timestamp
 	txn.CommitTS = tm.calculateCommitTS(txn.StartTS)
 
-	// Phase 3: Apply data changes
-	// DDL transactions or batch-disabled: immediate execution
-	// DML transactions with batching: route through SQLiteBatchCommitter
-	if tm.hasDDLIntents(intents) || !tm.batchCommitEnabled() {
-		if err := tm.applyDataChanges(txn, intents); err != nil {
-			return err
+	if len(cdcEntries) > 0 {
+		// DML path: apply CDC entries
+		if tm.batchCommitEnabled() {
+			txn.Statements = tm.rebuildStatementsFromCDC(cdcEntries, nil)
+			fut := tm.batchCommitter.Enqueue(txn.ID, txn.CommitTS, cdcEntries, txn.Statements)
+			if _, err := fut.Get(); err != nil {
+				return fmt.Errorf("batch commit failed: %w", err)
+			}
+		} else {
+			if err := tm.applyCDCEntries(txn.ID, cdcEntries); err != nil {
+				return err
+			}
+			txn.Statements = tm.rebuildStatementsFromCDC(cdcEntries, nil)
 		}
 	} else {
-		// DML: batch through SQLiteBatchCommitter
-		cdcEntries, err := tm.metaStore.GetIntentEntries(txn.ID)
+		// DDL path: flush pending DML first to ensure isolation
+		if tm.batchCommitEnabled() {
+			tm.batchCommitter.Flush()
+		}
+
+		intents, err := tm.metaStore.GetIntentsByTxn(txn.ID)
 		if err != nil {
-			return fmt.Errorf("failed to load CDC entries for batch: %w", err)
+			return fmt.Errorf("failed to fetch write intents: %w", err)
 		}
-
-		// Rebuild statements for anti-entropy (needed by finalizeCommit)
-		txn.Statements = tm.rebuildStatementsFromCDC(cdcEntries, intents)
-
-		// Enqueue and wait for batch to apply CDC to SQLite
-		fut := tm.batchCommitter.Enqueue(txn.ID, txn.CommitTS, cdcEntries, txn.Statements)
-		if _, err := fut.Get(); err != nil {
-			return fmt.Errorf("batch commit failed: %w", err)
+		if err := tm.applyDDLIntents(txn.ID, intents); err != nil {
+			return err
 		}
+		txn.Statements = tm.rebuildStatementsFromCDC(nil, intents)
 	}
 
-	// Phase 4: Finalize commit in MetaStore
+	// Finalize commit in MetaStore
 	if err := tm.finalizeCommit(txn); err != nil {
 		return err
 	}
 
-	// Phase 5: Cleanup (non-critical, synchronous to prevent goroutine explosion)
-	tm.cleanupAfterCommit(txn, intents)
+	// Cleanup
+	tm.cleanupAfterCommit(txn)
 
 	return nil
 }
 
-// validateIntents fetches and validates all write intents for the transaction.
-func (tm *TransactionManager) validateIntents(txn *Transaction) ([]*WriteIntentRecord, error) {
-	intents, err := tm.metaStore.GetIntentsByTxn(txn.ID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch write intents: %w", err)
-	}
-
-	for _, intent := range intents {
-		valid, err := tm.metaStore.ValidateIntent(intent.TableName, string(intent.IntentKey), txn.ID)
-		if err != nil {
-			return nil, fmt.Errorf("failed to validate intent: %w", err)
-		}
-		if !valid {
-			return nil, fmt.Errorf("write intent lost for %s:%s - transaction aborted",
-				intent.TableName, string(intent.IntentKey))
-		}
-	}
-
-	return intents, nil
-}
 
 // calculateCommitTS determines the commit timestamp (must be > start_ts).
 func (tm *TransactionManager) calculateCommitTS(startTS hlc.Timestamp) hlc.Timestamp {
@@ -320,30 +296,6 @@ func (tm *TransactionManager) calculateCommitTS(startTS hlc.Timestamp) hlc.Times
 	return commitTS
 }
 
-// applyDataChanges applies CDC entries or DDL statements from intents.
-func (tm *TransactionManager) applyDataChanges(txn *Transaction, intents []*WriteIntentRecord) error {
-	cdcEntries, err := tm.metaStore.GetIntentEntries(txn.ID)
-	if err != nil {
-		return fmt.Errorf("failed to load CDC entries: %w", err)
-	}
-
-	// Apply CDC entries (DML operations) - batched in single SQLite transaction
-	if err := tm.applyCDCEntries(txn.ID, cdcEntries); err != nil {
-		return err
-	}
-
-	// Rebuild txn.Statements from CDC entries
-	txn.Statements = tm.rebuildStatementsFromCDC(cdcEntries, intents)
-
-	// Apply DDL statements if no CDC entries
-	if len(cdcEntries) == 0 && len(intents) > 0 {
-		if err := tm.applyDDLIntents(txn.ID, intents); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
 
 // rebuildStatementsFromCDC reconstructs protocol.Statement slice from CDC entries
 // and DDL intents for in-memory transaction tracking.
@@ -506,7 +458,7 @@ func (tm *TransactionManager) finalizeCommit(txn *Transaction) error {
 }
 
 // cleanupAfterCommit performs synchronous cleanup to prevent goroutine explosion.
-func (tm *TransactionManager) cleanupAfterCommit(txn *Transaction, intents []*WriteIntentRecord) {
+func (tm *TransactionManager) cleanupAfterCommit(txn *Transaction) {
 	if err := tm.metaStore.CleanupAfterCommit(txn.ID); err != nil {
 		log.Warn().Err(err).Uint64("txn_id", txn.ID).Msg("Failed to cleanup after commit")
 	}
