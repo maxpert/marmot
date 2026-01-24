@@ -61,10 +61,8 @@ func TestMemoryMetaStore_BeginTransaction(t *testing.T) {
 	require.Greater(t, state.LastHeartbeat, int64(0))
 	require.Equal(t, nodeID, state.NodeID)
 
-	// Verify NOT in Pebble status/heartbeat keys
+	// Verify status NOT in Pebble (heartbeat is in-memory only, no Pebble storage)
 	_, err = store.pebble.readTxnStatus(txnID)
-	require.Error(t, err)
-	_, err = store.pebble.readHeartbeat(txnID)
 	require.Error(t, err)
 }
 
@@ -255,7 +253,8 @@ func TestMemoryMetaStore_CDCRowLocks(t *testing.T) {
 	// Try to acquire with different txn - should fail
 	err = store.AcquireCDCRowLock(999, tableName, intentKey)
 	require.Error(t, err)
-	require.Equal(t, ErrLockHeld, err)
+	var lockErr ErrCDCRowLocked
+	require.ErrorAs(t, err, &lockErr)
 
 	// Release lock
 	err = store.ReleaseCDCRowLock(tableName, intentKey, txnID)
@@ -406,25 +405,18 @@ func TestMemoryMetaStore_MemoryVsPebbleIsolation(t *testing.T) {
 	require.True(t, found)
 	require.Equal(t, TxnStatusPending, state.Status)
 
-	// Verify Pebble does NOT have status/heartbeat keys
+	// Verify Pebble does NOT have status key (heartbeat is in-memory only)
 	_, err = store.pebble.readTxnStatus(txnID)
 	require.Error(t, err, "Status should not be in Pebble")
-
-	_, err = store.pebble.readHeartbeat(txnID)
-	require.Error(t, err, "Heartbeat should not be in Pebble")
 
 	// Verify Pebble HAS immutable record
 	immutable, err := store.pebble.readImmutableTxnRecord(txnID)
 	require.NoError(t, err)
 	require.NotNil(t, immutable)
 
-	// Update heartbeat
+	// Update heartbeat (in-memory only)
 	err = store.Heartbeat(txnID)
 	require.NoError(t, err)
-
-	// Verify still not in Pebble
-	_, err = store.pebble.readHeartbeat(txnID)
-	require.Error(t, err, "Heartbeat updates should not go to Pebble")
 
 	// Commit transaction
 	commitTS := hlc.Timestamp{WallTime: time.Now().UnixNano(), Logical: 0}

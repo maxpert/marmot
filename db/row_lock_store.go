@@ -121,30 +121,57 @@ func (s *RowLockStore) DeleteGCMarker(db, table, rowKey string) {
 	}
 }
 
-// ReleaseByTxn releases all locks held by the specified transaction.
-func (s *RowLockStore) ReleaseByTxn(txnID uint64) {
+// MarkGCAndRelease marks GC for all locks, releases them, and returns the keys.
+// Single iteration over byTxn instead of three separate passes.
+// Uses LoadAndDelete to atomically remove from byTxn before iteration,
+// preventing race with concurrent AcquireLock.
+func (s *RowLockStore) MarkGCAndRelease(txnID uint64) []string {
+	// Atomically load and delete to prevent concurrent AcquireLock from adding
+	// to this map while we iterate. New locks will create a fresh map.
+	txnMap, ok := s.byTxn.LoadAndDelete(txnID)
+	if !ok {
+		return nil
+	}
+
+	// Collect keys and process in single pass
+	var keys []string
+	txnMap.Range(func(fullKey string, _ struct{}) bool {
+		keys = append(keys, fullKey)
+		return true
+	})
+
+	// Mark GC and release locks
+	for _, fullKey := range keys {
+		db, table, rowKey := parseFullKey(fullKey)
+		tableKey := makeTableKey(db, table)
+
+		// Set GC marker
+		s.SetGCMarker(db, table, rowKey)
+
+		// Release lock
+		if rowMap, ok := s.tables.Load(tableKey); ok {
+			rowMap.Delete(rowKey)
+			s.cleanupEmptyRowMap(tableKey, rowMap)
+		}
+	}
+
+	return keys
+}
+
+// MarkGCByTxn sets GC markers for all locks without releasing them.
+func (s *RowLockStore) MarkGCByTxn(txnID uint64) {
 	if txnMap, ok := s.byTxn.Load(txnID); ok {
-		// Collect all keys to avoid modification during iteration
-		var keys []string
 		txnMap.Range(func(fullKey string, _ struct{}) bool {
-			keys = append(keys, fullKey)
+			db, table, rowKey := parseFullKey(fullKey)
+			s.SetGCMarker(db, table, rowKey)
 			return true
 		})
-
-		// Release all locks
-		for _, fullKey := range keys {
-			db, table, rowKey := parseFullKey(fullKey)
-			tableKey := makeTableKey(db, table)
-
-			if rowMap, ok := s.tables.Load(tableKey); ok {
-				rowMap.Delete(rowKey)
-				s.cleanupEmptyRowMap(tableKey, rowMap)
-			}
-		}
-
-		// Remove the transaction's map
-		s.byTxn.Delete(txnID)
 	}
+}
+
+// ReleaseByTxn releases all locks held by the specified transaction.
+func (s *RowLockStore) ReleaseByTxn(txnID uint64) {
+	s.MarkGCAndRelease(txnID)
 }
 
 // ReleaseByTable releases all locks for the specified table.

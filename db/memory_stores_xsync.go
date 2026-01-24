@@ -1,13 +1,7 @@
 package db
 
 import (
-	"errors"
-
 	"github.com/puzpuzpuz/xsync/v3"
-)
-
-var (
-	ErrLockHeld = errors.New("lock held by another transaction")
 )
 
 // XsyncTransactionStore implements TransactionStore using lock-free concurrent maps.
@@ -84,15 +78,17 @@ func makeIntentKey(table, key string) string {
 
 // XsyncCDCLockStore implements CDCLockStore using lock-free concurrent maps.
 type XsyncCDCLockStore struct {
-	locks *xsync.MapOf[string, uint64]
-	byTxn *xsync.MapOf[uint64, *xsync.MapOf[string, struct{}]]
+	locks    *xsync.MapOf[string, uint64]
+	byTxn    *xsync.MapOf[uint64, *xsync.MapOf[string, struct{}]]
+	ddlLocks *xsync.MapOf[string, uint64]
 }
 
 // NewXsyncCDCLockStore creates a new xsync-backed CDC lock store.
 func NewXsyncCDCLockStore() *XsyncCDCLockStore {
 	return &XsyncCDCLockStore{
-		locks: xsync.NewMapOf[string, uint64](),
-		byTxn: xsync.NewMapOf[uint64, *xsync.MapOf[string, struct{}]](),
+		locks:    xsync.NewMapOf[string, uint64](),
+		byTxn:    xsync.NewMapOf[uint64, *xsync.MapOf[string, struct{}]](),
+		ddlLocks: xsync.NewMapOf[string, uint64](),
 	}
 }
 
@@ -103,7 +99,11 @@ func (s *XsyncCDCLockStore) Acquire(txnID uint64, table, intentKey string) error
 	holder, loaded := s.locks.LoadOrStore(key, txnID)
 	if loaded && holder != txnID {
 		// Lock is held by another transaction
-		return ErrLockHeld
+		return ErrCDCRowLocked{
+			Table:     table,
+			IntentKey: []byte(intentKey),
+			HeldByTxn: holder,
+		}
 	}
 
 	// Add to byTxn index
@@ -142,12 +142,80 @@ func (s *XsyncCDCLockStore) ReleaseByTxn(txnID uint64) {
 			return true
 		})
 
-		// Release all locks
+		// Release all locks (both row and DDL)
+		ddlSuffix := ":__ddl__"
 		for _, key := range keys {
-			s.locks.Delete(key)
+			if len(key) > len(ddlSuffix) && key[len(key)-len(ddlSuffix):] == ddlSuffix {
+				// DDL lock - extract table name
+				table := key[:len(key)-len(ddlSuffix)]
+				s.ddlLocks.Delete(table)
+			} else {
+				// Row lock
+				s.locks.Delete(key)
+			}
 		}
 
 		// Remove the transaction's map
 		s.byTxn.Delete(txnID)
 	}
+}
+
+// AcquireDDL acquires a table-level DDL lock.
+func (s *XsyncCDCLockStore) AcquireDDL(txnID uint64, table string) error {
+	// Check if any DML row locks exist for this table
+	if s.HasRowLocks(table) {
+		return ErrCDCDMLInProgress{Table: table}
+	}
+
+	// Try to acquire DDL lock
+	holder, loaded := s.ddlLocks.LoadOrStore(table, txnID)
+	if loaded && holder != txnID {
+		// Use ErrCDCRowLocked with __ddl__ marker for DDL conflicts
+		return ErrCDCRowLocked{Table: table, IntentKey: []byte("__ddl__"), HeldByTxn: holder}
+	}
+
+	// Add to byTxn index with special DDL marker
+	ddlKey := table + ":__ddl__"
+	txnMap, _ := s.byTxn.LoadOrStore(txnID, xsync.NewMapOf[string, struct{}]())
+	txnMap.Store(ddlKey, struct{}{})
+
+	return nil
+}
+
+// ReleaseDDL releases a table-level DDL lock if held by txnID.
+func (s *XsyncCDCLockStore) ReleaseDDL(table string, txnID uint64) {
+	if holder, held := s.ddlLocks.Load(table); held && holder == txnID {
+		s.ddlLocks.Delete(table)
+
+		// Remove from byTxn index
+		ddlKey := table + ":__ddl__"
+		if txnMap, ok := s.byTxn.Load(txnID); ok {
+			txnMap.Delete(ddlKey)
+		}
+	}
+}
+
+// GetDDLHolder returns the transaction holding the DDL lock.
+func (s *XsyncCDCLockStore) GetDDLHolder(table string) (uint64, bool) {
+	return s.ddlLocks.Load(table)
+}
+
+// HasRowLocks checks if any row locks exist for the table.
+func (s *XsyncCDCLockStore) HasRowLocks(table string) bool {
+	prefix := table + ":"
+	ddlMarker := table + ":__ddl__"
+
+	hasLocks := false
+	s.locks.Range(func(key string, _ uint64) bool {
+		if len(key) >= len(prefix) && key[:len(prefix)] == prefix {
+			// Skip DDL marker (shouldn't be in locks map, but be safe)
+			if key == ddlMarker {
+				return true
+			}
+			hasLocks = true
+			return false // Stop iteration
+		}
+		return true
+	})
+	return hasLocks
 }

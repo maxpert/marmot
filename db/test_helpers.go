@@ -56,7 +56,7 @@ func setupTestDBWithMeta(t *testing.T) *testDBWithMetaStore {
 	return openTestDBWithMeta(t, dbPath)
 }
 
-// openTestDBWithMeta opens an existing path with both user DB and MetaStore (PebbleDB)
+// openTestDBWithMeta opens an existing path with both user DB and MetaStore (MemoryMetaStore wrapping PebbleDB)
 func openTestDBWithMeta(t *testing.T, dbPath string) *testDBWithMetaStore {
 	t.Helper()
 
@@ -66,7 +66,7 @@ func openTestDBWithMeta(t *testing.T, dbPath string) *testDBWithMetaStore {
 	}
 
 	metaPath := strings.TrimSuffix(dbPath, ".db") + "_meta.pebble"
-	metaStore, err := NewPebbleMetaStore(metaPath, PebbleMetaStoreOptions{
+	pebbleStore, err := NewPebbleMetaStore(metaPath, PebbleMetaStoreOptions{
 		CacheSizeMB:           16, // Smaller for tests
 		MemTableSizeMB:        8,
 		MemTableCount:         2,
@@ -77,6 +77,9 @@ func openTestDBWithMeta(t *testing.T, dbPath string) *testDBWithMetaStore {
 		db.Close()
 		t.Fatalf("Failed to create meta store: %v", err)
 	}
+
+	// Wrap with MemoryMetaStore for in-memory heartbeat/status management
+	metaStore := NewMemoryMetaStore(pebbleStore)
 
 	result := &testDBWithMetaStore{
 		DB:        db,

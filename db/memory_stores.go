@@ -56,4 +56,18 @@ type CDCLockStore interface {
 
 	// ReleaseByTxn removes all CDC locks held by a transaction.
 	ReleaseByTxn(txnID uint64)
+
+	// AcquireDDL obtains a table-level DDL lock.
+	// Returns ErrDDLLockHeld if held by another txn.
+	// Returns ErrDMLInProgress if any row locks exist for table.
+	AcquireDDL(txnID uint64, table string) error
+
+	// ReleaseDDL releases DDL lock if held by txnID.
+	ReleaseDDL(table string, txnID uint64)
+
+	// GetDDLHolder returns txnID holding DDL lock, or (0, false) if none.
+	GetDDLHolder(table string) (txnID uint64, held bool)
+
+	// HasRowLocks returns true if any row locks exist for table.
+	HasRowLocks(table string) bool
 }

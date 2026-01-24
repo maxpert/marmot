@@ -11,14 +11,14 @@ import (
 // MemoryMetaStore wraps PebbleMetaStore to use memory for transitionary state
 // while delegating durable operations to Pebble.
 //
-// Memory stores eliminate Pebble writes for:
-// - Transaction status/heartbeat (/txn_status/, /txn_heartbeat/, /txn_idx/pend/)
-// - CDC row locks (/cdc/active/, /cdc/txn_locks/)
+// In-memory only (no Pebble storage):
+// - Transaction status and heartbeat (via XsyncTransactionStore)
+// - CDC row locks and DDL locks (via XsyncCDCLockStore)
 //
-// Durable operations remain in Pebble:
+// Durable operations in Pebble:
 // - Immutable transaction records (/txn/{txnID})
 // - Commit records (/txn_commit/{txnID}, /txn_idx/seq/)
-// - Write intents (not migrated yet - future optimization)
+// - Write intents (/intent_txn/)
 type MemoryMetaStore struct {
 	pebble    *PebbleMetaStore
 	txnStore  TransactionStore
@@ -211,7 +211,6 @@ func (m *MemoryMetaStore) GetIntent(tableName, intentKey string) (*WriteIntentRe
 	return m.pebble.GetIntent(tableName, intentKey)
 }
 
-
 // GetReplicationState delegates to Pebble.
 func (m *MemoryMetaStore) GetReplicationState(peerNodeID uint64, dbName string) (*ReplicationStateRecord, error) {
 	return m.pebble.GetReplicationState(peerNodeID, dbName)
@@ -337,24 +336,26 @@ func (m *MemoryMetaStore) GetCDCRowLock(tableName, intentKey string) (uint64, er
 	return 0, nil
 }
 
-// AcquireCDCTableDDLLock delegates to Pebble.
+// AcquireCDCTableDDLLock uses memory-only lock store.
 func (m *MemoryMetaStore) AcquireCDCTableDDLLock(txnID uint64, tableName string) error {
-	return m.pebble.AcquireCDCTableDDLLock(txnID, tableName)
+	return m.lockStore.AcquireDDL(txnID, tableName)
 }
 
-// ReleaseCDCTableDDLLock delegates to Pebble.
+// ReleaseCDCTableDDLLock uses memory-only lock store.
 func (m *MemoryMetaStore) ReleaseCDCTableDDLLock(tableName string, txnID uint64) error {
-	return m.pebble.ReleaseCDCTableDDLLock(tableName, txnID)
+	m.lockStore.ReleaseDDL(tableName, txnID)
+	return nil
 }
 
-// HasCDCRowLocksForTable delegates to Pebble.
+// HasCDCRowLocksForTable uses memory-only lock store.
 func (m *MemoryMetaStore) HasCDCRowLocksForTable(tableName string) (bool, error) {
-	return m.pebble.HasCDCRowLocksForTable(tableName)
+	return m.lockStore.HasRowLocks(tableName), nil
 }
 
-// GetCDCTableDDLLock delegates to Pebble.
+// GetCDCTableDDLLock uses memory-only lock store.
 func (m *MemoryMetaStore) GetCDCTableDDLLock(tableName string) (uint64, error) {
-	return m.pebble.GetCDCTableDDLLock(tableName)
+	txnID, _ := m.lockStore.GetDDLHolder(tableName)
+	return txnID, nil
 }
 
 // CleanupStaleTransactions iterates memory txnStore instead of Pebble /txn_idx/pend/.
@@ -377,8 +378,13 @@ func (m *MemoryMetaStore) CleanupStaleTransactions(timeout time.Duration) (int, 
 		return true
 	})
 
-	// Abort each stale transaction
+	// Abort each stale transaction and clean up intents
 	for _, txnID := range staleTxnIDs {
+		// Clean up write intents first
+		_ = m.DeleteIntentsByTxn(txnID)
+		_ = m.pebble.DeleteIntentEntries(txnID)
+
+		// Then abort the transaction
 		if err := m.AbortTransaction(txnID); err == nil {
 			cleaned++
 		}

@@ -25,7 +25,6 @@ const (
 	pebblePrefixTxnPending  = "/txn_idx/pend/"  // /txn_idx/pend/{8 bytes txnID}
 	pebblePrefixTxnSeq      = "/txn_idx/seq/"   // /txn_idx/seq/{8 bytes seqNum}{8 bytes txnID}
 	pebblePrefixTxnByID     = "/txn_idx/txnid/" // /txn_idx/txnid/{8 bytes txnID} - primary index for streaming
-	pebblePrefixCDC         = "/cdc/"           // /cdc/{8 bytes txnID}{8 bytes seq}
 	pebblePrefixCDCRaw      = "/cdc/raw/"       // /cdc/raw/{8 bytes txnID}{8 bytes seq}
 	pebblePrefixRepl        = "/repl/"          // /repl/{8 bytes peerNodeID}/{dbName}
 	pebblePrefixSchema      = "/schema/"        // /schema/{dbName}
@@ -33,13 +32,8 @@ const (
 	pebblePrefixSeq         = "/seq/"           // /seq/{8 bytes nodeID}
 	pebblePrefixIntentByTxn = "/intent_txn/"    // /intent_txn/{8 bytes txnID}{2 bytes tableNameLen}{tableName}{intentKey}
 	pebblePrefixCounter     = "/meta/"          // /meta/{counterName}
-	pebblePrefixCDCActive   = "/cdc/active/"    // /cdc/active/{2 bytes tableNameLen}{tableName}{intentKey|__ddl__}
-	pebblePrefixCDCTxnLocks = "/cdc/txn_locks/" // /cdc/txn_locks/{8 bytes txnID}{2 bytes tableNameLen}{tableName}{intentKey}
 	pebblePrefixTxnCommit   = "/txn_commit/"    // /txn_commit/{8 bytes txnID}
 	pebblePrefixTxnStatus   = "/txn_status/"    // /txn_status/{8 bytes txnID}
-	pebblePrefixTxnHbeat    = "/txn_heartbeat/" // /txn_heartbeat/{8 bytes txnID}
-
-	pebbleCDCDDLKeyMarker = "__ddl__" // Sentinel key for DDL locks
 )
 
 // Sharded lock for WriteIntent serialization (prevents TOCTOU race)
@@ -70,6 +64,9 @@ type PebbleMetaStore struct {
 	// In-memory row locking for fast-path intent conflict detection
 	rowLocks *RowLockStore
 
+	// In-memory CDC locks (row + DDL) for conflict detection
+	cdcLocks *XsyncCDCLockStore
+
 	// Optional transaction getter for conflict resolution (set by MemoryMetaStore wrapper)
 	txnGetter TransactionGetter
 }
@@ -83,13 +80,11 @@ func (s *PebbleMetaStore) intentLockFor(tableName, intentKey string) *sync.Mutex
 	return &s.intentLocks[xxhash.Sum64String(key)%intentLockShards]
 }
 
-
 // SetTransactionGetter sets a custom transaction getter for conflict resolution.
 // This allows MemoryMetaStore to inject its GetTransaction which reads from memory.
 func (s *PebbleMetaStore) SetTransactionGetter(getter TransactionGetter) {
 	s.txnGetter = getter
 }
-
 
 // PebbleMetaStoreOptions configures Pebble
 type PebbleMetaStoreOptions struct {
@@ -191,16 +186,11 @@ func NewPebbleMetaStore(path string, opts PebbleMetaStoreOptions) (*PebbleMetaSt
 		path:      path,
 		sequences: make(map[uint64]*AtomicSequence),
 		rowLocks:  NewRowLockStore(),
+		cdcLocks:  NewXsyncCDCLockStore(),
 	}
 
 	// Initialize persistent counters
 	store.counters = NewPebbleCounter(db, pebblePrefixCounter, 10)
-
-	// Clear any stale CDC locks from previous crash (CDC locks are ephemeral)
-	if err := store.clearAllCDCLocks(); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("failed to clear stale CDC locks: %w", err)
-	}
 
 	return store, nil
 }
@@ -352,13 +342,6 @@ func pebbleTxnStatusKey(txnID uint64) []byte {
 	return key
 }
 
-func pebbleTxnHeartbeatKey(txnID uint64) []byte {
-	key := make([]byte, len(pebblePrefixTxnHbeat)+8)
-	copy(key, pebblePrefixTxnHbeat)
-	binary.BigEndian.PutUint64(key[len(pebblePrefixTxnHbeat):], txnID)
-	return key
-}
-
 // pebbleIntentByTxnKey uses 2-byte length prefix for tableName
 func pebbleIntentByTxnKey(txnID uint64, tableName, intentKey string) []byte {
 	key := make([]byte, len(pebblePrefixIntentByTxn)+8+2+len(tableName)+len(intentKey))
@@ -393,21 +376,6 @@ func parseIntentByTxnKey(key []byte, prefixLen int) (tableName, intentKey string
 	tableName = string(key[offset : offset+tableNameLen])
 	intentKey = string(key[offset+tableNameLen:])
 	return tableName, intentKey, true
-}
-
-func pebbleCdcKey(txnID, seq uint64) []byte {
-	key := make([]byte, len(pebblePrefixCDC)+16)
-	copy(key, pebblePrefixCDC)
-	binary.BigEndian.PutUint64(key[len(pebblePrefixCDC):], txnID)
-	binary.BigEndian.PutUint64(key[len(pebblePrefixCDC)+8:], seq)
-	return key
-}
-
-func pebbleCdcPrefix(txnID uint64) []byte {
-	key := make([]byte, len(pebblePrefixCDC)+8)
-	copy(key, pebblePrefixCDC)
-	binary.BigEndian.PutUint64(key[len(pebblePrefixCDC):], txnID)
-	return key
 }
 
 func pebbleCdcRawKey(txnID, seq uint64) []byte {
@@ -456,73 +424,6 @@ func pebbleSeqKey(nodeID uint64) []byte {
 	return key
 }
 
-// pebbleCDCActiveIntentKey uses 2-byte length prefix for tableName
-func pebbleCDCActiveIntentKey(tableName, intentKey string) []byte {
-	key := make([]byte, len(pebblePrefixCDCActive)+2+len(tableName)+len(intentKey))
-	n := copy(key, pebblePrefixCDCActive)
-	binary.BigEndian.PutUint16(key[n:], uint16(len(tableName)))
-	n += 2
-	n += copy(key[n:], tableName)
-	copy(key[n:], intentKey)
-	return key
-}
-
-func pebbleCDCActiveDDLKey(tableName string) []byte {
-	key := make([]byte, len(pebblePrefixCDCActive)+2+len(tableName)+len(pebbleCDCDDLKeyMarker))
-	n := copy(key, pebblePrefixCDCActive)
-	binary.BigEndian.PutUint16(key[n:], uint16(len(tableName)))
-	n += 2
-	n += copy(key[n:], tableName)
-	copy(key[n:], pebbleCDCDDLKeyMarker)
-	return key
-}
-
-func pebbleCDCActiveTablePrefix(tableName string) []byte {
-	key := make([]byte, len(pebblePrefixCDCActive)+2+len(tableName))
-	n := copy(key, pebblePrefixCDCActive)
-	binary.BigEndian.PutUint16(key[n:], uint16(len(tableName)))
-	n += 2
-	copy(key[n:], tableName)
-	return key
-}
-
-// pebbleCDCTxnLockKey uses 2-byte length prefix for tableName
-func pebbleCDCTxnLockKey(txnID uint64, tableName, intentKey string) []byte {
-	key := make([]byte, len(pebblePrefixCDCTxnLocks)+8+2+len(tableName)+len(intentKey))
-	n := copy(key, pebblePrefixCDCTxnLocks)
-	binary.BigEndian.PutUint64(key[n:], txnID)
-	n += 8
-	binary.BigEndian.PutUint16(key[n:], uint16(len(tableName)))
-	n += 2
-	n += copy(key[n:], tableName)
-	copy(key[n:], intentKey)
-	return key
-}
-
-func pebbleCDCTxnLockPrefix(txnID uint64) []byte {
-	key := make([]byte, len(pebblePrefixCDCTxnLocks)+8)
-	copy(key, pebblePrefixCDCTxnLocks)
-	binary.BigEndian.PutUint64(key[len(pebblePrefixCDCTxnLocks):], txnID)
-	return key
-}
-
-
-// parseCDCTxnLockKey extracts tableName and intentKey from a CDC txn lock key
-func parseCDCTxnLockKey(key []byte, prefixLen int) (tableName, intentKey string, ok bool) {
-	offset := prefixLen
-	if len(key) < offset+2 {
-		return "", "", false
-	}
-	tableNameLen := int(binary.BigEndian.Uint16(key[offset:]))
-	offset += 2
-	if len(key) < offset+tableNameLen {
-		return "", "", false
-	}
-	tableName = string(key[offset : offset+tableNameLen])
-	intentKey = string(key[offset+tableNameLen:])
-	return tableName, intentKey, true
-}
-
 // prefixUpperBound returns prefix + 0xFF... for range iteration
 func prefixUpperBound(prefix []byte) []byte {
 	upper := make([]byte, len(prefix)+8)
@@ -544,33 +445,6 @@ func (s *PebbleMetaStore) getValueCopy(key []byte) ([]byte, error) {
 	result := make([]byte, len(val))
 	copy(result, val)
 	return result, nil
-}
-
-// readHeartbeat reads raw 8-byte timestamp from heartbeat key
-func (s *PebbleMetaStore) readHeartbeat(txnID uint64) (int64, error) {
-	val, closer, err := s.db.Get(pebbleTxnHeartbeatKey(txnID))
-	if err != nil {
-		return 0, err
-	}
-	defer closer.Close()
-	if len(val) != 8 {
-		return 0, fmt.Errorf("invalid heartbeat length: %d", len(val))
-	}
-	return int64(binary.BigEndian.Uint64(val)), nil
-}
-
-// writeHeartbeat writes raw 8-byte timestamp
-func (s *PebbleMetaStore) writeHeartbeat(txnID uint64, ts int64) error {
-	var buf [8]byte
-	binary.BigEndian.PutUint64(buf[:], uint64(ts))
-	return s.db.Set(pebbleTxnHeartbeatKey(txnID), buf[:], pebble.NoSync)
-}
-
-// writeHeartbeatInBatch writes heartbeat as part of a batch
-func (s *PebbleMetaStore) writeHeartbeatInBatch(batch *pebble.Batch, txnID uint64, ts int64) error {
-	var buf [8]byte
-	binary.BigEndian.PutUint64(buf[:], uint64(ts))
-	return batch.Set(pebbleTxnHeartbeatKey(txnID), buf[:], nil)
 }
 
 // readTxnStatus reads 1-byte status from status key
@@ -711,10 +585,7 @@ func (s *PebbleMetaStore) BeginTransaction(txnID, nodeID uint64, startTS hlc.Tim
 		return err
 	}
 
-	// Write heartbeat to /txn_heartbeat/{txnID}
-	if err := s.writeHeartbeatInBatch(batch, txnID, now); err != nil {
-		return err
-	}
+	// Heartbeat is now in-memory only (via MemoryMetaStore.txnStore)
 
 	// Write pending index
 	if err := batch.Set(pebbleTxnPendingKey(txnID), nil, nil); err != nil {
@@ -790,10 +661,7 @@ func (s *PebbleMetaStore) CommitTransaction(txnID uint64, commitTS hlc.Timestamp
 		return err
 	}
 
-	// Update heartbeat
-	if err := s.writeHeartbeatInBatch(batch, txnID, now); err != nil {
-		return err
-	}
+	// Heartbeat is in-memory only - no need to write at commit
 
 	// Remove from pending index
 	if err := batch.Delete(pebbleTxnPendingKey(txnID), nil); err != nil {
@@ -891,10 +759,7 @@ func (s *PebbleMetaStore) StoreReplayedTransaction(txnID, nodeID uint64, commitT
 		return err
 	}
 
-	// Write heartbeat
-	if err := s.writeHeartbeatInBatch(batch, txnID, now); err != nil {
-		return err
-	}
+	// Heartbeat not needed for replayed transactions (already committed)
 
 	// Add to sequence index (kept for backward compatibility and GC)
 	if err := batch.Set(pebbleTxnSeqKey(seqNum, txnID), nil, nil); err != nil {
@@ -946,13 +811,12 @@ func (s *PebbleMetaStore) AbortTransaction(txnID uint64) error {
 	batch := s.db.NewBatch()
 	defer batch.Close()
 
-	// Delete all keys: /txn/, /txn_commit/, /txn_status/, /txn_heartbeat/
+	// Delete all keys: /txn/, /txn_commit/, /txn_status/
 	if err := batch.Delete(pebbleTxnKey(txnID), nil); err != nil {
 		return err
 	}
 	_ = batch.Delete(pebbleTxnCommitKey(txnID), nil)
 	_ = batch.Delete(pebbleTxnStatusKey(txnID), nil)
-	_ = batch.Delete(pebbleTxnHeartbeatKey(txnID), nil)
 
 	// Remove from pending index (best-effort cleanup)
 	_ = batch.Delete(pebbleTxnPendingKey(txnID), nil)
@@ -990,13 +854,8 @@ func (s *PebbleMetaStore) GetTransaction(txnID uint64) (*TransactionRecord, erro
 		return nil, err
 	}
 
-	// Read heartbeat from /txn_heartbeat/
-	heartbeat, err := s.readHeartbeat(txnID)
-	if err != nil {
-		return nil, err
-	}
-
 	// Reconstruct TransactionRecord
+	// Heartbeat is in-memory only - use CreatedAt as fallback for direct PebbleMetaStore usage
 	rec := &TransactionRecord{
 		TxnID:          immutable.TxnID,
 		NodeID:         immutable.NodeID,
@@ -1004,7 +863,7 @@ func (s *PebbleMetaStore) GetTransaction(txnID uint64) (*TransactionRecord, erro
 		StartTSWall:    immutable.StartTSWall,
 		StartTSLogical: immutable.StartTSLogical,
 		CreatedAt:      immutable.CreatedAt,
-		LastHeartbeat:  heartbeat,
+		LastHeartbeat:  immutable.CreatedAt,
 	}
 
 	// If status == Committed, read TxnCommitRecord from /txn_commit/
@@ -1061,9 +920,9 @@ func (s *PebbleMetaStore) GetPendingTransactions() ([]*TransactionRecord, error)
 	return records, iter.Error()
 }
 
-// Heartbeat updates the last_heartbeat timestamp
-func (s *PebbleMetaStore) Heartbeat(txnID uint64) error {
-	return s.writeHeartbeat(txnID, time.Now().UnixNano())
+// Heartbeat is a no-op in PebbleMetaStore - heartbeats are managed in-memory by MemoryMetaStore
+func (s *PebbleMetaStore) Heartbeat(_ uint64) error {
+	return nil
 }
 
 // WriteIntent creates a write intent (distributed lock)
@@ -1130,12 +989,10 @@ func (s *PebbleMetaStore) WriteIntent(txnID uint64, intentType IntentType, table
 		return err
 	}
 
-	// Refresh heartbeat - transaction is active
-	_ = s.writeHeartbeat(txnID, time.Now().UnixNano())
+	// Heartbeat refresh is handled by MemoryMetaStore in-memory
 
 	return nil
 }
-
 
 // resolveIntentConflictPebble handles conflict with existing intent from different transaction.
 // Called after GC marker check - if GC marker exists, caller handles overwrite directly.
@@ -1170,19 +1027,13 @@ func (s *PebbleMetaStore) resolveIntentConflictPebble(batch *pebble.Batch, exist
 		canOverwrite = true
 
 	default:
-		// Check heartbeat timeout
+		// Check heartbeat timeout - use heartbeat from txnGetter (in-memory via MemoryMetaStore)
 		heartbeatTimeout := int64(10 * time.Second)
 		if cfg.Config != nil && cfg.Config.Transaction.HeartbeatTimeoutSeconds > 0 {
 			heartbeatTimeout = int64(time.Duration(cfg.Config.Transaction.HeartbeatTimeoutSeconds) * time.Second)
 		}
 
-		// Try to read heartbeat from new optimized key first
-		heartbeat, err := s.readHeartbeat(existingTxnID)
-		if err != nil {
-			// Fall back to TransactionRecord for backward compatibility
-			heartbeat = conflictTxnRec.LastHeartbeat
-		}
-
+		heartbeat := conflictTxnRec.LastHeartbeat
 		timeSinceHeartbeat := time.Now().UnixNano() - heartbeat
 		if timeSinceHeartbeat > heartbeatTimeout {
 			log.Debug().
@@ -1280,29 +1131,11 @@ func (s *PebbleMetaStore) DeleteIntentsByTxn(txnID uint64) error {
 	return nil
 }
 
-// MarkIntentsForCleanup marks all intents for a transaction as ready for overwrite
+// MarkIntentsForCleanup marks all intents for a transaction as ready for overwrite.
+// Uses in-memory RowLockStore.byTxn index instead of Pebble iteration.
 func (s *PebbleMetaStore) MarkIntentsForCleanup(txnID uint64) error {
-	prefix := pebbleIntentByTxnPrefix(txnID)
-
-	iter, err := s.db.NewIter(&pebble.IterOptions{
-		LowerBound: prefix,
-		UpperBound: prefixUpperBound(prefix),
-	})
-	if err != nil {
-		return err
-	}
-	defer iter.Close()
-
-	for iter.SeekGE(prefix); iter.Valid(); iter.Next() {
-		tableName, intentKey, ok := parseIntentByTxnKey(iter.Key(), len(prefix))
-		if !ok {
-			continue
-		}
-		// Set GC marker in RowLockStore
-		s.rowLocks.SetGCMarker("", tableName, intentKey)
-	}
-
-	return iter.Error()
+	s.rowLocks.MarkGCByTxn(txnID)
+	return nil
 }
 
 // CleanupAfterCommit performs all cleanup operations for a committed transaction.
@@ -1310,42 +1143,23 @@ func (s *PebbleMetaStore) MarkIntentsForCleanup(txnID uint64) error {
 // Phase 2: Deletes all intents and CDC entries in a single batch
 // This consolidates MarkIntentsForCleanup + DeleteIntentsByTxn + DeleteIntentEntries
 func (s *PebbleMetaStore) CleanupAfterCommit(txnID uint64) error {
-	// Phase 1: Mark intents for cleanup in RowLockStore
-	// Other transactions check GC markers to know if they can overwrite an intent.
-	if err := s.MarkIntentsForCleanup(txnID); err != nil {
-		return err
+	// Single pass: mark GC, release locks, get keys (no Pebble iteration)
+	lockKeys := s.rowLocks.MarkGCAndRelease(txnID)
+
+	// Single batch for all deletions
+	batch := s.db.NewBatch()
+	defer batch.Close()
+
+	// Delete intent index keys using in-memory data (no Pebble iteration)
+	for _, fullKey := range lockKeys {
+		_, table, rowKey := parseFullKey(fullKey)
+		if table != "" {
+			_ = batch.Delete(pebbleIntentByTxnKey(txnID, table, rowKey), nil)
+		}
 	}
 
-	// Phase 2: Release row locks and delete Pebble data
-	prefix := pebbleIntentByTxnPrefix(txnID)
-
-	// Release all row locks for this transaction
-	s.rowLocks.ReleaseByTxn(txnID)
-
-	// Collect /intent_txn/ index keys to delete
-	var indexKeys [][]byte
-
-	iter, err := s.db.NewIter(&pebble.IterOptions{
-		LowerBound: prefix,
-		UpperBound: prefixUpperBound(prefix),
-	})
-	if err != nil {
-		return err
-	}
-
-	for iter.SeekGE(prefix); iter.Valid(); iter.Next() {
-		indexKey := make([]byte, len(iter.Key()))
-		copy(indexKey, iter.Key())
-		indexKeys = append(indexKeys, indexKey)
-	}
-
-	if err := iter.Close(); err != nil {
-		return err
-	}
-
-	// Collect CDC entry keys (/cdc/{txnID}/*)
-	cdcPrefix := pebbleCdcPrefix(txnID)
-	var cdcKeys [][]byte
+	// Collect CDC entry keys (/cdc/raw/{txnID}/*) - still need iteration for now
+	cdcPrefix := pebbleCdcRawPrefix(txnID)
 
 	cdcIter, err := s.db.NewIter(&pebble.IterOptions{
 		LowerBound: cdcPrefix,
@@ -1358,7 +1172,7 @@ func (s *PebbleMetaStore) CleanupAfterCommit(txnID uint64) error {
 	for cdcIter.SeekGE(cdcPrefix); cdcIter.Valid(); cdcIter.Next() {
 		key := make([]byte, len(cdcIter.Key()))
 		copy(key, cdcIter.Key())
-		cdcKeys = append(cdcKeys, key)
+		_ = batch.Delete(key, nil)
 	}
 
 	if err := cdcIter.Close(); err != nil {
@@ -1366,31 +1180,13 @@ func (s *PebbleMetaStore) CleanupAfterCommit(txnID uint64) error {
 	}
 
 	// Early return if nothing to delete
-	if len(indexKeys) == 0 && len(cdcKeys) == 0 {
+	if batch.Empty() {
 		return nil
-	}
-
-	// Single batch for all deletions
-	batch := s.db.NewBatch()
-	defer batch.Close()
-
-	// Delete intent index keys
-	for _, key := range indexKeys {
-		_ = batch.Delete(key, nil)
-	}
-
-	// Delete CDC entries
-	for _, key := range cdcKeys {
-		_ = batch.Delete(key, nil)
 	}
 
 	// NoSync: Intent cleanup is idempotent. If crash occurs, intents remain
 	// (transaction is already committed) and will be cleaned up on next GC.
-	if err := batch.Commit(pebble.NoSync); err != nil {
-		return err
-	}
-
-	return nil
+	return batch.Commit(pebble.NoSync)
 }
 
 // GetIntentsByTxn retrieves all write intents for a transaction
@@ -2049,7 +1845,6 @@ func (s *PebbleMetaStore) CleanupStaleTransactions(timeout time.Duration) (int, 
 		return 0, nil
 	}
 
-	cutoff := time.Now().Add(-timeout).UnixNano()
 	cleaned := 0
 
 	// Phase 1: Find stale PENDING transactions
@@ -2071,30 +1866,22 @@ func (s *PebbleMetaStore) CleanupStaleTransactions(timeout time.Duration) (int, 
 		}
 		txnID := binary.BigEndian.Uint64(key[len(pebblePrefixTxnPending):])
 
-		// Try to read heartbeat from new optimized key first
-		heartbeat, err := s.readHeartbeat(txnID)
-		if err != nil {
-			// If heartbeat key doesn't exist but txn exists, it's a legacy record
-			// Fall back to GetTransaction for backward compatibility during migration
-			rec, err := s.GetTransaction(txnID)
-			if err != nil || rec == nil {
-				continue
-			}
-			heartbeat = rec.LastHeartbeat
+		// Heartbeats are in-memory only - for PebbleMetaStore direct use,
+		// use CreatedAt to determine staleness (MemoryMetaStore uses in-memory heartbeats)
+		rec, err := s.GetTransaction(txnID)
+		if err != nil || rec == nil {
+			continue
 		}
 
 		nowNs := time.Now().UnixNano()
-		ageMs := (nowNs - heartbeat) / 1e6
-		if heartbeat < cutoff {
+		ageNs := nowNs - rec.CreatedAt
+		if ageNs > timeout.Nanoseconds() {
 			staleTxnIDs = append(staleTxnIDs, txnID)
 			log.Warn().
 				Uint64("txn_id", txnID).
-				Int64("age_ms", ageMs).
+				Int64("age_ms", ageNs/1e6).
 				Int64("timeout_ms", timeout.Milliseconds()).
-				Int64("now_ns", nowNs).
-				Int64("cutoff_ns", cutoff).
-				Int64("last_heartbeat_ns", heartbeat).
-				Msg("GC: Found stale PENDING transaction - WILL BE CLEANED UP")
+				Msg("GC: Found stale PENDING transaction (no active heartbeat)")
 		}
 	}
 	if err := iter.Close(); err != nil {
@@ -2109,7 +1896,6 @@ func (s *PebbleMetaStore) CleanupStaleTransactions(timeout time.Duration) (int, 
 		_ = s.AbortTransaction(txnID)
 		_ = s.DeleteIntentsByTxn(txnID)
 		_ = s.DeleteIntentEntries(txnID)
-		_ = s.ReleaseCDCRowLocksByTxn(txnID)
 		cleaned++
 	}
 
@@ -2402,389 +2188,49 @@ func (s *PebbleMetaStore) ScanTransactions(fromTxnID uint64, descending bool, ca
 	return iter.Error()
 }
 
-// AcquireCDCRowLock attempts to acquire a row-level lock for CDC conflict detection.
-// Returns ErrCDCRowLocked if the row is already locked by a different transaction.
-// Same transaction can re-acquire (idempotent).
+// CDC Lock Methods (in-memory via cdcLocks)
+
+// AcquireCDCRowLock acquires a row-level CDC lock.
 func (s *PebbleMetaStore) AcquireCDCRowLock(txnID uint64, tableName, intentKey string) error {
-	// Sharded lock prevents TOCTOU race between check and write
-	mu := s.intentLockFor(tableName, intentKey)
-	mu.Lock()
-	defer mu.Unlock()
-
-	key := pebbleCDCActiveIntentKey(tableName, intentKey)
-
-	// Check if lock exists
-	val, closer, err := s.db.Get(key)
-	if err == nil {
-		defer closer.Close()
-		if len(val) >= 8 {
-			existingTxnID := binary.BigEndian.Uint64(val)
-			if existingTxnID != txnID {
-				return ErrCDCRowLocked{
-					Table:     tableName,
-					IntentKey: []byte(intentKey),
-					HeldByTxn: existingTxnID,
-				}
-			}
-			// Same txn - idempotent re-acquire
-			return nil
-		}
-	} else if err != pebble.ErrNotFound {
-		return err
-	}
-
-	// No lock exists - acquire it
-	buf := make([]byte, 8)
-	binary.BigEndian.PutUint64(buf, txnID)
-
-	batch := s.db.NewBatch()
-	defer batch.Close()
-
-	// Forward index: /cdc/active/{table}/{intentKey} → txnID
-	if err := batch.Set(key, buf, nil); err != nil {
-		return err
-	}
-
-	// Reverse index: /cdc/txn_locks/{txnID}/{table}/{intentKey} → empty
-	reverseKey := pebbleCDCTxnLockKey(txnID, tableName, intentKey)
-	if err := batch.Set(reverseKey, nil, nil); err != nil {
-		return err
-	}
-
-	return batch.Commit(pebble.NoSync)
+	return s.cdcLocks.Acquire(txnID, tableName, intentKey)
 }
 
-// ReleaseCDCRowLock releases a row-level lock if held by the specified txnID.
-// Idempotent - no error if already released.
+// ReleaseCDCRowLock releases a row-level CDC lock.
 func (s *PebbleMetaStore) ReleaseCDCRowLock(tableName, intentKey string, txnID uint64) error {
-	// Sharded lock prevents TOCTOU race between check and delete
-	mu := s.intentLockFor(tableName, intentKey)
-	mu.Lock()
-	defer mu.Unlock()
-
-	key := pebbleCDCActiveIntentKey(tableName, intentKey)
-
-	// Check if lock exists and belongs to this txn
-	val, closer, err := s.db.Get(key)
-	if err == pebble.ErrNotFound {
-		return nil // Already released
-	}
-	if err != nil {
-		return err
-	}
-
-	if len(val) >= 8 {
-		existingTxnID := binary.BigEndian.Uint64(val)
-		if existingTxnID != txnID {
-			closer.Close()
-			return nil // Lock held by different txn - don't release
-		}
-	}
-	closer.Close()
-
-	// Delete both forward and reverse index
-	batch := s.db.NewBatch()
-	defer batch.Close()
-
-	if err := batch.Delete(key, nil); err != nil {
-		return err
-	}
-
-	reverseKey := pebbleCDCTxnLockKey(txnID, tableName, intentKey)
-	if err := batch.Delete(reverseKey, nil); err != nil {
-		return err
-	}
-
-	return batch.Commit(pebble.NoSync)
+	s.cdcLocks.Release(tableName, intentKey, txnID)
+	return nil
 }
 
-// ReleaseCDCRowLocksByTxn releases all row locks held by the specified transaction.
-// Uses reverse index for O(m) complexity where m = locks held by txn.
+// ReleaseCDCRowLocksByTxn releases all CDC row locks held by a transaction.
 func (s *PebbleMetaStore) ReleaseCDCRowLocksByTxn(txnID uint64) error {
-	prefix := pebbleCDCTxnLockPrefix(txnID)
-
-	iter, err := s.db.NewIter(&pebble.IterOptions{
-		LowerBound: prefix,
-		UpperBound: prefixUpperBound(prefix),
-	})
-	if err != nil {
-		return err
-	}
-
-	batch := s.db.NewBatch()
-	defer batch.Close()
-
-	lockCount := 0
-
-	// Iterate over reverse index entries for this txn
-	for iter.SeekGE(prefix); iter.Valid(); iter.Next() {
-		// Parse table/intentKey from reverse key using length-prefixed format
-		tableName, intentKey, ok := parseCDCTxnLockKey(iter.Key(), len(prefix))
-		if !ok {
-			continue // Malformed key, skip
-		}
-
-		// Delete forward index key
-		forwardKey := pebbleCDCActiveIntentKey(tableName, intentKey)
-		if err := batch.Delete(forwardKey, nil); err != nil {
-			iter.Close()
-			return err
-		}
-
-		// Delete reverse index key
-		if err := batch.Delete(iter.Key(), nil); err != nil {
-			iter.Close()
-			return err
-		}
-		lockCount++
-	}
-
-	if lockCount > 0 {
-		log.Debug().
-			Uint64("txn_id", txnID).
-			Int("locks_released", lockCount).
-			Msg("CDC: Released row locks for transaction")
-	}
-
-	if err := iter.Close(); err != nil {
-		return err
-	}
-
-	return batch.Commit(pebble.NoSync)
+	s.cdcLocks.ReleaseByTxn(txnID)
+	return nil
 }
 
-// GetCDCRowLock returns the transaction ID holding the lock, or 0 if no lock exists.
+// GetCDCRowLock returns the transaction holding a row lock, or 0 if none.
 func (s *PebbleMetaStore) GetCDCRowLock(tableName, intentKey string) (uint64, error) {
-	key := pebbleCDCActiveIntentKey(tableName, intentKey)
-
-	val, closer, err := s.db.Get(key)
-	if err == pebble.ErrNotFound {
-		return 0, nil
-	}
-	if err != nil {
-		return 0, err
-	}
-	defer closer.Close()
-
-	if len(val) >= 8 {
-		return binary.BigEndian.Uint64(val), nil
-	}
-	return 0, nil
+	txnID, _ := s.cdcLocks.GetHolder(tableName, intentKey)
+	return txnID, nil
 }
 
-// AcquireCDCTableDDLLock attempts to acquire a table-level DDL lock.
-// Returns ErrCDCDMLInProgress if any DML row locks exist for the table.
-// Returns ErrCDCRowLocked if DDL lock already held by different transaction.
-//
-// NOTE: There is a TOCTOU race between checking HasCDCRowLocksForTable and
-// acquiring the DDL lock. This means DDL and DML operations could theoretically
-// overlap in a small window. In practice, this is mitigated by:
-// 1. The coordinator acquiring write intents before CDC capture
-// 2. The short duration of the window (microseconds)
-// 3. The retry mechanism on conflict (MySQL 1213 deadlock error)
-// A fully atomic implementation would require Pebble transactions.
+// AcquireCDCTableDDLLock acquires a table-level DDL lock.
 func (s *PebbleMetaStore) AcquireCDCTableDDLLock(txnID uint64, tableName string) error {
-	// First check if any DML is in progress
-	hasDML, err := s.HasCDCRowLocksForTable(tableName)
-	if err != nil {
-		return err
-	}
-	if hasDML {
-		log.Debug().
-			Uint64("txn_id", txnID).
-			Str("table", tableName).
-			Msg("CDC: DDL blocked - DML row locks exist on table")
-		return ErrCDCDMLInProgress{Table: tableName}
-	}
-
-	// Check if DDL lock exists
-	key := pebbleCDCActiveDDLKey(tableName)
-	val, closer, err := s.db.Get(key)
-	if err == nil {
-		defer closer.Close()
-		if len(val) >= 8 {
-			existingTxnID := binary.BigEndian.Uint64(val)
-			if existingTxnID != txnID {
-				log.Debug().
-					Uint64("txn_id", txnID).
-					Uint64("blocked_by_txn", existingTxnID).
-					Str("table", tableName).
-					Msg("CDC: DDL table-level lock conflict - blocked by another DDL transaction")
-				// DDL lock is stored as a special row with "__ddl__" key
-				// This allows us to reuse ErrCDCRowLocked for consistency
-				return ErrCDCRowLocked{
-					Table:     tableName,
-					IntentKey: []byte(pebbleCDCDDLKeyMarker), // Sentinel value indicating DDL lock
-					HeldByTxn: existingTxnID,
-				}
-			}
-			// Same txn - idempotent re-acquire
-			return nil
-		}
-	} else if err != pebble.ErrNotFound {
-		return err
-	}
-
-	// Acquire DDL lock - write both forward and reverse index
-	buf := make([]byte, 8)
-	binary.BigEndian.PutUint64(buf, txnID)
-
-	batch := s.db.NewBatch()
-	defer batch.Close()
-
-	// Forward index
-	if err := batch.Set(key, buf, nil); err != nil {
-		return err
-	}
-
-	// Reverse index (DDL uses __ddl__ as intentKey)
-	reverseKey := pebbleCDCTxnLockKey(txnID, tableName, pebbleCDCDDLKeyMarker)
-	if err := batch.Set(reverseKey, nil, nil); err != nil {
-		return err
-	}
-
-	return batch.Commit(pebble.NoSync)
+	return s.cdcLocks.AcquireDDL(txnID, tableName)
 }
 
-// ReleaseCDCTableDDLLock releases a table-level DDL lock if held by the specified txnID.
-// Idempotent - no error if already released.
+// ReleaseCDCTableDDLLock releases a table-level DDL lock.
 func (s *PebbleMetaStore) ReleaseCDCTableDDLLock(tableName string, txnID uint64) error {
-	key := pebbleCDCActiveDDLKey(tableName)
-
-	// Check if lock exists and belongs to this txn
-	val, closer, err := s.db.Get(key)
-	if err == pebble.ErrNotFound {
-		return nil // Already released
-	}
-	if err != nil {
-		return err
-	}
-
-	var existingTxnID uint64
-	if len(val) >= 8 {
-		existingTxnID = binary.BigEndian.Uint64(val)
-		if existingTxnID != txnID {
-			closer.Close()
-			return nil // Lock held by different txn - don't release
-		}
-	}
-	closer.Close()
-
-	// Delete both forward and reverse index
-	batch := s.db.NewBatch()
-	defer batch.Close()
-
-	// Forward index
-	if err := batch.Delete(key, nil); err != nil {
-		return err
-	}
-
-	// Reverse index
-	reverseKey := pebbleCDCTxnLockKey(txnID, tableName, pebbleCDCDDLKeyMarker)
-	if err := batch.Delete(reverseKey, nil); err != nil {
-		return err
-	}
-
-	return batch.Commit(pebble.NoSync)
+	s.cdcLocks.ReleaseDDL(tableName, txnID)
+	return nil
 }
 
-// HasCDCRowLocksForTable checks if any row-level locks exist for a table (excluding DDL lock).
-// Returns true if any DML is in progress on this table.
+// HasCDCRowLocksForTable checks if any row locks exist for a table.
 func (s *PebbleMetaStore) HasCDCRowLocksForTable(tableName string) (bool, error) {
-	prefix := pebbleCDCActiveTablePrefix(tableName)
-	ddlKey := pebbleCDCActiveDDLKey(tableName)
-
-	iter, err := s.db.NewIter(&pebble.IterOptions{
-		LowerBound: prefix,
-		UpperBound: prefixUpperBound(prefix),
-	})
-	if err != nil {
-		return false, err
-	}
-	defer iter.Close()
-
-	for iter.SeekGE(prefix); iter.Valid(); iter.Next() {
-		key := iter.Key()
-		// Skip the DDL lock key
-		if string(key) == string(ddlKey) {
-			continue
-		}
-		// Found a non-DDL lock
-		return true, nil
-	}
-
-	return false, iter.Error()
+	return s.cdcLocks.HasRowLocks(tableName), nil
 }
 
-// GetCDCTableDDLLock returns the transaction ID holding the DDL lock, or 0 if no lock exists.
+// GetCDCTableDDLLock returns the transaction holding a DDL lock, or 0 if none.
 func (s *PebbleMetaStore) GetCDCTableDDLLock(tableName string) (uint64, error) {
-	key := pebbleCDCActiveDDLKey(tableName)
-
-	val, closer, err := s.db.Get(key)
-	if err == pebble.ErrNotFound {
-		return 0, nil
-	}
-	if err != nil {
-		return 0, err
-	}
-	defer closer.Close()
-
-	if len(val) >= 8 {
-		return binary.BigEndian.Uint64(val), nil
-	}
-	return 0, nil
-}
-
-// clearAllCDCLocks deletes all CDC locks (both forward and reverse index).
-// Called on startup since CDC locks should never survive process restart.
-// Any surviving lock is from a crashed transaction and is invalid.
-func (s *PebbleMetaStore) clearAllCDCLocks() error {
-	batch := s.db.NewBatch()
-	defer batch.Close()
-
-	// Delete all forward locks: /cdc/active/*
-	activePrefix := []byte(pebblePrefixCDCActive)
-	iter, err := s.db.NewIter(&pebble.IterOptions{
-		LowerBound: activePrefix,
-		UpperBound: prefixUpperBound(activePrefix),
-	})
-	if err != nil {
-		return err
-	}
-
-	for iter.SeekGE(activePrefix); iter.Valid(); iter.Next() {
-		key := make([]byte, len(iter.Key()))
-		copy(key, iter.Key())
-		if err := batch.Delete(key, nil); err != nil {
-			iter.Close()
-			return err
-		}
-	}
-	if err := iter.Close(); err != nil {
-		return err
-	}
-
-	// Delete all reverse locks: /cdc/txn_locks/*
-	txnLocksPrefix := []byte(pebblePrefixCDCTxnLocks)
-	iter, err = s.db.NewIter(&pebble.IterOptions{
-		LowerBound: txnLocksPrefix,
-		UpperBound: prefixUpperBound(txnLocksPrefix),
-	})
-	if err != nil {
-		return err
-	}
-
-	for iter.SeekGE(txnLocksPrefix); iter.Valid(); iter.Next() {
-		key := make([]byte, len(iter.Key()))
-		copy(key, iter.Key())
-		if err := batch.Delete(key, nil); err != nil {
-			iter.Close()
-			return err
-		}
-	}
-	if err := iter.Close(); err != nil {
-		return err
-	}
-
-	return batch.Commit(pebble.NoSync)
+	txnID, _ := s.cdcLocks.GetDDLHolder(tableName)
+	return txnID, nil
 }

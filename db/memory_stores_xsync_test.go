@@ -215,8 +215,8 @@ func TestXsyncCDCLockStore_ConflictDetection(t *testing.T) {
 
 	// Try to acquire same lock from different transaction
 	err = store.Acquire(txnID2, table, key)
-	if err != ErrLockHeld {
-		t.Errorf("expected ErrLockHeld, got %v", err)
+	if _, ok := err.(ErrCDCRowLocked); !ok {
+		t.Errorf("expected ErrCDCRowLocked, got %T: %v", err, err)
 	}
 
 	// Verify original holder unchanged
@@ -387,5 +387,161 @@ func BenchmarkXsyncCDCLockStore_GetHolder(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		key := string(rune('a' + (i % 26)))
 		store.GetHolder("users", key)
+	}
+}
+
+// TestXsyncCDCLockStore_DDLLock tests DDL lock acquisition and release.
+func TestXsyncCDCLockStore_DDLLock(t *testing.T) {
+	store := NewXsyncCDCLockStore()
+
+	txnID := uint64(1)
+	table := "users"
+
+	// Acquire DDL lock
+	err := store.AcquireDDL(txnID, table)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Verify holder
+	holder, held := store.GetDDLHolder(table)
+	if !held || holder != txnID {
+		t.Errorf("expected DDL lock held by %d, got %d (held=%v)", txnID, holder, held)
+	}
+
+	// Same txn can re-acquire (idempotent)
+	err = store.AcquireDDL(txnID, table)
+	if err != nil {
+		t.Errorf("same txn should re-acquire: %v", err)
+	}
+
+	// Release DDL lock
+	store.ReleaseDDL(table, txnID)
+	_, held = store.GetDDLHolder(table)
+	if held {
+		t.Error("DDL lock should be released")
+	}
+}
+
+// TestXsyncCDCLockStore_DDLBlockedByDML tests DDL blocked when DML exists.
+func TestXsyncCDCLockStore_DDLBlockedByDML(t *testing.T) {
+	store := NewXsyncCDCLockStore()
+
+	dmlTxnID := uint64(1)
+	ddlTxnID := uint64(2)
+	table := "users"
+
+	// Acquire row lock (DML)
+	err := store.Acquire(dmlTxnID, table, "row1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Try DDL - should fail
+	err = store.AcquireDDL(ddlTxnID, table)
+	if err == nil {
+		t.Fatal("DDL should be blocked by DML")
+	}
+	if _, ok := err.(ErrCDCDMLInProgress); !ok {
+		t.Errorf("expected ErrCDCDMLInProgress, got %T: %v", err, err)
+	}
+
+	// Release DML
+	store.Release(table, "row1", dmlTxnID)
+
+	// Now DDL should succeed
+	err = store.AcquireDDL(ddlTxnID, table)
+	if err != nil {
+		t.Errorf("DDL should succeed after DML release: %v", err)
+	}
+}
+
+// TestXsyncCDCLockStore_DDLConflict tests DDL lock conflict between transactions.
+func TestXsyncCDCLockStore_DDLConflict(t *testing.T) {
+	store := NewXsyncCDCLockStore()
+
+	txnID1 := uint64(1)
+	txnID2 := uint64(2)
+	table := "users"
+
+	// First txn acquires DDL lock
+	err := store.AcquireDDL(txnID1, table)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Second txn tries DDL - should fail
+	err = store.AcquireDDL(txnID2, table)
+	if err == nil {
+		t.Fatal("second DDL should conflict")
+	}
+	ddlErr, ok := err.(ErrCDCRowLocked)
+	if !ok {
+		t.Errorf("expected ErrCDCRowLocked, got %T: %v", err, err)
+	}
+	if ddlErr.HeldByTxn != txnID1 {
+		t.Errorf("expected held by %d, got %d", txnID1, ddlErr.HeldByTxn)
+	}
+}
+
+// TestXsyncCDCLockStore_ReleaseByTxnIncludesDDL tests ReleaseByTxn releases DDL locks.
+func TestXsyncCDCLockStore_ReleaseByTxnIncludesDDL(t *testing.T) {
+	store := NewXsyncCDCLockStore()
+
+	txnID := uint64(1)
+	table := "users"
+
+	// Acquire both row and DDL locks
+	err := store.Acquire(txnID, table, "row1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	err = store.AcquireDDL(txnID, "orders") // Different table for DDL
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Release all by txn
+	store.ReleaseByTxn(txnID)
+
+	// Verify row lock released
+	_, held := store.GetHolder(table, "row1")
+	if held {
+		t.Error("row lock should be released")
+	}
+
+	// Verify DDL lock released
+	_, held = store.GetDDLHolder("orders")
+	if held {
+		t.Error("DDL lock should be released")
+	}
+}
+
+// TestXsyncCDCLockStore_HasRowLocks tests HasRowLocks method.
+func TestXsyncCDCLockStore_HasRowLocks(t *testing.T) {
+	store := NewXsyncCDCLockStore()
+
+	table := "users"
+
+	// No locks initially
+	if store.HasRowLocks(table) {
+		t.Error("should have no locks initially")
+	}
+
+	// Add row lock
+	store.Acquire(1, table, "row1")
+	if !store.HasRowLocks(table) {
+		t.Error("should have locks after acquire")
+	}
+
+	// Different table should have no locks
+	if store.HasRowLocks("orders") {
+		t.Error("different table should have no locks")
+	}
+
+	// Release and verify
+	store.Release(table, "row1", 1)
+	if store.HasRowLocks(table) {
+		t.Error("should have no locks after release")
 	}
 }
