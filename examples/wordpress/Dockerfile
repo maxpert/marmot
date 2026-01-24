@@ -10,7 +10,7 @@ COPY . .
 
 # Go 1.25.1 required - use GOTOOLCHAIN to fetch it
 ENV GOTOOLCHAIN=auto
-RUN CGO_ENABLED=1 go build -tags sqlite_preupdate_hook -o marmot-v2 .
+RUN CGO_ENABLED=1 go build -tags "sqlite_preupdate_hook sqlite_fts5 sqlite_json sqlite_math_functions sqlite_foreign_keys sqlite_stat4 sqlite_vacuum_incr" -o marmot-v2 .
 
 # Runtime
 FROM debian:bookworm-slim

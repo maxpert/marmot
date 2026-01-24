@@ -20,7 +20,18 @@ func init() {
 			}
 
 			// Register all MySQL-compatible functions for WordPress support
-			return RegisterAllMySQLCompatFuncs(conn)
+			if err := RegisterAllMySQLCompatFuncs(conn); err != nil {
+				return err
+			}
+
+			// Load all registered extensions (always_loaded and dynamically loaded)
+			if extMgr := GetExtensionManager(); extMgr != nil {
+				if err := extMgr.LoadAllExtensions(conn); err != nil {
+					return err
+				}
+			}
+
+			return nil
 		},
 	})
 }

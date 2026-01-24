@@ -81,7 +81,7 @@ async function execCommand(cmd: string): Promise<string> {
 async function buildMarmot(): Promise<string> {
   log("Building marmot-v2...");
   const repoRoot = await execCommand("cd ../.. && pwd");
-  await execCommand(`cd ${repoRoot} && go build -tags sqlite_preupdate_hook -o marmot-v2 .`);
+  await execCommand(`cd ${repoRoot} && go build -tags "sqlite_preupdate_hook sqlite_fts5 sqlite_json sqlite_math_functions sqlite_foreign_keys sqlite_stat4 sqlite_vacuum_incr" -o marmot-v2 .`);
   return `${repoRoot}/marmot-v2`;
 }
 

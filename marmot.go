@@ -122,6 +122,18 @@ func main() {
 	log.Info().Msg("Starting gossip protocol")
 	client, gossip := startGossip(grpcServer)
 
+	// Initialize extension manager if configured (must be before any DB connections)
+	if cfg.Config.Extensions.Directory != "" || len(cfg.Config.Extensions.AlwaysLoaded) > 0 {
+		log.Info().
+			Str("directory", cfg.Config.Extensions.Directory).
+			Strs("always_loaded", cfg.Config.Extensions.AlwaysLoaded).
+			Msg("Initializing SQLite extension manager")
+		if err := db.InitExtensionManager(cfg.Config.Extensions.Directory, cfg.Config.Extensions.AlwaysLoaded); err != nil {
+			log.Fatal().Err(err).Msg("Failed to initialize extension manager")
+			return
+		}
+	}
+
 	// Phase 5: Initialize Database Manager
 	log.Info().Msg("Initializing Database Manager")
 	clock := hlc.NewClock(cfg.Config.NodeID)

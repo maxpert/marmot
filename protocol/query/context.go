@@ -134,6 +134,10 @@ type QueryContext struct {
 	MySQLState     *MySQLParseState // nil for SQLite dialect
 	SchemaLookup   func(table string) string
 	SchemaProvider transform.SchemaProvider
+
+	// SkipTranspilation bypasses MySQL→SQLite transpilation when true.
+	// SQL is passed through unchanged, only statement type classification is performed.
+	SkipTranspilation bool
 }
 
 // NewContext creates a new QueryContext for the given SQL and parameters.

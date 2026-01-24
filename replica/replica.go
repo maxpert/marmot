@@ -119,6 +119,18 @@ func Run() {
 	// Initialize HLC clock
 	replica.clock = hlc.NewClock(cfg.Config.NodeID)
 
+	// Initialize extension manager if configured (must be before any DB connections)
+	if cfg.Config.Extensions.Directory != "" || len(cfg.Config.Extensions.AlwaysLoaded) > 0 {
+		log.Info().
+			Str("directory", cfg.Config.Extensions.Directory).
+			Strs("always_loaded", cfg.Config.Extensions.AlwaysLoaded).
+			Msg("Initializing SQLite extension manager")
+		if err := db.InitExtensionManager(cfg.Config.Extensions.Directory, cfg.Config.Extensions.AlwaysLoaded); err != nil {
+			log.Fatal().Err(err).Msg("Failed to initialize extension manager")
+			return
+		}
+	}
+
 	// Initialize database manager
 	log.Info().Msg("Initializing database manager")
 	dbMgr, err := db.NewDatabaseManager(cfg.Config.DataDir, cfg.Config.NodeID, replica.clock)

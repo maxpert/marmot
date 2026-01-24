@@ -6,4 +6,4 @@
 CC=x86_64-linux-musl-gcc \
 CXX=x86_64-linux-musl-g++ \
 GOARCH=amd64 GOOS=linux CGO_ENABLED=1 \
-go build -tags sqlite_preupdate_hook -ldflags "-linkmode external -extldflags -static" -o dist/linux/amd64/marmot-v2
+go build -tags "sqlite_preupdate_hook sqlite_fts5 sqlite_json sqlite_math_functions sqlite_foreign_keys sqlite_stat4 sqlite_vacuum_incr" -ldflags "-linkmode external -extldflags -static" -o dist/linux/amd64/marmot-v2

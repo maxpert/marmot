@@ -422,6 +422,8 @@ Marmot supports a wide range of MySQL/SQLite statements through its MySQL protoc
 | `UNLOCK TABLES` | ✅ Parsed | ❌ No | Requires distributed locking coordination |
 | **Session Configuration** |
 | `SET` statements | ✅ Parsed | ❌ No | Session-local, not replicated |
+| `SET marmot_transpilation` | ✅ Full | ❌ No | Toggle MySQL→SQLite transpilation |
+| `LOAD EXTENSION` | ✅ Full | ❌ No | Load SQLite extension (requires config) |
 | **XA Transactions** |
 | `XA START/END/PREPARE` | ✅ Parsed | ❌ No | Marmot uses its own 2PC protocol |
 | `XA COMMIT/ROLLBACK` | ✅ Parsed | ❌ No | Not compatible with Marmot's model |
@@ -451,6 +453,82 @@ Marmot supports a wide range of MySQL/SQLite statements through its MySQL protoc
 4. **Table Locking**: `LOCK TABLES` statements are recognized but not enforced across the cluster. Use application-level coordination for distributed locking needs.
 
 5. **Qualified Names**: Marmot fully supports qualified table names (e.g., `db.table`) in DML and DDL operations.
+
+## SQLite Extensions
+
+Marmot supports loading SQLite extensions to add custom functions, virtual tables, and other capabilities. This enables use cases like vector search (sqlite-vss), full-text search, and custom aggregations.
+
+### Configuration
+
+```toml
+[extensions]
+# Directory containing extension libraries (.so, .dylib, .dll)
+directory = "/opt/sqlite/extensions"
+
+# Extensions loaded automatically into every connection
+always_loaded = ["sqlite-vector"]
+```
+
+### Dynamic Loading
+
+Extensions can be loaded at runtime via SQL:
+
+```sql
+-- Load an extension by name (resolved from extensions.directory)
+LOAD EXTENSION sqlite-vector;
+
+-- Verify the extension is loaded
+SELECT vec_version();
+```
+
+**Extension Resolution:**
+- Searches the configured `directory` for the extension
+- Tries multiple patterns: `name`, `name.so`, `name.dylib`, `libname.so`, `libname.dylib`
+- Platform-appropriate suffix is preferred (.dylib on macOS, .so on Linux, .dll on Windows)
+
+**Security:**
+- Extension names cannot contain path separators (no path traversal)
+- Resolved paths must stay within the configured directory
+- Only extensions in the configured directory can be loaded
+
+### Use Cases
+
+| Extension | Purpose |
+|-----------|---------|
+| **sqlite-vss** | Vector similarity search for AI/ML embeddings |
+| **sqlite-vec** | Lightweight vector search |
+| **fts5** | Full-text search (usually built-in) |
+| **json1** | JSON functions (usually built-in) |
+
+## Session-Level Transpilation Toggle
+
+Marmot normally transpiles MySQL syntax to SQLite. You can disable this per-session to send raw SQLite SQL directly.
+
+### Usage
+
+```sql
+-- Disable MySQL→SQLite transpilation (raw SQLite mode)
+SET marmot_transpilation = OFF;
+
+-- Now you can use SQLite-specific syntax
+SELECT sqlite_version();
+PRAGMA table_info(users);
+
+-- Re-enable transpilation
+SET marmot_transpilation = ON;
+
+-- Back to MySQL mode
+SELECT NOW();  -- Transpiled to SQLite's datetime functions
+```
+
+### When to Use
+
+- **Raw SQLite queries**: Use SQLite-specific syntax like PRAGMA, ATTACH, etc.
+- **Performance testing**: Compare transpiled vs raw query performance
+- **Debugging**: See exactly what SQLite receives
+- **Advanced SQLite features**: Access features not available through MySQL syntax
+
+**Note:** Transpilation is enabled by default. The setting is per-session and not persisted.
 
 ## MySQL Protocol & Metadata Queries
 
@@ -903,6 +981,20 @@ retry_multiplier = 2.0           # Exponential backoff multiplier
 ```
 
 See the [Integrations documentation](https://maxpert.github.io/marmot/integrations) for details on event format, Kafka/NATS configuration, and use cases.
+
+### SQLite Extensions
+
+```toml
+[extensions]
+directory = "/opt/sqlite/extensions"  # Search path for extensions
+always_loaded = ["sqlite-vector"]     # Auto-load into every connection
+```
+
+**Loading Extensions at Runtime:**
+```sql
+LOAD EXTENSION sqlite-vector;
+SELECT vec_version();
+```
 
 ### Logging
 

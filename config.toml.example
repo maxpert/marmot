@@ -315,6 +315,20 @@ verbose = false
 format = "console"
 
 # ==============================================================================
+# SQLITE EXTENSIONS
+# ==============================================================================
+
+[extensions]
+# Directory containing SQLite extension libraries (.so, .dylib, .dll)
+# Extensions can be loaded via "LOAD EXTENSION <name>" SQL command
+# Example: "/opt/sqlite/extensions"
+directory = ""
+
+# Extensions to load automatically into every connection
+# Example: ["sqlite-vector", "sqlite-vss"]
+always_loaded = []
+
+# ==============================================================================
 # METRICS
 # ==============================================================================
 

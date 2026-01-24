@@ -78,6 +78,11 @@ type ConnectionSession struct {
 	// LastInsertId stores the value returned by LAST_INSERT_ID().
 	// Updated after INSERT statements that generate auto-increment IDs.
 	LastInsertId atomic.Int64
+
+	// TranspilationEnabled controls MySQL→SQLite transpilation for this session.
+	// Default: true (transpilation enabled).
+	// Set to false with: SET marmot_transpilation = OFF
+	TranspilationEnabled bool
 }
 
 // InTransaction returns true if session has an active explicit transaction
@@ -263,11 +268,12 @@ func (s *MySQLServer) handleConnection(conn net.Conn) {
 
 	// Create session for this connection
 	session := &ConnectionSession{
-		ConnID:          s.nextConnID(),
-		CurrentDatabase: "marmot", // Default database
-		RemoteAddr:      conn.RemoteAddr().String(),
-		preparedStmts:   make(map[uint32]*PreparedStatement),
-		nextStmtID:      1,
+		ConnID:               s.nextConnID(),
+		CurrentDatabase:      "marmot", // Default database
+		RemoteAddr:           conn.RemoteAddr().String(),
+		preparedStmts:        make(map[uint32]*PreparedStatement),
+		nextStmtID:           1,
+		TranspilationEnabled: true, // Default: MySQL→SQLite transpilation enabled
 	}
 
 	log.Debug().Uint64("conn_id", session.ConnID).Str("remote", session.RemoteAddr).Msg("New connection")

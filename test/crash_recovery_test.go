@@ -100,7 +100,7 @@ func (h *ClusterHarness) buildMarmot() error {
 	binPath := filepath.Join(h.BaseDir, "marmot")
 	h.MarmotBin = binPath
 
-	cmd := exec.Command("go", "build", "-tags", "sqlite_preupdate_hook", "-o", binPath, ".")
+	cmd := exec.Command("go", "build", "-tags", "sqlite_preupdate_hook sqlite_fts5 sqlite_json sqlite_math_functions sqlite_foreign_keys sqlite_stat4 sqlite_vacuum_incr", "-o", binPath, ".")
 	cmd.Dir = "/Users/zohaib/repos/marmot"
 	output, err := cmd.CombinedOutput()
 	if err != nil {

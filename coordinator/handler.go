@@ -204,6 +204,12 @@ func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, sq
 		Str("query", sql).
 		Msg("Handling query")
 
+	// Handle Marmot session commands first (SET marmot_*, LOAD EXTENSION)
+	// These are handled before parsing since they control parsing behavior
+	if protocol.IsMarmotSessionCommand(sql) {
+		return h.handleMarmotCommand(session, sql)
+	}
+
 	// Build schema lookup function for auto-increment ID injection.
 	// Uses cached schema via DatabaseManager - does NOT query SQLite PRAGMA.
 	var schemaLookup protocol.SchemaLookupFunc
@@ -218,8 +224,11 @@ func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, sq
 		}
 	}
 
-	// Parse first - all routing decisions based on parsed Statement
-	stmt := protocol.ParseStatementWithSchema(sql, schemaLookup)
+	// Parse with options based on session state
+	stmt := protocol.ParseStatementWithOptions(sql, protocol.ParseOptions{
+		SchemaLookup:      schemaLookup,
+		SkipTranspilation: !session.TranspilationEnabled,
+	})
 
 	// Handle system variable queries (@@version, DATABASE(), etc.)
 	if stmt.Type == protocol.StatementSystemVariable {
@@ -235,6 +244,7 @@ func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, sq
 		Uint64("conn_id", session.ConnID).
 		Int("stmt_type", int(stmt.Type)).
 		Str("table", stmt.TableName).
+		Bool("transpilation", session.TranspilationEnabled).
 		Msg("Parsed statement")
 
 	// Handle SET commands as no-op (return OK)
@@ -1078,4 +1088,39 @@ func (h *CoordinatorHandler) checkDeterminism(stmt protocol.Statement) {
 			Str("reason", result.Reason).
 			Msg("Non-deterministic DML detected")
 	}
+}
+
+// handleMarmotCommand handles Marmot session commands (SET marmot_*, LOAD EXTENSION).
+func (h *CoordinatorHandler) handleMarmotCommand(session *protocol.ConnectionSession, sql string) (*protocol.ResultSet, error) {
+	// Handle SET marmot_transpilation
+	if varType, value, matched := protocol.ParseMarmotSetCommand(sql); matched {
+		if varType == "transpilation" {
+			session.TranspilationEnabled = (value == "ON")
+			log.Debug().
+				Uint64("conn_id", session.ConnID).
+				Bool("transpilation", session.TranspilationEnabled).
+				Msg("Session transpilation updated")
+			return nil, nil
+		}
+	}
+
+	// Handle LOAD EXTENSION
+	if extName, matched := protocol.ParseLoadExtensionCommand(sql); matched {
+		extLoader := protocol.GetExtensionLoader()
+		if extLoader == nil {
+			return nil, fmt.Errorf("extension loading not configured (no extensions.directory set)")
+		}
+
+		if err := extLoader.LoadExtensionGlobally(extName); err != nil {
+			return nil, err
+		}
+
+		log.Info().
+			Uint64("conn_id", session.ConnID).
+			Str("extension", extName).
+			Msg("Extension loaded globally")
+		return nil, nil
+	}
+
+	return nil, fmt.Errorf("unrecognized marmot command: %s", sql)
 }

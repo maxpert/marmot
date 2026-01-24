@@ -40,8 +40,16 @@ func (h *ReadOnlyHandler) HandleQuery(session *protocol.ConnectionSession, sql s
 		Str("query", sql).
 		Msg("Handling query (read-only)")
 
-	// Parse first - all routing decisions based on parsed Statement
-	stmt := protocol.ParseStatement(sql)
+	// Handle Marmot session commands first (SET marmot_*, LOAD EXTENSION)
+	// These are handled before parsing since they control parsing behavior
+	if protocol.IsMarmotSessionCommand(sql) {
+		return h.handleMarmotCommand(session, sql)
+	}
+
+	// Parse with options based on session state
+	stmt := protocol.ParseStatementWithOptions(sql, protocol.ParseOptions{
+		SkipTranspilation: !session.TranspilationEnabled,
+	})
 
 	// Handle system variable queries (@@version, DATABASE(), etc.)
 	if stmt.Type == protocol.StatementSystemVariable {
@@ -53,6 +61,7 @@ func (h *ReadOnlyHandler) HandleQuery(session *protocol.ConnectionSession, sql s
 		Int("stmt_type", int(stmt.Type)).
 		Str("table", stmt.TableName).
 		Str("database", stmt.Database).
+		Bool("transpilation", session.TranspilationEnabled).
 		Msg("Parsed statement")
 
 	// Reject all mutations with MySQL read-only error
@@ -218,4 +227,39 @@ func (h *ReadOnlyHandler) executeLocalRead(stmt protocol.Statement, params []int
 	}
 
 	return result, rows.Err()
+}
+
+// handleMarmotCommand handles Marmot session commands (SET marmot_*, LOAD EXTENSION).
+func (h *ReadOnlyHandler) handleMarmotCommand(session *protocol.ConnectionSession, sql string) (*protocol.ResultSet, error) {
+	// Handle SET marmot_transpilation
+	if varType, value, matched := protocol.ParseMarmotSetCommand(sql); matched {
+		if varType == "transpilation" {
+			session.TranspilationEnabled = (value == "ON")
+			log.Debug().
+				Uint64("conn_id", session.ConnID).
+				Bool("transpilation", session.TranspilationEnabled).
+				Msg("Session transpilation updated")
+			return nil, nil
+		}
+	}
+
+	// Handle LOAD EXTENSION
+	if extName, matched := protocol.ParseLoadExtensionCommand(sql); matched {
+		extLoader := protocol.GetExtensionLoader()
+		if extLoader == nil {
+			return nil, fmt.Errorf("extension loading not configured (no extensions.directory set)")
+		}
+
+		if err := extLoader.LoadExtensionGlobally(extName); err != nil {
+			return nil, err
+		}
+
+		log.Info().
+			Uint64("conn_id", session.ConnID).
+			Str("extension", extName).
+			Msg("Extension loaded globally")
+		return nil, nil
+	}
+
+	return nil, fmt.Errorf("unrecognized marmot command: %s", sql)
 }

@@ -176,6 +176,12 @@ type SinkConfiguration struct {
 	RetryMultiplier float64  `toml:"retry_multiplier"` // Backoff multiplier (default: 2.0)
 }
 
+// ExtensionConfiguration controls SQLite extension loading
+type ExtensionConfiguration struct {
+	Directory    string   `toml:"directory"`     // Search path for extensions (like SQLite CLI's .load)
+	AlwaysLoaded []string `toml:"always_loaded"` // Extensions loaded into every connection via ConnectHook
+}
+
 // Configuration is the main configuration structure
 type Configuration struct {
 	NodeID  uint64 `toml:"node_id"`
@@ -196,6 +202,7 @@ type Configuration struct {
 	Replica        ReplicaConfiguration        `toml:"replica"`
 	Publisher      PublisherConfiguration      `toml:"publisher"`
 	BatchCommit    BatchCommitConfiguration    `toml:"batch_commit"`
+	Extensions     ExtensionConfiguration      `toml:"extensions"`
 }
 
 // Command line flags

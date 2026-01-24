@@ -107,7 +107,7 @@ TOML
 
 echo "✓ Configuration created"
 
- go build -tags sqlite_preupdate_hook -o marmot-v2 .
+ go build -tags "sqlite_preupdate_hook sqlite_fts5 sqlite_json sqlite_math_functions sqlite_foreign_keys sqlite_stat4 sqlite_vacuum_incr" -o marmot-v2 .
 echo "✓ Build complete"
 
 # Cleanup function

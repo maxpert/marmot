@@ -112,10 +112,65 @@ func InitializePipeline(cacheSize, poolSize int, idGen id.Generator) error {
 // SchemaLookupFunc returns the auto-increment column name for a table, or empty string if none.
 type SchemaLookupFunc func(table string) string
 
+// ParseOptions holds options for parsing SQL statements.
+type ParseOptions struct {
+	SchemaLookup      SchemaLookupFunc
+	SkipTranspilation bool
+}
+
 // ParseStatement analyzes a SQL statement and returns its type and metadata.
 // This version does not perform auto-increment ID injection.
 func ParseStatement(sql string) Statement {
 	return ParseStatementWithSchema(sql, nil)
+}
+
+// ParseStatementWithOptions parses a SQL statement with the given options.
+// Use this when you need to control transpilation behavior.
+func ParseStatementWithOptions(sql string, opts ParseOptions) Statement {
+	ctx := query.NewContext(sql, nil)
+	ctx.SchemaLookup = opts.SchemaLookup
+	ctx.SkipTranspilation = opts.SkipTranspilation
+
+	if err := globalPipeline.Process(ctx); err != nil {
+		log.Debug().
+			Err(err).
+			Str("sql_prefix", truncateSQLForLog(sql, 80)).
+			Bool("skip_transpilation", opts.SkipTranspilation).
+			Msg("PARSE: Pipeline processing failed")
+		return Statement{
+			SQL:   sql,
+			Type:  StatementUnsupported,
+			Error: err.Error(),
+		}
+	}
+
+	// Extract transpiled SQL from first statement
+	transpiledSQL := ""
+	if len(ctx.Output.Statements) > 0 {
+		transpiledSQL = ctx.Output.Statements[0].SQL
+	}
+
+	stmt := Statement{
+		SQL:      transpiledSQL,
+		Type:     ctx.Output.StatementType,
+		Database: ctx.Output.Database,
+		Error:    errorString(ctx.Output.ValidationErr),
+	}
+
+	// Extract MySQL-specific metadata (if available)
+	if ctx.MySQLState != nil {
+		stmt.TableName = ctx.MySQLState.TableName
+		stmt.ISFilter = InformationSchemaFilter{
+			SchemaName: ctx.MySQLState.ISFilter.SchemaName,
+			TableName:  ctx.MySQLState.ISFilter.TableName,
+			ColumnName: ctx.MySQLState.ISFilter.ColumnName,
+		}
+		stmt.ISTableType = InformationSchemaTableType(ctx.MySQLState.ISTableType)
+		stmt.VirtualTableType = VirtualTableType(ctx.MySQLState.VirtualTableType)
+		stmt.SystemVarNames = ctx.MySQLState.SystemVarNames
+	}
+
+	return stmt
 }
 
 // ParseStatementWithSchema analyzes a SQL statement with schema-based ID injection.

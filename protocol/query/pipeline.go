@@ -41,7 +41,16 @@ func (p *Pipeline) Close() {
 
 // Process parses and transpiles a query, setting execution flags and metadata in the context.
 // For SQLite dialect, queries pass through unchanged. For MySQL, they are parsed and transpiled.
+// When SkipTranspilation is true, SQL passes through unchanged with only classification performed.
 func (p *Pipeline) Process(ctx *QueryContext) error {
+	// Skip transpilation: pass through directly with classification only
+	if ctx.SkipTranspilation {
+		ctx.Output.Statements = []TranspiledStatement{{SQL: ctx.Input.SQL, Params: ctx.Input.Parameters}}
+		ctx.Output.IsValid = true
+		classifySQLiteStatement(ctx)
+		return nil
+	}
+
 	// SQLite dialect: pass through directly
 	if ctx.Input.Dialect == DialectSQLite {
 		ctx.Output.Statements = []TranspiledStatement{{SQL: ctx.Input.SQL, Params: ctx.Input.Parameters}}
