@@ -40,7 +40,6 @@ func RegisterRoutes(mux *http.ServeMux, handlers *AdminHandlers) {
 		r.Get("/transactions/{txnID}", handlers.txnByID)
 
 		// Intents
-		r.Get("/intents/filter/stats", handlers.wrapWithMeta(handlers.handleIntentFilterStats))
 		r.Get("/intents/table/{table}", handlers.intentsByTable)
 		r.Get("/intents/txn/{txnID}", handlers.intentsByTxn)
 		r.Get("/intents/range", handlers.wrapWithMeta(handlers.handleIntentRange))

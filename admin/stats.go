@@ -63,17 +63,10 @@ func (h *AdminHandlers) handleStats(w http.ResponseWriter, r *http.Request, data
 		return
 	}
 
-	intentFilter := metaStore.GetIntentFilter()
-	intentFilterSize := uint64(0)
-	if intentFilter != nil {
-		intentFilterSize = uint64(intentFilter.Size())
-	}
-
 	response := map[string]interface{}{
 		"max_committed_txn_id": maxTxnID,
 		"committed_txn_count":  txnCount,
 		"max_seq_num":          maxSeqNum,
-		"intent_filter_size":   intentFilterSize,
 		"pending_txns":         len(pendingTxns),
 	}
 
@@ -100,19 +93,12 @@ func (h *AdminHandlers) handleHealth(w http.ResponseWriter, r *http.Request, dat
 		return
 	}
 
-	intentFilter := metaStore.GetIntentFilter()
-	intentFilterSize := uint64(0)
-	if intentFilter != nil {
-		intentFilterSize = uint64(intentFilter.Size())
-	}
-
 	// Basic health check - healthy if we can access the metadata
 	response := map[string]interface{}{
 		"healthy": true,
 		"stats": map[string]interface{}{
 			"max_committed_txn_id": maxTxnID,
 			"pending_txns":         len(pendingTxns),
-			"intent_filter_size":   intentFilterSize,
 		},
 	}
 

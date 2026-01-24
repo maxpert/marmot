@@ -25,7 +25,6 @@ const (
 	pebblePrefixTxnPending  = "/txn_idx/pend/"  // /txn_idx/pend/{8 bytes txnID}
 	pebblePrefixTxnSeq      = "/txn_idx/seq/"   // /txn_idx/seq/{8 bytes seqNum}{8 bytes txnID}
 	pebblePrefixTxnByID     = "/txn_idx/txnid/" // /txn_idx/txnid/{8 bytes txnID} - primary index for streaming
-	pebblePrefixIntent      = "/intent/"        // /intent/{2 bytes tableNameLen}{tableName}{intentKey}
 	pebblePrefixCDC         = "/cdc/"           // /cdc/{8 bytes txnID}{8 bytes seq}
 	pebblePrefixCDCRaw      = "/cdc/raw/"       // /cdc/raw/{8 bytes txnID}{8 bytes seq}
 	pebblePrefixRepl        = "/repl/"          // /repl/{8 bytes peerNodeID}/{dbName}
@@ -36,7 +35,6 @@ const (
 	pebblePrefixCounter     = "/meta/"          // /meta/{counterName}
 	pebblePrefixCDCActive   = "/cdc/active/"    // /cdc/active/{2 bytes tableNameLen}{tableName}{intentKey|__ddl__}
 	pebblePrefixCDCTxnLocks = "/cdc/txn_locks/" // /cdc/txn_locks/{8 bytes txnID}{2 bytes tableNameLen}{tableName}{intentKey}
-	pebblePrefixGCIntent    = "/gc/intent/"     // /gc/intent/{2 bytes tableNameLen}{tableName}{intentKey}
 	pebblePrefixTxnCommit   = "/txn_commit/"    // /txn_commit/{8 bytes txnID}
 	pebblePrefixTxnStatus   = "/txn_status/"    // /txn_status/{8 bytes txnID}
 	pebblePrefixTxnHbeat    = "/txn_heartbeat/" // /txn_heartbeat/{8 bytes txnID}
@@ -69,8 +67,8 @@ type PebbleMetaStore struct {
 	// Sharded locks for WriteIntent serialization (prevents TOCTOU race)
 	intentLocks [intentLockShards]sync.Mutex
 
-	// Cuckoo filter for fast-path intent conflict detection
-	intentFilter *IntentFilter
+	// In-memory row locking for fast-path intent conflict detection
+	rowLocks *RowLockStore
 
 	// Optional transaction getter for conflict resolution (set by MemoryMetaStore wrapper)
 	txnGetter TransactionGetter
@@ -85,10 +83,6 @@ func (s *PebbleMetaStore) intentLockFor(tableName, intentKey string) *sync.Mutex
 	return &s.intentLocks[xxhash.Sum64String(key)%intentLockShards]
 }
 
-// GetIntentFilter returns the Cuckoo filter for fast-path conflict detection.
-func (s *PebbleMetaStore) GetIntentFilter() *IntentFilter {
-	return s.intentFilter
-}
 
 // SetTransactionGetter sets a custom transaction getter for conflict resolution.
 // This allows MemoryMetaStore to inject its GetTransaction which reads from memory.
@@ -96,57 +90,6 @@ func (s *PebbleMetaStore) SetTransactionGetter(getter TransactionGetter) {
 	s.txnGetter = getter
 }
 
-// rebuildIntentFilter scans all existing intents and populates the filter.
-// Called on startup to restore filter state after crash/restart.
-func (s *PebbleMetaStore) rebuildIntentFilter() error {
-	prefix := []byte(pebblePrefixIntent)
-	iter, err := s.db.NewIter(&pebble.IterOptions{
-		LowerBound: prefix,
-		UpperBound: prefixUpperBound(prefix),
-	})
-	if err != nil {
-		return err
-	}
-	defer iter.Close()
-
-	count := 0
-	for iter.SeekGE(prefix); iter.Valid(); iter.Next() {
-		// Parse table/intentKey from the intent key
-		key := iter.Key()
-		tableName, intentKey, ok := parseIntentKey(key)
-		if !ok {
-			continue
-		}
-
-		// Check if GC marker exists
-		gcKey := pebbleGCIntentKey(tableName, intentKey)
-		_, gcCloser, gcErr := s.db.Get(gcKey)
-		if gcErr == nil {
-			gcCloser.Close()
-			continue // Skip - marked for cleanup
-		}
-
-		val, err := iter.ValueAndErr()
-		if err != nil {
-			continue
-		}
-
-		var lock IntentLock
-		if err := encoding.Unmarshal(val, &lock); err != nil {
-			continue
-		}
-
-		tbHash := ComputeIntentHash(tableName, intentKey)
-		s.intentFilter.Add(lock.TxnID, tbHash)
-		count++
-	}
-
-	if count > 0 {
-		log.Info().Int("intents", count).Msg("Rebuilt intent filter from existing intents")
-	}
-
-	return nil
-}
 
 // PebbleMetaStoreOptions configures Pebble
 type PebbleMetaStoreOptions struct {
@@ -244,20 +187,14 @@ func NewPebbleMetaStore(path string, opts PebbleMetaStoreOptions) (*PebbleMetaSt
 	}
 
 	store := &PebbleMetaStore{
-		db:           db,
-		path:         path,
-		sequences:    make(map[uint64]*AtomicSequence),
-		intentFilter: NewIntentFilter(),
+		db:        db,
+		path:      path,
+		sequences: make(map[uint64]*AtomicSequence),
+		rowLocks:  NewRowLockStore(),
 	}
 
 	// Initialize persistent counters
 	store.counters = NewPebbleCounter(db, pebblePrefixCounter, 10)
-
-	// Rebuild intent filter from existing intents (for crash recovery)
-	if err := store.rebuildIntentFilter(); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("failed to rebuild intent filter: %w", err)
-	}
 
 	// Clear any stale CDC locks from previous crash (CDC locks are ephemeral)
 	if err := store.clearAllCDCLocks(); err != nil {
@@ -422,33 +359,6 @@ func pebbleTxnHeartbeatKey(txnID uint64) []byte {
 	return key
 }
 
-// pebbleIntentKey uses 2-byte length prefix for tableName (intentKey can contain any bytes)
-func pebbleIntentKey(tableName, intentKey string) []byte {
-	key := make([]byte, len(pebblePrefixIntent)+2+len(tableName)+len(intentKey))
-	n := copy(key, pebblePrefixIntent)
-	binary.BigEndian.PutUint16(key[n:], uint16(len(tableName)))
-	n += 2
-	n += copy(key[n:], tableName)
-	copy(key[n:], intentKey)
-	return key
-}
-
-// parseIntentKey extracts tableName and intentKey from an intent key
-func parseIntentKey(key []byte) (tableName, intentKey string, ok bool) {
-	offset := len(pebblePrefixIntent)
-	if len(key) < offset+2 {
-		return "", "", false
-	}
-	tableNameLen := int(binary.BigEndian.Uint16(key[offset:]))
-	offset += 2
-	if len(key) < offset+tableNameLen {
-		return "", "", false
-	}
-	tableName = string(key[offset : offset+tableNameLen])
-	intentKey = string(key[offset+tableNameLen:])
-	return tableName, intentKey, true
-}
-
 // pebbleIntentByTxnKey uses 2-byte length prefix for tableName
 func pebbleIntentByTxnKey(txnID uint64, tableName, intentKey string) []byte {
 	key := make([]byte, len(pebblePrefixIntentByTxn)+8+2+len(tableName)+len(intentKey))
@@ -596,17 +506,6 @@ func pebbleCDCTxnLockPrefix(txnID uint64) []byte {
 	return key
 }
 
-// pebbleGCIntentKey creates a GC marker key for an intent (presence key, empty value)
-func pebbleGCIntentKey(tableName, intentKey string) []byte {
-	tableNameBytes := []byte(tableName)
-	intentKeyBytes := []byte(intentKey)
-	key := make([]byte, len(pebblePrefixGCIntent)+2+len(tableNameBytes)+len(intentKeyBytes))
-	copy(key, pebblePrefixGCIntent)
-	binary.BigEndian.PutUint16(key[len(pebblePrefixGCIntent):], uint16(len(tableNameBytes)))
-	copy(key[len(pebblePrefixGCIntent)+2:], tableNameBytes)
-	copy(key[len(pebblePrefixGCIntent)+2+len(tableNameBytes):], intentKeyBytes)
-	return key
-}
 
 // parseCDCTxnLockKey extracts tableName and intentKey from a CDC txn lock key
 func parseCDCTxnLockKey(key []byte, prefixLen int) (tableName, intentKey string, ok bool) {
@@ -1174,160 +1073,40 @@ func (s *PebbleMetaStore) WriteIntent(txnID uint64, intentType IntentType, table
 	mu.Lock()
 	defer mu.Unlock()
 
-	tbHash := ComputeIntentHash(tableName, intentKey)
-
-	// Fast path: Cuckoo filter miss = definitely no conflict
-	if s.intentFilter != nil && !s.intentFilter.Check(tbHash) {
-		telemetry.IntentFilterChecks.With("fast_path").Inc()
-		return s.writeIntentFastPath(txnID, intentType, tableName, intentKey, op, sqlStmt, data, ts, nodeID, tbHash)
-	}
-
-	// Slow path: Filter hit (or no filter) - check Pebble
-	return s.writeIntentSlowPath(txnID, intentType, tableName, intentKey, op, sqlStmt, data, ts, nodeID, tbHash)
-}
-
-// writeIntentFastPath writes intent without Pebble conflict check (filter miss).
-func (s *PebbleMetaStore) writeIntentFastPath(txnID uint64, intentType IntentType, tableName, intentKey string, op OpType, sqlStmt string, data []byte, ts hlc.Timestamp, nodeID uint64, tbHash uint64) error {
-	// Lightweight lock for /intent/{table}/{key}
-	lock := &IntentLock{TxnID: txnID}
-	lockBytes, err := encoding.MarshalNative(lock)
-	if err != nil {
-		return err
-	}
-	defer lockBytes.Dispose()
-
-	// Full record for /intent_by_txn/{txnID}/{table}/{key}
-	rec := &WriteIntentRecord{
-		IntentType:   intentType,
-		TableName:    tableName,
-		IntentKey:    []byte(intentKey),
-		TxnID:        txnID,
-		TSWall:       ts.WallTime,
-		TSLogical:    ts.Logical,
-		NodeID:       nodeID,
-		Operation:    op,
-		SQLStatement: sqlStmt,
-		DataSnapshot: data,
-		CreatedAt:    time.Now().UnixNano(),
-	}
-	recBytes, err := encoding.MarshalNative(rec)
-	if err != nil {
-		return err
-	}
-	defer recBytes.Dispose()
-
-	batch := s.db.NewBatch()
-	defer batch.Close()
-
-	if err := batch.Set(pebbleIntentKey(tableName, intentKey), lockBytes.Bytes(), nil); err != nil {
-		return err
-	}
-	if err := batch.Set(pebbleIntentByTxnKey(txnID, tableName, intentKey), recBytes.Bytes(), nil); err != nil {
-		return err
-	}
-
-	if err := batch.Commit(pebble.NoSync); err != nil {
-		return err
-	}
-
-	// Add to filter after successful write
-	s.intentFilter.Add(txnID, tbHash)
-
-	// Refresh heartbeat - transaction is active
-	_ = s.writeHeartbeat(txnID, time.Now().UnixNano())
-
-	return nil
-}
-
-// writeIntentSlowPath writes intent with Pebble conflict check (filter hit).
-func (s *PebbleMetaStore) writeIntentSlowPath(txnID uint64, intentType IntentType, tableName, intentKey string, op OpType, sqlStmt string, data []byte, ts hlc.Timestamp, nodeID uint64, tbHash uint64) error {
-	lockKey := pebbleIntentKey(tableName, intentKey)
-
-	batch := s.db.NewBatch()
-	defer batch.Close()
-
-	// Check if lock already exists
-	existingData, closer, err := s.db.Get(lockKey)
-	if err == nil {
-		// CHECK GC MARKER FIRST - before expensive unmarshal
-		gcKey := pebbleGCIntentKey(tableName, intentKey)
-		_, gcCloser, gcErr := s.db.Get(gcKey)
-		if gcErr == nil {
-			// GC marker exists - intent is marked for cleanup, can overwrite
-			gcCloser.Close()
-			closer.Close()
-
-			// Delete GC marker - fall through to write new intent
-			if err := batch.Delete(gcKey, nil); err != nil {
-				return err
+	// Try to acquire row lock
+	existingTxnID, acquired := s.rowLocks.AcquireLock("", tableName, intentKey, txnID)
+	if !acquired {
+		// Lock held by different transaction - check GC marker first
+		if s.rowLocks.CheckGCMarker("", tableName, intentKey) {
+			// GC marker exists - intent is marked for cleanup, delete marker and acquire
+			s.rowLocks.DeleteGCMarker("", tableName, intentKey)
+			s.rowLocks.ReleaseLock("", tableName, intentKey)
+			existingTxnID, acquired = s.rowLocks.AcquireLock("", tableName, intentKey, txnID)
+			if !acquired {
+				// Race condition - another transaction acquired the lock
+				telemetry.WriteConflictsTotal.With("intent", "gc_race").Inc()
+				return fmt.Errorf("write-write conflict: row %s:%s locked by transaction %d (current txn: %d)",
+					tableName, intentKey, existingTxnID, txnID)
 			}
-		} else if gcErr != pebble.ErrNotFound {
-			closer.Close()
-			return gcErr
 		} else {
-			// No GC marker - check lock ownership
-			closer.Close()
-
-			var existingLock IntentLock
-			if err := encoding.Unmarshal(existingData, &existingLock); err != nil {
+			// No GC marker - resolve conflict
+			if err := s.resolveIntentConflictPebble(nil, existingTxnID, txnID, tableName, intentKey); err != nil {
+				telemetry.WriteConflictsTotal.With("intent", "conflict").Inc()
 				return err
 			}
-
-			if existingLock.TxnID == txnID {
-				// Same transaction - update full record in /intent_by_txn/ only
-				telemetry.IntentFilterChecks.With("slow_path_same_txn").Inc()
-
-				rec := &WriteIntentRecord{
-					IntentType:   intentType,
-					TableName:    tableName,
-					IntentKey:    []byte(intentKey),
-					TxnID:        txnID,
-					TSWall:       ts.WallTime,
-					TSLogical:    ts.Logical,
-					NodeID:       nodeID,
-					Operation:    op,
-					SQLStatement: sqlStmt,
-					DataSnapshot: data,
-					CreatedAt:    time.Now().UnixNano(),
-				}
-				recBytes, err := encoding.MarshalNative(rec)
-				if err != nil {
-					return err
-				}
-				defer recBytes.Dispose()
-
-				if err := s.db.Set(pebbleIntentByTxnKey(txnID, tableName, intentKey), recBytes.Bytes(), pebble.NoSync); err != nil {
-					return err
-				}
-
-				// Refresh heartbeat - transaction is active
-				_ = s.writeHeartbeat(txnID, time.Now().UnixNano())
-				return nil
-			}
-
-			// Different transaction - check if we can overwrite
-			telemetry.IntentFilterChecks.With("slow_path_conflict").Inc()
-			if err := s.resolveIntentConflictPebble(batch, existingLock.TxnID, txnID, tableName, intentKey); err != nil {
-				telemetry.WriteConflictsTotal.With("intent", "slow").Inc()
-				return err
+			// Conflict resolved - release old lock and acquire new one
+			s.rowLocks.ReleaseLock("", tableName, intentKey)
+			existingTxnID, acquired = s.rowLocks.AcquireLock("", tableName, intentKey, txnID)
+			if !acquired {
+				// Race condition
+				telemetry.WriteConflictsTotal.With("intent", "resolve_race").Inc()
+				return fmt.Errorf("write-write conflict: row %s:%s locked by transaction %d (current txn: %d)",
+					tableName, intentKey, existingTxnID, txnID)
 			}
 		}
-	} else if err != pebble.ErrNotFound {
-		return err
-	} else {
-		// Filter hit but no intent in Pebble = false positive
-		telemetry.IntentFilterChecks.With("slow_path_miss").Inc()
-		telemetry.IntentFilterFalsePositives.Inc()
 	}
 
-	// Create new intent - write lock to /intent/, full record to /intent_by_txn/
-	lock := &IntentLock{TxnID: txnID}
-	lockBytes, err := encoding.MarshalNative(lock)
-	if err != nil {
-		return err
-	}
-	defer lockBytes.Dispose()
-
+	// Lock acquired - write full record to /intent_txn/
 	rec := &WriteIntentRecord{
 		IntentType:   intentType,
 		TableName:    tableName,
@@ -1347,20 +1126,8 @@ func (s *PebbleMetaStore) writeIntentSlowPath(txnID uint64, intentType IntentTyp
 	}
 	defer recBytes.Dispose()
 
-	if err := batch.Set(lockKey, lockBytes.Bytes(), nil); err != nil {
+	if err := s.db.Set(pebbleIntentByTxnKey(txnID, tableName, intentKey), recBytes.Bytes(), pebble.NoSync); err != nil {
 		return err
-	}
-	if err := batch.Set(pebbleIntentByTxnKey(txnID, tableName, intentKey), recBytes.Bytes(), nil); err != nil {
-		return err
-	}
-
-	if err := batch.Commit(pebble.NoSync); err != nil {
-		return err
-	}
-
-	// Add to filter after successful write
-	if s.intentFilter != nil {
-		s.intentFilter.Add(txnID, tbHash)
 	}
 
 	// Refresh heartbeat - transaction is active
@@ -1368,6 +1135,7 @@ func (s *PebbleMetaStore) writeIntentSlowPath(txnID uint64, intentType IntentTyp
 
 	return nil
 }
+
 
 // resolveIntentConflictPebble handles conflict with existing intent from different transaction.
 // Called after GC marker check - if GC marker exists, caller handles overwrite directly.
@@ -1432,12 +1200,9 @@ func (s *PebbleMetaStore) resolveIntentConflictPebble(batch *pebble.Batch, exist
 			tableName, intentKey, existingTxnID, txnID)
 	}
 
-	_ = batch.Delete(pebbleIntentByTxnKey(existingTxnID, tableName, intentKey), nil)
-
-	// Clean up filter for the overwritten transaction's intent
-	if s.intentFilter != nil {
-		tbHash := ComputeIntentHash(tableName, intentKey)
-		s.intentFilter.RemoveHash(existingTxnID, tbHash)
+	// Delete /intent_txn/ index for the overwritten transaction
+	if err := s.db.Delete(pebbleIntentByTxnKey(existingTxnID, tableName, intentKey), pebble.NoSync); err != nil {
+		return err
 	}
 
 	return nil
@@ -1445,66 +1210,24 @@ func (s *PebbleMetaStore) resolveIntentConflictPebble(batch *pebble.Batch, exist
 
 // ValidateIntent checks if the intent is still held by the expected transaction
 func (s *PebbleMetaStore) ValidateIntent(tableName, intentKey string, expectedTxnID uint64) (bool, error) {
-	val, closer, err := s.db.Get(pebbleIntentKey(tableName, intentKey))
-	if err == pebble.ErrNotFound {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	defer closer.Close()
-
-	var lock IntentLock
-	if err := encoding.Unmarshal(val, &lock); err != nil {
-		return false, err
-	}
-
-	return lock.TxnID == expectedTxnID, nil
+	holder, exists := s.rowLocks.CheckLock("", tableName, intentKey)
+	return exists && holder == expectedTxnID, nil
 }
 
 // DeleteIntent removes a specific write intent
 func (s *PebbleMetaStore) DeleteIntent(tableName, intentKey string, txnID uint64) error {
-	lockKey := pebbleIntentKey(tableName, intentKey)
-
 	// Verify the intent belongs to this transaction
-	val, closer, err := s.db.Get(lockKey)
-	if err == pebble.ErrNotFound {
-		return nil
+	holder, exists := s.rowLocks.CheckLock("", tableName, intentKey)
+	if !exists || holder != txnID {
+		return nil // Intent doesn't exist or belongs to different transaction
 	}
-	if err != nil {
+
+	// Release row lock
+	s.rowLocks.ReleaseLock("", tableName, intentKey)
+
+	// Delete /intent_txn/ index
+	if err := s.db.Delete(pebbleIntentByTxnKey(txnID, tableName, intentKey), pebble.NoSync); err != nil {
 		return err
-	}
-
-	var lock IntentLock
-	if err := encoding.Unmarshal(val, &lock); err != nil {
-		closer.Close()
-		return err
-	}
-	closer.Close()
-
-	if lock.TxnID != txnID {
-		return nil // Intent belongs to different transaction
-	}
-
-	batch := s.db.NewBatch()
-	defer batch.Close()
-
-	if err := batch.Delete(lockKey, nil); err != nil {
-		return err
-	}
-	if err := batch.Delete(pebbleIntentByTxnKey(txnID, tableName, intentKey), nil); err != nil {
-		return err
-	}
-
-	// NoSync: ResolveIntent is cleanup after commit. Idempotent.
-	if err := batch.Commit(pebble.NoSync); err != nil {
-		return err
-	}
-
-	// Sync intent filter after successful Pebble delete
-	if s.intentFilter != nil {
-		tbHash := ComputeIntentHash(tableName, intentKey)
-		s.intentFilter.RemoveHash(txnID, tbHash)
 	}
 
 	return nil
@@ -1514,11 +1237,11 @@ func (s *PebbleMetaStore) DeleteIntent(tableName, intentKey string, txnID uint64
 func (s *PebbleMetaStore) DeleteIntentsByTxn(txnID uint64) error {
 	prefix := pebbleIntentByTxnPrefix(txnID)
 
-	// Collect keys to delete
-	var primaryKeys [][]byte
+	// Release all row locks for this transaction
+	s.rowLocks.ReleaseByTxn(txnID)
+
+	// Collect /intent_txn/ index keys to delete
 	var indexKeys [][]byte
-	var tableNames []string
-	var intentKeys []string
 
 	iter, err := s.db.NewIter(&pebble.IterOptions{
 		LowerBound: prefix,
@@ -1532,47 +1255,26 @@ func (s *PebbleMetaStore) DeleteIntentsByTxn(txnID uint64) error {
 		indexKey := make([]byte, len(iter.Key()))
 		copy(indexKey, iter.Key())
 		indexKeys = append(indexKeys, indexKey)
-
-		// Parse table/intentKey from index key using length-prefixed format
-		tableName, intentKey, ok := parseIntentByTxnKey(indexKey, len(prefix))
-		if ok {
-			primaryKeys = append(primaryKeys, pebbleIntentKey(tableName, intentKey))
-			tableNames = append(tableNames, tableName)
-			intentKeys = append(intentKeys, intentKey)
-		}
 	}
 	if err := iter.Close(); err != nil {
 		return err
 	}
 
-	if len(primaryKeys) == 0 {
+	if len(indexKeys) == 0 {
 		return nil
 	}
 
 	batch := s.db.NewBatch()
 	defer batch.Close()
 
-	for _, key := range primaryKeys {
-		_ = batch.Delete(key, nil)
-	}
 	for _, key := range indexKeys {
 		_ = batch.Delete(key, nil)
-	}
-	// Delete GC markers
-	for i := 0; i < len(tableNames); i++ {
-		gcKey := pebbleGCIntentKey(tableNames[i], intentKeys[i])
-		_ = batch.Delete(gcKey, nil)
 	}
 
 	// NoSync: Intent cleanup is idempotent. If crash occurs, intents remain
 	// (transaction is already committed) and will be cleaned up on next GC.
 	if err := batch.Commit(pebble.NoSync); err != nil {
 		return err
-	}
-
-	// Sync intent filter after successful Pebble delete
-	if s.intentFilter != nil {
-		s.intentFilter.Remove(txnID)
 	}
 
 	return nil
@@ -1591,56 +1293,37 @@ func (s *PebbleMetaStore) MarkIntentsForCleanup(txnID uint64) error {
 	}
 	defer iter.Close()
 
-	batch := s.db.NewBatch()
-	defer batch.Close()
-
-	count := 0
 	for iter.SeekGE(prefix); iter.Valid(); iter.Next() {
 		tableName, intentKey, ok := parseIntentByTxnKey(iter.Key(), len(prefix))
 		if !ok {
 			continue
 		}
-		// Write GC marker (empty value = presence key)
-		gcKey := pebbleGCIntentKey(tableName, intentKey)
-		if err := batch.Set(gcKey, nil, nil); err != nil {
-			return err
-		}
-		count++
+		// Set GC marker in RowLockStore
+		s.rowLocks.SetGCMarker("", tableName, intentKey)
 	}
 
-	if err := iter.Error(); err != nil {
-		return err
-	}
-
-	if count == 0 {
-		return nil
-	}
-
-	// NoSync: Cleanup marking is idempotent. If crash occurs, intents remain
-	// and will be cleaned up on next GC cycle.
-	return batch.Commit(pebble.NoSync)
+	return iter.Error()
 }
 
 // CleanupAfterCommit performs all cleanup operations for a committed transaction.
-// Phase 1: Writes GC markers (must commit first for safety - other txns check these)
+// Phase 1: Marks intents with GC markers (other txns can overwrite)
 // Phase 2: Deletes all intents and CDC entries in a single batch
 // This consolidates MarkIntentsForCleanup + DeleteIntentsByTxn + DeleteIntentEntries
 func (s *PebbleMetaStore) CleanupAfterCommit(txnID uint64) error {
-	// Phase 1: Write GC markers first (MUST be visible before deletions)
+	// Phase 1: Mark intents for cleanup in RowLockStore
 	// Other transactions check GC markers to know if they can overwrite an intent.
-	// If we delete the intent before the GC marker is visible, we have a race condition.
 	if err := s.MarkIntentsForCleanup(txnID); err != nil {
 		return err
 	}
 
-	// Phase 2: Single batch for ALL deletions
+	// Phase 2: Release row locks and delete Pebble data
 	prefix := pebbleIntentByTxnPrefix(txnID)
 
-	// Collect intent data for filter removal and GC key deletion
-	var primaryKeys [][]byte
+	// Release all row locks for this transaction
+	s.rowLocks.ReleaseByTxn(txnID)
+
+	// Collect /intent_txn/ index keys to delete
 	var indexKeys [][]byte
-	var tableNames []string
-	var intentKeys []string
 
 	iter, err := s.db.NewIter(&pebble.IterOptions{
 		LowerBound: prefix,
@@ -1654,13 +1337,6 @@ func (s *PebbleMetaStore) CleanupAfterCommit(txnID uint64) error {
 		indexKey := make([]byte, len(iter.Key()))
 		copy(indexKey, iter.Key())
 		indexKeys = append(indexKeys, indexKey)
-
-		tableName, intentKey, ok := parseIntentByTxnKey(indexKey, len(prefix))
-		if ok {
-			primaryKeys = append(primaryKeys, pebbleIntentKey(tableName, intentKey))
-			tableNames = append(tableNames, tableName)
-			intentKeys = append(intentKeys, intentKey)
-		}
 	}
 
 	if err := iter.Close(); err != nil {
@@ -1690,7 +1366,7 @@ func (s *PebbleMetaStore) CleanupAfterCommit(txnID uint64) error {
 	}
 
 	// Early return if nothing to delete
-	if len(primaryKeys) == 0 && len(cdcKeys) == 0 {
+	if len(indexKeys) == 0 && len(cdcKeys) == 0 {
 		return nil
 	}
 
@@ -1698,20 +1374,9 @@ func (s *PebbleMetaStore) CleanupAfterCommit(txnID uint64) error {
 	batch := s.db.NewBatch()
 	defer batch.Close()
 
-	// Delete primary intent keys
-	for _, key := range primaryKeys {
-		_ = batch.Delete(key, nil)
-	}
-
 	// Delete intent index keys
 	for _, key := range indexKeys {
 		_ = batch.Delete(key, nil)
-	}
-
-	// Delete GC markers
-	for i := 0; i < len(tableNames); i++ {
-		gcKey := pebbleGCIntentKey(tableNames[i], intentKeys[i])
-		_ = batch.Delete(gcKey, nil)
 	}
 
 	// Delete CDC entries
@@ -1723,11 +1388,6 @@ func (s *PebbleMetaStore) CleanupAfterCommit(txnID uint64) error {
 	// (transaction is already committed) and will be cleaned up on next GC.
 	if err := batch.Commit(pebble.NoSync); err != nil {
 		return err
-	}
-
-	// Sync intent filter after successful Pebble delete
-	if s.intentFilter != nil {
-		s.intentFilter.Remove(txnID)
 	}
 
 	return nil
@@ -1765,24 +1425,14 @@ func (s *PebbleMetaStore) GetIntentsByTxn(txnID uint64) ([]*WriteIntentRecord, e
 
 // GetIntent retrieves a specific write intent (two-step lookup for admin API)
 func (s *PebbleMetaStore) GetIntent(tableName, intentKey string) (*WriteIntentRecord, error) {
-	// Step 1: Get lock to find TxnID
-	lockVal, lockCloser, err := s.db.Get(pebbleIntentKey(tableName, intentKey))
-	if err == pebble.ErrNotFound {
+	// Step 1: Check RowLockStore to find TxnID
+	txnID, exists := s.rowLocks.CheckLock("", tableName, intentKey)
+	if !exists {
 		return nil, nil
 	}
-	if err != nil {
-		return nil, err
-	}
-
-	var lock IntentLock
-	if err := encoding.Unmarshal(lockVal, &lock); err != nil {
-		lockCloser.Close()
-		return nil, err
-	}
-	lockCloser.Close()
 
 	// Step 2: Get full record from /intent_by_txn/
-	recVal, recCloser, err := s.db.Get(pebbleIntentByTxnKey(lock.TxnID, tableName, intentKey))
+	recVal, recCloser, err := s.db.Get(pebbleIntentByTxnKey(txnID, tableName, intentKey))
 	if err == pebble.ErrNotFound {
 		return nil, nil
 	}
@@ -2463,78 +2113,13 @@ func (s *PebbleMetaStore) CleanupStaleTransactions(timeout time.Duration) (int, 
 		cleaned++
 	}
 
-	// Phase 2: Clean orphaned intents
-	type orphanedIntent struct {
-		key       []byte
-		txnID     uint64
-		table     string
-		intentKey string
-	}
-	var orphanedIntents []orphanedIntent
-	intentPrefix := []byte(pebblePrefixIntent)
-
-	iter, err = s.db.NewIter(&pebble.IterOptions{
-		LowerBound: intentPrefix,
-		UpperBound: prefixUpperBound(intentPrefix),
-	})
-	if err != nil {
-		return cleaned, err
-	}
-
-	for iter.SeekGE(intentPrefix); iter.Valid(); iter.Next() {
-		val, err := iter.ValueAndErr()
-		if err != nil {
-			continue
-		}
-
-		var rec WriteIntentRecord
-		if err := encoding.Unmarshal(val, &rec); err != nil {
-			continue
-		}
-
-		// Check if intent is old enough
-		if rec.CreatedAt >= cutoff {
-			continue
-		}
-
-		// Check if transaction exists
-		txnRec, _ := s.GetTransaction(rec.TxnID)
-		if txnRec == nil {
-			key := make([]byte, len(iter.Key()))
-			copy(key, iter.Key())
-			orphanedIntents = append(orphanedIntents, orphanedIntent{
-				key:       key,
-				txnID:     rec.TxnID,
-				table:     rec.TableName,
-				intentKey: string(rec.IntentKey),
-			})
-		}
-	}
-	if err := iter.Close(); err != nil {
-		return cleaned, err
-	}
-
-	// Delete orphaned intents and clean up IntentFilter
-	if len(orphanedIntents) > 0 {
-		batch := s.db.NewBatch()
-		for _, orphan := range orphanedIntents {
-			_ = batch.Delete(orphan.key, nil)
-			// Remove from IntentFilter to prevent false positives
-			if s.intentFilter != nil {
-				tbHash := ComputeIntentHash(orphan.table, orphan.intentKey)
-				s.intentFilter.RemoveHash(orphan.txnID, tbHash)
-			}
-			cleaned++
-		}
-		_ = batch.Commit(pebble.NoSync)
-		batch.Close()
-	}
+	// Phase 2: No orphaned intent cleanup needed - RowLockStore is ephemeral
+	// ReleaseByTxn in Phase 1 already cleaned up in-memory locks
 
 	if cleaned > 0 {
 		log.Info().
 			Int("stale_txns", len(staleTxnIDs)).
-			Int("orphaned_intents", len(orphanedIntents)).
-			Msg("MetaStore GC: Cleaned up stale transactions and orphaned intents")
+			Msg("MetaStore GC: Cleaned up stale transactions")
 	}
 
 	return cleaned, nil

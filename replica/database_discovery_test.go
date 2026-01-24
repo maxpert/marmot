@@ -106,6 +106,14 @@ func (m *mockMarmotServiceClient) GetClusterNodes(ctx context.Context, req *marm
 	return args.Get(0).(*marmotgrpc.GetClusterNodesResponse), args.Error(1)
 }
 
+func (m *mockMarmotServiceClient) TransactionStream(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[marmotgrpc.TransactionStreamMessage, marmotgrpc.TransactionResponse], error) {
+	args := m.Called(ctx, opts)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(grpc.ClientStreamingClient[marmotgrpc.TransactionStreamMessage, marmotgrpc.TransactionResponse]), args.Error(1)
+}
+
 // TestDiscoverNewDatabases_DetectsNewDatabase tests that discovery loop detects new databases
 func TestDiscoverNewDatabases_DetectsNewDatabase(t *testing.T) {
 	dbMgr, clock, _, cleanup := setupStreamClientTest(t)

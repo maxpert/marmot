@@ -4,38 +4,9 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
-	"strings"
 
 	"github.com/maxpert/marmot/db"
 )
-
-// handleTransactions handles transaction-related endpoints
-func (h *AdminHandlers) handleTransactions(w http.ResponseWriter, r *http.Request, database, path string) {
-	metaStore, err := h.getMetaStore(database)
-	if err != nil {
-		writeErrorResponse(w, http.StatusNotFound, err.Error())
-		return
-	}
-
-	// Parse path: transactions/{action} - path comes in as "transactions/pending" etc.
-	action := strings.TrimPrefix(path, "transactions/")
-
-	switch action {
-	case "pending":
-		h.handlePendingTransactions(w, r, metaStore)
-	case "committed":
-		h.handleCommittedTransactions(w, r, metaStore)
-	case "range":
-		h.handleTransactionRange(w, r, metaStore)
-	default:
-		// Check if it's a specific transaction ID
-		if txnID, err := parseTxnID(action); err == nil {
-			h.handleTransaction(w, r, metaStore, txnID)
-		} else {
-			writeErrorResponse(w, http.StatusNotFound, "not found")
-		}
-	}
-}
 
 // handleTransaction returns a specific transaction by ID
 func (h *AdminHandlers) handleTransaction(w http.ResponseWriter, r *http.Request, metaStore db.MetaStore, txnID uint64) {

@@ -81,8 +81,9 @@ func TestHandler_RejectInsert(t *testing.T) {
 	defer cleanup()
 
 	session := &protocol.ConnectionSession{
-		ConnID:          1,
-		CurrentDatabase: "testdb",
+		ConnID:               1,
+		CurrentDatabase:      "testdb",
+		TranspilationEnabled: true,
 	}
 
 	_, err := handler.HandleQuery(session, "INSERT INTO users (name, email) VALUES ('Bob', 'bob@test.com')", nil)
@@ -106,8 +107,9 @@ func TestHandler_RejectUpdate(t *testing.T) {
 	defer cleanup()
 
 	session := &protocol.ConnectionSession{
-		ConnID:          1,
-		CurrentDatabase: "testdb",
+		ConnID:               1,
+		CurrentDatabase:      "testdb",
+		TranspilationEnabled: true,
 	}
 
 	_, err := handler.HandleQuery(session, "UPDATE users SET name = 'Updated' WHERE id = 1", nil)
@@ -131,8 +133,9 @@ func TestHandler_RejectDelete(t *testing.T) {
 	defer cleanup()
 
 	session := &protocol.ConnectionSession{
-		ConnID:          1,
-		CurrentDatabase: "testdb",
+		ConnID:               1,
+		CurrentDatabase:      "testdb",
+		TranspilationEnabled: true,
 	}
 
 	_, err := handler.HandleQuery(session, "DELETE FROM users WHERE id = 1", nil)
@@ -156,8 +159,9 @@ func TestHandler_RejectDDL(t *testing.T) {
 	defer cleanup()
 
 	session := &protocol.ConnectionSession{
-		ConnID:          1,
-		CurrentDatabase: "testdb",
+		ConnID:               1,
+		CurrentDatabase:      "testdb",
+		TranspilationEnabled: true,
 	}
 
 	ddlStatements := []string{
@@ -192,8 +196,9 @@ func TestHandler_AllowSelect(t *testing.T) {
 	defer cleanup()
 
 	session := &protocol.ConnectionSession{
-		ConnID:          1,
-		CurrentDatabase: "testdb",
+		ConnID:               1,
+		CurrentDatabase:      "testdb",
+		TranspilationEnabled: true,
 	}
 
 	result, err := handler.HandleQuery(session, "SELECT * FROM users WHERE id = 1", nil)
@@ -216,8 +221,9 @@ func TestHandler_AllowSelectCount(t *testing.T) {
 	defer cleanup()
 
 	session := &protocol.ConnectionSession{
-		ConnID:          1,
-		CurrentDatabase: "testdb",
+		ConnID:               1,
+		CurrentDatabase:      "testdb",
+		TranspilationEnabled: true,
 	}
 
 	result, err := handler.HandleQuery(session, "SELECT COUNT(*) FROM users", nil)
@@ -240,8 +246,9 @@ func TestHandler_AllowBegin(t *testing.T) {
 	defer cleanup()
 
 	session := &protocol.ConnectionSession{
-		ConnID:          1,
-		CurrentDatabase: "testdb",
+		ConnID:               1,
+		CurrentDatabase:      "testdb",
+		TranspilationEnabled: true,
 	}
 
 	_, err := handler.HandleQuery(session, "BEGIN", nil)
@@ -256,8 +263,9 @@ func TestHandler_AllowCommit(t *testing.T) {
 	defer cleanup()
 
 	session := &protocol.ConnectionSession{
-		ConnID:          1,
-		CurrentDatabase: "testdb",
+		ConnID:               1,
+		CurrentDatabase:      "testdb",
+		TranspilationEnabled: true,
 	}
 
 	_, err := handler.HandleQuery(session, "COMMIT", nil)
@@ -272,8 +280,9 @@ func TestHandler_AllowRollback(t *testing.T) {
 	defer cleanup()
 
 	session := &protocol.ConnectionSession{
-		ConnID:          1,
-		CurrentDatabase: "testdb",
+		ConnID:               1,
+		CurrentDatabase:      "testdb",
+		TranspilationEnabled: true,
 	}
 
 	_, err := handler.HandleQuery(session, "ROLLBACK", nil)
@@ -288,7 +297,8 @@ func TestHandler_ShowDatabases(t *testing.T) {
 	defer cleanup()
 
 	session := &protocol.ConnectionSession{
-		ConnID: 1,
+		ConnID:               1,
+		TranspilationEnabled: true,
 	}
 
 	result, err := handler.HandleQuery(session, "SHOW DATABASES", nil)
@@ -312,8 +322,9 @@ func TestHandler_ShowTables(t *testing.T) {
 	defer cleanup()
 
 	session := &protocol.ConnectionSession{
-		ConnID:          1,
-		CurrentDatabase: "testdb",
+		ConnID:               1,
+		CurrentDatabase:      "testdb",
+		TranspilationEnabled: true,
 	}
 
 	result, err := handler.HandleQuery(session, "SHOW TABLES", nil)
@@ -344,8 +355,9 @@ func TestHandler_UseDatabase(t *testing.T) {
 	defer cleanup()
 
 	session := &protocol.ConnectionSession{
-		ConnID:          1,
-		CurrentDatabase: "",
+		ConnID:               1,
+		CurrentDatabase:      "",
+		TranspilationEnabled: true,
 	}
 
 	_, err := handler.HandleQuery(session, "USE testdb", nil)
@@ -364,8 +376,9 @@ func TestHandler_UseDatabase_NonExistent(t *testing.T) {
 	defer cleanup()
 
 	session := &protocol.ConnectionSession{
-		ConnID:          1,
-		CurrentDatabase: "",
+		ConnID:               1,
+		CurrentDatabase:      "",
+		TranspilationEnabled: true,
 	}
 
 	_, err := handler.HandleQuery(session, "USE nonexistent", nil)
@@ -380,8 +393,9 @@ func TestHandler_SystemVariables_ReadOnly(t *testing.T) {
 	defer cleanup()
 
 	session := &protocol.ConnectionSession{
-		ConnID:          1,
-		CurrentDatabase: "testdb",
+		ConnID:               1,
+		CurrentDatabase:      "testdb",
+		TranspilationEnabled: true,
 	}
 
 	tests := []struct {
@@ -418,8 +432,9 @@ func TestHandler_SystemVariables_Version(t *testing.T) {
 	defer cleanup()
 
 	session := &protocol.ConnectionSession{
-		ConnID:          1,
-		CurrentDatabase: "testdb",
+		ConnID:               1,
+		CurrentDatabase:      "testdb",
+		TranspilationEnabled: true,
 	}
 
 	result, err := handler.HandleQuery(session, "SELECT @@VERSION", nil)
@@ -443,8 +458,9 @@ func TestHandler_ShowColumns(t *testing.T) {
 	defer cleanup()
 
 	session := &protocol.ConnectionSession{
-		ConnID:          1,
-		CurrentDatabase: "testdb",
+		ConnID:               1,
+		CurrentDatabase:      "testdb",
+		TranspilationEnabled: true,
 	}
 
 	result, err := handler.HandleQuery(session, "SHOW COLUMNS FROM users", nil)
@@ -468,8 +484,9 @@ func TestHandler_Set_NoOp(t *testing.T) {
 	defer cleanup()
 
 	session := &protocol.ConnectionSession{
-		ConnID:          1,
-		CurrentDatabase: "testdb",
+		ConnID:               1,
+		CurrentDatabase:      "testdb",
+		TranspilationEnabled: true,
 	}
 
 	_, err := handler.HandleQuery(session, "SET autocommit = 1", nil)
@@ -484,8 +501,9 @@ func TestHandler_NoDatabaseSelected(t *testing.T) {
 	defer cleanup()
 
 	session := &protocol.ConnectionSession{
-		ConnID:          1,
-		CurrentDatabase: "", // No database selected
+		ConnID:               1,
+		CurrentDatabase:      "", // No database selected
+		TranspilationEnabled: true,
 	}
 
 	_, err := handler.HandleQuery(session, "SELECT * FROM users", nil)
@@ -545,8 +563,9 @@ func BenchmarkHandler_Select(b *testing.B) {
 
 	handler := NewReadOnlyHandler(dbMgr, clock, nil)
 	session := &protocol.ConnectionSession{
-		ConnID:          1,
-		CurrentDatabase: "testdb",
+		ConnID:               1,
+		CurrentDatabase:      "testdb",
+		TranspilationEnabled: true,
 	}
 
 	b.ResetTimer()
@@ -573,8 +592,9 @@ func BenchmarkHandler_RejectMutation(b *testing.B) {
 	dbMgr.CreateDatabase("testdb")
 	handler := NewReadOnlyHandler(dbMgr, clock, nil)
 	session := &protocol.ConnectionSession{
-		ConnID:          1,
-		CurrentDatabase: "testdb",
+		ConnID:               1,
+		CurrentDatabase:      "testdb",
+		TranspilationEnabled: true,
 	}
 
 	b.ResetTimer()

@@ -2,41 +2,10 @@ package admin
 
 import (
 	"net/http"
-	"strings"
 
 	"github.com/maxpert/marmot/db"
 	"github.com/maxpert/marmot/protocol/filter"
 )
-
-// handleCDC handles CDC-related endpoints
-func (h *AdminHandlers) handleCDC(w http.ResponseWriter, r *http.Request, database, path string) {
-	metaStore, err := h.getMetaStore(database)
-	if err != nil {
-		writeErrorResponse(w, http.StatusNotFound, err.Error())
-		return
-	}
-
-	// Parse path: cdc/{action}
-	pathParts := strings.SplitN(path, "/", 2)
-	if len(pathParts) == 0 {
-		writeErrorResponse(w, http.StatusNotFound, "not found")
-		return
-	}
-
-	action := pathParts[0]
-
-	switch action {
-	case "range":
-		h.handleCDCRange(w, r, metaStore)
-	default:
-		// Check if it's a specific transaction ID
-		if txnID, err := parseTxnID(action); err == nil {
-			h.handleCDCByTxn(w, r, metaStore, txnID)
-		} else {
-			writeErrorResponse(w, http.StatusNotFound, "not found")
-		}
-	}
-}
 
 // handleCDCByTxn returns all CDC entries for a transaction
 func (h *AdminHandlers) handleCDCByTxn(w http.ResponseWriter, r *http.Request, metaStore db.MetaStore, txnID uint64) {

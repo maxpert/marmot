@@ -53,7 +53,6 @@ type MetaStore interface {
 	MarkIntentsForCleanup(txnID uint64) error // Fast path: mark intents as ready for overwrite
 	GetIntentsByTxn(txnID uint64) ([]*WriteIntentRecord, error)
 	GetIntent(tableName, intentKey string) (*WriteIntentRecord, error)
-	GetIntentFilter() *IntentFilter // Cuckoo filter for fast-path conflict detection
 
 	// Replication state
 	GetReplicationState(peerNodeID uint64, dbName string) (*ReplicationStateRecord, error)

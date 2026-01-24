@@ -211,10 +211,6 @@ func (m *MemoryMetaStore) GetIntent(tableName, intentKey string) (*WriteIntentRe
 	return m.pebble.GetIntent(tableName, intentKey)
 }
 
-// GetIntentFilter delegates to Pebble.
-func (m *MemoryMetaStore) GetIntentFilter() *IntentFilter {
-	return m.pebble.GetIntentFilter()
-}
 
 // GetReplicationState delegates to Pebble.
 func (m *MemoryMetaStore) GetReplicationState(peerNodeID uint64, dbName string) (*ReplicationStateRecord, error) {

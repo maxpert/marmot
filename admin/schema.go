@@ -2,36 +2,9 @@ package admin
 
 import (
 	"net/http"
-	"strings"
 
 	"github.com/maxpert/marmot/db"
 )
-
-// handleSchema handles schema-related endpoints
-func (h *AdminHandlers) handleSchema(w http.ResponseWriter, r *http.Request, database, path string) {
-	metaStore, err := h.getMetaStore(database)
-	if err != nil {
-		writeErrorResponse(w, http.StatusNotFound, err.Error())
-		return
-	}
-
-	// Parse path: schema/{action}
-	pathParts := strings.SplitN(path, "/", 2)
-	if len(pathParts) == 0 {
-		writeErrorResponse(w, http.StatusNotFound, "not found")
-		return
-	}
-
-	action := pathParts[0]
-
-	switch action {
-	case "all":
-		h.handleSchemaAll(w, r, metaStore)
-	default:
-		// Handle specific database schema
-		h.handleSchemaDatabase(w, r, metaStore, database)
-	}
-}
 
 // handleSchemaDatabase returns schema version for current database
 func (h *AdminHandlers) handleSchemaDatabase(w http.ResponseWriter, r *http.Request, metaStore db.MetaStore, database string) {

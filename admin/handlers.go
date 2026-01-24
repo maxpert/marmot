@@ -117,86 +117,6 @@ func parseFrom(r *http.Request) string {
 	return r.URL.Query().Get("from")
 }
 
-// parseTo parses to parameter for range queries
-func parseTo(r *http.Request) string {
-	return r.URL.Query().Get("to")
-}
-
-// parseStatus parses status parameter
-func parseStatus(r *http.Request) string {
-	return r.URL.Query().Get("status")
-}
-
-// parseTable parses table parameter
-func parseTable(r *http.Request) string {
-	return r.URL.Query().Get("table")
-}
-
-// parseRowPrefix parses row_prefix parameter
-func parseRowPrefix(r *http.Request) string {
-	return r.URL.Query().Get("row_prefix")
-}
-
-// parseFromTS parses from_ts parameter as nanoseconds
-func parseFromTS(r *http.Request) (int64, error) {
-	tsStr := r.URL.Query().Get("from_ts")
-	if tsStr == "" {
-		return 0, nil
-	}
-
-	ts, err := strconv.ParseInt(tsStr, 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("invalid from_ts parameter: %w", err)
-	}
-
-	return ts, nil
-}
-
-// parseToTS parses to_ts parameter as nanoseconds
-func parseToTS(r *http.Request) (int64, error) {
-	tsStr := r.URL.Query().Get("to_ts")
-	if tsStr == "" {
-		return 0, nil
-	}
-
-	ts, err := strconv.ParseInt(tsStr, 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("invalid to_ts parameter: %w", err)
-	}
-
-	return ts, nil
-}
-
-// parseFromTxn parses from_txn parameter
-func parseFromTxn(r *http.Request) (uint64, error) {
-	txnStr := r.URL.Query().Get("from_txn")
-	if txnStr == "" {
-		return 0, nil
-	}
-
-	txn, err := strconv.ParseUint(txnStr, 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("invalid from_txn parameter: %w", err)
-	}
-
-	return txn, nil
-}
-
-// parseToTxn parses to_txn parameter
-func parseToTxn(r *http.Request) (uint64, error) {
-	txnStr := r.URL.Query().Get("to_txn")
-	if txnStr == "" {
-		return 0, nil
-	}
-
-	txn, err := strconv.ParseUint(txnStr, 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("invalid to_txn parameter: %w", err)
-	}
-
-	return txn, nil
-}
-
 // formatTimestamp converts nanoseconds to ISO 8601 string
 func formatTimestamp(nanos int64) string {
 	if nanos == 0 {
@@ -224,20 +144,6 @@ func encodeBase64Map(data map[string][]byte) map[string]string {
 		result[k] = encodeBase64(v)
 	}
 	return result
-}
-
-// parseTxnID parses transaction ID from hex string
-func parseTxnID(txnIDStr string) (uint64, error) {
-	if txnIDStr == "" {
-		return 0, fmt.Errorf("transaction ID is required")
-	}
-
-	txnID, err := strconv.ParseUint(txnIDStr, 16, 64)
-	if err != nil {
-		return 0, fmt.Errorf("invalid transaction ID: %w", err)
-	}
-
-	return txnID, nil
 }
 
 // parsePeerNodeID parses peer node ID

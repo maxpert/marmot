@@ -363,11 +363,6 @@ func TestMemoryMetaStore_DelegationMethods(t *testing.T) {
 	defer cleanup()
 
 	// Test that delegation methods work correctly
-	t.Run("GetIntentFilter", func(t *testing.T) {
-		filter := store.GetIntentFilter()
-		require.NotNil(t, filter)
-	})
-
 	t.Run("GetSchemaVersion", func(t *testing.T) {
 		version, err := store.GetSchemaVersion("testdb")
 		require.NoError(t, err)
