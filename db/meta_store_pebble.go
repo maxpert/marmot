@@ -297,49 +297,55 @@ const pebbleSeqBandwidth = 1000
 // Key helper functions - use binary encoding for uint64 (8 bytes vs 16 hex chars)
 // Big-endian preserves lexicographic sort order for range scans
 
-func pebbleTxnKey(txnID uint64) []byte {
-	key := make([]byte, len(pebblePrefixTxn)+8)
-	copy(key, pebblePrefixTxn)
-	binary.BigEndian.PutUint64(key[len(pebblePrefixTxn):], txnID)
+// buildKeyUint64 builds a key with prefix + single uint64 suffix
+func buildKeyUint64(prefix string, id uint64) []byte {
+	key := make([]byte, len(prefix)+8)
+	copy(key, prefix)
+	binary.BigEndian.PutUint64(key[len(prefix):], id)
 	return key
+}
+
+// buildKeyUint64x2 builds a key with prefix + two uint64 suffixes
+func buildKeyUint64x2(prefix string, id1, id2 uint64) []byte {
+	key := make([]byte, len(prefix)+16)
+	copy(key, prefix)
+	binary.BigEndian.PutUint64(key[len(prefix):], id1)
+	binary.BigEndian.PutUint64(key[len(prefix)+8:], id2)
+	return key
+}
+
+// buildKeyString builds a key with prefix + string suffix
+func buildKeyString(prefix, suffix string) []byte {
+	key := make([]byte, len(prefix)+len(suffix))
+	copy(key, prefix)
+	copy(key[len(prefix):], suffix)
+	return key
+}
+
+func pebbleTxnKey(txnID uint64) []byte {
+	return buildKeyUint64(pebblePrefixTxn, txnID)
 }
 
 func pebbleTxnPendingKey(txnID uint64) []byte {
-	key := make([]byte, len(pebblePrefixTxnPending)+8)
-	copy(key, pebblePrefixTxnPending)
-	binary.BigEndian.PutUint64(key[len(pebblePrefixTxnPending):], txnID)
-	return key
+	return buildKeyUint64(pebblePrefixTxnPending, txnID)
 }
 
 func pebbleTxnSeqKey(seqNum, txnID uint64) []byte {
-	key := make([]byte, len(pebblePrefixTxnSeq)+16)
-	copy(key, pebblePrefixTxnSeq)
-	binary.BigEndian.PutUint64(key[len(pebblePrefixTxnSeq):], seqNum)
-	binary.BigEndian.PutUint64(key[len(pebblePrefixTxnSeq)+8:], txnID)
-	return key
+	return buildKeyUint64x2(pebblePrefixTxnSeq, seqNum, txnID)
 }
 
 // pebbleTxnByIDKey creates the TxnID-ordered index key for streaming.
 // This is the primary index for ScanTransactions to ensure TxnID ordering.
 func pebbleTxnByIDKey(txnID uint64) []byte {
-	key := make([]byte, len(pebblePrefixTxnByID)+8)
-	copy(key, pebblePrefixTxnByID)
-	binary.BigEndian.PutUint64(key[len(pebblePrefixTxnByID):], txnID)
-	return key
+	return buildKeyUint64(pebblePrefixTxnByID, txnID)
 }
 
 func pebbleTxnCommitKey(txnID uint64) []byte {
-	key := make([]byte, len(pebblePrefixTxnCommit)+8)
-	copy(key, pebblePrefixTxnCommit)
-	binary.BigEndian.PutUint64(key[len(pebblePrefixTxnCommit):], txnID)
-	return key
+	return buildKeyUint64(pebblePrefixTxnCommit, txnID)
 }
 
 func pebbleTxnStatusKey(txnID uint64) []byte {
-	key := make([]byte, len(pebblePrefixTxnStatus)+8)
-	copy(key, pebblePrefixTxnStatus)
-	binary.BigEndian.PutUint64(key[len(pebblePrefixTxnStatus):], txnID)
-	return key
+	return buildKeyUint64(pebblePrefixTxnStatus, txnID)
 }
 
 // pebbleIntentByTxnKey uses 2-byte length prefix for tableName
@@ -356,10 +362,7 @@ func pebbleIntentByTxnKey(txnID uint64, tableName, intentKey string) []byte {
 }
 
 func pebbleIntentByTxnPrefix(txnID uint64) []byte {
-	key := make([]byte, len(pebblePrefixIntentByTxn)+8)
-	copy(key, pebblePrefixIntentByTxn)
-	binary.BigEndian.PutUint64(key[len(pebblePrefixIntentByTxn):], txnID)
-	return key
+	return buildKeyUint64(pebblePrefixIntentByTxn, txnID)
 }
 
 // parseIntentByTxnKey extracts tableName and intentKey from an intentByTxn index key
@@ -379,18 +382,11 @@ func parseIntentByTxnKey(key []byte, prefixLen int) (tableName, intentKey string
 }
 
 func pebbleCdcRawKey(txnID, seq uint64) []byte {
-	key := make([]byte, len(pebblePrefixCDCRaw)+16)
-	copy(key, pebblePrefixCDCRaw)
-	binary.BigEndian.PutUint64(key[len(pebblePrefixCDCRaw):], txnID)
-	binary.BigEndian.PutUint64(key[len(pebblePrefixCDCRaw)+8:], seq)
-	return key
+	return buildKeyUint64x2(pebblePrefixCDCRaw, txnID, seq)
 }
 
 func pebbleCdcRawPrefix(txnID uint64) []byte {
-	key := make([]byte, len(pebblePrefixCDCRaw)+8)
-	copy(key, pebblePrefixCDCRaw)
-	binary.BigEndian.PutUint64(key[len(pebblePrefixCDCRaw):], txnID)
-	return key
+	return buildKeyUint64(pebblePrefixCDCRaw, txnID)
 }
 
 func pebbleReplKey(peerNodeID uint64, dbName string) []byte {
@@ -404,24 +400,15 @@ func pebbleReplKey(peerNodeID uint64, dbName string) []byte {
 }
 
 func pebbleSchemaKey(dbName string) []byte {
-	key := make([]byte, len(pebblePrefixSchema)+len(dbName))
-	copy(key, pebblePrefixSchema)
-	copy(key[len(pebblePrefixSchema):], dbName)
-	return key
+	return buildKeyString(pebblePrefixSchema, dbName)
 }
 
 func pebbleDdlLockKey(dbName string) []byte {
-	key := make([]byte, len(pebblePrefixDDLLock)+len(dbName))
-	copy(key, pebblePrefixDDLLock)
-	copy(key[len(pebblePrefixDDLLock):], dbName)
-	return key
+	return buildKeyString(pebblePrefixDDLLock, dbName)
 }
 
 func pebbleSeqKey(nodeID uint64) []byte {
-	key := make([]byte, len(pebblePrefixSeq)+8)
-	copy(key, pebblePrefixSeq)
-	binary.BigEndian.PutUint64(key[len(pebblePrefixSeq):], nodeID)
-	return key
+	return buildKeyUint64(pebblePrefixSeq, nodeID)
 }
 
 // prefixUpperBound returns prefix + 0xFF... for range iteration

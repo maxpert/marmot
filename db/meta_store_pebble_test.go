@@ -4,6 +4,7 @@
 package db
 
 import (
+	"encoding/binary"
 	"os"
 	"path/filepath"
 	"testing"
@@ -528,4 +529,209 @@ func TestPebbleMetaStoreStreamCommittedTransactions(t *testing.T) {
 	if len(streamed) != 2 {
 		t.Errorf("Expected 2 streamed after txn[2], got %d", len(streamed))
 	}
+}
+
+func TestBuildKeyUint64(t *testing.T) {
+	prefix := "/test/"
+	id := uint64(12345)
+
+	key := buildKeyUint64(prefix, id)
+
+	// Verify length
+	expectedLen := len(prefix) + 8
+	if len(key) != expectedLen {
+		t.Errorf("Expected key length %d, got %d", expectedLen, len(key))
+	}
+
+	// Verify prefix
+	if string(key[:len(prefix)]) != prefix {
+		t.Errorf("Expected prefix '%s', got '%s'", prefix, string(key[:len(prefix)]))
+	}
+
+	// Verify uint64 encoding (big-endian)
+	decodedID := binary.BigEndian.Uint64(key[len(prefix):])
+	if decodedID != id {
+		t.Errorf("Expected decoded ID %d, got %d", id, decodedID)
+	}
+}
+
+func TestBuildKeyUint64x2(t *testing.T) {
+	prefix := "/test/"
+	id1 := uint64(111)
+	id2 := uint64(222)
+
+	key := buildKeyUint64x2(prefix, id1, id2)
+
+	// Verify length
+	expectedLen := len(prefix) + 16
+	if len(key) != expectedLen {
+		t.Errorf("Expected key length %d, got %d", expectedLen, len(key))
+	}
+
+	// Verify prefix
+	if string(key[:len(prefix)]) != prefix {
+		t.Errorf("Expected prefix '%s', got '%s'", prefix, string(key[:len(prefix)]))
+	}
+
+	// Verify first uint64
+	decoded1 := binary.BigEndian.Uint64(key[len(prefix):])
+	if decoded1 != id1 {
+		t.Errorf("Expected first ID %d, got %d", id1, decoded1)
+	}
+
+	// Verify second uint64
+	decoded2 := binary.BigEndian.Uint64(key[len(prefix)+8:])
+	if decoded2 != id2 {
+		t.Errorf("Expected second ID %d, got %d", id2, decoded2)
+	}
+}
+
+func TestBuildKeyString(t *testing.T) {
+	prefix := "/test/"
+	suffix := "mydb"
+
+	key := buildKeyString(prefix, suffix)
+
+	// Verify length
+	expectedLen := len(prefix) + len(suffix)
+	if len(key) != expectedLen {
+		t.Errorf("Expected key length %d, got %d", expectedLen, len(key))
+	}
+
+	// Verify full key
+	expected := prefix + suffix
+	if string(key) != expected {
+		t.Errorf("Expected key '%s', got '%s'", expected, string(key))
+	}
+}
+
+func TestPebbleKeyFunctionsProduceCorrectBytes(t *testing.T) {
+	// Test that all key-building functions produce expected byte sequences
+	tests := []struct {
+		name     string
+		fn       func() []byte
+		expected []byte
+	}{
+		{
+			name: "pebbleTxnKey",
+			fn:   func() []byte { return pebbleTxnKey(12345) },
+			expected: func() []byte {
+				b := make([]byte, len(pebblePrefixTxn)+8)
+				copy(b, pebblePrefixTxn)
+				binary.BigEndian.PutUint64(b[len(pebblePrefixTxn):], 12345)
+				return b
+			}(),
+		},
+		{
+			name: "pebbleTxnPendingKey",
+			fn:   func() []byte { return pebbleTxnPendingKey(67890) },
+			expected: func() []byte {
+				b := make([]byte, len(pebblePrefixTxnPending)+8)
+				copy(b, pebblePrefixTxnPending)
+				binary.BigEndian.PutUint64(b[len(pebblePrefixTxnPending):], 67890)
+				return b
+			}(),
+		},
+		{
+			name: "pebbleTxnSeqKey",
+			fn:   func() []byte { return pebbleTxnSeqKey(111, 222) },
+			expected: func() []byte {
+				b := make([]byte, len(pebblePrefixTxnSeq)+16)
+				copy(b, pebblePrefixTxnSeq)
+				binary.BigEndian.PutUint64(b[len(pebblePrefixTxnSeq):], 111)
+				binary.BigEndian.PutUint64(b[len(pebblePrefixTxnSeq)+8:], 222)
+				return b
+			}(),
+		},
+		{
+			name: "pebbleCdcRawKey",
+			fn:   func() []byte { return pebbleCdcRawKey(333, 444) },
+			expected: func() []byte {
+				b := make([]byte, len(pebblePrefixCDCRaw)+16)
+				copy(b, pebblePrefixCDCRaw)
+				binary.BigEndian.PutUint64(b[len(pebblePrefixCDCRaw):], 333)
+				binary.BigEndian.PutUint64(b[len(pebblePrefixCDCRaw)+8:], 444)
+				return b
+			}(),
+		},
+		{
+			name: "pebbleSchemaKey",
+			fn:   func() []byte { return pebbleSchemaKey("testdb") },
+			expected: func() []byte {
+				b := make([]byte, len(pebblePrefixSchema)+len("testdb"))
+				copy(b, pebblePrefixSchema)
+				copy(b[len(pebblePrefixSchema):], "testdb")
+				return b
+			}(),
+		},
+		{
+			name: "pebbleSeqKey",
+			fn:   func() []byte { return pebbleSeqKey(555) },
+			expected: func() []byte {
+				b := make([]byte, len(pebblePrefixSeq)+8)
+				copy(b, pebblePrefixSeq)
+				binary.BigEndian.PutUint64(b[len(pebblePrefixSeq):], 555)
+				return b
+			}(),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.fn()
+			if len(got) != len(tt.expected) {
+				t.Errorf("%s: length mismatch, expected %d, got %d", tt.name, len(tt.expected), len(got))
+			}
+			for i := range got {
+				if got[i] != tt.expected[i] {
+					t.Errorf("%s: byte mismatch at index %d, expected %d, got %d", tt.name, i, tt.expected[i], got[i])
+				}
+			}
+		})
+	}
+}
+
+func TestPebbleKeyEdgeCases(t *testing.T) {
+	// Test edge cases
+	t.Run("ZeroValues", func(t *testing.T) {
+		key := buildKeyUint64("/prefix/", 0)
+		decoded := binary.BigEndian.Uint64(key[len("/prefix/"):])
+		if decoded != 0 {
+			t.Errorf("Expected 0, got %d", decoded)
+		}
+	})
+
+	t.Run("MaxUint64", func(t *testing.T) {
+		maxID := ^uint64(0)
+		key := buildKeyUint64("/prefix/", maxID)
+		decoded := binary.BigEndian.Uint64(key[len("/prefix/"):])
+		if decoded != maxID {
+			t.Errorf("Expected max uint64 %d, got %d", maxID, decoded)
+		}
+	})
+
+	t.Run("EmptyString", func(t *testing.T) {
+		key := buildKeyString("/prefix/", "")
+		if len(key) != len("/prefix/") {
+			t.Errorf("Expected length %d, got %d", len("/prefix/"), len(key))
+		}
+		if string(key) != "/prefix/" {
+			t.Errorf("Expected '%s', got '%s'", "/prefix/", string(key))
+		}
+	})
+
+	t.Run("LexicographicOrdering", func(t *testing.T) {
+		// Big-endian preserves lexicographic ordering for range scans
+		key1 := buildKeyUint64("/prefix/", 100)
+		key2 := buildKeyUint64("/prefix/", 200)
+		key3 := buildKeyUint64("/prefix/", 300)
+
+		// Verify byte-level ordering
+		if string(key1) >= string(key2) {
+			t.Error("key1 should be < key2 in lexicographic order")
+		}
+		if string(key2) >= string(key3) {
+			t.Error("key2 should be < key3 in lexicographic order")
+		}
+	})
 }
