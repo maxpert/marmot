@@ -254,9 +254,7 @@ func (wc *WriteCoordinator) runPreparePhase(ctx context.Context, txn *Transactio
 
 	// Execute prepare phase on all nodes (including self) - single attempt, no retry
 	// All nodes now participate uniformly - no skipLocalReplication
-	prepStart := time.Now()
 	prepResponses, conflictErr := wc.executePreparePhase(ctx, txn, prepReq, otherNodes, false)
-	telemetry.TwoPhasePrepareSeconds.Observe(time.Since(prepStart).Seconds())
 	telemetry.TwoPhaseQuorumAcks.With("prepare").Observe(float64(len(prepResponses)))
 
 	if conflictErr != nil {
@@ -442,7 +440,6 @@ func (wc *WriteCoordinator) commitLocalAfterRemoteQuorum(ctx context.Context, re
 // This ensures if remote quorum fails, coordinator hasn't committed yet (clean abort).
 // After PREPARE ACK, commit MUST succeed (nodes promised they can commit).
 func (wc *WriteCoordinator) runCommitPhase(ctx context.Context, txn *Transaction, cluster *ClusterState, prepResponses map[uint64]*ReplicationResponse) error {
-	commitStart := time.Now()
 	log.Debug().
 		Uint64("txn_id", txn.ID).
 		Int("prepared_nodes", len(prepResponses)).
@@ -502,7 +499,6 @@ func (wc *WriteCoordinator) runCommitPhase(ctx context.Context, txn *Transaction
 	commitResponses[wc.nodeID] = localResp
 
 	totalCommitAcks := len(commitResponses)
-	telemetry.TwoPhaseCommitSeconds.Observe(time.Since(commitStart).Seconds())
 	telemetry.TwoPhaseQuorumAcks.With("commit").Observe(float64(totalCommitAcks))
 
 	log.Debug().

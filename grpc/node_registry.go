@@ -68,6 +68,11 @@ func NewNodeRegistry(localNodeID uint64, advertiseAddress string) *NodeRegistry 
 	}
 	nr.lastSeen[localNodeID] = now
 
+	// Initialize cluster metrics with self
+	nr.mu.Lock()
+	nr.updateClusterMetricsLocked()
+	nr.mu.Unlock()
+
 	log.Debug().
 		Uint64("node_id", localNodeID).
 		Str("timestamp", time.Now().Format("15:04:05.000")).
@@ -83,6 +88,7 @@ func (nr *NodeRegistry) Add(node *NodeState) {
 
 	nr.nodes[node.NodeId] = node
 	nr.lastSeen[node.NodeId] = time.Now()
+	nr.updateClusterMetricsLocked()
 }
 
 // Update updates a node's state using SWIM protocol rules
@@ -107,6 +113,7 @@ func (nr *NodeRegistry) Update(node *NodeState) {
 			Msg("REGISTRY: Adding NEW node")
 		nr.nodes[node.NodeId] = node
 		nr.lastSeen[node.NodeId] = time.Now()
+		nr.updateClusterMetricsLocked()
 		nr.mu.Unlock()
 		return
 	}
@@ -118,6 +125,7 @@ func (nr *NodeRegistry) Update(node *NodeState) {
 	becameAlive := false
 
 	// Rule 4: Apply SWIM state update rules
+	stateChanged := false
 	if node.Incarnation > existing.Incarnation {
 		// Higher incarnation always wins, EXCEPT:
 		// - REMOVED status is sticky (can only be cleared via admin API AllowRejoin)
@@ -143,20 +151,31 @@ func (nr *NodeRegistry) Update(node *NodeState) {
 			Msg("REGISTRY: Updating node (higher incarnation)")
 		nr.nodes[node.NodeId] = node
 
+		// Record state transition if status changed
+		if oldStatus != node.Status {
+			telemetry.NodeStateTransitionsTotal.With(oldStatus.String(), node.Status.String()).Inc()
+			stateChanged = true
+		}
+
 		// Check if node became ALIVE
 		if oldStatus != NodeStatus_ALIVE && node.Status == NodeStatus_ALIVE {
 			becameAlive = true
 		}
 	} else if node.Incarnation == existing.Incarnation && nr.shouldEscalate(existing.Status, node.Status) {
 		// Same incarnation: only allow escalation (ALIVE -> SUSPECT -> DEAD)
+		oldStatus := existing.Status
 		log.Debug().
 			Uint64("local_node", nr.localNodeID).
 			Uint64("update_node", node.NodeId).
-			Str("old_status", existing.Status.String()).
+			Str("old_status", oldStatus.String()).
 			Str("new_status", node.Status.String()).
 			Uint64("incarnation", node.Incarnation).
 			Msg("REGISTRY: Escalating node status (same incarnation)")
 		existing.Status = node.Status
+
+		// Record state transition
+		telemetry.NodeStateTransitionsTotal.With(oldStatus.String(), node.Status.String()).Inc()
+		stateChanged = true
 	} else {
 		log.Debug().
 			Uint64("local_node", nr.localNodeID).
@@ -168,6 +187,11 @@ func (nr *NodeRegistry) Update(node *NodeState) {
 			Msg("REGISTRY: Ignoring update (stale or invalid)")
 	}
 	// Ignore updates with same/older incarnation that don't escalate
+
+	// Update cluster metrics if state changed
+	if stateChanged {
+		nr.updateClusterMetricsLocked()
+	}
 
 	nr.mu.Unlock()
 
@@ -318,6 +342,7 @@ func (nr *NodeRegistry) Remove(nodeID uint64) {
 
 	delete(nr.nodes, nodeID)
 	delete(nr.lastSeen, nodeID)
+	nr.updateClusterMetricsLocked()
 
 	log.Info().Uint64("node_id", nodeID).Msg("Node removed from registry")
 }
@@ -328,6 +353,7 @@ func (nr *NodeRegistry) CheckTimeouts(suspectTimeout, deadTimeout time.Duration)
 
 	now := time.Now()
 	var deadNodes []*NodeState // Track nodes that became DEAD for cleanup callback
+	stateChanged := false
 
 	for nodeID, node := range nr.nodes {
 		if nodeID == nr.localNodeID {
@@ -339,16 +365,25 @@ func (nr *NodeRegistry) CheckTimeouts(suspectTimeout, deadTimeout time.Duration)
 		switch node.Status {
 		case NodeStatus_ALIVE:
 			if elapsed > suspectTimeout {
+				telemetry.NodeStateTransitionsTotal.With(NodeStatus_ALIVE.String(), NodeStatus_SUSPECT.String()).Inc()
 				node.Status = NodeStatus_SUSPECT
+				stateChanged = true
 				log.Warn().Uint64("node_id", nodeID).Msg("Node marked SUSPECT")
 			}
 		case NodeStatus_SUSPECT:
 			if elapsed > deadTimeout {
+				telemetry.NodeStateTransitionsTotal.With(NodeStatus_SUSPECT.String(), NodeStatus_DEAD.String()).Inc()
 				node.Status = NodeStatus_DEAD
+				stateChanged = true
 				log.Error().Uint64("node_id", nodeID).Msg("Node marked DEAD")
 				deadNodes = append(deadNodes, copyNodeState(node))
 			}
 		}
+	}
+
+	// Update cluster metrics if state changed
+	if stateChanged {
+		nr.updateClusterMetricsLocked()
 	}
 
 	nr.mu.Unlock()
@@ -421,7 +456,15 @@ func (nr *NodeRegistry) MarkJoining(nodeID uint64) {
 	defer nr.mu.Unlock()
 
 	if node, exists := nr.nodes[nodeID]; exists {
+		oldStatus := node.Status
 		node.Status = NodeStatus_JOINING
+
+		// Record state transition if status changed
+		if oldStatus != NodeStatus_JOINING {
+			telemetry.NodeStateTransitionsTotal.With(oldStatus.String(), NodeStatus_JOINING.String()).Inc()
+			nr.updateClusterMetricsLocked()
+		}
+
 		log.Info().Uint64("node_id", nodeID).Msg("Node marked as joining (catching up)")
 	}
 }
@@ -432,9 +475,16 @@ func (nr *NodeRegistry) MarkAlive(nodeID uint64) {
 	defer nr.mu.Unlock()
 
 	if node, exists := nr.nodes[nodeID]; exists {
+		oldStatus := node.Status
 		node.Status = NodeStatus_ALIVE
 		node.Incarnation++ // Increment to propagate state change via gossip
 		nr.lastSeen[nodeID] = time.Now()
+
+		// Record state transition if status changed
+		if oldStatus != NodeStatus_ALIVE {
+			telemetry.NodeStateTransitionsTotal.With(oldStatus.String(), NodeStatus_ALIVE.String()).Inc()
+			nr.updateClusterMetricsLocked()
+		}
 	}
 }
 
@@ -565,6 +615,10 @@ func (nr *NodeRegistry) MarkRemoved(nodeID uint64) error {
 	node.Status = NodeStatus_REMOVED
 	node.Incarnation++ // Increment to propagate via gossip
 
+	// Record state transition and update metrics
+	telemetry.NodeStateTransitionsTotal.With(oldStatus.String(), NodeStatus_REMOVED.String()).Inc()
+	nr.updateClusterMetricsLocked()
+
 	log.Info().
 		Uint64("node_id", nodeID).
 		Str("old_status", oldStatus.String()).
@@ -592,6 +646,10 @@ func (nr *NodeRegistry) AllowRejoin(nodeID uint64) error {
 	// When the node rejoins, it will transition through JOINING -> ALIVE
 	node.Status = NodeStatus_DEAD
 	node.Incarnation++ // Increment to propagate via gossip
+
+	// Record state transition and update metrics
+	telemetry.NodeStateTransitionsTotal.With(NodeStatus_REMOVED.String(), NodeStatus_DEAD.String()).Inc()
+	nr.updateClusterMetricsLocked()
 
 	log.Info().
 		Uint64("node_id", nodeID).

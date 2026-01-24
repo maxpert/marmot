@@ -328,3 +328,45 @@ func (s *RowLockStore) cleanupEmptyTxnMap(txnID uint64, txnMap *xsync.MapOf[stri
 		s.byTxn.Delete(txnID)
 	}
 }
+
+// Stats returns current statistics about the lock store.
+// Returns: (activeLocks, activeTransactions, gcMarkers, tablesWithLocks)
+func (s *RowLockStore) Stats() (activeLocks int, activeTransactions int, gcMarkers int, tablesWithLocks int) {
+	// Count active transactions (transactions holding locks)
+	s.byTxn.Range(func(_ uint64, txnMap *xsync.MapOf[string, struct{}]) bool {
+		hasLocks := false
+		txnMap.Range(func(_ string, _ struct{}) bool {
+			hasLocks = true
+			activeLocks++
+			return true
+		})
+		if hasLocks {
+			activeTransactions++
+		}
+		return true
+	})
+
+	// Count tables with locks
+	s.tables.Range(func(_ string, rowMap *xsync.MapOf[string, uint64]) bool {
+		hasEntries := false
+		rowMap.Range(func(_ string, _ uint64) bool {
+			hasEntries = true
+			return false // Just check if any exist
+		})
+		if hasEntries {
+			tablesWithLocks++
+		}
+		return true
+	})
+
+	// Count GC markers
+	s.gc.Range(func(_ string, gcMap *xsync.MapOf[string, struct{}]) bool {
+		gcMap.Range(func(_ string, _ struct{}) bool {
+			gcMarkers++
+			return true
+		})
+		return true
+	})
+
+	return activeLocks, activeTransactions, gcMarkers, tablesWithLocks
+}

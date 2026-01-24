@@ -428,6 +428,16 @@ func (m *MemoryMetaStore) Checkpoint() error {
 	return m.pebble.Checkpoint()
 }
 
+// GetRowLockStats returns row lock statistics (stub for memory store)
+func (m *MemoryMetaStore) GetRowLockStats() (activeLocks, activeTransactions, gcMarkers, tablesWithLocks int) {
+	return m.pebble.GetRowLockStats()
+}
+
+// IntentStats returns intent statistics (stub for memory store)
+func (m *MemoryMetaStore) IntentStats() (pendingIntents int, err error) {
+	return m.pebble.IntentStats()
+}
+
 // ReconstructFromPebble cleans up orphaned CDC data from crashed transactions.
 // Called at startup to ensure consistency.
 // Memory stores start empty - no pending transaction state survives crash.

@@ -1297,3 +1297,28 @@ func (dm *DatabaseManager) GetMaxSeqNum(database string) (uint64, error) {
 
 	return metaStore.GetMaxSeqNum()
 }
+
+// GetDatabaseStatsProvider returns a stats provider for the given database
+// Returns nil if database doesn't exist
+func (dm *DatabaseManager) GetDatabaseStatsProvider(name string) interface{} {
+	dm.mu.RLock()
+	defer dm.mu.RUnlock()
+
+	db, exists := dm.databases[name]
+	if !exists {
+		return nil
+	}
+	return db.GetMetaStore()
+}
+
+// ListDatabaseNames returns the names of all databases
+func (dm *DatabaseManager) ListDatabaseNames() []string {
+	dm.mu.RLock()
+	defer dm.mu.RUnlock()
+
+	names := make([]string, 0, len(dm.databases))
+	for name := range dm.databases {
+		names = append(names, name)
+	}
+	return names
+}

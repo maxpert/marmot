@@ -3,6 +3,7 @@ package grpc
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/maxpert/marmot/common"
 	"github.com/maxpert/marmot/db"
@@ -63,6 +64,11 @@ func (rh *ReplicationHandler) HandleReplicateTransaction(ctx context.Context, re
 
 // handlePrepare processes Phase 1 of 2PC: Create write intents
 func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *TransactionRequest) (*TransactionResponse, error) {
+	prepareStart := time.Now()
+	defer func() {
+		telemetry.ReplicaPrepareSeconds.Observe(time.Since(prepareStart).Seconds())
+	}()
+
 	// Schema version validation - MUST happen before engine call
 	if rh.schemaVersionMgr != nil && req.RequiredSchemaVersion > 0 {
 		dbName := req.Database
@@ -133,12 +139,19 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 			NodeId:   rh.nodeID,
 		}
 		telemetry.ReplicationRequestsTotal.With("prepare", "success").Inc()
+	} else {
+		telemetry.ReplicationRequestsTotal.With("prepare", "failed").Inc()
 	}
 	return resp, nil
 }
 
 // handleCommit processes Phase 2 of 2PC: Commit transaction
 func (rh *ReplicationHandler) handleCommit(ctx context.Context, req *TransactionRequest) (*TransactionResponse, error) {
+	commitStart := time.Now()
+	defer func() {
+		telemetry.ReplicaCommitSeconds.Observe(time.Since(commitStart).Seconds())
+	}()
+
 	// Convert proto statements to internal format (CDC data deferred from PREPARE)
 	statements := make([]protocol.Statement, 0, len(req.Statements))
 	for _, stmt := range req.Statements {
@@ -211,6 +224,11 @@ func (rh *ReplicationHandler) handleAbort(ctx context.Context, req *TransactionR
 // This bypasses 2PC state tracking since these transactions are already committed on the source.
 // Used by delta sync to repair divergent nodes without requiring PREPARE phase.
 func (rh *ReplicationHandler) handleReplay(ctx context.Context, req *TransactionRequest) (*TransactionResponse, error) {
+	replayStart := time.Now()
+	defer func() {
+		telemetry.ReplicaReplaySeconds.Observe(time.Since(replayStart).Seconds())
+	}()
+
 	log.Debug().
 		Uint64("node_id", rh.nodeID).
 		Str("database", req.Database).
@@ -221,6 +239,7 @@ func (rh *ReplicationHandler) handleReplay(ctx context.Context, req *Transaction
 	// Get the target database from request (database name is required)
 	dbName := req.Database
 	if dbName == "" {
+		telemetry.ReplicationRequestsTotal.With("replay", "failed").Inc()
 		return &TransactionResponse{
 			Success:      false,
 			ErrorMessage: "database name is required in replay request",
@@ -230,6 +249,7 @@ func (rh *ReplicationHandler) handleReplay(ctx context.Context, req *Transaction
 	// Get database instance
 	dbInstance, err := rh.dbMgr.GetDatabase(dbName)
 	if err != nil {
+		telemetry.ReplicationRequestsTotal.With("replay", "failed").Inc()
 		return &TransactionResponse{
 			Success:      false,
 			ErrorMessage: fmt.Sprintf("database %s not found: %v", dbName, err),
@@ -241,6 +261,7 @@ func (rh *ReplicationHandler) handleReplay(ctx context.Context, req *Transaction
 	// Execute statements directly in a SQLite transaction
 	tx, err := sqliteDB.BeginTx(ctx, nil)
 	if err != nil {
+		telemetry.ReplicationRequestsTotal.With("replay", "failed").Inc()
 		return &TransactionResponse{
 			Success:      false,
 			ErrorMessage: fmt.Sprintf("failed to begin transaction: %v", err),
@@ -267,6 +288,7 @@ func (rh *ReplicationHandler) handleReplay(ctx context.Context, req *Transaction
 				err = fmt.Errorf("unsupported statement type for CDC replay: %v", stmt.Type)
 			}
 			if err != nil {
+				telemetry.ReplicationRequestsTotal.With("replay", "failed").Inc()
 				return &TransactionResponse{
 					Success:      false,
 					ErrorMessage: fmt.Sprintf("failed to apply CDC statement: %v", err),
@@ -278,6 +300,7 @@ func (rh *ReplicationHandler) handleReplay(ctx context.Context, req *Transaction
 		// DDL path: execute SQL directly
 		if ddl := stmt.GetDdlChange(); ddl != nil && ddl.Sql != "" {
 			if _, err := tx.ExecContext(ctx, ddl.Sql); err != nil {
+				telemetry.ReplicationRequestsTotal.With("replay", "failed").Inc()
 				return &TransactionResponse{
 					Success:      false,
 					ErrorMessage: fmt.Sprintf("failed to execute DDL: %v", err),
@@ -295,6 +318,7 @@ func (rh *ReplicationHandler) handleReplay(ctx context.Context, req *Transaction
 
 	// Commit the transaction
 	if err := tx.Commit(); err != nil {
+		telemetry.ReplicationRequestsTotal.With("replay", "failed").Inc()
 		return &TransactionResponse{
 			Success:      false,
 			ErrorMessage: fmt.Sprintf("failed to commit: %v", err),

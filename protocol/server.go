@@ -13,6 +13,7 @@ import (
 
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/protocol/query"
+	"github.com/maxpert/marmot/telemetry"
 	"github.com/rs/zerolog/log"
 )
 
@@ -275,6 +276,9 @@ func (s *MySQLServer) handleConnection(conn net.Conn) {
 		nextStmtID:           1,
 		TranspilationEnabled: true, // Default: MySQL→SQLite transpilation enabled
 	}
+
+	telemetry.MySQLConnections.Inc()
+	defer telemetry.MySQLConnections.Dec()
 
 	log.Debug().Uint64("conn_id", session.ConnID).Str("remote", session.RemoteAddr).Msg("New connection")
 

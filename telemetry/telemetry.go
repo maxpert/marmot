@@ -6,6 +6,7 @@ import (
 
 	"github.com/maxpert/marmot/cfg"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/rs/zerolog/log"
 )
@@ -244,6 +245,11 @@ func InitializeTelemetry() {
 	}
 
 	registry = prometheus.NewRegistry()
+
+	// Register process and Go runtime collectors for CPU/memory metrics
+	registry.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
+	registry.MustRegister(collectors.NewGoCollector())
+
 	log.Info().Msg("Prometheus metrics enabled - will be served on gRPC port at /metrics")
 }
 

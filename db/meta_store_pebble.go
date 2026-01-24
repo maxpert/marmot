@@ -2234,3 +2234,28 @@ func (s *PebbleMetaStore) GetCDCTableDDLLock(tableName string) (uint64, error) {
 	txnID, _ := s.cdcLocks.GetDDLHolder(tableName)
 	return txnID, nil
 }
+
+// GetRowLockStats returns statistics from the in-memory row lock store
+func (s *PebbleMetaStore) GetRowLockStats() (activeLocks, activeTransactions, gcMarkers, tablesWithLocks int) {
+	return s.rowLocks.Stats()
+}
+
+// IntentStats returns statistics about pending intents in the store
+func (s *PebbleMetaStore) IntentStats() (pendingIntents int, err error) {
+	prefix := []byte(pebblePrefixIntentByTxn)
+
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: prefix,
+		UpperBound: prefixUpperBound(prefix),
+	})
+	if err != nil {
+		return 0, err
+	}
+	defer iter.Close()
+
+	for iter.First(); iter.Valid(); iter.Next() {
+		pendingIntents++
+	}
+
+	return pendingIntents, iter.Error()
+}

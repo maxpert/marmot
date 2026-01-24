@@ -376,7 +376,9 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, params []in
 
 	if isDDL && h.ddlLockMgr != nil {
 		// Acquire cluster-wide DDL lock for this database
+		lockStart := time.Now()
 		_, err := h.ddlLockMgr.AcquireLock(stmt.Database, h.nodeID, uint64(txnID), startTS)
+		telemetry.DDLLockWaitSeconds.Observe(time.Since(lockStart).Seconds())
 		if err != nil {
 			telemetry.QueriesTotal.With("ddl", "failed").Inc()
 			telemetry.QueryDurationSeconds.With("ddl").Observe(time.Since(queryStart).Seconds())

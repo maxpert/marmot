@@ -38,6 +38,26 @@ func (p *publisherAdapter) AppendCDC(txnID uint64, database string, entries []co
 	return p.registry.AppendCDC(txnID, database, entries, commitTSNanos, nodeID)
 }
 
+// dbManagerAdapter adapts DatabaseManager to telemetry.DatabaseLister
+type dbManagerAdapter struct {
+	dm *db.DatabaseManager
+}
+
+func (a *dbManagerAdapter) ListDatabases() []string {
+	return a.dm.ListDatabaseNames()
+}
+
+func (a *dbManagerAdapter) GetDatabase(name string) telemetry.StatsProvider {
+	provider := a.dm.GetDatabaseStatsProvider(name)
+	if provider == nil {
+		return nil
+	}
+	if sp, ok := provider.(telemetry.StatsProvider); ok {
+		return sp
+	}
+	return nil
+}
+
 func main() {
 	flag.Parse()
 
@@ -198,6 +218,11 @@ func main() {
 		return
 	}
 	defer dbMgr.Close()
+
+	// Start metrics collector for telemetry (updates every 10 seconds)
+	metricsCollector := telemetry.NewMetricsCollector(&dbManagerAdapter{dm: dbMgr}, 10*time.Second)
+	metricsCollector.Start()
+	defer metricsCollector.Stop()
 
 	// Initialize CDC Publisher if enabled
 	var publisherRegistry *publisher.Registry

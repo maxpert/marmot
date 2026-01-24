@@ -16,6 +16,9 @@ var (
 
 	// QuorumAckBuckets for number of quorum acknowledgments
 	QuorumAckBuckets = []float64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
+
+	// CombinedQueryBuckets covers both fast reads (µs-ms) and slow writes (ms-s)
+	CombinedQueryBuckets = []float64{0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10}
 )
 
 // Cluster Health Metrics
@@ -56,6 +59,15 @@ var (
 	// TwoPhaseCommitSeconds measures 2PC commit phase latency
 	TwoPhaseCommitSeconds Histogram = NoopStat{}
 
+	// ReplicaPrepareSeconds measures replica-side prepare phase latency
+	ReplicaPrepareSeconds Histogram = NoopStat{}
+
+	// ReplicaCommitSeconds measures replica-side commit phase latency
+	ReplicaCommitSeconds Histogram = NoopStat{}
+
+	// ReplicaReplaySeconds measures replica-side replay phase latency (anti-entropy)
+	ReplicaReplaySeconds Histogram = NoopStat{}
+
 	// TwoPhaseQuorumAcks measures number of acks received per phase
 	TwoPhaseQuorumAcks HistogramVec = noopHistogramVec{}
 
@@ -67,6 +79,9 @@ var (
 
 	// ActiveTransactions tracks currently active transactions
 	ActiveTransactions Gauge = NoopStat{}
+
+	// PendingIntents tracks number of pending write intents (uncommitted 2PC transactions)
+	PendingIntents Gauge = NoopStat{}
 )
 
 // Query Processing Metrics
@@ -109,6 +124,21 @@ var (
 
 	// DeltaSyncTxnsTotal counts transactions applied via delta sync
 	DeltaSyncTxnsTotal Counter = NoopStat{}
+)
+
+// RowLockStore metrics
+var (
+	// RowLocksActive tracks number of active row locks held
+	RowLocksActive Gauge = NoopStat{}
+
+	// RowLockTransactions tracks number of transactions holding row locks
+	RowLockTransactions Gauge = NoopStat{}
+
+	// RowLockGCMarkers tracks number of GC markers pending cleanup
+	RowLockGCMarkers Gauge = NoopStat{}
+
+	// RowLockTables tracks number of tables with active locks
+	RowLockTables Gauge = NoopStat{}
 )
 
 // InitMetrics initializes all Prometheus metrics.
@@ -170,6 +200,21 @@ func InitMetrics() {
 		"2PC commit phase duration in seconds",
 		TwoPCBuckets,
 	)
+	ReplicaPrepareSeconds = NewHistogramWithBuckets(
+		"replica_prepare_seconds",
+		"Replica-side prepare phase latency in seconds",
+		TwoPCBuckets,
+	)
+	ReplicaCommitSeconds = NewHistogramWithBuckets(
+		"replica_commit_seconds",
+		"Replica-side commit phase latency in seconds",
+		TwoPCBuckets,
+	)
+	ReplicaReplaySeconds = NewHistogramWithBuckets(
+		"replica_replay_seconds",
+		"Replica-side replay phase latency in seconds",
+		TwoPCBuckets,
+	)
 	TwoPhaseQuorumAcks = NewHistogramVec(
 		"twophase_quorum_acks",
 		"Number of quorum acknowledgments received",
@@ -190,6 +235,10 @@ func InitMetrics() {
 		"active_transactions",
 		"Number of currently active transactions",
 	)
+	PendingIntents = NewGauge(
+		"pending_intents",
+		"Number of pending write intents (uncommitted 2PC transactions)",
+	)
 
 	// Query Processing Metrics
 	QueriesTotal = NewCounterVec(
@@ -201,7 +250,7 @@ func InitMetrics() {
 		"query_duration_seconds",
 		"Query duration in seconds",
 		[]string{"type"},
-		WriteTxnBuckets,
+		CombinedQueryBuckets,
 	)
 	RowsAffected = NewHistogram(
 		"rows_affected",
@@ -250,4 +299,30 @@ func InitMetrics() {
 		"delta_sync_txns_total",
 		"Total transactions applied via delta sync",
 	)
+
+	// RowLockStore metrics
+	RowLocksActive = NewGauge(
+		"row_locks_active",
+		"Number of active row locks held",
+	)
+	RowLockTransactions = NewGauge(
+		"row_lock_transactions",
+		"Number of transactions holding row locks",
+	)
+	RowLockGCMarkers = NewGauge(
+		"row_lock_gc_markers",
+		"Number of GC markers pending cleanup",
+	)
+	RowLockTables = NewGauge(
+		"row_lock_tables",
+		"Number of tables with active locks",
+	)
+}
+
+// UpdateRowLockStats updates row lock gauges from stats
+func UpdateRowLockStats(activeLocks, activeTransactions, gcMarkers, tablesWithLocks int) {
+	RowLocksActive.Set(float64(activeLocks))
+	RowLockTransactions.Set(float64(activeTransactions))
+	RowLockGCMarkers.Set(float64(gcMarkers))
+	RowLockTables.Set(float64(tablesWithLocks))
 }

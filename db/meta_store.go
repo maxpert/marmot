@@ -111,6 +111,10 @@ type MetaStore interface {
 	// Callback returns nil to continue, ErrStopIteration to stop, or other error to abort.
 	ScanTransactions(fromTxnID uint64, descending bool, callback func(*TransactionRecord) error) error
 
+	// Stats methods for telemetry
+	GetRowLockStats() (activeLocks, activeTransactions, gcMarkers, tablesWithLocks int)
+	IntentStats() (pendingIntents int, err error)
+
 	// Lifecycle
 	Close() error
 	Checkpoint() error // Triggers PebbleDB checkpoint for consistency
