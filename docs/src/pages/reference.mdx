@@ -41,7 +41,20 @@ keepalive_time_seconds = 10    # Keepalive ping interval
 keepalive_timeout_seconds = 3  # Keepalive ping timeout
 max_retries = 3                # Max retry attempts
 retry_backoff_ms = 100         # Retry backoff duration
+compression_level = 1          # zstd compression (0=disabled, 1-4)
 ```
+
+**Compression Levels:**
+
+| Level | Speed | Ratio | Use Case |
+|-------|-------|-------|----------|
+| 0 | - | - | Disabled |
+| 1 | ~318 MB/s | 2.88x | Default - best for most deployments |
+| 2 | ~134 MB/s | 3.0x | Balanced speed/compression |
+| 3 | ~67 MB/s | 3.2x | Better compression, slower |
+| 4 | ~12 MB/s | 3.5x | Bandwidth-constrained networks |
+
+Decompression is always fast (~1600 MB/s) regardless of compression level. Uses [zstd](https://github.com/facebook/zstd) via [klauspost/compress](https://github.com/klauspost/compress).
 
 ## Coordinator
 

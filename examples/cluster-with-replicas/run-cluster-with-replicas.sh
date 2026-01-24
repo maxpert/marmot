@@ -106,6 +106,7 @@ keepalive_time_seconds = 10
 keepalive_timeout_seconds = 3
 max_retries = 3
 retry_backoff_ms = 100
+compression_level = 1  # zstd: 0=disabled, 1=fastest, 4=best
 
 [coordinator]
 prepare_timeout_ms = 120000

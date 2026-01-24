@@ -114,6 +114,7 @@ type GRPCClientConfiguration struct {
 	KeepaliveTimeoutSeconds int `toml:"keepalive_timeout_seconds"` // Keepalive ping timeout
 	MaxRetries              int `toml:"max_retries"`               // Max retry attempts
 	RetryBackoffMS          int `toml:"retry_backoff_ms"`          // Retry backoff duration
+	CompressionLevel        int `toml:"compression_level"`         // zstd compression level (1=fastest, 4=best, 0=disabled)
 }
 
 // CoordinatorConfiguration controls transaction coordinator behavior
@@ -275,6 +276,7 @@ var Config = &Configuration{
 		KeepaliveTimeoutSeconds: 3,   // Timeout keepalive after 3s
 		MaxRetries:              3,   // Retry failed requests up to 3 times
 		RetryBackoffMS:          100, // 100ms backoff between retries
+		CompressionLevel:        1,   // zstd level 1 (fastest: ~318 MB/s, 2.88x ratio)
 	},
 
 	Coordinator: CoordinatorConfiguration{
@@ -564,6 +566,11 @@ func Validate() error {
 
 	if Config.GRPCClient.RetryBackoffMS < 0 {
 		return fmt.Errorf("gRPC retry backoff must be >= 0")
+	}
+
+	// Validate compression level (0=disabled, 1-4 valid zstd levels for Go implementation)
+	if Config.GRPCClient.CompressionLevel < 0 || Config.GRPCClient.CompressionLevel > 4 {
+		return fmt.Errorf("gRPC compression_level must be 0-4 (0=disabled, 1=fastest, 4=best)")
 	}
 
 	// Validate coordinator configuration

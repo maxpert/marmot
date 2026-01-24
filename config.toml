@@ -168,6 +168,10 @@ max_retries = 3
 # Backoff duration between retries (milliseconds)
 retry_backoff_ms = 100
 
+# zstd compression level for gRPC messages (0 = disabled, 1-4)
+# Level 1: Fastest, Level 4: Best compression
+compression_level = 1
+
 # ==============================================================================
 # TRANSACTION COORDINATOR
 # ==============================================================================

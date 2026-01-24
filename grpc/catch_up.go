@@ -14,7 +14,6 @@ import (
 	"github.com/maxpert/marmot/db/snapshot"
 	"github.com/rs/zerolog/log"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 )
 
 // CatchUpStrategy determines how a node should catch up with the cluster
@@ -56,14 +55,9 @@ func (c *CatchUpClient) CatchUpFromPeer(ctx context.Context, peerNodeID uint64, 
 		Str("database", database).
 		Msg("Starting snapshot download for database from peer")
 
-	// Connect to peer
-	conn, err := grpc.DialContext(ctx, peerAddr,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithBlock(),
-		grpc.WithDefaultCallOptions(
-			grpc.MaxCallRecvMsgSize(100*1024*1024),
-		),
-	)
+	// Connect to peer with common dial options (includes compression)
+	dialOpts := append(createDialOptions(), grpc.WithBlock())
+	conn, err := grpc.DialContext(ctx, peerAddr, dialOpts...)
 	if err != nil {
 		return fmt.Errorf("failed to connect to peer: %w", err)
 	}
@@ -116,14 +110,9 @@ func (c *CatchUpClient) CatchUp(ctx context.Context) (uint64, error) {
 
 	log.Info().Str("seed", seedAddr).Msg("Catching up from seed node")
 
-	// Connect to seed
-	conn, err := grpc.DialContext(ctx, seedAddr,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithBlock(),
-		grpc.WithDefaultCallOptions(
-			grpc.MaxCallRecvMsgSize(100*1024*1024),
-		),
-	)
+	// Connect to seed with common dial options (includes compression)
+	dialOpts := append(createDialOptions(), grpc.WithBlock())
+	conn, err := grpc.DialContext(ctx, seedAddr, dialOpts...)
 	if err != nil {
 		return 0, fmt.Errorf("failed to connect to seed: %w", err)
 	}
@@ -198,10 +187,8 @@ func (c *CatchUpClient) checkNodeAvailable(ctx context.Context, addr string) boo
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	conn, err := grpc.DialContext(ctx, addr,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithBlock(),
-	)
+	dialOpts := append(createDialOptions(), grpc.WithBlock())
+	conn, err := grpc.DialContext(ctx, addr, dialOpts...)
 	if err != nil {
 		return false
 	}
@@ -395,12 +382,12 @@ func (c *CatchUpClient) getMaxTxnIDFromDB(dbPath string) (uint64, error) {
 
 // GetPeerMaxTxnIDs queries a peer node for its latest transaction IDs per database
 func (c *CatchUpClient) GetPeerMaxTxnIDs(ctx context.Context, peerAddr string) (map[string]uint64, error) {
-	// Connect to peer
-	conn, err := grpc.DialContext(ctx, peerAddr,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithBlock(),
-		grpc.WithTimeout(10*time.Second),
-	)
+	// Connect to peer with common dial options (includes compression)
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	dialOpts := append(createDialOptions(), grpc.WithBlock())
+	conn, err := grpc.DialContext(ctx, peerAddr, dialOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to peer %s: %w", peerAddr, err)
 	}

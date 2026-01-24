@@ -194,6 +194,14 @@ max_retries = 3
 # Backoff duration between retries (milliseconds)
 retry_backoff_ms = 100
 
+# zstd compression level for gRPC messages (0 = disabled)
+# Level 1: Fastest (~318 MB/s, 2.88x ratio) - recommended for most deployments
+# Level 2: Default (~134 MB/s, 3.0x ratio)
+# Level 3: Better compression (~67 MB/s, 3.2x ratio)
+# Level 4: Best compression (~12 MB/s, 3.5x ratio) - use for bandwidth-constrained networks
+# Note: Decompression is always fast (~1600 MB/s) regardless of level
+compression_level = 1
+
 # ==============================================================================
 # TRANSACTION COORDINATOR
 # ==============================================================================

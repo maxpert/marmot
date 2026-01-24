@@ -13,6 +13,7 @@ require (
 	github.com/gobwas/glob v0.2.3
 	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/jizhuozhi/go-future v0.1.5
+	github.com/klauspost/compress v1.18.0
 	github.com/linvon/cuckoo-filter v0.4.0
 	github.com/mattn/go-sqlite3 v1.14.18
 	github.com/nats-io/nats.go v1.47.0
@@ -45,7 +46,6 @@ require (
 	github.com/gogo/protobuf v1.3.2 // indirect
 	github.com/golang/glog v1.2.5 // indirect
 	github.com/golang/snappy v1.0.0 // indirect
-	github.com/klauspost/compress v1.18.0 // indirect
 	github.com/kr/pretty v0.3.1 // indirect
 	github.com/kr/text v0.2.0 // indirect
 	github.com/lib/pq v1.10.4 // indirect

@@ -40,6 +40,15 @@ func createDialOptions() []grpc.DialOption {
 		keepaliveTimeout = time.Duration(cfg.Config.GRPCClient.KeepaliveTimeoutSeconds) * time.Second
 	}
 
+	// Build call options with compression if enabled
+	callOpts := []grpc.CallOption{
+		grpc.MaxCallRecvMsgSize(100 * 1024 * 1024), // 100MB
+		grpc.MaxCallSendMsgSize(100 * 1024 * 1024),
+	}
+	if compressor := GetCompressionName(); compressor != "" {
+		callOpts = append(callOpts, grpc.UseCompressor(compressor))
+	}
+
 	return []grpc.DialOption{
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{
@@ -47,10 +56,7 @@ func createDialOptions() []grpc.DialOption {
 			Timeout:             keepaliveTimeout,
 			PermitWithoutStream: true,
 		}),
-		grpc.WithDefaultCallOptions(
-			grpc.MaxCallRecvMsgSize(100*1024*1024), // 100MB
-			grpc.MaxCallSendMsgSize(100*1024*1024),
-		),
+		grpc.WithDefaultCallOptions(callOpts...),
 		grpc.WithChainUnaryInterceptor(UnaryClientInterceptor()),
 		grpc.WithChainStreamInterceptor(StreamClientInterceptor()),
 	}
