@@ -38,10 +38,13 @@ func setupTestBatchCommitter(t *testing.T, maxBatchSize int, maxWaitTime time.Du
 		dbPath,
 		maxBatchSize,
 		maxWaitTime,
-		true, // checkpointEnabled
-		4.0,  // passiveThreshMB
-		16.0, // restartThreshMB
-		true, // allowDynamicBatchSize
+		true,  // checkpointEnabled
+		4.0,   // passiveThreshMB
+		16.0,  // restartThreshMB
+		true,  // allowDynamicBatchSize
+		false, // incrementalVacuumEnabled (disabled for tests)
+		0,     // incrementalVacuumPages
+		0,     // incrementalVacuumTimeLimitMS
 	)
 	if err := bc.Start(); err != nil {
 		db.Close()
@@ -397,6 +400,9 @@ func TestBatchCommitter_NoCheckpointBelowThreshold(t *testing.T) {
 		4.0,
 		16.0,
 		true,
+		false, // incrementalVacuumEnabled
+		0,     // incrementalVacuumPages
+		0,     // incrementalVacuumTimeLimitMS
 	)
 	if err := bc.Start(); err != nil {
 		t.Fatalf("failed to start batch committer: %v", err)
@@ -447,6 +453,9 @@ func TestBatchCommitter_PassiveCheckpointTriggered(t *testing.T) {
 		1.0,
 		4.0,
 		true,
+		false, // incrementalVacuumEnabled
+		0,     // incrementalVacuumPages
+		0,     // incrementalVacuumTimeLimitMS
 	)
 	if err := bc.Start(); err != nil {
 		t.Fatalf("failed to start batch committer: %v", err)
@@ -510,6 +519,9 @@ func TestBatchCommitter_RestartCheckpointTriggered(t *testing.T) {
 		1.0,
 		3.0,
 		true,
+		false, // incrementalVacuumEnabled
+		0,     // incrementalVacuumPages
+		0,     // incrementalVacuumTimeLimitMS
 	)
 	if err := bc.Start(); err != nil {
 		t.Fatalf("failed to start batch committer: %v", err)
@@ -562,6 +574,9 @@ func TestBatchCommitter_DynamicBatchSizing(t *testing.T) {
 		0.5,
 		2.0,
 		true,
+		false, // incrementalVacuumEnabled
+		0,     // incrementalVacuumPages
+		0,     // incrementalVacuumTimeLimitMS
 	)
 	if err := bc.Start(); err != nil {
 		t.Fatalf("failed to start batch committer: %v", err)
@@ -636,6 +651,9 @@ func TestBatchCommitter_TimerDisabledDuringCheckpoint(t *testing.T) {
 		0.5,
 		2.0,
 		true,
+		false, // incrementalVacuumEnabled
+		0,     // incrementalVacuumPages
+		0,     // incrementalVacuumTimeLimitMS
 	)
 	if err := bc.Start(); err != nil {
 		t.Fatalf("failed to start batch committer: %v", err)
@@ -699,6 +717,9 @@ func TestBatchCommitter_ConcurrentOperationsWithCheckpoint(t *testing.T) {
 		1.0,
 		4.0,
 		true,
+		false, // incrementalVacuumEnabled
+		0,     // incrementalVacuumPages
+		0,     // incrementalVacuumTimeLimitMS
 	)
 	if err := bc.Start(); err != nil {
 		t.Fatalf("failed to start batch committer: %v", err)
@@ -789,6 +810,9 @@ func TestBatchCommitter_CheckpointMetrics(t *testing.T) {
 		0.5,
 		2.0,
 		true,
+		false, // incrementalVacuumEnabled
+		0,     // incrementalVacuumPages
+		0,     // incrementalVacuumTimeLimitMS
 	)
 	if err := bc.Start(); err != nil {
 		t.Fatalf("failed to start batch committer: %v", err)

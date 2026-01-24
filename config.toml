@@ -128,6 +128,31 @@ max_idle_time_seconds = 10
 max_lifetime_seconds = 300
 
 # ==============================================================================
+# BATCH COMMIT - SQLite write batching for improved throughput
+# ==============================================================================
+
+[batch_commit]
+# Enable batch committing (batches multiple transactions into single SQLite commit)
+enabled = true
+
+# Maximum transactions per batch before flush
+max_batch_size = 128
+
+# Maximum wait time before flush (milliseconds)
+max_wait_ms = 10
+
+# WAL Checkpoint: Manages WAL file size
+checkpoint_enabled = true
+checkpoint_passive_thresh_mb = 4.0   # PASSIVE checkpoint when WAL > 4MB
+checkpoint_restart_thresh_mb = 16.0  # RESTART checkpoint when WAL > 16MB
+
+# Incremental Vacuum: Reclaims freelist pages after checkpoint
+# Runs in background with time budget, non-blocking to commits
+incremental_vacuum_enabled = true
+incremental_vacuum_pages = 100       # Pages to vacuum per iteration
+incremental_vacuum_time_limit_ms = 10 # Max time budget (ms)
+
+# ==============================================================================
 # METASTORE (PebbleDB) - CockroachDB-tested defaults
 # ==============================================================================
 

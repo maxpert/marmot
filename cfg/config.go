@@ -106,6 +106,11 @@ type BatchCommitConfiguration struct {
 	CheckpointPassiveThreshMB float64 `toml:"checkpoint_passive_thresh_mb"` // PASSIVE checkpoint threshold in MB (default: 4.0)
 	CheckpointRestartThreshMB float64 `toml:"checkpoint_restart_thresh_mb"` // RESTART checkpoint threshold in MB (default: 16.0)
 	AllowDynamicBatchSize     bool    `toml:"allow_dynamic_batch_size"`     // Allow dynamic batch size adjustment (default: true)
+
+	// Incremental vacuum configuration for freelist reclamation
+	IncrementalVacuumEnabled     bool `toml:"incremental_vacuum_enabled"`       // Enable incremental vacuum after checkpoint (default: true)
+	IncrementalVacuumPages       int  `toml:"incremental_vacuum_pages"`         // Pages to vacuum per iteration (default: 100)
+	IncrementalVacuumTimeLimitMS int  `toml:"incremental_vacuum_time_limit_ms"` // Max time budget for vacuum in ms (default: 50)
 }
 
 // GRPCClientConfiguration controls gRPC client behavior
@@ -324,13 +329,16 @@ var Config = &Configuration{
 	},
 
 	BatchCommit: BatchCommitConfiguration{
-		Enabled:                   true,
-		MaxBatchSize:              128,
-		MaxWaitMS:                 10,
-		CheckpointEnabled:         true,
-		CheckpointPassiveThreshMB: 4.0,
-		CheckpointRestartThreshMB: 16.0,
-		AllowDynamicBatchSize:     true,
+		Enabled:                      true,
+		MaxBatchSize:                 128,
+		MaxWaitMS:                    10,
+		CheckpointEnabled:            true,
+		CheckpointPassiveThreshMB:    4.0,
+		CheckpointRestartThreshMB:    16.0,
+		AllowDynamicBatchSize:        true,
+		IncrementalVacuumEnabled:     true,
+		IncrementalVacuumPages:       100,
+		IncrementalVacuumTimeLimitMS: 10,
 	},
 }
 

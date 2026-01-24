@@ -12,6 +12,7 @@ import (
 	"github.com/maxpert/marmot/coordinator"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/protocol"
+	"github.com/rs/zerolog/log"
 )
 
 // Ensure PendingLocalExecution implements coordinator.PendingExecution
@@ -158,6 +159,15 @@ func NewReplicatedDatabase(dbPath string, nodeID uint64, clock *hlc.Clock, metaS
 		}
 	}
 
+	// Enable incremental auto-vacuum on write connection if configured
+	// Note: auto_vacuum mode can only be changed on an empty database or after VACUUM
+	// For existing databases, this sets the mode for future use
+	if !isMemoryDB && cfg.Config.BatchCommit.IncrementalVacuumEnabled {
+		if _, err = writeDB.Exec("PRAGMA auto_vacuum=INCREMENTAL"); err != nil {
+			log.Debug().Err(err).Msg("Failed to set auto_vacuum mode (may require VACUUM for existing database)")
+		}
+	}
+
 	// Create schema cache (shared by TransactionManager and preupdate hooks)
 	schemaCache := NewSchemaCache()
 
@@ -175,6 +185,9 @@ func NewReplicatedDatabase(dbPath string, nodeID uint64, clock *hlc.Clock, metaS
 			cfg.Config.BatchCommit.CheckpointPassiveThreshMB,
 			cfg.Config.BatchCommit.CheckpointRestartThreshMB,
 			cfg.Config.BatchCommit.AllowDynamicBatchSize,
+			cfg.Config.BatchCommit.IncrementalVacuumEnabled,
+			cfg.Config.BatchCommit.IncrementalVacuumPages,
+			cfg.Config.BatchCommit.IncrementalVacuumTimeLimitMS,
 		)
 		if err := batchCommitter.Start(); err != nil {
 			closeAll()

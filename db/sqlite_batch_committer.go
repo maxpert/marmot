@@ -121,8 +121,14 @@ type SQLiteBatchCommitter struct {
 	checkpointRestartThreshMB float64
 	allowDynamicBatchSize     bool
 
-	// Checkpoint state
+	// Incremental vacuum configuration
+	incrementalVacuumEnabled     bool
+	incrementalVacuumPages       int
+	incrementalVacuumTimeLimitMS int
+
+	// Background task state
 	checkpointRunning atomic.Bool
+	vacuumRunning     atomic.Bool
 }
 
 func NewSQLiteBatchCommitter(
@@ -133,19 +139,25 @@ func NewSQLiteBatchCommitter(
 	passiveThreshMB float64,
 	restartThreshMB float64,
 	allowDynamicBatchSize bool,
+	incrementalVacuumEnabled bool,
+	incrementalVacuumPages int,
+	incrementalVacuumTimeLimitMS int,
 ) *SQLiteBatchCommitter {
 	initBatchCommitterMetrics()
 	return &SQLiteBatchCommitter{
-		dbPath:                    dbPath,
-		pending:                   make(map[uint64]*pendingCommit),
-		maxBatchSize:              maxBatchSize,
-		maxWaitTime:               maxWaitTime,
-		flushCh:                   make(chan struct{}, 1),
-		stopCh:                    make(chan struct{}),
-		checkpointEnabled:         checkpointEnabled,
-		checkpointPassiveThreshMB: passiveThreshMB,
-		checkpointRestartThreshMB: restartThreshMB,
-		allowDynamicBatchSize:     allowDynamicBatchSize,
+		dbPath:                       dbPath,
+		pending:                      make(map[uint64]*pendingCommit),
+		maxBatchSize:                 maxBatchSize,
+		maxWaitTime:                  maxWaitTime,
+		flushCh:                      make(chan struct{}, 1),
+		stopCh:                       make(chan struct{}),
+		checkpointEnabled:            checkpointEnabled,
+		checkpointPassiveThreshMB:    passiveThreshMB,
+		checkpointRestartThreshMB:    restartThreshMB,
+		allowDynamicBatchSize:        allowDynamicBatchSize,
+		incrementalVacuumEnabled:     incrementalVacuumEnabled,
+		incrementalVacuumPages:       incrementalVacuumPages,
+		incrementalVacuumTimeLimitMS: incrementalVacuumTimeLimitMS,
 	}
 }
 
@@ -476,11 +488,73 @@ func (bc *SQLiteBatchCommitter) backgroundCheckpoint(walSizeMB float64) {
 			Float64("wal_size_mb", walSizeMB).
 			Int64("duration_ms", duration.Milliseconds()).
 			Msg("Adaptive checkpoint completed")
+
+		// Run incremental vacuum after successful checkpoint
+		if bc.incrementalVacuumEnabled && !bc.vacuumRunning.Load() {
+			go bc.backgroundIncrementalVacuum()
+		}
 	} else {
 		log.Warn().
 			Err(err).
 			Str("mode", mode).
 			Float64("wal_size_mb", walSizeMB).
 			Msg("Background checkpoint failed")
+	}
+}
+
+// backgroundIncrementalVacuum reclaims freelist pages with a time budget.
+// Uses PRAGMA incremental_vacuum(N) to free N pages per iteration until
+// time limit is reached or no more pages to free.
+func (bc *SQLiteBatchCommitter) backgroundIncrementalVacuum() {
+	if !bc.vacuumRunning.CompareAndSwap(false, true) {
+		return // Already running
+	}
+	defer bc.vacuumRunning.Store(false)
+
+	start := time.Now()
+	timeLimit := time.Duration(bc.incrementalVacuumTimeLimitMS) * time.Millisecond
+	pagesPerIteration := bc.incrementalVacuumPages
+	totalPagesFreed := 0
+	iterations := 0
+
+	for time.Since(start) < timeLimit {
+		// PRAGMA incremental_vacuum(N) returns nothing, but frees up to N pages
+		// We check freelist_count before and after to see if work was done
+		var freelistBefore int
+		if err := bc.db.QueryRow("PRAGMA freelist_count").Scan(&freelistBefore); err != nil {
+			log.Debug().Err(err).Msg("Failed to get freelist count")
+			break
+		}
+
+		if freelistBefore == 0 {
+			break // No pages to free
+		}
+
+		// Free up to N pages
+		if _, err := bc.db.Exec(fmt.Sprintf("PRAGMA incremental_vacuum(%d)", pagesPerIteration)); err != nil {
+			log.Debug().Err(err).Msg("Incremental vacuum failed")
+			break
+		}
+
+		var freelistAfter int
+		if err := bc.db.QueryRow("PRAGMA freelist_count").Scan(&freelistAfter); err != nil {
+			break
+		}
+
+		pagesFreed := freelistBefore - freelistAfter
+		if pagesFreed <= 0 {
+			break // No progress, stop
+		}
+
+		totalPagesFreed += pagesFreed
+		iterations++
+	}
+
+	if totalPagesFreed > 0 {
+		log.Debug().
+			Int("pages_freed", totalPagesFreed).
+			Int("iterations", iterations).
+			Int64("duration_ms", time.Since(start).Milliseconds()).
+			Msg("Incremental vacuum completed")
 	}
 }

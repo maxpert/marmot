@@ -123,8 +123,40 @@ gc_max_retention_hours = 24  # Force delete after 24 hours
 ```toml
 [query_pipeline]
 transpiler_cache_size = 10000  # LRU cache for MySQL→SQLite transpilation
-validator_pool_size = 8        # SQLite connection pool for validation
 ```
+
+## Batch Commit
+
+Controls SQLite write batching for improved throughput. Batches multiple transactions into single SQLite commits, reducing fsync overhead.
+
+```toml
+[batch_commit]
+enabled = true                       # Enable batch committing
+max_batch_size = 128                 # Max transactions per batch
+max_wait_ms = 10                     # Max wait before flush (ms)
+
+# WAL Checkpoint: Manages WAL file size by checkpointing after batches
+checkpoint_enabled = true            # Enable automatic checkpointing
+checkpoint_passive_thresh_mb = 4.0   # PASSIVE checkpoint when WAL > 4MB
+checkpoint_restart_thresh_mb = 16.0  # RESTART checkpoint when WAL > 16MB
+
+# Incremental Vacuum: Reclaims freelist pages in time-limited background task
+# Requires sqlite_vacuum_incr build tag (included in default build)
+incremental_vacuum_enabled = true    # Enable incremental vacuum after checkpoint
+incremental_vacuum_pages = 100       # Pages to vacuum per iteration
+incremental_vacuum_time_limit_ms = 10 # Max time budget for vacuum (ms)
+```
+
+**How Incremental Vacuum Works:**
+1. After successful WAL checkpoint, vacuum is triggered in background goroutine
+2. Runs `PRAGMA incremental_vacuum(N)` in loop until time limit or freelist empty
+3. Non-blocking: doesn't delay commit responses to clients
+4. Prevents goroutine pileup with atomic flag (only one vacuum runs at a time)
+
+**Tuning Tips:**
+- **High write workload**: Decrease `incremental_vacuum_time_limit_ms` to 5-10ms
+- **Large deletes**: Increase `incremental_vacuum_pages` to 500+ for faster reclamation
+- **Disable**: Set `incremental_vacuum_enabled = false` if using external vacuum scheduling
 
 ## MySQL Protocol Server
 
