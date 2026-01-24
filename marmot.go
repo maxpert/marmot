@@ -404,7 +404,6 @@ func main() {
 	}
 	if err := protocol.InitializePipeline(
 		cfg.Config.QueryPipeline.TranspilerCacheSize,
-		cfg.Config.QueryPipeline.ValidatorPoolSize,
 		idGen,
 	); err != nil {
 		log.Fatal().Err(err).Msg("Failed to initialize query pipeline")

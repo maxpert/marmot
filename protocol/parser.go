@@ -102,8 +102,7 @@ var globalPipeline *query.Pipeline
 
 // InitializePipeline initializes the global query processing pipeline.
 // idGen is optional - if nil, auto-increment ID injection is disabled.
-// Note: poolSize parameter is deprecated (validator removed) and ignored.
-func InitializePipeline(cacheSize, poolSize int, idGen id.Generator) error {
+func InitializePipeline(cacheSize int, idGen id.Generator) error {
 	var err error
 	globalPipeline, err = query.NewPipeline(cacheSize, idGen)
 	return err

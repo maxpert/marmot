@@ -177,7 +177,6 @@ func Run() {
 	// Initialize query pipeline (nil ID generator - replicas are read-only)
 	if err := protocol.InitializePipeline(
 		cfg.Config.QueryPipeline.TranspilerCacheSize,
-		cfg.Config.QueryPipeline.ValidatorPoolSize,
 		nil,
 	); err != nil {
 		log.Fatal().Err(err).Msg("Failed to initialize query pipeline")
