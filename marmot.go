@@ -477,7 +477,7 @@ func initializeGRPCServer() (*marmotgrpc.Server, error) {
 }
 
 func startGossip(server *marmotgrpc.Server) (*marmotgrpc.Client, *marmotgrpc.GossipProtocol) {
-	gossipConfig := marmotgrpc.DefaultGossipConfig()
+	gossipConfig := marmotgrpc.GossipConfigFromCluster(cfg.Config.Cluster)
 
 	// Get gossip protocol from server (already initialized)
 	gossip := server.GetGossipProtocol()

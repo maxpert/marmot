@@ -271,24 +271,6 @@ func (a *grpcSnapshotStreamAdapter) Recv() (*snapshot.Chunk, error) {
 	}, nil
 }
 
-// NeedsCatchUp checks if this node needs to catch up (e.g., empty data directory)
-// DEPRECATED: Use DetermineCatchUpStrategy instead
-func (c *CatchUpClient) NeedsCatchUp() bool {
-	// Check if system database exists
-	systemDBPath := filepath.Join(c.dataDir, "__marmot_system.db")
-	if _, err := os.Stat(systemDBPath); os.IsNotExist(err) {
-		return true
-	}
-
-	// Check if default database exists
-	defaultDBPath := filepath.Join(c.dataDir, "databases", "marmot.db")
-	if _, err := os.Stat(defaultDBPath); os.IsNotExist(err) {
-		return true
-	}
-
-	return false
-}
-
 // DatabaseTxnInfo holds transaction state for a database
 type DatabaseTxnInfo struct {
 	DatabaseName string

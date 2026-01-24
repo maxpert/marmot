@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/maxpert/marmot/cfg"
 	"github.com/maxpert/marmot/telemetry"
 	"github.com/rs/zerolog/log"
 )
@@ -36,9 +37,29 @@ func DefaultGossipConfig() GossipConfig {
 	return GossipConfig{
 		Interval:       1 * time.Second,
 		Fanout:         3,
-		SuspectTimeout: 15 * time.Second, // Increased from 5s to allow gossip propagation
-		DeadTimeout:    30 * time.Second, // Increased proportionally
+		SuspectTimeout: 15 * time.Second,
+		DeadTimeout:    30 * time.Second,
 	}
+}
+
+// GossipConfigFromCluster creates gossip config from cluster configuration
+func GossipConfigFromCluster(cluster cfg.ClusterConfiguration) GossipConfig {
+	config := DefaultGossipConfig()
+
+	if cluster.GossipIntervalMS > 0 {
+		config.Interval = time.Duration(cluster.GossipIntervalMS) * time.Millisecond
+	}
+	if cluster.GossipFanout > 0 {
+		config.Fanout = cluster.GossipFanout
+	}
+	if cluster.SuspectTimeoutMS > 0 {
+		config.SuspectTimeout = time.Duration(cluster.SuspectTimeoutMS) * time.Millisecond
+	}
+	if cluster.DeadTimeoutMS > 0 {
+		config.DeadTimeout = time.Duration(cluster.DeadTimeoutMS) * time.Millisecond
+	}
+
+	return config
 }
 
 // NewGossipProtocol creates a new gossip protocol instance

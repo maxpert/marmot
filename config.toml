@@ -149,7 +149,6 @@ l0_stop_writes = 1000
 
 # WAL sync settings for durability
 wal_bytes_per_sync_kb = 512
-wal_sync_interval_ms = 10
 
 # ==============================================================================
 # GRPC CLIENT
@@ -269,29 +268,6 @@ auto_id_mode = "compact"
 # snapshot_cache_ttl_seconds = 30
 
 # ==============================================================================
-# SNAPSHOT (Not yet implemented)
-# ==============================================================================
-
-[snapshot]
-# Enable periodic snapshots
-enabled = false
-
-# Snapshot interval (seconds)
-interval_seconds = 300
-
-# Snapshot storage type: peer, s3, webdav, sftp, local
-store = "peer"
-
-# Snapshot chunk size (MB)
-chunk_size_mb = 5
-
-# Number of parallel chunks for snapshot transfer
-parallel_chunks = 5
-
-# Number of changes before triggering full snapshot
-incremental_threshold = 10000
-
-# ==============================================================================
 # LOGGING
 # ==============================================================================
 
@@ -307,11 +283,5 @@ format = "console"
 # ==============================================================================
 
 [prometheus]
-# Enable Prometheus metrics endpoint
+# Enable Prometheus metrics endpoint at /metrics on gRPC port
 enabled = false
-
-# Address to bind metrics server
-address = "0.0.0.0"
-
-# Prometheus metrics port
-port = 9090
