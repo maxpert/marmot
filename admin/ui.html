@@ -55,7 +55,7 @@
                                 <div class="flex-shrink-0 text-white font-bold text-xl">Marmot Admin</div>
                                 <div class="hidden md:block ml-10">
                                     <div class="flex items-baseline space-x-4">
-                                        <template x-for="tab in ['overview', 'cluster', 'transactions', 'intents']" :key="tab">
+                                        <template x-for="tab in ['overview', 'cluster', 'replication', 'transactions', 'intents']" :key="tab">
                                             <button @click="setActiveTab(tab)"
                                                 :class="activeTab === tab ? 'bg-indigo-700 text-white' : 'text-indigo-300 hover:bg-indigo-700 hover:text-white'"
                                                 class="px-3 py-2 rounded-md text-sm font-medium capitalize" x-text="tab"></button>
@@ -67,8 +67,8 @@
                                 <span class="text-white text-sm">
                                     Database:
                                     <select x-model="selectedDatabase" @change="loadStats()" class="bg-indigo-700 text-white rounded px-2 py-1 ml-1">
-                                        <template x-for="db in databases" :key="db">
-                                            <option :value="db" x-text="db"></option>
+                                        <template x-for="db in databases" :key="db.name">
+                                            <option :value="db.name" x-text="db.name"></option>
                                         </template>
                                     </select>
                                 </span>
@@ -82,6 +82,35 @@
                 <main class="max-w-7xl mx-auto py-6 sm:px-6 lg:px-8">
                     <!-- Overview Tab -->
                     <div x-show="activeTab === 'overview'" class="px-4 py-6 sm:px-0">
+                        <!-- Cluster Health Banner -->
+                        <div class="mb-6 rounded-lg p-4" :class="clusterHealth.healthy ? 'bg-green-50 border border-green-200' : 'bg-red-50 border border-red-200'">
+                            <div class="flex items-center justify-between">
+                                <div class="flex items-center">
+                                    <div class="flex-shrink-0">
+                                        <svg x-show="clusterHealth.healthy" class="h-8 w-8 text-green-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+                                        </svg>
+                                        <svg x-show="!clusterHealth.healthy" class="h-8 w-8 text-red-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                                        </svg>
+                                    </div>
+                                    <div class="ml-3">
+                                        <h3 class="text-sm font-medium" :class="clusterHealth.healthy ? 'text-green-800' : 'text-red-800'">
+                                            Cluster Status: <span x-text="clusterHealth.healthy ? 'Healthy' : 'Unhealthy'"></span>
+                                        </h3>
+                                        <div class="mt-1 text-sm" :class="clusterHealth.healthy ? 'text-green-700' : 'text-red-700'">
+                                            <span x-text="clusterHealth.alive_nodes"></span>/<span x-text="clusterHealth.total_nodes"></span> nodes alive
+                                            (quorum: <span x-text="clusterHealth.quorum_size"></span>)
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="text-sm" :class="clusterHealth.healthy ? 'text-green-600' : 'text-red-600'">
+                                    Local Node: <span x-text="clusterHealth.local_node_id"></span>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Stats Cards -->
                         <div class="grid grid-cols-1 gap-6 sm:grid-cols-2 lg:grid-cols-4">
                             <template x-for="card in [
                                 {label: 'Max Committed Txn ID', value: stats.max_committed_txn_id, color: 'indigo'},
@@ -107,23 +136,34 @@
                             </template>
                         </div>
 
+                        <!-- Databases List -->
                         <div class="mt-8 bg-white shadow overflow-hidden sm:rounded-lg">
                             <div class="px-4 py-5 sm:px-6">
-                                <h3 class="text-lg leading-6 font-medium text-gray-900">System Health</h3>
+                                <h3 class="text-lg leading-6 font-medium text-gray-900">Databases</h3>
                             </div>
-                            <div class="border-t border-gray-200 px-4 py-5">
-                                <dl class="divide-y divide-gray-200">
-                                    <div class="py-4 grid grid-cols-3 gap-4">
-                                        <dt class="text-sm font-medium text-gray-500">Status</dt>
-                                        <dd class="col-span-2">
-                                            <span class="inline-flex items-center px-3 py-1 rounded-full text-sm font-medium bg-green-100 text-green-800">Healthy</span>
-                                        </dd>
-                                    </div>
-                                    <div class="py-4 grid grid-cols-3 gap-4">
-                                        <dt class="text-sm font-medium text-gray-500">Max Sequence Number</dt>
-                                        <dd class="col-span-2 text-sm text-gray-900" x-text="formatNumber(stats.max_seq_num)"></dd>
-                                    </div>
-                                </dl>
+                            <div class="border-t border-gray-200">
+                                <table class="min-w-full divide-y divide-gray-200">
+                                    <thead class="bg-gray-50">
+                                        <tr>
+                                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Name</th>
+                                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">File Size</th>
+                                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Max Txn ID</th>
+                                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Txn Count</th>
+                                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Last Modified</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody class="bg-white divide-y divide-gray-200">
+                                        <template x-for="db in databases" :key="db.name">
+                                            <tr class="hover:bg-gray-50">
+                                                <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900" x-text="db.name"></td>
+                                                <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500" x-text="formatBytes(db.file_size)"></td>
+                                                <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500" x-text="formatNumber(db.max_txn_id)"></td>
+                                                <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500" x-text="formatNumber(db.txn_count)"></td>
+                                                <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500" x-text="db.last_modified"></td>
+                                            </tr>
+                                        </template>
+                                    </tbody>
+                                </table>
                             </div>
                         </div>
                     </div>
@@ -141,7 +181,9 @@
                                             <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Node ID</th>
                                             <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Address</th>
                                             <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Status</th>
+                                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Role</th>
                                             <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Incarnation</th>
+                                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Flags</th>
                                         </tr>
                                     </thead>
                                     <tbody class="bg-white divide-y divide-gray-200">
@@ -153,16 +195,105 @@
                                                     <span class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full"
                                                           :class="{
                                                             'bg-green-100 text-green-800': member.status === 'ALIVE',
-                                                            'bg-yellow-100 text-yellow-800': member.status === 'JOINING',
+                                                            'bg-yellow-100 text-yellow-800': member.status === 'JOINING' || member.status === 'SUSPECT',
                                                             'bg-red-100 text-red-800': member.status === 'DEAD',
                                                             'bg-gray-100 text-gray-800': member.status === 'REMOVED'
                                                           }" x-text="member.status"></span>
                                                 </td>
+                                                <td class="px-6 py-4 whitespace-nowrap">
+                                                    <span class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full"
+                                                          :class="member.role === 'seed' ? 'bg-purple-100 text-purple-800' : 'bg-blue-100 text-blue-800'"
+                                                          x-text="member.role || 'member'"></span>
+                                                </td>
                                                 <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500" x-text="member.incarnation"></td>
+                                                <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                                                    <span x-show="member.is_local" class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-indigo-100 text-indigo-800 mr-1">LOCAL</span>
+                                                    <span x-show="member.is_seed" class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-purple-100 text-purple-800">SEED</span>
+                                                </td>
                                             </tr>
                                         </template>
                                     </tbody>
                                 </table>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Replication Tab -->
+                    <div x-show="activeTab === 'replication'" class="px-4 py-6 sm:px-0">
+                        <!-- Watermark Info -->
+                        <div class="mb-6 grid grid-cols-1 gap-4 sm:grid-cols-2">
+                            <div class="bg-white overflow-hidden shadow rounded-lg p-4">
+                                <dt class="text-sm font-medium text-gray-500">Local Watermark</dt>
+                                <dd class="mt-1 text-2xl font-semibold text-gray-900" x-text="formatNumber(replicationStatus.local_watermark)"></dd>
+                            </div>
+                            <div class="bg-white overflow-hidden shadow rounded-lg p-4">
+                                <dt class="text-sm font-medium text-gray-500">Cluster Min Watermark</dt>
+                                <dd class="mt-1 text-2xl font-semibold text-gray-900" x-text="formatNumber(replicationStatus.cluster_min_watermark)"></dd>
+                            </div>
+                        </div>
+
+                        <!-- Peer Replication Status -->
+                        <div class="bg-white shadow overflow-hidden sm:rounded-lg">
+                            <div class="px-4 py-5 sm:px-6">
+                                <h3 class="text-lg leading-6 font-medium text-gray-900">Peer Replication Status</h3>
+                            </div>
+                            <div class="border-t border-gray-200">
+                                <template x-if="replicationStatus.peers && replicationStatus.peers.length > 0">
+                                    <div class="divide-y divide-gray-200">
+                                        <template x-for="peer in replicationStatus.peers" :key="peer.node_id">
+                                            <div class="px-4 py-4">
+                                                <div class="flex items-center justify-between mb-2">
+                                                    <div class="flex items-center">
+                                                        <span class="font-medium text-gray-900">Node <span x-text="peer.node_id"></span></span>
+                                                        <span class="ml-2 text-sm text-gray-500" x-text="peer.address"></span>
+                                                        <span class="ml-2 px-2 inline-flex text-xs leading-5 font-semibold rounded-full"
+                                                              :class="{
+                                                                'bg-green-100 text-green-800': peer.status === 'ALIVE',
+                                                                'bg-yellow-100 text-yellow-800': peer.status === 'SUSPECT',
+                                                                'bg-red-100 text-red-800': peer.status === 'DEAD'
+                                                              }" x-text="peer.status"></span>
+                                                    </div>
+                                                </div>
+                                                <table class="min-w-full divide-y divide-gray-200 mt-2">
+                                                    <thead class="bg-gray-50">
+                                                        <tr>
+                                                            <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">Database</th>
+                                                            <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">Last Applied Txn</th>
+                                                            <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">Lag</th>
+                                                            <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">Sync Status</th>
+                                                            <th class="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">Last Sync</th>
+                                                        </tr>
+                                                    </thead>
+                                                    <tbody class="bg-white divide-y divide-gray-200">
+                                                        <template x-for="db in peer.databases" :key="db.database">
+                                                            <tr>
+                                                                <td class="px-4 py-2 text-sm font-medium text-gray-900" x-text="db.database"></td>
+                                                                <td class="px-4 py-2 text-sm text-gray-500" x-text="formatNumber(db.last_applied_txn_id)"></td>
+                                                                <td class="px-4 py-2 text-sm">
+                                                                    <span :class="db.lag_txns > 100 ? 'text-red-600 font-semibold' : db.lag_txns > 10 ? 'text-yellow-600' : 'text-green-600'"
+                                                                          x-text="formatNumber(db.lag_txns)"></span>
+                                                                </td>
+                                                                <td class="px-4 py-2">
+                                                                    <span class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full"
+                                                                          :class="{
+                                                                            'bg-green-100 text-green-800': db.sync_status === 'SYNCED',
+                                                                            'bg-yellow-100 text-yellow-800': db.sync_status === 'CATCHING_UP',
+                                                                            'bg-red-100 text-red-800': db.sync_status === 'FAILED',
+                                                                            'bg-gray-100 text-gray-800': db.sync_status === 'UNKNOWN'
+                                                                          }" x-text="db.sync_status"></span>
+                                                                </td>
+                                                                <td class="px-4 py-2 text-sm text-gray-500" x-text="db.last_sync_time || 'Never'"></td>
+                                                            </tr>
+                                                        </template>
+                                                    </tbody>
+                                                </table>
+                                            </div>
+                                        </template>
+                                    </div>
+                                </template>
+                                <div x-show="!replicationStatus.peers || replicationStatus.peers.length === 0" class="text-center py-12">
+                                    <p class="text-gray-500">No peer replication data available (single node cluster)</p>
+                                </div>
                             </div>
                         </div>
                     </div>
@@ -172,9 +303,12 @@
                         <div class="bg-white shadow overflow-hidden sm:rounded-lg">
                             <div class="px-4 py-5 sm:px-6">
                                 <h3 class="text-lg leading-6 font-medium text-gray-900">Transaction Data</h3>
-                                <div class="mt-2 flex space-x-4">
-                                    <button @click="loadTransactions('pending')" class="px-3 py-2 text-sm font-medium rounded-md text-white bg-indigo-600 hover:bg-indigo-700">Pending</button>
-                                    <button @click="loadTransactions('committed')" class="px-3 py-2 text-sm font-medium rounded-md text-gray-700 bg-white border border-gray-300 hover:bg-gray-50">Committed</button>
+                                <div class="mt-2 flex space-x-2">
+                                    <template x-for="status in ['pending', 'committed', 'aborted', 'all']" :key="status">
+                                        <button @click="loadTransactions(status)"
+                                            :class="transactionsType === status ? 'bg-indigo-600 text-white' : 'bg-white text-gray-700 border border-gray-300 hover:bg-gray-50'"
+                                            class="px-3 py-2 text-sm font-medium rounded-md capitalize" x-text="status"></button>
+                                    </template>
                                 </div>
                             </div>
                             <div class="border-t border-gray-200">
@@ -189,12 +323,13 @@
                                                 <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Node ID</th>
                                                 <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Status</th>
                                                 <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Created At</th>
+                                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Actions</th>
                                             </tr>
                                         </thead>
                                         <tbody class="bg-white divide-y divide-gray-200">
                                             <template x-for="(txn, idx) in transactions" :key="txn.txn_id + '-' + idx">
-                                                <tr @click="showDetail('Transaction ' + txn.txn_id, txn)" class="cursor-pointer hover:bg-gray-50">
-                                                    <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900" x-text="txn.txn_id"></td>
+                                                <tr class="hover:bg-gray-50">
+                                                    <td @click="showDetail('Transaction ' + txn.txn_id, txn)" class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900 cursor-pointer" x-text="txn.txn_id"></td>
                                                     <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500" x-text="txn.node_id"></td>
                                                     <td class="px-6 py-4 whitespace-nowrap">
                                                         <span class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full"
@@ -205,6 +340,15 @@
                                                               }" x-text="txn.status"></span>
                                                     </td>
                                                     <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500" x-text="txn.created_at || 'N/A'"></td>
+                                                    <td class="px-6 py-4 whitespace-nowrap text-sm">
+                                                        <button x-show="txn.status === 'PENDING'"
+                                                                @click.stop="abortTransaction(txn.txn_id)"
+                                                                :disabled="abortingTxn === txn.txn_id"
+                                                                class="text-red-600 hover:text-red-900 disabled:opacity-50">
+                                                            <span x-show="abortingTxn === txn.txn_id" class="loading-spinner mr-1"></span>
+                                                            <span x-text="abortingTxn === txn.txn_id ? 'Aborting...' : 'Abort'"></span>
+                                                        </button>
+                                                    </td>
                                                 </tr>
                                             </template>
                                         </tbody>
@@ -309,16 +453,18 @@
                 psk: '',
                 loggingIn: false,
                 loginError: '',
-                
+
                 // UI state
                 activeTab: 'overview',
                 selectedDatabase: 'marmot',
-                databases: ['marmot'],
+                databases: [],
                 loading: false,
-                
+
                 // Data
                 stats: { max_committed_txn_id: 0, committed_txn_count: 0, pending_txns: 0, intent_filter_size: 0, max_seq_num: 0 },
                 clusterMembers: [],
+                clusterHealth: { healthy: true, total_nodes: 0, alive_nodes: 0, quorum_size: 0, local_node_id: 0 },
+                replicationStatus: { peers: [], local_watermark: 0, cluster_min_watermark: 0 },
                 transactions: [],
                 intents: [],
 
@@ -329,7 +475,7 @@
                 showDetailModal: false,
                 detailTitle: '',
                 detailData: null,
-                
+
                 // Pagination
                 transactionsHasMore: false,
                 transactionsLastKey: '',
@@ -337,7 +483,10 @@
                 intentsHasMore: false,
                 intentsLastKey: '',
                 loadingMore: false,
-                
+
+                // Abort state
+                abortingTxn: null,
+
                 init() {
                     const savedPsk = localStorage.getItem('marmot_psk');
                     if (savedPsk) {
@@ -346,20 +495,20 @@
                         this.loadData();
                     }
                 },
-                
+
                 getHeaders() {
                     return this.psk ? { 'X-Marmot-Secret': this.psk } : {};
                 },
-                
+
                 async login() {
                     this.loggingIn = true;
                     this.loginError = '';
-                    
+
                     try {
                         const response = await fetch('/admin/cluster/members', {
                             headers: this.getHeaders()
                         });
-                        
+
                         if (response.ok) {
                             this.authenticated = true;
                             if (this.psk) {
@@ -377,25 +526,52 @@
                         this.loggingIn = false;
                     }
                 },
-                
+
                 logout() {
                     this.authenticated = false;
                     this.psk = '';
                     localStorage.removeItem('marmot_psk');
                 },
-                
+
                 setActiveTab(tab) {
                     this.activeTab = tab;
                     if (tab === 'cluster') this.loadClusterMembers();
+                    else if (tab === 'replication') this.loadReplicationStatus();
                     else if (tab === 'transactions') this.loadTransactions('pending');
                     else if (tab === 'intents') this.loadIntents();
-                    else if (tab === 'overview') this.loadStats();
+                    else if (tab === 'overview') {
+                        this.loadStats();
+                        this.loadClusterHealth();
+                    }
                 },
-                
+
                 async loadData() {
-                    await Promise.all([this.loadStats(), this.loadClusterMembers()]);
+                    await Promise.all([
+                        this.loadDatabases(),
+                        this.loadStats(),
+                        this.loadClusterMembers(),
+                        this.loadClusterHealth()
+                    ]);
                 },
-                
+
+                async loadDatabases() {
+                    try {
+                        const response = await fetch('/admin/databases', {
+                            headers: this.getHeaders()
+                        });
+                        if (response.ok) {
+                            const data = await response.json();
+                            this.databases = data.data || [];
+                            if (this.databases.length > 0 && !this.databases.find(db => db.name === this.selectedDatabase)) {
+                                this.selectedDatabase = this.databases[0].name;
+                            }
+                        }
+                    } catch (error) {
+                        console.error('Failed to load databases:', error);
+                        this.databases = [{ name: 'marmot', file_size: 0, max_txn_id: 0, txn_count: 0 }];
+                    }
+                },
+
                 async loadStats() {
                     try {
                         const response = await fetch(`/admin/${this.selectedDatabase}/metadata/stats`, {
@@ -409,7 +585,7 @@
                         console.error('Failed to load stats:', error);
                     }
                 },
-                
+
                 async loadClusterMembers() {
                     try {
                         const response = await fetch('/admin/cluster/members', {
@@ -423,7 +599,35 @@
                         console.error('Failed to load cluster members:', error);
                     }
                 },
-                
+
+                async loadClusterHealth() {
+                    try {
+                        const response = await fetch('/admin/cluster/health', {
+                            headers: this.getHeaders()
+                        });
+                        if (response.ok || response.status === 503) {
+                            const data = await response.json();
+                            this.clusterHealth = data.data || this.clusterHealth;
+                        }
+                    } catch (error) {
+                        console.error('Failed to load cluster health:', error);
+                    }
+                },
+
+                async loadReplicationStatus() {
+                    try {
+                        const response = await fetch('/admin/cluster/replication', {
+                            headers: this.getHeaders()
+                        });
+                        if (response.ok) {
+                            const data = await response.json();
+                            this.replicationStatus = data.data || this.replicationStatus;
+                        }
+                    } catch (error) {
+                        console.error('Failed to load replication status:', error);
+                    }
+                },
+
                 async loadTransactions(type, append = false) {
                     if (append) {
                         this.loadingMore = true;
@@ -433,7 +637,7 @@
                         this.transactionsLastKey = '';
                     }
                     try {
-                        let url = `/admin/${this.selectedDatabase}/metadata/transactions/${type}`;
+                        let url = `/admin/${this.selectedDatabase}/metadata/transactions/status/${type}`;
                         if (append && this.transactionsLastKey) {
                             url += `?from=${this.transactionsLastKey}`;
                         }
@@ -461,11 +665,42 @@
                         this.loadingMore = false;
                     }
                 },
-                
+
                 loadMoreTransactions() {
                     this.loadTransactions(this.transactionsType, true);
                 },
-                
+
+                async abortTransaction(txnId) {
+                    if (!confirm(`Are you sure you want to abort transaction ${txnId}?`)) {
+                        return;
+                    }
+
+                    this.abortingTxn = txnId;
+                    try {
+                        const response = await fetch(`/admin/${this.selectedDatabase}/transactions/${txnId}/abort`, {
+                            method: 'POST',
+                            headers: {
+                                ...this.getHeaders(),
+                                'Content-Type': 'application/json'
+                            },
+                            body: JSON.stringify({ reason: 'Aborted via admin UI' })
+                        });
+
+                        if (response.ok) {
+                            // Refresh transactions list
+                            await this.loadTransactions(this.transactionsType);
+                        } else {
+                            const data = await response.json();
+                            alert(`Failed to abort transaction: ${data.error || 'Unknown error'}`);
+                        }
+                    } catch (error) {
+                        console.error('Failed to abort transaction:', error);
+                        alert('Failed to abort transaction');
+                    } finally {
+                        this.abortingTxn = null;
+                    }
+                },
+
                 async loadIntents(append = false) {
                     if (append) {
                         this.loadingMore = true;
@@ -503,7 +738,7 @@
                         this.loadingMore = false;
                     }
                 },
-                
+
                 loadMoreIntents() {
                     this.loadIntents(true);
                 },
@@ -512,23 +747,34 @@
                     if (num === undefined || num === null) return '0';
                     return num.toLocaleString();
                 },
-                
+
+                formatBytes(bytes) {
+                    if (!bytes) return '0 B';
+                    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+                    let i = 0;
+                    while (bytes >= 1024 && i < units.length - 1) {
+                        bytes /= 1024;
+                        i++;
+                    }
+                    return bytes.toFixed(i > 0 ? 1 : 0) + ' ' + units[i];
+                },
+
                 formatTimestamp(timestamp) {
                     if (!timestamp) return 'N/A';
                     return new Date(timestamp / 1000000).toISOString();
                 },
-                
+
                 showDetail(title, data) {
                     this.detailTitle = title;
                     this.detailData = data;
                     this.showDetailModal = true;
                 },
-                
+
                 closeDetail() {
                     this.showDetailModal = false;
                     this.detailData = null;
                 },
-                
+
                 formatJSON(data) {
                     return JSON.stringify(data, null, 2);
                 }
