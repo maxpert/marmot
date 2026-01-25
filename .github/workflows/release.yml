@@ -125,6 +125,6 @@ jobs:
 
       - name: Upload release tarball
         uses: softprops/action-gh-release@v2
-        if: github.event_name == 'release'
+        if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
         with:
           files: marmot-${{ env.VERSION }}-${{ env.GOOS }}-${{ env.GOARCH }}${{ env.SUFFIX }}.tar.gz
