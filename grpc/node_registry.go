@@ -257,6 +257,11 @@ func (nr *NodeRegistry) Get(nodeID uint64) (*NodeState, bool) {
 	return copyNodeState(node), true
 }
 
+// GetLocalNodeID returns the local node's ID
+func (nr *NodeRegistry) GetLocalNodeID() uint64 {
+	return nr.localNodeID
+}
+
 // GetAll returns all nodes (returns copies to avoid race conditions)
 func (nr *NodeRegistry) GetAll() []*NodeState {
 	nr.mu.RLock()

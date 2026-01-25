@@ -16,12 +16,23 @@ func RegisterRoutes(mux *http.ServeMux, handlers *AdminHandlers) {
 	// Admin UI
 	r.Get("/", handlers.ServeUI)
 
+	// List all databases (auth required)
+	r.With(chiAuthMiddleware).Get("/databases", handlers.handleListDatabases)
+
 	// Cluster management endpoints
 	r.Route("/cluster", func(r chi.Router) {
 		r.Use(chiAuthMiddleware)
 		r.Get("/members", handlers.handleClusterMembers)
+		r.Get("/health", handlers.handleClusterHealth)
+		r.Get("/replication", handlers.handleClusterReplication)
 		r.Post("/remove/{nodeID}", handlers.handleClusterRemove)
 		r.Post("/allow/{nodeID}", handlers.handleClusterAllow)
+	})
+
+	// Per-database transaction operations (outside metadata path)
+	r.Route("/{database}/transactions", func(r chi.Router) {
+		r.Use(chiAuthMiddleware)
+		r.Post("/{txnID}/abort", handlers.handleAbortTransaction)
 	})
 
 	// Database-specific metadata endpoints
@@ -37,6 +48,7 @@ func RegisterRoutes(mux *http.ServeMux, handlers *AdminHandlers) {
 		r.Get("/transactions/pending", handlers.wrapWithMeta(handlers.handlePendingTransactions))
 		r.Get("/transactions/committed", handlers.wrapWithMeta(handlers.handleCommittedTransactions))
 		r.Get("/transactions/range", handlers.wrapWithMeta(handlers.handleTransactionRange))
+		r.Get("/transactions/status/{status}", handlers.wrapWithMeta(handlers.handleTransactionsByStatus))
 		r.Get("/transactions/{txnID}", handlers.txnByID)
 
 		// Intents
