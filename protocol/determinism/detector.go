@@ -185,7 +185,6 @@ type deterministicChecker struct {
 	hasSubquery       bool
 	hasColumnInSet    bool
 	hasLimitNoOrderBy bool
-	inUpdateSet       bool // Track if we're inside UPDATE SET clause
 }
 
 func (c *deterministicChecker) Visit(node sql.Node) (sql.Visitor, sql.Node, error) {

@@ -7,22 +7,6 @@ import (
 	"time"
 )
 
-// waitForRowCount polls until expected row count or timeout
-func waitForRowCount(t *testing.T, db *sql.DB, table string, expected int, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		var count int
-		err := db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s", table)).Scan(&count)
-		if err == nil && count == expected {
-			return nil
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	var actual int
-	db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s", table)).Scan(&actual)
-	return fmt.Errorf("timeout: expected %d rows, got %d", expected, actual)
-}
-
 // waitForRowCountOnNode waits for expected row count on a specific node
 func waitForRowCountOnNode(t *testing.T, harness *ClusterHarness, nodeID int, table string, expected int, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)

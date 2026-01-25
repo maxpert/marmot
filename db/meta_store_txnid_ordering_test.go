@@ -597,32 +597,6 @@ func TestTxnIDOrdering_ScanTransactionsDescending(t *testing.T) {
 	})
 }
 
-// createTxnIDOrderingTestStore is a helper to create store for these tests.
-func createTxnIDOrderingTestStore(t *testing.T) (*PebbleMetaStore, func()) {
-	tmpDir, err := os.MkdirTemp("", "txnid_ordering_test")
-	if err != nil {
-		t.Fatalf("failed to create temp dir: %v", err)
-	}
-
-	metaPath := filepath.Join(tmpDir, "test_meta.pebble")
-	store, err := NewPebbleMetaStore(metaPath, PebbleMetaStoreOptions{
-		CacheSizeMB:    32,
-		MemTableSizeMB: 8,
-		MemTableCount:  2,
-	})
-	if err != nil {
-		os.RemoveAll(tmpDir)
-		t.Fatalf("failed to create pebble meta store: %v", err)
-	}
-
-	cleanup := func() {
-		store.Close()
-		os.RemoveAll(tmpDir)
-	}
-
-	return store, cleanup
-}
-
 // createBenchmarkPebbleMetaStore creates a PebbleMetaStore for benchmarks.
 func createBenchmarkPebbleMetaStore(b *testing.B) (*PebbleMetaStore, func()) {
 	tmpDir, err := os.MkdirTemp("", "benchmark_pebble")

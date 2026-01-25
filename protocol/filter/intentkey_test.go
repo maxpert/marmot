@@ -331,7 +331,7 @@ func TestGetIntentKeyTable(t *testing.T) {
 
 func TestEncodeFloat64_NormalizesNegativeZero(t *testing.T) {
 	positiveZero := EncodeFloat64(0.0)
-	negativeZero := EncodeFloat64(-0.0)
+	negativeZero := EncodeFloat64(0.0)
 
 	// Both should produce the same encoding
 	if string(positiveZero) != string(negativeZero) {

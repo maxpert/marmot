@@ -572,9 +572,8 @@ func TestCreateTransformer(t *testing.T) {
 		require.NoError(t, err)
 		require.NotNil(t, trans)
 
-		// Verify it's the right type
-		_, ok := trans.(Transformer)
-		assert.True(t, ok)
+		// Transformer interface is already satisfied by trans
+		assert.NotNil(t, trans)
 	})
 
 	t.Run("rejects unknown format", func(t *testing.T) {

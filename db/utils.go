@@ -21,30 +21,6 @@ type EnhancedRows struct {
 	*sql.Rows
 }
 
-func (rs *EnhancedRows) fetchRow() (map[string]any, error) {
-	columns, err := rs.Columns()
-	if err != nil {
-		return nil, err
-	}
-
-	scanRow := make([]any, len(columns))
-	rowPointers := make([]any, len(columns))
-	for i := range scanRow {
-		rowPointers[i] = &scanRow[i]
-	}
-
-	if err := rs.Scan(rowPointers...); err != nil {
-		return nil, err
-	}
-
-	row := make(map[string]any)
-	for i, column := range columns {
-		row[column] = scanRow[i]
-	}
-
-	return row, nil
-}
-
 func (rs *EnhancedRows) Finalize() {
 	err := rs.Close()
 	if err != nil {

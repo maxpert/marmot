@@ -129,10 +129,7 @@ func (svm *SchemaVersionManager) WaitForSchemaVersion(database string, targetVer
 			return fmt.Errorf("timeout waiting for schema version %d (current: %d)", targetVersion, currentVersion)
 		}
 
-		select {
-		case <-ticker.C:
-			// Continue waiting
-		}
+		<-ticker.C
 	}
 }
 

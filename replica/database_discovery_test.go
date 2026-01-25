@@ -224,6 +224,9 @@ func TestDiscoverNewDatabases_RespectsReplicateDatabasesFilter(t *testing.T) {
 	}
 	client.mu.RUnlock()
 
+	// Verify databases were discovered
+	assert.Greater(t, len(databases), 0, "Expected databases to be discovered")
+
 	// Note: This test verifies behavior - actual implementation should filter
 	// For now, just verify GetLatestTxnIDs was called
 	mockClient.AssertExpectations(t)

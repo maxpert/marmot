@@ -1411,7 +1411,6 @@ func (s *Server) TransactionStream(stream grpc.ClientStreamingServer[Transaction
 						ErrorMessage: fmt.Sprintf("database %s not found: %v", database, err),
 					})
 				}
-				metaStore = dbInstance.GetMetaStore()
 				txnMgr = dbInstance.GetTransactionManager()
 			}
 

@@ -433,28 +433,6 @@ func (ae *AntiEntropyService) findBestPeerForDatabase(ctx context.Context, alive
 	return bestPeer
 }
 
-// syncPeer checks and syncs a single peer across all databases
-func (ae *AntiEntropyService) syncPeer(ctx context.Context, peer *NodeState) {
-	log.Debug().
-		Uint64("peer_node", peer.NodeId).
-		Str("peer_addr", peer.Address).
-		Msg("Checking peer replication state")
-
-	// Get list of all databases
-	databases := ae.dbManager.ListDatabases()
-
-	for _, dbName := range databases {
-		if err := ae.syncPeerDatabase(ctx, peer, dbName); err != nil {
-			log.Warn().
-				Err(err).
-				Uint64("peer_node", peer.NodeId).
-				Str("database", dbName).
-				Msg("Failed to sync database with peer")
-			// Continue with other databases
-		}
-	}
-}
-
 // syncPeerDatabase syncs a single database with a peer
 // In a leaderless system, we need to compare our local max txn ID with the peer's
 // If peer has more transactions, we pull from them

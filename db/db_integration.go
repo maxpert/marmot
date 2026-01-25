@@ -457,7 +457,6 @@ func (mdb *ReplicatedDatabase) ApplyCDCEntries(entries []*IntentEntry) error {
 // The SQLite transaction is held open until Commit or Rollback is called
 type PendingLocalExecution struct {
 	session *EphemeralHookSession // Ephemeral session (owns its connection)
-	db      *ReplicatedDatabase
 }
 
 // CompletedLocalExecution represents a CDC capture that's already been rolled back.

@@ -501,12 +501,8 @@ func (s *StreamClient) connect(ctx context.Context) error {
 	keepaliveTime := time.Duration(cfg.Config.GRPCClient.KeepaliveTimeSeconds) * time.Second
 	keepaliveTimeout := time.Duration(cfg.Config.GRPCClient.KeepaliveTimeoutSeconds) * time.Second
 
-	dialCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-
-	conn, err := grpc.DialContext(dialCtx, s.currentAddr,
+	conn, err := grpc.NewClient(s.currentAddr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithBlock(),
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{
 			Time:                keepaliveTime,
 			Timeout:             keepaliveTimeout,
@@ -520,7 +516,7 @@ func (s *StreamClient) connect(ctx context.Context) error {
 		grpc.WithChainStreamInterceptor(marmotgrpc.StreamClientInterceptorWithSecret(replicaSecret)),
 	)
 	if err != nil {
-		return fmt.Errorf("failed to dial master: %w", err)
+		return fmt.Errorf("failed to create client for master: %w", err)
 	}
 
 	s.conn = conn
@@ -741,8 +737,12 @@ func (s *StreamClient) applySnapshot(ctx context.Context, snapshotInfo *marmotgr
 	}
 
 	// Convert gRPC DatabaseFileInfo to snapshot.DatabaseFileInfo
+	// Filter out system database - replicas maintain their own independent system DB
 	files := make([]snapshot.DatabaseFileInfo, 0, len(snapshotInfo.Databases))
 	for _, dbInfo := range snapshotInfo.Databases {
+		if dbInfo.Name == db.SystemDatabaseName {
+			continue
+		}
 		files = append(files, snapshot.DatabaseFileInfo{
 			Name:           dbInfo.Name,
 			Filename:       dbInfo.Filename,
@@ -1078,9 +1078,8 @@ func (s *StreamClient) dialWithPSK(ctx context.Context, addr string) (*grpc.Clie
 	keepaliveTime := time.Duration(cfg.Config.GRPCClient.KeepaliveTimeSeconds) * time.Second
 	keepaliveTimeout := time.Duration(cfg.Config.GRPCClient.KeepaliveTimeoutSeconds) * time.Second
 
-	conn, err := grpc.DialContext(ctx, addr,
+	conn, err := grpc.NewClient(addr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithBlock(),
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{
 			Time:                keepaliveTime,
 			Timeout:             keepaliveTimeout,

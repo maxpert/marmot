@@ -91,7 +91,7 @@ func (tn *testNode) dialFunc(context.Context, string) (net.Conn, error) {
 
 // connectTo establishes a connection to another test node
 func (tn *testNode) connectTo(other *testNode) error {
-	conn, err := grpc.Dial(
+	conn, err := grpc.NewClient(
 		fmt.Sprintf("node-%d", other.nodeID),
 		grpc.WithContextDialer(other.dialFunc),
 		grpc.WithTransportCredentials(insecure.NewCredentials()),

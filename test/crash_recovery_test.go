@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -1088,13 +1087,4 @@ func TestHighLoadRecovery(t *testing.T) {
 	}
 
 	t.Logf("SUCCESS: Node 3 recovered and caught up to %d rows", expectedTotal)
-}
-
-// Helper to parse PID from file
-func readPIDFile(path string) (int, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return 0, err
-	}
-	return strconv.Atoi(strings.TrimSpace(string(data)))
 }

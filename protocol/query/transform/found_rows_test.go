@@ -261,7 +261,7 @@ func TestSQLCalcFoundRowsRule_PreservesParameters(t *testing.T) {
 		t.Fatalf("Transform failed: %v", err)
 	}
 
-	if result == nil || len(result) == 0 {
+	if len(result) == 0 {
 		t.Fatal("expected result, got nil or empty")
 	}
 
@@ -302,7 +302,7 @@ func TestSQLCalcFoundRowsRule_ThreadSafety(t *testing.T) {
 				t.Errorf("Transform failed: %v", err)
 				return
 			}
-			if result == nil || len(result) == 0 {
+			if len(result) == 0 {
 				t.Error("expected result, got nil or empty")
 				return
 			}

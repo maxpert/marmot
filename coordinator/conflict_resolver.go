@@ -1,7 +1,6 @@
 package coordinator
 
 import (
-	"github.com/maxpert/marmot/cfg"
 	"github.com/maxpert/marmot/hlc"
 )
 
@@ -116,14 +115,6 @@ func IsConflict(ts1, ts2 hlc.Timestamp, thresholdNanos int64) bool {
 	}
 
 	return diff <= thresholdNanos
-}
-
-// getConflictWindow returns the conflict window duration in nanoseconds
-func getConflictWindow() int64 {
-	if cfg.Config != nil {
-		return int64(cfg.Config.Transaction.ConflictWindowSeconds) * 1000 * 1000 * 1000
-	}
-	return 10 * 1000 * 1000 * 1000 // Default: 10 seconds
 }
 
 // DefaultConflictHandler handles write-write conflicts by aborting the transaction

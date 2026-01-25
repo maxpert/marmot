@@ -365,22 +365,6 @@ func pebbleIntentByTxnPrefix(txnID uint64) []byte {
 	return buildKeyUint64(pebblePrefixIntentByTxn, txnID)
 }
 
-// parseIntentByTxnKey extracts tableName and intentKey from an intentByTxn index key
-func parseIntentByTxnKey(key []byte, prefixLen int) (tableName, intentKey string, ok bool) {
-	offset := prefixLen
-	if len(key) < offset+2 {
-		return "", "", false
-	}
-	tableNameLen := int(binary.BigEndian.Uint16(key[offset:]))
-	offset += 2
-	if len(key) < offset+tableNameLen {
-		return "", "", false
-	}
-	tableName = string(key[offset : offset+tableNameLen])
-	intentKey = string(key[offset+tableNameLen:])
-	return tableName, intentKey, true
-}
-
 func pebbleCdcRawKey(txnID, seq uint64) []byte {
 	return buildKeyUint64x2(pebblePrefixCDCRaw, txnID, seq)
 }
