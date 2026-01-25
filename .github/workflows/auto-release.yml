@@ -1,0 +1,134 @@
+name: Auto Release from Tag
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get previous tag
+        id: prev_tag
+        run: |
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          echo "tag=$PREV_TAG" >> $GITHUB_OUTPUT
+
+      - name: Generate Release Notes
+        id: notes
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF#refs/tags/}"
+          PREV_TAG="${{ steps.prev_tag.outputs.tag }}"
+
+          if [ -z "$PREV_TAG" ]; then
+            COMMITS=$(git log --oneline --no-merges)
+          else
+            COMMITS=$(git log "${PREV_TAG}..${TAG}" --oneline --no-merges)
+          fi
+
+          # Helper function to safely print commits without variable expansion
+          filter_commits() {
+            local pattern="$1"
+            local prefix="$2"
+            printf '%s\n' "$COMMITS" | grep -iE "$pattern" | sed -E 's/^[a-fA-F0-9]+ /- /' | sed -E "s/$prefix//" || true
+          }
+
+          {
+            echo "## What's Changed"
+            echo ""
+
+            # Features
+            FEATURES=$(filter_commits "^[a-fA-F0-9]+ [Ff]eat(\([^)]*\))?:" '[Ff]eat(\([^)]*\))?:')
+            if [ -n "$FEATURES" ]; then
+              echo "### 🚀 New Features"
+              printf '%s\n' "$FEATURES"
+              echo ""
+            fi
+
+            # Fixes
+            FIXES=$(filter_commits "^[a-fA-F0-9]+ [Ff]ix(\([^)]*\))?:" '[Ff]ix(\([^)]*\))?:')
+            if [ -n "$FIXES" ]; then
+              echo "### 🐛 Bug Fixes"
+              printf '%s\n' "$FIXES"
+              echo ""
+            fi
+
+            # Performance
+            PERF=$(filter_commits "^[a-fA-F0-9]+ [Pp]erf(\([^)]*\))?:" '[Pp]erf(\([^)]*\))?:')
+            if [ -n "$PERF" ]; then
+              echo "### ⚡ Performance"
+              printf '%s\n' "$PERF"
+              echo ""
+            fi
+
+            # Refactor
+            REFACTOR=$(filter_commits "^[a-fA-F0-9]+ [Rr]efactor(\([^)]*\))?:" '[Rr]efactor(\([^)]*\))?:')
+            if [ -n "$REFACTOR" ]; then
+              echo "### 🔧 Refactoring"
+              printf '%s\n' "$REFACTOR"
+              echo ""
+            fi
+
+            # Docs
+            DOCS=$(filter_commits "^[a-fA-F0-9]+ [Dd]ocs?(\([^)]*\))?:" '[Dd]ocs?(\([^)]*\))?:')
+            if [ -n "$DOCS" ]; then
+              echo "### 📖 Documentation"
+              printf '%s\n' "$DOCS"
+              echo ""
+            fi
+
+            # Chore
+            CHORE=$(filter_commits "^[a-fA-F0-9]+ [Cc]hore(\([^)]*\))?:" '[Cc]hore(\([^)]*\))?:')
+            if [ -n "$CHORE" ]; then
+              echo "### 🧹 Maintenance"
+              printf '%s\n' "$CHORE"
+              echo ""
+            fi
+
+            # Test
+            TEST=$(filter_commits "^[a-fA-F0-9]+ [Tt]est(\([^)]*\))?:" '[Tt]est(\([^)]*\))?:')
+            if [ -n "$TEST" ]; then
+              echo "### 🧪 Testing"
+              printf '%s\n' "$TEST"
+              echo ""
+            fi
+
+            # Other (non-conventional commits)
+            OTHER=$(printf '%s\n' "$COMMITS" | grep -viE "^[a-fA-F0-9]+ (feat|fix|perf|refactor|docs?|chore|test)(\([^)]*\))?:" | sed -E 's/^[a-fA-F0-9]+ /- /' || true)
+            if [ -n "$OTHER" ]; then
+              echo "### 📦 Other Changes"
+              printf '%s\n' "$OTHER"
+              echo ""
+            fi
+
+            echo "---"
+            if [ -n "$PREV_TAG" ]; then
+              echo "**Full Changelog**: https://github.com/${{ github.repository }}/compare/${PREV_TAG}...${TAG}"
+            fi
+          } > release_notes.md
+
+          cat release_notes.md
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          body_path: release_notes.md
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') }}
+
+      - name: Trigger Build Workflow
+        run: gh workflow run release.yml --ref ${{ github.ref_name }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
