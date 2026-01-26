@@ -209,8 +209,24 @@ Marmot supports the following command-line flags that override config file setti
 | `-grpc-port` | gRPC port (overrides `cluster.grpc_port` in config) |
 | `-mysql-port` | MySQL port (overrides `mysql.port` in config) |
 | `-follow-addresses` | Comma-separated addresses for replica mode |
+| `-daemon` | Run as background daemon (detached from terminal) |
+| `-pid-file` | PID file path (used with `-daemon`) |
 
 **Example:**
 ```bash
 ./marmot -config=/etc/marmot/config.toml -data-dir=/var/lib/marmot -grpc-port=8081 -mysql-port=3307
 ```
+
+**Running as Daemon:**
+```bash
+# Start as daemon with PID file
+./marmot -config=/etc/marmot/config.toml -daemon -pid-file=/var/run/marmot.pid
+
+# Check if running
+cat /var/run/marmot.pid
+
+# Stop daemon
+kill $(cat /var/run/marmot.pid)
+```
+
+**Note:** When running as daemon, configure `logging.file` in config to capture logs since stdout/stderr are detached.

@@ -61,6 +61,9 @@ Marmot excels at **read-heavy edge scenarios**:
 # Start a single-node cluster
 ./marmot-v2
 
+# Or run as daemon (background)
+./marmot-v2 -daemon -pid-file=/tmp/marmot/marmot.pid
+
 # Connect with MySQL client
 mysql -h localhost -P 3306 -u root
 

@@ -223,6 +223,8 @@ var (
 	GRPCPortFlag    = flag.Int("grpc-port", 0, "gRPC port (overrides config)")
 	MySQLPortFlag   = flag.Int("mysql-port", 0, "MySQL port (overrides config)")
 	FollowAddrsFlag = flag.String("follow-addresses", "", "Comma-separated addresses for replica mode")
+	DaemonFlag      = flag.Bool("daemon", false, "Run as daemon (background process)")
+	PidFileFlag     = flag.String("pid-file", "", "PID file path (used with -daemon)")
 )
 
 // Default configuration

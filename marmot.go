@@ -6,6 +6,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/maxpert/marmot/admin"
@@ -61,6 +65,12 @@ func (a *dbManagerAdapter) GetDatabase(name string) telemetry.StatsProvider {
 
 func main() {
 	flag.Parse()
+
+	// Handle daemonization before anything else
+	if *cfg.DaemonFlag {
+		daemonize()
+		return
+	}
 
 	// Load configuration
 	err := cfg.Load(*cfg.ConfigPathFlag)
@@ -539,4 +549,71 @@ func startGossip(server *marmotgrpc.Server) (*marmotgrpc.Client, *marmotgrpc.Gos
 	gossip.Start(gossipConfig)
 
 	return client, gossip
+}
+
+// daemonize spawns the process as a background daemon
+func daemonize() {
+	// Build args without -daemon flag to avoid infinite loop
+	args := []string{}
+	for i := 1; i < len(os.Args); i++ {
+		arg := os.Args[i]
+		if arg == "-daemon" || arg == "--daemon" {
+			continue
+		}
+		// Skip -daemon=true or --daemon=true
+		if len(arg) > 7 && (arg[:8] == "-daemon=" || arg[:9] == "--daemon=") {
+			continue
+		}
+		args = append(args, arg)
+	}
+
+	// Get executable path
+	executable, err := os.Executable()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to get executable path: %v\n", err)
+		os.Exit(1)
+	}
+	executable, err = filepath.EvalSymlinks(executable)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to resolve executable path: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Create command for child process
+	cmd := exec.Command(executable, args...)
+
+	// Detach from parent process group
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Setsid: true, // Create new session
+	}
+
+	// Redirect stdin from /dev/null
+	cmd.Stdin = nil
+
+	// For daemon mode, we rely on file logging (-logging.file config)
+	// Stdout/stderr go to /dev/null unless log file is configured
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+
+	// Start the daemon process
+	if err := cmd.Start(); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to start daemon: %v\n", err)
+		os.Exit(1)
+	}
+
+	pid := cmd.Process.Pid
+	fmt.Printf("Marmot daemon started with PID %d\n", pid)
+
+	// Write PID file if requested
+	if *cfg.PidFileFlag != "" {
+		pidDir := filepath.Dir(*cfg.PidFileFlag)
+		if err := os.MkdirAll(pidDir, 0755); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: Failed to create PID file directory: %v\n", err)
+		} else if err := os.WriteFile(*cfg.PidFileFlag, []byte(strconv.Itoa(pid)), 0644); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: Failed to write PID file: %v\n", err)
+		}
+	}
+
+	// Detach from child - parent exits, child continues
+	cmd.Process.Release()
 }
