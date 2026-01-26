@@ -61,8 +61,12 @@ type MySQLConfiguration struct {
 
 // LoggingConfiguration controls logging behavior
 type LoggingConfiguration struct {
-	Verbose bool   `toml:"verbose"`
-	Format  string `toml:"format"` // "console" or "json"
+	Verbose    bool   `toml:"verbose"`
+	Format     string `toml:"format"`      // "console" or "json"
+	File       string `toml:"file"`        // Log file path (empty = stdout only)
+	MaxSizeMB  int    `toml:"max_size_mb"` // Max size in MB before rotation (default: 100)
+	MaxBackups int    `toml:"max_backups"` // Number of old log files to keep (default: 5)
+	Compress   bool   `toml:"compress"`    // Compress rotated files with gzip
 }
 
 // PrometheusConfiguration for metrics
@@ -305,8 +309,12 @@ var Config = &Configuration{
 	},
 
 	Logging: LoggingConfiguration{
-		Verbose: false,
-		Format:  "json", // Use "json" for production (21% faster than "console")
+		Verbose:    false,
+		Format:     "json", // Use "json" for production (21% faster than "console")
+		File:       "",     // Empty = stdout only
+		MaxSizeMB:  100,    // 100MB before rotation
+		MaxBackups: 5,      // Keep 5 old log files
+		Compress:   true,   // Compress rotated files
 	},
 
 	Prometheus: PrometheusConfiguration{
@@ -342,7 +350,7 @@ var Config = &Configuration{
 	},
 }
 
-// Load loads configuration from file and applies CLI overrides
+// Load loads configuration from file
 func Load(configPath string) error {
 	// Load from file if it exists
 	if configPath != "" {

@@ -172,3 +172,45 @@ auto_id_mode = "compact"  # "compact" (53-bit, default) or "extended" (64-bit)
 **Auto ID Mode:**
 - `"compact"` (default): Generates 53-bit IDs that are safe for all clients including JavaScript (`Number.MAX_SAFE_INTEGER`). Format: 41 bits timestamp + 6 bits node + 6 bits sequence. Supports ~69 years from epoch (Jan 2, 2025) with 64K IDs/sec per node.
 - `"extended"`: Generates full 64-bit HLC-based IDs for maximum uniqueness and ordering guarantees. Use when all clients support 64-bit integers natively.
+
+## Logging
+
+```toml
+[logging]
+verbose = false          # Enable verbose logging (debug level)
+format = "json"          # Log format: "console" or "json" (json is 21% faster)
+file = ""                # Log file path (empty = stdout only)
+max_size_mb = 100        # Max size in MB before rotation (default: 100)
+max_backups = 5          # Number of old log files to keep (default: 5)
+compress = true          # Compress rotated files with gzip (default: true)
+```
+
+**File Logging with Rotation:**
+
+When `file` is set, logs are written to both stdout and the specified file. The file is automatically rotated when it reaches `max_size_mb`, keeping the last `max_backups` files.
+
+```toml
+[logging]
+file = "/var/log/marmot/marmot.log"
+max_size_mb = 100
+max_backups = 5
+compress = true
+```
+
+## CLI Flags
+
+Marmot supports the following command-line flags that override config file settings:
+
+| Flag | Description |
+|------|-------------|
+| `-config` | Path to configuration file (default: `config.toml`) |
+| `-data-dir` | Data directory (overrides `data_dir` in config) |
+| `-node-id` | Node ID (overrides `node_id` in config, 0=auto) |
+| `-grpc-port` | gRPC port (overrides `cluster.grpc_port` in config) |
+| `-mysql-port` | MySQL port (overrides `mysql.port` in config) |
+| `-follow-addresses` | Comma-separated addresses for replica mode |
+
+**Example:**
+```bash
+./marmot -config=/etc/marmot/config.toml -data-dir=/var/lib/marmot -grpc-port=8081 -mysql-port=3307
+```

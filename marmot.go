@@ -27,6 +27,7 @@ import (
 
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
+	"gopkg.in/natefinch/lumberjack.v2"
 )
 
 // publisherAdapter adapts publisher.Registry to coordinator.PublisherRegistry interface
@@ -73,10 +74,24 @@ func main() {
 	}
 
 	// Setup logging
-	var writer io.Writer = zerolog.NewConsoleWriter()
+	var writer io.Writer
 	if cfg.Config.Logging.Format == "json" {
 		writer = os.Stdout
+	} else {
+		writer = zerolog.NewConsoleWriter()
 	}
+
+	// Add file logging with rotation if configured
+	if cfg.Config.Logging.File != "" {
+		fileWriter := &lumberjack.Logger{
+			Filename:   cfg.Config.Logging.File,
+			MaxSize:    cfg.Config.Logging.MaxSizeMB,
+			MaxBackups: cfg.Config.Logging.MaxBackups,
+			Compress:   cfg.Config.Logging.Compress,
+		}
+		writer = io.MultiWriter(writer, fileWriter)
+	}
+
 	gLog := zerolog.New(writer).
 		With().
 		Timestamp().

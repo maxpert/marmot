@@ -82,6 +82,10 @@ wal_bytes_per_sync_kb = 512
 [logging]
 verbose = false
 format = "json"
+# file = "/tmp/marmot/logs/marmot.log"  # Uncomment to enable file logging
+# max_size_mb = 100                       # Max size before rotation (default: 100)
+# max_backups = 5                         # Number of old log files to keep (default: 5)
+# compress = true                         # Compress rotated files (default: true)
 
 [prometheus]
 # Metrics served on gRPC port at http://localhost:8082/metrics

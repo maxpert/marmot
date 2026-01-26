@@ -1001,7 +1001,23 @@ SELECT vec_version();
 ```toml
 [logging]
 verbose = false          # Enable verbose logging
-format = "console"       # Log format: console or json
+format = "json"          # Log format: "console" or "json" (json is faster)
+file = ""                # Log file path (empty = stdout only)
+max_size_mb = 100        # Max size in MB before rotation
+max_backups = 5          # Number of old log files to keep
+compress = true          # Compress rotated files with gzip
+```
+
+**File Logging with Rotation:**
+
+When `file` is set, logs are written to both stdout and the specified file. The file is automatically rotated when it reaches `max_size_mb`, keeping the last `max_backups` files. Rotated files are optionally compressed with gzip.
+
+```toml
+[logging]
+file = "/var/log/marmot/marmot.log"
+max_size_mb = 100
+max_backups = 5
+compress = true
 ```
 
 ### Prometheus Metrics
