@@ -284,8 +284,9 @@ func (h *ForwardHandler) handleStatement(ctx context.Context, session *ForwardSe
 	defer cancel()
 
 	connSession := &protocol.ConnectionSession{
-		ConnID:          req.SessionId,
-		CurrentDatabase: req.Database,
+		ConnID:               req.SessionId,
+		CurrentDatabase:      req.Database,
+		TranspilationEnabled: true, // Required for proper statement type detection (CREATE DATABASE, etc.)
 	}
 
 	done := make(chan struct{})
