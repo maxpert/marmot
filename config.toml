@@ -300,8 +300,21 @@ auto_id_mode = "compact"
 # Enable verbose debug logging
 verbose = false
 
-# Log format: "console" (human-readable) or "json" (structured)
+# Log format: "console" (human-readable) or "json" (structured, faster)
 format = "console"
+
+# Log file path (empty = stdout only)
+# When set, logs are written to both stdout and the file
+file = ""
+
+# Maximum log file size in MB before rotation (default: 100)
+max_size_mb = 100
+
+# Number of old log files to keep (default: 5)
+max_backups = 5
+
+# Compress rotated log files with gzip (default: true)
+compress = true
 
 # ==============================================================================
 # METRICS
