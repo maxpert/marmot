@@ -436,6 +436,20 @@ func main() {
 		registryAdapter,
 	)
 
+	// Initialize write forwarding for read-only replicas
+	forwardSessionMgr := marmotgrpc.NewForwardSessionManager(60 * time.Second)
+	defer forwardSessionMgr.Stop()
+	forwardHandler := marmotgrpc.NewForwardHandler(
+		cfg.Config.NodeID,
+		clock,
+		forwardSessionMgr,
+		handler,
+		dbMgr,
+	)
+	grpcServer.SetForwardSessionManager(forwardSessionMgr)
+	grpcServer.SetForwardHandler(forwardHandler)
+	log.Info().Msg("Write forwarding handler initialized for read-only replicas")
+
 	// Set publisher registry if enabled
 	if publisherRegistry != nil {
 		// Create adapter to bridge type mismatch between coordinator and publisher packages

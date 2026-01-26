@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/maxpert/marmot/cfg"
 	"github.com/maxpert/marmot/db"
+	marmotgrpc "github.com/maxpert/marmot/grpc"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/protocol"
 	"github.com/maxpert/marmot/protocol/handlers"
@@ -16,19 +18,27 @@ import (
 // ReadOnlyHandler implements protocol.ConnectionHandler for read-only replicas
 // It rejects all mutations and executes reads locally
 type ReadOnlyHandler struct {
-	dbManager *db.DatabaseManager
-	clock     *hlc.Clock
-	replica   *Replica
-	metadata  *handlers.MetadataHandler
+	dbManager      *db.DatabaseManager
+	clock          *hlc.Clock
+	replica        *Replica
+	metadata       *handlers.MetadataHandler
+	forwardWrites  bool
+	forwardTimeout time.Duration
 }
 
 // NewReadOnlyHandler creates a new read-only handler
 func NewReadOnlyHandler(dbManager *db.DatabaseManager, clock *hlc.Clock, replica *Replica) *ReadOnlyHandler {
+	forwardTimeout := 30 * time.Second
+	if cfg.Config.Replica.ForwardWriteTimeoutSec > 0 {
+		forwardTimeout = time.Duration(cfg.Config.Replica.ForwardWriteTimeoutSec) * time.Second
+	}
 	return &ReadOnlyHandler{
-		dbManager: dbManager,
-		clock:     clock,
-		replica:   replica,
-		metadata:  handlers.NewMetadataHandler(dbManager, db.SystemDatabaseName),
+		dbManager:      dbManager,
+		clock:          clock,
+		replica:        replica,
+		metadata:       handlers.NewMetadataHandler(dbManager, db.SystemDatabaseName),
+		forwardWrites:  cfg.Config.Replica.ForwardWrites,
+		forwardTimeout: forwardTimeout,
 	}
 }
 
@@ -66,6 +76,9 @@ func (h *ReadOnlyHandler) HandleQuery(session *protocol.ConnectionSession, sql s
 
 	// Reject all mutations with MySQL read-only error
 	if protocol.IsMutation(stmt) {
+		if h.forwardWrites {
+			return h.forwardMutation(session, stmt, params)
+		}
 		log.Debug().
 			Uint64("conn_id", session.ConnID).
 			Int("stmt_type", int(stmt.Type)).
@@ -76,6 +89,9 @@ func (h *ReadOnlyHandler) HandleQuery(session *protocol.ConnectionSession, sql s
 	// Reject transaction control for writes (BEGIN is ok for reads, but COMMIT on writes is not)
 	// Allow read-only transactions for compatibility
 	if protocol.IsTransactionControl(stmt) {
+		if h.forwardWrites {
+			return h.forwardTxnControl(session, stmt)
+		}
 		// Allow BEGIN/START TRANSACTION (for read-only transactions)
 		// Allow COMMIT/ROLLBACK (no-op for read-only)
 		switch stmt.Type {
@@ -233,12 +249,20 @@ func (h *ReadOnlyHandler) executeLocalRead(stmt protocol.Statement, params []int
 func (h *ReadOnlyHandler) handleMarmotCommand(session *protocol.ConnectionSession, sql string) (*protocol.ResultSet, error) {
 	// Handle SET marmot_transpilation
 	if varType, value, matched := protocol.ParseMarmotSetCommand(sql); matched {
-		if varType == "transpilation" {
+		switch varType {
+		case "transpilation":
 			session.TranspilationEnabled = (value == "ON")
 			log.Debug().
 				Uint64("conn_id", session.ConnID).
 				Bool("transpilation", session.TranspilationEnabled).
 				Msg("Session transpilation updated")
+			return nil, nil
+		case "wait_for_replication":
+			session.WaitForReplication = (value == "ON")
+			log.Debug().
+				Uint64("conn_id", session.ConnID).
+				Bool("wait_for_replication", session.WaitForReplication).
+				Msg("Session wait_for_replication updated")
 			return nil, nil
 		}
 	}
@@ -262,4 +286,117 @@ func (h *ReadOnlyHandler) handleMarmotCommand(session *protocol.ConnectionSessio
 	}
 
 	return nil, fmt.Errorf("unrecognized marmot command: %s", sql)
+}
+
+// forwardMutation forwards a mutation to the leader
+func (h *ReadOnlyHandler) forwardMutation(session *protocol.ConnectionSession, stmt protocol.Statement, params []interface{}) (*protocol.ResultSet, error) {
+	client := h.replica.streamClient.GetClient()
+	if client == nil {
+		return nil, fmt.Errorf("ERROR 2003 (HY000): Not connected to leader")
+	}
+
+	// Serialize params using msgpack
+	serializedParams, err := marmotgrpc.SerializeParams(params)
+	if err != nil {
+		return nil, fmt.Errorf("ERROR 1105 (HY000): Failed to serialize params: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), h.forwardTimeout)
+	defer cancel()
+
+	resp, err := client.ForwardQuery(ctx, &marmotgrpc.ForwardQueryRequest{
+		ReplicaNodeId:      h.replica.streamClient.GetNodeID(),
+		SessionId:          session.ConnID,
+		Database:           session.CurrentDatabase,
+		Sql:                stmt.SQL,
+		TxnControl:         marmotgrpc.ForwardTxnControl_FWD_TXN_NONE,
+		WaitForReplication: session.WaitForReplication,
+		Params:             serializedParams,
+		TimeoutMs:          uint32(h.forwardTimeout.Milliseconds()),
+	})
+
+	if err != nil {
+		return nil, fmt.Errorf("ERROR 2013 (HY000): Lost connection to leader during query: %v", err)
+	}
+	if !resp.Success {
+		return nil, fmt.Errorf("ERROR 1105 (HY000): %s", resp.ErrorMessage)
+	}
+
+	// Update session state
+	session.LastInsertId.Store(resp.LastInsertId)
+
+	// Track forwarded transaction state if within a transaction
+	session.ForwardedTxnActive = resp.InTransaction
+
+	// Wait for replication if requested OR if this is a DDL statement
+	// DDL always waits for replication to ensure schema is visible for subsequent reads
+	shouldWait := (session.WaitForReplication || protocol.IsDDL(stmt)) && resp.CommittedTxnId > 0
+	if shouldWait {
+		if err := h.waitForReplication(session.CurrentDatabase, resp.CommittedTxnId); err != nil {
+			log.Warn().Err(err).Uint64("txn_id", resp.CommittedTxnId).Bool("is_ddl", protocol.IsDDL(stmt)).Msg("Timeout waiting for replication")
+			// Don't return error - write succeeded, just visibility delay
+		}
+	}
+
+	return &protocol.ResultSet{RowsAffected: resp.RowsAffected}, nil
+}
+
+// forwardTxnControl forwards transaction control to the leader
+func (h *ReadOnlyHandler) forwardTxnControl(session *protocol.ConnectionSession, stmt protocol.Statement) (*protocol.ResultSet, error) {
+	client := h.replica.streamClient.GetClient()
+	if client == nil {
+		return nil, fmt.Errorf("ERROR 2003 (HY000): Not connected to leader")
+	}
+
+	var txnControl marmotgrpc.ForwardTxnControl
+	switch stmt.Type {
+	case protocol.StatementBegin:
+		txnControl = marmotgrpc.ForwardTxnControl_FWD_TXN_BEGIN
+	case protocol.StatementCommit:
+		txnControl = marmotgrpc.ForwardTxnControl_FWD_TXN_COMMIT
+	case protocol.StatementRollback:
+		txnControl = marmotgrpc.ForwardTxnControl_FWD_TXN_ROLLBACK
+	default:
+		return nil, protocol.ErrReadOnly()
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), h.forwardTimeout)
+	defer cancel()
+
+	resp, err := client.ForwardQuery(ctx, &marmotgrpc.ForwardQueryRequest{
+		ReplicaNodeId: h.replica.streamClient.GetNodeID(),
+		SessionId:     session.ConnID,
+		Database:      session.CurrentDatabase,
+		TxnControl:    txnControl,
+	})
+
+	if err != nil {
+		return nil, fmt.Errorf("ERROR 2013 (HY000): %v", err)
+	}
+	if !resp.Success {
+		return nil, fmt.Errorf("ERROR 1105 (HY000): %s", resp.ErrorMessage)
+	}
+
+	// Track forwarded transaction state based on response
+	session.ForwardedTxnActive = resp.InTransaction
+
+	// Clear state on COMMIT/ROLLBACK success
+	if txnControl == marmotgrpc.ForwardTxnControl_FWD_TXN_COMMIT ||
+		txnControl == marmotgrpc.ForwardTxnControl_FWD_TXN_ROLLBACK {
+		session.ForwardedTxnActive = false
+	}
+
+	return nil, nil
+}
+
+// waitForReplication waits for the specified transaction to be replicated
+func (h *ReadOnlyHandler) waitForReplication(database string, txnID uint64) error {
+	if txnID == 0 {
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), h.forwardTimeout)
+	defer cancel()
+
+	return h.replica.streamClient.WaitForTxn(ctx, database, txnID)
 }

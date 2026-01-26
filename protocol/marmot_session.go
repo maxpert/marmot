@@ -11,6 +11,9 @@ var (
 	// SET marmot_transpilation = ON/OFF
 	setTranspilationRe = regexp.MustCompile(`(?i)^\s*SET\s+marmot_transpilation\s*=\s*(ON|OFF)\s*;?\s*$`)
 
+	// SET marmot_wait_for_replication = ON/OFF/1/0
+	setWaitForReplicationRe = regexp.MustCompile(`(?i)^\s*SET\s+marmot_wait_for_replication\s*=\s*(ON|OFF|1|0)\s*;?\s*$`)
+
 	// LOAD EXTENSION <name>
 	// Extension name can contain alphanumeric, dash, underscore, and dot characters
 	loadExtensionRe = regexp.MustCompile(`(?i)^\s*LOAD\s+EXTENSION\s+([\w\-\.]+)\s*;?\s*$`)
@@ -54,12 +57,25 @@ const (
 // ParseMarmotSetCommand parses SET marmot_* commands.
 // Returns the variable type (e.g., "transpilation"), value ("ON"/"OFF"), and whether it matched.
 func ParseMarmotSetCommand(sql string) (varType, value string, matched bool) {
+	// Check transpilation first
 	matches := setTranspilationRe.FindStringSubmatch(sql)
-	if matches == nil {
-		return "", "", false
+	if matches != nil {
+		return "transpilation", strings.ToUpper(matches[1]), true
 	}
 
-	return "transpilation", strings.ToUpper(matches[1]), true
+	// Check wait_for_replication
+	matches = setWaitForReplicationRe.FindStringSubmatch(sql)
+	if matches != nil {
+		val := strings.ToUpper(matches[1])
+		if val == "1" {
+			val = "ON"
+		} else if val == "0" {
+			val = "OFF"
+		}
+		return "wait_for_replication", val, true
+	}
+
+	return "", "", false
 }
 
 // ParseLoadExtensionCommand parses LOAD EXTENSION commands.
@@ -76,5 +92,7 @@ func ParseLoadExtensionCommand(sql string) (extName string, matched bool) {
 // IsMarmotSessionCommand checks if the SQL is a marmot session command.
 func IsMarmotSessionCommand(sql string) bool {
 	upper := strings.ToUpper(strings.TrimSpace(sql))
-	return strings.HasPrefix(upper, "SET MARMOT_") || strings.HasPrefix(upper, "LOAD EXTENSION")
+	return strings.HasPrefix(upper, "SET MARMOT_TRANSPILATION") ||
+		strings.HasPrefix(upper, "SET MARMOT_WAIT_FOR_REPLICATION") ||
+		strings.HasPrefix(upper, "LOAD EXTENSION")
 }

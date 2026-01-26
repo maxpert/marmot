@@ -348,3 +348,9 @@ func IsTransactionControl(stmt Statement) bool {
 		return false
 	}
 }
+
+// IsDDL returns true if the statement is a DDL operation
+// (CREATE/ALTER/DROP TABLE, CREATE/DROP INDEX, etc.)
+func IsDDL(stmt Statement) bool {
+	return stmt.Type == StatementDDL
+}

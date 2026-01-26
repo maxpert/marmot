@@ -50,6 +50,9 @@ service MarmotService {
   // Read-only - does not modify cluster state.
   rpc GetClusterNodes(GetClusterNodesRequest) returns (GetClusterNodesResponse);
 
+  // Forward write query from read-only replica to leader
+  rpc ForwardQuery(ForwardQueryRequest) returns (ForwardQueryResponse);
+
   // ===== CDC STREAMING =====
   // Client-streaming RPC for large CDC payloads (≥128KB)
   // Sends TransactionChunks followed by TransactionCommit
@@ -336,4 +339,32 @@ message TransactionStreamMessage {
     TransactionChunk chunk = 1;
     TransactionCommit commit = 2;
   }
+}
+
+// Transaction control for forwarded queries
+enum ForwardTxnControl {
+  FWD_TXN_NONE = 0;      // Regular statement (auto-commit or part of txn)
+  FWD_TXN_BEGIN = 1;     // Start new transaction
+  FWD_TXN_COMMIT = 2;    // Commit current transaction
+  FWD_TXN_ROLLBACK = 3;  // Rollback current transaction
+}
+
+message ForwardQueryRequest {
+  uint64 replica_node_id = 1;    // Which replica is forwarding
+  uint64 session_id = 2;         // Client session ID on replica
+  string database = 3;           // Target database
+  string sql = 4;                // SQL statement (transpiled)
+  ForwardTxnControl txn_control = 5;
+  bool wait_for_replication = 6; // Block until replicated back
+  repeated bytes params = 7;     // Prepared statement params (msgpack encoded)
+  uint32 timeout_ms = 8;         // Client-specified timeout in milliseconds
+}
+
+message ForwardQueryResponse {
+  bool success = 1;
+  string error_message = 2;
+  int64 rows_affected = 3;
+  int64 last_insert_id = 4;
+  uint64 committed_txn_id = 5;   // For read-your-writes
+  bool in_transaction = 6;       // True if session has active transaction on leader
 }

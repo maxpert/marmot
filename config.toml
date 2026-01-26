@@ -291,6 +291,13 @@ auto_id_mode = "compact"
 #
 # # Snapshot: cache TTL to avoid redundant snapshot creation (seconds)
 # snapshot_cache_ttl_seconds = 30
+#
+# # Write forwarding: forward write operations to cluster nodes (default: false)
+# # When enabled, replicas can forward write operations to writable cluster nodes
+# forward_writes = false
+#
+# # Write forwarding timeout (seconds) - timeout for forwarded write operations
+# forward_write_timeout_sec = 30
 
 # ==============================================================================
 # LOGGING

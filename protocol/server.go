@@ -84,6 +84,16 @@ type ConnectionSession struct {
 	// Default: true (transpilation enabled).
 	// Set to false with: SET marmot_transpilation = OFF
 	TranspilationEnabled bool
+
+	// WaitForReplication controls whether forwarded writes should wait for replication.
+	// Default: false. Set via SET marmot_wait_for_replication = ON/OFF
+	WaitForReplication bool
+
+	// ForwardedTxnActive tracks whether this session has an active transaction
+	// on the leader node (via write forwarding). Used to properly handle
+	// COMMIT/ROLLBACK lifecycle. Reads within forwarded transactions execute
+	// locally and won't see uncommitted writes from that transaction.
+	ForwardedTxnActive bool
 }
 
 // InTransaction returns true if session has an active explicit transaction

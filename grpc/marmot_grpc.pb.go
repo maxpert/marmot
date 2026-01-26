@@ -30,6 +30,7 @@ const (
 	MarmotService_StreamSnapshot_FullMethodName       = "/marmot.v2.MarmotService/StreamSnapshot"
 	MarmotService_GetLatestTxnIDs_FullMethodName      = "/marmot.v2.MarmotService/GetLatestTxnIDs"
 	MarmotService_GetClusterNodes_FullMethodName      = "/marmot.v2.MarmotService/GetClusterNodes"
+	MarmotService_ForwardQuery_FullMethodName         = "/marmot.v2.MarmotService/ForwardQuery"
 	MarmotService_TransactionStream_FullMethodName    = "/marmot.v2.MarmotService/TransactionStream"
 )
 
@@ -65,6 +66,8 @@ type MarmotServiceClient interface {
 	// GetClusterNodes returns cluster membership for readonly replicas.
 	// Read-only - does not modify cluster state.
 	GetClusterNodes(ctx context.Context, in *GetClusterNodesRequest, opts ...grpc.CallOption) (*GetClusterNodesResponse, error)
+	// Forward write query from read-only replica to leader
+	ForwardQuery(ctx context.Context, in *ForwardQueryRequest, opts ...grpc.CallOption) (*ForwardQueryResponse, error)
 	// ===== CDC STREAMING =====
 	// Client-streaming RPC for large CDC payloads (≥128KB)
 	// Sends TransactionChunks followed by TransactionCommit
@@ -207,6 +210,16 @@ func (c *marmotServiceClient) GetClusterNodes(ctx context.Context, in *GetCluste
 	return out, nil
 }
 
+func (c *marmotServiceClient) ForwardQuery(ctx context.Context, in *ForwardQueryRequest, opts ...grpc.CallOption) (*ForwardQueryResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ForwardQueryResponse)
+	err := c.cc.Invoke(ctx, MarmotService_ForwardQuery_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *marmotServiceClient) TransactionStream(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[TransactionStreamMessage, TransactionResponse], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	stream, err := c.cc.NewStream(ctx, &MarmotService_ServiceDesc.Streams[2], MarmotService_TransactionStream_FullMethodName, cOpts...)
@@ -252,6 +265,8 @@ type MarmotServiceServer interface {
 	// GetClusterNodes returns cluster membership for readonly replicas.
 	// Read-only - does not modify cluster state.
 	GetClusterNodes(context.Context, *GetClusterNodesRequest) (*GetClusterNodesResponse, error)
+	// Forward write query from read-only replica to leader
+	ForwardQuery(context.Context, *ForwardQueryRequest) (*ForwardQueryResponse, error)
 	// ===== CDC STREAMING =====
 	// Client-streaming RPC for large CDC payloads (≥128KB)
 	// Sends TransactionChunks followed by TransactionCommit
@@ -298,6 +313,9 @@ func (UnimplementedMarmotServiceServer) GetLatestTxnIDs(context.Context, *Latest
 }
 func (UnimplementedMarmotServiceServer) GetClusterNodes(context.Context, *GetClusterNodesRequest) (*GetClusterNodesResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetClusterNodes not implemented")
+}
+func (UnimplementedMarmotServiceServer) ForwardQuery(context.Context, *ForwardQueryRequest) (*ForwardQueryResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ForwardQuery not implemented")
 }
 func (UnimplementedMarmotServiceServer) TransactionStream(grpc.ClientStreamingServer[TransactionStreamMessage, TransactionResponse]) error {
 	return status.Errorf(codes.Unimplemented, "method TransactionStream not implemented")
@@ -507,6 +525,24 @@ func _MarmotService_GetClusterNodes_Handler(srv interface{}, ctx context.Context
 	return interceptor(ctx, in, info, handler)
 }
 
+func _MarmotService_ForwardQuery_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ForwardQueryRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MarmotServiceServer).ForwardQuery(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: MarmotService_ForwardQuery_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MarmotServiceServer).ForwardQuery(ctx, req.(*ForwardQueryRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _MarmotService_TransactionStream_Handler(srv interface{}, stream grpc.ServerStream) error {
 	return srv.(MarmotServiceServer).TransactionStream(&grpc.GenericServerStream[TransactionStreamMessage, TransactionResponse]{ServerStream: stream})
 }
@@ -556,6 +592,10 @@ var MarmotService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetClusterNodes",
 			Handler:    _MarmotService_GetClusterNodes_Handler,
+		},
+		{
+			MethodName: "ForwardQuery",
+			Handler:    _MarmotService_ForwardQuery_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

@@ -98,6 +98,14 @@ func (m *mockMarmotServiceClient) GetReplicationState(ctx context.Context, req *
 	return args.Get(0).(*marmotgrpc.ReplicationStateResponse), args.Error(1)
 }
 
+func (m *mockMarmotServiceClient) ForwardQuery(ctx context.Context, req *marmotgrpc.ForwardQueryRequest, opts ...grpc.CallOption) (*marmotgrpc.ForwardQueryResponse, error) {
+	args := m.Called(ctx, req)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*marmotgrpc.ForwardQueryResponse), args.Error(1)
+}
+
 func (m *mockMarmotServiceClient) GetClusterNodes(ctx context.Context, req *marmotgrpc.GetClusterNodesRequest, opts ...grpc.CallOption) (*marmotgrpc.GetClusterNodesResponse, error) {
 	args := m.Called(ctx, req)
 	if args.Get(0) == nil {

@@ -161,6 +161,9 @@ type ReplicaConfiguration struct {
 	DatabaseDiscoveryIntervalSec int `toml:"database_discovery_interval_seconds"` // Database discovery interval (default: 10)
 	SnapshotConcurrency          int `toml:"snapshot_concurrency"`                // Snapshot concurrency (default: 3)
 	SnapshotCacheTTLSec          int `toml:"snapshot_cache_ttl_seconds"`          // Snapshot cache TTL (default: 30)
+
+	ForwardWrites          bool `toml:"forward_writes"`            // Forward writes to cluster nodes (default: false)
+	ForwardWriteTimeoutSec int  `toml:"forward_write_timeout_sec"` // Timeout for forwarded writes (default: 30)
 }
 
 // PublisherConfiguration configures the CDC publishing system
@@ -331,6 +334,8 @@ var Config = &Configuration{
 		ReconnectIntervalSec:   5,
 		ReconnectMaxBackoffSec: 30,
 		InitialSyncTimeoutMin:  30,
+		ForwardWrites:          false,
+		ForwardWriteTimeoutSec: 30,
 	},
 
 	Publisher: PublisherConfiguration{
@@ -716,6 +721,13 @@ func Validate() error {
 
 		if Config.Replica.SnapshotCacheTTLSec <= 0 {
 			Config.Replica.SnapshotCacheTTLSec = 30
+		}
+
+		// Validate write forwarding configuration
+		if Config.Replica.ForwardWrites {
+			if Config.Replica.ForwardWriteTimeoutSec < 1 {
+				Config.Replica.ForwardWriteTimeoutSec = 30
+			}
 		}
 
 		// Validate replicate_databases (cannot include system DB)

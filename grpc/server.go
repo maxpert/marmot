@@ -50,6 +50,10 @@ type Server struct {
 	dbManager          *db.DatabaseManager
 	metricsHandler     http.Handler
 
+	// Write forwarding for read-only replicas
+	forwardSessionMgr *ForwardSessionManager
+	forwardHandler    *ForwardHandler
+
 	// Snapshot caching
 	snapshotCache   map[string]*snapshotCacheEntry
 	snapshotCacheMu sync.RWMutex
@@ -353,6 +357,22 @@ func (s *Server) ReplicateTransaction(ctx context.Context, req *TransactionReque
 	return handler.HandleReplicateTransaction(ctx, req)
 }
 
+// ForwardQuery handles forwarded write queries from read-only replicas
+func (s *Server) ForwardQuery(ctx context.Context, req *ForwardQueryRequest) (*ForwardQueryResponse, error) {
+	s.mu.RLock()
+	handler := s.forwardHandler
+	s.mu.RUnlock()
+
+	if handler == nil {
+		return &ForwardQueryResponse{
+			Success:      false,
+			ErrorMessage: "write forwarding not enabled on this node",
+		}, nil
+	}
+
+	return handler.HandleForwardQuery(ctx, req)
+}
+
 // Read handles quorum read requests
 // Future Phase: This will support distributed quorum reads across replicas.
 // Currently reads are handled locally via coordinator.ReadCoordinator.
@@ -422,6 +442,13 @@ func (s *Server) sendChangeEvent(rec *db.TransactionRecord, metaStore db.MetaSto
 // StreamChanges handles change streaming for catch-up.
 // Streams committed transactions from a given txn_id for delta sync, then keeps stream alive for live updates.
 func (s *Server) StreamChanges(req *StreamRequest, stream MarmotService_StreamChangesServer) error {
+	// Clean up forwarded sessions when this replica disconnects
+	defer func() {
+		if s.forwardSessionMgr != nil && req.RequestingNodeId != 0 {
+			s.forwardSessionMgr.RemoveSessionsForReplica(req.RequestingNodeId)
+		}
+	}()
+
 	// Treat stream request as implicit heartbeat from requesting node
 	if req.RequestingNodeId != 0 {
 		s.registry.TouchLastSeen(req.RequestingNodeId)
@@ -975,6 +1002,27 @@ func (s *Server) SetReplicationHandler(handler *ReplicationHandler) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.replicationHandler = handler
+}
+
+// SetForwardHandler sets the write forwarding handler for read-only replicas
+func (s *Server) SetForwardHandler(handler *ForwardHandler) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.forwardHandler = handler
+}
+
+// SetForwardSessionManager sets the session manager for write forwarding
+func (s *Server) SetForwardSessionManager(mgr *ForwardSessionManager) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.forwardSessionMgr = mgr
+}
+
+// GetForwardSessionManager returns the forward session manager
+func (s *Server) GetForwardSessionManager() *ForwardSessionManager {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.forwardSessionMgr
 }
 
 // SetMetricsHandler sets the Prometheus metrics HTTP handler

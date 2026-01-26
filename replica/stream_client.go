@@ -36,8 +36,9 @@ type StreamClient struct {
 	conn   *grpc.ClientConn
 	client marmotgrpc.MarmotServiceClient
 
-	lastTxnID map[string]uint64 // per-database last applied txn_id
-	mu        sync.RWMutex
+	lastTxnID     map[string]uint64        // per-database last applied txn_id
+	txnWaitQueues map[string]*TxnWaitQueue // per-database wait queues
+	mu            sync.RWMutex
 
 	// snapshotInProgress prevents concurrent snapshot apply and change events
 	snapshotMu sync.RWMutex
@@ -91,6 +92,7 @@ func NewStreamClient(followAddrs []string, nodeID uint64, dbManager *db.Database
 		clock:             clock,
 		replica:           replica,
 		lastTxnID:         make(map[string]uint64),
+		txnWaitQueues:     make(map[string]*TxnWaitQueue),
 		clusterNodes:      clusterNodes,
 		currentAddr:       currentAddr,
 		discoveryCtx:      discoveryCtx,
@@ -614,6 +616,11 @@ func (s *StreamClient) streamChanges(ctx context.Context) error {
 			s.mu.Lock()
 			s.lastTxnID[dbName] = event.TxnId
 			s.mu.Unlock()
+
+			// Notify waiters
+			if q, ok := s.txnWaitQueues[dbName]; ok {
+				q.NotifyUpTo(event.TxnId)
+			}
 
 			log.Debug().
 				Uint64("txn_id", event.TxnId).
@@ -1280,4 +1287,52 @@ func (s *StreamClient) shouldReplicateDatabase(dbName string, filter []string) b
 	}
 
 	return false
+}
+
+// GetClient returns the gRPC client for forwarding queries.
+// Returns nil if not connected.
+func (s *StreamClient) GetClient() marmotgrpc.MarmotServiceClient {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.client
+}
+
+// GetNodeID returns the local node ID
+func (s *StreamClient) GetNodeID() uint64 {
+	return s.nodeID
+}
+
+// GetLastTxnID returns the last applied transaction ID for a database.
+// Used for read-your-writes consistency checking.
+func (s *StreamClient) GetLastTxnID(database string) uint64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.lastTxnID[database]
+}
+
+// getOrCreateWaitQueue returns the wait queue for a database, creating if needed.
+func (s *StreamClient) getOrCreateWaitQueue(database string) *TxnWaitQueue {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if q, ok := s.txnWaitQueues[database]; ok {
+		return q
+	}
+	q := NewTxnWaitQueue()
+	s.txnWaitQueues[database] = q
+	return q
+}
+
+// WaitForTxn blocks until the given txnID is replicated or context is cancelled.
+// Returns nil if txnID is already replicated or successfully waited for.
+func (s *StreamClient) WaitForTxn(ctx context.Context, database string, txnID uint64) error {
+	// Fast path: already replicated
+	s.mu.RLock()
+	if s.lastTxnID[database] >= txnID {
+		s.mu.RUnlock()
+		return nil
+	}
+	s.mu.RUnlock()
+
+	q := s.getOrCreateWaitQueue(database)
+	return q.Wait(ctx, txnID)
 }
