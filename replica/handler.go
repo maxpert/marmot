@@ -328,6 +328,24 @@ func (h *ReadOnlyHandler) forwardMutation(session *protocol.ConnectionSession, s
 	// Track forwarded transaction state if within a transaction
 	session.ForwardedTxnActive = resp.InTransaction
 
+	// Handle database operations locally after leader confirms success
+	// These don't replicate via change stream - replica must create/drop locally
+	if stmt.Type == protocol.StatementCreateDatabase && stmt.Database != "" {
+		if err := h.dbManager.CreateDatabase(stmt.Database); err != nil {
+			log.Warn().Err(err).Str("database", stmt.Database).Msg("Failed to create database locally after forward")
+			// Don't fail - leader succeeded, local create might fail if already exists
+		} else {
+			log.Info().Str("database", stmt.Database).Msg("Created database locally after forward to leader")
+		}
+	} else if stmt.Type == protocol.StatementDropDatabase && stmt.Database != "" {
+		if err := h.dbManager.DropDatabase(stmt.Database); err != nil {
+			log.Warn().Err(err).Str("database", stmt.Database).Msg("Failed to drop database locally after forward")
+			// Don't fail - leader succeeded
+		} else {
+			log.Info().Str("database", stmt.Database).Msg("Dropped database locally after forward to leader")
+		}
+	}
+
 	// Wait for replication if requested OR if this is a DDL statement
 	// DDL always waits for replication to ensure schema is visible for subsequent reads
 	shouldWait := (session.WaitForReplication || protocol.IsDDL(stmt)) && resp.CommittedTxnId > 0
