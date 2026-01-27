@@ -585,21 +585,19 @@ func (s *StreamClient) streamChanges(ctx context.Context) error {
 			}
 
 			// Gap detection on first event
+			// NOTE: txn_ids are HLC-based (nanoseconds), not sequential counters.
+			// Gap detection using raw txn_id difference doesn't work reliably.
+			// Anti-entropy service handles large gaps via periodic snapshots instead.
 			if firstEvent {
 				firstEvent = false
+				// Log the gap for debugging but don't trigger snapshot based on txn_id difference
 				gap := event.TxnId - fromTxnID
-				if gap > uint64(cfg.Config.Replication.DeltaSyncThresholdTxns) {
-					log.Warn().
-						Str("database", dbName).
-						Uint64("gap", gap).
-						Msg("Gap detected - triggering snapshot")
-					// Gap too large - need snapshot
-					if err := s.downloadSnapshotForDatabase(ctx, dbName); err != nil {
-						return fmt.Errorf("snapshot download failed for %s: %w", dbName, err)
-					}
-					// Restart stream after snapshot
-					break
-				}
+				log.Debug().
+					Str("database", dbName).
+					Uint64("gap", gap).
+					Uint64("from_txn_id", fromTxnID).
+					Uint64("event_txn_id", event.TxnId).
+					Msg("First stream event received")
 			}
 
 			// Apply change

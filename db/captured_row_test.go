@@ -74,6 +74,14 @@ func TestEncodedCapturedRow_RoundtripSerialization(t *testing.T) {
 				NewValues: nil,
 			},
 		},
+		{
+			name: "DDL operation with SQL",
+			row: &EncodedCapturedRow{
+				Table:  "users",
+				Op:     uint8(OpTypeDDL),
+				DDLSQL: "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)",
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -104,6 +112,7 @@ func TestEncodedCapturedRow_AllOpTypes(t *testing.T) {
 		{"OpTypeReplace", OpTypeReplace},
 		{"OpTypeUpdate", OpTypeUpdate},
 		{"OpTypeDelete", OpTypeDelete},
+		{"OpTypeDDL", OpTypeDDL},
 	}
 
 	for _, tt := range tests {

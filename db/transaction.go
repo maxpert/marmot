@@ -135,7 +135,6 @@ func (tm *TransactionManager) SetRefreshReplicationStatesFunc(fn RefreshReplicat
 	tm.refreshReplicationStates = fn
 }
 
-
 // batchCommitEnabled returns true if batch committing is enabled and configured
 func (tm *TransactionManager) batchCommitEnabled() bool {
 	return tm.batchCommitter != nil
@@ -271,6 +270,10 @@ func (tm *TransactionManager) CommitTransaction(txn *Transaction) error {
 		if err := tm.applyDDLIntents(txn.ID, intents); err != nil {
 			return err
 		}
+		// Write DDL statements to CDC storage for streaming replication
+		if err := tm.writeDDLToCDC(txn.ID, intents); err != nil {
+			return err
+		}
 		txn.Statements = tm.rebuildStatementsFromCDC(nil, intents)
 	}
 
@@ -285,7 +288,6 @@ func (tm *TransactionManager) CommitTransaction(txn *Transaction) error {
 	return nil
 }
 
-
 // calculateCommitTS determines the commit timestamp (must be > start_ts).
 func (tm *TransactionManager) calculateCommitTS(startTS hlc.Timestamp) hlc.Timestamp {
 	commitTS := tm.clock.Now()
@@ -295,7 +297,6 @@ func (tm *TransactionManager) calculateCommitTS(startTS hlc.Timestamp) hlc.Times
 	}
 	return commitTS
 }
-
 
 // rebuildStatementsFromCDC reconstructs protocol.Statement slice from CDC entries
 // and DDL intents for in-memory transaction tracking.
@@ -414,6 +415,38 @@ func (tm *TransactionManager) applyDDLIntents(txnID uint64, intents []*WriteInte
 		if err := tm.reloadSchemaCache(); err != nil {
 			log.Warn().Err(err).Uint64("txn_id", txnID).Msg("Failed to reload schema cache after DDL")
 		}
+	}
+
+	return nil
+}
+
+// writeDDLToCDC writes DDL statements to CDC storage for streaming replication.
+// This ensures DDL changes can be replicated to followers via the change stream.
+func (tm *TransactionManager) writeDDLToCDC(txnID uint64, intents []*WriteIntentRecord) error {
+	var seq uint64
+
+	for _, intent := range intents {
+		if intent.IntentType != IntentTypeDDL || intent.SQLStatement == "" {
+			continue
+		}
+
+		row := &EncodedCapturedRow{
+			Table:  intent.TableName,
+			Op:     uint8(OpTypeDDL),
+			DDLSQL: intent.SQLStatement,
+		}
+
+		data, err := EncodeRow(row)
+		if err != nil {
+			return fmt.Errorf("failed to encode DDL row: %w", err)
+		}
+
+		if err := tm.metaStore.WriteCapturedRow(txnID, seq, data); err != nil {
+			return fmt.Errorf("failed to write DDL to CDC: %w", err)
+		}
+
+		seq++
+		log.Debug().Uint64("txn_id", txnID).Str("ddl", intent.SQLStatement).Msg("DDL written to CDC for streaming")
 	}
 
 	return nil

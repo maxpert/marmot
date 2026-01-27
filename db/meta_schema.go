@@ -37,6 +37,7 @@ const (
 	OpTypeUpdate  OpType = 2
 	OpTypeDelete  OpType = 3
 	OpTypeDelta   OpType = 4 // Used for LWW delta sync operations
+	OpTypeDDL     OpType = 5 // DDL schema changes (CREATE/DROP/ALTER TABLE)
 )
 
 func (o OpType) String() string {
@@ -51,6 +52,8 @@ func (o OpType) String() string {
 		return "DELETE"
 	case OpTypeDelta:
 		return "DELTA"
+	case OpTypeDDL:
+		return "DDL"
 	default:
 		return "UNKNOWN"
 	}
@@ -164,7 +167,9 @@ func OpTypeToStatementType(op OpType) protocol.StatementCode {
 		return protocol.StatementUpdate
 	case OpTypeDelete:
 		return protocol.StatementDelete
+	case OpTypeDDL:
+		return protocol.StatementDDL
 	default:
-		panic(fmt.Sprintf("OpTypeToStatementType: unsupported op type %d (only DML types are supported)", op))
+		panic(fmt.Sprintf("OpTypeToStatementType: unsupported op type %d", op))
 	}
 }

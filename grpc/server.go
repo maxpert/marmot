@@ -408,17 +408,33 @@ func (s *Server) sendChangeEvent(rec *db.TransactionRecord, metaStore db.MetaSto
 			stmtCode := db.OpTypeToStatementType(db.OpType(row.Op))
 			wireType := common.MustToWireType(stmtCode)
 
-			stmt := &Statement{
-				Type:      wireType,
-				TableName: row.Table,
-				Database:  rec.DatabaseName,
-				Payload: &Statement_RowChange{
-					RowChange: &RowChange{
-						IntentKey: row.IntentKey,
-						OldValues: row.OldValues,
-						NewValues: row.NewValues,
+			var stmt *Statement
+			if db.OpType(row.Op) == db.OpTypeDDL {
+				// DDL statement - use DDLChange payload
+				stmt = &Statement{
+					Type:      wireType,
+					TableName: row.Table,
+					Database:  rec.DatabaseName,
+					Payload: &Statement_DdlChange{
+						DdlChange: &DDLChange{
+							Sql: row.DDLSQL,
+						},
 					},
-				},
+				}
+			} else {
+				// DML statement - use RowChange payload
+				stmt = &Statement{
+					Type:      wireType,
+					TableName: row.Table,
+					Database:  rec.DatabaseName,
+					Payload: &Statement_RowChange{
+						RowChange: &RowChange{
+							IntentKey: row.IntentKey,
+							OldValues: row.OldValues,
+							NewValues: row.NewValues,
+						},
+					},
+				}
 			}
 			statements = append(statements, stmt)
 		}

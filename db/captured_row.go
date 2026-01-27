@@ -6,12 +6,14 @@ import (
 
 // EncodedCapturedRow stores schema-encoded row data at capture time.
 // All column values are msgpack-encoded when the row is captured.
+// For DDL operations (Op == OpTypeDDL), only Table and DDLSQL are used.
 type EncodedCapturedRow struct {
 	Table     string            `msgpack:"t"`
 	Op        uint8             `msgpack:"o"`
 	IntentKey []byte            `msgpack:"k"`
 	OldValues map[string][]byte `msgpack:"ov,omitempty"`
 	NewValues map[string][]byte `msgpack:"nv,omitempty"`
+	DDLSQL    string            `msgpack:"ddl,omitempty"` // DDL statement (only for OpTypeDDL)
 }
 
 // EncodeRow serializes an EncodedCapturedRow to msgpack bytes.
