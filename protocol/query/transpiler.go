@@ -38,6 +38,7 @@ func NewTranspiler(cacheSize int, idGen id.Generator) (*Transpiler, error) {
 	// Transform rules modify AST for semantic changes
 	ruleSet := []transform.Rule{
 		&transform.DualTableRule{},            // Priority 1: Strip FROM dual
+		&transform.LastInsertIDRule{},         // Priority 5: LAST_INSERT_ID() → last_insert_rowid()
 		&transform.IntTypeRule{},              // Priority 5: Strip UNSIGNED, normalize int types
 		&transform.CreateTableRule{},          // Priority 10: Extract KEY → CREATE INDEX
 		&transform.InsertOnDuplicateKeyRule{}, // Priority 20: ON DUPLICATE KEY → ON CONFLICT

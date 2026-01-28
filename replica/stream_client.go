@@ -855,13 +855,29 @@ func (s *StreamClient) applyChangeEvent(ctx context.Context, event *marmotgrpc.C
 	}
 	defer tx.Rollback()
 
+	// Track if any DDL was applied (requires schema reload after commit)
+	hasDDL := false
 	for _, stmt := range event.Statements {
+		if stmt.GetDdlChange() != nil && stmt.GetDdlChange().Sql != "" {
+			hasDDL = true
+		}
 		if err := s.applyStatement(ctx, tx, mdb, stmt); err != nil {
 			return err
 		}
 	}
 
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+
+	// Reload schema cache after DDL to make new tables available for subsequent CDC
+	if hasDDL {
+		if err := mdb.ReloadSchema(); err != nil {
+			log.Warn().Err(err).Str("database", database).Msg("Failed to reload schema after DDL")
+		}
+	}
+
+	return nil
 }
 
 // applyCreateDatabase handles CREATE DATABASE replication

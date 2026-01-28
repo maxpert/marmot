@@ -356,7 +356,10 @@ func (h *ReadOnlyHandler) forwardMutation(session *protocol.ConnectionSession, s
 		}
 	}
 
-	return &protocol.ResultSet{RowsAffected: resp.RowsAffected}, nil
+	return &protocol.ResultSet{
+		RowsAffected: resp.RowsAffected,
+		LastInsertId: resp.LastInsertId,
+	}, nil
 }
 
 // forwardTxnControl forwards transaction control to the leader
