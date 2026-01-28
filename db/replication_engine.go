@@ -338,7 +338,15 @@ func (re *ReplicationEngine) Commit(ctx context.Context, req *CommitRequest) *Co
 							Uint64("node_id", re.nodeID).
 							Msg("Database operation committed successfully")
 
-						return &CommitResult{Success: true}
+						// Return DDLSQL so replication handler can increment schema version
+						var ddlSQL string
+						switch dbOp {
+						case DatabaseOpCreate:
+							ddlSQL = fmt.Sprintf("CREATE DATABASE IF NOT EXISTS %s", dbName)
+						case DatabaseOpDrop:
+							ddlSQL = fmt.Sprintf("DROP DATABASE IF EXISTS %s", dbName)
+						}
+						return &CommitResult{Success: true, DDLSQL: ddlSQL}
 					}
 				}
 			}
