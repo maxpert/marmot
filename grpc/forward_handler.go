@@ -49,6 +49,59 @@ func (h *ForwardHandler) HandleForwardQuery(ctx context.Context, req *ForwardQue
 		}, nil
 	}
 
+	// Handle transaction control first - doesn't need parsing or database validation
+	switch req.TxnControl {
+	case ForwardTxnControl_FWD_TXN_BEGIN, ForwardTxnControl_FWD_TXN_COMMIT, ForwardTxnControl_FWD_TXN_ROLLBACK:
+		// Transaction control requires database context
+		if req.Database == "" {
+			return &ForwardQueryResponse{
+				Success:      false,
+				ErrorMessage: "database is required",
+			}, nil
+		}
+		if !h.dbManager.DatabaseExists(req.Database) {
+			return &ForwardQueryResponse{
+				Success:      false,
+				ErrorMessage: fmt.Sprintf("database %s does not exist", req.Database),
+			}, nil
+		}
+		key := ForwardSessionKey{
+			ReplicaNodeID: req.ReplicaNodeId,
+			SessionID:     req.SessionId,
+		}
+		session := h.sessionMgr.GetOrCreateSession(key, req.Database)
+		session.Touch()
+
+		switch req.TxnControl {
+		case ForwardTxnControl_FWD_TXN_BEGIN:
+			return h.handleBegin(ctx, session, req)
+		case ForwardTxnControl_FWD_TXN_COMMIT:
+			return h.handleCommit(ctx, session, req)
+		case ForwardTxnControl_FWD_TXN_ROLLBACK:
+			return h.handleRollback(ctx, session, req)
+		}
+	}
+
+	// For regular statements, database is required (unless it's CREATE/DROP DATABASE)
+	// Check database first if SQL is empty or not a database operation
+	if req.Sql == "" {
+		if req.Database == "" {
+			return &ForwardQueryResponse{
+				Success:      false,
+				ErrorMessage: "database is required",
+			}, nil
+		}
+	} else {
+		// Parse to classify statement type - need transpilation for proper classification
+		stmt := protocol.ParseStatement(req.Sql)
+
+		// CREATE/DROP DATABASE don't need database context - handle via coordinator directly
+		if stmt.Type == protocol.StatementCreateDatabase || stmt.Type == protocol.StatementDropDatabase {
+			return h.handleDatabaseOp(ctx, req, stmt)
+		}
+	}
+
+	// For all other statements, database is required
 	if req.Database == "" {
 		return &ForwardQueryResponse{
 			Success:      false,
@@ -70,20 +123,45 @@ func (h *ForwardHandler) HandleForwardQuery(ctx context.Context, req *ForwardQue
 	session := h.sessionMgr.GetOrCreateSession(key, req.Database)
 	session.Touch()
 
-	switch req.TxnControl {
-	case ForwardTxnControl_FWD_TXN_BEGIN:
-		return h.handleBegin(ctx, session, req)
-	case ForwardTxnControl_FWD_TXN_COMMIT:
-		return h.handleCommit(ctx, session, req)
-	case ForwardTxnControl_FWD_TXN_ROLLBACK:
-		return h.handleRollback(ctx, session, req)
-	default:
-		return h.handleStatement(ctx, session, req)
+	return h.handleStatement(ctx, session, req)
+}
+
+// handleDatabaseOp handles CREATE/DROP DATABASE via coordinator
+func (h *ForwardHandler) handleDatabaseOp(_ context.Context, req *ForwardQueryRequest, stmt protocol.Statement) (*ForwardQueryResponse, error) {
+	log.Debug().
+		Uint64("replica_node_id", req.ReplicaNodeId).
+		Uint64("session_id", req.SessionId).
+		Int("stmt_type", int(stmt.Type)).
+		Str("database", stmt.Database).
+		Msg("Database operation via forward")
+
+	// Use coordinator with transpilation enabled - it handles CREATE/DROP DATABASE properly
+	connSession := &protocol.ConnectionSession{
+		ConnID:               req.SessionId,
+		TranspilationEnabled: true, // Need this for proper CREATE/DROP DATABASE handling
 	}
+
+	rs, err := h.coordHandler.HandleQuery(connSession, req.Sql, nil)
+	if err != nil {
+		return &ForwardQueryResponse{
+			Success:      false,
+			ErrorMessage: err.Error(),
+		}, nil
+	}
+
+	var rowsAffected int64
+	if rs != nil {
+		rowsAffected = rs.RowsAffected
+	}
+
+	return &ForwardQueryResponse{
+		Success:      true,
+		RowsAffected: rowsAffected,
+	}, nil
 }
 
 // handleBegin starts a new transaction
-func (h *ForwardHandler) handleBegin(ctx context.Context, session *ForwardSession, req *ForwardQueryRequest) (*ForwardQueryResponse, error) {
+func (h *ForwardHandler) handleBegin(_ context.Context, session *ForwardSession, req *ForwardQueryRequest) (*ForwardQueryResponse, error) {
 	startTS := h.clock.Now()
 	txnID := startTS.ToTxnID()
 
@@ -112,7 +190,7 @@ func (h *ForwardHandler) handleBegin(ctx context.Context, session *ForwardSessio
 }
 
 // handleCommit commits the transaction
-func (h *ForwardHandler) handleCommit(ctx context.Context, session *ForwardSession, req *ForwardQueryRequest) (*ForwardQueryResponse, error) {
+func (h *ForwardHandler) handleCommit(_ context.Context, session *ForwardSession, req *ForwardQueryRequest) (*ForwardQueryResponse, error) {
 	txn := session.GetTransaction()
 	if txn == nil {
 		return &ForwardQueryResponse{
@@ -165,7 +243,6 @@ func (h *ForwardHandler) handleCommit(ctx context.Context, session *ForwardSessi
 
 		if rs != nil {
 			totalRowsAffected += rs.RowsAffected
-			// Track the last non-zero LAST_INSERT_ID
 			if rs.LastInsertId > 0 {
 				lastInsertId = rs.LastInsertId
 			}
@@ -191,7 +268,7 @@ func (h *ForwardHandler) handleCommit(ctx context.Context, session *ForwardSessi
 }
 
 // handleRollback rolls back the transaction
-func (h *ForwardHandler) handleRollback(ctx context.Context, session *ForwardSession, req *ForwardQueryRequest) (*ForwardQueryResponse, error) {
+func (h *ForwardHandler) handleRollback(_ context.Context, session *ForwardSession, req *ForwardQueryRequest) (*ForwardQueryResponse, error) {
 	txn := session.GetTransaction()
 	stmtCount := 0
 	var txnID uint64
@@ -216,7 +293,6 @@ func (h *ForwardHandler) handleRollback(ctx context.Context, session *ForwardSes
 
 // handleStatement handles a regular statement (auto-commit or buffered)
 func (h *ForwardHandler) handleStatement(ctx context.Context, session *ForwardSession, req *ForwardQueryRequest) (*ForwardQueryResponse, error) {
-	// Deserialize params using the new helper
 	params, err := DeserializeParams(req.Params)
 	if err != nil {
 		return &ForwardQueryResponse{
@@ -225,12 +301,8 @@ func (h *ForwardHandler) handleStatement(ctx context.Context, session *ForwardSe
 		}, nil
 	}
 
-	// SQL from replica is already transpiled - execute directly without re-parsing
-	// The replica handles transpilation and multi-statement splitting
-
 	txn := session.GetTransaction()
 	if txn != nil {
-		// For transactions, buffer the statement
 		if err := session.AddStatement(req.Sql, params); err != nil {
 			return &ForwardQueryResponse{
 				Success:      false,
@@ -252,7 +324,6 @@ func (h *ForwardHandler) handleStatement(ctx context.Context, session *ForwardSe
 		}, nil
 	}
 
-	// Use client timeout if specified
 	timeout := time.Duration(cfg.Config.Replica.ForwardWriteTimeoutSec) * time.Second
 	if req.TimeoutMs > 0 {
 		timeout = time.Duration(req.TimeoutMs) * time.Millisecond
@@ -260,7 +331,7 @@ func (h *ForwardHandler) handleStatement(ctx context.Context, session *ForwardSe
 	execCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	// TranspilationEnabled=false because SQL from replica is already transpiled
+	// SQL from replica is already transpiled - skip re-transpilation
 	connSession := &protocol.ConnectionSession{
 		ConnID:               req.SessionId,
 		CurrentDatabase:      req.Database,
@@ -300,20 +371,18 @@ func (h *ForwardHandler) handleStatement(ctx context.Context, session *ForwardSe
 			}, nil
 		}
 
-		resp := &ForwardQueryResponse{
+		log.Debug().
+			Uint64("replica_node_id", req.ReplicaNodeId).
+			Uint64("session_id", req.SessionId).
+			Int64("rows_affected", totalRowsAffected).
+			Msg("Statement executed successfully")
+
+		return &ForwardQueryResponse{
 			Success:        true,
 			CommittedTxnId: committedTxnId,
 			RowsAffected:   totalRowsAffected,
 			LastInsertId:   lastInsertId,
-		}
-
-		log.Debug().
-			Uint64("replica_node_id", req.ReplicaNodeId).
-			Uint64("session_id", req.SessionId).
-			Int64("rows_affected", resp.RowsAffected).
-			Msg("Statement executed successfully")
-
-		return resp, nil
+		}, nil
 
 	case <-execCtx.Done():
 		log.Debug().
