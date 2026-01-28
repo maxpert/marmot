@@ -95,7 +95,7 @@ func (r *IntTypeRule) Transform(stmt sqlparser.Statement, params []interface{}, 
 
 // isIntegerType checks if the type is a MySQL integer type
 func isIntegerType(t string) bool {
-	switch t {
+	switch strings.ToUpper(t) {
 	case "TINYINT", "SMALLINT", "MEDIUMINT", "INT", "INTEGER", "BIGINT":
 		return true
 	default:

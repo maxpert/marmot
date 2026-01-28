@@ -56,8 +56,8 @@ func TestCreateTableRule_ExtractIndexes(t *testing.T) {
 				email VARCHAR(100),
 				UNIQUE KEY email_idx (email)
 			)`,
-			wantApplicable:     false,
-			wantStatementCount: 0,
+			wantApplicable:     true, // Rule always applies to CREATE TABLE (strips MySQL-specific options)
+			wantStatementCount: 1,    // Just the CREATE TABLE with UNIQUE KEY inline, no indexes extracted
 		},
 		{
 			name: "extract regular KEY, keep UNIQUE KEY inline",
@@ -92,8 +92,8 @@ func TestCreateTableRule_ExtractIndexes(t *testing.T) {
 				id INT,
 				PRIMARY KEY (id)
 			)`,
-			wantApplicable:     false,
-			wantStatementCount: 0,
+			wantApplicable:     true, // Rule always applies to CREATE TABLE (strips MySQL-specific options)
+			wantStatementCount: 1,    // Just the CREATE TABLE, no indexes extracted
 		},
 		{
 			name: "composite index",
@@ -119,8 +119,8 @@ func TestCreateTableRule_ExtractIndexes(t *testing.T) {
 		{
 			name:               "no indexes",
 			input:              "CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR(100))",
-			wantApplicable:     false,
-			wantStatementCount: 0,
+			wantApplicable:     true, // Rule always applies to CREATE TABLE (strips MySQL-specific options)
+			wantStatementCount: 1,    // Just the CREATE TABLE, no indexes extracted
 		},
 		{
 			name:               "not a CREATE TABLE",
@@ -209,13 +209,14 @@ func TestCreateTableRule_MultipleTransforms(t *testing.T) {
 	stmt2, _ := sqlparser.NewTestParser().Parse(input2)
 	results2, err := rule.Transform(stmt2, nil, nil, "", &SQLiteSerializer{})
 
-	// UNIQUE KEY should not be extracted, so rule should not apply
-	if err != ErrRuleNotApplicable {
-		t.Fatalf("expected ErrRuleNotApplicable for UNIQUE KEY only table, got: %v", err)
+	// Rule now always applies to CREATE TABLE (to strip MySQL-specific options)
+	// UNIQUE KEY is kept inline, not extracted
+	if err != nil {
+		t.Fatalf("expected rule to apply, got: %v", err)
 	}
 
-	if results2 != nil {
-		t.Errorf("expected nil results for UNIQUE KEY only table, got %d statements", len(results2))
+	if len(results2) != 1 {
+		t.Errorf("expected 1 statement for UNIQUE KEY only table, got %d statements", len(results2))
 	}
 }
 
@@ -232,18 +233,18 @@ func TestCreateTableRule_UniqueConstraintFormat(t *testing.T) {
 	}
 
 	rule := &CreateTableRule{}
-	_, err = rule.Transform(stmt, nil, nil, "", &SQLiteSerializer{})
+	results, err := rule.Transform(stmt, nil, nil, "", &SQLiteSerializer{})
 
-	// Should not be applicable since UNIQUE indexes are not extracted
-	if err != ErrRuleNotApplicable {
-		t.Fatalf("expected ErrRuleNotApplicable, got: %v", err)
+	// Rule now always applies to CREATE TABLE (to strip MySQL-specific options)
+	if err != nil {
+		t.Fatalf("expected rule to apply, got: %v", err)
 	}
 
-	// Now test that the serializer properly formats UNIQUE as CONSTRAINT
-	create := stmt.(*sqlparser.CreateTable)
-	serializer := &SQLiteSerializer{}
-	sql := serializer.Serialize(create)
+	if len(results) != 1 {
+		t.Fatalf("expected 1 statement, got %d", len(results))
+	}
 
+	sql := results[0].SQL
 	// Should contain CONSTRAINT ... UNIQUE, not UNIQUE KEY
 	lowerSQL := strings.ToLower(sql)
 	if !strings.Contains(lowerSQL, "constraint") {
@@ -517,5 +518,69 @@ func TestCreateTableRule_CombinedOptionsAndWidths(t *testing.T) {
 	// Check only regular index is extracted
 	if results[1].SQL != "CREATE INDEX IF NOT EXISTS created_idx ON users (created_at)" {
 		t.Errorf("unexpected index statement: %q", results[1].SQL)
+	}
+}
+
+// TestCreateTableRule_StripColumnCollateAndComment tests that MySQL-specific
+// column options (COLLATE, COMMENT) are stripped from CREATE TABLE statements.
+func TestCreateTableRule_StripColumnCollateAndComment(t *testing.T) {
+	input := `CREATE TABLE wp_litespeed_url_file (
+		id bigint(20) NOT NULL AUTO_INCREMENT,
+		vary varchar(32) COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT '' COMMENT 'md5 of final vary',
+		filename varchar(32) COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT '' COMMENT 'md5 of file content',
+		type tinyint(4) NOT NULL COMMENT 'css=1,js=2,ccss=3,ucss=4',
+		PRIMARY KEY (id),
+		KEY filename (filename),
+		KEY type (type)
+	) DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_520_ci`
+
+	stmt, err := sqlparser.NewTestParser().Parse(input)
+	if err != nil {
+		t.Fatalf("failed to parse SQL: %v", err)
+	}
+
+	rule := &CreateTableRule{}
+	results, err := rule.Transform(stmt, nil, nil, "", &SQLiteSerializer{})
+
+	if err != nil {
+		t.Fatalf("Transform failed: %v", err)
+	}
+
+	// Should have 3 statements: CREATE TABLE + 2 CREATE INDEX
+	if len(results) != 3 {
+		t.Fatalf("expected 3 statements, got %d", len(results))
+	}
+
+	mainSQL := results[0].SQL
+	lowerSQL := strings.ToLower(mainSQL)
+
+	// Check column-level COLLATE is stripped
+	if strings.Contains(lowerSQL, "utf8mb4_unicode_ci") {
+		t.Errorf("CREATE TABLE should not contain column COLLATE, got: %q", mainSQL)
+	}
+
+	// Check COMMENT is stripped
+	if strings.Contains(lowerSQL, "comment") {
+		t.Errorf("CREATE TABLE should not contain COMMENT, got: %q", mainSQL)
+	}
+
+	// Check table-level COLLATE is stripped
+	if strings.Contains(lowerSQL, "utf8mb4_unicode_520_ci") {
+		t.Errorf("CREATE TABLE should not contain table COLLATE, got: %q", mainSQL)
+	}
+
+	// Check integer widths are stripped
+	if strings.Contains(lowerSQL, "bigint(20)") || strings.Contains(lowerSQL, "tinyint(4)") {
+		t.Errorf("CREATE TABLE should not contain integer widths, got: %q", mainSQL)
+	}
+
+	// Check VARCHAR widths are preserved
+	if !strings.Contains(lowerSQL, "varchar(32)") {
+		t.Errorf("CREATE TABLE should preserve VARCHAR(32), got: %q", mainSQL)
+	}
+
+	// Verify it's valid SQLite SQL (no MySQL-specific syntax)
+	if strings.Contains(lowerSQL, "character set") {
+		t.Errorf("CREATE TABLE should not contain CHARACTER SET, got: %q", mainSQL)
 	}
 }

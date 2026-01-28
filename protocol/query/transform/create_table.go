@@ -6,14 +6,12 @@ import (
 	"vitess.io/vitess/go/vt/sqlparser"
 )
 
-// CreateTableRule extracts non-primary, non-unique KEY/INDEX definitions from CREATE TABLE
-// into separate CREATE INDEX statements.
-//
-// MySQL allows KEY/INDEX definitions inline in CREATE TABLE, but SQLite prefers
-// separate CREATE INDEX statements. This rule:
+// CreateTableRule transforms MySQL CREATE TABLE to SQLite-compatible form:
+//   - Strips MySQL-specific column options (COLLATE, COMMENT)
+//   - Strips MySQL-specific table options (ENGINE, CHARSET, COLLATE)
+//   - Extracts non-primary, non-unique KEY/INDEX definitions into separate CREATE INDEX statements
 //   - Keeps PRIMARY KEY definitions in the CREATE TABLE
 //   - Keeps UNIQUE KEY definitions in the CREATE TABLE (converted to CONSTRAINT by serializer)
-//   - Extracts regular KEY/INDEX definitions and returns them as separate CREATE INDEX statements
 //   - Strips column length specifications: KEY idx (col(191)) → col
 //   - Skips FULLTEXT/SPATIAL indexes (passed through to serializer)
 type CreateTableRule struct {
@@ -49,19 +47,27 @@ func (r *CreateTableRule) Transform(stmt sqlparser.Statement, params []interface
 		}
 	}
 
-	if len(indexesToExtract) == 0 {
-		return nil, ErrRuleNotApplicable
-	}
-
 	create.TableSpec.Indexes = remainingIndexes
 
 	// Clear MySQL-specific table options (ENGINE, CHARSET, COLLATE)
 	create.TableSpec.Options = nil
 
-	// Strip display widths from integer types: INTEGER(20) → INTEGER
+	// Process columns: strip MySQL-specific options
 	for _, col := range create.TableSpec.Columns {
-		if col.Type != nil && isIntegerType(col.Type.Type) {
-			col.Type.Length = nil
+		if col.Type != nil {
+			// Strip display widths from integer types: INTEGER(20) → INTEGER
+			if isIntegerType(col.Type.Type) {
+				col.Type.Length = nil
+			}
+			// Strip MySQL-specific column options
+			if col.Type.Options != nil {
+				// Strip MySQL-specific COLLATE (SQLite only supports NOCASE, BINARY, RTRIM)
+				col.Type.Options.Collate = ""
+				// Strip MySQL-specific COMMENT (not supported in SQLite column definitions)
+				col.Type.Options.Comment = nil
+			}
+			// Also strip charset (SQLite doesn't use MySQL charsets)
+			col.Type.Charset = sqlparser.ColumnCharset{}
 		}
 	}
 
