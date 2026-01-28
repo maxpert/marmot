@@ -150,13 +150,16 @@ func (h *ForwardHandler) handleDatabaseOp(_ context.Context, req *ForwardQueryRe
 	}
 
 	var rowsAffected int64
+	var committedTxnId uint64
 	if rs != nil {
 		rowsAffected = rs.RowsAffected
+		committedTxnId = rs.CommittedTxnId
 	}
 
 	return &ForwardQueryResponse{
-		Success:      true,
-		RowsAffected: rowsAffected,
+		Success:        true,
+		RowsAffected:   rowsAffected,
+		CommittedTxnId: committedTxnId,
 	}, nil
 }
 
@@ -185,7 +188,8 @@ func (h *ForwardHandler) handleBegin(_ context.Context, session *ForwardSession,
 		Msg("BEGIN transaction on leader")
 
 	return &ForwardQueryResponse{
-		Success: true,
+		Success:       true,
+		InTransaction: true,
 	}, nil
 }
 
