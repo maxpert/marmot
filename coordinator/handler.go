@@ -536,7 +536,8 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, params []in
 	telemetry.RowsAffected.Observe(float64(rowsAffected))
 
 	rs := &protocol.ResultSet{
-		RowsAffected: rowsAffected,
+		RowsAffected:   rowsAffected,
+		CommittedTxnId: uint64(txnID),
 	}
 
 	// Only set LastInsertId for INSERT/REPLACE operations (MySQL compliance)
@@ -971,7 +972,8 @@ func (h *CoordinatorHandler) handleCommit(session *protocol.ConnectionSession) (
 		Msg("COMMIT: Transaction committed successfully")
 
 	return &protocol.ResultSet{
-		RowsAffected: totalRowsAffected,
+		RowsAffected:   totalRowsAffected,
+		CommittedTxnId: txnState.TxnID,
 	}, nil
 }
 

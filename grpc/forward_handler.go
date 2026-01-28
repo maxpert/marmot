@@ -292,6 +292,7 @@ func (h *ForwardHandler) handleStatement(ctx context.Context, session *ForwardSe
 	done := make(chan struct{})
 	var totalRowsAffected int64
 	var lastInsertId int64
+	var committedTxnId uint64
 	var execErr error
 
 	go func() {
@@ -311,6 +312,9 @@ func (h *ForwardHandler) handleStatement(ctx context.Context, session *ForwardSe
 				totalRowsAffected += rs.RowsAffected
 				if rs.LastInsertId > 0 {
 					lastInsertId = rs.LastInsertId
+				}
+				if rs.CommittedTxnId > 0 {
+					committedTxnId = rs.CommittedTxnId
 				}
 			}
 		}
@@ -332,13 +336,9 @@ func (h *ForwardHandler) handleStatement(ctx context.Context, session *ForwardSe
 			}, nil
 		}
 
-		// Generate and return txn ID for auto-commit
-		ts := h.clock.Now()
-		txnID := ts.ToTxnID()
-
 		resp := &ForwardQueryResponse{
 			Success:        true,
-			CommittedTxnId: txnID,
+			CommittedTxnId: committedTxnId,
 			RowsAffected:   totalRowsAffected,
 			LastInsertId:   lastInsertId,
 		}

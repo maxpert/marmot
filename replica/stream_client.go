@@ -172,7 +172,20 @@ func (s *StreamClient) Bootstrap(ctx context.Context) error {
 	} else {
 		// Check each database
 		for dbName, masterTxnID := range filteredMasterTxnIDs {
-			localTxnID := localTxnIDs[dbName]
+			localTxnID, existsLocally := localTxnIDs[dbName]
+
+			// If database doesn't exist locally, create it
+			if !existsLocally {
+				created, err := s.ensureDatabaseExists(dbName)
+				if err != nil {
+					log.Error().Err(err).Str("database", dbName).Msg("Failed to create database during bootstrap")
+					continue
+				}
+				if created {
+					log.Info().Str("database", dbName).Msg("Created database during bootstrap")
+				}
+			}
+
 			gap := masterTxnID - localTxnID
 
 			if gap == 0 {
@@ -539,96 +552,84 @@ func (s *StreamClient) disconnect() {
 
 // streamChanges streams and applies changes from master
 func (s *StreamClient) streamChanges(ctx context.Context) error {
-	// Get list of databases to stream
-	databases := s.dbManager.ListDatabases()
-	if len(databases) == 0 {
-		databases = []string{"marmot"} // Default database
+	// Get minimum txnID across all databases for starting point
+	s.mu.RLock()
+	var minFromTxnID uint64
+	for _, txnID := range s.lastTxnID {
+		if minFromTxnID == 0 || txnID < minFromTxnID {
+			minFromTxnID = txnID
+		}
+	}
+	s.mu.RUnlock()
+
+	log.Info().
+		Uint64("from_txn_id", minFromTxnID).
+		Msg("Starting unified change stream for all databases")
+
+	// Request streaming for ALL databases (empty Database means all)
+	// This avoids the sequential blocking issue where only one database gets streamed
+	stream, err := s.client.StreamChanges(ctx, &marmotgrpc.StreamRequest{
+		FromTxnId:        minFromTxnID,
+		RequestingNodeId: s.nodeID,
+		Database:         "", // Empty means stream all databases
+	})
+	if err != nil {
+		return fmt.Errorf("failed to start stream: %w", err)
 	}
 
-	// Stream changes for each database
-	// For simplicity, we stream all databases sequentially
-	// In production, you might want parallel streams
-	for _, dbName := range databases {
+	// Process multiplexed stream from all databases
+	for {
+		event, err := stream.Recv()
+		if err == io.EOF {
+			log.Info().Msg("Change stream ended")
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("stream error: %w", err)
+		}
+
+		dbName := event.Database
+		if dbName == "" {
+			log.Warn().Uint64("txn_id", event.TxnId).Msg("Received event without database name, skipping")
+			continue
+		}
+
+		// Skip already applied transactions for this database
 		s.mu.RLock()
-		fromTxnID := s.lastTxnID[dbName]
+		lastTxnID := s.lastTxnID[dbName]
 		s.mu.RUnlock()
 
-		log.Info().
-			Str("database", dbName).
-			Uint64("from_txn_id", fromTxnID).
-			Msg("Starting change stream for database")
-
-		stream, err := s.client.StreamChanges(ctx, &marmotgrpc.StreamRequest{
-			FromTxnId:        fromTxnID,
-			RequestingNodeId: s.nodeID,
-			Database:         dbName,
-		})
-		if err != nil {
-			return fmt.Errorf("failed to start stream for %s: %w", dbName, err)
+		if event.TxnId <= lastTxnID {
+			continue
 		}
 
-		// Process stream
-		firstEvent := true
-		for {
-			event, err := stream.Recv()
-			if err == io.EOF {
-				// Stream ended, move to next database
-				break
-			}
-			if err != nil {
-				return fmt.Errorf("stream error: %w", err)
-			}
-
-			// Skip already applied transactions
-			if event.TxnId <= fromTxnID {
-				continue
-			}
-
-			// Gap detection on first event
-			// NOTE: txn_ids are HLC-based (nanoseconds), not sequential counters.
-			// Gap detection using raw txn_id difference doesn't work reliably.
-			// Anti-entropy service handles large gaps via periodic snapshots instead.
-			if firstEvent {
-				firstEvent = false
-				// Log the gap for debugging but don't trigger snapshot based on txn_id difference
-				gap := event.TxnId - fromTxnID
-				log.Debug().
-					Str("database", dbName).
-					Uint64("gap", gap).
-					Uint64("from_txn_id", fromTxnID).
-					Uint64("event_txn_id", event.TxnId).
-					Msg("First stream event received")
-			}
-
-			// Apply change
-			if err := s.applyChangeEvent(ctx, event); err != nil {
-				log.Error().Err(err).
-					Uint64("txn_id", event.TxnId).
-					Str("database", dbName).
-					Msg("Failed to apply change event")
-				// Continue anyway - anti-entropy will fix it
-				continue
-			}
-
-			// Update last txn ID
-			s.mu.Lock()
-			s.lastTxnID[dbName] = event.TxnId
-			s.mu.Unlock()
-
-			// Notify waiters
-			if q, ok := s.txnWaitQueues[dbName]; ok {
-				q.NotifyUpTo(event.TxnId)
-			}
-
-			log.Debug().
+		// Apply change
+		if err := s.applyChangeEvent(ctx, event); err != nil {
+			log.Error().Err(err).
 				Uint64("txn_id", event.TxnId).
 				Str("database", dbName).
-				Int("statements", len(event.Statements)).
-				Msg("Applied change event")
+				Msg("Failed to apply change event")
+			// Continue anyway - anti-entropy will fix it
+			continue
 		}
-	}
 
-	return nil
+		// Update last txn ID for this database and get wait queue if exists
+		s.mu.Lock()
+		s.lastTxnID[dbName] = event.TxnId
+		q := s.txnWaitQueues[dbName] // May be nil if no waiters
+		s.mu.Unlock()
+
+		// Notify waiters for this database (outside lock to avoid deadlock)
+		if q != nil {
+			q.NotifyUpTo(event.TxnId)
+		}
+
+		log.Debug().
+			Uint64("txn_id", event.TxnId).
+			Str("database", dbName).
+			Int("statements", len(event.Statements)).
+			Msg("Applied change event")
+	}
 }
 
 // deltaSync performs delta sync for a single database
@@ -897,6 +898,19 @@ func (s *StreamClient) applyDropDatabase(stmt *marmotgrpc.Statement, fallbackDB 
 		return nil
 	}
 	return fmt.Errorf("failed to drop database %s: %w", dbName, err)
+}
+
+// ensureDatabaseExists creates a database if it doesn't exist.
+// Returns (created, error) where created is true if a new database was created.
+func (s *StreamClient) ensureDatabaseExists(dbName string) (bool, error) {
+	if err := s.dbManager.CreateDatabase(dbName); err != nil {
+		// Idempotent: database may already exist
+		if strings.Contains(err.Error(), "already exists") {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 // applyStatement applies a single statement within a transaction
@@ -1241,12 +1255,16 @@ func (s *StreamClient) discoverNewDatabases(ctx context.Context) {
 		s.mu.RUnlock()
 
 		if !exists {
-			// New database detected - mark it for tracking
-			// The actual snapshot download will happen during normal streaming
-			log.Info().
-				Str("database", dbName).
-				Uint64("max_txn_id", dbInfo.MaxTxnId).
-				Msg("Discovered new database, will sync via streaming")
+			// New database detected - create it immediately so it can receive streamed changes
+			created, err := s.ensureDatabaseExists(dbName)
+			if err != nil {
+				log.Error().Err(err).Str("database", dbName).Msg("Failed to create discovered database")
+				continue
+			}
+
+			if created {
+				log.Info().Str("database", dbName).Uint64("max_txn_id", dbInfo.MaxTxnId).Msg("Created discovered database")
+			}
 
 			s.mu.Lock()
 			s.lastTxnID[dbName] = 0 // Start from beginning

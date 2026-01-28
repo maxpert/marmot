@@ -155,10 +155,11 @@ type ConnectionHandler interface {
 
 // ResultSet represents a MySQL result set
 type ResultSet struct {
-	Columns      []ColumnDef
-	Rows         [][]interface{}
-	RowsAffected int64
-	LastInsertId int64
+	Columns        []ColumnDef
+	Rows           [][]interface{}
+	RowsAffected   int64
+	LastInsertId   int64
+	CommittedTxnId uint64 // For write forwarding: actual CDC txnID
 }
 
 // ColumnDef represents a column definition
