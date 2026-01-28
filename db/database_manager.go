@@ -37,6 +37,7 @@ type DatabaseManager struct {
 	nodeID                   uint64
 	clock                    *hlc.Clock
 	refreshReplicationStates RefreshReplicationStatesFunc // Callback to refresh peer states before GC
+	cdcHub                   CDCHub                       // CDC notification hub, can be nil
 }
 
 // DatabaseMetadata represents database registry information
@@ -191,6 +192,11 @@ func (dm *DatabaseManager) wireGCCoordination(mdb *ReplicatedDatabase, dbName st
 	if dm.refreshReplicationStates != nil {
 		txnMgr.SetRefreshReplicationStatesFunc(dm.refreshReplicationStates)
 	}
+
+	// Wire CDC notifier if available
+	if dm.cdcHub != nil {
+		txnMgr.SetNotifier(dm.cdcHub)
+	}
 }
 
 // SetRefreshReplicationStatesFunc sets the callback for refreshing peer replication states
@@ -209,6 +215,29 @@ func (dm *DatabaseManager) SetRefreshReplicationStatesFunc(fn RefreshReplication
 		txnMgr := mdb.GetTransactionManager()
 		txnMgr.SetRefreshReplicationStatesFunc(fn)
 	}
+}
+
+// SetCDCHub sets the CDC notification hub and wires it to all existing databases
+func (dm *DatabaseManager) SetCDCHub(hub CDCHub) {
+	dm.mu.Lock()
+	dm.cdcHub = hub
+	dm.mu.Unlock()
+
+	// Wire to all existing databases
+	dm.mu.RLock()
+	defer dm.mu.RUnlock()
+
+	for _, mdb := range dm.databases {
+		txnMgr := mdb.GetTransactionManager()
+		txnMgr.SetNotifier(hub)
+	}
+}
+
+// GetCDCHub returns the CDC notification hub
+func (dm *DatabaseManager) GetCDCHub() CDCHub {
+	dm.mu.RLock()
+	defer dm.mu.RUnlock()
+	return dm.cdcHub
 }
 
 // ensureDefaultDatabase ensures the default database exists

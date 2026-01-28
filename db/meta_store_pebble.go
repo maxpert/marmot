@@ -1109,15 +1109,15 @@ func (s *PebbleMetaStore) MarkIntentsForCleanup(txnID uint64) error {
 	return nil
 }
 
-// CleanupAfterCommit performs all cleanup operations for a committed transaction.
+// CleanupAfterCommit performs cleanup operations for a committed transaction.
 // Phase 1: Marks intents with GC markers (other txns can overwrite)
-// Phase 2: Deletes all intents and CDC entries in a single batch
-// This consolidates MarkIntentsForCleanup + DeleteIntentsByTxn + DeleteIntentEntries
+// Phase 2: Deletes intent index entries only (NOT CDC raw entries)
+// Note: CDC raw entries are retained for streaming replication and deleted by GC.
 func (s *PebbleMetaStore) CleanupAfterCommit(txnID uint64) error {
 	// Single pass: mark GC, release locks, get keys (no Pebble iteration)
 	lockKeys := s.rowLocks.MarkGCAndRelease(txnID)
 
-	// Single batch for all deletions
+	// Single batch for intent index deletions only
 	batch := s.db.NewBatch()
 	defer batch.Close()
 
@@ -1127,27 +1127,6 @@ func (s *PebbleMetaStore) CleanupAfterCommit(txnID uint64) error {
 		if table != "" {
 			_ = batch.Delete(pebbleIntentByTxnKey(txnID, table, rowKey), nil)
 		}
-	}
-
-	// Collect CDC entry keys (/cdc/raw/{txnID}/*) - still need iteration for now
-	cdcPrefix := pebbleCdcRawPrefix(txnID)
-
-	cdcIter, err := s.db.NewIter(&pebble.IterOptions{
-		LowerBound: cdcPrefix,
-		UpperBound: prefixUpperBound(cdcPrefix),
-	})
-	if err != nil {
-		return err
-	}
-
-	for cdcIter.SeekGE(cdcPrefix); cdcIter.Valid(); cdcIter.Next() {
-		key := make([]byte, len(cdcIter.Key()))
-		copy(key, cdcIter.Key())
-		_ = batch.Delete(key, nil)
-	}
-
-	if err := cdcIter.Close(); err != nil {
-		return err
 	}
 
 	// Early return if nothing to delete

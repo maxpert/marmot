@@ -20,6 +20,7 @@ import (
 	marmotgrpc "github.com/maxpert/marmot/grpc"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/id"
+	"github.com/maxpert/marmot/notify"
 	"github.com/maxpert/marmot/protocol"
 	"github.com/maxpert/marmot/publisher"
 	"github.com/maxpert/marmot/replica"
@@ -243,6 +244,12 @@ func main() {
 		return
 	}
 	defer dbMgr.Close()
+
+	// Initialize CDC notification hub for signal-based change streaming
+	cdcHub := notify.NewHub()
+	dbMgr.SetCDCHub(cdcHub)
+	grpcServer.SetCDCSubscriber(cdcHub)
+	log.Info().Msg("CDC notification hub initialized")
 
 	// Start metrics collector for telemetry (updates every 10 seconds)
 	metricsCollector := telemetry.NewMetricsCollector(&dbManagerAdapter{dm: dbMgr}, 10*time.Second)

@@ -3,6 +3,7 @@ package grpc
 import (
 	"context"
 	"crypto/md5"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -23,6 +24,9 @@ import (
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/reflection"
 )
+
+// errStopIteration is a sentinel error used to exit early from transaction iteration.
+var errStopIteration = errors.New("stop iteration")
 
 // snapshotCacheEntry represents a cached snapshot for a database
 type snapshotCacheEntry struct {
@@ -53,6 +57,9 @@ type Server struct {
 	// Write forwarding for read-only replicas
 	forwardSessionMgr *ForwardSessionManager
 	forwardHandler    *ForwardHandler
+
+	// CDC signal-based change streaming
+	cdcSubscriber db.CDCSubscriber
 
 	// Snapshot caching
 	snapshotCache   map[string]*snapshotCacheEntry
@@ -381,9 +388,6 @@ func (s *Server) Read(ctx context.Context, req *ReadRequest) (*ReadResponse, err
 	return &ReadResponse{}, nil
 }
 
-// Polling interval for live transaction streaming
-const liveStreamPollInterval = 500 * time.Millisecond
-
 // sendChangeEvent converts a TransactionRecord to ChangeEvent and sends it on the stream.
 // Handles both CDC (Change Data Capture) path with row data and DDL path with SQL statements.
 // Reads CDC entries from MetaStore for the transaction and converts them to Statement objects.
@@ -455,8 +459,9 @@ func (s *Server) sendChangeEvent(rec *db.TransactionRecord, metaStore db.MetaSto
 	return stream.Send(event)
 }
 
-// StreamChanges handles change streaming for catch-up.
-// Streams committed transactions from a given txn_id for delta sync, then keeps stream alive for live updates.
+// StreamChanges handles change streaming for catch-up and live push.
+// Phase 1: Streams historical transactions for delta sync
+// Phase 2: Subscribes to CDC signals for real-time push (no polling)
 func (s *Server) StreamChanges(req *StreamRequest, stream MarmotService_StreamChangesServer) error {
 	// Clean up forwarded sessions when this replica disconnects
 	defer func() {
@@ -472,28 +477,41 @@ func (s *Server) StreamChanges(req *StreamRequest, stream MarmotService_StreamCh
 
 	s.mu.RLock()
 	dbManager := s.dbManager
+	cdcSubscriber := s.cdcSubscriber
 	s.mu.RUnlock()
 
 	if dbManager == nil {
 		return fmt.Errorf("database manager not initialized")
 	}
 
+	if cdcSubscriber == nil {
+		return fmt.Errorf("CDC subscriber not initialized")
+	}
+
 	log.Info().
 		Uint64("from_txn_id", req.FromTxnId).
 		Uint64("requesting_node", req.RequestingNodeId).
 		Str("database", req.Database).
-		Msg("Starting change stream")
+		Msg("Starting change stream (signal-based push mode)")
 
-	// Get databases to stream from
+	// Track last sent transaction ID per database
+	lastSentTxn := make(map[string]uint64)
+
+	// Subscribe to CDC signals BEFORE streaming historical to avoid missing changes
+	filter := db.CDCFilter{}
+	if req.Database != "" {
+		filter.Databases = []string{req.Database}
+	}
+	signals, cancel := cdcSubscriber.Subscribe(filter)
+	defer cancel()
+
+	// Get databases to stream from for historical catch-up
 	var databases []string
 	if req.Database != "" {
 		databases = []string{req.Database}
 	} else {
 		databases = dbManager.ListDatabases()
 	}
-
-	// Track last sent transaction ID per database
-	lastSentTxn := make(map[string]uint64)
 
 	// Phase 1: Stream historical transactions (catch-up)
 	if err := s.streamHistoricalTransactions(dbManager, databases, req.FromTxnId, stream, lastSentTxn); err != nil {
@@ -502,10 +520,94 @@ func (s *Server) StreamChanges(req *StreamRequest, stream MarmotService_StreamCh
 
 	log.Info().
 		Uint64("from_txn_id", req.FromTxnId).
-		Msg("Historical transactions streamed, entering live streaming mode")
+		Uint64("requesting_node", req.RequestingNodeId).
+		Msg("Historical transactions streamed, entering signal-based push mode")
 
-	// Phase 2: Keep stream alive and poll for new transactions
-	return s.pollForNewTransactions(dbManager, databases, stream, lastSentTxn, req.RequestingNodeId)
+	// Phase 2: Live streaming via CDC signals
+	for {
+		select {
+		case <-stream.Context().Done():
+			return stream.Context().Err()
+		case sig := <-signals:
+			// Pull and stream the transaction
+			if err := s.pullAndStreamTransaction(sig, lastSentTxn, stream); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+// pullAndStreamTransaction pulls a transaction from MetaStore and streams it
+func (s *Server) pullAndStreamTransaction(sig db.CDCSignal, lastSentTxn map[string]uint64, stream MarmotService_StreamChangesServer) error {
+	// Skip if already sent
+	if sig.TxnID <= lastSentTxn[sig.Database] {
+		return nil
+	}
+
+	s.mu.RLock()
+	dbManager := s.dbManager
+	s.mu.RUnlock()
+
+	if dbManager == nil {
+		log.Debug().
+			Str("database", sig.Database).
+			Uint64("txn_id", sig.TxnID).
+			Msg("Skipping CDC signal - database manager not initialized")
+		return nil
+	}
+
+	mdb, err := dbManager.GetDatabase(sig.Database)
+	if err != nil {
+		log.Debug().
+			Str("database", sig.Database).
+			Uint64("txn_id", sig.TxnID).
+			Msg("Skipping CDC signal - database dropped")
+		return nil
+	}
+
+	metaStore := mdb.GetMetaStore()
+	if metaStore == nil {
+		log.Debug().
+			Str("database", sig.Database).
+			Uint64("txn_id", sig.TxnID).
+			Msg("Skipping CDC signal - MetaStore unavailable")
+		return nil
+	}
+
+	// Pull the specific transaction using StreamCommittedTransactions with tight range
+	var rec *db.TransactionRecord
+	err = metaStore.StreamCommittedTransactions(sig.TxnID-1, func(r *db.TransactionRecord) error {
+		if r.TxnID == sig.TxnID {
+			rec = r
+			return errStopIteration
+		}
+		return nil
+	})
+
+	// Ignore stop iteration sentinel - it's our way to exit early
+	if err != nil && !errors.Is(err, errStopIteration) {
+		log.Debug().
+			Err(err).
+			Str("database", sig.Database).
+			Uint64("txn_id", sig.TxnID).
+			Msg("Skipping CDC signal - failed to read transaction")
+		return nil
+	}
+
+	if rec == nil {
+		log.Debug().
+			Str("database", sig.Database).
+			Uint64("txn_id", sig.TxnID).
+			Msg("Skipping CDC signal - transaction not found (may be GC'd)")
+		return nil
+	}
+
+	if err := s.sendChangeEvent(rec, metaStore, stream); err != nil {
+		return err
+	}
+
+	lastSentTxn[sig.Database] = sig.TxnID
+	return nil
 }
 
 // streamHistoricalTransactions streams all historical transactions for initial catch-up
@@ -544,58 +646,6 @@ func (s *Server) streamHistoricalTransactions(
 		}
 	}
 	return nil
-}
-
-// pollForNewTransactions keeps stream alive and polls for new transactions
-func (s *Server) pollForNewTransactions(
-	dbManager *db.DatabaseManager,
-	databases []string,
-	stream MarmotService_StreamChangesServer,
-	lastSentTxn map[string]uint64,
-	requestingNodeId uint64,
-) error {
-	ticker := time.NewTicker(liveStreamPollInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-stream.Context().Done():
-			// Client disconnected
-			log.Info().
-				Uint64("requesting_node", requestingNodeId).
-				Msg("Change stream client disconnected")
-			return stream.Context().Err()
-		case <-ticker.C:
-			// Poll for new transactions
-			for _, dbName := range databases {
-				mdb, err := dbManager.GetDatabase(dbName)
-				if err != nil {
-					continue
-				}
-
-				metaStore := mdb.GetMetaStore()
-				if metaStore == nil {
-					continue
-				}
-
-				fromTxn := lastSentTxn[dbName]
-				err = metaStore.StreamCommittedTransactions(fromTxn, func(rec *db.TransactionRecord) error {
-					// Skip already sent transaction
-					if rec.TxnID <= fromTxn {
-						return nil
-					}
-					if err := s.sendChangeEvent(rec, metaStore, stream); err != nil {
-						return err
-					}
-					lastSentTxn[dbName] = rec.TxnID
-					return nil
-				})
-				if err != nil {
-					log.Warn().Err(err).Str("database", dbName).Msg("Failed to poll transactions")
-				}
-			}
-		}
-	}
 }
 
 // GetReplicationState returns current replication state for anti-entropy
@@ -1053,6 +1103,13 @@ func (s *Server) SetDatabaseManager(manager *db.DatabaseManager) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.dbManager = manager
+}
+
+// SetCDCSubscriber sets the CDC subscriber for change streaming
+func (s *Server) SetCDCSubscriber(subscriber db.CDCSubscriber) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cdcSubscriber = subscriber
 }
 
 // =======================

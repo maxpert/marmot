@@ -63,6 +63,7 @@ type TransactionManager struct {
 	getClusterMinWatermark   ClusterMinWatermarkFunc      // Callback for GC via gossip watermark
 	refreshReplicationStates RefreshReplicationStatesFunc // Callback to refresh watermarks before GC
 	batchCommitter           *SQLiteBatchCommitter        // SQLite write batcher (nil if disabled)
+	notifier                 CDCNotifier                  // Injected, can be nil
 }
 
 // NewTransactionManager creates a new transaction manager
@@ -133,6 +134,13 @@ func (tm *TransactionManager) SetRefreshReplicationStatesFunc(fn RefreshReplicat
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 	tm.refreshReplicationStates = fn
+}
+
+// SetNotifier sets the CDC notifier for signaling after commits
+func (tm *TransactionManager) SetNotifier(n CDCNotifier) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	tm.notifier = n
 }
 
 // batchCommitEnabled returns true if batch committing is enabled and configured
@@ -280,6 +288,11 @@ func (tm *TransactionManager) CommitTransaction(txn *Transaction) error {
 	// Finalize commit in MetaStore
 	if err := tm.finalizeCommit(txn); err != nil {
 		return err
+	}
+
+	// Signal CDC subscribers that new data is available
+	if tm.notifier != nil {
+		tm.notifier.Signal(tm.databaseName, txn.ID)
 	}
 
 	// Cleanup
