@@ -225,48 +225,25 @@ func (h *ForwardHandler) handleStatement(ctx context.Context, session *ForwardSe
 		}, nil
 	}
 
-	// Use multi-statement parser to handle DDL that generates multiple statements
-	// (e.g., CREATE TABLE with KEY definitions generates CREATE TABLE + CREATE INDEX)
-	stmts := protocol.ParseStatementsWithSchema(req.Sql, nil)
-	if len(stmts) == 0 {
-		return &ForwardQueryResponse{
-			Success:      false,
-			ErrorMessage: "failed to parse SQL",
-		}, nil
-	}
-
-	// Check for parse errors in first statement
-	if stmts[0].Error != "" {
-		return &ForwardQueryResponse{
-			Success:      false,
-			ErrorMessage: stmts[0].Error,
-		}, nil
-	}
+	// SQL from replica is already transpiled - execute directly without re-parsing
+	// The replica handles transpilation and multi-statement splitting
 
 	txn := session.GetTransaction()
 	if txn != nil {
-		// For transactions, buffer all statements
-		for i, stmt := range stmts {
-			// Params only apply to first statement
-			var stmtParams []interface{}
-			if i == 0 {
-				stmtParams = params
-			}
-			if err := session.AddStatement(stmt.SQL, stmtParams); err != nil {
-				return &ForwardQueryResponse{
-					Success:      false,
-					ErrorMessage: err.Error(),
-				}, nil
-			}
+		// For transactions, buffer the statement
+		if err := session.AddStatement(req.Sql, params); err != nil {
+			return &ForwardQueryResponse{
+				Success:      false,
+				ErrorMessage: err.Error(),
+			}, nil
 		}
 
 		log.Debug().
 			Uint64("replica_node_id", req.ReplicaNodeId).
 			Uint64("session_id", req.SessionId).
 			Uint64("txn_id", txn.TxnID).
-			Int("stmt_count", len(stmts)).
 			Str("sql", req.Sql).
-			Msg("Buffered statement(s) in transaction")
+			Msg("Buffered statement in transaction")
 
 		return &ForwardQueryResponse{
 			Success:       true,
@@ -283,10 +260,11 @@ func (h *ForwardHandler) handleStatement(ctx context.Context, session *ForwardSe
 	execCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	// TranspilationEnabled=false because SQL from replica is already transpiled
 	connSession := &protocol.ConnectionSession{
 		ConnID:               req.SessionId,
 		CurrentDatabase:      req.Database,
-		TranspilationEnabled: true, // Required for proper statement type detection (CREATE DATABASE, etc.)
+		TranspilationEnabled: false,
 	}
 
 	done := make(chan struct{})
@@ -296,27 +274,13 @@ func (h *ForwardHandler) handleStatement(ctx context.Context, session *ForwardSe
 	var execErr error
 
 	go func() {
-		// Execute all statements in order
-		for i, stmt := range stmts {
-			// Params only apply to first statement
-			var stmtParams []interface{}
-			if i == 0 {
-				stmtParams = params
-			}
-			rs, err := h.coordHandler.HandleQuery(connSession, stmt.SQL, stmtParams)
-			if err != nil {
-				execErr = err
-				break
-			}
-			if rs != nil {
-				totalRowsAffected += rs.RowsAffected
-				if rs.LastInsertId > 0 {
-					lastInsertId = rs.LastInsertId
-				}
-				if rs.CommittedTxnId > 0 {
-					committedTxnId = rs.CommittedTxnId
-				}
-			}
+		rs, err := h.coordHandler.HandleQuery(connSession, req.Sql, params)
+		if err != nil {
+			execErr = err
+		} else if rs != nil {
+			totalRowsAffected = rs.RowsAffected
+			lastInsertId = rs.LastInsertId
+			committedTxnId = rs.CommittedTxnId
 		}
 		close(done)
 	}()
@@ -346,9 +310,8 @@ func (h *ForwardHandler) handleStatement(ctx context.Context, session *ForwardSe
 		log.Debug().
 			Uint64("replica_node_id", req.ReplicaNodeId).
 			Uint64("session_id", req.SessionId).
-			Int("stmt_count", len(stmts)).
 			Int64("rows_affected", resp.RowsAffected).
-			Msg("Statement(s) executed successfully")
+			Msg("Statement executed successfully")
 
 		return resp, nil
 
