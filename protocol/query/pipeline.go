@@ -78,6 +78,20 @@ func (p *Pipeline) Process(ctx *QueryContext) error {
 		stripDatabaseQualifiers(ctx)
 	}
 
+	// Extract literals from DML/SELECT statements for parameterized execution
+	// Skip if params already provided (prepared statements) or if DDL or if not enabled
+	if ctx.ExtractLiterals && len(ctx.Input.Parameters) == 0 && ctx.MySQLState != nil && ctx.MySQLState.AST != nil {
+		if shouldExtractLiterals(ctx.Output.StatementType) {
+			params := transform.ExtractLiterals(ctx.MySQLState.AST)
+			if params != nil {
+				// Re-serialize AST with placeholders
+				serializer := &transform.SQLiteSerializer{}
+				ctx.Output.Statements[0].SQL = serializer.Serialize(ctx.MySQLState.AST)
+				ctx.Output.Statements[0].Params = params
+			}
+		}
+	}
+
 	// Mark query as valid (validator removed - transpilation success means valid)
 	ctx.Output.IsValid = true
 
@@ -125,7 +139,7 @@ func stripDatabaseQualifiers(ctx *QueryContext) {
 // This is needed for compatibility with Drupal and other apps that use ANSI SQL quoting.
 // The function preserves:
 //   - Content inside single-quoted strings
-//   - Empty strings "" (converts to '' for MySQL compatibility)
+//   - Empty strings "" (converts to ” for MySQL compatibility)
 //   - Strings that look like values (after = or DEFAULT keywords)
 func convertANSIQuotesToBackticks(sql string) string {
 	// Quick check: if no double quotes, return as-is
@@ -217,6 +231,16 @@ func convertANSIQuotesToBackticks(sql string) string {
 	}
 
 	return result.String()
+}
+
+// shouldExtractLiterals returns true for statement types that benefit from parameterization
+func shouldExtractLiterals(stmtType StatementCode) bool {
+	switch stmtType {
+	case StatementInsert, StatementUpdate, StatementDelete, StatementSelect:
+		return true
+	default:
+		return false
+	}
 }
 
 // classifySQLiteStatement classifies SQLite dialect statements based on prefix matching.

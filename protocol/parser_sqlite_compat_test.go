@@ -119,10 +119,10 @@ func TestParser_SQLiteExecution_BatchInserts(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			stmt := ParseStatement(tt.mysqlQuery)
 
-			// Execute parsed SQL in SQLite
-			_, err := db.Exec(stmt.SQL)
+			// Execute parsed SQL in SQLite with extracted params
+			_, err := db.Exec(stmt.SQL, stmt.ExtractedParams...)
 			if err != nil {
-				t.Fatalf("Failed to execute: %v\nSQL: %s", err, stmt.SQL)
+				t.Fatalf("Failed to execute: %v\nSQL: %s\nParams: %v", err, stmt.SQL, stmt.ExtractedParams)
 			}
 
 			// Verify results
@@ -185,9 +185,9 @@ func TestParser_SQLiteExecution_Updates(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			stmt := ParseStatement(tt.mysqlQuery)
 
-			_, err := db.Exec(stmt.SQL)
+			_, err := db.Exec(stmt.SQL, stmt.ExtractedParams...)
 			if err != nil {
-				t.Fatalf("Failed to execute: %v\nSQL: %s", err, stmt.SQL)
+				t.Fatalf("Failed to execute: %v\nSQL: %s\nParams: %v", err, stmt.SQL, stmt.ExtractedParams)
 			}
 
 			if tt.verifyFunc != nil {

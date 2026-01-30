@@ -115,6 +115,7 @@ type SchemaLookupFunc func(table string) string
 type ParseOptions struct {
 	SchemaLookup      SchemaLookupFunc
 	SkipTranspilation bool
+	ExtractLiterals   bool // Enable literal extraction for parameterized execution
 }
 
 // ParseStatement analyzes a SQL statement and returns its type and metadata.
@@ -129,6 +130,7 @@ func ParseStatementWithOptions(sql string, opts ParseOptions) Statement {
 	ctx := query.NewContext(sql, nil)
 	ctx.SchemaLookup = opts.SchemaLookup
 	ctx.SkipTranspilation = opts.SkipTranspilation
+	ctx.ExtractLiterals = opts.ExtractLiterals
 
 	if err := globalPipeline.Process(ctx); err != nil {
 		log.Debug().
@@ -145,15 +147,20 @@ func ParseStatementWithOptions(sql string, opts ParseOptions) Statement {
 
 	// Extract transpiled SQL from first statement
 	transpiledSQL := ""
+	var extractedParams []interface{}
 	if len(ctx.Output.Statements) > 0 {
 		transpiledSQL = ctx.Output.Statements[0].SQL
+		if len(ctx.Output.Statements[0].Params) > 0 {
+			extractedParams = ctx.Output.Statements[0].Params
+		}
 	}
 
 	stmt := Statement{
-		SQL:      transpiledSQL,
-		Type:     ctx.Output.StatementType,
-		Database: ctx.Output.Database,
-		Error:    errorString(ctx.Output.ValidationErr),
+		SQL:             transpiledSQL,
+		Type:            ctx.Output.StatementType,
+		Database:        ctx.Output.Database,
+		Error:           errorString(ctx.Output.ValidationErr),
+		ExtractedParams: extractedParams,
 	}
 
 	// Extract MySQL-specific metadata (if available)
@@ -195,15 +202,20 @@ func ParseStatementWithSchema(sql string, schemaLookup SchemaLookupFunc) Stateme
 
 	// Extract transpiled SQL from first statement
 	transpiledSQL := ""
+	var extractedParams []interface{}
 	if len(ctx.Output.Statements) > 0 {
 		transpiledSQL = ctx.Output.Statements[0].SQL
+		if len(ctx.Output.Statements[0].Params) > 0 {
+			extractedParams = ctx.Output.Statements[0].Params
+		}
 	}
 
 	stmt := Statement{
-		SQL:      transpiledSQL,
-		Type:     ctx.Output.StatementType,
-		Database: ctx.Output.Database,
-		Error:    errorString(ctx.Output.ValidationErr),
+		SQL:             transpiledSQL,
+		Type:            ctx.Output.StatementType,
+		Database:        ctx.Output.Database,
+		Error:           errorString(ctx.Output.ValidationErr),
+		ExtractedParams: extractedParams,
 	}
 
 	// Extract MySQL-specific metadata (if available)
@@ -246,18 +258,24 @@ func ParseStatementsWithSchema(sql string, schemaLookup SchemaLookupFunc) []Stat
 	// Create a Statement for each transpiled statement
 	stmts := make([]Statement, 0, len(ctx.Output.Statements))
 	for _, ts := range ctx.Output.Statements {
-		stmts = append(stmts, buildStatement(*ctx, ts.SQL))
+		stmts = append(stmts, buildStatement(*ctx, ts))
 	}
 	return stmts
 }
 
-// buildStatement creates a Statement from context with specified SQL
-func buildStatement(ctx query.QueryContext, sql string) Statement {
+// buildStatement creates a Statement from context with specified TranspiledStatement
+func buildStatement(ctx query.QueryContext, ts query.TranspiledStatement) Statement {
+	var extractedParams []interface{}
+	if len(ts.Params) > 0 {
+		extractedParams = ts.Params
+	}
+
 	stmt := Statement{
-		SQL:      sql,
-		Type:     ctx.Output.StatementType,
-		Database: ctx.Output.Database,
-		Error:    errorString(ctx.Output.ValidationErr),
+		SQL:             ts.SQL,
+		Type:            ctx.Output.StatementType,
+		Database:        ctx.Output.Database,
+		Error:           errorString(ctx.Output.ValidationErr),
+		ExtractedParams: extractedParams,
 	}
 
 	// Extract MySQL-specific metadata (if available)

@@ -228,6 +228,7 @@ func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, sq
 	stmt := protocol.ParseStatementWithOptions(sql, protocol.ParseOptions{
 		SchemaLookup:      schemaLookup,
 		SkipTranspilation: !session.TranspilationEnabled,
+		ExtractLiterals:   true, // Enable literal extraction for parameterized execution
 	})
 
 	// Handle system variable queries (@@version, DATABASE(), etc.)
@@ -432,7 +433,12 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, params []in
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), hookTimeout)
 			cancelHookCtx = cancel // Store for later - DO NOT call yet
-			req := ExecutionRequest{SQL: stmt.SQL, Params: params}
+			// Use extracted params from literal extraction, or wire protocol params
+			execParams := params
+			if len(execParams) == 0 && len(stmt.ExtractedParams) > 0 {
+				execParams = stmt.ExtractedParams
+			}
+			req := ExecutionRequest{SQL: stmt.SQL, Params: execParams}
 			pendingExec, err = replicatedDB.ExecuteLocalWithHooks(ctx, uint64(txnID), []ExecutionRequest{req})
 
 			if err != nil {
@@ -560,9 +566,15 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, params []in
 func (h *CoordinatorHandler) handleRead(stmt protocol.Statement, params []interface{}, consistency protocol.ConsistencyLevel) (*protocol.ResultSet, error) {
 	queryStart := time.Now()
 
+	// Use extracted params from literal extraction, or wire protocol params
+	execParams := params
+	if len(execParams) == 0 && len(stmt.ExtractedParams) > 0 {
+		execParams = stmt.ExtractedParams
+	}
+
 	req := &ReadRequest{
 		Query:       stmt.SQL,
-		Args:        params,
+		Args:        execParams,
 		SnapshotTS:  h.clock.Now(),
 		Consistency: consistency,
 		TableName:   stmt.TableName,
@@ -893,7 +905,9 @@ func (h *CoordinatorHandler) handleCommit(session *protocol.ConnectionSession) (
 			}
 
 			ctx, cancel := context.WithTimeout(context.Background(), hookTimeout)
-			req := ExecutionRequest{SQL: stmt.SQL, Params: nil}
+			// Use extracted params from literal extraction if available
+			execParams := stmt.ExtractedParams
+			req := ExecutionRequest{SQL: stmt.SQL, Params: execParams}
 			pendingExec, err := replicatedDB.ExecuteLocalWithHooks(ctx, txnState.TxnID, []ExecutionRequest{req})
 			if err != nil {
 				cancel()

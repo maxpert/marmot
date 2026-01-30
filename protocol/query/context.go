@@ -141,6 +141,12 @@ type QueryContext struct {
 	// SkipTranspilation bypasses MySQL→SQLite transpilation when true.
 	// SQL is passed through unchanged, only statement type classification is performed.
 	SkipTranspilation bool
+
+	// ExtractLiterals enables extraction of literal values into parameters.
+	// When true, literals in DML/SELECT statements are replaced with placeholders
+	// and the values are stored in Params. This enables binary data handling and
+	// query plan caching.
+	ExtractLiterals bool
 }
 
 // NewContext creates a new QueryContext for the given SQL and parameters.

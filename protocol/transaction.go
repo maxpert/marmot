@@ -142,6 +142,11 @@ type Statement struct {
 
 	// ShowFilter holds the LIKE pattern for SHOW TABLES LIKE queries
 	ShowFilter string
+
+	// ExtractedParams holds literal values extracted during transpilation.
+	// Used for local execution only - not serialized for CDC replication.
+	// DML ships OldValues/NewValues via CDC, not SQL+params.
+	ExtractedParams []interface{} `msgpack:"-"` // Exclude from msgpack serialization
 }
 
 // Transaction represents a buffered transaction
