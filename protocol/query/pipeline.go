@@ -59,7 +59,11 @@ func (p *Pipeline) Process(ctx *QueryContext) error {
 		return nil
 	}
 
-	// MySQL path: Parse with Vitess
+	// MySQL path: Preprocess to convert ANSI SQL quoted identifiers to MySQL backticks
+	// Drupal and some other apps use "table_name" instead of `table_name`
+	ctx.Input.SQL = convertANSIQuotesToBackticks(ctx.Input.SQL)
+
+	// Parse with Vitess
 	if err := p.parser.Parse(ctx); err != nil {
 		log.Debug().Err(err).Str("sql", ctx.Input.SQL).Msg("Parse failed")
 		return err
@@ -114,6 +118,105 @@ func stripDatabaseQualifiers(ctx *QueryContext) {
 	serializer := &transform.SQLiteSerializer{}
 	sql := serializer.Serialize(ctx.MySQLState.AST)
 	ctx.Output.Statements[0].SQL = sql
+}
+
+// convertANSIQuotesToBackticks converts ANSI SQL double-quoted identifiers to MySQL backticks.
+// For example: SELECT "column" FROM "table" becomes SELECT `column` FROM `table`
+// This is needed for compatibility with Drupal and other apps that use ANSI SQL quoting.
+// The function preserves:
+//   - Content inside single-quoted strings
+//   - Empty strings "" (converts to '' for MySQL compatibility)
+//   - Strings that look like values (after = or DEFAULT keywords)
+func convertANSIQuotesToBackticks(sql string) string {
+	// Quick check: if no double quotes, return as-is
+	if !strings.Contains(sql, "\"") {
+		return sql
+	}
+
+	var result strings.Builder
+	result.Grow(len(sql))
+
+	inSingleQuote := false
+	i := 0
+
+	for i < len(sql) {
+		c := sql[i]
+
+		// Handle single quotes (string literals)
+		if c == '\'' {
+			if !inSingleQuote {
+				inSingleQuote = true
+			} else if i+1 < len(sql) && sql[i+1] == '\'' {
+				// Escaped single quote ('') - write both and skip
+				result.WriteString("''")
+				i += 2
+				continue
+			} else {
+				inSingleQuote = false
+			}
+			result.WriteByte(c)
+			i++
+			continue
+		}
+
+		// Inside single-quoted string - pass through unchanged
+		if inSingleQuote {
+			result.WriteByte(c)
+			i++
+			continue
+		}
+
+		// Handle double quotes outside of single-quoted strings
+		if c == '"' {
+			// Find the closing double quote
+			end := i + 1
+			for end < len(sql) && sql[end] != '"' {
+				end++
+			}
+
+			if end < len(sql) {
+				identifier := sql[i+1 : end]
+
+				// Check if this is a string value context (after = or DEFAULT)
+				// by looking at preceding non-whitespace characters
+				isValueContext := false
+				for j := i - 1; j >= 0; j-- {
+					if sql[j] == ' ' || sql[j] == '\t' || sql[j] == '\n' || sql[j] == '\r' {
+						continue
+					}
+					// Check for = sign or end of DEFAULT keyword
+					if sql[j] == '=' {
+						isValueContext = true
+					} else if j >= 6 {
+						preceding := strings.ToUpper(sql[j-6 : j+1])
+						if strings.HasSuffix(preceding, "DEFAULT") {
+							isValueContext = true
+						}
+					}
+					break
+				}
+
+				// Empty string or value context - convert to single quotes
+				if identifier == "" || isValueContext {
+					result.WriteByte('\'')
+					result.WriteString(identifier)
+					result.WriteByte('\'')
+				} else {
+					// Identifier - convert to backticks
+					result.WriteByte('`')
+					result.WriteString(identifier)
+					result.WriteByte('`')
+				}
+				i = end + 1
+				continue
+			}
+		}
+
+		result.WriteByte(c)
+		i++
+	}
+
+	return result.String()
 }
 
 // classifySQLiteStatement classifies SQLite dialect statements based on prefix matching.

@@ -50,6 +50,7 @@ func (m *MetadataHandler) handleInformationSchemaTables(currentDB string, filter
 
 	log.Debug().
 		Str("database", dbName).
+		Str("filter_table", filter.TableName).
 		Msg("Querying INFORMATION_SCHEMA.TABLES")
 
 	sqlDB, err := m.db.GetDatabaseConnection(dbName)
@@ -57,8 +58,14 @@ func (m *MetadataHandler) handleInformationSchemaTables(currentDB string, filter
 		return nil, err
 	}
 
-	// Query SQLite's sqlite_master table
-	rows, err := sqlDB.Query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '__marmot__%' ORDER BY name")
+	// Query SQLite's sqlite_master table with optional table name filter
+	var rows *sql.Rows
+	if filter.TableName != "" {
+		// Filter by specific table name
+		rows, err = sqlDB.Query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '__marmot__%' AND name = ? ORDER BY name", filter.TableName)
+	} else {
+		rows, err = sqlDB.Query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '__marmot__%' ORDER BY name")
+	}
 	if err != nil {
 		return nil, err
 	}

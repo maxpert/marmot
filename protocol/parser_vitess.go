@@ -524,6 +524,10 @@ func ParseStatementVitess(sql string) Statement {
 				if showBasic.DbName.NotEmpty() {
 					stmt.Database = showBasic.DbName.String()
 				}
+				// Extract LIKE filter if specified
+				if showBasic.Filter != nil && showBasic.Filter.Like != "" {
+					stmt.ShowFilter = showBasic.Filter.Like
+				}
 			case sqlparser.Column:
 				stmt.Type = StatementShowColumns
 				// Extract table name

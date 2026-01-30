@@ -167,6 +167,7 @@ func ParseStatementWithOptions(sql string, opts ParseOptions) Statement {
 		stmt.ISTableType = InformationSchemaTableType(ctx.MySQLState.ISTableType)
 		stmt.VirtualTableType = VirtualTableType(ctx.MySQLState.VirtualTableType)
 		stmt.SystemVarNames = ctx.MySQLState.SystemVarNames
+		stmt.ShowFilter = ctx.MySQLState.ShowFilter
 	}
 
 	return stmt
@@ -216,6 +217,7 @@ func ParseStatementWithSchema(sql string, schemaLookup SchemaLookupFunc) Stateme
 		stmt.ISTableType = InformationSchemaTableType(ctx.MySQLState.ISTableType)
 		stmt.VirtualTableType = VirtualTableType(ctx.MySQLState.VirtualTableType)
 		stmt.SystemVarNames = ctx.MySQLState.SystemVarNames
+		stmt.ShowFilter = ctx.MySQLState.ShowFilter
 	}
 
 	return stmt

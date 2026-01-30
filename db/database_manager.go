@@ -311,6 +311,7 @@ func (dm *DatabaseManager) CreateDatabase(name string) error {
 }
 
 // DropDatabase drops a database
+// Returns nil if database doesn't exist (idempotent for IF EXISTS semantics)
 func (dm *DatabaseManager) DropDatabase(name string) error {
 	if name == SystemDatabaseName {
 		return fmt.Errorf("cannot drop system database")
@@ -323,10 +324,11 @@ func (dm *DatabaseManager) DropDatabase(name string) error {
 	dm.mu.Lock()
 	defer dm.mu.Unlock()
 
-	// Check if database exists
+	// Check if database exists - if not, return success (idempotent)
 	db, exists := dm.databases[name]
 	if !exists {
-		return fmt.Errorf("database %s does not exist", name)
+		log.Info().Str("name", name).Msg("Database does not exist, DROP is no-op")
+		return nil
 	}
 
 	// Get path before deletion

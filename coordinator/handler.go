@@ -198,11 +198,11 @@ func (h *CoordinatorHandler) SetPublisherRegistry(registry PublisherRegistry) {
 
 // HandleQuery processes a SQL query
 func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, sql string, params []interface{}) (*protocol.ResultSet, error) {
-	log.Trace().
+	log.Debug().
 		Uint64("conn_id", session.ConnID).
 		Str("database", session.CurrentDatabase).
-		Str("query", sql).
-		Msg("Handling query")
+		Str("sql", sql).
+		Msg("QUERY_IN")
 
 	// Handle Marmot session commands first (SET marmot_*, LOAD EXTENSION)
 	// These are handled before parsing since they control parsing behavior
@@ -240,12 +240,16 @@ func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, sq
 		return h.handleVirtualTableQuery(session, stmt)
 	}
 
-	log.Trace().
+	log.Debug().
 		Uint64("conn_id", session.ConnID).
 		Int("stmt_type", int(stmt.Type)).
 		Str("table", stmt.TableName).
+		Str("database", stmt.Database).
+		Str("transpiled_sql", stmt.SQL).
+		Str("show_filter", stmt.ShowFilter).
+		Str("error", stmt.Error).
 		Bool("transpilation", session.TranspilationEnabled).
-		Msg("Parsed statement")
+		Msg("PARSED")
 
 	// Handle SET commands as no-op (return OK)
 	if stmt.Type == protocol.StatementSet {
@@ -272,7 +276,7 @@ func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, sq
 		if dbName == "" {
 			dbName = session.CurrentDatabase
 		}
-		return h.metadata.HandleShowTables(dbName)
+		return h.metadata.HandleShowTables(dbName, stmt.ShowFilter)
 	case protocol.StatementShowColumns:
 		dbName := stmt.Database
 		if dbName == "" {
@@ -297,6 +301,8 @@ func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, sq
 			dbName = session.CurrentDatabase
 		}
 		return h.metadata.HandleShowTableStatus(dbName, stmt.TableName)
+	case protocol.StatementShowEngines:
+		return h.handleShowEngines()
 	case protocol.StatementInformationSchema:
 		return h.metadata.HandleInformationSchema(session.CurrentDatabase, stmt)
 	}

@@ -52,19 +52,32 @@ func (m *MetadataHandler) HandleUseDatabase(dbName string) error {
 }
 
 // HandleShowTables returns list of tables in the specified database
-func (m *MetadataHandler) HandleShowTables(dbName string) (*protocol.ResultSet, error) {
+// The likeFilter parameter filters tables by name (empty string = no filter)
+func (m *MetadataHandler) HandleShowTables(dbName string, likeFilter string) (*protocol.ResultSet, error) {
 	if dbName == "" {
 		return nil, fmt.Errorf("no database selected")
 	}
 
-	log.Debug().Str("database", dbName).Msg("Handling SHOW TABLES")
+	log.Debug().Str("database", dbName).Str("filter", likeFilter).Msg("Handling SHOW TABLES")
 
 	sqlDB, err := m.db.GetDatabaseConnection(dbName)
 	if err != nil {
 		return nil, err
 	}
 
-	rows, err := sqlDB.Query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '__marmot__%' ORDER BY name")
+	// Build query with optional LIKE filter
+	query := "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '__marmot__%'"
+	var args []interface{}
+	if likeFilter != "" {
+		// SQLite uses GLOB for case-sensitive matching or LIKE for case-insensitive
+		// MySQL LIKE is case-insensitive by default, so we use SQLite LIKE
+		// Convert MySQL LIKE pattern (% and _) to be used directly (SQLite supports same syntax)
+		query += " AND name LIKE ?"
+		args = append(args, likeFilter)
+	}
+	query += " ORDER BY name"
+
+	rows, err := sqlDB.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}

@@ -81,6 +81,7 @@ const (
 	StatementShowCreateTable   = common.StatementShowCreateTable
 	StatementShowIndexes       = common.StatementShowIndexes
 	StatementShowTableStatus   = common.StatementShowTableStatus
+	StatementShowEngines       = common.StatementShowEngines
 	StatementInformationSchema = common.StatementInformationSchema
 	StatementUnsupported       = common.StatementUnsupported
 	StatementSystemVariable    = common.StatementSystemVariable
@@ -138,6 +139,9 @@ type Statement struct {
 
 	// SystemVarNames lists system variables referenced (e.g., ["VERSION", "SQL_MODE", "DATABASE()"])
 	SystemVarNames []string
+
+	// ShowFilter holds the LIKE pattern for SHOW TABLES LIKE queries
+	ShowFilter string
 }
 
 // Transaction represents a buffered transaction

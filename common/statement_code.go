@@ -34,6 +34,7 @@ const (
 	StatementShowCreateTable
 	StatementShowIndexes
 	StatementShowTableStatus
+	StatementShowEngines
 	StatementInformationSchema
 	StatementUnsupported
 	StatementSystemVariable // SELECT @@version, SELECT DATABASE(), etc.
@@ -56,7 +57,7 @@ func (t StatementCode) IsReadOnly() bool {
 	switch t {
 	case StatementSelect, StatementShowDatabases, StatementShowTables,
 		StatementShowColumns, StatementShowCreateTable, StatementShowIndexes,
-		StatementShowTableStatus, StatementInformationSchema:
+		StatementShowTableStatus, StatementShowEngines, StatementInformationSchema:
 		return true
 	}
 	return false

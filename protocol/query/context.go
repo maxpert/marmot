@@ -57,6 +57,7 @@ const (
 	StatementShowCreateTable   = common.StatementShowCreateTable
 	StatementShowIndexes       = common.StatementShowIndexes
 	StatementShowTableStatus   = common.StatementShowTableStatus
+	StatementShowEngines       = common.StatementShowEngines
 	StatementInformationSchema = common.StatementInformationSchema
 	StatementUnsupported       = common.StatementUnsupported
 	StatementSystemVariable    = common.StatementSystemVariable
@@ -125,6 +126,8 @@ type MySQLParseState struct {
 	// - Metadata queries (SHOW COLUMNS, SHOW CREATE TABLE, etc.)
 	// - DML queries (INSERT, UPDATE, DELETE) for CDC schema preloading
 	TableName string
+	// ShowFilter holds the LIKE pattern for SHOW TABLES LIKE queries
+	ShowFilter string
 }
 
 // QueryContext holds all state for processing a single query through the pipeline.

@@ -131,7 +131,7 @@ func (h *ReadOnlyHandler) HandleQuery(session *protocol.ConnectionSession, sql s
 		if dbName == "" {
 			dbName = session.CurrentDatabase
 		}
-		return h.metadata.HandleShowTables(dbName)
+		return h.metadata.HandleShowTables(dbName, stmt.ShowFilter)
 	case protocol.StatementShowColumns:
 		dbName := stmt.Database
 		if dbName == "" {

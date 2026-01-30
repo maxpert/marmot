@@ -408,6 +408,12 @@ func (re *ReplicationEngine) Commit(ctx context.Context, req *CommitRequest) *Co
 		}
 	}
 
+	// If DDL was committed, refresh read pool to pick up schema changes
+	// SQLite caches schema per-connection; read connections need refresh
+	if ddlSQL != "" {
+		replicatedDB.RefreshReadPool()
+	}
+
 	return &CommitResult{
 		Success: true,
 		DDLSQL:  ddlSQL,

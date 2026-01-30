@@ -56,7 +56,7 @@ func getSystemVariableValueByName(varName string, config SystemVarConfig) interf
 
 	// Lookup table for known system variables
 	switch varUpper {
-	case "VERSION":
+	case "VERSION", "VERSION()":
 		if config.ReadOnly {
 			return "8.0.32-Marmot-Replica"
 		}

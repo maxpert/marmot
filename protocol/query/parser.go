@@ -251,17 +251,51 @@ func classifyShowStatement(ctx *QueryContext, parsed *sqlparser.Show) {
 			ctx.Output.StatementType = StatementShowDatabases
 		case sqlparser.Table:
 			ctx.Output.StatementType = StatementShowTables
+			// Extract database name if specified (SHOW TABLES FROM db)
+			if showBasic.DbName.NotEmpty() {
+				ctx.Output.Database = showBasic.DbName.String()
+			}
+			// Extract LIKE filter if specified (SHOW TABLES LIKE 'pattern')
+			if showBasic.Filter != nil && showBasic.Filter.Like != "" {
+				ctx.MySQLState.ShowFilter = showBasic.Filter.Like
+			}
 		case sqlparser.Column:
 			ctx.Output.StatementType = StatementShowColumns
+			// Extract table name for SHOW COLUMNS FROM table
+			if !showBasic.Tbl.IsEmpty() {
+				ctx.MySQLState.TableName = showBasic.Tbl.Name.String()
+				if showBasic.Tbl.Qualifier.NotEmpty() {
+					ctx.Output.Database = showBasic.Tbl.Qualifier.String()
+				}
+			}
 		case sqlparser.Index:
 			ctx.Output.StatementType = StatementShowIndexes
+			// Extract table name for SHOW INDEX FROM table
+			if !showBasic.Tbl.IsEmpty() {
+				ctx.MySQLState.TableName = showBasic.Tbl.Name.String()
+				if showBasic.Tbl.Qualifier.NotEmpty() {
+					ctx.Output.Database = showBasic.Tbl.Qualifier.String()
+				}
+			}
 		case sqlparser.TableStatus:
 			ctx.Output.StatementType = StatementShowTableStatus
+			// Extract database name if specified
+			if showBasic.DbName.NotEmpty() {
+				ctx.Output.Database = showBasic.DbName.String()
+			}
+			// Extract table name from LIKE filter if present
+			if showBasic.Filter != nil && showBasic.Filter.Like != "" {
+				ctx.MySQLState.TableName = showBasic.Filter.Like
+			}
+		case sqlparser.Engines:
+			ctx.Output.StatementType = StatementShowEngines
 		default:
 			ctx.Output.StatementType = StatementSelect
 		}
 	} else if _, ok := parsed.Internal.(*sqlparser.ShowCreate); ok {
 		ctx.Output.StatementType = StatementShowCreateTable
+		// Table name extraction for SHOW CREATE TABLE is handled separately
+		// via extractMetadata since ShowCreate has different structure
 	} else {
 		ctx.Output.StatementType = StatementSelect
 	}
@@ -480,17 +514,20 @@ func extractMetadata(ctx *QueryContext, stmt sqlparser.Statement) {
 		}
 
 	case *sqlparser.CreateTable:
+		ctx.MySQLState.TableName = parsed.Table.Name.String()
 		if parsed.Table.Qualifier.NotEmpty() {
 			ctx.Output.Database = parsed.Table.Qualifier.String()
 		}
 
 	case *sqlparser.AlterTable:
+		ctx.MySQLState.TableName = parsed.Table.Name.String()
 		if parsed.Table.Qualifier.NotEmpty() {
 			ctx.Output.Database = parsed.Table.Qualifier.String()
 		}
 
 	case *sqlparser.DropTable:
 		if len(parsed.FromTables) > 0 {
+			ctx.MySQLState.TableName = parsed.FromTables[0].Name.String()
 			if parsed.FromTables[0].Qualifier.NotEmpty() {
 				ctx.Output.Database = parsed.FromTables[0].Qualifier.String()
 			}
@@ -507,6 +544,7 @@ func extractMetadata(ctx *QueryContext, stmt sqlparser.Statement) {
 
 	case *sqlparser.RenameTable:
 		if len(parsed.TablePairs) > 0 {
+			ctx.MySQLState.TableName = parsed.TablePairs[0].FromTable.Name.String()
 			if parsed.TablePairs[0].FromTable.Qualifier.NotEmpty() {
 				ctx.Output.Database = parsed.TablePairs[0].FromTable.Qualifier.String()
 			}
@@ -515,6 +553,7 @@ func extractMetadata(ctx *QueryContext, stmt sqlparser.Statement) {
 	case sqlparser.DDLStatement:
 		table := parsed.GetTable()
 		if !table.IsEmpty() {
+			ctx.MySQLState.TableName = table.Name.String()
 			if table.Qualifier.NotEmpty() {
 				ctx.Output.Database = table.Qualifier.String()
 			}

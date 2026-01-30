@@ -497,11 +497,8 @@ func (s *MySQLServer) writeErrorWithState(w io.Writer, seq byte, code uint16, sq
 
 // writeMySQLErr writes a MySQLError to the connection, extracting code/state from the error
 func (s *MySQLServer) writeMySQLErr(w io.Writer, seq byte, err error) error {
-	if mysqlErr, ok := err.(*MySQLError); ok {
-		return s.writeErrorWithState(w, seq, mysqlErr.Code, mysqlErr.SQLState, mysqlErr.Message)
-	}
-	// Default to generic error code 1105 (ER_UNKNOWN_ERROR)
-	return s.writeError(w, seq, 1105, err.Error())
+	mysqlErr := ConvertToMySQLError(err)
+	return s.writeErrorWithState(w, seq, mysqlErr.Code, mysqlErr.SQLState, mysqlErr.Message)
 }
 
 func (s *MySQLServer) writeResultSet(w io.Writer, seq byte, rs *ResultSet) error {

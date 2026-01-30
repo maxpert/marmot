@@ -2,6 +2,34 @@ package protocol
 
 import "fmt"
 
+// MySQL error code constants
+const (
+	ErrCodeUnknown         uint16 = 1105
+	ErrCodeBadNull         uint16 = 1048
+	ErrCodeTableExists     uint16 = 1050
+	ErrCodeBadField        uint16 = 1054
+	ErrCodeDupEntry        uint16 = 1062
+	ErrCodeParseError      uint16 = 1064
+	ErrCodeTooBigRowsize   uint16 = 1118
+	ErrCodeNoSuchTable     uint16 = 1146
+	ErrCodeLockTimeout     uint16 = 1205
+	ErrCodeDeadlock        uint16 = 1213
+	ErrCodeReadOnly        uint16 = 1290
+	ErrCodeNoReferencedRow uint16 = 1452
+	ErrCodeCheckConstraint uint16 = 3819
+)
+
+// SQLSTATE constants
+const (
+	SQLStateGeneral     = "HY000"
+	SQLStateIntegrity   = "23000"
+	SQLStateSyntax      = "42000"
+	SQLStateDeadlock    = "40001"
+	SQLStateTableExists = "42S01"
+	SQLStateNoSuchTable = "42S02"
+	SQLStateNoSuchCol   = "42S22"
+)
+
 // MySQLError represents a MySQL protocol error with error code and SQLSTATE
 type MySQLError struct {
 	Code     uint16
@@ -26,33 +54,15 @@ func NewMySQLError(code uint16, sqlState, message string) *MySQLError {
 
 // ErrLockWaitTimeout returns error 1205 - lock wait timeout exceeded
 func ErrLockWaitTimeout() *MySQLError {
-	return NewMySQLError(1205, "HY000", "Lock wait timeout exceeded; try restarting transaction")
+	return NewMySQLError(ErrCodeLockTimeout, SQLStateGeneral, "Lock wait timeout exceeded; try restarting transaction")
 }
 
 // ErrDeadlock returns error 1213 - deadlock detected
 func ErrDeadlock() *MySQLError {
-	return NewMySQLError(1213, "40001", "Deadlock found when trying to get lock; try restarting transaction")
+	return NewMySQLError(ErrCodeDeadlock, SQLStateDeadlock, "Deadlock found when trying to get lock; try restarting transaction")
 }
 
 // ErrReadOnly returns error 1290 - server is running with --read-only option
-// This is the standard MySQL error for read-only replicas
 func ErrReadOnly() *MySQLError {
-	return NewMySQLError(1290, "HY000", "The MySQL server is running with the --read-only option so it cannot execute this statement")
-}
-
-// IsRetryableError checks if an error is a retryable transaction error
-func IsRetryableError(err error) bool {
-	mysqlErr, ok := err.(*MySQLError)
-	if !ok {
-		return false
-	}
-
-	// Errors that indicate retry is safe
-	switch mysqlErr.Code {
-	case 1205, // Lock wait timeout
-		1213: // Deadlock
-		return true
-	default:
-		return false
-	}
+	return NewMySQLError(ErrCodeReadOnly, SQLStateGeneral, "The MySQL server is running with the --read-only option so it cannot execute this statement")
 }

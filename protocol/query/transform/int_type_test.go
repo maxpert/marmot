@@ -21,54 +21,59 @@ func TestIntTypeRule_Priority(t *testing.T) {
 	}
 }
 
-func TestIntTypeRule_Transform(t *testing.T) {
+// TestIntTypeRule_ModifiesAST verifies that IntTypeRule modifies the AST correctly
+// even though it always defers to CreateTableRule for serialization.
+func TestIntTypeRule_ModifiesAST(t *testing.T) {
 	tests := []struct {
 		name            string
 		input           string
-		wantModified    bool
-		wantContains    string
-		wantNotContains []string
+		shouldModify    bool
+		checkUnsigned   bool
+		checkAutoInc    bool
+		checkIntType    bool
 	}{
 		{
-			name:            "INT AUTO_INCREMENT to INTEGER without auto_increment keyword",
-			input:           "CREATE TABLE users (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(100))",
-			wantModified:    true,
-			wantContains:    "integer",
-			wantNotContains: []string{"auto_increment"},
+			name:          "INT AUTO_INCREMENT stripped",
+			input:         "CREATE TABLE users (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(100))",
+			shouldModify:  true,
+			checkAutoInc:  true,
+			checkIntType:  true,
 		},
 		{
-			name:            "BIGINT UNSIGNED AUTO_INCREMENT stripped",
-			input:           "CREATE TABLE wp_users (ID BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT, name VARCHAR(100))",
-			wantModified:    true,
-			wantNotContains: []string{"unsigned", "auto_increment"},
+			name:          "BIGINT UNSIGNED AUTO_INCREMENT stripped",
+			input:         "CREATE TABLE wp_users (ID BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT, name VARCHAR(100))",
+			shouldModify:  true,
+			checkUnsigned: true,
+			checkAutoInc:  true,
 		},
 		{
-			name:            "INT UNSIGNED stripped",
-			input:           "CREATE TABLE items (id INT UNSIGNED NOT NULL, data TEXT)",
-			wantModified:    true,
-			wantNotContains: []string{"unsigned"},
+			name:          "INT UNSIGNED stripped",
+			input:         "CREATE TABLE items (id INT UNSIGNED NOT NULL, data TEXT)",
+			shouldModify:  true,
+			checkUnsigned: true,
 		},
 		{
-			name:            "TINYINT UNSIGNED stripped",
-			input:           "CREATE TABLE flags (active TINYINT UNSIGNED DEFAULT 0)",
-			wantModified:    true,
-			wantNotContains: []string{"unsigned"},
+			name:          "TINYINT UNSIGNED stripped",
+			input:         "CREATE TABLE flags (active TINYINT UNSIGNED DEFAULT 0)",
+			shouldModify:  true,
+			checkUnsigned: true,
+			checkIntType:  true,
 		},
 		{
 			name:         "INT converted to INTEGER",
 			input:        "CREATE TABLE orders (id INT PRIMARY KEY, total REAL)",
-			wantModified: true,
-			wantContains: "integer",
+			shouldModify: true,
+			checkIntType: true,
 		},
 		{
-			name:         "VARCHAR column unchanged",
+			name:         "VARCHAR column unchanged - no modification",
 			input:        "CREATE TABLE names (id VARCHAR(50) PRIMARY KEY, value TEXT)",
-			wantModified: false,
+			shouldModify: false,
 		},
 		{
-			name:         "not a CREATE TABLE",
+			name:         "not a CREATE TABLE - returns immediately",
 			input:        "INSERT INTO users (id, name) VALUES (1, 'test')",
-			wantModified: false,
+			shouldModify: false,
 		},
 	}
 
@@ -80,33 +85,44 @@ func TestIntTypeRule_Transform(t *testing.T) {
 			}
 
 			rule := &IntTypeRule{}
-			result, err := rule.Transform(stmt, nil, nil, "testdb", &SQLiteSerializer{})
+			_, err = rule.Transform(stmt, nil, nil, "testdb", &SQLiteSerializer{})
 
-			if tt.wantModified {
-				if err != nil {
-					t.Fatalf("Transform failed: %v", err)
+			// IntTypeRule always returns ErrRuleNotApplicable for CREATE TABLE
+			// (defers to CreateTableRule for serialization)
+			if err != ErrRuleNotApplicable {
+				t.Errorf("expected ErrRuleNotApplicable, got %v", err)
+			}
+
+			if !tt.shouldModify {
+				return
+			}
+
+			// Verify AST was modified
+			create, ok := stmt.(*sqlparser.CreateTable)
+			if !ok {
+				return // Non-CREATE TABLE statement
+			}
+
+			for _, col := range create.TableSpec.Columns {
+				if col.Type == nil {
+					continue
 				}
-				if len(result) == 0 {
-					t.Fatal("expected result, got nil or empty")
+
+				// Check UNSIGNED was stripped
+				if tt.checkUnsigned && col.Type.Unsigned {
+					t.Errorf("UNSIGNED should have been stripped from column %s", col.Name.String())
 				}
-				if len(result) != 1 {
-					t.Errorf("expected 1 statement, got %d", len(result))
+
+				// Check AUTO_INCREMENT was stripped
+				if tt.checkAutoInc && col.Type.Options != nil && col.Type.Options.Autoincrement {
+					t.Errorf("AUTO_INCREMENT should have been stripped from column %s", col.Name.String())
 				}
-				lowerOutput := strings.ToLower(result[0].SQL)
-				if tt.wantContains != "" && !strings.Contains(lowerOutput, tt.wantContains) {
-					t.Errorf("output doesn't contain expected %q:\n%s", tt.wantContains, result[0].SQL)
-				}
-				for _, notContains := range tt.wantNotContains {
-					if strings.Contains(lowerOutput, notContains) {
-						t.Errorf("output should not contain %q:\n%s", notContains, result[0].SQL)
+
+				// Check integer type was converted to INTEGER
+				if tt.checkIntType && isIntegerType(strings.ToUpper(col.Type.Type)) {
+					if col.Type.Type != "INTEGER" {
+						t.Errorf("integer type should have been converted to INTEGER for column %s, got %s", col.Name.String(), col.Type.Type)
 					}
-				}
-			} else {
-				if err != ErrRuleNotApplicable {
-					t.Errorf("expected ErrRuleNotApplicable, got %v", err)
-				}
-				if result != nil {
-					t.Errorf("expected nil result, got %v", result)
 				}
 			}
 		})
@@ -129,30 +145,36 @@ func TestIntTypeRule_WordPressSchema(t *testing.T) {
 	}
 
 	rule := &IntTypeRule{}
-	result, err := rule.Transform(stmt, nil, nil, "wordpress", &SQLiteSerializer{})
-	if err != nil {
-		t.Fatalf("Transform failed: %v", err)
+	_, err = rule.Transform(stmt, nil, nil, "wordpress", &SQLiteSerializer{})
+
+	// Should defer to CreateTableRule
+	if err != ErrRuleNotApplicable {
+		t.Errorf("expected ErrRuleNotApplicable, got %v", err)
 	}
 
-	if len(result) == 0 {
-		t.Fatal("expected result, got nil or empty")
-	}
+	// Verify AST was modified
+	create := stmt.(*sqlparser.CreateTable)
+	for _, col := range create.TableSpec.Columns {
+		if col.Type == nil {
+			continue
+		}
 
-	lowerOutput := strings.ToLower(result[0].SQL)
+		// Check UNSIGNED was stripped
+		if col.Type.Unsigned {
+			t.Errorf("UNSIGNED should have been stripped from column %s", col.Name.String())
+		}
 
-	// Should NOT contain unsigned
-	if strings.Contains(lowerOutput, "unsigned") {
-		t.Errorf("output should not contain 'unsigned':\n%s", result[0].SQL)
-	}
+		// Check AUTO_INCREMENT was stripped
+		if col.Type.Options != nil && col.Type.Options.Autoincrement {
+			t.Errorf("AUTO_INCREMENT should have been stripped from column %s", col.Name.String())
+		}
 
-	// Should NOT contain auto_increment
-	if strings.Contains(lowerOutput, "auto_increment") {
-		t.Errorf("output should not contain 'auto_increment':\n%s", result[0].SQL)
-	}
-
-	// AUTO_INCREMENT column should be INTEGER
-	if !strings.Contains(lowerOutput, "integer") {
-		t.Errorf("expected 'integer' for auto_increment column, got:\n%s", result[0].SQL)
+		// Check integer types were converted to INTEGER
+		if isIntegerType(strings.ToUpper(col.Type.Type)) {
+			if col.Type.Type != "INTEGER" {
+				t.Errorf("integer type should be INTEGER for column %s, got %s", col.Name.String(), col.Type.Type)
+			}
+		}
 	}
 }
 
@@ -174,18 +196,25 @@ func TestIntTypeRule_AllIntTypes(t *testing.T) {
 			stmt, _ := sqlparser.NewTestParser().Parse(tt.input)
 
 			rule := &IntTypeRule{}
-			result, err := rule.Transform(stmt, nil, nil, "testdb", &SQLiteSerializer{})
-			if err != nil {
-				t.Fatalf("Transform failed for %s: %v", tt.name, err)
+			_, err := rule.Transform(stmt, nil, nil, "testdb", &SQLiteSerializer{})
+
+			// Should defer to CreateTableRule
+			if err != ErrRuleNotApplicable {
+				t.Errorf("expected ErrRuleNotApplicable for %s, got %v", tt.name, err)
 			}
 
-			if len(result) == 0 {
-				t.Fatalf("expected result for %s, got nil or empty", tt.name)
-			}
-
-			lowerOutput := strings.ToLower(result[0].SQL)
-			if strings.Contains(lowerOutput, "unsigned") {
-				t.Errorf("%s: output should not contain 'unsigned':\n%s", tt.name, result[0].SQL)
+			// Verify AST was modified
+			create := stmt.(*sqlparser.CreateTable)
+			for _, col := range create.TableSpec.Columns {
+				if col.Type == nil {
+					continue
+				}
+				if col.Type.Unsigned {
+					t.Errorf("%s: UNSIGNED should have been stripped", tt.name)
+				}
+				if col.Type.Type != "INTEGER" {
+					t.Errorf("%s: type should be INTEGER, got %s", tt.name, col.Type.Type)
+				}
 			}
 		})
 	}
@@ -207,6 +236,10 @@ func TestIntTypeRule_DeferToCreateTableRule(t *testing.T) {
 		{
 			name:  "With multiple KEY definitions",
 			input: "CREATE TABLE posts (id INT AUTO_INCREMENT PRIMARY KEY, user_id INT UNSIGNED, title VARCHAR(100), KEY idx_user (user_id), KEY idx_title (title))",
+		},
+		{
+			name:  "With PRIMARY KEY only",
+			input: "CREATE TABLE users (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(100))",
 		},
 	}
 
@@ -246,33 +279,5 @@ func TestIntTypeRule_DeferToCreateTableRule(t *testing.T) {
 				}
 			}
 		})
-	}
-}
-
-func TestIntTypeRule_WithPrimaryKeyOnly(t *testing.T) {
-	input := "CREATE TABLE users (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(100), PRIMARY KEY (id))"
-
-	stmt, err := sqlparser.NewTestParser().Parse(input)
-	if err != nil {
-		t.Fatalf("failed to parse SQL: %v", err)
-	}
-
-	rule := &IntTypeRule{}
-	result, err := rule.Transform(stmt, nil, nil, "testdb", &SQLiteSerializer{})
-
-	// Should serialize since there are no non-primary indexes
-	if err != nil {
-		t.Fatalf("Transform failed: %v", err)
-	}
-	if len(result) == 0 {
-		t.Fatal("expected result, got nil or empty")
-	}
-
-	lowerOutput := strings.ToLower(result[0].SQL)
-	if strings.Contains(lowerOutput, "auto_increment") {
-		t.Errorf("output should not contain 'auto_increment':\n%s", result[0].SQL)
-	}
-	if !strings.Contains(lowerOutput, "integer") {
-		t.Errorf("expected 'integer' for auto_increment column, got:\n%s", result[0].SQL)
 	}
 }

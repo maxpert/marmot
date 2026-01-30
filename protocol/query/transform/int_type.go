@@ -79,18 +79,11 @@ func (r *IntTypeRule) Transform(stmt sqlparser.Statement, params []interface{}, 
 		return nil, ErrRuleNotApplicable
 	}
 
-	// Check if CreateTableRule should handle serialization (to extract indexes)
-	if len(create.TableSpec.Indexes) > 0 {
-		for _, idx := range create.TableSpec.Indexes {
-			if idx.Info != nil && idx.Info.Type != sqlparser.IndexTypePrimary {
-				// Let CreateTableRule handle serialization (it extracts non-primary indexes)
-				return nil, ErrRuleNotApplicable
-			}
-		}
-	}
-
-	sql := serializer.Serialize(create)
-	return []TranspiledStatement{{SQL: sql, Params: params}}, nil
+	// Always defer to CreateTableRule for CREATE TABLE serialization.
+	// CreateTableRule handles MySQL-specific options (COMMENT, ENGINE, etc.)
+	// that IntTypeRule doesn't strip. Without this, both rules would produce
+	// output and the unstripped version from IntTypeRule would be executed first.
+	return nil, ErrRuleNotApplicable
 }
 
 // isIntegerType checks if the type is a MySQL integer type

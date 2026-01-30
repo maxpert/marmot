@@ -25,6 +25,23 @@ func (h *CoordinatorHandler) handleShowDatabases() (*protocol.ResultSet, error) 
 	return h.metadata.HandleShowDatabases()
 }
 
+// handleShowEngines returns fake MySQL engine list for compatibility
+func (h *CoordinatorHandler) handleShowEngines() (*protocol.ResultSet, error) {
+	return &protocol.ResultSet{
+		Columns: []protocol.ColumnDef{
+			{Name: "Engine", Type: 0xFD},
+			{Name: "Support", Type: 0xFD},
+			{Name: "Comment", Type: 0xFD},
+			{Name: "Transactions", Type: 0xFD},
+			{Name: "XA", Type: 0xFD},
+			{Name: "Savepoints", Type: 0xFD},
+		},
+		Rows: [][]interface{}{
+			{"InnoDB", "DEFAULT", "Marmot SQLite engine with InnoDB compatibility", "YES", "NO", "YES"},
+		},
+	}, nil
+}
+
 // handleUseDatabase changes the current database for the session
 func (h *CoordinatorHandler) handleUseDatabase(session *protocol.ConnectionSession, dbName string) (*protocol.ResultSet, error) {
 	if h.dbManager != nil && !h.dbManager.DatabaseExists(dbName) {

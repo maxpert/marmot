@@ -245,6 +245,39 @@ func (mdb *ReplicatedDatabase) GetReadDB() *sql.DB {
 	return mdb.readDB
 }
 
+// RefreshReadPool forces read connections to refresh their schema cache.
+// SQLite caches schema per-connection. After DDL on writeDB, read connections
+// need to be refreshed to see the new schema.
+// This runs a WAL checkpoint to flush changes and closes idle connections.
+func (mdb *ReplicatedDatabase) RefreshReadPool() {
+	if mdb.readDB == nil || mdb.writeDB == nil {
+		return
+	}
+
+	// Force WAL checkpoint to ensure DDL changes are written to main database file
+	// PRAGMA wal_checkpoint(TRUNCATE) checkpoints and removes the WAL file
+	if _, err := mdb.writeDB.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+		log.Warn().Err(err).Msg("WAL checkpoint failed after DDL")
+	}
+
+	// Get current pool size from config
+	poolSize := 4 // Default
+	if cfg.Config != nil && cfg.Config.ConnectionPool.PoolSize > 0 {
+		poolSize = cfg.Config.ConnectionPool.PoolSize
+	}
+
+	// Close ALL read connections (not just idle) by setting max to 0
+	// then immediately restore to force fresh connections
+	mdb.readDB.SetMaxOpenConns(0)
+	mdb.readDB.SetMaxIdleConns(0)
+
+	// Restore pool settings - new connections will have fresh schema
+	mdb.readDB.SetMaxOpenConns(poolSize)
+	mdb.readDB.SetMaxIdleConns(poolSize)
+
+	log.Debug().Int("pool_size", poolSize).Msg("Read connection pool refreshed after DDL")
+}
+
 // GetTransactionManager returns the transaction manager
 func (mdb *ReplicatedDatabase) GetTransactionManager() *TransactionManager {
 	return mdb.txnMgr

@@ -512,8 +512,7 @@ func (wc *WriteCoordinator) runCommitPhase(ctx context.Context, txn *Transaction
 
 // classifyPrepareError classifies the prepare phase error for telemetry
 func (wc *WriteCoordinator) classifyPrepareError(err error) string {
-	// Check if this is a deadlock error (MySQL code 1213)
-	if mysqlErr, ok := err.(*protocol.MySQLError); ok && mysqlErr.Code == 1213 {
+	if mysqlErr, ok := err.(*protocol.MySQLError); ok && mysqlErr.Code == protocol.ErrCodeDeadlock {
 		return "conflict"
 	}
 	return "failed"
