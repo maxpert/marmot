@@ -177,12 +177,13 @@ func (bc *SQLiteBatchCommitter) openOptimizedConnection() (*sql.DB, error) {
 	// Build DSN with batch-optimized settings
 	// WAL mode for compatibility with other connections
 	// _txlock=immediate to acquire write lock at BEGIN
+	// cache=shared ensures writes are immediately visible to other connections
 	dsn := bc.dbPath
 	if !strings.Contains(dsn, ":memory:") {
 		if strings.Contains(dsn, "?") {
-			dsn += "&_journal_mode=WAL&_txlock=immediate"
+			dsn += "&_journal_mode=WAL&_txlock=immediate&cache=shared"
 		} else {
-			dsn += "?_journal_mode=WAL&_txlock=immediate"
+			dsn += "?_journal_mode=WAL&_txlock=immediate&cache=shared"
 		}
 	}
 
@@ -400,7 +401,7 @@ func (bc *SQLiteBatchCommitter) flush(batch map[uint64]*pendingCommit, trigger s
 		return
 	}
 
-	// Adaptive checkpoint
+	// Adaptive checkpoint for larger WAL sizes
 	if bc.checkpointEnabled {
 		walSizeMB := bc.checkWALSize()
 		if walSizeMB >= bc.checkpointPassiveThreshMB {

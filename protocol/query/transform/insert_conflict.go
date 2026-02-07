@@ -41,18 +41,17 @@ func (r *InsertOnDuplicateKeyRule) Transform(stmt sqlparser.Statement, params []
 		return nil, fmt.Errorf("insert on duplicate key: %w", err)
 	}
 
+	// Transform VALUES(col) → excluded.col in AST
 	r.transformValuesExpressions(insert.OnDup)
 
-	// Pass conflict columns to serializer - requires SQLiteSerializer
-	sqliteSerializer, ok := serializer.(*SQLiteSerializer)
-	if !ok {
-		return nil, fmt.Errorf("InsertOnDuplicateKeyRule requires SQLiteSerializer, got %T", serializer)
-	}
-	sqliteSerializer.SetConflictColumns(conflictColumns)
-
-	sql := serializer.Serialize(insert)
-
-	return []TranspiledStatement{{SQL: sql, Params: params}}, nil
+	// Return metadata with conflict columns - let transpiler handle serialization
+	return []TranspiledStatement{{
+		SQL:    "",
+		Params: params,
+		Metadata: map[string]interface{}{
+			"conflictColumns": conflictColumns,
+		},
+	}}, nil
 }
 
 func (r *InsertOnDuplicateKeyRule) determineConflictTarget(insert *sqlparser.Insert, schema SchemaProvider, database, tableName string) ([]string, error) {

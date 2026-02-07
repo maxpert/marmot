@@ -11,6 +11,7 @@ import (
 	"github.com/maxpert/marmot/protocol/query/rules"
 	"github.com/maxpert/marmot/protocol/query/transform"
 	"github.com/rs/zerolog/log"
+	"vitess.io/vitess/go/vt/sqlparser"
 )
 
 // CachedTranspilation holds transpiled SQL statements and their transformations for caching.
@@ -64,17 +65,21 @@ func NewTranspiler(cacheSize int, idGen id.Generator) (*Transpiler, error) {
 }
 
 // Transpile converts a MySQL query to SQLite by applying transformation rules in priority order.
-// It checks the cache first (if no ID injection is needed) and stores results for future use.
+// It checks the cache first (if safe to cache) and stores results for future use.
+// Queries that will have literal extraction are NOT cached because literal extraction modifies
+// the AST after transpilation, and caching would return SQL with embedded literals instead of placeholders.
 func (t *Transpiler) Transpile(ctx *QueryContext) error {
 	// Check if this statement needs ID injection
 	needsIDInjection := t.autoIncRule != nil && ctx.SchemaLookup != nil &&
 		t.autoIncRule.NeedsIDInjection(ctx.MySQLState.AST, ctx.SchemaLookup)
 
-	if !needsIDInjection {
-		// Safe to use cache
+	// Check if literal extraction will be applied
+	needsLiteralExtraction := ctx.ExtractLiterals && len(ctx.Input.Parameters) == 0 && isDMLStatement(ctx.MySQLState.AST)
+
+	// Only use cache when safe (no ID injection and no literal extraction needed)
+	if !needsIDInjection && !needsLiteralExtraction {
 		cacheKey := hashSQL(ctx.Input.SQL)
 		if cached, ok := t.cache.Get(cacheKey); ok {
-			// Convert transform.TranspiledStatement to query.TranspiledStatement
 			ctx.Output.Statements = make([]TranspiledStatement, len(cached.Statements))
 			for i, ts := range cached.Statements {
 				ctx.Output.Statements[i] = TranspiledStatement{
@@ -90,13 +95,11 @@ func (t *Transpiler) Transpile(ctx *QueryContext) error {
 
 	// Full transpilation
 	transformations := []Transformation{}
-	var transpiledStatements []transform.TranspiledStatement
-
-	// Reset serializer before use
-	t.serializer.Reset()
+	ast := ctx.MySQLState.AST
+	var conflictColumns []string
+	ruleApplied := false
 
 	// Apply ID injection FIRST if needed
-	ast := ctx.MySQLState.AST
 	if needsIDInjection {
 		newAST, applied, err := t.autoIncRule.ApplyAST(ast, ctx.SchemaLookup)
 		if err == nil && applied {
@@ -118,8 +121,35 @@ func (t *Transpiler) Transpile(ctx *QueryContext) error {
 		if err != nil {
 			return err
 		}
-		// Rule applied - collect results
-		transpiledStatements = append(transpiledStatements, results...)
+
+		// Extract conflict columns from metadata (InsertOnDuplicateKeyRule)
+		if len(results) > 0 && results[0].Metadata != nil {
+			if cols, ok := results[0].Metadata["conflictColumns"].([]string); ok {
+				conflictColumns = cols
+				ctx.MySQLState.ConflictColumns = cols
+			}
+		}
+
+		// If rule returned non-empty SQL, use it; otherwise mark rule applied (will serialize later)
+		if len(results) > 0 && results[0].SQL != "" {
+			// Rule did its own serialization (like CreateTableRule with multiple statements)
+			ctx.Output.Statements = make([]TranspiledStatement, len(results))
+			for i, ts := range results {
+				ctx.Output.Statements[i] = TranspiledStatement{
+					SQL:    ts.SQL,
+					Params: ts.Params,
+				}
+			}
+			ctx.MySQLState.Transformations = append(transformations, Transformation{
+				Rule:   rule.Name(),
+				Method: "AST",
+			})
+			ctx.MySQLState.AST = ast
+			// Don't cache rules that do their own serialization
+			return nil
+		}
+
+		ruleApplied = true
 		transformations = append(transformations, Transformation{
 			Rule:   rule.Name(),
 			Method: "AST",
@@ -127,35 +157,37 @@ func (t *Transpiler) Transpile(ctx *QueryContext) error {
 		log.Debug().Str("rule", rule.Name()).Msg("Applied transform rule")
 	}
 
-	// If no rules applied, serialize original AST
-	if len(transpiledStatements) == 0 {
-		sql := t.serializer.Serialize(ast)
-		transpiledStatements = []transform.TranspiledStatement{{SQL: sql, Params: ctx.Input.Parameters}}
-
-		// Collect any indexes extracted by serializer (for KEY definitions in CREATE TABLE)
-		if indexes := t.serializer.ExtractedIndexes(); len(indexes) > 0 {
-			for _, idx := range indexes {
-				transpiledStatements = append(transpiledStatements, transform.TranspiledStatement{SQL: idx, Params: nil})
-			}
-		}
+	// Strip database qualifiers (AST mutation only)
+	if ctx.Output.Database != "" {
+		stripDatabaseQualifiersAST(ast)
 	}
 
-	// Convert transform.TranspiledStatement to query.TranspiledStatement
-	ctx.Output.Statements = make([]TranspiledStatement, len(transpiledStatements))
-	for i, ts := range transpiledStatements {
-		ctx.Output.Statements[i] = TranspiledStatement{
-			SQL:    ts.SQL,
-			Params: ts.Params,
-		}
+	// Extract literals BEFORE serialization (AST mutation only)
+	var extractedParams []interface{}
+	if needsLiteralExtraction {
+		extractedParams = transform.ExtractLiterals(ast)
 	}
+
+	// Single serialization with all state
+	sql := t.serializer.SerializeWithOpts(ast, transform.SerializeOpts{
+		ConflictColumns: conflictColumns,
+	})
+
+	// Determine params
+	params := ctx.Input.Parameters
+	if extractedParams != nil {
+		params = extractedParams
+	}
+
+	ctx.Output.Statements = []TranspiledStatement{{SQL: sql, Params: params}}
 	ctx.MySQLState.AST = ast
 	ctx.MySQLState.Transformations = transformations
 
-	// Only cache if no ID injection was needed
-	if !needsIDInjection {
+	// Cache if appropriate (and no literal extraction happened)
+	if !needsIDInjection && !needsLiteralExtraction && !ruleApplied {
 		cacheKey := hashSQL(ctx.Input.SQL)
 		t.cache.Add(cacheKey, CachedTranspilation{
-			Statements:      transpiledStatements,
+			Statements:      []transform.TranspiledStatement{{SQL: sql, Params: params}},
 			Transformations: transformations,
 		})
 	}
@@ -163,9 +195,33 @@ func (t *Transpiler) Transpile(ctx *QueryContext) error {
 	return nil
 }
 
+// isDMLStatement returns true if the AST represents a DML statement (INSERT, UPDATE, DELETE, SELECT).
+// These statements are not cached because literal extraction modifies the AST after transpilation.
+func isDMLStatement(stmt sqlparser.Statement) bool {
+	switch stmt.(type) {
+	case *sqlparser.Insert, *sqlparser.Update, *sqlparser.Delete, *sqlparser.Select:
+		return true
+	default:
+		return false
+	}
+}
+
 // hashSQL generates a SHA256 hash of the SQL string for cache key generation.
 func hashSQL(sql string) string {
 	h := sha256.New()
 	h.Write([]byte(sql))
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+// stripDatabaseQualifiersAST removes database qualifiers from table references in-place.
+func stripDatabaseQualifiersAST(stmt sqlparser.Statement) {
+	sqlparser.Rewrite(stmt, func(cursor *sqlparser.Cursor) bool {
+		if tn, ok := cursor.Node().(sqlparser.TableName); ok {
+			cursor.Replace(sqlparser.TableName{
+				Name:      tn.Name,
+				Qualifier: sqlparser.NewIdentifierCS(""),
+			})
+		}
+		return true
+	}, nil)
 }

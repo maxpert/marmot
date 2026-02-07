@@ -14,6 +14,7 @@ import (
 
 	"github.com/maxpert/marmot/coordinator"
 	"github.com/maxpert/marmot/hlc"
+	"github.com/maxpert/marmot/protocol/query/transform"
 	"github.com/maxpert/marmot/publisher"
 	"github.com/rs/zerolog/log"
 )
@@ -1289,6 +1290,33 @@ func (dm *DatabaseManager) GetAutoIncrementColumn(database, table string) (strin
 	}
 
 	return schema.GetAutoIncrementCol(), nil
+}
+
+// GetTranspilerSchema returns schema information used by SQL transpilation rules.
+// Uses cached schema - does NOT query SQLite PRAGMA.
+func (dm *DatabaseManager) GetTranspilerSchema(database, table string) (*transform.SchemaInfo, error) {
+	db, err := dm.GetDatabase(database)
+	if err != nil {
+		return nil, err
+	}
+
+	schema, err := db.GetCachedTableSchema(table)
+	if err != nil {
+		return nil, fmt.Errorf("schema not cached for table %s: %w", table, err)
+	}
+
+	info := &transform.SchemaInfo{
+		AutoIncrementColumn: schema.GetAutoIncrementCol(),
+	}
+
+	// PrimaryKeys uses "rowid" sentinel when no explicit PRIMARY KEY is defined.
+	// Keep it out of transpiler conflict targeting to preserve fallback behavior.
+	if len(schema.PrimaryKeys) > 0 &&
+		!(len(schema.PrimaryKeys) == 1 && strings.EqualFold(schema.PrimaryKeys[0], "rowid")) {
+		info.PrimaryKey = append([]string(nil), schema.PrimaryKeys...)
+	}
+
+	return info, nil
 }
 
 // GetCommittedTxnCount returns the count of committed transactions in a database

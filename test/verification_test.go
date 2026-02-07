@@ -12,6 +12,7 @@ import (
 	"github.com/maxpert/marmot/db"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/protocol"
+	"github.com/maxpert/marmot/protocol/query/transform"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -84,6 +85,21 @@ func (tdm *TestDatabaseManager) GetAutoIncrementColumn(database, table string) (
 		return "", err
 	}
 	return schema.GetAutoIncrementCol(), nil
+}
+
+func (tdm *TestDatabaseManager) GetTranspilerSchema(database, table string) (*transform.SchemaInfo, error) {
+	schema, err := tdm.db.GetCachedTableSchema(table)
+	if err != nil {
+		return nil, err
+	}
+
+	info := &transform.SchemaInfo{
+		AutoIncrementColumn: schema.GetAutoIncrementCol(),
+	}
+	if len(schema.PrimaryKeys) > 0 && !(len(schema.PrimaryKeys) == 1 && schema.PrimaryKeys[0] == "rowid") {
+		info.PrimaryKey = append([]string(nil), schema.PrimaryKeys...)
+	}
+	return info, nil
 }
 
 func TestMySQLServerIntegration(t *testing.T) {

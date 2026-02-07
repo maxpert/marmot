@@ -108,9 +108,8 @@ type QueryOutput struct {
 
 // TranspiledStatement represents a single transpiled SQL statement with parameters.
 type TranspiledStatement struct {
-	SQL             string
-	Params          []interface{}
-	RequiresPrepare bool
+	SQL    string
+	Params []interface{}
 }
 
 // MySQLParseState holds MySQL-specific parsing state and metadata.
@@ -128,6 +127,9 @@ type MySQLParseState struct {
 	TableName string
 	// ShowFilter holds the LIKE pattern for SHOW TABLES LIKE queries
 	ShowFilter string
+	// ConflictColumns holds columns for ON CONFLICT clause.
+	// Set by InsertOnDuplicateKeyRule during transpilation.
+	ConflictColumns []string
 }
 
 // QueryContext holds all state for processing a single query through the pipeline.

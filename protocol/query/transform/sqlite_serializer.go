@@ -6,16 +6,20 @@ import (
 	"vitess.io/vitess/go/vt/sqlparser"
 )
 
+// SerializeOpts holds options for serialization
+type SerializeOpts struct {
+	ConflictColumns []string
+}
+
 // SQLiteSerializer converts a Vitess MySQL AST to SQLite-compatible SQL.
 // It uses a custom node formatter to handle SQLite-specific syntax differences:
 //   - Named parameters (:v1) → positional (?)
 //   - INSERT IGNORE → INSERT OR IGNORE
-//   - Escape sequences (\') → (”) for string literals
+//   - Escape sequences (\') → ('') for string literals
 //   - Remove MySQL-specific hints (FORCE INDEX, USE INDEX, FOR UPDATE)
 //   - Convert MySQL LIMIT offset,count → LIMIT count OFFSET offset
 type SQLiteSerializer struct {
-	extractedIndexes []string
-	conflictColumns  []string
+	conflictColumns []string
 }
 
 // Serialize converts a Vitess AST to SQLite SQL
@@ -25,9 +29,14 @@ func (s *SQLiteSerializer) Serialize(stmt sqlparser.Statement) string {
 	return buf.String()
 }
 
-// SetConflictColumns sets the conflict target columns for INSERT ON CONFLICT
-func (s *SQLiteSerializer) SetConflictColumns(columns []string) {
-	s.conflictColumns = columns
+// SerializeWithOpts serializes with explicit options (no state mutation)
+func (s *SQLiteSerializer) SerializeWithOpts(stmt sqlparser.Statement, opts SerializeOpts) string {
+	tempSerializer := &SQLiteSerializer{
+		conflictColumns: opts.ConflictColumns,
+	}
+	buf := sqlparser.NewTrackedBuffer(tempSerializer.nodeFormatter)
+	buf.Myprintf("%v", stmt)
+	return buf.String()
 }
 
 // nodeFormatter is called for each node during serialization.
@@ -342,15 +351,4 @@ func (s *SQLiteSerializer) formatStringLiteral(buf *sqlparser.TrackedBuffer, val
 	buf.WriteString("'")
 	buf.WriteString(str)
 	buf.WriteString("'")
-}
-
-// ExtractedIndexes returns CREATE INDEX statements extracted from CREATE TABLE
-func (s *SQLiteSerializer) ExtractedIndexes() []string {
-	return s.extractedIndexes
-}
-
-// Reset clears state for reuse
-func (s *SQLiteSerializer) Reset() {
-	s.extractedIndexes = nil
-	s.conflictColumns = nil
 }

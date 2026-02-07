@@ -34,6 +34,9 @@ type DatabaseManager interface {
 	// GetAutoIncrementColumn returns the auto-increment column name for a table.
 	// Uses cached schema - does NOT query SQLite PRAGMA.
 	GetAutoIncrementColumn(database, table string) (string, error)
+	// GetTranspilerSchema returns schema information for transpiler conflict resolution.
+	// Uses cached schema - does NOT query SQLite PRAGMA.
+	GetTranspilerSchema(database, table string) (*transform.SchemaInfo, error)
 }
 
 // ReplicatedDatabaseProvider provides access to replicated database operations
@@ -213,7 +216,7 @@ func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, sq
 	// Build schema lookup function for auto-increment ID injection.
 	// Uses cached schema via DatabaseManager - does NOT query SQLite PRAGMA.
 	var schemaLookup protocol.SchemaLookupFunc
-	if session.CurrentDatabase != "" {
+	if h.dbManager != nil && session.CurrentDatabase != "" {
 		dbName := session.CurrentDatabase
 		schemaLookup = func(table string) string {
 			col, err := h.dbManager.GetAutoIncrementColumn(dbName, table)
@@ -223,10 +226,29 @@ func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, sq
 			return col
 		}
 	}
+	schemaProvider := func(database, table string) *transform.SchemaInfo {
+		if table == "" || h.dbManager == nil {
+			return nil
+		}
+		dbName := database
+		if dbName == "" {
+			dbName = session.CurrentDatabase
+		}
+		if dbName == "" {
+			return nil
+		}
+
+		schemaInfo, err := h.dbManager.GetTranspilerSchema(dbName, table)
+		if err != nil {
+			return nil
+		}
+		return schemaInfo
+	}
 
 	// Parse with options based on session state
 	stmt := protocol.ParseStatementWithOptions(sql, protocol.ParseOptions{
 		SchemaLookup:      schemaLookup,
+		SchemaProvider:    schemaProvider,
 		SkipTranspilation: !session.TranspilationEnabled,
 		ExtractLiterals:   true, // Enable literal extraction for parameterized execution
 	})

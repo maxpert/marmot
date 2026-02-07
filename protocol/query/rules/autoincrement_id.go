@@ -57,7 +57,12 @@ func (r *AutoIncrementIDRule) NeedsIDInjection(stmt sqlparser.Statement, schemaL
 	// Check if the auto-inc column is missing or has 0/NULL value
 	colIdx := findColumnIndex(insert.Columns, autoIncCol)
 	if colIdx < 0 {
-		// Column missing from INSERT - needs injection
+		// Column missing from INSERT
+		// If no column list specified, we can't safely inject without schema
+		if len(insert.Columns) == 0 {
+			return false
+		}
+		// Column missing from explicit column list - needs injection
 		return true
 	}
 
@@ -107,7 +112,12 @@ func (r *AutoIncrementIDRule) ApplyAST(stmt sqlparser.Statement, schemaLookup Sc
 	colIdx := findColumnIndex(insert.Columns, autoIncCol)
 
 	if colIdx < 0 {
-		// Column missing from INSERT - add column and values
+		// Column missing from INSERT
+		// If no column list specified, we can't safely add a column without knowing schema
+		if len(insert.Columns) == 0 {
+			return stmt, false, nil
+		}
+		// Add column to explicit column list
 		insert.Columns = append(insert.Columns, sqlparser.NewIdentifierCI(autoIncCol))
 
 		// Add generated ID to each row (appended to match new column)

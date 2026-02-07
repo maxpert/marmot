@@ -391,6 +391,7 @@ func (tm *TransactionManager) applyCDCEntries(txnID uint64, entries []*IntentEnt
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("failed to commit CDC transaction: %w", err)
 	}
+
 	return nil
 }
 

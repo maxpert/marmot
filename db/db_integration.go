@@ -70,12 +70,13 @@ func NewReplicatedDatabase(dbPath string, nodeID uint64, clock *hlc.Clock, metaS
 	// === WRITE CONNECTION ===
 	// Single connection for all writes (SQLite allows only one writer at a time)
 	// Uses _txlock=immediate to acquire write lock at BEGIN, avoiding deadlocks
+	// Uses cache=shared so all local connections share a single page cache.
 	writeDSN := dbPath
 	if !isMemoryDB {
 		if strings.Contains(writeDSN, "?") {
-			writeDSN += fmt.Sprintf("&_journal_mode=WAL&_busy_timeout=%d&_txlock=immediate", busyTimeoutMS)
+			writeDSN += fmt.Sprintf("&_journal_mode=WAL&_busy_timeout=%d&_txlock=immediate&cache=shared", busyTimeoutMS)
 		} else {
-			writeDSN += fmt.Sprintf("?_journal_mode=WAL&_busy_timeout=%d&_txlock=immediate", busyTimeoutMS)
+			writeDSN += fmt.Sprintf("?_journal_mode=WAL&_busy_timeout=%d&_txlock=immediate&cache=shared", busyTimeoutMS)
 		}
 	}
 
@@ -108,12 +109,13 @@ func NewReplicatedDatabase(dbPath string, nodeID uint64, clock *hlc.Clock, metaS
 	// Multiple connections for concurrent reads (WAL mode supports this)
 	// No _txlock needed for reads - they don't acquire write locks
 	// Note: Don't use mode=ro as it can interfere with WAL checkpointing
+	// Uses cache=shared so all local connections share a single page cache.
 	readDSN := dbPath
 	if !isMemoryDB {
 		if strings.Contains(readDSN, "?") {
-			readDSN += fmt.Sprintf("&_journal_mode=WAL&_busy_timeout=%d", busyTimeoutMS)
+			readDSN += fmt.Sprintf("&_journal_mode=WAL&_busy_timeout=%d&cache=shared", busyTimeoutMS)
 		} else {
-			readDSN += fmt.Sprintf("?_journal_mode=WAL&_busy_timeout=%d", busyTimeoutMS)
+			readDSN += fmt.Sprintf("?_journal_mode=WAL&_busy_timeout=%d&cache=shared", busyTimeoutMS)
 		}
 	}
 
@@ -357,7 +359,7 @@ func (mdb *ReplicatedDatabase) OpenSQLiteConnections(dbPath string) error {
 	poolCfg := cfg.Config.ConnectionPool
 
 	// Open write connection
-	writeDSN := fmt.Sprintf("%s?_journal_mode=WAL&_busy_timeout=%d&_txlock=immediate", dbPath, busyTimeoutMS)
+	writeDSN := fmt.Sprintf("%s?_journal_mode=WAL&_busy_timeout=%d&_txlock=immediate&cache=shared", dbPath, busyTimeoutMS)
 	writeDB, err := sql.Open(SQLiteDriverName, writeDSN)
 	if err != nil {
 		return fmt.Errorf("failed to open write connection: %w", err)
@@ -383,7 +385,7 @@ func (mdb *ReplicatedDatabase) OpenSQLiteConnections(dbPath string) error {
 	hookDB.SetConnMaxLifetime(0)
 
 	// Open read connection pool
-	readDSN := fmt.Sprintf("%s?_journal_mode=WAL&_busy_timeout=%d", dbPath, busyTimeoutMS)
+	readDSN := fmt.Sprintf("%s?_journal_mode=WAL&_busy_timeout=%d&cache=shared", dbPath, busyTimeoutMS)
 	readDB, err := sql.Open(SQLiteDriverName, readDSN)
 	if err != nil {
 		writeDB.Close()
@@ -717,14 +719,12 @@ func (mdb *ReplicatedDatabase) ExecuteTransaction(ctx context.Context, statement
 	return nil
 }
 
-// ExecuteQuery executes a read query with snapshot isolation
-// Uses the read connection pool for concurrent read access
+// ExecuteQuery executes a read query with snapshot isolation.
+// Uses the read connection pool for concurrent read access.
 func (mdb *ReplicatedDatabase) ExecuteQuery(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error) {
 	// Get current snapshot timestamp
 	snapshotTS := mdb.clock.Now()
 
-	// Execute on read connection pool for concurrent reads
-	// SQLite's WAL mode provides snapshot isolation at the connection level
 	rows, err := mdb.readDB.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("query failed: %w", err)
@@ -736,11 +736,9 @@ func (mdb *ReplicatedDatabase) ExecuteQuery(ctx context.Context, query string, a
 	return rows, nil
 }
 
-// ExecuteSnapshotRead executes a read query with full transactional support
-// Uses rqlite/sql AST parser for proper SQL analysis
-// Uses the read connection pool for concurrent read access
+// ExecuteSnapshotRead executes a read query with full transactional support.
+// Uses the read connection pool for concurrent read access.
 func (mdb *ReplicatedDatabase) ExecuteSnapshotRead(ctx context.Context, query string, args ...interface{}) ([]string, []map[string]interface{}, error) {
-	// SQLite WAL mode provides snapshot isolation at connection level
 	rows, err := mdb.readDB.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, nil, err
@@ -776,8 +774,8 @@ func (mdb *ReplicatedDatabase) ExecuteSnapshotRead(ctx context.Context, query st
 	return columns, results, nil
 }
 
-// ExecuteQueryRow executes a single-row query with snapshot isolation
-// Uses the read connection pool for concurrent read access
+// ExecuteQueryRow executes a single-row query with snapshot isolation.
+// Uses the read connection pool for concurrent read access.
 func (mdb *ReplicatedDatabase) ExecuteQueryRow(ctx context.Context, query string, args ...interface{}) *sql.Row {
 	// Get current snapshot timestamp
 	// Note: SQLite's WAL mode provides snapshot isolation at transaction level.

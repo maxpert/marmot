@@ -18,8 +18,9 @@ import (
 
 // TranspiledStatement represents a SQLite-ready statement with parameters
 type TranspiledStatement struct {
-	SQL    string
-	Params []interface{}
+	SQL      string
+	Params   []interface{}
+	Metadata map[string]interface{} // Rule-specific metadata (e.g., "conflictColumns")
 }
 
 // ErrRuleNotApplicable indicates rule doesn't apply to this statement type

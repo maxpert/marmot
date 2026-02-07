@@ -4,9 +4,7 @@ import (
 	"strings"
 
 	"github.com/maxpert/marmot/id"
-	"github.com/maxpert/marmot/protocol/query/transform"
 	"github.com/rs/zerolog/log"
-	"vitess.io/vitess/go/vt/sqlparser"
 )
 
 // Pipeline coordinates query parsing and transpilation from MySQL to SQLite.
@@ -69,30 +67,13 @@ func (p *Pipeline) Process(ctx *QueryContext) error {
 		return err
 	}
 
+	// Transpile (handles database qualifier stripping and literal extraction)
 	if err := p.transpiler.Transpile(ctx); err != nil {
 		log.Debug().Err(err).Str("sql", ctx.Input.SQL).Msg("Transpile failed")
 		return err
 	}
 
-	if ctx.Output.Database != "" {
-		stripDatabaseQualifiers(ctx)
-	}
-
-	// Extract literals from DML/SELECT statements for parameterized execution
-	// Skip if params already provided (prepared statements) or if DDL or if not enabled
-	if ctx.ExtractLiterals && len(ctx.Input.Parameters) == 0 && ctx.MySQLState != nil && ctx.MySQLState.AST != nil {
-		if shouldExtractLiterals(ctx.Output.StatementType) {
-			params := transform.ExtractLiterals(ctx.MySQLState.AST)
-			if params != nil {
-				// Re-serialize AST with placeholders
-				serializer := &transform.SQLiteSerializer{}
-				ctx.Output.Statements[0].SQL = serializer.Serialize(ctx.MySQLState.AST)
-				ctx.Output.Statements[0].Params = params
-			}
-		}
-	}
-
-	// Mark query as valid (validator removed - transpilation success means valid)
+	// Mark query as valid
 	ctx.Output.IsValid = true
 
 	// Log transformations for debugging
@@ -108,39 +89,15 @@ func (p *Pipeline) Process(ctx *QueryContext) error {
 	return nil
 }
 
-// stripDatabaseQualifiers removes database name qualifiers from table references.
-// SQLite doesn't support database qualifiers in the same way as MySQL.
-func stripDatabaseQualifiers(ctx *QueryContext) {
-	if ctx.MySQLState == nil || ctx.MySQLState.AST == nil {
-		return
-	}
-
-	sqlparser.Rewrite(ctx.MySQLState.AST, func(cursor *sqlparser.Cursor) bool {
-		switch n := cursor.Node().(type) {
-		case sqlparser.TableName:
-			newTableName := sqlparser.TableName{
-				Name:      n.Name,
-				Qualifier: sqlparser.NewIdentifierCS(""),
-			}
-			cursor.Replace(newTableName)
-		}
-		return true
-	}, nil)
-
-	// Re-serialize the main statement after stripping qualifiers.
-	// Additional statements (like CREATE INDEX) are assumed not to have qualifiers.
-	serializer := &transform.SQLiteSerializer{}
-	sql := serializer.Serialize(ctx.MySQLState.AST)
-	ctx.Output.Statements[0].SQL = sql
-}
-
 // convertANSIQuotesToBackticks converts ANSI SQL double-quoted identifiers to MySQL backticks.
 // For example: SELECT "column" FROM "table" becomes SELECT `column` FROM `table`
 // This is needed for compatibility with Drupal and other apps that use ANSI SQL quoting.
-// The function preserves:
-//   - Content inside single-quoted strings
-//   - Empty strings "" (converts to ” for MySQL compatibility)
-//   - Strings that look like values (after = or DEFAULT keywords)
+//
+// The function uses a state machine to properly track:
+//   - Single-quoted strings (preserves content unchanged)
+//   - SQL escaped quotes ('') and MySQL backslash escapes (\')
+//   - Double-quoted identifiers (converts to backticks)
+//   - Value contexts after = or DEFAULT (converts to single quotes)
 func convertANSIQuotesToBackticks(sql string) string {
 	// Quick check: if no double quotes, return as-is
 	if !strings.Contains(sql, "\"") {
@@ -156,31 +113,38 @@ func convertANSIQuotesToBackticks(sql string) string {
 	for i < len(sql) {
 		c := sql[i]
 
-		// Handle single quotes (string literals)
-		if c == '\'' {
-			if !inSingleQuote {
-				inSingleQuote = true
-			} else if i+1 < len(sql) && sql[i+1] == '\'' {
-				// Escaped single quote ('') - write both and skip
-				result.WriteString("''")
-				i += 2
-				continue
-			} else {
-				inSingleQuote = false
-			}
-			result.WriteByte(c)
-			i++
-			continue
-		}
-
-		// Inside single-quoted string - pass through unchanged
+		// Inside single-quoted string
 		if inSingleQuote {
 			result.WriteByte(c)
+
+			if c == '\\' && i+1 < len(sql) {
+				// Backslash escape: write next char and skip (handles \', \\, \n, etc.)
+				i++
+				result.WriteByte(sql[i])
+			} else if c == '\'' {
+				if i+1 < len(sql) && sql[i+1] == '\'' {
+					// SQL escaped quote ('') - write second quote and skip
+					i++
+					result.WriteByte('\'')
+				} else {
+					// End of string
+					inSingleQuote = false
+				}
+			}
 			i++
 			continue
 		}
 
-		// Handle double quotes outside of single-quoted strings
+		// Outside single-quoted string
+		if c == '\'' {
+			// Start of single-quoted string
+			inSingleQuote = true
+			result.WriteByte(c)
+			i++
+			continue
+		}
+
+		// Handle double quotes (ANSI identifiers)
 		if c == '"' {
 			// Find the closing double quote
 			end := i + 1
@@ -192,14 +156,13 @@ func convertANSIQuotesToBackticks(sql string) string {
 				identifier := sql[i+1 : end]
 
 				// Check if this is a string value context (after = or DEFAULT)
-				// by looking at preceding non-whitespace characters
 				isValueContext := false
 				for j := i - 1; j >= 0; j-- {
-					if sql[j] == ' ' || sql[j] == '\t' || sql[j] == '\n' || sql[j] == '\r' {
+					ch := sql[j]
+					if ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' {
 						continue
 					}
-					// Check for = sign or end of DEFAULT keyword
-					if sql[j] == '=' {
+					if ch == '=' {
 						isValueContext = true
 					} else if j >= 6 {
 						preceding := strings.ToUpper(sql[j-6 : j+1])
@@ -231,16 +194,6 @@ func convertANSIQuotesToBackticks(sql string) string {
 	}
 
 	return result.String()
-}
-
-// shouldExtractLiterals returns true for statement types that benefit from parameterization
-func shouldExtractLiterals(stmtType StatementCode) bool {
-	switch stmtType {
-	case StatementInsert, StatementUpdate, StatementDelete, StatementSelect:
-		return true
-	default:
-		return false
-	}
 }
 
 // classifySQLiteStatement classifies SQLite dialect statements based on prefix matching.

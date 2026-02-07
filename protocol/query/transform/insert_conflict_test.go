@@ -101,8 +101,19 @@ func TestInsertOnDuplicateKeyRule_TransformValuesFunction(t *testing.T) {
 				if len(result) != 1 {
 					t.Fatalf("expected 1 transpiled statement, got %d", len(result))
 				}
+				// Rule now returns metadata instead of serialized SQL
+				if result[0].Metadata == nil {
+					t.Fatal("expected metadata, got nil")
+				}
+				if _, ok := result[0].Metadata["conflictColumns"]; !ok {
+					t.Fatal("expected conflictColumns in metadata")
+				}
+				// Verify AST was modified by serializing it
 				if tt.checkOutput != nil {
-					_ = tt.checkOutput(result[0].SQL)
+					serializer := &SQLiteSerializer{}
+					cols, _ := result[0].Metadata["conflictColumns"].([]string)
+					sql := serializer.SerializeWithOpts(stmt, SerializeOpts{ConflictColumns: cols})
+					_ = tt.checkOutput(sql)
 				}
 			} else {
 				if err != ErrRuleNotApplicable {
@@ -141,12 +152,29 @@ func TestInsertOnDuplicateKeyRule_ConflictTargetWithSchema(t *testing.T) {
 		t.Fatalf("expected 1 transpiled statement, got %d", len(result))
 	}
 
-	if !strings.Contains(result[0].SQL, "ON CONFLICT") {
-		t.Errorf("expected SQL to contain ON CONFLICT, got: %s", result[0].SQL)
+	// Rule now returns metadata with conflict columns
+	if result[0].Metadata == nil {
+		t.Fatal("expected metadata, got nil")
 	}
 
-	if !strings.Contains(result[0].SQL, "id") || !strings.Contains(result[0].SQL, "tenant_id") {
-		t.Errorf("expected SQL to contain conflict columns id and tenant_id, got: %s", result[0].SQL)
+	cols, ok := result[0].Metadata["conflictColumns"].([]string)
+	if !ok {
+		t.Fatal("expected conflictColumns in metadata")
+	}
+
+	// Verify conflict columns match schema primary key
+	if len(cols) != 2 || cols[0] != "id" || cols[1] != "tenant_id" {
+		t.Errorf("expected conflict columns [id, tenant_id], got: %v", cols)
+	}
+
+	// Verify serialization produces correct SQL
+	sql := serializer.SerializeWithOpts(stmt, SerializeOpts{ConflictColumns: cols})
+	if !strings.Contains(sql, "ON CONFLICT") {
+		t.Errorf("expected SQL to contain ON CONFLICT, got: %s", sql)
+	}
+
+	if !strings.Contains(sql, "id") || !strings.Contains(sql, "tenant_id") {
+		t.Errorf("expected SQL to contain conflict columns id and tenant_id, got: %s", sql)
 	}
 }
 
@@ -169,12 +197,29 @@ func TestInsertOnDuplicateKeyRule_ConflictTargetFallback(t *testing.T) {
 		t.Fatalf("expected 1 transpiled statement, got %d", len(result))
 	}
 
-	if !strings.Contains(result[0].SQL, "ON CONFLICT") {
-		t.Errorf("expected SQL to contain ON CONFLICT, got: %s", result[0].SQL)
+	// Rule now returns metadata with conflict columns
+	if result[0].Metadata == nil {
+		t.Fatal("expected metadata, got nil")
 	}
 
-	if !strings.Contains(result[0].SQL, "id") {
-		t.Errorf("expected SQL to contain fallback column 'id', got: %s", result[0].SQL)
+	cols, ok := result[0].Metadata["conflictColumns"].([]string)
+	if !ok {
+		t.Fatal("expected conflictColumns in metadata")
+	}
+
+	// Verify fallback to first column
+	if len(cols) != 1 || cols[0] != "id" {
+		t.Errorf("expected conflict column [id], got: %v", cols)
+	}
+
+	// Verify serialization produces correct SQL
+	sql := serializer.SerializeWithOpts(stmt, SerializeOpts{ConflictColumns: cols})
+	if !strings.Contains(sql, "ON CONFLICT") {
+		t.Errorf("expected SQL to contain ON CONFLICT, got: %s", sql)
+	}
+
+	if !strings.Contains(sql, "id") {
+		t.Errorf("expected SQL to contain fallback column 'id', got: %s", sql)
 	}
 }
 
@@ -207,16 +252,26 @@ func TestInsertOnDuplicateKeyRule_WrongSerializerError(t *testing.T) {
 	serializer := &mockSerializer{}
 	result, err := rule.Transform(stmt, nil, nil, "testdb", serializer)
 
-	if err == nil {
-		t.Fatal("expected error when non-SQLiteSerializer is passed, got nil")
+	// Rule now returns metadata instead of serializing, so serializer type doesn't matter
+	if err != nil {
+		t.Fatalf("Transform failed: %v", err)
 	}
 
-	if result != nil {
-		t.Errorf("expected nil result on error, got: %v", result)
+	if result == nil {
+		t.Fatal("expected result, got nil")
 	}
 
-	if !strings.Contains(err.Error(), "requires SQLiteSerializer") {
-		t.Errorf("expected 'requires SQLiteSerializer' in error, got: %v", err)
+	if len(result) != 1 {
+		t.Fatalf("expected 1 transpiled statement, got %d", len(result))
+	}
+
+	// Verify metadata is returned
+	if result[0].Metadata == nil {
+		t.Fatal("expected metadata, got nil")
+	}
+
+	if _, ok := result[0].Metadata["conflictColumns"]; !ok {
+		t.Fatal("expected conflictColumns in metadata")
 	}
 }
 
@@ -254,8 +309,13 @@ func TestInsertOnDuplicateKeyRule_ThreadSafety(t *testing.T) {
 				t.Error("expected result, got nil or empty")
 				return
 			}
-			if !strings.Contains(result[0].SQL, "ON CONFLICT") {
-				t.Errorf("expected ON CONFLICT in SQL: %s", result[0].SQL)
+			// Rule now returns metadata with conflict columns instead of serialized SQL
+			if result[0].Metadata == nil {
+				t.Error("expected metadata, got nil")
+				return
+			}
+			if _, ok := result[0].Metadata["conflictColumns"]; !ok {
+				t.Error("expected conflictColumns in metadata")
 			}
 		}()
 	}

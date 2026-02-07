@@ -6,6 +6,7 @@ import (
 
 	"github.com/maxpert/marmot/id"
 	"github.com/maxpert/marmot/protocol/query"
+	"github.com/maxpert/marmot/protocol/query/transform"
 	"github.com/rs/zerolog/log"
 )
 
@@ -114,6 +115,7 @@ type SchemaLookupFunc func(table string) string
 // ParseOptions holds options for parsing SQL statements.
 type ParseOptions struct {
 	SchemaLookup      SchemaLookupFunc
+	SchemaProvider    transform.SchemaProvider // For ON CONFLICT target resolution
 	SkipTranspilation bool
 	ExtractLiterals   bool // Enable literal extraction for parameterized execution
 }
@@ -129,6 +131,7 @@ func ParseStatement(sql string) Statement {
 func ParseStatementWithOptions(sql string, opts ParseOptions) Statement {
 	ctx := query.NewContext(sql, nil)
 	ctx.SchemaLookup = opts.SchemaLookup
+	ctx.SchemaProvider = opts.SchemaProvider
 	ctx.SkipTranspilation = opts.SkipTranspilation
 	ctx.ExtractLiterals = opts.ExtractLiterals
 

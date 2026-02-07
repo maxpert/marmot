@@ -13,6 +13,7 @@ import (
 	"github.com/maxpert/marmot/db"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/protocol"
+	"github.com/maxpert/marmot/protocol/query/transform"
 	"github.com/stretchr/testify/require"
 )
 
@@ -94,6 +95,11 @@ func (m *DDLMockDatabaseManager) GetReplicatedDatabase(name string) (coordinator
 func (m *DDLMockDatabaseManager) GetAutoIncrementColumn(database, table string) (string, error) {
 	// Not implemented in DDL mock - return empty
 	return "", nil
+}
+
+func (m *DDLMockDatabaseManager) GetTranspilerSchema(database, table string) (*transform.SchemaInfo, error) {
+	// Not implemented in DDL mock
+	return nil, nil
 }
 
 // DDLMockReader implements coordinator.Reader for testing

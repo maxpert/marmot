@@ -186,19 +186,3 @@ func TestSQLiteSerializer_SerializeBasic(t *testing.T) {
 		})
 	}
 }
-
-func TestSQLiteSerializer_Reset(t *testing.T) {
-	serializer := &SQLiteSerializer{}
-	serializer.extractedIndexes = []string{"CREATE INDEX idx1 ON t1 (col1)"}
-	serializer.conflictColumns = []string{"id", "tenant_id"}
-
-	serializer.Reset()
-
-	if serializer.extractedIndexes != nil {
-		t.Errorf("expected extractedIndexes to be nil after reset, got %v", serializer.extractedIndexes)
-	}
-
-	if serializer.conflictColumns != nil {
-		t.Errorf("expected conflictColumns to be nil after reset, got %v", serializer.conflictColumns)
-	}
-}

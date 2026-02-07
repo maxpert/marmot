@@ -12,6 +12,7 @@ import (
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/protocol"
 	"github.com/maxpert/marmot/protocol/handlers"
+	"github.com/maxpert/marmot/protocol/query/transform"
 
 	"github.com/rs/zerolog/log"
 	"google.golang.org/grpc/codes"
@@ -60,8 +61,28 @@ func (h *ReadOnlyHandler) HandleQuery(session *protocol.ConnectionSession, sql s
 	}
 
 	// Parse with options based on session state
+	schemaProvider := func(database, table string) *transform.SchemaInfo {
+		if table == "" || h.dbManager == nil {
+			return nil
+		}
+		dbName := database
+		if dbName == "" {
+			dbName = session.CurrentDatabase
+		}
+		if dbName == "" {
+			return nil
+		}
+
+		schemaInfo, err := h.dbManager.GetTranspilerSchema(dbName, table)
+		if err != nil {
+			return nil
+		}
+		return schemaInfo
+	}
+
 	stmt := protocol.ParseStatementWithOptions(sql, protocol.ParseOptions{
 		SkipTranspilation: !session.TranspilationEnabled,
+		SchemaProvider:    schemaProvider,
 	})
 
 	// Handle system variable queries (@@version, DATABASE(), etc.)

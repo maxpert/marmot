@@ -2,6 +2,8 @@ package query
 
 import (
 	"testing"
+
+	"github.com/maxpert/marmot/protocol/query/transform"
 )
 
 // TestPipelineLiteralExtraction verifies that literal extraction works when enabled
@@ -231,6 +233,102 @@ func TestPipelineLiteralExtraction_DDL(t *testing.T) {
 	// Verify no params were extracted
 	if len(stmt.Params) != 0 {
 		t.Errorf("Expected 0 params for DDL, got %d", len(stmt.Params))
+	}
+}
+
+// TestPipelineLiteralExtraction_InsertOnDuplicateKey verifies that INSERT ON DUPLICATE KEY
+// with literal extraction preserves the schema's composite primary key for conflict target.
+// This test specifically validates the fix for the state loss bug where re-serialization
+// after literal extraction would lose the conflict columns set by InsertOnDuplicateKeyRule.
+func TestPipelineLiteralExtraction_InsertOnDuplicateKey(t *testing.T) {
+	pipeline, err := NewPipeline(1000, nil)
+	if err != nil {
+		t.Fatalf("Failed to create pipeline: %v", err)
+	}
+	defer pipeline.Close()
+
+	tests := []struct {
+		name               string
+		sql                string
+		schemaProvider     func(db, table string) *transform.SchemaInfo
+		expectConflictCols string // substring to check in ON CONFLICT clause
+		expectParams       int
+	}{
+		{
+			name: "composite primary key from schema",
+			sql:  "INSERT INTO users (id, tenant_id, name) VALUES (1, 2, 'alice') ON DUPLICATE KEY UPDATE name = VALUES(name)",
+			schemaProvider: func(db, table string) *transform.SchemaInfo {
+				if table == "users" {
+					return &transform.SchemaInfo{PrimaryKey: []string{"id", "tenant_id"}}
+				}
+				return nil
+			},
+			expectConflictCols: "ON CONFLICT (id, tenant_id)",
+			expectParams:       3,
+		},
+		{
+			name: "single column primary key from schema",
+			sql:  "INSERT INTO items (id, name, qty) VALUES (100, 'widget', 5) ON DUPLICATE KEY UPDATE qty = qty + VALUES(qty)",
+			schemaProvider: func(db, table string) *transform.SchemaInfo {
+				if table == "items" {
+					return &transform.SchemaInfo{PrimaryKey: []string{"id"}}
+				}
+				return nil
+			},
+			expectConflictCols: "ON CONFLICT (id)",
+			expectParams:       3,
+		},
+		{
+			name:               "fallback to first column when no schema",
+			sql:                "INSERT INTO logs (event_id, msg) VALUES (1, 'test') ON DUPLICATE KEY UPDATE msg = VALUES(msg)",
+			schemaProvider:     nil,
+			expectConflictCols: "ON CONFLICT (event_id)",
+			expectParams:       2,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := NewContext(tt.sql, nil)
+			ctx.ExtractLiterals = true
+			ctx.SchemaProvider = tt.schemaProvider
+
+			if err := pipeline.Process(ctx); err != nil {
+				t.Fatalf("Pipeline processing failed: %v", err)
+			}
+
+			if !ctx.Output.IsValid {
+				t.Fatalf("Query validation failed: %v", ctx.Output.ValidationErr)
+			}
+
+			if len(ctx.Output.Statements) == 0 {
+				t.Fatal("No statements produced")
+			}
+
+			stmt := ctx.Output.Statements[0]
+
+			// Verify conflict columns are correct
+			if !contains(stmt.SQL, tt.expectConflictCols) {
+				t.Errorf("Expected conflict columns %q in SQL\nGot: %s", tt.expectConflictCols, stmt.SQL)
+			}
+
+			// Verify params were extracted
+			if len(stmt.Params) != tt.expectParams {
+				t.Errorf("Expected %d params, got %d", tt.expectParams, len(stmt.Params))
+			}
+
+			// Verify VALUES(col) was transformed to excluded.col
+			if !contains(stmt.SQL, "excluded.") {
+				t.Errorf("Expected 'excluded.' in SQL for VALUES() transformation\nGot: %s", stmt.SQL)
+			}
+
+			// Verify ConflictColumns are stored in context
+			if tt.schemaProvider != nil && ctx.MySQLState != nil {
+				if len(ctx.MySQLState.ConflictColumns) == 0 {
+					t.Error("Expected ConflictColumns to be set in MySQLState")
+				}
+			}
+		})
 	}
 }
 
