@@ -2,6 +2,7 @@ package replica
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -13,6 +14,8 @@ import (
 	"github.com/maxpert/marmot/protocol/handlers"
 
 	"github.com/rs/zerolog/log"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // ReadOnlyHandler implements protocol.ConnectionHandler for read-only replicas
@@ -301,12 +304,11 @@ func (h *ReadOnlyHandler) forwardMutation(session *protocol.ConnectionSession, s
 		return nil, fmt.Errorf("ERROR 1105 (HY000): Failed to serialize params: %v", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), h.forwardTimeout)
-	defer cancel()
-
-	resp, err := client.ForwardQuery(ctx, &marmotgrpc.ForwardQueryRequest{
+	requestID := session.NextForwardRequestID()
+	resp, err := h.forwardQueryWithRetry(client, &marmotgrpc.ForwardQueryRequest{
 		ReplicaNodeId:      h.replica.streamClient.GetNodeID(),
 		SessionId:          session.ConnID,
+		RequestId:          requestID,
 		Database:           session.CurrentDatabase,
 		Sql:                stmt.SQL,
 		TxnControl:         marmotgrpc.ForwardTxnControl_FWD_TXN_NONE,
@@ -381,14 +383,15 @@ func (h *ReadOnlyHandler) forwardTxnControl(session *protocol.ConnectionSession,
 		return nil, protocol.ErrReadOnly()
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), h.forwardTimeout)
-	defer cancel()
-
-	resp, err := client.ForwardQuery(ctx, &marmotgrpc.ForwardQueryRequest{
-		ReplicaNodeId: h.replica.streamClient.GetNodeID(),
-		SessionId:     session.ConnID,
-		Database:      session.CurrentDatabase,
-		TxnControl:    txnControl,
+	requestID := session.NextForwardRequestID()
+	resp, err := h.forwardQueryWithRetry(client, &marmotgrpc.ForwardQueryRequest{
+		ReplicaNodeId:      h.replica.streamClient.GetNodeID(),
+		SessionId:          session.ConnID,
+		RequestId:          requestID,
+		Database:           session.CurrentDatabase,
+		TxnControl:         txnControl,
+		WaitForReplication: session.WaitForReplication,
+		TimeoutMs:          uint32(h.forwardTimeout.Milliseconds()),
 	})
 
 	if err != nil {
@@ -407,7 +410,72 @@ func (h *ReadOnlyHandler) forwardTxnControl(session *protocol.ConnectionSession,
 		session.ForwardedTxnActive = false
 	}
 
+	// Optional read-your-own-writes guarantee for forwarded explicit COMMIT.
+	if txnControl == marmotgrpc.ForwardTxnControl_FWD_TXN_COMMIT &&
+		session.WaitForReplication && resp.CommittedTxnId > 0 {
+		if err := h.waitForReplication(session.CurrentDatabase, resp.CommittedTxnId); err != nil {
+			log.Warn().
+				Err(err).
+				Uint64("conn_id", session.ConnID).
+				Uint64("txn_id", resp.CommittedTxnId).
+				Msg("Timeout waiting for forwarded COMMIT replication")
+		}
+	}
+
 	return nil, nil
+}
+
+func (h *ReadOnlyHandler) forwardQueryWithRetry(
+	client marmotgrpc.MarmotServiceClient,
+	req *marmotgrpc.ForwardQueryRequest,
+) (*marmotgrpc.ForwardQueryResponse, error) {
+	resp, err := h.forwardQueryOnce(client, req)
+	if err == nil {
+		return resp, nil
+	}
+
+	if !isRetriableForwardError(err) {
+		return nil, err
+	}
+
+	log.Warn().
+		Err(err).
+		Uint64("session_id", req.SessionId).
+		Uint64("request_id", req.RequestId).
+		Msg("Forward query failed with retriable error, retrying once with same request_id")
+
+	return h.forwardQueryOnce(client, req)
+}
+
+func (h *ReadOnlyHandler) forwardQueryOnce(
+	client marmotgrpc.MarmotServiceClient,
+	req *marmotgrpc.ForwardQueryRequest,
+) (*marmotgrpc.ForwardQueryResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), h.forwardTimeout)
+	defer cancel()
+	return client.ForwardQuery(ctx, req)
+}
+
+func isRetriableForwardError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return true
+	}
+
+	st, ok := status.FromError(err)
+	if !ok {
+		return false
+	}
+
+	switch st.Code() {
+	case codes.DeadlineExceeded, codes.Unavailable, codes.Canceled, codes.ResourceExhausted:
+		return true
+	default:
+		return false
+	}
 }
 
 // waitForReplication waits for the specified transaction to be replicated

@@ -94,6 +94,10 @@ type ConnectionSession struct {
 	// COMMIT/ROLLBACK lifecycle. Reads within forwarded transactions execute
 	// locally and won't see uncommitted writes from that transaction.
 	ForwardedTxnActive bool
+
+	// ForwardRequestSeq is a monotonic request ID generator used when forwarding
+	// replica writes to leader with idempotent dedupe.
+	ForwardRequestSeq atomic.Uint64
 }
 
 // InTransaction returns true if session has an active explicit transaction
@@ -136,6 +140,11 @@ func (s *ConnectionSession) EndTransaction() {
 	s.activeTxnMu.Lock()
 	defer s.activeTxnMu.Unlock()
 	s.activeTxn = nil
+}
+
+// NextForwardRequestID allocates the next idempotency key for write forwarding.
+func (s *ConnectionSession) NextForwardRequestID() uint64 {
+	return s.ForwardRequestSeq.Add(1)
 }
 
 // PreparedStatement represents a prepared statement

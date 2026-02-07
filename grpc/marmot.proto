@@ -352,6 +352,7 @@ enum ForwardTxnControl {
 message ForwardQueryRequest {
   uint64 replica_node_id = 1;    // Which replica is forwarding
   uint64 session_id = 2;         // Client session ID on replica
+  uint64 request_id = 9;         // Monotonic per-session request ID for idempotency
   string database = 3;           // Target database
   string sql = 4;                // SQL statement (transpiled)
   ForwardTxnControl txn_control = 5;

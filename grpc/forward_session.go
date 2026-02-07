@@ -1,11 +1,12 @@
 package grpc
 
 import (
+	"context"
 	"errors"
 	"sync"
 	"time"
 
-	"github.com/maxpert/marmot/hlc"
+	"github.com/maxpert/marmot/protocol"
 	"github.com/rs/zerolog/log"
 )
 
@@ -15,27 +16,25 @@ type ForwardSessionKey struct {
 	SessionID     uint64
 }
 
-// BufferedStatement pairs a SQL statement with its parameters for deferred execution
-type BufferedStatement struct {
-	SQL    string
-	Params []any
-}
+const maxCachedForwardRequests = 1024
 
-// ForwardTransaction represents an active transaction being built on the leader
-type ForwardTransaction struct {
-	TxnID      uint64
-	StartTS    hlc.Timestamp
-	Statements []BufferedStatement
-	Database   string
+type forwardRequestState struct {
+	done chan struct{}
+	resp *ForwardQueryResponse
 }
 
 // ForwardSession tracks a single client session on the leader for write forwarding
 type ForwardSession struct {
 	Key          ForwardSessionKey
 	Database     string
-	ActiveTxn    *ForwardTransaction
+	ConnSession  *protocol.ConnectionSession
 	LastActivity time.Time
-	mu           sync.Mutex
+
+	execMu sync.Mutex
+	mu     sync.Mutex
+
+	requestStates map[uint64]*forwardRequestState
+	requestOrder  []uint64
 }
 
 // ForwardSessionManager manages all active forwarding sessions on the leader
@@ -45,11 +44,6 @@ type ForwardSessionManager struct {
 	sessionTimeout time.Duration
 	stopCh         chan struct{}
 }
-
-var (
-	errNoActiveTransaction      = errors.New("no active transaction")
-	errTransactionAlreadyActive = errors.New("transaction already active")
-)
 
 // NewForwardSessionManager creates a new session manager and starts cleanup loop
 func NewForwardSessionManager(timeout time.Duration) *ForwardSessionManager {
@@ -73,9 +67,12 @@ func (m *ForwardSessionManager) GetOrCreateSession(key ForwardSessionKey, db str
 	}
 
 	session := &ForwardSession{
-		Key:          key,
-		Database:     db,
-		LastActivity: time.Now(),
+		Key:           key,
+		Database:      db,
+		ConnSession:   newForwardConnSession(key.SessionID, db),
+		LastActivity:  time.Now(),
+		requestStates: make(map[uint64]*forwardRequestState),
+		requestOrder:  make([]uint64, 0, 16),
 	}
 	m.sessions[key] = session
 	return session
@@ -148,55 +145,138 @@ func (m *ForwardSessionManager) Stop() {
 	close(m.stopCh)
 }
 
-// BeginTransaction starts a new transaction in the session
-func (s *ForwardSession) BeginTransaction(txnID uint64, startTS hlc.Timestamp, db string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.ActiveTxn != nil {
-		return errTransactionAlreadyActive
+func newForwardConnSession(connID uint64, db string) *protocol.ConnectionSession {
+	return &protocol.ConnectionSession{
+		ConnID:               connID,
+		CurrentDatabase:      db,
+		TranspilationEnabled: false, // Forwarded SQL is already transpiled on replica
 	}
-
-	s.ActiveTxn = &ForwardTransaction{
-		TxnID:      txnID,
-		StartTS:    startTS,
-		Statements: make([]BufferedStatement, 0),
-		Database:   db,
-	}
-	s.LastActivity = time.Now()
-	return nil
 }
 
-// AddStatement adds a statement with its params to the active transaction
-func (s *ForwardSession) AddStatement(sql string, params []any) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.ActiveTxn == nil {
-		return errNoActiveTransaction
+// BeginRequest reserves a request slot for idempotent dedupe.
+// Returns (state, true) for new requests, (state, false) for retries/duplicates.
+func (s *ForwardSession) BeginRequest(requestID uint64) (*forwardRequestState, bool) {
+	if requestID == 0 {
+		return nil, true
 	}
 
-	s.ActiveTxn.Statements = append(s.ActiveTxn.Statements, BufferedStatement{
-		SQL:    sql,
-		Params: params,
-	})
-	s.LastActivity = time.Now()
-	return nil
-}
-
-// GetTransaction returns the active transaction or nil
-func (s *ForwardSession) GetTransaction() *ForwardTransaction {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.ActiveTxn
+
+	if state, ok := s.requestStates[requestID]; ok {
+		return state, false
+	}
+
+	state := &forwardRequestState{
+		done: make(chan struct{}),
+	}
+	s.requestStates[requestID] = state
+	s.requestOrder = append(s.requestOrder, requestID)
+	s.LastActivity = time.Now()
+	return state, true
 }
 
-// ClearTransaction clears the active transaction
-func (s *ForwardSession) ClearTransaction() {
+// WaitForRequest waits until an in-flight duplicate request finishes.
+func (s *ForwardSession) WaitForRequest(ctx context.Context, state *forwardRequestState) (*ForwardQueryResponse, error) {
+	if state == nil {
+		return nil, nil
+	}
+
+	select {
+	case <-state.done:
+		return cloneForwardResponse(state.resp), nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// CompleteRequest stores the response and unblocks duplicate waiters.
+func (s *ForwardSession) CompleteRequest(requestID uint64, state *forwardRequestState, resp *ForwardQueryResponse) {
+	if requestID == 0 || state == nil {
+		return
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.ActiveTxn = nil
+
+	state.resp = cloneForwardResponse(resp)
+	close(state.done)
 	s.LastActivity = time.Now()
+	s.pruneCompletedRequestsLocked()
+}
+
+// Execute serializes all operations for a forwarded session, preserving
+// single-connection ordering semantics and coordinator transaction state.
+func (s *ForwardSession) Execute(database string, fn func(connSession *protocol.ConnectionSession) (*ForwardQueryResponse, error)) (*ForwardQueryResponse, error) {
+	s.execMu.Lock()
+	defer s.execMu.Unlock()
+
+	s.mu.Lock()
+	s.ensureDatabaseLocked(database)
+	connSession := s.ConnSession
+	s.LastActivity = time.Now()
+	s.mu.Unlock()
+
+	if connSession == nil {
+		return nil, errors.New("forward session connection not initialized")
+	}
+
+	return fn(connSession)
+}
+
+func (s *ForwardSession) HasActiveTransaction() bool {
+	s.mu.Lock()
+	connSession := s.ConnSession
+	s.mu.Unlock()
+
+	if connSession == nil {
+		return false
+	}
+	return connSession.InTransaction()
+}
+
+func (s *ForwardSession) ensureDatabaseLocked(db string) {
+	if db == "" {
+		return
+	}
+	s.Database = db
+	if s.ConnSession == nil {
+		s.ConnSession = newForwardConnSession(s.Key.SessionID, db)
+		return
+	}
+	s.ConnSession.CurrentDatabase = db
+}
+
+func (s *ForwardSession) pruneCompletedRequestsLocked() {
+	if len(s.requestStates) <= maxCachedForwardRequests {
+		return
+	}
+
+	filtered := make([]uint64, 0, len(s.requestOrder))
+	for _, requestID := range s.requestOrder {
+		state, ok := s.requestStates[requestID]
+		if !ok {
+			continue
+		}
+		if len(s.requestStates) > maxCachedForwardRequests {
+			select {
+			case <-state.done:
+				delete(s.requestStates, requestID)
+				continue
+			default:
+			}
+		}
+		filtered = append(filtered, requestID)
+	}
+	s.requestOrder = filtered
+}
+
+func cloneForwardResponse(resp *ForwardQueryResponse) *ForwardQueryResponse {
+	if resp == nil {
+		return nil
+	}
+	cloned := *resp
+	return &cloned
 }
 
 // Touch updates the last activity timestamp
