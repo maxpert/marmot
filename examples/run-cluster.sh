@@ -1,5 +1,5 @@
 #!/bin/bash
-# Marmot v2.1.0-beta - Example 3-Node Cluster
+# Marmot v2.9.0-beta - Example 3-Node Cluster
 # Full Database Replication: ALL nodes get ALL data
 
 set -e
@@ -37,7 +37,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-echo "=== Marmot v2.1.0-beta Example Cluster ==="
+echo "=== Marmot v2.9.0-beta Example Cluster ==="
 echo "Starting 3-node cluster with full database replication"
 echo ""
 
@@ -98,7 +98,7 @@ generate_node_config() {
     done
 
     cat > "$config_file" << EOF
-# Marmot v2.1.0-beta - Node ${node_id} (auto-generated)
+# Marmot v2.9.0-beta - Node ${node_id} (auto-generated)
 node_id = ${node_id}
 data_dir = "${data_dir}"
 

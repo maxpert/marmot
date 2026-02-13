@@ -1,4 +1,4 @@
-# Marmot v2.1.0-beta - Read-Only Replica 2A
+# Marmot v2.9.0-beta - Read-Only Replica 2A
 # Follows cluster nodes for transparent failover
 
 node_id = 102

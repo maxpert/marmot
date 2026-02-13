@@ -1,6 +1,6 @@
 #!/bin/sh
 
-# Build Marmot v2.1.0-beta for Linux (static binary)
+# Build Marmot v2.9.0-beta for Linux (static binary)
 # Requires musl cross-compiler: brew install FiloSottile/musl-cross/musl-cross
 
 CC=x86_64-linux-musl-gcc \

@@ -135,7 +135,7 @@ func (h *ClusterHarness) createNodeConfig(node *ClusterNode) {
 		seedNodes = append(seedNodes, fmt.Sprintf("\"localhost:%d\"", baseGRPCPort+1))
 	}
 
-	config := fmt.Sprintf(`# Marmot v2.1.0-beta Test Node %d
+	config := fmt.Sprintf(`# Marmot v2.9.0-beta Test Node %d
 node_id = %d
 data_dir = "%s"
 

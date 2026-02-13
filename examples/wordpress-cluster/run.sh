@@ -15,7 +15,7 @@ NC='\033[0m'
 print_banner() {
     echo ""
     echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║${NC}     ${BOLD}Marmot v2.1.0-beta + WordPress Cluster Demo${NC}                    ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}     ${BOLD}Marmot v2.9.0-beta + WordPress Cluster Demo${NC}                    ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}     3-Node Distributed SQLite powering 3 WordPress instances ${CYAN}║${NC}"
     echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
     echo ""
@@ -54,7 +54,7 @@ start_stack() {
     echo -e "${YELLOW}[1/4]${NC} Cleaning up any existing containers..."
     docker compose down -v 2>/dev/null || true
 
-    echo -e "${YELLOW}[2/4]${NC} Building Marmot v2.1.0-beta image (this may take a few minutes on first run)..."
+    echo -e "${YELLOW}[2/4]${NC} Building Marmot v2.9.0-beta image (this may take a few minutes on first run)..."
     docker compose build
 
     echo -e "${YELLOW}[3/4]${NC} Starting services..."

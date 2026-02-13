@@ -1,4 +1,4 @@
-# Marmot v2.1.0-beta - WordPress Single Node Configuration
+# Marmot v2.9.0-beta - WordPress Single Node Configuration
 
 node_id = 1
 data_dir = "/data"
