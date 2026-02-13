@@ -309,7 +309,7 @@ Events follow the [Debezium envelope structure](https://debezium.io/documentatio
     "before": null,
     "after": {"id": 1, "name": "alice", "email": "alice@example.com"},
     "source": {
-      "version": "2.0.0",
+      "version": "2.1.0-beta",
       "connector": "marmot",
       "name": "marmot",
       "ts_ms": 1702500000000,

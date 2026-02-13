@@ -1,15 +1,14 @@
-# Marmot v2.0 Docker Image
+# Marmot v2.1.0-beta Docker Image
 # Multi-stage build
 
-FROM golang:1.24-bookworm AS builder
+FROM golang:1.26-bookworm AS builder
 
 RUN apt-get update && apt-get install -y gcc libsqlite3-dev
 
 WORKDIR /build
 COPY . .
 
-# Go 1.25.1 required - use GOTOOLCHAIN to fetch it
-ENV GOTOOLCHAIN=auto
+ENV GOEXPERIMENT=greenteagc
 RUN CGO_ENABLED=1 go build -tags "sqlite_preupdate_hook sqlite_fts5 sqlite_json sqlite_math_functions sqlite_foreign_keys sqlite_stat4 sqlite_vacuum_incr" -o marmot-v2 .
 
 # Runtime

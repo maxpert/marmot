@@ -1,5 +1,5 @@
 #!/bin/bash
-# Marmot v2.0 - Read-Only Replica with Transparent Failover
+# Marmot v2.1.0-beta - Read-Only Replica with Transparent Failover
 # Streams from cluster nodes with automatic failover
 
 set -e
@@ -29,7 +29,7 @@ generate_secret() {
 
 REPLICA_SECRET=${3:-${MARMOT_REPLICA_SECRET:-$(generate_secret)}}
 
-echo "=== Marmot v2.0 Read-Only Replica ==="
+echo "=== Marmot v2.1.0-beta Read-Only Replica ==="
 echo "Replica with transparent failover to cluster nodes"
 echo ""
 

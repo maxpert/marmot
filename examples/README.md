@@ -1,4 +1,4 @@
-# Marmot v2.0 Examples
+# Marmot v2.1.0-beta Examples
 
 Quick start examples for running Marmot in different configurations.
 
@@ -122,7 +122,7 @@ Each config includes:
 
 ### Full Database Replication
 
-Marmot v2.0 uses **full database replication**, not partitioning:
+Marmot v2.1.0-beta uses **full database replication**, not partitioning:
 
 - **Every node** has a complete copy of the database
 - **Writes** go to all nodes (broadcast)

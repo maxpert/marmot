@@ -1,5 +1,5 @@
 #!/bin/bash
-# Marmot v2.0 - 2-Node Cluster with Read-Only Replicas
+# Marmot v2.1.0-beta - 2-Node Cluster with Read-Only Replicas
 #
 # Topology:
 #   Node 1 (primary)  ←→  Node 2 (primary)     [2-node cluster with QUORUM writes]
@@ -24,7 +24,7 @@ generate_secret() {
 CLUSTER_SECRET=$(generate_secret)
 REPLICA_SECRET=$(generate_secret)
 
-echo "=== Marmot v2.0 Cluster with Replicas ==="
+echo "=== Marmot v2.1.0-beta Cluster with Replicas ==="
 echo "Starting 2-node cluster + 2 read-only replicas"
 echo ""
 
@@ -60,7 +60,7 @@ generate_node_config() {
     local config_file="/tmp/marmot-cluster/node-${node_id}.toml"
 
     cat > "$config_file" << EOF
-# Marmot v2.0 - Node ${node_id} (auto-generated)
+# Marmot v2.1.0-beta - Node ${node_id} (auto-generated)
 node_id = ${node_id}
 data_dir = "/tmp/marmot-cluster/node-${node_id}"
 
@@ -143,7 +143,7 @@ generate_replica_config() {
     local config_file="/tmp/marmot-cluster/replica-${replica_id}a.toml"
 
     cat > "$config_file" << EOF
-# Marmot v2.0 - Replica ${replica_id}A (auto-generated)
+# Marmot v2.1.0-beta - Replica ${replica_id}A (auto-generated)
 node_id = ${replica_id}00
 data_dir = "/tmp/marmot-cluster/replica-${replica_id}a"
 

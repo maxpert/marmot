@@ -1,4 +1,4 @@
-# Marmot v2.0 - Cluster Node 2 (Primary)
+# Marmot v2.1.0-beta - Cluster Node 2 (Primary)
 # 2-node cluster with read-only replicas
 
 node_id = 2

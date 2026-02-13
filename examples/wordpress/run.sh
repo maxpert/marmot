@@ -15,7 +15,7 @@ NC='\033[0m'
 print_banner() {
     echo ""
     echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║${NC}     ${BOLD}Marmot v2.0 + WordPress Demo${NC}                             ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}     ${BOLD}Marmot v2.1.0-beta + WordPress Demo${NC}                             ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}     Distributed SQLite powering WordPress                    ${CYAN}║${NC}"
     echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
     echo ""
@@ -54,7 +54,7 @@ start_stack() {
     echo -e "${YELLOW}[1/4]${NC} Cleaning up any existing containers..."
     docker compose down -v 2>/dev/null || true
 
-    echo -e "${YELLOW}[2/4]${NC} Building Marmot v2.0 image (this may take a few minutes on first run)..."
+    echo -e "${YELLOW}[2/4]${NC} Building Marmot v2.1.0-beta image (this may take a few minutes on first run)..."
     docker compose build --quiet
 
     echo -e "${YELLOW}[3/4]${NC} Starting services..."
@@ -137,7 +137,7 @@ print_success() {
     echo -e "${GREEN}╚══════════════════════════════════════════════════════════════╝${NC}"
     echo ""
     echo -e "${BOLD}Services Running:${NC}"
-    echo -e "  ${CYAN}Marmot v2.0${NC}  - Distributed SQLite with MySQL protocol"
+    echo -e "  ${CYAN}Marmot v2.1.0-beta${NC}  - Distributed SQLite with MySQL protocol"
     echo -e "  ${CYAN}WordPress${NC}    - Connected to Marmot as its database backend"
     echo ""
     echo -e "${BOLD}Access Points:${NC}"
@@ -153,7 +153,7 @@ print_success() {
     echo ""
     echo -e "${BOLD}Architecture:${NC}"
     echo -e "  ┌─────────────┐    ┌──────────────────┐"
-    echo -e "  │  WordPress  │───>│  Marmot v2.0     │"
+    echo -e "  │  WordPress  │───>│  Marmot v2.1.0-beta     │"
     echo -e "  │  (port 8080)│    │  MySQL: 3316     │"
     echo -e "  └─────────────┘    │  gRPC:  8090     │"
     echo -e "                     │  (internal only) │"

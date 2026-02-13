@@ -1,5 +1,5 @@
 #!/bin/bash
-# Marmot v2.0 - Single Node Example
+# Marmot v2.1.0-beta - Single Node Example
 # Simplest way to run Marmot
 
 set -e
@@ -7,7 +7,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-echo "=== Marmot v2.0 Single Node ==="
+echo "=== Marmot v2.1.0-beta Single Node ==="
 echo ""
 
 # Kill any existing marmot processes
@@ -25,7 +25,7 @@ mkdir -p /tmp/marmot-single
 
 # Create config
 cat > /tmp/marmot-single/config.toml <<'TOML'
-# Marmot v2.0 - Single Node Configuration (Optimized for Benchmarks)
+# Marmot v2.1.0-beta - Single Node Configuration (Optimized for Benchmarks)
 
 node_id = 1
 data_dir = "/tmp/marmot-single"

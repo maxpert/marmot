@@ -54,6 +54,7 @@ jobs:
       GOARCH: ${{ matrix.arch }}
       GOARM:  ${{ matrix.arm }}
       CC:     ${{ matrix.cc }}
+      GOEXPERIMENT: greenteagc
       LDFLAGS: ${{ matrix.static && '-extldflags "-static"' || '' }}
       SUFFIX: "${{ matrix.static && '-static' || ''}}"
       VERSION: "${{ github.event_name == 'release' && github.event.release.tag_name || (startsWith(github.ref, 'refs/tags/') && github.ref_name || github.sha) }}"
@@ -62,7 +63,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: '^1.23'
+          go-version: '1.26.x'
 
       - name: Install cross-compilers
         run: |
@@ -102,6 +103,7 @@ jobs:
       GOOS: darwin
       GOARCH: ${{ matrix.arch }}
       CC: ${{ matrix.cc }}
+      GOEXPERIMENT: greenteagc
       LDFLAGS: ${{ matrix.static && '-extldflags "-static"' || '' }}
       SUFFIX: "${{ matrix.static && '-static' || ''}}"
       VERSION: "${{ github.event_name == 'release' && github.event.release.tag_name || (startsWith(github.ref, 'refs/tags/') && github.ref_name || github.sha) }}"
@@ -110,7 +112,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: '^1.23'
+          go-version: '1.26.x'
 
       - name: Build marmot
         run: |

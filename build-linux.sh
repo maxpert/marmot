@@ -1,9 +1,9 @@
 #!/bin/sh
 
-# Build Marmot v2.0 for Linux (static binary)
+# Build Marmot v2.1.0-beta for Linux (static binary)
 # Requires musl cross-compiler: brew install FiloSottile/musl-cross/musl-cross
 
 CC=x86_64-linux-musl-gcc \
 CXX=x86_64-linux-musl-g++ \
-GOARCH=amd64 GOOS=linux CGO_ENABLED=1 \
+GOARCH=amd64 GOOS=linux CGO_ENABLED=1 GOEXPERIMENT=greenteagc \
 go build -tags "sqlite_preupdate_hook sqlite_fts5 sqlite_json sqlite_math_functions sqlite_foreign_keys sqlite_stat4 sqlite_vacuum_incr" -ldflags "-linkmode external -extldflags -static" -o dist/linux/amd64/marmot-v2
