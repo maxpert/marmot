@@ -35,6 +35,12 @@ type Replicator interface {
 	ReplicateTransaction(ctx context.Context, nodeID uint64, req *ReplicationRequest) (*ReplicationResponse, error)
 }
 
+// StagedPayloadCleaner is implemented by replicators that stage large payloads.
+// CleanupStagedPayload is called when a transaction finishes (commit or abort).
+type StagedPayloadCleaner interface {
+	CleanupStagedPayload(txnID uint64)
+}
+
 // StreamReplicator extends Replicator with streaming capability for large payloads
 type StreamReplicator interface {
 	Replicator
@@ -128,6 +134,7 @@ func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transacti
 	metrics := NewTxnMetrics("write")
 	telemetry.ActiveTransactions.Inc()
 	defer telemetry.ActiveTransactions.Dec()
+	defer wc.cleanupStagedPayloads(txn.ID)
 
 	log.Trace().
 		Uint64("txn_id", txn.ID).
@@ -175,6 +182,15 @@ func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transacti
 	return metrics.RecordSuccess()
 }
 
+func (wc *WriteCoordinator) cleanupStagedPayloads(txnID uint64) {
+	if cleaner, ok := wc.replicator.(StagedPayloadCleaner); ok {
+		cleaner.CleanupStagedPayload(txnID)
+	}
+	if cleaner, ok := wc.localReplicator.(StagedPayloadCleaner); ok {
+		cleaner.CleanupStagedPayload(txnID)
+	}
+}
+
 // validateStatements validates that all CDC statements have required fields for replication
 func (wc *WriteCoordinator) validateStatements(txn *Transaction) error {
 	for i, stmt := range txn.Statements {
@@ -205,6 +221,11 @@ func (wc *WriteCoordinator) buildPrepareRequest(txn *Transaction) *ReplicationRe
 			SQL:       stmt.SQL, // Keep SQL for DDL statements
 			// OldValues: nil - NOT sent in PREPARE
 			// NewValues: nil - NOT sent in PREPARE
+		}
+		// LOAD DATA requires payload bytes during PREPARE so replicas can persist
+		// durable intents with the same content before COMMIT.
+		if stmt.Type == protocol.StatementLoadData {
+			prepareStmts[i].LoadDataPayload = stmt.LoadDataPayload
 		}
 	}
 	return &ReplicationRequest{

@@ -53,6 +53,12 @@ service MarmotService {
   // Forward write query from read-only replica to leader
   rpc ForwardQuery(ForwardQueryRequest) returns (ForwardQueryResponse);
 
+  // Forward LOAD DATA LOCAL INFILE payload from read-only replica to leader.
+  rpc ForwardLoadData(ForwardLoadDataRequest) returns (ForwardQueryResponse);
+
+  // Fetch staged LOAD DATA payload chunk by chunk.
+  rpc GetLoadDataChunk(LoadDataChunkRequest) returns (LoadDataChunkResponse);
+
   // ===== CDC STREAMING =====
   // Client-streaming RPC for large CDC payloads (≥128KB)
   // Sends TransactionChunks followed by TransactionCommit
@@ -151,6 +157,7 @@ message Statement {
   oneof payload {
     RowChange row_change = 4;  // For INSERT/UPDATE/DELETE - actual row data
     DDLChange ddl_change = 5;  // For DDL - SQL statement only
+    LoadDataChange load_data_change = 6; // For LOAD DATA LOCAL INFILE
   }
 }
 
@@ -174,6 +181,14 @@ message RowChange {
 // DDL operations must ship SQL because schema changes cannot be represented as row data
 message DDLChange {
   string sql = 1;  // Transpiled SQLite DDL statement
+}
+
+message LoadDataChange {
+  string sql = 1;  // Original LOAD DATA LOCAL INFILE statement
+  bytes data = 2;  // Optional inline payload (used for replay/streaming)
+  string load_id = 3;      // Staged payload id for pull-based replication
+  uint64 data_size = 4;    // Total staged payload size
+  uint32 chunk_bytes = 5;  // Suggested chunk size for pull
 }
 
 
@@ -368,4 +383,27 @@ message ForwardQueryResponse {
   int64 last_insert_id = 4;
   uint64 committed_txn_id = 5;   // For read-your-writes
   bool in_transaction = 6;       // True if session has active transaction on leader
+}
+
+message ForwardLoadDataRequest {
+  uint64 replica_node_id = 1;
+  uint64 session_id = 2;
+  uint64 request_id = 3;
+  string database = 4;
+  string sql = 5;
+  bytes data = 6;
+  bool wait_for_replication = 7;
+  uint32 timeout_ms = 8;
+}
+
+message LoadDataChunkRequest {
+  uint64 requesting_node_id = 1;
+  string load_id = 2;
+  uint64 offset = 3;
+  uint32 max_bytes = 4;
+}
+
+message LoadDataChunkResponse {
+  bytes data = 1;
+  uint64 total_size = 2;
 }

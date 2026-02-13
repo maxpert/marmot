@@ -623,6 +623,35 @@ TRUNCATE TABLE temp_table;
 
 ---
 
+## LOAD DATA LOCAL INFILE
+
+### Supported Variations
+
+| Syntax | Support | Replication | Notes |
+|--------|---------|-------------|-------|
+| `LOAD DATA LOCAL INFILE 'file.csv' INTO TABLE t ...` | ✅ Full | ✅ Yes | Client-uploaded payload, replicated with 2PC |
+| `LOAD DATA INFILE 'server-path' INTO TABLE t ...` | ❌ Not Supported | - | Server-side file access is not supported |
+
+### Example
+
+```sql
+-- Client must enable LOCAL INFILE capability
+LOAD DATA LOCAL INFILE 'users.csv'
+INTO TABLE users
+FIELDS TERMINATED BY ','
+LINES TERMINATED BY '\n'
+IGNORE 1 LINES
+(id, name, email);
+```
+
+### Behavior
+
+- Payload bytes are uploaded by the client over the MySQL protocol.
+- Cluster members durably stage and apply the same payload through 2PC.
+- In read-only replica mode with `forward_writes = true`, the replica keeps reads local and forwards `LOAD DATA LOCAL INFILE` writes to a writable cluster node.
+
+---
+
 ## DDL Statements
 
 ### CREATE TABLE

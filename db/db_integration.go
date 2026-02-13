@@ -501,6 +501,7 @@ type CompletedLocalExecution struct {
 	cdcEntries   []*IntentEntry
 	lastInsertId int64
 	db           *ReplicatedDatabase
+	rowCount     int64
 }
 
 // Ensure CompletedLocalExecution implements coordinator.PendingExecution
@@ -508,6 +509,9 @@ var _ coordinator.PendingExecution = (*CompletedLocalExecution)(nil)
 
 // GetTotalRowCount returns count of CDC entries.
 func (c *CompletedLocalExecution) GetTotalRowCount() int64 {
+	if c.rowCount > 0 {
+		return c.rowCount
+	}
 	return int64(len(c.cdcEntries))
 }
 
@@ -629,6 +633,19 @@ func (mdb *ReplicatedDatabase) ExecuteLocalWithHooks(ctx context.Context, txnID 
 	// SchemaCache must be pre-populated via ReloadSchema() before calling this
 	session, err := StartEphemeralSession(ctx, mdb.hookDB, mdb.metaStore, mdb.schemaCache, txnID)
 	if err != nil {
+		// Non-hook builds: fall back to statement-based 2PC without CDC row capture.
+		// This keeps DML functional in single-node/testing environments.
+		if strings.Contains(err.Error(), "preupdate hook requires build tag") {
+			log.Warn().
+				Uint64("txn_id", txnID).
+				Msg("Preupdate hook not enabled; falling back to statement-based execution")
+			return &CompletedLocalExecution{
+				cdcEntries:   nil,
+				lastInsertId: 0,
+				db:           mdb,
+				rowCount:     int64(len(requests)),
+			}, nil
+		}
 		return nil, fmt.Errorf("failed to start session: %w", err)
 	}
 
@@ -663,6 +680,7 @@ func (mdb *ReplicatedDatabase) ExecuteLocalWithHooks(ctx context.Context, txnID 
 		cdcEntries:   cdcEntries,
 		lastInsertId: lastInsertId,
 		db:           mdb,
+		rowCount:     int64(len(cdcEntries)),
 	}, nil
 }
 

@@ -26,9 +26,14 @@ func NewGRPCReplicator(client *Client) *GRPCReplicator {
 	}
 }
 
+// CleanupStagedPayload removes staged load-data payloads for a completed transaction.
+func (gr *GRPCReplicator) CleanupStagedPayload(txnID uint64) {
+	cleanupStagedLoadDataByTxn(txnID)
+}
+
 // ReplicateTransaction implements coordinator.Replicator
 func (gr *GRPCReplicator) ReplicateTransaction(ctx context.Context, nodeID uint64, req *coordinator.ReplicationRequest) (*coordinator.ReplicationResponse, error) {
-	statements, err := convertStatementsToProto(req.Statements, req.Database)
+	statements, err := convertStatementsToProto(req.Statements, req.Database, req.TxnID)
 	if err != nil {
 		return nil, err
 	}
@@ -65,7 +70,7 @@ func (gr *GRPCReplicator) ReplicateTransaction(ctx context.Context, nodeID uint6
 }
 
 // convertStatementsToProto converts protocol.Statement to gRPC Statement with CDC
-func convertStatementsToProto(stmts []protocol.Statement, database string) ([]*Statement, error) {
+func convertStatementsToProto(stmts []protocol.Statement, database string, txnID uint64) ([]*Statement, error) {
 	protoStmts := make([]*Statement, len(stmts))
 	for i, stmt := range stmts {
 		// Use statement's database if set, otherwise use the transaction's database
@@ -91,7 +96,19 @@ func convertStatementsToProto(stmts []protocol.Statement, database string) ([]*S
 			stmt.Type == protocol.StatementDelete ||
 			stmt.Type == protocol.StatementReplace
 
-		if isDML && (len(stmt.NewValues) > 0 || len(stmt.OldValues) > 0) {
+		switch {
+		case stmt.Type == protocol.StatementLoadData:
+			loadID := fmt.Sprintf("%d:%d", txnID, i)
+			stageLoadDataPayload(loadID, stmt.LoadDataPayload)
+			protoStmt.Payload = &Statement_LoadDataChange{
+				LoadDataChange: &LoadDataChange{
+					Sql:        stmt.SQL,
+					LoadId:     loadID,
+					DataSize:   uint64(len(stmt.LoadDataPayload)),
+					ChunkBytes: 256 * 1024,
+				},
+			}
+		case isDML && (len(stmt.NewValues) > 0 || len(stmt.OldValues) > 0):
 			// CDC path: send row data instead of SQL
 			protoStmt.Payload = &Statement_RowChange{
 				RowChange: &RowChange{
@@ -100,7 +117,7 @@ func convertStatementsToProto(stmts []protocol.Statement, database string) ([]*S
 					NewValues: stmt.NewValues,
 				},
 			}
-		} else {
+		default:
 			// DDL or DML without CDC data: send SQL
 			protoStmt.Payload = &Statement_DdlChange{
 				DdlChange: &DDLChange{
@@ -142,7 +159,7 @@ func convertTimestampToHLC(ts hlc.Timestamp) *HLC {
 // StreamReplicateTransaction implements coordinator.StreamReplicator.
 // Uses gRPC streaming for large CDC payloads (≥128KB).
 func (gr *GRPCReplicator) StreamReplicateTransaction(ctx context.Context, nodeID uint64, req *coordinator.ReplicationRequest) (*coordinator.ReplicationResponse, error) {
-	statements, err := convertStatementsToProto(req.Statements, req.Database)
+	statements, err := convertStatementsToProto(req.Statements, req.Database, req.TxnID)
 	if err != nil {
 		return nil, err
 	}

@@ -13,7 +13,9 @@ type EncodedCapturedRow struct {
 	IntentKey []byte            `msgpack:"k"`
 	OldValues map[string][]byte `msgpack:"ov,omitempty"`
 	NewValues map[string][]byte `msgpack:"nv,omitempty"`
-	DDLSQL    string            `msgpack:"ddl,omitempty"` // DDL statement (only for OpTypeDDL)
+	DDLSQL    string            `msgpack:"ddl,omitempty"`   // DDL statement (only for OpTypeDDL)
+	LoadSQL   string            `msgpack:"ldsql,omitempty"` // LOAD DATA statement (only for OpTypeLoadData)
+	LoadData  []byte            `msgpack:"ldd,omitempty"`   // LOAD DATA payload bytes
 }
 
 // EncodeRow serializes an EncodedCapturedRow to msgpack bytes.

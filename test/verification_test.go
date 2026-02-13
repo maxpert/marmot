@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"net"
 	"testing"
 	"time"
 
@@ -133,8 +134,8 @@ func TestMySQLServerIntegration(t *testing.T) {
 	// Setup Handler
 	handler := coordinator.NewCoordinatorHandler(1, writeCoord, readCoord, clock, dbMgr, nil, nil, nil)
 
-	// Setup Server
-	port := 3307 // Use non-standard port
+	// Setup server on an ephemeral port to avoid collisions with other tests.
+	port := findFreeTCPPort(t)
 	server := protocol.NewMySQLServer(fmt.Sprintf("127.0.0.1:%d", port), "", 0, handler)
 
 	err = server.Start()
@@ -191,4 +192,12 @@ func TestMySQLServerIntegration(t *testing.T) {
 	// Test snapshot read (Implicit via ExecuteSnapshotRead)
 	// We can't easily verify internal snapshot state here without exposing it,
 	// but success means the read path is working.
+}
+
+func findFreeTCPPort(t *testing.T) int {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer l.Close()
+	return l.Addr().(*net.TCPAddr).Port
 }

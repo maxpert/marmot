@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -46,11 +47,17 @@ func (n *testNode) cleanup() {
 	if n.mysqlConn != nil {
 		n.mysqlConn.Close()
 	}
-	if n.mysqlServer != nil {
-		n.mysqlServer.Stop()
-	}
 	if n.antiEntropy != nil {
 		n.antiEntropy.Stop()
+	}
+	if n.gossip != nil {
+		n.gossip.Stop()
+	}
+	if n.client != nil {
+		_ = n.client.Close()
+	}
+	if n.mysqlServer != nil {
+		n.mysqlServer.Stop()
 	}
 	if n.grpcServer != nil {
 		n.grpcServer.Stop()
@@ -246,6 +253,112 @@ func TestClusterReplication(t *testing.T) {
 	t.Log("All cluster replication tests passed ✓")
 }
 
+func TestClusterLoadDataLocalReplication(t *testing.T) {
+	// Skip if short mode (this is an integration test)
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	// Create 3 nodes with dedicated ports to avoid collisions with other integration tests
+	nodes := make([]*testNode, 3)
+	for i := 0; i < 3; i++ {
+		nodeID := uint64(i + 1)
+		node := &testNode{
+			nodeID:    nodeID,
+			dataDir:   filepath.Join(os.TempDir(), fmt.Sprintf("marmot-load-test-node-%d-%d", nodeID, time.Now().UnixNano())),
+			grpcPort:  18181 + i,
+			mysqlPort: 13407 + i,
+		}
+		nodes[i] = node
+		t.Cleanup(node.cleanup)
+		require.NoError(t, os.MkdirAll(node.dataDir, 0755))
+	}
+
+	// Start nodes sequentially (node 1 as seed)
+	for i, node := range nodes {
+		var seedNodes []string
+		if i > 0 {
+			seedNodes = []string{fmt.Sprintf("localhost:%d", nodes[0].grpcPort)}
+		}
+		startNode(t, node, seedNodes)
+		time.Sleep(startupDelay)
+	}
+
+	// Wait for membership convergence
+	time.Sleep(2 * time.Second)
+	for _, node := range nodes {
+		aliveNodes := node.gossip.GetNodeRegistry().GetAlive()
+		require.GreaterOrEqual(t, len(aliveNodes), 3, "Node %d should see at least 3 nodes", node.nodeID)
+	}
+
+	_, err := nodes[0].mysqlConn.Exec("CREATE TABLE bulk_users (id INT PRIMARY KEY, name TEXT, score INT)")
+	require.NoError(t, err, "Failed to create bulk_users table")
+	waitForReplication(t, "bulk_users table creation")
+	for _, node := range nodes {
+		verifyTableExists(t, node, "bulk_users")
+	}
+
+	// Create LOCAL INFILE payload on disk (header + rows)
+	csvPath := filepath.Join(t.TempDir(), "bulk_users.csv")
+	csvBody := strings.Join([]string{
+		"id,name,score",
+		"1,alice,100",
+		"2,bob,200",
+		"3,charlie,300",
+		"4,dana,400",
+		"5,eve,500",
+		"",
+	}, "\n")
+	require.NoError(t, os.WriteFile(csvPath, []byte(csvBody), 0644))
+
+	// Use a dedicated connection that allows LOCAL INFILE file reads.
+	loadDSN := fmt.Sprintf("root:@tcp(127.0.0.1:%d)/marmot?allowAllFiles=true", nodes[0].mysqlPort)
+	loadConn, err := sql.Open("mysql", loadDSN)
+	require.NoError(t, err)
+	defer loadConn.Close()
+	require.NoError(t, loadConn.Ping())
+
+	loadSQL := fmt.Sprintf(
+		"LOAD DATA LOCAL INFILE '%s' INTO TABLE bulk_users FIELDS TERMINATED BY ',' LINES TERMINATED BY '\\n' IGNORE 1 LINES (id,name,score)",
+		csvPath,
+	)
+	res, err := loadConn.Exec(loadSQL)
+	require.NoError(t, err, "LOAD DATA LOCAL INFILE should succeed")
+
+	rowsAffected, err := res.RowsAffected()
+	require.NoError(t, err)
+	require.Greater(t, rowsAffected, int64(0), "LOAD DATA should report some inserted rows")
+
+	waitForReplication(t, "LOAD DATA LOCAL replication")
+
+	// Verify convergence using existing replication metadata (txn_id + seq_num).
+	// This gives a fast cluster-level barrier before row-by-row assertions.
+	targetTxnID, err := nodes[0].dbMgr.GetMaxTxnID("marmot")
+	require.NoError(t, err, "Failed to get source node max txn_id")
+	targetSeqNum, err := nodes[0].dbMgr.GetMaxSeqNum("marmot")
+	require.NoError(t, err, "Failed to get source node max seq_num")
+	waitForClusterWatermark(t, nodes, "marmot", targetTxnID, targetSeqNum, propagationTimeout)
+
+	for _, node := range nodes {
+		verifyRowCount(t, node, "bulk_users", 5)
+	}
+
+	// Final strict equality check: all nodes must have identical ordered rows.
+	baseline := getOrderedRows(t, nodes[0], "SELECT id, name, score FROM bulk_users ORDER BY id")
+	require.Len(t, baseline, 5)
+	require.Equal(t, []string{
+		"1|alice|100",
+		"2|bob|200",
+		"3|charlie|300",
+		"4|dana|400",
+		"5|eve|500",
+	}, baseline, "Source node should contain expected LOAD DATA rows")
+	for _, node := range nodes[1:] {
+		rows := getOrderedRows(t, node, "SELECT id, name, score FROM bulk_users ORDER BY id")
+		require.Equal(t, baseline, rows, "Node %d should exactly match node %d", node.nodeID, nodes[0].nodeID)
+	}
+}
+
 func startNode(t *testing.T, node *testNode, seedNodes []string) {
 	// Initialize HLC clock
 	node.clock = hlc.NewClock(node.nodeID)
@@ -298,6 +411,7 @@ func startNode(t *testing.T, node *testNode, seedNodes []string) {
 		node.clock,
 		schemaVersionMgr,
 	)
+	replicationHandler.SetClient(client)
 	grpcServer.SetReplicationHandler(replicationHandler)
 	grpcServer.SetDatabaseManager(dbMgr)
 
@@ -410,13 +524,21 @@ func waitForReplication(t *testing.T, description string) {
 }
 
 func verifyTableExists(t *testing.T, node *testNode, tableName string) {
-	var name string
-	err := node.mysqlConn.QueryRow(
-		"SELECT name FROM sqlite_master WHERE type='table' AND name=?",
-		tableName,
-	).Scan(&name)
-	require.NoError(t, err, "Table %s should exist on node %d", tableName, node.nodeID)
-	require.Equal(t, tableName, name)
+	rows, err := node.mysqlConn.Query("SHOW TABLES")
+	require.NoError(t, err, "Failed to list tables on node %d", node.nodeID)
+	defer rows.Close()
+
+	found := false
+	for rows.Next() {
+		var name string
+		require.NoError(t, rows.Scan(&name), "Failed scanning table name on node %d", node.nodeID)
+		if name == tableName {
+			found = true
+			break
+		}
+	}
+	require.NoError(t, rows.Err(), "Error iterating tables on node %d", node.nodeID)
+	require.True(t, found, "Table %s should exist on node %d", tableName, node.nodeID)
 }
 
 func verifyRowCount(t *testing.T, node *testNode, tableName string, expectedCount int) {
@@ -446,4 +568,61 @@ func verifyRowNotExists(t *testing.T, node *testNode, tableName string, id int) 
 	).Scan(&count)
 	require.NoError(t, err, "Failed to check row %d in %s on node %d", id, tableName, node.nodeID)
 	require.Equal(t, 0, count, "Node %d should not have row %d in %s", node.nodeID, id, tableName)
+}
+
+func getOrderedRows(t *testing.T, node *testNode, query string) []string {
+	rows, err := node.mysqlConn.Query(query)
+	require.NoError(t, err, "Failed ordered query on node %d", node.nodeID)
+	defer rows.Close()
+
+	result := make([]string, 0)
+	for rows.Next() {
+		var id int
+		var name string
+		var score int
+		require.NoError(t, rows.Scan(&id, &name, &score))
+		result = append(result, fmt.Sprintf("%d|%s|%d", id, name, score))
+	}
+	require.NoError(t, rows.Err())
+	return result
+}
+
+func waitForClusterWatermark(t *testing.T, nodes []*testNode, database string, targetTxnID, targetSeqNum uint64, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+
+	var lastStatus []string
+	for time.Now().Before(deadline) {
+		allReached := true
+		lastStatus = lastStatus[:0]
+
+		for _, node := range nodes {
+			maxTxnID, txnErr := node.dbMgr.GetMaxTxnID(database)
+			require.NoError(t, txnErr, "Failed to get max txn_id on node %d", node.nodeID)
+			maxSeqNum, seqErr := node.dbMgr.GetMaxSeqNum(database)
+			require.NoError(t, seqErr, "Failed to get max seq_num on node %d", node.nodeID)
+
+			lastStatus = append(lastStatus, fmt.Sprintf("node=%d txn=%d seq=%d", node.nodeID, maxTxnID, maxSeqNum))
+			if maxTxnID < targetTxnID || maxSeqNum < targetSeqNum {
+				allReached = false
+			}
+		}
+
+		if allReached {
+			t.Logf("Cluster watermark reached: target_txn=%d target_seq=%d", targetTxnID, targetSeqNum)
+			return
+		}
+
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	require.FailNowf(
+		t,
+		"cluster watermark timeout",
+		"database=%s target_txn=%d target_seq=%d status=%s",
+		database,
+		targetTxnID,
+		targetSeqNum,
+		strings.Join(lastStatus, "; "),
+	)
 }

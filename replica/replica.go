@@ -195,6 +195,7 @@ func Run() {
 		unixSocketPerm,
 		replica.handler,
 	)
+	mysqlServer.SetLocalInfileEnabled(cfg.Config.MySQL.LocalInfile)
 
 	if err := mysqlServer.Start(); err != nil {
 		log.Fatal().Err(err).Msg("Failed to start MySQL server")

@@ -16,6 +16,12 @@ mysql -h localhost -P 3306 -u root
 # Or use DBeaver, MySQL Workbench, etc.
 ```
 
+If you plan to use bulk ingest with `LOAD DATA LOCAL INFILE`, enable local infile in your client:
+
+```bash
+mysql --local-infile=1 -h localhost -P 3306 -u root
+```
+
 ### Testing Replication
 
 ```bash

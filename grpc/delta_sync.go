@@ -363,6 +363,15 @@ func (ds *DeltaSyncClient) applyChangeEvent(ctx context.Context, event *ChangeEv
 			continue
 		}
 
+		// LOAD DATA path.
+		if loadData := stmt.GetLoadDataChange(); loadData != nil {
+			if _, err := db.ApplyLoadDataInTx(tx, loadData.Sql, loadData.Data); err != nil {
+				return fmt.Errorf("failed to apply LOAD DATA statement: %w", err)
+			}
+			log.Debug().Msg("DELTA-SYNC: Applied LOAD DATA")
+			continue
+		}
+
 		// SQL path: execute SQL statement
 		sql := stmt.GetSQL()
 		if sql == "" {

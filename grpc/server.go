@@ -380,6 +380,37 @@ func (s *Server) ForwardQuery(ctx context.Context, req *ForwardQueryRequest) (*F
 	return handler.HandleForwardQuery(ctx, req)
 }
 
+// ForwardLoadData handles forwarded LOAD DATA LOCAL INFILE payloads from read-only replicas.
+func (s *Server) ForwardLoadData(ctx context.Context, req *ForwardLoadDataRequest) (*ForwardQueryResponse, error) {
+	s.mu.RLock()
+	handler := s.forwardHandler
+	s.mu.RUnlock()
+
+	if handler == nil {
+		return &ForwardQueryResponse{
+			Success:      false,
+			ErrorMessage: "write forwarding not enabled on this node",
+		}, nil
+	}
+
+	return handler.HandleForwardLoadData(ctx, req)
+}
+
+// GetLoadDataChunk returns a staged chunk for pull-based LOAD DATA replication.
+func (s *Server) GetLoadDataChunk(ctx context.Context, req *LoadDataChunkRequest) (*LoadDataChunkResponse, error) {
+	if req.LoadId == "" {
+		return &LoadDataChunkResponse{}, nil
+	}
+	chunk, total, ok := getLoadDataChunk(req.LoadId, req.Offset, req.MaxBytes)
+	if !ok {
+		return &LoadDataChunkResponse{}, nil
+	}
+	return &LoadDataChunkResponse{
+		Data:      chunk,
+		TotalSize: total,
+	}, nil
+}
+
 // Read handles quorum read requests
 // Future Phase: This will support distributed quorum reads across replicas.
 // Currently reads are handled locally via coordinator.ReadCoordinator.
@@ -413,7 +444,8 @@ func (s *Server) sendChangeEvent(rec *db.TransactionRecord, metaStore db.MetaSto
 			wireType := common.MustToWireType(stmtCode)
 
 			var stmt *Statement
-			if db.OpType(row.Op) == db.OpTypeDDL {
+			switch db.OpType(row.Op) {
+			case db.OpTypeDDL:
 				// DDL statement - use DDLChange payload
 				stmt = &Statement{
 					Type:      wireType,
@@ -425,7 +457,19 @@ func (s *Server) sendChangeEvent(rec *db.TransactionRecord, metaStore db.MetaSto
 						},
 					},
 				}
-			} else {
+			case db.OpTypeLoadData:
+				stmt = &Statement{
+					Type:      wireType,
+					TableName: row.Table,
+					Database:  rec.DatabaseName,
+					Payload: &Statement_LoadDataChange{
+						LoadDataChange: &LoadDataChange{
+							Sql:  row.LoadSQL,
+							Data: row.LoadData,
+						},
+					},
+				}
+			default:
 				// DML statement - use RowChange payload
 				stmt = &Statement{
 					Type:      wireType,
@@ -935,20 +979,6 @@ func (s *Server) StreamSnapshot(req *SnapshotRequest, stream MarmotService_Strea
 	if shouldCleanup {
 		defer os.RemoveAll(tempDir)
 	}
-
-	// Filter out system database when serving replicas
-	// Replicas maintain their own independent system DB
-	filteredSnapshots := make([]db.SnapshotInfo, 0, len(snapshots))
-	for _, snap := range snapshots {
-		if snap.Name == db.SystemDatabaseName {
-			log.Debug().
-				Str("database", snap.Name).
-				Msg("Excluding system database from replica snapshot")
-			continue
-		}
-		filteredSnapshots = append(filteredSnapshots, snap)
-	}
-	snapshots = filteredSnapshots
 
 	log.Info().
 		Uint64("requesting_node", req.RequestingNodeId).

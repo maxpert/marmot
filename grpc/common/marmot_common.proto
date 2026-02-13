@@ -14,4 +14,5 @@ enum StatementType {
   DDL = 4;
   CREATE_DATABASE = 5;
   DROP_DATABASE = 6;
+  LOAD_DATA = 7;
 }

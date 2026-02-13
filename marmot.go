@@ -321,6 +321,7 @@ func main() {
 		clock,
 		schemaVersionMgr,
 	)
+	replicationHandler.SetClient(client)
 	grpcServer.SetReplicationHandler(replicationHandler)
 	grpcServer.SetDatabaseManager(dbMgr)
 
@@ -492,6 +493,7 @@ func main() {
 		unixSocketPerm,
 		handler,
 	)
+	mysqlServer.SetLocalInfileEnabled(cfg.Config.MySQL.LocalInfile)
 
 	if err := mysqlServer.Start(); err != nil {
 		log.Fatal().Err(err).Msg("Failed to start MySQL server")

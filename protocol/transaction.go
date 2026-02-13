@@ -147,6 +147,10 @@ type Statement struct {
 	// Used for local execution only - not serialized for CDC replication.
 	// DML ships OldValues/NewValues via CDC, not SQL+params.
 	ExtractedParams []interface{} `msgpack:"-"` // Exclude from msgpack serialization
+
+	// LoadDataPayload carries LOAD DATA LOCAL INFILE file bytes for replicated
+	// non-DML bulk-load transactions.
+	LoadDataPayload []byte `msgpack:"LoadDataPayload,omitempty"`
 }
 
 // Transaction represents a buffered transaction

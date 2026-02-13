@@ -321,7 +321,7 @@ func (h *ClusterHarness) WaitForAlive(nodeID int, timeout time.Duration) error {
 	for {
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("timeout waiting for node %d to become ALIVE", nodeID)
+			return fmt.Errorf("timeout waiting for node %d to become ALIVE; log tail:\n%s", nodeID, h.getNodeLogTail(nodeID, 40))
 		case <-ticker.C:
 			db, err := h.ConnectToNode(nodeID)
 			if err != nil {
@@ -336,6 +336,21 @@ func (h *ClusterHarness) WaitForAlive(nodeID int, timeout time.Duration) error {
 			}
 		}
 	}
+}
+
+func (h *ClusterHarness) getNodeLogTail(nodeID int, lines int) string {
+	if nodeID < 1 || nodeID > len(h.Nodes) {
+		return "invalid node id"
+	}
+	data, err := os.ReadFile(h.Nodes[nodeID-1].LogFile)
+	if err != nil {
+		return fmt.Sprintf("failed to read log: %v", err)
+	}
+	all := strings.Split(string(data), "\n")
+	if lines <= 0 || len(all) <= lines {
+		return strings.Join(all, "\n")
+	}
+	return strings.Join(all[len(all)-lines:], "\n")
 }
 
 func (h *ClusterHarness) ConnectToNode(nodeID int) (*sql.DB, error) {
@@ -613,7 +628,11 @@ func (h *ClusterHarness) Cleanup() {
 		h.t.Logf("Cleaning up cluster harness...")
 		h.StopCluster()
 		time.Sleep(500 * time.Millisecond)
-		os.RemoveAll(h.BaseDir)
+		if h.t.Failed() {
+			h.t.Logf("Preserving test artifacts for debugging: %s", h.BaseDir)
+		} else {
+			os.RemoveAll(h.BaseDir)
+		}
 		h.t.Logf("Cleanup complete")
 	})
 }
@@ -1066,6 +1085,7 @@ func TestHighLoadRecovery(t *testing.T) {
 		t.Fatalf("Failed to restart node 3: %v", err)
 	}
 	if err := harness.WaitForAlive(3, 30*time.Second); err != nil {
+		harness.dumpNodeLogs("highload_restart_alive")
 		t.Fatalf("Node 3 did not become ALIVE: %v", err)
 	}
 

@@ -166,12 +166,18 @@ enabled = true
 bind_address = "0.0.0.0"
 port = 3306
 max_connections = 1000
+local_infile_enabled = true         # Enable LOAD DATA LOCAL INFILE
 auto_id_mode = "compact"  # "compact" (53-bit, default) or "extended" (64-bit)
 ```
 
 **Auto ID Mode:**
 - `"compact"` (default): Generates 53-bit IDs that are safe for all clients including JavaScript (`Number.MAX_SAFE_INTEGER`). Format: 41 bits timestamp + 6 bits node + 6 bits sequence. Supports ~69 years from epoch (Jan 2, 2025) with 64K IDs/sec per node.
 - `"extended"`: Generates full 64-bit HLC-based IDs for maximum uniqueness and ordering guarantees. Use when all clients support 64-bit integers natively.
+
+**`LOAD DATA LOCAL INFILE` Notes:**
+- Supported variant is `LOAD DATA LOCAL INFILE` (client-uploaded bytes).
+- `LOAD DATA INFILE` (server-side file read) is not supported.
+- Client capability must be enabled (for example, `mysql --local-infile=1` or driver-specific local infile flags).
 
 ## Logging
 

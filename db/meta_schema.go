@@ -32,12 +32,13 @@ func (t IntentType) String() string {
 type OpType uint8
 
 const (
-	OpTypeInsert  OpType = 0
-	OpTypeReplace OpType = 1
-	OpTypeUpdate  OpType = 2
-	OpTypeDelete  OpType = 3
-	OpTypeDelta   OpType = 4 // Used for LWW delta sync operations
-	OpTypeDDL     OpType = 5 // DDL schema changes (CREATE/DROP/ALTER TABLE)
+	OpTypeInsert   OpType = 0
+	OpTypeReplace  OpType = 1
+	OpTypeUpdate   OpType = 2
+	OpTypeDelete   OpType = 3
+	OpTypeDelta    OpType = 4 // Used for LWW delta sync operations
+	OpTypeDDL      OpType = 5 // DDL schema changes (CREATE/DROP/ALTER TABLE)
+	OpTypeLoadData OpType = 6 // LOAD DATA LOCAL INFILE bulk load
 )
 
 func (o OpType) String() string {
@@ -54,6 +55,8 @@ func (o OpType) String() string {
 		return "DELTA"
 	case OpTypeDDL:
 		return "DDL"
+	case OpTypeLoadData:
+		return "LOAD_DATA"
 	default:
 		return "UNKNOWN"
 	}
@@ -138,6 +141,15 @@ type DDLSnapshot struct {
 	TableName string `msgpack:"table_name"`
 }
 
+// LoadDataSnapshot is a typed struct for LOAD DATA LOCAL INFILE intents.
+type LoadDataSnapshot struct {
+	Type      int    `msgpack:"type"`
+	Timestamp int64  `msgpack:"timestamp"`
+	SQL       string `msgpack:"sql"`
+	TableName string `msgpack:"table_name"`
+	Data      []byte `msgpack:"data"`
+}
+
 // StatementTypeToOpType converts protocol.StatementCode to OpType.
 // Panics on unknown/unsupported statement type - only DML statements have CDC op types.
 func StatementTypeToOpType(stmtType protocol.StatementCode) OpType {
@@ -169,6 +181,8 @@ func OpTypeToStatementType(op OpType) protocol.StatementCode {
 		return protocol.StatementDelete
 	case OpTypeDDL:
 		return protocol.StatementDDL
+	case OpTypeLoadData:
+		return protocol.StatementLoadData
 	default:
 		panic(fmt.Sprintf("OpTypeToStatementType: unsupported op type %d", op))
 	}

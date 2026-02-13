@@ -30,6 +30,7 @@ func TestAllWireTypesAreMapped(t *testing.T) {
 		pb.StatementType_DDL,
 		pb.StatementType_CREATE_DATABASE,
 		pb.StatementType_DROP_DATABASE,
+		pb.StatementType_LOAD_DATA,
 	}
 	for _, st := range wireTypes {
 		_, ok := wireToCode[st]
@@ -51,6 +52,7 @@ func TestToWireType(t *testing.T) {
 		{"DDL", StatementDDL, pb.StatementType_DDL, true},
 		{"CREATE_DATABASE", StatementCreateDatabase, pb.StatementType_CREATE_DATABASE, true},
 		{"DROP_DATABASE", StatementDropDatabase, pb.StatementType_DROP_DATABASE, true},
+		{"LOAD_DATA", StatementLoadData, pb.StatementType_LOAD_DATA, true},
 		{"UNKNOWN", StatementUnknown, 0, false},
 		{"SELECT", StatementSelect, 0, false}, // SELECT has no wire representation
 	}
@@ -80,6 +82,7 @@ func TestFromWireType(t *testing.T) {
 		{"DDL", pb.StatementType_DDL, StatementDDL, true},
 		{"CREATE_DATABASE", pb.StatementType_CREATE_DATABASE, StatementCreateDatabase, true},
 		{"DROP_DATABASE", pb.StatementType_DROP_DATABASE, StatementDropDatabase, true},
+		{"LOAD_DATA", pb.StatementType_LOAD_DATA, StatementLoadData, true},
 	}
 
 	for _, tt := range tests {
@@ -118,6 +121,7 @@ func TestMustToWireType(t *testing.T) {
 		{"DDL", StatementDDL, pb.StatementType_DDL},
 		{"CREATE_DATABASE", StatementCreateDatabase, pb.StatementType_CREATE_DATABASE},
 		{"DROP_DATABASE", StatementDropDatabase, pb.StatementType_DROP_DATABASE},
+		{"LOAD_DATA", StatementLoadData, pb.StatementType_LOAD_DATA},
 	}
 
 	for _, tt := range tests {
@@ -141,6 +145,7 @@ func TestMustFromWireType(t *testing.T) {
 		{"DDL", pb.StatementType_DDL, StatementDDL},
 		{"CREATE_DATABASE", pb.StatementType_CREATE_DATABASE, StatementCreateDatabase},
 		{"DROP_DATABASE", pb.StatementType_DROP_DATABASE, StatementDropDatabase},
+		{"LOAD_DATA", pb.StatementType_LOAD_DATA, StatementLoadData},
 	}
 
 	for _, tt := range tests {

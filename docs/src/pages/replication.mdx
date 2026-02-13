@@ -91,6 +91,18 @@ Commit locally
 Cleanup intents
 ```
 
+### Special Case: `LOAD DATA LOCAL INFILE`
+
+`LOAD DATA LOCAL INFILE` is replicated as a bulk-load operation with payload transfer, not as row-by-row CDC extraction:
+
+1. Coordinator receives file bytes from client over MySQL protocol.
+2. PREPARE broadcasts load metadata (`load_id`, payload size, chunk hint).
+3. Replicas pull payload chunks from coordinator and persist durable LOAD intents.
+4. COMMIT applies the same payload locally on each node.
+5. Operation is recorded in CDC stream for replay/catch-up.
+
+This keeps `LOAD DATA LOCAL INFILE` deterministic and durable across cluster members while preserving normal 2PC quorum semantics.
+
 ### Example: 2PC for UPDATE users SET balance = 75 WHERE id = 1
 
 **Step 1: Node 1 (Coordinator) executes locally**

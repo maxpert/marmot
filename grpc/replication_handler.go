@@ -21,6 +21,7 @@ type ReplicationHandler struct {
 	clock            *hlc.Clock
 	schemaVersionMgr *db.SchemaVersionManager
 	engine           *db.ReplicationEngine
+	client           *Client
 }
 
 // NewReplicationHandler creates a new replication handler
@@ -32,6 +33,11 @@ func NewReplicationHandler(nodeID uint64, dbMgr *db.DatabaseManager, clock *hlc.
 		schemaVersionMgr: schemaVersionMgr,
 		engine:           db.NewReplicationEngine(nodeID, dbMgr, clock),
 	}
+}
+
+// SetClient wires the gRPC client used for pull-based LOAD DATA chunk fetches.
+func (rh *ReplicationHandler) SetClient(client *Client) {
+	rh.client = client
 }
 
 // HandleReplicateTransaction handles incoming transaction replication requests.
@@ -105,6 +111,20 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 			internalStmt.OldValues = rowChange.OldValues
 			internalStmt.NewValues = rowChange.NewValues
 		}
+		if loadData := stmt.GetLoadDataChange(); loadData != nil {
+			internalStmt.SQL = loadData.Sql
+			internalStmt.LoadDataPayload = loadData.Data
+			if len(internalStmt.LoadDataPayload) == 0 && loadData.LoadId != "" {
+				payload, err := rh.pullLoadDataPayload(ctx, req.SourceNodeId, loadData.LoadId, loadData.DataSize, loadData.ChunkBytes)
+				if err != nil {
+					return &TransactionResponse{
+						Success:      false,
+						ErrorMessage: fmt.Sprintf("failed to fetch LOAD DATA payload during prepare: %v", err),
+					}, nil
+				}
+				internalStmt.LoadDataPayload = payload
+			}
+		}
 		statements = append(statements, internalStmt)
 	}
 
@@ -166,6 +186,10 @@ func (rh *ReplicationHandler) handleCommit(ctx context.Context, req *Transaction
 			internalStmt.OldValues = rowChange.OldValues
 			internalStmt.NewValues = rowChange.NewValues
 		}
+		if loadData := stmt.GetLoadDataChange(); loadData != nil {
+			internalStmt.SQL = loadData.Sql
+			internalStmt.LoadDataPayload = loadData.Data
+		}
 		statements = append(statements, internalStmt)
 	}
 
@@ -203,6 +227,45 @@ func (rh *ReplicationHandler) handleCommit(ctx context.Context, req *Transaction
 			NodeId:   rh.nodeID,
 		},
 	}, nil
+}
+
+func (rh *ReplicationHandler) pullLoadDataPayload(ctx context.Context, sourceNodeID uint64, loadID string, expectedSize uint64, chunkBytes uint32) ([]byte, error) {
+	if sourceNodeID == 0 {
+		return nil, fmt.Errorf("invalid source node id")
+	}
+	if rh.client == nil {
+		return nil, fmt.Errorf("client not configured")
+	}
+	if chunkBytes == 0 {
+		chunkBytes = 256 * 1024
+	}
+
+	var out []byte
+	offset := uint64(0)
+	for {
+		resp, err := rh.client.GetLoadDataChunk(ctx, sourceNodeID, &LoadDataChunkRequest{
+			RequestingNodeId: rh.nodeID,
+			LoadId:           loadID,
+			Offset:           offset,
+			MaxBytes:         chunkBytes,
+		})
+		if err != nil {
+			return nil, err
+		}
+		if resp == nil || len(resp.Data) == 0 {
+			break
+		}
+		out = append(out, resp.Data...)
+		offset += uint64(len(resp.Data))
+		if resp.TotalSize > 0 && offset >= resp.TotalSize {
+			break
+		}
+	}
+
+	if expectedSize > 0 && uint64(len(out)) != expectedSize {
+		return nil, fmt.Errorf("payload size mismatch: got %d want %d", len(out), expectedSize)
+	}
+	return out, nil
 }
 
 // handleAbort processes abort: Rollback transaction
@@ -304,6 +367,18 @@ func (rh *ReplicationHandler) handleReplay(ctx context.Context, req *Transaction
 				return &TransactionResponse{
 					Success:      false,
 					ErrorMessage: fmt.Sprintf("failed to execute DDL: %v", err),
+				}, nil
+			}
+			continue
+		}
+
+		// LOAD DATA path: apply via shared bulk-load executor.
+		if loadData := stmt.GetLoadDataChange(); loadData != nil {
+			if _, err := db.ApplyLoadDataInTx(tx, loadData.Sql, loadData.Data); err != nil {
+				telemetry.ReplicationRequestsTotal.With("replay", "failed").Inc()
+				return &TransactionResponse{
+					Success:      false,
+					ErrorMessage: fmt.Sprintf("failed to apply LOAD DATA: %v", err),
 				}, nil
 			}
 			continue

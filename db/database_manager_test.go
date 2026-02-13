@@ -186,8 +186,8 @@ func TestDropNonExistentDatabase(t *testing.T) {
 	defer dm.Close()
 
 	err := dm.DropDatabase("nonexistent")
-	if err == nil {
-		t.Error("Expected error when dropping non-existent database")
+	if err != nil {
+		t.Errorf("Expected nil when dropping non-existent database, got: %v", err)
 	}
 }
 

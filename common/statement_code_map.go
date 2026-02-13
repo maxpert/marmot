@@ -23,6 +23,7 @@ var (
 		StatementDDL:            pb.StatementType_DDL,
 		StatementCreateDatabase: pb.StatementType_CREATE_DATABASE,
 		StatementDropDatabase:   pb.StatementType_DROP_DATABASE,
+		StatementLoadData:       pb.StatementType_LOAD_DATA,
 	}
 
 	// Wire StatementType -> Internal StatementCode
@@ -34,6 +35,7 @@ var (
 		pb.StatementType_DDL:             StatementDDL,
 		pb.StatementType_CREATE_DATABASE: StatementCreateDatabase,
 		pb.StatementType_DROP_DATABASE:   StatementDropDatabase,
+		pb.StatementType_LOAD_DATA:       StatementLoadData,
 	}
 )
 

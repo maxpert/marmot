@@ -27,6 +27,7 @@ type Transaction struct {
 	CommitTS              hlc.Timestamp
 	Status                TxnStatus
 	Statements            []protocol.Statement
+	StatementFallback     bool   // Execute SQL statements directly when CDC hooks are unavailable
 	RequiredSchemaVersion uint64 // Minimum schema version required for this transaction
 	mu                    sync.RWMutex
 }
@@ -266,7 +267,7 @@ func (tm *TransactionManager) CommitTransaction(txn *Transaction) error {
 			txn.Statements = tm.rebuildStatementsFromCDC(cdcEntries, nil)
 		}
 	} else {
-		// DDL path: flush pending DML first to ensure isolation
+		// Statement/DDL path: flush pending DML first to ensure isolation
 		if tm.batchCommitEnabled() {
 			tm.batchCommitter.Flush()
 		}
@@ -275,11 +276,20 @@ func (tm *TransactionManager) CommitTransaction(txn *Transaction) error {
 		if err != nil {
 			return fmt.Errorf("failed to fetch write intents: %w", err)
 		}
-		if err := tm.applyDDLIntents(txn.ID, intents); err != nil {
+
+		// Non-hook fallback: when explicitly marked by replication/coordination
+		// path, apply concrete DML SQL directly in commit phase.
+		if txn.StatementFallback {
+			if err := tm.applyStatementFallbackDML(txn.ID, txn.Statements); err != nil {
+				return err
+			}
+		}
+
+		if err := tm.applyNonDMLIntents(txn.ID, intents); err != nil {
 			return err
 		}
-		// Write DDL statements to CDC storage for streaming replication
-		if err := tm.writeDDLToCDC(txn.ID, intents); err != nil {
+		// Write non-DML statements to CDC storage for streaming replication
+		if err := tm.writeNonDMLToCDC(txn.ID, intents); err != nil {
 			return err
 		}
 		txn.Statements = tm.rebuildStatementsFromCDC(nil, intents)
@@ -301,6 +311,61 @@ func (tm *TransactionManager) CommitTransaction(txn *Transaction) error {
 	return nil
 }
 
+func isStatementFallbackDML(stmt protocol.Statement) bool {
+	if len(stmt.OldValues) > 0 || len(stmt.NewValues) > 0 {
+		return false
+	}
+	if stmt.SQL == "" {
+		return false
+	}
+	switch stmt.Type {
+	case protocol.StatementInsert, protocol.StatementUpdate, protocol.StatementDelete, protocol.StatementReplace:
+		return true
+	default:
+		return false
+	}
+}
+
+// applyStatementFallbackDML executes DML SQL directly when CDC hooks were not available.
+func (tm *TransactionManager) applyStatementFallbackDML(txnID uint64, statements []protocol.Statement) error {
+	if len(statements) == 0 {
+		return nil
+	}
+
+	tx, err := tm.db.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin fallback DML transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	applied := 0
+	for _, stmt := range statements {
+		if !isStatementFallbackDML(stmt) {
+			continue
+		}
+		if len(stmt.ExtractedParams) > 0 {
+			if _, err := tx.Exec(stmt.SQL, stmt.ExtractedParams...); err != nil {
+				return fmt.Errorf("failed to execute fallback DML: %w", err)
+			}
+		} else {
+			if _, err := tx.Exec(stmt.SQL); err != nil {
+				return fmt.Errorf("failed to execute fallback DML: %w", err)
+			}
+		}
+		applied++
+	}
+
+	if applied == 0 {
+		return nil
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit fallback DML transaction: %w", err)
+	}
+
+	log.Debug().Uint64("txn_id", txnID).Int("statement_count", applied).Msg("Applied statement-based DML fallback")
+	return nil
+}
+
 // calculateCommitTS determines the commit timestamp (must be > start_ts).
 func (tm *TransactionManager) calculateCommitTS(startTS hlc.Timestamp) hlc.Timestamp {
 	commitTS := tm.clock.Now()
@@ -312,7 +377,7 @@ func (tm *TransactionManager) calculateCommitTS(startTS hlc.Timestamp) hlc.Times
 }
 
 // rebuildStatementsFromCDC reconstructs protocol.Statement slice from CDC entries
-// and DDL intents for in-memory transaction tracking.
+// and non-DML intents for in-memory transaction tracking.
 func (tm *TransactionManager) rebuildStatementsFromCDC(cdcEntries []*IntentEntry, intents []*WriteIntentRecord) []protocol.Statement {
 	statements := make([]protocol.Statement, 0, len(cdcEntries)+len(intents))
 
@@ -328,26 +393,31 @@ func (tm *TransactionManager) rebuildStatementsFromCDC(cdcEntries []*IntentEntry
 		statements = append(statements, stmt)
 	}
 
-	// Add DDL statements from intents (only if no CDC entries - DDL-only transactions)
+	// Add non-DML statements from intents (only if no CDC entries)
 	if len(cdcEntries) == 0 {
-		// Filter and sort DDL intents by CreatedAt to preserve execution order
-		ddlIntents := make([]*WriteIntentRecord, 0, len(intents))
+		// Filter and sort non-DML intents by CreatedAt to preserve execution order.
+		nonDMLIntents := make([]*WriteIntentRecord, 0, len(intents))
 		for _, intent := range intents {
 			if intent.IntentType == IntentTypeDDL && intent.SQLStatement != "" {
-				ddlIntents = append(ddlIntents, intent)
+				nonDMLIntents = append(nonDMLIntents, intent)
 			}
 		}
 
-		// Sort by CreatedAt to ensure CREATE TABLE comes before CREATE INDEX, etc.
-		sort.Slice(ddlIntents, func(i, j int) bool {
-			return ddlIntents[i].CreatedAt < ddlIntents[j].CreatedAt
+		// Sort by CreatedAt to ensure deterministic execution order.
+		sort.Slice(nonDMLIntents, func(i, j int) bool {
+			return nonDMLIntents[i].CreatedAt < nonDMLIntents[j].CreatedAt
 		})
 
-		for _, intent := range ddlIntents {
+		for _, intent := range nonDMLIntents {
 			stmt := protocol.Statement{
 				TableName: intent.TableName,
 				SQL:       intent.SQLStatement,
 				Type:      protocol.StatementDDL,
+			}
+			var loadSnap LoadDataSnapshot
+			if err := DeserializeData(intent.DataSnapshot, &loadSnap); err == nil && loadSnap.Type == int(protocol.StatementLoadData) {
+				stmt.Type = protocol.StatementLoadData
+				stmt.LoadDataPayload = loadSnap.Data
 			}
 			statements = append(statements, stmt)
 		}
@@ -395,37 +465,39 @@ func (tm *TransactionManager) applyCDCEntries(txnID uint64, entries []*IntentEnt
 	return nil
 }
 
-// applyDDLIntents executes DDL statements from write intents.
-// Only processes intents with IntentType == IntentTypeDDL.
-// DML intents are handled via CDC entries in applyCDCEntries.
-// CRITICAL: DDL statements must be executed in the order they were added to the transaction.
-// For example, CREATE TABLE must execute before CREATE INDEX on that table.
-func (tm *TransactionManager) applyDDLIntents(txnID uint64, intents []*WriteIntentRecord) error {
-	// Filter DDL intents
-	ddlIntents := make([]*WriteIntentRecord, 0, len(intents))
+// applyNonDMLIntents executes DDL and LOAD DATA statements from write intents.
+func (tm *TransactionManager) applyNonDMLIntents(txnID uint64, intents []*WriteIntentRecord) error {
+	nonDMLIntents := make([]*WriteIntentRecord, 0, len(intents))
 	for _, intent := range intents {
 		if intent.IntentType == IntentTypeDDL && intent.SQLStatement != "" {
-			ddlIntents = append(ddlIntents, intent)
+			nonDMLIntents = append(nonDMLIntents, intent)
 		}
 	}
 
-	// Sort DDL intents by CreatedAt timestamp to preserve execution order
-	// This ensures CREATE TABLE executes before CREATE INDEX, etc.
-	sort.Slice(ddlIntents, func(i, j int) bool {
-		return ddlIntents[i].CreatedAt < ddlIntents[j].CreatedAt
+	sort.Slice(nonDMLIntents, func(i, j int) bool {
+		return nonDMLIntents[i].CreatedAt < nonDMLIntents[j].CreatedAt
 	})
 
-	// Execute DDL statements in order
-	for _, intent := range ddlIntents {
+	hasDDL := false
+	for _, intent := range nonDMLIntents {
+		var loadSnap LoadDataSnapshot
+		if err := DeserializeData(intent.DataSnapshot, &loadSnap); err == nil && loadSnap.Type == int(protocol.StatementLoadData) {
+			if _, err := ApplyLoadData(tm.db, loadSnap.SQL, loadSnap.Data); err != nil {
+				return fmt.Errorf("failed to execute LOAD DATA statement: %w", err)
+			}
+			log.Debug().Uint64("txn_id", txnID).Msg("LOAD DATA statement executed")
+			continue
+		}
 		if _, err := tm.db.Exec(intent.SQLStatement); err != nil {
 			return fmt.Errorf("failed to execute DDL statement: %w", err)
 		}
+		hasDDL = true
 
 		log.Debug().Uint64("txn_id", txnID).Str("sql", intent.SQLStatement).Msg("DDL statement executed")
 	}
 
-	// Reload schema cache after DDL operations
-	if len(ddlIntents) > 0 && tm.schemaCache != nil {
+	// Reload schema cache after DDL operations.
+	if hasDDL && tm.schemaCache != nil {
 		if err := tm.reloadSchemaCache(); err != nil {
 			log.Warn().Err(err).Uint64("txn_id", txnID).Msg("Failed to reload schema cache after DDL")
 		}
@@ -434,9 +506,8 @@ func (tm *TransactionManager) applyDDLIntents(txnID uint64, intents []*WriteInte
 	return nil
 }
 
-// writeDDLToCDC writes DDL statements to CDC storage for streaming replication.
-// This ensures DDL changes can be replicated to followers via the change stream.
-func (tm *TransactionManager) writeDDLToCDC(txnID uint64, intents []*WriteIntentRecord) error {
+// writeNonDMLToCDC writes DDL/LOAD DATA statements to CDC storage for streaming replication.
+func (tm *TransactionManager) writeNonDMLToCDC(txnID uint64, intents []*WriteIntentRecord) error {
 	var seq uint64
 
 	for _, intent := range intents {
@@ -444,15 +515,24 @@ func (tm *TransactionManager) writeDDLToCDC(txnID uint64, intents []*WriteIntent
 			continue
 		}
 
+		var loadSnap LoadDataSnapshot
+		isLoadData := DeserializeData(intent.DataSnapshot, &loadSnap) == nil && loadSnap.Type == int(protocol.StatementLoadData)
+
 		row := &EncodedCapturedRow{
-			Table:  intent.TableName,
-			Op:     uint8(OpTypeDDL),
-			DDLSQL: intent.SQLStatement,
+			Table: intent.TableName,
+		}
+		if isLoadData {
+			row.Op = uint8(OpTypeLoadData)
+			row.LoadSQL = loadSnap.SQL
+			row.LoadData = loadSnap.Data
+		} else {
+			row.Op = uint8(OpTypeDDL)
+			row.DDLSQL = intent.SQLStatement
 		}
 
 		data, err := EncodeRow(row)
 		if err != nil {
-			return fmt.Errorf("failed to encode DDL row: %w", err)
+			return fmt.Errorf("failed to encode non-DML row: %w", err)
 		}
 
 		if err := tm.metaStore.WriteCapturedRow(txnID, seq, data); err != nil {
@@ -460,7 +540,11 @@ func (tm *TransactionManager) writeDDLToCDC(txnID uint64, intents []*WriteIntent
 		}
 
 		seq++
-		log.Debug().Uint64("txn_id", txnID).Str("ddl", intent.SQLStatement).Msg("DDL written to CDC for streaming")
+		if isLoadData {
+			log.Debug().Uint64("txn_id", txnID).Msg("LOAD DATA written to CDC for streaming")
+		} else {
+			log.Debug().Uint64("txn_id", txnID).Str("ddl", intent.SQLStatement).Msg("DDL written to CDC for streaming")
+		}
 	}
 
 	return nil

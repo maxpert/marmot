@@ -193,6 +193,55 @@ func (h *ReadOnlyHandler) HandleQuery(session *protocol.ConnectionSession, sql s
 	return h.executeLocalRead(stmt, params)
 }
 
+// HandleLoadData forwards LOAD DATA LOCAL INFILE as a single operation to the leader.
+func (h *ReadOnlyHandler) HandleLoadData(session *protocol.ConnectionSession, sql string, data []byte) (*protocol.ResultSet, error) {
+	stmt := protocol.ParseStatement(sql)
+	if stmt.Type != protocol.StatementLoadData {
+		return nil, fmt.Errorf("ERROR 1105 (HY000): statement is not LOAD DATA")
+	}
+	if !h.forwardWrites {
+		return nil, protocol.ErrReadOnly()
+	}
+
+	client := h.replica.streamClient.GetClient()
+	if client == nil {
+		return nil, fmt.Errorf("ERROR 2003 (HY000): Not connected to leader")
+	}
+
+	requestID := session.NextForwardRequestID()
+	resp, err := h.forwardLoadDataWithRetry(client, &marmotgrpc.ForwardLoadDataRequest{
+		ReplicaNodeId:      h.replica.streamClient.GetNodeID(),
+		SessionId:          session.ConnID,
+		RequestId:          requestID,
+		Database:           session.CurrentDatabase,
+		Sql:                sql,
+		Data:               data,
+		WaitForReplication: session.WaitForReplication,
+		TimeoutMs:          uint32(h.forwardTimeout.Milliseconds()),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("ERROR 2013 (HY000): Lost connection to leader during query: %v", err)
+	}
+	if !resp.Success {
+		return nil, fmt.Errorf("ERROR 1105 (HY000): %s", resp.ErrorMessage)
+	}
+
+	session.LastInsertId.Store(resp.LastInsertId)
+	session.ForwardedTxnActive = resp.InTransaction
+
+	if session.WaitForReplication && resp.CommittedTxnId > 0 {
+		if err := h.waitForReplication(session.CurrentDatabase, resp.CommittedTxnId); err != nil {
+			log.Warn().Err(err).Uint64("txn_id", resp.CommittedTxnId).Msg("Timeout waiting for replication")
+		}
+	}
+
+	return &protocol.ResultSet{
+		RowsAffected:   resp.RowsAffected,
+		LastInsertId:   resp.LastInsertId,
+		CommittedTxnId: resp.CommittedTxnId,
+	}, nil
+}
+
 // handleSystemQuery handles MySQL system variable queries
 func (h *ReadOnlyHandler) handleSystemQuery(session *protocol.ConnectionSession, stmt protocol.Statement) (*protocol.ResultSet, error) {
 	config := handlers.SystemVarConfig{
@@ -468,6 +517,28 @@ func (h *ReadOnlyHandler) forwardQueryWithRetry(
 	return h.forwardQueryOnce(client, req)
 }
 
+func (h *ReadOnlyHandler) forwardLoadDataWithRetry(
+	client marmotgrpc.MarmotServiceClient,
+	req *marmotgrpc.ForwardLoadDataRequest,
+) (*marmotgrpc.ForwardQueryResponse, error) {
+	resp, err := h.forwardLoadDataOnce(client, req)
+	if err == nil {
+		return resp, nil
+	}
+
+	if !isRetriableForwardError(err) {
+		return nil, err
+	}
+
+	log.Warn().
+		Err(err).
+		Uint64("session_id", req.SessionId).
+		Uint64("request_id", req.RequestId).
+		Msg("Forward load data failed with retriable error, retrying once with same request_id")
+
+	return h.forwardLoadDataOnce(client, req)
+}
+
 func (h *ReadOnlyHandler) forwardQueryOnce(
 	client marmotgrpc.MarmotServiceClient,
 	req *marmotgrpc.ForwardQueryRequest,
@@ -475,6 +546,15 @@ func (h *ReadOnlyHandler) forwardQueryOnce(
 	ctx, cancel := context.WithTimeout(context.Background(), h.forwardTimeout)
 	defer cancel()
 	return client.ForwardQuery(ctx, req)
+}
+
+func (h *ReadOnlyHandler) forwardLoadDataOnce(
+	client marmotgrpc.MarmotServiceClient,
+	req *marmotgrpc.ForwardLoadDataRequest,
+) (*marmotgrpc.ForwardQueryResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), h.forwardTimeout)
+	defer cancel()
+	return client.ForwardLoadData(ctx, req)
 }
 
 func isRetriableForwardError(err error) bool {

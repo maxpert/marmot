@@ -61,6 +61,7 @@ func TestOpTypeToStatementType(t *testing.T) {
 		{"OpTypeUpdate maps to StatementUpdate", OpTypeUpdate, protocol.StatementUpdate},
 		{"OpTypeDelete maps to StatementDelete", OpTypeDelete, protocol.StatementDelete},
 		{"OpTypeDDL maps to StatementDDL", OpTypeDDL, protocol.StatementDDL},
+		{"OpTypeLoadData maps to StatementLoadData", OpTypeLoadData, protocol.StatementLoadData},
 	}
 
 	for _, tt := range tests {
@@ -171,6 +172,9 @@ func TestOpTypeEnumValues(t *testing.T) {
 	if int(OpTypeDDL) != 5 {
 		t.Errorf("OpTypeDDL should be 5, got %d", OpTypeDDL)
 	}
+	if int(OpTypeLoadData) != 6 {
+		t.Errorf("OpTypeLoadData should be 6, got %d", OpTypeLoadData)
+	}
 }
 
 // TestOpTypeString verifies String() method returns correct values.
@@ -185,6 +189,7 @@ func TestOpTypeString(t *testing.T) {
 		{OpTypeDelete, "DELETE"},
 		{OpTypeDelta, "DELTA"},
 		{OpTypeDDL, "DDL"},
+		{OpTypeLoadData, "LOAD_DATA"},
 		{OpType(99), "UNKNOWN"},
 	}
 

@@ -15,6 +15,7 @@ Marmot v2 is a leaderless, distributed SQLite replication system built on a goss
 - **Distributed Transactions**: Percolator-style write intents with conflict detection
 - **Multi-Database Support**: Create and manage multiple databases per cluster
 - **DDL Replication**: Distributed schema changes with automatic idempotency and cluster-wide locking
+- **Replicated Bulk Load**: `LOAD DATA LOCAL INFILE` with distributed commit semantics
 - **Production-Ready SQL Parser**: Powered by rqlite/sql AST parser for MySQL→SQLite transpilation
 - **CDC-Based Replication**: Row-level change data capture for consistent replication
 
@@ -398,7 +399,7 @@ Marmot supports a wide range of MySQL/SQLite statements through its MySQL protoc
 | `UPDATE` | ✅ Full | ✅ Yes | Includes qualified table names |
 | `DELETE` | ✅ Full | ✅ Yes | Includes qualified table names |
 | `SELECT` | ✅ Full | N/A | Read operations |
-| `LOAD DATA` | ✅ Full | ✅ Yes | Bulk data loading |
+| `LOAD DATA LOCAL INFILE` | ✅ Full | ✅ Yes | Replicated bulk loading (cluster + forwarded replica writes) |
 | **DDL - Data Definition** |
 | `CREATE TABLE` | ✅ Full | ✅ Yes | Replicated with cluster-wide locking |
 | `ALTER TABLE` | ✅ Full | ✅ Yes | Replicated with cluster-wide locking |
@@ -456,6 +457,8 @@ Marmot supports a wide range of MySQL/SQLite statements through its MySQL protoc
 4. **Table Locking**: `LOCK TABLES` statements are recognized but not enforced across the cluster. Use application-level coordination for distributed locking needs.
 
 5. **Qualified Names**: Marmot fully supports qualified table names (e.g., `db.table`) in DML and DDL operations.
+
+6. **`LOAD DATA` Scope**: Marmot supports `LOAD DATA LOCAL INFILE` (client-uploaded file bytes). `LOAD DATA INFILE` (server-side file access) is not supported.
 
 ## SQLite Extensions
 
@@ -854,6 +857,8 @@ reconnect_max_backoff_seconds = 30               # Max reconnect backoff (defaul
 initial_sync_timeout_minutes = 30                # Timeout for initial snapshot (default: 30)
 snapshot_concurrency = 3                         # Parallel snapshot downloads (default: 3)
 snapshot_cache_ttl_seconds = 30                  # Snapshot cache TTL in seconds (default: 30)
+forward_writes = false                           # Forward writes to cluster nodes (default: false)
+forward_write_timeout_sec = 30                   # Timeout for forwarded writes (default: 30s)
 ```
 
 You can also specify follow addresses via CLI:
@@ -895,7 +900,9 @@ Control download concurrency with `snapshot_concurrency`:
 - Partial failure handling: continues even if some databases fail
 - Failed databases retry in background with exponential backoff
 
-**Note:** Replica mode is mutually exclusive with cluster mode. A replica receives all data via streaming replication but cannot accept writes. It automatically discovers cluster nodes and fails over to another node if the current source becomes unavailable.
+**Write forwarding in replica mode:** Reads stay local. If `forward_writes = true`, writes (including `LOAD DATA LOCAL INFILE`) are transparently proxied to a writable cluster node.
+
+**Note:** Replica mode is mutually exclusive with cluster mode. A replica receives all data via streaming replication and automatically discovers cluster nodes and fails over to another node if the current source becomes unavailable.
 
 ### Replication
 
@@ -954,6 +961,7 @@ port = 3306
 max_connections = 1000
 unix_socket = ""              # Unix socket path (empty = disabled)
 unix_socket_perm = 0660       # Socket file permissions
+local_infile_enabled = true   # Enable LOAD DATA LOCAL INFILE
 auto_id_mode = "compact"      # "compact" (53-bit, JS-safe) or "extended" (64-bit)
 ```
 
@@ -961,6 +969,10 @@ auto_id_mode = "compact"      # "compact" (53-bit, JS-safe) or "extended" (64-bi
 ```bash
 mysql --socket=/tmp/marmot/mysql.sock -u root
 ```
+
+**`LOAD DATA LOCAL INFILE` requirements:**
+- Server: `mysql.local_infile_enabled = true`
+- Client capability enabled (for example: `mysql --local-infile=1`, or driver-specific local infile flag)
 
 ### CDC Publisher
 

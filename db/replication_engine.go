@@ -180,6 +180,10 @@ func (re *ReplicationEngine) processStatement(txn *Transaction, txnMgr *Transact
 
 	intentKey := stmt.IntentKey
 	if len(intentKey) == 0 {
+		if stmt.Type == protocol.StatementLoadData {
+			return re.createLoadDataIntent(txnMgr, txn, stmt, req.StartTS)
+		}
+
 		if stmt.Type == protocol.StatementInsert {
 			log.Trace().
 				Str("table", stmt.TableName).
@@ -203,6 +207,36 @@ func (re *ReplicationEngine) processStatement(txn *Transaction, txnMgr *Transact
 	}
 
 	return re.createDMLIntent(txnMgr, metaStore, txn, stmt, string(intentKey), req, stmtSeq)
+}
+
+// createLoadDataIntent creates a durable intent for LOAD DATA LOCAL INFILE statements.
+func (re *ReplicationEngine) createLoadDataIntent(txnMgr *TransactionManager, txn *Transaction, stmt protocol.Statement, startTS hlc.Timestamp) *PrepareResult {
+	loadIntentKey := filter.EncodeDDLIntentKey(stmt.TableName)
+
+	snapshotData := LoadDataSnapshot{
+		Type:      int(stmt.Type),
+		Timestamp: startTS.WallTime,
+		SQL:       stmt.SQL,
+		TableName: stmt.TableName,
+		Data:      stmt.LoadDataPayload,
+	}
+	dataSnapshot, serErr := SerializeData(snapshotData)
+	if serErr != nil {
+		_ = txnMgr.AbortTransaction(txn)
+		return &PrepareResult{Success: false, Error: fmt.Sprintf("failed to serialize LOAD DATA payload: %v", serErr)}
+	}
+
+	if err := txnMgr.WriteIntent(txn, IntentTypeDDL, stmt.TableName, string(loadIntentKey), stmt, dataSnapshot); err != nil {
+		_ = txnMgr.AbortTransaction(txn)
+		return &PrepareResult{
+			Success:          false,
+			Error:            fmt.Sprintf("LOAD DATA conflict: %v", err),
+			ConflictDetected: true,
+			ConflictDetails:  err.Error(),
+		}
+	}
+
+	return nil
 }
 
 // createDDLIntent creates a write intent for DDL statements
@@ -371,6 +405,10 @@ func (re *ReplicationEngine) Commit(ctx context.Context, req *CommitRequest) *Co
 			Msg("COMMIT FAILED: Transaction not found - possibly GC'd or never prepared")
 		return &CommitResult{Success: false, Error: "transaction not found"}
 	}
+	// Preserve commit-phase statements on the transaction object so fallback
+	// statement-based DML apply can execute when CDC hooks are unavailable.
+	txn.Statements = req.Statements
+	txn.StatementFallback = hasStatementFallbackDML(req.Statements)
 
 	// Store CDC data from COMMIT request to PebbleDB (deferred from PREPARE phase)
 	// This must happen BEFORE CommitTransaction which reads from /cdc/raw/
@@ -418,6 +456,21 @@ func (re *ReplicationEngine) Commit(ctx context.Context, req *CommitRequest) *Co
 		Success: true,
 		DDLSQL:  ddlSQL,
 	}
+}
+
+func hasStatementFallbackDML(statements []protocol.Statement) bool {
+	for _, stmt := range statements {
+		if len(stmt.OldValues) > 0 || len(stmt.NewValues) > 0 {
+			continue
+		}
+		switch stmt.Type {
+		case protocol.StatementInsert, protocol.StatementUpdate, protocol.StatementDelete, protocol.StatementReplace:
+			if stmt.SQL != "" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // Abort handles the abort phase of 2PC replication

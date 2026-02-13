@@ -378,6 +378,26 @@ func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, sq
 	return rs, nil
 }
 
+// HandleLoadData executes a LOAD DATA LOCAL INFILE payload by reusing the same
+// INSERT/replication path as regular mutations.
+func (h *CoordinatorHandler) HandleLoadData(session *protocol.ConnectionSession, sql string, data []byte) (*protocol.ResultSet, error) {
+	stmt := protocol.ParseStatement(sql)
+	if stmt.Type != protocol.StatementLoadData {
+		return nil, fmt.Errorf("statement is not LOAD DATA")
+	}
+	// Preserve the original SQL text so replicated peers re-apply the same
+	// LOAD DATA LOCAL INFILE semantics (parser normalization can drop LOCAL).
+	stmt.SQL = sql
+	stmt.Database = session.CurrentDatabase
+	stmt.LoadDataPayload = data
+
+	consistency, _ := protocol.ParseConsistencyLevel(cfg.Config.Replication.DefaultWriteConsist)
+	if session.InTransaction() {
+		return h.bufferStatement(session, stmt)
+	}
+	return h.handleMutation(stmt, nil, consistency)
+}
+
 func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, params []interface{}, consistency protocol.ConsistencyLevel) (*protocol.ResultSet, error) {
 	queryStart := time.Now()
 
@@ -485,6 +505,19 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, params []in
 				// Keep original SQL in first statement for debugging
 				statements[0].SQL = stmt.SQL
 				statements[0].Database = stmt.Database
+			} else {
+				// Non-hook fallback: no CDC entries captured, so replicate using
+				// the concrete SQL text with literals inlined.
+				materializedSQL, matErr := materializeSQLWithParams(stmt.SQL, execParams)
+				if matErr != nil {
+					cancel()
+					telemetry.QueriesTotal.With("dml", "failed").Inc()
+					telemetry.QueryDurationSeconds.With("dml").Observe(time.Since(queryStart).Seconds())
+					return nil, fmt.Errorf("failed to materialize DML statement for replication: %w", matErr)
+				}
+				stmt.SQL = materializedSQL
+				stmt.ExtractedParams = nil
+				statements = []protocol.Statement{stmt}
 			}
 		}
 	}
@@ -952,6 +985,14 @@ func (h *CoordinatorHandler) handleCommit(session *protocol.ConnectionSession) (
 					enrichedStatements = append(enrichedStatements, cdcStmt)
 				}
 			} else {
+				materializedSQL, matErr := materializeSQLWithParams(stmt.SQL, execParams)
+				if matErr != nil {
+					session.EndTransaction()
+					h.recentTxnIDs.Delete(txnState.TxnID)
+					return nil, fmt.Errorf("failed to materialize DML statement for replication: %w", matErr)
+				}
+				stmt.SQL = materializedSQL
+				stmt.ExtractedParams = nil
 				enrichedStatements = append(enrichedStatements, stmt)
 			}
 		} else {

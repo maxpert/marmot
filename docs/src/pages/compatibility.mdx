@@ -15,7 +15,7 @@ Marmot supports a wide range of MySQL/SQLite statements through its MySQL protoc
 | `UPDATE` | ✅ Full | ✅ Yes | Includes qualified table names |
 | `DELETE` | ✅ Full | ✅ Yes | Includes qualified table names |
 | `SELECT` | ✅ Full | N/A | Read operations |
-| `LOAD DATA` | ✅ Full | ✅ Yes | Bulk data loading |
+| `LOAD DATA LOCAL INFILE` | ✅ Full | ✅ Yes | Replicated bulk loading (cluster + forwarded replica writes) |
 | **DDL - Data Definition** |
 | `CREATE TABLE` | ✅ Full | ✅ Yes | Replicated with cluster-wide locking |
 | `ALTER TABLE` | ✅ Full | ✅ Yes | Replicated with cluster-wide locking |
@@ -71,6 +71,8 @@ Marmot supports a wide range of MySQL/SQLite statements through its MySQL protoc
 4. **Table Locking**: `LOCK TABLES` statements are recognized but not enforced across the cluster. Use application-level coordination for distributed locking needs.
 
 5. **Qualified Names**: Marmot fully supports qualified table names (e.g., `db.table`) in DML and DDL operations.
+
+6. **`LOAD DATA` Scope**: Marmot supports `LOAD DATA LOCAL INFILE` (client-uploaded file bytes). `LOAD DATA INFILE` (server-side file access) is not supported.
 
 ## MySQL Protocol & Metadata Queries
 

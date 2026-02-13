@@ -41,6 +41,7 @@ type MySQLServer struct {
 	tcpAddress     string
 	unixSocket     string
 	unixSocketPerm os.FileMode
+	localInfile    bool
 	listeners      []net.Listener
 	quit           chan struct{}
 	wg             sync.WaitGroup
@@ -62,6 +63,7 @@ type ConnectionSession struct {
 	ConnID           uint64
 	CurrentDatabase  string
 	RemoteAddr       string
+	ClientCaps       uint32
 	preparedStmts    map[uint32]*PreparedStatement
 	preparedStmtLock sync.Mutex
 	nextStmtID       uint32
@@ -162,6 +164,12 @@ type ConnectionHandler interface {
 	HandleQuery(session *ConnectionSession, sql string, params []interface{}) (*ResultSet, error)
 }
 
+// LoadDataHandler is an optional extension for handlers that can process
+// LOAD DATA LOCAL INFILE payloads directly.
+type LoadDataHandler interface {
+	HandleLoadData(session *ConnectionSession, sql string, data []byte) (*ResultSet, error)
+}
+
 // ResultSet represents a MySQL result set
 type ResultSet struct {
 	Columns        []ColumnDef
@@ -183,9 +191,15 @@ func NewMySQLServer(tcpAddress, unixSocket string, unixSocketPerm os.FileMode, h
 		tcpAddress:     tcpAddress,
 		unixSocket:     unixSocket,
 		unixSocketPerm: unixSocketPerm,
+		localInfile:    true,
 		quit:           make(chan struct{}),
 		handler:        handler,
 	}
+}
+
+// SetLocalInfileEnabled enables/disables LOAD DATA LOCAL INFILE protocol handling.
+func (s *MySQLServer) SetLocalInfileEnabled(enabled bool) {
+	s.localInfile = enabled
 }
 
 // Start starts the MySQL server
@@ -317,6 +331,7 @@ func (s *MySQLServer) handleConnection(conn net.Conn) {
 
 	// Parse handshake response to extract database name and other info
 	if handshake, err := ParseHandshakeResponse(handshakeResp); err == nil {
+		session.ClientCaps = handshake.Capabilities
 		if handshake.Database != "" {
 			session.CurrentDatabase = handshake.Database
 			log.Debug().
@@ -390,6 +405,13 @@ func (s *MySQLServer) handleConnection(conn net.Conn) {
 }
 
 func (s *MySQLServer) processQuery(conn net.Conn, session *ConnectionSession, query string) {
+	if isLoadDataStatement(query) {
+		if err := s.processLoadDataQuery(conn, session, query); err != nil {
+			_ = s.writeMySQLErr(conn, 1, err)
+		}
+		return
+	}
+
 	// Parse first to check validity (optional, but good for sanity)
 	// For now, we pass directly to handler which will use the parser/coordinator
 
@@ -398,7 +420,6 @@ func (s *MySQLServer) processQuery(conn net.Conn, session *ConnectionSession, qu
 		_ = s.writeMySQLErr(conn, 1, err)
 		return
 	}
-
 	if rs == nil || (len(rs.Columns) == 0 && len(rs.Rows) == 0) {
 		// OK response for non-SELECT (INSERT/UPDATE/DELETE/etc)
 		rowsAffected := int64(0)
@@ -443,10 +464,14 @@ func (s *MySQLServer) writeHandshake(w io.Writer) error {
 	buf.WriteByte(0)
 
 	// Capability flags (lower 2 bytes)
-	// CLIENT_LONG_PASSWORD (0x0001) | CLIENT_CONNECT_WITH_DB (0x0008) | CLIENT_PROTOCOL_41 (0x0200) |
-	// CLIENT_TRANSACTIONS (0x2000) | CLIENT_SECURE_CONNECTION (0x8000)
-	// Lower 16 bits: 0xa209 = 0x0001 | 0x0008 | 0x0200 | 0x2000 | 0x8000
-	_ = binary.Write(buf, binary.LittleEndian, uint16(0xa209))
+	// CLIENT_LONG_PASSWORD (0x0001) | CLIENT_CONNECT_WITH_DB (0x0008) |
+	// CLIENT_PROTOCOL_41 (0x0200) | CLIENT_TRANSACTIONS (0x2000) | CLIENT_SECURE_CONNECTION (0x8000)
+	// Optionally add CLIENT_LOCAL_FILES (0x0080) when enabled.
+	lowerCaps := uint16(0xa209)
+	if s.localInfile {
+		lowerCaps |= 0x0080
+	}
+	_ = binary.Write(buf, binary.LittleEndian, lowerCaps)
 
 	// Character set (utf8mb4_general_ci = 45, supports full 4-byte UTF-8 including emojis)
 	buf.WriteByte(45)
@@ -680,20 +705,25 @@ func (s *MySQLServer) writePacket(w io.Writer, seq byte, payload []byte) error {
 }
 
 func (s *MySQLServer) readPacket(r io.Reader) ([]byte, error) {
+	payload, _, err := s.readPacketWithSeq(r)
+	return payload, err
+}
+
+func (s *MySQLServer) readPacketWithSeq(r io.Reader) ([]byte, byte, error) {
 	header := make([]byte, 4)
 	if _, err := io.ReadFull(r, header); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	length := int(uint32(header[0]) | uint32(header[1])<<8 | uint32(header[2])<<16)
-	// seq := header[3] // We ignore sequence check for simplicity
+	seq := header[3]
 
 	payload := make([]byte, length)
 	if _, err := io.ReadFull(r, payload); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
-	return payload, nil
+	return payload, seq, nil
 }
 
 // --- Utils ---

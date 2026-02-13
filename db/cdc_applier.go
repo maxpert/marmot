@@ -1,6 +1,3 @@
-//go:build sqlite_preupdate_hook
-// +build sqlite_preupdate_hook
-
 package db
 
 import (

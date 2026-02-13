@@ -213,6 +213,16 @@ func (c *Client) Read(ctx context.Context, nodeID uint64, req *ReadRequest) (*Re
 	return client.Read(ctx, req)
 }
 
+// GetLoadDataChunk fetches a staged LOAD DATA payload chunk from a peer.
+func (c *Client) GetLoadDataChunk(ctx context.Context, nodeID uint64, req *LoadDataChunkRequest) (*LoadDataChunkResponse, error) {
+	conn, err := c.getConn(nodeID)
+	if err != nil {
+		return nil, err
+	}
+	client := NewMarmotServiceClient(conn)
+	return client.GetLoadDataChunk(ctx, req)
+}
+
 // GetClientByAddress returns a MarmotServiceClient for an address
 // If not already connected, it creates a connection using a temporary node ID
 func (c *Client) GetClientByAddress(address string) (MarmotServiceClient, error) {

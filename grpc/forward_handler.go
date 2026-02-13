@@ -112,18 +112,104 @@ func (h *ForwardHandler) HandleForwardQuery(ctx context.Context, req *ForwardQue
 	})
 }
 
+// HandleForwardLoadData handles a forwarded LOAD DATA LOCAL INFILE from a read-only replica.
+func (h *ForwardHandler) HandleForwardLoadData(ctx context.Context, req *ForwardLoadDataRequest) (*ForwardQueryResponse, error) {
+	if req.ReplicaNodeId == 0 || req.SessionId == 0 {
+		return &ForwardQueryResponse{
+			Success:      false,
+			ErrorMessage: "replica_node_id and session_id are required",
+		}, nil
+	}
+	if req.RequestId == 0 {
+		return &ForwardQueryResponse{
+			Success:      false,
+			ErrorMessage: "request_id is required",
+		}, nil
+	}
+	if req.Sql == "" {
+		return &ForwardQueryResponse{
+			Success:      false,
+			ErrorMessage: "sql is required",
+		}, nil
+	}
+	if req.Database == "" {
+		return &ForwardQueryResponse{
+			Success:      false,
+			ErrorMessage: "database is required",
+		}, nil
+	}
+	if !h.dbManager.DatabaseExists(req.Database) {
+		return &ForwardQueryResponse{
+			Success:      false,
+			ErrorMessage: fmt.Sprintf("database %s does not exist", req.Database),
+		}, nil
+	}
+
+	stmt := protocol.ParseStatement(req.Sql)
+	if stmt.Type != protocol.StatementLoadData {
+		return &ForwardQueryResponse{
+			Success:      false,
+			ErrorMessage: "sql must be LOAD DATA LOCAL INFILE",
+		}, nil
+	}
+
+	key := ForwardSessionKey{
+		ReplicaNodeID: req.ReplicaNodeId,
+		SessionID:     req.SessionId,
+	}
+	session := h.sessionMgr.GetOrCreateSession(key, req.Database)
+	session.Touch()
+
+	return h.executeIdempotentLoad(ctx, session, req, func(connSession *protocol.ConnectionSession) *ForwardQueryResponse {
+		rs, err := h.coordHandler.HandleLoadData(connSession, req.Sql, req.Data)
+		if err != nil {
+			return &ForwardQueryResponse{
+				Success:      false,
+				ErrorMessage: err.Error(),
+			}
+		}
+
+		resp := &ForwardQueryResponse{Success: true}
+		if rs != nil {
+			resp.RowsAffected = rs.RowsAffected
+			resp.LastInsertId = rs.LastInsertId
+			resp.CommittedTxnId = rs.CommittedTxnId
+		}
+		return resp
+	})
+}
+
 func (h *ForwardHandler) executeIdempotent(
 	ctx context.Context,
 	session *ForwardSession,
 	req *ForwardQueryRequest,
 	execFn func(connSession *protocol.ConnectionSession) *ForwardQueryResponse,
 ) (*ForwardQueryResponse, error) {
-	reqState, isNew := session.BeginRequest(req.RequestId)
+	return h.executeIdempotentRequest(ctx, session, req.RequestId, req.Database, execFn)
+}
+
+func (h *ForwardHandler) executeIdempotentLoad(
+	ctx context.Context,
+	session *ForwardSession,
+	req *ForwardLoadDataRequest,
+	execFn func(connSession *protocol.ConnectionSession) *ForwardQueryResponse,
+) (*ForwardQueryResponse, error) {
+	return h.executeIdempotentRequest(ctx, session, req.RequestId, req.Database, execFn)
+}
+
+func (h *ForwardHandler) executeIdempotentRequest(
+	ctx context.Context,
+	session *ForwardSession,
+	requestID uint64,
+	database string,
+	execFn func(connSession *protocol.ConnectionSession) *ForwardQueryResponse,
+) (*ForwardQueryResponse, error) {
+	reqState, isNew := session.BeginRequest(requestID)
 	if !isNew {
 		return session.WaitForRequest(ctx, reqState)
 	}
 
-	resp, execErr := session.Execute(req.Database, func(connSession *protocol.ConnectionSession) (*ForwardQueryResponse, error) {
+	resp, execErr := session.Execute(database, func(connSession *protocol.ConnectionSession) (*ForwardQueryResponse, error) {
 		return execFn(connSession), nil
 	})
 	if execErr != nil {
@@ -137,7 +223,7 @@ func (h *ForwardHandler) executeIdempotent(
 	}
 	resp.InTransaction = session.HasActiveTransaction()
 
-	session.CompleteRequest(req.RequestId, reqState, resp)
+	session.CompleteRequest(requestID, reqState, resp)
 	return cloneForwardResponse(resp), nil
 }
 

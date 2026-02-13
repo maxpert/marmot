@@ -255,6 +255,14 @@ port = 3306
 # Maximum concurrent MySQL connections
 max_connections = 1000
 
+# Enable LOAD DATA LOCAL INFILE support (client uploads file contents)
+local_infile_enabled = true
+
+# Auto-increment ID generation mode
+# "compact" (default) = 53-bit IDs safe for JavaScript (Number.MAX_SAFE_INTEGER)
+# "extended" = 64-bit HLC-based IDs for maximum uniqueness
+auto_id_mode = "compact"
+
 # ==============================================================================
 # SNAPSHOT (Streaming recovery for new/lagging nodes)
 # ==============================================================================
