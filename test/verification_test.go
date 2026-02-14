@@ -153,6 +153,9 @@ func TestMySQLServerIntegration(t *testing.T) {
 		Addr:                 fmt.Sprintf("127.0.0.1:%d", port),
 		DBName:               "test",
 		AllowNativePasswords: true,
+		// Avoid driver startup probe `SELECT @@max_allowed_packet`, which is
+		// orthogonal to this integration test's read/write behavior.
+		MaxAllowedPacket: 64 << 20,
 	}
 
 	db, err := sql.Open("mysql", cfg.FormatDSN())

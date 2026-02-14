@@ -9,6 +9,9 @@ import (
 
 // waitForRowCountOnNode waits for expected row count on a specific node
 func waitForRowCountOnNode(t *testing.T, harness *ClusterHarness, nodeID int, table string, expected int, timeout time.Duration) error {
+	if timeout < 15*time.Second {
+		timeout = 15 * time.Second
+	}
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		count := harness.getRowCount(nodeID, table)

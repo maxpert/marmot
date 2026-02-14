@@ -334,6 +334,7 @@ func (rh *ReplicationHandler) handleReplay(ctx context.Context, req *Transaction
 
 	// Create schema adapter for CDC operations
 	schemaAdapter := &replicationSchemaAdapter{dbMgr: rh.dbMgr, dbName: dbName}
+	hasDDL := false
 
 	for _, stmt := range req.Statements {
 		// Check for CDC data (RowChange payload)
@@ -362,13 +363,14 @@ func (rh *ReplicationHandler) handleReplay(ctx context.Context, req *Transaction
 
 		// DDL path: execute SQL directly
 		if ddl := stmt.GetDdlChange(); ddl != nil && ddl.Sql != "" {
-			if _, err := tx.ExecContext(ctx, ddl.Sql); err != nil {
+			if err := db.ApplyDDLSQLInTx(ctx, tx, ddl.Sql); err != nil {
 				telemetry.ReplicationRequestsTotal.With("replay", "failed").Inc()
 				return &TransactionResponse{
 					Success:      false,
 					ErrorMessage: fmt.Sprintf("failed to execute DDL: %v", err),
 				}, nil
 			}
+			hasDDL = true
 			continue
 		}
 
@@ -398,6 +400,11 @@ func (rh *ReplicationHandler) handleReplay(ctx context.Context, req *Transaction
 			Success:      false,
 			ErrorMessage: fmt.Sprintf("failed to commit: %v", err),
 		}, nil
+	}
+	if hasDDL {
+		if err := dbInstance.ReloadSchema(); err != nil {
+			log.Warn().Err(err).Str("database", dbName).Msg("handleReplay: failed to reload schema after DDL")
+		}
 	}
 
 	// Store TransactionRecord in MetaStore so GetCommittedTxnCount/GetMaxTxnID return correct values.
