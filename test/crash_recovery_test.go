@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -24,8 +25,15 @@ const (
 	numNodes      = 3
 )
 
+var (
+	crashHarnessBuildOnce sync.Once
+	crashHarnessBinPath   string
+	crashHarnessBuildErr  error
+)
+
 // cleanupStalePorts kills any processes using ports that will be used by the test cluster
 func cleanupStalePorts() {
+	selfPID := os.Getpid()
 	ports := []int{
 		baseGRPCPort + 1, baseGRPCPort + 2, baseGRPCPort + 3,
 		baseMySQLPort + 1, baseMySQLPort + 2, baseMySQLPort + 3,
@@ -36,12 +44,38 @@ func cleanupStalePorts() {
 		if err == nil && len(output) > 0 {
 			pids := strings.Fields(strings.TrimSpace(string(output)))
 			for _, pid := range pids {
+				parsedPID, parseErr := strconv.Atoi(pid)
+				if parseErr != nil {
+					continue
+				}
+				if parsedPID == selfPID {
+					continue
+				}
+				if !isMarmotProcess(parsedPID) {
+					continue
+				}
 				killCmd := exec.Command("kill", "-9", pid)
 				killCmd.Run()
 			}
 		}
 	}
 	time.Sleep(100 * time.Millisecond)
+}
+
+func isMarmotProcess(pid int) bool {
+	cmd := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "command=")
+	output, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+	commandLine := strings.ToLower(strings.TrimSpace(string(output)))
+	if commandLine == "" {
+		return false
+	}
+	if strings.Contains(commandLine, "go test") || strings.Contains(commandLine, "___go_build") {
+		return false
+	}
+	return strings.Contains(commandLine, "marmot")
 }
 
 // ClusterNode represents a running Marmot node
@@ -73,16 +107,16 @@ func NewClusterHarness(t *testing.T) *ClusterHarness {
 	cleanupStalePorts()
 
 	baseDir := filepath.Join(os.TempDir(), fmt.Sprintf("marmot_crash_test_%d", time.Now().UnixNano()))
+	marmotBin, err := getCrashHarnessBinary(t)
+	if err != nil {
+		t.Fatalf("Failed to build Marmot: %v", err)
+	}
 
 	harness := &ClusterHarness{
 		Nodes:     make([]*ClusterNode, numNodes),
 		BaseDir:   baseDir,
-		MarmotBin: "",
+		MarmotBin: marmotBin,
 		t:         t,
-	}
-
-	if err := harness.buildMarmot(); err != nil {
-		t.Fatalf("Failed to build Marmot: %v", err)
 	}
 
 	for i := 0; i < numNodes; i++ {
@@ -93,21 +127,32 @@ func NewClusterHarness(t *testing.T) *ClusterHarness {
 	return harness
 }
 
-func (h *ClusterHarness) buildMarmot() error {
-	h.t.Logf("Building Marmot binary...")
+func getCrashHarnessBinary(t *testing.T) (string, error) {
+	t.Helper()
 
-	binPath := filepath.Join(h.BaseDir, "marmot")
-	h.MarmotBin = binPath
+	crashHarnessBuildOnce.Do(func() {
+		t.Logf("Building shared Marmot binary for crash-recovery tests...")
 
-	cmd := exec.Command("go", "build", "-tags", "sqlite_preupdate_hook sqlite_fts5 sqlite_json sqlite_math_functions sqlite_foreign_keys sqlite_stat4 sqlite_vacuum_incr", "-o", binPath, ".")
-	cmd.Dir = "/Users/zohaib/repos/marmot"
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("build failed: %v\n%s", err, output)
-	}
+		buildDir, err := os.MkdirTemp("", "marmot_crash_bin_")
+		if err != nil {
+			crashHarnessBuildErr = fmt.Errorf("failed to create build dir: %w", err)
+			return
+		}
 
-	h.t.Logf("Marmot binary built at %s", binPath)
-	return nil
+		binPath := filepath.Join(buildDir, "marmot")
+		cmd := exec.Command("go", "build", "-tags", "sqlite_preupdate_hook sqlite_fts5 sqlite_json sqlite_math_functions sqlite_foreign_keys sqlite_stat4 sqlite_vacuum_incr", "-o", binPath, ".")
+		cmd.Dir = "/Users/zohaib/repos/marmot"
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			crashHarnessBuildErr = fmt.Errorf("build failed: %v\n%s", err, output)
+			return
+		}
+
+		crashHarnessBinPath = binPath
+		t.Logf("Shared Marmot binary built at %s", crashHarnessBinPath)
+	})
+
+	return crashHarnessBinPath, crashHarnessBuildErr
 }
 
 func (h *ClusterHarness) createNode(nodeID int) *ClusterNode {
@@ -191,7 +236,7 @@ port = %d
 max_connections = 100
 
 [logging]
-verbose = true
+verbose = false
 format = "console"
 
 [prometheus]
@@ -455,6 +500,9 @@ func (h *ClusterHarness) getRowCount(nodeID int, tableName string) int {
 
 // WaitForRowCount waits for all specified nodes to have at least expectedCount rows
 func (h *ClusterHarness) WaitForRowCount(tableName string, nodes []int, expectedCount int, timeout time.Duration) error {
+	if timeout < 15*time.Second {
+		timeout = 15 * time.Second
+	}
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		allMatch := true
