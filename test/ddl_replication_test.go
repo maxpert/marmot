@@ -232,6 +232,16 @@ func TestDDLIdempotencyRewriter(t *testing.T) {
 			input:    "CREATE TABLE IF NOT EXISTS users (id INT PRIMARY KEY, name TEXT)",
 			expected: "CREATE TABLE IF NOT EXISTS users (id INT PRIMARY KEY, name TEXT)",
 		},
+		{
+			name:     "CREATE TABLE with quoted identifier",
+			input:    "CREATE TABLE `users` (id INT PRIMARY KEY, name TEXT)",
+			expected: "CREATE TABLE IF NOT EXISTS `users` (id INT PRIMARY KEY, name TEXT)",
+		},
+		{
+			name:     "CREATE TEMP TABLE gets IF NOT EXISTS",
+			input:    "CREATE TEMP TABLE users_tmp (id INT PRIMARY KEY, name TEXT)",
+			expected: "CREATE TEMP TABLE IF NOT EXISTS users_tmp (id INT PRIMARY KEY, name TEXT)",
+		},
 		// DROP TABLE
 		{
 			name:     "DROP TABLE without IF EXISTS",
@@ -243,6 +253,11 @@ func TestDDLIdempotencyRewriter(t *testing.T) {
 			input:    "DROP TABLE IF EXISTS users",
 			expected: "DROP TABLE IF EXISTS users",
 		},
+		{
+			name:     "DROP TABLE with quoted identifier",
+			input:    "DROP TABLE `users`",
+			expected: "DROP TABLE IF EXISTS `users`",
+		},
 		// CREATE INDEX
 		{
 			name:     "CREATE INDEX without IF NOT EXISTS",
@@ -253,6 +268,11 @@ func TestDDLIdempotencyRewriter(t *testing.T) {
 			name:     "CREATE INDEX with IF NOT EXISTS",
 			input:    "CREATE INDEX IF NOT EXISTS idx_name ON users(name)",
 			expected: "CREATE INDEX IF NOT EXISTS idx_name ON users(name)",
+		},
+		{
+			name:     "CREATE UNIQUE INDEX with quoted identifier",
+			input:    "CREATE UNIQUE INDEX `idx_name` ON users(name)",
+			expected: "CREATE UNIQUE INDEX IF NOT EXISTS `idx_name` ON users(name)",
 		},
 		// DROP INDEX
 		{

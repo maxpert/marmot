@@ -7,28 +7,28 @@ import (
 
 // DDL rewriting patterns (simplified without negative lookahead)
 var (
-	// CREATE TABLE patterns
-	createTableRe = regexp.MustCompile(`(?i)^\s*CREATE\s+TABLE\s+(\w+)`)
-
-	// DROP TABLE patterns
-	dropTableRe = regexp.MustCompile(`(?i)^\s*DROP\s+TABLE\s+(\w+)`)
-
-	// CREATE DATABASE patterns
-	createDatabaseRe = regexp.MustCompile(`(?i)^\s*CREATE\s+DATABASE\s+(\w+)`)
-
-	// DROP DATABASE patterns
-	dropDatabaseRe = regexp.MustCompile(`(?i)^\s*DROP\s+DATABASE\s+(\w+)`)
-
-	// CREATE INDEX patterns
-	createIndexRe = regexp.MustCompile(`(?i)^\s*CREATE\s+(UNIQUE\s+)?INDEX\s+(\w+)`)
-
-	// DROP INDEX patterns
-	dropIndexRe = regexp.MustCompile(`(?i)^\s*DROP\s+INDEX\s+(\w+)`)
+	// Prefix patterns are intentionally identifier-agnostic (quoted names,
+	// schema-qualified names, etc.) and only match the leading DDL verb.
+	createTablePrefixRe = regexp.MustCompile(`(?i)^\s*CREATE\s+(?:TEMP(?:ORARY)?\s+)?TABLE\s+`)
+	dropTablePrefixRe   = regexp.MustCompile(`(?i)^\s*DROP\s+TABLE\s+`)
+	createDBPrefixRe    = regexp.MustCompile(`(?i)^\s*CREATE\s+DATABASE\s+`)
+	dropDBPrefixRe      = regexp.MustCompile(`(?i)^\s*DROP\s+DATABASE\s+`)
+	createUniqueIdxRe   = regexp.MustCompile(`(?i)^\s*CREATE\s+UNIQUE\s+INDEX\s+`)
+	createIdxPrefixRe   = regexp.MustCompile(`(?i)^\s*CREATE\s+INDEX\s+`)
+	dropIdxPrefixRe     = regexp.MustCompile(`(?i)^\s*DROP\s+INDEX\s+`)
 
 	// TRUNCATE TABLE patterns (SQLite doesn't support TRUNCATE, convert to DELETE)
 	truncateTableRe = regexp.MustCompile(`(?i)^\s*TRUNCATE\s+TABLE\s+(\w+)`)
 	truncateRe      = regexp.MustCompile(`(?i)^\s*TRUNCATE\s+(\w+)`)
 )
+
+func insertClauseAfterPrefix(sql string, prefixRe *regexp.Regexp, clause string) (string, bool) {
+	match := prefixRe.FindStringIndex(sql)
+	if len(match) != 2 || match[0] != 0 {
+		return sql, false
+	}
+	return sql[:match[1]] + clause + sql[match[1]:], true
+}
 
 // RewriteDDLForIdempotency rewrites a DDL statement to be idempotent
 // This allows DDL to be safely replayed after node failures or partitions
@@ -47,14 +47,17 @@ func RewriteDDLForIdempotency(sql string) string {
 	upperSQL := strings.ToUpper(trimmed)
 
 	// CREATE TABLE
-	if strings.HasPrefix(upperSQL, "CREATE TABLE") {
+	if strings.HasPrefix(upperSQL, "CREATE TABLE") ||
+		strings.HasPrefix(upperSQL, "CREATE TEMP TABLE") ||
+		strings.HasPrefix(upperSQL, "CREATE TEMPORARY TABLE") {
 		// Check if already has IF NOT EXISTS
 		if strings.Contains(upperSQL, "IF NOT EXISTS") {
 			return trimmed
 		}
-		// Insert "IF NOT EXISTS" after CREATE TABLE
-		rewritten := createTableRe.ReplaceAllString(trimmed, "CREATE TABLE IF NOT EXISTS $1")
-		return rewritten
+		if rewritten, ok := insertClauseAfterPrefix(trimmed, createTablePrefixRe, "IF NOT EXISTS "); ok {
+			return rewritten
+		}
+		return trimmed
 	}
 
 	// DROP TABLE
@@ -63,9 +66,10 @@ func RewriteDDLForIdempotency(sql string) string {
 		if strings.Contains(upperSQL, "IF EXISTS") {
 			return trimmed
 		}
-		// Insert "IF EXISTS" after DROP TABLE
-		rewritten := dropTableRe.ReplaceAllString(trimmed, "DROP TABLE IF EXISTS $1")
-		return rewritten
+		if rewritten, ok := insertClauseAfterPrefix(trimmed, dropTablePrefixRe, "IF EXISTS "); ok {
+			return rewritten
+		}
+		return trimmed
 	}
 
 	// CREATE DATABASE
@@ -74,9 +78,10 @@ func RewriteDDLForIdempotency(sql string) string {
 		if strings.Contains(upperSQL, "IF NOT EXISTS") {
 			return trimmed
 		}
-		// Insert "IF NOT EXISTS" after CREATE DATABASE
-		rewritten := createDatabaseRe.ReplaceAllString(trimmed, "CREATE DATABASE IF NOT EXISTS $1")
-		return rewritten
+		if rewritten, ok := insertClauseAfterPrefix(trimmed, createDBPrefixRe, "IF NOT EXISTS "); ok {
+			return rewritten
+		}
+		return trimmed
 	}
 
 	// DROP DATABASE
@@ -85,9 +90,10 @@ func RewriteDDLForIdempotency(sql string) string {
 		if strings.Contains(upperSQL, "IF EXISTS") {
 			return trimmed
 		}
-		// Insert "IF EXISTS" after DROP DATABASE
-		rewritten := dropDatabaseRe.ReplaceAllString(trimmed, "DROP DATABASE IF EXISTS $1")
-		return rewritten
+		if rewritten, ok := insertClauseAfterPrefix(trimmed, dropDBPrefixRe, "IF EXISTS "); ok {
+			return rewritten
+		}
+		return trimmed
 	}
 
 	// CREATE INDEX (including UNIQUE INDEX)
@@ -96,17 +102,13 @@ func RewriteDDLForIdempotency(sql string) string {
 		if strings.Contains(upperSQL, "IF NOT EXISTS") {
 			return trimmed
 		}
-		// Handle both CREATE INDEX and CREATE UNIQUE INDEX
-		if match := createIndexRe.FindStringSubmatch(trimmed); len(match) >= 3 {
-			if match[1] != "" {
-				// UNIQUE INDEX case
-				rewritten := createIndexRe.ReplaceAllString(trimmed, "CREATE UNIQUE INDEX IF NOT EXISTS $2")
-				return rewritten
-			}
-			// Regular INDEX case
-			rewritten := createIndexRe.ReplaceAllString(trimmed, "CREATE INDEX IF NOT EXISTS $2")
+		if rewritten, ok := insertClauseAfterPrefix(trimmed, createUniqueIdxRe, "IF NOT EXISTS "); ok {
 			return rewritten
 		}
+		if rewritten, ok := insertClauseAfterPrefix(trimmed, createIdxPrefixRe, "IF NOT EXISTS "); ok {
+			return rewritten
+		}
+		return trimmed
 	}
 
 	// DROP INDEX
@@ -115,9 +117,10 @@ func RewriteDDLForIdempotency(sql string) string {
 		if strings.Contains(upperSQL, "IF EXISTS") {
 			return trimmed
 		}
-		// Insert "IF EXISTS" after DROP INDEX
-		rewritten := dropIndexRe.ReplaceAllString(trimmed, "DROP INDEX IF EXISTS $1")
-		return rewritten
+		if rewritten, ok := insertClauseAfterPrefix(trimmed, dropIdxPrefixRe, "IF EXISTS "); ok {
+			return rewritten
+		}
+		return trimmed
 	}
 
 	// TRUNCATE TABLE - SQLite doesn't support TRUNCATE, convert to DELETE FROM
