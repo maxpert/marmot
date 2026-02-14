@@ -448,6 +448,62 @@ func TestStreamClient_ApplyChangeEvent_DDL(t *testing.T) {
 	}
 }
 
+// TestStreamClient_ApplyChangeEvent_LoadData ensures stream apply handles
+// LOAD DATA payloads instead of silently skipping them.
+func TestStreamClient_ApplyChangeEvent_LoadData(t *testing.T) {
+	dbMgr, clock, _, cleanup := setupStreamClientTest(t)
+	defer cleanup()
+
+	if err := dbMgr.CreateDatabase("testdb"); err != nil {
+		t.Fatalf("Failed to create database: %v", err)
+	}
+
+	mdb, _ := dbMgr.GetDatabase("testdb")
+	sqlDB := mdb.GetDB()
+	_, err := sqlDB.Exec(`CREATE TABLE bulk_users (
+		id INTEGER PRIMARY KEY,
+		name TEXT
+	)`)
+	if err != nil {
+		t.Fatalf("Failed to create table: %v", err)
+	}
+
+	client := NewStreamClient([]string{"localhost:8080"}, 1, dbMgr, clock, nil)
+
+	loadSQL := "LOAD DATA LOCAL INFILE 'users.csv' INTO TABLE bulk_users FIELDS TERMINATED BY ',' LINES TERMINATED BY '\\n' IGNORE 1 LINES (id,name)"
+	loadBytes := []byte("id,name\n1,Alice\n2,Bob\n")
+
+	event := &marmotgrpc.ChangeEvent{
+		TxnId:    201,
+		Database: "testdb",
+		Statements: []*marmotgrpc.Statement{
+			{
+				Type:      pb.StatementType_LOAD_DATA,
+				TableName: "bulk_users",
+				Payload: &marmotgrpc.Statement_LoadDataChange{
+					LoadDataChange: &marmotgrpc.LoadDataChange{
+						Sql:  loadSQL,
+						Data: loadBytes,
+					},
+				},
+			},
+		},
+	}
+
+	err = client.applyChangeEvent(context.Background(), event)
+	if err != nil {
+		t.Fatalf("applyChangeEvent (LOAD DATA) failed: %v", err)
+	}
+
+	var count int
+	if err := sqlDB.QueryRow("SELECT COUNT(*) FROM bulk_users").Scan(&count); err != nil {
+		t.Fatalf("Failed to count rows: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("Expected 2 rows after LOAD DATA, got %d", count)
+	}
+}
+
 // TestStreamClient_GetLocalMaxTxnIDs tests local txn ID retrieval
 func TestStreamClient_GetLocalMaxTxnIDs(t *testing.T) {
 	dbMgr, clock, _, cleanup := setupStreamClientTest(t)

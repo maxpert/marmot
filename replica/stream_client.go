@@ -18,7 +18,6 @@ import (
 	marmotgrpc "github.com/maxpert/marmot/grpc"
 	pb "github.com/maxpert/marmot/grpc/common"
 	"github.com/maxpert/marmot/hlc"
-	"github.com/maxpert/marmot/protocol"
 
 	"github.com/rs/zerolog/log"
 	"google.golang.org/grpc"
@@ -938,9 +937,16 @@ func (s *StreamClient) applyStatement(ctx context.Context, tx *sql.Tx, mdb *db.R
 
 	// DDL path: schema changes with idempotency rewriting
 	if ddlChange := stmt.GetDdlChange(); ddlChange != nil && ddlChange.Sql != "" {
-		idempotentSQL := protocol.RewriteDDLForIdempotency(ddlChange.Sql)
-		if _, err := tx.ExecContext(ctx, idempotentSQL); err != nil {
+		if err := db.ApplyDDLSQLInTx(ctx, tx, ddlChange.Sql); err != nil {
 			return fmt.Errorf("DDL failed: %w", err)
+		}
+		return nil
+	}
+
+	// LOAD DATA path: apply bulk-load payload inside transaction.
+	if loadData := stmt.GetLoadDataChange(); loadData != nil {
+		if _, err := db.ApplyLoadDataInTx(tx, loadData.Sql, loadData.Data); err != nil {
+			return fmt.Errorf("LOAD DATA failed: %w", err)
 		}
 		return nil
 	}
