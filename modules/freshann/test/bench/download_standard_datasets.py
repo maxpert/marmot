@@ -1,11 +1,28 @@
 #!/usr/bin/env python3
 import argparse
 import json
-import os
 import struct
 import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+
+
+@dataclass(frozen=True)
+class CoreDataset:
+    name: str
+    file: str
+    metric: str
+
+
+CORE6 = [
+    CoreDataset("glove-100-angular", "glove-100-angular.hdf5", "cosine"),
+    CoreDataset("sift-128-euclidean", "sift-128-euclidean.hdf5", "euclidean"),
+    CoreDataset("fashion-mnist-784-euclidean", "fashion-mnist-784-euclidean.hdf5", "euclidean"),
+    CoreDataset("nytimes-256-angular", "nytimes-256-angular.hdf5", "cosine"),
+    CoreDataset("gist-960-euclidean", "gist-960-euclidean.hdf5", "euclidean"),
+    CoreDataset("glove-25-angular", "glove-25-angular.hdf5", "cosine"),
+]
 
 
 def download(url: str, dst: Path, max_size: Optional[int] = None) -> None:
@@ -14,7 +31,7 @@ def download(url: str, dst: Path, max_size: Optional[int] = None) -> None:
         print(f"[download] exists: {dst}")
         return
     print(f"[download] {url} -> {dst}")
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; freshann-bench/1.0)"})
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; freshann-bench/2.0)"})
     with urllib.request.urlopen(req) as resp, open(dst, "wb") as out:
         chunk = 1024 * 1024
         total = 0
@@ -53,37 +70,56 @@ def write_i32bin(path: Path, arr) -> None:
         arr.astype("int32").tofile(f)
 
 
-def prepare_annbench(root: Path, ann_base_count: int, ann_query_count: int) -> None:
-    import h5py
-    import numpy as np
+def write_f32bin_from_h5(path: Path, h5_ds, count: int, chunk_rows: int = 16384) -> None:
+    d = int(h5_ds.shape[1])
+    with open(path, "wb") as f:
+        f.write(struct.pack("<II", count, d))
+        off = 0
+        while off < count:
+            n = min(chunk_rows, count - off)
+            block = h5_ds[off : off + n]
+            block.astype("float32").tofile(f)
+            off += n
 
-    ds_dir = root / "annbench-glove-100-angular"
+
+def write_i32bin_from_h5(path: Path, h5_ds, rows: int, cols: int, chunk_rows: int = 16384) -> None:
+    with open(path, "wb") as f:
+        f.write(struct.pack("<II", rows, cols))
+        off = 0
+        while off < rows:
+            n = min(chunk_rows, rows - off)
+            block = h5_ds[off : off + n, :cols]
+            block.astype("int32").tofile(f)
+            off += n
+
+
+def prepare_annbench_hdf5(root: Path, ds: CoreDataset, base_count: int, query_count: int) -> None:
+    import h5py
+    ds_dir = root / ds.name
     ds_dir.mkdir(parents=True, exist_ok=True)
-    h5_path = ds_dir / "glove-100-angular.hdf5"
-    download("https://ann-benchmarks.com/glove-100-angular.hdf5", h5_path)
+    h5_path = ds_dir / ds.file
+    download(f"https://ann-benchmarks.com/{ds.file}", h5_path)
 
     with h5py.File(h5_path, "r") as h:
         train = h["train"]
         test = h["test"]
         neighbors = h["neighbors"]
 
-        base_n = min(train.shape[0], ann_base_count)
-        query_n = min(test.shape[0], ann_query_count)
-        base = np.asarray(train[:base_n], dtype=np.float32)
-        queries = np.asarray(test[:query_n], dtype=np.float32)
+        base_n = train.shape[0] if base_count <= 0 else min(train.shape[0], base_count)
+        query_n = test.shape[0] if query_count <= 0 else min(test.shape[0], query_count)
 
-        write_f32bin(ds_dir / "base.f32bin", base)
-        write_f32bin(ds_dir / "queries.f32bin", queries)
+        write_f32bin_from_h5(ds_dir / "base.f32bin", train, base_n)
+        write_f32bin_from_h5(ds_dir / "queries.f32bin", test, query_n)
 
-        has_official_gt = False
-        if base_n == train.shape[0]:
-            gt = np.asarray(neighbors[:query_n, :100], dtype=np.int32)
-            write_i32bin(ds_dir / "gt.i32bin", gt)
-            has_official_gt = True
+        # Official neighbors are valid only for full train set.
+        has_official_gt = base_n == train.shape[0]
+        if has_official_gt:
+            k = min(100, neighbors.shape[1])
+            write_i32bin_from_h5(ds_dir / "gt.i32bin", neighbors, query_n, k)
 
         manifest = {
-            "dataset_name": "annbench-glove-100-angular",
-            "metric": "cosine",
+            "dataset_name": ds.name,
+            "metric": ds.metric,
             "base_count": int(base_n),
             "query_count": int(query_n),
             "has_official_gt": has_official_gt,
@@ -104,50 +140,30 @@ def read_u8bin(path: Path, n_limit: Optional[int] = None):
     return np.asarray(data, dtype=np.float32)
 
 
-def read_knn_ids(path: Path, q_limit: Optional[int] = None, k_limit: Optional[int] = None):
-    import numpy as np
-
-    with open(path, "rb") as f:
-        nq, k = struct.unpack("<II", f.read(8))
-        if q_limit is not None:
-            nq = min(nq, q_limit)
-        ids = np.fromfile(f, dtype=np.int32, count=nq * k).reshape(nq, k)
-        # skip distances in file; not needed
-    if k_limit is not None and k_limit < ids.shape[1]:
-        ids = ids[:, :k_limit]
-    return ids
-
-
-def prepare_bigann(root: Path, bigann_base_count: int, bigann_query_count: int) -> None:
+def prepare_bigann(root: Path, base_count: int, query_count: int) -> None:
     ds_dir = root / "bigann-10m"
     ds_dir.mkdir(parents=True, exist_ok=True)
 
-    base_raw = ds_dir / f"base.crop_{bigann_base_count}.u8bin"
+    base_raw = ds_dir / f"base.crop_{base_count}.u8bin"
     query_raw = ds_dir / "query.public.10K.u8bin"
-    gt_raw = ds_dir / "GT_10M.bigann-10M"
 
     d = 128
-    max_size = 8 + bigann_base_count * d
+    max_size = 8 + base_count * d
     download("https://dl.fbaipublicfiles.com/billion-scale-ann-benchmarks/bigann/base.1B.u8bin", base_raw, max_size=max_size)
-    patch_u8bin_header_count(base_raw, bigann_base_count)
+    patch_u8bin_header_count(base_raw, base_count)
     download("https://dl.fbaipublicfiles.com/billion-scale-ann-benchmarks/bigann/query.public.10K.u8bin", query_raw)
-    download("https://dl.fbaipublicfiles.com/billion-scale-ann-benchmarks/GT_10M/bigann-10M", gt_raw)
 
-    base = read_u8bin(base_raw, bigann_base_count)
-    queries = read_u8bin(query_raw, bigann_query_count)
+    base = read_u8bin(base_raw, base_count)
+    queries = read_u8bin(query_raw, query_count if query_count > 0 else None)
     write_f32bin(ds_dir / "base.f32bin", base)
     write_f32bin(ds_dir / "queries.f32bin", queries)
-
-    # BigANN official GT is Euclidean; freshann harness currently benchmarks cosine/dot.
-    # Keep GT downloaded for future use, but mark as not directly comparable in this harness.
-    has_official_gt = False
 
     manifest = {
         "dataset_name": "bigann-10m",
         "metric": "cosine",
-        "base_count": int(bigann_base_count),
-        "query_count": int(bigann_query_count),
-        "has_official_gt": has_official_gt,
+        "base_count": int(base.shape[0]),
+        "query_count": int(queries.shape[0]),
+        "has_official_gt": False,
         "original_base_all": 10_000_000,
     }
     (ds_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
@@ -155,10 +171,11 @@ def prepare_bigann(root: Path, bigann_base_count: int, bigann_query_count: int) 
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="Download and prepare ANN-Benchmarks + Big-ANN datasets for freshann benchmark harness")
+    p = argparse.ArgumentParser(description="Download and prepare ANN-Bench Core-6 (+optional BigANN) datasets")
     p.add_argument("--root", default="/tmp/freshann-bench-data/datasets")
-    p.add_argument("--ann-base-count", type=int, default=50_000)
-    p.add_argument("--ann-query-count", type=int, default=1_000)
+    p.add_argument("--base-count", type=int, default=0, help="0 means full dataset")
+    p.add_argument("--query-count", type=int, default=0, help="0 means full query set")
+    p.add_argument("--include-bigann", action="store_true")
     p.add_argument("--bigann-base-count", type=int, default=100_000)
     p.add_argument("--bigann-query-count", type=int, default=1_000)
     args = p.parse_args()
@@ -167,8 +184,10 @@ def main() -> None:
     root.mkdir(parents=True, exist_ok=True)
 
     try:
-        prepare_annbench(root, args.ann_base_count, args.ann_query_count)
-        prepare_bigann(root, args.bigann_base_count, args.bigann_query_count)
+        for ds in CORE6:
+            prepare_annbench_hdf5(root, ds, args.base_count, args.query_count)
+        if args.include_bigann:
+            prepare_bigann(root, args.bigann_base_count, args.bigann_query_count)
     except ModuleNotFoundError as e:
         print(
             "missing python dependency: "

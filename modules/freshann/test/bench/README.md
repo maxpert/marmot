@@ -1,4 +1,6 @@
-# Baseline Bench Harness
+# Benchmark Harness
+
+## External baseline stack (optional)
 
 This folder contains reproducible local baseline infrastructure for:
 
@@ -6,25 +8,22 @@ This folder contains reproducible local baseline infrastructure for:
 - Qdrant
 - pgvector
 
-## Bring up baselines
+Bring up baselines:
 
 ```bash
 docker compose -f test/bench/docker-compose.baselines.yml up -d
 ```
 
-## Planned benchmark workflow
+## Freshann Core-6 ANN-Bench harness
 
-1. Load shared datasets into all systems and freshann.
-2. Execute standardized query sets.
-3. Emit recall/latency/QPS reports.
-4. Compare with fixed tier thresholds.
+The standard run targets ANN-Bench Core-6:
 
-## Freshann standard dataset harness (no Docker required)
-
-Runs on:
-
-- ANN-Benchmarks `glove-100-angular`
-- Big-ANN `bigann-10m` (configurable subset)
+- `glove-100-angular`
+- `sift-128-euclidean`
+- `fashion-mnist-784-euclidean`
+- `nytimes-256-angular`
+- `gist-960-euclidean`
+- `glove-25-angular`
 
 Persistent paths (default):
 
@@ -38,8 +37,24 @@ Run:
 ./test/bench/run_standard_benchmarks.sh
 ```
 
-Tune subset sizes:
+Common tuning controls:
 
 ```bash
-ANN_BASE_COUNT=100000 ANN_QUERY_COUNT=2000 BIGANN_BASE_COUNT=250000 BIGANN_QUERY_COUNT=2000 ./test/bench/run_standard_benchmarks.sh
+BASE_COUNT=50000 QUERY_COUNT=1000 EFSEARCH_LIST=96,160 BEAM_LIST=8,16 CANDIDATE_BUDGET_LIST=512,1024 RERANK_LIST=64,128 ./test/bench/run_standard_benchmarks.sh
 ```
+
+Default tuning mode is `auto`, driven by the in-library adaptive budget policy (`pkg/budget`) and its sweep grid generator. Override with explicit lists via env vars above.
+
+Baseline freeze / compare:
+
+```bash
+FREEZE_BASELINE=1 ./test/bench/run_standard_benchmarks.sh
+```
+
+Outputs include per-dataset reports plus:
+
+- `/tmp/freshann-bench-data/reports/baseline-core6.json`
+- `/tmp/freshann-bench-data/reports/core6-comparison-matrix.json`
+- `/tmp/freshann-bench-data/reports/internet-comparison-matrix.json`
+- `/tmp/freshann-bench-data/reports/core6-comprehensive-table.json`
+- `/tmp/freshann-bench-data/reports/core6-comprehensive-table.md`

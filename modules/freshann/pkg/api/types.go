@@ -72,6 +72,47 @@ type GraphSpec struct {
 	Beam    int
 }
 
+type StorageSpec struct {
+	PebbleCacheBytes int64
+	VectorCacheBytes int64
+	BloomBitsPerKey  int
+	VectorBlockSize  int
+	GraphPageSize    int
+	PostingChunkSize int
+	EnableSSTIngest  bool
+}
+
+type BudgetPolicyMode string
+
+const (
+	BudgetPolicyAdaptive BudgetPolicyMode = "adaptive"
+	BudgetPolicyFixed    BudgetPolicyMode = "fixed"
+)
+
+type BudgetPolicySpec struct {
+	Mode               BudgetPolicyMode
+	TargetRecall       float64
+	MinEfSearch        int
+	MaxEfSearch        int
+	MinBeam            int
+	MaxBeam            int
+	MinCandidateBudget int
+	MaxCandidateBudget int
+	MinRerankK         int
+	MaxRerankK         int
+}
+
+type SearchTuning struct {
+	EfSearch           int
+	Beam               int
+	CandidateBudget    int
+	RerankK            int
+	ShardWorkers       int
+	TargetRecall       float64
+	BudgetScale        float64
+	AllowExactFallback bool
+}
+
 type FilterSpec struct {
 	EnablePartitionKey bool
 	EnableTags         bool
@@ -85,6 +126,9 @@ type IndexSpec struct {
 	DurabilityMode DurabilityMode
 	Quantizer      QuantizerSpec
 	Graph          GraphSpec
+	Storage        StorageSpec
+	BudgetPolicy   BudgetPolicySpec
+	SearchDefaults SearchTuning
 	FilterSpec     FilterSpec
 }
 
@@ -114,6 +158,7 @@ type SearchRequest struct {
 	TopK         int
 	PartitionKey string
 	Tags         map[string]string
+	Tuning       SearchTuning
 }
 
 type SearchHit struct {
@@ -145,4 +190,9 @@ type IndexStats struct {
 	VectorCount      uint64
 	AppliedMutations uint64
 	CurrentWatermark ApplyToken
+	FallbackScans    uint64
+	GraphPageReads   uint64
+	VectorBlockReads uint64
+	QPS90Last        float64
+	RecallAt10Last   float64
 }

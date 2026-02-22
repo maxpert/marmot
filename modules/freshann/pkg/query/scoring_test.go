@@ -56,3 +56,27 @@ func TestTopKWithWorkersMatchesSequential(t *testing.T) {
 		require.InDelta(t, seq[i].Score, par[i].Score, 1e-6)
 	}
 }
+
+func TestTopKDocIDsWithWorkersMatchesSequential(t *testing.T) {
+	rng := rand.New(rand.NewSource(42))
+	candidates := make(map[uint64][]float32, 5000)
+	for i := 0; i < 5000; i++ {
+		v := make([]float32, 16)
+		for j := range v {
+			v[j] = rng.Float32()
+		}
+		candidates[uint64(i)] = v
+	}
+	query := make([]float32, 16)
+	for i := range query {
+		query[i] = rng.Float32()
+	}
+
+	seq := TopKDocIDsWithWorkers(api.MetricCosine, query, candidates, 25, 1)
+	par := TopKDocIDsWithWorkers(api.MetricCosine, query, candidates, 25, 8)
+	require.Equal(t, len(seq), len(par))
+	for i := range seq {
+		require.Equal(t, seq[i].DocID, par[i].DocID)
+		require.InDelta(t, seq[i].Score, par[i].Score, 1e-6)
+	}
+}

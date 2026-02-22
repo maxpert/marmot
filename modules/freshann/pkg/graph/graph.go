@@ -106,9 +106,77 @@ func (g *Index) Build(vectors map[string][]float32) error {
 	return nil
 }
 
+func (g *Index) Insert(id string, vec []float32, lSearch int, beam int, getVec func(id string) ([]float32, bool)) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	if g.state.Adj == nil {
+		g.state.Adj = make(map[string][]string)
+	}
+	if _, exists := g.state.Adj[id]; exists {
+		g.removeNodeLocked(id)
+	}
+
+	if len(g.state.Adj) == 0 {
+		g.state.Adj[id] = nil
+		g.state.Start = []string{id}
+		return
+	}
+
+	if lSearch <= 0 {
+		lSearch = 64
+	}
+	if beam <= 0 {
+		beam = 8
+	}
+
+	candidates := g.searchUnlocked(vec, g.state.R*4, lSearch, beam, getVec)
+	neighbors := make([]string, 0, g.state.R)
+	for _, p := range candidates {
+		if p.id == id {
+			continue
+		}
+		neighbors = append(neighbors, p.id)
+		if len(neighbors) >= g.state.R {
+			break
+		}
+	}
+	g.state.Adj[id] = neighbors
+
+	for _, nb := range neighbors {
+		list := append(g.state.Adj[nb], id)
+		nbVec, ok := getVec(nb)
+		if !ok {
+			if len(list) > g.state.R {
+				list = list[:g.state.R]
+			}
+			g.state.Adj[nb] = list
+			continue
+		}
+		g.state.Adj[nb] = g.trimNeighborsByScore(nbVec, list, getVec)
+	}
+
+	seen := false
+	for _, sid := range g.state.Start {
+		if sid == id {
+			seen = true
+			break
+		}
+	}
+	if !seen {
+		if len(g.state.Start) < 8 {
+			g.state.Start = append(g.state.Start, id)
+		}
+	}
+}
+
 func (g *Index) RemoveNode(id string) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	g.removeNodeLocked(id)
+}
+
+func (g *Index) removeNodeLocked(id string) {
 	delete(g.state.Adj, id)
 	for n, nb := range g.state.Adj {
 		if len(nb) == 0 {
@@ -131,6 +199,104 @@ func (g *Index) RemoveNode(id string) {
 		}
 		g.state.Start = filtered
 	}
+}
+
+func (g *Index) trimNeighborsByScore(centerVec []float32, neighbors []string, getVec func(id string) ([]float32, bool)) []string {
+	if len(neighbors) <= g.state.R {
+		return dedupeStrings(neighbors)
+	}
+	u := dedupeStrings(neighbors)
+	type scoredNeighbor struct {
+		id    string
+		score float32
+	}
+	scored := make([]scoredNeighbor, 0, len(u))
+	for _, id := range u {
+		vec, ok := getVec(id)
+		if !ok {
+			continue
+		}
+		scored = append(scored, scoredNeighbor{id: id, score: score(g.state.Metric, centerVec, vec)})
+	}
+	sort.Slice(scored, func(i, j int) bool { return scored[i].score > scored[j].score })
+	if len(scored) > g.state.R {
+		scored = scored[:g.state.R]
+	}
+	out := make([]string, len(scored))
+	for i := range scored {
+		out[i] = scored[i].id
+	}
+	return out
+}
+
+func dedupeStrings(in []string) []string {
+	seen := make(map[string]struct{}, len(in))
+	out := make([]string, 0, len(in))
+	for _, v := range in {
+		if _, ok := seen[v]; ok {
+			continue
+		}
+		seen[v] = struct{}{}
+		out = append(out, v)
+	}
+	return out
+}
+
+func (g *Index) searchUnlocked(queryVec []float32, topK int, lSearch int, beam int,
+	getVec func(id string) ([]float32, bool)) []pair {
+	if topK <= 0 {
+		topK = 10
+	}
+	if len(g.state.Adj) == 0 || len(g.state.Start) == 0 {
+		return nil
+	}
+	visited := make(map[string]struct{}, lSearch*2)
+	frontier := &minHeap{}
+	heap.Init(frontier)
+	for _, id := range g.state.Start {
+		if _, ok := visited[id]; ok {
+			continue
+		}
+		vec, ok := getVec(id)
+		if !ok {
+			continue
+		}
+		visited[id] = struct{}{}
+		s := score(g.state.Metric, queryVec, vec)
+		heap.Push(frontier, pair{id: id, score: -s})
+	}
+	best := &topKHeap{}
+	heap.Init(&best.h)
+	expanded := 0
+	for frontier.Len() > 0 && expanded < lSearch {
+		current := heap.Pop(frontier).(pair)
+		id := current.id
+		expanded++
+		vec, ok := getVec(id)
+		if ok {
+			s := score(g.state.Metric, queryVec, vec)
+			best.push(topK, pair{id: id, score: s})
+		}
+		nb := g.state.Adj[id]
+		limit := len(nb)
+		if limit > beam {
+			limit = beam
+		}
+		for i := 0; i < limit; i++ {
+			cand := nb[i]
+			if _, ok := visited[cand]; ok {
+				continue
+			}
+			vec, ok := getVec(cand)
+			if !ok {
+				continue
+			}
+			visited[cand] = struct{}{}
+			s := score(g.state.Metric, queryVec, vec)
+			heap.Push(frontier, pair{id: cand, score: -s})
+		}
+	}
+	return best.sortedDesc()
 }
 
 func (g *Index) Search(queryVec []float32, topK int, lSearch int, beam int,
