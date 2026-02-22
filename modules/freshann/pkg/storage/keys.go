@@ -5,17 +5,21 @@ import "encoding/binary"
 var (
 	keySpec      = []byte("meta/spec")
 	keyWatermark = []byte("meta/watermark")
+	keyNextDocID = []byte("meta/next_docid")
 	keyGraphMeta = []byte("graph/meta")
 	keyGraphHead = []byte("graph/head")
 )
 
 const (
-	prefixVector  = "vec/"
-	prefixApplied = "applied/"
-	prefixPart    = "part/"
-	prefixTag     = "tag/"
-	prefixIDMap   = "idmap/"
-	prefixGraphN  = "graph/n/"
+	prefixVector    = "vec/"
+	prefixVectorDoc = "vecdoc/"
+	prefixExtToDoc  = "id/e2d/"
+	prefixDocToExt  = "id/d2e/"
+	prefixApplied   = "applied/"
+	prefixPart      = "part/"
+	prefixTag       = "tag/"
+	prefixIDMap     = "idmap/"
+	prefixGraphN    = "graph/n/"
 )
 
 func encodeAppliedKey(txnID, seqID uint64) []byte {
@@ -40,6 +44,34 @@ func decodeVectorExternalID(key []byte) []byte {
 	out := make([]byte, len(key)-len(prefixVector))
 	copy(out, key[len(prefixVector):])
 	return out
+}
+
+func encodeVectorDocKey(docID uint64) []byte {
+	buf := make([]byte, len(prefixVectorDoc)+8)
+	copy(buf, []byte(prefixVectorDoc))
+	binary.BigEndian.PutUint64(buf[len(prefixVectorDoc):], docID)
+	return buf
+}
+
+func decodeVectorDocID(key []byte) uint64 {
+	if len(key) < len(prefixVectorDoc)+8 {
+		return 0
+	}
+	return binary.BigEndian.Uint64(key[len(prefixVectorDoc):])
+}
+
+func encodeExtToDocKey(externalID []byte) []byte {
+	out := make([]byte, len(prefixExtToDoc)+len(externalID))
+	copy(out, []byte(prefixExtToDoc))
+	copy(out[len(prefixExtToDoc):], externalID)
+	return out
+}
+
+func encodeDocToExtKey(docID uint64) []byte {
+	buf := make([]byte, len(prefixDocToExt)+8)
+	copy(buf, []byte(prefixDocToExt))
+	binary.BigEndian.PutUint64(buf[len(prefixDocToExt):], docID)
+	return buf
 }
 
 func encodePartitionKey(partition string) []byte {

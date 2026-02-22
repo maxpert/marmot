@@ -11,7 +11,7 @@ import (
 type fakeRunner struct{}
 
 func (f fakeRunner) Run(_ context.Context, system System, cfg RunConfig) (Result, error) {
-	return Result{System: system, Dataset: cfg.Dataset, RecallAt10: 0.9, P95MS: 10, P99MS: 15, QPS: 500}, nil
+	return Result{System: system, Dataset: cfg.Dataset, RecallAt10: 0.9, P95MS: 10, P99MS: 15, QPS: 500, QPSAtRecall90: 500}, nil
 }
 
 func TestRunComparisonAndThreshold(t *testing.T) {

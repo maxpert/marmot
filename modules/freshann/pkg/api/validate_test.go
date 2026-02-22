@@ -17,6 +17,16 @@ func TestValidateSpec(t *testing.T) {
 		{ID: "x", Dim: 4, Metric: "l2"},
 		{ID: "x", Dim: 4, Metric: MetricDot, ApplyMode: "bad"},
 		{ID: "x", Dim: 4, Metric: MetricDot, DurabilityMode: "bad"},
+		{ID: "x", Dim: 4, Metric: MetricDot, Storage: StorageSpec{PebbleCacheBytes: -1}},
+		{ID: "x", Dim: 4, Metric: MetricDot, Storage: StorageSpec{VectorCacheBytes: -1}},
+		{ID: "x", Dim: 4, Metric: MetricDot, Storage: StorageSpec{VectorCacheBytes: MaxVectorCacheBytes + 1}},
+		{ID: "x", Dim: 4, Metric: MetricDot, BudgetPolicy: BudgetPolicySpec{Mode: "bad"}},
+		{ID: "x", Dim: 4, Metric: MetricDot, BudgetPolicy: BudgetPolicySpec{TargetRecall: 1.1}},
+		{ID: "x", Dim: 4, Metric: MetricDot, BudgetPolicy: BudgetPolicySpec{MinEfSearch: 20, MaxEfSearch: 10}},
+		{ID: "x", Dim: 4, Metric: MetricDot, BudgetPolicy: BudgetPolicySpec{MinCandidateBudget: 20, MaxCandidateBudget: 10}},
+		{ID: "x", Dim: 4, Metric: MetricDot, SearchDefaults: SearchTuning{CandidateBudget: -1}},
+		{ID: "x", Dim: 4, Metric: MetricDot, SearchDefaults: SearchTuning{TargetRecall: 1.5}},
+		{ID: "x", Dim: 4, Metric: MetricDot, SearchDefaults: SearchTuning{BudgetScale: -1}},
 	}
 	for _, tc := range cases {
 		require.Error(t, ValidateSpec(tc))

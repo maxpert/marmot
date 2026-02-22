@@ -77,6 +77,11 @@ type Candidate struct {
 	Score      float32
 }
 
+type CandidateDoc struct {
+	DocID uint64
+	Score float32
+}
+
 type minHeap []Candidate
 
 func (h minHeap) Len() int            { return len(h) }
@@ -211,6 +216,140 @@ func topKSequential(metric api.Metric, q []float32, candidates map[string][]floa
 	out := make([]Candidate, h.Len())
 	for i := len(out) - 1; i >= 0; i-- {
 		out[i] = heap.Pop(h).(Candidate)
+	}
+	return out
+}
+
+type minHeapDoc []CandidateDoc
+
+func (h minHeapDoc) Len() int            { return len(h) }
+func (h minHeapDoc) Less(i, j int) bool  { return h[i].Score < h[j].Score }
+func (h minHeapDoc) Swap(i, j int)       { h[i], h[j] = h[j], h[i] }
+func (h *minHeapDoc) Push(x interface{}) { *h = append(*h, x.(CandidateDoc)) }
+func (h *minHeapDoc) Pop() interface{} {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[:n-1]
+	return x
+}
+
+type CandidateDocEntry struct {
+	DocID uint64
+	Vec   []float32
+}
+
+func TopKDocIDsWithWorkers(metric api.Metric, q []float32, candidates map[uint64][]float32, k int, workers int) []CandidateDoc {
+	if k <= 0 {
+		return nil
+	}
+	if len(candidates) == 0 {
+		return nil
+	}
+	if workers <= 0 {
+		workers = runtime.GOMAXPROCS(0)
+		if workers > 4 {
+			workers = 4
+		}
+	}
+	if workers <= 1 || len(candidates) < 4096 {
+		return topKDocSequential(metric, q, candidates, k)
+	}
+
+	entries := make([]CandidateDocEntry, 0, len(candidates))
+	for docID, vec := range candidates {
+		entries = append(entries, CandidateDocEntry{DocID: docID, Vec: vec})
+	}
+	if workers > len(entries) {
+		workers = len(entries)
+	}
+	chunk := (len(entries) + workers - 1) / workers
+	locals := make([][]CandidateDoc, workers)
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for w := 0; w < workers; w++ {
+		start := w * chunk
+		end := start + chunk
+		if end > len(entries) {
+			end = len(entries)
+		}
+		go func(idx, lo, hi int) {
+			defer wg.Done()
+			if lo >= hi {
+				return
+			}
+			locals[idx] = topKDocEntries(metric, q, entries[lo:hi], k)
+		}(w, start, end)
+	}
+	wg.Wait()
+
+	merged := &minHeapDoc{}
+	heap.Init(merged)
+	for _, partial := range locals {
+		for _, cand := range partial {
+			if merged.Len() < k {
+				heap.Push(merged, cand)
+				continue
+			}
+			if (*merged)[0].Score < cand.Score {
+				heap.Pop(merged)
+				heap.Push(merged, cand)
+			}
+		}
+	}
+	out := make([]CandidateDoc, merged.Len())
+	for i := len(out) - 1; i >= 0; i-- {
+		out[i] = heap.Pop(merged).(CandidateDoc)
+	}
+	return out
+}
+
+func topKDocEntries(metric api.Metric, q []float32, entries []CandidateDocEntry, k int) []CandidateDoc {
+	if k <= 0 {
+		return nil
+	}
+	h := &minHeapDoc{}
+	heap.Init(h)
+	for _, ent := range entries {
+		s := Score(metric, q, ent.Vec)
+		cand := CandidateDoc{DocID: ent.DocID, Score: s}
+		if h.Len() < k {
+			heap.Push(h, cand)
+			continue
+		}
+		if (*h)[0].Score < s {
+			heap.Pop(h)
+			heap.Push(h, cand)
+		}
+	}
+	out := make([]CandidateDoc, h.Len())
+	for i := len(out) - 1; i >= 0; i-- {
+		out[i] = heap.Pop(h).(CandidateDoc)
+	}
+	return out
+}
+
+func topKDocSequential(metric api.Metric, q []float32, candidates map[uint64][]float32, k int) []CandidateDoc {
+	if k <= 0 {
+		return nil
+	}
+	h := &minHeapDoc{}
+	heap.Init(h)
+	for docID, vec := range candidates {
+		s := Score(metric, q, vec)
+		cand := CandidateDoc{DocID: docID, Score: s}
+		if h.Len() < k {
+			heap.Push(h, cand)
+			continue
+		}
+		if (*h)[0].Score < s {
+			heap.Pop(h)
+			heap.Push(h, cand)
+		}
+	}
+	out := make([]CandidateDoc, h.Len())
+	for i := len(out) - 1; i >= 0; i-- {
+		out[i] = heap.Pop(h).(CandidateDoc)
 	}
 	return out
 }

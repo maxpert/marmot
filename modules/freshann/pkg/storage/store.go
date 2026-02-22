@@ -15,6 +15,7 @@ import (
 	"github.com/RoaringBitmap/roaring/roaring64"
 	"github.com/cespare/xxhash/v2"
 	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/bloom"
 	"github.com/maxpert/marmot/modules/freshann/pkg/api"
 	"github.com/maxpert/marmot/modules/freshann/pkg/graph"
 )
@@ -30,8 +31,15 @@ type IndexStore struct {
 	db *pebble.DB
 }
 
+type VectorLookup struct {
+	iter *pebble.Iterator
+}
+
 type OpenOptions struct {
-	DisableWAL bool
+	DisableWAL       bool
+	PebbleCacheBytes int64
+	BloomBitsPerKey  int
+	BytesPerSync     int
 }
 
 type graphMeta struct {
@@ -43,7 +51,27 @@ func Open(path string, opts OpenOptions) (*IndexStore, error) {
 	if err := os.MkdirAll(path, 0o755); err != nil {
 		return nil, err
 	}
-	db, err := pebble.Open(path, &pebble.Options{DisableWAL: opts.DisableWAL})
+	if opts.PebbleCacheBytes <= 0 {
+		opts.PebbleCacheBytes = 256 << 20
+	}
+	if opts.BloomBitsPerKey <= 0 {
+		opts.BloomBitsPerKey = 10
+	}
+	if opts.BytesPerSync <= 0 {
+		opts.BytesPerSync = 512 << 10
+	}
+	c := pebble.NewCache(opts.PebbleCacheBytes)
+	defer c.Unref()
+	popts := &pebble.Options{
+		DisableWAL:   opts.DisableWAL,
+		BytesPerSync: opts.BytesPerSync,
+		Cache:        c,
+	}
+	for i := range popts.Levels {
+		popts.Levels[i].FilterPolicy = bloom.FilterPolicy(opts.BloomBitsPerKey)
+		popts.Levels[i].FilterType = pebble.TableFilter
+	}
+	db, err := pebble.Open(path, popts)
 	if err != nil {
 		return nil, err
 	}
@@ -222,10 +250,189 @@ func (s *IndexStore) Watermark() (api.ApplyToken, error) {
 	return tok, nil
 }
 
-func (s *IndexStore) PutVector(externalID []byte, rec VectorRecord, wo *pebble.WriteOptions) error {
-	old, exists, err := s.GetVector(externalID)
+func (s *IndexStore) nextDocID(batch *pebble.Batch) (uint64, error) {
+	v, closer, err := s.db.Get(keyNextDocID)
+	if err != nil && !errors.Is(err, pebble.ErrNotFound) {
+		return 0, err
+	}
+	var next uint64 = 1
+	if err == nil {
+		if len(v) != 8 {
+			closer.Close()
+			return 0, fmt.Errorf("invalid next doc id payload")
+		}
+		next = binary.BigEndian.Uint64(v)
+		closer.Close()
+	}
+	out := make([]byte, 8)
+	binary.BigEndian.PutUint64(out, next+1)
+	if err := batch.Set(keyNextDocID, out, nil); err != nil {
+		return 0, err
+	}
+	return next, nil
+}
+
+func (s *IndexStore) DocIDForExternalID(externalID []byte) (uint64, bool, error) {
+	key := encodeExtToDocKey(externalID)
+	v, closer, err := s.db.Get(key)
+	if errors.Is(err, pebble.ErrNotFound) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	defer closer.Close()
+	if len(v) != 8 {
+		return 0, false, fmt.Errorf("invalid doc id payload")
+	}
+	return binary.BigEndian.Uint64(v), true, nil
+}
+
+func (s *IndexStore) ExternalIDForDocID(docID uint64) ([]byte, bool, error) {
+	key := encodeDocToExtKey(docID)
+	v, closer, err := s.db.Get(key)
+	if errors.Is(err, pebble.ErrNotFound) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	defer closer.Close()
+	out := make([]byte, len(v))
+	copy(out, v)
+	return out, true, nil
+}
+
+func (s *IndexStore) GetVectorByDocID(docID uint64) (VectorRecord, bool, error) {
+	key := encodeVectorDocKey(docID)
+	v, closer, err := s.db.Get(key)
+	if errors.Is(err, pebble.ErrNotFound) {
+		return VectorRecord{}, false, nil
+	}
+	if err != nil {
+		return VectorRecord{}, false, err
+	}
+	defer closer.Close()
+	rec, err := decodeVectorRecord(v)
+	if err != nil {
+		return VectorRecord{}, false, err
+	}
+	return rec, true, nil
+}
+
+func (s *IndexStore) NewVectorLookup() (*VectorLookup, error) {
+	lower, upper := prefixBounds(prefixVectorDoc)
+	iter, err := s.db.NewIter(&pebble.IterOptions{LowerBound: lower, UpperBound: upper})
+	if err != nil {
+		return nil, err
+	}
+	return &VectorLookup{iter: iter}, nil
+}
+
+func (l *VectorLookup) Close() error {
+	if l == nil || l.iter == nil {
+		return nil
+	}
+	return l.iter.Close()
+}
+
+func (l *VectorLookup) GetVectorFP32ByDocID(docID uint64) ([]float32, bool, error) {
+	if l == nil || l.iter == nil {
+		return nil, false, fmt.Errorf("vector lookup is closed")
+	}
+	key := encodeVectorDocKey(docID)
+	if !l.iter.SeekGE(key) {
+		if err := l.iter.Error(); err != nil {
+			return nil, false, err
+		}
+		return nil, false, nil
+	}
+	if !bytes.Equal(l.iter.Key(), key) {
+		return nil, false, nil
+	}
+	vec, err := decodeVectorOnly(l.iter.Value())
+	if err != nil {
+		return nil, false, err
+	}
+	return vec, true, nil
+}
+
+func (l *VectorLookup) GetVectorByDocID(docID uint64) (VectorRecord, bool, error) {
+	if l == nil || l.iter == nil {
+		return VectorRecord{}, false, fmt.Errorf("vector lookup is closed")
+	}
+	key := encodeVectorDocKey(docID)
+	if !l.iter.SeekGE(key) {
+		if err := l.iter.Error(); err != nil {
+			return VectorRecord{}, false, err
+		}
+		return VectorRecord{}, false, nil
+	}
+	if !bytes.Equal(l.iter.Key(), key) {
+		return VectorRecord{}, false, nil
+	}
+	rec, err := decodeVectorRecord(l.iter.Value())
+	if err != nil {
+		return VectorRecord{}, false, err
+	}
+	return rec, true, nil
+}
+
+func (s *IndexStore) GetVectorFP32ByDocID(docID uint64) ([]float32, bool, error) {
+	key := encodeVectorDocKey(docID)
+	v, closer, err := s.db.Get(key)
+	if errors.Is(err, pebble.ErrNotFound) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	defer closer.Close()
+	vec, err := decodeVectorOnly(v)
+	if err != nil {
+		return nil, false, err
+	}
+	return vec, true, nil
+}
+
+func (s *IndexStore) IterateVectorsByDoc(fn func(docID uint64, externalID []byte, rec VectorRecord) error) error {
+	lower, upper := prefixBounds(prefixVectorDoc)
+	iter, err := s.db.NewIter(&pebble.IterOptions{LowerBound: lower, UpperBound: upper})
 	if err != nil {
 		return err
+	}
+	defer iter.Close()
+	for iter.First(); iter.Valid(); iter.Next() {
+		docID := decodeVectorDocID(iter.Key())
+		rec, err := decodeVectorRecord(iter.Value())
+		if err != nil {
+			return err
+		}
+		external, ok, err := s.ExternalIDForDocID(docID)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			continue
+		}
+		if err := fn(docID, external, rec); err != nil {
+			return err
+		}
+	}
+	return iter.Error()
+}
+
+func (s *IndexStore) PutVector(externalID []byte, rec VectorRecord, wo *pebble.WriteOptions) error {
+	docID, exists, err := s.DocIDForExternalID(externalID)
+	if err != nil {
+		return err
+	}
+	var old VectorRecord
+	if exists {
+		old, exists, err = s.GetVectorByDocID(docID)
+		if err != nil {
+			return err
+		}
 	}
 
 	encoded, err := encodeVectorRecord(rec)
@@ -235,12 +442,28 @@ func (s *IndexStore) PutVector(externalID []byte, rec VectorRecord, wo *pebble.W
 	hash := hashExternalID(externalID)
 	batch := s.db.NewBatch()
 	defer batch.Close()
-	if err := batch.Set(encodeVectorKey(externalID), encoded, nil); err != nil {
+	if !exists {
+		docID, err = s.nextDocID(batch)
+		if err != nil {
+			return err
+		}
+	}
+	docPayload := make([]byte, 8)
+	binary.BigEndian.PutUint64(docPayload, docID)
+	if err := batch.Set(encodeExtToDocKey(externalID), docPayload, nil); err != nil {
+		return err
+	}
+	if err := batch.Set(encodeDocToExtKey(docID), append([]byte(nil), externalID...), nil); err != nil {
+		return err
+	}
+	if err := batch.Set(encodeVectorDocKey(docID), encoded, nil); err != nil {
 		return err
 	}
 	if exists {
-		if err := s.bitmapRemove(batch, encodePartitionKey(old.PartitionKey), hash); err != nil {
-			return err
+		if old.PartitionKey != "" {
+			if err := s.bitmapRemove(batch, encodePartitionKey(old.PartitionKey), hash); err != nil {
+				return err
+			}
 		}
 		for k, v := range old.Tags {
 			if err := s.bitmapRemove(batch, encodeTagKey(k, v), hash); err != nil {
@@ -248,22 +471,33 @@ func (s *IndexStore) PutVector(externalID []byte, rec VectorRecord, wo *pebble.W
 			}
 		}
 	}
-	if err := s.bitmapAdd(batch, encodePartitionKey(rec.PartitionKey), hash); err != nil {
-		return err
+	if rec.PartitionKey != "" {
+		if err := s.bitmapAdd(batch, encodePartitionKey(rec.PartitionKey), hash); err != nil {
+			return err
+		}
 	}
 	for k, v := range rec.Tags {
 		if err := s.bitmapAdd(batch, encodeTagKey(k, v), hash); err != nil {
 			return err
 		}
 	}
-	if err := s.idMapAdd(batch, hash, externalID); err != nil {
-		return err
+	if rec.PartitionKey != "" || len(rec.Tags) > 0 {
+		if err := s.idMapAdd(batch, hash, externalID); err != nil {
+			return err
+		}
 	}
 	return batch.Commit(wo)
 }
 
 func (s *IndexStore) DeleteVector(externalID []byte, wo *pebble.WriteOptions) error {
-	old, exists, err := s.GetVector(externalID)
+	docID, exists, err := s.DocIDForExternalID(externalID)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return nil
+	}
+	old, exists, err := s.GetVectorByDocID(docID)
 	if err != nil {
 		return err
 	}
@@ -273,24 +507,42 @@ func (s *IndexStore) DeleteVector(externalID []byte, wo *pebble.WriteOptions) er
 	hash := hashExternalID(externalID)
 	batch := s.db.NewBatch()
 	defer batch.Close()
-	if err := batch.Delete(encodeVectorKey(externalID), nil); err != nil {
+	if err := batch.Delete(encodeVectorDocKey(docID), nil); err != nil {
 		return err
 	}
-	if err := s.bitmapRemove(batch, encodePartitionKey(old.PartitionKey), hash); err != nil {
+	if err := batch.Delete(encodeExtToDocKey(externalID), nil); err != nil {
 		return err
+	}
+	if err := batch.Delete(encodeDocToExtKey(docID), nil); err != nil {
+		return err
+	}
+	if old.PartitionKey != "" {
+		if err := s.bitmapRemove(batch, encodePartitionKey(old.PartitionKey), hash); err != nil {
+			return err
+		}
 	}
 	for k, v := range old.Tags {
 		if err := s.bitmapRemove(batch, encodeTagKey(k, v), hash); err != nil {
 			return err
 		}
 	}
-	if err := s.idMapRemove(batch, hash, externalID); err != nil {
-		return err
+	if old.PartitionKey != "" || len(old.Tags) > 0 {
+		if err := s.idMapRemove(batch, hash, externalID); err != nil {
+			return err
+		}
 	}
 	return batch.Commit(wo)
 }
 
 func (s *IndexStore) GetVector(externalID []byte) (VectorRecord, bool, error) {
+	docID, ok, err := s.DocIDForExternalID(externalID)
+	if err != nil {
+		return VectorRecord{}, false, err
+	}
+	if ok {
+		return s.GetVectorByDocID(docID)
+	}
+	// Backward compatibility for pre-docID records.
 	key := encodeVectorKey(externalID)
 	v, closer, err := s.db.Get(key)
 	if errors.Is(err, pebble.ErrNotFound) {
@@ -355,7 +607,37 @@ func (s *IndexStore) CandidateExternalIDs(partition string, tags map[string]stri
 	return out, nil
 }
 
+func (s *IndexStore) CandidateDocIDs(partition string, tags map[string]string) ([]uint64, error) {
+	ids, err := s.CandidateExternalIDs(partition, tags)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]uint64, 0, len(ids))
+	for _, externalID := range ids {
+		docID, ok, err := s.DocIDForExternalID(externalID)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			out = append(out, docID)
+		}
+	}
+	return out, nil
+}
+
 func (s *IndexStore) IterateVectors(fn func(externalID []byte, rec VectorRecord) error) error {
+	foundDoc := false
+	err := s.IterateVectorsByDoc(func(_ uint64, externalID []byte, rec VectorRecord) error {
+		foundDoc = true
+		return fn(externalID, rec)
+	})
+	if err != nil {
+		return err
+	}
+	if foundDoc {
+		return nil
+	}
+	// Backward compatibility for pre-docID key layout.
 	lower, upper := prefixBounds(prefixVector)
 	iter, err := s.db.NewIter(&pebble.IterOptions{LowerBound: lower, UpperBound: upper})
 	if err != nil {
@@ -415,12 +697,15 @@ func tokenGreater(a, b api.ApplyToken) bool {
 
 func encodeVectorRecord(rec VectorRecord) ([]byte, error) {
 	tags := rec.Tags
-	if tags == nil {
-		tags = map[string]string{}
-	}
-	tagsJSON, err := json.Marshal(tags)
-	if err != nil {
-		return nil, err
+	var (
+		tagsJSON []byte
+		err      error
+	)
+	if len(tags) > 0 {
+		tagsJSON, err = json.Marshal(tags)
+		if err != nil {
+			return nil, err
+		}
 	}
 	part := []byte(rec.PartitionKey)
 	vecBytes := len(rec.VectorFP32) * 4
@@ -462,8 +747,10 @@ func decodeVectorRecord(data []byte) (VectorRecord, error) {
 	if len(data) < off+tagsLen+4 {
 		return rec, fmt.Errorf("invalid vector record: short tags body")
 	}
-	if err := json.Unmarshal(data[off:off+tagsLen], &rec.Tags); err != nil {
-		return rec, err
+	if tagsLen > 0 {
+		if err := json.Unmarshal(data[off:off+tagsLen], &rec.Tags); err != nil {
+			return rec, err
+		}
 	}
 	off += tagsLen
 	dim := int(binary.BigEndian.Uint32(data[off : off+4]))
@@ -477,6 +764,36 @@ func decodeVectorRecord(data []byte) (VectorRecord, error) {
 		off += 4
 	}
 	return rec, nil
+}
+
+func decodeVectorOnly(data []byte) ([]float32, error) {
+	off := 0
+	if len(data) < 2 {
+		return nil, fmt.Errorf("invalid vector record: short partition len")
+	}
+	partLen := int(binary.BigEndian.Uint16(data[off : off+2]))
+	off += 2
+	if len(data) < off+partLen+4 {
+		return nil, fmt.Errorf("invalid vector record: short partition body")
+	}
+	off += partLen
+	tagsLen := int(binary.BigEndian.Uint32(data[off : off+4]))
+	off += 4
+	if len(data) < off+tagsLen+4 {
+		return nil, fmt.Errorf("invalid vector record: short tags body")
+	}
+	off += tagsLen
+	dim := int(binary.BigEndian.Uint32(data[off : off+4]))
+	off += 4
+	if len(data) < off+dim*4 {
+		return nil, fmt.Errorf("invalid vector record: vector payload truncated")
+	}
+	vec := make([]float32, dim)
+	for i := 0; i < dim; i++ {
+		vec[i] = math.Float32frombits(binary.LittleEndian.Uint32(data[off : off+4]))
+		off += 4
+	}
+	return vec, nil
 }
 
 func hashExternalID(externalID []byte) uint64 { return xxhash.Sum64(externalID) }

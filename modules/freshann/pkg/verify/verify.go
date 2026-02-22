@@ -2,6 +2,7 @@ package verify
 
 import (
 	"fmt"
+	"strconv"
 
 	"github.com/maxpert/marmot/modules/freshann/pkg/api"
 	"github.com/maxpert/marmot/modules/freshann/pkg/segment"
@@ -59,9 +60,17 @@ func RunComprehensive(spec api.IndexSpec, store *storage.IndexStore, manifest se
 	}
 	report.Checks = append(report.Checks, checkGraphPresent)
 	if hasGraph && deep {
+		resolveGraphNode := func(nodeID string) (bool, error) {
+			if docID, err := strconv.ParseUint(nodeID, 10, 64); err == nil {
+				_, ok, err := store.GetVectorByDocID(docID)
+				return ok, err
+			}
+			_, ok, err := store.GetVector([]byte(nodeID))
+			return ok, err
+		}
 		dangling := 0
 		for src, nbs := range state.Adj {
-			_, ok, err := store.GetVector([]byte(src))
+			ok, err := resolveGraphNode(src)
 			if err != nil {
 				return api.VerifyReport{}, err
 			}
@@ -69,7 +78,7 @@ func RunComprehensive(spec api.IndexSpec, store *storage.IndexStore, manifest se
 				dangling++
 			}
 			for _, dst := range nbs {
-				_, ok, err := store.GetVector([]byte(dst))
+				ok, err := resolveGraphNode(dst)
 				if err != nil {
 					return api.VerifyReport{}, err
 				}

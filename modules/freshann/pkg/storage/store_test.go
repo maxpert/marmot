@@ -19,6 +19,14 @@ func TestStoreVectorRoundTrip(t *testing.T) {
 
 	rec := VectorRecord{PartitionKey: "p", Tags: map[string]string{"a": "b"}, VectorFP32: []float32{1, 2}}
 	require.NoError(t, store.PutVector([]byte("k"), rec, nil))
+	docID, ok, err := store.DocIDForExternalID([]byte("k"))
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.NotZero(t, docID)
+	ext, ok, err := store.ExternalIDForDocID(docID)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, []byte("k"), ext)
 
 	var got VectorRecord
 	err = store.IterateVectors(func(_ []byte, rec VectorRecord) error {
@@ -29,6 +37,28 @@ func TestStoreVectorRoundTrip(t *testing.T) {
 	require.Equal(t, rec.PartitionKey, got.PartitionKey)
 	require.Equal(t, rec.Tags, got.Tags)
 	require.Equal(t, rec.VectorFP32, got.VectorFP32)
+
+	docRec, ok, err := store.GetVectorByDocID(docID)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, rec.VectorFP32, docRec.VectorFP32)
+
+	vecOnly, ok, err := store.GetVectorFP32ByDocID(docID)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, rec.VectorFP32, vecOnly)
+
+	lookup, err := store.NewVectorLookup()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = lookup.Close() })
+	vecOnly, ok, err = lookup.GetVectorFP32ByDocID(docID)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, rec.VectorFP32, vecOnly)
+	docRec, ok, err = lookup.GetVectorByDocID(docID)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, rec.VectorFP32, docRec.VectorFP32)
 }
 
 func TestCandidateExternalIDs(t *testing.T) {
@@ -76,4 +106,22 @@ func TestAppliedAndWatermark(t *testing.T) {
 	wm, err := store.Watermark()
 	require.NoError(t, err)
 	require.Equal(t, tok, wm)
+}
+
+func TestStoreVectorRoundTripNoTags(t *testing.T) {
+	store, err := Open(t.TempDir(), OpenOptions{})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = store.Close() })
+
+	rec := VectorRecord{PartitionKey: "", VectorFP32: []float32{3, 4}}
+	require.NoError(t, store.PutVector([]byte("n"), rec, nil))
+	docID, ok, err := store.DocIDForExternalID([]byte("n"))
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	got, ok, err := store.GetVectorByDocID(docID)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, rec.VectorFP32, got.VectorFP32)
+	require.Nil(t, got.Tags)
 }
