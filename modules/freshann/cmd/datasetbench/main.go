@@ -39,14 +39,27 @@ type tuningPoint struct {
 }
 
 type runResult struct {
-	Tuning        tuningPoint `json:"tuning"`
-	RecallAtK     float64     `json:"recall_at_k"`
-	P50MS         float64     `json:"p50_ms"`
-	P95MS         float64     `json:"p95_ms"`
-	P99MS         float64     `json:"p99_ms"`
-	QPS           float64     `json:"qps"`
-	QuerySeconds  float64     `json:"query_seconds"`
-	FallbackScans uint64      `json:"fallback_scans"`
+	Tuning         tuningPoint     `json:"tuning"`
+	ResolvedTuning tuningPoint     `json:"resolved_tuning"`
+	Diagnostics    diagnosticsView `json:"diagnostics"`
+	RecallAtK      float64         `json:"recall_at_k"`
+	P50MS          float64         `json:"p50_ms"`
+	P95MS          float64         `json:"p95_ms"`
+	P99MS          float64         `json:"p99_ms"`
+	QPS            float64         `json:"qps"`
+	QuerySeconds   float64         `json:"query_seconds"`
+	FallbackScans  uint64          `json:"fallback_scans"`
+}
+
+type diagnosticsView struct {
+	CandidatesBeforeRerank float64 `json:"candidates_before_rerank"`
+	CandidatesAfterRerank  float64 `json:"candidates_after_rerank"`
+	CoarseCandidates       float64 `json:"coarse_candidates"`
+	GraphCandidates        float64 `json:"graph_candidates"`
+	FilterCandidates       float64 `json:"filter_candidates"`
+	VectorCacheHitRatio    float64 `json:"vector_cache_hit_ratio"`
+	GraphSteps             float64 `json:"graph_steps"`
+	FallbackUsed           bool    `json:"fallback_used"`
 }
 
 type memSummary struct {
@@ -167,16 +180,20 @@ func main() {
 	searchDefaults.AllowExactFallback = *allowFallback
 
 	_, err = eng.CreateIndex(ctx, freshann.IndexSpec{
+		FormatVersion:  2,
 		ID:             freshann.IndexID("bench"),
 		Dim:            dim,
 		Metric:         metric,
 		ApplyMode:      freshann.ApplyModeSync,
 		DurabilityMode: freshann.DurabilityPeriodic,
 		Graph: freshann.GraphSpec{
-			R:       16,
-			LBuild:  *graphLBuild,
-			LSearch: 256,
-			Beam:    32,
+			R:                         16,
+			LBuild:                    *graphLBuild,
+			LSearch:                   256,
+			Beam:                      32,
+			ConsolidateEveryMutations: *graphLBuild,
+			ConsolidateMinInterval:    5 * time.Second,
+			ConsolidateDeltaRatio:     0.05,
 		},
 		Storage: freshann.StorageSpec{
 			VectorCacheBytes: 128 << 20,
@@ -353,6 +370,19 @@ func main() {
 func runQueries(ctx context.Context, idx freshann.Index, queries [][]float32, gt [][]int, topK int, queryWorkers int, allowFallback bool, tuning tuningPoint) runResult {
 	durations := make([]time.Duration, len(queries))
 	hitCounts := make([]int, len(queries))
+	type queryDiag struct {
+		before      int
+		after       int
+		coarse      int
+		graph       int
+		filter      int
+		cacheRatio  float64
+		graphSteps  int
+		fallback    bool
+		resolved    freshann.SearchTuning
+		hasResolved bool
+	}
+	diags := make([]queryDiag, len(queries))
 	queryStart := time.Now()
 
 	workerCount := queryWorkers
@@ -368,6 +398,7 @@ func runQueries(ctx context.Context, idx freshann.Index, queries [][]float32, gt
 			res, err := idx.Search(ctx, freshann.SearchRequest{
 				VectorFP32: qv,
 				TopK:       topK,
+				Debug:      true,
 				Tuning: freshann.SearchTuning{
 					EfSearch:           tuning.EfSearch,
 					Beam:               tuning.Beam,
@@ -380,6 +411,18 @@ func runQueries(ctx context.Context, idx freshann.Index, queries [][]float32, gt
 			durations[qi] = time.Since(t0)
 			if err != nil {
 				continue
+			}
+			diags[qi] = queryDiag{
+				before:      res.Diagnostics.CandidatesBeforeRerank,
+				after:       res.Diagnostics.CandidatesAfterRerank,
+				coarse:      res.Diagnostics.CoarseCandidates,
+				graph:       res.Diagnostics.GraphCandidates,
+				filter:      res.Diagnostics.FilterCandidates,
+				cacheRatio:  res.Diagnostics.VectorCacheHitRatio,
+				graphSteps:  res.Diagnostics.GraphSteps,
+				fallback:    res.Diagnostics.FallbackUsed,
+				resolved:    res.ResolvedTuning,
+				hasResolved: true,
 			}
 			pred := make([]int, 0, len(res.Hits))
 			for _, h := range res.Hits {
@@ -406,6 +449,7 @@ func runQueries(ctx context.Context, idx freshann.Index, queries [][]float32, gt
 					res, err := idx.Search(ctx, freshann.SearchRequest{
 						VectorFP32: queries[j.qi],
 						TopK:       topK,
+						Debug:      true,
 						Tuning: freshann.SearchTuning{
 							EfSearch:           tuning.EfSearch,
 							Beam:               tuning.Beam,
@@ -418,6 +462,18 @@ func runQueries(ctx context.Context, idx freshann.Index, queries [][]float32, gt
 					durations[j.qi] = time.Since(t0)
 					if err != nil {
 						continue
+					}
+					diags[j.qi] = queryDiag{
+						before:      res.Diagnostics.CandidatesBeforeRerank,
+						after:       res.Diagnostics.CandidatesAfterRerank,
+						coarse:      res.Diagnostics.CoarseCandidates,
+						graph:       res.Diagnostics.GraphCandidates,
+						filter:      res.Diagnostics.FilterCandidates,
+						cacheRatio:  res.Diagnostics.VectorCacheHitRatio,
+						graphSteps:  res.Diagnostics.GraphSteps,
+						fallback:    res.Diagnostics.FallbackUsed,
+						resolved:    res.ResolvedTuning,
+						hasResolved: true,
 					}
 					pred := make([]int, 0, len(res.Hits))
 					for _, h := range res.Hits {
@@ -443,12 +499,62 @@ func runQueries(ctx context.Context, idx freshann.Index, queries [][]float32, gt
 	for _, n := range hitCounts {
 		totalHits += n
 	}
+	var (
+		totalBefore     int
+		totalAfter      int
+		totalCoarse     int
+		totalGraph      int
+		totalFilter     int
+		totalGraphSteps int
+		totalCacheRatio float64
+		diagCount       int
+		fallbackUsed    bool
+		resolved        freshann.SearchTuning
+	)
+	for _, d := range diags {
+		if !d.hasResolved {
+			continue
+		}
+		diagCount++
+		totalBefore += d.before
+		totalAfter += d.after
+		totalCoarse += d.coarse
+		totalGraph += d.graph
+		totalFilter += d.filter
+		totalGraphSteps += d.graphSteps
+		totalCacheRatio += d.cacheRatio
+		if d.fallback {
+			fallbackUsed = true
+		}
+		resolved = d.resolved
+	}
 	recall := float64(totalHits) / float64(len(queries)*topK)
 	p50, p95, p99 := percentileMS(durations, 50), percentileMS(durations, 95), percentileMS(durations, 99)
 	qps := float64(len(queries)) / queryDur.Seconds()
+	diagView := diagnosticsView{}
+	if diagCount > 0 {
+		diagView = diagnosticsView{
+			CandidatesBeforeRerank: float64(totalBefore) / float64(diagCount),
+			CandidatesAfterRerank:  float64(totalAfter) / float64(diagCount),
+			CoarseCandidates:       float64(totalCoarse) / float64(diagCount),
+			GraphCandidates:        float64(totalGraph) / float64(diagCount),
+			FilterCandidates:       float64(totalFilter) / float64(diagCount),
+			VectorCacheHitRatio:    totalCacheRatio / float64(diagCount),
+			GraphSteps:             float64(totalGraphSteps) / float64(diagCount),
+			FallbackUsed:           fallbackUsed,
+		}
+	}
 
 	return runResult{
-		Tuning:       tuning,
+		Tuning: tuning,
+		ResolvedTuning: tuningPoint{
+			EfSearch:        resolved.EfSearch,
+			Beam:            resolved.Beam,
+			CandidateBudget: resolved.CandidateBudget,
+			RerankK:         resolved.RerankK,
+			ShardWorkers:    resolved.ShardWorkers,
+		},
+		Diagnostics:  diagView,
 		RecallAtK:    recall,
 		P50MS:        p50,
 		P95MS:        p95,

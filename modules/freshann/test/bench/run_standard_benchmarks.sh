@@ -19,6 +19,8 @@ EFSEARCH_LIST="${EFSEARCH_LIST:-auto}"
 BEAM_LIST="${BEAM_LIST:-auto}"
 CANDIDATE_BUDGET_LIST="${CANDIDATE_BUDGET_LIST:-auto}"
 RERANK_LIST="${RERANK_LIST:-auto}"
+CPU_PROFILE_DIR="${CPU_PROFILE_DIR:-}"
+MEM_PROFILE_DIR="${MEM_PROFILE_DIR:-}"
 
 BASELINE_REPORT="${BASELINE_REPORT:-$REPORT_ROOT/baseline-core6.json}"
 MATRIX_REPORT="${MATRIX_REPORT:-$REPORT_ROOT/core6-comparison-matrix.json}"
@@ -52,6 +54,16 @@ datasets=(
 for ds in "${datasets[@]}"; do
   echo "[freshann] running dataset: $ds"
   out="$REPORT_ROOT/$ds.json"
+  cpu_args=()
+  mem_args=()
+  if [[ -n "$CPU_PROFILE_DIR" ]]; then
+    mkdir -p "$CPU_PROFILE_DIR"
+    cpu_args=(--cpu-profile "$CPU_PROFILE_DIR/$ds.cpu.pprof")
+  fi
+  if [[ -n "$MEM_PROFILE_DIR" ]]; then
+    mkdir -p "$MEM_PROFILE_DIR"
+    mem_args=(--mem-profile "$MEM_PROFILE_DIR/$ds.mem.pprof")
+  fi
   go run ./cmd/datasetbench \
     --dataset-dir "$DATASET_ROOT/$ds" \
     --index-root "$INDEX_ROOT" \
@@ -63,6 +75,8 @@ for ds in "${datasets[@]}"; do
     --candidate-budget-list "$CANDIDATE_BUDGET_LIST" \
     --rerank-list "$RERANK_LIST" \
     --allow-exact-fallback=$([[ "$ALLOW_EXACT_FALLBACK" == "1" ]] && echo true || echo false) \
+    "${cpu_args[@]}" \
+    "${mem_args[@]}" \
     --out "$out"
 done
 

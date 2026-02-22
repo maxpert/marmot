@@ -2,22 +2,21 @@ package verify
 
 import (
 	"fmt"
-	"strconv"
 
 	"github.com/maxpert/marmot/modules/freshann/pkg/api"
 	"github.com/maxpert/marmot/modules/freshann/pkg/segment"
-	"github.com/maxpert/marmot/modules/freshann/pkg/storage"
+	"github.com/maxpert/marmot/modules/freshann/pkg/storagev2"
 )
 
-func RunBasic(spec api.IndexSpec, store *storage.IndexStore) (api.VerifyReport, error) {
+func RunBasic(spec api.IndexSpec, store *storagev2.IndexStore) (api.VerifyReport, error) {
 	return RunComprehensive(spec, store, segment.Manifest{}, "", false)
 }
 
-func RunComprehensive(spec api.IndexSpec, store *storage.IndexStore, manifest segment.Manifest, indexDir string, deep bool) (api.VerifyReport, error) {
+func RunComprehensive(spec api.IndexSpec, store *storagev2.IndexStore, manifest segment.Manifest, indexDir string, deep bool) (api.VerifyReport, error) {
 	report := api.VerifyReport{Healthy: true}
 
 	var dimMismatch int
-	err := store.IterateVectors(func(_ []byte, rec storage.VectorRecord) error {
+	err := store.IterateVectorsByDoc(func(_ uint64, _ []byte, rec storagev2.VectorRecord) error {
 		if len(rec.VectorFP32) != spec.Dim {
 			dimMismatch++
 		}
@@ -60,12 +59,8 @@ func RunComprehensive(spec api.IndexSpec, store *storage.IndexStore, manifest se
 	}
 	report.Checks = append(report.Checks, checkGraphPresent)
 	if hasGraph && deep {
-		resolveGraphNode := func(nodeID string) (bool, error) {
-			if docID, err := strconv.ParseUint(nodeID, 10, 64); err == nil {
-				_, ok, err := store.GetVectorByDocID(docID)
-				return ok, err
-			}
-			_, ok, err := store.GetVector([]byte(nodeID))
+		resolveGraphNode := func(docID uint64) (bool, error) {
+			_, ok, err := store.GetVectorByDocID(docID)
 			return ok, err
 		}
 		dangling := 0

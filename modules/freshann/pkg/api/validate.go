@@ -1,12 +1,18 @@
 package api
 
-import "fmt"
+import (
+	"fmt"
+	"time"
+)
 
 const MaxVectorCacheBytes int64 = 128 << 20
 
 func ValidateSpec(spec IndexSpec) error {
 	if spec.ID == "" {
 		return fmt.Errorf("%w: id is required", ErrInvalidSpec)
+	}
+	if spec.FormatVersion != 0 && spec.FormatVersion != 2 {
+		return fmt.Errorf("%w: format version %d", ErrUnsupportedFormat, spec.FormatVersion)
 	}
 	if spec.Dim <= 0 {
 		return fmt.Errorf("%w: dim must be > 0", ErrInvalidSpec)
@@ -28,6 +34,15 @@ func ValidateSpec(spec IndexSpec) error {
 	}
 	if spec.Graph.R < 0 || spec.Graph.LBuild < 0 || spec.Graph.LSearch < 0 || spec.Graph.Beam < 0 {
 		return fmt.Errorf("%w: graph values must be >= 0", ErrInvalidSpec)
+	}
+	if spec.Graph.ConsolidateEveryMutations < 0 {
+		return fmt.Errorf("%w: consolidate every mutations must be >= 0", ErrInvalidSpec)
+	}
+	if spec.Graph.ConsolidateMinInterval < 0*time.Second {
+		return fmt.Errorf("%w: consolidate min interval must be >= 0", ErrInvalidSpec)
+	}
+	if spec.Graph.ConsolidateDeltaRatio < 0 || spec.Graph.ConsolidateDeltaRatio > 1 {
+		return fmt.Errorf("%w: consolidate delta ratio must be between 0 and 1", ErrInvalidSpec)
 	}
 	if spec.Storage.PebbleCacheBytes < 0 {
 		return fmt.Errorf("%w: storage pebble cache bytes must be >= 0", ErrInvalidSpec)

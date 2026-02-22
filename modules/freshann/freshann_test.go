@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/maxpert/marmot/modules/freshann/pkg/storage"
+	"github.com/maxpert/marmot/modules/freshann/pkg/storagev2"
 	"github.com/stretchr/testify/require"
 )
 
@@ -244,7 +245,7 @@ func TestSearchSteadyStateSkipsFullScanFallback(t *testing.T) {
 	orig := iterateAllVectorsForSearch
 	defer func() { iterateAllVectorsForSearch = orig }()
 	fullScanCalls := 0
-	iterateAllVectorsForSearch = func(store *storage.IndexStore, fn func([]byte, storage.VectorRecord) error) error {
+	iterateAllVectorsForSearch = func(store *storagev2.IndexStore, fn func(uint64, []byte, storagev2.VectorRecord) error) error {
 		fullScanCalls++
 		return orig(store, fn)
 	}
@@ -274,7 +275,7 @@ func TestSearchDirtyStateUsesPendingDeltaWithoutFullScan(t *testing.T) {
 	orig := iterateAllVectorsForSearch
 	defer func() { iterateAllVectorsForSearch = orig }()
 	fullScanCalls := 0
-	iterateAllVectorsForSearch = func(store *storage.IndexStore, fn func([]byte, storage.VectorRecord) error) error {
+	iterateAllVectorsForSearch = func(store *storagev2.IndexStore, fn func(uint64, []byte, storagev2.VectorRecord) error) error {
 		fullScanCalls++
 		return orig(store, fn)
 	}
@@ -283,4 +284,68 @@ func TestSearchDirtyStateUsesPendingDeltaWithoutFullScan(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEmpty(t, res.Hits)
 	require.Equal(t, 0, fullScanCalls)
+}
+
+func TestCreateRejectsUnsupportedFormatVersion(t *testing.T) {
+	t.Parallel()
+	eng, err := NewEngine(EngineOptions{RootDir: t.TempDir()})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = eng.Close() })
+
+	_, err = eng.CreateIndex(context.Background(), IndexSpec{
+		ID:            "idx",
+		FormatVersion: 1,
+		Dim:           2,
+		Metric:        MetricDot,
+	})
+	require.ErrorIs(t, err, ErrUnsupportedFormat)
+}
+
+func TestOpenRejectsLegacyFormatIndex(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	idxDir := filepath.Join(root, "idx")
+	store, err := storage.Open(storage.PebblePath(idxDir), storage.OpenOptions{})
+	require.NoError(t, err)
+	require.NoError(t, store.SaveSpec(IndexSpec{ID: "idx", Dim: 2, Metric: MetricDot, FormatVersion: 1}))
+	require.NoError(t, store.Close())
+
+	eng, err := NewEngine(EngineOptions{RootDir: root})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = eng.Close() })
+
+	_, err = eng.OpenIndex(context.Background(), "idx")
+	require.ErrorIs(t, err, ErrUnsupportedFormat)
+}
+
+func TestSearchDebugDiagnosticsAndStats(t *testing.T) {
+	t.Parallel()
+	eng, err := NewEngine(EngineOptions{RootDir: t.TempDir()})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = eng.Close() })
+
+	ctx := context.Background()
+	_, err = eng.CreateIndex(ctx, IndexSpec{ID: "idx", Dim: 2, Metric: MetricDot})
+	require.NoError(t, err)
+	idx, err := eng.OpenIndex(ctx, "idx")
+	require.NoError(t, err)
+
+	_, err = idx.Upsert(ctx, Mutation{TxnID: 1, SeqID: 1, ExternalID: []byte("a"), VectorFP32: []float32{1, 0}})
+	require.NoError(t, err)
+	_, err = idx.Upsert(ctx, Mutation{TxnID: 1, SeqID: 2, ExternalID: []byte("b"), VectorFP32: []float32{0, 1}})
+	require.NoError(t, err)
+	require.NoError(t, idx.Flush(ctx))
+
+	res, err := idx.Search(ctx, SearchRequest{VectorFP32: []float32{1, 0}, TopK: 1, Debug: true})
+	require.NoError(t, err)
+	require.NotEmpty(t, res.Hits)
+	require.Greater(t, res.ResolvedTuning.EfSearch, 0)
+	require.GreaterOrEqual(t, res.Diagnostics.CandidatesBeforeRerank, res.Diagnostics.CandidatesAfterRerank)
+	require.Greater(t, res.Diagnostics.GraphSteps, 0)
+
+	stats, err := idx.Stats(ctx)
+	require.NoError(t, err)
+	require.Greater(t, stats.QueryCount, uint64(0))
+	require.Greater(t, stats.AvgCandidates, 0.0)
+	require.Greater(t, stats.LastResolvedTuning.EfSearch, 0)
 }
