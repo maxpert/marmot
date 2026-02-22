@@ -2,6 +2,7 @@ package api
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -13,6 +14,7 @@ func TestValidateSpec(t *testing.T) {
 
 	cases := []IndexSpec{
 		{Dim: 4, Metric: MetricCosine},
+		{ID: "x", FormatVersion: 1, Dim: 4, Metric: MetricCosine},
 		{ID: "x", Dim: 0, Metric: MetricCosine},
 		{ID: "x", Dim: 4, Metric: "l2"},
 		{ID: "x", Dim: 4, Metric: MetricDot, ApplyMode: "bad"},
@@ -27,6 +29,9 @@ func TestValidateSpec(t *testing.T) {
 		{ID: "x", Dim: 4, Metric: MetricDot, SearchDefaults: SearchTuning{CandidateBudget: -1}},
 		{ID: "x", Dim: 4, Metric: MetricDot, SearchDefaults: SearchTuning{TargetRecall: 1.5}},
 		{ID: "x", Dim: 4, Metric: MetricDot, SearchDefaults: SearchTuning{BudgetScale: -1}},
+		{ID: "x", Dim: 4, Metric: MetricDot, Graph: GraphSpec{ConsolidateEveryMutations: -1}},
+		{ID: "x", Dim: 4, Metric: MetricDot, Graph: GraphSpec{ConsolidateMinInterval: -1 * time.Second}},
+		{ID: "x", Dim: 4, Metric: MetricDot, Graph: GraphSpec{ConsolidateDeltaRatio: 1.1}},
 	}
 	for _, tc := range cases {
 		require.Error(t, ValidateSpec(tc))

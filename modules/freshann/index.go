@@ -19,17 +19,17 @@ import (
 	"github.com/dgraph-io/ristretto"
 	"github.com/maxpert/marmot/modules/freshann/pkg/api"
 	annbudget "github.com/maxpert/marmot/modules/freshann/pkg/budget"
-	annfilter "github.com/maxpert/marmot/modules/freshann/pkg/filter"
-	"github.com/maxpert/marmot/modules/freshann/pkg/graph"
+	"github.com/maxpert/marmot/modules/freshann/pkg/graphv2"
 	"github.com/maxpert/marmot/modules/freshann/pkg/query"
 	"github.com/maxpert/marmot/modules/freshann/pkg/repair"
 	"github.com/maxpert/marmot/modules/freshann/pkg/segment"
 	"github.com/maxpert/marmot/modules/freshann/pkg/storage"
+	"github.com/maxpert/marmot/modules/freshann/pkg/storagev2"
 	annverify "github.com/maxpert/marmot/modules/freshann/pkg/verify"
 )
 
-var iterateAllVectorsForSearch = func(store *storage.IndexStore, fn func([]byte, storage.VectorRecord) error) error {
-	return store.IterateVectors(fn)
+var iterateAllVectorsForSearch = func(store *storagev2.IndexStore, fn func(uint64, []byte, storagev2.VectorRecord) error) error {
+	return store.IterateVectorsByDoc(fn)
 }
 
 type mutationOp string
@@ -52,10 +52,10 @@ type index struct {
 	dir  string
 	spec IndexSpec
 
-	store    *storage.IndexStore
+	store    *storagev2.IndexStore
 	manifest segment.Manifest
 
-	graphIdx *graph.Index
+	graphIdx *graphv2.Index
 
 	repairQ             *repair.Queue
 	graphDirty          bool
@@ -80,6 +80,14 @@ type index struct {
 	fallbackScans    uint64
 	graphPageReads   uint64
 	vectorBlockReads uint64
+	queryCount       uint64
+	totalCandidates  uint64
+	totalRerank      uint64
+	vectorCacheHits  uint64
+	vectorCacheLooks uint64
+
+	tuningMu           sync.RWMutex
+	lastResolvedTuning SearchTuning
 }
 
 type coarseIndex struct {
@@ -310,13 +318,15 @@ func openIndex(indexDir string, createSpec IndexSpec, periodicSync time.Duration
 	if err := os.MkdirAll(indexDir, 0o755); err != nil {
 		return nil, err
 	}
-	openOpts := storage.OpenOptions{}
+	openOpts := storagev2.OpenOptions{}
 	if create {
 		def := withDefaultSpec(createSpec)
 		openOpts.PebbleCacheBytes = def.Storage.PebbleCacheBytes
 		openOpts.BloomBitsPerKey = def.Storage.BloomBitsPerKey
+		openOpts.PostingChunkSize = def.Storage.PostingChunkSize
+		openOpts.GraphPageSize = def.Storage.GraphPageSize
 	}
-	store, err := storage.Open(storage.PebblePath(indexDir), openOpts)
+	store, err := storagev2.Open(storagev2.PebblePath(indexDir), openOpts)
 	if err != nil {
 		return nil, err
 	}
@@ -324,6 +334,10 @@ func openIndex(indexDir string, createSpec IndexSpec, periodicSync time.Duration
 	var spec IndexSpec
 	if create {
 		spec = withDefaultSpec(createSpec)
+		if spec.FormatVersion != 2 {
+			_ = store.Close()
+			return nil, fmt.Errorf("%w: requested=%d", ErrUnsupportedFormat, spec.FormatVersion)
+		}
 		if err := store.SaveSpec(spec); err != nil {
 			_ = store.Close()
 			return nil, err
@@ -331,10 +345,18 @@ func openIndex(indexDir string, createSpec IndexSpec, periodicSync time.Duration
 	} else {
 		spec, err = store.LoadSpec()
 		if err != nil {
+			if errors.Is(err, pebble.ErrNotFound) {
+				_ = store.Close()
+				return nil, fmt.Errorf("%w: missing v2 spec", ErrUnsupportedFormat)
+			}
 			_ = store.Close()
 			return nil, fmt.Errorf("load spec: %w", err)
 		}
 		spec = withDefaultSpec(spec)
+		if spec.FormatVersion != 2 {
+			_ = store.Close()
+			return nil, fmt.Errorf("%w: found=%d", ErrUnsupportedFormat, spec.FormatVersion)
+		}
 	}
 
 	idx := &index{
@@ -343,9 +365,9 @@ func openIndex(indexDir string, createSpec IndexSpec, periodicSync time.Duration
 		store:              store,
 		notify:             make(chan struct{}, 1),
 		repairQ:            repair.NewQueue(),
-		compactThreshold:   spec.Graph.LBuild,
+		compactThreshold:   spec.Graph.ConsolidateEveryMutations,
 		lastCheckpointAt:   time.Now().UTC(),
-		minCheckpointDelay: 5 * time.Second,
+		minCheckpointDelay: spec.Graph.ConsolidateMinInterval,
 		pendingIDs:         make(map[uint64]struct{}),
 		budgetResolver:     annbudget.NewResolver(spec.BudgetPolicy),
 	}
@@ -428,7 +450,7 @@ func (i *index) coarseListSizeLimit() int {
 
 func (i *index) rebuildCoarseIndex() error {
 	c := newCoarseIndex(internalMetric(i.spec.Metric), i.coarseCentroidCount(), i.coarseListSizeLimit())
-	err := i.store.IterateVectorsByDoc(func(docID uint64, _ []byte, rec storage.VectorRecord) error {
+	err := i.store.IterateVectorsByDoc(func(docID uint64, _ []byte, rec storagev2.VectorRecord) error {
 		c.upsert(docID, rec.VectorFP32)
 		return nil
 	})
@@ -459,14 +481,17 @@ func (i *index) loadOrInitGraph() error {
 	}
 	if ok {
 		state.Metric = internalMetric(state.Metric)
-		i.graphIdx = graph.FromState(state)
+		i.graphIdx = graphv2.FromState(state)
 		return nil
 	}
-	i.graphIdx = graph.New(internalMetric(i.spec.Metric), i.spec.Graph.R)
+	i.graphIdx = graphv2.New(internalMetric(i.spec.Metric), i.spec.Graph.R)
 	return nil
 }
 
 func withDefaultSpec(spec IndexSpec) IndexSpec {
+	if spec.FormatVersion == 0 {
+		spec.FormatVersion = 2
+	}
 	if spec.ApplyMode == "" {
 		spec.ApplyMode = ApplyModeSync
 	}
@@ -514,6 +539,15 @@ func withDefaultSpec(spec IndexSpec) IndexSpec {
 	}
 	if spec.Graph.LBuild <= 0 {
 		spec.Graph.LBuild = 256
+	}
+	if spec.Graph.ConsolidateEveryMutations <= 0 {
+		spec.Graph.ConsolidateEveryMutations = spec.Graph.LBuild
+	}
+	if spec.Graph.ConsolidateMinInterval <= 0 {
+		spec.Graph.ConsolidateMinInterval = 5 * time.Second
+	}
+	if spec.Graph.ConsolidateDeltaRatio <= 0 {
+		spec.Graph.ConsolidateDeltaRatio = 0.05
 	}
 	if spec.Storage.PebbleCacheBytes <= 0 {
 		spec.Storage.PebbleCacheBytes = 256 << 20
@@ -597,10 +631,15 @@ func (i *index) resolveSearchTuning(req SearchRequest, filteredCount int) Search
 	if i.budgetResolver == nil {
 		return mergeSearchTuning(i.spec.SearchDefaults, req.Tuning)
 	}
+	corpusCount := 0
+	if count, err := i.store.CountVectors(); err == nil {
+		corpusCount = int(count)
+	}
 	return i.budgetResolver.Resolve(annbudget.Input{
 		Spec:               i.spec,
 		TopK:               req.TopK,
 		FilteredCount:      filteredCount,
+		CorpusCount:        corpusCount,
 		Requested:          req.Tuning,
 		AllowExactFallback: req.Tuning.AllowExactFallback,
 	})
@@ -644,78 +683,71 @@ func (i *index) Delete(ctx context.Context, mut DeleteMutation) (ApplyToken, err
 }
 
 func (i *index) applyEnvelope(env mutationEnvelope) error {
-	applied, err := i.store.IsApplied(env.Token)
-	if err != nil {
-		return err
-	}
-	if applied {
-		i.signalApplied()
-		return nil
-	}
-
 	writeOpts := pebble.NoSync
 	if i.spec.DurabilityMode == DurabilitySyncEveryCommit {
 		writeOpts = pebble.Sync
 	}
 
-	var resolvedDocID uint64
-	var resolvedDocOK bool
+	var (
+		resolvedDocID uint64
+		resolvedDocOK bool
+		appliedNow    bool
+		err           error
+	)
 	switch env.Op {
 	case mutationUpsert:
 		if i.spec.Metric == MetricCosine {
 			normalizeVectorInPlace(env.VectorFP32)
 		}
-		err = i.store.PutVector(env.ExternalID, storage.VectorRecord{
+		resolvedDocID, appliedNow, err = i.store.ApplyUpsert(env.Token, env.ExternalID, storagev2.VectorRecord{
 			PartitionKey: env.PartitionKey,
 			Tags:         cloneTags(env.Tags),
 			VectorFP32:   append([]float32(nil), env.VectorFP32...),
 		}, writeOpts)
-		if err == nil {
-			resolvedDocID, resolvedDocOK, err = i.store.DocIDForExternalID(env.ExternalID)
+		if err != nil {
+			return err
 		}
+		if !appliedNow {
+			i.signalApplied()
+			return nil
+		}
+		resolvedDocOK = resolvedDocID != 0
 	case mutationDelete:
-		docID, ok, derr := i.store.DocIDForExternalID(env.ExternalID)
-		if derr != nil {
-			return derr
+		var existed bool
+		resolvedDocID, existed, appliedNow, err = i.store.ApplyDelete(env.Token, env.ExternalID, writeOpts)
+		if err != nil {
+			return err
 		}
-		resolvedDocID, resolvedDocOK = docID, ok
-		err = i.store.DeleteVector(env.ExternalID, writeOpts)
-		if ok {
-			i.repairQ.Enqueue(strconv.FormatUint(docID, 10))
+		if !appliedNow {
+			i.signalApplied()
+			return nil
+		}
+		resolvedDocOK = existed
+		if existed {
+			i.repairQ.Enqueue(strconv.FormatUint(resolvedDocID, 10))
 		}
 	default:
-		err = fmt.Errorf("unknown op %q", env.Op)
-	}
-	if err != nil {
-		return err
-	}
-	if err := i.store.MarkApplied(env.Token, writeOpts); err != nil {
-		return err
+		return fmt.Errorf("unknown op %q", env.Op)
 	}
 
 	if env.Op == mutationUpsert && resolvedDocOK {
 		if i.cache != nil {
 			i.cache.Set(resolvedDocID, append([]float32(nil), env.VectorFP32...), int64(len(env.VectorFP32))*4)
 		}
-		id := strconv.FormatUint(resolvedDocID, 10)
-		getVec := func(nodeID string) ([]float32, bool) {
-			docID, err := strconv.ParseUint(nodeID, 10, 64)
-			if err != nil {
-				return nil, false
-			}
-			rec, ok, err := i.store.GetVectorByDocID(docID)
+		getVec := func(docID uint64) ([]float32, bool) {
+			vec, ok, err := i.store.GetVectorFP32ByDocID(docID)
 			if err != nil || !ok {
 				return nil, false
 			}
-			return rec.VectorFP32, true
+			return vec, true
 		}
-		i.graphIdx.Insert(id, env.VectorFP32, i.spec.Graph.LSearch, i.spec.Graph.Beam, getVec)
+		i.graphIdx.Insert(resolvedDocID, env.VectorFP32, i.spec.Graph.LSearch, i.spec.Graph.Beam, getVec)
 	}
 	if env.Op == mutationDelete && resolvedDocOK {
 		if i.cache != nil {
 			i.cache.Del(resolvedDocID)
 		}
-		i.graphIdx.RemoveNode(strconv.FormatUint(resolvedDocID, 10))
+		i.graphIdx.RemoveNode(resolvedDocID)
 	}
 
 	i.pendingMu.Lock()
@@ -750,7 +782,11 @@ func (i *index) applyEnvelope(env mutationEnvelope) error {
 
 func (i *index) runMaintenance(force bool) error {
 	if err := i.repairQ.RunOnce(context.Background(), func(id string) error {
-		i.graphIdx.RemoveNode(id)
+		docID, err := strconv.ParseUint(id, 10, 64)
+		if err != nil {
+			return nil
+		}
+		i.graphIdx.RemoveNode(docID)
 		return nil
 	}); err != nil {
 		return err
@@ -798,8 +834,21 @@ func (i *index) persistActiveState(records map[string]storage.VectorRecord) erro
 	return nil
 }
 
+func (i *index) snapshotSegmentRecords() (map[string]storage.VectorRecord, error) {
+	out := make(map[string]storage.VectorRecord)
+	err := i.store.IterateVectorsByDoc(func(_ uint64, externalID []byte, rec storagev2.VectorRecord) error {
+		out[string(externalID)] = storage.VectorRecord{
+			PartitionKey: rec.PartitionKey,
+			Tags:         cloneTags(rec.Tags),
+			VectorFP32:   append([]float32(nil), rec.VectorFP32...),
+		}
+		return nil
+	})
+	return out, err
+}
+
 func (i *index) checkpointActiveState() error {
-	records, err := i.store.SnapshotVectorsMap()
+	records, err := i.snapshotSegmentRecords()
 	if err != nil {
 		return err
 	}
@@ -807,13 +856,13 @@ func (i *index) checkpointActiveState() error {
 }
 
 func (i *index) rebuildFromStoreState() error {
-	records, err := i.store.SnapshotVectorsMap()
+	records, err := i.snapshotSegmentRecords()
 	if err != nil {
 		return err
 	}
-	vectors := make(map[string][]float32, len(records))
-	err = i.store.IterateVectorsByDoc(func(docID uint64, _ []byte, rec storage.VectorRecord) error {
-		vectors[strconv.FormatUint(docID, 10)] = rec.VectorFP32
+	vectors := make(map[uint64][]float32, len(records))
+	err = i.store.IterateVectorsByDoc(func(docID uint64, _ []byte, rec storagev2.VectorRecord) error {
+		vectors[docID] = rec.VectorFP32
 		return nil
 	})
 	if err != nil {
@@ -869,50 +918,45 @@ func (i *index) Search(ctx context.Context, req SearchRequest) (SearchResult, er
 	if tuning.CandidateBudget < req.TopK {
 		tuning.CandidateBudget = req.TopK
 	}
+	if tuning.RerankK < req.TopK {
+		tuning.RerankK = req.TopK
+	}
+	if tuning.RerankK > tuning.CandidateBudget {
+		tuning.RerankK = tuning.CandidateBudget
+	}
 	allowSet := map[uint64]struct{}{}
 	if len(filteredDocIDs) > 0 {
 		for _, id := range filteredDocIDs {
 			allowSet[id] = struct{}{}
 		}
 	}
+	allowFn := func(docID uint64) bool {
+		if len(allowSet) == 0 {
+			return true
+		}
+		_, ok := allowSet[docID]
+		return ok
+	}
+
 	vecLookup, err := i.store.NewVectorLookup()
 	if err != nil {
 		return SearchResult{}, err
 	}
 	defer vecLookup.Close()
-	docIDCache := make(map[string]uint64, tuning.CandidateBudget)
-	parseDocID := func(id string) (uint64, bool) {
-		if v, ok := docIDCache[id]; ok {
-			return v, true
-		}
-		v, err := strconv.ParseUint(id, 10, 64)
-		if err != nil {
-			return 0, false
-		}
-		docIDCache[id] = v
-		return v, true
-	}
-	allowFn := func(id string) bool {
-		docID, ok := parseDocID(id)
-		if !ok {
-			return false
-		}
-		if len(allowSet) == 0 {
-			return true
-		}
-		_, present := allowSet[docID]
-		return present
-	}
 
 	vectorCache := make(map[uint64][]float32, tuning.CandidateBudget)
+	var cacheHits uint64
+	var cacheLookups uint64
 	loadVec := func(docID uint64) ([]float32, bool) {
 		if vec, ok := vectorCache[docID]; ok {
 			return vec, true
 		}
 		if i.cache != nil && req.PartitionKey == "" && len(req.Tags) == 0 {
+			cacheLookups++
 			if cached, ok := i.cache.Get(docID); ok {
 				if vec, vok := cached.([]float32); vok {
 					vectorCache[docID] = vec
+					cacheHits++
 					return vec, true
 				}
 			}
@@ -928,29 +972,28 @@ func (i *index) Search(ctx context.Context, req SearchRequest) (SearchResult, er
 			}
 			return vec, true
 		}
-		rec, ok, err := vecLookup.GetVectorByDocID(docID)
+		meta, ok, err := vecLookup.GetMetaByDocID(docID)
 		if err != nil || !ok {
 			return nil, false
 		}
-		if !annfilter.Match(rec, req.PartitionKey, req.Tags) {
+		if !matchPartitionTags(meta.PartitionKey, meta.Tags, req.PartitionKey, req.Tags) {
 			return nil, false
 		}
-		vectorCache[docID] = rec.VectorFP32
+		vec, ok, err := vecLookup.GetVectorFP32ByDocID(docID)
+		if err != nil || !ok {
+			return nil, false
+		}
+		vectorCache[docID] = vec
 		if i.cache != nil {
-			i.cache.Set(docID, rec.VectorFP32, int64(len(rec.VectorFP32))*4)
+			i.cache.Set(docID, vec, int64(len(vec))*4)
 		}
-		return rec.VectorFP32, true
+		return vec, true
 	}
-
-	getVec := func(id string) ([]float32, bool) {
-		docID, ok := parseDocID(id)
-		if !ok {
-			return nil, false
-		}
-		return loadVec(docID)
-	}
+	getVec := func(docID uint64) ([]float32, bool) { return loadVec(docID) }
 
 	candidateMap := make(map[uint64][]float32, tuning.CandidateBudget)
+	diag := SearchDiagnostics{FilterCandidates: len(filteredDocIDs)}
+	addedCoarse := 0
 	if i.coarse != nil {
 		coarseBudget := tuning.CandidateBudget
 		nprobe := tuning.Beam * 4
@@ -980,7 +1023,10 @@ func (i *index) Search(ctx context.Context, req SearchRequest) (SearchResult, er
 		}
 		for _, docID := range i.coarse.candidates(queryVector, nprobe, coarseBudget) {
 			if vec, ok := loadVec(docID); ok {
-				candidateMap[docID] = vec
+				if _, exists := candidateMap[docID]; !exists {
+					candidateMap[docID] = vec
+					addedCoarse++
+				}
 				atomic.AddUint64(&i.vectorBlockReads, 1)
 				if len(candidateMap) >= coarseBudget {
 					break
@@ -988,6 +1034,7 @@ func (i *index) Search(ctx context.Context, req SearchRequest) (SearchResult, er
 			}
 		}
 	}
+	diag.CoarseCandidates = addedCoarse
 
 	// Top up candidates from graph traversal if coarse candidates are not enough.
 	graphTopK := tuning.CandidateBudget * 2
@@ -997,15 +1044,16 @@ func (i *index) Search(ctx context.Context, req SearchRequest) (SearchResult, er
 	if graphTopK < tuning.RerankK {
 		graphTopK = tuning.RerankK
 	}
-	graphIDs, gerr := i.graphIdx.Search(queryVector, graphTopK, tuning.EfSearch, tuning.Beam, getVec, allowFn)
+	graphIDs, graphSteps, gerr := i.graphIdx.Search(queryVector, graphTopK, tuning.EfSearch, tuning.Beam, getVec, allowFn)
+	diag.GraphSteps = graphSteps
+	addedGraph := 0
 	if gerr == nil {
-		for _, id := range graphIDs {
-			docID, ok := parseDocID(id)
-			if !ok {
-				continue
-			}
+		for _, docID := range graphIDs {
 			if vec, ok := loadVec(docID); ok {
-				candidateMap[docID] = vec
+				if _, exists := candidateMap[docID]; !exists {
+					candidateMap[docID] = vec
+					addedGraph++
+				}
 				atomic.AddUint64(&i.graphPageReads, 1)
 				if len(candidateMap) >= tuning.CandidateBudget {
 					break
@@ -1013,6 +1061,7 @@ func (i *index) Search(ctx context.Context, req SearchRequest) (SearchResult, er
 			}
 		}
 	}
+	diag.GraphCandidates = addedGraph
 
 	// Merge pending mutations since last graph rebuild instead of full-scanning the table.
 	var pendingIDs []uint64
@@ -1051,13 +1100,10 @@ func (i *index) Search(ctx context.Context, req SearchRequest) (SearchResult, er
 	// Catastrophic fallback only when graph produced nothing and there is no pending delta to search.
 	if tuning.AllowExactFallback && len(candidateMap) == 0 && len(filteredDocIDs) == 0 {
 		atomic.AddUint64(&i.fallbackScans, 1)
-		err := iterateAllVectorsForSearch(i.store, func(externalID []byte, rec storage.VectorRecord) error {
-			if !annfilter.Match(rec, req.PartitionKey, req.Tags) {
+		diag.FallbackUsed = true
+		err := iterateAllVectorsForSearch(i.store, func(docID uint64, _ []byte, rec storagev2.VectorRecord) error {
+			if !matchPartitionTags(rec.PartitionKey, rec.Tags, req.PartitionKey, req.Tags) {
 				return nil
-			}
-			docID, ok, derr := i.store.DocIDForExternalID(externalID)
-			if derr != nil || !ok {
-				return derr
 			}
 			candidateMap[docID] = rec.VectorFP32
 			atomic.AddUint64(&i.vectorBlockReads, 1)
@@ -1071,6 +1117,7 @@ func (i *index) Search(ctx context.Context, req SearchRequest) (SearchResult, er
 		}
 	}
 
+	diag.CandidatesBeforeRerank = len(candidateMap)
 	if len(candidateMap) > tuning.RerankK {
 		topRerank := query.TopKDocIDsWithWorkers(searchMetric, queryVector, candidateMap, tuning.RerankK, tuning.ShardWorkers)
 		trimmed := make(map[uint64][]float32, len(topRerank))
@@ -1081,8 +1128,18 @@ func (i *index) Search(ctx context.Context, req SearchRequest) (SearchResult, er
 		}
 		candidateMap = trimmed
 	}
+	diag.CandidatesAfterRerank = len(candidateMap)
+	if cacheLookups > 0 {
+		diag.VectorCacheHitRatio = float64(cacheHits) / float64(cacheLookups)
+	}
 	top := query.TopKDocIDsWithWorkers(searchMetric, queryVector, candidateMap, req.TopK, tuning.ShardWorkers)
-	res := SearchResult{Hits: make([]SearchHit, 0, len(top))}
+	res := SearchResult{
+		Hits:           make([]SearchHit, 0, len(top)),
+		ResolvedTuning: tuning,
+	}
+	if req.Debug {
+		res.Diagnostics = diag
+	}
 	for idx := range top {
 		externalID, ok, err := i.store.ExternalIDForDocID(top[idx].DocID)
 		if err != nil || !ok {
@@ -1094,6 +1151,14 @@ func (i *index) Search(ctx context.Context, req SearchRequest) (SearchResult, er
 			Distance:   query.DistanceFromScore(i.spec.Metric, top[idx].Score),
 		})
 	}
+	atomic.AddUint64(&i.queryCount, 1)
+	atomic.AddUint64(&i.totalCandidates, uint64(diag.CandidatesBeforeRerank))
+	atomic.AddUint64(&i.totalRerank, uint64(diag.CandidatesAfterRerank))
+	atomic.AddUint64(&i.vectorCacheHits, cacheHits)
+	atomic.AddUint64(&i.vectorCacheLooks, cacheLookups)
+	i.tuningMu.Lock()
+	i.lastResolvedTuning = tuning
+	i.tuningMu.Unlock()
 	return res, nil
 }
 
@@ -1157,13 +1222,36 @@ func (i *index) Stats(ctx context.Context) (IndexStats, error) {
 	if err != nil && !errors.Is(err, pebble.ErrNotFound) {
 		return IndexStats{}, err
 	}
+	queryCount := atomic.LoadUint64(&i.queryCount)
+	totalCandidates := atomic.LoadUint64(&i.totalCandidates)
+	totalRerank := atomic.LoadUint64(&i.totalRerank)
+	cacheHits := atomic.LoadUint64(&i.vectorCacheHits)
+	cacheLooks := atomic.LoadUint64(&i.vectorCacheLooks)
+	avgCandidates := 0.0
+	avgRerank := 0.0
+	cacheRatio := 0.0
+	if queryCount > 0 {
+		avgCandidates = float64(totalCandidates) / float64(queryCount)
+		avgRerank = float64(totalRerank) / float64(queryCount)
+	}
+	if cacheLooks > 0 {
+		cacheRatio = float64(cacheHits) / float64(cacheLooks)
+	}
+	i.tuningMu.RLock()
+	lastTuning := i.lastResolvedTuning
+	i.tuningMu.RUnlock()
 	stats := IndexStats{
-		VectorCount:      vectorCount,
-		AppliedMutations: applied,
-		CurrentWatermark: wm,
-		FallbackScans:    atomic.LoadUint64(&i.fallbackScans),
-		GraphPageReads:   atomic.LoadUint64(&i.graphPageReads),
-		VectorBlockReads: atomic.LoadUint64(&i.vectorBlockReads),
+		VectorCount:         vectorCount,
+		AppliedMutations:    applied,
+		CurrentWatermark:    wm,
+		FallbackScans:       atomic.LoadUint64(&i.fallbackScans),
+		GraphPageReads:      atomic.LoadUint64(&i.graphPageReads),
+		VectorBlockReads:    atomic.LoadUint64(&i.vectorBlockReads),
+		QueryCount:          queryCount,
+		AvgCandidates:       avgCandidates,
+		AvgRerank:           avgRerank,
+		VectorCacheHitRatio: cacheRatio,
+		LastResolvedTuning:  lastTuning,
 	}
 	return stats, nil
 }
@@ -1192,6 +1280,24 @@ func cloneTags(in map[string]string) map[string]string {
 		out[k] = v
 	}
 	return out
+}
+
+func matchPartitionTags(recPartition string, recTags map[string]string, partition string, tags map[string]string) bool {
+	if partition != "" && recPartition != partition {
+		return false
+	}
+	if len(tags) == 0 {
+		return true
+	}
+	if len(recTags) == 0 {
+		return false
+	}
+	for k, v := range tags {
+		if recTags[k] != v {
+			return false
+		}
+	}
+	return true
 }
 
 func copyDir(src, dst string) error {

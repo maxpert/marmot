@@ -1,6 +1,9 @@
 package api
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // Engine owns index lifecycle under a root path.
 type Engine interface {
@@ -70,6 +73,10 @@ type GraphSpec struct {
 	LBuild  int
 	LSearch int
 	Beam    int
+
+	ConsolidateEveryMutations int
+	ConsolidateMinInterval    time.Duration
+	ConsolidateDeltaRatio     float64
 }
 
 type StorageSpec struct {
@@ -119,6 +126,7 @@ type FilterSpec struct {
 }
 
 type IndexSpec struct {
+	FormatVersion  int
 	ID             IndexID
 	Dim            int
 	Metric         Metric
@@ -158,6 +166,7 @@ type SearchRequest struct {
 	TopK         int
 	PartitionKey string
 	Tags         map[string]string
+	Debug        bool
 	Tuning       SearchTuning
 }
 
@@ -167,8 +176,21 @@ type SearchHit struct {
 	Distance   float32
 }
 
+type SearchDiagnostics struct {
+	CandidatesBeforeRerank int
+	CandidatesAfterRerank  int
+	CoarseCandidates       int
+	GraphCandidates        int
+	FilterCandidates       int
+	FallbackUsed           bool
+	VectorCacheHitRatio    float64
+	GraphSteps             int
+}
+
 type SearchResult struct {
-	Hits []SearchHit
+	Hits           []SearchHit
+	ResolvedTuning SearchTuning
+	Diagnostics    SearchDiagnostics
 }
 
 type VerifyOptions struct {
@@ -195,4 +217,10 @@ type IndexStats struct {
 	VectorBlockReads uint64
 	QPS90Last        float64
 	RecallAt10Last   float64
+
+	QueryCount          uint64
+	AvgCandidates       float64
+	AvgRerank           float64
+	VectorCacheHitRatio float64
+	LastResolvedTuning  SearchTuning
 }

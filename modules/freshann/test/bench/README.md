@@ -45,6 +45,12 @@ BASE_COUNT=50000 QUERY_COUNT=1000 EFSEARCH_LIST=96,160 BEAM_LIST=8,16 CANDIDATE_
 
 Default tuning mode is `auto`, driven by the in-library adaptive budget policy (`pkg/budget`) and its sweep grid generator. Override with explicit lists via env vars above.
 
+Optional profile capture:
+
+```bash
+CPU_PROFILE_DIR=/tmp/freshann-bench-data/reports MEM_PROFILE_DIR=/tmp/freshann-bench-data/reports ./test/bench/run_standard_benchmarks.sh
+```
+
 Baseline freeze / compare:
 
 ```bash

@@ -10,4 +10,5 @@ var (
 	ErrClosed            = errors.New("engine/index is closed")
 	ErrNotAppliedYet     = errors.New("token not applied yet")
 	ErrUnsupportedMetric = errors.New("unsupported metric")
+	ErrUnsupportedFormat = errors.New("unsupported index format")
 )
