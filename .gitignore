@@ -41,6 +41,7 @@ AGENTS.md
 QWEN.md
 .claude/
 .opencode/
+.serena/
 .mcp.json
 marmot-test
 marmot-v2-test
