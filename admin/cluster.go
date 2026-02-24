@@ -162,7 +162,7 @@ func (h *AdminHandlers) handleClusterReplication(w http.ResponseWriter, r *http.
 
 // handleClusterRemove handles POST /admin/cluster/remove/{node_id}
 func (h *AdminHandlers) handleClusterRemove(w http.ResponseWriter, r *http.Request) {
-	path := strings.TrimPrefix(r.URL.Path, "/admin/cluster/remove/")
+	path := strings.TrimPrefix(r.URL.Path, "/cluster/remove/")
 	nodeID, err := parsePeerNodeID(path)
 	if err != nil {
 		writeErrorResponse(w, http.StatusBadRequest, err.Error())
@@ -185,7 +185,7 @@ func (h *AdminHandlers) handleClusterRemove(w http.ResponseWriter, r *http.Reque
 
 // handleClusterAllow handles POST /admin/cluster/allow/{node_id}
 func (h *AdminHandlers) handleClusterAllow(w http.ResponseWriter, r *http.Request) {
-	path := strings.TrimPrefix(r.URL.Path, "/admin/cluster/allow/")
+	path := strings.TrimPrefix(r.URL.Path, "/cluster/allow/")
 	nodeID, err := parsePeerNodeID(path)
 	if err != nil {
 		writeErrorResponse(w, http.StatusBadRequest, err.Error())
