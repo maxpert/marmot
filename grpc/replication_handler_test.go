@@ -284,3 +284,199 @@ func mustMarshalMsgpack(t *testing.T, v interface{}) []byte {
 	}
 	return b
 }
+
+// newLeavingHandlerFixture creates a ReplicationHandler with a LEAVING local node.
+func newLeavingHandlerFixture(t *testing.T) (*ReplicationHandler, *NodeRegistry, string) {
+	t.Helper()
+	tmpDir, err := os.MkdirTemp("", "marmot_test_leaving_handler")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(tmpDir) })
+
+	const localNodeID uint64 = 1
+	clock := hlc.NewClock(localNodeID)
+	dbMgr, err := db.NewDatabaseManager(tmpDir, localNodeID, clock)
+	if err != nil {
+		t.Fatalf("Failed to create database manager: %v", err)
+	}
+	t.Cleanup(func() { dbMgr.Close() })
+
+	const testDB = "test_leaving"
+	if err := dbMgr.CreateDatabase(testDB); err != nil {
+		t.Fatalf("Failed to create test database: %v", err)
+	}
+
+	systemDB, err := dbMgr.GetDatabase(db.SystemDatabaseName)
+	if err != nil {
+		t.Fatalf("Failed to get system database: %v", err)
+	}
+
+	handler := NewReplicationHandler(localNodeID, dbMgr, clock, db.NewSchemaVersionManager(systemDB.GetMetaStore()))
+
+	registry := NewNodeRegistry(localNodeID, "localhost:9000")
+	handler.SetRegistry(registry)
+
+	return handler, registry, testDB
+}
+
+// makePrepareReq builds a minimal PREPARE request for use in LEAVING-node tests.
+func makePrepareReq(t *testing.T, txnID uint64, testDB string, clock *hlc.Clock) *TransactionRequest {
+	t.Helper()
+	return &TransactionRequest{
+		TxnId:        txnID,
+		SourceNodeId: 2,
+		Database:     testDB,
+		Phase:        TransactionPhase_PREPARE,
+		Timestamp: &HLC{
+			WallTime: clock.Now().WallTime,
+			Logical:  clock.Now().Logical,
+			NodeId:   2,
+		},
+		Statements: []*Statement{
+			{
+				Type:      pb.StatementType_INSERT,
+				TableName: "t",
+				Database:  testDB,
+				Payload: &Statement_RowChange{
+					RowChange: &RowChange{
+						IntentKey: []byte("k1"),
+						NewValues: map[string][]byte{"id": mustMarshalMsgpack(t, int64(1))},
+					},
+				},
+			},
+		},
+	}
+}
+
+// TestReplicationHandler_RejectsNewPrepareWhenLeaving verifies that a LEAVING
+// node refuses new PREPARE requests.
+func TestReplicationHandler_RejectsNewPrepareWhenLeaving(t *testing.T) {
+	t.Parallel()
+	handler, registry, testDB := newLeavingHandlerFixture(t)
+
+	if err := registry.MarkSelfLeaving(); err != nil {
+		t.Fatalf("MarkSelfLeaving failed: %v", err)
+	}
+
+	clock := hlc.NewClock(1)
+	req := makePrepareReq(t, 100, testDB, clock)
+
+	resp, err := handler.HandleReplicateTransaction(context.Background(), req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.Success {
+		t.Fatal("expected PREPARE to be rejected when node is LEAVING")
+	}
+	if resp.ErrorMessage != "node is leaving cluster" {
+		t.Errorf("unexpected error message: %q", resp.ErrorMessage)
+	}
+}
+
+// TestReplicationHandler_AcceptsCommitWhenLeaving verifies that a LEAVING
+// node still accepts COMMIT for already-prepared transactions.
+func TestReplicationHandler_AcceptsCommitWhenLeaving(t *testing.T) {
+	t.Parallel()
+	handler, registry, testDB := newLeavingHandlerFixture(t)
+	clock := hlc.NewClock(1)
+
+	// First prepare while still ALIVE
+	prepReq := makePrepareReq(t, 200, testDB, clock)
+	prepResp, err := handler.HandleReplicateTransaction(context.Background(), prepReq)
+	if err != nil {
+		t.Fatalf("PREPARE failed: %v", err)
+	}
+	if !prepResp.Success {
+		t.Fatalf("PREPARE rejected before LEAVING: %s", prepResp.ErrorMessage)
+	}
+
+	// Transition to LEAVING
+	if err := registry.MarkSelfLeaving(); err != nil {
+		t.Fatalf("MarkSelfLeaving failed: %v", err)
+	}
+
+	// COMMIT must still succeed
+	commitReq := &TransactionRequest{
+		TxnId:    200,
+		Database: testDB,
+		Phase:    TransactionPhase_COMMIT,
+		Timestamp: &HLC{
+			WallTime: clock.Now().WallTime,
+			Logical:  clock.Now().Logical,
+			NodeId:   2,
+		},
+	}
+	commitResp, err := handler.HandleReplicateTransaction(context.Background(), commitReq)
+	if err != nil {
+		t.Fatalf("COMMIT returned error: %v", err)
+	}
+	if !commitResp.Success {
+		t.Fatalf("COMMIT rejected on LEAVING node: %s", commitResp.ErrorMessage)
+	}
+}
+
+// TestReplicationHandler_AcceptsAbortWhenLeaving verifies that a LEAVING
+// node still accepts ABORT for already-prepared transactions.
+func TestReplicationHandler_AcceptsAbortWhenLeaving(t *testing.T) {
+	t.Parallel()
+	handler, registry, testDB := newLeavingHandlerFixture(t)
+	clock := hlc.NewClock(1)
+
+	// Prepare while ALIVE
+	prepReq := makePrepareReq(t, 300, testDB, clock)
+	prepResp, err := handler.HandleReplicateTransaction(context.Background(), prepReq)
+	if err != nil {
+		t.Fatalf("PREPARE failed: %v", err)
+	}
+	if !prepResp.Success {
+		t.Fatalf("PREPARE rejected before LEAVING: %s", prepResp.ErrorMessage)
+	}
+
+	// Transition to LEAVING
+	if err := registry.MarkSelfLeaving(); err != nil {
+		t.Fatalf("MarkSelfLeaving failed: %v", err)
+	}
+
+	// ABORT must still succeed
+	abortReq := &TransactionRequest{
+		TxnId:    300,
+		Database: testDB,
+		Phase:    TransactionPhase_ABORT,
+		Timestamp: &HLC{
+			WallTime: clock.Now().WallTime,
+			Logical:  clock.Now().Logical,
+			NodeId:   2,
+		},
+	}
+	abortResp, err := handler.HandleReplicateTransaction(context.Background(), abortReq)
+	if err != nil {
+		t.Fatalf("ABORT returned error: %v", err)
+	}
+	if !abortResp.Success {
+		t.Fatalf("ABORT rejected on LEAVING node: %s", abortResp.ErrorMessage)
+	}
+}
+
+// TestReplicationHandler_AcceptsPrepareWhenNotLeaving verifies that a non-LEAVING
+// node accepts PREPARE normally (regression guard).
+func TestReplicationHandler_AcceptsPrepareWhenNotLeaving(t *testing.T) {
+	t.Parallel()
+	handler, _, testDB := newLeavingHandlerFixture(t)
+	clock := hlc.NewClock(1)
+
+	// Create the table so the prepare has something to work with
+	req := makePrepareReq(t, 400, testDB, clock)
+
+	resp, err := handler.HandleReplicateTransaction(context.Background(), req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Should not be rejected due to LEAVING — any failure here is a real engine issue
+	if !resp.Success {
+		// Only acceptable failure is schema/engine related, not our new LEAVING check
+		if resp.ErrorMessage == "node is leaving cluster" {
+			t.Fatal("PREPARE incorrectly rejected as if node is LEAVING")
+		}
+	}
+}

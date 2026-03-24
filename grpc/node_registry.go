@@ -35,13 +35,14 @@ func copyNodeState(node *NodeState) *NodeState {
 
 // NodeRegistry tracks cluster membership using SWIM protocol
 type NodeRegistry struct {
-	localNodeID     uint64
-	nodes           map[uint64]*NodeState
-	lastSeen        map[uint64]time.Time
-	mu              sync.RWMutex
-	onNodeAliveFunc func(*NodeState) // Callback when node transitions to ALIVE
-	onNodeDeadFunc  func(*NodeState) // Callback when node transitions to DEAD
-	callbackMu      sync.RWMutex
+	localNodeID       uint64
+	nodes             map[uint64]*NodeState
+	lastSeen          map[uint64]time.Time
+	mu                sync.RWMutex
+	onNodeAliveFunc   func(*NodeState) // Callback when node transitions to ALIVE
+	onNodeDeadFunc    func(*NodeState) // Callback when node transitions to DEAD
+	onNodeLeavingFunc func()           // Callback when local node marked LEAVING via remote decommission
+	callbackMu        sync.RWMutex
 }
 
 // NewNodeRegistry creates a new node registry
@@ -212,7 +213,44 @@ func (nr *NodeRegistry) Update(node *NodeState) {
 func (nr *NodeRegistry) handleSelfUpdateLocked(node *NodeState) {
 	self := nr.nodes[nr.localNodeID]
 
-	// If someone claims we're SUSPECT/DEAD, refute by incrementing incarnation
+	// If we are LEAVING, we do not refute SUSPECT/DEAD — we are intentionally departing.
+	// However, stale ALIVE gossip must not override our intentional LEAVING status.
+	if self.Status == NodeStatus_LEAVING {
+		if node.Status == NodeStatus_ALIVE && node.Incarnation >= self.Incarnation {
+			// Stale ALIVE gossip: refute to keep LEAVING status propagating
+			self.Incarnation = node.Incarnation + 1
+			log.Debug().
+				Uint64("refuted_incarnation", node.Incarnation).
+				Uint64("new_incarnation", self.Incarnation).
+				Msg("SWIM refutation: rejecting stale ALIVE claim while LEAVING")
+		}
+		return
+	}
+
+	// Accept LEAVING from higher incarnation — this is a remote decommission
+	// via admin API, not a failure detection. Don't refute it.
+	if node.Status == NodeStatus_LEAVING && node.Incarnation > self.Incarnation {
+		oldStatus := self.Status
+		self.Status = NodeStatus_LEAVING
+		self.Incarnation = node.Incarnation
+		log.Info().
+			Uint64("old_incarnation", node.Incarnation-1).
+			Uint64("new_incarnation", self.Incarnation).
+			Msg("Accepting remote decommission — transitioning to LEAVING")
+		if oldStatus != NodeStatus_LEAVING {
+			telemetry.NodeStateTransitionsTotal.With(oldStatus.String(), NodeStatus_LEAVING.String()).Inc()
+			nr.updateClusterMetricsLocked()
+		}
+		// Release mu before firing callback to avoid lock inversion with callbackMu.
+		// State is fully committed above; the immediate return after reacquire means
+		// no code runs under the reacquired lock.
+		nr.mu.Unlock()
+		nr.fireOnNodeLeaving()
+		nr.mu.Lock()
+		return
+	}
+
+	// If someone claims we're not ALIVE, refute by incrementing incarnation
 	if node.Status != NodeStatus_ALIVE && node.Incarnation >= self.Incarnation {
 		self.Incarnation = node.Incarnation + 1
 		// Only set to ALIVE if we're not JOINING
@@ -239,6 +277,14 @@ func (nr *NodeRegistry) shouldEscalate(oldStatus, newStatus NodeStatus) bool {
 	}
 	// Any state can escalate to REMOVED (admin action)
 	if newStatus == NodeStatus_REMOVED && oldStatus != NodeStatus_REMOVED {
+		return true
+	}
+	// ALIVE -> LEAVING (graceful shutdown)
+	if oldStatus == NodeStatus_ALIVE && newStatus == NodeStatus_LEAVING {
+		return true
+	}
+	// LEAVING -> SUSPECT/DEAD (node crashes mid-leaving)
+	if oldStatus == NodeStatus_LEAVING && (newStatus == NodeStatus_SUSPECT || newStatus == NodeStatus_DEAD) {
 		return true
 	}
 	return false
@@ -407,15 +453,16 @@ func (nr *NodeRegistry) CheckTimeouts(suspectTimeout, deadTimeout time.Duration)
 	}
 }
 
-// Count returns the number of nodes in membership (excludes REMOVED nodes)
-// Used for quorum calculation to prevent split-brain
+// Count returns the number of nodes in membership (excludes REMOVED and LEAVING nodes)
+// Used for quorum calculation to prevent split-brain. LEAVING nodes are excluded
+// because they are intentionally departing and should not count toward quorum.
 func (nr *NodeRegistry) Count() int {
 	nr.mu.RLock()
 	defer nr.mu.RUnlock()
 
 	count := 0
 	for _, node := range nr.nodes {
-		if node.Status != NodeStatus_REMOVED {
+		if node.Status != NodeStatus_REMOVED && node.Status != NodeStatus_LEAVING {
 			count++
 		}
 	}
@@ -437,8 +484,8 @@ func (nr *NodeRegistry) CountAlive() int {
 	return count
 }
 
-// GetReplicationEligible returns nodes eligible for DML replication (ALIVE only, excludes JOINING)
-// JOINING nodes are catching up and should not receive DML replication yet
+// GetReplicationEligible returns nodes eligible for DML replication (ALIVE only).
+// Excludes JOINING (catching up), LEAVING (gracefully departing), and all other non-ALIVE states.
 func (nr *NodeRegistry) GetReplicationEligible() []*NodeState {
 	nr.mu.RLock()
 	defer nr.mu.RUnlock()
@@ -548,6 +595,25 @@ func (nr *NodeRegistry) SetOnNodeDead(callback func(*NodeState)) {
 	nr.callbackMu.Lock()
 	defer nr.callbackMu.Unlock()
 	nr.onNodeDeadFunc = callback
+}
+
+// SetOnNodeLeaving sets the callback for when the local node is marked LEAVING
+// via remote decommission (gossip from admin API on another node).
+func (nr *NodeRegistry) SetOnNodeLeaving(callback func()) {
+	nr.callbackMu.Lock()
+	defer nr.callbackMu.Unlock()
+	nr.onNodeLeavingFunc = callback
+}
+
+// fireOnNodeLeaving calls the LEAVING callback outside the main lock.
+func (nr *NodeRegistry) fireOnNodeLeaving() {
+	nr.callbackMu.RLock()
+	callback := nr.onNodeLeavingFunc
+	nr.callbackMu.RUnlock()
+
+	if callback != nil {
+		callback()
+	}
 }
 
 // DetectSchemaDrift logs warnings for nodes with different schema versions
@@ -675,6 +741,88 @@ func (nr *NodeRegistry) IsRemoved(nodeID uint64) bool {
 	return node.Status == NodeStatus_REMOVED
 }
 
+// MarkLeaving marks a node as LEAVING — gracefully departing the cluster.
+// Unlike MarkRemoved, this can be called on self and is reversible.
+// Returns an error if the node is not found or is already LEAVING/REMOVED.
+func (nr *NodeRegistry) MarkLeaving(nodeID uint64) error {
+	nr.mu.Lock()
+	defer nr.mu.Unlock()
+
+	node, exists := nr.nodes[nodeID]
+	if !exists {
+		return fmt.Errorf("node %d not found in registry", nodeID)
+	}
+
+	if node.Status == NodeStatus_LEAVING {
+		return fmt.Errorf("node %d is already LEAVING", nodeID)
+	}
+	if node.Status == NodeStatus_REMOVED {
+		return fmt.Errorf("node %d is REMOVED; use AllowRejoin first", nodeID)
+	}
+
+	oldStatus := node.Status
+	node.Status = NodeStatus_LEAVING
+	node.Incarnation++ // Increment to propagate via gossip
+
+	telemetry.NodeStateTransitionsTotal.With(oldStatus.String(), NodeStatus_LEAVING.String()).Inc()
+	nr.updateClusterMetricsLocked()
+
+	log.Info().
+		Uint64("node_id", nodeID).
+		Str("old_status", oldStatus.String()).
+		Uint64("incarnation", node.Incarnation).
+		Msg("Node marked as LEAVING cluster")
+
+	return nil
+}
+
+// MarkSelfLeaving marks the local node as LEAVING.
+// Increments incarnation so the LEAVING status propagates via gossip.
+func (nr *NodeRegistry) MarkSelfLeaving() error {
+	return nr.MarkLeaving(nr.localNodeID)
+}
+
+// RevertLeaving transitions a LEAVING node back to ALIVE, cancelling decommission.
+// Returns an error if the node is not currently in LEAVING state.
+func (nr *NodeRegistry) RevertLeaving(nodeID uint64) error {
+	nr.mu.Lock()
+	defer nr.mu.Unlock()
+
+	node, exists := nr.nodes[nodeID]
+	if !exists {
+		return fmt.Errorf("node %d not found in registry", nodeID)
+	}
+
+	if node.Status != NodeStatus_LEAVING {
+		return fmt.Errorf("node %d is not LEAVING (current: %s)", nodeID, node.Status.String())
+	}
+
+	node.Status = NodeStatus_ALIVE
+	node.Incarnation++ // Increment to propagate via gossip
+
+	telemetry.NodeStateTransitionsTotal.With(NodeStatus_LEAVING.String(), NodeStatus_ALIVE.String()).Inc()
+	nr.updateClusterMetricsLocked()
+
+	log.Info().
+		Uint64("node_id", nodeID).
+		Uint64("incarnation", node.Incarnation).
+		Msg("Node reverted from LEAVING back to ALIVE")
+
+	return nil
+}
+
+// IsLeaving checks if a node is in LEAVING state
+func (nr *NodeRegistry) IsLeaving(nodeID uint64) bool {
+	nr.mu.RLock()
+	defer nr.mu.RUnlock()
+
+	node, exists := nr.nodes[nodeID]
+	if !exists {
+		return false
+	}
+	return node.Status == NodeStatus_LEAVING
+}
+
 // MemberInfo represents membership information for admin API
 type MemberInfo struct {
 	NodeID      uint64
@@ -713,10 +861,11 @@ func (nr *NodeRegistry) updateClusterMetricsLocked() {
 	telemetry.ClusterNodes.With("DEAD").Set(float64(counts[NodeStatus_DEAD]))
 	telemetry.ClusterNodes.With("JOINING").Set(float64(counts[NodeStatus_JOINING]))
 	telemetry.ClusterNodes.With("REMOVED").Set(float64(counts[NodeStatus_REMOVED]))
+	telemetry.ClusterNodes.With("LEAVING").Set(float64(counts[NodeStatus_LEAVING]))
 
-	// Update quorum available
+	// Update quorum available — exclude REMOVED and LEAVING from membership denominator
 	aliveCount := counts[NodeStatus_ALIVE]
-	totalMembership := len(nr.nodes) - counts[NodeStatus_REMOVED]
+	totalMembership := len(nr.nodes) - counts[NodeStatus_REMOVED] - counts[NodeStatus_LEAVING]
 	quorumSize := (totalMembership / 2) + 1
 	if aliveCount >= quorumSize {
 		telemetry.ClusterQuorumAvailable.Set(1)
@@ -731,7 +880,7 @@ func (nr *NodeRegistry) QuorumInfo() (totalMembership int, aliveCount int, quoru
 	defer nr.mu.RUnlock()
 
 	for _, node := range nr.nodes {
-		if node.Status != NodeStatus_REMOVED {
+		if node.Status != NodeStatus_REMOVED && node.Status != NodeStatus_LEAVING {
 			totalMembership++
 			if node.Status == NodeStatus_ALIVE {
 				aliveCount++

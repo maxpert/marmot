@@ -28,6 +28,12 @@ type DDLLock struct {
 	AcquiredAt  hlc.Timestamp
 	ExpiresAt   time.Time
 	ReleaseChan chan struct{} // Closed when lock is released
+	once        sync.Once
+}
+
+// release closes ReleaseChan exactly once, safe for concurrent or duplicate calls.
+func (l *DDLLock) release() {
+	l.once.Do(func() { close(l.ReleaseChan) })
 }
 
 // NewDDLLockManager creates a new DDL lock manager
@@ -100,7 +106,7 @@ func (dlm *DDLLockManager) ReleaseLock(database string, txnID uint64) error {
 	}
 
 	// Close the release channel to notify any waiters
-	close(lock.ReleaseChan)
+	lock.release()
 
 	// Remove from active locks
 	delete(dlm.activeLocks, database)
@@ -170,7 +176,7 @@ func (dlm *DDLLockManager) CleanupExpiredLocks() int {
 				Str("database", database).
 				Uint64("txn_id", lock.TxnID).
 				Msg("Cleaning up expired DDL lock")
-			close(lock.ReleaseChan)
+			lock.release()
 			delete(dlm.activeLocks, database)
 			cleaned++
 		}
@@ -179,17 +185,32 @@ func (dlm *DDLLockManager) CleanupExpiredLocks() int {
 	return cleaned
 }
 
+// ReleaseAll releases all active locks. Intended for graceful shutdown when the
+// node enters LEAVING state. Waiters blocked on WaitForLock are unblocked.
+func (dlm *DDLLockManager) ReleaseAll() {
+	dlm.mu.Lock()
+	defer dlm.mu.Unlock()
+
+	count := len(dlm.activeLocks)
+	for _, lock := range dlm.activeLocks {
+		lock.release()
+	}
+	dlm.activeLocks = make(map[string]*DDLLock)
+
+	if count > 0 {
+		log.Info().Int("count", count).Msg("Released all active DDL locks")
+	}
+}
+
 // GetActiveLocks returns a map of all active locks (for debugging/monitoring)
 func (dlm *DDLLockManager) GetActiveLocks() map[string]*DDLLock {
 	dlm.mu.RLock()
 	defer dlm.mu.RUnlock()
 
-	// Return a copy to avoid concurrent modification
+	// Return a snapshot of the map; callers must treat pointers as read-only
 	result := make(map[string]*DDLLock, len(dlm.activeLocks))
 	for db, lock := range dlm.activeLocks {
-		// Create a copy of the lock
-		lockCopy := *lock
-		result[db] = &lockCopy
+		result[db] = lock
 	}
 
 	return result

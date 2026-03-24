@@ -5,6 +5,7 @@ import (
 	"sync/atomic"
 
 	"github.com/maxpert/marmot/db"
+	"github.com/rs/zerolog/log"
 )
 
 // defaultSignalBufferSize is the buffer size for CDC signal channels.
@@ -48,6 +49,7 @@ type Hub struct {
 	mu            sync.RWMutex
 	subscriptions map[uint64]*subscription
 	nextID        atomic.Uint64
+	closed        atomic.Bool
 }
 
 // NewHub creates a new CDC notification hub.
@@ -59,6 +61,10 @@ func NewHub() *Hub {
 
 // Signal sends a CDC signal to all matching subscribers (non-blocking).
 func (h *Hub) Signal(database string, txnID uint64) {
+	if h.closed.Load() {
+		return
+	}
+
 	signal := db.CDCSignal{
 		Database: database,
 		TxnID:    txnID,
@@ -84,7 +90,12 @@ func (h *Hub) Signal(database string, txnID uint64) {
 // Subscribe creates a new subscription and returns the signal channel and cancel function.
 // The returned channel is buffered. If the subscriber cannot keep up with the signal rate,
 // signals will be dropped silently by Signal(). The cancel function is idempotent.
+// Returns nil, nil if the hub is closed.
 func (h *Hub) Subscribe(filter db.CDCFilter) (<-chan db.CDCSignal, func()) {
+	if h.closed.Load() {
+		return nil, nil
+	}
+
 	sub := &subscription{
 		id:     h.nextID.Add(1),
 		filter: filter,
@@ -114,4 +125,26 @@ func (h *Hub) unsubscribe(id uint64) {
 	if ok {
 		sub.close()
 	}
+}
+
+// Close shuts down the hub by closing all active subscription channels and
+// clearing the subscriptions map. After Close returns, Subscribe returns nil,
+// Signal and Unsubscribe are no-ops. Close is idempotent.
+func (h *Hub) Close() {
+	if !h.closed.CompareAndSwap(false, true) {
+		return
+	}
+
+	h.mu.Lock()
+	subs := h.subscriptions
+	h.subscriptions = make(map[uint64]*subscription)
+	h.mu.Unlock()
+
+	for _, sub := range subs {
+		sub.close()
+	}
+
+	log.Info().
+		Int("subscriptions_cleared", len(subs)).
+		Msg("CDC notification hub closed")
 }

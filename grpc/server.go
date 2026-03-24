@@ -39,13 +39,14 @@ type snapshotCacheEntry struct {
 
 // Server implements the gRPC server for Marmot
 type Server struct {
-	nodeID   uint64
-	address  string
-	port     int
-	server   *grpc.Server
-	listener net.Listener
-	mux      cmux.CMux
-	httpMux  *http.ServeMux // HTTP mux for admin endpoints
+	nodeID     uint64
+	address    string
+	port       int
+	server     *grpc.Server
+	listener   net.Listener
+	mux        cmux.CMux
+	httpMux    *http.ServeMux // HTTP mux for admin endpoints
+	httpServer *http.Server
 
 	// Components
 	gossip             *GossipProtocol
@@ -65,7 +66,9 @@ type Server struct {
 	snapshotCache   map[string]*snapshotCacheEntry
 	snapshotCacheMu sync.RWMutex
 
-	mu sync.RWMutex
+	mu       sync.RWMutex
+	stopCh   chan struct{}
+	stopOnce sync.Once
 
 	UnimplementedMarmotServiceServer
 }
@@ -86,6 +89,7 @@ func NewServer(config ServerConfig) (*Server, error) {
 		port:          config.Port,
 		httpMux:       http.NewServeMux(),
 		snapshotCache: make(map[string]*snapshotCacheEntry),
+		stopCh:        make(chan struct{}),
 	}
 
 	// Initialize components with advertise address
@@ -201,12 +205,12 @@ func (s *Server) Start() error {
 
 	// Admin endpoints will be registered externally to avoid import cycles
 
-	httpServer := &http.Server{
+	s.httpServer = &http.Server{
 		Handler: httpMux,
 	}
 
 	go func() {
-		if err := httpServer.Serve(httpListener); err != nil {
+		if err := s.httpServer.Serve(httpListener); err != nil && err != http.ErrServerClosed {
 			log.Error().Err(err).Msg("HTTP server failed")
 		}
 	}()
@@ -231,12 +235,45 @@ func (s *Server) Start() error {
 	return nil
 }
 
-// Stop gracefully stops the gRPC server
+// Stop gracefully stops the server. It is safe to call multiple times.
 func (s *Server) Stop() {
-	if s.server != nil {
-		log.Info().Msg("Stopping gRPC server")
-		s.server.GracefulStop()
-	}
+	s.stopOnce.Do(func() {
+		log.Info().Msg("Stopping server")
+
+		// 1. Signal background goroutines to exit.
+		close(s.stopCh)
+
+		// 2. Shut down HTTP server with timeout.
+		if s.httpServer != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := s.httpServer.Shutdown(ctx); err != nil {
+				log.Warn().Err(err).Msg("HTTP server shutdown error")
+			}
+		}
+
+		// 3. Gracefully stop gRPC with a 5s timeout, then force-stop.
+		if s.server != nil {
+			done := make(chan struct{})
+			go func() {
+				s.server.GracefulStop()
+				close(done)
+			}()
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				log.Warn().Msg("gRPC graceful stop timed out, forcing stop")
+				s.server.Stop()
+			}
+		}
+
+		// 4. Close the TCP listener, which causes cmux.Serve() to return.
+		if s.listener != nil {
+			if err := s.listener.Close(); err != nil {
+				log.Warn().Err(err).Msg("Listener close error")
+			}
+		}
+	})
 }
 
 // =======================
@@ -1313,10 +1350,13 @@ func (s *Server) runSnapshotCacheCleanup() {
 	ticker := time.NewTicker(60 * time.Second)
 	defer ticker.Stop()
 
-	log.Debug().Msg("Started snapshot cache cleanup goroutine")
-
-	for range ticker.C {
-		s.cleanupExpiredSnapshots()
+	for {
+		select {
+		case <-s.stopCh:
+			return
+		case <-ticker.C:
+			s.cleanupExpiredSnapshots()
+		}
 	}
 }
 

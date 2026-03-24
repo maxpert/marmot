@@ -6,6 +6,7 @@ import (
 	"hash/fnv"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/BurntSushi/toml"
 	"github.com/denisbrodbeck/machineid"
@@ -20,16 +21,22 @@ type PromotionConfiguration struct {
 
 // ClusterConfiguration controls cluster membership and communication
 type ClusterConfiguration struct {
-	GRPCBindAddress      string                 `toml:"grpc_bind_address"`
-	GRPCAdvertiseAddress string                 `toml:"grpc_advertise_address"` // Address other nodes use to connect (defaults to hostname:port)
-	GRPCPort             int                    `toml:"grpc_port"`
-	SeedNodes            []string               `toml:"seed_nodes"`
-	ClusterSecret        string                 `toml:"cluster_secret"` // PSK for cluster authentication (env: MARMOT_CLUSTER_SECRET)
-	GossipIntervalMS     int                    `toml:"gossip_interval_ms"`
-	GossipFanout         int                    `toml:"gossip_fanout"`
-	SuspectTimeoutMS     int                    `toml:"suspect_timeout_ms"`
-	DeadTimeoutMS        int                    `toml:"dead_timeout_ms"`
-	Promotion            PromotionConfiguration `toml:"promotion"`
+	GRPCBindAddress       string                 `toml:"grpc_bind_address"`
+	GRPCAdvertiseAddress  string                 `toml:"grpc_advertise_address"` // Address other nodes use to connect (defaults to hostname:port)
+	GRPCPort              int                    `toml:"grpc_port"`
+	SeedNodes             []string               `toml:"seed_nodes"`
+	ClusterSecret         string                 `toml:"cluster_secret"` // PSK for cluster authentication (env: MARMOT_CLUSTER_SECRET)
+	GossipIntervalMS      int                    `toml:"gossip_interval_ms"`
+	GossipFanout          int                    `toml:"gossip_fanout"`
+	SuspectTimeoutMS      int                    `toml:"suspect_timeout_ms"`
+	DeadTimeoutMS         int                    `toml:"dead_timeout_ms"`
+	ShutdownGracePeriodMS int                    `toml:"shutdown_grace_period_ms"` // Grace period for in-flight queries during shutdown (default: 15000ms)
+	Promotion             PromotionConfiguration `toml:"promotion"`
+}
+
+// GetShutdownGracePeriod returns the configured shutdown grace period as a time.Duration.
+func (c *ClusterConfiguration) GetShutdownGracePeriod() time.Duration {
+	return time.Duration(c.ShutdownGracePeriodMS) * time.Millisecond
 }
 
 // ReplicationConfiguration controls replication behavior
@@ -237,13 +244,14 @@ var Config = &Configuration{
 	DataDir: "./marmot-data",
 
 	Cluster: ClusterConfiguration{
-		GRPCBindAddress:  "0.0.0.0",
-		GRPCPort:         8080,
-		SeedNodes:        []string{},
-		GossipIntervalMS: 1000,
-		GossipFanout:     3,
-		SuspectTimeoutMS: 5000,
-		DeadTimeoutMS:    10000,
+		GRPCBindAddress:       "0.0.0.0",
+		GRPCPort:              8080,
+		SeedNodes:             []string{},
+		GossipIntervalMS:      1000,
+		GossipFanout:          3,
+		SuspectTimeoutMS:      5000,
+		DeadTimeoutMS:         10000,
+		ShutdownGracePeriodMS: 15000, // 15 seconds to drain in-flight queries
 		Promotion: PromotionConfiguration{
 			CheckIntervalSeconds:  2, // Check every 2 seconds
 			MinHealthyDurationSec: 3, // Must be healthy for 3 seconds
@@ -738,6 +746,11 @@ func Validate() error {
 				return fmt.Errorf("cannot explicitly replicate system database in replicate_databases")
 			}
 		}
+	}
+
+	// Validate shutdown grace period
+	if Config.Cluster.ShutdownGracePeriodMS < 1000 {
+		return fmt.Errorf("cluster.shutdown_grace_period_ms must be >= 1000ms")
 	}
 
 	// Validate publisher configuration

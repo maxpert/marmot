@@ -94,6 +94,7 @@ enum NodeStatus {
   DEAD = 2;
   JOINING = 3;  // Node is catching up, receives gossip but not replication
   REMOVED = 4;  // Node explicitly removed from cluster via admin API
+  LEAVING = 5;  // Node is gracefully shutting down or being decommissioned
 }
 
 message JoinRequest {

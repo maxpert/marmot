@@ -891,3 +891,323 @@ func TestNodeRegistry_CopyNodeStateIncludesWatermark(t *testing.T) {
 		t.Errorf("Expected watermark 999 in copy, got %d", node.MinAppliedSeq)
 	}
 }
+
+// =======================
+// LEAVING STATUS TESTS
+// =======================
+
+func TestMarkLeaving_Success(t *testing.T) {
+	t.Parallel()
+	nr := NewNodeRegistry(1, "localhost:8081")
+
+	nr.Add(&NodeState{NodeId: 2, Address: "localhost:8082", Status: NodeStatus_ALIVE, Incarnation: 0})
+
+	err := nr.MarkLeaving(2)
+	if err != nil {
+		t.Fatalf("MarkLeaving failed: %v", err)
+	}
+
+	node, exists := nr.Get(2)
+	if !exists {
+		t.Fatal("Node should still exist after MarkLeaving")
+	}
+	if node.Status != NodeStatus_LEAVING {
+		t.Errorf("Expected LEAVING status, got %v", node.Status)
+	}
+	if node.Incarnation != 1 {
+		t.Errorf("Expected incarnation 1 (incremented for gossip), got %d", node.Incarnation)
+	}
+}
+
+func TestMarkLeaving_Self(t *testing.T) {
+	t.Parallel()
+	nr := NewNodeRegistry(1, "localhost:8081")
+
+	err := nr.MarkLeaving(1)
+	if err != nil {
+		t.Fatalf("MarkLeaving self should succeed, got: %v", err)
+	}
+
+	node, _ := nr.Get(1)
+	if node.Status != NodeStatus_LEAVING {
+		t.Errorf("Expected self status LEAVING, got %v", node.Status)
+	}
+}
+
+func TestMarkSelfLeaving(t *testing.T) {
+	t.Parallel()
+	nr := NewNodeRegistry(1, "localhost:8081")
+
+	err := nr.MarkSelfLeaving()
+	if err != nil {
+		t.Fatalf("MarkSelfLeaving failed: %v", err)
+	}
+
+	node, _ := nr.Get(1)
+	if node.Status != NodeStatus_LEAVING {
+		t.Errorf("Expected LEAVING status, got %v", node.Status)
+	}
+}
+
+func TestMarkLeaving_AlreadyLeaving(t *testing.T) {
+	t.Parallel()
+	nr := NewNodeRegistry(1, "localhost:8081")
+
+	nr.Add(&NodeState{NodeId: 2, Address: "localhost:8082", Status: NodeStatus_ALIVE})
+	nr.MarkLeaving(2) //nolint:errcheck
+
+	err := nr.MarkLeaving(2)
+	if err == nil {
+		t.Fatal("MarkLeaving on already-LEAVING node should return error")
+	}
+}
+
+func TestMarkLeaving_RemovedNodeFails(t *testing.T) {
+	t.Parallel()
+	nr := NewNodeRegistry(1, "localhost:8081")
+
+	nr.Add(&NodeState{NodeId: 2, Address: "localhost:8082", Status: NodeStatus_ALIVE})
+	nr.MarkRemoved(2) //nolint:errcheck
+
+	err := nr.MarkLeaving(2)
+	if err == nil {
+		t.Fatal("MarkLeaving on REMOVED node should return error")
+	}
+}
+
+func TestMarkLeaving_NodeNotFound(t *testing.T) {
+	t.Parallel()
+	nr := NewNodeRegistry(1, "localhost:8081")
+
+	err := nr.MarkLeaving(999)
+	if err == nil {
+		t.Fatal("MarkLeaving on non-existent node should return error")
+	}
+}
+
+func TestRevertLeaving_BackToAlive(t *testing.T) {
+	t.Parallel()
+	nr := NewNodeRegistry(1, "localhost:8081")
+
+	nr.Add(&NodeState{NodeId: 2, Address: "localhost:8082", Status: NodeStatus_ALIVE, Incarnation: 0})
+	nr.MarkLeaving(2) //nolint:errcheck
+
+	err := nr.RevertLeaving(2)
+	if err != nil {
+		t.Fatalf("RevertLeaving failed: %v", err)
+	}
+
+	node, _ := nr.Get(2)
+	if node.Status != NodeStatus_ALIVE {
+		t.Errorf("Expected ALIVE status after RevertLeaving, got %v", node.Status)
+	}
+	// incarnation was 1 after MarkLeaving, should be 2 after RevertLeaving
+	if node.Incarnation != 2 {
+		t.Errorf("Expected incarnation 2, got %d", node.Incarnation)
+	}
+}
+
+func TestRevertLeaving_NotLeaving_Fails(t *testing.T) {
+	t.Parallel()
+	nr := NewNodeRegistry(1, "localhost:8081")
+
+	nr.Add(&NodeState{NodeId: 2, Address: "localhost:8082", Status: NodeStatus_ALIVE})
+
+	err := nr.RevertLeaving(2)
+	if err == nil {
+		t.Fatal("RevertLeaving on non-LEAVING node should return error")
+	}
+}
+
+func TestRevertLeaving_NodeNotFound(t *testing.T) {
+	t.Parallel()
+	nr := NewNodeRegistry(1, "localhost:8081")
+
+	err := nr.RevertLeaving(999)
+	if err == nil {
+		t.Fatal("RevertLeaving on non-existent node should return error")
+	}
+}
+
+func TestIsLeaving(t *testing.T) {
+	t.Parallel()
+	nr := NewNodeRegistry(1, "localhost:8081")
+
+	nr.Add(&NodeState{NodeId: 2, Address: "localhost:8082", Status: NodeStatus_ALIVE})
+
+	if nr.IsLeaving(2) {
+		t.Error("Node should not be LEAVING before MarkLeaving")
+	}
+
+	nr.MarkLeaving(2) //nolint:errcheck
+
+	if !nr.IsLeaving(2) {
+		t.Error("Node should be LEAVING after MarkLeaving")
+	}
+
+	if nr.IsLeaving(999) {
+		t.Error("Non-existent node should not be LEAVING")
+	}
+}
+
+func TestLeavingExcludedFromQuorum(t *testing.T) {
+	t.Parallel()
+	nr := NewNodeRegistry(1, "localhost:8081")
+
+	nr.Add(&NodeState{NodeId: 2, Address: "localhost:8082", Status: NodeStatus_ALIVE})
+	nr.Add(&NodeState{NodeId: 3, Address: "localhost:8083", Status: NodeStatus_ALIVE})
+
+	// 3 members: 1, 2, 3
+	if nr.Count() != 3 {
+		t.Fatalf("Expected count 3 before LEAVING, got %d", nr.Count())
+	}
+
+	nr.MarkLeaving(2) //nolint:errcheck
+
+	// LEAVING node excluded from membership count
+	if nr.Count() != 2 {
+		t.Errorf("Expected count 2 after one LEAVING, got %d", nr.Count())
+	}
+
+	total, alive, quorum := nr.QuorumInfo()
+	if total != 2 {
+		t.Errorf("Expected totalMembership 2, got %d", total)
+	}
+	if alive != 2 {
+		t.Errorf("Expected aliveCount 2 (nodes 1 and 3), got %d", alive)
+	}
+	if quorum != 2 {
+		t.Errorf("Expected quorumSize 2, got %d", quorum)
+	}
+}
+
+func TestLeavingExcludedFromReplication(t *testing.T) {
+	t.Parallel()
+	nr := NewNodeRegistry(1, "localhost:8081")
+
+	nr.Add(&NodeState{NodeId: 2, Address: "localhost:8082", Status: NodeStatus_ALIVE})
+	nr.Add(&NodeState{NodeId: 3, Address: "localhost:8083", Status: NodeStatus_ALIVE})
+
+	before := nr.GetReplicationEligible()
+	if len(before) != 3 {
+		t.Fatalf("Expected 3 eligible nodes before LEAVING, got %d", len(before))
+	}
+
+	nr.MarkLeaving(3) //nolint:errcheck
+
+	after := nr.GetReplicationEligible()
+	if len(after) != 2 {
+		t.Errorf("Expected 2 eligible nodes after LEAVING, got %d", len(after))
+	}
+	for _, n := range after {
+		if n.NodeId == 3 {
+			t.Error("LEAVING node 3 should not appear in replication eligible list")
+		}
+	}
+}
+
+func TestShouldEscalate_LeavingPaths(t *testing.T) {
+	t.Parallel()
+	nr := NewNodeRegistry(1, "localhost:8081")
+
+	if !nr.shouldEscalate(NodeStatus_ALIVE, NodeStatus_LEAVING) {
+		t.Error("ALIVE -> LEAVING should be a valid escalation")
+	}
+	if !nr.shouldEscalate(NodeStatus_LEAVING, NodeStatus_SUSPECT) {
+		t.Error("LEAVING -> SUSPECT should be a valid escalation")
+	}
+	if !nr.shouldEscalate(NodeStatus_LEAVING, NodeStatus_DEAD) {
+		t.Error("LEAVING -> DEAD should be a valid escalation")
+	}
+	// LEAVING -> ALIVE is NOT an escalation (use RevertLeaving with higher incarnation instead)
+	if nr.shouldEscalate(NodeStatus_LEAVING, NodeStatus_ALIVE) {
+		t.Error("LEAVING -> ALIVE should NOT be an escalation via shouldEscalate")
+	}
+}
+
+func TestLeavingSelfRefutation(t *testing.T) {
+	t.Parallel()
+	localID := uint64(1)
+	nr := NewNodeRegistry(localID, "localhost:8081")
+
+	// Mark self as LEAVING at incarnation 1
+	nr.MarkSelfLeaving() //nolint:errcheck
+
+	self, _ := nr.Get(localID)
+	if self.Incarnation != 1 {
+		t.Fatalf("Expected incarnation 1 after MarkSelfLeaving, got %d", self.Incarnation)
+	}
+
+	// A peer claims we are SUSPECT: we should NOT refute (we're intentionally leaving)
+	nr.Update(&NodeState{NodeId: localID, Status: NodeStatus_SUSPECT, Incarnation: 1})
+
+	self, _ = nr.Get(localID)
+	if self.Status != NodeStatus_LEAVING {
+		t.Errorf("LEAVING node should not refute SUSPECT; status is %v", self.Status)
+	}
+	// Incarnation should NOT have been bumped
+	if self.Incarnation != 1 {
+		t.Errorf("Incarnation should remain 1, got %d", self.Incarnation)
+	}
+
+	// A peer claims we are DEAD: same — no refutation
+	nr.Update(&NodeState{NodeId: localID, Status: NodeStatus_DEAD, Incarnation: 1})
+
+	self, _ = nr.Get(localID)
+	if self.Status != NodeStatus_LEAVING {
+		t.Errorf("LEAVING node should not refute DEAD; status is %v", self.Status)
+	}
+}
+
+func TestStaleGossipCantOverrideLeaving(t *testing.T) {
+	t.Parallel()
+	localID := uint64(1)
+	nr := NewNodeRegistry(localID, "localhost:8081")
+
+	// Mark self as LEAVING at incarnation 1
+	nr.MarkSelfLeaving() //nolint:errcheck
+
+	// A peer that hasn't heard the LEAVING gossip sends an ALIVE claim with the same
+	// incarnation. We must refute it so our LEAVING status keeps propagating.
+	nr.Update(&NodeState{NodeId: localID, Status: NodeStatus_ALIVE, Incarnation: 1})
+
+	self, _ := nr.Get(localID)
+	if self.Status != NodeStatus_LEAVING {
+		t.Errorf("Stale ALIVE gossip should not override LEAVING; status is %v", self.Status)
+	}
+	// Incarnation must be bumped so the refutation propagates
+	if self.Incarnation <= 1 {
+		t.Errorf("Incarnation should be > 1 after refuting stale ALIVE, got %d", self.Incarnation)
+	}
+}
+
+func TestLeavingGossipPropagation(t *testing.T) {
+	t.Parallel()
+	nr := NewNodeRegistry(1, "localhost:8081")
+
+	nr.Add(&NodeState{NodeId: 2, Address: "localhost:8082", Status: NodeStatus_ALIVE, Incarnation: 0})
+
+	// Simulate receiving LEAVING status via gossip from node 2
+	nr.Update(&NodeState{NodeId: 2, Status: NodeStatus_LEAVING, Incarnation: 1})
+
+	node, _ := nr.Get(2)
+	if node.Status != NodeStatus_LEAVING {
+		t.Errorf("LEAVING should propagate via gossip, got %v", node.Status)
+	}
+}
+
+func TestLeavingThenCrashesSuspect(t *testing.T) {
+	t.Parallel()
+	nr := NewNodeRegistry(1, "localhost:8081")
+
+	nr.Add(&NodeState{NodeId: 2, Address: "localhost:8082", Status: NodeStatus_ALIVE, Incarnation: 0})
+	nr.MarkLeaving(2) //nolint:errcheck
+
+	// Node crashes mid-leaving: same incarnation escalation to SUSPECT
+	nr.Update(&NodeState{NodeId: 2, Status: NodeStatus_SUSPECT, Incarnation: 1})
+
+	node, _ := nr.Get(2)
+	if node.Status != NodeStatus_SUSPECT {
+		t.Errorf("LEAVING -> SUSPECT should be valid via escalation, got %v", node.Status)
+	}
+}

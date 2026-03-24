@@ -129,6 +129,7 @@ type SQLiteBatchCommitter struct {
 	// Background task state
 	checkpointRunning atomic.Bool
 	vacuumRunning     atomic.Bool
+	bgWg              sync.WaitGroup
 }
 
 func NewSQLiteBatchCommitter(
@@ -226,6 +227,7 @@ func (bc *SQLiteBatchCommitter) Stop() {
 	}
 	close(bc.stopCh)
 	bc.wg.Wait()
+	bc.bgWg.Wait()
 
 	if bc.db != nil {
 		bc.db.Close()
@@ -405,7 +407,11 @@ func (bc *SQLiteBatchCommitter) flush(batch map[uint64]*pendingCommit, trigger s
 	if bc.checkpointEnabled {
 		walSizeMB := bc.checkWALSize()
 		if walSizeMB >= bc.checkpointPassiveThreshMB {
-			go bc.backgroundCheckpoint(walSizeMB)
+			bc.bgWg.Add(1)
+			go func() {
+				defer bc.bgWg.Done()
+				bc.backgroundCheckpoint(walSizeMB)
+			}()
 		}
 	}
 
@@ -442,6 +448,10 @@ func (bc *SQLiteBatchCommitter) checkWALSize() float64 {
 
 // backgroundCheckpoint runs checkpoint in goroutine without blocking flush.
 func (bc *SQLiteBatchCommitter) backgroundCheckpoint(walSizeMB float64) {
+	if bc.stopped.Load() {
+		return
+	}
+
 	bc.checkpointRunning.Store(true)
 	defer bc.checkpointRunning.Store(false)
 
@@ -492,7 +502,11 @@ func (bc *SQLiteBatchCommitter) backgroundCheckpoint(walSizeMB float64) {
 
 		// Run incremental vacuum after successful checkpoint
 		if bc.incrementalVacuumEnabled && !bc.vacuumRunning.Load() {
-			go bc.backgroundIncrementalVacuum()
+			bc.bgWg.Add(1)
+			go func() {
+				defer bc.bgWg.Done()
+				bc.backgroundIncrementalVacuum()
+			}()
 		}
 	} else {
 		log.Warn().
@@ -507,6 +521,10 @@ func (bc *SQLiteBatchCommitter) backgroundCheckpoint(walSizeMB float64) {
 // Uses PRAGMA incremental_vacuum(N) to free N pages per iteration until
 // time limit is reached or no more pages to free.
 func (bc *SQLiteBatchCommitter) backgroundIncrementalVacuum() {
+	if bc.stopped.Load() {
+		return
+	}
+
 	if !bc.vacuumRunning.CompareAndSwap(false, true) {
 		return // Already running
 	}

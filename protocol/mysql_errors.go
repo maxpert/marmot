@@ -15,6 +15,7 @@ const (
 	ErrCodeLockTimeout     uint16 = 1205
 	ErrCodeDeadlock        uint16 = 1213
 	ErrCodeReadOnly        uint16 = 1290
+	ErrCodeServerShutdown  uint16 = 1053
 	ErrCodeNoReferencedRow uint16 = 1452
 	ErrCodeCheckConstraint uint16 = 3819
 )
@@ -65,4 +66,9 @@ func ErrDeadlock() *MySQLError {
 // ErrReadOnly returns error 1290 - server is running with --read-only option
 func ErrReadOnly() *MySQLError {
 	return NewMySQLError(ErrCodeReadOnly, SQLStateGeneral, "The MySQL server is running with the --read-only option so it cannot execute this statement")
+}
+
+// ErrServerShutdown returns error 1053 - server shutdown in progress
+func ErrServerShutdown() *MySQLError {
+	return NewMySQLError(ErrCodeServerShutdown, "08S01", "Server shutdown in progress")
 }

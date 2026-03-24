@@ -3,6 +3,7 @@ package grpc
 import (
 	"context"
 	"testing"
+	"time"
 )
 
 // TestGetClusterNodes_ReturnsAllNodes verifies that GetClusterNodes returns all nodes from the registry
@@ -119,5 +120,110 @@ func TestGetClusterNodes_EmptyRegistry(t *testing.T) {
 	// Registry should contain at least the local node
 	if len(resp.Nodes) < 1 {
 		t.Fatalf("Expected at least 1 node (self), got %d", len(resp.Nodes))
+	}
+}
+
+// TestServerStop_CompletesWithoutHanging verifies that Stop() returns within a reasonable deadline
+// without a running network listener (unit-level check).
+func TestServerStop_CompletesWithoutHanging(t *testing.T) {
+	t.Parallel()
+
+	config := ServerConfig{
+		NodeID:           42,
+		Address:          "127.0.0.1",
+		Port:             0,
+		AdvertiseAddress: "127.0.0.1:0",
+	}
+
+	srv, err := NewServer(config)
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		srv.Stop()
+	}()
+
+	select {
+	case <-done:
+		// expected
+	case <-time.After(3 * time.Second):
+		t.Fatal("Stop() did not return within 3 seconds")
+	}
+}
+
+// TestServerStop_Idempotent verifies that calling Stop() multiple times does not panic or deadlock.
+func TestServerStop_Idempotent(t *testing.T) {
+	t.Parallel()
+
+	config := ServerConfig{
+		NodeID:           43,
+		Address:          "127.0.0.1",
+		Port:             0,
+		AdvertiseAddress: "127.0.0.1:0",
+	}
+
+	srv, err := NewServer(config)
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		srv.Stop()
+		srv.Stop() // second call must be a no-op
+		srv.Stop() // third call must also be a no-op
+	}()
+
+	select {
+	case <-done:
+		// expected
+	case <-time.After(3 * time.Second):
+		t.Fatal("repeated Stop() calls did not return within 3 seconds")
+	}
+}
+
+// TestServerStop_StopsSnapshotCleanupGoroutine verifies that the stopCh
+// channel is closed by Stop(), allowing the cleanup goroutine to exit.
+func TestServerStop_StopsSnapshotCleanupGoroutine(t *testing.T) {
+	t.Parallel()
+
+	config := ServerConfig{
+		NodeID:           44,
+		Address:          "127.0.0.1",
+		Port:             0,
+		AdvertiseAddress: "127.0.0.1:0",
+	}
+
+	srv, err := NewServer(config)
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+
+	// Manually launch the cleanup goroutine (mimicking Start behaviour)
+	// and verify it exits after Stop is called.
+	exited := make(chan struct{})
+	go func() {
+		defer close(exited)
+		srv.runSnapshotCacheCleanup()
+	}()
+
+	// stopCh should not be closed yet
+	select {
+	case <-srv.stopCh:
+		t.Fatal("stopCh closed before Stop() was called")
+	default:
+	}
+
+	srv.Stop()
+
+	select {
+	case <-exited:
+		// goroutine exited cleanly
+	case <-time.After(3 * time.Second):
+		t.Fatal("runSnapshotCacheCleanup did not exit after Stop()")
 	}
 }

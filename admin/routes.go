@@ -27,6 +27,9 @@ func RegisterRoutes(mux *http.ServeMux, handlers *AdminHandlers) {
 		r.Get("/replication", handlers.handleClusterReplication)
 		r.Post("/remove/{nodeID}", handlers.handleClusterRemove)
 		r.Post("/allow/{nodeID}", handlers.handleClusterAllow)
+		r.Post("/decommission/{nodeID}", handlers.handleDecommission)
+		r.Get("/decommission/{nodeID}/status", handlers.handleDecommissionStatus)
+		r.Post("/decommission/{nodeID}/cancel", handlers.handleDecommissionCancel)
 	})
 
 	// Per-database transaction operations (outside metadata path)

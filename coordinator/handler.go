@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/maxpert/marmot/cfg"
@@ -112,6 +113,8 @@ type NodeRegistry interface {
 	UpdateSchemaVersions(versions map[string]uint64)
 	CountAlive() int
 	GetAll() []any // Returns slice of node states (avoids import cycle)
+	IsLeaving(nodeID uint64) bool
+	GetLocalNodeID() uint64
 }
 
 // NodeState represents cluster node state
@@ -175,6 +178,7 @@ type CoordinatorHandler struct {
 	recentTxnIDs      sync.Map // txn_id -> conn_id for duplicate detection
 	publisherRegistry PublisherRegistry
 	publisherMu       sync.RWMutex
+	draining          atomic.Bool
 }
 
 // NewCoordinatorHandler creates a new handler
@@ -190,6 +194,17 @@ func NewCoordinatorHandler(nodeID uint64, writeCoord *WriteCoordinator, readCoor
 		nodeRegistry:     nodeRegistry,
 		metadata:         handlers.NewMetadataHandler(dbManager, SystemDatabaseName),
 	}
+}
+
+// SetDraining marks the handler as draining (node is leaving the cluster).
+// When draining, new write queries are rejected with ER_SERVER_SHUTDOWN (1053).
+func (h *CoordinatorHandler) SetDraining(d bool) {
+	h.draining.Store(d)
+}
+
+// IsDraining reports whether the handler is currently rejecting new writes.
+func (h *CoordinatorHandler) IsDraining() bool {
+	return h.draining.Load()
 }
 
 // SetPublisherRegistry sets the CDC publisher registry
@@ -335,13 +350,21 @@ func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, sq
 		stmt.Database = session.CurrentDatabase
 	}
 
+	isMutation := protocol.IsMutation(stmt)
+
+	// Reject new write queries when the node is draining (graceful shutdown).
+	// Checked before checkDeterminism and coordinator dispatch so we fail fast
+	// without touching internal state that requires a real DB.
+	if isMutation && h.draining.Load() {
+		return nil, protocol.ErrServerShutdown()
+	}
+
 	// Check determinism for DML statements before execution
 	h.checkDeterminism(stmt)
 
 	// Check for consistency hint
 	consistency, found := protocol.ExtractConsistencyHint(sql)
 
-	isMutation := protocol.IsMutation(stmt)
 	inTransaction := session.InTransaction()
 
 	// Use configured default if no hint specified (different defaults for reads vs writes)
@@ -381,6 +404,10 @@ func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, sq
 // HandleLoadData executes a LOAD DATA LOCAL INFILE payload by reusing the same
 // INSERT/replication path as regular mutations.
 func (h *CoordinatorHandler) HandleLoadData(session *protocol.ConnectionSession, sql string, data []byte) (*protocol.ResultSet, error) {
+	if h.draining.Load() {
+		return nil, protocol.ErrServerShutdown()
+	}
+
 	stmt := protocol.ParseStatement(sql)
 	if stmt.Type != protocol.StatementLoadData {
 		return nil, fmt.Errorf("statement is not LOAD DATA")

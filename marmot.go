@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"syscall"
@@ -162,7 +163,6 @@ func main() {
 		log.Fatal().Err(err).Msg("Failed to start gRPC server")
 		return
 	}
-	defer grpcServer.Stop()
 
 	// Start gossip protocol
 	log.Info().Msg("Starting gossip protocol")
@@ -243,7 +243,6 @@ func main() {
 		log.Fatal().Err(err).Msg("Failed to initialize Database Manager")
 		return
 	}
-	defer dbMgr.Close()
 
 	// Initialize CDC notification hub for signal-based change streaming
 	cdcHub := notify.NewHub()
@@ -254,7 +253,6 @@ func main() {
 	// Start metrics collector for telemetry (updates every 10 seconds)
 	metricsCollector := telemetry.NewMetricsCollector(&dbManagerAdapter{dm: dbMgr}, 10*time.Second)
 	metricsCollector.Start()
-	defer metricsCollector.Stop()
 
 	// Initialize CDC Publisher if enabled
 	var publisherRegistry *publisher.Registry
@@ -276,7 +274,6 @@ func main() {
 			log.Fatal().Err(err).Msg("Failed to start publisher")
 			return
 		}
-		defer publisherRegistry.Stop()
 
 		log.Info().
 			Int("sinks", len(cfg.Config.Publisher.Sinks)).
@@ -322,6 +319,7 @@ func main() {
 		schemaVersionMgr,
 	)
 	replicationHandler.SetClient(client)
+	replicationHandler.SetRegistry(grpcServer.GetNodeRegistry())
 	grpcServer.SetReplicationHandler(replicationHandler)
 	grpcServer.SetDatabaseManager(dbMgr)
 
@@ -386,7 +384,6 @@ func main() {
 
 	// Start anti-entropy service
 	antiEntropy.Start()
-	defer antiEntropy.Stop()
 
 	log.Info().Msg("Anti-entropy service initialized")
 
@@ -446,7 +443,6 @@ func main() {
 
 	// Initialize write forwarding for read-only replicas
 	forwardSessionMgr := marmotgrpc.NewForwardSessionManager(60 * time.Second)
-	defer forwardSessionMgr.Stop()
 	forwardHandler := marmotgrpc.NewForwardHandler(
 		cfg.Config.NodeID,
 		clock,
@@ -499,7 +495,6 @@ func main() {
 		log.Fatal().Err(err).Msg("Failed to start MySQL server")
 		return
 	}
-	defer mysqlServer.Stop()
 
 	// Now that all services are initialized and running, handle node state
 	if isJoiningCluster {
@@ -528,8 +523,52 @@ func main() {
 		Str("data_dir", cfg.Config.DataDir).
 		Msg("Node is operational")
 
-	// Keep running
-	select {}
+	orchestrator := &ShutdownOrchestrator{
+		grpcServer:         grpcServer,
+		gossip:             gossip,
+		registry:           grpcServer.GetNodeRegistry(),
+		mysqlServer:        mysqlServer,
+		ddlLockMgr:         ddlLockMgr,
+		dbManager:          dbMgr,
+		notifierHub:        cdcHub,
+		publisherReg:       publisherRegistry,
+		antiEntropy:        antiEntropy,
+		metricsCollector:   metricsCollector,
+		forwardSessMgr:     forwardSessionMgr,
+		coordinatorHandler: handler,
+		gracePeriod:        cfg.Config.Cluster.GetShutdownGracePeriod(),
+	}
+
+	// shutdownCh is triggered by either SIGTERM/SIGINT or remote decommission
+	shutdownCh := make(chan string, 1)
+
+	// Listen for OS signals
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		sig := <-sigCh
+		shutdownCh <- sig.String()
+	}()
+
+	// Listen for remote decommission (admin API marks this node as LEAVING via gossip)
+	grpcServer.GetNodeRegistry().SetOnNodeLeaving(func() {
+		select {
+		case shutdownCh <- "remote decommission":
+		default: // shutdown already triggered
+		}
+	})
+
+	reason := <-shutdownCh
+	log.Info().Str("reason", reason).Msg("Starting graceful shutdown")
+
+	// A second signal forces immediate exit.
+	go func() {
+		sig2 := <-sigCh
+		log.Warn().Str("signal", sig2.String()).Msg("Received second signal, forcing immediate shutdown")
+		os.Exit(1)
+	}()
+
+	orchestrator.Shutdown()
 }
 
 func initializeGRPCServer() (*marmotgrpc.Server, error) {

@@ -2,8 +2,8 @@ package admin
 
 import (
 	"net/http"
-	"strings"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/maxpert/marmot/cfg"
 	marmotgrpc "github.com/maxpert/marmot/grpc"
 )
@@ -23,9 +23,8 @@ func (h *AdminHandlers) getRegistry() *marmotgrpc.NodeRegistry {
 
 // handleClusterMembers handles GET /admin/cluster/members
 func (h *AdminHandlers) handleClusterMembers(w http.ResponseWriter, r *http.Request) {
-	registry := h.getRegistry()
+	registry := h.resolveRegistryOrError(w)
 	if registry == nil {
-		writeErrorResponse(w, http.StatusInternalServerError, "node registry unavailable")
 		return
 	}
 
@@ -64,9 +63,8 @@ func (h *AdminHandlers) handleClusterMembers(w http.ResponseWriter, r *http.Requ
 
 // handleClusterHealth handles GET /admin/cluster/health
 func (h *AdminHandlers) handleClusterHealth(w http.ResponseWriter, r *http.Request) {
-	registry := h.getRegistry()
+	registry := h.resolveRegistryOrError(w)
 	if registry == nil {
-		writeErrorResponse(w, http.StatusInternalServerError, "node registry unavailable")
 		return
 	}
 
@@ -91,9 +89,8 @@ func (h *AdminHandlers) handleClusterHealth(w http.ResponseWriter, r *http.Reque
 
 // handleClusterReplication handles GET /admin/cluster/replication
 func (h *AdminHandlers) handleClusterReplication(w http.ResponseWriter, r *http.Request) {
-	registry := h.getRegistry()
+	registry := h.resolveRegistryOrError(w)
 	if registry == nil {
-		writeErrorResponse(w, http.StatusInternalServerError, "node registry unavailable")
 		return
 	}
 
@@ -162,16 +159,14 @@ func (h *AdminHandlers) handleClusterReplication(w http.ResponseWriter, r *http.
 
 // handleClusterRemove handles POST /admin/cluster/remove/{node_id}
 func (h *AdminHandlers) handleClusterRemove(w http.ResponseWriter, r *http.Request) {
-	path := strings.TrimPrefix(r.URL.Path, "/cluster/remove/")
-	nodeID, err := parsePeerNodeID(path)
+	nodeID, err := parsePeerNodeID(chi.URLParam(r, "nodeID"))
 	if err != nil {
 		writeErrorResponse(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	registry := h.getRegistry()
+	registry := h.resolveRegistryOrError(w)
 	if registry == nil {
-		writeErrorResponse(w, http.StatusInternalServerError, "node registry unavailable")
 		return
 	}
 
@@ -185,16 +180,14 @@ func (h *AdminHandlers) handleClusterRemove(w http.ResponseWriter, r *http.Reque
 
 // handleClusterAllow handles POST /admin/cluster/allow/{node_id}
 func (h *AdminHandlers) handleClusterAllow(w http.ResponseWriter, r *http.Request) {
-	path := strings.TrimPrefix(r.URL.Path, "/cluster/allow/")
-	nodeID, err := parsePeerNodeID(path)
+	nodeID, err := parsePeerNodeID(chi.URLParam(r, "nodeID"))
 	if err != nil {
 		writeErrorResponse(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	registry := h.getRegistry()
+	registry := h.resolveRegistryOrError(w)
 	if registry == nil {
-		writeErrorResponse(w, http.StatusInternalServerError, "node registry unavailable")
 		return
 	}
 

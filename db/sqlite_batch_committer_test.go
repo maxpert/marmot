@@ -786,6 +786,120 @@ func TestBatchCommitter_ConcurrentOperationsWithCheckpoint(t *testing.T) {
 	}
 }
 
+func TestBatchCommitter_StopWaitsForBackgroundGoroutines(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "test.db")
+
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatalf("failed to open db: %v", err)
+	}
+	_, err = db.Exec(`CREATE TABLE test_table (id INTEGER PRIMARY KEY, name TEXT, value INTEGER)`)
+	if err != nil {
+		db.Close()
+		t.Fatalf("failed to create table: %v", err)
+	}
+	db.Close()
+
+	// Low thresholds so checkpoint triggers quickly.
+	bc := NewSQLiteBatchCommitter(
+		dbPath,
+		10,
+		50*time.Millisecond,
+		true,
+		0.0, // passive threshold: always trigger checkpoint
+		0.5, // restart threshold
+		false,
+		false,
+		0,
+		0,
+	)
+	if err := bc.Start(); err != nil {
+		t.Fatalf("failed to start batch committer: %v", err)
+	}
+
+	// Enqueue and wait so a checkpoint goroutine may be started.
+	entry := makeIntentEntry("test_table", OpTypeInsert, 1, "test", 1)
+	fut := bc.Enqueue(1, hlc.Timestamp{}, []*IntentEntry{entry}, nil)
+	if _, err := fut.Get(); err != nil {
+		t.Fatalf("enqueue failed: %v", err)
+	}
+
+	// Stop must return only after all background goroutines finish.
+	// A race detector run will catch any db access after Close.
+	done := make(chan struct{})
+	go func() {
+		bc.Stop()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop() did not return within 5 seconds — possible goroutine leak")
+	}
+
+	// bgWg counter must be zero after Stop returns.
+	// We verify indirectly: a second Stop() is idempotent and must not block.
+	bc.Stop()
+}
+
+func TestBatchCommitter_BackgroundGoroutinesCheckStoppedFlag(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "test.db")
+
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatalf("failed to open db: %v", err)
+	}
+	_, err = db.Exec(`CREATE TABLE test_table (id INTEGER PRIMARY KEY, name TEXT, value INTEGER)`)
+	if err != nil {
+		db.Close()
+		t.Fatalf("failed to create table: %v", err)
+	}
+	db.Close()
+
+	bc := NewSQLiteBatchCommitter(
+		dbPath,
+		10,
+		50*time.Millisecond,
+		true,
+		0.0,
+		0.5,
+		false,
+		true, // incrementalVacuumEnabled
+		10,   // incrementalVacuumPages
+		100,  // incrementalVacuumTimeLimitMS
+	)
+	if err := bc.Start(); err != nil {
+		t.Fatalf("failed to start batch committer: %v", err)
+	}
+
+	entry := makeIntentEntry("test_table", OpTypeInsert, 1, "test", 1)
+	fut := bc.Enqueue(1, hlc.Timestamp{}, []*IntentEntry{entry}, nil)
+	if _, err := fut.Get(); err != nil {
+		t.Fatalf("enqueue failed: %v", err)
+	}
+
+	// Stop: flushLoop exits, bgWg waits for any running checkpoint/vacuum,
+	// then db is closed. No panic or race must occur.
+	done := make(chan struct{})
+	go func() {
+		bc.Stop()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop() did not return within 5 seconds")
+	}
+}
+
 func TestBatchCommitter_CheckpointMetrics(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "test.db")

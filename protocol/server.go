@@ -10,10 +10,12 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/protocol/query"
 	"github.com/maxpert/marmot/telemetry"
+	"github.com/puzpuzpuz/xsync/v3"
 	"github.com/rs/zerolog/log"
 )
 
@@ -44,10 +46,13 @@ type MySQLServer struct {
 	localInfile    bool
 	listeners      []net.Listener
 	quit           chan struct{}
-	wg             sync.WaitGroup
+	wg             sync.WaitGroup // tracks accept-loop goroutines
+	connWg         sync.WaitGroup // tracks per-connection goroutines
 	handler        ConnectionHandler
 	connIDGen      uint64
 	connIDLock     sync.Mutex
+	activeConns    *xsync.MapOf[uint64, net.Conn]
+	draining       atomic.Bool
 }
 
 // SessionTransaction holds transaction state for explicit BEGIN/COMMIT
@@ -194,6 +199,7 @@ func NewMySQLServer(tcpAddress, unixSocket string, unixSocketPerm os.FileMode, h
 		localInfile:    true,
 		quit:           make(chan struct{}),
 		handler:        handler,
+		activeConns:    xsync.NewMapOf[uint64, net.Conn](),
 	}
 }
 
@@ -249,8 +255,11 @@ func (s *MySQLServer) Start() error {
 	return nil
 }
 
-// Stop stops the MySQL server
+// Stop stops the MySQL server. It signals draining, closes all listeners,
+// and waits for accept-loop goroutines to finish. Active connection goroutines
+// finish on their own; call GracefulDrain if you need to wait for them.
 func (s *MySQLServer) Stop() {
+	s.draining.Store(true)
 	close(s.quit)
 	for _, listener := range s.listeners {
 		if listener != nil {
@@ -265,6 +274,55 @@ func (s *MySQLServer) Stop() {
 			log.Warn().Err(err).Str("socket", s.unixSocket).Msg("Failed to remove Unix socket file")
 		}
 	}
+}
+
+// IsDraining returns true if the server is in the process of shutting down.
+func (s *MySQLServer) IsDraining() bool {
+	return s.draining.Load()
+}
+
+// ActiveConnectionCount returns the number of connections that have completed
+// the handshake and are currently in the command loop.
+func (s *MySQLServer) ActiveConnectionCount() int {
+	return s.activeConns.Size()
+}
+
+// GracefulDrain waits up to timeout for all active connections to finish.
+// If the timeout expires, every remaining connection is forcibly closed and
+// the method waits for those goroutines to finish via the WaitGroup before returning.
+// This is intended to be called by the shutdown orchestrator after Stop().
+func (s *MySQLServer) GracefulDrain(timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+
+	lastN := -1
+	for {
+		n := s.activeConns.Size()
+		if n == 0 {
+			return
+		}
+
+		if n != lastN {
+			log.Info().Int("active_connections", n).Msg("Waiting for active connections to drain")
+			lastN = n
+		}
+
+		if time.Now().After(deadline) {
+			break
+		}
+
+		<-ticker.C
+	}
+
+	// Force-close all remaining connections.
+	s.activeConns.Range(func(id uint64, conn net.Conn) bool {
+		conn.Close()
+		return true
+	})
+
+	// Wait for the per-connection goroutines to exit via the WaitGroup.
+	s.connWg.Wait()
 }
 
 // nextConnID generates a unique connection ID
@@ -290,9 +348,9 @@ func (s *MySQLServer) acceptLoop(listener net.Listener) {
 			}
 		}
 
-		s.wg.Add(1)
+		s.connWg.Add(1)
 		go func() {
-			defer s.wg.Done()
+			defer s.connWg.Done()
 			s.handleConnection(conn)
 		}()
 	}
@@ -344,11 +402,24 @@ func (s *MySQLServer) handleConnection(conn net.Conn) {
 		log.Warn().Err(err).Uint64("conn_id", session.ConnID).Msg("Failed to parse handshake response")
 	}
 
+	// Reject new connections when the server is draining.
+	// ER_SERVER_SHUTDOWN (1053) signals clients to reconnect elsewhere.
+	// This check intentionally sits before the OK packet so the client never
+	// thinks it is authenticated.
+	if s.draining.Load() {
+		_ = s.writeMySQLErr(conn, 2, ErrServerShutdown())
+		return
+	}
+
 	// 3. Send OK Packet (Authentication successful)
 	if err := s.writeOK(conn, 2, 0, 0); err != nil {
 		log.Error().Err(err).Msg("Failed to write OK packet")
 		return
 	}
+
+	// Register this connection for tracking; deregister on any exit path.
+	s.activeConns.Store(session.ConnID, conn)
+	defer s.activeConns.Delete(session.ConnID)
 
 	// 4. Command Loop
 	for {

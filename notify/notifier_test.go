@@ -285,6 +285,55 @@ func TestHub_SignalBeforeSubscribe(t *testing.T) {
 	}
 }
 
+func TestHub_CloseUnblocksSubscriber(t *testing.T) {
+	hub := NewHub()
+
+	signals, _ := hub.Subscribe(db.CDCFilter{})
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		// This receive blocks until the channel is closed by Close().
+		for range signals {
+		}
+	}()
+
+	hub.Close()
+
+	select {
+	case <-done:
+		// Expected — goroutine unblocked by channel close
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("goroutine did not unblock after Close()")
+	}
+}
+
+func TestHub_SubscribeAfterClose(t *testing.T) {
+	hub := NewHub()
+	hub.Close()
+
+	ch, cancel := hub.Subscribe(db.CDCFilter{})
+	if ch != nil || cancel != nil {
+		t.Error("Subscribe after Close should return nil, nil")
+	}
+}
+
+func TestHub_SignalAfterCloseNoPanic(t *testing.T) {
+	hub := NewHub()
+	hub.Close()
+
+	// Must not panic
+	hub.Signal("testdb", 1)
+}
+
+func TestHub_CloseIdempotent(t *testing.T) {
+	hub := NewHub()
+
+	// Calling Close twice must not panic
+	hub.Close()
+	hub.Close()
+}
+
 func TestHub_DoubleCancel(t *testing.T) {
 	hub := NewHub()
 

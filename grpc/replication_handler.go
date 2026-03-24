@@ -22,6 +22,7 @@ type ReplicationHandler struct {
 	schemaVersionMgr *db.SchemaVersionManager
 	engine           *db.ReplicationEngine
 	client           *Client
+	registry         *NodeRegistry
 }
 
 // NewReplicationHandler creates a new replication handler
@@ -33,6 +34,11 @@ func NewReplicationHandler(nodeID uint64, dbMgr *db.DatabaseManager, clock *hlc.
 		schemaVersionMgr: schemaVersionMgr,
 		engine:           db.NewReplicationEngine(nodeID, dbMgr, clock),
 	}
+}
+
+// SetRegistry wires the NodeRegistry so the handler can check node status.
+func (rh *ReplicationHandler) SetRegistry(registry *NodeRegistry) {
+	rh.registry = registry
 }
 
 // SetClient wires the gRPC client used for pull-based LOAD DATA chunk fetches.
@@ -74,6 +80,17 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 	defer func() {
 		telemetry.ReplicaPrepareSeconds.Observe(time.Since(prepareStart).Seconds())
 	}()
+
+	// Reject new PREPARE requests when this node is LEAVING the cluster.
+	// COMMIT and ABORT are still accepted for transactions that were already
+	// prepared before we started leaving — those must be honored.
+	if rh.registry != nil && rh.registry.IsLeaving(rh.registry.GetLocalNodeID()) {
+		telemetry.ReplicationRequestsTotal.With("prepare", "failed").Inc()
+		return &TransactionResponse{
+			Success:      false,
+			ErrorMessage: "node is leaving cluster",
+		}, nil
+	}
 
 	// Schema version validation - MUST happen before engine call
 	if rh.schemaVersionMgr != nil && req.RequiredSchemaVersion > 0 {

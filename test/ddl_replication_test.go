@@ -119,6 +119,8 @@ type MockNodeRegistry struct{}
 func (m *MockNodeRegistry) UpdateSchemaVersions(versions map[string]uint64) {}
 func (m *MockNodeRegistry) CountAlive() int                                 { return 1 }
 func (m *MockNodeRegistry) GetAll() []any                                   { return []any{} }
+func (m *MockNodeRegistry) IsLeaving(nodeID uint64) bool                    { return false }
+func (m *MockNodeRegistry) GetLocalNodeID() uint64                          { return 0 }
 
 // TestDDLStatementDetection validates that DDL statements are correctly identified
 func TestDDLStatementDetection(t *testing.T) {

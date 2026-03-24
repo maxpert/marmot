@@ -192,6 +192,45 @@ func (gp *GossipProtocol) BroadcastImmediate() {
 	gp.doGossipRound()
 }
 
+// BroadcastDeparture sends the local node's LEAVING status to ALL alive peers (not
+// just the fanout subset) and repeats for rounds rounds to maximise propagation.
+// Call this after MarkSelfLeaving(), before initiating shutdown.
+func (gp *GossipProtocol) BroadcastDeparture(rounds int) {
+	allNodes := gp.registry.GetAll()
+
+	peers := make([]*NodeState, 0, len(allNodes))
+	for _, n := range allNodes {
+		if n.NodeId != gp.nodeID && n.Status == NodeStatus_ALIVE {
+			peers = append(peers, n)
+		}
+	}
+
+	if len(peers) == 0 {
+		return
+	}
+
+	req := &GossipRequest{
+		SourceNodeId: gp.nodeID,
+		Nodes:        allNodes,
+		Incarnation:  gp.incarnation,
+	}
+
+	for i := 0; i < rounds; i++ {
+		var wg sync.WaitGroup
+		for _, peer := range peers {
+			wg.Add(1)
+			go func(p *NodeState) {
+				defer wg.Done()
+				gp.sendGossip(p, req)
+			}(peer)
+		}
+		wg.Wait()
+		if i < rounds-1 {
+			time.Sleep(200 * time.Millisecond)
+		}
+	}
+}
+
 // BroadcastAndVerifyAlive broadcasts ALIVE status and verifies peers have acknowledged it
 // Retries up to maxRetries times with retryInterval between attempts
 // Returns true if at least one peer has us marked as ALIVE in their registry
