@@ -1105,11 +1105,6 @@ func (s *Server) GetNodeRegistry() *NodeRegistry {
 	return s.registry
 }
 
-// GetRegistry returns the node registry (alias for GetNodeRegistry)
-func (s *Server) GetRegistry() *NodeRegistry {
-	return s.registry
-}
-
 // GetGossipProtocol returns the gossip protocol instance
 func (s *Server) GetGossipProtocol() *GossipProtocol {
 	return s.gossip

@@ -133,13 +133,7 @@ func TestQuorumSafeAfterLeaving_SingleNode(t *testing.T) {
 
 func TestQuorumSafeAfterLeaving_TwoNodes_Blocked(t *testing.T) {
 	t.Parallel()
-	// 2 total, 2 alive → after: 1 total, 1 alive, quorum=1 → 1>=1 safe
-	// Wait — 2 nodes: newTotal=1, newQuorum=(1/2)+1=1, newAlive=1 → 1>=1 → safe
-	// But in practice a 2-node cluster needs both for writes; quorum math says it's safe.
-	// This reflects majority quorum: 2 nodes, quorum=1 (floor(2/2)+1=2, NOT 1).
-	// Let's check: total=2, (2/2)+1=2. After leaving: newTotal=1, newQuorum=(1/2)+1=1. Safe.
-	// Hmm — actually with 2 nodes both alive, (alive-1)=1 >= (newQuorum=1): safe.
-	// With 2 nodes and only 1 alive, (alive-1)=0 >= 1: NOT safe.
+	// 2 total, 1 alive: newTotal=1, newAlive=0, newQuorum=1 → 0<1 → unsafe
 	if quorumSafeAfterLeaving(2, 1) {
 		t.Error("2 nodes with 1 alive: decommission must be unsafe (would leave 0 alive, quorum needs 1)")
 	}

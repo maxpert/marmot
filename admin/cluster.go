@@ -13,12 +13,7 @@ func (h *AdminHandlers) getRegistry() *marmotgrpc.NodeRegistry {
 	if h.server == nil {
 		return nil
 	}
-	if regGetter, ok := any(h.server).(interface {
-		GetRegistry() *marmotgrpc.NodeRegistry
-	}); ok {
-		return regGetter.GetRegistry()
-	}
-	return nil
+	return h.server.GetNodeRegistry()
 }
 
 // handleClusterMembers handles GET /admin/cluster/members

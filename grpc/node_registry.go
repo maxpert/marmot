@@ -231,10 +231,11 @@ func (nr *NodeRegistry) handleSelfUpdateLocked(node *NodeState) {
 	// via admin API, not a failure detection. Don't refute it.
 	if node.Status == NodeStatus_LEAVING && node.Incarnation > self.Incarnation {
 		oldStatus := self.Status
+		oldIncarnation := self.Incarnation
 		self.Status = NodeStatus_LEAVING
 		self.Incarnation = node.Incarnation
 		log.Info().
-			Uint64("old_incarnation", node.Incarnation-1).
+			Uint64("old_incarnation", oldIncarnation).
 			Uint64("new_incarnation", self.Incarnation).
 			Msg("Accepting remote decommission — transitioning to LEAVING")
 		if oldStatus != NodeStatus_LEAVING {

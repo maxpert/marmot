@@ -91,7 +91,7 @@ func (h *AdminHandlers) handleDecommission(w http.ResponseWriter, r *http.Reques
 	w.WriteHeader(http.StatusAccepted)
 	writeJSONResponse(w, map[string]any{
 		"node_id": nodeID,
-		"status":  "LEAVING",
+		"status":  marmotgrpc.NodeStatus_LEAVING.String(),
 		"message": "decommission started, node will drain and shut down",
 	}, false, "")
 }
@@ -142,7 +142,7 @@ func (h *AdminHandlers) handleDecommissionCancel(w http.ResponseWriter, r *http.
 
 	writeJSONResponse(w, map[string]any{
 		"node_id": nodeID,
-		"status":  "ALIVE",
+		"status":  marmotgrpc.NodeStatus_ALIVE.String(),
 		"message": "decommission cancelled",
 	}, false, "")
 }

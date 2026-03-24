@@ -748,9 +748,12 @@ func Validate() error {
 		}
 	}
 
-	// Validate shutdown grace period
-	if Config.Cluster.ShutdownGracePeriodMS < 1000 {
-		return fmt.Errorf("cluster.shutdown_grace_period_ms must be >= 1000ms")
+	// Validate shutdown grace period (1s min, 5m max; 0 means use default 15s)
+	if Config.Cluster.ShutdownGracePeriodMS == 0 {
+		Config.Cluster.ShutdownGracePeriodMS = 15000
+	}
+	if Config.Cluster.ShutdownGracePeriodMS < 1000 || Config.Cluster.ShutdownGracePeriodMS > 300000 {
+		return fmt.Errorf("cluster.shutdown_grace_period_ms must be between 1000ms and 300000ms (5 minutes)")
 	}
 
 	// Validate publisher configuration
