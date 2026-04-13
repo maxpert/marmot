@@ -39,6 +39,7 @@ type DatabaseManager struct {
 	clock                    *hlc.Clock
 	refreshReplicationStates RefreshReplicationStatesFunc // Callback to refresh peer states before GC
 	cdcHub                   CDCHub                       // CDC notification hub, can be nil
+	vecIndexMgr              *VectorIndexManager          // Optional vector index manager
 }
 
 // DatabaseMetadata represents database registry information
@@ -239,6 +240,20 @@ func (dm *DatabaseManager) GetCDCHub() CDCHub {
 	dm.mu.RLock()
 	defer dm.mu.RUnlock()
 	return dm.cdcHub
+}
+
+// SetVectorIndexManager sets the vector index manager.
+func (dm *DatabaseManager) SetVectorIndexManager(mgr *VectorIndexManager) {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+	dm.vecIndexMgr = mgr
+}
+
+// GetVectorIndexManager returns the vector index manager (may be nil).
+func (dm *DatabaseManager) GetVectorIndexManager() *VectorIndexManager {
+	dm.mu.RLock()
+	defer dm.mu.RUnlock()
+	return dm.vecIndexMgr
 }
 
 // ensureDefaultDatabase ensures the default database exists
