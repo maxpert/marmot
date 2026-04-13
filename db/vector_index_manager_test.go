@@ -108,7 +108,7 @@ func setupTestVIM(t *testing.T) (*VectorIndexManager, *DatabaseManager, *mockVec
 	require.NoError(t, err)
 
 	eng := newMockEngine()
-	vim := NewVectorIndexManager(eng, dm, 0)
+	vim := NewVectorIndexManager(eng, dm, 0, 0)
 	// Stop VIM before closing DM so background goroutines are cancelled first.
 	t.Cleanup(func() {
 		_ = vim.Stop()
@@ -332,7 +332,7 @@ func TestVectorIndexManager_DatabaseManager_Accessors(t *testing.T) {
 	t.Parallel()
 	_, dm, eng := setupTestVIM(t)
 
-	vim := NewVectorIndexManager(eng, dm, 0)
+	vim := NewVectorIndexManager(eng, dm, 0, 0)
 	assert.Nil(t, dm.GetVectorIndexManager())
 
 	dm.SetVectorIndexManager(vim)

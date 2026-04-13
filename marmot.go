@@ -263,7 +263,7 @@ func main() {
 			return
 		}
 		reconcileInterval := time.Duration(cfg.Config.VectorIndex.ReconcileIntervalSec) * time.Second
-		vecIndexMgr = db.NewVectorIndexManager(vecEngine, dbMgr, reconcileInterval)
+		vecIndexMgr = db.NewVectorIndexManager(vecEngine, dbMgr, reconcileInterval, cfg.Config.VectorIndex.MinVectorsForCreate)
 		dbMgr.SetVectorIndexManager(vecIndexMgr)
 		if err := vecIndexMgr.Start(context.Background()); err != nil {
 			log.Fatal().Err(err).Msg("Failed to start vector index manager")

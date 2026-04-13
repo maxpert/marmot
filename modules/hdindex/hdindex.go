@@ -329,7 +329,9 @@ func persistMeta(batch *pebble.Batch, spec HDIndexSpec, refs *refobj.ReferenceSe
 	if err != nil {
 		return fmt.Errorf("marshal spec: %w", err)
 	}
-	if err := batch.Set([]byte(metaKeySpec), specBytes, pebble.Sync); err != nil {
+	// Batch.Set write options are ignored by Pebble — durability is controlled
+	// by the batch.Commit call in buildIndex. Use NoSync for clarity.
+	if err := batch.Set([]byte(metaKeySpec), specBytes, pebble.NoSync); err != nil {
 		return err
 	}
 
@@ -337,20 +339,20 @@ func persistMeta(batch *pebble.Batch, spec HDIndexSpec, refs *refobj.ReferenceSe
 	for i, rv := range refs.Vectors {
 		key := fmt.Sprintf("%s%d", metaKeyRefPfx, i)
 		val := encodeFloat32Slice(rv)
-		if err := batch.Set([]byte(key), val, pebble.Sync); err != nil {
+		if err := batch.Set([]byte(key), val, pebble.NoSync); err != nil {
 			return err
 		}
 	}
 
 	// Store pairwise distances.
-	if err := batch.Set([]byte(metaKeyRefDists), encodeFloat32Slice(refs.PairDists), pebble.Sync); err != nil {
+	if err := batch.Set([]byte(metaKeyRefDists), encodeFloat32Slice(refs.PairDists), pebble.NoSync); err != nil {
 		return err
 	}
 
 	// Store ref count for loading.
 	rcBytes := make([]byte, 4)
 	binary.BigEndian.PutUint32(rcBytes, uint32(refs.M))
-	if err := batch.Set([]byte(metaKeyRefCount), rcBytes, pebble.Sync); err != nil {
+	if err := batch.Set([]byte(metaKeyRefCount), rcBytes, pebble.NoSync); err != nil {
 		return err
 	}
 

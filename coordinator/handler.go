@@ -683,6 +683,10 @@ func (h *CoordinatorHandler) handleVectorDDL(stmt protocol.Statement) (*protocol
 		return nil, fmt.Errorf("vector index support not enabled")
 	}
 
+	if stmt.Database == "" {
+		return nil, fmt.Errorf("vector index: no database selected; use USE <database> first")
+	}
+
 	ctx := context.Background()
 
 	switch stmt.Type {

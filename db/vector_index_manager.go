@@ -36,22 +36,25 @@ type VectorIndexManager struct {
 	indexes           map[string]VectorIndex      // indexName → VectorIndex
 	tableMeta         map[string]*VectorIndexMeta // "database.table" → meta (for CDC routing)
 	dbMgr             *DatabaseManager
-	cdcCancel         func() // cancel CDC subscription
-	bgCtx             context.Context
-	bgCancel          context.CancelFunc
-	reconcileInterval time.Duration
+	cdcCancel            func() // cancel CDC subscription
+	bgCtx                context.Context
+	bgCancel             context.CancelFunc
+	reconcileInterval    time.Duration
+	minVectorsForCreate  int
 }
 
 // NewVectorIndexManager creates a new VectorIndexManager.
 // reconcileInterval controls how often the manager scans for CDC signal gaps.
 // Pass 0 to disable periodic reconciliation.
-func NewVectorIndexManager(engine VectorIndexEngine, dbMgr *DatabaseManager, reconcileInterval time.Duration) *VectorIndexManager {
+// minVectors is the minimum row count required before CREATE INDEX is allowed (0 = no limit).
+func NewVectorIndexManager(engine VectorIndexEngine, dbMgr *DatabaseManager, reconcileInterval time.Duration, minVectors int) *VectorIndexManager {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &VectorIndexManager{
-		engine:            engine,
-		indexes:           make(map[string]VectorIndex),
-		tableMeta:         make(map[string]*VectorIndexMeta),
-		dbMgr:             dbMgr,
+		engine:              engine,
+		indexes:             make(map[string]VectorIndex),
+		tableMeta:           make(map[string]*VectorIndexMeta),
+		dbMgr:               dbMgr,
+		minVectorsForCreate: minVectors,
 		bgCtx:             ctx,
 		bgCancel:          cancel,
 		reconcileInterval: reconcileInterval,
@@ -149,6 +152,10 @@ func (m *VectorIndexManager) CreateIndex(ctx context.Context, meta VectorIndexMe
 	rows.Close()
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("vector index: iterate source table: %w", err)
+	}
+
+	if m.minVectorsForCreate > 0 && len(bulk) < m.minVectorsForCreate {
+		return fmt.Errorf("vector index: need at least %d vectors for index creation, got %d", m.minVectorsForCreate, len(bulk))
 	}
 
 	if meta.CreatedAt == 0 {
