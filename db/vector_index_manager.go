@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"database/sql"
 	"encoding/binary"
 	"fmt"
 	"sync"
@@ -36,6 +37,8 @@ type VectorIndexManager struct {
 	tableMeta         map[string]*VectorIndexMeta // "database.table" → meta (for CDC routing)
 	dbMgr             *DatabaseManager
 	cdcCancel         func() // cancel CDC subscription
+	bgCtx             context.Context
+	bgCancel          context.CancelFunc
 	reconcileInterval time.Duration
 }
 
@@ -43,11 +46,14 @@ type VectorIndexManager struct {
 // reconcileInterval controls how often the manager scans for CDC signal gaps.
 // Pass 0 to disable periodic reconciliation.
 func NewVectorIndexManager(engine VectorIndexEngine, dbMgr *DatabaseManager, reconcileInterval time.Duration) *VectorIndexManager {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &VectorIndexManager{
 		engine:            engine,
 		indexes:           make(map[string]VectorIndex),
 		tableMeta:         make(map[string]*VectorIndexMeta),
 		dbMgr:             dbMgr,
+		bgCtx:             ctx,
+		bgCancel:          cancel,
 		reconcileInterval: reconcileInterval,
 	}
 }
@@ -77,8 +83,10 @@ func (m *VectorIndexManager) Start(ctx context.Context) error {
 	return nil
 }
 
-// Stop cancels CDC subscription and closes all indexes.
+// Stop cancels CDC subscription, background goroutines, and closes all indexes.
 func (m *VectorIndexManager) Stop() error {
+	m.bgCancel()
+
 	m.mu.Lock()
 	cancel := m.cdcCancel
 	m.cdcCancel = nil
@@ -236,14 +244,33 @@ func (m *VectorIndexManager) DropIndex(ctx context.Context, indexName, database 
 }
 
 // Search performs a kNN search on a named index.
+// Returns an error if the index is not found or if the source table no longer exists.
 func (m *VectorIndexManager) Search(ctx context.Context, indexName string, vector []float32, topK int) ([]VectorSearchHit, error) {
 	m.mu.RLock()
 	idx, ok := m.indexes[indexName]
+	var meta *VectorIndexMeta
+	for _, v := range m.tableMeta {
+		if v.IndexName == indexName {
+			meta = v
+			break
+		}
+	}
 	m.mu.RUnlock()
 
 	if !ok {
 		return nil, fmt.Errorf("vector index %q not found", indexName)
 	}
+
+	if meta != nil {
+		conn, err := m.dbMgr.GetDatabaseConnection(meta.Database)
+		if err != nil {
+			return nil, fmt.Errorf("vector index %q: source database %q unavailable: %w", indexName, meta.Database, err)
+		}
+		if !tableExists(ctx, conn, meta.TableName) {
+			return nil, fmt.Errorf("vector index %q: source table %q no longer exists", indexName, meta.TableName)
+		}
+	}
+
 	return idx.Search(ctx, vector, topK)
 }
 
@@ -261,6 +288,8 @@ func (m *VectorIndexManager) GetIndexMeta(indexName string) (*VectorIndexMeta, b
 }
 
 // loadExistingIndexes scans all databases for __marmot_vector_indexes and opens ready indexes.
+// Indexes stuck in 'building' are marked as 'error' (crash recovery).
+// Indexes whose Pebble directory is missing trigger an async rebuild.
 func (m *VectorIndexManager) loadExistingIndexes(ctx context.Context) error {
 	names := m.dbMgr.ListDatabases()
 	for _, dbName := range names {
@@ -270,15 +299,18 @@ func (m *VectorIndexManager) loadExistingIndexes(ctx context.Context) error {
 			continue
 		}
 
-		// Table might not exist yet — that is fine.
+		// Fetch both 'ready' and 'building' rows so we can handle crash recovery.
+		// Collect all rows first, then close the cursor before issuing any writes
+		// (SQLite allows only one active statement per connection at a time).
 		rows, err := conn.QueryContext(ctx,
 			`SELECT index_name, table_name, column_name, database_name, metric, dim, status, created_at
-             FROM __marmot_vector_indexes WHERE status = 'ready'`)
+             FROM __marmot_vector_indexes WHERE status IN ('ready', 'building')`)
 		if err != nil {
 			// Table does not exist yet; skip silently.
 			continue
 		}
 
+		var metas []VectorIndexMeta
 		for rows.Next() {
 			var meta VectorIndexMeta
 			if err := rows.Scan(
@@ -288,10 +320,35 @@ func (m *VectorIndexManager) loadExistingIndexes(ctx context.Context) error {
 				log.Error().Err(err).Str("database", dbName).Msg("VectorIndexManager: failed to scan index metadata")
 				continue
 			}
+			metas = append(metas, meta)
+		}
+		rows.Close()
+
+		// Process after cursor is closed so writes don't contend with the open read.
+		var toRebuild []VectorIndexMeta
+		for _, meta := range metas {
+			// Crash recovery: index was mid-build when the process died.
+			if meta.Status == "building" {
+				log.Warn().Str("index", meta.IndexName).Msg("VectorIndexManager: found interrupted index build, marking as error")
+				if _, uerr := conn.ExecContext(ctx,
+					"UPDATE __marmot_vector_indexes SET status = 'error' WHERE index_name = ?",
+					meta.IndexName,
+				); uerr != nil {
+					log.Error().Err(uerr).Str("index", meta.IndexName).Msg("VectorIndexManager: failed to update interrupted index to error")
+				}
+				continue
+			}
 
 			idx, err := m.engine.OpenIndex(ctx, meta.IndexName)
 			if err != nil {
-				log.Error().Err(err).Str("index", meta.IndexName).Msg("VectorIndexManager: failed to open index")
+				log.Warn().Err(err).Str("index", meta.IndexName).Msg("VectorIndexManager: index missing or corrupt, scheduling rebuild")
+				if _, uerr := conn.ExecContext(ctx,
+					"UPDATE __marmot_vector_indexes SET status = 'error' WHERE index_name = ?",
+					meta.IndexName,
+				); uerr != nil {
+					log.Error().Err(uerr).Str("index", meta.IndexName).Msg("VectorIndexManager: failed to update missing index to error")
+				}
+				toRebuild = append(toRebuild, meta)
 				continue
 			}
 
@@ -303,9 +360,122 @@ func (m *VectorIndexManager) loadExistingIndexes(ctx context.Context) error {
 
 			log.Info().Str("index", meta.IndexName).Str("database", dbName).Msg("VectorIndexManager: loaded existing index")
 		}
-		rows.Close()
+
+		for _, meta := range toRebuild {
+			go m.rebuildIndex(m.bgCtx, meta)
+		}
 	}
 	return nil
+}
+
+// rebuildIndex drops any stale index data and recreates it by scanning the source table.
+// It updates the metadata row status to 'ready' on success or 'error' on failure.
+func (m *VectorIndexManager) rebuildIndex(ctx context.Context, meta VectorIndexMeta) {
+	log.Info().Str("index", meta.IndexName).Str("database", meta.Database).Msg("VectorIndexManager: rebuilding index from source table")
+
+	conn, err := m.dbMgr.GetDatabaseConnection(meta.Database)
+	if err != nil {
+		log.Error().Err(err).Str("index", meta.IndexName).Msg("VectorIndexManager: rebuild — cannot get database connection")
+		return
+	}
+
+	// Drop stale Pebble data if any (best effort; ignore error).
+	_ = m.engine.DropIndex(ctx, meta.IndexName)
+
+	// Check source table still exists before attempting scan.
+	if !tableExists(ctx, conn, meta.TableName) {
+		log.Warn().Str("index", meta.IndexName).Str("table", meta.TableName).Msg("VectorIndexManager: rebuild skipped — source table no longer exists")
+		if _, uerr := conn.ExecContext(ctx,
+			"UPDATE __marmot_vector_indexes SET status = 'error' WHERE index_name = ?",
+			meta.IndexName,
+		); uerr != nil {
+			log.Error().Err(uerr).Str("index", meta.IndexName).Msg("VectorIndexManager: failed to mark missing-table index as error")
+		}
+		return
+	}
+
+	// #nosec G202 -- tableName and columnName originate from DDL, not user input
+	rows, err := conn.QueryContext(ctx, fmt.Sprintf("SELECT rowid, %s FROM %s", meta.ColumnName, meta.TableName))
+	if err != nil {
+		log.Error().Err(err).Str("index", meta.IndexName).Msg("VectorIndexManager: rebuild — failed to scan source table")
+		return
+	}
+
+	var bulk []VectorBulkEntry
+	for rows.Next() {
+		var rowID int64
+		var rawBlob []byte
+		if err := rows.Scan(&rowID, &rawBlob); err != nil {
+			rows.Close()
+			log.Error().Err(err).Str("index", meta.IndexName).Msg("VectorIndexManager: rebuild — failed to scan row")
+			return
+		}
+		if len(rawBlob)%4 != 0 {
+			log.Warn().Int64("rowid", rowID).Str("index", meta.IndexName).Msg("VectorIndexManager: rebuild — skipping row with invalid vector blob length")
+			continue
+		}
+		bulk = append(bulk, VectorBulkEntry{
+			ExternalID: rowidToBytes(rowID),
+			Vector:     encoding.DecodeFloat32Slice(rawBlob),
+		})
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		log.Error().Err(err).Str("index", meta.IndexName).Msg("VectorIndexManager: rebuild — source table iteration failed")
+		return
+	}
+
+	// Mark as building before creating index so crashes are detectable.
+	if _, err := conn.ExecContext(ctx,
+		"UPDATE __marmot_vector_indexes SET status = 'building' WHERE index_name = ?",
+		meta.IndexName,
+	); err != nil {
+		log.Error().Err(err).Str("index", meta.IndexName).Msg("VectorIndexManager: rebuild — failed to set building status")
+		return
+	}
+
+	idx, err := m.engine.CreateIndex(ctx, meta.IndexName, meta.Dim, meta.Metric, bulk)
+	if err != nil {
+		log.Error().Err(err).Str("index", meta.IndexName).Msg("VectorIndexManager: rebuild — engine CreateIndex failed")
+		_, _ = conn.ExecContext(ctx,
+			"UPDATE __marmot_vector_indexes SET status = 'error' WHERE index_name = ?",
+			meta.IndexName,
+		)
+		return
+	}
+
+	if _, err := conn.ExecContext(ctx,
+		"UPDATE __marmot_vector_indexes SET status = 'ready' WHERE index_name = ?",
+		meta.IndexName,
+	); err != nil {
+		_ = idx.Close()
+		log.Error().Err(err).Str("index", meta.IndexName).Msg("VectorIndexManager: rebuild — failed to set ready status")
+		return
+	}
+
+	meta.Status = "ready"
+	tableKey := tableMetaKey(meta.Database, meta.TableName)
+
+	m.mu.Lock()
+	m.indexes[meta.IndexName] = idx
+	m.tableMeta[tableKey] = &meta
+	m.mu.Unlock()
+
+	log.Info().
+		Str("index", meta.IndexName).
+		Str("database", meta.Database).
+		Int("vectors", len(bulk)).
+		Msg("VectorIndexManager: index rebuilt successfully")
+}
+
+// tableExists reports whether the named table is present in the SQLite database.
+func tableExists(ctx context.Context, conn *sql.DB, tableName string) bool {
+	var count int
+	err := conn.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?",
+		tableName,
+	).Scan(&count)
+	return err == nil && count > 0
 }
 
 // runReconcileLoop periodically checks each vector index watermark against the
@@ -419,6 +589,7 @@ func (m *VectorIndexManager) handleCDCSignal(signal CDCSignal) {
 
 	mdb, err := m.dbMgr.GetDatabase(signal.Database)
 	if err != nil {
+		log.Warn().Err(err).Str("database", signal.Database).Msg("VectorIndexManager: CDC signal for dropped database, skipping")
 		return
 	}
 

@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"encoding/binary"
+	"fmt"
 	"math"
 	"testing"
 
@@ -55,13 +56,17 @@ func (m *mockVectorIndex) Stats() VectorIndexStats { return m.stats }
 func (m *mockVectorIndex) Close() error            { m.closed = true; return nil }
 
 type mockVectorEngine struct {
-	indexes map[string]*mockVectorIndex
-	created []string
-	dropped []string
+	indexes    map[string]*mockVectorIndex
+	created    []string
+	dropped    []string
+	openErrors map[string]error // optional per-index error returned by OpenIndex
 }
 
 func newMockEngine() *mockVectorEngine {
-	return &mockVectorEngine{indexes: make(map[string]*mockVectorIndex)}
+	return &mockVectorEngine{
+		indexes:    make(map[string]*mockVectorIndex),
+		openErrors: make(map[string]error),
+	}
 }
 
 func (e *mockVectorEngine) CreateIndex(_ context.Context, id string, _ int, _ string, _ []VectorBulkEntry) (VectorIndex, error) {
@@ -72,6 +77,9 @@ func (e *mockVectorEngine) CreateIndex(_ context.Context, id string, _ int, _ st
 }
 
 func (e *mockVectorEngine) OpenIndex(_ context.Context, id string) (VectorIndex, error) {
+	if err, hasErr := e.openErrors[id]; hasErr {
+		return nil, err
+	}
 	idx, ok := e.indexes[id]
 	if !ok {
 		idx = &mockVectorIndex{}
@@ -98,10 +106,14 @@ func setupTestVIM(t *testing.T) (*VectorIndexManager, *DatabaseManager, *mockVec
 	clock := hlc.NewClock(1)
 	dm, err := NewDatabaseManager(tmpDir, 1, clock)
 	require.NoError(t, err)
-	t.Cleanup(func() { dm.Close() })
 
 	eng := newMockEngine()
 	vim := NewVectorIndexManager(eng, dm, 0)
+	// Stop VIM before closing DM so background goroutines are cancelled first.
+	t.Cleanup(func() {
+		_ = vim.Stop()
+		dm.Close()
+	})
 	return vim, dm, eng
 }
 
@@ -411,4 +423,126 @@ func TestVectorIndexManager_ReconcileDetectsGap(t *testing.T) {
 	maxTxnID, err := ms.GetMaxCommittedTxnID()
 	require.NoError(t, err)
 	assert.Equal(t, uint64(42), maxTxnID)
+}
+
+// TestVectorIndexManager_CrashRecovery_BuildingStatus verifies that an index
+// stuck in 'building' at startup is marked 'error' and not loaded.
+func TestVectorIndexManager_CrashRecovery_BuildingStatus(t *testing.T) {
+	t.Parallel()
+	vim, dm, _ := setupTestVIM(t)
+	ctx := context.Background()
+
+	conn, err := dm.GetDatabaseConnection(DefaultDatabaseName)
+	require.NoError(t, err)
+
+	// Ensure the metadata table exists.
+	_, err = conn.ExecContext(ctx, vectorIndexMetaTable)
+	require.NoError(t, err)
+
+	// Insert a row simulating a crash mid-build.
+	_, err = conn.ExecContext(ctx,
+		`INSERT INTO __marmot_vector_indexes
+         (index_name, table_name, column_name, database_name, metric, dim, status, created_at)
+         VALUES ('crashed_idx', 'some_vecs', 'embedding', ?, 'cosine', 3, 'building', 1)`,
+		DefaultDatabaseName,
+	)
+	require.NoError(t, err)
+
+	// loadExistingIndexes should handle crash recovery.
+	require.NoError(t, vim.loadExistingIndexes(ctx))
+
+	// Index must NOT be registered in memory.
+	vim.mu.RLock()
+	_, loaded := vim.indexes["crashed_idx"]
+	vim.mu.RUnlock()
+	assert.False(t, loaded, "crashed index must not be loaded into memory")
+
+	// Status must be updated to 'error'.
+	var status string
+	err = conn.QueryRowContext(ctx,
+		"SELECT status FROM __marmot_vector_indexes WHERE index_name = 'crashed_idx'",
+	).Scan(&status)
+	require.NoError(t, err)
+	assert.Equal(t, "error", status)
+}
+
+// TestVectorIndexManager_CrashRecovery_MissingDirectory verifies that a 'ready'
+// index whose backing store cannot be opened is marked 'error' and a rebuild is
+// scheduled rather than crashing startup.
+func TestVectorIndexManager_CrashRecovery_MissingDirectory(t *testing.T) {
+	t.Parallel()
+	vim, dm, eng := setupTestVIM(t)
+	ctx := context.Background()
+
+	conn, err := dm.GetDatabaseConnection(DefaultDatabaseName)
+	require.NoError(t, err)
+
+	// Ensure the metadata table exists.
+	_, err = conn.ExecContext(ctx, vectorIndexMetaTable)
+	require.NoError(t, err)
+
+	// Create the source table so the rebuild can succeed.
+	_, err = conn.ExecContext(ctx, "CREATE TABLE missing_vecs (id INTEGER PRIMARY KEY, embedding BLOB)")
+	require.NoError(t, err)
+
+	// Insert metadata as if index was previously ready.
+	_, err = conn.ExecContext(ctx,
+		`INSERT INTO __marmot_vector_indexes
+         (index_name, table_name, column_name, database_name, metric, dim, status, created_at)
+         VALUES ('missing_idx', 'missing_vecs', 'embedding', ?, 'cosine', 3, 'ready', 1)`,
+		DefaultDatabaseName,
+	)
+	require.NoError(t, err)
+
+	// Make OpenIndex fail to simulate a missing Pebble directory.
+	eng.openErrors["missing_idx"] = fmt.Errorf("pebble: no such directory")
+
+	// loadExistingIndexes must not return an error.
+	require.NoError(t, vim.loadExistingIndexes(ctx))
+
+	// Index must NOT be loaded into memory immediately.
+	vim.mu.RLock()
+	_, loaded := vim.indexes["missing_idx"]
+	vim.mu.RUnlock()
+	assert.False(t, loaded, "index with missing directory must not be loaded immediately")
+
+	// Status must be updated to 'error'.
+	var status string
+	err = conn.QueryRowContext(ctx,
+		"SELECT status FROM __marmot_vector_indexes WHERE index_name = 'missing_idx'",
+	).Scan(&status)
+	require.NoError(t, err)
+	assert.Equal(t, "error", status)
+}
+
+// TestVectorIndexManager_Search_SourceTableDropped verifies that Search returns
+// a clear error when the source table no longer exists.
+func TestVectorIndexManager_Search_SourceTableDropped(t *testing.T) {
+	t.Parallel()
+	vim, dm, _ := setupTestVIM(t)
+	ctx := context.Background()
+
+	conn, err := dm.GetDatabaseConnection(DefaultDatabaseName)
+	require.NoError(t, err)
+
+	_, err = conn.ExecContext(ctx, "CREATE TABLE droppable_vecs (id INTEGER PRIMARY KEY, embedding BLOB)")
+	require.NoError(t, err)
+
+	meta := VectorIndexMeta{
+		IndexName:  "droppable_idx",
+		TableName:  "droppable_vecs",
+		ColumnName: "embedding",
+		Database:   DefaultDatabaseName,
+		Metric:     "cosine",
+		Dim:        3,
+	}
+	require.NoError(t, vim.CreateIndex(ctx, meta))
+
+	// Drop the source table (simulating schema change after index was built).
+	_, err = conn.ExecContext(ctx, "DROP TABLE droppable_vecs")
+	require.NoError(t, err)
+
+	_, err = vim.Search(ctx, "droppable_idx", []float32{1.0, 0.0, 0.0}, 5)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "source table")
 }
