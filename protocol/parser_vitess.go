@@ -339,6 +339,30 @@ func ParseStatementVitess(sql string) Statement {
 		return stmt
 	}
 
+	// Vector Index DDL (sqlite-vec extension syntax not parsed by Vitess)
+	if createVectorIndexPattern.MatchString(sql) {
+		stmt.Type = StatementCreateVectorIndex
+		vecIdxPattern := regexp.MustCompile(`(?i)CREATE\s+VECTOR\s+INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)\s+ON\s+(\w+)\s*\(`)
+		if m := vecIdxPattern.FindStringSubmatch(sql); len(m) > 2 {
+			stmt.VectorIndexName = m[1]
+			stmt.TableName = m[2]
+		}
+		withPattern := regexp.MustCompile(`(?i)WITH\s*\(([^)]+)\)`)
+		if wm := withPattern.FindStringSubmatch(sql); len(wm) > 1 {
+			parseVectorWithClause(&stmt, wm[1])
+		}
+		return stmt
+	}
+	if dropVectorIndexPattern.MatchString(sql) {
+		stmt.Type = StatementDropVectorIndex
+		vecDropPattern := regexp.MustCompile(`(?i)DROP\s+VECTOR\s+INDEX\s+(?:IF\s+EXISTS\s+)?(\w+)\s+ON\s+(\w+)`)
+		if m := vecDropPattern.FindStringSubmatch(sql); len(m) > 2 {
+			stmt.VectorIndexName = m[1]
+			stmt.TableName = m[2]
+		}
+		return stmt
+	}
+
 	// Check for DCL statements (Vitess doesn't parse these)
 	if createUserPattern.MatchString(sql) || dropUserPattern.MatchString(sql) ||
 		alterUserPattern.MatchString(sql) || renameUserPattern.MatchString(sql) ||
@@ -623,6 +647,33 @@ func ParseStatementVitess(sql string) Statement {
 	stmt.SQL = transpileMySQLToSQLite(stmt.SQL)
 
 	return stmt
+}
+
+// parseVectorWithClause parses key=value pairs from a WITH(...) clause into Statement vector fields.
+// Recognized keys: metric, dim, col (column name).
+func parseVectorWithClause(stmt *Statement, clause string) {
+	kvPattern := regexp.MustCompile(`(?i)(\w+)\s*=\s*'?([^',)]+)'?`)
+	for _, m := range kvPattern.FindAllStringSubmatch(clause, -1) {
+		if len(m) < 3 {
+			continue
+		}
+		key := strings.ToLower(strings.TrimSpace(m[1]))
+		val := strings.TrimSpace(m[2])
+		switch key {
+		case "metric":
+			stmt.VectorMetric = strings.ToLower(val)
+		case "dim":
+			n := 0
+			for _, ch := range val {
+				if ch >= '0' && ch <= '9' {
+					n = n*10 + int(ch-'0')
+				}
+			}
+			stmt.VectorDim = n
+		case "col", "column":
+			stmt.VectorColumnName = val
+		}
+	}
 }
 
 // isInformationSchemaQuery checks if a SELECT statement queries INFORMATION_SCHEMA

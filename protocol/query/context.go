@@ -62,6 +62,8 @@ const (
 	StatementUnsupported       = common.StatementUnsupported
 	StatementSystemVariable    = common.StatementSystemVariable
 	StatementVirtualTable      = common.StatementVirtualTable
+	StatementCreateVectorIndex = common.StatementCreateVectorIndex
+	StatementDropVectorIndex   = common.StatementDropVectorIndex
 )
 
 // InformationSchemaTableType identifies which INFORMATION_SCHEMA table is being queried.
@@ -130,6 +132,9 @@ type MySQLParseState struct {
 	// ConflictColumns holds columns for ON CONFLICT clause.
 	// Set by InsertOnDuplicateKeyRule during transpilation.
 	ConflictColumns []string
+	// SkipVitess signals that the statement was fully classified by pattern
+	// and must not be passed to Vitess (e.g. vector index DDL, DROP INDEX).
+	SkipVitess bool
 }
 
 // QueryContext holds all state for processing a single query through the pipeline.

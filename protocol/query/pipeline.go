@@ -67,6 +67,14 @@ func (p *Pipeline) Process(ctx *QueryContext) error {
 		return err
 	}
 
+	// If the parser short-circuited (no AST produced), pass SQL through unchanged.
+	// This happens for statements like CREATE/DROP VECTOR INDEX that are classified
+	// by pattern but not understood by Vitess.
+	if ctx.MySQLState != nil && ctx.MySQLState.AST == nil {
+		ctx.Output.Statements = []TranspiledStatement{{SQL: ctx.Input.SQL, Params: ctx.Input.Parameters}}
+		return nil
+	}
+
 	// Transpile (handles database qualifier stripping and literal extraction)
 	if err := p.transpiler.Transpile(ctx); err != nil {
 		log.Debug().Err(err).Str("sql", ctx.Input.SQL).Msg("Transpile failed")
@@ -95,7 +103,7 @@ func (p *Pipeline) Process(ctx *QueryContext) error {
 //
 // The function uses a state machine to properly track:
 //   - Single-quoted strings (preserves content unchanged)
-//   - SQL escaped quotes ('') and MySQL backslash escapes (\')
+//   - SQL escaped quotes (”) and MySQL backslash escapes (\')
 //   - Double-quoted identifiers (converts to backticks)
 //   - Value contexts after = or DEFAULT (converts to single quotes)
 func convertANSIQuotesToBackticks(sql string) string {

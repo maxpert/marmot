@@ -85,6 +85,10 @@ var (
 	dropIndexPattern           = regexp.MustCompile(`(?i)^\s*DROP\s+INDEX\s+`)
 	renameTablePattern         = regexp.MustCompile(`(?i)^\s*RENAME\s+TABLE\s+`)
 
+	// Vector index DDL patterns
+	createVectorIndexPattern = regexp.MustCompile(`(?i)^\s*CREATE\s+VECTOR\s+INDEX\s+`)
+	dropVectorIndexPattern   = regexp.MustCompile(`(?i)^\s*DROP\s+VECTOR\s+INDEX\s+`)
+
 	// DCL patterns
 	createUserPattern     = regexp.MustCompile(`(?i)^\s*CREATE\s+USER\s+`)
 	dropUserPattern       = regexp.MustCompile(`(?i)^\s*DROP\s+USER\s+`)

@@ -86,6 +86,8 @@ const (
 	StatementUnsupported       = common.StatementUnsupported
 	StatementSystemVariable    = common.StatementSystemVariable
 	StatementVirtualTable      = common.StatementVirtualTable
+	StatementCreateVectorIndex = common.StatementCreateVectorIndex
+	StatementDropVectorIndex   = common.StatementDropVectorIndex
 )
 
 // InformationSchemaTableType identifies which INFORMATION_SCHEMA table is being queried
@@ -142,6 +144,12 @@ type Statement struct {
 
 	// ShowFilter holds the LIKE pattern for SHOW TABLES LIKE queries
 	ShowFilter string
+
+	// Vector index metadata (populated for CREATE/DROP VECTOR INDEX)
+	VectorIndexName  string `msgpack:"-"` // Index name
+	VectorColumnName string `msgpack:"-"` // Column being indexed
+	VectorMetric     string `msgpack:"-"` // cosine, euclidean, dot
+	VectorDim        int    `msgpack:"-"` // Vector dimensionality
 
 	// ExtractedParams holds literal values extracted during transpilation.
 	// Used for local execution only - not serialized for CDC replication.

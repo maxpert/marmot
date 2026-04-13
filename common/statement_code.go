@@ -37,8 +37,10 @@ const (
 	StatementShowEngines
 	StatementInformationSchema
 	StatementUnsupported
-	StatementSystemVariable // SELECT @@version, SELECT DATABASE(), etc.
-	StatementVirtualTable   // SELECT * FROM MARMOT_CLUSTER_NODES, etc.
+	StatementSystemVariable    // SELECT @@version, SELECT DATABASE(), etc.
+	StatementVirtualTable      // SELECT * FROM MARMOT_CLUSTER_NODES, etc.
+	StatementCreateVectorIndex // CREATE VECTOR INDEX
+	StatementDropVectorIndex   // DROP VECTOR INDEX
 )
 
 // IsMutation returns true if the statement type is a mutation operation.
@@ -46,7 +48,8 @@ func (t StatementCode) IsMutation() bool {
 	switch t {
 	case StatementInsert, StatementReplace, StatementUpdate, StatementDelete,
 		StatementLoadData, StatementDDL, StatementDCL, StatementAdmin,
-		StatementCreateDatabase, StatementDropDatabase:
+		StatementCreateDatabase, StatementDropDatabase,
+		StatementCreateVectorIndex, StatementDropVectorIndex:
 		return true
 	}
 	return false

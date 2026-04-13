@@ -32,6 +32,17 @@ var (
 
 	insertDelayedPattern = regexp.MustCompile(`(?i)^\s*INSERT\s+(DELAYED|LOW_PRIORITY|HIGH_PRIORITY)\s+`)
 	insertOrPattern      = regexp.MustCompile(`(?i)^\s*INSERT\s+OR\s+(IGNORE|REPLACE)\s+INTO\s+`)
+
+	// DDL patterns Vitess cannot parse
+	dropIndexPattern = regexp.MustCompile(`(?i)^\s*DROP\s+INDEX\s+`)
+
+	// Vector index DDL patterns (sqlite-vec extension, not parsed by Vitess)
+	createVectorIndexPattern = regexp.MustCompile(`(?i)^\s*CREATE\s+VECTOR\s+INDEX\s+`)
+	dropVectorIndexPattern   = regexp.MustCompile(`(?i)^\s*DROP\s+VECTOR\s+INDEX\s+`)
+
+	// Extraction patterns for vector index metadata
+	vecCreateExtractPattern = regexp.MustCompile(`(?i)CREATE\s+VECTOR\s+INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)\s+ON\s+(\w+)\s*\(`)
+	vecDropExtractPattern   = regexp.MustCompile(`(?i)DROP\s+VECTOR\s+INDEX\s+(?:IF\s+EXISTS\s+)?(\w+)\s+ON\s+(\w+)`)
 )
 
 type VitessParser struct {
@@ -52,6 +63,11 @@ func (p *VitessParser) Parse(ctx *QueryContext) error {
 	}
 
 	classifyByPattern(ctx)
+
+	// If the pattern classifier marked this statement as Vitess-incompatible, skip Vitess.
+	if ctx.MySQLState.SkipVitess {
+		return nil
+	}
 
 	stmt, err := p.parser.Parse(ctx.Input.SQL)
 	if err != nil {
@@ -112,6 +128,32 @@ func classifyByPattern(ctx *QueryContext) {
 		} else {
 			ctx.Output.StatementType = StatementInsert
 		}
+		return
+	}
+
+	// Vector index must be checked before plain DROP INDEX (more specific prefix wins).
+	// These statements are not understood by Vitess — set SkipVitess to bypass it.
+	if createVectorIndexPattern.MatchString(sql) {
+		ctx.Output.StatementType = StatementCreateVectorIndex
+		ctx.MySQLState.SkipVitess = true
+		if m := vecCreateExtractPattern.FindStringSubmatch(sql); len(m) > 2 {
+			ctx.MySQLState.TableName = m[2]
+		}
+		return
+	}
+
+	if dropVectorIndexPattern.MatchString(sql) {
+		ctx.Output.StatementType = StatementDropVectorIndex
+		ctx.MySQLState.SkipVitess = true
+		if m := vecDropExtractPattern.FindStringSubmatch(sql); len(m) > 2 {
+			ctx.MySQLState.TableName = m[2]
+		}
+		return
+	}
+
+	if dropIndexPattern.MatchString(sql) {
+		ctx.Output.StatementType = StatementDDL
+		ctx.MySQLState.SkipVitess = true
 		return
 	}
 }
