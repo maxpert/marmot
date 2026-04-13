@@ -14,8 +14,8 @@ type hdindexAdapter struct {
 	engine *hdindex.Engine
 }
 
-func newHDIndexAdapter(rootDir string) (*hdindexAdapter, error) {
-	engine, err := hdindex.NewEngine(rootDir)
+func newHDIndexAdapter(rootDir string, cacheMB int) (*hdindexAdapter, error) {
+	engine, err := hdindex.NewEngine(rootDir, hdindex.EngineConfig{PebbleCacheMB: cacheMB})
 	if err != nil {
 		return nil, err
 	}

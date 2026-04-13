@@ -139,3 +139,8 @@ type ApplyToken struct {
 	TxnID uint64
 	SeqID uint64
 }
+
+// EngineConfig holds options for creating an HD-Index engine.
+type EngineConfig struct {
+	PebbleCacheMB int // Block cache size in MB (0 = Pebble default)
+}

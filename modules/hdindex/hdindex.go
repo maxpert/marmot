@@ -36,17 +36,19 @@ type VectorEntry struct {
 // Engine manages HD-Index lifecycle (create, open, drop, list, close).
 type Engine struct {
 	rootDir string
+	config  EngineConfig
 	mu      sync.RWMutex
 	indexes map[string]*Index
 }
 
 // NewEngine creates an engine that stores indexes under rootDir.
-func NewEngine(rootDir string) (*Engine, error) {
+func NewEngine(rootDir string, config EngineConfig) (*Engine, error) {
 	if err := os.MkdirAll(rootDir, 0o755); err != nil {
 		return nil, fmt.Errorf("hdindex: create root dir: %w", err)
 	}
 	return &Engine{
 		rootDir: rootDir,
+		config:  config,
 		indexes: make(map[string]*Index),
 	}, nil
 }
@@ -81,7 +83,7 @@ func (e *Engine) CreateIndex(ctx context.Context, spec HDIndexSpec, vectors []Ve
 		return nil, fmt.Errorf("hdindex: index directory %q already exists", idxDir)
 	}
 
-	db, err := openPebble(idxDir)
+	db, err := openPebble(idxDir, e.config.PebbleCacheMB)
 	if err != nil {
 		return nil, fmt.Errorf("hdindex: open pebble: %w", err)
 	}
@@ -111,7 +113,7 @@ func (e *Engine) OpenIndex(ctx context.Context, id string) (*Index, error) {
 		return nil, fmt.Errorf("hdindex: index %q not found", id)
 	}
 
-	db, err := openPebble(idxDir)
+	db, err := openPebble(idxDir, e.config.PebbleCacheMB)
 	if err != nil {
 		return nil, fmt.Errorf("hdindex: open pebble: %w", err)
 	}
@@ -413,9 +415,14 @@ func loadRefs(db *pebble.DB, m int) (*refobj.ReferenceSet, error) {
 }
 
 // openPebble opens a Pebble DB at the given path with sensible options.
-func openPebble(dir string) (*pebble.DB, error) {
+func openPebble(dir string, cacheMB int) (*pebble.DB, error) {
 	opts := &pebble.Options{
 		MaxOpenFiles: 256,
+	}
+	if cacheMB > 0 {
+		cache := pebble.NewCache(int64(cacheMB) << 20)
+		defer cache.Unref()
+		opts.Cache = cache
 	}
 	return pebble.Open(dir, opts)
 }

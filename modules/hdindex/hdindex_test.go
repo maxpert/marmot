@@ -1,6 +1,7 @@
 package hdindex
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"math"
@@ -40,7 +41,7 @@ func makeVectorEntries(vecs [][]float32) []VectorEntry {
 
 func TestCreateAndSearch(t *testing.T) {
 	ctx := context.Background()
-	eng, err := NewEngine(t.TempDir())
+	eng, err := NewEngine(t.TempDir(), EngineConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +84,7 @@ func TestCreateAndSearch(t *testing.T) {
 
 func TestCreateAndSearch_Cosine(t *testing.T) {
 	ctx := context.Background()
-	eng, err := NewEngine(t.TempDir())
+	eng, err := NewEngine(t.TempDir(), EngineConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -123,7 +124,7 @@ func TestCreateAndSearch_Cosine(t *testing.T) {
 
 func TestCreateAndSearch_Dot(t *testing.T) {
 	ctx := context.Background()
-	eng, err := NewEngine(t.TempDir())
+	eng, err := NewEngine(t.TempDir(), EngineConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -157,7 +158,7 @@ func TestCreateAndSearch_Dot(t *testing.T) {
 
 func TestUpsert_Insert(t *testing.T) {
 	ctx := context.Background()
-	eng, err := NewEngine(t.TempDir())
+	eng, err := NewEngine(t.TempDir(), EngineConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -212,7 +213,7 @@ func TestUpsert_Insert(t *testing.T) {
 
 func TestUpsert_Update(t *testing.T) {
 	ctx := context.Background()
-	eng, err := NewEngine(t.TempDir())
+	eng, err := NewEngine(t.TempDir(), EngineConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -268,7 +269,7 @@ func TestUpsert_Update(t *testing.T) {
 
 func TestDelete(t *testing.T) {
 	ctx := context.Background()
-	eng, err := NewEngine(t.TempDir())
+	eng, err := NewEngine(t.TempDir(), EngineConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -314,7 +315,7 @@ func TestOpenIndex(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 
-	eng, err := NewEngine(dir)
+	eng, err := NewEngine(dir, EngineConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -337,7 +338,7 @@ func TestOpenIndex(t *testing.T) {
 	}
 
 	// Reopen via new engine.
-	eng2, err := NewEngine(dir)
+	eng2, err := NewEngine(dir, EngineConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -367,7 +368,7 @@ func TestDropIndex(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 
-	eng, err := NewEngine(dir)
+	eng, err := NewEngine(dir, EngineConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -396,7 +397,7 @@ func TestDropIndex(t *testing.T) {
 
 func TestSearchRecall(t *testing.T) {
 	ctx := context.Background()
-	eng, err := NewEngine(t.TempDir())
+	eng, err := NewEngine(t.TempDir(), EngineConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -476,7 +477,7 @@ func TestSearchRecall(t *testing.T) {
 func TestUpsert_DimensionMismatch(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	eng, err := NewEngine(t.TempDir())
+	eng, err := NewEngine(t.TempDir(), EngineConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -507,7 +508,7 @@ func TestUpsert_DimensionMismatch(t *testing.T) {
 func TestDotMetric_MIPSOrdering(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	eng, err := NewEngine(t.TempDir())
+	eng, err := NewEngine(t.TempDir(), EngineConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -587,7 +588,7 @@ func TestDotMetric_MIPSOrdering(t *testing.T) {
 
 func TestStats(t *testing.T) {
 	ctx := context.Background()
-	eng, err := NewEngine(t.TempDir())
+	eng, err := NewEngine(t.TempDir(), EngineConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -604,5 +605,68 @@ func TestStats(t *testing.T) {
 	stats := idx.Stats()
 	if stats.VectorCount != n {
 		t.Errorf("expected VectorCount=%d, got %d", n, stats.VectorCount)
+	}
+}
+
+func TestSnapshotAndRestore(t *testing.T) {
+	ctx := context.Background()
+	dir1 := t.TempDir()
+	dir2 := t.TempDir()
+
+	eng1, err := NewEngine(dir1, EngineConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng1.Close()
+
+	vecs := randomVectors(200, 32, 99)
+	spec := DefaultSpec("snap-test", 32, MetricEuclidean)
+	idx1, err := eng1.CreateIndex(ctx, spec, makeVectorEntries(vecs))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	query := vecs[0]
+	resBefore, err := idx1.Search(ctx, SearchRequest{VectorFP32: query, TopK: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	if err := eng1.SnapshotIndex(ctx, "snap-test", &buf); err != nil {
+		t.Fatal(err)
+	}
+	if buf.Len() == 0 {
+		t.Fatal("snapshot should produce data")
+	}
+
+	eng2, err := NewEngine(dir2, EngineConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng2.Close()
+
+	if err := eng2.RestoreIndex(ctx, "snap-test", &buf); err != nil {
+		t.Fatal(err)
+	}
+
+	idx2, err := eng2.OpenIndex(ctx, "snap-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resAfter, err := idx2.Search(ctx, SearchRequest{VectorFP32: query, TopK: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(resBefore.Hits) != len(resAfter.Hits) {
+		t.Fatalf("hit count mismatch: before=%d after=%d", len(resBefore.Hits), len(resAfter.Hits))
+	}
+	for i := range resBefore.Hits {
+		if string(resBefore.Hits[i].ExternalID) != string(resAfter.Hits[i].ExternalID) {
+			t.Errorf("hit[%d] ExternalID mismatch: before=%s after=%s",
+				i, resBefore.Hits[i].ExternalID, resAfter.Hits[i].ExternalID)
+		}
 	}
 }

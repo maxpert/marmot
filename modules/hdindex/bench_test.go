@@ -58,7 +58,7 @@ func computeRecall(approxIDs []string, exactIndices []int, idPrefix string) floa
 func buildTestIndex(t testing.TB, vecs [][]float32, metricType Metric, idSuffix string) (*Engine, *Index) {
 	t.Helper()
 	ctx := context.Background()
-	eng, err := NewEngine(t.TempDir())
+	eng, err := NewEngine(t.TempDir(), EngineConfig{})
 	if err != nil {
 		t.Fatalf("NewEngine: %v", err)
 	}
@@ -172,7 +172,7 @@ func benchmarkBuild(b *testing.B, n, dim int, metricType Metric) {
 	b.ResetTimer()
 	for range b.N {
 		b.StopTimer()
-		eng, err := NewEngine(b.TempDir())
+		eng, err := NewEngine(b.TempDir(), EngineConfig{})
 		if err != nil {
 			b.Fatalf("NewEngine: %v", err)
 		}

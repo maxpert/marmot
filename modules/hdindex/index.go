@@ -330,6 +330,16 @@ func (idx *Index) Spec() HDIndexSpec {
 	return idx.spec
 }
 
+// Checkpoint creates a consistent point-in-time snapshot of the index's Pebble
+// database at destDir. The checkpoint uses hard links when possible, making it
+// very fast. The caller should tar/compress destDir for transport and remove it
+// when done.
+func (idx *Index) Checkpoint(destDir string) error {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	return idx.db.Checkpoint(destDir)
+}
+
 // Close flushes and closes the index.
 func (idx *Index) Close() error {
 	idx.mu.Lock()
