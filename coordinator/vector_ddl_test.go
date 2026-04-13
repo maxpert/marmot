@@ -14,10 +14,12 @@ import (
 
 // stubVectorIndexManager is a test double for VectorIndexManagerProvider.
 type stubVectorIndexManager struct {
-	createErr error
-	dropErr   error
-	created   []common.VectorIndexMeta
-	dropped   []string
+	createErr     error
+	dropErr       error
+	searchErr     error
+	created       []common.VectorIndexMeta
+	dropped       []string
+	searchResults []common.VectorSearchHit
 }
 
 func (s *stubVectorIndexManager) CreateIndex(_ context.Context, meta common.VectorIndexMeta) error {
@@ -34,6 +36,13 @@ func (s *stubVectorIndexManager) DropIndex(_ context.Context, indexName, _ strin
 	}
 	s.dropped = append(s.dropped, indexName)
 	return nil
+}
+
+func (s *stubVectorIndexManager) Search(_ context.Context, _ string, _ []float32, _ int) ([]common.VectorSearchHit, error) {
+	if s.searchErr != nil {
+		return nil, s.searchErr
+	}
+	return s.searchResults, nil
 }
 
 // stubDatabaseManagerWithVec satisfies coordinator.DatabaseManager and exposes a VectorIndexManagerProvider.

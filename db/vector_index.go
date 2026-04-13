@@ -1,6 +1,10 @@
 package db
 
-import "context"
+import (
+	"context"
+
+	"github.com/maxpert/marmot/common"
+)
 
 // VectorIndex represents an open vector index.
 type VectorIndex interface {
@@ -20,11 +24,8 @@ type VectorIndexEngine interface {
 }
 
 // VectorSearchHit is a single search result.
-type VectorSearchHit struct {
-	ExternalID []byte
-	Distance   float32
-	Score      float32
-}
+// Aliased from common to allow coordinator to reference it without an import cycle.
+type VectorSearchHit = common.VectorSearchHit
 
 // VectorIndexStats provides index statistics.
 type VectorIndexStats struct {

@@ -12,3 +12,11 @@ type VectorIndexMeta struct {
 	Status     string // "building", "ready", "error"
 	CreatedAt  int64
 }
+
+// VectorSearchHit is a single result from a kNN vector search.
+// ExternalID is an 8-byte big-endian encoded SQLite rowid.
+type VectorSearchHit struct {
+	ExternalID []byte
+	Distance   float32
+	Score      float32
+}

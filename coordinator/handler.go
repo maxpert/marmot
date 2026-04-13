@@ -3,6 +3,7 @@ package coordinator
 import (
 	"context"
 	"database/sql"
+	"encoding/binary"
 	"fmt"
 	"math"
 	"reflect"
@@ -28,6 +29,7 @@ import (
 type VectorIndexManagerProvider interface {
 	CreateIndex(ctx context.Context, meta common.VectorIndexMeta) error
 	DropIndex(ctx context.Context, indexName, database string) error
+	Search(ctx context.Context, indexName string, vector []float32, topK int) ([]common.VectorSearchHit, error)
 }
 
 // DatabaseManager interface to avoid import cycles
@@ -235,6 +237,12 @@ func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, sq
 	// These are handled before parsing since they control parsing behavior
 	if protocol.IsMarmotSessionCommand(sql) {
 		return h.handleMarmotCommand(session, sql)
+	}
+
+	// Handle vec_knn() vector search queries before the Vitess parser sees them.
+	// The Vitess parser does not understand this custom function syntax.
+	if protocol.ContainsVecKnn(sql) {
+		return h.handleVecKnn(session, sql, params)
 	}
 
 	// Build schema lookup function for auto-increment ID injection.
@@ -1296,4 +1304,66 @@ func (h *CoordinatorHandler) handleMarmotCommand(session *protocol.ConnectionSes
 	}
 
 	return nil, fmt.Errorf("unrecognized marmot command: %s", sql)
+}
+
+// handleVecKnn executes a vec_knn() vector search and returns a result set with
+// columns (rowid BIGINT, distance FLOAT, score FLOAT).
+func (h *CoordinatorHandler) handleVecKnn(_ *protocol.ConnectionSession, sql string, params []interface{}) (*protocol.ResultSet, error) {
+	call, err := protocol.ParseVecKnnCall(sql)
+	if err != nil {
+		return nil, err
+	}
+
+	if h.dbManager == nil {
+		return nil, fmt.Errorf("vector index: database manager not available")
+	}
+
+	vecMgr := h.dbManager.GetVectorIndexManager()
+	if vecMgr == nil {
+		return nil, fmt.Errorf("vector index support not enabled")
+	}
+
+	if len(params) == 0 {
+		return nil, fmt.Errorf("vec_knn requires a query vector parameter")
+	}
+	vectorBytes, ok := params[0].([]byte)
+	if !ok {
+		return nil, fmt.Errorf("vec_knn query vector must be a BLOB parameter")
+	}
+
+	vector := decodeFloat32Vector(vectorBytes)
+
+	ctx := context.Background()
+	hits, err := vecMgr.Search(ctx, call.IndexName, vector, call.TopK)
+	if err != nil {
+		return nil, fmt.Errorf("vec_knn search failed: %w", err)
+	}
+
+	rs := &protocol.ResultSet{
+		Columns: []protocol.ColumnDef{
+			{Name: "rowid", Type: 0x08},    // MYSQL_TYPE_LONGLONG
+			{Name: "distance", Type: 0x04}, // MYSQL_TYPE_FLOAT
+			{Name: "score", Type: 0x04},    // MYSQL_TYPE_FLOAT
+		},
+		Rows: make([][]interface{}, len(hits)),
+	}
+	for i, hit := range hits {
+		var rowid int64
+		if len(hit.ExternalID) == 8 {
+			rowid = int64(binary.BigEndian.Uint64(hit.ExternalID))
+		}
+		rs.Rows[i] = []interface{}{rowid, float64(hit.Distance), float64(hit.Score)}
+	}
+	return rs, nil
+}
+
+// decodeFloat32Vector decodes a raw byte slice into a []float32.
+// The bytes must be IEEE-754 little-endian 32-bit floats.
+func decodeFloat32Vector(b []byte) []float32 {
+	n := len(b) / 4
+	v := make([]float32, n)
+	for i := range n {
+		v[i] = math.Float32frombits(binary.LittleEndian.Uint32(b[i*4:]))
+	}
+	return v
 }
