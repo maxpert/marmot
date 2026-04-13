@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/maxpert/marmot/common"
+	"github.com/maxpert/marmot/encoding"
 	"github.com/maxpert/marmot/protocol"
 )
 
@@ -90,13 +91,13 @@ func TestDecodeFloat32Vector(t *testing.T) {
 	binary.LittleEndian.PutUint32(buf[4:], math.Float32bits(2.0))
 	binary.LittleEndian.PutUint32(buf[8:], math.Float32bits(3.0))
 
-	got := decodeFloat32Vector(buf)
+	got := encoding.DecodeFloat32Slice(buf)
 	if len(got) != len(want) {
-		t.Fatalf("decodeFloat32Vector: len = %d, want %d", len(got), len(want))
+		t.Fatalf("DecodeFloat32Slice: len = %d, want %d", len(got), len(want))
 	}
 	for i := range want {
 		if got[i] != want[i] {
-			t.Errorf("decodeFloat32Vector[%d] = %v, want %v", i, got[i], want[i])
+			t.Errorf("DecodeFloat32Slice[%d] = %v, want %v", i, got[i], want[i])
 		}
 	}
 }
@@ -104,7 +105,7 @@ func TestDecodeFloat32Vector(t *testing.T) {
 func TestDecodeFloat32Vector_Empty(t *testing.T) {
 	t.Parallel()
 
-	got := decodeFloat32Vector([]byte{})
+	got := encoding.DecodeFloat32Slice([]byte{})
 	if len(got) != 0 {
 		t.Errorf("expected empty slice, got len=%d", len(got))
 	}

@@ -250,6 +250,28 @@ func main() {
 	grpcServer.SetCDCSubscriber(cdcHub)
 	log.Info().Msg("CDC notification hub initialized")
 
+	// Initialize Vector Index Manager if enabled
+	var vecIndexMgr *db.VectorIndexManager
+	if cfg.Config.VectorIndex.Enabled {
+		vecDataDir := cfg.Config.VectorIndex.DataDir
+		if vecDataDir == "" {
+			vecDataDir = filepath.Join(cfg.Config.DataDir, "vector_indexes")
+		}
+		vecEngine, err := newHDIndexAdapter(vecDataDir)
+		if err != nil {
+			log.Fatal().Err(err).Msg("Failed to initialize vector index engine")
+			return
+		}
+		reconcileInterval := time.Duration(cfg.Config.VectorIndex.ReconcileIntervalSec) * time.Second
+		vecIndexMgr = db.NewVectorIndexManager(vecEngine, dbMgr, reconcileInterval)
+		dbMgr.SetVectorIndexManager(vecIndexMgr)
+		if err := vecIndexMgr.Start(context.Background()); err != nil {
+			log.Fatal().Err(err).Msg("Failed to start vector index manager")
+			return
+		}
+		log.Info().Str("data_dir", vecDataDir).Msg("Vector index manager initialized")
+	}
+
 	// Start metrics collector for telemetry (updates every 10 seconds)
 	metricsCollector := telemetry.NewMetricsCollector(&dbManagerAdapter{dm: dbMgr}, 10*time.Second)
 	metricsCollector.Start()
@@ -536,6 +558,7 @@ func main() {
 		metricsCollector:   metricsCollector,
 		forwardSessMgr:     forwardSessionMgr,
 		coordinatorHandler: handler,
+		vecIndexMgr:        vecIndexMgr,
 		gracePeriod:        cfg.Config.Cluster.GetShutdownGracePeriod(),
 	}
 

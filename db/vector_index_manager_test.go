@@ -101,7 +101,7 @@ func setupTestVIM(t *testing.T) (*VectorIndexManager, *DatabaseManager, *mockVec
 	t.Cleanup(func() { dm.Close() })
 
 	eng := newMockEngine()
-	vim := NewVectorIndexManager(eng, dm)
+	vim := NewVectorIndexManager(eng, dm, 0)
 	return vim, dm, eng
 }
 
@@ -320,9 +320,95 @@ func TestVectorIndexManager_DatabaseManager_Accessors(t *testing.T) {
 	t.Parallel()
 	_, dm, eng := setupTestVIM(t)
 
-	vim := NewVectorIndexManager(eng, dm)
+	vim := NewVectorIndexManager(eng, dm, 0)
 	assert.Nil(t, dm.GetVectorIndexManager())
 
 	dm.SetVectorIndexManager(vim)
 	assert.Equal(t, vim, dm.GetVectorIndexManager())
+}
+
+// TestVectorIndexManager_ReconcileNoGap verifies that reconcileAll runs without
+// error and does not report a gap when the index watermark matches the database.
+func TestVectorIndexManager_ReconcileNoGap(t *testing.T) {
+	t.Parallel()
+	vim, dm, eng := setupTestVIM(t)
+
+	ctx := context.Background()
+
+	conn, err := dm.GetDatabaseConnection(DefaultDatabaseName)
+	require.NoError(t, err)
+
+	_, err = conn.ExecContext(ctx, "CREATE TABLE reconcile_vecs (id INTEGER PRIMARY KEY, embedding BLOB)")
+	require.NoError(t, err)
+
+	meta := VectorIndexMeta{
+		IndexName:  "reconcile_idx",
+		TableName:  "reconcile_vecs",
+		ColumnName: "embedding",
+		Database:   DefaultDatabaseName,
+		Metric:     "cosine",
+		Dim:        3,
+	}
+	require.NoError(t, vim.CreateIndex(ctx, meta))
+
+	// Both the index watermark (0) and max committed txnID (0) are zero — no gap.
+	// reconcileAll must complete without error.
+	vim.reconcileAll()
+
+	// Index must still be registered after reconciliation.
+	_, ok := eng.indexes["reconcile_idx"]
+	assert.True(t, ok)
+}
+
+// TestVectorIndexManager_ReconcileDetectsGap verifies that reconcileIndex
+// detects a gap when the database has committed transactions beyond the index
+// watermark.
+func TestVectorIndexManager_ReconcileDetectsGap(t *testing.T) {
+	t.Parallel()
+	vim, dm, eng := setupTestVIM(t)
+
+	ctx := context.Background()
+
+	conn, err := dm.GetDatabaseConnection(DefaultDatabaseName)
+	require.NoError(t, err)
+
+	_, err = conn.ExecContext(ctx, "CREATE TABLE gap_vecs (id INTEGER PRIMARY KEY, embedding BLOB)")
+	require.NoError(t, err)
+
+	meta := VectorIndexMeta{
+		IndexName:  "gap_idx",
+		TableName:  "gap_vecs",
+		ColumnName: "embedding",
+		Database:   DefaultDatabaseName,
+		Metric:     "cosine",
+		Dim:        3,
+	}
+	require.NoError(t, vim.CreateIndex(ctx, meta))
+
+	// Advance the metastore's max committed txnID past the index watermark (0)
+	// by recording a committed transaction directly.
+	rdb, err := dm.GetDatabase(DefaultDatabaseName)
+	require.NoError(t, err)
+	ms := rdb.GetMetaStore()
+	require.NotNil(t, ms)
+
+	require.NoError(t, ms.StoreReplayedTransaction(42, 1, hlc.Timestamp{WallTime: 1}, DefaultDatabaseName, 0))
+
+	// Gap should now be detected: index watermark=0, db max txnID=42.
+	// reconcileIndex must return nil (gap is logged, not an error).
+	vim.mu.RLock()
+	gapMeta := vim.tableMeta[tableMetaKey(DefaultDatabaseName, "gap_vecs")]
+	vim.mu.RUnlock()
+	require.NotNil(t, gapMeta)
+
+	err = vim.reconcileIndex(gapMeta)
+	require.NoError(t, err)
+
+	// The mock index watermark is still 0; gap should be detectable.
+	mockIdx := eng.indexes["gap_idx"]
+	assert.Equal(t, uint64(0), mockIdx.Stats().WatermarkTxnID)
+
+	maxTxnID, err := ms.GetMaxCommittedTxnID()
+	require.NoError(t, err)
+	assert.Equal(t, uint64(42), maxTxnID)
 }

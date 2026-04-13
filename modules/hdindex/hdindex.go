@@ -65,6 +65,9 @@ func (e *Engine) CreateIndex(ctx context.Context, spec HDIndexSpec, vectors []Ve
 	if spec.RefCount > len(vectors) {
 		return nil, fmt.Errorf("hdindex: RefCount %d > number of vectors %d", spec.RefCount, len(vectors))
 	}
+	if len(vectors) < spec.RefCount*2 {
+		return nil, fmt.Errorf("hdindex: need at least %d vectors (2x RefCount), got %d", spec.RefCount*2, len(vectors))
+	}
 
 	e.mu.Lock()
 	defer e.mu.Unlock()

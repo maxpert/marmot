@@ -4,11 +4,11 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
-	"math"
 	"sync"
 	"time"
 
 	"github.com/maxpert/marmot/common"
+	"github.com/maxpert/marmot/encoding"
 	"github.com/rs/zerolog/log"
 )
 
@@ -30,21 +30,25 @@ type VectorIndexMeta = common.VectorIndexMeta
 
 // VectorIndexManager manages vector index lifecycle and CDC-driven mutations.
 type VectorIndexManager struct {
-	mu        sync.RWMutex
-	engine    VectorIndexEngine
-	indexes   map[string]VectorIndex      // indexName → VectorIndex
-	tableMeta map[string]*VectorIndexMeta // "database.table" → meta (for CDC routing)
-	dbMgr     *DatabaseManager
-	cdcCancel func() // cancel CDC subscription
+	mu                sync.RWMutex
+	engine            VectorIndexEngine
+	indexes           map[string]VectorIndex      // indexName → VectorIndex
+	tableMeta         map[string]*VectorIndexMeta // "database.table" → meta (for CDC routing)
+	dbMgr             *DatabaseManager
+	cdcCancel         func() // cancel CDC subscription
+	reconcileInterval time.Duration
 }
 
 // NewVectorIndexManager creates a new VectorIndexManager.
-func NewVectorIndexManager(engine VectorIndexEngine, dbMgr *DatabaseManager) *VectorIndexManager {
+// reconcileInterval controls how often the manager scans for CDC signal gaps.
+// Pass 0 to disable periodic reconciliation.
+func NewVectorIndexManager(engine VectorIndexEngine, dbMgr *DatabaseManager, reconcileInterval time.Duration) *VectorIndexManager {
 	return &VectorIndexManager{
-		engine:    engine,
-		indexes:   make(map[string]VectorIndex),
-		tableMeta: make(map[string]*VectorIndexMeta),
-		dbMgr:     dbMgr,
+		engine:            engine,
+		indexes:           make(map[string]VectorIndex),
+		tableMeta:         make(map[string]*VectorIndexMeta),
+		dbMgr:             dbMgr,
+		reconcileInterval: reconcileInterval,
 	}
 }
 
@@ -52,6 +56,10 @@ func NewVectorIndexManager(engine VectorIndexEngine, dbMgr *DatabaseManager) *Ve
 func (m *VectorIndexManager) Start(ctx context.Context) error {
 	if err := m.loadExistingIndexes(ctx); err != nil {
 		return fmt.Errorf("vector index manager: load existing indexes: %w", err)
+	}
+
+	if m.reconcileInterval > 0 {
+		go m.runReconcileLoop(ctx)
 	}
 
 	hub := m.dbMgr.GetCDCHub()
@@ -120,12 +128,11 @@ func (m *VectorIndexManager) CreateIndex(ctx context.Context, meta VectorIndexMe
 			rows.Close()
 			return fmt.Errorf("vector index: scan row: %w", err)
 		}
-		vec, err := decodeFloat32Slice(rawBlob)
-		if err != nil {
-			// Skip rows with unreadable vector data rather than aborting the build.
-			log.Warn().Err(err).Int64("rowid", rowID).Str("table", meta.TableName).Msg("VectorIndexManager: skipping row with invalid vector")
+		if len(rawBlob)%4 != 0 {
+			log.Warn().Int64("rowid", rowID).Str("table", meta.TableName).Msg("VectorIndexManager: skipping row with invalid vector blob length")
 			continue
 		}
+		vec := encoding.DecodeFloat32Slice(rawBlob)
 		bulk = append(bulk, VectorBulkEntry{
 			ExternalID: rowidToBytes(rowID),
 			Vector:     vec,
@@ -301,6 +308,83 @@ func (m *VectorIndexManager) loadExistingIndexes(ctx context.Context) error {
 	return nil
 }
 
+// runReconcileLoop periodically checks each vector index watermark against the
+// latest committed txnID in its source database and logs any gaps detected.
+func (m *VectorIndexManager) runReconcileLoop(ctx context.Context) {
+	ticker := time.NewTicker(m.reconcileInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			m.reconcileAll()
+		}
+	}
+}
+
+// reconcileAll iterates every registered index and checks for watermark gaps.
+func (m *VectorIndexManager) reconcileAll() {
+	m.mu.RLock()
+	metas := make([]*VectorIndexMeta, 0, len(m.tableMeta))
+	for _, meta := range m.tableMeta {
+		metas = append(metas, meta)
+	}
+	m.mu.RUnlock()
+
+	for _, meta := range metas {
+		if err := m.reconcileIndex(meta); err != nil {
+			log.Warn().Err(err).
+				Str("index", meta.IndexName).
+				Str("database", meta.Database).
+				Msg("VectorIndexManager: reconciliation failed")
+		}
+	}
+}
+
+// reconcileIndex compares the index watermark against the max committed txnID
+// for the database and logs a warning when a gap is detected.
+func (m *VectorIndexManager) reconcileIndex(meta *VectorIndexMeta) error {
+	m.mu.RLock()
+	idx, exists := m.indexes[meta.IndexName]
+	m.mu.RUnlock()
+	if !exists {
+		return nil
+	}
+
+	indexWatermark := idx.Stats().WatermarkTxnID
+
+	rdb, err := m.dbMgr.GetDatabase(meta.Database)
+	if err != nil {
+		return fmt.Errorf("get database: %w", err)
+	}
+
+	metaStore := rdb.GetMetaStore()
+	if metaStore == nil {
+		return nil
+	}
+
+	maxTxnID, err := metaStore.GetMaxCommittedTxnID()
+	if err != nil {
+		return fmt.Errorf("get max committed txn id: %w", err)
+	}
+
+	if indexWatermark >= maxTxnID {
+		return nil
+	}
+
+	gap := maxTxnID - indexWatermark
+	log.Warn().
+		Str("index", meta.IndexName).
+		Str("database", meta.Database).
+		Uint64("index_watermark", indexWatermark).
+		Uint64("db_max_txn_id", maxTxnID).
+		Uint64("gap", gap).
+		Msg("VectorIndexManager: watermark gap detected — CDC signals may have been dropped")
+	return nil
+}
+
 // runCDCLoop reads CDC signals and routes changes to vector indexes.
 func (m *VectorIndexManager) runCDCLoop(ctx context.Context, signals <-chan CDCSignal) {
 	for {
@@ -384,14 +468,14 @@ func (m *VectorIndexManager) routeEntry(ctx context.Context, database string, tx
 		if !found {
 			return
 		}
-		vec, err := decodeFloat32Slice(rawVec)
-		if err != nil {
-			log.Warn().Err(err).
+		if len(rawVec)%4 != 0 {
+			log.Warn().
 				Str("table", entry.Table).
 				Str("column", metaCopy.ColumnName).
-				Msg("VectorIndexManager: invalid vector in CDC entry, skipping")
+				Msg("VectorIndexManager: invalid vector blob length in CDC entry, skipping")
 			return
 		}
+		vec := encoding.DecodeFloat32Slice(rawVec)
 		externalID := intentKeyToExternalID(entry.IntentKey)
 		if err := idx.Upsert(ctx, externalID, vec, txnID, entry.Seq); err != nil {
 			log.Error().Err(err).
@@ -427,19 +511,4 @@ func intentKeyToExternalID(intentKey []byte) []byte {
 	cp := make([]byte, len(intentKey))
 	copy(cp, intentKey)
 	return cp
-}
-
-// decodeFloat32Slice decodes a raw BLOB into a []float32.
-// The BLOB must be a sequence of IEEE-754 little-endian 32-bit floats.
-func decodeFloat32Slice(data []byte) ([]float32, error) {
-	if len(data)%4 != 0 {
-		return nil, fmt.Errorf("vector blob length %d is not a multiple of 4", len(data))
-	}
-	n := len(data) / 4
-	vec := make([]float32, n)
-	for i := range vec {
-		bits := binary.LittleEndian.Uint32(data[i*4:])
-		vec[i] = math.Float32frombits(bits)
-	}
-	return vec, nil
 }

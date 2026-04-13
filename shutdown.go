@@ -28,6 +28,7 @@ type ShutdownOrchestrator struct {
 	metricsCollector   *telemetry.MetricsCollector
 	forwardSessMgr     *marmotgrpc.ForwardSessionManager
 	coordinatorHandler *coordinator.CoordinatorHandler
+	vecIndexMgr        *db.VectorIndexManager
 	gracePeriod        time.Duration
 }
 
@@ -94,6 +95,14 @@ func (o *ShutdownOrchestrator) Shutdown() {
 	if o.metricsCollector != nil {
 		o.runStep("stop metrics collector", func() {
 			o.metricsCollector.Stop()
+		})
+	}
+
+	if o.vecIndexMgr != nil {
+		o.runStep("stop vector index manager", func() {
+			if err := o.vecIndexMgr.Stop(); err != nil {
+				log.Error().Err(err).Msg("Error stopping vector index manager")
+			}
 		})
 	}
 

@@ -15,6 +15,7 @@ import (
 
 	"github.com/maxpert/marmot/cfg"
 	"github.com/maxpert/marmot/common"
+	"github.com/maxpert/marmot/encoding"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/protocol"
 	"github.com/maxpert/marmot/protocol/determinism"
@@ -1331,7 +1332,7 @@ func (h *CoordinatorHandler) handleVecKnn(_ *protocol.ConnectionSession, sql str
 		return nil, fmt.Errorf("vec_knn query vector must be a BLOB parameter")
 	}
 
-	vector := decodeFloat32Vector(vectorBytes)
+	vector := encoding.DecodeFloat32Slice(vectorBytes)
 
 	ctx := context.Background()
 	hits, err := vecMgr.Search(ctx, call.IndexName, vector, call.TopK)
@@ -1355,15 +1356,4 @@ func (h *CoordinatorHandler) handleVecKnn(_ *protocol.ConnectionSession, sql str
 		rs.Rows[i] = []interface{}{rowid, float64(hit.Distance), float64(hit.Score)}
 	}
 	return rs, nil
-}
-
-// decodeFloat32Vector decodes a raw byte slice into a []float32.
-// The bytes must be IEEE-754 little-endian 32-bit floats.
-func decodeFloat32Vector(b []byte) []float32 {
-	n := len(b) / 4
-	v := make([]float32, n)
-	for i := range n {
-		v[i] = math.Float32frombits(binary.LittleEndian.Uint32(b[i*4:]))
-	}
-	return v
 }

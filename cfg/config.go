@@ -203,6 +203,15 @@ type ExtensionConfiguration struct {
 	AlwaysLoaded []string `toml:"always_loaded"` // Extensions loaded into every connection via ConnectHook
 }
 
+// VectorIndexConfiguration controls vector index behavior
+type VectorIndexConfiguration struct {
+	Enabled              bool   `toml:"enabled"`
+	DataDir              string `toml:"data_dir"`                   // Default: {data_dir}/vector_indexes
+	PebbleCacheMB        int    `toml:"pebble_cache_mb"`            // Block cache for hdindex Pebble (default: 256)
+	ReconcileIntervalSec int    `toml:"reconcile_interval_seconds"` // Background watermark reconciliation (default: 60)
+	MinVectorsForCreate  int    `toml:"min_vectors_for_create"`     // Minimum rows before CREATE INDEX (default: 100)
+}
+
 // Configuration is the main configuration structure
 type Configuration struct {
 	NodeID  uint64 `toml:"node_id"`
@@ -224,6 +233,7 @@ type Configuration struct {
 	Publisher      PublisherConfiguration      `toml:"publisher"`
 	BatchCommit    BatchCommitConfiguration    `toml:"batch_commit"`
 	Extensions     ExtensionConfiguration      `toml:"extensions"`
+	VectorIndex    VectorIndexConfiguration    `toml:"vector_index"`
 }
 
 // Command line flags
@@ -364,6 +374,13 @@ var Config = &Configuration{
 		IncrementalVacuumEnabled:     true,
 		IncrementalVacuumPages:       100,
 		IncrementalVacuumTimeLimitMS: 10,
+	},
+
+	VectorIndex: VectorIndexConfiguration{
+		Enabled:              false,
+		PebbleCacheMB:        256,
+		ReconcileIntervalSec: 60,
+		MinVectorsForCreate:  100,
 	},
 }
 
