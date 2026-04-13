@@ -250,9 +250,13 @@ func (dm *DatabaseManager) SetVectorIndexManager(mgr *VectorIndexManager) {
 }
 
 // GetVectorIndexManager returns the vector index manager (may be nil).
-func (dm *DatabaseManager) GetVectorIndexManager() *VectorIndexManager {
+// Returns coordinator.VectorIndexManagerProvider to satisfy the coordinator.DatabaseManager interface.
+func (dm *DatabaseManager) GetVectorIndexManager() coordinator.VectorIndexManagerProvider {
 	dm.mu.RLock()
 	defer dm.mu.RUnlock()
+	if dm.vecIndexMgr == nil {
+		return nil
+	}
 	return dm.vecIndexMgr
 }
 

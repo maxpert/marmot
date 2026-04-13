@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/maxpert/marmot/common"
 	"github.com/rs/zerolog/log"
 )
 
@@ -24,17 +25,8 @@ CREATE TABLE IF NOT EXISTS __marmot_vector_indexes (
     UNIQUE(table_name, column_name)
 )`
 
-// VectorIndexMeta holds metadata for a vector index stored in SQLite.
-type VectorIndexMeta struct {
-	IndexName  string
-	TableName  string
-	ColumnName string
-	Database   string
-	Metric     string
-	Dim        int
-	Status     string // "building", "ready", "error"
-	CreatedAt  int64
-}
+// VectorIndexMeta is an alias for the shared common.VectorIndexMeta.
+type VectorIndexMeta = common.VectorIndexMeta
 
 // VectorIndexManager manages vector index lifecycle and CDC-driven mutations.
 type VectorIndexManager struct {

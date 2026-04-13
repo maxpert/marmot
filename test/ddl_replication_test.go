@@ -102,6 +102,10 @@ func (m *DDLMockDatabaseManager) GetTranspilerSchema(database, table string) (*t
 	return nil, nil
 }
 
+func (m *DDLMockDatabaseManager) GetVectorIndexManager() coordinator.VectorIndexManagerProvider {
+	return nil
+}
+
 // DDLMockReader implements coordinator.Reader for testing
 type DDLMockReader struct{}
 

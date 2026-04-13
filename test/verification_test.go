@@ -103,6 +103,10 @@ func (tdm *TestDatabaseManager) GetTranspilerSchema(database, table string) (*tr
 	return info, nil
 }
 
+func (tdm *TestDatabaseManager) GetVectorIndexManager() coordinator.VectorIndexManagerProvider {
+	return nil
+}
+
 func TestMySQLServerIntegration(t *testing.T) {
 	// Setup temporary DB with MetaStore
 	tmpDir := t.TempDir()

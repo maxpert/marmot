@@ -348,7 +348,8 @@ func IsMutation(stmt Statement) bool {
 	switch stmt.Type {
 	case StatementInsert, StatementReplace, StatementUpdate, StatementDelete, StatementLoadData,
 		StatementDDL, StatementDCL, StatementAdmin,
-		StatementCreateDatabase, StatementDropDatabase:
+		StatementCreateDatabase, StatementDropDatabase,
+		StatementCreateVectorIndex, StatementDropVectorIndex:
 		return true
 	default:
 		return false

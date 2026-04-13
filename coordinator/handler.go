@@ -23,6 +23,13 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
+// VectorIndexManagerProvider manages vector index lifecycle.
+// Defined here to avoid an import cycle with the db package.
+type VectorIndexManagerProvider interface {
+	CreateIndex(ctx context.Context, meta common.VectorIndexMeta) error
+	DropIndex(ctx context.Context, indexName, database string) error
+}
+
 // DatabaseManager interface to avoid import cycles
 type DatabaseManager interface {
 	ListDatabases() []string
@@ -38,6 +45,8 @@ type DatabaseManager interface {
 	// GetTranspilerSchema returns schema information for transpiler conflict resolution.
 	// Uses cached schema - does NOT query SQLite PRAGMA.
 	GetTranspilerSchema(database, table string) (*transform.SchemaInfo, error)
+	// GetVectorIndexManager returns the vector index manager (may be nil).
+	GetVectorIndexManager() VectorIndexManagerProvider
 }
 
 // ReplicatedDatabaseProvider provides access to replicated database operations
@@ -433,6 +442,13 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, params []in
 	startTS := h.clock.Now()
 	txnID := startTS.ToTxnID()
 
+	// Vector DDL is handled locally — VectorIndexManager owns its own storage.
+	// No 2PC needed: the metadata table is CDC-replicated and each node builds
+	// its Pebble index independently from the source table data.
+	if stmt.Type == protocol.StatementCreateVectorIndex || stmt.Type == protocol.StatementDropVectorIndex {
+		return h.handleVectorDDL(stmt)
+	}
+
 	// Detect DDL and handle differently
 	isDDL := stmt.Type == protocol.StatementDDL ||
 		stmt.Type == protocol.StatementCreateDatabase ||
@@ -643,6 +659,49 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, params []in
 	}
 
 	return rs, nil
+}
+
+// handleVectorDDL executes CREATE/DROP VECTOR INDEX locally via the VectorIndexManager.
+// Vector DDL does not go through 2PC: the metadata row written to SQLite is
+// CDC-replicated, and each node rebuilds its own Pebble index from the source data.
+func (h *CoordinatorHandler) handleVectorDDL(stmt protocol.Statement) (*protocol.ResultSet, error) {
+	if h.dbManager == nil {
+		return nil, fmt.Errorf("vector index: database manager not available")
+	}
+
+	vecMgr := h.dbManager.GetVectorIndexManager()
+	if vecMgr == nil {
+		return nil, fmt.Errorf("vector index support not enabled")
+	}
+
+	ctx := context.Background()
+
+	switch stmt.Type {
+	case protocol.StatementCreateVectorIndex:
+		meta := common.VectorIndexMeta{
+			IndexName:  stmt.VectorIndexName,
+			TableName:  stmt.TableName,
+			ColumnName: stmt.VectorColumnName,
+			Database:   stmt.Database,
+			Metric:     stmt.VectorMetric,
+			Dim:        stmt.VectorDim,
+			Status:     "building",
+			CreatedAt:  time.Now().UnixNano(),
+		}
+		if err := vecMgr.CreateIndex(ctx, meta); err != nil {
+			return nil, fmt.Errorf("create vector index: %w", err)
+		}
+		return &protocol.ResultSet{RowsAffected: 0}, nil
+
+	case protocol.StatementDropVectorIndex:
+		if err := vecMgr.DropIndex(ctx, stmt.VectorIndexName, stmt.Database); err != nil {
+			return nil, fmt.Errorf("drop vector index: %w", err)
+		}
+		return &protocol.ResultSet{RowsAffected: 0}, nil
+
+	default:
+		return nil, fmt.Errorf("unknown vector DDL type: %d", stmt.Type)
+	}
 }
 
 func (h *CoordinatorHandler) handleRead(stmt protocol.Statement, params []interface{}, consistency protocol.ConsistencyLevel) (*protocol.ResultSet, error) {
