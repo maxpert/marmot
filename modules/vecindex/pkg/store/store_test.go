@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"testing"
 
@@ -103,4 +104,64 @@ func TestKeyEncoding_SortOrder(t *testing.T) {
 	// cluster 10 keys must all be less than cluster 11 keys.
 	kNext := store.EncodePostingKey(11, 0)
 	require.True(t, bytes.Compare(k4, kNext) < 0)
+}
+
+func TestScanClusterFunc_MatchesScanCluster(t *testing.T) {
+	t.Parallel()
+	s := openStore(t)
+
+	vecs := [][]float32{
+		{1.0, 2.0, 3.0},
+		{4.0, 5.0, 6.0},
+		{7.0, 8.0, 9.0},
+	}
+	for i, v := range vecs {
+		require.NoError(t, s.PutPosting(1, uint64(i), v))
+	}
+
+	// Collect via ScanCluster (reference).
+	entries, err := s.ScanCluster(1)
+	require.NoError(t, err)
+	require.Len(t, entries, len(vecs))
+
+	// Collect via ScanClusterFunc.
+	type row struct {
+		docID    uint64
+		vecBytes []byte
+	}
+	var rows []row
+	require.NoError(t, s.ScanClusterFunc(1, func(docID uint64, vecBytes []byte) error {
+		// Must copy: vecBytes is iterator-owned.
+		cp := make([]byte, len(vecBytes))
+		copy(cp, vecBytes)
+		rows = append(rows, row{docID: docID, vecBytes: cp})
+		return nil
+	}))
+	require.Len(t, rows, len(vecs))
+
+	for i, e := range entries {
+		require.Equal(t, e.DocID, rows[i].docID)
+		require.Equal(t, len(e.Vector)*4, len(rows[i].vecBytes))
+	}
+}
+
+func TestScanClusterFunc_EarlyAbort(t *testing.T) {
+	t.Parallel()
+	s := openStore(t)
+
+	for i := range 5 {
+		require.NoError(t, s.PutPosting(2, uint64(i), []float32{float32(i)}))
+	}
+
+	count := 0
+	sentinel := errors.New("stop")
+	err := s.ScanClusterFunc(2, func(_ uint64, _ []byte) error {
+		count++
+		if count == 2 {
+			return sentinel
+		}
+		return nil
+	})
+	require.ErrorIs(t, err, sentinel)
+	require.Equal(t, 2, count)
 }

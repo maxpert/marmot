@@ -207,40 +207,41 @@ func (idx *Index) Search(ctx context.Context, req SearchRequest) ([]SearchHit, e
 }
 
 // flatSearch scans all vectors in cluster 0 and returns exact top-k.
+// extIDs are resolved only for the final top-K to minimise Pebble Gets.
 func (idx *Index) flatSearch(ctx context.Context, req SearchRequest) ([]SearchHit, error) {
-	entries, err := idx.st.ScanCluster(0)
-	if err != nil {
-		return nil, err
-	}
-	if len(entries) == 0 {
-		return nil, nil
-	}
-
 	k := req.K
-	if k > len(entries) {
-		k = len(entries)
-	}
-
 	idx.lastNprobe.Store(1)
 
 	h := &hitHeap{}
 	heap.Init(h)
-	for _, e := range entries {
+
+	scanErr := idx.st.ScanClusterFunc(0, func(docID uint64, vecBytes []byte) error {
 		if ctx.Err() != nil {
-			return nil, ctx.Err()
+			return ctx.Err()
 		}
-		d := metric.Distance(idx.spec.Metric, req.Vector, e.Vector)
-		extID, err := idx.st.GetDocToExt(e.DocID)
-		if err != nil {
-			continue
-		}
-		heap.Push(h, SearchHit{DocID: e.DocID, ExternalID: extID, Distance: d})
+		d := metric.DistanceFromBytes(idx.spec.Metric, req.Vector, vecBytes)
+		heap.Push(h, SearchHit{DocID: docID, Distance: d})
 		if h.Len() > k {
 			heap.Pop(h)
 		}
+		return nil
+	})
+	if scanErr != nil {
+		return nil, scanErr
+	}
+	if h.Len() == 0 {
+		return nil, nil
 	}
 
-	return sortedHits(h, k), nil
+	hits := sortedHits(h, k)
+	for i := range hits {
+		extID, err := idx.st.GetDocToExt(hits[i].DocID)
+		if err != nil {
+			continue
+		}
+		hits[i].ExternalID = extID
+	}
+	return hits, nil
 }
 
 // ivfSearch performs IVF-based approximate nearest-neighbour search.
@@ -321,28 +322,33 @@ func (idx *Index) ivfSearch(ctx context.Context, req SearchRequest, cs *centroid
 			continue
 		}
 		clusterID := cs.clusterIDs[centIdx]
-		entries, err := idx.st.ScanCluster(clusterID)
-		if err != nil {
-			return nil, err
-		}
-		for _, e := range entries {
-			if _, dup := seen[e.DocID]; dup {
-				continue
+		scanErr := idx.st.ScanClusterFunc(clusterID, func(docID uint64, vecBytes []byte) error {
+			if _, dup := seen[docID]; dup {
+				return nil
 			}
-			seen[e.DocID] = struct{}{}
-			d := metric.Distance(idx.spec.Metric, req.Vector, e.Vector)
-			extID, err := idx.st.GetDocToExt(e.DocID)
-			if err != nil {
-				continue
-			}
-			heap.Push(h, SearchHit{DocID: e.DocID, ExternalID: extID, Distance: d})
+			seen[docID] = struct{}{}
+			d := metric.DistanceFromBytes(idx.spec.Metric, req.Vector, vecBytes)
+			heap.Push(h, SearchHit{DocID: docID, Distance: d})
 			if h.Len() > k {
 				heap.Pop(h)
 			}
+			return nil
+		})
+		if scanErr != nil {
+			return nil, scanErr
 		}
 	}
 
-	return sortedHits(h, k), nil
+	// Resolve extIDs only for the final top-K — not inside the inner scan loop.
+	hits := sortedHits(h, k)
+	for i := range hits {
+		extID, err := idx.st.GetDocToExt(hits[i].DocID)
+		if err != nil {
+			continue
+		}
+		hits[i].ExternalID = extID
+	}
+	return hits, nil
 }
 
 // Upsert inserts or updates the vector associated with externalID.

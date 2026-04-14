@@ -265,6 +265,40 @@ func (s *Store) ScanCluster(clusterID uint32) ([]PostingEntry, error) {
 	return entries, nil
 }
 
+// ScanClusterFunc iterates all posting entries for clusterID, calling fn for each
+// entry with its docID and the raw little-endian float32 bytes of the vector.
+// fn MUST NOT retain vecBytes beyond its return — the slice is owned by the Pebble
+// iterator and becomes invalid after fn returns. Return a non-nil error from fn to
+// abort iteration early; that error is propagated to the caller.
+//
+// Deprecated: ScanCluster materialises a full []PostingEntry slice; prefer
+// ScanClusterFunc for search hot-paths to avoid 6KB-per-vector heap allocations.
+func (s *Store) ScanClusterFunc(clusterID uint32, fn func(docID uint64, vecBytes []byte) error) error {
+	lower := EncodePostingPrefix(clusterID)
+	upper := EncodePostingPrefix(clusterID + 1)
+
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: lower,
+		UpperBound: upper,
+	})
+	if err != nil {
+		return err
+	}
+	defer iter.Close()
+
+	for iter.First(); iter.Valid(); iter.Next() {
+		key := iter.Key()
+		if len(key) < 13 || key[0] != KeyPrefixPosting {
+			break
+		}
+		docID := binary.BigEndian.Uint64(key[5:13])
+		if err := fn(docID, iter.Value()); err != nil {
+			return err
+		}
+	}
+	return iter.Error()
+}
+
 // PutReverseMap stores docID → clusterID in namespace 0x03.
 func (s *Store) PutReverseMap(docID uint64, clusterID uint32) error {
 	key := EncodeReverseKey(docID)

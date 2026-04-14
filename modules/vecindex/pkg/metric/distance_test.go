@@ -1,9 +1,19 @@
 package metric
 
 import (
+	"encoding/binary"
 	"math"
 	"testing"
 )
+
+// encodeVec serialises a []float32 as raw little-endian bytes for testing.
+func encodeVec(v []float32) []byte {
+	buf := make([]byte, len(v)*4)
+	for i, f := range v {
+		binary.LittleEndian.PutUint32(buf[i*4:], math.Float32bits(f))
+	}
+	return buf
+}
 
 func TestL2Squared(t *testing.T) {
 	t.Parallel()
@@ -162,4 +172,50 @@ func TestNorm(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestFromBytes_BitIdenticalToFloat32 verifies that the FromBytes variants produce
+// exactly the same results as their []float32 counterparts for L2, Dot, and Cosine.
+func TestFromBytes_BitIdenticalToFloat32(t *testing.T) {
+	t.Parallel()
+	a := []float32{1.0, -2.5, 3.14, 0.0, -0.001, 100.0}
+	b := []float32{0.5, 1.0, -3.14, 1.0, 200.0, -1.0}
+	bBytes := encodeVec(b)
+
+	t.Run("L2Squared", func(t *testing.T) {
+		t.Parallel()
+		want := L2Squared(a, b)
+		got := L2SquaredFromBytes(a, bBytes)
+		if want != got {
+			t.Errorf("L2SquaredFromBytes = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("Dot", func(t *testing.T) {
+		t.Parallel()
+		want := -DotProduct(a, b)
+		got := DotFromBytes(a, bBytes)
+		if want != got {
+			t.Errorf("DotFromBytes = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("Cosine", func(t *testing.T) {
+		t.Parallel()
+		want := 1 - CosineSimilarity(a, b)
+		got := CosineFromBytes(a, bBytes)
+		if math.Abs(float64(got-want)) > 1e-6 {
+			t.Errorf("CosineFromBytes = %v, want %v", got, want)
+		}
+	})
+}
+
+func TestFromBytes_LengthMismatchPanics(t *testing.T) {
+	t.Parallel()
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("expected panic for mismatched lengths")
+		}
+	}()
+	L2SquaredFromBytes([]float32{1, 2}, []byte{0, 0, 0, 0}) // 1 float vs 2-dim query
 }
