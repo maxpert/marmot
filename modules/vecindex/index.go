@@ -255,10 +255,11 @@ func (idx *Index) ivfSearch(ctx context.Context, req SearchRequest, cs *centroid
 		nprobe = 1
 	}
 
-	// Extract all centroid vectors from the CentroidSet.
+	// Build a read-only view of centroid vectors — no defensive copies.
+	// CentroidSet is immutable after construction; concurrent readers are safe.
 	centVecs := make([][]float32, cs.cs.Len())
 	for i := range centVecs {
-		v, err := cs.cs.Get(uint32(i))
+		v, err := cs.cs.GetReadOnly(uint32(i))
 		if err != nil {
 			return nil, fmt.Errorf("index: get centroid %d: %w", i, err)
 		}
@@ -359,7 +360,14 @@ func (idx *Index) ivfSearch(ctx context.Context, req SearchRequest, cs *centroid
 	wg.Wait()
 
 	// Merge per-cluster heaps, deduplicating by docID.
-	seen := make(map[uint64]struct{})
+	// Pre-size the seen map to avoid rehashing: estimate avgClusterSize = total/nlist.
+	nlist := cs.cs.Len()
+	avgClusterSize := 1
+	if nlist > 0 {
+		total := idx.vectorCount.Load()
+		avgClusterSize = int(total)/nlist + 1
+	}
+	seen := make(map[uint64]struct{}, len(ids)*avgClusterSize)
 	h := &hitHeap{}
 	heap.Init(h)
 	for _, r := range results {
@@ -426,7 +434,7 @@ func (idx *Index) Upsert(ctx context.Context, externalID []byte, vec []float32, 
 	if cs != nil {
 		centVecs := make([][]float32, cs.cs.Len())
 		for i := range centVecs {
-			v, _ := cs.cs.Get(uint32(i))
+			v, _ := cs.cs.GetReadOnly(uint32(i))
 			centVecs[i] = v
 		}
 		centIdx, _, assignErr := kmeans.Assign(vec, centVecs, idx.spec.Metric)

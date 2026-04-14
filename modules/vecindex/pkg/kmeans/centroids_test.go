@@ -66,6 +66,26 @@ func TestCentroidSet_Immutable(t *testing.T) {
 	require.Equal(t, float32(1), got2[0], "mutating returned slice must not affect CentroidSet internal state")
 }
 
+func TestCentroidSet_GetReadOnly_NoAlloc(t *testing.T) {
+	t.Parallel()
+	vecs := [][]float32{{1, 2, 3}, {4, 5, 6}}
+	cs, err := kmeans.NewCentroidSet(0, vecs)
+	require.NoError(t, err)
+
+	v, err := cs.GetReadOnly(0)
+	require.NoError(t, err)
+	require.Equal(t, []float32{1, 2, 3}, v)
+
+	// GetReadOnly must return the same pointer on repeated calls (no copy).
+	v2, err := cs.GetReadOnly(0)
+	require.NoError(t, err)
+	require.Equal(t, &v[0], &v2[0], "GetReadOnly must return the same backing array without copying")
+
+	// Out-of-range must error.
+	_, err = cs.GetReadOnly(99)
+	require.Error(t, err)
+}
+
 func TestCentroidSet_Encode_Decode(t *testing.T) {
 	t.Parallel()
 	vecs := [][]float32{

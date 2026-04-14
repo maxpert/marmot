@@ -44,9 +44,8 @@ func (cs *CentroidSet) Epoch() uint64 {
 	return cs.epoch
 }
 
-// Get returns a copy of the centroid vector for the given cluster ID.
-// Callers MUST NOT mutate the returned slice; doing so does not affect
-// the CentroidSet's internal state because a defensive copy is returned.
+// Get returns a mutable copy of the centroid vector for the given cluster ID.
+// Use this when the caller needs to modify the returned slice.
 // Returns an error if clusterID is out of range.
 func (cs *CentroidSet) Get(clusterID uint32) ([]float32, error) {
 	if int(clusterID) >= len(cs.centroids) {
@@ -56,6 +55,18 @@ func (cs *CentroidSet) Get(clusterID uint32) ([]float32, error) {
 	cp := make([]float32, len(src))
 	copy(cp, src)
 	return cp, nil
+}
+
+// GetReadOnly returns the internal centroid slice for read-only access.
+// Callers MUST NOT mutate the returned slice — it aliases the CentroidSet's
+// internal state and is shared across concurrent readers. For a mutable copy
+// use Get instead.
+// Returns an error if clusterID is out of range.
+func (cs *CentroidSet) GetReadOnly(clusterID uint32) ([]float32, error) {
+	if int(clusterID) >= len(cs.centroids) {
+		return nil, fmt.Errorf("kmeans: cluster ID %d out of range (len=%d)", clusterID, len(cs.centroids))
+	}
+	return cs.centroids[clusterID], nil
 }
 
 // Encode serialises the CentroidSet to msgpack bytes.
