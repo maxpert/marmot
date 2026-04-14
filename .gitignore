@@ -51,3 +51,6 @@ test-config.toml
 test-config-no-secret.toml
 marmot-data/
 plan/
+
+# Python bytecode in vecindex scripts
+modules/vecindex/scripts/__pycache__/
