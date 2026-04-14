@@ -1,3 +1,4 @@
+// Package metric provides SIMD-accelerated vector distance functions.
 package metric
 
 import (
@@ -47,12 +48,6 @@ func DotProduct(a, b []float32) float32 {
 	return f32.DotProduct(a, b)
 }
 
-func assertEqualLen(a, b []float32) {
-	if len(a) != len(b) {
-		panic("metric: mismatched vector lengths")
-	}
-}
-
 // CosineSimilarity computes the cosine similarity between two vectors.
 // Returns a value in [-1, 1]. Returns 0 if either vector has near-zero norm
 // or if the norm product underflows to zero.
@@ -79,4 +74,30 @@ func Norm(v []float32) float32 {
 // norm computes sqrt(sum(v[i]^2)) via SIMD self-dot-product.
 func norm(v []float32) float32 {
 	return float32(math.Sqrt(float64(f32.DotProduct(v, v))))
+}
+
+// Distance dispatches to the correct distance function based on the Metric
+// enum. Returned values are always "smaller means closer":
+//   - MetricL2     → squared Euclidean distance
+//   - MetricDot    → negative inner product
+//   - MetricCosine → 1 - cosine similarity
+//
+// Panics if len(a) != len(b) or if m is not a known Metric value.
+func Distance(m Metric, a, b []float32) float32 {
+	switch m {
+	case MetricL2:
+		return L2Squared(a, b)
+	case MetricDot:
+		return -DotProduct(a, b)
+	case MetricCosine:
+		return 1 - CosineSimilarity(a, b)
+	default:
+		panic("metric: unknown Metric value")
+	}
+}
+
+func assertEqualLen(a, b []float32) {
+	if len(a) != len(b) {
+		panic("metric: mismatched vector lengths")
+	}
 }
