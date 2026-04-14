@@ -5,8 +5,12 @@ package store
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
+	"math"
+	"sync"
 
 	"github.com/cockroachdb/pebble"
+	"github.com/rs/zerolog/log"
 )
 
 // ErrNotFound is returned when a requested key does not exist in the store.
@@ -29,6 +33,13 @@ const (
 	// KeyPrefixSpec stores the serialized IVFSpec for the index.
 	KeyPrefixSpec byte = 0x07
 )
+
+// keyClusterIDCounter is the sub-key within KeyPrefixSpec for the cluster ID watermark.
+var keyClusterIDCounter = []byte{KeyPrefixSpec, 0x01}
+
+// clusterMetaSize is the fixed binary size of a serialized ClusterMeta.
+// Layout: Size(4) + Epoch(8) + TombstoneCount(4) + State(1) = 17 bytes.
+const clusterMetaSize = 17
 
 // ClusterState represents the lifecycle state of an IVF cluster.
 type ClusterState uint8
@@ -69,16 +80,41 @@ type Batch struct {
 
 // Store wraps a Pebble database and provides typed key access for vecindex data.
 type Store struct {
-	db *pebble.DB
+	db        *pebble.DB
+	allocMu   sync.Mutex
+	clusterID uint32 // in-memory watermark; persisted on each alloc
 }
 
 // New opens or creates a Pebble store at the given directory path.
 func New(dir string, opts *pebble.Options) (*Store, error) {
 	db, err := pebble.Open(dir, opts)
 	if err != nil {
+		return nil, fmt.Errorf("store: open pebble at %s: %w", dir, err)
+	}
+
+	s := &Store{db: db}
+	if err := s.loadClusterIDWatermark(); err != nil {
+		_ = db.Close()
 		return nil, err
 	}
-	return &Store{db: db}, nil
+
+	log.Info().Str("dir", dir).Msg("store: opened")
+	return s, nil
+}
+
+// loadClusterIDWatermark reads the persisted cluster ID counter from disk.
+func (s *Store) loadClusterIDWatermark() error {
+	val, closer, err := s.db.Get(keyClusterIDCounter)
+	if errors.Is(err, pebble.ErrNotFound) {
+		s.clusterID = 0
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("store: load cluster ID watermark: %w", err)
+	}
+	defer closer.Close()
+	s.clusterID = binary.BigEndian.Uint32(val)
+	return nil
 }
 
 // DB returns the underlying Pebble database.
@@ -88,6 +124,7 @@ func (s *Store) DB() *pebble.DB {
 
 // Close closes the underlying Pebble database.
 func (s *Store) Close() error {
+	log.Info().Msg("store: closing")
 	return s.db.Close()
 }
 
@@ -98,114 +135,287 @@ func (s *Store) NewBatch() *Batch {
 
 // Commit atomically applies the batch to the store.
 func (b *Batch) Commit() error {
-	return errors.New("not implemented: Batch.Commit")
+	return b.b.Commit(pebble.NoSync)
 }
 
 // Close discards the batch without committing.
 func (b *Batch) Close() error {
-	return errors.New("not implemented: Batch.Close")
+	return b.b.Close()
 }
 
 // PutCentroid stores a centroid vector for clusterID.
 // Returns an error if vec has the wrong dimension (dim > 0 to validate).
 func (s *Store) PutCentroid(clusterID uint32, vec []float32, dim int) error {
-	return errors.New("not implemented: PutCentroid")
+	if dim > 0 && len(vec) != dim {
+		return fmt.Errorf("store: centroid dimension mismatch: got %d, want %d", len(vec), dim)
+	}
+	key := EncodeCentroidKey(clusterID)
+	val := encodeFloat32Slice(vec)
+	return s.db.Set(key, val, pebble.NoSync)
 }
 
 // GetCentroid retrieves the centroid vector for clusterID.
 // Returns ErrNotFound if absent.
 func (s *Store) GetCentroid(clusterID uint32) ([]float32, error) {
-	return nil, errors.New("not implemented: GetCentroid")
+	key := EncodeCentroidKey(clusterID)
+	val, closer, err := s.db.Get(key)
+	if errors.Is(err, pebble.ErrNotFound) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer closer.Close()
+	return decodeFloat32Slice(val), nil
 }
 
 // DeleteCentroid removes the centroid for clusterID.
 func (s *Store) DeleteCentroid(clusterID uint32) error {
-	return errors.New("not implemented: DeleteCentroid")
+	key := EncodeCentroidKey(clusterID)
+	return s.db.Delete(key, pebble.NoSync)
 }
 
 // ListCentroids returns all (clusterID, vector) pairs sorted by clusterID ascending.
 func (s *Store) ListCentroids() ([]uint32, [][]float32, error) {
-	return nil, nil, errors.New("not implemented: ListCentroids")
+	lower := []byte{KeyPrefixCentroid}
+	upper := []byte{KeyPrefixCentroid + 1}
+
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: lower,
+		UpperBound: upper,
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	defer iter.Close()
+
+	var ids []uint32
+	var vecs [][]float32
+	for iter.First(); iter.Valid(); iter.Next() {
+		key := iter.Key()
+		if len(key) < 5 || key[0] != KeyPrefixCentroid {
+			break
+		}
+		clusterID := binary.BigEndian.Uint32(key[1:5])
+		vec := decodeFloat32Slice(iter.Value())
+		ids = append(ids, clusterID)
+		vecs = append(vecs, vec)
+	}
+	if err := iter.Error(); err != nil {
+		return nil, nil, err
+	}
+	return ids, vecs, nil
 }
 
 // PutPosting inserts an inline vector for (clusterID, docID) into namespace 0x02.
 func (s *Store) PutPosting(clusterID uint32, docID uint64, vec []float32) error {
-	return errors.New("not implemented: PutPosting")
+	key := EncodePostingKey(clusterID, docID)
+	val := encodeFloat32Slice(vec)
+	return s.db.Set(key, val, pebble.NoSync)
 }
 
 // GetPosting retrieves the inline vector for (clusterID, docID).
 // Returns ErrNotFound if absent.
 func (s *Store) GetPosting(clusterID uint32, docID uint64) ([]float32, error) {
-	return nil, errors.New("not implemented: GetPosting")
+	key := EncodePostingKey(clusterID, docID)
+	val, closer, err := s.db.Get(key)
+	if errors.Is(err, pebble.ErrNotFound) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer closer.Close()
+	return decodeFloat32Slice(val), nil
 }
 
 // DeletePosting removes the posting entry for (clusterID, docID).
 func (s *Store) DeletePosting(clusterID uint32, docID uint64) error {
-	return errors.New("not implemented: DeletePosting")
+	key := EncodePostingKey(clusterID, docID)
+	return s.db.Delete(key, pebble.NoSync)
 }
 
 // ScanCluster iterates all posting entries for clusterID in docID ascending order.
 func (s *Store) ScanCluster(clusterID uint32) ([]PostingEntry, error) {
-	return nil, errors.New("not implemented: ScanCluster")
+	lower := EncodePostingPrefix(clusterID)
+	upper := EncodePostingPrefix(clusterID + 1)
+
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: lower,
+		UpperBound: upper,
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer iter.Close()
+
+	var entries []PostingEntry
+	for iter.First(); iter.Valid(); iter.Next() {
+		key := iter.Key()
+		if len(key) < 13 || key[0] != KeyPrefixPosting {
+			break
+		}
+		docID := binary.BigEndian.Uint64(key[5:13])
+		vec := decodeFloat32Slice(iter.Value())
+		entries = append(entries, PostingEntry{DocID: docID, Vector: vec})
+	}
+	if err := iter.Error(); err != nil {
+		return nil, err
+	}
+	return entries, nil
 }
 
 // PutReverseMap stores docID → clusterID in namespace 0x03.
 func (s *Store) PutReverseMap(docID uint64, clusterID uint32) error {
-	return errors.New("not implemented: PutReverseMap")
+	key := EncodeReverseKey(docID)
+	val := make([]byte, 4)
+	binary.BigEndian.PutUint32(val, clusterID)
+	return s.db.Set(key, val, pebble.NoSync)
 }
 
 // GetClusterForDoc returns the clusterID assigned to docID.
 // Returns ErrNotFound if absent.
 func (s *Store) GetClusterForDoc(docID uint64) (uint32, error) {
-	return 0, errors.New("not implemented: GetClusterForDoc")
+	key := EncodeReverseKey(docID)
+	val, closer, err := s.db.Get(key)
+	if errors.Is(err, pebble.ErrNotFound) {
+		return 0, ErrNotFound
+	}
+	if err != nil {
+		return 0, err
+	}
+	defer closer.Close()
+	return binary.BigEndian.Uint32(val), nil
 }
 
 // GetClusterMeta retrieves metadata for clusterID.
 // Returns ErrNotFound if absent.
 func (s *Store) GetClusterMeta(clusterID uint32) (ClusterMeta, error) {
-	return ClusterMeta{}, errors.New("not implemented: GetClusterMeta")
+	key := EncodeClusterMetaKey(clusterID)
+	val, closer, err := s.db.Get(key)
+	if errors.Is(err, pebble.ErrNotFound) {
+		return ClusterMeta{}, ErrNotFound
+	}
+	if err != nil {
+		return ClusterMeta{}, err
+	}
+	defer closer.Close()
+	return decodeClusterMeta(val), nil
 }
 
 // PutClusterMeta stores metadata for clusterID.
 func (s *Store) PutClusterMeta(clusterID uint32, meta ClusterMeta) error {
-	return errors.New("not implemented: PutClusterMeta")
+	key := EncodeClusterMetaKey(clusterID)
+	val := encodeClusterMeta(meta)
+	return s.db.Set(key, val, pebble.NoSync)
 }
 
 // ListActiveClusters returns clusterIDs whose state is ClusterStateActive.
 func (s *Store) ListActiveClusters() ([]uint32, error) {
-	return nil, errors.New("not implemented: ListActiveClusters")
+	lower := []byte{KeyPrefixClusterMeta}
+	upper := []byte{KeyPrefixClusterMeta + 1}
+
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: lower,
+		UpperBound: upper,
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer iter.Close()
+
+	var ids []uint32
+	for iter.First(); iter.Valid(); iter.Next() {
+		key := iter.Key()
+		if len(key) < 5 || key[0] != KeyPrefixClusterMeta {
+			break
+		}
+		meta := decodeClusterMeta(iter.Value())
+		if meta.State == ClusterStateActive {
+			clusterID := binary.BigEndian.Uint32(key[1:5])
+			ids = append(ids, clusterID)
+		}
+	}
+	if err := iter.Error(); err != nil {
+		return nil, err
+	}
+	return ids, nil
 }
 
 // PutExtToDoc stores a mapping from externalID → docID in namespace 0x05.
 func (s *Store) PutExtToDoc(externalID []byte, docID uint64) error {
-	return errors.New("not implemented: PutExtToDoc")
+	key := EncodeExtToDocKey(externalID)
+	val := make([]byte, 8)
+	binary.BigEndian.PutUint64(val, docID)
+	return s.db.Set(key, val, pebble.NoSync)
 }
 
 // GetExtToDoc retrieves the docID for externalID.
 // Returns ErrNotFound if absent.
 func (s *Store) GetExtToDoc(externalID []byte) (uint64, error) {
-	return 0, errors.New("not implemented: GetExtToDoc")
+	key := EncodeExtToDocKey(externalID)
+	val, closer, err := s.db.Get(key)
+	if errors.Is(err, pebble.ErrNotFound) {
+		return 0, ErrNotFound
+	}
+	if err != nil {
+		return 0, err
+	}
+	defer closer.Close()
+	return binary.BigEndian.Uint64(val), nil
 }
 
 // PutDocToExt stores a mapping from docID → externalID in namespace 0x06.
 func (s *Store) PutDocToExt(docID uint64, externalID []byte) error {
-	return errors.New("not implemented: PutDocToExt")
+	key := EncodeDocToExtKey(docID)
+	return s.db.Set(key, externalID, pebble.NoSync)
 }
 
 // GetDocToExt retrieves the externalID for docID.
 // Returns ErrNotFound if absent.
 func (s *Store) GetDocToExt(docID uint64) ([]byte, error) {
-	return nil, errors.New("not implemented: GetDocToExt")
+	key := EncodeDocToExtKey(docID)
+	val, closer, err := s.db.Get(key)
+	if errors.Is(err, pebble.ErrNotFound) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer closer.Close()
+	// Copy the value before closing
+	result := make([]byte, len(val))
+	copy(result, val)
+	return result, nil
 }
 
 // DeleteExtMapping removes both 0x05 and 0x06 entries for the given pair atomically.
 func (s *Store) DeleteExtMapping(externalID []byte, docID uint64) error {
-	return errors.New("not implemented: DeleteExtMapping")
+	b := s.db.NewBatch()
+	defer b.Close()
+	if err := b.Delete(EncodeExtToDocKey(externalID), pebble.NoSync); err != nil {
+		return err
+	}
+	if err := b.Delete(EncodeDocToExtKey(docID), pebble.NoSync); err != nil {
+		return err
+	}
+	return b.Commit(pebble.NoSync)
 }
 
 // CompactCluster runs pebble.Compact over the posting prefix for clusterID.
 func (s *Store) CompactCluster(clusterID uint32) error {
-	return errors.New("not implemented: CompactCluster")
+	postStart := EncodePostingPrefix(clusterID)
+	postEnd := EncodePostingPrefix(clusterID + 1)
+	if err := s.db.Compact(postStart, postEnd, true); err != nil {
+		return fmt.Errorf("store: compact posting range for cluster %d: %w", clusterID, err)
+	}
+
+	centStart := EncodeCentroidKey(clusterID)
+	centEnd := EncodeCentroidKey(clusterID + 1)
+	if err := s.db.Compact(centStart, centEnd, true); err != nil {
+		return fmt.Errorf("store: compact centroid range for cluster %d: %w", clusterID, err)
+	}
+	return nil
 }
 
 // ShouldCompact returns true when the cluster's tombstone ratio exceeds 30%.
@@ -220,48 +430,77 @@ func ShouldCompact(meta ClusterMeta) bool {
 // AllocateClusterID returns the next monotonically increasing cluster ID,
 // persisting the watermark so it survives restarts.
 func (s *Store) AllocateClusterID() (uint32, error) {
-	return 0, errors.New("not implemented: AllocateClusterID")
+	s.allocMu.Lock()
+	defer s.allocMu.Unlock()
+
+	next := s.clusterID + 1
+	val := make([]byte, 4)
+	binary.BigEndian.PutUint32(val, next)
+	if err := s.db.Set(keyClusterIDCounter, val, pebble.Sync); err != nil {
+		return 0, fmt.Errorf("store: persist cluster ID watermark: %w", err)
+	}
+	s.clusterID = next
+	return next, nil
 }
 
 // Checkpoint creates a hard-linked snapshot of the store at destDir using
-// pebble.Checkpoint semantics.
+// pebble.Checkpoint semantics. Flushes memtables first so all data is visible
+// in the snapshot.
 func (s *Store) Checkpoint(destDir string) error {
-	return errors.New("not implemented: Checkpoint")
+	if err := s.db.Flush(); err != nil {
+		return fmt.Errorf("store: flush before checkpoint: %w", err)
+	}
+	return s.db.Checkpoint(destDir)
 }
 
 // BatchPutPosting adds an inline-vector posting write to the batch.
 func (b *Batch) BatchPutPosting(clusterID uint32, docID uint64, vec []float32) error {
-	return errors.New("not implemented: Batch.BatchPutPosting")
+	key := EncodePostingKey(clusterID, docID)
+	val := encodeFloat32Slice(vec)
+	return b.b.Set(key, val, pebble.NoSync)
 }
 
 // BatchDeletePosting adds a posting delete to the batch.
 func (b *Batch) BatchDeletePosting(clusterID uint32, docID uint64) error {
-	return errors.New("not implemented: Batch.BatchDeletePosting")
+	key := EncodePostingKey(clusterID, docID)
+	return b.b.Delete(key, pebble.NoSync)
 }
 
 // BatchPutReverseMap adds a reverse-map write to the batch.
 func (b *Batch) BatchPutReverseMap(docID uint64, clusterID uint32) error {
-	return errors.New("not implemented: Batch.BatchPutReverseMap")
+	key := EncodeReverseKey(docID)
+	val := make([]byte, 4)
+	binary.BigEndian.PutUint32(val, clusterID)
+	return b.b.Set(key, val, pebble.NoSync)
 }
 
 // BatchPutClusterMeta adds a cluster-meta write to the batch.
 func (b *Batch) BatchPutClusterMeta(clusterID uint32, meta ClusterMeta) error {
-	return errors.New("not implemented: Batch.BatchPutClusterMeta")
+	key := EncodeClusterMetaKey(clusterID)
+	val := encodeClusterMeta(meta)
+	return b.b.Set(key, val, pebble.NoSync)
 }
 
 // BatchPutExtToDoc adds an ext→doc mapping write to the batch.
 func (b *Batch) BatchPutExtToDoc(externalID []byte, docID uint64) error {
-	return errors.New("not implemented: Batch.BatchPutExtToDoc")
+	key := EncodeExtToDocKey(externalID)
+	val := make([]byte, 8)
+	binary.BigEndian.PutUint64(val, docID)
+	return b.b.Set(key, val, pebble.NoSync)
 }
 
 // BatchPutDocToExt adds a doc→ext mapping write to the batch.
 func (b *Batch) BatchPutDocToExt(docID uint64, externalID []byte) error {
-	return errors.New("not implemented: Batch.BatchPutDocToExt")
+	key := EncodeDocToExtKey(docID)
+	return b.b.Set(key, externalID, pebble.NoSync)
 }
 
 // BatchDeleteExtMapping adds both ext→doc and doc→ext deletes to the batch.
 func (b *Batch) BatchDeleteExtMapping(externalID []byte, docID uint64) error {
-	return errors.New("not implemented: Batch.BatchDeleteExtMapping")
+	if err := b.b.Delete(EncodeExtToDocKey(externalID), pebble.NoSync); err != nil {
+		return err
+	}
+	return b.b.Delete(EncodeDocToExtKey(docID), pebble.NoSync)
 }
 
 // EncodeCentroidKey returns the key for a centroid record.
@@ -350,4 +589,45 @@ func DecodeDocIDFromPostingKey(key []byte) uint64 {
 // Callers must verify the key has prefix KeyPrefixReverseMap before calling.
 func DecodeDocIDFromReverseKey(key []byte) uint64 {
 	return binary.BigEndian.Uint64(key[1:9])
+}
+
+// encodeFloat32Slice encodes a float32 slice as raw little-endian bytes.
+func encodeFloat32Slice(vec []float32) []byte {
+	buf := make([]byte, len(vec)*4)
+	for i, v := range vec {
+		binary.LittleEndian.PutUint32(buf[i*4:], math.Float32bits(v))
+	}
+	return buf
+}
+
+// decodeFloat32Slice decodes raw little-endian bytes into a float32 slice.
+func decodeFloat32Slice(buf []byte) []float32 {
+	n := len(buf) / 4
+	vec := make([]float32, n)
+	for i := range vec {
+		bits := binary.LittleEndian.Uint32(buf[i*4:])
+		vec[i] = math.Float32frombits(bits)
+	}
+	return vec
+}
+
+// encodeClusterMeta serializes a ClusterMeta to a fixed-size byte slice.
+// Layout: [Size uint32 BE][Epoch uint64 BE][TombstoneCount uint32 BE][State uint8]
+func encodeClusterMeta(m ClusterMeta) []byte {
+	buf := make([]byte, clusterMetaSize)
+	binary.BigEndian.PutUint32(buf[0:4], m.Size)
+	binary.BigEndian.PutUint64(buf[4:12], m.Epoch)
+	binary.BigEndian.PutUint32(buf[12:16], m.TombstoneCount)
+	buf[16] = uint8(m.State)
+	return buf
+}
+
+// decodeClusterMeta deserializes a ClusterMeta from its binary representation.
+func decodeClusterMeta(buf []byte) ClusterMeta {
+	return ClusterMeta{
+		Size:           binary.BigEndian.Uint32(buf[0:4]),
+		Epoch:          binary.BigEndian.Uint64(buf[4:12]),
+		TombstoneCount: binary.BigEndian.Uint32(buf[12:16]),
+		State:          ClusterState(buf[16]),
+	}
 }
