@@ -12,87 +12,101 @@ import (
 	"github.com/maxpert/marmot/common"
 	"github.com/maxpert/marmot/db"
 	"github.com/maxpert/marmot/hlc"
-	hdindex "github.com/maxpert/marmot/modules/hdindex"
+	"github.com/maxpert/marmot/modules/vecindex"
 	"github.com/maxpert/marmot/notify"
 	"github.com/maxpert/marmot/protocol"
+	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 // ---------------------------------------------------------------------------
-// Local hdindex adapter (mirrors hdindex_adapter.go but in package test)
+// Local vecindex adapter (mirrors vecindex_adapter.go but in package test)
 // ---------------------------------------------------------------------------
 
-type e2eHDIndexAdapter struct {
-	engine *hdindex.Engine
+type e2eVecEngineAdapter struct {
+	engine *vecindex.Engine
 }
 
-func newE2EHDIndexAdapter(rootDir string) (*e2eHDIndexAdapter, error) {
-	engine, err := hdindex.NewEngine(rootDir, hdindex.EngineConfig{})
+type e2eVecIndexAdapter struct {
+	idx *vecindex.Index
+}
+
+func newE2EVecIndexAdapter(rootDir string) (*e2eVecEngineAdapter, error) {
+	engine, err := vecindex.NewEngine(rootDir, zerolog.Nop())
 	if err != nil {
 		return nil, err
 	}
-	return &e2eHDIndexAdapter{engine: engine}, nil
+	return &e2eVecEngineAdapter{engine: engine}, nil
 }
 
-func (a *e2eHDIndexAdapter) CreateIndex(ctx context.Context, id string, dim int, metric string, vectors []db.VectorBulkEntry) (db.VectorIndex, error) {
-	m, ok := hdindex.ParseMetric(metric)
-	if !ok {
-		return nil, fmt.Errorf("unknown metric: %s", metric)
+func parseE2EMetric(metric string) (vecindex.Metric, error) {
+	switch metric {
+	case "", "l2", "euclidean":
+		return vecindex.MetricL2, nil
+	case "dot", "ip":
+		return vecindex.MetricDot, nil
+	case "cosine":
+		return vecindex.MetricCosine, nil
+	default:
+		return 0, fmt.Errorf("unknown metric: %s", metric)
 	}
-	spec := hdindex.DefaultSpec(id, dim, m)
-	entries := make([]hdindex.VectorEntry, len(vectors))
+}
+
+func (a *e2eVecEngineAdapter) CreateIndex(ctx context.Context, id string, dim int, metric string, vectors []db.VectorBulkEntry) (db.VectorIndex, error) {
+	m, err := parseE2EMetric(metric)
+	if err != nil {
+		return nil, err
+	}
+	spec := vecindex.DefaultSpec(id, dim, m)
+	bulk := make([]vecindex.BulkEntry, len(vectors))
 	for i, v := range vectors {
-		entries[i] = hdindex.VectorEntry{ExternalID: v.ExternalID, Vector: v.Vector}
+		bulk[i] = vecindex.BulkEntry{ExternalID: v.ExternalID, Vector: v.Vector}
 	}
-	idx, err := a.engine.CreateIndex(ctx, spec, entries)
+	idx, err := a.engine.CreateIndex(ctx, spec, bulk)
 	if err != nil {
 		return nil, err
 	}
-	return &e2eHDIndexIndexAdapter{idx: idx}, nil
+	return &e2eVecIndexAdapter{idx: idx}, nil
 }
 
-func (a *e2eHDIndexAdapter) OpenIndex(ctx context.Context, id string) (db.VectorIndex, error) {
+func (a *e2eVecEngineAdapter) OpenIndex(ctx context.Context, id string) (db.VectorIndex, error) {
 	idx, err := a.engine.OpenIndex(ctx, id)
 	if err != nil {
 		return nil, err
 	}
-	return &e2eHDIndexIndexAdapter{idx: idx}, nil
+	return &e2eVecIndexAdapter{idx: idx}, nil
 }
 
-func (a *e2eHDIndexAdapter) DropIndex(ctx context.Context, id string) error {
+func (a *e2eVecEngineAdapter) DropIndex(ctx context.Context, id string) error {
 	return a.engine.DropIndex(ctx, id)
 }
 
-func (a *e2eHDIndexAdapter) Close() error {
+func (a *e2eVecEngineAdapter) Close() error {
 	return a.engine.Close()
 }
 
-type e2eHDIndexIndexAdapter struct {
-	idx *hdindex.Index
-}
-
-func (a *e2eHDIndexIndexAdapter) Search(ctx context.Context, vector []float32, topK int) ([]common.VectorSearchHit, error) {
-	result, err := a.idx.Search(ctx, hdindex.SearchRequest{VectorFP32: vector, TopK: topK})
+func (a *e2eVecIndexAdapter) Search(ctx context.Context, vector []float32, topK int) ([]common.VectorSearchHit, error) {
+	hits, err := a.idx.Search(ctx, vecindex.SearchRequest{Vector: vector, K: topK})
 	if err != nil {
 		return nil, err
 	}
-	hits := make([]common.VectorSearchHit, len(result.Hits))
-	for i, h := range result.Hits {
-		hits[i] = common.VectorSearchHit{ExternalID: h.ExternalID, Distance: h.Distance, Score: h.Score}
+	result := make([]common.VectorSearchHit, len(hits))
+	for i, h := range hits {
+		result[i] = common.VectorSearchHit{ExternalID: h.ExternalID, Distance: h.Distance}
 	}
-	return hits, nil
+	return result, nil
 }
 
-func (a *e2eHDIndexIndexAdapter) Upsert(ctx context.Context, externalID []byte, vector []float32, txnID, seqID uint64) error {
-	return a.idx.Upsert(ctx, hdindex.Mutation{TxnID: txnID, SeqID: seqID, ExternalID: externalID, VectorFP32: vector})
+func (a *e2eVecIndexAdapter) Upsert(ctx context.Context, externalID []byte, vector []float32, txnID, seqID uint64) error {
+	return a.idx.Upsert(ctx, externalID, vector, txnID, seqID)
 }
 
-func (a *e2eHDIndexIndexAdapter) Delete(ctx context.Context, externalID []byte, txnID, seqID uint64) error {
-	return a.idx.Delete(ctx, hdindex.DeleteMutation{TxnID: txnID, SeqID: seqID, ExternalID: externalID})
+func (a *e2eVecIndexAdapter) Delete(ctx context.Context, externalID []byte, txnID, seqID uint64) error {
+	return a.idx.Delete(ctx, externalID, txnID, seqID)
 }
 
-func (a *e2eHDIndexIndexAdapter) Stats() db.VectorIndexStats {
+func (a *e2eVecIndexAdapter) Stats() db.VectorIndexStats {
 	s := a.idx.Stats()
 	return db.VectorIndexStats{VectorCount: s.VectorCount, WatermarkTxnID: s.WatermarkTxnID}
 }
@@ -101,7 +115,7 @@ func (a *e2eHDIndexIndexAdapter) Stats() db.VectorIndexStats {
 // VectorIndex before calling engine.DropIndex. The Engine.DropIndex then closes
 // the underlying pebble DB. Calling a.idx.Close() here would cause a double-close
 // panic because Index.Close() closes pebble but leaves the entry in Engine.indexes.
-func (a *e2eHDIndexIndexAdapter) Close() error {
+func (a *e2eVecIndexAdapter) Close() error {
 	return nil
 }
 
@@ -135,8 +149,8 @@ func rowidBytes(rowID int64) []byte {
 }
 
 // setupVectorE2E creates a DatabaseManager + VectorIndexManager backed by a real
-// hdindex engine. The caller is responsible for calling cleanup.
-func setupVectorE2E(t *testing.T) (*db.VectorIndexManager, *db.DatabaseManager, *e2eHDIndexAdapter) {
+// vecindex engine. The caller is responsible for calling cleanup.
+func setupVectorE2E(t *testing.T) (*db.VectorIndexManager, *db.DatabaseManager, *e2eVecEngineAdapter) {
 	t.Helper()
 	tmpDir := t.TempDir()
 	clock := hlc.NewClock(1)
@@ -144,7 +158,7 @@ func setupVectorE2E(t *testing.T) (*db.VectorIndexManager, *db.DatabaseManager, 
 	require.NoError(t, err)
 
 	idxDir := tmpDir + "/vector_indexes"
-	eng, err := newE2EHDIndexAdapter(idxDir)
+	eng, err := newE2EVecIndexAdapter(idxDir)
 	require.NoError(t, err)
 
 	vim := db.NewVectorIndexManager(eng, dm, 0, 0)
@@ -265,7 +279,7 @@ func TestVectorIndex_E2E_CDCUpdates(t *testing.T) {
 	dm.SetCDCHub(cdcHub)
 
 	idxDir := tmpDir + "/vector_indexes"
-	eng, err := newE2EHDIndexAdapter(idxDir)
+	eng, err := newE2EVecIndexAdapter(idxDir)
 	require.NoError(t, err)
 
 	vim := db.NewVectorIndexManager(eng, dm, 0, 0)
@@ -468,7 +482,7 @@ func TestVectorIndex_E2E_ErrorCases(t *testing.T) {
 		require.NoError(t, err)
 
 		idxDir := tmpDir + "/vector_indexes"
-		eng, err := newE2EHDIndexAdapter(idxDir)
+		eng, err := newE2EVecIndexAdapter(idxDir)
 		require.NoError(t, err)
 
 		vim := db.NewVectorIndexManager(eng, dm, 0, 50) // minVectors=50
