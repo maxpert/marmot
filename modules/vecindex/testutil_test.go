@@ -73,7 +73,7 @@ func computeRecall(got []SearchHit, truth []int, k int) float32 {
 // newTempEngine creates an Engine backed by t.TempDir().
 func newTempEngine(t *testing.T) *Engine {
 	t.Helper()
-	e, err := NewEngine(t.TempDir(), newTestLogger())
+	e, err := NewEngine(t.TempDir(), 64, newTestLogger())
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = e.Close() })
 	return e

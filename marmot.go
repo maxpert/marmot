@@ -257,7 +257,7 @@ func main() {
 		if vecDataDir == "" {
 			vecDataDir = filepath.Join(cfg.Config.DataDir, "vector_indexes")
 		}
-		vecEngine, err := newVecIndexAdapter(vecDataDir, log.Logger)
+		vecEngine, err := newVecIndexAdapter(vecDataDir, cfg.Config.VectorIndex.PebbleCacheMB, log.Logger)
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to initialize vector index engine")
 			return

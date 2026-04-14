@@ -33,7 +33,7 @@ type e2eVecIndexAdapter struct {
 }
 
 func newE2EVecIndexAdapter(rootDir string) (*e2eVecEngineAdapter, error) {
-	engine, err := vecindex.NewEngine(rootDir, zerolog.Nop())
+	engine, err := vecindex.NewEngine(rootDir, 64, zerolog.Nop())
 	if err != nil {
 		return nil, err
 	}

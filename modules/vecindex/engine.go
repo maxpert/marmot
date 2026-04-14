@@ -2,7 +2,6 @@ package vecindex
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -10,23 +9,28 @@ import (
 	"sync"
 
 	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/bloom"
 	"github.com/maxpert/marmot/modules/vecindex/pkg/store"
 	"github.com/rs/zerolog"
+	"github.com/vmihailenco/msgpack/v5"
 )
 
 // Engine opens and manages a collection of IVF vector indexes backed by Pebble.
 type Engine struct {
 	rootDir string
+	cacheMB int
 	logger  zerolog.Logger
 	indexes sync.Map // map[string]*Index
+	specs   sync.Map // map[string]IVFSpec
 }
 
 // NewEngine creates an Engine that stores index data under rootDir.
-func NewEngine(rootDir string, logger zerolog.Logger) (*Engine, error) {
+// cacheMB controls the Pebble block cache size; <= 0 uses a 64 MB default.
+func NewEngine(rootDir string, cacheMB int, logger zerolog.Logger) (*Engine, error) {
 	if err := os.MkdirAll(rootDir, 0o755); err != nil {
 		return nil, fmt.Errorf("vecindex: create engine root %s: %w", rootDir, err)
 	}
-	return &Engine{rootDir: rootDir, logger: logger}, nil
+	return &Engine{rootDir: rootDir, cacheMB: cacheMB, logger: logger}, nil
 }
 
 // CreateIndex builds a new IVF index from bulk entries and persists it.
@@ -48,7 +52,7 @@ func (e *Engine) CreateIndex(ctx context.Context, spec IVFSpec, bulk []BulkEntry
 		return nil, fmt.Errorf("vecindex: create index dir: %w", err)
 	}
 
-	st, err := store.New(dir, pebbleOptions())
+	st, err := store.New(dir, e.pebbleOptions())
 	if err != nil {
 		_ = os.RemoveAll(dir)
 		return nil, fmt.Errorf("vecindex: open store for %s: %w", spec.ID, err)
@@ -70,6 +74,7 @@ func (e *Engine) CreateIndex(ctx context.Context, spec IVFSpec, bulk []BulkEntry
 		}
 	}
 
+	e.specs.Store(spec.ID, spec)
 	e.indexes.Store(spec.ID, idx)
 	return idx, nil
 }
@@ -85,7 +90,7 @@ func (e *Engine) OpenIndex(ctx context.Context, id string) (*Index, error) {
 		return nil, fmt.Errorf("vecindex: index %q not found", id)
 	}
 
-	st, err := store.New(dir, pebbleOptions())
+	st, err := store.New(dir, e.pebbleOptions())
 	if err != nil {
 		return nil, fmt.Errorf("vecindex: open store for %s: %w", id, err)
 	}
@@ -108,7 +113,17 @@ func (e *Engine) OpenIndex(ctx context.Context, id string) (*Index, error) {
 		_ = st.Close()
 		return actual.(*Index), nil
 	}
+	e.specs.Store(id, spec)
 	return idx, nil
+}
+
+// SpecOf returns the IVFSpec for an open index, or false if not loaded.
+func (e *Engine) SpecOf(id string) (IVFSpec, bool) {
+	v, ok := e.specs.Load(id)
+	if !ok {
+		return IVFSpec{}, false
+	}
+	return v.(IVFSpec), true
 }
 
 // DropIndex permanently removes an index and its backing data.
@@ -116,6 +131,7 @@ func (e *Engine) DropIndex(ctx context.Context, id string) error {
 	if v, loaded := e.indexes.LoadAndDelete(id); loaded {
 		_ = v.(*Index).Close()
 	}
+	e.specs.Delete(id)
 	dir := e.indexDir(id)
 	if err := os.RemoveAll(dir); err != nil {
 		return fmt.Errorf("vecindex: drop index %s: %w", id, err)
@@ -159,9 +175,9 @@ func validateSpec(spec IVFSpec) error {
 	return nil
 }
 
-// persistSpec serialises the IVFSpec to JSON and writes it under the 0x07 key.
+// persistSpec serialises the IVFSpec via msgpack and writes it under the 0x07 key.
 func persistSpec(st *store.Store, spec IVFSpec) error {
-	data, err := json.Marshal(spec)
+	data, err := msgpack.Marshal(spec)
 	if err != nil {
 		return err
 	}
@@ -179,13 +195,24 @@ func loadSpec(st *store.Store) (IVFSpec, error) {
 	}
 	defer closer.Close()
 	var spec IVFSpec
-	if err := json.Unmarshal(val, &spec); err != nil {
+	if err := msgpack.Unmarshal(val, &spec); err != nil {
 		return IVFSpec{}, fmt.Errorf("vecindex: decode spec: %w", err)
 	}
 	return spec, nil
 }
 
-// pebbleOptions returns a minimal pebble.Options for index stores.
-func pebbleOptions() *pebble.Options {
-	return &pebble.Options{}
+// pebbleOptions returns pebble.Options configured with the engine's cache size and a bloom filter.
+// cacheMB <= 0 defaults to 64 MB.
+func (e *Engine) pebbleOptions() *pebble.Options {
+	mb := e.cacheMB
+	if mb <= 0 {
+		mb = 64
+	}
+	cache := pebble.NewCache(int64(mb) << 20)
+	return &pebble.Options{
+		Cache: cache,
+		Levels: []pebble.LevelOptions{
+			{FilterPolicy: bloom.FilterPolicy(BloomBitsPerKey)},
+		},
+	}
 }

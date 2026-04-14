@@ -14,7 +14,7 @@ func TestNewEngine_CreatesRootDir(t *testing.T) {
 	dir := t.TempDir()
 	subDir := filepath.Join(dir, "engine-root")
 
-	e, err := NewEngine(subDir, newTestLogger())
+	e, err := NewEngine(subDir, 64, newTestLogger())
 	require.NoError(t, err)
 	require.NoError(t, e.Close())
 
@@ -63,7 +63,7 @@ func TestOpenIndex_AfterClose(t *testing.T) {
 	dir := t.TempDir()
 	ctx := context.Background()
 
-	e1, err := NewEngine(dir, newTestLogger())
+	e1, err := NewEngine(dir, 64, newTestLogger())
 	require.NoError(t, err)
 
 	spec := DefaultSpec("reopen-idx", 8, MetricL2)
@@ -71,7 +71,7 @@ func TestOpenIndex_AfterClose(t *testing.T) {
 	require.NoError(t, createErr)
 	require.NoError(t, e1.Close())
 
-	e2, err := NewEngine(dir, newTestLogger())
+	e2, err := NewEngine(dir, 64, newTestLogger())
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = e2.Close() })
 
@@ -100,7 +100,7 @@ func TestEngineClose_ClosesAllIndexes(t *testing.T) {
 	dir := t.TempDir()
 	ctx := context.Background()
 
-	e1, err := NewEngine(dir, newTestLogger())
+	e1, err := NewEngine(dir, 64, newTestLogger())
 	require.NoError(t, err)
 
 	for _, id := range []string{"a", "b", "c"} {
@@ -111,7 +111,7 @@ func TestEngineClose_ClosesAllIndexes(t *testing.T) {
 	require.NoError(t, e1.Close())
 
 	// Engine must be re-openable after clean close.
-	e2, err2 := NewEngine(dir, newTestLogger())
+	e2, err2 := NewEngine(dir, 64, newTestLogger())
 	require.NoError(t, err2)
 	require.NoError(t, e2.Close())
 }

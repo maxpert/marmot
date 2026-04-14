@@ -207,7 +207,7 @@ type ExtensionConfiguration struct {
 type VectorIndexConfiguration struct {
 	Enabled              bool   `toml:"enabled"`
 	DataDir              string `toml:"data_dir"`                   // Default: {data_dir}/vector_indexes
-	PebbleCacheMB        int    `toml:"pebble_cache_mb"`            // Block cache for hdindex Pebble (default: 256)
+	PebbleCacheMB        int    `toml:"pebble_cache_mb"`            // Block cache size in MB for vector index Pebble store (default: 256)
 	ReconcileIntervalSec int    `toml:"reconcile_interval_seconds"` // Background watermark reconciliation (default: 60)
 	MinVectorsForCreate  int    `toml:"min_vectors_for_create"`     // Minimum rows before CREATE INDEX (default: 100)
 }
