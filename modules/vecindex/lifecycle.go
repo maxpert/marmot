@@ -33,6 +33,12 @@ func Graduate(ctx context.Context, idx *Index, targetNlist int) error {
 			flatScanThreshold, count,
 		)
 	}
+	if minRequired := minVectorsForNlist(targetNlist); int(count) < minRequired {
+		return fmt.Errorf(
+			"vecindex: need at least %d vectors for nlist=%d, have %d",
+			minRequired, targetNlist, count,
+		)
+	}
 	if int(count) < targetNlist {
 		return fmt.Errorf(
 			"vecindex: need at least %d vectors for nlist=%d (k-means requirement), have %d",
@@ -45,9 +51,8 @@ func Graduate(ctx context.Context, idx *Index, targetNlist int) error {
 
 // Retrain rebuilds all centroids for idx using the given seed and sets the epoch.
 func Retrain(ctx context.Context, idx *Index, seed uint64, epoch uint64) error {
-	idx.mu.RLock()
+	// Read current nlist without holding the lock — retrainWithNlist acquires write lock.
 	cs := idx.centroids.Load()
-	idx.mu.RUnlock()
 
 	nlist := idx.spec.Nlist
 	if cs != nil {
@@ -65,10 +70,15 @@ func Retrain(ctx context.Context, idx *Index, seed uint64, epoch uint64) error {
 const kmeansTrainSampleFactor = 2
 
 // retrainWithNlist reads all vectors, runs k-means, and atomically swaps the centroid set.
+// Holds idx.mu write lock for the entire operation so that concurrent ListActiveClusters
+// callers never observe a mix of old and new cluster states during the centroid swap.
 func retrainWithNlist(ctx context.Context, idx *Index, nlist int, seed uint64, epoch uint64) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
+
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
 
 	// Collect all vectors from the flat cluster (0) or all active clusters.
 	vecs, docIDs, oldClusterIDs, err := gatherAllVectors(idx)
@@ -181,14 +191,12 @@ func retrainWithNlist(ctx context.Context, idx *Index, nlist int, seed uint64, e
 
 	newState := &centroidState{cs: cs, clusterIDs: newClusterIDs}
 
-	// Swap under write lock.
-	idx.mu.Lock()
+	// Swap centroid state (already holding write lock from function entry).
 	oldState := idx.centroids.Load()
 	idx.centroids.Store(newState)
 	idx.spec.Nlist = nlist
 	idx.spec.Epoch = epoch
 	idx.spec.Seed = seed
-	idx.mu.Unlock()
 
 	// Persist updated spec.
 	if err := persistSpec(idx.st, idx.spec); err != nil {
@@ -309,8 +317,10 @@ func splitCluster(idx *Index, clusterID uint32, cs *centroidState) error {
 		vecs[i] = e.Vector
 	}
 
-	// k=2 split.
-	newCentroids, err := kmeans.KMeansPlusPlus(vecs, 2, idx.spec.Seed, kmeansMaxIter)
+	// k=2 split. Use a cluster-specific seed to avoid same-seed bias across splits.
+	// Golden-ratio mixing: deterministic given (clusterID, spec.Seed) so all nodes agree.
+	clusterSeed := idx.spec.Seed ^ (uint64(clusterID) * 0x9E3779B97F4A7C15)
+	newCentroids, err := kmeans.KMeansPlusPlus(vecs, 2, clusterSeed, kmeansMaxIter)
 	if err != nil {
 		return fmt.Errorf("vecindex: split k-means: %w", err)
 	}
@@ -335,6 +345,8 @@ func splitCluster(idx *Index, clusterID uint32, cs *centroidState) error {
 	meta1 := store.ClusterMeta{State: store.ClusterStateActive, Epoch: idx.spec.Epoch}
 	meta2 := store.ClusterMeta{State: store.ClusterStateActive, Epoch: idx.spec.Epoch}
 
+	// Single batch for all entry moves — atomic split.
+	b := idx.st.NewBatch()
 	for _, e := range entries {
 		c, _, _ := kmeans.Assign(e.Vector, newCentroids, idx.spec.Metric)
 		var targetCID uint32
@@ -345,14 +357,26 @@ func splitCluster(idx *Index, clusterID uint32, cs *centroidState) error {
 			targetCID = newCID2
 			meta2.Size++
 		}
-		b := idx.st.NewBatch()
-		_ = b.BatchPutPosting(targetCID, e.DocID, e.Vector)
-		_ = b.BatchPutReverseMap(e.DocID, targetCID)
-		_ = b.Commit()
+		if err := b.BatchPutPosting(targetCID, e.DocID, e.Vector); err != nil {
+			_ = b.Close()
+			return fmt.Errorf("vecindex: split put posting: %w", err)
+		}
+		if err := b.BatchPutReverseMap(e.DocID, targetCID); err != nil {
+			_ = b.Close()
+			return fmt.Errorf("vecindex: split put reverse map: %w", err)
+		}
 	}
-
-	_ = idx.st.PutClusterMeta(newCID1, meta1)
-	_ = idx.st.PutClusterMeta(newCID2, meta2)
+	if err := b.BatchPutClusterMeta(newCID1, meta1); err != nil {
+		_ = b.Close()
+		return fmt.Errorf("vecindex: split put meta1: %w", err)
+	}
+	if err := b.BatchPutClusterMeta(newCID2, meta2); err != nil {
+		_ = b.Close()
+		return fmt.Errorf("vecindex: split put meta2: %w", err)
+	}
+	if err := b.Commit(); err != nil {
+		return fmt.Errorf("vecindex: split batch commit: %w", err)
+	}
 
 	// Find the centroid index for clusterID in the current state.
 	centIdx := -1
@@ -482,14 +506,29 @@ func CheckMerge(idx *Index, centIdx uint32) error {
 		return err
 	}
 
+	// Single batch for all entry moves — atomic merge.
+	b := idx.st.NewBatch()
 	for _, e := range entries {
-		b := idx.st.NewBatch()
-		_ = b.BatchDeletePosting(clusterID, e.DocID)
-		_ = b.BatchPutPosting(targetCID, e.DocID, e.Vector)
-		_ = b.BatchPutReverseMap(e.DocID, targetCID)
+		if err := b.BatchDeletePosting(clusterID, e.DocID); err != nil {
+			_ = b.Close()
+			return fmt.Errorf("vecindex: merge delete posting: %w", err)
+		}
+		if err := b.BatchPutPosting(targetCID, e.DocID, e.Vector); err != nil {
+			_ = b.Close()
+			return fmt.Errorf("vecindex: merge put posting: %w", err)
+		}
+		if err := b.BatchPutReverseMap(e.DocID, targetCID); err != nil {
+			_ = b.Close()
+			return fmt.Errorf("vecindex: merge put reverse map: %w", err)
+		}
 		targetMeta.Size++
-		_ = b.BatchPutClusterMeta(targetCID, targetMeta)
-		_ = b.Commit()
+	}
+	if err := b.BatchPutClusterMeta(targetCID, targetMeta); err != nil {
+		_ = b.Close()
+		return fmt.Errorf("vecindex: merge put cluster meta: %w", err)
+	}
+	if err := b.Commit(); err != nil {
+		return fmt.Errorf("vecindex: merge batch commit: %w", err)
 	}
 
 	// Retire source cluster.
@@ -523,6 +562,7 @@ func CheckMerge(idx *Index, centIdx uint32) error {
 }
 
 // meanClusterSize returns the mean size across all active clusters.
+// Must be called with idx.mu held (read or write).
 func meanClusterSize(idx *Index) int {
 	cs := idx.centroids.Load()
 	if cs == nil {
