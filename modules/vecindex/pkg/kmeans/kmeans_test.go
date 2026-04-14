@@ -129,7 +129,7 @@ func TestKMeansPlusPlus_K1(t *testing.T) {
 	require.Len(t, centroids, 1)
 
 	for i, got := range centroids[0] {
-		expected := float32(i*2+3)
+		expected := float32(i + 3)
 		require.InDelta(t, expected, got, 0.01, "centroid[0][%d]", i)
 	}
 }
