@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"runtime"
 	"sync"
 	"sync/atomic"
 
@@ -309,33 +310,71 @@ func (idx *Index) ivfSearch(ctx context.Context, req SearchRequest, cs *centroid
 	idx.lastNprobe.Store(uint64(len(ids)))
 
 	k := req.K
-	seen := make(map[uint64]struct{})
-	h := &hitHeap{}
-	heap.Init(h)
 
-	for _, centIdx := range ids {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		// Map centroid index → store cluster ID.
+	// parallelScan: each goroutine scans one cluster and builds a local top-K heap.
+	// Goroutine count is capped at min(nprobe, GOMAXPROCS×2) to avoid spawning more
+	// goroutines than SSD I/O bandwidth can saturate.
+	concurrency := runtime.GOMAXPROCS(0) * 2
+	if concurrency > len(ids) {
+		concurrency = len(ids)
+	}
+	sem := make(chan struct{}, concurrency)
+
+	type clusterResult struct {
+		hits []SearchHit
+		err  error
+	}
+	results := make([]clusterResult, len(ids))
+
+	var wg sync.WaitGroup
+	for i, centIdx := range ids {
 		if int(centIdx) >= len(cs.clusterIDs) {
 			continue
 		}
 		clusterID := cs.clusterIDs[centIdx]
-		scanErr := idx.st.ScanClusterFunc(clusterID, func(docID uint64, vecBytes []byte) error {
-			if _, dup := seen[docID]; dup {
-				return nil
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(slot int, cid uint32) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			if ctx.Err() != nil {
+				results[slot].err = ctx.Err()
+				return
 			}
-			seen[docID] = struct{}{}
-			d := metric.DistanceFromBytes(idx.spec.Metric, req.Vector, vecBytes)
-			heap.Push(h, SearchHit{DocID: docID, Distance: d})
+			lh := &hitHeap{}
+			heap.Init(lh)
+			scanErr := idx.st.ScanClusterFunc(cid, func(docID uint64, vecBytes []byte) error {
+				d := metric.DistanceFromBytes(idx.spec.Metric, req.Vector, vecBytes)
+				heap.Push(lh, SearchHit{DocID: docID, Distance: d})
+				if lh.Len() > k {
+					heap.Pop(lh)
+				}
+				return nil
+			})
+			results[slot].err = scanErr
+			results[slot].hits = sortedHits(lh, k)
+		}(i, clusterID)
+	}
+	wg.Wait()
+
+	// Merge per-cluster heaps, deduplicating by docID.
+	seen := make(map[uint64]struct{})
+	h := &hitHeap{}
+	heap.Init(h)
+	for _, r := range results {
+		if r.err != nil {
+			return nil, r.err
+		}
+		for _, hit := range r.hits {
+			if _, dup := seen[hit.DocID]; dup {
+				continue
+			}
+			seen[hit.DocID] = struct{}{}
+			heap.Push(h, hit)
 			if h.Len() > k {
 				heap.Pop(h)
 			}
-			return nil
-		})
-		if scanErr != nil {
-			return nil, scanErr
 		}
 	}
 
