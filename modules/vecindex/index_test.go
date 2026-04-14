@@ -154,6 +154,43 @@ func TestSearch_AdaptiveMultiProbe(t *testing.T) {
 		"adaptive multi-probe must bump nprobe for at least one boundary query")
 }
 
+// TestAdaptiveMultiProbe_NoRunawayCascade verifies that the one-shot adaptive bump
+// keeps effective nprobe within nprobe+max(2,nprobe/4) even when the boundary
+// condition fires on every query. nprobe=8 must stay <= 10.
+func TestAdaptiveMultiProbe_NoRunawayCascade(t *testing.T) {
+	t.Parallel()
+	const (
+		n      = 8_000
+		dim    = 32
+		k      = 10
+		nprobe = 8
+	)
+	e := newTempEngine(t)
+	spec := IVFSpec{ID: "cascade-guard", Dim: dim, Metric: MetricL2, Nlist: 64, Nprobe: nprobe}
+	vecs := makeRandomVectors(n, dim, 33)
+	bulk := make([]BulkEntry, n)
+	for i, v := range vecs {
+		bulk[i] = BulkEntry{ExternalID: []byte(fmt.Sprintf("v%d", i)), Vector: v}
+	}
+	ctx := context.Background()
+	idx, err := e.CreateIndex(ctx, spec, bulk)
+	require.NoError(t, err)
+	require.NoError(t, Graduate(ctx, idx, 64))
+
+	// maxAdaptive = nprobe + max(2, nprobe/4) = 8 + 2 = 10
+	maxAllowed := nprobe + max(2, nprobe/4)
+
+	queries := makeRandomVectors(100, dim, 44)
+	for _, q := range queries {
+		hits, searchErr := idx.Search(ctx, SearchRequest{Vector: q, K: k})
+		require.NoError(t, searchErr)
+		_ = hits
+		got := int(idx.Stats().LastQueryNprobe)
+		require.LessOrEqual(t, got, maxAllowed,
+			"adaptive bump must not exceed nprobe+max(2,nprobe/4)=%d, got %d", maxAllowed, got)
+	}
+}
+
 func TestSearch_EmptyIndex_ReturnsEmpty(t *testing.T) {
 	t.Parallel()
 	e := newTempEngine(t)

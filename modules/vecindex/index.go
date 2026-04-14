@@ -273,31 +273,32 @@ func (idx *Index) ivfSearch(ctx context.Context, req SearchRequest, cs *centroid
 		return nil, fmt.Errorf("index: assign centroids: %w", err)
 	}
 
-	// Adaptive multi-probe: if the 2nd nearest centroid is within 10% of the nearest,
-	// the query sits near a Voronoi boundary. Cascade 50% bumps until the boundary
-	// condition no longer holds or nprobe reaches nlist/2.
-	maxProbe := cs.cs.Len() / 2
-	if maxProbe < nprobe {
-		maxProbe = nprobe
-	}
-	for len(dists) >= 2 && dists[0] > 0 && dists[1]/dists[0] < 1.1 && nprobe < maxProbe {
-		bump := nprobe + nprobe/2 + 1 // +1 ensures progress when nprobe is small
-		if bump > maxProbe {
-			bump = maxProbe
+	// Adaptive multi-probe: one-shot conservative bump when the query sits near a
+	// Voronoi boundary (2nd centroid within 5% of nearest). The cap is intentionally
+	// tight — nprobe+max(2,nprobe/4) — to prevent cascade blowup in high-dimensional
+	// spaces where distance concentration makes the 1.1 threshold fire on nearly every
+	// query. Users who need higher recall should raise Nprobe explicitly.
+	if len(dists) >= 2 && dists[0] > 0 && dists[1]/dists[0] < 1.05 {
+		extra := nprobe / 4
+		if extra < 2 {
+			extra = 2
 		}
-		if bump <= nprobe {
-			break
+		bump := nprobe + extra
+		if bump > cs.cs.Len() {
+			bump = cs.cs.Len()
 		}
-		fetchBump := bump + 1
-		if fetchBump > cs.cs.Len() {
-			fetchBump = cs.cs.Len()
+		if bump > nprobe {
+			fetchBump := bump + 1
+			if fetchBump > cs.cs.Len() {
+				fetchBump = cs.cs.Len()
+			}
+			newIDs, newDists, assignErr := kmeans.AssignTopN(req.Vector, centVecs, fetchBump, idx.spec.Metric)
+			if assignErr != nil {
+				return nil, assignErr
+			}
+			ids, dists = newIDs, newDists
+			nprobe = bump
 		}
-		newIDs, newDists, assignErr := kmeans.AssignTopN(req.Vector, centVecs, fetchBump, idx.spec.Metric)
-		if assignErr != nil {
-			return nil, assignErr
-		}
-		ids, dists = newIDs, newDists
-		nprobe = bump
 	}
 
 	if len(ids) > nprobe {
