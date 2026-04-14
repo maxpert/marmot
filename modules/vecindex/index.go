@@ -27,6 +27,7 @@ type Index struct {
 	lastNprobe    atomic.Uint64
 	closed        atomic.Bool
 	compactNotify chan uint32 // single-slot channel; background worker drains
+	compactDone   chan struct{}
 }
 
 // centroidState bundles a CentroidSet with the corresponding store cluster IDs.
@@ -43,6 +44,7 @@ func newIndex(spec IVFSpec, st *store.Store, logger zerolog.Logger) *Index {
 		st:            st,
 		logger:        logger,
 		compactNotify: make(chan uint32, 1),
+		compactDone:   make(chan struct{}),
 	}
 	go idx.compactWorker()
 	return idx
@@ -51,6 +53,7 @@ func newIndex(spec IVFSpec, st *store.Store, logger zerolog.Logger) *Index {
 // compactWorker drains compactNotify and runs Pebble compaction asynchronously.
 // Exits when the channel is closed (on Index.Close).
 func (idx *Index) compactWorker() {
+	defer close(idx.compactDone)
 	for clusterID := range idx.compactNotify {
 		if idx.closed.Load() {
 			return
@@ -560,6 +563,7 @@ func (idx *Index) Stats() Stats {
 func (idx *Index) Close() error {
 	idx.closed.Store(true)
 	close(idx.compactNotify)
+	<-idx.compactDone
 	return idx.st.Close()
 }
 

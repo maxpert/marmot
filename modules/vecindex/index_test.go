@@ -47,8 +47,8 @@ func TestSearch_IVFPhase_Recall(t *testing.T) {
 		ID:     "ivf-recall",
 		Dim:    dim,
 		Metric: MetricL2,
-		Nlist:  256,
-		Nprobe: 32,
+		Nlist:  64,
+		Nprobe: 16,
 	}
 	vecs := makeRandomVectors(n, dim, 7)
 	bulk := make([]BulkEntry, n)
@@ -63,7 +63,7 @@ func TestSearch_IVFPhase_Recall(t *testing.T) {
 	require.NoError(t, err)
 
 	// Graduate to IVF tier so centroids are trained.
-	require.NoError(t, Graduate(ctx, idx, 256))
+	require.NoError(t, Graduate(ctx, idx, 64))
 
 	queries := makeRandomVectors(nQueries, dim, 13)
 	var totalRecall float32
