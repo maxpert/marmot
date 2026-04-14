@@ -1,6 +1,7 @@
 package hdindex
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -8,9 +9,11 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 
 	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/bloom"
 	vmsgpack "github.com/vmihailenco/msgpack/v5"
 
 	"github.com/maxpert/marmot/modules/hdindex/pkg/hilbert"
@@ -232,12 +235,19 @@ func buildIndex(ctx context.Context, db *pebble.DB, spec HDIndexSpec, vectors []
 		return nil, fmt.Errorf("hdindex: persist metadata: %w", err)
 	}
 
-	// 5. Set up stores.
+	// 5. Compute Hilbert-order sort index. Assigning doc_ids in partition-0
+	// Hilbert key order makes v/{doc_id} keys spatially clustered in Pebble,
+	// so candidate vector reads during search hit sequential blocks instead
+	// of random blocks (same principle as MicroNN/DiskANN co-location).
+	sortOrder := hilbertSortOrder(spec, transformedVecs)
+
+	// 6. Set up stores.
 	rdbStore := rdb.Open(db, spec.RefCount)
 	vsStore := vecstore.Open(db, spec.Dim)
 
-	// 6. Index all vectors.
-	for i, ve := range vectors {
+	// 7. Index all vectors in Hilbert-sorted order.
+	for iter, i := range sortOrder {
+		ve := vectors[i]
 		if err := ctx.Err(); err != nil {
 			batch.Close()
 			return nil, err
@@ -275,10 +285,10 @@ func buildIndex(ctx context.Context, db *pebble.DB, spec HDIndexSpec, vectors []
 
 		// Flush batch periodically to avoid huge batches.
 		// Use NoSync for intermediate flushes; only the final commit syncs.
-		if (i+1)%1000 == 0 {
+		if (iter+1)%1000 == 0 {
 			if err := batch.Commit(pebble.NoSync); err != nil {
 				batch.Close()
-				return nil, fmt.Errorf("hdindex: commit batch at %d: %w", i, err)
+				return nil, fmt.Errorf("hdindex: commit batch at %d: %w", iter, err)
 			}
 			batch = db.NewBatch()
 		}
@@ -414,10 +424,25 @@ func loadRefs(db *pebble.DB, m int) (*refobj.ReferenceSet, error) {
 	return refs, nil
 }
 
-// openPebble opens a Pebble DB at the given path with sensible options.
+// openPebble opens a Pebble DB at the given path with options tuned for
+// vector index read-heavy workloads.
 func openPebble(dir string, cacheMB int) (*pebble.DB, error) {
+	// Bloom filters help point lookups (GetVector, GetExternalID) at L0-L2.
+	// L3-L6 are dominated by ScanNearest range scans which skip bloom filters
+	// entirely, so adding them there wastes memory without benefit.
+	filterPolicy := bloom.FilterPolicy(10)
+
 	opts := &pebble.Options{
 		MaxOpenFiles: 256,
+		Levels: []pebble.LevelOptions{
+			{FilterPolicy: filterPolicy, BlockSize: 8 * 1024},  // L0
+			{FilterPolicy: filterPolicy, BlockSize: 16 * 1024}, // L1
+			{FilterPolicy: filterPolicy, BlockSize: 16 * 1024}, // L2
+			{BlockSize: 32 * 1024}, // L3: range-scan dominated, no bloom filter
+			{BlockSize: 32 * 1024}, // L4
+			{BlockSize: 32 * 1024}, // L5
+			{BlockSize: 32 * 1024}, // L6
+		},
 	}
 	if cacheMB > 0 {
 		cache := pebble.NewCache(int64(cacheMB) << 20)
@@ -427,18 +452,54 @@ func openPebble(dir string, cacheMB int) (*pebble.DB, error) {
 	return pebble.Open(dir, opts)
 }
 
-// transformVectorWithSpec applies the metric transformation defined by spec.
+// transformVectorWithSpec applies the metric transformation for DATA vectors.
+// For Dot: appends sqrt(M²-||v||²) so all data vectors have norm M.
+// The output is zero-padded to spec.InternalDim if needed.
 func transformVectorWithSpec(spec HDIndexSpec, v []float32) ([]float32, error) {
+	var tv []float32
+	var err error
 	switch spec.Metric {
 	case MetricCosine:
-		return metric.NormalizeCopy(v), nil
+		tv = metric.NormalizeCopy(v)
 	case MetricDot:
-		return metric.AugmentForMIPS(v, spec.NormMax)
+		tv, err = metric.AugmentForMIPS(v, spec.NormMax)
+		if err != nil {
+			return nil, err
+		}
 	default:
-		out := make([]float32, len(v))
-		copy(out, v)
-		return out, nil
+		tv = make([]float32, len(v))
+		copy(tv, v)
 	}
+	// Zero-pad to InternalDim if needed (e.g., 769 → 784 for dot product).
+	if len(tv) < spec.InternalDim {
+		padded := make([]float32, spec.InternalDim)
+		copy(padded, tv)
+		return padded, nil
+	}
+	return tv, nil
+}
+
+// transformQueryVectorWithSpec applies the metric transformation for QUERY vectors.
+// For Dot: appends 0 (not sqrt(M²-||q||²)) so that minimizing L2(q',x') maximizes dot(q,x).
+// The output is zero-padded to spec.InternalDim if needed.
+func transformQueryVectorWithSpec(spec HDIndexSpec, v []float32) ([]float32, error) {
+	var tv []float32
+	switch spec.Metric {
+	case MetricCosine:
+		tv = metric.NormalizeCopy(v)
+	case MetricDot:
+		tv = metric.AugmentQueryForMIPS(v)
+	default:
+		tv = make([]float32, len(v))
+		copy(tv, v)
+	}
+	// Zero-pad to InternalDim if needed.
+	if len(tv) < spec.InternalDim {
+		padded := make([]float32, spec.InternalDim)
+		copy(padded, tv)
+		return padded, nil
+	}
+	return tv, nil
 }
 
 // computeHilbertKeysFromSpec computes tau Hilbert keys from a transformed vector.
@@ -455,6 +516,35 @@ func computeHilbertKeysFromSpec(spec HDIndexSpec, transformed []float32) [][]byt
 		keys[i] = hilbert.Encode(coords, spec.Omega)
 	}
 	return keys
+}
+
+// hilbertSortOrder computes partition-0 Hilbert keys for all transformed
+// vectors and returns an index permutation that sorts them by Hilbert key.
+// This makes doc_id assignment spatially ordered: nearby vectors in embedding
+// space get nearby doc_ids, so Pebble co-locates them on disk.
+func hilbertSortOrder(spec HDIndexSpec, transformedVecs [][]float32) []int {
+	n := len(transformedVecs)
+	etaDims := spec.Eta
+
+	// Compute partition-0 Hilbert key for each vector.
+	keys := make([][]byte, n)
+	for i, tv := range transformedVecs {
+		partSlice := tv[:etaDims]
+		domainMin := spec.DomainMin[:etaDims]
+		domainMax := spec.DomainMax[:etaDims]
+		coords := metric.QuantizeDims(partSlice, domainMin, domainMax, spec.Omega)
+		keys[i] = hilbert.Encode(coords, spec.Omega)
+	}
+
+	// Build sort index and sort by Hilbert key (lexicographic).
+	order := make([]int, n)
+	for i := range n {
+		order[i] = i
+	}
+	sort.Slice(order, func(a, b int) bool {
+		return bytes.Compare(keys[order[a]], keys[order[b]]) < 0
+	})
+	return order
 }
 
 // encodeFloat32Slice encodes []float32 as little-endian bytes.

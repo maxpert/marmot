@@ -57,6 +57,9 @@ func (s *Store) Delete(batch *pebble.Batch, partitionID int, hilbertKey []byte, 
 
 // ScanNearest performs a bidirectional scan from the query's Hilbert key,
 // collecting up to alpha entries with the closest Hilbert keys.
+// Reference distances are decoded into a single pre-allocated arena to
+// avoid per-entry heap allocations. Each Entry.RefDists is a subslice of
+// the arena and must not be retained beyond the caller's scope.
 func (s *Store) ScanNearest(partitionID int, queryHilbertKey []byte, alpha int) ([]Entry, error) {
 	if partitionID < 0 || partitionID >= maxPartitions {
 		return nil, fmt.Errorf("rdb: partitionID %d out of range [0, %d)", partitionID, maxPartitions)
@@ -76,20 +79,22 @@ func (s *Store) ScanNearest(partitionID int, queryHilbertKey []byte, alpha int) 
 	}
 	defer fwdIter.Close()
 
-	bwdIter, err := s.db.NewIter(iterOpts)
+	bwdIter, err := fwdIter.Clone(pebble.CloneOptions{})
 	if err != nil {
-		return nil, fmt.Errorf("rdb: new backward iter: %w", err)
+		return nil, fmt.Errorf("rdb: clone backward iter: %w", err)
 	}
 	defer bwdIter.Close()
 
 	fwdValid := fwdIter.SeekGE(seekKey)
 	bwdValid := bwdIter.SeekLT(seekKey)
 
-	entries := make([]Entry, 0, min(alpha, 64))
+	// Pre-allocate arena for all ref distances: one contiguous buffer sliced per entry.
+	refArena := make([]float32, alpha*s.refCount)
+	entries := make([]Entry, 0, alpha)
 
 	for len(entries) < alpha && (fwdValid || bwdValid) {
 		if fwdValid {
-			e, err := s.readEntry(fwdIter)
+			e, err := s.readEntryArena(fwdIter, refArena, len(entries))
 			if err != nil {
 				return nil, err
 			}
@@ -101,7 +106,7 @@ func (s *Store) ScanNearest(partitionID int, queryHilbertKey []byte, alpha int) 
 		}
 
 		if bwdValid {
-			e, err := s.readEntry(bwdIter)
+			e, err := s.readEntryArena(bwdIter, refArena, len(entries))
 			if err != nil {
 				return nil, err
 			}
@@ -120,15 +125,23 @@ func (s *Store) ScanNearest(partitionID int, queryHilbertKey []byte, alpha int) 
 	return entries, nil
 }
 
-func (s *Store) readEntry(iter *pebble.Iterator) (Entry, error) {
+// readEntryArena decodes an RDB entry, writing ref distances into the
+// pre-allocated arena at the given entry index.
+func (s *Store) readEntryArena(iter *pebble.Iterator, arena []float32, entryIdx int) (Entry, error) {
 	key := iter.Key()
 	val, err := iter.ValueAndErr()
 	if err != nil {
 		return Entry{}, fmt.Errorf("rdb: read value: %w", err)
 	}
+	want := s.refCount * 4
+	if len(val) < want {
+		return Entry{}, fmt.Errorf("rdb: corrupt entry: got %d bytes, want %d", len(val), want)
+	}
 	docID := extractDocID(key)
-	refDists := decodeRefDists(val, s.refCount)
-	return Entry{DocID: docID, RefDists: refDists}, nil
+	offset := entryIdx * s.refCount
+	dst := arena[offset : offset+s.refCount]
+	decodeRefDistsInto(val, dst)
+	return Entry{DocID: docID, RefDists: dst}, nil
 }
 
 // rdbKey builds the Pebble key for an RDB entry.
@@ -179,17 +192,13 @@ func encodeRefDists(dists []float32) []byte {
 	return out
 }
 
-// decodeRefDists decodes reference distances from little-endian float32 bytes.
-func decodeRefDists(data []byte, m int) []float32 {
-	count := len(data) / 4
-	if m > 0 && count > m {
-		count = m
+// decodeRefDistsInto decodes reference distances from little-endian float32
+// bytes into the pre-allocated dst buffer. len(dst) determines how many
+// distances are decoded.
+func decodeRefDistsInto(data []byte, dst []float32) {
+	for i := range dst {
+		dst[i] = math.Float32frombits(binary.LittleEndian.Uint32(data[i*4:]))
 	}
-	dists := make([]float32, count)
-	for i := range count {
-		dists[i] = math.Float32frombits(binary.LittleEndian.Uint32(data[i*4:]))
-	}
-	return dists
 }
 
 // extractDocID extracts the doc_id from the last 8 bytes of an RDB key.

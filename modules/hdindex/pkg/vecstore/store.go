@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+	"slices"
 	"sync"
 	"sync/atomic"
 
@@ -79,20 +80,57 @@ func (s *Store) GetVector(docID uint64) ([]float32, error) {
 	return decodeVector(val, s.dim), nil
 }
 
-// GetVectors retrieves multiple vectors by doc_id. Returns a map of docID -> vector.
+// GetVectors retrieves multiple vectors by doc_id using a single Pebble
+// iterator with sorted seeks. Returns a map of docID -> vector.
 // Missing doc_ids are silently skipped.
 func (s *Store) GetVectors(docIDs []uint64) (map[uint64][]float32, error) {
-	result := make(map[uint64][]float32, len(docIDs))
-	for _, id := range docIDs {
-		vec, err := s.GetVector(id)
-		if err == pebble.ErrNotFound {
+	if len(docIDs) == 0 {
+		return nil, nil
+	}
+
+	// Sort and deduplicate for sequential iterator access.
+	sorted := make([]uint64, len(docIDs))
+	copy(sorted, docIDs)
+	slices.Sort(sorted)
+	sorted = slices.Compact(sorted)
+
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: []byte(prefixVector),
+		UpperBound: []byte(prefixVector[:len(prefixVector)-1] + string(prefixVector[len(prefixVector)-1]+1)),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("vecstore: new vector iter: %w", err)
+	}
+	defer iter.Close()
+
+	result := make(map[uint64][]float32, len(sorted))
+	keyBuf := make([]byte, len(prefixVector)+8)
+	copy(keyBuf, prefixVector)
+
+	for _, id := range sorted {
+		binary.BigEndian.PutUint64(keyBuf[len(prefixVector):], id)
+		if !iter.SeekGE(keyBuf) {
+			break // past end of key space
+		}
+		iterKey := iter.Key()
+		if len(iterKey) != len(keyBuf) {
 			continue
 		}
-		if err != nil {
-			return nil, err
+		// Compare only the docID suffix — prefix is guaranteed by bounds.
+		if binary.BigEndian.Uint64(iterKey[len(prefixVector):]) != id {
+			continue
 		}
-		result[id] = vec
+		val, err := iter.ValueAndErr()
+		if err != nil {
+			return nil, fmt.Errorf("vecstore: read vector %d: %w", id, err)
+		}
+		result[id] = decodeVector(val, s.dim)
 	}
+
+	if err := iter.Error(); err != nil {
+		return nil, fmt.Errorf("vecstore: vector iter error: %w", err)
+	}
+
 	return result, nil
 }
 

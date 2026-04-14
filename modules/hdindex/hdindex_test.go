@@ -412,8 +412,6 @@ func TestSearchRecall(t *testing.T) {
 
 	vecs := randomVectors(n, dim, 100)
 	spec := DefaultSpec("test-recall", dim, MetricEuclidean)
-	// Use a larger alpha for better recall.
-	spec.Alpha = 8192
 	entries := makeVectorEntries(vecs)
 	idx, err := eng.CreateIndex(ctx, spec, entries)
 	if err != nil {
@@ -449,8 +447,9 @@ func TestSearchRecall(t *testing.T) {
 			trueTopK[fmt.Sprintf("vec-%d", bruteForce[i].idx)] = struct{}{}
 		}
 
-		// Approximate search.
-		result, err := idx.Search(ctx, SearchRequest{VectorFP32: query, TopK: topK})
+		// Approximate search — use per-query alpha override to bypass adaptive
+		// scaling (n=1000 is too small for meaningful Hilbert locality on random data).
+		result, err := idx.Search(ctx, SearchRequest{VectorFP32: query, TopK: topK, Alpha: 8192})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -522,7 +521,6 @@ func TestDotMetric_MIPSOrdering(t *testing.T) {
 
 	vecs := randomVectors(n, dim, 70)
 	spec := DefaultSpec("test-mips-order", dim, MetricDot)
-	spec.Alpha = 8192
 	idx, err := eng.CreateIndex(ctx, spec, makeVectorEntries(vecs))
 	if err != nil {
 		t.Fatal(err)
@@ -547,7 +545,8 @@ func TestDotMetric_MIPSOrdering(t *testing.T) {
 		trueTopK[fmt.Sprintf("vec-%d", dots[i].i)] = struct{}{}
 	}
 
-	result, err := idx.Search(ctx, SearchRequest{VectorFP32: query, TopK: topK})
+	// Per-query alpha override bypasses adaptive scaling for this small test dataset.
+	result, err := idx.Search(ctx, SearchRequest{VectorFP32: query, TopK: topK, Alpha: 8192})
 	if err != nil {
 		t.Fatal(err)
 	}

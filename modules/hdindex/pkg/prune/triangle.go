@@ -1,6 +1,6 @@
 package prune
 
-import "sort"
+import "slices"
 
 // Candidate represents a candidate vector with its precomputed reference distances.
 type Candidate struct {
@@ -29,28 +29,84 @@ func TriangleLowerBound(queryRefDists, candidateRefDists []float32) float32 {
 
 // TrianglePrune filters candidates using the triangle inequality.
 // Keeps the top-beta candidates with the smallest triangle lower bounds.
-// queryRefDists: distances from query to each reference object.
-// candidates: slice of candidates with their reference distances.
-// beta: number of candidates to keep.
 // Returns the pruned candidates sorted by triangle lower bound (ascending).
 func TrianglePrune(queryRefDists []float32, candidates []Candidate, beta int) []Candidate {
-	type scored struct {
-		c     Candidate
-		bound float32
+	n := len(candidates)
+	keep := min(beta, n)
+	if keep == 0 {
+		return nil
 	}
 
-	list := make([]scored, len(candidates))
-	for i, c := range candidates {
-		list[i] = scored{c: c, bound: TriangleLowerBound(queryRefDists, c.RefDists)}
-	}
-	sort.Slice(list, func(i, j int) bool {
-		return list[i].bound < list[j].bound
-	})
+	indices := TrianglePruneIndices(queryRefDists, candidates, beta)
 
-	keep := min(beta, len(list))
-	out := make([]Candidate, keep)
-	for i := range out {
-		out[i] = list[i].c
+	out := make([]Candidate, len(indices))
+	for i, idx := range indices {
+		out[i] = candidates[idx]
 	}
 	return out
+}
+
+// TrianglePruneIndices computes triangle lower bounds and returns the indices
+// (into candidates) of the top-beta entries with the smallest bounds.
+// Uses index-based sorting to avoid moving Candidate structs during sort,
+// eliminating reflection overhead and GC write barriers.
+func TrianglePruneIndices(queryRefDists []float32, candidates []Candidate, beta int) []int {
+	n := len(candidates)
+	keep := min(beta, n)
+	if keep == 0 {
+		return nil
+	}
+
+	bounds := make([]float32, n)
+	indices := make([]int, n)
+	for i := range n {
+		bounds[i] = TriangleLowerBound(queryRefDists, candidates[i].RefDists)
+		indices[i] = i
+	}
+
+	// Sort indices by bound value. Swapping 8-byte ints is ~4x faster than
+	// swapping 32-byte Candidate structs with GC write barriers.
+	slices.SortFunc(indices, func(a, b int) int {
+		ba, bb := bounds[a], bounds[b]
+		if ba < bb {
+			return -1
+		}
+		if ba > bb {
+			return 1
+		}
+		return 0
+	})
+
+	return indices[:keep]
+}
+
+// TrianglePruneRefDists filters ref distance slices directly (without requiring
+// Candidate construction). Returns indices into the refDists slice of the
+// top-beta entries with the smallest triangle lower bounds.
+func TrianglePruneRefDists(queryRefDists []float32, refDists [][]float32, beta int) []int {
+	n := len(refDists)
+	keep := min(beta, n)
+	if keep == 0 {
+		return nil
+	}
+
+	bounds := make([]float32, n)
+	indices := make([]int, n)
+	for i := range n {
+		bounds[i] = TriangleLowerBound(queryRefDists, refDists[i])
+		indices[i] = i
+	}
+
+	slices.SortFunc(indices, func(a, b int) int {
+		ba, bb := bounds[a], bounds[b]
+		if ba < bb {
+			return -1
+		}
+		if ba > bb {
+			return 1
+		}
+		return 0
+	})
+
+	return indices[:keep]
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"runtime"
 	"sort"
 	"sync"
 
@@ -27,7 +28,18 @@ type Index struct {
 	mu       sync.RWMutex
 }
 
+// partitionResult holds the output of a single partition scan + prune.
+// entries carries the raw RDB scan result; keptIdx holds indices into entries
+// that survived triangle pruning. This avoids copying Entry→Candidate structs.
+type partitionResult struct {
+	entries []rdb.Entry
+	keptIdx []int
+	scanned int
+	pruned  int
+}
+
 // Search performs a kNN query using the HD-Index algorithm (Algorithm 2 from paper).
+// Partition scans run in parallel across available cores.
 func (idx *Index) Search(ctx context.Context, req SearchRequest) (*SearchResult, error) {
 	if len(req.VectorFP32) != idx.spec.Dim {
 		return nil, fmt.Errorf("hdindex: query dimension %d != index dimension %d", len(req.VectorFP32), idx.spec.Dim)
@@ -37,7 +49,8 @@ func (idx *Index) Search(ctx context.Context, req SearchRequest) (*SearchResult,
 	}
 
 	alpha := idx.spec.Alpha
-	if req.Alpha > 0 {
+	explicitAlpha := req.Alpha > 0
+	if explicitAlpha {
 		alpha = req.Alpha
 	}
 	gamma := idx.spec.Gamma
@@ -45,11 +58,19 @@ func (idx *Index) Search(ctx context.Context, req SearchRequest) (*SearchResult,
 		gamma = req.Gamma
 	}
 
-	// Cap alpha to half the dataset size — scanning >50% per partition wastes I/O
-	// without improving recall (the Hilbert scan only helps when alpha << n).
+	// Adaptive alpha: scale proportionally to dataset size when using spec
+	// defaults. Scanning >5% per partition degrades to a random scan with no
+	// Hilbert locality benefit. When alpha is reduced, gamma scales down to
+	// maintain the paper's alpha/gamma ratio for effective triangle pruning.
+	// Skipped for per-query overrides (caller knows what they want).
 	vecCount, _ := idx.vecStore.GetVectorCount()
-	if vc := int(vecCount); vc > 0 && alpha > vc/2 {
-		alpha = max(vc/2, gamma)
+	if vc := int(vecCount); vc > 0 && !explicitAlpha {
+		maxAlpha := max(int(float64(vc)*0.05), req.TopK*2)
+		if alpha > maxAlpha {
+			scale := float64(maxAlpha) / float64(alpha)
+			alpha = maxAlpha
+			gamma = max(int(float64(gamma)*scale), req.TopK*2)
+		}
 	}
 
 	// Transform query according to metric.
@@ -62,56 +83,60 @@ func (idx *Index) Search(ctx context.Context, req SearchRequest) (*SearchResult,
 	// Compute query distances to all m reference objects.
 	queryRefDists := idx.refs.ComputeRefDists(queryTransformed)
 
-	var stats SearchStats
-	seen := make(map[uint64]struct{})
-	allCandidates := make([]prune.Candidate, 0, gamma*idx.spec.Tau)
+	// Scan all τ partitions in parallel.
+	tau := idx.spec.Tau
+	partResults := make([]partitionResult, tau)
+	partErrors := make([]error, tau)
 
-	etaDims := idx.spec.Eta
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, max(1, min(tau, runtime.GOMAXPROCS(0))))
 
-	for i := range idx.spec.Tau {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
+	for i := range tau {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
 
-		start := i * etaDims
-		end := start + etaDims
-		partSlice := queryTransformed[start:end]
-		domainMinSlice := idx.spec.DomainMin[start:end]
-		domainMaxSlice := idx.spec.DomainMax[start:end]
+			if ctx.Err() != nil {
+				partErrors[i] = ctx.Err()
+				return
+			}
 
-		coords := metric.QuantizeDims(partSlice, domainMinSlice, domainMaxSlice, idx.spec.Omega)
-		hilbertKey := hilbert.Encode(coords, idx.spec.Omega)
+			pr, err := idx.searchPartition(i, queryTransformed, queryRefDists, alpha, gamma)
+			if err != nil {
+				partErrors[i] = err
+				return
+			}
+			partResults[i] = pr
+		}()
+	}
+	wg.Wait()
 
-		entries, err := idx.rdbStore.ScanNearest(i, hilbertKey, alpha)
+	// Check for errors from any partition.
+	for i, err := range partErrors {
 		if err != nil {
 			return nil, fmt.Errorf("hdindex: scan partition %d: %w", i, err)
 		}
-		stats.PartitionsSearched++
-		stats.CandidatesScanned += len(entries)
-
-		// Per HD-Index paper Section 5.2.5: use triangle inequality alone as the
-		// filter (not Ptolemaic). Triangle prune from α candidates directly to γ.
-		// This is the paper's recommended configuration: α/γ = 4.
-		candidates := make([]prune.Candidate, len(entries))
-		for j, e := range entries {
-			candidates[j] = prune.Candidate{DocID: e.DocID, RefDists: e.RefDists}
-		}
-		pruned := prune.TrianglePrune(queryRefDists, candidates, gamma)
-		stats.CandidatesAfterTriangle += len(pruned)
-		stats.CandidatesAfterPtolemaic += len(pruned)
-
-		for _, c := range pruned {
-			if _, exists := seen[c.DocID]; !exists {
-				seen[c.DocID] = struct{}{}
-				allCandidates = append(allCandidates, c)
-			}
-		}
 	}
 
-	// Collect unique doc IDs and load their original vectors.
-	docIDs := make([]uint64, 0, len(allCandidates))
-	for _, c := range allCandidates {
-		docIDs = append(docIDs, c.DocID)
+	// Merge and deduplicate candidates across partitions.
+	var stats SearchStats
+	seen := make(map[uint64]struct{}, gamma*tau)
+	docIDs := make([]uint64, 0, gamma*tau)
+
+	for _, pr := range partResults {
+		stats.PartitionsSearched++
+		stats.CandidatesScanned += pr.scanned
+		stats.CandidatesAfterTriangle += pr.pruned
+
+		for _, ki := range pr.keptIdx {
+			did := pr.entries[ki].DocID
+			if _, exists := seen[did]; !exists {
+				seen[did] = struct{}{}
+				docIDs = append(docIDs, did)
+			}
+		}
 	}
 
 	vecs, err := idx.vecStore.GetVectors(docIDs)
@@ -151,6 +176,38 @@ func (idx *Index) Search(ctx context.Context, req SearchRequest) (*SearchResult,
 	return &SearchResult{Hits: hits, Stats: stats}, nil
 }
 
+// searchPartition runs the Hilbert scan + triangle prune for a single partition.
+func (idx *Index) searchPartition(partIdx int, queryTransformed, queryRefDists []float32, alpha, gamma int) (partitionResult, error) {
+	etaDims := idx.spec.Eta
+	start := partIdx * etaDims
+	end := start + etaDims
+
+	coords := metric.QuantizeDims(queryTransformed[start:end], idx.spec.DomainMin[start:end], idx.spec.DomainMax[start:end], idx.spec.Omega)
+	hilbertKey := hilbert.Encode(coords, idx.spec.Omega)
+
+	entries, err := idx.rdbStore.ScanNearest(partIdx, hilbertKey, alpha)
+	if err != nil {
+		return partitionResult{}, err
+	}
+
+	// Extract ref distances slice headers (no data copy — they point into the
+	// ScanNearest arena). This avoids constructing prune.Candidate structs.
+	refDists := make([][]float32, len(entries))
+	for j := range entries {
+		refDists[j] = entries[j].RefDists
+	}
+
+	// Per HD-Index paper Section 5.2.5: triangle inequality prune α → γ.
+	keptIdx := prune.TrianglePruneRefDists(queryRefDists, refDists, gamma)
+
+	return partitionResult{
+		entries: entries,
+		keptIdx: keptIdx,
+		scanned: len(entries),
+		pruned:  len(keptIdx),
+	}, nil
+}
+
 // Upsert inserts or updates a single vector. Idempotent via (TxnID, SeqID).
 func (idx *Index) Upsert(ctx context.Context, mut Mutation) error {
 	if len(mut.VectorFP32) != idx.spec.Dim {
@@ -167,7 +224,7 @@ func (idx *Index) Upsert(ctx context.Context, mut Mutation) error {
 		return fmt.Errorf("hdindex: lookup external id: %w", err)
 	}
 
-	transformed, err := idx.transformVector(mut.VectorFP32)
+	transformed, err := idx.transformDataVector(mut.VectorFP32)
 	if err != nil {
 		return fmt.Errorf("hdindex: transform vector: %w", err)
 	}
@@ -347,19 +404,16 @@ func (idx *Index) Close() error {
 	return idx.db.Close()
 }
 
-// transformVector applies the metric-specific transformation to a vector.
-// For Cosine: normalize. For Dot: MIPS augmentation. For Euclidean: no-op.
+// transformVector applies the metric-specific transformation to a QUERY vector.
+// For Cosine: normalize. For Dot: MIPS query augmentation (appends 0). For Euclidean: no-op.
 func (idx *Index) transformVector(v []float32) ([]float32, error) {
-	switch idx.spec.Metric {
-	case MetricCosine:
-		return metric.NormalizeCopy(v), nil
-	case MetricDot:
-		return metric.AugmentForMIPS(v, idx.spec.NormMax)
-	default:
-		out := make([]float32, len(v))
-		copy(out, v)
-		return out, nil
-	}
+	return transformQueryVectorWithSpec(idx.spec, v)
+}
+
+// transformDataVector applies the metric-specific transformation to a DATA vector.
+// For Cosine: normalize. For Dot: MIPS data augmentation (appends sqrt(M²-||x||²)). For Euclidean: no-op.
+func (idx *Index) transformDataVector(v []float32) ([]float32, error) {
+	return transformVectorWithSpec(idx.spec, v)
 }
 
 // exactDistance computes the true metric distance between two original (non-transformed) vectors.

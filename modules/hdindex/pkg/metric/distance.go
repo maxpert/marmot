@@ -3,16 +3,15 @@ package metric
 import (
 	"math"
 
-	"github.com/viterin/vek/vek32"
+	"github.com/tphakala/simd/f32"
 )
 
 // L2Squared computes the squared Euclidean distance between two vectors.
-// Uses 4-wide manual unrolling for auto-vectorization on both amd64 and arm64.
+// Uses a 4-wide unrolled loop to enable auto-vectorization and avoid the
+// precision loss of sqrt(x)² ≠ x in float32.
 // Panics if len(a) != len(b).
 func L2Squared(a, b []float32) float32 {
-	if len(a) != len(b) {
-		panic("metric: mismatched vector lengths")
-	}
+	assertEqualLen(a, b)
 	n := len(a)
 	var s0, s1, s2, s3 float32
 	i := 0
@@ -34,39 +33,50 @@ func L2Squared(a, b []float32) float32 {
 	return sum
 }
 
-// L2 computes the Euclidean distance (square root of L2Squared).
+// L2 computes the Euclidean distance using SIMD (NEON on arm64, AVX on amd64).
 // Panics if len(a) != len(b).
 func L2(a, b []float32) float32 {
-	return float32(math.Sqrt(float64(L2Squared(a, b))))
+	assertEqualLen(a, b)
+	return f32.EuclideanDistance(a, b)
 }
 
-// DotProduct computes the inner product of two vectors using SIMD-optimized vek.
+// DotProduct computes the inner product using SIMD (NEON on arm64, AVX on amd64).
 // Panics if len(a) != len(b).
 func DotProduct(a, b []float32) float32 {
+	assertEqualLen(a, b)
+	return f32.DotProduct(a, b)
+}
+
+func assertEqualLen(a, b []float32) {
 	if len(a) != len(b) {
 		panic("metric: mismatched vector lengths")
 	}
-	return vek32.Dot(a, b)
 }
 
 // CosineSimilarity computes the cosine similarity between two vectors.
 // Returns a value in [-1, 1]. Returns 0 if either vector has near-zero norm
 // or if the norm product underflows to zero.
+// Uses SIMD-accelerated dot product and sum for norm computation.
 // Panics if len(a) != len(b).
 func CosineSimilarity(a, b []float32) float32 {
 	if len(a) != len(b) {
 		panic("metric: mismatched vector lengths")
 	}
-	na := vek32.Norm(a)
-	nb := vek32.Norm(b)
+	na := norm(a)
+	nb := norm(b)
 	denom := na * nb
 	if denom == 0 {
 		return 0
 	}
-	return vek32.Dot(a, b) / denom
+	return f32.DotProduct(a, b) / denom
 }
 
-// Norm computes the L2 norm of a vector using SIMD-optimized vek.
+// Norm computes the L2 norm of a vector using SIMD-accelerated dot product.
 func Norm(v []float32) float32 {
-	return vek32.Norm(v)
+	return norm(v)
+}
+
+// norm computes sqrt(sum(v[i]^2)) via SIMD self-dot-product.
+func norm(v []float32) float32 {
+	return float32(math.Sqrt(float64(f32.DotProduct(v, v))))
 }

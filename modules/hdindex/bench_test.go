@@ -41,6 +41,9 @@ func bruteForceTopK(query []float32, dataset [][]float32, k int, metricType Metr
 
 // computeRecall computes recall@k between approximate result IDs and exact indices.
 func computeRecall(approxIDs []string, exactIndices []int, idPrefix string) float64 {
+	if len(exactIndices) == 0 {
+		return 0
+	}
 	exactSet := make(map[string]struct{}, len(exactIndices))
 	for _, idx := range exactIndices {
 		exactSet[fmt.Sprintf("%s%d", idPrefix, idx)] = struct{}{}
@@ -57,8 +60,13 @@ func computeRecall(approxIDs []string, exactIndices []int, idPrefix string) floa
 // buildTestIndex creates an engine+index for the given vectors and metric, using a temp dir.
 func buildTestIndex(t testing.TB, vecs [][]float32, metricType Metric, idSuffix string) (*Engine, *Index) {
 	t.Helper()
+	return buildTestIndexWithCache(t, vecs, metricType, idSuffix, 0)
+}
+
+func buildTestIndexWithCache(t testing.TB, vecs [][]float32, metricType Metric, idSuffix string, cacheMB int) (*Engine, *Index) {
+	t.Helper()
 	ctx := context.Background()
-	eng, err := NewEngine(t.TempDir(), EngineConfig{})
+	eng, err := NewEngine(t.TempDir(), EngineConfig{PebbleCacheMB: cacheMB})
 	if err != nil {
 		t.Fatalf("NewEngine: %v", err)
 	}
@@ -80,6 +88,9 @@ type recallConfig struct {
 
 // TestRecallEvaluation measures recall@10 for various dataset sizes, dimensions, and metrics.
 func TestRecallEvaluation(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping heavy recall evaluation in short mode")
+	}
 	const (
 		nQueries = 100
 		topK     = 10
@@ -193,24 +204,34 @@ func benchmarkBuild(b *testing.B, n, dim int, metricType Metric) {
 
 // BenchmarkSearch_1K_128dim_k10 measures search QPS for 1K 128-dim index.
 func BenchmarkSearch_1K_128dim_k10(b *testing.B) {
-	benchmarkSearch(b, 1000, 128, MetricEuclidean)
+	benchmarkSearch(b, 1000, 128, MetricEuclidean, 0)
 }
 
 // BenchmarkSearch_10K_128dim_k10 measures search QPS for 10K 128-dim index.
 func BenchmarkSearch_10K_128dim_k10(b *testing.B) {
-	benchmarkSearch(b, 10000, 128, MetricEuclidean)
+	benchmarkSearch(b, 10000, 128, MetricEuclidean, 0)
 }
 
 // BenchmarkSearch_10K_768dim_k10 measures search QPS for 10K 768-dim index.
 func BenchmarkSearch_10K_768dim_k10(b *testing.B) {
-	benchmarkSearch(b, 10000, 768, MetricEuclidean)
+	benchmarkSearch(b, 10000, 768, MetricEuclidean, 0)
 }
 
-func benchmarkSearch(b *testing.B, n, dim int, metricType Metric) {
+// BenchmarkSearchCached_10K_128dim_k10 measures search QPS with a warm block cache (production config).
+func BenchmarkSearchCached_10K_128dim_k10(b *testing.B) {
+	benchmarkSearch(b, 10000, 128, MetricEuclidean, 64)
+}
+
+// BenchmarkSearchCached_10K_768dim_k10 measures search QPS with a warm block cache (production config).
+func BenchmarkSearchCached_10K_768dim_k10(b *testing.B) {
+	benchmarkSearch(b, 10000, 768, MetricEuclidean, 64)
+}
+
+func benchmarkSearch(b *testing.B, n, dim int, metricType Metric, cacheMB int) {
 	b.Helper()
 	ctx := context.Background()
 	vecs := randomVectors(n, dim, 42)
-	eng, idx := buildTestIndex(b, vecs, metricType, fmt.Sprintf("%d-%d", n, dim))
+	eng, idx := buildTestIndexWithCache(b, vecs, metricType, fmt.Sprintf("%d-%d", n, dim), cacheMB)
 	defer eng.Close()
 
 	// Pre-generate query vectors so random generation is not in the hot path.
@@ -248,7 +269,6 @@ func TestSearchLatencyProfile(t *testing.T) {
 	latencies := make([]time.Duration, nSearch)
 	var totalCandidatesScanned int
 	var totalAfterTriangle int
-	var totalAfterPtolemaic int
 	var totalExactScored int
 	var totalPartitions int
 
@@ -262,7 +282,6 @@ func TestSearchLatencyProfile(t *testing.T) {
 		s := result.Stats
 		totalCandidatesScanned += s.CandidatesScanned
 		totalAfterTriangle += s.CandidatesAfterTriangle
-		totalAfterPtolemaic += s.CandidatesAfterPtolemaic
 		totalExactScored += s.CandidatesExactScored
 		totalPartitions += s.PartitionsSearched
 	}
@@ -280,10 +299,9 @@ func TestSearchLatencyProfile(t *testing.T) {
 
 	t.Logf("Search latency profile (n=%d dim=%d topK=%d nSearch=%d):", n, dim, topK, nSearch)
 	t.Logf("  mean=%v  p50=%v  p99=%v", mean, p50, p99)
-	t.Logf("  avg candidates_scanned=%.1f  after_triangle=%.1f  after_ptolemaic=%.1f  exact_scored=%.1f",
+	t.Logf("  avg candidates_scanned=%.1f  after_triangle=%.1f  exact_scored=%.1f",
 		float64(totalCandidatesScanned)/float64(nSearch),
 		float64(totalAfterTriangle)/float64(nSearch),
-		float64(totalAfterPtolemaic)/float64(nSearch),
 		float64(totalExactScored)/float64(nSearch),
 	)
 	t.Logf("  avg partitions_searched=%.2f", float64(totalPartitions)/float64(nSearch))
