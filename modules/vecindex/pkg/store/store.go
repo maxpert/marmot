@@ -98,7 +98,7 @@ func New(dir string, opts *pebble.Options) (*Store, error) {
 		return nil, err
 	}
 
-	log.Info().Str("dir", dir).Msg("store: opened")
+	log.Debug().Str("dir", dir).Msg("store: opened")
 	return s, nil
 }
 
@@ -300,7 +300,7 @@ func (s *Store) GetClusterMeta(clusterID uint32) (ClusterMeta, error) {
 		return ClusterMeta{}, err
 	}
 	defer closer.Close()
-	return decodeClusterMeta(val), nil
+	return decodeClusterMeta(val)
 }
 
 // PutClusterMeta stores metadata for clusterID.
@@ -330,7 +330,10 @@ func (s *Store) ListActiveClusters() ([]uint32, error) {
 		if len(key) < 5 || key[0] != KeyPrefixClusterMeta {
 			break
 		}
-		meta := decodeClusterMeta(iter.Value())
+		meta, decErr := decodeClusterMeta(iter.Value())
+		if decErr != nil {
+			continue
+		}
 		if meta.State == ClusterStateActive {
 			clusterID := binary.BigEndian.Uint32(key[1:5])
 			ids = append(ids, clusterID)
@@ -503,6 +506,29 @@ func (b *Batch) BatchDeleteExtMapping(externalID []byte, docID uint64) error {
 	return b.b.Delete(EncodeDocToExtKey(docID), pebble.NoSync)
 }
 
+// BatchDeleteReverseMap adds a reverse-map delete to the batch.
+func (b *Batch) BatchDeleteReverseMap(docID uint64) error {
+	return b.b.Delete(EncodeReverseKey(docID), pebble.NoSync)
+}
+
+// BatchPutWatermark adds a watermark write for externalID to the batch.
+// The watermark is stored in the 0x08 namespace.
+func (b *Batch) BatchPutWatermark(externalID []byte, txnID, seqID uint64) error {
+	key := EncodeWatermarkKey(externalID)
+	val := make([]byte, 16)
+	binary.BigEndian.PutUint64(val[:8], txnID)
+	binary.BigEndian.PutUint64(val[8:], seqID)
+	return b.b.Set(key, val, pebble.NoSync)
+}
+
+// EncodeWatermarkKey encodes the 0x08-prefixed watermark key for externalID.
+func EncodeWatermarkKey(externalID []byte) []byte {
+	key := make([]byte, 1+len(externalID))
+	key[0] = 0x08
+	copy(key[1:], externalID)
+	return key
+}
+
 // EncodeCentroidKey returns the key for a centroid record.
 // Layout: [0x01][clusterID uint32 big-endian]
 func EncodeCentroidKey(clusterID uint32) []byte {
@@ -623,11 +649,15 @@ func encodeClusterMeta(m ClusterMeta) []byte {
 }
 
 // decodeClusterMeta deserializes a ClusterMeta from its binary representation.
-func decodeClusterMeta(buf []byte) ClusterMeta {
+// Returns an error if the buffer is too short to be valid.
+func decodeClusterMeta(buf []byte) (ClusterMeta, error) {
+	if len(buf) < clusterMetaSize {
+		return ClusterMeta{}, fmt.Errorf("store: cluster meta buffer too short: %d < %d", len(buf), clusterMetaSize)
+	}
 	return ClusterMeta{
 		Size:           binary.BigEndian.Uint32(buf[0:4]),
 		Epoch:          binary.BigEndian.Uint64(buf[4:12]),
 		TombstoneCount: binary.BigEndian.Uint32(buf[12:16]),
 		State:          ClusterState(buf[16]),
-	}
+	}, nil
 }

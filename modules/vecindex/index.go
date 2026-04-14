@@ -16,20 +16,17 @@ import (
 	"github.com/rs/zerolog"
 )
 
-// keyPrefixWatermark is the per-externalID watermark namespace.
-// Layout: [0x08][externalID bytes] → [txnID uint64 BE][seqID uint64 BE]
-const keyPrefixWatermark byte = 0x08
-
 // Index is an open IVF vector index backed by a Pebble store.
 type Index struct {
-	spec        IVFSpec
-	st          *store.Store
-	logger      zerolog.Logger
-	mu          sync.RWMutex
-	centroids   atomic.Pointer[centroidState]
-	vectorCount atomic.Uint64
-	lastNprobe  atomic.Uint64
-	closed      atomic.Bool
+	spec          IVFSpec
+	st            *store.Store
+	logger        zerolog.Logger
+	mu            sync.RWMutex
+	centroids     atomic.Pointer[centroidState]
+	vectorCount   atomic.Uint64
+	lastNprobe    atomic.Uint64
+	closed        atomic.Bool
+	compactNotify chan uint32 // single-slot channel; background worker drains
 }
 
 // centroidState bundles a CentroidSet with the corresponding store cluster IDs.
@@ -41,7 +38,25 @@ type centroidState struct {
 
 // newIndex constructs an Index without loading existing data.
 func newIndex(spec IVFSpec, st *store.Store, logger zerolog.Logger) *Index {
-	return &Index{spec: spec, st: st, logger: logger}
+	idx := &Index{
+		spec:          spec,
+		st:            st,
+		logger:        logger,
+		compactNotify: make(chan uint32, 1),
+	}
+	go idx.compactWorker()
+	return idx
+}
+
+// compactWorker drains compactNotify and runs Pebble compaction asynchronously.
+// Exits when the channel is closed (on Index.Close).
+func (idx *Index) compactWorker() {
+	for clusterID := range idx.compactNotify {
+		if idx.closed.Load() {
+			return
+		}
+		_ = idx.st.CompactCluster(clusterID)
+	}
 }
 
 // loadCentroids reads centroids from the store and populates the atomic pointer.
@@ -103,13 +118,12 @@ func (idx *Index) bulkLoad(ctx context.Context, bulk []BulkEntry) error {
 	batchCount := 0
 
 	commitBatch := func() error {
-		meta.Size = uint32(batchCount) // set final size in last write
-		// We update meta per batch — actual size tracked incrementally below.
 		if err := b.Commit(); err != nil {
 			_ = b.Close()
 			return err
 		}
 		b = idx.st.NewBatch()
+		batchCount = 0
 		return nil
 	}
 
@@ -345,30 +359,19 @@ func (idx *Index) Upsert(ctx context.Context, externalID []byte, vec []float32, 
 	existingDocID, err := idx.st.GetExtToDoc(externalID)
 	isUpdate := err == nil
 
+	// Resolve old cluster state before building the batch (HR-06: single atomic batch).
+	var oldClusterID uint32
+	var oldMeta store.ClusterMeta
 	if isUpdate {
-		// Remove old posting entry from its current cluster.
-		oldClusterID, err := idx.st.GetClusterForDoc(existingDocID)
-		if err == nil {
-			b := idx.st.NewBatch()
-			if batchErr := b.BatchDeletePosting(oldClusterID, existingDocID); batchErr != nil {
-				_ = b.Close()
-				return batchErr
-			}
-			if batchErr := b.Commit(); batchErr != nil {
-				_ = b.Close()
-				return batchErr
-			}
-			// Decrement old cluster meta.
-			if meta, metaErr := idx.st.GetClusterMeta(oldClusterID); metaErr == nil {
-				if meta.Size > 0 {
-					meta.Size--
-				}
-				_ = idx.st.PutClusterMeta(oldClusterID, meta)
+		if cid, cerr := idx.st.GetClusterForDoc(existingDocID); cerr == nil {
+			oldClusterID = cid
+			if m, merr := idx.st.GetClusterMeta(cid); merr == nil {
+				oldMeta = m
 			}
 		}
 	}
 
-	// Assign cluster.
+	// Assign new cluster.
 	var clusterID uint32
 	cs := idx.centroids.Load()
 	if cs != nil {
@@ -389,20 +392,38 @@ func (idx *Index) Upsert(ctx context.Context, externalID []byte, vec []float32, 
 	if isUpdate {
 		docID = existingDocID
 	} else {
-		// Allocate a new docID using cluster-ID allocator trick: use next seq from
-		// ext→doc table. We derive a monotonic docID from the current vector count.
 		docID = idx.nextDocID()
 	}
 
-	// Ensure cluster meta exists.
-	meta, err := idx.st.GetClusterMeta(clusterID)
+	// Ensure new cluster meta exists.
+	newMeta, err := idx.st.GetClusterMeta(clusterID)
 	if errors.Is(err, store.ErrNotFound) {
-		meta = store.ClusterMeta{State: store.ClusterStateActive}
+		newMeta = store.ClusterMeta{State: store.ClusterStateActive}
 	} else if err != nil {
 		return err
 	}
+	newMeta.Size++
 
 	b := idx.st.NewBatch()
+	// For updates: remove old posting and update old cluster meta in the same batch.
+	if isUpdate {
+		if batchErr := b.BatchDeletePosting(oldClusterID, existingDocID); batchErr != nil {
+			_ = b.Close()
+			return batchErr
+		}
+		if oldClusterID != clusterID {
+			if oldMeta.Size > 0 {
+				oldMeta.Size--
+			}
+			if batchErr := b.BatchPutClusterMeta(oldClusterID, oldMeta); batchErr != nil {
+				_ = b.Close()
+				return batchErr
+			}
+		} else {
+			// Same cluster: net size is unchanged (deleted then re-inserted).
+			newMeta.Size = oldMeta.Size
+		}
+	}
 	if err := b.BatchPutPosting(clusterID, docID, vec); err != nil {
 		_ = b.Close()
 		return err
@@ -419,13 +440,12 @@ func (idx *Index) Upsert(ctx context.Context, externalID []byte, vec []float32, 
 		_ = b.Close()
 		return err
 	}
-	if !isUpdate {
-		meta.Size++
-	} else {
-		// Re-increment since we decremented on the old cluster above.
-		meta.Size++
+	if err := b.BatchPutClusterMeta(clusterID, newMeta); err != nil {
+		_ = b.Close()
+		return err
 	}
-	if err := b.BatchPutClusterMeta(clusterID, meta); err != nil {
+	// Watermark in the same batch — no crash window (HR-02).
+	if err := b.BatchPutWatermark(externalID, txnID, seqID); err != nil {
 		_ = b.Close()
 		return err
 	}
@@ -433,9 +453,6 @@ func (idx *Index) Upsert(ctx context.Context, externalID []byte, vec []float32, 
 		_ = b.Close()
 		return err
 	}
-
-	// Persist watermark.
-	idx.putWatermark(externalID, txnID, seqID)
 
 	if !isUpdate {
 		idx.vectorCount.Add(1)
@@ -454,9 +471,13 @@ func (idx *Index) Delete(ctx context.Context, externalID []byte, txnID, seqID ui
 
 	docID, err := idx.st.GetExtToDoc(externalID)
 	if errors.Is(err, store.ErrNotFound) {
-		// Idempotent: persist tombstone watermark so future stale upserts are blocked.
-		idx.putWatermark(externalID, txnID, seqID)
-		return nil
+		// Idempotent: persist tombstone watermark atomically.
+		b := idx.st.NewBatch()
+		if batchErr := b.BatchPutWatermark(externalID, txnID, seqID); batchErr != nil {
+			_ = b.Close()
+			return batchErr
+		}
+		return b.Commit()
 	}
 	if err != nil {
 		return err
@@ -476,8 +497,8 @@ func (idx *Index) Delete(ctx context.Context, externalID []byte, txnID, seqID ui
 		_ = b.Close()
 		return err
 	}
-	// Remove reverse map entry.
-	if err := idx.batchDeleteReverseMap(b, docID); err != nil {
+	// Remove reverse map entry in the same batch (CR-02).
+	if err := b.BatchDeleteReverseMap(docID); err != nil {
 		_ = b.Close()
 		return err
 	}
@@ -493,20 +514,26 @@ func (idx *Index) Delete(ctx context.Context, externalID []byte, txnID, seqID ui
 			return err
 		}
 	}
+	// Watermark in the same batch — no crash window (HR-02).
+	if err := b.BatchPutWatermark(externalID, txnID, seqID); err != nil {
+		_ = b.Close()
+		return err
+	}
 	if err := b.Commit(); err != nil {
 		_ = b.Close()
 		return err
 	}
 
-	// Persist watermark tombstone.
-	idx.putWatermark(externalID, txnID, seqID)
 	idx.vectorCount.Add(^uint64(0)) // decrement by 1
 
-	// Compact synchronously if tombstone ratio is high enough to warrant it.
+	// Enqueue compaction to background worker (non-blocking, single-slot) (HR-04).
 	if metaErr == nil {
 		meta.TombstoneCount++ // reflect the increment written above
 		if store.ShouldCompact(meta) && !idx.closed.Load() {
-			_ = idx.st.CompactCluster(clusterID)
+			select {
+			case idx.compactNotify <- clusterID:
+			default: // slot occupied — compaction already pending
+			}
 		}
 	}
 
@@ -522,9 +549,9 @@ func (idx *Index) Stats() Stats {
 		epoch = cs.cs.Epoch()
 	}
 	return Stats{
-		VectorCount:    idx.vectorCount.Load(),
-		CentroidCount:  centCount,
-		Epoch:          epoch,
+		VectorCount:     idx.vectorCount.Load(),
+		CentroidCount:   centCount,
+		Epoch:           epoch,
 		LastQueryNprobe: idx.lastNprobe.Load(),
 	}
 }
@@ -532,6 +559,7 @@ func (idx *Index) Stats() Stats {
 // Close releases resources held by this index.
 func (idx *Index) Close() error {
 	idx.closed.Store(true)
+	close(idx.compactNotify)
 	return idx.st.Close()
 }
 
@@ -550,13 +578,13 @@ func (idx *Index) nextDocID() uint64 {
 	next := cur + 1
 	buf := make([]byte, 8)
 	binary.BigEndian.PutUint64(buf, next)
-	_ = idx.st.DB().Set(keyDocIDCounter, buf, pebble.NoSync)
+	_ = idx.st.DB().Set(keyDocIDCounter, buf, pebble.Sync)
 	return next
 }
 
 // getWatermark reads (txnID, seqID) for externalID from the 0x08 namespace.
 func (idx *Index) getWatermark(externalID []byte) (txnID, seqID uint64, found bool) {
-	key := encodeWatermarkKey(externalID)
+	key := store.EncodeWatermarkKey(externalID)
 	val, closer, err := idx.st.DB().Get(key)
 	if errors.Is(err, pebble.ErrNotFound) {
 		return 0, 0, false
@@ -568,34 +596,6 @@ func (idx *Index) getWatermark(externalID []byte) (txnID, seqID uint64, found bo
 	txnID = binary.BigEndian.Uint64(val[:8])
 	seqID = binary.BigEndian.Uint64(val[8:16])
 	return txnID, seqID, true
-}
-
-// putWatermark writes (txnID, seqID) for externalID into the 0x08 namespace.
-func (idx *Index) putWatermark(externalID []byte, txnID, seqID uint64) {
-	key := encodeWatermarkKey(externalID)
-	val := make([]byte, 16)
-	binary.BigEndian.PutUint64(val[:8], txnID)
-	binary.BigEndian.PutUint64(val[8:], seqID)
-	_ = idx.st.DB().Set(key, val, pebble.NoSync)
-}
-
-// encodeWatermarkKey encodes the 0x08-prefixed key for externalID.
-func encodeWatermarkKey(externalID []byte) []byte {
-	key := make([]byte, 1+len(externalID))
-	key[0] = keyPrefixWatermark
-	copy(key[1:], externalID)
-	return key
-}
-
-// batchDeleteReverseMap adds a reverse-map delete to the batch.
-// store.Batch does not expose a BatchDeleteReverseMap helper, so we write
-// the delete directly to the underlying pebble batch via the DB.
-// We do it outside the batch for simplicity — the posting + ext mappings
-// being in the batch is the critical atomic unit; the reverse map is
-// a secondary index and can be stale-read at worst.
-func (idx *Index) batchDeleteReverseMap(_ *store.Batch, docID uint64) error {
-	key := store.EncodeReverseKey(docID)
-	return idx.st.DB().Delete(key, pebble.NoSync)
 }
 
 // hitHeap is a max-heap of SearchHit ordered by Distance (largest distance at top).
