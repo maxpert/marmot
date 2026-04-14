@@ -5,6 +5,7 @@ go 1.26.0
 require (
 	github.com/cockroachdb/pebble v1.1.5
 	github.com/rs/zerolog v1.34.0
+	github.com/stretchr/testify v1.11.1
 	github.com/tphakala/simd v1.0.22
 )
 
@@ -35,11 +36,9 @@ require (
 	github.com/prometheus/common v0.42.0 // indirect
 	github.com/prometheus/procfs v0.9.0 // indirect
 	github.com/rogpeppe/go-internal v1.9.0 // indirect
-	github.com/stretchr/testify v1.11.1 // indirect
-	github.com/vmihailenco/msgpack/v5 v5.4.1 // indirect
-	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
 	golang.org/x/exp v0.0.0-20230817173708-d852ddb80c63 // indirect
 	golang.org/x/sys v0.38.0 // indirect
 	golang.org/x/text v0.14.0 // indirect
 	google.golang.org/protobuf v1.33.0 // indirect
+	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
