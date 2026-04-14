@@ -12,6 +12,19 @@ import (
 
 const convergenceThreshold = 1e-4
 
+// foldSeed maps any uint64 seed into a non-negative int64 suitable for
+// rand.NewSource, guaranteeing that the SAME uint64 input always produces the
+// SAME int64 output on every node. Distinct uint64 values may collide with
+// probability ~1/2^63, which is acceptable because the only contract is
+// same-in → same-out, not collision-freedom.
+//
+// Folding strategy: mask off the sign bit, then XOR with the value shifted
+// right by 1 so that seeds that differ only in the high bit still produce
+// distinct outputs in almost all practical cases.
+func foldSeed(s uint64) int64 {
+	return int64(s&0x7FFFFFFFFFFFFFFF) ^ int64(s>>1)
+}
+
 // KMeansPlusPlus runs k-means++ initialisation followed by Lloyd's algorithm.
 // Returns k centroids or an error if the inputs are invalid.
 // The algorithm is deterministic: same (vectors, k, seed) always produces the
@@ -22,7 +35,7 @@ func KMeansPlusPlus(vectors [][]float32, k int, seed uint64, maxIter int) ([][]f
 	}
 
 	dim := len(vectors[0])
-	rng := rand.New(rand.NewSource(int64(seed)))
+	rng := rand.New(rand.NewSource(foldSeed(seed)))
 
 	centroids := kMeansPlusPlusInit(vectors, k, dim, rng)
 	centroids = lloydIterations(vectors, centroids, k, dim, maxIter, rng)

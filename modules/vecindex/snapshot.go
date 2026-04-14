@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/cockroachdb/pebble"
 	"github.com/maxpert/marmot/modules/vecindex/pkg/store"
@@ -156,7 +157,14 @@ func untarGz(ctx context.Context, r io.Reader, destDir string) error {
 			return err
 		}
 
+		if strings.Contains(hdr.Name, "..") || strings.HasPrefix(hdr.Name, "/") {
+			return fmt.Errorf("untarGz: unsafe path in archive: %s", hdr.Name)
+		}
 		target := filepath.Join(destDir, filepath.Clean(hdr.Name))
+		cleanDest := filepath.Clean(destDir) + string(os.PathSeparator)
+		if !strings.HasPrefix(target, cleanDest) && target != filepath.Clean(destDir) {
+			return fmt.Errorf("untarGz: path escapes dest: %s", hdr.Name)
+		}
 
 		switch hdr.Typeflag {
 		case tar.TypeDir:
