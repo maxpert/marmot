@@ -86,6 +86,9 @@ type Stats struct {
 	WatermarkTxnID uint64
 	// WatermarkSeqID is the highest sequence ID within WatermarkTxnID.
 	WatermarkSeqID uint64
+	// LastQueryNprobe is the effective nprobe used in the most recent Search call.
+	// Used to verify adaptive multi-probe behaviour in tests.
+	LastQueryNprobe uint64
 }
 
 // BulkEntry is a single vector supplied during index creation.
@@ -94,4 +97,15 @@ type BulkEntry struct {
 	ExternalID []byte
 	// Vector holds the raw float32 values.
 	Vector []float32
+}
+
+// RetrainCluster is the CDC event that triggers a deterministic centroid retrain
+// across all nodes. Nodes apply the same seed to reproduce identical centroids.
+type RetrainCluster struct {
+	// IndexID identifies the target index.
+	IndexID string
+	// Epoch is the new centroid generation after retrain.
+	Epoch uint64
+	// Seed is the RNG seed used for k-means initialisation.
+	Seed uint64
 }

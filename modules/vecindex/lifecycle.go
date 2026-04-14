@@ -22,3 +22,9 @@ func Retrain(ctx context.Context, idx *Index, seed uint64, epoch uint64) error {
 func CheckSplit(idx *Index, clusterID uint32) error {
 	return errors.New("not implemented: CheckSplit")
 }
+
+// CheckMerge decides whether cluster clusterID in idx has shrunk below the
+// merge threshold (0.25× mean size) and collapses it into a neighbour if so.
+func CheckMerge(idx *Index, clusterID uint32) error {
+	return errors.New("not implemented: CheckMerge")
+}
