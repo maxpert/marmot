@@ -72,6 +72,11 @@ type Index struct {
 	// Keyed by clusterID. Access under per-shard lock.
 	publishCounts map[uint32]uint64
 
+	// specMu guards mutations to the spec field.
+	// Graduate holds Write lock when updating Nlist/Epoch; background goroutines
+	// that read spec fields hold Read lock.
+	specMu sync.RWMutex
+
 	// docIDCounter is the in-memory next docID to allocate (block-allocated).
 	// docIDBlockEnd is the exclusive upper bound of the currently-reserved block.
 	// docIDAllocMu serialises Pebble block reservations.
@@ -230,7 +235,10 @@ func (idx *Index) publishDirtyCentroids() {
 		lk.Unlock()
 
 		// Persist updated centroid to store.
-		if err := idx.st.PutCentroid(cid, centroid, idx.spec.InternalDim()); err != nil {
+		idx.specMu.RLock()
+		internalDim := idx.spec.InternalDim()
+		idx.specMu.RUnlock()
+		if err := idx.st.PutCentroid(cid, centroid, internalDim); err != nil {
 			idx.logger.Error().Err(err).Uint32("clusterID", cid).Msg("vecindex: persist centroid update failed")
 		}
 	}

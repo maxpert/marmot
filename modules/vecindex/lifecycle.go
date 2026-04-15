@@ -196,10 +196,14 @@ func Graduate(ctx context.Context, idx *Index, targetNlist int) error {
 
 	oldState := idx.centroids.Load()
 	idx.centroids.Store(newState)
+
+	idx.specMu.Lock()
 	idx.spec.Nlist = nlist
 	idx.spec.Epoch = epoch
+	updatedSpec := idx.spec
+	idx.specMu.Unlock()
 
-	if err := persistSpec(idx.st, idx.spec); err != nil {
+	if err := persistSpec(idx.st, updatedSpec); err != nil {
 		idx.logger.Error().Err(err).Msg("vecindex: failed to persist spec after graduation")
 	}
 
