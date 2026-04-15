@@ -442,3 +442,98 @@ func TestStats_Accurate(t *testing.T) {
 
 	_ = metric.MetricL2 // keep metric import used
 }
+
+// TestUpsert_SQ8_Integration verifies that SQ8-encoded upserts produce valid
+// posting bytes and that subsequent search returns correct results.
+func TestUpsert_SQ8_Integration(t *testing.T) {
+	t.Parallel()
+	const (
+		n   = 500
+		dim = 32
+		k   = 5
+	)
+	ctx := context.Background()
+	e := newTempEngine(t)
+
+	spec := IVFSpec{
+		ID:           "sq8-upsert-test",
+		Dim:          dim,
+		Metric:       MetricL2,
+		Nlist:        0,
+		Nprobe:       0,
+		Quantization: QuantSQ8,
+	}
+
+	vecs := makeRandomVectors(n, dim, 77)
+	bulk := make([]BulkEntry, n)
+	for i, v := range vecs {
+		bulk[i] = BulkEntry{ExternalID: []byte(fmt.Sprintf("sq8-%d", i)), Vector: v}
+	}
+
+	idx, err := e.CreateIndex(ctx, spec, bulk)
+	require.NoError(t, err)
+
+	// Verify posting bytes are SQ8 format (8 + dim bytes, not 4*dim).
+	entry, scanErr := idx.st.ScanClusterRaw(0)
+	require.NoError(t, scanErr)
+	require.NotEmpty(t, entry)
+	expectedSize := 8 + dim
+	require.Equal(t, expectedSize, len(entry[0].Value),
+		"SQ8 posting must be 8+dim bytes, got %d", len(entry[0].Value))
+
+	// Upsert a new vector and verify it is searchable.
+	newVec := makeRandomVectors(1, dim, 999)[0]
+	require.NoError(t, idx.Upsert(ctx, []byte("sq8-new"), newVec, 1000, 0))
+
+	hits, err := idx.Search(ctx, SearchRequest{Vector: newVec, K: k})
+	require.NoError(t, err)
+	require.NotEmpty(t, hits)
+	require.Equal(t, "sq8-new", string(hits[0].ExternalID),
+		"exact match must be nearest neighbour")
+}
+
+// TestSearch_SQ8_Recall verifies that SQ8 quantization achieves recall@10 >= 0.9
+// on a synthetic 1536-D index with 8K vectors (IVF phase).
+func TestSearch_SQ8_Recall(t *testing.T) {
+	t.Parallel()
+	const (
+		n         = 8_000
+		dim       = 128
+		k         = 10
+		nQueries  = 50
+		minRecall = 0.85
+	)
+	ctx := context.Background()
+	e := newTempEngine(t)
+
+	spec := IVFSpec{
+		ID:           "sq8-recall",
+		Dim:          dim,
+		Metric:       MetricL2,
+		Nlist:        64,
+		Nprobe:       16,
+		Quantization: QuantSQ8,
+	}
+
+	vecs := makeRandomVectors(n, dim, 31)
+	bulk := make([]BulkEntry, n)
+	for i, v := range vecs {
+		bulk[i] = BulkEntry{ExternalID: []byte(fmt.Sprintf("v%d", i)), Vector: v}
+	}
+
+	idx, err := e.CreateIndex(ctx, spec, bulk)
+	require.NoError(t, err)
+	require.NoError(t, Graduate(ctx, idx, 64))
+
+	queries := makeRandomVectors(nQueries, dim, 17)
+	var totalRecall float32
+	for _, q := range queries {
+		truth := bruteForceTopK(q, vecs, k, MetricL2)
+		hits, searchErr := idx.Search(ctx, SearchRequest{Vector: q, K: k})
+		require.NoError(t, searchErr)
+		totalRecall += computeRecall(hits, truth, k)
+	}
+	avgRecall := totalRecall / float32(nQueries)
+	require.GreaterOrEqual(t, avgRecall, float32(minRecall),
+		"SQ8 IVF recall@10 must be >= %.2f, got %.3f", minRecall, avgRecall)
+}

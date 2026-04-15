@@ -24,6 +24,18 @@ const (
 	BloomBitsPerKey = 10
 )
 
+// Quantization selects the posting-list vector encoding format.
+type Quantization uint8
+
+const (
+	// QuantNone stores posting vectors as raw float32 (legacy path).
+	QuantNone Quantization = iota
+	// QuantSQ8 stores posting vectors as scalar int8 quantization:
+	// [scale float32][sqNorm2 float32][codes int8[dim]] = 8+dim bytes.
+	// At dim=1536 this is 1544 bytes vs 6144 for float32 — ~4× smaller.
+	QuantSQ8
+)
+
 // IVFSpec describes the configuration for a single IVF vector index.
 type IVFSpec struct {
 	// ID is the unique index identifier.
@@ -40,17 +52,21 @@ type IVFSpec struct {
 	Seed uint64
 	// Epoch tracks the centroid generation; incremented on retrain.
 	Epoch uint64
+	// Quantization selects the posting-list encoding. QuantSQ8 is the default.
+	Quantization Quantization
 }
 
 // DefaultSpec returns a sensible IVFSpec for a new empty index.
 // Lifecycle management may adjust Nlist/Nprobe as the index grows.
+// Quantization defaults to QuantSQ8 for optimal I/O performance.
 func DefaultSpec(id string, dim int, metric Metric) IVFSpec {
 	return IVFSpec{
-		ID:     id,
-		Dim:    dim,
-		Metric: metric,
-		Nlist:  256,
-		Nprobe: 16,
+		ID:           id,
+		Dim:          dim,
+		Metric:       metric,
+		Nlist:        256,
+		Nprobe:       16,
+		Quantization: QuantSQ8,
 	}
 }
 

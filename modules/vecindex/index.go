@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -14,6 +15,7 @@ import (
 	"github.com/cockroachdb/pebble"
 	"github.com/maxpert/marmot/modules/vecindex/pkg/kmeans"
 	"github.com/maxpert/marmot/modules/vecindex/pkg/metric"
+	"github.com/maxpert/marmot/modules/vecindex/pkg/quant"
 	"github.com/maxpert/marmot/modules/vecindex/pkg/store"
 	"github.com/rs/zerolog"
 )
@@ -381,7 +383,7 @@ func (idx *Index) bulkLoad(ctx context.Context, bulk []BulkEntry) error {
 				e := bulk[i]
 				docID := uint64(i) // 0-indexed to match brute-force truth indices
 
-				if bErr := b.BatchPutPosting(0, docID, e.Vector); bErr != nil {
+				if bErr := idx.batchPutPostingVec(b, 0, docID, e.Vector); bErr != nil {
 					_ = b.Close()
 					results[slot].err = bErr
 					return
@@ -466,6 +468,22 @@ func (idx *Index) Search(ctx context.Context, req SearchRequest) ([]SearchHit, e
 	return idx.ivfSearch(ctx, req, cs)
 }
 
+// distanceFromBytes computes distance between query and a stored posting byte slice.
+// Routes to the SQ8 path when the index uses QuantSQ8, otherwise uses the float32 path.
+func (idx *Index) distanceFromBytes(queryEncoded quant.Vector, query []float32, vecBytes []byte) float32 {
+	if idx.spec.Quantization == QuantSQ8 {
+		switch idx.spec.Metric {
+		case MetricL2:
+			return quant.L2SquaredFromSQ8(queryEncoded, vecBytes)
+		case MetricCosine:
+			return quant.CosineFromSQ8(queryEncoded, vecBytes)
+		default:
+			return quant.DotFromSQ8(queryEncoded, vecBytes)
+		}
+	}
+	return metric.DistanceFromBytes(idx.spec.Metric, query, vecBytes)
+}
+
 // flatSearch scans all vectors in cluster 0 and returns exact top-k.
 func (idx *Index) flatSearch(ctx context.Context, req SearchRequest) ([]SearchHit, error) {
 	k := req.K
@@ -474,11 +492,16 @@ func (idx *Index) flatSearch(ctx context.Context, req SearchRequest) ([]SearchHi
 	h := &hitHeap{}
 	heap.Init(h)
 
+	var qEncoded quant.Vector
+	if idx.spec.Quantization == QuantSQ8 {
+		qEncoded = quant.Encode(req.Vector)
+	}
+
 	scanErr := idx.st.ScanClusterFunc(0, func(docID uint64, vecBytes []byte) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		d := metric.DistanceFromBytes(idx.spec.Metric, req.Vector, vecBytes)
+		d := idx.distanceFromBytes(qEncoded, req.Vector, vecBytes)
 		heap.Push(h, SearchHit{DocID: docID, Distance: d})
 		if h.Len() > k {
 			heap.Pop(h)
@@ -565,6 +588,12 @@ func (idx *Index) ivfSearch(ctx context.Context, req SearchRequest, cs *centroid
 
 	k := req.K
 
+	// Encode query once for SQ8 path; zero value is safe for float32 path.
+	var qEncoded quant.Vector
+	if idx.spec.Quantization == QuantSQ8 {
+		qEncoded = quant.Encode(req.Vector)
+	}
+
 	// Parallel scan: cap goroutines at min(nprobe, GOMAXPROCS×2).
 	concurrency := runtime.GOMAXPROCS(0) * 2
 	if concurrency > len(ids) {
@@ -597,7 +626,7 @@ func (idx *Index) ivfSearch(ctx context.Context, req SearchRequest, cs *centroid
 			lh := &hitHeap{}
 			heap.Init(lh)
 			scanErr := idx.st.ScanClusterFunc(cid, func(docID uint64, vecBytes []byte) error {
-				d := metric.DistanceFromBytes(idx.spec.Metric, req.Vector, vecBytes)
+				d := idx.distanceFromBytes(qEncoded, req.Vector, vecBytes)
 				heap.Push(lh, SearchHit{DocID: docID, Distance: d})
 				if lh.Len() > k {
 					heap.Pop(lh)
@@ -738,7 +767,7 @@ func (idx *Index) Upsert(ctx context.Context, externalID []byte, vec []float32, 
 			lk.Unlock()
 		}
 	}
-	if err := b.BatchPutPosting(clusterID, docID, vec); err != nil {
+	if err := idx.batchPutPostingVec(b, clusterID, docID, vec); err != nil {
 		_ = b.Close()
 		return err
 	}
@@ -916,6 +945,43 @@ func (idx *Index) getWatermark(externalID []byte) (txnID, seqID uint64, found bo
 	txnID = binary.BigEndian.Uint64(val[:8])
 	seqID = binary.BigEndian.Uint64(val[8:16])
 	return txnID, seqID, true
+}
+
+// batchPutPostingVec writes a posting entry using the index's configured encoding.
+// For QuantSQ8 it encodes vec to SQ8 bytes; for QuantNone it writes raw float32.
+func (idx *Index) batchPutPostingVec(b *store.Batch, clusterID uint32, docID uint64, vec []float32) error {
+	if idx.spec.Quantization == QuantSQ8 {
+		q := quant.Encode(vec)
+		raw := quant.MarshalBinary(q, nil)
+		return b.BatchPutPostingRaw(clusterID, docID, raw)
+	}
+	return b.BatchPutPosting(clusterID, docID, vec)
+}
+
+// decodePostingBytes converts stored posting bytes to float32 based on the
+// index's quantization mode. For QuantNone, bytes are raw little-endian float32.
+// For QuantSQ8, bytes are decoded via quant.Decode.
+func (idx *Index) decodePostingBytes(vecBytes []byte) []float32 {
+	if idx.spec.Quantization == QuantSQ8 {
+		scale, _, off := quant.UnmarshalHeader(vecBytes)
+		codes := vecBytes[off:]
+		out := make([]float32, len(codes))
+		for i, c := range codes {
+			out[i] = float32(int8(c)) * scale
+		}
+		return out
+	}
+	// QuantNone: raw little-endian float32
+	n := len(vecBytes) / 4
+	out := make([]float32, n)
+	for i := range out {
+		bits := uint32(vecBytes[i*4]) |
+			uint32(vecBytes[i*4+1])<<8 |
+			uint32(vecBytes[i*4+2])<<16 |
+			uint32(vecBytes[i*4+3])<<24
+		out[i] = math.Float32frombits(bits)
+	}
+	return out
 }
 
 // hitHeap is a max-heap of SearchHit ordered by Distance (largest distance at top).

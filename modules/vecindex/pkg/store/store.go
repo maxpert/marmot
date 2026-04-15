@@ -265,6 +265,47 @@ func (s *Store) ScanCluster(clusterID uint32) ([]PostingEntry, error) {
 	return entries, nil
 }
 
+// RawPostingEntry is a single result returned by ScanClusterRaw.
+type RawPostingEntry struct {
+	// DocID is the internal document identifier.
+	DocID uint64
+	// Value is a copy of the raw stored bytes for this posting.
+	Value []byte
+}
+
+// ScanClusterRaw iterates all posting entries for clusterID and returns raw bytes.
+// Unlike ScanCluster, it does not interpret the value bytes — callers decode based
+// on their encoding scheme (float32 or SQ8).
+func (s *Store) ScanClusterRaw(clusterID uint32) ([]RawPostingEntry, error) {
+	lower := EncodePostingPrefix(clusterID)
+	upper := EncodePostingPrefix(clusterID + 1)
+
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: lower,
+		UpperBound: upper,
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer iter.Close()
+
+	var entries []RawPostingEntry
+	for iter.First(); iter.Valid(); iter.Next() {
+		key := iter.Key()
+		if len(key) < 13 || key[0] != KeyPrefixPosting {
+			break
+		}
+		docID := binary.BigEndian.Uint64(key[5:13])
+		val := make([]byte, len(iter.Value()))
+		copy(val, iter.Value())
+		entries = append(entries, RawPostingEntry{DocID: docID, Value: val})
+	}
+	if err := iter.Error(); err != nil {
+		return nil, err
+	}
+	return entries, nil
+}
+
 // ScanClusterFunc iterates all posting entries for clusterID, calling fn for each
 // entry with its docID and the raw little-endian float32 bytes of the vector.
 // fn MUST NOT retain vecBytes beyond its return — the slice is owned by the Pebble
@@ -494,6 +535,13 @@ func (s *Store) Checkpoint(destDir string) error {
 func (b *Batch) BatchPutPosting(clusterID uint32, docID uint64, vec []float32) error {
 	key := EncodePostingKey(clusterID, docID)
 	val := encodeFloat32Slice(vec)
+	return b.b.Set(key, val, pebble.NoSync)
+}
+
+// BatchPutPostingRaw adds a pre-encoded posting value to the batch.
+// The caller is responsible for encoding val in the correct format (e.g. SQ8).
+func (b *Batch) BatchPutPostingRaw(clusterID uint32, docID uint64, val []byte) error {
+	key := EncodePostingKey(clusterID, docID)
 	return b.b.Set(key, val, pebble.NoSync)
 }
 
