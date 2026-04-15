@@ -210,15 +210,13 @@ func loadSpec(st *store.Store) (IVFSpec, error) {
 
 // pebbleOptions returns pebble.Options configured with the engine's cache size and a bloom filter.
 // cacheMB <= 0 defaults to 64 MB.
+// The caller (store.New) must call opts.Cache.Unref() after pebble.Open takes its own reference.
 func (e *Engine) pebbleOptions() *pebble.Options {
 	mb := e.cacheMB
 	if mb <= 0 {
 		mb = 64
 	}
 	cache := pebble.NewCache(int64(mb) << 20)
-	// pebble.Options.Cache takes its own reference; release ours so the cache is
-	// freed when the DB closes (MR-04: prevent one reference leak per open call).
-	defer cache.Unref()
 	return &pebble.Options{
 		Cache: cache,
 		Levels: []pebble.LevelOptions{

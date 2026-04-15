@@ -86,10 +86,15 @@ type Store struct {
 }
 
 // New opens or creates a Pebble store at the given directory path.
+// If opts.Cache is non-nil, New releases the caller's construction-time reference
+// after pebble.Open takes its own, preventing a one-ref leak per open call (MR-04).
 func New(dir string, opts *pebble.Options) (*Store, error) {
 	db, err := pebble.Open(dir, opts)
 	if err != nil {
 		return nil, fmt.Errorf("store: open pebble at %s: %w", dir, err)
+	}
+	if opts != nil && opts.Cache != nil {
+		opts.Cache.Unref()
 	}
 
 	s := &Store{db: db}
