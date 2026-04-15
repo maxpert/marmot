@@ -40,6 +40,13 @@ type clusterStats struct {
 	count uint64    // number of vectors assigned
 }
 
+// LOCK ORDER: onlineMu must never be acquired while holding a shard lock.
+// Correct order when both are needed: (1) shard lock, (2) onlineMu.
+// publishDirtyCentroids takes onlineMu for a snapshot copy, releases it, then
+// acquires shard locks individually — this is the only safe pattern.
+// macQueenUpdate is called under the shard lock and acquires onlineMu internally;
+// callers must never hold onlineMu before calling macQueenUpdate.
+
 // Index is an open IVF vector index backed by a Pebble store.
 type Index struct {
 	spec          IVFSpec
@@ -64,6 +71,13 @@ type Index struct {
 	// publishCounts tracks the count value at the last centroid publish per cluster.
 	// Keyed by clusterID. Access under per-shard lock.
 	publishCounts map[uint32]uint64
+
+	// docIDCounter is the in-memory next docID to allocate (block-allocated).
+	// docIDBlockEnd is the exclusive upper bound of the currently-reserved block.
+	// docIDAllocMu serialises Pebble block reservations.
+	docIDCounter  atomic.Uint64
+	docIDBlockEnd atomic.Uint64
+	docIDAllocMu  sync.Mutex
 }
 
 // centroidState bundles a CentroidSet with the corresponding store cluster IDs.
@@ -78,7 +92,12 @@ func (idx *Index) clusterLock(clusterID uint32) *sync.Mutex {
 	return &idx.locks[clusterID%clusterShards]
 }
 
+// docIDBlockSize is the number of docIDs reserved per Pebble write.
+// Unused IDs in the last block are abandoned on close (no collision risk).
+const docIDBlockSize = 1024
+
 // newIndex constructs an Index without loading existing data.
+// It loads the persisted docID counter and reserves the first block.
 func newIndex(spec IVFSpec, st *store.Store, logger zerolog.Logger) *Index {
 	idx := &Index{
 		spec:          spec,
@@ -91,9 +110,28 @@ func newIndex(spec IVFSpec, st *store.Store, logger zerolog.Logger) *Index {
 		onlineStats:   make(map[uint32]*clusterStats),
 		publishCounts: make(map[uint32]uint64),
 	}
+	idx.reserveDocIDBlock()
 	go idx.compactWorker()
 	go idx.publishWorker()
 	return idx
+}
+
+// reserveDocIDBlock reads the persisted counter, reserves the next block of
+// docIDBlockSize IDs via a Sync Pebble write, and sets in-memory bounds.
+// Must be called with docIDAllocMu held, or during single-threaded init.
+func (idx *Index) reserveDocIDBlock() {
+	val, closer, err := idx.st.DB().Get(keyDocIDCounter)
+	var persisted uint64
+	if err == nil {
+		persisted = binary.BigEndian.Uint64(val)
+		closer.Close()
+	}
+	blockEnd := persisted + docIDBlockSize
+	buf := make([]byte, 8)
+	binary.BigEndian.PutUint64(buf, blockEnd)
+	_ = idx.st.DB().Set(keyDocIDCounter, buf, pebble.Sync)
+	idx.docIDCounter.Store(persisted)
+	idx.docIDBlockEnd.Store(blockEnd)
 }
 
 // compactWorker drains compactNotify and runs Pebble compaction asynchronously.
@@ -192,7 +230,9 @@ func (idx *Index) publishDirtyCentroids() {
 		lk.Unlock()
 
 		// Persist updated centroid to store.
-		_ = idx.st.PutCentroid(cid, centroid, idx.spec.Dim)
+		if err := idx.st.PutCentroid(cid, centroid, idx.spec.InternalDim()); err != nil {
+			idx.logger.Error().Err(err).Uint32("clusterID", cid).Msg("vecindex: persist centroid update failed")
+		}
 	}
 
 	if !dirty {
@@ -211,11 +251,10 @@ func (idx *Index) publishDirtyCentroids() {
 // initClusterStats initialises online MacQueen state from a full vector assignment
 // after graduation. Called once per graduation; not on hot path.
 func (idx *Index) initClusterStats(clusterIDs []uint32, centroids [][]float32, vecs [][]float32) {
-	dim := idx.spec.Dim
 	stats := make(map[uint32]*clusterStats, len(clusterIDs))
 	for i, cid := range clusterIDs {
 		stats[cid] = &clusterStats{
-			sum:   make([]float64, dim),
+			sum:   make([]float64, idx.spec.InternalDim()),
 			count: 0,
 		}
 		// Seed sum from the k-means centroid itself.
@@ -227,7 +266,7 @@ func (idx *Index) initClusterStats(clusterIDs []uint32, centroids [][]float32, v
 
 	// Accumulate each vector into its assigned cluster.
 	for _, vec := range vecs {
-		centIdx, _, err := kmeans.Assign(vec, centroids, idx.spec.Metric)
+		centIdx, _, err := kmeans.Assign(vec, centroids, idx.storageMetric())
 		if err != nil {
 			continue
 		}
@@ -343,11 +382,6 @@ func (idx *Index) bulkLoad(ctx context.Context, bulk []BulkEntry) error {
 	nWorkers := runtime.GOMAXPROCS(0)
 	chunkSize := (n + nWorkers - 1) / nWorkers
 
-	// docIDBase is the atomic counter for block-allocated docIDs.
-	// Workers reserve blocks of bulkBlockSize by incrementing this.
-	var docIDBase atomic.Uint64
-	docIDBase.Store(0)
-
 	type workerResult struct {
 		count uint32
 		err   error
@@ -434,11 +468,17 @@ func (idx *Index) bulkLoad(ctx context.Context, bulk []BulkEntry) error {
 		return err
 	}
 
-	// Seed docID counter beyond bulk range.
+	// Seed docID counter beyond bulk range so nextDocID never collides with
+	// bulk-assigned IDs. Use Sync to ensure durability before any subsequent
+	// Upserts read the counter.
 	if n > 0 {
 		buf := make([]byte, 8)
 		binary.BigEndian.PutUint64(buf, uint64(n-1))
-		_ = idx.st.DB().Set(keyDocIDCounter, buf, pebble.NoSync)
+		_ = idx.st.DB().Set(keyDocIDCounter, buf, pebble.Sync)
+		// Reset the in-memory block so the next nextDocID() call allocates a
+		// fresh block starting above the bulk range.
+		idx.docIDCounter.Store(uint64(n - 1))
+		idx.docIDBlockEnd.Store(uint64(n - 1))
 	}
 
 	idx.vectorCount.Store(uint64(n))
@@ -446,24 +486,42 @@ func (idx *Index) bulkLoad(ctx context.Context, bulk []BulkEntry) error {
 }
 
 // Search returns up to req.K nearest neighbours for the given query vector.
-// MetricDot is not supported — returns an error.
+// For MetricDot, query is MIPS-augmented and returned distances are -⟨q,v⟩
+// (lower is more similar, consistent with other metrics).
 func (idx *Index) Search(ctx context.Context, req SearchRequest) ([]SearchHit, error) {
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
 	}
-	if idx.spec.Metric == MetricDot {
-		return nil, errors.New("vecindex: MetricDot not yet supported; use pre-normalized vectors with MetricCosine")
-	}
 
-	// Normalize query for cosine metric.
-	query := normalizeVec(req.Vector, idx.spec.Metric)
-	req.Vector = query
+	var queryNorm2 float32
+	if idx.spec.Metric == MetricDot {
+		queryNorm2 = metric.Norm2(req.Vector)
+		req.Vector = metric.AugmentQuery(req.Vector, nil)
+	} else {
+		// Normalize query for cosine metric.
+		req.Vector = normalizeVec(req.Vector, idx.spec.Metric)
+	}
 
 	cs := idx.centroids.Load()
+	var hits []SearchHit
+	var err error
 	if cs == nil {
-		return idx.flatSearch(ctx, req)
+		hits, err = idx.flatSearch(ctx, req)
+	} else {
+		hits, err = idx.ivfSearch(ctx, req, cs)
 	}
-	return idx.ivfSearch(ctx, req, cs)
+	if err != nil || idx.spec.Metric != MetricDot {
+		return hits, err
+	}
+
+	// Convert L2² on augmented space back to -⟨q,v⟩ so callers get meaningful
+	// inner-product distances (lower = more similar).
+	maxNorm := idx.spec.MaxNorm
+	for i := range hits {
+		dot := metric.RecoverDotFromL2Sq(hits[i].Distance, queryNorm2, maxNorm)
+		hits[i].Distance = -dot
+	}
+	return hits, nil
 }
 
 // flatSearch scans all vectors in cluster 0 and returns exact top-k.
@@ -478,7 +536,7 @@ func (idx *Index) flatSearch(ctx context.Context, req SearchRequest) ([]SearchHi
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		d := metric.DistanceFromBytes(idx.spec.Metric, req.Vector, vecBytes)
+		d := metric.DistanceFromBytes(idx.storageMetric(), req.Vector, vecBytes)
 		heap.Push(h, SearchHit{DocID: docID, Distance: d})
 		if h.Len() > k {
 			heap.Pop(h)
@@ -527,7 +585,7 @@ func (idx *Index) ivfSearch(ctx context.Context, req SearchRequest, cs *centroid
 	if fetchN > cs.cs.Len() {
 		fetchN = cs.cs.Len()
 	}
-	ids, dists, err := kmeans.AssignTopN(req.Vector, centVecs, fetchN, idx.spec.Metric)
+	ids, dists, err := kmeans.AssignTopN(req.Vector, centVecs, fetchN, idx.storageMetric())
 	if err != nil {
 		return nil, fmt.Errorf("index: assign centroids: %w", err)
 	}
@@ -548,7 +606,7 @@ func (idx *Index) ivfSearch(ctx context.Context, req SearchRequest, cs *centroid
 			if fetchBump > cs.cs.Len() {
 				fetchBump = cs.cs.Len()
 			}
-			newIDs, newDists, assignErr := kmeans.AssignTopN(req.Vector, centVecs, fetchBump, idx.spec.Metric)
+			newIDs, newDists, assignErr := kmeans.AssignTopN(req.Vector, centVecs, fetchBump, idx.storageMetric())
 			if assignErr != nil {
 				return nil, assignErr
 			}
@@ -597,7 +655,7 @@ func (idx *Index) ivfSearch(ctx context.Context, req SearchRequest, cs *centroid
 			lh := &hitHeap{}
 			heap.Init(lh)
 			scanErr := idx.st.ScanClusterFunc(cid, func(docID uint64, vecBytes []byte) error {
-				d := metric.DistanceFromBytes(idx.spec.Metric, req.Vector, vecBytes)
+				d := metric.DistanceFromBytes(idx.storageMetric(), req.Vector, vecBytes)
 				heap.Push(lh, SearchHit{DocID: docID, Distance: d})
 				if lh.Len() > k {
 					heap.Pop(lh)
@@ -647,17 +705,23 @@ func (idx *Index) ivfSearch(ctx context.Context, req SearchRequest, cs *centroid
 }
 
 // Upsert inserts or updates the vector associated with externalID.
-// Returns an error for MetricDot (unsupported).
+// For MetricDot, the vector is MIPS-augmented before storage; any vector whose
+// L2 norm exceeds IVFSpec.MaxNorm is rejected.
 func (idx *Index) Upsert(ctx context.Context, externalID []byte, vec []float32, txnID, seqID uint64) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
-	if idx.spec.Metric == MetricDot {
-		return errors.New("vecindex: MetricDot not yet supported; use pre-normalized vectors with MetricCosine")
-	}
 
-	// Normalize for cosine metric before storing.
-	vec = normalizeVec(vec, idx.spec.Metric)
+	var err error
+	switch idx.spec.Metric {
+	case MetricDot:
+		vec, err = metric.AugmentData(vec, idx.spec.MaxNorm, nil)
+		if err != nil {
+			return fmt.Errorf("vecindex: upsert %s: %w", externalID, err)
+		}
+	case MetricCosine:
+		vec = normalizeVec(vec, idx.spec.Metric)
+	}
 
 	// Check watermark for idempotency.
 	wmTxn, wmSeq, wmFound := idx.getWatermark(externalID)
@@ -688,7 +752,7 @@ func (idx *Index) Upsert(ctx context.Context, externalID []byte, vec []float32, 
 			v, _ := cs.cs.GetReadOnly(uint32(i))
 			centVecs[i] = v
 		}
-		centIdx, _, assignErr := kmeans.Assign(vec, centVecs, idx.spec.Metric)
+		centIdx, _, assignErr := kmeans.Assign(vec, centVecs, idx.storageMetric())
 		if assignErr == nil && int(centIdx) < len(cs.clusterIDs) {
 			clusterID = cs.clusterIDs[centIdx]
 		}
@@ -701,74 +765,106 @@ func (idx *Index) Upsert(ctx context.Context, externalID []byte, vec []float32, 
 		docID = idx.nextDocID()
 	}
 
+	// Hold the shard lock for the entire read-meta → increment → batch-commit
+	// sequence so concurrent Upserts to the same cluster never overwrite each
+	// other's size writes (HR-01 TOCTOU fix).
+	lk := idx.clusterLock(clusterID)
+	lk.Lock()
+
 	newMeta, err := idx.st.GetClusterMeta(clusterID)
 	if errors.Is(err, store.ErrNotFound) {
 		newMeta = store.ClusterMeta{State: store.ClusterStateActive}
 	} else if err != nil {
+		lk.Unlock()
 		return err
 	}
-
-	// Acquire per-cluster shard lock only for the cluster stat update.
-	lk := idx.clusterLock(clusterID)
-	lk.Lock()
-	newMeta.Size++
-	lk.Unlock()
 
 	b := idx.st.NewBatch()
 	if isUpdate {
 		if batchErr := b.BatchDeletePosting(oldClusterID, existingDocID); batchErr != nil {
 			_ = b.Close()
+			lk.Unlock()
 			return batchErr
 		}
 		if oldClusterID != clusterID {
+			// Acquire old-cluster lock using canonical order (lower ID first) to
+			// prevent deadlock with concurrent merges/upserts on the same pair.
 			lkOld := idx.clusterLock(oldClusterID)
-			lkOld.Lock()
+			if oldClusterID%clusterShards < clusterID%clusterShards {
+				// lkOld maps to a lower or equal shard index — must be taken first,
+				// but lk is already held. Unlock lk, take lkOld, retake lk.
+				lk.Unlock()
+				lkOld.Lock()
+				lk.Lock()
+				// Re-read newMeta because another goroutine may have modified it.
+				newMeta, err = idx.st.GetClusterMeta(clusterID)
+				if errors.Is(err, store.ErrNotFound) {
+					newMeta = store.ClusterMeta{State: store.ClusterStateActive}
+				} else if err != nil {
+					lkOld.Unlock()
+					lk.Unlock()
+					_ = b.Close()
+					return err
+				}
+			} else {
+				lkOld.Lock()
+			}
 			if oldMeta.Size > 0 {
 				oldMeta.Size--
 			}
-			lkOld.Unlock()
 			if batchErr := b.BatchPutClusterMeta(oldClusterID, oldMeta); batchErr != nil {
+				lkOld.Unlock()
+				lk.Unlock()
 				_ = b.Close()
 				return batchErr
 			}
-		} else {
-			// Same cluster: net size unchanged.
-			lk.Lock()
-			newMeta.Size = oldMeta.Size
-			lk.Unlock()
+			lkOld.Unlock()
+			newMeta.Size++
 		}
+		// Same cluster: net size unchanged — no Size mutation needed.
+	} else {
+		newMeta.Size++
 	}
+
 	if err := b.BatchPutPosting(clusterID, docID, vec); err != nil {
+		lk.Unlock()
 		_ = b.Close()
 		return err
 	}
 	if err := b.BatchPutReverseMap(docID, clusterID); err != nil {
+		lk.Unlock()
 		_ = b.Close()
 		return err
 	}
 	if err := b.BatchPutExtToDoc(externalID, docID); err != nil {
+		lk.Unlock()
 		_ = b.Close()
 		return err
 	}
 	if err := b.BatchPutDocToExt(docID, externalID); err != nil {
+		lk.Unlock()
 		_ = b.Close()
 		return err
 	}
 	if err := b.BatchPutClusterMeta(clusterID, newMeta); err != nil {
+		lk.Unlock()
 		_ = b.Close()
 		return err
 	}
 	if err := b.BatchPutWatermark(externalID, txnID, seqID); err != nil {
+		lk.Unlock()
 		_ = b.Close()
 		return err
 	}
 	if err := b.Commit(); err != nil {
+		lk.Unlock()
 		_ = b.Close()
 		return err
 	}
 
-	// MacQueen online centroid update — after successful Pebble commit.
-	lk.Lock()
+	// MacQueen online centroid update — after successful Pebble commit, still
+	// under the shard lock (macQueenUpdate acquires onlineMu internally; see
+	// LOCK ORDER comment above the Index struct definition).
 	idx.macQueenUpdate(clusterID, vec)
 	lk.Unlock()
 
@@ -843,13 +939,10 @@ func (idx *Index) Delete(ctx context.Context, externalID []byte, txnID, seqID ui
 
 	idx.vectorCount.Add(^uint64(0))
 
-	if metaErr == nil {
-		meta.TombstoneCount++
-		if store.ShouldCompact(meta) && !idx.closed.Load() {
-			select {
-			case idx.compactNotify <- clusterID:
-			default:
-			}
+	if metaErr == nil && store.ShouldCompact(meta) && !idx.closed.Load() {
+		select {
+		case idx.compactNotify <- clusterID:
+		default:
 		}
 	}
 
@@ -886,20 +979,29 @@ func (idx *Index) Close() error {
 var keyDocIDCounter = []byte{0x09, 0x01}
 
 // nextDocID allocates a new monotonically-increasing document ID.
-// Uses Pebble directly; called under no mutex — atomic CAS semantics not
-// required here because callers serialize via the watermark check pattern.
+// Uses a block-allocation scheme: IDs are dispensed from an in-memory counter
+// (atomic increment); when the in-memory block is exhausted a new block is
+// reserved via a single Sync Pebble write under docIDAllocMu.  Concurrent
+// callers never collide — each gets a unique value from the atomic counter.
 func (idx *Index) nextDocID() uint64 {
-	val, closer, err := idx.st.DB().Get(keyDocIDCounter)
-	var cur uint64
-	if err == nil {
-		cur = binary.BigEndian.Uint64(val)
-		closer.Close()
+	id := idx.docIDCounter.Add(1)
+	if id <= idx.docIDBlockEnd.Load() {
+		return id
 	}
-	next := cur + 1
-	buf := make([]byte, 8)
-	binary.BigEndian.PutUint64(buf, next)
-	_ = idx.st.DB().Set(keyDocIDCounter, buf, pebble.Sync)
-	return next
+	// Block exhausted — reserve a new one under the allocation mutex.
+	idx.docIDAllocMu.Lock()
+	defer idx.docIDAllocMu.Unlock()
+	// Re-check after acquiring the lock: another goroutine may have already
+	// reserved a new block while we were waiting.
+	id = idx.docIDCounter.Add(1)
+	if id <= idx.docIDBlockEnd.Load() {
+		return id
+	}
+	// We are the designated block allocator for this round.
+	// Roll back the spurious Add before reserveDocIDBlock resets the counter.
+	idx.docIDCounter.Add(^uint64(0)) // subtract 1
+	idx.reserveDocIDBlock()
+	return idx.docIDCounter.Add(1)
 }
 
 // getWatermark reads (txnID, seqID) for externalID from the 0x08 namespace.
@@ -916,6 +1018,16 @@ func (idx *Index) getWatermark(externalID []byte) (txnID, seqID uint64, found bo
 	txnID = binary.BigEndian.Uint64(val[:8])
 	seqID = binary.BigEndian.Uint64(val[8:16])
 	return txnID, seqID, true
+}
+
+// storageMetric returns the metric used for distance computations on stored vectors.
+// For MetricDot, vectors are MIPS-augmented so L2Squared is the correct storage metric.
+// For all other metrics it equals idx.spec.Metric.
+func (idx *Index) storageMetric() metric.Metric {
+	if idx.spec.Metric == MetricDot {
+		return MetricL2
+	}
+	return idx.spec.Metric
 }
 
 // hitHeap is a max-heap of SearchHit ordered by Distance (largest distance at top).

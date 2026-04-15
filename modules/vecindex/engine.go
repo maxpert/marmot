@@ -168,6 +168,9 @@ func validateSpec(spec IVFSpec) error {
 	if spec.Metric != MetricL2 && spec.Metric != MetricDot && spec.Metric != MetricCosine {
 		return fmt.Errorf("vecindex: unknown metric %d", spec.Metric)
 	}
+	if spec.Metric == MetricDot && spec.MaxNorm <= 0 {
+		return errors.New("vecindex: MaxNorm must be > 0 for MetricDot")
+	}
 	// Reject specs where Nprobe is set but Nlist is 0 — that's an inconsistent state.
 	if spec.Nprobe > 0 && spec.Nlist == 0 {
 		return errors.New("vecindex: Nlist must be > 0 when Nprobe > 0")
@@ -198,6 +201,10 @@ func loadSpec(st *store.Store) (IVFSpec, error) {
 	if err := msgpack.Unmarshal(val, &spec); err != nil {
 		return IVFSpec{}, fmt.Errorf("vecindex: decode spec: %w", err)
 	}
+	// Back-compat: old persisted specs predate MaxNorm; apply default.
+	if spec.Metric == MetricDot && spec.MaxNorm <= 0 {
+		spec.MaxNorm = defaultMaxNorm
+	}
 	return spec, nil
 }
 
@@ -209,6 +216,9 @@ func (e *Engine) pebbleOptions() *pebble.Options {
 		mb = 64
 	}
 	cache := pebble.NewCache(int64(mb) << 20)
+	// pebble.Options.Cache takes its own reference; release ours so the cache is
+	// freed when the DB closes (MR-04: prevent one reference leak per open call).
+	defer cache.Unref()
 	return &pebble.Options{
 		Cache: cache,
 		Levels: []pebble.LevelOptions{

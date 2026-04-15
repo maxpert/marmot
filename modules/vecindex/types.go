@@ -24,11 +24,16 @@ const (
 	BloomBitsPerKey = 10
 )
 
+// defaultMaxNorm is the fixed upper bound on vector L2 norms for MetricDot.
+// Vectors whose L2 norm exceeds this value are rejected at Upsert time.
+// 1000.0 comfortably covers unnormalized embeddings from common models.
+const defaultMaxNorm = float32(1000.0)
+
 // IVFSpec describes the configuration for a single IVF vector index.
 type IVFSpec struct {
 	// ID is the unique index identifier.
 	ID string
-	// Dim is the vector dimensionality.
+	// Dim is the vector dimensionality of caller-supplied vectors.
 	Dim int
 	// Metric is the distance function to use.
 	Metric Metric
@@ -40,17 +45,33 @@ type IVFSpec struct {
 	Seed uint64
 	// Epoch tracks the centroid generation; incremented on retrain.
 	Epoch uint64
+	// MaxNorm is the fixed upper bound on vector L2 norms used for MIPS→L2
+	// augmentation when Metric == MetricDot. Any vector with ||v|| > MaxNorm
+	// is rejected at Upsert time. Defaults to 1000.0 via DefaultSpec.
+	// Ignored for MetricL2 and MetricCosine.
+	MaxNorm float32
+}
+
+// InternalDim returns the dimensionality of vectors as stored in the index.
+// For MetricDot this is Dim+1 (one augmented dimension for MIPS→L2 reduction).
+// For all other metrics it equals Dim.
+func (s IVFSpec) InternalDim() int {
+	if s.Metric == MetricDot {
+		return s.Dim + 1
+	}
+	return s.Dim
 }
 
 // DefaultSpec returns a sensible IVFSpec for a new empty index.
 // Lifecycle management may adjust Nlist/Nprobe as the index grows.
 func DefaultSpec(id string, dim int, metric Metric) IVFSpec {
 	return IVFSpec{
-		ID:     id,
-		Dim:    dim,
-		Metric: metric,
-		Nlist:  256,
-		Nprobe: 16,
+		ID:      id,
+		Dim:     dim,
+		Metric:  metric,
+		Nlist:   256,
+		Nprobe:  16,
+		MaxNorm: defaultMaxNorm,
 	}
 }
 
@@ -71,6 +92,7 @@ type SearchHit struct {
 	// ExternalID is the caller-supplied identifier for the vector.
 	ExternalID []byte
 	// Distance is the computed distance to the query vector.
+	// For MetricDot: Distance = -⟨q,v⟩ (lower = more similar).
 	Distance float32
 }
 

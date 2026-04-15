@@ -94,7 +94,7 @@ func Graduate(ctx context.Context, idx *Index, targetNlist int) error {
 	}
 
 	for i, c := range centroids {
-		if err := idx.st.PutCentroid(newClusterIDs[i], c, idx.spec.Dim); err != nil {
+		if err := idx.st.PutCentroid(newClusterIDs[i], c, idx.spec.InternalDim()); err != nil {
 			return fmt.Errorf("vecindex: put centroid %d: %w", i, err)
 		}
 	}
@@ -133,7 +133,7 @@ func Graduate(ctx context.Context, idx *Index, targetNlist int) error {
 					return
 				}
 				vec := vecs[vi]
-				centIdx, _, assignErr := kmeans.Assign(vec, centroids, idx.spec.Metric)
+				centIdx, _, assignErr := kmeans.Assign(vec, centroids, idx.storageMetric())
 				if assignErr != nil {
 					_ = b.Close()
 					errs[slot].err = assignErr
@@ -320,10 +320,10 @@ func splitCluster(idx *Index, clusterID uint32, cs *centroidState) error {
 		return err
 	}
 
-	if err := idx.st.PutCentroid(newCID1, newCentroids[0], idx.spec.Dim); err != nil {
+	if err := idx.st.PutCentroid(newCID1, newCentroids[0], idx.spec.InternalDim()); err != nil {
 		return err
 	}
-	if err := idx.st.PutCentroid(newCID2, newCentroids[1], idx.spec.Dim); err != nil {
+	if err := idx.st.PutCentroid(newCID2, newCentroids[1], idx.spec.InternalDim()); err != nil {
 		return err
 	}
 
@@ -332,7 +332,7 @@ func splitCluster(idx *Index, clusterID uint32, cs *centroidState) error {
 
 	b := idx.st.NewBatch()
 	for _, e := range entries {
-		c, _, _ := kmeans.Assign(e.Vector, newCentroids, idx.spec.Metric)
+		c, _, _ := kmeans.Assign(e.Vector, newCentroids, idx.storageMetric())
 		var targetCID uint32
 		if c == 0 {
 			targetCID = newCID1
@@ -463,23 +463,45 @@ func CheckMerge(idx *Index, centIdx uint32) error {
 		return nil
 	}
 
-	// Use the index metric (not hardcoded MetricL2) to find nearest neighbour.
-	nearestIdx, _, err := kmeans.Assign(srcVec, otherVecs, idx.spec.Metric)
+	// Use storageMetric (L2 on augmented space for MetricDot) to find nearest neighbour.
+	nearestIdx, _, err := kmeans.Assign(srcVec, otherVecs, idx.storageMetric())
 	if err != nil {
 		return err
 	}
 	targetCentIdx := otherIndices[nearestIdx]
 	targetCID := cs.clusterIDs[targetCentIdx]
 
-	lk := idx.clusterLock(clusterID)
-	lk.Lock()
-	defer lk.Unlock()
+	// Acquire both shard locks in canonical order (lower shard index first) to
+	// prevent deadlock with concurrent Upserts holding one lock and waiting for
+	// the other (HR-06 fix).
+	lkSrc := idx.clusterLock(clusterID)
+	lkDst := idx.clusterLock(targetCID)
+	srcShard := clusterID % clusterShards
+	dstShard := targetCID % clusterShards
+	switch {
+	case srcShard < dstShard:
+		lkSrc.Lock()
+		lkDst.Lock()
+	case srcShard > dstShard:
+		lkDst.Lock()
+		lkSrc.Lock()
+	default:
+		// Same shard — one lock covers both clusters.
+		lkSrc.Lock()
+	}
+	defer func() {
+		lkSrc.Unlock()
+		if srcShard != dstShard {
+			lkDst.Unlock()
+		}
+	}()
 
 	entries, err := idx.st.ScanCluster(clusterID)
 	if err != nil {
 		return err
 	}
 
+	// Re-read targetMeta under the lock to get the current size.
 	targetMeta, err := idx.st.GetClusterMeta(targetCID)
 	if errors.Is(err, store.ErrNotFound) {
 		targetMeta = store.ClusterMeta{State: store.ClusterStateActive}

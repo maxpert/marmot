@@ -3,6 +3,7 @@ package vecindex
 import (
 	"context"
 	"fmt"
+	"sort"
 	"testing"
 
 	"github.com/maxpert/marmot/modules/vecindex/pkg/metric"
@@ -225,25 +226,126 @@ func TestSearch_KGreaterThanVectorCount(t *testing.T) {
 	require.Len(t, hits, 5, "k > n must return all n vectors")
 }
 
-func TestSearch_DotMetric_Unsupported(t *testing.T) {
+func TestUpsert_MetricDot_SmallIndex(t *testing.T) {
 	t.Parallel()
-	e := newTempEngine(t)
-	const dim = 8
+	const (
+		n   = 100
+		dim = 64
+		k   = 10
+		// makeRandomVectors produces components in [-1,1]; norm for dim=64 ≈ 4.6.
+		// MaxNorm=10 is a safe upper bound.
+		maxNorm = float32(10)
+	)
 	ctx := context.Background()
-	spec := DefaultSpec("dot-idx", dim, MetricDot)
+	e := newTempEngine(t)
+	spec := DefaultSpec("dot-small", dim, MetricDot)
+	spec.MaxNorm = maxNorm
 	idx, err := e.CreateIndex(ctx, spec, nil)
 	require.NoError(t, err)
 
-	// MetricDot is unsupported — Upsert and Search must return an explicit error.
-	vec := makeRandomVectors(1, dim, 5)[0]
-	err = idx.Upsert(ctx, []byte("ext-1"), vec, 1, 0)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "MetricDot not yet supported")
+	vecs := makeRandomVectors(n, dim, 77)
+	for i, v := range vecs {
+		require.NoError(t, idx.Upsert(ctx, []byte(fmt.Sprintf("v%d", i)), v, uint64(i+1), 1))
+	}
 
-	query := makeRandomVectors(1, dim, 9)[0]
-	_, err = idx.Search(ctx, SearchRequest{Vector: query, K: 3})
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "MetricDot not yet supported")
+	query := makeRandomVectors(1, dim, 55)[0]
+	truth := bruteForceTopKDot(query, vecs, k)
+
+	hits, err := idx.Search(ctx, SearchRequest{Vector: query, K: k})
+	require.NoError(t, err)
+	require.NotEmpty(t, hits)
+
+	recall := computeRecallDot(hits, truth, k)
+	require.GreaterOrEqual(t, recall, float32(0.8),
+		"MetricDot flat-scan recall@10 must be >= 0.8, got %.3f", recall)
+}
+
+func TestUpsert_MetricDot_NormExceedsMaxNorm_Error(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	e := newTempEngine(t)
+	spec := DefaultSpec("dot-norm-check", 4, MetricDot)
+	spec.MaxNorm = 5
+	idx, err := e.CreateIndex(ctx, spec, nil)
+	require.NoError(t, err)
+
+	// Vector with norm > MaxNorm (5): sqrt(16+9+1) ≈ 5.1
+	huge := []float32{4, 3, 1, 0}
+	err = idx.Upsert(ctx, []byte("big"), huge, 1, 1)
+	require.Error(t, err, "upsert of vector with norm > MaxNorm must fail")
+}
+
+func TestMetricDot_DistanceConvention(t *testing.T) {
+	t.Parallel()
+	// Verify SearchHit.Distance = -⟨q,v⟩ so lower distance = higher dot product.
+	// MaxNorm=2 keeps the augmented dim small relative to signal components.
+	ctx := context.Background()
+	e := newTempEngine(t)
+	spec := DefaultSpec("dot-dist-conv", 4, MetricDot)
+	spec.MaxNorm = 2
+	idx, err := e.CreateIndex(ctx, spec, nil)
+	require.NoError(t, err)
+
+	query := []float32{1, 0, 0, 0}
+	high := []float32{0.9, 0.1, 0.1, 0.1} // dot ≈ 0.9
+	low := []float32{0.1, 0.9, 0.1, 0.1}  // dot ≈ 0.1
+
+	require.NoError(t, idx.Upsert(ctx, []byte("high"), high, 1, 1))
+	require.NoError(t, idx.Upsert(ctx, []byte("low"), low, 2, 1))
+
+	hits, err := idx.Search(ctx, SearchRequest{Vector: query, K: 2})
+	require.NoError(t, err)
+	require.Len(t, hits, 2)
+
+	// Lower distance = better match = higher dot product.
+	require.Less(t, hits[0].Distance, hits[1].Distance,
+		"hit[0] (higher dot) must have lower distance than hit[1]")
+	// Distances are negative (negated dot of positive vectors).
+	require.Less(t, hits[0].Distance, float32(0),
+		"distance for MetricDot must be negative when dot product is positive")
+}
+
+// bruteForceTopKDot returns the ExternalIDs with highest inner product (descending).
+// ExternalIDs are assumed to be fmt.Sprintf("v%d", i).
+func bruteForceTopKDot(query []float32, vecs [][]float32, k int) []string {
+	type entry struct {
+		id  string
+		dot float32
+	}
+	entries := make([]entry, len(vecs))
+	for i, v := range vecs {
+		entries[i] = entry{fmt.Sprintf("v%d", i), metric.DotProduct(query, v)}
+	}
+	sort.Slice(entries, func(a, b int) bool { return entries[a].dot > entries[b].dot })
+	if k > len(entries) {
+		k = len(entries)
+	}
+	result := make([]string, k)
+	for i := range result {
+		result[i] = entries[i].id
+	}
+	return result
+}
+
+// computeRecallDot computes recall@k matching on ExternalID.
+func computeRecallDot(got []SearchHit, truth []string, k int) float32 {
+	truthSet := make(map[string]struct{}, len(truth))
+	for i, id := range truth {
+		if i >= k {
+			break
+		}
+		truthSet[id] = struct{}{}
+	}
+	hit := 0
+	for _, h := range got {
+		if _, ok := truthSet[string(h.ExternalID)]; ok {
+			hit++
+		}
+	}
+	if len(truth) == 0 {
+		return 1.0
+	}
+	return float32(hit) / float32(len(truth))
 }
 
 func TestUpsert_NewVector_Inserts(t *testing.T) {
