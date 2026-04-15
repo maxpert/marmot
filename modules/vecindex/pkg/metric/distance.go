@@ -2,11 +2,25 @@
 package metric
 
 import (
-	"encoding/binary"
 	"math"
+	"unsafe"
 
 	"github.com/tphakala/simd/f32"
 )
+
+// bytesToFloat32Slice reinterprets a little-endian float32 byte slice as []float32
+// without copying.  Valid only when:
+//   - len(b) is a multiple of 4
+//   - b is 4-byte aligned (Pebble value buffers satisfy this invariant)
+//   - the host is little-endian (arm64 and amd64 are both LE)
+//
+// The caller must NOT retain the returned slice beyond the lifetime of b.
+func bytesToFloat32Slice(b []byte) []float32 {
+	if len(b) == 0 {
+		return nil
+	}
+	return unsafe.Slice((*float32)(unsafe.Pointer(&b[0])), len(b)/4)
+}
 
 // L2Squared computes the squared Euclidean distance between two vectors.
 // Uses a 4-wide unrolled loop to enable auto-vectorization and avoid the
@@ -98,74 +112,37 @@ func Distance(m Metric, a, b []float32) float32 {
 }
 
 // L2SquaredFromBytes computes squared Euclidean distance between query and a
-// vector encoded as raw little-endian float32 bytes. The caller must NOT retain
-// vecBytes beyond the call — this matches the ScanClusterFunc invariant.
+// vector encoded as raw little-endian float32 bytes. Uses unsafe zero-copy
+// reinterpretation of vecBytes as []float32 then delegates to L2Squared, which
+// applies a 4-wide unrolled loop.  Valid only on little-endian hosts (arm64,
+// amd64); Pebble value buffers are 4-byte aligned by construction.
+// The caller must NOT retain vecBytes beyond the call — this matches the
+// ScanClusterFunc invariant.
 // Panics if len(vecBytes)/4 != len(query).
 func L2SquaredFromBytes(query []float32, vecBytes []byte) float32 {
 	assertFromBytesLen(query, vecBytes)
-	n := len(query)
-	var s0, s1, s2, s3 float32
-	i := 0
-	for ; i+3 < n; i += 4 {
-		d0 := query[i] - math.Float32frombits(binary.LittleEndian.Uint32(vecBytes[i*4:]))
-		d1 := query[i+1] - math.Float32frombits(binary.LittleEndian.Uint32(vecBytes[(i+1)*4:]))
-		d2 := query[i+2] - math.Float32frombits(binary.LittleEndian.Uint32(vecBytes[(i+2)*4:]))
-		d3 := query[i+3] - math.Float32frombits(binary.LittleEndian.Uint32(vecBytes[(i+3)*4:]))
-		s0 += d0 * d0
-		s1 += d1 * d1
-		s2 += d2 * d2
-		s3 += d3 * d3
-	}
-	sum := s0 + s1 + s2 + s3
-	for ; i < n; i++ {
-		d := query[i] - math.Float32frombits(binary.LittleEndian.Uint32(vecBytes[i*4:]))
-		sum += d * d
-	}
-	return sum
+	return L2Squared(query, bytesToFloat32Slice(vecBytes))
 }
 
 // DotFromBytes computes the negative inner product between query and a vector
 // encoded as raw little-endian float32 bytes. Negative because smaller means closer.
+// Uses unsafe zero-copy reinterpretation then delegates to SIMD DotProduct.
 // The caller must NOT retain vecBytes beyond the call.
 // Panics if len(vecBytes)/4 != len(query).
 func DotFromBytes(query []float32, vecBytes []byte) float32 {
 	assertFromBytesLen(query, vecBytes)
-	n := len(query)
-	var s0, s1, s2, s3 float32
-	i := 0
-	for ; i+3 < n; i += 4 {
-		s0 += query[i] * math.Float32frombits(binary.LittleEndian.Uint32(vecBytes[i*4:]))
-		s1 += query[i+1] * math.Float32frombits(binary.LittleEndian.Uint32(vecBytes[(i+1)*4:]))
-		s2 += query[i+2] * math.Float32frombits(binary.LittleEndian.Uint32(vecBytes[(i+2)*4:]))
-		s3 += query[i+3] * math.Float32frombits(binary.LittleEndian.Uint32(vecBytes[(i+3)*4:]))
-	}
-	dot := s0 + s1 + s2 + s3
-	for ; i < n; i++ {
-		dot += query[i] * math.Float32frombits(binary.LittleEndian.Uint32(vecBytes[i*4:]))
-	}
-	return -dot
+	return -f32.DotProduct(query, bytesToFloat32Slice(vecBytes))
 }
 
 // CosineFromBytes computes cosine distance (1 - cosine_similarity) between query
 // and a vector encoded as raw little-endian float32 bytes.
+// Uses unsafe zero-copy reinterpretation then delegates to CosineSimilarity,
+// which uses SIMD-accelerated dot product and norm computation.
 // The caller must NOT retain vecBytes beyond the call.
 // Panics if len(vecBytes)/4 != len(query).
 func CosineFromBytes(query []float32, vecBytes []byte) float32 {
 	assertFromBytesLen(query, vecBytes)
-	n := len(query)
-	var dot, normB float32
-	for i := range n {
-		b := math.Float32frombits(binary.LittleEndian.Uint32(vecBytes[i*4:]))
-		dot += query[i] * b
-		normB += b * b
-	}
-	na := norm(query)
-	nb := float32(math.Sqrt(float64(normB)))
-	denom := na * nb
-	if denom == 0 {
-		return 1
-	}
-	return 1 - dot/denom
+	return 1 - CosineSimilarity(query, bytesToFloat32Slice(vecBytes))
 }
 
 // DistanceFromBytes dispatches to the correct FromBytes distance function.
