@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -296,6 +297,375 @@ func BenchmarkIVFSearch_Warm_DBPedia1536_100K(b *testing.B) {
 			b.ReportMetric(p99, "p99_ms")
 			b.ReportMetric(qps, "qps")
 		})
+	}
+}
+
+// BenchmarkBulkLoad_DBPedia1536_100K measures the end-to-end cost of
+// CreateIndex + Graduate on 100K DBpedia vectors. A fresh b.TempDir() is used
+// per sub-benchmark iteration so each run starts with a cold engine. Data
+// loading happens before b.ResetTimer(), so only the build + graduation time is
+// captured in the reported ns/op.
+func BenchmarkBulkLoad_DBPedia1536_100K(b *testing.B) {
+	dataDir := skipIfNoData(b, "dbpedia-openai-1536")
+	train, _, _, meta := loadRealDataset(b, dataDir)
+	if len(train) == 0 {
+		b.Skip("empty train set")
+	}
+
+	m := metricFromMeta(meta)
+
+	bulk := make([]BulkEntry, len(train))
+	for i, v := range train {
+		bulk[i] = BulkEntry{
+			ExternalID: []byte(strconv.Itoa(i)),
+			Vector:     v,
+		}
+	}
+
+	b.ReportAllocs()
+	b.SetBytes(int64(len(train)) * int64(vecDim*4))
+
+	for range b.N {
+		engDir := filepath.Join(b.TempDir(), "eng")
+
+		b.ResetTimer()
+		buildStart := time.Now()
+
+		eng, err := NewEngine(engDir, benchCacheMB, newTestLogger())
+		if err != nil {
+			b.Fatalf("NewEngine: %v", err)
+		}
+
+		spec := IVFSpec{
+			ID:     "bulk-bench",
+			Dim:    vecDim,
+			Metric: m,
+			Nlist:  defaultNlist,
+			Nprobe: defaultNprobe,
+		}
+
+		ctx := context.Background()
+		idx, err := eng.CreateIndex(ctx, spec, bulk)
+		if err != nil {
+			_ = eng.Close()
+			b.Fatalf("CreateIndex: %v", err)
+		}
+
+		if err = Graduate(ctx, idx, defaultNlist); err != nil {
+			_ = eng.Close()
+			b.Fatalf("Graduate: %v", err)
+		}
+
+		b.StopTimer()
+
+		elapsed := time.Since(buildStart)
+		vecsPerSec := float64(len(train)) / elapsed.Seconds()
+		b.ReportMetric(vecsPerSec, "vecs/sec")
+		b.ReportMetric(elapsed.Seconds()*1000, "build_ms")
+
+		// Measure on-disk size.
+		var diskBytes int64
+		_ = filepath.Walk(engDir, func(_ string, fi os.FileInfo, err error) error {
+			if err == nil && !fi.IsDir() {
+				diskBytes += fi.Size()
+			}
+			return nil
+		})
+		b.ReportMetric(float64(diskBytes)/(1024*1024), "disk_MB")
+
+		_ = eng.Close()
+	}
+}
+
+// BenchmarkUpsert_SteadyState_DBPedia1536 measures single-Upsert latency after
+// the index is warmed up. A temp-dir index seeded with the first 10K train
+// vectors is built during setup; the bench then measures incremental Upserts
+// using the last 10K test vectors as insert targets. This keeps the bench
+// hermetic and avoids corrupting the persistent search index.
+func BenchmarkUpsert_SteadyState_DBPedia1536(b *testing.B) {
+	dataDir := skipIfNoData(b, "dbpedia-openai-1536")
+	train, test, _, meta := loadRealDataset(b, dataDir)
+	if len(train) == 0 || len(test) == 0 {
+		b.Skip("empty dataset")
+	}
+
+	m := metricFromMeta(meta)
+
+	// Seed index with first 10K train vectors (above flatScanThreshold so
+	// Graduate succeeds, giving us a realistic IVF structure).
+	const seedCount = 10_000
+	seed := train
+	if len(seed) > seedCount {
+		seed = seed[:seedCount]
+	}
+
+	bulk := make([]BulkEntry, len(seed))
+	for i, v := range seed {
+		bulk[i] = BulkEntry{
+			ExternalID: []byte(strconv.Itoa(i)),
+			Vector:     v,
+		}
+	}
+
+	engDir := filepath.Join(b.TempDir(), "eng")
+	eng, err := NewEngine(engDir, benchCacheMB, newTestLogger())
+	if err != nil {
+		b.Fatalf("NewEngine: %v", err)
+	}
+	defer eng.Close()
+
+	ctx := context.Background()
+	spec := IVFSpec{
+		ID:     "upsert-bench",
+		Dim:    vecDim,
+		Metric: m,
+		Nlist:  64,
+		Nprobe: defaultNprobe,
+	}
+
+	idx, err := eng.CreateIndex(ctx, spec, bulk)
+	if err != nil {
+		b.Fatalf("CreateIndex: %v", err)
+	}
+	if err = Graduate(ctx, idx, 64); err != nil {
+		b.Fatalf("Graduate: %v", err)
+	}
+
+	// Use test vectors as insert targets; cycle if b.N > len(test).
+	insertVecs := test
+	iLen := len(insertVecs)
+
+	// 100 warmup Upserts.
+	for i := range 100 {
+		_ = idx.Upsert(ctx, []byte("warmup-"+strconv.Itoa(i)), insertVecs[i%iLen], uint64(i+1), 0)
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	b.SetBytes(int64(vecDim * 4))
+
+	durations := make([]time.Duration, 0, b.N)
+	start := time.Now()
+
+	for i := range b.N {
+		vec := insertVecs[i%iLen]
+		extID := []byte(strconv.Itoa(seedCount + 100 + i))
+		t0 := time.Now()
+		if err := idx.Upsert(ctx, extID, vec, uint64(seedCount+100+i+1), 0); err != nil {
+			b.Fatalf("Upsert: %v", err)
+		}
+		durations = append(durations, time.Since(t0))
+	}
+
+	elapsed := time.Since(start)
+	total := len(durations)
+	if total == 0 {
+		return
+	}
+
+	sorted := make([]time.Duration, total)
+	copy(sorted, durations)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+
+	b.ReportMetric(percentile(sorted, 50).Seconds()*1000, "p50_ms")
+	b.ReportMetric(percentile(sorted, 95).Seconds()*1000, "p95_ms")
+	b.ReportMetric(percentile(sorted, 99).Seconds()*1000, "p99_ms")
+	b.ReportMetric(float64(total)/elapsed.Seconds(), "qps")
+}
+
+// BenchmarkMixed_ReadWrite_DBPedia1536 simulates production load with 6 search
+// goroutines and 2 upsert goroutines (75/25 read/write ratio) running
+// concurrently. Intended for use with -benchtime=20s. Reports per-operation
+// p50/p95/p99 and QPS for both reads and writes.
+//
+// The bench uses the same temp-dir index seeded with 10K vectors that
+// BenchmarkUpsert_SteadyState_DBPedia1536 uses — hermetic and no interference
+// with the persistent search index.
+func BenchmarkMixed_ReadWrite_DBPedia1536(b *testing.B) {
+	dataDir := skipIfNoData(b, "dbpedia-openai-1536")
+	train, test, _, meta := loadRealDataset(b, dataDir)
+	if len(train) == 0 || len(test) == 0 {
+		b.Skip("empty dataset")
+	}
+
+	m := metricFromMeta(meta)
+
+	const seedCount = 10_000
+	seed := train
+	if len(seed) > seedCount {
+		seed = seed[:seedCount]
+	}
+
+	bulk := make([]BulkEntry, len(seed))
+	for i, v := range seed {
+		bulk[i] = BulkEntry{
+			ExternalID: []byte(strconv.Itoa(i)),
+			Vector:     v,
+		}
+	}
+
+	engDir := filepath.Join(b.TempDir(), "eng")
+	eng, err := NewEngine(engDir, benchCacheMB, newTestLogger())
+	if err != nil {
+		b.Fatalf("NewEngine: %v", err)
+	}
+	defer eng.Close()
+
+	ctx := context.Background()
+	spec := IVFSpec{
+		ID:     "mixed-bench",
+		Dim:    vecDim,
+		Metric: m,
+		Nlist:  64,
+		Nprobe: defaultNprobe,
+	}
+
+	idx, err := eng.CreateIndex(ctx, spec, bulk)
+	if err != nil {
+		b.Fatalf("CreateIndex: %v", err)
+	}
+	if err = Graduate(ctx, idx, 64); err != nil {
+		b.Fatalf("Graduate: %v", err)
+	}
+
+	qLen := len(test)
+	iLen := len(test)
+
+	type opResult struct {
+		d       time.Duration
+		isWrite bool
+	}
+
+	results := make(chan opResult, b.N+8)
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	b.SetBytes(int64(vecDim * 4))
+
+	start := time.Now()
+
+	var opCounter atomic.Int64
+
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			// Use atomic counter to distribute: every 4th op is a write (75/25 ratio).
+			n := opCounter.Add(1)
+			if n%4 == 0 {
+				// Upsert worker path.
+				i := int(n)
+				vec := test[i%iLen]
+				extID := []byte("mixed-" + strconv.Itoa(seedCount+i))
+				t0 := time.Now()
+				_ = idx.Upsert(ctx, extID, vec, uint64(seedCount+i+1), 0)
+				results <- opResult{d: time.Since(t0), isWrite: true}
+			} else {
+				// Search worker path.
+				i := int(n)
+				vec := test[i%qLen]
+				t0 := time.Now()
+				_, _ = idx.Search(ctx, SearchRequest{Vector: vec, K: 10})
+				results <- opResult{d: time.Since(t0), isWrite: false}
+			}
+		}
+	})
+
+	close(results)
+	elapsed := time.Since(start)
+
+	var readDurs, writeDurs []time.Duration
+	for r := range results {
+		if r.isWrite {
+			writeDurs = append(writeDurs, r.d)
+		} else {
+			readDurs = append(readDurs, r.d)
+		}
+	}
+
+	sort.Slice(readDurs, func(i, j int) bool { return readDurs[i] < readDurs[j] })
+	sort.Slice(writeDurs, func(i, j int) bool { return writeDurs[i] < writeDurs[j] })
+
+	if len(readDurs) > 0 {
+		b.ReportMetric(percentile(readDurs, 50).Seconds()*1000, "search_p50_ms")
+		b.ReportMetric(percentile(readDurs, 95).Seconds()*1000, "search_p95_ms")
+		b.ReportMetric(percentile(readDurs, 99).Seconds()*1000, "search_p99_ms")
+		b.ReportMetric(float64(len(readDurs))/elapsed.Seconds(), "search_qps")
+	}
+	if len(writeDurs) > 0 {
+		b.ReportMetric(percentile(writeDurs, 50).Seconds()*1000, "upsert_p50_ms")
+		b.ReportMetric(percentile(writeDurs, 95).Seconds()*1000, "upsert_p95_ms")
+		b.ReportMetric(percentile(writeDurs, 99).Seconds()*1000, "upsert_p99_ms")
+		b.ReportMetric(float64(len(writeDurs))/elapsed.Seconds(), "upsert_qps")
+	}
+}
+
+// BenchmarkGraduation_100K isolates the cost of promoting a flat index to IVF
+// via Graduate. The flat index is built from the first 10K train vectors (the
+// minimum viable size) during setup; only the Graduate call is timed.
+func BenchmarkGraduation_100K(b *testing.B) {
+	dataDir := skipIfNoData(b, "dbpedia-openai-1536")
+	train, _, _, meta := loadRealDataset(b, dataDir)
+	if len(train) == 0 {
+		b.Skip("empty train set")
+	}
+
+	m := metricFromMeta(meta)
+
+	// Use up to 10K vectors; flatScanThreshold is 6400 so this is safely above it.
+	const gradCount = 10_000
+	seed := train
+	if len(seed) > gradCount {
+		seed = seed[:gradCount]
+	}
+
+	bulk := make([]BulkEntry, len(seed))
+	for i, v := range seed {
+		bulk[i] = BulkEntry{
+			ExternalID: []byte(strconv.Itoa(i)),
+			Vector:     v,
+		}
+	}
+
+	b.ReportAllocs()
+	b.SetBytes(int64(len(seed)) * int64(vecDim*4))
+
+	for range b.N {
+		engDir := filepath.Join(b.TempDir(), "eng")
+
+		eng, err := NewEngine(engDir, benchCacheMB, newTestLogger())
+		if err != nil {
+			b.Fatalf("NewEngine: %v", err)
+		}
+
+		ctx := context.Background()
+		spec := IVFSpec{
+			ID:     "grad-bench",
+			Dim:    vecDim,
+			Metric: m,
+			Nlist:  64,
+			Nprobe: defaultNprobe,
+		}
+
+		idx, err := eng.CreateIndex(ctx, spec, bulk)
+		if err != nil {
+			_ = eng.Close()
+			b.Fatalf("CreateIndex: %v", err)
+		}
+
+		b.ResetTimer()
+		gradStart := time.Now()
+
+		if err = Graduate(ctx, idx, 64); err != nil {
+			_ = eng.Close()
+			b.Fatalf("Graduate: %v", err)
+		}
+
+		b.StopTimer()
+
+		elapsed := time.Since(gradStart)
+		b.ReportMetric(float64(len(seed))/elapsed.Seconds(), "vecs/sec")
+		b.ReportMetric(elapsed.Seconds()*1000, "grad_ms")
+
+		_ = eng.Close()
 	}
 }
 
