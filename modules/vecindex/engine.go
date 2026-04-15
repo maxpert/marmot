@@ -220,7 +220,10 @@ func (e *Engine) pebbleOptions() *pebble.Options {
 	return &pebble.Options{
 		Cache: cache,
 		Levels: []pebble.LevelOptions{
-			{FilterPolicy: bloom.FilterPolicy(BloomBitsPerKey)},
+			{
+				FilterPolicy: bloom.FilterPolicy(BloomBitsPerKey),
+				BlockSize:    PostingBlockSize,
+			},
 		},
 	}
 }

@@ -20,7 +20,7 @@ const (
 	benchDataDir     = "/tmp/marmot-bench"
 	benchIndexDir    = "/tmp/marmot-bench/ivf-idx"
 	benchIndexID     = "dbpedia1536-100k"
-	benchIndexVer    = "v1" // bump to force rebuild when index format changes
+	benchIndexVer    = "v2" // bump to force rebuild when index format changes
 	benchCacheMB     = 512
 	warmupQueries    = 200
 	benchQueryCount  = 5000

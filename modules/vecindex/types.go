@@ -22,6 +22,11 @@ const (
 	MaxNlist = 16384
 	// BloomBitsPerKey is the bits-per-key for Bloom filters in Pebble.
 	BloomBitsPerKey = 10
+	// PostingBlockSize is the Pebble SST block size for the posting-list column family.
+	// IVF posting entries are 6144 B each (1536-dim float32); default 4 KB blocks force
+	// multiple pread() calls per vector. 64 KB amortises that to ~10 reads/vector on
+	// average while staying within the standard Pebble block-cache unit size.
+	PostingBlockSize = 64 << 10 // 64 KB
 )
 
 // defaultMaxNorm is the fixed upper bound on vector L2 norms for MetricDot.
