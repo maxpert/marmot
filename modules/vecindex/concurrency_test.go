@@ -274,3 +274,97 @@ func TestLockFreeSearch_DoesNotBlockInsert(t *testing.T) {
 	require.Equal(t, uint64(n+500), stats.VectorCount)
 	_ = math.Pi // suppress import if needed
 }
+
+// TestNextDocID_ConcurrentNoDuplicates verifies that 100 goroutines each
+// calling Upsert 100 times (10 000 total inserts) produce 10 000 distinct
+// docIDs — the block-allocation scheme must not assign the same ID twice.
+// Regression test for CR-02.
+func TestNextDocID_ConcurrentNoDuplicates(t *testing.T) {
+	t.Parallel()
+	const (
+		goroutines = 100
+		perG       = 100
+		dim        = 8
+	)
+	e := newTempEngine(t)
+	ctx := context.Background()
+
+	spec := DefaultSpec("docid-race", dim, MetricL2)
+	idx, err := e.CreateIndex(ctx, spec, nil)
+	require.NoError(t, err)
+
+	var wg sync.WaitGroup
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func(base int) {
+			defer wg.Done()
+			vecs := makeRandomVectors(perG, dim, int64(base))
+			for i, v := range vecs {
+				extID := []byte(fmt.Sprintf("g%d-v%d", base, i))
+				uErr := idx.Upsert(ctx, extID, v, uint64(base*perG+i+1), 0)
+				require.NoError(t, uErr)
+			}
+		}(g)
+	}
+	wg.Wait()
+
+	require.Equal(t, uint64(goroutines*perG), idx.Stats().VectorCount,
+		"all 10 000 inserts must be counted")
+
+	// Collect all docIDs and verify uniqueness.
+	seen := make(map[uint64]struct{}, goroutines*perG)
+	for g := 0; g < goroutines; g++ {
+		for i := 0; i < perG; i++ {
+			extID := []byte(fmt.Sprintf("g%d-v%d", g, i))
+			docID, docErr := idx.st.GetExtToDoc(extID)
+			require.NoError(t, docErr, "extID %s must be in index", extID)
+			_, dup := seen[docID]
+			require.False(t, dup, "docID %d is a duplicate (extID %s)", docID, extID)
+			seen[docID] = struct{}{}
+		}
+	}
+	require.Len(t, seen, goroutines*perG, "must have exactly 10 000 unique docIDs")
+}
+
+// TestUpsert_ConcurrentSameCluster_NoSizeRace inserts many vectors concurrently
+// into a flat (pre-IVF) index — all land in cluster 0 — and verifies the final
+// cluster size equals the insert count. Regression test for HR-01.
+func TestUpsert_ConcurrentSameCluster_NoSizeRace(t *testing.T) {
+	t.Parallel()
+	const (
+		goroutines = 50
+		perG       = 40
+		total      = goroutines * perG
+		dim        = 8
+	)
+	e := newTempEngine(t)
+	ctx := context.Background()
+
+	spec := DefaultSpec("cluster-size-race", dim, MetricL2)
+	idx, err := e.CreateIndex(ctx, spec, nil)
+	require.NoError(t, err)
+
+	var wg sync.WaitGroup
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func(base int) {
+			defer wg.Done()
+			vecs := makeRandomVectors(perG, dim, int64(base+1000))
+			for i, v := range vecs {
+				extID := []byte(fmt.Sprintf("cs%d-v%d", base, i))
+				uErr := idx.Upsert(ctx, extID, v, uint64(base*perG+i+1), 0)
+				require.NoError(t, uErr)
+			}
+		}(g)
+	}
+	wg.Wait()
+
+	require.Equal(t, uint64(total), idx.Stats().VectorCount,
+		"vector count must equal total inserts")
+
+	// All vectors land in cluster 0 (no centroids trained yet).
+	meta, metaErr := idx.st.GetClusterMeta(0)
+	require.NoError(t, metaErr)
+	require.Equal(t, uint32(total), meta.Size,
+		"cluster 0 size must equal total inserts — no size TOCTOU allowed")
+}
