@@ -189,7 +189,8 @@ func percentile(sorted []time.Duration, p float64) time.Duration {
 
 // TestRealDataRecall_DBPedia1536_100K verifies recall@10 >= 0.85 on the
 // DBPedia-OpenAI-1536 dataset (100K vectors, nlist=256, nprobe=32).
-// Uses t.TempDir() — correctness does not depend on cache state.
+// Also reports recall@1 and recall@100. Uses t.TempDir() so correctness
+// does not depend on cache state.
 func TestRealDataRecall_DBPedia1536_100K(t *testing.T) {
 	dir := skipIfNoData(t, "dbpedia-openai-1536")
 	train, test, gt, meta := loadRealDataset(t, dir)
@@ -209,25 +210,31 @@ func TestRealDataRecall_DBPedia1536_100K(t *testing.T) {
 	t.Logf("index stats: vectors=%d, centroids=%d, epoch=%d",
 		stats.VectorCount, stats.CentroidCount, stats.Epoch)
 
-	const k = 10
+	// Retrieve enough results to evaluate recall@100.
+	const kMax = 100
 	nQ := recallQueryCount
 	if nQ > len(test) {
 		nQ = len(test)
 	}
 
 	ctx := context.Background()
-	var sumRecall float64
+	var sum1, sum10, sum100 float64
 	for q := range nQ {
-		hits, err := idx.Search(ctx, SearchRequest{Vector: test[q], K: k})
+		hits, err := idx.Search(ctx, SearchRequest{Vector: test[q], K: kMax})
 		require.NoError(t, err, fmt.Sprintf("Search q=%d", q))
-		sumRecall += recallAtK(hits, gt[q], k)
+		sum1 += recallAtK(hits, gt[q], 1)
+		sum10 += recallAtK(hits, gt[q], 10)
+		sum100 += recallAtK(hits, gt[q], kMax)
 	}
 
-	avgRecall := sumRecall / float64(nQ)
-	t.Logf("recall@%d=%.4f  queries=%d", k, avgRecall, nQ)
+	nf := float64(nQ)
+	r1 := sum1 / nf
+	r10 := sum10 / nf
+	r100 := sum100 / nf
+	t.Logf("recall@1=%.4f  recall@10=%.4f  recall@100=%.4f  queries=%d", r1, r10, r100, nQ)
 
-	require.GreaterOrEqual(t, avgRecall, recallMinK10,
-		fmt.Sprintf("recall@%d=%.4f below minimum %.2f", k, avgRecall, recallMinK10))
+	require.GreaterOrEqual(t, r10, recallMinK10,
+		fmt.Sprintf("recall@10=%.4f below minimum %.2f", r10, recallMinK10))
 }
 
 // BenchmarkIVFSearch_Warm_DBPedia1536_100K measures steady-state search latency
@@ -667,6 +674,108 @@ func BenchmarkGraduation_100K(b *testing.B) {
 
 		_ = eng.Close()
 	}
+}
+
+// BenchmarkUpdate_SteadyState_DBPedia1536 measures Upsert latency on EXISTING
+// extIDs (hot update path: watermark check → reverse-map old-cluster lookup →
+// delete old posting → insert new posting, potentially across clusters).
+//
+// Setup: temp-dir index seeded with 10K train vectors graduated at nlist=64.
+// Warmup: 100 updates on extIDs already in the index. Measure: b.N updates on
+// randomly cycling existing docIDs using test vectors. Reports p50/p95/p99/QPS/allocs.
+func BenchmarkUpdate_SteadyState_DBPedia1536(b *testing.B) {
+	dataDir := skipIfNoData(b, "dbpedia-openai-1536")
+	train, test, _, meta := loadRealDataset(b, dataDir)
+	if len(train) == 0 || len(test) == 0 {
+		b.Skip("empty dataset")
+	}
+
+	m := metricFromMeta(meta)
+
+	const seedCount = 10_000
+	seed := train
+	if len(seed) > seedCount {
+		seed = seed[:seedCount]
+	}
+
+	bulk := make([]BulkEntry, len(seed))
+	for i, v := range seed {
+		bulk[i] = BulkEntry{
+			ExternalID: []byte(strconv.Itoa(i)),
+			Vector:     v,
+		}
+	}
+
+	engDir := filepath.Join(b.TempDir(), "eng")
+	eng, err := NewEngine(engDir, benchCacheMB, newTestLogger())
+	if err != nil {
+		b.Fatalf("NewEngine: %v", err)
+	}
+	defer eng.Close()
+
+	ctx := context.Background()
+	spec := IVFSpec{
+		ID:     "update-bench",
+		Dim:    vecDim,
+		Metric: m,
+		Nlist:  64,
+		Nprobe: defaultNprobe,
+	}
+
+	idx, err := eng.CreateIndex(ctx, spec, bulk)
+	if err != nil {
+		b.Fatalf("CreateIndex: %v", err)
+	}
+	if err = Graduate(ctx, idx, 64); err != nil {
+		b.Fatalf("Graduate: %v", err)
+	}
+
+	// Epoch for update calls must be strictly greater than the seed epoch.
+	// Seed inserted docIDs 0..seedCount-1 with epochs 1..seedCount.
+	// Updates use epochs seedCount+101 onward to stay ahead of the watermark.
+	baseEpoch := uint64(seedCount + 100)
+	iLen := len(test)
+
+	// Warmup: 100 updates on existing extIDs.
+	for i := range 100 {
+		extID := []byte(strconv.Itoa(i % seedCount))
+		vec := test[i%iLen]
+		_ = idx.Upsert(ctx, extID, vec, baseEpoch+uint64(i)+1, 0)
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	b.SetBytes(int64(vecDim * 4))
+
+	durations := make([]time.Duration, 0, b.N)
+	start := time.Now()
+
+	for i := range b.N {
+		// Cycle through the existing seedCount docIDs so every call is a true update.
+		extID := []byte(strconv.Itoa(i % seedCount))
+		vec := test[i%iLen]
+		epoch := baseEpoch + uint64(100) + uint64(i) + 1
+		t0 := time.Now()
+		if err := idx.Upsert(ctx, extID, vec, epoch, 0); err != nil {
+			b.Fatalf("Upsert(update): %v", err)
+		}
+		durations = append(durations, time.Since(t0))
+	}
+
+	elapsed := time.Since(start)
+	total := len(durations)
+	if total == 0 {
+		return
+	}
+
+	sorted := make([]time.Duration, total)
+	copy(sorted, durations)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+
+	b.ReportMetric(percentile(sorted, 50).Seconds()*1000, "p50_ms")
+	b.ReportMetric(percentile(sorted, 95).Seconds()*1000, "p95_ms")
+	b.ReportMetric(percentile(sorted, 99).Seconds()*1000, "p99_ms")
+	b.ReportMetric(float64(total)/elapsed.Seconds(), "qps")
 }
 
 // BenchmarkIVFSearch_Cold_DBPedia1536_100K measures cold-start search latency
