@@ -20,9 +20,7 @@ const (
 	benchDataDir     = "/tmp/marmot-bench"
 	benchIndexDir    = "/tmp/marmot-bench/ivf-idx"
 	benchIndexID     = "dbpedia1536-100k"
-	benchIndexVerF32 = "v1-f32"  // float32 (QuantNone) index version
-	benchIndexVerSQ8 = "v2-sq8"  // SQ8-quantized index version
-	benchIndexVer    = benchIndexVerSQ8 // default persistent index uses SQ8
+	benchIndexVer    = "v1" // bump to force rebuild when index format changes
 	benchCacheMB     = 512
 	warmupQueries    = 200
 	benchQueryCount  = 5000
@@ -73,19 +71,17 @@ func metricFromMeta(meta benchutil.DatasetMetadata) Metric {
 
 // buildRealDataIVFIndex bulk-loads vecs into an Engine rooted at dir and graduates to IVF.
 // ExternalIDs are decimal integers equal to their train index position.
-// quant selects the posting-list encoding (QuantNone = float32, QuantSQ8 = int8).
-func buildRealDataIVFIndex(t testing.TB, engDir string, vecs [][]float32, m Metric, nlist, nprobe int, id string, quant Quantization) (*Engine, *Index) {
+func buildRealDataIVFIndex(t testing.TB, engDir string, vecs [][]float32, m Metric, nlist, nprobe int, id string) (*Engine, *Index) {
 	t.Helper()
 	eng, err := NewEngine(engDir, benchCacheMB, newTestLogger())
 	require.NoError(t, err, "NewEngine")
 
 	spec := IVFSpec{
-		ID:           id,
-		Dim:          len(vecs[0]),
-		Metric:       m,
-		Nlist:        nlist,
-		Nprobe:       nprobe,
-		Quantization: quant,
+		ID:     id,
+		Dim:    len(vecs[0]),
+		Metric: m,
+		Nlist:  nlist,
+		Nprobe: nprobe,
 	}
 
 	bulk := make([]BulkEntry, len(vecs))
@@ -96,7 +92,7 @@ func buildRealDataIVFIndex(t testing.TB, engDir string, vecs [][]float32, m Metr
 		}
 	}
 
-	t.Logf("bulk loading %d vectors (dim=%d, quant=%d) ...", len(vecs), len(vecs[0]), quant)
+	t.Logf("bulk loading %d vectors (dim=%d) ...", len(vecs), len(vecs[0]))
 	buildStart := time.Now()
 	idx, err := eng.CreateIndex(context.Background(), spec, bulk)
 	require.NoError(t, err, "CreateIndex")
@@ -111,12 +107,12 @@ func buildRealDataIVFIndex(t testing.TB, engDir string, vecs [][]float32, m Metr
 	return eng, idx
 }
 
-// setupOrReuseIndexWithQuant opens an existing persistent index if present, otherwise builds it.
+// setupOrReuseIndex opens an existing persistent index if present, otherwise builds it.
 // The index lives at benchIndexDir/<ver>/<id>. The version stamp ensures stale
 // indexes are rebuilt when benchIndexVer is bumped.
-func setupOrReuseIndexWithQuant(tb testing.TB, dataDir string, ver string, quant Quantization) (*Engine, *Index) {
+func setupOrReuseIndex(tb testing.TB, dataDir string) (*Engine, *Index) {
 	tb.Helper()
-	engDir := filepath.Join(benchIndexDir, ver)
+	engDir := filepath.Join(benchIndexDir, benchIndexVer)
 
 	train, _, _, meta := loadRealDataset(tb, dataDir)
 	require.NotEmpty(tb, train, "train set must be non-empty")
@@ -137,14 +133,9 @@ func setupOrReuseIndexWithQuant(tb testing.TB, dataDir string, ver string, quant
 	tb.Logf("persistent index not found (%v), building ...", err)
 	_ = eng.Close()
 
-	eng, idx = buildRealDataIVFIndex(tb, engDir, train, m, defaultNlist, defaultNprobe, benchIndexID, quant)
+	eng, idx = buildRealDataIVFIndex(tb, engDir, train, m, defaultNlist, defaultNprobe, benchIndexID)
 	tb.Logf("persistent index built at %s", engDir)
 	return eng, idx
-}
-
-// setupOrReuseIndex opens the default (SQ8) persistent index.
-func setupOrReuseIndex(tb testing.TB, dataDir string) (*Engine, *Index) {
-	return setupOrReuseIndexWithQuant(tb, dataDir, benchIndexVerSQ8, QuantSQ8)
 }
 
 // recallAtK computes the fraction of the top-k groundtruth neighbours found in hits.
@@ -211,7 +202,7 @@ func TestRealDataRecall_DBPedia1536_100K(t *testing.T) {
 
 	m := metricFromMeta(meta)
 	engDir := filepath.Join(t.TempDir(), "eng")
-	eng, idx := buildRealDataIVFIndex(t, engDir, train, m, defaultNlist, defaultNprobe, "dbpedia1536-100k-recall", QuantSQ8)
+	eng, idx := buildRealDataIVFIndex(t, engDir, train, m, defaultNlist, defaultNprobe, "dbpedia1536-100k-recall")
 	defer eng.Close()
 
 	stats := idx.Stats()
@@ -305,70 +296,6 @@ func BenchmarkIVFSearch_Warm_DBPedia1536_100K(b *testing.B) {
 			b.ReportMetric(p95, "p95_ms")
 			b.ReportMetric(p99, "p99_ms")
 			b.ReportMetric(qps, "qps")
-		})
-	}
-}
-
-// BenchmarkIVFSearch_Float32_Warm_DBPedia1536_100K is the float32 (QuantNone) regression
-// benchmark. Use alongside BenchmarkIVFSearch_Warm_DBPedia1536_100K to compare SQ8 vs float32.
-func BenchmarkIVFSearch_Float32_Warm_DBPedia1536_100K(b *testing.B) {
-	dataDir := skipIfNoData(b, "dbpedia-openai-1536")
-	_, test, _, _ := loadRealDataset(b, dataDir)
-	if len(test) == 0 {
-		b.Skip("empty test set")
-	}
-
-	eng, idx := setupOrReuseIndexWithQuant(b, dataDir, benchIndexVerF32, QuantNone)
-	defer eng.Close()
-
-	ctx := context.Background()
-	qLen := len(test)
-
-	nprobeValues := []int{8, 16, 32}
-	for _, nprobe := range nprobeValues {
-		np := nprobe
-		b.Run(fmt.Sprintf("nprobe=%d", np), func(b *testing.B) {
-			wCount := warmupQueries
-			if wCount > qLen {
-				wCount = qLen
-			}
-			for i := range wCount {
-				req := SearchRequest{Vector: test[i%qLen], K: 10, NprobeOverride: np}
-				_, _ = idx.Search(ctx, req)
-			}
-
-			b.ResetTimer()
-			b.ReportAllocs()
-			b.SetBytes(int64(vecDim * 4))
-
-			nQ := benchQueryCount
-			durations := make([]time.Duration, 0, nQ)
-			start := time.Now()
-
-			for i := range b.N {
-				q := test[i%qLen]
-				t0 := time.Now()
-				_, err := idx.Search(ctx, SearchRequest{Vector: q, K: 10, NprobeOverride: np})
-				durations = append(durations, time.Since(t0))
-				if err != nil {
-					b.Fatalf("Search: %v", err)
-				}
-			}
-
-			elapsed := time.Since(start)
-			total := len(durations)
-			if total == 0 {
-				return
-			}
-
-			sorted := make([]time.Duration, total)
-			copy(sorted, durations)
-			sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
-
-			b.ReportMetric(percentile(sorted, 50).Seconds()*1000, "p50_ms")
-			b.ReportMetric(percentile(sorted, 95).Seconds()*1000, "p95_ms")
-			b.ReportMetric(percentile(sorted, 99).Seconds()*1000, "p99_ms")
-			b.ReportMetric(float64(total)/elapsed.Seconds(), "qps")
 		})
 	}
 }
@@ -754,7 +681,7 @@ func BenchmarkIVFSearch_Cold_DBPedia1536_100K(b *testing.B) {
 
 	m := metricFromMeta(meta)
 	engDir := filepath.Join(b.TempDir(), "eng")
-	eng, idx := buildRealDataIVFIndex(b, engDir, train, m, defaultNlist, defaultNprobe, "dbpedia1536-100k-cold", QuantSQ8)
+	eng, idx := buildRealDataIVFIndex(b, engDir, train, m, defaultNlist, defaultNprobe, "dbpedia1536-100k-cold")
 	defer eng.Close()
 
 	ctx := context.Background()

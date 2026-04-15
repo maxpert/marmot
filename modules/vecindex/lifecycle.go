@@ -52,9 +52,7 @@ func Graduate(ctx context.Context, idx *Index, targetNlist int) error {
 		return ctx.Err()
 	}
 
-	// Gather all vectors. vecs are float32 (decoded from SQ8 if needed) for k-means;
-	// rawVals carries the original stored bytes so we can copy them without re-encoding.
-	vecs, docIDs, rawVals, oldClusterIDs, err := gatherAllVectorsWithRaw(idx)
+	vecs, docIDs, oldClusterIDs, err := gatherAllVectors(idx)
 	if err != nil {
 		return fmt.Errorf("vecindex: gather vectors for graduation: %w", err)
 	}
@@ -102,7 +100,6 @@ func Graduate(ctx context.Context, idx *Index, targetNlist int) error {
 	}
 
 	// Parallel assignment: GOMAXPROCS workers each write their own Pebble batch.
-	// Raw bytes are copied directly — no re-encoding regardless of quantization mode.
 	nWorkers := runtime.GOMAXPROCS(0)
 	chunkSize := (len(vecs) + nWorkers - 1) / nWorkers
 
@@ -145,8 +142,7 @@ func Graduate(ctx context.Context, idx *Index, targetNlist int) error {
 				cid := newClusterIDs[centIdx]
 				docID := docIDs[vi]
 
-				// Copy raw posting bytes directly to avoid re-encoding loss.
-				if bErr := b.BatchPutPostingRaw(cid, docID, rawVals[vi]); bErr != nil {
+				if bErr := b.BatchPutPosting(cid, docID, vec); bErr != nil {
 					_ = b.Close()
 					errs[slot].err = bErr
 					return
@@ -225,12 +221,12 @@ func Graduate(ctx context.Context, idx *Index, targetNlist int) error {
 
 // cleanupOldCluster deletes all posting entries for clusterID.
 func cleanupOldCluster(idx *Index, clusterID uint32) {
-	raw, err := idx.st.ScanClusterRaw(clusterID)
+	entries, err := idx.st.ScanCluster(clusterID)
 	if err != nil {
 		return
 	}
 	b := idx.st.NewBatch()
-	for _, e := range raw {
+	for _, e := range entries {
 		_ = b.BatchDeletePosting(clusterID, e.DocID)
 	}
 	_ = b.Commit()
@@ -239,35 +235,32 @@ func cleanupOldCluster(idx *Index, clusterID uint32) {
 	_ = idx.st.PutClusterMeta(clusterID, meta)
 }
 
-
-// gatherAllVectorsWithRaw collects all live vectors as float32 (for k-means) AND
-// the original raw posting bytes (for lossless copy to new clusters).
-// rawVals[i] is a copy of the stored bytes for docIDs[i]; it must not be modified.
-func gatherAllVectorsWithRaw(idx *Index) (vecs [][]float32, docIDs []uint64, rawVals [][]byte, clusterIDs []uint32, err error) {
-	clusters, listErr := idx.st.ListActiveClusters()
-	if listErr != nil {
-		return nil, nil, nil, nil, listErr
+// gatherAllVectors collects all live vectors from the index.
+func gatherAllVectors(idx *Index) ([][]float32, []uint64, []uint32, error) {
+	clusters, err := idx.st.ListActiveClusters()
+	if err != nil {
+		return nil, nil, nil, err
 	}
 	if len(clusters) == 0 {
 		clusters = []uint32{0}
 	}
 
+	var vecs [][]float32
+	var docIDs []uint64
+	var clusterIDs []uint32
+
 	for _, cid := range clusters {
-		scanErr := idx.st.ScanClusterFunc(cid, func(docID uint64, vecBytes []byte) error {
-			vec := idx.decodePostingBytes(vecBytes)
-			raw := make([]byte, len(vecBytes))
-			copy(raw, vecBytes)
-			vecs = append(vecs, vec)
-			docIDs = append(docIDs, docID)
-			rawVals = append(rawVals, raw)
+		entries, err := idx.st.ScanCluster(cid)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		for _, e := range entries {
+			vecs = append(vecs, e.Vector)
+			docIDs = append(docIDs, e.DocID)
 			clusterIDs = append(clusterIDs, cid)
-			return nil
-		})
-		if scanErr != nil {
-			return nil, nil, nil, nil, scanErr
 		}
 	}
-	return vecs, docIDs, rawVals, clusterIDs, nil
+	return vecs, docIDs, clusterIDs, nil
 }
 
 // CheckSplit splits the cluster at centroid index centIdx if it has grown beyond
@@ -299,18 +292,17 @@ func CheckSplit(idx *Index, centIdx uint32) error {
 
 // splitCluster splits clusterID into two child clusters using k-means(k=2).
 func splitCluster(idx *Index, clusterID uint32, cs *centroidState) error {
-	raw, err := idx.st.ScanClusterRaw(clusterID)
+	entries, err := idx.st.ScanCluster(clusterID)
 	if err != nil {
 		return err
 	}
-	if len(raw) < 2 {
+	if len(entries) < 2 {
 		return nil
 	}
 
-	// Decode to float32 for k-means assignment; centroid math always in float32.
-	vecs := make([][]float32, len(raw))
-	for i, e := range raw {
-		vecs[i] = idx.decodePostingBytes(e.Value)
+	vecs := make([][]float32, len(entries))
+	for i, e := range entries {
+		vecs[i] = e.Vector
 	}
 
 	clusterSeed := idx.spec.Seed ^ (uint64(clusterID) * 0x9E3779B97F4A7C15)
@@ -339,8 +331,8 @@ func splitCluster(idx *Index, clusterID uint32, cs *centroidState) error {
 	meta2 := store.ClusterMeta{State: store.ClusterStateActive, Epoch: idx.spec.Epoch}
 
 	b := idx.st.NewBatch()
-	for i, e := range raw {
-		c, _, _ := kmeans.Assign(vecs[i], newCentroids, idx.spec.Metric)
+	for _, e := range entries {
+		c, _, _ := kmeans.Assign(e.Vector, newCentroids, idx.spec.Metric)
 		var targetCID uint32
 		if c == 0 {
 			targetCID = newCID1
@@ -349,8 +341,7 @@ func splitCluster(idx *Index, clusterID uint32, cs *centroidState) error {
 			targetCID = newCID2
 			meta2.Size++
 		}
-		// Copy raw bytes directly — no re-encoding needed when moving postings.
-		if err := b.BatchPutPostingRaw(targetCID, e.DocID, e.Value); err != nil {
+		if err := b.BatchPutPosting(targetCID, e.DocID, e.Vector); err != nil {
 			_ = b.Close()
 			return fmt.Errorf("vecindex: split put posting: %w", err)
 		}
@@ -418,12 +409,12 @@ func splitCluster(idx *Index, clusterID uint32, cs *centroidState) error {
 
 // cleanupOldClusterPostings removes posting entries for clusterID after a split.
 func cleanupOldClusterPostings(idx *Index, clusterID uint32) {
-	raw, err := idx.st.ScanClusterRaw(clusterID)
+	entries, err := idx.st.ScanCluster(clusterID)
 	if err != nil {
 		return
 	}
 	b := idx.st.NewBatch()
-	for _, e := range raw {
+	for _, e := range entries {
 		_ = b.BatchDeletePosting(clusterID, e.DocID)
 	}
 	_ = b.Commit()
@@ -484,7 +475,7 @@ func CheckMerge(idx *Index, centIdx uint32) error {
 	lk.Lock()
 	defer lk.Unlock()
 
-	rawEntries, err := idx.st.ScanClusterRaw(clusterID)
+	entries, err := idx.st.ScanCluster(clusterID)
 	if err != nil {
 		return err
 	}
@@ -497,13 +488,12 @@ func CheckMerge(idx *Index, centIdx uint32) error {
 	}
 
 	b := idx.st.NewBatch()
-	for _, e := range rawEntries {
+	for _, e := range entries {
 		if err := b.BatchDeletePosting(clusterID, e.DocID); err != nil {
 			_ = b.Close()
 			return fmt.Errorf("vecindex: merge delete posting: %w", err)
 		}
-		// Copy raw posting bytes directly — format (float32 or SQ8) is preserved.
-		if err := b.BatchPutPostingRaw(targetCID, e.DocID, e.Value); err != nil {
+		if err := b.BatchPutPosting(targetCID, e.DocID, e.Vector); err != nil {
 			_ = b.Close()
 			return fmt.Errorf("vecindex: merge put posting: %w", err)
 		}
