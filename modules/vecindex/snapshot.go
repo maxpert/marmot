@@ -27,17 +27,13 @@ func (e *Engine) SnapshotIndex(ctx context.Context, id string, w io.Writer) erro
 	}
 	idx := v.(*Index)
 
-	// Take a read lock to get a consistent checkpoint.
-	idx.mu.RLock()
 	checkpointDir, err := os.MkdirTemp("", "vecindex-snap-*")
 	if err != nil {
-		idx.mu.RUnlock()
 		return fmt.Errorf("vecindex: create checkpoint temp dir: %w", err)
 	}
 	// Pebble Checkpoint requires the destination to not exist.
 	checkpointDir = filepath.Join(checkpointDir, "chk")
 	snapErr := idx.st.Checkpoint(checkpointDir)
-	idx.mu.RUnlock()
 
 	defer os.RemoveAll(filepath.Dir(checkpointDir))
 

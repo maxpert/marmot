@@ -95,75 +95,6 @@ func TestGraduation_BelowThreshold_NoOp(t *testing.T) {
 	require.Error(t, err, "graduating below threshold must return an error")
 }
 
-func TestRetrain_DeterministicAcrossNodes(t *testing.T) {
-	t.Parallel()
-	const (
-		n    = 8_000
-		dim  = 16
-		seed = uint64(12345)
-	)
-	vecs := makeRandomVectors(n, dim, 99)
-	bulk := make([]BulkEntry, n)
-	for i, v := range vecs {
-		bulk[i] = BulkEntry{ExternalID: []byte(fmt.Sprintf("v%d", i)), Vector: v}
-	}
-
-	makeIdx := func(id string) *Index {
-		e := newTempEngine(t)
-		ctx := context.Background()
-		spec := IVFSpec{ID: id, Dim: dim, Metric: MetricL2, Nlist: 64, Nprobe: 8}
-		idx, err := e.CreateIndex(ctx, spec, bulk)
-		require.NoError(t, err)
-		require.NoError(t, Graduate(ctx, idx, 64))
-		return idx
-	}
-
-	ctx := context.Background()
-	idxA := makeIdx("node-a")
-	idxB := makeIdx("node-b")
-
-	require.NoError(t, Retrain(ctx, idxA, seed, 1))
-	require.NoError(t, Retrain(ctx, idxB, seed, 1))
-
-	statsA := idxA.Stats()
-	statsB := idxB.Stats()
-	require.Equal(t, statsA.Epoch, statsB.Epoch)
-	require.Equal(t, statsA.CentroidCount, statsB.CentroidCount,
-		"same seed must produce identical centroid sets")
-}
-
-func TestRetrain_NewEpoch_InvalidatesOldPointer(t *testing.T) {
-	t.Parallel()
-	const (
-		n   = 8_000
-		dim = 16
-	)
-	e := newTempEngine(t)
-	ctx := context.Background()
-
-	vecs := makeRandomVectors(n, dim, 7)
-	bulk := make([]BulkEntry, n)
-	for i, v := range vecs {
-		bulk[i] = BulkEntry{ExternalID: []byte(fmt.Sprintf("v%d", i)), Vector: v}
-	}
-	spec := IVFSpec{ID: "epoch-swap", Dim: dim, Metric: MetricL2, Nlist: 64, Nprobe: 8}
-	idx, err := e.CreateIndex(ctx, spec, bulk)
-	require.NoError(t, err)
-	require.NoError(t, Graduate(ctx, idx, 64))
-
-	require.NoError(t, Retrain(ctx, idx, 42, 5))
-
-	stats := idx.Stats()
-	require.Equal(t, uint64(5), stats.Epoch,
-		"after Retrain(epoch=5), Stats().Epoch must be 5")
-
-	// Index must still be searchable — old pointer reference should not crash.
-	q := makeRandomVectors(1, dim, 77)[0]
-	hits, err := idx.Search(ctx, SearchRequest{Vector: q, K: 5})
-	require.NoError(t, err)
-	_ = hits
-}
-
 func TestSplit_Trigger_3xMean(t *testing.T) {
 	t.Parallel()
 	const (
@@ -301,21 +232,3 @@ func TestMerge_Trigger(t *testing.T) {
 		"merging an undersized cluster must reduce or keep CentroidCount")
 }
 
-func TestRetrainEvent_WireFormat(t *testing.T) {
-	t.Parallel()
-	event := RetrainCluster{
-		IndexID: "my-index",
-		Epoch:   42,
-		Seed:    12345,
-	}
-
-	data, err := event.Encode()
-	require.NoError(t, err)
-	require.NotEmpty(t, data)
-
-	decoded, err := DecodeRetrainCluster(data)
-	require.NoError(t, err)
-	require.Equal(t, event.IndexID, decoded.IndexID)
-	require.Equal(t, event.Epoch, decoded.Epoch)
-	require.Equal(t, event.Seed, decoded.Seed)
-}

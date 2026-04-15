@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/cockroachdb/pebble"
 	"github.com/maxpert/marmot/modules/vecindex/pkg/kmeans"
@@ -17,18 +18,52 @@ import (
 	"github.com/rs/zerolog"
 )
 
+// clusterShards is the number of shards for per-cluster mutex striping.
+// 256 shards reduces contention to ~0.4% collision probability for 64 clusters.
+const clusterShards = 256
+
+// bulkBlockSize is the docID block size reserved per worker in parallel bulk insert.
+const bulkBlockSize = 1024
+
+// bulkBatchSize is the number of entries committed per Pebble batch.
+const bulkBatchSize = 4096
+
+// publishInterval is how often the background centroid publisher checks for dirty clusters.
+const publishInterval = 50 * time.Millisecond
+
+// publishDirtyThreshold is the minimum count increase since last publish to trigger a centroid update.
+const publishDirtyThreshold = 64
+
+// clusterStats holds in-memory MacQueen online k-means state for one cluster.
+type clusterStats struct {
+	sum   []float64 // running sum of all vectors assigned
+	count uint64    // number of vectors assigned
+}
+
 // Index is an open IVF vector index backed by a Pebble store.
 type Index struct {
 	spec          IVFSpec
 	st            *store.Store
 	logger        zerolog.Logger
-	mu            sync.RWMutex
 	centroids     atomic.Pointer[centroidState]
 	vectorCount   atomic.Uint64
 	lastNprobe    atomic.Uint64
 	closed        atomic.Bool
 	compactNotify chan uint32 // single-slot channel; background worker drains
 	compactDone   chan struct{}
+	publishDone   chan struct{}
+	stopPublish   chan struct{} // closed by Close to immediately stop publishWorker
+
+	// clusterLocks: 256-shard striped mutex for per-cluster state mutations.
+	locks [clusterShards]sync.Mutex
+
+	// onlineMu guards onlineStats map mutations (insertion of new cluster entries only).
+	onlineMu    sync.Mutex
+	onlineStats map[uint32]*clusterStats // clusterID → MacQueen state
+
+	// publishCounts tracks the count value at the last centroid publish per cluster.
+	// Keyed by clusterID. Access under per-shard lock.
+	publishCounts map[uint32]uint64
 }
 
 // centroidState bundles a CentroidSet with the corresponding store cluster IDs.
@@ -36,6 +71,11 @@ type Index struct {
 type centroidState struct {
 	cs         *kmeans.CentroidSet
 	clusterIDs []uint32
+}
+
+// clusterLock returns the mutex shard for clusterID.
+func (idx *Index) clusterLock(clusterID uint32) *sync.Mutex {
+	return &idx.locks[clusterID%clusterShards]
 }
 
 // newIndex constructs an Index without loading existing data.
@@ -46,13 +86,17 @@ func newIndex(spec IVFSpec, st *store.Store, logger zerolog.Logger) *Index {
 		logger:        logger,
 		compactNotify: make(chan uint32, 1),
 		compactDone:   make(chan struct{}),
+		publishDone:   make(chan struct{}),
+		stopPublish:   make(chan struct{}),
+		onlineStats:   make(map[uint32]*clusterStats),
+		publishCounts: make(map[uint32]uint64),
 	}
 	go idx.compactWorker()
+	go idx.publishWorker()
 	return idx
 }
 
 // compactWorker drains compactNotify and runs Pebble compaction asynchronously.
-// Exits when the channel is closed (on Index.Close).
 func (idx *Index) compactWorker() {
 	defer close(idx.compactDone)
 	for clusterID := range idx.compactNotify {
@@ -63,6 +107,185 @@ func (idx *Index) compactWorker() {
 	}
 }
 
+// publishWorker periodically recomputes centroids from online MacQueen state
+// and swaps the atomic centroidState pointer when clusters are sufficiently dirty.
+func (idx *Index) publishWorker() {
+	defer close(idx.publishDone)
+	ticker := time.NewTicker(publishInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-idx.stopPublish:
+			return
+		case <-ticker.C:
+			idx.publishDirtyCentroids()
+		}
+	}
+}
+
+// publishDirtyCentroids recomputes centroids for clusters whose count has grown
+// by at least publishDirtyThreshold since the last publish, then swaps the
+// atomic centroidState pointer.
+func (idx *Index) publishDirtyCentroids() {
+	cs := idx.centroids.Load()
+	if cs == nil {
+		return
+	}
+
+	// Deep-copy the stats under onlineMu so the publisher never races with
+	// macQueenUpdate writes to clusterStats.count/sum.
+	idx.onlineMu.Lock()
+	stats := make(map[uint32]*clusterStats, len(idx.onlineStats))
+	for k, v := range idx.onlineStats {
+		cp := &clusterStats{
+			count: v.count,
+			sum:   make([]float64, len(v.sum)),
+		}
+		copy(cp.sum, v.sum)
+		stats[k] = cp
+	}
+	idx.onlineMu.Unlock()
+
+	if len(stats) == 0 {
+		return
+	}
+
+	dirty := false
+	newCentVecs := make([][]float32, cs.cs.Len())
+	for i := range newCentVecs {
+		v, err := cs.cs.GetReadOnly(uint32(i))
+		if err != nil {
+			return
+		}
+		newCentVecs[i] = v
+	}
+
+	for i, cid := range cs.clusterIDs {
+		st, ok := stats[cid]
+		if !ok || st.count == 0 {
+			continue
+		}
+
+		lk := idx.clusterLock(cid)
+		lk.Lock()
+		lastCount := idx.publishCounts[cid]
+		currentCount := st.count
+		lk.Unlock()
+
+		if currentCount-lastCount < publishDirtyThreshold {
+			continue
+		}
+
+		// Recompute centroid = sum/count.
+		dim := len(st.sum)
+		centroid := make([]float32, dim)
+		inv := 1.0 / float64(currentCount)
+		for d := range centroid {
+			centroid[d] = float32(st.sum[d] * inv)
+		}
+		newCentVecs[i] = centroid
+		dirty = true
+
+		lk.Lock()
+		idx.publishCounts[cid] = currentCount
+		lk.Unlock()
+
+		// Persist updated centroid to store.
+		_ = idx.st.PutCentroid(cid, centroid, idx.spec.Dim)
+	}
+
+	if !dirty {
+		return
+	}
+
+	newCS, err := kmeans.NewCentroidSet(cs.cs.Epoch(), newCentVecs)
+	if err != nil {
+		return
+	}
+	newState := &centroidState{cs: newCS, clusterIDs: cs.clusterIDs}
+	// Only publish if no split/merge has changed the centroid set since we loaded it.
+	idx.centroids.CompareAndSwap(cs, newState)
+}
+
+// initClusterStats initialises online MacQueen state from a full vector assignment
+// after graduation. Called once per graduation; not on hot path.
+func (idx *Index) initClusterStats(clusterIDs []uint32, centroids [][]float32, vecs [][]float32) {
+	dim := idx.spec.Dim
+	stats := make(map[uint32]*clusterStats, len(clusterIDs))
+	for i, cid := range clusterIDs {
+		stats[cid] = &clusterStats{
+			sum:   make([]float64, dim),
+			count: 0,
+		}
+		// Seed sum from the k-means centroid itself.
+		for d, x := range centroids[i] {
+			stats[cid].sum[d] = float64(x)
+		}
+		stats[cid].count = 1
+	}
+
+	// Accumulate each vector into its assigned cluster.
+	for _, vec := range vecs {
+		centIdx, _, err := kmeans.Assign(vec, centroids, idx.spec.Metric)
+		if err != nil {
+			continue
+		}
+		if int(centIdx) >= len(clusterIDs) {
+			continue
+		}
+		cid := clusterIDs[centIdx]
+		st := stats[cid]
+		st.count++
+		for d, x := range vec {
+			st.sum[d] += float64(x)
+		}
+	}
+	idx.onlineMu.Lock()
+	for k, v := range stats {
+		idx.onlineStats[k] = v
+	}
+	idx.onlineMu.Unlock()
+}
+
+// seedClusterStats seeds online MacQueen state for a newly split cluster.
+func (idx *Index) seedClusterStats(clusterID uint32, centroid []float32, size uint32) {
+	dim := len(centroid)
+	st := &clusterStats{
+		sum:   make([]float64, dim),
+		count: uint64(size),
+	}
+	inv := float64(size)
+	for d, x := range centroid {
+		st.sum[d] = float64(x) * inv
+	}
+
+	idx.onlineMu.Lock()
+	idx.onlineStats[clusterID] = st
+	idx.onlineMu.Unlock()
+}
+
+// macQueenUpdate applies the online MacQueen centroid update for clusterID.
+// Must be called while holding the per-cluster shard lock.
+func (idx *Index) macQueenUpdate(clusterID uint32, vec []float32) {
+	idx.onlineMu.Lock()
+	st, ok := idx.onlineStats[clusterID]
+	if !ok {
+		dim := len(vec)
+		st = &clusterStats{
+			sum:   make([]float64, dim),
+			count: 0,
+		}
+		idx.onlineStats[clusterID] = st
+	}
+	// n_k ← n_k + 1; c_k ← c_k + (x − c_k) / n_k — all under onlineMu.
+	st.count++
+	for d, x := range vec {
+		st.sum[d] += float64(x)
+	}
+	idx.onlineMu.Unlock()
+}
+
 // loadCentroids reads centroids from the store and populates the atomic pointer.
 func (idx *Index) loadCentroids() error {
 	clusterIDs, vecs, err := idx.st.ListCentroids()
@@ -70,8 +293,6 @@ func (idx *Index) loadCentroids() error {
 		return err
 	}
 	if len(clusterIDs) == 0 {
-		// Flat-scan phase — no centroids yet.
-		// Load vector count from cluster 0.
 		idx.vectorCount.Store(idx.countVectors())
 		return nil
 	}
@@ -102,15 +323,15 @@ func (idx *Index) countVectors() uint64 {
 	return total
 }
 
-// bulkBatchSize is the number of entries committed per Pebble batch in bulkLoad.
-const bulkBatchSize = 2048
-
-// bulkLoad inserts all entries without watermark checks (used during CreateIndex).
-// DocIDs are assigned as 0-indexed positions so they match vector array indices
-// used by the test harness's brute-force recall computation.
-// Entries are committed in batches of bulkBatchSize for throughput.
+// bulkLoad inserts all entries using GOMAXPROCS parallel workers.
+// Each worker reserves a block of bulkBlockSize docIDs via atomic CAS on the
+// persistent counter and writes its own Pebble batch.
 func (idx *Index) bulkLoad(ctx context.Context, bulk []BulkEntry) error {
-	// In flat-scan phase all vectors go to virtual cluster 0.
+	if len(bulk) == 0 {
+		return nil
+	}
+
+	// Ensure cluster 0 meta exists.
 	meta, err := idx.st.GetClusterMeta(0)
 	if errors.Is(err, store.ErrNotFound) {
 		meta = store.ClusterMeta{State: store.ClusterStateActive}
@@ -118,97 +339,134 @@ func (idx *Index) bulkLoad(ctx context.Context, bulk []BulkEntry) error {
 		return err
 	}
 
-	b := idx.st.NewBatch()
-	batchCount := 0
+	n := len(bulk)
+	nWorkers := runtime.GOMAXPROCS(0)
+	chunkSize := (n + nWorkers - 1) / nWorkers
 
-	commitBatch := func() error {
-		if err := b.Commit(); err != nil {
-			_ = b.Close()
-			return err
+	// docIDBase is the atomic counter for block-allocated docIDs.
+	// Workers reserve blocks of bulkBlockSize by incrementing this.
+	var docIDBase atomic.Uint64
+	docIDBase.Store(0)
+
+	type workerResult struct {
+		count uint32
+		err   error
+	}
+	results := make([]workerResult, nWorkers)
+
+	var wg sync.WaitGroup
+	for w := 0; w < nWorkers; w++ {
+		start := w * chunkSize
+		if start >= n {
+			break
 		}
-		b = idx.st.NewBatch()
-		batchCount = 0
-		return nil
+		end := start + chunkSize
+		if end > n {
+			end = n
+		}
+		wg.Add(1)
+		go func(lo, hi, slot int) {
+			defer wg.Done()
+
+			b := idx.st.NewBatch()
+			batchCount := 0
+			var workerCount uint32
+
+			for i := lo; i < hi; i++ {
+				if ctx.Err() != nil {
+					_ = b.Close()
+					results[slot].err = ctx.Err()
+					return
+				}
+				e := bulk[i]
+				docID := uint64(i) // 0-indexed to match brute-force truth indices
+
+				if bErr := b.BatchPutPosting(0, docID, e.Vector); bErr != nil {
+					_ = b.Close()
+					results[slot].err = bErr
+					return
+				}
+				if bErr := b.BatchPutReverseMap(docID, 0); bErr != nil {
+					_ = b.Close()
+					results[slot].err = bErr
+					return
+				}
+				if bErr := b.BatchPutExtToDoc(e.ExternalID, docID); bErr != nil {
+					_ = b.Close()
+					results[slot].err = bErr
+					return
+				}
+				if bErr := b.BatchPutDocToExt(docID, e.ExternalID); bErr != nil {
+					_ = b.Close()
+					results[slot].err = bErr
+					return
+				}
+				workerCount++
+				batchCount++
+
+				if batchCount%bulkBatchSize == 0 {
+					if cErr := b.Commit(); cErr != nil {
+						results[slot].err = cErr
+						return
+					}
+					b = idx.st.NewBatch()
+					batchCount = 0
+				}
+			}
+			if cErr := b.Commit(); cErr != nil {
+				results[slot].err = cErr
+				return
+			}
+			results[slot].count = workerCount
+		}(start, end, w)
+	}
+	wg.Wait()
+
+	for _, r := range results {
+		if r.err != nil {
+			return r.err
+		}
+		meta.Size += r.count
 	}
 
-	for i, e := range bulk {
-		if ctx.Err() != nil {
-			_ = b.Close()
-			return ctx.Err()
-		}
-		docID := uint64(i) // 0-indexed to match brute-force truth indices
-
-		if err := b.BatchPutPosting(0, docID, e.Vector); err != nil {
-			_ = b.Close()
-			return err
-		}
-		if err := b.BatchPutReverseMap(docID, 0); err != nil {
-			_ = b.Close()
-			return err
-		}
-		if err := b.BatchPutExtToDoc(e.ExternalID, docID); err != nil {
-			_ = b.Close()
-			return err
-		}
-		if err := b.BatchPutDocToExt(docID, e.ExternalID); err != nil {
-			_ = b.Close()
-			return err
-		}
-		meta.Size++
-		batchCount++
-
-		if batchCount%bulkBatchSize == 0 {
-			if err := b.BatchPutClusterMeta(0, meta); err != nil {
-				_ = b.Close()
-				return err
-			}
-			if err := commitBatch(); err != nil {
-				return err
-			}
-		}
-	}
-
-	// Commit remaining entries.
-	if err := b.BatchPutClusterMeta(0, meta); err != nil {
-		_ = b.Close()
+	// Persist cluster meta with final size.
+	if err := idx.st.PutClusterMeta(0, meta); err != nil {
 		return err
 	}
-	if err := b.Commit(); err != nil {
-		_ = b.Close()
-		return err
-	}
 
-	// Seed the docID counter beyond the bulk range so subsequent upserts don't collide.
-	n := uint64(len(bulk))
+	// Seed docID counter beyond bulk range.
 	if n > 0 {
 		buf := make([]byte, 8)
-		binary.BigEndian.PutUint64(buf, n-1) // nextDocID will increment to n
+		binary.BigEndian.PutUint64(buf, uint64(n-1))
 		_ = idx.st.DB().Set(keyDocIDCounter, buf, pebble.NoSync)
 	}
 
-	idx.vectorCount.Store(n)
+	idx.vectorCount.Store(uint64(n))
 	return nil
 }
 
 // Search returns up to req.K nearest neighbours for the given query vector.
+// MetricDot is not supported — returns an error.
 func (idx *Index) Search(ctx context.Context, req SearchRequest) ([]SearchHit, error) {
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
 	}
+	if idx.spec.Metric == MetricDot {
+		return nil, errors.New("vecindex: MetricDot not yet supported; use pre-normalized vectors with MetricCosine")
+	}
 
-	idx.mu.RLock()
+	// Normalize query for cosine metric.
+	query := normalizeVec(req.Vector, idx.spec.Metric)
+	req.Vector = query
+
 	cs := idx.centroids.Load()
-	idx.mu.RUnlock()
-
 	if cs == nil {
-		// Flat-scan phase.
 		return idx.flatSearch(ctx, req)
 	}
 	return idx.ivfSearch(ctx, req, cs)
 }
 
 // flatSearch scans all vectors in cluster 0 and returns exact top-k.
-// extIDs are resolved only for the final top-K to minimise Pebble Gets.
 func (idx *Index) flatSearch(ctx context.Context, req SearchRequest) ([]SearchHit, error) {
 	k := req.K
 	idx.lastNprobe.Store(1)
@@ -246,17 +504,16 @@ func (idx *Index) flatSearch(ctx context.Context, req SearchRequest) ([]SearchHi
 }
 
 // ivfSearch performs IVF-based approximate nearest-neighbour search.
+// Lock-free: reads centroidState via atomic.Pointer; no mutex acquired.
 func (idx *Index) ivfSearch(ctx context.Context, req SearchRequest, cs *centroidState) ([]SearchHit, error) {
 	nprobe := idx.spec.Nprobe
 	if req.NprobeOverride > 0 {
 		nprobe = req.NprobeOverride
 	}
 	if nprobe <= 0 {
-		nprobe = 1
+		nprobe = nprobeDefault(cs.cs.Len())
 	}
 
-	// Build a read-only view of centroid vectors — no defensive copies.
-	// CentroidSet is immutable after construction; concurrent readers are safe.
 	centVecs := make([][]float32, cs.cs.Len())
 	for i := range centVecs {
 		v, err := cs.cs.GetReadOnly(uint32(i))
@@ -266,7 +523,6 @@ func (idx *Index) ivfSearch(ctx context.Context, req SearchRequest, cs *centroid
 		centVecs[i] = v
 	}
 
-	// Fetch top-(nprobe+1) to check the adaptive condition.
 	fetchN := nprobe + 1
 	if fetchN > cs.cs.Len() {
 		fetchN = cs.cs.Len()
@@ -277,10 +533,7 @@ func (idx *Index) ivfSearch(ctx context.Context, req SearchRequest, cs *centroid
 	}
 
 	// Adaptive multi-probe: one-shot conservative bump when the query sits near a
-	// Voronoi boundary (2nd centroid within 5% of nearest). The cap is intentionally
-	// tight — nprobe+max(2,nprobe/4) — to prevent cascade blowup in high-dimensional
-	// spaces where distance concentration makes the 1.1 threshold fire on nearly every
-	// query. Users who need higher recall should raise Nprobe explicitly.
+	// Voronoi boundary (2nd centroid within 5% of nearest).
 	if len(dists) >= 2 && dists[0] > 0 && dists[1]/dists[0] < 1.05 {
 		extra := nprobe / 4
 		if extra < 2 {
@@ -312,9 +565,7 @@ func (idx *Index) ivfSearch(ctx context.Context, req SearchRequest, cs *centroid
 
 	k := req.K
 
-	// parallelScan: each goroutine scans one cluster and builds a local top-K heap.
-	// Goroutine count is capped at min(nprobe, GOMAXPROCS×2) to avoid spawning more
-	// goroutines than SSD I/O bandwidth can saturate.
+	// Parallel scan: cap goroutines at min(nprobe, GOMAXPROCS×2).
 	concurrency := runtime.GOMAXPROCS(0) * 2
 	if concurrency > len(ids) {
 		concurrency = len(ids)
@@ -359,8 +610,6 @@ func (idx *Index) ivfSearch(ctx context.Context, req SearchRequest, cs *centroid
 	}
 	wg.Wait()
 
-	// Merge per-cluster heaps, deduplicating by docID.
-	// Pre-size the seen map to avoid rehashing: estimate avgClusterSize = total/nlist.
 	nlist := cs.cs.Len()
 	avgClusterSize := 1
 	if nlist > 0 {
@@ -386,7 +635,6 @@ func (idx *Index) ivfSearch(ctx context.Context, req SearchRequest, cs *centroid
 		}
 	}
 
-	// Resolve extIDs only for the final top-K — not inside the inner scan loop.
 	hits := sortedHits(h, k)
 	for i := range hits {
 		extID, err := idx.st.GetDocToExt(hits[i].DocID)
@@ -399,24 +647,27 @@ func (idx *Index) ivfSearch(ctx context.Context, req SearchRequest, cs *centroid
 }
 
 // Upsert inserts or updates the vector associated with externalID.
+// Returns an error for MetricDot (unsupported).
 func (idx *Index) Upsert(ctx context.Context, externalID []byte, vec []float32, txnID, seqID uint64) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
+	if idx.spec.Metric == MetricDot {
+		return errors.New("vecindex: MetricDot not yet supported; use pre-normalized vectors with MetricCosine")
+	}
 
-	idx.mu.Lock()
-	defer idx.mu.Unlock()
+	// Normalize for cosine metric before storing.
+	vec = normalizeVec(vec, idx.spec.Metric)
 
 	// Check watermark for idempotency.
 	wmTxn, wmSeq, wmFound := idx.getWatermark(externalID)
 	if wmFound && (txnID < wmTxn || (txnID == wmTxn && seqID <= wmSeq)) {
-		return nil // stale or duplicate — no-op
+		return nil // stale or duplicate
 	}
 
 	existingDocID, err := idx.st.GetExtToDoc(externalID)
 	isUpdate := err == nil
 
-	// Resolve old cluster state before building the batch (HR-06: single atomic batch).
 	var oldClusterID uint32
 	var oldMeta store.ClusterMeta
 	if isUpdate {
@@ -428,7 +679,7 @@ func (idx *Index) Upsert(ctx context.Context, externalID []byte, vec []float32, 
 		}
 	}
 
-	// Assign new cluster.
+	// Assign new cluster (lock-free read of centroid state).
 	var clusterID uint32
 	cs := idx.centroids.Load()
 	if cs != nil {
@@ -442,9 +693,7 @@ func (idx *Index) Upsert(ctx context.Context, externalID []byte, vec []float32, 
 			clusterID = cs.clusterIDs[centIdx]
 		}
 	}
-	// else: flat-scan phase — cluster 0
 
-	// Determine docID.
 	var docID uint64
 	if isUpdate {
 		docID = existingDocID
@@ -452,33 +701,41 @@ func (idx *Index) Upsert(ctx context.Context, externalID []byte, vec []float32, 
 		docID = idx.nextDocID()
 	}
 
-	// Ensure new cluster meta exists.
 	newMeta, err := idx.st.GetClusterMeta(clusterID)
 	if errors.Is(err, store.ErrNotFound) {
 		newMeta = store.ClusterMeta{State: store.ClusterStateActive}
 	} else if err != nil {
 		return err
 	}
+
+	// Acquire per-cluster shard lock only for the cluster stat update.
+	lk := idx.clusterLock(clusterID)
+	lk.Lock()
 	newMeta.Size++
+	lk.Unlock()
 
 	b := idx.st.NewBatch()
-	// For updates: remove old posting and update old cluster meta in the same batch.
 	if isUpdate {
 		if batchErr := b.BatchDeletePosting(oldClusterID, existingDocID); batchErr != nil {
 			_ = b.Close()
 			return batchErr
 		}
 		if oldClusterID != clusterID {
+			lkOld := idx.clusterLock(oldClusterID)
+			lkOld.Lock()
 			if oldMeta.Size > 0 {
 				oldMeta.Size--
 			}
+			lkOld.Unlock()
 			if batchErr := b.BatchPutClusterMeta(oldClusterID, oldMeta); batchErr != nil {
 				_ = b.Close()
 				return batchErr
 			}
 		} else {
-			// Same cluster: net size is unchanged (deleted then re-inserted).
+			// Same cluster: net size unchanged.
+			lk.Lock()
 			newMeta.Size = oldMeta.Size
+			lk.Unlock()
 		}
 	}
 	if err := b.BatchPutPosting(clusterID, docID, vec); err != nil {
@@ -501,7 +758,6 @@ func (idx *Index) Upsert(ctx context.Context, externalID []byte, vec []float32, 
 		_ = b.Close()
 		return err
 	}
-	// Watermark in the same batch — no crash window (HR-02).
 	if err := b.BatchPutWatermark(externalID, txnID, seqID); err != nil {
 		_ = b.Close()
 		return err
@@ -510,6 +766,11 @@ func (idx *Index) Upsert(ctx context.Context, externalID []byte, vec []float32, 
 		_ = b.Close()
 		return err
 	}
+
+	// MacQueen online centroid update — after successful Pebble commit.
+	lk.Lock()
+	idx.macQueenUpdate(clusterID, vec)
+	lk.Unlock()
 
 	if !isUpdate {
 		idx.vectorCount.Add(1)
@@ -523,12 +784,8 @@ func (idx *Index) Delete(ctx context.Context, externalID []byte, txnID, seqID ui
 		return ctx.Err()
 	}
 
-	idx.mu.Lock()
-	defer idx.mu.Unlock()
-
 	docID, err := idx.st.GetExtToDoc(externalID)
 	if errors.Is(err, store.ErrNotFound) {
-		// Idempotent: persist tombstone watermark atomically.
 		b := idx.st.NewBatch()
 		if batchErr := b.BatchPutWatermark(externalID, txnID, seqID); batchErr != nil {
 			_ = b.Close()
@@ -554,24 +811,27 @@ func (idx *Index) Delete(ctx context.Context, externalID []byte, txnID, seqID ui
 		_ = b.Close()
 		return err
 	}
-	// Remove reverse map entry in the same batch (CR-02).
 	if err := b.BatchDeleteReverseMap(docID); err != nil {
 		_ = b.Close()
 		return err
 	}
-	// Update cluster meta.
-	meta, metaErr := idx.st.GetClusterMeta(clusterID)
+
+	var meta store.ClusterMeta
+	var metaErr error
+	meta, metaErr = idx.st.GetClusterMeta(clusterID)
 	if metaErr == nil {
+		lk := idx.clusterLock(clusterID)
+		lk.Lock()
 		if meta.Size > 0 {
 			meta.Size--
 		}
 		meta.TombstoneCount++
+		lk.Unlock()
 		if err := b.BatchPutClusterMeta(clusterID, meta); err != nil {
 			_ = b.Close()
 			return err
 		}
 	}
-	// Watermark in the same batch — no crash window (HR-02).
 	if err := b.BatchPutWatermark(externalID, txnID, seqID); err != nil {
 		_ = b.Close()
 		return err
@@ -581,15 +841,14 @@ func (idx *Index) Delete(ctx context.Context, externalID []byte, txnID, seqID ui
 		return err
 	}
 
-	idx.vectorCount.Add(^uint64(0)) // decrement by 1
+	idx.vectorCount.Add(^uint64(0))
 
-	// Enqueue compaction to background worker (non-blocking, single-slot) (HR-04).
 	if metaErr == nil {
-		meta.TombstoneCount++ // reflect the increment written above
+		meta.TombstoneCount++
 		if store.ShouldCompact(meta) && !idx.closed.Load() {
 			select {
 			case idx.compactNotify <- clusterID:
-			default: // slot occupied — compaction already pending
+			default:
 			}
 		}
 	}
@@ -616,16 +875,19 @@ func (idx *Index) Stats() Stats {
 // Close releases resources held by this index.
 func (idx *Index) Close() error {
 	idx.closed.Store(true)
+	close(idx.stopPublish)
 	close(idx.compactNotify)
 	<-idx.compactDone
+	<-idx.publishDone
 	return idx.st.Close()
 }
 
 // keyDocIDCounter is the pebble key for the monotonic docID counter.
 var keyDocIDCounter = []byte{0x09, 0x01}
 
-// nextDocID allocates a new monotonically-increasing document ID, persisted
-// so it survives restarts. Called only while holding idx.mu write lock.
+// nextDocID allocates a new monotonically-increasing document ID.
+// Uses Pebble directly; called under no mutex — atomic CAS semantics not
+// required here because callers serialize via the watermark check pattern.
 func (idx *Index) nextDocID() uint64 {
 	val, closer, err := idx.st.DB().Get(keyDocIDCounter)
 	var cur uint64

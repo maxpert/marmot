@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime"
+	"sync"
 
 	"github.com/maxpert/marmot/modules/vecindex/pkg/kmeans"
 	"github.com/maxpert/marmot/modules/vecindex/pkg/metric"
@@ -11,16 +13,17 @@ import (
 )
 
 // kmeansMaxIter is the Lloyd iteration cap passed to KMeansPlusPlus.
-// Convergence detection in kmeans.go terminates early when centroids stabilise.
+// Convergence detection terminates early when centroids stabilise.
 const kmeansMaxIter = 3
 
 // flatScanThreshold is the minimum vector count required to leave flat-scan phase.
 const flatScanThreshold = 6400
 
+// kmeansTrainSampleFactor controls subsampling: training uses min(n, nlist*factor) vectors.
+const kmeansTrainSampleFactor = 2
+
 // Graduate promotes an index from flat-scan to IVF by training centroids.
 // Returns an error if count < flatScanThreshold (below IVF viable range).
-// The caller supplies targetNlist; Graduate does not enforce tier boundaries
-// beyond the flat-scan threshold so tests can use arbitrary nlist values.
 func Graduate(ctx context.Context, idx *Index, targetNlist int) error {
 	if targetNlist <= 0 || targetNlist > MaxNlist {
 		return fmt.Errorf("vecindex: targetNlist %d out of range [1, %d]", targetNlist, MaxNlist)
@@ -45,145 +48,142 @@ func Graduate(ctx context.Context, idx *Index, targetNlist int) error {
 			targetNlist, targetNlist, count,
 		)
 	}
-
-	return retrainWithNlist(ctx, idx, targetNlist, idx.spec.Seed, idx.spec.Epoch+1)
-}
-
-// Retrain rebuilds all centroids for idx using the given seed and sets the epoch.
-func Retrain(ctx context.Context, idx *Index, seed uint64, epoch uint64) error {
-	// Read current nlist without holding the lock — retrainWithNlist acquires write lock.
-	cs := idx.centroids.Load()
-
-	nlist := idx.spec.Nlist
-	if cs != nil {
-		nlist = cs.cs.Len()
-	}
-	if nlist <= 0 {
-		return errors.New("vecindex: cannot retrain — no centroids and nlist=0")
-	}
-
-	return retrainWithNlist(ctx, idx, nlist, seed, epoch)
-}
-
-// kmeansTrainSampleFactor controls subsampling: training uses min(n, nlist*factor) vectors.
-// k-means++ init is O(n_train × k²); keeping n_train small bounds init time for large k.
-const kmeansTrainSampleFactor = 2
-
-// retrainWithNlist reads all vectors, runs k-means, and atomically swaps the centroid set.
-// Holds idx.mu write lock for the entire operation so that concurrent ListActiveClusters
-// callers never observe a mix of old and new cluster states during the centroid swap.
-func retrainWithNlist(ctx context.Context, idx *Index, nlist int, seed uint64, epoch uint64) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
 
-	idx.mu.Lock()
-	defer idx.mu.Unlock()
-
-	// Collect all vectors from the flat cluster (0) or all active clusters.
 	vecs, docIDs, oldClusterIDs, err := gatherAllVectors(idx)
 	if err != nil {
-		return fmt.Errorf("vecindex: gather vectors for retrain: %w", err)
+		return fmt.Errorf("vecindex: gather vectors for graduation: %w", err)
 	}
 	if len(vecs) == 0 {
-		return errors.New("vecindex: no vectors to retrain on")
+		return errors.New("vecindex: no vectors to graduate on")
 	}
+
+	nlist := targetNlist
 	if nlist > len(vecs) {
 		nlist = len(vecs)
 	}
 
-	// Subsample for k-means training to bound init cost (O(n_train × k²)).
-	// n_train is capped at max(nlist*factor, nlist+1) to ensure k ≤ n_train.
 	maxSamples := nlist * kmeansTrainSampleFactor
 	if maxSamples < nlist+1 {
 		maxSamples = nlist + 1
 	}
 	trainVecs := vecs
 	if len(vecs) > maxSamples {
-		trainVecs = subsampleVecs(vecs, maxSamples, seed)
+		trainVecs = subsampleVecs(vecs, maxSamples, idx.spec.Seed)
 	}
 	if nlist > len(trainVecs) {
 		nlist = len(trainVecs)
 	}
 
-	centroids, err := kmeans.KMeansPlusPlus(trainVecs, nlist, seed, kmeansMaxIter)
+	centroids, err := kmeans.KMeansPlusPlus(trainVecs, nlist, idx.spec.Seed, kmeansMaxIter)
 	if err != nil {
 		return fmt.Errorf("vecindex: k-means: %w", err)
 	}
 
-	// Allocate new cluster IDs.
+	epoch := idx.spec.Epoch + 1
+
 	newClusterIDs := make([]uint32, nlist)
 	for i := range newClusterIDs {
-		cid, err := idx.st.AllocateClusterID()
-		if err != nil {
-			return fmt.Errorf("vecindex: allocate cluster ID: %w", err)
+		cid, allocErr := idx.st.AllocateClusterID()
+		if allocErr != nil {
+			return fmt.Errorf("vecindex: allocate cluster ID: %w", allocErr)
 		}
 		newClusterIDs[i] = cid
 	}
 
-	// Persist new centroids.
 	for i, c := range centroids {
 		if err := idx.st.PutCentroid(newClusterIDs[i], c, idx.spec.Dim); err != nil {
 			return fmt.Errorf("vecindex: put centroid %d: %w", i, err)
 		}
 	}
 
-	// Build and write new posting lists in batches for throughput.
+	// Parallel assignment: GOMAXPROCS workers each write their own Pebble batch.
+	nWorkers := runtime.GOMAXPROCS(0)
+	chunkSize := (len(vecs) + nWorkers - 1) / nWorkers
+
 	newMetas := make([]store.ClusterMeta, nlist)
 	for i := range newMetas {
 		newMetas[i] = store.ClusterMeta{State: store.ClusterStateActive, Epoch: epoch}
 	}
+	var metaMu sync.Mutex
 
-	// Pre-assign all vectors to centroids.
-	assignments := make([]uint32, len(vecs))
-	for vi, vec := range vecs {
-		centIdx, _, err := kmeans.Assign(vec, centroids, idx.spec.Metric)
-		if err != nil {
-			return err
+	type workerErr struct{ err error }
+	errs := make([]workerErr, nWorkers)
+
+	var wg sync.WaitGroup
+	for w := 0; w < nWorkers; w++ {
+		start := w * chunkSize
+		if start >= len(vecs) {
+			break
 		}
-		assignments[vi] = centIdx
-		newMetas[centIdx].Size++
+		end := start + chunkSize
+		if end > len(vecs) {
+			end = len(vecs)
+		}
+		wg.Add(1)
+		go func(lo, hi, slot int) {
+			defer wg.Done()
+			b := idx.st.NewBatch()
+			for vi := lo; vi < hi; vi++ {
+				if ctx.Err() != nil {
+					_ = b.Close()
+					errs[slot].err = ctx.Err()
+					return
+				}
+				vec := vecs[vi]
+				centIdx, _, assignErr := kmeans.Assign(vec, centroids, idx.spec.Metric)
+				if assignErr != nil {
+					_ = b.Close()
+					errs[slot].err = assignErr
+					return
+				}
+				cid := newClusterIDs[centIdx]
+				docID := docIDs[vi]
+
+				if bErr := b.BatchPutPosting(cid, docID, vec); bErr != nil {
+					_ = b.Close()
+					errs[slot].err = bErr
+					return
+				}
+				if bErr := b.BatchPutReverseMap(docID, cid); bErr != nil {
+					_ = b.Close()
+					errs[slot].err = bErr
+					return
+				}
+
+				metaMu.Lock()
+				newMetas[centIdx].Size++
+				metaMu.Unlock()
+
+				if (vi-lo+1)%bulkBatchSize == 0 {
+					if cErr := b.Commit(); cErr != nil {
+						errs[slot].err = cErr
+						return
+					}
+					b = idx.st.NewBatch()
+				}
+			}
+			if cErr := b.Commit(); cErr != nil {
+				errs[slot].err = cErr
+			}
+		}(start, end, w)
+	}
+	wg.Wait()
+
+	for _, we := range errs {
+		if we.err != nil {
+			return fmt.Errorf("vecindex: parallel graduation worker: %w", we.err)
+		}
 	}
 
-	// Write all cluster metas first.
 	for i, cid := range newClusterIDs {
 		if err := idx.st.PutClusterMeta(cid, newMetas[i]); err != nil {
 			return fmt.Errorf("vecindex: put cluster meta %d: %w", i, err)
 		}
 	}
 
-	// Write posting lists and reverse maps in batches.
-	b := idx.st.NewBatch()
-	for vi, vec := range vecs {
-		if ctx.Err() != nil {
-			_ = b.Close()
-			return ctx.Err()
-		}
-		centIdx := assignments[vi]
-		cid := newClusterIDs[centIdx]
-		docID := docIDs[vi]
-
-		if err := b.BatchPutPosting(cid, docID, vec); err != nil {
-			_ = b.Close()
-			return err
-		}
-		if err := b.BatchPutReverseMap(docID, cid); err != nil {
-			_ = b.Close()
-			return err
-		}
-
-		if (vi+1)%bulkBatchSize == 0 {
-			if err := b.Commit(); err != nil {
-				return err
-			}
-			b = idx.st.NewBatch()
-		}
-	}
-	if err := b.Commit(); err != nil {
-		return err
-	}
-
-	// Build new CentroidSet.
 	cs, err := kmeans.NewCentroidSet(epoch, centroids)
 	if err != nil {
 		return fmt.Errorf("vecindex: build centroid set: %w", err)
@@ -191,28 +191,25 @@ func retrainWithNlist(ctx context.Context, idx *Index, nlist int, seed uint64, e
 
 	newState := &centroidState{cs: cs, clusterIDs: newClusterIDs}
 
-	// Swap centroid state (already holding write lock from function entry).
+	// Seed online MacQueen state for new clusters.
+	idx.initClusterStats(newClusterIDs, centroids, vecs)
+
 	oldState := idx.centroids.Load()
 	idx.centroids.Store(newState)
 	idx.spec.Nlist = nlist
 	idx.spec.Epoch = epoch
-	idx.spec.Seed = seed
 
-	// Persist updated spec.
 	if err := persistSpec(idx.st, idx.spec); err != nil {
-		idx.logger.Error().Err(err).Msg("vecindex: failed to persist spec after retrain")
+		idx.logger.Error().Err(err).Msg("vecindex: failed to persist spec after graduation")
 	}
 
-	// Delete old posting lists and centroids.
 	if oldState != nil {
 		for _, oldCID := range oldState.clusterIDs {
 			cleanupOldCluster(idx, oldCID)
 		}
 	} else if len(oldClusterIDs) > 0 {
-		// Came from flat-scan phase — clean up cluster 0 postings.
 		uniqueOld := uniqueUint32(oldClusterIDs)
 		for _, oldCID := range uniqueOld {
-			// Only clean up flat cluster 0 if it's not in the new cluster IDs.
 			if !containsUint32(newClusterIDs, oldCID) {
 				cleanupOldCluster(idx, oldCID)
 			}
@@ -223,7 +220,6 @@ func retrainWithNlist(ctx context.Context, idx *Index, nlist int, seed uint64, e
 }
 
 // cleanupOldCluster deletes all posting entries for clusterID.
-// Compaction is skipped — the OS will reclaim space on next open.
 func cleanupOldCluster(idx *Index, clusterID uint32) {
 	entries, err := idx.st.ScanCluster(clusterID)
 	if err != nil {
@@ -240,13 +236,11 @@ func cleanupOldCluster(idx *Index, clusterID uint32) {
 }
 
 // gatherAllVectors collects all live vectors from the index.
-// Returns (vectors, docIDs, clusterIDs-per-doc).
 func gatherAllVectors(idx *Index) ([][]float32, []uint64, []uint32, error) {
 	clusters, err := idx.st.ListActiveClusters()
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	// Also include cluster 0 if no clusters listed (flat-scan phase).
 	if len(clusters) == 0 {
 		clusters = []uint32{0}
 	}
@@ -270,23 +264,14 @@ func gatherAllVectors(idx *Index) ([][]float32, []uint64, []uint32, error) {
 }
 
 // CheckSplit splits the cluster at centroid index centIdx if it has grown beyond
-// 3× the mean cluster size (the canonical trigger). The function is also a
-// public split primitive: callers that have already verified the size condition
-// externally may call it directly.
-//
-// centIdx is a 0-based index into the current centroid set.
-// Returns nil without splitting when the cluster has < 2 vectors.
+// 3× the mean cluster size. Returns nil without splitting when the cluster has < 2 vectors.
 func CheckSplit(idx *Index, centIdx uint32) error {
-	idx.mu.Lock()
-	defer idx.mu.Unlock()
-
 	cs := idx.centroids.Load()
 	if cs == nil {
-		return nil // flat-scan phase — no split
+		return nil
 	}
-
 	if int(centIdx) >= len(cs.clusterIDs) {
-		return nil // out of range
+		return nil
 	}
 	storeClusterID := cs.clusterIDs[centIdx]
 
@@ -294,10 +279,13 @@ func CheckSplit(idx *Index, centIdx uint32) error {
 	if err != nil {
 		return err
 	}
-
 	if int(meta.Size) < 2 {
-		return nil // nothing to split
+		return nil
 	}
+
+	lk := idx.clusterLock(storeClusterID)
+	lk.Lock()
+	defer lk.Unlock()
 
 	return splitCluster(idx, storeClusterID, cs)
 }
@@ -317,15 +305,12 @@ func splitCluster(idx *Index, clusterID uint32, cs *centroidState) error {
 		vecs[i] = e.Vector
 	}
 
-	// k=2 split. Use a cluster-specific seed to avoid same-seed bias across splits.
-	// Golden-ratio mixing: deterministic given (clusterID, spec.Seed) so all nodes agree.
 	clusterSeed := idx.spec.Seed ^ (uint64(clusterID) * 0x9E3779B97F4A7C15)
 	newCentroids, err := kmeans.KMeansPlusPlus(vecs, 2, clusterSeed, kmeansMaxIter)
 	if err != nil {
 		return fmt.Errorf("vecindex: split k-means: %w", err)
 	}
 
-	// Allocate two new cluster IDs.
 	newCID1, err := idx.st.AllocateClusterID()
 	if err != nil {
 		return err
@@ -345,7 +330,6 @@ func splitCluster(idx *Index, clusterID uint32, cs *centroidState) error {
 	meta1 := store.ClusterMeta{State: store.ClusterStateActive, Epoch: idx.spec.Epoch}
 	meta2 := store.ClusterMeta{State: store.ClusterStateActive, Epoch: idx.spec.Epoch}
 
-	// Single batch for all entry moves — atomic split.
 	b := idx.st.NewBatch()
 	for _, e := range entries {
 		c, _, _ := kmeans.Assign(e.Vector, newCentroids, idx.spec.Metric)
@@ -378,7 +362,6 @@ func splitCluster(idx *Index, clusterID uint32, cs *centroidState) error {
 		return fmt.Errorf("vecindex: split batch commit: %w", err)
 	}
 
-	// Find the centroid index for clusterID in the current state.
 	centIdx := -1
 	for i, cid := range cs.clusterIDs {
 		if cid == clusterID {
@@ -387,7 +370,6 @@ func splitCluster(idx *Index, clusterID uint32, cs *centroidState) error {
 		}
 	}
 
-	// Build updated centroid state: replace old with two new.
 	oldCentroids := make([][]float32, cs.cs.Len())
 	for i := range oldCentroids {
 		v, _ := cs.cs.Get(uint32(i))
@@ -405,7 +387,6 @@ func splitCluster(idx *Index, clusterID uint32, cs *centroidState) error {
 		}
 	}
 	if centIdx == -1 {
-		// Cluster not in current centroid set — just append.
 		newCentVecs = append(newCentVecs, newCentroids[0], newCentroids[1])
 		newCentIDs = append(newCentIDs, newCID1, newCID2)
 	}
@@ -416,10 +397,12 @@ func splitCluster(idx *Index, clusterID uint32, cs *centroidState) error {
 	}
 	idx.centroids.Store(&centroidState{cs: newCS, clusterIDs: newCentIDs})
 
-	// Retire and clean up old cluster.
 	oldMeta := store.ClusterMeta{State: store.ClusterStateRetired}
 	_ = idx.st.PutClusterMeta(clusterID, oldMeta)
 	cleanupOldClusterPostings(idx, clusterID)
+
+	idx.seedClusterStats(newCID1, newCentroids[0], meta1.Size)
+	idx.seedClusterStats(newCID2, newCentroids[1], meta2.Size)
 
 	return nil
 }
@@ -440,18 +423,13 @@ func cleanupOldClusterPostings(idx *Index, clusterID uint32) {
 
 // CheckMerge checks if the cluster at centroid index centIdx has shrunk below
 // 0.25× mean cluster size and merges it into its nearest neighbour if so.
-// centIdx is a 0-based index into the current centroid set.
 func CheckMerge(idx *Index, centIdx uint32) error {
-	idx.mu.Lock()
-	defer idx.mu.Unlock()
-
 	cs := idx.centroids.Load()
 	if cs == nil {
-		return nil // flat-scan phase
+		return nil
 	}
-
 	if int(centIdx) >= len(cs.clusterIDs) {
-		return nil // out of range
+		return nil
 	}
 	clusterID := cs.clusterIDs[centIdx]
 
@@ -463,10 +441,9 @@ func CheckMerge(idx *Index, centIdx uint32) error {
 	meanSize := meanClusterSize(idx)
 	threshold := meanSize / 4
 	if int(meta.Size) > threshold {
-		return nil // not undersized
+		return nil
 	}
 
-	// Find the nearest other centroid.
 	srcVec, err := cs.cs.Get(centIdx)
 	if err != nil {
 		return err
@@ -483,17 +460,21 @@ func CheckMerge(idx *Index, centIdx uint32) error {
 		otherIndices = append(otherIndices, i)
 	}
 	if len(otherVecs) == 0 {
-		return nil // only one cluster — cannot merge
+		return nil
 	}
 
-	nearestIdx, _, err := kmeans.Assign(srcVec, otherVecs, metric.MetricL2)
+	// Use the index metric (not hardcoded MetricL2) to find nearest neighbour.
+	nearestIdx, _, err := kmeans.Assign(srcVec, otherVecs, idx.spec.Metric)
 	if err != nil {
 		return err
 	}
 	targetCentIdx := otherIndices[nearestIdx]
 	targetCID := cs.clusterIDs[targetCentIdx]
 
-	// Move all docs from clusterID → targetCID.
+	lk := idx.clusterLock(clusterID)
+	lk.Lock()
+	defer lk.Unlock()
+
 	entries, err := idx.st.ScanCluster(clusterID)
 	if err != nil {
 		return err
@@ -506,7 +487,6 @@ func CheckMerge(idx *Index, centIdx uint32) error {
 		return err
 	}
 
-	// Single batch for all entry moves — atomic merge.
 	b := idx.st.NewBatch()
 	for _, e := range entries {
 		if err := b.BatchDeletePosting(clusterID, e.DocID); err != nil {
@@ -531,12 +511,10 @@ func CheckMerge(idx *Index, centIdx uint32) error {
 		return fmt.Errorf("vecindex: merge batch commit: %w", err)
 	}
 
-	// Retire source cluster.
 	retiredMeta := store.ClusterMeta{State: store.ClusterStateRetired}
 	_ = idx.st.PutClusterMeta(clusterID, retiredMeta)
 	_ = idx.st.DeleteCentroid(clusterID)
 
-	// Rebuild centroid state without the retired centroid.
 	newCentVecs := make([][]float32, 0, cs.cs.Len()-1)
 	newCentIDs := make([]uint32, 0, len(cs.clusterIDs)-1)
 	for i := 0; i < cs.cs.Len(); i++ {
@@ -562,7 +540,6 @@ func CheckMerge(idx *Index, centIdx uint32) error {
 }
 
 // meanClusterSize returns the mean size across all active clusters.
-// Must be called with idx.mu held (read or write).
 func meanClusterSize(idx *Index) int {
 	cs := idx.centroids.Load()
 	if cs == nil {
@@ -571,12 +548,12 @@ func meanClusterSize(idx *Index) int {
 	total := 0
 	count := 0
 	for _, cid := range cs.clusterIDs {
-		meta, err := idx.st.GetClusterMeta(cid)
+		m, err := idx.st.GetClusterMeta(cid)
 		if err != nil {
 			continue
 		}
-		if meta.State == store.ClusterStateActive {
-			total += int(meta.Size)
+		if m.State == store.ClusterStateActive {
+			total += int(m.Size)
 			count++
 		}
 	}
@@ -604,6 +581,40 @@ func minVectorsForNlist(nlist int) int {
 	}
 }
 
+// nprobeDefault returns the canonical nprobe for a given nlist tier.
+func nprobeDefault(nlist int) int {
+	switch {
+	case nlist <= 64:
+		return 6
+	case nlist <= 256:
+		return 12
+	case nlist <= 1024:
+		return 32
+	case nlist <= 4096:
+		return 64
+	default:
+		return 128
+	}
+}
+
+// normalizeVec returns a unit-normalised copy of vec for cosine metric.
+// Returns vec unchanged for other metrics.
+func normalizeVec(vec []float32, m metric.Metric) []float32 {
+	if m != metric.MetricCosine {
+		return vec
+	}
+	n := metric.Norm(vec)
+	if n == 0 {
+		return vec
+	}
+	out := make([]float32, len(vec))
+	inv := float32(1.0 / float64(n))
+	for i, x := range vec {
+		out[i] = x * inv
+	}
+	return out
+}
+
 // uniqueUint32 returns deduplicated elements of s.
 func uniqueUint32(s []uint32) []uint32 {
 	seen := make(map[uint32]struct{}, len(s))
@@ -627,21 +638,18 @@ func containsUint32(s []uint32, v uint32) bool {
 	return false
 }
 
-// subsampleVecs returns a deterministic subsample of size m from vecs using the
-// given seed. Uses a stride-based selection for O(n) time with no allocations
-// beyond the output slice.
+// subsampleVecs returns a deterministic subsample of size m from vecs.
 func subsampleVecs(vecs [][]float32, m int, seed uint64) [][]float32 {
 	n := len(vecs)
 	if m >= n {
 		return vecs
 	}
-	// Deterministic stride sampling: pick evenly spaced indices with a seed offset.
 	out := make([][]float32, m)
 	step := float64(n) / float64(m)
 	offset := int(seed % uint64(n))
 	for i := 0; i < m; i++ {
-		idx := (offset + int(float64(i)*step)) % n
-		out[i] = vecs[idx]
+		vidx := (offset + int(float64(i)*step)) % n
+		out[i] = vecs[vidx]
 	}
 	return out
 }

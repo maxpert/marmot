@@ -225,29 +225,25 @@ func TestSearch_KGreaterThanVectorCount(t *testing.T) {
 	require.Len(t, hits, 5, "k > n must return all n vectors")
 }
 
-func TestSearch_DotMetric(t *testing.T) {
+func TestSearch_DotMetric_Unsupported(t *testing.T) {
 	t.Parallel()
 	e := newTempEngine(t)
 	const dim = 8
-	vecs := makeRandomVectors(20, dim, 5)
-	bulk := make([]BulkEntry, 20)
-	for i, v := range vecs {
-		bulk[i] = BulkEntry{ExternalID: []byte(fmt.Sprintf("v%d", i)), Vector: v}
-	}
 	ctx := context.Background()
 	spec := DefaultSpec("dot-idx", dim, MetricDot)
-	idx, err := e.CreateIndex(ctx, spec, bulk)
+	idx, err := e.CreateIndex(ctx, spec, nil)
 	require.NoError(t, err)
+
+	// MetricDot is unsupported — Upsert and Search must return an explicit error.
+	vec := makeRandomVectors(1, dim, 5)[0]
+	err = idx.Upsert(ctx, []byte("ext-1"), vec, 1, 0)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "MetricDot not yet supported")
 
 	query := makeRandomVectors(1, dim, 9)[0]
-	truth := bruteForceTopK(query, vecs, 3, MetricDot)
-	hits, err := idx.Search(ctx, SearchRequest{Vector: query, K: 3})
-	require.NoError(t, err)
-	require.Len(t, hits, 3)
-
-	recall := computeRecall(hits, truth, 3)
-	require.Equal(t, float32(1.0), recall,
-		"dot-metric flat scan must return exact nearest neighbours")
+	_, err = idx.Search(ctx, SearchRequest{Vector: query, K: 3})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "MetricDot not yet supported")
 }
 
 func TestUpsert_NewVector_Inserts(t *testing.T) {
@@ -443,11 +439,6 @@ func TestStats_Accurate(t *testing.T) {
 
 	stats := idx.Stats()
 	require.Equal(t, uint64(n-3), stats.VectorCount)
-
-	// Retrain increments epoch.
-	require.NoError(t, Retrain(ctx, idx, 42, 1))
-	stats = idx.Stats()
-	require.Equal(t, uint64(1), stats.Epoch)
 
 	_ = metric.MetricL2 // keep metric import used
 }
