@@ -63,6 +63,9 @@ func TestKMeansParallelInit_LargeKQualityParity(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skip large-k quality parity under -short")
 	}
+	if RaceDetectorEnabled {
+		t.Skip("O(n·k²) reference path is incompatible with race instrumentation overhead")
+	}
 	t.Parallel()
 	const (
 		n    = 50_000

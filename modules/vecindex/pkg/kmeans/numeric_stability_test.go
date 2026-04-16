@@ -11,6 +11,9 @@ import (
 )
 
 func TestKMeans_LargeVectors_1536D(t *testing.T) {
+	if kmeans.RaceDetectorEnabled {
+		t.Skip("timing bound is incompatible with race instrumentation overhead")
+	}
 	t.Parallel()
 	const (
 		n    = 10_000
