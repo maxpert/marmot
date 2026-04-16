@@ -1,0 +1,442 @@
+---
+title: Vector Search
+---
+
+# Vector Search
+
+Marmot has built-in vector similarity search — approximate nearest-neighbor (ANN) queries over float32 embeddings stored directly in your tables. The surface is deliberately small: two SQL functions (`vec_match` and `vec_distance`) plus three DDL statements (`CREATE VECTOR INDEX`, `REINDEX VECTOR`, `DROP VECTOR INDEX`). Queries compose with ordinary WHERE predicates, JOINs, and `LIMIT` — no bespoke grammar.
+
+## Design Philosophy
+
+- **Functions, not syntax** — `vec_match(col, ?, K)` in WHERE and `vec_distance(col, ?)` in ORDER BY. The coordinator transpiles these into native SQLite that the engine can execute.
+- **One source of truth** — your BLOB column is the only place vectors live. No duplicated storage, no external service.
+- **Derived local state** — the index (centroids + cluster membership) is rebuilt on each node from the same replicated data. Only a small compressed centroid blob crosses the wire.
+- **Predicate-aware** — the cost-based planner chooses between brute-force pre-filter (when the predicate is narrow) and IVF post-filter (when the index is cheaper), and falls back to the exact path when a query returns fewer than K results.
+- **Deterministic** — two nodes running `CREATE VECTOR INDEX` concurrently compute byte-identical centroids, so LWW replication is a no-op.
+
+---
+
+## Quick Start
+
+```sql
+-- 1. Create a table with an embedding column.
+CREATE TABLE docs (
+    id    INTEGER PRIMARY KEY,
+    title TEXT,
+    embed BLOB,
+    status TEXT
+);
+
+-- 2. Ingest float32 little-endian vectors into `embed`.
+INSERT INTO docs (id, title, embed, status)
+VALUES (1, 'hello', ?, 'published');
+
+-- 3. Build an index.
+CREATE VECTOR INDEX docs_embed ON docs(embed) DIM 128 METRIC cosine;
+
+-- 4. Search.
+SELECT id, title
+  FROM docs
+ WHERE vec_match(embed, ?, 10)
+   AND status = 'published'
+ ORDER BY vec_distance(embed, ?)
+ LIMIT 10;
+```
+
+The two bind parameters after `vec_match` and inside `vec_distance` both take the query vector as a BLOB. Both appear because the functions serve different roles in rewriting — see [Under the Hood](#under-the-hood).
+
+---
+
+## DDL
+
+### CREATE VECTOR INDEX
+
+```sql
+CREATE VECTOR INDEX <index_name>
+    ON <table>(<blob_column>)
+    DIM <n>
+    METRIC <l2 | cosine | dot>
+    [WITH (nlist = <n>, nprobe = <n>, max_norm = <f>)];
+```
+
+| Clause | Meaning |
+|---|---|
+| `DIM` | Vector dimensionality. Required. Must match the `float32` length encoded in the BLOB. |
+| `METRIC` | One of `l2` (squared Euclidean), `cosine` (1 − cosine similarity), `dot` (negated inner product — smaller is closer). Required. |
+| `WITH (nlist = n)` | Number of IVF cluster centroids. Optional; auto-tunes to `clamp(4·√n, 64, 2048)`. |
+| `WITH (nprobe = n)` | Clusters probed per query. Optional; auto-tunes to `max(8, √nlist)`. |
+| `WITH (max_norm = f)` | Required only for `METRIC dot` — upper bound on vector norms used for the MIPS transformation. |
+
+**Preconditions on the base table:**
+- Must declare `INTEGER PRIMARY KEY`. Vector indexes use `rowid` references, which SQLite renumbers on `VACUUM` unless the table has an integer PK alias.
+- Target column must be `BLOB` containing packed little-endian `float32`.
+
+### REINDEX VECTOR
+
+```sql
+REINDEX VECTOR <index_name>;
+```
+
+Rebuilds centroids from the current data and re-assigns cluster membership. Uses a shadow-table swap internally so writers are not blocked for the full rebuild (see [REINDEX Flow](#reindex-flow)). Automatic retraining also runs in the background (see [Auto-Retrain](#auto-retrain)).
+
+### DROP VECTOR INDEX
+
+```sql
+DROP VECTOR INDEX <index_name>;
+```
+
+Atomically drops all internal objects for the index on every node. In-flight queries on the dropped index fail with a clear error rather than observe partial state.
+
+### SHOW VECTOR INDEXES
+
+```sql
+SHOW VECTOR INDEXES;
+```
+
+Lists all vector indexes with their configuration and current status (`building`, `ready`, `reindexing`).
+
+---
+
+## Query Syntax
+
+### vec_match
+
+```sql
+WHERE vec_match(<column>, <query_vec>, <k>)
+```
+
+Marks the query as vector-filtered. The coordinator rewrites this away before SQLite sees it. `<column>` must be the indexed BLOB column on the base table. `<query_vec>` is the query vector (BLOB or parameter). `<k>` is the desired result count; usually matches the outer `LIMIT`.
+
+Exactly one `vec_match` per SELECT is supported. If two show up the rewriter returns `MARMOT-VEC-020`.
+
+### vec_distance
+
+```sql
+ORDER BY vec_distance(<column>, <query_vec>)
+```
+
+Expression used to rank candidates. At transpile time this is resolved to the index's metric: `vec_distance_l2`, `vec_distance_cosine`, or `vec_distance_dot` — you do not need to pick the variant manually. Pair this with `LIMIT K` (required when `vec_match` is present; absence returns `MARMOT-VEC-021`).
+
+### Metrics
+
+| Metric | Underlying distance | Monotone relation | Use for |
+|---|---|---|---|
+| `l2` | `‖a − b‖²` (squared Euclidean) | smaller = closer | Raw / un-normalized embeddings |
+| `cosine` | `1 − cos(a, b)` | smaller = closer | Text embeddings, normalized features |
+| `dot` | `−⟨a, b⟩` | smaller = closer | Ranking models that train against inner product (paired with `max_norm`) |
+
+---
+
+## Filtering Examples
+
+### 1. Simple vector-only query
+
+```sql
+SELECT id, title
+  FROM docs
+ WHERE vec_match(embed, :q, 10)
+ ORDER BY vec_distance(embed, :q)
+ LIMIT 10;
+```
+
+The planner picks the IVF post-filter path — probes `nprobe` clusters, ranks candidates, returns top-10.
+
+### 2. With a scalar predicate (cost-based plan)
+
+```sql
+SELECT id, title
+  FROM docs
+ WHERE vec_match(embed, :q, 10)
+   AND status = 'published'
+ ORDER BY vec_distance(embed, :q)
+ LIMIT 10;
+```
+
+The planner estimates how selective `status = 'published'` is. If most rows match, it stays with the IVF post-filter and intersects with the predicate at scan time. If the estimate is small enough, it switches to the pre-filter path described next. You do not need to choose.
+
+### 3. Narrow predicate forcing pre-filter
+
+```sql
+SELECT id, title
+  FROM docs
+ WHERE vec_match(embed, :q, 10)
+   AND tenant_id = :tenant
+ ORDER BY vec_distance(embed, :q)
+ LIMIT 10;
+```
+
+When a predicate yields fewer rows than the IVF candidate pool would, the planner runs the predicate first, computes exact distance over the tiny filtered set, and returns. This guarantees recall on tenant-scoped or otherwise sliced searches.
+
+### 4. Overriding plan selection
+
+```sql
+SET @@marmot_vec_force_plan = 'pre';
+SELECT ... WHERE vec_match(embed, :q, 10) AND rarely_set = TRUE ...;
+
+SET @@marmot_vec_force_plan = 'auto';  -- restore (default)
+```
+
+Force `pre` (brute-force with predicate) or `post` (IVF) when you know your data better than the planner. `auto` is the default and usually correct.
+
+### 5. Joining with another table
+
+```sql
+SELECT d.id, d.title, u.display_name
+  FROM docs d
+  JOIN users u ON u.id = d.owner_id
+ WHERE vec_match(d.embed, :q, 10)
+   AND u.org_id = :org
+ ORDER BY vec_distance(d.embed, :q)
+ LIMIT 10;
+```
+
+`vec_match` always binds to the base-table column — the rewriter resolves the alias (`d`) and leaves the join intact. Candidate rowids are intersected with the JOIN before final ranking.
+
+### 6. Lifecycle
+
+```sql
+-- Build an index.
+CREATE VECTOR INDEX docs_embed ON docs(embed) DIM 1536 METRIC cosine;
+
+-- After bulk ingest or drift, retrain.
+REINDEX VECTOR docs_embed;
+
+-- Remove.
+DROP VECTOR INDEX docs_embed;
+```
+
+Background workers automatically trigger `REINDEX VECTOR` when any cluster grows ≥ 1.5× its initial size, or when the delta (unassigned) set exceeds 20% of total rows. Both thresholds are tunable via session variables — see below.
+
+---
+
+## Session Variables
+
+All variables are per-connection. Set them with standard MySQL-compat `SET @@var = value` syntax.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `@@marmot_vec_nprobe` | index default | Clusters to probe per query |
+| `@@marmot_vec_force_plan` | `auto` | `auto` / `pre` / `post` |
+| `@@marmot_vec_prefilter_cap` | `5000` | Hard cap on rows scanned by pre-filter |
+| `@@marmot_vec_fallback` | `on` | If post-filter returns fewer than `K`, run the pre-filter plan and fill up |
+| `@@marmot_vec_use_cache` | `on` | Use the in-memory cache path for ranking (bypasses SQLite UDF dispatch) |
+| `@@marmot_vec_use_go_rank` | `on` | Use the Go-side ranking path (vs SQL UDF path) |
+| `@@marmot_vec_delta_flush_interval` | `10` | Seconds between delta-flush cycles |
+| `@@marmot_vec_delta_max_rows` | `10000` | Max delta rows per flush |
+| `@@marmot_vec_delta_flush_batch` | `1000` | Rows per sub-batch inside one flush |
+| `@@marmot_vec_retrain_enabled` | `on` | Background auto-retrain monitor |
+| `@@marmot_vec_retrain_check_interval` | `30` | Seconds between retrain sensor polls |
+| `@@marmot_vec_retrain_growth_ratio` | `1.5` | Trip retrain when any cluster grows by this factor |
+| `@@marmot_vec_retrain_delta_ratio` | `0.2` | Trip retrain when delta / total exceeds this |
+| `@@marmot_vec_reindex_chunk_rows` | `10000` | Rows per sub-txn during shadow-swap REINDEX |
+
+Invalid values return `MARMOT-VEC-012`.
+
+---
+
+## Under the Hood
+
+### Storage Layout
+
+For an index named `docs_embed` on `docs(embed)`, three objects back it:
+
+| Object | Name pattern | Replicated? | Contents |
+|---|---|---|---|
+| Centroid row | `_marmot_vec_docs_embed_centroids` | **Yes** — single-underscore prefix flows through CDC | One row: version, HLC timestamp, zstd-compressed msgpack of the centroid matrix |
+| Members table | `__marmot_vec_docs_embed_members` | **No** — double-underscore prefix is CDC-excluded | `(cluster_id INTEGER, rowid INTEGER)` with `PRIMARY KEY(cluster_id, rowid)`; `cluster_id = 0` is the delta partition |
+| Metadata row | `__marmot_vector_indexes` | No — local | Dim, metric, nlist, nprobe, status |
+
+The naming convention is deliberate: single underscore = cluster-visible derived state that must converge across nodes; double underscore = strictly local derived state built per node from replicated inputs.
+
+### Query Translation
+
+Take the example from above:
+
+```sql
+SELECT id, title
+  FROM docs
+ WHERE vec_match(embed, :q, 10)
+   AND status = 'published'
+ ORDER BY vec_distance(embed, :q)
+ LIMIT 10;
+```
+
+The coordinator AST-walks the query (Vitess parser, no regex), resolves the index on `docs.embed`, and picks a plan.
+
+**Post-filter plan** (IVF — the common case):
+
+1. Load the in-memory centroid state for `docs_embed`.
+2. Call `TopNprobeClusters(:q, nprobe)` → a list of `cluster_id` integers.
+3. Rewrite to native SQL:
+
+```sql
+SELECT id, title
+  FROM docs
+ WHERE rowid IN (
+         SELECT rowid
+           FROM __marmot_vec_docs_embed_members
+          WHERE cluster_id = 0
+             OR cluster_id IN (?, ?, ..., ?)
+       )
+   AND status = 'published'
+ ORDER BY vec_distance_cosine(embed, :q)
+ LIMIT 10;
+```
+
+SQLite executes this natively. Cluster IDs are bound parameters, one per probed cluster.
+
+**Pre-filter plan** (exact — narrow predicates):
+
+```sql
+SELECT id, title
+  FROM docs
+ WHERE status = 'rare_status'
+ ORDER BY vec_distance_cosine(embed, :q)
+ LIMIT 10;
+```
+
+No IVF involved — SQLite scans the (tiny) filtered set and ranks via the distance UDF.
+
+### Cost-Based Planning
+
+The planner estimates the cardinality of the predicate from SQLite stats and picks:
+
+- **No predicate** → post-filter.
+- `force_plan` set → honored.
+- Estimated cardinality ≤ `min(K·nprobe·overfetch, prefilter_cap)` → pre-filter.
+- Otherwise → post-filter.
+
+When post-filter returns fewer than K rows (predicate reduced the candidate set too aggressively) and `@@marmot_vec_fallback = 'on'`, the pre-filter plan is executed to fill up. Worst case is 2× single-plan latency; normal case adds nothing.
+
+### In-Memory Cache Path
+
+To hit low single-digit millisecond p99, Marmot maintains a per-index in-memory cache: `map[cluster_id] → []{rowid, float32[]}`. On search with `@@marmot_vec_use_cache = 'on'` (default):
+
+1. Iterate the probed cluster buckets directly in Go.
+2. Compute distances with the pure-Go SIMD-friendly metric package.
+3. Maintain a top-K heap.
+4. Issue one final `SELECT rowid IN (…)` to fetch the user's projected columns.
+
+No per-row SQLite UDF dispatch — this is where the big p99 drop comes from. When the cache is unavailable (cold startup, epoch mismatch during REINDEX, session var off), the path falls through to the SQL rewrite above.
+
+Coherence is enforced via a monotonic epoch on the centroid state. Each query captures the epoch used to compute cluster IDs; `cacheRank` skips if `cache.Epoch() ≠ plan.ProbeEpoch` — the SQL path handles the transition.
+
+### What Replicates
+
+Only **centroid rows** cross nodes. When `REINDEX VECTOR` runs (manually or automatically) on one node:
+
+1. That node computes new centroids in-memory.
+2. It writes a single row into `_marmot_vec_<idx>_centroids` — the row is `(version, hlc_txnid, zstd(msgpack(centroid_matrix)))`.
+3. CDC picks up this write like any other DML and replicates it to peers.
+4. On each peer, an `AFTER INSERT` trigger on `_marmot_vec_<idx>_centroids` calls a non-blocking notify UDF.
+5. The UDF enqueues a rebuild request on the peer's index manager.
+6. A worker drains the request: loads the new centroid blob, re-assigns every local member row against the new centroids using a shadow table, atomically renames the shadow into place, and swaps the in-memory probe state.
+
+Members never replicate — each node rebuilds its own. This keeps the CDC payload to a single compressed blob per REINDEX (typically 3–10 MB at `nlist = 2048`) regardless of data size.
+
+### REINDEX Flow
+
+Naive `DELETE FROM members; INSERT ...` would hold SQLite's single writer lock for the full rebuild — unacceptable at 1M+ rows. Marmot uses a shadow-table swap:
+
+1. Compute new centroids (k-means||, warm-started from the drift tracker — see [Drift Isolation](#drift-isolation)).
+2. `CREATE TABLE __marmot_vec_<idx>_members_next` with the same schema.
+3. **Chunked populate**: in batches of `@@marmot_vec_reindex_chunk_rows` (default 10 000), compute each rowid's new cluster in Go and `INSERT` into the staging table. Each chunk is its own short transaction — writers get slots between chunks.
+4. **Atomic swap txn**:
+   - Replay any delta rows (`cluster_id = 0`) that arrived during stages 2–3 by recomputing their new cluster from the current `embed` and inserting into staging.
+   - `DROP TABLE` the live members.
+   - `ALTER TABLE staging RENAME TO members`.
+   - Recreate the rowid index.
+   - `REPLACE INTO _marmot_vec_<idx>_centroids` with version+1 and the new HLC timestamp (this is the CDC event peers receive).
+   - Update status → `ready`.
+   - `probeState.Store(new)` inside the same Go function.
+5. Swap completes in tens of milliseconds.
+
+Crash recovery at startup drops any orphaned staging table and reverts status — reindex is fully idempotent.
+
+### Drift Isolation
+
+`IndexState` carries two independent centroid pointers:
+
+- **probeState** — frozen between REINDEX runs. All queries and member assignments use this.
+- **driftState** — updated online by the delta flusher using MacQueen running means. Used only as a warm-start seed for the next REINDEX.
+
+Because probe and member-assignment always read the same probeState, cluster IDs the query path resolves and cluster IDs rows are filed under never drift apart. MacQueen tracks population drift so the next retrain converges in fewer Lloyd iterations.
+
+### Delta Flush
+
+INSERT/UPDATE triggers on the base table write `(cluster_id = 0, rowid)` into the members table — the delta partition. A per-index goroutine drains it every `@@marmot_vec_delta_flush_interval`:
+
+1. Capture `cv_start = probeState.Version()`.
+2. For each batch, fetch `(rowid, embed)` from the base table.
+3. Compute assignments in Go (not via UDF — avoids per-row SQLite overhead).
+4. In one short transaction: check `probeState.Version() == cv_start` (abort if centroids swapped mid-flush), `DELETE` batch from `cluster_id = 0`, `INSERT` with new cluster IDs.
+5. Update the MacQueen drift sums.
+
+Search queries include `cluster_id = 0` in the probe set, so delta rows are always considered — at the cost of a small brute-force scan. Auto-retrain triggers when delta grows beyond `@@marmot_vec_retrain_delta_ratio` of total.
+
+### Auto-Retrain
+
+A monitor goroutine polls every `@@marmot_vec_retrain_check_interval` and trips `REINDEX VECTOR` when any of the following hold:
+
+- `max_cluster_growth_ratio ≥ @@marmot_vec_retrain_growth_ratio` (default 1.5)
+- `delta_ratio ≥ @@marmot_vec_retrain_delta_ratio` (default 0.2)
+
+A compare-and-swap `rebuilding` flag acts as hysteresis — only one retrain is ever in flight per index. When multiple nodes independently trip the threshold, each runs a retrain and the first to write the new centroid row wins LWW (higher HLC). Losers see the version bump via their replica listener and rebuild from the winner's centroids — wasted compute but correct.
+
+### Concurrent CREATE Convergence
+
+CREATE VECTOR INDEX replicates as DDL, and both nodes will independently run k-means on their local data. If the two nodes produced different centroids, the LWW write would discard one side's compute.
+
+Marmot avoids this with two guarantees:
+
+1. **Deterministic seed** — the k-means seed is `fnv64a(TableName, ColumnName, Dim, Metric, Nlist)`. All nodes derive the same seed.
+2. **Deterministic sampling** — training samples are drawn with `ORDER BY rowid` + a seeded Algorithm-R reservoir sampler (not `ORDER BY RANDOM()`, which uses system entropy). Same data + same seed = same sample.
+3. **Deterministic k-means||** — fixed chunk partitioning, per-chunk child RNGs seeded from the parent seed, fixed-order reduction across chunks.
+
+Given the same replicated data, both nodes produce byte-identical centroid blobs. When both attempt to write `_marmot_vec_<idx>_centroids`, the LWW resolution is a no-op — both sides converge instantly with no wasted progress.
+
+---
+
+## Performance
+
+Measured on Apple M3 Pro, 100 000 vectors × 128 dimensions, cosine metric, `nlist = 128`, `nprobe = 8` (the benchmark defaults):
+
+| Metric | Value |
+|---|---|
+| Recall @ 10 | 0.994 |
+| Serial search p99 | 1.7 – 3.1 ms |
+| Memory per index | ~51 MB |
+| REINDEX (100 K rows) | ~1.4 s |
+
+k-means init scales to 1 M × 2048 in ~75 s (historical 11+ hour O(n·k²) init was replaced by k-means|| per Bahmani 2012).
+
+Parallel query throughput saturates around 12 cores on the M3 Pro; tail latency under saturation is not a reported target — the p99 contract applies to single-query latency.
+
+Memory grows linearly with vector count and dimension: `n × dim × 4 bytes` for the in-memory cache, plus ~50 MB for MacQueen drift state and centroid snapshots. At 1 M × 1536 dimensions the cache is ~600 MB per index — consider setting `@@marmot_vec_use_cache = 'off'` for very large high-dim corpora.
+
+---
+
+## Limitations
+
+- Only one `vec_match` per SELECT. Multiple filter clauses against the same column are not merged.
+- `LIMIT` is required with `vec_match`.
+- Base table must declare `INTEGER PRIMARY KEY`.
+- Vector BLOB must be little-endian `float32` packed tightly.
+- The delta partition is brute-scanned; very high ingest rates without an auto-retrain can degrade tail latency — tune the retrain ratios or issue a manual `REINDEX VECTOR`.
+- k-means||-based CREATE/REINDEX runs in-process; expect several minutes for 1 M × 2048 / dim ≥ 128.
+
+---
+
+## Error Codes
+
+| Code | Meaning |
+|---|---|
+| `MARMOT-VEC-010` | `vec_match` reached the SQL engine — rewriter bug; should never happen |
+| `MARMOT-VEC-011` | Base table has no `INTEGER PRIMARY KEY` |
+| `MARMOT-VEC-012` | Invalid `@@marmot_vec_*` session value |
+| `MARMOT-VEC-013` | Unknown vector index |
+| `MARMOT-VEC-014` | Schema migration for `__marmot_vector_indexes` failed / invalid embed BLOB |
+| `MARMOT-VEC-015` | Target column missing or non-BLOB |
+| `MARMOT-VEC-020` | Multiple `vec_match` calls in one SELECT |
+| `MARMOT-VEC-021` | `vec_match` present without `LIMIT` |
+| `MARMOT-VEC-022` | No vector index on the target column |

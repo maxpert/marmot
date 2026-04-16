@@ -6,6 +6,7 @@ import (
 
 	"github.com/maxpert/marmot/common"
 	"github.com/maxpert/marmot/hlc"
+	"vitess.io/vitess/go/vt/sqlparser"
 )
 
 // ConsistencyLevel defines read/write consistency requirements
@@ -55,39 +56,40 @@ type StatementCode = common.StatementCode
 
 // Statement code constants - aliased from common package for backward compatibility
 const (
-	StatementUnknown           = common.StatementUnknown
-	StatementInsert            = common.StatementInsert
-	StatementReplace           = common.StatementReplace
-	StatementUpdate            = common.StatementUpdate
-	StatementDelete            = common.StatementDelete
-	StatementLoadData          = common.StatementLoadData
-	StatementDDL               = common.StatementDDL
-	StatementDCL               = common.StatementDCL
-	StatementBegin             = common.StatementBegin
-	StatementCommit            = common.StatementCommit
-	StatementRollback          = common.StatementRollback
-	StatementSavepoint         = common.StatementSavepoint
-	StatementXA                = common.StatementXA
-	StatementLock              = common.StatementLock
-	StatementSelect            = common.StatementSelect
-	StatementAdmin             = common.StatementAdmin
-	StatementSet               = common.StatementSet
-	StatementShowDatabases     = common.StatementShowDatabases
-	StatementUseDatabase       = common.StatementUseDatabase
-	StatementCreateDatabase    = common.StatementCreateDatabase
-	StatementDropDatabase      = common.StatementDropDatabase
-	StatementShowTables        = common.StatementShowTables
-	StatementShowColumns       = common.StatementShowColumns
-	StatementShowCreateTable   = common.StatementShowCreateTable
-	StatementShowIndexes       = common.StatementShowIndexes
-	StatementShowTableStatus   = common.StatementShowTableStatus
-	StatementShowEngines       = common.StatementShowEngines
-	StatementInformationSchema = common.StatementInformationSchema
-	StatementUnsupported       = common.StatementUnsupported
-	StatementSystemVariable    = common.StatementSystemVariable
-	StatementVirtualTable      = common.StatementVirtualTable
-	StatementCreateVectorIndex = common.StatementCreateVectorIndex
-	StatementDropVectorIndex   = common.StatementDropVectorIndex
+	StatementUnknown            = common.StatementUnknown
+	StatementInsert             = common.StatementInsert
+	StatementReplace            = common.StatementReplace
+	StatementUpdate             = common.StatementUpdate
+	StatementDelete             = common.StatementDelete
+	StatementLoadData           = common.StatementLoadData
+	StatementDDL                = common.StatementDDL
+	StatementDCL                = common.StatementDCL
+	StatementBegin              = common.StatementBegin
+	StatementCommit             = common.StatementCommit
+	StatementRollback           = common.StatementRollback
+	StatementSavepoint          = common.StatementSavepoint
+	StatementXA                 = common.StatementXA
+	StatementLock               = common.StatementLock
+	StatementSelect             = common.StatementSelect
+	StatementAdmin              = common.StatementAdmin
+	StatementSet                = common.StatementSet
+	StatementShowDatabases      = common.StatementShowDatabases
+	StatementUseDatabase        = common.StatementUseDatabase
+	StatementCreateDatabase     = common.StatementCreateDatabase
+	StatementDropDatabase       = common.StatementDropDatabase
+	StatementShowTables         = common.StatementShowTables
+	StatementShowColumns        = common.StatementShowColumns
+	StatementShowCreateTable    = common.StatementShowCreateTable
+	StatementShowIndexes        = common.StatementShowIndexes
+	StatementShowTableStatus    = common.StatementShowTableStatus
+	StatementShowEngines        = common.StatementShowEngines
+	StatementInformationSchema  = common.StatementInformationSchema
+	StatementUnsupported        = common.StatementUnsupported
+	StatementSystemVariable     = common.StatementSystemVariable
+	StatementVirtualTable       = common.StatementVirtualTable
+	StatementCreateVectorIndex  = common.StatementCreateVectorIndex
+	StatementDropVectorIndex    = common.StatementDropVectorIndex
+	StatementReindexVectorIndex = common.StatementReindexVectorIndex
 )
 
 // InformationSchemaTableType identifies which INFORMATION_SCHEMA table is being queried
@@ -146,15 +148,29 @@ type Statement struct {
 	ShowFilter string
 
 	// Vector index metadata (populated for CREATE/DROP VECTOR INDEX)
-	VectorIndexName  string `msgpack:"-"` // Index name
-	VectorColumnName string `msgpack:"-"` // Column being indexed
-	VectorMetric     string `msgpack:"-"` // cosine, euclidean, dot
-	VectorDim        int    `msgpack:"-"` // Vector dimensionality
+	VectorIndexName  string  `msgpack:"-"` // Index name
+	VectorColumnName string  `msgpack:"-"` // Column being indexed
+	VectorMetric     string  `msgpack:"-"` // cosine, l2, dot
+	VectorDim        int     `msgpack:"-"` // Vector dimensionality
+	VectorNlist      int     `msgpack:"-"` // Number of IVF centroids (0 = auto-tune)
+	VectorNprobe     int     `msgpack:"-"` // Clusters searched per query (0 = auto-tune)
+	VectorMaxNorm    float32 `msgpack:"-"` // Max norm for dot-product augmentation
 
 	// ExtractedParams holds literal values extracted during transpilation.
 	// Used for local execution only - not serialized for CDC replication.
 	// DML ships OldValues/NewValues via CDC, not SQL+params.
 	ExtractedParams []interface{} `msgpack:"-"` // Exclude from msgpack serialization
+
+	// ParsedAST carries the Vitess AST produced during MySQL-dialect parse.
+	// Non-nil only when the pipeline parsed the statement via Vitess (SELECT,
+	// DML, and most DDL). Downstream components that need the AST — notably
+	// coordinator/vec_handler's vec_match rewriter — use this to avoid a
+	// second parse. Never serialized over the wire: the AST holds non-portable
+	// Go pointers and replicated peers re-parse from SQL.
+	//
+	// Consumers must treat the value as read-only; pass sqlparser.Clone(ast)
+	// into any builder that mutates node fields.
+	ParsedAST sqlparser.Statement `msgpack:"-"`
 
 	// LoadDataPayload carries LOAD DATA LOCAL INFILE file bytes for replicated
 	// non-DML bulk-load transactions.

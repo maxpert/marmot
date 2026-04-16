@@ -190,7 +190,7 @@ func TestKMeansPlusPlus_DimensionConsistency(t *testing.T) {
 	t.Parallel()
 	vecs := [][]float32{
 		{1, 2, 3},
-		{4, 5},   // wrong dim
+		{4, 5}, // wrong dim
 		{7, 8, 9},
 	}
 	_, err := kmeans.KMeansPlusPlus(vecs, 2, 0, 20)

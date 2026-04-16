@@ -21,6 +21,7 @@ import (
 	marmotgrpc "github.com/maxpert/marmot/grpc"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/id"
+	"github.com/maxpert/marmot/modules/vecindex"
 	"github.com/maxpert/marmot/notify"
 	"github.com/maxpert/marmot/protocol"
 	"github.com/maxpert/marmot/publisher"
@@ -250,26 +251,18 @@ func main() {
 	grpcServer.SetCDCSubscriber(cdcHub)
 	log.Info().Msg("CDC notification hub initialized")
 
-	// Initialize Vector Index Manager if enabled
-	var vecIndexMgr *db.VectorIndexManager
-	if cfg.Config.VectorIndex.Enabled {
-		vecDataDir := cfg.Config.VectorIndex.DataDir
-		if vecDataDir == "" {
-			vecDataDir = filepath.Join(cfg.Config.DataDir, "vector_indexes")
-		}
-		vecEngine, err := newVecIndexAdapter(vecDataDir, cfg.Config.VectorIndex.PebbleCacheMB, log.Logger)
-		if err != nil {
-			log.Fatal().Err(err).Msg("Failed to initialize vector index engine")
-			return
-		}
-		reconcileInterval := time.Duration(cfg.Config.VectorIndex.ReconcileIntervalSec) * time.Second
-		vecIndexMgr = db.NewVectorIndexManager(vecEngine, dbMgr, reconcileInterval, cfg.Config.VectorIndex.MinVectorsForCreate)
-		dbMgr.SetVectorIndexManager(vecIndexMgr)
-		if err := vecIndexMgr.Start(context.Background()); err != nil {
-			log.Fatal().Err(err).Msg("Failed to start vector index manager")
-			return
-		}
-		log.Info().Str("data_dir", vecDataDir).Msg("Vector index manager initialized")
+	// Initialize Vector Index Manager + in-memory engine and wire the bridge
+	// so CREATE populates and registers state and DROP removes it (design §8.1/§8.2).
+	vecIndexMgr := db.NewVectorIndexManager(dbMgr)
+	dbMgr.SetVectorIndexManager(vecIndexMgr)
+	vecEngine := vecindex.NewEngine()
+	vecEngineHook := db.NewEngineHook(vecEngine, dbMgr)
+	vecIndexMgr.SetLifecycleHook(vecEngineHook)
+	vecIndexMgr.SetReindexHook(vecEngineHook)
+	vecIndexMgr.SetEngineProvider(vecEngineHook)
+	if err := vecIndexMgr.Start(context.Background()); err != nil {
+		log.Fatal().Err(err).Msg("Failed to start vector index manager")
+		return
 	}
 
 	// Start metrics collector for telemetry (updates every 10 seconds)
@@ -462,6 +455,7 @@ func main() {
 		schemaVersionMgr,
 		registryAdapter,
 	)
+	handler.SetVectorEngine(vecEngine)
 
 	// Initialize write forwarding for read-only replicas
 	forwardSessionMgr := marmotgrpc.NewForwardSessionManager(60 * time.Second)

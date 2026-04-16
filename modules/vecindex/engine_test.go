@@ -1,140 +1,141 @@
 package vecindex
 
 import (
-	"context"
-	"os"
-	"path/filepath"
 	"testing"
 
+	"github.com/maxpert/marmot/modules/vecindex/pkg/kmeans"
 	"github.com/stretchr/testify/require"
 )
 
-func TestNewEngine_CreatesRootDir(t *testing.T) {
-	t.Parallel()
-	dir := t.TempDir()
-	subDir := filepath.Join(dir, "engine-root")
-
-	e, err := NewEngine(subDir, 64, newTestLogger())
-	require.NoError(t, err)
-	require.NoError(t, e.Close())
-
-	_, statErr := os.Stat(subDir)
-	require.NoError(t, statErr, "engine root dir must exist after NewEngine")
+func makeEngine(t *testing.T) *Engine {
+	t.Helper()
+	return NewEngine()
 }
 
-func TestCreateIndex_Empty(t *testing.T) {
-	t.Parallel()
-	e := newTempEngine(t)
-	ctx := context.Background()
-
-	spec := DefaultSpec("empty-idx", 16, MetricL2)
-	idx, err := e.CreateIndex(ctx, spec, nil)
+func makeState(t *testing.T, id string, dim int, centroids [][]float32) *IndexState {
+	t.Helper()
+	spec := IVFSpec{ID: id, Dim: dim, Metric: MetricL2, Nlist: len(centroids)}
+	cs, err := kmeans.NewCentroidSet(1, centroids)
 	require.NoError(t, err)
-	require.NotNil(t, idx)
-
-	stats := idx.Stats()
-	require.Equal(t, uint64(0), stats.VectorCount)
+	return NewIndexState(spec, cs)
 }
 
-func TestCreateIndex_WithBulk1k(t *testing.T) {
+func TestEngine_RegisterAndLookup(t *testing.T) {
 	t.Parallel()
-	e := newTempEngine(t)
+	e := makeEngine(t)
+	state := makeState(t, "emb", 3, [][]float32{{1, 0, 0}, {0, 1, 0}})
 
-	idx := buildTestIndex(t, e, "bulk-idx", 64, 1000, MetricL2)
-	stats := idx.Stats()
-	require.Equal(t, uint64(1000), stats.VectorCount)
+	e.Register("emb", state)
+
+	got, ok := e.Lookup("emb")
+	require.True(t, ok)
+	require.Same(t, state, got)
 }
 
-func TestCreateIndex_DuplicateIDRejected(t *testing.T) {
+func TestEngine_LookupUnknown(t *testing.T) {
 	t.Parallel()
-	e := newTempEngine(t)
-	ctx := context.Background()
-
-	spec := DefaultSpec("dup-idx", 8, MetricL2)
-	_, err := e.CreateIndex(ctx, spec, nil)
-	require.NoError(t, err)
-
-	_, err2 := e.CreateIndex(ctx, spec, nil)
-	require.Error(t, err2, "creating same index ID twice must return an error")
+	e := makeEngine(t)
+	_, ok := e.Lookup("nonexistent")
+	require.False(t, ok)
 }
 
-func TestOpenIndex_AfterClose(t *testing.T) {
+func TestEngine_Unregister(t *testing.T) {
 	t.Parallel()
-	dir := t.TempDir()
-	ctx := context.Background()
-
-	e1, err := NewEngine(dir, 64, newTestLogger())
-	require.NoError(t, err)
-
-	spec := DefaultSpec("reopen-idx", 8, MetricL2)
-	_, createErr := e1.CreateIndex(ctx, spec, nil)
-	require.NoError(t, createErr)
-	require.NoError(t, e1.Close())
-
-	e2, err := NewEngine(dir, 64, newTestLogger())
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = e2.Close() })
-
-	idx, openErr := e2.OpenIndex(ctx, "reopen-idx")
-	require.NoError(t, openErr)
-	require.NotNil(t, idx)
+	e := makeEngine(t)
+	state := makeState(t, "emb", 2, [][]float32{{1, 0}})
+	e.Register("emb", state)
+	e.Unregister("emb")
+	_, ok := e.Lookup("emb")
+	require.False(t, ok)
 }
 
-func TestDropIndex_RemovesFiles(t *testing.T) {
+func TestEngine_UnregisterNoop(t *testing.T) {
 	t.Parallel()
-	e := newTempEngine(t)
-	ctx := context.Background()
-
-	spec := DefaultSpec("drop-idx", 8, MetricL2)
-	_, err := e.CreateIndex(ctx, spec, nil)
-	require.NoError(t, err)
-
-	require.NoError(t, e.DropIndex(ctx, "drop-idx"))
-
-	_, openErr := e.OpenIndex(ctx, "drop-idx")
-	require.Error(t, openErr, "OpenIndex after DropIndex must fail")
+	e := makeEngine(t)
+	require.NotPanics(t, func() { e.Unregister("nothing") })
 }
 
-func TestEngineClose_ClosesAllIndexes(t *testing.T) {
+func TestEngine_AssignNearest_ReturnsOneBased(t *testing.T) {
 	t.Parallel()
-	dir := t.TempDir()
-	ctx := context.Background()
+	e := makeEngine(t)
+	state := makeState(t, "emb", 3, [][]float32{{1, 0, 0}, {0, 1, 0}})
+	e.Register("emb", state)
 
-	e1, err := NewEngine(dir, 64, newTestLogger())
+	id, err := e.AssignNearest("emb", encodeVec([]float32{0.9, 0.1, 0}))
+	require.NoError(t, err)
+	require.Equal(t, int64(1), id)
+
+	id, err = e.AssignNearest("emb", encodeVec([]float32{0.1, 0.9, 0}))
+	require.NoError(t, err)
+	require.Equal(t, int64(2), id)
+}
+
+func TestEngine_AssignNearest_UnknownIndex(t *testing.T) {
+	t.Parallel()
+	e := makeEngine(t)
+	_, err := e.AssignNearest("noindex", encodeVec([]float32{1, 0}))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "MARMOT-VEC-013")
+}
+
+func TestEngine_AssignNearest_DimMismatch(t *testing.T) {
+	t.Parallel()
+	e := makeEngine(t)
+	state := makeState(t, "emb", 3, [][]float32{{1, 0, 0}})
+	e.Register("emb", state)
+
+	_, err := e.AssignNearest("emb", encodeVec([]float32{1, 0})) // 2-dim on 3-dim index
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "MARMOT-VEC-014")
+}
+
+func TestEngine_NotifyCentroidChange_NoOp(t *testing.T) {
+	t.Parallel()
+	e := makeEngine(t)
+	// No listener installed — must not return an error regardless of registration state.
+	require.NoError(t, e.NotifyCentroidChange("any", 99))
+	require.NoError(t, e.NotifyCentroidChange("", 0))
+}
+
+func TestEngine_RegisterWithCentroidSet(t *testing.T) {
+	t.Parallel()
+	e := makeEngine(t)
+	spec := IVFSpec{ID: "emb", Dim: 2, Metric: MetricL2, Nlist: 2}
+	cs, err := kmeans.NewCentroidSet(5, [][]float32{{1, 0}, {0, 1}})
 	require.NoError(t, err)
 
-	for _, id := range []string{"a", "b", "c"} {
-		spec := DefaultSpec(id, 8, MetricL2)
-		_, createErr := e1.CreateIndex(ctx, spec, nil)
-		require.NoError(t, createErr)
+	state := e.RegisterWithCentroidSet("emb", spec, cs)
+	require.NotNil(t, state)
+	require.Equal(t, uint64(5), state.ProbeVersion())
+
+	got, ok := e.Lookup("emb")
+	require.True(t, ok)
+	require.Same(t, state, got)
+}
+
+func TestEngine_ImplementsVectorUDFProvider(t *testing.T) {
+	t.Parallel()
+	// Compile-time check that Engine satisfies VectorUDFProvider.
+	var _ VectorUDFProvider = (*Engine)(nil)
+}
+
+func TestEngine_ConcurrentRegisterLookup(t *testing.T) {
+	t.Parallel()
+	e := makeEngine(t)
+	const n = 64
+	done := make(chan struct{})
+
+	for i := 0; i < n; i++ {
+		go func(i int) {
+			state := makeState(t, "emb", 2, [][]float32{{float32(i), 0}})
+			e.Register("emb", state)
+			e.Lookup("emb")
+			done <- struct{}{}
+		}(i)
 	}
-	require.NoError(t, e1.Close())
-
-	// Engine must be re-openable after clean close.
-	e2, err2 := NewEngine(dir, 64, newTestLogger())
-	require.NoError(t, err2)
-	require.NoError(t, e2.Close())
-}
-
-func TestCreateIndex_InvalidSpec(t *testing.T) {
-	t.Parallel()
-	e := newTempEngine(t)
-	ctx := context.Background()
-
-	cases := []struct {
-		name string
-		spec IVFSpec
-	}{
-		{"dim=0", IVFSpec{ID: "bad-dim", Dim: 0, Metric: MetricL2, Nlist: 64, Nprobe: 4}},
-		{"nlist=0", IVFSpec{ID: "bad-nlist", Dim: 8, Metric: MetricL2, Nlist: 0, Nprobe: 4}},
-		{"metric=255", IVFSpec{ID: "bad-metric", Dim: 8, Metric: Metric(255), Nlist: 64, Nprobe: 4}},
+	for i := 0; i < n; i++ {
+		<-done
 	}
-	for _, tc := range cases {
-		tc := tc
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			_, err := e.CreateIndex(ctx, tc.spec, nil)
-			require.Error(t, err, "invalid spec must be rejected")
-		})
-	}
+	_, ok := e.Lookup("emb")
+	require.True(t, ok)
 }

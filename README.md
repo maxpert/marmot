@@ -46,7 +46,7 @@ Marmot excels at **read-heavy edge scenarios**:
 |----------|------------------|
 | **Distributed WordPress** | Multi-region WordPress with replicated database |
 | **Lambda/Edge sidecars** | Lightweight regional SQLite replicas, local reads |
-| **Edge vector databases** | Distributed embeddings with local query |
+| **Edge vector databases** | Built-in ANN search + distributed embeddings with local query |
 | **Regional config servers** | Fast local config reads, replicated writes |
 | **Product catalogs** | Geo-distributed catalog data, eventual sync |
 
@@ -460,9 +460,59 @@ Marmot supports a wide range of MySQL/SQLite statements through its MySQL protoc
 
 6. **`LOAD DATA` Scope**: Marmot supports `LOAD DATA LOCAL INFILE` (client-uploaded file bytes). `LOAD DATA INFILE` (server-side file access) is not supported.
 
+## Vector Search
+
+Marmot has built-in vector similarity search. No extensions, no sidecars — two SQL functions and three DDL statements let you add ANN search to any table with a `BLOB` column of float32 embeddings.
+
+### Example
+
+```sql
+-- Table with an embedding column (must have INTEGER PRIMARY KEY).
+CREATE TABLE docs (
+    id    INTEGER PRIMARY KEY,
+    title TEXT,
+    embed BLOB,
+    status TEXT
+);
+
+-- One-line DDL. nlist/nprobe auto-tune from row count.
+CREATE VECTOR INDEX docs_embed ON docs(embed) DIM 1536 METRIC cosine;
+
+-- Query composes with ordinary WHERE / LIMIT / JOIN.
+SELECT id, title
+  FROM docs
+ WHERE vec_match(embed, :q, 10)
+   AND status = 'published'
+ ORDER BY vec_distance(embed, :q)
+ LIMIT 10;
+
+-- Retrain when drift accumulates (also runs automatically).
+REINDEX VECTOR docs_embed;
+```
+
+### What It Gives You
+
+- **Metrics**: `l2`, `cosine`, `dot` — pick at CREATE time; `vec_distance` automatically resolves to the right one at query time.
+- **Cost-based planner**: brute-force over a narrow `WHERE` predicate, or IVF probe when the index is cheaper. You do not pick — the planner does. Short-result fallback fills to K when a predicate was too aggressive.
+- **Replication by design**: only a small zstd-compressed centroid blob replicates. Cluster membership is rebuilt locally on each node from the same data, byte-deterministic across nodes so concurrent CREATE/REINDEX converges without wasted work.
+- **Low-latency hot path**: an in-memory cache bypasses per-row SQLite UDF dispatch on search. Serial p99 ≈ 1.7–3 ms on 100 K × 128-dim at recall ≥ 0.99.
+- **Auto-retrain**: background monitor trips REINDEX when cluster growth or delta ratio crosses a tunable threshold. Manual `REINDEX VECTOR` is always available.
+- **Scale**: k-means|| initialization scales to 1 M × 2048 centroids in roughly 75 seconds.
+
+### Controls
+
+```sql
+-- Override planner selection for a single connection
+SET @@marmot_vec_force_plan = 'pre';     -- 'auto' | 'pre' | 'post'
+SET @@marmot_vec_nprobe = 32;
+SET @@marmot_vec_fallback = 'on';
+```
+
+Delta-flush and auto-retrain knobs are similarly session-scoped. Full variable list, rewrite-to-SQL examples, replication internals, REINDEX shadow-swap flow, and error codes are in the [Vector Search docs](docs/src/pages/vector-search.mdx).
+
 ## SQLite Extensions
 
-Marmot supports loading SQLite extensions to add custom functions, virtual tables, and other capabilities. This enables use cases like vector search (sqlite-vss), full-text search, and custom aggregations.
+Marmot also supports loading arbitrary SQLite extensions for anything that isn't vector search — full-text search tokenizers, JSON extensions, custom aggregates, domain-specific functions.
 
 ### Configuration
 
@@ -472,7 +522,7 @@ Marmot supports loading SQLite extensions to add custom functions, virtual table
 directory = "/opt/sqlite/extensions"
 
 # Extensions loaded automatically into every connection
-always_loaded = ["sqlite-vector"]
+always_loaded = ["my-custom-ext"]
 ```
 
 ### Dynamic Loading
@@ -481,10 +531,7 @@ Extensions can be loaded at runtime via SQL:
 
 ```sql
 -- Load an extension by name (resolved from extensions.directory)
-LOAD EXTENSION sqlite-vector;
-
--- Verify the extension is loaded
-SELECT vec_version();
+LOAD EXTENSION my-custom-ext;
 ```
 
 **Extension Resolution:**
@@ -497,14 +544,15 @@ SELECT vec_version();
 - Resolved paths must stay within the configured directory
 - Only extensions in the configured directory can be loaded
 
-### Use Cases
+### Typical Uses
 
 | Extension | Purpose |
 |-----------|---------|
-| **sqlite-vss** | Vector similarity search for AI/ML embeddings |
-| **sqlite-vec** | Lightweight vector search |
 | **fts5** | Full-text search (usually built-in) |
 | **json1** | JSON functions (usually built-in) |
+| **Custom .so** | Domain-specific aggregates or functions |
+
+For vector search, use the native functions described above — no extension required.
 
 ## Session-Level Transpilation Toggle
 
@@ -1002,14 +1050,15 @@ See the [Integrations documentation](https://maxpert.github.io/marmot/integratio
 ```toml
 [extensions]
 directory = "/opt/sqlite/extensions"  # Search path for extensions
-always_loaded = ["sqlite-vector"]     # Auto-load into every connection
+always_loaded = ["my-custom-ext"]     # Auto-load into every connection
 ```
 
 **Loading Extensions at Runtime:**
 ```sql
-LOAD EXTENSION sqlite-vector;
-SELECT vec_version();
+LOAD EXTENSION my-custom-ext;
 ```
+
+Vector search is built-in and does not require an extension. See the Vector Search section above.
 
 ### Logging
 

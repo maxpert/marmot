@@ -3,7 +3,6 @@ package coordinator
 import (
 	"context"
 	"database/sql"
-	"encoding/binary"
 	"fmt"
 	"math"
 	"reflect"
@@ -15,8 +14,8 @@ import (
 
 	"github.com/maxpert/marmot/cfg"
 	"github.com/maxpert/marmot/common"
-	"github.com/maxpert/marmot/encoding"
 	"github.com/maxpert/marmot/hlc"
+	"github.com/maxpert/marmot/modules/vecindex"
 	"github.com/maxpert/marmot/protocol"
 	"github.com/maxpert/marmot/protocol/determinism"
 	"github.com/maxpert/marmot/protocol/handlers"
@@ -30,7 +29,12 @@ import (
 type VectorIndexManagerProvider interface {
 	CreateIndex(ctx context.Context, meta common.VectorIndexMeta) error
 	DropIndex(ctx context.Context, indexName, database string) error
-	Search(ctx context.Context, indexName string, vector []float32, topK int) ([]common.VectorSearchHit, error)
+	ReindexIndex(ctx context.Context, indexName string) error
+
+	// GetIndexByColumn and EstimatedRowCount are consumed by the vector-query
+	// rewriter (coordinator/vec_rewrite.go) via VectorIndexLookup.
+	GetIndexByColumn(database, table, column string) (*common.VectorIndexMeta, bool)
+	EstimatedRowCount(database, table string) int64
 }
 
 // DatabaseManager interface to avoid import cycles
@@ -191,6 +195,12 @@ type CoordinatorHandler struct {
 	publisherRegistry PublisherRegistry
 	publisherMu       sync.RWMutex
 	draining          atomic.Bool
+
+	// vecEngine is the VectorUDFProvider used by the vector-query rewriter
+	// (see coordinator/vec_rewrite.go). It is set once at startup via
+	// SetVectorEngine. Nil disables the rewrite hook (handler falls through
+	// to normal execution for any vec_match query).
+	vecEngine atomic.Pointer[vecindex.VectorUDFProvider]
 }
 
 // NewCoordinatorHandler creates a new handler
@@ -219,6 +229,24 @@ func (h *CoordinatorHandler) IsDraining() bool {
 	return h.draining.Load()
 }
 
+// SetVectorEngine installs the VectorUDFProvider consumed by the vector-query
+// rewriter. Safe to call at any time; must be non-nil for vec_match rewrites
+// to activate. A nil argument clears the engine.
+func (h *CoordinatorHandler) SetVectorEngine(p vecindex.VectorUDFProvider) {
+	if p == nil {
+		h.vecEngine.Store(nil)
+		return
+	}
+	h.vecEngine.Store(&p)
+}
+
+func (h *CoordinatorHandler) loadVectorEngine() vecindex.VectorUDFProvider {
+	if p := h.vecEngine.Load(); p != nil {
+		return *p
+	}
+	return nil
+}
+
 // SetPublisherRegistry sets the CDC publisher registry
 func (h *CoordinatorHandler) SetPublisherRegistry(registry PublisherRegistry) {
 	h.publisherMu.Lock()
@@ -238,12 +266,6 @@ func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, sq
 	// These are handled before parsing since they control parsing behavior
 	if protocol.IsMarmotSessionCommand(sql) {
 		return h.handleMarmotCommand(session, sql)
-	}
-
-	// Handle vec_knn() vector search queries before the Vitess parser sees them.
-	// The Vitess parser does not understand this custom function syntax.
-	if protocol.ContainsVecKnn(sql) {
-		return h.handleVecKnn(session, sql, params)
 	}
 
 	// Build schema lookup function for auto-increment ID injection.
@@ -307,9 +329,9 @@ func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, sq
 		Bool("transpilation", session.TranspilationEnabled).
 		Msg("PARSED")
 
-	// Handle SET commands as no-op (return OK)
+	// Handle SET commands: extract @@marmot_vec_* vars via Vitess AST; ignore others.
 	if stmt.Type == protocol.StatementSet {
-		return nil, nil
+		return h.handleSetCommand(session, sql)
 	}
 
 	// Handle transaction control statements (BEGIN/COMMIT/ROLLBACK)
@@ -410,6 +432,24 @@ func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, sq
 		return h.handleMutation(stmt, params, consistency)
 	}
 
+	// Vector-query rewrite hook (design §7): intercept vec_match() + vec_distance()
+	// SELECTs before the standard read path. Pass-through (info==nil) when the
+	// query has no vector predicate or when the engine is not installed.
+	if stmt.Type == protocol.StatementSelect {
+		info, rewrittenArgs, vecErr := h.maybeRewriteVectorSelect(stmt, params, session)
+		if vecErr != nil {
+			return nil, vecErr
+		}
+		if info != nil {
+			rs, err := h.executeVectorPlan(stmt, info, rewrittenArgs, consistency)
+			if err != nil {
+				return nil, err
+			}
+			h.processFoundRowsResult(session, rs)
+			return rs, nil
+		}
+	}
+
 	rs, err := h.handleRead(stmt, params, consistency)
 	if err != nil {
 		return nil, err
@@ -451,10 +491,10 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, params []in
 	startTS := h.clock.Now()
 	txnID := startTS.ToTxnID()
 
-	// Vector DDL is handled locally — VectorIndexManager owns its own storage.
-	// No 2PC needed: the metadata table is CDC-replicated and each node builds
-	// its Pebble index independently from the source table data.
-	if stmt.Type == protocol.StatementCreateVectorIndex || stmt.Type == protocol.StatementDropVectorIndex {
+	// Vector DDL is handled locally — VectorIndexManager owns shadow tables and triggers.
+	// No 2PC needed: shadow tables are local derived state; the centroids table is
+	// CDC-replicated and drives convergence across nodes (design §8.1).
+	if stmt.Type == protocol.StatementCreateVectorIndex || stmt.Type == protocol.StatementDropVectorIndex || stmt.Type == protocol.StatementReindexVectorIndex {
 		return h.handleVectorDDL(stmt)
 	}
 
@@ -698,6 +738,9 @@ func (h *CoordinatorHandler) handleVectorDDL(stmt protocol.Statement) (*protocol
 			Database:   stmt.Database,
 			Metric:     stmt.VectorMetric,
 			Dim:        stmt.VectorDim,
+			Nlist:      stmt.VectorNlist,
+			Nprobe:     stmt.VectorNprobe,
+			MaxNorm:    stmt.VectorMaxNorm,
 			Status:     "building",
 			CreatedAt:  time.Now().UnixNano(),
 		}
@@ -709,6 +752,12 @@ func (h *CoordinatorHandler) handleVectorDDL(stmt protocol.Statement) (*protocol
 	case protocol.StatementDropVectorIndex:
 		if err := vecMgr.DropIndex(ctx, stmt.VectorIndexName, stmt.Database); err != nil {
 			return nil, fmt.Errorf("drop vector index: %w", err)
+		}
+		return &protocol.ResultSet{RowsAffected: 0}, nil
+
+	case protocol.StatementReindexVectorIndex:
+		if err := vecMgr.ReindexIndex(ctx, stmt.VectorIndexName); err != nil {
+			return nil, fmt.Errorf("reindex vector index: %w", err)
 		}
 		return &protocol.ResultSet{RowsAffected: 0}, nil
 
@@ -1311,53 +1360,19 @@ func (h *CoordinatorHandler) handleMarmotCommand(session *protocol.ConnectionSes
 	return nil, fmt.Errorf("unrecognized marmot command: %s", sql)
 }
 
-// handleVecKnn executes a vec_knn() vector search and returns a result set with
-// columns (rowid BIGINT, distance FLOAT, score FLOAT).
-func (h *CoordinatorHandler) handleVecKnn(_ *protocol.ConnectionSession, sql string, params []interface{}) (*protocol.ResultSet, error) {
-	call, err := protocol.ParseVecKnnCall(sql)
+// handleSetCommand processes a StatementSet. It extracts any @@marmot_vec_*
+// variables via the Vitess AST and applies them to the session. All other SET
+// vars (@@autocommit, @@sql_mode, etc.) are silently accepted as no-ops, which
+// is the existing behaviour for non-vec SET statements.
+func (h *CoordinatorHandler) handleSetCommand(session *protocol.ConnectionSession, sql string) (*protocol.ResultSet, error) {
+	updates, err := protocol.ExtractVecSessionVarUpdates(sql)
 	if err != nil {
 		return nil, err
 	}
-
-	if h.dbManager == nil {
-		return nil, fmt.Errorf("vector index: database manager not available")
-	}
-
-	vecMgr := h.dbManager.GetVectorIndexManager()
-	if vecMgr == nil {
-		return nil, fmt.Errorf("vector index support not enabled")
-	}
-
-	if len(params) == 0 {
-		return nil, fmt.Errorf("vec_knn requires a query vector parameter")
-	}
-	vectorBytes, ok := params[0].([]byte)
-	if !ok {
-		return nil, fmt.Errorf("vec_knn query vector must be a BLOB parameter")
-	}
-
-	vector := encoding.DecodeFloat32Slice(vectorBytes)
-
-	ctx := context.Background()
-	hits, err := vecMgr.Search(ctx, call.IndexName, vector, call.TopK)
-	if err != nil {
-		return nil, fmt.Errorf("vec_knn search failed: %w", err)
-	}
-
-	rs := &protocol.ResultSet{
-		Columns: []protocol.ColumnDef{
-			{Name: "rowid", Type: 0x08},    // MYSQL_TYPE_LONGLONG
-			{Name: "distance", Type: 0x04}, // MYSQL_TYPE_FLOAT
-			{Name: "score", Type: 0x04},    // MYSQL_TYPE_FLOAT
-		},
-		Rows: make([][]interface{}, len(hits)),
-	}
-	for i, hit := range hits {
-		var rowid int64
-		if len(hit.ExternalID) == 8 {
-			rowid = int64(binary.BigEndian.Uint64(hit.ExternalID))
+	for _, u := range updates {
+		if applyErr := session.VecVars.Apply(u.Name, u.Value); applyErr != nil {
+			return nil, applyErr
 		}
-		rs.Rows[i] = []interface{}{rowid, float64(hit.Distance), float64(hit.Score)}
 	}
-	return rs, nil
+	return nil, nil
 }

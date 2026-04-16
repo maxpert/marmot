@@ -203,13 +203,13 @@ type ExtensionConfiguration struct {
 	AlwaysLoaded []string `toml:"always_loaded"` // Extensions loaded into every connection via ConnectHook
 }
 
-// VectorIndexConfiguration controls vector index behavior
+// VectorIndexConfiguration controls vector index behavior.
+// Pebble-specific fields (pebble_cache_mb, reconcile_interval_seconds,
+// min_vectors_for_create) have been removed; the SQLite-native engine
+// introduced in a later phase will add its own configuration.
 type VectorIndexConfiguration struct {
-	Enabled              bool   `toml:"enabled"`
-	DataDir              string `toml:"data_dir"`                   // Default: {data_dir}/vector_indexes
-	PebbleCacheMB        int    `toml:"pebble_cache_mb"`            // Block cache size in MB for vector index Pebble store (default: 256)
-	ReconcileIntervalSec int    `toml:"reconcile_interval_seconds"` // Background watermark reconciliation (default: 60)
-	MinVectorsForCreate  int    `toml:"min_vectors_for_create"`     // Minimum rows before CREATE INDEX (default: 100)
+	Enabled bool   `toml:"enabled"`
+	DataDir string `toml:"data_dir"` // Reserved for future SQLite-native engine data path
 }
 
 // Configuration is the main configuration structure
@@ -377,10 +377,7 @@ var Config = &Configuration{
 	},
 
 	VectorIndex: VectorIndexConfiguration{
-		Enabled:              false,
-		PebbleCacheMB:        256,
-		ReconcileIntervalSec: 60,
-		MinVectorsForCreate:  100,
+		Enabled: false,
 	},
 }
 

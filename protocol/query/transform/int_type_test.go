@@ -25,19 +25,19 @@ func TestIntTypeRule_Priority(t *testing.T) {
 // even though it always defers to CreateTableRule for serialization.
 func TestIntTypeRule_ModifiesAST(t *testing.T) {
 	tests := []struct {
-		name            string
-		input           string
-		shouldModify    bool
-		checkUnsigned   bool
-		checkAutoInc    bool
-		checkIntType    bool
+		name          string
+		input         string
+		shouldModify  bool
+		checkUnsigned bool
+		checkAutoInc  bool
+		checkIntType  bool
 	}{
 		{
-			name:          "INT AUTO_INCREMENT stripped",
-			input:         "CREATE TABLE users (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(100))",
-			shouldModify:  true,
-			checkAutoInc:  true,
-			checkIntType:  true,
+			name:         "INT AUTO_INCREMENT stripped",
+			input:        "CREATE TABLE users (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(100))",
+			shouldModify: true,
+			checkAutoInc: true,
+			checkIntType: true,
 		},
 		{
 			name:          "BIGINT UNSIGNED AUTO_INCREMENT stripped",

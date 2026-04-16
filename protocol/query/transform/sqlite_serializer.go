@@ -15,7 +15,7 @@ type SerializeOpts struct {
 // It uses a custom node formatter to handle SQLite-specific syntax differences:
 //   - Named parameters (:v1) → positional (?)
 //   - INSERT IGNORE → INSERT OR IGNORE
-//   - Escape sequences (\') → ('') for string literals
+//   - Escape sequences (\') → (”) for string literals
 //   - Remove MySQL-specific hints (FORCE INDEX, USE INDEX, FOR UPDATE)
 //   - Convert MySQL LIMIT offset,count → LIMIT count OFFSET offset
 type SQLiteSerializer struct {

@@ -6,6 +6,7 @@
   "integrations": "Integrations",
   "compatibility": "Compatibility",
   "sql-reference": "SQL Reference",
+  "vector-search": "Vector Search",
   "operations": "Operations",
   "metrics": "Prometheus Metrics",
   "reference": "Reference",

@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -342,11 +343,21 @@ func ParseStatementVitess(sql string) Statement {
 	// Vector Index DDL (sqlite-vec extension syntax not parsed by Vitess)
 	if createVectorIndexPattern.MatchString(sql) {
 		stmt.Type = StatementCreateVectorIndex
-		vecIdxPattern := regexp.MustCompile(`(?i)CREATE\s+VECTOR\s+INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)\s+ON\s+(\w+)\s*\(`)
-		if m := vecIdxPattern.FindStringSubmatch(sql); len(m) > 2 {
+		// Capture: (1) index name, (2) table name, (3) column name
+		vecIdxPattern := regexp.MustCompile(`(?i)CREATE\s+VECTOR\s+INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)\s+ON\s+(\w+)\s*\(\s*(\w+)\s*\)`)
+		if m := vecIdxPattern.FindStringSubmatch(sql); len(m) > 3 {
 			stmt.VectorIndexName = m[1]
 			stmt.TableName = m[2]
+			stmt.VectorColumnName = m[3]
 		}
+		// Parse DIM and METRIC from the main syntax (before optional WITH clause).
+		if m := regexp.MustCompile(`(?i)\bDIM\s+(\d+)`).FindStringSubmatch(sql); len(m) > 1 {
+			stmt.VectorDim = parseDecimalInt(m[1])
+		}
+		if m := regexp.MustCompile(`(?i)\bMETRIC\s+(\w+)`).FindStringSubmatch(sql); len(m) > 1 {
+			stmt.VectorMetric = strings.ToLower(m[1])
+		}
+		// WITH clause overrides main-syntax values for all keys it mentions.
 		withPattern := regexp.MustCompile(`(?i)WITH\s*\(([^)]+)\)`)
 		if wm := withPattern.FindStringSubmatch(sql); len(wm) > 1 {
 			parseVectorWithClause(&stmt, wm[1])
@@ -355,11 +366,31 @@ func ParseStatementVitess(sql string) Statement {
 	}
 	if dropVectorIndexPattern.MatchString(sql) {
 		stmt.Type = StatementDropVectorIndex
-		vecDropPattern := regexp.MustCompile(`(?i)DROP\s+VECTOR\s+INDEX\s+(?:IF\s+EXISTS\s+)?(\w+)\s+ON\s+(\w+)`)
-		if m := vecDropPattern.FindStringSubmatch(sql); len(m) > 2 {
+		// ON <table> is optional — index names are unique within a database.
+		vecDropPattern := regexp.MustCompile(`(?i)DROP\s+VECTOR\s+INDEX\s+(?:IF\s+EXISTS\s+)?(\w+)(?:\s+ON\s+(\w+))?`)
+		if m := vecDropPattern.FindStringSubmatch(sql); len(m) > 1 {
 			stmt.VectorIndexName = m[1]
-			stmt.TableName = m[2]
+			if len(m) > 2 {
+				stmt.TableName = m[2]
+			}
 		}
+		return stmt
+	}
+
+	// REINDEX VECTOR <name> — SQLite-specific DDL (design §8.3). Vitess cannot
+	// parse this, so we tokenize the statement ourselves rather than fall
+	// through to Vitess. Tokenization preserves the hard "no regex for DDL
+	// parsing" rule: we walk whitespace-separated tokens and validate shape
+	// explicitly. `REINDEX TABLE <name>` and plain `REINDEX` fall through
+	// unchanged — only the VECTOR variant is intercepted here.
+	if name, ok, rvErr := parseReindexVectorDDL(sql); ok {
+		if rvErr != nil {
+			stmt.Type = StatementUnsupported
+			stmt.Error = rvErr.Error()
+			return stmt
+		}
+		stmt.Type = StatementReindexVectorIndex
+		stmt.VectorIndexName = name
 		return stmt
 	}
 
@@ -649,8 +680,87 @@ func ParseStatementVitess(sql string) Statement {
 	return stmt
 }
 
+// Vitess token constants used by parseReindexVectorDDL. These match the
+// yacc-generated values in vitess.io/vitess/go/vt/sqlparser/sql.go.
+// Declared here to avoid exporting internals; the values are stable across
+// Vitess minor versions since they come from the generated grammar.
+const (
+	vitessTokenID     = 57440 // unquoted or backtick-quoted identifier
+	vitessTokenVECTOR = 57730 // the VECTOR keyword
+)
+
+// parseReindexVectorDDL detects and parses `REINDEX VECTOR <name>` statements
+// using the Vitess tokenizer so that SQL comments, quoted identifiers, and
+// string literals are handled correctly. No regex, no string splitting.
+//
+// Returns:
+//
+//	(name, true,  nil)  — valid `REINDEX VECTOR <name>` (optional trailing ';')
+//	("",   true,  err)  — starts with `REINDEX VECTOR` but shape is invalid
+//	                      (missing name, extra tokens, etc.) — a typed error
+//	                      so the caller can surface it as Unsupported.
+//	("",   false, nil)  — not a REINDEX VECTOR statement (e.g. plain REINDEX,
+//	                      REINDEX TABLE, or anything else). Caller falls
+//	                      through to the normal parse path.
+//
+// The index name must also pass identifier shape validation at manager level;
+// this helper only enforces syntactic shape — the two keywords followed by
+// exactly one identifier token.
+func parseReindexVectorDDL(sql string) (name string, matched bool, err error) {
+	tkn := vitessParser.NewStringTokenizer(sql)
+
+	// Consume non-significant tokens (comments) until the first keyword.
+	tok1, val1 := scanSkipComments(tkn)
+	if tok1 == 0 {
+		return "", false, nil
+	}
+	// REINDEX is not a MySQL keyword — Vitess lexes it as a plain ID.
+	if tok1 != vitessTokenID || !strings.EqualFold(val1, "REINDEX") {
+		return "", false, nil
+	}
+
+	tok2, _ := scanSkipComments(tkn)
+	if tok2 != vitessTokenVECTOR {
+		// `REINDEX TABLE`, `REINDEX idx`, or just `REINDEX` — not ours.
+		return "", false, nil
+	}
+
+	// From here we own the statement — shape errors surface as Unsupported.
+	tok3, val3 := scanSkipComments(tkn)
+	if tok3 == 0 || tok3 == ';' {
+		return "", true, fmt.Errorf("MARMOT-VEC-015: REINDEX VECTOR requires an index name")
+	}
+	if tok3 != vitessTokenID {
+		return "", true, fmt.Errorf("MARMOT-VEC-015: REINDEX VECTOR index name must be an identifier, got token %d", tok3)
+	}
+
+	// Expect end-of-input or a trailing semicolon — nothing else.
+	tok4, _ := scanSkipComments(tkn)
+	if tok4 != 0 && tok4 != ';' {
+		return "", true, fmt.Errorf("MARMOT-VEC-015: REINDEX VECTOR takes exactly one index name; unexpected trailing token")
+	}
+	return val3, true, nil
+}
+
+// scanSkipComments calls tkn.Scan() in a loop, skipping comment tokens
+// (Vitess emits them as token type 57449 / COMMENT). Returns (0, "") at
+// end-of-input.
+func scanSkipComments(tkn *sqlparser.Tokenizer) (int, string) {
+	for {
+		tok, val := tkn.Scan()
+		if tok == 0 {
+			return 0, ""
+		}
+		// Vitess comment token = 57449; skip silently.
+		if tok == 57449 {
+			continue
+		}
+		return tok, val
+	}
+}
+
 // parseVectorWithClause parses key=value pairs from a WITH(...) clause into Statement vector fields.
-// Recognized keys: metric, dim, col (column name).
+// Recognized keys: metric, dim, col/column, nlist, nprobe, max_norm.
 func parseVectorWithClause(stmt *Statement, clause string) {
 	kvPattern := regexp.MustCompile(`(?i)(\w+)\s*=\s*'?([^',)]+)'?`)
 	for _, m := range kvPattern.FindAllStringSubmatch(clause, -1) {
@@ -663,17 +773,25 @@ func parseVectorWithClause(stmt *Statement, clause string) {
 		case "metric":
 			stmt.VectorMetric = strings.ToLower(val)
 		case "dim":
-			n := 0
-			for _, ch := range val {
-				if ch >= '0' && ch <= '9' {
-					n = n*10 + int(ch-'0')
-				}
-			}
-			stmt.VectorDim = n
+			stmt.VectorDim = parseDecimalInt(val)
 		case "col", "column":
 			stmt.VectorColumnName = val
+		case "nlist":
+			stmt.VectorNlist = parseDecimalInt(val)
+		case "nprobe":
+			stmt.VectorNprobe = parseDecimalInt(val)
+		case "max_norm":
+			if f, err := strconv.ParseFloat(val, 32); err == nil {
+				stmt.VectorMaxNorm = float32(f)
+			}
 		}
 	}
+}
+
+// parseDecimalInt converts a decimal digit string to int, returning 0 on any error.
+func parseDecimalInt(s string) int {
+	n, _ := strconv.Atoi(strings.TrimSpace(s))
+	return n
 }
 
 // isInformationSchemaQuery checks if a SELECT statement queries INFORMATION_SCHEMA

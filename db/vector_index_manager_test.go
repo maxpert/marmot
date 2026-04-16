@@ -1,548 +1,367 @@
+//go:build sqlite_preupdate_hook
+// +build sqlite_preupdate_hook
+
 package db
 
 import (
 	"context"
-	"encoding/binary"
+	"database/sql"
 	"fmt"
-	"math"
 	"testing"
+	"time"
 
-	"github.com/maxpert/marmot/hlc"
-	"github.com/stretchr/testify/assert"
+	"github.com/maxpert/marmot/common"
+	"github.com/maxpert/marmot/modules/vecindex"
 	"github.com/stretchr/testify/require"
 )
 
-// ---------------------------------------------------------------------------
-// Mock implementations
-// ---------------------------------------------------------------------------
-
-type mockUpsertCall struct {
-	externalID []byte
-	vector     []float32
-	txnID      uint64
-	seqID      uint64
-}
-
-type mockDeleteCall struct {
-	externalID []byte
-	txnID      uint64
-	seqID      uint64
-}
-
-type mockVectorIndex struct {
-	searchResults []VectorSearchHit
-	searchErr     error
-	upsertCalls   []mockUpsertCall
-	deleteCalls   []mockDeleteCall
-	stats         VectorIndexStats
-	closed        bool
-}
-
-func (m *mockVectorIndex) Search(_ context.Context, _ []float32, _ int) ([]VectorSearchHit, error) {
-	return m.searchResults, m.searchErr
-}
-
-func (m *mockVectorIndex) Upsert(_ context.Context, externalID []byte, vector []float32, txnID, seqID uint64) error {
-	m.upsertCalls = append(m.upsertCalls, mockUpsertCall{externalID: externalID, vector: vector, txnID: txnID, seqID: seqID})
-	return nil
-}
-
-func (m *mockVectorIndex) Delete(_ context.Context, externalID []byte, txnID, seqID uint64) error {
-	m.deleteCalls = append(m.deleteCalls, mockDeleteCall{externalID: externalID, txnID: txnID, seqID: seqID})
-	return nil
-}
-
-func (m *mockVectorIndex) Stats() VectorIndexStats { return m.stats }
-func (m *mockVectorIndex) Close() error            { m.closed = true; return nil }
-
-type mockVectorEngine struct {
-	indexes    map[string]*mockVectorIndex
-	created    []string
-	dropped    []string
-	openErrors map[string]error // optional per-index error returned by OpenIndex
-}
-
-func newMockEngine() *mockVectorEngine {
-	return &mockVectorEngine{
-		indexes:    make(map[string]*mockVectorIndex),
-		openErrors: make(map[string]error),
-	}
-}
-
-func (e *mockVectorEngine) CreateIndex(_ context.Context, id string, _ int, _ string, _ []VectorBulkEntry) (VectorIndex, error) {
-	e.created = append(e.created, id)
-	idx := &mockVectorIndex{}
-	e.indexes[id] = idx
-	return idx, nil
-}
-
-func (e *mockVectorEngine) OpenIndex(_ context.Context, id string) (VectorIndex, error) {
-	if err, hasErr := e.openErrors[id]; hasErr {
-		return nil, err
-	}
-	idx, ok := e.indexes[id]
-	if !ok {
-		idx = &mockVectorIndex{}
-		e.indexes[id] = idx
-	}
-	return idx, nil
-}
-
-func (e *mockVectorEngine) DropIndex(_ context.Context, id string) error {
-	e.dropped = append(e.dropped, id)
-	delete(e.indexes, id)
-	return nil
-}
-
-func (e *mockVectorEngine) Close() error { return nil }
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-func setupTestVIM(t *testing.T) (*VectorIndexManager, *DatabaseManager, *mockVectorEngine) {
+// setupVecIndexTestDB opens an in-memory DB and runs schema migration.
+func setupVecIndexTestDB(t *testing.T) *sql.DB {
 	t.Helper()
-	tmpDir := t.TempDir()
-	clock := hlc.NewClock(1)
-	dm, err := NewDatabaseManager(tmpDir, 1, clock)
+	db := openInMemorySQLite(t)
+	require.NoError(t, MigrateVectorIndexesSchema(db))
+	_, err := db.Exec(`CREATE TABLE docs (id INTEGER PRIMARY KEY, embed BLOB, title TEXT)`)
 	require.NoError(t, err)
-
-	eng := newMockEngine()
-	vim := NewVectorIndexManager(eng, dm, 0, 0)
-	// Stop VIM before closing DM so background goroutines are cancelled first.
-	t.Cleanup(func() {
-		_ = vim.Stop()
-		dm.Close()
-	})
-	return vim, dm, eng
+	return db
 }
 
-// encodeFloat32Vec encodes a []float32 as a little-endian IEEE-754 BLOB.
-func encodeFloat32Vec(vec []float32) []byte {
-	b := make([]byte, len(vec)*4)
-	for i, v := range vec {
-		binary.LittleEndian.PutUint32(b[i*4:], math.Float32bits(v))
-	}
-	return b
+// objectExists checks whether a SQLite object (table or trigger) with the given
+// name is recorded in sqlite_master.
+func objectExists(t *testing.T, db *sql.DB, name string) bool {
+	t.Helper()
+	var n int
+	err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE name = ?`, name).Scan(&n)
+	require.NoError(t, err)
+	return n > 0
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
-func TestVectorIndexManager_CreateIndex(t *testing.T) {
-	t.Parallel()
-	vim, dm, eng := setupTestVIM(t)
-
-	ctx := context.Background()
-
-	// Create a test table with vector data in the default database.
-	conn, err := dm.GetDatabaseConnection(DefaultDatabaseName)
-	require.NoError(t, err)
-
-	_, err = conn.ExecContext(ctx, "CREATE TABLE vecs (id INTEGER PRIMARY KEY, embedding BLOB)")
-	require.NoError(t, err)
-
-	vec := []float32{1.0, 2.0, 3.0}
-	_, err = conn.ExecContext(ctx, "INSERT INTO vecs (id, embedding) VALUES (1, ?)", encodeFloat32Vec(vec))
-	require.NoError(t, err)
-
-	meta := VectorIndexMeta{
-		IndexName:  "test_idx",
-		TableName:  "vecs",
-		ColumnName: "embedding",
-		Database:   DefaultDatabaseName,
-		Metric:     "cosine",
-		Dim:        3,
-	}
-
-	require.NoError(t, vim.CreateIndex(ctx, meta))
-
-	// Engine was called.
-	assert.Contains(t, eng.created, "test_idx")
-
-	// Index is registered.
-	vim.mu.RLock()
-	_, ok := vim.indexes["test_idx"]
-	vim.mu.RUnlock()
-	assert.True(t, ok)
-
-	// Metadata row exists with status=ready.
+// metaRow returns the status of an index from __marmot_vector_indexes or "" if absent.
+func metaStatus(t *testing.T, db *sql.DB, indexName string) string {
+	t.Helper()
 	var status string
-	err = conn.QueryRowContext(ctx, "SELECT status FROM __marmot_vector_indexes WHERE index_name = ?", "test_idx").Scan(&status)
+	err := db.QueryRow(
+		`SELECT status FROM __marmot_vector_indexes WHERE index_name = ?`, indexName,
+	).Scan(&status)
+	if err == sql.ErrNoRows {
+		return ""
+	}
 	require.NoError(t, err)
-	assert.Equal(t, "ready", status)
+	return status
 }
 
-func TestVectorIndexManager_DropIndex(t *testing.T) {
-	t.Parallel()
-	vim, dm, eng := setupTestVIM(t)
-
+func TestCreateVectorIndex_DDL(t *testing.T) {
+	db := setupVecIndexTestDB(t)
 	ctx := context.Background()
 
-	conn, err := dm.GetDatabaseConnection(DefaultDatabaseName)
-	require.NoError(t, err)
-
-	_, err = conn.ExecContext(ctx, "CREATE TABLE drop_vecs (id INTEGER PRIMARY KEY, embedding BLOB)")
-	require.NoError(t, err)
-
-	meta := VectorIndexMeta{
-		IndexName:  "drop_idx",
-		TableName:  "drop_vecs",
-		ColumnName: "embedding",
-		Database:   DefaultDatabaseName,
-		Metric:     "euclidean",
+	meta := common.VectorIndexMeta{
+		IndexName:  "embeddings",
+		TableName:  "docs",
+		ColumnName: "embed",
+		Database:   "test",
+		Metric:     "cosine",
 		Dim:        4,
+		Nlist:      64,
+		Nprobe:     8,
+		CreatedAt:  time.Now().UnixNano(),
 	}
-	require.NoError(t, vim.CreateIndex(ctx, meta))
 
-	require.NoError(t, vim.DropIndex(ctx, "drop_idx", DefaultDatabaseName))
+	mgr := &VectorIndexManager{}
 
-	// Engine was asked to drop.
-	assert.Contains(t, eng.dropped, "drop_idx")
-
-	// Index removed from internal map.
-	vim.mu.RLock()
-	_, ok := vim.indexes["drop_idx"]
-	vim.mu.RUnlock()
-	assert.False(t, ok)
-
-	// Metadata row removed.
-	var count int
-	err = conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM __marmot_vector_indexes WHERE index_name = ?", "drop_idx").Scan(&count)
+	err := mgr.execCreateDDL(ctx, db, meta)
 	require.NoError(t, err)
-	assert.Equal(t, 0, count)
+
+	// Centroids table (single underscore → CDC-replicated).
+	require.True(t, objectExists(t, db, vecindex.CentroidsTable("embeddings")),
+		"centroids table must exist")
+
+	// Members shadow table (double underscore → local).
+	require.True(t, objectExists(t, db, vecindex.MembersTable("embeddings")),
+		"members table must exist")
+
+	// Members rowid index.
+	require.True(t, objectExists(t, db, vecindex.MembersRowidIndex("embeddings")),
+		"members rowid index must exist")
+
+	// Base-table triggers.
+	require.True(t, objectExists(t, db, vecindex.TriggerInsert("embeddings")), "insert trigger")
+	require.True(t, objectExists(t, db, vecindex.TriggerUpdate("embeddings")), "update trigger")
+	require.True(t, objectExists(t, db, vecindex.TriggerDelete("embeddings")), "delete trigger")
+
+	// Centroid-change triggers.
+	require.True(t, objectExists(t, db, vecindex.TriggerCentroidChange("embeddings")), "centroid insert trigger")
+	require.True(t, objectExists(t, db, vecindex.TriggerCentroidsVersionUpdate("embeddings")), "centroid update trigger")
+
+	// Metadata row present with status='building'.
+	require.Equal(t, "building", metaStatus(t, db, "embeddings"))
 }
 
-func TestVectorIndexManager_Search(t *testing.T) {
-	t.Parallel()
-	vim, dm, eng := setupTestVIM(t)
-
+func TestCreateVectorIndex_Idempotent(t *testing.T) {
+	db := setupVecIndexTestDB(t)
 	ctx := context.Background()
 
-	conn, err := dm.GetDatabaseConnection(DefaultDatabaseName)
-	require.NoError(t, err)
-
-	_, err = conn.ExecContext(ctx, "CREATE TABLE search_vecs (id INTEGER PRIMARY KEY, embedding BLOB)")
-	require.NoError(t, err)
-
-	meta := VectorIndexMeta{
-		IndexName:  "search_idx",
-		TableName:  "search_vecs",
-		ColumnName: "embedding",
-		Database:   DefaultDatabaseName,
+	meta := common.VectorIndexMeta{
+		IndexName:  "embeddings",
+		TableName:  "docs",
+		ColumnName: "embed",
+		Database:   "test",
 		Metric:     "cosine",
-		Dim:        2,
+		Dim:        4,
+		Nlist:      64,
+		Nprobe:     8,
+		CreatedAt:  time.Now().UnixNano(),
 	}
-	require.NoError(t, vim.CreateIndex(ctx, meta))
+	mgr := &VectorIndexManager{}
 
-	// Pre-load results on the mock.
-	mockIdx := eng.indexes["search_idx"]
-	mockIdx.searchResults = []VectorSearchHit{
-		{ExternalID: []byte("abc"), Distance: 0.1, Score: 0.9},
-	}
-
-	hits, err := vim.Search(ctx, "search_idx", []float32{1.0, 0.0}, 5)
-	require.NoError(t, err)
-	require.Len(t, hits, 1)
-	assert.Equal(t, []byte("abc"), hits[0].ExternalID)
+	require.NoError(t, mgr.execCreateDDL(ctx, db, meta))
+	// Second call with IF NOT EXISTS guards must not error.
+	require.NoError(t, mgr.execCreateDDL(ctx, db, meta))
 }
 
-func TestVectorIndexManager_Search_NotFound(t *testing.T) {
-	t.Parallel()
-	vim, _, _ := setupTestVIM(t)
-
-	_, err := vim.Search(context.Background(), "nonexistent", []float32{1.0}, 1)
-	assert.Error(t, err)
-}
-
-func TestVectorIndexManager_GetIndexMeta(t *testing.T) {
-	t.Parallel()
-	vim, dm, _ := setupTestVIM(t)
-
+func TestDropVectorIndex_DDL(t *testing.T) {
+	db := setupVecIndexTestDB(t)
 	ctx := context.Background()
 
-	conn, err := dm.GetDatabaseConnection(DefaultDatabaseName)
-	require.NoError(t, err)
-
-	_, err = conn.ExecContext(ctx, "CREATE TABLE meta_vecs (id INTEGER PRIMARY KEY, embedding BLOB)")
-	require.NoError(t, err)
-
-	meta := VectorIndexMeta{
-		IndexName:  "meta_idx",
-		TableName:  "meta_vecs",
-		ColumnName: "embedding",
-		Database:   DefaultDatabaseName,
-		Metric:     "dot",
-		Dim:        8,
+	meta := common.VectorIndexMeta{
+		IndexName:  "embeddings",
+		TableName:  "docs",
+		ColumnName: "embed",
+		Database:   "test",
+		Metric:     "cosine",
+		Dim:        4,
+		Nlist:      64,
+		Nprobe:     8,
+		CreatedAt:  time.Now().UnixNano(),
 	}
-	require.NoError(t, vim.CreateIndex(ctx, meta))
+	mgr := &VectorIndexManager{}
 
-	got, ok := vim.GetIndexMeta("meta_idx")
+	require.NoError(t, mgr.execCreateDDL(ctx, db, meta))
+	require.NoError(t, mgr.execDropDDL(ctx, db, "embeddings"))
+
+	// All generated objects must be gone.
+	require.False(t, objectExists(t, db, vecindex.CentroidsTable("embeddings")), "centroids table must be dropped")
+	require.False(t, objectExists(t, db, vecindex.MembersTable("embeddings")), "members table must be dropped")
+	require.False(t, objectExists(t, db, vecindex.TriggerInsert("embeddings")), "insert trigger must be dropped")
+	require.False(t, objectExists(t, db, vecindex.TriggerUpdate("embeddings")), "update trigger must be dropped")
+	require.False(t, objectExists(t, db, vecindex.TriggerDelete("embeddings")), "delete trigger must be dropped")
+	require.False(t, objectExists(t, db, vecindex.TriggerCentroidChange("embeddings")), "centroid insert trigger must be dropped")
+	require.False(t, objectExists(t, db, vecindex.TriggerCentroidsVersionUpdate("embeddings")), "centroid update trigger must be dropped")
+
+	// Metadata row must be removed.
+	require.Equal(t, "", metaStatus(t, db, "embeddings"), "metadata row must be deleted")
+}
+
+func TestInsertTrigger_AddsToDelta(t *testing.T) {
+	db := setupVecIndexTestDB(t)
+	ctx := context.Background()
+
+	meta := common.VectorIndexMeta{
+		IndexName:  "embeddings",
+		TableName:  "docs",
+		ColumnName: "embed",
+		Database:   "test",
+		Metric:     "cosine",
+		Dim:        4,
+		Nlist:      64,
+		Nprobe:     8,
+		CreatedAt:  time.Now().UnixNano(),
+	}
+	mgr := &VectorIndexManager{}
+	require.NoError(t, mgr.execCreateDDL(ctx, db, meta))
+
+	// Insert a row with a non-NULL embed.
+	embed := []byte{0, 0, 0x80, 0x3f} // float32(1.0) little-endian
+	_, err := db.Exec(`INSERT INTO docs (id, embed) VALUES (1, ?)`, embed)
+	require.NoError(t, err)
+
+	// The trigger must have inserted (cluster_id=0, rowid=1) into members.
+	var clusterID, rowid int64
+	err = db.QueryRow(
+		fmt.Sprintf(`SELECT cluster_id, rowid FROM "%s" WHERE rowid = 1`,
+			vecindex.MembersTable("embeddings")),
+	).Scan(&clusterID, &rowid)
+	require.NoError(t, err)
+	require.Equal(t, int64(0), clusterID, "new row must enter delta (cluster_id=0)")
+	require.Equal(t, int64(1), rowid)
+}
+
+func TestDeleteTrigger_RemovesFromMembers(t *testing.T) {
+	db := setupVecIndexTestDB(t)
+	ctx := context.Background()
+
+	meta := common.VectorIndexMeta{
+		IndexName:  "embeddings",
+		TableName:  "docs",
+		ColumnName: "embed",
+		Database:   "test",
+		Metric:     "cosine",
+		Dim:        4,
+		Nlist:      64,
+		Nprobe:     8,
+		CreatedAt:  time.Now().UnixNano(),
+	}
+	mgr := &VectorIndexManager{}
+	require.NoError(t, mgr.execCreateDDL(ctx, db, meta))
+
+	embed := []byte{0, 0, 0x80, 0x3f}
+	_, err := db.Exec(`INSERT INTO docs (id, embed) VALUES (2, ?)`, embed)
+	require.NoError(t, err)
+
+	_, err = db.Exec(`DELETE FROM docs WHERE id = 2`)
+	require.NoError(t, err)
+
+	var n int
+	err = db.QueryRow(
+		fmt.Sprintf(`SELECT COUNT(*) FROM "%s" WHERE rowid = 2`, vecindex.MembersTable("embeddings")),
+	).Scan(&n)
+	require.NoError(t, err)
+	require.Equal(t, 0, n, "deleted row must be removed from members")
+}
+
+func TestAutoTuneNlist(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		n    int64
+		want int
+	}{
+		{0, 64},
+		{100, 64},       // 4*10=40 < 64 → clamp to 64
+		{1000, 126},     // int(4*31.62)=126
+		{100000, 1264},  // int(4*316.22)=1264
+		{1000000, 2048}, // int(4*1000)=4000 > 2048 → clamp to 2048
+	}
+	for _, tc := range cases {
+		got := autoTuneNlist(tc.n)
+		require.Equal(t, tc.want, got, "n=%d", tc.n)
+	}
+}
+
+func TestAutoTuneNprobe(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		nlist int
+		want  int
+	}{
+		{64, 8},   // sqrt(64)=8
+		{256, 16}, // sqrt(256)=16
+		{4, 8},    // sqrt(4)=2 < 8 → clamped to 8
+	}
+	for _, tc := range cases {
+		got := autoTuneNprobe(tc.nlist)
+		require.Equal(t, tc.want, got, "nlist=%d", tc.nlist)
+	}
+}
+
+// setupManagerWithDB creates a VectorIndexManager wired to a single in-memory
+// database. It uses package-internal execCreateDDL to bypass DatabaseManager
+// (which we don't need for cache tests).
+func setupManagerWithDB(t *testing.T) (*VectorIndexManager, *sql.DB) {
+	t.Helper()
+	db := setupVecIndexTestDB(t)
+	mgr := NewVectorIndexManager(nil) // nil dbMgr — we call loadExistingIndexes manually
+	return mgr, db
+}
+
+// loadMetaIntoCache inserts a row into __marmot_vector_indexes and then calls
+// loadExistingIndexes to warm the cache.  It uses a one-database stub that
+// returns the provided *sql.DB.
+func seedManagerCache(t *testing.T, mgr *VectorIndexManager, db *sql.DB, meta common.VectorIndexMeta) {
+	t.Helper()
+	// Insert metadata row directly (execCreateDDL already did this in the DDL test).
+	_, err := db.Exec(`INSERT INTO __marmot_vector_indexes
+		(index_name, table_name, column_name, database_name, metric, dim, nlist, nprobe, max_norm, status, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'ready', ?)
+		ON CONFLICT(index_name) DO NOTHING`,
+		meta.IndexName, meta.TableName, meta.ColumnName, meta.Database,
+		meta.Metric, meta.Dim, meta.Nlist, meta.Nprobe, meta.MaxNorm, meta.CreatedAt,
+	)
+	require.NoError(t, err)
+
+	// Warm cache by scanning the row.
+	ctx := context.Background()
+	rows, err := db.QueryContext(ctx, `
+		SELECT index_name, table_name, column_name, database_name,
+		       metric, dim, nlist, nprobe, max_norm, status
+		FROM __marmot_vector_indexes`)
+	require.NoError(t, err)
+	for rows.Next() {
+		var m common.VectorIndexMeta
+		require.NoError(t, rows.Scan(
+			&m.IndexName, &m.TableName, &m.ColumnName, &m.Database,
+			&m.Metric, &m.Dim, &m.Nlist, &m.Nprobe, &m.MaxNorm, &m.Status,
+		))
+		key := indexCacheKey{database: m.Database, table: m.TableName, column: m.ColumnName}
+		mc := m
+		mgr.cacheMu.Lock()
+		mgr.indexCache[key] = &mc
+		mgr.cacheMu.Unlock()
+	}
+	rows.Close()
+}
+
+func TestGetIndexByColumn_Found(t *testing.T) {
+	t.Parallel()
+	mgr, db := setupManagerWithDB(t)
+	meta := common.VectorIndexMeta{
+		IndexName:  "embeddings",
+		TableName:  "docs",
+		ColumnName: "embed",
+		Database:   "testdb",
+		Metric:     "cosine",
+		Dim:        4, Nlist: 64, Nprobe: 8,
+		CreatedAt: time.Now().UnixNano(),
+	}
+	seedManagerCache(t, mgr, db, meta)
+
+	got, ok := mgr.GetIndexByColumn("testdb", "docs", "embed")
 	require.True(t, ok)
-	assert.Equal(t, "meta_idx", got.IndexName)
-	assert.Equal(t, "meta_vecs", got.TableName)
-	assert.Equal(t, "embedding", got.ColumnName)
-	assert.Equal(t, "dot", got.Metric)
-	assert.Equal(t, 8, got.Dim)
-	assert.Equal(t, "ready", got.Status)
+	require.NotNil(t, got)
+	require.Equal(t, "embeddings", got.IndexName)
+	require.Equal(t, "cosine", got.Metric)
 }
 
-func TestVectorIndexManager_StartLoadsExisting(t *testing.T) {
+func TestGetIndexByColumn_EmptyDatabase_UniqueMatch(t *testing.T) {
 	t.Parallel()
-	vim, dm, eng := setupTestVIM(t)
-
-	ctx := context.Background()
-
-	conn, err := dm.GetDatabaseConnection(DefaultDatabaseName)
-	require.NoError(t, err)
-
-	_, err = conn.ExecContext(ctx, "CREATE TABLE start_vecs (id INTEGER PRIMARY KEY, embedding BLOB)")
-	require.NoError(t, err)
-
-	meta := VectorIndexMeta{
-		IndexName:  "start_idx",
-		TableName:  "start_vecs",
-		ColumnName: "embedding",
-		Database:   DefaultDatabaseName,
-		Metric:     "cosine",
-		Dim:        3,
+	mgr, db := setupManagerWithDB(t)
+	meta := common.VectorIndexMeta{
+		IndexName: "embeddings", TableName: "docs", ColumnName: "embed",
+		Database: "testdb", Metric: "l2", Dim: 4, Nlist: 64, Nprobe: 8,
+		CreatedAt: time.Now().UnixNano(),
 	}
-	require.NoError(t, vim.CreateIndex(ctx, meta))
+	seedManagerCache(t, mgr, db, meta)
 
-	// Remove from in-memory maps to simulate a fresh start.
-	vim.mu.Lock()
-	delete(vim.indexes, "start_idx")
-	delete(vim.tableMeta, tableMetaKey(DefaultDatabaseName, "start_vecs"))
-	vim.mu.Unlock()
-
-	// Pre-register the index in the mock engine so OpenIndex succeeds.
-	eng.indexes["start_idx"] = &mockVectorIndex{}
-
-	// Start should reload from the metadata table.
-	require.NoError(t, vim.Start(ctx))
-
-	vim.mu.RLock()
-	_, loaded := vim.indexes["start_idx"]
-	vim.mu.RUnlock()
-	assert.True(t, loaded)
+	// Empty database → unique scan.
+	got, ok := mgr.GetIndexByColumn("", "docs", "embed")
+	require.True(t, ok)
+	require.Equal(t, "embeddings", got.IndexName)
 }
 
-func TestVectorIndexManager_DatabaseManager_Accessors(t *testing.T) {
+func TestGetIndexByColumn_NotFound(t *testing.T) {
 	t.Parallel()
-	_, dm, eng := setupTestVIM(t)
-
-	vim := NewVectorIndexManager(eng, dm, 0, 0)
-	assert.Nil(t, dm.GetVectorIndexManager())
-
-	dm.SetVectorIndexManager(vim)
-	assert.Equal(t, vim, dm.GetVectorIndexManager())
+	mgr, _ := setupManagerWithDB(t)
+	got, ok := mgr.GetIndexByColumn("testdb", "unknown_table", "embed")
+	require.False(t, ok)
+	require.Nil(t, got)
 }
 
-// TestVectorIndexManager_ReconcileNoGap verifies that reconcileAll runs without
-// error and does not report a gap when the index watermark matches the database.
-func TestVectorIndexManager_ReconcileNoGap(t *testing.T) {
+func TestGetIndexByColumn_AfterDrop(t *testing.T) {
 	t.Parallel()
-	vim, dm, eng := setupTestVIM(t)
-
-	ctx := context.Background()
-
-	conn, err := dm.GetDatabaseConnection(DefaultDatabaseName)
-	require.NoError(t, err)
-
-	_, err = conn.ExecContext(ctx, "CREATE TABLE reconcile_vecs (id INTEGER PRIMARY KEY, embedding BLOB)")
-	require.NoError(t, err)
-
-	meta := VectorIndexMeta{
-		IndexName:  "reconcile_idx",
-		TableName:  "reconcile_vecs",
-		ColumnName: "embedding",
-		Database:   DefaultDatabaseName,
-		Metric:     "cosine",
-		Dim:        3,
+	mgr, db := setupManagerWithDB(t)
+	meta := common.VectorIndexMeta{
+		IndexName: "embeddings", TableName: "docs", ColumnName: "embed",
+		Database: "testdb", Metric: "l2", Dim: 4, Nlist: 64, Nprobe: 8,
+		CreatedAt: time.Now().UnixNano(),
 	}
-	require.NoError(t, vim.CreateIndex(ctx, meta))
+	seedManagerCache(t, mgr, db, meta)
 
-	// Both the index watermark (0) and max committed txnID (0) are zero — no gap.
-	// reconcileAll must complete without error.
-	vim.reconcileAll()
+	_, ok := mgr.GetIndexByColumn("testdb", "docs", "embed")
+	require.True(t, ok)
 
-	// Index must still be registered after reconciliation.
-	_, ok := eng.indexes["reconcile_idx"]
-	assert.True(t, ok)
-}
+	// Simulate drop: remove from cache.
+	mgr.cacheMu.Lock()
+	delete(mgr.indexCache, indexCacheKey{database: "testdb", table: "docs", column: "embed"})
+	mgr.cacheMu.Unlock()
 
-// TestVectorIndexManager_ReconcileDetectsGap verifies that reconcileIndex
-// detects a gap when the database has committed transactions beyond the index
-// watermark.
-func TestVectorIndexManager_ReconcileDetectsGap(t *testing.T) {
-	t.Parallel()
-	vim, dm, eng := setupTestVIM(t)
-
-	ctx := context.Background()
-
-	conn, err := dm.GetDatabaseConnection(DefaultDatabaseName)
-	require.NoError(t, err)
-
-	_, err = conn.ExecContext(ctx, "CREATE TABLE gap_vecs (id INTEGER PRIMARY KEY, embedding BLOB)")
-	require.NoError(t, err)
-
-	meta := VectorIndexMeta{
-		IndexName:  "gap_idx",
-		TableName:  "gap_vecs",
-		ColumnName: "embedding",
-		Database:   DefaultDatabaseName,
-		Metric:     "cosine",
-		Dim:        3,
-	}
-	require.NoError(t, vim.CreateIndex(ctx, meta))
-
-	// Advance the metastore's max committed txnID past the index watermark (0)
-	// by recording a committed transaction directly.
-	rdb, err := dm.GetDatabase(DefaultDatabaseName)
-	require.NoError(t, err)
-	ms := rdb.GetMetaStore()
-	require.NotNil(t, ms)
-
-	require.NoError(t, ms.StoreReplayedTransaction(42, 1, hlc.Timestamp{WallTime: 1}, DefaultDatabaseName, 0))
-
-	// Gap should now be detected: index watermark=0, db max txnID=42.
-	// reconcileIndex must return nil (gap is logged, not an error).
-	vim.mu.RLock()
-	gapMeta := vim.tableMeta[tableMetaKey(DefaultDatabaseName, "gap_vecs")]
-	vim.mu.RUnlock()
-	require.NotNil(t, gapMeta)
-
-	err = vim.reconcileIndex(gapMeta)
-	require.NoError(t, err)
-
-	// The mock index watermark is still 0; gap should be detectable.
-	mockIdx := eng.indexes["gap_idx"]
-	assert.Equal(t, uint64(0), mockIdx.Stats().WatermarkTxnID)
-
-	maxTxnID, err := ms.GetMaxCommittedTxnID()
-	require.NoError(t, err)
-	assert.Equal(t, uint64(42), maxTxnID)
-}
-
-// TestVectorIndexManager_CrashRecovery_BuildingStatus verifies that an index
-// stuck in 'building' at startup is marked 'error' and not loaded.
-func TestVectorIndexManager_CrashRecovery_BuildingStatus(t *testing.T) {
-	t.Parallel()
-	vim, dm, _ := setupTestVIM(t)
-	ctx := context.Background()
-
-	conn, err := dm.GetDatabaseConnection(DefaultDatabaseName)
-	require.NoError(t, err)
-
-	// Ensure the metadata table exists.
-	_, err = conn.ExecContext(ctx, vectorIndexMetaTable)
-	require.NoError(t, err)
-
-	// Insert a row simulating a crash mid-build.
-	_, err = conn.ExecContext(ctx,
-		`INSERT INTO __marmot_vector_indexes
-         (index_name, table_name, column_name, database_name, metric, dim, status, created_at)
-         VALUES ('crashed_idx', 'some_vecs', 'embedding', ?, 'cosine', 3, 'building', 1)`,
-		DefaultDatabaseName,
-	)
-	require.NoError(t, err)
-
-	// loadExistingIndexes should handle crash recovery.
-	require.NoError(t, vim.loadExistingIndexes(ctx))
-
-	// Index must NOT be registered in memory.
-	vim.mu.RLock()
-	_, loaded := vim.indexes["crashed_idx"]
-	vim.mu.RUnlock()
-	assert.False(t, loaded, "crashed index must not be loaded into memory")
-
-	// Status must be updated to 'error'.
-	var status string
-	err = conn.QueryRowContext(ctx,
-		"SELECT status FROM __marmot_vector_indexes WHERE index_name = 'crashed_idx'",
-	).Scan(&status)
-	require.NoError(t, err)
-	assert.Equal(t, "error", status)
-}
-
-// TestVectorIndexManager_CrashRecovery_MissingDirectory verifies that a 'ready'
-// index whose backing store cannot be opened is marked 'error' and a rebuild is
-// scheduled rather than crashing startup.
-func TestVectorIndexManager_CrashRecovery_MissingDirectory(t *testing.T) {
-	t.Parallel()
-	vim, dm, eng := setupTestVIM(t)
-	ctx := context.Background()
-
-	conn, err := dm.GetDatabaseConnection(DefaultDatabaseName)
-	require.NoError(t, err)
-
-	// Ensure the metadata table exists.
-	_, err = conn.ExecContext(ctx, vectorIndexMetaTable)
-	require.NoError(t, err)
-
-	// Create the source table so the rebuild can succeed.
-	_, err = conn.ExecContext(ctx, "CREATE TABLE missing_vecs (id INTEGER PRIMARY KEY, embedding BLOB)")
-	require.NoError(t, err)
-
-	// Insert metadata as if index was previously ready.
-	_, err = conn.ExecContext(ctx,
-		`INSERT INTO __marmot_vector_indexes
-         (index_name, table_name, column_name, database_name, metric, dim, status, created_at)
-         VALUES ('missing_idx', 'missing_vecs', 'embedding', ?, 'cosine', 3, 'ready', 1)`,
-		DefaultDatabaseName,
-	)
-	require.NoError(t, err)
-
-	// Make OpenIndex fail to simulate a missing Pebble directory.
-	eng.openErrors["missing_idx"] = fmt.Errorf("pebble: no such directory")
-
-	// loadExistingIndexes must not return an error.
-	require.NoError(t, vim.loadExistingIndexes(ctx))
-
-	// Index must NOT be loaded into memory immediately.
-	vim.mu.RLock()
-	_, loaded := vim.indexes["missing_idx"]
-	vim.mu.RUnlock()
-	assert.False(t, loaded, "index with missing directory must not be loaded immediately")
-
-	// Status must be updated to 'error'.
-	var status string
-	err = conn.QueryRowContext(ctx,
-		"SELECT status FROM __marmot_vector_indexes WHERE index_name = 'missing_idx'",
-	).Scan(&status)
-	require.NoError(t, err)
-	assert.Equal(t, "error", status)
-}
-
-// TestVectorIndexManager_Search_SourceTableDropped verifies that Search returns
-// a clear error when the source table no longer exists.
-func TestVectorIndexManager_Search_SourceTableDropped(t *testing.T) {
-	t.Parallel()
-	vim, dm, _ := setupTestVIM(t)
-	ctx := context.Background()
-
-	conn, err := dm.GetDatabaseConnection(DefaultDatabaseName)
-	require.NoError(t, err)
-
-	_, err = conn.ExecContext(ctx, "CREATE TABLE droppable_vecs (id INTEGER PRIMARY KEY, embedding BLOB)")
-	require.NoError(t, err)
-
-	meta := VectorIndexMeta{
-		IndexName:  "droppable_idx",
-		TableName:  "droppable_vecs",
-		ColumnName: "embedding",
-		Database:   DefaultDatabaseName,
-		Metric:     "cosine",
-		Dim:        3,
-	}
-	require.NoError(t, vim.CreateIndex(ctx, meta))
-
-	// Drop the source table (simulating schema change after index was built).
-	_, err = conn.ExecContext(ctx, "DROP TABLE droppable_vecs")
-	require.NoError(t, err)
-
-	_, err = vim.Search(ctx, "droppable_idx", []float32{1.0, 0.0, 0.0}, 5)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "source table")
+	got, ok := mgr.GetIndexByColumn("testdb", "docs", "embed")
+	require.False(t, ok)
+	require.Nil(t, got)
 }

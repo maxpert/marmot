@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/maxpert/marmot/modules/vecindex/pkg/metric"
 	"github.com/vmihailenco/msgpack/v5"
 )
 
@@ -75,6 +76,34 @@ func (cs *CentroidSet) Encode() ([]byte, error) {
 		Epoch:     cs.epoch,
 		Centroids: cs.centroids,
 	})
+}
+
+// AssignNearest returns the 0-based cluster ID and distance for the nearest
+// centroid in the set. Delegates to Assign using the caller-supplied metric.
+// Returns an error if vec length mismatches centroid dimensionality.
+func (cs *CentroidSet) AssignNearest(vec []float32, m metric.Metric) (uint32, float32, error) {
+	return Assign(vec, cs.centroids, m)
+}
+
+// AssignTopN returns the n nearest 0-based cluster IDs sorted by ascending
+// distance. Delegates to AssignTopN using the caller-supplied metric. n is
+// clamped to [0, cs.Len()] by the package-level implementation.
+// Returns an error if vec length mismatches centroid dimensionality.
+func (cs *CentroidSet) AssignTopN(vec []float32, n int, m metric.Metric) ([]uint32, []float32, error) {
+	return AssignTopN(vec, cs.centroids, n, m)
+}
+
+// Snapshot returns a deep copy of all centroid vectors. Use this when the
+// caller needs an independent mutable copy, e.g. as a warm start for a
+// subsequent k-means run.
+func (cs *CentroidSet) Snapshot() [][]float32 {
+	out := make([][]float32, len(cs.centroids))
+	for i, c := range cs.centroids {
+		cp := make([]float32, len(c))
+		copy(cp, c)
+		out[i] = cp
+	}
+	return out
 }
 
 // DecodeCentroidSet deserialises a CentroidSet from msgpack bytes produced by Encode.

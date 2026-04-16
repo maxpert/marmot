@@ -37,10 +37,71 @@ func KMeansPlusPlus(vectors [][]float32, k int, seed uint64, maxIter int) ([][]f
 	dim := len(vectors[0])
 	rng := rand.New(rand.NewSource(foldSeed(seed)))
 
-	centroids := kMeansPlusPlusInit(vectors, k, dim, rng)
+	centroids := kMeansPlusPlusInitDispatch(vectors, k, dim, rng)
 	centroids = lloydIterations(vectors, centroids, k, dim, maxIter, rng)
 
 	return centroids, nil
+}
+
+// LloydFromInit runs Lloyd's algorithm starting from caller-supplied initial
+// centroids — the warm-start path used by REINDEX (design §8.3 step 2, fix G).
+//
+// Contract mirrors KMeansPlusPlus: deterministic for a given (vectors,
+// initCentroids, seed, maxIter). The seed controls only the empty-cluster
+// reseed RNG path (all-deterministic when every cluster receives at least
+// one point). maxIter must be >= 1.
+//
+// initCentroids is deep-copied so the caller may reuse/modify it.
+//
+// Returns an error if:
+//   - vectors is empty
+//   - initCentroids is empty
+//   - any vector or centroid has a mismatched dimension
+//   - maxIter < 1
+//
+// The number of output centroids always equals len(initCentroids) (never
+// grows; never shrinks via empty-cluster drop).
+func LloydFromInit(vectors [][]float32, initCentroids [][]float32, seed uint64, maxIter int) ([][]float32, error) {
+	if len(vectors) == 0 {
+		return nil, errors.New("kmeans: vectors must not be empty")
+	}
+	if len(initCentroids) == 0 {
+		return nil, errors.New("kmeans: initCentroids must not be empty")
+	}
+	if maxIter < 1 {
+		return nil, errors.New("kmeans: maxIter must be >= 1")
+	}
+	dim := len(vectors[0])
+	for i, v := range vectors {
+		if len(v) != dim {
+			return nil, errors.New("kmeans: vector dim mismatch at index " + itoa(i))
+		}
+	}
+	for i, c := range initCentroids {
+		if len(c) != dim {
+			return nil, errors.New("kmeans: init centroid dim mismatch at index " + itoa(i))
+		}
+	}
+
+	k := len(initCentroids)
+	if k > len(vectors) {
+		// Defensive: cap k to len(vectors) to match KMeansPlusPlus semantics.
+		// A drifted state with more centroids than vectors can happen on tiny
+		// tables; we keep the first k=len(vectors) centroids.
+		k = len(vectors)
+		initCentroids = initCentroids[:k]
+	}
+
+	// Deep copy so the caller's slice is not mutated by Lloyd.
+	seed0 := make([][]float32, k)
+	for i, c := range initCentroids {
+		cp := make([]float32, dim)
+		copy(cp, c)
+		seed0[i] = cp
+	}
+
+	rng := rand.New(rand.NewSource(foldSeed(seed)))
+	return lloydIterations(vectors, seed0, k, dim, maxIter, rng), nil
 }
 
 // Assign returns the index and distance of the nearest centroid for vec.
@@ -138,46 +199,22 @@ func validateInputs(vectors [][]float32, k int, maxIter int) error {
 	return nil
 }
 
-// kMeansPlusPlusInit selects k initial centroids using the k-means++ algorithm.
-func kMeansPlusPlusInit(vectors [][]float32, k, dim int, rng *rand.Rand) [][]float32 {
-	n := len(vectors)
-	centroids := make([][]float32, 0, k)
+// kMeansParallelThreshold is the value of k at which the dispatcher switches
+// from the O(n·k) sequential incremental k-means++ path to the parallel
+// k-means|| (Bahmani 2012) path. Below the threshold the incremental path's
+// constant factors beat the parallel overhead; above it, k sequential
+// passes over n dominate and k-means|| collapses to ~log(ψ) parallel rounds.
+const kMeansParallelThreshold = 64
 
-	// Choose first centroid uniformly at random.
-	first := copyVec(vectors[rng.Intn(n)])
-	centroids = append(centroids, first)
-
-	dists := make([]float64, n)
-
-	for len(centroids) < k {
-		// Compute D^2 weights.
-		var total float64
-		for i, v := range vectors {
-			minD := float64(metric.L2Squared(v, centroids[0]))
-			for _, c := range centroids[1:] {
-				if d := float64(metric.L2Squared(v, c)); d < minD {
-					minD = d
-				}
-			}
-			dists[i] = minD
-			total += minD
-		}
-
-		// Sample next centroid proportional to D^2.
-		target := rng.Float64() * total
-		var cumulative float64
-		chosen := n - 1
-		for i, d := range dists {
-			cumulative += d
-			if cumulative >= target {
-				chosen = i
-				break
-			}
-		}
-		centroids = append(centroids, copyVec(vectors[chosen]))
+// kMeansPlusPlusInitDispatch selects k initial centroids. For small k the
+// O(n·k) incremental k-means++ path is used (byte-identical to the classic
+// O(n·k²) reference). For large k the O(n·log ψ·ℓ) parallel k-means||
+// path is used. Both paths preserve the same-seed determinism contract.
+func kMeansPlusPlusInitDispatch(vectors [][]float32, k, dim int, rng *rand.Rand) [][]float32 {
+	if k >= kMeansParallelThreshold {
+		return kMeansParallelInit(vectors, k, dim, rng)
 	}
-
-	return centroids
+	return kMeansPlusPlusInitIncremental(vectors, k, dim, rng)
 }
 
 // lloydIterations runs Lloyd's algorithm for at most maxIter iterations.

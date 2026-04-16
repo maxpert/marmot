@@ -15,6 +15,94 @@ func encodeVec(v []float32) []byte {
 	return buf
 }
 
+// TestL2SquaredSIMD_MatchesGoFallback pins the invariant that the SIMD
+// squared-distance implementation stays within a tight relative tolerance of
+// the pure-Go 4-wide reference across representative dims. Absolute mismatch
+// is expected from the sqrt-then-square roundtrip; the contract is relative
+// agreement for downstream k-means weighting.
+func TestL2SquaredSIMD_MatchesGoFallback(t *testing.T) {
+	t.Parallel()
+	dims := []int{8, 16, 32, 64, 128, 1536}
+	for _, dim := range dims {
+		dim := dim
+		t.Run("dim="+itoaTest(dim), func(t *testing.T) {
+			t.Parallel()
+			// Per-subtest rng seeded by dim so parallel subtests do not
+			// share mutable state (the race detector flags a shared rng).
+			rng := randSource(int64(424242 + dim))
+			for trial := 0; trial < 16; trial++ {
+				a := randomVec(rng, dim)
+				b := randomVec(rng, dim)
+				got := L2SquaredSIMD(a, b)
+				want := L2SquaredGo(a, b)
+				// Use relative tolerance; sqrt-then-square roundtrip can lose ~1 ULP
+				// of float32 precision which becomes absolute error proportional to
+				// the magnitude. Guard against zero to avoid div-by-zero.
+				denom := float64(want)
+				if denom < 1e-6 {
+					denom = 1e-6
+				}
+				rel := math.Abs(float64(got-want)) / denom
+				if rel > 1e-5 {
+					t.Fatalf("dim=%d trial=%d SIMD=%v Go=%v relErr=%.3e", dim, trial, got, want, rel)
+				}
+			}
+		})
+	}
+}
+
+// TestL2Squared_DispatchesToGo pins the L2Squared default to the pure-Go
+// reference implementation. This locks the choice made after benchmarking:
+// SIMD L2Squared is not ≥ 2× faster on the k-means dims, and the Go path
+// preserves bit-exact determinism across platforms.
+func TestL2Squared_DispatchesToGo(t *testing.T) {
+	t.Parallel()
+	rng := randSource(1)
+	for _, dim := range []int{8, 32, 128, 1536} {
+		a := randomVec(rng, dim)
+		b := randomVec(rng, dim)
+		if L2Squared(a, b) != L2SquaredGo(a, b) {
+			t.Fatalf("dim=%d: L2Squared must delegate to L2SquaredGo", dim)
+		}
+	}
+}
+
+func BenchmarkL2SquaredGo(b *testing.B) {
+	for _, dim := range []int{32, 128, 1536} {
+		dim := dim
+		b.Run("dim="+itoaTest(dim), func(b *testing.B) {
+			rng := randSource(7)
+			x := randomVec(rng, dim)
+			y := randomVec(rng, dim)
+			b.ResetTimer()
+			var sink float32
+			for i := 0; i < b.N; i++ {
+				sink += L2SquaredGo(x, y)
+			}
+			benchSink = sink
+		})
+	}
+}
+
+func BenchmarkL2SquaredSIMD(b *testing.B) {
+	for _, dim := range []int{32, 128, 1536} {
+		dim := dim
+		b.Run("dim="+itoaTest(dim), func(b *testing.B) {
+			rng := randSource(7)
+			x := randomVec(rng, dim)
+			y := randomVec(rng, dim)
+			b.ResetTimer()
+			var sink float32
+			for i := 0; i < b.N; i++ {
+				sink += L2SquaredSIMD(x, y)
+			}
+			benchSink = sink
+		})
+	}
+}
+
+var benchSink float32
+
 func TestL2Squared(t *testing.T) {
 	t.Parallel()
 	tests := []struct {

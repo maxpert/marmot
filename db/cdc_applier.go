@@ -2,9 +2,13 @@ package db
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
+
+	"github.com/mattn/go-sqlite3"
+	"github.com/maxpert/marmot/modules/vecindex"
 )
 
 // CDCExecutor abstracts sql.DB and sql.Tx - both have identical Exec signature.
@@ -170,4 +174,28 @@ func ApplyCDCDelete(exec CDCExecutor, schema CDCSchemaProvider, tableName string
 		return fmt.Errorf("ApplyCDCDelete %s: %w", tableName, err)
 	}
 	return nil
+}
+
+// IsVecDropRaceError reports whether err is a "no such table" error on a
+// CDC-excluded vector index object (double-underscore prefix). During a DROP
+// VECTOR INDEX race the centroids table CDC event may arrive after the local
+// members/staging tables have already been dropped. Callers should log at
+// warn level and skip the event (design §13, fix R7).
+func IsVecDropRaceError(tableName string, err error) bool {
+	if err == nil {
+		return false
+	}
+	if !vecindex.IsVecLocalTable(tableName) {
+		return false
+	}
+	var sqliteErr sqlite3.Error
+	if !errors.As(err, &sqliteErr) {
+		return false
+	}
+	// sqlite3.ErrError (code 1) is SQLITE_ERROR — the general "SQL error or
+	// missing database" code that covers "no such table".
+	if sqliteErr.Code != sqlite3.ErrError {
+		return false
+	}
+	return strings.Contains(sqliteErr.Error(), "no such table")
 }

@@ -1,9 +1,7 @@
 package protocol
 
 import (
-	"fmt"
 	"regexp"
-	"strconv"
 	"strings"
 
 	"github.com/maxpert/marmot/id"
@@ -90,12 +88,6 @@ var (
 	// Vector index DDL patterns
 	createVectorIndexPattern = regexp.MustCompile(`(?i)^\s*CREATE\s+VECTOR\s+INDEX\s+`)
 	dropVectorIndexPattern   = regexp.MustCompile(`(?i)^\s*DROP\s+VECTOR\s+INDEX\s+`)
-
-	// vec_knn() function detection pattern (for SELECT interception)
-	vecKnnPattern = regexp.MustCompile(`(?i)\bvec_knn\s*\(`)
-
-	// vec_knn() parameter extraction: vec_knn('index_name', ?, K)
-	vecKnnParsePattern = regexp.MustCompile(`(?i)vec_knn\s*\(\s*'([^']+)'\s*,\s*\?\s*,\s*(\d+)\s*\)`)
 
 	// DCL patterns
 	createUserPattern     = regexp.MustCompile(`(?i)^\s*CREATE\s+USER\s+`)
@@ -190,6 +182,7 @@ func ParseStatementWithOptions(sql string, opts ParseOptions) Statement {
 		stmt.VirtualTableType = VirtualTableType(ctx.MySQLState.VirtualTableType)
 		stmt.SystemVarNames = ctx.MySQLState.SystemVarNames
 		stmt.ShowFilter = ctx.MySQLState.ShowFilter
+		stmt.ParsedAST = ctx.MySQLState.AST
 	}
 
 	return stmt
@@ -245,6 +238,7 @@ func ParseStatementWithSchema(sql string, schemaLookup SchemaLookupFunc) Stateme
 		stmt.VirtualTableType = VirtualTableType(ctx.MySQLState.VirtualTableType)
 		stmt.SystemVarNames = ctx.MySQLState.SystemVarNames
 		stmt.ShowFilter = ctx.MySQLState.ShowFilter
+		stmt.ParsedAST = ctx.MySQLState.AST
 	}
 
 	return stmt
@@ -304,6 +298,7 @@ func buildStatement(ctx query.QueryContext, ts query.TranspiledStatement) Statem
 		stmt.ISTableType = InformationSchemaTableType(ctx.MySQLState.ISTableType)
 		stmt.VirtualTableType = VirtualTableType(ctx.MySQLState.VirtualTableType)
 		stmt.SystemVarNames = ctx.MySQLState.SystemVarNames
+		stmt.ParsedAST = ctx.MySQLState.AST
 	}
 
 	return stmt
@@ -357,7 +352,8 @@ func IsMutation(stmt Statement) bool {
 	case StatementInsert, StatementReplace, StatementUpdate, StatementDelete, StatementLoadData,
 		StatementDDL, StatementDCL, StatementAdmin,
 		StatementCreateDatabase, StatementDropDatabase,
-		StatementCreateVectorIndex, StatementDropVectorIndex:
+		StatementCreateVectorIndex, StatementDropVectorIndex,
+		StatementReindexVectorIndex:
 		return true
 	default:
 		return false
@@ -389,31 +385,4 @@ func IsTransactionControl(stmt Statement) bool {
 // (CREATE/ALTER/DROP TABLE, CREATE/DROP INDEX, etc.)
 func IsDDL(stmt Statement) bool {
 	return stmt.Type == StatementDDL
-}
-
-// ContainsVecKnn returns true if the SQL contains a vec_knn() function call.
-// Used to intercept vector search queries before the Vitess parser sees them.
-func ContainsVecKnn(sql string) bool {
-	return vecKnnPattern.MatchString(sql)
-}
-
-// VecKnnCall holds parsed parameters from a vec_knn() function call.
-type VecKnnCall struct {
-	IndexName string
-	TopK      int
-}
-
-// ParseVecKnnCall extracts vec_knn parameters from SQL.
-// Expected syntax: vec_knn('index_name', ?, K)
-// The query vector is supplied as a bound parameter (?), not parsed from SQL.
-func ParseVecKnnCall(sql string) (*VecKnnCall, error) {
-	matches := vecKnnParsePattern.FindStringSubmatch(sql)
-	if len(matches) < 3 {
-		return nil, fmt.Errorf("invalid vec_knn syntax: expected vec_knn('index_name', ?, K)")
-	}
-	k, err := strconv.Atoi(matches[2])
-	if err != nil {
-		return nil, fmt.Errorf("invalid vec_knn top-K value %q: %w", matches[2], err)
-	}
-	return &VecKnnCall{IndexName: matches[1], TopK: k}, nil
 }

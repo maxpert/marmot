@@ -24,6 +24,11 @@ func init() {
 				return err
 			}
 
+			// Register v5.4 vector-search UDFs (vec_distance_*, __marmot_vec_*).
+			if err := RegisterVectorUDFs(conn); err != nil {
+				return err
+			}
+
 			// Load all registered extensions (always_loaded and dynamically loaded)
 			if extMgr := GetExtensionManager(); extMgr != nil {
 				if err := extMgr.LoadAllExtensions(conn); err != nil {

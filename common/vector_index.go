@@ -9,14 +9,12 @@ type VectorIndexMeta struct {
 	Database   string
 	Metric     string
 	Dim        int
-	Status     string // "building", "ready", "error"
-	CreatedAt  int64
-}
-
-// VectorSearchHit is a single result from a kNN vector search.
-// ExternalID is an 8-byte big-endian encoded SQLite rowid.
-type VectorSearchHit struct {
-	ExternalID []byte
-	Distance   float32
-	Score      float32
+	// Nlist is the number of IVF centroids. 0 means auto-tune at CREATE time.
+	Nlist int
+	// Nprobe is the number of centroids searched per query. 0 means auto-tune.
+	Nprobe int
+	// MaxNorm is the fixed L2 norm cap for dot-product MIPS→L2 augmentation.
+	MaxNorm   float32
+	Status    string // "building", "ready", "reindexing"
+	CreatedAt int64
 }

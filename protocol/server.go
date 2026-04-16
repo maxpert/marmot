@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/maxpert/marmot/hlc"
+	"github.com/maxpert/marmot/modules/vecindex"
 	"github.com/maxpert/marmot/protocol/query"
 	"github.com/maxpert/marmot/telemetry"
 	"github.com/puzpuzpuz/xsync/v3"
@@ -105,6 +106,10 @@ type ConnectionSession struct {
 	// ForwardRequestSeq is a monotonic request ID generator used when forwarding
 	// replica writes to leader with idempotent dedupe.
 	ForwardRequestSeq atomic.Uint64
+
+	// VecVars holds per-connection @@marmot_vec_* session variables (§6.3, §6.4).
+	// Initialised to defaults on connection open; updated via SET @@marmot_vec_* = ...
+	VecVars vecindex.VecSessionVars
 }
 
 // InTransaction returns true if session has an active explicit transaction
@@ -367,6 +372,7 @@ func (s *MySQLServer) handleConnection(conn net.Conn) {
 		preparedStmts:        make(map[uint32]*PreparedStatement),
 		nextStmtID:           1,
 		TranspilationEnabled: true, // Default: MySQL→SQLite transpilation enabled
+		VecVars:              vecindex.DefaultVecSessionVars(),
 	}
 
 	telemetry.MySQLConnections.Inc()

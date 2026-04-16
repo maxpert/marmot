@@ -23,10 +23,42 @@ func bytesToFloat32Slice(b []byte) []float32 {
 }
 
 // L2Squared computes the squared Euclidean distance between two vectors.
-// Uses a 4-wide unrolled loop to enable auto-vectorization and avoid the
-// precision loss of sqrt(x)² ≠ x in float32.
+// Implementation is the pure-Go 4-wide unrolled loop (L2SquaredGo) — the Go
+// compiler auto-vectorises it effectively and measurement shows the SIMD
+// sqrt-then-square alternative is NOT 2× faster at the dims used in
+// k-means/IVF (32, 128, 1536); at dim=32 it is materially slower due to
+// per-call dispatch overhead and the extra sqrt instruction.
+//
+// Measured arm64 / Apple M3 Pro, go1.26:
+//
+//	dim=32:   Go 8.45 ns/op  vs SIMD 16.57 ns/op  (SIMD 0.51×)
+//	dim=128:  Go 31.35 ns/op vs SIMD 38.76 ns/op  (SIMD 0.81×)
+//	dim=1536: Go 389.0 ns/op vs SIMD 380.0 ns/op  (SIMD 1.02×)
+//
+// L2SquaredSIMD remains exported for callers that want to experiment, and
+// L2SquaredGo remains exported as an explicit pure-Go reference.
+//
 // Panics if len(a) != len(b).
 func L2Squared(a, b []float32) float32 {
+	return L2SquaredGo(a, b)
+}
+
+// L2SquaredSIMD computes the squared Euclidean distance via SIMD-accelerated
+// f32.EuclideanDistance. Returns d*d where d = sqrt(sum(diff²)).
+// Loses ~1 ULP of precision vs L2SquaredGo due to the sqrt-then-square
+// roundtrip. Panics if len(a) != len(b).
+func L2SquaredSIMD(a, b []float32) float32 {
+	assertEqualLen(a, b)
+	d := f32.EuclideanDistance(a, b)
+	return d * d
+}
+
+// L2SquaredGo is the pure-Go 4-wide unrolled reference implementation of the
+// squared Euclidean distance. Reliable auto-vectorised baseline used by
+// L2Squared as the default, and kept exported so SIMD parity tests have a
+// named reference.
+// Panics if len(a) != len(b).
+func L2SquaredGo(a, b []float32) float32 {
 	assertEqualLen(a, b)
 	n := len(a)
 	var s0, s1, s2, s3 float32
