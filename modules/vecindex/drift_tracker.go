@@ -93,12 +93,3 @@ func (t *DriftTracker) ClusterCount(clusterID int) int64 {
 	}
 	return t.counts[clusterID]
 }
-
-// TotalCount returns the sum of all cluster counts.
-func (t *DriftTracker) TotalCount() int64 {
-	var total int64
-	for _, c := range t.counts {
-		total += c
-	}
-	return total
-}

@@ -14,8 +14,7 @@ import (
 //
 // All methods are safe for concurrent use.
 type Engine struct {
-	indexes  sync.Map // map[string]*IndexState
-	listener *ReplicaListener
+	indexes sync.Map // map[string]*IndexState
 
 	flushDB  DeltaFlushDB
 	flushCfg DeltaFlushConfig
@@ -132,31 +131,18 @@ func (e *Engine) AssignNearest(indexName string, vec []byte) (int64, error) {
 	return state.AssignNearest(vec)
 }
 
-// SetReplicaListener installs the listener that receives centroid-change
-// notifications. Must be called before any triggers fire.
-func (e *Engine) SetReplicaListener(l *ReplicaListener) {
-	e.listener = l
-}
-
-// NotifyCentroidChange implements VectorUDFProvider.
-// Enqueues a non-blocking rebuild request on the replica listener channel.
-// Returns immediately so the writer transaction is not held (design §8.8).
-func (e *Engine) NotifyCentroidChange(indexName string, version int64) error {
-	if l := e.listener; l != nil {
-		l.Notify(indexName, version)
-	}
+// NotifyCentroidChange implements VectorUDFProvider as a no-op. The
+// centroid-change trigger fires into this method from the UDF layer; no
+// replica listener is currently wired, so the call returns immediately.
+func (e *Engine) NotifyCentroidChange(_ string, _ int64) error {
 	return nil
 }
 
-// TopNprobeClusters implements VectorUDFProvider.
-// Returns the nearest n 1-based cluster IDs for the query vector against the
-// named index's probeState. Returns MARMOT-VEC-013 if the index is unknown.
+// TopNprobeClusters implements VectorUDFProvider. Thin wrapper over
+// TopNprobeClustersWithEpoch that discards the epoch.
 func (e *Engine) TopNprobeClusters(indexName string, vec []byte, n int) ([]int64, error) {
-	state, ok := e.Lookup(indexName)
-	if !ok {
-		return nil, fmt.Errorf("MARMOT-VEC-013: vector index %q not registered in engine", indexName)
-	}
-	return state.TopNprobeClusters(vec, n)
+	ids, _, err := e.TopNprobeClustersWithEpoch(indexName, vec, n)
+	return ids, err
 }
 
 // TopNprobeClustersWithEpoch is TopNprobeClusters + the probe-state epoch the

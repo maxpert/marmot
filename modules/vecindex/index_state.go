@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"math"
 	"sync/atomic"
-	"unsafe"
 
 	"github.com/maxpert/marmot/modules/vecindex/pkg/kmeans"
 	"github.com/maxpert/marmot/modules/vecindex/pkg/metric"
@@ -202,7 +201,7 @@ func (s *IndexState) AssignNearest(vecBytes []byte) (int64, error) {
 			s.spec.ID, rawDim, s.spec.Dim)
 	}
 
-	raw := bytesToFloat32Unsafe(vecBytes)
+	raw := metric.BytesToFloat32(vecBytes)
 
 	// For MIPS→L2: augment data vector to internal D+1 space.
 	var vec []float32
@@ -230,55 +229,11 @@ func (s *IndexState) AssignNearest(vecBytes []byte) (int64, error) {
 }
 
 // TopNprobeClusters returns the top-n 1-based cluster IDs ordered by ascending
-// distance to the query vector (closest first). Uses probeState; n is clamped
-// to [1, probe.Len()]. Vector bytes follow the same format as AssignNearest
-// (little-endian float32; MetricDot auto-augments). Returns the sorted slice
-// plus any error. Safe for concurrent invocation.
+// distance to the query vector (closest first). Thin wrapper over
+// TopNprobeClustersWithEpoch that discards the epoch.
 func (s *IndexState) TopNprobeClusters(vecBytes []byte, n int) ([]int64, error) {
-	if len(vecBytes) == 0 || len(vecBytes)%4 != 0 {
-		return nil, fmt.Errorf("MARMOT-VEC-014: invalid vector blob length %d for index %q", len(vecBytes), s.spec.ID)
-	}
-	rawDim := len(vecBytes) / 4
-	if rawDim != s.spec.Dim {
-		return nil, fmt.Errorf("MARMOT-VEC-014: dimension mismatch for index %q: got %d, want %d",
-			s.spec.ID, rawDim, s.spec.Dim)
-	}
-
-	raw := bytesToFloat32Unsafe(vecBytes)
-
-	var vec []float32
-	if s.spec.Metric == MetricDot {
-		augmented, err := metric.AugmentData(raw, s.spec.MaxNorm, nil)
-		if err != nil {
-			return nil, fmt.Errorf("vecindex: augment for index %q: %w", s.spec.ID, err)
-		}
-		vec = augmented
-	} else {
-		vec = raw
-	}
-
-	cs := s.probeState.Load()
-	if cs == nil || cs.Len() == 0 {
-		return nil, fmt.Errorf("vecindex: no centroids loaded for index %q", s.spec.ID)
-	}
-
-	if n < 1 {
-		n = 1
-	}
-	if n > cs.Len() {
-		n = cs.Len()
-	}
-
-	ids, _, err := cs.AssignTopN(vec, n, s.spec.InternalMetric())
-	if err != nil {
-		return nil, fmt.Errorf("vecindex: top-n probe for index %q: %w", s.spec.ID, err)
-	}
-
-	result := make([]int64, len(ids))
-	for i, id := range ids {
-		result[i] = int64(id) + 1 // 1-based; 0 reserved for delta
-	}
-	return result, nil
+	ids, _, err := s.TopNprobeClustersWithEpoch(vecBytes, n)
+	return ids, err
 }
 
 // TopNprobeClustersWithEpoch is TopNprobeClusters + the probe-state epoch the
@@ -296,7 +251,7 @@ func (s *IndexState) TopNprobeClustersWithEpoch(vecBytes []byte, n int) ([]int64
 			s.spec.ID, rawDim, s.spec.Dim)
 	}
 
-	raw := bytesToFloat32Unsafe(vecBytes)
+	raw := metric.BytesToFloat32(vecBytes)
 
 	var vec []float32
 	if s.spec.Metric == MetricDot {
@@ -331,15 +286,6 @@ func (s *IndexState) TopNprobeClustersWithEpoch(vecBytes []byte, n int) ([]int64
 		result[i] = int64(id) + 1
 	}
 	return result, cs.Epoch(), nil
-}
-
-// bytesToFloat32Unsafe reinterprets a little-endian float32 BLOB as []float32
-// without copying. Safe when:
-//   - len(b) is a multiple of 4
-//   - b is produced by mattn's C.GoBytes (heap-allocated, 4-byte aligned on arm64/amd64)
-//   - caller does not retain the slice beyond the lifetime of b
-func bytesToFloat32Unsafe(b []byte) []float32 {
-	return unsafe.Slice((*float32)(unsafe.Pointer(&b[0])), len(b)/4)
 }
 
 // Float32ToBytes encodes a []float32 as little-endian bytes.

@@ -3,7 +3,6 @@ package db
 import (
 	"fmt"
 	"sync/atomic"
-	"unsafe"
 
 	"github.com/mattn/go-sqlite3"
 	"github.com/maxpert/marmot/modules/vecindex"
@@ -29,12 +28,6 @@ func SetVectorUDFProvider(p vecindex.VectorUDFProvider) {
 		return
 	}
 	vectorUDFProvider.Store(&p)
-}
-
-// LoadVectorUDFProvider returns the currently installed VectorUDFProvider, or
-// nil if none has been set. Safe for concurrent use on the query hot-path.
-func LoadVectorUDFProvider() vecindex.VectorUDFProvider {
-	return loadVectorUDFProvider()
 }
 
 func loadVectorUDFProvider() vecindex.VectorUDFProvider {
@@ -80,7 +73,7 @@ func decodeVec(b []byte) ([]float32, error) {
 	if len(b)%4 != 0 {
 		return nil, fmt.Errorf("MARMOT-VEC-014: vector blob length %d is not a multiple of 4", len(b))
 	}
-	return unsafe.Slice((*float32)(unsafe.Pointer(&b[0])), len(b)/4), nil
+	return metric.BytesToFloat32(b), nil
 }
 
 func distanceArgs(a, b []byte) ([]float32, []float32, error) {

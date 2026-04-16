@@ -153,16 +153,3 @@ func (c *VectorCache) withDelete(rowid int64) *VectorCache {
 	buckets[target] = entries
 	return &VectorCache{epoch: c.epoch, byCluster: buckets}
 }
-
-// Clusters returns the sorted list of cluster IDs present. Primarily for
-// tests and diagnostics; hot search paths address clusters by known ID.
-func (c *VectorCache) Clusters() []int64 {
-	if c == nil {
-		return nil
-	}
-	out := make([]int64, 0, len(c.byCluster))
-	for cid := range c.byCluster {
-		out = append(out, cid)
-	}
-	return out
-}

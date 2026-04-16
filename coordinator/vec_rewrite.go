@@ -102,7 +102,7 @@ func RewriteVectorQuery(
 	// --- Selectivity estimation ---
 	userPred := stripVecMatch(sel.Where)
 	total := mgr.EstimatedRowCount(meta.Database, realTable)
-	estimatedF := stat4.EstimateCardinality(userPred, total, nil)
+	estimatedF := stat4.EstimateCardinality(userPred, total)
 
 	nprobe := session.Nprobe(meta.Nprobe)
 	const overfetch = 4

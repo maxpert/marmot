@@ -8,14 +8,15 @@ import (
 	"github.com/tphakala/simd/f32"
 )
 
-// bytesToFloat32Slice reinterprets a little-endian float32 byte slice as []float32
-// without copying.  Valid only when:
-//   - len(b) is a multiple of 4
-//   - b is 4-byte aligned (Pebble value buffers satisfy this invariant)
+// BytesToFloat32 reinterprets a little-endian float32 byte slice as []float32
+// without copying. Valid only when:
+//   - len(b) is a multiple of 4 (caller must validate; we return nil on zero-length)
+//   - b is 4-byte aligned (heap allocations on arm64/amd64 and SQLite BLOB
+//     buffers satisfy this invariant)
 //   - the host is little-endian (arm64 and amd64 are both LE)
 //
 // The caller must NOT retain the returned slice beyond the lifetime of b.
-func bytesToFloat32Slice(b []byte) []float32 {
+func BytesToFloat32(b []byte) []float32 {
 	if len(b) == 0 {
 		return nil
 	}
@@ -146,14 +147,14 @@ func Distance(m Metric, a, b []float32) float32 {
 // L2SquaredFromBytes computes squared Euclidean distance between query and a
 // vector encoded as raw little-endian float32 bytes. Uses unsafe zero-copy
 // reinterpretation of vecBytes as []float32 then delegates to L2Squared, which
-// applies a 4-wide unrolled loop.  Valid only on little-endian hosts (arm64,
-// amd64); Pebble value buffers are 4-byte aligned by construction.
+// applies a 4-wide unrolled loop. Valid only on little-endian hosts (arm64,
+// amd64); heap- and SQLite-BLOB-backed slices are 4-byte aligned.
 // The caller must NOT retain vecBytes beyond the call — this matches the
 // ScanClusterFunc invariant.
 // Panics if len(vecBytes)/4 != len(query).
 func L2SquaredFromBytes(query []float32, vecBytes []byte) float32 {
 	assertFromBytesLen(query, vecBytes)
-	return L2Squared(query, bytesToFloat32Slice(vecBytes))
+	return L2Squared(query, BytesToFloat32(vecBytes))
 }
 
 // DotFromBytes computes the negative inner product between query and a vector
@@ -163,7 +164,7 @@ func L2SquaredFromBytes(query []float32, vecBytes []byte) float32 {
 // Panics if len(vecBytes)/4 != len(query).
 func DotFromBytes(query []float32, vecBytes []byte) float32 {
 	assertFromBytesLen(query, vecBytes)
-	return -f32.DotProduct(query, bytesToFloat32Slice(vecBytes))
+	return -f32.DotProduct(query, BytesToFloat32(vecBytes))
 }
 
 // CosineFromBytes computes cosine distance (1 - cosine_similarity) between query
@@ -174,7 +175,7 @@ func DotFromBytes(query []float32, vecBytes []byte) float32 {
 // Panics if len(vecBytes)/4 != len(query).
 func CosineFromBytes(query []float32, vecBytes []byte) float32 {
 	assertFromBytesLen(query, vecBytes)
-	return 1 - CosineSimilarity(query, bytesToFloat32Slice(vecBytes))
+	return 1 - CosineSimilarity(query, BytesToFloat32(vecBytes))
 }
 
 // DistanceFromBytes dispatches to the correct FromBytes distance function.

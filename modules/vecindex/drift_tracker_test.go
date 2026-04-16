@@ -15,7 +15,6 @@ func TestDriftTracker_NewFromCentroids(t *testing.T) {
 	require.Equal(t, 2, dt.Len())
 	require.Equal(t, int64(1), dt.ClusterCount(0))
 	require.Equal(t, int64(1), dt.ClusterCount(1))
-	require.Equal(t, int64(2), dt.TotalCount())
 
 	// Centroids should match originals (sum/1 == original).
 	got := dt.Centroids()
@@ -27,7 +26,6 @@ func TestDriftTracker_Empty(t *testing.T) {
 	t.Parallel()
 	dt := NewDriftTracker(nil)
 	require.Equal(t, 0, dt.Len())
-	require.Equal(t, int64(0), dt.TotalCount())
 	require.Empty(t, dt.Centroids())
 }
 

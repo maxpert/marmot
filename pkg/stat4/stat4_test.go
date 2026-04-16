@@ -25,13 +25,13 @@ func parseWhere(t *testing.T, expr string) sqlparser.Expr {
 func TestEstimateCardinality_ZeroTotal(t *testing.T) {
 	t.Parallel()
 	expr := parseWhere(t, "a = 1")
-	got := stat4.EstimateCardinality(expr, 0, nil)
+	got := stat4.EstimateCardinality(expr, 0)
 	require.Equal(t, int64(0), got)
 }
 
 func TestEstimateCardinality_NilExpr(t *testing.T) {
 	t.Parallel()
-	got := stat4.EstimateCardinality(nil, 1000, nil)
+	got := stat4.EstimateCardinality(nil, 1000)
 	require.Equal(t, int64(500), got)
 }
 
@@ -48,7 +48,7 @@ func TestEstimateCardinality_EqualOp(t *testing.T) {
 	}
 	for _, tc := range cases {
 		expr := parseWhere(t, "col = 42")
-		got := stat4.EstimateCardinality(expr, tc.total, nil)
+		got := stat4.EstimateCardinality(expr, tc.total)
 		require.Equal(t, tc.want, got, "total=%d", tc.total)
 	}
 }
@@ -69,7 +69,7 @@ func TestEstimateCardinality_InOp(t *testing.T) {
 	}
 	for _, tc := range cases {
 		expr := parseWhere(t, tc.exprSQL)
-		got := stat4.EstimateCardinality(expr, tc.total, nil)
+		got := stat4.EstimateCardinality(expr, tc.total)
 		require.Equal(t, tc.want, got, "expr=%s total=%d", tc.exprSQL, tc.total)
 	}
 }
@@ -79,7 +79,7 @@ func TestEstimateCardinality_AndAllEquality(t *testing.T) {
 	// AND of equalities → max(estimates).
 	// a=1 → 100, b=2 → 100 (total=1000, each gives 1000/10=100)
 	expr := parseWhere(t, "a = 1 AND b = 2")
-	got := stat4.EstimateCardinality(expr, 1000, nil)
+	got := stat4.EstimateCardinality(expr, 1000)
 	require.Equal(t, int64(100), got)
 }
 
@@ -88,7 +88,7 @@ func TestEstimateCardinality_AndMixed(t *testing.T) {
 	// a = 1 → 100 (equality), b IN (1,2) → 200 (in)
 	// mixed AND → product / total^(n-1) = (100 * 200) / 1000^1 = 20000/1000 = 20
 	expr := parseWhere(t, "a = 1 AND b IN (1, 2)")
-	got := stat4.EstimateCardinality(expr, 1000, nil)
+	got := stat4.EstimateCardinality(expr, 1000)
 	require.Equal(t, int64(20), got)
 }
 
@@ -96,7 +96,7 @@ func TestEstimateCardinality_OrExpr(t *testing.T) {
 	t.Parallel()
 	// a=1 → 100, b=2 → 100; OR → min(1000, 200) = 200
 	expr := parseWhere(t, "a = 1 OR b = 2")
-	got := stat4.EstimateCardinality(expr, 1000, nil)
+	got := stat4.EstimateCardinality(expr, 1000)
 	require.Equal(t, int64(200), got)
 }
 
@@ -104,7 +104,7 @@ func TestEstimateCardinality_OrCappedAtTotal(t *testing.T) {
 	t.Parallel()
 	// 10 IN values * 0.1 * 100 = 100 each side; OR → min(100, 200) = 100
 	expr := parseWhere(t, "a IN (1,2,3,4,5,6,7,8,9,10) OR b IN (1,2,3,4,5,6,7,8,9,10)")
-	got := stat4.EstimateCardinality(expr, 100, nil)
+	got := stat4.EstimateCardinality(expr, 100)
 	require.Equal(t, int64(100), got)
 }
 
@@ -112,7 +112,7 @@ func TestEstimateCardinality_Default(t *testing.T) {
 	t.Parallel()
 	// A NOT comparison falls through to default → total/2.
 	expr := parseWhere(t, "a != 1")
-	got := stat4.EstimateCardinality(expr, 1000, nil)
+	got := stat4.EstimateCardinality(expr, 1000)
 	require.Equal(t, int64(500), got)
 }
 
@@ -120,6 +120,6 @@ func TestEstimateCardinality_NestedAnd(t *testing.T) {
 	t.Parallel()
 	// (a=1 AND b=2 AND c=3) — all equality → max(100,100,100) = 100
 	expr := parseWhere(t, "a = 1 AND b = 2 AND c = 3")
-	got := stat4.EstimateCardinality(expr, 1000, nil)
+	got := stat4.EstimateCardinality(expr, 1000)
 	require.Equal(t, int64(100), got)
 }

@@ -7,24 +7,17 @@ import (
 	"vitess.io/vitess/go/vt/sqlparser"
 )
 
-// Histogram is a placeholder for SQLite stat4-derived histograms.
-// For P2 it is an opaque struct with only the TotalRows field populated;
-// a future phase wires real stat4 bucket loading. Zero value means "no stats".
-type Histogram struct {
-	TotalRows int64
-}
-
 // EstimateCardinality estimates how many rows satisfy the predicate expression
 // against the total row count. Rules per design §7.1:
-//   - Comparison col = literal          → TotalRows/10  (if Histogram has no buckets)
+//   - Comparison col = literal          → total/10
 //   - col IN (v1..vn)                   → min(total, n * 0.1 * total)
 //   - AND(all equality)                 → max(estimates)
 //   - AND(mixed)                        → product(estimates) / total^(n-1)
 //   - OR(a, b)                          → min(total, a+b)
 //   - default                           → total/2
 //
-// A nil Histogram uses only TotalRows guidance; zero total returns 0.
-func EstimateCardinality(expr sqlparser.Expr, total int64, h *Histogram) int64 {
+// Zero total returns 0.
+func EstimateCardinality(expr sqlparser.Expr, total int64) int64 {
 	if total == 0 {
 		return 0
 	}

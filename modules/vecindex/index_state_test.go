@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/maxpert/marmot/modules/vecindex/pkg/kmeans"
+	"github.com/maxpert/marmot/modules/vecindex/pkg/metric"
 	"github.com/stretchr/testify/require"
 )
 
@@ -262,7 +263,7 @@ func TestFloat32ToBytes_RoundTrip(t *testing.T) {
 	b := Float32ToBytes(v)
 	require.Len(t, b, 4*len(v))
 
-	got := bytesToFloat32Unsafe(b)
+	got := metric.BytesToFloat32(b)
 	for i, f := range v {
 		require.InDelta(t, f, got[i], 1e-6, "element %d", i)
 	}

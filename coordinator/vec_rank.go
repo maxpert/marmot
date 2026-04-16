@@ -32,11 +32,10 @@ type GoRankPlan struct {
 	BaseTable  string
 	BaseAlias  string // empty → use BaseTable
 
-	IndexName   string  // for cache lookup
-	ClusterIDs  []int64 // probed clusters; cache path iterates these + cluster 0
-	ProbeEpoch  uint64  // epoch of the probe set that produced ClusterIDs; guards cache coherence
-	UseCache    bool    // session toggle: cache path enabled
-	HasUserPred bool    // user predicate present → cache path only if we defer to SQL for final fetch
+	IndexName  string  // for cache lookup
+	ClusterIDs []int64 // probed clusters; cache path iterates these + cluster 0
+	ProbeEpoch uint64  // epoch of the probe set that produced ClusterIDs; guards cache coherence
+	UseCache   bool    // session toggle: cache path enabled
 
 	EmbedColumn string
 	// CandidateSQL is built lazily: the cache-hit path (the hot path) never
@@ -187,7 +186,6 @@ func BuildGoRankPlan(
 		BaseAlias:          tableAlias,
 		IndexName:          meta.IndexName,
 		ClusterIDs:         clusterIDs,
-		HasUserPred:        userPred != nil,
 		EmbedColumn:        meta.ColumnName,
 		CandidateSQL:       candidateSQL,
 		CandidateArgFilter: candidateArgFilter,

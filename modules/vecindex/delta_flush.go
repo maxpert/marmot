@@ -3,6 +3,8 @@ package vecindex
 import (
 	"context"
 	"time"
+
+	"github.com/maxpert/marmot/modules/vecindex/pkg/metric"
 )
 
 // DeltaFlushConfig holds configuration for the per-index delta flush worker.
@@ -169,11 +171,11 @@ func deltaFlushCycle(
 }
 
 // bytesToFloat32Copy decodes a little-endian float32 BLOB to a new []float32.
-// Unlike bytesToFloat32Unsafe this allocates a copy, which is needed because
+// Unlike metric.BytesToFloat32 this allocates a copy, which is needed because
 // the BLOB from SQL may be reused after the rows iterator advances.
 func bytesToFloat32Copy(b []byte) []float32 {
 	n := len(b) / 4
 	out := make([]float32, n)
-	copy(out, bytesToFloat32Unsafe(b))
+	copy(out, metric.BytesToFloat32(b))
 	return out
 }

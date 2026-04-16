@@ -712,7 +712,7 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, params []in
 
 // handleVectorDDL executes CREATE/DROP VECTOR INDEX locally via the VectorIndexManager.
 // Vector DDL does not go through 2PC: the metadata row written to SQLite is
-// CDC-replicated, and each node rebuilds its own Pebble index from the source data.
+// CDC-replicated, and each node rebuilds its own IVF index from the source data.
 func (h *CoordinatorHandler) handleVectorDDL(stmt protocol.Statement) (*protocol.ResultSet, error) {
 	if h.dbManager == nil {
 		return nil, fmt.Errorf("vector index: database manager not available")
