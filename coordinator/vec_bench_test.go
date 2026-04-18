@@ -633,14 +633,14 @@ func TestDeltaFlush100K(t *testing.T) {
 	t.Logf("Initial delta rows: %d", initialDelta)
 
 	// Wire delta flush with a short interval for the test.
-	flushDB := db.NewSQLDeltaFlushDB(s.conn)
+	flushDB := db.NewSQLDeltaFlushDB(s.dbMgr)
 	s.engine.SetFlushDB(flushDB)
 	s.engine.SetFlushConfig(vecindex.DeltaFlushConfig{
 		Interval:  500 * time.Millisecond,
 		MaxRows:   20_000,
 		BatchSize: 2_000,
 	})
-	s.engine.StartFlush(benchIndexName, "docs", "embed")
+	s.engine.StartFlush(benchIndexName, benchDBName, "docs", "embed")
 	defer s.engine.StopFlush(benchIndexName)
 
 	// Insert 10K more rows.

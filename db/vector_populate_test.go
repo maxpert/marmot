@@ -40,8 +40,13 @@ func setupPopulateDB(t *testing.T, indexName string) (*sql.DB, *vecindex.Engine)
 	_, err = db.Exec(`CREATE TABLE "` + mt + `" (
 		cluster_id INTEGER NOT NULL,
 		rowid      INTEGER NOT NULL,
+		vec        BLOB    NOT NULL,
 		PRIMARY KEY (cluster_id, rowid)
 	) WITHOUT ROWID`)
+	require.NoError(t, err)
+	_, err = db.Exec(`CREATE INDEX "` + vecindex.MembersRowidIndex(indexName) + `" ON "` + mt + `"(rowid)`)
+	require.NoError(t, err)
+	_, err = db.Exec(`CREATE UNIQUE INDEX "` + vecindex.MembersRowidUniqueIndex(indexName) + `" ON "` + mt + `"(rowid)`)
 	require.NoError(t, err)
 
 	// Metadata table for the status='ready' update inside populateMembers.
@@ -54,14 +59,18 @@ func setupPopulateDB(t *testing.T, indexName string) (*sql.DB, *vecindex.Engine)
 		dim           INTEGER NOT NULL,
 		nlist         INTEGER NOT NULL,
 		nprobe        INTEGER NOT NULL,
+		auto_nlist    INTEGER NOT NULL DEFAULT 0,
+		auto_nprobe   INTEGER NOT NULL DEFAULT 0,
+		target_partition_size INTEGER NOT NULL DEFAULT 100,
 		max_norm      REAL NOT NULL DEFAULT 0,
 		status        TEXT NOT NULL DEFAULT 'building',
 		created_at    INTEGER NOT NULL DEFAULT 0
 	)`)
 	require.NoError(t, err)
 	_, err = db.Exec(`INSERT OR IGNORE INTO __marmot_vector_indexes
-		(index_name, table_name, column_name, database_name, metric, dim, nlist, nprobe, status)
-		VALUES (?, 'docs', 'embed', 'test', 'l2', 3, 2, 1, 'building')`, indexName)
+		(index_name, table_name, column_name, database_name, metric, dim,
+		 nlist, nprobe, auto_nlist, auto_nprobe, target_partition_size, status)
+		VALUES (?, 'docs', 'embed', 'test', 'l2', 3, 2, 1, 0, 0, 100, 'building')`, indexName)
 	require.NoError(t, err)
 
 	return db, engine
@@ -110,7 +119,7 @@ func TestBulkPopulate_NoDuplicateRowidsWithDelta(t *testing.T) {
 	// as well, producing duplicate rowids.
 	mt := vecindex.MembersTable(idx)
 	for _, id := range []int{1, 2, 3, 4} {
-		_, err := db.Exec(`INSERT INTO "`+mt+`" (cluster_id, rowid) VALUES (0, ?)`, id)
+		_, err := db.Exec(`INSERT INTO "`+mt+`" (cluster_id, rowid, vec) VALUES (0, ?, zeroblob(12))`, id)
 		require.NoError(t, err)
 	}
 
@@ -163,9 +172,16 @@ func TestBulkPopulate_EmptyTable(t *testing.T) {
 	err := BulkPopulate(ctx, db, engine, 1000, "docs", "embed", spec)
 	require.NoError(t, err)
 
-	_, ok := engine.Lookup(idx)
-	require.False(t, ok, "engine must not register state for empty table")
+	state, ok := engine.Lookup(idx)
+	require.True(t, ok, "engine must register empty state for online inserts")
+	require.Zero(t, state.ProbeVersion(), "empty index should start without centroids")
 	require.Equal(t, 0, membersCount(t, db, idx))
+
+	var status string
+	require.NoError(t, db.QueryRow(
+		`SELECT status FROM __marmot_vector_indexes WHERE index_name = ?`, idx,
+	).Scan(&status))
+	require.Equal(t, "ready", status, "empty index must become queryable immediately")
 }
 
 func TestBulkPopulate_ReplicaPath(t *testing.T) {

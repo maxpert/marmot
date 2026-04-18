@@ -4,10 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"math"
 	"math/rand"
 	"strings"
 
+	"github.com/maxpert/marmot/common"
 	"github.com/maxpert/marmot/modules/vecindex"
 	"github.com/maxpert/marmot/modules/vecindex/pkg/kmeans"
 	"github.com/maxpert/marmot/modules/vecindex/pkg/metric"
@@ -57,8 +57,13 @@ func BulkPopulate(
 			return fmt.Errorf("bulk populate %q: compute centroids: %w", spec.ID, err)
 		}
 		if cs == nil {
-			// Empty base table — nothing to index yet; DDL status stays 'building'.
-			log.Info().Str("index", spec.ID).Msg("BulkPopulate: base table empty, skipping centroid compute")
+			state := engine.RegisterWithCentroidSet(spec.ID, spec, nil)
+			state.StoreCache(nil)
+			if err := setIndexReady(ctx, db, spec.ID); err != nil {
+				engine.Unregister(spec.ID)
+				return fmt.Errorf("bulk populate %q: set empty index ready: %w", spec.ID, err)
+			}
+			log.Info().Str("index", spec.ID).Msg("BulkPopulate: base table empty, index ready in delta-only mode")
 			return nil
 		}
 		if err := writeCentroidRow(ctx, db, spec, cs, updatedAt); err != nil {
@@ -69,22 +74,45 @@ func BulkPopulate(
 	// Register BEFORE the bulk SQL so the __marmot_vec_assign UDF can resolve.
 	state := engine.RegisterWithCentroidSet(spec.ID, spec, cs)
 
-	if err := populateMembers(ctx, db, tableName, columnName, spec.ID); err != nil {
+	if err := populateMembers(ctx, db, tableName, columnName, spec.ID, int64(spec.Metric), spec.Dim, spec.MaxNorm); err != nil {
 		engine.Unregister(spec.ID)
 		return fmt.Errorf("bulk populate %q: populate members: %w", spec.ID, err)
 	}
 
-	// Build the in-memory vector cache (task #16) from the committed members.
-	// A single streaming scan decodes vectors once into owned float32 slices.
+	// The legacy in-memory cache is optional. The primary query path streams
+	// sidecar rows directly from SQLite, so cache install is skipped by default.
 	if err := buildAndStoreCache(ctx, db, state, spec, tableName, columnName); err != nil {
 		log.Warn().Err(err).Str("index", spec.ID).Msg("BulkPopulate: vector cache build failed; queries will fall back to SQL")
+	}
+	if err := loadAndStoreResidentDelta(ctx, db, state, spec, tableName, columnName); err != nil {
+		log.Warn().Err(err).Str("index", spec.ID).Msg("BulkPopulate: resident delta load failed")
 	}
 	return nil
 }
 
-// buildAndStoreCache scans (members JOIN base) once, decodes each vector into
-// an owned float32 slice, groups them by cluster_id, and atomically installs
-// the result as the index's in-memory VectorCache (task #16).
+func setIndexReady(ctx context.Context, db *sql.DB, indexName string) error {
+	if _, err := db.ExecContext(ctx,
+		`UPDATE __marmot_vector_indexes SET status='ready' WHERE index_name=?`,
+		indexName,
+	); err != nil {
+		return err
+	}
+	return nil
+}
+
+// buildAndStoreCache installs the optional legacy VectorCache for the index
+// when a non-zero cache budget is configured.
+//
+//  1. An empty PartitionCache wired to a SQL BulkLoader — partitions load
+//     lazily on first probe and evict under a byte budget (otter W-TinyLFU).
+//  2. An eagerly-loaded DeltaBuffer holding every cluster_id=0 row, since
+//     every query scans the delta buffer regardless of which partitions it
+//     probes (§3.3 of the design).
+//
+// This replaces the prior behaviour of reading every member row into RAM at
+// index-open — a 6 GB residency for a 1 M × 1536D index. The partition cache
+// now stays under VectorIndex.CacheBytes (default 1 GiB); cold-start queries
+// pay one SQL read per probed partition and are cached thereafter.
 //
 // A cache failure is non-fatal — searches transparently fall back to the SQL
 // candidate path. Callers log the error and continue.
@@ -95,56 +123,73 @@ func buildAndStoreCache(
 	spec vecindex.IVFSpec,
 	tableName, columnName string,
 ) error {
-	mt := quoteIdent(vecindex.MembersTable(spec.ID))
-	colQ := quoteIdent(columnName)
-	tblQ := quoteIdent(tableName)
+	budget := partitionCacheBytes()
+	if budget == 0 {
+		state.StoreCache(nil)
+		log.Info().Str("index", spec.ID).Msg("vector cache: disabled")
+		return nil
+	}
 
-	rows, err := db.QueryContext(ctx,
-		fmt.Sprintf(`SELECT m.cluster_id, m.rowid, b.%s FROM %s m JOIN %s b ON b.rowid = m.rowid`,
-			colQ, mt, tblQ),
-	)
+	internalDim := spec.InternalDim()
+	loader := newSQLPartitionLoader(db, spec.ID, tableName, columnName, internalDim, spec.Metric)
+
+	pc, err := vecindex.NewPartitionCache(vecindex.PartitionCacheOptions{
+		MaxBytes: budget,
+		Dim:      internalDim,
+		Epoch:    state.ProbeVersion(),
+		Loader:   loader,
+	})
 	if err != nil {
-		return fmt.Errorf("cache scan query: %w", err)
-	}
-	defer rows.Close()
-
-	byCluster := make(map[int64][]vecindex.CachedVector)
-	for rows.Next() {
-		var cid, rid int64
-		var blob []byte
-		if err := rows.Scan(&cid, &rid, &blob); err != nil {
-			return fmt.Errorf("cache scan row: %w", err)
-		}
-		if len(blob) == 0 || len(blob)%4 != 0 {
-			continue
-		}
-		n := len(blob) / 4
-		if n != spec.Dim {
-			continue
-		}
-		vec := make([]float32, n)
-		for i := 0; i < n; i++ {
-			bits := uint32(blob[i*4]) |
-				uint32(blob[i*4+1])<<8 |
-				uint32(blob[i*4+2])<<16 |
-				uint32(blob[i*4+3])<<24
-			vec[i] = math.Float32frombits(bits)
-		}
-		byCluster[cid] = append(byCluster[cid], vecindex.CachedVector{RowID: rid, Vec: vec})
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("cache scan iter: %w", err)
+		return fmt.Errorf("partition cache: %w", err)
 	}
 
-	cache := vecindex.NewVectorCache(state.ProbeVersion(), byCluster)
+	delta, err := loader.loadDelta(ctx)
+	if err != nil {
+		return fmt.Errorf("load delta buffer: %w", err)
+	}
+
+	cache := vecindex.NewVectorCache(state.ProbeVersion(), pc, delta)
 	state.StoreCache(cache)
 	log.Info().
 		Str("index", spec.ID).
-		Int("cached_vectors", cache.Len()).
-		Int("clusters", cache.ClusterCount()).
 		Uint64("epoch", cache.Epoch()).
-		Msg("vector cache: populated from members scan")
+		Int("delta_rows", delta.Len()).
+		Uint64("cache_bytes_budget", budget).
+		Msg("vector cache: installed (LRU partitions + resident delta)")
 	return nil
+}
+
+func loadAndStoreResidentDelta(
+	ctx context.Context,
+	db *sql.DB,
+	state *vecindex.IndexState,
+	spec vecindex.IVFSpec,
+	tableName, columnName string,
+) error {
+	if cache := state.LoadCache(); cache != nil && cache.Delta() != nil {
+		state.StoreResidentDelta(cache.Delta())
+		return nil
+	}
+	internalDim := spec.InternalDim()
+	loader := newSQLPartitionLoader(db, spec.ID, tableName, columnName, internalDim, spec.Metric)
+	delta, err := loader.loadDelta(ctx)
+	if err != nil {
+		return fmt.Errorf("load resident delta: %w", err)
+	}
+	state.StoreResidentDelta(delta)
+	return nil
+}
+
+// BuildResidentDeltaOnReopen reloads the always-resident cluster_id=0 buffer
+// for an already-registered index state after process restart.
+func BuildResidentDeltaOnReopen(
+	ctx context.Context,
+	db *sql.DB,
+	state *vecindex.IndexState,
+	meta common.VectorIndexMeta,
+	spec vecindex.IVFSpec,
+) error {
+	return loadAndStoreResidentDelta(ctx, db, state, spec, meta.TableName, meta.ColumnName)
 }
 
 // loadCentroidSet queries the centroids table and returns the stored CentroidSet,
@@ -324,6 +369,9 @@ func populateMembers(
 	tableName string,
 	columnName string,
 	indexName string,
+	metricCode int64,
+	dim int,
+	maxNorm float32,
 ) error {
 	mt := quoteIdent(vecindex.MembersTable(indexName))
 	colQ := quoteIdent(columnName)
@@ -347,11 +395,18 @@ func populateMembers(
 
 	// Bulk-assign all non-null vectors. No OR IGNORE needed: delta cleared above.
 	if _, err := tx.ExecContext(ctx,
-		fmt.Sprintf(`INSERT INTO %s (cluster_id, rowid)
-		             SELECT __marmot_vec_assign(?, %s), rowid
-		             FROM %s WHERE %s IS NOT NULL`,
-			mt, colQ, tblQ, colQ),
-		indexName,
+		fmt.Sprintf(`WITH prepared AS (
+		                 SELECT rowid,
+		                        %s AS raw,
+		                        __marmot_vec_materialize(%s, ?, ?, ?) AS vec
+		                 FROM %s WHERE %s IS NOT NULL
+		             )
+		             INSERT INTO %s (cluster_id, rowid, vec)
+		             SELECT __marmot_vec_assign(?, raw), rowid, vec
+		             FROM prepared
+		             WHERE vec IS NOT NULL`,
+			colQ, colQ, tblQ, colQ, mt),
+		metricCode, dim, maxNorm, indexName,
 	); err != nil {
 		return fmt.Errorf("populate members: insert: %w", err)
 	}

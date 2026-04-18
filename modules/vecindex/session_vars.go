@@ -46,8 +46,8 @@ type VecSessionVars struct {
 	// UseGoRank enables the Go-side ranking path that bypasses per-row UDF
 	// dispatch on post-filter plans (§7.6).
 	UseGoRank bool
-	// UseCache enables the in-memory vector cache ranking path that bypasses
-	// SQLite entirely for ranking (task #16).
+	// UseCache enables the legacy in-memory vector cache ranking path.
+	// Sidecar streaming remains the primary runtime path.
 	UseCache bool
 
 	// Delta flush
@@ -71,7 +71,7 @@ func DefaultVecSessionVars() VecSessionVars {
 		PrefilterCap:         5000,
 		Fallback:             true,
 		UseGoRank:            true,
-		UseCache:             true,
+		UseCache:             false,
 		DeltaFlushInterval:   10,
 		DeltaMaxRows:         10000,
 		DeltaFlushBatch:      1000,

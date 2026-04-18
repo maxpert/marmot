@@ -405,13 +405,26 @@ func (dm *DatabaseManager) GetDatabase(name string) (*ReplicatedDatabase, error)
 	return db, nil
 }
 
-// GetDatabaseConnection returns the *sql.DB for a database
+// GetDatabaseConnection returns the write *sql.DB for a database.
+// Writes must use this. Reads should use GetDatabaseReadConnection instead —
+// the write handle has SetMaxOpenConns(1) and _txlock=immediate, which
+// serialises all access through a single connection.
 func (dm *DatabaseManager) GetDatabaseConnection(name string) (*sql.DB, error) {
 	replicatedDB, err := dm.GetDatabase(name)
 	if err != nil {
 		return nil, err
 	}
 	return replicatedDB.GetDB(), nil
+}
+
+// GetDatabaseReadConnection returns the read-only *sql.DB pool for a database.
+// Pool size comes from config; WAL mode permits concurrent readers.
+func (dm *DatabaseManager) GetDatabaseReadConnection(name string) (*sql.DB, error) {
+	replicatedDB, err := dm.GetDatabase(name)
+	if err != nil {
+		return nil, err
+	}
+	return replicatedDB.GetReadDB(), nil
 }
 
 // GetReplicatedDatabase returns the ReplicatedDatabase as coordinator.ReplicatedDatabaseProvider

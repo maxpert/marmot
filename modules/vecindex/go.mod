@@ -4,6 +4,7 @@ go 1.26.0
 
 require (
 	github.com/klauspost/compress v1.18.0
+	github.com/maypok86/otter/v2 v2.3.0
 	github.com/stretchr/testify v1.11.1
 	github.com/tphakala/simd v1.0.22
 	github.com/vmihailenco/msgpack/v5 v5.4.1

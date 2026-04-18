@@ -20,14 +20,19 @@ type Engine struct {
 	flushCfg DeltaFlushConfig
 
 	flusherMu sync.Mutex
-	flushers  map[string]context.CancelFunc
+	flushers  map[string]*flushHandle
+}
+
+type flushHandle struct {
+	cancel context.CancelFunc
+	done   chan struct{}
 }
 
 // NewEngine creates a new Engine with no registered indexes.
 func NewEngine() *Engine {
 	return &Engine{
 		flushCfg: DefaultDeltaFlushConfig(),
-		flushers: make(map[string]context.CancelFunc),
+		flushers: make(map[string]*flushHandle),
 	}
 }
 
@@ -45,7 +50,7 @@ func (e *Engine) SetFlushConfig(cfg DeltaFlushConfig) {
 // StartFlush launches a delta flush goroutine for the named index.
 // The index must already be registered. No-op if flushDB is nil or
 // the index is not found.
-func (e *Engine) StartFlush(indexName, tableName, columnName string) {
+func (e *Engine) StartFlush(indexName, database, tableName, columnName string) {
 	if e.flushDB == nil {
 		return
 	}
@@ -55,25 +60,47 @@ func (e *Engine) StartFlush(indexName, tableName, columnName string) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
 	e.flusherMu.Lock()
-	if old, exists := e.flushers[indexName]; exists {
-		old()
-	}
-	e.flushers[indexName] = cancel
+	old := e.flushers[indexName]
+	e.flushers[indexName] = &flushHandle{cancel: cancel, done: done}
 	e.flusherMu.Unlock()
+	if old != nil {
+		old.cancel()
+		<-old.done
+	}
 
-	go deltaFlushLoop(ctx, e.flushCfg, state, e.flushDB, indexName, tableName, columnName)
+	go func() {
+		defer close(done)
+		deltaFlushLoop(ctx, e.flushCfg, state, e.flushDB, database, indexName, tableName, columnName)
+	}()
 }
 
 // StopFlush cancels the delta flush goroutine for the named index.
 // No-op if no flusher is running.
 func (e *Engine) StopFlush(indexName string) {
 	e.flusherMu.Lock()
-	if cancel, ok := e.flushers[indexName]; ok {
-		cancel()
+	if h, ok := e.flushers[indexName]; ok {
+		h.cancel()
 		delete(e.flushers, indexName)
 	}
 	e.flusherMu.Unlock()
+}
+
+// StopFlushAndWait cancels the delta flush goroutine for the named index and
+// blocks until the worker has fully exited.
+func (e *Engine) StopFlushAndWait(indexName string) {
+	e.flusherMu.Lock()
+	h := e.flushers[indexName]
+	if h != nil {
+		delete(e.flushers, indexName)
+	}
+	e.flusherMu.Unlock()
+	if h == nil {
+		return
+	}
+	h.cancel()
+	<-h.done
 }
 
 // Register stores the IndexState for indexName in the engine, replacing any
@@ -87,7 +114,9 @@ func (e *Engine) Register(indexName string, state *IndexState) {
 // cache first so pending searches observe a nil cache before losing the state.
 func (e *Engine) Unregister(indexName string) {
 	if val, ok := e.indexes.Load(indexName); ok {
-		val.(*IndexState).CacheClear()
+		state := val.(*IndexState)
+		state.CacheClear()
+		state.ClearPackedStore()
 	}
 	e.indexes.Delete(indexName)
 }

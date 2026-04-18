@@ -52,6 +52,7 @@ func RegisterVectorUDFs(conn *sqlite3.SQLiteConn) error {
 		{"vec_distance_cosine", vecDistanceCosine, true},
 		{"vec_distance_dot", vecDistanceDot, true},
 		{"__marmot_vec_assign", vecAssign, false},
+		{"__marmot_vec_materialize", vecMaterialize, true},
 		{"__marmot_vec_notify_centroid_change", vecNotifyCentroidChange, false},
 		{"vec_match", vecMatchSentinel, true},
 	}
@@ -124,6 +125,10 @@ func vecAssign(indexName string, vec []byte) (int64, error) {
 		return 0, fmt.Errorf("MARMOT-VEC-014: invalid vector blob length %d", len(vec))
 	}
 	return p.AssignNearest(indexName, vec)
+}
+
+func vecMaterialize(vec []byte, metricCode int64, dim int64, maxNorm float64) ([]byte, error) {
+	return materializeVectorBlob(vec, metric.Metric(metricCode), int(dim), float32(maxNorm))
 }
 
 // vecNotifyCentroidChange is a best-effort side-effect UDF invoked from

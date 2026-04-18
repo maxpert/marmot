@@ -23,7 +23,7 @@ type mockFlushDB struct {
 	onCommit    func() // optional callback after each commit
 }
 
-func (m *mockFlushDB) FetchDeltaEmbeddings(_ context.Context, _, _, _ string, limit int) ([]DeltaRow, error) {
+func (m *mockFlushDB) FetchDeltaEmbeddings(_ context.Context, _, _, _, _ string, limit int) ([]DeltaRow, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	atomic.AddInt64(&m.fetchCalls, 1)
@@ -40,7 +40,7 @@ func (m *mockFlushDB) FetchDeltaEmbeddings(_ context.Context, _, _, _ string, li
 	return result, nil
 }
 
-func (m *mockFlushDB) CommitFlushBatch(_ context.Context, _ string, assignments []DeltaAssignment) error {
+func (m *mockFlushDB) CommitFlushBatch(_ context.Context, _, _ string, assignments []DeltaAssignment) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	atomic.AddInt64(&m.commitCalls, 1)
@@ -89,7 +89,7 @@ func TestDeltaFlushCycle_AssignsAllDelta(t *testing.T) {
 	db := &mockFlushDB{deltaRows: makeDeltaRows(nRows, dim)}
 	cfg := DeltaFlushConfig{Interval: time.Millisecond, MaxRows: nRows, BatchSize: 200}
 
-	deltaFlushCycle(context.Background(), cfg, state, db, "test", "docs", "embed")
+	deltaFlushCycle(context.Background(), cfg, state, db, "bench", "test", "docs", "embed")
 
 	// All 1000 rows should have been committed.
 	require.Equal(t, nRows, db.committedCount())
@@ -126,7 +126,7 @@ func TestDeltaFlushCycle_VersionMismatchAbortsBatch(t *testing.T) {
 	}
 
 	cfg := DeltaFlushConfig{Interval: time.Second, MaxRows: 500, BatchSize: 100}
-	deltaFlushCycle(context.Background(), cfg, state, db, "test", "docs", "embed")
+	deltaFlushCycle(context.Background(), cfg, state, db, "bench", "test", "docs", "embed")
 
 	// Should have committed exactly 2 batches (200 rows) before aborting.
 	// The 3rd batch sees version mismatch and aborts.
@@ -142,7 +142,7 @@ func TestDeltaFlushCycle_EmptyDeltaNoOp(t *testing.T) {
 	db := &mockFlushDB{} // no delta rows
 	cfg := DefaultDeltaFlushConfig()
 
-	deltaFlushCycle(context.Background(), cfg, state, db, "test", "docs", "embed")
+	deltaFlushCycle(context.Background(), cfg, state, db, "bench", "test", "docs", "embed")
 
 	require.Equal(t, int64(1), atomic.LoadInt64(&db.fetchCalls))
 	require.Equal(t, int64(0), atomic.LoadInt64(&db.commitCalls))
@@ -160,7 +160,7 @@ func TestDeltaFlushLoop_GracefulShutdown(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
-		deltaFlushLoop(ctx, cfg, state, db, "test", "docs", "embed")
+		deltaFlushLoop(ctx, cfg, state, db, "bench", "test", "docs", "embed")
 		close(done)
 	}()
 
@@ -198,7 +198,7 @@ func TestDeltaFlushCycle_UpdatesDriftTracker(t *testing.T) {
 	db := &mockFlushDB{deltaRows: rows}
 	cfg := DeltaFlushConfig{Interval: time.Second, MaxRows: 100, BatchSize: 100}
 
-	deltaFlushCycle(context.Background(), cfg, state, db, "test", "docs", "embed")
+	deltaFlushCycle(context.Background(), cfg, state, db, "bench", "test", "docs", "embed")
 
 	// All 10 should be assigned to cluster 1 (1-based, nearest to {0,0}).
 	tracker := state.LoadDriftTracker()
@@ -230,7 +230,7 @@ func TestDeltaFlushCycle_OnErrorCallbackFires(t *testing.T) {
 		},
 	}
 
-	deltaFlushCycle(context.Background(), cfg, state, errDB, "myidx", "docs", "embed")
+	deltaFlushCycle(context.Background(), cfg, state, errDB, "bench", "myidx", "docs", "embed")
 
 	require.ErrorIs(t, captured, fetchErr)
 	require.Equal(t, "myidx", capturedIndex)
@@ -242,10 +242,26 @@ type errorFlushDB struct {
 	err error
 }
 
-func (e *errorFlushDB) FetchDeltaEmbeddings(context.Context, string, string, string, int) ([]DeltaRow, error) {
+func (e *errorFlushDB) FetchDeltaEmbeddings(context.Context, string, string, string, string, int) ([]DeltaRow, error) {
 	return nil, e.err
 }
 
-func (e *errorFlushDB) CommitFlushBatch(context.Context, string, []DeltaAssignment) error {
+func (e *errorFlushDB) CommitFlushBatch(context.Context, string, string, []DeltaAssignment) error {
 	return e.err
+}
+
+func TestDeltaFlushCycle_DrainsBacklogInSingleTick(t *testing.T) {
+	t.Parallel()
+
+	spec := IVFSpec{ID: "test", Dim: 2, Metric: MetricL2, Nlist: 1}
+	cs, _ := kmeans.NewCentroidSet(1, [][]float32{{1, 0}})
+	state := NewIndexState(spec, cs)
+
+	db := &mockFlushDB{deltaRows: makeDeltaRows(250, 2)}
+	cfg := DeltaFlushConfig{Interval: time.Second, MaxRows: 100, BatchSize: 50}
+
+	deltaFlushCycle(context.Background(), cfg, state, db, "bench", "test", "docs", "embed")
+
+	require.Equal(t, 250, db.committedCount())
+	require.Equal(t, int64(3), atomic.LoadInt64(&db.fetchCalls), "drain should stop after the final partial fetch")
 }

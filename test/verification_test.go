@@ -76,6 +76,10 @@ func (tdm *TestDatabaseManager) GetDatabaseConnection(name string) (*sql.DB, err
 	return tdm.db.GetDB(), nil
 }
 
+func (tdm *TestDatabaseManager) GetDatabaseReadConnection(name string) (*sql.DB, error) {
+	return tdm.db.GetReadDB(), nil
+}
+
 func (tdm *TestDatabaseManager) GetReplicatedDatabase(name string) (coordinator.ReplicatedDatabaseProvider, error) {
 	return tdm.db, nil
 }

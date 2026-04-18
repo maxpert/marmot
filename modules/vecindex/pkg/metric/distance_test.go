@@ -3,6 +3,7 @@ package metric
 import (
 	"encoding/binary"
 	"math"
+	"strings"
 	"testing"
 )
 
@@ -306,4 +307,171 @@ func TestFromBytes_LengthMismatchPanics(t *testing.T) {
 		}
 	}()
 	L2SquaredFromBytes([]float32{1, 2}, []byte{0, 0, 0, 0}) // 1 float vs 2-dim query
+}
+
+// unitize returns a copy of v scaled to unit L2 norm. Used by the
+// CosineDistanceUnit tests to satisfy the pre-normalization contract.
+// Returns v unchanged (as a copy) if its norm is non-finite or zero —
+// such degenerate inputs are not exercised by the tests below.
+func unitize(v []float32) []float32 {
+	out := make([]float32, len(v))
+	n := Norm(v)
+	if n == 0 {
+		copy(out, v)
+		return out
+	}
+	inv := 1.0 / n
+	for i, x := range v {
+		out[i] = x * inv
+	}
+	return out
+}
+
+// TestCosineDistanceUnit_ParityWithCosineSimilarity pins the contract that
+// for pre-normalized inputs CosineDistanceUnit returns 1 - CosineSimilarity
+// within a tight absolute tolerance across representative dims. The unit
+// function short-circuits the norm/divide; parity with the reference
+// cosine pipeline is the load-bearing invariant for IVF ranking.
+func TestCosineDistanceUnit_ParityWithCosineSimilarity(t *testing.T) {
+	t.Parallel()
+	dims := []int{8, 32, 128, 1536}
+	for _, dim := range dims {
+		dim := dim
+		t.Run("dim="+itoaTest(dim), func(t *testing.T) {
+			t.Parallel()
+			// Per-subtest rng seeded by dim to avoid shared-rng race flags.
+			rng := randSource(int64(131313 + dim))
+			for trial := 0; trial < 16; trial++ {
+				q := randomVec(rng, dim)
+				v := randomVec(rng, dim)
+				qU := unitize(q)
+				vU := unitize(v)
+				got := CosineDistanceUnit(qU, vU)
+				want := 1 - CosineSimilarity(q, v)
+				if math.Abs(float64(got-want)) > 1e-5 {
+					t.Fatalf("dim=%d trial=%d got=%v want=%v diff=%.3e",
+						dim, trial, got, want, math.Abs(float64(got-want)))
+				}
+			}
+		})
+	}
+}
+
+// TestCosineDistanceUnit_OrthogonalIsOne pins that orthogonal unit vectors
+// produce distance exactly 1 (within float32 rounding). Guards against an
+// off-by-one sign flip in the (1 - dot) return.
+func TestCosineDistanceUnit_OrthogonalIsOne(t *testing.T) {
+	t.Parallel()
+	const dim = 1536
+	a := make([]float32, dim)
+	b := make([]float32, dim)
+	a[0] = 1
+	b[1] = 1
+	got := CosineDistanceUnit(a, b)
+	if math.Abs(float64(got-1.0)) > 1e-6 {
+		t.Errorf("orthogonal unit vectors: got %v, want 1.0", got)
+	}
+}
+
+// TestCosineDistanceUnit_IdenticalIsZero pins that identical unit vectors
+// produce distance 0. Guards against the trivial "always return 1" bug.
+func TestCosineDistanceUnit_IdenticalIsZero(t *testing.T) {
+	t.Parallel()
+	const dim = 1536
+	rng := randSource(20260416)
+	v := unitize(randomVec(rng, dim))
+	got := CosineDistanceUnit(v, v)
+	if math.Abs(float64(got)) > 1e-6 {
+		t.Errorf("identical unit vectors: got %v, want 0", got)
+	}
+}
+
+// TestCosineDistanceUnit_NegatedIsTwo pins that a unit vector versus its
+// negation produces the maximum cosine distance of 2. Guards against a
+// missing sign in the dot product accumulation.
+func TestCosineDistanceUnit_NegatedIsTwo(t *testing.T) {
+	t.Parallel()
+	const dim = 1536
+	rng := randSource(20260417)
+	v := unitize(randomVec(rng, dim))
+	neg := make([]float32, dim)
+	for i, x := range v {
+		neg[i] = -x
+	}
+	got := CosineDistanceUnit(v, neg)
+	if math.Abs(float64(got-2.0)) > 1e-6 {
+		t.Errorf("v vs -v: got %v, want 2.0", got)
+	}
+}
+
+// TestCosineDistanceUnit_MismatchedLenPanics pins that the fast path still
+// enforces the shared length precondition. Uses defer/recover to assert the
+// panic message matches the existing assertEqualLen helper contract.
+func TestCosineDistanceUnit_MismatchedLenPanics(t *testing.T) {
+	t.Parallel()
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("expected panic for mismatched lengths")
+		}
+		msg, ok := r.(string)
+		if !ok {
+			t.Fatalf("panic value not string: %T %v", r, r)
+		}
+		if !strings.Contains(msg, "mismatched vector lengths") {
+			t.Errorf("panic message %q does not contain %q", msg, "mismatched vector lengths")
+		}
+	}()
+	CosineDistanceUnit([]float32{1, 0}, []float32{1, 0, 0})
+}
+
+// TestCosineDistanceUnit_NoAlloc pins the zero-overhead contract: a single
+// SIMD dot product and a subtract must not allocate. Uses AllocsPerRun with
+// N=100 so the assertion is stable against one-shot lazy-init allocations.
+func TestCosineDistanceUnit_NoAlloc(t *testing.T) {
+	// Intentionally not t.Parallel(): testing.AllocsPerRun panics when called
+	// concurrently with other parallel tests (Go 1.26 hard check).
+	const dim = 1536
+	rng := randSource(20260418)
+	q := unitize(randomVec(rng, dim))
+	v := unitize(randomVec(rng, dim))
+	var sink float32
+	allocs := testing.AllocsPerRun(100, func() {
+		sink += CosineDistanceUnit(q, v)
+	})
+	if allocs != 0 {
+		t.Errorf("CosineDistanceUnit allocs/op = %v, want 0", allocs)
+	}
+	benchSink = sink
+}
+
+// BenchmarkCosineDistanceUnit measures the zero-overhead fast path on
+// pre-normalized dim=1536 inputs, the target shape for IVF cosine search.
+func BenchmarkCosineDistanceUnit(b *testing.B) {
+	const dim = 1536
+	rng := randSource(20260419)
+	q := unitize(randomVec(rng, dim))
+	v := unitize(randomVec(rng, dim))
+	var sink float32
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		sink += CosineDistanceUnit(q, v)
+	}
+	benchSink = sink
+}
+
+// BenchmarkCosineSimilarity is the reference comparison for
+// BenchmarkCosineDistanceUnit at the same dim, so pprof profiles can be
+// directly compared between the general and the unit-norm fast path.
+func BenchmarkCosineSimilarity(b *testing.B) {
+	const dim = 1536
+	rng := randSource(20260419)
+	q := randomVec(rng, dim)
+	v := randomVec(rng, dim)
+	var sink float32
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		sink += CosineSimilarity(q, v)
+	}
+	benchSink = sink
 }

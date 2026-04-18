@@ -4,10 +4,16 @@
 package coordinator_test
 
 import (
+	"context"
 	"math/rand"
 	"sort"
 	"testing"
+	"time"
 
+	"github.com/maxpert/marmot/common"
+	"github.com/maxpert/marmot/coordinator"
+	"github.com/maxpert/marmot/db"
+	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/modules/vecindex"
 	"github.com/maxpert/marmot/protocol"
 	"github.com/stretchr/testify/require"
@@ -113,4 +119,99 @@ func TestGoRank_Recall(t *testing.T) {
 	recall := float64(totalHits) / float64(nQueries*k)
 	t.Logf("GoRank recall@%d over %d queries = %.4f (%d/%d hits)", k, nQueries, recall, totalHits, nQueries*k)
 	require.GreaterOrEqual(t, recall, 0.95, "go-rank recall@%d must be >= 0.95 (got %.4f)", k, recall)
+}
+
+func TestGoRank_DeltaOnlyAfterEmptyCreate(t *testing.T) {
+	tmpDir := t.TempDir()
+	clock := hlc.NewClock(1)
+
+	dbMgr, err := db.NewDatabaseManager(tmpDir, 1, clock)
+	require.NoError(t, err)
+	require.NoError(t, dbMgr.CreateDatabase(e2eDBName))
+
+	vecMgr := db.NewVectorIndexManager(dbMgr)
+	dbMgr.SetVectorIndexManager(vecMgr)
+
+	engine := vecindex.NewEngine()
+	db.SetVectorUDFProvider(engine)
+	t.Cleanup(func() { db.SetVectorUDFProvider(nil) })
+
+	hook := db.NewEngineHook(engine, dbMgr)
+	vecMgr.SetLifecycleHook(hook)
+	vecMgr.SetEngineProvider(hook)
+	vecMgr.SetReindexHook(hook)
+	require.NoError(t, vecMgr.Start(context.Background()))
+
+	conn, err := dbMgr.GetDatabaseConnection(e2eDBName)
+	require.NoError(t, err)
+	_, err = conn.Exec(`CREATE TABLE IF NOT EXISTS docs (
+		id     INTEGER PRIMARY KEY,
+		embed  BLOB,
+		status TEXT
+	)`)
+	require.NoError(t, err)
+
+	localReader := db.NewLocalReader(dbMgr)
+	nodeProvider := coordinator.NewMockNodeProvider([]uint64{1})
+	rc := coordinator.NewReadCoordinator(1, nodeProvider, localReader, 10*time.Second)
+	handler := coordinator.NewTestHandler(1, rc, dbMgr, clock)
+	handler.SetVectorEngine(engine)
+
+	meta := common.VectorIndexMeta{
+		IndexName:  e2eIndexName,
+		TableName:  "docs",
+		ColumnName: "embed",
+		Database:   e2eDBName,
+		Metric:     "cosine",
+		Dim:        e2eDim,
+		Nlist:      e2eNlist,
+		Nprobe:     e2eNprobe,
+		Status:     "building",
+		CreatedAt:  time.Now().UnixNano(),
+	}
+	require.NoError(t, vecMgr.CreateIndex(context.Background(), meta))
+	require.NoError(t, waitIndexReady(conn, e2eIndexName, e2eReadyPoll))
+
+	var status string
+	require.NoError(t, conn.QueryRow(
+		`SELECT status FROM __marmot_vector_indexes WHERE index_name = ?`, e2eIndexName,
+	).Scan(&status))
+	require.Equal(t, "ready", status)
+
+	rng := rand.New(rand.NewSource(91))
+	vectors := make([][]float32, 32)
+	stmt, err := conn.Prepare(`INSERT INTO docs(id, embed, status) VALUES (?, ?, 'published')`)
+	require.NoError(t, err)
+	defer stmt.Close()
+	for i := range vectors {
+		v := make([]float32, e2eDim)
+		for j := range v {
+			v[j] = float32(rng.NormFloat64())
+		}
+		vectors[i] = unitNorm(v)
+		_, err := stmt.Exec(i+1, float32sToBlob(vectors[i]))
+		require.NoError(t, err)
+	}
+
+	s := &e2eSetup{
+		dbMgr:   dbMgr,
+		vecMgr:  vecMgr,
+		engine:  engine,
+		handler: handler,
+		conn:    conn,
+		vectors: vectors,
+	}
+
+	qb := float32sToBlob(vectors[0])
+	goRankIDs := runVecQuery(t, s, rankQuerySQL, qb, newGoRankSession(true))
+	udfIDs := runVecQuery(t, s, rankQuerySQL, qb, newGoRankSession(false))
+
+	require.NotEmpty(t, goRankIDs, "delta-only go-rank should return rows before centroids exist")
+	require.Equal(t, len(udfIDs), len(goRankIDs))
+
+	sortedGR := append([]int64(nil), goRankIDs...)
+	sortedUDF := append([]int64(nil), udfIDs...)
+	sort.Slice(sortedGR, func(i, j int) bool { return sortedGR[i] < sortedGR[j] })
+	sort.Slice(sortedUDF, func(i, j int) bool { return sortedUDF[i] < sortedUDF[j] })
+	require.Equal(t, sortedUDF, sortedGR)
 }

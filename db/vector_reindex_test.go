@@ -48,17 +48,20 @@ func setupReindexDB(t *testing.T, nVec int) (*sql.DB, *vecindex.Engine, vecindex
 	_, err = db.Exec(`CREATE TABLE "` + mt + `" (
 		cluster_id INTEGER NOT NULL,
 		rowid      INTEGER NOT NULL,
+		vec        BLOB    NOT NULL,
 		PRIMARY KEY (cluster_id, rowid)
 	) WITHOUT ROWID`)
 	require.NoError(t, err)
 	_, err = db.Exec(`CREATE INDEX "` + vecindex.MembersRowidIndex(idx) + `" ON "` + mt + `"(rowid)`)
+	require.NoError(t, err)
+	_, err = db.Exec(`CREATE UNIQUE INDEX "` + vecindex.MembersRowidUniqueIndex(idx) + `" ON "` + mt + `"(rowid)`)
 	require.NoError(t, err)
 
 	// Triggers: AFTER INSERT → cluster_id=0 delta.
 	_, err = db.Exec(`CREATE TRIGGER "` + vecindex.TriggerInsert(idx) + `"
 		AFTER INSERT ON docs WHEN NEW.embed IS NOT NULL
 		BEGIN
-			INSERT INTO "` + mt + `" (cluster_id, rowid) VALUES (0, NEW.rowid);
+			INSERT INTO "` + mt + `" (cluster_id, rowid, vec) VALUES (0, NEW.rowid, NEW.embed);
 		END`)
 	require.NoError(t, err)
 
@@ -72,6 +75,9 @@ func setupReindexDB(t *testing.T, nVec int) (*sql.DB, *vecindex.Engine, vecindex
 		dim INTEGER NOT NULL,
 		nlist INTEGER NOT NULL,
 		nprobe INTEGER NOT NULL,
+		auto_nlist INTEGER NOT NULL DEFAULT 0,
+		auto_nprobe INTEGER NOT NULL DEFAULT 0,
+		target_partition_size INTEGER NOT NULL DEFAULT 100,
 		max_norm REAL NOT NULL,
 		status TEXT NOT NULL,
 		created_at INTEGER NOT NULL
@@ -79,8 +85,9 @@ func setupReindexDB(t *testing.T, nVec int) (*sql.DB, *vecindex.Engine, vecindex
 	require.NoError(t, err)
 	_, err = db.Exec(`INSERT INTO __marmot_vector_indexes
 		(index_name, table_name, column_name, database_name, metric, dim,
-		 nlist, nprobe, max_norm, status, created_at)
-		VALUES (?, 'docs', 'embed', 'test', 'l2', 4, 4, 2, 0, 'ready', ?)`,
+		 nlist, nprobe, auto_nlist, auto_nprobe, target_partition_size,
+		 max_norm, status, created_at)
+		VALUES (?, 'docs', 'embed', 'test', 'l2', 4, 4, 2, 0, 0, 100, 0, 'ready', ?)`,
 		idx, time.Now().UnixNano())
 	require.NoError(t, err)
 
@@ -121,6 +128,10 @@ func TestReindex_BasicComplete(t *testing.T) {
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM docs WHERE embed IS NOT NULL`).Scan(&baseCount))
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM "`+vecindex.MembersTable(idx)+`"`).Scan(&memberCount))
 	require.Equal(t, baseCount, memberCount, "every base row must be in members")
+	require.NoError(t, db.QueryRow(
+		`SELECT COUNT(*) FROM "`+vecindex.MembersTable(idx)+`" WHERE vec IS NOT NULL`,
+	).Scan(&memberCount))
+	require.Equal(t, baseCount, memberCount, "every member row must carry a materialized vec")
 
 	// No duplicate rowids.
 	var maxDup int
@@ -135,6 +146,13 @@ func TestReindex_BasicComplete(t *testing.T) {
 	err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, staging).Scan(&cnt)
 	require.NoError(t, err)
 	require.Equal(t, 0, cnt, "staging table must be dropped after swap")
+
+	err = db.QueryRow(
+		`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?`,
+		vecindex.MembersRowidUniqueIndex(idx),
+	).Scan(&cnt)
+	require.NoError(t, err)
+	require.Equal(t, 1, cnt, "rowid unique index must exist after swap")
 
 	// (c) Centroid version bumped.
 	newState, ok := engine.Lookup(idx)
@@ -151,6 +169,61 @@ func TestReindex_BasicComplete(t *testing.T) {
 		`SELECT status FROM __marmot_vector_indexes WHERE index_name=?`, idx,
 	).Scan(&status))
 	require.Equal(t, "ready", status)
+}
+
+func TestReindex_RetunesAutoTunedParams(t *testing.T) {
+	db, engine, spec := setupReindexDB(t, 100)
+	ctx := context.Background()
+	idx := spec.ID
+
+	_, err := db.Exec(`UPDATE __marmot_vector_indexes
+		SET auto_nlist = 1, auto_nprobe = 1
+		WHERE index_name = ?`, idx)
+	require.NoError(t, err)
+
+	meta := testMeta(idx)
+	meta.AutoTuneNlist = true
+	meta.AutoTuneNprobe = true
+
+	require.NoError(t, Reindex(ctx, db, engine, meta, 50, time.Now().UnixNano()))
+
+	var nlist, nprobe int
+	require.NoError(t, db.QueryRow(
+		`SELECT nlist, nprobe FROM __marmot_vector_indexes WHERE index_name=?`, idx,
+	).Scan(&nlist, &nprobe))
+	require.Equal(t, autoTuneNlist(100), nlist)
+	require.Equal(t, autoTuneNprobe(nlist), nprobe)
+
+	state, ok := engine.Lookup(idx)
+	require.True(t, ok)
+	require.Equal(t, nlist, state.Spec().Nlist)
+	require.Equal(t, nprobe, state.Spec().Nprobe)
+
+	var centroidNlist int
+	require.NoError(t, db.QueryRow(
+		`SELECT nlist FROM "`+vecindex.CentroidsTable(idx)+`" WHERE index_id = 1`,
+	).Scan(&centroidNlist))
+	require.Equal(t, nlist, centroidNlist)
+}
+
+func TestReindex_PreservesExplicitParams(t *testing.T) {
+	db, engine, spec := setupReindexDB(t, 100)
+	ctx := context.Background()
+	idx := spec.ID
+
+	require.NoError(t, Reindex(ctx, db, engine, testMeta(idx), 50, time.Now().UnixNano()))
+
+	var nlist, nprobe int
+	require.NoError(t, db.QueryRow(
+		`SELECT nlist, nprobe FROM __marmot_vector_indexes WHERE index_name=?`, idx,
+	).Scan(&nlist, &nprobe))
+	require.Equal(t, spec.Nlist, nlist)
+	require.Equal(t, spec.Nprobe, nprobe)
+
+	state, ok := engine.Lookup(idx)
+	require.True(t, ok)
+	require.Equal(t, spec.Nlist, state.Spec().Nlist)
+	require.Equal(t, spec.Nprobe, state.Spec().Nprobe)
 }
 
 // TestReindex_DriftIsolation locks the §8.5 contract: after REINDEX both
@@ -187,10 +260,13 @@ func TestReindex_CrashRecovery(t *testing.T) {
 	_, err := db.Exec(`CREATE TABLE "` + staging + `" (
 		cluster_id INTEGER NOT NULL,
 		rowid      INTEGER NOT NULL,
+		vec        BLOB    NOT NULL,
 		PRIMARY KEY (cluster_id, rowid)
 	) WITHOUT ROWID`)
 	require.NoError(t, err)
-	_, err = db.Exec(`INSERT INTO "` + staging + `" (cluster_id, rowid) VALUES (1, 1)`)
+	_, err = db.Exec(`CREATE UNIQUE INDEX "` + vecindex.StagingRowidUniqueIndex(idx) + `" ON "` + staging + `"(rowid)`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO "` + staging + `" (cluster_id, rowid, vec) VALUES (1, 1, zeroblob(16))`)
 	require.NoError(t, err)
 	require.NoError(t, updateIndexStatus(ctx, db, idx, "reindexing"))
 

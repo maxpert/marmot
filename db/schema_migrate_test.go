@@ -20,7 +20,8 @@ func TestMigrateVectorIndexesSchema_CreatesFresh(t *testing.T) {
 	require.NoError(t, err)
 
 	required := []string{"index_name", "table_name", "column_name", "database_name",
-		"metric", "dim", "nlist", "nprobe", "max_norm", "status", "created_at"}
+		"metric", "dim", "nlist", "nprobe", "auto_nlist", "auto_nprobe",
+		"target_partition_size", "max_norm", "status", "created_at"}
 	for _, col := range required {
 		_, ok := cols[col]
 		require.True(t, ok, "missing column: %s", col)
@@ -58,6 +59,9 @@ func TestMigrateVectorIndexesSchema_AddsNewColumn(t *testing.T) {
 	require.NoError(t, err)
 	require.Contains(t, cols, "nlist")
 	require.Contains(t, cols, "nprobe")
+	require.Contains(t, cols, "auto_nlist")
+	require.Contains(t, cols, "auto_nprobe")
+	require.Contains(t, cols, "target_partition_size")
 	require.Contains(t, cols, "max_norm")
 }
 

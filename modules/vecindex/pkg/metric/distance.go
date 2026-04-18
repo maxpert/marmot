@@ -114,6 +114,32 @@ func CosineSimilarity(a, b []float32) float32 {
 	return f32.DotProduct(a, b) / denom
 }
 
+// CosineDistanceUnit returns the cosine distance 1 - dot(qUnit, vUnit) assuming
+// both inputs are already unit-norm (L2 norm == 1). This is the hot path used
+// by IVF ranking after vectors have been normalized once at load time; it
+// skips the per-call norm and divide of CosineSimilarity and delegates the
+// inner product to SIMD f32.DotProduct.
+//
+// Caller invariant: both qUnit and vUnit MUST have unit L2 norm. Behaviour on
+// non-unit inputs is undefined but safe — the function will not panic or
+// allocate; it will simply return the wrong number.
+//
+// Panics if len(qUnit) != len(vUnit).
+func CosineDistanceUnit(qUnit, vUnit []float32) float32 {
+	assertEqualLen(qUnit, vUnit)
+	return 1 - f32.DotProduct(qUnit, vUnit)
+}
+
+// CosineDistanceUnitFromBytes returns cosine distance 1 - dot(qUnit, vUnit)
+// assuming query and encoded vector are both already unit-norm.
+//
+// The vector bytes must encode little-endian float32 values. The caller must
+// NOT retain vecUnitBytes beyond the call.
+func CosineDistanceUnitFromBytes(qUnit []float32, vecUnitBytes []byte) float32 {
+	assertFromBytesLen(qUnit, vecUnitBytes)
+	return 1 - f32.DotProduct(qUnit, BytesToFloat32(vecUnitBytes))
+}
+
 // Norm computes the L2 norm of a vector using SIMD-accelerated dot product.
 func Norm(v []float32) float32 {
 	return norm(v)

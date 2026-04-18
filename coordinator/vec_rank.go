@@ -1,7 +1,6 @@
 package coordinator
 
 import (
-	"container/heap"
 	"context"
 	"database/sql"
 	"fmt"
@@ -21,35 +20,38 @@ import (
 // (§7.6): scan candidate rows from SQLite, compute distances in Go, then
 // fetch the top-K via a final SELECT with literal rowid ordering.
 //
-// When the in-memory VectorCache is available and session.UseCache is on,
-// executeGoRankPlan consults the cache directly (task #16) — IndexName +
-// ClusterIDs drive cache lookup — and falls back to CandidateSQL otherwise.
+// Candidate rows are streamed directly from the clustered sidecar members
+// table; the base table is only consulted for the final top-K projection.
 type GoRankPlan struct {
-	QueryVec   []float32
-	MetricKind metric.Metric
-	K          int
-	Database   string
-	BaseTable  string
-	BaseAlias  string // empty → use BaseTable
+	RawQueryVec []byte
+	QueryVec    []float32
+	RankMetric  metric.Metric
+	Nprobe      int
+	K           int
+	Database    string
+	BaseTable   string
+	BaseAlias   string // empty → use BaseTable
 
-	IndexName  string  // for cache lookup
-	ClusterIDs []int64 // probed clusters; cache path iterates these + cluster 0
-	ProbeEpoch uint64  // epoch of the probe set that produced ClusterIDs; guards cache coherence
-	UseCache   bool    // session toggle: cache path enabled
+	IndexName  string
+	ClusterIDs []int64 // probed clusters; execution adds cluster 0 for delta rows
+	ProbeEpoch uint64  // epoch of the probe set that produced ClusterIDs; enables reprobe on reindex races
 
 	EmbedColumn string
-	// CandidateSQL is built lazily: the cache-hit path (the hot path) never
-	// invokes it and avoids the ~150 allocs + ~5KB string build from the
-	// user-predicate render. The fallback path in executeGoRankPlan calls
-	// this exactly once when the cache cannot serve the query.
-	CandidateSQL func() string
+	// CandidateSQL is built lazily so the planner can carry the user predicate
+	// without paying render cost until execution. The execute path renders it
+	// exactly once per query, after any probe-epoch refresh.
+	CandidateSQL func(clusterIDs []int64) string
 	// CandidateArgFilter holds indices into rewrittenArgs that become the
 	// positional parameters for CandidateSQL (in order). Computed once by
 	// BuildGoRankPlan so executeGoRankPlan can resolve cheaply.
 	CandidateArgFilter []int
 
-	FinalSelectList string
-	FinalFromClause string
+	FinalSelectList  string
+	FinalFromClause  string
+	AllowCache       bool
+	HasUserPredicate bool
+	DirectPKColumn   string
+	DirectPKLabel    string
 }
 
 // alias returns the effective alias for the base table.
@@ -74,6 +76,7 @@ func BuildGoRankPlan(
 	meta *common.VectorIndexMeta,
 	metricKind metric.Metric,
 	clusterIDs []int64,
+	nprobe int,
 	tableAlias string,
 	k int,
 ) (*GoRankPlan, error) {
@@ -92,6 +95,21 @@ func BuildGoRankPlan(
 		qf[i] = math.Float32frombits(bits)
 	}
 
+	switch metricKind {
+	case metric.MetricCosine:
+		n := metric.Norm(qf)
+		if n > 0 {
+			inv := 1.0 / n
+			for i := range qf {
+				qf[i] *= inv
+			}
+		}
+		// If n == 0, leave qf as-is; downstream CosineDistanceUnit will return 1.0
+		// for every comparison, which is the correct "no direction" behaviour.
+	case metric.MetricDot:
+		qf = metric.AugmentQuery(qf, nil)
+	}
+
 	// Resolve alias.
 	alias := tableAlias
 	if alias == "" {
@@ -99,51 +117,42 @@ func BuildGoRankPlan(
 	}
 
 	membersTable := vecindex.MembersTable(meta.IndexName)
+	finalSelectList := sqlparser.String(sel.SelectExprs)
+	finalFromClause := sqlparser.String(sqlparser.TableExprs(sel.From))
+	directPKColumn, directPKLabel := detectDirectPKProjection(sel, alias)
 
-	// CandidateSQL closure: captured here, evaluated only on cache miss. Keeps
-	// the cache-hit hot path free of the ~150 allocs the user-predicate render
-	// costs per query. Capture userPred by pointer — it is read-only from here.
-	//
-	// SELECT `m`.`rowid`, `<alias>`.`<embed>` FROM `<members>` `m`
-	//   JOIN `<base>` `<alias>` ON `<alias>`.`rowid` = `m`.`rowid`
-	//   WHERE (`m`.`cluster_id` = 0 OR `m`.`cluster_id` IN (c1,...))
-	//   [AND (<userPred>)]
+	rowidExpr := sqlparser.String(&sqlparser.ColName{
+		Name:      sqlparser.NewIdentifierCI("rowid"),
+		Qualifier: sqlparser.TableName{Name: sqlparser.NewIdentifierCS(alias)},
+	})
+
+	// CandidateSQL closure: build a sidecar-driven streaming scan over the
+	// probed partitions. The base table is consulted only via EXISTS when a
+	// user predicate is present; the final top-K projection fetches user columns
+	// in a second query by rowid.
 	capturedUserPred := userPred
-	capturedClusterIDs := clusterIDs
-	capturedColumn := meta.ColumnName
-	capturedTable := meta.TableName
 	capturedMembers := membersTable
-	capturedAlias := alias
-	candidateSQL := func() string {
+	capturedFromClause := finalFromClause
+	candidateSQL := func(candidateClusterIDs []int64) string {
 		var sb strings.Builder
-		sb.WriteString("SELECT `m`.`rowid`, `")
-		sb.WriteString(capturedAlias)
-		sb.WriteString("`.`")
-		sb.WriteString(capturedColumn)
-		sb.WriteString("` FROM `")
+		sb.WriteString("SELECT `m`.`rowid`, `m`.`vec` FROM `")
 		sb.WriteString(capturedMembers)
-		sb.WriteString("` `m` JOIN `")
-		sb.WriteString(capturedTable)
-		sb.WriteString("` `")
-		sb.WriteString(capturedAlias)
-		sb.WriteString("` ON `")
-		sb.WriteString(capturedAlias)
-		sb.WriteString("`.`rowid` = `m`.`rowid` WHERE (`m`.`cluster_id` = 0")
-		if len(capturedClusterIDs) > 0 {
-			sb.WriteString(" OR `m`.`cluster_id` IN (")
-			for i, id := range capturedClusterIDs {
-				if i > 0 {
-					sb.WriteByte(',')
-				}
-				sb.WriteString(strconv.FormatInt(id, 10))
+		sb.WriteString("` `m` WHERE `m`.`cluster_id` IN (")
+		for i, id := range clusterIDsWithDelta(candidateClusterIDs) {
+			if i > 0 {
+				sb.WriteByte(',')
 			}
-			sb.WriteByte(')')
+			sb.WriteString(strconv.FormatInt(id, 10))
 		}
 		sb.WriteByte(')')
 		if capturedUserPred != nil {
-			sb.WriteString(" AND (")
+			sb.WriteString(" AND EXISTS (SELECT 1 FROM ")
+			sb.WriteString(capturedFromClause)
+			sb.WriteString(" WHERE ")
+			sb.WriteString(rowidExpr)
+			sb.WriteString(" = `m`.`rowid` AND (")
 			sb.WriteString(sqlparser.String(capturedUserPred))
-			sb.WriteString(")")
+			sb.WriteString("))")
 		}
 		return sb.String()
 	}
@@ -173,13 +182,11 @@ func BuildGoRankPlan(
 		candidateArgFilter = append(candidateArgFilter, rewrittenIdx)
 	}
 
-	// FinalSelectList and FinalFromClause via AST rendering.
-	finalSelectList := sqlparser.String(sel.SelectExprs)
-	finalFromClause := sqlparser.String(sqlparser.TableExprs(sel.From))
-
 	return &GoRankPlan{
+		RawQueryVec:        append([]byte(nil), queryVec...),
 		QueryVec:           qf,
-		MetricKind:         metricKind,
+		RankMetric:         metricKindToRankMetric(metricKind),
+		Nprobe:             nprobe,
 		K:                  k,
 		Database:           meta.Database,
 		BaseTable:          meta.TableName,
@@ -191,32 +198,15 @@ func BuildGoRankPlan(
 		CandidateArgFilter: candidateArgFilter,
 		FinalSelectList:    finalSelectList,
 		FinalFromClause:    finalFromClause,
+		HasUserPredicate:   userPred != nil,
+		DirectPKColumn:     directPKColumn,
+		DirectPKLabel:      directPKLabel,
 	}, nil
 }
-
-// --- min-heap of size K for top-K nearest neighbours ---
 
 type rankItem struct {
 	rowid int64
 	dist  float32
-}
-
-// rankHeap is a max-heap on dist so we can efficiently evict the farthest
-// candidate when the heap exceeds K.
-type rankHeap []rankItem
-
-func (h rankHeap) Len() int           { return len(h) }
-func (h rankHeap) Less(i, j int) bool { return h[i].dist > h[j].dist } // max on top
-func (h rankHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
-func (h *rankHeap) Push(x interface{}) {
-	*h = append(*h, x.(rankItem))
-}
-func (h *rankHeap) Pop() interface{} {
-	old := *h
-	n := len(old)
-	item := old[n-1]
-	*h = old[:n-1]
-	return item
 }
 
 // executeGoRankPlan scans candidate rows, ranks them in Go, then fetches
@@ -225,20 +215,68 @@ func (h *CoordinatorHandler) executeGoRankPlan(
 	plan *GoRankPlan,
 	rewrittenArgs []interface{},
 ) (*protocol.ResultSet, error) {
-	conn, err := h.dbManager.GetDatabaseConnection(plan.Database)
-	if err != nil {
-		return nil, fmt.Errorf("MARMOT-VEC-030: get db for go-rank: %w", err)
+	if plan.AllowCache {
+		if items, ok := h.cacheRank(plan); ok {
+			if rs, ok, err := h.tryDirectPKResult(plan, items); err != nil {
+				return nil, err
+			} else if ok {
+				return rs, nil
+			}
+			// Fall back to base-table projection only when the direct PK fast
+			// path is not applicable.
+			conn, err := h.dbManager.GetDatabaseReadConnection(plan.Database)
+			if err != nil {
+				return nil, fmt.Errorf("MARMOT-VEC-030: get db for go-rank: %w", err)
+			}
+			return h.fetchProjectionByRowID(conn, plan, nil, items)
+		}
 	}
 
-	// Cache-path fast lane (task #16): iterate the in-memory cache to rank
-	// candidates entirely in Go — no SQLite cursor for the hot loop. Falls
-	// through to the SQL candidate scan when the cache is unavailable, the
-	// session disabled it, or the cache epoch lags the active probeState.
-	if plan.UseCache {
-		topK, ok := h.cacheRank(plan)
-		if ok {
-			return h.fetchProjectionByRowID(conn, plan, rewrittenArgs, topK)
+	if items, ok, err := h.packedRank(plan); err != nil {
+		return nil, err
+	} else if ok {
+		if len(items) == 0 {
+			return &protocol.ResultSet{}, nil
 		}
+		if rs, ok, err := h.tryDirectPKResult(plan, items); err != nil {
+			return nil, err
+		} else if ok {
+			return rs, nil
+		}
+		conn, err := h.dbManager.GetDatabaseReadConnection(plan.Database)
+		if err != nil {
+			return nil, fmt.Errorf("MARMOT-VEC-030: get db for go-rank: %w", err)
+		}
+		return h.fetchProjectionByRowID(conn, plan, nil, items)
+	}
+
+	if h.canUseSharedScan(plan) {
+		if items, ok, err := h.sharedScanRank(plan); err != nil {
+			return nil, err
+		} else if ok {
+			if len(items) == 0 {
+				return &protocol.ResultSet{}, nil
+			}
+			if rs, ok, err := h.tryDirectPKResult(plan, items); err != nil {
+				return nil, err
+			} else if ok {
+				return rs, nil
+			}
+			conn, err := h.dbManager.GetDatabaseReadConnection(plan.Database)
+			if err != nil {
+				return nil, fmt.Errorf("MARMOT-VEC-030: get db for go-rank: %w", err)
+			}
+			return h.fetchProjectionByRowID(conn, plan, nil, items)
+		}
+	}
+
+	// Vector read path: use the read-only pool (multiple connections, WAL
+	// concurrent readers). The write handle is single-conn + _txlock=immediate
+	// and would serialise every ranked lookup against every other reader and
+	// any inflight writer — a ~50,000× slowdown on 1M-row benches.
+	conn, err := h.dbManager.GetDatabaseReadConnection(plan.Database)
+	if err != nil {
+		return nil, fmt.Errorf("MARMOT-VEC-030: get db for go-rank: %w", err)
 	}
 
 	// Resolve candidate args from rewrittenArgs.
@@ -253,50 +291,90 @@ func (h *CoordinatorHandler) executeGoRankPlan(
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	rows, err := conn.QueryContext(ctx, plan.CandidateSQL(), candidateArgs...)
+	clusterIDs := h.refreshProbeClusterIDs(plan)
+	rows, err := conn.QueryContext(ctx, plan.CandidateSQL(clusterIDs), candidateArgs...)
 	if err != nil {
 		return nil, fmt.Errorf("MARMOT-VEC-030: candidate query failed: %w", err)
 	}
 	defer rows.Close()
 
 	// Stream rows into max-heap of size K.
-	h2 := &rankHeap{}
-	heap.Init(h2)
+	topK := newTopKHeap(plan.K)
 
 	for rows.Next() {
 		var rowid int64
-		var embedBytes []byte
-		if err := rows.Scan(&rowid, &embedBytes); err != nil {
+		var vecBytes []byte
+		if err := rows.Scan(&rowid, &vecBytes); err != nil {
 			return nil, fmt.Errorf("MARMOT-VEC-030: scan candidate row: %w", err)
 		}
-		if len(embedBytes) != len(plan.QueryVec)*4 {
-			// Skip malformed rows — dimension mismatch.
+		if len(vecBytes) != len(plan.QueryVec)*4 {
 			continue
 		}
-		dist := metric.DistanceFromBytes(plan.MetricKind, plan.QueryVec, embedBytes)
-		item := rankItem{rowid: rowid, dist: dist}
-		if h2.Len() < plan.K {
-			heap.Push(h2, item)
-		} else if dist < (*h2)[0].dist {
-			heap.Pop(h2)
-			heap.Push(h2, item)
+		switch plan.RankMetric {
+		case metric.MetricCosine:
+			topK.Push(rowid, metric.CosineDistanceUnitFromBytes(plan.QueryVec, vecBytes))
+		default:
+			topK.Push(rowid, metric.DistanceFromBytes(plan.RankMetric, plan.QueryVec, vecBytes))
 		}
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("MARMOT-VEC-030: candidate scan error: %w", err)
 	}
 
-	if h2.Len() == 0 {
+	items := topK.Drain()
+	if len(items) == 0 {
 		return &protocol.ResultSet{}, nil
 	}
+	return h.fetchProjectionByRowID(conn, plan, nil, items)
+}
 
-	// Extract top-K in ascending-distance order.
-	topK := make([]rankItem, h2.Len())
-	for i := len(topK) - 1; i >= 0; i-- {
-		topK[i] = heap.Pop(h2).(rankItem)
+func (h *CoordinatorHandler) canUseSharedScan(plan *GoRankPlan) bool {
+	if plan == nil {
+		return false
 	}
+	// v1 batches only the unfiltered, no-cache Go-rank path.
+	return !plan.AllowCache && !plan.HasUserPredicate && len(plan.CandidateArgFilter) == 0
+}
 
-	return h.fetchProjectionByRowID(conn, plan, nil, topK)
+func clusterIDsWithDelta(clusterIDs []int64) []int64 {
+	out := make([]int64, 0, len(clusterIDs)+1)
+	out = append(out, 0)
+	for _, id := range clusterIDs {
+		if id == 0 {
+			continue
+		}
+		out = append(out, id)
+	}
+	return out
+}
+
+func metricKindToRankMetric(m metric.Metric) metric.Metric {
+	if m == metric.MetricDot {
+		return metric.MetricL2
+	}
+	return m
+}
+
+func (h *CoordinatorHandler) refreshProbeClusterIDs(plan *GoRankPlan) []int64 {
+	if plan.ProbeEpoch == 0 || len(plan.RawQueryVec) == 0 || plan.Nprobe <= 0 {
+		return plan.ClusterIDs
+	}
+	provider := h.loadVectorEngine()
+	if provider == nil {
+		return plan.ClusterIDs
+	}
+	type epochProvider interface {
+		TopNprobeClustersWithEpoch(indexName string, vec []byte, n int) ([]int64, uint64, error)
+	}
+	ep, ok := provider.(epochProvider)
+	if !ok {
+		return plan.ClusterIDs
+	}
+	clusterIDs, epoch, err := ep.TopNprobeClustersWithEpoch(plan.IndexName, plan.RawQueryVec, plan.Nprobe)
+	if err != nil || epoch == 0 || epoch == plan.ProbeEpoch {
+		return plan.ClusterIDs
+	}
+	return clusterIDs
 }
 
 // cacheRank executes the Go-side ranking path against the in-memory
@@ -323,49 +401,170 @@ func (h *CoordinatorHandler) cacheRank(plan *GoRankPlan) ([]rankItem, bool) {
 	if cache == nil {
 		return nil, false
 	}
-	// Coherence guard: plan.ClusterIDs were computed against a specific probe
-	// epoch. A REINDEX that already installed a fresh cache under a new epoch
-	// would silently return garbage if we indexed old-epoch cluster IDs into
-	// the new cache. plan.ProbeEpoch==0 means the rewriter could not capture
-	// an epoch (legacy provider); in that case we conservatively fall back.
 	if plan.ProbeEpoch == 0 || cache.Epoch() != plan.ProbeEpoch {
 		return nil, false
 	}
 
-	metricKind := plan.MetricKind
-	qv := plan.QueryVec
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	partitions, err := cache.BulkGetPartitions(ctx, plan.ClusterIDs)
+	if err != nil {
+		return nil, false
+	}
 
-	h2 := &rankHeap{}
-	heap.Init(h2)
-	push := func(entry vecindex.CachedVector) {
-		if len(entry.Vec) != len(qv) {
+	qv := plan.QueryVec
+	heap := newTopKHeap(plan.K)
+
+	// Inline the per-metric distance dispatch so the inner loop stays tight.
+	// For cosine, qv is pre-normalized in BuildGoRankPlan and cached vectors
+	// are pre-normalized in the SQL loader, so CosineDistanceUnit reduces to a
+	// single SIMD dot + subtract.
+	switch plan.RankMetric {
+	case metric.MetricCosine:
+		for _, entry := range cache.DeltaSnapshot() {
+			if len(entry.Vec) == len(qv) {
+				heap.Push(entry.RowID, metric.CosineDistanceUnit(qv, entry.Vec))
+			}
+		}
+		for _, cid := range plan.ClusterIDs {
+			part := partitions[cid]
+			for i, rid := range part.RowIDs {
+				vec := part.Vector(i, len(qv))
+				if len(vec) == len(qv) {
+					heap.Push(rid, metric.CosineDistanceUnit(qv, vec))
+				}
+			}
+		}
+	default:
+		for _, entry := range cache.DeltaSnapshot() {
+			if len(entry.Vec) == len(qv) {
+				heap.Push(entry.RowID, metric.Distance(plan.RankMetric, qv, entry.Vec))
+			}
+		}
+		for _, cid := range plan.ClusterIDs {
+			part := partitions[cid]
+			for i, rid := range part.RowIDs {
+				vec := part.Vector(i, len(qv))
+				if len(vec) == len(qv) {
+					heap.Push(rid, metric.Distance(plan.RankMetric, qv, vec))
+				}
+			}
+		}
+	}
+
+	return heap.Drain(), true
+}
+
+func (h *CoordinatorHandler) packedRank(plan *GoRankPlan) ([]rankItem, bool, error) {
+	if plan == nil || plan.AllowCache || plan.HasUserPredicate {
+		return nil, false, nil
+	}
+	provider := h.loadVectorEngine()
+	if provider == nil {
+		return nil, false, nil
+	}
+	stateProvider, ok := provider.(interface {
+		Lookup(indexName string) (*vecindex.IndexState, bool)
+	})
+	if !ok {
+		return nil, false, nil
+	}
+	state, ok := stateProvider.Lookup(plan.IndexName)
+	if !ok || state == nil {
+		return nil, false, nil
+	}
+	store := state.LoadPackedStore()
+	if store == nil {
+		return nil, false, nil
+	}
+
+	var stableClusterIDs []int64
+	var sqliteClusterIDs []int64
+	for _, cid := range plan.ClusterIDs {
+		if cid <= 0 || state.PackedClusterDirty(cid) {
+			sqliteClusterIDs = append(sqliteClusterIDs, cid)
+			continue
+		}
+		stableClusterIDs = append(stableClusterIDs, cid)
+	}
+
+	topK := newTopKHeap(plan.K)
+	push := func(rowid int64, vecBytes []byte) {
+		if len(vecBytes) != len(plan.QueryVec)*4 {
 			return
 		}
-		dist := metric.Distance(metricKind, qv, entry.Vec)
-		item := rankItem{rowid: entry.RowID, dist: dist}
-		if h2.Len() < plan.K {
-			heap.Push(h2, item)
-		} else if dist < (*h2)[0].dist {
-			heap.Pop(h2)
-			heap.Push(h2, item)
+		switch plan.RankMetric {
+		case metric.MetricCosine:
+			topK.Push(rowid, metric.CosineDistanceUnitFromBytes(plan.QueryVec, vecBytes))
+		default:
+			topK.Push(rowid, metric.DistanceFromBytes(plan.RankMetric, plan.QueryVec, vecBytes))
 		}
 	}
 
-	// cluster_id=0 holds delta rows — always probed to preserve recall.
-	for _, entry := range cache.Cluster(0) {
-		push(entry)
-	}
-	for _, cid := range plan.ClusterIDs {
-		for _, entry := range cache.Cluster(cid) {
-			push(entry)
+	store.ScanClusters(stableClusterIDs, func(rowid int64, vecBytes []byte) bool {
+		push(rowid, vecBytes)
+		return true
+	})
+
+	if delta := state.LoadResidentDelta(); delta != nil {
+		switch plan.RankMetric {
+		case metric.MetricCosine:
+			for _, entry := range delta.Snapshot() {
+				if len(entry.Vec) == len(plan.QueryVec) {
+					topK.Push(entry.RowID, metric.CosineDistanceUnit(plan.QueryVec, entry.Vec))
+				}
+			}
+		default:
+			for _, entry := range delta.Snapshot() {
+				if len(entry.Vec) == len(plan.QueryVec) {
+					topK.Push(entry.RowID, metric.Distance(plan.RankMetric, plan.QueryVec, entry.Vec))
+				}
+			}
 		}
 	}
 
-	topK := make([]rankItem, h2.Len())
-	for i := len(topK) - 1; i >= 0; i-- {
-		topK[i] = heap.Pop(h2).(rankItem)
+	if len(sqliteClusterIDs) == 0 {
+		return topK.Drain(), true, nil
 	}
-	return topK, true
+
+	conn, err := h.dbManager.GetDatabaseReadConnection(plan.Database)
+	if err != nil {
+		return nil, false, fmt.Errorf("MARMOT-VEC-030: get db for packed rank: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := scanVecSharedClusters(ctx, conn, plan.IndexName, sqliteClusterIDs, func(_cid, rowid int64, vecBytes []byte) error {
+		push(rowid, vecBytes)
+		return nil
+	}); err != nil {
+		return nil, false, fmt.Errorf("MARMOT-VEC-030: packed rank delta scan: %w", err)
+	}
+
+	return topK.Drain(), true, nil
+}
+
+func (h *CoordinatorHandler) tryDirectPKResult(
+	plan *GoRankPlan,
+	topK []rankItem,
+) (*protocol.ResultSet, bool, error) {
+	if len(topK) == 0 || plan.DirectPKColumn == "" {
+		return nil, false, nil
+	}
+	pk, err := h.dbManager.GetAutoIncrementColumn(plan.Database, plan.BaseTable)
+	if err != nil {
+		return nil, false, nil
+	}
+	if pk != plan.DirectPKColumn {
+		return nil, false, nil
+	}
+	rows := make([][]interface{}, len(topK))
+	for i, item := range topK {
+		rows[i] = []interface{}{item.rowid}
+	}
+	return &protocol.ResultSet{
+		Columns: []protocol.ColumnDef{{Name: plan.DirectPKLabel, Type: 0xFD}},
+		Rows:    rows,
+	}, true, nil
 }
 
 // fetchProjectionByRowID issues the final SELECT that projects the user's
@@ -382,6 +581,11 @@ func (h *CoordinatorHandler) fetchProjectionByRowID(
 ) (*protocol.ResultSet, error) {
 	if len(topK) == 0 {
 		return &protocol.ResultSet{}, nil
+	}
+	if rs, ok, err := h.tryDirectPKResult(plan, topK); err != nil {
+		return nil, err
+	} else if ok {
+		return rs, nil
 	}
 
 	alias := plan.alias()
@@ -452,6 +656,27 @@ func (h *CoordinatorHandler) fetchProjectionByRowID(
 		Columns: colDefs,
 		Rows:    resultRows,
 	}, nil
+}
+
+func detectDirectPKProjection(sel *sqlparser.Select, alias string) (column, label string) {
+	if len(sel.From) != 1 || sel.SelectExprs == nil || len(sel.SelectExprs.Exprs) != 1 {
+		return "", ""
+	}
+	expr, ok := sel.SelectExprs.Exprs[0].(*sqlparser.AliasedExpr)
+	if !ok {
+		return "", ""
+	}
+	col, ok := expr.Expr.(*sqlparser.ColName)
+	if !ok {
+		return "", ""
+	}
+	if !col.Qualifier.IsEmpty() && col.Qualifier.Name.String() != alias {
+		return "", ""
+	}
+	if !expr.As.IsEmpty() {
+		return col.Name.String(), expr.As.String()
+	}
+	return col.Name.String(), col.Name.String()
 }
 
 // findArgIndices walks sel once in document order, numbering all Argument

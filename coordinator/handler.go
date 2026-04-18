@@ -44,6 +44,9 @@ type DatabaseManager interface {
 	CreateDatabase(name string) error
 	DropDatabase(name string) error
 	GetDatabaseConnection(name string) (*sql.DB, error)
+	// GetDatabaseReadConnection returns the read-only connection pool for a database.
+	// Reads should use this; writes must use GetDatabaseConnection (single-writer).
+	GetDatabaseReadConnection(name string) (*sql.DB, error)
 	// GetReplicatedDatabase returns the ReplicatedDatabase for executing with hooks
 	GetReplicatedDatabase(name string) (ReplicatedDatabaseProvider, error)
 	// GetAutoIncrementColumn returns the auto-increment column name for a table.
@@ -182,19 +185,21 @@ type PublisherRegistry interface {
 // CoordinatorHandler implements protocol.ConnectionHandler
 // It routes queries to the appropriate coordinator (Read or Write)
 type CoordinatorHandler struct {
-	nodeID            uint64
-	writeCoord        *WriteCoordinator
-	readCoord         *ReadCoordinator
-	clock             *hlc.Clock
-	dbManager         DatabaseManager
-	ddlLockMgr        *DDLLockManager
-	schemaVersionMgr  SchemaVersionManager
-	nodeRegistry      NodeRegistry
-	metadata          *handlers.MetadataHandler
-	recentTxnIDs      sync.Map // txn_id -> conn_id for duplicate detection
-	publisherRegistry PublisherRegistry
-	publisherMu       sync.RWMutex
-	draining          atomic.Bool
+	nodeID                    uint64
+	writeCoord                *WriteCoordinator
+	readCoord                 *ReadCoordinator
+	clock                     *hlc.Clock
+	dbManager                 DatabaseManager
+	ddlLockMgr                *DDLLockManager
+	schemaVersionMgr          SchemaVersionManager
+	nodeRegistry              NodeRegistry
+	metadata                  *handlers.MetadataHandler
+	recentTxnIDs              sync.Map // txn_id -> conn_id for duplicate detection
+	publisherRegistry         PublisherRegistry
+	publisherMu               sync.RWMutex
+	draining                  atomic.Bool
+	vecGoRankTemplates        sync.Map
+	vecSharedScanCoordinators sync.Map
 
 	// vecEngine is the VectorUDFProvider used by the vector-query rewriter
 	// (see coordinator/vec_rewrite.go). It is set once at startup via

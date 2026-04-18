@@ -141,6 +141,42 @@ func TestRewrite_ValidVectorQuery(t *testing.T) {
 	require.Equal(t, "cosine", info.Metric)
 }
 
+func TestRewrite_GoRankEnablesCacheOnlyWithoutUserPredicate(t *testing.T) {
+	t.Parallel()
+
+	sess := defaultSession()
+	sess.useGoRank = true
+	sess.useCache = true
+
+	stmt := parseSQL(t, `SELECT id FROM docs
+		WHERE vec_match(embed, ?, 10)
+		ORDER BY vec_distance(embed, ?)
+		LIMIT 10`)
+	info, err := RewriteVectorQuery(stmt, make([]byte, 16), sess, defaultEngine(), defaultLookup())
+	require.NoError(t, err)
+	require.NotNil(t, info)
+	require.NotNil(t, info.GoRank)
+	require.True(t, info.GoRank.AllowCache)
+}
+
+func TestRewrite_GoRankDisablesCacheWithUserPredicate(t *testing.T) {
+	t.Parallel()
+
+	sess := defaultSession()
+	sess.useGoRank = true
+	sess.useCache = true
+
+	stmt := parseSQL(t, `SELECT id FROM docs
+		WHERE vec_match(embed, ?, 10) AND status = 'published'
+		ORDER BY vec_distance(embed, ?)
+		LIMIT 10`)
+	info, err := RewriteVectorQuery(stmt, make([]byte, 16), sess, defaultEngine(), defaultLookup())
+	require.NoError(t, err)
+	require.NotNil(t, info)
+	require.NotNil(t, info.GoRank)
+	require.False(t, info.GoRank.AllowCache)
+}
+
 // 2. Detection negative: SELECT without vec_match → returns (nil, nil).
 func TestRewrite_NoVecMatch_ReturnsNil(t *testing.T) {
 	t.Parallel()

@@ -54,3 +54,4 @@ plan/
 
 # Python bytecode in vecindex scripts
 modules/vecindex/scripts/__pycache__/
+vec-bench

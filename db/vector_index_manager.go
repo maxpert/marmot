@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"fmt"
 	"math"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -59,6 +61,8 @@ type EngineProvider interface {
 
 // VectorIndexMeta is an alias for the shared common.VectorIndexMeta.
 type VectorIndexMeta = common.VectorIndexMeta
+
+const defaultTargetPartitionSize = 100
 
 // VectorIndexManager manages vector index DDL lifecycle in SQLite.
 // It owns:
@@ -166,17 +170,29 @@ func (m *VectorIndexManager) CreateIndex(ctx context.Context, meta VectorIndexMe
 		return err
 	}
 
+	meta.AutoTuneNlist = meta.Nlist == 0
+	meta.AutoTuneNprobe = meta.Nprobe == 0
+	if meta.TargetPartitionSize <= 0 {
+		meta.TargetPartitionSize = defaultTargetPartitionSize
+	}
+
 	// Auto-tune nlist and nprobe if not user-supplied (design §6.1).
-	if meta.Nlist == 0 || meta.Nprobe == 0 {
+	if meta.AutoTuneNlist || meta.AutoTuneNprobe {
 		n, err := countRows(ctx, conn, meta.TableName)
 		if err != nil {
 			return fmt.Errorf("vector index: count rows for auto-tune: %w", err)
 		}
-		if meta.Nlist == 0 {
+		if meta.AutoTuneNlist {
 			meta.Nlist = autoTuneNlist(n)
 		}
-		if meta.Nprobe == 0 {
+		if meta.AutoTuneNprobe {
 			meta.Nprobe = autoTuneNprobe(meta.Nlist)
+		}
+		// Only preserve the auto flags when CREATE happened against an empty
+		// table; otherwise the parameters already reflect a meaningful corpus.
+		if n > 0 {
+			meta.AutoTuneNlist = false
+			meta.AutoTuneNprobe = false
 		}
 	}
 
@@ -327,8 +343,17 @@ func (m *VectorIndexManager) ReindexIndex(ctx context.Context, indexName string)
 		m.setCachedStatus(meta.Database, meta.TableName, meta.ColumnName, "ready")
 		return fmt.Errorf("vector reindex: pipeline: %w", err)
 	}
-	// Pipeline's swap txn already set status='ready' — refresh the cache.
-	m.setCachedStatus(meta.Database, meta.TableName, meta.ColumnName, "ready")
+	// Pipeline's swap txn already updated metadata; refresh the cache.
+	if refreshed, err := loadIndexMetaByName(ctx, conn, indexName); err != nil {
+		log.Warn().Err(err).Str("index", indexName).
+			Msg("VectorIndexManager: failed to refresh metadata after REINDEX; retaining cached values")
+		m.setCachedStatus(meta.Database, meta.TableName, meta.ColumnName, "ready")
+	} else {
+		key := indexCacheKey{database: refreshed.Database, table: refreshed.TableName, column: refreshed.ColumnName}
+		m.cacheMu.Lock()
+		m.indexCache[key] = refreshed
+		m.cacheMu.Unlock()
+	}
 
 	log.Info().Str("index", indexName).Msg("VectorIndexManager: REINDEX complete")
 	return nil
@@ -358,6 +383,31 @@ func (m *VectorIndexManager) setCachedStatus(database, table, column, status str
 	if v, ok := m.indexCache[key]; ok {
 		v.Status = status
 	}
+}
+
+func loadIndexMetaByName(ctx context.Context, conn *sql.DB, indexName string) (*VectorIndexMeta, error) {
+	row := conn.QueryRowContext(ctx, `
+		SELECT index_name, table_name, column_name, database_name,
+		       metric, dim, nlist, nprobe, auto_nlist, auto_nprobe,
+		       target_partition_size, max_norm, status
+		  FROM __marmot_vector_indexes
+		 WHERE index_name = ?`, indexName)
+	var (
+		meta       VectorIndexMeta
+		autoNlist  int64
+		autoNprobe int64
+	)
+	if err := row.Scan(
+		&meta.IndexName, &meta.TableName, &meta.ColumnName, &meta.Database,
+		&meta.Metric, &meta.Dim, &meta.Nlist, &meta.Nprobe,
+		&autoNlist, &autoNprobe, &meta.TargetPartitionSize,
+		&meta.MaxNorm, &meta.Status,
+	); err != nil {
+		return nil, err
+	}
+	meta.AutoTuneNlist = autoNlist != 0
+	meta.AutoTuneNprobe = autoNprobe != 0
+	return &meta, nil
 }
 
 // updateIndexStatus executes a short UPDATE on the metadata row. Shared by
@@ -434,11 +484,22 @@ func (m *VectorIndexManager) execCreateDDL(ctx context.Context, conn *sql.DB, me
 	centroids := vecindex.CentroidsTable(idx)
 	members := vecindex.MembersTable(idx)
 	membersIdx := vecindex.MembersRowidIndex(idx)
+	membersRowidUQ := vecindex.MembersRowidUniqueIndex(idx)
 	trgAI := vecindex.TriggerInsert(idx)
 	trgAU := vecindex.TriggerUpdate(idx)
 	trgAD := vecindex.TriggerDelete(idx)
 	trgCentAI := vecindex.TriggerCentroidChange(idx)
 	trgCentAU := vecindex.TriggerCentroidsVersionUpdate(idx)
+	metricKind, err := metricFromString(meta.Metric)
+	if err != nil {
+		return fmt.Errorf("vector index: parse metric for DDL: %w", err)
+	}
+	metricCode := strconv.FormatInt(int64(metricKind), 10)
+	dimLit := strconv.Itoa(meta.Dim)
+	maxNormLit := strconv.FormatFloat(float64(meta.MaxNorm), 'g', -1, 32)
+	if !strings.ContainsAny(maxNormLit, ".eE") {
+		maxNormLit += ".0"
+	}
 
 	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
@@ -466,27 +527,36 @@ func (m *VectorIndexManager) execCreateDDL(ctx context.Context, conn *sql.DB, me
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS "%s" (
 			cluster_id INTEGER NOT NULL,
 			rowid      INTEGER NOT NULL,
+			vec        BLOB    NOT NULL,
 			PRIMARY KEY (cluster_id, rowid)
 		) WITHOUT ROWID`, members),
 
 		// Secondary index for fast rowid lookups during UPDATE/DELETE.
 		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS "%s" ON "%s"(rowid)`,
 			membersIdx, members),
+		fmt.Sprintf(`CREATE UNIQUE INDEX IF NOT EXISTS "%s" ON "%s"(rowid)`,
+			membersRowidUQ, members),
 
 		// AFTER INSERT trigger: newly inserted rows enter delta (cluster_id=0).
 		fmt.Sprintf(`CREATE TRIGGER IF NOT EXISTS "%s"
 			AFTER INSERT ON "%s" WHEN NEW."%s" IS NOT NULL
 			BEGIN
-				INSERT INTO "%s" (cluster_id, rowid) VALUES (0, NEW.rowid);
-			END`, trgAI, tbl, col, members),
+				INSERT INTO "%s" (cluster_id, rowid, vec)
+				SELECT 0, NEW.rowid, mv
+				FROM (SELECT __marmot_vec_materialize(NEW."%s", %s, %s, %s) AS mv)
+				WHERE mv IS NOT NULL;
+			END`, trgAI, tbl, col, members, col, metricCode, dimLit, maxNormLit),
 
-		// AFTER UPDATE trigger: remove old assignment, re-enter delta.
+		// AFTER UPDATE trigger: remove old assignment, conditionally re-enter delta.
 		fmt.Sprintf(`CREATE TRIGGER IF NOT EXISTS "%s"
-			AFTER UPDATE OF "%s" ON "%s" WHEN NEW."%s" IS NOT NULL
+			AFTER UPDATE OF "%s" ON "%s"
 			BEGIN
 				DELETE FROM "%s" WHERE rowid = OLD.rowid;
-				INSERT INTO "%s" (cluster_id, rowid) VALUES (0, NEW.rowid);
-			END`, trgAU, col, tbl, col, members, members),
+				INSERT INTO "%s" (cluster_id, rowid, vec)
+				SELECT 0, NEW.rowid, mv
+				FROM (SELECT __marmot_vec_materialize(NEW."%s", %s, %s, %s) AS mv)
+				WHERE NEW."%s" IS NOT NULL AND mv IS NOT NULL;
+			END`, trgAU, col, tbl, members, members, col, metricCode, dimLit, maxNormLit, col),
 
 		// AFTER DELETE trigger: remove from members entirely.
 		fmt.Sprintf(`CREATE TRIGGER IF NOT EXISTS "%s"
@@ -512,8 +582,9 @@ func (m *VectorIndexManager) execCreateDDL(ctx context.Context, conn *sql.DB, me
 		// Metadata row — status='building'; engine flips to 'ready' after populate.
 		fmt.Sprintf(`INSERT INTO __marmot_vector_indexes
 			(index_name, table_name, column_name, database_name, metric, dim,
-			 nlist, nprobe, max_norm, status, created_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'building', ?)
+			 nlist, nprobe, auto_nlist, auto_nprobe, target_partition_size,
+			 max_norm, status, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'building', ?)
 			ON CONFLICT(index_name) DO NOTHING`),
 	}
 
@@ -527,7 +598,9 @@ func (m *VectorIndexManager) execCreateDDL(ctx context.Context, conn *sql.DB, me
 	// Metadata INSERT with bound parameters.
 	if _, err := tx.ExecContext(ctx, stmts[len(stmts)-1],
 		meta.IndexName, meta.TableName, meta.ColumnName, meta.Database,
-		meta.Metric, meta.Dim, meta.Nlist, meta.Nprobe, meta.MaxNorm,
+		meta.Metric, meta.Dim, meta.Nlist, meta.Nprobe,
+		boolToInt(meta.AutoTuneNlist), boolToInt(meta.AutoTuneNprobe),
+		meta.TargetPartitionSize, meta.MaxNorm,
 		meta.CreatedAt,
 	); err != nil {
 		return fmt.Errorf("vector index: insert metadata: %w", err)
@@ -604,22 +677,30 @@ func (m *VectorIndexManager) loadExistingIndexes(ctx context.Context) error {
 
 		rows, err := conn.QueryContext(ctx, `
 			SELECT index_name, table_name, column_name, database_name,
-			       metric, dim, nlist, nprobe, max_norm, status
+			       metric, dim, nlist, nprobe, auto_nlist, auto_nprobe,
+			       target_partition_size, max_norm, status
 			FROM __marmot_vector_indexes`)
 		if err != nil {
 			log.Warn().Err(err).Str("database", dbName).Msg("VectorIndexManager: failed to query existing indexes")
 			continue
 		}
 		for rows.Next() {
-			var meta VectorIndexMeta
+			var (
+				meta       VectorIndexMeta
+				autoNlist  int64
+				autoNprobe int64
+			)
 			if err := rows.Scan(
 				&meta.IndexName, &meta.TableName, &meta.ColumnName, &meta.Database,
-				&meta.Metric, &meta.Dim, &meta.Nlist, &meta.Nprobe, &meta.MaxNorm,
-				&meta.Status,
+				&meta.Metric, &meta.Dim, &meta.Nlist, &meta.Nprobe,
+				&autoNlist, &autoNprobe, &meta.TargetPartitionSize,
+				&meta.MaxNorm, &meta.Status,
 			); err != nil {
 				log.Warn().Err(err).Msg("VectorIndexManager: failed to scan index row")
 				continue
 			}
+			meta.AutoTuneNlist = autoNlist != 0
+			meta.AutoTuneNprobe = autoNprobe != 0
 			key := indexCacheKey{database: meta.Database, table: meta.TableName, column: meta.ColumnName}
 			metaCopy := meta
 			m.cacheMu.Lock()
@@ -663,9 +744,26 @@ func (m *VectorIndexManager) GetIndexByColumn(database, table, column string) (*
 }
 
 // EstimatedRowCount returns an approximate row count for (database, table).
-// The result is cached with a 1-minute TTL; on cache miss a SELECT COUNT(*)
-// is executed with a short timeout. Returns 100_000 on any error so the
+// The result is cached with a 1-minute TTL; on cache miss MAX(rowid) is
+// queried against the read pool. Returns 100_000 on any error so the
 // planner degrades gracefully.
+//
+// We use MAX(rowid), not COUNT(*). On a table with INTEGER PRIMARY KEY
+// rowid SQLite answers MAX(rowid) via a single right-descent of the PK
+// btree — O(log n) page reads, typically sub-millisecond. COUNT(*) has to
+// walk every leaf page and on a 1M-row × 6KB-blob table can easily exceed
+// 1 second (observed ~1.2 s uncached on DBpedia-1M). The planner only needs
+// an estimate for cardinality comparisons (pre- vs post-filter), so this
+// upper-bound approximation is strictly better — it avoids a pathological
+// 2 s stall on every vec_match rewrite when the cached row-count has
+// expired or could not be populated within the query timeout.
+//
+// Edge cases:
+//   - Empty table: MAX(rowid) → NULL. We surface 0 via sql.NullInt64.
+//   - Rowids with gaps from DELETEs: estimate is an upper bound, which is
+//     safe for selectivity comparisons.
+//   - Tables without INTEGER PRIMARY KEY: rowid still exists as an alias
+//     and MAX(rowid) still returns the largest assigned rowid.
 func (m *VectorIndexManager) EstimatedRowCount(database, table string) int64 {
 	key := indexCacheKey{database: database, table: table}
 
@@ -676,7 +774,7 @@ func (m *VectorIndexManager) EstimatedRowCount(database, table string) int64 {
 	}
 	m.cacheMu.RUnlock()
 
-	conn, err := m.dbMgr.GetDatabaseConnection(database)
+	conn, err := m.dbMgr.GetDatabaseReadConnection(database)
 	if err != nil {
 		return 100_000
 	}
@@ -684,11 +782,15 @@ func (m *VectorIndexManager) EstimatedRowCount(database, table string) int64 {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	var n int64
+	var maxRowID sql.NullInt64
 	if err := conn.QueryRowContext(ctx,
-		fmt.Sprintf(`SELECT COUNT(*) FROM "%s"`, escapeQuote(table)),
-	).Scan(&n); err != nil {
+		fmt.Sprintf(`SELECT MAX(rowid) FROM "%s"`, escapeQuote(table)),
+	).Scan(&maxRowID); err != nil {
 		return 100_000
+	}
+	n := int64(0)
+	if maxRowID.Valid {
+		n = maxRowID.Int64
 	}
 
 	m.cacheMu.Lock()
@@ -705,6 +807,13 @@ func countRows(ctx context.Context, db *sql.DB, tableName string) (int64, error)
 		fmt.Sprintf(`SELECT COUNT(*) FROM "%s"`, escapeQuote(tableName)),
 	).Scan(&n)
 	return n, err
+}
+
+func boolToInt(v bool) int {
+	if v {
+		return 1
+	}
+	return 0
 }
 
 // autoTuneNlist computes nlist = clamp(4·√n, 64, 2048) per design §6.1.

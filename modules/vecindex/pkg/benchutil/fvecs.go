@@ -9,6 +9,8 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"syscall"
+	"unsafe"
 )
 
 // DatasetMetadata describes an ANN benchmark dataset.
@@ -18,6 +20,154 @@ type DatasetMetadata struct {
 	Dim    int    `json:"dim"`
 	Metric string `json:"metric"`
 	K      int    `json:"k"`
+}
+
+// MMapFvecs is a memory-mapped .fvecs dataset. Vectors are exposed as slices
+// backed directly by the mapped file so the OS can page them on demand.
+type MMapFvecs struct {
+	file    *os.File
+	data    []byte
+	dim     int
+	n       int
+	recSize int
+}
+
+// OpenMMapFvecs opens and memory-maps an .fvecs file.
+func OpenMMapFvecs(path string) (*MMapFvecs, error) {
+	file, data, dim, n, recSize, err := mmapVecFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return &MMapFvecs{
+		file:    file,
+		data:    data,
+		dim:     dim,
+		n:       n,
+		recSize: recSize,
+	}, nil
+}
+
+func (m *MMapFvecs) Len() int { return m.n }
+func (m *MMapFvecs) Dim() int { return m.dim }
+
+// VectorBytes returns the raw little-endian float32 payload for vector i.
+func (m *MMapFvecs) VectorBytes(i int) []byte {
+	start := i*m.recSize + 4
+	end := start + m.dim*4
+	return m.data[start:end:end]
+}
+
+// Vector returns vector i as a []float32 backed by the mapped file.
+func (m *MMapFvecs) Vector(i int) []float32 {
+	b := m.VectorBytes(i)
+	if len(b) == 0 {
+		return nil
+	}
+	return unsafe.Slice((*float32)(unsafe.Pointer(&b[0])), len(b)/4)
+}
+
+// Close unmaps the file and closes the underlying descriptor.
+func (m *MMapFvecs) Close() error {
+	return closeMappedFile(m.file, m.data)
+}
+
+// MMapIvecs is a memory-mapped .ivecs dataset.
+type MMapIvecs struct {
+	file    *os.File
+	data    []byte
+	dim     int
+	n       int
+	recSize int
+}
+
+// OpenMMapIvecs opens and memory-maps an .ivecs file.
+func OpenMMapIvecs(path string) (*MMapIvecs, error) {
+	file, data, dim, n, recSize, err := mmapVecFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return &MMapIvecs{
+		file:    file,
+		data:    data,
+		dim:     dim,
+		n:       n,
+		recSize: recSize,
+	}, nil
+}
+
+func (m *MMapIvecs) Len() int { return m.n }
+func (m *MMapIvecs) Dim() int { return m.dim }
+
+// Vector returns vector i as a []int32 backed by the mapped file.
+func (m *MMapIvecs) Vector(i int) []int32 {
+	start := i*m.recSize + 4
+	end := start + m.dim*4
+	b := m.data[start:end:end]
+	if len(b) == 0 {
+		return nil
+	}
+	return unsafe.Slice((*int32)(unsafe.Pointer(&b[0])), len(b)/4)
+}
+
+// Close unmaps the file and closes the underlying descriptor.
+func (m *MMapIvecs) Close() error {
+	return closeMappedFile(m.file, m.data)
+}
+
+func mmapVecFile(path string) (*os.File, []byte, int, int, int, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, nil, 0, 0, 0, err
+	}
+
+	info, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, nil, 0, 0, 0, err
+	}
+	fileSize := info.Size()
+	if fileSize == 0 {
+		return f, nil, 0, 0, 0, nil
+	}
+
+	var dim32 int32
+	if err := binary.Read(f, binary.LittleEndian, &dim32); err != nil {
+		f.Close()
+		return nil, nil, 0, 0, 0, err
+	}
+	if dim32 <= 0 {
+		f.Close()
+		return nil, nil, 0, 0, 0, fmt.Errorf("vecs: invalid dimension %d", dim32)
+	}
+
+	recSize := int64(4 + dim32*4)
+	if fileSize%recSize != 0 {
+		f.Close()
+		return nil, nil, 0, 0, 0, fmt.Errorf("vecs: file size %d not divisible by record size %d", fileSize, recSize)
+	}
+
+	data, err := syscall.Mmap(int(f.Fd()), 0, int(fileSize), syscall.PROT_READ, syscall.MAP_SHARED)
+	if err != nil {
+		f.Close()
+		return nil, nil, 0, 0, 0, err
+	}
+
+	return f, data, int(dim32), int(fileSize / recSize), int(recSize), nil
+}
+
+func closeMappedFile(file *os.File, data []byte) error {
+	var firstErr error
+	if data != nil {
+		if err := syscall.Munmap(data); err != nil {
+			firstErr = err
+		}
+	}
+	if file != nil {
+		if err := file.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 // ReadFvecs reads an .fvecs file and returns a slice of float32 vectors.

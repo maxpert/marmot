@@ -1,6 +1,7 @@
 package coordinator
 
 import (
+	"errors"
 	"fmt"
 	"strconv"
 
@@ -176,7 +177,11 @@ func RewriteVectorQuery(
 			clusterIDs, err = engine.TopNprobeClusters(meta.IndexName, queryVec, nprobe)
 		}
 		if err != nil {
-			return nil, fmt.Errorf("MARMOT-VEC-023: top-n probe clusters failed: %w", err)
+			if !errors.Is(err, vecindex.ErrNoCentroidsLoaded) {
+				return nil, fmt.Errorf("MARMOT-VEC-023: top-n probe clusters failed: %w", err)
+			}
+			clusterIDs = nil
+			probeEpoch = 0
 		}
 		info.ClusterIDs = clusterIDs
 
@@ -202,6 +207,7 @@ func RewriteVectorQuery(
 				meta,
 				metricKindFromString(metricSuffix),
 				clusterIDs,
+				nprobe,
 				vm.tableRef,
 				limitK,
 			)
@@ -209,8 +215,8 @@ func RewriteVectorQuery(
 				return nil, grErr
 			}
 			goRank.Database = meta.Database
-			goRank.UseCache = session.UseCache()
 			goRank.ProbeEpoch = probeEpoch
+			goRank.AllowCache = session.UseCache() && userPred == nil
 			info.GoRank = goRank
 		}
 	}

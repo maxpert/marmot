@@ -1,10 +1,12 @@
 package vecindex
 
 import (
+	"context"
 	"sync"
 	"testing"
 
 	"github.com/maxpert/marmot/modules/vecindex/pkg/kmeans"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -17,25 +19,54 @@ func newCacheTestState(t *testing.T) *IndexState {
 	return NewIndexState(spec, cs)
 }
 
-func TestVectorCache_EmptyLookup(t *testing.T) {
-	t.Parallel()
-	c := NewVectorCache(1, nil)
-	require.Zero(t, c.Len())
-	require.Nil(t, c.Cluster(42))
+// makeTestCache builds a VectorCache preloaded from seed. The backing
+// PartitionCache uses a fakeLoader so any cache miss (post-invalidate or
+// post-eviction) reloads from seed.
+func makeTestCache(t *testing.T, epoch uint64, dim int, seed map[int64]CachedPartition) *VectorCache {
+	t.Helper()
+	loader := &fakeLoader{data: map[int64]CachedPartition{}}
+	for cid, part := range seed {
+		loader.data[cid] = part
+	}
+	pc, err := NewPartitionCache(PartitionCacheOptions{
+		MaxBytes: 16 << 20, Dim: dim, Epoch: epoch, Loader: loader,
+	})
+	require.NoError(t, err)
+	return NewVectorCache(epoch, pc, NewDeltaBuffer())
 }
 
-func TestVectorCache_ClusterRetrieval(t *testing.T) {
+func TestVectorCache_NilSafety(t *testing.T) {
 	t.Parallel()
-	entries := map[int64][]CachedVector{
-		1: {{RowID: 10, Vec: []float32{1, 2, 3}}},
-		2: {{RowID: 20, Vec: []float32{4, 5, 6}}, {RowID: 21, Vec: []float32{7, 8, 9}}},
-	}
-	c := NewVectorCache(5, entries)
-	require.Equal(t, 3, c.Len())
-	require.Equal(t, 2, c.ClusterCount())
-	require.Equal(t, int64(10), c.Cluster(1)[0].RowID)
-	require.Len(t, c.Cluster(2), 2)
-	require.Equal(t, uint64(5), c.Epoch())
+	var c *VectorCache
+	assert.Equal(t, uint64(0), c.Epoch())
+	assert.Nil(t, c.Partitions())
+	assert.Nil(t, c.Delta())
+	assert.Nil(t, c.DeltaSnapshot())
+	got, err := c.BulkGetPartitions(context.Background(), []int64{1})
+	require.NoError(t, err)
+	assert.Nil(t, got)
+}
+
+func TestVectorCache_BulkGetPartitionsAndDelta(t *testing.T) {
+	t.Parallel()
+	c := makeTestCache(t, 5, 3, map[int64]CachedPartition{
+		1: makePartition(CachedVector{RowID: 10, Vec: []float32{1, 2, 3}}),
+		2: makePartition(
+			CachedVector{RowID: 20, Vec: []float32{4, 5, 6}},
+			CachedVector{RowID: 21, Vec: []float32{7, 8, 9}},
+		),
+	})
+	c.Delta().Append(CachedVector{RowID: 99, Vec: []float32{0, 0, 1}})
+
+	got, err := c.BulkGetPartitions(context.Background(), []int64{1, 2})
+	require.NoError(t, err)
+	assert.Equal(t, 1, got[1].Len())
+	assert.Equal(t, 2, got[2].Len())
+	assert.Equal(t, uint64(5), c.Epoch())
+
+	d := c.DeltaSnapshot()
+	require.Len(t, d, 1)
+	assert.Equal(t, int64(99), d[0].RowID)
 }
 
 func TestIndexState_StoreAndLoadCache(t *testing.T) {
@@ -43,8 +74,8 @@ func TestIndexState_StoreAndLoadCache(t *testing.T) {
 	s := newCacheTestState(t)
 	require.Nil(t, s.LoadCache())
 
-	c := NewVectorCache(7, map[int64][]CachedVector{
-		1: {{RowID: 1, Vec: []float32{1, 0, 0}}},
+	c := makeTestCache(t, 7, 3, map[int64]CachedPartition{
+		1: makePartition(CachedVector{RowID: 1, Vec: []float32{1, 0, 0}}),
 	})
 	s.StoreCache(c)
 	require.Same(t, c, s.LoadCache())
@@ -53,97 +84,194 @@ func TestIndexState_StoreAndLoadCache(t *testing.T) {
 	require.Nil(t, s.LoadCache())
 }
 
-func TestIndexState_CacheInsertBatch_EpochGate(t *testing.T) {
+func TestIndexState_StoreResidentDelta(t *testing.T) {
+	t.Parallel()
+
+	s := newCacheTestState(t)
+	delta := NewDeltaBuffer()
+	delta.AppendBatch([]CachedVector{
+		{RowID: 10, Vec: []float32{1, 0, 0}},
+		{RowID: 11, Vec: []float32{0, 1, 0}},
+	})
+
+	s.StoreResidentDelta(delta)
+
+	got := s.LoadResidentDelta()
+	require.NotNil(t, got)
+	assert.Equal(t, []CachedVector{
+		{RowID: 10, Vec: []float32{1, 0, 0}},
+		{RowID: 11, Vec: []float32{0, 1, 0}},
+	}, got.Snapshot())
+}
+
+func TestIndexState_CacheInsertBatch_RemovesResidentDeltaWithoutCache(t *testing.T) {
+	t.Parallel()
+
+	s := newCacheTestState(t)
+	delta := NewDeltaBuffer()
+	delta.AppendBatch([]CachedVector{
+		{RowID: 10, Vec: []float32{1, 0, 0}},
+		{RowID: 11, Vec: []float32{0, 1, 0}},
+	})
+	s.StoreResidentDelta(delta)
+
+	s.CacheInsertBatch(7, []CacheEntry{
+		{ClusterID: 2, RowID: 10, Vec: []float32{1, 0, 0}},
+	})
+
+	require.Equal(t, []CachedVector{
+		{RowID: 11, Vec: []float32{0, 1, 0}},
+	}, s.LoadResidentDelta().Snapshot())
+}
+
+func TestIndexState_CacheInsertBatch_InvalidatesPartitionsAndDelta(t *testing.T) {
 	t.Parallel()
 	s := newCacheTestState(t)
-	s.StoreCache(NewVectorCache(7, map[int64][]CachedVector{}))
+	c := makeTestCache(t, 7, 3, map[int64]CachedPartition{
+		1: makePartition(CachedVector{RowID: 10, Vec: []float32{1, 0, 0}}),
+		2: makePartition(CachedVector{RowID: 20, Vec: []float32{0, 1, 0}}),
+	})
+	s.StoreCache(c)
 
-	// Correct epoch: inserts land.
+	// Seed delta with rowids that will get flushed.
+	c.Delta().AppendBatch([]CachedVector{
+		{RowID: 10, Vec: []float32{1, 0, 0}},
+		{RowID: 11, Vec: []float32{0, 1, 0}},
+	})
+
+	// Warm partitions 1 and 2.
+	_, err := c.BulkGetPartitions(context.Background(), []int64{1, 2})
+	require.NoError(t, err)
+	require.Equal(t, 2, c.Partitions().EstimatedSize())
+
+	// Post-flush entries: rowid 10 moved to cluster 1, rowid 11 moved to cluster 2.
 	s.CacheInsertBatch(7, []CacheEntry{
 		{ClusterID: 1, RowID: 10, Vec: []float32{1, 0, 0}},
-		{ClusterID: 1, RowID: 11, Vec: []float32{0, 1, 0}},
-		{ClusterID: 2, RowID: 12, Vec: []float32{0, 0, 1}},
+		{ClusterID: 2, RowID: 11, Vec: []float32{0, 1, 0}},
 	})
-	c := s.LoadCache()
-	require.Equal(t, 3, c.Len())
-	require.Len(t, c.Cluster(1), 2)
-	require.Len(t, c.Cluster(2), 1)
 
-	// Stale epoch: no-op (simulates post-reindex late flush).
-	s.CacheInsertBatch(6, []CacheEntry{
-		{ClusterID: 1, RowID: 99, Vec: []float32{0.5, 0.5, 0}},
-	})
-	require.Equal(t, 3, s.LoadCache().Len())
+	// Delta rowids removed.
+	d := c.DeltaSnapshot()
+	assert.Empty(t, d, "delta rowids must be removed after flush batch")
+
+	// Both partitions invalidated — next probe reloads via BulkLoader.
+	assert.Equal(t, 0, c.Partitions().EstimatedSize(),
+		"touched partitions should be evicted so next probe reloads fresh")
 }
 
-func TestIndexState_CacheDelete(t *testing.T) {
+func TestIndexState_CacheInsertBatch_StaleEpochNoOp(t *testing.T) {
 	t.Parallel()
 	s := newCacheTestState(t)
-	s.StoreCache(NewVectorCache(7, map[int64][]CachedVector{
-		1: {{RowID: 10, Vec: []float32{1, 0, 0}}, {RowID: 11, Vec: []float32{0, 1, 0}}},
-		2: {{RowID: 20, Vec: []float32{0, 0, 1}}},
-	}))
+	c := makeTestCache(t, 7, 3, map[int64]CachedPartition{
+		1: makePartition(CachedVector{RowID: 10, Vec: []float32{1, 0, 0}}),
+	})
+	s.StoreCache(c)
+	c.Delta().Append(CachedVector{RowID: 99, Vec: []float32{1, 1, 1}})
+
+	// Wrong epoch (simulates late flush after reindex).
+	s.CacheInsertBatch(6, []CacheEntry{
+		{ClusterID: 1, RowID: 99, Vec: []float32{1, 1, 1}},
+	})
+
+	require.Len(t, c.DeltaSnapshot(), 1,
+		"stale-epoch batch must not mutate delta buffer")
+}
+
+func TestIndexState_CacheDelete_FromDelta(t *testing.T) {
+	t.Parallel()
+	s := newCacheTestState(t)
+	c := makeTestCache(t, 7, 3, nil)
+	s.StoreCache(c)
+	c.Delta().AppendBatch([]CachedVector{
+		{RowID: 10, Vec: []float32{1, 0, 0}},
+		{RowID: 11, Vec: []float32{0, 1, 0}},
+	})
 
 	s.CacheDelete(11)
-	require.Equal(t, 2, s.LoadCache().Len())
-	require.Len(t, s.LoadCache().Cluster(1), 1)
+	snap := c.DeltaSnapshot()
+	require.Len(t, snap, 1)
+	assert.Equal(t, int64(10), snap[0].RowID)
 
-	// Missing rowid: no-op.
+	// Missing rowid: no panic.
 	s.CacheDelete(9999)
-	require.Equal(t, 2, s.LoadCache().Len())
+	assert.Len(t, c.DeltaSnapshot(), 1)
 }
 
-// TestIndexState_CacheInsertBatch_ConcurrentCOW drives parallel insert batches
-// into the same cache and asserts all entries land. Runs under -race to flag
-// any data race between COW readers and the atomic.Pointer swap.
-func TestIndexState_CacheInsertBatch_ConcurrentCOW(t *testing.T) {
+func TestIndexState_CacheDelete_FromPartition(t *testing.T) {
 	t.Parallel()
 	s := newCacheTestState(t)
-	s.StoreCache(NewVectorCache(7, map[int64][]CachedVector{}))
+	c := makeTestCache(t, 7, 3, map[int64]CachedPartition{
+		1: makePartition(
+			CachedVector{RowID: 10, Vec: []float32{1, 0, 0}},
+			CachedVector{RowID: 11, Vec: []float32{0, 1, 0}},
+		),
+		2: makePartition(CachedVector{RowID: 20, Vec: []float32{0, 0, 1}}),
+	})
+	s.StoreCache(c)
+
+	// Warm both partitions.
+	_, err := c.BulkGetPartitions(context.Background(), []int64{1, 2})
+	require.NoError(t, err)
+	require.Equal(t, 2, c.Partitions().EstimatedSize())
+
+	// Delete rowid 11 — lives in partition 1, which should get invalidated.
+	s.CacheDelete(11)
+	assert.Equal(t, 1, c.Partitions().EstimatedSize(),
+		"partition 1 should be evicted; partition 2 stays resident")
+}
+
+func TestIndexState_CacheDelete_NoCacheIsNoOp(t *testing.T) {
+	t.Parallel()
+	s := newCacheTestState(t)
+	require.Nil(t, s.LoadCache())
+
+	// Must not panic.
+	s.CacheDelete(42)
+}
+
+// TestIndexState_CacheInsertBatch_Concurrent drives parallel post-flush
+// batches and asserts the final state is consistent. Runs under -race.
+func TestIndexState_CacheInsertBatch_Concurrent(t *testing.T) {
+	t.Parallel()
+	s := newCacheTestState(t)
+	c := makeTestCache(t, 7, 3, map[int64]CachedPartition{
+		1: makePartition(CachedVector{RowID: 1, Vec: []float32{1, 0, 0}}),
+		2: makePartition(CachedVector{RowID: 2, Vec: []float32{0, 1, 0}}),
+		3: makePartition(CachedVector{RowID: 3, Vec: []float32{0, 0, 1}}),
+		4: makePartition(CachedVector{RowID: 4, Vec: []float32{1, 1, 0}}),
+	})
+	s.StoreCache(c)
+
+	// Seed delta with 1000 rowids that all concurrent flushes will remove.
+	const totalRows = 1000
+	seed := make([]CachedVector, totalRows)
+	for i := 0; i < totalRows; i++ {
+		seed[i] = CachedVector{RowID: int64(i), Vec: []float32{float32(i), 0, 0}}
+	}
+	c.Delta().AppendBatch(seed)
+	require.Equal(t, totalRows, c.Delta().Len())
 
 	const workers = 8
-	const perWorker = 125 // 8*125 = 1000 entries
+	perWorker := totalRows / workers
 
 	var wg sync.WaitGroup
 	for w := 0; w < workers; w++ {
 		wg.Add(1)
-		go func(base int64) {
+		go func(w int) {
 			defer wg.Done()
 			batch := make([]CacheEntry, perWorker)
 			for i := 0; i < perWorker; i++ {
 				batch[i] = CacheEntry{
-					ClusterID: 1 + (base+int64(i))%4,
-					RowID:     base*1000 + int64(i),
-					Vec:       []float32{float32(i), 0, 0},
+					ClusterID: int64(1 + (w+i)%4),
+					RowID:     int64(w*perWorker + i),
 				}
 			}
 			s.CacheInsertBatch(7, batch)
-		}(int64(w))
+		}(w)
 	}
-
-	// Concurrent readers should observe monotonically non-decreasing Len.
-	reader := make(chan int, 32)
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		for {
-			select {
-			case <-reader:
-				return
-			default:
-				c := s.LoadCache()
-				if c != nil {
-					_ = c.Len()
-				}
-			}
-		}
-	}()
-
 	wg.Wait()
-	close(reader)
-	<-done
 
-	require.Equal(t, workers*perWorker, s.LoadCache().Len())
+	assert.Empty(t, c.DeltaSnapshot(), "all delta entries should be removed after concurrent flushes")
 }
 
 func TestEngine_UnregisterClearsCache(t *testing.T) {
@@ -151,8 +279,8 @@ func TestEngine_UnregisterClearsCache(t *testing.T) {
 	e := makeEngine(t)
 	state := makeState(t, "emb", 3, [][]float32{{1, 0, 0}})
 	e.Register("emb", state)
-	state.StoreCache(NewVectorCache(1, map[int64][]CachedVector{
-		1: {{RowID: 1, Vec: []float32{1, 0, 0}}},
+	state.StoreCache(makeTestCache(t, 1, 3, map[int64]CachedPartition{
+		1: makePartition(CachedVector{RowID: 1, Vec: []float32{1, 0, 0}}),
 	}))
 	require.NotNil(t, state.LoadCache())
 	e.Unregister("emb")
@@ -168,8 +296,8 @@ func TestEngine_LookupCache(t *testing.T) {
 	e.Register("emb", state)
 	require.Nil(t, e.LookupCache("emb"))
 
-	c := NewVectorCache(1, map[int64][]CachedVector{
-		1: {{RowID: 1, Vec: []float32{1, 0, 0}}},
+	c := makeTestCache(t, 1, 3, map[int64]CachedPartition{
+		1: makePartition(CachedVector{RowID: 1, Vec: []float32{1, 0, 0}}),
 	})
 	state.StoreCache(c)
 	require.Same(t, c, e.LookupCache("emb"))

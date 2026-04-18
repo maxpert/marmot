@@ -268,11 +268,15 @@ func seedManagerCache(t *testing.T, mgr *VectorIndexManager, db *sql.DB, meta co
 	t.Helper()
 	// Insert metadata row directly (execCreateDDL already did this in the DDL test).
 	_, err := db.Exec(`INSERT INTO __marmot_vector_indexes
-		(index_name, table_name, column_name, database_name, metric, dim, nlist, nprobe, max_norm, status, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'ready', ?)
+		(index_name, table_name, column_name, database_name, metric, dim,
+		 nlist, nprobe, auto_nlist, auto_nprobe, target_partition_size,
+		 max_norm, status, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ready', ?)
 		ON CONFLICT(index_name) DO NOTHING`,
 		meta.IndexName, meta.TableName, meta.ColumnName, meta.Database,
-		meta.Metric, meta.Dim, meta.Nlist, meta.Nprobe, meta.MaxNorm, meta.CreatedAt,
+		meta.Metric, meta.Dim, meta.Nlist, meta.Nprobe,
+		boolToInt(meta.AutoTuneNlist), boolToInt(meta.AutoTuneNprobe),
+		meta.TargetPartitionSize, meta.MaxNorm, meta.CreatedAt,
 	)
 	require.NoError(t, err)
 
@@ -280,15 +284,24 @@ func seedManagerCache(t *testing.T, mgr *VectorIndexManager, db *sql.DB, meta co
 	ctx := context.Background()
 	rows, err := db.QueryContext(ctx, `
 		SELECT index_name, table_name, column_name, database_name,
-		       metric, dim, nlist, nprobe, max_norm, status
+		       metric, dim, nlist, nprobe, auto_nlist, auto_nprobe,
+		       target_partition_size, max_norm, status
 		FROM __marmot_vector_indexes`)
 	require.NoError(t, err)
 	for rows.Next() {
-		var m common.VectorIndexMeta
+		var (
+			m          common.VectorIndexMeta
+			autoNlist  int64
+			autoNprobe int64
+		)
 		require.NoError(t, rows.Scan(
 			&m.IndexName, &m.TableName, &m.ColumnName, &m.Database,
-			&m.Metric, &m.Dim, &m.Nlist, &m.Nprobe, &m.MaxNorm, &m.Status,
+			&m.Metric, &m.Dim, &m.Nlist, &m.Nprobe,
+			&autoNlist, &autoNprobe, &m.TargetPartitionSize,
+			&m.MaxNorm, &m.Status,
 		))
+		m.AutoTuneNlist = autoNlist != 0
+		m.AutoTuneNprobe = autoNprobe != 0
 		key := indexCacheKey{database: m.Database, table: m.TableName, column: m.ColumnName}
 		mc := m
 		mgr.cacheMu.Lock()

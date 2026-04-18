@@ -65,13 +65,20 @@ func (h *EngineHook) OnIndexCreated(ctx context.Context, meta common.VectorIndex
 	if err := BulkPopulate(ctx, conn, h.engine, updatedAt, meta.TableName, meta.ColumnName, spec); err != nil {
 		return fmt.Errorf("engine hook: bulk populate: %w", err)
 	}
+	if state, ok := h.engine.Lookup(meta.IndexName); ok {
+		if dbPath, pathErr := h.dbMgr.GetDatabasePath(meta.Database); pathErr == nil {
+			if err := buildAndStorePackedPartitionStore(ctx, conn, dbPath, state, meta, spec); err != nil {
+				return fmt.Errorf("engine hook: build packed store: %w", err)
+			}
+		}
+	}
 
 	// Status flip to 'ready' is now inside populateMembers' txn (MEDIUM-6 fix).
 	// For empty tables BulkPopulate skips populate and status stays 'building'
 	// until the delta flush assigns the first vectors.
 
 	// Start the delta flush goroutine for this index.
-	h.engine.StartFlush(meta.IndexName, meta.TableName, meta.ColumnName)
+	h.engine.StartFlush(meta.IndexName, meta.Database, meta.TableName, meta.ColumnName)
 
 	return nil
 }
@@ -86,8 +93,20 @@ func (h *EngineHook) OnIndexReindex(ctx context.Context, meta common.VectorIndex
 	if err != nil {
 		return fmt.Errorf("engine hook reindex: get db %s: %w", meta.Database, err)
 	}
+	h.engine.StopFlushAndWait(meta.IndexName)
+	defer h.engine.StartFlush(meta.IndexName, meta.Database, meta.TableName, meta.ColumnName)
 	updatedAt := time.Now().UnixNano()
-	return Reindex(ctx, conn, h.engine, meta, 0, updatedAt)
+	if err := Reindex(ctx, conn, h.engine, meta, 0, updatedAt); err != nil {
+		return err
+	}
+	if state, ok := h.engine.Lookup(meta.IndexName); ok {
+		if dbPath, pathErr := h.dbMgr.GetDatabasePath(meta.Database); pathErr == nil {
+			if err := buildAndStorePackedPartitionStore(ctx, conn, dbPath, state, meta, state.Spec()); err != nil {
+				return fmt.Errorf("engine hook reindex: build packed store: %w", err)
+			}
+		}
+	}
+	return nil
 }
 
 // RemoveIndex implements EngineProvider.

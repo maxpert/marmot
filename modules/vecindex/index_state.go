@@ -1,6 +1,7 @@
 package vecindex
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"sync/atomic"
@@ -8,6 +9,8 @@ import (
 	"github.com/maxpert/marmot/modules/vecindex/pkg/kmeans"
 	"github.com/maxpert/marmot/modules/vecindex/pkg/metric"
 )
+
+var ErrNoCentroidsLoaded = errors.New("vecindex: no centroids loaded")
 
 // IndexState holds the in-memory state for a single vector index.
 //
@@ -23,11 +26,18 @@ import (
 //
 // All pointers are stored as atomic.Pointer so readers are lock-free.
 type IndexState struct {
-	spec         IVFSpec
-	probeState   atomic.Pointer[kmeans.CentroidSet]
-	driftState   atomic.Pointer[kmeans.CentroidSet]
-	driftTracker atomic.Pointer[DriftTracker]
-	vectorCache  atomic.Pointer[VectorCache]
+	spec          IVFSpec
+	probeState    atomic.Pointer[kmeans.CentroidSet]
+	driftState    atomic.Pointer[kmeans.CentroidSet]
+	driftTracker  atomic.Pointer[DriftTracker]
+	vectorCache   atomic.Pointer[VectorCache]
+	residentDelta atomic.Pointer[DeltaBuffer]
+	packedStore   atomic.Pointer[PackedPartitionStore]
+	packedDirty   atomic.Pointer[packedDirtySet]
+}
+
+type packedDirtySet struct {
+	clusters map[int64]struct{}
 }
 
 // NewIndexState creates an IndexState with probe and drift both pointing at cs.
@@ -36,6 +46,7 @@ func NewIndexState(spec IVFSpec, cs *kmeans.CentroidSet) *IndexState {
 	s := &IndexState{spec: spec}
 	s.probeState.Store(cs)
 	s.driftState.Store(cs)
+	s.residentDelta.Store(NewDeltaBuffer())
 	if cs != nil {
 		s.driftTracker.Store(NewDriftTracker(cs.Snapshot()))
 	}
@@ -135,6 +146,62 @@ func (s *IndexState) LoadCache() *VectorCache {
 // prior snapshot. Passing nil clears the cache.
 func (s *IndexState) StoreCache(c *VectorCache) {
 	s.vectorCache.Store(c)
+	if c != nil && c.delta != nil {
+		s.residentDelta.Store(c.delta)
+	}
+}
+
+// LoadResidentDelta returns the always-resident cluster_id=0 buffer used by
+// the packed streaming path. The returned buffer is immutable to callers.
+func (s *IndexState) LoadResidentDelta() *DeltaBuffer {
+	return s.residentDelta.Load()
+}
+
+// StoreResidentDelta installs delta as the active always-resident
+// cluster_id=0 buffer. Passing nil resets it to an empty buffer.
+func (s *IndexState) StoreResidentDelta(delta *DeltaBuffer) {
+	if delta == nil {
+		delta = NewDeltaBuffer()
+	}
+	s.residentDelta.Store(delta)
+}
+
+// LoadPackedStore returns the current mmap-backed stable partition store.
+func (s *IndexState) LoadPackedStore() *PackedPartitionStore {
+	return s.packedStore.Load()
+}
+
+// StorePackedStore installs store as the active packed partition snapshot and
+// clears any dirty-cluster bookkeeping.
+func (s *IndexState) StorePackedStore(store *PackedPartitionStore) {
+	old := s.packedStore.Swap(store)
+	s.packedDirty.Store(nil)
+	if old != nil && old != store {
+		_ = old.Close()
+	}
+}
+
+// ClearPackedStore drops the active packed partition snapshot.
+func (s *IndexState) ClearPackedStore() {
+	old := s.packedStore.Swap(nil)
+	s.packedDirty.Store(nil)
+	if old != nil {
+		_ = old.Close()
+	}
+}
+
+// PackedClusterDirty reports whether the stable packed snapshot should be
+// bypassed for clusterID and SQLite should be consulted instead.
+func (s *IndexState) PackedClusterDirty(clusterID int64) bool {
+	if clusterID <= 0 {
+		return true
+	}
+	dirty := s.packedDirty.Load()
+	if dirty == nil {
+		return false
+	}
+	_, ok := dirty.clusters[clusterID]
+	return ok
 }
 
 // CacheClear atomically drops the cache. No-op if no cache is installed.
@@ -142,44 +209,88 @@ func (s *IndexState) CacheClear() {
 	s.vectorCache.Store(nil)
 }
 
-// CacheInsertBatch COW-inserts the batch into the active cache. The batch's
-// expected epoch must match the cache's epoch; on mismatch this is a no-op so
-// stale delta-flush writes cannot corrupt a newly-swapped post-reindex cache.
-// The cache caller transfers ownership of each entry.Vec — it must not be
-// mutated after this call.
+// CacheInsertBatch reflects a post-delta-flush batch in the cache: the rows
+// identified by RowID have just migrated from cluster_id=0 to their real
+// ClusterID on disk. Accordingly we (a) remove their rowids from the delta
+// buffer, and (b) invalidate each touched partition so the next probe
+// reloads from SQL with the new rows included.
+//
+// The expected epoch must match the cache's epoch; on mismatch this is a
+// no-op so stale delta-flush writes cannot corrupt a newly-swapped
+// post-reindex cache.
 func (s *IndexState) CacheInsertBatch(expectedEpoch uint64, entries []CacheEntry) {
 	if len(entries) == 0 {
 		return
 	}
-	for {
-		old := s.vectorCache.Load()
-		if old == nil {
-			return
-		}
-		if old.epoch != expectedEpoch {
-			return
-		}
-		updated := old.withBatchInsert(entries)
-		if s.vectorCache.CompareAndSwap(old, updated) {
-			return
+	if s.ProbeVersion() != expectedEpoch {
+		return
+	}
+	cache := s.vectorCache.Load()
+	if delta := s.residentDelta.Load(); delta != nil {
+		for _, e := range entries {
+			delta.Remove(e.RowID)
 		}
 	}
+
+	if cache != nil && cache.epoch == expectedEpoch && cache.partitions != nil {
+		partitions := cache.partitions
+		seen := make(map[int64]struct{}, len(entries))
+		for _, e := range entries {
+			if _, ok := seen[e.ClusterID]; ok {
+				continue
+			}
+			seen[e.ClusterID] = struct{}{}
+			partitions.Invalidate(e.ClusterID)
+		}
+	}
+	s.markPackedClustersDirty(entries)
 }
 
-// CacheDelete COW-removes the entry for rowid from whichever cluster holds
-// it. Safe when rowid is absent (no-op). Intended for DELETE-triggered
-// removals; bulk purges should replace the cache wholesale via StoreCache.
+// CacheDelete removes the row identified by rowid from the cache. Tries the
+// delta buffer first (cheap O(n) scan over a bounded buffer); if the row is
+// not resident there, falls back to invalidating whichever cached partition
+// holds it so the next probe reloads without the stale row.
+//
+// A deleted rowid that is on disk but not resident in any cached partition
+// needs no action — its next load reads post-delete state.
 func (s *IndexState) CacheDelete(rowid int64) {
+	if delta := s.residentDelta.Load(); delta != nil {
+		if delta.Remove(rowid) {
+			s.ClearPackedStore()
+		}
+	}
+	cache := s.vectorCache.Load()
+	if cache == nil {
+		return
+	}
+	if cache.delta != nil && cache.delta.Remove(rowid) {
+		s.ClearPackedStore()
+		return
+	}
+	if cache.partitions != nil {
+		cache.partitions.FindAndInvalidate(rowid)
+	}
+	s.ClearPackedStore()
+}
+
+func (s *IndexState) markPackedClustersDirty(entries []CacheEntry) {
+	if s.packedStore.Load() == nil || len(entries) == 0 {
+		return
+	}
 	for {
-		old := s.vectorCache.Load()
-		if old == nil {
-			return
+		old := s.packedDirty.Load()
+		next := &packedDirtySet{clusters: make(map[int64]struct{}, len(entries))}
+		if old != nil {
+			for cid := range old.clusters {
+				next.clusters[cid] = struct{}{}
+			}
 		}
-		updated := old.withDelete(rowid)
-		if updated == old {
-			return
+		for _, entry := range entries {
+			if entry.ClusterID > 0 {
+				next.clusters[entry.ClusterID] = struct{}{}
+			}
 		}
-		if s.vectorCache.CompareAndSwap(old, updated) {
+		if s.packedDirty.CompareAndSwap(old, next) {
 			return
 		}
 	}
@@ -217,7 +328,7 @@ func (s *IndexState) AssignNearest(vecBytes []byte) (int64, error) {
 
 	cs := s.probeState.Load()
 	if cs == nil || cs.Len() == 0 {
-		return 0, fmt.Errorf("vecindex: no centroids loaded for index %q", s.spec.ID)
+		return 0, fmt.Errorf("%w for index %q", ErrNoCentroidsLoaded, s.spec.ID)
 	}
 
 	clusterID, _, err := cs.AssignNearest(vec, s.spec.InternalMetric())
@@ -226,6 +337,33 @@ func (s *IndexState) AssignNearest(vecBytes []byte) (int64, error) {
 	}
 
 	return int64(clusterID) + 1, nil // 1-based; 0 reserved for delta
+}
+
+// AssignNearestPrepared returns the 1-based cluster ID for the nearest
+// centroid for a vector that is already in the internal search space.
+//
+// vecBytes must be a little-endian float32 BLOB of exactly spec.InternalDim()*4
+// bytes. Unlike AssignNearest, dot-metric vectors are not augmented here.
+func (s *IndexState) AssignNearestPrepared(vecBytes []byte) (int64, error) {
+	if len(vecBytes) == 0 || len(vecBytes)%4 != 0 {
+		return 0, fmt.Errorf("MARMOT-VEC-014: invalid vector blob length %d for index %q", len(vecBytes), s.spec.ID)
+	}
+	internalDim := s.spec.InternalDim()
+	if got := len(vecBytes) / 4; got != internalDim {
+		return 0, fmt.Errorf("MARMOT-VEC-014: internal dimension mismatch for index %q: got %d, want %d",
+			s.spec.ID, got, internalDim)
+	}
+
+	cs := s.probeState.Load()
+	if cs == nil || cs.Len() == 0 {
+		return 0, fmt.Errorf("%w for index %q", ErrNoCentroidsLoaded, s.spec.ID)
+	}
+
+	clusterID, _, err := cs.AssignNearest(metric.BytesToFloat32(vecBytes), s.spec.InternalMetric())
+	if err != nil {
+		return 0, fmt.Errorf("vecindex: assign nearest prepared for index %q: %w", s.spec.ID, err)
+	}
+	return int64(clusterID) + 1, nil
 }
 
 // TopNprobeClusters returns the top-n 1-based cluster IDs ordered by ascending
@@ -266,7 +404,7 @@ func (s *IndexState) TopNprobeClustersWithEpoch(vecBytes []byte, n int) ([]int64
 
 	cs := s.probeState.Load()
 	if cs == nil || cs.Len() == 0 {
-		return nil, 0, fmt.Errorf("vecindex: no centroids loaded for index %q", s.spec.ID)
+		return nil, 0, fmt.Errorf("%w for index %q", ErrNoCentroidsLoaded, s.spec.ID)
 	}
 
 	if n < 1 {

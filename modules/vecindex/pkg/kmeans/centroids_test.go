@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/maxpert/marmot/modules/vecindex/pkg/kmeans"
+	"github.com/maxpert/marmot/modules/vecindex/pkg/metric"
 	"github.com/stretchr/testify/require"
 )
 
@@ -113,4 +114,33 @@ func TestCentroidSet_Encode_Decode(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, v1, v2, "centroid %d must round-trip through msgpack", i)
 	}
+}
+
+func TestCentroidSet_AssignNearestCosineIsScaleInvariant(t *testing.T) {
+	t.Parallel()
+
+	cs, err := kmeans.NewCentroidSet(1, [][]float32{
+		{1, 0},
+		{0, 5},
+	})
+	require.NoError(t, err)
+
+	id, _, err := cs.AssignNearest([]float32{0, 2}, metric.MetricCosine)
+	require.NoError(t, err)
+	require.Equal(t, uint32(1), id)
+}
+
+func TestCentroidSet_AssignTopNCosineMatchesOrder(t *testing.T) {
+	t.Parallel()
+
+	cs, err := kmeans.NewCentroidSet(1, [][]float32{
+		{1, 0},
+		{1, 1},
+		{0, 1},
+	})
+	require.NoError(t, err)
+
+	ids, _, err := cs.AssignTopN([]float32{1, 0.2}, 2, metric.MetricCosine)
+	require.NoError(t, err)
+	require.Equal(t, []uint32{0, 1}, ids)
 }

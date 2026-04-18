@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/maxpert/marmot/cfg"
 	"github.com/maxpert/marmot/modules/vecindex"
 	"github.com/maxpert/marmot/protocol"
 	"github.com/stretchr/testify/require"
@@ -30,9 +31,19 @@ func newCacheSession(useCache, useGoRank bool) *protocol.ConnectionSession {
 	}
 }
 
+func enableLegacyVectorCache(t *testing.T) {
+	t.Helper()
+	old := cfg.Config.VectorIndex.CacheBytes
+	cfg.Config.VectorIndex.CacheBytes = 64 << 20
+	t.Cleanup(func() {
+		cfg.Config.VectorIndex.CacheBytes = old
+	})
+}
+
 // TestCache_ParityWithUDF asserts the cache-ranking path returns the same
 // top-K set as the SQL-UDF path across a spread of queries (task #16).
 func TestCache_ParityWithUDF(t *testing.T) {
+	enableLegacyVectorCache(t)
 	s := setupVecE2E(t)
 
 	const nQueries = 20
@@ -61,6 +72,7 @@ func TestCache_ParityWithUDF(t *testing.T) {
 // cleanly disables the cache path and the SQL candidate scan still produces
 // valid top-K results (task #16 session toggle).
 func TestCache_FallsThroughWhenDisabled(t *testing.T) {
+	enableLegacyVectorCache(t)
 	s := setupVecE2E(t)
 
 	rng := rand.New(rand.NewSource(7))
@@ -78,6 +90,7 @@ func TestCache_FallsThroughWhenDisabled(t *testing.T) {
 // SQL rather than indexing stale cluster IDs into a freshly-rebuilt cache
 // (task #16 HIGH-2 fix).
 func TestCache_EpochMismatchFallsThrough(t *testing.T) {
+	enableLegacyVectorCache(t)
 	s := setupVecE2E(t)
 
 	rng := rand.New(rand.NewSource(41))
@@ -122,6 +135,7 @@ func TestCache_EpochMismatchFallsThrough(t *testing.T) {
 // result sets; no error surface. Recall may drop during swap but correctness
 // (results are valid neighbors) must hold.
 func TestCache_ConcurrentREINDEX(t *testing.T) {
+	enableLegacyVectorCache(t)
 	s := setupVecE2E(t)
 
 	const (

@@ -9,8 +9,8 @@ Marmot has built-in vector similarity search — approximate nearest-neighbor (A
 ## Design Philosophy
 
 - **Functions, not syntax** — `vec_match(col, ?, K)` in WHERE and `vec_distance(col, ?)` in ORDER BY. The coordinator transpiles these into native SQLite that the engine can execute.
-- **One source of truth** — your BLOB column is the only place vectors live. No duplicated storage, no external service.
-- **Derived local state** — the index (centroids + cluster membership) is rebuilt on each node from the same replicated data. Only a small compressed centroid blob crosses the wire.
+- **Base table as source of truth** — the user-visible, replicated embedding stays in your table. Marmot also materializes local derived vector state for search.
+- **Derived local state** — centroids, sidecar membership, packed stable-partition snapshots, and other read-optimized structures are rebuilt on each node from the same replicated data. Only a small compressed centroid blob crosses the wire.
 - **Predicate-aware** — the cost-based planner chooses between brute-force pre-filter (when the predicate is narrow) and IVF post-filter (when the index is cheaper), and falls back to the exact path when a query returns fewer than K results.
 - **Deterministic** — two nodes running `CREATE VECTOR INDEX` concurrently compute byte-identical centroids, so LWW replication is a no-op.
 
@@ -44,6 +44,64 @@ SELECT id, title
 ```
 
 The two bind parameters after `vec_match` and inside `vec_distance` both take the query vector as a BLOB. Both appear because the functions serve different roles in rewriting — see [Under the Hood](#under-the-hood).
+
+## Full Schema Example
+
+This is the normal shape in Marmot: one table, ordinary secondary indexes for scalar filters, and one vector index on the embedding column.
+
+```sql
+CREATE TABLE docs (
+    id         INTEGER PRIMARY KEY,
+    tenant_id  BIGINT NOT NULL,
+    owner_id   BIGINT NOT NULL,
+    status     TEXT NOT NULL,
+    title      TEXT NOT NULL,
+    created_at BIGINT NOT NULL,
+    embed      BLOB NOT NULL
+);
+
+CREATE INDEX docs_tenant_status_created_idx
+    ON docs(tenant_id, status, created_at DESC);
+
+CREATE INDEX docs_owner_idx
+    ON docs(owner_id);
+
+CREATE VECTOR INDEX docs_embed_idx
+    ON docs(embed)
+    DIM 1536
+    METRIC cosine;
+```
+
+Typical queries:
+
+```sql
+-- Tenant-scoped semantic search with scalar filters.
+SELECT id, title, owner_id
+  FROM docs
+ WHERE vec_match(embed, :query_vec, 20)
+   AND tenant_id = :tenant_id
+   AND status = 'published'
+ ORDER BY vec_distance(embed, :query_vec)
+ LIMIT 20;
+
+-- Owner-scoped search on the same table.
+SELECT id, title
+  FROM docs
+ WHERE vec_match(embed, :query_vec, 10)
+   AND owner_id = :owner_id
+ ORDER BY vec_distance(embed, :query_vec)
+ LIMIT 10;
+
+-- Return created_at alongside the nearest neighbors.
+SELECT id, title, created_at
+  FROM docs
+ WHERE vec_match(embed, :query_vec, 50)
+   AND tenant_id = :tenant_id
+ ORDER BY vec_distance(embed, :query_vec)
+ LIMIT 50;
+```
+
+The scalar indexes and the vector index are independent. Marmot's planner decides whether to probe the IVF index first or to pre-filter on the scalar predicate first when that is cheaper.
 
 ---
 
@@ -219,8 +277,8 @@ All variables are per-connection. Set them with standard MySQL-compat `SET @@var
 | `@@marmot_vec_force_plan` | `auto` | `auto` / `pre` / `post` |
 | `@@marmot_vec_prefilter_cap` | `5000` | Hard cap on rows scanned by pre-filter |
 | `@@marmot_vec_fallback` | `on` | If post-filter returns fewer than `K`, run the pre-filter plan and fill up |
-| `@@marmot_vec_use_cache` | `on` | Use the in-memory cache path for ranking (bypasses SQLite UDF dispatch) |
 | `@@marmot_vec_use_go_rank` | `on` | Use the Go-side ranking path (vs SQL UDF path) |
+| `@@marmot_vec_use_cache` | `off` | Enable the legacy Go-side partition cache on post-filter plans |
 | `@@marmot_vec_delta_flush_interval` | `10` | Seconds between delta-flush cycles |
 | `@@marmot_vec_delta_max_rows` | `10000` | Max delta rows per flush |
 | `@@marmot_vec_delta_flush_batch` | `1000` | Rows per sub-batch inside one flush |
@@ -232,21 +290,44 @@ All variables are per-connection. Set them with standard MySQL-compat `SET @@var
 
 Invalid values return `MARMOT-VEC-012`.
 
+## Configuration
+
+Product-level vector-index config lives under `[vector_index]`:
+
+```toml
+[vector_index]
+enabled = true
+data_dir = ""    # reserved for a future SQLite-native engine path
+cache_bytes = 0  # 0 disables the legacy Go-side partition cache
+```
+
+- `enabled` turns vector-index support on.
+- `data_dir` is currently reserved and can be left unset.
+- `cache_bytes` caps the legacy per-index Go partition cache. The always-resident delta buffer is excluded from this budget. `0` keeps the default packed streaming path without the legacy cache.
+
 ---
 
 ## Under the Hood
 
 ### Storage Layout
 
-For an index named `docs_embed` on `docs(embed)`, three objects back it:
+For an index named `docs_embed` on `docs(embed)`, four objects back it:
 
 | Object | Name pattern | Replicated? | Contents |
 |---|---|---|---|
 | Centroid row | `_marmot_vec_docs_embed_centroids` | **Yes** — single-underscore prefix flows through CDC | One row: version, HLC timestamp, zstd-compressed msgpack of the centroid matrix |
-| Members table | `__marmot_vec_docs_embed_members` | **No** — double-underscore prefix is CDC-excluded | `(cluster_id INTEGER, rowid INTEGER)` with `PRIMARY KEY(cluster_id, rowid)`; `cluster_id = 0` is the delta partition |
+| Members table | `__marmot_vec_docs_embed_members` | **No** — double-underscore prefix is CDC-excluded | `(cluster_id INTEGER, rowid INTEGER, vec BLOB)` with `PRIMARY KEY(cluster_id, rowid)`; `cluster_id = 0` is the delta partition |
+| Packed snapshot | `<db>.docs_embed.vecpack` | No — local | Mmap-backed snapshot of stable `cluster_id > 0` partitions laid out in `cluster_id,rowid` order |
 | Metadata row | `__marmot_vector_indexes` | No — local | Dim, metric, nlist, nprobe, status |
 
-The naming convention is deliberate: single underscore = cluster-visible derived state that must converge across nodes; double underscore = strictly local derived state built per node from replicated inputs.
+The naming convention is deliberate: single underscore = cluster-visible derived state that must converge across nodes; double underscore and `.vecpack` files = strictly local derived state built per node from replicated inputs.
+
+The runtime state in `IndexState` mirrors that layout:
+
+- **probeState** — the active centroid set used by queries and assignments
+- **resident delta** — always-resident `cluster_id = 0` rows so fresh inserts are queryable immediately
+- **packed store** — mmap-backed stable partitions used by the primary post-filter read path
+- **optional vector cache** — the older Go partition cache, now disabled by default
 
 ### Query Translation
 
@@ -267,7 +348,12 @@ The coordinator AST-walks the query (Vitess parser, no regex), resolves the inde
 
 1. Load the in-memory centroid state for `docs_embed`.
 2. Call `TopNprobeClusters(:q, nprobe)` → a list of `cluster_id` integers.
-3. Rewrite to native SQL:
+3. Build a Go rank plan that can execute in one of three ways:
+   - **packed path**: scan stable clusters from the mmap snapshot, scan resident delta, then fetch projected columns only for the final top-K rowids
+   - **legacy cache path**: if `@@marmot_vec_use_cache = 'on'`, rank from the optional in-memory partition cache
+   - **SQLite fallback**: if packed/cache state is unavailable, fall back to shared-scan or SQL-candidate execution against `__marmot_vec_<idx>_members`
+
+The fallback candidate SQL still looks like:
 
 ```sql
 SELECT id, title
@@ -308,16 +394,31 @@ The planner estimates the cardinality of the predicate from SQLite stats and pic
 
 When post-filter returns fewer than K rows (predicate reduced the candidate set too aggressively) and `@@marmot_vec_fallback = 'on'`, the pre-filter plan is executed to fill up. Worst case is 2× single-plan latency; normal case adds nothing.
 
-### In-Memory Cache Path
+### Runtime Read Paths
 
-To hit low single-digit millisecond p99, Marmot maintains a per-index in-memory cache: `map[cluster_id] → []{rowid, float32[]}`. On search with `@@marmot_vec_use_cache = 'on'` (default):
+Marmot now defaults to the packed streaming path, not the legacy partition cache.
 
-1. Iterate the probed cluster buckets directly in Go.
-2. Compute distances with the pure-Go SIMD-friendly metric package.
-3. Maintain a top-K heap.
-4. Issue one final `SELECT rowid IN (…)` to fetch the user's projected columns.
+**Packed path** (`@@marmot_vec_use_go_rank = 'on'`, `@@marmot_vec_use_cache = 'off'`):
 
-No per-row SQLite UDF dispatch — this is where the big p99 drop comes from. When the cache is unavailable (cold startup, epoch mismatch during REINDEX, session var off), the path falls through to the SQL rewrite above.
+1. Probe centroids in memory.
+2. Scan stable `cluster_id > 0` partitions from the local `.vecpack` snapshot.
+3. Scan `cluster_id = 0` from the always-resident delta buffer.
+4. Rank in Go with SIMD-friendly distance kernels.
+5. Fetch only the final top-K projected rows from SQLite.
+
+This keeps memory bounded and avoids per-candidate SQLite UDF dispatch on the hot path.
+
+**Legacy cache path** (`@@marmot_vec_use_cache = 'on'`):
+
+1. Load probed partitions into the optional Go-side cache.
+2. Rank directly from cached float32 slices.
+3. Fetch only the final projection rows from SQLite.
+
+This can still be useful for specific workloads, but it consumes more Go heap and is no longer the default path.
+
+**SQLite fallback path**:
+
+If the packed store is absent, a probed cluster is marked dirty, the query has a user predicate that disables packed/shared scan shortcuts, or Go ranking is disabled, the executor falls back to scanning the sidecar members table through SQLite.
 
 Coherence is enforced via a monotonic epoch on the centroid state. Each query captures the epoch used to compute cluster IDs; `cacheRank` skips if `cache.Epoch() ≠ plan.ProbeEpoch` — the SQL path handles the transition.
 
@@ -332,14 +433,14 @@ Only **centroid rows** cross nodes. When `REINDEX VECTOR` runs (manually or auto
 5. The UDF enqueues a rebuild request on the peer's index manager.
 6. A worker drains the request: loads the new centroid blob, re-assigns every local member row against the new centroids using a shadow table, atomically renames the shadow into place, and swaps the in-memory probe state.
 
-Members never replicate — each node rebuilds its own. This keeps the CDC payload to a single compressed blob per REINDEX (typically 3–10 MB at `nlist = 2048`) regardless of data size.
+Members and packed snapshots never replicate — each node rebuilds its own. This keeps the CDC payload to a single compressed blob per REINDEX (typically 3–10 MB at `nlist = 2048`) regardless of data size.
 
 ### REINDEX Flow
 
 Naive `DELETE FROM members; INSERT ...` would hold SQLite's single writer lock for the full rebuild — unacceptable at 1M+ rows. Marmot uses a shadow-table swap:
 
 1. Compute new centroids (k-means||, warm-started from the drift tracker — see [Drift Isolation](#drift-isolation)).
-2. `CREATE TABLE __marmot_vec_<idx>_members_next` with the same schema.
+2. `CREATE TABLE __marmot_vec_<idx>_members_next` with the same schema, including materialized internal `vec` blobs.
 3. **Chunked populate**: in batches of `@@marmot_vec_reindex_chunk_rows` (default 10 000), compute each rowid's new cluster in Go and `INSERT` into the staging table. Each chunk is its own short transaction — writers get slots between chunks.
 4. **Atomic swap txn**:
    - Replay any delta rows (`cluster_id = 0`) that arrived during stages 2–3 by recomputing their new cluster from the current `embed` and inserting into staging.
@@ -349,7 +450,7 @@ Naive `DELETE FROM members; INSERT ...` would hold SQLite's single writer lock f
    - `REPLACE INTO _marmot_vec_<idx>_centroids` with version+1 and the new HLC timestamp (this is the CDC event peers receive).
    - Update status → `ready`.
    - `probeState.Store(new)` inside the same Go function.
-5. Swap completes in tens of milliseconds.
+5. After the swap, the node rebuilds the local packed snapshot and refreshes the resident delta buffer.
 
 Crash recovery at startup drops any orphaned staging table and reverts status — reindex is fully idempotent.
 
@@ -364,7 +465,7 @@ Because probe and member-assignment always read the same probeState, cluster IDs
 
 ### Delta Flush
 
-INSERT/UPDATE triggers on the base table write `(cluster_id = 0, rowid)` into the members table — the delta partition. A per-index goroutine drains it every `@@marmot_vec_delta_flush_interval`:
+INSERT/UPDATE triggers on the base table write `(cluster_id = 0, rowid, vec)` into the members table — the delta partition. A per-index goroutine drains it every `@@marmot_vec_delta_flush_interval`:
 
 1. Capture `cv_start = probeState.Version()`.
 2. For each batch, fetch `(rowid, embed)` from the base table.
@@ -372,7 +473,7 @@ INSERT/UPDATE triggers on the base table write `(cluster_id = 0, rowid)` into th
 4. In one short transaction: check `probeState.Version() == cv_start` (abort if centroids swapped mid-flush), `DELETE` batch from `cluster_id = 0`, `INSERT` with new cluster IDs.
 5. Update the MacQueen drift sums.
 
-Search queries include `cluster_id = 0` in the probe set, so delta rows are always considered — at the cost of a small brute-force scan. Auto-retrain triggers when delta grows beyond `@@marmot_vec_retrain_delta_ratio` of total.
+Search queries always include the resident delta buffer, so fresh rows are queryable before they are merged into stable partitions. Auto-retrain triggers when delta grows beyond `@@marmot_vec_retrain_delta_ratio` of total.
 
 ### Auto-Retrain
 
@@ -399,20 +500,42 @@ Given the same replicated data, both nodes produce byte-identical centroid blobs
 
 ## Performance
 
-Measured on Apple M3 Pro, 100 000 vectors × 128 dimensions, cosine metric, `nlist = 128`, `nprobe = 8` (the benchmark defaults):
+Current packed-path DBpedia numbers on ARM for the verified 100K subset run:
 
 | Metric | Value |
 |---|---|
-| Recall @ 10 | 0.994 |
-| Serial search p99 | 1.7 – 3.1 ms |
-| Memory per index | ~51 MB |
-| REINDEX (100 K rows) | ~1.4 s |
+| Read throughput | `2089 QPS` |
+| Query concurrency | `8` |
+| p50 latency | `3.69 ms` |
+| p95 latency | `5.41 ms` |
+| p99 latency | `6.14 ms` |
+| RSS after measurement | `753 MB` |
 
-k-means init scales to 1 M × 2048 in ~75 s (historical 11+ hour O(n·k²) init was replaced by k-means|| per Bahmani 2012).
+Those numbers are from `vec-bench` without CPU profiling. Profiled runs on the same workload were lower, around `843–846 QPS`, because CPU profiling was enabled.
 
-Parallel query throughput saturates around 12 cores on the M3 Pro; tail latency under saturation is not a reported target — the p99 contract applies to single-query latency.
+For large high-dimensional corpora, the packed path keeps Go heap low by leaning on mmap + SQLite page cache. The optional legacy Go cache can still improve some workloads, but it is intentionally off by default because it trades throughput for a larger memory footprint.
 
-Memory grows linearly with vector count and dimension: `n × dim × 4 bytes` for the in-memory cache, plus ~50 MB for MacQueen drift state and centroid snapshots. At 1 M × 1536 dimensions the cache is ~600 MB per index — consider setting `@@marmot_vec_use_cache = 'off'` for very large high-dim corpora.
+## Benchmarking with `vec-bench`
+
+`cmd/vec-bench` exercises the incremental lifecycle: create table, create index, insert rows online, optionally wait for delta flush, then run warmup and measured query phases.
+
+Most useful flags:
+
+| Flag | Meaning |
+|---|---|
+| `--query-concurrency` | Query goroutines during measurement. Defaults to `GOMAXPROCS`. |
+| `--read-pool` | SQLite read-pool size. `0` means match query concurrency. |
+| `--use-go-rank` | Enable the Go-side ranking path. Default `true`. |
+| `--use-cache` | Enable the legacy Go partition cache. Default `false`. |
+| `--cache-bytes` | Per-index cache budget when `--use-cache` is on. |
+| `--sqlite-cache-mb` | SQLite page-cache budget for benchmark connections. |
+| `--shared-scan-window` | Shared-scan microbatch window for SQLite fallback plans. |
+| `--shared-scan-max-requests` | Max fallback requests per shared-scan batch. |
+| `--shared-scan-max-union` | Max distinct probed clusters per shared-scan batch. |
+| `--delta-flush-interval` | Override product delta-flush interval for the run. |
+| `--delta-flush-max-rows` | Override max rows flushed per cycle. |
+| `--delta-flush-batch` | Override rows committed per flush batch. |
+| `--profile-cpu` | Enable or disable warmup/measurement CPU profiles. |
 
 ---
 

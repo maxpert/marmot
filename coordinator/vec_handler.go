@@ -28,6 +28,40 @@ func (h *CoordinatorHandler) maybeRewriteVectorSelect(
 		return nil, nil, nil
 	}
 
+	execParams := params
+	if len(execParams) == 0 && len(stmt.ExtractedParams) > 0 {
+		execParams = stmt.ExtractedParams
+	}
+
+	querySession := &connQuerySession{vars: &session.VecVars}
+	templateKey := makeGoRankTemplateKey(stmt.SQL, session.CurrentDatabase, querySession)
+	if template, ok := h.loadGoRankTemplate(templateKey); ok {
+		queryVec, err := template.resolveQueryVec(execParams)
+		if err != nil {
+			return nil, nil, err
+		}
+		meta, found := mgr.GetIndexByColumn("", template.tableName, template.columnName)
+		if !found {
+			return nil, nil, fmt.Errorf("MARMOT-VEC-022: no vector index on %s.%s", template.tableName, template.columnName)
+		}
+		nprobe := querySession.Nprobe(meta.Nprobe)
+		clusterIDs, probeEpoch, err := probeClustersWithEpoch(engine, meta.IndexName, queryVec, nprobe)
+		if err != nil {
+			return nil, nil, err
+		}
+		info, err := template.buildInfo(queryVec, meta, clusterIDs, probeEpoch, nprobe, session.VecVars.UseCache)
+		if err != nil {
+			return nil, nil, err
+		}
+		rewrittenArgs := execParams
+		if template.queryArgIdx >= 0 && template.queryArgIdx < len(execParams) {
+			rewrittenArgs = make([]interface{}, 0, len(execParams)-1)
+			rewrittenArgs = append(rewrittenArgs, execParams[:template.queryArgIdx]...)
+			rewrittenArgs = append(rewrittenArgs, execParams[template.queryArgIdx+1:]...)
+		}
+		return info, rewrittenArgs, nil
+	}
+
 	// Prefer the AST threaded through by the upstream parser pipeline. The
 	// rewriter mutates node fields (e.g., vec_distance → vec_distance_<metric>
 	// in ORDER BY), so we hand it a Clone rather than the shared AST the
@@ -44,11 +78,6 @@ func (h *CoordinatorHandler) maybeRewriteVectorSelect(
 		ast = parsed
 	}
 
-	execParams := params
-	if len(execParams) == 0 && len(stmt.ExtractedParams) > 0 {
-		execParams = stmt.ExtractedParams
-	}
-
 	queryVec, queryArgIdx, hasMatch, err := extractVecMatchQueryArg(ast, execParams)
 	if err != nil {
 		return nil, nil, err
@@ -57,7 +86,7 @@ func (h *CoordinatorHandler) maybeRewriteVectorSelect(
 		return nil, nil, nil
 	}
 
-	info, err := RewriteVectorQuery(ast, queryVec, NewQuerySession(session), engine, mgr)
+	info, err := RewriteVectorQuery(ast, queryVec, querySession, engine, mgr)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -73,6 +102,12 @@ func (h *CoordinatorHandler) maybeRewriteVectorSelect(
 		rewrittenArgs = make([]interface{}, 0, len(execParams)-1)
 		rewrittenArgs = append(rewrittenArgs, execParams[:queryArgIdx]...)
 		rewrittenArgs = append(rewrittenArgs, execParams[queryArgIdx+1:]...)
+	}
+
+	if info.GoRank != nil {
+		if tpl, tplErr := buildGoRankRewriteTemplate(ast, info, queryVec, queryArgIdx); tplErr == nil {
+			h.storeGoRankTemplate(templateKey, tpl)
+		}
 	}
 
 	return info, rewrittenArgs, nil

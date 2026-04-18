@@ -66,6 +66,12 @@ func MembersRowidIndex(idx string) string {
 	return "__marmot_vec_" + idx + "_members_rid"
 }
 
+// MembersRowidUniqueIndex returns the unique secondary index name that
+// enforces one live sidecar row per base-table rowid.
+func MembersRowidUniqueIndex(idx string) string {
+	return "__marmot_vec_" + idx + "_members_rowid_uq"
+}
+
 // TriggerInsert returns the AFTER INSERT trigger name on the base table.
 func TriggerInsert(idx string) string {
 	return "__marmot_vec_" + idx + "_ai"
@@ -100,6 +106,18 @@ func TriggerCentroidsVersionUpdate(idx string) string {
 // a shadow-swap REINDEX (design §8.3). Dropped and recreated each REINDEX.
 func StagingTable(idx string) string {
 	return "__marmot_vec_" + idx + "_members_next"
+}
+
+// StagingRowidIndex returns the transient rowid index name used during
+// REINDEX populate before the staging table is swapped into members.
+func StagingRowidIndex(idx string) string {
+	return "__marmot_vec_" + idx + "_members_next_rid"
+}
+
+// StagingRowidUniqueIndex returns the transient unique rowid index name used
+// during REINDEX populate to enforce one staged row per base-table rowid.
+func StagingRowidUniqueIndex(idx string) string {
+	return "__marmot_vec_" + idx + "_members_next_rowid_uq"
 }
 
 // vecLocalPrefix is the double-underscore prefix for CDC-excluded vec objects.
