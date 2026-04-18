@@ -48,7 +48,6 @@ type GoRankPlan struct {
 
 	FinalSelectList  string
 	FinalFromClause  string
-	AllowCache       bool
 	HasUserPredicate bool
 	DirectPKColumn   string
 	DirectPKLabel    string
@@ -215,23 +214,6 @@ func (h *CoordinatorHandler) executeGoRankPlan(
 	plan *GoRankPlan,
 	rewrittenArgs []interface{},
 ) (*protocol.ResultSet, error) {
-	if plan.AllowCache {
-		if items, ok := h.cacheRank(plan); ok {
-			if rs, ok, err := h.tryDirectPKResult(plan, items); err != nil {
-				return nil, err
-			} else if ok {
-				return rs, nil
-			}
-			// Fall back to base-table projection only when the direct PK fast
-			// path is not applicable.
-			conn, err := h.dbManager.GetDatabaseReadConnection(plan.Database)
-			if err != nil {
-				return nil, fmt.Errorf("MARMOT-VEC-030: get db for go-rank: %w", err)
-			}
-			return h.fetchProjectionByRowID(conn, plan, nil, items)
-		}
-	}
-
 	if items, ok, err := h.packedRank(plan); err != nil {
 		return nil, err
 	} else if ok {
@@ -332,8 +314,7 @@ func (h *CoordinatorHandler) canUseSharedScan(plan *GoRankPlan) bool {
 	if plan == nil {
 		return false
 	}
-	// v1 batches only the unfiltered, no-cache Go-rank path.
-	return !plan.AllowCache && !plan.HasUserPredicate && len(plan.CandidateArgFilter) == 0
+	return !plan.HasUserPredicate && len(plan.CandidateArgFilter) == 0
 }
 
 func clusterIDsWithDelta(clusterIDs []int64) []int64 {
@@ -377,86 +358,8 @@ func (h *CoordinatorHandler) refreshProbeClusterIDs(plan *GoRankPlan) []int64 {
 	return clusterIDs
 }
 
-// cacheRank executes the Go-side ranking path against the in-memory
-// VectorCache when the cache is usable. Returns (topK, true) on cache hit,
-// (nil, false) when the caller should fall back to the SQL candidate scan.
-//
-// A cache is "usable" when: the engine exposes LookupCache (Engine does), a
-// non-nil cache exists, and cache.Epoch matches the active probeState's
-// epoch (guards against the reindex-swap gap between probe swap and cache
-// installation). Delta-flush candidates live under cluster_id=0 and are
-// always scanned in addition to plan.ClusterIDs to preserve recall.
-func (h *CoordinatorHandler) cacheRank(plan *GoRankPlan) ([]rankItem, bool) {
-	provider := h.loadVectorEngine()
-	if provider == nil {
-		return nil, false
-	}
-	cacheProvider, ok := provider.(interface {
-		LookupCache(indexName string) *vecindex.VectorCache
-	})
-	if !ok {
-		return nil, false
-	}
-	cache := cacheProvider.LookupCache(plan.IndexName)
-	if cache == nil {
-		return nil, false
-	}
-	if plan.ProbeEpoch == 0 || cache.Epoch() != plan.ProbeEpoch {
-		return nil, false
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	partitions, err := cache.BulkGetPartitions(ctx, plan.ClusterIDs)
-	if err != nil {
-		return nil, false
-	}
-
-	qv := plan.QueryVec
-	heap := newTopKHeap(plan.K)
-
-	// Inline the per-metric distance dispatch so the inner loop stays tight.
-	// For cosine, qv is pre-normalized in BuildGoRankPlan and cached vectors
-	// are pre-normalized in the SQL loader, so CosineDistanceUnit reduces to a
-	// single SIMD dot + subtract.
-	switch plan.RankMetric {
-	case metric.MetricCosine:
-		for _, entry := range cache.DeltaSnapshot() {
-			if len(entry.Vec) == len(qv) {
-				heap.Push(entry.RowID, metric.CosineDistanceUnit(qv, entry.Vec))
-			}
-		}
-		for _, cid := range plan.ClusterIDs {
-			part := partitions[cid]
-			for i, rid := range part.RowIDs {
-				vec := part.Vector(i, len(qv))
-				if len(vec) == len(qv) {
-					heap.Push(rid, metric.CosineDistanceUnit(qv, vec))
-				}
-			}
-		}
-	default:
-		for _, entry := range cache.DeltaSnapshot() {
-			if len(entry.Vec) == len(qv) {
-				heap.Push(entry.RowID, metric.Distance(plan.RankMetric, qv, entry.Vec))
-			}
-		}
-		for _, cid := range plan.ClusterIDs {
-			part := partitions[cid]
-			for i, rid := range part.RowIDs {
-				vec := part.Vector(i, len(qv))
-				if len(vec) == len(qv) {
-					heap.Push(rid, metric.Distance(plan.RankMetric, qv, vec))
-				}
-			}
-		}
-	}
-
-	return heap.Drain(), true
-}
-
 func (h *CoordinatorHandler) packedRank(plan *GoRankPlan) ([]rankItem, bool, error) {
-	if plan == nil || plan.AllowCache || plan.HasUserPredicate {
+	if plan == nil || plan.HasUserPredicate {
 		return nil, false, nil
 	}
 	provider := h.loadVectorEngine()

@@ -45,7 +45,6 @@ type stubSession struct {
 	prefilterCap int64
 	fallback     string
 	useGoRank    bool
-	useCache     bool
 }
 
 func (s *stubSession) Nprobe(def int) int {
@@ -58,7 +57,6 @@ func (s *stubSession) ForcePlan() string   { return s.forcePlan }
 func (s *stubSession) PrefilterCap() int64 { return s.prefilterCap }
 func (s *stubSession) Fallback() string    { return s.fallback }
 func (s *stubSession) UseGoRank() bool     { return s.useGoRank }
-func (s *stubSession) UseCache() bool      { return s.useCache }
 
 // --- helpers ---
 
@@ -141,12 +139,11 @@ func TestRewrite_ValidVectorQuery(t *testing.T) {
 	require.Equal(t, "cosine", info.Metric)
 }
 
-func TestRewrite_GoRankEnablesCacheOnlyWithoutUserPredicate(t *testing.T) {
+func TestRewrite_GoRankBuildsPlanWithoutUserPredicate(t *testing.T) {
 	t.Parallel()
 
 	sess := defaultSession()
 	sess.useGoRank = true
-	sess.useCache = true
 
 	stmt := parseSQL(t, `SELECT id FROM docs
 		WHERE vec_match(embed, ?, 10)
@@ -156,15 +153,13 @@ func TestRewrite_GoRankEnablesCacheOnlyWithoutUserPredicate(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, info)
 	require.NotNil(t, info.GoRank)
-	require.True(t, info.GoRank.AllowCache)
 }
 
-func TestRewrite_GoRankDisablesCacheWithUserPredicate(t *testing.T) {
+func TestRewrite_GoRankWithUserPredicateBuildsPlan(t *testing.T) {
 	t.Parallel()
 
 	sess := defaultSession()
 	sess.useGoRank = true
-	sess.useCache = true
 
 	stmt := parseSQL(t, `SELECT id FROM docs
 		WHERE vec_match(embed, ?, 10) AND status = 'published'
@@ -174,7 +169,7 @@ func TestRewrite_GoRankDisablesCacheWithUserPredicate(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, info)
 	require.NotNil(t, info.GoRank)
-	require.False(t, info.GoRank.AllowCache)
+	require.True(t, info.GoRank.HasUserPredicate)
 }
 
 // 2. Detection negative: SELECT without vec_match → returns (nil, nil).

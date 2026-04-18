@@ -154,8 +154,8 @@ func Reindex(
 	}
 
 	// Step 5: chunked populate of staging table. Vectors are NOT accumulated
-	// in RAM here — the new cache post-swap starts empty and lazily loads
-	// partitions from the committed members table on first probe.
+	// in RAM here — the primary read path is the packed snapshot plus resident
+	// delta rebuilt after the swap commits.
 	if err := populateStaging(ctx, db, meta, spec, newCS, chunkRows); err != nil {
 		return fmt.Errorf("reindex: populate staging: %w", err)
 	}
@@ -165,15 +165,8 @@ func Reindex(
 		return fmt.Errorf("reindex: swap: %w", err)
 	}
 
-	// Step 7: in-memory swap (probe + drift + optional legacy cache).
-	// Sidecar-streaming search is the primary path; cache install is opt-in.
-	newCache, err := BuildEmptyVectorCache(ctx, db, meta, spec, newCS.Epoch())
-	if err != nil {
-		log.Warn().Err(err).Str("index", meta.IndexName).
-			Msg("reindex: new cache construction failed; searches will fall back to SQL until next reindex")
-	}
+	// Step 7: in-memory swap (probe + drift + resident delta).
 	newState := vecindex.NewIndexState(spec, newCS)
-	newState.StoreCache(newCache)
 	if err := loadAndStoreResidentDelta(ctx, db, newState, spec, meta.TableName, meta.ColumnName); err != nil {
 		log.Warn().Err(err).Str("index", meta.IndexName).
 			Msg("reindex: resident delta load failed")
@@ -674,48 +667,4 @@ func swapEmptyMembers(ctx context.Context, db *sql.DB, meta common.VectorIndexMe
 	}
 	tx = nil
 	return nil
-}
-
-// BuildEmptyVectorCache constructs the optional legacy VectorCache for the
-// index at the given epoch: an empty PartitionCache (lazy-load on first
-// probe) plus a DeltaBuffer eagerly populated with the current
-// cluster_id=0 rows. Returns (nil, nil) when the cache is disabled.
-//
-// Installed AFTER a successful reindex swap or at index-open rehydration.
-// The partition LRU starts empty by design so we don't blow memory decoding
-// every member into RAM at swap time — the old code's 6 GB residency for a
-// 1 M × 1536D index is now bounded by VectorIndex.CacheBytes with
-// cold-start reload on first probe.
-//
-// The *sql.DB should be the READ pool: partition loads run concurrently
-// under WAL and must not serialise on the single writer.
-func BuildEmptyVectorCache(
-	ctx context.Context,
-	db *sql.DB,
-	meta common.VectorIndexMeta,
-	spec vecindex.IVFSpec,
-	epoch uint64,
-) (*vecindex.VectorCache, error) {
-	budget := partitionCacheBytes()
-	if budget == 0 {
-		return nil, nil
-	}
-
-	internalDim := spec.InternalDim()
-	loader := newSQLPartitionLoader(db, meta.IndexName, meta.TableName, meta.ColumnName, internalDim, spec.Metric)
-
-	pc, err := vecindex.NewPartitionCache(vecindex.PartitionCacheOptions{
-		MaxBytes: budget,
-		Dim:      internalDim,
-		Epoch:    epoch,
-		Loader:   loader,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("partition cache: %w", err)
-	}
-	delta, err := loader.loadDelta(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("load delta: %w", err)
-	}
-	return vecindex.NewVectorCache(epoch, pc, delta), nil
 }

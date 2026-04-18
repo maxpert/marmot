@@ -7,18 +7,11 @@ import (
 	"math"
 	"strings"
 
-	"github.com/maxpert/marmot/cfg"
 	"github.com/maxpert/marmot/modules/vecindex"
 	vecmetric "github.com/maxpert/marmot/modules/vecindex/pkg/metric"
 )
 
-// sqlPartitionLoader materialises vecindex partitions from the clustered
-// sidecar members table. It satisfies vecindex.PartitionLoader and is owned by
-// a PartitionCache: invoked only on cache misses.
-//
-// The loader reads from the given *sql.DB — callers should pass the read
-// pool (readDB) so concurrent BulkLoads execute on the WAL-concurrent path
-// rather than serialising against the single writer.
+// sqlPartitionLoader reads the clustered sidecar members table.
 type sqlPartitionLoader struct {
 	db           *sql.DB
 	indexName    string
@@ -35,75 +28,34 @@ func newSQLPartitionLoader(db *sql.DB, indexName, _baseTable, _embedColumn strin
 	}
 }
 
-// BulkLoad reads every requested cluster_id's member vectors in a single
-// statement. Returns a map with one entry per requested key — empty clusters
-// map to a zero-length slice so otter caches the "known empty" state and
-// avoids a repeat load on every probe.
-func (l *sqlPartitionLoader) BulkLoad(ctx context.Context, clusterIDs []int64) (map[int64]vecindex.CachedPartition, error) {
-	if len(clusterIDs) == 0 {
-		return map[int64]vecindex.CachedPartition{}, nil
-	}
-
-	// Pre-seed result with empty slices so any clusterID the loader did not
-	// return a row for still lands in the map (otter-caching contract: keys
-	// omitted from the returned map are NOT cached, causing re-loads).
-	out := make(map[int64]vecindex.CachedPartition, len(clusterIDs))
-	for _, cid := range clusterIDs {
-		out[cid] = vecindex.CachedPartition{}
-	}
-
-	query := l.buildSelect(len(clusterIDs))
-	args := make([]interface{}, len(clusterIDs))
-	for i, cid := range clusterIDs {
-		args[i] = cid
-	}
-
-	rows, err := l.db.QueryContext(ctx, query, args...)
+// loadDelta returns a fully-populated DeltaBuffer containing every
+// cluster_id=0 row.
+func (l *sqlPartitionLoader) loadDelta(ctx context.Context) (*vecindex.DeltaBuffer, error) {
+	rows, err := l.db.QueryContext(ctx, l.buildSelect(1), int64(0))
 	if err != nil {
-		return nil, fmt.Errorf("partition loader query: %w", err)
+		return nil, fmt.Errorf("load delta query: %w", err)
 	}
 	defer rows.Close()
 
+	buf := vecindex.NewDeltaBuffer()
+	var entries []vecindex.CachedVector
 	for rows.Next() {
-		var cid, rid int64
+		var _cid, rid int64
 		var blob []byte
-		if err := rows.Scan(&cid, &rid, &blob); err != nil {
-			return nil, fmt.Errorf("partition loader scan: %w", err)
+		if err := rows.Scan(&_cid, &rid, &blob); err != nil {
+			return nil, fmt.Errorf("load delta scan: %w", err)
 		}
 		vec := l.decodeBlob(blob)
 		if vec == nil {
 			continue
 		}
-		part := out[cid]
-		part.RowIDs = append(part.RowIDs, rid)
-		part.Vecs = append(part.Vecs, vec...)
-		out[cid] = part
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("partition loader iter: %w", err)
-	}
-
-	// Ensure every key has at least a non-empty map entry so the
-	// cache records "empty partition" explicitly.
-	return out, nil
-}
-
-// loadDelta returns a fully-populated DeltaBuffer containing every
-// cluster_id=0 row. Called once at index open; the buffer stays resident for
-// the life of the cache.
-func (l *sqlPartitionLoader) loadDelta(ctx context.Context) (*vecindex.DeltaBuffer, error) {
-	got, err := l.BulkLoad(ctx, []int64{0})
-	if err != nil {
-		return nil, err
-	}
-	buf := vecindex.NewDeltaBuffer()
-	part := got[0]
-	entries := make([]vecindex.CachedVector, 0, part.Len())
-	for i, rid := range part.RowIDs {
 		entries = append(entries, vecindex.CachedVector{
 			RowID: rid,
-			Vec:   append([]float32(nil), part.Vector(i, l.dim)...),
+			Vec:   vec,
 		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("load delta iter: %w", err)
 	}
 	buf.AppendBatch(entries)
 	return buf, nil
@@ -154,13 +106,4 @@ func (l *sqlPartitionLoader) decodeBlob(blob []byte) []float32 {
 		vec[i] = math.Float32frombits(bits)
 	}
 	return vec
-}
-
-// partitionCacheBytes returns the configured byte budget for the legacy
-// in-memory partition cache. Zero means disabled.
-func partitionCacheBytes() uint64 {
-	if cfg.Config != nil {
-		return cfg.Config.VectorIndex.CacheBytes
-	}
-	return 0
 }

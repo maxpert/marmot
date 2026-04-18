@@ -49,7 +49,7 @@ func (h *CoordinatorHandler) maybeRewriteVectorSelect(
 		if err != nil {
 			return nil, nil, err
 		}
-		info, err := template.buildInfo(queryVec, meta, clusterIDs, probeEpoch, nprobe, session.VecVars.UseCache)
+		info, err := template.buildInfo(queryVec, meta, clusterIDs, probeEpoch, nprobe)
 		if err != nil {
 			return nil, nil, err
 		}

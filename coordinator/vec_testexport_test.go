@@ -42,19 +42,3 @@ func (h *CoordinatorHandler) ExecuteVectorPlan(
 ) (*protocol.ResultSet, error) {
 	return h.executeVectorPlan(stmt, info, args, consistency)
 }
-
-// CacheRankForTest exposes the cache-ranking fast path so external tests can
-// verify the epoch coherence guard (task #16). Returns (topKRowIDs, hit) —
-// hit=false means cacheRank fell through to SQL (caller can assert this when
-// the plan's probe epoch does not match the cache).
-func (h *CoordinatorHandler) CacheRankForTest(plan *GoRankPlan) ([]int64, bool) {
-	items, ok := h.cacheRank(plan)
-	if !ok {
-		return nil, false
-	}
-	rowids := make([]int64, len(items))
-	for i, it := range items {
-		rowids[i] = it.rowid
-	}
-	return rowids, true
-}

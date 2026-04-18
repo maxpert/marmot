@@ -61,7 +61,4 @@ type QuerySession interface {
 	Fallback() string
 	// UseGoRank returns true when the Go-side ranking path is enabled.
 	UseGoRank() bool
-	// UseCache returns true when the in-memory vector cache ranking path is
-	// enabled (task #16).
-	UseCache() bool
 }

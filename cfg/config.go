@@ -210,10 +210,6 @@ type ExtensionConfiguration struct {
 type VectorIndexConfiguration struct {
 	Enabled bool   `toml:"enabled"`
 	DataDir string `toml:"data_dir"` // Reserved for future SQLite-native engine data path
-	// CacheBytes caps the per-index in-memory partition cache (otter W-TinyLFU).
-	// The always-resident delta buffer (cluster_id=0) is excluded from this
-	// budget. 0 disables the legacy Go-side vector cache.
-	CacheBytes uint64 `toml:"cache_bytes"`
 }
 
 // Configuration is the main configuration structure
@@ -381,8 +377,7 @@ var Config = &Configuration{
 	},
 
 	VectorIndex: VectorIndexConfiguration{
-		Enabled:    false,
-		CacheBytes: 0, // disabled by default; sidecar streaming is the primary path
+		Enabled: false,
 	},
 }
 

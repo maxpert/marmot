@@ -46,9 +46,6 @@ type VecSessionVars struct {
 	// UseGoRank enables the Go-side ranking path that bypasses per-row UDF
 	// dispatch on post-filter plans (§7.6).
 	UseGoRank bool
-	// UseCache enables the legacy in-memory vector cache ranking path.
-	// Sidecar streaming remains the primary runtime path.
-	UseCache bool
 
 	// Delta flush
 	DeltaFlushInterval int // seconds between delta flush ticks
@@ -71,7 +68,6 @@ func DefaultVecSessionVars() VecSessionVars {
 		PrefilterCap:         5000,
 		Fallback:             true,
 		UseGoRank:            true,
-		UseCache:             false,
 		DeltaFlushInterval:   10,
 		DeltaMaxRows:         10000,
 		DeltaFlushBatch:      1000,
@@ -124,13 +120,6 @@ func (v *VecSessionVars) Apply(name, value string) error {
 			return err
 		}
 		v.UseGoRank = b
-
-	case "marmot_vec_use_cache":
-		b, err := parseOnOff(name, value)
-		if err != nil {
-			return err
-		}
-		v.UseCache = b
 
 	case "marmot_vec_delta_flush_interval":
 		n, err := parsePositiveInt(name, value, false)

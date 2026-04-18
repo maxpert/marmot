@@ -43,10 +43,17 @@ func TestEngine_Unregister(t *testing.T) {
 	t.Parallel()
 	e := makeEngine(t)
 	state := makeState(t, "emb", 2, [][]float32{{1, 0}})
+	store, err := CreatePackedPartitionStoreWriter(t.TempDir()+"/emb.vecpack", 2, 1)
+	require.NoError(t, err)
+	require.NoError(t, store.Append(1, 1, encodeVec([]float32{1, 0})))
+	packed, err := store.Close()
+	require.NoError(t, err)
+	state.StorePackedStore(packed)
 	e.Register("emb", state)
 	e.Unregister("emb")
 	_, ok := e.Lookup("emb")
 	require.False(t, ok)
+	require.Nil(t, state.LoadPackedStore())
 }
 
 func TestEngine_UnregisterNoop(t *testing.T) {

@@ -539,7 +539,7 @@ SELECT id, title
 - **Cost-based planner**: brute-force over a narrow `WHERE` predicate, or IVF probe when the index is cheaper. You do not pick — the planner does. Short-result fallback fills to K when a predicate was too aggressive.
 - **Local derived state**: the replicated source of truth stays in your base table, while Marmot materializes local sidecar vectors and a packed stable-partition snapshot for fast reads.
 - **Replication by design**: only a small zstd-compressed centroid blob replicates. Membership, packed snapshots, and other read-optimized state are rebuilt locally on each node from the same data, byte-deterministic across nodes so concurrent CREATE/REINDEX converges without wasted work.
-- **Low-memory default hot path**: packed stable partitions are mmap-read from a local snapshot, the delta partition stays resident, and the legacy Go partition cache is optional and off by default.
+- **Low-memory hot path**: packed stable partitions are mmap-read from a local snapshot and the delta partition stays resident.
 - **Auto-retrain**: background monitor trips REINDEX when cluster growth or delta ratio crosses a tunable threshold. Manual `REINDEX VECTOR` is always available.
 - **Scale**: k-means|| initialization scales to 1 M × 2048 centroids in roughly 75 seconds.
 
@@ -549,7 +549,6 @@ SELECT id, title
 - **Members sidecar**: `__marmot_vec_<idx>_members` stores `(cluster_id, rowid, vec)` locally; `cluster_id = 0` is the delta partition.
 - **Packed snapshot**: stable `cluster_id > 0` partitions are compacted into a local `.vecpack` file and scanned directly on the primary read path.
 - **Resident delta**: fresh inserts stay queryable immediately through an always-resident `cluster_id = 0` buffer.
-- **Legacy cache**: `vector_index.cache_bytes` and `@@marmot_vec_use_cache` control the older Go-side partition cache; it is no longer the default path.
 
 ### Controls
 
@@ -559,13 +558,6 @@ SET @@marmot_vec_force_plan = 'pre';     -- 'auto' | 'pre' | 'post'
 SET @@marmot_vec_nprobe = 32;
 SET @@marmot_vec_fallback = 'on';
 SET @@marmot_vec_use_go_rank = 'on';
-SET @@marmot_vec_use_cache = 'off';
-```
-
-```toml
-[vector_index]
-enabled = true
-cache_bytes = 0  # 0 disables the legacy Go partition cache
 ```
 
 ### Benchmarks

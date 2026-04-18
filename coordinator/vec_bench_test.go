@@ -902,7 +902,6 @@ ORDER BY vec_distance(embed, ?) LIMIT 10`
 
 	sess := newBenchSession()
 	sess.VecVars.Fallback = false
-	sess.VecVars.UseCache = true
 	sess.VecVars.UseGoRank = true
 
 	// Warm cache once so the rewrite subtests run against a populated cache.

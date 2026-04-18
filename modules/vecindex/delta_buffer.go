@@ -2,6 +2,12 @@ package vecindex
 
 import "sync/atomic"
 
+// CachedVector is one resident queryable vector kept in memory.
+type CachedVector struct {
+	RowID int64
+	Vec   []float32
+}
+
 // DeltaBuffer is the always-resident buffer for cluster_id=0, which holds
 // rows that have been inserted since the last reindex but not yet assigned
 // to a centroid-specific partition. Every query MUST scan the delta buffer

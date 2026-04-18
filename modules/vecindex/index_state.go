@@ -19,18 +19,12 @@ var ErrNoCentroidsLoaded = errors.New("vecindex: no centroids loaded")
 // seeds the next k-means warm start. driftTracker accumulates the running
 // sum/count statistics that produce the drifted centroids.
 //
-// vectorCache is the optional in-memory (cluster_id → entries) snapshot that
-// lets the coordinator rank candidates in Go without a SQLite cursor (task
-// #16). Epoch-tagged so searches can fall back to SQL when the cache has not
-// yet caught up to a fresh probeState.
-//
 // All pointers are stored as atomic.Pointer so readers are lock-free.
 type IndexState struct {
 	spec          IVFSpec
 	probeState    atomic.Pointer[kmeans.CentroidSet]
 	driftState    atomic.Pointer[kmeans.CentroidSet]
 	driftTracker  atomic.Pointer[DriftTracker]
-	vectorCache   atomic.Pointer[VectorCache]
 	residentDelta atomic.Pointer[DeltaBuffer]
 	packedStore   atomic.Pointer[PackedPartitionStore]
 	packedDirty   atomic.Pointer[packedDirtySet]
@@ -136,21 +130,6 @@ func (s *IndexState) LoadDriftTracker() *DriftTracker {
 	return s.driftTracker.Load()
 }
 
-// LoadCache returns the current in-memory vector cache snapshot, or nil when
-// no cache has been installed. The returned *VectorCache is immutable.
-func (s *IndexState) LoadCache() *VectorCache {
-	return s.vectorCache.Load()
-}
-
-// StoreCache atomically installs c as the active vector cache, replacing any
-// prior snapshot. Passing nil clears the cache.
-func (s *IndexState) StoreCache(c *VectorCache) {
-	s.vectorCache.Store(c)
-	if c != nil && c.delta != nil {
-		s.residentDelta.Store(c.delta)
-	}
-}
-
 // LoadResidentDelta returns the always-resident cluster_id=0 buffer used by
 // the packed streaming path. The returned buffer is immutable to callers.
 func (s *IndexState) LoadResidentDelta() *DeltaBuffer {
@@ -204,76 +183,26 @@ func (s *IndexState) PackedClusterDirty(clusterID int64) bool {
 	return ok
 }
 
-// CacheClear atomically drops the cache. No-op if no cache is installed.
-func (s *IndexState) CacheClear() {
-	s.vectorCache.Store(nil)
-}
-
-// CacheInsertBatch reflects a post-delta-flush batch in the cache: the rows
-// identified by RowID have just migrated from cluster_id=0 to their real
-// ClusterID on disk. Accordingly we (a) remove their rowids from the delta
-// buffer, and (b) invalidate each touched partition so the next probe
-// reloads from SQL with the new rows included.
-//
-// The expected epoch must match the cache's epoch; on mismatch this is a
-// no-op so stale delta-flush writes cannot corrupt a newly-swapped
-// post-reindex cache.
-func (s *IndexState) CacheInsertBatch(expectedEpoch uint64, entries []CacheEntry) {
+// ApplyDeltaFlushUpdates reflects a committed delta-flush batch in memory:
+// rowids are removed from the resident delta buffer and touched clusters are
+// marked dirty so subsequent packed reads consult SQLite until the next
+// snapshot rebuild.
+func (s *IndexState) ApplyDeltaFlushUpdates(expectedEpoch uint64, entries []PartitionUpdate) {
 	if len(entries) == 0 {
 		return
 	}
 	if s.ProbeVersion() != expectedEpoch {
 		return
 	}
-	cache := s.vectorCache.Load()
 	if delta := s.residentDelta.Load(); delta != nil {
 		for _, e := range entries {
 			delta.Remove(e.RowID)
 		}
 	}
-
-	if cache != nil && cache.epoch == expectedEpoch && cache.partitions != nil {
-		partitions := cache.partitions
-		seen := make(map[int64]struct{}, len(entries))
-		for _, e := range entries {
-			if _, ok := seen[e.ClusterID]; ok {
-				continue
-			}
-			seen[e.ClusterID] = struct{}{}
-			partitions.Invalidate(e.ClusterID)
-		}
-	}
 	s.markPackedClustersDirty(entries)
 }
 
-// CacheDelete removes the row identified by rowid from the cache. Tries the
-// delta buffer first (cheap O(n) scan over a bounded buffer); if the row is
-// not resident there, falls back to invalidating whichever cached partition
-// holds it so the next probe reloads without the stale row.
-//
-// A deleted rowid that is on disk but not resident in any cached partition
-// needs no action — its next load reads post-delete state.
-func (s *IndexState) CacheDelete(rowid int64) {
-	if delta := s.residentDelta.Load(); delta != nil {
-		if delta.Remove(rowid) {
-			s.ClearPackedStore()
-		}
-	}
-	cache := s.vectorCache.Load()
-	if cache == nil {
-		return
-	}
-	if cache.delta != nil && cache.delta.Remove(rowid) {
-		s.ClearPackedStore()
-		return
-	}
-	if cache.partitions != nil {
-		cache.partitions.FindAndInvalidate(rowid)
-	}
-	s.ClearPackedStore()
-}
-
-func (s *IndexState) markPackedClustersDirty(entries []CacheEntry) {
+func (s *IndexState) markPackedClustersDirty(entries []PartitionUpdate) {
 	if s.packedStore.Load() == nil || len(entries) == 0 {
 		return
 	}

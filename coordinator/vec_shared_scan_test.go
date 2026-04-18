@@ -66,12 +66,6 @@ func TestMakeVecSharedScanKey(t *testing.T) {
 		t.Fatalf("expected probe epoch to participate in the batch key, got %+v", keyF)
 	}
 
-	planD := *planA
-	planD.AllowCache = true
-	if _, ok := makeVecSharedScanKey(&planD); ok {
-		t.Fatal("cacheable plan must not enter shared scan batching")
-	}
-
 	planE := *planA
 	planE.CandidateArgFilter = []int{0}
 	if _, ok := makeVecSharedScanKey(&planE); ok {

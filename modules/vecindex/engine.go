@@ -110,26 +110,13 @@ func (e *Engine) Register(indexName string, state *IndexState) {
 }
 
 // Unregister removes the IndexState for indexName from the engine.
-// It is a no-op if indexName is not registered. Clears the in-memory vector
-// cache first so pending searches observe a nil cache before losing the state.
+// It is a no-op if indexName is not registered.
 func (e *Engine) Unregister(indexName string) {
 	if val, ok := e.indexes.Load(indexName); ok {
 		state := val.(*IndexState)
-		state.CacheClear()
 		state.ClearPackedStore()
 	}
 	e.indexes.Delete(indexName)
-}
-
-// LookupCache returns the active VectorCache for indexName, or nil when no
-// cache is installed. Used by the coordinator's Go-side ranking path to
-// bypass SQLite when cache coverage is available.
-func (e *Engine) LookupCache(indexName string) *VectorCache {
-	state, ok := e.Lookup(indexName)
-	if !ok {
-		return nil
-	}
-	return state.LoadCache()
 }
 
 // Lookup returns the IndexState for indexName and whether it was found.

@@ -31,7 +31,7 @@ type vecSharedScanKey struct {
 }
 
 func makeVecSharedScanKey(plan *GoRankPlan) (vecSharedScanKey, bool) {
-	if plan == nil || plan.AllowCache || plan.HasUserPredicate || plan.K <= 0 || len(plan.QueryVec) == 0 || len(plan.CandidateArgFilter) != 0 {
+	if plan == nil || plan.HasUserPredicate || plan.K <= 0 || len(plan.QueryVec) == 0 || len(plan.CandidateArgFilter) != 0 {
 		return vecSharedScanKey{}, false
 	}
 	return vecSharedScanKey{

@@ -216,7 +216,6 @@ func RewriteVectorQuery(
 			}
 			goRank.Database = meta.Database
 			goRank.ProbeEpoch = probeEpoch
-			goRank.AllowCache = session.UseCache() && userPred == nil
 			info.GoRank = goRank
 		}
 	}

@@ -95,10 +95,7 @@ func seedMaterializedVector(t *testing.T, db *sql.DB, indexName string, clusterI
 // Contract tests for metric-aware normalisation in the SQL partition loader.
 // -----------------------------------------------------------------------------
 
-// TestLoader_CosineReadsMaterializedSidecarVectors pins the new contract:
-// cosine vectors are already unit-normalized in the sidecar, so the loader
-// must return those stored values directly.
-func TestLoader_CosineReadsMaterializedSidecarVectors(t *testing.T) {
+func TestLoader_DecodeBlob_CosineReadsMaterializedSidecarVectors(t *testing.T) {
 	t.Parallel()
 	const (
 		dim = 8
@@ -114,31 +111,25 @@ func TestLoader_CosineReadsMaterializedSidecarVectors(t *testing.T) {
 	seedMaterializedVector(t, db, idx, 1, 102, v2, vecindex.MetricCosine)
 
 	loader := newSQLPartitionLoader(db, idx, base, "embed", dim, vecindex.MetricCosine)
-	got, err := loader.BulkLoad(context.Background(), []int64{1})
+	blob1, err := materializeVectorBlob(encodeLEBlob(v1), vecindex.MetricCosine, dim, 0)
 	require.NoError(t, err)
-	require.Equal(t, 2, got[1].Len(), "both non-zero vectors must be returned")
-
-	for i := range got[1].RowIDs {
-		assertUnitNorm(t, got[1].Vector(i, dim), 1e-5)
-	}
-
-	// Direction preservation on v1: {3,4,...}/5 → first element 0.6.
-	var first []float32
-	for i, rid := range got[1].RowIDs {
-		if rid == 101 {
-			first = got[1].Vector(i, dim)
-			break
-		}
-	}
-	require.NotNil(t, first, "rowid=101 must be present")
+	first := loader.decodeBlob(blob1)
+	require.NotNil(t, first)
 	require.InDelta(t, 0.6, first[0], 1e-5, "first component of v1 after normalisation must be 3/5")
 	require.InDelta(t, 0.8, first[1], 1e-5, "second component of v1 after normalisation must be 4/5")
+	assertUnitNorm(t, first, 1e-5)
+
+	blob2, err := materializeVectorBlob(encodeLEBlob(v2), vecindex.MetricCosine, dim, 0)
+	require.NoError(t, err)
+	second := loader.decodeBlob(blob2)
+	require.NotNil(t, second)
+	assertUnitNorm(t, second, 1e-5)
 }
 
 // TestLoader_UsesSidecarVecInsteadOfBaseTableBlob catches regressions back to
 // the old members JOIN base design: the loader must ignore docs.embed and read
 // only the clustered sidecar vec column.
-func TestLoader_UsesSidecarVecInsteadOfBaseTableBlob(t *testing.T) {
+func TestLoader_LoadDelta_UsesSidecarVecInsteadOfBaseTableBlob(t *testing.T) {
 	t.Parallel()
 	const (
 		dim = 4
@@ -149,20 +140,20 @@ func TestLoader_UsesSidecarVecInsteadOfBaseTableBlob(t *testing.T) {
 	baseVec := []float32{9, 9, 9, 9}
 	sidecarVec := []float32{1, 0, 0, 0}
 	seedBaseVector(t, db, 201, baseVec)
-	seedMemberBlob(t, db, idx, 1, 201, encodeLEBlob(sidecarVec))
+	seedMemberBlob(t, db, idx, 0, 201, encodeLEBlob(sidecarVec))
 
 	loader := newSQLPartitionLoader(db, idx, base, "embed", dim, vecindex.MetricCosine)
-	got, err := loader.BulkLoad(context.Background(), []int64{1})
+	got, err := loader.loadDelta(context.Background())
 	require.NoError(t, err)
-	require.Equal(t, 1, got[1].Len())
-	require.Equal(t, int64(201), got[1].RowIDs[0])
-	require.Equal(t, sidecarVec, got[1].Vector(0, dim))
+	require.Len(t, got.Snapshot(), 1)
+	require.Equal(t, int64(201), got.Snapshot()[0].RowID)
+	require.Equal(t, sidecarVec, got.Snapshot()[0].Vec)
 }
 
 // TestLoader_L2PreservesRawBytes pins: MetricL2 must return bit-identical
 // float32 values. No normalisation, no mutation — the cached slice must be
 // exactly decodable back to the stored bits.
-func TestLoader_L2PreservesRawBytes(t *testing.T) {
+func TestLoader_DecodeBlob_L2PreservesRawBytes(t *testing.T) {
 	t.Parallel()
 	const (
 		dim = 8
@@ -172,14 +163,10 @@ func TestLoader_L2PreservesRawBytes(t *testing.T) {
 
 	raw := make([]float32, dim)
 	raw[0], raw[1] = 3, 4 // norm = 5; must NOT be normalised.
-	seedMaterializedVector(t, db, idx, 1, 301, raw, vecindex.MetricL2)
-
 	loader := newSQLPartitionLoader(db, idx, base, "embed", dim, vecindex.MetricL2)
-	got, err := loader.BulkLoad(context.Background(), []int64{1})
+	blob, err := materializeVectorBlob(encodeLEBlob(raw), vecindex.MetricL2, dim, 0)
 	require.NoError(t, err)
-	require.Equal(t, 1, got[1].Len())
-
-	out := got[1].Vector(0, dim)
+	out := loader.decodeBlob(blob)
 	require.Len(t, out, dim)
 	for i := range raw {
 		require.Equalf(t,
@@ -191,7 +178,7 @@ func TestLoader_L2PreservesRawBytes(t *testing.T) {
 
 // TestLoader_DotPreservesRawBytes mirrors the L2 contract for MetricDot —
 // callers augment/normalise outside the loader if needed.
-func TestLoader_DotPreservesRawBytes(t *testing.T) {
+func TestLoader_DecodeBlob_DotPreservesRawBytes(t *testing.T) {
 	t.Parallel()
 	const (
 		dim = 8
@@ -201,14 +188,10 @@ func TestLoader_DotPreservesRawBytes(t *testing.T) {
 
 	raw := make([]float32, dim)
 	raw[0], raw[1] = 3, 4
-	seedMaterializedVector(t, db, idx, 1, 401, raw, vecindex.MetricDot)
-
 	loader := newSQLPartitionLoader(db, idx, base, "embed", dim+1, vecindex.MetricDot)
-	got, err := loader.BulkLoad(context.Background(), []int64{1})
+	blob, err := materializeVectorBlob(encodeLEBlob(raw), vecindex.MetricDot, dim, metric.Norm(raw)+1)
 	require.NoError(t, err)
-	require.Equal(t, 1, got[1].Len())
-
-	out := got[1].Vector(0, dim+1)
+	out := loader.decodeBlob(blob)
 	require.Len(t, out, dim+1)
 }
 
@@ -264,41 +247,6 @@ func TestLoader_LoadDeltaL2PreservesRaw(t *testing.T) {
 	}
 }
 
-// TestLoader_MissingClusterReturnsEmptySlice pins the pre-existing cache
-// contract: requested cluster_ids with no member rows must map to a
-// non-nil, zero-length slice so otter caches the "known empty" state
-// rather than re-loading on every probe. This invariant MUST survive the
-// metric-aware normalise change — tests run for both cosine and L2.
-func TestLoader_MissingClusterReturnsEmptySlice(t *testing.T) {
-	t.Parallel()
-	const (
-		dim = 4
-		idx = "missing"
-	)
-
-	cases := []struct {
-		name string
-		m    metric.Metric
-	}{
-		{"cosine", vecindex.MetricCosine},
-		{"l2", vecindex.MetricL2},
-		{"dot", vecindex.MetricDot},
-	}
-	for _, tc := range cases {
-		tc := tc
-		t.Run(tc.name, func(t *testing.T) {
-			db, base := newLoaderTestDB(t, idx)
-			loader := newSQLPartitionLoader(db, idx, base, "embed", dim, tc.m)
-			got, err := loader.BulkLoad(context.Background(), []int64{999})
-			require.NoError(t, err)
-			s, ok := got[999]
-			require.True(t, ok, "missing cluster key must still be present in map")
-			require.Empty(t, s.RowIDs, "missing cluster rowids must be zero-length")
-			require.Empty(t, s.Vecs, "missing cluster vecs must be zero-length")
-		})
-	}
-}
-
 // TestLoader_CosineRoundTripPrecision pins single-precision stability:
 // unit vectors that are encoded → stored → loaded with MetricCosine must
 // survive the round-trip within 1e-6 per component. Uses 32 random unit
@@ -332,16 +280,18 @@ func TestLoader_CosineRoundTripPrecision(t *testing.T) {
 		}
 		rowID := i + 10
 		originals[rowID] = v
-		seedMaterializedVector(t, db, idx, 1, rowID, v, vecindex.MetricCosine)
+		seedMaterializedVector(t, db, idx, 0, rowID, v, vecindex.MetricCosine)
 	}
 
 	loader := newSQLPartitionLoader(db, idx, base, "embed", dim, vecindex.MetricCosine)
-	got, err := loader.BulkLoad(context.Background(), []int64{1})
+	got, err := loader.loadDelta(context.Background())
 	require.NoError(t, err)
-	require.Equal(t, n, got[1].Len())
+	snap := got.Snapshot()
+	require.Len(t, snap, n)
 
-	for i, rid := range got[1].RowIDs {
-		cv := got[1].Vector(i, dim)
+	for _, entry := range snap {
+		rid := entry.RowID
+		cv := entry.Vec
 		want, ok := originals[rid]
 		require.True(t, ok, "unexpected rowid in result: %d", rid)
 		require.Equal(t, len(want), len(cv))

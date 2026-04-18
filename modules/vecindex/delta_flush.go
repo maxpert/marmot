@@ -160,18 +160,14 @@ func deltaFlushCycle(
 				state.DriftUpdate(a.ClusterID, a.vec)
 			}
 
-			// Cache update (task #16) — epoch-gated inside CacheInsertBatch so a
-			// concurrent REINDEX that already installed a fresh cache cannot have
-			// these stale entries leaked back in.
-			cacheEntries := make([]CacheEntry, 0, len(batch))
+			updates := make([]PartitionUpdate, 0, len(batch))
 			for _, a := range batch {
-				cacheEntries = append(cacheEntries, CacheEntry{
+				updates = append(updates, PartitionUpdate{
 					ClusterID: a.ClusterID,
 					RowID:     a.Rowid,
-					Vec:       a.vec,
 				})
 			}
-			state.CacheInsertBatch(cvStart, cacheEntries)
+			state.ApplyDeltaFlushUpdates(cvStart, updates)
 		}
 
 		if len(rows) < cfg.MaxRows {

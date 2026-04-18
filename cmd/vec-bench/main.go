@@ -40,9 +40,6 @@
 //	                       measurement. Default 0 (don't wait).
 //	--profile-dir  pprof output dir. Default /tmp/marmot/vec-bench/prof.
 //	--use-go-rank  Use the Go-side ranking path (default true).
-//	--use-cache    Use the legacy in-memory vector cache (default false).
-//	--cache-bytes  Per-index cache budget for --use-cache.
-//	               Default 0 = auto (256 MiB).
 package main
 
 import (
@@ -92,8 +89,6 @@ type config struct {
 	profileDir         string
 	profileCPU         bool
 	useGoRank          bool
-	useCache           bool
-	cacheBytes         uint64
 	insertTx           int
 	insertN            int
 	queryConc          int
@@ -134,8 +129,6 @@ func parseFlags() *config {
 	fs.StringVar(&c.profileDir, "profile-dir", "", "pprof output dir (default db-dir/prof)")
 	fs.BoolVar(&c.profileCPU, "profile-cpu", true, "Write CPU profiles for warmup/measurement phases")
 	fs.BoolVar(&c.useGoRank, "use-go-rank", true, "Use Go-side ranking path")
-	fs.BoolVar(&c.useCache, "use-cache", false, "Use legacy in-memory vector cache")
-	fs.Uint64Var(&c.cacheBytes, "cache-bytes", 0, "Per-index cache budget for --use-cache (0 = auto 256 MiB)")
 	fs.IntVar(&c.insertTx, "insert-tx", 20000, "Rows per insert transaction")
 	fs.IntVar(&c.insertN, "insert-n", 0, "Cap inserted rows (0 = all train vectors). Useful for insert-throughput benches.")
 	fs.IntVar(&c.queryConc, "query-concurrency", defaultQueryConc, "Concurrent query goroutines (parallel measurement; default = GOMAXPROCS)")
@@ -324,14 +317,6 @@ func openHarness(cfg *config) (*harness, error) {
 	if cfg.skipInsert {
 		appcfg.Config.BatchCommit.Enabled = false
 		plog("batch committer disabled for skip-insert run")
-	}
-	if cfg.useCache || cfg.cacheBytes > 0 {
-		budget := cfg.cacheBytes
-		if budget == 0 {
-			budget = 256 << 20
-		}
-		appcfg.Config.VectorIndex.CacheBytes = budget
-		plog("legacy vector cache budget: %.0f MB", float64(budget)/(1<<20))
 	}
 	dbMgr, err := db.NewDatabaseManager(cfg.dbDir, 1, clock)
 	if err != nil {
@@ -892,14 +877,6 @@ func (h *harness) rehydrateEngine() error {
 		Metric: metricFromString(meta.Metric),
 	}
 	state := h.engine.RegisterWithCentroidSet(meta.IndexName, spec, cs)
-	cache, err := db.BuildEmptyVectorCache(context.Background(), h.readDB, *meta, spec, state.ProbeVersion())
-	if err != nil {
-		return fmt.Errorf("build cache on reopen: %w", err)
-	}
-	if cache != nil {
-		state.StoreCache(cache)
-		plog("rehydrated legacy vector cache on reopen")
-	}
 	if err := db.BuildResidentDeltaOnReopen(context.Background(), h.readDB, state, *meta, spec); err != nil {
 		return fmt.Errorf("build resident delta on reopen: %w", err)
 	}
@@ -1016,7 +993,6 @@ func (h *harness) runQueryPhase() error {
 		VecVars:         vecindex.DefaultVecSessionVars(),
 	}
 	sess.VecVars.UseGoRank = h.cfg.useGoRank
-	sess.VecVars.UseCache = h.cfg.useCache
 	sess.VecVars.Fallback = false
 	h.handler.BenchConfigureSharedScan(h.cfg.sharedScanWindow, h.cfg.sharedScanMaxReq, h.cfg.sharedScanMaxUnion)
 

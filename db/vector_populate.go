@@ -57,8 +57,7 @@ func BulkPopulate(
 			return fmt.Errorf("bulk populate %q: compute centroids: %w", spec.ID, err)
 		}
 		if cs == nil {
-			state := engine.RegisterWithCentroidSet(spec.ID, spec, nil)
-			state.StoreCache(nil)
+			engine.RegisterWithCentroidSet(spec.ID, spec, nil)
 			if err := setIndexReady(ctx, db, spec.ID); err != nil {
 				engine.Unregister(spec.ID)
 				return fmt.Errorf("bulk populate %q: set empty index ready: %w", spec.ID, err)
@@ -79,11 +78,6 @@ func BulkPopulate(
 		return fmt.Errorf("bulk populate %q: populate members: %w", spec.ID, err)
 	}
 
-	// The legacy in-memory cache is optional. The primary query path streams
-	// sidecar rows directly from SQLite, so cache install is skipped by default.
-	if err := buildAndStoreCache(ctx, db, state, spec, tableName, columnName); err != nil {
-		log.Warn().Err(err).Str("index", spec.ID).Msg("BulkPopulate: vector cache build failed; queries will fall back to SQL")
-	}
 	if err := loadAndStoreResidentDelta(ctx, db, state, spec, tableName, columnName); err != nil {
 		log.Warn().Err(err).Str("index", spec.ID).Msg("BulkPopulate: resident delta load failed")
 	}
@@ -100,65 +94,6 @@ func setIndexReady(ctx context.Context, db *sql.DB, indexName string) error {
 	return nil
 }
 
-// buildAndStoreCache installs the optional legacy VectorCache for the index
-// when a non-zero cache budget is configured.
-//
-//  1. An empty PartitionCache wired to a SQL BulkLoader — partitions load
-//     lazily on first probe and evict under a byte budget (otter W-TinyLFU).
-//  2. An eagerly-loaded DeltaBuffer holding every cluster_id=0 row, since
-//     every query scans the delta buffer regardless of which partitions it
-//     probes (§3.3 of the design).
-//
-// This replaces the prior behaviour of reading every member row into RAM at
-// index-open — a 6 GB residency for a 1 M × 1536D index. The partition cache
-// now stays under VectorIndex.CacheBytes (default 1 GiB); cold-start queries
-// pay one SQL read per probed partition and are cached thereafter.
-//
-// A cache failure is non-fatal — searches transparently fall back to the SQL
-// candidate path. Callers log the error and continue.
-func buildAndStoreCache(
-	ctx context.Context,
-	db *sql.DB,
-	state *vecindex.IndexState,
-	spec vecindex.IVFSpec,
-	tableName, columnName string,
-) error {
-	budget := partitionCacheBytes()
-	if budget == 0 {
-		state.StoreCache(nil)
-		log.Info().Str("index", spec.ID).Msg("vector cache: disabled")
-		return nil
-	}
-
-	internalDim := spec.InternalDim()
-	loader := newSQLPartitionLoader(db, spec.ID, tableName, columnName, internalDim, spec.Metric)
-
-	pc, err := vecindex.NewPartitionCache(vecindex.PartitionCacheOptions{
-		MaxBytes: budget,
-		Dim:      internalDim,
-		Epoch:    state.ProbeVersion(),
-		Loader:   loader,
-	})
-	if err != nil {
-		return fmt.Errorf("partition cache: %w", err)
-	}
-
-	delta, err := loader.loadDelta(ctx)
-	if err != nil {
-		return fmt.Errorf("load delta buffer: %w", err)
-	}
-
-	cache := vecindex.NewVectorCache(state.ProbeVersion(), pc, delta)
-	state.StoreCache(cache)
-	log.Info().
-		Str("index", spec.ID).
-		Uint64("epoch", cache.Epoch()).
-		Int("delta_rows", delta.Len()).
-		Uint64("cache_bytes_budget", budget).
-		Msg("vector cache: installed (LRU partitions + resident delta)")
-	return nil
-}
-
 func loadAndStoreResidentDelta(
 	ctx context.Context,
 	db *sql.DB,
@@ -166,10 +101,6 @@ func loadAndStoreResidentDelta(
 	spec vecindex.IVFSpec,
 	tableName, columnName string,
 ) error {
-	if cache := state.LoadCache(); cache != nil && cache.Delta() != nil {
-		state.StoreResidentDelta(cache.Delta())
-		return nil
-	}
 	internalDim := spec.InternalDim()
 	loader := newSQLPartitionLoader(db, spec.ID, tableName, columnName, internalDim, spec.Metric)
 	delta, err := loader.loadDelta(ctx)

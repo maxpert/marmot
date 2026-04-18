@@ -278,7 +278,6 @@ All variables are per-connection. Set them with standard MySQL-compat `SET @@var
 | `@@marmot_vec_prefilter_cap` | `5000` | Hard cap on rows scanned by pre-filter |
 | `@@marmot_vec_fallback` | `on` | If post-filter returns fewer than `K`, run the pre-filter plan and fill up |
 | `@@marmot_vec_use_go_rank` | `on` | Use the Go-side ranking path (vs SQL UDF path) |
-| `@@marmot_vec_use_cache` | `off` | Enable the legacy Go-side partition cache on post-filter plans |
 | `@@marmot_vec_delta_flush_interval` | `10` | Seconds between delta-flush cycles |
 | `@@marmot_vec_delta_max_rows` | `10000` | Max delta rows per flush |
 | `@@marmot_vec_delta_flush_batch` | `1000` | Rows per sub-batch inside one flush |
@@ -298,12 +297,10 @@ Product-level vector-index config lives under `[vector_index]`:
 [vector_index]
 enabled = true
 data_dir = ""    # reserved for a future SQLite-native engine path
-cache_bytes = 0  # 0 disables the legacy Go-side partition cache
 ```
 
 - `enabled` turns vector-index support on.
 - `data_dir` is currently reserved and can be left unset.
-- `cache_bytes` caps the legacy per-index Go partition cache. The always-resident delta buffer is excluded from this budget. `0` keeps the default packed streaming path without the legacy cache.
 
 ---
 
@@ -327,7 +324,6 @@ The runtime state in `IndexState` mirrors that layout:
 - **probeState** — the active centroid set used by queries and assignments
 - **resident delta** — always-resident `cluster_id = 0` rows so fresh inserts are queryable immediately
 - **packed store** — mmap-backed stable partitions used by the primary post-filter read path
-- **optional vector cache** — the older Go partition cache, now disabled by default
 
 ### Query Translation
 
@@ -348,10 +344,9 @@ The coordinator AST-walks the query (Vitess parser, no regex), resolves the inde
 
 1. Load the in-memory centroid state for `docs_embed`.
 2. Call `TopNprobeClusters(:q, nprobe)` → a list of `cluster_id` integers.
-3. Build a Go rank plan that can execute in one of three ways:
+3. Build a Go rank plan that can execute in one of two ways:
    - **packed path**: scan stable clusters from the mmap snapshot, scan resident delta, then fetch projected columns only for the final top-K rowids
-   - **legacy cache path**: if `@@marmot_vec_use_cache = 'on'`, rank from the optional in-memory partition cache
-   - **SQLite fallback**: if packed/cache state is unavailable, fall back to shared-scan or SQL-candidate execution against `__marmot_vec_<idx>_members`
+   - **SQLite fallback**: if packed state is unavailable, fall back to shared-scan or SQL-candidate execution against `__marmot_vec_<idx>_members`
 
 The fallback candidate SQL still looks like:
 
@@ -396,9 +391,7 @@ When post-filter returns fewer than K rows (predicate reduced the candidate set 
 
 ### Runtime Read Paths
 
-Marmot now defaults to the packed streaming path, not the legacy partition cache.
-
-**Packed path** (`@@marmot_vec_use_go_rank = 'on'`, `@@marmot_vec_use_cache = 'off'`):
+**Packed path** (`@@marmot_vec_use_go_rank = 'on'`):
 
 1. Probe centroids in memory.
 2. Scan stable `cluster_id > 0` partitions from the local `.vecpack` snapshot.
@@ -408,19 +401,11 @@ Marmot now defaults to the packed streaming path, not the legacy partition cache
 
 This keeps memory bounded and avoids per-candidate SQLite UDF dispatch on the hot path.
 
-**Legacy cache path** (`@@marmot_vec_use_cache = 'on'`):
-
-1. Load probed partitions into the optional Go-side cache.
-2. Rank directly from cached float32 slices.
-3. Fetch only the final projection rows from SQLite.
-
-This can still be useful for specific workloads, but it consumes more Go heap and is no longer the default path.
-
 **SQLite fallback path**:
 
 If the packed store is absent, a probed cluster is marked dirty, the query has a user predicate that disables packed/shared scan shortcuts, or Go ranking is disabled, the executor falls back to scanning the sidecar members table through SQLite.
 
-Coherence is enforced via a monotonic epoch on the centroid state. Each query captures the epoch used to compute cluster IDs; `cacheRank` skips if `cache.Epoch() ≠ plan.ProbeEpoch` — the SQL path handles the transition.
+Coherence is enforced via a monotonic epoch on the centroid state. Each query captures the epoch used to compute cluster IDs, and a probe refresh falls back to SQLite candidate scanning when packed state may no longer match the current centroid epoch.
 
 ### What Replicates
 
@@ -513,7 +498,7 @@ Current packed-path DBpedia numbers on ARM for the verified 100K subset run:
 
 Those numbers are from `vec-bench` without CPU profiling. Profiled runs on the same workload were lower, around `843–846 QPS`, because CPU profiling was enabled.
 
-For large high-dimensional corpora, the packed path keeps Go heap low by leaning on mmap + SQLite page cache. The optional legacy Go cache can still improve some workloads, but it is intentionally off by default because it trades throughput for a larger memory footprint.
+For large high-dimensional corpora, the packed path keeps Go heap low by leaning on mmap + SQLite page cache.
 
 ## Benchmarking with `vec-bench`
 
@@ -526,8 +511,6 @@ Most useful flags:
 | `--query-concurrency` | Query goroutines during measurement. Defaults to `GOMAXPROCS`. |
 | `--read-pool` | SQLite read-pool size. `0` means match query concurrency. |
 | `--use-go-rank` | Enable the Go-side ranking path. Default `true`. |
-| `--use-cache` | Enable the legacy Go partition cache. Default `false`. |
-| `--cache-bytes` | Per-index cache budget when `--use-cache` is on. |
 | `--sqlite-cache-mb` | SQLite page-cache budget for benchmark connections. |
 | `--shared-scan-window` | Shared-scan microbatch window for SQLite fallback plans. |
 | `--shared-scan-max-requests` | Max fallback requests per shared-scan batch. |

@@ -131,17 +131,14 @@ transpiler_cache_size = 10000  # LRU cache for MySQL→SQLite transpilation
 [vector_index]
 enabled = false
 data_dir = ""     # Reserved for a future SQLite-native engine path
-cache_bytes = 0   # 0 disables the legacy Go-side partition cache
 ```
 
 **Settings:**
 - `enabled`: Enables vector-index DDL, background workers, and query rewrite support.
 - `data_dir`: Reserved for future vector-engine storage. Leave unset for current releases.
-- `cache_bytes`: Caps the legacy per-index Go partition cache. The packed mmap snapshot and always-resident delta buffer remain available even when this is `0`.
 
 **Runtime note:**
 - The default read path is the packed streaming executor with resident delta.
-- Set `cache_bytes` to a non-zero value only if you explicitly want to budget memory for the older Go partition cache.
 
 ## Batch Commit
 

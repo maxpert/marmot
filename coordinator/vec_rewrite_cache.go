@@ -129,7 +129,6 @@ func (tpl *goRankRewriteTemplate) buildInfo(
 	clusterIDs []int64,
 	probeEpoch uint64,
 	nprobe int,
-	useCache bool,
 ) (*RewriteInfo, error) {
 	goRank, err := BuildGoRankPlan(
 		tpl.selectStmt,
@@ -150,7 +149,6 @@ func (tpl *goRankRewriteTemplate) buildInfo(
 	}
 	goRank.Database = meta.Database
 	goRank.ProbeEpoch = probeEpoch
-	goRank.AllowCache = useCache && tpl.userPred == nil
 	return &RewriteInfo{
 		Plan:       PlanPostFilter,
 		IndexName:  meta.IndexName,

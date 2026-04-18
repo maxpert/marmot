@@ -42,5 +42,3 @@ func (s *connQuerySession) Fallback() string {
 }
 
 func (s *connQuerySession) UseGoRank() bool { return s.vars.UseGoRank }
-
-func (s *connQuerySession) UseCache() bool { return s.vars.UseCache }
