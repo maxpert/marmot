@@ -31,7 +31,7 @@ static inline float marmot_decode_float16(uint16_t h) {
   return out;
 }
 
-__attribute__((target("dotprod")))
+__attribute__((target("+dotprod")))
 static int32_t marmot_dot_i8_dotprod_impl(const int8_t* a, const int8_t* b, int n) {
   int32x4_t acc = vdupq_n_s32(0);
   int i = 0;
@@ -47,7 +47,7 @@ static int32_t marmot_dot_i8_dotprod_impl(const int8_t* a, const int8_t* b, int 
   return sum;
 }
 
-__attribute__((target("dotprod")))
+__attribute__((target("+dotprod")))
 int marmot_residual_score_span_arm64(
     int rank_metric,
     float query_norm2,
