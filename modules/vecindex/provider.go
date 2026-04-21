@@ -12,12 +12,6 @@ type VectorUDFProvider interface {
 	// MARMOT-VEC-013 if the index is unknown.
 	AssignNearest(indexName string, vec []byte) (int64, error)
 
-	// NotifyCentroidChange is invoked from the centroid-change listener
-	// trigger (design §8.8). Implementations must be non-blocking: they
-	// enqueue the rebuild request and return immediately so the writer
-	// transaction is not held.
-	NotifyCentroidChange(indexName string, version int64) error
-
 	// TopNprobeClusters returns the nearest n 1-based cluster IDs for the query
 	// vector against the named index's probeState. Error MARMOT-VEC-013 if the
 	// index is unknown.

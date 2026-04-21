@@ -3,7 +3,6 @@ package vecindex
 import (
 	"encoding/binary"
 	"math"
-	"sync"
 	"testing"
 
 	"github.com/maxpert/marmot/modules/vecindex/pkg/kmeans"
@@ -54,7 +53,7 @@ func TestIndexState_AssignNearest_NeverReturnsZero(t *testing.T) {
 	for _, v := range vecs {
 		id, err := state.AssignNearest(encodeVec(v))
 		require.NoError(t, err)
-		require.Greater(t, id, int64(0), "cluster_id must be >= 1 (0 reserved for delta)")
+		require.Greater(t, id, int64(0), "cluster_id must be >= 1")
 	}
 }
 
@@ -126,89 +125,6 @@ func TestIndexState_CosineMetric(t *testing.T) {
 	require.Equal(t, int64(1), id)
 }
 
-func TestIndexState_StoreResidentDelta(t *testing.T) {
-	t.Parallel()
-
-	state := makeIndexState(t, IVFSpec{ID: "emb", Dim: 2, Metric: MetricL2, Nlist: 1}, [][]float32{{1, 0}})
-	delta := NewDeltaBuffer()
-	delta.AppendBatch([]CachedVector{
-		{RowID: 10, Vec: []float32{1, 0}},
-		{RowID: 11, Vec: []float32{0, 1}},
-	})
-
-	state.StoreResidentDelta(delta)
-	require.Equal(t, []CachedVector{
-		{RowID: 10, Vec: []float32{1, 0}},
-		{RowID: 11, Vec: []float32{0, 1}},
-	}, state.LoadResidentDelta().Snapshot())
-}
-
-func TestIndexState_ApplyDeltaFlushUpdates_RemovesResidentRows(t *testing.T) {
-	t.Parallel()
-
-	state := makeIndexState(t, IVFSpec{ID: "emb", Dim: 2, Metric: MetricL2, Nlist: 2}, [][]float32{{1, 0}, {0, 1}})
-	delta := NewDeltaBuffer()
-	delta.AppendBatch([]CachedVector{
-		{RowID: 10, Vec: []float32{1, 0}},
-		{RowID: 11, Vec: []float32{0, 1}},
-	})
-	state.StoreResidentDelta(delta)
-
-	state.ApplyDeltaFlushUpdates(1, []PartitionUpdate{{ClusterID: 2, RowID: 10}})
-
-	require.Equal(t, []CachedVector{
-		{RowID: 11, Vec: []float32{0, 1}},
-	}, state.LoadResidentDelta().Snapshot())
-}
-
-func TestIndexState_ApplyDeltaFlushUpdates_StaleEpochNoOp(t *testing.T) {
-	t.Parallel()
-
-	state := makeIndexState(t, IVFSpec{ID: "emb", Dim: 2, Metric: MetricL2, Nlist: 1}, [][]float32{{1, 0}})
-	delta := NewDeltaBuffer()
-	delta.Append(CachedVector{RowID: 99, Vec: []float32{1, 0}})
-	state.StoreResidentDelta(delta)
-
-	state.ApplyDeltaFlushUpdates(999, []PartitionUpdate{{ClusterID: 1, RowID: 99}})
-
-	require.Len(t, state.LoadResidentDelta().Snapshot(), 1)
-}
-
-func TestIndexState_ApplyDeltaFlushUpdates_Concurrent(t *testing.T) {
-	t.Parallel()
-
-	state := makeIndexState(t, IVFSpec{ID: "emb", Dim: 2, Metric: MetricL2, Nlist: 4}, [][]float32{{1, 0}, {0, 1}, {-1, 0}, {0, -1}})
-	const totalRows = 1000
-	seed := make([]CachedVector, totalRows)
-	for i := 0; i < totalRows; i++ {
-		seed[i] = CachedVector{RowID: int64(i), Vec: []float32{float32(i), 0}}
-	}
-	delta := NewDeltaBuffer()
-	delta.AppendBatch(seed)
-	state.StoreResidentDelta(delta)
-
-	const workers = 8
-	perWorker := totalRows / workers
-	var wg sync.WaitGroup
-	for w := 0; w < workers; w++ {
-		wg.Add(1)
-		go func(w int) {
-			defer wg.Done()
-			batch := make([]PartitionUpdate, perWorker)
-			for i := 0; i < perWorker; i++ {
-				batch[i] = PartitionUpdate{
-					ClusterID: int64(1 + (w+i)%4),
-					RowID:     int64(w*perWorker + i),
-				}
-			}
-			state.ApplyDeltaFlushUpdates(1, batch)
-		}(w)
-	}
-	wg.Wait()
-
-	require.Empty(t, state.LoadResidentDelta().Snapshot())
-}
-
 func TestIndexState_DriftUpdate_AccumulatesCorrectly(t *testing.T) {
 	t.Parallel()
 	spec := IVFSpec{ID: "test", Dim: 2, Metric: MetricL2, Nlist: 2}
@@ -251,6 +167,17 @@ func TestIndexState_DriftUpdate_InvalidClusterNoOp(t *testing.T) {
 
 	tracker := state.LoadDriftTracker()
 	require.Equal(t, int64(1), tracker.ClusterCount(0)) // unchanged
+}
+
+func TestIndexState_HotClusters(t *testing.T) {
+	t.Parallel()
+	spec := IVFSpec{ID: "test", Dim: 2, Metric: MetricL2, Nlist: 4}
+	state := makeIndexState(t, spec, [][]float32{{1, 0}, {0, 1}, {-1, 0}, {0, -1}})
+
+	state.RecordClusterHits([]int64{2, 3, 3, 4, 3, 2, 4})
+
+	require.Equal(t, []int64{3, 2, 4}, state.HotClusters(3))
+	require.Equal(t, map[int64]uint64{3: 3, 2: 2}, state.HotClusterScores(2))
 }
 
 func TestIndexState_DriftCentroids_MatchesMeanShift(t *testing.T) {

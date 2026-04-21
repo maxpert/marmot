@@ -145,9 +145,11 @@ func TestStableIndexSeed_ConcurrentCreateConvergence(t *testing.T) {
 		}
 		require.NoError(t, BulkPopulate(ctx, db1, engine, 1000, "docs", "embed", spec))
 
-		ct := vecindex.CentroidsTable(idx)
-		var blob []byte
-		require.NoError(t, db1.QueryRow(`SELECT centroids FROM "`+ct+`"`).Scan(&blob))
+		state, ok := engine.Lookup(idx)
+		require.True(t, ok)
+		require.NotNil(t, state.ProbeState())
+		blob, err := vecindex.EncodeCentroidBlob(state.ProbeState())
+		require.NoError(t, err)
 		require.NotEmpty(t, blob)
 		return blob
 	}

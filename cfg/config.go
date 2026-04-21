@@ -203,13 +203,12 @@ type ExtensionConfiguration struct {
 	AlwaysLoaded []string `toml:"always_loaded"` // Extensions loaded into every connection via ConnectHook
 }
 
-// VectorIndexConfiguration controls vector index behavior.
-// Pebble-specific fields (pebble_cache_mb, reconcile_interval_seconds,
-// min_vectors_for_create) have been removed; the SQLite-native engine
-// introduced in a later phase will add its own configuration.
+// VectorIndexConfiguration controls vector index behavior. Stable ANN serving
+// state lives in local `.vecseg` directories next to the database file. DataDir
+// is reserved for a future explicit override of that root.
 type VectorIndexConfiguration struct {
 	Enabled bool   `toml:"enabled"`
-	DataDir string `toml:"data_dir"` // Reserved for future SQLite-native engine data path
+	DataDir string `toml:"data_dir"`
 }
 
 // Configuration is the main configuration structure

@@ -3,7 +3,6 @@ package db
 import (
 	"database/sql"
 	"encoding/binary"
-	"fmt"
 	"math"
 	"strings"
 	"sync/atomic"
@@ -25,12 +24,9 @@ func encodeVec(t *testing.T, v []float32) []byte {
 
 type stubProvider struct {
 	assignCalls  atomic.Int64
-	notifyCalls  atomic.Int64
 	assignResult int64
 	assignErr    error
-	notifyErr    error
 	lastIndex    atomic.Value // string
-	lastVersion  atomic.Int64
 }
 
 func (s *stubProvider) AssignNearest(indexName string, vec []byte) (int64, error) {
@@ -40,13 +36,6 @@ func (s *stubProvider) AssignNearest(indexName string, vec []byte) (int64, error
 		return 0, s.assignErr
 	}
 	return s.assignResult, nil
-}
-
-func (s *stubProvider) NotifyCentroidChange(indexName string, version int64) error {
-	s.notifyCalls.Add(1)
-	s.lastIndex.Store(indexName)
-	s.lastVersion.Store(version)
-	return s.notifyErr
 }
 
 func (s *stubProvider) TopNprobeClusters(_ string, _ []byte, _ int) ([]int64, error) {
@@ -186,84 +175,6 @@ func TestVecAssignNoProvider(t *testing.T) {
 	err := db.QueryRow("SELECT __marmot_vec_assign(?, ?)", "x", encodeVec(t, []float32{1, 2, 3, 4})).Scan(&got)
 	if err == nil || !strings.Contains(err.Error(), "MARMOT-VEC-013") {
 		t.Fatalf("want MARMOT-VEC-013 error, got %v", err)
-	}
-}
-
-func TestVecNotifyCentroidChange(t *testing.T) {
-	stub := &stubProvider{}
-	withProvider(t, stub)
-	db := openVecDB(t)
-	var got int64
-	if err := db.QueryRow("SELECT __marmot_vec_notify_centroid_change(?, ?)", "embeddings", int64(42)).Scan(&got); err != nil {
-		t.Fatalf("query: %v", err)
-	}
-	if got != 0 {
-		t.Errorf("notify returned %d, want 0", got)
-	}
-	if stub.notifyCalls.Load() != 1 {
-		t.Errorf("notifyCalls = %d, want 1", stub.notifyCalls.Load())
-	}
-	if stub.lastVersion.Load() != 42 {
-		t.Errorf("lastVersion = %d, want 42", stub.lastVersion.Load())
-	}
-}
-
-// TestVecNotifyCentroidChange_ColdStart exercises the contract that the
-// notify UDF is best-effort: when no engine provider is installed (replica
-// cold start applying CDC before the engine is wired), the UDF MUST return
-// (0, nil) so the AFTER INSERT trigger on the centroids table cannot abort
-// the writer transaction.
-func TestVecNotifyCentroidChange_ColdStart(t *testing.T) {
-	SetVectorUDFProvider(nil)
-	db := openVecDB(t)
-
-	// Direct call — UDF invoked with no provider must succeed.
-	var got int64
-	if err := db.QueryRow("SELECT __marmot_vec_notify_centroid_change(?, ?)", "emb", int64(1)).Scan(&got); err != nil {
-		t.Fatalf("direct UDF call errored with no provider: %v", err)
-	}
-	if got != 0 {
-		t.Errorf("got %d, want 0", got)
-	}
-
-	// Integration path: a trigger body that invokes the UDF must NOT abort
-	// the INSERT. Mirrors the centroids_ai / centroids_au triggers emitted
-	// by vector_index_manager.
-	if _, err := db.Exec(`
-		CREATE TABLE _marmot_vec_emb_centroids (
-			index_id   INTEGER PRIMARY KEY,
-			version    INTEGER NOT NULL,
-			updated_at INTEGER NOT NULL
-		);
-		CREATE TRIGGER __marmot_vec_emb_centroids_ai
-			AFTER INSERT ON _marmot_vec_emb_centroids
-			BEGIN
-				SELECT __marmot_vec_notify_centroid_change('emb', NEW.version);
-			END;
-	`); err != nil {
-		t.Fatalf("setup: %v", err)
-	}
-	if _, err := db.Exec(`INSERT INTO _marmot_vec_emb_centroids VALUES (1, 7, 0)`); err != nil {
-		t.Fatalf("INSERT was aborted by cold-start notify trigger: %v", err)
-	}
-}
-
-// TestVecNotifyCentroidChange_SwallowsProviderError locks the contract that
-// a provider-returned error does NOT surface to SQLite — the trigger must
-// never fail the writer.
-func TestVecNotifyCentroidChange_SwallowsProviderError(t *testing.T) {
-	stub := &stubProvider{notifyErr: fmt.Errorf("engine queue full")}
-	withProvider(t, stub)
-	db := openVecDB(t)
-	var got int64
-	if err := db.QueryRow("SELECT __marmot_vec_notify_centroid_change(?, ?)", "emb", int64(9)).Scan(&got); err != nil {
-		t.Fatalf("provider error must not surface: %v", err)
-	}
-	if got != 0 {
-		t.Errorf("got %d, want 0", got)
-	}
-	if stub.notifyCalls.Load() != 1 {
-		t.Errorf("provider was not called: %d", stub.notifyCalls.Load())
 	}
 }
 

@@ -37,8 +37,8 @@ func getDecoder() *zstd.Decoder {
 	return blobDecoder
 }
 
-// EncodeCentroidBlob serialises a CentroidSet to a zstd-compressed msgpack blob.
-// This is the format stored in _marmot_vec_<idx>_centroids.centroids per design §3.2.
+// EncodeCentroidBlob serialises a CentroidSet to a zstd-compressed msgpack
+// blob. The active centroid blob is embedded in the local segment manifest.
 func EncodeCentroidBlob(cs *kmeans.CentroidSet) ([]byte, error) {
 	raw, err := cs.Encode()
 	if err != nil {

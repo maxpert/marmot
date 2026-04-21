@@ -47,11 +47,6 @@ type VecSessionVars struct {
 	// dispatch on post-filter plans (§7.6).
 	UseGoRank bool
 
-	// Delta flush
-	DeltaFlushInterval int // seconds between delta flush ticks
-	DeltaMaxRows       int // maximum delta rows per flush cycle
-	DeltaFlushBatch    int // rows per flush batch txn
-
 	// Auto-retrain (§8.7)
 	RetrainEnabled       bool
 	RetrainCheckInterval int     // seconds between retrain checks
@@ -68,9 +63,6 @@ func DefaultVecSessionVars() VecSessionVars {
 		PrefilterCap:         5000,
 		Fallback:             true,
 		UseGoRank:            true,
-		DeltaFlushInterval:   10,
-		DeltaMaxRows:         10000,
-		DeltaFlushBatch:      1000,
 		RetrainEnabled:       true,
 		RetrainCheckInterval: 30,
 		RetrainGrowthRatio:   1.5,
@@ -120,27 +112,6 @@ func (v *VecSessionVars) Apply(name, value string) error {
 			return err
 		}
 		v.UseGoRank = b
-
-	case "marmot_vec_delta_flush_interval":
-		n, err := parsePositiveInt(name, value, false)
-		if err != nil {
-			return err
-		}
-		v.DeltaFlushInterval = n
-
-	case "marmot_vec_delta_max_rows":
-		n, err := parsePositiveInt(name, value, false)
-		if err != nil {
-			return err
-		}
-		v.DeltaMaxRows = n
-
-	case "marmot_vec_delta_flush_batch":
-		n, err := parsePositiveInt(name, value, false)
-		if err != nil {
-			return err
-		}
-		v.DeltaFlushBatch = n
 
 	case "marmot_vec_retrain_enabled":
 		b, err := parseOnOff(name, value)

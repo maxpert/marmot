@@ -10,18 +10,15 @@ import (
 )
 
 // vectorUDFProvider is the process-wide provider used by per-connection
-// UDFs that must reach back into the vector-index engine. It is set once
-// at startup via SetVectorUDFProvider before any SQLite connection is
-// opened, and read without locking on the hot path via atomic.Pointer.
+// SQLite UDFs that need index metadata/assignment helpers. It is set once at
+// startup via SetVectorUDFProvider before any SQLite connection is opened,
+// and read without locking on the hot path via atomic.Pointer.
 var vectorUDFProvider atomic.Pointer[vecindex.VectorUDFProvider]
 
-// SetVectorUDFProvider installs the engine implementation used by the
-// `__marmot_vec_assign` and `__marmot_vec_notify_centroid_change` UDFs.
-// A nil argument clears the provider. With no provider installed,
-// `__marmot_vec_assign` errors with MARMOT-VEC-013 (it cannot produce a
-// cluster id without the engine) while `__marmot_vec_notify_centroid_change`
-// is best-effort and silently returns 0 so replica cold-start writes are
-// never aborted by a missing bootstrap dependency. Safe for concurrent use.
+// SetVectorUDFProvider installs the engine implementation used by
+// `__marmot_vec_assign`. A nil argument clears the provider. With no provider
+// installed, `__marmot_vec_assign` errors with MARMOT-VEC-013 because it
+// cannot produce a cluster id without the engine. Safe for concurrent use.
 func SetVectorUDFProvider(p vecindex.VectorUDFProvider) {
 	if p == nil {
 		vectorUDFProvider.Store(nil)
@@ -37,11 +34,11 @@ func loadVectorUDFProvider() vecindex.VectorUDFProvider {
 	return nil
 }
 
-// RegisterVectorUDFs registers the v5.4 vector-search UDFs on a single
+// RegisterVectorUDFs registers the vector-search UDFs on a single
 // SQLite connection. It is intended to be called from the driver's
 // ConnectHook (see sqlite_driver.go) alongside regexp and MySQL compat
-// registration. The engine argument may be nil during bootstrap; the
-// side-effect UDFs will error out until an engine is installed.
+// registration. The engine argument may be nil during bootstrap; assignment
+// UDF calls will error until an engine is installed.
 func RegisterVectorUDFs(conn *sqlite3.SQLiteConn) error {
 	funcs := []struct {
 		name string
@@ -53,7 +50,6 @@ func RegisterVectorUDFs(conn *sqlite3.SQLiteConn) error {
 		{"vec_distance_dot", vecDistanceDot, true},
 		{"__marmot_vec_assign", vecAssign, false},
 		{"__marmot_vec_materialize", vecMaterialize, true},
-		{"__marmot_vec_notify_centroid_change", vecNotifyCentroidChange, false},
 		{"vec_match", vecMatchSentinel, true},
 	}
 	for _, f := range funcs {
@@ -129,22 +125,6 @@ func vecAssign(indexName string, vec []byte) (int64, error) {
 
 func vecMaterialize(vec []byte, metricCode int64, dim int64, maxNorm float64) ([]byte, error) {
 	return materializeVectorBlob(vec, metric.Metric(metricCode), int(dim), float32(maxNorm))
-}
-
-// vecNotifyCentroidChange is a best-effort side-effect UDF invoked from
-// AFTER INSERT / AFTER UPDATE triggers on the centroids table. It MUST
-// NEVER abort the writer transaction:
-//   - No provider installed (cold start or test) → silently return 0.
-//   - Provider returns an error → swallow it.
-//
-// The engine's own retrain loop is the source of truth; the trigger only
-// exists to wake the engine up early when a replicated centroid row lands.
-// Contract: non-blocking, always returns (0, nil).
-func vecNotifyCentroidChange(indexName string, version int64) (int64, error) {
-	if p := loadVectorUDFProvider(); p != nil {
-		_ = p.NotifyCentroidChange(indexName, version)
-	}
-	return 0, nil
 }
 
 // vecMatchSentinel is a placeholder implementation: the coordinator

@@ -38,10 +38,9 @@ func newGoRankSession(useGoRank bool) *protocol.ConnectionSession {
 	}
 }
 
-// TestGoRank_HappyPath_MatchesSQL_UDF runs the same query with Go-rank and
-// SQL-UDF paths and asserts both return the same set of IDs (order may differ
-// on tied distances so we compare sorted sets).
-func TestGoRank_HappyPath_MatchesSQL_UDF(t *testing.T) {
+// TestGoRank_HappyPath_ReturnsNearestNeighbors checks the active segment/overlay
+// path against an exact brute-force baseline.
+func TestGoRank_HappyPath_ReturnsNearestNeighbors(t *testing.T) {
 	s := setupVecE2E(t)
 
 	// Use zero scale to get an exact copy of the vector.
@@ -49,24 +48,11 @@ func TestGoRank_HappyPath_MatchesSQL_UDF(t *testing.T) {
 	qv := addNoise(s.vectors[5], rng, 0)
 	qb := float32sToBlob(qv)
 
-	sessGoRank := newGoRankSession(true)
-	sessUDF := newGoRankSession(false)
+	ids := runVecQuery(t, s, rankQuerySQL, qb, newGoRankSession(true))
+	require.NotEmpty(t, ids, "go-rank: expected non-empty results")
 
-	goRankIDs := runVecQuery(t, s, rankQuerySQL, qb, sessGoRank)
-	udfIDs := runVecQuery(t, s, rankQuerySQL, qb, sessUDF)
-
-	require.NotEmpty(t, goRankIDs, "go-rank: expected non-empty results")
-	require.Equal(t, len(udfIDs), len(goRankIDs), "result count must match")
-
-	sortedGR := make([]int64, len(goRankIDs))
-	copy(sortedGR, goRankIDs)
-	sort.Slice(sortedGR, func(i, j int) bool { return sortedGR[i] < sortedGR[j] })
-
-	sortedUDF := make([]int64, len(udfIDs))
-	copy(sortedUDF, udfIDs)
-	sort.Slice(sortedUDF, func(i, j int) bool { return sortedUDF[i] < sortedUDF[j] })
-
-	require.Equal(t, sortedUDF, sortedGR, "go-rank and UDF must return the same IDs")
+	truth := bruteForceTopK(qv, s.vectors, len(ids))
+	require.Equal(t, truth, ids, "go-rank should match the exact nearest neighbors for an exact query vector")
 }
 
 // TestGoRank_WithUserPredicate asserts that a Go-rank query with AND status='published'
@@ -87,6 +73,46 @@ func TestGoRank_WithUserPredicate(t *testing.T) {
 	for _, id := range ids {
 		require.True(t, pubSet[id], "id=%d must be published", id)
 	}
+}
+
+func TestGoRank_WithUserPredicate_ExactRerankFillsLimit(t *testing.T) {
+	s := setupVecE2E(t)
+
+	qv := append([]float32(nil), s.vectors[0]...)
+	qb := float32sToBlob(qv)
+
+	type dist struct {
+		id int64
+		d  float32
+	}
+	dists := make([]dist, len(s.vectors))
+	for i, v := range s.vectors {
+		dists[i] = dist{id: int64(i + 1), d: cosineDistance(qv, v)}
+	}
+	sort.Slice(dists, func(i, j int) bool { return dists[i].d < dists[j].d })
+
+	stmt, err := s.conn.Prepare(`UPDATE docs SET status = ? WHERE id = ?`)
+	require.NoError(t, err)
+	defer stmt.Close()
+
+	for _, item := range dists[:10] {
+		_, err := stmt.Exec("draft", item.id)
+		require.NoError(t, err)
+	}
+	for _, item := range dists[10:20] {
+		_, err := stmt.Exec("published", item.id)
+		require.NoError(t, err)
+	}
+
+	ids := runVecQuery(t, s, rankQueryWithPredSQL, qb, newGoRankSession(true))
+
+	require.Len(t, ids, 10, "expected exact rerank to refill the post-filter top-k")
+
+	expected := make([]int64, 10)
+	for i, item := range dists[10:20] {
+		expected[i] = item.id
+	}
+	require.Equal(t, expected, ids, "post-filter exact rerank should skip predicate-mismatched nearest rows")
 }
 
 // TestGoRank_Recall asserts recall >= 0.95 for Go-rank queries over 1000 rows.
@@ -154,7 +180,9 @@ func TestGoRank_DeltaOnlyAfterEmptyCreate(t *testing.T) {
 	localReader := db.NewLocalReader(dbMgr)
 	nodeProvider := coordinator.NewMockNodeProvider([]uint64{1})
 	rc := coordinator.NewReadCoordinator(1, nodeProvider, localReader, 10*time.Second)
-	handler := coordinator.NewTestHandler(1, rc, dbMgr, clock)
+	localReplicator := db.NewLocalReplicator(1, dbMgr, clock)
+	writeCoord := coordinator.NewWriteCoordinator(1, nodeProvider, localReplicator, localReplicator, 5*time.Second, clock)
+	handler := coordinator.NewCoordinatorHandler(1, writeCoord, rc, clock, dbMgr, nil, nil, nil)
 	handler.SetVectorEngine(engine)
 
 	meta := common.VectorIndexMeta{
@@ -179,19 +207,26 @@ func TestGoRank_DeltaOnlyAfterEmptyCreate(t *testing.T) {
 	require.Equal(t, "ready", status)
 
 	rng := rand.New(rand.NewSource(91))
-	vectors := make([][]float32, 32)
-	stmt, err := conn.Prepare(`INSERT INTO docs(id, embed, status) VALUES (?, ?, 'published')`)
-	require.NoError(t, err)
-	defer stmt.Close()
+	const bootstrapRows = 4096
+	vectors := make([][]float32, bootstrapRows)
 	for i := range vectors {
 		v := make([]float32, e2eDim)
 		for j := range v {
 			v[j] = float32(rng.NormFloat64())
 		}
 		vectors[i] = unitNorm(v)
-		_, err := stmt.Exec(i+1, float32sToBlob(vectors[i]))
+		_, err := handler.HandleQuery(
+			newGoRankSession(true),
+			`INSERT INTO docs(id, embed, status) VALUES (?, ?, 'published')`,
+			[]interface{}{i + 1, float32sToBlob(vectors[i])},
+		)
 		require.NoError(t, err)
 	}
+
+	require.Eventually(t, func() bool {
+		state, ok := engine.Lookup(e2eIndexName)
+		return ok && state.ProbeVersion() > 0 && state.LoadSegmentStore() != nil
+	}, 30*time.Second, 100*time.Millisecond, "empty-table create should bootstrap centroids automatically after inserts")
 
 	s := &e2eSetup{
 		dbMgr:   dbMgr,
@@ -204,14 +239,8 @@ func TestGoRank_DeltaOnlyAfterEmptyCreate(t *testing.T) {
 
 	qb := float32sToBlob(vectors[0])
 	goRankIDs := runVecQuery(t, s, rankQuerySQL, qb, newGoRankSession(true))
-	udfIDs := runVecQuery(t, s, rankQuerySQL, qb, newGoRankSession(false))
 
-	require.NotEmpty(t, goRankIDs, "delta-only go-rank should return rows before centroids exist")
-	require.Equal(t, len(udfIDs), len(goRankIDs))
-
-	sortedGR := append([]int64(nil), goRankIDs...)
-	sortedUDF := append([]int64(nil), udfIDs...)
-	sort.Slice(sortedGR, func(i, j int) bool { return sortedGR[i] < sortedGR[j] })
-	sort.Slice(sortedUDF, func(i, j int) bool { return sortedUDF[i] < sortedUDF[j] })
-	require.Equal(t, sortedUDF, sortedGR)
+	require.NotEmpty(t, goRankIDs, "go-rank should return rows after automatic bootstrap")
+	truth := bruteForceTopK(vectors[0], vectors, len(goRankIDs))
+	require.Equal(t, truth, goRankIDs)
 }

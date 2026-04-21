@@ -8,8 +8,8 @@ import (
 )
 
 // materializeVectorBlob converts a raw user-space embedding blob into the
-// canonical internal sidecar representation. The transform is pure and depends
-// only on (metric, dim, maxNorm, rawBlob); it does not require engine state.
+// canonical internal search-space representation. The transform is pure and
+// depends only on (metric, dim, maxNorm, rawBlob); it does not require engine state.
 //
 // Returns nil, nil for vectors that should not be indexed (currently only
 // zero-norm cosine vectors). Malformed blobs still return an error so the

@@ -29,15 +29,11 @@
 //	--nprobe       Probed clusters per query. 0 = auto-tune (√nlist, min 8).
 //	--force-build  Drop existing index + table and rebuild from scratch.
 //	--skip-insert  Assume docs already populated; just (re)use the index.
-//	--bootstrap-rows Initial rows inserted before the first REINDEX.
-//	                 Default -1 = auto (~50%, floored at nlist). Use 0 to
-//	                 keep the run delta-only end-to-end.
 //	--warmup       Warmup query count before measurement. Default 1000.
 //	--n-queries    Measurement query count. Default len(test).
 //	--k            Top-K returned per query. Default 10.
-//	--settle-delta-timeout Wait up to this long for background delta flush
-//	                       to drain cluster_id=0 rows before read
-//	                       measurement. Default 0 (don't wait).
+//	--settle-timeout Wait up to this long for automatic bootstrap and local
+//	                segment publish before read measurement. Default 0.
 //	--profile-dir  pprof output dir. Default /tmp/marmot/vec-bench/prof.
 //	--use-go-rank  Use the Go-side ranking path (default true).
 package main
@@ -65,42 +61,34 @@ import (
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/modules/vecindex"
 	"github.com/maxpert/marmot/modules/vecindex/pkg/benchutil"
-	"github.com/maxpert/marmot/modules/vecindex/pkg/kmeans"
 	"github.com/maxpert/marmot/protocol"
 )
 
 type config struct {
-	dataDir            string
-	dbDir              string
-	dbName             string
-	indexName          string
-	tableName          string
-	columnName         string
-	metric             string
-	nlist              int
-	nprobe             int
-	forceBuild         bool
-	skipInsert         bool
-	bootstrapRows      int
-	warmup             int
-	nQueries           int
-	k                  int
-	settleDeltaTimeout time.Duration
-	profileDir         string
-	profileCPU         bool
-	useGoRank          bool
-	insertTx           int
-	insertN            int
-	queryConc          int
-	insertConc         int
-	readPool           int
-	deltaFlushInterval time.Duration
-	deltaFlushMaxRows  int
-	deltaFlushBatch    int
-	sqliteCacheMB      int
-	sharedScanWindow   time.Duration
-	sharedScanMaxReq   int
-	sharedScanMaxUnion int
+	dataDir       string
+	dbDir         string
+	dbName        string
+	indexName     string
+	tableName     string
+	columnName    string
+	metric        string
+	nlist         int
+	nprobe        int
+	forceBuild    bool
+	skipInsert    bool
+	warmup        int
+	nQueries      int
+	k             int
+	settleTimeout time.Duration
+	profileDir    string
+	profileCPU    bool
+	useGoRank     bool
+	insertTx      int
+	insertN       int
+	queryConc     int
+	insertConc    int
+	readPool      int
+	sqliteCacheMB int
 }
 
 func parseFlags() *config {
@@ -121,11 +109,10 @@ func parseFlags() *config {
 	fs.IntVar(&c.nprobe, "nprobe", 0, "Probed clusters (0 = auto-tune)")
 	fs.BoolVar(&c.forceBuild, "force-build", false, "Drop existing index + table and rebuild")
 	fs.BoolVar(&c.skipInsert, "skip-insert", false, "Assume docs already populated; just use the existing index")
-	fs.IntVar(&c.bootstrapRows, "bootstrap-rows", -1, "Initial rows inserted before first REINDEX (-1 = auto, 0 = delta-only)")
 	fs.IntVar(&c.warmup, "warmup", 1000, "Warmup query count before measurement")
 	fs.IntVar(&c.nQueries, "n-queries", 0, "Measurement query count (0 = full test set)")
 	fs.IntVar(&c.k, "k", 10, "Top-K per query")
-	fs.DurationVar(&c.settleDeltaTimeout, "settle-delta-timeout", 0, "Wait for background delta flush before read measurement (0 = disabled)")
+	fs.DurationVar(&c.settleTimeout, "settle-timeout", 0, "Wait for automatic bootstrap and segment publish before read measurement (0 = disabled)")
 	fs.StringVar(&c.profileDir, "profile-dir", "", "pprof output dir (default db-dir/prof)")
 	fs.BoolVar(&c.profileCPU, "profile-cpu", true, "Write CPU profiles for warmup/measurement phases")
 	fs.BoolVar(&c.useGoRank, "use-go-rank", true, "Use Go-side ranking path")
@@ -134,12 +121,6 @@ func parseFlags() *config {
 	fs.IntVar(&c.queryConc, "query-concurrency", defaultQueryConc, "Concurrent query goroutines (parallel measurement; default = GOMAXPROCS)")
 	fs.IntVar(&c.insertConc, "insert-concurrency", 1, "Concurrent insert goroutines (parallel insert phase)")
 	fs.IntVar(&c.readPool, "read-pool", 0, "Override readDB max-open-conns (0 = match query-concurrency)")
-	fs.DurationVar(&c.sharedScanWindow, "shared-scan-window", 100*time.Microsecond, "Shared-scan microbatch window")
-	fs.IntVar(&c.sharedScanMaxReq, "shared-scan-max-requests", 8, "Shared-scan max requests per batch")
-	fs.IntVar(&c.sharedScanMaxUnion, "shared-scan-max-union", 64, "Shared-scan max distinct clusters per batch")
-	fs.DurationVar(&c.deltaFlushInterval, "delta-flush-interval", 0, "Override delta flush interval (0 = product default)")
-	fs.IntVar(&c.deltaFlushMaxRows, "delta-flush-max-rows", 0, "Override delta flush max rows per cycle (0 = product default)")
-	fs.IntVar(&c.deltaFlushBatch, "delta-flush-batch", 0, "Override delta flush commit batch size (0 = product default)")
 	fs.IntVar(&c.sqliteCacheMB, "sqlite-cache-mb", 64, "SQLite page-cache budget in MiB for vec-bench connections")
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		os.Exit(2)
@@ -338,18 +319,6 @@ func openHarness(cfg *config) (*harness, error) {
 	if err != nil {
 		return nil, fmt.Errorf("get write conn: %w", err)
 	}
-	engine.SetFlushDB(db.NewSQLDeltaFlushDB(dbMgr))
-	flushCfg := vecindex.DefaultDeltaFlushConfig()
-	if cfg.deltaFlushInterval > 0 {
-		flushCfg.Interval = cfg.deltaFlushInterval
-	}
-	if cfg.deltaFlushMaxRows > 0 {
-		flushCfg.MaxRows = cfg.deltaFlushMaxRows
-	}
-	if cfg.deltaFlushBatch > 0 {
-		flushCfg.BatchSize = cfg.deltaFlushBatch
-	}
-	engine.SetFlushConfig(flushCfg)
 
 	hook := db.NewEngineHook(engine, dbMgr)
 	vecMgr.SetLifecycleHook(hook)
@@ -509,36 +478,13 @@ func (h *harness) ensureTableAndInsert() error {
 		return nil
 	}
 
-	bootstrapRows := resolveBootstrapRows(toInsert, h.cfg.bootstrapRows, h.cfg.nlist)
-	plog("online load plan: total=%d bootstrap=%d online=%d",
-		toInsert, bootstrapRows, toInsert-bootstrapRows)
-
-	hasCentroids, err := h.indexHasCentroids()
-	if err != nil {
-		return fmt.Errorf("check centroid state: %w", err)
+	plog("online load plan: total=%d", toInsert)
+	if err := h.insertRange(0, toInsert, "online"); err != nil {
+		return err
 	}
 
-	if bootstrapRows > 0 {
-		if err := h.insertRange(0, bootstrapRows, "bootstrap"); err != nil {
-			return err
-		}
-	}
-
-	if !hasCentroids && bootstrapRows > 0 {
-		if err := h.reindexIndex("bootstrap"); err != nil {
-			return err
-		}
-		hasCentroids = true
-	}
-
-	if bootstrapRows < toInsert {
-		if err := h.insertRange(bootstrapRows, toInsert, "online"); err != nil {
-			return err
-		}
-	}
-
-	if hasCentroids && h.cfg.settleDeltaTimeout > 0 {
-		if err := h.waitForDeltaDrain(h.cfg.settleDeltaTimeout); err != nil {
+	if h.cfg.settleTimeout > 0 {
+		if err := h.waitForVectorReadiness(h.cfg.settleTimeout); err != nil {
 			return err
 		}
 	}
@@ -551,29 +497,6 @@ func targetInsertRows(trainLen, insertCap int) int {
 		return insertCap
 	}
 	return trainLen
-}
-
-func resolveBootstrapRows(totalRows, requested, nlist int) int {
-	if totalRows <= 0 {
-		return 0
-	}
-	if requested >= 0 {
-		if requested > totalRows {
-			return totalRows
-		}
-		return requested
-	}
-	auto := totalRows / 2
-	if auto == 0 {
-		auto = totalRows
-	}
-	if nlist > 0 && auto < nlist {
-		auto = nlist
-	}
-	if auto > totalRows {
-		auto = totalRows
-	}
-	return auto
 }
 
 func (h *harness) insertRange(lo, hi int, phase string) error {
@@ -717,45 +640,55 @@ func (h *harness) insertRange(lo, hi int, phase string) error {
 	return nil
 }
 
-func (h *harness) indexHasCentroids() (bool, error) {
-	cs, err := h.loadCentroidSet(h.cfg.indexName)
-	if err != nil {
-		return false, err
-	}
-	return cs != nil, nil
+func vectorStateSettled(probeVersion uint64, segmentReady bool, overlayReady bool) bool {
+	return probeVersion > 0 && segmentReady && overlayReady
 }
 
-func (h *harness) reindexIndex(reason string) error {
-	plog("reindexing %q after %s phase ...", h.cfg.indexName, reason)
-	start := time.Now()
-	if err := h.vecMgr.ReindexIndex(context.Background(), h.cfg.indexName); err != nil {
-		return fmt.Errorf("reindex %s: %w", reason, err)
-	}
-	plog("  reindex done in %s", time.Since(start))
-	logMemorySnapshot("after reindex")
-	return nil
-}
-
-func (h *harness) waitForDeltaDrain(timeout time.Duration) error {
-	membersQ := fmt.Sprintf(`"%s"`, vecindex.MembersTable(h.cfg.indexName))
+func (h *harness) waitForVectorReadiness(timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for {
-		var deltaRows int64
-		if err := h.conn.QueryRow(
-			fmt.Sprintf(`SELECT COUNT(*) FROM %s WHERE cluster_id = 0`, membersQ),
-		).Scan(&deltaRows); err != nil {
-			return fmt.Errorf("count delta rows: %w", err)
+		probeVersion := uint64(0)
+		segmentReady := false
+		overlayReady := false
+		overlayRows := 0
+		if h.engine != nil {
+			if state, ok := h.engine.Lookup(h.cfg.indexName); ok {
+				probeVersion = state.ProbeVersion()
+				segmentReady = state.LoadSegmentStore() != nil
+				overlayReady = state.LoadOverlay() != nil
+				if overlay := state.LoadOverlay(); overlay != nil && overlay.Snapshot() != nil {
+					overlayRows = overlay.Snapshot().Len()
+				}
+			}
 		}
-		if deltaRows == 0 {
-			plog("delta flush settled: cluster_id=0 rows drained")
-			logMemorySnapshot("after delta settle")
+		if vectorStateSettled(probeVersion, segmentReady, overlayReady) {
+			if err := h.refreshIndexTuning(); err != nil {
+				return err
+			}
+			plog("vector state settled: probe=%d segment=%t overlay=%t overlay_rows=%d", probeVersion, segmentReady, overlayReady, overlayRows)
+			logMemorySnapshot("after vector settle")
 			return nil
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("delta flush did not settle within %s (remaining=%d)", timeout, deltaRows)
+			return fmt.Errorf("vector state did not settle within %s (probe=%d segment=%t overlay=%t overlay_rows=%d)",
+				timeout, probeVersion, segmentReady, overlayReady, overlayRows)
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
+}
+
+func (h *harness) refreshIndexTuning() error {
+	row := h.conn.QueryRow(
+		`SELECT nlist, nprobe FROM __marmot_vector_indexes WHERE index_name = ?`,
+		h.cfg.indexName,
+	)
+	var nlist, nprobe int
+	if err := row.Scan(&nlist, &nprobe); err != nil {
+		return fmt.Errorf("refresh index tuning: %w", err)
+	}
+	h.cfg.nlist = nlist
+	h.cfg.nprobe = nprobe
+	return nil
 }
 
 func (h *harness) ensureIndex() error {
@@ -766,24 +699,13 @@ func (h *harness) ensureIndex() error {
 		h.cfg.indexName,
 	).Scan(&status)
 	if err == nil && status == "ready" {
-		ok, err := h.hasSidecarVecLayout(h.cfg.indexName)
-		if err != nil {
-			return fmt.Errorf("check sidecar layout: %w", err)
+		plog("index %q already exists (status=%s); rehydrating engine state",
+			h.cfg.indexName, status)
+		if err := h.rehydrateEngine(); err != nil {
+			return err
 		}
-		if !ok {
-			plog("index %q uses legacy members layout; dropping and rebuilding sidecar storage", h.cfg.indexName)
-			if err := h.vecMgr.DropIndex(ctx, h.cfg.indexName, h.cfg.dbName); err != nil {
-				return fmt.Errorf("drop legacy index: %w", err)
-			}
-		} else {
-			plog("index %q already exists (status=%s); rehydrating engine state",
-				h.cfg.indexName, status)
-			if err := h.rehydrateEngine(); err != nil {
-				return err
-			}
-			logMemorySnapshot("after reopen")
-			return nil
-		}
+		logMemorySnapshot("after reopen")
+		return nil
 	}
 	if err != nil && err != sql.ErrNoRows {
 		return fmt.Errorf("query existing index: %w", err)
@@ -856,17 +778,12 @@ func (h *harness) ensureIndex() error {
 	return nil
 }
 
-// rehydrateEngine restores the in-memory CentroidSet for an index whose
-// on-disk state is present but whose Engine hasn't been populated.
+// rehydrateEngine restores in-memory segment and overlay state for an index
+// whose on-disk state is present but whose Engine hasn't been populated.
 func (h *harness) rehydrateEngine() error {
 	meta, err := h.readIndexMeta()
 	if err != nil {
 		return fmt.Errorf("read index meta: %w", err)
-	}
-
-	cs, err := h.loadCentroidSet(meta.IndexName)
-	if err != nil {
-		return fmt.Errorf("load centroid set: %w", err)
 	}
 
 	spec := vecindex.IVFSpec{
@@ -876,33 +793,33 @@ func (h *harness) rehydrateEngine() error {
 		Nprobe: meta.Nprobe,
 		Metric: metricFromString(meta.Metric),
 	}
-	state := h.engine.RegisterWithCentroidSet(meta.IndexName, spec, cs)
-	if err := db.BuildResidentDeltaOnReopen(context.Background(), h.readDB, state, *meta, spec); err != nil {
-		return fmt.Errorf("build resident delta on reopen: %w", err)
+	state := vecindex.NewIndexState(spec, nil)
+	h.engine.Register(meta.IndexName, state)
+	dbPath, err := h.dbMgr.GetDatabasePath(meta.Database)
+	if err != nil {
+		return fmt.Errorf("get db path on reopen: %w", err)
 	}
-	if delta := state.LoadResidentDelta(); delta != nil {
-		plog("rehydrated resident delta on reopen: rows=%d", delta.Len())
+	if err := db.BuildSegmentGenerationOnReopen(context.Background(), h.conn, dbPath, state, *meta, spec); err != nil {
+		return fmt.Errorf("build segment generation on reopen: %w", err)
 	}
-	if cs == nil {
-		plog("engine rehydrated without centroids; queries will scan the delta partition only until reindex")
+	if generation := state.LoadSegmentStore(); generation != nil && generation.Data != nil {
+		plog("rehydrated stable segment store: %s", generation.Data.Path())
+	}
+	if overlay := state.LoadOverlay(); overlay != nil && overlay.Snapshot() != nil {
+		plog("rehydrated overlay journal: rows=%d seq=%d", overlay.Snapshot().Len(), overlay.Snapshot().LastSequence())
+	}
+	if state.ProbeVersion() == 0 {
+		plog("engine rehydrated without centroids; automatic bootstrap has not published a stable generation yet")
 	} else {
-		if dbPath, pathErr := h.dbMgr.GetDatabasePath(meta.Database); pathErr == nil {
-			plog("attempting packed partition store rebuild on reopen: %s", dbPath)
-			if err := db.BuildPackedPartitionStoreOnReopen(context.Background(), h.conn, dbPath, state, *meta, spec); err != nil {
-				return fmt.Errorf("build packed store on reopen: %w", err)
-			}
-			if store := state.LoadPackedStore(); store != nil {
-				plog("rehydrated packed partition store: %s", store.Path())
-			} else {
-				plog("packed partition store unavailable on reopen")
-			}
-		}
-		plog("loaded %d centroids (dim=%d) from disk", cs.Len(), meta.Dim)
-		plog("engine rehydrated from centroids only; sidecar rows stream directly from SQLite")
+		plog("engine rehydrated from local segment generation: probe=%d dim=%d", state.ProbeVersion(), meta.Dim)
 	}
 
-	h.cfg.nlist = meta.Nlist
-	h.cfg.nprobe = meta.Nprobe
+	if h.cfg.nlist == 0 {
+		h.cfg.nlist = meta.Nlist
+	}
+	if h.cfg.nprobe == 0 {
+		h.cfg.nprobe = meta.Nprobe
+	}
 	return nil
 }
 
@@ -910,7 +827,7 @@ func (h *harness) readIndexMeta() (*common.VectorIndexMeta, error) {
 	row := h.conn.QueryRow(`
 		SELECT index_name, table_name, column_name, database_name,
 		       metric, dim, nlist, nprobe, auto_nlist, auto_nprobe,
-		       target_partition_size, max_norm, status
+		       target_partition_size, max_norm, status, created_at
 		FROM __marmot_vector_indexes WHERE index_name = ?`, h.cfg.indexName)
 	var (
 		m          common.VectorIndexMeta
@@ -921,7 +838,7 @@ func (h *harness) readIndexMeta() (*common.VectorIndexMeta, error) {
 		&m.IndexName, &m.TableName, &m.ColumnName, &m.Database,
 		&m.Metric, &m.Dim, &m.Nlist, &m.Nprobe,
 		&autoNlist, &autoNprobe, &m.TargetPartitionSize,
-		&m.MaxNorm, &m.Status,
+		&m.MaxNorm, &m.Status, &m.CreatedAt,
 	)
 	if err != nil {
 		return nil, err
@@ -929,54 +846,6 @@ func (h *harness) readIndexMeta() (*common.VectorIndexMeta, error) {
 	m.AutoTuneNlist = autoNlist != 0
 	m.AutoTuneNprobe = autoNprobe != 0
 	return &m, nil
-}
-
-func (h *harness) hasSidecarVecLayout(indexName string) (bool, error) {
-	rows, err := h.conn.Query(fmt.Sprintf(`PRAGMA table_info("%s")`, vecindex.MembersTable(indexName)))
-	if err != nil {
-		return false, err
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var (
-			cid       int
-			name      string
-			ctype     string
-			notnull   int
-			dfltValue interface{}
-			pk        int
-		)
-		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dfltValue, &pk); err != nil {
-			return false, err
-		}
-		if name == "vec" {
-			return true, nil
-		}
-	}
-	return false, rows.Err()
-}
-
-func (h *harness) loadCentroidSet(indexName string) (*kmeans.CentroidSet, error) {
-	table := vecindex.CentroidsTable(indexName)
-	row := h.conn.QueryRow(fmt.Sprintf(
-		`SELECT version, compression, centroids FROM "%s" WHERE index_id = 1`, table))
-	var version int64
-	var compression string
-	var blob []byte
-	if err := row.Scan(&version, &compression, &blob); err == sql.ErrNoRows {
-		return nil, nil
-	} else if err != nil {
-		return nil, err
-	}
-	switch compression {
-	case "zstd":
-		return vecindex.DecodeCentroidBlob(blob)
-	case "none":
-		return kmeans.DecodeCentroidSet(blob)
-	default:
-		return nil, fmt.Errorf("unknown compression %q", compression)
-	}
 }
 
 func (h *harness) runQueryPhase() error {
@@ -987,14 +856,7 @@ func (h *harness) runQueryPhase() error {
 		h.cfg.warmup = h.test.Len()
 	}
 
-	sess := &protocol.ConnectionSession{
-		CurrentDatabase: h.cfg.dbName,
-		ConnID:          42,
-		VecVars:         vecindex.DefaultVecSessionVars(),
-	}
-	sess.VecVars.UseGoRank = h.cfg.useGoRank
-	sess.VecVars.Fallback = false
-	h.handler.BenchConfigureSharedScan(h.cfg.sharedScanWindow, h.cfg.sharedScanMaxReq, h.cfg.sharedScanMaxUnion)
+	sess := h.newQuerySession()
 
 	// Vitess parses double-quoted literals as strings, not identifiers.
 	// Use backticks (MySQL identifier) or unquoted names — matching the
@@ -1004,18 +866,15 @@ func (h *harness) runQueryPhase() error {
 		h.cfg.tableName, h.cfg.columnName, h.cfg.k, h.cfg.columnName, h.cfg.k)
 
 	if h.cfg.warmup > 0 {
-		h.handler.BenchResetSharedScanStats()
 		plog("warming %d queries ...", h.cfg.warmup)
 		ws := time.Now()
 		if _, err := h.runQueries(sess, querySQL, h.cfg.warmup, "warm"); err != nil {
 			return fmt.Errorf("warmup: %w", err)
 		}
 		plog("  warmup done in %s", time.Since(ws))
-		logSharedScanStats("warmup", h.handler.BenchSharedScanStats())
 		logMemorySnapshot("after warmup")
 	}
 
-	h.handler.BenchResetSharedScanStats()
 	plog("measurement: %d queries (concurrency=%d) ...", h.cfg.nQueries, h.cfg.queryConc)
 	measureStart := time.Now()
 	stats, err := h.runQueries(sess, querySQL, h.cfg.nQueries, "measure")
@@ -1043,8 +902,6 @@ func (h *harness) runQueryPhase() error {
 	plog("=== results ===")
 	plog("  config: nlist=%d nprobe=%d metric=%s dim=%d K=%d concurrency=%d",
 		h.cfg.nlist, h.cfg.nprobe, h.cfg.metric, h.meta.Dim, h.cfg.k, h.cfg.queryConc)
-	plog("  shared-scan: window=%s max-requests=%d max-union=%d",
-		h.cfg.sharedScanWindow, h.cfg.sharedScanMaxReq, h.cfg.sharedScanMaxUnion)
 	plog("  recall@%d      = %.4f  (top-%d vs truth top-%d)", h.cfg.k, stats.recall10, h.cfg.k, h.cfg.k)
 	plog("  recall@%d-in-100 = %.4f  (top-%d vs truth top-100)", h.cfg.k, stats.recall10in100, h.cfg.k)
 	plog("  latency: p50=%s p95=%s p99=%s p999=%s max=%s",
@@ -1057,46 +914,22 @@ func (h *harness) runQueryPhase() error {
 		plog("  read worker[%d]: queries=%d qps=%.2f",
 			wid, n, float64(n)/wallElapsed.Seconds())
 	}
-	logSharedScanStats("measure", h.handler.BenchSharedScanStats())
 	logMemorySnapshot("after measurement")
 	return nil
 }
 
-func logSharedScanStats(label string, stats coordinator.VecSharedScanStats) {
-	if stats.ExecuteCalls == 0 && stats.ProbeRefreshFallbacks == 0 {
-		return
+func (h *harness) newQuerySession() *protocol.ConnectionSession {
+	sess := &protocol.ConnectionSession{
+		CurrentDatabase: h.cfg.dbName,
+		ConnID:          42,
+		VecVars:         vecindex.DefaultVecSessionVars(),
 	}
-	avgBatch := ratio(stats.BatchRequestsTotal, stats.SharedBatches)
-	avgUnion := ratio(stats.BatchUnionClustersTotal, stats.SharedBatches)
-	clusterReuse := ratio(stats.BatchRequestedClustersTotal, stats.BatchUnionClustersTotal)
-	sharedRate := ratio(stats.SharedRequests, stats.ExecuteCalls)
-	plog("  shared-scan[%s]: calls=%d shared-req=%d (%.2f%%) shared-batches=%d singleton-fallbacks=%d oversized=%d probe-refresh=%d",
-		label,
-		stats.ExecuteCalls,
-		stats.SharedRequests,
-		100*sharedRate,
-		stats.SharedBatches,
-		stats.SingletonFallbacks,
-		stats.OversizedRequestFallbacks,
-		stats.ProbeRefreshFallbacks)
-	plog("                  avg-batch=%.2f max-batch=%d avg-union=%.2f max-union=%d cluster-reuse=%.2fx scan-clusters=%d scan-rows=%d seals(timer=%d maxReq=%d maxUnion=%d)",
-		avgBatch,
-		stats.MaxBatchSize,
-		avgUnion,
-		stats.MaxUnionClusters,
-		clusterReuse,
-		stats.ScanClusters,
-		stats.ScanRows,
-		stats.SealByTimer,
-		stats.SealByMaxRequests,
-		stats.SealByMaxUnion)
-}
-
-func ratio(num, den int64) float64 {
-	if den == 0 {
-		return 0
+	sess.VecVars.UseGoRank = h.cfg.useGoRank
+	sess.VecVars.Fallback = false
+	if h.cfg.nprobe > 0 {
+		sess.VecVars.Nprobe = h.cfg.nprobe
 	}
-	return float64(num) / float64(den)
+	return sess
 }
 
 // runQueries executes nQueries queries from h.test, captures a CPU profile

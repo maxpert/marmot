@@ -3,10 +3,10 @@ package db
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"math"
-	"strconv"
-	"strings"
+	"os"
 	"sync"
 	"time"
 
@@ -45,6 +45,14 @@ type IndexLifecycleHook interface {
 // manager owns that column so crash recovery can detect "still reindexing".
 type IndexReindexHook interface {
 	OnIndexReindex(ctx context.Context, meta common.VectorIndexMeta) error
+}
+
+type IndexLocalChangeHook interface {
+	OnIndexLocalChanges(ctx context.Context, meta common.VectorIndexMeta, entries []common.CDCEntry) error
+}
+
+type IndexOpenHook interface {
+	OnIndexLoaded(ctx context.Context, meta common.VectorIndexMeta) error
 }
 
 // EngineProvider allows the VectorIndexManager to remove in-memory engine
@@ -132,9 +140,12 @@ func (m *VectorIndexManager) Start(ctx context.Context) error {
 	if err := m.loadExistingIndexes(ctx); err != nil {
 		return err
 	}
-	// Design §8.4: recover any indexes left in status='reindexing' after a
-	// crash. Drop leftover staging tables so the next REINDEX starts clean.
-	return m.recoverReindexingIndexes(ctx)
+	// Recover any indexes left in status='reindexing' after a crash, then open
+	// local file-backed state for all known indexes.
+	if err := m.recoverReindexingIndexes(ctx); err != nil {
+		return err
+	}
+	return m.openExistingIndexes(ctx)
 }
 
 // Stop is a no-op; individual index shutdown is handled by the engine.
@@ -142,18 +153,8 @@ func (m *VectorIndexManager) Stop() error {
 	return nil
 }
 
-// CreateIndex executes the full CREATE VECTOR INDEX DDL transaction (design §8.1):
-//  1. Validates the base table has INTEGER PRIMARY KEY (fix R6).
-//  2. Auto-tunes nlist/nprobe if not supplied.
-//  3. Creates: centroids table, members table+index, base-table triggers,
-//     centroid-change triggers — all in one atomic DDL transaction.
-//  4. Inserts metadata row with status='building'.
-//  5. Calls the lifecycle hook (P1-C) which performs bulk population and
-//     flips status to 'ready'.
-//
-// Note: the DDL transaction holds SQLite's single writer lock for its duration.
-// Concurrent user writes block until the DDL commits. For large base tables the
-// lock window is the DDL itself (fast); bulk populate runs outside the DDL txn.
+// CreateIndex records the vector-index metadata in SQLite and then lets the
+// engine build or bootstrap the local file-backed serving state.
 func (m *VectorIndexManager) CreateIndex(ctx context.Context, meta VectorIndexMeta) error {
 	conn, err := m.dbMgr.GetDatabaseConnection(meta.Database)
 	if err != nil {
@@ -203,6 +204,7 @@ func (m *VectorIndexManager) CreateIndex(ctx context.Context, meta VectorIndexMe
 	// Hand off to engine for bulk populate (P1-C). Non-fatal if hook not yet wired.
 	m.mu.Lock()
 	hook := m.lifecycleHook
+	ep := m.engineProv
 	m.mu.Unlock()
 
 	// Insert into in-memory cache now that DDL has committed.
@@ -215,27 +217,29 @@ func (m *VectorIndexManager) CreateIndex(ctx context.Context, meta VectorIndexMe
 	if hook != nil {
 		if err := hook.OnIndexCreated(ctx, meta); err != nil {
 			log.Error().Err(err).Str("index", meta.IndexName).Msg("VectorIndexManager: lifecycle hook failed")
+			if ep != nil {
+				ep.RemoveIndex(meta.IndexName)
+			}
+			m.removeCachedIndex(meta.Database, meta.TableName, meta.ColumnName)
+			rollbackErr := m.execDropDDL(ctx, conn, meta.IndexName)
+			if m.dbMgr != nil {
+				if dbPath, pathErr := m.dbMgr.GetDatabasePath(meta.Database); pathErr == nil {
+					rollbackErr = errors.Join(rollbackErr, os.RemoveAll(vecindex.SegmentStoreDir(dbPath, meta.IndexName)))
+				}
+			}
+			if rollbackErr != nil {
+				log.Error().Err(rollbackErr).Str("index", meta.IndexName).
+					Msg("VectorIndexManager: failed to roll back metadata after lifecycle hook failure")
+				return fmt.Errorf("vector index: populate failed: %w", errors.Join(err, fmt.Errorf("rollback state: %w", rollbackErr)))
+			}
 			return fmt.Errorf("vector index: populate failed: %w", err)
 		}
 	}
 	return nil
 }
 
-// DropIndex executes the atomic DROP VECTOR INDEX sequence (design §8.2):
-//  1. Removes in-memory engine state first (via EngineProvider) so concurrent
-//     queries fail fast with "index not found" rather than touching partially-
-//     dropped SQLite objects.
-//  2. Runs a single DDL transaction: drop triggers → drop shadow tables →
-//     drop centroids table → delete metadata row.
-//
-// Failure semantics: if the DDL transaction fails after in-memory state has
-// been evicted, the index is left in an inconsistent state (engine evicted,
-// SQL objects still present). All DROP statements use IF EXISTS, so this
-// situation is rare. Recovery: restart the node — Start() reloads metadata
-// and the lifecycle hook re-registers the engine state. Documented as
-// acceptable per design §8.2 ("no 'dropping' status column needed").
-//
-// Note: the DDL transaction holds SQLite's single writer lock for its duration.
+// DropIndex removes in-memory engine state first so concurrent queries fail
+// fast, then deletes the metadata row from SQLite.
 func (m *VectorIndexManager) DropIndex(ctx context.Context, indexName, database string) error {
 	conn, err := m.dbMgr.GetDatabaseConnection(database)
 	if err != nil {
@@ -289,23 +293,15 @@ func (m *VectorIndexManager) DropIndex(ctx context.Context, indexName, database 
 		return err
 	}
 	ddlSucceeded = true
+	if dbPath, err := m.dbMgr.GetDatabasePath(database); err == nil {
+		_ = os.RemoveAll(vecindex.SegmentStoreDir(dbPath, indexName))
+	}
 	return nil
 }
 
-// ReindexIndex executes REINDEX VECTOR <name> per design §8.3:
-//  1. Validates the index exists and is in a reindex-eligible status.
-//  2. Flips __marmot_vector_indexes.status to 'reindexing' in a short txn.
-//  3. Invokes the installed IndexReindexHook (EngineHook), which runs the
-//     shadow-swap pipeline: warm-start k-means → chunked populate of the
-//     staging table → atomic swap txn → in-memory probeState swap.
-//  4. On pipeline success, the swap txn has already set status='ready'.
-//  5. On pipeline failure, reverts status back to 'ready' so subsequent
-//     retries can re-enter the pipeline from a clean baseline.
-//
-// The staging table is the sole drift-isolation boundary: triggers on the
-// base table continue writing cluster_id=0 entries to the LIVE members
-// table during reindex, and the swap txn replays them against the new
-// centroids via Go-side assignment before the DROP+RENAME.
+// ReindexIndex executes REINDEX VECTOR <name> by flipping metadata status to
+// 'reindexing', delegating the rebuild to the engine hook, then restoring the
+// cached metadata.
 func (m *VectorIndexManager) ReindexIndex(ctx context.Context, indexName string) error {
 	if err := vecindex.ValidateIndexName(indexName); err != nil {
 		return fmt.Errorf("vector reindex: %w", err)
@@ -385,11 +381,88 @@ func (m *VectorIndexManager) setCachedStatus(database, table, column, status str
 	}
 }
 
+func (m *VectorIndexManager) removeCachedIndex(database, table, column string) {
+	key := indexCacheKey{database: database, table: table, column: column}
+	m.cacheMu.Lock()
+	delete(m.indexCache, key)
+	m.cacheMu.Unlock()
+}
+
+// ApplyLocalCDC updates local vector serving state after a transaction has
+// committed successfully on this node. It never touches replication payload;
+// it only forwards relevant CDC entries to the local file-backed vector path.
+func (m *VectorIndexManager) ApplyLocalCDC(ctx context.Context, database string, entries []common.CDCEntry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+
+	m.mu.Lock()
+	hook, _ := m.lifecycleHook.(IndexLocalChangeHook)
+	m.mu.Unlock()
+	if hook == nil {
+		return nil
+	}
+
+	byTable := make(map[string][]common.CDCEntry)
+	for _, entry := range entries {
+		if entry.Table == "" {
+			continue
+		}
+		byTable[entry.Table] = append(byTable[entry.Table], entry)
+	}
+
+	for tableName, tableEntries := range byTable {
+		for _, meta := range m.indexesForTable(database, tableName) {
+			if err := hook.OnIndexLocalChanges(ctx, meta, tableEntries); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (m *VectorIndexManager) indexesForTable(database, table string) []common.VectorIndexMeta {
+	m.cacheMu.RLock()
+	defer m.cacheMu.RUnlock()
+
+	var metas []common.VectorIndexMeta
+	for key, meta := range m.indexCache {
+		if key.database != database || key.table != table {
+			continue
+		}
+		metas = append(metas, *meta)
+	}
+	return metas
+}
+
+func (m *VectorIndexManager) openExistingIndexes(ctx context.Context) error {
+	m.mu.Lock()
+	hook, _ := m.lifecycleHook.(IndexOpenHook)
+	m.mu.Unlock()
+	if hook == nil {
+		return nil
+	}
+
+	m.cacheMu.RLock()
+	metas := make([]common.VectorIndexMeta, 0, len(m.indexCache))
+	for _, meta := range m.indexCache {
+		metas = append(metas, *meta)
+	}
+	m.cacheMu.RUnlock()
+
+	for _, meta := range metas {
+		if err := hook.OnIndexLoaded(ctx, meta); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func loadIndexMetaByName(ctx context.Context, conn *sql.DB, indexName string) (*VectorIndexMeta, error) {
 	row := conn.QueryRowContext(ctx, `
 		SELECT index_name, table_name, column_name, database_name,
 		       metric, dim, nlist, nprobe, auto_nlist, auto_nprobe,
-		       target_partition_size, max_norm, status
+		       target_partition_size, max_norm, status, created_at
 		  FROM __marmot_vector_indexes
 		 WHERE index_name = ?`, indexName)
 	var (
@@ -401,7 +474,7 @@ func loadIndexMetaByName(ctx context.Context, conn *sql.DB, indexName string) (*
 		&meta.IndexName, &meta.TableName, &meta.ColumnName, &meta.Database,
 		&meta.Metric, &meta.Dim, &meta.Nlist, &meta.Nprobe,
 		&autoNlist, &autoNprobe, &meta.TargetPartitionSize,
-		&meta.MaxNorm, &meta.Status,
+		&meta.MaxNorm, &meta.Status, &meta.CreatedAt,
 	); err != nil {
 		return nil, err
 	}
@@ -419,11 +492,8 @@ func updateIndexStatus(ctx context.Context, conn *sql.DB, indexName, status stri
 	return err
 }
 
-// recoverReindexingIndexes implements design §8.4 for status='reindexing':
-// on startup, drop any leftover staging table (from a crashed REINDEX
-// attempt) and flip the metadata status back to 'ready'. The live members
-// table is untouched — old centroids remain valid; the operator may
-// re-issue REINDEX to retry.
+// recoverReindexingIndexes flips any index left in status='reindexing' back to
+// 'ready' on startup so a local rebuild can be retried cleanly.
 func (m *VectorIndexManager) recoverReindexingIndexes(ctx context.Context) error {
 	m.cacheMu.RLock()
 	stale := make([]VectorIndexMeta, 0)
@@ -441,12 +511,6 @@ func (m *VectorIndexManager) recoverReindexingIndexes(ctx context.Context) error
 				Msg("VectorIndexManager: crash recovery: get connection failed")
 			continue
 		}
-		staging := vecindex.StagingTable(meta.IndexName)
-		if _, err := conn.ExecContext(ctx, fmt.Sprintf(`DROP TABLE IF EXISTS "%s"`, staging)); err != nil {
-			log.Warn().Err(err).Str("index", meta.IndexName).
-				Msg("VectorIndexManager: crash recovery: drop staging failed")
-			continue
-		}
 		if err := updateIndexStatus(ctx, conn, meta.IndexName, "ready"); err != nil {
 			log.Warn().Err(err).Str("index", meta.IndexName).
 				Msg("VectorIndexManager: crash recovery: revert status failed")
@@ -454,51 +518,16 @@ func (m *VectorIndexManager) recoverReindexingIndexes(ctx context.Context) error
 		}
 		m.setCachedStatus(meta.Database, meta.TableName, meta.ColumnName, "ready")
 		log.Info().Str("index", meta.IndexName).
-			Msg("VectorIndexManager: crash recovery: dropped staging and reverted to 'ready'")
+			Msg("VectorIndexManager: crash recovery: reverted to 'ready'")
 	}
 	return nil
 }
 
-// execCreateDDL runs the DDL transaction for CREATE VECTOR INDEX (design §8.1 steps 1-9).
-//
-// Identifier safety: idx, tbl, and col are interpolated into DDL strings via
-// double-quote SQL identifier escaping. idx is pre-validated by
-// vecindex.ValidateIndexName (ASCII letters/digits/underscore only) before
-// reaching this function, so the '...<idx>...' literal in trigger bodies is
-// injection-safe. tbl and col are quoted with escapeQuote to handle edge-cases.
+// execCreateDDL records vector-index metadata only. Local serving state lives
+// in file-backed segment/overlay data outside SQLite.
 func (m *VectorIndexManager) execCreateDDL(ctx context.Context, conn *sql.DB, meta VectorIndexMeta) error {
-	idx := meta.IndexName
-	tbl := meta.TableName
-	col := meta.ColumnName
-
-	// Defense-in-depth: idx is interpolated as a SQL string literal inside the
-	// centroid-change trigger bodies (`'<idx>'`). ValidateIndexName guarantees
-	// idx matches [A-Za-z][A-Za-z0-9_]* with no quote characters, making the
-	// interpolation safe. Re-assert here so any future caller that skips the
-	// CreateIndex validation path is caught at emit time rather than silently
-	// producing unsafe DDL.
-	if err := vecindex.ValidateIndexName(idx); err != nil {
+	if err := vecindex.ValidateIndexName(meta.IndexName); err != nil {
 		return fmt.Errorf("execCreateDDL: %w", err)
-	}
-
-	centroids := vecindex.CentroidsTable(idx)
-	members := vecindex.MembersTable(idx)
-	membersIdx := vecindex.MembersRowidIndex(idx)
-	membersRowidUQ := vecindex.MembersRowidUniqueIndex(idx)
-	trgAI := vecindex.TriggerInsert(idx)
-	trgAU := vecindex.TriggerUpdate(idx)
-	trgAD := vecindex.TriggerDelete(idx)
-	trgCentAI := vecindex.TriggerCentroidChange(idx)
-	trgCentAU := vecindex.TriggerCentroidsVersionUpdate(idx)
-	metricKind, err := metricFromString(meta.Metric)
-	if err != nil {
-		return fmt.Errorf("vector index: parse metric for DDL: %w", err)
-	}
-	metricCode := strconv.FormatInt(int64(metricKind), 10)
-	dimLit := strconv.Itoa(meta.Dim)
-	maxNormLit := strconv.FormatFloat(float64(meta.MaxNorm), 'g', -1, 32)
-	if !strings.ContainsAny(maxNormLit, ".eE") {
-		maxNormLit += ".0"
 	}
 
 	tx, err := conn.BeginTx(ctx, nil)
@@ -511,92 +540,12 @@ func (m *VectorIndexManager) execCreateDDL(ctx context.Context, conn *sql.DB, me
 		}
 	}()
 
-	stmts := []string{
-		// Centroids table — CDC-replicated (single underscore prefix).
-		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS "%s" (
-			index_id    INTEGER PRIMARY KEY,
-			version     INTEGER NOT NULL,
-			updated_at  INTEGER NOT NULL,
-			nlist       INTEGER NOT NULL,
-			compression TEXT    NOT NULL,
-			centroids   BLOB    NOT NULL,
-			last_n      INTEGER NOT NULL
-		)`, centroids),
-
-		// Members shadow table — CDC-excluded (double underscore prefix).
-		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS "%s" (
-			cluster_id INTEGER NOT NULL,
-			rowid      INTEGER NOT NULL,
-			vec        BLOB    NOT NULL,
-			PRIMARY KEY (cluster_id, rowid)
-		) WITHOUT ROWID`, members),
-
-		// Secondary index for fast rowid lookups during UPDATE/DELETE.
-		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS "%s" ON "%s"(rowid)`,
-			membersIdx, members),
-		fmt.Sprintf(`CREATE UNIQUE INDEX IF NOT EXISTS "%s" ON "%s"(rowid)`,
-			membersRowidUQ, members),
-
-		// AFTER INSERT trigger: newly inserted rows enter delta (cluster_id=0).
-		fmt.Sprintf(`CREATE TRIGGER IF NOT EXISTS "%s"
-			AFTER INSERT ON "%s" WHEN NEW."%s" IS NOT NULL
-			BEGIN
-				INSERT INTO "%s" (cluster_id, rowid, vec)
-				SELECT 0, NEW.rowid, mv
-				FROM (SELECT __marmot_vec_materialize(NEW."%s", %s, %s, %s) AS mv)
-				WHERE mv IS NOT NULL;
-			END`, trgAI, tbl, col, members, col, metricCode, dimLit, maxNormLit),
-
-		// AFTER UPDATE trigger: remove old assignment, conditionally re-enter delta.
-		fmt.Sprintf(`CREATE TRIGGER IF NOT EXISTS "%s"
-			AFTER UPDATE OF "%s" ON "%s"
-			BEGIN
-				DELETE FROM "%s" WHERE rowid = OLD.rowid;
-				INSERT INTO "%s" (cluster_id, rowid, vec)
-				SELECT 0, NEW.rowid, mv
-				FROM (SELECT __marmot_vec_materialize(NEW."%s", %s, %s, %s) AS mv)
-				WHERE NEW."%s" IS NOT NULL AND mv IS NOT NULL;
-			END`, trgAU, col, tbl, members, members, col, metricCode, dimLit, maxNormLit, col),
-
-		// AFTER DELETE trigger: remove from members entirely.
-		fmt.Sprintf(`CREATE TRIGGER IF NOT EXISTS "%s"
-			AFTER DELETE ON "%s"
-			BEGIN
-				DELETE FROM "%s" WHERE rowid = OLD.rowid;
-			END`, trgAD, tbl, members),
-
-		// Centroid-change trigger — AFTER INSERT on centroids (design §8.8).
-		fmt.Sprintf(`CREATE TRIGGER IF NOT EXISTS "%s"
-			AFTER INSERT ON "%s"
-			BEGIN
-				SELECT __marmot_vec_notify_centroid_change('%s', NEW.version);
-			END`, trgCentAI, centroids, idx),
-
-		// Centroid-change trigger — AFTER UPDATE OF version on centroids (design §8.8).
-		fmt.Sprintf(`CREATE TRIGGER IF NOT EXISTS "%s"
-			AFTER UPDATE OF version ON "%s"
-			BEGIN
-				SELECT __marmot_vec_notify_centroid_change('%s', NEW.version);
-			END`, trgCentAU, centroids, idx),
-
-		// Metadata row — status='building'; engine flips to 'ready' after populate.
-		fmt.Sprintf(`INSERT INTO __marmot_vector_indexes
-			(index_name, table_name, column_name, database_name, metric, dim,
-			 nlist, nprobe, auto_nlist, auto_nprobe, target_partition_size,
-			 max_norm, status, created_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'building', ?)
-			ON CONFLICT(index_name) DO NOTHING`),
-	}
-
-	// All DDL statements except the last metadata INSERT.
-	for _, s := range stmts[:len(stmts)-1] {
-		if _, err := tx.ExecContext(ctx, s); err != nil {
-			return fmt.Errorf("vector index: DDL %q: %w", s[:min(60, len(s))], err)
-		}
-	}
-
-	// Metadata INSERT with bound parameters.
-	if _, err := tx.ExecContext(ctx, stmts[len(stmts)-1],
+	if _, err := tx.ExecContext(ctx, `INSERT INTO __marmot_vector_indexes
+		(index_name, table_name, column_name, database_name, metric, dim,
+		 nlist, nprobe, auto_nlist, auto_nprobe, target_partition_size,
+		 max_norm, status, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'building', ?)
+		ON CONFLICT(index_name) DO NOTHING`,
 		meta.IndexName, meta.TableName, meta.ColumnName, meta.Database,
 		meta.Metric, meta.Dim, meta.Nlist, meta.Nprobe,
 		boolToInt(meta.AutoTuneNlist), boolToInt(meta.AutoTuneNprobe),
@@ -622,10 +571,9 @@ func (m *VectorIndexManager) execCreateDDL(ctx context.Context, conn *sql.DB, me
 	return nil
 }
 
-// execDropDDL runs the atomic DROP DDL transaction (design §8.2 steps 2-9).
+// execDropDDL removes the metadata row for the vector index. Local files are
+// managed outside SQLite.
 func (m *VectorIndexManager) execDropDDL(ctx context.Context, conn *sql.DB, indexName string) error {
-	idx := indexName
-
 	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("vector index drop: begin DDL txn: %w", err)
@@ -636,24 +584,7 @@ func (m *VectorIndexManager) execDropDDL(ctx context.Context, conn *sql.DB, inde
 		}
 	}()
 
-	stmts := []string{
-		fmt.Sprintf(`DROP TRIGGER IF EXISTS "%s"`, vecindex.TriggerInsert(idx)),
-		fmt.Sprintf(`DROP TRIGGER IF EXISTS "%s"`, vecindex.TriggerUpdate(idx)),
-		fmt.Sprintf(`DROP TRIGGER IF EXISTS "%s"`, vecindex.TriggerDelete(idx)),
-		fmt.Sprintf(`DROP TRIGGER IF EXISTS "%s"`, vecindex.TriggerCentroidChange(idx)),
-		fmt.Sprintf(`DROP TRIGGER IF EXISTS "%s"`, vecindex.TriggerCentroidsVersionUpdate(idx)),
-		fmt.Sprintf(`DROP TABLE IF EXISTS "%s"`, vecindex.MembersTable(idx)),
-		// Drop centroids table last — its CDC event replicates the DROP to peers.
-		fmt.Sprintf(`DROP TABLE IF EXISTS "%s"`, vecindex.CentroidsTable(idx)),
-		`DELETE FROM __marmot_vector_indexes WHERE index_name = ?`,
-	}
-
-	for _, s := range stmts[:len(stmts)-1] {
-		if _, err := tx.ExecContext(ctx, s); err != nil {
-			return fmt.Errorf("vector index drop: %w", err)
-		}
-	}
-	if _, err := tx.ExecContext(ctx, stmts[len(stmts)-1], indexName); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM __marmot_vector_indexes WHERE index_name = ?`, indexName); err != nil {
 		return fmt.Errorf("vector index drop: delete metadata: %w", err)
 	}
 
@@ -678,7 +609,7 @@ func (m *VectorIndexManager) loadExistingIndexes(ctx context.Context) error {
 		rows, err := conn.QueryContext(ctx, `
 			SELECT index_name, table_name, column_name, database_name,
 			       metric, dim, nlist, nprobe, auto_nlist, auto_nprobe,
-			       target_partition_size, max_norm, status
+			       target_partition_size, max_norm, status, created_at
 			FROM __marmot_vector_indexes`)
 		if err != nil {
 			log.Warn().Err(err).Str("database", dbName).Msg("VectorIndexManager: failed to query existing indexes")
@@ -694,7 +625,7 @@ func (m *VectorIndexManager) loadExistingIndexes(ctx context.Context) error {
 				&meta.IndexName, &meta.TableName, &meta.ColumnName, &meta.Database,
 				&meta.Metric, &meta.Dim, &meta.Nlist, &meta.Nprobe,
 				&autoNlist, &autoNprobe, &meta.TargetPartitionSize,
-				&meta.MaxNorm, &meta.Status,
+				&meta.MaxNorm, &meta.Status, &meta.CreatedAt,
 			); err != nil {
 				log.Warn().Err(err).Msg("VectorIndexManager: failed to scan index row")
 				continue

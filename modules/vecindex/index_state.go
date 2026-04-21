@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"sync/atomic"
 
 	"github.com/maxpert/marmot/modules/vecindex/pkg/kmeans"
@@ -21,26 +22,25 @@ var ErrNoCentroidsLoaded = errors.New("vecindex: no centroids loaded")
 //
 // All pointers are stored as atomic.Pointer so readers are lock-free.
 type IndexState struct {
-	spec          IVFSpec
-	probeState    atomic.Pointer[kmeans.CentroidSet]
-	driftState    atomic.Pointer[kmeans.CentroidSet]
-	driftTracker  atomic.Pointer[DriftTracker]
-	residentDelta atomic.Pointer[DeltaBuffer]
-	packedStore   atomic.Pointer[PackedPartitionStore]
-	packedDirty   atomic.Pointer[packedDirtySet]
-}
-
-type packedDirtySet struct {
-	clusters map[int64]struct{}
+	spec         IVFSpec
+	probeState   atomic.Pointer[kmeans.CentroidSet]
+	driftState   atomic.Pointer[kmeans.CentroidSet]
+	driftTracker atomic.Pointer[DriftTracker]
+	overlay      atomic.Pointer[JournaledOverlay]
+	segmentStore atomic.Pointer[SegmentGeneration]
+	clusterHits  []atomic.Uint64
 }
 
 // NewIndexState creates an IndexState with probe and drift both pointing at cs.
 // The drift tracker is initialized from cs's centroids for MacQueen tracking.
 func NewIndexState(spec IVFSpec, cs *kmeans.CentroidSet) *IndexState {
 	s := &IndexState{spec: spec}
+	if spec.Nlist > 0 {
+		s.clusterHits = make([]atomic.Uint64, spec.Nlist+1)
+	}
 	s.probeState.Store(cs)
 	s.driftState.Store(cs)
-	s.residentDelta.Store(NewDeltaBuffer())
+	s.overlay.Store(nil)
 	if cs != nil {
 		s.driftTracker.Store(NewDriftTracker(cs.Snapshot()))
 	}
@@ -130,103 +130,134 @@ func (s *IndexState) LoadDriftTracker() *DriftTracker {
 	return s.driftTracker.Load()
 }
 
-// LoadResidentDelta returns the always-resident cluster_id=0 buffer used by
-// the packed streaming path. The returned buffer is immutable to callers.
-func (s *IndexState) LoadResidentDelta() *DeltaBuffer {
-	return s.residentDelta.Load()
+func (s *IndexState) LoadOverlay() *JournaledOverlay {
+	return s.overlay.Load()
 }
 
-// StoreResidentDelta installs delta as the active always-resident
-// cluster_id=0 buffer. Passing nil resets it to an empty buffer.
-func (s *IndexState) StoreResidentDelta(delta *DeltaBuffer) {
-	if delta == nil {
-		delta = NewDeltaBuffer()
-	}
-	s.residentDelta.Store(delta)
-}
-
-// LoadPackedStore returns the current mmap-backed stable partition store.
-func (s *IndexState) LoadPackedStore() *PackedPartitionStore {
-	return s.packedStore.Load()
-}
-
-// StorePackedStore installs store as the active packed partition snapshot and
-// clears any dirty-cluster bookkeeping.
-func (s *IndexState) StorePackedStore(store *PackedPartitionStore) {
-	old := s.packedStore.Swap(store)
-	s.packedDirty.Store(nil)
-	if old != nil && old != store {
+func (s *IndexState) StoreOverlay(overlay *JournaledOverlay) {
+	old := s.overlay.Swap(overlay)
+	if old != nil && old != overlay {
 		_ = old.Close()
 	}
 }
 
-// ClearPackedStore drops the active packed partition snapshot.
-func (s *IndexState) ClearPackedStore() {
-	old := s.packedStore.Swap(nil)
-	s.packedDirty.Store(nil)
+func (s *IndexState) ClearOverlay() {
+	old := s.overlay.Swap(nil)
 	if old != nil {
 		_ = old.Close()
 	}
 }
 
-// PackedClusterDirty reports whether the stable packed snapshot should be
-// bypassed for clusterID and SQLite should be consulted instead.
-func (s *IndexState) PackedClusterDirty(clusterID int64) bool {
-	if clusterID <= 0 {
-		return true
-	}
-	dirty := s.packedDirty.Load()
-	if dirty == nil {
-		return false
-	}
-	_, ok := dirty.clusters[clusterID]
-	return ok
+// LoadSegmentStore returns the active stable on-disk generation snapshot.
+func (s *IndexState) LoadSegmentStore() *SegmentGeneration {
+	return s.segmentStore.Load()
 }
 
-// ApplyDeltaFlushUpdates reflects a committed delta-flush batch in memory:
-// rowids are removed from the resident delta buffer and touched clusters are
-// marked dirty so subsequent packed reads consult SQLite until the next
-// snapshot rebuild.
-func (s *IndexState) ApplyDeltaFlushUpdates(expectedEpoch uint64, entries []PartitionUpdate) {
-	if len(entries) == 0 {
-		return
-	}
-	if s.ProbeVersion() != expectedEpoch {
-		return
-	}
-	if delta := s.residentDelta.Load(); delta != nil {
-		for _, e := range entries {
-			delta.Remove(e.RowID)
+// StoreSegmentStore installs generation as the active stable on-disk snapshot.
+func (s *IndexState) StoreSegmentStore(generation *SegmentGeneration) {
+	if generation != nil && generation.Data != nil {
+		warmClusters := s.HotClusters(32)
+		if len(warmClusters) == 0 && len(generation.LayoutHotClusters) > 0 {
+			warmClusters = append([]int64(nil), generation.LayoutHotClusters...)
+		}
+		if len(warmClusters) > 0 {
+			_ = generation.Data.WarmClusters(warmClusters, 16<<20)
 		}
 	}
-	s.markPackedClustersDirty(entries)
+	old := s.segmentStore.Swap(generation)
+	if old != nil && old != generation {
+		_ = old.Close()
+	}
 }
 
-func (s *IndexState) markPackedClustersDirty(entries []PartitionUpdate) {
-	if s.packedStore.Load() == nil || len(entries) == 0 {
+// ClearSegmentStore drops the active stable on-disk snapshot.
+func (s *IndexState) ClearSegmentStore() {
+	old := s.segmentStore.Swap(nil)
+	if old != nil {
+		_ = old.Close()
+	}
+}
+
+func (s *IndexState) RecordClusterHits(clusterIDs []int64) {
+	if len(clusterIDs) == 0 || len(s.clusterHits) == 0 {
 		return
 	}
-	for {
-		old := s.packedDirty.Load()
-		next := &packedDirtySet{clusters: make(map[int64]struct{}, len(entries))}
-		if old != nil {
-			for cid := range old.clusters {
-				next.clusters[cid] = struct{}{}
-			}
+	for _, clusterID := range clusterIDs {
+		if clusterID <= 0 || int(clusterID) >= len(s.clusterHits) {
+			continue
 		}
-		for _, entry := range entries {
-			if entry.ClusterID > 0 {
-				next.clusters[entry.ClusterID] = struct{}{}
-			}
-		}
-		if s.packedDirty.CompareAndSwap(old, next) {
-			return
-		}
+		s.clusterHits[clusterID].Add(1)
 	}
+}
+
+func (s *IndexState) HotClusters(limit int) []int64 {
+	scores := s.hotClusterScores(limit)
+	if len(scores) == 0 {
+		return nil
+	}
+	clusters := make([]int64, len(scores))
+	for i, score := range scores {
+		clusters[i] = score.clusterID
+	}
+	return clusters
+}
+
+func (s *IndexState) HotClusterScores(limit int) map[int64]uint64 {
+	scores := s.hotClusterScores(limit)
+	if len(scores) == 0 {
+		return nil
+	}
+	out := make(map[int64]uint64, len(scores))
+	for _, score := range scores {
+		out[score.clusterID] = score.hits
+	}
+	return out
+}
+
+type clusterHitScore struct {
+	clusterID int64
+	hits      uint64
+}
+
+func (s *IndexState) hotClusterScores(limit int) []clusterHitScore {
+	if len(s.clusterHits) == 0 {
+		return nil
+	}
+	scores := make([]clusterHitScore, 0, len(s.clusterHits)-1)
+	for clusterID := 1; clusterID < len(s.clusterHits); clusterID++ {
+		hits := s.clusterHits[clusterID].Load()
+		if hits == 0 {
+			continue
+		}
+		scores = append(scores, clusterHitScore{
+			clusterID: int64(clusterID),
+			hits:      hits,
+		})
+	}
+	if len(scores) == 0 {
+		return nil
+	}
+	slices.SortFunc(scores, func(a, b clusterHitScore) int {
+		switch {
+		case a.hits > b.hits:
+			return -1
+		case a.hits < b.hits:
+			return 1
+		case a.clusterID < b.clusterID:
+			return -1
+		case a.clusterID > b.clusterID:
+			return 1
+		default:
+			return 0
+		}
+	})
+	if limit > 0 && len(scores) > limit {
+		scores = scores[:limit]
+	}
+	return scores
 }
 
 // AssignNearest returns the 1-based cluster ID for the nearest centroid.
-// cluster_id=0 is reserved for delta (unassigned) rows per design §3.3.
 //
 // vecBytes must be a little-endian float32 BLOB of exactly spec.Dim*4 bytes
 // for L2/Cosine, or spec.Dim*4 bytes for Dot (augmentation is applied here).
@@ -265,7 +296,7 @@ func (s *IndexState) AssignNearest(vecBytes []byte) (int64, error) {
 		return 0, fmt.Errorf("vecindex: assign nearest for index %q: %w", s.spec.ID, err)
 	}
 
-	return int64(clusterID) + 1, nil // 1-based; 0 reserved for delta
+	return int64(clusterID) + 1, nil // 1-based cluster IDs for stable partitions
 }
 
 // AssignNearestPrepared returns the 1-based cluster ID for the nearest

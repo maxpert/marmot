@@ -114,11 +114,11 @@ func RewriteVectorQuery(
 	// --- Plan selection (design §7.2) ---
 	var plan RewritePlan
 	switch {
-	case userPred == nil:
-		plan = PlanPostFilter
 	case forcePlan == "pre":
 		plan = PlanPreFilter
 	case forcePlan == "post":
+		plan = PlanPostFilter
+	case userPred == nil:
 		plan = PlanPostFilter
 	case estimatedF <= min64(estimatedI, prefilterCap):
 		plan = PlanPreFilter
@@ -185,43 +185,34 @@ func RewriteVectorQuery(
 		}
 		info.ClusterIDs = clusterIDs
 
-		primary, err := buildPostFilter(sel, userPred, meta.IndexName, vm.tableRef, clusterIDs)
-		if err != nil {
-			return nil, err
+		vmIdx, vdIdx, totalArgs, walkErr := findArgIndices(sel, vm.node, vd.node)
+		if walkErr != nil {
+			return nil, walkErr
 		}
-		info.PrimaryStmt = primary
-		info.PrimarySQL = sqlparser.String(primary)
-
-		if session.UseGoRank() {
-			vmIdx, vdIdx, totalArgs, walkErr := findArgIndices(sel, vm.node, vd.node)
-			if walkErr != nil {
-				return nil, walkErr
-			}
-			goRank, grErr := BuildGoRankPlan(
-				sel,
-				userPred,
-				queryVec,
-				vmIdx,
-				vdIdx,
-				totalArgs,
-				meta,
-				metricKindFromString(metricSuffix),
-				clusterIDs,
-				nprobe,
-				vm.tableRef,
-				limitK,
-			)
-			if grErr != nil {
-				return nil, grErr
-			}
-			goRank.Database = meta.Database
-			goRank.ProbeEpoch = probeEpoch
-			info.GoRank = goRank
+		goRank, grErr := BuildGoRankPlan(
+			sel,
+			userPred,
+			queryVec,
+			vmIdx,
+			vdIdx,
+			totalArgs,
+			meta,
+			metricKindFromString(metricSuffix),
+			clusterIDs,
+			nprobe,
+			vm.tableRef,
+			limitK,
+		)
+		if grErr != nil {
+			return nil, grErr
 		}
+		goRank.Database = meta.Database
+		goRank.ProbeEpoch = probeEpoch
+		info.GoRank = goRank
 	}
 
 	// --- Fallback (design §7.5) ---
-	if plan == PlanPostFilter && session.Fallback() == "on" {
+	if plan == PlanPostFilter && info.GoRank == nil && session.Fallback() == "on" {
 		fallback, err := buildPreFilter(sel, userPred)
 		if err != nil {
 			return nil, err
@@ -396,101 +387,6 @@ func buildPreFilter(sel *sqlparser.Select, userPred sqlparser.Expr) (*sqlparser.
 			Type: sqlparser.WhereClause,
 			Expr: sqlparser.Clone(userPred),
 		}
-	}
-	return cloned, nil
-}
-
-// buildPostFilter constructs the post-filter SELECT (design §7.4):
-//
-//	WHERE <tableAlias>.rowid IN (
-//	    SELECT rowid FROM __marmot_vec_<idx>_members
-//	     WHERE cluster_id = 0 OR cluster_id IN (c1, c2, ...)
-//	) AND <userPredicate>
-func buildPostFilter(
-	sel *sqlparser.Select,
-	userPred sqlparser.Expr,
-	indexName string,
-	tableAlias string,
-	clusterIDs []int64,
-) (*sqlparser.Select, error) {
-	cloned := sqlparser.Clone(sel)
-
-	membersTable := vecindex.MembersTable(indexName)
-
-	// cluster_id = 0
-	clusterZero := &sqlparser.ComparisonExpr{
-		Operator: sqlparser.EqualOp,
-		Left:     sqlparser.NewColName("cluster_id"),
-		Right:    sqlparser.NewIntLiteral("0"),
-	}
-
-	// cluster_id IN (c1, c2, ...) OR cluster_id = 0
-	var clusterPred sqlparser.Expr
-	if len(clusterIDs) > 0 {
-		tuple := make(sqlparser.ValTuple, len(clusterIDs))
-		for i, id := range clusterIDs {
-			tuple[i] = sqlparser.NewIntLiteral(strconv.FormatInt(id, 10))
-		}
-		inExpr := &sqlparser.ComparisonExpr{
-			Operator: sqlparser.InOp,
-			Left:     sqlparser.NewColName("cluster_id"),
-			Right:    tuple,
-		}
-		clusterPred = &sqlparser.OrExpr{Left: clusterZero, Right: inExpr}
-	} else {
-		clusterPred = clusterZero
-	}
-
-	// Subquery: SELECT rowid FROM <membersTable> WHERE <clusterPred>
-	subSel := &sqlparser.Select{
-		SelectExprs: &sqlparser.SelectExprs{
-			Exprs: []sqlparser.SelectExpr{
-				sqlparser.NewAliasedExpr(sqlparser.NewColName("rowid"), ""),
-			},
-		},
-		From: sqlparser.TableExprs{
-			&sqlparser.AliasedTableExpr{
-				Expr: sqlparser.TableName{
-					Name: sqlparser.NewIdentifierCS(membersTable),
-				},
-			},
-		},
-		Where: &sqlparser.Where{
-			Type: sqlparser.WhereClause,
-			Expr: clusterPred,
-		},
-	}
-
-	// <tableAlias>.rowid or plain rowid
-	var rowidCol sqlparser.Expr
-	if tableAlias != "" {
-		rowidCol = &sqlparser.ColName{
-			Name:      sqlparser.NewIdentifierCI("rowid"),
-			Qualifier: sqlparser.TableName{Name: sqlparser.NewIdentifierCS(tableAlias)},
-		}
-	} else {
-		rowidCol = sqlparser.NewColName("rowid")
-	}
-
-	inClause := &sqlparser.ComparisonExpr{
-		Operator: sqlparser.InOp,
-		Left:     rowidCol,
-		Right:    &sqlparser.Subquery{Select: subSel},
-	}
-
-	var newWhere sqlparser.Expr
-	if userPred != nil {
-		newWhere = &sqlparser.AndExpr{
-			Left:  inClause,
-			Right: sqlparser.Clone(userPred),
-		}
-	} else {
-		newWhere = inClause
-	}
-
-	cloned.Where = &sqlparser.Where{
-		Type: sqlparser.WhereClause,
-		Expr: newWhere,
 	}
 	return cloned, nil
 }

@@ -1,7 +1,6 @@
-// Package vecindex implements IVF (Inverted File Index) vector similarity search.
-// The Pebble-backed storage engine has been retired in v5.4; this package now
-// holds shared type definitions and primitive sub-packages (metric, kmeans)
-// used by the forthcoming SQLite-native implementation.
+// Package vecindex implements IVF (Inverted File Index) vector similarity
+// search using local segment files, overlay journals, and shared metric/kmeans
+// primitives.
 package vecindex
 
 import "github.com/maxpert/marmot/modules/vecindex/pkg/metric"

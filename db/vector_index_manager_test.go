@@ -6,14 +6,43 @@ package db
 import (
 	"context"
 	"database/sql"
-	"fmt"
+	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/maxpert/marmot/common"
+	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/modules/vecindex"
 	"github.com/stretchr/testify/require"
 )
+
+type failingCreateHook struct {
+	dbMgr *DatabaseManager
+	err   error
+}
+
+func (h failingCreateHook) OnIndexCreated(_ context.Context, meta common.VectorIndexMeta) error {
+	if h.dbMgr != nil {
+		dbPath, err := h.dbMgr.GetDatabasePath(meta.Database)
+		if err == nil {
+			dir := vecindex.SegmentStoreDir(dbPath, meta.IndexName)
+			_ = os.MkdirAll(dir, 0o755)
+			_ = os.WriteFile(filepath.Join(dir, "partial"), []byte("partial"), 0o644)
+		}
+	}
+	return h.err
+}
+
+type recordingEngineProvider struct {
+	removed []string
+}
+
+func (p *recordingEngineProvider) RemoveIndex(indexName string) func() {
+	p.removed = append(p.removed, indexName)
+	return func() {}
+}
 
 // setupVecIndexTestDB opens an in-memory DB and runs schema migration.
 func setupVecIndexTestDB(t *testing.T) *sql.DB {
@@ -70,26 +99,12 @@ func TestCreateVectorIndex_DDL(t *testing.T) {
 	err := mgr.execCreateDDL(ctx, db, meta)
 	require.NoError(t, err)
 
-	// Centroids table (single underscore → CDC-replicated).
-	require.True(t, objectExists(t, db, vecindex.CentroidsTable("embeddings")),
-		"centroids table must exist")
-
-	// Members shadow table (double underscore → local).
-	require.True(t, objectExists(t, db, vecindex.MembersTable("embeddings")),
-		"members table must exist")
-
-	// Members rowid index.
-	require.True(t, objectExists(t, db, vecindex.MembersRowidIndex("embeddings")),
-		"members rowid index must exist")
-
-	// Base-table triggers.
-	require.True(t, objectExists(t, db, vecindex.TriggerInsert("embeddings")), "insert trigger")
-	require.True(t, objectExists(t, db, vecindex.TriggerUpdate("embeddings")), "update trigger")
-	require.True(t, objectExists(t, db, vecindex.TriggerDelete("embeddings")), "delete trigger")
-
-	// Centroid-change triggers.
-	require.True(t, objectExists(t, db, vecindex.TriggerCentroidChange("embeddings")), "centroid insert trigger")
-	require.True(t, objectExists(t, db, vecindex.TriggerCentroidsVersionUpdate("embeddings")), "centroid update trigger")
+	var derivedObjects int
+	require.NoError(t, db.QueryRow(
+		`SELECT COUNT(*) FROM sqlite_master WHERE name LIKE ?`,
+		"%marmot_vec_embeddings%",
+	).Scan(&derivedObjects))
+	require.Zero(t, derivedObjects, "vector index DDL should not create SQLite-side payload tables or triggers")
 
 	// Metadata row present with status='building'.
 	require.Equal(t, "building", metaStatus(t, db, "embeddings"))
@@ -137,22 +152,35 @@ func TestDropVectorIndex_DDL(t *testing.T) {
 	require.NoError(t, mgr.execCreateDDL(ctx, db, meta))
 	require.NoError(t, mgr.execDropDDL(ctx, db, "embeddings"))
 
-	// All generated objects must be gone.
-	require.False(t, objectExists(t, db, vecindex.CentroidsTable("embeddings")), "centroids table must be dropped")
-	require.False(t, objectExists(t, db, vecindex.MembersTable("embeddings")), "members table must be dropped")
-	require.False(t, objectExists(t, db, vecindex.TriggerInsert("embeddings")), "insert trigger must be dropped")
-	require.False(t, objectExists(t, db, vecindex.TriggerUpdate("embeddings")), "update trigger must be dropped")
-	require.False(t, objectExists(t, db, vecindex.TriggerDelete("embeddings")), "delete trigger must be dropped")
-	require.False(t, objectExists(t, db, vecindex.TriggerCentroidChange("embeddings")), "centroid insert trigger must be dropped")
-	require.False(t, objectExists(t, db, vecindex.TriggerCentroidsVersionUpdate("embeddings")), "centroid update trigger must be dropped")
-
 	// Metadata row must be removed.
 	require.Equal(t, "", metaStatus(t, db, "embeddings"), "metadata row must be deleted")
 }
 
-func TestInsertTrigger_AddsToDelta(t *testing.T) {
-	db := setupVecIndexTestDB(t)
-	ctx := context.Background()
+func TestCreateIndex_EmptyTableAutoBootstrapsOnInsert(t *testing.T) {
+	tmpDir := t.TempDir()
+	clock := hlc.NewClock(1)
+
+	dbMgr, err := NewDatabaseManager(tmpDir, 1, clock)
+	require.NoError(t, err)
+	require.NoError(t, dbMgr.CreateDatabase("test"))
+
+	vecMgr := NewVectorIndexManager(dbMgr)
+	dbMgr.SetVectorIndexManager(vecMgr)
+
+	engine := vecindex.NewEngine()
+	SetVectorUDFProvider(engine)
+	t.Cleanup(func() { SetVectorUDFProvider(nil) })
+
+	hook := NewEngineHook(engine, dbMgr)
+	vecMgr.SetLifecycleHook(hook)
+	vecMgr.SetEngineProvider(hook)
+	vecMgr.SetReindexHook(hook)
+	require.NoError(t, vecMgr.Start(context.Background()))
+
+	conn, err := dbMgr.GetDatabaseConnection("test")
+	require.NoError(t, err)
+	_, err = conn.Exec(`CREATE TABLE docs (id INTEGER PRIMARY KEY, embed BLOB)`)
+	require.NoError(t, err)
 
 	meta := common.VectorIndexMeta{
 		IndexName:  "embeddings",
@@ -165,28 +193,62 @@ func TestInsertTrigger_AddsToDelta(t *testing.T) {
 		Nprobe:     8,
 		CreatedAt:  time.Now().UnixNano(),
 	}
-	mgr := &VectorIndexManager{}
-	require.NoError(t, mgr.execCreateDDL(ctx, db, meta))
+	require.NoError(t, vecMgr.CreateIndex(context.Background(), meta))
 
-	// Insert a row with a non-NULL embed.
-	embed := []byte{0, 0, 0x80, 0x3f} // float32(1.0) little-endian
-	_, err := db.Exec(`INSERT INTO docs (id, embed) VALUES (1, ?)`, embed)
-	require.NoError(t, err)
+	state, ok := engine.Lookup(meta.IndexName)
+	require.True(t, ok)
+	require.Zero(t, state.ProbeVersion(), "empty create may start without centroids, but must bootstrap automatically")
 
-	// The trigger must have inserted (cluster_id=0, rowid=1) into members.
-	var clusterID, rowid int64
-	err = db.QueryRow(
-		fmt.Sprintf(`SELECT cluster_id, rowid FROM "%s" WHERE rowid = 1`,
-			vecindex.MembersTable("embeddings")),
-	).Scan(&clusterID, &rowid)
-	require.NoError(t, err)
-	require.Equal(t, int64(0), clusterID, "new row must enter delta (cluster_id=0)")
-	require.Equal(t, int64(1), rowid)
+	const bootstrapRows = 4096
+	for i := 0; i < bootstrapRows; i++ {
+		_, err := conn.Exec(`INSERT INTO docs (id, embed) VALUES (?, ?)`, i+1, encodeVec(t, []float32{
+			1, float32(i % 7), float32((i + 1) % 11), float32((i + 2) % 13),
+		}))
+		require.NoError(t, err)
+	}
+
+	ok = false
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		state, found := engine.Lookup(meta.IndexName)
+		if !found || state.ProbeVersion() == 0 || state.LoadSegmentStore() == nil {
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		ok = true
+		break
+		time.Sleep(100 * time.Millisecond)
+	}
+	if !ok {
+		state, stateOK := engine.Lookup(meta.IndexName)
+		probeVersion := uint64(0)
+		hasSegment := false
+		if stateOK {
+			probeVersion = state.ProbeVersion()
+			hasSegment = state.LoadSegmentStore() != nil
+		}
+		t.Fatalf("empty-table index did not auto-bootstrap: probeVersion=%d hasSegment=%v", probeVersion, hasSegment)
+	}
 }
 
-func TestDeleteTrigger_RemovesFromMembers(t *testing.T) {
-	db := setupVecIndexTestDB(t)
-	ctx := context.Background()
+func TestCreateIndex_RollsBackMetadataAndCacheOnHookFailure(t *testing.T) {
+	tmpDir := t.TempDir()
+	clock := hlc.NewClock(1)
+
+	dbMgr, err := NewDatabaseManager(tmpDir, 1, clock)
+	require.NoError(t, err)
+	require.NoError(t, dbMgr.CreateDatabase("test"))
+
+	vecMgr := NewVectorIndexManager(dbMgr)
+	provider := &recordingEngineProvider{}
+	vecMgr.SetEngineProvider(provider)
+	vecMgr.SetLifecycleHook(failingCreateHook{dbMgr: dbMgr, err: errors.New("boom")})
+	require.NoError(t, vecMgr.Start(context.Background()))
+
+	conn, err := dbMgr.GetDatabaseConnection("test")
+	require.NoError(t, err)
+	_, err = conn.Exec(`CREATE TABLE docs (id INTEGER PRIMARY KEY, embed BLOB)`)
+	require.NoError(t, err)
 
 	meta := common.VectorIndexMeta{
 		IndexName:  "embeddings",
@@ -199,22 +261,23 @@ func TestDeleteTrigger_RemovesFromMembers(t *testing.T) {
 		Nprobe:     8,
 		CreatedAt:  time.Now().UnixNano(),
 	}
-	mgr := &VectorIndexManager{}
-	require.NoError(t, mgr.execCreateDDL(ctx, db, meta))
 
-	embed := []byte{0, 0, 0x80, 0x3f}
-	_, err := db.Exec(`INSERT INTO docs (id, embed) VALUES (2, ?)`, embed)
-	require.NoError(t, err)
+	err = vecMgr.CreateIndex(context.Background(), meta)
+	require.Error(t, err)
+	require.ErrorContains(t, err, "populate failed")
+	require.ErrorContains(t, err, "boom")
 
-	_, err = db.Exec(`DELETE FROM docs WHERE id = 2`)
-	require.NoError(t, err)
+	require.Equal(t, "", metaStatus(t, conn, meta.IndexName), "metadata row must be removed after hook failure")
 
-	var n int
-	err = db.QueryRow(
-		fmt.Sprintf(`SELECT COUNT(*) FROM "%s" WHERE rowid = 2`, vecindex.MembersTable("embeddings")),
-	).Scan(&n)
+	got, ok := vecMgr.GetIndexByColumn(meta.Database, meta.TableName, meta.ColumnName)
+	require.False(t, ok, "index cache must be cleared after hook failure")
+	require.Nil(t, got)
+	require.Equal(t, []string{meta.IndexName}, provider.removed, "failed create must remove any partially-registered engine state")
+
+	dbPath, err := dbMgr.GetDatabasePath(meta.Database)
 	require.NoError(t, err)
-	require.Equal(t, 0, n, "deleted row must be removed from members")
+	_, statErr := os.Stat(vecindex.SegmentStoreDir(dbPath, meta.IndexName))
+	require.ErrorIs(t, statErr, os.ErrNotExist, "failed create must remove partial local files")
 }
 
 func TestAutoTuneNlist(t *testing.T) {
@@ -285,7 +348,7 @@ func seedManagerCache(t *testing.T, mgr *VectorIndexManager, db *sql.DB, meta co
 	rows, err := db.QueryContext(ctx, `
 		SELECT index_name, table_name, column_name, database_name,
 		       metric, dim, nlist, nprobe, auto_nlist, auto_nprobe,
-		       target_partition_size, max_norm, status
+		       target_partition_size, max_norm, status, created_at
 		FROM __marmot_vector_indexes`)
 	require.NoError(t, err)
 	for rows.Next() {
@@ -298,7 +361,7 @@ func seedManagerCache(t *testing.T, mgr *VectorIndexManager, db *sql.DB, meta co
 			&m.IndexName, &m.TableName, &m.ColumnName, &m.Database,
 			&m.Metric, &m.Dim, &m.Nlist, &m.Nprobe,
 			&autoNlist, &autoNprobe, &m.TargetPartitionSize,
-			&m.MaxNorm, &m.Status,
+			&m.MaxNorm, &m.Status, &m.CreatedAt,
 		))
 		m.AutoTuneNlist = autoNlist != 0
 		m.AutoTuneNprobe = autoNprobe != 0
@@ -330,6 +393,7 @@ func TestGetIndexByColumn_Found(t *testing.T) {
 	require.NotNil(t, got)
 	require.Equal(t, "embeddings", got.IndexName)
 	require.Equal(t, "cosine", got.Metric)
+	require.Equal(t, meta.CreatedAt, got.CreatedAt)
 }
 
 func TestGetIndexByColumn_EmptyDatabase_UniqueMatch(t *testing.T) {

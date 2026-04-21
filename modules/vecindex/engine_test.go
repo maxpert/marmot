@@ -43,17 +43,12 @@ func TestEngine_Unregister(t *testing.T) {
 	t.Parallel()
 	e := makeEngine(t)
 	state := makeState(t, "emb", 2, [][]float32{{1, 0}})
-	store, err := CreatePackedPartitionStoreWriter(t.TempDir()+"/emb.vecpack", 2, 1)
-	require.NoError(t, err)
-	require.NoError(t, store.Append(1, 1, encodeVec([]float32{1, 0})))
-	packed, err := store.Close()
-	require.NoError(t, err)
-	state.StorePackedStore(packed)
 	e.Register("emb", state)
 	e.Unregister("emb")
 	_, ok := e.Lookup("emb")
 	require.False(t, ok)
-	require.Nil(t, state.LoadPackedStore())
+	require.Nil(t, state.LoadOverlay())
+	require.Nil(t, state.LoadSegmentStore())
 }
 
 func TestEngine_UnregisterNoop(t *testing.T) {
@@ -94,14 +89,6 @@ func TestEngine_AssignNearest_DimMismatch(t *testing.T) {
 	_, err := e.AssignNearest("emb", encodeVec([]float32{1, 0})) // 2-dim on 3-dim index
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "MARMOT-VEC-014")
-}
-
-func TestEngine_NotifyCentroidChange_NoOp(t *testing.T) {
-	t.Parallel()
-	e := makeEngine(t)
-	// No listener installed — must not return an error regardless of registration state.
-	require.NoError(t, e.NotifyCentroidChange("any", 99))
-	require.NoError(t, e.NotifyCentroidChange("", 0))
 }
 
 func TestEngine_RegisterWithCentroidSet(t *testing.T) {

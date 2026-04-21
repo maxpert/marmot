@@ -475,7 +475,7 @@ CREATE TABLE docs (
     status TEXT
 );
 
--- One-line DDL. nlist/nprobe auto-tune from row count.
+-- One-line DDL. nlist/nprobe auto-tune from the current corpus.
 CREATE VECTOR INDEX docs_embed ON docs(embed) DIM 1536 METRIC cosine;
 
 -- Query composes with ordinary WHERE / LIMIT / JOIN.
@@ -486,7 +486,7 @@ SELECT id, title
  ORDER BY vec_distance(embed, :q)
  LIMIT 10;
 
--- Retrain when drift accumulates (also runs automatically).
+-- Retrain when the corpus or cluster layout changes materially.
 REINDEX VECTOR docs_embed;
 ```
 
@@ -537,18 +537,18 @@ SELECT id, title
 
 - **Metrics**: `l2`, `cosine`, `dot` — pick at CREATE time; `vec_distance` automatically resolves to the right one at query time.
 - **Cost-based planner**: brute-force over a narrow `WHERE` predicate, or IVF probe when the index is cheaper. You do not pick — the planner does. Short-result fallback fills to K when a predicate was too aggressive.
-- **Local derived state**: the replicated source of truth stays in your base table, while Marmot materializes local sidecar vectors and a packed stable-partition snapshot for fast reads.
-- **Replication by design**: only a small zstd-compressed centroid blob replicates. Membership, packed snapshots, and other read-optimized state are rebuilt locally on each node from the same data, byte-deterministic across nodes so concurrent CREATE/REINDEX converges without wasted work.
-- **Low-memory hot path**: packed stable partitions are mmap-read from a local snapshot and the delta partition stays resident.
-- **Auto-retrain**: background monitor trips REINDEX when cluster growth or delta ratio crosses a tunable threshold. Manual `REINDEX VECTOR` is always available.
-- **Scale**: k-means|| initialization scales to 1 M × 2048 centroids in roughly 75 seconds.
+- **Local derived state**: the exact embedding stays in your base table; Marmot builds local centroids, immutable segment files, row maps, manifests, and an overlay journal for fast reads.
+- **No SQLite vector sidecar**: ANN candidate serving does not read vector payload from SQLite side tables.
+- **Crash-safe publish**: stable generations are written immutably and published through a Lucene-style manifest/current swap.
+- **Automatic empty-table bootstrap**: if you create an index before loading rows, Marmot publishes the first centroid/segment generation automatically once enough indexable rows arrive.
+- **Manual retrain**: `REINDEX VECTOR` retrains centroids and republishes a new local generation.
 
 ### Runtime Model
 
 - **Base table**: your embedding BLOB remains the user-visible, replicated source of truth.
-- **Members sidecar**: `__marmot_vec_<idx>_members` stores `(cluster_id, rowid, vec)` locally; `cluster_id = 0` is the delta partition.
-- **Packed snapshot**: stable `cluster_id > 0` partitions are compacted into a local `.vecpack` file and scanned directly on the primary read path.
-- **Resident delta**: fresh inserts stay queryable immediately through an always-resident `cluster_id = 0` buffer.
+- **Local segment store**: stable vectors live in immutable `.vecseg` generations (`manifest/current`, `segments`, `rowmap`).
+- **Overlay journal**: committed local writes land in a local overlay log and are merged into reads immediately.
+- **Exact rerank**: the final shortlist is reranked from the base table, so only the base table keeps the exact vector payload.
 
 ### Controls
 
@@ -560,15 +560,7 @@ SET @@marmot_vec_fallback = 'on';
 SET @@marmot_vec_use_go_rank = 'on';
 ```
 
-### Benchmarks
-
-On ARM, the packed-path DBpedia 100K subset benchmark reached:
-
-- **Read throughput**: `2089 QPS` at query concurrency `8`
-- **Latency**: `p50 3.69 ms`, `p95 5.41 ms`, `p99 6.14 ms`
-- **Memory**: `753 MB` RSS after measurement
-
-Those numbers are from the current `vec-bench` packed-path run without CPU profiling. Full session variables, config knobs, benchmarking flags, replication internals, REINDEX flow, and error codes are in the [Vector Search docs](docs/src/pages/vector-search.mdx).
+Full session variables, runtime layout, benchmarking flags, crash semantics, and error codes are in the [Vector Search docs](docs/src/pages/vector-search.mdx).
 
 ## SQLite Extensions
 

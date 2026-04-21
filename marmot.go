@@ -256,7 +256,6 @@ func main() {
 	vecIndexMgr := db.NewVectorIndexManager(dbMgr)
 	dbMgr.SetVectorIndexManager(vecIndexMgr)
 	vecEngine := vecindex.NewEngine()
-	vecEngine.SetFlushDB(db.NewSQLDeltaFlushDB(dbMgr))
 	vecEngineHook := db.NewEngineHook(vecEngine, dbMgr)
 	vecIndexMgr.SetLifecycleHook(vecEngineHook)
 	vecIndexMgr.SetReindexHook(vecEngineHook)

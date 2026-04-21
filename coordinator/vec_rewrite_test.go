@@ -19,7 +19,6 @@ type stubEngine struct {
 }
 
 func (s *stubEngine) AssignNearest(_ string, _ []byte) (int64, error) { return 1, nil }
-func (s *stubEngine) NotifyCentroidChange(_ string, _ int64) error    { return nil }
 func (s *stubEngine) TopNprobeClusters(_ string, _ []byte, _ int) ([]int64, error) {
 	return s.clusterIDs, nil
 }
@@ -376,10 +375,9 @@ func TestRewrite_PreFilter_RenderedSQL(t *testing.T) {
 	require.NotNil(t, sel.Where, "user predicate must be preserved in WHERE")
 }
 
-// 16. Post-filter rewrite — assert WHERE contains subquery on members table
-//
-//	with cluster_id IN (3,17,22) and cluster_id=0 disjunct; user predicate preserved.
-func TestRewrite_PostFilter_RenderedSQL(t *testing.T) {
+// 16. Post-filter rewrite — assert it produces a Go-rank plan keyed to the
+// probed clusters instead of a SQLite sidecar SQL scan.
+func TestRewrite_PostFilter_BuildsGoRankPlan(t *testing.T) {
 	t.Parallel()
 	sql := `SELECT title FROM docs WHERE vec_match(embed, ?, 10) AND status = 'published' ORDER BY vec_distance(embed, ?) LIMIT 10`
 	stmt := parseSQL(t, sql)
@@ -389,46 +387,14 @@ func TestRewrite_PostFilter_RenderedSQL(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, PlanPostFilter, info.Plan)
 	require.Equal(t, []int64{3, 17, 22}, info.ClusterIDs)
-
-	// Parse and walk the rendered SQL.
-	primary, err := vitessParser.Parse(info.PrimarySQL)
-	require.NoError(t, err)
-	sel := primary.(*sqlparser.Select)
-	require.NotNil(t, sel.Where)
-
-	// Walk for a subquery referencing the members table.
-	var foundSubquery bool
-	_ = sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
-		sub, ok := node.(*sqlparser.Subquery)
-		if !ok {
-			return true, nil
-		}
-		subStr := sqlparser.String(sub)
-		if strContains(subStr, "__marmot_vec_embeddings_members") {
-			foundSubquery = true
-			return false, nil
-		}
-		return true, nil
-	}, sel.Where)
-	require.True(t, foundSubquery, "post-filter WHERE must contain subquery on members table")
-
-	// User predicate still present.
-	var foundUserPred bool
-	_ = sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
-		cmp, ok := node.(*sqlparser.ComparisonExpr)
-		if !ok {
-			return true, nil
-		}
-		if col, ok := cmp.Left.(*sqlparser.ColName); ok && col.Name.EqualString("status") {
-			foundUserPred = true
-		}
-		return true, nil
-	}, sel.Where)
-	require.True(t, foundUserPred, "post-filter WHERE must preserve the user predicate")
+	require.NotNil(t, info.GoRank)
+	require.True(t, info.GoRank.HasUserPredicate)
+	require.Equal(t, []int64{3, 17, 22}, info.GoRank.ClusterIDs)
+	require.Equal(t, "`status` = 'published'", info.GoRank.UserPredicateSQL)
 }
 
-// 17. Fallback populated: post plan + fallback=on ⇒ FallbackOn=true, FallbackStmt is pre-filter.
-func TestRewrite_FallbackPopulated(t *testing.T) {
+// 17. Go-rank post-filter path does not emit SQL fallback plans.
+func TestRewrite_NoFallbackForGoRankPostFilter(t *testing.T) {
 	t.Parallel()
 	sql := `SELECT title FROM docs WHERE vec_match(embed, ?, 10) AND status = 'x' ORDER BY vec_distance(embed, ?) LIMIT 10`
 	stmt := parseSQL(t, sql)
@@ -436,15 +402,10 @@ func TestRewrite_FallbackPopulated(t *testing.T) {
 	info, err := RewriteVectorQuery(stmt, make([]byte, 16), sess, defaultEngine(), defaultLookup())
 	require.NoError(t, err)
 	require.Equal(t, PlanPostFilter, info.Plan)
-	require.True(t, info.FallbackOn)
-	require.NotNil(t, info.FallbackStmt)
-	require.NotEmpty(t, info.FallbackSQL)
-
-	// Fallback is the pre-filter: no vec_match, has vec_distance_cosine.
-	fb, err := vitessParser.Parse(info.FallbackSQL)
-	require.NoError(t, err)
-	require.Nil(t, walkForFunc(t, fb, "vec_match"))
-	require.NotNil(t, walkForFunc(t, fb, "vec_distance_cosine"))
+	require.NotNil(t, info.GoRank)
+	require.False(t, info.FallbackOn)
+	require.Nil(t, info.FallbackStmt)
+	require.Empty(t, info.FallbackSQL)
 }
 
 // 18. Fallback not populated when plan is pre-filter.

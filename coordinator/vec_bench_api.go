@@ -4,8 +4,6 @@
 package coordinator
 
 import (
-	"time"
-
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/protocol"
 )
@@ -59,32 +57,4 @@ func (h *CoordinatorHandler) BenchExecuteVectorPlan(
 	consistency protocol.ConsistencyLevel,
 ) (*protocol.ResultSet, error) {
 	return h.executeVectorPlan(stmt, info, args, consistency)
-}
-
-// BenchResetSharedScanStats clears shared-scan counters on the benchmark
-// handler, if the coordinator has been initialized.
-func (h *CoordinatorHandler) BenchResetSharedScanStats() {
-	if c := h.sharedScanCoordinatorIfLoaded(); c != nil {
-		c.ResetStats()
-	}
-}
-
-// BenchSharedScanStats snapshots shared-scan counters on the benchmark
-// handler, if the coordinator has been initialized.
-func (h *CoordinatorHandler) BenchSharedScanStats() VecSharedScanStats {
-	if c := h.sharedScanCoordinatorIfLoaded(); c != nil {
-		return c.SnapshotStats()
-	}
-	return VecSharedScanStats{}
-}
-
-// BenchConfigureSharedScan overrides shared-scan batching knobs for the
-// benchmark handler.
-func (h *CoordinatorHandler) BenchConfigureSharedScan(window time.Duration, maxRequests, maxUnion int) {
-	c := h.sharedScanCoordinator()
-	c.Configure(vecSharedScanOptions{
-		MicrobatchWindow: window,
-		MaxRequests:      maxRequests,
-		MaxUnionClusters: maxUnion,
-	})
 }

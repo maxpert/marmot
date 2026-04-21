@@ -19,15 +19,6 @@ func TestDefaultVecSessionVars(t *testing.T) {
 	if !v.Fallback {
 		t.Error("Fallback default = false, want true")
 	}
-	if v.DeltaFlushInterval != 10 {
-		t.Errorf("DeltaFlushInterval default = %d, want 10", v.DeltaFlushInterval)
-	}
-	if v.DeltaMaxRows != 10000 {
-		t.Errorf("DeltaMaxRows default = %d, want 10000", v.DeltaMaxRows)
-	}
-	if v.DeltaFlushBatch != 1000 {
-		t.Errorf("DeltaFlushBatch default = %d, want 1000", v.DeltaFlushBatch)
-	}
 	if !v.RetrainEnabled {
 		t.Error("RetrainEnabled default = false, want true")
 	}
@@ -55,9 +46,6 @@ func TestVecSessionVars_Apply_IntVars(t *testing.T) {
 	}{
 		{"nprobe", "marmot_vec_nprobe", "64", func(v *VecSessionVars) bool { return v.Nprobe == 64 }, false},
 		{"prefilter_cap", "marmot_vec_prefilter_cap", "1000", func(v *VecSessionVars) bool { return v.PrefilterCap == 1000 }, false},
-		{"delta_flush_interval", "marmot_vec_delta_flush_interval", "5", func(v *VecSessionVars) bool { return v.DeltaFlushInterval == 5 }, false},
-		{"delta_max_rows", "marmot_vec_delta_max_rows", "500", func(v *VecSessionVars) bool { return v.DeltaMaxRows == 500 }, false},
-		{"delta_flush_batch", "marmot_vec_delta_flush_batch", "200", func(v *VecSessionVars) bool { return v.DeltaFlushBatch == 200 }, false},
 		{"retrain_check_interval", "marmot_vec_retrain_check_interval", "60", func(v *VecSessionVars) bool { return v.RetrainCheckInterval == 60 }, false},
 		{"reindex_chunk_rows", "marmot_vec_reindex_chunk_rows", "5000", func(v *VecSessionVars) bool { return v.ReindexChunkRows == 5000 }, false},
 		{"nprobe_negative", "marmot_vec_nprobe", "-1", nil, true},

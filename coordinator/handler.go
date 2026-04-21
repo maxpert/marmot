@@ -37,6 +37,10 @@ type VectorIndexManagerProvider interface {
 	EstimatedRowCount(database, table string) int64
 }
 
+type localVectorCDCProvider interface {
+	ApplyLocalCDC(ctx context.Context, database string, entries []common.CDCEntry) error
+}
+
 // DatabaseManager interface to avoid import cycles
 type DatabaseManager interface {
 	ListDatabases() []string
@@ -185,21 +189,20 @@ type PublisherRegistry interface {
 // CoordinatorHandler implements protocol.ConnectionHandler
 // It routes queries to the appropriate coordinator (Read or Write)
 type CoordinatorHandler struct {
-	nodeID                    uint64
-	writeCoord                *WriteCoordinator
-	readCoord                 *ReadCoordinator
-	clock                     *hlc.Clock
-	dbManager                 DatabaseManager
-	ddlLockMgr                *DDLLockManager
-	schemaVersionMgr          SchemaVersionManager
-	nodeRegistry              NodeRegistry
-	metadata                  *handlers.MetadataHandler
-	recentTxnIDs              sync.Map // txn_id -> conn_id for duplicate detection
-	publisherRegistry         PublisherRegistry
-	publisherMu               sync.RWMutex
-	draining                  atomic.Bool
-	vecGoRankTemplates        sync.Map
-	vecSharedScanCoordinators sync.Map
+	nodeID             uint64
+	writeCoord         *WriteCoordinator
+	readCoord          *ReadCoordinator
+	clock              *hlc.Clock
+	dbManager          DatabaseManager
+	ddlLockMgr         *DDLLockManager
+	schemaVersionMgr   SchemaVersionManager
+	nodeRegistry       NodeRegistry
+	metadata           *handlers.MetadataHandler
+	recentTxnIDs       sync.Map // txn_id -> conn_id for duplicate detection
+	publisherRegistry  PublisherRegistry
+	publisherMu        sync.RWMutex
+	draining           atomic.Bool
+	vecGoRankTemplates sync.Map
 
 	// vecEngine is the VectorUDFProvider used by the vector-query rewriter
 	// (see coordinator/vec_rewrite.go). It is set once at startup via
@@ -496,9 +499,9 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, params []in
 	startTS := h.clock.Now()
 	txnID := startTS.ToTxnID()
 
-	// Vector DDL is handled locally — VectorIndexManager owns shadow tables and triggers.
-	// No 2PC needed: shadow tables are local derived state; the centroids table is
-	// CDC-replicated and drives convergence across nodes (design §8.1).
+	// Vector DDL is handled locally — VectorIndexManager owns index metadata and
+	// local file-backed serving state. No 2PC is needed because vector-index
+	// artifacts are derived from the base table on each node.
 	if stmt.Type == protocol.StatementCreateVectorIndex || stmt.Type == protocol.StatementDropVectorIndex || stmt.Type == protocol.StatementReindexVectorIndex {
 		return h.handleVectorDDL(stmt)
 	}
@@ -655,6 +658,20 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, params []in
 	}
 	// Success - coordinator committed via CDC replay in WriteTransaction
 	// No pendingExec.Commit() needed - hookDB was already rolled back
+	if pendingExec != nil {
+		cdcEntries := pendingExec.GetCDCEntries()
+		if len(cdcEntries) > 0 {
+			if vecMgr, ok := h.dbManager.GetVectorIndexManager().(localVectorCDCProvider); ok {
+				if err := vecMgr.ApplyLocalCDC(ctx, stmt.Database, cdcEntries); err != nil {
+					log.Error().
+						Err(err).
+						Str("database", stmt.Database).
+						Uint64("txn_id", uint64(txnID)).
+						Msg("Failed to apply local vector CDC")
+				}
+			}
+		}
+	}
 
 	// Publish CDC events if publisher is enabled and we have CDC entries
 	if pendingExec != nil {
@@ -1192,6 +1209,18 @@ func (h *CoordinatorHandler) handleCommit(session *protocol.ConnectionSession) (
 			Int("stmt_count", len(txnState.Statements)).
 			Msg("COMMIT: 2PC failed")
 		return nil, err
+	}
+
+	if len(allCDCEntries) > 0 {
+		if vecMgr, ok := h.dbManager.GetVectorIndexManager().(localVectorCDCProvider); ok {
+			if err := vecMgr.ApplyLocalCDC(ctx, txnState.Database, allCDCEntries); err != nil {
+				log.Error().
+					Err(err).
+					Str("database", txnState.Database).
+					Uint64("txn_id", txnState.TxnID).
+					Msg("Failed to apply local vector CDC")
+			}
+		}
 	}
 
 	// Publish CDC events if publisher is enabled and we have CDC entries

@@ -1,7 +1,6 @@
 package vecindex
 
 import (
-	"context"
 	"fmt"
 	"sync"
 
@@ -15,92 +14,11 @@ import (
 // All methods are safe for concurrent use.
 type Engine struct {
 	indexes sync.Map // map[string]*IndexState
-
-	flushDB  DeltaFlushDB
-	flushCfg DeltaFlushConfig
-
-	flusherMu sync.Mutex
-	flushers  map[string]*flushHandle
-}
-
-type flushHandle struct {
-	cancel context.CancelFunc
-	done   chan struct{}
 }
 
 // NewEngine creates a new Engine with no registered indexes.
 func NewEngine() *Engine {
-	return &Engine{
-		flushCfg: DefaultDeltaFlushConfig(),
-		flushers: make(map[string]*flushHandle),
-	}
-}
-
-// SetFlushDB installs the DeltaFlushDB implementation used by delta flush
-// workers. Must be called before StartFlush.
-func (e *Engine) SetFlushDB(db DeltaFlushDB) {
-	e.flushDB = db
-}
-
-// SetFlushConfig overrides the default delta flush configuration.
-func (e *Engine) SetFlushConfig(cfg DeltaFlushConfig) {
-	e.flushCfg = cfg
-}
-
-// StartFlush launches a delta flush goroutine for the named index.
-// The index must already be registered. No-op if flushDB is nil or
-// the index is not found.
-func (e *Engine) StartFlush(indexName, database, tableName, columnName string) {
-	if e.flushDB == nil {
-		return
-	}
-	state, ok := e.Lookup(indexName)
-	if !ok {
-		return
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	e.flusherMu.Lock()
-	old := e.flushers[indexName]
-	e.flushers[indexName] = &flushHandle{cancel: cancel, done: done}
-	e.flusherMu.Unlock()
-	if old != nil {
-		old.cancel()
-		<-old.done
-	}
-
-	go func() {
-		defer close(done)
-		deltaFlushLoop(ctx, e.flushCfg, state, e.flushDB, database, indexName, tableName, columnName)
-	}()
-}
-
-// StopFlush cancels the delta flush goroutine for the named index.
-// No-op if no flusher is running.
-func (e *Engine) StopFlush(indexName string) {
-	e.flusherMu.Lock()
-	if h, ok := e.flushers[indexName]; ok {
-		h.cancel()
-		delete(e.flushers, indexName)
-	}
-	e.flusherMu.Unlock()
-}
-
-// StopFlushAndWait cancels the delta flush goroutine for the named index and
-// blocks until the worker has fully exited.
-func (e *Engine) StopFlushAndWait(indexName string) {
-	e.flusherMu.Lock()
-	h := e.flushers[indexName]
-	if h != nil {
-		delete(e.flushers, indexName)
-	}
-	e.flusherMu.Unlock()
-	if h == nil {
-		return
-	}
-	h.cancel()
-	<-h.done
+	return &Engine{}
 }
 
 // Register stores the IndexState for indexName in the engine, replacing any
@@ -114,7 +32,8 @@ func (e *Engine) Register(indexName string, state *IndexState) {
 func (e *Engine) Unregister(indexName string) {
 	if val, ok := e.indexes.Load(indexName); ok {
 		state := val.(*IndexState)
-		state.ClearPackedStore()
+		state.ClearOverlay()
+		state.ClearSegmentStore()
 	}
 	e.indexes.Delete(indexName)
 }
@@ -145,13 +64,6 @@ func (e *Engine) AssignNearest(indexName string, vec []byte) (int64, error) {
 		return 0, fmt.Errorf("MARMOT-VEC-013: vector index %q not registered in engine", indexName)
 	}
 	return state.AssignNearest(vec)
-}
-
-// NotifyCentroidChange implements VectorUDFProvider as a no-op. The
-// centroid-change trigger fires into this method from the UDF layer; no
-// replica listener is currently wired, so the call returns immediately.
-func (e *Engine) NotifyCentroidChange(_ string, _ int64) error {
-	return nil
 }
 
 // TopNprobeClusters implements VectorUDFProvider. Thin wrapper over

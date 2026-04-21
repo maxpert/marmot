@@ -130,15 +130,15 @@ transpiler_cache_size = 10000  # LRU cache for MySQL→SQLite transpilation
 ```toml
 [vector_index]
 enabled = false
-data_dir = ""     # Reserved for a future SQLite-native engine path
+data_dir = ""     # Reserved for a future explicit local vector-state root override
 ```
 
 **Settings:**
 - `enabled`: Enables vector-index DDL, background workers, and query rewrite support.
-- `data_dir`: Reserved for future vector-engine storage. Leave unset for current releases.
+- `data_dir`: Reserved for a future explicit local vector-state root override. Current builds colocate `.vecseg` state next to the database file.
 
 **Runtime note:**
-- The default read path is the packed streaming executor with resident delta.
+- Current builds store vector derived state in local `.vecseg` files next to the database and use the local segment store plus overlay journal for ANN reads, with exact rerank from the base table shortlist.
 
 ## Batch Commit
 

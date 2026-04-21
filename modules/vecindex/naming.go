@@ -48,85 +48,15 @@ func isDigit(c byte) bool {
 	return c >= '0' && c <= '9'
 }
 
-// CentroidsTable returns the replicated centroids table name for the given
-// index. Single leading underscore marks it for CDC replication (see
-// design §3.4).
-func CentroidsTable(idx string) string {
-	return "_marmot_vec_" + idx + "_centroids"
-}
-
-// MembersTable returns the CDC-excluded members table name (double
-// leading underscore, see design §3.4).
-func MembersTable(idx string) string {
-	return "__marmot_vec_" + idx + "_members"
-}
-
-// MembersRowidIndex returns the secondary index name on members(rowid).
-func MembersRowidIndex(idx string) string {
-	return "__marmot_vec_" + idx + "_members_rid"
-}
-
-// MembersRowidUniqueIndex returns the unique secondary index name that
-// enforces one live sidecar row per base-table rowid.
-func MembersRowidUniqueIndex(idx string) string {
-	return "__marmot_vec_" + idx + "_members_rowid_uq"
-}
-
-// TriggerInsert returns the AFTER INSERT trigger name on the base table.
-func TriggerInsert(idx string) string {
-	return "__marmot_vec_" + idx + "_ai"
-}
-
-// TriggerUpdate returns the AFTER UPDATE OF <column> trigger name on the
-// base table.
-func TriggerUpdate(idx string) string {
-	return "__marmot_vec_" + idx + "_au"
-}
-
-// TriggerDelete returns the AFTER DELETE trigger name on the base table.
-func TriggerDelete(idx string) string {
-	return "__marmot_vec_" + idx + "_ad"
-}
-
-// TriggerCentroidChange returns the AFTER INSERT trigger name on the
-// centroids table used to notify replicas of a centroid rebuild (design
-// §8.8).
-func TriggerCentroidChange(idx string) string {
-	return "__marmot_vec_" + idx + "_centroids_ai"
-}
-
-// TriggerCentroidsVersionUpdate returns the AFTER UPDATE OF version trigger
-// name on the centroids table (design §8.8). Fires when a remote REINDEX
-// bumps the version column.
-func TriggerCentroidsVersionUpdate(idx string) string {
-	return "__marmot_vec_" + idx + "_centroids_au"
-}
-
-// StagingTable returns the ephemeral staging members table name used during
-// a shadow-swap REINDEX (design §8.3). Dropped and recreated each REINDEX.
-func StagingTable(idx string) string {
-	return "__marmot_vec_" + idx + "_members_next"
-}
-
-// StagingRowidIndex returns the transient rowid index name used during
-// REINDEX populate before the staging table is swapped into members.
-func StagingRowidIndex(idx string) string {
-	return "__marmot_vec_" + idx + "_members_next_rid"
-}
-
-// StagingRowidUniqueIndex returns the transient unique rowid index name used
-// during REINDEX populate to enforce one staged row per base-table rowid.
-func StagingRowidUniqueIndex(idx string) string {
-	return "__marmot_vec_" + idx + "_members_next_rowid_uq"
-}
-
-// vecLocalPrefix is the double-underscore prefix for CDC-excluded vec objects.
+// vecLocalPrefix is the double-underscore prefix for local-only vector index
+// artifacts. The current implementation keeps serving state in local files,
+// but we still tolerate legacy local SQLite object names during upgrade/drop
+// races and crash recovery.
 const vecLocalPrefix = "__marmot_vec_"
 
-// IsVecLocalTable reports whether tableName is a CDC-excluded vector index
-// object (members, staging, triggers). These use the double-underscore prefix
-// per design §3.4. Used by the CDC applier to tolerate "no such table"
-// errors during DROP races (fix R7).
+// IsVecLocalTable reports whether tableName is a legacy local-only vector
+// object. Used by the CDC applier to tolerate DROP races against pre-cutover
+// SQLite artifacts without treating them as replicated user tables.
 func IsVecLocalTable(tableName string) bool {
 	return strings.HasPrefix(tableName, vecLocalPrefix)
 }
