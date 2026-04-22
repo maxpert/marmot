@@ -48,6 +48,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"runtime/pprof"
 	"slices"
 	"sort"
@@ -60,6 +61,7 @@ import (
 	"github.com/maxpert/marmot/common"
 	"github.com/maxpert/marmot/coordinator"
 	"github.com/maxpert/marmot/db"
+	"github.com/maxpert/marmot/encoding"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/modules/vecindex"
 	"github.com/maxpert/marmot/modules/vecindex/pkg/benchutil"
@@ -167,6 +169,44 @@ type queryRunStats struct {
 	workerQueries []int64
 }
 
+type insertMetrics struct {
+	rows      int
+	startedAt time.Time
+	endedAt   time.Time
+}
+
+type vectorReadiness struct {
+	firstPublishAt time.Time
+	settledAt      time.Time
+	probeVersion   uint64
+	nlist          int
+	nprobe         int
+}
+
+func (h *harness) insertCDCEntries(lo, hi int) ([]common.CDCEntry, error) {
+	entries := make([]common.CDCEntry, 0, hi-lo)
+	for i := lo; i < hi; i++ {
+		rowID := int64(i + 1)
+		rowIDBytes, err := encoding.Marshal(rowID)
+		if err != nil {
+			return nil, fmt.Errorf("marshal row id %d: %w", rowID, err)
+		}
+		vecBytes, err := encoding.Marshal(h.train.VectorBytes(i))
+		if err != nil {
+			return nil, fmt.Errorf("marshal vector row %d: %w", rowID, err)
+		}
+		entries = append(entries, common.CDCEntry{
+			Table:     h.cfg.tableName,
+			IntentKey: []byte(fmt.Sprintf("%s:%d", h.cfg.tableName, rowID)),
+			NewValues: map[string][]byte{
+				"id":             rowIDBytes,
+				h.cfg.columnName: vecBytes,
+			},
+		})
+	}
+	return entries, nil
+}
+
 // plog writes a timestamped line-terminated message to stderr, prefixed so
 // bench output can be grep'd out of the surrounding zerolog noise.
 func plog(format string, args ...interface{}) {
@@ -218,6 +258,7 @@ func logMemorySnapshot(label string) {
 
 func main() {
 	cfg := parseFlags()
+	benchStart := time.Now()
 	plog("starting: data-dir=%s db-dir=%s db-name=%s index=%s",
 		cfg.dataDir, cfg.dbDir, cfg.dbName, cfg.indexName)
 	if err := os.MkdirAll(cfg.dbDir, 0o755); err != nil {
@@ -256,11 +297,37 @@ func main() {
 		fatal("ensureIndex: %v", err)
 	}
 
+	var insertStats *insertMetrics
 	if !cfg.skipInsert {
-		if err := h.ensureTableAndInsert(); err != nil {
+		var err error
+		insertStats, err = h.ensureTableAndInsert()
+		if err != nil {
 			fatal("ensureTableAndInsert: %v", err)
 		}
 	}
+	if cfg.settleTimeout > 0 {
+		readiness, err := h.waitForVectorReadiness(cfg.settleTimeout)
+		if err != nil {
+			fatal("waitForVectorReadiness: %v", err)
+		}
+		if !readiness.firstPublishAt.IsZero() {
+			plog("  milestone: first clustered publish in %s", readiness.firstPublishAt.Sub(benchStart))
+		}
+		plog("  milestone: final settled for read in %s (probe=%d nlist=%d nprobe=%d)",
+			readiness.settledAt.Sub(benchStart), readiness.probeVersion, readiness.nlist, readiness.nprobe)
+		if insertStats != nil && insertStats.rows > 0 {
+			plog("  query-ready throughput: rows/s=%.0f (rows=%d elapsed=%s)",
+				float64(insertStats.rows)/readiness.settledAt.Sub(insertStats.startedAt).Seconds(),
+				insertStats.rows,
+				readiness.settledAt.Sub(insertStats.startedAt),
+			)
+		}
+	} else if cfg.skipInsert {
+		if err := h.refreshIndexTuning(); err != nil {
+			fatal("refreshIndexTuning: %v", err)
+		}
+	}
+	h.releaseTrain()
 
 	if err := h.runQueryPhase(); err != nil {
 		fatal("runQueryPhase: %v", err)
@@ -286,12 +353,17 @@ func (h *harness) Close() {
 
 func (h *harness) releaseTrain() {
 	if h.train == nil {
+		runtime.GC()
+		debug.FreeOSMemory()
+		logMemorySnapshot("after releasing train mmap")
 		return
 	}
 	if err := h.train.Close(); err != nil {
 		plog("warning: close train mmap: %v", err)
 	}
 	h.train = nil
+	runtime.GC()
+	debug.FreeOSMemory()
 	logMemorySnapshot("after releasing train mmap")
 }
 
@@ -448,6 +520,13 @@ func (h *harness) ensureTable() error {
 	if err != nil {
 		return fmt.Errorf("create table: %w", err)
 	}
+	replicatedDB, err := h.dbMgr.GetDatabase(h.cfg.dbName)
+	if err != nil {
+		return fmt.Errorf("get database for schema reload: %w", err)
+	}
+	if err := replicatedDB.ReloadSchema(); err != nil {
+		return fmt.Errorf("reload schema: %w", err)
+	}
 	return nil
 }
 
@@ -461,37 +540,31 @@ func (h *harness) dropExisting() error {
 	return nil
 }
 
-func (h *harness) ensureTableAndInsert() error {
+func (h *harness) ensureTableAndInsert() (*insertMetrics, error) {
 	toInsert := targetInsertRows(h.train.Len(), h.cfg.insertN)
 
 	var existing int64
 	if err := h.conn.QueryRow(fmt.Sprintf(`SELECT COUNT(*) FROM "%s"`, h.cfg.tableName)).Scan(&existing); err != nil {
-		return fmt.Errorf("count rows: %w", err)
+		return nil, fmt.Errorf("count rows: %w", err)
 	}
 	if existing == int64(toInsert) {
 		plog("docs already populated (%d rows), skipping insert", existing)
-		return nil
+		return nil, nil
 	}
 	if existing > 0 {
-		return fmt.Errorf("docs already contains %d rows, expected %d; rerun with --force-build for a clean online benchmark", existing, toInsert)
+		return nil, fmt.Errorf("docs already contains %d rows, expected %d; rerun with --force-build for a clean online benchmark", existing, toInsert)
 	}
 	if toInsert == 0 {
 		plog("insert skipped: target rows=0")
-		return nil
+		return &insertMetrics{rows: 0}, nil
 	}
 
 	plog("online load plan: total=%d", toInsert)
+	insertStart := time.Now()
 	if err := h.insertRange(0, toInsert, "online"); err != nil {
-		return err
+		return nil, err
 	}
-
-	if h.cfg.settleTimeout > 0 {
-		if err := h.waitForVectorReadiness(h.cfg.settleTimeout); err != nil {
-			return err
-		}
-	}
-	h.releaseTrain()
-	return nil
+	return &insertMetrics{rows: toInsert, startedAt: insertStart, endedAt: time.Now()}, nil
 }
 
 func targetInsertRows(trainLen, insertCap int) int {
@@ -559,6 +632,15 @@ func (h *harness) insertRange(lo, hi int, phase string) error {
 				stmt.Close()
 				if err := tx.Commit(); err != nil {
 					workerErr.Store(fmt.Errorf("%s commit tx [%d,%d): %w", phase, c.lo, c.hi, err))
+					return
+				}
+				entries, err := h.insertCDCEntries(c.lo, c.hi)
+				if err != nil {
+					workerErr.Store(fmt.Errorf("%s build local cdc [%d,%d): %w", phase, c.lo, c.hi, err))
+					return
+				}
+				if err := h.vecMgr.ApplyLocalCDC(context.Background(), h.cfg.dbName, entries); err != nil {
+					workerErr.Store(fmt.Errorf("%s apply local cdc [%d,%d): %w", phase, c.lo, c.hi, err))
 					return
 				}
 				lat := time.Since(tStart)
@@ -744,12 +826,13 @@ func vectorStateStableForRead(meta *common.VectorIndexMeta, state *vecindex.Inde
 		float64(p95Rows) <= float64(targetPartitionSize)*settleClusterP95Factor
 }
 
-func (h *harness) waitForVectorReadiness(timeout time.Duration) error {
+func (h *harness) waitForVectorReadiness(timeout time.Duration) (*vectorReadiness, error) {
 	deadline := time.Now().Add(timeout)
+	info := &vectorReadiness{}
 	for {
 		meta, err := h.readIndexMeta()
 		if err != nil {
-			return fmt.Errorf("read index meta while settling: %w", err)
+			return nil, fmt.Errorf("read index meta while settling: %w", err)
 		}
 		probeVersion := uint64(0)
 		segmentReady := false
@@ -767,16 +850,25 @@ func (h *harness) waitForVectorReadiness(timeout time.Duration) error {
 				stableForRead = vectorStateStableForRead(meta, state)
 			}
 		}
+		if info.firstPublishAt.IsZero() && vectorStateSettled(probeVersion, segmentReady, overlayReady) {
+			info.firstPublishAt = time.Now()
+			plog("vector state first clustered publish: probe=%d segment=%t overlay=%t overlay_rows=%d",
+				probeVersion, segmentReady, overlayReady, overlayRows)
+		}
 		if stableForRead {
 			if err := h.refreshIndexTuning(); err != nil {
-				return err
+				return nil, err
 			}
 			plog("vector state settled: probe=%d segment=%t overlay=%t overlay_rows=%d", probeVersion, segmentReady, overlayReady, overlayRows)
 			logMemorySnapshot("after vector settle")
-			return nil
+			info.settledAt = time.Now()
+			info.probeVersion = probeVersion
+			info.nlist = h.cfg.nlist
+			info.nprobe = h.cfg.nprobe
+			return info, nil
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("vector state did not settle within %s (probe=%d segment=%t overlay=%t overlay_rows=%d stable=%t)",
+			return nil, fmt.Errorf("vector state did not settle within %s (probe=%d segment=%t overlay=%t overlay_rows=%d stable=%t)",
 				timeout, probeVersion, segmentReady, overlayReady, overlayRows, stableForRead)
 		}
 		time.Sleep(500 * time.Millisecond)
@@ -856,7 +948,7 @@ func (h *harness) ensureIndex() error {
 	pprof.StopCPUProfile()
 	cpuF.Close()
 	indexElapsed := time.Since(indexStart)
-	plog("index built in %s  [cpu %s]", indexElapsed, cpuPath)
+	plog("index created in %s  [cpu %s]", indexElapsed, cpuPath)
 
 	heapF, err := os.Create(heapPath)
 	if err != nil {

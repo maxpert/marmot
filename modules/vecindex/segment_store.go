@@ -10,7 +10,8 @@ import (
 )
 
 const (
-	SegmentStoreVersion = 1
+	SegmentStoreVersion = 2
+	segmentStoreV1      = 1
 
 	segmentManifestMagic = "MVSMAN01"
 	segmentCurrentMagic  = "MVSCUR01"
@@ -24,8 +25,12 @@ type SegmentManifest struct {
 	Metric                   string      `msgpack:"metric"`
 	Dim                      uint32      `msgpack:"dim"`
 	InternalDim              uint32      `msgpack:"internal_dim"`
-	CentroidEpoch            uint64      `msgpack:"centroid_epoch"`
-	CentroidBlob             []byte      `msgpack:"centroid_blob"`
+	ProbeCentroidEpoch       uint64      `msgpack:"probe_centroid_epoch,omitempty"`
+	ProbeCentroidBlob        []byte      `msgpack:"probe_centroid_blob,omitempty"`
+	StableCentroidEpoch      uint64      `msgpack:"stable_centroid_epoch,omitempty"`
+	StableCentroidBlob       []byte      `msgpack:"stable_centroid_blob,omitempty"`
+	CentroidEpoch            uint64      `msgpack:"centroid_epoch,omitempty"`
+	CentroidBlob             []byte      `msgpack:"centroid_blob,omitempty"`
 	AppliedOverlaySeq        uint64      `msgpack:"applied_overlay_seq"`
 	Generation               uint64      `msgpack:"generation"`
 	DataFile                 string      `msgpack:"data_file"`
@@ -129,4 +134,80 @@ func decodeSegmentEnvelope(magic string, data []byte, dst any) error {
 		return fmt.Errorf("vecindex: decode segment envelope: %w", err)
 	}
 	return nil
+}
+
+func SegmentStoreV1Compat() uint32 {
+	return segmentStoreV1
+}
+
+func (m *SegmentManifest) ProbeEpochValue() uint64 {
+	if m == nil {
+		return 0
+	}
+	if m.ProbeCentroidEpoch != 0 {
+		return m.ProbeCentroidEpoch
+	}
+	return m.CentroidEpoch
+}
+
+func (m *SegmentManifest) StableEpochValue() uint64 {
+	if m == nil {
+		return 0
+	}
+	if m.StableCentroidEpoch != 0 {
+		return m.StableCentroidEpoch
+	}
+	if m.CentroidEpoch != 0 {
+		return m.CentroidEpoch
+	}
+	return m.ProbeCentroidEpoch
+}
+
+func (m *SegmentManifest) ProbeBlobValue() []byte {
+	if m == nil {
+		return nil
+	}
+	if len(m.ProbeCentroidBlob) > 0 {
+		return m.ProbeCentroidBlob
+	}
+	return m.CentroidBlob
+}
+
+func (m *SegmentManifest) StableBlobValue() []byte {
+	if m == nil {
+		return nil
+	}
+	if len(m.StableCentroidBlob) > 0 {
+		return m.StableCentroidBlob
+	}
+	if len(m.CentroidBlob) > 0 {
+		return m.CentroidBlob
+	}
+	return m.ProbeCentroidBlob
+}
+
+func (m *SegmentManifest) NormalizeCentroidFields() {
+	if m == nil {
+		return
+	}
+	if m.ProbeCentroidEpoch == 0 {
+		m.ProbeCentroidEpoch = m.CentroidEpoch
+	}
+	if len(m.ProbeCentroidBlob) == 0 {
+		m.ProbeCentroidBlob = append([]byte(nil), m.CentroidBlob...)
+	}
+	if m.StableCentroidEpoch == 0 {
+		if m.CentroidEpoch != 0 {
+			m.StableCentroidEpoch = m.CentroidEpoch
+		} else {
+			m.StableCentroidEpoch = m.ProbeCentroidEpoch
+		}
+	}
+	if len(m.StableCentroidBlob) == 0 {
+		if len(m.CentroidBlob) > 0 {
+			m.StableCentroidBlob = append([]byte(nil), m.CentroidBlob...)
+		} else {
+			m.StableCentroidBlob = append([]byte(nil), m.ProbeCentroidBlob...)
+		}
+	}
 }

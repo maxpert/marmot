@@ -134,6 +134,42 @@ func (h *EngineHook) maintenanceOnce(ctx context.Context, meta common.VectorInde
 			driftBacklogRows = 0
 		}
 	}
+	currentClusters := currentClusterCount(meta, clusterRowCounts)
+	wantClusters := desiredClusterCount(totalTrackedRows(clusterRowCounts, driftBacklogRows), maintenanceTargetClusterSize(meta))
+	growForPromotion := meta.AutoTuneNlist &&
+		wantClusters > currentClusters &&
+		currentClusters > 0 &&
+		float64(wantClusters-currentClusters)/float64(currentClusters) >= rebuildClusterDriftPct
+
+	if overlaySnapshot != nil && overlaySnapshot.LastSequence() > base.AppliedOverlaySeq && (shouldIncrementalMerge(backlogRows, backlogBytes, oldestUnixNano) || growForPromotion) {
+		dbPath, err := h.dbMgr.GetDatabasePath(meta.Database)
+		if err != nil {
+			log.Warn().Err(err).Str("index", meta.IndexName).Msg("maintenance: get db path failed")
+			return false
+		}
+		if err := h.runIncrementalMerge(ctx, dbPath, meta, spec, state); err != nil {
+			log.Warn().Err(err).Str("index", meta.IndexName).Msg("maintenance: incremental merge failed")
+		}
+		return false
+	}
+	if growForPromotion {
+		dbPath, err := h.dbMgr.GetDatabasePath(meta.Database)
+		if err != nil {
+			log.Warn().Err(err).Str("index", meta.IndexName).Msg("maintenance: get db path failed")
+			return false
+		}
+		nextClusters := stepPromotionClusterCount(currentClusters, wantClusters)
+		if err := h.runIncrementalPromotion(ctx, conn, dbPath, meta, spec, state, nextClusters); err != nil {
+			if errors.Is(err, errIncrementalPromotionFallback) {
+				if err := h.runAutomaticRebuild(ctx, conn, meta); err != nil {
+					log.Warn().Err(err).Str("index", meta.IndexName).Msg("maintenance: promotion fallback rebuild failed")
+				}
+			} else {
+				log.Warn().Err(err).Str("index", meta.IndexName).Msg("maintenance: incremental promotion failed")
+			}
+		}
+		return false
+	}
 
 	if shouldAutoRebuild(meta, clusterRowCounts, maintenance, countTargetClusterDrift(meta, clusterRowCounts, driftBacklogRows)) {
 		if err := h.runAutomaticRebuild(ctx, conn, meta); err != nil {
@@ -355,7 +391,6 @@ func (h *EngineHook) prepareIncrementalMerge(
 	}
 	cutoff := overlaySnapshot.LastSequence()
 	baseGeneration := base.Data.Generation()
-	maintenance := state.LoadMaintenanceState().Clone()
 	pinnedBase, err := openPinnedSegmentGeneration(dbPath, meta, spec, currentProbe.Epoch(), baseGeneration)
 	hotClusterScores := state.HotClusterScores(segmentLayoutHotClusterLimit)
 	h.localChangeMu.Unlock()
@@ -364,16 +399,35 @@ func (h *EngineHook) prepareIncrementalMerge(
 	}
 	defer pinnedBase.Close()
 
+	stats, err := buildCutoffClusterStats(spec, pinnedBase, overlaySnapshot, cutoff)
+	if err != nil {
+		return nil, err
+	}
+	nextEpoch := currentProbe.Epoch() + 1
+	if nextEpoch == 0 {
+		nextEpoch = 1
+	}
+	nextProbe, err := probeCentroidSetForTouched(currentProbe, stats.Counts, stats.Sums, stats.Touched, nextEpoch)
+	if err != nil {
+		return nil, err
+	}
+	nextStable, err := stableCentroidSetForTouched(pinnedBase.StableCentroids, nextProbe, stats.Touched)
+	if err != nil {
+		return nil, err
+	}
+
 	pending, err := BuildIncrementalSegmentGeneration(
 		ctx,
 		dbPath,
 		meta,
 		spec,
-		currentProbe,
+		nextProbe,
+		nextStable,
 		pinnedBase,
 		overlaySnapshot,
 		cutoff,
-		maintenance,
+		stats.Counts,
+		stats.Sums,
 		hotClusterScores,
 	)
 	if err != nil || pending == nil {
@@ -385,7 +439,7 @@ func (h *EngineHook) prepareIncrementalMerge(
 		currentEpoch:   currentProbe.Epoch(),
 		baseGeneration: baseGeneration,
 		cutoff:         cutoff,
-		nextProbe:      currentProbe,
+		nextProbe:      nextProbe,
 		pending:        pending,
 	}, nil
 }
@@ -423,7 +477,11 @@ func (h *EngineHook) publishIncrementalMerge(
 	if err := plan.pending.Publish(); err != nil {
 		return err
 	}
-	nextOverlay, err := rewriteOverlayForEpoch(dbPath, meta.IndexName, plan.currentEpoch, plan.cutoff, currentSnapshot.MutationsAfter(plan.cutoff))
+	tailMutations, err := reassignOverlayMutationsForProbe(currentSnapshot, plan.cutoff, plan.spec, plan.nextProbe, plan.pending.generation)
+	if err != nil {
+		return err
+	}
+	nextOverlay, err := rewriteOverlayForEpoch(dbPath, meta.IndexName, plan.nextProbe.Epoch(), plan.cutoff, tailMutations)
 	if err != nil {
 		return err
 	}
@@ -492,7 +550,6 @@ func (h *EngineHook) runAutomaticRebuild(ctx context.Context, conn *sql.DB, meta
 	if err != nil {
 		return err
 	}
-
 	h.localChangeMu.Lock()
 	defer h.localChangeMu.Unlock()
 
@@ -527,7 +584,7 @@ func (h *EngineHook) runAutomaticRebuild(ctx context.Context, conn *sql.DB, meta
 
 func rewriteOverlayForEpoch(dbPath, indexName string, epoch uint64, minSequence uint64, mutations []vecindex.OverlayMutation) (*vecindex.JournaledOverlay, error) {
 	dir := vecindex.SegmentStoreDir(dbPath, indexName)
-	overlay, err := vecindex.OpenJournaledOverlay(vecindex.OverlayJournalPath(dir))
+	overlay, err := vecindex.OpenJournaledOverlayForRewrite(vecindex.OverlayJournalPath(dir))
 	if err != nil {
 		return nil, err
 	}

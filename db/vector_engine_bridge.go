@@ -16,6 +16,9 @@ import (
 const (
 	bootstrapMinTargetPartitions = 8
 	retireStateGracePeriod       = 30 * time.Second
+	bootstrapMaxTailRows         = 4096
+	bootstrapStabilizeDelay      = time.Second
+	bootstrapStabilizePasses     = 2
 )
 
 // Ensure EngineHook implements both lifecycle hooks.
@@ -323,11 +326,27 @@ func (h *EngineHook) bootstrapOnce(ctx context.Context, meta common.VectorIndexM
 		return true
 	}
 
-	currentN, err := countIndexableRows(ctx, conn, meta.TableName, meta.ColumnName, spec)
+	dbPath, err := h.dbMgr.GetDatabasePath(meta.Database)
 	if err != nil {
-		log.Warn().Err(err).Str("index", meta.IndexName).Msg("engine hook bootstrap: row-count probe failed")
+		log.Warn().Err(err).Str("index", meta.IndexName).Msg("engine hook bootstrap: get db path failed")
 		return false
 	}
+	if state.LoadOverlay() == nil {
+		if err := openAndStoreOverlay(dbPath, meta.IndexName, state, 0); err != nil {
+			log.Warn().Err(err).Str("index", meta.IndexName).Msg("engine hook bootstrap: open overlay failed")
+			return false
+		}
+	}
+	overlay := state.LoadOverlay()
+	if overlay == nil {
+		return false
+	}
+	overlaySnapshot := overlay.Snapshot()
+	if overlaySnapshot == nil {
+		return false
+	}
+
+	currentN := int64(overlaySnapshot.Len())
 	if currentN == 0 {
 		return false
 	}
@@ -338,6 +357,16 @@ func (h *EngineHook) bootstrapOnce(ctx context.Context, meta common.VectorIndexM
 		}
 	}
 	log.Info().Int64("rows", currentN).Str("index", meta.IndexName).Msg("engine hook bootstrap: bootstrap threshold reached")
+
+	if meta.AutoTuneNlist {
+		refreshedSnapshot, stable := waitForBootstrapStableSnapshot(overlay, overlaySnapshot, meta)
+		if !stable {
+			log.Info().Str("index", meta.IndexName).Msg("engine hook bootstrap: deferring centroid build while overlay is still growing")
+			return false
+		}
+		overlaySnapshot = refreshedSnapshot
+		currentN = int64(overlaySnapshot.Len())
+	}
 
 	if retunedMeta, retunedSpec, changed, err := retuneBootstrapMeta(ctx, conn, meta, spec, currentN); err != nil {
 		log.Warn().Err(err).Str("index", meta.IndexName).Msg("engine hook bootstrap: retune failed")
@@ -357,34 +386,97 @@ func (h *EngineHook) bootstrapOnce(ctx context.Context, meta common.VectorIndexM
 		}
 	}
 
-	oldState, _ := h.engine.Lookup(meta.IndexName)
-	updatedAt := time.Now().UnixNano()
-	if err := BulkPopulate(ctx, conn, h.engine, updatedAt, meta.TableName, meta.ColumnName, spec, meta.TargetPartitionSize); err != nil {
-		if oldState != nil {
-			h.engine.Register(meta.IndexName, oldState)
-		}
-		log.Warn().Err(err).Str("index", meta.IndexName).Msg("engine hook bootstrap: bulk populate failed")
-		return false
-	}
-
-	newState, ok := h.engine.Lookup(meta.IndexName)
-	if !ok || newState.ProbeVersion() == 0 {
-		log.Warn().Str("index", meta.IndexName).Msg("engine hook bootstrap: populate finished without centroids")
-		return false
-	}
-	dbPath, err := h.dbMgr.GetDatabasePath(meta.Database)
+	cutoff := overlaySnapshot.LastSequence()
+	probeCS, err := computeCentroidsFromOverlaySnapshot(overlaySnapshot, spec, meta.TargetPartitionSize, cutoff, 1)
 	if err != nil {
-		log.Warn().Err(err).Str("index", meta.IndexName).Msg("engine hook bootstrap: get db path failed after populate")
+		log.Warn().Err(err).Str("index", meta.IndexName).Msg("engine hook bootstrap: compute overlay centroids failed")
 		return false
 	}
-	if err := openAndStoreOverlay(dbPath, meta.IndexName, newState, newState.ProbeVersion()); err != nil {
-		log.Warn().Err(err).Str("index", meta.IndexName).Msg("engine hook bootstrap: open overlay failed")
+	if probeCS == nil {
 		return false
 	}
-	if err := buildAndStoreSegmentGeneration(ctx, conn, dbPath, newState, meta, spec); err != nil {
-		log.Warn().Err(err).Str("index", meta.IndexName).Msg("engine hook bootstrap: build segment generation failed after populate")
+	pending, err := BuildBootstrapSegmentGenerationFromOverlay(
+		dbPath,
+		meta,
+		spec,
+		probeCS,
+		overlaySnapshot,
+		cutoff,
+		state.HotClusterScores(segmentLayoutHotClusterLimit),
+	)
+	if err != nil {
+		log.Warn().Err(err).Str("index", meta.IndexName).Msg("engine hook bootstrap: build overlay segment generation failed")
 		return false
 	}
+	if pending == nil {
+		return false
+	}
+	defer pending.Close()
+
+	h.localChangeMu.Lock()
+	current, ok := h.engine.Lookup(meta.IndexName)
+	if !ok || current != state {
+		h.localChangeMu.Unlock()
+		return false
+	}
+	if current.ProbeVersion() != 0 {
+		h.localChangeMu.Unlock()
+		if current.LoadSegmentStore() != nil {
+			h.startMaintenanceWatcher(meta)
+			return true
+		}
+		return false
+	}
+	currentOverlay := current.LoadOverlay()
+	if currentOverlay == nil {
+		h.localChangeMu.Unlock()
+		return false
+	}
+	currentSnapshot := currentOverlay.Snapshot()
+	if currentSnapshot == nil || currentSnapshot.Epoch() != 0 || currentSnapshot.LastSequence() < cutoff {
+		h.localChangeMu.Unlock()
+		return false
+	}
+	tailRows, _, _ := currentSnapshot.BacklogStats(cutoff)
+	if tailRows > bootstrapPublishTailLimit(meta) {
+		h.localChangeMu.Unlock()
+		log.Info().
+			Str("index", meta.IndexName).
+			Int("tail_rows", tailRows).
+			Msg("engine hook bootstrap: deferring publish until overlay tail shrinks")
+		return false
+	}
+	if err := pending.Publish(); err != nil {
+		h.localChangeMu.Unlock()
+		log.Warn().Err(err).Str("index", meta.IndexName).Msg("engine hook bootstrap: publish overlay segment generation failed")
+		return false
+	}
+	tailMutations, err := reassignOverlayMutationsForProbe(currentSnapshot, cutoff, spec, probeCS, pending.generation)
+	if err != nil {
+		h.localChangeMu.Unlock()
+		log.Warn().Err(err).Str("index", meta.IndexName).Msg("engine hook bootstrap: rewrite overlay tail failed")
+		return false
+	}
+	nextOverlay, err := rewriteOverlayForEpoch(dbPath, meta.IndexName, probeCS.Epoch(), cutoff, tailMutations)
+	if err != nil {
+		h.localChangeMu.Unlock()
+		log.Warn().Err(err).Str("index", meta.IndexName).Msg("engine hook bootstrap: rewrite overlay failed")
+		return false
+	}
+	newState := vecindex.NewIndexState(spec, probeCS)
+	newState.StoreSegmentStore(pending.generation)
+	pending.generation = nil
+	newState.StoreOverlay(nextOverlay)
+	if err := syncMaintenanceStateFromOverlay(newState); err != nil {
+		h.localChangeMu.Unlock()
+		newState.ClearOverlay()
+		newState.ClearSegmentStore()
+		log.Warn().Err(err).Str("index", meta.IndexName).Msg("engine hook bootstrap: sync maintenance state failed")
+		return false
+	}
+	h.engine.Register(meta.IndexName, newState)
+	h.localChangeMu.Unlock()
+	h.retireState(state)
 	h.startMaintenanceWatcher(meta)
 	log.Info().Str("index", meta.IndexName).Msg("engine hook bootstrap: automatic bootstrap complete")
 	return true
@@ -440,6 +532,52 @@ func bootstrapAutoTuneFloor(meta common.VectorIndexMeta) int64 {
 		partitions = 1
 	}
 	return int64(target) * int64(partitions)
+}
+
+func bootstrapPublishTailLimit(meta common.VectorIndexMeta) int {
+	target := meta.TargetPartitionSize
+	if target <= 0 {
+		target = defaultTargetPartitionSize
+	}
+	limit := target * 4
+	if limit < bootstrapMaxTailRows {
+		limit = bootstrapMaxTailRows
+	}
+	return limit
+}
+
+func waitForBootstrapStableSnapshot(
+	overlay *vecindex.JournaledOverlay,
+	snapshot *vecindex.OverlaySnapshot,
+	meta common.VectorIndexMeta,
+) (*vecindex.OverlaySnapshot, bool) {
+	if overlay == nil || snapshot == nil {
+		return snapshot, false
+	}
+	current := snapshot
+	stablePasses := 0
+	for attempt := 0; attempt < bootstrapStabilizePasses*2; attempt++ {
+		time.Sleep(bootstrapStabilizeDelay)
+		next := overlay.Snapshot()
+		if next == nil || next.Epoch() != current.Epoch() {
+			return current, false
+		}
+		if next.LastSequence() == current.LastSequence() {
+			stablePasses++
+			current = next
+			if stablePasses >= bootstrapStabilizePasses {
+				return current, true
+			}
+			continue
+		}
+		stablePasses = 0
+		tailRows, _, _ := next.BacklogStats(current.LastSequence())
+		if tailRows > bootstrapPublishTailLimit(meta) {
+			return next, false
+		}
+		current = next
+	}
+	return current, false
 }
 
 func autoTuneBootstrapNlist(rows int64, targetPartitionSize int) int {

@@ -588,8 +588,8 @@ func initialMiniBatchCentroids(vectors [][]float32, k int, seed uint64, opts Min
 	if initCap > len(vectors) {
 		initCap = len(vectors)
 	}
-	initSample := make([][]float32, initCap)
 	order := miniBatchOrder(len(vectors), seed^0x9e3779b97f4a7c15)
+	initSample := make([][]float32, initCap)
 	for i := 0; i < initCap; i++ {
 		initSample[i] = vectors[order[i]]
 	}
@@ -597,7 +597,18 @@ func initialMiniBatchCentroids(vectors [][]float32, k int, seed uint64, opts Min
 	if err != nil {
 		return nil, err
 	}
-	return RebalanceInitialCentroids(vectors, centroids, opts, seed)
+	rebalanceCap := initCap * DefaultMiniBatchInitFactor
+	if rebalanceCap < k {
+		rebalanceCap = k
+	}
+	if rebalanceCap > len(vectors) {
+		rebalanceCap = len(vectors)
+	}
+	rebalanceSample := make([][]float32, rebalanceCap)
+	for i := 0; i < rebalanceCap; i++ {
+		rebalanceSample[i] = vectors[order[i]]
+	}
+	return RebalanceInitialCentroids(rebalanceSample, centroids, opts, seed)
 }
 
 func RebalanceInitialCentroids(vectors [][]float32, initCentroids [][]float32, opts MiniBatchBalancedOptions, seed uint64) ([][]float32, error) {

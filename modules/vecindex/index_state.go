@@ -15,37 +15,27 @@ var ErrNoCentroidsLoaded = errors.New("vecindex: no centroids loaded")
 
 // IndexState holds the in-memory state for a single vector index.
 //
-// probeState is frozen at REINDEX time; query transpile and UDF assignment use
-// this pointer. driftState is updated online via MacQueen increments and
-// seeds the next k-means warm start. driftTracker accumulates the running
-// sum/count statistics that produce the drifted centroids.
-//
-// All pointers are stored as atomic.Pointer so readers are lock-free.
+// probeState is the active routing centroid set used by query transpile and
+// assignment. All pointers are stored as atomic.Pointer so readers are
+// lock-free.
 type IndexState struct {
 	spec         IVFSpec
 	probeState   atomic.Pointer[kmeans.CentroidSet]
-	driftState   atomic.Pointer[kmeans.CentroidSet]
-	driftTracker atomic.Pointer[DriftTracker]
 	overlay      atomic.Pointer[JournaledOverlay]
 	segmentStore atomic.Pointer[SegmentGeneration]
 	maintenance  atomic.Pointer[MaintenanceState]
 	clusterHits  []atomic.Uint64
 }
 
-// NewIndexState creates an IndexState with probe and drift both pointing at cs.
-// The drift tracker is initialized from cs's centroids for MacQueen tracking.
+// NewIndexState creates an IndexState rooted at cs.
 func NewIndexState(spec IVFSpec, cs *kmeans.CentroidSet) *IndexState {
 	s := &IndexState{spec: spec}
 	if spec.Nlist > 0 {
 		s.clusterHits = make([]atomic.Uint64, spec.Nlist+1)
 	}
 	s.probeState.Store(cs)
-	s.driftState.Store(cs)
 	s.overlay.Store(nil)
 	s.maintenance.Store(&MaintenanceState{})
-	if cs != nil {
-		s.driftTracker.Store(NewDriftTracker(cs.Snapshot()))
-	}
 	return s
 }
 
@@ -71,65 +61,6 @@ func (s *IndexState) ProbeVersion() uint64 {
 // previous one. Called at REINDEX commit (design §8.3 step 7 in-txn swap).
 func (s *IndexState) SwapProbeState(cs *kmeans.CentroidSet) *kmeans.CentroidSet {
 	return s.probeState.Swap(cs)
-}
-
-// DriftState returns the current drift centroid set (design §8.5). The
-// drift state carries MacQueen-updated centroids — it is the warm-start
-// source for the next REINDEX k-means (§8.3 step 2, fix G).
-//
-// Returns nil before any centroids have been installed. The returned
-// CentroidSet is immutable; callers that want to fork it must call
-// CentroidSet.Snapshot to get a mutable copy.
-func (s *IndexState) DriftState() *kmeans.CentroidSet {
-	return s.driftState.Load()
-}
-
-// ResetDriftState atomically replaces the drift centroid set and reinitializes
-// the MacQueen drift tracker from the new centroids. Called at REINDEX commit
-// so drift tracking starts from the newly-swapped probe state — subsequent
-// DriftUpdate calls then fork drift cleanly from the new baseline.
-//
-// Returns the previous drift pointer.
-func (s *IndexState) ResetDriftState(cs *kmeans.CentroidSet) *kmeans.CentroidSet {
-	if cs != nil {
-		s.driftTracker.Store(NewDriftTracker(cs.Snapshot()))
-	}
-	return s.driftState.Swap(cs)
-}
-
-// DriftUpdate accumulates a vector into the MacQueen drift tracker for the
-// given 1-based clusterID. Uses CAS-loop copy-on-write so concurrent callers
-// never block. No-op if the tracker is nil or clusterID is out of range.
-func (s *IndexState) DriftUpdate(clusterID int64, vec []float32) {
-	idx := int(clusterID - 1) // convert 1-based to 0-based
-	for {
-		old := s.driftTracker.Load()
-		if old == nil || idx < 0 || idx >= old.Len() {
-			return
-		}
-		updated := old.Update(idx, vec)
-		if s.driftTracker.CompareAndSwap(old, updated) {
-			return
-		}
-	}
-}
-
-// DriftCentroids returns the MacQueen-drifted centroid positions computed from
-// the running sum/count tracker. Returns nil if no tracker is initialized.
-// Used as the warm-start seed for the next REINDEX k-means (design §8.3 fix G).
-func (s *IndexState) DriftCentroids() [][]float32 {
-	t := s.driftTracker.Load()
-	if t == nil {
-		return nil
-	}
-	return t.Centroids()
-}
-
-// LoadDriftTracker returns the current drift tracker for external inspection
-// (e.g., growth-ratio sensor in the auto-retrain monitor). The returned
-// tracker is immutable; safe for concurrent reads.
-func (s *IndexState) LoadDriftTracker() *DriftTracker {
-	return s.driftTracker.Load()
 }
 
 func (s *IndexState) LoadOverlay() *JournaledOverlay {

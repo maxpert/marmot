@@ -67,6 +67,15 @@ type overlayTombstone struct {
 	appliedAtUnixNano int64
 }
 
+type overlayMutationRef struct {
+	kind              OverlayMutationKind
+	sequence          uint64
+	clusterID         int64
+	rowID             int64
+	appliedAtUnixNano int64
+	vec               []byte
+}
+
 func newOverlaySnapshot(epoch, lastSequence uint64) *OverlaySnapshot {
 	return &OverlaySnapshot{
 		epoch:        epoch,
@@ -284,6 +293,73 @@ func (s *OverlaySnapshot) MutationsAfter(minSequence uint64) []OverlayMutation {
 		}
 	})
 	return mutations
+}
+
+func (s *OverlaySnapshot) VisitMutationsAfter(minSequence uint64, visit func(OverlayMutation) bool) {
+	if s == nil || visit == nil {
+		return
+	}
+	refs := make([]overlayMutationRef, 0, len(s.rowCluster)+len(s.tombstones))
+	for clusterID, rows := range s.byCluster {
+		for rowID, row := range rows {
+			if row.sequence <= minSequence {
+				continue
+			}
+			kind := OverlayMutationUpsert
+			if tombstone, ok := s.tombstones[rowID]; ok && tombstone.sequence == row.sequence {
+				kind = OverlayMutationReplace
+			}
+			refs = append(refs, overlayMutationRef{
+				kind:              kind,
+				sequence:          row.sequence,
+				clusterID:         clusterID,
+				rowID:             rowID,
+				appliedAtUnixNano: row.appliedAtUnixNano,
+				vec:               row.vec,
+			})
+		}
+	}
+	for rowID, tombstone := range s.tombstones {
+		if tombstone.sequence <= minSequence {
+			continue
+		}
+		if _, ok := s.rowCluster[rowID]; ok {
+			continue
+		}
+		refs = append(refs, overlayMutationRef{
+			kind:              OverlayMutationDelete,
+			sequence:          tombstone.sequence,
+			rowID:             rowID,
+			appliedAtUnixNano: tombstone.appliedAtUnixNano,
+		})
+	}
+	slices.SortFunc(refs, func(a, b overlayMutationRef) int {
+		switch {
+		case a.sequence < b.sequence:
+			return -1
+		case a.sequence > b.sequence:
+			return 1
+		case a.rowID < b.rowID:
+			return -1
+		case a.rowID > b.rowID:
+			return 1
+		default:
+			return 0
+		}
+	})
+	for _, ref := range refs {
+		if !visit(OverlayMutation{
+			Kind:              ref.kind,
+			Epoch:             s.epoch,
+			Sequence:          ref.sequence,
+			ClusterID:         ref.clusterID,
+			RowID:             ref.rowID,
+			AppliedAtUnixNano: ref.appliedAtUnixNano,
+			Vec:               ref.vec,
+		}) {
+			return
+		}
+	}
 }
 
 func (s *OverlaySnapshot) clone() *OverlaySnapshot {
@@ -529,6 +605,23 @@ func OpenOverlayJournal(path string) (*OverlayJournal, error) {
 	}, nil
 }
 
+// OpenOverlayJournalForRewrite opens or creates the journal file without
+// replaying its contents. Use this only for callers that will immediately
+// replace the on-disk contents via Rewrite/Reset.
+func OpenOverlayJournalForRewrite(path string) (*OverlayJournal, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, err
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	return &OverlayJournal{
+		path: path,
+		file: file,
+	}, nil
+}
+
 // Replay rebuilds the overlay snapshot from the journal contents.
 func (j *OverlayJournal) Replay() (*OverlaySnapshot, error) {
 	if j == nil || j.file == nil {
@@ -732,6 +825,22 @@ func OpenJournaledOverlay(path string) (*JournaledOverlay, error) {
 	}
 	buffer := NewOverlayBuffer()
 	buffer.StoreSnapshot(snapshot)
+	return &JournaledOverlay{
+		journal: journal,
+		buffer:  buffer,
+	}, nil
+}
+
+// OpenJournaledOverlayForRewrite opens the journal file without replaying the
+// current overlay state. It is intended for callers that already have the
+// mutations they want to persist and will immediately call Rewrite.
+func OpenJournaledOverlayForRewrite(path string) (*JournaledOverlay, error) {
+	journal, err := OpenOverlayJournalForRewrite(path)
+	if err != nil {
+		return nil, err
+	}
+	buffer := NewOverlayBuffer()
+	buffer.StoreSnapshot(newOverlaySnapshot(0, 0))
 	return &JournaledOverlay{
 		journal: journal,
 		buffer:  buffer,

@@ -57,12 +57,16 @@ func TestIncrementalMerge_PublishesNewGenerationAndClearsOverlay(t *testing.T) {
 	require.NoError(t, vecMgr.CreateIndex(context.Background(), meta))
 
 	const bootstrapRows = bootstrapMinTargetPartitions * 32
+	mirrorRows := make([]overlayMirrorRow, 0, bootstrapRows)
 	for i := 0; i < bootstrapRows; i++ {
-		_, err := conn.Exec(`INSERT INTO docs (id, embed) VALUES (?, ?)`, i+1, encodeVec(t, []float32{
+		vec := []float32{
 			1, float32(i % 7), float32((i + 1) % 11), float32((i + 2) % 13),
-		}))
+		}
+		_, err := conn.Exec(`INSERT INTO docs (id, embed) VALUES (?, ?)`, i+1, encodeVec(t, vec))
 		require.NoError(t, err)
+		mirrorRows = append(mirrorRows, overlayMirrorRow{rowID: int64(i + 1), vec: vec})
 	}
+	mirrorRowsToOverlay(t, hook, meta, mirrorRows)
 
 	var state *vecindex.IndexState
 	require.Eventually(t, func() bool {
@@ -103,10 +107,11 @@ func TestIncrementalMerge_PublishesNewGenerationAndClearsOverlay(t *testing.T) {
 	require.NoError(t, hook.runIncrementalMerge(context.Background(), dbPath, meta, state.Spec(), state))
 
 	state, _ = engine.Lookup(meta.IndexName)
-	require.Equal(t, oldEpoch, state.ProbeVersion())
+	require.Equal(t, oldEpoch+1, state.ProbeVersion())
 	require.NotNil(t, state.LoadSegmentStore())
 	require.Greater(t, state.LoadSegmentStore().Data.Generation(), oldGeneration)
-	require.Equal(t, state.ProbeVersion(), state.LoadSegmentStore().Centroids.Epoch())
+	require.Equal(t, state.ProbeVersion(), state.LoadSegmentStore().ProbeCentroids.Epoch())
+	require.Equal(t, state.ProbeVersion(), state.LoadSegmentStore().StableCentroids.Epoch())
 
 	overlay = state.LoadOverlay()
 	require.NotNil(t, overlay)
@@ -164,12 +169,16 @@ func TestIncrementalMerge_PreservesOverlayTailAcrossPublish(t *testing.T) {
 	require.NoError(t, vecMgr.CreateIndex(context.Background(), meta))
 
 	const bootstrapRows = bootstrapMinTargetPartitions * 32
+	mirrorRows := make([]overlayMirrorRow, 0, bootstrapRows)
 	for i := 0; i < bootstrapRows; i++ {
-		_, err := conn.Exec(`INSERT INTO docs (id, embed) VALUES (?, ?)`, i+1, encodeVec(t, []float32{
+		vec := []float32{
 			1, float32(i % 7), float32((i + 1) % 11), float32((i + 2) % 13),
-		}))
+		}
+		_, err := conn.Exec(`INSERT INTO docs (id, embed) VALUES (?, ?)`, i+1, encodeVec(t, vec))
 		require.NoError(t, err)
+		mirrorRows = append(mirrorRows, overlayMirrorRow{rowID: int64(i + 1), vec: vec})
 	}
+	mirrorRowsToOverlay(t, hook, meta, mirrorRows)
 
 	var state *vecindex.IndexState
 	require.Eventually(t, func() bool {
@@ -214,8 +223,8 @@ func TestIncrementalMerge_PreservesOverlayTailAcrossPublish(t *testing.T) {
 	require.NoError(t, hook.publishIncrementalMerge(dbPath, meta, plan))
 
 	state, _ = engine.Lookup(meta.IndexName)
-	require.Equal(t, oldEpoch, state.ProbeVersion())
-	require.Equal(t, state.ProbeVersion(), plan.currentEpoch)
+	require.Equal(t, oldEpoch+1, state.ProbeVersion())
+	require.Equal(t, oldEpoch, plan.currentEpoch)
 
 	overlay := state.LoadOverlay()
 	require.NotNil(t, overlay)
@@ -238,4 +247,115 @@ func TestIncrementalMerge_PreservesOverlayTailAcrossPublish(t *testing.T) {
 		tracked += liveCounts[clusterID]
 	}
 	require.Equal(t, uint64(bootstrapRows+2), tracked)
+}
+
+func TestIncrementalPromotion_PublishesLargerClusterLayout(t *testing.T) {
+	tmpDir := t.TempDir()
+	clock := hlc.NewClock(1)
+
+	dbMgr, err := NewDatabaseManager(tmpDir, 1, clock)
+	require.NoError(t, err)
+	require.NoError(t, dbMgr.CreateDatabase("test"))
+
+	vecMgr := NewVectorIndexManager(dbMgr)
+	dbMgr.SetVectorIndexManager(vecMgr)
+
+	engine := vecindex.NewEngine()
+	SetVectorUDFProvider(engine)
+	t.Cleanup(func() { SetVectorUDFProvider(nil) })
+
+	hook := NewEngineHook(engine, dbMgr)
+	hook.BindVectorIndexManager(vecMgr)
+	t.Cleanup(func() {
+		cleanupIndexWatchers(t, hook, dbMgr, "test", "embeddings")
+	})
+	vecMgr.SetLifecycleHook(hook)
+	vecMgr.SetEngineProvider(hook)
+	vecMgr.SetReindexHook(hook)
+	require.NoError(t, vecMgr.Start(context.Background()))
+
+	conn, err := dbMgr.GetDatabaseConnection("test")
+	require.NoError(t, err)
+	_, err = conn.Exec(`CREATE TABLE docs (id INTEGER PRIMARY KEY, embed BLOB)`)
+	require.NoError(t, err)
+
+	meta := common.VectorIndexMeta{
+		IndexName:           "embeddings",
+		TableName:           "docs",
+		ColumnName:          "embed",
+		Database:            "test",
+		Metric:              "l2",
+		Dim:                 4,
+		Nlist:               8,
+		Nprobe:              3,
+		TargetPartitionSize: 4,
+		CreatedAt:           time.Now().UnixNano(),
+	}
+	require.NoError(t, vecMgr.CreateIndex(context.Background(), meta))
+
+	rows := make([]overlayMirrorRow, 0, 64)
+	bases := [][]float32{
+		{0, 0, 0, 0},
+		{5, 5, 5, 5},
+		{10, 10, 10, 10},
+		{15, 15, 15, 15},
+		{20, 20, 20, 20},
+		{25, 25, 25, 25},
+		{30, 30, 30, 30},
+		{35, 35, 35, 35},
+	}
+	rowID := 1
+	for baseIdx, base := range bases {
+		groupRows := 8
+		if baseIdx == 0 {
+			groupRows = 12
+		}
+		for i := 0; i < groupRows; i++ {
+			vec := []float32{
+				base[0] + float32(i%2),
+				base[1] + float32((i/2)%2),
+				base[2] + float32((i/4)%2),
+				base[3] + float32(i%3),
+			}
+			_, err := conn.Exec(`INSERT INTO docs (id, embed) VALUES (?, ?)`, rowID, encodeVec(t, vec))
+			require.NoError(t, err)
+			rows = append(rows, overlayMirrorRow{rowID: int64(rowID), vec: vec})
+			rowID++
+		}
+	}
+	mirrorRowsToOverlay(t, hook, meta, rows)
+
+	var state *vecindex.IndexState
+	require.Eventually(t, func() bool {
+		var ok bool
+		state, ok = engine.Lookup(meta.IndexName)
+		return ok && state.ProbeVersion() > 0 && state.LoadSegmentStore() != nil
+	}, 30*time.Second, 100*time.Millisecond)
+
+	hook.stopMaintenanceWatcher(meta.IndexName)
+	oldEpoch := state.ProbeVersion()
+	oldGeneration := state.LoadSegmentStore().Data.Generation()
+
+	dbPath, err := dbMgr.GetDatabasePath("test")
+	require.NoError(t, err)
+	require.NoError(t, hook.runIncrementalPromotion(context.Background(), conn, dbPath, meta, state.Spec(), state, 10))
+
+	state, _ = engine.Lookup(meta.IndexName)
+	require.Equal(t, oldEpoch+1, state.ProbeVersion())
+	require.NotNil(t, state.LoadSegmentStore())
+	require.Greater(t, state.LoadSegmentStore().Data.Generation(), oldGeneration)
+	require.Equal(t, 10, state.Spec().Nlist)
+	require.Equal(t, 10, state.LoadSegmentStore().ProbeCentroids.Len())
+	require.Equal(t, 10, state.LoadSegmentStore().StableCentroids.Len())
+
+	overlay := state.LoadOverlay()
+	require.NotNil(t, overlay)
+	snapshot := overlay.Snapshot()
+	require.NotNil(t, snapshot)
+	require.Equal(t, state.ProbeVersion(), snapshot.Epoch())
+	require.Zero(t, snapshot.Len())
+
+	var nlist int
+	require.NoError(t, conn.QueryRow(`SELECT nlist FROM __marmot_vector_indexes WHERE index_name = ?`, meta.IndexName).Scan(&nlist))
+	require.Equal(t, 10, nlist)
 }

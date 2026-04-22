@@ -119,7 +119,7 @@ func promotionWarmStartCentroids(
 		return base, nil
 	}
 	segments := state.LoadSegmentStore()
-	if segments == nil || segments.Data == nil || segments.Centroids == nil {
+	if segments == nil || segments.Data == nil || segments.StableCentroids == nil {
 		return base, nil
 	}
 	counts := segments.ClusterRowCounts
@@ -220,7 +220,7 @@ func clusterSplitSeeds(
 	baseCentroid []float32,
 	extra int,
 ) ([][]float32, error) {
-	if segments == nil || segments.Data == nil || segments.Centroids == nil || extra <= 0 {
+	if segments == nil || segments.Data == nil || segments.StableCentroids == nil || extra <= 0 {
 		return nil, nil
 	}
 	clusterCount := int(segments.Data.ClusterCount(clusterID))
@@ -229,7 +229,7 @@ func clusterSplitSeeds(
 	}
 	vectors := make([][]float32, 0, clusterCount)
 	if err := segments.Data.ScanCluster(clusterID, func(_ int64, vecBytes []byte) bool {
-		prepared, err := decodeStableMemberPrepared(spec, segments.Centroids, clusterID, vecBytes)
+		prepared, err := decodeStableMemberPrepared(spec, segments.StableCentroids, clusterID, vecBytes)
 		if err != nil {
 			vectors = nil
 			return false

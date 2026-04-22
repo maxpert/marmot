@@ -60,14 +60,16 @@ func BuildIncrementalSegmentGeneration(
 	dbPath string,
 	meta common.VectorIndexMeta,
 	spec vecindex.IVFSpec,
-	cs *kmeans.CentroidSet,
+	probeCS *kmeans.CentroidSet,
+	stableCS *kmeans.CentroidSet,
 	base *vecindex.SegmentGeneration,
 	overlaySnapshot *vecindex.OverlaySnapshot,
 	cutoffSequence uint64,
-	maintenance *vecindex.MaintenanceState,
+	clusterRowCounts []uint64,
+	clusterVectorSums [][]float32,
 	hotClusterScores map[int64]uint64,
 ) (*pendingSegmentGeneration, error) {
-	if cs == nil || base == nil || base.Data == nil || base.RowMap == nil {
+	if probeCS == nil || stableCS == nil || base == nil || base.Data == nil || base.RowMap == nil {
 		return nil, fmt.Errorf("incremental segment generation: stable base generation is required")
 	}
 	if overlaySnapshot == nil {
@@ -84,11 +86,41 @@ func BuildIncrementalSegmentGeneration(
 		}
 		mutations = filtered
 	}
+	return buildIncrementalSegmentGenerationFromMutations(
+		ctx,
+		dbPath,
+		meta,
+		spec,
+		probeCS,
+		stableCS,
+		base,
+		mutations,
+		cutoffSequence,
+		clusterRowCounts,
+		clusterVectorSums,
+		hotClusterScores,
+	)
+}
+
+func buildIncrementalSegmentGenerationFromMutations(
+	ctx context.Context,
+	dbPath string,
+	meta common.VectorIndexMeta,
+	spec vecindex.IVFSpec,
+	probeCS *kmeans.CentroidSet,
+	stableCS *kmeans.CentroidSet,
+	base *vecindex.SegmentGeneration,
+	mutations []vecindex.OverlayMutation,
+	cutoffSequence uint64,
+	clusterRowCounts []uint64,
+	clusterVectorSums [][]float32,
+	hotClusterScores map[int64]uint64,
+) (*pendingSegmentGeneration, error) {
 	if len(mutations) == 0 {
 		return nil, nil
 	}
 
-	maxCluster := cs.Len()
+	maxCluster := stableCS.Len()
 	if maxCluster == 0 {
 		return nil, nil
 	}
@@ -131,7 +163,7 @@ func BuildIncrementalSegmentGeneration(
 		spec.InternalDim(),
 		vecBytes,
 		maxCluster,
-		cs.Epoch(),
+		stableCS.Epoch(),
 		generation,
 	)
 	if err != nil {
@@ -139,7 +171,7 @@ func BuildIncrementalSegmentGeneration(
 	}
 	defer dataWriter.Abort()
 
-	rowMapWriter, err := vecindex.CreateSegmentRowMapWriter(rowMapPath, cs.Epoch(), generation)
+	rowMapWriter, err := vecindex.CreateSegmentRowMapWriter(rowMapPath, stableCS.Epoch(), generation)
 	if err != nil {
 		return nil, err
 	}
@@ -152,21 +184,17 @@ func BuildIncrementalSegmentGeneration(
 	defer oldDataFile.Close()
 
 	order := incrementalClusterWriteOrder(base.Data, maxCluster)
-	clusterRowCounts := make([]uint64, maxCluster+1)
-	clusterVectorSums := cloneClusterVectorSums(base.ClusterVectorSums)
-	if maintenance != nil {
-		clusterRowCounts = maintenance.LiveClusterRowCounts()
-		clusterVectorSums = cloneClusterVectorSums(maintenance.LiveClusterVectorSums())
-		if len(clusterRowCounts) < maxCluster+1 {
-			next := make([]uint64, maxCluster+1)
-			copy(next, clusterRowCounts)
-			clusterRowCounts = next
-		}
-		if len(clusterVectorSums) < maxCluster+1 {
-			next := make([][]float32, maxCluster+1)
-			copy(next, clusterVectorSums)
-			clusterVectorSums = next
-		}
+	clusterRowCounts = append([]uint64(nil), clusterRowCounts...)
+	if len(clusterRowCounts) < maxCluster+1 {
+		next := make([]uint64, maxCluster+1)
+		copy(next, clusterRowCounts)
+		clusterRowCounts = next
+	}
+	clusterVectorSums = cloneClusterVectorSums(clusterVectorSums)
+	if len(clusterVectorSums) < maxCluster+1 {
+		next := make([][]float32, maxCluster+1)
+		copy(next, clusterVectorSums)
+		clusterVectorSums = next
 	}
 	oldOffsets := make([]uint64, maxCluster+1)
 	newOffsets := make([]uint64, maxCluster+1)
@@ -200,7 +228,7 @@ func BuildIncrementalSegmentGeneration(
 			continue
 		}
 
-		entries, err := rebuildTouchedClusterEntries(ctx, spec, cs, base, clusterID, pendingByRow)
+		entries, err := rebuildTouchedClusterEntries(ctx, spec, stableCS, base, clusterID, pendingByRow)
 		if err != nil {
 			return nil, err
 		}
@@ -211,7 +239,7 @@ func BuildIncrementalSegmentGeneration(
 			if err := dataWriter.Append(clusterID, entry.rowID, entry.vec); err != nil {
 				return nil, fmt.Errorf("incremental segment generation: append touched cluster %d rowid %d: %w", clusterID, entry.rowID, err)
 			}
-			prepared, err := decodeStableMemberPrepared(spec, cs, clusterID, entry.vec)
+			prepared, err := decodeStableMemberPrepared(spec, stableCS, clusterID, entry.vec)
 			if err != nil {
 				return nil, fmt.Errorf("incremental segment generation: decode prepared rowid %d: %w", entry.rowID, err)
 			}
@@ -280,8 +308,10 @@ func BuildIncrementalSegmentGeneration(
 		Metric:                   meta.Metric,
 		Dim:                      uint32(meta.Dim),
 		InternalDim:              uint32(spec.InternalDim()),
-		CentroidEpoch:            cs.Epoch(),
-		CentroidBlob:             mustCentroidBlob(cs),
+		ProbeCentroidEpoch:       probeCS.Epoch(),
+		ProbeCentroidBlob:        mustCentroidBlob(probeCS),
+		StableCentroidEpoch:      stableCS.Epoch(),
+		StableCentroidBlob:       mustCentroidBlob(stableCS),
 		AppliedOverlaySeq:        cutoffSequence,
 		Generation:               generation,
 		MaxCluster:               uint32(maxCluster),
@@ -302,7 +332,8 @@ func BuildIncrementalSegmentGeneration(
 		generation: &vecindex.SegmentGeneration{
 			Data:                     dataStore,
 			RowMap:                   rowMapStore,
-			Centroids:                cs,
+			ProbeCentroids:           probeCS,
+			StableCentroids:          stableCS,
 			AppliedOverlaySeq:        cutoffSequence,
 			ClusterRowCounts:         append([]uint64(nil), clusterRowCounts...),
 			ClusterVectorSums:        cloneClusterVectorSums(clusterVectorSums),
@@ -317,7 +348,7 @@ func BuildIncrementalSegmentGeneration(
 func rebuildTouchedClusterEntries(
 	ctx context.Context,
 	spec vecindex.IVFSpec,
-	cs *kmeans.CentroidSet,
+	stableCS *kmeans.CentroidSet,
 	base *vecindex.SegmentGeneration,
 	clusterID int64,
 	pendingByRow map[int64]pendingMutation,
@@ -329,12 +360,12 @@ func rebuildTouchedClusterEntries(
 		if _, changed := pendingByRow[rowID]; changed {
 			return true
 		}
-		prepared, err := decodeStableMemberPrepared(spec, base.Centroids, clusterID, vecBytes)
+		prepared, err := decodeStableMemberPrepared(spec, base.StableCentroids, clusterID, vecBytes)
 		if err != nil {
 			scanErr = err
 			return false
 		}
-		enc, encoded, err := vecindex.EncodeStableMember(spec, cs, clusterID, vecindex.Float32ToBytes(prepared))
+		enc, encoded, err := vecindex.EncodeStableMember(spec, stableCS, clusterID, vecindex.Float32ToBytes(prepared))
 		if err != nil {
 			scanErr = err
 			return false
@@ -359,7 +390,7 @@ func rebuildTouchedClusterEntries(
 		if mutation.kind == vecindex.OverlayMutationDelete || mutation.clusterID != clusterID {
 			continue
 		}
-		enc, encoded, err := vecindex.EncodeStableMember(spec, cs, clusterID, mutation.vec)
+		enc, encoded, err := vecindex.EncodeStableMember(spec, stableCS, clusterID, mutation.vec)
 		if err != nil {
 			return nil, fmt.Errorf("incremental segment generation: encode rowid %d: %w", mutation.rowID, err)
 		}

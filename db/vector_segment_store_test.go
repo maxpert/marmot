@@ -248,20 +248,23 @@ func TestBuildIncrementalSegmentGeneration_RewritesTouchedClustersOnly(t *testin
 		t.Fatalf("overlay apply: %v", err)
 	}
 
+	stats, err := buildCutoffClusterStats(spec, base, overlay.Snapshot(), 3)
+	if err != nil {
+		t.Fatalf("buildCutoffClusterStats: %v", err)
+	}
+
 	pending, err := BuildIncrementalSegmentGeneration(
 		context.Background(),
 		tdb.dbPath,
 		meta,
 		spec,
 		cs,
+		cs,
 		base,
 		overlay.Snapshot(),
 		3,
-		&vecindex.MaintenanceState{
-			ClusterRowCounts:    append([]uint64(nil), base.ClusterRowCounts...),
-			ClusterVectorSums:   cloneClusterVectorSums(base.ClusterVectorSums),
-			LastRebuildRowCount: base.LastRebuildRowCount,
-		},
+		stats.Counts,
+		stats.Sums,
 		nil,
 	)
 	if err != nil {

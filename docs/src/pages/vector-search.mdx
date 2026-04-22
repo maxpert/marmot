@@ -20,6 +20,7 @@ The exact embedding remains in the base table. The vector index builds local der
 - **Local file-backed serving state**: Marmot stores centroids, stable cluster segments, row maps, manifests, and an overlay journal in a per-index `.vecseg` directory next to the database.
 - **No SQLite vector sidecar**: candidate serving does not scan `__marmot_vec_*_members` or any equivalent payload table.
 - **Predicate-aware planning**: Marmot chooses between exact pre-filtering and IVF post-filtering. Exact rerank always comes from the base table shortlist.
+- **Overlay-first bootstrap and maintenance**: empty-table create starts with overlay visibility, then publishes the first clustered generation from a local overlay snapshot and maintains later generations incrementally.
 - **Crash-safe publish**: new stable generations are written immutably and published by swapping `manifest/current`, Lucene-style.
 
 ## Quick Start
@@ -65,7 +66,7 @@ CREATE VECTOR INDEX <index_name>
 | `DIM` | Vector dimensionality. Required. |
 | `METRIC` | `l2`, `cosine`, or `dot`. Required. |
 | `WITH (nlist = n)` | IVF cluster count. Optional; auto-tuned when omitted. |
-| `WITH (nprobe = n)` | Probed clusters per query. Optional; auto-tuned when omitted. |
+| `WITH (nprobe = n)` | Probed clusters per query. Optional; auto-derived when omitted. |
 | `WITH (max_norm = f)` | Required only for `METRIC dot`. |
 
 Requirements:
@@ -75,7 +76,7 @@ Requirements:
 
 If the table already has rows, `CREATE VECTOR INDEX` computes centroids, builds the first stable segment generation, and marks the index `ready`.
 
-If the table is empty, the index is still created immediately. Marmot starts a local bootstrap watcher and publishes the first centroid/segment generation automatically once enough indexable rows arrive. No manual `REINDEX VECTOR` is required just because the table was empty at create time.
+If the table is empty, the index is still created immediately. Marmot serves fresh rows from the local overlay right away, then starts a local bootstrap watcher. Once enough indexable rows arrive and the overlay snapshot stops growing, Marmot trains the first probe set from that snapshot and publishes the first clustered generation automatically. No manual `REINDEX VECTOR` is required just because the table was empty at create time.
 
 ### REINDEX VECTOR
 
@@ -83,7 +84,7 @@ If the table is empty, the index is still created immediately. Marmot starts a l
 REINDEX VECTOR <index_name>;
 ```
 
-Retrains centroids from the current base-table rows, rewrites a new immutable local generation, and atomically swaps it into service. Old generations remain valid for existing readers until the new one is published.
+Retrains centroids from the current base-table rows, rewrites a new immutable local generation, and atomically swaps it into service. Old generations remain valid for existing readers until the new one is published. Normal empty-table growth and steady-state overlay merges do not require `REINDEX VECTOR`; they use the local incremental maintenance path.
 
 ### DROP VECTOR INDEX
 
@@ -126,7 +127,7 @@ Marmot uses two execution shapes:
 - **Pre-filter**: apply the scalar predicate first, then compute exact distance over the smaller filtered set.
 - **Post-filter**: probe IVF centroids, scan stable segment clusters plus the overlay, then exact-rerank a shortlist from the base table.
 
-The planner uses estimated predicate cardinality plus session overrides to choose between them.
+The planner uses estimated predicate cardinality plus session overrides to choose between them. In post-filter mode, Marmot chooses a probe prefix from the nearest clusters; with default auto-tuning that prefix is budget-driven rather than a fixed hard-coded `sqrt(nlist)` probe count.
 
 ## Session Variables
 
@@ -173,7 +174,7 @@ For `docs_embed_idx` on `docs(embed)`, Marmot stores local derived state under:
 What each file does:
 
 - `manifest/current`: points to the active generation.
-- `gen-*.mf`: manifest with index identity, centroid epoch, compressed centroid blob, checksums, and file names.
+- `gen-*.mf`: manifest with index identity, probe/stable centroid epochs and blobs, checksums, and file names.
 - `segments/gen-*.dat`: stable vector payload laid out by cluster.
 - `rowmap/gen-*.rmap`: rowid-to-stable-location map for rebuild and compaction.
 - `overlay/current.log`: append-only local overlay journal for recent committed mutations.
@@ -182,17 +183,17 @@ What each file does:
 
 For IVF post-filter queries:
 
-1. Load centroids from the active manifest into memory.
-2. Probe the nearest `nprobe` clusters.
+1. Load probe/stable centroid state from the active manifest into memory.
+2. Pick the nearest cluster prefix for this query, using either explicit `nprobe` or the auto-tuned scan budget.
 3. Read stable cluster payload from the segment file with `pread`.
 4. Merge the in-memory overlay snapshot.
-5. Exact-rerank the shortlist from the base table.
+5. Fetch the shortlist vectors from the base table, materialize them in Go, and exact-rerank there.
 
 The hot candidate scan is file-backed, not SQLite-row backed.
 
 ### Write Path
 
-Committed base-table inserts, updates, and deletes update the local overlay journal and overlay snapshot. Stable segment files are immutable; Marmot rewrites touched clusters into a new generation and publishes that generation atomically.
+Committed base-table inserts, updates, and deletes update the local overlay journal and overlay snapshot. Before the first clustered publish, queries read from the overlay only. After bootstrap, stable segment files remain immutable; Marmot rewrites touched clusters into a new generation, advances routing metadata, and publishes that generation atomically. Bounded cluster-count growth uses the same local generation machinery instead of a SQLite sidecar.
 
 ### Crash Safety
 
@@ -219,11 +220,15 @@ If local derived state is invalid, Marmot rebuilds it from the base table.
 
 Use `cmd/vec-bench` for local vector benchmarking. A meaningful run should always report the full bundle:
 
+- create time
+- first clustered publish time
+- final settled time
+- query-ready throughput
 - write throughput
 - read QPS
 - recall
 - p50 / p95 / p99 latency
-- RSS after build, warmup, and measurement
+- RSS after build, vector settle, warmup, and measurement
 - CPU profiles when relevant
 
 Example:
@@ -236,10 +241,11 @@ Example:
   --table=docs \
   --column=embed \
   --index=embed_idx \
+  --force-build \
   --insert-n=100000 \
+  --warmup=200 \
   --n-queries=500 \
   --query-concurrency=1 \
-  --nprobe=35 \
   --settle-timeout=10m \
   --profile-dir=/tmp/marmot/bench-active/prof
 ```
@@ -250,4 +256,5 @@ Example:
 - `LIMIT` is required with `vec_match`.
 - Base table must have `INTEGER PRIMARY KEY`.
 - Exact rerank still reads the shortlist vectors from the base table.
-- Initial bootstrap and large `REINDEX VECTOR` runs are still CPU- and memory-heavy because centroid training happens in-process.
+- Initial bootstrap, larger promotions, and `REINDEX VECTOR` are still CPU- and memory-heavy because centroid training happens in-process.
+- Raw insert throughput is not the same thing as final query-ready throughput; for create-on-empty runs, judge the system by the reported clustered-publish and settled milestones, not by insert speed alone.

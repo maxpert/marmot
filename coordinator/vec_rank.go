@@ -466,21 +466,25 @@ func (h *CoordinatorHandler) segmentRank(plan *GoRankPlan) ([]rankItem, bool, er
 		overlaySnapshot = overlay.Snapshot()
 	}
 
-	var cs *kmeans.CentroidSet
-	if segments != nil {
-		cs = segments.Centroids
+	var probeCentroids *kmeans.CentroidSet
+	if state != nil {
+		probeCentroids = state.ProbeState()
 	}
-	if cs == nil {
+	if probeCentroids == nil {
 		var err error
-		cs, err = h.loadProbeCentroids(plan)
+		probeCentroids, err = h.loadProbeCentroids(plan)
 		if err != nil {
 			return nil, false, err
 		}
 	}
-	plan.ProbeSet = cs
-	plan.ClusterIDs = selectProbeClusterIDs(plan, state, cs, segments)
+	plan.ProbeSet = probeCentroids
+	plan.ClusterIDs = selectProbeClusterIDs(plan, state, probeCentroids, segments)
 
 	if segments != nil && segments.Data != nil {
+		stableCentroids := segments.StableCentroids
+		if stableCentroids == nil {
+			stableCentroids = probeCentroids
+		}
 		scorerCache := make(map[int64]*vecindex.StableMemberScorer, len(plan.ClusterIDs))
 		var encodedScanErr error
 		if segmentEnc == vecindex.MemberEncodingResidualInt8 {
@@ -489,7 +493,7 @@ func (h *CoordinatorHandler) segmentRank(plan *GoRankPlan) ([]rankItem, bool, er
 				scorer, ok := scorerCache[clusterID]
 				if !ok {
 					var err error
-					scorer, err = vecindex.NewStableMemberScorer(plan.IndexSpec, cs, plan.QueryVec, plan.QueryNorm2, clusterID, segmentEnc)
+					scorer, err = vecindex.NewStableMemberScorer(plan.IndexSpec, stableCentroids, plan.QueryVec, plan.QueryNorm2, clusterID, segmentEnc)
 					if err != nil {
 						encodedScanErr = err
 						return false
@@ -537,7 +541,7 @@ func (h *CoordinatorHandler) segmentRank(plan *GoRankPlan) ([]rankItem, bool, er
 			scorer, ok := scorerCache[clusterID]
 			if !ok {
 				var err error
-				scorer, err = vecindex.NewStableMemberScorer(plan.IndexSpec, cs, plan.QueryVec, plan.QueryNorm2, clusterID, segmentEnc)
+				scorer, err = vecindex.NewStableMemberScorer(plan.IndexSpec, stableCentroids, plan.QueryVec, plan.QueryNorm2, clusterID, segmentEnc)
 				if err != nil {
 					encodedScanErr = err
 					return false
@@ -575,7 +579,7 @@ func (h *CoordinatorHandler) segmentRank(plan *GoRankPlan) ([]rankItem, bool, er
 				return true
 			})
 		}
-		if cs == nil || len(plan.ClusterIDs) == 0 {
+		if probeCentroids == nil || len(plan.ClusterIDs) == 0 {
 			overlaySnapshot.VisitAllAfter(appliedOverlaySeq, func(_clusterID, rowID int64, vec []byte) bool {
 				if len(vec) != len(plan.QueryVec)*4 {
 					return true

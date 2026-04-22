@@ -21,10 +21,11 @@ import (
 )
 
 type OpenedSegmentGeneration struct {
-	Manifest  *vecindex.SegmentManifest
-	Data      *vecindex.SegmentDataStore
-	RowMap    *vecindex.SegmentRowMap
-	Centroids *kmeans.CentroidSet
+	Manifest        *vecindex.SegmentManifest
+	Data            *vecindex.SegmentDataStore
+	RowMap          *vecindex.SegmentRowMap
+	ProbeCentroids  *kmeans.CentroidSet
+	StableCentroids *kmeans.CentroidSet
 }
 
 func segmentGenerationFromOpened(opened *OpenedSegmentGeneration) *vecindex.SegmentGeneration {
@@ -34,7 +35,8 @@ func segmentGenerationFromOpened(opened *OpenedSegmentGeneration) *vecindex.Segm
 	return &vecindex.SegmentGeneration{
 		Data:                     opened.Data,
 		RowMap:                   opened.RowMap,
-		Centroids:                opened.Centroids,
+		ProbeCentroids:           opened.ProbeCentroids,
+		StableCentroids:          opened.StableCentroids,
 		AppliedOverlaySeq:        opened.Manifest.AppliedOverlaySeq,
 		ClusterRowCounts:         append([]uint64(nil), opened.Manifest.ClusterRowCounts...),
 		ClusterVectorSums:        cloneClusterVectorSums(opened.Manifest.ClusterVectorSums),
@@ -210,9 +212,15 @@ func openSegmentGeneration(dir string, meta common.VectorIndexMeta, spec vecinde
 	if err := validateSegmentFile(rowMapPath, manifest.RowMapFileSize, manifest.RowMapFileSHA256); err != nil {
 		return nil, err
 	}
-	centroids, err := vecindex.DecodeCentroidBlob(manifest.CentroidBlob)
+	manifest.NormalizeCentroidFields()
+
+	probeCentroids, err := vecindex.DecodeCentroidBlob(manifest.ProbeBlobValue())
 	if err != nil {
-		return nil, fmt.Errorf("segment store decode centroids: %w", err)
+		return nil, fmt.Errorf("segment store decode probe centroids: %w", err)
+	}
+	stableCentroids, err := vecindex.DecodeCentroidBlob(manifest.StableBlobValue())
+	if err != nil {
+		return nil, fmt.Errorf("segment store decode stable centroids: %w", err)
 	}
 
 	dataStore, err := vecindex.OpenSegmentDataStore(dataPath)
@@ -224,16 +232,17 @@ func openSegmentGeneration(dir string, meta common.VectorIndexMeta, spec vecinde
 		_ = dataStore.Close()
 		return nil, err
 	}
-	if err := validateOpenedSegmentGeneration(manifest, dataStore, rowMap, centroids, meta, spec, expectedEpoch); err != nil {
+	if err := validateOpenedSegmentGeneration(manifest, dataStore, rowMap, probeCentroids, stableCentroids, meta, spec, expectedEpoch); err != nil {
 		_ = dataStore.Close()
 		_ = rowMap.Close()
 		return nil, err
 	}
 	return &OpenedSegmentGeneration{
-		Manifest:  manifest,
-		Data:      dataStore,
-		RowMap:    rowMap,
-		Centroids: centroids,
+		Manifest:        manifest,
+		Data:            dataStore,
+		RowMap:          rowMap,
+		ProbeCentroids:  probeCentroids,
+		StableCentroids: stableCentroids,
 	}, nil
 }
 
@@ -250,7 +259,7 @@ func loadCurrentManifest(dir string) (*vecindex.SegmentCurrent, *vecindex.Segmen
 	if err != nil {
 		return nil, nil, err
 	}
-	if current.Version != vecindex.SegmentStoreVersion {
+	if current.Version != vecindex.SegmentStoreVersion && current.Version != vecindex.SegmentStoreV1Compat() {
 		return nil, nil, fmt.Errorf("segment current version %d unsupported", current.Version)
 	}
 	if !isSafeSegmentFile(current.ManifestFile) {
@@ -264,6 +273,7 @@ func loadCurrentManifest(dir string) (*vecindex.SegmentCurrent, *vecindex.Segmen
 	if err != nil {
 		return nil, nil, err
 	}
+	manifest.NormalizeCentroidFields()
 	if current.Generation != manifest.Generation {
 		return nil, nil, fmt.Errorf("segment current generation mismatch")
 	}
@@ -274,9 +284,10 @@ func validateSegmentManifest(manifest *vecindex.SegmentManifest, meta common.Vec
 	if manifest == nil {
 		return fmt.Errorf("segment manifest missing")
 	}
-	if manifest.Version != vecindex.SegmentStoreVersion {
+	if manifest.Version != vecindex.SegmentStoreVersion && manifest.Version != vecindex.SegmentStoreV1Compat() {
 		return fmt.Errorf("segment manifest version %d unsupported", manifest.Version)
 	}
+	manifest.NormalizeCentroidFields()
 	if manifest.Database != meta.Database {
 		return fmt.Errorf("segment manifest database mismatch")
 	}
@@ -292,14 +303,20 @@ func validateSegmentManifest(manifest *vecindex.SegmentManifest, meta common.Vec
 	if manifest.Dim != uint32(meta.Dim) || manifest.InternalDim != uint32(spec.InternalDim()) {
 		return fmt.Errorf("segment manifest dimension mismatch")
 	}
-	if manifest.CentroidEpoch == 0 {
-		return fmt.Errorf("segment manifest centroid epoch missing")
+	if manifest.ProbeEpochValue() == 0 {
+		return fmt.Errorf("segment manifest probe centroid epoch missing")
 	}
-	if len(manifest.CentroidBlob) == 0 {
-		return fmt.Errorf("segment manifest centroid blob missing")
+	if len(manifest.ProbeBlobValue()) == 0 {
+		return fmt.Errorf("segment manifest probe centroid blob missing")
 	}
-	if expectedEpoch != 0 && manifest.CentroidEpoch != expectedEpoch {
-		return fmt.Errorf("segment manifest centroid epoch mismatch")
+	if manifest.StableEpochValue() == 0 {
+		return fmt.Errorf("segment manifest stable centroid epoch missing")
+	}
+	if len(manifest.StableBlobValue()) == 0 {
+		return fmt.Errorf("segment manifest stable centroid blob missing")
+	}
+	if expectedEpoch != 0 && manifest.ProbeEpochValue() != expectedEpoch {
+		return fmt.Errorf("segment manifest probe centroid epoch mismatch")
 	}
 	if manifest.Generation == 0 {
 		return fmt.Errorf("segment manifest generation missing")
@@ -335,11 +352,17 @@ func validatePublishableSegmentManifest(manifest *vecindex.SegmentManifest) erro
 	if manifest.Dim == 0 || manifest.InternalDim == 0 {
 		return fmt.Errorf("missing dimensions")
 	}
-	if manifest.CentroidEpoch == 0 {
-		return fmt.Errorf("missing centroid epoch")
+	if manifest.ProbeEpochValue() == 0 {
+		return fmt.Errorf("missing probe centroid epoch")
 	}
-	if len(manifest.CentroidBlob) == 0 {
-		return fmt.Errorf("missing centroid blob")
+	if len(manifest.ProbeBlobValue()) == 0 {
+		return fmt.Errorf("missing probe centroid blob")
+	}
+	if manifest.StableEpochValue() == 0 {
+		return fmt.Errorf("missing stable centroid epoch")
+	}
+	if len(manifest.StableBlobValue()) == 0 {
+		return fmt.Errorf("missing stable centroid blob")
 	}
 	if manifest.Generation == 0 {
 		return fmt.Errorf("missing generation")
@@ -363,31 +386,39 @@ func validateOpenedSegmentGeneration(
 	manifest *vecindex.SegmentManifest,
 	dataStore *vecindex.SegmentDataStore,
 	rowMap *vecindex.SegmentRowMap,
-	centroids *kmeans.CentroidSet,
+	probeCentroids *kmeans.CentroidSet,
+	stableCentroids *kmeans.CentroidSet,
 	meta common.VectorIndexMeta,
 	spec vecindex.IVFSpec,
 	expectedEpoch uint64,
 ) error {
-	if dataStore == nil || rowMap == nil || centroids == nil {
+	if dataStore == nil || rowMap == nil || probeCentroids == nil || stableCentroids == nil {
 		return fmt.Errorf("segment store missing opened files")
 	}
+	manifest.NormalizeCentroidFields()
 	if dataStore.Generation() != manifest.Generation || rowMap.Generation() != manifest.Generation {
 		return fmt.Errorf("segment store header generation mismatch")
 	}
-	if dataStore.Epoch() != manifest.CentroidEpoch || rowMap.Epoch() != manifest.CentroidEpoch {
+	if dataStore.Epoch() != manifest.StableEpochValue() || rowMap.Epoch() != manifest.StableEpochValue() {
 		return fmt.Errorf("segment store header epoch mismatch")
 	}
-	if expectedEpoch != 0 && dataStore.Epoch() != expectedEpoch {
-		return fmt.Errorf("segment store expected epoch mismatch")
+	if expectedEpoch != 0 && manifest.ProbeEpochValue() != expectedEpoch {
+		return fmt.Errorf("segment probe expected epoch mismatch")
 	}
-	if centroids.Epoch() != manifest.CentroidEpoch {
-		return fmt.Errorf("segment centroid epoch mismatch")
+	if probeCentroids.Epoch() != manifest.ProbeEpochValue() {
+		return fmt.Errorf("segment probe centroid epoch mismatch")
+	}
+	if stableCentroids.Epoch() != manifest.StableEpochValue() {
+		return fmt.Errorf("segment stable centroid epoch mismatch")
 	}
 	if dataStore.Dim() != meta.Dim || dataStore.InternalDim() != spec.InternalDim() {
 		return fmt.Errorf("segment store header dimension mismatch")
 	}
-	if centroids.Len() != int(manifest.MaxCluster) {
-		return fmt.Errorf("segment centroid count mismatch")
+	if probeCentroids.Len() != int(manifest.MaxCluster) {
+		return fmt.Errorf("segment probe centroid count mismatch")
+	}
+	if stableCentroids.Len() != int(manifest.MaxCluster) {
+		return fmt.Errorf("segment stable centroid count mismatch")
 	}
 	if int(manifest.MaxCluster) != dataStore.MaxCluster() {
 		return fmt.Errorf("segment store cluster count mismatch")
@@ -404,7 +435,18 @@ func validateOpenedSegmentGeneration(
 	}
 	if len(manifest.ClusterVectorSums) > 0 {
 		for clusterID := 1; clusterID <= dataStore.MaxCluster(); clusterID++ {
-			if len(manifest.ClusterVectorSums[clusterID]) != spec.InternalDim() {
+			sumLen := len(manifest.ClusterVectorSums[clusterID])
+			rowCount := uint64(0)
+			if len(manifest.ClusterRowCounts) > clusterID {
+				rowCount = manifest.ClusterRowCounts[clusterID]
+			}
+			if rowCount == 0 {
+				if sumLen != 0 && sumLen != spec.InternalDim() {
+					return fmt.Errorf("segment cluster %d vector-sum dim mismatch", clusterID)
+				}
+				continue
+			}
+			if sumLen != spec.InternalDim() {
 				return fmt.Errorf("segment cluster %d vector-sum dim mismatch", clusterID)
 			}
 		}
@@ -758,8 +800,10 @@ SELECT rowid, %s
 		Metric:                   meta.Metric,
 		Dim:                      uint32(meta.Dim),
 		InternalDim:              uint32(spec.InternalDim()),
-		CentroidEpoch:            expectedEpoch,
-		CentroidBlob:             mustCentroidBlob(cs),
+		ProbeCentroidEpoch:       expectedEpoch,
+		ProbeCentroidBlob:        mustCentroidBlob(cs),
+		StableCentroidEpoch:      expectedEpoch,
+		StableCentroidBlob:       mustCentroidBlob(cs),
 		AppliedOverlaySeq:        appliedOverlaySeq,
 		Generation:               generation,
 		MaxCluster:               uint32(maxCluster),
@@ -1065,7 +1109,7 @@ func loadStablePreparedForMaintenance(segments *vecindex.SegmentGeneration, spec
 	if readRowID != rowID {
 		return 0, nil, fmt.Errorf("stable maintenance row mismatch: got %d want %d", readRowID, rowID)
 	}
-	prepared, err := decodeStableMemberPrepared(spec, segments.Centroids, loc.ClusterID, vecBytes)
+	prepared, err := decodeStableMemberPrepared(spec, segments.StableCentroids, loc.ClusterID, vecBytes)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -1085,10 +1129,9 @@ func BuildSegmentGenerationOnReopen(
 	}
 	dir := vecindex.SegmentStoreDir(dbPath, meta.IndexName)
 	if generation, err := openSegmentGeneration(dir, meta, spec, state.ProbeVersion()); err == nil && generation != nil {
-		state.SwapProbeState(generation.Centroids)
-		state.ResetDriftState(generation.Centroids)
+		state.SwapProbeState(generation.ProbeCentroids)
 		state.StoreSegmentStore(segmentGenerationFromOpened(generation))
-		if err := openAndStoreOverlay(dbPath, meta.IndexName, state, generation.Manifest.CentroidEpoch); err != nil {
+		if err := openAndStoreOverlay(dbPath, meta.IndexName, state, generation.Manifest.ProbeEpochValue()); err != nil {
 			return err
 		}
 		return nil

@@ -88,6 +88,40 @@ func insertDocVectorRows(t *testing.T, db *sql.DB, n int) {
 	require.NoError(t, tx.Commit())
 }
 
+type overlayMirrorRow struct {
+	rowID int64
+	vec   []float32
+}
+
+func mirrorRowsToOverlay(t *testing.T, hook *EngineHook, meta common.VectorIndexMeta, rows []overlayMirrorRow) {
+	t.Helper()
+
+	state, spec, err := hook.ensureIndexState(context.Background(), meta)
+	require.NoError(t, err)
+	require.NotNil(t, state)
+
+	overlay := state.LoadOverlay()
+	require.NotNil(t, overlay)
+	snapshot := overlay.Snapshot()
+	nextSequence := uint64(1)
+	if snapshot != nil {
+		nextSequence = snapshot.LastSequence() + 1
+	}
+
+	mutations := make([]vecindex.OverlayMutation, 0, len(rows))
+	appliedAtUnixNano := time.Now().UnixNano()
+	for _, row := range rows {
+		mutation, err := buildUpsertMutation(state, spec, state.ProbeVersion(), row.rowID, encodeVec(t, row.vec), nextSequence)
+		require.NoError(t, err)
+		mutation.AppliedAtUnixNano = appliedAtUnixNano
+		mutations = append(mutations, mutation)
+		nextSequence++
+	}
+
+	require.NoError(t, overlay.ApplyCommittedBatch(mutations))
+	state.RecordRowsModified(uint64(countUniqueMutationRows(mutations)))
+}
+
 func cleanupIndexWatchers(t *testing.T, hook *EngineHook, dbMgr *DatabaseManager, database, indexName string) {
 	t.Helper()
 	if hook == nil || dbMgr == nil {
@@ -257,12 +291,16 @@ func TestCreateIndex_EmptyTableAutoBootstrapsOnInsert(t *testing.T) {
 	require.Zero(t, state.ProbeVersion(), "empty create may start without centroids, but must bootstrap automatically")
 
 	const bootstrapRows = 4096
+	mirrorRows := make([]overlayMirrorRow, 0, bootstrapRows)
 	for i := 0; i < bootstrapRows; i++ {
-		_, err := conn.Exec(`INSERT INTO docs (id, embed) VALUES (?, ?)`, i+1, encodeVec(t, []float32{
+		vec := []float32{
 			1, float32(i % 7), float32((i + 1) % 11), float32((i + 2) % 13),
-		}))
+		}
+		_, err := conn.Exec(`INSERT INTO docs (id, embed) VALUES (?, ?)`, i+1, encodeVec(t, vec))
 		require.NoError(t, err)
+		mirrorRows = append(mirrorRows, overlayMirrorRow{rowID: int64(i + 1), vec: vec})
 	}
+	mirrorRowsToOverlay(t, hook, meta, mirrorRows)
 
 	ok = false
 	deadline := time.Now().Add(30 * time.Second)
@@ -280,11 +318,27 @@ func TestCreateIndex_EmptyTableAutoBootstrapsOnInsert(t *testing.T) {
 		state, stateOK := engine.Lookup(meta.IndexName)
 		probeVersion := uint64(0)
 		hasSegment := false
+		overlayEpoch := uint64(0)
+		overlayRows := 0
+		overlaySeq := uint64(0)
 		if stateOK {
 			probeVersion = state.ProbeVersion()
 			hasSegment = state.LoadSegmentStore() != nil
+			if overlay := state.LoadOverlay(); overlay != nil && overlay.Snapshot() != nil {
+				snapshot := overlay.Snapshot()
+				overlayEpoch = snapshot.Epoch()
+				overlayRows = snapshot.Len()
+				overlaySeq = snapshot.LastSequence()
+			}
 		}
-		t.Fatalf("empty-table index did not auto-bootstrap: probeVersion=%d hasSegment=%v", probeVersion, hasSegment)
+		t.Fatalf(
+			"empty-table index did not auto-bootstrap: probeVersion=%d hasSegment=%v overlayEpoch=%d overlayRows=%d overlaySeq=%d",
+			probeVersion,
+			hasSegment,
+			overlayEpoch,
+			overlayRows,
+			overlaySeq,
+		)
 	}
 }
 
@@ -335,12 +389,16 @@ func TestCreateIndex_EmptyTableAutoTuneBootstrapsAtTargetPartitionFloor(t *testi
 	require.Zero(t, state.ProbeVersion(), "empty create may start without centroids, but must bootstrap automatically")
 
 	const bootstrapRows = bootstrapMinTargetPartitions * 128
+	mirrorRows := make([]overlayMirrorRow, 0, bootstrapRows)
 	for i := 0; i < bootstrapRows-1; i++ {
-		_, err := conn.Exec(`INSERT INTO docs (id, embed) VALUES (?, ?)`, i+1, encodeVec(t, []float32{
+		vec := []float32{
 			1, float32(i % 5), float32((i + 1) % 7), float32((i + 2) % 11),
-		}))
+		}
+		_, err := conn.Exec(`INSERT INTO docs (id, embed) VALUES (?, ?)`, i+1, encodeVec(t, vec))
 		require.NoError(t, err)
+		mirrorRows = append(mirrorRows, overlayMirrorRow{rowID: int64(i + 1), vec: vec})
 	}
+	mirrorRowsToOverlay(t, hook, meta, mirrorRows)
 
 	time.Sleep(750 * time.Millisecond)
 
@@ -349,10 +407,11 @@ func TestCreateIndex_EmptyTableAutoTuneBootstrapsAtTargetPartitionFloor(t *testi
 	require.Zero(t, state.ProbeVersion(), "auto bootstrap should wait for the minimum target-sized training set")
 	require.Nil(t, state.LoadSegmentStore(), "segment store should not publish before the bootstrap floor is reached")
 
-	_, err = conn.Exec(`INSERT INTO docs (id, embed) VALUES (?, ?)`, bootstrapRows, encodeVec(t, []float32{
-		1, 0, 1, 2,
-	}))
+	lastVec := []float32{1, 0, 1, 2}
+	_, err = conn.Exec(`INSERT INTO docs (id, embed) VALUES (?, ?)`, bootstrapRows, encodeVec(t, lastVec))
 	require.NoError(t, err)
+	mirrorRows = append(mirrorRows, overlayMirrorRow{rowID: int64(bootstrapRows), vec: lastVec})
+	mirrorRowsToOverlay(t, hook, meta, mirrorRows)
 
 	require.Eventually(t, func() bool {
 		state, ok := engine.Lookup(meta.IndexName)
@@ -417,6 +476,19 @@ func TestBootstrapOnce_RetriesAfterSegmentPublishFailure(t *testing.T) {
 	require.NoError(t, err)
 
 	require.NoError(t, BulkPopulate(context.Background(), conn, engine, 0, meta.TableName, meta.ColumnName, spec, meta.TargetPartitionSize))
+	mirrorRows := make([]overlayMirrorRow, 0, 32)
+	for i := 1; i <= 32; i++ {
+		mirrorRows = append(mirrorRows, overlayMirrorRow{
+			rowID: int64(i),
+			vec: []float32{
+				float32(i % 11),
+				float32((i * 3) % 17),
+				float32((i * 5) % 19),
+				float32((i * 7) % 23),
+			},
+		})
+	}
+	mirrorRowsToOverlay(t, hook, meta, mirrorRows)
 
 	state, ok := engine.Lookup(meta.IndexName)
 	require.True(t, ok)
@@ -426,13 +498,14 @@ func TestBootstrapOnce_RetriesAfterSegmentPublishFailure(t *testing.T) {
 	dbPath, err := dbMgr.GetDatabasePath(meta.Database)
 	require.NoError(t, err)
 	segmentDir := vecindex.SegmentStoreDir(dbPath, meta.IndexName)
-	require.NoError(t, os.WriteFile(segmentDir, []byte("blocker"), 0o644))
+	blockerPath := filepath.Join(segmentDir, "manifest")
+	require.NoError(t, os.WriteFile(blockerPath, []byte("blocker"), 0o644))
 
 	retry := hook.bootstrapOnce(context.Background(), meta, spec)
 	require.False(t, retry, "bootstrap should keep retrying after a transient segment publish failure")
 	require.Nil(t, state.LoadSegmentStore(), "failed publish must not install a partial segment generation")
 
-	require.NoError(t, os.Remove(segmentDir))
+	require.NoError(t, os.Remove(blockerPath))
 	require.True(t, hook.bootstrapOnce(context.Background(), meta, spec), "bootstrap should complete once the publish blocker is removed")
 	require.NotNil(t, state.LoadSegmentStore())
 	hook.stopMaintenanceWatcher(meta.IndexName)

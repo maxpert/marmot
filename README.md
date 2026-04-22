@@ -475,7 +475,7 @@ CREATE TABLE docs (
     status TEXT
 );
 
--- One-line DDL. nlist/nprobe auto-tune from the current corpus.
+-- One-line DDL. nlist/nprobe auto-tune from the current indexable corpus and target partition size.
 CREATE VECTOR INDEX docs_embed ON docs(embed) DIM 1536 METRIC cosine;
 
 -- Query composes with ordinary WHERE / LIMIT / JOIN.
@@ -540,15 +540,17 @@ SELECT id, title
 - **Local derived state**: the exact embedding stays in your base table; Marmot builds local centroids, immutable segment files, row maps, manifests, and an overlay journal for fast reads.
 - **No SQLite vector sidecar**: ANN candidate serving does not read vector payload from SQLite side tables.
 - **Crash-safe publish**: stable generations are written immutably and published through a Lucene-style manifest/current swap.
-- **Automatic empty-table bootstrap**: if you create an index before loading rows, Marmot publishes the first centroid/segment generation automatically once enough indexable rows arrive.
-- **Manual retrain**: `REINDEX VECTOR` retrains centroids and republishes a new local generation.
+- **Automatic empty-table bootstrap**: if you create an index before loading rows, Marmot serves fresh rows from the overlay immediately and publishes the first clustered generation automatically once enough indexable rows arrive and the local overlay snapshot stabilizes.
+- **Incremental local maintenance**: background maintenance folds overlay rows into new stable generations and can grow cluster count incrementally as the corpus grows.
+- **Manual retrain**: `REINDEX VECTOR` remains the explicit full retrain path.
 
 ### Runtime Model
 
 - **Base table**: your embedding BLOB remains the user-visible, replicated source of truth.
 - **Local segment store**: stable vectors live in immutable `.vecseg` generations (`manifest/current`, `segments`, `rowmap`).
 - **Overlay journal**: committed local writes land in a local overlay log and are merged into reads immediately.
-- **Exact rerank**: the final shortlist is reranked from the base table, so only the base table keeps the exact vector payload.
+- **Overlay-first bootstrap**: empty-table create starts with overlay-only visibility, then bootstraps the first clustered generation from the local overlay snapshot.
+- **Exact rerank**: the final shortlist is fetched from the base table, materialized in Go, and reranked exactly there, so only the base table keeps the exact vector payload.
 
 ### Controls
 

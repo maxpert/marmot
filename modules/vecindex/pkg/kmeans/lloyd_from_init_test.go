@@ -8,10 +8,10 @@ import (
 	"github.com/maxpert/marmot/modules/vecindex/pkg/metric"
 )
 
-// TestLloydFromInit_DeterministicWarmStart locks the contract from design
-// §8.3 step 2 (fix G): k-means during REINDEX initialises from driftState
-// centroids rather than running k-means++ afresh. Given the same inputs,
-// repeated calls must produce byte-identical output.
+// TestLloydFromInit_DeterministicWarmStart locks the contract that REINDEX
+// warm-starts from an explicit centroid seed rather than running k-means++
+// afresh. Given the same inputs, repeated calls must produce byte-identical
+// output.
 func TestLloydFromInit_DeterministicWarmStart(t *testing.T) {
 	t.Parallel()
 
@@ -100,8 +100,8 @@ func TestLloydFromInit_ConvergesToCentroids(t *testing.T) {
 }
 
 // TestLloydFromInit_PreservesCentroidCount proves that warm-start is
-// count-stable: driftState with k centroids must yield exactly k centroids
-// after warm-start, or the §8.3 swap step will produce a mismatched
+// count-stable: a seed with k centroids must yield exactly k centroids
+// after warm-start, or the swap step will produce a mismatched
 // member-cluster universe.
 func TestLloydFromInit_PreservesCentroidCount(t *testing.T) {
 	t.Parallel()
@@ -123,8 +123,8 @@ func TestLloydFromInit_PreservesCentroidCount(t *testing.T) {
 }
 
 // TestLloydFromInit_InputValidation covers the failure modes the REINDEX
-// pipeline may stumble on — empty staging sample, empty drift seed,
-// dimension mismatch between drift and sample.
+// pipeline may stumble on — empty staging sample, empty warm-start seed,
+// dimension mismatch between seed and sample.
 func TestLloydFromInit_InputValidation(t *testing.T) {
 	t.Parallel()
 

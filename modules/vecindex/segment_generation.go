@@ -7,7 +7,8 @@ import "github.com/maxpert/marmot/modules/vecindex/pkg/kmeans"
 type SegmentGeneration struct {
 	Data                     *SegmentDataStore
 	RowMap                   *SegmentRowMap
-	Centroids                *kmeans.CentroidSet
+	ProbeCentroids           *kmeans.CentroidSet
+	StableCentroids          *kmeans.CentroidSet
 	AppliedOverlaySeq        uint64
 	ClusterRowCounts         []uint64
 	ClusterVectorSums        [][]float32
