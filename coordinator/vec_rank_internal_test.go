@@ -1,91 +1,160 @@
-//go:build sqlite_preupdate_hook
-// +build sqlite_preupdate_hook
-
 package coordinator
 
 import (
-	"database/sql"
 	"testing"
 
-	"github.com/maxpert/marmot/protocol/query/transform"
+	"github.com/maxpert/marmot/modules/vecindex"
+	"github.com/maxpert/marmot/modules/vecindex/pkg/kmeans"
 )
 
-type directPKDBManagerStub struct {
-	pk string
-}
-
-func (s directPKDBManagerStub) ListDatabases() []string                            { return nil }
-func (s directPKDBManagerStub) DatabaseExists(name string) bool                    { return false }
-func (s directPKDBManagerStub) CreateDatabase(name string) error                   { return nil }
-func (s directPKDBManagerStub) DropDatabase(name string) error                     { return nil }
-func (s directPKDBManagerStub) GetDatabaseConnection(name string) (*sql.DB, error) { return nil, nil }
-func (s directPKDBManagerStub) GetDatabaseReadConnection(name string) (*sql.DB, error) {
-	return nil, nil
-}
-func (s directPKDBManagerStub) GetReplicatedDatabase(name string) (ReplicatedDatabaseProvider, error) {
-	return nil, nil
-}
-func (s directPKDBManagerStub) GetAutoIncrementColumn(database, table string) (string, error) {
-	return s.pk, nil
-}
-func (s directPKDBManagerStub) GetTranspilerSchema(database, table string) (*transform.SchemaInfo, error) {
-	return nil, nil
-}
-func (s directPKDBManagerStub) GetVectorIndexManager() VectorIndexManagerProvider { return nil }
-
-func TestTryDirectPKResult(t *testing.T) {
+func TestRefreshProbeClusterIDs_ReprobesOnEpochChange(t *testing.T) {
 	t.Parallel()
 
-	h := &CoordinatorHandler{dbManager: directPKDBManagerStub{pk: "id"}}
-	plan := &GoRankPlan{
-		Database:       "dbpedia",
-		BaseTable:      "docs",
-		DirectPKColumn: "id",
-		DirectPKLabel:  "id",
+	cs, err := kmeans.NewCentroidSet(3, [][]float32{{0}, {10}, {20}})
+	if err != nil {
+		t.Fatalf("NewCentroidSet: %v", err)
 	}
-	topK := []rankItem{
-		{rowid: 7, dist: 0.1},
-		{rowid: 2, dist: 0.2},
-		{rowid: 9, dist: 0.3},
+	state := vecindex.NewIndexState(vecindex.IVFSpec{
+		ID:     "idx",
+		Dim:    1,
+		Metric: vecindex.MetricL2,
+		Nlist:  3,
+		Nprobe: 2,
+	}, cs)
+
+	plan := &GoRankPlan{
+		RawQueryVec: []byte{0, 0, 16, 65}, // 9.0
+		Nprobe:      2,
+		ProbeEpoch:  1,
+		ClusterIDs:  []int64{1, 3},
 	}
 
-	rs, ok, err := h.tryDirectPKResult(plan, topK)
+	got := (&CoordinatorHandler{}).refreshProbeClusterIDs(plan, state)
+	want := []int64{2, 1}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("refreshProbeClusterIDs() = %v, want %v", got, want)
+	}
+	if plan.ProbeEpoch != 3 {
+		t.Fatalf("ProbeEpoch = %d, want 3", plan.ProbeEpoch)
+	}
+}
+
+func TestRefreshProbeClusterIDs_LeavesPlanOnSameEpoch(t *testing.T) {
+	t.Parallel()
+
+	cs, err := kmeans.NewCentroidSet(1, [][]float32{{0}, {10}, {20}})
 	if err != nil {
-		t.Fatalf("tryDirectPKResult returned error: %v", err)
+		t.Fatalf("NewCentroidSet: %v", err)
 	}
-	if !ok {
-		t.Fatalf("tryDirectPKResult should match autoincrement primary key")
+	state := vecindex.NewIndexState(vecindex.IVFSpec{
+		ID:     "idx",
+		Dim:    1,
+		Metric: vecindex.MetricL2,
+		Nlist:  3,
+		Nprobe: 2,
+	}, cs)
+
+	plan := &GoRankPlan{
+		RawQueryVec: []byte{0, 0, 16, 65}, // 9.0
+		Nprobe:      2,
+		ProbeEpoch:  1,
+		ClusterIDs:  []int64{1, 3},
 	}
-	if len(rs.Columns) != 1 || rs.Columns[0].Name != "id" {
-		t.Fatalf("unexpected columns: %#v", rs.Columns)
+
+	got := (&CoordinatorHandler{}).refreshProbeClusterIDs(plan, state)
+	want := []int64{1, 3}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("refreshProbeClusterIDs() = %v, want %v", got, want)
 	}
-	if got, want := rs.Rows, [][]interface{}{{int64(7)}, {int64(2)}, {int64(9)}}; len(got) != len(want) {
-		t.Fatalf("row count mismatch: got=%d want=%d", len(got), len(want))
-	} else {
-		for i := range want {
-			if got[i][0] != want[i][0] {
-				t.Fatalf("row %d mismatch: got=%v want=%v", i, got[i], want[i])
-			}
+	if plan.ProbeEpoch != 1 {
+		t.Fatalf("ProbeEpoch = %d, want 1", plan.ProbeEpoch)
+	}
+}
+
+func TestSelectProbeClusterIDs_UsesRowBudget(t *testing.T) {
+	t.Parallel()
+
+	cs, err := kmeans.NewCentroidSet(7, [][]float32{{0}, {10}, {20}, {30}})
+	if err != nil {
+		t.Fatalf("NewCentroidSet: %v", err)
+	}
+	spec := vecindex.IVFSpec{
+		ID:     "idx",
+		Dim:    1,
+		Metric: vecindex.MetricL2,
+		Nlist:  4,
+		Nprobe: 4,
+	}
+	state := vecindex.NewIndexState(spec, cs)
+	state.StoreMaintenanceState(&vecindex.MaintenanceState{
+		ClusterRowCounts: []uint64{0, 7000, 900, 500, 6000},
+	})
+	plan := &GoRankPlan{
+		QueryVec:            []float32{9},
+		IndexSpec:           spec,
+		UseBudgetProbe:      true,
+		ScanBudgetRows:      8192,
+		TargetPartitionSize: 512,
+		ClusterIDs:          []int64{4},
+		ProbeEpoch:          1,
+	}
+
+	got := selectProbeClusterIDs(plan, state, cs, &vecindex.SegmentGeneration{
+		ClusterRowCounts: []uint64{0, 7000, 900, 500, 6000},
+	})
+	want := []int64{2, 1, 3}
+	if len(got) != len(want) {
+		t.Fatalf("selectProbeClusterIDs() len=%d, want %d (%v)", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("selectProbeClusterIDs()[%d] = %d, want %d (full=%v)", i, got[i], want[i], got)
 		}
 	}
+	if plan.ProbeEpoch != 7 {
+		t.Fatalf("ProbeEpoch = %d, want 7", plan.ProbeEpoch)
+	}
 }
 
-func TestTryDirectPKResult_SkipsNonPKProjection(t *testing.T) {
+func TestSelectProbeClusterIDs_UsesLiveMaintenanceCounts(t *testing.T) {
 	t.Parallel()
 
-	h := &CoordinatorHandler{dbManager: directPKDBManagerStub{pk: "id"}}
+	cs, err := kmeans.NewCentroidSet(9, [][]float32{{0}, {10}, {20}})
+	if err != nil {
+		t.Fatalf("NewCentroidSet: %v", err)
+	}
+	spec := vecindex.IVFSpec{
+		ID:     "idx",
+		Dim:    1,
+		Metric: vecindex.MetricL2,
+		Nlist:  3,
+		Nprobe: 3,
+	}
+	state := vecindex.NewIndexState(spec, cs)
+	state.StoreMaintenanceState(&vecindex.MaintenanceState{
+		ClusterRowCounts:       []uint64{0, 7000, 0, 0},
+		PendingClusterRowDelta: []int64{0, 0, 1500, 0},
+	})
 	plan := &GoRankPlan{
-		Database:       "dbpedia",
-		BaseTable:      "docs",
-		DirectPKColumn: "other_id",
-		DirectPKLabel:  "other_id",
+		QueryVec:            []float32{9},
+		IndexSpec:           spec,
+		UseBudgetProbe:      true,
+		ScanBudgetRows:      8192,
+		TargetPartitionSize: 512,
+		ClusterIDs:          []int64{3},
+		ProbeEpoch:          1,
 	}
 
-	rs, ok, err := h.tryDirectPKResult(plan, []rankItem{{rowid: 1, dist: 0}})
-	if err != nil {
-		t.Fatalf("tryDirectPKResult returned error: %v", err)
+	got := selectProbeClusterIDs(plan, state, cs, &vecindex.SegmentGeneration{
+		ClusterRowCounts: []uint64{0, 7000, 0, 0},
+	})
+	want := []int64{2, 1}
+	if len(got) != len(want) {
+		t.Fatalf("selectProbeClusterIDs() len=%d, want %d (%v)", len(got), len(want), got)
 	}
-	if ok || rs != nil {
-		t.Fatalf("tryDirectPKResult should skip non-primary-key projections, got ok=%v rs=%#v", ok, rs)
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("selectProbeClusterIDs()[%d] = %d, want %d (full=%v)", i, got[i], want[i], got)
+		}
 	}
 }

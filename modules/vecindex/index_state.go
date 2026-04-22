@@ -28,6 +28,7 @@ type IndexState struct {
 	driftTracker atomic.Pointer[DriftTracker]
 	overlay      atomic.Pointer[JournaledOverlay]
 	segmentStore atomic.Pointer[SegmentGeneration]
+	maintenance  atomic.Pointer[MaintenanceState]
 	clusterHits  []atomic.Uint64
 }
 
@@ -41,6 +42,7 @@ func NewIndexState(spec IVFSpec, cs *kmeans.CentroidSet) *IndexState {
 	s.probeState.Store(cs)
 	s.driftState.Store(cs)
 	s.overlay.Store(nil)
+	s.maintenance.Store(&MaintenanceState{})
 	if cs != nil {
 		s.driftTracker.Store(NewDriftTracker(cs.Snapshot()))
 	}
@@ -148,6 +150,35 @@ func (s *IndexState) ClearOverlay() {
 	}
 }
 
+func (s *IndexState) LoadMaintenanceState() *MaintenanceState {
+	return s.maintenance.Load()
+}
+
+func (s *IndexState) StoreMaintenanceState(ms *MaintenanceState) {
+	if ms == nil {
+		ms = &MaintenanceState{}
+	}
+	s.maintenance.Store(ms.Clone())
+}
+
+func (s *IndexState) RecordRowsModified(delta uint64) {
+	if delta == 0 {
+		return
+	}
+	if current := s.maintenance.Load(); current != nil {
+		current.RecordRowsModified(delta)
+	}
+}
+
+func (s *IndexState) RecordClusterMutation(oldCluster int64, oldVec []float32, newCluster int64, newVec []float32) {
+	if oldCluster <= 0 && newCluster <= 0 {
+		return
+	}
+	if current := s.maintenance.Load(); current != nil {
+		current.RecordClusterMutation(oldCluster, oldVec, newCluster, newVec)
+	}
+}
+
 // LoadSegmentStore returns the active stable on-disk generation snapshot.
 func (s *IndexState) LoadSegmentStore() *SegmentGeneration {
 	return s.segmentStore.Load()
@@ -163,6 +194,16 @@ func (s *IndexState) StoreSegmentStore(generation *SegmentGeneration) {
 		if len(warmClusters) > 0 {
 			_ = generation.Data.WarmClusters(warmClusters, 16<<20)
 		}
+	}
+	if generation != nil {
+		nextMaintenance := &MaintenanceState{
+			ClusterRowCounts:         append([]uint64(nil), generation.ClusterRowCounts...),
+			ClusterVectorSums:        cloneVectorSums(generation.ClusterVectorSums),
+			RowsModifiedSinceRebuild: generation.RowsModifiedSinceRebuild,
+			LastRebuildRowCount:      generation.LastRebuildRowCount,
+			ConsecutiveSkewCycles:    generation.ConsecutiveSkewCycles,
+		}
+		s.StoreMaintenanceState(nextMaintenance)
 	}
 	old := s.segmentStore.Swap(generation)
 	if old != nil && old != generation {

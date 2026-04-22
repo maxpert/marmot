@@ -13,6 +13,7 @@ import (
 	"github.com/maxpert/marmot/common"
 	"github.com/maxpert/marmot/modules/vecindex"
 	"github.com/maxpert/marmot/modules/vecindex/pkg/kmeans"
+	vecmaterialize "github.com/maxpert/marmot/modules/vecindex/pkg/materialize"
 	"github.com/maxpert/marmot/modules/vecindex/pkg/metric"
 	"github.com/maxpert/marmot/protocol"
 	"vitess.io/vitess/go/vt/sqlparser"
@@ -22,22 +23,25 @@ import (
 // scan candidate rows from the local segment store plus overlay, compute
 // distances in Go, then fetch the top-K projection from the base table.
 type GoRankPlan struct {
-	RawQueryVec []byte
-	QueryVec    []float32
-	QueryNorm2  float32
-	RankMetric  metric.Metric
-	Nprobe      int
-	K           int
-	Shortlist   int
-	Database    string
-	BaseTable   string
-	BaseAlias   string // empty → use BaseTable
+	RawQueryVec    []byte
+	QueryVec       []float32
+	QueryNorm2     float32
+	RankMetric     metric.Metric
+	Nprobe         int
+	UseBudgetProbe bool
+	ScanBudgetRows int
+	K              int
+	Shortlist      int
+	Database       string
+	BaseTable      string
+	BaseAlias      string // empty → use BaseTable
 
-	IndexName  string
-	IndexSpec  vecindex.IVFSpec
-	ClusterIDs []int64 // probed stable clusters; overlay merge handles fresh writes
-	ProbeEpoch uint64  // epoch of the probe set that produced ClusterIDs; enables reprobe on reindex races
-	ProbeSet   *kmeans.CentroidSet
+	IndexName           string
+	IndexSpec           vecindex.IVFSpec
+	ClusterIDs          []int64 // probed stable clusters; overlay merge handles fresh writes
+	ProbeEpoch          uint64  // epoch of the probe set that produced ClusterIDs; enables reprobe on reindex races
+	ProbeSet            *kmeans.CentroidSet
+	TargetPartitionSize int
 
 	EmbedColumn string
 	// CandidateArgFilter holds indices into rewrittenArgs that correspond to
@@ -154,17 +158,19 @@ func BuildGoRankPlan(
 	}
 
 	return &GoRankPlan{
-		RawQueryVec: append([]byte(nil), queryVec...),
-		QueryVec:    qf,
-		QueryNorm2:  queryNorm2,
-		RankMetric:  metricKindToRankMetric(metricKind),
-		Nprobe:      nprobe,
-		K:           k,
-		Shortlist:   exactRerankShortlist(k),
-		Database:    meta.Database,
-		BaseTable:   meta.TableName,
-		BaseAlias:   tableAlias,
-		IndexName:   meta.IndexName,
+		RawQueryVec:    append([]byte(nil), queryVec...),
+		QueryVec:       qf,
+		QueryNorm2:     queryNorm2,
+		RankMetric:     metricKindToRankMetric(metricKind),
+		Nprobe:         nprobe,
+		UseBudgetProbe: meta.AutoTuneNprobe && nprobe == meta.Nprobe,
+		ScanBudgetRows: defaultProbeScanBudgetRows(meta.TargetPartitionSize),
+		K:              k,
+		Shortlist:      exactRerankShortlist(k),
+		Database:       meta.Database,
+		BaseTable:      meta.TableName,
+		BaseAlias:      tableAlias,
+		IndexName:      meta.IndexName,
 		IndexSpec: vecindex.IVFSpec{
 			ID:      meta.IndexName,
 			Dim:     meta.Dim,
@@ -173,15 +179,16 @@ func BuildGoRankPlan(
 			Nprobe:  nprobe,
 			MaxNorm: meta.MaxNorm,
 		},
-		ClusterIDs:         clusterIDs,
-		EmbedColumn:        meta.ColumnName,
-		CandidateArgFilter: candidateArgFilter,
-		FinalSelectList:    finalSelectList,
-		FinalFromClause:    finalFromClause,
-		UserPredicateSQL:   userPredicateSQL,
-		HasUserPredicate:   userPred != nil,
-		DirectPKColumn:     directPKColumn,
-		DirectPKLabel:      directPKLabel,
+		ClusterIDs:          clusterIDs,
+		TargetPartitionSize: meta.TargetPartitionSize,
+		EmbedColumn:         meta.ColumnName,
+		CandidateArgFilter:  candidateArgFilter,
+		FinalSelectList:     finalSelectList,
+		FinalFromClause:     finalFromClause,
+		UserPredicateSQL:    userPredicateSQL,
+		HasUserPredicate:    userPred != nil,
+		DirectPKColumn:      directPKColumn,
+		DirectPKLabel:       directPKLabel,
 	}, nil
 }
 
@@ -211,9 +218,22 @@ func (h *CoordinatorHandler) executeGoRankPlan(
 	// concurrent readers). The write handle is single-conn + _txlock=immediate
 	// and would serialise every ranked lookup against every other reader and
 	// any inflight writer — a ~50,000× slowdown on 1M-row benches.
-	conn, err := h.dbManager.GetDatabaseReadConnection(plan.Database)
+	readDB, err := h.dbManager.GetDatabaseReadConnection(plan.Database)
 	if err != nil {
 		return nil, fmt.Errorf("MARMOT-VEC-030: get db for go-rank: %w", err)
+	}
+	queryCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	readConn, err := readDB.Conn(queryCtx)
+	if err != nil {
+		return nil, fmt.Errorf("MARMOT-VEC-030: get read conn for go-rank: %w", err)
+	}
+	defer func() {
+		_, _ = readConn.ExecContext(context.Background(), "ROLLBACK")
+		_ = readConn.Close()
+	}()
+	if _, err := readConn.ExecContext(queryCtx, "BEGIN"); err != nil {
+		return nil, fmt.Errorf("MARMOT-VEC-030: begin go-rank read txn: %w", err)
 	}
 
 	userArgs, err := resolvePlanArgs(plan, rewrittenArgs)
@@ -221,7 +241,7 @@ func (h *CoordinatorHandler) executeGoRankPlan(
 		return nil, err
 	}
 
-	items, err = h.exactRerankCandidates(conn, plan, userArgs, items)
+	items, err = h.exactRerankCandidates(queryCtx, readConn, plan, userArgs, items)
 	if err != nil {
 		return nil, err
 	}
@@ -230,7 +250,7 @@ func (h *CoordinatorHandler) executeGoRankPlan(
 	} else if ok {
 		return rs, nil
 	}
-	return h.fetchProjectionByRowID(conn, plan, userArgs, items)
+	return h.fetchProjectionByRowID(queryCtx, readConn, plan, userArgs, items)
 }
 
 func resolvePlanArgs(plan *GoRankPlan, rewrittenArgs []interface{}) ([]interface{}, error) {
@@ -254,26 +274,119 @@ func metricKindToRankMetric(m metric.Metric) metric.Metric {
 	return m
 }
 
-func (h *CoordinatorHandler) refreshProbeClusterIDs(plan *GoRankPlan) []int64 {
-	if plan.ProbeEpoch == 0 || len(plan.RawQueryVec) == 0 || plan.Nprobe <= 0 {
+func defaultProbeScanBudgetRows(targetPartitionSize int) int {
+	if targetPartitionSize <= 0 {
+		targetPartitionSize = 512
+	}
+	budget := 8192
+	if widened := 16 * targetPartitionSize; widened > budget {
+		budget = widened
+	}
+	return budget
+}
+
+func loadLiveClusterRowCounts(state *vecindex.IndexState, segments *vecindex.SegmentGeneration) []uint64 {
+	if state != nil {
+		if maintenance := state.LoadMaintenanceState(); maintenance != nil {
+			if counts := maintenance.LiveClusterRowCounts(); len(counts) > 0 {
+				return counts
+			}
+		}
+	}
+	if segments != nil && len(segments.ClusterRowCounts) > 0 {
+		return segments.ClusterRowCounts
+	}
+	if segments != nil && segments.Data != nil {
+		return segments.Data.ClusterRowCounts()
+	}
+	return nil
+}
+
+func probeCountsUsable(counts []uint64, centroids *kmeans.CentroidSet) bool {
+	if centroids == nil || len(counts) != centroids.Len()+1 {
+		return false
+	}
+	for clusterID := 1; clusterID < len(counts); clusterID++ {
+		if counts[clusterID] > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func selectProbeClusterIDs(
+	plan *GoRankPlan,
+	state *vecindex.IndexState,
+	centroids *kmeans.CentroidSet,
+	segments *vecindex.SegmentGeneration,
+) []int64 {
+	if plan == nil || state == nil || centroids == nil {
+		if plan == nil {
+			return nil
+		}
 		return plan.ClusterIDs
 	}
-	provider := h.loadVectorEngine()
-	if provider == nil {
+	if !plan.UseBudgetProbe {
+		return refreshFixedProbeClusterIDs(plan, state)
+	}
+	counts := loadLiveClusterRowCounts(state, segments)
+	if !probeCountsUsable(counts, centroids) {
+		return refreshFixedProbeClusterIDs(plan, state)
+	}
+	ids, _, err := centroids.AssignTopN(plan.QueryVec, centroids.Len(), plan.IndexSpec.InternalMetric())
+	if err != nil || len(ids) == 0 {
+		return refreshFixedProbeClusterIDs(plan, state)
+	}
+	budget := uint64(plan.ScanBudgetRows)
+	if budget == 0 {
+		budget = uint64(defaultProbeScanBudgetRows(plan.TargetPartitionSize))
+	}
+	selected := make([]int64, 0, len(ids))
+	var cumulative uint64
+	for _, id := range ids {
+		clusterID := int64(id) + 1
+		selected = append(selected, clusterID)
+		if int(clusterID) < len(counts) {
+			cumulative += counts[clusterID]
+		}
+		if cumulative >= budget {
+			break
+		}
+	}
+	if len(selected) == 0 {
+		return refreshFixedProbeClusterIDs(plan, state)
+	}
+	plan.ProbeEpoch = centroids.Epoch()
+	return selected
+}
+
+func refreshFixedProbeClusterIDs(plan *GoRankPlan, state *vecindex.IndexState) []int64 {
+	if plan == nil || state == nil || len(plan.RawQueryVec) == 0 || plan.Nprobe <= 0 {
+		if plan == nil {
+			return nil
+		}
 		return plan.ClusterIDs
 	}
-	type epochProvider interface {
-		TopNprobeClustersWithEpoch(indexName string, vec []byte, n int) ([]int64, uint64, error)
-	}
-	ep, ok := provider.(epochProvider)
-	if !ok {
+	if state.ProbeVersion() == 0 || state.ProbeVersion() == plan.ProbeEpoch {
 		return plan.ClusterIDs
 	}
-	clusterIDs, epoch, err := ep.TopNprobeClustersWithEpoch(plan.IndexName, plan.RawQueryVec, plan.Nprobe)
+	clusterIDs, epoch, err := state.TopNprobeClustersWithEpoch(plan.RawQueryVec, plan.Nprobe)
 	if err != nil || epoch == 0 || epoch == plan.ProbeEpoch {
 		return plan.ClusterIDs
 	}
+	plan.ProbeEpoch = epoch
 	return clusterIDs
+}
+
+func (h *CoordinatorHandler) refreshProbeClusterIDs(plan *GoRankPlan, state *vecindex.IndexState) []int64 {
+	if plan == nil || state == nil {
+		return refreshFixedProbeClusterIDs(plan, state)
+	}
+	cs := state.ProbeState()
+	if cs == nil || cs.Epoch() == plan.ProbeEpoch {
+		return plan.ClusterIDs
+	}
+	return selectProbeClusterIDs(plan, state, cs, state.LoadSegmentStore())
 }
 
 func exactRerankShortlist(k int) int {
@@ -331,8 +444,12 @@ func (h *CoordinatorHandler) segmentRank(plan *GoRankPlan) ([]rankItem, bool, er
 		return nil, false, nil
 	}
 
-	segments := state.LoadSegmentStore()
+	// Read overlay before the stable generation. Maintenance publishes a new
+	// generation before compacting overlay entries up to that watermark, so
+	// this ordering prevents observing an old generation together with a
+	// compacted overlay snapshot.
 	overlay := state.LoadOverlay()
+	segments := state.LoadSegmentStore()
 	if (segments == nil || segments.Data == nil) && overlay == nil {
 		return nil, false, nil
 	}
@@ -344,6 +461,11 @@ func (h *CoordinatorHandler) segmentRank(plan *GoRankPlan) ([]rankItem, bool, er
 	}
 
 	topK := newTopKHeap(rankShortlistLimit(plan))
+	overlaySnapshot := (*vecindex.OverlaySnapshot)(nil)
+	if overlay != nil {
+		overlaySnapshot = overlay.Snapshot()
+	}
+
 	var cs *kmeans.CentroidSet
 	if segments != nil {
 		cs = segments.Centroids
@@ -356,18 +478,7 @@ func (h *CoordinatorHandler) segmentRank(plan *GoRankPlan) ([]rankItem, bool, er
 		}
 	}
 	plan.ProbeSet = cs
-
-	overlaySnapshot := (*vecindex.OverlaySnapshot)(nil)
-	overlayRows := make(map[int64]struct{})
-	if overlay != nil {
-		overlaySnapshot = overlay.Snapshot()
-		if overlaySnapshot != nil {
-			overlaySnapshot.VisitAllAfter(appliedOverlaySeq, func(_clusterID, rowID int64, _vec []byte) bool {
-				overlayRows[rowID] = struct{}{}
-				return true
-			})
-		}
-	}
+	plan.ClusterIDs = selectProbeClusterIDs(plan, state, cs, segments)
 
 	if segments != nil && segments.Data != nil {
 		scorerCache := make(map[int64]*vecindex.StableMemberScorer, len(plan.ClusterIDs))
@@ -397,9 +508,11 @@ func (h *CoordinatorHandler) segmentRank(plan *GoRankPlan) ([]rankItem, bool, er
 				cursor := 0
 				for i := 0; i < n; i++ {
 					rowid := int64(binary.LittleEndian.Uint64(rows[cursor : cursor+8]))
-					if _, ok := overlayRows[rowid]; ok {
-						cursor += entrySize
-						continue
+					if overlaySnapshot != nil {
+						if _, ok := overlaySnapshot.RowClusterAfter(rowid, appliedOverlaySeq); ok {
+							cursor += entrySize
+							continue
+						}
 					}
 					if overlaySnapshot != nil && overlaySnapshot.HasTombstoneAfter(rowid, appliedOverlaySeq) {
 						cursor += entrySize
@@ -413,8 +526,10 @@ func (h *CoordinatorHandler) segmentRank(plan *GoRankPlan) ([]rankItem, bool, er
 				return nil, false, fmt.Errorf("MARMOT-VEC-030: segment scan failed: %w", err)
 			}
 		} else if err := segments.Data.ScanClustersFileOrder(plan.ClusterIDs, func(clusterID, rowid int64, vecBytes []byte) bool {
-			if _, ok := overlayRows[rowid]; ok {
-				return true
+			if overlaySnapshot != nil {
+				if _, ok := overlaySnapshot.RowClusterAfter(rowid, appliedOverlaySeq); ok {
+					return true
+				}
 			}
 			if overlaySnapshot != nil && overlaySnapshot.HasTombstoneAfter(rowid, appliedOverlaySeq) {
 				return true
@@ -493,8 +608,13 @@ func rankShortlistLimit(plan *GoRankPlan) int {
 	return plan.K
 }
 
+type sqlQueryer interface {
+	QueryContext(context.Context, string, ...interface{}) (*sql.Rows, error)
+}
+
 func (h *CoordinatorHandler) exactRerankCandidates(
-	conn *sql.DB,
+	ctx context.Context,
+	conn sqlQueryer,
 	plan *GoRankPlan,
 	userArgs []interface{},
 	candidates []rankItem,
@@ -505,23 +625,13 @@ func (h *CoordinatorHandler) exactRerankCandidates(
 
 	var sb strings.Builder
 	alias := plan.alias()
-	maxNormLit := strconv.FormatFloat(float64(plan.IndexSpec.MaxNorm), 'g', -1, 32)
-	if !strings.ContainsAny(maxNormLit, ".eE") {
-		maxNormLit += ".0"
-	}
 	sb.WriteString("SELECT `")
 	sb.WriteString(alias)
-	sb.WriteString("`.`rowid`, __marmot_vec_materialize(`")
+	sb.WriteString("`.`rowid`, `")
 	sb.WriteString(alias)
 	sb.WriteString("`.`")
 	sb.WriteString(plan.EmbedColumn)
-	sb.WriteString("`, ")
-	sb.WriteString(strconv.FormatInt(int64(plan.IndexSpec.Metric), 10))
-	sb.WriteString(", ")
-	sb.WriteString(strconv.Itoa(plan.IndexSpec.Dim))
-	sb.WriteString(", ")
-	sb.WriteString(maxNormLit)
-	sb.WriteString(") FROM `")
+	sb.WriteString("` FROM `")
 	sb.WriteString(plan.BaseTable)
 	sb.WriteString("` AS `")
 	sb.WriteString(alias)
@@ -541,9 +651,6 @@ func (h *CoordinatorHandler) exactRerankCandidates(
 		sb.WriteByte(')')
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
 	rows, err := conn.QueryContext(ctx, sb.String(), userArgs...)
 	if err != nil {
 		return nil, fmt.Errorf("MARMOT-VEC-030: exact rerank query failed: %w", err)
@@ -553,9 +660,16 @@ func (h *CoordinatorHandler) exactRerankCandidates(
 	topK := newTopKHeap(plan.K)
 	for rows.Next() {
 		var rowid int64
-		var prepared []byte
-		if err := rows.Scan(&rowid, &prepared); err != nil {
+		var raw []byte
+		if err := rows.Scan(&rowid, &raw); err != nil {
 			return nil, fmt.Errorf("MARMOT-VEC-030: exact rerank scan failed: %w", err)
+		}
+		if raw == nil {
+			continue
+		}
+		prepared, err := vecmaterialize.VectorBlob(raw, plan.IndexSpec.Metric, plan.IndexSpec.Dim, plan.IndexSpec.MaxNorm)
+		if err != nil {
+			return nil, fmt.Errorf("MARMOT-VEC-030: exact rerank materialize failed: %w", err)
 		}
 		if prepared == nil {
 			continue
@@ -602,7 +716,8 @@ func (h *CoordinatorHandler) tryDirectPKResult(
 // positional values referenced by UserPredicateSQL when the original query had
 // a post-filter predicate.
 func (h *CoordinatorHandler) fetchProjectionByRowID(
-	conn *sql.DB,
+	ctx context.Context,
+	conn sqlQueryer,
 	plan *GoRankPlan,
 	userArgs []interface{},
 	topK []rankItem,
@@ -649,9 +764,6 @@ func (h *CoordinatorHandler) fetchProjectionByRowID(
 	}
 	fsb.WriteString(" END LIMIT ")
 	fsb.WriteString(strconv.Itoa(plan.K))
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
 
 	finalRows, err := conn.QueryContext(ctx, fsb.String(), userArgs...)
 	if err != nil {

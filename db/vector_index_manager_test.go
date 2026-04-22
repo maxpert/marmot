@@ -54,6 +54,59 @@ func setupVecIndexTestDB(t *testing.T) *sql.DB {
 	return db
 }
 
+func insertDocRows(t *testing.T, db *sql.DB, n int) {
+	t.Helper()
+	tx, err := db.Begin()
+	require.NoError(t, err)
+	stmt, err := tx.Prepare(`INSERT INTO docs(id) VALUES (?)`)
+	require.NoError(t, err)
+	for i := 1; i <= n; i++ {
+		_, err = stmt.Exec(i)
+		require.NoError(t, err)
+	}
+	require.NoError(t, stmt.Close())
+	require.NoError(t, tx.Commit())
+}
+
+func insertDocVectorRows(t *testing.T, db *sql.DB, n int) {
+	t.Helper()
+	tx, err := db.Begin()
+	require.NoError(t, err)
+	stmt, err := tx.Prepare(`INSERT INTO docs(id, embed) VALUES (?, ?)`)
+	require.NoError(t, err)
+	for i := 1; i <= n; i++ {
+		vec := []float32{
+			float32(i % 11),
+			float32((i * 3) % 17),
+			float32((i * 5) % 19),
+			float32((i * 7) % 23),
+		}
+		_, err = stmt.Exec(i, encodeVec(t, vec))
+		require.NoError(t, err)
+	}
+	require.NoError(t, stmt.Close())
+	require.NoError(t, tx.Commit())
+}
+
+func cleanupIndexWatchers(t *testing.T, hook *EngineHook, dbMgr *DatabaseManager, database, indexName string) {
+	t.Helper()
+	if hook == nil || dbMgr == nil {
+		return
+	}
+
+	hook.stopBootstrapWatcher(indexName)
+	hook.stopMaintenanceWatcher(indexName)
+
+	dbPath, err := dbMgr.GetDatabasePath(database)
+	require.NoError(t, err)
+	segmentDir := vecindex.SegmentStoreDir(dbPath, indexName)
+	require.Eventually(t, func() bool {
+		_ = os.RemoveAll(segmentDir)
+		_, statErr := os.Stat(segmentDir)
+		return os.IsNotExist(statErr)
+	}, 5*time.Second, 50*time.Millisecond)
+}
+
 // objectExists checks whether a SQLite object (table or trigger) with the given
 // name is recorded in sqlite_master.
 func objectExists(t *testing.T, db *sql.DB, name string) bool {
@@ -172,6 +225,10 @@ func TestCreateIndex_EmptyTableAutoBootstrapsOnInsert(t *testing.T) {
 	t.Cleanup(func() { SetVectorUDFProvider(nil) })
 
 	hook := NewEngineHook(engine, dbMgr)
+	hook.BindVectorIndexManager(vecMgr)
+	t.Cleanup(func() {
+		cleanupIndexWatchers(t, hook, dbMgr, "test", "embeddings")
+	})
 	vecMgr.SetLifecycleHook(hook)
 	vecMgr.SetEngineProvider(hook)
 	vecMgr.SetReindexHook(hook)
@@ -231,6 +288,156 @@ func TestCreateIndex_EmptyTableAutoBootstrapsOnInsert(t *testing.T) {
 	}
 }
 
+func TestCreateIndex_EmptyTableAutoTuneBootstrapsAtTargetPartitionFloor(t *testing.T) {
+	tmpDir := t.TempDir()
+	clock := hlc.NewClock(1)
+
+	dbMgr, err := NewDatabaseManager(tmpDir, 1, clock)
+	require.NoError(t, err)
+	require.NoError(t, dbMgr.CreateDatabase("test"))
+
+	vecMgr := NewVectorIndexManager(dbMgr)
+	dbMgr.SetVectorIndexManager(vecMgr)
+
+	engine := vecindex.NewEngine()
+	SetVectorUDFProvider(engine)
+	t.Cleanup(func() { SetVectorUDFProvider(nil) })
+
+	hook := NewEngineHook(engine, dbMgr)
+	hook.BindVectorIndexManager(vecMgr)
+	t.Cleanup(func() {
+		cleanupIndexWatchers(t, hook, dbMgr, "test", "embeddings")
+	})
+	vecMgr.SetLifecycleHook(hook)
+	vecMgr.SetEngineProvider(hook)
+	vecMgr.SetReindexHook(hook)
+	require.NoError(t, vecMgr.Start(context.Background()))
+
+	conn, err := dbMgr.GetDatabaseConnection("test")
+	require.NoError(t, err)
+	_, err = conn.Exec(`CREATE TABLE docs (id INTEGER PRIMARY KEY, embed BLOB)`)
+	require.NoError(t, err)
+
+	meta := common.VectorIndexMeta{
+		IndexName:           "embeddings",
+		TableName:           "docs",
+		ColumnName:          "embed",
+		Database:            "test",
+		Metric:              "cosine",
+		Dim:                 4,
+		TargetPartitionSize: 128,
+		CreatedAt:           time.Now().UnixNano(),
+	}
+	require.NoError(t, vecMgr.CreateIndex(context.Background(), meta))
+
+	state, ok := engine.Lookup(meta.IndexName)
+	require.True(t, ok)
+	require.Zero(t, state.ProbeVersion(), "empty create may start without centroids, but must bootstrap automatically")
+
+	const bootstrapRows = bootstrapMinTargetPartitions * 128
+	for i := 0; i < bootstrapRows-1; i++ {
+		_, err := conn.Exec(`INSERT INTO docs (id, embed) VALUES (?, ?)`, i+1, encodeVec(t, []float32{
+			1, float32(i % 5), float32((i + 1) % 7), float32((i + 2) % 11),
+		}))
+		require.NoError(t, err)
+	}
+
+	time.Sleep(750 * time.Millisecond)
+
+	state, ok = engine.Lookup(meta.IndexName)
+	require.True(t, ok)
+	require.Zero(t, state.ProbeVersion(), "auto bootstrap should wait for the minimum target-sized training set")
+	require.Nil(t, state.LoadSegmentStore(), "segment store should not publish before the bootstrap floor is reached")
+
+	_, err = conn.Exec(`INSERT INTO docs (id, embed) VALUES (?, ?)`, bootstrapRows, encodeVec(t, []float32{
+		1, 0, 1, 2,
+	}))
+	require.NoError(t, err)
+
+	require.Eventually(t, func() bool {
+		state, ok := engine.Lookup(meta.IndexName)
+		return ok && state.ProbeVersion() > 0 && state.LoadSegmentStore() != nil
+	}, 30*time.Second, 100*time.Millisecond, "empty-table auto-tuned create should bootstrap when the target-partition floor is reached")
+
+	var nlist, nprobe int
+	require.NoError(t, conn.QueryRow(
+		`SELECT nlist, nprobe FROM __marmot_vector_indexes WHERE index_name = ?`, meta.IndexName,
+	).Scan(&nlist, &nprobe))
+	require.Equal(t, bootstrapMinTargetPartitions, nlist)
+	require.Equal(t, autoTuneNprobeForTarget(nlist, meta.TargetPartitionSize), nprobe)
+
+	state, ok = engine.Lookup(meta.IndexName)
+	require.True(t, ok)
+	require.Equal(t, nlist, state.Spec().Nlist)
+	require.Equal(t, nprobe, state.Spec().Nprobe)
+}
+
+func TestBootstrapOnce_RetriesAfterSegmentPublishFailure(t *testing.T) {
+	tmpDir := t.TempDir()
+	clock := hlc.NewClock(1)
+
+	dbMgr, err := NewDatabaseManager(tmpDir, 1, clock)
+	require.NoError(t, err)
+	require.NoError(t, dbMgr.CreateDatabase("test"))
+
+	conn, err := dbMgr.GetDatabaseConnection("test")
+	require.NoError(t, err)
+	require.NoError(t, MigrateVectorIndexesSchema(conn))
+	_, err = conn.Exec(`CREATE TABLE docs (id INTEGER PRIMARY KEY, embed BLOB)`)
+	require.NoError(t, err)
+	insertDocVectorRows(t, conn, 32)
+
+	engine := vecindex.NewEngine()
+	hook := NewEngineHook(engine, dbMgr)
+
+	meta := common.VectorIndexMeta{
+		IndexName:  "embeddings",
+		TableName:  "docs",
+		ColumnName: "embed",
+		Database:   "test",
+		Metric:     "cosine",
+		Dim:        4,
+		Nlist:      8,
+		Nprobe:     8,
+		CreatedAt:  time.Now().UnixNano(),
+	}
+	spec := vecindex.IVFSpec{
+		ID:      meta.IndexName,
+		Dim:     meta.Dim,
+		Metric:  vecindex.MetricCosine,
+		Nlist:   meta.Nlist,
+		Nprobe:  meta.Nprobe,
+		Seed:    StableIndexSeed(meta),
+		MaxNorm: meta.MaxNorm,
+	}
+	_, err = conn.Exec(`INSERT INTO __marmot_vector_indexes
+		(index_name, table_name, column_name, database_name, metric, dim, nlist, nprobe, status, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'building', ?)`,
+		meta.IndexName, meta.TableName, meta.ColumnName, meta.Database, meta.Metric, meta.Dim, meta.Nlist, meta.Nprobe, meta.CreatedAt)
+	require.NoError(t, err)
+
+	require.NoError(t, BulkPopulate(context.Background(), conn, engine, 0, meta.TableName, meta.ColumnName, spec, meta.TargetPartitionSize))
+
+	state, ok := engine.Lookup(meta.IndexName)
+	require.True(t, ok)
+	require.NotZero(t, state.ProbeVersion())
+	require.Nil(t, state.LoadSegmentStore())
+
+	dbPath, err := dbMgr.GetDatabasePath(meta.Database)
+	require.NoError(t, err)
+	segmentDir := vecindex.SegmentStoreDir(dbPath, meta.IndexName)
+	require.NoError(t, os.WriteFile(segmentDir, []byte("blocker"), 0o644))
+
+	retry := hook.bootstrapOnce(context.Background(), meta, spec)
+	require.False(t, retry, "bootstrap should keep retrying after a transient segment publish failure")
+	require.Nil(t, state.LoadSegmentStore(), "failed publish must not install a partial segment generation")
+
+	require.NoError(t, os.Remove(segmentDir))
+	require.True(t, hook.bootstrapOnce(context.Background(), meta, spec), "bootstrap should complete once the publish blocker is removed")
+	require.NotNil(t, state.LoadSegmentStore())
+	hook.stopMaintenanceWatcher(meta.IndexName)
+}
+
 func TestCreateIndex_RollsBackMetadataAndCacheOnHookFailure(t *testing.T) {
 	tmpDir := t.TempDir()
 	clock := hlc.NewClock(1)
@@ -287,10 +494,13 @@ func TestAutoTuneNlist(t *testing.T) {
 		want int
 	}{
 		{0, 64},
-		{100, 64},       // 4*10=40 < 64 → clamp to 64
-		{1000, 126},     // int(4*31.62)=126
-		{100000, 1264},  // int(4*316.22)=1264
-		{1000000, 2048}, // int(4*1000)=4000 > 2048 → clamp to 2048
+		{100, 64},       // ceil(100/512)=1 < 64 → clamp to 64
+		{1000, 64},      // ceil(1000/512)=2 < 64 → clamp to 64
+		{32768, 64},     // ceil(32768/512)=64
+		{100000, 196},   // ceil(100000/512)=196
+		{1000000, 1954}, // ceil(1000000/512)=1954
+		{1048576, 2048}, // ceil(1048576/512)=2048
+		{2000000, 2048}, // ceil(2000000/512)=3907 > 2048 → clamp to 2048
 	}
 	for _, tc := range cases {
 		got := autoTuneNlist(tc.n)
@@ -298,19 +508,106 @@ func TestAutoTuneNlist(t *testing.T) {
 	}
 }
 
+func TestCreateIndex_AutoTuneDefaultsTargetPartitionSizeTo512(t *testing.T) {
+	tmpDir := t.TempDir()
+	clock := hlc.NewClock(1)
+
+	dbMgr, err := NewDatabaseManager(tmpDir, 1, clock)
+	require.NoError(t, err)
+	require.NoError(t, dbMgr.CreateDatabase("test"))
+
+	vecMgr := NewVectorIndexManager(dbMgr)
+	require.NoError(t, vecMgr.Start(context.Background()))
+
+	conn, err := dbMgr.GetDatabaseConnection("test")
+	require.NoError(t, err)
+	_, err = conn.Exec(`CREATE TABLE docs (id INTEGER PRIMARY KEY, embed BLOB)`)
+	require.NoError(t, err)
+	insertDocVectorRows(t, conn, 32769)
+
+	meta := common.VectorIndexMeta{
+		IndexName:  "embeddings",
+		TableName:  "docs",
+		ColumnName: "embed",
+		Database:   "test",
+		Metric:     "cosine",
+		Dim:        4,
+		CreatedAt:  time.Now().UnixNano(),
+	}
+	require.NoError(t, vecMgr.CreateIndex(context.Background(), meta))
+
+	var nlist, nprobe, targetPartitionSize int
+	var autoNlist, autoNprobe int64
+	require.NoError(t, conn.QueryRow(`
+		SELECT nlist, nprobe, auto_nlist, auto_nprobe, target_partition_size
+		FROM __marmot_vector_indexes
+		WHERE index_name = ?`,
+		meta.IndexName,
+	).Scan(&nlist, &nprobe, &autoNlist, &autoNprobe, &targetPartitionSize))
+	require.Equal(t, 65, nlist)
+	require.Equal(t, autoTuneNprobe(nlist), nprobe)
+	require.Zero(t, autoNlist)
+	require.Zero(t, autoNprobe)
+	require.Equal(t, defaultTargetPartitionSize, targetPartitionSize)
+}
+
+func TestCreateIndex_AutoTuneUsesExplicitTargetPartitionSize(t *testing.T) {
+	tmpDir := t.TempDir()
+	clock := hlc.NewClock(1)
+
+	dbMgr, err := NewDatabaseManager(tmpDir, 1, clock)
+	require.NoError(t, err)
+	require.NoError(t, dbMgr.CreateDatabase("test"))
+
+	vecMgr := NewVectorIndexManager(dbMgr)
+	require.NoError(t, vecMgr.Start(context.Background()))
+
+	conn, err := dbMgr.GetDatabaseConnection("test")
+	require.NoError(t, err)
+	_, err = conn.Exec(`CREATE TABLE docs (id INTEGER PRIMARY KEY, embed BLOB)`)
+	require.NoError(t, err)
+	insertDocVectorRows(t, conn, 8200)
+
+	meta := common.VectorIndexMeta{
+		IndexName:           "embeddings",
+		TableName:           "docs",
+		ColumnName:          "embed",
+		Database:            "test",
+		Metric:              "cosine",
+		Dim:                 4,
+		TargetPartitionSize: 128,
+		CreatedAt:           time.Now().UnixNano(),
+	}
+	require.NoError(t, vecMgr.CreateIndex(context.Background(), meta))
+
+	var nlist, nprobe, targetPartitionSize int
+	require.NoError(t, conn.QueryRow(`
+		SELECT nlist, nprobe, target_partition_size
+		FROM __marmot_vector_indexes
+		WHERE index_name = ?`,
+		meta.IndexName,
+	).Scan(&nlist, &nprobe, &targetPartitionSize))
+	require.Equal(t, 65, nlist)
+	require.Equal(t, autoTuneNprobeForTarget(nlist, meta.TargetPartitionSize), nprobe)
+	require.Equal(t, meta.TargetPartitionSize, targetPartitionSize)
+}
+
 func TestAutoTuneNprobe(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
-		nlist int
-		want  int
+		nlist  int
+		target int
+		want   int
 	}{
-		{64, 8},   // sqrt(64)=8
-		{256, 16}, // sqrt(256)=16
-		{4, 8},    // sqrt(4)=2 < 8 → clamped to 8
+		{64, defaultTargetPartitionSize, 16},
+		{256, defaultTargetPartitionSize, 16},
+		{4, defaultTargetPartitionSize, 4},
+		{65, 128, 64},
+		{8, 128, 8},
 	}
 	for _, tc := range cases {
-		got := autoTuneNprobe(tc.nlist)
-		require.Equal(t, tc.want, got, "nlist=%d", tc.nlist)
+		got := autoTuneNprobeForTarget(tc.nlist, tc.target)
+		require.Equal(t, tc.want, got, "nlist=%d target=%d", tc.nlist, tc.target)
 	}
 }
 

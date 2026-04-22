@@ -5,10 +5,12 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"time"
 
 	"github.com/maxpert/marmot/common"
 	"github.com/maxpert/marmot/encoding"
 	"github.com/maxpert/marmot/modules/vecindex"
+	"github.com/maxpert/marmot/modules/vecindex/pkg/metric"
 )
 
 func (h *EngineHook) OnIndexLocalChanges(ctx context.Context, meta common.VectorIndexMeta, entries []common.CDCEntry) error {
@@ -38,9 +40,21 @@ func (h *EngineHook) OnIndexLocalChanges(ctx context.Context, meta common.Vector
 	if len(mutations) == 0 {
 		return nil
 	}
+	pkColumn, err := h.primaryKeyColumn(meta.Database, meta.TableName)
+	if err != nil {
+		return err
+	}
+	var overlaySnapshotBefore *vecindex.OverlaySnapshot
+	if overlay != nil {
+		overlaySnapshotBefore = overlay.Snapshot()
+	}
+	if err := recordMaintenanceDeltas(meta, state, spec, pkColumn, overlaySnapshotBefore, entries); err != nil {
+		return err
+	}
 	if err := overlay.ApplyCommittedBatch(mutations); err != nil {
 		return fmt.Errorf("vector local changes: apply overlay batch: %w", err)
 	}
+	state.RecordRowsModified(uint64(countUniqueMutationRows(mutations)))
 	return nil
 }
 
@@ -63,6 +77,8 @@ func (h *EngineHook) OnIndexLoaded(ctx context.Context, meta common.VectorIndexM
 			MaxNorm: meta.MaxNorm,
 			Seed:    StableIndexSeed(meta),
 		})
+	} else if state != nil && state.ProbeVersion() != 0 {
+		h.startMaintenanceWatcher(meta)
 	}
 	return nil
 }
@@ -136,6 +152,7 @@ func (h *EngineHook) buildOverlayMutations(
 	epoch := state.ProbeVersion()
 
 	mutations := make([]vecindex.OverlayMutation, 0, len(merged))
+	appliedAtUnixNano := time.Now().UnixNano()
 	for _, entry := range merged {
 		oldRowID, oldRowOK, err := decodeCDCInt64(entry.OldValues, pkColumn)
 		if err != nil {
@@ -151,6 +168,7 @@ func (h *EngineHook) buildOverlayMutations(
 				return nil, err
 			}
 			if used {
+				deleteMutation.AppliedAtUnixNano = appliedAtUnixNano
 				mutations = append(mutations, deleteMutation)
 				nextSequence++
 			}
@@ -180,6 +198,7 @@ func (h *EngineHook) buildOverlayMutations(
 			if err != nil {
 				return nil, err
 			}
+			mutation.AppliedAtUnixNano = appliedAtUnixNano
 			mutations = append(mutations, mutation)
 			nextSequence++
 		case oldRowOK:
@@ -188,12 +207,116 @@ func (h *EngineHook) buildOverlayMutations(
 				return nil, err
 			}
 			if used {
+				mutation.AppliedAtUnixNano = appliedAtUnixNano
 				mutations = append(mutations, mutation)
 				nextSequence++
 			}
 		}
 	}
 	return mutations, nil
+}
+
+func countUniqueMutationRows(mutations []vecindex.OverlayMutation) int {
+	if len(mutations) == 0 {
+		return 0
+	}
+	seen := make(map[int64]struct{}, len(mutations))
+	for _, mutation := range mutations {
+		seen[mutation.RowID] = struct{}{}
+	}
+	return len(seen)
+}
+
+func recordMaintenanceDeltas(
+	meta common.VectorIndexMeta,
+	state *vecindex.IndexState,
+	spec vecindex.IVFSpec,
+	pkColumn string,
+	overlaySnapshot *vecindex.OverlaySnapshot,
+	entries []common.CDCEntry,
+) error {
+	if state == nil || state.ProbeState() == nil {
+		return nil
+	}
+	merged := mergeLocalCDCEntries(meta.TableName, entries)
+	for _, entry := range merged {
+		oldRowID, oldRowOK, err := decodeCDCInt64(entry.OldValues, pkColumn)
+		if err != nil {
+			return fmt.Errorf("vector local changes: decode old rowid for maintenance: %w", err)
+		}
+		oldRaw, _, err := decodeCDCBytes(entry.OldValues, meta.ColumnName)
+		if err != nil {
+			return fmt.Errorf("vector local changes: decode old vector for maintenance: %w", err)
+		}
+		newRaw, _, err := decodeCDCBytes(entry.NewValues, meta.ColumnName)
+		if err != nil {
+			return fmt.Errorf("vector local changes: decode new vector for maintenance: %w", err)
+		}
+		if bytes.Equal(oldRaw, newRaw) {
+			continue
+		}
+		oldCluster := int64(0)
+		if oldRowOK {
+			oldCluster = currentRowCluster(state, overlaySnapshot, oldRowID)
+		}
+		_, oldVec, err := maintenancePreparedCluster(state, spec, oldRaw)
+		if err != nil {
+			return err
+		}
+		if oldCluster == 0 {
+			oldCluster, _, err = maintenancePreparedCluster(state, spec, oldRaw)
+			if err != nil {
+				return err
+			}
+		}
+		newCluster, newVec, err := maintenancePreparedCluster(state, spec, newRaw)
+		if err != nil {
+			return err
+		}
+		state.RecordClusterMutation(oldCluster, oldVec, newCluster, newVec)
+	}
+	return nil
+}
+
+func currentRowCluster(state *vecindex.IndexState, overlaySnapshot *vecindex.OverlaySnapshot, rowID int64) int64 {
+	if state == nil || rowID == 0 {
+		return 0
+	}
+	if overlaySnapshot != nil {
+		if clusterID, ok := overlaySnapshot.RowCluster(rowID); ok {
+			return clusterID
+		}
+	}
+	segment := state.LoadSegmentStore()
+	if segment == nil || segment.RowMap == nil {
+		return 0
+	}
+	loc, ok, err := segment.RowMap.Lookup(rowID)
+	if err != nil || !ok {
+		return 0
+	}
+	return loc.ClusterID
+}
+
+func maintenancePreparedCluster(state *vecindex.IndexState, spec vecindex.IVFSpec, raw []byte) (int64, []float32, error) {
+	if len(raw) == 0 {
+		return 0, nil, nil
+	}
+	prepared, err := materializeVectorBlob(raw, spec.Metric, spec.Dim, spec.MaxNorm)
+	if err != nil {
+		return 0, nil, fmt.Errorf("vector local changes: materialize maintenance vector: %w", err)
+	}
+	if prepared == nil {
+		return 0, nil, nil
+	}
+	clusterID := int64(0)
+	if cs := state.ProbeState(); cs != nil {
+		clusterID, err = assignPreparedAgainstSet(prepared, spec, cs)
+		if err != nil {
+			return 0, nil, fmt.Errorf("vector local changes: assign maintenance vector: %w", err)
+		}
+	}
+	return clusterID, append([]float32(nil), metric.BytesToFloat32(prepared)...), nil
 }
 
 func buildUpsertMutation(

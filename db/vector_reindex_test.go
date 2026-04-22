@@ -3,11 +3,13 @@ package db
 import (
 	"context"
 	"database/sql"
+	"math"
 	"math/rand"
 	"testing"
 	"time"
 
 	"github.com/maxpert/marmot/modules/vecindex"
+	"github.com/maxpert/marmot/modules/vecindex/pkg/metric"
 	"github.com/stretchr/testify/require"
 )
 
@@ -33,7 +35,7 @@ func setupReindexDB(t *testing.T, nVec int) (*sql.DB, *vecindex.Engine, vecindex
 		nprobe INTEGER NOT NULL,
 		auto_nlist INTEGER NOT NULL DEFAULT 0,
 		auto_nprobe INTEGER NOT NULL DEFAULT 0,
-		target_partition_size INTEGER NOT NULL DEFAULT 100,
+			target_partition_size INTEGER NOT NULL DEFAULT 512,
 		max_norm REAL NOT NULL,
 		status TEXT NOT NULL,
 		created_at INTEGER NOT NULL
@@ -45,8 +47,8 @@ func setupReindexDB(t *testing.T, nVec int) (*sql.DB, *vecindex.Engine, vecindex
 		(index_name, table_name, column_name, database_name, metric, dim,
 		 nlist, nprobe, auto_nlist, auto_nprobe, target_partition_size,
 		 max_norm, status, created_at)
-		VALUES (?, 'docs', 'embed', 'test', 'l2', 4, 4, 2, 0, 0, 100, 0, 'ready', ?)`,
-		"embeddings", createdAt)
+			VALUES (?, 'docs', 'embed', 'test', 'l2', 4, 4, 2, 0, 0, ?, 0, 'ready', ?)`,
+		"embeddings", defaultTargetPartitionSize, createdAt)
 	require.NoError(t, err)
 
 	spec := vecindex.IVFSpec{ID: "embeddings", Dim: 4, Metric: vecindex.MetricL2, Nlist: 4, Nprobe: 2, Seed: 42}
@@ -58,7 +60,7 @@ func setupReindexDB(t *testing.T, nVec int) (*sql.DB, *vecindex.Engine, vecindex
 		}
 		insertTestVec(t, db, i, v)
 	}
-	require.NoError(t, BulkPopulate(context.Background(), db, engine, createdAt, "docs", "embed", spec))
+	require.NoError(t, BulkPopulate(context.Background(), db, engine, createdAt, "docs", "embed", spec, defaultTargetPartitionSize))
 	return db, engine, spec
 }
 
@@ -70,7 +72,7 @@ func TestReindex_BasicComplete(t *testing.T) {
 	require.True(t, ok)
 	oldEpoch := oldState.ProbeVersion()
 
-	meta, newState, err := Reindex(ctx, db, engine, testMeta(spec.ID), 100, time.Now().UnixNano())
+	meta, newState, err := Reindex(ctx, db, engine, testMeta(spec.ID), 0, time.Now().UnixNano())
 	require.NoError(t, err)
 
 	currentState, ok := engine.Lookup(spec.ID)
@@ -102,7 +104,7 @@ func TestReindex_RetunesAutoTunedParams(t *testing.T) {
 	meta.AutoTuneNlist = true
 	meta.AutoTuneNprobe = true
 
-	retunedMeta, newState, err := Reindex(ctx, db, engine, meta, 50, time.Now().UnixNano())
+	retunedMeta, newState, err := Reindex(ctx, db, engine, meta, 0, time.Now().UnixNano())
 	require.NoError(t, err)
 
 	var nlist, nprobe int
@@ -126,7 +128,7 @@ func TestReindex_PreservesExplicitParams(t *testing.T) {
 	db, engine, spec := setupReindexDB(t, 100)
 	ctx := context.Background()
 
-	meta, newState, err := Reindex(ctx, db, engine, testMeta(spec.ID), 50, time.Now().UnixNano())
+	meta, newState, err := Reindex(ctx, db, engine, testMeta(spec.ID), 0, time.Now().UnixNano())
 	require.NoError(t, err)
 
 	var nlist, nprobe int
@@ -150,7 +152,7 @@ func TestReindex_DriftIsolation(t *testing.T) {
 	db, engine, spec := setupReindexDB(t, 100)
 	ctx := context.Background()
 
-	_, newState, err := Reindex(ctx, db, engine, testMeta(spec.ID), 50, time.Now().UnixNano())
+	_, newState, err := Reindex(ctx, db, engine, testMeta(spec.ID), 0, time.Now().UnixNano())
 	require.NoError(t, err)
 
 	state, ok := engine.Lookup(spec.ID)
@@ -163,16 +165,116 @@ func TestReindex_DriftIsolation(t *testing.T) {
 	require.NotSame(t, newState, state, "prepared reindex state must remain unpublished until the hook commits it")
 }
 
+func TestSelectPromotionSplitSources(t *testing.T) {
+	got := selectPromotionSplitSources([]uint64{0, 1536, 900, 400, 1300}, 4, 7, 512)
+	require.Equal(t, []promotionSplitSource{
+		{clusterID: 1, count: 1536, splits: 2},
+		{clusterID: 4, count: 1300, splits: 1},
+	}, got)
+}
+
+func TestPromotionWarmStartCentroids_SplitsHeavyClusters(t *testing.T) {
+	tdb, engine := func(t *testing.T) (*testDBWithMetaStore, *vecindex.Engine) {
+		t.Helper()
+		engine := vecindex.NewEngine()
+		SetVectorUDFProvider(engine)
+		t.Cleanup(func() { SetVectorUDFProvider(nil) })
+
+		tdb := openTestDBWithMeta(t, t.TempDir()+"/promotion.db")
+		db := tdb.DB
+		_, err := db.Exec(`CREATE TABLE docs (id INTEGER PRIMARY KEY, embed BLOB)`)
+		require.NoError(t, err)
+		_, err = db.Exec(`CREATE TABLE IF NOT EXISTS __marmot_vector_indexes (
+			index_name TEXT PRIMARY KEY,
+			table_name TEXT NOT NULL,
+			column_name TEXT NOT NULL,
+			database_name TEXT NOT NULL,
+			metric TEXT NOT NULL,
+			dim INTEGER NOT NULL,
+			nlist INTEGER NOT NULL,
+			nprobe INTEGER NOT NULL,
+			auto_nlist INTEGER NOT NULL DEFAULT 0,
+			auto_nprobe INTEGER NOT NULL DEFAULT 0,
+			target_partition_size INTEGER NOT NULL DEFAULT 512,
+			max_norm REAL NOT NULL,
+			status TEXT NOT NULL,
+			created_at INTEGER NOT NULL
+		)`)
+		require.NoError(t, err)
+		_, err = db.Exec(`INSERT INTO __marmot_vector_indexes
+			(index_name, table_name, column_name, database_name, metric, dim, nlist, nprobe, auto_nlist, auto_nprobe, target_partition_size, max_norm, status, created_at)
+			VALUES ('embeddings', 'docs', 'embed', 'test', 'l2', 2, 2, 1, 0, 0, 4, 0, 'ready', ?)`, time.Now().UnixNano())
+		require.NoError(t, err)
+		return tdb, engine
+	}(t)
+	db := tdb.DB
+
+	spec := vecindex.IVFSpec{ID: "embeddings", Dim: 2, Metric: vecindex.MetricL2, Nlist: 2, Nprobe: 1, Seed: 42}
+	rowID := 1
+	for _, vec := range [][]float32{
+		{0, 0}, {0.2, 0.1}, {-0.1, 0.2}, {0.1, -0.1},
+		{5, 5}, {5.2, 5.1}, {4.8, 5.1}, {5.1, 4.9},
+		{10, 10}, {10.2, 9.8}, {9.8, 10.3}, {10.1, 10.1},
+		{30, 30}, {30.2, 29.9}, {29.8, 30.1}, {30.1, 30.2},
+	} {
+		insertTestVec(t, db, rowID, vec)
+		rowID++
+	}
+	require.NoError(t, BulkPopulate(context.Background(), db, engine, time.Now().UnixNano(), "docs", "embed", spec, 4))
+
+	state, ok := engine.Lookup(spec.ID)
+	require.True(t, ok)
+	generation, err := RebuildSegmentGeneration(context.Background(), db, tdb.dbPath, VectorIndexMeta{
+		IndexName:           spec.ID,
+		TableName:           "docs",
+		ColumnName:          "embed",
+		Database:            "test",
+		Metric:              "l2",
+		Dim:                 2,
+		Nlist:               2,
+		Nprobe:              1,
+		TargetPartitionSize: 4,
+		CreatedAt:           time.Now().UnixNano(),
+	}, spec, state.ProbeState(), 0, nil)
+	require.NoError(t, err)
+	state.StoreSegmentStore(generation)
+	base := state.ProbeState().Snapshot()
+	expanded, err := promotionWarmStartCentroids(state, vecindex.IVFSpec{
+		ID:     spec.ID,
+		Dim:    spec.Dim,
+		Metric: spec.Metric,
+		Nlist:  4,
+		Nprobe: 1,
+		Seed:   spec.Seed,
+	}, base, 4)
+	require.NoError(t, err)
+	require.Len(t, expanded, 4)
+
+	extras := expanded[len(base):]
+	require.Len(t, extras, 2)
+	for _, extra := range extras {
+		best := float32(math.MaxFloat32)
+		for _, centroid := range base {
+			dist := metric.Distance(metric.MetricL2, extra, centroid)
+			if dist < best {
+				best = dist
+			}
+		}
+		require.Greater(t, best, float32(1.0))
+	}
+}
+
 func testMeta(idx string) VectorIndexMeta {
 	return VectorIndexMeta{
-		IndexName:  idx,
-		TableName:  "docs",
-		ColumnName: "embed",
-		Database:   "test",
-		Metric:     "l2",
-		Dim:        4,
-		Nlist:      4,
-		Nprobe:     2,
-		Status:     "reindexing",
+		IndexName:           idx,
+		TableName:           "docs",
+		ColumnName:          "embed",
+		Database:            "test",
+		Metric:              "l2",
+		Dim:                 4,
+		Nlist:               4,
+		Nprobe:              2,
+		TargetPartitionSize: defaultTargetPartitionSize,
+		Status:              "reindexing",
 	}
 }

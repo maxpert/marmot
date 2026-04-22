@@ -143,7 +143,7 @@ func TestStableIndexSeed_ConcurrentCreateConvergence(t *testing.T) {
 			Nprobe: nodeMeta.Nprobe,
 			Seed:   StableIndexSeed(nodeMeta),
 		}
-		require.NoError(t, BulkPopulate(ctx, db1, engine, 1000, "docs", "embed", spec))
+		require.NoError(t, BulkPopulate(ctx, db1, engine, 1000, "docs", "embed", spec, 100))
 
 		state, ok := engine.Lookup(idx)
 		require.True(t, ok)

@@ -223,3 +223,37 @@ func (m *SegmentRowMap) Lookup(rowID int64) (SegmentRowLocation, bool, error) {
 	}
 	return SegmentRowLocation{}, false, nil
 }
+
+func (m *SegmentRowMap) Scan(visit func(SegmentRowLocation) bool) error {
+	if m == nil || m.file == nil || visit == nil || m.entryCount == 0 {
+		return nil
+	}
+	buf := make([]byte, segmentRowMapEntrySize*1024)
+	offset := int64(segmentRowMapHdrSize)
+	remaining := m.entryCount
+	for remaining > 0 {
+		entriesThisChunk := int(remaining)
+		if entriesThisChunk > 1024 {
+			entriesThisChunk = 1024
+		}
+		chunkBytes := entriesThisChunk * segmentRowMapEntrySize
+		if _, err := m.file.ReadAt(buf[:chunkBytes], offset); err != nil {
+			return err
+		}
+		cursor := 0
+		for i := 0; i < entriesThisChunk; i++ {
+			loc := SegmentRowLocation{
+				RowID:     int64(binary.LittleEndian.Uint64(buf[cursor : cursor+8])),
+				ClusterID: int64(binary.LittleEndian.Uint32(buf[cursor+8 : cursor+12])),
+				Offset:    binary.LittleEndian.Uint64(buf[cursor+16 : cursor+24]),
+			}
+			if !visit(loc) {
+				return nil
+			}
+			cursor += segmentRowMapEntrySize
+		}
+		offset += int64(chunkBytes)
+		remaining -= uint64(entriesThisChunk)
+	}
+	return nil
+}

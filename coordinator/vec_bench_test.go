@@ -87,6 +87,7 @@ func setupBench100KWith(t testing.TB, nlist, nprobe int) *benchSetup {
 	db.SetVectorUDFProvider(engine)
 
 	hook := db.NewEngineHook(engine, dbMgr)
+	hook.BindVectorIndexManager(vecMgr)
 	vecMgr.SetLifecycleHook(hook)
 	vecMgr.SetEngineProvider(hook)
 	vecMgr.SetReindexHook(hook)

@@ -17,27 +17,32 @@ const (
 )
 
 type SegmentManifest struct {
-	Version           uint32   `msgpack:"version"`
-	Database          string   `msgpack:"database"`
-	IndexName         string   `msgpack:"index_name"`
-	IndexCreatedAt    int64    `msgpack:"index_created_at"`
-	Metric            string   `msgpack:"metric"`
-	Dim               uint32   `msgpack:"dim"`
-	InternalDim       uint32   `msgpack:"internal_dim"`
-	CentroidEpoch     uint64   `msgpack:"centroid_epoch"`
-	CentroidBlob      []byte   `msgpack:"centroid_blob"`
-	AppliedOverlaySeq uint64   `msgpack:"applied_overlay_seq"`
-	Generation        uint64   `msgpack:"generation"`
-	DataFile          string   `msgpack:"data_file"`
-	DataFileSize      uint64   `msgpack:"data_file_size"`
-	DataFileSHA256    string   `msgpack:"data_file_sha256"`
-	RowMapFile        string   `msgpack:"rowmap_file"`
-	RowMapFileSize    uint64   `msgpack:"rowmap_file_size"`
-	RowMapFileSHA256  string   `msgpack:"rowmap_file_sha256"`
-	MaxCluster        uint32   `msgpack:"max_cluster"`
-	RowCount          uint64   `msgpack:"row_count"`
-	LayoutHotClusters []uint32 `msgpack:"layout_hot_clusters,omitempty"`
-	CreatedAtUnixNano int64    `msgpack:"created_at_unix_nano"`
+	Version                  uint32      `msgpack:"version"`
+	Database                 string      `msgpack:"database"`
+	IndexName                string      `msgpack:"index_name"`
+	IndexCreatedAt           int64       `msgpack:"index_created_at"`
+	Metric                   string      `msgpack:"metric"`
+	Dim                      uint32      `msgpack:"dim"`
+	InternalDim              uint32      `msgpack:"internal_dim"`
+	CentroidEpoch            uint64      `msgpack:"centroid_epoch"`
+	CentroidBlob             []byte      `msgpack:"centroid_blob"`
+	AppliedOverlaySeq        uint64      `msgpack:"applied_overlay_seq"`
+	Generation               uint64      `msgpack:"generation"`
+	DataFile                 string      `msgpack:"data_file"`
+	DataFileSize             uint64      `msgpack:"data_file_size"`
+	DataFileSHA256           string      `msgpack:"data_file_sha256"`
+	RowMapFile               string      `msgpack:"rowmap_file"`
+	RowMapFileSize           uint64      `msgpack:"rowmap_file_size"`
+	RowMapFileSHA256         string      `msgpack:"rowmap_file_sha256"`
+	MaxCluster               uint32      `msgpack:"max_cluster"`
+	RowCount                 uint64      `msgpack:"row_count"`
+	ClusterRowCounts         []uint64    `msgpack:"cluster_row_counts,omitempty"`
+	ClusterVectorSums        [][]float32 `msgpack:"cluster_vector_sums,omitempty"`
+	RowsModifiedSinceRebuild uint64      `msgpack:"rows_modified_since_rebuild,omitempty"`
+	LastRebuildRowCount      uint64      `msgpack:"last_rebuild_row_count,omitempty"`
+	ConsecutiveSkewCycles    uint32      `msgpack:"consecutive_skew_cycles,omitempty"`
+	LayoutHotClusters        []uint32    `msgpack:"layout_hot_clusters,omitempty"`
+	CreatedAtUnixNano        int64       `msgpack:"created_at_unix_nano"`
 }
 
 type SegmentCurrent struct {

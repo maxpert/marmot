@@ -1,0 +1,241 @@
+//go:build sqlite_preupdate_hook
+// +build sqlite_preupdate_hook
+
+package db
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/maxpert/marmot/common"
+	"github.com/maxpert/marmot/hlc"
+	"github.com/maxpert/marmot/modules/vecindex"
+	"github.com/stretchr/testify/require"
+)
+
+func TestIncrementalMerge_PublishesNewGenerationAndClearsOverlay(t *testing.T) {
+	tmpDir := t.TempDir()
+	clock := hlc.NewClock(1)
+
+	dbMgr, err := NewDatabaseManager(tmpDir, 1, clock)
+	require.NoError(t, err)
+	require.NoError(t, dbMgr.CreateDatabase("test"))
+
+	vecMgr := NewVectorIndexManager(dbMgr)
+	dbMgr.SetVectorIndexManager(vecMgr)
+
+	engine := vecindex.NewEngine()
+	SetVectorUDFProvider(engine)
+	t.Cleanup(func() { SetVectorUDFProvider(nil) })
+
+	hook := NewEngineHook(engine, dbMgr)
+	hook.BindVectorIndexManager(vecMgr)
+	t.Cleanup(func() {
+		cleanupIndexWatchers(t, hook, dbMgr, "test", "embeddings")
+	})
+	vecMgr.SetLifecycleHook(hook)
+	vecMgr.SetEngineProvider(hook)
+	vecMgr.SetReindexHook(hook)
+	require.NoError(t, vecMgr.Start(context.Background()))
+
+	conn, err := dbMgr.GetDatabaseConnection("test")
+	require.NoError(t, err)
+	_, err = conn.Exec(`CREATE TABLE docs (id INTEGER PRIMARY KEY, embed BLOB)`)
+	require.NoError(t, err)
+
+	meta := common.VectorIndexMeta{
+		IndexName:           "embeddings",
+		TableName:           "docs",
+		ColumnName:          "embed",
+		Database:            "test",
+		Metric:              "cosine",
+		Dim:                 4,
+		TargetPartitionSize: 32,
+		CreatedAt:           time.Now().UnixNano(),
+	}
+	require.NoError(t, vecMgr.CreateIndex(context.Background(), meta))
+
+	const bootstrapRows = bootstrapMinTargetPartitions * 32
+	for i := 0; i < bootstrapRows; i++ {
+		_, err := conn.Exec(`INSERT INTO docs (id, embed) VALUES (?, ?)`, i+1, encodeVec(t, []float32{
+			1, float32(i % 7), float32((i + 1) % 11), float32((i + 2) % 13),
+		}))
+		require.NoError(t, err)
+	}
+
+	var state *vecindex.IndexState
+	require.Eventually(t, func() bool {
+		var ok bool
+		state, ok = engine.Lookup(meta.IndexName)
+		return ok && state.ProbeVersion() > 0 && state.LoadSegmentStore() != nil
+	}, 30*time.Second, 100*time.Millisecond)
+
+	oldEpoch := state.ProbeVersion()
+	oldGeneration := state.LoadSegmentStore().Data.Generation()
+	hook.stopMaintenanceWatcher(meta.IndexName)
+
+	raw := encodeVec(t, []float32{0.1, 0.9, 0.2, 0.8})
+	_, err = conn.Exec(`INSERT INTO docs (id, embed) VALUES (?, ?)`, bootstrapRows+1, raw)
+	require.NoError(t, err)
+	overlay := state.LoadOverlay()
+	require.NotNil(t, overlay)
+	snapshotBefore := overlay.Snapshot()
+	require.NotNil(t, snapshotBefore)
+	mutation, err := buildUpsertMutation(state, state.Spec(), state.ProbeVersion(), bootstrapRows+1, raw, snapshotBefore.LastSequence()+1)
+	require.NoError(t, err)
+	require.NoError(t, overlay.ApplyCommittedBatch([]vecindex.OverlayMutation{mutation}))
+	newCluster, newVec, err := maintenancePreparedCluster(state, state.Spec(), raw)
+	require.NoError(t, err)
+	state.RecordClusterMutation(0, nil, newCluster, newVec)
+	state.RecordRowsModified(1)
+
+	require.Eventually(t, func() bool {
+		state, _ = engine.Lookup(meta.IndexName)
+		overlay := state.LoadOverlay()
+		return overlay != nil && overlay.Snapshot() != nil && overlay.Snapshot().Len() > 0
+	}, 10*time.Second, 50*time.Millisecond)
+
+	dbPath, err := dbMgr.GetDatabasePath("test")
+	require.NoError(t, err)
+
+	state, _ = engine.Lookup(meta.IndexName)
+	require.NoError(t, hook.runIncrementalMerge(context.Background(), dbPath, meta, state.Spec(), state))
+
+	state, _ = engine.Lookup(meta.IndexName)
+	require.Equal(t, oldEpoch, state.ProbeVersion())
+	require.NotNil(t, state.LoadSegmentStore())
+	require.Greater(t, state.LoadSegmentStore().Data.Generation(), oldGeneration)
+	require.Equal(t, state.ProbeVersion(), state.LoadSegmentStore().Centroids.Epoch())
+
+	overlay = state.LoadOverlay()
+	require.NotNil(t, overlay)
+	snapshot := overlay.Snapshot()
+	require.NotNil(t, snapshot)
+	require.Equal(t, state.ProbeVersion(), snapshot.Epoch())
+	require.Zero(t, snapshot.Len())
+
+	loc, ok, err := state.LoadSegmentStore().RowMap.Lookup(int64(bootstrapRows + 1))
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Greater(t, loc.ClusterID, int64(0))
+}
+
+func TestIncrementalMerge_PreservesOverlayTailAcrossPublish(t *testing.T) {
+	tmpDir := t.TempDir()
+	clock := hlc.NewClock(1)
+
+	dbMgr, err := NewDatabaseManager(tmpDir, 1, clock)
+	require.NoError(t, err)
+	require.NoError(t, dbMgr.CreateDatabase("test"))
+
+	vecMgr := NewVectorIndexManager(dbMgr)
+	dbMgr.SetVectorIndexManager(vecMgr)
+
+	engine := vecindex.NewEngine()
+	SetVectorUDFProvider(engine)
+	t.Cleanup(func() { SetVectorUDFProvider(nil) })
+
+	hook := NewEngineHook(engine, dbMgr)
+	hook.BindVectorIndexManager(vecMgr)
+	t.Cleanup(func() {
+		cleanupIndexWatchers(t, hook, dbMgr, "test", "embeddings")
+	})
+	vecMgr.SetLifecycleHook(hook)
+	vecMgr.SetEngineProvider(hook)
+	vecMgr.SetReindexHook(hook)
+	require.NoError(t, vecMgr.Start(context.Background()))
+
+	conn, err := dbMgr.GetDatabaseConnection("test")
+	require.NoError(t, err)
+	_, err = conn.Exec(`CREATE TABLE docs (id INTEGER PRIMARY KEY, embed BLOB)`)
+	require.NoError(t, err)
+
+	meta := common.VectorIndexMeta{
+		IndexName:           "embeddings",
+		TableName:           "docs",
+		ColumnName:          "embed",
+		Database:            "test",
+		Metric:              "cosine",
+		Dim:                 4,
+		TargetPartitionSize: 32,
+		CreatedAt:           time.Now().UnixNano(),
+	}
+	require.NoError(t, vecMgr.CreateIndex(context.Background(), meta))
+
+	const bootstrapRows = bootstrapMinTargetPartitions * 32
+	for i := 0; i < bootstrapRows; i++ {
+		_, err := conn.Exec(`INSERT INTO docs (id, embed) VALUES (?, ?)`, i+1, encodeVec(t, []float32{
+			1, float32(i % 7), float32((i + 1) % 11), float32((i + 2) % 13),
+		}))
+		require.NoError(t, err)
+	}
+
+	var state *vecindex.IndexState
+	require.Eventually(t, func() bool {
+		var ok bool
+		state, ok = engine.Lookup(meta.IndexName)
+		return ok && state.ProbeVersion() > 0 && state.LoadSegmentStore() != nil
+	}, 30*time.Second, 100*time.Millisecond)
+
+	hook.stopMaintenanceWatcher(meta.IndexName)
+	oldEpoch := state.ProbeVersion()
+
+	applyTail := func(rowID int64, vec []byte) {
+		_, err := conn.Exec(`INSERT INTO docs (id, embed) VALUES (?, ?)`, rowID, vec)
+		require.NoError(t, err)
+		overlay := state.LoadOverlay()
+		require.NotNil(t, overlay)
+		snapshot := overlay.Snapshot()
+		require.NotNil(t, snapshot)
+		mutation, err := buildUpsertMutation(state, state.Spec(), state.ProbeVersion(), rowID, vec, snapshot.LastSequence()+1)
+		require.NoError(t, err)
+		require.NoError(t, overlay.ApplyCommittedBatch([]vecindex.OverlayMutation{mutation}))
+		newCluster, newVec, err := maintenancePreparedCluster(state, state.Spec(), vec)
+		require.NoError(t, err)
+		state.RecordClusterMutation(0, nil, newCluster, newVec)
+		state.RecordRowsModified(1)
+	}
+
+	firstRaw := encodeVec(t, []float32{0.1, 0.9, 0.2, 0.8})
+	applyTail(bootstrapRows+1, firstRaw)
+
+	dbPath, err := dbMgr.GetDatabasePath("test")
+	require.NoError(t, err)
+
+	plan, err := hook.prepareIncrementalMerge(context.Background(), dbPath, meta, state.Spec(), state)
+	require.NoError(t, err)
+	require.NotNil(t, plan)
+	defer plan.Close()
+
+	tailRaw := encodeVec(t, []float32{0.2, 0.8, 0.4, 0.6})
+	applyTail(bootstrapRows+2, tailRaw)
+
+	require.NoError(t, hook.publishIncrementalMerge(dbPath, meta, plan))
+
+	state, _ = engine.Lookup(meta.IndexName)
+	require.Equal(t, oldEpoch, state.ProbeVersion())
+	require.Equal(t, state.ProbeVersion(), plan.currentEpoch)
+
+	overlay := state.LoadOverlay()
+	require.NotNil(t, overlay)
+	snapshot := overlay.Snapshot()
+	require.NotNil(t, snapshot)
+	require.Equal(t, state.ProbeVersion(), snapshot.Epoch())
+	require.Equal(t, 1, snapshot.Len())
+	clusterID, ok := snapshot.RowCluster(int64(bootstrapRows + 2))
+	require.True(t, ok)
+	require.Greater(t, clusterID, int64(0))
+
+	loc, ok, err := state.LoadSegmentStore().RowMap.Lookup(int64(bootstrapRows + 1))
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Greater(t, loc.ClusterID, int64(0))
+
+	liveCounts := state.LoadMaintenanceState().LiveClusterRowCounts()
+	var tracked uint64
+	for clusterID := 1; clusterID < len(liveCounts); clusterID++ {
+		tracked += liveCounts[clusterID]
+	}
+	require.Equal(t, uint64(bootstrapRows+2), tracked)
+}

@@ -68,7 +68,7 @@ func TestBulkPopulate_Basic(t *testing.T) {
 	insertTestVec(t, db, 4, []float32{0.9, 0.1, 0})
 
 	spec := vecindex.IVFSpec{ID: idx, Dim: 3, Metric: vecindex.MetricL2, Nlist: 2, Seed: 42}
-	err := BulkPopulate(ctx, db, engine, 1000, "docs", "embed", spec)
+	err := BulkPopulate(ctx, db, engine, 1000, "docs", "embed", spec, 100)
 	require.NoError(t, err)
 
 	state, ok := engine.Lookup(idx)
@@ -91,7 +91,7 @@ func TestBulkPopulate_EmptyTable(t *testing.T) {
 	db, engine := setupPopulateDB(t, idx)
 
 	spec := vecindex.IVFSpec{ID: idx, Dim: 2, Metric: vecindex.MetricL2, Nlist: 4, Seed: 1}
-	err := BulkPopulate(ctx, db, engine, 1000, "docs", "embed", spec)
+	err := BulkPopulate(ctx, db, engine, 1000, "docs", "embed", spec, 100)
 	require.NoError(t, err)
 
 	state, ok := engine.Lookup(idx)
@@ -122,13 +122,63 @@ func TestBulkPopulate_NlistCappedToSampleCount(t *testing.T) {
 	insertTestVec(t, db, 3, []float32{0.5, 0.5})
 
 	spec := vecindex.IVFSpec{ID: idx, Dim: 2, Metric: vecindex.MetricL2, Nlist: 10, Seed: 1}
-	err := BulkPopulate(ctx, db, engine, 1000, "docs", "embed", spec)
+	err := BulkPopulate(ctx, db, engine, 1000, "docs", "embed", spec, 100)
 	require.NoError(t, err)
 
 	state, ok := engine.Lookup(idx)
 	require.True(t, ok)
 	require.NotNil(t, state.ProbeState())
 	require.Equal(t, 3, state.ProbeState().Len())
+}
+
+func TestComputeCentroids_WarmStartExpandsToRequestedK(t *testing.T) {
+	ctx := context.Background()
+	db := openVecDB(t)
+	_, err := db.Exec(`CREATE TABLE docs (id INTEGER PRIMARY KEY, embed BLOB)`)
+	require.NoError(t, err)
+
+	for i, vec := range [][]float32{
+		{0, 0}, {0.1, 0},
+		{10, 10}, {10.1, 10},
+		{-10, 10}, {-10.1, 10},
+		{10, -10}, {10.1, -10},
+	} {
+		insertTestVec(t, db, i+1, vec)
+	}
+
+	cs, err := computeCentroids(ctx, db, "docs", "embed", vecindex.IVFSpec{
+		ID:     "emb",
+		Dim:    2,
+		Metric: vecindex.MetricL2,
+		Nlist:  4,
+		Seed:   7,
+	}, 2, [][]float32{{0, 0}, {10, 10}})
+	require.NoError(t, err)
+	require.NotNil(t, cs)
+	require.Equal(t, 4, cs.Len())
+}
+
+func TestComputeCentroids_CapsToIndexableRows(t *testing.T) {
+	ctx := context.Background()
+	db := openVecDB(t)
+	_, err := db.Exec(`CREATE TABLE docs (id INTEGER PRIMARY KEY, embed BLOB)`)
+	require.NoError(t, err)
+
+	insertTestVec(t, db, 1, []float32{0, 0})
+	insertTestVec(t, db, 2, []float32{0, 0})
+	insertTestVec(t, db, 3, []float32{1, 0})
+	insertTestVec(t, db, 4, []float32{0, 1})
+
+	cs, err := computeCentroids(ctx, db, "docs", "embed", vecindex.IVFSpec{
+		ID:     "emb",
+		Dim:    2,
+		Metric: vecindex.MetricCosine,
+		Nlist:  4,
+		Seed:   11,
+	}, 2, nil)
+	require.NoError(t, err)
+	require.NotNil(t, cs)
+	require.Equal(t, 2, cs.Len())
 }
 
 func TestDecodeVecBlob_RoundTrip(t *testing.T) {

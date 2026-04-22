@@ -27,6 +27,24 @@ type OpenedSegmentGeneration struct {
 	Centroids *kmeans.CentroidSet
 }
 
+func segmentGenerationFromOpened(opened *OpenedSegmentGeneration) *vecindex.SegmentGeneration {
+	if opened == nil || opened.Manifest == nil {
+		return nil
+	}
+	return &vecindex.SegmentGeneration{
+		Data:                     opened.Data,
+		RowMap:                   opened.RowMap,
+		Centroids:                opened.Centroids,
+		AppliedOverlaySeq:        opened.Manifest.AppliedOverlaySeq,
+		ClusterRowCounts:         append([]uint64(nil), opened.Manifest.ClusterRowCounts...),
+		ClusterVectorSums:        cloneClusterVectorSums(opened.Manifest.ClusterVectorSums),
+		RowsModifiedSinceRebuild: opened.Manifest.RowsModifiedSinceRebuild,
+		LastRebuildRowCount:      opened.Manifest.LastRebuildRowCount,
+		ConsecutiveSkewCycles:    opened.Manifest.ConsecutiveSkewCycles,
+		LayoutHotClusters:        int64Slice(opened.Manifest.LayoutHotClusters),
+	}
+}
+
 const segmentLayoutSeed uint64 = 0x9e3779b97f4a7c15
 const segmentLayoutHotClusterLimit = 64
 
@@ -332,6 +350,12 @@ func validatePublishableSegmentManifest(manifest *vecindex.SegmentManifest) erro
 	if manifest.RowCount == 0 {
 		return fmt.Errorf("missing row count")
 	}
+	if len(manifest.ClusterRowCounts) > 0 && len(manifest.ClusterRowCounts) != int(manifest.MaxCluster)+1 {
+		return fmt.Errorf("cluster row count metadata length mismatch")
+	}
+	if len(manifest.ClusterVectorSums) > 0 && len(manifest.ClusterVectorSums) != int(manifest.MaxCluster)+1 {
+		return fmt.Errorf("cluster vector sums metadata length mismatch")
+	}
 	return nil
 }
 
@@ -370,6 +394,20 @@ func validateOpenedSegmentGeneration(
 	}
 	if manifest.RowCount != dataStore.RowCount() || manifest.RowCount != rowMap.EntryCount() {
 		return fmt.Errorf("segment store row count mismatch")
+	}
+	if len(manifest.ClusterRowCounts) > 0 {
+		for clusterID := 1; clusterID <= dataStore.MaxCluster(); clusterID++ {
+			if got, want := dataStore.ClusterCount(int64(clusterID)), manifest.ClusterRowCounts[clusterID]; got != want {
+				return fmt.Errorf("segment cluster %d row count mismatch", clusterID)
+			}
+		}
+	}
+	if len(manifest.ClusterVectorSums) > 0 {
+		for clusterID := 1; clusterID <= dataStore.MaxCluster(); clusterID++ {
+			if len(manifest.ClusterVectorSums[clusterID]) != spec.InternalDim() {
+				return fmt.Errorf("segment cluster %d vector-sum dim mismatch", clusterID)
+			}
+		}
 	}
 	if dataStore.Metric() != spec.InternalMetric() {
 		return fmt.Errorf("segment store header metric mismatch")
@@ -542,6 +580,8 @@ SELECT rowid, %s
 	}
 	rowLocs := make([]rowLoc, 0, 1024)
 	dataEncoding, vecBytes := vecindex.StableMemberEncodingSpec(spec)
+	clusterRowCounts := make([]uint64, maxCluster+1)
+	clusterVectorSums := make([][]float32, maxCluster+1)
 	type clusterSpool struct {
 		path string
 		file *os.File
@@ -593,6 +633,13 @@ SELECT rowid, %s
 		if err != nil {
 			return nil, fmt.Errorf("segment generation rebuild: assign rowid %d: %w", rowID, err)
 		}
+		if clusterVectorSums[clusterID] == nil {
+			clusterVectorSums[clusterID] = make([]float32, spec.InternalDim())
+		}
+		preparedVec := metric.BytesToFloat32(prepared)
+		for i, value := range preparedVec {
+			clusterVectorSums[clusterID][i] += value
+		}
 		enc, encoded, err := vecindex.EncodeStableMember(spec, cs, clusterID, prepared)
 		if err != nil {
 			return nil, fmt.Errorf("segment generation rebuild: encode rowid %d: %w", rowID, err)
@@ -617,6 +664,7 @@ SELECT rowid, %s
 		if _, err := spool.file.Write(encoded); err != nil {
 			return nil, fmt.Errorf("segment generation rebuild: write spool vec: %w", err)
 		}
+		clusterRowCounts[clusterID]++
 		rowCount++
 	}
 	if err := rows.Err(); err != nil {
@@ -703,21 +751,26 @@ SELECT rowid, %s
 	rowMapWriter = nil
 
 	manifest := vecindex.SegmentManifest{
-		Version:           vecindex.SegmentStoreVersion,
-		Database:          meta.Database,
-		IndexName:         meta.IndexName,
-		IndexCreatedAt:    meta.CreatedAt,
-		Metric:            meta.Metric,
-		Dim:               uint32(meta.Dim),
-		InternalDim:       uint32(spec.InternalDim()),
-		CentroidEpoch:     expectedEpoch,
-		CentroidBlob:      mustCentroidBlob(cs),
-		AppliedOverlaySeq: appliedOverlaySeq,
-		Generation:        generation,
-		MaxCluster:        uint32(maxCluster),
-		RowCount:          rowCount,
-		LayoutHotClusters: uint32Slice(layoutHotClusters),
-		CreatedAtUnixNano: time.Now().UnixNano(),
+		Version:                  vecindex.SegmentStoreVersion,
+		Database:                 meta.Database,
+		IndexName:                meta.IndexName,
+		IndexCreatedAt:           meta.CreatedAt,
+		Metric:                   meta.Metric,
+		Dim:                      uint32(meta.Dim),
+		InternalDim:              uint32(spec.InternalDim()),
+		CentroidEpoch:            expectedEpoch,
+		CentroidBlob:             mustCentroidBlob(cs),
+		AppliedOverlaySeq:        appliedOverlaySeq,
+		Generation:               generation,
+		MaxCluster:               uint32(maxCluster),
+		RowCount:                 rowCount,
+		ClusterRowCounts:         clusterRowCounts,
+		ClusterVectorSums:        cloneClusterVectorSums(clusterVectorSums),
+		RowsModifiedSinceRebuild: 0,
+		LastRebuildRowCount:      rowCount,
+		ConsecutiveSkewCycles:    nextSkewCycleCount(clusterRowCounts, meta.TargetPartitionSize, 0),
+		LayoutHotClusters:        uint32Slice(layoutHotClusters),
+		CreatedAtUnixNano:        time.Now().UnixNano(),
 	}
 	if err := publishSegmentGeneration(dir, manifest, dataStore.Path(), rowMapStore.Path()); err != nil {
 		_ = dataStore.Close()
@@ -731,13 +784,7 @@ SELECT rowid, %s
 	if err != nil {
 		return nil, err
 	}
-	return &vecindex.SegmentGeneration{
-		Data:              opened.Data,
-		RowMap:            opened.RowMap,
-		Centroids:         opened.Centroids,
-		AppliedOverlaySeq: opened.Manifest.AppliedOverlaySeq,
-		LayoutHotClusters: int64Slice(opened.Manifest.LayoutHotClusters),
-	}, nil
+	return segmentGenerationFromOpened(opened), nil
 }
 
 func buildAndStoreSegmentGeneration(
@@ -772,6 +819,13 @@ func buildAndStoreSegmentGeneration(
 	)
 	if err != nil {
 		return err
+	}
+	if generation != nil {
+		var previous uint32
+		if maintenance := state.LoadMaintenanceState(); maintenance != nil {
+			_, _, previous = maintenance.Stats()
+		}
+		generation.ConsecutiveSkewCycles = nextSkewCycleCount(generation.ClusterRowCounts, meta.TargetPartitionSize, previous)
 	}
 	state.StoreSegmentStore(generation)
 	return nil
@@ -921,6 +975,20 @@ func int64Slice(clusterIDs []uint32) []int64 {
 	return out
 }
 
+func cloneClusterVectorSums(src [][]float32) [][]float32 {
+	if len(src) == 0 {
+		return nil
+	}
+	out := make([][]float32, len(src))
+	for i := range src {
+		if len(src[i]) == 0 {
+			continue
+		}
+		out[i] = append([]float32(nil), src[i]...)
+	}
+	return out
+}
+
 func openAndStoreOverlay(dbPath, indexName string, state *vecindex.IndexState, epoch uint64) error {
 	if state == nil || dbPath == "" {
 		return nil
@@ -937,7 +1005,71 @@ func openAndStoreOverlay(dbPath, indexName string, state *vecindex.IndexState, e
 		}
 	}
 	state.StoreOverlay(overlay)
+	if err := syncMaintenanceStateFromOverlay(state); err != nil {
+		state.ClearOverlay()
+		return err
+	}
 	return nil
+}
+
+func syncMaintenanceStateFromOverlay(state *vecindex.IndexState) error {
+	if state == nil {
+		return nil
+	}
+	maintenance := state.LoadMaintenanceState()
+	if maintenance == nil {
+		return nil
+	}
+	maintenance.ResetPending()
+	segments := state.LoadSegmentStore()
+	overlay := state.LoadOverlay()
+	if segments == nil || segments.Data == nil || segments.RowMap == nil || overlay == nil {
+		return nil
+	}
+	snapshot := overlay.Snapshot()
+	if snapshot == nil {
+		return nil
+	}
+	for _, mutation := range snapshot.MutationsAfter(segments.AppliedOverlaySeq) {
+		oldCluster, oldVec, err := loadStablePreparedForMaintenance(segments, state.Spec(), mutation.RowID)
+		if err != nil {
+			return err
+		}
+		var newCluster int64
+		var newVec []float32
+		if mutation.Kind != vecindex.OverlayMutationDelete {
+			newCluster = mutation.ClusterID
+			newVec = append([]float32(nil), metric.BytesToFloat32(mutation.Vec)...)
+		}
+		if mutation.Kind == vecindex.OverlayMutationUpsert {
+			oldCluster = 0
+			oldVec = nil
+		}
+		maintenance.RecordClusterMutation(oldCluster, oldVec, newCluster, newVec)
+	}
+	return nil
+}
+
+func loadStablePreparedForMaintenance(segments *vecindex.SegmentGeneration, spec vecindex.IVFSpec, rowID int64) (int64, []float32, error) {
+	if segments == nil || segments.Data == nil || segments.RowMap == nil || rowID == 0 {
+		return 0, nil, nil
+	}
+	loc, ok, err := segments.RowMap.Lookup(rowID)
+	if err != nil || !ok {
+		return 0, nil, err
+	}
+	readRowID, vecBytes, err := segments.Data.ReadEntryAt(loc.Offset)
+	if err != nil {
+		return 0, nil, err
+	}
+	if readRowID != rowID {
+		return 0, nil, fmt.Errorf("stable maintenance row mismatch: got %d want %d", readRowID, rowID)
+	}
+	prepared, err := decodeStableMemberPrepared(spec, segments.Centroids, loc.ClusterID, vecBytes)
+	if err != nil {
+		return 0, nil, err
+	}
+	return loc.ClusterID, prepared, nil
 }
 
 func BuildSegmentGenerationOnReopen(
@@ -955,13 +1087,7 @@ func BuildSegmentGenerationOnReopen(
 	if generation, err := openSegmentGeneration(dir, meta, spec, state.ProbeVersion()); err == nil && generation != nil {
 		state.SwapProbeState(generation.Centroids)
 		state.ResetDriftState(generation.Centroids)
-		state.StoreSegmentStore(&vecindex.SegmentGeneration{
-			Data:              generation.Data,
-			RowMap:            generation.RowMap,
-			Centroids:         generation.Centroids,
-			AppliedOverlaySeq: generation.Manifest.AppliedOverlaySeq,
-			LayoutHotClusters: int64Slice(generation.Manifest.LayoutHotClusters),
-		})
+		state.StoreSegmentStore(segmentGenerationFromOpened(generation))
 		if err := openAndStoreOverlay(dbPath, meta.IndexName, state, generation.Manifest.CentroidEpoch); err != nil {
 			return err
 		}

@@ -70,7 +70,7 @@ type EngineProvider interface {
 // VectorIndexMeta is an alias for the shared common.VectorIndexMeta.
 type VectorIndexMeta = common.VectorIndexMeta
 
-const defaultTargetPartitionSize = 100
+const defaultTargetPartitionSize = 512
 
 // VectorIndexManager manages vector index DDL lifecycle in SQLite.
 // It owns:
@@ -179,15 +179,24 @@ func (m *VectorIndexManager) CreateIndex(ctx context.Context, meta VectorIndexMe
 
 	// Auto-tune nlist and nprobe if not user-supplied (design §6.1).
 	if meta.AutoTuneNlist || meta.AutoTuneNprobe {
-		n, err := countRows(ctx, conn, meta.TableName)
+		metric, err := metricFromString(meta.Metric)
 		if err != nil {
-			return fmt.Errorf("vector index: count rows for auto-tune: %w", err)
+			return fmt.Errorf("vector index: parse metric for auto-tune: %w", err)
+		}
+		n, err := countIndexableRows(ctx, conn, meta.TableName, meta.ColumnName, vecindex.IVFSpec{
+			ID:      meta.IndexName,
+			Dim:     meta.Dim,
+			Metric:  metric,
+			MaxNorm: meta.MaxNorm,
+		})
+		if err != nil {
+			return fmt.Errorf("vector index: count indexable rows for auto-tune: %w", err)
 		}
 		if meta.AutoTuneNlist {
-			meta.Nlist = autoTuneNlist(n)
+			meta.Nlist = autoTuneNlistForTarget(n, meta.TargetPartitionSize)
 		}
 		if meta.AutoTuneNprobe {
-			meta.Nprobe = autoTuneNprobe(meta.Nlist)
+			meta.Nprobe = autoTuneNprobeForTarget(meta.Nlist, meta.TargetPartitionSize)
 		}
 		// Only preserve the auto flags when CREATE happened against an empty
 		// table; otherwise the parameters already reflect a meaningful corpus.
@@ -385,6 +394,17 @@ func (m *VectorIndexManager) removeCachedIndex(database, table, column string) {
 	key := indexCacheKey{database: database, table: table, column: column}
 	m.cacheMu.Lock()
 	delete(m.indexCache, key)
+	m.cacheMu.Unlock()
+}
+
+func (m *VectorIndexManager) storeCachedIndexMeta(meta *VectorIndexMeta) {
+	if m == nil || meta == nil {
+		return
+	}
+	key := indexCacheKey{database: meta.Database, table: meta.TableName, column: meta.ColumnName}
+	metaCopy := *meta
+	m.cacheMu.Lock()
+	m.indexCache[key] = &metaCopy
 	m.cacheMu.Unlock()
 }
 
@@ -747,9 +767,18 @@ func boolToInt(v bool) int {
 	return 0
 }
 
-// autoTuneNlist computes nlist = clamp(4·√n, 64, 2048) per design §6.1.
+// autoTuneNlist computes nlist from the default target partition size.
 func autoTuneNlist(n int64) int {
-	v := int(4 * math.Sqrt(float64(n)))
+	return autoTuneNlistForTarget(n, defaultTargetPartitionSize)
+}
+
+// autoTuneNlistForTarget computes nlist so average cluster size stays near the
+// requested target partition size, clamped to the supported IVF range.
+func autoTuneNlistForTarget(n int64, targetPartitionSize int) int {
+	if targetPartitionSize <= 0 {
+		targetPartitionSize = defaultTargetPartitionSize
+	}
+	v := int((n + int64(targetPartitionSize) - 1) / int64(targetPartitionSize))
 	if v < 64 {
 		return 64
 	}
@@ -759,11 +788,39 @@ func autoTuneNlist(n int64) int {
 	return v
 }
 
-// autoTuneNprobe computes nprobe = max(8, √nlist) per design §6.1.
-func autoTuneNprobe(nlist int) int {
-	v := int(math.Sqrt(float64(nlist)))
-	if v < 8 {
-		return 8
+const defaultScanBudgetRows = 8192
+
+func defaultScanBudgetRowsForTarget(targetPartitionSize int) int {
+	if targetPartitionSize <= 0 {
+		targetPartitionSize = defaultTargetPartitionSize
 	}
-	return v
+	budget := defaultScanBudgetRows
+	if widened := 16 * targetPartitionSize; widened > budget {
+		budget = widened
+	}
+	return budget
+}
+
+// autoTuneNprobe computes the derived/default probe count from the current
+// target partition size policy. It is introspection/default metadata only; the
+// query engine may further adapt the live probe prefix using row-budget logic.
+func autoTuneNprobe(nlist int) int {
+	return autoTuneNprobeForTarget(nlist, defaultTargetPartitionSize)
+}
+
+func autoTuneNprobeForTarget(nlist int, targetPartitionSize int) int {
+	if nlist <= 0 {
+		return 1
+	}
+	if targetPartitionSize <= 0 {
+		targetPartitionSize = defaultTargetPartitionSize
+	}
+	probe := int(math.Ceil(float64(defaultScanBudgetRowsForTarget(targetPartitionSize)) / float64(targetPartitionSize)))
+	if probe < 1 {
+		probe = 1
+	}
+	if probe > nlist {
+		probe = nlist
+	}
+	return probe
 }

@@ -163,6 +163,7 @@ func TestGoRank_DeltaOnlyAfterEmptyCreate(t *testing.T) {
 	t.Cleanup(func() { db.SetVectorUDFProvider(nil) })
 
 	hook := db.NewEngineHook(engine, dbMgr)
+	hook.BindVectorIndexManager(vecMgr)
 	vecMgr.SetLifecycleHook(hook)
 	vecMgr.SetEngineProvider(hook)
 	vecMgr.SetReindexHook(hook)

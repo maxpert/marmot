@@ -174,6 +174,38 @@ func TestOverlayJournal_ResetCompactsState(t *testing.T) {
 	require.Equal(t, int64(2), clusterID)
 }
 
+func TestJournaledOverlay_CompactAfterPreservesHighWatermark(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "overlay.journal")
+	overlay, err := OpenJournaledOverlay(path)
+	require.NoError(t, err)
+	require.NoError(t, overlay.ApplyCommittedBatch([]OverlayMutation{
+		{Kind: OverlayMutationUpsert, Epoch: 4, Sequence: 1, ClusterID: 1, RowID: 1, Vec: encodeOverlayTestVec(1, 0)},
+		{Kind: OverlayMutationDelete, Epoch: 4, Sequence: 2, RowID: 1},
+	}))
+	require.NoError(t, overlay.CompactAfter(2))
+	require.NoError(t, overlay.Close())
+
+	reopened, err := OpenJournaledOverlay(path)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, reopened.Close()) })
+
+	snapshot := reopened.Snapshot()
+	require.Equal(t, uint64(4), snapshot.Epoch())
+	require.Equal(t, uint64(2), snapshot.LastSequence())
+	require.Equal(t, 0, snapshot.Len())
+
+	require.NoError(t, reopened.ApplyCommittedBatch([]OverlayMutation{
+		{Kind: OverlayMutationUpsert, Epoch: 4, Sequence: 3, ClusterID: 2, RowID: 2, Vec: encodeOverlayTestVec(0, 1)},
+	}))
+	snapshot = reopened.Snapshot()
+	require.Equal(t, uint64(3), snapshot.LastSequence())
+	clusterID, ok := snapshot.RowCluster(2)
+	require.True(t, ok)
+	require.Equal(t, int64(2), clusterID)
+}
+
 func TestOverlayJournal_RejectsSequenceRegression(t *testing.T) {
 	t.Parallel()
 

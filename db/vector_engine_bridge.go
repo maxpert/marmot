@@ -13,6 +13,11 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
+const (
+	bootstrapMinTargetPartitions = 8
+	retireStateGracePeriod       = 30 * time.Second
+)
+
 // Ensure EngineHook implements both lifecycle hooks.
 var (
 	_ IndexLifecycleHook = (*EngineHook)(nil)
@@ -25,16 +30,25 @@ var (
 // It owns the step-10 flow from design §8.1: centroid check → k-means or
 // load → register → bulk populate → flip status='ready'.
 type EngineHook struct {
-	engine *vecindex.Engine
-	dbMgr  *DatabaseManager
+	engine   *vecindex.Engine
+	dbMgr    *DatabaseManager
+	indexMgr *VectorIndexManager
 
-	bootstrapMu       sync.Mutex
-	bootstrapSeq      uint64
-	bootstrapWatchers map[string]bootstrapWatcher
-	localChangeMu     sync.Mutex
+	bootstrapMu         sync.Mutex
+	bootstrapSeq        uint64
+	bootstrapWatchers   map[string]bootstrapWatcher
+	maintenanceMu       sync.Mutex
+	maintenanceSeq      uint64
+	maintenanceWatchers map[string]maintenanceWatcher
+	localChangeMu       sync.Mutex
 }
 
 type bootstrapWatcher struct {
+	cancel context.CancelFunc
+	seq    uint64
+}
+
+type maintenanceWatcher struct {
 	cancel context.CancelFunc
 	seq    uint64
 }
@@ -43,10 +57,25 @@ type bootstrapWatcher struct {
 // mgr.SetEngineProvider(h) to wire it into VectorIndexManager.
 func NewEngineHook(engine *vecindex.Engine, dbMgr *DatabaseManager) *EngineHook {
 	return &EngineHook{
-		engine:            engine,
-		dbMgr:             dbMgr,
-		bootstrapWatchers: make(map[string]bootstrapWatcher),
+		engine:              engine,
+		dbMgr:               dbMgr,
+		bootstrapWatchers:   make(map[string]bootstrapWatcher),
+		maintenanceWatchers: make(map[string]maintenanceWatcher),
 	}
+}
+
+func (h *EngineHook) BindVectorIndexManager(mgr *VectorIndexManager) {
+	h.indexMgr = mgr
+}
+
+func (h *EngineHook) retireState(state *vecindex.IndexState) {
+	if state == nil {
+		return
+	}
+	time.AfterFunc(retireStateGracePeriod, func() {
+		state.ClearOverlay()
+		state.ClearSegmentStore()
+	})
 }
 
 // OnIndexCreated implements IndexLifecycleHook.
@@ -79,7 +108,7 @@ func (h *EngineHook) OnIndexCreated(ctx context.Context, meta common.VectorIndex
 	}
 
 	updatedAt := time.Now().UnixNano()
-	if err := BulkPopulate(ctx, conn, h.engine, updatedAt, meta.TableName, meta.ColumnName, spec); err != nil {
+	if err := BulkPopulate(ctx, conn, h.engine, updatedAt, meta.TableName, meta.ColumnName, spec, meta.TargetPartitionSize); err != nil {
 		return fmt.Errorf("engine hook: bulk populate: %w", err)
 	}
 	if state, ok := h.engine.Lookup(meta.IndexName); ok {
@@ -94,6 +123,7 @@ func (h *EngineHook) OnIndexCreated(ctx context.Context, meta common.VectorIndex
 			if err := buildAndStoreSegmentGeneration(ctx, conn, dbPath, state, meta, spec); err != nil {
 				return fmt.Errorf("engine hook: build segment generation: %w", err)
 			}
+			h.startMaintenanceWatcher(meta)
 		}
 	}
 
@@ -107,6 +137,7 @@ func (h *EngineHook) OnIndexCreated(ctx context.Context, meta common.VectorIndex
 // probeState swap.
 func (h *EngineHook) OnIndexReindex(ctx context.Context, meta common.VectorIndexMeta) error {
 	h.stopBootstrapWatcher(meta.IndexName)
+	h.stopMaintenanceWatcher(meta.IndexName)
 	h.localChangeMu.Lock()
 	defer h.localChangeMu.Unlock()
 
@@ -143,6 +174,9 @@ func (h *EngineHook) OnIndexReindex(ctx context.Context, meta common.VectorIndex
 		if err := buildAndStoreSegmentGeneration(ctx, conn, dbPath, newState, meta, newState.Spec()); err != nil {
 			return fmt.Errorf("engine hook reindex: build segment generation: %w", err)
 		}
+		if err := openAndStoreOverlay(dbPath, meta.IndexName, newState, newState.ProbeVersion()); err != nil {
+			return fmt.Errorf("engine hook reindex: reset overlay: %w", err)
+		}
 	}
 	if _, err := conn.ExecContext(ctx,
 		`UPDATE __marmot_vector_indexes SET nlist=?, nprobe=?, status='ready' WHERE index_name=?`,
@@ -151,10 +185,11 @@ func (h *EngineHook) OnIndexReindex(ctx context.Context, meta common.VectorIndex
 		return fmt.Errorf("engine hook reindex: publish metadata: %w", err)
 	}
 	h.engine.Register(meta.IndexName, newState)
-	oldState.ClearOverlay()
-	oldState.ClearSegmentStore()
+	h.retireState(oldState)
 	if newState.ProbeVersion() == 0 {
 		h.startBootstrapWatcher(meta, newState.Spec())
+	} else {
+		h.startMaintenanceWatcher(meta)
 	}
 	publishOK = true
 	return nil
@@ -166,6 +201,7 @@ func (h *EngineHook) OnIndexReindex(ctx context.Context, meta common.VectorIndex
 // function that re-registers the state if the DDL fails (MEDIUM-7 fix).
 func (h *EngineHook) RemoveIndex(indexName string) func() {
 	h.stopBootstrapWatcher(indexName)
+	h.stopMaintenanceWatcher(indexName)
 	state, ok := h.engine.Lookup(indexName)
 	h.engine.Unregister(indexName)
 	if !ok {
@@ -270,17 +306,19 @@ func (h *EngineHook) bootstrapOnce(ctx context.Context, meta common.VectorIndexM
 	}
 	if state.ProbeVersion() != 0 {
 		if state.LoadSegmentStore() != nil {
+			h.startMaintenanceWatcher(meta)
 			return true
 		}
 		dbPath, err := h.dbMgr.GetDatabasePath(meta.Database)
 		if err != nil {
 			log.Warn().Err(err).Str("index", meta.IndexName).Msg("engine hook bootstrap: get db path failed")
-			return true
+			return false
 		}
 		if err := buildAndStoreSegmentGeneration(ctx, conn, dbPath, state, meta, spec); err != nil {
 			log.Warn().Err(err).Str("index", meta.IndexName).Msg("engine hook bootstrap: build segment generation failed")
-			return true
+			return false
 		}
+		h.startMaintenanceWatcher(meta)
 		log.Info().Str("index", meta.IndexName).Msg("engine hook bootstrap: segment generation published")
 		return true
 	}
@@ -294,23 +332,23 @@ func (h *EngineHook) bootstrapOnce(ctx context.Context, meta common.VectorIndexM
 		return false
 	}
 	if meta.AutoTuneNlist {
-		bootstrapFloor := int64(meta.TargetPartitionSize * max(meta.Nlist, 64))
-		if bootstrapFloor < 4096 {
-			bootstrapFloor = 4096
-		}
+		bootstrapFloor := bootstrapAutoTuneFloor(meta)
 		if currentN < bootstrapFloor {
 			return false
 		}
 	}
 	log.Info().Int64("rows", currentN).Str("index", meta.IndexName).Msg("engine hook bootstrap: bootstrap threshold reached")
 
-	if retunedMeta, retunedSpec, changed, err := retuneBootstrapMeta(ctx, conn, meta, spec); err != nil {
+	if retunedMeta, retunedSpec, changed, err := retuneBootstrapMeta(ctx, conn, meta, spec, currentN); err != nil {
 		log.Warn().Err(err).Str("index", meta.IndexName).Msg("engine hook bootstrap: retune failed")
 		return false
 	} else {
 		meta = retunedMeta
 		spec = retunedSpec
 		if changed {
+			if h.indexMgr != nil {
+				h.indexMgr.storeCachedIndexMeta(&meta)
+			}
 			log.Info().
 				Str("index", meta.IndexName).
 				Int("nlist", meta.Nlist).
@@ -321,7 +359,7 @@ func (h *EngineHook) bootstrapOnce(ctx context.Context, meta common.VectorIndexM
 
 	oldState, _ := h.engine.Lookup(meta.IndexName)
 	updatedAt := time.Now().UnixNano()
-	if err := BulkPopulate(ctx, conn, h.engine, updatedAt, meta.TableName, meta.ColumnName, spec); err != nil {
+	if err := BulkPopulate(ctx, conn, h.engine, updatedAt, meta.TableName, meta.ColumnName, spec, meta.TargetPartitionSize); err != nil {
 		if oldState != nil {
 			h.engine.Register(meta.IndexName, oldState)
 		}
@@ -337,16 +375,17 @@ func (h *EngineHook) bootstrapOnce(ctx context.Context, meta common.VectorIndexM
 	dbPath, err := h.dbMgr.GetDatabasePath(meta.Database)
 	if err != nil {
 		log.Warn().Err(err).Str("index", meta.IndexName).Msg("engine hook bootstrap: get db path failed after populate")
-		return true
+		return false
 	}
 	if err := openAndStoreOverlay(dbPath, meta.IndexName, newState, newState.ProbeVersion()); err != nil {
 		log.Warn().Err(err).Str("index", meta.IndexName).Msg("engine hook bootstrap: open overlay failed")
-		return true
+		return false
 	}
 	if err := buildAndStoreSegmentGeneration(ctx, conn, dbPath, newState, meta, spec); err != nil {
 		log.Warn().Err(err).Str("index", meta.IndexName).Msg("engine hook bootstrap: build segment generation failed after populate")
-		return true
+		return false
 	}
+	h.startMaintenanceWatcher(meta)
 	log.Info().Str("index", meta.IndexName).Msg("engine hook bootstrap: automatic bootstrap complete")
 	return true
 }
@@ -356,19 +395,26 @@ func retuneBootstrapMeta(
 	conn *sql.DB,
 	meta common.VectorIndexMeta,
 	spec vecindex.IVFSpec,
+	rows int64,
 ) (common.VectorIndexMeta, vecindex.IVFSpec, bool, error) {
 	if !meta.AutoTuneNlist && !meta.AutoTuneNprobe {
 		return meta, spec, false, nil
 	}
-	currentN, err := countIndexableRows(ctx, conn, meta.TableName, meta.ColumnName, spec)
-	if err != nil {
-		return meta, spec, false, err
-	}
-	if currentN <= 0 {
+	if rows <= 0 {
 		return meta, spec, false, nil
 	}
 	oldNlist, oldNprobe := meta.Nlist, meta.Nprobe
-	meta, spec = retuneReindexMeta(meta, spec, currentN)
+	if meta.AutoTuneNlist {
+		meta.Nlist = autoTuneBootstrapNlist(rows, meta.TargetPartitionSize)
+		spec.Nlist = meta.Nlist
+	}
+	if meta.AutoTuneNprobe {
+		meta.Nprobe = autoTuneNprobeForTarget(meta.Nlist, meta.TargetPartitionSize)
+		spec.Nprobe = meta.Nprobe
+	}
+	if meta.AutoTuneNlist || meta.AutoTuneNprobe {
+		spec.Seed = StableIndexSeed(meta)
+	}
 	if meta.Nlist == oldNlist && meta.Nprobe == oldNprobe {
 		return meta, spec, false, nil
 	}
@@ -381,9 +427,35 @@ func retuneBootstrapMeta(
 	return meta, spec, true, nil
 }
 
-func max(a, b int) int {
-	if a > b {
-		return a
+func bootstrapAutoTuneFloor(meta common.VectorIndexMeta) int64 {
+	target := meta.TargetPartitionSize
+	if target <= 0 {
+		target = defaultTargetPartitionSize
 	}
-	return b
+	partitions := bootstrapMinTargetPartitions
+	if meta.Nlist > 0 && meta.Nlist < partitions {
+		partitions = meta.Nlist
+	}
+	if partitions < 1 {
+		partitions = 1
+	}
+	return int64(target) * int64(partitions)
+}
+
+func autoTuneBootstrapNlist(rows int64, targetPartitionSize int) int {
+	nlist := autoTuneNlistForTarget(rows, targetPartitionSize)
+	if rows <= 0 {
+		return nlist
+	}
+	if targetPartitionSize <= 0 {
+		targetPartitionSize = defaultTargetPartitionSize
+	}
+	targetDriven := int((rows + int64(targetPartitionSize) - 1) / int64(targetPartitionSize))
+	if targetDriven < bootstrapMinTargetPartitions {
+		targetDriven = bootstrapMinTargetPartitions
+	}
+	if targetDriven > nlist {
+		targetDriven = nlist
+	}
+	return targetDriven
 }

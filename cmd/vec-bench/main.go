@@ -25,8 +25,8 @@
 //	--table        Base table name. Default "docs".
 //	--column       Embedding column name. Default "embed".
 //	--metric       cosine | l2 | dot. Default: from metadata.json ("angular"→cosine).
-//	--nlist        IVF clusters. 0 = auto-tune (~4√n, capped at 2048).
-//	--nprobe       Probed clusters per query. 0 = auto-tune (√nlist, min 8).
+//	--nlist        IVF clusters. 0 = auto-tune from target partition size.
+//	--nprobe       Probed clusters per query. 0 = derived default from scan-row budget.
 //	--force-build  Drop existing index + table and rebuild from scratch.
 //	--skip-insert  Assume docs already populated; just (re)use the index.
 //	--warmup       Warmup query count before measurement. Default 1000.
@@ -43,11 +43,13 @@ import (
 	"database/sql"
 	"flag"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"runtime/pprof"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -644,13 +646,116 @@ func vectorStateSettled(probeVersion uint64, segmentReady bool, overlayReady boo
 	return probeVersion > 0 && segmentReady && overlayReady
 }
 
+const (
+	settleClusterDriftPct  = 0.10
+	settleClusterP95Factor = 1.5
+	settleClusterMaxFactor = 2.0
+)
+
+func desiredClusterCount(totalRows uint64, targetPartitionSize int) int {
+	if totalRows == 0 || targetPartitionSize <= 0 {
+		return 0
+	}
+	return int((totalRows + uint64(targetPartitionSize) - 1) / uint64(targetPartitionSize))
+}
+
+func clusterSkewMetrics(clusterRows []uint64) (maxRows uint64, p95Rows uint64) {
+	if len(clusterRows) <= 1 {
+		return 0, 0
+	}
+	nonzero := make([]uint64, 0, len(clusterRows)-1)
+	for clusterID := 1; clusterID < len(clusterRows); clusterID++ {
+		rows := clusterRows[clusterID]
+		if rows == 0 {
+			continue
+		}
+		if rows > maxRows {
+			maxRows = rows
+		}
+		nonzero = append(nonzero, rows)
+	}
+	if len(nonzero) == 0 {
+		return maxRows, 0
+	}
+	slices.Sort(nonzero)
+	idx := int(math.Ceil(float64(len(nonzero))*0.95)) - 1
+	if idx < 0 {
+		idx = 0
+	}
+	if idx >= len(nonzero) {
+		idx = len(nonzero) - 1
+	}
+	return maxRows, nonzero[idx]
+}
+
+func vectorStateStableForRead(meta *common.VectorIndexMeta, state *vecindex.IndexState) bool {
+	if state == nil || !vectorStateSettled(state.ProbeVersion(), state.LoadSegmentStore() != nil, state.LoadOverlay() != nil) {
+		return false
+	}
+	generation := state.LoadSegmentStore()
+	if generation == nil {
+		return false
+	}
+	if meta == nil {
+		return true
+	}
+	spec := state.Spec()
+	if spec.Nlist != meta.Nlist || spec.Nprobe != meta.Nprobe {
+		return false
+	}
+	if !meta.AutoTuneNlist {
+		return true
+	}
+	targetPartitionSize := meta.TargetPartitionSize
+	if targetPartitionSize <= 0 {
+		targetPartitionSize = 512
+	}
+	clusterRows := generation.ClusterRowCounts
+	if len(clusterRows) <= 1 {
+		return false
+	}
+	var totalRows uint64
+	for clusterID := 1; clusterID < len(clusterRows); clusterID++ {
+		totalRows += clusterRows[clusterID]
+	}
+	if overlay := state.LoadOverlay(); overlay != nil && overlay.Snapshot() != nil {
+		backlogRows, _, _ := overlay.Snapshot().BacklogStats(generation.AppliedOverlaySeq)
+		if backlogRows > 0 {
+			totalRows += uint64(backlogRows)
+		}
+	}
+	currentClusters := len(clusterRows) - 1
+	if currentClusters <= 0 {
+		return false
+	}
+	wantClusters := desiredClusterCount(totalRows, targetPartitionSize)
+	if wantClusters <= 0 {
+		return false
+	}
+	diff := wantClusters - currentClusters
+	if diff < 0 {
+		diff = -diff
+	}
+	if float64(diff)/float64(currentClusters) >= settleClusterDriftPct {
+		return false
+	}
+	maxRows, p95Rows := clusterSkewMetrics(clusterRows)
+	return float64(maxRows) <= float64(targetPartitionSize)*settleClusterMaxFactor &&
+		float64(p95Rows) <= float64(targetPartitionSize)*settleClusterP95Factor
+}
+
 func (h *harness) waitForVectorReadiness(timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for {
+		meta, err := h.readIndexMeta()
+		if err != nil {
+			return fmt.Errorf("read index meta while settling: %w", err)
+		}
 		probeVersion := uint64(0)
 		segmentReady := false
 		overlayReady := false
 		overlayRows := 0
+		stableForRead := false
 		if h.engine != nil {
 			if state, ok := h.engine.Lookup(h.cfg.indexName); ok {
 				probeVersion = state.ProbeVersion()
@@ -659,9 +764,10 @@ func (h *harness) waitForVectorReadiness(timeout time.Duration) error {
 				if overlay := state.LoadOverlay(); overlay != nil && overlay.Snapshot() != nil {
 					overlayRows = overlay.Snapshot().Len()
 				}
+				stableForRead = vectorStateStableForRead(meta, state)
 			}
 		}
-		if vectorStateSettled(probeVersion, segmentReady, overlayReady) {
+		if stableForRead {
 			if err := h.refreshIndexTuning(); err != nil {
 				return err
 			}
@@ -670,8 +776,8 @@ func (h *harness) waitForVectorReadiness(timeout time.Duration) error {
 			return nil
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("vector state did not settle within %s (probe=%d segment=%t overlay=%t overlay_rows=%d)",
-				timeout, probeVersion, segmentReady, overlayReady, overlayRows)
+			return fmt.Errorf("vector state did not settle within %s (probe=%d segment=%t overlay=%t overlay_rows=%d stable=%t)",
+				timeout, probeVersion, segmentReady, overlayReady, overlayRows, stableForRead)
 		}
 		time.Sleep(500 * time.Millisecond)
 	}

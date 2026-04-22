@@ -257,6 +257,7 @@ func main() {
 	dbMgr.SetVectorIndexManager(vecIndexMgr)
 	vecEngine := vecindex.NewEngine()
 	vecEngineHook := db.NewEngineHook(vecEngine, dbMgr)
+	vecEngineHook.BindVectorIndexManager(vecIndexMgr)
 	vecIndexMgr.SetLifecycleHook(vecEngineHook)
 	vecIndexMgr.SetReindexHook(vecEngineHook)
 	vecIndexMgr.SetEngineProvider(vecEngineHook)

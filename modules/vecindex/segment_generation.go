@@ -5,11 +5,16 @@ import "github.com/maxpert/marmot/modules/vecindex/pkg/kmeans"
 // SegmentGeneration is the active stable on-disk serving snapshot for one
 // vector index epoch.
 type SegmentGeneration struct {
-	Data              *SegmentDataStore
-	RowMap            *SegmentRowMap
-	Centroids         *kmeans.CentroidSet
-	AppliedOverlaySeq uint64
-	LayoutHotClusters []int64
+	Data                     *SegmentDataStore
+	RowMap                   *SegmentRowMap
+	Centroids                *kmeans.CentroidSet
+	AppliedOverlaySeq        uint64
+	ClusterRowCounts         []uint64
+	ClusterVectorSums        [][]float32
+	RowsModifiedSinceRebuild uint64
+	LastRebuildRowCount      uint64
+	ConsecutiveSkewCycles    uint32
+	LayoutHotClusters        []int64
 }
 
 func (g *SegmentGeneration) Close() error {

@@ -360,6 +360,31 @@ func (w *SegmentDataWriter) Append(clusterID, rowid int64, vec []byte) error {
 	return nil
 }
 
+func (w *SegmentDataWriter) AppendRawCluster(clusterID int64, count uint64, rows io.Reader) error {
+	if w == nil || w.file == nil {
+		return fmt.Errorf("vecindex: segment data writer is closed")
+	}
+	if clusterID <= 0 || int(clusterID) > w.maxCluster {
+		return fmt.Errorf("vecindex: segment data cluster %d out of range", clusterID)
+	}
+	ref := &w.refs[clusterID]
+	if ref.count > 0 && clusterID != w.lastCID {
+		return fmt.Errorf("vecindex: segment data cluster %d cannot be reopened after another cluster", clusterID)
+	}
+	if ref.count == 0 {
+		ref.offset = w.offset
+	}
+	bytesToCopy := int64(count) * int64(w.entrySize)
+	if _, err := io.CopyN(w.file, rows, bytesToCopy); err != nil {
+		return err
+	}
+	ref.count += count
+	w.rowCount += count
+	w.offset += uint64(bytesToCopy)
+	w.lastCID = clusterID
+	return nil
+}
+
 func (w *SegmentDataWriter) Close() (*SegmentDataStore, error) {
 	if w == nil || w.closed {
 		return nil, fmt.Errorf("vecindex: segment data writer already closed")
@@ -437,6 +462,83 @@ func (s *SegmentDataStore) Path() string       { return s.path }
 func (s *SegmentDataStore) MaxCluster() int    { return s.maxCluster }
 func (s *SegmentDataStore) FileSize() int64    { return s.fileSize }
 func (s *SegmentDataStore) RowCount() uint64   { return s.rowCount }
+
+func (s *SegmentDataStore) ClusterCount(clusterID int64) uint64 {
+	if s == nil || clusterID <= 0 || int(clusterID) > s.maxCluster {
+		return 0
+	}
+	return s.refs[clusterID].count
+}
+
+func (s *SegmentDataStore) ClusterRowCounts() []uint64 {
+	if s == nil || s.maxCluster == 0 {
+		return nil
+	}
+	counts := make([]uint64, len(s.refs))
+	for clusterID := 1; clusterID <= s.maxCluster; clusterID++ {
+		counts[clusterID] = s.refs[clusterID].count
+	}
+	return counts
+}
+
+func (s *SegmentDataStore) FileOrderedClusters() []int64 {
+	if s == nil || len(s.fileOrderRank) == 0 {
+		return nil
+	}
+	out := make([]int64, 0, s.maxCluster)
+	for _, span := range s.fileOrderedClusterSpans(allClustersUpTo(s.maxCluster)) {
+		out = append(out, span.clusterID)
+	}
+	return out
+}
+
+func allClustersUpTo(maxCluster int) []int64 {
+	if maxCluster <= 0 {
+		return nil
+	}
+	out := make([]int64, maxCluster)
+	for i := 1; i <= maxCluster; i++ {
+		out[i-1] = int64(i)
+	}
+	return out
+}
+
+func (s *SegmentDataStore) ClusterSpan(clusterID int64) (offset int64, bytes int64, count uint64, ok bool) {
+	if s == nil || clusterID <= 0 || int(clusterID) >= len(s.spanByCluster) {
+		return 0, 0, 0, false
+	}
+	span := s.spanByCluster[clusterID]
+	if span.count == 0 {
+		return 0, 0, 0, false
+	}
+	return span.offset, span.bytes, span.count, true
+}
+
+func (s *SegmentDataStore) ReadEntryAt(offset uint64) (int64, []byte, error) {
+	if s == nil || s.file == nil {
+		return 0, nil, fmt.Errorf("vecindex: segment store is not open")
+	}
+	buf := make([]byte, s.entrySize)
+	if _, err := s.file.ReadAt(buf, int64(offset)); err != nil {
+		return 0, nil, err
+	}
+	rowID := int64(binary.LittleEndian.Uint64(buf[:8]))
+	return rowID, append([]byte(nil), buf[8:s.entrySize]...), nil
+}
+
+func (s *SegmentDataStore) CopyClusterTo(clusterID int64, w io.Writer) (uint64, error) {
+	if s == nil || s.file == nil {
+		return 0, nil
+	}
+	offset, bytes, count, ok := s.ClusterSpan(clusterID)
+	if !ok {
+		return 0, nil
+	}
+	if _, err := io.CopyN(w, io.NewSectionReader(s.file, offset, bytes), bytes); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
 
 func (s *SegmentDataStore) ScanCluster(clusterID int64, yield func(rowid int64, vecBytes []byte) bool) error {
 	if s == nil || s.file == nil || clusterID <= 0 || int(clusterID) > s.maxCluster {

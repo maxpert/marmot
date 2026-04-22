@@ -112,6 +112,7 @@ func setupVecE2E(t *testing.T) *e2eSetup {
 	db.SetVectorUDFProvider(engine)
 
 	hook := db.NewEngineHook(engine, dbMgr)
+	hook.BindVectorIndexManager(vecMgr)
 	vecMgr.SetLifecycleHook(hook)
 	vecMgr.SetEngineProvider(hook)
 	vecMgr.SetReindexHook(hook)
