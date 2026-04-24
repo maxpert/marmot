@@ -104,7 +104,7 @@ func TestIncrementalMerge_PublishesNewGenerationAndClearsOverlay(t *testing.T) {
 	require.NoError(t, err)
 
 	state, _ = engine.Lookup(meta.IndexName)
-	require.NoError(t, hook.runIncrementalMerge(context.Background(), dbPath, meta, state.Spec(), state))
+	require.NoError(t, hook.runIncrementalMerge(context.Background(), conn, dbPath, meta, state.Spec(), state))
 
 	state, _ = engine.Lookup(meta.IndexName)
 	require.Equal(t, oldEpoch+1, state.ProbeVersion())
@@ -212,7 +212,7 @@ func TestIncrementalMerge_PreservesOverlayTailAcrossPublish(t *testing.T) {
 	dbPath, err := dbMgr.GetDatabasePath("test")
 	require.NoError(t, err)
 
-	plan, err := hook.prepareIncrementalMerge(context.Background(), dbPath, meta, state.Spec(), state)
+	plan, err := hook.prepareIncrementalMerge(context.Background(), conn, dbPath, meta, state.Spec(), state)
 	require.NoError(t, err)
 	require.NotNil(t, plan)
 	defer plan.Close()

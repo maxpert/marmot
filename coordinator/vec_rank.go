@@ -285,6 +285,17 @@ func defaultProbeScanBudgetRows(targetPartitionSize int) int {
 	return budget
 }
 
+func pqProbeScanBudgetRows(targetPartitionSize int) int {
+	if targetPartitionSize <= 0 {
+		targetPartitionSize = 512
+	}
+	budget := defaultProbeScanBudgetRows(targetPartitionSize)
+	if widened := 48 * targetPartitionSize; widened > budget {
+		budget = widened
+	}
+	return budget
+}
+
 func loadLiveClusterRowCounts(state *vecindex.IndexState, segments *vecindex.SegmentGeneration) []uint64 {
 	if state != nil {
 		if maintenance := state.LoadMaintenanceState(); maintenance != nil {
@@ -341,6 +352,9 @@ func selectProbeClusterIDs(
 	if budget == 0 {
 		budget = uint64(defaultProbeScanBudgetRows(plan.TargetPartitionSize))
 	}
+	if segments != nil && segments.Data != nil && segments.Data.Encoding() == vecindex.MemberEncodingResidualPQ8 {
+		budget = uint64(pqProbeScanBudgetRows(plan.TargetPartitionSize))
+	}
 	selected := make([]int64, 0, len(ids))
 	var cumulative uint64
 	for _, id := range ids {
@@ -396,6 +410,17 @@ func exactRerankShortlist(k int) int {
 	}
 	if n > 256 {
 		n = 256
+	}
+	return n
+}
+
+func pqExactRerankShortlist(k int) int {
+	n := k * 12
+	if n < 128 {
+		n = 128
+	}
+	if n > 512 {
+		n = 512
 	}
 	return n
 }
@@ -460,7 +485,7 @@ func (h *CoordinatorHandler) segmentRank(plan *GoRankPlan) ([]rankItem, bool, er
 		appliedOverlaySeq = segments.AppliedOverlaySeq
 	}
 
-	topK := newTopKHeap(rankShortlistLimit(plan))
+	topK := newTopKHeap(rankShortlistLimitForEncoding(plan, segmentEnc))
 	overlaySnapshot := (*vecindex.OverlaySnapshot)(nil)
 	if overlay != nil {
 		overlaySnapshot = overlay.Snapshot()
@@ -485,15 +510,27 @@ func (h *CoordinatorHandler) segmentRank(plan *GoRankPlan) ([]rankItem, bool, er
 		if stableCentroids == nil {
 			stableCentroids = probeCentroids
 		}
+		stableCodec := segments.StableCodec
+		if stableCodec == nil {
+			var err error
+			stableCodec, err = vecindex.NewStableMemberCodec(plan.IndexSpec, stableCentroids, segmentEnc, nil)
+			if err != nil {
+				return nil, false, err
+			}
+		}
 		scorerCache := make(map[int64]*vecindex.StableMemberScorer, len(plan.ClusterIDs))
+		queryScorer, err := vecindex.NewStableMemberQueryScorerWithCodec(stableCodec, plan.QueryVec, plan.QueryNorm2)
+		if err != nil {
+			return nil, false, err
+		}
 		var encodedScanErr error
-		if segmentEnc == vecindex.MemberEncodingResidualInt8 {
+		if segmentEnc == vecindex.MemberEncodingResidualInt8 || segmentEnc == vecindex.MemberEncodingResidualPQ8 {
 			distBuf := make([]float32, 0, 256)
 			if err := segments.Data.ScanClustersFileOrderSpans(plan.ClusterIDs, func(clusterID int64, rows []byte, count uint64, entrySize int) bool {
 				scorer, ok := scorerCache[clusterID]
 				if !ok {
 					var err error
-					scorer, err = vecindex.NewStableMemberScorer(plan.IndexSpec, stableCentroids, plan.QueryVec, plan.QueryNorm2, clusterID, segmentEnc)
+					scorer, err = queryScorer.ClusterScorer(clusterID)
 					if err != nil {
 						encodedScanErr = err
 						return false
@@ -541,7 +578,7 @@ func (h *CoordinatorHandler) segmentRank(plan *GoRankPlan) ([]rankItem, bool, er
 			scorer, ok := scorerCache[clusterID]
 			if !ok {
 				var err error
-				scorer, err = vecindex.NewStableMemberScorer(plan.IndexSpec, stableCentroids, plan.QueryVec, plan.QueryNorm2, clusterID, segmentEnc)
+				scorer, err = queryScorer.ClusterScorer(clusterID)
 				if err != nil {
 					encodedScanErr = err
 					return false
@@ -610,6 +647,18 @@ func rankShortlistLimit(plan *GoRankPlan) int {
 		return plan.Shortlist
 	}
 	return plan.K
+}
+
+func rankShortlistLimitForEncoding(plan *GoRankPlan, enc int64) int {
+	limit := rankShortlistLimit(plan)
+	if plan == nil || enc != vecindex.MemberEncodingResidualPQ8 {
+		return limit
+	}
+	pqLimit := pqExactRerankShortlist(plan.K)
+	if pqLimit > limit {
+		return pqLimit
+	}
+	return limit
 }
 
 type sqlQueryer interface {

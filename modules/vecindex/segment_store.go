@@ -10,7 +10,8 @@ import (
 )
 
 const (
-	SegmentStoreVersion = 2
+	SegmentStoreVersion = 3
+	segmentStoreV2      = 2
 	segmentStoreV1      = 1
 
 	segmentManifestMagic = "MVSMAN01"
@@ -29,6 +30,7 @@ type SegmentManifest struct {
 	ProbeCentroidBlob        []byte      `msgpack:"probe_centroid_blob,omitempty"`
 	StableCentroidEpoch      uint64      `msgpack:"stable_centroid_epoch,omitempty"`
 	StableCentroidBlob       []byte      `msgpack:"stable_centroid_blob,omitempty"`
+	StableMemberCodecBlob    []byte      `msgpack:"stable_member_codec_blob,omitempty"`
 	CentroidEpoch            uint64      `msgpack:"centroid_epoch,omitempty"`
 	CentroidBlob             []byte      `msgpack:"centroid_blob,omitempty"`
 	AppliedOverlaySeq        uint64      `msgpack:"applied_overlay_seq"`
@@ -138,6 +140,10 @@ func decodeSegmentEnvelope(magic string, data []byte, dst any) error {
 
 func SegmentStoreV1Compat() uint32 {
 	return segmentStoreV1
+}
+
+func SegmentStoreV2Compat() uint32 {
+	return segmentStoreV2
 }
 
 func (m *SegmentManifest) ProbeEpochValue() uint64 {

@@ -229,7 +229,7 @@ func clusterSplitSeeds(
 	}
 	vectors := make([][]float32, 0, clusterCount)
 	if err := segments.Data.ScanCluster(clusterID, func(_ int64, vecBytes []byte) bool {
-		prepared, err := decodeStableMemberPrepared(spec, segments.StableCentroids, clusterID, vecBytes)
+		prepared, err := decodeStableMemberPrepared(spec, segments.StableCodec, segments.StableCentroids, clusterID, vecBytes)
 		if err != nil {
 			vectors = nil
 			return false

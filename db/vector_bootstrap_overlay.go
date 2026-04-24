@@ -67,9 +67,9 @@ func computeCentroidsFromOverlaySnapshot(
 	stablePasses := 0
 	var lastResult kmeans.MiniBatchPassResult
 	var bestAssignedCentroids [][]float32
-	bestAssignedShift := float32(1<<30)
+	bestAssignedShift := float32(1 << 30)
 	var bestCentroids [][]float32
-	bestShift := float32(1<<30)
+	bestShift := float32(1 << 30)
 	for iter := 0; iter < opts.MaxIter; iter++ {
 		result, err := runMiniBatchOverlayTrainerPass(snapshot, cutoff, opts.BatchSize, trainer, spec.Seed^uint64(iter+1))
 		if err != nil {
@@ -150,24 +150,8 @@ func BuildBootstrapSegmentGenerationFromOverlay(
 	if err != nil {
 		return nil, fmt.Errorf("bootstrap segment generation: next generation: %w", err)
 	}
-	dataEncoding, vecBytes := vecindex.StableMemberEncodingSpec(spec)
 	dataPath := vecindex.SegmentDataPath(dir, generation)
 	rowMapPath := vecindex.SegmentRowMapPath(dir, generation)
-	dataWriter, err := vecindex.CreateSegmentDataWriter(
-		dataPath,
-		spec.InternalMetric(),
-		dataEncoding,
-		spec.Dim,
-		spec.InternalDim(),
-		vecBytes,
-		maxCluster,
-		probeCS.Epoch(),
-		generation,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer dataWriter.Abort()
 	rowMapWriter, err := vecindex.CreateSegmentRowMapWriter(rowMapPath, probeCS.Epoch(), generation)
 	if err != nil {
 		return nil, err
@@ -177,6 +161,11 @@ func BuildBootstrapSegmentGenerationFromOverlay(
 	clusterEntries := make([][]incrementalClusterEntry, maxCluster+1)
 	clusterRowCounts := make([]uint64, maxCluster+1)
 	clusterVectorSums := make([][]float32, maxCluster+1)
+	codecReservoir, err := newStableCodecReservoir(spec.Seed^probeCS.Epoch(), spec.InternalDim())
+	if err != nil {
+		return nil, fmt.Errorf("bootstrap segment generation: stable codec reservoir: %w", err)
+	}
+	defer codecReservoir.Close()
 	var visitErr error
 	overlaySnapshot.VisitMutationsAfter(0, func(mutation vecindex.OverlayMutation) bool {
 		if cutoffSequence > 0 && mutation.Sequence > cutoffSequence {
@@ -190,19 +179,10 @@ func BuildBootstrapSegmentGenerationFromOverlay(
 			visitErr = fmt.Errorf("bootstrap segment generation: assign rowid %d: %w", mutation.RowID, err)
 			return false
 		}
-		enc, encoded, err := vecindex.EncodeStableMember(spec, probeCS, clusterID, mutation.Vec)
-		if err != nil {
-			visitErr = fmt.Errorf("bootstrap segment generation: encode rowid %d: %w", mutation.RowID, err)
-			return false
-		}
-		wantEnc, _ := vecindex.StableMemberEncodingSpec(spec)
-		if enc != wantEnc {
-			visitErr = fmt.Errorf("bootstrap segment generation: unexpected stable encoding %d for rowid %d", enc, mutation.RowID)
-			return false
-		}
+		codecReservoir.Add(clusterID, mutation.Vec)
 		clusterEntries[clusterID] = append(clusterEntries[clusterID], incrementalClusterEntry{
 			rowID: mutation.RowID,
-			vec:   encoded,
+			vec:   append([]byte(nil), mutation.Vec...),
 		})
 		clusterRowCounts[clusterID]++
 		if clusterVectorSums[clusterID] == nil {
@@ -217,6 +197,25 @@ func BuildBootstrapSegmentGenerationFromOverlay(
 	if visitErr != nil {
 		return nil, visitErr
 	}
+	stableCodec, stableCodecBlob, err := buildStableMemberCodec(spec, probeCS, codecReservoir)
+	if err != nil {
+		return nil, fmt.Errorf("bootstrap segment generation: build stable codec: %w", err)
+	}
+	dataWriter, err := vecindex.CreateSegmentDataWriter(
+		dataPath,
+		spec.InternalMetric(),
+		stableCodec.Encoding(),
+		spec.Dim,
+		spec.InternalDim(),
+		stableCodec.EncodedSize(),
+		maxCluster,
+		probeCS.Epoch(),
+		generation,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer dataWriter.Abort()
 
 	rowLocs := make([]rowLoc, 0)
 	for _, clusterID := range segmentClusterWriteOrder(spec, probeCS, hotClusterScores) {
@@ -235,8 +234,15 @@ func BuildBootstrapSegmentGenerationFromOverlay(
 			}
 		})
 		for _, entry := range entries {
+			enc, encoded, err := stableCodec.Encode(clusterID, entry.vec)
+			if err != nil {
+				return nil, fmt.Errorf("bootstrap segment generation: encode rowid %d: %w", entry.rowID, err)
+			}
+			if enc != stableCodec.Encoding() {
+				return nil, fmt.Errorf("bootstrap segment generation: unexpected stable encoding %d for rowid %d", enc, entry.rowID)
+			}
 			offset := dataWriter.NextOffset()
-			if err := dataWriter.Append(clusterID, entry.rowID, entry.vec); err != nil {
+			if err := dataWriter.Append(clusterID, entry.rowID, encoded); err != nil {
 				return nil, fmt.Errorf("bootstrap segment generation: append rowid %d: %w", entry.rowID, err)
 			}
 			rowLocs = append(rowLocs, rowLoc{rowID: entry.rowID, clusterID: clusterID, offset: offset})
@@ -287,6 +293,7 @@ func BuildBootstrapSegmentGenerationFromOverlay(
 		ProbeCentroidBlob:        mustCentroidBlob(probeCS),
 		StableCentroidEpoch:      probeCS.Epoch(),
 		StableCentroidBlob:       mustCentroidBlob(probeCS),
+		StableMemberCodecBlob:    stableCodecBlob,
 		AppliedOverlaySeq:        cutoffSequence,
 		Generation:               generation,
 		MaxCluster:               uint32(maxCluster),
@@ -309,6 +316,7 @@ func BuildBootstrapSegmentGenerationFromOverlay(
 			RowMap:                   rowMapStore,
 			ProbeCentroids:           probeCS,
 			StableCentroids:          probeCS,
+			StableCodec:              stableCodec,
 			AppliedOverlaySeq:        cutoffSequence,
 			ClusterRowCounts:         append([]uint64(nil), clusterRowCounts...),
 			ClusterVectorSums:        cloneClusterVectorSums(clusterVectorSums),

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sync"
+	"sync/atomic"
 )
 
 const (
@@ -18,6 +19,7 @@ const (
 	segmentReadChunk   = 1 << 20
 	segmentReadBatch   = 8 << 20
 	segmentReadGap     = 1 << 20
+	segmentPQReadGap   = 0
 )
 
 type segmentClusterRef struct {
@@ -36,6 +38,12 @@ type segmentReadBatchSpec struct {
 	start int64
 	end   int64
 	spans []segmentClusterSpan
+}
+
+type SegmentScanStats struct {
+	ReadBytes    uint64
+	LogicalBytes uint64
+	ReadBatches  uint64
 }
 
 // SegmentDataStore is a read-only stable-vector generation file opened with
@@ -64,6 +72,9 @@ type SegmentDataStore struct {
 	seenPool      sync.Pool
 	spanByCluster []segmentClusterSpan
 	fileOrderRank []int
+	readBytes     atomic.Uint64
+	logicalBytes  atomic.Uint64
+	readBatches   atomic.Uint64
 }
 
 type SegmentDataWriter struct {
@@ -131,7 +142,7 @@ func OpenSegmentDataStore(path string) (*SegmentDataStore, error) {
 	}
 	encoding := int64(header[13])
 	switch encoding {
-	case MemberEncodingRawPreparedF32, MemberEncodingResidualInt8:
+	case MemberEncodingRawPreparedF32, MemberEncodingResidualInt8, MemberEncodingResidualPQ8:
 	default:
 		_ = file.Close()
 		return nil, fmt.Errorf("vecindex: invalid segment data encoding %d", encoding)
@@ -463,6 +474,26 @@ func (s *SegmentDataStore) MaxCluster() int    { return s.maxCluster }
 func (s *SegmentDataStore) FileSize() int64    { return s.fileSize }
 func (s *SegmentDataStore) RowCount() uint64   { return s.rowCount }
 
+func (s *SegmentDataStore) ResetScanStats() {
+	if s == nil {
+		return
+	}
+	s.readBytes.Store(0)
+	s.logicalBytes.Store(0)
+	s.readBatches.Store(0)
+}
+
+func (s *SegmentDataStore) SnapshotScanStats() SegmentScanStats {
+	if s == nil {
+		return SegmentScanStats{}
+	}
+	return SegmentScanStats{
+		ReadBytes:    s.readBytes.Load(),
+		LogicalBytes: s.logicalBytes.Load(),
+		ReadBatches:  s.readBatches.Load(),
+	}
+}
+
 func (s *SegmentDataStore) ClusterCount(clusterID int64) uint64 {
 	if s == nil || clusterID <= 0 || int(clusterID) > s.maxCluster {
 		return 0
@@ -624,6 +655,8 @@ func (s *SegmentDataStore) ScanClustersFileOrder(clusterIDs []int64, yield func(
 		if _, err := s.file.ReadAt(buf[:need], batch.start); err != nil {
 			return err
 		}
+		s.readBytes.Add(uint64(need))
+		s.readBatches.Add(1)
 		for _, span := range batch.spans {
 			cursor := int(span.offset - batch.start)
 			for i := uint64(0); i < span.count; i++ {
@@ -665,9 +698,12 @@ func (s *SegmentDataStore) ScanClustersFileOrderSpans(clusterIDs []int64, yield 
 		if _, err := s.file.ReadAt(buf[:need], batch.start); err != nil {
 			return err
 		}
+		s.readBytes.Add(uint64(need))
+		s.readBatches.Add(1)
 		for _, span := range batch.spans {
 			start := int(span.offset - batch.start)
 			end := start + int(span.bytes)
+			s.logicalBytes.Add(uint64(span.bytes))
 			if !yield(span.clusterID, buf[start:end], span.count, s.entrySize) {
 				return nil
 			}
@@ -764,6 +800,9 @@ func (s *SegmentDataStore) clusterReadBatches(clusterIDs []int64) []segmentReadB
 	spans := s.fileOrderedClusterSpans(clusterIDs)
 	if len(spans) == 0 {
 		return nil
+	}
+	if s.encoding == MemberEncodingResidualPQ8 {
+		return planSegmentReadBatches(spans, segmentReadBatch, segmentPQReadGap)
 	}
 	return planSegmentReadBatches(spans, segmentReadBatch, segmentReadGap)
 }

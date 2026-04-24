@@ -39,12 +39,24 @@ func buildCutoffClusterStats(
 	base *vecindex.SegmentGeneration,
 	overlaySnapshot *vecindex.OverlaySnapshot,
 	cutoff uint64,
+	maintenance *vecindex.MaintenanceState,
 ) (*cutoffClusterStats, error) {
 	if base == nil || base.Data == nil || base.RowMap == nil {
 		return nil, fmt.Errorf("cutoff cluster stats: base generation is required")
 	}
 	counts := append([]uint64(nil), base.ClusterRowCounts...)
 	sums := cloneClusterVectorSums(base.ClusterVectorSums)
+	useMaintenanceLiveStats := maintenance != nil &&
+		overlaySnapshot != nil &&
+		(cutoff == 0 || cutoff == overlaySnapshot.LastSequence())
+	if useMaintenanceLiveStats {
+		if liveCounts := maintenance.LiveClusterRowCounts(); len(liveCounts) > 0 {
+			counts = liveCounts
+		}
+		if liveSums := maintenance.LiveClusterVectorSums(); len(liveSums) > 0 {
+			sums = liveSums
+		}
+	}
 	if len(counts) == 0 {
 		counts = make([]uint64, base.Data.MaxCluster()+1)
 		for clusterID := 1; clusterID <= base.Data.MaxCluster(); clusterID++ {
@@ -58,7 +70,7 @@ func buildCutoffClusterStats(
 			return nil, fmt.Errorf("cutoff cluster stats: lookup rowid %d: %w", mutation.RowID, err)
 		} else if ok {
 			touched[loc.ClusterID] = struct{}{}
-			if mutation.Kind == vecindex.OverlayMutationReplace || mutation.Kind == vecindex.OverlayMutationDelete {
+			if !useMaintenanceLiveStats && (mutation.Kind == vecindex.OverlayMutationReplace || mutation.Kind == vecindex.OverlayMutationDelete) {
 				if err := applyStableDelta(counts, sums, base, spec, loc.ClusterID, mutation.RowID, -1); err != nil {
 					return nil, err
 				}
@@ -68,6 +80,9 @@ func buildCutoffClusterStats(
 			continue
 		}
 		touched[mutation.ClusterID] = struct{}{}
+		if useMaintenanceLiveStats {
+			continue
+		}
 		ensureClusterStatsCapacity(&counts, &sums, int(mutation.ClusterID), len(metric.BytesToFloat32(mutation.Vec)))
 		counts[mutation.ClusterID]++
 		sum := sums[mutation.ClusterID]

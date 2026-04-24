@@ -9,6 +9,7 @@ type SegmentGeneration struct {
 	RowMap                   *SegmentRowMap
 	ProbeCentroids           *kmeans.CentroidSet
 	StableCentroids          *kmeans.CentroidSet
+	StableCodec              *StableMemberCodec
 	AppliedOverlaySeq        uint64
 	ClusterRowCounts         []uint64
 	ClusterVectorSums        [][]float32

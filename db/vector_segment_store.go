@@ -26,6 +26,7 @@ type OpenedSegmentGeneration struct {
 	RowMap          *vecindex.SegmentRowMap
 	ProbeCentroids  *kmeans.CentroidSet
 	StableCentroids *kmeans.CentroidSet
+	StableCodec     *vecindex.StableMemberCodec
 }
 
 func segmentGenerationFromOpened(opened *OpenedSegmentGeneration) *vecindex.SegmentGeneration {
@@ -37,6 +38,7 @@ func segmentGenerationFromOpened(opened *OpenedSegmentGeneration) *vecindex.Segm
 		RowMap:                   opened.RowMap,
 		ProbeCentroids:           opened.ProbeCentroids,
 		StableCentroids:          opened.StableCentroids,
+		StableCodec:              opened.StableCodec,
 		AppliedOverlaySeq:        opened.Manifest.AppliedOverlaySeq,
 		ClusterRowCounts:         append([]uint64(nil), opened.Manifest.ClusterRowCounts...),
 		ClusterVectorSums:        cloneClusterVectorSums(opened.Manifest.ClusterVectorSums),
@@ -227,6 +229,15 @@ func openSegmentGeneration(dir string, meta common.VectorIndexMeta, spec vecinde
 	if err != nil {
 		return nil, err
 	}
+	stableCodec, err := vecindex.DecodeStableMemberCodecBlob(spec, stableCentroids, dataStore.Encoding(), manifest.StableMemberCodecBlob)
+	if err != nil {
+		_ = dataStore.Close()
+		return nil, fmt.Errorf("segment store decode stable codec: %w", err)
+	}
+	if stableCodec.Encoding() != dataStore.Encoding() || stableCodec.EncodedSize() != dataStore.VecBytes() {
+		_ = dataStore.Close()
+		return nil, fmt.Errorf("segment store stable codec/header mismatch")
+	}
 	rowMap, err := vecindex.OpenSegmentRowMap(rowMapPath)
 	if err != nil {
 		_ = dataStore.Close()
@@ -243,6 +254,7 @@ func openSegmentGeneration(dir string, meta common.VectorIndexMeta, spec vecinde
 		RowMap:          rowMap,
 		ProbeCentroids:  probeCentroids,
 		StableCentroids: stableCentroids,
+		StableCodec:     stableCodec,
 	}, nil
 }
 
@@ -259,7 +271,9 @@ func loadCurrentManifest(dir string) (*vecindex.SegmentCurrent, *vecindex.Segmen
 	if err != nil {
 		return nil, nil, err
 	}
-	if current.Version != vecindex.SegmentStoreVersion && current.Version != vecindex.SegmentStoreV1Compat() {
+	if current.Version != vecindex.SegmentStoreVersion &&
+		current.Version != vecindex.SegmentStoreV2Compat() &&
+		current.Version != vecindex.SegmentStoreV1Compat() {
 		return nil, nil, fmt.Errorf("segment current version %d unsupported", current.Version)
 	}
 	if !isSafeSegmentFile(current.ManifestFile) {
@@ -284,7 +298,9 @@ func validateSegmentManifest(manifest *vecindex.SegmentManifest, meta common.Vec
 	if manifest == nil {
 		return fmt.Errorf("segment manifest missing")
 	}
-	if manifest.Version != vecindex.SegmentStoreVersion && manifest.Version != vecindex.SegmentStoreV1Compat() {
+	if manifest.Version != vecindex.SegmentStoreVersion &&
+		manifest.Version != vecindex.SegmentStoreV2Compat() &&
+		manifest.Version != vecindex.SegmentStoreV1Compat() {
 		return fmt.Errorf("segment manifest version %d unsupported", manifest.Version)
 	}
 	manifest.NormalizeCentroidFields()
@@ -621,9 +637,14 @@ SELECT rowid, %s
 		offset    uint64
 	}
 	rowLocs := make([]rowLoc, 0, 1024)
-	dataEncoding, vecBytes := vecindex.StableMemberEncodingSpec(spec)
 	clusterRowCounts := make([]uint64, maxCluster+1)
 	clusterVectorSums := make([][]float32, maxCluster+1)
+	codecReservoir, err := newStableCodecReservoir(spec.Seed^expectedEpoch, spec.InternalDim())
+	if err != nil {
+		return nil, fmt.Errorf("segment generation rebuild: stable codec reservoir: %w", err)
+	}
+	defer codecReservoir.Close()
+	preparedEntrySize := 8 + spec.InternalDim()*4
 	type clusterSpool struct {
 		path string
 		file *os.File
@@ -642,21 +663,6 @@ SELECT rowid, %s
 			}
 		}
 	}()
-	dataWriter, err := vecindex.CreateSegmentDataWriter(
-		dataPath,
-		spec.InternalMetric(),
-		dataEncoding,
-		spec.Dim,
-		spec.InternalDim(),
-		vecBytes,
-		maxCluster,
-		expectedEpoch,
-		generation,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer dataWriter.Abort()
 	var rowCount uint64
 	for rows.Next() {
 		var rowID int64
@@ -682,13 +688,7 @@ SELECT rowid, %s
 		for i, value := range preparedVec {
 			clusterVectorSums[clusterID][i] += value
 		}
-		enc, encoded, err := vecindex.EncodeStableMember(spec, cs, clusterID, prepared)
-		if err != nil {
-			return nil, fmt.Errorf("segment generation rebuild: encode rowid %d: %w", rowID, err)
-		}
-		if enc != dataEncoding {
-			return nil, fmt.Errorf("segment generation rebuild: unexpected stable encoding %d for rowid %d", enc, rowID)
-		}
+		codecReservoir.Add(clusterID, prepared)
 		spool := clusterSpools[clusterID]
 		if spool == nil {
 			tmp, err := os.CreateTemp(dir, fmt.Sprintf("cluster-%06d-*.segrows", clusterID))
@@ -703,7 +703,7 @@ SELECT rowid, %s
 		if _, err := spool.file.Write(rowidBuf[:]); err != nil {
 			return nil, fmt.Errorf("segment generation rebuild: write spool rowid: %w", err)
 		}
-		if _, err := spool.file.Write(encoded); err != nil {
+		if _, err := spool.file.Write(prepared); err != nil {
 			return nil, fmt.Errorf("segment generation rebuild: write spool vec: %w", err)
 		}
 		clusterRowCounts[clusterID]++
@@ -715,9 +715,27 @@ SELECT rowid, %s
 	if rowCount == 0 {
 		return nil, nil
 	}
+	stableCodec, stableCodecBlob, err := buildStableMemberCodec(spec, cs, codecReservoir)
+	if err != nil {
+		return nil, fmt.Errorf("segment generation rebuild: build stable codec: %w", err)
+	}
+	dataWriter, err := vecindex.CreateSegmentDataWriter(
+		dataPath,
+		spec.InternalMetric(),
+		stableCodec.Encoding(),
+		spec.Dim,
+		spec.InternalDim(),
+		stableCodec.EncodedSize(),
+		maxCluster,
+		expectedEpoch,
+		generation,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer dataWriter.Abort()
 	layoutHotClusters := orderedHotClusterIDs(hotClusterScores, segmentLayoutHotClusterLimit)
-	entrySize := 8 + vecBytes
-	buf := make([]byte, entrySize*256)
+	buf := make([]byte, preparedEntrySize*256)
 	for _, clusterID := range segmentClusterWriteOrder(spec, cs, hotClusterScores) {
 		spool := clusterSpools[clusterID]
 		if spool == nil {
@@ -735,17 +753,24 @@ SELECT rowid, %s
 				if n == 0 {
 					break
 				}
-				if n%entrySize != 0 {
+				if n%preparedEntrySize != 0 {
 					return nil, fmt.Errorf("segment generation rebuild: truncated cluster spool")
 				}
 			} else if err != nil {
 				return nil, fmt.Errorf("segment generation rebuild: read cluster spool: %w", err)
 			}
-			for cursor := 0; cursor < n; cursor += entrySize {
+			for cursor := 0; cursor < n; cursor += preparedEntrySize {
 				rowID := int64(binary.LittleEndian.Uint64(buf[cursor : cursor+8]))
-				vec := buf[cursor+8 : cursor+entrySize]
+				prepared := buf[cursor+8 : cursor+preparedEntrySize]
+				enc, encoded, err := stableCodec.Encode(clusterID, prepared)
+				if err != nil {
+					return nil, fmt.Errorf("segment generation rebuild: encode rowid %d: %w", rowID, err)
+				}
+				if enc != stableCodec.Encoding() {
+					return nil, fmt.Errorf("segment generation rebuild: unexpected stable encoding %d for rowid %d", enc, rowID)
+				}
 				offset := dataWriter.NextOffset()
-				if err := dataWriter.Append(clusterID, rowID, vec); err != nil {
+				if err := dataWriter.Append(clusterID, rowID, encoded); err != nil {
 					return nil, fmt.Errorf("segment generation rebuild: append data: %w", err)
 				}
 				rowLocs = append(rowLocs, rowLoc{rowID: rowID, clusterID: clusterID, offset: offset})
@@ -804,6 +829,7 @@ SELECT rowid, %s
 		ProbeCentroidBlob:        mustCentroidBlob(cs),
 		StableCentroidEpoch:      expectedEpoch,
 		StableCentroidBlob:       mustCentroidBlob(cs),
+		StableMemberCodecBlob:    stableCodecBlob,
 		AppliedOverlaySeq:        appliedOverlaySeq,
 		Generation:               generation,
 		MaxCluster:               uint32(maxCluster),
@@ -1109,7 +1135,7 @@ func loadStablePreparedForMaintenance(segments *vecindex.SegmentGeneration, spec
 	if readRowID != rowID {
 		return 0, nil, fmt.Errorf("stable maintenance row mismatch: got %d want %d", readRowID, rowID)
 	}
-	prepared, err := decodeStableMemberPrepared(spec, segments.StableCentroids, loc.ClusterID, vecBytes)
+	prepared, err := decodeStableMemberPrepared(spec, segments.StableCodec, segments.StableCentroids, loc.ClusterID, vecBytes)
 	if err != nil {
 		return 0, nil, err
 	}

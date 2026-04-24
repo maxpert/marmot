@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"io"
 	"os"
@@ -16,8 +17,9 @@ import (
 )
 
 type incrementalClusterEntry struct {
-	rowID int64
-	vec   []byte
+	rowID    int64
+	vec      []byte
+	prepared []float32
 }
 
 type rowLoc struct {
@@ -57,6 +59,7 @@ func (p *pendingSegmentGeneration) Close() {
 
 func BuildIncrementalSegmentGeneration(
 	ctx context.Context,
+	db *sql.DB,
 	dbPath string,
 	meta common.VectorIndexMeta,
 	spec vecindex.IVFSpec,
@@ -88,6 +91,7 @@ func BuildIncrementalSegmentGeneration(
 	}
 	return buildIncrementalSegmentGenerationFromMutations(
 		ctx,
+		db,
 		dbPath,
 		meta,
 		spec,
@@ -104,6 +108,7 @@ func BuildIncrementalSegmentGeneration(
 
 func buildIncrementalSegmentGenerationFromMutations(
 	ctx context.Context,
+	db *sql.DB,
 	dbPath string,
 	meta common.VectorIndexMeta,
 	spec vecindex.IVFSpec,
@@ -151,17 +156,38 @@ func buildIncrementalSegmentGenerationFromMutations(
 	if len(touchedClusters) == 0 {
 		return nil, nil
 	}
+	exactFetcher, err := newExactVectorFetcher(ctx, db, meta, spec)
+	if err != nil {
+		return nil, fmt.Errorf("incremental segment generation: exact vector fetcher: %w", err)
+	}
+	if exactFetcher != nil {
+		defer exactFetcher.Close()
+	}
 
-	dataEncoding, vecBytes := vecindex.StableMemberEncodingSpec(spec)
+	baseCodec := base.StableCodec
+	if baseCodec == nil {
+		baseCodec, err = vecindex.DecodeStableMemberCodecBlob(spec, base.StableCentroids, base.Data.Encoding(), nil)
+		if err != nil {
+			return nil, fmt.Errorf("incremental segment generation: load base stable codec: %w", err)
+		}
+	}
+	stableCodec, err := baseCodec.WithCentroids(stableCS)
+	if err != nil {
+		return nil, fmt.Errorf("incremental segment generation: derive stable codec: %w", err)
+	}
+	stableCodecBlob, err := vecindex.EncodeStableMemberCodecBlob(stableCodec)
+	if err != nil {
+		return nil, fmt.Errorf("incremental segment generation: encode stable codec metadata: %w", err)
+	}
 	dataPath := vecindex.SegmentDataPath(dir, generation)
 	rowMapPath := vecindex.SegmentRowMapPath(dir, generation)
 	dataWriter, err := vecindex.CreateSegmentDataWriter(
 		dataPath,
 		spec.InternalMetric(),
-		dataEncoding,
+		stableCodec.Encoding(),
 		spec.Dim,
 		spec.InternalDim(),
-		vecBytes,
+		stableCodec.EncodedSize(),
 		maxCluster,
 		stableCS.Epoch(),
 		generation,
@@ -228,7 +254,7 @@ func buildIncrementalSegmentGenerationFromMutations(
 			continue
 		}
 
-		entries, err := rebuildTouchedClusterEntries(ctx, spec, stableCS, base, clusterID, pendingByRow)
+		entries, err := rebuildTouchedClusterEntries(ctx, baseCodec, stableCodec, exactFetcher, base, clusterID, pendingByRow)
 		if err != nil {
 			return nil, err
 		}
@@ -239,9 +265,13 @@ func buildIncrementalSegmentGenerationFromMutations(
 			if err := dataWriter.Append(clusterID, entry.rowID, entry.vec); err != nil {
 				return nil, fmt.Errorf("incremental segment generation: append touched cluster %d rowid %d: %w", clusterID, entry.rowID, err)
 			}
-			prepared, err := decodeStableMemberPrepared(spec, stableCS, clusterID, entry.vec)
-			if err != nil {
-				return nil, fmt.Errorf("incremental segment generation: decode prepared rowid %d: %w", entry.rowID, err)
+			prepared := entry.prepared
+			if len(prepared) == 0 {
+				var err error
+				prepared, err = stableCodec.DecodePrepared(clusterID, entry.vec)
+				if err != nil {
+					return nil, fmt.Errorf("incremental segment generation: decode prepared rowid %d: %w", entry.rowID, err)
+				}
 			}
 			for i, value := range prepared {
 				clusterVectorSums[clusterID][i] += value
@@ -312,6 +342,7 @@ func buildIncrementalSegmentGenerationFromMutations(
 		ProbeCentroidBlob:        mustCentroidBlob(probeCS),
 		StableCentroidEpoch:      stableCS.Epoch(),
 		StableCentroidBlob:       mustCentroidBlob(stableCS),
+		StableMemberCodecBlob:    stableCodecBlob,
 		AppliedOverlaySeq:        cutoffSequence,
 		Generation:               generation,
 		MaxCluster:               uint32(maxCluster),
@@ -334,6 +365,7 @@ func buildIncrementalSegmentGenerationFromMutations(
 			RowMap:                   rowMapStore,
 			ProbeCentroids:           probeCS,
 			StableCentroids:          stableCS,
+			StableCodec:              stableCodec,
 			AppliedOverlaySeq:        cutoffSequence,
 			ClusterRowCounts:         append([]uint64(nil), clusterRowCounts...),
 			ClusterVectorSums:        cloneClusterVectorSums(clusterVectorSums),
@@ -347,37 +379,55 @@ func buildIncrementalSegmentGenerationFromMutations(
 
 func rebuildTouchedClusterEntries(
 	ctx context.Context,
-	spec vecindex.IVFSpec,
-	stableCS *kmeans.CentroidSet,
+	baseCodec *vecindex.StableMemberCodec,
+	stableCodec *vecindex.StableMemberCodec,
+	exactFetcher *exactVectorFetcher,
 	base *vecindex.SegmentGeneration,
 	clusterID int64,
 	pendingByRow map[int64]pendingMutation,
 ) ([]incrementalClusterEntry, error) {
-	_ = ctx
 	entries := make([]incrementalClusterEntry, 0, base.Data.ClusterCount(clusterID))
 	var scanErr error
 	if err := base.Data.ScanCluster(clusterID, func(rowID int64, vecBytes []byte) bool {
 		if _, changed := pendingByRow[rowID]; changed {
 			return true
 		}
-		prepared, err := decodeStableMemberPrepared(spec, base.StableCentroids, clusterID, vecBytes)
+		var preparedBlob []byte
+		var prepared []float32
+		if exactFetcher != nil {
+			var ok bool
+			var err error
+			preparedBlob, ok, err = exactFetcher.Prepared(ctx, rowID)
+			if err != nil {
+				scanErr = err
+				return false
+			}
+			if !ok {
+				return true
+			}
+			prepared = clonePreparedVector(preparedBlob)
+		} else {
+			var err error
+			prepared, err = baseCodec.DecodePrepared(clusterID, vecBytes)
+			if err != nil {
+				scanErr = err
+				return false
+			}
+			preparedBlob = vecindex.Float32ToBytes(prepared)
+		}
+		enc, encoded, err := stableCodec.Encode(clusterID, preparedBlob)
 		if err != nil {
 			scanErr = err
 			return false
 		}
-		enc, encoded, err := vecindex.EncodeStableMember(spec, stableCS, clusterID, vecindex.Float32ToBytes(prepared))
-		if err != nil {
-			scanErr = err
-			return false
-		}
-		wantEnc, _ := vecindex.StableMemberEncodingSpec(spec)
-		if enc != wantEnc {
+		if enc != stableCodec.Encoding() {
 			scanErr = fmt.Errorf("unexpected stable encoding %d for rowid %d", enc, rowID)
 			return false
 		}
 		entries = append(entries, incrementalClusterEntry{
-			rowID: rowID,
-			vec:   encoded,
+			rowID:    rowID,
+			vec:      encoded,
+			prepared: prepared,
 		})
 		return true
 	}); err != nil {
@@ -390,17 +440,17 @@ func rebuildTouchedClusterEntries(
 		if mutation.kind == vecindex.OverlayMutationDelete || mutation.clusterID != clusterID {
 			continue
 		}
-		enc, encoded, err := vecindex.EncodeStableMember(spec, stableCS, clusterID, mutation.vec)
+		enc, encoded, err := stableCodec.Encode(clusterID, mutation.vec)
 		if err != nil {
 			return nil, fmt.Errorf("incremental segment generation: encode rowid %d: %w", mutation.rowID, err)
 		}
-		wantEnc, _ := vecindex.StableMemberEncodingSpec(spec)
-		if enc != wantEnc {
+		if enc != stableCodec.Encoding() {
 			return nil, fmt.Errorf("incremental segment generation: unexpected stable encoding %d for rowid %d", enc, mutation.rowID)
 		}
 		entries = append(entries, incrementalClusterEntry{
-			rowID: mutation.rowID,
-			vec:   encoded,
+			rowID:    mutation.rowID,
+			vec:      encoded,
+			prepared: clonePreparedVector(mutation.vec),
 		})
 	}
 	slices.SortFunc(entries, func(a, b incrementalClusterEntry) int {
@@ -416,7 +466,10 @@ func rebuildTouchedClusterEntries(
 	return entries, nil
 }
 
-func decodeStableMemberPrepared(spec vecindex.IVFSpec, cs *kmeans.CentroidSet, clusterID int64, vecBytes []byte) ([]float32, error) {
+func decodeStableMemberPrepared(spec vecindex.IVFSpec, codec *vecindex.StableMemberCodec, cs *kmeans.CentroidSet, clusterID int64, vecBytes []byte) ([]float32, error) {
+	if codec != nil {
+		return codec.DecodePrepared(clusterID, vecBytes)
+	}
 	enc, _ := vecindex.StableMemberEncodingSpec(spec)
 	switch enc {
 	case vecindex.MemberEncodingRawPreparedF32:

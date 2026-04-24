@@ -69,30 +69,32 @@ import (
 )
 
 type config struct {
-	dataDir       string
-	dbDir         string
-	dbName        string
-	indexName     string
-	tableName     string
-	columnName    string
-	metric        string
-	nlist         int
-	nprobe        int
-	forceBuild    bool
-	skipInsert    bool
-	warmup        int
-	nQueries      int
-	k             int
-	settleTimeout time.Duration
-	profileDir    string
-	profileCPU    bool
-	useGoRank     bool
-	insertTx      int
-	insertN       int
-	queryConc     int
-	insertConc    int
-	readPool      int
-	sqliteCacheMB int
+	dataDir        string
+	dbDir          string
+	dbName         string
+	indexName      string
+	tableName      string
+	columnName     string
+	metric         string
+	nlist          int
+	nprobe         int
+	nlistExplicit  bool
+	nprobeExplicit bool
+	forceBuild     bool
+	skipInsert     bool
+	warmup         int
+	nQueries       int
+	k              int
+	settleTimeout  time.Duration
+	profileDir     string
+	profileCPU     bool
+	useGoRank      bool
+	insertTx       int
+	insertN        int
+	queryConc      int
+	insertConc     int
+	readPool       int
+	sqliteCacheMB  int
 }
 
 func parseFlags() *config {
@@ -129,6 +131,14 @@ func parseFlags() *config {
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		os.Exit(2)
 	}
+	fs.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "nlist":
+			c.nlistExplicit = true
+		case "nprobe":
+			c.nprobeExplicit = true
+		}
+	})
 
 	if c.dataDir == "" {
 		fmt.Fprintln(os.Stderr, "--data-dir is required")
@@ -167,6 +177,7 @@ type queryRunStats struct {
 	recall10      float64
 	recall10in100 float64
 	workerQueries []int64
+	segmentStats  vecindex.SegmentScanStats
 }
 
 type insertMetrics struct {
@@ -181,6 +192,19 @@ type vectorReadiness struct {
 	probeVersion   uint64
 	nlist          int
 	nprobe         int
+}
+
+type segmentEncodingStats struct {
+	encodingName        string
+	payloadBytes        int
+	entryBytes          int
+	rowCount            uint64
+	dataFileBytes       int64
+	scanRowsEstimate    uint64
+	scanBytesEstimate   uint64
+	appliedOverlaySeq   uint64
+	probeCentroidEpoch  uint64
+	stableCentroidEpoch uint64
 }
 
 func (h *harness) insertCDCEntries(lo, hi int) ([]common.CDCEntry, error) {
@@ -884,9 +908,116 @@ func (h *harness) refreshIndexTuning() error {
 	if err := row.Scan(&nlist, &nprobe); err != nil {
 		return fmt.Errorf("refresh index tuning: %w", err)
 	}
-	h.cfg.nlist = nlist
-	h.cfg.nprobe = nprobe
+	if !h.cfg.nlistExplicit {
+		h.cfg.nlist = nlist
+	}
+	if !h.cfg.nprobeExplicit {
+		h.cfg.nprobe = nprobe
+	}
 	return nil
+}
+
+func (h *harness) currentSegmentEncodingStats() *segmentEncodingStats {
+	if h == nil || h.engine == nil {
+		return nil
+	}
+	state, ok := h.engine.Lookup(h.cfg.indexName)
+	if !ok || state == nil {
+		return nil
+	}
+	segments := state.LoadSegmentStore()
+	if segments == nil || segments.Data == nil {
+		return nil
+	}
+	indexMeta, err := h.readIndexMeta()
+	if err != nil {
+		return nil
+	}
+	targetPartitionSize := indexMeta.TargetPartitionSize
+	if targetPartitionSize <= 0 {
+		targetPartitionSize = 512
+	}
+	scanRowsEstimate := uint64(h.cfg.nprobe * targetPartitionSize)
+	if indexMeta.AutoTuneNprobe {
+		scanRowsEstimate = uint64(defaultBenchProbeScanBudgetRows(targetPartitionSize))
+		if segments.Data.Encoding() == vecindex.MemberEncodingResidualPQ8 {
+			scanRowsEstimate = uint64(defaultBenchPQProbeScanBudgetRows(targetPartitionSize))
+		}
+	}
+	if scanRowsEstimate == 0 || scanRowsEstimate > segments.Data.RowCount() {
+		scanRowsEstimate = segments.Data.RowCount()
+	}
+	entryBytes := 8 + segments.Data.VecBytes()
+	var probeEpoch, stableEpoch uint64
+	if segments.ProbeCentroids != nil {
+		probeEpoch = segments.ProbeCentroids.Epoch()
+	}
+	if segments.StableCentroids != nil {
+		stableEpoch = segments.StableCentroids.Epoch()
+	}
+	stats := &segmentEncodingStats{
+		encodingName:        benchMemberEncodingName(segments.Data.Encoding()),
+		payloadBytes:        segments.Data.VecBytes(),
+		entryBytes:          entryBytes,
+		rowCount:            segments.Data.RowCount(),
+		dataFileBytes:       segments.Data.FileSize(),
+		scanRowsEstimate:    scanRowsEstimate,
+		scanBytesEstimate:   scanRowsEstimate * uint64(entryBytes),
+		appliedOverlaySeq:   segments.AppliedOverlaySeq,
+		probeCentroidEpoch:  probeEpoch,
+		stableCentroidEpoch: stableEpoch,
+	}
+	return stats
+}
+
+func (h *harness) currentSegmentDataStore() *vecindex.SegmentDataStore {
+	if h == nil || h.engine == nil {
+		return nil
+	}
+	state, ok := h.engine.Lookup(h.cfg.indexName)
+	if !ok || state == nil {
+		return nil
+	}
+	segments := state.LoadSegmentStore()
+	if segments == nil {
+		return nil
+	}
+	return segments.Data
+}
+
+func defaultBenchProbeScanBudgetRows(targetPartitionSize int) int {
+	if targetPartitionSize <= 0 {
+		targetPartitionSize = 512
+	}
+	budget := 8192
+	if widened := 16 * targetPartitionSize; widened > budget {
+		budget = widened
+	}
+	return budget
+}
+
+func defaultBenchPQProbeScanBudgetRows(targetPartitionSize int) int {
+	if targetPartitionSize <= 0 {
+		targetPartitionSize = 512
+	}
+	budget := defaultBenchProbeScanBudgetRows(targetPartitionSize)
+	if widened := 48 * targetPartitionSize; widened > budget {
+		budget = widened
+	}
+	return budget
+}
+
+func benchMemberEncodingName(enc int64) string {
+	switch enc {
+	case vecindex.MemberEncodingRawPreparedF32:
+		return "raw-prepared-f32"
+	case vecindex.MemberEncodingResidualInt8:
+		return "residual-int8"
+	case vecindex.MemberEncodingResidualPQ8:
+		return "residual-pq8"
+	default:
+		return fmt.Sprintf("unknown-%d", enc)
+	}
 }
 
 func (h *harness) ensureIndex() error {
@@ -1100,6 +1231,20 @@ func (h *harness) runQueryPhase() error {
 	plog("=== results ===")
 	plog("  config: nlist=%d nprobe=%d metric=%s dim=%d K=%d concurrency=%d",
 		h.cfg.nlist, h.cfg.nprobe, h.cfg.metric, h.meta.Dim, h.cfg.k, h.cfg.queryConc)
+	if segmentStats := h.currentSegmentEncodingStats(); segmentStats != nil {
+		plog("  stable encoding: %s payload_bytes/vector=%d entry_bytes/vector=%d rows=%d data_file_bytes=%d",
+			segmentStats.encodingName, segmentStats.payloadBytes, segmentStats.entryBytes, segmentStats.rowCount, segmentStats.dataFileBytes)
+		plog("  segment scan estimate: rows/query=%d bytes/query=%d applied_overlay_seq=%d probe_epoch=%d stable_epoch=%d",
+			segmentStats.scanRowsEstimate, segmentStats.scanBytesEstimate, segmentStats.appliedOverlaySeq,
+			segmentStats.probeCentroidEpoch, segmentStats.stableCentroidEpoch)
+		if len(stats.lats) > 0 && stats.segmentStats.ReadBatches > 0 && stats.segmentStats.LogicalBytes > 0 {
+			plog("  segment scan actual: read_bytes/query=%d logical_bytes/query=%d read_batches/query=%.2f overread=%.2fx",
+				stats.segmentStats.ReadBytes/uint64(len(stats.lats)),
+				stats.segmentStats.LogicalBytes/uint64(len(stats.lats)),
+				float64(stats.segmentStats.ReadBatches)/float64(len(stats.lats)),
+				float64(stats.segmentStats.ReadBytes)/float64(stats.segmentStats.LogicalBytes))
+		}
+	}
 	plog("  recall@%d      = %.4f  (top-%d vs truth top-%d)", h.cfg.k, stats.recall10, h.cfg.k, h.cfg.k)
 	plog("  recall@%d-in-100 = %.4f  (top-%d vs truth top-100)", h.cfg.k, stats.recall10in100, h.cfg.k)
 	plog("  latency: p50=%s p95=%s p99=%s p999=%s max=%s",
@@ -1153,6 +1298,10 @@ func (h *harness) runQueries(sess *protocol.ConnectionSession, querySQL string, 
 			pprof.StopCPUProfile()
 			cpuF.Close()
 		}()
+	}
+	segmentData := h.currentSegmentDataStore()
+	if segmentData != nil {
+		segmentData.ResetScanStats()
 	}
 
 	workers := h.cfg.queryConc
@@ -1268,11 +1417,16 @@ func (h *harness) runQueries(sess *protocol.ConnectionSession, querySQL string, 
 	if h.cfg.profileCPU {
 		plog("  cpu profile: %s", cpuPath)
 	}
+	var segmentStats vecindex.SegmentScanStats
+	if segmentData != nil {
+		segmentStats = segmentData.SnapshotScanStats()
+	}
 	return &queryRunStats{
 		lats:          lats,
 		recall10:      recall10,
 		recall10in100: recall10in100,
 		workerQueries: workerQueries,
+		segmentStats:  segmentStats,
 	}, nil
 }
 

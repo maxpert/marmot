@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"slices"
 
 	"github.com/maxpert/marmot/common"
 	"github.com/maxpert/marmot/modules/vecindex"
@@ -54,6 +55,7 @@ func stepPromotionClusterCount(currentK, wantK int) int {
 
 func prepareIncrementalPromotion(
 	ctx context.Context,
+	conn *sql.DB,
 	dbPath string,
 	meta common.VectorIndexMeta,
 	spec vecindex.IVFSpec,
@@ -132,7 +134,7 @@ func prepareIncrementalPromotion(
 		if extra <= 0 {
 			break
 		}
-		rows, err := loadPromotionRows(pinnedBase, spec, source.clusterID)
+		rows, err := loadPromotionRows(ctx, conn, meta, spec, pinnedBase, source.clusterID)
 		if err != nil {
 			return nil, err
 		}
@@ -141,7 +143,7 @@ func prepareIncrementalPromotion(
 		}
 		initCentroids := make([][]float32, 0, extra+1)
 		initCentroids = append(initCentroids, append([]float32(nil), currentProbe.Snapshot()[source.clusterID-1]...))
-		seeds, err := clusterSplitSeeds(pinnedBase, spec, source.clusterID, initCentroids[0], extra)
+		seeds, err := clusterSplitSeedsFromRows(rows, spec, source.clusterID, initCentroids[0], extra)
 		if err != nil {
 			return nil, err
 		}
@@ -198,6 +200,7 @@ func prepareIncrementalPromotion(
 	}
 	pending, err := buildIncrementalSegmentGenerationFromMutations(
 		ctx,
+		conn,
 		dbPath,
 		nextMeta,
 		nextSpec,
@@ -298,7 +301,7 @@ func (h *EngineHook) runIncrementalPromotion(
 	state *vecindex.IndexState,
 	nextClusters int,
 ) error {
-	plan, err := prepareIncrementalPromotion(ctx, dbPath, meta, spec, state, nextClusters)
+	plan, err := prepareIncrementalPromotion(ctx, conn, dbPath, meta, spec, state, nextClusters)
 	if err != nil || plan == nil {
 		return err
 	}
@@ -306,14 +309,35 @@ func (h *EngineHook) runIncrementalPromotion(
 	return h.publishIncrementalPromotion(ctx, conn, dbPath, meta, plan)
 }
 
-func loadPromotionRows(base *vecindex.SegmentGeneration, spec vecindex.IVFSpec, clusterID int64) ([]promotionRow, error) {
+func loadPromotionRows(ctx context.Context, conn *sql.DB, meta common.VectorIndexMeta, spec vecindex.IVFSpec, base *vecindex.SegmentGeneration, clusterID int64) ([]promotionRow, error) {
+	fetcher, err := newExactVectorFetcher(ctx, conn, meta, spec)
+	if err != nil {
+		return nil, err
+	}
+	if fetcher != nil {
+		defer fetcher.Close()
+	}
 	rows := make([]promotionRow, 0, base.Data.ClusterCount(clusterID))
 	var scanErr error
 	if err := base.Data.ScanCluster(clusterID, func(rowID int64, vecBytes []byte) bool {
-		prepared, err := decodeStableMemberPrepared(spec, base.StableCentroids, clusterID, vecBytes)
-		if err != nil {
-			scanErr = err
-			return false
+		var prepared []float32
+		if fetcher != nil {
+			preparedBlob, ok, err := fetcher.Prepared(ctx, rowID)
+			if err != nil {
+				scanErr = err
+				return false
+			}
+			if !ok {
+				return true
+			}
+			prepared = clonePreparedVector(preparedBlob)
+		} else {
+			var err error
+			prepared, err = decodeStableMemberPrepared(spec, base.StableCodec, base.StableCentroids, clusterID, vecBytes)
+			if err != nil {
+				scanErr = err
+				return false
+			}
 		}
 		rows = append(rows, promotionRow{
 			rowID: rowID,
@@ -327,6 +351,52 @@ func loadPromotionRows(base *vecindex.SegmentGeneration, spec vecindex.IVFSpec, 
 		return nil, scanErr
 	}
 	return rows, nil
+}
+
+func clusterSplitSeedsFromRows(
+	rows []promotionRow,
+	spec vecindex.IVFSpec,
+	clusterID int64,
+	baseCentroid []float32,
+	extra int,
+) ([][]float32, error) {
+	if len(rows) <= extra || extra <= 0 {
+		return nil, nil
+	}
+	vectors := make([][]float32, 0, len(rows))
+	for _, row := range rows {
+		if len(row.vec) == 0 {
+			continue
+		}
+		vectors = append(vectors, row.vec)
+	}
+	if len(vectors) <= extra {
+		return nil, nil
+	}
+	split, err := kmeans.KMeansPlusPlus(vectors, extra+1, spec.Seed^uint64(clusterID), 3)
+	if err != nil {
+		return nil, err
+	}
+	slices.SortFunc(split, func(a, b []float32) int {
+		da := metric.Distance(spec.InternalMetric(), a, baseCentroid)
+		db := metric.Distance(spec.InternalMetric(), b, baseCentroid)
+		switch {
+		case da > db:
+			return -1
+		case da < db:
+			return 1
+		default:
+			return 0
+		}
+	})
+	if len(split) > extra {
+		split = split[:extra]
+	}
+	out := make([][]float32, len(split))
+	for i := range split {
+		out[i] = append([]float32(nil), split[i]...)
+	}
+	return out, nil
 }
 
 func splitPromotionFamily(

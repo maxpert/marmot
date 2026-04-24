@@ -11,6 +11,7 @@ import (
 	"github.com/maxpert/marmot/modules/vecindex"
 	"github.com/maxpert/marmot/modules/vecindex/pkg/kmeans"
 	"github.com/maxpert/marmot/modules/vecindex/pkg/metric"
+	"github.com/maxpert/marmot/modules/vecindex/pkg/quantize"
 )
 
 func TestRebuildSegmentGeneration(t *testing.T) {
@@ -186,6 +187,147 @@ func TestRebuildSegmentGeneration_DotMetricUsesInternalL2(t *testing.T) {
 	}
 }
 
+func TestOpenSegmentGenerationResidualPQ8(t *testing.T) {
+	t.Parallel()
+
+	tdb := openTestDBWithMeta(t, filepath.Join(t.TempDir(), "segment-pq.db"))
+	idx := "segment_pq_idx"
+	meta := common.VectorIndexMeta{
+		IndexName:  idx,
+		TableName:  "docs",
+		ColumnName: "embed",
+		Database:   "testdb",
+		Metric:     "l2",
+		Dim:        16,
+		CreatedAt:  1,
+	}
+	spec := vecindex.IVFSpec{ID: idx, Dim: 16, Metric: vecindex.MetricL2, Nlist: 1, Nprobe: 1}
+	centroid := make([]float32, spec.InternalDim())
+	cs, err := kmeans.NewCentroidSet(1, [][]float32{centroid})
+	if err != nil {
+		t.Fatalf("NewCentroidSet: %v", err)
+	}
+	residuals := make([][]float32, 300)
+	for i := range residuals {
+		residuals[i] = make([]float32, spec.InternalDim())
+		for d := range residuals[i] {
+			residuals[i][d] = float32(((i+1)*(d+3))%31) * 0.01
+		}
+	}
+	pq, err := quantize.TrainPQ8(residuals, spec.InternalDim(), quantize.PQ8Options{M: 4, MaxIter: 3, Seed: 5})
+	if err != nil {
+		t.Fatalf("TrainPQ8: %v", err)
+	}
+	codec, err := vecindex.NewStableMemberCodec(spec, cs, vecindex.MemberEncodingResidualPQ8, pq)
+	if err != nil {
+		t.Fatalf("NewStableMemberCodec: %v", err)
+	}
+	codecBlob, err := vecindex.EncodeStableMemberCodecBlob(codec)
+	if err != nil {
+		t.Fatalf("EncodeStableMemberCodecBlob: %v", err)
+	}
+
+	dir := vecindex.SegmentStoreDir(tdb.dbPath, idx)
+	generation := uint64(1)
+	dataWriter, err := vecindex.CreateSegmentDataWriter(
+		vecindex.SegmentDataPath(dir, generation),
+		spec.InternalMetric(),
+		codec.Encoding(),
+		spec.Dim,
+		spec.InternalDim(),
+		codec.EncodedSize(),
+		1,
+		cs.Epoch(),
+		generation,
+	)
+	if err != nil {
+		t.Fatalf("CreateSegmentDataWriter: %v", err)
+	}
+	rowMapWriter, err := vecindex.CreateSegmentRowMapWriter(vecindex.SegmentRowMapPath(dir, generation), cs.Epoch(), generation)
+	if err != nil {
+		t.Fatalf("CreateSegmentRowMapWriter: %v", err)
+	}
+	vec := make([]float32, spec.InternalDim())
+	for i := range vec {
+		vec[i] = residuals[17][i]
+	}
+	_, encoded, err := codec.Encode(1, vecindex.Float32ToBytes(vec))
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	offset := dataWriter.NextOffset()
+	if err := dataWriter.Append(1, 11, encoded); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if err := rowMapWriter.Append(11, 1, offset); err != nil {
+		t.Fatalf("Append rowmap: %v", err)
+	}
+	dataStore, err := dataWriter.Close()
+	if err != nil {
+		t.Fatalf("Close data: %v", err)
+	}
+	rowMapStore, err := rowMapWriter.Close()
+	if err != nil {
+		t.Fatalf("Close rowmap: %v", err)
+	}
+	if err := rowMapStore.Close(); err != nil {
+		t.Fatalf("Close rowmap store: %v", err)
+	}
+	if err := dataStore.Close(); err != nil {
+		t.Fatalf("Close data store: %v", err)
+	}
+	manifest := vecindex.SegmentManifest{
+		Version:               vecindex.SegmentStoreVersion,
+		Database:              meta.Database,
+		IndexName:             meta.IndexName,
+		IndexCreatedAt:        meta.CreatedAt,
+		Metric:                meta.Metric,
+		Dim:                   uint32(meta.Dim),
+		InternalDim:           uint32(spec.InternalDim()),
+		ProbeCentroidEpoch:    cs.Epoch(),
+		ProbeCentroidBlob:     mustCentroidBlob(cs),
+		StableCentroidEpoch:   cs.Epoch(),
+		StableCentroidBlob:    mustCentroidBlob(cs),
+		StableMemberCodecBlob: codecBlob,
+		AppliedOverlaySeq:     7,
+		Generation:            generation,
+		MaxCluster:            1,
+		RowCount:              1,
+		ClusterRowCounts:      []uint64{0, 1},
+		ClusterVectorSums:     [][]float32{nil, append([]float32(nil), vec...)},
+		CreatedAtUnixNano:     1,
+	}
+	if err := publishSegmentGeneration(dir, manifest, dataStore.Path(), rowMapStore.Path()); err != nil {
+		t.Fatalf("publishSegmentGeneration: %v", err)
+	}
+
+	opened, err := openSegmentGeneration(dir, meta, spec, cs.Epoch())
+	if err != nil {
+		t.Fatalf("openSegmentGeneration: %v", err)
+	}
+	defer opened.Close()
+	if got := opened.Data.Encoding(); got != vecindex.MemberEncodingResidualPQ8 {
+		t.Fatalf("encoding = %d, want PQ", got)
+	}
+	if got := opened.Data.VecBytes(); got != codec.EncodedSize() {
+		t.Fatalf("vec bytes = %d, want %d", got, codec.EncodedSize())
+	}
+	loc, ok, err := opened.RowMap.Lookup(11)
+	if err != nil || !ok {
+		t.Fatalf("RowMap.Lookup = %+v %v %v", loc, ok, err)
+	}
+	if loc.Offset != offset {
+		t.Fatalf("row offset = %d, want %d", loc.Offset, offset)
+	}
+	decoded, err := opened.StableCodec.DecodePrepared(1, encoded)
+	if err != nil {
+		t.Fatalf("DecodePrepared: %v", err)
+	}
+	if len(decoded) != spec.InternalDim() {
+		t.Fatalf("decoded dim = %d, want %d", len(decoded), spec.InternalDim())
+	}
+}
+
 func TestBuildIncrementalSegmentGeneration_RewritesTouchedClustersOnly(t *testing.T) {
 	t.Parallel()
 
@@ -248,13 +390,14 @@ func TestBuildIncrementalSegmentGeneration_RewritesTouchedClustersOnly(t *testin
 		t.Fatalf("overlay apply: %v", err)
 	}
 
-	stats, err := buildCutoffClusterStats(spec, base, overlay.Snapshot(), 3)
+	stats, err := buildCutoffClusterStats(spec, base, overlay.Snapshot(), 3, nil)
 	if err != nil {
 		t.Fatalf("buildCutoffClusterStats: %v", err)
 	}
 
 	pending, err := BuildIncrementalSegmentGeneration(
 		context.Background(),
+		db,
 		tdb.dbPath,
 		meta,
 		spec,

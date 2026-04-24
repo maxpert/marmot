@@ -205,7 +205,6 @@ func (bc *SQLiteBatchCommitter) openOptimizedConnection() (*sql.DB, error) {
 		"PRAGMA synchronous = OFF",             // Skip fsync per-commit (batch amortizes crash risk)
 		"PRAGMA cache_size = -64000",           // 64MB page cache
 		"PRAGMA temp_store = MEMORY",           // Temp tables in RAM
-		"PRAGMA mmap_size = 268435456",         // 256MB memory-mapped I/O
 		"PRAGMA journal_mode = WAL",            // WAL mode for concurrent reads
 		"PRAGMA wal_autocheckpoint = 1000",     // ~4MB WAL before checkpoint (smaller = faster checkpoints)
 		"PRAGMA journal_size_limit = 67108864", // 64MB max WAL size after checkpoint

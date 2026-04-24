@@ -147,7 +147,7 @@ func (h *EngineHook) maintenanceOnce(ctx context.Context, meta common.VectorInde
 			log.Warn().Err(err).Str("index", meta.IndexName).Msg("maintenance: get db path failed")
 			return false
 		}
-		if err := h.runIncrementalMerge(ctx, dbPath, meta, spec, state); err != nil {
+		if err := h.runIncrementalMerge(ctx, conn, dbPath, meta, spec, state); err != nil {
 			log.Warn().Err(err).Str("index", meta.IndexName).Msg("maintenance: incremental merge failed")
 		}
 		return false
@@ -189,7 +189,7 @@ func (h *EngineHook) maintenanceOnce(ctx context.Context, meta common.VectorInde
 		log.Warn().Err(err).Str("index", meta.IndexName).Msg("maintenance: get db path failed")
 		return false
 	}
-	if err := h.runIncrementalMerge(ctx, dbPath, meta, spec, state); err != nil {
+	if err := h.runIncrementalMerge(ctx, conn, dbPath, meta, spec, state); err != nil {
 		log.Warn().Err(err).Str("index", meta.IndexName).Msg("maintenance: incremental merge failed")
 	}
 	return false
@@ -366,6 +366,7 @@ func openPinnedSegmentGeneration(
 
 func (h *EngineHook) prepareIncrementalMerge(
 	ctx context.Context,
+	conn *sql.DB,
 	dbPath string,
 	meta common.VectorIndexMeta,
 	spec vecindex.IVFSpec,
@@ -399,7 +400,7 @@ func (h *EngineHook) prepareIncrementalMerge(
 	}
 	defer pinnedBase.Close()
 
-	stats, err := buildCutoffClusterStats(spec, pinnedBase, overlaySnapshot, cutoff)
+	stats, err := buildCutoffClusterStats(spec, pinnedBase, overlaySnapshot, cutoff, state.LoadMaintenanceState())
 	if err != nil {
 		return nil, err
 	}
@@ -418,6 +419,7 @@ func (h *EngineHook) prepareIncrementalMerge(
 
 	pending, err := BuildIncrementalSegmentGeneration(
 		ctx,
+		conn,
 		dbPath,
 		meta,
 		spec,
@@ -501,12 +503,13 @@ func (h *EngineHook) publishIncrementalMerge(
 
 func (h *EngineHook) runIncrementalMerge(
 	ctx context.Context,
+	conn *sql.DB,
 	dbPath string,
 	meta common.VectorIndexMeta,
 	spec vecindex.IVFSpec,
 	state *vecindex.IndexState,
 ) error {
-	plan, err := h.prepareIncrementalMerge(ctx, dbPath, meta, spec, state)
+	plan, err := h.prepareIncrementalMerge(ctx, conn, dbPath, meta, spec, state)
 	if err != nil || plan == nil {
 		return err
 	}
