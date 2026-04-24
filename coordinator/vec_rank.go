@@ -79,6 +79,7 @@ func BuildGoRankPlan(
 	metricKind metric.Metric,
 	clusterIDs []int64,
 	nprobe int,
+	useBudgetProbe bool,
 	tableAlias string,
 	k int,
 ) (*GoRankPlan, error) {
@@ -162,7 +163,7 @@ func BuildGoRankPlan(
 		QueryNorm2:     queryNorm2,
 		RankMetric:     metricKindToRankMetric(metricKind),
 		Nprobe:         nprobe,
-		UseBudgetProbe: meta.AutoTuneNprobe && nprobe == meta.Nprobe,
+		UseBudgetProbe: useBudgetProbe,
 		ScanBudgetRows: defaultProbeScanBudgetRows(meta.TargetPartitionSize),
 		K:              k,
 		Shortlist:      exactRerankShortlist(k),

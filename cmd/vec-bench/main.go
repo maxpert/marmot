@@ -55,6 +55,7 @@ import (
 	"runtime/pprof"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -98,6 +99,8 @@ type config struct {
 	insertConc     int
 	readPool       int
 	sqliteCacheMB  int
+	projection     string
+	payloadBytes   int
 	minRecall      float64
 	minQPS         float64
 	maxOverread    float64
@@ -134,6 +137,8 @@ func parseFlags() *config {
 	fs.IntVar(&c.insertConc, "insert-concurrency", 1, "Concurrent insert goroutines (parallel insert phase)")
 	fs.IntVar(&c.readPool, "read-pool", 0, "Override readDB max-open-conns (0 = match query-concurrency)")
 	fs.IntVar(&c.sqliteCacheMB, "sqlite-cache-mb", 64, "SQLite page-cache budget in MiB for vec-bench connections")
+	fs.StringVar(&c.projection, "projection", "id", "Projection shape: id | payload")
+	fs.IntVar(&c.payloadBytes, "payload-bytes", 256, "Deterministic text payload bytes per row for projection=payload")
 	fs.Float64Var(&c.minRecall, "min-recall", 0, "Fail if recall@K is below this value (0 = disabled)")
 	fs.Float64Var(&c.minQPS, "min-qps", 0, "Fail if aggregate read QPS is below this value (0 = disabled)")
 	fs.Float64Var(&c.maxOverread, "max-overread", 0, "Fail if segment actual/logical read ratio exceeds this value (0 = disabled)")
@@ -156,6 +161,14 @@ func parseFlags() *config {
 	}
 	if c.profileDir == "" {
 		c.profileDir = filepath.Join(c.dbDir, "prof")
+	}
+	if c.projection != "id" && c.projection != "payload" {
+		fmt.Fprintf(os.Stderr, "--projection must be id or payload, got %q\n", c.projection)
+		os.Exit(2)
+	}
+	if c.payloadBytes < 0 {
+		fmt.Fprintln(os.Stderr, "--payload-bytes must be >= 0")
+		os.Exit(2)
 	}
 	return c
 }
@@ -565,11 +578,17 @@ func (h *harness) loadDataset() error {
 
 func (h *harness) ensureTable() error {
 	_, err := h.conn.Exec(fmt.Sprintf(`CREATE TABLE IF NOT EXISTS "%s" (
-		id    INTEGER PRIMARY KEY,
-		"%s"  BLOB
+		id      INTEGER PRIMARY KEY,
+		doc_key TEXT,
+		body    TEXT,
+		score   INTEGER,
+		"%s"    BLOB
 	)`, h.cfg.tableName, h.cfg.columnName))
 	if err != nil {
 		return fmt.Errorf("create table: %w", err)
+	}
+	if err := h.ensurePayloadColumns(); err != nil {
+		return err
 	}
 	replicatedDB, err := h.dbMgr.GetDatabase(h.cfg.dbName)
 	if err != nil {
@@ -577,6 +596,45 @@ func (h *harness) ensureTable() error {
 	}
 	if err := replicatedDB.ReloadSchema(); err != nil {
 		return fmt.Errorf("reload schema: %w", err)
+	}
+	return nil
+}
+
+func (h *harness) ensurePayloadColumns() error {
+	rows, err := h.conn.Query(fmt.Sprintf(`PRAGMA table_info("%s")`, h.cfg.tableName))
+	if err != nil {
+		return fmt.Errorf("inspect table columns: %w", err)
+	}
+	defer rows.Close()
+	columns := make(map[string]struct{})
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull int
+		var defaultValue any
+		var pk int
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+			return fmt.Errorf("scan table column: %w", err)
+		}
+		columns[name] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate table columns: %w", err)
+	}
+	for _, column := range []struct {
+		name string
+		typ  string
+	}{
+		{name: "doc_key", typ: "TEXT"},
+		{name: "body", typ: "TEXT"},
+		{name: "score", typ: "INTEGER"},
+	} {
+		if _, ok := columns[column.name]; ok {
+			continue
+		}
+		if _, err := h.conn.Exec(fmt.Sprintf(`ALTER TABLE "%s" ADD COLUMN %s %s`, h.cfg.tableName, column.name, column.typ)); err != nil {
+			return fmt.Errorf("add payload column %s: %w", column.name, err)
+		}
 	}
 	return nil
 }
@@ -625,6 +683,40 @@ func targetInsertRows(trainLen, insertCap int) int {
 	return trainLen
 }
 
+func benchPayload(rowID, payloadBytes int) (string, string, int64) {
+	x := uint64(rowID) * 0x9e3779b185ebca87
+	x ^= x >> 33
+	x *= 0xff51afd7ed558ccd
+	x ^= x >> 33
+	docKey := fmt.Sprintf("doc-%016x", x)
+	score := int64(x % 1_000_003)
+	if payloadBytes <= 0 {
+		return docKey, "", score
+	}
+	words := []string{
+		"marmot", "vector", "segment", "cluster", "payload", "query", "index", "rerank",
+		"sqlite", "storage", "probe", "centroid", "document", "ranking", "snapshot", "stable",
+	}
+	var b strings.Builder
+	b.Grow(payloadBytes + 32)
+	for b.Len() < payloadBytes {
+		x ^= x << 13
+		x ^= x >> 7
+		x ^= x << 17
+		if b.Len() > 0 {
+			b.WriteByte(' ')
+		}
+		b.WriteString(words[int(x%uint64(len(words)))])
+		b.WriteByte('-')
+		b.WriteString(strconv.FormatUint(x&0xffff, 16))
+	}
+	body := b.String()
+	if len(body) > payloadBytes {
+		body = body[:payloadBytes]
+	}
+	return docKey, body, score
+}
+
 func (h *harness) insertRange(lo, hi int, phase string) error {
 	if hi <= lo {
 		plog("%s insert skipped: empty range", phase)
@@ -665,7 +757,7 @@ func (h *harness) insertRange(lo, hi int, phase string) error {
 					workerErr.Store(fmt.Errorf("%s begin tx [%d,%d): %w", phase, c.lo, c.hi, err))
 					return
 				}
-				stmt, err := tx.Prepare(fmt.Sprintf(`INSERT INTO "%s"(id, "%s") VALUES (?, ?)`,
+				stmt, err := tx.Prepare(fmt.Sprintf(`INSERT INTO "%s"(id, doc_key, body, score, "%s") VALUES (?, ?, ?, ?, ?)`,
 					h.cfg.tableName, h.cfg.columnName))
 				if err != nil {
 					tx.Rollback()
@@ -673,7 +765,8 @@ func (h *harness) insertRange(lo, hi int, phase string) error {
 					return
 				}
 				for i := c.lo; i < c.hi; i++ {
-					if _, err := stmt.Exec(int64(i+1), h.train.VectorBytes(i)); err != nil {
+					docKey, body, score := benchPayload(i+1, h.cfg.payloadBytes)
+					if _, err := stmt.Exec(int64(i+1), docKey, body, score, h.train.VectorBytes(i)); err != nil {
 						stmt.Close()
 						tx.Rollback()
 						workerErr.Store(fmt.Errorf("%s insert id=%d: %w", phase, i+1, err))
@@ -1221,9 +1314,7 @@ func (h *harness) runQueryPhase() error {
 	// Vitess parses double-quoted literals as strings, not identifiers.
 	// Use backticks (MySQL identifier) or unquoted names — matching the
 	// existing coordinator bench which is known to round-trip through rewriting.
-	querySQL := fmt.Sprintf(
-		"SELECT id FROM `%s` WHERE vec_match(`%s`, ?, %d) ORDER BY vec_distance(`%s`, ?) LIMIT %d",
-		h.cfg.tableName, h.cfg.columnName, h.cfg.k, h.cfg.columnName, h.cfg.k)
+	querySQL := h.querySQL()
 
 	if h.cfg.warmup > 0 {
 		plog("warming %d queries ...", h.cfg.warmup)
@@ -1260,8 +1351,8 @@ func (h *harness) runQueryPhase() error {
 	}
 	perWorkerQPS := float64(len(stats.lats)) / latSum.Seconds()
 	plog("=== results ===")
-	plog("  config: nlist=%d nprobe=%d metric=%s dim=%d K=%d concurrency=%d",
-		h.cfg.nlist, h.cfg.nprobe, h.cfg.metric, h.meta.Dim, h.cfg.k, h.cfg.queryConc)
+	plog("  config: nlist=%d nprobe=%d metric=%s dim=%d K=%d concurrency=%d projection=%s payload_bytes=%d",
+		h.cfg.nlist, h.cfg.nprobe, h.cfg.metric, h.meta.Dim, h.cfg.k, h.cfg.queryConc, h.cfg.projection, h.cfg.payloadBytes)
 	if segmentStats := h.currentSegmentEncodingStats(); segmentStats != nil {
 		plog("  stable encoding: %s payload_bytes/vector=%d entry_bytes/vector=%d rows=%d data_file_bytes=%d",
 			segmentStats.encodingName, segmentStats.payloadBytes, segmentStats.entryBytes, segmentStats.rowCount, segmentStats.dataFileBytes)
@@ -1296,6 +1387,16 @@ func (h *harness) runQueryPhase() error {
 	return nil
 }
 
+func (h *harness) querySQL() string {
+	selectList := "id"
+	if h.cfg.projection == "payload" {
+		selectList = "id, doc_key, body, score"
+	}
+	return fmt.Sprintf(
+		"SELECT %s FROM `%s` WHERE vec_match(`%s`, ?, %d) ORDER BY vec_distance(`%s`, ?) LIMIT %d",
+		selectList, h.cfg.tableName, h.cfg.columnName, h.cfg.k, h.cfg.columnName, h.cfg.k)
+}
+
 func (h *harness) checkBenchmarkGates(stats *queryRunStats, aggregateQPS float64) error {
 	if h == nil || h.cfg == nil || stats == nil {
 		return nil
@@ -1323,7 +1424,7 @@ func (h *harness) newQuerySession() *protocol.ConnectionSession {
 	}
 	sess.VecVars.UseGoRank = h.cfg.useGoRank
 	sess.VecVars.Fallback = false
-	if h.cfg.nprobe > 0 {
+	if h.cfg.nprobeExplicit && h.cfg.nprobe > 0 {
 		sess.VecVars.Nprobe = h.cfg.nprobe
 	}
 	return sess

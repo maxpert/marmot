@@ -24,6 +24,16 @@ type VectorIndexLookup interface {
 	EstimatedRowCount(database, table string) int64
 }
 
+func useBudgetProbeForSession(meta *common.VectorIndexMeta, session QuerySession, effectiveNprobe int) bool {
+	if meta == nil || session == nil || !meta.AutoTuneNprobe || effectiveNprobe != meta.Nprobe {
+		return false
+	}
+	// Nprobe(0) exposes whether the session has an explicit override. An
+	// explicit override equal to the stored auto default must still mean
+	// fixed-probe execution, not row-budget probing.
+	return session.Nprobe(0) == 0
+}
+
 // vecMatchInfo holds data extracted from a single vec_match(col, q, k) call.
 type vecMatchInfo struct {
 	colName  string         // unqualified column name
@@ -106,6 +116,7 @@ func RewriteVectorQuery(
 	estimatedF := stat4.EstimateCardinality(userPred, total)
 
 	nprobe := session.Nprobe(meta.Nprobe)
+	useBudgetProbe := useBudgetProbeForSession(meta, session, nprobe)
 	const overfetch = 4
 	estimatedI := int64(limitK) * int64(nprobe) * overfetch
 	prefilterCap := session.PrefilterCap()
@@ -200,6 +211,7 @@ func RewriteVectorQuery(
 			metricKindFromString(metricSuffix),
 			clusterIDs,
 			nprobe,
+			useBudgetProbe,
 			vm.tableRef,
 			limitK,
 		)

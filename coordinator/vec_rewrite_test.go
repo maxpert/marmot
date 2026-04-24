@@ -57,6 +57,17 @@ func (s *stubSession) PrefilterCap() int64 { return s.prefilterCap }
 func (s *stubSession) Fallback() string    { return s.fallback }
 func (s *stubSession) UseGoRank() bool     { return s.useGoRank }
 
+func TestUseBudgetProbeForSessionRequiresUnsetSessionNprobe(t *testing.T) {
+	meta := &common.VectorIndexMeta{
+		Nprobe:         16,
+		AutoTuneNprobe: true,
+	}
+
+	require.True(t, useBudgetProbeForSession(meta, &stubSession{}, 16))
+	require.False(t, useBudgetProbeForSession(meta, &stubSession{nprobe: 16}, 16))
+	require.False(t, useBudgetProbeForSession(meta, &stubSession{nprobe: 12}, 12))
+}
+
 // --- helpers ---
 
 var vitessParser *sqlparser.Parser

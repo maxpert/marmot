@@ -129,6 +129,7 @@ func (tpl *goRankRewriteTemplate) buildInfo(
 	clusterIDs []int64,
 	probeEpoch uint64,
 	nprobe int,
+	useBudgetProbe bool,
 ) (*RewriteInfo, error) {
 	goRank, err := BuildGoRankPlan(
 		tpl.selectStmt,
@@ -141,6 +142,7 @@ func (tpl *goRankRewriteTemplate) buildInfo(
 		metricKindFromString(meta.Metric),
 		clusterIDs,
 		nprobe,
+		useBudgetProbe,
 		tpl.tableAlias,
 		tpl.k,
 	)

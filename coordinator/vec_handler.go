@@ -45,11 +45,12 @@ func (h *CoordinatorHandler) maybeRewriteVectorSelect(
 			return nil, nil, fmt.Errorf("MARMOT-VEC-022: no vector index on %s.%s", template.tableName, template.columnName)
 		}
 		nprobe := querySession.Nprobe(meta.Nprobe)
+		useBudgetProbe := useBudgetProbeForSession(meta, querySession, nprobe)
 		clusterIDs, probeEpoch, err := probeClustersWithEpoch(engine, meta.IndexName, queryVec, nprobe)
 		if err != nil {
 			return nil, nil, err
 		}
-		info, err := template.buildInfo(queryVec, meta, clusterIDs, probeEpoch, nprobe)
+		info, err := template.buildInfo(queryVec, meta, clusterIDs, probeEpoch, nprobe, useBudgetProbe)
 		if err != nil {
 			return nil, nil, err
 		}
