@@ -20,18 +20,15 @@ func overlayMutationsUpTo(snapshot *vecindex.OverlaySnapshot, minSequence, cutof
 	if snapshot == nil {
 		return nil
 	}
-	mutations := snapshot.MutationsAfter(minSequence)
-	if cutoff == 0 || len(mutations) == 0 {
-		return mutations
-	}
-	filtered := mutations[:0]
-	for _, mutation := range mutations {
-		if mutation.Sequence > cutoff {
-			break
+	mutations := make([]vecindex.OverlayMutation, 0)
+	snapshot.VisitMutationsAfter(minSequence, func(mutation vecindex.OverlayMutation) bool {
+		if cutoff > 0 && mutation.Sequence > cutoff {
+			return false
 		}
-		filtered = append(filtered, mutation)
-	}
-	return filtered
+		mutations = append(mutations, mutation)
+		return true
+	})
+	return mutations
 }
 
 func buildCutoffClusterStats(
@@ -236,33 +233,36 @@ func reassignOverlayMutationsForProbe(
 	if snapshot == nil {
 		return nil, nil
 	}
-	mutations := snapshot.MutationsAfter(minSequence)
-	if len(mutations) == 0 {
-		return nil, nil
-	}
-	rewritten := make([]vecindex.OverlayMutation, 0, len(mutations))
-	for _, mutation := range mutations {
+	rewritten := make([]vecindex.OverlayMutation, 0)
+	var reassignErr error
+	snapshot.VisitMutationsAfter(minSequence, func(mutation vecindex.OverlayMutation) bool {
 		next := mutation
 		next.Epoch = probe.Epoch()
 		if mutation.Kind == vecindex.OverlayMutationDelete {
 			next.ClusterID = 0
 			rewritten = append(rewritten, next)
-			continue
+			return true
 		}
 		next.Kind = vecindex.OverlayMutationUpsert
 		if stable != nil && stable.RowMap != nil {
 			if _, ok, err := stable.RowMap.Lookup(mutation.RowID); err != nil {
-				return nil, fmt.Errorf("reassign overlay mutation rowid %d: stable lookup: %w", mutation.RowID, err)
+				reassignErr = fmt.Errorf("reassign overlay mutation rowid %d: stable lookup: %w", mutation.RowID, err)
+				return false
 			} else if ok {
 				next.Kind = vecindex.OverlayMutationReplace
 			}
 		}
 		clusterID, err := assignPreparedAgainstSet(mutation.Vec, spec, probe)
 		if err != nil {
-			return nil, fmt.Errorf("reassign overlay mutation rowid %d: %w", mutation.RowID, err)
+			reassignErr = fmt.Errorf("reassign overlay mutation rowid %d: %w", mutation.RowID, err)
+			return false
 		}
 		next.ClusterID = clusterID
 		rewritten = append(rewritten, next)
+		return true
+	})
+	if reassignErr != nil {
+		return nil, reassignErr
 	}
 	return rewritten, nil
 }

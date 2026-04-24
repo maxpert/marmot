@@ -9,22 +9,9 @@ import (
 )
 
 var (
-	blobEncoderOnce sync.Once
 	blobDecoderOnce sync.Once
-	blobEncoder     *zstd.Encoder
 	blobDecoder     *zstd.Decoder
 )
-
-func getEncoder() *zstd.Encoder {
-	blobEncoderOnce.Do(func() {
-		var err error
-		blobEncoder, err = zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedDefault))
-		if err != nil {
-			panic(fmt.Sprintf("vecindex: init zstd encoder: %v", err))
-		}
-	})
-	return blobEncoder
-}
 
 func getDecoder() *zstd.Decoder {
 	blobDecoderOnce.Do(func() {
@@ -37,6 +24,20 @@ func getDecoder() *zstd.Decoder {
 	return blobDecoder
 }
 
+func encodeMetadataBlob(raw []byte) ([]byte, error) {
+	enc, err := zstd.NewWriter(nil,
+		zstd.WithEncoderLevel(zstd.SpeedFastest),
+		zstd.WithEncoderConcurrency(1),
+		zstd.WithLowerEncoderMem(true),
+		zstd.WithWindowSize(1<<20),
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer enc.Close()
+	return enc.EncodeAll(raw, nil), nil
+}
+
 // EncodeCentroidBlob serialises a CentroidSet to a zstd-compressed msgpack
 // blob. The active centroid blob is embedded in the local segment manifest.
 func EncodeCentroidBlob(cs *kmeans.CentroidSet) ([]byte, error) {
@@ -44,7 +45,11 @@ func EncodeCentroidBlob(cs *kmeans.CentroidSet) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("centroid blob: encode msgpack: %w", err)
 	}
-	return getEncoder().EncodeAll(raw, nil), nil
+	blob, err := encodeMetadataBlob(raw)
+	if err != nil {
+		return nil, fmt.Errorf("centroid blob: zstd compress: %w", err)
+	}
+	return blob, nil
 }
 
 // DecodeCentroidBlob deserialises a CentroidSet from a zstd-compressed msgpack blob.

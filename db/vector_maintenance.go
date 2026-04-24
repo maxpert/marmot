@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"fmt"
 	"math"
 	"slices"
 	"time"
@@ -20,6 +19,8 @@ const (
 	mergeRowsThreshold       = 4096
 	mergeBytesThreshold      = 32 << 20
 	mergeAgeThreshold        = 30 * time.Second
+	mergeMaxPrefixRows       = 64 * 1024
+	mergeTargetMultiplier    = 128
 	rebuildRowsFloor         = 50_000
 	rebuildTargetClusterSize = 512
 	rebuildClusterDriftPct   = 0.10
@@ -45,6 +46,10 @@ func (h *EngineHook) startMaintenanceWatcher(meta common.VectorIndexMeta) {
 	h.maintenanceWatchers[meta.IndexName] = watch
 	h.maintenanceMu.Unlock()
 	go h.maintenanceLoop(ctx, meta, watch.seq)
+}
+
+func (h *EngineHook) StartMaintenanceForIndex(meta common.VectorIndexMeta) {
+	h.startMaintenanceWatcher(meta)
 }
 
 func (h *EngineHook) stopMaintenanceWatcher(indexName string) {
@@ -149,6 +154,8 @@ func (h *EngineHook) maintenanceOnce(ctx context.Context, meta common.VectorInde
 		}
 		if err := h.runIncrementalMerge(ctx, conn, dbPath, meta, spec, state); err != nil {
 			log.Warn().Err(err).Str("index", meta.IndexName).Msg("maintenance: incremental merge failed")
+		} else {
+			releaseVectorBuildResources(ctx, conn)
 		}
 		return false
 	}
@@ -161,19 +168,26 @@ func (h *EngineHook) maintenanceOnce(ctx context.Context, meta common.VectorInde
 		nextClusters := stepPromotionClusterCount(currentClusters, wantClusters)
 		if err := h.runIncrementalPromotion(ctx, conn, dbPath, meta, spec, state, nextClusters); err != nil {
 			if errors.Is(err, errIncrementalPromotionFallback) {
-				if err := h.runAutomaticRebuild(ctx, conn, meta); err != nil {
-					log.Warn().Err(err).Str("index", meta.IndexName).Msg("maintenance: promotion fallback rebuild failed")
-				}
+				log.Warn().Str("index", meta.IndexName).Msg("maintenance: incremental promotion exceeded bounded scope")
 			} else {
 				log.Warn().Err(err).Str("index", meta.IndexName).Msg("maintenance: incremental promotion failed")
 			}
+		} else {
+			releaseVectorBuildResources(ctx, conn)
 		}
 		return false
 	}
 
-	if shouldAutoRebuild(meta, clusterRowCounts, maintenance, countTargetClusterDrift(meta, clusterRowCounts, driftBacklogRows)) {
-		if err := h.runAutomaticRebuild(ctx, conn, meta); err != nil {
-			log.Warn().Err(err).Str("index", meta.IndexName).Msg("maintenance: automatic rebuild failed")
+	if shouldIncrementalRepair(meta, clusterRowCounts, maintenance, countTargetClusterDrift(meta, clusterRowCounts, driftBacklogRows)) {
+		dbPath, err := h.dbMgr.GetDatabasePath(meta.Database)
+		if err != nil {
+			log.Warn().Err(err).Str("index", meta.IndexName).Msg("maintenance: get db path failed")
+			return false
+		}
+		if err := h.runIncrementalRepair(ctx, conn, dbPath, meta, spec, state); err != nil {
+			log.Warn().Err(err).Str("index", meta.IndexName).Msg("maintenance: incremental repair failed")
+		} else {
+			releaseVectorBuildResources(ctx, conn)
 		}
 		return false
 	}
@@ -191,6 +205,8 @@ func (h *EngineHook) maintenanceOnce(ctx context.Context, meta common.VectorInde
 	}
 	if err := h.runIncrementalMerge(ctx, conn, dbPath, meta, spec, state); err != nil {
 		log.Warn().Err(err).Str("index", meta.IndexName).Msg("maintenance: incremental merge failed")
+	} else {
+		releaseVectorBuildResources(ctx, conn)
 	}
 	return false
 }
@@ -205,7 +221,47 @@ func shouldIncrementalMerge(backlogRows int, backlogBytes int64, oldestUnixNano 
 	return false
 }
 
-func shouldAutoRebuild(meta common.VectorIndexMeta, clusterRowCounts []uint64, maintenance *vecindex.MaintenanceState, targetClusterDrift float64) bool {
+func incrementalMergePrefixRows(meta common.VectorIndexMeta) int {
+	target := maintenanceTargetClusterSize(meta)
+	if target <= 0 {
+		target = defaultTargetPartitionSize
+	}
+	limit := target * mergeTargetMultiplier
+	if limit < mergeRowsThreshold {
+		limit = mergeRowsThreshold
+	}
+	if limit > mergeMaxPrefixRows {
+		limit = mergeMaxPrefixRows
+	}
+	return limit
+}
+
+func overlayMutationCutoffSequence(snapshot *vecindex.OverlaySnapshot, minSequence uint64, maxMutations int) (uint64, int) {
+	if snapshot == nil {
+		return minSequence, 0
+	}
+	cutoff := minSequence
+	count := 0
+	stopped := false
+	snapshot.VisitMutationsAfter(minSequence, func(mutation vecindex.OverlayMutation) bool {
+		count++
+		cutoff = mutation.Sequence
+		if maxMutations > 0 && count >= maxMutations {
+			stopped = true
+			return false
+		}
+		return true
+	})
+	if count == 0 {
+		return minSequence, 0
+	}
+	if !stopped {
+		return snapshot.LastSequence(), count
+	}
+	return cutoff, count
+}
+
+func shouldIncrementalRepair(meta common.VectorIndexMeta, clusterRowCounts []uint64, maintenance *vecindex.MaintenanceState, targetClusterDrift float64) bool {
 	var rowsModifiedSinceRebuild uint64
 	var lastRebuildRowCount uint64
 	var skewCycles uint32
@@ -390,7 +446,11 @@ func (h *EngineHook) prepareIncrementalMerge(
 		h.localChangeMu.Unlock()
 		return nil, nil
 	}
-	cutoff := overlaySnapshot.LastSequence()
+	cutoff, prefixRows := overlayMutationCutoffSequence(overlaySnapshot, base.AppliedOverlaySeq, incrementalMergePrefixRows(meta))
+	if prefixRows == 0 || cutoff <= base.AppliedOverlaySeq {
+		h.localChangeMu.Unlock()
+		return nil, nil
+	}
 	baseGeneration := base.Data.Generation()
 	pinnedBase, err := openPinnedSegmentGeneration(dbPath, meta, spec, currentProbe.Epoch(), baseGeneration)
 	hotClusterScores := state.HotClusterScores(segmentLayoutHotClusterLimit)
@@ -515,74 +575,6 @@ func (h *EngineHook) runIncrementalMerge(
 	}
 	defer plan.Close()
 	return h.publishIncrementalMerge(dbPath, meta, plan)
-}
-
-func (h *EngineHook) runAutomaticRebuild(ctx context.Context, conn *sql.DB, meta common.VectorIndexMeta) error {
-	h.localChangeMu.Lock()
-	oldState, ok := h.engine.Lookup(meta.IndexName)
-	if !ok {
-		h.localChangeMu.Unlock()
-		return fmt.Errorf("automatic rebuild: index %q not registered", meta.IndexName)
-	}
-	liveCounts := oldState.LoadMaintenanceState().LiveClusterRowCounts()
-	wantClusters := desiredClusterCount(totalTrackedRows(liveCounts, 0), maintenanceTargetClusterSize(meta))
-	nextClusters := meta.Nlist
-	if meta.AutoTuneNlist && wantClusters > 0 {
-		switch {
-		case wantClusters > nextClusters:
-			stepped := max(nextClusters+promotionStepFloor, int(math.Ceil(float64(nextClusters)*promotionGrowthFactor)))
-			if stepped < wantClusters {
-				nextClusters = stepped
-			} else {
-				nextClusters = wantClusters
-			}
-		case wantClusters < nextClusters:
-			stepped := min(nextClusters-promotionStepFloor, int(math.Floor(float64(nextClusters)/promotionGrowthFactor)))
-			if stepped < wantClusters {
-				nextClusters = wantClusters
-			} else {
-				nextClusters = stepped
-			}
-			if nextClusters < 1 {
-				nextClusters = 1
-			}
-		}
-	}
-	dbPath, err := h.dbMgr.GetDatabasePath(meta.Database)
-	h.localChangeMu.Unlock()
-	if err != nil {
-		return err
-	}
-	h.localChangeMu.Lock()
-	defer h.localChangeMu.Unlock()
-
-	updatedMeta, newState, err := Reindex(ctx, conn, h.engine, meta, nextClusters, time.Now().UnixNano())
-	if err != nil {
-		return err
-	}
-	if newState.ProbeVersion() != 0 {
-		if err := buildAndStoreSegmentGeneration(ctx, conn, dbPath, newState, updatedMeta, newState.Spec()); err != nil {
-			return err
-		}
-		if err := openAndStoreOverlay(dbPath, updatedMeta.IndexName, newState, newState.ProbeVersion()); err != nil {
-			return err
-		}
-	}
-	if _, err := conn.ExecContext(ctx,
-		`UPDATE __marmot_vector_indexes SET nlist=?, nprobe=?, status='ready' WHERE index_name=?`,
-		updatedMeta.Nlist, updatedMeta.Nprobe, updatedMeta.IndexName,
-	); err != nil {
-		return err
-	}
-	h.engine.Register(updatedMeta.IndexName, newState)
-	h.retireState(oldState)
-	if newState.ProbeVersion() == 0 {
-		h.startBootstrapWatcher(updatedMeta, newState.Spec())
-	}
-	if h.indexMgr != nil {
-		h.indexMgr.storeCachedIndexMeta(&updatedMeta)
-	}
-	return nil
 }
 
 func rewriteOverlayForEpoch(dbPath, indexName string, epoch uint64, minSequence uint64, mutations []vecindex.OverlayMutation) (*vecindex.JournaledOverlay, error) {

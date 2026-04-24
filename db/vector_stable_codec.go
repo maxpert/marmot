@@ -6,6 +6,7 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"slices"
 
 	"github.com/maxpert/marmot/modules/vecindex"
 	"github.com/maxpert/marmot/modules/vecindex/pkg/kmeans"
@@ -100,7 +101,7 @@ func (r *stableCodecReservoir) Samples() ([]vecindex.StableCodecTrainingVector, 
 		return nil, err
 	}
 	buf := make([]byte, r.recordSize)
-	out := make([]vecindex.StableCodecTrainingVector, 0, r.slots)
+	byCluster := make(map[int64][]vecindex.StableCodecTrainingVector)
 	for slot := 0; slot < r.slots; slot++ {
 		if _, err := r.file.ReadAt(buf, int64(slot)*r.recordSize); err != nil {
 			return nil, err
@@ -112,7 +113,24 @@ func (r *stableCodecReservoir) Samples() ([]vecindex.StableCodecTrainingVector, 
 			vec[i] = math.Float32frombits(binary.LittleEndian.Uint32(buf[cursor : cursor+4]))
 			cursor += 4
 		}
-		out = append(out, vecindex.StableCodecTrainingVector{ClusterID: clusterID, Vec: vec})
+		byCluster[clusterID] = append(byCluster[clusterID], vecindex.StableCodecTrainingVector{ClusterID: clusterID, Vec: vec})
+	}
+	out := make([]vecindex.StableCodecTrainingVector, 0, r.slots)
+	clusterIDs := make([]int64, 0, len(byCluster))
+	for clusterID := range byCluster {
+		clusterIDs = append(clusterIDs, clusterID)
+	}
+	slices.Sort(clusterIDs)
+	perClusterCap := stableCodecTrainingSampleLimit
+	if len(clusterIDs) > 0 {
+		perClusterCap = max(1, stableCodecTrainingSampleLimit/len(clusterIDs))
+	}
+	for _, clusterID := range clusterIDs {
+		samples := byCluster[clusterID]
+		if len(samples) > perClusterCap {
+			samples = samples[:perClusterCap]
+		}
+		out = append(out, samples...)
 	}
 	return out, nil
 }

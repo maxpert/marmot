@@ -28,16 +28,16 @@ func VectorBlob(raw []byte, m vecmetric.Metric, dim int, maxNorm float32) ([]byt
 	case vecmetric.MetricL2:
 		return append([]byte(nil), raw...), nil
 	case vecmetric.MetricCosine:
-		vec := append([]float32(nil), src...)
-		norm := vecmetric.Norm(vec)
+		norm := vecmetric.Norm(src)
 		if norm == 0 {
 			return nil, nil
 		}
 		inv := 1.0 / norm
-		for i := range vec {
-			vec[i] *= inv
+		out := make([]byte, len(raw))
+		for i, value := range src {
+			putFloat32(out[i*4:], value*inv)
 		}
-		return float32sToBlob(vec), nil
+		return out, nil
 	case vecmetric.MetricDot:
 		aug, err := vecmetric.AugmentData(src, maxNorm, nil)
 		if err != nil {
@@ -52,11 +52,15 @@ func VectorBlob(raw []byte, m vecmetric.Metric, dim int, maxNorm float32) ([]byt
 func float32sToBlob(v []float32) []byte {
 	out := make([]byte, len(v)*4)
 	for i, f := range v {
-		bits := math.Float32bits(f)
-		out[i*4] = byte(bits)
-		out[i*4+1] = byte(bits >> 8)
-		out[i*4+2] = byte(bits >> 16)
-		out[i*4+3] = byte(bits >> 24)
+		putFloat32(out[i*4:], f)
 	}
 	return out
+}
+
+func putFloat32(dst []byte, f float32) {
+	bits := math.Float32bits(f)
+	dst[0] = byte(bits)
+	dst[1] = byte(bits >> 8)
+	dst[2] = byte(bits >> 16)
+	dst[3] = byte(bits >> 24)
 }

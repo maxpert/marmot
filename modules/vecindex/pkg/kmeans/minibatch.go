@@ -216,6 +216,9 @@ func (t *MiniBatchBalancedTrainer) EndPass(seed uint64) (MiniBatchPassResult, er
 
 func (t *MiniBatchBalancedTrainer) recordRepairCandidate(clusterID int, vec []float32, dist float32) {
 	candidates := t.passCandidates[clusterID]
+	if len(candidates) >= maxRepairCandidatesPerBucket && dist <= candidates[len(candidates)-1].dist {
+		return
+	}
 	entry := repairCandidate{vec: append([]float32(nil), vec...), dist: dist}
 	candidates = append(candidates, entry)
 	slices.SortFunc(candidates, func(a, b repairCandidate) int {

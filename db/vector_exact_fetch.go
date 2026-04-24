@@ -8,7 +8,6 @@ import (
 
 	"github.com/maxpert/marmot/common"
 	"github.com/maxpert/marmot/modules/vecindex"
-	"github.com/maxpert/marmot/modules/vecindex/pkg/metric"
 )
 
 type exactVectorFetcher struct {
@@ -43,12 +42,22 @@ func (f *exactVectorFetcher) Prepared(ctx context.Context, rowID int64) ([]byte,
 	if f == nil || f.stmt == nil || rowID == 0 {
 		return nil, false, nil
 	}
-	var raw []byte
-	err := f.stmt.QueryRowContext(ctx, rowID).Scan(&raw)
-	if errors.Is(err, sql.ErrNoRows) {
+	rows, err := f.stmt.QueryContext(ctx, rowID)
+	if err != nil {
+		return nil, false, err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return nil, false, err
+		}
 		return nil, false, nil
 	}
-	if err != nil {
+	var raw sql.RawBytes
+	if err := rows.Scan(&raw); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, false, nil
+		}
 		return nil, false, err
 	}
 	if len(raw) == 0 {
@@ -62,11 +71,4 @@ func (f *exactVectorFetcher) Prepared(ctx context.Context, rowID int64) ([]byte,
 		return nil, false, nil
 	}
 	return prepared, true, nil
-}
-
-func clonePreparedVector(prepared []byte) []float32 {
-	if len(prepared) == 0 {
-		return nil
-	}
-	return append([]float32(nil), metric.BytesToFloat32(prepared)...)
 }

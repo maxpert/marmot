@@ -1,6 +1,7 @@
 package vecindex
 
 import (
+	"bufio"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -379,7 +380,7 @@ func (s *OverlaySnapshot) clone() *OverlaySnapshot {
 			copied[rowID] = overlayRow{
 				sequence:          row.sequence,
 				appliedAtUnixNano: row.appliedAtUnixNano,
-				vec:               append([]byte(nil), row.vec...),
+				vec:               row.vec,
 			}
 		}
 		next.byCluster[clusterID] = copied
@@ -477,7 +478,7 @@ func (s *OverlaySnapshot) upsertRow(clusterID, rowID int64, sequence uint64, app
 	rows[rowID] = overlayRow{
 		sequence:          sequence,
 		appliedAtUnixNano: appliedAtUnixNano,
-		vec:               append([]byte(nil), vec...),
+		vec:               vec,
 	}
 	s.rowCluster[rowID] = clusterID
 }
@@ -657,11 +658,12 @@ func (j *OverlayJournal) AppendBatch(mutations []OverlayMutation) error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 
-	batch, epoch, lastSequence, err := encodeOverlayJournalBatch(j.currentEpoch, j.lastSequence, mutations)
+	writer := bufio.NewWriterSize(j.file, 256<<10)
+	epoch, lastSequence, err := writeOverlayJournalBatch(writer, j.currentEpoch, j.lastSequence, mutations)
 	if err != nil {
 		return err
 	}
-	if _, err := j.file.Write(batch); err != nil {
+	if err := writer.Flush(); err != nil {
 		return err
 	}
 	if err := j.file.Sync(); err != nil {
@@ -749,19 +751,20 @@ func (j *OverlayJournal) Rewrite(epoch uint64, lastSequence uint64, mutations []
 	currentEpoch := epoch
 	currentSequence := lastSequence
 	if len(mutations) > 0 {
-		batch, _, lastSequence, err := encodeOverlayJournalBatch(epoch, 0, mutations)
+		writer := bufio.NewWriterSize(tmp, 256<<10)
+		_, rewrittenLastSequence, err := writeOverlayJournalBatch(writer, epoch, 0, mutations)
 		if err != nil {
 			tmp.Close()
 			_ = os.Remove(tmpPath)
 			return err
 		}
-		if _, err := tmp.Write(batch); err != nil {
+		if err := writer.Flush(); err != nil {
 			tmp.Close()
 			_ = os.Remove(tmpPath)
 			return err
 		}
 		currentEpoch = mutations[len(mutations)-1].Epoch
-		currentSequence = lastSequence
+		currentSequence = rewrittenLastSequence
 	}
 	if err := tmp.Sync(); err != nil {
 		tmp.Close()
@@ -895,7 +898,11 @@ func (o *JournaledOverlay) CompactAfter(minSequence uint64) error {
 	if current == nil {
 		return o.Reset(0)
 	}
-	mutations := current.MutationsAfter(minSequence)
+	mutations := make([]OverlayMutation, 0)
+	current.VisitMutationsAfter(minSequence, func(mutation OverlayMutation) bool {
+		mutations = append(mutations, mutation)
+		return true
+	})
 	next := newOverlaySnapshot(current.Epoch(), current.LastSequence())
 	if len(mutations) > 0 {
 		var err error
@@ -938,49 +945,54 @@ func (o *JournaledOverlay) Close() error {
 	return o.journal.Close()
 }
 
-func encodeOverlayJournalBatch(currentEpoch, currentSequence uint64, mutations []OverlayMutation) ([]byte, uint64, uint64, error) {
-	var out []byte
+func writeOverlayJournalBatch(w io.Writer, currentEpoch, currentSequence uint64, mutations []OverlayMutation) (uint64, uint64, error) {
 	epoch := currentEpoch
 	lastSequence := currentSequence
 	for i, mutation := range mutations {
 		if err := validateOverlayMutation(mutation); err != nil {
-			return nil, 0, 0, fmt.Errorf("overlay mutation %d: %w", i, err)
+			return 0, 0, fmt.Errorf("overlay mutation %d: %w", i, err)
 		}
 		if mutation.Epoch < epoch {
-			return nil, 0, 0, fmt.Errorf("overlay mutation %d: epoch %d regresses from %d", i, mutation.Epoch, epoch)
+			return 0, 0, fmt.Errorf("overlay mutation %d: epoch %d regresses from %d", i, mutation.Epoch, epoch)
 		}
 		if mutation.Epoch > epoch {
 			epoch = mutation.Epoch
 			lastSequence = 0
 		}
 		if mutation.Sequence <= lastSequence {
-			return nil, 0, 0, fmt.Errorf("overlay mutation %d: sequence %d must be greater than %d", i, mutation.Sequence, lastSequence)
+			return 0, 0, fmt.Errorf("overlay mutation %d: sequence %d must be greater than %d", i, mutation.Sequence, lastSequence)
 		}
-		payload := encodeOverlayJournalRecord(mutation)
+		payloadLen := overlayJournalRecordFloor + len(mutation.Vec)
 		var lenBuf [4]byte
-		binary.LittleEndian.PutUint32(lenBuf[:], uint32(len(payload)))
-		out = append(out, lenBuf[:]...)
-		out = append(out, payload...)
+		binary.LittleEndian.PutUint32(lenBuf[:], uint32(payloadLen))
+		var payloadHeader [overlayJournalRecordFloor]byte
+		payloadHeader[0] = byte(mutation.Kind)
+		binary.LittleEndian.PutUint64(payloadHeader[1:9], mutation.Epoch)
+		binary.LittleEndian.PutUint64(payloadHeader[9:17], mutation.Sequence)
+		binary.LittleEndian.PutUint64(payloadHeader[17:25], uint64(mutation.ClusterID))
+		binary.LittleEndian.PutUint64(payloadHeader[25:33], uint64(mutation.RowID))
+		binary.LittleEndian.PutUint64(payloadHeader[33:41], uint64(mutation.AppliedAtUnixNano))
+		binary.LittleEndian.PutUint32(payloadHeader[41:45], uint32(len(mutation.Vec)))
+		crc := crc32.Update(0, overlayJournalCRCTable, payloadHeader[:])
+		crc = crc32.Update(crc, overlayJournalCRCTable, mutation.Vec)
 		var crcBuf [4]byte
-		binary.LittleEndian.PutUint32(crcBuf[:], crc32.Checksum(payload, overlayJournalCRCTable))
-		out = append(out, crcBuf[:]...)
+		binary.LittleEndian.PutUint32(crcBuf[:], crc)
+		if _, err := w.Write(lenBuf[:]); err != nil {
+			return 0, 0, err
+		}
+		if _, err := w.Write(payloadHeader[:]); err != nil {
+			return 0, 0, err
+		}
+		if _, err := w.Write(mutation.Vec); err != nil {
+			return 0, 0, err
+		}
+		if _, err := w.Write(crcBuf[:]); err != nil {
+			return 0, 0, err
+		}
 		epoch = mutation.Epoch
 		lastSequence = mutation.Sequence
 	}
-	return out, epoch, lastSequence, nil
-}
-
-func encodeOverlayJournalRecord(mutation OverlayMutation) []byte {
-	payload := make([]byte, overlayJournalRecordFloor+len(mutation.Vec))
-	payload[0] = byte(mutation.Kind)
-	binary.LittleEndian.PutUint64(payload[1:9], mutation.Epoch)
-	binary.LittleEndian.PutUint64(payload[9:17], mutation.Sequence)
-	binary.LittleEndian.PutUint64(payload[17:25], uint64(mutation.ClusterID))
-	binary.LittleEndian.PutUint64(payload[25:33], uint64(mutation.RowID))
-	binary.LittleEndian.PutUint64(payload[33:41], uint64(mutation.AppliedAtUnixNano))
-	binary.LittleEndian.PutUint32(payload[41:45], uint32(len(mutation.Vec)))
-	copy(payload[45:], mutation.Vec)
-	return payload
+	return epoch, lastSequence, nil
 }
 
 func replayOverlayJournalFile(file *os.File) (*OverlaySnapshot, int64, error) {

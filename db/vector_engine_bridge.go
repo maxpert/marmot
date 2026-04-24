@@ -15,10 +15,9 @@ import (
 
 const (
 	bootstrapMinTargetPartitions = 8
-	retireStateGracePeriod       = 30 * time.Second
-	bootstrapMaxTailRows         = 4096
-	bootstrapStabilizeDelay      = time.Second
-	bootstrapStabilizePasses     = 2
+	dropRetireGracePeriod        = 30 * time.Second
+	bootstrapPublishMultiplier   = 4
+	bootstrapMaxPublishRows      = 16 * 1024
 )
 
 // Ensure EngineHook implements both lifecycle hooks.
@@ -75,10 +74,7 @@ func (h *EngineHook) retireState(state *vecindex.IndexState) {
 	if state == nil {
 		return
 	}
-	time.AfterFunc(retireStateGracePeriod, func() {
-		state.ClearOverlay()
-		state.ClearSegmentStore()
-	})
+	state.Retire()
 }
 
 // OnIndexCreated implements IndexLifecycleHook.
@@ -205,12 +201,15 @@ func (h *EngineHook) OnIndexReindex(ctx context.Context, meta common.VectorIndex
 func (h *EngineHook) RemoveIndex(indexName string) func() {
 	h.stopBootstrapWatcher(indexName)
 	h.stopMaintenanceWatcher(indexName)
-	state, ok := h.engine.Lookup(indexName)
-	h.engine.Unregister(indexName)
+	state, ok := h.engine.Detach(indexName)
 	if !ok {
 		return func() {}
 	}
+	retireTimer := time.AfterFunc(dropRetireGracePeriod, state.Retire)
 	return func() {
+		if !retireTimer.Stop() {
+			return
+		}
 		h.engine.Register(indexName, state)
 	}
 }
@@ -356,19 +355,22 @@ func (h *EngineHook) bootstrapOnce(ctx context.Context, meta common.VectorIndexM
 			return false
 		}
 	}
-	log.Info().Int64("rows", currentN).Str("index", meta.IndexName).Msg("engine hook bootstrap: bootstrap threshold reached")
-
-	if meta.AutoTuneNlist {
-		refreshedSnapshot, stable := waitForBootstrapStableSnapshot(overlay, overlaySnapshot, meta)
-		if !stable {
-			log.Info().Str("index", meta.IndexName).Msg("engine hook bootstrap: deferring centroid build while overlay is still growing")
-			return false
-		}
-		overlaySnapshot = refreshedSnapshot
-		currentN = int64(overlaySnapshot.Len())
+	publishLimit := bootstrapInitialPublishRows(meta, currentN)
+	cutoff, publishRows := overlayPreparedVectorCutoffSequence(overlaySnapshot, publishLimit)
+	if publishRows == 0 || cutoff == 0 {
+		return false
 	}
+	if meta.AutoTuneNlist && int64(publishRows) < bootstrapAutoTuneFloor(meta) {
+		return false
+	}
+	log.Info().
+		Int64("overlay_rows", currentN).
+		Int("publish_rows", publishRows).
+		Int64("tail_rows", currentN-int64(publishRows)).
+		Str("index", meta.IndexName).
+		Msg("engine hook bootstrap: bootstrap threshold reached")
 
-	if retunedMeta, retunedSpec, changed, err := retuneBootstrapMeta(ctx, conn, meta, spec, currentN); err != nil {
+	if retunedMeta, retunedSpec, changed, err := retuneBootstrapMeta(ctx, conn, meta, spec, int64(publishRows)); err != nil {
 		log.Warn().Err(err).Str("index", meta.IndexName).Msg("engine hook bootstrap: retune failed")
 		return false
 	} else {
@@ -386,7 +388,6 @@ func (h *EngineHook) bootstrapOnce(ctx context.Context, meta common.VectorIndexM
 		}
 	}
 
-	cutoff := overlaySnapshot.LastSequence()
 	probeCS, err := computeCentroidsFromOverlaySnapshot(overlaySnapshot, spec, meta.TargetPartitionSize, cutoff, 1)
 	if err != nil {
 		log.Warn().Err(err).Str("index", meta.IndexName).Msg("engine hook bootstrap: compute overlay centroids failed")
@@ -437,15 +438,6 @@ func (h *EngineHook) bootstrapOnce(ctx context.Context, meta common.VectorIndexM
 		h.localChangeMu.Unlock()
 		return false
 	}
-	tailRows, _, _ := currentSnapshot.BacklogStats(cutoff)
-	if tailRows > bootstrapPublishTailLimit(meta) {
-		h.localChangeMu.Unlock()
-		log.Info().
-			Str("index", meta.IndexName).
-			Int("tail_rows", tailRows).
-			Msg("engine hook bootstrap: deferring publish until overlay tail shrinks")
-		return false
-	}
 	if err := pending.Publish(); err != nil {
 		h.localChangeMu.Unlock()
 		log.Warn().Err(err).Str("index", meta.IndexName).Msg("engine hook bootstrap: publish overlay segment generation failed")
@@ -477,6 +469,7 @@ func (h *EngineHook) bootstrapOnce(ctx context.Context, meta common.VectorIndexM
 	h.engine.Register(meta.IndexName, newState)
 	h.localChangeMu.Unlock()
 	h.retireState(state)
+	releaseVectorBuildResources(ctx, conn)
 	h.startMaintenanceWatcher(meta)
 	log.Info().Str("index", meta.IndexName).Msg("engine hook bootstrap: automatic bootstrap complete")
 	return true
@@ -534,52 +527,6 @@ func bootstrapAutoTuneFloor(meta common.VectorIndexMeta) int64 {
 	return int64(target) * int64(partitions)
 }
 
-func bootstrapPublishTailLimit(meta common.VectorIndexMeta) int {
-	target := meta.TargetPartitionSize
-	if target <= 0 {
-		target = defaultTargetPartitionSize
-	}
-	limit := target * 4
-	if limit < bootstrapMaxTailRows {
-		limit = bootstrapMaxTailRows
-	}
-	return limit
-}
-
-func waitForBootstrapStableSnapshot(
-	overlay *vecindex.JournaledOverlay,
-	snapshot *vecindex.OverlaySnapshot,
-	meta common.VectorIndexMeta,
-) (*vecindex.OverlaySnapshot, bool) {
-	if overlay == nil || snapshot == nil {
-		return snapshot, false
-	}
-	current := snapshot
-	stablePasses := 0
-	for attempt := 0; attempt < bootstrapStabilizePasses*2; attempt++ {
-		time.Sleep(bootstrapStabilizeDelay)
-		next := overlay.Snapshot()
-		if next == nil || next.Epoch() != current.Epoch() {
-			return current, false
-		}
-		if next.LastSequence() == current.LastSequence() {
-			stablePasses++
-			current = next
-			if stablePasses >= bootstrapStabilizePasses {
-				return current, true
-			}
-			continue
-		}
-		stablePasses = 0
-		tailRows, _, _ := next.BacklogStats(current.LastSequence())
-		if tailRows > bootstrapPublishTailLimit(meta) {
-			return next, false
-		}
-		current = next
-	}
-	return current, false
-}
-
 func autoTuneBootstrapNlist(rows int64, targetPartitionSize int) int {
 	nlist := autoTuneNlistForTarget(rows, targetPartitionSize)
 	if rows <= 0 {
@@ -596,4 +543,25 @@ func autoTuneBootstrapNlist(rows int64, targetPartitionSize int) int {
 		targetDriven = nlist
 	}
 	return targetDriven
+}
+
+func bootstrapInitialPublishRows(meta common.VectorIndexMeta, availableRows int64) int {
+	if availableRows <= 0 {
+		return 0
+	}
+	floor := int(bootstrapAutoTuneFloor(meta))
+	if floor < 1 {
+		floor = 1
+	}
+	limit := floor * bootstrapPublishMultiplier
+	if limit < floor {
+		limit = floor
+	}
+	if limit > bootstrapMaxPublishRows {
+		limit = bootstrapMaxPublishRows
+	}
+	if int64(limit) > availableRows {
+		return int(availableRows)
+	}
+	return limit
 }

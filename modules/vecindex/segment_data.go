@@ -18,6 +18,7 @@ const (
 	segmentDataRefSize = 16
 	segmentReadChunk   = 1 << 20
 	segmentReadBatch   = 8 << 20
+	segmentPQReadBatch = 512 << 10
 	segmentReadGap     = 1 << 20
 	segmentPQReadGap   = 0
 )
@@ -286,7 +287,7 @@ func OpenSegmentDataStore(path string) (*SegmentDataStore, error) {
 		return &buf
 	}
 	s.batchBufPool.New = func() any {
-		buf := make([]byte, segmentReadBatch)
+		buf := make([]byte, s.batchBufferSize())
 		return &buf
 	}
 	seenWords := (maxCluster + 64) / 64
@@ -295,6 +296,13 @@ func OpenSegmentDataStore(path string) (*SegmentDataStore, error) {
 		return &bits
 	}
 	return s, nil
+}
+
+func (s *SegmentDataStore) batchBufferSize() int {
+	if s != nil && s.encoding == MemberEncodingResidualPQ8 {
+		return segmentPQReadBatch
+	}
+	return segmentReadBatch
 }
 
 func CreateSegmentDataWriter(path string, metric Metric, encoding int64, dim, internalDim, vecBytes, maxCluster int, epoch, generation uint64) (*SegmentDataWriter, error) {
@@ -638,9 +646,10 @@ func (s *SegmentDataStore) ScanClustersFileOrder(clusterIDs []int64, yield func(
 		return nil
 	}
 	bufPtr := s.batchBufPool.Get().(*[]byte)
+	maxBuf := s.batchBufferSize()
 	defer func() {
-		if cap(*bufPtr) > segmentReadBatch {
-			buf := make([]byte, segmentReadBatch)
+		if cap(*bufPtr) > maxBuf {
+			buf := make([]byte, maxBuf)
 			*bufPtr = buf
 		}
 		s.batchBufPool.Put(bufPtr)
@@ -681,9 +690,10 @@ func (s *SegmentDataStore) ScanClustersFileOrderSpans(clusterIDs []int64, yield 
 		return nil
 	}
 	bufPtr := s.batchBufPool.Get().(*[]byte)
+	maxBuf := s.batchBufferSize()
 	defer func() {
-		if cap(*bufPtr) > segmentReadBatch {
-			buf := make([]byte, segmentReadBatch)
+		if cap(*bufPtr) > maxBuf {
+			buf := make([]byte, maxBuf)
 			*bufPtr = buf
 		}
 		s.batchBufPool.Put(bufPtr)
@@ -721,9 +731,10 @@ func (s *SegmentDataStore) WarmClusters(clusterIDs []int64, maxBytes int64) erro
 		return nil
 	}
 	bufPtr := s.batchBufPool.Get().(*[]byte)
+	maxBuf := s.batchBufferSize()
 	defer func() {
-		if cap(*bufPtr) > segmentReadBatch {
-			buf := make([]byte, segmentReadBatch)
+		if cap(*bufPtr) > maxBuf {
+			buf := make([]byte, maxBuf)
 			*bufPtr = buf
 		}
 		s.batchBufPool.Put(bufPtr)
@@ -802,7 +813,7 @@ func (s *SegmentDataStore) clusterReadBatches(clusterIDs []int64) []segmentReadB
 		return nil
 	}
 	if s.encoding == MemberEncodingResidualPQ8 {
-		return planSegmentReadBatches(spans, segmentReadBatch, segmentPQReadGap)
+		return planSegmentReadBatches(spans, segmentPQReadBatch, segmentPQReadGap)
 	}
 	return planSegmentReadBatches(spans, segmentReadBatch, segmentReadGap)
 }

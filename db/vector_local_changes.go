@@ -3,6 +3,7 @@ package db
 import (
 	"bytes"
 	"context"
+	stdbinary "encoding/binary"
 	"fmt"
 	"sort"
 	"time"
@@ -400,6 +401,8 @@ func stableRowExists(state *vecindex.IndexState, rowID int64) bool {
 type mergedLocalCDCEntry struct {
 	OldValues map[string][]byte
 	NewValues map[string][]byte
+	oldOwned  bool
+	newOwned  bool
 }
 
 func mergeLocalCDCEntries(tableName string, entries []common.CDCEntry) []mergedLocalCDCEntry {
@@ -413,8 +416,8 @@ func mergeLocalCDCEntries(tableName string, entries []common.CDCEntry) []mergedL
 		current, ok := merged[key]
 		if !ok {
 			current = &mergedLocalCDCEntry{
-				OldValues: copyCDCValues(entry.OldValues),
-				NewValues: copyCDCValues(entry.NewValues),
+				OldValues: entry.OldValues,
+				NewValues: entry.NewValues,
 			}
 			merged[key] = current
 			ordered = append(ordered, key)
@@ -422,9 +425,17 @@ func mergeLocalCDCEntries(tableName string, entries []common.CDCEntry) []mergedL
 		}
 		if current.OldValues == nil && len(entry.OldValues) > 0 {
 			current.OldValues = make(map[string][]byte, len(entry.OldValues))
+			current.oldOwned = true
+		} else if len(entry.OldValues) > 0 && !current.oldOwned {
+			current.OldValues = copyCDCValues(current.OldValues)
+			current.oldOwned = true
 		}
 		if current.NewValues == nil && len(entry.NewValues) > 0 {
 			current.NewValues = make(map[string][]byte, len(entry.NewValues))
+			current.newOwned = true
+		} else if len(entry.NewValues) > 0 && !current.newOwned {
+			current.NewValues = copyCDCValues(current.NewValues)
+			current.newOwned = true
 		}
 		mergeCDCValueMap(current.OldValues, entry.OldValues)
 		mergeCDCValueMap(current.NewValues, entry.NewValues)
@@ -508,6 +519,9 @@ func decodeCDCBytes(values map[string][]byte, column string) ([]byte, bool, erro
 	if !ok {
 		return nil, false, nil
 	}
+	if value, handled, err := decodeCDCMsgpackBytes(raw); handled || err != nil {
+		return value, true, err
+	}
 	var value any
 	if err := encoding.Unmarshal(raw, &value); err != nil {
 		return nil, false, err
@@ -516,10 +530,49 @@ func decodeCDCBytes(values map[string][]byte, column string) ([]byte, bool, erro
 	case nil:
 		return nil, true, nil
 	case []byte:
-		return append([]byte(nil), v...), true, nil
+		return v, true, nil
 	case string:
 		return []byte(v), true, nil
 	default:
 		return nil, false, fmt.Errorf("unexpected vector value type %T", value)
+	}
+}
+
+func decodeCDCMsgpackBytes(raw []byte) ([]byte, bool, error) {
+	if len(raw) == 0 {
+		return nil, false, nil
+	}
+	switch raw[0] {
+	case 0xc0:
+		return nil, true, nil
+	case 0xc4:
+		if len(raw) < 2 {
+			return nil, true, fmt.Errorf("malformed msgpack bin8")
+		}
+		n := int(raw[1])
+		if len(raw) != 2+n {
+			return nil, true, fmt.Errorf("malformed msgpack bin8 length")
+		}
+		return raw[2:], true, nil
+	case 0xc5:
+		if len(raw) < 3 {
+			return nil, true, fmt.Errorf("malformed msgpack bin16")
+		}
+		n := int(stdbinary.BigEndian.Uint16(raw[1:3]))
+		if len(raw) != 3+n {
+			return nil, true, fmt.Errorf("malformed msgpack bin16 length")
+		}
+		return raw[3:], true, nil
+	case 0xc6:
+		if len(raw) < 5 {
+			return nil, true, fmt.Errorf("malformed msgpack bin32")
+		}
+		n := int(stdbinary.BigEndian.Uint32(raw[1:5]))
+		if len(raw) != 5+n {
+			return nil, true, fmt.Errorf("malformed msgpack bin32 length")
+		}
+		return raw[5:], true, nil
+	default:
+		return nil, false, nil
 	}
 }

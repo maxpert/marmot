@@ -4,6 +4,7 @@ package kmeans
 import (
 	"errors"
 	"fmt"
+	"math"
 
 	"github.com/maxpert/marmot/modules/vecindex/pkg/metric"
 	"github.com/vmihailenco/msgpack/v5"
@@ -181,15 +182,17 @@ func normalizeQuery(vec []float32, centroids [][]float32) ([]float32, error) {
 	if len(vec) != len(centroids[0]) {
 		return nil, errors.New("kmeans: dimension mismatch between vec and centroids")
 	}
-	q := make([]float32, len(vec))
-	copy(q, vec)
-	n := metric.Norm(q)
+	n := metric.Norm(vec)
 	if n == 0 {
-		return q, nil
+		return vec, nil
 	}
+	if math.Abs(float64(n-1)) <= 1e-5 {
+		return vec, nil
+	}
+	q := make([]float32, len(vec))
 	inv := 1.0 / n
-	for i := range q {
-		q[i] *= inv
+	for i, value := range vec {
+		q[i] = value * inv
 	}
 	return q, nil
 }

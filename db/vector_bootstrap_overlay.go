@@ -345,6 +345,34 @@ func countOverlayPreparedVectors(snapshot *vecindex.OverlaySnapshot, cutoff uint
 	return count
 }
 
+func overlayPreparedVectorCutoffSequence(snapshot *vecindex.OverlaySnapshot, maxRows int) (uint64, int) {
+	if snapshot == nil || maxRows <= 0 {
+		return 0, 0
+	}
+	count := 0
+	cutoff := uint64(0)
+	stopped := false
+	snapshot.VisitMutationsAfter(0, func(mutation vecindex.OverlayMutation) bool {
+		if mutation.Kind == vecindex.OverlayMutationDelete || len(mutation.Vec) == 0 {
+			return true
+		}
+		count++
+		cutoff = mutation.Sequence
+		if count >= maxRows {
+			stopped = true
+			return false
+		}
+		return true
+	})
+	if count == 0 {
+		return 0, 0
+	}
+	if !stopped {
+		return snapshot.LastSequence(), count
+	}
+	return cutoff, count
+}
+
 func collectOverlayReservoirSample(snapshot *vecindex.OverlaySnapshot, cutoff uint64, want int, seed uint64) ([][]float32, error) {
 	if snapshot == nil || want <= 0 {
 		return nil, nil

@@ -13,7 +13,6 @@ import (
 	"github.com/maxpert/marmot/common"
 	"github.com/maxpert/marmot/modules/vecindex"
 	"github.com/maxpert/marmot/modules/vecindex/pkg/kmeans"
-	vecmaterialize "github.com/maxpert/marmot/modules/vecindex/pkg/materialize"
 	"github.com/maxpert/marmot/modules/vecindex/pkg/metric"
 	"github.com/maxpert/marmot/protocol"
 	"vitess.io/vitess/go/vt/sqlparser"
@@ -464,9 +463,20 @@ func (h *CoordinatorHandler) segmentRank(plan *GoRankPlan) ([]rankItem, bool, er
 	if !ok {
 		return nil, false, nil
 	}
-	state, ok := stateProvider.Lookup(plan.IndexName)
+	var state *vecindex.IndexState
+	var releaseState func()
+	if refProvider, ok := provider.(interface {
+		LookupRef(indexName string) (*vecindex.IndexState, func(), bool)
+	}); ok {
+		state, releaseState, ok = refProvider.LookupRef(plan.IndexName)
+	} else {
+		state, ok = stateProvider.Lookup(plan.IndexName)
+	}
 	if !ok || state == nil {
 		return nil, false, nil
+	}
+	if releaseState != nil {
+		defer releaseState()
 	}
 
 	// Read overlay before the stable generation. Maintenance publishes a new
@@ -713,31 +723,54 @@ func (h *CoordinatorHandler) exactRerankCandidates(
 	topK := newTopKHeap(plan.K)
 	for rows.Next() {
 		var rowid int64
-		var raw []byte
+		var raw sql.RawBytes
 		if err := rows.Scan(&rowid, &raw); err != nil {
 			return nil, fmt.Errorf("MARMOT-VEC-030: exact rerank scan failed: %w", err)
 		}
-		if raw == nil {
-			continue
-		}
-		prepared, err := vecmaterialize.VectorBlob(raw, plan.IndexSpec.Metric, plan.IndexSpec.Dim, plan.IndexSpec.MaxNorm)
+		dist, ok, err := exactDistanceFromRaw(plan, raw)
 		if err != nil {
-			return nil, fmt.Errorf("MARMOT-VEC-030: exact rerank materialize failed: %w", err)
+			return nil, err
 		}
-		if prepared == nil {
+		if !ok {
 			continue
 		}
-		switch plan.RankMetric {
-		case metric.MetricCosine:
-			topK.Push(rowid, metric.CosineDistanceUnitFromBytes(plan.QueryVec, prepared))
-		default:
-			topK.Push(rowid, metric.DistanceFromBytes(plan.RankMetric, plan.QueryVec, prepared))
-		}
+		topK.Push(rowid, dist)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("MARMOT-VEC-030: exact rerank iter failed: %w", err)
 	}
 	return topK.Drain(), nil
+}
+
+func exactDistanceFromRaw(plan *GoRankPlan, raw []byte) (float32, bool, error) {
+	if plan == nil || len(raw) == 0 {
+		return 0, false, nil
+	}
+	if len(raw)%4 != 0 || len(raw)/4 != plan.IndexSpec.Dim {
+		return 0, false, fmt.Errorf("MARMOT-VEC-030: exact rerank vector dim mismatch: got bytes=%d dim=%d", len(raw), plan.IndexSpec.Dim)
+	}
+	switch plan.IndexSpec.Metric {
+	case metric.MetricCosine:
+		vec := metric.BytesToFloat32(raw)
+		norm := metric.Norm(vec)
+		if norm == 0 {
+			return 0, false, nil
+		}
+		return 1 - metric.DotProduct(plan.QueryVec, vec)/norm, true, nil
+	case metric.MetricDot:
+		vec := metric.BytesToFloat32(raw)
+		norm2 := metric.Norm2(vec)
+		maxNorm2 := plan.IndexSpec.MaxNorm * plan.IndexSpec.MaxNorm
+		if norm2 > maxNorm2 {
+			return 0, false, fmt.Errorf("MARMOT-VEC-030: exact rerank vector norm exceeds MaxNorm")
+		}
+		dot := metric.DotProduct(plan.QueryVec[:plan.IndexSpec.Dim], vec)
+		return plan.QueryNorm2 + maxNorm2 - 2*dot, true, nil
+	case metric.MetricL2:
+		return metric.DistanceFromBytes(metric.MetricL2, plan.QueryVec, raw), true, nil
+	default:
+		return 0, false, fmt.Errorf("MARMOT-VEC-030: exact rerank unknown metric %d", plan.IndexSpec.Metric)
+	}
 }
 
 func (h *CoordinatorHandler) tryDirectPKResult(

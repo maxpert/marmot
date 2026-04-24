@@ -24,6 +24,8 @@ type IndexState struct {
 	overlay      atomic.Pointer[JournaledOverlay]
 	segmentStore atomic.Pointer[SegmentGeneration]
 	maintenance  atomic.Pointer[MaintenanceState]
+	readers      atomic.Int64
+	retired      atomic.Bool
 	clusterHits  []atomic.Uint64
 }
 
@@ -41,6 +43,52 @@ func NewIndexState(spec IVFSpec, cs *kmeans.CentroidSet) *IndexState {
 
 // Spec returns the immutable IVF configuration for this index.
 func (s *IndexState) Spec() IVFSpec { return s.spec }
+
+// Acquire pins the state for a serving reader. It returns false when the state
+// has already been retired and its file-backed resources may be closing.
+func (s *IndexState) Acquire() bool {
+	if s == nil {
+		return false
+	}
+	if s.retired.Load() {
+		return false
+	}
+	s.readers.Add(1)
+	if s.retired.Load() {
+		s.Release()
+		return false
+	}
+	return true
+}
+
+// Release drops a serving reader pin acquired by Acquire.
+func (s *IndexState) Release() {
+	if s == nil {
+		return
+	}
+	if s.readers.Add(-1) == 0 && s.retired.Load() {
+		s.closeServingResources()
+	}
+}
+
+// Retire prevents new serving readers from pinning this state and closes
+// file-backed resources as soon as all existing readers have left.
+func (s *IndexState) Retire() {
+	if s == nil {
+		return
+	}
+	if s.retired.Swap(true) {
+		return
+	}
+	if s.readers.Load() == 0 {
+		s.closeServingResources()
+	}
+}
+
+func (s *IndexState) closeServingResources() {
+	s.ClearOverlay()
+	s.ClearSegmentStore()
+}
 
 // ProbeState returns the current probe centroid set. Nil when no centroids
 // are loaded (empty-table bootstrap). The returned CentroidSet is immutable.

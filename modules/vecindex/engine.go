@@ -30,12 +30,19 @@ func (e *Engine) Register(indexName string, state *IndexState) {
 // Unregister removes the IndexState for indexName from the engine.
 // It is a no-op if indexName is not registered.
 func (e *Engine) Unregister(indexName string) {
-	if val, ok := e.indexes.Load(indexName); ok {
-		state := val.(*IndexState)
-		state.ClearOverlay()
-		state.ClearSegmentStore()
+	if state, ok := e.Detach(indexName); ok {
+		state.Retire()
 	}
-	e.indexes.Delete(indexName)
+}
+
+// Detach removes an index from the lookup map without retiring its resources.
+// Callers that do not restore the state must eventually call Retire.
+func (e *Engine) Detach(indexName string) (*IndexState, bool) {
+	val, ok := e.indexes.LoadAndDelete(indexName)
+	if !ok {
+		return nil, false
+	}
+	return val.(*IndexState), true
 }
 
 // Lookup returns the IndexState for indexName and whether it was found.
@@ -45,6 +52,27 @@ func (e *Engine) Lookup(indexName string) (*IndexState, bool) {
 		return nil, false
 	}
 	return val.(*IndexState), true
+}
+
+// LookupRef returns a serving reference to the current state. The caller must
+// invoke the returned release function when it is done reading from file-backed
+// segment or overlay resources.
+func (e *Engine) LookupRef(indexName string) (*IndexState, func(), bool) {
+	for {
+		val, ok := e.indexes.Load(indexName)
+		if !ok {
+			return nil, nil, false
+		}
+		state := val.(*IndexState)
+		if !state.Acquire() {
+			continue
+		}
+		current, ok := e.indexes.Load(indexName)
+		if ok && current == val {
+			return state, state.Release, true
+		}
+		state.Release()
+	}
 }
 
 // RegisterWithCentroidSet is a convenience wrapper that creates a new

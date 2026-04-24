@@ -36,6 +36,9 @@
 //	                segment publish before read measurement. Default 0.
 //	--profile-dir  pprof output dir. Default /tmp/marmot/vec-bench/prof.
 //	--use-go-rank  Use the Go-side ranking path (default true).
+//	--min-recall   Fail if recall@K is below this value. Default 0 = disabled.
+//	--min-qps      Fail if aggregate read QPS is below this value. Default 0 = disabled.
+//	--max-overread Fail if actual/logical segment read ratio exceeds this value. Default 0 = disabled.
 package main
 
 import (
@@ -95,6 +98,9 @@ type config struct {
 	insertConc     int
 	readPool       int
 	sqliteCacheMB  int
+	minRecall      float64
+	minQPS         float64
+	maxOverread    float64
 }
 
 func parseFlags() *config {
@@ -128,6 +134,9 @@ func parseFlags() *config {
 	fs.IntVar(&c.insertConc, "insert-concurrency", 1, "Concurrent insert goroutines (parallel insert phase)")
 	fs.IntVar(&c.readPool, "read-pool", 0, "Override readDB max-open-conns (0 = match query-concurrency)")
 	fs.IntVar(&c.sqliteCacheMB, "sqlite-cache-mb", 64, "SQLite page-cache budget in MiB for vec-bench connections")
+	fs.Float64Var(&c.minRecall, "min-recall", 0, "Fail if recall@K is below this value (0 = disabled)")
+	fs.Float64Var(&c.minQPS, "min-qps", 0, "Fail if aggregate read QPS is below this value (0 = disabled)")
+	fs.Float64Var(&c.maxOverread, "max-overread", 0, "Fail if segment actual/logical read ratio exceeds this value (0 = disabled)")
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		os.Exit(2)
 	}
@@ -163,6 +172,7 @@ type harness struct {
 	dbMgr   *db.DatabaseManager
 	vecMgr  *db.VectorIndexManager
 	engine  *vecindex.Engine
+	hook    *db.EngineHook
 	handler *coordinator.CoordinatorHandler
 	conn    *sql.DB
 	readDB  *sql.DB
@@ -278,6 +288,22 @@ func logMemorySnapshot(label string) {
 		float64(ms.HeapInuse)/1e6,
 		float64(ms.Sys)/1e6,
 		float64(rssBytes)/1e6)
+}
+
+func writeHeapProfile(profileDir, name string) {
+	path := filepath.Join(profileDir, name)
+	f, err := os.Create(path)
+	if err != nil {
+		plog("warning: create heap profile %s: %v", path, err)
+		return
+	}
+	defer f.Close()
+	runtime.GC()
+	if err := pprof.WriteHeapProfile(f); err != nil {
+		plog("warning: write heap profile %s: %v", path, err)
+		return
+	}
+	plog("heap profile: %s", path)
 }
 
 func main() {
@@ -476,6 +502,7 @@ func openHarness(cfg *config) (*harness, error) {
 		dbMgr:   dbMgr,
 		vecMgr:  vecMgr,
 		engine:  engine,
+		hook:    hook,
 		handler: handler,
 		conn:    conn,
 		readDB:  readDB,
@@ -885,6 +912,7 @@ func (h *harness) waitForVectorReadiness(timeout time.Duration) (*vectorReadines
 			}
 			plog("vector state settled: probe=%d segment=%t overlay=%t overlay_rows=%d", probeVersion, segmentReady, overlayReady, overlayRows)
 			logMemorySnapshot("after vector settle")
+			writeHeapProfile(h.cfg.profileDir, "heap-settle.pb.gz")
 			info.settledAt = time.Now()
 			info.probeVersion = probeVersion
 			info.nlist = h.cfg.nlist
@@ -1141,6 +1169,9 @@ func (h *harness) rehydrateEngine() error {
 		plog("engine rehydrated without centroids; automatic bootstrap has not published a stable generation yet")
 	} else {
 		plog("engine rehydrated from local segment generation: probe=%d dim=%d", state.ProbeVersion(), meta.Dim)
+		if h.hook != nil {
+			h.hook.StartMaintenanceForIndex(*meta)
+		}
 	}
 
 	if h.cfg.nlist == 0 {
@@ -1258,6 +1289,29 @@ func (h *harness) runQueryPhase() error {
 			wid, n, float64(n)/wallElapsed.Seconds())
 	}
 	logMemorySnapshot("after measurement")
+	writeHeapProfile(h.cfg.profileDir, "heap-measure.pb.gz")
+	if err := h.checkBenchmarkGates(stats, aggregateQPS); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (h *harness) checkBenchmarkGates(stats *queryRunStats, aggregateQPS float64) error {
+	if h == nil || h.cfg == nil || stats == nil {
+		return nil
+	}
+	if h.cfg.minRecall > 0 && stats.recall10 < h.cfg.minRecall {
+		return fmt.Errorf("benchmark gate failed: recall@%d %.4f < %.4f", h.cfg.k, stats.recall10, h.cfg.minRecall)
+	}
+	if h.cfg.minQPS > 0 && aggregateQPS < h.cfg.minQPS {
+		return fmt.Errorf("benchmark gate failed: aggregate QPS %.0f < %.0f", aggregateQPS, h.cfg.minQPS)
+	}
+	if h.cfg.maxOverread > 0 && stats.segmentStats.LogicalBytes > 0 {
+		overread := float64(stats.segmentStats.ReadBytes) / float64(stats.segmentStats.LogicalBytes)
+		if overread > h.cfg.maxOverread {
+			return fmt.Errorf("benchmark gate failed: segment overread %.2fx > %.2fx", overread, h.cfg.maxOverread)
+		}
+	}
 	return nil
 }
 

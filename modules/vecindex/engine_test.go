@@ -39,6 +39,26 @@ func TestEngine_LookupUnknown(t *testing.T) {
 	require.False(t, ok)
 }
 
+func TestEngine_LookupRefPinsRetiredState(t *testing.T) {
+	t.Parallel()
+	e := makeEngine(t)
+	state := makeState(t, "emb", 2, [][]float32{{1, 0}})
+	e.Register("emb", state)
+
+	got, release, ok := e.LookupRef("emb")
+	require.True(t, ok)
+	require.Same(t, state, got)
+	require.NotNil(t, release)
+
+	state.Retire()
+	require.False(t, state.Acquire())
+	require.Equal(t, int64(1), state.readers.Load())
+	release()
+	require.Equal(t, int64(0), state.readers.Load())
+	require.Nil(t, state.LoadOverlay())
+	require.Nil(t, state.LoadSegmentStore())
+}
+
 func TestEngine_Unregister(t *testing.T) {
 	t.Parallel()
 	e := makeEngine(t)

@@ -132,7 +132,11 @@ func EncodeStableMemberCodecBlob(codec *StableMemberCodec) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("stable codec blob: encode msgpack: %w", err)
 	}
-	return getEncoder().EncodeAll(raw, nil), nil
+	blob, err := encodeMetadataBlob(raw)
+	if err != nil {
+		return nil, fmt.Errorf("stable codec blob: zstd compress: %w", err)
+	}
+	return blob, nil
 }
 
 func (c *StableMemberCodec) Encoding() int64 {

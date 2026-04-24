@@ -17,9 +17,10 @@ import (
 )
 
 type incrementalClusterEntry struct {
-	rowID    int64
-	vec      []byte
-	prepared []float32
+	rowID        int64
+	vec          []byte
+	prepared     []float32
+	preparedBlob []byte
 }
 
 type rowLoc struct {
@@ -78,17 +79,14 @@ func BuildIncrementalSegmentGeneration(
 	if overlaySnapshot == nil {
 		return nil, nil
 	}
-	mutations := overlaySnapshot.MutationsAfter(base.AppliedOverlaySeq)
-	if cutoffSequence > 0 && len(mutations) > 0 {
-		filtered := mutations[:0]
-		for _, mutation := range mutations {
-			if mutation.Sequence > cutoffSequence {
-				break
-			}
-			filtered = append(filtered, mutation)
+	mutations := make([]vecindex.OverlayMutation, 0)
+	overlaySnapshot.VisitMutationsAfter(base.AppliedOverlaySeq, func(mutation vecindex.OverlayMutation) bool {
+		if cutoffSequence > 0 && mutation.Sequence > cutoffSequence {
+			return false
 		}
-		mutations = filtered
-	}
+		mutations = append(mutations, mutation)
+		return true
+	})
 	return buildIncrementalSegmentGenerationFromMutations(
 		ctx,
 		db,
@@ -142,7 +140,7 @@ func buildIncrementalSegmentGenerationFromMutations(
 			kind:      mutation.Kind,
 			clusterID: mutation.ClusterID,
 			rowID:     mutation.RowID,
-			vec:       append([]byte(nil), mutation.Vec...),
+			vec:       mutation.Vec,
 		}
 		if loc, ok, err := base.RowMap.Lookup(mutation.RowID); err != nil {
 			return nil, fmt.Errorf("incremental segment generation: lookup rowmap rowid %d: %w", mutation.RowID, err)
@@ -266,6 +264,9 @@ func buildIncrementalSegmentGenerationFromMutations(
 				return nil, fmt.Errorf("incremental segment generation: append touched cluster %d rowid %d: %w", clusterID, entry.rowID, err)
 			}
 			prepared := entry.prepared
+			if len(prepared) == 0 && len(entry.preparedBlob) > 0 {
+				prepared = metric.BytesToFloat32(entry.preparedBlob)
+			}
 			if len(prepared) == 0 {
 				var err error
 				prepared, err = stableCodec.DecodePrepared(clusterID, entry.vec)
@@ -405,7 +406,6 @@ func rebuildTouchedClusterEntries(
 			if !ok {
 				return true
 			}
-			prepared = clonePreparedVector(preparedBlob)
 		} else {
 			var err error
 			prepared, err = baseCodec.DecodePrepared(clusterID, vecBytes)
@@ -425,9 +425,10 @@ func rebuildTouchedClusterEntries(
 			return false
 		}
 		entries = append(entries, incrementalClusterEntry{
-			rowID:    rowID,
-			vec:      encoded,
-			prepared: prepared,
+			rowID:        rowID,
+			vec:          encoded,
+			prepared:     prepared,
+			preparedBlob: preparedBlob,
 		})
 		return true
 	}); err != nil {
@@ -448,9 +449,9 @@ func rebuildTouchedClusterEntries(
 			return nil, fmt.Errorf("incremental segment generation: unexpected stable encoding %d for rowid %d", enc, mutation.rowID)
 		}
 		entries = append(entries, incrementalClusterEntry{
-			rowID:    mutation.rowID,
-			vec:      encoded,
-			prepared: clonePreparedVector(mutation.vec),
+			rowID:        mutation.rowID,
+			vec:          encoded,
+			preparedBlob: mutation.vec,
 		})
 	}
 	slices.SortFunc(entries, func(a, b incrementalClusterEntry) int {

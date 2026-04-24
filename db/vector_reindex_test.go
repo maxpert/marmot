@@ -170,6 +170,46 @@ func TestSelectPromotionSplitSources(t *testing.T) {
 	}, got)
 }
 
+func TestCapPromotionSplitSourcesByRowBudget(t *testing.T) {
+	got := capPromotionSplitSourcesByRowBudget([]promotionSplitSource{
+		{clusterID: 1, count: 100, splits: 2},
+		{clusterID: 2, count: 80, splits: 1},
+		{clusterID: 3, count: 70, splits: 1},
+	}, 180)
+	require.Equal(t, []promotionSplitSource{
+		{clusterID: 1, count: 100, splits: 2},
+		{clusterID: 2, count: 80, splits: 1},
+	}, got)
+
+	require.Nil(t, capPromotionSplitSourcesByRowBudget([]promotionSplitSource{
+		{clusterID: 1, count: 200, splits: 2},
+	}, 100))
+}
+
+func TestRepairClusterSets(t *testing.T) {
+	overfull, underfull, total := repairClusterSets([]uint64{0, 1200, 32, 900, 0, 500}, 512)
+
+	require.Equal(t, uint64(2632), total)
+	require.Equal(t, []promotionSplitSource{
+		{clusterID: 1, count: 1200, splits: 2},
+		{clusterID: 3, count: 900, splits: 1},
+	}, overfull)
+	require.Equal(t, []int64{4, 2, 5}, underfull)
+}
+
+func TestAssignPromotionRowsBalancedCapsFamilySkew(t *testing.T) {
+	rows := make([]promotionRow, 0, 10)
+	for i := 0; i < 10; i++ {
+		rows = append(rows, promotionRow{rowID: int64(i + 1), vec: []float32{float32(i), 0}})
+	}
+	centroids := [][]float32{{0, 0}, {9, 0}}
+	_, counts, _ := assignPromotionRowsBalanced(rows, centroids, vecindex.MetricL2, 4)
+
+	require.LessOrEqual(t, counts[0], uint64(5))
+	require.LessOrEqual(t, counts[1], uint64(5))
+	require.Equal(t, uint64(10), counts[0]+counts[1])
+}
+
 func TestPromotionWarmStartCentroids_SplitsHeavyClusters(t *testing.T) {
 	tdb, engine := func(t *testing.T) (*testDBWithMetaStore, *vecindex.Engine) {
 		t.Helper()

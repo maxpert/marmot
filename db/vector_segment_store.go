@@ -1068,11 +1068,9 @@ func openAndStoreOverlay(dbPath, indexName string, state *vecindex.IndexState, e
 	if err != nil {
 		return err
 	}
-	if snapshot := overlay.Snapshot(); snapshot == nil || (epoch != 0 && snapshot.Epoch() != epoch) {
-		if err := overlay.Reset(epoch); err != nil {
-			_ = overlay.Close()
-			return err
-		}
+	if err := reconcileOverlayForState(state, overlay, epoch); err != nil {
+		_ = overlay.Close()
+		return err
 	}
 	state.StoreOverlay(overlay)
 	if err := syncMaintenanceStateFromOverlay(state); err != nil {
@@ -1080,6 +1078,34 @@ func openAndStoreOverlay(dbPath, indexName string, state *vecindex.IndexState, e
 		return err
 	}
 	return nil
+}
+
+func reconcileOverlayForState(state *vecindex.IndexState, overlay *vecindex.JournaledOverlay, epoch uint64) error {
+	if overlay == nil {
+		return nil
+	}
+	snapshot := overlay.Snapshot()
+	if snapshot == nil {
+		if err := overlay.Reset(epoch); err != nil {
+			return err
+		}
+		return nil
+	}
+	segments := state.LoadSegmentStore()
+	if epoch == 0 || snapshot.Epoch() == epoch {
+		if segments != nil && snapshot.LastSequence() < segments.AppliedOverlaySeq {
+			return overlay.Rewrite(epoch, segments.AppliedOverlaySeq, nil)
+		}
+		return nil
+	}
+	if segments == nil || state.ProbeState() == nil {
+		return overlay.Reset(epoch)
+	}
+	tailMutations, err := reassignOverlayMutationsForProbe(snapshot, segments.AppliedOverlaySeq, state.Spec(), state.ProbeState(), segments)
+	if err != nil {
+		return err
+	}
+	return overlay.Rewrite(epoch, segments.AppliedOverlaySeq, tailMutations)
 }
 
 func syncMaintenanceStateFromOverlay(state *vecindex.IndexState) error {
@@ -1100,22 +1126,28 @@ func syncMaintenanceStateFromOverlay(state *vecindex.IndexState) error {
 	if snapshot == nil {
 		return nil
 	}
-	for _, mutation := range snapshot.MutationsAfter(segments.AppliedOverlaySeq) {
+	var syncErr error
+	snapshot.VisitMutationsAfter(segments.AppliedOverlaySeq, func(mutation vecindex.OverlayMutation) bool {
 		oldCluster, oldVec, err := loadStablePreparedForMaintenance(segments, state.Spec(), mutation.RowID)
 		if err != nil {
-			return err
+			syncErr = err
+			return false
 		}
 		var newCluster int64
 		var newVec []float32
 		if mutation.Kind != vecindex.OverlayMutationDelete {
 			newCluster = mutation.ClusterID
-			newVec = append([]float32(nil), metric.BytesToFloat32(mutation.Vec)...)
+			newVec = metric.BytesToFloat32(mutation.Vec)
 		}
 		if mutation.Kind == vecindex.OverlayMutationUpsert {
 			oldCluster = 0
 			oldVec = nil
 		}
 		maintenance.RecordClusterMutation(oldCluster, oldVec, newCluster, newVec)
+		return true
+	})
+	if syncErr != nil {
+		return syncErr
 	}
 	return nil
 }

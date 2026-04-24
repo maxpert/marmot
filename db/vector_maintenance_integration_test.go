@@ -126,6 +126,91 @@ func TestIncrementalMerge_PublishesNewGenerationAndClearsOverlay(t *testing.T) {
 	require.Greater(t, loc.ClusterID, int64(0))
 }
 
+func TestBootstrapPublishesBoundedPrefixAndPreservesOverlayTail(t *testing.T) {
+	tmpDir := t.TempDir()
+	clock := hlc.NewClock(1)
+
+	dbMgr, err := NewDatabaseManager(tmpDir, 1, clock)
+	require.NoError(t, err)
+	require.NoError(t, dbMgr.CreateDatabase("test"))
+
+	vecMgr := NewVectorIndexManager(dbMgr)
+	dbMgr.SetVectorIndexManager(vecMgr)
+
+	engine := vecindex.NewEngine()
+	SetVectorUDFProvider(engine)
+	t.Cleanup(func() { SetVectorUDFProvider(nil) })
+
+	hook := NewEngineHook(engine, dbMgr)
+	hook.BindVectorIndexManager(vecMgr)
+	t.Cleanup(func() {
+		cleanupIndexWatchers(t, hook, dbMgr, "test", "embeddings")
+	})
+	vecMgr.SetLifecycleHook(hook)
+	vecMgr.SetEngineProvider(hook)
+	vecMgr.SetReindexHook(hook)
+	require.NoError(t, vecMgr.Start(context.Background()))
+
+	conn, err := dbMgr.GetDatabaseConnection("test")
+	require.NoError(t, err)
+	_, err = conn.Exec(`CREATE TABLE docs (id INTEGER PRIMARY KEY, embed BLOB)`)
+	require.NoError(t, err)
+
+	meta := common.VectorIndexMeta{
+		IndexName:           "embeddings",
+		TableName:           "docs",
+		ColumnName:          "embed",
+		Database:            "test",
+		Metric:              "cosine",
+		Dim:                 4,
+		TargetPartitionSize: 8,
+		CreatedAt:           time.Now().UnixNano(),
+	}
+	require.NoError(t, vecMgr.CreateIndex(context.Background(), meta))
+
+	const rows = 300
+	mirrorRows := make([]overlayMirrorRow, 0, rows)
+	for i := 0; i < rows; i++ {
+		vec := []float32{
+			1, float32(i % 7), float32((i + 1) % 11), float32((i + 2) % 13),
+		}
+		_, err := conn.Exec(`INSERT INTO docs (id, embed) VALUES (?, ?)`, i+1, encodeVec(t, vec))
+		require.NoError(t, err)
+		mirrorRows = append(mirrorRows, overlayMirrorRow{rowID: int64(i + 1), vec: vec})
+	}
+	mirrorRowsToOverlay(t, hook, meta, mirrorRows)
+
+	var state *vecindex.IndexState
+	require.Eventually(t, func() bool {
+		var ok bool
+		state, ok = engine.Lookup(meta.IndexName)
+		return ok && state.ProbeVersion() > 0 && state.LoadSegmentStore() != nil
+	}, 30*time.Second, 100*time.Millisecond)
+	hook.stopMaintenanceWatcher(meta.IndexName)
+
+	expectedPublished := bootstrapInitialPublishRows(meta, rows)
+	segments := state.LoadSegmentStore()
+	require.NotNil(t, segments)
+	require.Equal(t, uint64(expectedPublished), segments.AppliedOverlaySeq)
+	require.Equal(t, uint64(expectedPublished), segments.Data.RowCount())
+
+	overlay := state.LoadOverlay()
+	require.NotNil(t, overlay)
+	snapshot := overlay.Snapshot()
+	require.NotNil(t, snapshot)
+	require.Equal(t, rows-expectedPublished, snapshot.Len())
+	require.Equal(t, state.ProbeVersion(), snapshot.Epoch())
+
+	_, ok, err := segments.RowMap.Lookup(int64(expectedPublished))
+	require.NoError(t, err)
+	require.True(t, ok)
+	_, ok, err = segments.RowMap.Lookup(int64(expectedPublished + 1))
+	require.NoError(t, err)
+	require.False(t, ok)
+	_, ok = snapshot.RowCluster(int64(expectedPublished + 1))
+	require.True(t, ok)
+}
+
 func TestIncrementalMerge_PreservesOverlayTailAcrossPublish(t *testing.T) {
 	tmpDir := t.TempDir()
 	clock := hlc.NewClock(1)

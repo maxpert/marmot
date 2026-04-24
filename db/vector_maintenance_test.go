@@ -44,7 +44,7 @@ func TestShouldIncrementalMerge(t *testing.T) {
 	}
 }
 
-func TestShouldAutoRebuild(t *testing.T) {
+func TestShouldIncrementalRepair(t *testing.T) {
 	t.Parallel()
 
 	meta := common.VectorIndexMeta{
@@ -90,9 +90,9 @@ func TestShouldAutoRebuild(t *testing.T) {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			got := shouldAutoRebuild(meta, tc.clusterRows, tc.maintenance, tc.clusterDrift)
+			got := shouldIncrementalRepair(meta, tc.clusterRows, tc.maintenance, tc.clusterDrift)
 			if got != tc.wantDecision {
-				t.Fatalf("shouldAutoRebuild() = %v, want %v", got, tc.wantDecision)
+				t.Fatalf("shouldIncrementalRepair() = %v, want %v", got, tc.wantDecision)
 			}
 		})
 	}
