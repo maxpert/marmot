@@ -1187,6 +1187,7 @@ func BuildSegmentGenerationOnReopen(
 	}
 	dir := vecindex.SegmentStoreDir(dbPath, meta.IndexName)
 	if generation, err := openSegmentGeneration(dir, meta, spec, state.ProbeVersion()); err == nil && generation != nil {
+		pruneSegmentStoreOnStartup(dir, generation.Manifest.Generation)
 		state.SwapProbeState(generation.ProbeCentroids)
 		state.StoreSegmentStore(segmentGenerationFromOpened(generation))
 		if err := openAndStoreOverlay(dbPath, meta.IndexName, state, generation.Manifest.ProbeEpochValue()); err != nil {

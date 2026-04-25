@@ -112,6 +112,89 @@ func TestJournaledOverlay_ReplayOnReopen(t *testing.T) {
 	require.True(t, snapshot.HasTombstone(11))
 }
 
+func TestJournaledOverlay_SnapshotStoresJournalRefs(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "overlay.journal")
+	overlay, err := OpenJournaledOverlay(path)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, overlay.Close()) })
+
+	vec := encodeOverlayTestVec(1, 2)
+	require.NoError(t, overlay.ApplyCommittedBatch([]OverlayMutation{
+		{Kind: OverlayMutationUpsert, Epoch: 1, Sequence: 1, ClusterID: 1, RowID: 10, Vec: vec},
+	}))
+	vec[0] ^= 0xff
+
+	snapshot := overlay.Snapshot()
+	row := snapshot.byCluster[1][10]
+	require.Empty(t, row.vec.inline)
+	require.Positive(t, row.vec.offset)
+	require.Equal(t, len(encodeOverlayTestVec(1, 2)), row.vec.length)
+
+	got, err := snapshot.ReadVec(10)
+	require.NoError(t, err)
+	require.Equal(t, encodeOverlayTestVec(1, 2), got)
+}
+
+func TestJournaledOverlay_ReplayStoresJournalRefs(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "overlay.journal")
+	overlay, err := OpenJournaledOverlay(path)
+	require.NoError(t, err)
+	require.NoError(t, overlay.ApplyCommittedBatch([]OverlayMutation{
+		{Kind: OverlayMutationUpsert, Epoch: 7, Sequence: 1, ClusterID: 2, RowID: 11, Vec: encodeOverlayTestVec(3, 4)},
+	}))
+	require.NoError(t, overlay.Close())
+
+	reopened, err := OpenJournaledOverlay(path)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, reopened.Close()) })
+
+	snapshot := reopened.Snapshot()
+	row := snapshot.byCluster[2][11]
+	require.Empty(t, row.vec.inline)
+	require.Positive(t, row.vec.offset)
+	got, err := snapshot.ReadVec(11)
+	require.NoError(t, err)
+	require.Equal(t, encodeOverlayTestVec(3, 4), got)
+}
+
+func TestOverlayVecCacheEvictsAtByteCap(t *testing.T) {
+	t.Parallel()
+
+	cache := newOverlayVecCache(8)
+	cache.Put(overlayVecKey{sequence: 1, rowID: 1}, []byte{1, 2, 3, 4})
+	cache.Put(overlayVecKey{sequence: 2, rowID: 2}, []byte{5, 6, 7, 8})
+	_, ok := cache.Get(overlayVecKey{sequence: 1, rowID: 1})
+	require.True(t, ok)
+	cache.Put(overlayVecKey{sequence: 3, rowID: 3}, []byte{9, 10, 11, 12})
+
+	_, ok = cache.Get(overlayVecKey{sequence: 2, rowID: 2})
+	require.False(t, ok)
+	_, ok = cache.Get(overlayVecKey{sequence: 1, rowID: 1})
+	require.True(t, ok)
+	_, ok = cache.Get(overlayVecKey{sequence: 3, rowID: 3})
+	require.True(t, ok)
+}
+
+func TestOverlaySnapshot_NewestUnixNanoAfter(t *testing.T) {
+	t.Parallel()
+
+	buffer := NewOverlayBuffer()
+	require.NoError(t, buffer.ApplyBatch([]OverlayMutation{
+		{Kind: OverlayMutationUpsert, Epoch: 1, Sequence: 1, ClusterID: 1, RowID: 1, AppliedAtUnixNano: 100, Vec: encodeOverlayTestVec(1, 0)},
+		{Kind: OverlayMutationUpsert, Epoch: 1, Sequence: 2, ClusterID: 2, RowID: 2, AppliedAtUnixNano: 200, Vec: encodeOverlayTestVec(0, 1)},
+		{Kind: OverlayMutationDelete, Epoch: 1, Sequence: 3, RowID: 3, AppliedAtUnixNano: 300},
+	}))
+
+	snapshot := buffer.Snapshot()
+	require.Equal(t, int64(300), snapshot.NewestUnixNanoAfter(0))
+	require.Equal(t, int64(300), snapshot.NewestUnixNanoAfter(2))
+	require.Zero(t, snapshot.NewestUnixNanoAfter(3))
+}
+
 func TestOverlayJournal_TruncatedTailIgnoredOnOpen(t *testing.T) {
 	t.Parallel()
 

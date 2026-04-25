@@ -19,7 +19,7 @@ const (
 	mergeRowsThreshold       = 4096
 	mergeBytesThreshold      = 32 << 20
 	mergeAgeThreshold        = 30 * time.Second
-	mergeMaxPrefixRows       = 64 * 1024
+	mergeMaxPrefixRows       = 256 * 1024
 	mergeTargetMultiplier    = 128
 	rebuildRowsFloor         = 50_000
 	rebuildTargetClusterSize = 512
@@ -29,6 +29,7 @@ const (
 	repairP95Factor          = 1.5
 	promotionStepFloor       = 32
 	promotionGrowthFactor    = 1.25
+	catchUpQuiesceDuration   = 2 * time.Second
 )
 
 func (h *EngineHook) startMaintenanceWatcher(meta common.VectorIndexMeta) {
@@ -42,10 +43,14 @@ func (h *EngineHook) startMaintenanceWatcher(meta common.VectorIndexMeta) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	h.maintenanceSeq++
-	watch := maintenanceWatcher{cancel: cancel, seq: h.maintenanceSeq}
+	done := make(chan struct{})
+	watch := maintenanceWatcher{cancel: cancel, done: done, seq: h.maintenanceSeq}
 	h.maintenanceWatchers[meta.IndexName] = watch
 	h.maintenanceMu.Unlock()
-	go h.maintenanceLoop(ctx, meta, watch.seq)
+	go func() {
+		defer close(done)
+		h.maintenanceLoop(ctx, meta, watch.seq)
+	}()
 }
 
 func (h *EngineHook) StartMaintenanceForIndex(meta common.VectorIndexMeta) {
@@ -62,6 +67,9 @@ func (h *EngineHook) stopMaintenanceWatcher(indexName string) {
 	h.maintenanceMu.Unlock()
 	if ok && watch.cancel != nil {
 		watch.cancel()
+	}
+	if ok && watch.done != nil {
+		<-watch.done
 	}
 }
 
@@ -81,17 +89,14 @@ func (h *EngineHook) maintenanceLoop(ctx context.Context, meta common.VectorInde
 	defer ticker.Stop()
 	defer h.clearMaintenanceWatcher(meta.IndexName, seq)
 	for {
-		if ctx.Err() != nil {
-			return
-		}
-		shouldStop := h.maintenanceOnce(ctx, meta)
-		if shouldStop {
-			return
-		}
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+		}
+		shouldStop := h.maintenanceOnce(ctx, meta)
+		if shouldStop {
+			return
 		}
 	}
 }
@@ -135,16 +140,38 @@ func (h *EngineHook) maintenanceOnce(ctx context.Context, meta common.VectorInde
 	driftBacklogRows := backlogRows
 	if maintenance != nil {
 		if live := maintenance.LiveClusterRowCounts(); len(live) > 0 {
+			stableRows := totalTrackedRows(base.ClusterRowCounts, 0)
+			liveRows := totalTrackedRows(live, 0)
 			clusterRowCounts = live
-			driftBacklogRows = 0
+			if liveRows >= stableRows+uint64(backlogRows) {
+				driftBacklogRows = 0
+			}
 		}
 	}
 	currentClusters := currentClusterCount(meta, clusterRowCounts)
+	stableRows := totalTrackedRows(clusterRowCounts, 0)
 	wantClusters := desiredClusterCount(totalTrackedRows(clusterRowCounts, driftBacklogRows), maintenanceTargetClusterSize(meta))
 	growForPromotion := meta.AutoTuneNlist &&
 		wantClusters > currentClusters &&
 		currentClusters > 0 &&
 		float64(wantClusters-currentClusters)/float64(currentClusters) >= rebuildClusterDriftPct
+
+	if growForPromotion && shouldCatchUpRebuild(stableRows, backlogRows, currentClusters, wantClusters) {
+		if !catchUpOverlayQuiesced(overlaySnapshot, base.AppliedOverlaySeq) {
+			return false
+		}
+		dbPath, err := h.dbMgr.GetDatabasePath(meta.Database)
+		if err != nil {
+			log.Warn().Err(err).Str("index", meta.IndexName).Msg("maintenance: get db path failed")
+			return false
+		}
+		if err := h.runCatchUpRebuild(ctx, conn, dbPath, meta, spec, state); err != nil {
+			log.Warn().Err(err).Str("index", meta.IndexName).Msg("maintenance: catch-up rebuild failed")
+		} else {
+			releaseVectorBuildResources(ctx, conn)
+		}
+		return false
+	}
 
 	if overlaySnapshot != nil && overlaySnapshot.LastSequence() > base.AppliedOverlaySeq && (shouldIncrementalMerge(backlogRows, backlogBytes, oldestUnixNano) || growForPromotion) {
 		dbPath, err := h.dbMgr.GetDatabasePath(meta.Database)
@@ -211,6 +238,30 @@ func (h *EngineHook) maintenanceOnce(ctx context.Context, meta common.VectorInde
 	return false
 }
 
+func shouldCatchUpRebuild(stableRows uint64, backlogRows int, currentClusters, wantClusters int) bool {
+	if currentClusters <= 0 || wantClusters <= currentClusters || backlogRows <= 0 {
+		return false
+	}
+	if wantClusters > currentClusters*2 {
+		return true
+	}
+	if stableRows == 0 {
+		return true
+	}
+	return uint64(backlogRows)*4 >= stableRows
+}
+
+func catchUpOverlayQuiesced(snapshot *vecindex.OverlaySnapshot, appliedSeq uint64) bool {
+	if snapshot == nil {
+		return false
+	}
+	newest := snapshot.NewestUnixNanoAfter(appliedSeq)
+	if newest == 0 {
+		return false
+	}
+	return time.Since(time.Unix(0, newest)) >= catchUpQuiesceDuration
+}
+
 func shouldIncrementalMerge(backlogRows int, backlogBytes int64, oldestUnixNano int64) bool {
 	if backlogRows >= mergeRowsThreshold || backlogBytes >= mergeBytesThreshold {
 		return true
@@ -221,7 +272,7 @@ func shouldIncrementalMerge(backlogRows int, backlogBytes int64, oldestUnixNano 
 	return false
 }
 
-func incrementalMergePrefixRows(meta common.VectorIndexMeta) int {
+func incrementalMergePrefixRows(meta common.VectorIndexMeta, spec vecindex.IVFSpec, backlogRows int, desiredK int) int {
 	target := maintenanceTargetClusterSize(meta)
 	if target <= 0 {
 		target = defaultTargetPartitionSize
@@ -230,8 +281,26 @@ func incrementalMergePrefixRows(meta common.VectorIndexMeta) int {
 	if limit < mergeRowsThreshold {
 		limit = mergeRowsThreshold
 	}
+	if desiredK > 0 {
+		catchUpLimit := desiredK * target / 2
+		if catchUpLimit > limit {
+			limit = catchUpLimit
+		}
+	}
+	if rowBytes := spec.InternalDim() * 4; rowBytes > 0 {
+		memoryCapRows := int((512 << 20) / rowBytes)
+		if memoryCapRows < mergeRowsThreshold {
+			memoryCapRows = mergeRowsThreshold
+		}
+		if limit > memoryCapRows {
+			limit = memoryCapRows
+		}
+	}
 	if limit > mergeMaxPrefixRows {
 		limit = mergeMaxPrefixRows
+	}
+	if backlogRows > 0 && limit > backlogRows {
+		limit = backlogRows
 	}
 	return limit
 }
@@ -243,7 +312,7 @@ func overlayMutationCutoffSequence(snapshot *vecindex.OverlaySnapshot, minSequen
 	cutoff := minSequence
 	count := 0
 	stopped := false
-	snapshot.VisitMutationsAfter(minSequence, func(mutation vecindex.OverlayMutation) bool {
+	snapshot.VisitMutationHeadersAfter(minSequence, func(mutation vecindex.OverlayMutation) bool {
 		count++
 		cutoff = mutation.Sequence
 		if maxMutations > 0 && count >= maxMutations {
@@ -409,9 +478,13 @@ func openPinnedSegmentGeneration(
 	expectedGeneration uint64,
 ) (*vecindex.SegmentGeneration, error) {
 	dir := vecindex.SegmentStoreDir(dbPath, meta.IndexName)
-	opened, err := openSegmentGeneration(dir, meta, spec, expectedEpoch)
+	opened, err := openSegmentGeneration(dir, meta, spec, 0)
 	if err != nil || opened == nil {
 		return nil, err
+	}
+	if expectedEpoch != 0 && opened.Manifest.ProbeEpochValue() != expectedEpoch {
+		_ = opened.Close()
+		return nil, nil
 	}
 	if opened.Manifest.Generation != expectedGeneration {
 		_ = opened.Close()
@@ -446,7 +519,9 @@ func (h *EngineHook) prepareIncrementalMerge(
 		h.localChangeMu.Unlock()
 		return nil, nil
 	}
-	cutoff, prefixRows := overlayMutationCutoffSequence(overlaySnapshot, base.AppliedOverlaySeq, incrementalMergePrefixRows(meta))
+	backlogRows, _, _ := overlaySnapshot.BacklogStats(base.AppliedOverlaySeq)
+	desiredK := desiredClusterCount(totalTrackedRows(base.ClusterRowCounts, backlogRows), maintenanceTargetClusterSize(meta))
+	cutoff, prefixRows := overlayMutationCutoffSequence(overlaySnapshot, base.AppliedOverlaySeq, incrementalMergePrefixRows(meta, spec, backlogRows, desiredK))
 	if prefixRows == 0 || cutoff <= base.AppliedOverlaySeq {
 		h.localChangeMu.Unlock()
 		return nil, nil
@@ -464,18 +539,8 @@ func (h *EngineHook) prepareIncrementalMerge(
 	if err != nil {
 		return nil, err
 	}
-	nextEpoch := currentProbe.Epoch() + 1
-	if nextEpoch == 0 {
-		nextEpoch = 1
-	}
-	nextProbe, err := probeCentroidSetForTouched(currentProbe, stats.Counts, stats.Sums, stats.Touched, nextEpoch)
-	if err != nil {
-		return nil, err
-	}
-	nextStable, err := stableCentroidSetForTouched(pinnedBase.StableCentroids, nextProbe, stats.Touched)
-	if err != nil {
-		return nil, err
-	}
+	nextProbe := currentProbe
+	nextStable := pinnedBase.StableCentroids
 
 	pending, err := BuildIncrementalSegmentGeneration(
 		ctx,
@@ -539,23 +604,15 @@ func (h *EngineHook) publishIncrementalMerge(
 	if err := plan.pending.Publish(); err != nil {
 		return err
 	}
-	tailMutations, err := reassignOverlayMutationsForProbe(currentSnapshot, plan.cutoff, plan.spec, plan.nextProbe, plan.pending.generation)
-	if err != nil {
-		return err
-	}
-	nextOverlay, err := rewriteOverlayForEpoch(dbPath, meta.IndexName, plan.nextProbe.Epoch(), plan.cutoff, tailMutations)
-	if err != nil {
-		return err
-	}
 	newState := vecindex.NewIndexState(plan.spec, plan.nextProbe)
 	newState.StoreSegmentStore(plan.pending.generation)
 	plan.pending.generation = nil
-	newState.StoreOverlay(nextOverlay)
-	if err := syncMaintenanceStateFromOverlay(newState); err != nil {
-		newState.ClearOverlay()
+	nextOverlay, err := rewriteOverlayTailForProbe(dbPath, meta.IndexName, plan.nextProbe.Epoch(), plan.cutoff, currentSnapshot, plan.spec, plan.nextProbe, newState.LoadSegmentStore())
+	if err != nil {
 		newState.ClearSegmentStore()
 		return err
 	}
+	newState.StoreOverlay(nextOverlay)
 	h.engine.Register(meta.IndexName, newState)
 	h.retireState(plan.state)
 	return nil
@@ -569,6 +626,9 @@ func (h *EngineHook) runIncrementalMerge(
 	spec vecindex.IVFSpec,
 	state *vecindex.IndexState,
 ) error {
+	h.maintenanceBuildMu.Lock()
+	defer h.maintenanceBuildMu.Unlock()
+
 	plan, err := h.prepareIncrementalMerge(ctx, conn, dbPath, meta, spec, state)
 	if err != nil || plan == nil {
 		return err
@@ -577,13 +637,64 @@ func (h *EngineHook) runIncrementalMerge(
 	return h.publishIncrementalMerge(dbPath, meta, plan)
 }
 
-func rewriteOverlayForEpoch(dbPath, indexName string, epoch uint64, minSequence uint64, mutations []vecindex.OverlayMutation) (*vecindex.JournaledOverlay, error) {
+func rewriteOverlayTailForProbe(
+	dbPath string,
+	indexName string,
+	epoch uint64,
+	minSequence uint64,
+	snapshot *vecindex.OverlaySnapshot,
+	spec vecindex.IVFSpec,
+	probe *kmeans.CentroidSet,
+	stable *vecindex.SegmentGeneration,
+) (*vecindex.JournaledOverlay, error) {
 	dir := vecindex.SegmentStoreDir(dbPath, indexName)
 	overlay, err := vecindex.OpenJournaledOverlayForRewrite(vecindex.OverlayJournalPath(dir))
 	if err != nil {
 		return nil, err
 	}
-	if err := overlay.Rewrite(epoch, minSequence, mutations); err != nil {
+	if err := overlay.Rewrite(epoch, minSequence, nil); err != nil {
+		_ = overlay.Close()
+		return nil, err
+	}
+	if snapshot == nil {
+		return overlay, nil
+	}
+	batch := make([]vecindex.OverlayMutation, 0, 1024)
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		if err := overlay.ApplyCommittedBatch(batch); err != nil {
+			return err
+		}
+		for i := range batch {
+			batch[i].Vec = nil
+		}
+		batch = batch[:0]
+		return nil
+	}
+	var rewriteErr error
+	snapshot.VisitMutationsAfter(minSequence, func(mutation vecindex.OverlayMutation) bool {
+		next, err := reassignOverlayMutationForProbe(mutation, spec, probe, stable)
+		if err != nil {
+			rewriteErr = err
+			return false
+		}
+		batch = append(batch, next)
+		if len(batch) < cap(batch) {
+			return true
+		}
+		if err := flush(); err != nil {
+			rewriteErr = err
+			return false
+		}
+		return true
+	})
+	if rewriteErr != nil {
+		_ = overlay.Close()
+		return nil, rewriteErr
+	}
+	if err := flush(); err != nil {
 		_ = overlay.Close()
 		return nil, err
 	}

@@ -290,7 +290,8 @@ func pqProbeScanBudgetRows(targetPartitionSize int) int {
 		targetPartitionSize = 512
 	}
 	budget := defaultProbeScanBudgetRows(targetPartitionSize)
-	if widened := 48 * targetPartitionSize; widened > budget {
+	multiplier := 38
+	if widened := multiplier * targetPartitionSize; widened > budget {
 		budget = widened
 	}
 	return budget
@@ -344,10 +345,6 @@ func selectProbeClusterIDs(
 	if !probeCountsUsable(counts, centroids) {
 		return refreshFixedProbeClusterIDs(plan, state)
 	}
-	ids, _, err := centroids.AssignTopN(plan.QueryVec, centroids.Len(), plan.IndexSpec.InternalMetric())
-	if err != nil || len(ids) == 0 {
-		return refreshFixedProbeClusterIDs(plan, state)
-	}
 	budget := uint64(plan.ScanBudgetRows)
 	if budget == 0 {
 		budget = uint64(defaultProbeScanBudgetRows(plan.TargetPartitionSize))
@@ -355,17 +352,44 @@ func selectProbeClusterIDs(
 	if segments != nil && segments.Data != nil && segments.Data.Encoding() == vecindex.MemberEncodingResidualPQ8 {
 		budget = uint64(pqProbeScanBudgetRows(plan.TargetPartitionSize))
 	}
-	selected := make([]int64, 0, len(ids))
+	rowCounts := counts[1:]
+	target := plan.TargetPartitionSize
+	if target <= 0 {
+		target = 512
+	}
+	minProbe := plan.Nprobe
+	if minProbe <= 0 {
+		minProbe = 1
+	}
+	estimatedProbe := int((budget + uint64(target) - 1) / uint64(target))
+	maxProbe := estimatedProbe * 4
+	if maxProbe < minProbe {
+		maxProbe = minProbe
+	}
+	if maxProbe < 32 {
+		maxProbe = 32
+	}
+	if maxProbe > centroids.Len() {
+		maxProbe = centroids.Len()
+	}
+	ids, _, err := centroids.AssignTopNUntilBudget(plan.QueryVec, rowCounts, budget, minProbe, maxProbe, plan.IndexSpec.InternalMetric())
+	if err != nil || len(ids) == 0 {
+		return refreshFixedProbeClusterIDs(plan, state)
+	}
 	var cumulative uint64
+	for _, id := range ids {
+		cumulative += rowCounts[id]
+	}
+	if cumulative < budget && maxProbe < centroids.Len() {
+		ids, _, err = centroids.AssignTopNUntilBudget(plan.QueryVec, rowCounts, budget, minProbe, centroids.Len(), plan.IndexSpec.InternalMetric())
+		if err != nil || len(ids) == 0 {
+			return refreshFixedProbeClusterIDs(plan, state)
+		}
+	}
+	selected := make([]int64, 0, len(ids))
 	for _, id := range ids {
 		clusterID := int64(id) + 1
 		selected = append(selected, clusterID)
-		if int(clusterID) < len(counts) {
-			cumulative += counts[clusterID]
-		}
-		if cumulative >= budget {
-			break
-		}
 	}
 	if len(selected) == 0 {
 		return refreshFixedProbeClusterIDs(plan, state)

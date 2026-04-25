@@ -5,6 +5,7 @@ package db
 
 import (
 	"context"
+	"os"
 	"testing"
 	"time"
 
@@ -14,7 +15,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestIncrementalMerge_PublishesNewGenerationAndClearsOverlay(t *testing.T) {
+func TestIncrementalMerge_PublishesNewGenerationAndAdvancesAppliedSeq(t *testing.T) {
 	tmpDir := t.TempDir()
 	clock := hlc.NewClock(1)
 
@@ -107,7 +108,7 @@ func TestIncrementalMerge_PublishesNewGenerationAndClearsOverlay(t *testing.T) {
 	require.NoError(t, hook.runIncrementalMerge(context.Background(), conn, dbPath, meta, state.Spec(), state))
 
 	state, _ = engine.Lookup(meta.IndexName)
-	require.Equal(t, oldEpoch+1, state.ProbeVersion())
+	require.Equal(t, oldEpoch, state.ProbeVersion())
 	require.NotNil(t, state.LoadSegmentStore())
 	require.Greater(t, state.LoadSegmentStore().Data.Generation(), oldGeneration)
 	require.Equal(t, state.ProbeVersion(), state.LoadSegmentStore().ProbeCentroids.Epoch())
@@ -118,7 +119,11 @@ func TestIncrementalMerge_PublishesNewGenerationAndClearsOverlay(t *testing.T) {
 	snapshot := overlay.Snapshot()
 	require.NotNil(t, snapshot)
 	require.Equal(t, state.ProbeVersion(), snapshot.Epoch())
-	require.Zero(t, snapshot.Len())
+	backlogRows, _, _ := snapshot.BacklogStats(state.LoadSegmentStore().AppliedOverlaySeq)
+	require.Zero(t, backlogRows)
+	overlayInfo, err := os.Stat(vecindex.OverlayJournalPath(vecindex.SegmentStoreDir(dbPath, meta.IndexName)))
+	require.NoError(t, err)
+	require.LessOrEqual(t, overlayInfo.Size(), int64(64))
 
 	loc, ok, err := state.LoadSegmentStore().RowMap.Lookup(int64(bootstrapRows + 1))
 	require.NoError(t, err)
@@ -209,6 +214,102 @@ func TestBootstrapPublishesBoundedPrefixAndPreservesOverlayTail(t *testing.T) {
 	require.False(t, ok)
 	_, ok = snapshot.RowCluster(int64(expectedPublished + 1))
 	require.True(t, ok)
+}
+
+func TestCatchUpRebuildPromotesOverlayTailInOnePublish(t *testing.T) {
+	tmpDir := t.TempDir()
+	clock := hlc.NewClock(1)
+
+	dbMgr, err := NewDatabaseManager(tmpDir, 1, clock)
+	require.NoError(t, err)
+	require.NoError(t, dbMgr.CreateDatabase("test"))
+
+	vecMgr := NewVectorIndexManager(dbMgr)
+	dbMgr.SetVectorIndexManager(vecMgr)
+
+	engine := vecindex.NewEngine()
+	SetVectorUDFProvider(engine)
+	t.Cleanup(func() { SetVectorUDFProvider(nil) })
+
+	hook := NewEngineHook(engine, dbMgr)
+	hook.BindVectorIndexManager(vecMgr)
+	t.Cleanup(func() {
+		cleanupIndexWatchers(t, hook, dbMgr, "test", "embeddings")
+	})
+	vecMgr.SetLifecycleHook(hook)
+	vecMgr.SetEngineProvider(hook)
+	vecMgr.SetReindexHook(hook)
+	require.NoError(t, vecMgr.Start(context.Background()))
+
+	conn, err := dbMgr.GetDatabaseConnection("test")
+	require.NoError(t, err)
+	_, err = conn.Exec(`CREATE TABLE docs (id INTEGER PRIMARY KEY, embed BLOB)`)
+	require.NoError(t, err)
+
+	meta := common.VectorIndexMeta{
+		IndexName:           "embeddings",
+		TableName:           "docs",
+		ColumnName:          "embed",
+		Database:            "test",
+		Metric:              "cosine",
+		Dim:                 4,
+		TargetPartitionSize: 4,
+		CreatedAt:           time.Now().UnixNano(),
+	}
+	require.NoError(t, vecMgr.CreateIndex(context.Background(), meta))
+
+	const rows = 300
+	mirrorRows := make([]overlayMirrorRow, 0, rows)
+	for i := 0; i < rows; i++ {
+		group := i / 4
+		vec := []float32{
+			1,
+			float32(group % 19),
+			float32((group / 19) % 17),
+			float32(i % 4),
+		}
+		_, err := conn.Exec(`INSERT INTO docs (id, embed) VALUES (?, ?)`, i+1, encodeVec(t, vec))
+		require.NoError(t, err)
+		mirrorRows = append(mirrorRows, overlayMirrorRow{rowID: int64(i + 1), vec: vec})
+	}
+	mirrorRowsToOverlay(t, hook, meta, mirrorRows)
+
+	var state *vecindex.IndexState
+	require.Eventually(t, func() bool {
+		var ok bool
+		state, ok = engine.Lookup(meta.IndexName)
+		if ok && state.ProbeVersion() > 0 && state.LoadSegmentStore() != nil {
+			hook.stopMaintenanceWatcher(meta.IndexName)
+			return true
+		}
+		return false
+	}, 30*time.Second, 100*time.Millisecond)
+
+	initialGeneration := state.LoadSegmentStore().Data.Generation()
+	ranCatchUp := false
+	if state.Spec().Nlist < desiredClusterCount(rows, meta.TargetPartitionSize) {
+		require.NotZero(t, state.LoadOverlay().Snapshot().Len())
+		refreshedMeta, err := loadIndexMetaByName(context.Background(), conn, meta.IndexName)
+		require.NoError(t, err)
+		dbPath, err := dbMgr.GetDatabasePath("test")
+		require.NoError(t, err)
+		require.NoError(t, hook.runCatchUpRebuild(context.Background(), conn, dbPath, *refreshedMeta, state.Spec(), state))
+		ranCatchUp = true
+	}
+
+	state, _ = engine.Lookup(meta.IndexName)
+	require.Equal(t, desiredClusterCount(rows, meta.TargetPartitionSize), state.Spec().Nlist)
+	if ranCatchUp {
+		require.Greater(t, state.LoadSegmentStore().Data.Generation(), initialGeneration)
+	}
+	require.Equal(t, uint64(rows), state.LoadSegmentStore().Data.RowCount())
+	require.Equal(t, uint64(rows), state.LoadSegmentStore().AppliedOverlaySeq)
+	require.Zero(t, state.LoadOverlay().Snapshot().Len())
+
+	loc, ok, err := state.LoadSegmentStore().RowMap.Lookup(rows)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Greater(t, loc.ClusterID, int64(0))
 }
 
 func TestIncrementalMerge_PreservesOverlayTailAcrossPublish(t *testing.T) {
@@ -308,7 +409,7 @@ func TestIncrementalMerge_PreservesOverlayTailAcrossPublish(t *testing.T) {
 	require.NoError(t, hook.publishIncrementalMerge(dbPath, meta, plan))
 
 	state, _ = engine.Lookup(meta.IndexName)
-	require.Equal(t, oldEpoch+1, state.ProbeVersion())
+	require.Equal(t, oldEpoch, state.ProbeVersion())
 	require.Equal(t, oldEpoch, plan.currentEpoch)
 
 	overlay := state.LoadOverlay()
@@ -316,22 +417,18 @@ func TestIncrementalMerge_PreservesOverlayTailAcrossPublish(t *testing.T) {
 	snapshot := overlay.Snapshot()
 	require.NotNil(t, snapshot)
 	require.Equal(t, state.ProbeVersion(), snapshot.Epoch())
-	require.Equal(t, 1, snapshot.Len())
-	clusterID, ok := snapshot.RowCluster(int64(bootstrapRows + 2))
+	backlogRows, _, _ := snapshot.BacklogStats(state.LoadSegmentStore().AppliedOverlaySeq)
+	require.Equal(t, 1, backlogRows)
+	clusterID, ok := snapshot.RowClusterAfter(int64(bootstrapRows+2), state.LoadSegmentStore().AppliedOverlaySeq)
 	require.True(t, ok)
 	require.Greater(t, clusterID, int64(0))
+	_, ok = snapshot.RowClusterAfter(int64(bootstrapRows+1), state.LoadSegmentStore().AppliedOverlaySeq)
+	require.False(t, ok)
 
 	loc, ok, err := state.LoadSegmentStore().RowMap.Lookup(int64(bootstrapRows + 1))
 	require.NoError(t, err)
 	require.True(t, ok)
 	require.Greater(t, loc.ClusterID, int64(0))
-
-	liveCounts := state.LoadMaintenanceState().LiveClusterRowCounts()
-	var tracked uint64
-	for clusterID := 1; clusterID < len(liveCounts); clusterID++ {
-		tracked += liveCounts[clusterID]
-	}
-	require.Equal(t, uint64(bootstrapRows+2), tracked)
 }
 
 func TestIncrementalPromotion_PublishesLargerClusterLayout(t *testing.T) {

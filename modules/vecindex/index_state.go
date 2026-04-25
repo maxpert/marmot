@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"slices"
+	"sync"
 	"sync/atomic"
 
 	"github.com/maxpert/marmot/modules/vecindex/pkg/kmeans"
@@ -26,6 +27,9 @@ type IndexState struct {
 	maintenance  atomic.Pointer[MaintenanceState]
 	readers      atomic.Int64
 	retired      atomic.Bool
+	closeOnce    sync.Once
+	closeMu      sync.Mutex
+	closeHooks   []func()
 	clusterHits  []atomic.Uint64
 }
 
@@ -85,9 +89,29 @@ func (s *IndexState) Retire() {
 	}
 }
 
+// AddRetireCallback registers fn to run after all readers have released and
+// file-backed serving resources have been closed.
+func (s *IndexState) AddRetireCallback(fn func()) {
+	if s == nil || fn == nil {
+		return
+	}
+	s.closeMu.Lock()
+	s.closeHooks = append(s.closeHooks, fn)
+	s.closeMu.Unlock()
+}
+
 func (s *IndexState) closeServingResources() {
-	s.ClearOverlay()
-	s.ClearSegmentStore()
+	s.closeOnce.Do(func() {
+		s.ClearOverlay()
+		s.ClearSegmentStore()
+		s.closeMu.Lock()
+		hooks := append([]func(){}, s.closeHooks...)
+		s.closeHooks = nil
+		s.closeMu.Unlock()
+		for _, hook := range hooks {
+			hook()
+		}
+	})
 }
 
 // ProbeState returns the current probe centroid set. Nil when no centroids

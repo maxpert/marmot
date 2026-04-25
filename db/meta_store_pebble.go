@@ -1056,7 +1056,15 @@ func (s *PebbleMetaStore) DeleteIntent(tableName, intentKey string, txnID uint64
 }
 
 // DeleteIntentsByTxn removes all write intents for a transaction
-func (s *PebbleMetaStore) DeleteIntentsByTxn(txnID uint64) error {
+func (s *PebbleMetaStore) DeleteIntentsByTxn(txnID uint64) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("pebble metastore delete intents by txn: %v", recovered)
+		}
+	}()
+	if s == nil || s.closed.Load() {
+		return fmt.Errorf("pebble metastore closed")
+	}
 	prefix := pebbleIntentByTxnPrefix(txnID)
 
 	// Release all row locks for this transaction
@@ -1568,7 +1576,15 @@ func (s *PebbleMetaStore) GetIntentEntries(txnID uint64) ([]*IntentEntry, error)
 }
 
 // DeleteIntentEntries deletes CDC intent entries for a transaction
-func (s *PebbleMetaStore) DeleteIntentEntries(txnID uint64) error {
+func (s *PebbleMetaStore) DeleteIntentEntries(txnID uint64) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("pebble metastore delete intent entries: %v", recovered)
+		}
+	}()
+	if s == nil || s.closed.Load() {
+		return fmt.Errorf("pebble metastore closed")
+	}
 	prefix := pebbleCdcRawPrefix(txnID)
 	var keys [][]byte
 

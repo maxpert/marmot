@@ -2,6 +2,7 @@ package vecindex
 
 import (
 	"bufio"
+	"container/list"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -19,9 +20,138 @@ const (
 	overlayJournalVersion     = uint32(2)
 	overlayJournalHeaderSize  = 28
 	overlayJournalRecordFloor = 1 + 8 + 8 + 8 + 8 + 8 + 4
+	overlayVecCacheBytes      = 64 << 20
 )
 
 var overlayJournalCRCTable = crc32.MakeTable(crc32.Castagnoli)
+
+type overlayVecRef struct {
+	offset int64
+	length int
+	inline []byte
+}
+
+func inlineOverlayVecRef(vec []byte) overlayVecRef {
+	if len(vec) == 0 {
+		return overlayVecRef{}
+	}
+	return overlayVecRef{length: len(vec), inline: append([]byte(nil), vec...)}
+}
+
+func journalOverlayVecRef(offset int64, length int) overlayVecRef {
+	if length <= 0 {
+		return overlayVecRef{}
+	}
+	return overlayVecRef{offset: offset, length: length}
+}
+
+type overlayVecKey struct {
+	sequence uint64
+	rowID    int64
+}
+
+type overlayVecReader struct {
+	file  *os.File
+	cache *overlayVecCache
+}
+
+func newOverlayVecReader(file *os.File) *overlayVecReader {
+	if file == nil {
+		return nil
+	}
+	return &overlayVecReader{file: file, cache: newOverlayVecCache(overlayVecCacheBytes)}
+}
+
+func (r *overlayVecReader) read(ref overlayVecRef, key overlayVecKey) ([]byte, error) {
+	if len(ref.inline) > 0 {
+		return ref.inline, nil
+	}
+	if ref.length == 0 {
+		return nil, nil
+	}
+	if r == nil || r.file == nil || ref.offset <= 0 {
+		return nil, fmt.Errorf("vecindex: overlay vector ref is not readable")
+	}
+	if r.cache != nil {
+		if vec, ok := r.cache.Get(key); ok {
+			return vec, nil
+		}
+	}
+	vec := make([]byte, ref.length)
+	if _, err := r.file.ReadAt(vec, ref.offset); err != nil {
+		return nil, err
+	}
+	if r.cache != nil {
+		r.cache.Put(key, vec)
+	}
+	return vec, nil
+}
+
+type overlayVecCache struct {
+	mu       sync.Mutex
+	maxBytes int64
+	bytes    int64
+	ll       *list.List
+	items    map[overlayVecKey]*list.Element
+}
+
+type overlayVecCacheEntry struct {
+	key overlayVecKey
+	vec []byte
+}
+
+func newOverlayVecCache(maxBytes int64) *overlayVecCache {
+	if maxBytes <= 0 {
+		return nil
+	}
+	return &overlayVecCache{
+		maxBytes: maxBytes,
+		ll:       list.New(),
+		items:    make(map[overlayVecKey]*list.Element),
+	}
+}
+
+func (c *overlayVecCache) Get(key overlayVecKey) ([]byte, bool) {
+	if c == nil {
+		return nil, false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	elem, ok := c.items[key]
+	if !ok {
+		return nil, false
+	}
+	c.ll.MoveToFront(elem)
+	return elem.Value.(*overlayVecCacheEntry).vec, true
+}
+
+func (c *overlayVecCache) Put(key overlayVecKey, vec []byte) {
+	if c == nil || len(vec) == 0 || int64(len(vec)) > c.maxBytes {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if elem, ok := c.items[key]; ok {
+		entry := elem.Value.(*overlayVecCacheEntry)
+		c.bytes += int64(len(vec) - len(entry.vec))
+		entry.vec = vec
+		c.ll.MoveToFront(elem)
+	} else {
+		entry := &overlayVecCacheEntry{key: key, vec: vec}
+		c.items[key] = c.ll.PushFront(entry)
+		c.bytes += int64(len(vec))
+	}
+	for c.bytes > c.maxBytes {
+		elem := c.ll.Back()
+		if elem == nil {
+			break
+		}
+		entry := elem.Value.(*overlayVecCacheEntry)
+		delete(c.items, entry.key)
+		c.bytes -= int64(len(entry.vec))
+		c.ll.Remove(elem)
+	}
+}
 
 type OverlayMutationKind uint8
 
@@ -52,6 +182,7 @@ type OverlayMutation struct {
 type OverlaySnapshot struct {
 	epoch        uint64
 	lastSequence uint64
+	reader       *overlayVecReader
 	byCluster    map[int64]map[int64]overlayRow
 	rowCluster   map[int64]int64
 	tombstones   map[int64]overlayTombstone
@@ -60,7 +191,7 @@ type OverlaySnapshot struct {
 type overlayRow struct {
 	sequence          uint64
 	appliedAtUnixNano int64
-	vec               []byte
+	vec               overlayVecRef
 }
 
 type overlayTombstone struct {
@@ -74,13 +205,18 @@ type overlayMutationRef struct {
 	clusterID         int64
 	rowID             int64
 	appliedAtUnixNano int64
-	vec               []byte
+	vec               overlayVecRef
 }
 
 func newOverlaySnapshot(epoch, lastSequence uint64) *OverlaySnapshot {
+	return newOverlaySnapshotWithReader(epoch, lastSequence, nil)
+}
+
+func newOverlaySnapshotWithReader(epoch, lastSequence uint64, reader *overlayVecReader) *OverlaySnapshot {
 	return &OverlaySnapshot{
 		epoch:        epoch,
 		lastSequence: lastSequence,
+		reader:       reader,
 		byCluster:    make(map[int64]map[int64]overlayRow),
 		rowCluster:   make(map[int64]int64),
 		tombstones:   make(map[int64]overlayTombstone),
@@ -165,7 +301,32 @@ func (s *OverlaySnapshot) VisitClusterAfter(clusterID int64, minSequence uint64,
 		if row.sequence <= minSequence {
 			continue
 		}
-		if !visit(rowID, row.vec) {
+		vec, err := s.readRowVec(rowID, row)
+		if err != nil {
+			return
+		}
+		if !visit(rowID, vec) {
+			return
+		}
+	}
+}
+
+func (s *OverlaySnapshot) VisitClusterRange(clusterID int64, minSequence uint64, maxSequence uint64, visit func(rowID int64, vec []byte) bool) {
+	if s == nil || visit == nil {
+		return
+	}
+	for rowID, row := range s.byCluster[clusterID] {
+		if row.sequence <= minSequence {
+			continue
+		}
+		if maxSequence > 0 && row.sequence > maxSequence {
+			continue
+		}
+		vec, err := s.readRowVec(rowID, row)
+		if err != nil {
+			return
+		}
+		if !visit(rowID, vec) {
 			return
 		}
 	}
@@ -199,7 +360,11 @@ func (s *OverlaySnapshot) VisitAllAfter(minSequence uint64, visit func(clusterID
 			if row.sequence <= minSequence {
 				continue
 			}
-			if !visit(clusterID, rowID, row.vec) {
+			vec, err := s.readRowVec(rowID, row)
+			if err != nil {
+				return
+			}
+			if !visit(clusterID, rowID, vec) {
 				return
 			}
 		}
@@ -216,7 +381,7 @@ func (s *OverlaySnapshot) BacklogStats(minSequence uint64) (rows int, bytes int6
 				continue
 			}
 			rows++
-			bytes += int64(len(row.vec))
+			bytes += int64(row.vec.length)
 			if oldestUnixNano == 0 || row.appliedAtUnixNano < oldestUnixNano {
 				oldestUnixNano = row.appliedAtUnixNano
 			}
@@ -239,6 +404,37 @@ func (s *OverlaySnapshot) BacklogStats(minSequence uint64) (rows int, bytes int6
 	return rows, bytes, oldestUnixNano
 }
 
+func (s *OverlaySnapshot) NewestUnixNanoAfter(minSequence uint64) int64 {
+	if s == nil {
+		return 0
+	}
+	var newest int64
+	for _, clusterRows := range s.byCluster {
+		for _, row := range clusterRows {
+			if row.sequence <= minSequence {
+				continue
+			}
+			if row.appliedAtUnixNano > newest {
+				newest = row.appliedAtUnixNano
+			}
+		}
+	}
+	for rowID, tombstone := range s.tombstones {
+		if tombstone.sequence <= minSequence {
+			continue
+		}
+		if clusterID, ok := s.rowCluster[rowID]; ok {
+			if row, ok := s.byCluster[clusterID][rowID]; ok && row.sequence == tombstone.sequence {
+				continue
+			}
+		}
+		if tombstone.appliedAtUnixNano > newest {
+			newest = tombstone.appliedAtUnixNano
+		}
+	}
+	return newest
+}
+
 func (s *OverlaySnapshot) MutationsAfter(minSequence uint64) []OverlayMutation {
 	if s == nil {
 		return nil
@@ -247,6 +443,10 @@ func (s *OverlaySnapshot) MutationsAfter(minSequence uint64) []OverlayMutation {
 	for clusterID, rows := range s.byCluster {
 		for rowID, row := range rows {
 			if row.sequence <= minSequence {
+				continue
+			}
+			vec, err := s.readRowVec(rowID, row)
+			if err != nil {
 				continue
 			}
 			kind := OverlayMutationUpsert
@@ -260,7 +460,7 @@ func (s *OverlaySnapshot) MutationsAfter(minSequence uint64) []OverlayMutation {
 				ClusterID:         clusterID,
 				RowID:             rowID,
 				AppliedAtUnixNano: row.appliedAtUnixNano,
-				Vec:               append([]byte(nil), row.vec...),
+				Vec:               append([]byte(nil), vec...),
 			})
 		}
 	}
@@ -299,6 +499,94 @@ func (s *OverlaySnapshot) MutationsAfter(minSequence uint64) []OverlayMutation {
 func (s *OverlaySnapshot) VisitMutationsAfter(minSequence uint64, visit func(OverlayMutation) bool) {
 	if s == nil || visit == nil {
 		return
+	}
+	for _, ref := range s.mutationRefsAfter(minSequence) {
+		vec, err := s.readVec(ref.vec, ref.sequence, ref.rowID)
+		if err != nil {
+			return
+		}
+		if !visit(OverlayMutation{
+			Kind:              ref.kind,
+			Epoch:             s.epoch,
+			Sequence:          ref.sequence,
+			ClusterID:         ref.clusterID,
+			RowID:             ref.rowID,
+			AppliedAtUnixNano: ref.appliedAtUnixNano,
+			Vec:               vec,
+		}) {
+			return
+		}
+	}
+}
+
+func (s *OverlaySnapshot) VisitMutationHeadersAfter(minSequence uint64, visit func(OverlayMutation) bool) {
+	if s == nil || visit == nil {
+		return
+	}
+	for _, ref := range s.mutationRefsAfter(minSequence) {
+		if !visit(OverlayMutation{
+			Kind:              ref.kind,
+			Epoch:             s.epoch,
+			Sequence:          ref.sequence,
+			ClusterID:         ref.clusterID,
+			RowID:             ref.rowID,
+			AppliedAtUnixNano: ref.appliedAtUnixNano,
+		}) {
+			return
+		}
+	}
+}
+
+// VisitMutationHeadersAfterUnordered visits mutation headers without building a
+// sorted intermediate slice. Use it for maintenance accounting where sequence
+// order is not required.
+func (s *OverlaySnapshot) VisitMutationHeadersAfterUnordered(minSequence uint64, visit func(OverlayMutation) bool) {
+	if s == nil || visit == nil {
+		return
+	}
+	for clusterID, rows := range s.byCluster {
+		for rowID, row := range rows {
+			if row.sequence <= minSequence {
+				continue
+			}
+			kind := OverlayMutationUpsert
+			if tombstone, ok := s.tombstones[rowID]; ok && tombstone.sequence == row.sequence {
+				kind = OverlayMutationReplace
+			}
+			if !visit(OverlayMutation{
+				Kind:              kind,
+				Epoch:             s.epoch,
+				Sequence:          row.sequence,
+				ClusterID:         clusterID,
+				RowID:             rowID,
+				AppliedAtUnixNano: row.appliedAtUnixNano,
+			}) {
+				return
+			}
+		}
+	}
+	for rowID, tombstone := range s.tombstones {
+		if tombstone.sequence <= minSequence {
+			continue
+		}
+		if _, ok := s.rowCluster[rowID]; ok {
+			continue
+		}
+		if !visit(OverlayMutation{
+			Kind:              OverlayMutationDelete,
+			Epoch:             s.epoch,
+			Sequence:          tombstone.sequence,
+			RowID:             rowID,
+			AppliedAtUnixNano: tombstone.appliedAtUnixNano,
+		}) {
+			return
+		}
+	}
+}
+
+func (s *OverlaySnapshot) mutationRefsAfter(minSequence uint64) []overlayMutationRef {
+	if s == nil {
+		return nil
 	}
 	refs := make([]overlayMutationRef, 0, len(s.rowCluster)+len(s.tombstones))
 	for clusterID, rows := range s.byCluster {
@@ -348,19 +636,40 @@ func (s *OverlaySnapshot) VisitMutationsAfter(minSequence uint64, visit func(Ove
 			return 0
 		}
 	})
-	for _, ref := range refs {
-		if !visit(OverlayMutation{
-			Kind:              ref.kind,
-			Epoch:             s.epoch,
-			Sequence:          ref.sequence,
-			ClusterID:         ref.clusterID,
-			RowID:             ref.rowID,
-			AppliedAtUnixNano: ref.appliedAtUnixNano,
-			Vec:               ref.vec,
-		}) {
-			return
-		}
+	return refs
+}
+
+// ReadVec returns the current overlay vector bytes for rowID.
+func (s *OverlaySnapshot) ReadVec(rowID int64) ([]byte, error) {
+	if s == nil {
+		return nil, fmt.Errorf("vecindex: overlay snapshot is nil")
 	}
+	clusterID, ok := s.rowCluster[rowID]
+	if !ok {
+		return nil, fmt.Errorf("vecindex: overlay rowid %d not found", rowID)
+	}
+	row, ok := s.byCluster[clusterID][rowID]
+	if !ok {
+		return nil, fmt.Errorf("vecindex: overlay rowid %d missing cluster row", rowID)
+	}
+	return s.readRowVec(rowID, row)
+}
+
+func (s *OverlaySnapshot) readRowVec(rowID int64, row overlayRow) ([]byte, error) {
+	return s.readVec(row.vec, row.sequence, rowID)
+}
+
+func (s *OverlaySnapshot) readVec(ref overlayVecRef, sequence uint64, rowID int64) ([]byte, error) {
+	if ref.length == 0 {
+		return nil, nil
+	}
+	if len(ref.inline) > 0 {
+		return ref.inline, nil
+	}
+	if s == nil || s.reader == nil {
+		return nil, fmt.Errorf("vecindex: overlay vector rowid %d has no reader", rowID)
+	}
+	return s.reader.read(ref, overlayVecKey{sequence: sequence, rowID: rowID})
 }
 
 func (s *OverlaySnapshot) clone() *OverlaySnapshot {
@@ -370,6 +679,7 @@ func (s *OverlaySnapshot) clone() *OverlaySnapshot {
 	next := &OverlaySnapshot{
 		epoch:        s.epoch,
 		lastSequence: s.lastSequence,
+		reader:       s.reader,
 		byCluster:    make(map[int64]map[int64]overlayRow, len(s.byCluster)),
 		rowCluster:   make(map[int64]int64, len(s.rowCluster)),
 		tombstones:   make(map[int64]overlayTombstone, len(s.tombstones)),
@@ -398,21 +708,38 @@ func (s *OverlaySnapshot) applyBatch(mutations []OverlayMutation) (*OverlaySnaps
 	if len(mutations) == 0 {
 		return s, nil
 	}
+	refs := make([]overlayVecRef, len(mutations))
+	for i, mutation := range mutations {
+		refs[i] = inlineOverlayVecRef(mutation.Vec)
+	}
+	return s.applyBatchRefs(mutations, refs, nil)
+}
+
+func (s *OverlaySnapshot) applyBatchRefs(mutations []OverlayMutation, refs []overlayVecRef, reader *overlayVecReader) (*OverlaySnapshot, error) {
+	if len(mutations) == 0 {
+		return s, nil
+	}
+	if len(refs) != len(mutations) {
+		return nil, fmt.Errorf("overlay mutation refs length mismatch")
+	}
 
 	current := s
 	if current == nil {
-		current = newOverlaySnapshot(0, 0)
+		current = newOverlaySnapshotWithReader(0, 0, reader)
 	}
 	next := current.clone()
+	if reader != nil {
+		next.reader = reader
+	}
 	for i, mutation := range mutations {
-		if err := validateOverlayMutation(mutation); err != nil {
+		if err := validateOverlayMutationRef(mutation, refs[i]); err != nil {
 			return nil, fmt.Errorf("overlay mutation %d: %w", i, err)
 		}
 		if mutation.Epoch < next.epoch {
 			return nil, fmt.Errorf("overlay mutation %d: epoch %d regresses from %d", i, mutation.Epoch, next.epoch)
 		}
 		if mutation.Epoch > next.epoch {
-			next = newOverlaySnapshot(mutation.Epoch, 0)
+			next = newOverlaySnapshotWithReader(mutation.Epoch, 0, reader)
 		}
 		if mutation.Sequence <= next.lastSequence {
 			return nil, fmt.Errorf("overlay mutation %d: sequence %d must be greater than %d", i, mutation.Sequence, next.lastSequence)
@@ -426,7 +753,7 @@ func (s *OverlaySnapshot) applyBatch(mutations []OverlayMutation) (*OverlaySnaps
 				return nil, fmt.Errorf("overlay mutation %d: sequence %d must be strictly increasing", i, mutation.Sequence)
 			}
 		}
-		next.applyMutation(mutation)
+		next.applyMutationRef(mutation, refs[i])
 		next.lastSequence = mutation.Sequence
 		next.epoch = mutation.Epoch
 	}
@@ -434,18 +761,22 @@ func (s *OverlaySnapshot) applyBatch(mutations []OverlayMutation) (*OverlaySnaps
 }
 
 func (s *OverlaySnapshot) applyMutation(mutation OverlayMutation) {
+	s.applyMutationRef(mutation, inlineOverlayVecRef(mutation.Vec))
+}
+
+func (s *OverlaySnapshot) applyMutationRef(mutation OverlayMutation, ref overlayVecRef) {
 	switch mutation.Kind {
 	case OverlayMutationUpsert:
 		s.removeRow(mutation.RowID)
 		delete(s.tombstones, mutation.RowID)
-		s.upsertRow(mutation.ClusterID, mutation.RowID, mutation.Sequence, mutation.AppliedAtUnixNano, mutation.Vec)
+		s.upsertRow(mutation.ClusterID, mutation.RowID, mutation.Sequence, mutation.AppliedAtUnixNano, ref)
 	case OverlayMutationReplace:
 		s.removeRow(mutation.RowID)
 		s.tombstones[mutation.RowID] = overlayTombstone{
 			sequence:          mutation.Sequence,
 			appliedAtUnixNano: mutation.AppliedAtUnixNano,
 		}
-		s.upsertRow(mutation.ClusterID, mutation.RowID, mutation.Sequence, mutation.AppliedAtUnixNano, mutation.Vec)
+		s.upsertRow(mutation.ClusterID, mutation.RowID, mutation.Sequence, mutation.AppliedAtUnixNano, ref)
 	case OverlayMutationDelete:
 		s.removeRow(mutation.RowID)
 		s.tombstones[mutation.RowID] = overlayTombstone{
@@ -469,7 +800,7 @@ func (s *OverlaySnapshot) removeRow(rowID int64) {
 	delete(s.rowCluster, rowID)
 }
 
-func (s *OverlaySnapshot) upsertRow(clusterID, rowID int64, sequence uint64, appliedAtUnixNano int64, vec []byte) {
+func (s *OverlaySnapshot) upsertRow(clusterID, rowID int64, sequence uint64, appliedAtUnixNano int64, vec overlayVecRef) {
 	rows := s.byCluster[clusterID]
 	if rows == nil {
 		rows = make(map[int64]overlayRow)
@@ -484,6 +815,10 @@ func (s *OverlaySnapshot) upsertRow(clusterID, rowID int64, sequence uint64, app
 }
 
 func validateOverlayMutation(mutation OverlayMutation) error {
+	return validateOverlayMutationRef(mutation, inlineOverlayVecRef(mutation.Vec))
+}
+
+func validateOverlayMutationRef(mutation OverlayMutation, ref overlayVecRef) error {
 	if mutation.Sequence == 0 {
 		return fmt.Errorf("sequence must be > 0")
 	}
@@ -495,11 +830,11 @@ func validateOverlayMutation(mutation OverlayMutation) error {
 	}
 	switch mutation.Kind {
 	case OverlayMutationUpsert, OverlayMutationReplace:
-		if len(mutation.Vec) == 0 {
+		if ref.length == 0 {
 			return fmt.Errorf("vec must be non-empty for kind %d", mutation.Kind)
 		}
 	case OverlayMutationDelete:
-		if len(mutation.Vec) != 0 {
+		if ref.length != 0 {
 			return fmt.Errorf("delete mutation must not carry vec bytes")
 		}
 	default:
@@ -570,6 +905,7 @@ func (b *OverlayBuffer) Reset(epoch uint64) {
 type OverlayJournal struct {
 	path         string
 	file         *os.File
+	reader       *overlayVecReader
 	mu           sync.Mutex
 	currentEpoch uint64
 	lastSequence uint64
@@ -585,7 +921,8 @@ func OpenOverlayJournal(path string) (*OverlayJournal, error) {
 	if err != nil {
 		return nil, err
 	}
-	snapshot, validEnd, err := replayOverlayJournalFile(file)
+	reader := newOverlayVecReader(file)
+	snapshot, validEnd, err := replayOverlayJournalFile(file, reader)
 	if err != nil {
 		file.Close()
 		return nil, err
@@ -601,6 +938,7 @@ func OpenOverlayJournal(path string) (*OverlayJournal, error) {
 	return &OverlayJournal{
 		path:         path,
 		file:         file,
+		reader:       reader,
 		currentEpoch: snapshot.Epoch(),
 		lastSequence: snapshot.LastSequence(),
 	}, nil
@@ -618,8 +956,9 @@ func OpenOverlayJournalForRewrite(path string) (*OverlayJournal, error) {
 		return nil, err
 	}
 	return &OverlayJournal{
-		path: path,
-		file: file,
+		path:   path,
+		file:   file,
+		reader: newOverlayVecReader(file),
 	}, nil
 }
 
@@ -630,7 +969,8 @@ func (j *OverlayJournal) Replay() (*OverlaySnapshot, error) {
 	}
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	snapshot, validEnd, err := replayOverlayJournalFile(j.file)
+	j.reader = newOverlayVecReader(j.file)
+	snapshot, validEnd, err := replayOverlayJournalFile(j.file, j.reader)
 	if err != nil {
 		return nil, err
 	}
@@ -648,30 +988,34 @@ func (j *OverlayJournal) Replay() (*OverlaySnapshot, error) {
 // AppendBatch appends committed overlay mutations atomically and fsyncs once
 // per batch so replay after a crash sees either the full batch or none of the
 // torn tail.
-func (j *OverlayJournal) AppendBatch(mutations []OverlayMutation) error {
+func (j *OverlayJournal) AppendBatch(mutations []OverlayMutation) ([]overlayVecRef, error) {
 	if j == nil {
-		return fmt.Errorf("vecindex: overlay journal is nil")
+		return nil, fmt.Errorf("vecindex: overlay journal is nil")
 	}
 	if len(mutations) == 0 {
-		return nil
+		return nil, nil
 	}
 	j.mu.Lock()
 	defer j.mu.Unlock()
 
-	writer := bufio.NewWriterSize(j.file, 256<<10)
-	epoch, lastSequence, err := writeOverlayJournalBatch(writer, j.currentEpoch, j.lastSequence, mutations)
+	startOffset, err := j.file.Seek(0, io.SeekCurrent)
 	if err != nil {
-		return err
+		return nil, err
+	}
+	writer := bufio.NewWriterSize(j.file, 256<<10)
+	epoch, lastSequence, refs, err := writeOverlayJournalBatch(writer, startOffset, j.currentEpoch, j.lastSequence, mutations)
+	if err != nil {
+		return nil, err
 	}
 	if err := writer.Flush(); err != nil {
-		return err
+		return nil, err
 	}
 	if err := j.file.Sync(); err != nil {
-		return err
+		return nil, err
 	}
 	j.currentEpoch = epoch
 	j.lastSequence = lastSequence
-	return nil
+	return refs, nil
 }
 
 // Reset compacts the journal to an empty state for epoch.
@@ -718,6 +1062,7 @@ func (j *OverlayJournal) Reset(epoch uint64) error {
 		return err
 	}
 	j.file = file
+	j.reader = newOverlayVecReader(file)
 	j.currentEpoch = epoch
 	j.lastSequence = 0
 	return nil
@@ -731,9 +1076,9 @@ func (j *OverlayJournal) Close() error {
 	return j.file.Close()
 }
 
-func (j *OverlayJournal) Rewrite(epoch uint64, lastSequence uint64, mutations []OverlayMutation) error {
+func (j *OverlayJournal) Rewrite(epoch uint64, lastSequence uint64, mutations []OverlayMutation) ([]overlayVecRef, error) {
 	if j == nil {
-		return fmt.Errorf("vecindex: overlay journal is nil")
+		return nil, fmt.Errorf("vecindex: overlay journal is nil")
 	}
 	j.mu.Lock()
 	defer j.mu.Unlock()
@@ -741,69 +1086,81 @@ func (j *OverlayJournal) Rewrite(epoch uint64, lastSequence uint64, mutations []
 	tmpPath := j.path + ".tmp"
 	tmp, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if err := writeOverlayJournalHeader(tmp, epoch, lastSequence); err != nil {
 		tmp.Close()
 		_ = os.Remove(tmpPath)
-		return err
+		return nil, err
 	}
 	currentEpoch := epoch
 	currentSequence := lastSequence
+	var refs []overlayVecRef
 	if len(mutations) > 0 {
 		writer := bufio.NewWriterSize(tmp, 256<<10)
-		_, rewrittenLastSequence, err := writeOverlayJournalBatch(writer, epoch, 0, mutations)
+		startOffset, err := tmp.Seek(0, io.SeekCurrent)
 		if err != nil {
 			tmp.Close()
 			_ = os.Remove(tmpPath)
-			return err
+			return nil, err
+		}
+		_, rewrittenLastSequence, rewrittenRefs, err := writeOverlayJournalBatch(writer, startOffset, epoch, 0, mutations)
+		if err != nil {
+			tmp.Close()
+			_ = os.Remove(tmpPath)
+			return nil, err
 		}
 		if err := writer.Flush(); err != nil {
 			tmp.Close()
 			_ = os.Remove(tmpPath)
-			return err
+			return nil, err
 		}
 		currentEpoch = mutations[len(mutations)-1].Epoch
 		currentSequence = rewrittenLastSequence
+		refs = rewrittenRefs
 	}
 	if err := tmp.Sync(); err != nil {
 		tmp.Close()
 		_ = os.Remove(tmpPath)
-		return err
+		return nil, err
 	}
 	if err := tmp.Close(); err != nil {
 		_ = os.Remove(tmpPath)
-		return err
+		return nil, err
 	}
 	if err := j.file.Close(); err != nil {
 		_ = os.Remove(tmpPath)
-		return err
+		return nil, err
 	}
 	if err := os.Rename(tmpPath, j.path); err != nil {
 		_ = os.Remove(tmpPath)
-		return err
+		return nil, err
 	}
 	file, err := os.OpenFile(j.path, os.O_RDWR, 0o644)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	end := int64(overlayJournalHeaderSize)
 	if len(mutations) > 0 {
 		info, err := file.Stat()
 		if err != nil {
 			file.Close()
-			return err
+			return nil, err
 		}
 		end = info.Size()
 	}
 	if _, err := file.Seek(end, io.SeekStart); err != nil {
 		file.Close()
-		return err
+		return nil, err
 	}
 	j.file = file
+	j.reader = newOverlayVecReader(file)
 	j.currentEpoch = currentEpoch
 	j.lastSequence = currentSequence
-	return nil
+	for i := range refs {
+		refs[i].inline = nil
+	}
+	return refs, nil
 }
 
 // JournaledOverlay couples a crash-safe local journal with an in-memory
@@ -843,7 +1200,7 @@ func OpenJournaledOverlayForRewrite(path string) (*JournaledOverlay, error) {
 		return nil, err
 	}
 	buffer := NewOverlayBuffer()
-	buffer.StoreSnapshot(newOverlaySnapshot(0, 0))
+	buffer.StoreSnapshot(newOverlaySnapshotWithReader(0, 0, journal.reader))
 	return &JournaledOverlay{
 		journal: journal,
 		buffer:  buffer,
@@ -867,11 +1224,12 @@ func (o *JournaledOverlay) ApplyCommittedBatch(mutations []OverlayMutation) erro
 	if len(mutations) == 0 {
 		return nil
 	}
-	next, err := o.buffer.Snapshot().applyBatch(mutations)
+	refs, err := o.journal.AppendBatch(mutations)
 	if err != nil {
 		return err
 	}
-	if err := o.journal.AppendBatch(mutations); err != nil {
+	next, err := o.buffer.Snapshot().applyBatchRefs(mutations, refs, o.journal.reader)
+	if err != nil {
 		return err
 	}
 	o.buffer.StoreSnapshot(next)
@@ -886,7 +1244,7 @@ func (o *JournaledOverlay) Reset(epoch uint64) error {
 	if err := o.journal.Reset(epoch); err != nil {
 		return err
 	}
-	o.buffer.Reset(epoch)
+	o.buffer.StoreSnapshot(newOverlaySnapshotWithReader(epoch, 0, o.journal.reader))
 	return nil
 }
 
@@ -903,16 +1261,16 @@ func (o *JournaledOverlay) CompactAfter(minSequence uint64) error {
 		mutations = append(mutations, mutation)
 		return true
 	})
-	next := newOverlaySnapshot(current.Epoch(), current.LastSequence())
+	refs, err := o.journal.Rewrite(current.Epoch(), current.LastSequence(), mutations)
+	if err != nil {
+		return err
+	}
+	next := newOverlaySnapshotWithReader(current.Epoch(), current.LastSequence(), o.journal.reader)
 	if len(mutations) > 0 {
-		var err error
-		next, err = newOverlaySnapshot(current.Epoch(), minSequence).applyBatch(mutations)
+		next, err = newOverlaySnapshotWithReader(current.Epoch(), minSequence, o.journal.reader).applyBatchRefs(mutations, refs, o.journal.reader)
 		if err != nil {
 			return err
 		}
-	}
-	if err := o.journal.Rewrite(current.Epoch(), current.LastSequence(), mutations); err != nil {
-		return err
 	}
 	o.buffer.StoreSnapshot(next)
 	return nil
@@ -922,16 +1280,16 @@ func (o *JournaledOverlay) Rewrite(epoch uint64, minSequence uint64, mutations [
 	if o == nil || o.journal == nil || o.buffer == nil {
 		return fmt.Errorf("vecindex: journaled overlay is not initialized")
 	}
-	next := newOverlaySnapshot(epoch, minSequence)
+	refs, err := o.journal.Rewrite(epoch, minSequence, mutations)
+	if err != nil {
+		return err
+	}
+	next := newOverlaySnapshotWithReader(epoch, minSequence, o.journal.reader)
 	if len(mutations) > 0 {
-		var err error
-		next, err = next.applyBatch(mutations)
+		next, err = next.applyBatchRefs(mutations, refs, o.journal.reader)
 		if err != nil {
 			return err
 		}
-	}
-	if err := o.journal.Rewrite(epoch, minSequence, mutations); err != nil {
-		return err
 	}
 	o.buffer.StoreSnapshot(next)
 	return nil
@@ -945,24 +1303,29 @@ func (o *JournaledOverlay) Close() error {
 	return o.journal.Close()
 }
 
-func writeOverlayJournalBatch(w io.Writer, currentEpoch, currentSequence uint64, mutations []OverlayMutation) (uint64, uint64, error) {
+func writeOverlayJournalBatch(w io.Writer, startOffset int64, currentEpoch, currentSequence uint64, mutations []OverlayMutation) (uint64, uint64, []overlayVecRef, error) {
 	epoch := currentEpoch
 	lastSequence := currentSequence
+	refs := make([]overlayVecRef, len(mutations))
+	offset := startOffset
 	for i, mutation := range mutations {
 		if err := validateOverlayMutation(mutation); err != nil {
-			return 0, 0, fmt.Errorf("overlay mutation %d: %w", i, err)
+			return 0, 0, nil, fmt.Errorf("overlay mutation %d: %w", i, err)
 		}
 		if mutation.Epoch < epoch {
-			return 0, 0, fmt.Errorf("overlay mutation %d: epoch %d regresses from %d", i, mutation.Epoch, epoch)
+			return 0, 0, nil, fmt.Errorf("overlay mutation %d: epoch %d regresses from %d", i, mutation.Epoch, epoch)
 		}
 		if mutation.Epoch > epoch {
 			epoch = mutation.Epoch
 			lastSequence = 0
 		}
 		if mutation.Sequence <= lastSequence {
-			return 0, 0, fmt.Errorf("overlay mutation %d: sequence %d must be greater than %d", i, mutation.Sequence, lastSequence)
+			return 0, 0, nil, fmt.Errorf("overlay mutation %d: sequence %d must be greater than %d", i, mutation.Sequence, lastSequence)
 		}
 		payloadLen := overlayJournalRecordFloor + len(mutation.Vec)
+		if len(mutation.Vec) > 0 && offset >= 0 {
+			refs[i] = journalOverlayVecRef(offset+4+overlayJournalRecordFloor, len(mutation.Vec))
+		}
 		var lenBuf [4]byte
 		binary.LittleEndian.PutUint32(lenBuf[:], uint32(payloadLen))
 		var payloadHeader [overlayJournalRecordFloor]byte
@@ -978,24 +1341,27 @@ func writeOverlayJournalBatch(w io.Writer, currentEpoch, currentSequence uint64,
 		var crcBuf [4]byte
 		binary.LittleEndian.PutUint32(crcBuf[:], crc)
 		if _, err := w.Write(lenBuf[:]); err != nil {
-			return 0, 0, err
+			return 0, 0, nil, err
 		}
 		if _, err := w.Write(payloadHeader[:]); err != nil {
-			return 0, 0, err
+			return 0, 0, nil, err
 		}
 		if _, err := w.Write(mutation.Vec); err != nil {
-			return 0, 0, err
+			return 0, 0, nil, err
 		}
 		if _, err := w.Write(crcBuf[:]); err != nil {
-			return 0, 0, err
+			return 0, 0, nil, err
+		}
+		if offset >= 0 {
+			offset += int64(4 + payloadLen + 4)
 		}
 		epoch = mutation.Epoch
 		lastSequence = mutation.Sequence
 	}
-	return epoch, lastSequence, nil
+	return epoch, lastSequence, refs, nil
 }
 
-func replayOverlayJournalFile(file *os.File) (*OverlaySnapshot, int64, error) {
+func replayOverlayJournalFile(file *os.File, reader *overlayVecReader) (*OverlaySnapshot, int64, error) {
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
 		return nil, 0, err
 	}
@@ -1011,7 +1377,7 @@ func replayOverlayJournalFile(file *os.File) (*OverlaySnapshot, int64, error) {
 		if err := file.Sync(); err != nil {
 			return nil, 0, err
 		}
-		return newOverlaySnapshot(0, 0), overlayJournalHeaderSize, nil
+		return newOverlaySnapshotWithReader(0, 0, reader), overlayJournalHeaderSize, nil
 	}
 	if size < overlayJournalHeaderSize {
 		return nil, 0, fmt.Errorf("vecindex: overlay journal %q is too small", file.Name())
@@ -1030,10 +1396,11 @@ func replayOverlayJournalFile(file *os.File) (*OverlaySnapshot, int64, error) {
 	headerEpoch := binary.LittleEndian.Uint64(header[12:20])
 	headerLastSequence := binary.LittleEndian.Uint64(header[20:28])
 
-	snapshot := newOverlaySnapshot(0, 0)
+	snapshot := newOverlaySnapshotWithReader(0, 0, reader)
 	if size == overlayJournalHeaderSize {
-		snapshot = newOverlaySnapshot(headerEpoch, headerLastSequence)
+		snapshot = newOverlaySnapshotWithReader(headerEpoch, headerLastSequence, reader)
 	}
+	scratch := make([]byte, 256<<10)
 	offset := int64(overlayJournalHeaderSize)
 	for offset < size {
 		recordOffset := offset
@@ -1056,14 +1423,36 @@ func replayOverlayJournalFile(file *os.File) (*OverlaySnapshot, int64, error) {
 			return snapshot, recordOffset, nil
 		}
 
-		payload := make([]byte, recordLen)
-		if _, err := io.ReadFull(file, payload); err != nil {
+		var payloadHeader [overlayJournalRecordFloor]byte
+		if _, err := io.ReadFull(file, payloadHeader[:]); err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 				return snapshot, recordOffset, nil
 			}
 			return nil, 0, err
 		}
-		offset += recordLen
+		offset += overlayJournalRecordFloor
+		vecLen := int(binary.LittleEndian.Uint32(payloadHeader[41:45]))
+		if vecLen != int(recordLen)-overlayJournalRecordFloor {
+			return nil, 0, fmt.Errorf("vecindex: overlay journal payload length mismatch")
+		}
+		crc := crc32.Update(0, overlayJournalCRCTable, payloadHeader[:])
+		vecOffset := offset
+		remaining := vecLen
+		for remaining > 0 {
+			chunk := scratch
+			if len(chunk) > remaining {
+				chunk = chunk[:remaining]
+			}
+			if _, err := io.ReadFull(file, chunk); err != nil {
+				if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+					return snapshot, recordOffset, nil
+				}
+				return nil, 0, err
+			}
+			crc = crc32.Update(crc, overlayJournalCRCTable, chunk)
+			offset += int64(len(chunk))
+			remaining -= len(chunk)
+		}
 
 		var crcBuf [4]byte
 		if _, err := io.ReadFull(file, crcBuf[:]); err != nil {
@@ -1073,14 +1462,15 @@ func replayOverlayJournalFile(file *os.File) (*OverlaySnapshot, int64, error) {
 			return nil, 0, err
 		}
 		offset += 4
-		if want, got := binary.LittleEndian.Uint32(crcBuf[:]), crc32.Checksum(payload, overlayJournalCRCTable); want != got {
+		if want, got := binary.LittleEndian.Uint32(crcBuf[:]), crc; want != got {
 			return nil, 0, fmt.Errorf("vecindex: overlay journal checksum mismatch at offset %d", recordOffset)
 		}
-		mutation, err := decodeOverlayJournalRecord(payload)
+		mutation, err := decodeOverlayJournalRecordHeader(payloadHeader[:])
 		if err != nil {
 			return nil, 0, err
 		}
-		next, err := snapshot.applyBatch([]OverlayMutation{mutation})
+		ref := journalOverlayVecRef(vecOffset, vecLen)
+		next, err := snapshot.applyBatchRefs([]OverlayMutation{mutation}, []overlayVecRef{ref}, reader)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -1112,6 +1502,20 @@ func decodeOverlayJournalRecord(payload []byte) (OverlayMutation, error) {
 		return OverlayMutation{}, err
 	}
 	return mutation, nil
+}
+
+func decodeOverlayJournalRecordHeader(payload []byte) (OverlayMutation, error) {
+	if len(payload) < overlayJournalRecordFloor {
+		return OverlayMutation{}, fmt.Errorf("vecindex: overlay journal payload too small")
+	}
+	return OverlayMutation{
+		Kind:              OverlayMutationKind(payload[0]),
+		Epoch:             binary.LittleEndian.Uint64(payload[1:9]),
+		Sequence:          binary.LittleEndian.Uint64(payload[9:17]),
+		ClusterID:         int64(binary.LittleEndian.Uint64(payload[17:25])),
+		RowID:             int64(binary.LittleEndian.Uint64(payload[25:33])),
+		AppliedAtUnixNano: int64(binary.LittleEndian.Uint64(payload[33:41])),
+	}, nil
 }
 
 func writeOverlayJournalHeader(file *os.File, epoch, lastSequence uint64) error {

@@ -58,6 +58,7 @@ type TransactionManager struct {
 	gcMaxRetention           time.Duration // Force GC after this duration
 	heartbeatTimeout         time.Duration
 	stopGC                   chan struct{}
+	gcDone                   chan struct{}
 	gcRunning                bool
 	databaseName             string                       // Name of database this manager manages
 	getMinAppliedTxnID       MinAppliedTxnIDFunc          // Callback for GC coordination
@@ -674,9 +675,15 @@ func (tm *TransactionManager) StartGarbageCollection() {
 	}
 	tm.gcRunning = true
 	tm.stopGC = make(chan struct{}) // Fresh channel for this GC cycle
+	tm.gcDone = make(chan struct{})
+	stopGC := tm.stopGC
+	gcDone := tm.gcDone
 	tm.mu.Unlock()
 
-	go tm.gcLoop()
+	go func() {
+		defer close(gcDone)
+		tm.gcLoop(stopGC)
+	}()
 }
 
 // StopGarbageCollection stops the background garbage collection.
@@ -684,23 +691,32 @@ func (tm *TransactionManager) StartGarbageCollection() {
 func (tm *TransactionManager) StopGarbageCollection() {
 	tm.mu.Lock()
 	if !tm.gcRunning {
+		done := tm.gcDone
 		tm.mu.Unlock()
+		if done != nil {
+			<-done
+		}
 		return
 	}
 	tm.gcRunning = false
+	stopGC := tm.stopGC
+	done := tm.gcDone
 	tm.mu.Unlock()
 
 	// Safe close - only close if not already closed
 	select {
-	case <-tm.stopGC:
+	case <-stopGC:
 		// Already closed
 	default:
-		close(tm.stopGC)
+		close(stopGC)
+	}
+	if done != nil {
+		<-done
 	}
 }
 
 // gcLoop runs the garbage collection loop
-func (tm *TransactionManager) gcLoop() {
+func (tm *TransactionManager) gcLoop(stopGC <-chan struct{}) {
 	ticker := time.NewTicker(tm.gcInterval)
 	defer ticker.Stop()
 
@@ -708,7 +724,7 @@ func (tm *TransactionManager) gcLoop() {
 		select {
 		case <-ticker.C:
 			tm.runGarbageCollection()
-		case <-tm.stopGC:
+		case <-stopGC:
 			return
 		}
 	}
@@ -718,6 +734,11 @@ func (tm *TransactionManager) gcLoop() {
 // Phase 1 (Critical): Cleanup stale transactions and orphaned intents - always runs
 // Phase 2 (Background): Cleanup old transaction records - skipped under load
 func (tm *TransactionManager) runGarbageCollection() {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			log.Warn().Interface("panic", recovered).Msg("transaction GC recovered")
+		}
+	}()
 	// ====================
 	// PHASE 1: CRITICAL - Always runs
 	// ====================

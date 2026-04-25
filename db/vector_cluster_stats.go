@@ -236,28 +236,11 @@ func reassignOverlayMutationsForProbe(
 	rewritten := make([]vecindex.OverlayMutation, 0)
 	var reassignErr error
 	snapshot.VisitMutationsAfter(minSequence, func(mutation vecindex.OverlayMutation) bool {
-		next := mutation
-		next.Epoch = probe.Epoch()
-		if mutation.Kind == vecindex.OverlayMutationDelete {
-			next.ClusterID = 0
-			rewritten = append(rewritten, next)
-			return true
-		}
-		next.Kind = vecindex.OverlayMutationUpsert
-		if stable != nil && stable.RowMap != nil {
-			if _, ok, err := stable.RowMap.Lookup(mutation.RowID); err != nil {
-				reassignErr = fmt.Errorf("reassign overlay mutation rowid %d: stable lookup: %w", mutation.RowID, err)
-				return false
-			} else if ok {
-				next.Kind = vecindex.OverlayMutationReplace
-			}
-		}
-		clusterID, err := assignPreparedAgainstSet(mutation.Vec, spec, probe)
+		next, err := reassignOverlayMutationForProbe(mutation, spec, probe, stable)
 		if err != nil {
-			reassignErr = fmt.Errorf("reassign overlay mutation rowid %d: %w", mutation.RowID, err)
+			reassignErr = err
 			return false
 		}
-		next.ClusterID = clusterID
 		rewritten = append(rewritten, next)
 		return true
 	})
@@ -265,4 +248,32 @@ func reassignOverlayMutationsForProbe(
 		return nil, reassignErr
 	}
 	return rewritten, nil
+}
+
+func reassignOverlayMutationForProbe(
+	mutation vecindex.OverlayMutation,
+	spec vecindex.IVFSpec,
+	probe *kmeans.CentroidSet,
+	stable *vecindex.SegmentGeneration,
+) (vecindex.OverlayMutation, error) {
+	next := mutation
+	next.Epoch = probe.Epoch()
+	if mutation.Kind == vecindex.OverlayMutationDelete {
+		next.ClusterID = 0
+		return next, nil
+	}
+	next.Kind = vecindex.OverlayMutationUpsert
+	if stable != nil && stable.RowMap != nil {
+		if _, ok, err := stable.RowMap.Lookup(mutation.RowID); err != nil {
+			return vecindex.OverlayMutation{}, fmt.Errorf("reassign overlay mutation rowid %d: stable lookup: %w", mutation.RowID, err)
+		} else if ok {
+			next.Kind = vecindex.OverlayMutationReplace
+		}
+	}
+	clusterID, err := assignPreparedAgainstSet(mutation.Vec, spec, probe)
+	if err != nil {
+		return vecindex.OverlayMutation{}, fmt.Errorf("reassign overlay mutation rowid %d: %w", mutation.RowID, err)
+	}
+	next.ClusterID = clusterID
+	return next, nil
 }

@@ -231,6 +231,9 @@ Use `cmd/vec-bench` for local vector benchmarking. A meaningful run should alway
 - RSS after build, vector settle, warmup, and measurement
 - CPU profiles when relevant
 
+Acceptance for the 100K OpenAI-vector benchmark is recall@10 `>= 0.95`,
+read QPS `> 1,000`, and segment overread `<= 1.05x`.
+
 Example:
 
 ```bash
@@ -247,6 +250,9 @@ Example:
   --n-queries=500 \
   --query-concurrency=1 \
   --settle-timeout=10m \
+  --min-recall=0.95 \
+  --min-qps=1000 \
+  --max-overread=1.05 \
   --profile-dir=/tmp/marmot/bench-active/prof
 ```
 

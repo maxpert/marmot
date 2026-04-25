@@ -14,9 +14,12 @@ import (
 // Index uses atomic.Pointer[CentroidSet] to allow lock-free reads.
 // CentroidSet is immutable after creation via NewCentroidSet.
 type CentroidSet struct {
-	epoch     uint64
-	centroids [][]float32
-	unit      [][]float32
+	epoch        uint64
+	centroids    [][]float32
+	unit         [][]float32
+	dim          int
+	centroidFlat []float32
+	unitFlat     []float32
 }
 
 // centroidSetMsg is the msgpack wire format for CentroidSet.
@@ -30,10 +33,20 @@ type centroidSetMsg struct {
 func NewCentroidSet(epoch uint64, centroids [][]float32) (*CentroidSet, error) {
 	copied := make([][]float32, len(centroids))
 	unit := make([][]float32, len(centroids))
+	dim := 0
+	if len(centroids) > 0 {
+		dim = len(centroids[0])
+	}
+	centroidFlat := make([]float32, 0, len(centroids)*dim)
+	unitFlat := make([]float32, 0, len(centroids)*dim)
 	for i, c := range centroids {
+		if i > 0 && len(c) != dim {
+			return nil, fmt.Errorf("kmeans: centroid %d dimension mismatch", i)
+		}
 		cp := make([]float32, len(c))
 		copy(cp, c)
 		copied[i] = cp
+		centroidFlat = append(centroidFlat, cp...)
 		if len(cp) == 0 {
 			continue
 		}
@@ -47,8 +60,9 @@ func NewCentroidSet(epoch uint64, centroids [][]float32) (*CentroidSet, error) {
 			}
 		}
 		unit[i] = up
+		unitFlat = append(unitFlat, up...)
 	}
-	return &CentroidSet{epoch: epoch, centroids: copied, unit: unit}, nil
+	return &CentroidSet{epoch: epoch, centroids: copied, unit: unit, dim: dim, centroidFlat: centroidFlat, unitFlat: unitFlat}, nil
 }
 
 // Len returns the number of centroids in the set.
@@ -115,6 +129,78 @@ func (cs *CentroidSet) AssignTopN(vec []float32, n int, m metric.Metric) ([]uint
 	return AssignTopN(vec, cs.centroids, n, m)
 }
 
+// AssignTopNUntilBudget returns the nearest centroid prefix needed to satisfy
+// budgetRows, ordered by ascending distance. rowCounts must be 0-based and
+// aligned with centroid IDs. minProbe and maxProbe bound the selected prefix.
+func (cs *CentroidSet) AssignTopNUntilBudget(
+	vec []float32,
+	rowCounts []uint64,
+	budgetRows uint64,
+	minProbe int,
+	maxProbe int,
+	m metric.Metric,
+) ([]uint32, []float32, error) {
+	if cs == nil || len(cs.centroids) == 0 {
+		return nil, nil, errors.New("kmeans: centroids must not be empty")
+	}
+	if len(rowCounts) != len(cs.centroids) {
+		return nil, nil, fmt.Errorf("kmeans: rowCounts length %d does not match centroids %d", len(rowCounts), len(cs.centroids))
+	}
+	if len(vec) != cs.dim {
+		return nil, nil, errors.New("kmeans: dimension mismatch between vec and centroids")
+	}
+	if minProbe < 1 {
+		minProbe = 1
+	}
+	if minProbe > len(cs.centroids) {
+		minProbe = len(cs.centroids)
+	}
+	if maxProbe <= 0 || maxProbe > len(cs.centroids) {
+		maxProbe = len(cs.centroids)
+	}
+	if maxProbe < minProbe {
+		maxProbe = minProbe
+	}
+
+	q := vec
+	var err error
+	if m == metric.MetricCosine {
+		q, err = normalizeQuery(vec, cs.unit)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	entries := make([]centroidTopNEntry, len(cs.centroids))
+	for i := range cs.centroids {
+		var dist float32
+		if m == metric.MetricCosine && cs.dim > 0 && len(cs.unitFlat) == len(cs.centroids)*cs.dim {
+			start := i * cs.dim
+			dist = metric.CosineDistanceUnit(q, cs.unitFlat[start:start+cs.dim])
+		} else if cs.dim > 0 && len(cs.centroidFlat) == len(cs.centroids)*cs.dim {
+			start := i * cs.dim
+			dist = metric.Distance(m, q, cs.centroidFlat[start:start+cs.dim])
+		} else {
+			dist = metric.Distance(m, q, cs.centroids[i])
+		}
+		entries[i] = centroidTopNEntry{id: uint32(i), dist: dist}
+	}
+	heapifyBest(entries)
+
+	ids := make([]uint32, 0, maxProbe)
+	dists := make([]float32, 0, maxProbe)
+	var cumulative uint64
+	for len(entries) > 0 && len(ids) < maxProbe {
+		entry := popBest(&entries)
+		ids = append(ids, entry.id)
+		dists = append(dists, entry.dist)
+		cumulative += rowCounts[entry.id]
+		if len(ids) >= minProbe && budgetRows > 0 && cumulative >= budgetRows {
+			break
+		}
+	}
+	return ids, dists, nil
+}
+
 // Snapshot returns a deep copy of all centroid vectors. Use this when the
 // caller needs an independent mutable copy, e.g. as a warm start for a
 // subsequent k-means run.
@@ -146,9 +232,9 @@ func (cs *CentroidSet) assignNearestUnit(vec []float32) (uint32, float32, error)
 		return 0, 0, err
 	}
 	bestID := uint32(0)
-	bestDist := metric.CosineDistanceUnit(q, cs.unit[0])
+	bestDist := metric.CosineDistanceUnit(q, cs.unitSlice(0))
 	for i := 1; i < len(cs.unit); i++ {
-		d := metric.CosineDistanceUnit(q, cs.unit[i])
+		d := metric.CosineDistanceUnit(q, cs.unitSlice(i))
 		if d < bestDist {
 			bestDist = d
 			bestID = uint32(i)
@@ -170,9 +256,17 @@ func (cs *CentroidSet) assignTopNUnit(vec []float32, n int) ([]uint32, []float32
 	}
 	h := newCentroidTopNHeap(n)
 	for i := range cs.unit {
-		h.Push(uint32(i), metric.CosineDistanceUnit(q, cs.unit[i]))
+		h.Push(uint32(i), metric.CosineDistanceUnit(q, cs.unitSlice(i)))
 	}
 	return h.Drain()
+}
+
+func (cs *CentroidSet) unitSlice(i int) []float32 {
+	if cs != nil && cs.dim > 0 && len(cs.unitFlat) == len(cs.unit)*cs.dim {
+		start := i * cs.dim
+		return cs.unitFlat[start : start+cs.dim]
+	}
+	return cs.unit[i]
 }
 
 func normalizeQuery(vec []float32, centroids [][]float32) ([]float32, error) {
@@ -287,5 +381,50 @@ func sortCentroidEntries(items []centroidTopNEntry) {
 			items[prev], items[j] = items[j], items[prev]
 			j--
 		}
+	}
+}
+
+func betterThan(a, b centroidTopNEntry) bool {
+	if a.dist != b.dist {
+		return a.dist < b.dist
+	}
+	return a.id < b.id
+}
+
+func heapifyBest(items []centroidTopNEntry) {
+	for i := len(items)/2 - 1; i >= 0; i-- {
+		siftBestDown(items, i)
+	}
+}
+
+func popBest(items *[]centroidTopNEntry) centroidTopNEntry {
+	h := *items
+	best := h[0]
+	last := len(h) - 1
+	h[0] = h[last]
+	h = h[:last]
+	if len(h) > 0 {
+		siftBestDown(h, 0)
+	}
+	*items = h
+	return best
+}
+
+func siftBestDown(items []centroidTopNEntry, i int) {
+	for {
+		l := 2*i + 1
+		if l >= len(items) {
+			return
+		}
+		best := l
+		r := l + 1
+		if r < len(items) && betterThan(items[r], items[l]) {
+			best = r
+		}
+		if !betterThan(items[best], items[i]) {
+			return
+		}
+		items[i], items[best] = items[best], items[i]
+		i = best
 	}
 }

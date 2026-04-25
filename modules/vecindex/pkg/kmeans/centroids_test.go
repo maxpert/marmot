@@ -144,3 +144,36 @@ func TestCentroidSet_AssignTopNCosineMatchesOrder(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []uint32{0, 1}, ids)
 }
+
+func TestCentroidSet_AssignTopNUntilBudgetMatchesSortedPrefix(t *testing.T) {
+	t.Parallel()
+
+	cs, err := kmeans.NewCentroidSet(1, [][]float32{{0}, {10}, {20}, {30}})
+	require.NoError(t, err)
+
+	ids, _, err := cs.AssignTopNUntilBudget([]float32{9}, []uint64{7000, 900, 500, 6000}, 8192, 1, 4, metric.MetricL2)
+	require.NoError(t, err)
+	require.Equal(t, []uint32{1, 0, 2}, ids)
+}
+
+func TestCentroidSet_AssignTopNUntilBudgetHonorsZeroCountsAndMinProbe(t *testing.T) {
+	t.Parallel()
+
+	cs, err := kmeans.NewCentroidSet(1, [][]float32{{0}, {10}, {20}, {30}})
+	require.NoError(t, err)
+
+	ids, _, err := cs.AssignTopNUntilBudget([]float32{9}, []uint64{0, 0, 100, 100}, 1, 3, 4, metric.MetricL2)
+	require.NoError(t, err)
+	require.Equal(t, []uint32{1, 0, 2}, ids)
+}
+
+func TestCentroidSet_AssignTopNUntilBudgetCosineTieBreaksByID(t *testing.T) {
+	t.Parallel()
+
+	cs, err := kmeans.NewCentroidSet(1, [][]float32{{1, 0}, {2, 0}, {0, 1}})
+	require.NoError(t, err)
+
+	ids, _, err := cs.AssignTopNUntilBudget([]float32{1, 0}, []uint64{10, 10, 10}, 1, 1, 3, metric.MetricCosine)
+	require.NoError(t, err)
+	require.Equal(t, []uint32{0}, ids)
+}

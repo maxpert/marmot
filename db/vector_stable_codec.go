@@ -13,7 +13,7 @@ import (
 	"github.com/maxpert/marmot/modules/vecindex/pkg/metric"
 )
 
-const stableCodecTrainingSampleLimit = 16384
+const stableCodecTrainingSampleLimit = 32768
 const stableCodecPQTrainingRowFloor = 4096
 
 type stableCodecReservoir struct {

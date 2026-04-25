@@ -52,6 +52,9 @@ func stepPromotionClusterCount(currentK, wantK int) int {
 	if wantK <= currentK {
 		return currentK
 	}
+	if wantK > currentK*2 {
+		return wantK
+	}
 	nextK := max(currentK+promotionStepFloor, int(float64(currentK)*promotionGrowthFactor))
 	if nextK > wantK {
 		nextK = wantK
@@ -302,11 +305,7 @@ func (h *EngineHook) publishIncrementalPromotion(
 	if err := plan.pending.Publish(); err != nil {
 		return err
 	}
-	tailMutations, err := reassignOverlayMutationsForProbe(currentSnapshot, plan.cutoff, plan.nextSpec, plan.nextProbe, plan.pending.generation)
-	if err != nil {
-		return err
-	}
-	nextOverlay, err := rewriteOverlayForEpoch(dbPath, meta.IndexName, plan.nextProbe.Epoch(), plan.cutoff, tailMutations)
+	nextOverlay, err := rewriteOverlayTailForProbe(dbPath, meta.IndexName, plan.nextProbe.Epoch(), plan.cutoff, currentSnapshot, plan.nextSpec, plan.nextProbe, plan.pending.generation)
 	if err != nil {
 		return err
 	}
@@ -320,11 +319,6 @@ func (h *EngineHook) publishIncrementalPromotion(
 	newState.StoreSegmentStore(plan.pending.generation)
 	plan.pending.generation = nil
 	newState.StoreOverlay(nextOverlay)
-	if err := syncMaintenanceStateFromOverlay(newState); err != nil {
-		newState.ClearOverlay()
-		newState.ClearSegmentStore()
-		return err
-	}
 	h.engine.Register(plan.nextMeta.IndexName, newState)
 	h.retireState(plan.state)
 	if h.indexMgr != nil {
@@ -342,6 +336,9 @@ func (h *EngineHook) runIncrementalPromotion(
 	state *vecindex.IndexState,
 	nextClusters int,
 ) error {
+	h.maintenanceBuildMu.Lock()
+	defer h.maintenanceBuildMu.Unlock()
+
 	plan, err := prepareIncrementalPromotion(ctx, conn, dbPath, meta, spec, state, nextClusters)
 	if err != nil || plan == nil {
 		return err
@@ -358,6 +355,9 @@ func (h *EngineHook) runIncrementalRepair(
 	spec vecindex.IVFSpec,
 	state *vecindex.IndexState,
 ) error {
+	h.maintenanceBuildMu.Lock()
+	defer h.maintenanceBuildMu.Unlock()
+
 	plan, err := prepareIncrementalRepair(ctx, conn, dbPath, meta, spec, state)
 	if err != nil || plan == nil {
 		return err

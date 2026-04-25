@@ -18,6 +18,7 @@ const (
 	dropRetireGracePeriod        = 30 * time.Second
 	bootstrapPublishMultiplier   = 4
 	bootstrapMaxPublishRows      = 16 * 1024
+	bootstrapQuiesceDuration     = time.Second
 )
 
 // Ensure EngineHook implements both lifecycle hooks.
@@ -42,6 +43,7 @@ type EngineHook struct {
 	maintenanceMu       sync.Mutex
 	maintenanceSeq      uint64
 	maintenanceWatchers map[string]maintenanceWatcher
+	maintenanceBuildMu  sync.Mutex
 	localChangeMu       sync.Mutex
 }
 
@@ -52,6 +54,7 @@ type bootstrapWatcher struct {
 
 type maintenanceWatcher struct {
 	cancel context.CancelFunc
+	done   <-chan struct{}
 	seq    uint64
 }
 
@@ -74,6 +77,7 @@ func (h *EngineHook) retireState(state *vecindex.IndexState) {
 	if state == nil {
 		return
 	}
+	installRetiredGenerationGC(state)
 	state.Retire()
 }
 
@@ -355,6 +359,9 @@ func (h *EngineHook) bootstrapOnce(ctx context.Context, meta common.VectorIndexM
 			return false
 		}
 	}
+	if currentN < int64(bootstrapPublishTargetRows(meta)) && !bootstrapOverlayQuiesced(overlaySnapshot) {
+		return false
+	}
 	publishLimit := bootstrapInitialPublishRows(meta, currentN)
 	cutoff, publishRows := overlayPreparedVectorCutoffSequence(overlaySnapshot, publishLimit)
 	if publishRows == 0 || cutoff == 0 {
@@ -443,13 +450,7 @@ func (h *EngineHook) bootstrapOnce(ctx context.Context, meta common.VectorIndexM
 		log.Warn().Err(err).Str("index", meta.IndexName).Msg("engine hook bootstrap: publish overlay segment generation failed")
 		return false
 	}
-	tailMutations, err := reassignOverlayMutationsForProbe(currentSnapshot, cutoff, spec, probeCS, pending.generation)
-	if err != nil {
-		h.localChangeMu.Unlock()
-		log.Warn().Err(err).Str("index", meta.IndexName).Msg("engine hook bootstrap: rewrite overlay tail failed")
-		return false
-	}
-	nextOverlay, err := rewriteOverlayForEpoch(dbPath, meta.IndexName, probeCS.Epoch(), cutoff, tailMutations)
+	nextOverlay, err := rewriteOverlayTailForProbe(dbPath, meta.IndexName, probeCS.Epoch(), cutoff, currentSnapshot, spec, probeCS, pending.generation)
 	if err != nil {
 		h.localChangeMu.Unlock()
 		log.Warn().Err(err).Str("index", meta.IndexName).Msg("engine hook bootstrap: rewrite overlay failed")
@@ -459,13 +460,6 @@ func (h *EngineHook) bootstrapOnce(ctx context.Context, meta common.VectorIndexM
 	newState.StoreSegmentStore(pending.generation)
 	pending.generation = nil
 	newState.StoreOverlay(nextOverlay)
-	if err := syncMaintenanceStateFromOverlay(newState); err != nil {
-		h.localChangeMu.Unlock()
-		newState.ClearOverlay()
-		newState.ClearSegmentStore()
-		log.Warn().Err(err).Str("index", meta.IndexName).Msg("engine hook bootstrap: sync maintenance state failed")
-		return false
-	}
 	h.engine.Register(meta.IndexName, newState)
 	h.localChangeMu.Unlock()
 	h.retireState(state)
@@ -549,6 +543,14 @@ func bootstrapInitialPublishRows(meta common.VectorIndexMeta, availableRows int6
 	if availableRows <= 0 {
 		return 0
 	}
+	limit := bootstrapPublishTargetRows(meta)
+	if int64(limit) > availableRows {
+		return int(availableRows)
+	}
+	return limit
+}
+
+func bootstrapPublishTargetRows(meta common.VectorIndexMeta) int {
 	floor := int(bootstrapAutoTuneFloor(meta))
 	if floor < 1 {
 		floor = 1
@@ -560,8 +562,16 @@ func bootstrapInitialPublishRows(meta common.VectorIndexMeta, availableRows int6
 	if limit > bootstrapMaxPublishRows {
 		limit = bootstrapMaxPublishRows
 	}
-	if int64(limit) > availableRows {
-		return int(availableRows)
-	}
 	return limit
+}
+
+func bootstrapOverlayQuiesced(snapshot *vecindex.OverlaySnapshot) bool {
+	if snapshot == nil {
+		return false
+	}
+	newest := snapshot.NewestUnixNanoAfter(0)
+	if newest == 0 {
+		return false
+	}
+	return time.Since(time.Unix(0, newest)) >= bootstrapQuiesceDuration
 }

@@ -18,9 +18,10 @@ const (
 )
 
 type PQ8Options struct {
-	M       int
-	MaxIter int
-	Seed    uint64
+	M         int
+	MaxIter   int
+	Seed      uint64
+	StoreNorm bool
 }
 
 type PQ8Codec struct {
@@ -28,6 +29,7 @@ type PQ8Codec struct {
 	M         int       `msgpack:"m"`
 	Offsets   []int     `msgpack:"offsets"`
 	Codebooks []float32 `msgpack:"codebooks"`
+	StoreNorm bool      `msgpack:"store_norm,omitempty"`
 
 	offsetOnce      sync.Once
 	codebookOffsets []int
@@ -38,6 +40,7 @@ type PQ8QueryScorer struct {
 	queryNorm2 float32
 	m          int
 	codeOffset int
+	storeNorm  bool
 	lut        []float32
 }
 
@@ -46,6 +49,7 @@ type PQ8Scorer struct {
 	queryNorm2 float32
 	m          int
 	codeOffset int
+	storeNorm  bool
 	baseDot    float32
 	lut        []float32
 }
@@ -112,7 +116,7 @@ func TrainPQ8(residuals [][]float32, dim int, opts PQ8Options) (*PQ8Codec, error
 			return nil, err
 		}
 	}
-	return &PQ8Codec{Dim: dim, M: opts.M, Offsets: offsets, Codebooks: codebooks, codebookOffsets: codebookOffsets}, nil
+	return &PQ8Codec{Dim: dim, M: opts.M, Offsets: offsets, Codebooks: codebooks, StoreNorm: opts.StoreNorm, codebookOffsets: codebookOffsets}, nil
 }
 
 func (c *PQ8Codec) Validate() error {
@@ -143,7 +147,7 @@ func (c *PQ8Codec) EncodedSize(rankMetric metric.Metric) int {
 		return 0
 	}
 	size := c.M
-	if rankMetric == metric.MetricL2 {
+	if rankMetric == metric.MetricL2 || c.StoreNorm {
 		size += 4
 	}
 	return size
@@ -161,9 +165,24 @@ func (c *PQ8Codec) EncodeResidual(rankMetric metric.Metric, vec, centroid []floa
 	if rankMetric == metric.MetricL2 {
 		binary.LittleEndian.PutUint32(out[:4], math.Float32bits(metric.Norm2(vec)))
 		off = 4
+	} else if c.StoreNorm {
+		off = 4
 	}
+	reconstructedNorm2 := float32(0)
 	for sub := 0; sub < c.M; sub++ {
-		out[off+sub] = byte(c.nearestCodeForResidual(sub, vec, centroid))
+		code := c.nearestCodeForResidual(sub, vec, centroid)
+		out[off+sub] = byte(code)
+		if c.StoreNorm && rankMetric != metric.MetricL2 {
+			start, end := c.Offsets[sub], c.Offsets[sub+1]
+			cb := c.codeword(sub, code)
+			for d := start; d < end; d++ {
+				value := centroid[d] + cb[d-start]
+				reconstructedNorm2 += value * value
+			}
+		}
+	}
+	if c.StoreNorm && rankMetric != metric.MetricL2 {
+		binary.LittleEndian.PutUint32(out[:4], math.Float32bits(reconstructedNorm2))
 	}
 	return out, nil
 }
@@ -186,6 +205,9 @@ func (c *PQ8Codec) DecodeResidual(centroid []float32, blob []byte, rankMetric me
 	norm2 := float32(0)
 	off := 0
 	if rankMetric == metric.MetricL2 {
+		norm2 = math.Float32frombits(binary.LittleEndian.Uint32(blob[:4]))
+		off = 4
+	} else if c.StoreNorm {
 		norm2 = math.Float32frombits(binary.LittleEndian.Uint32(blob[:4]))
 		off = 4
 	}
@@ -233,7 +255,8 @@ func NewPQ8QueryScorer(rankMetric metric.Metric, query []float32, queryNorm2 flo
 		}
 	}
 	codeOffset := 0
-	if rankMetric == metric.MetricL2 {
+	storeNorm := codec.StoreNorm
+	if rankMetric == metric.MetricL2 || storeNorm {
 		codeOffset = 4
 	}
 	return &PQ8QueryScorer{
@@ -241,6 +264,7 @@ func NewPQ8QueryScorer(rankMetric metric.Metric, query []float32, queryNorm2 flo
 		queryNorm2: queryNorm2,
 		m:          codec.M,
 		codeOffset: codeOffset,
+		storeNorm:  storeNorm,
 		lut:        lut,
 	}, nil
 }
@@ -257,6 +281,7 @@ func (q *PQ8QueryScorer) ClusterScorer(query, centroid []float32) (*PQ8Scorer, e
 		queryNorm2: q.queryNorm2,
 		m:          q.m,
 		codeOffset: q.codeOffset,
+		storeNorm:  q.storeNorm,
 		baseDot:    metric.DotProduct(query, centroid),
 		lut:        q.lut,
 	}, nil
@@ -277,6 +302,13 @@ func (s *PQ8Scorer) Distance(blob []byte) (float32, error) {
 	}
 	switch s.rankMetric {
 	case metric.MetricCosine:
+		if s.storeNorm {
+			norm2 := math.Float32frombits(binary.LittleEndian.Uint32(blob[:4]))
+			if norm2 <= 0 {
+				return 1, nil
+			}
+			return 1 - dot/float32(math.Sqrt(float64(norm2))), nil
+		}
 		return 1 - dot, nil
 	case metric.MetricL2:
 		norm2 := math.Float32frombits(binary.LittleEndian.Uint32(blob[:4]))
@@ -303,14 +335,24 @@ func (s *PQ8Scorer) ScoreSpan(rows []byte, entrySize int, out []float32) error {
 	switch s.rankMetric {
 	case metric.MetricCosine:
 		for i := range out {
-			codeCursor := cursor + 8 + s.codeOffset
+			payloadCursor := cursor + 8
+			codeCursor := payloadCursor + s.codeOffset
 			dot := s.baseDot
 			lutOffset := 0
 			for sub := 0; sub < s.m; sub++ {
 				dot += s.lut[lutOffset+int(rows[codeCursor+sub])]
 				lutOffset += pq8CodebookSize
 			}
-			out[i] = 1 - dot
+			if s.storeNorm {
+				norm2 := math.Float32frombits(binary.LittleEndian.Uint32(rows[payloadCursor : payloadCursor+4]))
+				if norm2 <= 0 {
+					out[i] = 1
+				} else {
+					out[i] = 1 - dot/float32(math.Sqrt(float64(norm2)))
+				}
+			} else {
+				out[i] = 1 - dot
+			}
 			cursor += entrySize
 		}
 	case metric.MetricL2:

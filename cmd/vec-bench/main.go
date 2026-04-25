@@ -199,6 +199,7 @@ type queryRunStats struct {
 	lats          []time.Duration
 	recall10      float64
 	recall10in100 float64
+	truthLimit    int
 	workerQueries []int64
 	segmentStats  vecindex.SegmentScanStats
 }
@@ -368,6 +369,7 @@ func main() {
 			fatal("ensureTableAndInsert: %v", err)
 		}
 	}
+	h.releaseTrain()
 	if cfg.settleTimeout > 0 {
 		readiness, err := h.waitForVectorReadiness(cfg.settleTimeout)
 		if err != nil {
@@ -390,8 +392,6 @@ func main() {
 			fatal("refreshIndexTuning: %v", err)
 		}
 	}
-	h.releaseTrain()
-
 	if err := h.runQueryPhase(); err != nil {
 		fatal("runQueryPhase: %v", err)
 	}
@@ -778,14 +778,20 @@ func (h *harness) insertRange(lo, hi int, phase string) error {
 					workerErr.Store(fmt.Errorf("%s commit tx [%d,%d): %w", phase, c.lo, c.hi, err))
 					return
 				}
-				entries, err := h.insertCDCEntries(c.lo, c.hi)
-				if err != nil {
-					workerErr.Store(fmt.Errorf("%s build local cdc [%d,%d): %w", phase, c.lo, c.hi, err))
-					return
-				}
-				if err := h.vecMgr.ApplyLocalCDC(context.Background(), h.cfg.dbName, entries); err != nil {
-					workerErr.Store(fmt.Errorf("%s apply local cdc [%d,%d): %w", phase, c.lo, c.hi, err))
-					return
+				for cdcLo := c.lo; cdcLo < c.hi; cdcLo += benchCDCApplyChunk {
+					cdcHi := cdcLo + benchCDCApplyChunk
+					if cdcHi > c.hi {
+						cdcHi = c.hi
+					}
+					entries, err := h.insertCDCEntries(cdcLo, cdcHi)
+					if err != nil {
+						workerErr.Store(fmt.Errorf("%s build local cdc [%d,%d): %w", phase, cdcLo, cdcHi, err))
+						return
+					}
+					if err := h.vecMgr.ApplyLocalCDC(context.Background(), h.cfg.dbName, entries); err != nil {
+						workerErr.Store(fmt.Errorf("%s apply local cdc [%d,%d): %w", phase, cdcLo, cdcHi, err))
+						return
+					}
 				}
 				lat := time.Since(tStart)
 				txLatSum.Add(int64(lat))
@@ -873,6 +879,7 @@ func vectorStateSettled(probeVersion uint64, segmentReady bool, overlayReady boo
 }
 
 const (
+	benchCDCApplyChunk     = 1024
 	settleClusterDriftPct  = 0.10
 	settleClusterP95Factor = 1.5
 	settleClusterMaxFactor = 2.0
@@ -1007,6 +1014,8 @@ func (h *harness) waitForVectorReadiness(timeout time.Duration) (*vectorReadines
 			logMemorySnapshot("after vector settle")
 			writeHeapProfile(h.cfg.profileDir, "heap-settle.pb.gz")
 			info.settledAt = time.Now()
+			h.releasePostSettleResources()
+			time.Sleep(2 * time.Second)
 			info.probeVersion = probeVersion
 			info.nlist = h.cfg.nlist
 			info.nprobe = h.cfg.nprobe
@@ -1018,6 +1027,21 @@ func (h *harness) waitForVectorReadiness(timeout time.Duration) (*vectorReadines
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
+}
+
+func (h *harness) releasePostSettleResources() {
+	if h == nil {
+		return
+	}
+	if h.conn != nil {
+		_, _ = h.conn.Exec("PRAGMA shrink_memory")
+	}
+	if h.readDB != nil {
+		_, _ = h.readDB.Exec("PRAGMA shrink_memory")
+	}
+	runtime.GC()
+	debug.FreeOSMemory()
+	logMemorySnapshot("after vector settle cleanup")
 }
 
 func (h *harness) refreshIndexTuning() error {
@@ -1122,7 +1146,8 @@ func defaultBenchPQProbeScanBudgetRows(targetPartitionSize int) int {
 		targetPartitionSize = 512
 	}
 	budget := defaultBenchProbeScanBudgetRows(targetPartitionSize)
-	if widened := 48 * targetPartitionSize; widened > budget {
+	multiplier := 38
+	if widened := multiplier * targetPartitionSize; widened > budget {
 		budget = widened
 	}
 	return budget
@@ -1369,6 +1394,9 @@ func (h *harness) runQueryPhase() error {
 	}
 	plog("  recall@%d      = %.4f  (top-%d vs truth top-%d)", h.cfg.k, stats.recall10, h.cfg.k, h.cfg.k)
 	plog("  recall@%d-in-100 = %.4f  (top-%d vs truth top-100)", h.cfg.k, stats.recall10in100, h.cfg.k)
+	if stats.truthLimit > 0 && h.meta.NTrain > 0 && stats.truthLimit < h.meta.NTrain {
+		plog("  recall truth filtered to indexed rowids <= %d", stats.truthLimit)
+	}
 	plog("  latency: p50=%s p95=%s p99=%s p999=%s max=%s",
 		p(0.50), p(0.95), p(0.99), p(0.999), stats.lats[len(stats.lats)-1])
 	plog("  throughput: %.0f QPS (aggregate wall, concurrency=%d, n=%d, elapsed=%s)",
@@ -1471,14 +1499,18 @@ func (h *harness) runQueries(sess *protocol.ConnectionSession, querySQL string, 
 		top100 map[int64]bool
 	}
 	truths := make([]truthPair, nQueries)
+	truthLimit := h.recallTruthLimit()
 	for q := 0; q < nQueries; q++ {
 		gt := h.gt.Vector(q)
 		t10 := make(map[int64]bool, h.cfg.k)
 		t100 := make(map[int64]bool, len(gt))
-		for i, id := range gt {
+		for _, id := range gt {
+			if truthLimit > 0 && int(id) >= truthLimit {
+				continue
+			}
 			mapped := int64(id) + 1
 			t100[mapped] = true
-			if i < h.cfg.k {
+			if len(t10) < h.cfg.k {
 				t10[mapped] = true
 			}
 		}
@@ -1580,9 +1612,23 @@ func (h *harness) runQueries(sess *protocol.ConnectionSession, querySQL string, 
 		lats:          lats,
 		recall10:      recall10,
 		recall10in100: recall10in100,
+		truthLimit:    truthLimit,
 		workerQueries: workerQueries,
 		segmentStats:  segmentStats,
 	}, nil
+}
+
+func (h *harness) recallTruthLimit() int {
+	if h == nil {
+		return 0
+	}
+	if h.cfg != nil && h.cfg.insertN > 0 {
+		if h.meta.NTrain > 0 && h.cfg.insertN > h.meta.NTrain {
+			return h.meta.NTrain
+		}
+		return h.cfg.insertN
+	}
+	return h.meta.NTrain
 }
 
 func sqliteCacheKB(mb int) int {

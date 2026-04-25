@@ -111,3 +111,45 @@ func TestCountTargetClusterDrift(t *testing.T) {
 		t.Fatalf("countTargetClusterDrift() = %f, want 0", drift)
 	}
 }
+
+func TestAllocateCatchUpChildCountsSumsToDesiredK(t *testing.T) {
+	t.Parallel()
+
+	parentCounts := []uint64{0, 16_000, 15_000, 1_000, 0}
+	got := allocateCatchUpChildCounts(parentCounts, 4, 64, 512)
+	var sum int
+	for parentID := 1; parentID < len(got); parentID++ {
+		sum += got[parentID]
+		if got[parentID] < 1 {
+			t.Fatalf("parent %d child count = %d, want at least 1", parentID, got[parentID])
+		}
+	}
+	if sum != 64 {
+		t.Fatalf("child sum = %d, want 64 (%v)", sum, got)
+	}
+	if got[1] <= got[3] {
+		t.Fatalf("heavy parent child count = %d, light parent = %d; want heavy > light", got[1], got[3])
+	}
+}
+
+func TestCatchUpChildIDLayoutPreservesParentIDs(t *testing.T) {
+	t.Parallel()
+
+	children := catchUpChildIDLayout([]int{0, 3, 1, 2}, 3, 6)
+	want := [][]int64{
+		nil,
+		{1, 4, 5},
+		{2},
+		{3, 6},
+	}
+	for parentID := 1; parentID < len(want); parentID++ {
+		if len(children[parentID]) != len(want[parentID]) {
+			t.Fatalf("parent %d children = %v, want %v", parentID, children[parentID], want[parentID])
+		}
+		for i := range want[parentID] {
+			if children[parentID][i] != want[parentID][i] {
+				t.Fatalf("parent %d children = %v, want %v", parentID, children[parentID], want[parentID])
+			}
+		}
+	}
+}

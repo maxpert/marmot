@@ -79,9 +79,10 @@ func BuildStableMemberCodec(spec IVFSpec, cs *kmeans.CentroidSet, training []Sta
 			residuals = append(residuals, residual)
 		}
 		pq, err := quantize.TrainPQ8(residuals, spec.InternalDim(), quantize.PQ8Options{
-			M:       quantize.DefaultPQ8Subquantizers,
-			MaxIter: 8,
-			Seed:    seed,
+			M:         quantize.DefaultPQ8Subquantizers,
+			MaxIter:   8,
+			Seed:      seed,
+			StoreNorm: spec.InternalMetric() == metric.MetricCosine,
 		})
 		if err != nil {
 			return nil, err
