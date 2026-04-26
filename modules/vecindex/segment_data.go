@@ -9,6 +9,8 @@ import (
 	"slices"
 	"sync"
 	"sync/atomic"
+
+	"github.com/maxpert/marmot/modules/vecindex/pkg/quantize"
 )
 
 const (
@@ -142,12 +144,6 @@ func OpenSegmentDataStore(path string) (*SegmentDataStore, error) {
 		return nil, fmt.Errorf("vecindex: invalid segment data metric %d", metric)
 	}
 	encoding := int64(header[13])
-	switch encoding {
-	case MemberEncodingRawPreparedF32, MemberEncodingResidualInt8, MemberEncodingResidualPQ8:
-	default:
-		_ = file.Close()
-		return nil, fmt.Errorf("vecindex: invalid segment data encoding %d", encoding)
-	}
 	dim := int(binary.LittleEndian.Uint32(header[16:20]))
 	internalDim := int(binary.LittleEndian.Uint32(header[20:24]))
 	epoch := binary.LittleEndian.Uint64(header[24:32])
@@ -162,6 +158,10 @@ func OpenSegmentDataStore(path string) (*SegmentDataStore, error) {
 	if maxCluster < 0 {
 		_ = file.Close()
 		return nil, fmt.Errorf("vecindex: invalid segment data maxCluster=%d", maxCluster)
+	}
+	if err := validateSegmentStableEncoding(metric, encoding, internalDim, vecBytes); err != nil {
+		_ = file.Close()
+		return nil, err
 	}
 
 	refBytes := int64((maxCluster + 1) * segmentDataRefSize)
@@ -315,6 +315,9 @@ func CreateSegmentDataWriter(path string, metric Metric, encoding int64, dim, in
 	if maxCluster < 0 {
 		return nil, fmt.Errorf("vecindex: segment data maxCluster must be >= 0")
 	}
+	if err := validateSegmentStableEncoding(metric, encoding, internalDim, vecBytes); err != nil {
+		return nil, err
+	}
 	tmpPath := path + ".tmp"
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err
@@ -458,6 +461,35 @@ func (w *SegmentDataWriter) Abort() {
 	}
 	if w.tmpPath != "" {
 		_ = os.Remove(w.tmpPath)
+	}
+}
+
+func validateSegmentStableEncoding(rankMetric Metric, encoding int64, internalDim int, vecBytes int) error {
+	if internalDim <= 0 || vecBytes <= 0 {
+		return fmt.Errorf("vecindex: invalid stable encoding dimensions")
+	}
+	switch encoding {
+	case MemberEncodingRawPreparedF32:
+		return fmt.Errorf("vecindex: raw stable encoding is retired")
+	case MemberEncodingResidualInt8:
+		if internalDim >= StablePQMinInternalDim {
+			return fmt.Errorf("vecindex: residual-int8 stable encoding is only allowed for internal dim < %d", StablePQMinInternalDim)
+		}
+		want := quantize.EncodedResidualSize(rankMetric, internalDim, MemberResidualBlockSize)
+		if vecBytes != want {
+			return fmt.Errorf("vecindex: residual-int8 stable vec bytes=%d want=%d", vecBytes, want)
+		}
+		return nil
+	case MemberEncodingResidualPQ8:
+		if internalDim < StablePQMinInternalDim {
+			return fmt.Errorf("vecindex: PQ stable encoding is only allowed for internal dim >= %d", StablePQMinInternalDim)
+		}
+		if vecBytes >= internalDim*4 {
+			return fmt.Errorf("vecindex: PQ stable vec bytes=%d must be smaller than raw bytes=%d", vecBytes, internalDim*4)
+		}
+		return nil
+	default:
+		return fmt.Errorf("vecindex: invalid segment data encoding %d", encoding)
 	}
 }
 

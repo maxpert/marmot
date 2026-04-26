@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/maxpert/marmot/cfg"
+	"github.com/maxpert/marmot/common"
 	"github.com/maxpert/marmot/db"
 	pb "github.com/maxpert/marmot/grpc/common"
 	"github.com/maxpert/marmot/hlc"
@@ -327,6 +328,11 @@ func (ds *DeltaSyncClient) applyChangeEvent(ctx context.Context, event *ChangeEv
 	if err != nil {
 		return fmt.Errorf("database %s not found: %w", database, err)
 	}
+	if len(event.Statements) == 1 {
+		if change := event.Statements[0].GetVectorIndexChange(); change != nil {
+			return ds.applyVectorIndexChange(ctx, vectorChangeFromProto(change))
+		}
+	}
 
 	// Execute each statement in a transaction
 	tx, err := mdb.GetDB().BeginTx(ctx, nil)
@@ -403,8 +409,57 @@ func (ds *DeltaSyncClient) applyChangeEvent(ctx context.Context, event *ChangeEv
 			log.Warn().Err(err).Str("database", database).Msg("DELTA-SYNC: failed to reload schema after DDL")
 		}
 	}
+	ds.applyVectorCDCFromEvent(ctx, database, event)
 
 	return nil
+}
+
+func (ds *DeltaSyncClient) applyVectorIndexChange(ctx context.Context, change common.VectorIndexChange) error {
+	vecMgr := ds.dbManager.GetVectorIndexManager()
+	if vecMgr == nil {
+		return fmt.Errorf("vector index manager not configured")
+	}
+	applier, ok := vecMgr.(interface {
+		ApplyVectorControl(context.Context, common.VectorIndexChange) error
+	})
+	if !ok {
+		return fmt.Errorf("vector index manager cannot apply replicated control metadata")
+	}
+	return applier.ApplyVectorControl(ctx, change)
+}
+
+func (ds *DeltaSyncClient) applyVectorCDCFromEvent(ctx context.Context, database string, event *ChangeEvent) {
+	entries := make([]common.CDCEntry, 0, len(event.Statements))
+	for _, stmt := range event.Statements {
+		rowChange := stmt.GetRowChange()
+		if rowChange == nil || (len(rowChange.NewValues) == 0 && len(rowChange.OldValues) == 0) {
+			continue
+		}
+		entries = append(entries, common.CDCEntry{
+			Table:        stmt.TableName,
+			IntentKey:    rowChange.IntentKey,
+			OldValues:    rowChange.OldValues,
+			NewValues:    rowChange.NewValues,
+			CommitTxnID:  event.TxnId,
+			CommitSeqNum: event.SeqNum,
+		})
+	}
+	if len(entries) == 0 {
+		return
+	}
+	vecMgr := ds.dbManager.GetVectorIndexManager()
+	if vecMgr == nil {
+		return
+	}
+	applier, ok := vecMgr.(interface {
+		ApplyCommittedVectorCDC(context.Context, string, uint64, uint64, []common.CDCEntry) error
+	})
+	if !ok {
+		return
+	}
+	if err := applier.ApplyCommittedVectorCDC(ctx, database, event.TxnId, event.SeqNum, entries); err != nil {
+		log.Error().Err(err).Uint64("txn_id", event.TxnId).Str("database", database).Msg("DELTA-SYNC: failed to apply vector CDC")
+	}
 }
 
 // deltaSyncSchemaAdapter adapts DatabaseManager schema access to CDCSchemaProvider

@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"reflect"
 	"sort"
@@ -198,16 +199,16 @@ func TestOpenSegmentGenerationResidualPQ8(t *testing.T) {
 		ColumnName: "embed",
 		Database:   "testdb",
 		Metric:     "l2",
-		Dim:        16,
+		Dim:        vecindex.StablePQMinInternalDim,
 		CreatedAt:  1,
 	}
-	spec := vecindex.IVFSpec{ID: idx, Dim: 16, Metric: vecindex.MetricL2, Nlist: 1, Nprobe: 1}
+	spec := vecindex.IVFSpec{ID: idx, Dim: vecindex.StablePQMinInternalDim, Metric: vecindex.MetricL2, Nlist: 1, Nprobe: 1}
 	centroid := make([]float32, spec.InternalDim())
 	cs, err := kmeans.NewCentroidSet(1, [][]float32{centroid})
 	if err != nil {
 		t.Fatalf("NewCentroidSet: %v", err)
 	}
-	residuals := make([][]float32, 300)
+	residuals := make([][]float32, 32)
 	for i := range residuals {
 		residuals[i] = make([]float32, spec.InternalDim())
 		for d := range residuals[i] {
@@ -390,7 +391,7 @@ func TestBuildIncrementalSegmentGeneration_RewritesTouchedClustersOnly(t *testin
 		t.Fatalf("overlay apply: %v", err)
 	}
 
-	stats, err := buildCutoffClusterStats(spec, base, overlay.Snapshot(), 3, nil)
+	stats, err := buildCutoffClusterStats(context.Background(), spec, base, overlay.Snapshot(), 3, nil, nil)
 	if err != nil {
 		t.Fatalf("buildCutoffClusterStats: %v", err)
 	}
@@ -414,8 +415,14 @@ func TestBuildIncrementalSegmentGeneration_RewritesTouchedClustersOnly(t *testin
 		t.Fatalf("BuildIncrementalSegmentGeneration: %v", err)
 	}
 	defer pending.Close()
+	if _, err := os.Stat(pending.stagingDir); err != nil {
+		t.Fatalf("pending staging dir missing before publish: %v", err)
+	}
 	if err := pending.Publish(); err != nil {
 		t.Fatalf("publish incremental generation: %v", err)
+	}
+	if _, err := os.Stat(pending.stagingDir); !os.IsNotExist(err) {
+		t.Fatalf("pending staging dir exists after publish: %v", err)
 	}
 	next := pending.generation
 	pending.generation = nil

@@ -81,11 +81,11 @@ func TestOpenSegmentDataStoreRejectsUnknownEncoding(t *testing.T) {
 	t.Parallel()
 
 	path := t.TempDir() + "/segment.dat"
-	writer, err := CreateSegmentDataWriter(path, MetricCosine, MemberEncodingRawPreparedF32, 2, 2, 8, 1, 1, 1)
+	writer, err := CreateSegmentDataWriter(path, MetricCosine, MemberEncodingResidualInt8, 2, 2, 4, 1, 1, 1)
 	if err != nil {
 		t.Fatalf("CreateSegmentDataWriter: %v", err)
 	}
-	if err := writer.Append(1, 11, make([]byte, 8)); err != nil {
+	if err := writer.Append(1, 11, make([]byte, 4)); err != nil {
 		t.Fatalf("Append: %v", err)
 	}
 	store, err := writer.Close()
@@ -111,11 +111,43 @@ func TestOpenSegmentDataStoreRejectsUnknownEncoding(t *testing.T) {
 	}
 }
 
+func TestCreateSegmentDataWriterRejectsRetiredRawEncoding(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "segment.dat")
+	_, err := CreateSegmentDataWriter(path, MetricCosine, MemberEncodingRawPreparedF32, 2, 2, 8, 1, 1, 1)
+	if err == nil {
+		t.Fatal("CreateSegmentDataWriter accepted raw stable encoding")
+	}
+}
+
+func TestCreateSegmentDataWriterRejectsHighDimResidualInt8(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "segment.dat")
+	_, err := CreateSegmentDataWriter(path, MetricCosine, MemberEncodingResidualInt8, StablePQMinInternalDim, StablePQMinInternalDim, StablePQMinInternalDim+4, 1, 1, 1)
+	if err == nil {
+		t.Fatal("CreateSegmentDataWriter accepted high-dimensional residual-int8 stable encoding")
+	}
+}
+
+func TestCreateSegmentDataWriterAcceptsLowDimResidualInt8(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "segment.dat")
+	vecBytes := 4
+	writer, err := CreateSegmentDataWriter(path, MetricCosine, MemberEncodingResidualInt8, 2, 2, vecBytes, 1, 1, 1)
+	if err != nil {
+		t.Fatalf("CreateSegmentDataWriter: %v", err)
+	}
+	writer.Abort()
+}
+
 func TestSegmentDataStoreScanClustersFileOrderRoundTrip(t *testing.T) {
 	t.Parallel()
 
 	path := filepath.Join(t.TempDir(), "segment.dat")
-	writer, err := CreateSegmentDataWriter(path, MetricCosine, MemberEncodingResidualInt8, 2, 2, 6, 3, 1, 1)
+	writer, err := CreateSegmentDataWriter(path, MetricCosine, MemberEncodingResidualInt8, 2, 2, 4, 3, 1, 1)
 	if err != nil {
 		t.Fatalf("CreateSegmentDataWriter: %v", err)
 	}
@@ -124,9 +156,9 @@ func TestSegmentDataStoreScanClustersFileOrderRoundTrip(t *testing.T) {
 		rowID     int64
 		vec       []byte
 	}{
-		{clusterID: 1, rowID: 11, vec: []byte{1, 2, 3, 4, 5, 6}},
-		{clusterID: 2, rowID: 21, vec: []byte{7, 8, 9, 10, 11, 12}},
-		{clusterID: 2, rowID: 22, vec: []byte{13, 14, 15, 16, 17, 18}},
+		{clusterID: 1, rowID: 11, vec: []byte{1, 2, 3, 4}},
+		{clusterID: 2, rowID: 21, vec: []byte{7, 8, 9, 10}},
+		{clusterID: 2, rowID: 22, vec: []byte{13, 14, 15, 16}},
 	}
 	for _, row := range rows {
 		if err := writer.Append(row.clusterID, row.rowID, row.vec); err != nil {
@@ -156,7 +188,7 @@ func TestSegmentDataStoreScanClustersFileOrderSpansRoundTrip(t *testing.T) {
 	t.Parallel()
 
 	path := filepath.Join(t.TempDir(), "segment.dat")
-	writer, err := CreateSegmentDataWriter(path, MetricCosine, MemberEncodingResidualInt8, 2, 2, 6, 3, 1, 1)
+	writer, err := CreateSegmentDataWriter(path, MetricCosine, MemberEncodingResidualInt8, 2, 2, 4, 3, 1, 1)
 	if err != nil {
 		t.Fatalf("CreateSegmentDataWriter: %v", err)
 	}
@@ -165,9 +197,9 @@ func TestSegmentDataStoreScanClustersFileOrderSpansRoundTrip(t *testing.T) {
 		rowID     int64
 		vec       []byte
 	}{
-		{clusterID: 1, rowID: 11, vec: []byte{1, 2, 3, 4, 5, 6}},
-		{clusterID: 2, rowID: 21, vec: []byte{7, 8, 9, 10, 11, 12}},
-		{clusterID: 2, rowID: 22, vec: []byte{13, 14, 15, 16, 17, 18}},
+		{clusterID: 1, rowID: 11, vec: []byte{1, 2, 3, 4}},
+		{clusterID: 2, rowID: 21, vec: []byte{7, 8, 9, 10}},
+		{clusterID: 2, rowID: 22, vec: []byte{13, 14, 15, 16}},
 	}
 	for _, row := range rows {
 		if err := writer.Append(row.clusterID, row.rowID, row.vec); err != nil {

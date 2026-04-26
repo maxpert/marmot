@@ -117,17 +117,7 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 	// Convert proto statements to internal format
 	statements := make([]protocol.Statement, 0, len(req.Statements))
 	for _, stmt := range req.Statements {
-		internalStmt := protocol.Statement{
-			SQL:       stmt.GetSQL(),
-			Type:      common.MustFromWireType(stmt.Type),
-			TableName: stmt.TableName,
-			Database:  stmt.Database,
-			IntentKey: stmt.GetIntentKey(),
-		}
-		if rowChange := stmt.GetRowChange(); rowChange != nil {
-			internalStmt.OldValues = rowChange.OldValues
-			internalStmt.NewValues = rowChange.NewValues
-		}
+		internalStmt := protocolStatementFromProto(stmt)
 		if loadData := stmt.GetLoadDataChange(); loadData != nil {
 			internalStmt.SQL = loadData.Sql
 			internalStmt.LoadDataPayload = loadData.Data
@@ -192,22 +182,7 @@ func (rh *ReplicationHandler) handleCommit(ctx context.Context, req *Transaction
 	// Convert proto statements to internal format (CDC data deferred from PREPARE)
 	statements := make([]protocol.Statement, 0, len(req.Statements))
 	for _, stmt := range req.Statements {
-		internalStmt := protocol.Statement{
-			SQL:       stmt.GetSQL(),
-			Type:      common.MustFromWireType(stmt.Type),
-			TableName: stmt.TableName,
-			Database:  stmt.Database,
-			IntentKey: stmt.GetIntentKey(),
-		}
-		if rowChange := stmt.GetRowChange(); rowChange != nil {
-			internalStmt.OldValues = rowChange.OldValues
-			internalStmt.NewValues = rowChange.NewValues
-		}
-		if loadData := stmt.GetLoadDataChange(); loadData != nil {
-			internalStmt.SQL = loadData.Sql
-			internalStmt.LoadDataPayload = loadData.Data
-		}
-		statements = append(statements, internalStmt)
+		statements = append(statements, protocolStatementFromProto(stmt))
 	}
 
 	engineReq := &db.CommitRequest{
@@ -335,6 +310,27 @@ func (rh *ReplicationHandler) handleReplay(ctx context.Context, req *Transaction
 			ErrorMessage: fmt.Sprintf("database %s not found: %v", dbName, err),
 		}, nil
 	}
+	if len(req.Statements) == 1 {
+		if change := req.Statements[0].GetVectorIndexChange(); change != nil {
+			if err := rh.applyVectorIndexChange(ctx, vectorChangeFromProto(change)); err != nil {
+				telemetry.ReplicationRequestsTotal.With("replay", "failed").Inc()
+				return &TransactionResponse{
+					Success:      false,
+					ErrorMessage: fmt.Sprintf("failed to apply vector index control: %v", err),
+				}, nil
+			}
+			rh.storeReplayRecord(req, dbInstance, dbName)
+			telemetry.ReplicationRequestsTotal.With("replay", "success").Inc()
+			return &TransactionResponse{
+				Success: true,
+				AppliedAt: &HLC{
+					WallTime: rh.clock.Now().WallTime,
+					Logical:  rh.clock.Now().Logical,
+					NodeId:   rh.nodeID,
+				},
+			}, nil
+		}
+	}
 
 	sqliteDB := dbInstance.GetDB()
 
@@ -443,6 +439,11 @@ func (rh *ReplicationHandler) handleReplay(ctx context.Context, req *Transaction
 				Uint64("txn_id", req.TxnId).
 				Msg("handleReplay: failed to store transaction record in MetaStore")
 		}
+		var seqNum uint64
+		if rec, recErr := metaStore.GetTransaction(req.TxnId); recErr == nil && rec != nil {
+			seqNum = rec.SeqNum
+		}
+		rh.applyVectorCDCFromStatements(ctx, dbName, req.TxnId, seqNum, req.Statements)
 	}
 
 	log.Debug().
@@ -460,6 +461,69 @@ func (rh *ReplicationHandler) handleReplay(ctx context.Context, req *Transaction
 			NodeId:   rh.nodeID,
 		},
 	}, nil
+}
+
+func (rh *ReplicationHandler) applyVectorIndexChange(ctx context.Context, change common.VectorIndexChange) error {
+	vecMgr := rh.dbMgr.GetVectorIndexManager()
+	if vecMgr == nil {
+		return fmt.Errorf("vector index manager not configured")
+	}
+	applier, ok := vecMgr.(interface {
+		ApplyVectorControl(context.Context, common.VectorIndexChange) error
+	})
+	if !ok {
+		return fmt.Errorf("vector index manager cannot apply replicated control metadata")
+	}
+	return applier.ApplyVectorControl(ctx, change)
+}
+
+func (rh *ReplicationHandler) storeReplayRecord(req *TransactionRequest, dbInstance *db.ReplicatedDatabase, dbName string) {
+	metaStore := dbInstance.GetMetaStore()
+	if metaStore == nil {
+		return
+	}
+	commitTS := hlc.Timestamp{
+		WallTime: req.Timestamp.WallTime,
+		Logical:  req.Timestamp.Logical,
+		NodeID:   req.Timestamp.NodeId,
+	}
+	if err := metaStore.StoreReplayedTransaction(req.TxnId, req.Timestamp.NodeId, commitTS, dbName, uint32(len(req.Statements))); err != nil {
+		log.Warn().Err(err).Uint64("txn_id", req.TxnId).Msg("handleReplay: failed to store transaction record in MetaStore")
+	}
+}
+
+func (rh *ReplicationHandler) applyVectorCDCFromStatements(ctx context.Context, database string, txnID, seqNum uint64, statements []*Statement) {
+	entries := make([]common.CDCEntry, 0, len(statements))
+	for _, stmt := range statements {
+		rowChange := stmt.GetRowChange()
+		if rowChange == nil || (len(rowChange.NewValues) == 0 && len(rowChange.OldValues) == 0) {
+			continue
+		}
+		entries = append(entries, common.CDCEntry{
+			Table:        stmt.TableName,
+			IntentKey:    rowChange.IntentKey,
+			OldValues:    rowChange.OldValues,
+			NewValues:    rowChange.NewValues,
+			CommitTxnID:  txnID,
+			CommitSeqNum: seqNum,
+		})
+	}
+	if len(entries) == 0 {
+		return
+	}
+	vecMgr := rh.dbMgr.GetVectorIndexManager()
+	if vecMgr == nil {
+		return
+	}
+	applier, ok := vecMgr.(interface {
+		ApplyCommittedVectorCDC(context.Context, string, uint64, uint64, []common.CDCEntry) error
+	})
+	if !ok {
+		return
+	}
+	if err := applier.ApplyCommittedVectorCDC(ctx, database, txnID, seqNum, entries); err != nil {
+		log.Error().Err(err).Uint64("txn_id", txnID).Str("database", database).Msg("handleReplay: failed to apply vector CDC")
+	}
 }
 
 // replicationSchemaAdapter adapts DatabaseManager schema access to CDCSchemaProvider

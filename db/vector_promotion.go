@@ -305,7 +305,7 @@ func (h *EngineHook) publishIncrementalPromotion(
 	if err := plan.pending.Publish(); err != nil {
 		return err
 	}
-	nextOverlay, err := rewriteOverlayTailForProbe(dbPath, meta.IndexName, plan.nextProbe.Epoch(), plan.cutoff, currentSnapshot, plan.nextSpec, plan.nextProbe, plan.pending.generation)
+	nextOverlay, err := rewriteOverlayTailForProbe(ctx, conn, dbPath, meta, plan.nextProbe.Epoch(), plan.cutoff, currentSnapshot, plan.nextSpec, plan.nextProbe, plan.pending.generation)
 	if err != nil {
 		return err
 	}

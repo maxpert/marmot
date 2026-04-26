@@ -156,54 +156,16 @@ func (m *VectorIndexManager) Stop() error {
 // CreateIndex records the vector-index metadata in SQLite and then lets the
 // engine build or bootstrap the local file-backed serving state.
 func (m *VectorIndexManager) CreateIndex(ctx context.Context, meta VectorIndexMeta) error {
+	meta, err := m.ResolveCreateIndexMeta(ctx, meta)
+	if err != nil {
+		return err
+	}
 	conn, err := m.dbMgr.GetDatabaseConnection(meta.Database)
 	if err != nil {
 		return fmt.Errorf("vector index: get database %s: %w", meta.Database, err)
 	}
-
-	// Schema migration is run at Start(); skip redundant call here.
-
-	if err := vecindex.ValidateIndexName(meta.IndexName); err != nil {
-		return fmt.Errorf("vector index: %w", err)
-	}
-
-	if err := ValidateBaseTableForVectorIndex(conn, meta.TableName); err != nil {
-		return err
-	}
-
-	meta.AutoTuneNlist = meta.Nlist == 0
-	meta.AutoTuneNprobe = meta.Nprobe == 0
-	if meta.TargetPartitionSize <= 0 {
-		meta.TargetPartitionSize = defaultTargetPartitionSize
-	}
-
-	// Auto-tune nlist and nprobe if not user-supplied (design §6.1).
-	if meta.AutoTuneNlist || meta.AutoTuneNprobe {
-		metric, err := metricFromString(meta.Metric)
-		if err != nil {
-			return fmt.Errorf("vector index: parse metric for auto-tune: %w", err)
-		}
-		n, err := countIndexableRows(ctx, conn, meta.TableName, meta.ColumnName, vecindex.IVFSpec{
-			ID:      meta.IndexName,
-			Dim:     meta.Dim,
-			Metric:  metric,
-			MaxNorm: meta.MaxNorm,
-		})
-		if err != nil {
-			return fmt.Errorf("vector index: count indexable rows for auto-tune: %w", err)
-		}
-		if meta.AutoTuneNlist {
-			meta.Nlist = autoTuneNlistForTarget(n, meta.TargetPartitionSize)
-		}
-		if meta.AutoTuneNprobe {
-			meta.Nprobe = autoTuneNprobeForTarget(meta.Nlist, meta.TargetPartitionSize)
-		}
-		// Only preserve the auto flags when CREATE happened against an empty
-		// table; otherwise the parameters already reflect a meaningful corpus.
-		if n > 0 {
-			meta.AutoTuneNlist = false
-			meta.AutoTuneNprobe = false
-		}
+	if err := MigrateVectorIndexesSchema(conn); err != nil {
+		return fmt.Errorf("vector index schema migration for %s: %w", meta.Database, err)
 	}
 
 	if err := m.execCreateDDL(ctx, conn, meta); err != nil {
@@ -247,6 +209,63 @@ func (m *VectorIndexManager) CreateIndex(ctx context.Context, meta VectorIndexMe
 	return nil
 }
 
+// ResolveCreateIndexMeta validates create metadata and resolves auto-tuned
+// parameters once at the coordinator before the vector-control payload is
+// replicated. Replicas apply the resolved metadata without re-deciding nlist.
+func (m *VectorIndexManager) ResolveCreateIndexMeta(ctx context.Context, meta VectorIndexMeta) (VectorIndexMeta, error) {
+	conn, err := m.dbMgr.GetDatabaseConnection(meta.Database)
+	if err != nil {
+		return meta, fmt.Errorf("vector index: get database %s: %w", meta.Database, err)
+	}
+	if err := vecindex.ValidateIndexName(meta.IndexName); err != nil {
+		return meta, fmt.Errorf("vector index: %w", err)
+	}
+	if err := ValidateBaseTableForVectorIndex(conn, meta.TableName); err != nil {
+		return meta, err
+	}
+	resolveNlist := meta.Nlist == 0
+	resolveNprobe := meta.Nprobe == 0
+	if resolveNlist {
+		meta.AutoTuneNlist = true
+	}
+	if resolveNprobe {
+		meta.AutoTuneNprobe = true
+	}
+	if meta.TargetPartitionSize <= 0 {
+		meta.TargetPartitionSize = defaultTargetPartitionSize
+	}
+	if resolveNlist || resolveNprobe {
+		metric, err := metricFromString(meta.Metric)
+		if err != nil {
+			return meta, fmt.Errorf("vector index: parse metric for auto-tune: %w", err)
+		}
+		n, err := countIndexableRows(ctx, conn, meta.TableName, meta.ColumnName, vecindex.IVFSpec{
+			ID:      meta.IndexName,
+			Dim:     meta.Dim,
+			Metric:  metric,
+			MaxNorm: meta.MaxNorm,
+		})
+		if err != nil {
+			return meta, fmt.Errorf("vector index: count indexable rows for auto-tune: %w", err)
+		}
+		if resolveNlist {
+			meta.Nlist = autoTuneNlistForTarget(n, meta.TargetPartitionSize)
+		}
+		if resolveNprobe {
+			meta.Nprobe = autoTuneNprobeForTarget(meta.Nlist, meta.TargetPartitionSize)
+		}
+		if n > 0 {
+			if resolveNlist {
+				meta.AutoTuneNlist = false
+			}
+			if resolveNprobe {
+				meta.AutoTuneNprobe = false
+			}
+		}
+	}
+	return meta, nil
+}
+
 // DropIndex removes in-memory engine state first so concurrent queries fail
 // fast, then deletes the metadata row from SQLite.
 func (m *VectorIndexManager) DropIndex(ctx context.Context, indexName, database string) error {
@@ -270,7 +289,7 @@ func (m *VectorIndexManager) DropIndex(ctx context.Context, indexName, database 
 	var removedMeta *VectorIndexMeta
 	m.cacheMu.Lock()
 	for k, v := range m.indexCache {
-		if v.IndexName == indexName {
+		if v.Database == database && v.IndexName == indexName {
 			removedKey = k
 			removedMeta = v
 			delete(m.indexCache, k)
@@ -316,7 +335,7 @@ func (m *VectorIndexManager) ReindexIndex(ctx context.Context, indexName string)
 		return fmt.Errorf("vector reindex: %w", err)
 	}
 
-	meta, ok := m.getIndexByName(indexName)
+	meta, ok := m.getIndexByNameAny(indexName)
 	if !ok {
 		return fmt.Errorf("MARMOT-VEC-013: vector index %q not found", indexName)
 	}
@@ -364,10 +383,22 @@ func (m *VectorIndexManager) ReindexIndex(ctx context.Context, indexName string)
 	return nil
 }
 
-// getIndexByName scans the in-memory cache for a metadata row by index name.
+// getIndexByName scans the in-memory cache for a metadata row by database and index name.
 // Returns a copy plus ok=true on hit. O(n) in the number of indexes, which
 // is small (typically 0-10 per node).
-func (m *VectorIndexManager) getIndexByName(name string) (*VectorIndexMeta, bool) {
+func (m *VectorIndexManager) getIndexByName(database, name string) (*VectorIndexMeta, bool) {
+	m.cacheMu.RLock()
+	defer m.cacheMu.RUnlock()
+	for _, v := range m.indexCache {
+		if v.Database == database && v.IndexName == name {
+			cp := *v
+			return &cp, true
+		}
+	}
+	return nil, false
+}
+
+func (m *VectorIndexManager) getIndexByNameAny(name string) (*VectorIndexMeta, bool) {
 	m.cacheMu.RLock()
 	defer m.cacheMu.RUnlock()
 	for _, v := range m.indexCache {
@@ -412,8 +443,20 @@ func (m *VectorIndexManager) storeCachedIndexMeta(meta *VectorIndexMeta) {
 // committed successfully on this node. It never touches replication payload;
 // it only forwards relevant CDC entries to the local file-backed vector path.
 func (m *VectorIndexManager) ApplyLocalCDC(ctx context.Context, database string, entries []common.CDCEntry) error {
+	return m.ApplyCommittedVectorCDC(ctx, database, 0, 0, entries)
+}
+
+func (m *VectorIndexManager) ApplyCommittedVectorCDC(ctx context.Context, database string, txnID, seqNum uint64, entries []common.CDCEntry) error {
 	if len(entries) == 0 {
 		return nil
+	}
+	for i := range entries {
+		if entries[i].CommitTxnID == 0 {
+			entries[i].CommitTxnID = txnID
+		}
+		if entries[i].CommitSeqNum == 0 {
+			entries[i].CommitSeqNum = seqNum
+		}
 	}
 
 	m.mu.Lock()
@@ -434,11 +477,62 @@ func (m *VectorIndexManager) ApplyLocalCDC(ctx context.Context, database string,
 	for tableName, tableEntries := range byTable {
 		for _, meta := range m.indexesForTable(database, tableName) {
 			if err := hook.OnIndexLocalChanges(ctx, meta, tableEntries); err != nil {
+				m.markIndexDirty(ctx, meta, err)
 				return err
 			}
 		}
 	}
 	return nil
+}
+
+func (m *VectorIndexManager) ApplyVectorControl(ctx context.Context, change common.VectorIndexChange) error {
+	if change.Database == "" {
+		return fmt.Errorf("vector index control: database is required")
+	}
+	if change.IndexName == "" {
+		return fmt.Errorf("vector index control: index name is required")
+	}
+	switch change.Action {
+	case common.VectorIndexActionCreate:
+		if existing, ok := m.getIndexByName(change.Database, change.IndexName); ok {
+			m.storeCachedIndexMeta(existing)
+			return nil
+		}
+		return m.CreateIndex(ctx, change.Meta())
+	case common.VectorIndexActionDrop:
+		return m.DropIndex(ctx, change.IndexName, change.Database)
+	case common.VectorIndexActionReindex:
+		return m.ReindexIndex(ctx, change.IndexName)
+	case common.VectorIndexActionCheckpoint:
+		if existing, ok := m.getIndexByName(change.Database, change.IndexName); ok {
+			m.mu.Lock()
+			maintenanceHook, _ := m.lifecycleHook.(interface {
+				StartMaintenanceForIndex(common.VectorIndexMeta)
+			})
+			m.mu.Unlock()
+			if maintenanceHook != nil {
+				maintenanceHook.StartMaintenanceForIndex(*existing)
+			}
+			return nil
+		}
+		return fmt.Errorf("vector index control: checkpoint index %q not found", change.IndexName)
+	default:
+		return fmt.Errorf("vector index control: unsupported action %d", change.Action)
+	}
+}
+
+func (m *VectorIndexManager) markIndexDirty(ctx context.Context, meta common.VectorIndexMeta, cause error) {
+	conn, err := m.dbMgr.GetDatabaseConnection(meta.Database)
+	if err == nil {
+		if _, updateErr := conn.ExecContext(ctx,
+			`UPDATE __marmot_vector_indexes SET status='dirty' WHERE index_name=?`,
+			meta.IndexName,
+		); updateErr != nil {
+			log.Warn().Err(updateErr).Str("index", meta.IndexName).Msg("VectorIndexManager: failed to mark dirty")
+		}
+	}
+	m.setCachedStatus(meta.Database, meta.TableName, meta.ColumnName, "dirty")
+	log.Error().Err(cause).Str("index", meta.IndexName).Msg("VectorIndexManager: local vector index marked dirty")
 }
 
 func (m *VectorIndexManager) indexesForTable(database, table string) []common.VectorIndexMeta {
@@ -677,13 +771,19 @@ func (m *VectorIndexManager) GetIndexByColumn(database, table, column string) (*
 	if database != "" {
 		key := indexCacheKey{database: database, table: table, column: column}
 		meta, ok := m.indexCache[key]
-		return meta, ok
+		if !ok || !isQueryableVectorIndex(meta) {
+			return nil, false
+		}
+		return meta, true
 	}
 
 	// Empty database: scan for a unique match.
 	var found *VectorIndexMeta
 	for k, v := range m.indexCache {
 		if k.table == table && k.column == column {
+			if !isQueryableVectorIndex(v) {
+				continue
+			}
 			if found != nil {
 				// Ambiguous — caller must supply a database qualifier.
 				return nil, false
@@ -692,6 +792,13 @@ func (m *VectorIndexManager) GetIndexByColumn(database, table, column string) (*
 		}
 	}
 	return found, found != nil
+}
+
+func isQueryableVectorIndex(meta *VectorIndexMeta) bool {
+	if meta == nil {
+		return false
+	}
+	return meta.Status != "dirty"
 }
 
 // EstimatedRowCount returns an approximate row count for (database, table).

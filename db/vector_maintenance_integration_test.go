@@ -406,7 +406,7 @@ func TestIncrementalMerge_PreservesOverlayTailAcrossPublish(t *testing.T) {
 	tailRaw := encodeVec(t, []float32{0.2, 0.8, 0.4, 0.6})
 	applyTail(bootstrapRows+2, tailRaw)
 
-	require.NoError(t, hook.publishIncrementalMerge(dbPath, meta, plan))
+	require.NoError(t, hook.publishIncrementalMerge(context.Background(), conn, dbPath, meta, plan))
 
 	state, _ = engine.Lookup(meta.IndexName)
 	require.Equal(t, oldEpoch, state.ProbeVersion())

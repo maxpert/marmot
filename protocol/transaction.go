@@ -90,6 +90,7 @@ const (
 	StatementCreateVectorIndex  = common.StatementCreateVectorIndex
 	StatementDropVectorIndex    = common.StatementDropVectorIndex
 	StatementReindexVectorIndex = common.StatementReindexVectorIndex
+	StatementVectorIndexControl = common.StatementVectorIndexControl
 )
 
 // InformationSchemaTableType identifies which INFORMATION_SCHEMA table is being queried
@@ -148,13 +149,14 @@ type Statement struct {
 	ShowFilter string
 
 	// Vector index metadata (populated for CREATE/DROP VECTOR INDEX)
-	VectorIndexName  string  `msgpack:"-"` // Index name
-	VectorColumnName string  `msgpack:"-"` // Column being indexed
-	VectorMetric     string  `msgpack:"-"` // cosine, l2, dot
-	VectorDim        int     `msgpack:"-"` // Vector dimensionality
-	VectorNlist      int     `msgpack:"-"` // Number of IVF centroids (0 = auto-tune)
-	VectorNprobe     int     `msgpack:"-"` // Clusters searched per query (0 = auto-tune)
-	VectorMaxNorm    float32 `msgpack:"-"` // Max norm for dot-product augmentation
+	VectorIndexName   string                    `msgpack:"-"` // Index name
+	VectorColumnName  string                    `msgpack:"-"` // Column being indexed
+	VectorMetric      string                    `msgpack:"-"` // cosine, l2, dot
+	VectorDim         int                       `msgpack:"-"` // Vector dimensionality
+	VectorNlist       int                       `msgpack:"-"` // Number of IVF centroids (0 = auto-tune)
+	VectorNprobe      int                       `msgpack:"-"` // Clusters searched per query (0 = auto-tune)
+	VectorMaxNorm     float32                   `msgpack:"-"` // Max norm for dot-product augmentation
+	VectorIndexChange *common.VectorIndexChange `msgpack:"VectorIndexChange,omitempty"`
 
 	// ExtractedParams holds literal values extracted during transpilation.
 	// Used for local execution only - not serialized for CDC replication.

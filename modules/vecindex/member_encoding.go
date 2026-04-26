@@ -16,9 +16,12 @@ const (
 )
 
 const MemberResidualBlockSize = quantize.DefaultResidualBlockSize
-const pqTrainingRowFloor = 4096
+const StablePQMinInternalDim = 512
 
 func StableMemberEncodingSpec(spec IVFSpec) (int64, int) {
+	if spec.InternalDim() >= StablePQMinInternalDim {
+		return MemberEncodingResidualPQ8, 0
+	}
 	return MemberEncodingResidualInt8, quantize.EncodedResidualSize(spec.InternalMetric(), spec.InternalDim(), MemberResidualBlockSize)
 }
 
@@ -35,11 +38,9 @@ type StableMemberCodec struct {
 }
 
 type StableMemberScorer struct {
-	enc       int64
-	rawMetric metric.Metric
-	query     []float32
-	residual  *quantize.ResidualInt8Scorer
-	pq        *quantize.PQ8Scorer
+	enc      int64
+	residual *quantize.ResidualInt8Scorer
+	pq       *quantize.PQ8Scorer
 }
 
 type StableMemberQueryScorer struct {
@@ -59,7 +60,10 @@ func BuildStableMemberCodec(spec IVFSpec, cs *kmeans.CentroidSet, training []Sta
 	if cs == nil {
 		return nil, fmt.Errorf("vecindex: centroid set is nil")
 	}
-	if spec.InternalDim() >= 512 && len(training) >= pqTrainingRowFloor {
+	if spec.InternalDim() >= StablePQMinInternalDim {
+		if len(training) == 0 {
+			return nil, fmt.Errorf("vecindex: PQ stable codec requires training vectors")
+		}
 		residuals := make([][]float32, 0, len(training))
 		for i, sample := range training {
 			if sample.ClusterID <= 0 || int(sample.ClusterID) > cs.Len() {
@@ -104,8 +108,11 @@ func NewStableMemberCodec(spec IVFSpec, cs *kmeans.CentroidSet, enc int64, pq *q
 }
 
 func DecodeStableMemberCodecBlob(spec IVFSpec, cs *kmeans.CentroidSet, enc int64, blob []byte) (*StableMemberCodec, error) {
-	if enc != MemberEncodingResidualPQ8 {
+	if enc == MemberEncodingResidualInt8 {
 		return NewStableMemberCodec(spec, cs, enc, nil)
+	}
+	if enc != MemberEncodingResidualPQ8 {
+		return nil, fmt.Errorf("vecindex: retired stable encoding %d", enc)
 	}
 	if len(blob) == 0 {
 		return nil, fmt.Errorf("vecindex: missing PQ codec blob")
@@ -152,8 +159,6 @@ func (c *StableMemberCodec) EncodedSize() int {
 		return 0
 	}
 	switch c.enc {
-	case MemberEncodingRawPreparedF32:
-		return c.spec.InternalDim() * 4
 	case MemberEncodingResidualInt8:
 		return quantize.EncodedResidualSize(c.spec.InternalMetric(), c.spec.InternalDim(), MemberResidualBlockSize)
 	case MemberEncodingResidualPQ8:
@@ -178,9 +183,17 @@ func (c *StableMemberCodec) Validate() error {
 		return fmt.Errorf("vecindex: stable codec centroid set is nil")
 	}
 	switch c.enc {
-	case MemberEncodingRawPreparedF32, MemberEncodingResidualInt8:
+	case MemberEncodingRawPreparedF32:
+		return fmt.Errorf("vecindex: raw stable encoding is retired")
+	case MemberEncodingResidualInt8:
+		if c.spec.InternalDim() >= StablePQMinInternalDim {
+			return fmt.Errorf("vecindex: residual-int8 stable encoding is only allowed for internal dim < %d", StablePQMinInternalDim)
+		}
 		return nil
 	case MemberEncodingResidualPQ8:
+		if c.spec.InternalDim() < StablePQMinInternalDim {
+			return fmt.Errorf("vecindex: PQ stable encoding is only allowed for internal dim >= %d", StablePQMinInternalDim)
+		}
 		if c.pq == nil {
 			return fmt.Errorf("vecindex: PQ stable codec metadata is nil")
 		}
@@ -201,7 +214,7 @@ func (c *StableMemberCodec) Encode(clusterID int64, prepared []byte) (int64, []b
 		return 0, nil, fmt.Errorf("vecindex: stable codec is nil")
 	}
 	if clusterID <= 0 {
-		return MemberEncodingRawPreparedF32, append([]byte(nil), prepared...), nil
+		return 0, nil, fmt.Errorf("vecindex: stable encoding requires cluster id, got %d", clusterID)
 	}
 	if len(prepared) != c.spec.InternalDim()*4 {
 		return 0, nil, fmt.Errorf("vecindex: prepared blob length %d does not match internal dim %d", len(prepared), c.spec.InternalDim())
@@ -212,8 +225,6 @@ func (c *StableMemberCodec) Encode(clusterID int64, prepared []byte) (int64, []b
 	}
 	vec := metric.BytesToFloat32(prepared)
 	switch c.enc {
-	case MemberEncodingRawPreparedF32:
-		return c.enc, append([]byte(nil), prepared...), nil
 	case MemberEncodingResidualInt8:
 		blob, err := quantize.EncodeResidualInt8(c.spec.InternalMetric(), vec, centroid, MemberResidualBlockSize)
 		if err != nil {
@@ -236,8 +247,6 @@ func (c *StableMemberCodec) DecodePrepared(clusterID int64, vecBytes []byte) ([]
 		return nil, fmt.Errorf("vecindex: stable codec is nil")
 	}
 	switch c.enc {
-	case MemberEncodingRawPreparedF32:
-		return append([]float32(nil), metric.BytesToFloat32(vecBytes)...), nil
 	case MemberEncodingResidualInt8:
 		if c.centroid == nil || clusterID <= 0 || int(clusterID) > c.centroid.Len() {
 			return nil, fmt.Errorf("vecindex: missing centroid for cluster %d", clusterID)
@@ -269,22 +278,8 @@ func (c *StableMemberCodec) DecodePrepared(clusterID int64, vecBytes []byte) ([]
 	}
 }
 
-func EncodeStableMember(spec IVFSpec, cs *kmeans.CentroidSet, clusterID int64, prepared []byte) (int64, []byte, error) {
-	codec, err := NewStableMemberCodec(spec, cs, MemberEncodingResidualInt8, nil)
-	if err != nil {
-		return 0, nil, err
-	}
-	return codec.Encode(clusterID, prepared)
-}
-
 func NewStableMemberScorer(spec IVFSpec, cs *kmeans.CentroidSet, query []float32, queryNorm2 float32, clusterID int64, enc int64) (*StableMemberScorer, error) {
 	switch enc {
-	case MemberEncodingRawPreparedF32:
-		return &StableMemberScorer{
-			enc:       enc,
-			rawMetric: spec.InternalMetric(),
-			query:     query,
-		}, nil
 	case MemberEncodingResidualInt8:
 		if clusterID <= 0 {
 			return nil, fmt.Errorf("vecindex: residual encoding requires stable cluster id, got %d", clusterID)
@@ -324,7 +319,7 @@ func NewStableMemberQueryScorerWithCodec(codec *StableMemberCodec, query []float
 		return nil, fmt.Errorf("vecindex: stable codec is nil")
 	}
 	switch codec.enc {
-	case MemberEncodingRawPreparedF32, MemberEncodingResidualInt8:
+	case MemberEncodingResidualInt8:
 		return &StableMemberQueryScorer{codec: codec, query: query, queryNorm2: queryNorm2}, nil
 	case MemberEncodingResidualPQ8:
 		pq, err := quantize.NewPQ8QueryScorer(codec.spec.InternalMetric(), query, queryNorm2, codec.pq)
@@ -342,7 +337,7 @@ func (q *StableMemberQueryScorer) ClusterScorer(clusterID int64) (*StableMemberS
 		return nil, fmt.Errorf("vecindex: stable member query scorer is nil")
 	}
 	switch q.codec.enc {
-	case MemberEncodingRawPreparedF32, MemberEncodingResidualInt8:
+	case MemberEncodingResidualInt8:
 		return NewStableMemberScorer(q.codec.spec, q.codec.centroid, q.query, q.queryNorm2, clusterID, q.codec.enc)
 	case MemberEncodingResidualPQ8:
 		if clusterID <= 0 {
@@ -367,18 +362,6 @@ func (s *StableMemberScorer) Score(vec []byte) (float32, error) {
 		return 0, fmt.Errorf("vecindex: stable member scorer is nil")
 	}
 	switch s.enc {
-	case MemberEncodingRawPreparedF32:
-		if len(vec) != len(s.query)*4 {
-			return 0, fmt.Errorf("vecindex: raw vec length %d does not match query dim %d", len(vec), len(s.query))
-		}
-		switch s.rawMetric {
-		case metric.MetricCosine:
-			return metric.CosineDistanceUnitFromBytes(s.query, vec), nil
-		case metric.MetricL2:
-			return metric.L2SquaredFromBytes(s.query, vec), nil
-		default:
-			return 0, fmt.Errorf("vecindex: unsupported internal metric %d", s.rawMetric)
-		}
 	case MemberEncodingResidualInt8:
 		return s.residual.Distance(vec)
 	case MemberEncodingResidualPQ8:

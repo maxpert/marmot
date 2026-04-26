@@ -14,7 +14,6 @@ import (
 )
 
 const stableCodecTrainingSampleLimit = 32768
-const stableCodecPQTrainingRowFloor = 4096
 
 type stableCodecReservoir struct {
 	rng        *rand.Rand
@@ -152,7 +151,7 @@ func (r *stableCodecReservoir) writeSlot(slot int, clusterID int64, vec []float3
 
 func buildStableMemberCodec(spec vecindex.IVFSpec, cs *kmeans.CentroidSet, reservoir *stableCodecReservoir) (*vecindex.StableMemberCodec, []byte, error) {
 	var samples []vecindex.StableCodecTrainingVector
-	if reservoir != nil && spec.InternalDim() >= 512 && reservoir.Count() >= stableCodecPQTrainingRowFloor {
+	if reservoir != nil {
 		var err error
 		samples, err = reservoir.Samples()
 		if err != nil {

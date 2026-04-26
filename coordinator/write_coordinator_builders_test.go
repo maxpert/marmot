@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/maxpert/marmot/common"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/protocol"
 )
@@ -209,6 +210,52 @@ func TestBuildPrepareRequest_EmptyDatabase(t *testing.T) {
 
 	if req.Database != "" {
 		t.Errorf("Database: got %s, want empty string", req.Database)
+	}
+}
+
+func TestBuildPrepareRequest_PreservesVectorControlMetadata(t *testing.T) {
+	wc := createTestCoordinator(1)
+	change := common.VectorIndexChange{
+		Action:              common.VectorIndexActionCreate,
+		Database:            "testdb",
+		IndexName:           "docs_embed_idx",
+		TableName:           "docs",
+		ColumnName:          "embed",
+		Metric:              "cosine",
+		Dim:                 1536,
+		Nlist:               8,
+		Nprobe:              4,
+		TargetPartitionSize: common.DefaultVectorTargetPartitionSize,
+	}
+	txn := NewTxnBuilder().
+		WithDatabase("testdb").
+		WithStatements([]protocol.Statement{{
+			Type:              protocol.StatementCreateVectorIndex,
+			Database:          "testdb",
+			TableName:         "docs",
+			VectorIndexName:   "docs_embed_idx",
+			VectorColumnName:  "embed",
+			VectorMetric:      "cosine",
+			VectorDim:         1536,
+			VectorNlist:       8,
+			VectorNprobe:      4,
+			VectorIndexChange: &change,
+		}}).
+		Build()
+
+	req := wc.buildPrepareRequest(txn)
+	if len(req.Statements) != 1 {
+		t.Fatalf("statement count = %d, want 1", len(req.Statements))
+	}
+	stmt := req.Statements[0]
+	if stmt.VectorIndexName != "docs_embed_idx" || stmt.VectorColumnName != "embed" {
+		t.Fatalf("vector identity = (%q,%q), want (docs_embed_idx,embed)", stmt.VectorIndexName, stmt.VectorColumnName)
+	}
+	if stmt.VectorIndexChange == nil {
+		t.Fatal("VectorIndexChange is nil")
+	}
+	if stmt.VectorIndexChange.IndexName != "docs_embed_idx" || stmt.VectorIndexChange.Action != common.VectorIndexActionCreate {
+		t.Fatalf("VectorIndexChange = %+v, want create docs_embed_idx", stmt.VectorIndexChange)
 	}
 }
 

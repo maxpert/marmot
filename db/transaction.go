@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/maxpert/marmot/cfg"
+	"github.com/maxpert/marmot/common"
 	"github.com/maxpert/marmot/encoding"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/protocol"
@@ -44,6 +45,10 @@ type ClusterMinWatermarkFunc func() uint64
 // This queries all alive peers and updates local state, ensuring fresh watermarks
 type RefreshReplicationStatesFunc func(ctx context.Context) error
 
+type VectorCDCNotifier interface {
+	ApplyCommittedVectorCDC(ctx context.Context, database string, txnID, seqNum uint64, entries []common.CDCEntry) error
+}
+
 // TransactionManager manages distributed transactions
 // All transaction state is stored in MetaStore (PebbleDB) - no in-memory caching
 type TransactionManager struct {
@@ -66,6 +71,7 @@ type TransactionManager struct {
 	refreshReplicationStates RefreshReplicationStatesFunc // Callback to refresh watermarks before GC
 	batchCommitter           *SQLiteBatchCommitter        // SQLite write batcher (nil if disabled)
 	notifier                 CDCNotifier                  // Injected, can be nil
+	vectorCDCNotifier        VectorCDCNotifier            // Injected, can be nil
 }
 
 // NewTransactionManager creates a new transaction manager
@@ -153,6 +159,12 @@ func (tm *TransactionManager) batchCommitEnabled() bool {
 // SetBatchCommitter sets the batch committer (called by ReplicatedDatabase)
 func (tm *TransactionManager) SetBatchCommitter(bc *SQLiteBatchCommitter) {
 	tm.batchCommitter = bc
+}
+
+func (tm *TransactionManager) SetVectorCDCNotifier(notifier VectorCDCNotifier) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	tm.vectorCDCNotifier = notifier
 }
 
 // BeginTransaction starts a new distributed transaction with auto-generated ID
@@ -301,6 +313,10 @@ func (tm *TransactionManager) CommitTransaction(txn *Transaction) error {
 		return err
 	}
 
+	if len(cdcEntries) > 0 {
+		tm.notifyVectorCDC(txn, cdcEntries)
+	}
+
 	// Signal CDC subscribers that new data is available
 	if tm.notifier != nil {
 		tm.notifier.Signal(tm.databaseName, txn.ID)
@@ -310,6 +326,38 @@ func (tm *TransactionManager) CommitTransaction(txn *Transaction) error {
 	tm.cleanupAfterCommit(txn)
 
 	return nil
+}
+
+func (tm *TransactionManager) notifyVectorCDC(txn *Transaction, entries []*IntentEntry) {
+	tm.mu.RLock()
+	notifier := tm.vectorCDCNotifier
+	dbName := tm.databaseName
+	tm.mu.RUnlock()
+	if notifier == nil || len(entries) == 0 {
+		return
+	}
+	if dbName == "" && len(txn.Statements) > 0 {
+		dbName = txn.Statements[0].Database
+	}
+	rec, err := tm.metaStore.GetTransaction(txn.ID)
+	var seqNum uint64
+	if err == nil && rec != nil {
+		seqNum = rec.SeqNum
+	}
+	cdcEntries := make([]common.CDCEntry, 0, len(entries))
+	for _, entry := range entries {
+		cdcEntries = append(cdcEntries, common.CDCEntry{
+			Table:        entry.Table,
+			IntentKey:    entry.IntentKey,
+			OldValues:    entry.OldValues,
+			NewValues:    entry.NewValues,
+			CommitTxnID:  txn.ID,
+			CommitSeqNum: seqNum,
+		})
+	}
+	if err := notifier.ApplyCommittedVectorCDC(context.Background(), dbName, txn.ID, seqNum, cdcEntries); err != nil {
+		log.Error().Err(err).Uint64("txn_id", txn.ID).Str("database", dbName).Msg("Failed to apply committed vector CDC")
+	}
 }
 
 func isStatementFallbackDML(stmt protocol.Statement) bool {
@@ -399,7 +447,7 @@ func (tm *TransactionManager) rebuildStatementsFromCDC(cdcEntries []*IntentEntry
 		// Filter and sort non-DML intents by CreatedAt to preserve execution order.
 		nonDMLIntents := make([]*WriteIntentRecord, 0, len(intents))
 		for _, intent := range intents {
-			if intent.IntentType == IntentTypeDDL && intent.SQLStatement != "" {
+			if intent.IntentType == IntentTypeDDL && (intent.SQLStatement != "" || len(intent.DataSnapshot) > 0) {
 				nonDMLIntents = append(nonDMLIntents, intent)
 			}
 		}
@@ -410,6 +458,11 @@ func (tm *TransactionManager) rebuildStatementsFromCDC(cdcEntries []*IntentEntry
 		})
 
 		for _, intent := range nonDMLIntents {
+			var vectorChange common.VectorIndexChange
+			if err := DeserializeData(intent.DataSnapshot, &vectorChange); err == nil && vectorChange.Action != 0 {
+				statements = append(statements, vectorIndexStatementFromChange(vectorChange))
+				continue
+			}
 			stmt := protocol.Statement{
 				TableName: intent.TableName,
 				SQL:       intent.SQLStatement,
@@ -470,7 +523,7 @@ func (tm *TransactionManager) applyCDCEntries(txnID uint64, entries []*IntentEnt
 func (tm *TransactionManager) applyNonDMLIntents(txnID uint64, intents []*WriteIntentRecord) error {
 	nonDMLIntents := make([]*WriteIntentRecord, 0, len(intents))
 	for _, intent := range intents {
-		if intent.IntentType == IntentTypeDDL && intent.SQLStatement != "" {
+		if intent.IntentType == IntentTypeDDL && (intent.SQLStatement != "" || len(intent.DataSnapshot) > 0) {
 			nonDMLIntents = append(nonDMLIntents, intent)
 		}
 	}
@@ -481,6 +534,19 @@ func (tm *TransactionManager) applyNonDMLIntents(txnID uint64, intents []*WriteI
 
 	hasDDL := false
 	for _, intent := range nonDMLIntents {
+		var vectorChange common.VectorIndexChange
+		if err := DeserializeData(intent.DataSnapshot, &vectorChange); err == nil && vectorChange.Action != 0 {
+			controlApplier, ok := tm.vectorCDCNotifier.(interface {
+				ApplyVectorControl(context.Context, common.VectorIndexChange) error
+			})
+			if !ok {
+				return fmt.Errorf("vector index control %s: vector manager not configured", vectorChange.IndexName)
+			}
+			if err := controlApplier.ApplyVectorControl(context.Background(), vectorChange); err != nil {
+				return fmt.Errorf("failed to apply vector index control: %w", err)
+			}
+			continue
+		}
 		var loadSnap LoadDataSnapshot
 		if err := DeserializeData(intent.DataSnapshot, &loadSnap); err == nil && loadSnap.Type == int(protocol.StatementLoadData) {
 			if _, err := ApplyLoadData(tm.db, loadSnap.SQL, loadSnap.Data); err != nil {
@@ -512,20 +578,27 @@ func (tm *TransactionManager) writeNonDMLToCDC(txnID uint64, intents []*WriteInt
 	var seq uint64
 
 	for _, intent := range intents {
-		if intent.IntentType != IntentTypeDDL || intent.SQLStatement == "" {
+		if intent.IntentType != IntentTypeDDL {
 			continue
 		}
 
+		var vectorChange common.VectorIndexChange
+		isVectorControl := DeserializeData(intent.DataSnapshot, &vectorChange) == nil && vectorChange.Action != 0
 		var loadSnap LoadDataSnapshot
 		isLoadData := DeserializeData(intent.DataSnapshot, &loadSnap) == nil && loadSnap.Type == int(protocol.StatementLoadData)
 
 		row := &EncodedCapturedRow{
 			Table: intent.TableName,
 		}
-		if isLoadData {
+		if isVectorControl {
+			row.Op = uint8(OpTypeVectorIndex)
+			row.VectorIndexChange = &vectorChange
+		} else if isLoadData {
 			row.Op = uint8(OpTypeLoadData)
 			row.LoadSQL = loadSnap.SQL
 			row.LoadData = loadSnap.Data
+		} else if intent.SQLStatement == "" {
+			continue
 		} else {
 			row.Op = uint8(OpTypeDDL)
 			row.DDLSQL = intent.SQLStatement
@@ -541,7 +614,9 @@ func (tm *TransactionManager) writeNonDMLToCDC(txnID uint64, intents []*WriteInt
 		}
 
 		seq++
-		if isLoadData {
+		if isVectorControl {
+			log.Debug().Uint64("txn_id", txnID).Str("index", vectorChange.IndexName).Str("action", vectorChange.Action.String()).Msg("Vector index control written to CDC for streaming")
+		} else if isLoadData {
 			log.Debug().Uint64("txn_id", txnID).Msg("LOAD DATA written to CDC for streaming")
 		} else {
 			log.Debug().Uint64("txn_id", txnID).Str("ddl", intent.SQLStatement).Msg("DDL written to CDC for streaming")

@@ -222,6 +222,16 @@ func (wc *WriteCoordinator) buildPrepareRequest(txn *Transaction) *ReplicationRe
 			// OldValues: nil - NOT sent in PREPARE
 			// NewValues: nil - NOT sent in PREPARE
 		}
+		if isVectorControlStatement(stmt.Type) {
+			prepareStmts[i].VectorIndexName = stmt.VectorIndexName
+			prepareStmts[i].VectorColumnName = stmt.VectorColumnName
+			prepareStmts[i].VectorMetric = stmt.VectorMetric
+			prepareStmts[i].VectorDim = stmt.VectorDim
+			prepareStmts[i].VectorNlist = stmt.VectorNlist
+			prepareStmts[i].VectorNprobe = stmt.VectorNprobe
+			prepareStmts[i].VectorMaxNorm = stmt.VectorMaxNorm
+			prepareStmts[i].VectorIndexChange = stmt.VectorIndexChange
+		}
 		// LOAD DATA requires payload bytes during PREPARE so replicas can persist
 		// durable intents with the same content before COMMIT.
 		if stmt.Type == protocol.StatementLoadData {
@@ -236,6 +246,16 @@ func (wc *WriteCoordinator) buildPrepareRequest(txn *Transaction) *ReplicationRe
 		Phase:                 PhasePrep,
 		Database:              txn.Database,
 		RequiredSchemaVersion: txn.RequiredSchemaVersion,
+	}
+}
+
+func isVectorControlStatement(stmtType protocol.StatementCode) bool {
+	switch stmtType {
+	case protocol.StatementCreateVectorIndex, protocol.StatementDropVectorIndex,
+		protocol.StatementReindexVectorIndex, protocol.StatementVectorIndexControl:
+		return true
+	default:
+		return false
 	}
 }
 

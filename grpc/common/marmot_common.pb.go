@@ -34,6 +34,7 @@ const (
 	StatementType_CREATE_DATABASE StatementType = 5
 	StatementType_DROP_DATABASE   StatementType = 6
 	StatementType_LOAD_DATA       StatementType = 7
+	StatementType_VECTOR_INDEX    StatementType = 8
 )
 
 // Enum value maps for StatementType.
@@ -47,6 +48,7 @@ var (
 		5: "CREATE_DATABASE",
 		6: "DROP_DATABASE",
 		7: "LOAD_DATA",
+		8: "VECTOR_INDEX",
 	}
 	StatementType_value = map[string]int32{
 		"INSERT":          0,
@@ -57,6 +59,7 @@ var (
 		"CREATE_DATABASE": 5,
 		"DROP_DATABASE":   6,
 		"LOAD_DATA":       7,
+		"VECTOR_INDEX":    8,
 	}
 )
 
@@ -91,7 +94,7 @@ var File_grpc_common_marmot_common_proto protoreflect.FileDescriptor
 
 const file_grpc_common_marmot_common_proto_rawDesc = "" +
 	"\n" +
-	"\x1fgrpc/common/marmot_common.proto\x12\rmarmot.common*\x80\x01\n" +
+	"\x1fgrpc/common/marmot_common.proto\x12\rmarmot.common*\x92\x01\n" +
 	"\rStatementType\x12\n" +
 	"\n" +
 	"\x06INSERT\x10\x00\x12\n" +
@@ -103,7 +106,8 @@ const file_grpc_common_marmot_common_proto_rawDesc = "" +
 	"\x03DDL\x10\x04\x12\x13\n" +
 	"\x0fCREATE_DATABASE\x10\x05\x12\x11\n" +
 	"\rDROP_DATABASE\x10\x06\x12\r\n" +
-	"\tLOAD_DATA\x10\aB'Z%github.com/maxpert/marmot/grpc/commonb\x06proto3"
+	"\tLOAD_DATA\x10\a\x12\x10\n" +
+	"\fVECTOR_INDEX\x10\bB'Z%github.com/maxpert/marmot/grpc/commonb\x06proto3"
 
 var (
 	file_grpc_common_marmot_common_proto_rawDescOnce sync.Once

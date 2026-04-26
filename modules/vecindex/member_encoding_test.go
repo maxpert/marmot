@@ -23,9 +23,13 @@ func TestNewStableMemberScorer_ResidualInt8(t *testing.T) {
 		0x00, 0x00, 0x00, 0x3f,
 		0x00, 0x00, 0x00, 0x3f,
 	}
-	enc, blob, err := EncodeStableMember(spec, cs, 1, prepared)
+	codec, err := NewStableMemberCodec(spec, cs, MemberEncodingResidualInt8, nil)
 	if err != nil {
-		t.Fatalf("EncodeStableMember: %v", err)
+		t.Fatalf("NewStableMemberCodec: %v", err)
+	}
+	enc, blob, err := codec.Encode(1, prepared)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
 	}
 	if enc != MemberEncodingResidualInt8 {
 		t.Fatalf("encoding = %d, want residual-int8", enc)
@@ -62,7 +66,7 @@ func TestNewStableMemberScorer_ResidualInt8(t *testing.T) {
 func TestStableMemberCodecResidualPQ8RoundTripAndScoreSpan(t *testing.T) {
 	t.Parallel()
 
-	spec := IVFSpec{ID: "idx", Dim: 16, Metric: MetricL2, Nlist: 1, Nprobe: 1}
+	spec := IVFSpec{ID: "idx", Dim: StablePQMinInternalDim, Metric: MetricL2, Nlist: 1, Nprobe: 1}
 	centroid := make([]float32, spec.InternalDim())
 	for i := range centroid {
 		centroid[i] = float32(i%7) * 0.01
@@ -129,6 +133,28 @@ func TestStableMemberCodecResidualPQ8RoundTripAndScoreSpan(t *testing.T) {
 	}
 	if out[0] != scalar {
 		t.Fatalf("span score = %v, want %v", out[0], scalar)
+	}
+}
+
+func TestBuildStableMemberCodecUsesPQForHighDimSmallTrainingSet(t *testing.T) {
+	t.Parallel()
+
+	spec := IVFSpec{ID: "idx", Dim: StablePQMinInternalDim, Metric: MetricL2, Nlist: 1, Nprobe: 1}
+	centroid := make([]float32, spec.InternalDim())
+	cs, err := kmeans.NewCentroidSet(1, [][]float32{centroid})
+	if err != nil {
+		t.Fatalf("NewCentroidSet: %v", err)
+	}
+	vec := make([]float32, spec.InternalDim())
+	for i := range vec {
+		vec[i] = float32(i%11) * 0.01
+	}
+	codec, err := BuildStableMemberCodec(spec, cs, []StableCodecTrainingVector{{ClusterID: 1, Vec: vec}}, 3)
+	if err != nil {
+		t.Fatalf("BuildStableMemberCodec: %v", err)
+	}
+	if codec.Encoding() != MemberEncodingResidualPQ8 {
+		t.Fatalf("encoding = %d, want PQ", codec.Encoding())
 	}
 }
 

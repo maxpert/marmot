@@ -129,6 +129,14 @@ type MySQLParseState struct {
 	TableName string
 	// ShowFilter holds the LIKE pattern for SHOW TABLES LIKE queries
 	ShowFilter string
+	// Vector index metadata extracted for CREATE/DROP VECTOR INDEX statements.
+	VectorIndexName  string
+	VectorColumnName string
+	VectorMetric     string
+	VectorDim        int
+	VectorNlist      int
+	VectorNprobe     int
+	VectorMaxNorm    float32
 	// ConflictColumns holds columns for ON CONFLICT clause.
 	// Set by InsertOnDuplicateKeyRule during transpilation.
 	ConflictColumns []string

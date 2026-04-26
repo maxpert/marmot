@@ -351,9 +351,13 @@ def fetch_dbpedia1536(output_dir: Path, subset: int, k: int, force: bool) -> Non
     print("[dbpedia-openai-1536] Reading HDF5 file ...")
     with h5py.File(hdf5_file, "r") as hf:
         _validate_hdf5_keys(hf, required=["train", "test", "neighbors", "distances"])
-        train = hf["train"][:]
+        n_train = hf["train"].shape[0]
+        if subset and subset < n_train:
+            train = hf["train"][:subset]
+        else:
+            train = hf["train"][:]
         test = hf["test"][:]
-        gt_native = hf["neighbors"][:]
+        gt_native = None if subset and subset < n_train else hf["neighbors"][:]
 
     np = _require_numpy()
     train = np.asarray(train, dtype=np.float32)
@@ -361,9 +365,8 @@ def fetch_dbpedia1536(output_dir: Path, subset: int, k: int, force: bool) -> Non
 
     _validate_dims(train, test, expected_dim=1536, name="dbpedia-openai-1536")
 
-    if subset and subset < len(train):
+    if subset and subset < n_train:
         print(f"[dbpedia-openai-1536] Subsetting to first {subset} train vectors, recomputing ground truth ...")
-        train = train[:subset]
         gt = compute_ground_truth(train, test, "angular", k)
     else:
         subset = len(train)

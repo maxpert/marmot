@@ -178,12 +178,15 @@ func (re *ReplicationEngine) processStatement(txn *Transaction, txnMgr *Transact
 		return &PrepareResult{Success: false, Error: err.Error()}
 	}
 
+	if isVectorIndexControlStatement(stmt.Type) {
+		return re.createVectorIndexIntent(txnMgr, txn, stmt, req)
+	}
+
 	intentKey := stmt.IntentKey
 	if len(intentKey) == 0 {
 		if stmt.Type == protocol.StatementLoadData {
 			return re.createLoadDataIntent(txnMgr, txn, stmt, req.StartTS)
 		}
-
 		if stmt.Type == protocol.StatementInsert {
 			log.Trace().
 				Str("table", stmt.TableName).
@@ -207,6 +210,16 @@ func (re *ReplicationEngine) processStatement(txn *Transaction, txnMgr *Transact
 	}
 
 	return re.createDMLIntent(txnMgr, metaStore, txn, stmt, string(intentKey), req, stmtSeq)
+}
+
+func isVectorIndexControlStatement(stmtType protocol.StatementCode) bool {
+	switch stmtType {
+	case protocol.StatementCreateVectorIndex, protocol.StatementDropVectorIndex,
+		protocol.StatementReindexVectorIndex, protocol.StatementVectorIndexControl:
+		return true
+	default:
+		return false
+	}
 }
 
 // createLoadDataIntent creates a durable intent for LOAD DATA LOCAL INFILE statements.
@@ -270,6 +283,29 @@ func (re *ReplicationEngine) createDDLIntent(txnMgr *TransactionManager, txn *Tr
 		Str("ddl_intent_key", string(ddlIntentKey)).
 		Msg("Created write intent for DDL statement")
 
+	return nil
+}
+
+func (re *ReplicationEngine) createVectorIndexIntent(txnMgr *TransactionManager, txn *Transaction, stmt protocol.Statement, req *PrepareRequest) *PrepareResult {
+	dataSnapshot, change, err := vectorIndexChangeSnapshot(stmt, req.Database, req.StartTS)
+	if err != nil {
+		_ = txnMgr.AbortTransaction(txn)
+		return &PrepareResult{Success: false, Error: fmt.Sprintf("failed to serialize vector index control: %v", err)}
+	}
+	intentKey := vectorControlIntentKey(change)
+	stmt.VectorIndexChange = &change
+	stmt.TableName = change.TableName
+	stmt.Database = change.Database
+	stmt.IntentKey = []byte(intentKey)
+	if err := txnMgr.WriteIntent(txn, IntentTypeDDL, change.TableName, intentKey, stmt, dataSnapshot); err != nil {
+		_ = txnMgr.AbortTransaction(txn)
+		return &PrepareResult{
+			Success:          false,
+			Error:            fmt.Sprintf("vector index control conflict: %v", err),
+			ConflictDetected: true,
+			ConflictDetails:  err.Error(),
+		}
+	}
 	return nil
 }
 

@@ -286,15 +286,7 @@ func defaultProbeScanBudgetRows(targetPartitionSize int) int {
 }
 
 func pqProbeScanBudgetRows(targetPartitionSize int) int {
-	if targetPartitionSize <= 0 {
-		targetPartitionSize = 512
-	}
-	budget := defaultProbeScanBudgetRows(targetPartitionSize)
-	multiplier := 38
-	if widened := multiplier * targetPartitionSize; widened > budget {
-		budget = widened
-	}
-	return budget
+	return defaultProbeScanBudgetRows(targetPartitionSize)
 }
 
 func loadLiveClusterRowCounts(state *vecindex.IndexState, segments *vecindex.SegmentGeneration) []uint64 {
@@ -439,9 +431,9 @@ func exactRerankShortlist(k int) int {
 }
 
 func pqExactRerankShortlist(k int) int {
-	n := k * 12
-	if n < 128 {
-		n = 128
+	n := k * 14
+	if n < 144 {
+		n = 144
 	}
 	if n > 512 {
 		n = 512
@@ -513,7 +505,7 @@ func (h *CoordinatorHandler) segmentRank(plan *GoRankPlan) ([]rankItem, bool, er
 	if (segments == nil || segments.Data == nil) && overlay == nil {
 		return nil, false, nil
 	}
-	segmentEnc := int64(vecindex.MemberEncodingRawPreparedF32)
+	segmentEnc := int64(vecindex.MemberEncodingResidualInt8)
 	var appliedOverlaySeq uint64
 	if segments != nil && segments.Data != nil {
 		segmentEnc = segments.Data.Encoding()
@@ -637,8 +629,11 @@ func (h *CoordinatorHandler) segmentRank(plan *GoRankPlan) ([]rankItem, bool, er
 	}
 
 	if overlaySnapshot != nil {
-		visitCluster := func(clusterID int64) {
-			overlaySnapshot.VisitClusterAfter(clusterID, appliedOverlaySeq, func(rowID int64, vec []byte) bool {
+		overlayScorers := make(map[int64]*vecindex.StableMemberScorer, len(plan.ClusterIDs)+1)
+		var overlayScanErr error
+		scoreOverlay := func(clusterID, rowID int64, encoding vecindex.OverlayVecEncoding, vec []byte) bool {
+			switch encoding {
+			case vecindex.OverlayPreparedF32:
 				if len(vec) != len(plan.QueryVec)*4 {
 					return true
 				}
@@ -649,26 +644,55 @@ func (h *CoordinatorHandler) segmentRank(plan *GoRankPlan) ([]rankItem, bool, er
 					topK.Push(rowID, metric.DistanceFromBytes(plan.RankMetric, plan.QueryVec, vec))
 				}
 				return true
+			case vecindex.OverlayResidualInt8:
+				if probeCentroids == nil || clusterID <= 0 {
+					overlayScanErr = fmt.Errorf("missing probe centroid for overlay cluster %d", clusterID)
+					return false
+				}
+				scorer, ok := overlayScorers[clusterID]
+				if !ok {
+					var err error
+					scorer, err = vecindex.NewStableMemberScorer(plan.IndexSpec, probeCentroids, plan.QueryVec, plan.QueryNorm2, clusterID, vecindex.MemberEncodingResidualInt8)
+					if err != nil {
+						overlayScanErr = err
+						return false
+					}
+					overlayScorers[clusterID] = scorer
+				}
+				dist, err := scorer.Score(vec)
+				if err != nil {
+					overlayScanErr = err
+					return false
+				}
+				topK.Push(rowID, dist)
+				return true
+			default:
+				overlayScanErr = fmt.Errorf("unsupported overlay vector encoding %d", encoding)
+				return false
+			}
+		}
+		visitCluster := func(clusterID int64) bool {
+			overlaySnapshot.VisitClusterEncodedAfter(clusterID, appliedOverlaySeq, func(rowID int64, encoding vecindex.OverlayVecEncoding, vec []byte) bool {
+				return scoreOverlay(clusterID, rowID, encoding, vec)
 			})
+			return overlayScanErr == nil
 		}
 		if probeCentroids == nil || len(plan.ClusterIDs) == 0 {
-			overlaySnapshot.VisitAllAfter(appliedOverlaySeq, func(_clusterID, rowID int64, vec []byte) bool {
-				if len(vec) != len(plan.QueryVec)*4 {
-					return true
-				}
-				switch plan.RankMetric {
-				case metric.MetricCosine:
-					topK.Push(rowID, metric.CosineDistanceUnitFromBytes(plan.QueryVec, vec))
-				default:
-					topK.Push(rowID, metric.DistanceFromBytes(plan.RankMetric, plan.QueryVec, vec))
-				}
-				return true
+			overlaySnapshot.VisitAllEncodedAfter(appliedOverlaySeq, func(clusterID, rowID int64, encoding vecindex.OverlayVecEncoding, vec []byte) bool {
+				return scoreOverlay(clusterID, rowID, encoding, vec)
 			})
 		} else {
-			visitCluster(0)
-			for _, cid := range plan.ClusterIDs {
-				visitCluster(cid)
+			if !visitCluster(0) {
+				return nil, false, fmt.Errorf("MARMOT-VEC-030: overlay scan failed: %w", overlayScanErr)
 			}
+			for _, cid := range plan.ClusterIDs {
+				if !visitCluster(cid) {
+					return nil, false, fmt.Errorf("MARMOT-VEC-030: overlay scan failed: %w", overlayScanErr)
+				}
+			}
+		}
+		if overlayScanErr != nil {
+			return nil, false, fmt.Errorf("MARMOT-VEC-030: overlay scan failed: %w", overlayScanErr)
 		}
 	}
 	return topK.Drain(), true, nil

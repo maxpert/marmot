@@ -27,3 +27,7 @@ func (stmt *Statement) HasCDCData() bool {
 func (stmt *Statement) HasSQL() bool {
 	return stmt.GetDdlChange() != nil
 }
+
+func (stmt *Statement) HasVectorIndexChange() bool {
+	return stmt.GetVectorIndexChange() != nil
+}

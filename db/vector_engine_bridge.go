@@ -450,7 +450,7 @@ func (h *EngineHook) bootstrapOnce(ctx context.Context, meta common.VectorIndexM
 		log.Warn().Err(err).Str("index", meta.IndexName).Msg("engine hook bootstrap: publish overlay segment generation failed")
 		return false
 	}
-	nextOverlay, err := rewriteOverlayTailForProbe(dbPath, meta.IndexName, probeCS.Epoch(), cutoff, currentSnapshot, spec, probeCS, pending.generation)
+	nextOverlay, err := rewriteOverlayTailForProbe(ctx, conn, dbPath, meta, probeCS.Epoch(), cutoff, currentSnapshot, spec, probeCS, pending.generation)
 	if err != nil {
 		h.localChangeMu.Unlock()
 		log.Warn().Err(err).Str("index", meta.IndexName).Msg("engine hook bootstrap: rewrite overlay failed")

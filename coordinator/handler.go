@@ -27,6 +27,7 @@ import (
 // VectorIndexManagerProvider manages vector index lifecycle.
 // Defined here to avoid an import cycle with the db package.
 type VectorIndexManagerProvider interface {
+	ResolveCreateIndexMeta(ctx context.Context, meta common.VectorIndexMeta) (common.VectorIndexMeta, error)
 	CreateIndex(ctx context.Context, meta common.VectorIndexMeta) error
 	DropIndex(ctx context.Context, indexName, database string) error
 	ReindexIndex(ctx context.Context, indexName string) error
@@ -35,10 +36,6 @@ type VectorIndexManagerProvider interface {
 	// rewriter (coordinator/vec_rewrite.go) via VectorIndexLookup.
 	GetIndexByColumn(database, table, column string) (*common.VectorIndexMeta, bool)
 	EstimatedRowCount(database, table string) int64
-}
-
-type localVectorCDCProvider interface {
-	ApplyLocalCDC(ctx context.Context, database string, entries []common.CDCEntry) error
 }
 
 // DatabaseManager interface to avoid import cycles
@@ -499,11 +496,10 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, params []in
 	startTS := h.clock.Now()
 	txnID := startTS.ToTxnID()
 
-	// Vector DDL is handled locally — VectorIndexManager owns index metadata and
-	// local file-backed serving state. No 2PC is needed because vector-index
-	// artifacts are derived from the base table on each node.
+	// Vector DDL is replicated as control metadata. Segment files, rowmaps, and
+	// overlays remain node-local derived state.
 	if stmt.Type == protocol.StatementCreateVectorIndex || stmt.Type == protocol.StatementDropVectorIndex || stmt.Type == protocol.StatementReindexVectorIndex {
-		return h.handleVectorDDL(stmt)
+		return h.handleVectorControlMutation(stmt, uint64(txnID), startTS, consistency)
 	}
 
 	// Detect DDL and handle differently
@@ -656,22 +652,9 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, params []in
 		telemetry.QueryDurationSeconds.With(queryType).Observe(time.Since(queryStart).Seconds())
 		return nil, err
 	}
-	// Success - coordinator committed via CDC replay in WriteTransaction
-	// No pendingExec.Commit() needed - hookDB was already rolled back
-	if pendingExec != nil {
-		cdcEntries := pendingExec.GetCDCEntries()
-		if len(cdcEntries) > 0 {
-			if vecMgr, ok := h.dbManager.GetVectorIndexManager().(localVectorCDCProvider); ok {
-				if err := vecMgr.ApplyLocalCDC(ctx, stmt.Database, cdcEntries); err != nil {
-					log.Error().
-						Err(err).
-						Str("database", stmt.Database).
-						Uint64("txn_id", uint64(txnID)).
-						Msg("Failed to apply local vector CDC")
-				}
-			}
-		}
-	}
+	// Success - coordinator committed via CDC replay in WriteTransaction.
+	// Vector CDC is applied by the transaction commit pipeline on every node.
+	// No pendingExec.Commit() needed - hookDB was already rolled back.
 
 	// Publish CDC events if publisher is enabled and we have CDC entries
 	if pendingExec != nil {
@@ -732,14 +715,15 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, params []in
 	return rs, nil
 }
 
-// handleVectorDDL executes CREATE/DROP VECTOR INDEX locally via the VectorIndexManager.
-// Vector DDL does not go through 2PC: the metadata row written to SQLite is
-// CDC-replicated, and each node rebuilds its own IVF index from the source data.
-func (h *CoordinatorHandler) handleVectorDDL(stmt protocol.Statement) (*protocol.ResultSet, error) {
+func (h *CoordinatorHandler) handleVectorControlMutation(
+	stmt protocol.Statement,
+	txnID uint64,
+	startTS hlc.Timestamp,
+	consistency protocol.ConsistencyLevel,
+) (*protocol.ResultSet, error) {
 	if h.dbManager == nil {
 		return nil, fmt.Errorf("vector index: database manager not available")
 	}
-
 	vecMgr := h.dbManager.GetVectorIndexManager()
 	if vecMgr == nil {
 		return nil, fmt.Errorf("vector index support not enabled")
@@ -750,10 +734,27 @@ func (h *CoordinatorHandler) handleVectorDDL(stmt protocol.Statement) (*protocol
 	}
 
 	ctx := context.Background()
+	change := common.VectorIndexChange{
+		Database:            stmt.Database,
+		IndexName:           stmt.VectorIndexName,
+		TableName:           stmt.TableName,
+		ColumnName:          stmt.VectorColumnName,
+		Metric:              stmt.VectorMetric,
+		Dim:                 stmt.VectorDim,
+		Nlist:               stmt.VectorNlist,
+		Nprobe:              stmt.VectorNprobe,
+		AutoTuneNlist:       stmt.VectorNlist == 0,
+		AutoTuneNprobe:      stmt.VectorNprobe == 0,
+		TargetPartitionSize: common.DefaultVectorTargetPartitionSize,
+		MaxNorm:             stmt.VectorMaxNorm,
+		TrainerVersion:      common.VectorControlTrainerVersion,
+		CodecVersion:        common.VectorControlCodecVersion,
+		CreatedAt:           time.Now().UnixNano(),
+	}
 
 	switch stmt.Type {
 	case protocol.StatementCreateVectorIndex:
-		meta := common.VectorIndexMeta{
+		meta, err := vecMgr.ResolveCreateIndexMeta(ctx, common.VectorIndexMeta{
 			IndexName:  stmt.VectorIndexName,
 			TableName:  stmt.TableName,
 			ColumnName: stmt.VectorColumnName,
@@ -765,27 +766,74 @@ func (h *CoordinatorHandler) handleVectorDDL(stmt protocol.Statement) (*protocol
 			MaxNorm:    stmt.VectorMaxNorm,
 			Status:     "building",
 			CreatedAt:  time.Now().UnixNano(),
-		}
-		if err := vecMgr.CreateIndex(ctx, meta); err != nil {
+		})
+		if err != nil {
 			return nil, fmt.Errorf("create vector index: %w", err)
 		}
-		return &protocol.ResultSet{RowsAffected: 0}, nil
+		change = common.VectorIndexChange{
+			Action:              common.VectorIndexActionCreate,
+			Database:            meta.Database,
+			IndexName:           meta.IndexName,
+			TableName:           meta.TableName,
+			ColumnName:          meta.ColumnName,
+			Metric:              meta.Metric,
+			Dim:                 meta.Dim,
+			Nlist:               meta.Nlist,
+			Nprobe:              meta.Nprobe,
+			AutoTuneNlist:       meta.AutoTuneNlist,
+			AutoTuneNprobe:      meta.AutoTuneNprobe,
+			TargetPartitionSize: meta.TargetPartitionSize,
+			MaxNorm:             meta.MaxNorm,
+			TrainerVersion:      common.VectorControlTrainerVersion,
+			CodecVersion:        common.VectorControlCodecVersion,
+			CreatedAt:           meta.CreatedAt,
+		}
 
 	case protocol.StatementDropVectorIndex:
-		if err := vecMgr.DropIndex(ctx, stmt.VectorIndexName, stmt.Database); err != nil {
-			return nil, fmt.Errorf("drop vector index: %w", err)
-		}
-		return &protocol.ResultSet{RowsAffected: 0}, nil
+		change.Action = common.VectorIndexActionDrop
 
 	case protocol.StatementReindexVectorIndex:
-		if err := vecMgr.ReindexIndex(ctx, stmt.VectorIndexName); err != nil {
-			return nil, fmt.Errorf("reindex vector index: %w", err)
-		}
-		return &protocol.ResultSet{RowsAffected: 0}, nil
+		change.Action = common.VectorIndexActionReindex
 
 	default:
 		return nil, fmt.Errorf("unknown vector DDL type: %d", stmt.Type)
 	}
+
+	controlStmt := protocol.Statement{
+		Type:              stmt.Type,
+		TableName:         change.TableName,
+		Database:          change.Database,
+		VectorIndexName:   change.IndexName,
+		VectorColumnName:  change.ColumnName,
+		VectorMetric:      change.Metric,
+		VectorDim:         change.Dim,
+		VectorNlist:       change.Nlist,
+		VectorNprobe:      change.Nprobe,
+		VectorMaxNorm:     change.MaxNorm,
+		VectorIndexChange: &change,
+	}
+
+	var schemaVersion uint64
+	if h.schemaVersionMgr != nil {
+		if version, err := h.schemaVersionMgr.GetSchemaVersion(stmt.Database); err == nil {
+			schemaVersion = version
+		}
+	}
+	txn := &Transaction{
+		ID:                    txnID,
+		NodeID:                h.nodeID,
+		Statements:            []protocol.Statement{controlStmt},
+		StartTS:               startTS,
+		WriteConsistency:      consistency,
+		Database:              stmt.Database,
+		RequiredSchemaVersion: schemaVersion,
+	}
+	writeCtx, cancel := context.WithTimeout(context.Background(), getWriteTimeout())
+	defer cancel()
+	if err := h.writeCoord.WriteTransaction(writeCtx, txn); err != nil {
+		return nil, err
+	}
+	return &protocol.ResultSet{RowsAffected: 0, CommittedTxnId: txnID}, nil
 }
 
 func (h *CoordinatorHandler) handleRead(stmt protocol.Statement, params []interface{}, consistency protocol.ConsistencyLevel) (*protocol.ResultSet, error) {
@@ -1209,18 +1257,6 @@ func (h *CoordinatorHandler) handleCommit(session *protocol.ConnectionSession) (
 			Int("stmt_count", len(txnState.Statements)).
 			Msg("COMMIT: 2PC failed")
 		return nil, err
-	}
-
-	if len(allCDCEntries) > 0 {
-		if vecMgr, ok := h.dbManager.GetVectorIndexManager().(localVectorCDCProvider); ok {
-			if err := vecMgr.ApplyLocalCDC(ctx, txnState.Database, allCDCEntries); err != nil {
-				log.Error().
-					Err(err).
-					Str("database", txnState.Database).
-					Uint64("txn_id", txnState.TxnID).
-					Msg("Failed to apply local vector CDC")
-			}
-		}
 	}
 
 	// Publish CDC events if publisher is enabled and we have CDC entries

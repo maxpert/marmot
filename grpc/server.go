@@ -482,6 +482,19 @@ func (s *Server) sendChangeEvent(rec *db.TransactionRecord, metaStore db.MetaSto
 
 			var stmt *Statement
 			switch db.OpType(row.Op) {
+			case db.OpTypeVectorIndex:
+				if row.VectorIndexChange == nil {
+					log.Warn().Uint64("txn_id", rec.TxnID).Msg("Vector index CDC row missing payload")
+					continue
+				}
+				stmt = &Statement{
+					Type:      common.MustToWireType(common.StatementVectorIndexControl),
+					TableName: row.Table,
+					Database:  rec.DatabaseName,
+					Payload: &Statement_VectorIndexChange{
+						VectorIndexChange: vectorChangeToProto(*row.VectorIndexChange),
+					},
+				}
 			case db.OpTypeDDL:
 				// DDL statement - use DDLChange payload
 				stmt = &Statement{

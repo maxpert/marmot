@@ -55,6 +55,7 @@ func pruneSegmentStoreOnStartup(dir string, keepGeneration uint64) {
 	removeTmpFiles(filepath.Join(dir, "segments"))
 	removeTmpFiles(filepath.Join(dir, "rowmap"))
 	removeTmpFiles(filepath.Join(dir, "manifest"))
+	removeStagingDirs(filepath.Join(dir, "staging"))
 	removeOldGenerationFiles(filepath.Join(dir, "segments"), ".dat", keepGeneration)
 	removeOldGenerationFiles(filepath.Join(dir, "rowmap"), ".rmap", keepGeneration)
 	removeOldGenerationFiles(filepath.Join(dir, "manifest"), ".mf", keepGeneration)
@@ -72,6 +73,22 @@ func removeTmpFiles(dir string) {
 		path := filepath.Join(dir, entry.Name())
 		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 			log.Debug().Err(err).Str("path", path).Msg("vector segment gc: remove tmp failed")
+		}
+	}
+}
+
+func removeStagingDirs(dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
+		if err := os.RemoveAll(path); err != nil && !os.IsNotExist(err) {
+			log.Debug().Err(err).Str("path", path).Msg("vector segment gc: remove staging failed")
 		}
 	}
 }

@@ -16,14 +16,15 @@ import (
 var (
 	// Internal StatementCode -> Wire StatementType
 	codeToWire = map[StatementCode]pb.StatementType{
-		StatementInsert:         pb.StatementType_INSERT,
-		StatementUpdate:         pb.StatementType_UPDATE,
-		StatementDelete:         pb.StatementType_DELETE,
-		StatementReplace:        pb.StatementType_REPLACE,
-		StatementDDL:            pb.StatementType_DDL,
-		StatementCreateDatabase: pb.StatementType_CREATE_DATABASE,
-		StatementDropDatabase:   pb.StatementType_DROP_DATABASE,
-		StatementLoadData:       pb.StatementType_LOAD_DATA,
+		StatementInsert:             pb.StatementType_INSERT,
+		StatementUpdate:             pb.StatementType_UPDATE,
+		StatementDelete:             pb.StatementType_DELETE,
+		StatementReplace:            pb.StatementType_REPLACE,
+		StatementDDL:                pb.StatementType_DDL,
+		StatementCreateDatabase:     pb.StatementType_CREATE_DATABASE,
+		StatementDropDatabase:       pb.StatementType_DROP_DATABASE,
+		StatementLoadData:           pb.StatementType_LOAD_DATA,
+		StatementVectorIndexControl: pb.StatementType_VECTOR_INDEX,
 	}
 
 	// Wire StatementType -> Internal StatementCode
@@ -36,6 +37,7 @@ var (
 		pb.StatementType_CREATE_DATABASE: StatementCreateDatabase,
 		pb.StatementType_DROP_DATABASE:   StatementDropDatabase,
 		pb.StatementType_LOAD_DATA:       StatementLoadData,
+		pb.StatementType_VECTOR_INDEX:    StatementVectorIndexControl,
 	}
 )
 

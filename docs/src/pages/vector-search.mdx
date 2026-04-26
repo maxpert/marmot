@@ -222,7 +222,7 @@ Current defaults:
 | Non-empty create `nlist` | roughly `ceil(rows / 512)`, clamped by the supported auto range |
 | Empty-table first publish | starts from a smaller bootstrap cluster set once enough overlay rows exist |
 | Later growth | background maintenance can promote to a larger cluster count as rows grow |
-| Auto `nprobe` | derived from a row scan budget and the target partition size |
+| Auto `nprobe` | derived from the target partition size; default behavior probes about 16 target partitions |
 
 Manual override guidance:
 
@@ -376,9 +376,11 @@ After a successful commit:
 
 1. Marmot CDC captures the row-level change.
 2. The vector hook materializes new vector values into internal form.
-3. The local overlay journal records inserts, updates, or tombstones.
+3. The local overlay journal records inserts, updates, or tombstones. Before the first clustered publish, overlay vectors are temporary prepared float32 bytes; after probe centroids exist, overlay vectors are compact residual int8 bytes.
 4. Queries see those changes immediately from the overlay.
 5. Background maintenance publishes new immutable generations and compacts applied overlay rows.
+
+Exact rerank and maintenance always use the base table as the truth source. Lossy stable or overlay encodings are not used to update centroid sums or exact distances.
 
 ### Stable Encoding
 
@@ -386,11 +388,10 @@ Stable segments use compact encodings:
 
 | Encoding | Used when |
 |---|---|
-| Residual PQ8 | Internal dimension is at least 512 and there are at least 4096 stable training rows. |
-| Residual int8 | Fallback for smaller indexes, lower dimensions, or legacy generations. |
-| Raw prepared float32 | Compatibility/testing path. |
+| Residual PQ8 | Internal dimension is at least 512. |
+| Residual int8 | Internal dimension is less than 512. |
 
-Residual PQ8 uses generation-local codebooks. Incremental maintenance reuses the generation codec for touched clusters so untouched cluster spans remain byte-copyable. Full rebuild or manual `REINDEX VECTOR` is the codec refresh path.
+Raw float32 stable segment payloads are not written. Residual PQ8 uses generation-local codebooks. Incremental maintenance reuses the generation codec for touched clusters so untouched cluster spans remain byte-copyable. Full rebuild or manual `REINDEX VECTOR` is the codec refresh path.
 
 ## Replication
 

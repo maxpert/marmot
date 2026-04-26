@@ -10,7 +10,7 @@ func TestPruneSegmentStoreOnStartupRemovesOrphansAndTemps(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	for _, subdir := range []string{"segments", "rowmap", "manifest"} {
+	for _, subdir := range []string{"segments", "rowmap", "manifest", "staging/gen-00000000000000000004-1"} {
 		if err := os.MkdirAll(filepath.Join(dir, subdir), 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -24,6 +24,7 @@ func TestPruneSegmentStoreOnStartupRemovesOrphansAndTemps(t *testing.T) {
 		"manifest/gen-00000000000000000001.mf":      false,
 		"manifest/gen-00000000000000000002.mf":      true,
 		"manifest/current":                          true,
+		"staging/gen-00000000000000000004-1/junk":   false,
 	}
 	for name := range files {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o644); err != nil {

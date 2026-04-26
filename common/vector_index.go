@@ -26,3 +26,79 @@ type VectorIndexMeta struct {
 	Status    string // "building", "ready", "reindexing"
 	CreatedAt int64
 }
+
+const (
+	DefaultVectorTargetPartitionSize = 512
+	VectorControlTrainerVersion      = uint32(1)
+	VectorControlCodecVersion        = uint32(1)
+)
+
+type VectorIndexAction uint8
+
+const (
+	VectorIndexActionCreate     VectorIndexAction = 1
+	VectorIndexActionDrop       VectorIndexAction = 2
+	VectorIndexActionReindex    VectorIndexAction = 3
+	VectorIndexActionCheckpoint VectorIndexAction = 4
+)
+
+func (a VectorIndexAction) String() string {
+	switch a {
+	case VectorIndexActionCreate:
+		return "create"
+	case VectorIndexActionDrop:
+		return "drop"
+	case VectorIndexActionReindex:
+		return "reindex"
+	case VectorIndexActionCheckpoint:
+		return "checkpoint"
+	default:
+		return "unknown"
+	}
+}
+
+// VectorIndexChange is the replicated control-plane payload for local vector
+// index state. It intentionally carries metadata only; segment files, rowmaps,
+// centroids, PQ codebooks, and overlay journals remain node-local derived data.
+type VectorIndexChange struct {
+	Action              VectorIndexAction `msgpack:"a"`
+	Database            string            `msgpack:"db"`
+	IndexName           string            `msgpack:"idx"`
+	TableName           string            `msgpack:"tbl"`
+	ColumnName          string            `msgpack:"col"`
+	Metric              string            `msgpack:"m"`
+	Dim                 int               `msgpack:"dim"`
+	Nlist               int               `msgpack:"nl"`
+	Nprobe              int               `msgpack:"np"`
+	AutoTuneNlist       bool              `msgpack:"anl"`
+	AutoTuneNprobe      bool              `msgpack:"anp"`
+	TargetPartitionSize int               `msgpack:"tps"`
+	MaxNorm             float32           `msgpack:"mn"`
+	SourceProbeEpoch    uint64            `msgpack:"spe"`
+	TargetProbeEpoch    uint64            `msgpack:"tpe"`
+	CutoffTxnID         uint64            `msgpack:"ctxn"`
+	CutoffSeqNum        uint64            `msgpack:"cseq"`
+	TrainerVersion      uint32            `msgpack:"trv"`
+	CodecVersion        uint32            `msgpack:"cv"`
+	Seed                uint64            `msgpack:"seed"`
+	CreatedAt           int64             `msgpack:"ca"`
+}
+
+func (c VectorIndexChange) Meta() VectorIndexMeta {
+	return VectorIndexMeta{
+		IndexName:           c.IndexName,
+		TableName:           c.TableName,
+		ColumnName:          c.ColumnName,
+		Database:            c.Database,
+		Metric:              c.Metric,
+		Dim:                 c.Dim,
+		Nlist:               c.Nlist,
+		Nprobe:              c.Nprobe,
+		AutoTuneNlist:       c.AutoTuneNlist,
+		AutoTuneNprobe:      c.AutoTuneNprobe,
+		TargetPartitionSize: c.TargetPartitionSize,
+		MaxNorm:             c.MaxNorm,
+		Status:              "building",
+		CreatedAt:           c.CreatedAt,
+	}
+}

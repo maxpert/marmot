@@ -32,13 +32,14 @@ func (t IntentType) String() string {
 type OpType uint8
 
 const (
-	OpTypeInsert   OpType = 0
-	OpTypeReplace  OpType = 1
-	OpTypeUpdate   OpType = 2
-	OpTypeDelete   OpType = 3
-	OpTypeDelta    OpType = 4 // Used for LWW delta sync operations
-	OpTypeDDL      OpType = 5 // DDL schema changes (CREATE/DROP/ALTER TABLE)
-	OpTypeLoadData OpType = 6 // LOAD DATA LOCAL INFILE bulk load
+	OpTypeInsert      OpType = 0
+	OpTypeReplace     OpType = 1
+	OpTypeUpdate      OpType = 2
+	OpTypeDelete      OpType = 3
+	OpTypeDelta       OpType = 4 // Used for LWW delta sync operations
+	OpTypeDDL         OpType = 5 // DDL schema changes (CREATE/DROP/ALTER TABLE)
+	OpTypeLoadData    OpType = 6 // LOAD DATA LOCAL INFILE bulk load
+	OpTypeVectorIndex OpType = 7 // Vector index control metadata
 )
 
 func (o OpType) String() string {
@@ -57,6 +58,8 @@ func (o OpType) String() string {
 		return "DDL"
 	case OpTypeLoadData:
 		return "LOAD_DATA"
+	case OpTypeVectorIndex:
+		return "VECTOR_INDEX"
 	default:
 		return "UNKNOWN"
 	}
@@ -183,6 +186,8 @@ func OpTypeToStatementType(op OpType) protocol.StatementCode {
 		return protocol.StatementDDL
 	case OpTypeLoadData:
 		return protocol.StatementLoadData
+	case OpTypeVectorIndex:
+		return protocol.StatementVectorIndexControl
 	default:
 		panic(fmt.Sprintf("OpTypeToStatementType: unsupported op type %d", op))
 	}

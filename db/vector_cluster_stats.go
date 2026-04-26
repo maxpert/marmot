@@ -1,11 +1,13 @@
 package db
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/maxpert/marmot/modules/vecindex"
 	"github.com/maxpert/marmot/modules/vecindex/pkg/kmeans"
 	"github.com/maxpert/marmot/modules/vecindex/pkg/metric"
+	"github.com/maxpert/marmot/modules/vecindex/pkg/quantize"
 )
 
 type cutoffClusterStats struct {
@@ -32,20 +34,20 @@ func overlayMutationsUpTo(snapshot *vecindex.OverlaySnapshot, minSequence, cutof
 }
 
 func buildCutoffClusterStats(
+	ctx context.Context,
 	spec vecindex.IVFSpec,
 	base *vecindex.SegmentGeneration,
 	overlaySnapshot *vecindex.OverlaySnapshot,
 	cutoff uint64,
 	maintenance *vecindex.MaintenanceState,
+	exactFetcher *exactVectorFetcher,
 ) (*cutoffClusterStats, error) {
 	if base == nil || base.Data == nil || base.RowMap == nil {
 		return nil, fmt.Errorf("cutoff cluster stats: base generation is required")
 	}
 	counts := append([]uint64(nil), base.ClusterRowCounts...)
 	sums := cloneClusterVectorSums(base.ClusterVectorSums)
-	useMaintenanceLiveStats := maintenance != nil &&
-		overlaySnapshot != nil &&
-		(cutoff == 0 || cutoff == overlaySnapshot.LastSequence())
+	useMaintenanceLiveStats := false
 	if useMaintenanceLiveStats {
 		if liveCounts := maintenance.LiveClusterRowCounts(); len(liveCounts) > 0 {
 			counts = liveCounts
@@ -80,10 +82,17 @@ func buildCutoffClusterStats(
 		if useMaintenanceLiveStats {
 			continue
 		}
-		ensureClusterStatsCapacity(&counts, &sums, int(mutation.ClusterID), len(metric.BytesToFloat32(mutation.Vec)))
+		preparedBlob, ok, err := overlayMutationPrepared(ctx, exactFetcher, mutation)
+		if err != nil {
+			return nil, fmt.Errorf("cutoff cluster stats: load exact overlay rowid %d: %w", mutation.RowID, err)
+		}
+		if !ok {
+			continue
+		}
+		ensureClusterStatsCapacity(&counts, &sums, int(mutation.ClusterID), len(metric.BytesToFloat32(preparedBlob)))
 		counts[mutation.ClusterID]++
 		sum := sums[mutation.ClusterID]
-		for i, value := range metric.BytesToFloat32(mutation.Vec) {
+		for i, value := range metric.BytesToFloat32(preparedBlob) {
 			sum[i] += value
 		}
 	}
@@ -224,6 +233,8 @@ func stableCentroidSetForTouched(baseStable *kmeans.CentroidSet, nextProbe *kmea
 }
 
 func reassignOverlayMutationsForProbe(
+	ctx context.Context,
+	exactFetcher *exactVectorFetcher,
 	snapshot *vecindex.OverlaySnapshot,
 	minSequence uint64,
 	spec vecindex.IVFSpec,
@@ -236,7 +247,7 @@ func reassignOverlayMutationsForProbe(
 	rewritten := make([]vecindex.OverlayMutation, 0)
 	var reassignErr error
 	snapshot.VisitMutationsAfter(minSequence, func(mutation vecindex.OverlayMutation) bool {
-		next, err := reassignOverlayMutationForProbe(mutation, spec, probe, stable)
+		next, err := reassignOverlayMutationForProbe(ctx, exactFetcher, mutation, spec, probe, stable)
 		if err != nil {
 			reassignErr = err
 			return false
@@ -251,6 +262,8 @@ func reassignOverlayMutationsForProbe(
 }
 
 func reassignOverlayMutationForProbe(
+	ctx context.Context,
+	exactFetcher *exactVectorFetcher,
 	mutation vecindex.OverlayMutation,
 	spec vecindex.IVFSpec,
 	probe *kmeans.CentroidSet,
@@ -260,7 +273,15 @@ func reassignOverlayMutationForProbe(
 	next.Epoch = probe.Epoch()
 	if mutation.Kind == vecindex.OverlayMutationDelete {
 		next.ClusterID = 0
+		next.VecEncoding = 0
 		return next, nil
+	}
+	prepared, ok, err := overlayMutationPrepared(ctx, exactFetcher, mutation)
+	if err != nil {
+		return vecindex.OverlayMutation{}, fmt.Errorf("reassign overlay mutation rowid %d: exact vector: %w", mutation.RowID, err)
+	}
+	if !ok {
+		return vecindex.OverlayMutation{}, fmt.Errorf("reassign overlay mutation rowid %d: exact vector missing", mutation.RowID)
 	}
 	next.Kind = vecindex.OverlayMutationUpsert
 	if stable != nil && stable.RowMap != nil {
@@ -270,10 +291,44 @@ func reassignOverlayMutationForProbe(
 			next.Kind = vecindex.OverlayMutationReplace
 		}
 	}
-	clusterID, err := assignPreparedAgainstSet(mutation.Vec, spec, probe)
+	clusterID, err := assignPreparedAgainstSet(prepared, spec, probe)
 	if err != nil {
 		return vecindex.OverlayMutation{}, fmt.Errorf("reassign overlay mutation rowid %d: %w", mutation.RowID, err)
 	}
+	vecEncoding, encodedVec, err := encodePreparedForOverlayProbe(spec, probe, clusterID, prepared)
+	if err != nil {
+		return vecindex.OverlayMutation{}, fmt.Errorf("reassign overlay mutation rowid %d: encode: %w", mutation.RowID, err)
+	}
 	next.ClusterID = clusterID
+	next.VecEncoding = vecEncoding
+	next.Vec = encodedVec
 	return next, nil
+}
+
+func overlayMutationPrepared(ctx context.Context, exactFetcher *exactVectorFetcher, mutation vecindex.OverlayMutation) ([]byte, bool, error) {
+	if mutation.Kind == vecindex.OverlayMutationDelete {
+		return nil, false, nil
+	}
+	if mutation.VecEncoding == vecindex.OverlayPreparedF32 {
+		return mutation.Vec, len(mutation.Vec) > 0, nil
+	}
+	if exactFetcher == nil {
+		return nil, false, fmt.Errorf("exact fetcher is required for overlay encoding %d", mutation.VecEncoding)
+	}
+	return exactFetcher.Prepared(ctx, mutation.RowID)
+}
+
+func encodePreparedForOverlayProbe(spec vecindex.IVFSpec, probe *kmeans.CentroidSet, clusterID int64, prepared []byte) (vecindex.OverlayVecEncoding, []byte, error) {
+	if probe == nil || probe.Epoch() == 0 || clusterID <= 0 {
+		return vecindex.OverlayPreparedF32, prepared, nil
+	}
+	centroid, err := probe.GetReadOnly(uint32(clusterID - 1))
+	if err != nil {
+		return 0, nil, err
+	}
+	encoded, err := quantize.EncodeResidualInt8(spec.InternalMetric(), metric.BytesToFloat32(prepared), centroid, vecindex.MemberResidualBlockSize)
+	if err != nil {
+		return 0, nil, err
+	}
+	return vecindex.OverlayResidualInt8, encoded, nil
 }

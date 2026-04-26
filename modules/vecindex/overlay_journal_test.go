@@ -2,6 +2,7 @@ package vecindex
 
 import (
 	"encoding/binary"
+	"hash/crc32"
 	"os"
 	"path/filepath"
 	"testing"
@@ -110,6 +111,166 @@ func TestJournaledOverlay_ReplayOnReopen(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, int64(2), clusterID)
 	require.True(t, snapshot.HasTombstone(11))
+}
+
+func TestJournaledOverlay_ReplayPreservesCommitMetadata(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "overlay.journal")
+	overlay, err := OpenJournaledOverlay(path)
+	require.NoError(t, err)
+	require.NoError(t, overlay.ApplyCommittedBatch([]OverlayMutation{
+		{
+			Kind:              OverlayMutationUpsert,
+			Epoch:             9,
+			Sequence:          1,
+			ClusterID:         3,
+			RowID:             10,
+			AppliedAtUnixNano: 111,
+			CommitTxnID:       101,
+			CommitSeqNum:      202,
+			Vec:               encodeOverlayTestVec(1, 0),
+		},
+		{
+			Kind:              OverlayMutationDelete,
+			Epoch:             9,
+			Sequence:          2,
+			RowID:             11,
+			AppliedAtUnixNano: 222,
+			CommitTxnID:       103,
+			CommitSeqNum:      204,
+		},
+	}))
+	require.NoError(t, overlay.Close())
+
+	reopened, err := OpenJournaledOverlay(path)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, reopened.Close()) })
+
+	mutations := reopened.Snapshot().MutationsAfter(0)
+	require.Len(t, mutations, 2)
+	require.Equal(t, uint64(101), mutations[0].CommitTxnID)
+	require.Equal(t, uint64(202), mutations[0].CommitSeqNum)
+	require.Equal(t, uint64(103), mutations[1].CommitTxnID)
+	require.Equal(t, uint64(204), mutations[1].CommitSeqNum)
+}
+
+func TestJournaledOverlay_ReplayPreservesVectorEncoding(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "overlay.journal")
+	overlay, err := OpenJournaledOverlay(path)
+	require.NoError(t, err)
+	require.NoError(t, overlay.ApplyCommittedBatch([]OverlayMutation{
+		{
+			Kind:        OverlayMutationUpsert,
+			Epoch:       11,
+			Sequence:    1,
+			ClusterID:   3,
+			RowID:       42,
+			VecEncoding: OverlayResidualInt8,
+			Vec:         []byte{1, 2, 3, 4},
+		},
+	}))
+	require.NoError(t, overlay.Close())
+
+	reopened, err := OpenJournaledOverlay(path)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, reopened.Close()) })
+
+	var seen bool
+	reopened.Snapshot().VisitClusterEncodedAfter(3, 0, func(rowID int64, encoding OverlayVecEncoding, vec []byte) bool {
+		require.Equal(t, int64(42), rowID)
+		require.Equal(t, OverlayResidualInt8, encoding)
+		require.Equal(t, []byte{1, 2, 3, 4}, vec)
+		seen = true
+		return true
+	})
+	require.True(t, seen)
+	mutations := reopened.Snapshot().MutationsAfter(0)
+	require.Len(t, mutations, 1)
+	require.Equal(t, OverlayResidualInt8, mutations[0].VecEncoding)
+}
+
+func TestJournaledOverlay_RejectsUnknownVectorEncoding(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "overlay.journal")
+	overlay, err := OpenJournaledOverlay(path)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, overlay.Close()) })
+
+	err = overlay.ApplyCommittedBatch([]OverlayMutation{
+		{
+			Kind:        OverlayMutationUpsert,
+			Epoch:       1,
+			Sequence:    1,
+			ClusterID:   1,
+			RowID:       1,
+			VecEncoding: OverlayVecEncoding(99),
+			Vec:         []byte{1, 2, 3},
+		},
+	})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "unknown overlay vector encoding")
+}
+
+func TestOverlayJournal_ReplayLegacyV2WithoutCommitMetadata(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "overlay-v2.journal")
+	vec := encodeOverlayTestVec(4, 5)
+	payload := make([]byte, overlayJournalRecordFloorV2+len(vec))
+	payload[0] = byte(OverlayMutationUpsert)
+	binary.LittleEndian.PutUint64(payload[1:9], 4)
+	binary.LittleEndian.PutUint64(payload[9:17], 1)
+	binary.LittleEndian.PutUint64(payload[17:25], 2)
+	binary.LittleEndian.PutUint64(payload[25:33], 99)
+	binary.LittleEndian.PutUint64(payload[33:41], 1234)
+	binary.LittleEndian.PutUint32(payload[41:45], uint32(len(vec)))
+	copy(payload[overlayJournalRecordFloorV2:], vec)
+
+	var header [overlayJournalHeaderSize]byte
+	copy(header[:8], overlayJournalMagic)
+	binary.LittleEndian.PutUint32(header[8:12], 2)
+	binary.LittleEndian.PutUint64(header[12:20], 4)
+	binary.LittleEndian.PutUint64(header[20:28], 1)
+
+	var lenBuf [4]byte
+	binary.LittleEndian.PutUint32(lenBuf[:], uint32(len(payload)))
+	crc := crc32.Checksum(payload, overlayJournalCRCTable)
+	var crcBuf [4]byte
+	binary.LittleEndian.PutUint32(crcBuf[:], crc)
+
+	file, err := os.Create(path)
+	require.NoError(t, err)
+	_, err = file.Write(header[:])
+	require.NoError(t, err)
+	_, err = file.Write(lenBuf[:])
+	require.NoError(t, err)
+	_, err = file.Write(payload)
+	require.NoError(t, err)
+	_, err = file.Write(crcBuf[:])
+	require.NoError(t, err)
+	require.NoError(t, file.Close())
+
+	reopened, err := OpenJournaledOverlay(path)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, reopened.Close()) })
+
+	snapshot := reopened.Snapshot()
+	require.Equal(t, uint64(4), snapshot.Epoch())
+	require.Equal(t, uint64(1), snapshot.LastSequence())
+	clusterID, ok := snapshot.RowCluster(99)
+	require.True(t, ok)
+	require.Equal(t, int64(2), clusterID)
+	got, err := snapshot.ReadVec(99)
+	require.NoError(t, err)
+	require.Equal(t, vec, got)
+	mutations := snapshot.MutationsAfter(0)
+	require.Len(t, mutations, 1)
+	require.Zero(t, mutations[0].CommitTxnID)
+	require.Zero(t, mutations[0].CommitSeqNum)
 }
 
 func TestJournaledOverlay_SnapshotStoresJournalRefs(t *testing.T) {
@@ -226,6 +387,19 @@ func TestOverlayJournal_TruncatedTailIgnoredOnOpen(t *testing.T) {
 	clusterID, ok = snapshot.RowCluster(2)
 	require.True(t, ok)
 	require.Equal(t, int64(2), clusterID)
+}
+
+func TestOverlayJournal_OpenRemovesStaleTemp(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "overlay.journal")
+	require.NoError(t, os.WriteFile(path+".tmp", []byte("stale"), 0o644))
+	overlay, err := OpenJournaledOverlay(path)
+	require.NoError(t, err)
+	require.NoError(t, overlay.Close())
+
+	_, err = os.Stat(path + ".tmp")
+	require.True(t, os.IsNotExist(err), "stale temp file should be removed on open")
 }
 
 func TestOverlayJournal_ResetCompactsState(t *testing.T) {

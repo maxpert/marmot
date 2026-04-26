@@ -199,6 +199,9 @@ func (dm *DatabaseManager) wireGCCoordination(mdb *ReplicatedDatabase, dbName st
 	if dm.cdcHub != nil {
 		txnMgr.SetNotifier(dm.cdcHub)
 	}
+	if dm.vecIndexMgr != nil {
+		txnMgr.SetVectorCDCNotifier(dm.vecIndexMgr)
+	}
 }
 
 // SetRefreshReplicationStatesFunc sets the callback for refreshing peer replication states
@@ -247,6 +250,13 @@ func (dm *DatabaseManager) SetVectorIndexManager(mgr *VectorIndexManager) {
 	dm.mu.Lock()
 	defer dm.mu.Unlock()
 	dm.vecIndexMgr = mgr
+	for _, mdb := range dm.databases {
+		if mgr == nil {
+			mdb.GetTransactionManager().SetVectorCDCNotifier(nil)
+		} else {
+			mdb.GetTransactionManager().SetVectorCDCNotifier(mgr)
+		}
+	}
 }
 
 // GetVectorIndexManager returns the vector index manager (may be nil).

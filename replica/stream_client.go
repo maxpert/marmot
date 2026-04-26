@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/maxpert/marmot/cfg"
+	"github.com/maxpert/marmot/common"
 	"github.com/maxpert/marmot/db"
 	"github.com/maxpert/marmot/db/snapshot"
 	marmotgrpc "github.com/maxpert/marmot/grpc"
@@ -847,6 +848,11 @@ func (s *StreamClient) applyChangeEvent(ctx context.Context, event *marmotgrpc.C
 	if sqlDB == nil {
 		return fmt.Errorf("database %s connections are closed", database)
 	}
+	if len(event.Statements) == 1 {
+		if change := event.Statements[0].GetVectorIndexChange(); change != nil {
+			return s.applyVectorIndexChange(ctx, marmotgrpc.VectorChangeFromProto(change))
+		}
+	}
 
 	tx, err := sqlDB.BeginTx(ctx, nil)
 	if err != nil {
@@ -875,8 +881,57 @@ func (s *StreamClient) applyChangeEvent(ctx context.Context, event *marmotgrpc.C
 			log.Warn().Err(err).Str("database", database).Msg("Failed to reload schema after DDL")
 		}
 	}
+	s.applyVectorCDCFromEvent(ctx, database, event)
 
 	return nil
+}
+
+func (s *StreamClient) applyVectorIndexChange(ctx context.Context, change common.VectorIndexChange) error {
+	vecMgr := s.dbManager.GetVectorIndexManager()
+	if vecMgr == nil {
+		return fmt.Errorf("vector index manager not configured")
+	}
+	applier, ok := vecMgr.(interface {
+		ApplyVectorControl(context.Context, common.VectorIndexChange) error
+	})
+	if !ok {
+		return fmt.Errorf("vector index manager cannot apply replicated control metadata")
+	}
+	return applier.ApplyVectorControl(ctx, change)
+}
+
+func (s *StreamClient) applyVectorCDCFromEvent(ctx context.Context, database string, event *marmotgrpc.ChangeEvent) {
+	entries := make([]common.CDCEntry, 0, len(event.Statements))
+	for _, stmt := range event.Statements {
+		rowChange := stmt.GetRowChange()
+		if rowChange == nil || (len(rowChange.NewValues) == 0 && len(rowChange.OldValues) == 0) {
+			continue
+		}
+		entries = append(entries, common.CDCEntry{
+			Table:        stmt.TableName,
+			IntentKey:    rowChange.IntentKey,
+			OldValues:    rowChange.OldValues,
+			NewValues:    rowChange.NewValues,
+			CommitTxnID:  event.TxnId,
+			CommitSeqNum: event.SeqNum,
+		})
+	}
+	if len(entries) == 0 {
+		return
+	}
+	vecMgr := s.dbManager.GetVectorIndexManager()
+	if vecMgr == nil {
+		return
+	}
+	applier, ok := vecMgr.(interface {
+		ApplyCommittedVectorCDC(context.Context, string, uint64, uint64, []common.CDCEntry) error
+	})
+	if !ok {
+		return
+	}
+	if err := applier.ApplyCommittedVectorCDC(ctx, database, event.TxnId, event.SeqNum, entries); err != nil {
+		log.Error().Err(err).Uint64("txn_id", event.TxnId).Str("database", database).Msg("Failed to apply streamed vector CDC")
+	}
 }
 
 // applyCreateDatabase handles CREATE DATABASE replication

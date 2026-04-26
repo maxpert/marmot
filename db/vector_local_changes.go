@@ -12,6 +12,7 @@ import (
 	"github.com/maxpert/marmot/encoding"
 	"github.com/maxpert/marmot/modules/vecindex"
 	"github.com/maxpert/marmot/modules/vecindex/pkg/metric"
+	"github.com/maxpert/marmot/modules/vecindex/pkg/quantize"
 )
 
 func (h *EngineHook) OnIndexLocalChanges(ctx context.Context, meta common.VectorIndexMeta, entries []common.CDCEntry) error {
@@ -170,6 +171,8 @@ func (h *EngineHook) buildOverlayMutations(
 			}
 			if used {
 				deleteMutation.AppliedAtUnixNano = appliedAtUnixNano
+				deleteMutation.CommitTxnID = entry.CommitTxnID
+				deleteMutation.CommitSeqNum = entry.CommitSeqNum
 				mutations = append(mutations, deleteMutation)
 				nextSequence++
 			}
@@ -200,6 +203,8 @@ func (h *EngineHook) buildOverlayMutations(
 				return nil, err
 			}
 			mutation.AppliedAtUnixNano = appliedAtUnixNano
+			mutation.CommitTxnID = entry.CommitTxnID
+			mutation.CommitSeqNum = entry.CommitSeqNum
 			mutations = append(mutations, mutation)
 			nextSequence++
 		case oldRowOK:
@@ -209,6 +214,8 @@ func (h *EngineHook) buildOverlayMutations(
 			}
 			if used {
 				mutation.AppliedAtUnixNano = appliedAtUnixNano
+				mutation.CommitTxnID = entry.CommitTxnID
+				mutation.CommitSeqNum = entry.CommitSeqNum
 				mutations = append(mutations, mutation)
 				nextSequence++
 			}
@@ -348,14 +355,34 @@ func buildUpsertMutation(
 	if stableRowExists(state, rowID) {
 		kind = vecindex.OverlayMutationReplace
 	}
+	vecEncoding, encodedVec, err := encodeOverlayVectorForJournal(state, spec, clusterID, prepared, epoch)
+	if err != nil {
+		return vecindex.OverlayMutation{}, fmt.Errorf("vector local changes: encode overlay rowid %d: %w", rowID, err)
+	}
 	return vecindex.OverlayMutation{
-		Kind:      kind,
-		Epoch:     epoch,
-		Sequence:  sequence,
-		ClusterID: clusterID,
-		RowID:     rowID,
-		Vec:       prepared,
+		Kind:        kind,
+		Epoch:       epoch,
+		Sequence:    sequence,
+		ClusterID:   clusterID,
+		RowID:       rowID,
+		VecEncoding: vecEncoding,
+		Vec:         encodedVec,
 	}, nil
+}
+
+func encodeOverlayVectorForJournal(state *vecindex.IndexState, spec vecindex.IVFSpec, clusterID int64, prepared []byte, epoch uint64) (vecindex.OverlayVecEncoding, []byte, error) {
+	if epoch == 0 || clusterID <= 0 || state == nil || state.ProbeState() == nil {
+		return vecindex.OverlayPreparedF32, prepared, nil
+	}
+	centroid, err := state.ProbeState().GetReadOnly(uint32(clusterID - 1))
+	if err != nil {
+		return 0, nil, err
+	}
+	encoded, err := quantize.EncodeResidualInt8(spec.InternalMetric(), metric.BytesToFloat32(prepared), centroid, vecindex.MemberResidualBlockSize)
+	if err != nil {
+		return 0, nil, err
+	}
+	return vecindex.OverlayResidualInt8, encoded, nil
 }
 
 func buildDeleteMutation(
@@ -399,10 +426,12 @@ func stableRowExists(state *vecindex.IndexState, rowID int64) bool {
 }
 
 type mergedLocalCDCEntry struct {
-	OldValues map[string][]byte
-	NewValues map[string][]byte
-	oldOwned  bool
-	newOwned  bool
+	OldValues    map[string][]byte
+	NewValues    map[string][]byte
+	CommitTxnID  uint64
+	CommitSeqNum uint64
+	oldOwned     bool
+	newOwned     bool
 }
 
 func mergeLocalCDCEntries(tableName string, entries []common.CDCEntry) []mergedLocalCDCEntry {
@@ -416,8 +445,10 @@ func mergeLocalCDCEntries(tableName string, entries []common.CDCEntry) []mergedL
 		current, ok := merged[key]
 		if !ok {
 			current = &mergedLocalCDCEntry{
-				OldValues: entry.OldValues,
-				NewValues: entry.NewValues,
+				OldValues:    entry.OldValues,
+				NewValues:    entry.NewValues,
+				CommitTxnID:  entry.CommitTxnID,
+				CommitSeqNum: entry.CommitSeqNum,
 			}
 			merged[key] = current
 			ordered = append(ordered, key)
@@ -439,6 +470,12 @@ func mergeLocalCDCEntries(tableName string, entries []common.CDCEntry) []mergedL
 		}
 		mergeCDCValueMap(current.OldValues, entry.OldValues)
 		mergeCDCValueMap(current.NewValues, entry.NewValues)
+		if entry.CommitTxnID > current.CommitTxnID {
+			current.CommitTxnID = entry.CommitTxnID
+		}
+		if entry.CommitSeqNum > current.CommitSeqNum {
+			current.CommitSeqNum = entry.CommitSeqNum
+		}
 	}
 
 	result := make([]mergedLocalCDCEntry, 0, len(ordered))

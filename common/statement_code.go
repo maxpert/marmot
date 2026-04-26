@@ -42,6 +42,7 @@ const (
 	StatementCreateVectorIndex  // CREATE VECTOR INDEX
 	StatementDropVectorIndex    // DROP VECTOR INDEX
 	StatementReindexVectorIndex // REINDEX VECTOR <name> (design §8.3)
+	StatementVectorIndexControl // Replicated vector index control-plane event
 )
 
 // IsMutation returns true if the statement type is a mutation operation.
@@ -51,7 +52,7 @@ func (t StatementCode) IsMutation() bool {
 		StatementLoadData, StatementDDL, StatementDCL, StatementAdmin,
 		StatementCreateDatabase, StatementDropDatabase,
 		StatementCreateVectorIndex, StatementDropVectorIndex,
-		StatementReindexVectorIndex:
+		StatementReindexVectorIndex, StatementVectorIndexControl:
 		return true
 	}
 	return false

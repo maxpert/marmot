@@ -74,7 +74,10 @@ func (t *Transpiler) Transpile(ctx *QueryContext) error {
 		t.autoIncRule.NeedsIDInjection(ctx.MySQLState.AST, ctx.SchemaLookup)
 
 	// Check if literal extraction will be applied
-	needsLiteralExtraction := ctx.ExtractLiterals && len(ctx.Input.Parameters) == 0 && isDMLStatement(ctx.MySQLState.AST)
+	needsLiteralExtraction := ctx.ExtractLiterals &&
+		len(ctx.Input.Parameters) == 0 &&
+		isDMLStatement(ctx.MySQLState.AST) &&
+		!containsVectorSearchFunc(ctx.MySQLState.AST)
 
 	// Only use cache when safe (no ID injection and no literal extraction needed)
 	if !needsIDInjection && !needsLiteralExtraction {
@@ -204,6 +207,22 @@ func isDMLStatement(stmt sqlparser.Statement) bool {
 	default:
 		return false
 	}
+}
+
+func containsVectorSearchFunc(stmt sqlparser.Statement) bool {
+	found := false
+	_ = sqlparser.Walk(func(node sqlparser.SQLNode) (kontinue bool, err error) {
+		fn, ok := node.(*sqlparser.FuncExpr)
+		if !ok {
+			return true, nil
+		}
+		if fn.Name.EqualString("vec_match") || fn.Name.EqualString("vec_distance") {
+			found = true
+			return false, nil
+		}
+		return true, nil
+	}, stmt)
+	return found
 }
 
 // hashSQL generates a SHA256 hash of the SQL string for cache key generation.

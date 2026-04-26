@@ -3,6 +3,7 @@ package query
 import (
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"vitess.io/vitess/go/vt/sqlparser"
@@ -41,8 +42,10 @@ var (
 	dropVectorIndexPattern   = regexp.MustCompile(`(?i)^\s*DROP\s+VECTOR\s+INDEX\s+`)
 
 	// Extraction patterns for vector index metadata
-	vecCreateExtractPattern = regexp.MustCompile(`(?i)CREATE\s+VECTOR\s+INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)\s+ON\s+(\w+)\s*\(`)
-	vecDropExtractPattern   = regexp.MustCompile(`(?i)DROP\s+VECTOR\s+INDEX\s+(?:IF\s+EXISTS\s+)?(\w+)\s+ON\s+(\w+)`)
+	vecIdent                = "`?([A-Za-z_][A-Za-z0-9_]*)`?"
+	vecCreateExtractPattern = regexp.MustCompile(`(?i)CREATE\s+VECTOR\s+INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?` + vecIdent + `\s+ON\s+` + vecIdent + `\s*\(\s*` + vecIdent + `\s*\)`)
+	vecDropExtractPattern   = regexp.MustCompile(`(?i)DROP\s+VECTOR\s+INDEX\s+(?:IF\s+EXISTS\s+)?` + vecIdent + `(?:\s+ON\s+` + vecIdent + `)?`)
+	vecWithPattern          = regexp.MustCompile(`(?i)WITH\s*\(([^)]+)\)`)
 )
 
 type VitessParser struct {
@@ -136,8 +139,19 @@ func classifyByPattern(ctx *QueryContext) {
 	if createVectorIndexPattern.MatchString(sql) {
 		ctx.Output.StatementType = StatementCreateVectorIndex
 		ctx.MySQLState.SkipVitess = true
-		if m := vecCreateExtractPattern.FindStringSubmatch(sql); len(m) > 2 {
+		if m := vecCreateExtractPattern.FindStringSubmatch(sql); len(m) > 3 {
+			ctx.MySQLState.VectorIndexName = m[1]
 			ctx.MySQLState.TableName = m[2]
+			ctx.MySQLState.VectorColumnName = m[3]
+		}
+		if m := regexp.MustCompile(`(?i)\bDIM\s+(\d+)`).FindStringSubmatch(sql); len(m) > 1 {
+			ctx.MySQLState.VectorDim = parseDecimalInt(m[1])
+		}
+		if m := regexp.MustCompile(`(?i)\bMETRIC\s+(\w+)`).FindStringSubmatch(sql); len(m) > 1 {
+			ctx.MySQLState.VectorMetric = strings.ToLower(m[1])
+		}
+		if wm := vecWithPattern.FindStringSubmatch(sql); len(wm) > 1 {
+			parseVectorWithClause(ctx.MySQLState, wm[1])
 		}
 		return
 	}
@@ -145,8 +159,11 @@ func classifyByPattern(ctx *QueryContext) {
 	if dropVectorIndexPattern.MatchString(sql) {
 		ctx.Output.StatementType = StatementDropVectorIndex
 		ctx.MySQLState.SkipVitess = true
-		if m := vecDropExtractPattern.FindStringSubmatch(sql); len(m) > 2 {
-			ctx.MySQLState.TableName = m[2]
+		if m := vecDropExtractPattern.FindStringSubmatch(sql); len(m) > 1 {
+			ctx.MySQLState.VectorIndexName = m[1]
+			if len(m) > 2 {
+				ctx.MySQLState.TableName = m[2]
+			}
 		}
 		return
 	}
@@ -156,6 +173,38 @@ func classifyByPattern(ctx *QueryContext) {
 		ctx.MySQLState.SkipVitess = true
 		return
 	}
+}
+
+func parseVectorWithClause(state *MySQLParseState, clause string) {
+	kvPattern := regexp.MustCompile(`(?i)(\w+)\s*=\s*'?([^',)]+)'?`)
+	for _, m := range kvPattern.FindAllStringSubmatch(clause, -1) {
+		if len(m) < 3 {
+			continue
+		}
+		key := strings.ToLower(strings.TrimSpace(m[1]))
+		val := strings.TrimSpace(m[2])
+		switch key {
+		case "metric":
+			state.VectorMetric = strings.ToLower(val)
+		case "dim":
+			state.VectorDim = parseDecimalInt(val)
+		case "col", "column":
+			state.VectorColumnName = val
+		case "nlist":
+			state.VectorNlist = parseDecimalInt(val)
+		case "nprobe":
+			state.VectorNprobe = parseDecimalInt(val)
+		case "max_norm":
+			if f, err := strconv.ParseFloat(val, 32); err == nil {
+				state.VectorMaxNorm = float32(f)
+			}
+		}
+	}
+}
+
+func parseDecimalInt(s string) int {
+	n, _ := strconv.Atoi(strings.TrimSpace(s))
+	return n
 }
 
 func classifyStatement(ctx *QueryContext, stmt sqlparser.Statement) {

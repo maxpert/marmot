@@ -269,6 +269,9 @@ func estimateStatementSize(stmt *Statement) int {
 			size += len(v)
 		}
 	}
+	if vc := stmt.GetVectorIndexChange(); vc != nil {
+		size += len(vc.Database) + len(vc.IndexName) + len(vc.TableName) + len(vc.ColumnName) + len(vc.Metric) + 128
+	}
 	return size
 }
 

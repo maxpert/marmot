@@ -172,7 +172,7 @@ func (h *EngineHook) publishCatchUpRebuild(
 	if err := plan.pending.Publish(); err != nil {
 		return err
 	}
-	nextOverlay, err := rewriteOverlayTailForProbe(dbPath, meta.IndexName, plan.nextProbe.Epoch(), plan.cutoff, currentSnapshot, plan.nextSpec, plan.nextProbe, plan.pending.generation)
+	nextOverlay, err := rewriteOverlayTailForProbe(ctx, conn, dbPath, meta, plan.nextProbe.Epoch(), plan.cutoff, currentSnapshot, plan.nextSpec, plan.nextProbe, plan.pending.generation)
 	if err != nil {
 		return err
 	}
@@ -299,7 +299,15 @@ func visitCatchUpPreparedVectors(
 		if mutation.Kind == vecindex.OverlayMutationDelete {
 			return true
 		}
-		if err := visit(mutation.RowID, mutation.Vec); err != nil {
+		prepared, ok, err := overlayMutationPrepared(ctx, fetcher, mutation)
+		if err != nil {
+			visitErr = err
+			return false
+		}
+		if !ok {
+			return true
+		}
+		if err := visit(mutation.RowID, prepared); err != nil {
 			visitErr = err
 			return false
 		}
@@ -385,8 +393,16 @@ func BuildHierarchicalCatchUpSegmentGeneration(
 	if err != nil {
 		return nil, nil, fmt.Errorf("hierarchical catch-up: next generation: %w", err)
 	}
-	dataPath := vecindex.SegmentDataPath(dir, generation)
-	rowMapPath := vecindex.SegmentRowMapPath(dir, generation)
+	stagingDir, dataPath, rowMapPath, err := createSegmentGenerationStaging(dir, generation)
+	if err != nil {
+		return nil, nil, fmt.Errorf("hierarchical catch-up: create staging: %w", err)
+	}
+	keepStaging := false
+	defer func() {
+		if !keepStaging {
+			_ = os.RemoveAll(stagingDir)
+		}
+	}()
 
 	clusterRowCounts := make([]uint64, desiredK+1)
 	clusterVectorSums := make([][]float32, desiredK+1)
@@ -575,8 +591,12 @@ func BuildHierarchicalCatchUpSegmentGeneration(
 		LayoutHotClusters:        uint32Slice(orderedHotClusterIDs(hotClusterScores, segmentLayoutHotClusterLimit)),
 		CreatedAtUnixNano:        time.Now().UnixNano(),
 	}
+	keepStaging = true
 	pending := &pendingSegmentGeneration{
+		meta:       meta,
+		spec:       spec,
 		dir:        dir,
+		stagingDir: stagingDir,
 		manifest:   manifest,
 		dataPath:   dataStore.Path(),
 		rowMapPath: rowMapStore.Path(),
@@ -831,14 +851,14 @@ func loadCatchUpParentRows(
 	shadow map[int64]struct{},
 ) ([]promotionRow, error) {
 	var rows []promotionRow
+	fetcher, err := newExactVectorFetcher(ctx, conn, meta, spec)
+	if err != nil {
+		return nil, err
+	}
+	if fetcher != nil {
+		defer fetcher.Close()
+	}
 	if base != nil && base.Data != nil {
-		fetcher, err := newExactVectorFetcher(ctx, conn, meta, spec)
-		if err != nil {
-			return nil, err
-		}
-		if fetcher != nil {
-			defer fetcher.Close()
-		}
 		rows = make([]promotionRow, 0, base.Data.ClusterCount(parentID))
 		var scanErr error
 		if err := base.Data.ScanCluster(parentID, func(rowID int64, _ []byte) bool {
@@ -867,15 +887,33 @@ func loadCatchUpParentRows(
 		}
 	}
 	if snapshot != nil {
-		snapshot.VisitClusterRange(parentID, minSequence, cutoff, func(rowID int64, vec []byte) bool {
-			blob := append([]byte(nil), vec...)
+		var visitErr error
+		snapshot.VisitMutationsAfter(minSequence, func(mutation vecindex.OverlayMutation) bool {
+			if cutoff > 0 && mutation.Sequence > cutoff {
+				return false
+			}
+			if mutation.Kind == vecindex.OverlayMutationDelete || mutation.ClusterID != parentID {
+				return true
+			}
+			blob, ok, err := overlayMutationPrepared(ctx, fetcher, mutation)
+			if err != nil {
+				visitErr = err
+				return false
+			}
+			if !ok {
+				return true
+			}
+			blob = append([]byte(nil), blob...)
 			rows = append(rows, promotionRow{
-				rowID: rowID,
+				rowID: mutation.RowID,
 				vec:   metric.BytesToFloat32(blob),
 				blob:  blob,
 			})
 			return true
 		})
+		if visitErr != nil {
+			return nil, visitErr
+		}
 	}
 	return rows, nil
 }

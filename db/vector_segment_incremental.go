@@ -30,32 +30,66 @@ type rowLoc struct {
 }
 
 type pendingMutation struct {
-	kind      vecindex.OverlayMutationKind
-	clusterID int64
-	rowID     int64
-	vec       []byte
+	kind        vecindex.OverlayMutationKind
+	clusterID   int64
+	rowID       int64
+	vecEncoding vecindex.OverlayVecEncoding
+	vec         []byte
 }
 
 type pendingSegmentGeneration struct {
+	meta       common.VectorIndexMeta
+	spec       vecindex.IVFSpec
 	dir        string
+	stagingDir string
 	manifest   vecindex.SegmentManifest
 	dataPath   string
 	rowMapPath string
 	generation *vecindex.SegmentGeneration
+	published  bool
 }
 
 func (p *pendingSegmentGeneration) Publish() error {
 	if p == nil {
 		return nil
 	}
-	return publishSegmentGeneration(p.dir, p.manifest, p.dataPath, p.rowMapPath)
+	if p.generation != nil {
+		_ = p.generation.Close()
+		p.generation = nil
+	}
+	if err := publishSegmentGeneration(p.dir, p.manifest, p.dataPath, p.rowMapPath); err != nil {
+		return err
+	}
+	opened, err := openSegmentGeneration(p.dir, p.meta, p.spec, p.manifest.ProbeEpochValue())
+	if err != nil {
+		return err
+	}
+	p.generation = segmentGenerationFromOpened(opened)
+	p.published = true
+	if p.stagingDir != "" {
+		_ = os.RemoveAll(p.stagingDir)
+	}
+	return nil
 }
 
 func (p *pendingSegmentGeneration) Close() {
-	if p == nil || p.generation == nil {
+	if p == nil {
 		return
 	}
-	_ = p.generation.Close()
+	if p.generation != nil {
+		_ = p.generation.Close()
+	}
+	if !p.published {
+		if p.dataPath != "" {
+			_ = os.Remove(p.dataPath)
+		}
+		if p.rowMapPath != "" {
+			_ = os.Remove(p.rowMapPath)
+		}
+		if p.stagingDir != "" {
+			_ = os.RemoveAll(p.stagingDir)
+		}
+	}
 }
 
 func BuildIncrementalSegmentGeneration(
@@ -137,10 +171,11 @@ func buildIncrementalSegmentGenerationFromMutations(
 	touchedClusters := make(map[int64]struct{}, len(mutations)*2)
 	for _, mutation := range mutations {
 		pendingByRow[mutation.RowID] = pendingMutation{
-			kind:      mutation.Kind,
-			clusterID: mutation.ClusterID,
-			rowID:     mutation.RowID,
-			vec:       mutation.Vec,
+			kind:        mutation.Kind,
+			clusterID:   mutation.ClusterID,
+			rowID:       mutation.RowID,
+			vecEncoding: mutation.VecEncoding,
+			vec:         mutation.Vec,
 		}
 		if loc, ok, err := base.RowMap.Lookup(mutation.RowID); err != nil {
 			return nil, fmt.Errorf("incremental segment generation: lookup rowmap rowid %d: %w", mutation.RowID, err)
@@ -177,8 +212,16 @@ func buildIncrementalSegmentGenerationFromMutations(
 	if err != nil {
 		return nil, fmt.Errorf("incremental segment generation: encode stable codec metadata: %w", err)
 	}
-	dataPath := vecindex.SegmentDataPath(dir, generation)
-	rowMapPath := vecindex.SegmentRowMapPath(dir, generation)
+	stagingDir, dataPath, rowMapPath, err := createSegmentGenerationStaging(dir, generation)
+	if err != nil {
+		return nil, fmt.Errorf("incremental segment generation: create staging: %w", err)
+	}
+	keepStaging := false
+	defer func() {
+		if !keepStaging {
+			_ = os.RemoveAll(stagingDir)
+		}
+	}()
 	dataWriter, err := vecindex.CreateSegmentDataWriter(
 		dataPath,
 		spec.InternalMetric(),
@@ -356,8 +399,12 @@ func buildIncrementalSegmentGenerationFromMutations(
 		LayoutHotClusters:        uint32Slice(orderedHotClusterIDs(hotClusterScores, segmentLayoutHotClusterLimit)),
 		CreatedAtUnixNano:        time.Now().UnixNano(),
 	}
+	keepStaging = true
 	return &pendingSegmentGeneration{
+		meta:       meta,
+		spec:       spec,
 		dir:        dir,
+		stagingDir: stagingDir,
 		manifest:   manifest,
 		dataPath:   dataStore.Path(),
 		rowMapPath: rowMapStore.Path(),
@@ -441,7 +488,22 @@ func rebuildTouchedClusterEntries(
 		if mutation.kind == vecindex.OverlayMutationDelete || mutation.clusterID != clusterID {
 			continue
 		}
-		enc, encoded, err := stableCodec.Encode(clusterID, mutation.vec)
+		preparedBlob := mutation.vec
+		if mutation.vecEncoding != vecindex.OverlayPreparedF32 {
+			if exactFetcher == nil {
+				return nil, fmt.Errorf("incremental segment generation: exact vector fetcher required for encoded overlay rowid %d", mutation.rowID)
+			}
+			var ok bool
+			var err error
+			preparedBlob, ok, err = exactFetcher.Prepared(ctx, mutation.rowID)
+			if err != nil {
+				return nil, fmt.Errorf("incremental segment generation: fetch exact overlay rowid %d: %w", mutation.rowID, err)
+			}
+			if !ok {
+				continue
+			}
+		}
+		enc, encoded, err := stableCodec.Encode(clusterID, preparedBlob)
 		if err != nil {
 			return nil, fmt.Errorf("incremental segment generation: encode rowid %d: %w", mutation.rowID, err)
 		}
@@ -451,7 +513,7 @@ func rebuildTouchedClusterEntries(
 		entries = append(entries, incrementalClusterEntry{
 			rowID:        mutation.rowID,
 			vec:          encoded,
-			preparedBlob: mutation.vec,
+			preparedBlob: preparedBlob,
 		})
 	}
 	slices.SortFunc(entries, func(a, b incrementalClusterEntry) int {
@@ -473,8 +535,6 @@ func decodeStableMemberPrepared(spec vecindex.IVFSpec, codec *vecindex.StableMem
 	}
 	enc, _ := vecindex.StableMemberEncodingSpec(spec)
 	switch enc {
-	case vecindex.MemberEncodingRawPreparedF32:
-		return append([]float32(nil), metric.BytesToFloat32(vecBytes)...), nil
 	case vecindex.MemberEncodingResidualInt8:
 		if cs == nil || clusterID <= 0 || int(clusterID) > cs.Len() {
 			return nil, fmt.Errorf("missing centroid for cluster %d", clusterID)

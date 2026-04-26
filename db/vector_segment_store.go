@@ -580,6 +580,16 @@ func nextSegmentGeneration(dir string) (uint64, error) {
 	return manifest.Generation + 1, nil
 }
 
+func createSegmentGenerationStaging(dir string, generation uint64) (string, string, string, error) {
+	stagingDir := filepath.Join(dir, "staging", fmt.Sprintf("gen-%020d-%d", generation, time.Now().UnixNano()))
+	if err := os.MkdirAll(stagingDir, 0o755); err != nil {
+		return "", "", "", err
+	}
+	dataPath := filepath.Join(stagingDir, filepath.Base(vecindex.SegmentDataPath(dir, generation)))
+	rowMapPath := filepath.Join(stagingDir, filepath.Base(vecindex.SegmentRowMapPath(dir, generation)))
+	return stagingDir, dataPath, rowMapPath, nil
+}
+
 func RebuildSegmentGeneration(
 	ctx context.Context,
 	db *sql.DB,
@@ -608,8 +618,11 @@ func RebuildSegmentGeneration(
 		return nil, nil
 	}
 
-	dataPath := vecindex.SegmentDataPath(dir, generation)
-	rowMapPath := vecindex.SegmentRowMapPath(dir, generation)
+	stagingDir, dataPath, rowMapPath, err := createSegmentGenerationStaging(dir, generation)
+	if err != nil {
+		return nil, fmt.Errorf("segment generation rebuild: create staging: %w", err)
+	}
+	defer os.RemoveAll(stagingDir)
 	rowMapWriter, err := vecindex.CreateSegmentRowMapWriter(rowMapPath, expectedEpoch, generation)
 	if err != nil {
 		return nil, err
@@ -1101,7 +1114,7 @@ func reconcileOverlayForState(state *vecindex.IndexState, overlay *vecindex.Jour
 	if segments == nil || state.ProbeState() == nil {
 		return overlay.Reset(epoch)
 	}
-	tailMutations, err := reassignOverlayMutationsForProbe(snapshot, segments.AppliedOverlaySeq, state.Spec(), state.ProbeState(), segments)
+	tailMutations, err := reassignOverlayMutationsForProbe(context.Background(), nil, snapshot, segments.AppliedOverlaySeq, state.Spec(), state.ProbeState(), segments)
 	if err != nil {
 		return err
 	}
@@ -1128,22 +1141,21 @@ func syncMaintenanceStateFromOverlay(state *vecindex.IndexState) error {
 	}
 	var syncErr error
 	snapshot.VisitMutationsAfter(segments.AppliedOverlaySeq, func(mutation vecindex.OverlayMutation) bool {
-		oldCluster, oldVec, err := loadStablePreparedForMaintenance(segments, state.Spec(), mutation.RowID)
-		if err != nil {
+		oldCluster := int64(0)
+		if loc, ok, err := segments.RowMap.Lookup(mutation.RowID); err != nil {
 			syncErr = err
 			return false
+		} else if ok {
+			oldCluster = loc.ClusterID
 		}
 		var newCluster int64
-		var newVec []float32
 		if mutation.Kind != vecindex.OverlayMutationDelete {
 			newCluster = mutation.ClusterID
-			newVec = metric.BytesToFloat32(mutation.Vec)
 		}
 		if mutation.Kind == vecindex.OverlayMutationUpsert {
 			oldCluster = 0
-			oldVec = nil
 		}
-		maintenance.RecordClusterMutation(oldCluster, oldVec, newCluster, newVec)
+		maintenance.RecordClusterMutation(oldCluster, nil, newCluster, nil)
 		return true
 	})
 	if syncErr != nil {

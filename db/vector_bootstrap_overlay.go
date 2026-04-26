@@ -3,6 +3,7 @@ package db
 import (
 	"fmt"
 	"math/rand"
+	"os"
 	"slices"
 	"time"
 
@@ -150,8 +151,16 @@ func BuildBootstrapSegmentGenerationFromOverlay(
 	if err != nil {
 		return nil, fmt.Errorf("bootstrap segment generation: next generation: %w", err)
 	}
-	dataPath := vecindex.SegmentDataPath(dir, generation)
-	rowMapPath := vecindex.SegmentRowMapPath(dir, generation)
+	stagingDir, dataPath, rowMapPath, err := createSegmentGenerationStaging(dir, generation)
+	if err != nil {
+		return nil, fmt.Errorf("bootstrap segment generation: create staging: %w", err)
+	}
+	keepStaging := false
+	defer func() {
+		if !keepStaging {
+			_ = os.RemoveAll(stagingDir)
+		}
+	}()
 	rowMapWriter, err := vecindex.CreateSegmentRowMapWriter(rowMapPath, probeCS.Epoch(), generation)
 	if err != nil {
 		return nil, err
@@ -306,8 +315,12 @@ func BuildBootstrapSegmentGenerationFromOverlay(
 		LayoutHotClusters:        uint32Slice(orderedHotClusterIDs(hotClusterScores, segmentLayoutHotClusterLimit)),
 		CreatedAtUnixNano:        time.Now().UnixNano(),
 	}
+	keepStaging = true
 	return &pendingSegmentGeneration{
+		meta:       meta,
+		spec:       spec,
 		dir:        dir,
+		stagingDir: stagingDir,
 		manifest:   manifest,
 		dataPath:   dataStore.Path(),
 		rowMapPath: rowMapStore.Path(),

@@ -80,6 +80,10 @@ func convertStatementsToProto(stmts []protocol.Statement, database string, txnID
 		}
 
 		grpcType, ok := common.ToWireType(stmt.Type)
+		if isVectorStatement(stmt.Type) {
+			grpcType = common.MustToWireType(common.StatementVectorIndexControl)
+			ok = true
+		}
 		if !ok {
 			return nil, fmt.Errorf("convertStatementsToProto: unknown statement type %v", stmt.Type)
 		}
@@ -96,7 +100,16 @@ func convertStatementsToProto(stmts []protocol.Statement, database string, txnID
 			stmt.Type == protocol.StatementDelete ||
 			stmt.Type == protocol.StatementReplace
 
+		if isVectorStatement(stmt.Type) && stmt.VectorIndexChange == nil {
+			change := vectorChangeFromProtocolStatement(stmt, stmtDB)
+			stmt.VectorIndexChange = &change
+		}
+
 		switch {
+		case stmt.VectorIndexChange != nil:
+			protoStmt.Payload = &Statement_VectorIndexChange{
+				VectorIndexChange: vectorChangeToProto(*stmt.VectorIndexChange),
+			}
 		case stmt.Type == protocol.StatementLoadData:
 			loadID := fmt.Sprintf("%d:%d", txnID, i)
 			stageLoadDataPayload(loadID, stmt.LoadDataPayload)
@@ -130,6 +143,45 @@ func convertStatementsToProto(stmts []protocol.Statement, database string, txnID
 	}
 
 	return protoStmts, nil
+}
+
+func isVectorStatement(stmtType protocol.StatementCode) bool {
+	switch stmtType {
+	case protocol.StatementCreateVectorIndex, protocol.StatementDropVectorIndex,
+		protocol.StatementReindexVectorIndex, protocol.StatementVectorIndexControl:
+		return true
+	default:
+		return false
+	}
+}
+
+func vectorChangeFromProtocolStatement(stmt protocol.Statement, database string) common.VectorIndexChange {
+	action := common.VectorIndexActionCheckpoint
+	switch stmt.Type {
+	case protocol.StatementCreateVectorIndex:
+		action = common.VectorIndexActionCreate
+	case protocol.StatementDropVectorIndex:
+		action = common.VectorIndexActionDrop
+	case protocol.StatementReindexVectorIndex:
+		action = common.VectorIndexActionReindex
+	}
+	return common.VectorIndexChange{
+		Action:              action,
+		Database:            database,
+		IndexName:           stmt.VectorIndexName,
+		TableName:           stmt.TableName,
+		ColumnName:          stmt.VectorColumnName,
+		Metric:              stmt.VectorMetric,
+		Dim:                 stmt.VectorDim,
+		Nlist:               stmt.VectorNlist,
+		Nprobe:              stmt.VectorNprobe,
+		AutoTuneNlist:       stmt.VectorNlist == 0,
+		AutoTuneNprobe:      stmt.VectorNprobe == 0,
+		TargetPartitionSize: common.DefaultVectorTargetPartitionSize,
+		MaxNorm:             stmt.VectorMaxNorm,
+		TrainerVersion:      common.VectorControlTrainerVersion,
+		CodecVersion:        common.VectorControlCodecVersion,
+	}
 }
 
 // convertPhaseToProto converts coordinator.ReplicationPhase to gRPC TransactionPhase.

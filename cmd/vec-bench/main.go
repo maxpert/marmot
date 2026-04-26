@@ -39,6 +39,9 @@
 //	--min-recall   Fail if recall@K is below this value. Default 0 = disabled.
 //	--min-qps      Fail if aggregate read QPS is below this value. Default 0 = disabled.
 //	--max-overread Fail if actual/logical segment read ratio exceeds this value. Default 0 = disabled.
+//	--overlay-tail-rows
+//	                Add synthetic committed vector CDC replacements after settle
+//	                to benchmark compact overlay-tail reads. Default 0.
 package main
 
 import (
@@ -73,37 +76,38 @@ import (
 )
 
 type config struct {
-	dataDir        string
-	dbDir          string
-	dbName         string
-	indexName      string
-	tableName      string
-	columnName     string
-	metric         string
-	nlist          int
-	nprobe         int
-	nlistExplicit  bool
-	nprobeExplicit bool
-	forceBuild     bool
-	skipInsert     bool
-	warmup         int
-	nQueries       int
-	k              int
-	settleTimeout  time.Duration
-	profileDir     string
-	profileCPU     bool
-	useGoRank      bool
-	insertTx       int
-	insertN        int
-	queryConc      int
-	insertConc     int
-	readPool       int
-	sqliteCacheMB  int
-	projection     string
-	payloadBytes   int
-	minRecall      float64
-	minQPS         float64
-	maxOverread    float64
+	dataDir         string
+	dbDir           string
+	dbName          string
+	indexName       string
+	tableName       string
+	columnName      string
+	metric          string
+	nlist           int
+	nprobe          int
+	nlistExplicit   bool
+	nprobeExplicit  bool
+	forceBuild      bool
+	skipInsert      bool
+	warmup          int
+	nQueries        int
+	k               int
+	settleTimeout   time.Duration
+	profileDir      string
+	profileCPU      bool
+	useGoRank       bool
+	insertTx        int
+	insertN         int
+	queryConc       int
+	insertConc      int
+	readPool        int
+	sqliteCacheMB   int
+	projection      string
+	payloadBytes    int
+	overlayTailRows int
+	minRecall       float64
+	minQPS          float64
+	maxOverread     float64
 }
 
 func parseFlags() *config {
@@ -139,6 +143,7 @@ func parseFlags() *config {
 	fs.IntVar(&c.sqliteCacheMB, "sqlite-cache-mb", 64, "SQLite page-cache budget in MiB for vec-bench connections")
 	fs.StringVar(&c.projection, "projection", "id", "Projection shape: id | payload")
 	fs.IntVar(&c.payloadBytes, "payload-bytes", 256, "Deterministic text payload bytes per row for projection=payload")
+	fs.IntVar(&c.overlayTailRows, "overlay-tail-rows", 0, "Synthesize this many committed vector CDC replacements after settle to measure overlay-tail reads")
 	fs.Float64Var(&c.minRecall, "min-recall", 0, "Fail if recall@K is below this value (0 = disabled)")
 	fs.Float64Var(&c.minQPS, "min-qps", 0, "Fail if aggregate read QPS is below this value (0 = disabled)")
 	fs.Float64Var(&c.maxOverread, "max-overread", 0, "Fail if segment actual/logical read ratio exceeds this value (0 = disabled)")
@@ -168,6 +173,10 @@ func parseFlags() *config {
 	}
 	if c.payloadBytes < 0 {
 		fmt.Fprintln(os.Stderr, "--payload-bytes must be >= 0")
+		os.Exit(2)
+	}
+	if c.overlayTailRows < 0 {
+		fmt.Fprintln(os.Stderr, "--overlay-tail-rows must be >= 0")
 		os.Exit(2)
 	}
 	return c
@@ -224,6 +233,12 @@ type segmentEncodingStats struct {
 	entryBytes          int
 	rowCount            uint64
 	dataFileBytes       int64
+	overlayRows         int
+	overlayBytes        int64
+	overlayPreparedRows int
+	overlayResidualRows int
+	overlayDeleteRows   int
+	overlayLogBytes     int64
 	scanRowsEstimate    uint64
 	scanBytesEstimate   uint64
 	appliedOverlaySeq   uint64
@@ -251,6 +266,56 @@ func (h *harness) insertCDCEntries(lo, hi int) ([]common.CDCEntry, error) {
 				h.cfg.columnName: vecBytes,
 			},
 		})
+	}
+	return entries, nil
+}
+
+func (h *harness) existingVectorCDCEntries(lo, hi int) ([]common.CDCEntry, error) {
+	if hi <= lo {
+		return nil, nil
+	}
+	rows, err := h.conn.Query(
+		fmt.Sprintf(`SELECT id, "%s" FROM "%s" WHERE id >= ? AND id <= ? ORDER BY id`, h.cfg.columnName, h.cfg.tableName),
+		int64(lo+1),
+		int64(hi),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("select existing vectors [%d,%d): %w", lo, hi, err)
+	}
+	defer rows.Close()
+
+	entries := make([]common.CDCEntry, 0, hi-lo)
+	for rows.Next() {
+		var rowID int64
+		var raw []byte
+		if err := rows.Scan(&rowID, &raw); err != nil {
+			return nil, fmt.Errorf("scan existing vector: %w", err)
+		}
+		rowIDBytes, err := encoding.Marshal(rowID)
+		if err != nil {
+			return nil, fmt.Errorf("marshal row id %d: %w", rowID, err)
+		}
+		vecBytes, err := encoding.Marshal(append([]byte(nil), raw...))
+		if err != nil {
+			return nil, fmt.Errorf("marshal vector row %d: %w", rowID, err)
+		}
+		entries = append(entries, common.CDCEntry{
+			Table:     h.cfg.tableName,
+			IntentKey: []byte(fmt.Sprintf("%s:%d", h.cfg.tableName, rowID)),
+			OldValues: map[string][]byte{
+				"id": rowIDBytes,
+			},
+			NewValues: map[string][]byte{
+				"id":             rowIDBytes,
+				h.cfg.columnName: vecBytes,
+			},
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate existing vectors: %w", err)
+	}
+	if len(entries) != hi-lo {
+		return nil, fmt.Errorf("selected %d existing vectors for [%d,%d), want %d", len(entries), lo, hi, hi-lo)
 	}
 	return entries, nil
 }
@@ -390,6 +455,11 @@ func main() {
 	} else if cfg.skipInsert {
 		if err := h.refreshIndexTuning(); err != nil {
 			fatal("refreshIndexTuning: %v", err)
+		}
+	}
+	if cfg.overlayTailRows > 0 {
+		if err := h.applyOverlayTail(cfg.overlayTailRows); err != nil {
+			fatal("applyOverlayTail: %v", err)
 		}
 	}
 	if err := h.runQueryPhase(); err != nil {
@@ -874,6 +944,37 @@ func (h *harness) insertRange(lo, hi int, phase string) error {
 	return nil
 }
 
+func (h *harness) applyOverlayTail(rows int) error {
+	if rows <= 0 {
+		return nil
+	}
+	var existing int
+	if err := h.conn.QueryRow(fmt.Sprintf(`SELECT COUNT(*) FROM "%s"`, h.cfg.tableName)).Scan(&existing); err != nil {
+		return fmt.Errorf("count rows for overlay tail: %w", err)
+	}
+	if rows > existing {
+		return fmt.Errorf("overlay tail rows %d exceeds existing rows %d", rows, existing)
+	}
+	plog("overlay-tail CDC: rows=%d chunk=%d", rows, benchCDCApplyChunk)
+	start := time.Now()
+	for lo := 0; lo < rows; lo += benchCDCApplyChunk {
+		hi := lo + benchCDCApplyChunk
+		if hi > rows {
+			hi = rows
+		}
+		entries, err := h.existingVectorCDCEntries(lo, hi)
+		if err != nil {
+			return err
+		}
+		if err := h.vecMgr.ApplyLocalCDC(context.Background(), h.cfg.dbName, entries); err != nil {
+			return fmt.Errorf("apply overlay-tail cdc [%d,%d): %w", lo, hi, err)
+		}
+	}
+	elapsed := time.Since(start)
+	plog("overlay-tail CDC complete in %s (rows/s=%.0f)", elapsed, float64(rows)/elapsed.Seconds())
+	return nil
+}
+
 func vectorStateSettled(probeVersion uint64, segmentReady bool, overlayReady bool) bool {
 	return probeVersion > 0 && segmentReady && overlayReady
 }
@@ -1083,7 +1184,7 @@ func (h *harness) currentSegmentEncodingStats() *segmentEncodingStats {
 		targetPartitionSize = 512
 	}
 	scanRowsEstimate := uint64(h.cfg.nprobe * targetPartitionSize)
-	if indexMeta.AutoTuneNprobe {
+	if indexMeta.AutoTuneNprobe && !h.cfg.nprobeExplicit {
 		scanRowsEstimate = uint64(defaultBenchProbeScanBudgetRows(targetPartitionSize))
 		if segments.Data.Encoding() == vecindex.MemberEncodingResidualPQ8 {
 			scanRowsEstimate = uint64(defaultBenchPQProbeScanBudgetRows(targetPartitionSize))
@@ -1111,6 +1212,30 @@ func (h *harness) currentSegmentEncodingStats() *segmentEncodingStats {
 		appliedOverlaySeq:   segments.AppliedOverlaySeq,
 		probeCentroidEpoch:  probeEpoch,
 		stableCentroidEpoch: stableEpoch,
+	}
+	if overlay := state.LoadOverlay(); overlay != nil && overlay.Snapshot() != nil {
+		snapshot := overlay.Snapshot()
+		stats.overlayRows, stats.overlayBytes, _ = snapshot.BacklogStats(segments.AppliedOverlaySeq)
+		snapshot.VisitMutationsAfter(segments.AppliedOverlaySeq, func(mutation vecindex.OverlayMutation) bool {
+			if mutation.Kind == vecindex.OverlayMutationDelete {
+				stats.overlayDeleteRows++
+				return true
+			}
+			switch mutation.VecEncoding {
+			case vecindex.OverlayResidualInt8:
+				stats.overlayResidualRows++
+			default:
+				stats.overlayPreparedRows++
+			}
+			return true
+		})
+		if h.dbMgr != nil {
+			if dbPath, err := h.dbMgr.GetDatabasePath(indexMeta.Database); err == nil {
+				if info, err := os.Stat(vecindex.OverlayJournalPath(vecindex.SegmentStoreDir(dbPath, indexMeta.IndexName))); err == nil {
+					stats.overlayLogBytes = info.Size()
+				}
+			}
+		}
 	}
 	return stats
 }
@@ -1142,15 +1267,7 @@ func defaultBenchProbeScanBudgetRows(targetPartitionSize int) int {
 }
 
 func defaultBenchPQProbeScanBudgetRows(targetPartitionSize int) int {
-	if targetPartitionSize <= 0 {
-		targetPartitionSize = 512
-	}
-	budget := defaultBenchProbeScanBudgetRows(targetPartitionSize)
-	multiplier := 38
-	if widened := multiplier * targetPartitionSize; widened > budget {
-		budget = widened
-	}
-	return budget
+	return defaultBenchProbeScanBudgetRows(targetPartitionSize)
 }
 
 func benchMemberEncodingName(enc int64) string {
@@ -1384,6 +1501,9 @@ func (h *harness) runQueryPhase() error {
 		plog("  segment scan estimate: rows/query=%d bytes/query=%d applied_overlay_seq=%d probe_epoch=%d stable_epoch=%d",
 			segmentStats.scanRowsEstimate, segmentStats.scanBytesEstimate, segmentStats.appliedOverlaySeq,
 			segmentStats.probeCentroidEpoch, segmentStats.stableCentroidEpoch)
+		plog("  overlay tail: rows=%d bytes=%d prepared_f32=%d residual_int8=%d deletes=%d journal_bytes=%d",
+			segmentStats.overlayRows, segmentStats.overlayBytes, segmentStats.overlayPreparedRows,
+			segmentStats.overlayResidualRows, segmentStats.overlayDeleteRows, segmentStats.overlayLogBytes)
 		if len(stats.lats) > 0 && stats.segmentStats.ReadBatches > 0 && stats.segmentStats.LogicalBytes > 0 {
 			plog("  segment scan actual: read_bytes/query=%d logical_bytes/query=%d read_batches/query=%.2f overread=%.2fx",
 				stats.segmentStats.ReadBytes/uint64(len(stats.lats)),

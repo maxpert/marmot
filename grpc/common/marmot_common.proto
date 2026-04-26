@@ -15,4 +15,5 @@ enum StatementType {
   CREATE_DATABASE = 5;
   DROP_DATABASE = 6;
   LOAD_DATA = 7;
+  VECTOR_INDEX = 8;
 }

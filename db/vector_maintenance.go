@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"math"
 	"slices"
 	"time"
@@ -535,7 +536,14 @@ func (h *EngineHook) prepareIncrementalMerge(
 	}
 	defer pinnedBase.Close()
 
-	stats, err := buildCutoffClusterStats(spec, pinnedBase, overlaySnapshot, cutoff, state.LoadMaintenanceState())
+	exactFetcher, err := newExactVectorFetcher(ctx, conn, meta, spec)
+	if err != nil {
+		return nil, fmt.Errorf("incremental merge: exact vector fetcher: %w", err)
+	}
+	if exactFetcher != nil {
+		defer exactFetcher.Close()
+	}
+	stats, err := buildCutoffClusterStats(ctx, spec, pinnedBase, overlaySnapshot, cutoff, state.LoadMaintenanceState(), exactFetcher)
 	if err != nil {
 		return nil, err
 	}
@@ -572,6 +580,8 @@ func (h *EngineHook) prepareIncrementalMerge(
 }
 
 func (h *EngineHook) publishIncrementalMerge(
+	ctx context.Context,
+	conn *sql.DB,
 	dbPath string,
 	meta common.VectorIndexMeta,
 	plan *incrementalMergePlan,
@@ -607,7 +617,7 @@ func (h *EngineHook) publishIncrementalMerge(
 	newState := vecindex.NewIndexState(plan.spec, plan.nextProbe)
 	newState.StoreSegmentStore(plan.pending.generation)
 	plan.pending.generation = nil
-	nextOverlay, err := rewriteOverlayTailForProbe(dbPath, meta.IndexName, plan.nextProbe.Epoch(), plan.cutoff, currentSnapshot, plan.spec, plan.nextProbe, newState.LoadSegmentStore())
+	nextOverlay, err := rewriteOverlayTailForProbe(ctx, conn, dbPath, meta, plan.nextProbe.Epoch(), plan.cutoff, currentSnapshot, plan.spec, plan.nextProbe, newState.LoadSegmentStore())
 	if err != nil {
 		newState.ClearSegmentStore()
 		return err
@@ -634,12 +644,14 @@ func (h *EngineHook) runIncrementalMerge(
 		return err
 	}
 	defer plan.Close()
-	return h.publishIncrementalMerge(dbPath, meta, plan)
+	return h.publishIncrementalMerge(ctx, conn, dbPath, meta, plan)
 }
 
 func rewriteOverlayTailForProbe(
+	ctx context.Context,
+	conn *sql.DB,
 	dbPath string,
-	indexName string,
+	meta common.VectorIndexMeta,
 	epoch uint64,
 	minSequence uint64,
 	snapshot *vecindex.OverlaySnapshot,
@@ -647,7 +659,7 @@ func rewriteOverlayTailForProbe(
 	probe *kmeans.CentroidSet,
 	stable *vecindex.SegmentGeneration,
 ) (*vecindex.JournaledOverlay, error) {
-	dir := vecindex.SegmentStoreDir(dbPath, indexName)
+	dir := vecindex.SegmentStoreDir(dbPath, meta.IndexName)
 	overlay, err := vecindex.OpenJournaledOverlayForRewrite(vecindex.OverlayJournalPath(dir))
 	if err != nil {
 		return nil, err
@@ -658,6 +670,14 @@ func rewriteOverlayTailForProbe(
 	}
 	if snapshot == nil {
 		return overlay, nil
+	}
+	exactFetcher, err := newExactVectorFetcher(ctx, conn, meta, spec)
+	if err != nil {
+		_ = overlay.Close()
+		return nil, err
+	}
+	if exactFetcher != nil {
+		defer exactFetcher.Close()
 	}
 	batch := make([]vecindex.OverlayMutation, 0, 1024)
 	flush := func() error {
@@ -675,7 +695,7 @@ func rewriteOverlayTailForProbe(
 	}
 	var rewriteErr error
 	snapshot.VisitMutationsAfter(minSequence, func(mutation vecindex.OverlayMutation) bool {
-		next, err := reassignOverlayMutationForProbe(mutation, spec, probe, stable)
+		next, err := reassignOverlayMutationForProbe(ctx, exactFetcher, mutation, spec, probe, stable)
 		if err != nil {
 			rewriteErr = err
 			return false

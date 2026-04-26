@@ -172,17 +172,7 @@ func ParseStatementWithOptions(sql string, opts ParseOptions) Statement {
 
 	// Extract MySQL-specific metadata (if available)
 	if ctx.MySQLState != nil {
-		stmt.TableName = ctx.MySQLState.TableName
-		stmt.ISFilter = InformationSchemaFilter{
-			SchemaName: ctx.MySQLState.ISFilter.SchemaName,
-			TableName:  ctx.MySQLState.ISFilter.TableName,
-			ColumnName: ctx.MySQLState.ISFilter.ColumnName,
-		}
-		stmt.ISTableType = InformationSchemaTableType(ctx.MySQLState.ISTableType)
-		stmt.VirtualTableType = VirtualTableType(ctx.MySQLState.VirtualTableType)
-		stmt.SystemVarNames = ctx.MySQLState.SystemVarNames
-		stmt.ShowFilter = ctx.MySQLState.ShowFilter
-		stmt.ParsedAST = ctx.MySQLState.AST
+		applyMySQLStateToStatement(&stmt, ctx.MySQLState)
 	}
 
 	return stmt
@@ -228,17 +218,7 @@ func ParseStatementWithSchema(sql string, schemaLookup SchemaLookupFunc) Stateme
 
 	// Extract MySQL-specific metadata (if available)
 	if ctx.MySQLState != nil {
-		stmt.TableName = ctx.MySQLState.TableName
-		stmt.ISFilter = InformationSchemaFilter{
-			SchemaName: ctx.MySQLState.ISFilter.SchemaName,
-			TableName:  ctx.MySQLState.ISFilter.TableName,
-			ColumnName: ctx.MySQLState.ISFilter.ColumnName,
-		}
-		stmt.ISTableType = InformationSchemaTableType(ctx.MySQLState.ISTableType)
-		stmt.VirtualTableType = VirtualTableType(ctx.MySQLState.VirtualTableType)
-		stmt.SystemVarNames = ctx.MySQLState.SystemVarNames
-		stmt.ShowFilter = ctx.MySQLState.ShowFilter
-		stmt.ParsedAST = ctx.MySQLState.AST
+		applyMySQLStateToStatement(&stmt, ctx.MySQLState)
 	}
 
 	return stmt
@@ -289,19 +269,31 @@ func buildStatement(ctx query.QueryContext, ts query.TranspiledStatement) Statem
 
 	// Extract MySQL-specific metadata (if available)
 	if ctx.MySQLState != nil {
-		stmt.TableName = ctx.MySQLState.TableName
-		stmt.ISFilter = InformationSchemaFilter{
-			SchemaName: ctx.MySQLState.ISFilter.SchemaName,
-			TableName:  ctx.MySQLState.ISFilter.TableName,
-			ColumnName: ctx.MySQLState.ISFilter.ColumnName,
-		}
-		stmt.ISTableType = InformationSchemaTableType(ctx.MySQLState.ISTableType)
-		stmt.VirtualTableType = VirtualTableType(ctx.MySQLState.VirtualTableType)
-		stmt.SystemVarNames = ctx.MySQLState.SystemVarNames
-		stmt.ParsedAST = ctx.MySQLState.AST
+		applyMySQLStateToStatement(&stmt, ctx.MySQLState)
 	}
 
 	return stmt
+}
+
+func applyMySQLStateToStatement(stmt *Statement, state *query.MySQLParseState) {
+	stmt.TableName = state.TableName
+	stmt.ISFilter = InformationSchemaFilter{
+		SchemaName: state.ISFilter.SchemaName,
+		TableName:  state.ISFilter.TableName,
+		ColumnName: state.ISFilter.ColumnName,
+	}
+	stmt.ISTableType = InformationSchemaTableType(state.ISTableType)
+	stmt.VirtualTableType = VirtualTableType(state.VirtualTableType)
+	stmt.SystemVarNames = state.SystemVarNames
+	stmt.ShowFilter = state.ShowFilter
+	stmt.VectorIndexName = state.VectorIndexName
+	stmt.VectorColumnName = state.VectorColumnName
+	stmt.VectorMetric = state.VectorMetric
+	stmt.VectorDim = state.VectorDim
+	stmt.VectorNlist = state.VectorNlist
+	stmt.VectorNprobe = state.VectorNprobe
+	stmt.VectorMaxNorm = state.VectorMaxNorm
+	stmt.ParsedAST = state.AST
 }
 
 // NormalizeSQLForSQLite converts MySQL-style SQL to SQLite-compatible SQL
