@@ -139,6 +139,8 @@ data_dir = ""     # Reserved for a future explicit local vector-state root overr
 
 **Runtime note:**
 - Current builds store vector derived state in local `.vecseg` files next to the database and use the local segment store plus overlay journal for ANN reads, with exact rerank from the base table shortlist.
+- Vector index DML follows ordinary row-level CDC. Vector DDL replicates compact control metadata; segment files, rowmaps, centroids, PQ codebooks, and overlay journals are local derived state.
+- SQL tuning is through `CREATE VECTOR INDEX ... WITH (nlist = ..., nprobe = ..., max_norm = ...)` and per-connection `@@marmot_vec_*` session variables. See [Vector Search](/vector-search) for the startup guide and parameter details.
 
 ## Batch Commit
 

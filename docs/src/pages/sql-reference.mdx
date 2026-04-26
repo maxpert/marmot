@@ -856,26 +856,31 @@ WHERE TABLE_SCHEMA = 'mydb' AND TABLE_NAME = 'users';
 
 ## Vector Search
 
-Marmot has built-in vector similarity search through two SQL functions and three DDL statements:
+Marmot has built-in vector similarity search through two SQL functions and three DDL statements. Embeddings are stored as packed little-endian `float32` blobs in normal user tables.
 
 ```sql
 -- DDL
-CREATE VECTOR INDEX docs_embed ON docs(embed) DIM 1536 METRIC cosine;
+CREATE VECTOR INDEX docs_embed
+    ON docs(embed)
+    DIM 1536
+    METRIC cosine
+    WITH (nlist = 512, nprobe = 32);
+
 REINDEX VECTOR docs_embed;
 DROP VECTOR INDEX docs_embed;
 
 -- Query
 SELECT id, title
   FROM docs
- WHERE vec_match(embed, :q, 10)
+ WHERE vec_match(embed, ?, 10)
    AND status = 'published'
- ORDER BY vec_distance(embed, :q)
+ ORDER BY vec_distance(embed, ?)
  LIMIT 10;
 ```
 
-Supported metrics: `l2`, `cosine`, `dot`. The planner automatically chooses between pre-filter (brute-force over a predicate subset) and post-filter (IVF probe) per query, with an optional fallback that guarantees returning `min(|F|, K)` rows when a predicate is narrow.
+Supported metrics: `l2`, `cosine`, `dot`. `nlist`, `nprobe`, and `max_norm` are optional `WITH` parameters; omit `nlist` and `nprobe` to use auto tuning. `vec_match` queries require one `vec_match`, `ORDER BY vec_distance(...)` on the same column, and a literal positive `LIMIT`.
 
-See the [Vector Search](/vector-search) page for the full reference — query translation, replication semantics, REINDEX flow, session variables, and error codes.
+See the [Vector Search](/vector-search) page for the full startup guide, RAG schema example, lifecycle and settling details, tuning guidance, replication semantics, session variables, and limitations.
 
 ---
 

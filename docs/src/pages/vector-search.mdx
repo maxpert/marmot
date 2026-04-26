@@ -4,144 +4,21 @@ title: Vector Search
 
 # Vector Search
 
-Marmot provides ANN vector search over `float32` embeddings stored directly in user tables. The public surface stays small:
+Marmot provides ANN vector search over packed `float32` embeddings stored in normal user tables. It is designed for RAG stores where each row contains ordinary metadata plus an embedding.
 
-- `vec_match(col, ?, K)` in `WHERE`
-- `vec_distance(col, ?)` in `ORDER BY`
+The public SQL surface is small:
+
 - `CREATE VECTOR INDEX`
-- `REINDEX VECTOR`
 - `DROP VECTOR INDEX`
+- `REINDEX VECTOR`
+- `vec_match(column, query_vector, k)` in `WHERE`
+- `vec_distance(column, query_vector)` in `ORDER BY`
 
-The exact embedding remains in the base table. The vector index builds local derived state for fast reads and never duplicates serving payload into SQLite side tables.
+The exact embedding remains in the base table. Marmot builds node-local derived state for fast candidate search: centroids, immutable segment generations, row maps, manifests, and an overlay journal. Exact rerank still reads the shortlist vectors from the base table before returning final rows.
 
-## Design
+## Enable It
 
-- **Base table is the truth**: your embedding blob stays in the user table and is the only exact vector copy.
-- **Local file-backed serving state**: Marmot stores centroids, stable cluster segments, row maps, manifests, and an overlay journal in a per-index `.vecseg` directory next to the database.
-- **No SQLite vector sidecar**: candidate serving does not scan `__marmot_vec_*_members` or any equivalent payload table.
-- **Predicate-aware planning**: Marmot chooses between exact pre-filtering and IVF post-filtering. Exact rerank always comes from the base table shortlist.
-- **Overlay-first bootstrap and maintenance**: empty-table create starts with overlay visibility, then publishes the first clustered generation from a local overlay snapshot and maintains later generations incrementally.
-- **Crash-safe publish**: new stable generations are written immutably and published by swapping `manifest/current`, Lucene-style.
-
-## Quick Start
-
-```sql
-CREATE TABLE docs (
-    id    INTEGER PRIMARY KEY,
-    title TEXT,
-    embed BLOB,
-    status TEXT
-);
-
-INSERT INTO docs (id, title, embed, status)
-VALUES (1, 'hello', ?, 'published');
-
-CREATE VECTOR INDEX docs_embed_idx
-    ON docs(embed)
-    DIM 128
-    METRIC cosine;
-
-SELECT id, title
-  FROM docs
- WHERE vec_match(embed, ?, 10)
-   AND status = 'published'
- ORDER BY vec_distance(embed, ?)
- LIMIT 10;
-```
-
-## DDL
-
-### CREATE VECTOR INDEX
-
-```sql
-CREATE VECTOR INDEX <index_name>
-    ON <table>(<blob_column>)
-    DIM <n>
-    METRIC <l2 | cosine | dot>
-    [WITH (nlist = <n>, nprobe = <n>, max_norm = <f>)];
-```
-
-| Clause | Meaning |
-|---|---|
-| `DIM` | Vector dimensionality. Required. |
-| `METRIC` | `l2`, `cosine`, or `dot`. Required. |
-| `WITH (nlist = n)` | IVF cluster count. Optional; auto-tuned when omitted. |
-| `WITH (nprobe = n)` | Probed clusters per query. Optional; auto-derived when omitted. |
-| `WITH (max_norm = f)` | Required only for `METRIC dot`. |
-
-Requirements:
-
-- Base table must declare `INTEGER PRIMARY KEY`.
-- Target column must be a packed little-endian `float32` `BLOB`.
-
-If the table already has rows, `CREATE VECTOR INDEX` computes centroids, builds the first stable segment generation, and marks the index `ready`.
-
-If the table is empty, the index is still created immediately. Marmot serves fresh rows from the local overlay right away, then starts a local bootstrap watcher. Once enough indexable rows arrive and the overlay snapshot stops growing, Marmot trains the first probe set from that snapshot and publishes the first clustered generation automatically. No manual `REINDEX VECTOR` is required just because the table was empty at create time.
-
-### REINDEX VECTOR
-
-```sql
-REINDEX VECTOR <index_name>;
-```
-
-Retrains centroids from the current base-table rows, rewrites a new immutable local generation, and atomically swaps it into service. Old generations remain valid for existing readers until the new one is published. Normal empty-table growth and steady-state overlay merges do not require `REINDEX VECTOR`; they use the local incremental maintenance path.
-
-### DROP VECTOR INDEX
-
-```sql
-DROP VECTOR INDEX <index_name>;
-```
-
-Drops the index metadata and local derived files. The base-table vectors are unaffected.
-
-## Query Syntax
-
-### `vec_match`
-
-```sql
-WHERE vec_match(<column>, <query_vec>, <k>)
-```
-
-Marks the query as vector-filtered. Exactly one `vec_match` is supported per `SELECT`.
-
-### `vec_distance`
-
-```sql
-ORDER BY vec_distance(<column>, <query_vec>)
-```
-
-Ranks the result set. The rewriter resolves this to the metric-specific distance function internally.
-
-### Metrics
-
-| Metric | Distance |
-|---|---|
-| `l2` | Squared Euclidean distance |
-| `cosine` | `1 - cosine_similarity` |
-| `dot` | Negative inner product |
-
-## Planning
-
-Marmot uses two execution shapes:
-
-- **Pre-filter**: apply the scalar predicate first, then compute exact distance over the smaller filtered set.
-- **Post-filter**: probe IVF centroids, scan stable segment clusters plus the overlay, then exact-rerank a shortlist from the base table.
-
-The planner uses estimated predicate cardinality plus session overrides to choose between them. In post-filter mode, Marmot chooses a probe prefix from the nearest clusters; with default auto-tuning that prefix is budget-driven rather than a fixed hard-coded `sqrt(nlist)` probe count.
-
-## Session Variables
-
-Current query/session controls are per connection.
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `@@marmot_vec_nprobe` | index default | Probed clusters per query |
-| `@@marmot_vec_force_plan` | `auto` | `auto`, `pre`, or `post` |
-| `@@marmot_vec_prefilter_cap` | `5000` | Hard cap for pre-filter row count |
-| `@@marmot_vec_fallback` | `on` | Allow exact fallback if post-filter returns too few rows |
-| `@@marmot_vec_use_go_rank` | `on` | Use the Go-side ranking path |
-
-## Configuration
+Vector search is controlled by the `vector_index` config section.
 
 ```toml
 [vector_index]
@@ -149,17 +26,317 @@ enabled = true
 data_dir = ""
 ```
 
-- `enabled` turns vector index support on.
-- `data_dir` is reserved for a future explicit override of the local vector-state root. Today Marmot colocates `.vecseg` state next to the database file.
+- `enabled` enables vector DDL, query rewriting, and background vector maintenance.
+- `data_dir` is reserved for a future explicit vector-state root. Current builds colocate `.vecseg` files next to the SQLite database.
 
-## Under the Hood
+## RAG Table Pattern
 
-### Local Layout
+Use a normal table with an `INTEGER PRIMARY KEY`, scalar metadata columns, and one `BLOB` embedding column.
 
-For `docs_embed_idx` on `docs(embed)`, Marmot stores local derived state under:
+```sql
+CREATE DATABASE rag;
+USE rag;
+
+CREATE TABLE chunks (
+    id          INTEGER PRIMARY KEY,
+    tenant_id   INTEGER NOT NULL,
+    source_uri  TEXT NOT NULL,
+    chunk_no    INTEGER NOT NULL,
+    title       TEXT NOT NULL,
+    body        TEXT NOT NULL,
+    status      TEXT NOT NULL,
+    created_at  INTEGER NOT NULL,
+    embedding   BLOB NOT NULL
+);
+
+CREATE INDEX chunks_tenant_status_idx
+    ON chunks(tenant_id, status);
+
+CREATE INDEX chunks_source_chunk_idx
+    ON chunks(source_uri, chunk_no);
+```
+
+The scalar indexes are optional, but they matter when your vector query also filters by tenant, status, source, owner, timestamp, or ACL columns.
+
+## Vector Blob Format
+
+The vector column must contain packed little-endian `float32` values. The byte length must be exactly `DIM * 4`.
+
+Prefer driver parameters. Do not construct large SQL hex literals in application code.
+
+```python
+import struct
+
+def vec_blob(values: list[float]) -> bytes:
+    return struct.pack("<" + "f" * len(values), *values)
+
+embedding = get_embedding("Marmot stores vectors in SQLite.")
+
+# Use your driver's placeholder convention; the important part is binding
+# vec_blob(embedding) as bytes for the BLOB column.
+cursor.execute(
+    """
+    INSERT INTO chunks
+        (id, tenant_id, source_uri, chunk_no, title, body, status, created_at, embedding)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """,
+    (
+        1,
+        42,
+        "s3://kb/marmot.md",
+        0,
+        "Marmot vector search",
+        "Marmot stores exact embeddings in the base table.",
+        "published",
+        1730000000,
+        vec_blob(embedding),
+    ),
+)
+```
+
+For Go:
+
+```go
+func Float32Blob(v []float32) []byte {
+	buf := make([]byte, len(v)*4)
+	for i, x := range v {
+		binary.LittleEndian.PutUint32(buf[i*4:], math.Float32bits(x))
+	}
+	return buf
+}
+```
+
+## Create An Index
+
+Start with auto tuning unless you have benchmark data that says otherwise.
+
+```sql
+CREATE VECTOR INDEX chunks_embedding_idx
+    ON chunks(embedding)
+    DIM 1536
+    METRIC cosine;
+```
+
+Equivalent explicit form:
+
+```sql
+CREATE VECTOR INDEX chunks_embedding_idx
+    ON chunks(embedding)
+    DIM 1536
+    METRIC cosine
+    WITH (nlist = 512, nprobe = 32);
+```
+
+For maximum-inner-product search:
+
+```sql
+CREATE VECTOR INDEX chunks_embedding_dot_idx
+    ON chunks(embedding)
+    DIM 1536
+    METRIC dot
+    WITH (max_norm = 80.0);
+```
+
+`max_norm` is required for `dot` workloads that rely on MIPS-to-L2 augmentation. Set it to a fixed upper bound for your vector norms; vectors above it fail materialization and should be reindexed with a larger bound.
+
+## Insert, Update, Delete
+
+Vector CRUD uses ordinary SQL. Marmot CDC captures row changes and updates each local vector overlay after commit.
+
+```sql
+INSERT INTO chunks
+    (id, tenant_id, source_uri, chunk_no, title, body, status, created_at, embedding)
+VALUES
+    (?, ?, ?, ?, ?, ?, ?, ?, ?);
+
+UPDATE chunks
+   SET body = ?,
+       embedding = ?
+ WHERE id = ?;
+
+DELETE FROM chunks
+ WHERE id = ?;
+```
+
+Committed changes are query-visible immediately through the local overlay. They do not need to wait for a full rebuild.
+
+## Search
+
+Use `vec_match` as a vector predicate and order by `vec_distance` on the same column.
+
+```sql
+SELECT id, source_uri, chunk_no, title, body
+  FROM chunks
+ WHERE vec_match(embedding, ?, 10)
+   AND tenant_id = 42
+   AND status = 'published'
+ ORDER BY vec_distance(embedding, ?)
+ LIMIT 10;
+```
+
+Pass the same query-vector blob to both placeholders.
+
+Requirements:
+
+- Use exactly one `vec_match` per `SELECT`.
+- Include `ORDER BY vec_distance(...)` on the same vector column.
+- Include a positive literal `LIMIT`.
+- Keep `vec_match` K and `LIMIT` aligned for normal top-K search.
+- Use the same embedding dimensionality that was declared in `DIM`.
+
+## DDL Reference
+
+```sql
+CREATE VECTOR INDEX <index_name>
+    ON <table>(<blob_column>)
+    DIM <n>
+    METRIC <l2 | cosine | dot>
+    [WITH (nlist = <n>, nprobe = <n>, max_norm = <f>)];
+
+REINDEX VECTOR <index_name>;
+
+DROP VECTOR INDEX <index_name>;
+```
+
+| Clause | Required | Meaning |
+|---|---:|---|
+| `DIM n` | yes | External vector dimensionality. A 1536-dimensional embedding must be a 6144-byte blob. |
+| `METRIC l2` | yes | Squared Euclidean distance. Lower is better. |
+| `METRIC cosine` | yes | Cosine distance, `1 - cosine_similarity`. Lower is better. |
+| `METRIC dot` | yes | Negative inner product. Higher dot product becomes lower distance. |
+| `WITH (nlist = n)` | no | IVF cluster count. More clusters usually reduce rows scanned per cluster but increase build and maintenance cost. |
+| `WITH (nprobe = n)` | no | Default number of clusters probed per query. Higher values usually improve recall and increase read cost. |
+| `WITH (max_norm = f)` | for dot | Norm cap used by dot-product augmentation. |
+
+Current SQL DDL does not expose `target_partition_size`. Auto tuning uses an internal default target of 512 vectors per partition.
+
+## Auto Tuning
+
+When `nlist` is omitted, Marmot chooses the IVF cluster count from the current indexable row count and the internal target partition size.
+
+Current defaults:
+
+| Policy | Current behavior |
+|---|---|
+| Target partition size | 512 vectors per IVF partition |
+| Non-empty create `nlist` | roughly `ceil(rows / 512)`, clamped by the supported auto range |
+| Empty-table first publish | starts from a smaller bootstrap cluster set once enough overlay rows exist |
+| Later growth | background maintenance can promote to a larger cluster count as rows grow |
+| Auto `nprobe` | derived from a row scan budget and the target partition size |
+
+Manual override guidance:
+
+| Goal | Try |
+|---|---|
+| Higher recall | Increase `nprobe` first. |
+| Lower query disk reads | Lower `nprobe`, or use more clusters with enough training data. |
+| Better large-corpus structure | Let auto `nlist` grow, or use a larger explicit `nlist` after benchmarking. |
+| Faster build | Use fewer clusters. |
+| Tenant-heavy filtering | Keep scalar tenant/status indexes and let the planner choose pre-filter when cheaper. |
+
+Do not tune from insert throughput alone. A vector workload has separate write, first-publish, settled, and read-QPS milestones.
+
+## Session Tuning
+
+Session variables are per connection.
+
+```sql
+SET @@marmot_vec_nprobe = 64;
+SET @@marmot_vec_nprobe = 0;
+
+SET @@marmot_vec_force_plan = 'pre';
+SET @@marmot_vec_force_plan = 'post';
+SET @@marmot_vec_force_plan = 'auto';
+
+SET @@marmot_vec_prefilter_cap = 5000;
+SET @@marmot_vec_fallback = 'on';
+SET @@marmot_vec_use_go_rank = 'on';
+```
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `@@marmot_vec_nprobe` | `0` | `0` means use the index default and budget probing when eligible. A positive value forces a fixed probe count for this connection. |
+| `@@marmot_vec_force_plan` | `auto` | `auto`, `pre`, or `post`. Use this to compare exact pre-filter vs IVF post-filter. |
+| `@@marmot_vec_prefilter_cap` | `5000` | Maximum estimated scalar-filter row count before the planner prefers IVF post-filter. |
+| `@@marmot_vec_fallback` | `on` | Allows exact fallback if a post-filter path returns too few rows. |
+| `@@marmot_vec_use_go_rank` | `on` | Uses the Go-side segment scan, exact-vector fetch, exact rerank, and final projection path. |
+
+Operational variables also exist for retrain checks and chunk sizing, but the default path is the recommended starting point.
+
+## Lifecycle And Settling
+
+Vector indexes have four practical milestones.
+
+| Milestone | What it means |
+|---|---|
+| DDL committed | The vector index metadata exists. If the table was empty, the index can accept overlay writes immediately. |
+| Overlay visibility | Inserts, updates, and deletes are visible to vector queries through the local overlay after commit. |
+| First clustered publish | Marmot has published the first immutable `.vecseg` generation and can scan stable clusters. |
+| Settled | Overlay backlog is below merge thresholds, auto cluster count no longer needs promotion, and cluster skew is within the current bounds. |
+
+For empty-table create, Marmot does not wait for the whole corpus before the first clustered state. The current bootstrap path waits until enough overlay rows exist for auto tuning. With default policy that floor is 8 target partitions, or 4096 rows. The first publish is bounded by the bootstrap target and capped at 16384 rows. If the overlay is below the publish target, Marmot waits briefly for writes to quiesce before publishing.
+
+For non-empty create, `CREATE VECTOR INDEX` builds the first local generation from existing table rows before the index is ready.
+
+Settling is not a correctness boundary:
+
+- Queries before settle include stable rows plus overlay rows.
+- Updates and deletes mask old stable rows through overlay tombstones before merge.
+- Background maintenance folds overlay rows into new immutable generations.
+- Promotions grow `nlist` when auto tuning decides the corpus has outgrown the current cluster count.
+
+Settling affects read cost. Large overlays are correct but slower because queries must merge recent mutations in addition to scanning stable clusters.
+
+## Observability
+
+The local vector catalog is stored in `__marmot_vector_indexes`. Treat it as read-only.
+
+```sql
+SELECT index_name,
+       table_name,
+       column_name,
+       metric,
+       dim,
+       nlist,
+       nprobe,
+       auto_nlist,
+       auto_nprobe,
+       target_partition_size,
+       status
+  FROM __marmot_vector_indexes;
+```
+
+Useful log messages include:
+
+- `engine hook bootstrap: bootstrap threshold reached`
+- `engine hook bootstrap: automatic bootstrap complete`
+- `maintenance: incremental merge failed`
+- `maintenance: catch-up rebuild failed`
+- `VectorIndexManager: local vector index marked dirty`
+
+`vec-bench` reports the measurements that matter for tuning:
+
+- DDL create time
+- first clustered publish time
+- final settled time
+- insert throughput
+- read QPS
+- recall
+- p50, p95, and p99 latency
+- RSS snapshots
+- stable encoding
+- segment logical bytes/query
+- segment actual read bytes/query
+- segment overread
+
+## Runtime Model
+
+### Local Files
+
+For `chunks_embedding_idx`, Marmot stores derived state beside the database:
 
 ```text
-<db>.docs_embed_idx.vecseg/
+<db>.chunks_embedding_idx.vecseg/
   manifest/
     current
     gen-00000000000000000001.mf
@@ -171,70 +348,75 @@ For `docs_embed_idx` on `docs(embed)`, Marmot stores local derived state under:
     current.log
 ```
 
-What each file does:
-
-- `manifest/current`: points to the active generation.
-- `gen-*.mf`: manifest with index identity, probe/stable centroid epochs and blobs, checksums, and file names.
-- `segments/gen-*.dat`: stable vector payload laid out by cluster.
-- `rowmap/gen-*.rmap`: rowid-to-stable-location map for rebuild and compaction.
-- `overlay/current.log`: append-only local overlay journal for recent committed mutations.
+| File | Purpose |
+|---|---|
+| `manifest/current` | Atomic pointer to the active generation. |
+| `manifest/gen-*.mf` | Manifest with index identity, centroid epochs, encoding metadata, checksums, and file names. |
+| `segments/gen-*.dat` | Stable vector payload laid out by cluster. |
+| `rowmap/gen-*.rmap` | Rowid to stable-location map. |
+| `overlay/current.log` | Append-only local mutation log for rows newer than the stable generation. |
 
 ### Read Path
 
-For IVF post-filter queries:
+In post-filter IVF mode:
 
-1. Load probe/stable centroid state from the active manifest into memory.
-2. Pick the nearest cluster prefix for this query, using either explicit `nprobe` or the auto-tuned scan budget.
-3. Read stable cluster payload from the segment file with `pread`.
-4. Merge the in-memory overlay snapshot.
-5. Fetch the shortlist vectors from the base table, materialize them in Go, and exact-rerank there.
+1. Marmot materializes the query vector into the internal metric representation.
+2. It selects probe clusters from the active probe centroids.
+3. It scans the selected stable cluster spans with `pread`.
+4. It merges overlay rows and tombstones newer than the generation cutoff.
+5. It fetches shortlisted exact vectors from the base table.
+6. It reranks exact distances in Go.
+7. It issues a final projection query for only the final top-K rowids.
 
-The hot candidate scan is file-backed, not SQLite-row backed.
+The approximate scan is used for candidate generation only. Final distance ordering uses exact vectors from the base table.
 
 ### Write Path
 
-Committed base-table inserts, updates, and deletes update the local overlay journal and overlay snapshot. Before the first clustered publish, queries read from the overlay only. After bootstrap, stable segment files remain immutable; Marmot rewrites touched clusters into a new generation, advances routing metadata, and publishes that generation atomically. Bounded cluster-count growth uses the same local generation machinery instead of a SQLite sidecar.
+After a successful commit:
 
-### Crash Safety
+1. Marmot CDC captures the row-level change.
+2. The vector hook materializes new vector values into internal form.
+3. The local overlay journal records inserts, updates, or tombstones.
+4. Queries see those changes immediately from the overlay.
+5. Background maintenance publishes new immutable generations and compacts applied overlay rows.
 
-Publish order is:
+### Stable Encoding
 
-1. write temp segment and rowmap files
-2. fsync temp files
-3. write temp manifest
-4. fsync manifest
-5. rename manifest into place
-6. swap `manifest/current`
-7. fsync manifest directory
+Stable segments use compact encodings:
 
-On reopen, Marmot validates:
+| Encoding | Used when |
+|---|---|
+| Residual PQ8 | Internal dimension is at least 512 and there are at least 4096 stable training rows. |
+| Residual int8 | Fallback for smaller indexes, lower dimensions, or legacy generations. |
+| Raw prepared float32 | Compatibility/testing path. |
 
-- `manifest/current`
-- manifest version and index identity
-- stable file sizes and checksums
-- rowmap sizes and checksums
+Residual PQ8 uses generation-local codebooks. Incremental maintenance reuses the generation codec for touched clusters so untouched cluster spans remain byte-copyable. Full rebuild or manual `REINDEX VECTOR` is the codec refresh path.
 
-If local derived state is invalid, Marmot rebuilds it from the base table.
+## Replication
+
+Marmot does not replicate vector segment artifacts.
+
+Replicated:
+
+- row-level DML CDC for the base table
+- vector-control metadata for `CREATE VECTOR INDEX`
+- vector-control metadata for `DROP VECTOR INDEX`
+- vector-control metadata for `REINDEX VECTOR`
+
+Node-local derived state:
+
+- `.vecseg` segment files
+- rowmaps
+- manifest files
+- overlay journals
+- centroids
+- PQ codebooks
+
+Each node builds and maintains its own local vector index from the same replicated table rows and vector-control metadata. A replica may publish its local generation at a different wall-clock time, but queries use only locally ready vector indexes. If local vector CDC fails after the SQLite commit, the index is marked `dirty` so stale ANN results are not served until repaired or rebuilt.
 
 ## Benchmarking
 
-Use `cmd/vec-bench` for local vector benchmarking. A meaningful run should always report the full bundle:
-
-- create time
-- first clustered publish time
-- final settled time
-- query-ready throughput
-- write throughput
-- read QPS
-- recall
-- p50 / p95 / p99 latency
-- RSS after build, vector settle, warmup, and measurement
-- CPU profiles when relevant
-
-Acceptance for the 100K OpenAI-vector benchmark is recall@10 `>= 0.95`,
-read QPS `> 1,000`, and segment overread `<= 1.05x`.
-
-Example:
+Use `cmd/vec-bench` for repeatable vector benchmarking.
 
 ```bash
 ./vec-bench \
@@ -248,7 +430,7 @@ Example:
   --insert-n=100000 \
   --warmup=200 \
   --n-queries=500 \
-  --query-concurrency=1 \
+  --query-concurrency=8 \
   --settle-timeout=10m \
   --min-recall=0.95 \
   --min-qps=1000 \
@@ -256,11 +438,47 @@ Example:
   --profile-dir=/tmp/marmot/bench-active/prof
 ```
 
+Always report:
+
+- dataset and embedding dimension
+- row count
+- `nlist` and `nprobe`
+- stable encoding
+- create time
+- first clustered publish time
+- final settled time
+- insert QPS
+- read QPS
+- recall@K
+- latency percentiles
+- RSS after build and after settle
+- segment read bytes/query and overread
+
+Do not report raw insert throughput as query-ready build throughput. Inserts are live immediately, but the clustered generation and settled read structure are separate milestones.
+
+## Crash Safety
+
+Stable generation publish is append-and-swap:
+
+1. write temp segment and rowmap files
+2. fsync temp files
+3. write temp manifest
+4. fsync manifest
+5. rename manifest into place
+6. swap `manifest/current`
+7. fsync the manifest directory
+
+The old generation remains valid until `manifest/current` points to the new generation. The overlay journal remains the source of truth for mutations after the applied cutoff.
+
 ## Limitations
 
-- One `vec_match` per `SELECT`.
-- `LIMIT` is required with `vec_match`.
-- Base table must have `INTEGER PRIMARY KEY`.
-- Exact rerank still reads the shortlist vectors from the base table.
-- Initial bootstrap, larger promotions, and `REINDEX VECTOR` are still CPU- and memory-heavy because centroid training happens in-process.
-- Raw insert throughput is not the same thing as final query-ready throughput; for create-on-empty runs, judge the system by the reported clustered-publish and settled milestones, not by insert speed alone.
+- Exactly one `vec_match` is supported per `SELECT`.
+- `LIMIT` is required and must be a positive literal integer.
+- `vec_match` queries must order by `vec_distance` on the same vector column.
+- The base table must have an `INTEGER PRIMARY KEY`.
+- The embedding must be a packed little-endian `float32` `BLOB`.
+- Vector index DDL uses simple table/index/column identifiers; run `USE database` first.
+- `target_partition_size` is currently internal and not a SQL DDL option.
+- Initial bootstrap, promotion, and `REINDEX VECTOR` are CPU-heavy because centroid training happens in-process.
+- Exact rerank reads shortlisted vectors from the base table, so very large final shortlist settings can increase SQLite read cost.
+- Segment files, rowmaps, centroids, PQ codebooks, and overlay journals are local derived state and are not replicated.
