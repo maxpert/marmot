@@ -4,7 +4,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
-	"math/bits"
 
 	"github.com/maxpert/marmot/modules/vecindex/pkg/kmeans"
 	"github.com/maxpert/marmot/modules/vecindex/pkg/metric"
@@ -51,7 +50,6 @@ type StableMemberQueryScorer struct {
 	query      []float32
 	queryNorm2 float32
 	pq         *quantize.PQ8QueryScorer
-	pqLUT      []float32
 	residualQ  []float32
 }
 
@@ -335,7 +333,7 @@ func NewStableMemberQueryScorerWithCodec(codec *StableMemberCodec, query []float
 		if err != nil {
 			return nil, err
 		}
-		return &StableMemberQueryScorer{codec: codec, query: query, queryNorm2: queryNorm2, pq: pq, pqLUT: pq.DotLUT()}, nil
+		return &StableMemberQueryScorer{codec: codec, query: query, queryNorm2: queryNorm2, pq: pq}, nil
 	default:
 		return nil, fmt.Errorf("vecindex: unknown member encoding %d", codec.enc)
 	}
@@ -376,76 +374,78 @@ func (q *StableMemberQueryScorer) BlockLowerBound(clusterID int64, block Segment
 	}
 	switch q.codec.enc {
 	case MemberEncodingResidualInt8:
-		if len(block.Stats) != q.codec.spec.InternalDim()*8 || len(q.residualQ) != q.codec.spec.InternalDim() {
-			return 0, false
-		}
-		baseDot := metric.DotProduct(q.query, centroid)
-		residualUB := float32(0)
-		dim := q.codec.spec.InternalDim()
-		maxBase := dim * 4
-		for i, qv := range q.residualQ {
-			minValue := math.Float32frombits(binary.LittleEndian.Uint32(block.Stats[i*4:]))
-			maxValue := math.Float32frombits(binary.LittleEndian.Uint32(block.Stats[maxBase+i*4:]))
-			if qv >= 0 {
-				residualUB += qv * maxValue
-			} else {
-				residualUB += qv * minValue
-			}
-		}
-		dotUB := baseDot + residualUB
-		switch q.codec.spec.InternalMetric() {
-		case metric.MetricCosine:
-			return 1 - dotUB, true
-		case metric.MetricL2:
-			return q.queryNorm2 + block.MinNorm2 - 2*dotUB, true
-		default:
-			return 0, false
-		}
+		return q.residualBlockLowerBound(centroid, block)
 	case MemberEncodingResidualPQ8:
-		pq := q.codec.pq
-		if pq == nil || len(q.pqLUT) != pq.M*segmentBlockPQCodebookSize || len(block.Stats) != pq.M*segmentBlockPQMaskWords*8 {
+		return q.pqBlockLowerBound(centroid, block)
+	default:
+		return 0, false
+	}
+}
+
+func (q *StableMemberQueryScorer) residualBlockLowerBound(centroid []float32, block SegmentBlockRecord) (float32, bool) {
+	dim := q.codec.spec.InternalDim()
+	if len(block.Stats) != dim*8 || len(q.residualQ) != dim {
+		return 0, false
+	}
+	dotUB := metric.DotProduct(q.query, centroid) + residualStatsDotUpperBound(block.Stats, q.residualQ)
+	switch q.codec.spec.InternalMetric() {
+	case metric.MetricCosine:
+		return 1 - dotUB, true
+	case metric.MetricL2:
+		return q.queryNorm2 + block.MinNorm2 - 2*dotUB, true
+	default:
+		return 0, false
+	}
+}
+
+func residualStatsDotUpperBound(stats []byte, queryResidual []float32) float32 {
+	residualUB := float32(0)
+	maxBase := len(queryResidual) * 4
+	for i, qv := range queryResidual {
+		minValue := math.Float32frombits(binary.LittleEndian.Uint32(stats[i*4:]))
+		maxValue := math.Float32frombits(binary.LittleEndian.Uint32(stats[maxBase+i*4:]))
+		if qv >= 0 {
+			residualUB += qv * maxValue
+		} else {
+			residualUB += qv * minValue
+		}
+	}
+	return residualUB
+}
+
+func (q *StableMemberQueryScorer) pqBlockLowerBound(centroid []float32, block SegmentBlockRecord) (float32, bool) {
+	pq := q.codec.pq
+	if pq == nil || q.pq == nil || len(block.Stats) != pq.M*segmentBlockPQMaskWords*8 {
+		return 0, false
+	}
+	dotUB := metric.DotProduct(q.query, centroid)
+	var maskWords [segmentBlockPQMaskWords]uint64
+	for sub := 0; sub < pq.M; sub++ {
+		maskBase := sub * segmentBlockPQMaskWords * 8
+		for word := 0; word < segmentBlockPQMaskWords; word++ {
+			maskWords[word] = binary.LittleEndian.Uint64(block.Stats[maskBase+word*8:])
+		}
+		best, ok := q.pq.MaxDotForCodeMask(sub, maskWords[:])
+		if !ok {
 			return 0, false
 		}
-		dotUB := metric.DotProduct(q.query, centroid)
-		for sub := 0; sub < pq.M; sub++ {
-			best := -float32(math.MaxFloat32)
-			maskBase := sub * segmentBlockPQMaskWords * 8
-			lutBase := sub * segmentBlockPQCodebookSize
-			for word := 0; word < segmentBlockPQMaskWords; word++ {
-				mask := binary.LittleEndian.Uint64(block.Stats[maskBase+word*8:])
-				for mask != 0 {
-					bit := bits.TrailingZeros64(mask)
-					code := word*64 + bit
-					value := q.pqLUT[lutBase+code]
-					if value > best {
-						best = value
-					}
-					mask &= mask - 1
-				}
-			}
-			if best == -float32(math.MaxFloat32) {
-				return 0, false
-			}
-			dotUB += best
-		}
-		switch q.codec.spec.InternalMetric() {
-		case metric.MetricL2:
-			return q.queryNorm2 + block.MinNorm2 - 2*dotUB, true
-		case metric.MetricCosine:
-			if block.MinNorm2 <= 0 || block.MaxNorm2 <= 0 {
-				return 0, false
-			}
-			denom := float32(math.Sqrt(float64(block.MinNorm2)))
-			if dotUB < 0 {
-				denom = float32(math.Sqrt(float64(block.MaxNorm2)))
-			}
-			if denom <= 0 {
-				return 0, false
-			}
-			return 1 - dotUB/denom, true
-		default:
+		dotUB += best
+	}
+	switch q.codec.spec.InternalMetric() {
+	case metric.MetricL2:
+		return q.queryNorm2 + block.MinNorm2 - 2*dotUB, true
+	case metric.MetricCosine:
+		if block.MinNorm2 <= 0 || block.MaxNorm2 <= 0 {
 			return 0, false
 		}
+		denom := float32(math.Sqrt(float64(block.MinNorm2)))
+		if dotUB < 0 {
+			denom = float32(math.Sqrt(float64(block.MaxNorm2)))
+		}
+		if denom <= 0 {
+			return 0, false
+		}
+		return 1 - dotUB/denom, true
 	default:
 		return 0, false
 	}

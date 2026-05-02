@@ -143,48 +143,94 @@ func DecodeResidualInt8(rankMetric metric.Metric, centroid []float32, blob []byt
 	return dst, norm2, nil
 }
 
-func AccumulateResidualInt8Stats(rankMetric metric.Metric, dim, blockSize int, blob []byte, minResidual, maxResidual []float32) (float32, bool, error) {
+// ResidualInt8StatsAccumulator tracks conservative per-dimension residual
+// bounds for a block of residual-int8 encoded rows.
+type ResidualInt8StatsAccumulator struct {
+	rankMetric  metric.Metric
+	dim         int
+	blockSize   int
+	minResidual []float32
+	maxResidual []float32
+}
+
+// NewResidualInt8StatsAccumulator creates an initialized block-level residual
+// range accumulator for encoded residual-int8 rows.
+func NewResidualInt8StatsAccumulator(rankMetric metric.Metric, dim, blockSize int) (*ResidualInt8StatsAccumulator, error) {
 	if dim <= 0 {
-		return 0, false, fmt.Errorf("quantize: invalid dim %d", dim)
+		return nil, fmt.Errorf("quantize: invalid dim %d", dim)
 	}
 	if blockSize <= 0 {
-		return 0, false, fmt.Errorf("quantize: invalid block size %d", blockSize)
+		return nil, fmt.Errorf("quantize: invalid block size %d", blockSize)
 	}
-	if len(minResidual) != dim || len(maxResidual) != dim {
-		return 0, false, fmt.Errorf("quantize: residual stats dim mismatch")
+	acc := &ResidualInt8StatsAccumulator{
+		rankMetric:  rankMetric,
+		dim:         dim,
+		blockSize:   blockSize,
+		minResidual: make([]float32, dim),
+		maxResidual: make([]float32, dim),
 	}
-	if len(blob) != EncodedResidualSize(rankMetric, dim, blockSize) {
-		return 0, false, fmt.Errorf("quantize: blob size mismatch: got=%d want=%d", len(blob), EncodedResidualSize(rankMetric, dim, blockSize))
+	for i := range acc.minResidual {
+		acc.minResidual[i] = float32(math.MaxFloat32)
+		acc.maxResidual[i] = -float32(math.MaxFloat32)
+	}
+	return acc, nil
+}
+
+// Accumulate folds one encoded residual-int8 row into the accumulator and
+// returns the row norm when the encoding stores one.
+func (a *ResidualInt8StatsAccumulator) Accumulate(blob []byte) (float32, bool, error) {
+	if a == nil {
+		return 0, false, fmt.Errorf("quantize: residual stats accumulator is nil")
+	}
+	want := EncodedResidualSize(a.rankMetric, a.dim, a.blockSize)
+	if len(blob) != want {
+		return 0, false, fmt.Errorf("quantize: blob size mismatch: got=%d want=%d", len(blob), want)
 	}
 	norm2 := float32(0)
 	hasNorm := false
 	off := 0
-	if rankMetric == metric.MetricL2 {
+	if a.rankMetric == metric.MetricL2 {
 		norm2 = math.Float32frombits(binary.LittleEndian.Uint32(blob[:4]))
 		hasNorm = true
 		off = 4
 	}
-	blocks := ResidualBlockCount(dim, blockSize)
+	blocks := ResidualBlockCount(a.dim, a.blockSize)
 	scaleOff := off
 	codeOff := off + blocks*2
 	for block := 0; block < blocks; block++ {
-		start := block * blockSize
-		end := start + blockSize
-		if end > dim {
-			end = dim
+		start := block * a.blockSize
+		end := start + a.blockSize
+		if end > a.dim {
+			end = a.dim
 		}
 		scale := decodeFloat16(binary.LittleEndian.Uint16(blob[scaleOff+block*2:]))
 		for i := start; i < end; i++ {
 			value := float32(int8(blob[codeOff+i])) * scale
-			if value < minResidual[i] {
-				minResidual[i] = value
+			if value < a.minResidual[i] {
+				a.minResidual[i] = value
 			}
-			if value > maxResidual[i] {
-				maxResidual[i] = value
+			if value > a.maxResidual[i] {
+				a.maxResidual[i] = value
 			}
 		}
 	}
 	return norm2, hasNorm, nil
+}
+
+// MinResidual returns the accumulator-owned per-dimension residual minima.
+func (a *ResidualInt8StatsAccumulator) MinResidual() []float32 {
+	if a == nil {
+		return nil
+	}
+	return a.minResidual
+}
+
+// MaxResidual returns the accumulator-owned per-dimension residual maxima.
+func (a *ResidualInt8StatsAccumulator) MaxResidual() []float32 {
+	if a == nil {
+		return nil
+	}
+	return a.maxResidual
 }
 
 func QuantizeQueryInt8(query []float32, blockSize int) ([]int8, []float32, error) {

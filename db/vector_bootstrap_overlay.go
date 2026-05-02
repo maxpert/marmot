@@ -3,7 +3,6 @@ package db
 import (
 	"fmt"
 	"math/rand"
-	"os"
 	"slices"
 	"time"
 
@@ -151,17 +150,17 @@ func BuildBootstrapSegmentGenerationFromOverlay(
 	if err != nil {
 		return nil, fmt.Errorf("bootstrap segment generation: next generation: %w", err)
 	}
-	stagingDir, dataPath, rowMapPath, blockPath, err := createSegmentGenerationStaging(dir, generation)
+	staging, err := createSegmentGenerationStaging(dir, generation)
 	if err != nil {
 		return nil, fmt.Errorf("bootstrap segment generation: create staging: %w", err)
 	}
 	keepStaging := false
 	defer func() {
 		if !keepStaging {
-			_ = os.RemoveAll(stagingDir)
+			staging.cleanup()
 		}
 	}()
-	rowMapWriter, err := vecindex.CreateSegmentRowMapWriter(rowMapPath, probeCS.Epoch(), generation)
+	rowMapWriter, err := vecindex.CreateSegmentRowMapWriter(staging.artifacts.rowMapPath, probeCS.Epoch(), generation)
 	if err != nil {
 		return nil, err
 	}
@@ -211,7 +210,7 @@ func BuildBootstrapSegmentGenerationFromOverlay(
 		return nil, fmt.Errorf("bootstrap segment generation: build stable codec: %w", err)
 	}
 	dataWriter, err := vecindex.CreateSegmentDataWriter(
-		dataPath,
+		staging.artifacts.dataPath,
 		spec.InternalMetric(),
 		stableCodec.Encoding(),
 		spec.Dim,
@@ -226,7 +225,7 @@ func BuildBootstrapSegmentGenerationFromOverlay(
 	}
 	defer dataWriter.Abort()
 	blockWriter, err := vecindex.CreateSegmentBlockMetaWriter(
-		blockPath,
+		staging.artifacts.blockPath,
 		spec,
 		stableCodec,
 		vecindex.DefaultSegmentBlockRows(stableCodec.Encoding()),
@@ -342,14 +341,11 @@ func BuildBootstrapSegmentGenerationFromOverlay(
 	}
 	keepStaging = true
 	return &pendingSegmentGeneration{
-		meta:       meta,
-		spec:       spec,
-		dir:        dir,
-		stagingDir: stagingDir,
-		manifest:   manifest,
-		dataPath:   dataStore.Path(),
-		rowMapPath: rowMapStore.Path(),
-		blockPath:  blockStore.Path(),
+		meta:     meta,
+		spec:     spec,
+		dir:      dir,
+		staging:  staging,
+		manifest: manifest,
 		generation: &vecindex.SegmentGeneration{
 			Data:                     dataStore,
 			RowMap:                   rowMapStore,

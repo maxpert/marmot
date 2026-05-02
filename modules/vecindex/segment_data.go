@@ -50,6 +50,7 @@ type SegmentScanStats struct {
 	BlockMetaReadBytes uint64
 	BlockMetaReads     uint64
 	BlocksConsidered   uint64
+	BlocksWouldSkip    uint64
 	BlocksSkipped      uint64
 	BlocksScored       uint64
 	BlockRowsScored    uint64

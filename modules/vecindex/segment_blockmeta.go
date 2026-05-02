@@ -20,8 +20,7 @@ const (
 	segmentBlockMetaHeaderSize  = 96
 	segmentBlockMetaRefSize     = 16
 	segmentBlockMetaRecordFixed = 64
-	segmentBlockPQMaskWords     = 4
-	segmentBlockPQCodebookSize  = 256
+	segmentBlockPQMaskWords     = (quantize.PQ8CodebookSize + 63) / 64
 
 	segmentBlockStatsNone uint8 = iota
 	segmentBlockStatsPQ8
@@ -29,6 +28,36 @@ const (
 
 	segmentBlockMetaReadBatch = 512 << 10
 	segmentBlockMetaReadGap   = 32 << 10
+)
+
+const (
+	blockHeaderMagicEnd       = 8
+	blockHeaderVersionOffset  = 8
+	blockHeaderMetricOffset   = 12
+	blockHeaderEncodingOffset = 13
+	blockHeaderStatsKind      = 14
+	blockHeaderDimOffset      = 16
+	blockHeaderInternalDim    = 20
+	blockHeaderEpochOffset    = 24
+	blockHeaderGeneration     = 32
+	blockHeaderMaxCluster     = 40
+	blockHeaderBlockRows      = 44
+	blockHeaderStatsBytes     = 48
+	blockHeaderRecordSize     = 52
+	blockHeaderRecordCount    = 56
+
+	blockRefFirstOffset = 0
+	blockRefCountOffset = 8
+
+	blockRecordClusterID       = 0
+	blockRecordFirstRowOrdinal = 8
+	blockRecordRowCount        = 16
+	blockRecordDataOffset      = 24
+	blockRecordDataBytes       = 32
+	blockRecordMinRowID        = 40
+	blockRecordMaxRowID        = 48
+	blockRecordMinNorm2        = 56
+	blockRecordMaxNorm2        = 60
 )
 
 type segmentBlockRef struct {
@@ -40,6 +69,7 @@ type SegmentBlockScanStats struct {
 	MetaReadBytes uint64
 	MetaReads     uint64
 	Considered    uint64
+	WouldSkip     uint64
 	Skipped       uint64
 	Scored        uint64
 	RowsScored    uint64
@@ -83,6 +113,7 @@ type SegmentBlockMetaStore struct {
 	metaReadBytes atomic.Uint64
 	metaReads     atomic.Uint64
 	considered    atomic.Uint64
+	wouldSkip     atomic.Uint64
 	skipped       atomic.Uint64
 	scored        atomic.Uint64
 	rowsScored    atomic.Uint64
@@ -125,8 +156,7 @@ type segmentBlockAccumulator struct {
 	maxNorm2        float32
 	hasNorm         bool
 	pqMasks         []uint64
-	resMin          []float32
-	resMax          []float32
+	resStats        *quantize.ResidualInt8StatsAccumulator
 }
 
 func DefaultSegmentBlockRows(encoding int64) int {
@@ -202,26 +232,26 @@ func OpenSegmentBlockMetaStore(path string) (*SegmentBlockMetaStore, error) {
 		_ = file.Close()
 		return nil, err
 	}
-	if string(header[:8]) != segmentBlockMetaMagic {
+	if string(header[:blockHeaderMagicEnd]) != segmentBlockMetaMagic {
 		_ = file.Close()
 		return nil, fmt.Errorf("vecindex: invalid block meta magic")
 	}
-	if got := binary.LittleEndian.Uint32(header[8:12]); got != segmentBlockMetaVersion {
+	if got := binary.LittleEndian.Uint32(header[blockHeaderVersionOffset:]); got != segmentBlockMetaVersion {
 		_ = file.Close()
 		return nil, fmt.Errorf("vecindex: unsupported block meta version %d", got)
 	}
-	metricKind := Metric(header[12])
-	encoding := int64(header[13])
-	statsKind := header[14]
-	dim := int(binary.LittleEndian.Uint32(header[16:20]))
-	internalDim := int(binary.LittleEndian.Uint32(header[20:24]))
-	epoch := binary.LittleEndian.Uint64(header[24:32])
-	generation := binary.LittleEndian.Uint64(header[32:40])
-	maxCluster := int(binary.LittleEndian.Uint32(header[40:44]))
-	blockRows := int(binary.LittleEndian.Uint32(header[44:48]))
-	statsBytes := int(binary.LittleEndian.Uint32(header[48:52]))
-	recordSize := int(binary.LittleEndian.Uint32(header[52:56]))
-	recordCount := binary.LittleEndian.Uint64(header[56:64])
+	metricKind := Metric(header[blockHeaderMetricOffset])
+	encoding := int64(header[blockHeaderEncodingOffset])
+	statsKind := header[blockHeaderStatsKind]
+	dim := int(binary.LittleEndian.Uint32(header[blockHeaderDimOffset:]))
+	internalDim := int(binary.LittleEndian.Uint32(header[blockHeaderInternalDim:]))
+	epoch := binary.LittleEndian.Uint64(header[blockHeaderEpochOffset:])
+	generation := binary.LittleEndian.Uint64(header[blockHeaderGeneration:])
+	maxCluster := int(binary.LittleEndian.Uint32(header[blockHeaderMaxCluster:]))
+	blockRows := int(binary.LittleEndian.Uint32(header[blockHeaderBlockRows:]))
+	statsBytes := int(binary.LittleEndian.Uint32(header[blockHeaderStatsBytes:]))
+	recordSize := int(binary.LittleEndian.Uint32(header[blockHeaderRecordSize:]))
+	recordCount := binary.LittleEndian.Uint64(header[blockHeaderRecordCount:])
 	if dim <= 0 || internalDim <= 0 || maxCluster < 0 || blockRows <= 0 || recordSize < segmentBlockMetaRecordFixed {
 		_ = file.Close()
 		return nil, fmt.Errorf("vecindex: invalid block meta header")
@@ -261,32 +291,41 @@ func OpenSegmentBlockMetaStore(path string) (*SegmentBlockMetaStore, error) {
 		_ = file.Close()
 		return nil, fmt.Errorf("vecindex: read block refs: %w", err)
 	}
-	maxInt := uint64(int(^uint(0) >> 1))
-	if recordCount > maxInt {
-		_ = file.Close()
-		return nil, fmt.Errorf("vecindex: block record count too large")
-	}
-	seen := make([]bool, int(recordCount))
 	var counted uint64
+	ranges := make([]segmentBlockRef, 0, maxCluster)
 	for i := range refs {
 		cursor := i * segmentBlockMetaRefSize
 		ref := segmentBlockRef{
-			first: binary.LittleEndian.Uint64(refBuf[cursor : cursor+8]),
-			count: binary.LittleEndian.Uint64(refBuf[cursor+8 : cursor+16]),
+			first: binary.LittleEndian.Uint64(refBuf[cursor+blockRefFirstOffset:]),
+			count: binary.LittleEndian.Uint64(refBuf[cursor+blockRefCountOffset:]),
 		}
-		if ref.count > 0 && ref.first+ref.count > recordCount {
+		if ref.count > 0 && (ref.first >= recordCount || ref.count > recordCount-ref.first) {
 			_ = file.Close()
 			return nil, fmt.Errorf("vecindex: block refs out of range")
 		}
-		for ordinal := ref.first; ordinal < ref.first+ref.count; ordinal++ {
-			if seen[int(ordinal)] {
-				_ = file.Close()
-				return nil, fmt.Errorf("vecindex: block refs overlap")
-			}
-			seen[int(ordinal)] = true
+		if ref.count > 0 {
+			ranges = append(ranges, ref)
 		}
 		counted += ref.count
 		refs[i] = ref
+	}
+	slices.SortFunc(ranges, func(a, b segmentBlockRef) int {
+		switch {
+		case a.first < b.first:
+			return -1
+		case a.first > b.first:
+			return 1
+		default:
+			return 0
+		}
+	})
+	var prevEnd uint64
+	for _, ref := range ranges {
+		if ref.first < prevEnd {
+			_ = file.Close()
+			return nil, fmt.Errorf("vecindex: block refs overlap")
+		}
+		prevEnd = ref.first + ref.count
 	}
 	if counted != recordCount {
 		_ = file.Close()
@@ -332,13 +371,21 @@ func (w *SegmentBlockMetaWriter) Append(clusterID, rowID int64, dataOffset uint6
 		if ref.count == 0 {
 			ref.first = w.recordCount
 		}
-		w.current = w.newAccumulator(clusterID, dataOffset)
+		acc, err := w.newAccumulator(clusterID, dataOffset)
+		if err != nil {
+			return err
+		}
+		w.current = acc
 	}
 	if w.current.rowCount >= uint64(w.blockRows) {
 		if err := w.flushCurrent(); err != nil {
 			return err
 		}
-		w.current = w.newAccumulator(clusterID, dataOffset)
+		acc, err := w.newAccumulator(clusterID, dataOffset)
+		if err != nil {
+			return err
+		}
+		w.current = acc
 	}
 	if err := w.current.add(w, rowID, dataOffset, dataBytes, encoded); err != nil {
 		return err
@@ -369,11 +416,19 @@ func (w *SegmentBlockMetaWriter) AppendRawBlocks(clusterID int64, blocks []Segme
 	if ref.count == 0 {
 		ref.first = w.recordCount
 	}
+	var expectedOffset int64
 	for _, block := range blocks {
 		if block.ClusterID != clusterID {
 			return fmt.Errorf("vecindex: raw block cluster mismatch")
 		}
+		if block.RowCount == 0 || block.DataBytes <= 0 {
+			return fmt.Errorf("vecindex: raw block has invalid extent")
+		}
 		block.DataOffset += offsetDelta
+		if expectedOffset != 0 && block.DataOffset != expectedOffset {
+			return fmt.Errorf("vecindex: raw block offsets are not contiguous")
+		}
+		expectedOffset = block.DataOffset + block.DataBytes
 		if err := w.writeRecord(block); err != nil {
 			return err
 		}
@@ -394,24 +449,24 @@ func (w *SegmentBlockMetaWriter) Close() (*SegmentBlockMetaStore, error) {
 		return nil, err
 	}
 	header := make([]byte, segmentBlockMetaHeaderSize+len(w.refs)*segmentBlockMetaRefSize)
-	copy(header[:8], []byte(segmentBlockMetaMagic))
-	binary.LittleEndian.PutUint32(header[8:12], segmentBlockMetaVersion)
-	header[12] = byte(w.metric)
-	header[13] = byte(w.encoding)
-	header[14] = w.statsKind
-	binary.LittleEndian.PutUint32(header[16:20], uint32(w.dim))
-	binary.LittleEndian.PutUint32(header[20:24], uint32(w.internalDim))
-	binary.LittleEndian.PutUint64(header[24:32], w.epoch)
-	binary.LittleEndian.PutUint64(header[32:40], w.generation)
-	binary.LittleEndian.PutUint32(header[40:44], uint32(w.maxCluster))
-	binary.LittleEndian.PutUint32(header[44:48], uint32(w.blockRows))
-	binary.LittleEndian.PutUint32(header[48:52], uint32(w.statsBytes))
-	binary.LittleEndian.PutUint32(header[52:56], uint32(w.recordSize))
-	binary.LittleEndian.PutUint64(header[56:64], w.recordCount)
+	copy(header[:blockHeaderMagicEnd], []byte(segmentBlockMetaMagic))
+	binary.LittleEndian.PutUint32(header[blockHeaderVersionOffset:], segmentBlockMetaVersion)
+	header[blockHeaderMetricOffset] = byte(w.metric)
+	header[blockHeaderEncodingOffset] = byte(w.encoding)
+	header[blockHeaderStatsKind] = w.statsKind
+	binary.LittleEndian.PutUint32(header[blockHeaderDimOffset:], uint32(w.dim))
+	binary.LittleEndian.PutUint32(header[blockHeaderInternalDim:], uint32(w.internalDim))
+	binary.LittleEndian.PutUint64(header[blockHeaderEpochOffset:], w.epoch)
+	binary.LittleEndian.PutUint64(header[blockHeaderGeneration:], w.generation)
+	binary.LittleEndian.PutUint32(header[blockHeaderMaxCluster:], uint32(w.maxCluster))
+	binary.LittleEndian.PutUint32(header[blockHeaderBlockRows:], uint32(w.blockRows))
+	binary.LittleEndian.PutUint32(header[blockHeaderStatsBytes:], uint32(w.statsBytes))
+	binary.LittleEndian.PutUint32(header[blockHeaderRecordSize:], uint32(w.recordSize))
+	binary.LittleEndian.PutUint64(header[blockHeaderRecordCount:], w.recordCount)
 	cursor := segmentBlockMetaHeaderSize
 	for _, ref := range w.refs {
-		binary.LittleEndian.PutUint64(header[cursor:cursor+8], ref.first)
-		binary.LittleEndian.PutUint64(header[cursor+8:cursor+16], ref.count)
+		binary.LittleEndian.PutUint64(header[cursor+blockRefFirstOffset:], ref.first)
+		binary.LittleEndian.PutUint64(header[cursor+blockRefCountOffset:], ref.count)
 		cursor += segmentBlockMetaRefSize
 	}
 	if _, err := w.file.WriteAt(header, 0); err != nil {
@@ -479,6 +534,7 @@ func (s *SegmentBlockMetaStore) ResetScanStats() {
 	s.metaReadBytes.Store(0)
 	s.metaReads.Store(0)
 	s.considered.Store(0)
+	s.wouldSkip.Store(0)
 	s.skipped.Store(0)
 	s.scored.Store(0)
 	s.rowsScored.Store(0)
@@ -492,17 +548,19 @@ func (s *SegmentBlockMetaStore) SnapshotScanStats() SegmentBlockScanStats {
 		MetaReadBytes: s.metaReadBytes.Load(),
 		MetaReads:     s.metaReads.Load(),
 		Considered:    s.considered.Load(),
+		WouldSkip:     s.wouldSkip.Load(),
 		Skipped:       s.skipped.Load(),
 		Scored:        s.scored.Load(),
 		RowsScored:    s.rowsScored.Load(),
 	}
 }
 
-func (s *SegmentBlockMetaStore) RecordQueryStats(considered, skipped, scored, rowsScored uint64) {
+func (s *SegmentBlockMetaStore) RecordQueryStats(considered, wouldSkip, skipped, scored, rowsScored uint64) {
 	if s == nil {
 		return
 	}
 	s.considered.Add(considered)
+	s.wouldSkip.Add(wouldSkip)
 	s.skipped.Add(skipped)
 	s.scored.Add(scored)
 	s.rowsScored.Add(rowsScored)
@@ -660,15 +718,15 @@ func (s *SegmentBlockMetaStore) decodeRecord(raw []byte, includeStats bool) (Seg
 		return SegmentBlockRecord{}, fmt.Errorf("vecindex: invalid block record size")
 	}
 	rec := SegmentBlockRecord{
-		ClusterID:       int64(binary.LittleEndian.Uint32(raw[0:4])),
-		FirstRowOrdinal: binary.LittleEndian.Uint64(raw[8:16]),
-		RowCount:        uint64(binary.LittleEndian.Uint32(raw[16:20])),
-		DataOffset:      int64(binary.LittleEndian.Uint64(raw[24:32])),
-		DataBytes:       int64(binary.LittleEndian.Uint64(raw[32:40])),
-		MinRowID:        int64(binary.LittleEndian.Uint64(raw[40:48])),
-		MaxRowID:        int64(binary.LittleEndian.Uint64(raw[48:56])),
-		MinNorm2:        math.Float32frombits(binary.LittleEndian.Uint32(raw[56:60])),
-		MaxNorm2:        math.Float32frombits(binary.LittleEndian.Uint32(raw[60:64])),
+		ClusterID:       int64(binary.LittleEndian.Uint32(raw[blockRecordClusterID:])),
+		FirstRowOrdinal: binary.LittleEndian.Uint64(raw[blockRecordFirstRowOrdinal:]),
+		RowCount:        uint64(binary.LittleEndian.Uint32(raw[blockRecordRowCount:])),
+		DataOffset:      int64(binary.LittleEndian.Uint64(raw[blockRecordDataOffset:])),
+		DataBytes:       int64(binary.LittleEndian.Uint64(raw[blockRecordDataBytes:])),
+		MinRowID:        int64(binary.LittleEndian.Uint64(raw[blockRecordMinRowID:])),
+		MaxRowID:        int64(binary.LittleEndian.Uint64(raw[blockRecordMaxRowID:])),
+		MinNorm2:        math.Float32frombits(binary.LittleEndian.Uint32(raw[blockRecordMinNorm2:])),
+		MaxNorm2:        math.Float32frombits(binary.LittleEndian.Uint32(raw[blockRecordMaxNorm2:])),
 	}
 	if includeStats && s.statsBytes > 0 {
 		rec.Stats = raw[segmentBlockMetaRecordFixed:]
@@ -693,7 +751,7 @@ func segmentBlockStatsLayout(spec IVFSpec, codec *StableMemberCodec) (uint8, int
 	}
 }
 
-func (w *SegmentBlockMetaWriter) newAccumulator(clusterID int64, dataOffset uint64) *segmentBlockAccumulator {
+func (w *SegmentBlockMetaWriter) newAccumulator(clusterID int64, dataOffset uint64) (*segmentBlockAccumulator, error) {
 	acc := &segmentBlockAccumulator{
 		clusterID:       clusterID,
 		firstRowOrdinal: w.refs[clusterID].count * uint64(w.blockRows),
@@ -705,17 +763,19 @@ func (w *SegmentBlockMetaWriter) newAccumulator(clusterID int64, dataOffset uint
 	case segmentBlockStatsPQ8:
 		acc.pqMasks = make([]uint64, w.codec.pq.M*segmentBlockPQMaskWords)
 	case segmentBlockStatsResidualInt8:
-		acc.resMin = make([]float32, w.internalDim)
-		acc.resMax = make([]float32, w.internalDim)
-		for i := range acc.resMin {
-			acc.resMin[i] = float32(math.MaxFloat32)
-			acc.resMax[i] = -float32(math.MaxFloat32)
+		resStats, err := quantize.NewResidualInt8StatsAccumulator(w.metric, w.internalDim, MemberResidualBlockSize)
+		if err != nil {
+			return nil, err
 		}
+		acc.resStats = resStats
 	}
-	return acc
+	return acc, nil
 }
 
 func (a *segmentBlockAccumulator) add(w *SegmentBlockMetaWriter, rowID int64, dataOffset uint64, dataBytes int, encoded []byte) error {
+	if dataBytes <= 0 {
+		return fmt.Errorf("vecindex: block meta row data bytes must be > 0")
+	}
 	if a.rowCount == 0 {
 		a.minRowID = rowID
 		a.maxRowID = rowID
@@ -729,6 +789,8 @@ func (a *segmentBlockAccumulator) add(w *SegmentBlockMetaWriter, rowID int64, da
 	}
 	if a.rowCount == 0 {
 		a.dataOffset = dataOffset
+	} else if dataOffset != a.dataOffset+a.dataBytes {
+		return fmt.Errorf("vecindex: block meta row offset is not contiguous")
 	}
 	a.dataBytes += uint64(dataBytes)
 	var norm2 float32
@@ -742,7 +804,7 @@ func (a *segmentBlockAccumulator) add(w *SegmentBlockMetaWriter, rowID int64, da
 		}
 	case segmentBlockStatsResidualInt8:
 		var err error
-		norm2, hasNorm, err = quantize.AccumulateResidualInt8Stats(w.metric, w.internalDim, MemberResidualBlockSize, encoded, a.resMin, a.resMax)
+		norm2, hasNorm, err = a.resStats.Accumulate(encoded)
 		if err != nil {
 			return err
 		}
@@ -817,12 +879,14 @@ func (a *segmentBlockAccumulator) record(w *SegmentBlockMetaWriter) SegmentBlock
 	case segmentBlockStatsPQ8:
 		rec.Stats = encodeUint64s(a.pqMasks)
 	case segmentBlockStatsResidualInt8:
-		stats := make([]byte, len(a.resMin)*8)
-		for i, value := range a.resMin {
+		minResidual := a.resStats.MinResidual()
+		maxResidual := a.resStats.MaxResidual()
+		stats := make([]byte, len(minResidual)*8)
+		for i, value := range minResidual {
 			binary.LittleEndian.PutUint32(stats[i*4:], math.Float32bits(value))
 		}
-		base := len(a.resMin) * 4
-		for i, value := range a.resMax {
+		base := len(minResidual) * 4
+		for i, value := range maxResidual {
 			binary.LittleEndian.PutUint32(stats[base+i*4:], math.Float32bits(value))
 		}
 		rec.Stats = stats
@@ -835,15 +899,15 @@ func (w *SegmentBlockMetaWriter) writeRecord(rec SegmentBlockRecord) error {
 		return fmt.Errorf("vecindex: block stats length %d want %d", len(rec.Stats), w.statsBytes)
 	}
 	buf := make([]byte, w.recordSize)
-	binary.LittleEndian.PutUint32(buf[0:4], uint32(rec.ClusterID))
-	binary.LittleEndian.PutUint64(buf[8:16], rec.FirstRowOrdinal)
-	binary.LittleEndian.PutUint32(buf[16:20], uint32(rec.RowCount))
-	binary.LittleEndian.PutUint64(buf[24:32], uint64(rec.DataOffset))
-	binary.LittleEndian.PutUint64(buf[32:40], uint64(rec.DataBytes))
-	binary.LittleEndian.PutUint64(buf[40:48], uint64(rec.MinRowID))
-	binary.LittleEndian.PutUint64(buf[48:56], uint64(rec.MaxRowID))
-	binary.LittleEndian.PutUint32(buf[56:60], math.Float32bits(rec.MinNorm2))
-	binary.LittleEndian.PutUint32(buf[60:64], math.Float32bits(rec.MaxNorm2))
+	binary.LittleEndian.PutUint32(buf[blockRecordClusterID:], uint32(rec.ClusterID))
+	binary.LittleEndian.PutUint64(buf[blockRecordFirstRowOrdinal:], rec.FirstRowOrdinal)
+	binary.LittleEndian.PutUint32(buf[blockRecordRowCount:], uint32(rec.RowCount))
+	binary.LittleEndian.PutUint64(buf[blockRecordDataOffset:], uint64(rec.DataOffset))
+	binary.LittleEndian.PutUint64(buf[blockRecordDataBytes:], uint64(rec.DataBytes))
+	binary.LittleEndian.PutUint64(buf[blockRecordMinRowID:], uint64(rec.MinRowID))
+	binary.LittleEndian.PutUint64(buf[blockRecordMaxRowID:], uint64(rec.MaxRowID))
+	binary.LittleEndian.PutUint32(buf[blockRecordMinNorm2:], math.Float32bits(rec.MinNorm2))
+	binary.LittleEndian.PutUint32(buf[blockRecordMaxNorm2:], math.Float32bits(rec.MaxNorm2))
 	copy(buf[segmentBlockMetaRecordFixed:], rec.Stats)
 	if _, err := w.file.Write(buf); err != nil {
 		return err

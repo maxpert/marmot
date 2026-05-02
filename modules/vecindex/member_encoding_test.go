@@ -1,6 +1,7 @@
 package vecindex
 
 import (
+	"encoding/binary"
 	"math"
 	"path/filepath"
 	"testing"
@@ -297,6 +298,66 @@ func TestStableMemberQueryScorerPQBlockLowerBoundForDotInternalL2(t *testing.T) 
 	}
 	query := metric.AugmentQuery(rawQuery, nil)
 	assertBlockLowerBoundCoversRows(t, codec, query, metric.Norm2(query), 1, block, blobs)
+}
+
+func TestStableMemberQueryScorerPQBlockLowerBoundProductionShapeMasks(t *testing.T) {
+	t.Parallel()
+
+	spec := IVFSpec{ID: "idx", Dim: StablePQMinInternalDim, Metric: MetricL2, Nlist: 1, Nprobe: 1}
+	centroid := make([]float32, spec.InternalDim())
+	cs, err := kmeans.NewCentroidSet(1, [][]float32{centroid})
+	if err != nil {
+		t.Fatalf("NewCentroidSet: %v", err)
+	}
+	pq := productionShapePQCodec(spec.InternalDim())
+	codec, err := NewStableMemberCodec(spec, cs, MemberEncodingResidualPQ8, pq)
+	if err != nil {
+		t.Fatalf("NewStableMemberCodec: %v", err)
+	}
+
+	scale := float32(0.001)
+	rows := make([][]float32, 4)
+	for i, code := range []int{0, 64, 128, 255} {
+		row := make([]float32, spec.InternalDim())
+		row[0] = float32(code) * scale
+		rows[i] = row
+	}
+	block, blobs := blockRecordForEncodedRows(t, spec, codec, 1, rows)
+	for _, code := range []int{0, 64, 128, 255} {
+		word := code / 64
+		bit := uint(code % 64)
+		mask := binary.LittleEndian.Uint64(block.Stats[word*8:])
+		if mask&(uint64(1)<<bit) == 0 {
+			t.Fatalf("PQ mask missing code %d", code)
+		}
+	}
+	query := make([]float32, spec.InternalDim())
+	for i := range query {
+		query[i] = float32((i*11)%23) * scale
+	}
+	assertBlockLowerBoundCoversRows(t, codec, query, metric.Norm2(query), 1, block, blobs)
+}
+
+func productionShapePQCodec(dim int) *quantize.PQ8Codec {
+	m := quantize.DefaultPQ8Subquantizers
+	offsets := make([]int, m+1)
+	for i := range offsets {
+		offsets[i] = i * dim / m
+	}
+	codebooks := make([]float32, 0, quantize.PQ8CodebookSize*dim)
+	for sub := 0; sub < m; sub++ {
+		width := offsets[sub+1] - offsets[sub]
+		for code := 0; code < quantize.PQ8CodebookSize; code++ {
+			for d := 0; d < width; d++ {
+				value := float32(0)
+				if d == 0 {
+					value = float32(code) * 0.001
+				}
+				codebooks = append(codebooks, value)
+			}
+		}
+	}
+	return &quantize.PQ8Codec{Dim: dim, M: m, Offsets: offsets, Codebooks: codebooks}
 }
 
 func blockRecordForEncodedRows(t *testing.T, spec IVFSpec, codec *StableMemberCodec, clusterID int64, rows [][]float32) (SegmentBlockRecord, [][]byte) {

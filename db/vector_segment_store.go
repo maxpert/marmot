@@ -30,25 +30,33 @@ type OpenedSegmentGeneration struct {
 	StableCodec     *vecindex.StableMemberCodec
 }
 
-func segmentGenerationFromOpened(opened *OpenedSegmentGeneration) *vecindex.SegmentGeneration {
-	if opened == nil || opened.Manifest == nil {
+func (g *OpenedSegmentGeneration) TakeGeneration() *vecindex.SegmentGeneration {
+	if g == nil || g.Manifest == nil {
 		return nil
 	}
-	return &vecindex.SegmentGeneration{
-		Data:                     opened.Data,
-		RowMap:                   opened.RowMap,
-		Blocks:                   opened.Blocks,
-		ProbeCentroids:           opened.ProbeCentroids,
-		StableCentroids:          opened.StableCentroids,
-		StableCodec:              opened.StableCodec,
-		AppliedOverlaySeq:        opened.Manifest.AppliedOverlaySeq,
-		ClusterRowCounts:         append([]uint64(nil), opened.Manifest.ClusterRowCounts...),
-		ClusterVectorSums:        cloneClusterVectorSums(opened.Manifest.ClusterVectorSums),
-		RowsModifiedSinceRebuild: opened.Manifest.RowsModifiedSinceRebuild,
-		LastRebuildRowCount:      opened.Manifest.LastRebuildRowCount,
-		ConsecutiveSkewCycles:    opened.Manifest.ConsecutiveSkewCycles,
-		LayoutHotClusters:        int64Slice(opened.Manifest.LayoutHotClusters),
+	generation := &vecindex.SegmentGeneration{
+		Data:                     g.Data,
+		RowMap:                   g.RowMap,
+		Blocks:                   g.Blocks,
+		ProbeCentroids:           g.ProbeCentroids,
+		StableCentroids:          g.StableCentroids,
+		StableCodec:              g.StableCodec,
+		AppliedOverlaySeq:        g.Manifest.AppliedOverlaySeq,
+		ClusterRowCounts:         append([]uint64(nil), g.Manifest.ClusterRowCounts...),
+		ClusterVectorSums:        cloneClusterVectorSums(g.Manifest.ClusterVectorSums),
+		RowsModifiedSinceRebuild: g.Manifest.RowsModifiedSinceRebuild,
+		LastRebuildRowCount:      g.Manifest.LastRebuildRowCount,
+		ConsecutiveSkewCycles:    g.Manifest.ConsecutiveSkewCycles,
+		LayoutHotClusters:        int64Slice(g.Manifest.LayoutHotClusters),
 	}
+	g.Data = nil
+	g.RowMap = nil
+	g.Blocks = nil
+	return generation
+}
+
+func segmentGenerationFromOpened(opened *OpenedSegmentGeneration) *vecindex.SegmentGeneration {
+	return opened.TakeGeneration()
 }
 
 const segmentLayoutSeed uint64 = 0x9e3779b97f4a7c15
@@ -77,7 +85,28 @@ func (g *OpenedSegmentGeneration) Close() error {
 	return firstErr
 }
 
-func publishSegmentGeneration(dir string, manifest vecindex.SegmentManifest, dataTmpPath, rowMapTmpPath, blockTmpPath string) error {
+type segmentGenerationArtifacts struct {
+	dataPath   string
+	rowMapPath string
+	blockPath  string
+}
+
+type segmentGenerationStaging struct {
+	dir       string
+	artifacts segmentGenerationArtifacts
+}
+
+func (s *segmentGenerationStaging) cleanup() {
+	if s == nil || s.dir == "" {
+		return
+	}
+	_ = os.RemoveAll(s.dir)
+}
+
+func publishSegmentGeneration(dir string, manifest vecindex.SegmentManifest, artifacts segmentGenerationArtifacts) error {
+	dataTmpPath := artifacts.dataPath
+	rowMapTmpPath := artifacts.rowMapPath
+	blockTmpPath := artifacts.blockPath
 	if dataTmpPath == "" || rowMapTmpPath == "" {
 		return fmt.Errorf("segment publish: temp paths must not be empty")
 	}
@@ -707,15 +736,19 @@ func nextSegmentGeneration(dir string) (uint64, error) {
 	return manifest.Generation + 1, nil
 }
 
-func createSegmentGenerationStaging(dir string, generation uint64) (string, string, string, string, error) {
+func createSegmentGenerationStaging(dir string, generation uint64) (*segmentGenerationStaging, error) {
 	stagingDir := filepath.Join(dir, "staging", fmt.Sprintf("gen-%020d-%d", generation, time.Now().UnixNano()))
 	if err := os.MkdirAll(stagingDir, 0o755); err != nil {
-		return "", "", "", "", err
+		return nil, err
 	}
-	dataPath := filepath.Join(stagingDir, filepath.Base(vecindex.SegmentDataPath(dir, generation)))
-	rowMapPath := filepath.Join(stagingDir, filepath.Base(vecindex.SegmentRowMapPath(dir, generation)))
-	blockPath := filepath.Join(stagingDir, filepath.Base(vecindex.SegmentBlockPath(dir, generation)))
-	return stagingDir, dataPath, rowMapPath, blockPath, nil
+	return &segmentGenerationStaging{
+		dir: stagingDir,
+		artifacts: segmentGenerationArtifacts{
+			dataPath:   filepath.Join(stagingDir, filepath.Base(vecindex.SegmentDataPath(dir, generation))),
+			rowMapPath: filepath.Join(stagingDir, filepath.Base(vecindex.SegmentRowMapPath(dir, generation))),
+			blockPath:  filepath.Join(stagingDir, filepath.Base(vecindex.SegmentBlockPath(dir, generation))),
+		},
+	}, nil
 }
 
 func RebuildSegmentGeneration(
@@ -746,12 +779,12 @@ func RebuildSegmentGeneration(
 		return nil, nil
 	}
 
-	stagingDir, dataPath, rowMapPath, blockPath, err := createSegmentGenerationStaging(dir, generation)
+	staging, err := createSegmentGenerationStaging(dir, generation)
 	if err != nil {
 		return nil, fmt.Errorf("segment generation rebuild: create staging: %w", err)
 	}
-	defer os.RemoveAll(stagingDir)
-	rowMapWriter, err := vecindex.CreateSegmentRowMapWriter(rowMapPath, expectedEpoch, generation)
+	defer staging.cleanup()
+	rowMapWriter, err := vecindex.CreateSegmentRowMapWriter(staging.artifacts.rowMapPath, expectedEpoch, generation)
 	if err != nil {
 		return nil, err
 	}
@@ -861,7 +894,7 @@ SELECT rowid, %s
 		return nil, fmt.Errorf("segment generation rebuild: build stable codec: %w", err)
 	}
 	dataWriter, err := vecindex.CreateSegmentDataWriter(
-		dataPath,
+		staging.artifacts.dataPath,
 		spec.InternalMetric(),
 		stableCodec.Encoding(),
 		spec.Dim,
@@ -876,7 +909,7 @@ SELECT rowid, %s
 	}
 	defer dataWriter.Abort()
 	blockWriter, err := vecindex.CreateSegmentBlockMetaWriter(
-		blockPath,
+		staging.artifacts.blockPath,
 		spec,
 		stableCodec,
 		vecindex.DefaultSegmentBlockRows(stableCodec.Encoding()),
@@ -1008,7 +1041,7 @@ SELECT rowid, %s
 		BlockRows:                uint32(blockStore.BlockRows()),
 		CreatedAtUnixNano:        time.Now().UnixNano(),
 	}
-	if err := publishSegmentGeneration(dir, manifest, dataStore.Path(), rowMapStore.Path(), blockStore.Path()); err != nil {
+	if err := publishSegmentGeneration(dir, manifest, staging.artifacts); err != nil {
 		_ = dataStore.Close()
 		_ = rowMapStore.Close()
 		_ = blockStore.Close()

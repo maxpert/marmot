@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+	"math/bits"
 	"math/rand"
 	"runtime"
 	"sync"
@@ -13,7 +14,7 @@ import (
 
 const (
 	DefaultPQ8Subquantizers = 128
-	pq8CodebookSize         = 256
+	PQ8CodebookSize         = 256
 	defaultPQ8MaxIter       = 8
 )
 
@@ -134,7 +135,7 @@ func (c *PQ8Codec) Validate() error {
 		if c.Offsets[m+1] <= c.Offsets[m] {
 			return fmt.Errorf("quantize: invalid PQ subspace %d", m)
 		}
-		want += pq8CodebookSize * (c.Offsets[m+1] - c.Offsets[m])
+		want += PQ8CodebookSize * (c.Offsets[m+1] - c.Offsets[m])
 	}
 	if len(c.Codebooks) != want {
 		return fmt.Errorf("quantize: PQ codebook length mismatch: got=%d want=%d", len(c.Codebooks), want)
@@ -238,14 +239,14 @@ func NewPQ8QueryScorer(rankMetric metric.Metric, query []float32, queryNorm2 flo
 	if len(query) != codec.Dim {
 		return nil, fmt.Errorf("quantize: PQ scorer dim mismatch")
 	}
-	lut := make([]float32, codec.M*pq8CodebookSize)
+	lut := make([]float32, codec.M*PQ8CodebookSize)
 	codebookOffsets := codec.codebookBases()
 	for sub := 0; sub < codec.M; sub++ {
 		start, end := codec.Offsets[sub], codec.Offsets[sub+1]
 		width := end - start
 		codebookStart := codebookOffsets[sub]
-		lutStart := sub * pq8CodebookSize
-		for code := 0; code < pq8CodebookSize; code++ {
+		lutStart := sub * PQ8CodebookSize
+		for code := 0; code < PQ8CodebookSize; code++ {
 			cb := codec.Codebooks[codebookStart+code*width : codebookStart+(code+1)*width]
 			var dot float32
 			for d := start; d < end; d++ {
@@ -269,13 +270,6 @@ func NewPQ8QueryScorer(rankMetric metric.Metric, query []float32, queryNorm2 flo
 	}, nil
 }
 
-func (q *PQ8QueryScorer) DotLUT() []float32 {
-	if q == nil {
-		return nil
-	}
-	return q.lut
-}
-
 func (q *PQ8QueryScorer) ClusterScorer(query, centroid []float32) (*PQ8Scorer, error) {
 	if q == nil {
 		return nil, fmt.Errorf("quantize: PQ query scorer is nil")
@@ -294,6 +288,29 @@ func (q *PQ8QueryScorer) ClusterScorer(query, centroid []float32) (*PQ8Scorer, e
 	}, nil
 }
 
+func (q *PQ8QueryScorer) MaxDotForCodeMask(subquantizer int, maskWords []uint64) (float32, bool) {
+	if q == nil || subquantizer < 0 || subquantizer >= q.m || len(maskWords) == 0 {
+		return 0, false
+	}
+	lutBase := subquantizer * PQ8CodebookSize
+	best := -float32(math.MaxFloat32)
+	found := false
+	for wordIdx, mask := range maskWords {
+		for mask != 0 {
+			bit := bits.TrailingZeros64(mask)
+			code := wordIdx*64 + bit
+			if code < PQ8CodebookSize {
+				if value := q.lut[lutBase+code]; value > best {
+					best = value
+				}
+				found = true
+			}
+			mask &= mask - 1
+		}
+	}
+	return best, found
+}
+
 func (s *PQ8Scorer) Distance(blob []byte) (float32, error) {
 	if s == nil {
 		return 0, fmt.Errorf("quantize: PQ scorer is nil")
@@ -305,7 +322,7 @@ func (s *PQ8Scorer) Distance(blob []byte) (float32, error) {
 	lutOffset := 0
 	for sub := 0; sub < s.m; sub++ {
 		dot += s.lut[lutOffset+int(blob[s.codeOffset+sub])]
-		lutOffset += pq8CodebookSize
+		lutOffset += PQ8CodebookSize
 	}
 	switch s.rankMetric {
 	case metric.MetricCosine:
@@ -348,7 +365,7 @@ func (s *PQ8Scorer) ScoreSpan(rows []byte, entrySize int, out []float32) error {
 			lutOffset := 0
 			for sub := 0; sub < s.m; sub++ {
 				dot += s.lut[lutOffset+int(rows[codeCursor+sub])]
-				lutOffset += pq8CodebookSize
+				lutOffset += PQ8CodebookSize
 			}
 			if s.storeNorm {
 				norm2 := math.Float32frombits(binary.LittleEndian.Uint32(rows[payloadCursor : payloadCursor+4]))
@@ -371,7 +388,7 @@ func (s *PQ8Scorer) ScoreSpan(rows []byte, entrySize int, out []float32) error {
 			lutOffset := 0
 			for sub := 0; sub < s.m; sub++ {
 				dot += s.lut[lutOffset+int(rows[codeCursor+sub])]
-				lutOffset += pq8CodebookSize
+				lutOffset += PQ8CodebookSize
 			}
 			out[i] = s.queryNorm2 + norm2 - 2*dot
 			cursor += entrySize
@@ -402,7 +419,7 @@ func pqOffsets(dim, m int) []int {
 func pqCodebookOffset(offsets []int, sub int) int {
 	var off int
 	for i := 0; i < sub; i++ {
-		off += pq8CodebookSize * (offsets[i+1] - offsets[i])
+		off += PQ8CodebookSize * (offsets[i+1] - offsets[i])
 	}
 	return off
 }
@@ -410,7 +427,7 @@ func pqCodebookOffset(offsets []int, sub int) int {
 func pqCodebookOffsets(offsets []int) []int {
 	out := make([]int, len(offsets))
 	for i := 0; i < len(offsets)-1; i++ {
-		out[i+1] = out[i] + pq8CodebookSize*(offsets[i+1]-offsets[i])
+		out[i+1] = out[i] + PQ8CodebookSize*(offsets[i+1]-offsets[i])
 	}
 	return out
 }
@@ -434,7 +451,7 @@ func (c *PQ8Codec) nearestCodeForResidual(sub int, vec, centroid []float32) int 
 	codebookStart := c.codebookBases()[sub]
 	best := 0
 	bestDist := float32(math.MaxFloat32)
-	for code := 0; code < pq8CodebookSize; code++ {
+	for code := 0; code < PQ8CodebookSize; code++ {
 		cb := c.Codebooks[codebookStart+code*width : codebookStart+(code+1)*width]
 		var dist float32
 		for d := start; d < end; d++ {
@@ -454,20 +471,20 @@ func trainPQ8Subspace(vectors [][]float32, start, end, maxIter int, seed uint64,
 	if width <= 0 {
 		return fmt.Errorf("quantize: invalid PQ subspace")
 	}
-	if len(dst) != pq8CodebookSize*width {
+	if len(dst) != PQ8CodebookSize*width {
 		return fmt.Errorf("quantize: PQ subspace dst length mismatch")
 	}
 	n := len(vectors)
 	rng := rand.New(rand.NewSource(int64(seed)))
 	perm := rng.Perm(n)
-	active := pq8CodebookSize
+	active := PQ8CodebookSize
 	if n < active {
 		active = n
 	}
 	for code := 0; code < active; code++ {
 		copy(dst[code*width:(code+1)*width], vectors[perm[code]][start:end])
 	}
-	for code := active; code < pq8CodebookSize; code++ {
+	for code := active; code < PQ8CodebookSize; code++ {
 		copy(dst[code*width:(code+1)*width], dst[(code%active)*width:((code%active)+1)*width])
 	}
 	if maxIter <= 0 {
@@ -514,7 +531,7 @@ func trainPQ8Subspace(vectors [][]float32, start, end, maxIter int, seed uint64,
 			}
 		}
 	}
-	for code := active; code < pq8CodebookSize; code++ {
+	for code := active; code < PQ8CodebookSize; code++ {
 		copy(dst[code*width:(code+1)*width], dst[(code%active)*width:((code%active)+1)*width])
 	}
 	return nil

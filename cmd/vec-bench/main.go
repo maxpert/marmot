@@ -458,6 +458,8 @@ func main() {
 		if err := h.refreshIndexTuning(); err != nil {
 			fatal("refreshIndexTuning: %v", err)
 		}
+	} else {
+		plog("  milestone: settle wait disabled; read measurement may include bootstrap or overlay-tail state")
 	}
 	if cfg.overlayTailRows > 0 {
 		if err := h.applyOverlayTail(cfg.overlayTailRows); err != nil {
@@ -1505,6 +1507,7 @@ func (h *harness) runQueryPhase() error {
 	plog("=== results ===")
 	plog("  config: nlist=%d nprobe=%d metric=%s dim=%d K=%d concurrency=%d projection=%s payload_bytes=%d",
 		h.cfg.nlist, h.cfg.nprobe, h.cfg.metric, h.meta.Dim, h.cfg.k, h.cfg.queryConc, h.cfg.projection, h.cfg.payloadBytes)
+	plog("  settle: waited=%t timeout=%s", h.cfg.settleTimeout > 0, h.cfg.settleTimeout)
 	if segmentStats := h.currentSegmentEncodingStats(); segmentStats != nil {
 		plog("  stable encoding: %s payload_bytes/vector=%d entry_bytes/vector=%d rows=%d data_file_bytes=%d",
 			segmentStats.encodingName, segmentStats.payloadBytes, segmentStats.entryBytes, segmentStats.rowCount, segmentStats.dataFileBytes)
@@ -1525,10 +1528,11 @@ func (h *harness) runQueryPhase() error {
 				float64(stats.segmentStats.ReadBytes)/float64(stats.segmentStats.LogicalBytes))
 		}
 		if len(stats.lats) > 0 && stats.segmentStats.BlocksConsidered > 0 {
-			plog("  block pruning: meta_bytes/query=%d meta_reads/query=%.2f blocks_considered/query=%.2f blocks_skipped/query=%.2f blocks_scored/query=%.2f rows_scored/query=%.0f",
+			plog("  block pruning: meta_bytes/query=%d meta_reads/query=%.2f blocks_considered/query=%.2f blocks_would_skip/query=%.2f blocks_skipped/query=%.2f blocks_scored/query=%.2f rows_scored/query=%.0f",
 				stats.segmentStats.BlockMetaReadBytes/uint64(len(stats.lats)),
 				float64(stats.segmentStats.BlockMetaReads)/float64(len(stats.lats)),
 				float64(stats.segmentStats.BlocksConsidered)/float64(len(stats.lats)),
+				float64(stats.segmentStats.BlocksWouldSkip)/float64(len(stats.lats)),
 				float64(stats.segmentStats.BlocksSkipped)/float64(len(stats.lats)),
 				float64(stats.segmentStats.BlocksScored)/float64(len(stats.lats)),
 				float64(stats.segmentStats.BlockRowsScored)/float64(len(stats.lats)))
@@ -1758,6 +1762,7 @@ func (h *harness) runQueries(sess *protocol.ConnectionSession, querySQL string, 
 		segmentStats.BlockMetaReadBytes = blockStats.MetaReadBytes
 		segmentStats.BlockMetaReads = blockStats.MetaReads
 		segmentStats.BlocksConsidered = blockStats.Considered
+		segmentStats.BlocksWouldSkip = blockStats.WouldSkip
 		segmentStats.BlocksSkipped = blockStats.Skipped
 		segmentStats.BlocksScored = blockStats.Scored
 		segmentStats.BlockRowsScored = blockStats.RowsScored

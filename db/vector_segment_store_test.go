@@ -298,7 +298,10 @@ func TestOpenSegmentGenerationResidualPQ8(t *testing.T) {
 		ClusterVectorSums:     [][]float32{nil, append([]float32(nil), vec...)},
 		CreatedAtUnixNano:     1,
 	}
-	if err := publishSegmentGeneration(dir, manifest, dataStore.Path(), rowMapStore.Path(), ""); err != nil {
+	if err := publishSegmentGeneration(dir, manifest, segmentGenerationArtifacts{
+		dataPath:   dataStore.Path(),
+		rowMapPath: rowMapStore.Path(),
+	}); err != nil {
 		t.Fatalf("publishSegmentGeneration: %v", err)
 	}
 
@@ -415,13 +418,16 @@ func TestBuildIncrementalSegmentGeneration_RewritesTouchedClustersOnly(t *testin
 		t.Fatalf("BuildIncrementalSegmentGeneration: %v", err)
 	}
 	defer pending.Close()
-	if _, err := os.Stat(pending.stagingDir); err != nil {
+	if pending.staging == nil {
+		t.Fatalf("pending staging is nil")
+	}
+	if _, err := os.Stat(pending.staging.dir); err != nil {
 		t.Fatalf("pending staging dir missing before publish: %v", err)
 	}
 	if err := pending.Publish(); err != nil {
 		t.Fatalf("publish incremental generation: %v", err)
 	}
-	if _, err := os.Stat(pending.stagingDir); !os.IsNotExist(err) {
+	if _, err := os.Stat(pending.staging.dir); !os.IsNotExist(err) {
 		t.Fatalf("pending staging dir exists after publish: %v", err)
 	}
 	next := pending.generation

@@ -41,11 +41,8 @@ type pendingSegmentGeneration struct {
 	meta       common.VectorIndexMeta
 	spec       vecindex.IVFSpec
 	dir        string
-	stagingDir string
+	staging    *segmentGenerationStaging
 	manifest   vecindex.SegmentManifest
-	dataPath   string
-	rowMapPath string
-	blockPath  string
 	generation *vecindex.SegmentGeneration
 	published  bool
 }
@@ -58,7 +55,10 @@ func (p *pendingSegmentGeneration) Publish() error {
 		_ = p.generation.Close()
 		p.generation = nil
 	}
-	if err := publishSegmentGeneration(p.dir, p.manifest, p.dataPath, p.rowMapPath, p.blockPath); err != nil {
+	if p.staging == nil {
+		return fmt.Errorf("incremental segment generation: staging artifacts are nil")
+	}
+	if err := publishSegmentGeneration(p.dir, p.manifest, p.staging.artifacts); err != nil {
 		return err
 	}
 	opened, err := openSegmentGeneration(p.dir, p.meta, p.spec, p.manifest.ProbeEpochValue())
@@ -67,9 +67,7 @@ func (p *pendingSegmentGeneration) Publish() error {
 	}
 	p.generation = segmentGenerationFromOpened(opened)
 	p.published = true
-	if p.stagingDir != "" {
-		_ = os.RemoveAll(p.stagingDir)
-	}
+	p.staging.cleanup()
 	return nil
 }
 
@@ -81,18 +79,7 @@ func (p *pendingSegmentGeneration) Close() {
 		_ = p.generation.Close()
 	}
 	if !p.published {
-		if p.dataPath != "" {
-			_ = os.Remove(p.dataPath)
-		}
-		if p.rowMapPath != "" {
-			_ = os.Remove(p.rowMapPath)
-		}
-		if p.blockPath != "" {
-			_ = os.Remove(p.blockPath)
-		}
-		if p.stagingDir != "" {
-			_ = os.RemoveAll(p.stagingDir)
-		}
+		p.staging.cleanup()
 	}
 }
 
@@ -216,18 +203,18 @@ func buildIncrementalSegmentGenerationFromMutations(
 	if err != nil {
 		return nil, fmt.Errorf("incremental segment generation: encode stable codec metadata: %w", err)
 	}
-	stagingDir, dataPath, rowMapPath, blockPath, err := createSegmentGenerationStaging(dir, generation)
+	staging, err := createSegmentGenerationStaging(dir, generation)
 	if err != nil {
 		return nil, fmt.Errorf("incremental segment generation: create staging: %w", err)
 	}
 	keepStaging := false
 	defer func() {
 		if !keepStaging {
-			_ = os.RemoveAll(stagingDir)
+			staging.cleanup()
 		}
 	}()
 	dataWriter, err := vecindex.CreateSegmentDataWriter(
-		dataPath,
+		staging.artifacts.dataPath,
 		spec.InternalMetric(),
 		stableCodec.Encoding(),
 		spec.Dim,
@@ -242,7 +229,7 @@ func buildIncrementalSegmentGenerationFromMutations(
 	}
 	defer dataWriter.Abort()
 	blockWriter, err := vecindex.CreateSegmentBlockMetaWriter(
-		blockPath,
+		staging.artifacts.blockPath,
 		spec,
 		stableCodec,
 		vecindex.DefaultSegmentBlockRows(stableCodec.Encoding()),
@@ -255,7 +242,7 @@ func buildIncrementalSegmentGenerationFromMutations(
 	}
 	defer blockWriter.Abort()
 
-	rowMapWriter, err := vecindex.CreateSegmentRowMapWriter(rowMapPath, stableCS.Epoch(), generation)
+	rowMapWriter, err := vecindex.CreateSegmentRowMapWriter(staging.artifacts.rowMapPath, stableCS.Epoch(), generation)
 	if err != nil {
 		return nil, err
 	}
@@ -458,14 +445,11 @@ func buildIncrementalSegmentGenerationFromMutations(
 	}
 	keepStaging = true
 	return &pendingSegmentGeneration{
-		meta:       meta,
-		spec:       spec,
-		dir:        dir,
-		stagingDir: stagingDir,
-		manifest:   manifest,
-		dataPath:   dataStore.Path(),
-		rowMapPath: rowMapStore.Path(),
-		blockPath:  blockStore.Path(),
+		meta:     meta,
+		spec:     spec,
+		dir:      dir,
+		staging:  staging,
+		manifest: manifest,
 		generation: &vecindex.SegmentGeneration{
 			Data:                     dataStore,
 			RowMap:                   rowMapStore,

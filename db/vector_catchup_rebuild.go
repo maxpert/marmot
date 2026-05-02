@@ -393,14 +393,14 @@ func BuildHierarchicalCatchUpSegmentGeneration(
 	if err != nil {
 		return nil, nil, fmt.Errorf("hierarchical catch-up: next generation: %w", err)
 	}
-	stagingDir, dataPath, rowMapPath, blockPath, err := createSegmentGenerationStaging(dir, generation)
+	staging, err := createSegmentGenerationStaging(dir, generation)
 	if err != nil {
 		return nil, nil, fmt.Errorf("hierarchical catch-up: create staging: %w", err)
 	}
 	keepStaging := false
 	defer func() {
 		if !keepStaging {
-			_ = os.RemoveAll(stagingDir)
+			staging.cleanup()
 		}
 	}()
 
@@ -460,7 +460,7 @@ func BuildHierarchicalCatchUpSegmentGeneration(
 		return nil, nil, fmt.Errorf("hierarchical catch-up: build stable codec: %w", err)
 	}
 	dataWriter, err := vecindex.CreateSegmentDataWriter(
-		dataPath,
+		staging.artifacts.dataPath,
 		spec.InternalMetric(),
 		stableCodec.Encoding(),
 		spec.Dim,
@@ -475,7 +475,7 @@ func BuildHierarchicalCatchUpSegmentGeneration(
 	}
 	defer dataWriter.Abort()
 	blockWriter, err := vecindex.CreateSegmentBlockMetaWriter(
-		blockPath,
+		staging.artifacts.blockPath,
 		spec,
 		stableCodec,
 		vecindex.DefaultSegmentBlockRows(stableCodec.Encoding()),
@@ -570,7 +570,7 @@ func BuildHierarchicalCatchUpSegmentGeneration(
 			return 0
 		}
 	})
-	rowMapWriter, err := vecindex.CreateSegmentRowMapWriter(rowMapPath, epoch, generation)
+	rowMapWriter, err := vecindex.CreateSegmentRowMapWriter(staging.artifacts.rowMapPath, epoch, generation)
 	if err != nil {
 		_ = dataStore.Close()
 		_ = blockStore.Close()
@@ -620,14 +620,11 @@ func BuildHierarchicalCatchUpSegmentGeneration(
 	}
 	keepStaging = true
 	pending := &pendingSegmentGeneration{
-		meta:       meta,
-		spec:       spec,
-		dir:        dir,
-		stagingDir: stagingDir,
-		manifest:   manifest,
-		dataPath:   dataStore.Path(),
-		rowMapPath: rowMapStore.Path(),
-		blockPath:  blockStore.Path(),
+		meta:     meta,
+		spec:     spec,
+		dir:      dir,
+		staging:  staging,
+		manifest: manifest,
 		generation: &vecindex.SegmentGeneration{
 			Data:                     dataStore,
 			RowMap:                   rowMapStore,

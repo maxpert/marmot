@@ -83,8 +83,8 @@ func TestPQ8ValidationRejectsMalformedCodec(t *testing.T) {
 
 	cases := []*PQ8Codec{
 		nil,
-		{Dim: 0, M: 1, Offsets: []int{0, 1}, Codebooks: make([]float32, pq8CodebookSize)},
-		{Dim: 4, M: 5, Offsets: []int{0, 1, 2, 3, 4, 5}, Codebooks: make([]float32, pq8CodebookSize*5)},
+		{Dim: 0, M: 1, Offsets: []int{0, 1}, Codebooks: make([]float32, PQ8CodebookSize)},
+		{Dim: 4, M: 5, Offsets: []int{0, 1, 2, 3, 4, 5}, Codebooks: make([]float32, PQ8CodebookSize*5)},
 		{Dim: 4, M: 2, Offsets: []int{0, 3, 4}, Codebooks: make([]float32, 1)},
 	}
 	for i, codec := range cases {
