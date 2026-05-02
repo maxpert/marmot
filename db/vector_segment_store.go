@@ -24,6 +24,7 @@ type OpenedSegmentGeneration struct {
 	Manifest        *vecindex.SegmentManifest
 	Data            *vecindex.SegmentDataStore
 	RowMap          *vecindex.SegmentRowMap
+	Blocks          *vecindex.SegmentBlockMetaStore
 	ProbeCentroids  *kmeans.CentroidSet
 	StableCentroids *kmeans.CentroidSet
 	StableCodec     *vecindex.StableMemberCodec
@@ -36,6 +37,7 @@ func segmentGenerationFromOpened(opened *OpenedSegmentGeneration) *vecindex.Segm
 	return &vecindex.SegmentGeneration{
 		Data:                     opened.Data,
 		RowMap:                   opened.RowMap,
+		Blocks:                   opened.Blocks,
 		ProbeCentroids:           opened.ProbeCentroids,
 		StableCentroids:          opened.StableCentroids,
 		StableCodec:              opened.StableCodec,
@@ -67,10 +69,15 @@ func (g *OpenedSegmentGeneration) Close() error {
 			firstErr = err
 		}
 	}
+	if g.Blocks != nil {
+		if err := g.Blocks.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
 	return firstErr
 }
 
-func publishSegmentGeneration(dir string, manifest vecindex.SegmentManifest, dataTmpPath, rowMapTmpPath string) error {
+func publishSegmentGeneration(dir string, manifest vecindex.SegmentManifest, dataTmpPath, rowMapTmpPath, blockTmpPath string) error {
 	if dataTmpPath == "" || rowMapTmpPath == "" {
 		return fmt.Errorf("segment publish: temp paths must not be empty")
 	}
@@ -95,8 +102,9 @@ func publishSegmentGeneration(dir string, manifest vecindex.SegmentManifest, dat
 
 	dataDir := filepath.Join(dir, "segments")
 	rowMapDir := filepath.Join(dir, "rowmap")
+	blockDir := filepath.Join(dir, "blocks")
 	manifestDir := filepath.Join(dir, "manifest")
-	for _, path := range []string{dataDir, rowMapDir, manifestDir} {
+	for _, path := range []string{dataDir, rowMapDir, blockDir, manifestDir} {
 		if err := os.MkdirAll(path, 0o755); err != nil {
 			return err
 		}
@@ -106,6 +114,13 @@ func publishSegmentGeneration(dir string, manifest vecindex.SegmentManifest, dat
 	finalRowMapPath := vecindex.SegmentRowMapPath(dir, manifest.Generation)
 	manifest.DataFile = filepath.Base(finalDataPath)
 	manifest.RowMapFile = filepath.Base(finalRowMapPath)
+	if blockTmpPath != "" {
+		finalBlockPath := vecindex.SegmentBlockPath(dir, manifest.Generation)
+		manifest.BlockMetaFile = filepath.Base(finalBlockPath)
+		if manifest.BlockRows == 0 {
+			return fmt.Errorf("segment publish: block rows missing")
+		}
+	}
 
 	if manifest.DataFileSize != 0 && manifest.DataFileSize != uint64(dataInfo.Size()) {
 		return fmt.Errorf("segment publish: data size mismatch: temp=%d manifest=%d", dataInfo.Size(), manifest.DataFileSize)
@@ -118,6 +133,23 @@ func publishSegmentGeneration(dir string, manifest vecindex.SegmentManifest, dat
 	}
 	if manifest.RowMapFileSize == 0 {
 		manifest.RowMapFileSize = uint64(rowMapInfo.Size())
+	}
+	var blockInfo os.FileInfo
+	if blockTmpPath != "" {
+		var err error
+		blockInfo, err = os.Stat(blockTmpPath)
+		if err != nil {
+			return fmt.Errorf("segment publish: stat temp blocks: %w", err)
+		}
+		if blockInfo.IsDir() {
+			return fmt.Errorf("segment publish: temp blocks path is a directory")
+		}
+		if manifest.BlockMetaFileSize != 0 && manifest.BlockMetaFileSize != uint64(blockInfo.Size()) {
+			return fmt.Errorf("segment publish: block size mismatch: temp=%d manifest=%d", blockInfo.Size(), manifest.BlockMetaFileSize)
+		}
+		if manifest.BlockMetaFileSize == 0 {
+			manifest.BlockMetaFileSize = uint64(blockInfo.Size())
+		}
 	}
 
 	dataHash, err := sha256File(dataTmpPath)
@@ -137,6 +169,16 @@ func publishSegmentGeneration(dir string, manifest vecindex.SegmentManifest, dat
 		return fmt.Errorf("segment publish: rowmap checksum mismatch")
 	}
 	manifest.RowMapFileSHA256 = rowMapHash
+	if blockTmpPath != "" {
+		blockHash, err := sha256File(blockTmpPath)
+		if err != nil {
+			return fmt.Errorf("segment publish: hash temp blocks: %w", err)
+		}
+		if manifest.BlockMetaFileSHA256 != "" && !strings.EqualFold(manifest.BlockMetaFileSHA256, blockHash) {
+			return fmt.Errorf("segment publish: block checksum mismatch")
+		}
+		manifest.BlockMetaFileSHA256 = blockHash
+	}
 
 	if err := syncFile(dataTmpPath); err != nil {
 		return fmt.Errorf("segment publish: sync temp data: %w", err)
@@ -156,6 +198,18 @@ func publishSegmentGeneration(dir string, manifest vecindex.SegmentManifest, dat
 	}
 	if err := syncDir(rowMapDir); err != nil {
 		return fmt.Errorf("segment publish: sync rowmap dir: %w", err)
+	}
+	if blockTmpPath != "" {
+		finalBlockPath := vecindex.SegmentBlockPath(dir, manifest.Generation)
+		if err := syncFile(blockTmpPath); err != nil {
+			return fmt.Errorf("segment publish: sync temp blocks: %w", err)
+		}
+		if err := os.Rename(blockTmpPath, finalBlockPath); err != nil {
+			return fmt.Errorf("segment publish: rename blocks: %w", err)
+		}
+		if err := syncDir(blockDir); err != nil {
+			return fmt.Errorf("segment publish: sync blocks dir: %w", err)
+		}
 	}
 
 	manifestPath := vecindex.SegmentManifestPath(dir, manifest.Generation)
@@ -214,44 +268,77 @@ func openSegmentGeneration(dir string, meta common.VectorIndexMeta, spec vecinde
 	if err := validateSegmentFile(rowMapPath, manifest.RowMapFileSize, manifest.RowMapFileSHA256); err != nil {
 		return nil, err
 	}
+	var blockStore *vecindex.SegmentBlockMetaStore
+	if manifest.BlockMetaFile != "" {
+		blockPath := filepath.Join(dir, "blocks", manifest.BlockMetaFile)
+		if err := validateSegmentFile(blockPath, manifest.BlockMetaFileSize, manifest.BlockMetaFileSHA256); err != nil {
+			return nil, err
+		}
+		blockStore, err = vecindex.OpenSegmentBlockMetaStore(blockPath)
+		if err != nil {
+			return nil, err
+		}
+	}
 	manifest.NormalizeCentroidFields()
 
 	probeCentroids, err := vecindex.DecodeCentroidBlob(manifest.ProbeBlobValue())
 	if err != nil {
+		if blockStore != nil {
+			_ = blockStore.Close()
+		}
 		return nil, fmt.Errorf("segment store decode probe centroids: %w", err)
 	}
 	stableCentroids, err := vecindex.DecodeCentroidBlob(manifest.StableBlobValue())
 	if err != nil {
+		if blockStore != nil {
+			_ = blockStore.Close()
+		}
 		return nil, fmt.Errorf("segment store decode stable centroids: %w", err)
 	}
 
 	dataStore, err := vecindex.OpenSegmentDataStore(dataPath)
 	if err != nil {
+		if blockStore != nil {
+			_ = blockStore.Close()
+		}
 		return nil, err
 	}
 	stableCodec, err := vecindex.DecodeStableMemberCodecBlob(spec, stableCentroids, dataStore.Encoding(), manifest.StableMemberCodecBlob)
 	if err != nil {
 		_ = dataStore.Close()
+		if blockStore != nil {
+			_ = blockStore.Close()
+		}
 		return nil, fmt.Errorf("segment store decode stable codec: %w", err)
 	}
 	if stableCodec.Encoding() != dataStore.Encoding() || stableCodec.EncodedSize() != dataStore.VecBytes() {
 		_ = dataStore.Close()
+		if blockStore != nil {
+			_ = blockStore.Close()
+		}
 		return nil, fmt.Errorf("segment store stable codec/header mismatch")
 	}
 	rowMap, err := vecindex.OpenSegmentRowMap(rowMapPath)
 	if err != nil {
 		_ = dataStore.Close()
+		if blockStore != nil {
+			_ = blockStore.Close()
+		}
 		return nil, err
 	}
-	if err := validateOpenedSegmentGeneration(manifest, dataStore, rowMap, probeCentroids, stableCentroids, meta, spec, expectedEpoch); err != nil {
+	if err := validateOpenedSegmentGeneration(manifest, dataStore, rowMap, blockStore, probeCentroids, stableCentroids, meta, spec, expectedEpoch); err != nil {
 		_ = dataStore.Close()
 		_ = rowMap.Close()
+		if blockStore != nil {
+			_ = blockStore.Close()
+		}
 		return nil, err
 	}
 	return &OpenedSegmentGeneration{
 		Manifest:        manifest,
 		Data:            dataStore,
 		RowMap:          rowMap,
+		Blocks:          blockStore,
 		ProbeCentroids:  probeCentroids,
 		StableCentroids: stableCentroids,
 		StableCodec:     stableCodec,
@@ -272,6 +359,7 @@ func loadCurrentManifest(dir string) (*vecindex.SegmentCurrent, *vecindex.Segmen
 		return nil, nil, err
 	}
 	if current.Version != vecindex.SegmentStoreVersion &&
+		current.Version != vecindex.SegmentStoreV3Compat() &&
 		current.Version != vecindex.SegmentStoreV2Compat() &&
 		current.Version != vecindex.SegmentStoreV1Compat() {
 		return nil, nil, fmt.Errorf("segment current version %d unsupported", current.Version)
@@ -299,6 +387,7 @@ func validateSegmentManifest(manifest *vecindex.SegmentManifest, meta common.Vec
 		return fmt.Errorf("segment manifest missing")
 	}
 	if manifest.Version != vecindex.SegmentStoreVersion &&
+		manifest.Version != vecindex.SegmentStoreV3Compat() &&
 		manifest.Version != vecindex.SegmentStoreV2Compat() &&
 		manifest.Version != vecindex.SegmentStoreV1Compat() {
 		return fmt.Errorf("segment manifest version %d unsupported", manifest.Version)
@@ -343,11 +432,17 @@ func validateSegmentManifest(manifest *vecindex.SegmentManifest, meta common.Vec
 	if !isSafeSegmentFile(manifest.RowMapFile) {
 		return fmt.Errorf("segment manifest rowmap filename is unsafe")
 	}
+	if manifest.BlockMetaFile != "" && !isSafeSegmentFile(manifest.BlockMetaFile) {
+		return fmt.Errorf("segment manifest block filename is unsafe")
+	}
 	if manifest.DataFileSize == 0 || manifest.RowMapFileSize == 0 {
 		return fmt.Errorf("segment manifest file sizes missing")
 	}
 	if manifest.DataFileSHA256 == "" || manifest.RowMapFileSHA256 == "" {
 		return fmt.Errorf("segment manifest file checksums missing")
+	}
+	if manifest.BlockMetaFile != "" && (manifest.BlockMetaFileSize == 0 || manifest.BlockMetaFileSHA256 == "") {
+		return fmt.Errorf("segment manifest block metadata incomplete")
 	}
 	return nil
 }
@@ -395,6 +490,11 @@ func validatePublishableSegmentManifest(manifest *vecindex.SegmentManifest) erro
 	if len(manifest.ClusterVectorSums) > 0 && len(manifest.ClusterVectorSums) != int(manifest.MaxCluster)+1 {
 		return fmt.Errorf("cluster vector sums metadata length mismatch")
 	}
+	if manifest.BlockMetaFile != "" {
+		if manifest.BlockMetaFileSize == 0 || manifest.BlockMetaFileSHA256 == "" || manifest.BlockRows == 0 {
+			return fmt.Errorf("block metadata fields incomplete")
+		}
+	}
 	return nil
 }
 
@@ -402,6 +502,7 @@ func validateOpenedSegmentGeneration(
 	manifest *vecindex.SegmentManifest,
 	dataStore *vecindex.SegmentDataStore,
 	rowMap *vecindex.SegmentRowMap,
+	blockStore *vecindex.SegmentBlockMetaStore,
 	probeCentroids *kmeans.CentroidSet,
 	stableCentroids *kmeans.CentroidSet,
 	meta common.VectorIndexMeta,
@@ -415,8 +516,14 @@ func validateOpenedSegmentGeneration(
 	if dataStore.Generation() != manifest.Generation || rowMap.Generation() != manifest.Generation {
 		return fmt.Errorf("segment store header generation mismatch")
 	}
+	if blockStore != nil && blockStore.Generation() != manifest.Generation {
+		return fmt.Errorf("segment block header generation mismatch")
+	}
 	if dataStore.Epoch() != manifest.StableEpochValue() || rowMap.Epoch() != manifest.StableEpochValue() {
 		return fmt.Errorf("segment store header epoch mismatch")
+	}
+	if blockStore != nil && blockStore.Epoch() != manifest.StableEpochValue() {
+		return fmt.Errorf("segment block header epoch mismatch")
 	}
 	if expectedEpoch != 0 && manifest.ProbeEpochValue() != expectedEpoch {
 		return fmt.Errorf("segment probe expected epoch mismatch")
@@ -438,6 +545,26 @@ func validateOpenedSegmentGeneration(
 	}
 	if int(manifest.MaxCluster) != dataStore.MaxCluster() {
 		return fmt.Errorf("segment store cluster count mismatch")
+	}
+	if blockStore != nil {
+		if blockStore.Metric() != dataStore.Metric() {
+			return fmt.Errorf("segment block metric mismatch")
+		}
+		if blockStore.Encoding() != dataStore.Encoding() {
+			return fmt.Errorf("segment block encoding mismatch")
+		}
+		if blockStore.Dim() != dataStore.Dim() || blockStore.InternalDim() != dataStore.InternalDim() {
+			return fmt.Errorf("segment block dimension mismatch")
+		}
+		if blockStore.MaxCluster() != dataStore.MaxCluster() {
+			return fmt.Errorf("segment block cluster count mismatch")
+		}
+		if manifest.BlockRows != 0 && uint32(blockStore.BlockRows()) != manifest.BlockRows {
+			return fmt.Errorf("segment block rows mismatch")
+		}
+		if err := blockStore.ValidateCoverage(dataStore); err != nil {
+			return fmt.Errorf("segment block coverage mismatch: %w", err)
+		}
 	}
 	if manifest.RowCount != dataStore.RowCount() || manifest.RowCount != rowMap.EntryCount() {
 		return fmt.Errorf("segment store row count mismatch")
@@ -580,14 +707,15 @@ func nextSegmentGeneration(dir string) (uint64, error) {
 	return manifest.Generation + 1, nil
 }
 
-func createSegmentGenerationStaging(dir string, generation uint64) (string, string, string, error) {
+func createSegmentGenerationStaging(dir string, generation uint64) (string, string, string, string, error) {
 	stagingDir := filepath.Join(dir, "staging", fmt.Sprintf("gen-%020d-%d", generation, time.Now().UnixNano()))
 	if err := os.MkdirAll(stagingDir, 0o755); err != nil {
-		return "", "", "", err
+		return "", "", "", "", err
 	}
 	dataPath := filepath.Join(stagingDir, filepath.Base(vecindex.SegmentDataPath(dir, generation)))
 	rowMapPath := filepath.Join(stagingDir, filepath.Base(vecindex.SegmentRowMapPath(dir, generation)))
-	return stagingDir, dataPath, rowMapPath, nil
+	blockPath := filepath.Join(stagingDir, filepath.Base(vecindex.SegmentBlockPath(dir, generation)))
+	return stagingDir, dataPath, rowMapPath, blockPath, nil
 }
 
 func RebuildSegmentGeneration(
@@ -618,7 +746,7 @@ func RebuildSegmentGeneration(
 		return nil, nil
 	}
 
-	stagingDir, dataPath, rowMapPath, err := createSegmentGenerationStaging(dir, generation)
+	stagingDir, dataPath, rowMapPath, blockPath, err := createSegmentGenerationStaging(dir, generation)
 	if err != nil {
 		return nil, fmt.Errorf("segment generation rebuild: create staging: %w", err)
 	}
@@ -747,6 +875,19 @@ SELECT rowid, %s
 		return nil, err
 	}
 	defer dataWriter.Abort()
+	blockWriter, err := vecindex.CreateSegmentBlockMetaWriter(
+		blockPath,
+		spec,
+		stableCodec,
+		vecindex.DefaultSegmentBlockRows(stableCodec.Encoding()),
+		maxCluster,
+		expectedEpoch,
+		generation,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer blockWriter.Abort()
 	layoutHotClusters := orderedHotClusterIDs(hotClusterScores, segmentLayoutHotClusterLimit)
 	buf := make([]byte, preparedEntrySize*256)
 	for _, clusterID := range segmentClusterWriteOrder(spec, cs, hotClusterScores) {
@@ -786,6 +927,9 @@ SELECT rowid, %s
 				if err := dataWriter.Append(clusterID, rowID, encoded); err != nil {
 					return nil, fmt.Errorf("segment generation rebuild: append data: %w", err)
 				}
+				if err := blockWriter.Append(clusterID, rowID, offset, dataWriter.EntrySize(), encoded); err != nil {
+					return nil, fmt.Errorf("segment generation rebuild: append block rowid %d: %w", rowID, err)
+				}
 				rowLocs = append(rowLocs, rowLoc{rowID: rowID, clusterID: clusterID, offset: offset})
 			}
 			if err == io.ErrUnexpectedEOF {
@@ -806,6 +950,12 @@ SELECT rowid, %s
 		return nil, fmt.Errorf("segment generation rebuild: close data writer: %w", err)
 	}
 	dataWriter = nil
+	blockStore, err := blockWriter.Close()
+	if err != nil {
+		_ = dataStore.Close()
+		return nil, fmt.Errorf("segment generation rebuild: close block writer: %w", err)
+	}
+	blockWriter = nil
 
 	slices.SortFunc(rowLocs, func(a, b rowLoc) int {
 		switch {
@@ -820,12 +970,14 @@ SELECT rowid, %s
 	for _, loc := range rowLocs {
 		if err := rowMapWriter.Append(loc.rowID, loc.clusterID, loc.offset); err != nil {
 			_ = dataStore.Close()
+			_ = blockStore.Close()
 			return nil, fmt.Errorf("segment generation rebuild: append rowmap: %w", err)
 		}
 	}
 	rowMapStore, err := rowMapWriter.Close()
 	if err != nil {
 		_ = dataStore.Close()
+		_ = blockStore.Close()
 		return nil, fmt.Errorf("segment generation rebuild: close rowmap writer: %w", err)
 	}
 	rowMapWriter = nil
@@ -853,15 +1005,18 @@ SELECT rowid, %s
 		LastRebuildRowCount:      rowCount,
 		ConsecutiveSkewCycles:    nextSkewCycleCount(clusterRowCounts, meta.TargetPartitionSize, 0),
 		LayoutHotClusters:        uint32Slice(layoutHotClusters),
+		BlockRows:                uint32(blockStore.BlockRows()),
 		CreatedAtUnixNano:        time.Now().UnixNano(),
 	}
-	if err := publishSegmentGeneration(dir, manifest, dataStore.Path(), rowMapStore.Path()); err != nil {
+	if err := publishSegmentGeneration(dir, manifest, dataStore.Path(), rowMapStore.Path(), blockStore.Path()); err != nil {
 		_ = dataStore.Close()
 		_ = rowMapStore.Close()
+		_ = blockStore.Close()
 		return nil, err
 	}
 	_ = dataStore.Close()
 	_ = rowMapStore.Close()
+	_ = blockStore.Close()
 
 	opened, err := openSegmentGeneration(dir, meta, spec, expectedEpoch)
 	if err != nil {

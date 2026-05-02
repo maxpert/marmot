@@ -298,7 +298,7 @@ func TestOpenSegmentGenerationResidualPQ8(t *testing.T) {
 		ClusterVectorSums:     [][]float32{nil, append([]float32(nil), vec...)},
 		CreatedAtUnixNano:     1,
 	}
-	if err := publishSegmentGeneration(dir, manifest, dataStore.Path(), rowMapStore.Path()); err != nil {
+	if err := publishSegmentGeneration(dir, manifest, dataStore.Path(), rowMapStore.Path(), ""); err != nil {
 		t.Fatalf("publishSegmentGeneration: %v", err)
 	}
 

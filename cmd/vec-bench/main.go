@@ -233,6 +233,8 @@ type segmentEncodingStats struct {
 	entryBytes          int
 	rowCount            uint64
 	dataFileBytes       int64
+	blockRows           int
+	blockCount          uint64
 	overlayRows         int
 	overlayBytes        int64
 	overlayPreparedRows int
@@ -1213,6 +1215,10 @@ func (h *harness) currentSegmentEncodingStats() *segmentEncodingStats {
 		probeCentroidEpoch:  probeEpoch,
 		stableCentroidEpoch: stableEpoch,
 	}
+	if segments.Blocks != nil {
+		stats.blockRows = segments.Blocks.BlockRows()
+		stats.blockCount = segments.Blocks.RecordCount()
+	}
 	if overlay := state.LoadOverlay(); overlay != nil && overlay.Snapshot() != nil {
 		snapshot := overlay.Snapshot()
 		stats.overlayRows, stats.overlayBytes, _ = snapshot.BacklogStats(segments.AppliedOverlaySeq)
@@ -1241,6 +1247,14 @@ func (h *harness) currentSegmentEncodingStats() *segmentEncodingStats {
 }
 
 func (h *harness) currentSegmentDataStore() *vecindex.SegmentDataStore {
+	segments := h.currentSegmentGeneration()
+	if segments == nil {
+		return nil
+	}
+	return segments.Data
+}
+
+func (h *harness) currentSegmentGeneration() *vecindex.SegmentGeneration {
 	if h == nil || h.engine == nil {
 		return nil
 	}
@@ -1248,11 +1262,7 @@ func (h *harness) currentSegmentDataStore() *vecindex.SegmentDataStore {
 	if !ok || state == nil {
 		return nil
 	}
-	segments := state.LoadSegmentStore()
-	if segments == nil {
-		return nil
-	}
-	return segments.Data
+	return state.LoadSegmentStore()
 }
 
 func defaultBenchProbeScanBudgetRows(targetPartitionSize int) int {
@@ -1498,6 +1508,9 @@ func (h *harness) runQueryPhase() error {
 	if segmentStats := h.currentSegmentEncodingStats(); segmentStats != nil {
 		plog("  stable encoding: %s payload_bytes/vector=%d entry_bytes/vector=%d rows=%d data_file_bytes=%d",
 			segmentStats.encodingName, segmentStats.payloadBytes, segmentStats.entryBytes, segmentStats.rowCount, segmentStats.dataFileBytes)
+		if segmentStats.blockRows > 0 {
+			plog("  block metadata: block_rows=%d blocks=%d", segmentStats.blockRows, segmentStats.blockCount)
+		}
 		plog("  segment scan estimate: rows/query=%d bytes/query=%d applied_overlay_seq=%d probe_epoch=%d stable_epoch=%d",
 			segmentStats.scanRowsEstimate, segmentStats.scanBytesEstimate, segmentStats.appliedOverlaySeq,
 			segmentStats.probeCentroidEpoch, segmentStats.stableCentroidEpoch)
@@ -1510,6 +1523,15 @@ func (h *harness) runQueryPhase() error {
 				stats.segmentStats.LogicalBytes/uint64(len(stats.lats)),
 				float64(stats.segmentStats.ReadBatches)/float64(len(stats.lats)),
 				float64(stats.segmentStats.ReadBytes)/float64(stats.segmentStats.LogicalBytes))
+		}
+		if len(stats.lats) > 0 && stats.segmentStats.BlocksConsidered > 0 {
+			plog("  block pruning: meta_bytes/query=%d meta_reads/query=%.2f blocks_considered/query=%.2f blocks_skipped/query=%.2f blocks_scored/query=%.2f rows_scored/query=%.0f",
+				stats.segmentStats.BlockMetaReadBytes/uint64(len(stats.lats)),
+				float64(stats.segmentStats.BlockMetaReads)/float64(len(stats.lats)),
+				float64(stats.segmentStats.BlocksConsidered)/float64(len(stats.lats)),
+				float64(stats.segmentStats.BlocksSkipped)/float64(len(stats.lats)),
+				float64(stats.segmentStats.BlocksScored)/float64(len(stats.lats)),
+				float64(stats.segmentStats.BlockRowsScored)/float64(len(stats.lats)))
 		}
 	}
 	plog("  recall@%d      = %.4f  (top-%d vs truth top-%d)", h.cfg.k, stats.recall10, h.cfg.k, h.cfg.k)
@@ -1602,9 +1624,12 @@ func (h *harness) runQueries(sess *protocol.ConnectionSession, querySQL string, 
 			cpuF.Close()
 		}()
 	}
-	segmentData := h.currentSegmentDataStore()
-	if segmentData != nil {
-		segmentData.ResetScanStats()
+	segmentGeneration := h.currentSegmentGeneration()
+	if segmentGeneration != nil && segmentGeneration.Data != nil {
+		segmentGeneration.Data.ResetScanStats()
+	}
+	if segmentGeneration != nil && segmentGeneration.Blocks != nil {
+		segmentGeneration.Blocks.ResetScanStats()
 	}
 
 	workers := h.cfg.queryConc
@@ -1725,8 +1750,17 @@ func (h *harness) runQueries(sess *protocol.ConnectionSession, querySQL string, 
 		plog("  cpu profile: %s", cpuPath)
 	}
 	var segmentStats vecindex.SegmentScanStats
-	if segmentData != nil {
-		segmentStats = segmentData.SnapshotScanStats()
+	if segmentGeneration != nil && segmentGeneration.Data != nil {
+		segmentStats = segmentGeneration.Data.SnapshotScanStats()
+	}
+	if segmentGeneration != nil && segmentGeneration.Blocks != nil {
+		blockStats := segmentGeneration.Blocks.SnapshotScanStats()
+		segmentStats.BlockMetaReadBytes = blockStats.MetaReadBytes
+		segmentStats.BlockMetaReads = blockStats.MetaReads
+		segmentStats.BlocksConsidered = blockStats.Considered
+		segmentStats.BlocksSkipped = blockStats.Skipped
+		segmentStats.BlocksScored = blockStats.Scored
+		segmentStats.BlockRowsScored = blockStats.RowsScored
 	}
 	return &queryRunStats{
 		lats:          lats,

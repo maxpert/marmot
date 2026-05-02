@@ -572,13 +572,31 @@ Vector indexes are live:
 
 Settling improves read latency and QPS; it is not required for correctness. Raw insert QPS and final query-ready QPS are different measurements.
 
+Latest local 100K vector validation:
+
+| Metric | Value |
+|--------|-------|
+| Dataset | Random 100K DBpedia OpenAI 1536d subset from 990K rows, seed 42 |
+| Query set | 10,000 queries, cosine, `K=10`, Go-rank, id projection |
+| Index shape | `nlist=196`, explicit read test `nprobe=24` |
+| Stable encoding | Residual PQ8, 132 payload bytes/vector, 140 entry bytes/vector |
+| Stable data file | 14,003,208 bytes for 100,000 rows |
+| Block metadata | 877 blocks, 3,651,568 bytes |
+| Segment read/query | 1,739,024 bytes, 1.00x overread |
+| Recall | `recall@10 = 0.9628`, `recall@10-in-100 = 1.0000` |
+| Read throughput | 1,752 QPS aggregate at concurrency 8 |
+| Read latency | p50 4.31ms, p95 5.82ms, p99 6.48ms |
+| RSS after measurement | 340 MB |
+
+The same 100K force-build validation measured DDL create at 203ms, insert at 100,000 rows in 3.00s, first clustered publish at 15.886s, and final settled state at 1m08.286s.
+
 ### Runtime Model
 
 - **Base table**: exact vectors and metadata remain in your user table.
-- **Local derived files**: each node stores immutable `.vecseg` generations, rowmaps, manifests, and an overlay journal next to the SQLite database.
-- **Approximate scan**: stable rows are encoded with compact residual PQ when eligible, falling back to residual int8 for small or low-dimensional indexes.
+- **Local derived files**: each node stores immutable `.vecseg` generations, rowmaps, block metadata sidecars, manifests, and an overlay journal next to the SQLite database.
+- **Approximate scan**: high-dimensional stable rows use compact residual PQ8; low-dimensional stable rows use residual int8. Raw float32 stable segment payloads are not written.
 - **Exact rerank**: Marmot fetches shortlisted exact vectors from the base table, materializes them in Go, and reranks exactly before returning rows.
-- **Replication**: DML replicates as row-level CDC; vector index DDL replicates as compact control metadata. Segment files, rowmaps, centroids, PQ codebooks, and overlay journals are local derived state, not replicated artifacts.
+- **Replication**: DML replicates as row-level CDC; vector index DDL replicates as compact control metadata. Segment files, rowmaps, block metadata sidecars, centroids, PQ codebooks, and overlay journals are local derived state, not replicated artifacts.
 
 Metrics: `l2`, `cosine`, and `dot`. For `dot`, set `WITH (max_norm = ...)` to a fixed upper bound for vector norms.
 

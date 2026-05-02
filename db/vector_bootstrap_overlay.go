@@ -151,7 +151,7 @@ func BuildBootstrapSegmentGenerationFromOverlay(
 	if err != nil {
 		return nil, fmt.Errorf("bootstrap segment generation: next generation: %w", err)
 	}
-	stagingDir, dataPath, rowMapPath, err := createSegmentGenerationStaging(dir, generation)
+	stagingDir, dataPath, rowMapPath, blockPath, err := createSegmentGenerationStaging(dir, generation)
 	if err != nil {
 		return nil, fmt.Errorf("bootstrap segment generation: create staging: %w", err)
 	}
@@ -225,6 +225,19 @@ func BuildBootstrapSegmentGenerationFromOverlay(
 		return nil, err
 	}
 	defer dataWriter.Abort()
+	blockWriter, err := vecindex.CreateSegmentBlockMetaWriter(
+		blockPath,
+		spec,
+		stableCodec,
+		vecindex.DefaultSegmentBlockRows(stableCodec.Encoding()),
+		maxCluster,
+		probeCS.Epoch(),
+		generation,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer blockWriter.Abort()
 
 	rowLocs := make([]rowLoc, 0)
 	for _, clusterID := range segmentClusterWriteOrder(spec, probeCS, hotClusterScores) {
@@ -254,6 +267,9 @@ func BuildBootstrapSegmentGenerationFromOverlay(
 			if err := dataWriter.Append(clusterID, entry.rowID, encoded); err != nil {
 				return nil, fmt.Errorf("bootstrap segment generation: append rowid %d: %w", entry.rowID, err)
 			}
+			if err := blockWriter.Append(clusterID, entry.rowID, offset, dataWriter.EntrySize(), encoded); err != nil {
+				return nil, fmt.Errorf("bootstrap segment generation: append block rowid %d: %w", entry.rowID, err)
+			}
 			rowLocs = append(rowLocs, rowLoc{rowID: entry.rowID, clusterID: clusterID, offset: offset})
 		}
 	}
@@ -262,6 +278,12 @@ func BuildBootstrapSegmentGenerationFromOverlay(
 		return nil, fmt.Errorf("bootstrap segment generation: close data writer: %w", err)
 	}
 	dataWriter = nil
+	blockStore, err := blockWriter.Close()
+	if err != nil {
+		_ = dataStore.Close()
+		return nil, fmt.Errorf("bootstrap segment generation: close block writer: %w", err)
+	}
+	blockWriter = nil
 
 	slices.SortFunc(rowLocs, func(a, b rowLoc) int {
 		switch {
@@ -276,12 +298,14 @@ func BuildBootstrapSegmentGenerationFromOverlay(
 	for _, loc := range rowLocs {
 		if err := rowMapWriter.Append(loc.rowID, loc.clusterID, loc.offset); err != nil {
 			_ = dataStore.Close()
+			_ = blockStore.Close()
 			return nil, fmt.Errorf("bootstrap segment generation: append rowmap rowid %d: %w", loc.rowID, err)
 		}
 	}
 	rowMapStore, err := rowMapWriter.Close()
 	if err != nil {
 		_ = dataStore.Close()
+		_ = blockStore.Close()
 		return nil, fmt.Errorf("bootstrap segment generation: close rowmap writer: %w", err)
 	}
 	rowMapWriter = nil
@@ -313,6 +337,7 @@ func BuildBootstrapSegmentGenerationFromOverlay(
 		LastRebuildRowCount:      rowCount,
 		ConsecutiveSkewCycles:    nextSkewCycleCount(clusterRowCounts, meta.TargetPartitionSize, 0),
 		LayoutHotClusters:        uint32Slice(orderedHotClusterIDs(hotClusterScores, segmentLayoutHotClusterLimit)),
+		BlockRows:                uint32(blockStore.BlockRows()),
 		CreatedAtUnixNano:        time.Now().UnixNano(),
 	}
 	keepStaging = true
@@ -324,9 +349,11 @@ func BuildBootstrapSegmentGenerationFromOverlay(
 		manifest:   manifest,
 		dataPath:   dataStore.Path(),
 		rowMapPath: rowMapStore.Path(),
+		blockPath:  blockStore.Path(),
 		generation: &vecindex.SegmentGeneration{
 			Data:                     dataStore,
 			RowMap:                   rowMapStore,
+			Blocks:                   blockStore,
 			ProbeCentroids:           probeCS,
 			StableCentroids:          probeCS,
 			StableCodec:              stableCodec,

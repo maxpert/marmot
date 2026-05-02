@@ -397,11 +397,7 @@ func (s *IndexState) TopNprobeClustersWithEpoch(vecBytes []byte, n int) ([]int64
 
 	var vec []float32
 	if s.spec.Metric == MetricDot {
-		augmented, err := metric.AugmentData(raw, s.spec.MaxNorm, nil)
-		if err != nil {
-			return nil, 0, fmt.Errorf("vecindex: augment for index %q: %w", s.spec.ID, err)
-		}
-		vec = augmented
+		vec = metric.AugmentQuery(raw, nil)
 	} else {
 		vec = raw
 	}

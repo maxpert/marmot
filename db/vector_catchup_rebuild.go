@@ -393,7 +393,7 @@ func BuildHierarchicalCatchUpSegmentGeneration(
 	if err != nil {
 		return nil, nil, fmt.Errorf("hierarchical catch-up: next generation: %w", err)
 	}
-	stagingDir, dataPath, rowMapPath, err := createSegmentGenerationStaging(dir, generation)
+	stagingDir, dataPath, rowMapPath, blockPath, err := createSegmentGenerationStaging(dir, generation)
 	if err != nil {
 		return nil, nil, fmt.Errorf("hierarchical catch-up: create staging: %w", err)
 	}
@@ -474,6 +474,19 @@ func BuildHierarchicalCatchUpSegmentGeneration(
 		return nil, nil, err
 	}
 	defer dataWriter.Abort()
+	blockWriter, err := vecindex.CreateSegmentBlockMetaWriter(
+		blockPath,
+		spec,
+		stableCodec,
+		vecindex.DefaultSegmentBlockRows(stableCodec.Encoding()),
+		desiredK,
+		probeCS.Epoch(),
+		generation,
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer blockWriter.Abort()
 
 	preparedEntrySize := 8 + spec.InternalDim()*4
 	buf := make([]byte, preparedEntrySize*256)
@@ -521,6 +534,10 @@ func BuildHierarchicalCatchUpSegmentGeneration(
 					_ = file.Close()
 					return nil, nil, fmt.Errorf("hierarchical catch-up: append rowid %d: %w", rowID, err)
 				}
+				if err := blockWriter.Append(clusterID, rowID, offset, dataWriter.EntrySize(), encoded); err != nil {
+					_ = file.Close()
+					return nil, nil, fmt.Errorf("hierarchical catch-up: append block rowid %d: %w", rowID, err)
+				}
 				rowLocs = append(rowLocs, rowLoc{rowID: rowID, clusterID: clusterID, offset: offset})
 			}
 			if readErr == io.ErrUnexpectedEOF {
@@ -536,6 +553,12 @@ func BuildHierarchicalCatchUpSegmentGeneration(
 		return nil, nil, fmt.Errorf("hierarchical catch-up: close data writer: %w", err)
 	}
 	dataWriter = nil
+	blockStore, err := blockWriter.Close()
+	if err != nil {
+		_ = dataStore.Close()
+		return nil, nil, fmt.Errorf("hierarchical catch-up: close block writer: %w", err)
+	}
+	blockWriter = nil
 
 	slices.SortFunc(rowLocs, func(a, b rowLoc) int {
 		switch {
@@ -550,18 +573,21 @@ func BuildHierarchicalCatchUpSegmentGeneration(
 	rowMapWriter, err := vecindex.CreateSegmentRowMapWriter(rowMapPath, epoch, generation)
 	if err != nil {
 		_ = dataStore.Close()
+		_ = blockStore.Close()
 		return nil, nil, err
 	}
 	defer rowMapWriter.Abort()
 	for _, loc := range rowLocs {
 		if err := rowMapWriter.Append(loc.rowID, loc.clusterID, loc.offset); err != nil {
 			_ = dataStore.Close()
+			_ = blockStore.Close()
 			return nil, nil, fmt.Errorf("hierarchical catch-up: append rowmap rowid %d: %w", loc.rowID, err)
 		}
 	}
 	rowMapStore, err := rowMapWriter.Close()
 	if err != nil {
 		_ = dataStore.Close()
+		_ = blockStore.Close()
 		return nil, nil, fmt.Errorf("hierarchical catch-up: close rowmap writer: %w", err)
 	}
 	rowMapWriter = nil
@@ -589,6 +615,7 @@ func BuildHierarchicalCatchUpSegmentGeneration(
 		LastRebuildRowCount:      rowCount,
 		ConsecutiveSkewCycles:    nextSkewCycleCount(clusterRowCounts, meta.TargetPartitionSize, 0),
 		LayoutHotClusters:        uint32Slice(orderedHotClusterIDs(hotClusterScores, segmentLayoutHotClusterLimit)),
+		BlockRows:                uint32(blockStore.BlockRows()),
 		CreatedAtUnixNano:        time.Now().UnixNano(),
 	}
 	keepStaging = true
@@ -600,9 +627,11 @@ func BuildHierarchicalCatchUpSegmentGeneration(
 		manifest:   manifest,
 		dataPath:   dataStore.Path(),
 		rowMapPath: rowMapStore.Path(),
+		blockPath:  blockStore.Path(),
 		generation: &vecindex.SegmentGeneration{
 			Data:                     dataStore,
 			RowMap:                   rowMapStore,
+			Blocks:                   blockStore,
 			ProbeCentroids:           probeCS,
 			StableCentroids:          probeCS,
 			StableCodec:              stableCodec,

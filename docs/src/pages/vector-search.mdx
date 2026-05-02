@@ -325,6 +325,7 @@ Useful log messages include:
 - p50, p95, and p99 latency
 - RSS snapshots
 - stable encoding
+- block metadata rows and file size
 - segment logical bytes/query
 - segment actual read bytes/query
 - segment overread
@@ -344,6 +345,8 @@ For `chunks_embedding_idx`, Marmot stores derived state beside the database:
     gen-00000000000000000001.dat
   rowmap/
     gen-00000000000000000001.rmap
+  blocks/
+    gen-00000000000000000001.blk
   overlay/
     current.log
 ```
@@ -354,6 +357,7 @@ For `chunks_embedding_idx`, Marmot stores derived state beside the database:
 | `manifest/gen-*.mf` | Manifest with index identity, centroid epochs, encoding metadata, checksums, and file names. |
 | `segments/gen-*.dat` | Stable vector payload laid out by cluster. |
 | `rowmap/gen-*.rmap` | Rowid to stable-location map. |
+| `blocks/gen-*.blk` | Validated per-generation block metadata sidecar for disk-first pruning and scan instrumentation. |
 | `overlay/current.log` | Append-only local mutation log for rows newer than the stable generation. |
 
 ### Read Path
@@ -369,6 +373,8 @@ In post-filter IVF mode:
 7. It issues a final projection query for only the final top-K rowids.
 
 The approximate scan is used for candidate generation only. Final distance ordering uses exact vectors from the base table.
+
+New generations also write a `.blk` sidecar. The sidecar is validated against the `.dat` file on open, is deleted with retired generations, and is available for internal block-pruning experiments and scan metrics. Current default query execution keeps block pruning off unless explicitly enabled internally, because the latest 100K run showed the full selected-cluster PQ scan was faster at this scale.
 
 ### Write Path
 
@@ -408,6 +414,7 @@ Node-local derived state:
 
 - `.vecseg` segment files
 - rowmaps
+- block metadata sidecars
 - manifest files
 - overlay journals
 - centroids
@@ -432,6 +439,7 @@ Use `cmd/vec-bench` for repeatable vector benchmarking.
   --warmup=200 \
   --n-queries=500 \
   --query-concurrency=8 \
+  --nprobe=24 \
   --settle-timeout=10m \
   --min-recall=0.95 \
   --min-qps=1000 \
@@ -456,6 +464,31 @@ Always report:
 - segment read bytes/query and overread
 
 Do not report raw insert throughput as query-ready build throughput. Inserts are live immediately, but the clustered generation and settled read structure are separate milestones.
+
+### Latest 100K Validation
+
+Latest local validation used a random 100K-row subset of the DBpedia OpenAI 1536d dataset from the 990K-row source corpus with subset seed `42`. The query set contained 10,000 queries, `K=10`, cosine distance, Go-rank, id projection, and read concurrency `8`.
+
+| Metric | Measured value |
+|---|---:|
+| Rows | 100,000 |
+| Source rows | 990,000 |
+| `nlist` | 196 |
+| `nprobe` | 24 |
+| Stable encoding | Residual PQ8 |
+| Payload bytes/vector | 132 |
+| Entry bytes/vector | 140 |
+| Stable `.dat` size | 14,003,208 bytes |
+| Block metadata | 877 blocks, 3,651,568 bytes |
+| Segment read bytes/query | 1,739,024 |
+| Segment overread | 1.00x |
+| Recall@10 | 0.9628 |
+| Recall@10-in-100 | 1.0000 |
+| Aggregate read QPS | 1,752 |
+| Latency p50 / p95 / p99 | 4.31ms / 5.82ms / 6.48ms |
+| RSS after measurement | 340 MB |
+
+The matching 100K force-build lifecycle run measured DDL create at 203ms, 100,000 inserts in 3.00s, first clustered publish at 15.886s, and final settled state at 1m08.286s.
 
 ## Crash Safety
 

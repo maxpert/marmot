@@ -143,6 +143,50 @@ func DecodeResidualInt8(rankMetric metric.Metric, centroid []float32, blob []byt
 	return dst, norm2, nil
 }
 
+func AccumulateResidualInt8Stats(rankMetric metric.Metric, dim, blockSize int, blob []byte, minResidual, maxResidual []float32) (float32, bool, error) {
+	if dim <= 0 {
+		return 0, false, fmt.Errorf("quantize: invalid dim %d", dim)
+	}
+	if blockSize <= 0 {
+		return 0, false, fmt.Errorf("quantize: invalid block size %d", blockSize)
+	}
+	if len(minResidual) != dim || len(maxResidual) != dim {
+		return 0, false, fmt.Errorf("quantize: residual stats dim mismatch")
+	}
+	if len(blob) != EncodedResidualSize(rankMetric, dim, blockSize) {
+		return 0, false, fmt.Errorf("quantize: blob size mismatch: got=%d want=%d", len(blob), EncodedResidualSize(rankMetric, dim, blockSize))
+	}
+	norm2 := float32(0)
+	hasNorm := false
+	off := 0
+	if rankMetric == metric.MetricL2 {
+		norm2 = math.Float32frombits(binary.LittleEndian.Uint32(blob[:4]))
+		hasNorm = true
+		off = 4
+	}
+	blocks := ResidualBlockCount(dim, blockSize)
+	scaleOff := off
+	codeOff := off + blocks*2
+	for block := 0; block < blocks; block++ {
+		start := block * blockSize
+		end := start + blockSize
+		if end > dim {
+			end = dim
+		}
+		scale := decodeFloat16(binary.LittleEndian.Uint16(blob[scaleOff+block*2:]))
+		for i := start; i < end; i++ {
+			value := float32(int8(blob[codeOff+i])) * scale
+			if value < minResidual[i] {
+				minResidual[i] = value
+			}
+			if value > maxResidual[i] {
+				maxResidual[i] = value
+			}
+		}
+	}
+	return norm2, hasNorm, nil
+}
+
 func QuantizeQueryInt8(query []float32, blockSize int) ([]int8, []float32, error) {
 	if len(query) == 0 {
 		return nil, nil, fmt.Errorf("quantize: empty query")

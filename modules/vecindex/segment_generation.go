@@ -7,6 +7,7 @@ import "github.com/maxpert/marmot/modules/vecindex/pkg/kmeans"
 type SegmentGeneration struct {
 	Data                     *SegmentDataStore
 	RowMap                   *SegmentRowMap
+	Blocks                   *SegmentBlockMetaStore
 	ProbeCentroids           *kmeans.CentroidSet
 	StableCentroids          *kmeans.CentroidSet
 	StableCodec              *StableMemberCodec
@@ -31,6 +32,11 @@ func (g *SegmentGeneration) Close() error {
 	}
 	if g.RowMap != nil {
 		if err := g.RowMap.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	if g.Blocks != nil {
+		if err := g.Blocks.Close(); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}

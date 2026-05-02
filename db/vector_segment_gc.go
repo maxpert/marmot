@@ -44,6 +44,11 @@ func retiredGenerationFiles(generation *vecindex.SegmentGeneration) []string {
 	} else {
 		files = append(files, vecindex.SegmentRowMapPath(dir, gen))
 	}
+	if generation.Blocks != nil && generation.Blocks.Path() != "" {
+		files = append(files, generation.Blocks.Path())
+	} else {
+		files = append(files, vecindex.SegmentBlockPath(dir, gen))
+	}
 	files = append(files, vecindex.SegmentManifestPath(dir, gen))
 	return files
 }
@@ -54,10 +59,12 @@ func pruneSegmentStoreOnStartup(dir string, keepGeneration uint64) {
 	}
 	removeTmpFiles(filepath.Join(dir, "segments"))
 	removeTmpFiles(filepath.Join(dir, "rowmap"))
+	removeTmpFiles(filepath.Join(dir, "blocks"))
 	removeTmpFiles(filepath.Join(dir, "manifest"))
 	removeStagingDirs(filepath.Join(dir, "staging"))
 	removeOldGenerationFiles(filepath.Join(dir, "segments"), ".dat", keepGeneration)
 	removeOldGenerationFiles(filepath.Join(dir, "rowmap"), ".rmap", keepGeneration)
+	removeOldGenerationFiles(filepath.Join(dir, "blocks"), ".blk", keepGeneration)
 	removeOldGenerationFiles(filepath.Join(dir, "manifest"), ".mf", keepGeneration)
 }
 

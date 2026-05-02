@@ -25,6 +25,17 @@ func newTopKHeap(k int) *topKHeap {
 // Len reports the current number of items in the heap.
 func (h *topKHeap) Len() int { return len(h.items) }
 
+func (h *topKHeap) Full() bool {
+	return h != nil && h.k > 0 && len(h.items) >= h.k
+}
+
+func (h *topKHeap) WorstDistance() (float32, bool) {
+	if h == nil || !h.Full() {
+		return 0, false
+	}
+	return h.items[0].dist, true
+}
+
 // Push offers (rowid, dist) to the heap. If the heap is not yet full the item
 // is appended and sifted up. If full, the item replaces the current max only
 // when strictly closer; equal-dist candidates are rejected so ties preserve

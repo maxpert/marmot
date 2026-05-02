@@ -2,6 +2,7 @@ package vecindex
 
 import (
 	"math"
+	"path/filepath"
 	"testing"
 
 	"github.com/maxpert/marmot/modules/vecindex/pkg/kmeans"
@@ -176,4 +177,197 @@ func TestStableMemberCodecBlobCompatibility(t *testing.T) {
 	if _, err := DecodeStableMemberCodecBlob(spec, cs, MemberEncodingResidualPQ8, nil); err == nil {
 		t.Fatalf("PQ decode with missing blob succeeded, want error")
 	}
+}
+
+func TestStableMemberQueryScorerResidualInt8BlockLowerBound(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name       string
+		metricKind Metric
+	}{
+		{name: "l2", metricKind: MetricL2},
+		{name: "cosine", metricKind: MetricCosine},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			spec := IVFSpec{ID: "idx", Dim: 8, Metric: tc.metricKind, Nlist: 1, Nprobe: 1}
+			centroid := []float32{0.2, 0.1, -0.1, 0.3, 0, 0.2, -0.2, 0.1}
+			cs, err := kmeans.NewCentroidSet(1, [][]float32{centroid})
+			if err != nil {
+				t.Fatalf("NewCentroidSet: %v", err)
+			}
+			codec, err := NewStableMemberCodec(spec, cs, MemberEncodingResidualInt8, nil)
+			if err != nil {
+				t.Fatalf("NewStableMemberCodec: %v", err)
+			}
+			rows := [][]float32{
+				{0.25, 0.05, -0.05, 0.35, 0.1, 0.15, -0.1, 0.2},
+				{0.15, 0.2, -0.2, 0.25, -0.1, 0.25, -0.3, 0},
+				{0.3, 0.1, -0.15, 0.4, 0.05, 0.1, -0.25, 0.15},
+			}
+			block, blobs := blockRecordForEncodedRows(t, spec, codec, 1, rows)
+
+			query := []float32{0.4, -0.1, 0.2, 0.3, 0.05, 0.1, -0.4, 0.2}
+			if tc.metricKind == MetricCosine {
+				n := metric.Norm(query)
+				for i := range query {
+					query[i] /= n
+				}
+			}
+			assertBlockLowerBoundCoversRows(t, codec, query, metric.Norm2(query), 1, block, blobs)
+		})
+	}
+}
+
+func TestStableMemberQueryScorerPQBlockLowerBound(t *testing.T) {
+	t.Parallel()
+
+	spec := IVFSpec{ID: "idx", Dim: StablePQMinInternalDim, Metric: MetricL2, Nlist: 1, Nprobe: 1}
+	centroid := make([]float32, spec.InternalDim())
+	for i := range centroid {
+		centroid[i] = float32(i%17) * 0.001
+	}
+	cs, err := kmeans.NewCentroidSet(1, [][]float32{centroid})
+	if err != nil {
+		t.Fatalf("NewCentroidSet: %v", err)
+	}
+	pq, err := quantize.TrainPQ8(testResiduals(320, spec.InternalDim()), spec.InternalDim(), quantize.PQ8Options{M: 4, MaxIter: 3, Seed: 11})
+	if err != nil {
+		t.Fatalf("TrainPQ8: %v", err)
+	}
+	codec, err := NewStableMemberCodec(spec, cs, MemberEncodingResidualPQ8, pq)
+	if err != nil {
+		t.Fatalf("NewStableMemberCodec: %v", err)
+	}
+
+	residuals := testResiduals(8, spec.InternalDim())
+	rows := make([][]float32, 3)
+	for i := range rows {
+		rows[i] = make([]float32, spec.InternalDim())
+		for d := range rows[i] {
+			rows[i][d] = centroid[d] + residuals[i+2][d]
+		}
+	}
+	block, blobs := blockRecordForEncodedRows(t, spec, codec, 1, rows)
+	query := make([]float32, spec.InternalDim())
+	for i := range query {
+		query[i] = float32((i*7)%19) * 0.002
+	}
+	assertBlockLowerBoundCoversRows(t, codec, query, metric.Norm2(query), 1, block, blobs)
+}
+
+func TestStableMemberQueryScorerPQBlockLowerBoundForDotInternalL2(t *testing.T) {
+	t.Parallel()
+
+	spec := IVFSpec{ID: "idx", Dim: StablePQMinInternalDim - 1, Metric: MetricDot, Nlist: 1, Nprobe: 1, MaxNorm: 64}
+	centroid := make([]float32, spec.InternalDim())
+	cs, err := kmeans.NewCentroidSet(1, [][]float32{centroid})
+	if err != nil {
+		t.Fatalf("NewCentroidSet: %v", err)
+	}
+
+	training := make([][]float32, 320)
+	for i := range training {
+		raw := make([]float32, spec.Dim)
+		for d := range raw {
+			raw[d] = float32(math.Sin(float64((i+1)*(d+5)%131))) * 0.01
+		}
+		prepared, err := metric.AugmentData(raw, spec.MaxNorm, nil)
+		if err != nil {
+			t.Fatalf("AugmentData training: %v", err)
+		}
+		training[i] = prepared
+	}
+	pq, err := quantize.TrainPQ8(training, spec.InternalDim(), quantize.PQ8Options{M: 4, MaxIter: 3, Seed: 13})
+	if err != nil {
+		t.Fatalf("TrainPQ8: %v", err)
+	}
+	codec, err := NewStableMemberCodec(spec, cs, MemberEncodingResidualPQ8, pq)
+	if err != nil {
+		t.Fatalf("NewStableMemberCodec: %v", err)
+	}
+
+	rows := training[10:14]
+	block, blobs := blockRecordForEncodedRows(t, spec, codec, 1, rows)
+	rawQuery := make([]float32, spec.Dim)
+	for i := range rawQuery {
+		rawQuery[i] = float32(math.Cos(float64((i+3)%29))) * 0.5
+	}
+	query := metric.AugmentQuery(rawQuery, nil)
+	assertBlockLowerBoundCoversRows(t, codec, query, metric.Norm2(query), 1, block, blobs)
+}
+
+func blockRecordForEncodedRows(t *testing.T, spec IVFSpec, codec *StableMemberCodec, clusterID int64, rows [][]float32) (SegmentBlockRecord, [][]byte) {
+	t.Helper()
+	writer, err := CreateSegmentBlockMetaWriter(filepath.Join(t.TempDir(), "gen.blk"), spec, codec, len(rows)+1, spec.Nlist, 1, 1)
+	if err != nil {
+		t.Fatalf("CreateSegmentBlockMetaWriter: %v", err)
+	}
+	offset := uint64(0)
+	blobs := make([][]byte, 0, len(rows))
+	for i, row := range rows {
+		_, blob, err := codec.Encode(clusterID, Float32ToBytes(row))
+		if err != nil {
+			t.Fatalf("Encode row %d: %v", i, err)
+		}
+		if err := writer.Append(clusterID, int64(i+1), offset, 8+len(blob), blob); err != nil {
+			t.Fatalf("Append row %d: %v", i, err)
+		}
+		offset += uint64(8 + len(blob))
+		blobs = append(blobs, blob)
+	}
+	store, err := writer.Close()
+	if err != nil {
+		t.Fatalf("Close block writer: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = store.Close()
+	})
+	blocks, err := store.ReadClusterBlocks([]int64{clusterID})
+	if err != nil {
+		t.Fatalf("ReadClusterBlocks: %v", err)
+	}
+	if len(blocks) != 1 {
+		t.Fatalf("blocks = %d, want 1", len(blocks))
+	}
+	return blocks[0], blobs
+}
+
+func assertBlockLowerBoundCoversRows(t *testing.T, codec *StableMemberCodec, query []float32, queryNorm2 float32, clusterID int64, block SegmentBlockRecord, blobs [][]byte) {
+	t.Helper()
+	queryScorer, err := NewStableMemberQueryScorerWithCodec(codec, query, queryNorm2)
+	if err != nil {
+		t.Fatalf("NewStableMemberQueryScorerWithCodec: %v", err)
+	}
+	bound, ok := queryScorer.BlockLowerBound(clusterID, block)
+	if !ok {
+		t.Fatalf("BlockLowerBound returned !ok")
+	}
+	scorer, err := queryScorer.ClusterScorer(clusterID)
+	if err != nil {
+		t.Fatalf("ClusterScorer: %v", err)
+	}
+	for i, blob := range blobs {
+		score, err := scorer.Score(blob)
+		if err != nil {
+			t.Fatalf("Score row %d: %v", i, err)
+		}
+		if bound > score+1e-3 {
+			t.Fatalf("block lower bound = %v, row %d score = %v", bound, i, score)
+		}
+	}
+}
+
+func testResiduals(n, dim int) [][]float32 {
+	out := make([][]float32, n)
+	for i := range out {
+		out[i] = make([]float32, dim)
+		for d := range out[i] {
+			x := float64((i+3)*(d+7)%149) / 149
+			out[i][d] = float32(math.Sin(x*math.Pi*2) * 0.05)
+		}
+	}
+	return out
 }

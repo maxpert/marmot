@@ -10,7 +10,8 @@ import (
 )
 
 const (
-	SegmentStoreVersion = 3
+	SegmentStoreVersion = 4
+	segmentStoreV3      = 3
 	segmentStoreV2      = 2
 	segmentStoreV1      = 1
 
@@ -41,6 +42,10 @@ type SegmentManifest struct {
 	RowMapFile               string      `msgpack:"rowmap_file"`
 	RowMapFileSize           uint64      `msgpack:"rowmap_file_size"`
 	RowMapFileSHA256         string      `msgpack:"rowmap_file_sha256"`
+	BlockMetaFile            string      `msgpack:"block_meta_file,omitempty"`
+	BlockMetaFileSize        uint64      `msgpack:"block_meta_file_size,omitempty"`
+	BlockMetaFileSHA256      string      `msgpack:"block_meta_file_sha256,omitempty"`
+	BlockRows                uint32      `msgpack:"block_rows,omitempty"`
 	MaxCluster               uint32      `msgpack:"max_cluster"`
 	RowCount                 uint64      `msgpack:"row_count"`
 	ClusterRowCounts         []uint64    `msgpack:"cluster_row_counts,omitempty"`
@@ -76,6 +81,10 @@ func SegmentDataPath(dir string, generation uint64) string {
 
 func SegmentRowMapPath(dir string, generation uint64) string {
 	return filepath.Join(dir, "rowmap", fmt.Sprintf("gen-%020d.rmap", generation))
+}
+
+func SegmentBlockPath(dir string, generation uint64) string {
+	return SegmentBlockMetaPath(dir, generation)
 }
 
 func OverlayJournalPath(dir string) string {
@@ -144,6 +153,10 @@ func SegmentStoreV1Compat() uint32 {
 
 func SegmentStoreV2Compat() uint32 {
 	return segmentStoreV2
+}
+
+func SegmentStoreV3Compat() uint32 {
+	return segmentStoreV3
 }
 
 func (m *SegmentManifest) ProbeEpochValue() uint64 {

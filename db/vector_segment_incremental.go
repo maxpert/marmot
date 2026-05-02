@@ -45,6 +45,7 @@ type pendingSegmentGeneration struct {
 	manifest   vecindex.SegmentManifest
 	dataPath   string
 	rowMapPath string
+	blockPath  string
 	generation *vecindex.SegmentGeneration
 	published  bool
 }
@@ -57,7 +58,7 @@ func (p *pendingSegmentGeneration) Publish() error {
 		_ = p.generation.Close()
 		p.generation = nil
 	}
-	if err := publishSegmentGeneration(p.dir, p.manifest, p.dataPath, p.rowMapPath); err != nil {
+	if err := publishSegmentGeneration(p.dir, p.manifest, p.dataPath, p.rowMapPath, p.blockPath); err != nil {
 		return err
 	}
 	opened, err := openSegmentGeneration(p.dir, p.meta, p.spec, p.manifest.ProbeEpochValue())
@@ -85,6 +86,9 @@ func (p *pendingSegmentGeneration) Close() {
 		}
 		if p.rowMapPath != "" {
 			_ = os.Remove(p.rowMapPath)
+		}
+		if p.blockPath != "" {
+			_ = os.Remove(p.blockPath)
 		}
 		if p.stagingDir != "" {
 			_ = os.RemoveAll(p.stagingDir)
@@ -212,7 +216,7 @@ func buildIncrementalSegmentGenerationFromMutations(
 	if err != nil {
 		return nil, fmt.Errorf("incremental segment generation: encode stable codec metadata: %w", err)
 	}
-	stagingDir, dataPath, rowMapPath, err := createSegmentGenerationStaging(dir, generation)
+	stagingDir, dataPath, rowMapPath, blockPath, err := createSegmentGenerationStaging(dir, generation)
 	if err != nil {
 		return nil, fmt.Errorf("incremental segment generation: create staging: %w", err)
 	}
@@ -237,6 +241,19 @@ func buildIncrementalSegmentGenerationFromMutations(
 		return nil, err
 	}
 	defer dataWriter.Abort()
+	blockWriter, err := vecindex.CreateSegmentBlockMetaWriter(
+		blockPath,
+		spec,
+		stableCodec,
+		vecindex.DefaultSegmentBlockRows(stableCodec.Encoding()),
+		maxCluster,
+		stableCS.Epoch(),
+		generation,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer blockWriter.Abort()
 
 	rowMapWriter, err := vecindex.CreateSegmentRowMapWriter(rowMapPath, stableCS.Epoch(), generation)
 	if err != nil {
@@ -289,8 +306,35 @@ func buildIncrementalSegmentGenerationFromMutations(
 			if !ok {
 				return nil, fmt.Errorf("incremental segment generation: missing span for untouched cluster %d", clusterID)
 			}
+			newOffset := dataWriter.NextOffset()
 			if err := dataWriter.AppendRawCluster(clusterID, count, io.NewSectionReader(oldDataFile, offset, bytes)); err != nil {
 				return nil, fmt.Errorf("incremental segment generation: copy untouched cluster %d: %w", clusterID, err)
+			}
+			if base.Blocks != nil {
+				blocks, err := base.Blocks.ReadClusterBlocks([]int64{clusterID})
+				if err != nil {
+					return nil, fmt.Errorf("incremental segment generation: read untouched blocks %d: %w", clusterID, err)
+				}
+				if err := blockWriter.AppendRawBlocks(clusterID, blocks, int64(newOffset)-offset); err != nil {
+					return nil, fmt.Errorf("incremental segment generation: copy untouched blocks %d: %w", clusterID, err)
+				}
+			} else {
+				var rowIndex uint64
+				var scanErr error
+				if err := base.Data.ScanCluster(clusterID, func(rowID int64, vecBytes []byte) bool {
+					rowOffset := newOffset + rowIndex*uint64(dataWriter.EntrySize())
+					if err := blockWriter.Append(clusterID, rowID, rowOffset, dataWriter.EntrySize(), vecBytes); err != nil {
+						scanErr = err
+						return false
+					}
+					rowIndex++
+					return true
+				}); err != nil {
+					return nil, fmt.Errorf("incremental segment generation: scan untouched cluster %d for blocks: %w", clusterID, err)
+				}
+				if scanErr != nil {
+					return nil, fmt.Errorf("incremental segment generation: rebuild untouched blocks %d: %w", clusterID, scanErr)
+				}
 			}
 			continue
 		}
@@ -305,6 +349,9 @@ func buildIncrementalSegmentGenerationFromMutations(
 			offset := dataWriter.NextOffset()
 			if err := dataWriter.Append(clusterID, entry.rowID, entry.vec); err != nil {
 				return nil, fmt.Errorf("incremental segment generation: append touched cluster %d rowid %d: %w", clusterID, entry.rowID, err)
+			}
+			if err := blockWriter.Append(clusterID, entry.rowID, offset, dataWriter.EntrySize(), entry.vec); err != nil {
+				return nil, fmt.Errorf("incremental segment generation: append block rowid %d: %w", entry.rowID, err)
 			}
 			prepared := entry.prepared
 			if len(prepared) == 0 && len(entry.preparedBlob) > 0 {
@@ -329,6 +376,12 @@ func buildIncrementalSegmentGenerationFromMutations(
 		return nil, fmt.Errorf("incremental segment generation: close data writer: %w", err)
 	}
 	dataWriter = nil
+	blockStore, err := blockWriter.Close()
+	if err != nil {
+		_ = dataStore.Close()
+		return nil, fmt.Errorf("incremental segment generation: close block writer: %w", err)
+	}
+	blockWriter = nil
 
 	err = base.RowMap.Scan(func(loc vecindex.SegmentRowLocation) bool {
 		if _, touched := touchedClusters[loc.ClusterID]; touched {
@@ -343,6 +396,7 @@ func buildIncrementalSegmentGenerationFromMutations(
 	})
 	if err != nil {
 		_ = dataStore.Close()
+		_ = blockStore.Close()
 		return nil, fmt.Errorf("incremental segment generation: scan existing rowmap: %w", err)
 	}
 
@@ -359,6 +413,7 @@ func buildIncrementalSegmentGenerationFromMutations(
 	for _, loc := range rowLocs {
 		if err := rowMapWriter.Append(loc.rowID, loc.clusterID, loc.offset); err != nil {
 			_ = dataStore.Close()
+			_ = blockStore.Close()
 			return nil, fmt.Errorf("incremental segment generation: append rowmap rowid %d: %w", loc.rowID, err)
 		}
 	}
@@ -366,6 +421,7 @@ func buildIncrementalSegmentGenerationFromMutations(
 	rowMapStore, err := rowMapWriter.Close()
 	if err != nil {
 		_ = dataStore.Close()
+		_ = blockStore.Close()
 		return nil, fmt.Errorf("incremental segment generation: close rowmap writer: %w", err)
 	}
 	rowMapWriter = nil
@@ -397,6 +453,7 @@ func buildIncrementalSegmentGenerationFromMutations(
 		LastRebuildRowCount:      rowCount,
 		ConsecutiveSkewCycles:    nextSkewCycleCount(clusterRowCounts, meta.TargetPartitionSize, base.ConsecutiveSkewCycles),
 		LayoutHotClusters:        uint32Slice(orderedHotClusterIDs(hotClusterScores, segmentLayoutHotClusterLimit)),
+		BlockRows:                uint32(blockStore.BlockRows()),
 		CreatedAtUnixNano:        time.Now().UnixNano(),
 	}
 	keepStaging = true
@@ -408,9 +465,11 @@ func buildIncrementalSegmentGenerationFromMutations(
 		manifest:   manifest,
 		dataPath:   dataStore.Path(),
 		rowMapPath: rowMapStore.Path(),
+		blockPath:  blockStore.Path(),
 		generation: &vecindex.SegmentGeneration{
 			Data:                     dataStore,
 			RowMap:                   rowMapStore,
+			Blocks:                   blockStore,
 			ProbeCentroids:           probeCS,
 			StableCentroids:          stableCS,
 			StableCodec:              stableCodec,

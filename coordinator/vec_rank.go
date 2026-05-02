@@ -6,6 +6,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -545,85 +547,12 @@ func (h *CoordinatorHandler) segmentRank(plan *GoRankPlan) ([]rankItem, bool, er
 				return nil, false, err
 			}
 		}
-		scorerCache := make(map[int64]*vecindex.StableMemberScorer, len(plan.ClusterIDs))
 		queryScorer, err := vecindex.NewStableMemberQueryScorerWithCodec(stableCodec, plan.QueryVec, plan.QueryNorm2)
 		if err != nil {
 			return nil, false, err
 		}
-		var encodedScanErr error
-		if segmentEnc == vecindex.MemberEncodingResidualInt8 || segmentEnc == vecindex.MemberEncodingResidualPQ8 {
-			distBuf := make([]float32, 0, 256)
-			if err := segments.Data.ScanClustersFileOrderSpans(plan.ClusterIDs, func(clusterID int64, rows []byte, count uint64, entrySize int) bool {
-				scorer, ok := scorerCache[clusterID]
-				if !ok {
-					var err error
-					scorer, err = queryScorer.ClusterScorer(clusterID)
-					if err != nil {
-						encodedScanErr = err
-						return false
-					}
-					scorerCache[clusterID] = scorer
-				}
-				n := int(count)
-				if cap(distBuf) < n {
-					distBuf = make([]float32, n)
-				}
-				dists := distBuf[:n]
-				if err := scorer.ScoreSpan(rows, entrySize, dists); err != nil {
-					encodedScanErr = err
-					return false
-				}
-				cursor := 0
-				for i := 0; i < n; i++ {
-					rowid := int64(binary.LittleEndian.Uint64(rows[cursor : cursor+8]))
-					if overlaySnapshot != nil {
-						if _, ok := overlaySnapshot.RowClusterAfter(rowid, appliedOverlaySeq); ok {
-							cursor += entrySize
-							continue
-						}
-					}
-					if overlaySnapshot != nil && overlaySnapshot.HasTombstoneAfter(rowid, appliedOverlaySeq) {
-						cursor += entrySize
-						continue
-					}
-					topK.Push(rowid, dists[i])
-					cursor += entrySize
-				}
-				return true
-			}); err != nil {
-				return nil, false, fmt.Errorf("MARMOT-VEC-030: segment scan failed: %w", err)
-			}
-		} else if err := segments.Data.ScanClustersFileOrder(plan.ClusterIDs, func(clusterID, rowid int64, vecBytes []byte) bool {
-			if overlaySnapshot != nil {
-				if _, ok := overlaySnapshot.RowClusterAfter(rowid, appliedOverlaySeq); ok {
-					return true
-				}
-			}
-			if overlaySnapshot != nil && overlaySnapshot.HasTombstoneAfter(rowid, appliedOverlaySeq) {
-				return true
-			}
-			scorer, ok := scorerCache[clusterID]
-			if !ok {
-				var err error
-				scorer, err = queryScorer.ClusterScorer(clusterID)
-				if err != nil {
-					encodedScanErr = err
-					return false
-				}
-				scorerCache[clusterID] = scorer
-			}
-			dist, err := scorer.Score(vecBytes)
-			if err != nil {
-				encodedScanErr = err
-				return false
-			}
-			topK.Push(rowid, dist)
-			return true
-		}); err != nil {
-			return nil, false, fmt.Errorf("MARMOT-VEC-030: segment scan failed: %w", err)
-		}
-		if encodedScanErr != nil {
-			return nil, false, fmt.Errorf("MARMOT-VEC-030: encoded segment scoring failed: %w", encodedScanErr)
+		if err := h.scanStableGeneration(plan, segments, queryScorer, segmentEnc, appliedOverlaySeq, overlaySnapshot, topK); err != nil {
+			return nil, false, err
 		}
 		state.RecordClusterHits(plan.ClusterIDs)
 	}
@@ -696,6 +625,242 @@ func (h *CoordinatorHandler) segmentRank(plan *GoRankPlan) ([]rankItem, bool, er
 		}
 	}
 	return topK.Drain(), true, nil
+}
+
+type blockPruneMode int
+
+const (
+	blockPruneSafe blockPruneMode = iota
+	blockPruneOff
+	blockPruneShadow
+)
+
+const blockPruneMargin = 1e-5
+
+type scoredBlockRecord struct {
+	record     vecindex.SegmentBlockRecord
+	lowerBound float32
+	bounded    bool
+}
+
+func currentBlockPruneMode() blockPruneMode {
+	switch strings.ToLower(os.Getenv("MARMOT_VEC_BLOCK_PRUNE_MODE")) {
+	case "safe":
+		return blockPruneSafe
+	case "shadow":
+		return blockPruneShadow
+	default:
+		return blockPruneOff
+	}
+}
+
+func (h *CoordinatorHandler) scanStableGeneration(
+	plan *GoRankPlan,
+	segments *vecindex.SegmentGeneration,
+	queryScorer *vecindex.StableMemberQueryScorer,
+	segmentEnc int64,
+	appliedOverlaySeq uint64,
+	overlaySnapshot *vecindex.OverlaySnapshot,
+	topK *topKHeap,
+) error {
+	scorerCache := make(map[int64]*vecindex.StableMemberScorer, len(plan.ClusterIDs))
+	distBuf := make([]float32, 0, 256)
+	scoreRows := func(clusterID int64, rows []byte, count uint64, entrySize int) error {
+		scorer, ok := scorerCache[clusterID]
+		if !ok {
+			var err error
+			scorer, err = queryScorer.ClusterScorer(clusterID)
+			if err != nil {
+				return err
+			}
+			scorerCache[clusterID] = scorer
+		}
+		n := int(count)
+		if cap(distBuf) < n {
+			distBuf = make([]float32, n)
+		}
+		dists := distBuf[:n]
+		if err := scorer.ScoreSpan(rows, entrySize, dists); err != nil {
+			return err
+		}
+		cursor := 0
+		for i := 0; i < n; i++ {
+			rowid := int64(binary.LittleEndian.Uint64(rows[cursor : cursor+8]))
+			if overlaySnapshot != nil {
+				if _, ok := overlaySnapshot.RowClusterAfter(rowid, appliedOverlaySeq); ok {
+					cursor += entrySize
+					continue
+				}
+			}
+			if overlaySnapshot != nil && overlaySnapshot.HasTombstoneAfter(rowid, appliedOverlaySeq) {
+				cursor += entrySize
+				continue
+			}
+			topK.Push(rowid, dists[i])
+			cursor += entrySize
+		}
+		return nil
+	}
+	if !plan.HasUserPredicate && (segmentEnc == vecindex.MemberEncodingResidualInt8 || segmentEnc == vecindex.MemberEncodingResidualPQ8) && segments.Blocks != nil && currentBlockPruneMode() != blockPruneOff {
+		used, err := scanStableGenerationBlocks(plan, segments, queryScorer, topK, scoreRows)
+		if err != nil {
+			return err
+		}
+		if used {
+			return nil
+		}
+	}
+	if segmentEnc == vecindex.MemberEncodingResidualInt8 || segmentEnc == vecindex.MemberEncodingResidualPQ8 {
+		var encodedScanErr error
+		if err := segments.Data.ScanClustersFileOrderSpans(plan.ClusterIDs, func(clusterID int64, rows []byte, count uint64, entrySize int) bool {
+			if err := scoreRows(clusterID, rows, count, entrySize); err != nil {
+				encodedScanErr = err
+				return false
+			}
+			return true
+		}); err != nil {
+			return fmt.Errorf("MARMOT-VEC-030: segment scan failed: %w", err)
+		}
+		if encodedScanErr != nil {
+			return fmt.Errorf("MARMOT-VEC-030: encoded segment scoring failed: %w", encodedScanErr)
+		}
+		return nil
+	}
+	var encodedScanErr error
+	if err := segments.Data.ScanClustersFileOrder(plan.ClusterIDs, func(clusterID, rowid int64, vecBytes []byte) bool {
+		if overlaySnapshot != nil {
+			if _, ok := overlaySnapshot.RowClusterAfter(rowid, appliedOverlaySeq); ok {
+				return true
+			}
+		}
+		if overlaySnapshot != nil && overlaySnapshot.HasTombstoneAfter(rowid, appliedOverlaySeq) {
+			return true
+		}
+		scorer, ok := scorerCache[clusterID]
+		if !ok {
+			var err error
+			scorer, err = queryScorer.ClusterScorer(clusterID)
+			if err != nil {
+				encodedScanErr = err
+				return false
+			}
+			scorerCache[clusterID] = scorer
+		}
+		dist, err := scorer.Score(vecBytes)
+		if err != nil {
+			encodedScanErr = err
+			return false
+		}
+		topK.Push(rowid, dist)
+		return true
+	}); err != nil {
+		return fmt.Errorf("MARMOT-VEC-030: segment scan failed: %w", err)
+	}
+	if encodedScanErr != nil {
+		return fmt.Errorf("MARMOT-VEC-030: encoded segment scoring failed: %w", encodedScanErr)
+	}
+	return nil
+}
+
+func scanStableGenerationBlocks(
+	plan *GoRankPlan,
+	segments *vecindex.SegmentGeneration,
+	queryScorer *vecindex.StableMemberQueryScorer,
+	topK *topKHeap,
+	scoreRows func(clusterID int64, rows []byte, count uint64, entrySize int) error,
+) (bool, error) {
+	blocks, err := segments.Blocks.ReadClusterBlocks(plan.ClusterIDs)
+	if err != nil {
+		return false, fmt.Errorf("MARMOT-VEC-030: block metadata scan failed: %w", err)
+	}
+	if len(blocks) == 0 {
+		return false, nil
+	}
+	mode := currentBlockPruneMode()
+	scored := make([]scoredBlockRecord, 0, len(blocks))
+	for _, block := range blocks {
+		lb, ok := queryScorer.BlockLowerBound(block.ClusterID, block)
+		scored = append(scored, scoredBlockRecord{record: block, lowerBound: lb, bounded: ok})
+	}
+	slices.SortFunc(scored, func(a, b scoredBlockRecord) int {
+		if !a.bounded && b.bounded {
+			return -1
+		}
+		if a.bounded && !b.bounded {
+			return 1
+		}
+		switch {
+		case a.lowerBound < b.lowerBound:
+			return -1
+		case a.lowerBound > b.lowerBound:
+			return 1
+		default:
+			switch {
+			case a.record.DataOffset < b.record.DataOffset:
+				return -1
+			case a.record.DataOffset > b.record.DataOffset:
+				return 1
+			default:
+				return 0
+			}
+		}
+	})
+	const waveSize = 64
+	var considered, skipped, scoredBlocks, rowsScored uint64
+	for start := 0; start < len(scored); start += waveSize {
+		end := start + waveSize
+		if end > len(scored) {
+			end = len(scored)
+		}
+		wave := scored[start:end]
+		toScore := make([]vecindex.SegmentBlockRecord, 0, len(wave))
+		for _, candidate := range wave {
+			considered++
+			skip := false
+			if candidate.bounded {
+				if worst, ok := topK.WorstDistance(); ok && candidate.lowerBound >= worst+blockPruneMargin {
+					skip = true
+				}
+			}
+			if skip {
+				skipped++
+				if mode == blockPruneSafe {
+					continue
+				}
+			}
+			toScore = append(toScore, candidate.record)
+			scoredBlocks++
+			rowsScored += candidate.record.RowCount
+		}
+		if len(toScore) == 0 {
+			continue
+		}
+		slices.SortFunc(toScore, func(a, b vecindex.SegmentBlockRecord) int {
+			switch {
+			case a.DataOffset < b.DataOffset:
+				return -1
+			case a.DataOffset > b.DataOffset:
+				return 1
+			default:
+				return 0
+			}
+		})
+		var scanErr error
+		if err := segments.Data.ScanBlockRecordsFileOrder(toScore, func(clusterID int64, rows []byte, count uint64, entrySize int) bool {
+			if err := scoreRows(clusterID, rows, count, entrySize); err != nil {
+				scanErr = err
+				return false
+			}
+			return true
+		}); err != nil {
+			return true, fmt.Errorf("MARMOT-VEC-030: block segment scan failed: %w", err)
+		}
+		if scanErr != nil {
+			return true, fmt.Errorf("MARMOT-VEC-030: encoded block scoring failed: %w", scanErr)
+		}
+	}
+	segments.Blocks.RecordQueryStats(considered, skipped, scoredBlocks, rowsScored)
+	return true, nil
 }
 
 func rankShortlistLimit(plan *GoRankPlan) int {

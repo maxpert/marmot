@@ -125,6 +125,19 @@ func TestIndexState_CosineMetric(t *testing.T) {
 	require.Equal(t, int64(1), id)
 }
 
+func TestIndexState_TopNprobeDotUsesQueryAugmentation(t *testing.T) {
+	t.Parallel()
+
+	spec := IVFSpec{ID: "dot", Dim: 2, Metric: MetricDot, Nlist: 2, Nprobe: 1, MaxNorm: 1}
+	centroids := [][]float32{{0, 0, 1}, {3, 0, 0}}
+	state := makeIndexState(t, spec, centroids)
+
+	ids, epoch, err := state.TopNprobeClustersWithEpoch(encodeVec([]float32{3, 0}), 1)
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), epoch)
+	require.Equal(t, []int64{2}, ids)
+}
+
 func TestIndexState_HotClusters(t *testing.T) {
 	t.Parallel()
 	spec := IVFSpec{ID: "test", Dim: 2, Metric: MetricL2, Nlist: 4}

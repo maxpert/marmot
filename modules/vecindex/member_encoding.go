@@ -1,7 +1,10 @@
 package vecindex
 
 import (
+	"encoding/binary"
 	"fmt"
+	"math"
+	"math/bits"
 
 	"github.com/maxpert/marmot/modules/vecindex/pkg/kmeans"
 	"github.com/maxpert/marmot/modules/vecindex/pkg/metric"
@@ -48,6 +51,8 @@ type StableMemberQueryScorer struct {
 	query      []float32
 	queryNorm2 float32
 	pq         *quantize.PQ8QueryScorer
+	pqLUT      []float32
+	residualQ  []float32
 }
 
 type stableMemberCodecMsg struct {
@@ -320,13 +325,17 @@ func NewStableMemberQueryScorerWithCodec(codec *StableMemberCodec, query []float
 	}
 	switch codec.enc {
 	case MemberEncodingResidualInt8:
-		return &StableMemberQueryScorer{codec: codec, query: query, queryNorm2: queryNorm2}, nil
+		residualQ, err := residualQueryValues(query, MemberResidualBlockSize)
+		if err != nil {
+			return nil, err
+		}
+		return &StableMemberQueryScorer{codec: codec, query: query, queryNorm2: queryNorm2, residualQ: residualQ}, nil
 	case MemberEncodingResidualPQ8:
 		pq, err := quantize.NewPQ8QueryScorer(codec.spec.InternalMetric(), query, queryNorm2, codec.pq)
 		if err != nil {
 			return nil, err
 		}
-		return &StableMemberQueryScorer{codec: codec, query: query, queryNorm2: queryNorm2, pq: pq}, nil
+		return &StableMemberQueryScorer{codec: codec, query: query, queryNorm2: queryNorm2, pq: pq, pqLUT: pq.DotLUT()}, nil
 	default:
 		return nil, fmt.Errorf("vecindex: unknown member encoding %d", codec.enc)
 	}
@@ -357,6 +366,91 @@ func (q *StableMemberQueryScorer) ClusterScorer(clusterID int64) (*StableMemberS
 	}
 }
 
+func (q *StableMemberQueryScorer) BlockLowerBound(clusterID int64, block SegmentBlockRecord) (float32, bool) {
+	if q == nil || q.codec == nil || clusterID <= 0 || int(clusterID) > q.codec.centroid.Len() || block.RowCount == 0 {
+		return 0, false
+	}
+	centroid, err := q.codec.centroid.GetReadOnly(uint32(clusterID - 1))
+	if err != nil {
+		return 0, false
+	}
+	switch q.codec.enc {
+	case MemberEncodingResidualInt8:
+		if len(block.Stats) != q.codec.spec.InternalDim()*8 || len(q.residualQ) != q.codec.spec.InternalDim() {
+			return 0, false
+		}
+		baseDot := metric.DotProduct(q.query, centroid)
+		residualUB := float32(0)
+		dim := q.codec.spec.InternalDim()
+		maxBase := dim * 4
+		for i, qv := range q.residualQ {
+			minValue := math.Float32frombits(binary.LittleEndian.Uint32(block.Stats[i*4:]))
+			maxValue := math.Float32frombits(binary.LittleEndian.Uint32(block.Stats[maxBase+i*4:]))
+			if qv >= 0 {
+				residualUB += qv * maxValue
+			} else {
+				residualUB += qv * minValue
+			}
+		}
+		dotUB := baseDot + residualUB
+		switch q.codec.spec.InternalMetric() {
+		case metric.MetricCosine:
+			return 1 - dotUB, true
+		case metric.MetricL2:
+			return q.queryNorm2 + block.MinNorm2 - 2*dotUB, true
+		default:
+			return 0, false
+		}
+	case MemberEncodingResidualPQ8:
+		pq := q.codec.pq
+		if pq == nil || len(q.pqLUT) != pq.M*segmentBlockPQCodebookSize || len(block.Stats) != pq.M*segmentBlockPQMaskWords*8 {
+			return 0, false
+		}
+		dotUB := metric.DotProduct(q.query, centroid)
+		for sub := 0; sub < pq.M; sub++ {
+			best := -float32(math.MaxFloat32)
+			maskBase := sub * segmentBlockPQMaskWords * 8
+			lutBase := sub * segmentBlockPQCodebookSize
+			for word := 0; word < segmentBlockPQMaskWords; word++ {
+				mask := binary.LittleEndian.Uint64(block.Stats[maskBase+word*8:])
+				for mask != 0 {
+					bit := bits.TrailingZeros64(mask)
+					code := word*64 + bit
+					value := q.pqLUT[lutBase+code]
+					if value > best {
+						best = value
+					}
+					mask &= mask - 1
+				}
+			}
+			if best == -float32(math.MaxFloat32) {
+				return 0, false
+			}
+			dotUB += best
+		}
+		switch q.codec.spec.InternalMetric() {
+		case metric.MetricL2:
+			return q.queryNorm2 + block.MinNorm2 - 2*dotUB, true
+		case metric.MetricCosine:
+			if block.MinNorm2 <= 0 || block.MaxNorm2 <= 0 {
+				return 0, false
+			}
+			denom := float32(math.Sqrt(float64(block.MinNorm2)))
+			if dotUB < 0 {
+				denom = float32(math.Sqrt(float64(block.MaxNorm2)))
+			}
+			if denom <= 0 {
+				return 0, false
+			}
+			return 1 - dotUB/denom, true
+		default:
+			return 0, false
+		}
+	default:
+		return 0, false
+	}
+}
+
 func (s *StableMemberScorer) Score(vec []byte) (float32, error) {
 	if s == nil {
 		return 0, fmt.Errorf("vecindex: stable member scorer is nil")
@@ -369,6 +463,25 @@ func (s *StableMemberScorer) Score(vec []byte) (float32, error) {
 	default:
 		return 0, fmt.Errorf("vecindex: unknown member encoding %d", s.enc)
 	}
+}
+
+func residualQueryValues(query []float32, blockSize int) ([]float32, error) {
+	codes, scales, err := quantize.QuantizeQueryInt8(query, blockSize)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]float32, len(query))
+	for block, scale := range scales {
+		start := block * blockSize
+		end := start + blockSize
+		if end > len(query) {
+			end = len(query)
+		}
+		for i := start; i < end; i++ {
+			out[i] = scale * float32(codes[i])
+		}
+	}
+	return out, nil
 }
 
 func (s *StableMemberScorer) ScoreSpan(rows []byte, entrySize int, out []float32) error {

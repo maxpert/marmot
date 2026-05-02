@@ -127,15 +127,22 @@ def _try_tqdm():
 def download_file(url: str, dest_path: Path) -> None:
     """Download url to dest_path with progress reporting."""
     dest_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = dest_path.with_name(dest_path.name + ".part")
+    tmp_path.unlink(missing_ok=True)
     tqdm = _try_tqdm()
 
     print(f"  Downloading {url}")
     print(f"  -> {dest_path}")
 
-    if tqdm is not None:
-        _download_with_tqdm(url, dest_path, tqdm)
-    else:
-        _download_simple(url, dest_path)
+    try:
+        if tqdm is not None:
+            _download_with_tqdm(url, tmp_path, tqdm)
+        else:
+            _download_simple(url, tmp_path)
+        os.replace(tmp_path, dest_path)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
 
 
 def _download_with_tqdm(url: str, dest_path: Path, tqdm_cls) -> None:
@@ -254,7 +261,14 @@ _SIFT_URL = "ftp://ftp.irisa.fr/local/texmex/corpus/sift.tar.gz"
 _SIFT_REQUIRED_BYTES = 700 * (1 << 20)  # ~700 MB after extraction
 
 
-def fetch_sift128(output_dir: Path, subset: int, k: int, force: bool) -> None:
+def random_subset_indices(np, n: int, subset: int, seed: int):
+    if subset <= 0 or subset >= n:
+        return None
+    rng = np.random.default_rng(seed)
+    return rng.choice(n, size=subset, replace=False)
+
+
+def fetch_sift128(output_dir: Path, subset: int, k: int, force: bool, subset_seed: int) -> None:
     dataset_dir = output_dir / "sift-128"
     if _output_exists(dataset_dir) and not force:
         print(f"[sift-128] Output already exists at {dataset_dir}. Use --force to re-generate.")
@@ -289,12 +303,15 @@ def fetch_sift128(output_dir: Path, subset: int, k: int, force: bool) -> None:
         train = read_fvecs(sift_dir / "sift_base.fvecs")
         test = read_fvecs(sift_dir / "sift_query.fvecs")
         gt_native = read_ivecs(sift_dir / "sift_groundtruth.ivecs")
+    source_n_train = len(train)
 
     _validate_dims(train, test, expected_dim=128, name="sift-128")
 
-    if subset and subset < len(train):
-        print(f"[sift-128] Subsetting to first {subset} train vectors, recomputing ground truth ...")
-        train = train[:subset]
+    np = _require_numpy()
+    subset_indices = random_subset_indices(np, len(train), subset, subset_seed)
+    if subset_indices is not None:
+        print(f"[sift-128] Randomly selecting {subset} train vectors with seed {subset_seed}, recomputing ground truth ...")
+        train = train[subset_indices]
         gt = compute_ground_truth(train, test, "euclidean", k)
     else:
         subset = len(train)
@@ -312,6 +329,9 @@ def fetch_sift128(output_dir: Path, subset: int, k: int, force: bool) -> None:
         "dim": 128,
         "metric": "euclidean",
         "k": k,
+        "subset_method": "random_without_replacement" if subset_indices is not None else "full",
+        "subset_seed": subset_seed if subset_indices is not None else None,
+        "source_n_train": source_n_train,
     })
     print(f"[sift-128] Done. Output at {dataset_dir}")
 
@@ -327,7 +347,7 @@ _DBPEDIA_URL = (
 _DBPEDIA_REQUIRED_BYTES = 7 * (1 << 30)  # ~7 GB
 
 
-def fetch_dbpedia1536(output_dir: Path, subset: int, k: int, force: bool) -> None:
+def fetch_dbpedia1536(output_dir: Path, subset: int, k: int, force: bool, subset_seed: int) -> None:
     h5py = _require_h5py()
     dataset_dir = output_dir / "dbpedia-openai-1536"
     if _output_exists(dataset_dir) and not force:
@@ -351,22 +371,27 @@ def fetch_dbpedia1536(output_dir: Path, subset: int, k: int, force: bool) -> Non
     print("[dbpedia-openai-1536] Reading HDF5 file ...")
     with h5py.File(hdf5_file, "r") as hf:
         _validate_hdf5_keys(hf, required=["train", "test", "neighbors", "distances"])
+        np = _require_numpy()
         n_train = hf["train"].shape[0]
-        if subset and subset < n_train:
-            train = hf["train"][:subset]
+        subset_indices = random_subset_indices(np, n_train, subset, subset_seed)
+        if subset_indices is not None:
+            order = np.argsort(subset_indices)
+            read_indices = subset_indices[order]
+            train_sorted = np.asarray(hf["train"][read_indices], dtype=np.float32)
+            inverse = np.empty_like(order)
+            inverse[order] = np.arange(len(order))
+            train = train_sorted[inverse]
         else:
             train = hf["train"][:]
-        test = hf["test"][:]
-        gt_native = None if subset and subset < n_train else hf["neighbors"][:]
+        test = np.asarray(hf["test"][:], dtype=np.float32)
+        gt_native = None if subset_indices is not None else hf["neighbors"][:]
 
-    np = _require_numpy()
     train = np.asarray(train, dtype=np.float32)
-    test = np.asarray(test, dtype=np.float32)
 
     _validate_dims(train, test, expected_dim=1536, name="dbpedia-openai-1536")
 
-    if subset and subset < n_train:
-        print(f"[dbpedia-openai-1536] Subsetting to first {subset} train vectors, recomputing ground truth ...")
+    if subset_indices is not None:
+        print(f"[dbpedia-openai-1536] Randomly selected {subset} train vectors with seed {subset_seed}, recomputing ground truth ...")
         gt = compute_ground_truth(train, test, "angular", k)
     else:
         subset = len(train)
@@ -383,6 +408,9 @@ def fetch_dbpedia1536(output_dir: Path, subset: int, k: int, force: bool) -> Non
         "dim": 1536,
         "metric": "angular",
         "k": k,
+        "subset_method": "random_without_replacement" if subset_indices is not None else "full",
+        "subset_seed": subset_seed if subset_indices is not None else None,
+        "source_n_train": int(n_train),
     })
     print(f"[dbpedia-openai-1536] Done. Output at {dataset_dir}")
 
@@ -448,7 +476,13 @@ def main() -> None:
         type=int,
         default=0,
         metavar="N",
-        help="Use first N training vectors (0 = all). Recomputes ground truth.",
+        help="Randomly select N training vectors without replacement (0 = all). Recomputes ground truth.",
+    )
+    parser.add_argument(
+        "--subset-seed",
+        type=int,
+        default=42,
+        help="Seed for deterministic random subset selection.",
     )
     parser.add_argument(
         "--output-dir",
@@ -485,6 +519,7 @@ def main() -> None:
         subset=args.subset,
         k=args.k,
         force=args.force,
+        subset_seed=args.subset_seed,
     )
 
 

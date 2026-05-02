@@ -158,3 +158,20 @@ func TestSelectProbeClusterIDs_UsesLiveMaintenanceCounts(t *testing.T) {
 		}
 	}
 }
+
+func TestCurrentBlockPruneModeDefaultsOff(t *testing.T) {
+	t.Setenv("MARMOT_VEC_BLOCK_PRUNE_MODE", "")
+	if got := currentBlockPruneMode(); got != blockPruneOff {
+		t.Fatalf("currentBlockPruneMode() = %v, want off", got)
+	}
+
+	t.Setenv("MARMOT_VEC_BLOCK_PRUNE_MODE", "safe")
+	if got := currentBlockPruneMode(); got != blockPruneSafe {
+		t.Fatalf("currentBlockPruneMode() = %v, want safe", got)
+	}
+
+	t.Setenv("MARMOT_VEC_BLOCK_PRUNE_MODE", "shadow")
+	if got := currentBlockPruneMode(); got != blockPruneShadow {
+		t.Fatalf("currentBlockPruneMode() = %v, want shadow", got)
+	}
+}

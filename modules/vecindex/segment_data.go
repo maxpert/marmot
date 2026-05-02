@@ -44,9 +44,15 @@ type segmentReadBatchSpec struct {
 }
 
 type SegmentScanStats struct {
-	ReadBytes    uint64
-	LogicalBytes uint64
-	ReadBatches  uint64
+	ReadBytes          uint64
+	LogicalBytes       uint64
+	ReadBatches        uint64
+	BlockMetaReadBytes uint64
+	BlockMetaReads     uint64
+	BlocksConsidered   uint64
+	BlocksSkipped      uint64
+	BlocksScored       uint64
+	BlockRowsScored    uint64
 }
 
 // SegmentDataStore is a read-only stable-vector generation file opened with
@@ -105,6 +111,13 @@ func (w *SegmentDataWriter) NextOffset() uint64 {
 		return 0
 	}
 	return w.offset
+}
+
+func (w *SegmentDataWriter) EntrySize() int {
+	if w == nil {
+		return 0
+	}
+	return w.entrySize
 }
 
 func OpenSegmentDataStore(path string) (*SegmentDataStore, error) {
@@ -721,6 +734,73 @@ func (s *SegmentDataStore) ScanClustersFileOrderSpans(clusterIDs []int64, yield 
 	if len(batches) == 0 {
 		return nil
 	}
+	bufPtr := s.batchBufPool.Get().(*[]byte)
+	maxBuf := s.batchBufferSize()
+	defer func() {
+		if cap(*bufPtr) > maxBuf {
+			buf := make([]byte, maxBuf)
+			*bufPtr = buf
+		}
+		s.batchBufPool.Put(bufPtr)
+	}()
+	buf := *bufPtr
+	for _, batch := range batches {
+		need := int(batch.end - batch.start)
+		if need > len(buf) {
+			buf = make([]byte, need)
+			*bufPtr = buf
+		}
+		if _, err := s.file.ReadAt(buf[:need], batch.start); err != nil {
+			return err
+		}
+		s.readBytes.Add(uint64(need))
+		s.readBatches.Add(1)
+		for _, span := range batch.spans {
+			start := int(span.offset - batch.start)
+			end := start + int(span.bytes)
+			s.logicalBytes.Add(uint64(span.bytes))
+			if !yield(span.clusterID, buf[start:end], span.count, s.entrySize) {
+				return nil
+			}
+		}
+	}
+	return nil
+}
+
+func (s *SegmentDataStore) ScanBlockRecordsFileOrder(blocks []SegmentBlockRecord, yield func(clusterID int64, rows []byte, count uint64, entrySize int) bool) error {
+	if s == nil || len(blocks) == 0 {
+		return nil
+	}
+	spans := make([]segmentClusterSpan, 0, len(blocks))
+	for _, block := range blocks {
+		if block.RowCount == 0 || block.DataBytes <= 0 {
+			continue
+		}
+		spans = append(spans, segmentClusterSpan{
+			clusterID: block.ClusterID,
+			offset:    block.DataOffset,
+			bytes:     block.DataBytes,
+			count:     block.RowCount,
+		})
+	}
+	if len(spans) == 0 {
+		return nil
+	}
+	slices.SortFunc(spans, func(a, b segmentClusterSpan) int {
+		switch {
+		case a.offset < b.offset:
+			return -1
+		case a.offset > b.offset:
+			return 1
+		default:
+			return 0
+		}
+	})
+	gap := int64(0)
+	if s.encoding != MemberEncodingResidualPQ8 {
+		gap = segmentReadGap
+	}
+	batches := planSegmentReadBatches(spans, int64(s.batchBufferSize()), gap)
 	bufPtr := s.batchBufPool.Get().(*[]byte)
 	maxBuf := s.batchBufferSize()
 	defer func() {

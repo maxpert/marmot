@@ -269,6 +269,13 @@ func NewPQ8QueryScorer(rankMetric metric.Metric, query []float32, queryNorm2 flo
 	}, nil
 }
 
+func (q *PQ8QueryScorer) DotLUT() []float32 {
+	if q == nil {
+		return nil
+	}
+	return q.lut
+}
+
 func (q *PQ8QueryScorer) ClusterScorer(query, centroid []float32) (*PQ8Scorer, error) {
 	if q == nil {
 		return nil, fmt.Errorf("quantize: PQ query scorer is nil")
