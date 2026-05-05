@@ -7,6 +7,7 @@ import (
 	"context"
 	"database/sql"
 	"math/rand"
+	"os"
 	"runtime"
 	"sort"
 	"strings"
@@ -49,6 +50,16 @@ const (
 	benchBatchSize = 1000
 	benchNQueries  = 100
 )
+
+func requireVectorBenchTests(t testing.TB, name string) {
+	t.Helper()
+	if testing.Short() {
+		t.Skipf("skipping %s in short mode", name)
+	}
+	if os.Getenv("MARMOT_RUN_VECTOR_BENCH_TESTS") != "1" {
+		t.Skipf("skipping %s; set MARMOT_RUN_VECTOR_BENCH_TESTS=1 to run 100K vector benchmark tests", name)
+	}
+}
 
 // benchSetup holds all objects for the 100K benchmark tests.
 type benchSetup struct {
@@ -285,9 +296,7 @@ func benchVecQuery(t testing.TB, s *benchSetup, sqlTpl string, qVec []byte, sess
 // TestRecall100K measures recall@10 across 100 queries against 100K vectors
 // through the full coordinator rewrite → execute path.
 func TestRecall100K(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping 100K recall test in short mode")
-	}
+	requireVectorBenchTests(t, "100K recall test")
 
 	s := setupBench100K(t)
 	rng := rand.New(rand.NewSource(17))
@@ -486,9 +495,7 @@ func reportLatencyPercentiles(b *testing.B, latencies []time.Duration) {
 
 // TestMemoryProfile100K measures heap allocations from index creation + populate.
 func TestMemoryProfile100K(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping 100K memory test in short mode")
-	}
+	requireVectorBenchTests(t, "100K memory profile test")
 
 	runtime.GC()
 	var memBefore runtime.MemStats
@@ -523,9 +530,7 @@ func TestMemoryProfile100K(t *testing.T) {
 
 // TestReindexUnderLoad100K runs REINDEX while concurrent queries execute.
 func TestReindexUnderLoad100K(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping 100K reindex-under-load test in short mode")
-	}
+	requireVectorBenchTests(t, "100K reindex-under-load test")
 
 	s := setupBench100K(t)
 	rng := rand.New(rand.NewSource(31))
@@ -653,9 +658,7 @@ ORDER BY vec_distance(embed, ?) LIMIT 10`
 // TestSweepRecallLatency runs recall + latency measurements across multiple
 // nlist/nprobe configurations to find the optimal operating point.
 func TestSweepRecallLatency(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping sweep in short mode")
-	}
+	requireVectorBenchTests(t, "100K recall/latency sweep")
 
 	configs := []struct {
 		name   string

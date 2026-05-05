@@ -148,6 +148,8 @@ func TestGoRank_Recall(t *testing.T) {
 }
 
 func TestGoRank_DeltaOnlyAfterEmptyCreate(t *testing.T) {
+	requireVectorBenchTests(t, "empty-create delta vector integration test")
+
 	tmpDir := t.TempDir()
 	clock := hlc.NewClock(1)
 
