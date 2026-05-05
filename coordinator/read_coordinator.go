@@ -123,7 +123,7 @@ func (rc *ReadCoordinator) ReadTransaction(ctx context.Context, req *ReadRequest
 	}
 
 	// For QUORUM/ALL, read from multiple nodes
-	responses, err := rc.readFromNodes(ctx, cluster.AliveNodes, req)
+	responses, err := rc.readFromNodes(ctx, cluster.AliveNodes, cluster.RequiredQuorum, req)
 	if err != nil {
 		return nil, fmt.Errorf("read failed: %w", err)
 	}
@@ -151,7 +151,7 @@ func (rc *ReadCoordinator) ReadTransaction(ctx context.Context, req *ReadRequest
 }
 
 // readFromNodes executes read on multiple nodes
-func (rc *ReadCoordinator) readFromNodes(ctx context.Context, nodeIDs []uint64,
+func (rc *ReadCoordinator) readFromNodes(ctx context.Context, nodeIDs []uint64, requiredResponses int,
 	req *ReadRequest) (map[uint64]*ReadResponse, error) {
 
 	ctx, cancel := context.WithTimeout(ctx, rc.timeout)
@@ -183,6 +183,9 @@ func (rc *ReadCoordinator) readFromNodes(ctx context.Context, nodeIDs []uint64,
 		select {
 		case result := <-responseChan:
 			responses[result.nodeID] = result.resp
+			if len(responses) >= requiredResponses {
+				return responses, nil
+			}
 		case <-ctx.Done():
 			return responses, nil
 		}
