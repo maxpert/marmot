@@ -14,7 +14,7 @@ The public SQL surface is small:
 - `vec_match(column, query_vector, k)` in `WHERE`
 - `vec_distance(column, query_vector)` in `ORDER BY`
 
-The exact embedding remains in the base table. Marmot builds node-local derived state for fast candidate search: centroids, immutable segment generations, row maps, manifests, and an overlay journal. Exact rerank still reads the shortlist vectors from the base table before returning final rows.
+The exact embedding remains in the base table. Marmot builds node-local derived state for fast candidate search: centroids, immutable segment generations, row maps, manifests, and an overlay journal. Exact rerank still reads shortlist vectors from the base table before returning final rows.
 
 ## Enable It
 
@@ -176,12 +176,25 @@ SELECT id, source_uri, chunk_no, title, body
 
 Pass the same query-vector blob to both placeholders.
 
+`LIMIT` is the final output count. The third argument to `vec_match` is the candidate and exact-rerank budget. For ordinary top-10 search, keep them equal. For extra recall headroom or selective filters, use a larger `vec_match` budget while keeping the final `LIMIT` small:
+
+```sql
+SELECT id, source_uri, chunk_no, title
+  FROM chunks
+ WHERE vec_match(embedding, ?, 100)
+   AND tenant_id = 42
+   AND status = 'published'
+ ORDER BY vec_distance(embedding, ?)
+ LIMIT 10;
+```
+
 Requirements:
 
 - Use exactly one `vec_match` per `SELECT`.
 - Include `ORDER BY vec_distance(...)` on the same vector column.
 - Include a positive literal `LIMIT`.
-- Keep `vec_match` K and `LIMIT` aligned for normal top-K search.
+- Keep `vec_match` K and `LIMIT` aligned for normal top-K search, or make `vec_match` K larger when you want a deeper candidate/rerank budget.
+- `vec_match` K must be greater than or equal to `LIMIT`.
 - Use the same embedding dimensionality that was declared in `DIM`.
 
 ## DDL Reference
@@ -220,7 +233,7 @@ Current defaults:
 |---|---|
 | Target partition size | 512 vectors per IVF partition |
 | Non-empty create `nlist` | roughly `ceil(rows / 512)`, clamped by the supported auto range |
-| Empty-table first publish | starts from a smaller bootstrap cluster set once enough overlay rows exist |
+| Empty-table first publish | starts from a bounded overlay snapshot once enough overlay rows exist |
 | Later growth | background maintenance can promote to a larger cluster count as rows grow |
 | Auto `nprobe` | derived from the target partition size; default behavior probes about 16 target partitions |
 
@@ -274,7 +287,7 @@ Vector indexes have four practical milestones.
 | First clustered publish | Marmot has published the first immutable `.vecseg` generation and can scan stable clusters. |
 | Settled | Overlay backlog is below merge thresholds, auto cluster count no longer needs promotion, and cluster skew is within the current bounds. |
 
-For empty-table create, Marmot does not wait for the whole corpus before the first clustered state. The current bootstrap path waits until enough overlay rows exist for auto tuning. With default policy that floor is 8 target partitions, or 4096 rows. The first publish is bounded by the bootstrap target and capped at 16384 rows. If the overlay is below the publish target, Marmot waits briefly for writes to quiesce before publishing.
+For empty-table create, Marmot does not wait for the whole corpus before the first clustered state. The current auto-tuned bootstrap path waits until enough overlay rows exist for a useful initial structure. With the default target partition size, that floor is 64 target partitions, or 32,768 rows. The first publish is bounded by the bootstrap target and capped at 65,536 rows. If the overlay is below the publish target, Marmot waits briefly for writes to quiesce before publishing.
 
 For non-empty create, `CREATE VECTOR INDEX` builds the first local generation from existing table rows before the index is ready.
 
@@ -325,10 +338,12 @@ Useful log messages include:
 - p50, p95, and p99 latency
 - RSS snapshots
 - stable encoding
+- overlay encoding mix and overlay journal size
 - block metadata rows and file size
 - segment logical bytes/query
 - segment actual read bytes/query
 - segment overread
+- exact rerank rows/query
 
 ## Runtime Model
 
@@ -372,7 +387,7 @@ In post-filter IVF mode:
 6. It reranks exact distances in Go.
 7. It issues a final projection query for only the final top-K rowids.
 
-The approximate scan is used for candidate generation only. Final distance ordering uses exact vectors from the base table.
+The approximate scan is used for candidate generation only. Final distance ordering uses exact vectors from the base table for every non-empty ANN candidate set. For safe filtered post-ranking, Marmot can widen the candidate budget and refill until enough rows survive the SQL predicate, the search space is exhausted, or the internal safety cap is reached. Unsupported predicate shapes fall back to the pre-filter path instead of serving stale approximate results.
 
 New generations also write a `.blk` sidecar. The sidecar is validated against the `.dat` file on open, is deleted with retired generations, and is available for internal block-pruning experiments and scan metrics. Current default query execution keeps block pruning off unless explicitly enabled internally, because the latest 100K run showed the full selected-cluster PQ scan was faster at this scale.
 
@@ -386,7 +401,7 @@ After a successful commit:
 4. Queries see those changes immediately from the overlay.
 5. Background maintenance publishes new immutable generations and compacts applied overlay rows.
 
-Exact rerank and maintenance always use the base table as the truth source. Lossy stable or overlay encodings are not used to update centroid sums or exact distances.
+Overlay snapshots are offset-backed and use a bounded vector cache; large online builds stream bootstrap and catch-up rows through temporary spools instead of retaining every prepared vector in heap. Exact rerank and maintenance always use the base table as the truth source. Lossy stable or overlay encodings are not used to update centroid sums or exact distances.
 
 ### Stable Encoding
 
@@ -398,6 +413,8 @@ Stable segments use compact encodings:
 | Residual int8 | Internal dimension is less than 512. |
 
 Raw float32 stable segment payloads are not written. Residual PQ8 uses generation-local codebooks. Incremental maintenance reuses the generation codec for touched clusters so untouched cluster spans remain byte-copyable. Full rebuild or manual `REINDEX VECTOR` is the codec refresh path.
+
+PQ8 codebooks are trained deterministically from a bounded sample with multi-start subspace k-means. This spends more build CPU to improve compressed-score quality while keeping read memory low.
 
 ## Replication
 
@@ -490,6 +507,32 @@ Latest local validation used a random 100K-row subset of the DBpedia OpenAI 1536
 
 The matching 100K force-build lifecycle run measured DDL create at 203ms, 100,000 inserts in 3.00s, first clustered publish at 15.886s, and final settled state at 1m08.286s.
 
+### Latest 500K Validation
+
+Latest larger local validation used a random 500K-row subset of the same DBpedia OpenAI 1536d source corpus with subset seed `42`. The read-only measurement used the full 10,000-query set, `K=10`, cosine distance, Go-rank, id projection, read concurrency `8`, and explicit `nprobe=48`.
+
+| Metric | Measured value |
+|---|---:|
+| Rows | 500,000 |
+| Source rows | 990,000 |
+| `nlist` | 977 |
+| `nprobe` | 48 |
+| Stable encoding | Residual PQ8 |
+| Payload bytes/vector | 132 |
+| Entry bytes/vector | 140 |
+| Stable `.dat` size | 70,015,704 bytes |
+| Block metadata | 4,401 blocks |
+| Segment read bytes/query | 3,456,555 |
+| Segment overread | 1.00x |
+| Recall@10 | 0.9575 |
+| Recall@10-in-100 | 1.0000 |
+| Aggregate read QPS | 1,053 |
+| Latency p50 / p95 / p99 | 7.04ms / 12.13ms / 15.28ms |
+| RSS after reopen | 185 MB |
+| RSS after measurement | 459 MB |
+
+The matching 500K force-build lifecycle run measured 500,000 inserts in 36.118s, first clustered publish at 1m21.011s, final settled state at 5m31.928s, and same-process RSS after settled cleanup at 917 MB. Reopened steady read memory is lower because transient insert, bootstrap, and catch-up buffers are gone.
+
 ## Crash Safety
 
 Stable generation publish is append-and-swap:
@@ -508,11 +551,12 @@ The old generation remains valid until `manifest/current` points to the new gene
 
 - Exactly one `vec_match` is supported per `SELECT`.
 - `LIMIT` is required and must be a positive literal integer.
+- `vec_match` K is the candidate/rerank budget and must be greater than or equal to `LIMIT`.
 - `vec_match` queries must order by `vec_distance` on the same vector column.
 - The base table must have an `INTEGER PRIMARY KEY`.
 - The embedding must be a packed little-endian `float32` `BLOB`.
 - Vector index DDL uses simple table/index/column identifiers; run `USE database` first.
 - `target_partition_size` is currently internal and not a SQL DDL option.
 - Initial bootstrap, promotion, and `REINDEX VECTOR` are CPU-heavy because centroid training happens in-process.
-- Exact rerank reads shortlisted vectors from the base table, so very large final shortlist settings can increase SQLite read cost.
+- Exact rerank reads shortlisted vectors from the base table, so very large `vec_match` candidate budgets can increase SQLite read cost.
 - Segment files, rowmaps, centroids, PQ codebooks, and overlay journals are local derived state and are not replicated.

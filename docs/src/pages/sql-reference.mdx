@@ -878,7 +878,7 @@ SELECT id, title
  LIMIT 10;
 ```
 
-Supported metrics: `l2`, `cosine`, `dot`. `nlist`, `nprobe`, and `max_norm` are optional `WITH` parameters; omit `nlist` and `nprobe` to use auto tuning. `vec_match` queries require one `vec_match`, `ORDER BY vec_distance(...)` on the same column, and a literal positive `LIMIT`.
+Supported metrics: `l2`, `cosine`, `dot`. `nlist`, `nprobe`, and `max_norm` are optional `WITH` parameters; omit `nlist` and `nprobe` to use auto tuning. `vec_match` queries require one `vec_match`, `ORDER BY vec_distance(...)` on the same column, and a literal positive `LIMIT`. `LIMIT` is the final output count; `vec_match(..., k)` is the ANN candidate and exact-rerank budget, and `k` must be greater than or equal to `LIMIT`.
 
 See the [Vector Search](/vector-search) page for the full startup guide, RAG schema example, lifecycle and settling details, tuning guidance, replication semantics, session variables, and limitations.
 

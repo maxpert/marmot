@@ -534,6 +534,19 @@ SELECT id, source_uri, chunk_no, title, body
 
 Pass the same query-vector blob to both placeholders.
 
+`LIMIT` is the final row count. The third argument to `vec_match` is the ANN candidate and exact-rerank budget, so it may be larger than `LIMIT` when you want more recall headroom or selective post-filters:
+
+```sql
+SELECT id, title
+  FROM chunks
+ WHERE vec_match(embedding, ?, 100)
+   AND tenant_id = 42
+ ORDER BY vec_distance(embedding, ?)
+ LIMIT 10;
+```
+
+Marmot rejects `vec_match(..., k)` when `k < LIMIT`.
+
 ### Tuning Basics
 
 For most RAG stores, start with auto tuning:
@@ -590,12 +603,32 @@ Latest local 100K vector validation:
 
 The same 100K force-build validation measured DDL create at 203ms, insert at 100,000 rows in 3.00s, first clustered publish at 15.886s, and final settled state at 1m08.286s.
 
+Latest local 500K read validation:
+
+| Metric | Value |
+|--------|-------|
+| Dataset | Random 500K DBpedia OpenAI 1536d subset from 990K rows, seed 42 |
+| Query set | 10,000 queries, cosine, `K=10`, Go-rank, id projection |
+| Index shape | `nlist=977`, explicit read test `nprobe=48` |
+| Stable encoding | Residual PQ8, 132 payload bytes/vector, 140 entry bytes/vector |
+| Stable data file | 70,015,704 bytes for 500,000 rows |
+| Block metadata | 4,401 blocks |
+| Segment read/query | 3,456,555 bytes, 1.00x overread |
+| Recall | `recall@10 = 0.9575`, `recall@10-in-100 = 1.0000` |
+| Read throughput | 1,053 QPS aggregate at concurrency 8 |
+| Read latency | p50 7.04ms, p95 12.13ms, p99 15.28ms |
+| RSS after reopen | 185 MB |
+| RSS after measurement | 459 MB |
+
+The matching 500K force-build lifecycle run measured 500,000 inserts in 36.118s, first clustered publish at 1m21.011s, final settled state at 5m31.928s, and RSS after settled cleanup at 917 MB in the same process. Reopened steady read memory is lower because the transient build buffers are gone.
+
 ### Runtime Model
 
 - **Base table**: exact vectors and metadata remain in your user table.
 - **Local derived files**: each node stores immutable `.vecseg` generations, rowmaps, block metadata sidecars, manifests, and an overlay journal next to the SQLite database.
 - **Approximate scan**: high-dimensional stable rows use compact residual PQ8; low-dimensional stable rows use residual int8. Raw float32 stable segment payloads are not written.
-- **Exact rerank**: Marmot fetches shortlisted exact vectors from the base table, materializes them in Go, and reranks exactly before returning rows.
+- **Overlay**: rows are query-visible immediately. Before first publish the overlay may hold temporary prepared float32 bytes; after probe centroids exist, overlay rows are compact residual int8 refs and applied prefixes are compacted away.
+- **Exact rerank**: Marmot fetches shortlisted exact vectors from the base table, materializes them in Go, and reranks every non-empty ANN candidate set before returning rows. Filtered Go-rank queries can widen candidate budgets to refill the final `LIMIT`.
 - **Replication**: DML replicates as row-level CDC; vector index DDL replicates as compact control metadata. Segment files, rowmaps, block metadata sidecars, centroids, PQ codebooks, and overlay journals are local derived state, not replicated artifacts.
 
 Metrics: `l2`, `cosine`, and `dot`. For `dot`, set `WITH (max_norm = ...)` to a fixed upper bound for vector norms.
