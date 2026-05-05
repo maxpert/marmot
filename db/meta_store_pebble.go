@@ -2,7 +2,10 @@ package db
 
 import (
 	"encoding/binary"
+	"hash/crc32"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -39,6 +42,20 @@ const (
 // Sharded lock for WriteIntent serialization (prevents TOCTOU race)
 const intentLockShards = 256
 
+const (
+	cdcRawWALFileName  = "cdc_rows.log"
+	cdcRawPointerMagic = uint32(0x43444259) // "CDBY"
+	cdcRawPointerVer   = uint8(1)
+	cdcRawHeaderSize   = 16
+	cdcRawPointerSize  = 24
+)
+
+type cdcRawPointer struct {
+	Offset uint64
+	Length uint32
+	CRC32  uint32
+}
+
 // PebbleMetaStore implements MetaStore using Pebble
 // TransactionGetter is a function type for looking up transaction records.
 // Used to allow MemoryMetaStore to inject its own transaction lookup during conflict resolution.
@@ -66,6 +83,9 @@ type PebbleMetaStore struct {
 
 	// In-memory CDC locks (row + DDL) for conflict detection
 	cdcLocks *XsyncCDCLockStore
+
+	cdcWALMu   sync.Mutex
+	cdcWALFile *os.File
 
 	// Optional transaction getter for conflict resolution (set by MemoryMetaStore wrapper)
 	txnGetter TransactionGetter
