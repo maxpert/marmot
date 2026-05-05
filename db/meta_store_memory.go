@@ -63,6 +63,11 @@ func (m *MemoryMetaStore) BeginTransaction(txnID, nodeID uint64, startTS hlc.Tim
 	return nil
 }
 
+// DurablyPrepareTransaction delegates the durable prepare fence to Pebble.
+func (m *MemoryMetaStore) DurablyPrepareTransaction(txnID uint64) error {
+	return m.pebble.DurablyPrepareTransaction(txnID)
+}
+
 // GetTransaction reconstructs TransactionRecord from Pebble and memory state.
 func (m *MemoryMetaStore) GetTransaction(txnID uint64) (*TransactionRecord, error) {
 	// Read immutable from Pebble
@@ -294,6 +299,11 @@ func (m *MemoryMetaStore) CleanupAfterCommit(txnID uint64) error {
 // WriteCapturedRow delegates to Pebble.
 func (m *MemoryMetaStore) WriteCapturedRow(txnID, seq uint64, data []byte) error {
 	return m.pebble.WriteCapturedRow(txnID, seq, data)
+}
+
+// SealCapturedRows delegates to Pebble.
+func (m *MemoryMetaStore) SealCapturedRows(txnID uint64) error {
+	return m.pebble.SealCapturedRows(txnID)
 }
 
 // IterateCapturedRows delegates to Pebble.

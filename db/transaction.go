@@ -158,6 +158,9 @@ func (tm *TransactionManager) batchCommitEnabled() bool {
 
 // SetBatchCommitter sets the batch committer (called by ReplicatedDatabase)
 func (tm *TransactionManager) SetBatchCommitter(bc *SQLiteBatchCommitter) {
+	if bc != nil {
+		bc.SetSealCapturedRows(tm.metaStore.SealCapturedRows)
+	}
 	tm.batchCommitter = bc
 }
 
@@ -274,7 +277,10 @@ func (tm *TransactionManager) CommitTransaction(txn *Transaction) error {
 				return fmt.Errorf("batch commit failed: %w", err)
 			}
 		} else {
-			if err := tm.applyCDCEntries(txn.ID, cdcEntries); err != nil {
+			if err := tm.metaStore.SealCapturedRows(txn.ID); err != nil {
+				return fmt.Errorf("failed to seal CDC rows: %w", err)
+			}
+			if err := tm.applyCDCEntries(txn.ID, txn.CommitTS, cdcEntries); err != nil {
 				return err
 			}
 			txn.Statements = tm.rebuildStatementsFromCDC(cdcEntries, nil)
@@ -304,6 +310,9 @@ func (tm *TransactionManager) CommitTransaction(txn *Transaction) error {
 		// Write non-DML statements to CDC storage for streaming replication
 		if err := tm.writeNonDMLToCDC(txn.ID, intents); err != nil {
 			return err
+		}
+		if err := tm.metaStore.SealCapturedRows(txn.ID); err != nil {
+			return fmt.Errorf("failed to seal CDC rows: %w", err)
 		}
 		txn.Statements = tm.rebuildStatementsFromCDC(nil, intents)
 	}
@@ -481,7 +490,7 @@ func (tm *TransactionManager) rebuildStatementsFromCDC(cdcEntries []*IntentEntry
 }
 
 // applyCDCEntries applies CDC data entries to SQLite within a single transaction.
-func (tm *TransactionManager) applyCDCEntries(txnID uint64, entries []*IntentEntry) error {
+func (tm *TransactionManager) applyCDCEntries(txnID uint64, commitTS hlc.Timestamp, entries []*IntentEntry) error {
 	if len(entries) == 0 {
 		return nil
 	}
@@ -499,6 +508,9 @@ func (tm *TransactionManager) applyCDCEntries(txnID uint64, entries []*IntentEnt
 		if err := ApplyCDCEntry(tx, schemaAdapter, entry); err != nil {
 			return fmt.Errorf("failed to write CDC data for %s: %w", entry.Table, err)
 		}
+	}
+	if err := MarkSQLiteTxnApplied(tx, txnID, commitTS); err != nil {
+		return err
 	}
 
 	if err := tx.Commit(); err != nil {

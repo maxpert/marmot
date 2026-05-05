@@ -97,9 +97,12 @@ func initBatchCommitterMetrics() {
 type pendingCommit struct {
 	cdcEntries []*IntentEntry
 	stmts      []protocol.Statement
+	commitTS   hlc.Timestamp
 	promise    *future.Promise[error]
 	err        error
 }
+
+type sealCapturedRowsFunc func(txnID uint64) error
 
 type SQLiteBatchCommitter struct {
 	dbPath string
@@ -107,6 +110,8 @@ type SQLiteBatchCommitter struct {
 
 	mu      sync.Mutex
 	pending map[uint64]*pendingCommit
+
+	sealCapturedRows sealCapturedRowsFunc
 
 	maxBatchSize int
 	maxWaitTime  time.Duration
@@ -131,6 +136,12 @@ type SQLiteBatchCommitter struct {
 	checkpointRunning atomic.Bool
 	vacuumRunning     atomic.Bool
 	bgWg              sync.WaitGroup
+}
+
+func (bc *SQLiteBatchCommitter) SetSealCapturedRows(fn sealCapturedRowsFunc) {
+	bc.mu.Lock()
+	defer bc.mu.Unlock()
+	bc.sealCapturedRows = fn
 }
 
 func NewSQLiteBatchCommitter(
@@ -203,7 +214,7 @@ func (bc *SQLiteBatchCommitter) openOptimizedConnection() (*sql.DB, error) {
 	// See: https://www.powersync.com/blog/sqlite-optimizations-for-ultra-high-performance
 	// See: https://sqlite.org/wal.html
 	pragmas := []string{
-		"PRAGMA synchronous = OFF",             // Skip fsync per-commit (batch amortizes crash risk)
+		"PRAGMA synchronous = NORMAL",          // Marmot CDC WAL is redo source; SQLite must remain crash-consistent.
 		"PRAGMA cache_size = -64000",           // 64MB page cache
 		"PRAGMA temp_store = MEMORY",           // Temp tables in RAM
 		"PRAGMA journal_mode = WAL",            // WAL mode for concurrent reads
@@ -216,6 +227,10 @@ func (bc *SQLiteBatchCommitter) openOptimizedConnection() (*sql.DB, error) {
 			db.Close()
 			return nil, fmt.Errorf("failed to set %s: %w", pragma, err)
 		}
+	}
+	if err := ensureAppliedTxnTable(db); err != nil {
+		db.Close()
+		return nil, err
 	}
 
 	return db, nil
@@ -241,6 +256,7 @@ func (bc *SQLiteBatchCommitter) Enqueue(txnID uint64, commitTS hlc.Timestamp, cd
 	bc.pending[txnID] = &pendingCommit{
 		cdcEntries: cdcEntries,
 		stmts:      stmts,
+		commitTS:   commitTS,
 		promise:    p,
 	}
 	effectiveMaxBatchSize := bc.maxBatchSize
@@ -293,9 +309,10 @@ func (bc *SQLiteBatchCommitter) tryFlush(trigger string) {
 	}
 	batch := bc.pending
 	bc.pending = make(map[uint64]*pendingCommit)
+	sealCapturedRows := bc.sealCapturedRows
 	bc.mu.Unlock()
 
-	bc.flush(batch, trigger)
+	bc.flush(batch, trigger, sealCapturedRows)
 }
 
 // Flush synchronously flushes all pending DML transactions.
@@ -308,9 +325,10 @@ func (bc *SQLiteBatchCommitter) Flush() {
 	}
 	batch := bc.pending
 	bc.pending = make(map[uint64]*pendingCommit)
+	sealCapturedRows := bc.sealCapturedRows
 	bc.mu.Unlock()
 
-	bc.flush(batch, "ddl_barrier")
+	bc.flush(batch, "ddl_barrier", sealCapturedRows)
 }
 
 func (bc *SQLiteBatchCommitter) getSchemaCache(conn *sql.Conn) (*SchemaCache, error) {
@@ -328,7 +346,7 @@ func (bc *SQLiteBatchCommitter) getSchemaCache(conn *sql.Conn) (*SchemaCache, er
 	return cache, nil
 }
 
-func (bc *SQLiteBatchCommitter) flush(batch map[uint64]*pendingCommit, trigger string) {
+func (bc *SQLiteBatchCommitter) flush(batch map[uint64]*pendingCommit, trigger string, sealCapturedRows sealCapturedRowsFunc) {
 	start := time.Now()
 	batchSize := len(batch)
 
@@ -378,11 +396,28 @@ func (bc *SQLiteBatchCommitter) flush(batch map[uint64]*pendingCommit, trigger s
 	}
 	sort.Slice(txnIDs, func(i, j int) bool { return txnIDs[i] < txnIDs[j] })
 
+	if sealCapturedRows != nil {
+		var wg sync.WaitGroup
+		for _, txnID := range txnIDs {
+			wg.Add(1)
+			go func(txnID uint64) {
+				defer wg.Done()
+				if err := sealCapturedRows(txnID); err != nil {
+					batch[txnID].err = err
+				}
+			}(txnID)
+		}
+		wg.Wait()
+	}
+
 	// Apply each logical transaction under a savepoint. A failed transaction
 	// rolls back its own row changes without poisoning successful peers in the
 	// same fsync batch.
 	for _, txnID := range txnIDs {
 		pc := batch[txnID]
+		if pc.err != nil {
+			continue
+		}
 		savepoint := fmt.Sprintf("marmot_batch_%d", txnID)
 		if _, err := tx.Exec("SAVEPOINT " + savepoint); err != nil {
 			pc.err = err
@@ -393,6 +428,9 @@ func (bc *SQLiteBatchCommitter) flush(batch map[uint64]*pendingCommit, trigger s
 				pc.err = err
 				break
 			}
+		}
+		if pc.err == nil {
+			pc.err = MarkSQLiteTxnApplied(tx, txnID, pc.commitTS)
 		}
 		if pc.err != nil {
 			_, _ = tx.Exec("ROLLBACK TO " + savepoint)

@@ -64,6 +64,10 @@ func openTestDBWithMeta(t *testing.T, dbPath string) *testDBWithMetaStore {
 	if err != nil {
 		t.Fatalf("Failed to open database: %v", err)
 	}
+	if err := ensureAppliedTxnTable(db); err != nil {
+		db.Close()
+		t.Fatalf("Failed to create applied transaction marker table: %v", err)
+	}
 
 	metaPath := strings.TrimSuffix(dbPath, ".db") + "_meta.pebble"
 	pebbleStore, err := NewPebbleMetaStore(metaPath, PebbleMetaStoreOptions{

@@ -410,6 +410,13 @@ func (rh *ReplicationHandler) handleReplay(ctx context.Context, req *Transaction
 	}
 
 	// Commit the transaction
+	if err := db.MarkSQLiteTxnApplied(tx, req.TxnId, HLCToTimestamp(req.Timestamp)); err != nil {
+		telemetry.ReplicationRequestsTotal.With("replay", "failed").Inc()
+		return &TransactionResponse{
+			Success:      false,
+			ErrorMessage: fmt.Sprintf("failed to mark applied txn: %v", err),
+		}, nil
+	}
 	if err := tx.Commit(); err != nil {
 		telemetry.ReplicationRequestsTotal.With("replay", "failed").Inc()
 		return &TransactionResponse{

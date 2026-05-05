@@ -34,6 +34,7 @@ type CapturedRowCursor interface {
 type MetaStore interface {
 	// Transaction lifecycle
 	BeginTransaction(txnID, nodeID uint64, startTS hlc.Timestamp) error
+	DurablyPrepareTransaction(txnID uint64) error
 	CommitTransaction(txnID uint64, commitTS hlc.Timestamp, statements []byte, dbName, tablesInvolved string, requiredSchemaVersion uint64, rowCount uint32) error
 	AbortTransaction(txnID uint64) error
 	GetTransaction(txnID uint64) (*TransactionRecord, error)
@@ -80,6 +81,7 @@ type MetaStore interface {
 
 	// CDC raw capture (fast path during hook - stores raw values without per-value encoding)
 	WriteCapturedRow(txnID, seq uint64, data []byte) error
+	SealCapturedRows(txnID uint64) error
 	IterateCapturedRows(txnID uint64) (CapturedRowCursor, error)
 	DeleteCapturedRow(txnID, seq uint64) error
 	DeleteCapturedRows(txnID uint64) error

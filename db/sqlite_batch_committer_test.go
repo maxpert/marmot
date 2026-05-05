@@ -94,6 +94,19 @@ func mustMarshal(v interface{}) []byte {
 	return b
 }
 
+type batchCommitFuture interface {
+	Get() (error, error)
+}
+
+func waitBatchCommitFutures(t *testing.T, futures []batchCommitFuture) {
+	t.Helper()
+	for _, fut := range futures {
+		if _, err := fut.Get(); err != nil {
+			t.Fatalf("enqueue failed: %v", err)
+		}
+	}
+}
+
 func TestBatchCommitter_SingleTransaction(t *testing.T) {
 	bc, db, cleanup := setupTestBatchCommitter(t, 1, 50*time.Millisecond)
 	defer cleanup()
@@ -454,13 +467,12 @@ func TestBatchCommitter_NoCheckpointBelowThreshold(t *testing.T) {
 	}
 	defer bc.Stop()
 
+	futures := make([]batchCommitFuture, 0, 100)
 	for i := 0; i < 100; i++ {
 		entry := makeIntentEntry("test_table", OpTypeInsert, i, "small", i)
-		fut := bc.Enqueue(uint64(i), hlc.Timestamp{}, []*IntentEntry{entry}, nil)
-		if _, err := fut.Get(); err != nil {
-			t.Fatalf("enqueue failed: %v", err)
-		}
+		futures = append(futures, bc.Enqueue(uint64(i), hlc.Timestamp{}, []*IntentEntry{entry}, nil))
 	}
+	waitBatchCommitFutures(t, futures)
 
 	time.Sleep(200 * time.Millisecond)
 
@@ -508,13 +520,12 @@ func TestBatchCommitter_PassiveCheckpointTriggered(t *testing.T) {
 	defer bc.Stop()
 
 	largeValue := fmt.Sprintf("%0*d", 10000, 0)
+	futures := make([]batchCommitFuture, 0, 200)
 	for i := 0; i < 200; i++ {
 		entry := makeIntentEntry("test_table", OpTypeInsert, i, largeValue, i)
-		fut := bc.Enqueue(uint64(i), hlc.Timestamp{}, []*IntentEntry{entry}, nil)
-		if _, err := fut.Get(); err != nil {
-			t.Fatalf("enqueue failed: %v", err)
-		}
+		futures = append(futures, bc.Enqueue(uint64(i), hlc.Timestamp{}, []*IntentEntry{entry}, nil))
 	}
+	waitBatchCommitFutures(t, futures)
 
 	walSizeBeforeCheckpoint := bc.checkWALSize()
 	if walSizeBeforeCheckpoint < 1.0 {
@@ -574,13 +585,12 @@ func TestBatchCommitter_RestartCheckpointTriggered(t *testing.T) {
 	defer bc.Stop()
 
 	largeValue := fmt.Sprintf("%0*d", 15000, 0)
+	futures := make([]batchCommitFuture, 0, 300)
 	for i := 0; i < 300; i++ {
 		entry := makeIntentEntry("test_table", OpTypeInsert, i, largeValue, i)
-		fut := bc.Enqueue(uint64(i), hlc.Timestamp{}, []*IntentEntry{entry}, nil)
-		if _, err := fut.Get(); err != nil {
-			t.Fatalf("enqueue failed: %v", err)
-		}
+		futures = append(futures, bc.Enqueue(uint64(i), hlc.Timestamp{}, []*IntentEntry{entry}, nil))
 	}
+	waitBatchCommitFutures(t, futures)
 
 	walSizeBeforeCheckpoint := bc.checkWALSize()
 	if walSizeBeforeCheckpoint < 3.0 {
@@ -979,13 +989,12 @@ func TestBatchCommitter_CheckpointMetrics(t *testing.T) {
 	defer bc.Stop()
 
 	largeValue := fmt.Sprintf("%0*d", 8000, 0)
+	futures := make([]batchCommitFuture, 0, 100)
 	for i := 0; i < 100; i++ {
 		entry := makeIntentEntry("test_table", OpTypeInsert, i, largeValue, i)
-		fut := bc.Enqueue(uint64(i), hlc.Timestamp{}, []*IntentEntry{entry}, nil)
-		if _, err := fut.Get(); err != nil {
-			t.Fatalf("enqueue failed: %v", err)
-		}
+		futures = append(futures, bc.Enqueue(uint64(i), hlc.Timestamp{}, []*IntentEntry{entry}, nil))
 	}
+	waitBatchCommitFutures(t, futures)
 
 	time.Sleep(1 * time.Second)
 

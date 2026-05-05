@@ -145,6 +145,13 @@ func (c *SchemaCache) Clear() {
 	c.cache = make(map[string]*TableSchema)
 }
 
+// IsEmpty reports whether the cache currently has any table schema entries.
+func (c *SchemaCache) IsEmpty() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return len(c.cache) == 0
+}
+
 // LoadTable loads schema for a single table into the cache.
 // Used by tests and for on-demand schema loading.
 func (c *SchemaCache) LoadTable(conn *sqlite3.SQLiteConn, tableName string) error {

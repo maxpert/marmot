@@ -874,6 +874,10 @@ func (s *StreamClient) applyChangeEvent(ctx context.Context, event *marmotgrpc.C
 		}
 	}
 
+	if err := db.MarkSQLiteTxnApplied(tx, event.TxnId, marmotgrpc.HLCToTimestamp(event.Timestamp)); err != nil {
+		return err
+	}
+
 	if err := tx.Commit(); err != nil {
 		return err
 	}

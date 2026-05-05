@@ -141,6 +141,11 @@ func (re *ReplicationEngine) prepareDatabaseOperation(req *PrepareRequest) *Prep
 		Uint64("txn_id", req.TxnID).
 		Msg("Database operation prepared (intent created)")
 
+	if err := systemDB.GetMetaStore().DurablyPrepareTransaction(req.TxnID); err != nil {
+		_ = txnMgr.AbortTransaction(txn)
+		return &PrepareResult{Success: false, Error: fmt.Sprintf("failed to durably prepare transaction: %v", err)}
+	}
+
 	return &PrepareResult{Success: true}
 }
 
@@ -166,6 +171,11 @@ func (re *ReplicationEngine) prepareRegularTransaction(req *PrepareRequest) *Pre
 		if result := re.processStatement(txn, txnMgr, metaStore, stmt, req, stmtSeq); result != nil {
 			return result
 		}
+	}
+
+	if err := metaStore.DurablyPrepareTransaction(req.TxnID); err != nil {
+		_ = txnMgr.AbortTransaction(txn)
+		return &PrepareResult{Success: false, Error: fmt.Sprintf("failed to durably prepare transaction: %v", err)}
 	}
 
 	return &PrepareResult{Success: true}
@@ -446,8 +456,8 @@ func (re *ReplicationEngine) Commit(ctx context.Context, req *CommitRequest) *Co
 	txn.Statements = req.Statements
 	txn.StatementFallback = hasStatementFallbackDML(req.Statements)
 
-	// Store CDC data from COMMIT request to PebbleDB (deferred from PREPARE phase)
-	// This must happen BEFORE CommitTransaction which reads from /cdc/raw/
+	// Store CDC data from COMMIT request into the segmented CDC log. This
+	// must happen before CommitTransaction seals the transaction range.
 	var stmtSeq uint64 = 0
 	for _, stmt := range req.Statements {
 		if len(stmt.OldValues) > 0 || len(stmt.NewValues) > 0 {

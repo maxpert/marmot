@@ -1,12 +1,9 @@
 package db
 
 import (
-	"errors"
 	"encoding/binary"
+	"errors"
 	"fmt"
-	"hash/crc32"
-	"io"
-	"os"
 	"path/filepath"
 	"sort"
 	"sync"
@@ -30,7 +27,8 @@ const (
 	pebblePrefixTxnPending  = "/txn_idx/pend/"  // /txn_idx/pend/{8 bytes txnID}
 	pebblePrefixTxnSeq      = "/txn_idx/seq/"   // /txn_idx/seq/{8 bytes seqNum}{8 bytes txnID}
 	pebblePrefixTxnByID     = "/txn_idx/txnid/" // /txn_idx/txnid/{8 bytes txnID} - primary index for streaming
-	pebblePrefixCDCRaw      = "/cdc/raw/"       // /cdc/raw/{8 bytes txnID}{8 bytes seq}
+	pebblePrefixCDCRaw      = "/cdc/raw/"       // legacy per-row CDC prefix; rejected on open
+	pebblePrefixCDCManifest = "/cdc/manifest/"  // /cdc/manifest/{8 bytes txnID}
 	pebblePrefixRepl        = "/repl/"          // /repl/{8 bytes peerNodeID}/{dbName}
 	pebblePrefixSchema      = "/schema/"        // /schema/{dbName}
 	pebblePrefixDDLLock     = "/ddl/"           // /ddl/{dbName}
@@ -43,20 +41,6 @@ const (
 
 // Sharded lock for WriteIntent serialization (prevents TOCTOU race)
 const intentLockShards = 256
-
-const (
-	cdcRawWALFileName  = "cdc_rows.log"
-	cdcRawPointerMagic = uint32(0x43444259) // "CDBY"
-	cdcRawPointerVer   = uint8(1)
-	cdcRawHeaderSize   = 16
-	cdcRawPointerSize  = 24
-)
-
-type cdcRawPointer struct {
-	Offset uint64
-	Length uint32
-	CRC32  uint32
-}
 
 // PebbleMetaStore implements MetaStore using Pebble
 // TransactionGetter is a function type for looking up transaction records.
@@ -86,8 +70,7 @@ type PebbleMetaStore struct {
 	// In-memory CDC locks (row + DDL) for conflict detection
 	cdcLocks *XsyncCDCLockStore
 
-	cdcWALMu   sync.Mutex
-	cdcWALFile *os.File
+	cdcLog *cdcSegmentLog
 
 	// Optional transaction getter for conflict resolution (set by MemoryMetaStore wrapper)
 	txnGetter TransactionGetter
@@ -202,6 +185,10 @@ func NewPebbleMetaStore(path string, opts PebbleMetaStoreOptions) (*PebbleMetaSt
 	if err != nil {
 		return nil, fmt.Errorf("failed to open pebble db: %w", err)
 	}
+	if err := rejectLegacyCDCRawKeys(db); err != nil {
+		db.Close()
+		return nil, err
+	}
 
 	store := &PebbleMetaStore{
 		db:        db,
@@ -214,7 +201,30 @@ func NewPebbleMetaStore(path string, opts PebbleMetaStoreOptions) (*PebbleMetaSt
 	// Initialize persistent counters
 	store.counters = NewPebbleCounter(db, pebblePrefixCounter, 10)
 
+	cdcLog, err := openCDCSegmentLog(path)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to open cdc segment log: %w", err)
+	}
+	store.cdcLog = cdcLog
+
 	return store, nil
+}
+
+func rejectLegacyCDCRawKeys(db *pebble.DB) error {
+	prefix := []byte(pebblePrefixCDCRaw)
+	iter, err := db.NewIter(&pebble.IterOptions{
+		LowerBound: prefix,
+		UpperBound: prefixUpperBound(prefix),
+	})
+	if err != nil {
+		return err
+	}
+	defer iter.Close()
+	if iter.First() {
+		return fmt.Errorf("legacy per-row CDC payload keys found under %s; clean or rebuild node data", pebblePrefixCDCRaw)
+	}
+	return iter.Error()
 }
 
 // Close closes the Pebble DB (idempotent - safe to call multiple times)
@@ -231,6 +241,10 @@ func (s *PebbleMetaStore) Close() error {
 	}
 	s.sequences = nil
 	s.seqMu.Unlock()
+
+	if err := s.cdcLog.close(); err != nil {
+		log.Warn().Err(err).Str("path", filepath.Join(s.path, cdcSegmentDirName)).Msg("Failed to close CDC segment log")
+	}
 
 	return s.db.Close()
 }
@@ -387,12 +401,8 @@ func pebbleIntentByTxnPrefix(txnID uint64) []byte {
 	return buildKeyUint64(pebblePrefixIntentByTxn, txnID)
 }
 
-func pebbleCdcRawKey(txnID, seq uint64) []byte {
-	return buildKeyUint64x2(pebblePrefixCDCRaw, txnID, seq)
-}
-
-func pebbleCdcRawPrefix(txnID uint64) []byte {
-	return buildKeyUint64(pebblePrefixCDCRaw, txnID)
+func pebbleCDCManifestKey(txnID uint64) []byte {
+	return buildKeyUint64(pebblePrefixCDCManifest, txnID)
 }
 
 func pebbleReplKey(peerNodeID uint64, dbName string) []byte {
@@ -425,181 +435,6 @@ func prefixUpperBound(prefix []byte) []byte {
 		upper[i] = 0xFF
 	}
 	return upper
-}
-
-func (s *PebbleMetaStore) cdcRawWALPath() string {
-	return filepath.Join(s.path, cdcRawWALFileName)
-}
-
-func (s *PebbleMetaStore) openCDCRawWAL() error {
-	s.cdcWALMu.Lock()
-	defer s.cdcWALMu.Unlock()
-
-	if s.cdcWALFile != nil {
-		return nil
-	}
-
-	f, err := os.OpenFile(s.cdcRawWALPath(), os.O_CREATE|os.O_RDWR, 0o644)
-	if err != nil {
-		return fmt.Errorf("open cdc raw wal: %w", err)
-	}
-
-	s.cdcWALFile = f
-	return nil
-}
-
-func (s *PebbleMetaStore) closeCDCRawWAL() error {
-	s.cdcWALMu.Lock()
-	defer s.cdcWALMu.Unlock()
-
-	if s.cdcWALFile == nil {
-		return nil
-	}
-
-	err := s.cdcWALFile.Close()
-	s.cdcWALFile = nil
-	return err
-}
-
-func encodeCDCRawPointer(pointer cdcRawPointer) []byte {
-	b := make([]byte, cdcRawPointerSize)
-	binary.BigEndian.PutUint32(b[0:4], cdcRawPointerMagic)
-	b[4] = cdcRawPointerVer
-	binary.BigEndian.PutUint32(b[8:12], pointer.Length)
-	binary.BigEndian.PutUint32(b[12:16], pointer.CRC32)
-	binary.BigEndian.PutUint64(b[16:24], pointer.Offset)
-	return b
-}
-
-func decodeCDCRawPointer(data []byte) (cdcRawPointer, error) {
-	if len(data) != cdcRawPointerSize {
-		return cdcRawPointer{}, errors.New("invalid cdc raw pointer size")
-	}
-
-	magic := binary.BigEndian.Uint32(data[:4])
-	if magic != cdcRawPointerMagic {
-		return cdcRawPointer{}, errors.New("invalid cdc raw pointer magic")
-	}
-	if data[4] != cdcRawPointerVer {
-		return cdcRawPointer{}, fmt.Errorf("unsupported cdc raw pointer version: %d", data[4])
-	}
-
-	return cdcRawPointer{
-		Offset: binary.BigEndian.Uint64(data[16:24]),
-		Length: binary.BigEndian.Uint32(data[8:12]),
-		CRC32:  binary.BigEndian.Uint32(data[12:16]),
-	}, nil
-}
-
-func (s *PebbleMetaStore) appendToCDCRawWAL(data []byte) (cdcRawPointer, error) {
-	crc := crc32.ChecksumIEEE(data)
-	length := uint32(len(data))
-
-	entry := make([]byte, cdcRawHeaderSize+len(data))
-	binary.BigEndian.PutUint32(entry[0:4], cdcRawPointerMagic)
-	entry[4] = cdcRawPointerVer
-	binary.BigEndian.PutUint32(entry[8:12], length)
-	binary.BigEndian.PutUint32(entry[12:16], crc)
-	copy(entry[16:], data)
-
-	s.cdcWALMu.Lock()
-	defer s.cdcWALMu.Unlock()
-
-	if s.cdcWALFile == nil {
-		if err := s.openCDCRawWAL(); err != nil {
-			return cdcRawPointer{}, err
-		}
-	}
-
-	offset, err := s.cdcWALFile.Seek(0, io.SeekEnd)
-	if err != nil {
-		return cdcRawPointer{}, fmt.Errorf("seek cdc raw wal: %w", err)
-	}
-
-	n, err := s.cdcWALFile.Write(entry)
-	if err != nil {
-		return cdcRawPointer{}, fmt.Errorf("write cdc raw wal: %w", err)
-	}
-	if n < len(entry) {
-		return cdcRawPointer{}, io.ErrShortWrite
-	}
-
-	if err := s.cdcWALFile.Sync(); err != nil {
-		// Keep path functional on non-fsync filesystems.
-		log.Warn().Err(err).Str("path", s.cdcRawWALPath()).Msg("CDC WAL sync failed")
-	}
-
-	return cdcRawPointer{Offset: uint64(offset), Length: length, CRC32: crc}, nil
-}
-
-func (s *PebbleMetaStore) readCDCRawPayload(pointer cdcRawPointer) ([]byte, error) {
-	if pointer.Length == 0 {
-		return nil, nil
-	}
-
-	s.cdcWALMu.Lock()
-	defer s.cdcWALMu.Unlock()
-
-	if s.cdcWALFile == nil {
-		if err := s.openCDCRawWAL(); err != nil {
-			return nil, err
-		}
-	}
-
-	if _, err := s.cdcWALFile.Seek(int64(pointer.Offset), io.SeekStart); err != nil {
-		return nil, fmt.Errorf("seek cdc raw wal payload: %w", err)
-	}
-
-	header := make([]byte, cdcRawHeaderSize)
-	n, err := s.cdcWALFile.Read(header)
-	if err != nil {
-		return nil, fmt.Errorf("read cdc raw wal header: %w", err)
-	}
-	if n < len(header) {
-		return nil, io.ErrUnexpectedEOF
-	}
-
-	magic := binary.BigEndian.Uint32(header[0:4])
-	ver := header[4]
-	if magic != cdcRawPointerMagic || ver != cdcRawPointerVer {
-		return nil, errors.New("invalid cdc raw wal header")
-	}
-
-	storedLength := binary.BigEndian.Uint32(header[8:12])
-	storedCRC := binary.BigEndian.Uint32(header[12:16])
-	if storedLength != pointer.Length || storedCRC != pointer.CRC32 {
-		return nil, errors.New("cdc raw wal header mismatch")
-	}
-
-	rowData := make([]byte, pointer.Length)
-	n, err = s.cdcWALFile.Read(rowData)
-	if err != nil {
-		return nil, fmt.Errorf("read cdc raw wal payload: %w", err)
-	}
-	if uint32(n) < pointer.Length {
-		return nil, io.ErrUnexpectedEOF
-	}
-
-	if crc32.ChecksumIEEE(rowData) != pointer.CRC32 {
-		return nil, errors.New("cdc raw wal crc mismatch")
-	}
-
-	return rowData, nil
-}
-
-func (s *PebbleMetaStore) decodeCapturedRowValue(data []byte) ([]byte, error) {
-	if len(data) == cdcRawPointerSize {
-		if pointer, err := decodeCDCRawPointer(data); err == nil {
-			return s.readCDCRawPayload(pointer)
-		}
-	}
-
-	if len(data) == 0 {
-		return nil, errors.New("empty captured row")
-	}
-
-	// Backward compatibility with inline EncodedCapturedRow values.
-	return data, nil
 }
 
 // getValueCopy reads a key and returns a copy of the value
@@ -765,6 +600,17 @@ func (s *PebbleMetaStore) BeginTransaction(txnID, nodeID uint64, startTS hlc.Tim
 	return batch.Commit(pebble.NoSync)
 }
 
+// DurablyPrepareTransaction force-syncs the prepare promise after all intents
+// have been written. This keeps individual intent writes cheap while ensuring
+// a PREPARE ACK survives a local crash.
+func (s *PebbleMetaStore) DurablyPrepareTransaction(txnID uint64) error {
+	statusBuf := []byte{byte(TxnStatusPending)}
+	if err := s.db.Set(pebbleTxnStatusKey(txnID), statusBuf, pebble.NoSync); err != nil {
+		return err
+	}
+	return s.cdcLog.appendPrepareFence(txnID)
+}
+
 // CommitTransaction marks a transaction as COMMITTED
 func (s *PebbleMetaStore) CommitTransaction(txnID uint64, commitTS hlc.Timestamp, statements []byte, dbName, tablesInvolved string, requiredSchemaVersion uint64, rowCount uint32) error {
 	log.Debug().
@@ -774,6 +620,10 @@ func (s *PebbleMetaStore) CommitTransaction(txnID uint64, commitTS hlc.Timestamp
 		Uint32("row_count", rowCount).
 		Uint64("required_schema_version", requiredSchemaVersion).
 		Msg("CDC: CommitTransaction")
+
+	if err := s.SealCapturedRows(txnID); err != nil {
+		return fmt.Errorf("seal captured rows: %w", err)
+	}
 
 	// Step 1: Read ONLY immutable record to get NodeID
 	immutableData, err := s.getValueCopy(pebbleTxnKey(txnID))
@@ -866,6 +716,10 @@ func (s *PebbleMetaStore) StoreReplayedTransaction(txnID, nodeID uint64, commitT
 		Str("database", dbName).
 		Uint32("row_count", rowCount).
 		Msg("StoreReplayedTransaction: storing replayed transaction")
+
+	if err := s.SealCapturedRows(txnID); err != nil {
+		return fmt.Errorf("seal replayed rows: %w", err)
+	}
 
 	// Get sequence number
 	seqNum, err := s.GetNextSeqNum(nodeID)
@@ -1693,43 +1547,23 @@ func (s *PebbleMetaStore) WriteIntentEntry(txnID, seq uint64, op uint8, table, i
 		return err
 	}
 
-	// Write to /cdc/raw/ for unified access with hookCallback path
-	// NoSync: CDC entries are protected by WriteIntent (PREPARE).
-	// If crash occurs, intent exists and CDC can be recovered or transaction aborted.
-	return s.db.Set(pebbleCdcRawKey(txnID, seq), data, pebble.NoSync)
+	return s.WriteCapturedRow(txnID, seq, data)
 }
 
 // GetIntentEntries retrieves CDC intent entries for a transaction.
-// Reads from /cdc/raw/ and converts EncodedCapturedRow to IntentEntry format.
+// Reads from the segmented CDC log and converts EncodedCapturedRow to IntentEntry format.
 func (s *PebbleMetaStore) GetIntentEntries(txnID uint64) ([]*IntentEntry, error) {
 	var entries []*IntentEntry
-	prefix := pebbleCdcRawPrefix(txnID)
-
-	iter, err := s.db.NewIter(&pebble.IterOptions{
-		LowerBound: prefix,
-		UpperBound: prefixUpperBound(prefix),
-	})
+	cursor, err := s.IterateCapturedRows(txnID)
 	if err != nil {
 		return nil, err
 	}
-	defer iter.Close()
+	defer cursor.Close()
 
-	var seq uint64
-	for iter.SeekGE(prefix); iter.Valid(); iter.Next() {
-		key := iter.Key()
-		val, err := iter.ValueAndErr()
-		if err != nil {
-			continue
-		}
-
-		// Extract sequence from key (/cdc/raw/{8 bytes txnID}{8 bytes seq})
-		expectedLen := len(pebblePrefixCDCRaw) + 16
-		if len(key) >= expectedLen {
-			seq = binary.BigEndian.Uint64(key[len(pebblePrefixCDCRaw)+8:])
-		}
-
+	for cursor.Next() {
+		seq, data := cursor.Row()
 		// Decode EncodedCapturedRow
-		row, err := DecodeRow(val)
+		row, err := DecodeRow(data)
 		if err != nil {
 			continue
 		}
@@ -1746,7 +1580,7 @@ func (s *PebbleMetaStore) GetIntentEntries(txnID uint64) ([]*IntentEntry, error)
 		})
 	}
 
-	if err := iter.Error(); err != nil {
+	if err := cursor.Err(); err != nil {
 		return nil, err
 	}
 
@@ -1782,187 +1616,69 @@ func (s *PebbleMetaStore) DeleteIntentEntries(txnID uint64) (err error) {
 	if s == nil || s.closed.Load() {
 		return fmt.Errorf("pebble metastore closed")
 	}
-	prefix := pebbleCdcRawPrefix(txnID)
-	var keys [][]byte
-
-	iter, err := s.db.NewIter(&pebble.IterOptions{
-		LowerBound: prefix,
-		UpperBound: prefixUpperBound(prefix),
-	})
-	if err != nil {
-		return err
-	}
-
-	for iter.SeekGE(prefix); iter.Valid(); iter.Next() {
-		key := make([]byte, len(iter.Key()))
-		copy(key, iter.Key())
-		keys = append(keys, key)
-	}
-	if err := iter.Close(); err != nil {
-		return err
-	}
-
-	if len(keys) == 0 {
-		return nil
-	}
-
-	batch := s.db.NewBatch()
-	defer batch.Close()
-
-	for _, key := range keys {
-		_ = batch.Delete(key, nil)
-	}
-
-	// NoSync: CDC entry cleanup is idempotent. Transaction is already committed.
-	return batch.Commit(pebble.NoSync)
+	return s.DeleteCapturedRows(txnID)
 }
 
 // WriteCapturedRow stores a raw captured row during hook callback.
 // This is the fast path - just store bytes with minimal processing.
 // Data is pre-serialized by the caller (CapturedRow msgpack).
 func (s *PebbleMetaStore) WriteCapturedRow(txnID, seq uint64, data []byte) error {
-	key := pebbleCdcRawKey(txnID, seq)
-	return s.db.Set(key, data, pebble.NoSync)
+	return s.cdcLog.appendRow(txnID, seq, data)
 }
 
-// pebbleCapturedRowCursor implements CapturedRowCursor for Pebble
-type pebbleCapturedRowCursor struct {
-	iter    *pebble.Iterator
-	txnID   uint64
-	started bool
-	seq     uint64
-	data    []byte
-	err     error
-}
-
-// Next advances to the next row
-func (c *pebbleCapturedRowCursor) Next() bool {
-	if c.err != nil || c.iter == nil {
-		return false
-	}
-
-	if !c.started {
-		c.started = true
-		if !c.iter.First() {
-			c.err = c.iter.Error()
-			return false
-		}
-	} else {
-		if !c.iter.Next() {
-			c.err = c.iter.Error()
-			return false
-		}
-	}
-
-	if !c.iter.Valid() {
-		return false
-	}
-
-	// Extract seq from key (binary format): prefix + 8 bytes txnID + 8 bytes seq
-	key := c.iter.Key()
-	expectedLen := len(pebblePrefixCDCRaw) + 16
-	if len(key) < expectedLen {
-		// Skip malformed keys
-		return c.Next()
-	}
-	c.seq = binary.BigEndian.Uint64(key[len(pebblePrefixCDCRaw)+8:])
-
-	val, err := c.iter.ValueAndErr()
+// SealCapturedRows makes a transaction's CDC range durable and publishes its manifest.
+func (s *PebbleMetaStore) SealCapturedRows(txnID uint64) error {
+	manifest, err := s.cdcLog.sealTxn(txnID)
 	if err != nil {
-		c.err = err
-		return false
+		if errors.Is(err, errCDCSegmentTxnNotFound) {
+			return nil
+		}
+		return err
 	}
-
-	// Copy data since iter.Value() is only valid until Next()
-	c.data = make([]byte, len(val))
-	copy(c.data, val)
-
-	return true
-}
-
-// Row returns current row's seq and data
-func (c *pebbleCapturedRowCursor) Row() (uint64, []byte) {
-	return c.seq, c.data
-}
-
-// Err returns any iteration error
-func (c *pebbleCapturedRowCursor) Err() error {
-	return c.err
-}
-
-// Close releases the iterator
-func (c *pebbleCapturedRowCursor) Close() error {
-	if c.iter != nil {
-		return c.iter.Close()
+	native, err := encoding.MarshalNative(manifest)
+	if err != nil {
+		return err
 	}
-	return nil
+	defer native.Dispose()
+	return s.db.Set(pebbleCDCManifestKey(txnID), native.Bytes(), pebble.NoSync)
 }
 
 // IterateCapturedRows returns a cursor over raw captured rows for a transaction.
 func (s *PebbleMetaStore) IterateCapturedRows(txnID uint64) (CapturedRowCursor, error) {
-	prefix := pebbleCdcRawPrefix(txnID)
-
-	iter, err := s.db.NewIter(&pebble.IterOptions{
-		LowerBound: prefix,
-		UpperBound: prefixUpperBound(prefix),
-	})
+	if manifest := s.cdcLog.getPendingManifest(txnID); manifest != nil {
+		return newCDCSegmentCursor(s.cdcLog, manifest), nil
+	}
+	data, closer, err := s.db.Get(pebbleCDCManifestKey(txnID))
+	if err == pebble.ErrNotFound {
+		return newCDCSegmentCursor(s.cdcLog, nil), nil
+	}
 	if err != nil {
 		return nil, err
 	}
-
-	return &pebbleCapturedRowCursor{
-		iter:  iter,
-		txnID: txnID,
-	}, nil
+	defer closer.Close()
+	var manifest cdcSegmentTxnManifest
+	if err := encoding.Unmarshal(data, &manifest); err != nil {
+		return nil, err
+	}
+	return newCDCSegmentCursor(s.cdcLog, &manifest), nil
 }
 
 // DeleteCapturedRow deletes a single captured row after processing.
 func (s *PebbleMetaStore) DeleteCapturedRow(txnID, seq uint64) error {
-	key := pebbleCdcRawKey(txnID, seq)
-	return s.db.Delete(key, pebble.NoSync)
+	return nil
 }
 
 // DeleteCapturedRows deletes all raw captured rows for a transaction.
 // Called after ProcessCapturedRows completes.
 func (s *PebbleMetaStore) DeleteCapturedRows(txnID uint64) error {
-	prefix := pebbleCdcRawPrefix(txnID)
-	var keys [][]byte
-
-	iter, err := s.db.NewIter(&pebble.IterOptions{
-		LowerBound: prefix,
-		UpperBound: prefixUpperBound(prefix),
-	})
-	if err != nil {
-		return err
-	}
-
-	for iter.SeekGE(prefix); iter.Valid(); iter.Next() {
-		key := make([]byte, len(iter.Key()))
-		copy(key, iter.Key())
-		keys = append(keys, key)
-	}
-	if err := iter.Close(); err != nil {
-		return err
-	}
-
-	if len(keys) == 0 {
-		return nil
-	}
-
-	batch := s.db.NewBatch()
-	defer batch.Close()
-
-	for _, key := range keys {
-		_ = batch.Delete(key, nil)
-	}
-
-	return batch.Commit(pebble.NoSync)
+	s.cdcLog.discardTxn(txnID)
+	return s.db.Delete(pebbleCDCManifestKey(txnID), pebble.NoSync)
 }
 
-// findOrphanedCDCRawTxnIDs finds transaction IDs that have /cdc/raw/ data but no /txn_commit/ record.
-// These are orphaned transactions from crashes that never completed commit.
+// findOrphanedCDCRawTxnIDs finds transaction IDs that have CDC manifests but no /txn_commit/ record.
+// These are sealed transactions from crashes that never completed commit.
 func (s *PebbleMetaStore) findOrphanedCDCRawTxnIDs() ([]uint64, error) {
-	prefix := []byte(pebblePrefixCDCRaw)
+	prefix := []byte(pebblePrefixCDCManifest)
 
 	iter, err := s.db.NewIter(&pebble.IterOptions{
 		LowerBound: prefix,
@@ -1977,10 +1693,10 @@ func (s *PebbleMetaStore) findOrphanedCDCRawTxnIDs() ([]uint64, error) {
 
 	for iter.SeekGE(prefix); iter.Valid(); iter.Next() {
 		key := iter.Key()
-		if len(key) < len(pebblePrefixCDCRaw)+8 {
+		if len(key) < len(pebblePrefixCDCManifest)+8 {
 			continue
 		}
-		txnID := binary.BigEndian.Uint64(key[len(pebblePrefixCDCRaw):])
+		txnID := binary.BigEndian.Uint64(key[len(pebblePrefixCDCManifest):])
 		seenTxnIDs[txnID] = true
 	}
 
@@ -1989,6 +1705,14 @@ func (s *PebbleMetaStore) findOrphanedCDCRawTxnIDs() ([]uint64, error) {
 	}
 
 	var orphaned []uint64
+	for _, txnID := range s.cdcLog.pendingTxnIDs() {
+		_, closer, err := s.db.Get(pebbleTxnCommitKey(txnID))
+		if err == pebble.ErrNotFound {
+			orphaned = append(orphaned, txnID)
+		} else if err == nil {
+			closer.Close()
+		}
+	}
 	for txnID := range seenTxnIDs {
 		_, closer, err := s.db.Get(pebbleTxnCommitKey(txnID))
 		if err == pebble.ErrNotFound {

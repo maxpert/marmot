@@ -4,12 +4,14 @@
 package db
 
 import (
+	"bytes"
 	"encoding/binary"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/pebble"
 	"github.com/maxpert/marmot/hlc"
 )
 
@@ -285,6 +287,101 @@ func TestPebbleMetaStoreCDCIntentEntries(t *testing.T) {
 	}
 	if len(entries) != 0 {
 		t.Errorf("Expected 0 entries after delete, got %d", len(entries))
+	}
+}
+
+func TestPebbleMetaStoreWriteCapturedRowUsesSegmentLogForLargePayload(t *testing.T) {
+	store, cleanup := createTestPebbleMetaStore(t)
+	defer cleanup()
+
+	txnID := uint64(22222)
+	largePayload := bytes.Repeat([]byte("x"), 32*1024)
+
+	if err := store.WriteCapturedRow(txnID, 1, largePayload); err != nil {
+		t.Fatalf("WriteCapturedRow failed: %v", err)
+	}
+
+	cursor, err := store.IterateCapturedRows(txnID)
+	if err != nil {
+		t.Fatalf("IterateCapturedRows failed: %v", err)
+	}
+	defer cursor.Close()
+
+	if !cursor.Next() {
+		t.Fatalf("Expected one captured row")
+	}
+
+	_, data := cursor.Row()
+	if !bytes.Equal(data, largePayload) {
+		t.Fatalf("decoded captured row payload mismatch")
+	}
+
+	if err := cursor.Err(); err != nil {
+		t.Fatalf("cursor.Err() returned error: %v", err)
+	}
+
+	iter, err := store.db.NewIter(&pebble.IterOptions{
+		LowerBound: []byte(pebblePrefixCDCRaw),
+		UpperBound: prefixUpperBound([]byte(pebblePrefixCDCRaw)),
+	})
+	if err != nil {
+		t.Fatalf("NewIter raw CDC prefix failed: %v", err)
+	}
+	defer iter.Close()
+	if iter.First() {
+		t.Fatalf("captured row payload should not create /cdc/raw Pebble keys")
+	}
+}
+
+func TestPebbleMetaStoreGetIntentEntriesSupportsMixedCDCPayloadSizes(t *testing.T) {
+	store, cleanup := createTestPebbleMetaStore(t)
+	defer cleanup()
+
+	txnID := uint64(33333)
+
+	largePayload := bytes.Repeat([]byte("y"), 32*1024)
+	smallRow := &EncodedCapturedRow{
+		Table:     "users",
+		Op:        uint8(OpTypeInsert),
+		IntentKey: []byte("user:1"),
+		NewValues: map[string][]byte{
+			"id": []byte(`1`),
+		},
+	}
+	largeRow := &EncodedCapturedRow{
+		Table:     "users",
+		Op:        uint8(OpTypeInsert),
+		IntentKey: []byte("user:2"),
+		NewValues: map[string][]byte{
+			"id":   []byte(`2`),
+			"blob": largePayload,
+		},
+	}
+	smallData, err := EncodeRow(smallRow)
+	if err != nil {
+		t.Fatalf("EncodeRow small failed: %v", err)
+	}
+	largeData, err := EncodeRow(largeRow)
+	if err != nil {
+		t.Fatalf("EncodeRow large failed: %v", err)
+	}
+
+	if err := store.WriteCapturedRow(txnID, 1, smallData); err != nil {
+		t.Fatalf("WriteCapturedRow small failed: %v", err)
+	}
+	if err := store.WriteCapturedRow(txnID, 2, largeData); err != nil {
+		t.Fatalf("WriteCapturedRow large failed: %v", err)
+	}
+
+	entries, err := store.GetIntentEntries(txnID)
+	if err != nil {
+		t.Fatalf("GetIntentEntries failed: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("Expected 2 entries, got %d", len(entries))
+	}
+	if entries[0].Table != "users" || entries[1].Table != "users" {
+		t.Fatalf("Unexpected entry tables: %q, %q", entries[0].Table, entries[1].Table)
 	}
 }
 
@@ -644,13 +741,12 @@ func TestPebbleKeyFunctionsProduceCorrectBytes(t *testing.T) {
 			}(),
 		},
 		{
-			name: "pebbleCdcRawKey",
-			fn:   func() []byte { return pebbleCdcRawKey(333, 444) },
+			name: "pebbleCDCManifestKey",
+			fn:   func() []byte { return pebbleCDCManifestKey(333) },
 			expected: func() []byte {
-				b := make([]byte, len(pebblePrefixCDCRaw)+16)
-				copy(b, pebblePrefixCDCRaw)
-				binary.BigEndian.PutUint64(b[len(pebblePrefixCDCRaw):], 333)
-				binary.BigEndian.PutUint64(b[len(pebblePrefixCDCRaw)+8:], 444)
+				b := make([]byte, len(pebblePrefixCDCManifest)+8)
+				copy(b, pebblePrefixCDCManifest)
+				binary.BigEndian.PutUint64(b[len(pebblePrefixCDCManifest):], 333)
 				return b
 			}(),
 		},

@@ -397,6 +397,9 @@ func (ds *DeltaSyncClient) applyChangeEvent(ctx context.Context, event *ChangeEv
 	}
 
 	// Commit the transaction
+	if err := db.MarkSQLiteTxnApplied(tx, event.TxnId, HLCToTimestamp(event.Timestamp)); err != nil {
+		return fmt.Errorf("failed to mark applied txn: %w", err)
+	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("failed to commit: %w", err)
 	}

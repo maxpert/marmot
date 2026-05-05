@@ -170,6 +170,15 @@ func NewReplicatedDatabase(dbPath string, nodeID uint64, clock *hlc.Clock, metaS
 		}
 	}
 
+	if err := ensureAppliedTxnTable(writeDB); err != nil {
+		closeAll()
+		return nil, err
+	}
+	if err := repairAppliedTxnMetadata(writeDB, metaStore, ""); err != nil {
+		closeAll()
+		return nil, err
+	}
+
 	// Create schema cache (shared by TransactionManager and preupdate hooks)
 	schemaCache := NewSchemaCache()
 
@@ -485,7 +494,7 @@ func (mdb *ReplicatedDatabase) ApplyCDCEntries(entries []*IntentEntry) error {
 	if mdb.txnMgr == nil {
 		return fmt.Errorf("transaction manager not initialized")
 	}
-	return mdb.txnMgr.applyCDCEntries(0, entries)
+	return mdb.txnMgr.applyCDCEntries(0, mdb.clock.Now(), entries)
 }
 
 // PendingLocalExecution represents a locally executed transaction waiting for quorum
@@ -672,8 +681,8 @@ func (mdb *ReplicatedDatabase) ExecuteLocalWithHooks(ctx context.Context, txnID 
 		return nil, fmt.Errorf("failed to rollback hook session: %w", err)
 	}
 
-	// Get CDC entries AFTER rollback - ProcessCapturedRows has now created IntentEntries
-	cdcEntries, _ := mdb.metaStore.GetIntentEntries(txnID)
+	// Get CDC entries cached by session processing - avoids a second cursor pass.
+	cdcEntries, _ := session.GetIntentEntries()
 
 	// Return completed execution with captured CDC data
 	return &CompletedLocalExecution{

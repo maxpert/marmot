@@ -67,6 +67,9 @@ func StoreAppliedChangeEvent(metaStore db.MetaStore, txnID uint64, timestamp *HL
 	if err := StoreCapturedRowsFromStatements(metaStore, txnID, statements); err != nil {
 		return 0, err
 	}
+	if err := metaStore.SealCapturedRows(txnID); err != nil {
+		return 0, err
+	}
 	commitTS := HLCToTimestamp(timestamp)
 	if err := metaStore.StoreReplayedTransaction(txnID, commitTS.NodeID, commitTS, database, uint32(len(statements))); err != nil {
 		return 0, err

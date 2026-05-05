@@ -35,6 +35,9 @@ type EphemeralHookSession struct {
 	mu           sync.Mutex
 
 	conflictError error // Set if conflict detected during hook
+
+	intentEntries    []*IntentEntry
+	intentEntriesErr error
 }
 
 // IntentEntry represents a CDC entry stored in the system database
@@ -57,29 +60,12 @@ type IntentEntry struct {
 // The session owns the connection and will close it when done.
 // CDC entries are written to the per-database MetaStore during hooks.
 //
-// IMPORTANT: SchemaCache must be pre-populated for all tables that will be accessed.
-// If a table's schema is not in the cache, its changes will be silently skipped.
-// Call ReplicatedDatabase.ReloadSchema() before starting the session to ensure schemas are loaded.
+// SchemaCache is initialized on session start when empty and then read from cache
+// during capture. If a table is not in cache, CDC for that row is skipped.
 func StartEphemeralSession(ctx context.Context, userDB *sql.DB, metaStore MetaStore, schemaCache *SchemaCache, txnID uint64) (*EphemeralHookSession, error) {
 	conn, err := userDB.Conn(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get connection: %w", err)
-	}
-
-	// Ensure schema cache is fresh before CDC capture
-	err = conn.Raw(func(driverConn interface{}) error {
-		sqliteConn, ok := driverConn.(*sqlite3.SQLiteConn)
-		if !ok {
-			return fmt.Errorf("unexpected driver connection type: %T", driverConn)
-		}
-		if err := schemaCache.Reload(sqliteConn); err != nil {
-			return fmt.Errorf("failed to reload schemas: %w", err)
-		}
-		return nil
-	})
-	if err != nil {
-		conn.Close()
-		return nil, err
 	}
 
 	session := &EphemeralHookSession{
@@ -88,6 +74,20 @@ func StartEphemeralSession(ctx context.Context, userDB *sql.DB, metaStore MetaSt
 		txnID:       txnID,
 		seq:         0,
 		schemaCache: schemaCache,
+	}
+
+	if schemaCache != nil && schemaCache.IsEmpty() {
+		err = conn.Raw(func(driverConn interface{}) error {
+			sqliteConn, ok := driverConn.(*sqlite3.SQLiteConn)
+			if !ok {
+				return fmt.Errorf("unexpected driver connection type: %T", driverConn)
+			}
+			return schemaCache.Reload(sqliteConn)
+		})
+		if err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("failed to load schema cache: %w", err)
+		}
 	}
 
 	err = conn.Raw(func(driverConn interface{}) error {
@@ -146,12 +146,12 @@ func (s *EphemeralHookSession) ExecContext(ctx context.Context, query string, ar
 // TransactionManager.cleanupAfterCommit() or cleanupAfterAbort().
 func (s *EphemeralHookSession) Commit() error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	var txErr error
 	if s.tx != nil {
 		txErr = s.tx.Commit()
+		s.tx = nil
 	}
+	s.mu.Unlock()
 
 	s.cleanup()
 	return txErr
@@ -170,13 +170,15 @@ func (s *EphemeralHookSession) Commit() error {
 // CDC intent entries persist in MetaStore until the distributed transaction completes.
 // Cleanup happens in TransactionManager.cleanupAfterCommit() or cleanupAfterAbort().
 func (s *EphemeralHookSession) Rollback() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
+	// Keep lock scope small: avoid calling ProcessCapturedRows under mutex.
+	// ProcessCapturedRows performs cursor scanning and lock checks, which can block.
 	var txErr error
+	s.mu.Lock()
 	if s.tx != nil {
 		txErr = s.tx.Rollback()
+		s.tx = nil
 	}
+	s.mu.Unlock()
 
 	// Release hookDB connection ASAP - ProcessCapturedRows only needs Pebble
 	s.releaseConnection()
@@ -193,57 +195,59 @@ func (s *EphemeralHookSession) Rollback() error {
 // Called AFTER transaction rollback when SQLite lock is released.
 // Encoding happens in hookCallback, so this only does lock acquisition and conflict detection.
 func (s *EphemeralHookSession) ProcessCapturedRows() error {
-	cursor, err := s.metaStore.IterateCapturedRows(s.txnID)
+	s.mu.Lock()
+	if s.intentEntries != nil || s.intentEntriesErr != nil {
+		err := s.intentEntriesErr
+		s.mu.Unlock()
+		return err
+	}
+	s.mu.Unlock()
+
+	entries, err := s.collectCapturedRows(true)
 	if err != nil {
-		return fmt.Errorf("failed to iterate captured rows: %w", err)
-	}
-	defer cursor.Close()
-
-	for cursor.Next() {
-		rawSeq, data := cursor.Row()
-
-		row, err := DecodeRow(data)
-		if err != nil {
-			return fmt.Errorf("failed to decode captured row: %w", err)
-		}
-
-		// Check DDL lock conflict
-		if ddlTxn, err := s.metaStore.GetCDCTableDDLLock(row.Table); err == nil && ddlTxn != 0 && ddlTxn != s.txnID {
-			s.conflictError = ErrCDCTableDDLInProgress{Table: row.Table, HeldByTxn: ddlTxn}
-			return s.conflictError
-		}
-
-		// Acquire row lock
-		if err := s.metaStore.AcquireCDCRowLock(s.txnID, row.Table, string(row.IntentKey)); err != nil {
-			s.conflictError = err
-			return err
-		}
-
-		// Note: Do NOT delete captured rows here. They are retained for:
-		// 1. GetIntentEntries reads them for replication preparation
-		// 2. StreamCommittedTransactions reads them for delta sync
-		// 3. CleanupOldTransactionRecords deletes them at GC time
-		_ = rawSeq // Silence unused warning
+		s.mu.Lock()
+		s.intentEntriesErr = err
+		s.conflictError = err
+		s.mu.Unlock()
+		return err
 	}
 
-	return cursor.Err()
+	s.mu.Lock()
+	s.intentEntries = entries
+	s.intentEntriesErr = nil
+	s.mu.Unlock()
+
+	return nil
 }
 
-// GetIntentEntries reads all intent entries for this session from captured rows
-func (s *EphemeralHookSession) GetIntentEntries() ([]*IntentEntry, error) {
+func (s *EphemeralHookSession) collectCapturedRows(collectOnly bool) ([]*IntentEntry, error) {
 	cursor, err := s.metaStore.IterateCapturedRows(s.txnID)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to iterate captured rows: %w", err)
 	}
 	defer cursor.Close()
 
-	var entries []*IntentEntry
+	entries := make([]*IntentEntry, 0)
 	for cursor.Next() {
 		seq, data := cursor.Row()
+
 		row, err := DecodeRow(data)
 		if err != nil {
-			continue
+			return nil, fmt.Errorf("failed to decode captured row: %w", err)
 		}
+
+		if collectOnly {
+			// Check DDL lock conflict
+			if ddlTxn, err := s.metaStore.GetCDCTableDDLLock(row.Table); err == nil && ddlTxn != 0 && ddlTxn != s.txnID {
+				return nil, ErrCDCTableDDLInProgress{Table: row.Table, HeldByTxn: ddlTxn}
+			}
+
+			// Acquire row lock
+			if err := s.metaStore.AcquireCDCRowLock(s.txnID, row.Table, string(row.IntentKey)); err != nil {
+				return nil, err
+			}
+		}
+
 		entries = append(entries, &IntentEntry{
 			TxnID:     s.txnID,
 			Seq:       seq,
@@ -254,7 +258,53 @@ func (s *EphemeralHookSession) GetIntentEntries() ([]*IntentEntry, error) {
 			NewValues: row.NewValues,
 		})
 	}
-	return entries, cursor.Err()
+
+	if err := cursor.Err(); err != nil {
+		return nil, err
+	}
+
+	return entries, nil
+}
+
+func (s *EphemeralHookSession) getSchemaForTable(tableName string) (*TableSchema, error) {
+	if s.schemaCache == nil {
+		return nil, fmt.Errorf("schema cache unavailable")
+	}
+	return s.schemaCache.GetSchemaFor(tableName)
+}
+
+// GetIntentEntries reads all intent entries for this session from captured rows
+func (s *EphemeralHookSession) GetIntentEntries() ([]*IntentEntry, error) {
+	if err := s.GetConflictError(); err != nil {
+		return nil, err
+	}
+
+	s.mu.Lock()
+	if s.intentEntries != nil || s.intentEntriesErr != nil {
+		cached := s.intentEntries
+		err := s.intentEntriesErr
+		s.mu.Unlock()
+		if err != nil {
+			return nil, err
+		}
+		return cached, nil
+	}
+	s.mu.Unlock()
+
+	entries, err := s.collectCapturedRows(false)
+	if err != nil {
+		s.mu.Lock()
+		s.intentEntriesErr = err
+		s.mu.Unlock()
+		return nil, err
+	}
+
+	s.mu.Lock()
+	s.intentEntries = entries
+	s.intentEntriesErr = nil
+	s.mu.Unlock()
+
+	return entries, nil
 }
 
 // GetTxnID returns the transaction ID for this session
@@ -324,8 +374,8 @@ func (s *EphemeralHookSession) hookCallback(data sqlite3.SQLitePreUpdateData) {
 		return
 	}
 
-	// Get schema - skip if not cached (DDL operations)
-	schema, err := s.schemaCache.GetSchemaFor(data.TableName)
+	// Get schema from cache; missing entries are treated as non-capturable rows.
+	schema, err := s.getSchemaForTable(data.TableName)
 	if err != nil {
 		log.Warn().Err(err).Uint64("txn_id", s.txnID).Str("table", data.TableName).Msg("hookCallback: schema not found, skipping CDC")
 		return
