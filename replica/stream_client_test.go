@@ -3,17 +3,31 @@ package replica
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"os"
 	"testing"
 	"time"
 
 	"github.com/maxpert/marmot/cfg"
+	"github.com/maxpert/marmot/common"
 	"github.com/maxpert/marmot/db"
 	"github.com/maxpert/marmot/encoding"
 	marmotgrpc "github.com/maxpert/marmot/grpc"
 	pb "github.com/maxpert/marmot/grpc/common"
 	"github.com/maxpert/marmot/hlc"
 )
+
+type streamVectorHook struct {
+	err error
+}
+
+func (h streamVectorHook) OnIndexCreated(context.Context, common.VectorIndexMeta) error {
+	return nil
+}
+
+func (h streamVectorHook) OnIndexLocalChanges(context.Context, common.VectorIndexMeta, []common.CDCEntry) error {
+	return h.err
+}
 
 // setupStreamClientTest creates test environment
 func setupStreamClientTest(t *testing.T) (*db.DatabaseManager, *hlc.Clock, string, func()) {
@@ -445,6 +459,135 @@ func TestStreamClient_ApplyChangeEvent_DDL(t *testing.T) {
 
 	if tableName != "new_table" {
 		t.Errorf("Expected table 'new_table', got '%s'", tableName)
+	}
+}
+
+func TestStreamClient_ApplyChangeEvent_FailureDoesNotStoreCommittedRecord(t *testing.T) {
+	dbMgr, clock, _, cleanup := setupStreamClientTest(t)
+	defer cleanup()
+
+	if err := dbMgr.CreateDatabase("testdb"); err != nil {
+		t.Fatalf("Failed to create database: %v", err)
+	}
+	mdb, err := dbMgr.GetDatabase("testdb")
+	if err != nil {
+		t.Fatalf("Failed to get database: %v", err)
+	}
+
+	client := NewStreamClient([]string{"localhost:8080"}, 1, dbMgr, clock, nil)
+	event := &marmotgrpc.ChangeEvent{
+		TxnId:    250,
+		Database: "testdb",
+		Statements: []*marmotgrpc.Statement{
+			{
+				Type:      pb.StatementType_INSERT,
+				TableName: "missing_table",
+				Payload: &marmotgrpc.Statement_RowChange{
+					RowChange: &marmotgrpc.RowChange{
+						IntentKey: []byte("missing:1"),
+						NewValues: map[string][]byte{
+							"id": msgpackMarshal(int64(1)),
+						},
+					},
+				},
+			},
+		},
+	}
+
+	if err := client.applyChangeEvent(context.Background(), event); err == nil {
+		t.Fatal("expected stream apply to fail")
+	}
+	if rec, err := mdb.GetMetaStore().GetTransaction(event.TxnId); err == nil && rec != nil && rec.Status == db.TxnStatusCommitted {
+		t.Fatalf("failed stream apply advanced committed transaction: %+v", rec)
+	}
+}
+
+func TestStreamClient_ApplyChangeEvent_VectorCDCFailureDoesNotBlockStream(t *testing.T) {
+	dbMgr, clock, _, cleanup := setupStreamClientTest(t)
+	defer cleanup()
+
+	if err := dbMgr.CreateDatabase("testdb"); err != nil {
+		t.Fatalf("Failed to create database: %v", err)
+	}
+	mdb, err := dbMgr.GetDatabase("testdb")
+	if err != nil {
+		t.Fatalf("Failed to get database: %v", err)
+	}
+	if _, err := mdb.GetDB().Exec(`CREATE TABLE docs (id INTEGER PRIMARY KEY, embed BLOB, title TEXT)`); err != nil {
+		t.Fatalf("Failed to create docs: %v", err)
+	}
+	if err := mdb.ReloadSchema(); err != nil {
+		t.Fatalf("ReloadSchema: %v", err)
+	}
+
+	vecMgr := db.NewVectorIndexManager(dbMgr)
+	vecMgr.SetLifecycleHook(streamVectorHook{err: errors.New("overlay write failed")})
+	dbMgr.SetVectorIndexManager(vecMgr)
+	if err := vecMgr.ApplyVectorControl(context.Background(), common.VectorIndexChange{
+		Action:              common.VectorIndexActionCreate,
+		Database:            "testdb",
+		IndexName:           "docs_embed_idx",
+		TableName:           "docs",
+		ColumnName:          "embed",
+		Metric:              "cosine",
+		Dim:                 4,
+		Nlist:               8,
+		Nprobe:              8,
+		TargetPartitionSize: 512,
+		CreatedAt:           time.Now().UnixNano(),
+	}); err != nil {
+		t.Fatalf("ApplyVectorControl: %v", err)
+	}
+
+	client := NewStreamClient([]string{"localhost:8080"}, 1, dbMgr, clock, nil)
+	event := &marmotgrpc.ChangeEvent{
+		TxnId:    251,
+		Database: "testdb",
+		Statements: []*marmotgrpc.Statement{
+			{
+				Type:      pb.StatementType_INSERT,
+				TableName: "docs",
+				Payload: &marmotgrpc.Statement_RowChange{
+					RowChange: &marmotgrpc.RowChange{
+						IntentKey: []byte("docs:1"),
+						NewValues: map[string][]byte{
+							"id":    msgpackMarshal(int64(1)),
+							"embed": msgpackMarshal([]byte{1, 2, 3, 4}),
+							"title": msgpackMarshal("stream vector row"),
+						},
+					},
+				},
+			},
+		},
+	}
+
+	if err := client.applyChangeEvent(context.Background(), event); err != nil {
+		t.Fatalf("vector CDC failure should not block stream row replication: %v", err)
+	}
+
+	var title string
+	if err := mdb.GetDB().QueryRow(`SELECT title FROM docs WHERE id = 1`).Scan(&title); err != nil {
+		t.Fatalf("Failed to read replicated row: %v", err)
+	}
+	if title != "stream vector row" {
+		t.Fatalf("title=%q, want stream vector row", title)
+	}
+	var status string
+	if err := mdb.GetDB().QueryRow(
+		`SELECT status FROM __marmot_vector_indexes WHERE index_name = ?`,
+		"docs_embed_idx",
+	).Scan(&status); err != nil {
+		t.Fatalf("Failed to read vector status: %v", err)
+	}
+	if status != "dirty" {
+		t.Fatalf("vector status=%q, want dirty", status)
+	}
+	rec, err := mdb.GetMetaStore().GetTransaction(event.TxnId)
+	if err != nil {
+		t.Fatalf("GetTransaction: %v", err)
+	}
+	if rec == nil || rec.Status != db.TxnStatusCommitted {
+		t.Fatalf("stream event not recorded committed: %+v", rec)
 	}
 }
 

@@ -593,7 +593,7 @@ ORDER BY vec_distance(embed, ?) LIMIT 10`
 	// Run REINDEX.
 	t.Log("Starting REINDEX under load...")
 	reindexStart := time.Now()
-	err := s.vecMgr.ReindexIndex(context.Background(), benchIndexName)
+	err := s.vecMgr.ReindexIndex(context.Background(), benchIndexName, benchDBName)
 	reindexDuration := time.Since(reindexStart)
 	require.NoError(t, err, "REINDEX must not error")
 

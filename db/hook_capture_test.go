@@ -369,8 +369,8 @@ func TestHookCapture_AllColumnTypes(t *testing.T) {
 
 	require.Len(t, captured, 1)
 	require.NotNil(t, captured[0].NewValues)
-	// NULL values are not included in the encoded map, so we have 5 not 6
-	assert.Len(t, captured[0].NewValues, 5)
+	// NULL values are preserved so replicated row images do not lose explicit NULL writes.
+	assert.Len(t, captured[0].NewValues, 6)
 
 	// Verify types - values are now msgpack encoded
 	var id int64
@@ -393,9 +393,9 @@ func TestHookCapture_AllColumnTypes(t *testing.T) {
 	require.NoError(t, encoding.Unmarshal(captured[0].NewValues["blob_col"], &blobCol))
 	assert.Equal(t, []byte{0xDE, 0xAD, 0xBE, 0xEF}, blobCol)
 
-	// NULL columns are not included in the map
-	_, hasNullCol := captured[0].NewValues["null_col"]
-	assert.False(t, hasNullCol)
+	var nullCol any
+	require.NoError(t, encoding.Unmarshal(captured[0].NewValues["null_col"], &nullCol))
+	assert.Nil(t, nullCol)
 }
 
 // TestHookCapture_MultipleOperations verifies multiple ops have correct sequence

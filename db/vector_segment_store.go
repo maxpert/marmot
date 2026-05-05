@@ -1403,6 +1403,15 @@ func BuildSegmentGenerationOnReopen(
 	if err := openAndStoreOverlay(dbPath, meta.IndexName, state, state.ProbeVersion()); err != nil {
 		return err
 	}
+	if state.ProbeState() == nil {
+		cs, err := computeCentroids(ctx, db, meta.TableName, meta.ColumnName, spec, meta.TargetPartitionSize, nil)
+		if err != nil {
+			return fmt.Errorf("reopen vector index %q: compute centroids: %w", meta.IndexName, err)
+		}
+		if cs != nil {
+			state.SwapProbeState(cs)
+		}
+	}
 	return buildAndStoreSegmentGeneration(ctx, db, dbPath, state, meta, spec)
 }
 

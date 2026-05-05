@@ -609,8 +609,7 @@ func (s *StreamClient) streamChanges(ctx context.Context) error {
 				Uint64("txn_id", event.TxnId).
 				Str("database", dbName).
 				Msg("Failed to apply change event")
-			// Continue anyway - anti-entropy will fix it
-			continue
+			return fmt.Errorf("failed to apply stream event %d for database %s: %w", event.TxnId, dbName, err)
 		}
 
 		// Update last txn ID for this database and get wait queue if exists
@@ -850,7 +849,11 @@ func (s *StreamClient) applyChangeEvent(ctx context.Context, event *marmotgrpc.C
 	}
 	if len(event.Statements) == 1 {
 		if change := event.Statements[0].GetVectorIndexChange(); change != nil {
-			return s.applyVectorIndexChange(ctx, marmotgrpc.VectorChangeFromProto(change))
+			if err := s.applyVectorIndexChange(ctx, marmotgrpc.VectorChangeFromProto(change)); err != nil {
+				return err
+			}
+			_, err := marmotgrpc.StoreAppliedChangeEvent(mdb.GetMetaStore(), event.TxnId, event.Timestamp, database, event.Statements)
+			return err
 		}
 	}
 
@@ -881,7 +884,18 @@ func (s *StreamClient) applyChangeEvent(ctx context.Context, event *marmotgrpc.C
 			log.Warn().Err(err).Str("database", database).Msg("Failed to reload schema after DDL")
 		}
 	}
-	s.applyVectorCDCFromEvent(ctx, database, event)
+	seqNum, err := marmotgrpc.StoreAppliedChangeEvent(mdb.GetMetaStore(), event.TxnId, event.Timestamp, database, event.Statements)
+	if err != nil {
+		return fmt.Errorf("failed to store streamed rows: %w", err)
+	}
+	if err := s.applyVectorCDCFromEvent(ctx, database, event.TxnId, seqNum, event.Statements); err != nil {
+		log.Error().
+			Err(err).
+			Str("database", database).
+			Uint64("txn_id", event.TxnId).
+			Uint64("seq_num", seqNum).
+			Msg("StreamClient: vector CDC failed after row commit; local vector index is dirty")
+	}
 
 	return nil
 }
@@ -900,9 +914,9 @@ func (s *StreamClient) applyVectorIndexChange(ctx context.Context, change common
 	return applier.ApplyVectorControl(ctx, change)
 }
 
-func (s *StreamClient) applyVectorCDCFromEvent(ctx context.Context, database string, event *marmotgrpc.ChangeEvent) {
-	entries := make([]common.CDCEntry, 0, len(event.Statements))
-	for _, stmt := range event.Statements {
+func (s *StreamClient) applyVectorCDCFromEvent(ctx context.Context, database string, txnID, seqNum uint64, statements []*marmotgrpc.Statement) error {
+	entries := make([]common.CDCEntry, 0, len(statements))
+	for _, stmt := range statements {
 		rowChange := stmt.GetRowChange()
 		if rowChange == nil || (len(rowChange.NewValues) == 0 && len(rowChange.OldValues) == 0) {
 			continue
@@ -912,26 +926,27 @@ func (s *StreamClient) applyVectorCDCFromEvent(ctx context.Context, database str
 			IntentKey:    rowChange.IntentKey,
 			OldValues:    rowChange.OldValues,
 			NewValues:    rowChange.NewValues,
-			CommitTxnID:  event.TxnId,
-			CommitSeqNum: event.SeqNum,
+			CommitTxnID:  txnID,
+			CommitSeqNum: seqNum,
 		})
 	}
 	if len(entries) == 0 {
-		return
+		return nil
 	}
 	vecMgr := s.dbManager.GetVectorIndexManager()
 	if vecMgr == nil {
-		return
+		return nil
 	}
 	applier, ok := vecMgr.(interface {
 		ApplyCommittedVectorCDC(context.Context, string, uint64, uint64, []common.CDCEntry) error
 	})
 	if !ok {
-		return
+		return nil
 	}
-	if err := applier.ApplyCommittedVectorCDC(ctx, database, event.TxnId, event.SeqNum, entries); err != nil {
-		log.Error().Err(err).Uint64("txn_id", event.TxnId).Str("database", database).Msg("Failed to apply streamed vector CDC")
+	if err := applier.ApplyCommittedVectorCDC(ctx, database, txnID, seqNum, entries); err != nil {
+		return fmt.Errorf("apply streamed vector CDC: %w", err)
 	}
+	return nil
 }
 
 // applyCreateDatabase handles CREATE DATABASE replication
@@ -1029,16 +1044,15 @@ func (s *StreamClient) applyCDCStatement(tx *sql.Tx, mdb *db.ReplicatedDatabase,
 	// Create schema adapter for PK lookups using cached schema
 	schemaAdapter := &streamClientSchemaAdapter{mdb: mdb}
 
-	switch stmt.Type {
-	case pb.StatementType_INSERT, pb.StatementType_REPLACE:
-		return db.ApplyCDCInsert(tx, stmt.TableName, rowChange.NewValues)
-	case pb.StatementType_UPDATE:
-		return db.ApplyCDCUpdate(tx, schemaAdapter, stmt.TableName, rowChange.OldValues, rowChange.NewValues)
-	case pb.StatementType_DELETE:
-		return db.ApplyCDCDelete(tx, schemaAdapter, stmt.TableName, rowChange.OldValues)
-	default:
+	stmtCode, ok := common.FromWireType(stmt.Type)
+	if !ok {
 		return fmt.Errorf("unsupported statement type: %v", stmt.Type)
 	}
+	switch stmtCode {
+	case common.StatementInsert, common.StatementUpdate, common.StatementDelete, common.StatementReplace:
+		return db.ApplyCDCValues(tx, schemaAdapter, db.StatementTypeToOpType(stmtCode), stmt.TableName, rowChange.OldValues, rowChange.NewValues)
+	}
+	return fmt.Errorf("unsupported statement type: %v", stmt.Type)
 }
 
 // streamClientSchemaAdapter adapts ReplicatedDatabase schema access to db.CDCSchemaProvider

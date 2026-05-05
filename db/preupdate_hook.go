@@ -421,10 +421,11 @@ func extractPKFromValues(schema *TableSchema, values []interface{}, rowID int64)
 func encodeValuesWithSchema(columns []string, values []interface{}) map[string][]byte {
 	result := make(map[string][]byte, len(columns))
 	for i, col := range columns {
-		if i < len(values) && values[i] != nil {
-			if encoded := encodeValue(values[i]); encoded != nil {
-				result[col] = encoded
-			}
+		if i >= len(values) {
+			continue
+		}
+		if encoded := encodeValue(values[i]); encoded != nil {
+			result[col] = encoded
 		}
 	}
 	return result
@@ -432,9 +433,6 @@ func encodeValuesWithSchema(columns []string, values []interface{}) map[string][
 
 // encodeValue encodes a single value to msgpack bytes.
 func encodeValue(v interface{}) []byte {
-	if v == nil {
-		return nil
-	}
 	data, err := encoding.Marshal(v)
 	if err != nil {
 		return nil

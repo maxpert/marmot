@@ -19,6 +19,38 @@ type CDCSchemaProvider interface {
 	GetPrimaryKeys(tableName string) ([]string, error)
 }
 
+func quoteSQLiteIdent(ident string) string {
+	return `"` + strings.ReplaceAll(ident, `"`, `""`) + `"`
+}
+
+func quoteSQLiteIdentList(columns []string) []string {
+	quoted := make([]string, len(columns))
+	for i, col := range columns {
+		quoted[i] = quoteSQLiteIdent(col)
+	}
+	return quoted
+}
+
+func ApplyCDCEntry(exec CDCExecutor, schema CDCSchemaProvider, entry *IntentEntry) error {
+	if entry == nil {
+		return nil
+	}
+	return ApplyCDCValues(exec, schema, OpType(entry.Operation), entry.Table, entry.OldValues, entry.NewValues)
+}
+
+func ApplyCDCValues(exec CDCExecutor, schema CDCSchemaProvider, opType OpType, tableName string, oldValues, newValues map[string][]byte) error {
+	switch opType {
+	case OpTypeInsert, OpTypeReplace:
+		return ApplyCDCInsert(exec, tableName, newValues)
+	case OpTypeUpdate:
+		return ApplyCDCUpdate(exec, schema, tableName, oldValues, newValues)
+	case OpTypeDelete:
+		return ApplyCDCDelete(exec, schema, tableName, oldValues)
+	default:
+		return fmt.Errorf("unsupported operation type for CDC: %v", opType)
+	}
+}
+
 // ApplyCDCInsert performs INSERT OR REPLACE using CDC row data.
 // Columns are sorted alphabetically to ensure deterministic SQL generation.
 // Values are deserialized from msgpack and []byte values are converted to strings
@@ -48,8 +80,8 @@ func ApplyCDCInsert(exec CDCExecutor, tableName string, newValues map[string][]b
 	}
 
 	sqlStmt := fmt.Sprintf("INSERT OR REPLACE INTO %s (%s) VALUES (%s)",
-		tableName,
-		strings.Join(columns, ", "),
+		quoteSQLiteIdent(tableName),
+		strings.Join(quoteSQLiteIdentList(columns), ", "),
 		strings.Join(placeholders, ", "))
 
 	_, err := exec.Exec(sqlStmt, values...)
@@ -86,7 +118,7 @@ func ApplyCDCUpdate(exec CDCExecutor, schema CDCSchemaProvider, tableName string
 	values := make([]interface{}, 0, len(newValues)+len(primaryKeys))
 
 	for i, col := range setCols {
-		setClauses[i] = fmt.Sprintf("%s = ?", col)
+		setClauses[i] = fmt.Sprintf("%s = ?", quoteSQLiteIdent(col))
 		value, err := unmarshalCDCValue(newValues[col])
 		if err != nil {
 			return fmt.Errorf("ApplyCDCUpdate %s: failed to deserialize column %s: %w", tableName, col, err)
@@ -108,16 +140,16 @@ func ApplyCDCUpdate(exec CDCExecutor, schema CDCSchemaProvider, tableName string
 			}
 		}
 
-		whereClauses[i] = fmt.Sprintf("%s = ?", pkCol)
-		value, err := unmarshalCDCValue(pkBytes)
+		clause, nextValues, err := cdcPrimaryKeyPredicate("ApplyCDCUpdate", tableName, pkCol, pkBytes, values)
 		if err != nil {
-			return fmt.Errorf("ApplyCDCUpdate %s: failed to deserialize PK column %s: %w", tableName, pkCol, err)
+			return err
 		}
-		values = append(values, value)
+		whereClauses[i] = clause
+		values = nextValues
 	}
 
 	sqlStmt := fmt.Sprintf("UPDATE %s SET %s WHERE %s",
-		tableName,
+		quoteSQLiteIdent(tableName),
 		strings.Join(setClauses, ", "),
 		strings.Join(whereClauses, " AND "))
 
@@ -145,7 +177,7 @@ func ApplyCDCDelete(exec CDCExecutor, schema CDCSchemaProvider, tableName string
 
 	// Build WHERE clause using primary key columns from oldValues
 	whereClauses := make([]string, len(primaryKeys))
-	values := make([]interface{}, len(primaryKeys))
+	values := make([]interface{}, 0, len(primaryKeys))
 
 	for i, pkCol := range primaryKeys {
 		pkBytes, ok := oldValues[pkCol]
@@ -153,16 +185,16 @@ func ApplyCDCDelete(exec CDCExecutor, schema CDCSchemaProvider, tableName string
 			return fmt.Errorf("ApplyCDCDelete %s: primary key column %s not found in old values", tableName, pkCol)
 		}
 
-		whereClauses[i] = fmt.Sprintf("%s = ?", pkCol)
-		value, err := unmarshalCDCValue(pkBytes)
+		clause, nextValues, err := cdcPrimaryKeyPredicate("ApplyCDCDelete", tableName, pkCol, pkBytes, values)
 		if err != nil {
-			return fmt.Errorf("ApplyCDCDelete %s: failed to deserialize PK column %s: %w", tableName, pkCol, err)
+			return err
 		}
-		values[i] = value
+		whereClauses[i] = clause
+		values = nextValues
 	}
 
 	sqlStmt := fmt.Sprintf("DELETE FROM %s WHERE %s",
-		tableName,
+		quoteSQLiteIdent(tableName),
 		strings.Join(whereClauses, " AND "))
 
 	_, err = exec.Exec(sqlStmt, values...)
@@ -170,4 +202,15 @@ func ApplyCDCDelete(exec CDCExecutor, schema CDCSchemaProvider, tableName string
 		return fmt.Errorf("ApplyCDCDelete %s: %w", tableName, err)
 	}
 	return nil
+}
+
+func cdcPrimaryKeyPredicate(opName, tableName, pkCol string, pkBytes []byte, values []interface{}) (string, []interface{}, error) {
+	value, err := unmarshalCDCValue(pkBytes)
+	if err != nil {
+		return "", nil, fmt.Errorf("%s %s: failed to deserialize PK column %s: %w", opName, tableName, pkCol, err)
+	}
+	if value == nil {
+		return fmt.Sprintf("%s IS NULL", quoteSQLiteIdent(pkCol)), values, nil
+	}
+	return fmt.Sprintf("%s = ?", quoteSQLiteIdent(pkCol)), append(values, value), nil
 }

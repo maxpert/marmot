@@ -9,7 +9,6 @@ import (
 	"github.com/maxpert/marmot/cfg"
 	"github.com/maxpert/marmot/common"
 	"github.com/maxpert/marmot/db"
-	pb "github.com/maxpert/marmot/grpc/common"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/rs/zerolog/log"
 )
@@ -330,7 +329,11 @@ func (ds *DeltaSyncClient) applyChangeEvent(ctx context.Context, event *ChangeEv
 	}
 	if len(event.Statements) == 1 {
 		if change := event.Statements[0].GetVectorIndexChange(); change != nil {
-			return ds.applyVectorIndexChange(ctx, vectorChangeFromProto(change))
+			if err := ds.applyVectorIndexChange(ctx, vectorChangeFromProto(change)); err != nil {
+				return err
+			}
+			_, err := StoreAppliedChangeEvent(mdb.GetMetaStore(), event.TxnId, event.Timestamp, database, event.Statements)
+			return err
 		}
 	}
 
@@ -347,18 +350,11 @@ func (ds *DeltaSyncClient) applyChangeEvent(ctx context.Context, event *ChangeEv
 		if rowChange := stmt.GetRowChange(); rowChange != nil && (len(rowChange.NewValues) > 0 || len(rowChange.OldValues) > 0) {
 			// CDC path: apply row data directly using unified applier
 			schemaAdapter := &deltaSyncSchemaAdapter{dbMgr: ds.dbManager, dbName: database}
-			var err error
-			switch stmt.Type {
-			case pb.StatementType_INSERT, pb.StatementType_REPLACE:
-				err = db.ApplyCDCInsert(tx, stmt.TableName, rowChange.NewValues)
-			case pb.StatementType_UPDATE:
-				err = db.ApplyCDCUpdate(tx, schemaAdapter, stmt.TableName, rowChange.OldValues, rowChange.NewValues)
-			case pb.StatementType_DELETE:
-				err = db.ApplyCDCDelete(tx, schemaAdapter, stmt.TableName, rowChange.OldValues)
-			default:
-				err = fmt.Errorf("unsupported statement type for CDC: %v", stmt.Type)
+			opType, opErr := wireDMLToOp(stmt.Type)
+			if opErr != nil {
+				return opErr
 			}
-			if err != nil {
+			if err := db.ApplyCDCValues(tx, schemaAdapter, opType, stmt.TableName, rowChange.OldValues, rowChange.NewValues); err != nil {
 				return fmt.Errorf("failed to apply CDC statement: %w", err)
 			}
 			log.Debug().
@@ -409,7 +405,18 @@ func (ds *DeltaSyncClient) applyChangeEvent(ctx context.Context, event *ChangeEv
 			log.Warn().Err(err).Str("database", database).Msg("DELTA-SYNC: failed to reload schema after DDL")
 		}
 	}
-	ds.applyVectorCDCFromEvent(ctx, database, event)
+	seqNum, err := StoreAppliedChangeEvent(mdb.GetMetaStore(), event.TxnId, event.Timestamp, database, event.Statements)
+	if err != nil {
+		return fmt.Errorf("failed to store delta-sync rows: %w", err)
+	}
+	if err := ds.applyVectorCDCFromEvent(ctx, database, event.TxnId, seqNum, event.Statements); err != nil {
+		log.Error().
+			Err(err).
+			Str("database", database).
+			Uint64("txn_id", event.TxnId).
+			Uint64("seq_num", seqNum).
+			Msg("DELTA-SYNC: vector CDC failed after row commit; local vector index is dirty")
+	}
 
 	return nil
 }
@@ -428,9 +435,9 @@ func (ds *DeltaSyncClient) applyVectorIndexChange(ctx context.Context, change co
 	return applier.ApplyVectorControl(ctx, change)
 }
 
-func (ds *DeltaSyncClient) applyVectorCDCFromEvent(ctx context.Context, database string, event *ChangeEvent) {
-	entries := make([]common.CDCEntry, 0, len(event.Statements))
-	for _, stmt := range event.Statements {
+func (ds *DeltaSyncClient) applyVectorCDCFromEvent(ctx context.Context, database string, txnID, seqNum uint64, statements []*Statement) error {
+	entries := make([]common.CDCEntry, 0, len(statements))
+	for _, stmt := range statements {
 		rowChange := stmt.GetRowChange()
 		if rowChange == nil || (len(rowChange.NewValues) == 0 && len(rowChange.OldValues) == 0) {
 			continue
@@ -440,26 +447,27 @@ func (ds *DeltaSyncClient) applyVectorCDCFromEvent(ctx context.Context, database
 			IntentKey:    rowChange.IntentKey,
 			OldValues:    rowChange.OldValues,
 			NewValues:    rowChange.NewValues,
-			CommitTxnID:  event.TxnId,
-			CommitSeqNum: event.SeqNum,
+			CommitTxnID:  txnID,
+			CommitSeqNum: seqNum,
 		})
 	}
 	if len(entries) == 0 {
-		return
+		return nil
 	}
 	vecMgr := ds.dbManager.GetVectorIndexManager()
 	if vecMgr == nil {
-		return
+		return nil
 	}
 	applier, ok := vecMgr.(interface {
 		ApplyCommittedVectorCDC(context.Context, string, uint64, uint64, []common.CDCEntry) error
 	})
 	if !ok {
-		return
+		return nil
 	}
-	if err := applier.ApplyCommittedVectorCDC(ctx, database, event.TxnId, event.SeqNum, entries); err != nil {
-		log.Error().Err(err).Uint64("txn_id", event.TxnId).Str("database", database).Msg("DELTA-SYNC: failed to apply vector CDC")
+	if err := applier.ApplyCommittedVectorCDC(ctx, database, txnID, seqNum, entries); err != nil {
+		return fmt.Errorf("DELTA-SYNC: apply vector CDC: %w", err)
 	}
+	return nil
 }
 
 // deltaSyncSchemaAdapter adapts DatabaseManager schema access to CDCSchemaProvider

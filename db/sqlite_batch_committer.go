@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -371,25 +372,35 @@ func (bc *SQLiteBatchCommitter) flush(batch map[uint64]*pendingCommit, trigger s
 	// Create schema adapter for the unified applier
 	schemaAdapter := &schemaCacheAdapter{cache: schemaCache}
 
-	// Apply all CDC entries
-	for _, pc := range batch {
+	txnIDs := make([]uint64, 0, len(batch))
+	for txnID := range batch {
+		txnIDs = append(txnIDs, txnID)
+	}
+	sort.Slice(txnIDs, func(i, j int) bool { return txnIDs[i] < txnIDs[j] })
+
+	// Apply each logical transaction under a savepoint. A failed transaction
+	// rolls back its own row changes without poisoning successful peers in the
+	// same fsync batch.
+	for _, txnID := range txnIDs {
+		pc := batch[txnID]
+		savepoint := fmt.Sprintf("marmot_batch_%d", txnID)
+		if _, err := tx.Exec("SAVEPOINT " + savepoint); err != nil {
+			pc.err = err
+			continue
+		}
 		for _, entry := range pc.cdcEntries {
-			opType := OpType(entry.Operation)
-			var err error
-			switch opType {
-			case OpTypeInsert, OpTypeReplace:
-				err = ApplyCDCInsert(tx, entry.Table, entry.NewValues)
-			case OpTypeUpdate:
-				err = ApplyCDCUpdate(tx, schemaAdapter, entry.Table, entry.OldValues, entry.NewValues)
-			case OpTypeDelete:
-				err = ApplyCDCDelete(tx, schemaAdapter, entry.Table, entry.OldValues)
-			default:
-				err = fmt.Errorf("unsupported operation type for CDC: %v", opType)
-			}
-			if err != nil {
+			if err := ApplyCDCEntry(tx, schemaAdapter, entry); err != nil {
 				pc.err = err
 				break
 			}
+		}
+		if pc.err != nil {
+			_, _ = tx.Exec("ROLLBACK TO " + savepoint)
+			_, _ = tx.Exec("RELEASE " + savepoint)
+			continue
+		}
+		if _, err := tx.Exec("RELEASE " + savepoint); err != nil {
+			pc.err = err
 		}
 	}
 

@@ -345,6 +345,57 @@ func TestApplyCDCUpdate_CompositePK(t *testing.T) {
 	}
 }
 
+func TestApplyCDCUpdate_CompositePKWithNullComponent(t *testing.T) {
+	db, cleanup := setupCDCTestDB(t)
+	defer cleanup()
+
+	_, err := db.Exec(`
+		CREATE TABLE test_null_composite (
+			tenant TEXT,
+			local_id INTEGER,
+			content TEXT,
+			PRIMARY KEY (tenant, local_id)
+		)
+	`)
+	if err != nil {
+		t.Fatalf("Failed to create table: %v", err)
+	}
+	_, err = db.Exec("INSERT INTO test_null_composite (tenant, local_id, content) VALUES (NULL, 7, 'old')")
+	if err != nil {
+		t.Fatalf("Failed to insert initial row: %v", err)
+	}
+
+	schema := &mockSchemaProvider{
+		schemas: map[string][]string{
+			"test_null_composite": {"tenant", "local_id"},
+		},
+	}
+	oldValues := map[string][]byte{
+		"tenant":   marshalValue(t, nil),
+		"local_id": marshalValue(t, int64(7)),
+		"content":  marshalValue(t, "old"),
+	}
+	newValues := map[string][]byte{
+		"tenant":   marshalValue(t, nil),
+		"local_id": marshalValue(t, int64(7)),
+		"content":  marshalValue(t, "new"),
+	}
+
+	if err := ApplyCDCUpdate(db, schema, "test_null_composite", oldValues, newValues); err != nil {
+		t.Fatalf("ApplyCDCUpdate failed: %v", err)
+	}
+
+	var content string
+	err = db.QueryRow("SELECT content FROM test_null_composite WHERE tenant IS NULL AND local_id = 7").
+		Scan(&content)
+	if err != nil {
+		t.Fatalf("Failed to query updated row: %v", err)
+	}
+	if content != "new" {
+		t.Errorf("Expected content='new', got '%s'", content)
+	}
+}
+
 // TestApplyCDCDelete_SinglePK verifies DELETE with single column primary key
 func TestApplyCDCDelete_SinglePK(t *testing.T) {
 	db, cleanup := setupCDCTestDB(t)
@@ -457,6 +508,62 @@ func TestApplyCDCDelete_CompositePK(t *testing.T) {
 	}
 	if content != "content2" {
 		t.Errorf("Expected content='content2', got '%s'", content)
+	}
+}
+
+func TestApplyCDCDelete_CompositePKWithNullComponent(t *testing.T) {
+	db, cleanup := setupCDCTestDB(t)
+	defer cleanup()
+
+	_, err := db.Exec(`
+		CREATE TABLE test_delete_null_composite (
+			tenant TEXT,
+			local_id INTEGER,
+			content TEXT,
+			PRIMARY KEY (tenant, local_id)
+		)
+	`)
+	if err != nil {
+		t.Fatalf("Failed to create table: %v", err)
+	}
+	_, err = db.Exec("INSERT INTO test_delete_null_composite (tenant, local_id, content) VALUES (NULL, 7, 'delete me')")
+	if err != nil {
+		t.Fatalf("Failed to insert null-PK row: %v", err)
+	}
+	_, err = db.Exec("INSERT INTO test_delete_null_composite (tenant, local_id, content) VALUES ('tenant-a', 7, 'keep me')")
+	if err != nil {
+		t.Fatalf("Failed to insert non-null-PK row: %v", err)
+	}
+
+	schema := &mockSchemaProvider{
+		schemas: map[string][]string{
+			"test_delete_null_composite": {"tenant", "local_id"},
+		},
+	}
+	oldValues := map[string][]byte{
+		"tenant":   marshalValue(t, nil),
+		"local_id": marshalValue(t, int64(7)),
+		"content":  marshalValue(t, "delete me"),
+	}
+
+	if err := ApplyCDCDelete(db, schema, "test_delete_null_composite", oldValues); err != nil {
+		t.Fatalf("ApplyCDCDelete failed: %v", err)
+	}
+
+	var count int
+	err = db.QueryRow("SELECT COUNT(*) FROM test_delete_null_composite WHERE tenant IS NULL AND local_id = 7").Scan(&count)
+	if err != nil {
+		t.Fatalf("Failed to count deleted row: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("Null-PK row should be deleted, found %d rows", count)
+	}
+	err = db.QueryRow("SELECT COUNT(*) FROM test_delete_null_composite WHERE tenant = 'tenant-a' AND local_id = 7").Scan(&count)
+	if err != nil {
+		t.Fatalf("Failed to count retained row: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("Non-null row should remain, found %d rows", count)
 	}
 }
 

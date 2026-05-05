@@ -51,6 +51,15 @@ const vecIndexMetaCreate = `CREATE TABLE IF NOT EXISTS __marmot_vector_indexes (
 	UNIQUE(table_name, column_name)
 )`
 
+const vecIndexAppliedCDCCreate = `CREATE TABLE IF NOT EXISTS __marmot_vector_cdc_applied (
+	database_name  TEXT NOT NULL,
+	index_name     TEXT NOT NULL,
+	commit_txn_id  INTEGER NOT NULL,
+	commit_seq_num INTEGER NOT NULL,
+	applied_at     INTEGER NOT NULL,
+	PRIMARY KEY(database_name, index_name, commit_txn_id, commit_seq_num)
+)`
+
 // MigrateVectorIndexesSchema ensures __marmot_vector_indexes exists and has
 // all required columns with compatible types (design §3.5, fix P).
 //
@@ -61,6 +70,9 @@ const vecIndexMetaCreate = `CREATE TABLE IF NOT EXISTS __marmot_vector_indexes (
 func MigrateVectorIndexesSchema(db *sql.DB) error {
 	if _, err := db.Exec(vecIndexMetaCreate); err != nil {
 		return fmt.Errorf("ensure __marmot_vector_indexes: %w", err)
+	}
+	if _, err := db.Exec(vecIndexAppliedCDCCreate); err != nil {
+		return fmt.Errorf("ensure __marmot_vector_cdc_applied: %w", err)
 	}
 
 	existing, err := currentVecIndexColumns(db)

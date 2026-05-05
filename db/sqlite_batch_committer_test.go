@@ -142,6 +142,51 @@ func TestBatchCommitter_MultipleConcurrent(t *testing.T) {
 	}
 }
 
+func TestBatchCommitter_SavepointIsolatesFailedTransaction(t *testing.T) {
+	bc, db, cleanup := setupTestBatchCommitter(t, 3, time.Second)
+	defer cleanup()
+
+	good1 := makeIntentEntry("test_table", OpTypeInsert, 1, "one", 100)
+	bad := makeIntentEntry("missing_table", OpTypeInsert, 2, "bad", 200)
+	good2 := makeIntentEntry("test_table", OpTypeInsert, 3, "three", 300)
+
+	fut1 := bc.Enqueue(1, hlc.Timestamp{}, []*IntentEntry{good1}, nil)
+	fut2 := bc.Enqueue(2, hlc.Timestamp{}, []*IntentEntry{bad}, nil)
+	fut3 := bc.Enqueue(3, hlc.Timestamp{}, []*IntentEntry{good2}, nil)
+
+	if _, err := fut1.Get(); err != nil {
+		t.Fatalf("first transaction should commit: %v", err)
+	}
+	if _, err := fut2.Get(); err == nil {
+		t.Fatal("second transaction should fail")
+	}
+	if _, err := fut3.Get(); err != nil {
+		t.Fatalf("third transaction should commit despite peer failure: %v", err)
+	}
+
+	rows, err := db.Query(`SELECT id, name FROM test_table ORDER BY id`)
+	if err != nil {
+		t.Fatalf("query committed rows: %v", err)
+	}
+	defer rows.Close()
+
+	got := make(map[int]string)
+	for rows.Next() {
+		var id int
+		var name string
+		if err := rows.Scan(&id, &name); err != nil {
+			t.Fatalf("scan row: %v", err)
+		}
+		got[id] = name
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("row iteration: %v", err)
+	}
+	if len(got) != 2 || got[1] != "one" || got[3] != "three" {
+		t.Fatalf("committed rows = %#v, want only txns 1 and 3", got)
+	}
+}
+
 func TestBatchCommitter_TimeoutFlush(t *testing.T) {
 	bc, db, cleanup := setupTestBatchCommitter(t, 100, 50*time.Millisecond)
 	defer cleanup()

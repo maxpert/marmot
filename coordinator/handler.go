@@ -30,7 +30,7 @@ type VectorIndexManagerProvider interface {
 	ResolveCreateIndexMeta(ctx context.Context, meta common.VectorIndexMeta) (common.VectorIndexMeta, error)
 	CreateIndex(ctx context.Context, meta common.VectorIndexMeta) error
 	DropIndex(ctx context.Context, indexName, database string) error
-	ReindexIndex(ctx context.Context, indexName string) error
+	ReindexIndex(ctx context.Context, indexName, database string) error
 
 	// GetIndexByColumn and EstimatedRowCount are consumed by the vector-query
 	// rewriter (coordinator/vec_rewrite.go) via VectorIndexLookup.
@@ -1168,7 +1168,8 @@ func (h *CoordinatorHandler) handleCommit(session *protocol.ConnectionSession) (
 		hookTimeout = time.Duration(cfg.Config.Transaction.LockWaitTimeoutSeconds) * time.Second
 	}
 
-	for _, stmt := range txnState.Statements {
+	for i := 0; i < len(txnState.Statements); {
+		stmt := txnState.Statements[i]
 		if protocol.IsDML(stmt) && stmt.Database != "" {
 			replicatedDB, err := h.dbManager.GetReplicatedDatabase(stmt.Database)
 			if err != nil {
@@ -1177,11 +1178,24 @@ func (h *CoordinatorHandler) handleCommit(session *protocol.ConnectionSession) (
 				return nil, fmt.Errorf("failed to get database %s: %w", stmt.Database, err)
 			}
 
+			groupStart := i
+			requests := make([]ExecutionRequest, 0, 1)
+			group := make([]protocol.Statement, 0, 1)
+			for i < len(txnState.Statements) {
+				nextStmt := txnState.Statements[i]
+				if !protocol.IsDML(nextStmt) || nextStmt.Database != stmt.Database {
+					break
+				}
+				requests = append(requests, ExecutionRequest{
+					SQL:    nextStmt.SQL,
+					Params: nextStmt.ExtractedParams,
+				})
+				group = append(group, nextStmt)
+				i++
+			}
+
 			ctx, cancel := context.WithTimeout(context.Background(), hookTimeout)
-			// Use extracted params from literal extraction if available
-			execParams := stmt.ExtractedParams
-			req := ExecutionRequest{SQL: stmt.SQL, Params: execParams}
-			pendingExec, err := replicatedDB.ExecuteLocalWithHooks(ctx, txnState.TxnID, []ExecutionRequest{req})
+			pendingExec, err := replicatedDB.ExecuteLocalWithHooks(ctx, txnState.TxnID, requests)
 			if err != nil {
 				cancel()
 				session.EndTransaction()
@@ -1203,18 +1217,21 @@ func (h *CoordinatorHandler) handleCommit(session *protocol.ConnectionSession) (
 					enrichedStatements = append(enrichedStatements, cdcStmt)
 				}
 			} else {
-				materializedSQL, matErr := materializeSQLWithParams(stmt.SQL, execParams)
-				if matErr != nil {
-					session.EndTransaction()
-					h.recentTxnIDs.Delete(txnState.TxnID)
-					return nil, fmt.Errorf("failed to materialize DML statement for replication: %w", matErr)
+				for _, fallbackStmt := range group {
+					materializedSQL, matErr := materializeSQLWithParams(fallbackStmt.SQL, fallbackStmt.ExtractedParams)
+					if matErr != nil {
+						session.EndTransaction()
+						h.recentTxnIDs.Delete(txnState.TxnID)
+						return nil, fmt.Errorf("failed to materialize DML statement %d for replication: %w", groupStart, matErr)
+					}
+					fallbackStmt.SQL = materializedSQL
+					fallbackStmt.ExtractedParams = nil
+					enrichedStatements = append(enrichedStatements, fallbackStmt)
 				}
-				stmt.SQL = materializedSQL
-				stmt.ExtractedParams = nil
-				enrichedStatements = append(enrichedStatements, stmt)
 			}
 		} else {
 			enrichedStatements = append(enrichedStatements, stmt)
+			i++
 		}
 	}
 

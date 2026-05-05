@@ -2,7 +2,11 @@ package db
 
 import (
 	"context"
+	"database/sql"
+	"errors"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/maxpert/marmot/common"
 	"github.com/maxpert/marmot/hlc"
@@ -26,6 +30,80 @@ func (r *recordingVectorCDCNotifier) ApplyCommittedVectorCDC(_ context.Context, 
 	r.seqNum = seqNum
 	r.entries = append([]common.CDCEntry(nil), entries...)
 	return r.err
+}
+
+type recordingVectorChangeHook struct {
+	mu      sync.Mutex
+	err     error
+	creates []common.VectorIndexMeta
+	changes []recordedVectorChange
+}
+
+type recordedVectorChange struct {
+	meta    common.VectorIndexMeta
+	entries []common.CDCEntry
+}
+
+func (h *recordingVectorChangeHook) OnIndexCreated(_ context.Context, meta common.VectorIndexMeta) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.creates = append(h.creates, meta)
+	return nil
+}
+
+func (h *recordingVectorChangeHook) OnIndexLocalChanges(_ context.Context, meta common.VectorIndexMeta, entries []common.CDCEntry) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	cloned := make([]common.CDCEntry, len(entries))
+	copy(cloned, entries)
+	h.changes = append(h.changes, recordedVectorChange{meta: meta, entries: cloned})
+	return h.err
+}
+
+func (h *recordingVectorChangeHook) changeCount() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.changes)
+}
+
+func (h *recordingVectorChangeHook) lastChange() recordedVectorChange {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.changes[len(h.changes)-1]
+}
+
+func setupVectorCDCManager(t *testing.T, hook *recordingVectorChangeHook) (*VectorIndexManager, *DatabaseManager, *sql.DB) {
+	t.Helper()
+
+	tmpDir := t.TempDir()
+	clock := hlc.NewClock(1)
+	dbMgr, err := NewDatabaseManager(tmpDir, 1, clock)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, dbMgr.Close()) })
+
+	require.NoError(t, dbMgr.CreateDatabase("app"))
+	conn, err := dbMgr.GetDatabaseConnection("app")
+	require.NoError(t, err)
+	_, err = conn.Exec(`CREATE TABLE docs (id INTEGER PRIMARY KEY, embed BLOB, title TEXT)`)
+	require.NoError(t, err)
+
+	vecMgr := NewVectorIndexManager(dbMgr)
+	vecMgr.SetLifecycleHook(hook)
+	dbMgr.SetVectorIndexManager(vecMgr)
+	require.NoError(t, vecMgr.ApplyVectorControl(context.Background(), common.VectorIndexChange{
+		Action:              common.VectorIndexActionCreate,
+		Database:            "app",
+		IndexName:           "docs_embed_idx",
+		TableName:           "docs",
+		ColumnName:          "embed",
+		Metric:              "cosine",
+		Dim:                 4,
+		Nlist:               8,
+		Nprobe:              8,
+		TargetPartitionSize: defaultTargetPartitionSize,
+		CreatedAt:           time.Now().UnixNano(),
+	}))
+	return vecMgr, dbMgr, conn
 }
 
 func TestVectorIndexChangeSnapshotRoundTrip(t *testing.T) {
@@ -67,6 +145,79 @@ func TestVectorIndexChangeSnapshotRoundTrip(t *testing.T) {
 	require.NoError(t, DeserializeData(data, &decoded))
 	require.Equal(t, change, decoded)
 	require.Equal(t, stmt.VectorIndexName, vectorIndexStatementFromChange(decoded).VectorIndexName)
+}
+
+func TestApplyCommittedVectorCDCIsIdempotentPerIndex(t *testing.T) {
+	hook := &recordingVectorChangeHook{}
+	vecMgr, _, conn := setupVectorCDCManager(t, hook)
+
+	entry := common.CDCEntry{
+		Table:     "docs",
+		IntentKey: []byte("docs:1"),
+		NewValues: encodeTestValues(map[string]interface{}{
+			"id":    int64(1),
+			"embed": []byte{1, 2, 3, 4},
+			"title": "one",
+		}),
+	}
+	require.NoError(t, vecMgr.ApplyCommittedVectorCDC(context.Background(), "app", 44, 7, []common.CDCEntry{entry}))
+	require.Equal(t, 1, hook.changeCount())
+
+	change := hook.lastChange()
+	require.Equal(t, "docs_embed_idx", change.meta.IndexName)
+	require.Len(t, change.entries, 1)
+	require.Equal(t, uint64(44), change.entries[0].CommitTxnID)
+	require.Equal(t, uint64(7), change.entries[0].CommitSeqNum)
+
+	require.NoError(t, vecMgr.ApplyCommittedVectorCDC(context.Background(), "app", 44, 7, []common.CDCEntry{entry}))
+	require.Equal(t, 1, hook.changeCount(), "duplicate transaction/sequence must not reapply vector CDC")
+
+	var ledgerRows int
+	require.NoError(t, conn.QueryRow(`
+		SELECT COUNT(*)
+		  FROM __marmot_vector_cdc_applied
+		 WHERE database_name='app'
+		   AND index_name='docs_embed_idx'
+		   AND commit_txn_id=44
+		   AND commit_seq_num=7`).Scan(&ledgerRows))
+	require.Equal(t, 1, ledgerRows)
+}
+
+func TestApplyCommittedVectorCDCFailureMarksIndexDirty(t *testing.T) {
+	hook := &recordingVectorChangeHook{err: errors.New("overlay write failed")}
+	vecMgr, _, conn := setupVectorCDCManager(t, hook)
+
+	err := vecMgr.ApplyCommittedVectorCDC(context.Background(), "app", 55, 9, []common.CDCEntry{{
+		Table:     "docs",
+		IntentKey: []byte("docs:1"),
+		NewValues: encodeTestValues(map[string]interface{}{
+			"id":    int64(1),
+			"embed": []byte{1, 2, 3, 4},
+		}),
+	}})
+	require.Error(t, err)
+	require.Equal(t, 1, hook.changeCount())
+
+	var status string
+	require.NoError(t, conn.QueryRow(
+		`SELECT status FROM __marmot_vector_indexes WHERE index_name = ?`,
+		"docs_embed_idx",
+	).Scan(&status))
+	require.Equal(t, "dirty", status)
+
+	got, ok := vecMgr.GetIndexByColumn("app", "docs", "embed")
+	require.False(t, ok)
+	require.Nil(t, got)
+
+	var ledgerRows int
+	require.NoError(t, conn.QueryRow(`
+		SELECT COUNT(*)
+		  FROM __marmot_vector_cdc_applied
+		 WHERE database_name='app'
+		   AND index_name='docs_embed_idx'
+		   AND commit_txn_id=55
+		   AND commit_seq_num=9`).Scan(&ledgerRows))
+	require.Zero(t, ledgerRows, "failed vector CDC must not be recorded as applied")
 }
 
 func TestTransactionManagerVectorCDCNotifierAfterCommitOnce(t *testing.T) {

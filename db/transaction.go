@@ -496,18 +496,7 @@ func (tm *TransactionManager) applyCDCEntries(txnID uint64, entries []*IntentEnt
 	schemaAdapter := &schemaCacheAdapter{cache: tm.schemaCache}
 
 	for _, entry := range entries {
-		var err error
-		switch OpType(entry.Operation) {
-		case OpTypeInsert, OpTypeReplace:
-			err = ApplyCDCInsert(tx, entry.Table, entry.NewValues)
-		case OpTypeUpdate:
-			err = ApplyCDCUpdate(tx, schemaAdapter, entry.Table, entry.OldValues, entry.NewValues)
-		case OpTypeDelete:
-			err = ApplyCDCDelete(tx, schemaAdapter, entry.Table, entry.OldValues)
-		default:
-			err = fmt.Errorf("unsupported operation type: %v", entry.Operation)
-		}
-		if err != nil {
+		if err := ApplyCDCEntry(tx, schemaAdapter, entry); err != nil {
 			return fmt.Errorf("failed to write CDC data for %s: %w", entry.Table, err)
 		}
 	}

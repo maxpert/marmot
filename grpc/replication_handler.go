@@ -7,7 +7,6 @@ import (
 
 	"github.com/maxpert/marmot/common"
 	"github.com/maxpert/marmot/db"
-	pb "github.com/maxpert/marmot/grpc/common"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/protocol"
 	"github.com/maxpert/marmot/telemetry"
@@ -319,13 +318,20 @@ func (rh *ReplicationHandler) handleReplay(ctx context.Context, req *Transaction
 					ErrorMessage: fmt.Sprintf("failed to apply vector index control: %v", err),
 				}, nil
 			}
-			rh.storeReplayRecord(req, dbInstance, dbName)
+			if _, err := StoreAppliedChangeEvent(dbInstance.GetMetaStore(), req.TxnId, req.Timestamp, dbName, req.Statements); err != nil {
+				telemetry.ReplicationRequestsTotal.With("replay", "failed").Inc()
+				return &TransactionResponse{
+					Success:      false,
+					ErrorMessage: fmt.Sprintf("failed to store vector index control rows: %v", err),
+				}, nil
+			}
+			now := rh.clock.Now()
 			telemetry.ReplicationRequestsTotal.With("replay", "success").Inc()
 			return &TransactionResponse{
 				Success: true,
 				AppliedAt: &HLC{
-					WallTime: rh.clock.Now().WallTime,
-					Logical:  rh.clock.Now().Logical,
+					WallTime: now.WallTime,
+					Logical:  now.Logical,
 					NodeId:   rh.nodeID,
 				},
 			}, nil
@@ -353,18 +359,15 @@ func (rh *ReplicationHandler) handleReplay(ctx context.Context, req *Transaction
 		// Check for CDC data (RowChange payload)
 		if rowChange := stmt.GetRowChange(); rowChange != nil && (len(rowChange.NewValues) > 0 || len(rowChange.OldValues) > 0) {
 			// CDC path: apply row data directly using unified applier
-			var err error
-			switch stmt.Type {
-			case pb.StatementType_INSERT, pb.StatementType_REPLACE:
-				err = db.ApplyCDCInsert(tx, stmt.TableName, rowChange.NewValues)
-			case pb.StatementType_UPDATE:
-				err = db.ApplyCDCUpdate(tx, schemaAdapter, stmt.TableName, rowChange.OldValues, rowChange.NewValues)
-			case pb.StatementType_DELETE:
-				err = db.ApplyCDCDelete(tx, schemaAdapter, stmt.TableName, rowChange.OldValues)
-			default:
-				err = fmt.Errorf("unsupported statement type for CDC replay: %v", stmt.Type)
+			opType, opErr := wireDMLToOp(stmt.Type)
+			if opErr != nil {
+				telemetry.ReplicationRequestsTotal.With("replay", "failed").Inc()
+				return &TransactionResponse{
+					Success:      false,
+					ErrorMessage: opErr.Error(),
+				}, nil
 			}
-			if err != nil {
+			if err := db.ApplyCDCValues(tx, schemaAdapter, opType, stmt.TableName, rowChange.OldValues, rowChange.NewValues); err != nil {
 				telemetry.ReplicationRequestsTotal.With("replay", "failed").Inc()
 				return &TransactionResponse{
 					Success:      false,
@@ -422,28 +425,21 @@ func (rh *ReplicationHandler) handleReplay(ctx context.Context, req *Transaction
 
 	// Store TransactionRecord in MetaStore so GetCommittedTxnCount/GetMaxTxnID return correct values.
 	// Without this, anti-entropy keeps thinking we're behind because these metrics read from PebbleDB.
-	metaStore := dbInstance.GetMetaStore()
-	if metaStore != nil {
-		commitTS := hlc.Timestamp{
-			WallTime: req.Timestamp.WallTime,
-			Logical:  req.Timestamp.Logical,
-			NodeID:   req.Timestamp.NodeId,
-		}
-
-		rowCount := uint32(len(req.Statements))
-
-		if err := metaStore.StoreReplayedTransaction(req.TxnId, req.Timestamp.NodeId, commitTS, dbName, rowCount); err != nil {
-			// Log but don't fail - data is already in SQLite
-			log.Warn().
-				Err(err).
-				Uint64("txn_id", req.TxnId).
-				Msg("handleReplay: failed to store transaction record in MetaStore")
-		}
-		var seqNum uint64
-		if rec, recErr := metaStore.GetTransaction(req.TxnId); recErr == nil && rec != nil {
-			seqNum = rec.SeqNum
-		}
-		rh.applyVectorCDCFromStatements(ctx, dbName, req.TxnId, seqNum, req.Statements)
+	seqNum, err := StoreAppliedChangeEvent(dbInstance.GetMetaStore(), req.TxnId, req.Timestamp, dbName, req.Statements)
+	if err != nil {
+		telemetry.ReplicationRequestsTotal.With("replay", "failed").Inc()
+		return &TransactionResponse{
+			Success:      false,
+			ErrorMessage: fmt.Sprintf("failed to store replay captured rows: %v", err),
+		}, nil
+	}
+	if err := rh.applyVectorCDCFromStatements(ctx, dbName, req.TxnId, seqNum, req.Statements); err != nil {
+		log.Error().
+			Err(err).
+			Str("database", dbName).
+			Uint64("txn_id", req.TxnId).
+			Uint64("seq_num", seqNum).
+			Msg("handleReplay: vector CDC failed after row commit; local vector index is dirty")
 	}
 
 	log.Debug().
@@ -453,11 +449,12 @@ func (rh *ReplicationHandler) handleReplay(ctx context.Context, req *Transaction
 		Msg("handleReplay: transaction applied successfully")
 
 	telemetry.ReplicationRequestsTotal.With("replay", "success").Inc()
+	now := rh.clock.Now()
 	return &TransactionResponse{
 		Success: true,
 		AppliedAt: &HLC{
-			WallTime: rh.clock.Now().WallTime,
-			Logical:  rh.clock.Now().Logical,
+			WallTime: now.WallTime,
+			Logical:  now.Logical,
 			NodeId:   rh.nodeID,
 		},
 	}, nil
@@ -477,22 +474,7 @@ func (rh *ReplicationHandler) applyVectorIndexChange(ctx context.Context, change
 	return applier.ApplyVectorControl(ctx, change)
 }
 
-func (rh *ReplicationHandler) storeReplayRecord(req *TransactionRequest, dbInstance *db.ReplicatedDatabase, dbName string) {
-	metaStore := dbInstance.GetMetaStore()
-	if metaStore == nil {
-		return
-	}
-	commitTS := hlc.Timestamp{
-		WallTime: req.Timestamp.WallTime,
-		Logical:  req.Timestamp.Logical,
-		NodeID:   req.Timestamp.NodeId,
-	}
-	if err := metaStore.StoreReplayedTransaction(req.TxnId, req.Timestamp.NodeId, commitTS, dbName, uint32(len(req.Statements))); err != nil {
-		log.Warn().Err(err).Uint64("txn_id", req.TxnId).Msg("handleReplay: failed to store transaction record in MetaStore")
-	}
-}
-
-func (rh *ReplicationHandler) applyVectorCDCFromStatements(ctx context.Context, database string, txnID, seqNum uint64, statements []*Statement) {
+func (rh *ReplicationHandler) applyVectorCDCFromStatements(ctx context.Context, database string, txnID, seqNum uint64, statements []*Statement) error {
 	entries := make([]common.CDCEntry, 0, len(statements))
 	for _, stmt := range statements {
 		rowChange := stmt.GetRowChange()
@@ -509,21 +491,22 @@ func (rh *ReplicationHandler) applyVectorCDCFromStatements(ctx context.Context, 
 		})
 	}
 	if len(entries) == 0 {
-		return
+		return nil
 	}
 	vecMgr := rh.dbMgr.GetVectorIndexManager()
 	if vecMgr == nil {
-		return
+		return nil
 	}
 	applier, ok := vecMgr.(interface {
 		ApplyCommittedVectorCDC(context.Context, string, uint64, uint64, []common.CDCEntry) error
 	})
 	if !ok {
-		return
+		return nil
 	}
 	if err := applier.ApplyCommittedVectorCDC(ctx, database, txnID, seqNum, entries); err != nil {
-		log.Error().Err(err).Uint64("txn_id", txnID).Str("database", database).Msg("handleReplay: failed to apply vector CDC")
+		return fmt.Errorf("handleReplay: apply vector CDC: %w", err)
 	}
+	return nil
 }
 
 // replicationSchemaAdapter adapts DatabaseManager schema access to CDCSchemaProvider

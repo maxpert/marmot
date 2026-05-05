@@ -276,7 +276,7 @@ func TestReplicationHandler_ReplayReloadsSchemaAfterDDL(t *testing.T) {
 	}
 }
 
-func mustMarshalMsgpack(t *testing.T, v interface{}) []byte {
+func mustMarshalMsgpack(t testing.TB, v interface{}) []byte {
 	t.Helper()
 	b, err := encoding.Marshal(v)
 	if err != nil {

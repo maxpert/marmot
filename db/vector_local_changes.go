@@ -5,7 +5,6 @@ import (
 	"context"
 	stdbinary "encoding/binary"
 	"fmt"
-	"sort"
 	"time"
 
 	"github.com/maxpert/marmot/common"
@@ -142,7 +141,6 @@ func (h *EngineHook) buildOverlayMutations(
 		return nil, err
 	}
 
-	merged := mergeLocalCDCEntries(meta.TableName, entries)
 	snapshot := (*vecindex.OverlaySnapshot)(nil)
 	if overlay := state.LoadOverlay(); overlay != nil {
 		snapshot = overlay.Snapshot()
@@ -153,9 +151,13 @@ func (h *EngineHook) buildOverlayMutations(
 	}
 	epoch := state.ProbeVersion()
 
-	mutations := make([]vecindex.OverlayMutation, 0, len(merged))
+	mutations := make([]vecindex.OverlayMutation, 0, len(entries))
+	batchLiveRows := make(map[int64]struct{}, len(entries))
 	appliedAtUnixNano := time.Now().UnixNano()
-	for _, entry := range merged {
+	for _, entry := range entries {
+		if entry.Table != meta.TableName {
+			continue
+		}
 		oldRowID, oldRowOK, err := decodeCDCInt64(entry.OldValues, pkColumn)
 		if err != nil {
 			return nil, fmt.Errorf("vector local changes: decode old rowid: %w", err)
@@ -165,7 +167,8 @@ func (h *EngineHook) buildOverlayMutations(
 			return nil, fmt.Errorf("vector local changes: decode new rowid: %w", err)
 		}
 		if oldRowOK && newRowOK && oldRowID != newRowID {
-			deleteMutation, used, err := buildDeleteMutation(state, epoch, oldRowID, nextSequence)
+			_, batchHadOldRow := batchLiveRows[oldRowID]
+			deleteMutation, used, err := buildDeleteMutation(state, epoch, oldRowID, nextSequence, batchHadOldRow)
 			if err != nil {
 				return nil, err
 			}
@@ -176,6 +179,7 @@ func (h *EngineHook) buildOverlayMutations(
 				mutations = append(mutations, deleteMutation)
 				nextSequence++
 			}
+			delete(batchLiveRows, oldRowID)
 			entry.OldValues = nil
 			oldRowOK = false
 		}
@@ -206,9 +210,11 @@ func (h *EngineHook) buildOverlayMutations(
 			mutation.CommitTxnID = entry.CommitTxnID
 			mutation.CommitSeqNum = entry.CommitSeqNum
 			mutations = append(mutations, mutation)
+			batchLiveRows[rowID] = struct{}{}
 			nextSequence++
 		case oldRowOK:
-			mutation, used, err := buildDeleteMutation(state, epoch, oldRowID, nextSequence)
+			_, batchHadOldRow := batchLiveRows[oldRowID]
+			mutation, used, err := buildDeleteMutation(state, epoch, oldRowID, nextSequence, batchHadOldRow)
 			if err != nil {
 				return nil, err
 			}
@@ -217,6 +223,7 @@ func (h *EngineHook) buildOverlayMutations(
 				mutation.CommitTxnID = entry.CommitTxnID
 				mutation.CommitSeqNum = entry.CommitSeqNum
 				mutations = append(mutations, mutation)
+				delete(batchLiveRows, oldRowID)
 				nextSequence++
 			}
 		}
@@ -246,8 +253,10 @@ func recordMaintenanceDeltas(
 	if state == nil || state.ProbeState() == nil {
 		return nil
 	}
-	merged := mergeLocalCDCEntries(meta.TableName, entries)
-	for _, entry := range merged {
+	for _, entry := range entries {
+		if entry.Table != meta.TableName {
+			continue
+		}
 		oldRowID, oldRowOK, err := decodeCDCInt64(entry.OldValues, pkColumn)
 		if err != nil {
 			return fmt.Errorf("vector local changes: decode old rowid for maintenance: %w", err)
@@ -390,11 +399,12 @@ func buildDeleteMutation(
 	epoch uint64,
 	rowID int64,
 	sequence uint64,
+	force bool,
 ) (vecindex.OverlayMutation, bool, error) {
 	if rowID == 0 {
 		return vecindex.OverlayMutation{}, false, nil
 	}
-	if !stableRowExists(state, rowID) {
+	if !force && !stableRowExists(state, rowID) {
 		if overlay := state.LoadOverlay(); overlay != nil {
 			snapshot := overlay.Snapshot()
 			if snapshot != nil {
@@ -423,94 +433,6 @@ func stableRowExists(state *vecindex.IndexState, rowID int64) bool {
 	}
 	_, ok, err := segment.RowMap.Lookup(rowID)
 	return err == nil && ok
-}
-
-type mergedLocalCDCEntry struct {
-	OldValues    map[string][]byte
-	NewValues    map[string][]byte
-	CommitTxnID  uint64
-	CommitSeqNum uint64
-	oldOwned     bool
-	newOwned     bool
-}
-
-func mergeLocalCDCEntries(tableName string, entries []common.CDCEntry) []mergedLocalCDCEntry {
-	ordered := make([]string, 0, len(entries))
-	merged := make(map[string]*mergedLocalCDCEntry, len(entries))
-	for _, entry := range entries {
-		if entry.Table != tableName {
-			continue
-		}
-		key := string(entry.IntentKey)
-		current, ok := merged[key]
-		if !ok {
-			current = &mergedLocalCDCEntry{
-				OldValues:    entry.OldValues,
-				NewValues:    entry.NewValues,
-				CommitTxnID:  entry.CommitTxnID,
-				CommitSeqNum: entry.CommitSeqNum,
-			}
-			merged[key] = current
-			ordered = append(ordered, key)
-			continue
-		}
-		if current.OldValues == nil && len(entry.OldValues) > 0 {
-			current.OldValues = make(map[string][]byte, len(entry.OldValues))
-			current.oldOwned = true
-		} else if len(entry.OldValues) > 0 && !current.oldOwned {
-			current.OldValues = copyCDCValues(current.OldValues)
-			current.oldOwned = true
-		}
-		if current.NewValues == nil && len(entry.NewValues) > 0 {
-			current.NewValues = make(map[string][]byte, len(entry.NewValues))
-			current.newOwned = true
-		} else if len(entry.NewValues) > 0 && !current.newOwned {
-			current.NewValues = copyCDCValues(current.NewValues)
-			current.newOwned = true
-		}
-		mergeCDCValueMap(current.OldValues, entry.OldValues)
-		mergeCDCValueMap(current.NewValues, entry.NewValues)
-		if entry.CommitTxnID > current.CommitTxnID {
-			current.CommitTxnID = entry.CommitTxnID
-		}
-		if entry.CommitSeqNum > current.CommitSeqNum {
-			current.CommitSeqNum = entry.CommitSeqNum
-		}
-	}
-
-	result := make([]mergedLocalCDCEntry, 0, len(ordered))
-	for _, key := range ordered {
-		result = append(result, *merged[key])
-	}
-	return result
-}
-
-func copyCDCValues(src map[string][]byte) map[string][]byte {
-	if len(src) == 0 {
-		return nil
-	}
-	out := make(map[string][]byte, len(src))
-	for key, value := range src {
-		out[key] = append([]byte(nil), value...)
-	}
-	return out
-}
-
-func mergeCDCValueMap(dst map[string][]byte, src map[string][]byte) {
-	if len(src) == 0 {
-		return
-	}
-	if dst == nil {
-		return
-	}
-	keys := make([]string, 0, len(src))
-	for key := range src {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	for _, key := range keys {
-		dst[key] = append([]byte(nil), src[key]...)
-	}
 }
 
 func (h *EngineHook) primaryKeyColumn(database, table string) (string, error) {

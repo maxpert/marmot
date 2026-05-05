@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"sort"
 	"sync"
 	"time"
 
@@ -340,12 +341,20 @@ func (m *VectorIndexManager) DropIndex(ctx context.Context, indexName, database 
 // ReindexIndex executes REINDEX VECTOR <name> by flipping metadata status to
 // 'reindexing', delegating the rebuild to the engine hook, then restoring the
 // cached metadata.
-func (m *VectorIndexManager) ReindexIndex(ctx context.Context, indexName string) error {
+func (m *VectorIndexManager) ReindexIndex(ctx context.Context, indexName, database string) error {
 	if err := vecindex.ValidateIndexName(indexName); err != nil {
 		return fmt.Errorf("vector reindex: %w", err)
 	}
 
-	meta, ok := m.getIndexByNameAny(indexName)
+	var (
+		meta *VectorIndexMeta
+		ok   bool
+	)
+	if database != "" {
+		meta, ok = m.getIndexByName(database, indexName)
+	} else {
+		meta, ok = m.getIndexByNameAny(indexName)
+	}
 	if !ok {
 		return fmt.Errorf("MARMOT-VEC-013: vector index %q not found", indexName)
 	}
@@ -484,15 +493,31 @@ func (m *VectorIndexManager) ApplyCommittedVectorCDC(ctx context.Context, databa
 		byTable[entry.Table] = append(byTable[entry.Table], entry)
 	}
 
-	for tableName, tableEntries := range byTable {
+	tableNames := make([]string, 0, len(byTable))
+	for tableName := range byTable {
+		tableNames = append(tableNames, tableName)
+	}
+	sort.Strings(tableNames)
+
+	var applyErr error
+	for _, tableName := range tableNames {
+		tableEntries := byTable[tableName]
 		for _, meta := range m.indexesForTable(database, tableName) {
+			if m.vectorCDCAlreadyApplied(ctx, meta, txnID, seqNum) {
+				continue
+			}
 			if err := hook.OnIndexLocalChanges(ctx, meta, tableEntries); err != nil {
 				m.markIndexDirty(ctx, meta, err)
-				return err
+				applyErr = errors.Join(applyErr, fmt.Errorf("%s: %w", meta.IndexName, err))
+				continue
+			}
+			if err := m.recordVectorCDCApplied(ctx, meta, txnID, seqNum); err != nil {
+				m.markIndexDirty(ctx, meta, err)
+				applyErr = errors.Join(applyErr, fmt.Errorf("%s: %w", meta.IndexName, err))
 			}
 		}
 	}
-	return nil
+	return applyErr
 }
 
 func (m *VectorIndexManager) ApplyVectorControl(ctx context.Context, change common.VectorIndexChange) error {
@@ -512,7 +537,7 @@ func (m *VectorIndexManager) ApplyVectorControl(ctx context.Context, change comm
 	case common.VectorIndexActionDrop:
 		return m.DropIndex(ctx, change.IndexName, change.Database)
 	case common.VectorIndexActionReindex:
-		return m.ReindexIndex(ctx, change.IndexName)
+		return m.ReindexIndex(ctx, change.IndexName, change.Database)
 	case common.VectorIndexActionCheckpoint:
 		if existing, ok := m.getIndexByName(change.Database, change.IndexName); ok {
 			m.mu.Lock()
@@ -556,7 +581,61 @@ func (m *VectorIndexManager) indexesForTable(database, table string) []common.Ve
 		}
 		metas = append(metas, *meta)
 	}
+	sort.Slice(metas, func(i, j int) bool {
+		if metas[i].Database != metas[j].Database {
+			return metas[i].Database < metas[j].Database
+		}
+		if metas[i].IndexName != metas[j].IndexName {
+			return metas[i].IndexName < metas[j].IndexName
+		}
+		if metas[i].TableName != metas[j].TableName {
+			return metas[i].TableName < metas[j].TableName
+		}
+		return metas[i].ColumnName < metas[j].ColumnName
+	})
 	return metas
+}
+
+func (m *VectorIndexManager) vectorCDCAlreadyApplied(ctx context.Context, meta common.VectorIndexMeta, txnID, seqNum uint64) bool {
+	if txnID == 0 || m == nil || m.dbMgr == nil {
+		return false
+	}
+	conn, err := m.dbMgr.GetDatabaseConnection(meta.Database)
+	if err != nil {
+		return false
+	}
+	if err := MigrateVectorIndexesSchema(conn); err != nil {
+		return false
+	}
+	var one int
+	err = conn.QueryRowContext(ctx, `
+		SELECT 1
+		  FROM __marmot_vector_cdc_applied
+		 WHERE database_name=? AND index_name=? AND commit_txn_id=? AND commit_seq_num=?
+		 LIMIT 1`,
+		meta.Database, meta.IndexName, txnID, seqNum,
+	).Scan(&one)
+	return err == nil
+}
+
+func (m *VectorIndexManager) recordVectorCDCApplied(ctx context.Context, meta common.VectorIndexMeta, txnID, seqNum uint64) error {
+	if txnID == 0 || m == nil || m.dbMgr == nil {
+		return nil
+	}
+	conn, err := m.dbMgr.GetDatabaseConnection(meta.Database)
+	if err != nil {
+		return err
+	}
+	if err := MigrateVectorIndexesSchema(conn); err != nil {
+		return err
+	}
+	_, err = conn.ExecContext(ctx, `
+		INSERT OR IGNORE INTO __marmot_vector_cdc_applied
+			(database_name, index_name, commit_txn_id, commit_seq_num, applied_at)
+		VALUES (?, ?, ?, ?, ?)`,
+		meta.Database, meta.IndexName, txnID, seqNum, time.Now().UnixNano(),
+	)
+	return err
 }
 
 func (m *VectorIndexManager) openExistingIndexes(ctx context.Context) error {
