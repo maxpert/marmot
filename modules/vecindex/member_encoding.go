@@ -79,11 +79,10 @@ func BuildStableMemberCodec(spec IVFSpec, cs *kmeans.CentroidSet, training []Sta
 			if err != nil {
 				return nil, err
 			}
-			residual := make([]float32, len(sample.Vec))
-			for d, value := range sample.Vec {
-				residual[d] = value - centroid[d]
+			for d := range sample.Vec {
+				sample.Vec[d] -= centroid[d]
 			}
-			residuals = append(residuals, residual)
+			residuals = append(residuals, sample.Vec)
 		}
 		pq, err := quantize.TrainPQ8(residuals, spec.InternalDim(), quantize.PQ8Options{
 			M:         quantize.DefaultPQ8Subquantizers,

@@ -813,11 +813,14 @@ SELECT rowid, %s
 	rowLocs := make([]rowLoc, 0, 1024)
 	clusterRowCounts := make([]uint64, maxCluster+1)
 	clusterVectorSums := make([][]float32, maxCluster+1)
-	codecReservoir, err := newStableCodecReservoir(spec.Seed^expectedEpoch, spec.InternalDim())
-	if err != nil {
-		return nil, fmt.Errorf("segment generation rebuild: stable codec reservoir: %w", err)
+	var codecReservoir *stableCodecReservoir
+	if spec.InternalDim() >= vecindex.StablePQMinInternalDim {
+		codecReservoir, err = newStableCodecReservoir(spec.Seed^expectedEpoch, spec.InternalDim())
+		if err != nil {
+			return nil, fmt.Errorf("segment generation rebuild: stable codec reservoir: %w", err)
+		}
+		defer codecReservoir.Close()
 	}
-	defer codecReservoir.Close()
 	preparedEntrySize := 8 + spec.InternalDim()*4
 	type clusterSpool struct {
 		path string
@@ -862,7 +865,9 @@ SELECT rowid, %s
 		for i, value := range preparedVec {
 			clusterVectorSums[clusterID][i] += value
 		}
-		codecReservoir.Add(clusterID, prepared)
+		if codecReservoir != nil {
+			codecReservoir.Add(clusterID, prepared)
+		}
 		spool := clusterSpools[clusterID]
 		if spool == nil {
 			tmp, err := os.CreateTemp(dir, fmt.Sprintf("cluster-%06d-*.segrows", clusterID))
@@ -1328,7 +1333,7 @@ func syncMaintenanceStateFromOverlay(state *vecindex.IndexState) error {
 		return nil
 	}
 	var syncErr error
-	snapshot.VisitMutationsAfter(segments.AppliedOverlaySeq, func(mutation vecindex.OverlayMutation) bool {
+	snapshot.VisitMutationHeadersAfter(segments.AppliedOverlaySeq, func(mutation vecindex.OverlayMutation) bool {
 		oldCluster := int64(0)
 		if loc, ok, err := segments.RowMap.Lookup(mutation.RowID); err != nil {
 			syncErr = err

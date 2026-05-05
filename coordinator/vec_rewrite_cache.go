@@ -16,6 +16,8 @@ type goRankTemplateKey struct {
 	SessionNprobe int
 	ForcePlan     string
 	PrefilterCap  int64
+	Fallback      string
+	UseGoRank     bool
 }
 
 type goRankRewriteTemplate struct {
@@ -28,7 +30,9 @@ type goRankRewriteTemplate struct {
 	queryLiteral  []byte
 	vecDistArgIdx int
 	origArgCount  int
-	k             int
+	limitK        int
+	candidateK    int
+	fallbackOn    bool
 }
 
 func makeGoRankTemplateKey(sql, database string, session *connQuerySession) goRankTemplateKey {
@@ -38,6 +42,8 @@ func makeGoRankTemplateKey(sql, database string, session *connQuerySession) goRa
 		SessionNprobe: session.vars.Nprobe,
 		ForcePlan:     session.ForcePlan(),
 		PrefilterCap:  session.PrefilterCap(),
+		Fallback:      session.Fallback(),
+		UseGoRank:     session.UseGoRank(),
 	}
 }
 
@@ -82,13 +88,17 @@ func buildGoRankRewriteTemplate(
 	if queryArgIdx >= 0 {
 		vmIdx = queryArgIdx
 	}
+	userPred, ok := stripVecMatchStrict(sel.Where)
+	if !ok {
+		return nil, fmt.Errorf("MARMOT-VEC-024: vec_match must be a top-level AND predicate")
+	}
 	literal := []byte(nil)
 	if vmIdx < 0 && len(queryVec) > 0 {
 		literal = append(literal, queryVec...)
 	}
 	return &goRankRewriteTemplate{
 		selectStmt:    sel,
-		userPred:      stripVecMatch(sel.Where),
+		userPred:      userPred,
 		tableName:     info.TableName,
 		tableAlias:    info.GoRank.BaseAlias,
 		columnName:    info.ColumnName,
@@ -96,7 +106,9 @@ func buildGoRankRewriteTemplate(
 		queryLiteral:  literal,
 		vecDistArgIdx: vdIdx,
 		origArgCount:  totalArgs,
-		k:             info.K,
+		limitK:        info.LimitK,
+		candidateK:    info.CandidateK,
+		fallbackOn:    info.FallbackOn,
 	}, nil
 }
 
@@ -144,24 +156,37 @@ func (tpl *goRankRewriteTemplate) buildInfo(
 		nprobe,
 		useBudgetProbe,
 		tpl.tableAlias,
-		tpl.k,
+		tpl.limitK,
+		tpl.candidateK,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("build go-rank plan from cache: %w", err)
 	}
 	goRank.Database = meta.Database
 	goRank.ProbeEpoch = probeEpoch
-	return &RewriteInfo{
+	info := &RewriteInfo{
 		Plan:       PlanPostFilter,
 		IndexName:  meta.IndexName,
 		Database:   meta.Database,
 		TableName:  meta.TableName,
 		ColumnName: meta.ColumnName,
 		Metric:     meta.Metric,
-		K:          tpl.k,
+		K:          tpl.limitK,
+		LimitK:     tpl.limitK,
+		CandidateK: tpl.candidateK,
 		ClusterIDs: append([]int64(nil), clusterIDs...),
 		GoRank:     goRank,
-	}, nil
+	}
+	if tpl.fallbackOn {
+		fallback, err := buildPreFilter(tpl.selectStmt, tpl.userPred)
+		if err != nil {
+			return nil, err
+		}
+		info.FallbackStmt = fallback
+		info.FallbackSQL = sqlparser.String(fallback)
+		info.FallbackOn = true
+	}
+	return info, nil
 }
 
 func (tpl *goRankRewriteTemplate) resolveQueryVec(params []interface{}) ([]byte, error) {

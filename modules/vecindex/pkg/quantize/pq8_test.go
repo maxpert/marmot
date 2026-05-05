@@ -94,6 +94,46 @@ func TestPQ8ValidationRejectsMalformedCodec(t *testing.T) {
 	}
 }
 
+func TestPQ8SubspaceMultiStartDoesNotIncreaseInertia(t *testing.T) {
+	t.Parallel()
+
+	residuals := pq8TestResiduals(600, 8)
+	single := make([]float32, PQ8CodebookSize*4)
+	multi := make([]float32, PQ8CodebookSize*4)
+	if err := trainPQ8Subspace(residuals, 0, 4, 4, 1, 99, single); err != nil {
+		t.Fatalf("single trainPQ8Subspace: %v", err)
+	}
+	if err := trainPQ8Subspace(residuals, 0, 4, 4, 3, 99, multi); err != nil {
+		t.Fatalf("multi trainPQ8Subspace: %v", err)
+	}
+	singleInertia := pq8SubspaceInertia(residuals, 0, 4, single)
+	multiInertia := pq8SubspaceInertia(residuals, 0, 4, multi)
+	if multiInertia > singleInertia+1e-4 {
+		t.Fatalf("multi-start inertia %.6f > single-start %.6f", multiInertia, singleInertia)
+	}
+}
+
+func pq8SubspaceInertia(vectors [][]float32, start, end int, codebook []float32) float64 {
+	width := end - start
+	var total float64
+	for _, vec := range vectors {
+		best := math.Inf(1)
+		for code := 0; code < PQ8CodebookSize; code++ {
+			cb := codebook[code*width : (code+1)*width]
+			var dist float64
+			for d := 0; d < width; d++ {
+				diff := float64(vec[start+d] - cb[d])
+				dist += diff * diff
+			}
+			if dist < best {
+				best = dist
+			}
+		}
+		total += best
+	}
+	return total
+}
+
 func pq8TestResiduals(n, dim int) [][]float32 {
 	out := make([][]float32, n)
 	for i := 0; i < n; i++ {

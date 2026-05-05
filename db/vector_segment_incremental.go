@@ -105,13 +105,21 @@ func BuildIncrementalSegmentGeneration(
 		return nil, nil
 	}
 	mutations := make([]vecindex.OverlayMutation, 0)
-	overlaySnapshot.VisitMutationsAfter(base.AppliedOverlaySeq, func(mutation vecindex.OverlayMutation) bool {
+	var scratch []byte
+	scratch, err := overlaySnapshot.VisitMutationsAfterBuffered(base.AppliedOverlaySeq, scratch, func(mutation vecindex.OverlayMutation) bool {
 		if cutoffSequence > 0 && mutation.Sequence > cutoffSequence {
 			return false
+		}
+		if len(mutation.Vec) > 0 {
+			mutation.Vec = append([]byte(nil), mutation.Vec...)
 		}
 		mutations = append(mutations, mutation)
 		return true
 	})
+	_ = scratch
+	if err != nil {
+		return nil, err
+	}
 	return buildIncrementalSegmentGenerationFromMutations(
 		ctx,
 		db,

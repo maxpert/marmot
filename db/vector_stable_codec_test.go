@@ -1,30 +1,40 @@
 package db
 
 import (
+	"encoding/binary"
+	"math"
 	"testing"
-
-	"github.com/stretchr/testify/require"
 )
 
-func TestStableCodecReservoirSamplesAreClusterCapped(t *testing.T) {
-	reservoir, err := newStableCodecReservoir(1, 2)
-	require.NoError(t, err)
+func testPreparedVec(values ...float32) []byte {
+	out := make([]byte, len(values)*4)
+	for i, value := range values {
+		binary.LittleEndian.PutUint32(out[i*4:], math.Float32bits(value))
+	}
+	return out
+}
+
+func TestStableCodecReservoirSamplesDoNotDiscardUnusedQuota(t *testing.T) {
+	t.Parallel()
+
+	reservoir, err := newStableCodecReservoir(17, 2)
+	if err != nil {
+		t.Fatalf("newStableCodecReservoir: %v", err)
+	}
 	defer reservoir.Close()
 
 	for i := 0; i < stableCodecTrainingSampleLimit; i++ {
-		clusterID := int64(1)
-		if i >= stableCodecTrainingSampleLimit-10 {
-			clusterID = 2
-		}
-		reservoir.Add(clusterID, encodeVec(t, []float32{float32(i), float32(clusterID)}))
+		reservoir.Add(1, testPreparedVec(float32(i), 1))
 	}
-	samples, err := reservoir.Samples()
-	require.NoError(t, err)
+	for i := 0; i < 10; i++ {
+		reservoir.Add(2, testPreparedVec(float32(i), 2))
+	}
 
-	counts := map[int64]int{}
-	for _, sample := range samples {
-		counts[sample.ClusterID]++
+	samples, err := reservoir.Samples()
+	if err != nil {
+		t.Fatalf("Samples: %v", err)
 	}
-	require.Equal(t, stableCodecTrainingSampleLimit/2, counts[1])
-	require.Equal(t, 10, counts[2])
+	if len(samples) != reservoir.Count() {
+		t.Fatalf("Samples() returned %d vectors, want all reservoir slots %d", len(samples), reservoir.Count())
+	}
 }

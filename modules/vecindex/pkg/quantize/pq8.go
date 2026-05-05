@@ -16,6 +16,8 @@ const (
 	DefaultPQ8Subquantizers = 128
 	PQ8CodebookSize         = 256
 	defaultPQ8MaxIter       = 8
+	defaultPQ8Restarts      = 2
+	pq8ConvergenceEpsilon   = 1e-5
 )
 
 type PQ8Options struct {
@@ -23,6 +25,7 @@ type PQ8Options struct {
 	MaxIter   int
 	Seed      uint64
 	StoreNorm bool
+	Restarts  int
 }
 
 type PQ8Codec struct {
@@ -76,6 +79,9 @@ func TrainPQ8(residuals [][]float32, dim int, opts PQ8Options) (*PQ8Codec, error
 	if opts.MaxIter <= 0 {
 		opts.MaxIter = defaultPQ8MaxIter
 	}
+	if opts.Restarts <= 0 {
+		opts.Restarts = defaultPQ8Restarts
+	}
 	offsets := pqOffsets(dim, opts.M)
 	codebookOffsets := pqCodebookOffsets(offsets)
 	codebookLen := codebookOffsets[len(codebookOffsets)-1]
@@ -99,7 +105,7 @@ func TrainPQ8(residuals [][]float32, dim int, opts PQ8Options) (*PQ8Codec, error
 			for sub := range jobs {
 				start, end := offsets[sub], offsets[sub+1]
 				dst := codebooks[codebookOffsets[sub]:codebookOffsets[sub+1]]
-				if err := trainPQ8Subspace(residuals, start, end, opts.MaxIter, opts.Seed^uint64(sub+1)*0x9e3779b97f4a7c15, dst); err != nil {
+				if err := trainPQ8Subspace(residuals, start, end, opts.MaxIter, opts.Restarts, opts.Seed^uint64(sub+1)*0x9e3779b97f4a7c15, dst); err != nil {
 					errCh <- err
 					return
 				}
@@ -466,7 +472,7 @@ func (c *PQ8Codec) nearestCodeForResidual(sub int, vec, centroid []float32) int 
 	return best
 }
 
-func trainPQ8Subspace(vectors [][]float32, start, end, maxIter int, seed uint64, dst []float32) error {
+func trainPQ8Subspace(vectors [][]float32, start, end, maxIter, restarts int, seed uint64, dst []float32) error {
 	width := end - start
 	if width <= 0 {
 		return fmt.Errorf("quantize: invalid PQ subspace")
@@ -474,30 +480,74 @@ func trainPQ8Subspace(vectors [][]float32, start, end, maxIter int, seed uint64,
 	if len(dst) != PQ8CodebookSize*width {
 		return fmt.Errorf("quantize: PQ subspace dst length mismatch")
 	}
+	if restarts <= 0 {
+		restarts = defaultPQ8Restarts
+	}
+	best := make([]float32, len(dst))
+	scratch := make([]float32, len(dst))
+	bestInertia := math.Inf(1)
+	active := PQ8CodebookSize
+	if len(vectors) < active {
+		active = len(vectors)
+	}
+	workspace := pq8SubspaceWorkspace{
+		sums:    make([]float64, active*width),
+		counts:  make([]int, active),
+		errors:  make([]float32, len(vectors)),
+		closest: make([]float32, len(vectors)),
+	}
+	for restart := 0; restart < restarts; restart++ {
+		seed := seed ^ uint64(restart+1)*0xbf58476d1ce4e5b9
+		inertia, err := trainPQ8SubspaceOnce(vectors, start, end, maxIter, seed, scratch, &workspace)
+		if err != nil {
+			return err
+		}
+		if inertia < bestInertia {
+			bestInertia = inertia
+			copy(best, scratch)
+		}
+	}
+	copy(dst, best)
+	return nil
+}
+
+type pq8SubspaceWorkspace struct {
+	sums    []float64
+	counts  []int
+	errors  []float32
+	closest []float32
+}
+
+func trainPQ8SubspaceOnce(vectors [][]float32, start, end, maxIter int, seed uint64, dst []float32, ws *pq8SubspaceWorkspace) (float64, error) {
+	width := end - start
 	n := len(vectors)
+	if n == 0 {
+		return 0, fmt.Errorf("quantize: PQ training requires vectors")
+	}
 	rng := rand.New(rand.NewSource(int64(seed)))
-	perm := rng.Perm(n)
 	active := PQ8CodebookSize
 	if n < active {
 		active = n
 	}
-	for code := 0; code < active; code++ {
-		copy(dst[code*width:(code+1)*width], vectors[perm[code]][start:end])
-	}
+	initPQ8KMeansPP(vectors, start, end, active, rng, dst, ws.closest)
 	for code := active; code < PQ8CodebookSize; code++ {
 		copy(dst[code*width:(code+1)*width], dst[(code%active)*width:((code%active)+1)*width])
 	}
 	if maxIter <= 0 {
 		maxIter = defaultPQ8MaxIter
 	}
-	sums := make([]float64, active*width)
-	counts := make([]int, active)
+	sums := ws.sums[:active*width]
+	counts := ws.counts[:active]
+	errors := ws.errors[:n]
+	prevInertia := math.Inf(1)
+	inertia := math.Inf(1)
 	for iter := 0; iter < maxIter; iter++ {
 		for i := range sums {
 			sums[i] = 0
 		}
 		clear(counts)
-		for _, vec := range vectors {
+		inertia = 0
+		for vecIdx, vec := range vectors {
 			best := 0
 			bestDist := float32(math.MaxFloat32)
 			for code := 0; code < active; code++ {
@@ -513,6 +563,8 @@ func trainPQ8Subspace(vectors [][]float32, start, end, maxIter int, seed uint64,
 				}
 			}
 			counts[best]++
+			errors[vecIdx] = bestDist
+			inertia += float64(bestDist)
 			sum := sums[best*width : (best+1)*width]
 			for d := 0; d < width; d++ {
 				sum[d] += float64(vec[start+d])
@@ -521,7 +573,7 @@ func trainPQ8Subspace(vectors [][]float32, start, end, maxIter int, seed uint64,
 		for code := 0; code < active; code++ {
 			cb := dst[code*width : (code+1)*width]
 			if counts[code] == 0 {
-				copy(cb, vectors[perm[(code+iter)%n]][start:end])
+				copy(cb, vectors[farthestPQ8TrainingVector(errors, code+iter)][start:end])
 				continue
 			}
 			inv := 1 / float64(counts[code])
@@ -530,9 +582,75 @@ func trainPQ8Subspace(vectors [][]float32, start, end, maxIter int, seed uint64,
 				cb[d] = float32(sum[d] * inv)
 			}
 		}
+		if prevInertia < math.Inf(1) {
+			improvement := (prevInertia - inertia) / math.Max(prevInertia, 1)
+			if improvement >= 0 && improvement < pq8ConvergenceEpsilon {
+				break
+			}
+		}
+		prevInertia = inertia
 	}
 	for code := active; code < PQ8CodebookSize; code++ {
 		copy(dst[code*width:(code+1)*width], dst[(code%active)*width:((code%active)+1)*width])
 	}
-	return nil
+	return inertia, nil
+}
+
+func initPQ8KMeansPP(vectors [][]float32, start, end, active int, rng *rand.Rand, dst []float32, closest []float32) {
+	width := end - start
+	n := len(vectors)
+	first := rng.Intn(n)
+	copy(dst[:width], vectors[first][start:end])
+	closest = closest[:n]
+	for i := range closest {
+		closest[i] = float32(math.MaxFloat32)
+	}
+	for code := 1; code < active; code++ {
+		last := dst[(code-1)*width : code*width]
+		var total float64
+		for i, vec := range vectors {
+			var dist float32
+			for d := 0; d < width; d++ {
+				diff := vec[start+d] - last[d]
+				dist += diff * diff
+			}
+			if dist < closest[i] {
+				closest[i] = dist
+			}
+			total += float64(closest[i])
+		}
+		next := 0
+		if total > 0 {
+			target := rng.Float64() * total
+			var cumulative float64
+			for i, dist := range closest {
+				cumulative += float64(dist)
+				if cumulative >= target {
+					next = i
+					break
+				}
+			}
+		} else {
+			next = code % n
+		}
+		copy(dst[code*width:(code+1)*width], vectors[next][start:end])
+	}
+	if active == 1 {
+		return
+	}
+}
+
+func farthestPQ8TrainingVector(errors []float32, offset int) int {
+	best := 0
+	bestErr := -float32(math.MaxFloat32)
+	for i, err := range errors {
+		if err > bestErr {
+			best = i
+			bestErr = err
+		}
+	}
+	if offset <= 0 || len(errors) == 0 {
+		return best
+	}
+	return (best + offset) % len(errors)
 }

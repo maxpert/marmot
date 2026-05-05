@@ -292,7 +292,8 @@ func visitCatchUpPreparedVectors(
 		return nil
 	}
 	var visitErr error
-	snapshot.VisitMutationsAfter(minSequence, func(mutation vecindex.OverlayMutation) bool {
+	var scratch []byte
+	scratch, err = snapshot.VisitMutationsAfterBuffered(minSequence, scratch, func(mutation vecindex.OverlayMutation) bool {
 		if cutoff > 0 && mutation.Sequence > cutoff {
 			return false
 		}
@@ -313,6 +314,10 @@ func visitCatchUpPreparedVectors(
 		}
 		return true
 	})
+	_ = scratch
+	if err != nil {
+		return err
+	}
 	return visitErr
 }
 
@@ -414,14 +419,18 @@ func BuildHierarchicalCatchUpSegmentGeneration(
 
 	clusterRowCounts := make([]uint64, desiredK+1)
 	clusterVectorSums := make([][]float32, desiredK+1)
-	codecReservoir, err := newStableCodecReservoir(spec.Seed^epoch, spec.InternalDim())
-	if err != nil {
-		return nil, nil, fmt.Errorf("hierarchical catch-up: stable codec reservoir: %w", err)
+	var codecReservoir *stableCodecReservoir
+	if spec.InternalDim() >= vecindex.StablePQMinInternalDim {
+		codecReservoir, err = newStableCodecReservoir(spec.Seed^epoch, spec.InternalDim())
+		if err != nil {
+			return nil, nil, fmt.Errorf("hierarchical catch-up: stable codec reservoir: %w", err)
+		}
+		defer codecReservoir.Close()
 	}
-	defer codecReservoir.Close()
 	spools := newCatchUpSpoolSet(dir, desiredK)
 	defer spools.Cleanup()
 
+	var parentReadBuf []byte
 	for parentID := 1; parentID <= currentK; parentID++ {
 		parentSpool := parentSpools.spools[int64(parentID)]
 		if parentSpool == nil || parentSpool.path == "" {
@@ -431,8 +440,10 @@ func BuildHierarchicalCatchUpSegmentGeneration(
 		if len(candidateIDs) == 0 {
 			candidateIDs = childIDsByParent[parentID]
 		}
-		if err := assignCatchUpParentSpoolToSpools(parentSpool, candidateIDs, trainedCentroids, spec, targetSize, spools, codecReservoir, clusterRowCounts, clusterVectorSums); err != nil {
-			return nil, nil, err
+		var assignErr error
+		parentReadBuf, assignErr = assignCatchUpParentSpoolToSpools(parentSpool, candidateIDs, trainedCentroids, spec, targetSize, spools, codecReservoir, clusterRowCounts, clusterVectorSums, parentReadBuf)
+		if assignErr != nil {
+			return nil, nil, assignErr
 		}
 	}
 	if err := spools.CloseAll(); err != nil {
@@ -883,18 +894,27 @@ func loadCatchUpRelabeledParentRows(spool *catchUpClusterSpool, spec vecindex.IV
 }
 
 func visitCatchUpSpoolRows(spool *catchUpClusterSpool, spec vecindex.IVFSpec, visit func(rowID int64, prepared []byte) error) error {
+	_, err := visitCatchUpSpoolRowsBuffered(spool, spec, nil, visit)
+	return err
+}
+
+func visitCatchUpSpoolRowsBuffered(spool *catchUpClusterSpool, spec vecindex.IVFSpec, buf []byte, visit func(rowID int64, prepared []byte) error) ([]byte, error) {
 	if spool == nil || spool.path == "" || visit == nil {
-		return nil
+		return buf, nil
 	}
 	preparedEntrySize := 8 + spec.InternalDim()*4
 	if preparedEntrySize <= 8 {
-		return fmt.Errorf("hierarchical catch-up: invalid prepared spool entry size %d", preparedEntrySize)
+		return buf, fmt.Errorf("hierarchical catch-up: invalid prepared spool entry size %d", preparedEntrySize)
 	}
 	file, err := os.Open(spool.path)
 	if err != nil {
-		return fmt.Errorf("hierarchical catch-up: open relabeled parent spool: %w", err)
+		return buf, fmt.Errorf("hierarchical catch-up: open relabeled parent spool: %w", err)
 	}
-	buf := make([]byte, preparedEntrySize*256)
+	if cap(buf) < preparedEntrySize*256 {
+		buf = make([]byte, preparedEntrySize*256)
+	} else {
+		buf = buf[:preparedEntrySize*256]
+	}
 	for {
 		n, readErr := io.ReadFull(file, buf)
 		if readErr == io.EOF {
@@ -906,18 +926,18 @@ func visitCatchUpSpoolRows(spool *catchUpClusterSpool, spec vecindex.IVFSpec, vi
 			}
 			if n%preparedEntrySize != 0 {
 				_ = file.Close()
-				return fmt.Errorf("hierarchical catch-up: truncated relabeled parent spool")
+				return buf, fmt.Errorf("hierarchical catch-up: truncated relabeled parent spool")
 			}
 		} else if readErr != nil {
 			_ = file.Close()
-			return fmt.Errorf("hierarchical catch-up: read relabeled parent spool: %w", readErr)
+			return buf, fmt.Errorf("hierarchical catch-up: read relabeled parent spool: %w", readErr)
 		}
 		for cursor := 0; cursor < n; cursor += preparedEntrySize {
 			rowID := int64(binary.LittleEndian.Uint64(buf[cursor : cursor+8]))
 			prepared := buf[cursor+8 : cursor+preparedEntrySize]
 			if err := visit(rowID, prepared); err != nil {
 				_ = file.Close()
-				return err
+				return buf, err
 			}
 		}
 		if readErr == io.ErrUnexpectedEOF {
@@ -925,9 +945,9 @@ func visitCatchUpSpoolRows(spool *catchUpClusterSpool, spec vecindex.IVFSpec, vi
 		}
 	}
 	if err := file.Close(); err != nil {
-		return fmt.Errorf("hierarchical catch-up: close relabeled parent spool: %w", err)
+		return buf, fmt.Errorf("hierarchical catch-up: close relabeled parent spool: %w", err)
 	}
-	return nil
+	return buf, nil
 }
 
 func trainCatchUpFamily(
@@ -1025,15 +1045,16 @@ func assignCatchUpParentSpoolToSpools(
 	codecReservoir *stableCodecReservoir,
 	clusterRowCounts []uint64,
 	clusterVectorSums [][]float32,
-) error {
+	buf []byte,
+) ([]byte, error) {
 	if parentSpool == nil || parentSpool.path == "" || len(candidateIDs) == 0 {
-		return nil
+		return buf, nil
 	}
 	hardLimit := uint64(0)
 	if targetSize > 0 {
 		hardLimit = uint64(targetSize * repairClusterFactor)
 	}
-	return visitCatchUpSpoolRows(parentSpool, spec, func(rowID int64, prepared []byte) error {
+	return visitCatchUpSpoolRowsBuffered(parentSpool, spec, buf, func(rowID int64, prepared []byte) error {
 		row := promotionRow{
 			rowID: rowID,
 			vec:   metric.BytesToFloat32(prepared),

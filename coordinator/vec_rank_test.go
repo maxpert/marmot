@@ -95,11 +95,11 @@ func TestGoRank_WithUserPredicate_ExactRerankFillsLimit(t *testing.T) {
 	require.NoError(t, err)
 	defer stmt.Close()
 
-	for _, item := range dists[:10] {
+	for _, item := range dists[:80] {
 		_, err := stmt.Exec("draft", item.id)
 		require.NoError(t, err)
 	}
-	for _, item := range dists[10:20] {
+	for _, item := range dists[80:90] {
 		_, err := stmt.Exec("published", item.id)
 		require.NoError(t, err)
 	}
@@ -109,7 +109,7 @@ func TestGoRank_WithUserPredicate_ExactRerankFillsLimit(t *testing.T) {
 	require.Len(t, ids, 10, "expected exact rerank to refill the post-filter top-k")
 
 	expected := make([]int64, 10)
-	for i, item := range dists[10:20] {
+	for i, item := range dists[80:90] {
 		expected[i] = item.id
 	}
 	require.Equal(t, expected, ids, "post-filter exact rerank should skip predicate-mismatched nearest rows")

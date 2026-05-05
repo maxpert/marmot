@@ -93,6 +93,10 @@ func RewriteVectorQuery(
 	if err != nil || limitK < 1 {
 		return nil, fmt.Errorf("MARMOT-VEC-021: vec_match query LIMIT must be a positive integer")
 	}
+	candidateK := vm.k
+	if candidateK < limitK {
+		return nil, fmt.Errorf("MARMOT-VEC-021: vec_match candidate budget %d must be >= LIMIT %d", candidateK, limitK)
+	}
 
 	// ORDER BY vec_distance(col, q) on the same column is required.
 	vd, err := findVecDistance(sel, vm.colName, vm.tableRef)
@@ -111,14 +115,17 @@ func RewriteVectorQuery(
 	}
 
 	// --- Selectivity estimation ---
-	userPred := stripVecMatch(sel.Where)
+	userPred, ok := stripVecMatchStrict(sel.Where)
+	if !ok {
+		return nil, fmt.Errorf("MARMOT-VEC-024: vec_match must be a top-level AND predicate")
+	}
 	total := mgr.EstimatedRowCount(meta.Database, realTable)
 	estimatedF := stat4.EstimateCardinality(userPred, total)
 
 	nprobe := session.Nprobe(meta.Nprobe)
 	useBudgetProbe := useBudgetProbeForSession(meta, session, nprobe)
 	const overfetch = 4
-	estimatedI := int64(limitK) * int64(nprobe) * overfetch
+	estimatedI := int64(candidateK) * int64(nprobe) * overfetch
 	prefilterCap := session.PrefilterCap()
 	forcePlan := session.ForcePlan()
 
@@ -135,6 +142,18 @@ func RewriteVectorQuery(
 		plan = PlanPreFilter
 	default:
 		plan = PlanPostFilter
+	}
+	if plan == PlanPostFilter && !session.UseGoRank() {
+		if forcePlan == "post" {
+			return nil, fmt.Errorf("MARMOT-VEC-024: post-filter vector plan requires @@marmot_vec_use_go_rank=on")
+		}
+		plan = PlanPreFilter
+	}
+	if plan == PlanPostFilter && !goRankPredicateSafe(sel, userPred, vm.tableRef, realTable) {
+		if forcePlan == "post" {
+			return nil, fmt.Errorf("MARMOT-VEC-024: predicate is not safe for Go-side post-filter vector ranking")
+		}
+		plan = PlanPreFilter
 	}
 
 	// --- Metric rewrite ---
@@ -153,6 +172,8 @@ func RewriteVectorQuery(
 		ColumnName:   vm.colName,
 		Metric:       metricSuffix,
 		K:            limitK,
+		LimitK:       limitK,
+		CandidateK:   candidateK,
 		EstimatedF:   estimatedF,
 		EstimatedI:   estimatedI,
 		PrefilterCap: prefilterCap,
@@ -214,6 +235,7 @@ func RewriteVectorQuery(
 			useBudgetProbe,
 			vm.tableRef,
 			limitK,
+			candidateK,
 		)
 		if grErr != nil {
 			return nil, grErr
@@ -224,7 +246,7 @@ func RewriteVectorQuery(
 	}
 
 	// --- Fallback (design §7.5) ---
-	if plan == PlanPostFilter && info.GoRank == nil && session.Fallback() == "on" {
+	if plan == PlanPostFilter && session.Fallback() == "on" {
 		fallback, err := buildPreFilter(sel, userPred)
 		if err != nil {
 			return nil, err
@@ -351,39 +373,101 @@ func resolveRealTable(sel *sqlparser.Select, tableRef string) string {
 	return ""
 }
 
-// stripVecMatch returns the WHERE expression with all vec_match(...) nodes
-// removed. Returns nil when vec_match is the only predicate.
+// stripVecMatch returns the WHERE expression with vec_match(...) removed from
+// top-level AND terms. Returns nil when vec_match is the only predicate.
 func stripVecMatch(where *sqlparser.Where) sqlparser.Expr {
-	if where == nil {
-		return nil
-	}
-	return removeVecMatch(where.Expr)
+	expr, _ := stripVecMatchStrict(where)
+	return expr
 }
 
-// removeVecMatch recursively removes vec_match nodes from an expression tree.
-func removeVecMatch(expr sqlparser.Expr) sqlparser.Expr {
+func stripVecMatchStrict(where *sqlparser.Where) (sqlparser.Expr, bool) {
+	if where == nil {
+		return nil, true
+	}
+	expr, removed, ok := removeVecMatch(where.Expr)
+	if !ok || !removed {
+		return expr, ok
+	}
+	return expr, true
+}
+
+// removeVecMatch removes vec_match only when it appears as a top-level AND
+// term. Removing it from OR/NOT/sub-expression shapes changes SQL semantics, so
+// those shapes are rejected by returning ok=false.
+func removeVecMatch(expr sqlparser.Expr) (out sqlparser.Expr, removed bool, ok bool) {
 	if expr == nil {
-		return nil
+		return nil, false, true
 	}
 	switch e := expr.(type) {
 	case *sqlparser.FuncExpr:
 		if e.Name.EqualString("vec_match") {
-			return nil
+			return nil, true, true
 		}
-		return e
+		if containsVecMatch(e) {
+			return e, false, false
+		}
+		return e, false, true
 	case *sqlparser.AndExpr:
-		left := removeVecMatch(e.Left)
-		right := removeVecMatch(e.Right)
+		left, leftRemoved, leftOK := removeVecMatch(e.Left)
+		right, rightRemoved, rightOK := removeVecMatch(e.Right)
+		if !leftOK || !rightOK {
+			return e, leftRemoved || rightRemoved, false
+		}
 		if left == nil {
-			return right
+			return right, leftRemoved || rightRemoved, true
 		}
 		if right == nil {
-			return left
+			return left, leftRemoved || rightRemoved, true
 		}
-		return &sqlparser.AndExpr{Left: left, Right: right}
+		return &sqlparser.AndExpr{Left: left, Right: right}, leftRemoved || rightRemoved, true
 	default:
-		return e
+		if containsVecMatch(e) {
+			return e, false, false
+		}
+		return e, false, true
 	}
+}
+
+func containsVecMatch(expr sqlparser.Expr) bool {
+	if expr == nil {
+		return false
+	}
+	found := false
+	_ = sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
+		if fn, ok := node.(*sqlparser.FuncExpr); ok && fn.Name.EqualString("vec_match") {
+			found = true
+			return false, nil
+		}
+		return true, nil
+	}, expr)
+	return found
+}
+
+func goRankPredicateSafe(sel *sqlparser.Select, userPred sqlparser.Expr, tableRef, realTable string) bool {
+	if userPred == nil {
+		return true
+	}
+	if sel == nil || len(sel.From) != 1 {
+		return false
+	}
+	alias := tableRef
+	if alias == "" {
+		alias = realTable
+	}
+	safe := true
+	_ = sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
+		col, ok := node.(*sqlparser.ColName)
+		if !ok {
+			return true, nil
+		}
+		qualifier := col.Qualifier.Name.String()
+		if qualifier != "" && qualifier != alias && qualifier != realTable {
+			safe = false
+			return false, nil
+		}
+		return true, nil
+	}, userPred)
+	return safe
 }
 
 // buildPreFilter constructs the pre-filter SELECT (design §7.3):

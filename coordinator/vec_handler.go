@@ -124,7 +124,17 @@ func (h *CoordinatorHandler) executeVectorPlan(
 	consistency protocol.ConsistencyLevel,
 ) (*protocol.ResultSet, error) {
 	if info.GoRank != nil {
-		return h.executeGoRankPlan(info.GoRank, args)
+		rs, err := h.executeGoRankPlan(info.GoRank, args)
+		if err != nil {
+			return nil, err
+		}
+		if info.FallbackOn && rs != nil && len(rs.Rows) < info.K && info.FallbackSQL != "" {
+			fb := stmt
+			fb.SQL = info.FallbackSQL
+			fb.ExtractedParams = args
+			return h.handleRead(fb, args, consistency)
+		}
+		return rs, nil
 	}
 
 	primary := stmt

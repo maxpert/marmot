@@ -288,7 +288,8 @@ func TestJournaledOverlay_SnapshotStoresJournalRefs(t *testing.T) {
 	vec[0] ^= 0xff
 
 	snapshot := overlay.Snapshot()
-	row := snapshot.byCluster[1][10]
+	row, ok := snapshot.clusterRow(1, 10)
+	require.True(t, ok)
 	require.Empty(t, row.vec.inline)
 	require.Positive(t, row.vec.offset)
 	require.Equal(t, len(encodeOverlayTestVec(1, 2)), row.vec.length)
@@ -314,12 +315,50 @@ func TestJournaledOverlay_ReplayStoresJournalRefs(t *testing.T) {
 	t.Cleanup(func() { require.NoError(t, reopened.Close()) })
 
 	snapshot := reopened.Snapshot()
-	row := snapshot.byCluster[2][11]
+	row, ok := snapshot.clusterRow(2, 11)
+	require.True(t, ok)
 	require.Empty(t, row.vec.inline)
 	require.Positive(t, row.vec.offset)
 	got, err := snapshot.ReadVec(11)
 	require.NoError(t, err)
 	require.Equal(t, encodeOverlayTestVec(3, 4), got)
+}
+
+func TestJournaledOverlay_SnapshotIsolationAcrossClusterMutations(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "overlay.journal")
+	overlay, err := OpenJournaledOverlay(path)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, overlay.Close()) })
+
+	require.NoError(t, overlay.ApplyCommittedBatch([]OverlayMutation{
+		{Kind: OverlayMutationUpsert, Epoch: 1, Sequence: 1, ClusterID: 1, RowID: 10, Vec: encodeOverlayTestVec(1, 2)},
+	}))
+	first := overlay.Snapshot()
+
+	require.NoError(t, overlay.ApplyCommittedBatch([]OverlayMutation{
+		{Kind: OverlayMutationUpsert, Epoch: 1, Sequence: 2, ClusterID: 1, RowID: 11, Vec: encodeOverlayTestVec(3, 4)},
+		{Kind: OverlayMutationReplace, Epoch: 1, Sequence: 3, ClusterID: 1, RowID: 10, Vec: encodeOverlayTestVec(5, 6)},
+	}))
+	second := overlay.Snapshot()
+
+	firstRows := make(map[int64][]byte)
+	first.VisitCluster(1, func(rowID int64, vec []byte) bool {
+		firstRows[rowID] = append([]byte(nil), vec...)
+		return true
+	})
+	require.Equal(t, map[int64][]byte{10: encodeOverlayTestVec(1, 2)}, firstRows)
+
+	secondRows := make(map[int64][]byte)
+	second.VisitCluster(1, func(rowID int64, vec []byte) bool {
+		secondRows[rowID] = append([]byte(nil), vec...)
+		return true
+	})
+	require.Equal(t, map[int64][]byte{
+		10: encodeOverlayTestVec(5, 6),
+		11: encodeOverlayTestVec(3, 4),
+	}, secondRows)
 }
 
 func TestOverlayVecCacheEvictsAtByteCap(t *testing.T) {

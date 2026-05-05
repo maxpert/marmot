@@ -6,11 +6,9 @@ import (
 	"math"
 	"math/rand"
 	"os"
-	"slices"
 
 	"github.com/maxpert/marmot/modules/vecindex"
 	"github.com/maxpert/marmot/modules/vecindex/pkg/kmeans"
-	"github.com/maxpert/marmot/modules/vecindex/pkg/metric"
 )
 
 const stableCodecTrainingSampleLimit = 32768
@@ -23,6 +21,7 @@ type stableCodecReservoir struct {
 	recordSize int64
 	path       string
 	file       *os.File
+	recordBuf  []byte
 	err        error
 }
 
@@ -43,6 +42,7 @@ func newStableCodecReservoir(seed uint64, dim int) (*stableCodecReservoir, error
 		recordSize: int64(8 + dim*4),
 		path:       file.Name(),
 		file:       file,
+		recordBuf:  make([]byte, 8+dim*4),
 	}, nil
 }
 
@@ -73,7 +73,7 @@ func (r *stableCodecReservoir) Add(clusterID int64, prepared []byte) {
 	}
 	r.seen++
 	if r.slots < stableCodecTrainingSampleLimit {
-		if err := r.writeSlot(r.slots, clusterID, metric.BytesToFloat32(prepared)); err != nil {
+		if err := r.writeSlot(r.slots, clusterID, prepared); err != nil {
 			r.err = err
 			return
 		}
@@ -84,7 +84,7 @@ func (r *stableCodecReservoir) Add(clusterID int64, prepared []byte) {
 	if slot >= int64(r.slots) {
 		return
 	}
-	if err := r.writeSlot(int(slot), clusterID, metric.BytesToFloat32(prepared)); err != nil {
+	if err := r.writeSlot(int(slot), clusterID, prepared); err != nil {
 		r.err = err
 	}
 }
@@ -100,58 +100,38 @@ func (r *stableCodecReservoir) Samples() ([]vecindex.StableCodecTrainingVector, 
 		return nil, err
 	}
 	buf := make([]byte, r.recordSize)
-	byCluster := make(map[int64][]vecindex.StableCodecTrainingVector)
+	backing := make([]float32, r.slots*r.dim)
+	out := make([]vecindex.StableCodecTrainingVector, 0, r.slots)
 	for slot := 0; slot < r.slots; slot++ {
 		if _, err := r.file.ReadAt(buf, int64(slot)*r.recordSize); err != nil {
 			return nil, err
 		}
 		clusterID := int64(binary.LittleEndian.Uint64(buf[:8]))
-		vec := make([]float32, r.dim)
+		vec := backing[slot*r.dim : (slot+1)*r.dim]
 		cursor := 8
 		for i := range vec {
 			vec[i] = math.Float32frombits(binary.LittleEndian.Uint32(buf[cursor : cursor+4]))
 			cursor += 4
 		}
-		byCluster[clusterID] = append(byCluster[clusterID], vecindex.StableCodecTrainingVector{ClusterID: clusterID, Vec: vec})
-	}
-	out := make([]vecindex.StableCodecTrainingVector, 0, r.slots)
-	clusterIDs := make([]int64, 0, len(byCluster))
-	for clusterID := range byCluster {
-		clusterIDs = append(clusterIDs, clusterID)
-	}
-	slices.Sort(clusterIDs)
-	perClusterCap := stableCodecTrainingSampleLimit
-	if len(clusterIDs) > 0 {
-		perClusterCap = max(1, stableCodecTrainingSampleLimit/len(clusterIDs))
-	}
-	for _, clusterID := range clusterIDs {
-		samples := byCluster[clusterID]
-		if len(samples) > perClusterCap {
-			samples = samples[:perClusterCap]
-		}
-		out = append(out, samples...)
+		out = append(out, vecindex.StableCodecTrainingVector{ClusterID: clusterID, Vec: vec})
 	}
 	return out, nil
 }
 
-func (r *stableCodecReservoir) writeSlot(slot int, clusterID int64, vec []float32) error {
-	if len(vec) != r.dim {
-		return fmt.Errorf("stable codec reservoir: vector dim=%d want=%d", len(vec), r.dim)
+func (r *stableCodecReservoir) writeSlot(slot int, clusterID int64, prepared []byte) error {
+	if len(prepared) != r.dim*4 {
+		return fmt.Errorf("stable codec reservoir: vector bytes=%d want=%d", len(prepared), r.dim*4)
 	}
-	buf := make([]byte, r.recordSize)
+	buf := r.recordBuf
 	binary.LittleEndian.PutUint64(buf[:8], uint64(clusterID))
-	cursor := 8
-	for _, value := range vec {
-		binary.LittleEndian.PutUint32(buf[cursor:cursor+4], math.Float32bits(value))
-		cursor += 4
-	}
+	copy(buf[8:], prepared)
 	_, err := r.file.WriteAt(buf, int64(slot)*r.recordSize)
 	return err
 }
 
 func buildStableMemberCodec(spec vecindex.IVFSpec, cs *kmeans.CentroidSet, reservoir *stableCodecReservoir) (*vecindex.StableMemberCodec, []byte, error) {
 	var samples []vecindex.StableCodecTrainingVector
-	if reservoir != nil {
+	if reservoir != nil && spec.InternalDim() >= vecindex.StablePQMinInternalDim {
 		var err error
 		samples, err = reservoir.Samples()
 		if err != nil {

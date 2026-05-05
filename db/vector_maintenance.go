@@ -704,7 +704,8 @@ func rewriteOverlayTailForProbe(
 		return nil
 	}
 	var rewriteErr error
-	snapshot.VisitMutationsAfter(minSequence, func(mutation vecindex.OverlayMutation) bool {
+	var scratch []byte
+	scratch, err = snapshot.VisitMutationsAfterBuffered(minSequence, scratch, func(mutation vecindex.OverlayMutation) bool {
 		next, err := reassignOverlayMutationForProbe(ctx, exactFetcher, mutation, spec, probe, stable)
 		if err != nil {
 			rewriteErr = err
@@ -720,6 +721,11 @@ func rewriteOverlayTailForProbe(
 		}
 		return true
 	})
+	_ = scratch
+	if err != nil {
+		_ = overlay.Close()
+		return nil, err
+	}
 	if rewriteErr != nil {
 		_ = overlay.Close()
 		return nil, rewriteErr

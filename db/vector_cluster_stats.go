@@ -11,26 +11,10 @@ import (
 )
 
 type cutoffClusterStats struct {
-	Counts          []uint64
-	Sums            [][]float32
-	Touched         map[int64]struct{}
-	TotalRows       uint64
-	PrefixMutations []vecindex.OverlayMutation
-}
-
-func overlayMutationsUpTo(snapshot *vecindex.OverlaySnapshot, minSequence, cutoff uint64) []vecindex.OverlayMutation {
-	if snapshot == nil {
-		return nil
-	}
-	mutations := make([]vecindex.OverlayMutation, 0)
-	snapshot.VisitMutationsAfter(minSequence, func(mutation vecindex.OverlayMutation) bool {
-		if cutoff > 0 && mutation.Sequence > cutoff {
-			return false
-		}
-		mutations = append(mutations, mutation)
-		return true
-	})
-	return mutations
+	Counts    []uint64
+	Sums      [][]float32
+	Touched   map[int64]struct{}
+	TotalRows uint64
 }
 
 func buildCutoffClusterStats(
@@ -62,32 +46,39 @@ func buildCutoffClusterStats(
 			counts[clusterID] = base.Data.ClusterCount(int64(clusterID))
 		}
 	}
-	prefix := overlayMutationsUpTo(overlaySnapshot, base.AppliedOverlaySeq, cutoff)
-	touched := make(map[int64]struct{}, len(prefix)*2)
-	for _, mutation := range prefix {
+	touched := make(map[int64]struct{}, 1024)
+	var visitErr error
+	var scratch []byte
+	scratch, err := overlaySnapshot.VisitMutationsAfterBuffered(base.AppliedOverlaySeq, scratch, func(mutation vecindex.OverlayMutation) bool {
+		if cutoff > 0 && mutation.Sequence > cutoff {
+			return false
+		}
 		if loc, ok, err := base.RowMap.Lookup(mutation.RowID); err != nil {
-			return nil, fmt.Errorf("cutoff cluster stats: lookup rowid %d: %w", mutation.RowID, err)
+			visitErr = fmt.Errorf("cutoff cluster stats: lookup rowid %d: %w", mutation.RowID, err)
+			return false
 		} else if ok {
 			touched[loc.ClusterID] = struct{}{}
 			if !useMaintenanceLiveStats && (mutation.Kind == vecindex.OverlayMutationReplace || mutation.Kind == vecindex.OverlayMutationDelete) {
 				if err := applyStableDelta(counts, sums, base, spec, loc.ClusterID, mutation.RowID, -1); err != nil {
-					return nil, err
+					visitErr = err
+					return false
 				}
 			}
 		}
 		if mutation.Kind == vecindex.OverlayMutationDelete || mutation.ClusterID <= 0 {
-			continue
+			return true
 		}
 		touched[mutation.ClusterID] = struct{}{}
 		if useMaintenanceLiveStats {
-			continue
+			return true
 		}
 		preparedBlob, ok, err := overlayMutationPrepared(ctx, exactFetcher, mutation)
 		if err != nil {
-			return nil, fmt.Errorf("cutoff cluster stats: load exact overlay rowid %d: %w", mutation.RowID, err)
+			visitErr = fmt.Errorf("cutoff cluster stats: load exact overlay rowid %d: %w", mutation.RowID, err)
+			return false
 		}
 		if !ok {
-			continue
+			return true
 		}
 		ensureClusterStatsCapacity(&counts, &sums, int(mutation.ClusterID), len(metric.BytesToFloat32(preparedBlob)))
 		counts[mutation.ClusterID]++
@@ -95,17 +86,24 @@ func buildCutoffClusterStats(
 		for i, value := range metric.BytesToFloat32(preparedBlob) {
 			sum[i] += value
 		}
+		return true
+	})
+	_ = scratch
+	if err != nil {
+		return nil, err
+	}
+	if visitErr != nil {
+		return nil, visitErr
 	}
 	var totalRows uint64
 	for clusterID := 1; clusterID < len(counts); clusterID++ {
 		totalRows += counts[clusterID]
 	}
 	return &cutoffClusterStats{
-		Counts:          counts,
-		Sums:            sums,
-		Touched:         touched,
-		TotalRows:       totalRows,
-		PrefixMutations: prefix,
+		Counts:    counts,
+		Sums:      sums,
+		Touched:   touched,
+		TotalRows: totalRows,
 	}, nil
 }
 
@@ -246,7 +244,8 @@ func reassignOverlayMutationsForProbe(
 	}
 	rewritten := make([]vecindex.OverlayMutation, 0)
 	var reassignErr error
-	snapshot.VisitMutationsAfter(minSequence, func(mutation vecindex.OverlayMutation) bool {
+	var scratch []byte
+	scratch, err := snapshot.VisitMutationsAfterBuffered(minSequence, scratch, func(mutation vecindex.OverlayMutation) bool {
 		next, err := reassignOverlayMutationForProbe(ctx, exactFetcher, mutation, spec, probe, stable)
 		if err != nil {
 			reassignErr = err
@@ -255,6 +254,10 @@ func reassignOverlayMutationsForProbe(
 		rewritten = append(rewritten, next)
 		return true
 	})
+	_ = scratch
+	if err != nil {
+		return nil, err
+	}
 	if reassignErr != nil {
 		return nil, reassignErr
 	}

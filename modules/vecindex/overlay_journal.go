@@ -103,6 +103,26 @@ func (r *overlayVecReader) read(ref overlayVecRef, key overlayVecKey) ([]byte, e
 	return vec, nil
 }
 
+func (r *overlayVecReader) readInto(ref overlayVecRef, key overlayVecKey, scratch []byte) ([]byte, []byte, error) {
+	if len(ref.inline) > 0 {
+		return ref.inline, scratch, nil
+	}
+	if ref.length == 0 {
+		return nil, scratch, nil
+	}
+	if r == nil || r.file == nil || ref.offset <= 0 {
+		return nil, scratch, fmt.Errorf("vecindex: overlay vector ref is not readable")
+	}
+	if cap(scratch) < ref.length {
+		scratch = make([]byte, ref.length)
+	}
+	vec := scratch[:ref.length]
+	if _, err := r.file.ReadAt(vec, ref.offset); err != nil {
+		return nil, scratch, err
+	}
+	return vec, scratch, nil
+}
+
 type overlayVecCache struct {
 	mu       sync.Mutex
 	maxBytes int64
@@ -209,9 +229,14 @@ type OverlaySnapshot struct {
 	epoch        uint64
 	lastSequence uint64
 	reader       *overlayVecReader
-	byCluster    map[int64]map[int64]overlayRow
+	byCluster    map[int64]*overlayClusterRows
 	rowCluster   map[int64]int64
 	tombstones   map[int64]overlayTombstone
+}
+
+type overlayClusterRows struct {
+	mu   sync.RWMutex
+	rows map[int64]overlayRow
 }
 
 type overlayRow struct {
@@ -249,7 +274,7 @@ func newOverlaySnapshotWithReader(epoch, lastSequence uint64, reader *overlayVec
 		epoch:        epoch,
 		lastSequence: lastSequence,
 		reader:       reader,
-		byCluster:    make(map[int64]map[int64]overlayRow),
+		byCluster:    make(map[int64]*overlayClusterRows),
 		rowCluster:   make(map[int64]int64),
 		tombstones:   make(map[int64]overlayTombstone),
 	}
@@ -313,11 +338,53 @@ func (s *OverlaySnapshot) RowClusterAfter(rowID int64, minSequence uint64) (int6
 	if !ok {
 		return 0, false
 	}
-	row, ok := s.byCluster[clusterID][rowID]
+	row, ok := s.clusterRow(clusterID, rowID)
 	if !ok || row.sequence <= minSequence {
 		return 0, false
 	}
 	return clusterID, true
+}
+
+func (s *OverlaySnapshot) clusterRow(clusterID, rowID int64) (overlayRow, bool) {
+	if s == nil {
+		return overlayRow{}, false
+	}
+	clusterRows := s.byCluster[clusterID]
+	if clusterRows == nil {
+		return overlayRow{}, false
+	}
+	clusterRows.mu.RLock()
+	row, ok := clusterRows.rows[rowID]
+	clusterRows.mu.RUnlock()
+	return row, ok
+}
+
+func (s *OverlaySnapshot) visitClusterRows(clusterID int64, visit func(rowID int64, row overlayRow) bool) {
+	if s == nil || visit == nil {
+		return
+	}
+	clusterRows := s.byCluster[clusterID]
+	if clusterRows == nil {
+		return
+	}
+	clusterRows.mu.RLock()
+	defer clusterRows.mu.RUnlock()
+	for rowID, row := range clusterRows.rows {
+		if !visit(rowID, row) {
+			return
+		}
+	}
+}
+
+func (s *OverlaySnapshot) overlayRowVisibleInCluster(clusterID, rowID int64, row overlayRow, minSequence, maxSequence uint64) bool {
+	if s == nil || row.sequence == 0 || row.sequence > s.lastSequence || row.sequence <= minSequence {
+		return false
+	}
+	if maxSequence > 0 && row.sequence > maxSequence {
+		return false
+	}
+	currentCluster, ok := s.rowCluster[rowID]
+	return ok && currentCluster == clusterID
 }
 
 // VisitCluster visits every overlay row in clusterID.
@@ -335,39 +402,38 @@ func (s *OverlaySnapshot) VisitClusterEncodedAfter(clusterID int64, minSequence 
 	if s == nil || visit == nil {
 		return
 	}
-	for rowID, row := range s.byCluster[clusterID] {
-		if row.sequence <= minSequence {
-			continue
+	s.visitClusterRows(clusterID, func(rowID int64, row overlayRow) bool {
+		if !s.overlayRowVisibleInCluster(clusterID, rowID, row, minSequence, 0) {
+			return true
 		}
 		vec, err := s.readRowVec(rowID, row)
 		if err != nil {
-			return
+			return false
 		}
 		if !visit(rowID, row.vec.encoding, vec) {
-			return
+			return false
 		}
-	}
+		return true
+	})
 }
 
 func (s *OverlaySnapshot) VisitClusterRange(clusterID int64, minSequence uint64, maxSequence uint64, visit func(rowID int64, vec []byte) bool) {
 	if s == nil || visit == nil {
 		return
 	}
-	for rowID, row := range s.byCluster[clusterID] {
-		if row.sequence <= minSequence {
-			continue
-		}
-		if maxSequence > 0 && row.sequence > maxSequence {
-			continue
+	s.visitClusterRows(clusterID, func(rowID int64, row overlayRow) bool {
+		if !s.overlayRowVisibleInCluster(clusterID, rowID, row, minSequence, maxSequence) {
+			return true
 		}
 		vec, err := s.readRowVec(rowID, row)
 		if err != nil {
-			return
+			return false
 		}
 		if !visit(rowID, vec) {
-			return
+			return false
 		}
-	}
+		return true
+	})
 }
 
 // VisitTombstones visits every tombstoned rowid.
@@ -399,18 +465,25 @@ func (s *OverlaySnapshot) VisitAllEncodedAfter(minSequence uint64, visit func(cl
 	if s == nil || visit == nil {
 		return
 	}
-	for clusterID, rows := range s.byCluster {
-		for rowID, row := range rows {
-			if row.sequence <= minSequence {
-				continue
+	for clusterID := range s.byCluster {
+		stopped := false
+		s.visitClusterRows(clusterID, func(rowID int64, row overlayRow) bool {
+			if !s.overlayRowVisibleInCluster(clusterID, rowID, row, minSequence, 0) {
+				return true
 			}
 			vec, err := s.readRowVec(rowID, row)
 			if err != nil {
-				return
+				stopped = true
+				return false
 			}
 			if !visit(clusterID, rowID, row.vec.encoding, vec) {
-				return
+				stopped = true
+				return false
 			}
+			return true
+		})
+		if stopped {
+			return
 		}
 	}
 }
@@ -419,24 +492,25 @@ func (s *OverlaySnapshot) BacklogStats(minSequence uint64) (rows int, bytes int6
 	if s == nil {
 		return 0, 0, 0
 	}
-	for _, clusterRows := range s.byCluster {
-		for _, row := range clusterRows {
-			if row.sequence <= minSequence {
-				continue
+	for clusterID := range s.byCluster {
+		s.visitClusterRows(clusterID, func(rowID int64, row overlayRow) bool {
+			if !s.overlayRowVisibleInCluster(clusterID, rowID, row, minSequence, 0) {
+				return true
 			}
 			rows++
 			bytes += int64(row.vec.length)
 			if oldestUnixNano == 0 || row.appliedAtUnixNano < oldestUnixNano {
 				oldestUnixNano = row.appliedAtUnixNano
 			}
-		}
+			return true
+		})
 	}
 	for rowID, tombstone := range s.tombstones {
 		if tombstone.sequence <= minSequence {
 			continue
 		}
 		if clusterID, ok := s.rowCluster[rowID]; ok {
-			if row, ok := s.byCluster[clusterID][rowID]; ok && row.sequence == tombstone.sequence {
+			if row, ok := s.clusterRow(clusterID, rowID); ok && row.sequence == tombstone.sequence {
 				continue
 			}
 		}
@@ -453,22 +527,23 @@ func (s *OverlaySnapshot) NewestUnixNanoAfter(minSequence uint64) int64 {
 		return 0
 	}
 	var newest int64
-	for _, clusterRows := range s.byCluster {
-		for _, row := range clusterRows {
-			if row.sequence <= minSequence {
-				continue
+	for clusterID := range s.byCluster {
+		s.visitClusterRows(clusterID, func(rowID int64, row overlayRow) bool {
+			if !s.overlayRowVisibleInCluster(clusterID, rowID, row, minSequence, 0) {
+				return true
 			}
 			if row.appliedAtUnixNano > newest {
 				newest = row.appliedAtUnixNano
 			}
-		}
+			return true
+		})
 	}
 	for rowID, tombstone := range s.tombstones {
 		if tombstone.sequence <= minSequence {
 			continue
 		}
 		if clusterID, ok := s.rowCluster[rowID]; ok {
-			if row, ok := s.byCluster[clusterID][rowID]; ok && row.sequence == tombstone.sequence {
+			if row, ok := s.clusterRow(clusterID, rowID); ok && row.sequence == tombstone.sequence {
 				continue
 			}
 		}
@@ -484,14 +559,14 @@ func (s *OverlaySnapshot) MutationsAfter(minSequence uint64) []OverlayMutation {
 		return nil
 	}
 	mutations := make([]OverlayMutation, 0, len(s.rowCluster)+len(s.tombstones))
-	for clusterID, rows := range s.byCluster {
-		for rowID, row := range rows {
-			if row.sequence <= minSequence {
-				continue
+	for clusterID := range s.byCluster {
+		s.visitClusterRows(clusterID, func(rowID int64, row overlayRow) bool {
+			if !s.overlayRowVisibleInCluster(clusterID, rowID, row, minSequence, 0) {
+				return true
 			}
 			vec, err := s.readRowVec(rowID, row)
 			if err != nil {
-				continue
+				return true
 			}
 			kind := OverlayMutationUpsert
 			if tombstone, ok := s.tombstones[rowID]; ok && tombstone.sequence == row.sequence {
@@ -509,7 +584,8 @@ func (s *OverlaySnapshot) MutationsAfter(minSequence uint64) []OverlayMutation {
 				VecEncoding:       row.vec.encoding,
 				Vec:               append([]byte(nil), vec...),
 			})
-		}
+			return true
+		})
 	}
 	for rowID, tombstone := range s.tombstones {
 		if tombstone.sequence <= minSequence {
@@ -571,6 +647,34 @@ func (s *OverlaySnapshot) VisitMutationsAfter(minSequence uint64, visit func(Ove
 	}
 }
 
+func (s *OverlaySnapshot) VisitMutationsAfterBuffered(minSequence uint64, scratch []byte, visit func(OverlayMutation) bool) ([]byte, error) {
+	if s == nil || visit == nil {
+		return scratch, nil
+	}
+	for _, ref := range s.mutationRefsAfter(minSequence) {
+		vec, nextScratch, err := s.readVecInto(ref.vec, ref.sequence, ref.rowID, scratch)
+		scratch = nextScratch
+		if err != nil {
+			return scratch, err
+		}
+		if !visit(OverlayMutation{
+			Kind:              ref.kind,
+			Epoch:             s.epoch,
+			Sequence:          ref.sequence,
+			ClusterID:         ref.clusterID,
+			RowID:             ref.rowID,
+			AppliedAtUnixNano: ref.appliedAtUnixNano,
+			CommitTxnID:       ref.commitTxnID,
+			CommitSeqNum:      ref.commitSeqNum,
+			VecEncoding:       ref.vec.encoding,
+			Vec:               vec,
+		}) {
+			return scratch, nil
+		}
+	}
+	return scratch, nil
+}
+
 func (s *OverlaySnapshot) VisitMutationHeadersAfter(minSequence uint64, visit func(OverlayMutation) bool) {
 	if s == nil || visit == nil {
 		return
@@ -598,10 +702,11 @@ func (s *OverlaySnapshot) VisitMutationHeadersAfterUnordered(minSequence uint64,
 	if s == nil || visit == nil {
 		return
 	}
-	for clusterID, rows := range s.byCluster {
-		for rowID, row := range rows {
-			if row.sequence <= minSequence {
-				continue
+	for clusterID := range s.byCluster {
+		stopped := false
+		s.visitClusterRows(clusterID, func(rowID int64, row overlayRow) bool {
+			if !s.overlayRowVisibleInCluster(clusterID, rowID, row, minSequence, 0) {
+				return true
 			}
 			kind := OverlayMutationUpsert
 			if tombstone, ok := s.tombstones[rowID]; ok && tombstone.sequence == row.sequence {
@@ -617,8 +722,13 @@ func (s *OverlaySnapshot) VisitMutationHeadersAfterUnordered(minSequence uint64,
 				CommitTxnID:       row.commitTxnID,
 				CommitSeqNum:      row.commitSeqNum,
 			}) {
-				return
+				stopped = true
+				return false
 			}
+			return true
+		})
+		if stopped {
+			return
 		}
 	}
 	for rowID, tombstone := range s.tombstones {
@@ -647,10 +757,10 @@ func (s *OverlaySnapshot) mutationRefsAfter(minSequence uint64) []overlayMutatio
 		return nil
 	}
 	refs := make([]overlayMutationRef, 0, len(s.rowCluster)+len(s.tombstones))
-	for clusterID, rows := range s.byCluster {
-		for rowID, row := range rows {
-			if row.sequence <= minSequence {
-				continue
+	for clusterID := range s.byCluster {
+		s.visitClusterRows(clusterID, func(rowID int64, row overlayRow) bool {
+			if !s.overlayRowVisibleInCluster(clusterID, rowID, row, minSequence, 0) {
+				return true
 			}
 			kind := OverlayMutationUpsert
 			if tombstone, ok := s.tombstones[rowID]; ok && tombstone.sequence == row.sequence {
@@ -666,7 +776,8 @@ func (s *OverlaySnapshot) mutationRefsAfter(minSequence uint64) []overlayMutatio
 				commitSeqNum:      row.commitSeqNum,
 				vec:               row.vec,
 			})
-		}
+			return true
+		})
 	}
 	for rowID, tombstone := range s.tombstones {
 		if tombstone.sequence <= minSequence {
@@ -710,7 +821,7 @@ func (s *OverlaySnapshot) ReadVec(rowID int64) ([]byte, error) {
 	if !ok {
 		return nil, fmt.Errorf("vecindex: overlay rowid %d not found", rowID)
 	}
-	row, ok := s.byCluster[clusterID][rowID]
+	row, ok := s.clusterRow(clusterID, rowID)
 	if !ok {
 		return nil, fmt.Errorf("vecindex: overlay rowid %d missing cluster row", rowID)
 	}
@@ -734,6 +845,19 @@ func (s *OverlaySnapshot) readVec(ref overlayVecRef, sequence uint64, rowID int6
 	return s.reader.read(ref, overlayVecKey{sequence: sequence, rowID: rowID})
 }
 
+func (s *OverlaySnapshot) readVecInto(ref overlayVecRef, sequence uint64, rowID int64, scratch []byte) ([]byte, []byte, error) {
+	if ref.length == 0 {
+		return nil, scratch, nil
+	}
+	if len(ref.inline) > 0 {
+		return ref.inline, scratch, nil
+	}
+	if s == nil || s.reader == nil {
+		return nil, scratch, fmt.Errorf("vecindex: overlay vector rowid %d has no reader", rowID)
+	}
+	return s.reader.readInto(ref, overlayVecKey{sequence: sequence, rowID: rowID}, scratch)
+}
+
 func (s *OverlaySnapshot) clone() *OverlaySnapshot {
 	if s == nil {
 		return newOverlaySnapshot(0, 0)
@@ -742,22 +866,12 @@ func (s *OverlaySnapshot) clone() *OverlaySnapshot {
 		epoch:        s.epoch,
 		lastSequence: s.lastSequence,
 		reader:       s.reader,
-		byCluster:    make(map[int64]map[int64]overlayRow, len(s.byCluster)),
+		byCluster:    make(map[int64]*overlayClusterRows, len(s.byCluster)),
 		rowCluster:   make(map[int64]int64, len(s.rowCluster)),
 		tombstones:   make(map[int64]overlayTombstone, len(s.tombstones)),
 	}
-	for clusterID, rows := range s.byCluster {
-		copied := make(map[int64]overlayRow, len(rows))
-		for rowID, row := range rows {
-			copied[rowID] = overlayRow{
-				sequence:          row.sequence,
-				appliedAtUnixNano: row.appliedAtUnixNano,
-				commitTxnID:       row.commitTxnID,
-				commitSeqNum:      row.commitSeqNum,
-				vec:               row.vec,
-			}
-		}
-		next.byCluster[clusterID] = copied
+	for clusterID, clusterRows := range s.byCluster {
+		next.byCluster[clusterID] = clusterRows
 	}
 	for rowID, clusterID := range s.rowCluster {
 		next.rowCluster[rowID] = clusterID
@@ -795,6 +909,7 @@ func (s *OverlaySnapshot) applyBatchRefs(mutations []OverlayMutation, refs []ove
 	if reader != nil {
 		next.reader = reader
 	}
+	copiedClusters := make(map[int64]struct{}, len(mutations)*2)
 	for i, mutation := range mutations {
 		if err := validateOverlayMutationRef(mutation, refs[i]); err != nil {
 			return nil, fmt.Errorf("overlay mutation %d: %w", i, err)
@@ -804,6 +919,7 @@ func (s *OverlaySnapshot) applyBatchRefs(mutations []OverlayMutation, refs []ove
 		}
 		if mutation.Epoch > next.epoch {
 			next = newOverlaySnapshotWithReader(mutation.Epoch, 0, reader)
+			copiedClusters = make(map[int64]struct{}, len(mutations)-i)
 		}
 		if mutation.Sequence <= next.lastSequence {
 			return nil, fmt.Errorf("overlay mutation %d: sequence %d must be greater than %d", i, mutation.Sequence, next.lastSequence)
@@ -817,7 +933,7 @@ func (s *OverlaySnapshot) applyBatchRefs(mutations []OverlayMutation, refs []ove
 				return nil, fmt.Errorf("overlay mutation %d: sequence %d must be strictly increasing", i, mutation.Sequence)
 			}
 		}
-		next.applyMutationRef(mutation, refs[i])
+		next.applyMutationRefCOW(mutation, refs[i], copiedClusters)
 		next.lastSequence = mutation.Sequence
 		next.epoch = mutation.Epoch
 	}
@@ -854,49 +970,110 @@ func (s *OverlaySnapshot) applyMutationRef(mutation OverlayMutation, ref overlay
 	}
 }
 
+func (s *OverlaySnapshot) applyMutationRefCOW(mutation OverlayMutation, ref overlayVecRef, copiedClusters map[int64]struct{}) {
+	switch mutation.Kind {
+	case OverlayMutationUpsert:
+		s.removeRowCOW(mutation.RowID, copiedClusters)
+		delete(s.tombstones, mutation.RowID)
+		s.upsertRowCOW(mutation.ClusterID, mutation.RowID, mutation.Sequence, mutation.AppliedAtUnixNano, mutation.CommitTxnID, mutation.CommitSeqNum, ref, copiedClusters)
+	case OverlayMutationReplace:
+		s.removeRowCOW(mutation.RowID, copiedClusters)
+		s.tombstones[mutation.RowID] = overlayTombstone{
+			sequence:          mutation.Sequence,
+			appliedAtUnixNano: mutation.AppliedAtUnixNano,
+			commitTxnID:       mutation.CommitTxnID,
+			commitSeqNum:      mutation.CommitSeqNum,
+		}
+		s.upsertRowCOW(mutation.ClusterID, mutation.RowID, mutation.Sequence, mutation.AppliedAtUnixNano, mutation.CommitTxnID, mutation.CommitSeqNum, ref, copiedClusters)
+	case OverlayMutationDelete:
+		s.removeRowCOW(mutation.RowID, copiedClusters)
+		s.tombstones[mutation.RowID] = overlayTombstone{
+			sequence:          mutation.Sequence,
+			appliedAtUnixNano: mutation.AppliedAtUnixNano,
+			commitTxnID:       mutation.CommitTxnID,
+			commitSeqNum:      mutation.CommitSeqNum,
+		}
+	}
+}
+
 func (s *OverlaySnapshot) removeRow(rowID int64) {
 	clusterID, ok := s.rowCluster[rowID]
 	if !ok {
 		return
 	}
 	if rows := s.byCluster[clusterID]; rows != nil {
-		delete(rows, rowID)
-		if len(rows) == 0 {
+		rows.mu.Lock()
+		delete(rows.rows, rowID)
+		empty := len(rows.rows) == 0
+		rows.mu.Unlock()
+		if empty {
 			delete(s.byCluster, clusterID)
 		}
 	}
 	delete(s.rowCluster, rowID)
 }
 
+func (s *OverlaySnapshot) removeRowCOW(rowID int64, copiedClusters map[int64]struct{}) {
+	clusterID, ok := s.rowCluster[rowID]
+	if !ok {
+		return
+	}
+	s.detachCluster(clusterID, copiedClusters)
+	s.removeRow(rowID)
+}
+
 func (s *OverlaySnapshot) upsertRow(clusterID, rowID int64, sequence uint64, appliedAtUnixNano int64, commitTxnID, commitSeqNum uint64, vec overlayVecRef) {
 	rows := s.byCluster[clusterID]
 	if rows == nil {
-		rows = make(map[int64]overlayRow)
+		rows = &overlayClusterRows{rows: make(map[int64]overlayRow)}
 		s.byCluster[clusterID] = rows
 	}
-	rows[rowID] = overlayRow{
+	rows.mu.Lock()
+	rows.rows[rowID] = overlayRow{
 		sequence:          sequence,
 		appliedAtUnixNano: appliedAtUnixNano,
 		commitTxnID:       commitTxnID,
 		commitSeqNum:      commitSeqNum,
 		vec:               vec,
 	}
+	rows.mu.Unlock()
 	s.rowCluster[rowID] = clusterID
 }
 
+func (s *OverlaySnapshot) upsertRowCOW(clusterID, rowID int64, sequence uint64, appliedAtUnixNano int64, commitTxnID, commitSeqNum uint64, vec overlayVecRef, copiedClusters map[int64]struct{}) {
+	if _, ok := s.clusterRow(clusterID, rowID); ok {
+		s.detachCluster(clusterID, copiedClusters)
+	}
+	s.upsertRow(clusterID, rowID, sequence, appliedAtUnixNano, commitTxnID, commitSeqNum, vec)
+}
+
+func (s *OverlaySnapshot) detachCluster(clusterID int64, copiedClusters map[int64]struct{}) {
+	if s == nil || copiedClusters == nil {
+		return
+	}
+	if _, ok := copiedClusters[clusterID]; ok {
+		return
+	}
+	rows := s.byCluster[clusterID]
+	if rows != nil {
+		rows.mu.RLock()
+		copied := make(map[int64]overlayRow, len(rows.rows)+1)
+		for rowID, row := range rows.rows {
+			copied[rowID] = row
+		}
+		rows.mu.RUnlock()
+		s.byCluster[clusterID] = &overlayClusterRows{rows: copied}
+	}
+	copiedClusters[clusterID] = struct{}{}
+}
+
 func validateOverlayMutation(mutation OverlayMutation) error {
-	return validateOverlayMutationRef(mutation, inlineOverlayVecRefWithEncoding(mutation.Vec, mutation.VecEncoding))
+	return validateOverlayMutationShape(mutation)
 }
 
 func validateOverlayMutationRef(mutation OverlayMutation, ref overlayVecRef) error {
-	if mutation.Sequence == 0 {
-		return fmt.Errorf("sequence must be > 0")
-	}
-	if mutation.RowID == 0 {
-		return fmt.Errorf("rowid must be non-zero")
-	}
-	if mutation.ClusterID < 0 {
-		return fmt.Errorf("cluster_id %d must be >= 0", mutation.ClusterID)
+	if err := validateOverlayMutationCore(mutation); err != nil {
+		return err
 	}
 	switch mutation.Kind {
 	case OverlayMutationUpsert, OverlayMutationReplace:
@@ -914,6 +1091,43 @@ func validateOverlayMutationRef(mutation OverlayMutation, ref overlayVecRef) err
 		}
 	default:
 		return fmt.Errorf("unknown mutation kind %d", mutation.Kind)
+	}
+	return nil
+}
+
+func validateOverlayMutationShape(mutation OverlayMutation) error {
+	if err := validateOverlayMutationCore(mutation); err != nil {
+		return err
+	}
+	switch mutation.Kind {
+	case OverlayMutationUpsert, OverlayMutationReplace:
+		if len(mutation.Vec) == 0 {
+			return fmt.Errorf("vec must be non-empty for kind %d", mutation.Kind)
+		}
+		switch mutation.VecEncoding {
+		case OverlayPreparedF32, OverlayResidualInt8:
+		default:
+			return fmt.Errorf("unknown overlay vector encoding %d", mutation.VecEncoding)
+		}
+	case OverlayMutationDelete:
+		if len(mutation.Vec) != 0 {
+			return fmt.Errorf("delete mutation must not carry vec bytes")
+		}
+	default:
+		return fmt.Errorf("unknown mutation kind %d", mutation.Kind)
+	}
+	return nil
+}
+
+func validateOverlayMutationCore(mutation OverlayMutation) error {
+	if mutation.Sequence == 0 {
+		return fmt.Errorf("sequence must be > 0")
+	}
+	if mutation.RowID == 0 {
+		return fmt.Errorf("rowid must be non-zero")
+	}
+	if mutation.ClusterID < 0 {
+		return fmt.Errorf("cluster_id %d must be >= 0", mutation.ClusterID)
 	}
 	return nil
 }
@@ -1334,10 +1548,19 @@ func (o *JournaledOverlay) CompactAfter(minSequence uint64) error {
 		return o.Reset(0)
 	}
 	mutations := make([]OverlayMutation, 0)
-	current.VisitMutationsAfter(minSequence, func(mutation OverlayMutation) bool {
+	var scratch []byte
+	var visitErr error
+	scratch, visitErr = current.VisitMutationsAfterBuffered(minSequence, scratch, func(mutation OverlayMutation) bool {
+		if len(mutation.Vec) > 0 {
+			mutation.Vec = append([]byte(nil), mutation.Vec...)
+		}
 		mutations = append(mutations, mutation)
 		return true
 	})
+	_ = scratch
+	if visitErr != nil {
+		return visitErr
+	}
 	refs, err := o.journal.Rewrite(current.Epoch(), current.LastSequence(), mutations)
 	if err != nil {
 		return err

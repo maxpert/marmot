@@ -104,6 +104,7 @@ func defaultSession() *stubSession {
 		forcePlan:    "auto",
 		prefilterCap: 5000,
 		fallback:     "on",
+		useGoRank:    true,
 	}
 }
 
@@ -295,7 +296,7 @@ func TestRewrite_NoPredicate_PostFilter(t *testing.T) {
 	t.Parallel()
 	sql := `SELECT title FROM docs WHERE vec_match(embed, ?, 10) ORDER BY vec_distance(embed, ?) LIMIT 10`
 	stmt := parseSQL(t, sql)
-	sess := &stubSession{forcePlan: "auto", prefilterCap: 5000, fallback: "off"}
+	sess := &stubSession{forcePlan: "auto", prefilterCap: 5000, fallback: "off", useGoRank: true}
 	info, err := RewriteVectorQuery(stmt, make([]byte, 16), sess, defaultEngine(), defaultLookup())
 	require.NoError(t, err)
 	require.Equal(t, PlanPostFilter, info.Plan)
@@ -317,7 +318,7 @@ func TestRewrite_ForcePost(t *testing.T) {
 	t.Parallel()
 	sql := `SELECT title FROM docs WHERE vec_match(embed, ?, 10) AND status = 'x' ORDER BY vec_distance(embed, ?) LIMIT 10`
 	stmt := parseSQL(t, sql)
-	sess := &stubSession{forcePlan: "post", prefilterCap: 5000, fallback: "off"}
+	sess := &stubSession{forcePlan: "post", prefilterCap: 5000, fallback: "off", useGoRank: true}
 	info, err := RewriteVectorQuery(stmt, make([]byte, 16), sess, defaultEngine(), defaultLookup())
 	require.NoError(t, err)
 	require.Equal(t, PlanPostFilter, info.Plan)
@@ -340,7 +341,7 @@ func TestRewrite_SmallF_PreFilter(t *testing.T) {
 	customLookup := &customRowCountLookup{meta: defaultMeta(), rows: 1}
 	sql := `SELECT title FROM docs WHERE vec_match(embed, ?, 10) AND status = 'x' ORDER BY vec_distance(embed, ?) LIMIT 10`
 	stmt := parseSQL(t, sql)
-	sess := &stubSession{forcePlan: "auto", prefilterCap: 5000, fallback: "off"}
+	sess := &stubSession{forcePlan: "auto", prefilterCap: 5000, fallback: "off", useGoRank: true}
 	info, err := RewriteVectorQuery(stmt, make([]byte, 16), sess, defaultEngine(), customLookup)
 	require.NoError(t, err)
 	require.Equal(t, PlanPreFilter, info.Plan)
@@ -353,7 +354,7 @@ func TestRewrite_LargeF_PostFilter(t *testing.T) {
 	customLookup := &customRowCountLookup{meta: defaultMeta(), rows: 10_000_000}
 	sql := `SELECT title FROM docs WHERE vec_match(embed, ?, 10) AND status = 'x' ORDER BY vec_distance(embed, ?) LIMIT 10`
 	stmt := parseSQL(t, sql)
-	sess := &stubSession{forcePlan: "auto", prefilterCap: 5000, fallback: "off"}
+	sess := &stubSession{forcePlan: "auto", prefilterCap: 5000, fallback: "off", useGoRank: true}
 	info, err := RewriteVectorQuery(stmt, make([]byte, 16), sess, defaultEngine(), customLookup)
 	require.NoError(t, err)
 	require.Equal(t, PlanPostFilter, info.Plan)
@@ -392,7 +393,7 @@ func TestRewrite_PostFilter_BuildsGoRankPlan(t *testing.T) {
 	t.Parallel()
 	sql := `SELECT title FROM docs WHERE vec_match(embed, ?, 10) AND status = 'published' ORDER BY vec_distance(embed, ?) LIMIT 10`
 	stmt := parseSQL(t, sql)
-	sess := &stubSession{forcePlan: "post", prefilterCap: 5000, fallback: "off"}
+	sess := &stubSession{forcePlan: "post", prefilterCap: 5000, fallback: "off", useGoRank: true}
 	engine := &stubEngine{clusterIDs: []int64{3, 17, 22}}
 	info, err := RewriteVectorQuery(stmt, make([]byte, 16), sess, engine, defaultLookup())
 	require.NoError(t, err)
@@ -404,19 +405,20 @@ func TestRewrite_PostFilter_BuildsGoRankPlan(t *testing.T) {
 	require.Equal(t, "`status` = 'published'", info.GoRank.UserPredicateSQL)
 }
 
-// 17. Go-rank post-filter path does not emit SQL fallback plans.
-func TestRewrite_NoFallbackForGoRankPostFilter(t *testing.T) {
+// 17. Go-rank post-filter keeps the configured short-result fallback.
+func TestRewrite_FallbackForGoRankPostFilter(t *testing.T) {
 	t.Parallel()
 	sql := `SELECT title FROM docs WHERE vec_match(embed, ?, 10) AND status = 'x' ORDER BY vec_distance(embed, ?) LIMIT 10`
 	stmt := parseSQL(t, sql)
 	sess := &stubSession{forcePlan: "post", prefilterCap: 5000, fallback: "on"}
+	sess.useGoRank = true
 	info, err := RewriteVectorQuery(stmt, make([]byte, 16), sess, defaultEngine(), defaultLookup())
 	require.NoError(t, err)
 	require.Equal(t, PlanPostFilter, info.Plan)
 	require.NotNil(t, info.GoRank)
-	require.False(t, info.FallbackOn)
-	require.Nil(t, info.FallbackStmt)
-	require.Empty(t, info.FallbackSQL)
+	require.True(t, info.FallbackOn)
+	require.NotNil(t, info.FallbackStmt)
+	require.NotEmpty(t, info.FallbackSQL)
 }
 
 // 18. Fallback not populated when plan is pre-filter.
@@ -437,11 +439,79 @@ func TestRewrite_NoFallbackWhenOff(t *testing.T) {
 	t.Parallel()
 	sql := `SELECT title FROM docs WHERE vec_match(embed, ?, 10) AND status = 'x' ORDER BY vec_distance(embed, ?) LIMIT 10`
 	stmt := parseSQL(t, sql)
-	sess := &stubSession{forcePlan: "post", prefilterCap: 5000, fallback: "off"}
+	sess := &stubSession{forcePlan: "post", prefilterCap: 5000, fallback: "off", useGoRank: true}
 	info, err := RewriteVectorQuery(stmt, make([]byte, 16), sess, defaultEngine(), defaultLookup())
 	require.NoError(t, err)
 	require.Equal(t, PlanPostFilter, info.Plan)
 	require.False(t, info.FallbackOn)
+}
+
+func TestRewrite_CandidateBudgetComesFromVecMatchK(t *testing.T) {
+	t.Parallel()
+
+	stmt := parseSQL(t, `SELECT id FROM docs
+		WHERE vec_match(embed, ?, 100)
+		ORDER BY vec_distance(embed, ?)
+		LIMIT 10`)
+	info, err := RewriteVectorQuery(stmt, make([]byte, 16), defaultSession(), defaultEngine(), defaultLookup())
+	require.NoError(t, err)
+	require.NotNil(t, info)
+	require.Equal(t, 10, info.LimitK)
+	require.Equal(t, 100, info.CandidateK)
+	require.NotNil(t, info.GoRank)
+	require.Equal(t, 10, info.GoRank.LimitK)
+	require.Equal(t, 100, info.GoRank.CandidateK)
+}
+
+func TestRewrite_CandidateBudgetMustCoverLimit(t *testing.T) {
+	t.Parallel()
+
+	stmt := parseSQL(t, `SELECT id FROM docs
+		WHERE vec_match(embed, ?, 5)
+		ORDER BY vec_distance(embed, ?)
+		LIMIT 10`)
+	_, err := RewriteVectorQuery(stmt, make([]byte, 16), defaultSession(), defaultEngine(), defaultLookup())
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "MARMOT-VEC-021")
+}
+
+func TestRewrite_UseGoRankOffRoutesAutoPostFilterToPreFilter(t *testing.T) {
+	t.Parallel()
+
+	stmt := parseSQL(t, `SELECT title FROM docs
+		WHERE vec_match(embed, ?, 10) AND status = 'x'
+		ORDER BY vec_distance(embed, ?)
+		LIMIT 10`)
+	sess := &stubSession{forcePlan: "auto", prefilterCap: 1, fallback: "off", useGoRank: false}
+	info, err := RewriteVectorQuery(stmt, make([]byte, 16), sess, defaultEngine(), defaultLookup())
+	require.NoError(t, err)
+	require.Equal(t, PlanPreFilter, info.Plan)
+	require.Nil(t, info.GoRank)
+}
+
+func TestRewrite_ForcePostRequiresGoRank(t *testing.T) {
+	t.Parallel()
+
+	stmt := parseSQL(t, `SELECT title FROM docs
+		WHERE vec_match(embed, ?, 10) AND status = 'x'
+		ORDER BY vec_distance(embed, ?)
+		LIMIT 10`)
+	sess := &stubSession{forcePlan: "post", prefilterCap: 5000, fallback: "off", useGoRank: false}
+	_, err := RewriteVectorQuery(stmt, make([]byte, 16), sess, defaultEngine(), defaultLookup())
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "MARMOT-VEC-024")
+}
+
+func TestRewrite_VecMatchUnderOrRejected(t *testing.T) {
+	t.Parallel()
+
+	stmt := parseSQL(t, `SELECT title FROM docs
+		WHERE vec_match(embed, ?, 10) OR status = 'x'
+		ORDER BY vec_distance(embed, ?)
+		LIMIT 10`)
+	_, err := RewriteVectorQuery(stmt, make([]byte, 16), defaultSession(), defaultEngine(), defaultLookup())
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "MARMOT-VEC-024")
 }
 
 // --- helpers for test ---

@@ -33,7 +33,9 @@ type GoRankPlan struct {
 	// ScanBudgetRows is an optional test/legacy override. Production auto mode
 	// leaves it unset so selectProbeClusterIDs can adapt to index/query shape.
 	ScanBudgetRows int
-	K              int
+	K              int // final output row count; kept as a compatibility alias for LimitK
+	LimitK         int
+	CandidateK     int
 	Shortlist      int
 	Database       string
 	BaseTable      string
@@ -85,10 +87,17 @@ func BuildGoRankPlan(
 	nprobe int,
 	useBudgetProbe bool,
 	tableAlias string,
-	k int,
+	limitK int,
+	candidateK int,
 ) (*GoRankPlan, error) {
 	if len(queryVec)%4 != 0 {
 		return nil, fmt.Errorf("MARMOT-VEC-030: queryVec length %d is not a multiple of 4", len(queryVec))
+	}
+	if limitK < 1 {
+		return nil, fmt.Errorf("MARMOT-VEC-030: LIMIT must be positive")
+	}
+	if candidateK < limitK {
+		return nil, fmt.Errorf("MARMOT-VEC-030: vec_match candidate budget %d is smaller than LIMIT %d", candidateK, limitK)
 	}
 
 	// Convert bytes → []float32 (allocate once, little-endian).
@@ -168,8 +177,10 @@ func BuildGoRankPlan(
 		RankMetric:     metricKindToRankMetric(metricKind),
 		Nprobe:         nprobe,
 		UseBudgetProbe: useBudgetProbe,
-		K:              k,
-		Shortlist:      exactRerankShortlist(k),
+		K:              limitK,
+		LimitK:         limitK,
+		CandidateK:     candidateK,
+		Shortlist:      exactRerankShortlist(limitK),
 		Database:       meta.Database,
 		BaseTable:      meta.TableName,
 		BaseAlias:      tableAlias,
@@ -206,17 +217,6 @@ func (h *CoordinatorHandler) executeGoRankPlan(
 	plan *GoRankPlan,
 	rewrittenArgs []interface{},
 ) (*protocol.ResultSet, error) {
-	items, ok, err := h.segmentRank(plan)
-	if err != nil {
-		return nil, err
-	}
-	if !ok {
-		return nil, fmt.Errorf("MARMOT-VEC-030: local vector store unavailable for index %q", plan.IndexName)
-	}
-	if len(items) == 0 {
-		return &protocol.ResultSet{}, nil
-	}
-
 	// Vector read path: use the read-only pool (multiple connections, WAL
 	// concurrent readers). The write handle is single-conn + _txlock=immediate
 	// and would serialise every ranked lookup against every other reader and
@@ -244,9 +244,26 @@ func (h *CoordinatorHandler) executeGoRankPlan(
 		return nil, err
 	}
 
-	items, err = h.exactRerankCandidates(queryCtx, readConn, plan, userArgs, items)
-	if err != nil {
-		return nil, err
+	var items []rankItem
+	for {
+		var ok bool
+		items, ok, err = h.segmentRank(plan)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return nil, fmt.Errorf("MARMOT-VEC-030: local vector store unavailable for index %q", plan.IndexName)
+		}
+		if len(items) == 0 {
+			return &protocol.ResultSet{}, nil
+		}
+		items, err = h.exactRerankCandidates(queryCtx, readConn, plan, userArgs, items)
+		if err != nil {
+			return nil, err
+		}
+		if !plan.HasUserPredicate || len(items) >= plan.finalLimit() || !plan.growRefillBudget() {
+			break
+		}
 	}
 	if rs, ok, err := h.tryDirectPKResult(plan, items); err != nil {
 		return nil, err
@@ -254,6 +271,34 @@ func (h *CoordinatorHandler) executeGoRankPlan(
 		return rs, nil
 	}
 	return h.fetchProjectionByRowID(queryCtx, readConn, plan, userArgs, items)
+}
+
+const goRankRefillMaxCandidateK = 4096
+
+func (p *GoRankPlan) growRefillBudget() bool {
+	if p == nil {
+		return false
+	}
+	current := p.candidateBudget()
+	if current <= 0 {
+		current = p.finalLimit()
+	}
+	maxBudget := goRankRefillMaxCandidateK
+	if p.CandidateK > maxBudget {
+		maxBudget = p.CandidateK
+	}
+	if current >= maxBudget {
+		return false
+	}
+	next := current * 2
+	if next < current+1 {
+		next = current + 1
+	}
+	if next > maxBudget {
+		next = maxBudget
+	}
+	p.CandidateK = next
+	return true
 }
 
 func resolvePlanArgs(plan *GoRankPlan, rewrittenArgs []interface{}) ([]interface{}, error) {
@@ -365,7 +410,7 @@ func autoProbePolicy(plan *GoRankPlan, encoding int64, centroidCount int) probeS
 	if nlist <= 0 || nlist > centroidCount {
 		nlist = centroidCount
 	}
-	minProbe := autoProbePartitionCount(nlist, target, plan.K, plan.IndexSpec.Metric, encoding)
+	minProbe := autoProbePartitionCount(nlist, target, plan.candidateBudget(), plan.IndexSpec.Metric, encoding)
 	if plan.Nprobe > minProbe {
 		minProbe = plan.Nprobe
 	}
@@ -760,6 +805,9 @@ func (h *CoordinatorHandler) segmentRank(plan *GoRankPlan) ([]rankItem, bool, er
 type blockPruneMode int
 
 const (
+	// blockPruneSafe is safe only relative to Marmot's compressed approximate
+	// candidate scan. It is not an exact-recall guarantee; exact rerank only
+	// sees the approximate shortlist that survives this stage.
 	blockPruneSafe blockPruneMode = iota
 	blockPruneOff
 	blockPruneShadow
@@ -783,7 +831,7 @@ type blockPruneCounters struct {
 
 func currentBlockPruneMode() blockPruneMode {
 	switch strings.ToLower(os.Getenv("MARMOT_VEC_BLOCK_PRUNE_MODE")) {
-	case "safe":
+	case "safe", "approx-safe", "approx_safe":
 		return blockPruneSafe
 	case "shadow":
 		return blockPruneShadow
@@ -1076,20 +1124,48 @@ func rankShortlistLimit(plan *GoRankPlan) int {
 	if plan == nil {
 		return 0
 	}
-	if plan.Shortlist > plan.K {
+	limit := plan.finalLimit()
+	if plan.Shortlist > limit {
 		return plan.Shortlist
 	}
-	return plan.K
+	return limit
 }
 
 func rankShortlistLimitForEncoding(plan *GoRankPlan, enc int64) int {
 	limit := rankShortlistLimit(plan)
-	if plan == nil || enc != vecindex.MemberEncodingResidualPQ8 {
+	if plan == nil {
 		return limit
 	}
-	pqLimit := pqExactRerankShortlist(plan.K)
+	if candidateK := plan.candidateBudget(); candidateK > limit {
+		limit = candidateK
+	}
+	if enc != vecindex.MemberEncodingResidualPQ8 {
+		return limit
+	}
+	pqLimit := pqExactRerankShortlist(plan.finalLimit())
 	if pqLimit > limit {
 		return pqLimit
+	}
+	return limit
+}
+
+func (p *GoRankPlan) finalLimit() int {
+	if p == nil {
+		return 0
+	}
+	if p.LimitK > 0 {
+		return p.LimitK
+	}
+	return p.K
+}
+
+func (p *GoRankPlan) candidateBudget() int {
+	if p == nil {
+		return 0
+	}
+	limit := p.finalLimit()
+	if p.CandidateK > limit {
+		return p.CandidateK
 	}
 	return limit
 }
@@ -1105,10 +1181,9 @@ func (h *CoordinatorHandler) exactRerankCandidates(
 	userArgs []interface{},
 	candidates []rankItem,
 ) ([]rankItem, error) {
-	if len(candidates) <= plan.K {
-		return candidates, nil
+	if len(candidates) == 0 {
+		return nil, nil
 	}
-
 	var sb strings.Builder
 	alias := plan.alias()
 	sb.WriteString("SELECT `")
@@ -1143,7 +1218,7 @@ func (h *CoordinatorHandler) exactRerankCandidates(
 	}
 	defer rows.Close()
 
-	topK := newTopKHeap(plan.K)
+	topK := newTopKHeap(plan.finalLimit())
 	for rows.Next() {
 		var rowid int64
 		var raw sql.RawBytes
@@ -1272,7 +1347,7 @@ func (h *CoordinatorHandler) fetchProjectionByRowID(
 		fsb.WriteString(strconv.Itoa(i + 1))
 	}
 	fsb.WriteString(" END LIMIT ")
-	fsb.WriteString(strconv.Itoa(plan.K))
+	fsb.WriteString(strconv.Itoa(plan.finalLimit()))
 
 	finalRows, err := conn.QueryContext(ctx, fsb.String(), userArgs...)
 	if err != nil {

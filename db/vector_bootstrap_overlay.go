@@ -46,7 +46,7 @@ func computeCentroidsFromOverlaySnapshot(
 	if initSize > nTotal {
 		initSize = nTotal
 	}
-	samples, err := collectOverlayReservoirSample(snapshot, cutoff, initSize, spec.Seed)
+	samples, err := collectOverlayReservoirSample(snapshot, cutoff, initSize, spec.Seed, spec.InternalDim())
 	if err != nil {
 		return nil, fmt.Errorf("overlay bootstrap sample: %w", err)
 	}
@@ -72,7 +72,7 @@ func computeCentroidsFromOverlaySnapshot(
 	var bestCentroids [][]float32
 	bestShift := float32(1 << 30)
 	for iter := 0; iter < opts.MaxIter; iter++ {
-		result, err := runMiniBatchOverlayTrainerPass(snapshot, cutoff, opts.BatchSize, trainer, spec.Seed^uint64(iter+1))
+		result, err := runMiniBatchOverlayTrainerPass(snapshot, cutoff, opts.BatchSize, spec.InternalDim(), trainer, spec.Seed^uint64(iter+1))
 		if err != nil {
 			return nil, fmt.Errorf("overlay bootstrap trainer pass %d: %w", iter+1, err)
 		}
@@ -96,7 +96,7 @@ func computeCentroidsFromOverlaySnapshot(
 		}
 	}
 	for extra := 0; extra < 4 && (lastResult.Repaired || !trainerClusterShapeAcceptable(trainer.Counts(), targetClusterSize)); extra++ {
-		result, err := runMiniBatchOverlayTrainerPass(snapshot, cutoff, opts.BatchSize, trainer, spec.Seed^uint64(opts.MaxIter+extra+1))
+		result, err := runMiniBatchOverlayTrainerPass(snapshot, cutoff, opts.BatchSize, spec.InternalDim(), trainer, spec.Seed^uint64(opts.MaxIter+extra+1))
 		if err != nil {
 			return nil, fmt.Errorf("overlay bootstrap repair pass %d: %w", extra+1, err)
 		}
@@ -167,16 +167,21 @@ func BuildBootstrapSegmentGenerationFromOverlay(
 	}
 	defer rowMapWriter.Abort()
 
-	clusterEntries := make([][]incrementalClusterEntry, maxCluster+1)
 	clusterRowCounts := make([]uint64, maxCluster+1)
 	clusterVectorSums := make([][]float32, maxCluster+1)
-	codecReservoir, err := newStableCodecReservoir(spec.Seed^probeCS.Epoch(), spec.InternalDim())
-	if err != nil {
-		return nil, fmt.Errorf("bootstrap segment generation: stable codec reservoir: %w", err)
+	var codecReservoir *stableCodecReservoir
+	if spec.InternalDim() >= vecindex.StablePQMinInternalDim {
+		codecReservoir, err = newStableCodecReservoir(spec.Seed^probeCS.Epoch(), spec.InternalDim())
+		if err != nil {
+			return nil, fmt.Errorf("bootstrap segment generation: stable codec reservoir: %w", err)
+		}
+		defer codecReservoir.Close()
 	}
-	defer codecReservoir.Close()
+	spools := newCatchUpSpoolSet(dir, maxCluster)
+	defer spools.Cleanup()
 	var visitErr error
-	overlaySnapshot.VisitMutationsAfter(0, func(mutation vecindex.OverlayMutation) bool {
+	var scratch []byte
+	scratch, err = overlaySnapshot.VisitMutationsAfterBuffered(0, scratch, func(mutation vecindex.OverlayMutation) bool {
 		if cutoffSequence > 0 && mutation.Sequence > cutoffSequence {
 			return false
 		}
@@ -188,11 +193,13 @@ func BuildBootstrapSegmentGenerationFromOverlay(
 			visitErr = fmt.Errorf("bootstrap segment generation: assign rowid %d: %w", mutation.RowID, err)
 			return false
 		}
-		codecReservoir.Add(clusterID, mutation.Vec)
-		clusterEntries[clusterID] = append(clusterEntries[clusterID], incrementalClusterEntry{
-			rowID: mutation.RowID,
-			vec:   append([]byte(nil), mutation.Vec...),
-		})
+		if codecReservoir != nil {
+			codecReservoir.Add(clusterID, mutation.Vec)
+		}
+		if err := spools.Write(clusterID, mutation.RowID, mutation.Vec); err != nil {
+			visitErr = fmt.Errorf("bootstrap segment generation: spool rowid %d: %w", mutation.RowID, err)
+			return false
+		}
 		clusterRowCounts[clusterID]++
 		if clusterVectorSums[clusterID] == nil {
 			clusterVectorSums[clusterID] = make([]float32, spec.InternalDim())
@@ -203,8 +210,15 @@ func BuildBootstrapSegmentGenerationFromOverlay(
 		}
 		return true
 	})
+	_ = scratch
+	if err != nil {
+		return nil, fmt.Errorf("bootstrap segment generation: read overlay: %w", err)
+	}
 	if visitErr != nil {
 		return nil, visitErr
+	}
+	if err := spools.CloseAll(); err != nil {
+		return nil, fmt.Errorf("bootstrap segment generation: close spools: %w", err)
 	}
 	stableCodec, stableCodecBlob, err := buildStableMemberCodec(spec, probeCS, codecReservoir)
 	if err != nil {
@@ -240,37 +254,33 @@ func BuildBootstrapSegmentGenerationFromOverlay(
 	defer blockWriter.Abort()
 
 	rowLocs := make([]rowLoc, 0)
+	var spoolReadBuf []byte
 	for _, clusterID := range segmentClusterWriteOrder(spec, probeCS, hotClusterScores) {
-		entries := clusterEntries[clusterID]
-		if len(entries) == 0 {
+		spool := spools.spools[clusterID]
+		if spool == nil {
 			continue
 		}
-		slices.SortFunc(entries, func(a, b incrementalClusterEntry) int {
-			switch {
-			case a.rowID < b.rowID:
-				return -1
-			case a.rowID > b.rowID:
-				return 1
-			default:
-				return 0
-			}
-		})
-		for _, entry := range entries {
-			enc, encoded, err := stableCodec.Encode(clusterID, entry.vec)
+		var readErr error
+		spoolReadBuf, readErr = visitCatchUpSpoolRowsBuffered(spool, spec, spoolReadBuf, func(rowID int64, prepared []byte) error {
+			enc, encoded, err := stableCodec.Encode(clusterID, prepared)
 			if err != nil {
-				return nil, fmt.Errorf("bootstrap segment generation: encode rowid %d: %w", entry.rowID, err)
+				return fmt.Errorf("bootstrap segment generation: encode rowid %d: %w", rowID, err)
 			}
 			if enc != stableCodec.Encoding() {
-				return nil, fmt.Errorf("bootstrap segment generation: unexpected stable encoding %d for rowid %d", enc, entry.rowID)
+				return fmt.Errorf("bootstrap segment generation: unexpected stable encoding %d for rowid %d", enc, rowID)
 			}
 			offset := dataWriter.NextOffset()
-			if err := dataWriter.Append(clusterID, entry.rowID, encoded); err != nil {
-				return nil, fmt.Errorf("bootstrap segment generation: append rowid %d: %w", entry.rowID, err)
+			if err := dataWriter.Append(clusterID, rowID, encoded); err != nil {
+				return fmt.Errorf("bootstrap segment generation: append rowid %d: %w", rowID, err)
 			}
-			if err := blockWriter.Append(clusterID, entry.rowID, offset, dataWriter.EntrySize(), encoded); err != nil {
-				return nil, fmt.Errorf("bootstrap segment generation: append block rowid %d: %w", entry.rowID, err)
+			if err := blockWriter.Append(clusterID, rowID, offset, dataWriter.EntrySize(), encoded); err != nil {
+				return fmt.Errorf("bootstrap segment generation: append block rowid %d: %w", rowID, err)
 			}
-			rowLocs = append(rowLocs, rowLoc{rowID: entry.rowID, clusterID: clusterID, offset: offset})
+			rowLocs = append(rowLocs, rowLoc{rowID: rowID, clusterID: clusterID, offset: offset})
+			return nil
+		})
+		if readErr != nil {
+			return nil, readErr
 		}
 	}
 	dataStore, err := dataWriter.Close()
@@ -370,11 +380,11 @@ func countOverlayPreparedVectors(snapshot *vecindex.OverlaySnapshot, cutoff uint
 		return 0
 	}
 	count := 0
-	snapshot.VisitMutationsAfter(0, func(mutation vecindex.OverlayMutation) bool {
+	snapshot.VisitMutationHeadersAfterUnordered(0, func(mutation vecindex.OverlayMutation) bool {
 		if cutoff > 0 && mutation.Sequence > cutoff {
-			return false
+			return true
 		}
-		if mutation.Kind != vecindex.OverlayMutationDelete && len(mutation.Vec) > 0 {
+		if mutation.Kind != vecindex.OverlayMutationDelete {
 			count++
 		}
 		return true
@@ -389,8 +399,8 @@ func overlayPreparedVectorCutoffSequence(snapshot *vecindex.OverlaySnapshot, max
 	count := 0
 	cutoff := uint64(0)
 	stopped := false
-	snapshot.VisitMutationsAfter(0, func(mutation vecindex.OverlayMutation) bool {
-		if mutation.Kind == vecindex.OverlayMutationDelete || len(mutation.Vec) == 0 {
+	snapshot.VisitMutationHeadersAfter(0, func(mutation vecindex.OverlayMutation) bool {
+		if mutation.Kind == vecindex.OverlayMutationDelete {
 			return true
 		}
 		count++
@@ -410,14 +420,17 @@ func overlayPreparedVectorCutoffSequence(snapshot *vecindex.OverlaySnapshot, max
 	return cutoff, count
 }
 
-func collectOverlayReservoirSample(snapshot *vecindex.OverlaySnapshot, cutoff uint64, want int, seed uint64) ([][]float32, error) {
-	if snapshot == nil || want <= 0 {
+func collectOverlayReservoirSample(snapshot *vecindex.OverlaySnapshot, cutoff uint64, want int, seed uint64, dim int) ([][]float32, error) {
+	if snapshot == nil || want <= 0 || dim <= 0 {
 		return nil, nil
 	}
 	sample := make([][]float32, 0, want)
+	backing := make([]float32, want*dim)
 	var seen int
 	rng := rand.New(rand.NewSource(int64(seed ^ 0x6a09e667f3bcc909)))
-	snapshot.VisitMutationsAfter(0, func(mutation vecindex.OverlayMutation) bool {
+	var visitErr error
+	var scratch []byte
+	scratch, err := snapshot.VisitMutationsAfterBuffered(0, scratch, func(mutation vecindex.OverlayMutation) bool {
 		if cutoff > 0 && mutation.Sequence > cutoff {
 			return false
 		}
@@ -425,17 +438,31 @@ func collectOverlayReservoirSample(snapshot *vecindex.OverlaySnapshot, cutoff ui
 			return true
 		}
 		vec := metric.BytesToFloat32(mutation.Vec)
+		if len(vec) != dim {
+			visitErr = fmt.Errorf("overlay bootstrap sample: vector dim=%d want=%d", len(vec), dim)
+			return false
+		}
 		if len(sample) < want {
-			sample = append(sample, append([]float32(nil), vec...))
+			slot := len(sample)
+			dst := backing[slot*dim : (slot+1)*dim]
+			copy(dst, vec)
+			sample = append(sample, dst)
 		} else {
 			j := int(rng.Uint64() % uint64(seen+1))
 			if j < want {
-				sample[j] = append(sample[j][:0], vec...)
+				copy(sample[j], vec)
 			}
 		}
 		seen++
 		return true
 	})
+	_ = scratch
+	if err != nil {
+		return nil, err
+	}
+	if visitErr != nil {
+		return nil, visitErr
+	}
 	return sample, nil
 }
 
@@ -443,6 +470,7 @@ func runMiniBatchOverlayTrainerPass(
 	snapshot *vecindex.OverlaySnapshot,
 	cutoff uint64,
 	batchSize int,
+	dim int,
 	trainer *kmeans.MiniBatchBalancedTrainer,
 	seed uint64,
 ) (kmeans.MiniBatchPassResult, error) {
@@ -450,15 +478,25 @@ func runMiniBatchOverlayTrainerPass(
 		return kmeans.MiniBatchPassResult{}, err
 	}
 	batch := make([][]float32, 0, batchSize)
+	batchBacking := make([]float32, batchSize*dim)
 	var observeErr error
-	snapshot.VisitMutationsAfter(0, func(mutation vecindex.OverlayMutation) bool {
+	var scratch []byte
+	scratch, err := snapshot.VisitMutationsAfterBuffered(0, scratch, func(mutation vecindex.OverlayMutation) bool {
 		if cutoff > 0 && mutation.Sequence > cutoff {
 			return false
 		}
 		if mutation.Kind == vecindex.OverlayMutationDelete || len(mutation.Vec) == 0 {
 			return true
 		}
-		batch = append(batch, metric.BytesToFloat32(mutation.Vec))
+		vec := metric.BytesToFloat32(mutation.Vec)
+		if len(vec) != dim {
+			observeErr = fmt.Errorf("overlay bootstrap trainer: vector dim=%d want=%d", len(vec), dim)
+			return false
+		}
+		slot := len(batch)
+		dst := batchBacking[slot*dim : (slot+1)*dim]
+		copy(dst, vec)
+		batch = append(batch, dst)
 		if len(batch) < batchSize {
 			return true
 		}
@@ -469,6 +507,10 @@ func runMiniBatchOverlayTrainerPass(
 		batch = batch[:0]
 		return true
 	})
+	_ = scratch
+	if err != nil {
+		return kmeans.MiniBatchPassResult{}, err
+	}
 	if observeErr != nil {
 		return kmeans.MiniBatchPassResult{}, observeErr
 	}

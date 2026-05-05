@@ -281,8 +281,44 @@ func TestCurrentBlockPruneModeDefaultsOff(t *testing.T) {
 		t.Fatalf("currentBlockPruneMode() = %v, want safe", got)
 	}
 
+	t.Setenv("MARMOT_VEC_BLOCK_PRUNE_MODE", "approx_safe")
+	if got := currentBlockPruneMode(); got != blockPruneSafe {
+		t.Fatalf("currentBlockPruneMode() = %v, want approx-safe", got)
+	}
+
 	t.Setenv("MARMOT_VEC_BLOCK_PRUNE_MODE", "shadow")
 	if got := currentBlockPruneMode(); got != blockPruneShadow {
 		t.Fatalf("currentBlockPruneMode() = %v, want shadow", got)
+	}
+}
+
+func TestRankShortlistUsesCandidateBudget(t *testing.T) {
+	t.Parallel()
+
+	plan := &GoRankPlan{K: 10, LimitK: 10, CandidateK: 100, Shortlist: exactRerankShortlist(10)}
+	if got := rankShortlistLimitForEncoding(plan, vecindex.MemberEncodingResidualInt8); got != 100 {
+		t.Fatalf("int8 shortlist = %d, want explicit candidate budget 100", got)
+	}
+	if got := rankShortlistLimitForEncoding(plan, vecindex.MemberEncodingResidualPQ8); got != 144 {
+		t.Fatalf("pq shortlist = %d, want max(default pq, candidate) 144", got)
+	}
+
+	plan.CandidateK = 800
+	if got := rankShortlistLimitForEncoding(plan, vecindex.MemberEncodingResidualPQ8); got != 800 {
+		t.Fatalf("pq shortlist = %d, want explicit candidate budget 800", got)
+	}
+}
+
+func TestGrowRefillBudgetWidensToInternalCap(t *testing.T) {
+	t.Parallel()
+
+	plan := &GoRankPlan{K: 10, LimitK: 10, CandidateK: 100}
+	if !plan.growRefillBudget() || plan.CandidateK != 200 {
+		t.Fatalf("first refill CandidateK=%d, want 200", plan.CandidateK)
+	}
+	for plan.growRefillBudget() {
+	}
+	if plan.CandidateK != goRankRefillMaxCandidateK {
+		t.Fatalf("final refill CandidateK=%d, want cap %d", plan.CandidateK, goRankRefillMaxCandidateK)
 	}
 }

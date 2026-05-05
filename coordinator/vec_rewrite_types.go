@@ -19,7 +19,9 @@ type RewriteInfo struct {
 	TableName  string
 	ColumnName string
 	Metric     string // "l2" | "cosine" | "dot"
-	K          int    // from LIMIT clause
+	K          int    // final output row count; kept as a compatibility alias for LimitK
+	LimitK     int    // from LIMIT clause
+	CandidateK int    // from vec_match(..., k)
 
 	// Primary statement executed by the handler. PrimarySQL still contains the
 	// original `?` placeholders for vec_distance (vec_match was structurally
