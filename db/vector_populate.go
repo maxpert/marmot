@@ -117,6 +117,7 @@ func computeCentroids(
 		BatchSize:         min(max(4096, targetClusterSize*4), 16384),
 		MaxIter:           kmeans.DefaultMiniBatchMaxIter,
 		TargetClusterSize: targetClusterSize,
+		Metric:            spec.InternalMetric(),
 	}
 	if len(initCentroids) > actualK {
 		initCentroids = initCentroids[:actualK]
@@ -136,12 +137,12 @@ func computeCentroids(
 		if len(samples) == 0 {
 			return nil, nil
 		}
-		initCentroids, err = kmeans.KMeansPlusPlus(samples, actualK, spec.Seed, 1)
+		initCentroids, err = kmeans.KMeansPlusPlusWithMetric(samples, actualK, spec.Seed, 1, spec.InternalMetric())
 		if err != nil {
 			return nil, fmt.Errorf("compute centroids: init mini-batch centroids: %w", err)
 		}
 	} else if len(initCentroids) < actualK {
-		initCentroids, err = supplementMiniBatchCentroids(initCentroids, samples, actualK, spec.Seed)
+		initCentroids, err = supplementMiniBatchCentroids(initCentroids, samples, actualK, spec.Seed, spec.InternalMetric())
 		if err != nil {
 			return nil, fmt.Errorf("compute centroids: extend warm start: %w", err)
 		}
@@ -275,7 +276,7 @@ func trainerClusterShapeAcceptable(counts []int64, targetClusterSize int) bool {
 	return p95 <= int64(float64(targetClusterSize)*repairP95Factor)
 }
 
-func supplementMiniBatchCentroids(initCentroids [][]float32, samples [][]float32, want int, seed uint64) ([][]float32, error) {
+func supplementMiniBatchCentroids(initCentroids [][]float32, samples [][]float32, want int, seed uint64, distanceMetric metric.Metric) ([][]float32, error) {
 	if len(initCentroids) >= want {
 		return initCentroids[:want], nil
 	}
@@ -296,7 +297,7 @@ func supplementMiniBatchCentroids(initCentroids [][]float32, samples [][]float32
 			if _, ok := used[sampleIdx]; ok {
 				continue
 			}
-			score := minDistanceToCentroids(samples[sampleIdx], centroids)
+			score := minDistanceToCentroids(samples[sampleIdx], centroids, distanceMetric)
 			if best == -1 || score > bestScore {
 				best = sampleIdx
 				bestScore = score
@@ -313,15 +314,11 @@ func supplementMiniBatchCentroids(initCentroids [][]float32, samples [][]float32
 	return centroids, nil
 }
 
-func minDistanceToCentroids(vec []float32, centroids [][]float32) float32 {
+func minDistanceToCentroids(vec []float32, centroids [][]float32, distanceMetric metric.Metric) float32 {
 	best := float32(0)
 	initialized := false
 	for _, centroid := range centroids {
-		var dist float32
-		for i := range vec {
-			diff := vec[i] - centroid[i]
-			dist += diff * diff
-		}
+		dist := metric.Distance(distanceMetric, vec, centroid)
 		if !initialized || dist < best {
 			best = dist
 			initialized = true

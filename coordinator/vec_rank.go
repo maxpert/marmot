@@ -30,6 +30,8 @@ type GoRankPlan struct {
 	RankMetric     metric.Metric
 	Nprobe         int
 	UseBudgetProbe bool
+	// ScanBudgetRows is an optional test/legacy override. Production auto mode
+	// leaves it unset so selectProbeClusterIDs can adapt to index/query shape.
 	ScanBudgetRows int
 	K              int
 	Shortlist      int
@@ -166,7 +168,6 @@ func BuildGoRankPlan(
 		RankMetric:     metricKindToRankMetric(metricKind),
 		Nprobe:         nprobe,
 		UseBudgetProbe: useBudgetProbe,
-		ScanBudgetRows: defaultProbeScanBudgetRows(meta.TargetPartitionSize),
 		K:              k,
 		Shortlist:      exactRerankShortlist(k),
 		Database:       meta.Database,
@@ -278,7 +279,7 @@ func metricKindToRankMetric(m metric.Metric) metric.Metric {
 
 func defaultProbeScanBudgetRows(targetPartitionSize int) int {
 	if targetPartitionSize <= 0 {
-		targetPartitionSize = 512
+		targetPartitionSize = common.DefaultVectorTargetPartitionSize
 	}
 	budget := 8192
 	if widened := 16 * targetPartitionSize; widened > budget {
@@ -287,8 +288,136 @@ func defaultProbeScanBudgetRows(targetPartitionSize int) int {
 	return budget
 }
 
-func pqProbeScanBudgetRows(targetPartitionSize int) int {
-	return defaultProbeScanBudgetRows(targetPartitionSize)
+type probeSelectionPolicy struct {
+	budgetRows uint64
+	minProbe   int
+	maxProbe   int
+}
+
+func probeTargetPartitionSize(targetPartitionSize int) int {
+	if targetPartitionSize <= 0 {
+		return common.DefaultVectorTargetPartitionSize
+	}
+	return targetPartitionSize
+}
+
+func ceilDivInt(n, d int) int {
+	if d <= 0 {
+		return 0
+	}
+	return (n + d - 1) / d
+}
+
+func ceilSqrtInt(n int) int {
+	if n <= 0 {
+		return 0
+	}
+	return int(math.Ceil(math.Sqrt(float64(n))))
+}
+
+func scaleProbeCount(n, numerator, denominator int) int {
+	if n <= 0 || numerator <= 0 || denominator <= 0 {
+		return n
+	}
+	return ceilDivInt(n*numerator, denominator)
+}
+
+func autoProbePartitionCount(nlist, targetPartitionSize, k int, metricKind metric.Metric, encoding int64) int {
+	if nlist <= 0 {
+		return 1
+	}
+	target := probeTargetPartitionSize(targetPartitionSize)
+	partitions := ceilDivInt(defaultProbeScanBudgetRows(target), target)
+	if nlistFloor := ceilSqrtInt(nlist); nlistFloor > partitions {
+		partitions = nlistFloor
+	}
+	if k > 0 {
+		// Larger K needs a broader IVF prefix to keep enough candidates alive
+		// for exact rerank after approximate stable scoring.
+		if kFloor := ceilDivInt(k*64, target); kFloor > partitions {
+			partitions = kFloor
+		}
+	}
+	switch metricKind {
+	case metric.MetricCosine:
+		partitions = scaleProbeCount(partitions, 5, 4)
+	case metric.MetricDot:
+		partitions = scaleProbeCount(partitions, 3, 2)
+	}
+	if encoding == vecindex.MemberEncodingResidualPQ8 {
+		partitions = scaleProbeCount(partitions, 6, 5)
+	}
+	if partitions < 1 {
+		partitions = 1
+	}
+	if partitions > nlist {
+		partitions = nlist
+	}
+	return partitions
+}
+
+func autoProbePolicy(plan *GoRankPlan, encoding int64, centroidCount int) probeSelectionPolicy {
+	if centroidCount <= 0 {
+		return probeSelectionPolicy{}
+	}
+	target := probeTargetPartitionSize(plan.TargetPartitionSize)
+	nlist := plan.IndexSpec.Nlist
+	if nlist <= 0 || nlist > centroidCount {
+		nlist = centroidCount
+	}
+	minProbe := autoProbePartitionCount(nlist, target, plan.K, plan.IndexSpec.Metric, encoding)
+	if plan.Nprobe > minProbe {
+		minProbe = plan.Nprobe
+	}
+	if minProbe > centroidCount {
+		minProbe = centroidCount
+	}
+	maxProbe := minProbe * 4
+	if maxProbe < 32 {
+		maxProbe = 32
+	}
+	if maxProbe > centroidCount {
+		maxProbe = centroidCount
+	}
+	return probeSelectionPolicy{
+		budgetRows: uint64(minProbe) * uint64(target),
+		minProbe:   minProbe,
+		maxProbe:   maxProbe,
+	}
+}
+
+func rowBudgetProbePolicy(plan *GoRankPlan, centroidCount int) probeSelectionPolicy {
+	if centroidCount <= 0 {
+		return probeSelectionPolicy{}
+	}
+	target := probeTargetPartitionSize(plan.TargetPartitionSize)
+	budget := uint64(plan.ScanBudgetRows)
+	if budget == 0 {
+		budget = uint64(defaultProbeScanBudgetRows(target))
+	}
+	minProbe := plan.Nprobe
+	if minProbe <= 0 {
+		minProbe = 1
+	}
+	if minProbe > centroidCount {
+		minProbe = centroidCount
+	}
+	estimatedProbe := int((budget + uint64(target) - 1) / uint64(target))
+	maxProbe := estimatedProbe * 4
+	if maxProbe < minProbe {
+		maxProbe = minProbe
+	}
+	if maxProbe < 32 {
+		maxProbe = 32
+	}
+	if maxProbe > centroidCount {
+		maxProbe = centroidCount
+	}
+	return probeSelectionPolicy{
+		budgetRows: budget,
+		minProbe:   minProbe,
+		maxProbe:   maxProbe,
+	}
 }
 
 func loadLiveClusterRowCounts(state *vecindex.IndexState, segments *vecindex.SegmentGeneration) []uint64 {
@@ -335,38 +464,23 @@ func selectProbeClusterIDs(
 	if !plan.UseBudgetProbe {
 		return refreshFixedProbeClusterIDs(plan, state)
 	}
+	encoding := int64(vecindex.MemberEncodingResidualInt8)
+	if segments != nil && segments.Data != nil {
+		encoding = segments.Data.Encoding()
+	}
+	policy := autoProbePolicy(plan, encoding, centroids.Len())
+	if plan.ScanBudgetRows > 0 {
+		policy = rowBudgetProbePolicy(plan, centroids.Len())
+	}
 	counts := loadLiveClusterRowCounts(state, segments)
 	if !probeCountsUsable(counts, centroids) {
+		if plan.ScanBudgetRows == 0 {
+			return refreshAutoProbeClusterIDs(plan, state, centroids, policy.minProbe)
+		}
 		return refreshFixedProbeClusterIDs(plan, state)
 	}
-	budget := uint64(plan.ScanBudgetRows)
-	if budget == 0 {
-		budget = uint64(defaultProbeScanBudgetRows(plan.TargetPartitionSize))
-	}
-	if segments != nil && segments.Data != nil && segments.Data.Encoding() == vecindex.MemberEncodingResidualPQ8 {
-		budget = uint64(pqProbeScanBudgetRows(plan.TargetPartitionSize))
-	}
 	rowCounts := counts[1:]
-	target := plan.TargetPartitionSize
-	if target <= 0 {
-		target = 512
-	}
-	minProbe := plan.Nprobe
-	if minProbe <= 0 {
-		minProbe = 1
-	}
-	estimatedProbe := int((budget + uint64(target) - 1) / uint64(target))
-	maxProbe := estimatedProbe * 4
-	if maxProbe < minProbe {
-		maxProbe = minProbe
-	}
-	if maxProbe < 32 {
-		maxProbe = 32
-	}
-	if maxProbe > centroids.Len() {
-		maxProbe = centroids.Len()
-	}
-	ids, _, err := centroids.AssignTopNUntilBudget(plan.QueryVec, rowCounts, budget, minProbe, maxProbe, plan.IndexSpec.InternalMetric())
+	ids, _, err := centroids.AssignTopNUntilBudget(plan.QueryVec, rowCounts, policy.budgetRows, policy.minProbe, policy.maxProbe, plan.IndexSpec.InternalMetric())
 	if err != nil || len(ids) == 0 {
 		return refreshFixedProbeClusterIDs(plan, state)
 	}
@@ -374,8 +488,8 @@ func selectProbeClusterIDs(
 	for _, id := range ids {
 		cumulative += rowCounts[id]
 	}
-	if cumulative < budget && maxProbe < centroids.Len() {
-		ids, _, err = centroids.AssignTopNUntilBudget(plan.QueryVec, rowCounts, budget, minProbe, centroids.Len(), plan.IndexSpec.InternalMetric())
+	if cumulative < policy.budgetRows && policy.maxProbe < centroids.Len() {
+		ids, _, err = centroids.AssignTopNUntilBudget(plan.QueryVec, rowCounts, policy.budgetRows, policy.minProbe, centroids.Len(), plan.IndexSpec.InternalMetric())
 		if err != nil || len(ids) == 0 {
 			return refreshFixedProbeClusterIDs(plan, state)
 		}
@@ -387,6 +501,22 @@ func selectProbeClusterIDs(
 	}
 	if len(selected) == 0 {
 		return refreshFixedProbeClusterIDs(plan, state)
+	}
+	plan.ProbeEpoch = centroids.Epoch()
+	return selected
+}
+
+func refreshAutoProbeClusterIDs(plan *GoRankPlan, state *vecindex.IndexState, centroids *kmeans.CentroidSet, nprobe int) []int64 {
+	if plan == nil || state == nil || centroids == nil || nprobe <= 0 || len(plan.QueryVec) == 0 {
+		return refreshFixedProbeClusterIDs(plan, state)
+	}
+	ids, _, err := centroids.AssignTopN(plan.QueryVec, nprobe, plan.IndexSpec.InternalMetric())
+	if err != nil || len(ids) == 0 {
+		return refreshFixedProbeClusterIDs(plan, state)
+	}
+	selected := make([]int64, 0, len(ids))
+	for _, id := range ids {
+		selected = append(selected, int64(id)+1)
 	}
 	plan.ProbeEpoch = centroids.Epoch()
 	return selected

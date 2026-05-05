@@ -133,7 +133,7 @@ func parseFlags() *config {
 	fs.IntVar(&c.k, "k", 10, "Top-K per query")
 	fs.DurationVar(&c.settleTimeout, "settle-timeout", 0, "Wait for automatic bootstrap and segment publish before read measurement (0 = disabled)")
 	fs.StringVar(&c.profileDir, "profile-dir", "", "pprof output dir (default db-dir/prof)")
-	fs.BoolVar(&c.profileCPU, "profile-cpu", true, "Write CPU profiles for warmup/measurement phases")
+	fs.BoolVar(&c.profileCPU, "profile-cpu", false, "Write CPU profiles for warmup/measurement phases")
 	fs.BoolVar(&c.useGoRank, "use-go-rank", true, "Use Go-side ranking path")
 	fs.IntVar(&c.insertTx, "insert-tx", 20000, "Rows per insert transaction")
 	fs.IntVar(&c.insertN, "insert-n", 0, "Cap inserted rows (0 = all train vectors). Useful for insert-throughput benches.")
@@ -235,6 +235,12 @@ type segmentEncodingStats struct {
 	dataFileBytes       int64
 	blockRows           int
 	blockCount          uint64
+	clusterCount        int
+	emptyClusters       int
+	clusterP50Rows      uint64
+	clusterP95Rows      uint64
+	clusterP99Rows      uint64
+	clusterMaxRows      uint64
 	overlayRows         int
 	overlayBytes        int64
 	overlayPreparedRows int
@@ -1221,6 +1227,19 @@ func (h *harness) currentSegmentEncodingStats() *segmentEncodingStats {
 		stats.blockRows = segments.Blocks.BlockRows()
 		stats.blockCount = segments.Blocks.RecordCount()
 	}
+	if len(segments.ClusterRowCounts) > 1 {
+		stats.clusterCount = len(segments.ClusterRowCounts) - 1
+		counts := append([]uint64(nil), segments.ClusterRowCounts[1:]...)
+		slices.Sort(counts)
+		stats.emptyClusters = int(countZeros(counts))
+		nonzero := counts[stats.emptyClusters:]
+		if len(nonzero) > 0 {
+			stats.clusterP50Rows = percentileUint64(nonzero, 0.50)
+			stats.clusterP95Rows = percentileUint64(nonzero, 0.95)
+			stats.clusterP99Rows = percentileUint64(nonzero, 0.99)
+			stats.clusterMaxRows = nonzero[len(nonzero)-1]
+		}
+	}
 	if overlay := state.LoadOverlay(); overlay != nil && overlay.Snapshot() != nil {
 		snapshot := overlay.Snapshot()
 		stats.overlayRows, stats.overlayBytes, _ = snapshot.BacklogStats(segments.AppliedOverlaySeq)
@@ -1246,6 +1265,37 @@ func (h *harness) currentSegmentEncodingStats() *segmentEncodingStats {
 		}
 	}
 	return stats
+}
+
+func countZeros(sorted []uint64) uint64 {
+	var count uint64
+	for _, v := range sorted {
+		if v != 0 {
+			return count
+		}
+		count++
+	}
+	return count
+}
+
+func percentileUint64(sortedNonzero []uint64, q float64) uint64 {
+	if len(sortedNonzero) == 0 {
+		return 0
+	}
+	if q <= 0 {
+		return sortedNonzero[0]
+	}
+	if q >= 1 {
+		return sortedNonzero[len(sortedNonzero)-1]
+	}
+	idx := int(math.Ceil(float64(len(sortedNonzero))*q)) - 1
+	if idx < 0 {
+		idx = 0
+	}
+	if idx >= len(sortedNonzero) {
+		idx = len(sortedNonzero) - 1
+	}
+	return sortedNonzero[idx]
 }
 
 func (h *harness) currentSegmentDataStore() *vecindex.SegmentDataStore {
@@ -1513,6 +1563,11 @@ func (h *harness) runQueryPhase() error {
 			segmentStats.encodingName, segmentStats.payloadBytes, segmentStats.entryBytes, segmentStats.rowCount, segmentStats.dataFileBytes)
 		if segmentStats.blockRows > 0 {
 			plog("  block metadata: block_rows=%d blocks=%d", segmentStats.blockRows, segmentStats.blockCount)
+		}
+		if segmentStats.clusterCount > 0 {
+			plog("  cluster rows: clusters=%d empty=%d p50=%d p95=%d p99=%d max=%d",
+				segmentStats.clusterCount, segmentStats.emptyClusters, segmentStats.clusterP50Rows,
+				segmentStats.clusterP95Rows, segmentStats.clusterP99Rows, segmentStats.clusterMaxRows)
 		}
 		plog("  segment scan estimate: rows/query=%d bytes/query=%d applied_overlay_seq=%d probe_epoch=%d stable_epoch=%d",
 			segmentStats.scanRowsEstimate, segmentStats.scanBytesEstimate, segmentStats.appliedOverlaySeq,

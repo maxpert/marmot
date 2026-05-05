@@ -52,6 +52,8 @@ func TestIncrementalMerge_PublishesNewGenerationAndAdvancesAppliedSeq(t *testing
 		Database:            "test",
 		Metric:              "cosine",
 		Dim:                 4,
+		Nlist:               8,
+		Nprobe:              8,
 		TargetPartitionSize: 32,
 		CreatedAt:           time.Now().UnixNano(),
 	}
@@ -89,6 +91,9 @@ func TestIncrementalMerge_PublishesNewGenerationAndAdvancesAppliedSeq(t *testing
 	require.NotNil(t, snapshotBefore)
 	mutation, err := buildUpsertMutation(state, state.Spec(), state.ProbeVersion(), bootstrapRows+1, raw, snapshotBefore.LastSequence()+1)
 	require.NoError(t, err)
+	require.Greater(t, mutation.ClusterID, int64(0))
+	touchedCluster := int(mutation.ClusterID - 1)
+	oldTouchedCentroid := state.ProbeState().Snapshot()[touchedCluster]
 	require.NoError(t, overlay.ApplyCommittedBatch([]vecindex.OverlayMutation{mutation}))
 	newCluster, newVec, err := maintenancePreparedCluster(state, state.Spec(), raw)
 	require.NoError(t, err)
@@ -108,11 +113,14 @@ func TestIncrementalMerge_PublishesNewGenerationAndAdvancesAppliedSeq(t *testing
 	require.NoError(t, hook.runIncrementalMerge(context.Background(), conn, dbPath, meta, state.Spec(), state))
 
 	state, _ = engine.Lookup(meta.IndexName)
-	require.Equal(t, oldEpoch, state.ProbeVersion())
+	require.Equal(t, oldEpoch+1, state.ProbeVersion())
 	require.NotNil(t, state.LoadSegmentStore())
 	require.Greater(t, state.LoadSegmentStore().Data.Generation(), oldGeneration)
 	require.Equal(t, state.ProbeVersion(), state.LoadSegmentStore().ProbeCentroids.Epoch())
 	require.Equal(t, state.ProbeVersion(), state.LoadSegmentStore().StableCentroids.Epoch())
+	nextTouchedCentroid := state.ProbeState().Snapshot()[touchedCluster]
+	require.NotEqual(t, oldTouchedCentroid, nextTouchedCentroid)
+	require.Equal(t, nextTouchedCentroid, state.LoadSegmentStore().StableCentroids.Snapshot()[touchedCluster])
 
 	overlay = state.LoadOverlay()
 	require.NotNil(t, overlay)
@@ -168,6 +176,8 @@ func TestBootstrapPublishesBoundedPrefixAndPreservesOverlayTail(t *testing.T) {
 		Database:            "test",
 		Metric:              "cosine",
 		Dim:                 4,
+		Nlist:               8,
+		Nprobe:              8,
 		TargetPartitionSize: 8,
 		CreatedAt:           time.Now().UnixNano(),
 	}
@@ -349,6 +359,8 @@ func TestIncrementalMerge_PreservesOverlayTailAcrossPublish(t *testing.T) {
 		Database:            "test",
 		Metric:              "cosine",
 		Dim:                 4,
+		Nlist:               8,
+		Nprobe:              8,
 		TargetPartitionSize: 32,
 		CreatedAt:           time.Now().UnixNano(),
 	}
@@ -409,8 +421,9 @@ func TestIncrementalMerge_PreservesOverlayTailAcrossPublish(t *testing.T) {
 	require.NoError(t, hook.publishIncrementalMerge(context.Background(), conn, dbPath, meta, plan))
 
 	state, _ = engine.Lookup(meta.IndexName)
-	require.Equal(t, oldEpoch, state.ProbeVersion())
+	require.Equal(t, oldEpoch+1, state.ProbeVersion())
 	require.Equal(t, oldEpoch, plan.currentEpoch)
+	require.Equal(t, oldEpoch+1, plan.nextProbe.Epoch())
 
 	overlay := state.LoadOverlay()
 	require.NotNil(t, overlay)

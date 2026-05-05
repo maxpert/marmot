@@ -388,7 +388,7 @@ func TestCreateIndex_EmptyTableAutoTuneBootstrapsAtTargetPartitionFloor(t *testi
 	require.True(t, ok)
 	require.Zero(t, state.ProbeVersion(), "empty create may start without centroids, but must bootstrap automatically")
 
-	const bootstrapRows = bootstrapMinTargetPartitions * 128
+	const bootstrapRows = 64 * 128
 	mirrorRows := make([]overlayMirrorRow, 0, bootstrapRows)
 	for i := 0; i < bootstrapRows-1; i++ {
 		vec := []float32{
@@ -422,13 +422,94 @@ func TestCreateIndex_EmptyTableAutoTuneBootstrapsAtTargetPartitionFloor(t *testi
 	require.NoError(t, conn.QueryRow(
 		`SELECT nlist, nprobe FROM __marmot_vector_indexes WHERE index_name = ?`, meta.IndexName,
 	).Scan(&nlist, &nprobe))
-	require.Equal(t, bootstrapMinTargetPartitions, nlist)
+	require.Equal(t, 64, nlist)
 	require.Equal(t, autoTuneNprobeForTarget(nlist, meta.TargetPartitionSize), nprobe)
 
 	state, ok = engine.Lookup(meta.IndexName)
 	require.True(t, ok)
 	require.Equal(t, nlist, state.Spec().Nlist)
 	require.Equal(t, nprobe, state.Spec().Nprobe)
+}
+
+func TestCreateIndex_EmptyTableAutoTuneWaitsForStrongBootstrapFloor(t *testing.T) {
+	tmpDir := t.TempDir()
+	clock := hlc.NewClock(1)
+
+	dbMgr, err := NewDatabaseManager(tmpDir, 1, clock)
+	require.NoError(t, err)
+	require.NoError(t, dbMgr.CreateDatabase("test"))
+
+	vecMgr := NewVectorIndexManager(dbMgr)
+	dbMgr.SetVectorIndexManager(vecMgr)
+
+	engine := vecindex.NewEngine()
+	SetVectorUDFProvider(engine)
+	t.Cleanup(func() { SetVectorUDFProvider(nil) })
+
+	hook := NewEngineHook(engine, dbMgr)
+	hook.BindVectorIndexManager(vecMgr)
+	t.Cleanup(func() {
+		cleanupIndexWatchers(t, hook, dbMgr, "test", "embeddings")
+	})
+	vecMgr.SetLifecycleHook(hook)
+	vecMgr.SetEngineProvider(hook)
+	vecMgr.SetReindexHook(hook)
+	require.NoError(t, vecMgr.Start(context.Background()))
+
+	conn, err := dbMgr.GetDatabaseConnection("test")
+	require.NoError(t, err)
+	_, err = conn.Exec(`CREATE TABLE docs (id INTEGER PRIMARY KEY, embed BLOB)`)
+	require.NoError(t, err)
+
+	meta := common.VectorIndexMeta{
+		IndexName:           "embeddings",
+		TableName:           "docs",
+		ColumnName:          "embed",
+		Database:            "test",
+		Metric:              "cosine",
+		Dim:                 4,
+		TargetPartitionSize: 64,
+		CreatedAt:           time.Now().UnixNano(),
+	}
+	require.NoError(t, vecMgr.CreateIndex(context.Background(), meta))
+
+	weakRows := (bootstrapMinTargetPartitions * meta.TargetPartitionSize) - 1
+	mirrorRows := make([]overlayMirrorRow, 0, weakRows)
+	for i := 0; i < weakRows; i++ {
+		vec := []float32{1, float32(i % 3), float32((i + 1) % 5), float32((i + 2) % 7)}
+		_, err := conn.Exec(`INSERT INTO docs (id, embed) VALUES (?, ?)`, i+1, encodeVec(t, vec))
+		require.NoError(t, err)
+		mirrorRows = append(mirrorRows, overlayMirrorRow{rowID: int64(i + 1), vec: vec})
+	}
+	mirrorRowsToOverlay(t, hook, meta, mirrorRows)
+
+	time.Sleep(bootstrapQuiesceDuration + 250*time.Millisecond)
+
+	state, ok := engine.Lookup(meta.IndexName)
+	require.True(t, ok)
+	require.Zero(t, state.ProbeVersion(), "auto bootstrap should not publish at the old 8-partition floor")
+	require.Nil(t, state.LoadSegmentStore())
+}
+
+func TestVectorIndexManagerSetHooksBindsEngineHook(t *testing.T) {
+	t.Parallel()
+
+	clock := hlc.NewClock(1)
+	dbMgr, err := NewDatabaseManager(t.TempDir(), 1, clock)
+	require.NoError(t, err)
+	vecMgr := NewVectorIndexManager(dbMgr)
+	hook := NewEngineHook(vecindex.NewEngine(), dbMgr)
+
+	vecMgr.SetLifecycleHook(hook)
+	require.Same(t, vecMgr, hook.indexMgr)
+
+	hook.indexMgr = nil
+	vecMgr.SetReindexHook(hook)
+	require.Same(t, vecMgr, hook.indexMgr)
+
+	hook.indexMgr = nil
+	vecMgr.SetEngineProvider(hook)
+	require.Same(t, vecMgr, hook.indexMgr)
 }
 
 func TestBootstrapOnce_RetriesAfterSegmentPublishFailure(t *testing.T) {
@@ -620,7 +701,7 @@ func TestCreateIndex_AutoTuneDefaultsTargetPartitionSizeTo512(t *testing.T) {
 	require.Equal(t, 65, nlist)
 	require.Equal(t, autoTuneNprobe(nlist), nprobe)
 	require.Zero(t, autoNlist)
-	require.Zero(t, autoNprobe)
+	require.EqualValues(t, 1, autoNprobe)
 	require.Equal(t, defaultTargetPartitionSize, targetPartitionSize)
 }
 
@@ -674,6 +755,7 @@ func TestAutoTuneNprobe(t *testing.T) {
 	}{
 		{64, defaultTargetPartitionSize, 16},
 		{256, defaultTargetPartitionSize, 16},
+		{977, defaultTargetPartitionSize, 32},
 		{4, defaultTargetPartitionSize, 4},
 		{65, 128, 64},
 		{8, 128, 8},

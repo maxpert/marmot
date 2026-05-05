@@ -242,7 +242,7 @@ func clusterSplitSeeds(
 	if len(vectors) <= extra {
 		return nil, nil
 	}
-	split, err := kmeans.KMeansPlusPlus(vectors, extra+1, spec.Seed^uint64(clusterID), 3)
+	split, err := kmeans.KMeansPlusPlusWithMetric(vectors, extra+1, spec.Seed^uint64(clusterID), 3, spec.InternalMetric())
 	if err != nil {
 		return nil, err
 	}

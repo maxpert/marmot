@@ -17,7 +17,7 @@ const (
 	bootstrapMinTargetPartitions = 8
 	dropRetireGracePeriod        = 30 * time.Second
 	bootstrapPublishMultiplier   = 4
-	bootstrapMaxPublishRows      = 16 * 1024
+	bootstrapMaxPublishRows      = 64 * 1024
 	bootstrapQuiesceDuration     = time.Second
 )
 
@@ -512,7 +512,9 @@ func bootstrapAutoTuneFloor(meta common.VectorIndexMeta) int64 {
 		target = defaultTargetPartitionSize
 	}
 	partitions := bootstrapMinTargetPartitions
-	if meta.Nlist > 0 && meta.Nlist < partitions {
+	if meta.AutoTuneNlist {
+		partitions = max(partitions, 64)
+	} else if meta.Nlist > 0 && meta.Nlist < partitions {
 		partitions = meta.Nlist
 	}
 	if partitions < 1 {
@@ -530,9 +532,6 @@ func autoTuneBootstrapNlist(rows int64, targetPartitionSize int) int {
 		targetPartitionSize = defaultTargetPartitionSize
 	}
 	targetDriven := int((rows + int64(targetPartitionSize) - 1) / int64(targetPartitionSize))
-	if targetDriven < bootstrapMinTargetPartitions {
-		targetDriven = bootstrapMinTargetPartitions
-	}
 	if targetDriven > nlist {
 		targetDriven = nlist
 	}

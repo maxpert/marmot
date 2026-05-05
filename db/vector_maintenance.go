@@ -549,6 +549,16 @@ func (h *EngineHook) prepareIncrementalMerge(
 	}
 	nextProbe := currentProbe
 	nextStable := pinnedBase.StableCentroids
+	if len(stats.Touched) > 0 {
+		nextProbe, err = probeCentroidSetForTouched(currentProbe, stats.Counts, stats.Sums, stats.Touched, currentProbe.Epoch()+1)
+		if err != nil {
+			return nil, fmt.Errorf("incremental merge: refresh probe centroids: %w", err)
+		}
+		nextStable, err = stableCentroidSetForTouched(pinnedBase.StableCentroids, nextProbe, stats.Touched)
+		if err != nil {
+			return nil, fmt.Errorf("incremental merge: refresh stable centroids: %w", err)
+		}
+	}
 
 	pending, err := BuildIncrementalSegmentGeneration(
 		ctx,

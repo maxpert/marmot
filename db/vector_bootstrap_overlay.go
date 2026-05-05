@@ -37,6 +37,7 @@ func computeCentroidsFromOverlaySnapshot(
 		BatchSize:         min(max(4096, targetClusterSize*4), 16384),
 		MaxIter:           kmeans.DefaultMiniBatchMaxIter,
 		TargetClusterSize: targetClusterSize,
+		Metric:            spec.InternalMetric(),
 	}
 	initSize := max(actualK*32, opts.BatchSize*kmeans.DefaultMiniBatchInitFactor)
 	if initSize < actualK {
@@ -52,7 +53,7 @@ func computeCentroidsFromOverlaySnapshot(
 	if len(samples) == 0 {
 		return nil, nil
 	}
-	initCentroids, err := kmeans.KMeansPlusPlus(samples, actualK, spec.Seed, 1)
+	initCentroids, err := kmeans.KMeansPlusPlusWithMetric(samples, actualK, spec.Seed, 1, spec.InternalMetric())
 	if err != nil {
 		return nil, fmt.Errorf("overlay bootstrap init centroids: %w", err)
 	}

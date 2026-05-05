@@ -5,6 +5,7 @@ import (
 
 	"github.com/maxpert/marmot/modules/vecindex"
 	"github.com/maxpert/marmot/modules/vecindex/pkg/kmeans"
+	"github.com/maxpert/marmot/modules/vecindex/pkg/metric"
 )
 
 func TestRefreshProbeClusterIDs_ReprobesOnEpochChange(t *testing.T) {
@@ -113,6 +114,116 @@ func TestSelectProbeClusterIDs_UsesRowBudget(t *testing.T) {
 	}
 	if plan.ProbeEpoch != 7 {
 		t.Fatalf("ProbeEpoch = %d, want 7", plan.ProbeEpoch)
+	}
+}
+
+func TestSelectProbeClusterIDs_AutoPolicyWidensLargeNlist(t *testing.T) {
+	t.Parallel()
+
+	const (
+		nlist  = 977
+		target = 512
+	)
+	centroids := make([][]float32, nlist)
+	counts := make([]uint64, nlist+1)
+	for i := range centroids {
+		centroids[i] = []float32{float32(i)}
+		counts[i+1] = target
+	}
+	cs, err := kmeans.NewCentroidSet(11, centroids)
+	if err != nil {
+		t.Fatalf("NewCentroidSet: %v", err)
+	}
+	spec := vecindex.IVFSpec{
+		ID:     "idx",
+		Dim:    1,
+		Metric: vecindex.MetricL2,
+		Nlist:  nlist,
+		Nprobe: 16,
+	}
+	state := vecindex.NewIndexState(spec, cs)
+	state.StoreMaintenanceState(&vecindex.MaintenanceState{
+		ClusterRowCounts: counts,
+	})
+	plan := &GoRankPlan{
+		QueryVec:            []float32{0},
+		IndexSpec:           spec,
+		Nprobe:              16,
+		UseBudgetProbe:      true,
+		TargetPartitionSize: target,
+		K:                   10,
+		ClusterIDs:          []int64{1},
+		ProbeEpoch:          1,
+	}
+
+	got := selectProbeClusterIDs(plan, state, cs, &vecindex.SegmentGeneration{
+		ClusterRowCounts: counts,
+	})
+	if len(got) <= 16 {
+		t.Fatalf("selectProbeClusterIDs() selected %d probes, want wider than 16", len(got))
+	}
+	if len(got) != 32 {
+		t.Fatalf("selectProbeClusterIDs() selected %d probes, want 32", len(got))
+	}
+}
+
+func TestAutoProbePartitionCount_CosinePQUsesMeasuredBudget(t *testing.T) {
+	t.Parallel()
+
+	if got := autoProbePartitionCount(196, 512, 10, metric.MetricCosine, vecindex.MemberEncodingResidualPQ8); got != 24 {
+		t.Fatalf("autoProbePartitionCount(196, cosine, pq8) = %d, want 24", got)
+	}
+	if got := autoProbePartitionCount(977, 512, 10, metric.MetricCosine, vecindex.MemberEncodingResidualPQ8); got != 48 {
+		t.Fatalf("autoProbePartitionCount(977, cosine, pq8) = %d, want 48", got)
+	}
+}
+
+func TestSelectProbeClusterIDs_ExplicitNprobeStaysFixed(t *testing.T) {
+	t.Parallel()
+
+	const (
+		nlist  = 977
+		target = 512
+		nprobe = 16
+	)
+	centroids := make([][]float32, nlist)
+	counts := make([]uint64, nlist+1)
+	for i := range centroids {
+		centroids[i] = []float32{float32(i)}
+		counts[i+1] = target
+	}
+	cs, err := kmeans.NewCentroidSet(13, centroids)
+	if err != nil {
+		t.Fatalf("NewCentroidSet: %v", err)
+	}
+	spec := vecindex.IVFSpec{
+		ID:     "idx",
+		Dim:    1,
+		Metric: vecindex.MetricL2,
+		Nlist:  nlist,
+		Nprobe: nprobe,
+	}
+	state := vecindex.NewIndexState(spec, cs)
+	state.StoreMaintenanceState(&vecindex.MaintenanceState{
+		ClusterRowCounts: counts,
+	})
+	plan := &GoRankPlan{
+		RawQueryVec:         []byte{0, 0, 0, 0},
+		QueryVec:            []float32{0},
+		IndexSpec:           spec,
+		Nprobe:              nprobe,
+		UseBudgetProbe:      false,
+		TargetPartitionSize: target,
+		K:                   10,
+		ClusterIDs:          []int64{1},
+		ProbeEpoch:          1,
+	}
+
+	got := selectProbeClusterIDs(plan, state, cs, &vecindex.SegmentGeneration{
+		ClusterRowCounts: counts,
+	})
+	if len(got) != nprobe {
+		t.Fatalf("selectProbeClusterIDs() selected %d probes, want explicit nprobe %d", len(got), nprobe)
 	}
 }
 

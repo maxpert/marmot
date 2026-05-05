@@ -125,6 +125,38 @@ func TestMiniBatchBalancedFromInit_PreservesWarmStartShape(t *testing.T) {
 	require.Len(t, centroids[1], 2)
 }
 
+func TestMiniBatchBalancedTrainer_UsesCosineAssignmentObjective(t *testing.T) {
+	t.Parallel()
+
+	vecs := [][]float32{
+		{1, 0}, {1, 0}, {1, 0}, {1, 0},
+		{0, 1}, {0, 1}, {0, 1}, {0, 1},
+	}
+	trainer, err := kmeans.NewMiniBatchBalancedTrainer([][]float32{
+		{100, 0},
+		{0, 1},
+	}, kmeans.MiniBatchBalancedOptions{
+		BatchSize:         len(vecs),
+		MaxIter:           1,
+		TargetClusterSize: len(vecs),
+		Metric:            metric.MetricCosine,
+	})
+	require.NoError(t, err)
+	require.NoError(t, trainer.BeginPass())
+	require.NoError(t, trainer.ObserveBatch(vecs))
+	result, err := trainer.EndPass(1)
+	require.NoError(t, err)
+	require.False(t, result.Repaired)
+
+	counts := trainer.Counts()
+	require.Equal(t, []int64{4, 4}, counts)
+	centroids := trainer.Centroids()
+	require.InDelta(t, 1, centroids[0][0], 1e-6)
+	require.InDelta(t, 0, centroids[0][1], 1e-6)
+	require.InDelta(t, 0, centroids[1][0], 1e-6)
+	require.InDelta(t, 1, centroids[1][1], 1e-6)
+}
+
 func TestMiniBatchBalanced_ReducesPartitionSkew(t *testing.T) {
 	t.Parallel()
 

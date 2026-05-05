@@ -67,6 +67,10 @@ type EngineProvider interface {
 	RemoveIndex(indexName string) (restore func())
 }
 
+type vectorIndexManagerBinder interface {
+	BindVectorIndexManager(*VectorIndexManager)
+}
+
 // VectorIndexMeta is an alias for the shared common.VectorIndexMeta.
 type VectorIndexMeta = common.VectorIndexMeta
 
@@ -107,6 +111,7 @@ func (m *VectorIndexManager) SetLifecycleHook(h IndexLifecycleHook) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.lifecycleHook = h
+	m.bindVectorIndexManager(h)
 }
 
 // SetReindexHook installs the hook invoked by ReindexIndex to execute the
@@ -115,6 +120,7 @@ func (m *VectorIndexManager) SetReindexHook(h IndexReindexHook) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.reindexHook = h
+	m.bindVectorIndexManager(h)
 }
 
 // SetEngineProvider installs the provider called during DROP to remove
@@ -123,6 +129,13 @@ func (m *VectorIndexManager) SetEngineProvider(e EngineProvider) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.engineProv = e
+	m.bindVectorIndexManager(e)
+}
+
+func (m *VectorIndexManager) bindVectorIndexManager(h any) {
+	if binder, ok := h.(vectorIndexManagerBinder); ok {
+		binder.BindVectorIndexManager(m)
+	}
 }
 
 // Start runs schema migration for all known databases and loads existing indexes.
@@ -257,9 +270,6 @@ func (m *VectorIndexManager) ResolveCreateIndexMeta(ctx context.Context, meta Ve
 		if n > 0 {
 			if resolveNlist {
 				meta.AutoTuneNlist = false
-			}
-			if resolveNprobe {
-				meta.AutoTuneNprobe = false
 			}
 		}
 	}
@@ -923,6 +933,9 @@ func autoTuneNprobeForTarget(nlist int, targetPartitionSize int) int {
 		targetPartitionSize = defaultTargetPartitionSize
 	}
 	probe := int(math.Ceil(float64(defaultScanBudgetRowsForTarget(targetPartitionSize)) / float64(targetPartitionSize)))
+	if byNlist := int(math.Ceil(math.Sqrt(float64(nlist)))); byNlist > probe {
+		probe = byNlist
+	}
 	if probe < 1 {
 		probe = 1
 	}

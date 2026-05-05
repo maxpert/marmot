@@ -6,6 +6,7 @@ import (
 
 	"github.com/maxpert/marmot/common"
 	"github.com/maxpert/marmot/modules/vecindex"
+	"github.com/maxpert/marmot/modules/vecindex/pkg/kmeans"
 )
 
 func uniformClusterRows(nlist int, rowsPerCluster uint64) []uint64 {
@@ -109,6 +110,68 @@ func TestCountTargetClusterDrift(t *testing.T) {
 	drift := countTargetClusterDrift(meta, clusterRows, 0)
 	if drift != 0 {
 		t.Fatalf("countTargetClusterDrift() = %f, want 0", drift)
+	}
+}
+
+func TestTouchedCentroidRefreshUpdatesOnlyTouchedClusters(t *testing.T) {
+	t.Parallel()
+
+	baseProbe, err := kmeans.NewCentroidSet(7, [][]float32{
+		{1, 0},
+		{0, 1},
+		{-1, 0},
+	})
+	if err != nil {
+		t.Fatalf("new base probe: %v", err)
+	}
+	baseStable, err := kmeans.NewCentroidSet(7, [][]float32{
+		{10, 0},
+		{0, 10},
+		{-10, 0},
+	})
+	if err != nil {
+		t.Fatalf("new base stable: %v", err)
+	}
+
+	counts := []uint64{0, 2, 4, 8}
+	sums := [][]float32{
+		nil,
+		{4, 2},
+		{8, 4},
+		{-16, 8},
+	}
+	touched := map[int64]struct{}{1: {}, 3: {}}
+	nextProbe, err := probeCentroidSetForTouched(baseProbe, counts, sums, touched, 8)
+	if err != nil {
+		t.Fatalf("probeCentroidSetForTouched: %v", err)
+	}
+	if got := nextProbe.Epoch(); got != 8 {
+		t.Fatalf("probe epoch = %d, want 8", got)
+	}
+	snap := nextProbe.Snapshot()
+	if snap[0][0] != 2 || snap[0][1] != 1 {
+		t.Fatalf("cluster 1 centroid = %v, want [2 1]", snap[0])
+	}
+	if snap[1][0] != 0 || snap[1][1] != 1 {
+		t.Fatalf("cluster 2 centroid changed: %v", snap[1])
+	}
+	if snap[2][0] != -2 || snap[2][1] != 1 {
+		t.Fatalf("cluster 3 centroid = %v, want [-2 1]", snap[2])
+	}
+
+	nextStable, err := stableCentroidSetForTouched(baseStable, nextProbe, touched)
+	if err != nil {
+		t.Fatalf("stableCentroidSetForTouched: %v", err)
+	}
+	stableSnap := nextStable.Snapshot()
+	if stableSnap[0][0] != snap[0][0] || stableSnap[0][1] != snap[0][1] {
+		t.Fatalf("stable touched cluster 1 = %v, want %v", stableSnap[0], snap[0])
+	}
+	if stableSnap[1][0] != 0 || stableSnap[1][1] != 10 {
+		t.Fatalf("stable untouched cluster changed: %v", stableSnap[1])
+	}
+	if stableSnap[2][0] != snap[2][0] || stableSnap[2][1] != snap[2][1] {
+		t.Fatalf("stable touched cluster 3 = %v, want %v", stableSnap[2], snap[2])
 	}
 }
 

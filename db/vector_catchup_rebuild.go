@@ -345,10 +345,33 @@ func BuildHierarchicalCatchUpSegmentGeneration(
 	if targetSize <= 0 {
 		targetSize = defaultTargetPartitionSize
 	}
-	shadow := catchUpShadowRowIDs(base, overlaySnapshot, minSequence, cutoffSequence)
-	parentCounts, err := catchUpParentCounts(base, overlaySnapshot, minSequence, cutoffSequence, currentK, shadow)
+	dir := vecindex.SegmentStoreDir(dbPath, meta.IndexName)
+	generation, err := nextSegmentGeneration(dir)
+	if err != nil {
+		return nil, nil, fmt.Errorf("hierarchical catch-up: next generation: %w", err)
+	}
+	staging, err := createSegmentGenerationStaging(dir, generation)
+	if err != nil {
+		return nil, nil, fmt.Errorf("hierarchical catch-up: create staging: %w", err)
+	}
+	keepStaging := false
+	defer func() {
+		if !keepStaging {
+			staging.cleanup()
+		}
+	}()
+
+	parentSpools := newCatchUpSpoolSet(dir, currentK)
+	defer parentSpools.Cleanup()
+	parentCounts, rowCount, err := spoolCatchUpRowsByCurrentParent(ctx, conn, meta, spec, base, overlaySnapshot, minSequence, cutoffSequence, parentProbe, parentSpools)
 	if err != nil {
 		return nil, nil, err
+	}
+	if rowCount == 0 {
+		return nil, nil, nil
+	}
+	if err := parentSpools.CloseAll(); err != nil {
+		return nil, nil, fmt.Errorf("hierarchical catch-up: close parent spools: %w", err)
 	}
 	childCounts := allocateCatchUpChildCounts(parentCounts, currentK, desiredK, targetSize)
 	childIDsByParent := catchUpChildIDLayout(childCounts, currentK, desiredK)
@@ -360,13 +383,14 @@ func BuildHierarchicalCatchUpSegmentGeneration(
 		BatchSize:         min(max(256, targetSize*2), 4096),
 		MaxIter:           4,
 		TargetClusterSize: targetSize,
+		Metric:            spec.InternalMetric(),
 	}
 	for parentID := 1; parentID <= currentK; parentID++ {
 		childIDs := childIDsByParent[parentID]
 		if len(childIDs) == 0 {
 			continue
 		}
-		rows, err := loadCatchUpParentRows(ctx, conn, meta, spec, base, overlaySnapshot, minSequence, cutoffSequence, int64(parentID), shadow)
+		rows, err := loadCatchUpRelabeledParentRows(parentSpools.spools[int64(parentID)], spec)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -388,22 +412,6 @@ func BuildHierarchicalCatchUpSegmentGeneration(
 		}
 	}
 
-	dir := vecindex.SegmentStoreDir(dbPath, meta.IndexName)
-	generation, err := nextSegmentGeneration(dir)
-	if err != nil {
-		return nil, nil, fmt.Errorf("hierarchical catch-up: next generation: %w", err)
-	}
-	staging, err := createSegmentGenerationStaging(dir, generation)
-	if err != nil {
-		return nil, nil, fmt.Errorf("hierarchical catch-up: create staging: %w", err)
-	}
-	keepStaging := false
-	defer func() {
-		if !keepStaging {
-			staging.cleanup()
-		}
-	}()
-
 	clusterRowCounts := make([]uint64, desiredK+1)
 	clusterVectorSums := make([][]float32, desiredK+1)
 	codecReservoir, err := newStableCodecReservoir(spec.Seed^epoch, spec.InternalDim())
@@ -414,26 +422,18 @@ func BuildHierarchicalCatchUpSegmentGeneration(
 	spools := newCatchUpSpoolSet(dir, desiredK)
 	defer spools.Cleanup()
 
-	var rowCount uint64
 	for parentID := 1; parentID <= currentK; parentID++ {
-		rows, err := loadCatchUpParentRows(ctx, conn, meta, spec, base, overlaySnapshot, minSequence, cutoffSequence, int64(parentID), shadow)
-		if err != nil {
-			return nil, nil, err
-		}
-		if len(rows) == 0 {
+		parentSpool := parentSpools.spools[int64(parentID)]
+		if parentSpool == nil || parentSpool.path == "" {
 			continue
 		}
 		candidateIDs := catchUpCandidateChildIDs(parentID, parentGuards, childIDsByParent)
 		if len(candidateIDs) == 0 {
 			candidateIDs = childIDsByParent[parentID]
 		}
-		if err := assignCatchUpRowsToSpools(rows, candidateIDs, trainedCentroids, spec, targetSize, spools, codecReservoir, clusterRowCounts, clusterVectorSums); err != nil {
+		if err := assignCatchUpParentSpoolToSpools(parentSpool, candidateIDs, trainedCentroids, spec, targetSize, spools, codecReservoir, clusterRowCounts, clusterVectorSums); err != nil {
 			return nil, nil, err
 		}
-		rowCount += uint64(len(rows))
-	}
-	if rowCount == 0 {
-		return nil, nil, nil
 	}
 	if err := spools.CloseAll(); err != nil {
 		return nil, nil, fmt.Errorf("hierarchical catch-up: close cluster spools: %w", err)
@@ -644,42 +644,43 @@ func BuildHierarchicalCatchUpSegmentGeneration(
 	return probeCS, pending, nil
 }
 
-func catchUpParentCounts(
+func spoolCatchUpRowsByCurrentParent(
+	ctx context.Context,
+	conn *sql.DB,
+	meta common.VectorIndexMeta,
+	spec vecindex.IVFSpec,
 	base *vecindex.SegmentGeneration,
 	snapshot *vecindex.OverlaySnapshot,
 	minSequence uint64,
 	cutoff uint64,
-	currentK int,
-	shadow map[int64]struct{},
-) ([]uint64, error) {
+	parentProbe *kmeans.CentroidSet,
+	spools *catchUpSpoolSet,
+) ([]uint64, uint64, error) {
+	if parentProbe == nil || parentProbe.Len() == 0 {
+		return nil, 0, vecindex.ErrNoCentroidsLoaded
+	}
+	currentK := parentProbe.Len()
 	counts := make([]uint64, currentK+1)
-	if base != nil && base.RowMap != nil {
-		if err := base.RowMap.Scan(func(loc vecindex.SegmentRowLocation) bool {
-			if loc.ClusterID <= 0 || int(loc.ClusterID) > currentK {
-				return true
-			}
-			if _, ok := shadow[loc.RowID]; ok {
-				return true
-			}
-			counts[loc.ClusterID]++
-			return true
-		}); err != nil {
-			return nil, err
+	var rowCount uint64
+	err := visitCatchUpPreparedVectors(ctx, conn, meta, spec, base, snapshot, minSequence, cutoff, func(rowID int64, prepared []byte) error {
+		parentID, err := assignPreparedAgainstSet(prepared, spec, parentProbe)
+		if err != nil {
+			return fmt.Errorf("hierarchical catch-up: relabel rowid %d: %w", rowID, err)
 		}
+		if parentID <= 0 || int(parentID) > currentK {
+			return fmt.Errorf("hierarchical catch-up: relabel rowid %d assigned invalid parent %d", rowID, parentID)
+		}
+		counts[parentID]++
+		rowCount++
+		if err := spools.Write(parentID, rowID, prepared); err != nil {
+			return fmt.Errorf("hierarchical catch-up: spool relabeled parent rowid %d: %w", rowID, err)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, 0, err
 	}
-	if snapshot != nil {
-		snapshot.VisitMutationHeadersAfterUnordered(minSequence, func(mutation vecindex.OverlayMutation) bool {
-			if cutoff > 0 && mutation.Sequence > cutoff {
-				return true
-			}
-			if mutation.Kind == vecindex.OverlayMutationDelete || mutation.ClusterID <= 0 || int(mutation.ClusterID) > currentK {
-				return true
-			}
-			counts[mutation.ClusterID]++
-			return true
-		})
-	}
-	return counts, nil
+	return counts, rowCount, nil
 }
 
 func allocateCatchUpChildCounts(parentCounts []uint64, currentK int, desiredK int, targetSize int) []int {
@@ -864,84 +865,69 @@ func catchUpCandidateChildIDs(parentID int, guards [][]int, childIDsByParent [][
 	return candidates
 }
 
-func loadCatchUpParentRows(
-	ctx context.Context,
-	conn *sql.DB,
-	meta common.VectorIndexMeta,
-	spec vecindex.IVFSpec,
-	base *vecindex.SegmentGeneration,
-	snapshot *vecindex.OverlaySnapshot,
-	minSequence uint64,
-	cutoff uint64,
-	parentID int64,
-	shadow map[int64]struct{},
-) ([]promotionRow, error) {
-	var rows []promotionRow
-	fetcher, err := newExactVectorFetcher(ctx, conn, meta, spec)
+func loadCatchUpRelabeledParentRows(spool *catchUpClusterSpool, spec vecindex.IVFSpec) ([]promotionRow, error) {
+	rows := make([]promotionRow, 0)
+	err := visitCatchUpSpoolRows(spool, spec, func(rowID int64, prepared []byte) error {
+		blob := append([]byte(nil), prepared...)
+		rows = append(rows, promotionRow{
+			rowID: rowID,
+			vec:   metric.BytesToFloat32(blob),
+			blob:  blob,
+		})
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	if fetcher != nil {
-		defer fetcher.Close()
-	}
-	if base != nil && base.Data != nil {
-		rows = make([]promotionRow, 0, base.Data.ClusterCount(parentID))
-		var scanErr error
-		if err := base.Data.ScanCluster(parentID, func(rowID int64, _ []byte) bool {
-			if _, ok := shadow[rowID]; ok {
-				return true
-			}
-			preparedBlob, ok, err := fetcher.Prepared(ctx, rowID)
-			if err != nil {
-				scanErr = err
-				return false
-			}
-			if !ok {
-				return true
-			}
-			rows = append(rows, promotionRow{
-				rowID: rowID,
-				vec:   metric.BytesToFloat32(preparedBlob),
-				blob:  preparedBlob,
-			})
-			return true
-		}); err != nil {
-			return nil, err
-		}
-		if scanErr != nil {
-			return nil, scanErr
-		}
-	}
-	if snapshot != nil {
-		var visitErr error
-		snapshot.VisitMutationsAfter(minSequence, func(mutation vecindex.OverlayMutation) bool {
-			if cutoff > 0 && mutation.Sequence > cutoff {
-				return false
-			}
-			if mutation.Kind == vecindex.OverlayMutationDelete || mutation.ClusterID != parentID {
-				return true
-			}
-			blob, ok, err := overlayMutationPrepared(ctx, fetcher, mutation)
-			if err != nil {
-				visitErr = err
-				return false
-			}
-			if !ok {
-				return true
-			}
-			blob = append([]byte(nil), blob...)
-			rows = append(rows, promotionRow{
-				rowID: mutation.RowID,
-				vec:   metric.BytesToFloat32(blob),
-				blob:  blob,
-			})
-			return true
-		})
-		if visitErr != nil {
-			return nil, visitErr
-		}
-	}
 	return rows, nil
+}
+
+func visitCatchUpSpoolRows(spool *catchUpClusterSpool, spec vecindex.IVFSpec, visit func(rowID int64, prepared []byte) error) error {
+	if spool == nil || spool.path == "" || visit == nil {
+		return nil
+	}
+	preparedEntrySize := 8 + spec.InternalDim()*4
+	if preparedEntrySize <= 8 {
+		return fmt.Errorf("hierarchical catch-up: invalid prepared spool entry size %d", preparedEntrySize)
+	}
+	file, err := os.Open(spool.path)
+	if err != nil {
+		return fmt.Errorf("hierarchical catch-up: open relabeled parent spool: %w", err)
+	}
+	buf := make([]byte, preparedEntrySize*256)
+	for {
+		n, readErr := io.ReadFull(file, buf)
+		if readErr == io.EOF {
+			break
+		}
+		if readErr == io.ErrUnexpectedEOF {
+			if n == 0 {
+				break
+			}
+			if n%preparedEntrySize != 0 {
+				_ = file.Close()
+				return fmt.Errorf("hierarchical catch-up: truncated relabeled parent spool")
+			}
+		} else if readErr != nil {
+			_ = file.Close()
+			return fmt.Errorf("hierarchical catch-up: read relabeled parent spool: %w", readErr)
+		}
+		for cursor := 0; cursor < n; cursor += preparedEntrySize {
+			rowID := int64(binary.LittleEndian.Uint64(buf[cursor : cursor+8]))
+			prepared := buf[cursor+8 : cursor+preparedEntrySize]
+			if err := visit(rowID, prepared); err != nil {
+				_ = file.Close()
+				return err
+			}
+		}
+		if readErr == io.ErrUnexpectedEOF {
+			break
+		}
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("hierarchical catch-up: close relabeled parent spool: %w", err)
+	}
+	return nil
 }
 
 func trainCatchUpFamily(
@@ -1029,8 +1015,8 @@ func fallbackCatchUpFamilyCentroids(rows []promotionRow, parentCentroid []float3
 	return out
 }
 
-func assignCatchUpRowsToSpools(
-	rows []promotionRow,
+func assignCatchUpParentSpoolToSpools(
+	parentSpool *catchUpClusterSpool,
 	candidateIDs []int64,
 	centroids [][]float32,
 	spec vecindex.IVFSpec,
@@ -1040,55 +1026,77 @@ func assignCatchUpRowsToSpools(
 	clusterRowCounts []uint64,
 	clusterVectorSums [][]float32,
 ) error {
-	if len(rows) == 0 || len(candidateIDs) == 0 {
+	if parentSpool == nil || parentSpool.path == "" || len(candidateIDs) == 0 {
 		return nil
 	}
 	hardLimit := uint64(0)
 	if targetSize > 0 {
 		hardLimit = uint64(targetSize * repairClusterFactor)
 	}
-	for _, row := range rows {
-		bestClusterID := candidateIDs[0]
-		bestDist := float32(0)
-		bestSet := false
-		overflowClusterID := candidateIDs[0]
-		overflowDist := float32(0)
-		overflowSet := false
-		for _, clusterID := range candidateIDs {
-			if clusterID <= 0 || int(clusterID) > len(centroids) || len(centroids[clusterID-1]) == 0 {
-				continue
-			}
-			dist := metric.Distance(spec.InternalMetric(), row.vec, centroids[clusterID-1])
-			if !overflowSet || dist < overflowDist || (dist == overflowDist && clusterID < overflowClusterID) {
-				overflowSet = true
-				overflowClusterID = clusterID
-				overflowDist = dist
-			}
-			if hardLimit > 0 && clusterRowCounts[clusterID] >= hardLimit {
-				continue
-			}
-			if !bestSet || dist < bestDist || (dist == bestDist && clusterID < bestClusterID) {
-				bestSet = true
-				bestDist = dist
-				bestClusterID = clusterID
-			}
+	return visitCatchUpSpoolRows(parentSpool, spec, func(rowID int64, prepared []byte) error {
+		row := promotionRow{
+			rowID: rowID,
+			vec:   metric.BytesToFloat32(prepared),
+			blob:  prepared,
 		}
-		if !bestSet {
-			bestClusterID = overflowClusterID
+		return assignCatchUpRowToSpools(row, candidateIDs, centroids, spec, hardLimit, spools, codecReservoir, clusterRowCounts, clusterVectorSums)
+	})
+}
+
+func assignCatchUpRowToSpools(
+	row promotionRow,
+	candidateIDs []int64,
+	centroids [][]float32,
+	spec vecindex.IVFSpec,
+	hardLimit uint64,
+	spools *catchUpSpoolSet,
+	codecReservoir *stableCodecReservoir,
+	clusterRowCounts []uint64,
+	clusterVectorSums [][]float32,
+) error {
+	bestClusterID := int64(0)
+	bestDist := float32(0)
+	bestSet := false
+	overflowClusterID := int64(0)
+	overflowDist := float32(0)
+	overflowSet := false
+	for _, clusterID := range candidateIDs {
+		if clusterID <= 0 || int(clusterID) > len(centroids) || len(centroids[clusterID-1]) == 0 {
+			continue
 		}
-		prepared := row.preparedBlob()
-		if clusterVectorSums[bestClusterID] == nil {
-			clusterVectorSums[bestClusterID] = make([]float32, spec.InternalDim())
+		dist := metric.Distance(spec.InternalMetric(), row.vec, centroids[clusterID-1])
+		if !overflowSet || dist < overflowDist || (dist == overflowDist && clusterID < overflowClusterID) {
+			overflowSet = true
+			overflowClusterID = clusterID
+			overflowDist = dist
 		}
-		for i, value := range row.vec {
-			clusterVectorSums[bestClusterID][i] += value
+		if hardLimit > 0 && clusterRowCounts[clusterID] >= hardLimit {
+			continue
 		}
-		codecReservoir.Add(bestClusterID, prepared)
-		if err := spools.Write(bestClusterID, row.rowID, prepared); err != nil {
-			return err
+		if !bestSet || dist < bestDist || (dist == bestDist && clusterID < bestClusterID) {
+			bestSet = true
+			bestDist = dist
+			bestClusterID = clusterID
 		}
-		clusterRowCounts[bestClusterID]++
 	}
+	if !bestSet {
+		bestClusterID = overflowClusterID
+	}
+	if bestClusterID <= 0 || int(bestClusterID) >= len(clusterRowCounts) {
+		return fmt.Errorf("hierarchical catch-up: rowid %d has no valid child assignment", row.rowID)
+	}
+	prepared := row.preparedBlob()
+	if clusterVectorSums[bestClusterID] == nil {
+		clusterVectorSums[bestClusterID] = make([]float32, spec.InternalDim())
+	}
+	for i, value := range row.vec {
+		clusterVectorSums[bestClusterID][i] += value
+	}
+	codecReservoir.Add(bestClusterID, prepared)
+	if err := spools.Write(bestClusterID, row.rowID, prepared); err != nil {
+		return err
+	}
+	clusterRowCounts[bestClusterID]++
 	return nil
 }
 

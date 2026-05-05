@@ -7,6 +7,8 @@ import (
 	"runtime"
 	"slices"
 	"sync"
+
+	"github.com/maxpert/marmot/modules/vecindex/pkg/metric"
 )
 
 const (
@@ -26,6 +28,7 @@ type MiniBatchBalancedOptions struct {
 	BatchSize           int
 	MaxIter             int
 	TargetClusterSize   int
+	Metric              metric.Metric
 	BalancePenalty      float32
 	HardClusterFactor   int
 	UnderfilledFraction float32
@@ -90,6 +93,7 @@ func NewMiniBatchBalancedTrainer(initCentroids [][]float32, opts MiniBatchBalanc
 	if dim == 0 {
 		return nil, errors.New("kmeans: initCentroids must not be empty")
 	}
+	opts = normalizeMiniBatchOptions(opts)
 	centroids := make([][]float32, len(initCentroids))
 	counts := make([]int64, len(initCentroids))
 	for i, centroid := range initCentroids {
@@ -98,9 +102,9 @@ func NewMiniBatchBalancedTrainer(initCentroids [][]float32, opts MiniBatchBalanc
 		}
 		cp := make([]float32, dim)
 		copy(cp, centroid)
+		normalizeCentroidForMetric(cp, opts.Metric)
 		centroids[i] = cp
 	}
-	opts = normalizeMiniBatchOptions(opts)
 	return &MiniBatchBalancedTrainer{
 		centroids:      centroids,
 		counts:         counts,
@@ -159,7 +163,7 @@ func (t *MiniBatchBalancedTrainer) ObserveBatch(vectors [][]float32) error {
 		}
 		batch := vectors[start:end]
 		rows := distances[:len(batch)*k]
-		fillMiniBatchDistanceRows(batch, t.centroids, rows)
+		fillMiniBatchDistanceRows(batch, t.centroids, rows, t.opts.Metric)
 		for i, vec := range batch {
 			row := rows[i*k : (i+1)*k]
 			rawClusterID := nearestCluster(row)
@@ -197,8 +201,13 @@ func (t *MiniBatchBalancedTrainer) EndPass(seed uint64) (MiniBatchPassResult, er
 		sum := t.passSums[clusterID]
 		var shift float32
 		inv := 1.0 / float64(n)
+		nextCentroid := make([]float32, len(centroid))
 		for d := range centroid {
 			next := float32(sum[d] * inv)
+			nextCentroid[d] = next
+		}
+		normalizeCentroidForMetric(nextCentroid, t.opts.Metric)
+		for d, next := range nextCentroid {
 			diff := centroid[d] - next
 			shift += diff * diff
 			centroid[d] = next
@@ -308,7 +317,7 @@ func (t *MiniBatchBalancedTrainer) mergeSparseCluster(clusterID int, underfilled
 		if i == repurposeIdx || candidate.clusterID == clusterID {
 			continue
 		}
-		dist := metricL2Squared(t.centroids[clusterID], t.centroids[candidate.clusterID])
+		dist := miniBatchDistance(t.centroids[clusterID], t.centroids[candidate.clusterID], t.opts.Metric)
 		if mergeTarget == -1 || dist < bestDist {
 			mergeTarget = candidate.clusterID
 			bestDist = dist
@@ -319,7 +328,7 @@ func (t *MiniBatchBalancedTrainer) mergeSparseCluster(clusterID int, underfilled
 			if candidateID == clusterID {
 				continue
 			}
-			dist := metricL2Squared(t.centroids[clusterID], t.centroids[candidateID])
+			dist := miniBatchDistance(t.centroids[clusterID], t.centroids[candidateID], t.opts.Metric)
 			if mergeTarget == -1 || dist < bestDist {
 				mergeTarget = candidateID
 				bestDist = dist
@@ -341,6 +350,7 @@ func (t *MiniBatchBalancedTrainer) mergeSparseCluster(clusterID int, underfilled
 				float64(t.centroids[clusterID][dim])*float64(dstCount)) / float64(total),
 		)
 	}
+	normalizeCentroidForMetric(t.centroids[mergeTarget], t.opts.Metric)
 	t.counts[mergeTarget] = total
 }
 
@@ -365,6 +375,8 @@ func (t *MiniBatchBalancedTrainer) splitOversizedCluster(srcClusterID, dstCluste
 	}
 	copy(t.centroids[srcClusterID], first.vec)
 	copy(t.centroids[dstClusterID], second)
+	normalizeCentroidForMetric(t.centroids[srcClusterID], t.opts.Metric)
+	normalizeCentroidForMetric(t.centroids[dstClusterID], t.opts.Metric)
 	t.counts[srcClusterID] = 0
 	t.counts[dstClusterID] = 0
 	return true
@@ -446,10 +458,14 @@ func balancedScore(dist float32, count int64, targetClusterSize int, balancePena
 	return dist + balancePenalty*over
 }
 
-func fillMiniBatchDistanceRows(vectors [][]float32, centroids [][]float32, rows []float32) {
+func fillMiniBatchDistanceRows(vectors [][]float32, centroids [][]float32, rows []float32, distanceMetric metric.Metric) {
 	n := len(vectors)
 	k := len(centroids)
 	if n == 0 || k == 0 {
+		return
+	}
+	if distanceMetric == metric.MetricCosine {
+		fillMiniBatchCosineDistanceRows(vectors, centroids, rows)
 		return
 	}
 	nChunks := (n + miniBatchParallelChunkSize - 1) / miniBatchParallelChunkSize
@@ -470,7 +486,53 @@ func fillMiniBatchDistanceRows(vectors [][]float32, centroids [][]float32, rows 
 			for i := start; i < end; i++ {
 				row := rows[i*k : (i+1)*k]
 				for j, centroid := range centroids {
-					row[j] = metricL2Squared(vectors[i], centroid)
+					row[j] = miniBatchDistance(vectors[i], centroid, distanceMetric)
+				}
+			}
+		}
+	}
+	if workers == 1 {
+		run(0)
+		return
+	}
+	var wg sync.WaitGroup
+	for worker := 0; worker < workers; worker++ {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			run(worker)
+		}(worker)
+	}
+	wg.Wait()
+}
+
+func fillMiniBatchCosineDistanceRows(vectors [][]float32, centroids [][]float32, rows []float32) {
+	unitCentroids := make([][]float32, len(centroids))
+	for i, centroid := range centroids {
+		unitCentroids[i] = unitVectorForCosine(centroid)
+	}
+	n := len(vectors)
+	k := len(centroids)
+	nChunks := (n + miniBatchParallelChunkSize - 1) / miniBatchParallelChunkSize
+	workers := runtime.GOMAXPROCS(0)
+	if workers > nChunks {
+		workers = nChunks
+	}
+	if workers < 1 {
+		workers = 1
+	}
+	run := func(worker int) {
+		for chunk := worker; chunk < nChunks; chunk += workers {
+			start := chunk * miniBatchParallelChunkSize
+			end := start + miniBatchParallelChunkSize
+			if end > n {
+				end = n
+			}
+			for i := start; i < end; i++ {
+				q := unitVectorForCosine(vectors[i])
+				row := rows[i*k : (i+1)*k]
+				for j, centroid := range unitCentroids {
+					row[j] = metric.CosineDistanceUnit(q, centroid)
 				}
 			}
 		}
@@ -499,23 +561,42 @@ func metricL2Squared(a, b []float32) float32 {
 	return sum
 }
 
-func farthestReferenceScore(vec []float32, centroids [][]float32, skip int) float32 {
-	best := float32(0)
-	initialized := false
-	for i, centroid := range centroids {
-		if i == skip {
-			continue
-		}
-		dist := metricL2Squared(vec, centroid)
-		if !initialized || dist < best {
-			best = dist
-			initialized = true
-		}
+func miniBatchDistance(a, b []float32, distanceMetric metric.Metric) float32 {
+	switch distanceMetric {
+	case metric.MetricCosine:
+		return metric.Distance(metric.MetricCosine, a, b)
+	case metric.MetricDot:
+		return metric.Distance(metric.MetricDot, a, b)
+	default:
+		return metricL2Squared(a, b)
 	}
-	if !initialized {
-		return 0
+}
+
+func normalizeCentroidForMetric(centroid []float32, distanceMetric metric.Metric) {
+	if distanceMetric != metric.MetricCosine {
+		return
 	}
-	return best
+	n := metric.Norm(centroid)
+	if n == 0 {
+		return
+	}
+	inv := 1 / n
+	for i := range centroid {
+		centroid[i] *= inv
+	}
+}
+
+func unitVectorForCosine(vec []float32) []float32 {
+	n := metric.Norm(vec)
+	if n == 0 || math.Abs(float64(n-1)) <= 1e-5 {
+		return vec
+	}
+	out := make([]float32, len(vec))
+	inv := 1 / n
+	for i, value := range vec {
+		out[i] = value * inv
+	}
+	return out
 }
 
 func MiniBatchBalanced(vectors [][]float32, k int, seed uint64, opts MiniBatchBalancedOptions) ([][]float32, error) {
@@ -528,6 +609,24 @@ func MiniBatchBalanced(vectors [][]float32, k int, seed uint64, opts MiniBatchBa
 		return nil, err
 	}
 	return MiniBatchBalancedFromInit(vectors, initCentroids, seed, opts)
+}
+
+// KMeansPlusPlusWithMetric runs deterministic k-means++ initialization and a
+// short Lloyd refinement using the same distance objective as the index.
+func KMeansPlusPlusWithMetric(vectors [][]float32, k int, seed uint64, maxIter int, distanceMetric metric.Metric) ([][]float32, error) {
+	if distanceMetric == metric.MetricL2 {
+		return KMeansPlusPlus(vectors, k, seed, maxIter)
+	}
+	if err := validateInputs(vectors, k, maxIter); err != nil {
+		return nil, err
+	}
+	dim := len(vectors[0])
+	rng := rand.New(rand.NewSource(foldSeed(seed)))
+	centroids := kMeansPlusPlusInitWithMetric(vectors, k, rng, distanceMetric)
+	for _, centroid := range centroids {
+		normalizeCentroidForMetric(centroid, distanceMetric)
+	}
+	return lloydIterationsWithMetric(vectors, centroids, dim, maxIter, rng, distanceMetric), nil
 }
 
 func MiniBatchBalancedFromInit(vectors [][]float32, initCentroids [][]float32, seed uint64, opts MiniBatchBalancedOptions) ([][]float32, error) {
@@ -583,6 +682,134 @@ func MiniBatchBalancedFromInit(vectors [][]float32, initCentroids [][]float32, s
 	return trainer.Centroids(), nil
 }
 
+func kMeansPlusPlusInitWithMetric(vectors [][]float32, k int, rng *rand.Rand, distanceMetric metric.Metric) [][]float32 {
+	n := len(vectors)
+	centroids := make([][]float32, 0, k)
+	first := copyVec(vectors[rng.Intn(n)])
+	normalizeCentroidForMetric(first, distanceMetric)
+	centroids = append(centroids, first)
+
+	nearest := make([]float64, n)
+	var total float64
+	for i, vec := range vectors {
+		d := float64(miniBatchDistance(vec, first, distanceMetric))
+		if d < 0 {
+			d = 0
+		}
+		nearest[i] = d
+		total += d
+	}
+
+	for len(centroids) < k {
+		chosen := 0
+		if total > 0 {
+			chosen = samplePrefix(nearest, rng.Float64()*total)
+		} else {
+			chosen = rng.Intn(n)
+		}
+		centroid := copyVec(vectors[chosen])
+		normalizeCentroidForMetric(centroid, distanceMetric)
+		centroids = append(centroids, centroid)
+		total = 0
+		for i, vec := range vectors {
+			d := float64(miniBatchDistance(vec, centroid, distanceMetric))
+			if d < 0 {
+				d = 0
+			}
+			if d < nearest[i] {
+				nearest[i] = d
+			}
+			total += nearest[i]
+		}
+	}
+	return centroids
+}
+
+func lloydIterationsWithMetric(vectors [][]float32, centroids [][]float32, dim, maxIter int, rng *rand.Rand, distanceMetric metric.Metric) [][]float32 {
+	k := len(centroids)
+	for iter := 0; iter < maxIter; iter++ {
+		assignments := make([]int, len(vectors))
+		fillAssignmentsWithMetric(vectors, centroids, assignments, distanceMetric)
+
+		sums := make([][]float64, k)
+		counts := make([]int, k)
+		for i := range sums {
+			sums[i] = make([]float64, dim)
+		}
+		for i, vec := range vectors {
+			clusterID := assignments[i]
+			counts[clusterID]++
+			for d, value := range vec {
+				sums[clusterID][d] += float64(value)
+			}
+		}
+
+		converged := true
+		nextCentroids := make([][]float32, k)
+		for clusterID := range nextCentroids {
+			next := make([]float32, dim)
+			if counts[clusterID] == 0 {
+				copy(next, vectors[rng.Intn(len(vectors))])
+			} else {
+				inv := 1 / float64(counts[clusterID])
+				for d := range next {
+					next[d] = float32(sums[clusterID][d] * inv)
+				}
+			}
+			normalizeCentroidForMetric(next, distanceMetric)
+			nextCentroids[clusterID] = next
+			if metricL2Squared(next, centroids[clusterID]) >= convergenceThreshold*convergenceThreshold {
+				converged = false
+			}
+		}
+		centroids = nextCentroids
+		if converged {
+			break
+		}
+	}
+	return centroids
+}
+
+func fillAssignmentsWithMetric(vectors [][]float32, centroids [][]float32, assignments []int, distanceMetric metric.Metric) {
+	n := len(vectors)
+	if n == 0 {
+		return
+	}
+	nChunks := (n + miniBatchParallelChunkSize - 1) / miniBatchParallelChunkSize
+	workers := runtime.GOMAXPROCS(0)
+	if workers > nChunks {
+		workers = nChunks
+	}
+	if workers < 1 {
+		workers = 1
+	}
+	run := func(worker int) {
+		for chunk := worker; chunk < nChunks; chunk += workers {
+			start := chunk * miniBatchParallelChunkSize
+			end := start + miniBatchParallelChunkSize
+			if end > n {
+				end = n
+			}
+			for i := start; i < end; i++ {
+				assignments[i] = nearestByVector(vectors[i], centroids, distanceMetric)
+			}
+		}
+	}
+	if workers == 1 {
+		run(0)
+		return
+	}
+	var wg sync.WaitGroup
+	for worker := 0; worker < workers; worker++ {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			run(worker)
+		}(worker)
+	}
+	wg.Wait()
+}
+
 func initialMiniBatchCentroids(vectors [][]float32, k int, seed uint64, opts MiniBatchBalancedOptions) ([][]float32, error) {
 	initCap := opts.BatchSize * DefaultMiniBatchInitFactor
 	if initCap < k {
@@ -596,7 +823,7 @@ func initialMiniBatchCentroids(vectors [][]float32, k int, seed uint64, opts Min
 	for i := 0; i < initCap; i++ {
 		initSample[i] = vectors[order[i]]
 	}
-	centroids, err := KMeansPlusPlus(initSample, k, seed, 1)
+	centroids, err := KMeansPlusPlusWithMetric(initSample, k, seed, 1, opts.Metric)
 	if err != nil {
 		return nil, err
 	}
@@ -632,20 +859,20 @@ func RebalanceInitialCentroids(vectors [][]float32, initCentroids [][]float32, o
 		hardLimit = 1
 	}
 	for iter := 0; iter < len(centroids); iter++ {
-		counts, members := assignSampleMembers(vectors, centroids)
+		counts, members := assignSampleMembers(vectors, centroids, opts.Metric)
 		underfilled, oversized := findSkewedSampleClusters(counts, members, underfilledLimit, hardLimit)
 		if len(underfilled) == 0 || len(oversized) == 0 {
 			break
 		}
 		dst := underfilled[0].clusterID
 		src := oversized[0].clusterID
-		mergeTarget := nearestSparseMergeTarget(centroids, underfilled, dst, src)
+		mergeTarget := nearestSparseMergeTarget(centroids, underfilled, dst, src, opts.Metric)
 		if mergeTarget == -1 {
-			mergeTarget = nearestCentroidExcluding(centroids, dst, src)
+			mergeTarget = nearestCentroidExcluding(centroids, dst, opts.Metric, src)
 		}
 		if mergeTarget != -1 && len(members[dst]) > 0 {
 			merged := append(append([]int(nil), members[mergeTarget]...), members[dst]...)
-			centroids[mergeTarget] = meanOfMembers(vectors, merged, len(centroids[mergeTarget]))
+			centroids[mergeTarget] = meanOfMembers(vectors, merged, len(centroids[mergeTarget]), opts.Metric)
 		}
 		if len(members[src]) < 2 {
 			break
@@ -654,7 +881,7 @@ func RebalanceInitialCentroids(vectors [][]float32, initCentroids [][]float32, o
 		for _, idx := range members[src] {
 			srcVectors = append(srcVectors, vectors[idx])
 		}
-		split, err := KMeansPlusPlus(srcVectors, 2, seed^uint64(iter+1)^uint64(src+1)^uint64(dst+1), 2)
+		split, err := KMeansPlusPlusWithMetric(srcVectors, 2, seed^uint64(iter+1)^uint64(src+1)^uint64(dst+1), 2, opts.Metric)
 		if err != nil {
 			return nil, err
 		}
@@ -664,11 +891,11 @@ func RebalanceInitialCentroids(vectors [][]float32, initCentroids [][]float32, o
 	return centroids, nil
 }
 
-func assignSampleMembers(vectors [][]float32, centroids [][]float32) ([]int64, [][]int) {
+func assignSampleMembers(vectors [][]float32, centroids [][]float32, distanceMetric metric.Metric) ([]int64, [][]int) {
 	counts := make([]int64, len(centroids))
 	members := make([][]int, len(centroids))
 	for idx, vec := range vectors {
-		clusterID := nearestByVector(vec, centroids)
+		clusterID := nearestByVector(vec, centroids, distanceMetric)
 		counts[clusterID]++
 		members[clusterID] = append(members[clusterID], idx)
 	}
@@ -713,14 +940,14 @@ func findSkewedSampleClusters(counts []int64, members [][]int, underfilledLimit,
 	return underfilled, oversized
 }
 
-func nearestSparseMergeTarget(centroids [][]float32, underfilled []clusterBucket, clusterID, exclude int) int {
+func nearestSparseMergeTarget(centroids [][]float32, underfilled []clusterBucket, clusterID, exclude int, distanceMetric metric.Metric) int {
 	mergeTarget := -1
 	bestDist := float32(0)
 	for _, candidate := range underfilled {
 		if candidate.clusterID == clusterID || candidate.clusterID == exclude {
 			continue
 		}
-		dist := metricL2Squared(centroids[clusterID], centroids[candidate.clusterID])
+		dist := miniBatchDistance(centroids[clusterID], centroids[candidate.clusterID], distanceMetric)
 		if mergeTarget == -1 || dist < bestDist {
 			mergeTarget = candidate.clusterID
 			bestDist = dist
@@ -729,7 +956,7 @@ func nearestSparseMergeTarget(centroids [][]float32, underfilled []clusterBucket
 	return mergeTarget
 }
 
-func nearestCentroidExcluding(centroids [][]float32, clusterID int, exclude ...int) int {
+func nearestCentroidExcluding(centroids [][]float32, clusterID int, distanceMetric metric.Metric, exclude ...int) int {
 	blocked := make(map[int]struct{}, len(exclude)+1)
 	blocked[clusterID] = struct{}{}
 	for _, candidate := range exclude {
@@ -741,7 +968,7 @@ func nearestCentroidExcluding(centroids [][]float32, clusterID int, exclude ...i
 		if _, ok := blocked[candidateID]; ok {
 			continue
 		}
-		dist := metricL2Squared(centroids[clusterID], centroids[candidateID])
+		dist := miniBatchDistance(centroids[clusterID], centroids[candidateID], distanceMetric)
 		if mergeTarget == -1 || dist < bestDist {
 			mergeTarget = candidateID
 			bestDist = dist
@@ -750,7 +977,7 @@ func nearestCentroidExcluding(centroids [][]float32, clusterID int, exclude ...i
 	return mergeTarget
 }
 
-func meanOfMembers(vectors [][]float32, members []int, dim int) []float32 {
+func meanOfMembers(vectors [][]float32, members []int, dim int, distanceMetric metric.Metric) []float32 {
 	centroid := make([]float32, dim)
 	if len(members) == 0 {
 		return centroid
@@ -764,14 +991,15 @@ func meanOfMembers(vectors [][]float32, members []int, dim int) []float32 {
 	for d := range centroid {
 		centroid[d] *= inv
 	}
+	normalizeCentroidForMetric(centroid, distanceMetric)
 	return centroid
 }
 
-func nearestByVector(vec []float32, centroids [][]float32) int {
+func nearestByVector(vec []float32, centroids [][]float32, distanceMetric metric.Metric) int {
 	best := 0
-	bestDist := metricL2Squared(vec, centroids[0])
+	bestDist := miniBatchDistance(vec, centroids[0], distanceMetric)
 	for i := 1; i < len(centroids); i++ {
-		dist := metricL2Squared(vec, centroids[i])
+		dist := miniBatchDistance(vec, centroids[i], distanceMetric)
 		if dist < bestDist {
 			best = i
 			bestDist = dist

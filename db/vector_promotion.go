@@ -147,6 +147,7 @@ func prepareIncrementalPromotion(
 		BatchSize:         min(max(256, targetSize*2), 4096),
 		MaxIter:           4,
 		TargetClusterSize: targetSize,
+		Metric:            spec.InternalMetric(),
 	}
 	for _, source := range sources {
 		extra := source.splits
@@ -419,6 +420,7 @@ func prepareIncrementalRepair(
 		BatchSize:         min(max(256, targetSize*2), 4096),
 		MaxIter:           4,
 		TargetClusterSize: targetSize,
+		Metric:            spec.InternalMetric(),
 	}
 	for _, source := range overfull {
 		if underIdx >= len(underfull) {
@@ -653,7 +655,7 @@ func clusterSplitSeedsFromRows(
 	if len(vectors) <= extra {
 		return nil, nil
 	}
-	split, err := kmeans.KMeansPlusPlus(vectors, extra+1, spec.Seed^uint64(clusterID), 3)
+	split, err := kmeans.KMeansPlusPlusWithMetric(vectors, extra+1, spec.Seed^uint64(clusterID), 3, spec.InternalMetric())
 	if err != nil {
 		return nil, err
 	}
