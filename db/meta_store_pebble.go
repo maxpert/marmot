@@ -1,9 +1,11 @@
 package db
 
 import (
+	"errors"
 	"encoding/binary"
-	"hash/crc32"
 	"fmt"
+	"hash/crc32"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -423,6 +425,181 @@ func prefixUpperBound(prefix []byte) []byte {
 		upper[i] = 0xFF
 	}
 	return upper
+}
+
+func (s *PebbleMetaStore) cdcRawWALPath() string {
+	return filepath.Join(s.path, cdcRawWALFileName)
+}
+
+func (s *PebbleMetaStore) openCDCRawWAL() error {
+	s.cdcWALMu.Lock()
+	defer s.cdcWALMu.Unlock()
+
+	if s.cdcWALFile != nil {
+		return nil
+	}
+
+	f, err := os.OpenFile(s.cdcRawWALPath(), os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return fmt.Errorf("open cdc raw wal: %w", err)
+	}
+
+	s.cdcWALFile = f
+	return nil
+}
+
+func (s *PebbleMetaStore) closeCDCRawWAL() error {
+	s.cdcWALMu.Lock()
+	defer s.cdcWALMu.Unlock()
+
+	if s.cdcWALFile == nil {
+		return nil
+	}
+
+	err := s.cdcWALFile.Close()
+	s.cdcWALFile = nil
+	return err
+}
+
+func encodeCDCRawPointer(pointer cdcRawPointer) []byte {
+	b := make([]byte, cdcRawPointerSize)
+	binary.BigEndian.PutUint32(b[0:4], cdcRawPointerMagic)
+	b[4] = cdcRawPointerVer
+	binary.BigEndian.PutUint32(b[8:12], pointer.Length)
+	binary.BigEndian.PutUint32(b[12:16], pointer.CRC32)
+	binary.BigEndian.PutUint64(b[16:24], pointer.Offset)
+	return b
+}
+
+func decodeCDCRawPointer(data []byte) (cdcRawPointer, error) {
+	if len(data) != cdcRawPointerSize {
+		return cdcRawPointer{}, errors.New("invalid cdc raw pointer size")
+	}
+
+	magic := binary.BigEndian.Uint32(data[:4])
+	if magic != cdcRawPointerMagic {
+		return cdcRawPointer{}, errors.New("invalid cdc raw pointer magic")
+	}
+	if data[4] != cdcRawPointerVer {
+		return cdcRawPointer{}, fmt.Errorf("unsupported cdc raw pointer version: %d", data[4])
+	}
+
+	return cdcRawPointer{
+		Offset: binary.BigEndian.Uint64(data[16:24]),
+		Length: binary.BigEndian.Uint32(data[8:12]),
+		CRC32:  binary.BigEndian.Uint32(data[12:16]),
+	}, nil
+}
+
+func (s *PebbleMetaStore) appendToCDCRawWAL(data []byte) (cdcRawPointer, error) {
+	crc := crc32.ChecksumIEEE(data)
+	length := uint32(len(data))
+
+	entry := make([]byte, cdcRawHeaderSize+len(data))
+	binary.BigEndian.PutUint32(entry[0:4], cdcRawPointerMagic)
+	entry[4] = cdcRawPointerVer
+	binary.BigEndian.PutUint32(entry[8:12], length)
+	binary.BigEndian.PutUint32(entry[12:16], crc)
+	copy(entry[16:], data)
+
+	s.cdcWALMu.Lock()
+	defer s.cdcWALMu.Unlock()
+
+	if s.cdcWALFile == nil {
+		if err := s.openCDCRawWAL(); err != nil {
+			return cdcRawPointer{}, err
+		}
+	}
+
+	offset, err := s.cdcWALFile.Seek(0, io.SeekEnd)
+	if err != nil {
+		return cdcRawPointer{}, fmt.Errorf("seek cdc raw wal: %w", err)
+	}
+
+	n, err := s.cdcWALFile.Write(entry)
+	if err != nil {
+		return cdcRawPointer{}, fmt.Errorf("write cdc raw wal: %w", err)
+	}
+	if n < len(entry) {
+		return cdcRawPointer{}, io.ErrShortWrite
+	}
+
+	if err := s.cdcWALFile.Sync(); err != nil {
+		// Keep path functional on non-fsync filesystems.
+		log.Warn().Err(err).Str("path", s.cdcRawWALPath()).Msg("CDC WAL sync failed")
+	}
+
+	return cdcRawPointer{Offset: uint64(offset), Length: length, CRC32: crc}, nil
+}
+
+func (s *PebbleMetaStore) readCDCRawPayload(pointer cdcRawPointer) ([]byte, error) {
+	if pointer.Length == 0 {
+		return nil, nil
+	}
+
+	s.cdcWALMu.Lock()
+	defer s.cdcWALMu.Unlock()
+
+	if s.cdcWALFile == nil {
+		if err := s.openCDCRawWAL(); err != nil {
+			return nil, err
+		}
+	}
+
+	if _, err := s.cdcWALFile.Seek(int64(pointer.Offset), io.SeekStart); err != nil {
+		return nil, fmt.Errorf("seek cdc raw wal payload: %w", err)
+	}
+
+	header := make([]byte, cdcRawHeaderSize)
+	n, err := s.cdcWALFile.Read(header)
+	if err != nil {
+		return nil, fmt.Errorf("read cdc raw wal header: %w", err)
+	}
+	if n < len(header) {
+		return nil, io.ErrUnexpectedEOF
+	}
+
+	magic := binary.BigEndian.Uint32(header[0:4])
+	ver := header[4]
+	if magic != cdcRawPointerMagic || ver != cdcRawPointerVer {
+		return nil, errors.New("invalid cdc raw wal header")
+	}
+
+	storedLength := binary.BigEndian.Uint32(header[8:12])
+	storedCRC := binary.BigEndian.Uint32(header[12:16])
+	if storedLength != pointer.Length || storedCRC != pointer.CRC32 {
+		return nil, errors.New("cdc raw wal header mismatch")
+	}
+
+	rowData := make([]byte, pointer.Length)
+	n, err = s.cdcWALFile.Read(rowData)
+	if err != nil {
+		return nil, fmt.Errorf("read cdc raw wal payload: %w", err)
+	}
+	if uint32(n) < pointer.Length {
+		return nil, io.ErrUnexpectedEOF
+	}
+
+	if crc32.ChecksumIEEE(rowData) != pointer.CRC32 {
+		return nil, errors.New("cdc raw wal crc mismatch")
+	}
+
+	return rowData, nil
+}
+
+func (s *PebbleMetaStore) decodeCapturedRowValue(data []byte) ([]byte, error) {
+	if len(data) == cdcRawPointerSize {
+		if pointer, err := decodeCDCRawPointer(data); err == nil {
+			return s.readCDCRawPayload(pointer)
+		}
+	}
+
+	if len(data) == 0 {
+		return nil, errors.New("empty captured row")
+	}
+
+	// Backward compatibility with inline EncodedCapturedRow values.
+	return data, nil
 }
 
 // getValueCopy reads a key and returns a copy of the value
