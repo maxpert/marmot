@@ -29,7 +29,6 @@ func NewTxnBuilder() *TxnBuilder {
 			ReadConsistency:       protocol.ConsistencyLocalOne,
 			Database:              "test",
 			RequiredSchemaVersion: 0,
-			LocalExecutionDone:    false,
 		},
 	}
 }
@@ -88,12 +87,6 @@ func (b *TxnBuilder) WithWriteConsistency(level protocol.ConsistencyLevel) *TxnB
 // WithRequiredSchemaVersion sets the required schema version
 func (b *TxnBuilder) WithRequiredSchemaVersion(version uint64) *TxnBuilder {
 	b.txn.RequiredSchemaVersion = version
-	return b
-}
-
-// WithLocalExecutionDone sets whether local execution is already done
-func (b *TxnBuilder) WithLocalExecutionDone(done bool) *TxnBuilder {
-	b.txn.LocalExecutionDone = done
 	return b
 }
 

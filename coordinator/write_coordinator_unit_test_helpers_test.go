@@ -122,16 +122,6 @@ func TestTxnBuilder(t *testing.T) {
 		}
 	})
 
-	t.Run("WithLocalExecutionDone", func(t *testing.T) {
-		txn := NewTxnBuilder().
-			WithLocalExecutionDone(true).
-			Build()
-
-		if !txn.LocalExecutionDone {
-			t.Error("LocalExecutionDone: got false, want true")
-		}
-	})
-
 	t.Run("FluentAPI", func(t *testing.T) {
 		oldVals := map[string][]byte{"id": {1}}
 		newVals := map[string][]byte{"id": {2}}

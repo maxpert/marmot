@@ -618,9 +618,8 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, params []in
 		}
 	}
 
-	// Build transaction for replication
-	// LocalExecutionDone is always false - coordinator commits via CDC replay like remotes
-	// This is the new unified commit path that avoids hookDB/writeDB deadlock
+	// Build transaction for replication. The coordinator commits through CDC
+	// replay like remotes, which avoids hookDB/writeDB deadlock.
 	txn := &Transaction{
 		ID:                    uint64(txnID),
 		NodeID:                h.nodeID,
@@ -629,7 +628,6 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, params []in
 		WriteConsistency:      consistency,
 		Database:              stmt.Database,
 		RequiredSchemaVersion: schemaVersion,
-		LocalExecutionDone:    false, // Coordinator commits via CDC replay, same as remotes
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), getWriteTimeout())

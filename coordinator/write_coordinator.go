@@ -70,9 +70,6 @@ type Transaction struct {
 	ReadConsistency       protocol.ConsistencyLevel
 	Database              string // Target database name
 	RequiredSchemaVersion uint64 // Minimum schema version required to execute this transaction
-	// LocalExecutionDone indicates that local execution was already performed
-	// (e.g., via ExecuteLocalWithHooks). Skip local replication in WriteTransaction.
-	LocalExecutionDone bool
 }
 
 // ReplicationRequest is sent to replica nodes
