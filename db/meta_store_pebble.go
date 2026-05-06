@@ -1281,18 +1281,21 @@ func (s *PebbleMetaStore) DeleteIntentsByTxn(txnID uint64) (err error) {
 	if s == nil || s.closed.Load() {
 		return fmt.Errorf("pebble metastore closed")
 	}
-	s.dmlIntents.Delete(txnID)
+	_, hadDML := s.dmlIntents.LoadAndDelete(txnID)
 	_, hasPersisted := s.persistedIntentTxns.LoadAndDelete(txnID)
-	prefix := pebbleIntentByTxnPrefix(txnID)
 
 	// Release all row locks for this transaction
 	s.rowLocks.ReleaseByTxn(txnID)
 
-	if !hasPersisted {
+	if hadDML && !hasPersisted {
 		return nil
 	}
 
-	// Collect /intent_txn/ index keys to delete
+	return s.deleteIntentTxnIndexByPrefix(txnID)
+}
+
+func (s *PebbleMetaStore) deleteIntentTxnIndexByPrefix(txnID uint64) error {
+	prefix := pebbleIntentByTxnPrefix(txnID)
 	var indexKeys [][]byte
 
 	iter, err := s.db.NewIter(&pebble.IterOptions{
@@ -1346,10 +1349,13 @@ func (s *PebbleMetaStore) MarkIntentsForCleanup(txnID uint64) error {
 func (s *PebbleMetaStore) CleanupAfterCommit(txnID uint64) error {
 	// Single pass: mark GC, release locks, get keys (no Pebble iteration)
 	lockKeys := s.rowLocks.MarkGCAndRelease(txnID)
-	s.dmlIntents.Delete(txnID)
+	_, hadDML := s.dmlIntents.LoadAndDelete(txnID)
 	_, hasPersisted := s.persistedIntentTxns.LoadAndDelete(txnID)
-	if !hasPersisted {
+	if hadDML && !hasPersisted {
 		return nil
+	}
+	if !hasPersisted || len(lockKeys) == 0 {
+		return s.deleteIntentTxnIndexByPrefix(txnID)
 	}
 
 	// Single batch for intent index deletions only
