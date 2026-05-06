@@ -98,6 +98,7 @@ type MetaStoreConfiguration struct {
 	L0CompactionThreshold int   `toml:"l0_compaction_threshold"` // L0 compaction trigger (default: 500)
 	L0StopWrites          int   `toml:"l0_stop_writes"`          // L0 stop writes trigger (default: 1000)
 	WALBytesPerSyncKB     int   `toml:"wal_bytes_per_sync_kb"`   // Background WAL sync every N KB (default: 512, 0=disabled)
+	StrictPrepareSync     bool  `toml:"strict_prepare_sync"`     // Wait for CDC segment fsync before PREPARE ACK (default: false)
 }
 
 // ConnectionPoolConfiguration controls database connection pooling
@@ -289,12 +290,13 @@ var Config = &Configuration{
 	},
 
 	MetaStore: MetaStoreConfiguration{
-		CacheSizeMB:           128,  // 128MB block cache (reduce Pebble disk reads)
-		MemTableSizeMB:        64,   // 64MB memtable (CockroachDB-style)
-		MemTableCount:         2,    // 2 memtables
-		L0CompactionThreshold: 500,  // CockroachDB default
-		L0StopWrites:          1000, // CockroachDB default
-		WALBytesPerSyncKB:     512,  // 512KB (CockroachDB default)
+		CacheSizeMB:           128,   // 128MB block cache (reduce Pebble disk reads)
+		MemTableSizeMB:        64,    // 64MB memtable (CockroachDB-style)
+		MemTableCount:         2,     // 2 memtables
+		L0CompactionThreshold: 500,   // CockroachDB default
+		L0StopWrites:          1000,  // CockroachDB default
+		WALBytesPerSyncKB:     512,   // 512KB (CockroachDB default)
+		StrictPrepareSync:     false, // Fast default: grouped async CDC segment sync
 	},
 
 	ConnectionPool: ConnectionPoolConfiguration{

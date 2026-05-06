@@ -135,6 +135,8 @@ type SQLiteBatchCommitter struct {
 	// Background task state
 	checkpointRunning atomic.Bool
 	vacuumRunning     atomic.Bool
+	vacuumScheduled   atomic.Bool
+	lastFlushNanos    atomic.Int64
 	bgWg              sync.WaitGroup
 }
 
@@ -450,11 +452,12 @@ func (bc *SQLiteBatchCommitter) flush(batch map[uint64]*pendingCommit, trigger s
 		}
 		return
 	}
+	bc.lastFlushNanos.Store(time.Now().UnixNano())
 
 	// Adaptive checkpoint for larger WAL sizes
 	if bc.checkpointEnabled {
 		walSizeMB := bc.checkWALSize()
-		if walSizeMB >= bc.checkpointPassiveThreshMB {
+		if walSizeMB >= bc.checkpointPassiveThreshMB && bc.checkpointRunning.CompareAndSwap(false, true) {
 			bc.bgWg.Add(1)
 			go func() {
 				defer bc.bgWg.Done()
@@ -497,10 +500,10 @@ func (bc *SQLiteBatchCommitter) checkWALSize() float64 {
 // backgroundCheckpoint runs checkpoint in goroutine without blocking flush.
 func (bc *SQLiteBatchCommitter) backgroundCheckpoint(walSizeMB float64) {
 	if bc.stopped.Load() {
+		bc.checkpointRunning.Store(false)
 		return
 	}
 
-	bc.checkpointRunning.Store(true)
 	defer bc.checkpointRunning.Store(false)
 
 	start := time.Now()
@@ -548,14 +551,7 @@ func (bc *SQLiteBatchCommitter) backgroundCheckpoint(walSizeMB float64) {
 			Int64("duration_ms", duration.Milliseconds()).
 			Msg("Adaptive checkpoint completed")
 
-		// Run incremental vacuum after successful checkpoint
-		if bc.incrementalVacuumEnabled && !bc.vacuumRunning.Load() {
-			bc.bgWg.Add(1)
-			go func() {
-				defer bc.bgWg.Done()
-				bc.backgroundIncrementalVacuum()
-			}()
-		}
+		bc.scheduleIncrementalVacuumIfIdle()
 	} else {
 		log.Warn().
 			Err(err).
@@ -563,6 +559,34 @@ func (bc *SQLiteBatchCommitter) backgroundCheckpoint(walSizeMB float64) {
 			Float64("wal_size_mb", walSizeMB).
 			Msg("Background checkpoint failed")
 	}
+}
+
+func (bc *SQLiteBatchCommitter) scheduleIncrementalVacuumIfIdle() {
+	if !bc.incrementalVacuumEnabled || bc.stopped.Load() || bc.vacuumRunning.Load() {
+		return
+	}
+	if !bc.vacuumScheduled.CompareAndSwap(false, true) {
+		return
+	}
+	bc.bgWg.Add(1)
+	go func() {
+		defer bc.bgWg.Done()
+		defer bc.vacuumScheduled.Store(false)
+		const idleDelay = 500 * time.Millisecond
+		time.Sleep(idleDelay)
+		if bc.stopped.Load() || !bc.hasBeenWriteIdleFor(idleDelay) {
+			return
+		}
+		bc.backgroundIncrementalVacuum()
+	}()
+}
+
+func (bc *SQLiteBatchCommitter) hasBeenWriteIdleFor(d time.Duration) bool {
+	last := bc.lastFlushNanos.Load()
+	if last == 0 {
+		return true
+	}
+	return time.Since(time.Unix(0, last)) >= d
 }
 
 // backgroundIncrementalVacuum reclaims freelist pages with a time budget.

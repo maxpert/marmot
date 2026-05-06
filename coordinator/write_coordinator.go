@@ -208,19 +208,22 @@ func (wc *WriteCoordinator) validateStatements(txn *Transaction) error {
 }
 
 // buildPrepareRequest creates a ReplicationRequest for the prepare phase.
-// CDC data (OldValues/NewValues) is stripped - only metadata for conflict detection.
+// DML CDC row images are included because PREPARE is the 2PC durability point:
+// a participant that ACKs PREPARE must be able to commit after a crash.
 func (wc *WriteCoordinator) buildPrepareRequest(txn *Transaction) *ReplicationRequest {
-	// Strip CDC data from statements - only send metadata for PREPARE
 	prepareStmts := make([]protocol.Statement, len(txn.Statements))
 	for i, stmt := range txn.Statements {
+		isDML := isDMLStatement(stmt.Type)
 		prepareStmts[i] = protocol.Statement{
 			Type:      stmt.Type,
 			TableName: stmt.TableName,
 			Database:  stmt.Database,
 			IntentKey: stmt.IntentKey,
-			SQL:       stmt.SQL, // Keep SQL for DDL statements
-			// OldValues: nil - NOT sent in PREPARE
-			// NewValues: nil - NOT sent in PREPARE
+			OldValues: stmt.OldValues,
+			NewValues: stmt.NewValues,
+		}
+		if !isDML {
+			prepareStmts[i].SQL = stmt.SQL
 		}
 		if isVectorControlStatement(stmt.Type) {
 			prepareStmts[i].VectorIndexName = stmt.VectorIndexName
@@ -260,15 +263,46 @@ func isVectorControlStatement(stmtType protocol.StatementCode) bool {
 }
 
 // buildCommitRequest creates a ReplicationRequest for the commit phase.
-// CDC data (OldValues/NewValues) is included - deferred from PREPARE phase.
+// DML CDC data was made durable during PREPARE; COMMIT only carries decision
+// metadata. Non-DML statements still carry their control payloads.
 func (wc *WriteCoordinator) buildCommitRequest(txn *Transaction) *ReplicationRequest {
+	commitStmts := make([]protocol.Statement, len(txn.Statements))
+	for i, stmt := range txn.Statements {
+		commitStmts[i] = protocol.Statement{
+			Type:      stmt.Type,
+			TableName: stmt.TableName,
+			Database:  stmt.Database,
+			IntentKey: stmt.IntentKey,
+		}
+		if !isDMLStatement(stmt.Type) {
+			commitStmts[i].SQL = stmt.SQL
+			commitStmts[i].LoadDataPayload = stmt.LoadDataPayload
+			commitStmts[i].VectorIndexName = stmt.VectorIndexName
+			commitStmts[i].VectorColumnName = stmt.VectorColumnName
+			commitStmts[i].VectorMetric = stmt.VectorMetric
+			commitStmts[i].VectorDim = stmt.VectorDim
+			commitStmts[i].VectorNlist = stmt.VectorNlist
+			commitStmts[i].VectorNprobe = stmt.VectorNprobe
+			commitStmts[i].VectorMaxNorm = stmt.VectorMaxNorm
+			commitStmts[i].VectorIndexChange = stmt.VectorIndexChange
+		}
+	}
 	return &ReplicationRequest{
 		TxnID:      txn.ID,
 		Phase:      PhaseCommit,
 		StartTS:    txn.StartTS,
 		NodeID:     wc.nodeID,
 		Database:   txn.Database,
-		Statements: txn.Statements, // Full CDC data included in COMMIT
+		Statements: commitStmts,
+	}
+}
+
+func isDMLStatement(stmtType protocol.StatementCode) bool {
+	switch stmtType {
+	case protocol.StatementInsert, protocol.StatementUpdate, protocol.StatementDelete, protocol.StatementReplace:
+		return true
+	default:
+		return false
 	}
 }
 

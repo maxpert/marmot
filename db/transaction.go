@@ -28,7 +28,6 @@ type Transaction struct {
 	CommitTS              hlc.Timestamp
 	Status                TxnStatus
 	Statements            []protocol.Statement
-	StatementFallback     bool   // Execute SQL statements directly when CDC hooks are unavailable
 	RequiredSchemaVersion uint64 // Minimum schema version required for this transaction
 	mu                    sync.RWMutex
 }
@@ -296,14 +295,6 @@ func (tm *TransactionManager) CommitTransaction(txn *Transaction) error {
 			return fmt.Errorf("failed to fetch write intents: %w", err)
 		}
 
-		// Non-hook fallback: when explicitly marked by replication/coordination
-		// path, apply concrete DML SQL directly in commit phase.
-		if txn.StatementFallback {
-			if err := tm.applyStatementFallbackDML(txn.ID, txn.Statements); err != nil {
-				return err
-			}
-		}
-
 		if err := tm.applyNonDMLIntents(txn.ID, intents); err != nil {
 			return err
 		}
@@ -367,61 +358,6 @@ func (tm *TransactionManager) notifyVectorCDC(txn *Transaction, entries []*Inten
 	if err := notifier.ApplyCommittedVectorCDC(context.Background(), dbName, txn.ID, seqNum, cdcEntries); err != nil {
 		log.Error().Err(err).Uint64("txn_id", txn.ID).Str("database", dbName).Msg("Failed to apply committed vector CDC")
 	}
-}
-
-func isStatementFallbackDML(stmt protocol.Statement) bool {
-	if len(stmt.OldValues) > 0 || len(stmt.NewValues) > 0 {
-		return false
-	}
-	if stmt.SQL == "" {
-		return false
-	}
-	switch stmt.Type {
-	case protocol.StatementInsert, protocol.StatementUpdate, protocol.StatementDelete, protocol.StatementReplace:
-		return true
-	default:
-		return false
-	}
-}
-
-// applyStatementFallbackDML executes DML SQL directly when CDC hooks were not available.
-func (tm *TransactionManager) applyStatementFallbackDML(txnID uint64, statements []protocol.Statement) error {
-	if len(statements) == 0 {
-		return nil
-	}
-
-	tx, err := tm.db.Begin()
-	if err != nil {
-		return fmt.Errorf("failed to begin fallback DML transaction: %w", err)
-	}
-	defer tx.Rollback()
-
-	applied := 0
-	for _, stmt := range statements {
-		if !isStatementFallbackDML(stmt) {
-			continue
-		}
-		if len(stmt.ExtractedParams) > 0 {
-			if _, err := tx.Exec(stmt.SQL, stmt.ExtractedParams...); err != nil {
-				return fmt.Errorf("failed to execute fallback DML: %w", err)
-			}
-		} else {
-			if _, err := tx.Exec(stmt.SQL); err != nil {
-				return fmt.Errorf("failed to execute fallback DML: %w", err)
-			}
-		}
-		applied++
-	}
-
-	if applied == 0 {
-		return nil
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit fallback DML transaction: %w", err)
-	}
-
-	log.Debug().Uint64("txn_id", txnID).Int("statement_count", applied).Msg("Applied statement-based DML fallback")
-	return nil
 }
 
 // calculateCommitTS determines the commit timestamp (must be > start_ts).

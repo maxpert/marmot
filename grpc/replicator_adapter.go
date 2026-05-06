@@ -122,7 +122,6 @@ func convertStatementsToProto(stmts []protocol.Statement, database string, txnID
 				},
 			}
 		case isDML && (len(stmt.NewValues) > 0 || len(stmt.OldValues) > 0):
-			// CDC path: send row data instead of SQL
 			protoStmt.Payload = &Statement_RowChange{
 				RowChange: &RowChange{
 					IntentKey: stmt.IntentKey,
@@ -130,8 +129,13 @@ func convertStatementsToProto(stmts []protocol.Statement, database string, txnID
 					NewValues: stmt.NewValues,
 				},
 			}
+		case isDML:
+			protoStmt.Payload = &Statement_DmlIntent{
+				DmlIntent: &DMLIntent{
+					IntentKey: stmt.IntentKey,
+				},
+			}
 		default:
-			// DDL or DML without CDC data: send SQL
 			protoStmt.Payload = &Statement_DdlChange{
 				DdlChange: &DDLChange{
 					Sql: stmt.SQL,

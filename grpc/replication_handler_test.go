@@ -306,6 +306,16 @@ func newLeavingHandlerFixture(t *testing.T) (*ReplicationHandler, *NodeRegistry,
 	if err := dbMgr.CreateDatabase(testDB); err != nil {
 		t.Fatalf("Failed to create test database: %v", err)
 	}
+	userDB, err := dbMgr.GetDatabase(testDB)
+	if err != nil {
+		t.Fatalf("Failed to get test database: %v", err)
+	}
+	if _, err := userDB.GetDB().Exec("CREATE TABLE t (id INTEGER PRIMARY KEY)"); err != nil {
+		t.Fatalf("Failed to create test table: %v", err)
+	}
+	if err := userDB.ReloadSchema(); err != nil {
+		t.Fatalf("Failed to reload test schema: %v", err)
+	}
 
 	systemDB, err := dbMgr.GetDatabase(db.SystemDatabaseName)
 	if err != nil {

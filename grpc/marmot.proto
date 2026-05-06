@@ -160,6 +160,7 @@ message Statement {
     DDLChange ddl_change = 5;  // For DDL - SQL statement only
     LoadDataChange load_data_change = 6; // For LOAD DATA LOCAL INFILE
     VectorIndexChange vector_index_change = 7; // For vector index control metadata
+    DMLIntent dml_intent = 8; // DML decision metadata without row payload
   }
 }
 
@@ -209,6 +210,10 @@ message RowChange {
   // - REPLACE: old_values for conflict check, new_values for data
   map<string, bytes> old_values = 2;  // Column name -> serialized value (before image)
   map<string, bytes> new_values = 3;  // Column name -> serialized value (after image)
+}
+
+message DMLIntent {
+  bytes intent_key = 1;
 }
 
 // DDL schema change (CREATE/DROP/ALTER)

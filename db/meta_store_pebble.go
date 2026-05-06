@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"sync"
@@ -74,6 +75,13 @@ type PebbleMetaStore struct {
 
 	// Optional transaction getter for conflict resolution (set by MemoryMetaStore wrapper)
 	txnGetter TransactionGetter
+}
+
+func cdcPrepareSyncStrict() bool {
+	if cfg.Config != nil && cfg.Config.MetaStore.StrictPrepareSync {
+		return true
+	}
+	return os.Getenv("MARMOT_CDC_PREPARE_SYNC") == "strict"
 }
 
 // Ensure PebbleMetaStore implements MetaStore
@@ -207,6 +215,11 @@ func NewPebbleMetaStore(path string, opts PebbleMetaStoreOptions) (*PebbleMetaSt
 		return nil, fmt.Errorf("failed to open cdc segment log: %w", err)
 	}
 	store.cdcLog = cdcLog
+	if err := store.recoverPreparedCDCState(); err != nil {
+		_ = cdcLog.close()
+		db.Close()
+		return nil, fmt.Errorf("failed to recover prepared CDC state: %w", err)
+	}
 
 	return store, nil
 }
@@ -225,6 +238,115 @@ func rejectLegacyCDCRawKeys(db *pebble.DB) error {
 		return fmt.Errorf("legacy per-row CDC payload keys found under %s; clean or rebuild node data", pebblePrefixCDCRaw)
 	}
 	return iter.Error()
+}
+
+func (s *PebbleMetaStore) recoverPreparedCDCState() error {
+	for _, txnID := range s.cdcLog.pendingTxnIDs() {
+		commit, err := s.readCommitRecord(txnID)
+		if err != nil {
+			return err
+		}
+		if commit != nil {
+			s.cdcLog.discardTxn(txnID)
+			continue
+		}
+
+		status, err := s.readTxnStatus(txnID)
+		if err != nil && err != pebble.ErrNotFound {
+			return err
+		}
+		if err == nil && status != TxnStatusPending {
+			s.cdcLog.discardTxn(txnID)
+			continue
+		}
+
+		manifest := s.cdcLog.getPendingManifest(txnID)
+		if manifest == nil {
+			continue
+		}
+		if err := s.ensureRecoveredPreparedTransaction(txnID, manifest, status, err); err != nil {
+			return err
+		}
+		if err := s.restorePreparedDMLIntents(txnID, manifest); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *PebbleMetaStore) ensureRecoveredPreparedTransaction(txnID uint64, manifest *cdcSegmentTxnManifest, status TxnStatus, statusErr error) error {
+	immutable, err := s.readImmutableTxnRecord(txnID)
+	if err != nil {
+		return err
+	}
+	if immutable == nil {
+		if manifest.NodeID == 0 {
+			return nil
+		}
+		startTS := hlc.Timestamp{
+			WallTime: manifest.StartTSWall,
+			Logical:  manifest.StartTSLogical,
+			NodeID:   manifest.NodeID,
+		}
+		if err := s.writeImmutableTxnRecord(txnID, manifest.NodeID, startTS); err != nil {
+			return err
+		}
+	}
+	if statusErr == pebble.ErrNotFound {
+		if err := s.db.Set(pebbleTxnStatusKey(txnID), []byte{byte(TxnStatusPending)}, pebble.NoSync); err != nil {
+			return err
+		}
+		return s.db.Set(pebbleTxnPendingKey(txnID), nil, pebble.NoSync)
+	}
+	if status == TxnStatusPending {
+		return s.db.Set(pebbleTxnPendingKey(txnID), nil, pebble.NoSync)
+	}
+	return nil
+}
+
+func (s *PebbleMetaStore) restorePreparedDMLIntents(txnID uint64, manifest *cdcSegmentTxnManifest) error {
+	cursor := newCDCSegmentCursor(s.cdcLog, manifest)
+	defer cursor.Close()
+
+	batch := s.db.NewBatch()
+	defer batch.Close()
+
+	now := time.Now().UnixNano()
+	for cursor.Next() {
+		_, data := cursor.Row()
+		row, err := DecodeRow(data)
+		if err != nil {
+			return err
+		}
+		tableName := row.Table
+		intentKey := string(row.IntentKey)
+		s.rowLocks.AcquireLock("", tableName, intentKey, txnID)
+
+		rec := &WriteIntentRecord{
+			IntentType: IntentTypeDML,
+			TableName:  tableName,
+			IntentKey:  append([]byte(nil), row.IntentKey...),
+			TxnID:      txnID,
+			TSWall:     manifest.StartTSWall,
+			TSLogical:  manifest.StartTSLogical,
+			NodeID:     manifest.NodeID,
+			Operation:  OpType(row.Op),
+			CreatedAt:  now,
+		}
+		recBytes, err := encoding.MarshalNative(rec)
+		if err != nil {
+			return err
+		}
+		if err := batch.Set(pebbleIntentByTxnKey(txnID, tableName, intentKey), recBytes.Bytes(), nil); err != nil {
+			recBytes.Dispose()
+			return err
+		}
+		recBytes.Dispose()
+	}
+	if err := cursor.Err(); err != nil {
+		return err
+	}
+	return batch.Commit(pebble.NoSync)
 }
 
 // Close closes the Pebble DB (idempotent - safe to call multiple times)
@@ -600,15 +722,16 @@ func (s *PebbleMetaStore) BeginTransaction(txnID, nodeID uint64, startTS hlc.Tim
 	return batch.Commit(pebble.NoSync)
 }
 
-// DurablyPrepareTransaction force-syncs the prepare promise after all intents
-// have been written. This keeps individual intent writes cheap while ensuring
-// a PREPARE ACK survives a local crash.
+// DurablyPrepareTransaction publishes the prepare promise after all CDC rows
+// have been written. The default path queues segment fsync through the grouped
+// CDC syncer to match Pebble NoSync hot-path behavior; set
+// MARMOT_CDC_PREPARE_SYNC=strict to wait for fsync before PREPARE ACK.
 func (s *PebbleMetaStore) DurablyPrepareTransaction(txnID uint64) error {
 	statusBuf := []byte{byte(TxnStatusPending)}
 	if err := s.db.Set(pebbleTxnStatusKey(txnID), statusBuf, pebble.NoSync); err != nil {
 		return err
 	}
-	return s.cdcLog.appendPrepareFence(txnID)
+	return s.sealCapturedRows(txnID, cdcPrepareSyncStrict())
 }
 
 // CommitTransaction marks a transaction as COMMITTED
@@ -987,7 +1110,12 @@ func (s *PebbleMetaStore) WriteIntent(txnID uint64, intentType IntentType, table
 		}
 	}
 
-	// Lock acquired - write full record to /intent_txn/
+	if intentType == IntentTypeDML {
+		sqlStmt = ""
+		data = nil
+	}
+
+	// Lock acquired - write intent metadata to /intent_txn/.
 	rec := &WriteIntentRecord{
 		IntentType:   intentType,
 		TableName:    tableName,
@@ -1628,19 +1756,34 @@ func (s *PebbleMetaStore) WriteCapturedRow(txnID, seq uint64, data []byte) error
 
 // SealCapturedRows makes a transaction's CDC range durable and publishes its manifest.
 func (s *PebbleMetaStore) SealCapturedRows(txnID uint64) error {
-	manifest, err := s.cdcLog.sealTxn(txnID)
+	return s.sealCapturedRows(txnID, cdcPrepareSyncStrict())
+}
+
+func (s *PebbleMetaStore) sealCapturedRows(txnID uint64, waitSync bool) error {
+	immutable, err := s.readImmutableTxnRecord(txnID)
+	if err != nil {
+		return err
+	}
+	manifest, err := s.cdcLog.sealTxn(txnID, immutable, waitSync)
 	if err != nil {
 		if errors.Is(err, errCDCSegmentTxnNotFound) {
 			return nil
 		}
 		return err
 	}
+	if manifest.published {
+		return nil
+	}
 	native, err := encoding.MarshalNative(manifest)
 	if err != nil {
 		return err
 	}
 	defer native.Dispose()
-	return s.db.Set(pebbleCDCManifestKey(txnID), native.Bytes(), pebble.NoSync)
+	if err := s.db.Set(pebbleCDCManifestKey(txnID), native.Bytes(), pebble.NoSync); err != nil {
+		return err
+	}
+	s.cdcLog.markTxnManifestPublished(txnID)
+	return nil
 }
 
 // IterateCapturedRows returns a cursor over raw captured rows for a transaction.

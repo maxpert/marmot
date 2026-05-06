@@ -102,8 +102,7 @@ func TestLocalReplicator_PrepareWithCDC(t *testing.T) {
 	ctx := context.Background()
 	startTS := hlc.Timestamp{WallTime: 1000, Logical: 1}
 
-	// PREPARE request - in new design CDC data is stripped by coordinator
-	// but we test that even if present, it's NOT stored
+	// PREPARE carries CDC row images because it is the 2PC durability point.
 	req := &coordinator.ReplicationRequest{
 		TxnID:    2,
 		NodeID:   1,
@@ -150,13 +149,13 @@ func TestLocalReplicator_PrepareWithCDC(t *testing.T) {
 		t.Fatalf("Expected 1 write intent, got %d", len(intents))
 	}
 
-	// Verify CDC intent entries are NOT stored during PREPARE (deferred to COMMIT)
+	// PREPARE is the 2PC durability point, so CDC row images are persisted before ACK.
 	entries, err := metaStore.GetIntentEntries(2)
 	if err != nil {
 		t.Fatalf("Failed to get intent entries: %v", err)
 	}
-	if len(entries) != 0 {
-		t.Fatalf("CDC entries should NOT be stored during PREPARE - got %d entries (deferred to COMMIT)", len(entries))
+	if len(entries) != 1 {
+		t.Fatalf("Expected 1 CDC entry during PREPARE, got %d", len(entries))
 	}
 }
 

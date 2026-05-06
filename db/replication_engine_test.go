@@ -120,8 +120,7 @@ func TestReplicationEngine_PrepareWithCDC(t *testing.T) {
 	ctx := context.Background()
 	startTS := hlc.Timestamp{WallTime: 2000, Logical: 1}
 
-	// PREPARE phase only sends metadata (no CDC data in new design)
-	// CDC data (OldValues/NewValues) is stripped by coordinator and sent in COMMIT
+	// PREPARE carries CDC row images because it is the 2PC durability point.
 	req := &PrepareRequest{
 		TxnID:    1002,
 		NodeID:   1,
@@ -133,8 +132,6 @@ func TestReplicationEngine_PrepareWithCDC(t *testing.T) {
 				TableName: "users",
 				IntentKey: []byte("users:1"),
 				SQL:       "INSERT INTO users (id, name) VALUES (1, 'alice')",
-				// Note: NewValues would be nil in actual PREPARE (stripped by coordinator)
-				// But we still test that they're NOT stored
 				NewValues: map[string][]byte{
 					"id":   []byte("1"),
 					"name": []byte("alice"),
@@ -179,13 +176,14 @@ func TestReplicationEngine_PrepareWithCDC(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, intents, 3, "Should have 3 write intents for conflict detection")
 
-	// Verify CDC intent entries are NOT stored during PREPARE (deferred to COMMIT)
+	// PREPARE is the 2PC durability point, so CDC row images are persisted before ACK.
 	entries, err := metaStore.GetIntentEntries(1002)
 	require.NoError(t, err)
-	require.Len(t, entries, 0, "CDC entries should NOT be stored during PREPARE - deferred to COMMIT")
+	require.Len(t, entries, 3, "CDC entries should be stored during PREPARE")
 }
 
-// TestReplicationEngine_DeferredCDCFlow tests the full PREPARE → COMMIT flow with deferred CDC
+// TestReplicationEngine_PrepareDurableCDCFlow tests the full PREPARE → COMMIT flow
+// with CDC row images durable at PREPARE and decision-only COMMIT.
 func TestReplicationEngine_DeferredCDCFlow(t *testing.T) {
 	engine, dm, cleanup := setupTestReplicationEngine(t)
 	defer cleanup()
@@ -203,7 +201,13 @@ func TestReplicationEngine_DeferredCDCFlow(t *testing.T) {
 	ctx := context.Background()
 	startTS := hlc.Timestamp{WallTime: 3000, Logical: 1}
 
-	// PREPARE phase - only metadata, no CDC data
+	encodedValues := encodeTestValues(map[string]interface{}{
+		"id":   int64(1),
+		"name": "alice",
+	})
+
+	// PREPARE phase carries CDC row data because participants must be able to
+	// commit after a crash once they ACK PREPARE.
 	prepareReq := &PrepareRequest{
 		TxnID:    1099,
 		NodeID:   1,
@@ -214,7 +218,7 @@ func TestReplicationEngine_DeferredCDCFlow(t *testing.T) {
 				Type:      protocol.StatementInsert,
 				TableName: "users",
 				IntentKey: []byte("users:1"),
-				// In real flow, OldValues/NewValues would be nil here (stripped by coordinator)
+				NewValues: encodedValues,
 			},
 		},
 	}
@@ -222,7 +226,7 @@ func TestReplicationEngine_DeferredCDCFlow(t *testing.T) {
 	prepResult := engine.Prepare(ctx, prepareReq)
 	require.True(t, prepResult.Success, "PREPARE should succeed")
 
-	// Verify write intent created but NO CDC entries
+	// Verify write intent and CDC entries are created during PREPARE.
 	metaStore := db.GetMetaStore()
 	intents, err := metaStore.GetIntentsByTxn(1099)
 	require.NoError(t, err)
@@ -230,9 +234,9 @@ func TestReplicationEngine_DeferredCDCFlow(t *testing.T) {
 
 	entries, err := metaStore.GetIntentEntries(1099)
 	require.NoError(t, err)
-	require.Len(t, entries, 0, "NO CDC entries during PREPARE")
+	require.Len(t, entries, 1, "CDC entries should be durable during PREPARE")
 
-	// COMMIT phase - includes CDC data (msgpack-encoded values)
+	// COMMIT phase is decision metadata only; row data is already durable.
 	commitReq := &CommitRequest{
 		TxnID:    1099,
 		Database: "testdb",
@@ -241,10 +245,6 @@ func TestReplicationEngine_DeferredCDCFlow(t *testing.T) {
 				Type:      protocol.StatementInsert,
 				TableName: "users",
 				IntentKey: []byte("users:1"),
-				NewValues: encodeTestValues(map[string]interface{}{
-					"id":   int64(1),
-					"name": "alice",
-				}),
 			},
 		},
 	}

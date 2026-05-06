@@ -10,7 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestBuildPrepareRequest_StripsCDCData(t *testing.T) {
+func TestBuildPrepareRequest_IncludesCDCData(t *testing.T) {
 	wc := &WriteCoordinator{
 		nodeID: 1,
 	}
@@ -59,10 +59,10 @@ func TestBuildPrepareRequest_StripsCDCData(t *testing.T) {
 	// Verify statements count is preserved
 	require.Len(t, req.Statements, 2)
 
-	// Verify CDC data (OldValues, NewValues) is stripped
+	// Verify CDC data is included because PREPARE is the durability point.
 	for i, stmt := range req.Statements {
-		assert.Nil(t, stmt.OldValues, "Statement %d should have nil OldValues", i)
-		assert.Nil(t, stmt.NewValues, "Statement %d should have nil NewValues", i)
+		assert.Equal(t, txn.Statements[i].OldValues, stmt.OldValues)
+		assert.Equal(t, txn.Statements[i].NewValues, stmt.NewValues)
 
 		// Verify metadata is preserved
 		assert.Equal(t, txn.Statements[i].Type, stmt.Type)
@@ -72,7 +72,7 @@ func TestBuildPrepareRequest_StripsCDCData(t *testing.T) {
 	}
 }
 
-func TestBuildCommitRequest_IncludesCDCData(t *testing.T) {
+func TestBuildCommitRequest_StripsCDCData(t *testing.T) {
 	wc := &WriteCoordinator{
 		nodeID: 1,
 	}
@@ -103,15 +103,15 @@ func TestBuildCommitRequest_IncludesCDCData(t *testing.T) {
 	assert.Equal(t, txn.Database, req.Database)
 	assert.Equal(t, PhaseCommit, req.Phase)
 
-	// Verify statements include full CDC data
+	// Verify commit carries decision metadata only. CDC row data was made
+	// durable during PREPARE.
 	require.Len(t, req.Statements, 1)
 	stmt := req.Statements[0]
 
 	assert.Equal(t, txn.Statements[0].Type, stmt.Type)
 	assert.Equal(t, txn.Statements[0].TableName, stmt.TableName)
-	require.NotNil(t, stmt.NewValues)
-	assert.Equal(t, []byte("1"), stmt.NewValues["id"])
-	assert.Equal(t, []byte("Alice"), stmt.NewValues["name"])
+	assert.Nil(t, stmt.OldValues)
+	assert.Nil(t, stmt.NewValues)
 }
 
 func TestEstimateCDCPayloadSize(t *testing.T) {

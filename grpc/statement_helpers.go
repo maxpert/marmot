@@ -7,6 +7,9 @@ func (stmt *Statement) GetIntentKey() []byte {
 	if rowChange := stmt.GetRowChange(); rowChange != nil {
 		return rowChange.IntentKey
 	}
+	if dmlIntent := stmt.GetDmlIntent(); dmlIntent != nil {
+		return dmlIntent.IntentKey
+	}
 	return nil
 }
 

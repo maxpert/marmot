@@ -67,7 +67,7 @@ func (lr *LocalReplicator) handleCommit(ctx context.Context, req *coordinator.Re
 	engineReq := &CommitRequest{
 		TxnID:      req.TxnID,
 		Database:   req.Database,
-		Statements: req.Statements, // CDC data deferred from PREPARE phase
+		Statements: req.Statements,
 	}
 
 	result := lr.engine.Commit(ctx, engineReq)

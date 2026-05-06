@@ -146,7 +146,7 @@ func TestWriteIntent_DetectsGCMarker(t *testing.T) {
 	intent, err := store.GetIntent(tableName, intentKey)
 	require.NoError(t, err)
 	require.Equal(t, txnID2, intent.TxnID, "Intent should belong to new transaction")
-	require.Equal(t, []byte("data2"), intent.DataSnapshot)
+	require.Nil(t, intent.DataSnapshot, "DML row payloads live in CDC segment storage, not write intents")
 }
 
 // TestRowLockStore_PersistenceAcrossRestart tests that RowLockStore is ephemeral and starts empty after restart

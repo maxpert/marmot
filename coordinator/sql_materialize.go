@@ -10,7 +10,7 @@ import (
 )
 
 // materializeSQLWithParams replaces top-level '?' placeholders with SQL literals.
-// This is used only for statement-based DML fallback when CDC hooks are unavailable.
+// This is used by fallback vector-query rewriting, not by DML replication.
 func materializeSQLWithParams(sql string, params []interface{}) (string, error) {
 	if !strings.Contains(sql, "?") {
 		if len(params) > 0 {

@@ -350,15 +350,16 @@ func TestBuildCommitRequest_StatementsIncluded(t *testing.T) {
 
 	req := wc.buildCommitRequest(txn)
 
-	// Statements with full CDC data should be included in COMMIT request (deferred from PREPARE)
+	// DML statements are still included in COMMIT, but row images are not:
+	// they were made durable during PREPARE.
 	if len(req.Statements) != 5 {
 		t.Errorf("expected 5 statements in commit request, got %d", len(req.Statements))
 	}
 
-	// Verify CDC data is present
+	// Verify CDC data is not duplicated in COMMIT.
 	for i, stmt := range req.Statements {
-		if len(stmt.NewValues) == 0 {
-			t.Errorf("statement %d: expected NewValues, got empty", i)
+		if len(stmt.OldValues) != 0 || len(stmt.NewValues) != 0 {
+			t.Errorf("statement %d: expected no CDC row image in COMMIT", i)
 		}
 	}
 }

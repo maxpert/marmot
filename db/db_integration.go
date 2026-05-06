@@ -681,8 +681,12 @@ func (mdb *ReplicatedDatabase) ExecuteLocalWithHooks(ctx context.Context, txnID 
 		return nil, fmt.Errorf("failed to rollback hook session: %w", err)
 	}
 
-	// Get CDC entries cached by session processing - avoids a second cursor pass.
-	cdcEntries, _ := session.GetIntentEntries()
+	// Get CDC entries cached by session processing. Capture errors must be
+	// propagated so DML never falls back to statement replication.
+	cdcEntries, err := session.GetIntentEntries()
+	if err != nil {
+		return nil, fmt.Errorf("failed to collect CDC entries: %w", err)
+	}
 
 	// Return completed execution with captured CDC data
 	return &CompletedLocalExecution{

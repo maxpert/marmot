@@ -178,7 +178,8 @@ func (rh *ReplicationHandler) handleCommit(ctx context.Context, req *Transaction
 		telemetry.ReplicaCommitSeconds.Observe(time.Since(commitStart).Seconds())
 	}()
 
-	// Convert proto statements to internal format (CDC data deferred from PREPARE)
+	// Convert proto statements to internal format. DML row images are already
+	// durable from PREPARE; COMMIT may carry only DML intent metadata.
 	statements := make([]protocol.Statement, 0, len(req.Statements))
 	for _, stmt := range req.Statements {
 		statements = append(statements, protocolStatementFromProto(stmt))
@@ -187,7 +188,7 @@ func (rh *ReplicationHandler) handleCommit(ctx context.Context, req *Transaction
 	engineReq := &db.CommitRequest{
 		TxnID:      req.TxnId,
 		Database:   req.Database,
-		Statements: statements, // CDC data deferred from PREPARE phase
+		Statements: statements,
 	}
 
 	result := rh.engine.Commit(ctx, engineReq)

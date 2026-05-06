@@ -76,12 +76,21 @@ func focusedRowStatement(dbName string, stmtType pb.StatementType, row *RowChang
 	}
 }
 
+func focusedDMLIntentStatement(dbName string, stmtType pb.StatementType, intentKey []byte) *Statement {
+	return &Statement{
+		Type:      stmtType,
+		TableName: "docs",
+		Database:  dbName,
+		Payload:   &Statement_DmlIntent{DmlIntent: &DMLIntent{IntentKey: intentKey}},
+	}
+}
+
 func TestReplicationHandlerTwoPCDeferredCDCInsertUpdateDelete(t *testing.T) {
 	handler, dbMgr, dbName := newFocusedReplicationHandler(t, "focused_2pc_cdc")
 	clock := hlc.NewClock(2)
 	ctx := context.Background()
 
-	prepare := func(txnID uint64, stmtType pb.StatementType, intentKey []byte) {
+	prepare := func(txnID uint64, stmtType pb.StatementType, row *RowChange) {
 		t.Helper()
 		resp, err := handler.HandleReplicateTransaction(ctx, &TransactionRequest{
 			TxnId:        txnID,
@@ -90,7 +99,7 @@ func TestReplicationHandlerTwoPCDeferredCDCInsertUpdateDelete(t *testing.T) {
 			Phase:        TransactionPhase_PREPARE,
 			Timestamp:    focusedHLC(clock),
 			Statements: []*Statement{
-				focusedRowStatement(dbName, stmtType, &RowChange{IntentKey: intentKey}),
+				focusedRowStatement(dbName, stmtType, row),
 			},
 		})
 		if err != nil {
@@ -119,7 +128,16 @@ func TestReplicationHandlerTwoPCDeferredCDCInsertUpdateDelete(t *testing.T) {
 		}
 	}
 
-	prepare(1001, pb.StatementType_INSERT, []byte("docs:1"))
+	insertRow := &RowChange{
+		IntentKey: []byte("docs:1"),
+		NewValues: map[string][]byte{
+			"id":    mustMarshalMsgpack(t, int64(1)),
+			"title": mustMarshalMsgpack(t, "alpha"),
+			"score": mustMarshalMsgpack(t, int64(10)),
+			"body":  mustMarshalMsgpack(t, "first body"),
+		},
+	}
+	prepare(1001, pb.StatementType_INSERT, insertRow)
 	mdb, err := dbMgr.GetDatabase(dbName)
 	if err != nil {
 		t.Fatalf("GetDatabase: %v", err)
@@ -132,19 +150,10 @@ func TestReplicationHandlerTwoPCDeferredCDCInsertUpdateDelete(t *testing.T) {
 		t.Fatalf("PREPARE applied row before COMMIT: count=%d", count)
 	}
 
-	commit(1001, focusedRowStatement(dbName, pb.StatementType_INSERT, &RowChange{
-		IntentKey: []byte("docs:1"),
-		NewValues: map[string][]byte{
-			"id":    mustMarshalMsgpack(t, int64(1)),
-			"title": mustMarshalMsgpack(t, "alpha"),
-			"score": mustMarshalMsgpack(t, int64(10)),
-			"body":  mustMarshalMsgpack(t, "first body"),
-		},
-	}))
+	commit(1001, focusedDMLIntentStatement(dbName, pb.StatementType_INSERT, []byte("docs:1")))
 	assertDocRow(t, mdb, 1, "alpha", 10)
 
-	prepare(1002, pb.StatementType_UPDATE, []byte("docs:1"))
-	commit(1002, focusedRowStatement(dbName, pb.StatementType_UPDATE, &RowChange{
+	updateRow := &RowChange{
 		IntentKey: []byte("docs:1"),
 		OldValues: map[string][]byte{
 			"id":    mustMarshalMsgpack(t, int64(1)),
@@ -157,16 +166,19 @@ func TestReplicationHandlerTwoPCDeferredCDCInsertUpdateDelete(t *testing.T) {
 			"score": mustMarshalMsgpack(t, int64(20)),
 			"body":  mustMarshalMsgpack(t, nil),
 		},
-	}))
+	}
+	prepare(1002, pb.StatementType_UPDATE, updateRow)
+	commit(1002, focusedDMLIntentStatement(dbName, pb.StatementType_UPDATE, []byte("docs:1")))
 	assertDocRow(t, mdb, 1, "beta", 20)
 
-	prepare(1003, pb.StatementType_DELETE, []byte("docs:1"))
-	commit(1003, focusedRowStatement(dbName, pb.StatementType_DELETE, &RowChange{
+	deleteRow := &RowChange{
 		IntentKey: []byte("docs:1"),
 		OldValues: map[string][]byte{
 			"id": mustMarshalMsgpack(t, int64(1)),
 		},
-	}))
+	}
+	prepare(1003, pb.StatementType_DELETE, deleteRow)
+	commit(1003, focusedDMLIntentStatement(dbName, pb.StatementType_DELETE, []byte("docs:1")))
 	if err := mdb.GetDB().QueryRow(`SELECT COUNT(*) FROM docs WHERE id = 1`).Scan(&count); err != nil {
 		t.Fatalf("count after delete: %v", err)
 	}
@@ -201,7 +213,17 @@ func TestReplicationHandlerPrepareConflictAbortRecovery(t *testing.T) {
 			Phase:        TransactionPhase_PREPARE,
 			Timestamp:    focusedHLC(clock),
 			Statements: []*Statement{
-				focusedRowStatement(dbName, pb.StatementType_UPDATE, &RowChange{IntentKey: []byte("docs:1")}),
+				focusedRowStatement(dbName, pb.StatementType_UPDATE, &RowChange{
+					IntentKey: []byte("docs:1"),
+					OldValues: map[string][]byte{
+						"id":    mustMarshalMsgpack(t, int64(1)),
+						"title": mustMarshalMsgpack(t, "seed"),
+					},
+					NewValues: map[string][]byte{
+						"id":    mustMarshalMsgpack(t, int64(1)),
+						"title": mustMarshalMsgpack(t, "updated"),
+					},
+				}),
 			},
 		}
 	}

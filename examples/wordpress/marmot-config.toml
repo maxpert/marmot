@@ -62,6 +62,7 @@ memtable_count = 2
 l0_compaction_threshold = 500
 l0_stop_writes = 1000
 wal_bytes_per_sync_kb = 512
+strict_prepare_sync = false  # true waits for CDC segment fsync before PREPARE ACK
 wal_sync_interval_ms = 10
 
 [logging]
