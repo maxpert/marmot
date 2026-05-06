@@ -253,7 +253,6 @@ func recordMaintenanceDeltas(
 	if state == nil || state.ProbeState() == nil {
 		return nil
 	}
-	batchRows := make(map[int64]maintenanceBatchRow, len(entries))
 	for _, entry := range entries {
 		if entry.Table != meta.TableName {
 			continue
@@ -261,10 +260,6 @@ func recordMaintenanceDeltas(
 		oldRowID, oldRowOK, err := decodeCDCInt64(entry.OldValues, pkColumn)
 		if err != nil {
 			return fmt.Errorf("vector local changes: decode old rowid for maintenance: %w", err)
-		}
-		newRowID, newRowOK, err := decodeCDCInt64(entry.NewValues, pkColumn)
-		if err != nil {
-			return fmt.Errorf("vector local changes: decode new rowid for maintenance: %w", err)
 		}
 		oldRaw, _, err := decodeCDCBytes(entry.OldValues, meta.ColumnName)
 		if err != nil {
@@ -278,23 +273,17 @@ func recordMaintenanceDeltas(
 			continue
 		}
 		oldCluster := int64(0)
-		var oldVec []float32
 		if oldRowOK {
-			if current, ok := batchRows[oldRowID]; ok {
-				if current.live {
-					oldCluster = current.cluster
-					oldVec = current.vec
-				}
-			} else {
-				oldCluster = currentRowCluster(state, overlaySnapshot, oldRowID)
-				assignedCluster, preparedVec, err := maintenancePreparedCluster(state, spec, oldRaw)
-				if err != nil {
-					return err
-				}
-				oldVec = preparedVec
-				if oldCluster == 0 {
-					oldCluster = assignedCluster
-				}
+			oldCluster = currentRowCluster(state, overlaySnapshot, oldRowID)
+		}
+		_, oldVec, err := maintenancePreparedCluster(state, spec, oldRaw)
+		if err != nil {
+			return err
+		}
+		if oldCluster == 0 {
+			oldCluster, _, err = maintenancePreparedCluster(state, spec, oldRaw)
+			if err != nil {
+				return err
 			}
 		}
 		newCluster, newVec, err := maintenancePreparedCluster(state, spec, newRaw)
@@ -302,26 +291,8 @@ func recordMaintenanceDeltas(
 			return err
 		}
 		state.RecordClusterMutation(oldCluster, oldVec, newCluster, newVec)
-		if oldRowOK && (!newRowOK || oldRowID != newRowID || len(newRaw) == 0) {
-			batchRows[oldRowID] = maintenanceBatchRow{}
-		}
-		if len(newRaw) > 0 {
-			rowID := newRowID
-			if !newRowOK {
-				rowID = oldRowID
-			}
-			if rowID != 0 {
-				batchRows[rowID] = maintenanceBatchRow{cluster: newCluster, vec: newVec, live: newCluster > 0}
-			}
-		}
 	}
 	return nil
-}
-
-type maintenanceBatchRow struct {
-	cluster int64
-	vec     []float32
-	live    bool
 }
 
 func currentRowCluster(state *vecindex.IndexState, overlaySnapshot *vecindex.OverlaySnapshot, rowID int64) int64 {

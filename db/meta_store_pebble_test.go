@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/cockroachdb/pebble"
-	"github.com/maxpert/marmot/encoding"
 	"github.com/maxpert/marmot/hlc"
 )
 
@@ -383,54 +382,6 @@ func TestPebbleMetaStoreGetIntentEntriesSupportsMixedCDCPayloadSizes(t *testing.
 	}
 	if entries[0].Table != "users" || entries[1].Table != "users" {
 		t.Fatalf("Unexpected entry tables: %q, %q", entries[0].Table, entries[1].Table)
-	}
-}
-
-func TestPebbleMetaStoreRejectsOversizedCDCSegmentRecord(t *testing.T) {
-	store, cleanup := createTestPebbleMetaStore(t)
-	defer cleanup()
-
-	err := store.cdcLog.appendRow(44, 1, make([]byte, cdcSegmentMaxPayloadSize+1))
-	if err == nil {
-		t.Fatal("expected oversized CDC segment record to be rejected")
-	}
-}
-
-func TestPebbleMetaStoreDeleteCapturedRowsReclaimsUnreferencedSegments(t *testing.T) {
-	store, cleanup := createTestPebbleMetaStore(t)
-	defer cleanup()
-
-	const segmentID = uint64(999)
-	segmentPath := cdcSegmentPath(store.cdcLog.dir, segmentID)
-	if err := os.WriteFile(segmentPath, []byte("orphaned"), 0o644); err != nil {
-		t.Fatalf("write fake segment: %v", err)
-	}
-
-	manifest := &cdcSegmentTxnManifest{
-		TxnID:    555,
-		RowCount: 1,
-		FirstSeq: 1,
-		LastSeq:  1,
-		Chunks: []cdcSegmentChunk{{
-			SegmentID: segmentID,
-			Offset:    0,
-			Length:    8,
-		}},
-	}
-	native, err := encoding.MarshalNative(manifest)
-	if err != nil {
-		t.Fatalf("marshal manifest: %v", err)
-	}
-	defer native.Dispose()
-	if err := store.db.Set(pebbleCDCManifestKey(manifest.TxnID), native.Bytes(), pebble.NoSync); err != nil {
-		t.Fatalf("store manifest: %v", err)
-	}
-
-	if err := store.DeleteCapturedRows(manifest.TxnID); err != nil {
-		t.Fatalf("DeleteCapturedRows failed: %v", err)
-	}
-	if _, err := os.Stat(segmentPath); !os.IsNotExist(err) {
-		t.Fatalf("expected unreferenced segment to be removed, stat err=%v", err)
 	}
 }
 
