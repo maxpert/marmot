@@ -362,6 +362,40 @@ func (bc *SQLiteBatchCommitter) flush(batch map[uint64]*pendingCommit, trigger s
 	ctx, cancel := context.WithTimeout(context.Background(), batchCommitTimeout)
 	defer cancel()
 
+	txnIDs := make([]uint64, 0, len(batch))
+	for txnID := range batch {
+		txnIDs = append(txnIDs, txnID)
+	}
+	sort.Slice(txnIDs, func(i, j int) bool { return txnIDs[i] < txnIDs[j] })
+
+	if sealCapturedRows != nil {
+		var wg sync.WaitGroup
+		for _, txnID := range txnIDs {
+			wg.Add(1)
+			go func(txnID uint64) {
+				defer wg.Done()
+				if err := sealCapturedRows(txnID); err != nil {
+					batch[txnID].err = err
+				}
+			}(txnID)
+		}
+		wg.Wait()
+	}
+
+	hasReadyTxn := false
+	for _, txnID := range txnIDs {
+		if batch[txnID].err == nil {
+			hasReadyTxn = true
+			break
+		}
+	}
+	if !hasReadyTxn {
+		for _, pc := range batch {
+			pc.promise.Set(nil, pc.err)
+		}
+		return
+	}
+
 	conn, err := bc.db.Conn(ctx)
 	if err != nil {
 		for _, pc := range batch {
@@ -389,26 +423,6 @@ func (bc *SQLiteBatchCommitter) flush(batch map[uint64]*pendingCommit, trigger s
 
 	// Create schema adapter for the unified applier
 	schemaAdapter := &schemaCacheAdapter{cache: schemaCache}
-
-	txnIDs := make([]uint64, 0, len(batch))
-	for txnID := range batch {
-		txnIDs = append(txnIDs, txnID)
-	}
-	sort.Slice(txnIDs, func(i, j int) bool { return txnIDs[i] < txnIDs[j] })
-
-	if sealCapturedRows != nil {
-		var wg sync.WaitGroup
-		for _, txnID := range txnIDs {
-			wg.Add(1)
-			go func(txnID uint64) {
-				defer wg.Done()
-				if err := sealCapturedRows(txnID); err != nil {
-					batch[txnID].err = err
-				}
-			}(txnID)
-		}
-		wg.Wait()
-	}
 
 	// Apply each logical transaction under a savepoint. A failed transaction
 	// rolls back its own row changes without poisoning successful peers in the
