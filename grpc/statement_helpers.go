@@ -5,7 +5,10 @@ package grpc
 // GetIntentKey extracts intent key from either RowChange or falls back to nil
 func (stmt *Statement) GetIntentKey() []byte {
 	if rowChange := stmt.GetRowChange(); rowChange != nil {
-		return rowChange.IntentKey
+		row, err := DecodeRowChangeForCDC(stmt)
+		if err == nil && row != nil {
+			return row.IntentKey
+		}
 	}
 	if dmlIntent := stmt.GetDmlIntent(); dmlIntent != nil {
 		return dmlIntent.IntentKey

@@ -129,9 +129,14 @@ type Statement struct {
 	Error     string        `msgpack:"Error"`     // Error message if Type is StatementUnsupported
 
 	// CDC: Row-level change data (for DML operations)
-	// Populated by preupdate hooks after local execution, sent to replicas instead of SQL
+	// Decoded local apply state. Replication sends EncodedRow, not raw SQL.
 	OldValues map[string][]byte `msgpack:"OldValues"` // Before image (for UPDATE/DELETE)
 	NewValues map[string][]byte `msgpack:"NewValues"` // After image (for INSERT/UPDATE/REPLACE)
+	Operation uint8             `msgpack:"Operation,omitempty"`
+
+	// EncodedRow carries the canonical msgpack EncodedCapturedRow bytes.
+	EncodedRow   []byte `msgpack:"EncodedRow,omitempty"`
+	EncodedCodec uint32 `msgpack:"EncodedCodec,omitempty"`
 
 	// ISFilter holds extracted WHERE clause values for INFORMATION_SCHEMA queries
 	ISFilter InformationSchemaFilter

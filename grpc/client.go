@@ -261,13 +261,7 @@ func (c *Client) RegisterTestConnection(nodeID uint64, conn *grpc.ClientConn) {
 func estimateStatementSize(stmt *Statement) int {
 	size := len(stmt.TableName)
 	if rc := stmt.GetRowChange(); rc != nil {
-		size += len(rc.IntentKey)
-		for _, v := range rc.OldValues {
-			size += len(v)
-		}
-		for _, v := range rc.NewValues {
-			size += len(v)
-		}
+		size += len(rc.EncodedRow)
 	}
 	if vc := stmt.GetVectorIndexChange(); vc != nil {
 		size += len(vc.Database) + len(vc.IndexName) + len(vc.TableName) + len(vc.ColumnName) + len(vc.Metric) + 128

@@ -191,8 +191,11 @@ func (wc *WriteCoordinator) cleanupStagedPayloads(txnID uint64) {
 // validateStatements validates that all CDC statements have required fields for replication
 func (wc *WriteCoordinator) validateStatements(txn *Transaction) error {
 	for i, stmt := range txn.Statements {
-		hasCDCData := len(stmt.OldValues) > 0 || len(stmt.NewValues) > 0
-		if hasCDCData && stmt.TableName == "" {
+		isDML := isDMLStatement(stmt.Type)
+		if isDML && len(stmt.EncodedRow) == 0 {
+			return fmt.Errorf("DML statement missing encoded CDC row (stmt %d)", i)
+		}
+		if isDML && stmt.TableName == "" {
 			log.Error().
 				Uint64("txn_id", txn.ID).
 				Int("stmt_index", i).
@@ -212,12 +215,13 @@ func (wc *WriteCoordinator) buildPrepareRequest(txn *Transaction) *ReplicationRe
 	for i, stmt := range txn.Statements {
 		isDML := isDMLStatement(stmt.Type)
 		prepareStmts[i] = protocol.Statement{
-			Type:      stmt.Type,
-			TableName: stmt.TableName,
-			Database:  stmt.Database,
-			IntentKey: stmt.IntentKey,
-			OldValues: stmt.OldValues,
-			NewValues: stmt.NewValues,
+			Type:         stmt.Type,
+			TableName:    stmt.TableName,
+			Database:     stmt.Database,
+			IntentKey:    stmt.IntentKey,
+			Operation:    stmt.Operation,
+			EncodedRow:   stmt.EncodedRow,
+			EncodedCodec: stmt.EncodedCodec,
 		}
 		if !isDML {
 			prepareStmts[i].SQL = stmt.SQL
@@ -308,12 +312,7 @@ func isDMLStatement(stmtType protocol.StatementCode) bool {
 func estimateCDCPayloadSize(statements []protocol.Statement) int {
 	var size int
 	for _, stmt := range statements {
-		for _, v := range stmt.OldValues {
-			size += len(v)
-		}
-		for _, v := range stmt.NewValues {
-			size += len(v)
-		}
+		size += len(stmt.EncodedRow)
 		size += len(stmt.IntentKey)
 		size += len(stmt.TableName)
 	}

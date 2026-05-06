@@ -347,21 +347,25 @@ func (ds *DeltaSyncClient) applyChangeEvent(ctx context.Context, event *ChangeEv
 
 	for _, stmt := range event.Statements {
 		// Check for CDC data (RowChange payload)
-		if rowChange := stmt.GetRowChange(); rowChange != nil && (len(rowChange.NewValues) > 0 || len(rowChange.OldValues) > 0) {
+		if rowChange := stmt.GetRowChange(); rowChange != nil && len(rowChange.EncodedRow) > 0 {
 			// CDC path: apply row data directly using unified applier
 			schemaAdapter := &deltaSyncSchemaAdapter{dbMgr: ds.dbManager, dbName: database}
 			opType, opErr := wireDMLToOp(stmt.Type)
 			if opErr != nil {
 				return opErr
 			}
-			if err := db.ApplyCDCValues(tx, schemaAdapter, opType, stmt.TableName, rowChange.OldValues, rowChange.NewValues); err != nil {
+			row, rowErr := decodeRowChange(stmt)
+			if rowErr != nil {
+				return rowErr
+			}
+			if err := db.ApplyCDCValues(tx, schemaAdapter, opType, stmt.TableName, row.OldValues, row.NewValues); err != nil {
 				return fmt.Errorf("failed to apply CDC statement: %w", err)
 			}
 			log.Debug().
 				Str("table", stmt.TableName).
-				Hex("intent_key", rowChange.IntentKey).
-				Int("new_values", len(rowChange.NewValues)).
-				Int("old_values", len(rowChange.OldValues)).
+				Hex("intent_key", row.IntentKey).
+				Int("new_values", len(row.NewValues)).
+				Int("old_values", len(row.OldValues)).
 				Msg("DELTA-SYNC: Applied CDC data")
 			continue
 		}
@@ -442,14 +446,21 @@ func (ds *DeltaSyncClient) applyVectorCDCFromEvent(ctx context.Context, database
 	entries := make([]common.CDCEntry, 0, len(statements))
 	for _, stmt := range statements {
 		rowChange := stmt.GetRowChange()
-		if rowChange == nil || (len(rowChange.NewValues) == 0 && len(rowChange.OldValues) == 0) {
+		if rowChange == nil || len(rowChange.EncodedRow) == 0 {
 			continue
+		}
+		row, err := decodeRowChange(stmt)
+		if err != nil {
+			return err
 		}
 		entries = append(entries, common.CDCEntry{
 			Table:        stmt.TableName,
-			IntentKey:    rowChange.IntentKey,
-			OldValues:    rowChange.OldValues,
-			NewValues:    rowChange.NewValues,
+			IntentKey:    row.IntentKey,
+			Operation:    row.Op,
+			OldValues:    row.OldValues,
+			NewValues:    row.NewValues,
+			EncodedRow:   rowChange.EncodedRow,
+			EncodedCodec: rowChange.EncodedRowCodec,
 			CommitTxnID:  txnID,
 			CommitSeqNum: seqNum,
 		})

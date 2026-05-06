@@ -74,7 +74,6 @@ type MetaStore interface {
 	ReleaseDDLLock(dbName string, nodeID uint64) error
 
 	// CDC intent entries (final processed format)
-	WriteIntentEntry(txnID, seq uint64, op uint8, table, intentKey string, oldVals, newVals map[string][]byte) error
 	GetIntentEntries(txnID uint64) ([]*IntentEntry, error)
 	DeleteIntentEntries(txnID uint64) error
 	CleanupAfterCommit(txnID uint64) error
@@ -82,6 +81,7 @@ type MetaStore interface {
 	// CDC raw capture (fast path during hook - stores raw values without per-value encoding)
 	WriteCapturedRow(txnID, seq uint64, data []byte) error
 	SealCapturedRows(txnID uint64) error
+	HasCapturedRows(txnID uint64) bool
 	IterateCapturedRows(txnID uint64) (CapturedRowCursor, error)
 	DeleteCapturedRow(txnID, seq uint64) error
 	DeleteCapturedRows(txnID uint64) error

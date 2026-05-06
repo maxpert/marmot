@@ -83,11 +83,7 @@ func TestFullReplication_QuorumWrite(t *testing.T) {
 		ID:     1,
 		NodeID: 1,
 		Statements: []protocol.Statement{
-			{
-				SQL:       "INSERT INTO users VALUES (1, 'Alice')",
-				Type:      protocol.StatementInsert,
-				TableName: "users",
-			},
+			testCDCStatement("users", nil, map[string][]byte{"id": []byte("1"), "name": []byte("Alice")}),
 		},
 		StartTS:          hlc.Timestamp{WallTime: 1000, Logical: 0, NodeID: 1},
 		WriteConsistency: protocol.ConsistencyQuorum,
@@ -143,11 +139,7 @@ func TestFullReplication_QuorumFailure(t *testing.T) {
 		ID:     1,
 		NodeID: 1,
 		Statements: []protocol.Statement{
-			{
-				SQL:       "INSERT INTO users VALUES (1, 'Alice')",
-				Type:      protocol.StatementInsert,
-				TableName: "users",
-			},
+			testCDCStatement("users", nil, map[string][]byte{"id": []byte("1"), "name": []byte("Alice")}),
 		},
 		StartTS:          hlc.Timestamp{WallTime: 1000, Logical: 0, NodeID: 1},
 		WriteConsistency: protocol.ConsistencyQuorum,
@@ -187,11 +179,7 @@ func TestFullReplication_AllNodesReceiveWrite(t *testing.T) {
 		ID:     1,
 		NodeID: 1,
 		Statements: []protocol.Statement{
-			{
-				SQL:       "INSERT INTO users VALUES (1, 'Alice')",
-				Type:      protocol.StatementInsert,
-				TableName: "users",
-			},
+			testCDCStatement("users", nil, map[string][]byte{"id": []byte("1"), "name": []byte("Alice")}),
 		},
 		StartTS:          hlc.Timestamp{WallTime: 1000, Logical: 0, NodeID: 1},
 		WriteConsistency: protocol.ConsistencyQuorum,
@@ -242,11 +230,7 @@ func TestFullReplication_NodeFailureDuringWrite(t *testing.T) {
 		ID:     1,
 		NodeID: 1,
 		Statements: []protocol.Statement{
-			{
-				SQL:       "INSERT INTO users VALUES (1, 'Alice')",
-				Type:      protocol.StatementInsert,
-				TableName: "users",
-			},
+			testCDCStatement("users", nil, map[string][]byte{"id": []byte("1"), "name": []byte("Alice")}),
 		},
 		StartTS:          hlc.Timestamp{WallTime: 1000, Logical: 0, NodeID: 1},
 		WriteConsistency: protocol.ConsistencyQuorum,
@@ -364,11 +348,7 @@ func TestCommitQuorumFailure_CoordinatorDoesNotCommit(t *testing.T) {
 		ID:     1,
 		NodeID: 1,
 		Statements: []protocol.Statement{
-			{
-				SQL:       "INSERT INTO users VALUES (1, 'Alice')",
-				Type:      protocol.StatementInsert,
-				TableName: "users",
-			},
+			testCDCStatement("users", nil, map[string][]byte{"id": []byte("1"), "name": []byte("Alice")}),
 		},
 		StartTS:          hlc.Timestamp{WallTime: 1000, Logical: 0, NodeID: 1},
 		WriteConsistency: protocol.ConsistencyQuorum,
@@ -427,11 +407,7 @@ func TestCommitQuorumSuccess_PartialRemoteFailure(t *testing.T) {
 		ID:     2,
 		NodeID: 1,
 		Statements: []protocol.Statement{
-			{
-				SQL:       "INSERT INTO users VALUES (2, 'Bob')",
-				Type:      protocol.StatementInsert,
-				TableName: "users",
-			},
+			testCDCStatement("users", nil, map[string][]byte{"id": []byte("2"), "name": []byte("Bob")}),
 		},
 		StartTS:          hlc.Timestamp{WallTime: 2000, Logical: 0, NodeID: 1},
 		WriteConsistency: protocol.ConsistencyQuorum,
@@ -489,7 +465,7 @@ func TestSplitBrainPrevention(t *testing.T) {
 		ID:     1,
 		NodeID: 1,
 		Statements: []protocol.Statement{
-			{SQL: "INSERT INTO users (id, name) VALUES (1, 'Alice')"},
+			testCDCStatement("users", nil, map[string][]byte{"id": []byte("1"), "name": []byte("Alice")}),
 		},
 		StartTS:          clock.Now(),
 		WriteConsistency: protocol.ConsistencyQuorum,
@@ -546,11 +522,7 @@ func TestNoAbortAfterCommitSent(t *testing.T) {
 		ID:     1,
 		NodeID: 1,
 		Statements: []protocol.Statement{
-			{
-				SQL:       "INSERT INTO users VALUES (1, 'Alice')",
-				Type:      protocol.StatementInsert,
-				TableName: "users",
-			},
+			testCDCStatement("users", nil, map[string][]byte{"id": []byte("1"), "name": []byte("Alice")}),
 		},
 		StartTS:          hlc.Timestamp{WallTime: 1000, Logical: 0, NodeID: 1},
 		WriteConsistency: protocol.ConsistencyQuorum,
@@ -618,11 +590,7 @@ func TestLocalPrepareMustSucceed(t *testing.T) {
 		ID:     1,
 		NodeID: 1,
 		Statements: []protocol.Statement{
-			{
-				SQL:       "INSERT INTO users VALUES (1, 'Alice')",
-				Type:      protocol.StatementInsert,
-				TableName: "users",
-			},
+			testCDCStatement("users", nil, map[string][]byte{"id": []byte("1"), "name": []byte("Alice")}),
 		},
 		StartTS:          hlc.Timestamp{WallTime: 1000, Logical: 0, NodeID: 1},
 		WriteConsistency: protocol.ConsistencyQuorum,
@@ -704,11 +672,7 @@ func TestPartialCommitErrorMessage(t *testing.T) {
 		ID:     1,
 		NodeID: 1,
 		Statements: []protocol.Statement{
-			{
-				SQL:       "INSERT INTO users VALUES (1, 'Alice')",
-				Type:      protocol.StatementInsert,
-				TableName: "users",
-			},
+			testCDCStatement("users", nil, map[string][]byte{"id": []byte("1"), "name": []byte("Alice")}),
 		},
 		StartTS:          hlc.Timestamp{WallTime: 1000, Logical: 0, NodeID: 1},
 		WriteConsistency: protocol.ConsistencyQuorum,

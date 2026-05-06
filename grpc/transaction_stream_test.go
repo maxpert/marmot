@@ -21,13 +21,10 @@ func TestTransactionChunk_BasicFields(t *testing.T) {
 				TableName: "users",
 				Database:  "test_db",
 				Payload: &Statement_RowChange{
-					RowChange: &RowChange{
-						IntentKey: []byte("users:1"),
-						NewValues: map[string][]byte{
-							"id":   []byte("1"),
-							"name": []byte("Alice"),
-						},
-					},
+					RowChange: testInsertRowChange("users", []byte("users:1"), map[string][]byte{
+						"id":   []byte("1"),
+						"name": []byte("Alice"),
+					}),
 				},
 			},
 		},

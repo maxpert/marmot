@@ -66,10 +66,7 @@ func TestSchemaVersionRejection(t *testing.T) {
 				TableName: "test_table",
 				Database:  testDB,
 				Payload: &Statement_RowChange{
-					RowChange: &RowChange{
-						IntentKey: []byte("test_key_4"),
-						NewValues: map[string][]byte{"id": []byte("4")},
-					},
+					RowChange: testInsertRowChange("test_table", []byte("test_key_4"), map[string][]byte{"id": []byte("4")}),
 				},
 			},
 		},
@@ -219,12 +216,10 @@ func TestReplicationHandler_ReplayReloadsSchemaAfterDDL(t *testing.T) {
 				TableName: "replay_updates",
 				Database:  testDB,
 				Payload: &Statement_RowChange{
-					RowChange: &RowChange{
-						NewValues: map[string][]byte{
-							"id":   mustMarshalMsgpack(t, int64(1)),
-							"name": mustMarshalMsgpack(t, "alice"),
-						},
-					},
+					RowChange: testInsertRowChange("replay_updates", []byte("replay_updates:1"), map[string][]byte{
+						"id":   mustMarshalMsgpack(t, int64(1)),
+						"name": mustMarshalMsgpack(t, "alice"),
+					}),
 				},
 			},
 		},
@@ -253,16 +248,13 @@ func TestReplicationHandler_ReplayReloadsSchemaAfterDDL(t *testing.T) {
 				TableName: "replay_updates",
 				Database:  testDB,
 				Payload: &Statement_RowChange{
-					RowChange: &RowChange{
-						OldValues: map[string][]byte{
-							"id":   mustMarshalMsgpack(t, int64(1)),
-							"name": mustMarshalMsgpack(t, "alice"),
-						},
-						NewValues: map[string][]byte{
-							"id":   mustMarshalMsgpack(t, int64(1)),
-							"name": mustMarshalMsgpack(t, "bob"),
-						},
-					},
+					RowChange: testUpdateRowChange("replay_updates", []byte("replay_updates:1"), map[string][]byte{
+						"id":   mustMarshalMsgpack(t, int64(1)),
+						"name": mustMarshalMsgpack(t, "alice"),
+					}, map[string][]byte{
+						"id":   mustMarshalMsgpack(t, int64(1)),
+						"name": mustMarshalMsgpack(t, "bob"),
+					}),
 				},
 			},
 		},
@@ -349,10 +341,7 @@ func makePrepareReq(t *testing.T, txnID uint64, testDB string, clock *hlc.Clock)
 				TableName: "t",
 				Database:  testDB,
 				Payload: &Statement_RowChange{
-					RowChange: &RowChange{
-						IntentKey: []byte("k1"),
-						NewValues: map[string][]byte{"id": mustMarshalMsgpack(t, int64(1))},
-					},
+					RowChange: testInsertRowChange("t", []byte("k1"), map[string][]byte{"id": mustMarshalMsgpack(t, int64(1))}),
 				},
 			},
 		},

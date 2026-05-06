@@ -110,17 +110,10 @@ func TestLocalReplicator_PrepareWithCDC(t *testing.T) {
 		Phase:    coordinator.PhasePrep,
 		StartTS:  startTS,
 		Statements: []protocol.Statement{
-			{
-				Type:      protocol.StatementInsert,
-				Database:  "testdb",
-				TableName: "users",
-				IntentKey: []byte("users:1"),
-				SQL:       "INSERT INTO users (id, name) VALUES (1, 'test')",
-				NewValues: map[string][]byte{
-					"id":   []byte("1"),
-					"name": []byte("test"),
-				},
-			},
+			testProtocolDMLStatement(protocol.StatementInsert, "testdb", "users", []byte("users:1"), nil, map[string][]byte{
+				"id":   []byte("1"),
+				"name": []byte("test"),
+			}),
 		},
 	}
 
@@ -237,17 +230,10 @@ func TestLocalReplicator_AbortCleanup(t *testing.T) {
 		Phase:    coordinator.PhasePrep,
 		StartTS:  startTS,
 		Statements: []protocol.Statement{
-			{
-				Type:      protocol.StatementInsert,
-				Database:  "abortdb",
-				TableName: "items",
-				IntentKey: []byte("items:1"),
-				SQL:       "INSERT INTO items (id, val) VALUES (1, 'test')",
-				NewValues: map[string][]byte{
-					"id":  []byte("1"),
-					"val": []byte("test"),
-				},
-			},
+			testProtocolDMLStatement(protocol.StatementInsert, "abortdb", "items", []byte("items:1"), nil, map[string][]byte{
+				"id":  []byte("1"),
+				"val": []byte("test"),
+			}),
 		},
 	}
 
@@ -322,15 +308,9 @@ func TestLocalReplicator_ConflictDetection(t *testing.T) {
 		Phase:    coordinator.PhasePrep,
 		StartTS:  startTS1,
 		Statements: []protocol.Statement{
-			{
-				Type:      protocol.StatementUpdate,
-				Database:  "conflictdb",
-				TableName: "data",
-				IntentKey: []byte("data:1"),
-				SQL:       "UPDATE data SET value = 'a' WHERE id = 1",
-				OldValues: map[string][]byte{"id": []byte("1"), "value": []byte("old")},
-				NewValues: map[string][]byte{"id": []byte("1"), "value": []byte("a")},
-			},
+			testProtocolDMLStatement(protocol.StatementUpdate, "conflictdb", "data", []byte("data:1"),
+				map[string][]byte{"id": []byte("1"), "value": []byte("old")},
+				map[string][]byte{"id": []byte("1"), "value": []byte("a")}),
 		},
 	}
 
@@ -350,15 +330,9 @@ func TestLocalReplicator_ConflictDetection(t *testing.T) {
 		Phase:    coordinator.PhasePrep,
 		StartTS:  startTS2,
 		Statements: []protocol.Statement{
-			{
-				Type:      protocol.StatementUpdate,
-				Database:  "conflictdb",
-				TableName: "data",
-				IntentKey: []byte("data:1"),
-				SQL:       "UPDATE data SET value = 'b' WHERE id = 1",
-				OldValues: map[string][]byte{"id": []byte("1"), "value": []byte("old")},
-				NewValues: map[string][]byte{"id": []byte("1"), "value": []byte("b")},
-			},
+			testProtocolDMLStatement(protocol.StatementUpdate, "conflictdb", "data", []byte("data:1"),
+				map[string][]byte{"id": []byte("1"), "value": []byte("old")},
+				map[string][]byte{"id": []byte("1"), "value": []byte("b")}),
 		},
 	}
 

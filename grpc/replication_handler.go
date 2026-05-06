@@ -358,7 +358,7 @@ func (rh *ReplicationHandler) handleReplay(ctx context.Context, req *Transaction
 
 	for _, stmt := range req.Statements {
 		// Check for CDC data (RowChange payload)
-		if rowChange := stmt.GetRowChange(); rowChange != nil && (len(rowChange.NewValues) > 0 || len(rowChange.OldValues) > 0) {
+		if rowChange := stmt.GetRowChange(); rowChange != nil && len(rowChange.EncodedRow) > 0 {
 			// CDC path: apply row data directly using unified applier
 			opType, opErr := wireDMLToOp(stmt.Type)
 			if opErr != nil {
@@ -368,7 +368,12 @@ func (rh *ReplicationHandler) handleReplay(ctx context.Context, req *Transaction
 					ErrorMessage: opErr.Error(),
 				}, nil
 			}
-			if err := db.ApplyCDCValues(tx, schemaAdapter, opType, stmt.TableName, rowChange.OldValues, rowChange.NewValues); err != nil {
+			row, rowErr := decodeRowChange(stmt)
+			if rowErr != nil {
+				telemetry.ReplicationRequestsTotal.With("replay", "failed").Inc()
+				return &TransactionResponse{Success: false, ErrorMessage: rowErr.Error()}, nil
+			}
+			if err := db.ApplyCDCValues(tx, schemaAdapter, opType, stmt.TableName, row.OldValues, row.NewValues); err != nil {
 				telemetry.ReplicationRequestsTotal.With("replay", "failed").Inc()
 				return &TransactionResponse{
 					Success:      false,
@@ -486,14 +491,21 @@ func (rh *ReplicationHandler) applyVectorCDCFromStatements(ctx context.Context, 
 	entries := make([]common.CDCEntry, 0, len(statements))
 	for _, stmt := range statements {
 		rowChange := stmt.GetRowChange()
-		if rowChange == nil || (len(rowChange.NewValues) == 0 && len(rowChange.OldValues) == 0) {
+		if rowChange == nil || len(rowChange.EncodedRow) == 0 {
 			continue
+		}
+		row, err := decodeRowChange(stmt)
+		if err != nil {
+			return err
 		}
 		entries = append(entries, common.CDCEntry{
 			Table:        stmt.TableName,
-			IntentKey:    rowChange.IntentKey,
-			OldValues:    rowChange.OldValues,
-			NewValues:    rowChange.NewValues,
+			IntentKey:    row.IntentKey,
+			Operation:    row.Op,
+			OldValues:    row.OldValues,
+			NewValues:    row.NewValues,
+			EncodedRow:   rowChange.EncodedRow,
+			EncodedCodec: rowChange.EncodedRowCodec,
 			CommitTxnID:  txnID,
 			CommitSeqNum: seqNum,
 		})

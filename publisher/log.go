@@ -45,7 +45,8 @@ type PublishLog struct {
 	cursorsMu sync.RWMutex
 
 	// Next sequence number (atomic)
-	nextSeq atomic.Uint64
+	nextSeq  atomic.Uint64
+	appendMu sync.Mutex
 
 	// Cleanup tracking
 	cleanupMu      sync.Mutex
@@ -168,6 +169,9 @@ func (pl *PublishLog) Append(events []CDCEvent) error {
 	if pl.closed.Load() {
 		return fmt.Errorf("publish log is closed")
 	}
+
+	pl.appendMu.Lock()
+	defer pl.appendMu.Unlock()
 
 	// Reserve sequence numbers locally first (before commit)
 	startSeq := pl.nextSeq.Load()

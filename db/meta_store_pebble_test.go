@@ -251,14 +251,33 @@ func TestPebbleMetaStoreCDCIntentEntries(t *testing.T) {
 	oldVals := map[string][]byte{"id": {0, 0, 0, 1}, "name": []byte("alice")}
 	newVals := map[string][]byte{"id": {0, 0, 0, 1}, "name": []byte("bob")}
 
-	err := store.WriteIntentEntry(txnID, 1, 1, "users", "user:1", oldVals, newVals)
+	row1, err := EncodeRow(&EncodedCapturedRow{
+		Table:     "users",
+		Op:        uint8(OpTypeReplace),
+		IntentKey: []byte("user:1"),
+		OldValues: oldVals,
+		NewValues: newVals,
+	})
 	if err != nil {
-		t.Fatalf("WriteIntentEntry failed: %v", err)
+		t.Fatalf("EncodeRow failed: %v", err)
+	}
+	err = store.WriteCapturedRow(txnID, 1, row1)
+	if err != nil {
+		t.Fatalf("WriteCapturedRow failed: %v", err)
 	}
 
-	err = store.WriteIntentEntry(txnID, 2, 0, "users", "user:2", nil, newVals)
+	row2, err := EncodeRow(&EncodedCapturedRow{
+		Table:     "users",
+		Op:        uint8(OpTypeInsert),
+		IntentKey: []byte("user:2"),
+		NewValues: newVals,
+	})
 	if err != nil {
-		t.Fatalf("WriteIntentEntry failed: %v", err)
+		t.Fatalf("EncodeRow failed: %v", err)
+	}
+	err = store.WriteCapturedRow(txnID, 2, row2)
+	if err != nil {
+		t.Fatalf("WriteCapturedRow failed: %v", err)
 	}
 
 	// Get entries

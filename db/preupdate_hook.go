@@ -24,7 +24,9 @@ import (
 
 // EphemeralHookSession represents a CDC capture session with its own dedicated connection.
 // The connection is held open for the duration of the session and closed on Commit/Rollback.
-// CDC entries are stored in the per-database MetaStore's __marmot__intent_entries table.
+// CDC rows are captured as canonical msgpack row records. Normal transactions
+// keep them in bounded session memory until SQLite rollback releases the writer;
+// oversized transactions spill directly to the CDC segment log.
 type EphemeralHookSession struct {
 	conn         *sql.Conn    // Dedicated user DB connection (closed on end)
 	tx           *sql.Tx      // Active transaction on user DB
@@ -55,14 +57,16 @@ const defaultCapturedRowsBudget = 64 * 1024 * 1024
 
 // IntentEntry represents a CDC entry stored in the system database
 type IntentEntry struct {
-	TxnID     uint64
-	Seq       uint64
-	Operation uint8
-	Table     string
-	IntentKey []byte
-	OldValues map[string][]byte
-	NewValues map[string][]byte
-	CreatedAt int64
+	TxnID        uint64
+	Seq          uint64
+	Operation    uint8
+	Table        string
+	IntentKey    []byte
+	OldValues    map[string][]byte
+	NewValues    map[string][]byte
+	EncodedRow   []byte
+	EncodedCodec uint32
+	CreatedAt    int64
 }
 
 // =============================================================================
@@ -71,7 +75,7 @@ type IntentEntry struct {
 
 // StartEphemeralSession creates a new CDC capture session with a dedicated connection.
 // The session owns the connection and will close it when done.
-// CDC entries are written to the per-database MetaStore during hooks.
+// CDC entries are captured during hooks and processed after rollback.
 //
 // SchemaCache is initialized on session start when empty and then read from cache
 // during capture. If a table is not in cache, CDC for that row is skipped.
@@ -176,7 +180,7 @@ func (s *EphemeralHookSession) Commit() error {
 // Flow:
 // 1. Rollback SQLite transaction (releases SQLite write lock)
 // 2. Release hookDB connection immediately (minimize connection hold time)
-// 3. ProcessCapturedRows (converts raw captures to IntentEntries) - uses only Pebble
+// 3. ProcessCapturedRows (converts raw captures to IntentEntries)
 // 4. Release row locks
 //
 // CRITICAL: hookDB connection is released BEFORE ProcessCapturedRows to avoid blocking
@@ -195,7 +199,7 @@ func (s *EphemeralHookSession) Rollback() error {
 	}
 	s.mu.Unlock()
 
-	// Release hookDB connection ASAP - ProcessCapturedRows only needs Pebble
+	// Release hookDB connection ASAP; ProcessCapturedRows does not need SQLite.
 	s.releaseConnection()
 
 	if processErr := s.ProcessCapturedRows(); processErr != nil {
@@ -263,13 +267,15 @@ func (s *EphemeralHookSession) collectCapturedRows(collectOnly bool) ([]*IntentE
 		}
 
 		entries = append(entries, &IntentEntry{
-			TxnID:     s.txnID,
-			Seq:       rowRef.seq,
-			Operation: row.Op,
-			Table:     row.Table,
-			IntentKey: row.IntentKey,
-			OldValues: row.OldValues,
-			NewValues: row.NewValues,
+			TxnID:        s.txnID,
+			Seq:          rowRef.seq,
+			Operation:    row.Op,
+			Table:        row.Table,
+			IntentKey:    row.IntentKey,
+			OldValues:    row.OldValues,
+			NewValues:    row.NewValues,
+			EncodedRow:   rowRef.data,
+			EncodedCodec: encodedCapturedRowCodecMsgpack,
 		})
 	}
 	return entries, nil

@@ -28,22 +28,39 @@ func StoreCapturedRowsFromStatements(metaStore db.MetaStore, txnID uint64, state
 		return nil
 	}
 	for i, stmt := range statements {
-		row, err := capturedRowFromStatement(stmt)
+		data, err := encodedCapturedRowFromStatement(stmt)
 		if err != nil {
 			return err
 		}
-		if row == nil {
+		if len(data) == 0 {
 			continue
-		}
-		data, err := db.EncodeRow(row)
-		if err != nil {
-			return fmt.Errorf("encode captured row: %w", err)
 		}
 		if err := metaStore.WriteCapturedRow(txnID, uint64(i+1), data); err != nil {
 			return fmt.Errorf("write captured row: %w", err)
 		}
 	}
 	return nil
+}
+
+func encodedCapturedRowFromStatement(stmt *Statement) ([]byte, error) {
+	if stmt == nil {
+		return nil, nil
+	}
+	if rowChange := stmt.GetRowChange(); rowChange != nil {
+		if _, err := decodeRowChange(stmt); err != nil {
+			return nil, err
+		}
+		return rowChange.EncodedRow, nil
+	}
+	row, err := capturedRowFromStatement(stmt)
+	if err != nil || row == nil {
+		return nil, err
+	}
+	data, err := db.EncodeRow(row)
+	if err != nil {
+		return nil, fmt.Errorf("encode captured row: %w", err)
+	}
+	return data, nil
 }
 
 func HLCToTimestamp(ts *HLC) hlc.Timestamp {
@@ -94,17 +111,11 @@ func capturedRowFromStatement(stmt *Statement) (*db.EncodedCapturedRow, error) {
 		}, nil
 	}
 	if rowChange := stmt.GetRowChange(); rowChange != nil {
-		opType, err := wireDMLToOp(stmt.Type)
+		row, err := decodeRowChange(stmt)
 		if err != nil {
 			return nil, err
 		}
-		return &db.EncodedCapturedRow{
-			Table:     stmt.TableName,
-			Op:        uint8(opType),
-			IntentKey: rowChange.IntentKey,
-			OldValues: rowChange.OldValues,
-			NewValues: rowChange.NewValues,
-		}, nil
+		return row, nil
 	}
 	if ddl := stmt.GetDdlChange(); ddl != nil && ddl.Sql != "" {
 		return &db.EncodedCapturedRow{
@@ -122,4 +133,36 @@ func capturedRowFromStatement(stmt *Statement) (*db.EncodedCapturedRow, error) {
 		}, nil
 	}
 	return nil, nil
+}
+
+func decodeRowChange(stmt *Statement) (*db.EncodedCapturedRow, error) {
+	rowChange := stmt.GetRowChange()
+	if rowChange == nil {
+		return nil, nil
+	}
+	if rowChange.EncodedRowCodec != db.EncodedCapturedRowCodecMsgpack() {
+		return nil, fmt.Errorf("unsupported encoded row codec %d", rowChange.EncodedRowCodec)
+	}
+	if len(rowChange.EncodedRow) == 0 {
+		return nil, fmt.Errorf("missing encoded row for DML statement")
+	}
+	row, err := db.DecodeRow(rowChange.EncodedRow)
+	if err != nil {
+		return nil, fmt.Errorf("decode encoded row: %w", err)
+	}
+	if stmt.TableName != "" && row.Table != "" && row.Table != stmt.TableName {
+		return nil, fmt.Errorf("encoded row table mismatch: statement=%s row=%s", stmt.TableName, row.Table)
+	}
+	op, err := wireDMLToOp(stmt.Type)
+	if err != nil {
+		return nil, err
+	}
+	if row.Op != uint8(op) {
+		return nil, fmt.Errorf("encoded row op mismatch: statement=%v row=%d", stmt.Type, row.Op)
+	}
+	return row, nil
+}
+
+func DecodeRowChangeForCDC(stmt *Statement) (*db.EncodedCapturedRow, error) {
+	return decodeRowChange(stmt)
 }

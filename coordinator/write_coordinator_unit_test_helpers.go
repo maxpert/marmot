@@ -2,10 +2,12 @@ package coordinator
 
 import (
 	"context"
+	"fmt"
 	"runtime"
 	"testing"
 	"time"
 
+	"github.com/maxpert/marmot/common"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/protocol"
 	"github.com/maxpert/marmot/telemetry"
@@ -54,11 +56,7 @@ func (b *TxnBuilder) WithStatements(stmts []protocol.Statement) *TxnBuilder {
 // WithCDCStatement adds a CDC statement with old/new values
 // oldVals and newVals are maps of column_name -> value
 func (b *TxnBuilder) WithCDCStatement(tableName string, oldVals, newVals map[string][]byte) *TxnBuilder {
-	stmt := protocol.Statement{
-		TableName: tableName,
-		OldValues: oldVals,
-		NewValues: newVals,
-	}
+	stmt := testCDCStatement(tableName, oldVals, newVals)
 	b.txn.Statements = append(b.txn.Statements, stmt)
 	return b
 }
@@ -461,13 +459,60 @@ func AssertNodeNotInResponses(t *testing.T, responses map[uint64]*ReplicationRes
 func CreateCDCStatements(count int, tableName string) []protocol.Statement {
 	stmts := make([]protocol.Statement, count)
 	for i := 0; i < count; i++ {
-		stmts[i] = protocol.Statement{
-			TableName: tableName,
-			OldValues: map[string][]byte{"id": {byte(i)}},
-			NewValues: map[string][]byte{"id": {byte(i + 1)}},
-		}
+		stmts[i] = testCDCStatement(tableName, map[string][]byte{"id": {byte(i)}}, map[string][]byte{"id": {byte(i + 1)}})
 	}
 	return stmts
+}
+
+func testCDCStatement(tableName string, oldVals, newVals map[string][]byte) protocol.Statement {
+	op, stmtType := testCDCOperation(oldVals, newVals)
+	intentKey := []byte(fmt.Sprintf("%s:%x", tableName, testCDCIntentValue(oldVals, newVals)))
+	row := &common.EncodedCapturedRow{
+		Table:     tableName,
+		Op:        op,
+		IntentKey: intentKey,
+		OldValues: oldVals,
+		NewValues: newVals,
+	}
+	encoded, err := common.EncodeCapturedRow(row)
+	if err != nil {
+		panic(err)
+	}
+	return protocol.Statement{
+		Type:         stmtType,
+		TableName:    tableName,
+		IntentKey:    intentKey,
+		OldValues:    oldVals,
+		NewValues:    newVals,
+		Operation:    op,
+		EncodedRow:   encoded,
+		EncodedCodec: common.EncodedCapturedRowCodecMsgpack,
+	}
+}
+
+func testCDCOperation(oldVals, newVals map[string][]byte) (uint8, protocol.StatementCode) {
+	switch {
+	case oldVals == nil && newVals != nil:
+		return 0, protocol.StatementInsert
+	case oldVals != nil && newVals == nil:
+		return 3, protocol.StatementDelete
+	default:
+		return 2, protocol.StatementUpdate
+	}
+}
+
+func testCDCIntentValue(oldVals, newVals map[string][]byte) []byte {
+	if newVals != nil {
+		if id, ok := newVals["id"]; ok {
+			return id
+		}
+	}
+	if oldVals != nil {
+		if id, ok := oldVals["id"]; ok {
+			return id
+		}
+	}
+	return []byte("row")
 }
 
 // CreateDDLStatements creates DDL statements for testing

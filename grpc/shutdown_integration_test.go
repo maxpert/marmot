@@ -276,10 +276,7 @@ func TestShutdown_ReplicationHandlerLifecycle(t *testing.T) {
 					TableName: "t",
 					Database:  testDB,
 					Payload: &Statement_RowChange{
-						RowChange: &RowChange{
-							IntentKey: []byte("k"),
-							NewValues: map[string][]byte{"id": mustMarshalMsgpack(t, int64(1))},
-						},
+						RowChange: testInsertRowChange("t", []byte("k"), map[string][]byte{"id": mustMarshalMsgpack(t, int64(1))}),
 					},
 				},
 			},

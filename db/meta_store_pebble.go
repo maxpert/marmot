@@ -1729,35 +1729,6 @@ func (s *PebbleMetaStore) ReleaseDDLLock(dbName string, nodeID uint64) error {
 	return s.db.Delete(key, pebble.NoSync)
 }
 
-// WriteIntentEntry writes a CDC intent entry using the unified EncodedCapturedRow format
-func (s *PebbleMetaStore) WriteIntentEntry(txnID, seq uint64, op uint8, table, intentKey string, oldVals, newVals map[string][]byte) error {
-	// Create EncodedCapturedRow for unified storage format (same as WriteCapturedRow)
-	row := &EncodedCapturedRow{
-		Table:     table,
-		Op:        op,
-		IntentKey: []byte(intentKey),
-		OldValues: oldVals,
-		NewValues: newVals,
-	}
-
-	log.Debug().
-		Uint64("txn_id", txnID).
-		Uint64("seq", seq).
-		Uint8("op", op).
-		Str("table", table).
-		Str("intent_key", intentKey).
-		Int("old_values_count", len(oldVals)).
-		Int("new_values_count", len(newVals)).
-		Msg("CDC: WriteIntentEntry")
-
-	data, err := EncodeRow(row)
-	if err != nil {
-		return err
-	}
-
-	return s.WriteCapturedRow(txnID, seq, data)
-}
-
 // GetIntentEntries retrieves CDC intent entries for a transaction.
 // Reads from the segmented CDC log and converts EncodedCapturedRow to IntentEntry format.
 func (s *PebbleMetaStore) GetIntentEntries(txnID uint64) ([]*IntentEntry, error) {
@@ -1778,13 +1749,15 @@ func (s *PebbleMetaStore) GetIntentEntries(txnID uint64) ([]*IntentEntry, error)
 
 		// Convert to IntentEntry format
 		entries = append(entries, &IntentEntry{
-			TxnID:     txnID,
-			Seq:       seq,
-			Operation: row.Op,
-			Table:     row.Table,
-			IntentKey: row.IntentKey,
-			OldValues: row.OldValues,
-			NewValues: row.NewValues,
+			TxnID:        txnID,
+			Seq:          seq,
+			Operation:    row.Op,
+			Table:        row.Table,
+			IntentKey:    row.IntentKey,
+			OldValues:    row.OldValues,
+			NewValues:    row.NewValues,
+			EncodedRow:   append([]byte(nil), data...),
+			EncodedCodec: EncodedCapturedRowCodecMsgpack(),
 		})
 	}
 
@@ -1832,6 +1805,18 @@ func (s *PebbleMetaStore) DeleteIntentEntries(txnID uint64) (err error) {
 // Data is pre-serialized by the caller (CapturedRow msgpack).
 func (s *PebbleMetaStore) WriteCapturedRow(txnID, seq uint64, data []byte) error {
 	return s.cdcLog.appendRow(txnID, seq, data)
+}
+
+func (s *PebbleMetaStore) HasCapturedRows(txnID uint64) bool {
+	if manifest := s.cdcLog.getPendingManifest(txnID); manifest != nil && manifest.RowCount > 0 {
+		return true
+	}
+	data, closer, err := s.db.Get(pebbleCDCManifestKey(txnID))
+	if err != nil {
+		return false
+	}
+	_ = closer.Close()
+	return len(data) > 0
 }
 
 // SealCapturedRows makes a transaction's CDC range durable and publishes its manifest.

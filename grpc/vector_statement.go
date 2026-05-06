@@ -123,8 +123,14 @@ func protocolStatementFromProto(stmt *Statement) protocol.Statement {
 		return internalStmt
 	}
 	if rowChange := stmt.GetRowChange(); rowChange != nil {
-		internalStmt.OldValues = rowChange.OldValues
-		internalStmt.NewValues = rowChange.NewValues
+		internalStmt.EncodedRow = rowChange.EncodedRow
+		internalStmt.EncodedCodec = rowChange.EncodedRowCodec
+		if row, err := decodeRowChange(stmt); err == nil && row != nil {
+			internalStmt.IntentKey = row.IntentKey
+			internalStmt.Operation = row.Op
+			internalStmt.OldValues = row.OldValues
+			internalStmt.NewValues = row.NewValues
+		}
 	}
 	if loadData := stmt.GetLoadDataChange(); loadData != nil {
 		internalStmt.SQL = loadData.Sql

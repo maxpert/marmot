@@ -20,31 +20,17 @@ func TestBuildPrepareRequest_IncludesCDCData(t *testing.T) {
 		NodeID:   1,
 		Database: "test_db",
 		Statements: []protocol.Statement{
-			{
-				Type:      protocol.StatementInsert,
-				TableName: "users",
-				Database:  "test_db",
-				IntentKey: []byte("users:1"),
-				OldValues: nil, // INSERT has no old values
-				NewValues: map[string][]byte{
-					"id":   []byte("1"),
-					"name": []byte("Alice"),
-				},
-			},
-			{
-				Type:      protocol.StatementUpdate,
-				TableName: "users",
-				Database:  "test_db",
-				IntentKey: []byte("users:2"),
-				OldValues: map[string][]byte{
-					"id":   []byte("2"),
-					"name": []byte("Bob"),
-				},
-				NewValues: map[string][]byte{
-					"id":   []byte("2"),
-					"name": []byte("Robert"),
-				},
-			},
+			testCDCStatement("users", nil, map[string][]byte{
+				"id":   []byte("1"),
+				"name": []byte("Alice"),
+			}),
+			testCDCStatement("users", map[string][]byte{
+				"id":   []byte("2"),
+				"name": []byte("Bob"),
+			}, map[string][]byte{
+				"id":   []byte("2"),
+				"name": []byte("Robert"),
+			}),
 		},
 	}
 
@@ -59,10 +45,13 @@ func TestBuildPrepareRequest_IncludesCDCData(t *testing.T) {
 	// Verify statements count is preserved
 	require.Len(t, req.Statements, 2)
 
-	// Verify CDC data is included because PREPARE is the durability point.
+	// Verify canonical CDC row bytes are included because PREPARE is the
+	// durability point; decoded maps are local apply-time state.
 	for i, stmt := range req.Statements {
-		assert.Equal(t, txn.Statements[i].OldValues, stmt.OldValues)
-		assert.Equal(t, txn.Statements[i].NewValues, stmt.NewValues)
+		assert.Nil(t, stmt.OldValues)
+		assert.Nil(t, stmt.NewValues)
+		assert.Equal(t, txn.Statements[i].EncodedRow, stmt.EncodedRow)
+		assert.Equal(t, txn.Statements[i].EncodedCodec, stmt.EncodedCodec)
 
 		// Verify metadata is preserved
 		assert.Equal(t, txn.Statements[i].Type, stmt.Type)
@@ -82,16 +71,10 @@ func TestBuildCommitRequest_StripsCDCData(t *testing.T) {
 		NodeID:   1,
 		Database: "test_db",
 		Statements: []protocol.Statement{
-			{
-				Type:      protocol.StatementInsert,
-				TableName: "users",
-				Database:  "test_db",
-				IntentKey: []byte("users:1"),
-				NewValues: map[string][]byte{
-					"id":   []byte("1"),
-					"name": []byte("Alice"),
-				},
-			},
+			testCDCStatement("users", nil, map[string][]byte{
+				"id":   []byte("1"),
+				"name": []byte("Alice"),
+			}),
 		},
 	}
 
@@ -128,48 +111,35 @@ func TestEstimateCDCPayloadSize(t *testing.T) {
 		{
 			name: "single insert",
 			stmts: []protocol.Statement{
-				{
-					TableName: "users",      // 5 bytes
-					IntentKey: []byte("k1"), // 2 bytes
-					NewValues: map[string][]byte{
-						"id":   []byte("1"),     // 1 byte
-						"name": []byte("Alice"), // 5 bytes
-					},
-				},
+				testCDCStatement("users", nil, map[string][]byte{
+					"id":   []byte("1"),
+					"name": []byte("Alice"),
+				}),
 			},
-			expected: 5 + 2 + 1 + 5, // 13 bytes
+			expected: len(testCDCStatement("users", nil, map[string][]byte{
+				"id":   []byte("1"),
+				"name": []byte("Alice"),
+			}).EncodedRow) + len("users") + len("users:31"),
 		},
 		{
 			name: "update with old and new values",
 			stmts: []protocol.Statement{
-				{
-					TableName: "items",           // 5 bytes
-					IntentKey: []byte("items:1"), // 7 bytes
-					OldValues: map[string][]byte{
-						"value": []byte("old"), // 3 bytes
-					},
-					NewValues: map[string][]byte{
-						"value": []byte("new"), // 3 bytes
-					},
-				},
+				testCDCStatement("items", map[string][]byte{"id": []byte("1"), "value": []byte("old")},
+					map[string][]byte{"id": []byte("1"), "value": []byte("new")}),
 			},
-			expected: 5 + 7 + 3 + 3, // 18 bytes
+			expected: len(testCDCStatement("items", map[string][]byte{"id": []byte("1"), "value": []byte("old")},
+				map[string][]byte{"id": []byte("1"), "value": []byte("new")}).EncodedRow) + len("items") + len("items:31"),
 		},
 		{
 			name: "multiple statements",
 			stmts: []protocol.Statement{
-				{
-					TableName: "t1",        // 2 bytes
-					IntentKey: []byte("a"), // 1 byte
-					NewValues: map[string][]byte{"x": []byte("y")},
-				},
-				{
-					TableName: "t2",        // 2 bytes
-					IntentKey: []byte("b"), // 1 byte
-					NewValues: map[string][]byte{"z": []byte("w")},
-				},
+				testCDCStatement("t1", nil, map[string][]byte{"id": []byte("a"), "x": []byte("y")}),
+				testCDCStatement("t2", nil, map[string][]byte{"id": []byte("b"), "z": []byte("w")}),
 			},
-			expected: (2 + 1 + 1) + (2 + 1 + 1), // 8 bytes
+			expected: estimateCDCPayloadSize([]protocol.Statement{
+				testCDCStatement("t1", nil, map[string][]byte{"id": []byte("a"), "x": []byte("y")}),
+				testCDCStatement("t2", nil, map[string][]byte{"id": []byte("b"), "z": []byte("w")}),
+			}),
 		},
 	}
 
@@ -200,14 +170,11 @@ func TestEstimateCDCPayloadSize_LargePayload(t *testing.T) {
 	}
 
 	stmts := []protocol.Statement{
-		{
-			TableName: "big_table",
-			IntentKey: []byte("row1"),
-			NewValues: map[string][]byte{
-				"data1": largeValue,
-				"data2": largeValue,
-			},
-		},
+		testCDCStatement("big_table", nil, map[string][]byte{
+			"id":    []byte("row1"),
+			"data1": largeValue,
+			"data2": largeValue,
+		}),
 	}
 
 	size := estimateCDCPayloadSize(stmts)

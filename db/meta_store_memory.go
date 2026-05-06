@@ -276,11 +276,6 @@ func (m *MemoryMetaStore) ReleaseDDLLock(dbName string, nodeID uint64) error {
 	return m.pebble.ReleaseDDLLock(dbName, nodeID)
 }
 
-// WriteIntentEntry delegates to Pebble.
-func (m *MemoryMetaStore) WriteIntentEntry(txnID, seq uint64, op uint8, table, intentKey string, oldVals, newVals map[string][]byte) error {
-	return m.pebble.WriteIntentEntry(txnID, seq, op, table, intentKey, oldVals, newVals)
-}
-
 // GetIntentEntries delegates to Pebble.
 func (m *MemoryMetaStore) GetIntentEntries(txnID uint64) ([]*IntentEntry, error) {
 	return m.pebble.GetIntentEntries(txnID)
@@ -304,6 +299,10 @@ func (m *MemoryMetaStore) WriteCapturedRow(txnID, seq uint64, data []byte) error
 // SealCapturedRows delegates to Pebble.
 func (m *MemoryMetaStore) SealCapturedRows(txnID uint64) error {
 	return m.pebble.SealCapturedRows(txnID)
+}
+
+func (m *MemoryMetaStore) HasCapturedRows(txnID uint64) bool {
+	return m.pebble.HasCapturedRows(txnID)
 }
 
 // IterateCapturedRows delegates to Pebble.

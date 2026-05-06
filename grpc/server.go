@@ -527,9 +527,8 @@ func (s *Server) sendChangeEvent(rec *db.TransactionRecord, metaStore db.MetaSto
 					Database:  rec.DatabaseName,
 					Payload: &Statement_RowChange{
 						RowChange: &RowChange{
-							IntentKey: row.IntentKey,
-							OldValues: row.OldValues,
-							NewValues: row.NewValues,
+							EncodedRow:      append([]byte(nil), data...),
+							EncodedRowCodec: db.EncodedCapturedRowCodecMsgpack(),
 						},
 					},
 				}
@@ -1550,24 +1549,16 @@ func (s *Server) TransactionStream(stream grpc.ClientStreamingServer[Transaction
 				stmtSeq++
 				rowChange := stmt.GetRowChange()
 				if rowChange == nil {
-					// DDL statements don't use WriteIntentEntry - they're handled separately
 					continue
 				}
 
-				// Convert wire type to internal OpType
-				stmtCode := common.MustFromWireType(stmt.Type)
-				op := db.StatementTypeToOpType(stmtCode)
-
-				// Store CDC entry to PebbleDB via metaStore
-				err := metaStore.WriteIntentEntry(
-					txnID,
-					stmtSeq,
-					uint8(op),
-					stmt.TableName,
-					string(rowChange.IntentKey),
-					rowChange.OldValues,
-					rowChange.NewValues,
-				)
+				if rowChange.EncodedRowCodec != db.EncodedCapturedRowCodecMsgpack() || len(rowChange.EncodedRow) == 0 {
+					return fmt.Errorf("transaction stream DML missing encoded row")
+				}
+				if _, err := db.DecodeRow(rowChange.EncodedRow); err != nil {
+					return fmt.Errorf("transaction stream DML invalid encoded row: %w", err)
+				}
+				err := metaStore.WriteCapturedRow(txnID, stmtSeq, rowChange.EncodedRow)
 				if err != nil {
 					log.Error().Err(err).
 						Uint64("txn_id", txnID).

@@ -240,19 +240,18 @@ func TestTransactionManagerVectorCDCNotifierAfterCommitOnce(t *testing.T) {
 		TableName: "docs",
 	}
 	require.NoError(t, tm.AddStatement(txn, stmt))
-	require.NoError(t, testDB.MetaStore.WriteIntentEntry(
-		txn.ID,
-		1,
-		uint8(OpTypeInsert),
-		"docs",
-		"docs:1",
-		nil,
-		encodeTestValues(map[string]interface{}{
+	rowData, err := EncodeRow(&EncodedCapturedRow{
+		Table:     "docs",
+		Op:        uint8(OpTypeInsert),
+		IntentKey: []byte("docs:1"),
+		NewValues: encodeTestValues(map[string]interface{}{
 			"id":    int64(1),
 			"embed": []byte{1, 2, 3, 4},
 			"body":  "hello",
 		}),
-	))
+	})
+	require.NoError(t, err)
+	require.NoError(t, testDB.MetaStore.WriteCapturedRow(txn.ID, 1, rowData))
 
 	require.NoError(t, tm.CommitTransaction(txn))
 	require.Equal(t, 1, recorder.calls)

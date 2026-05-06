@@ -128,15 +128,12 @@ func TestReplicationHandlerTwoPCDeferredCDCInsertUpdateDelete(t *testing.T) {
 		}
 	}
 
-	insertRow := &RowChange{
-		IntentKey: []byte("docs:1"),
-		NewValues: map[string][]byte{
-			"id":    mustMarshalMsgpack(t, int64(1)),
-			"title": mustMarshalMsgpack(t, "alpha"),
-			"score": mustMarshalMsgpack(t, int64(10)),
-			"body":  mustMarshalMsgpack(t, "first body"),
-		},
-	}
+	insertRow := testInsertRowChange("docs", []byte("docs:1"), map[string][]byte{
+		"id":    mustMarshalMsgpack(t, int64(1)),
+		"title": mustMarshalMsgpack(t, "alpha"),
+		"score": mustMarshalMsgpack(t, int64(10)),
+		"body":  mustMarshalMsgpack(t, "first body"),
+	})
 	prepare(1001, pb.StatementType_INSERT, insertRow)
 	mdb, err := dbMgr.GetDatabase(dbName)
 	if err != nil {
@@ -153,30 +150,23 @@ func TestReplicationHandlerTwoPCDeferredCDCInsertUpdateDelete(t *testing.T) {
 	commit(1001, focusedDMLIntentStatement(dbName, pb.StatementType_INSERT, []byte("docs:1")))
 	assertDocRow(t, mdb, 1, "alpha", 10)
 
-	updateRow := &RowChange{
-		IntentKey: []byte("docs:1"),
-		OldValues: map[string][]byte{
-			"id":    mustMarshalMsgpack(t, int64(1)),
-			"title": mustMarshalMsgpack(t, "alpha"),
-			"score": mustMarshalMsgpack(t, int64(10)),
-		},
-		NewValues: map[string][]byte{
-			"id":    mustMarshalMsgpack(t, int64(1)),
-			"title": mustMarshalMsgpack(t, "beta"),
-			"score": mustMarshalMsgpack(t, int64(20)),
-			"body":  mustMarshalMsgpack(t, nil),
-		},
-	}
+	updateRow := testUpdateRowChange("docs", []byte("docs:1"), map[string][]byte{
+		"id":    mustMarshalMsgpack(t, int64(1)),
+		"title": mustMarshalMsgpack(t, "alpha"),
+		"score": mustMarshalMsgpack(t, int64(10)),
+	}, map[string][]byte{
+		"id":    mustMarshalMsgpack(t, int64(1)),
+		"title": mustMarshalMsgpack(t, "beta"),
+		"score": mustMarshalMsgpack(t, int64(20)),
+		"body":  mustMarshalMsgpack(t, nil),
+	})
 	prepare(1002, pb.StatementType_UPDATE, updateRow)
 	commit(1002, focusedDMLIntentStatement(dbName, pb.StatementType_UPDATE, []byte("docs:1")))
 	assertDocRow(t, mdb, 1, "beta", 20)
 
-	deleteRow := &RowChange{
-		IntentKey: []byte("docs:1"),
-		OldValues: map[string][]byte{
-			"id": mustMarshalMsgpack(t, int64(1)),
-		},
-	}
+	deleteRow := testDeleteRowChange("docs", []byte("docs:1"), map[string][]byte{
+		"id": mustMarshalMsgpack(t, int64(1)),
+	})
 	prepare(1003, pb.StatementType_DELETE, deleteRow)
 	commit(1003, focusedDMLIntentStatement(dbName, pb.StatementType_DELETE, []byte("docs:1")))
 	if err := mdb.GetDB().QueryRow(`SELECT COUNT(*) FROM docs WHERE id = 1`).Scan(&count); err != nil {
@@ -213,17 +203,13 @@ func TestReplicationHandlerPrepareConflictAbortRecovery(t *testing.T) {
 			Phase:        TransactionPhase_PREPARE,
 			Timestamp:    focusedHLC(clock),
 			Statements: []*Statement{
-				focusedRowStatement(dbName, pb.StatementType_UPDATE, &RowChange{
-					IntentKey: []byte("docs:1"),
-					OldValues: map[string][]byte{
-						"id":    mustMarshalMsgpack(t, int64(1)),
-						"title": mustMarshalMsgpack(t, "seed"),
-					},
-					NewValues: map[string][]byte{
-						"id":    mustMarshalMsgpack(t, int64(1)),
-						"title": mustMarshalMsgpack(t, "updated"),
-					},
-				}),
+				focusedRowStatement(dbName, pb.StatementType_UPDATE, testUpdateRowChange("docs", []byte("docs:1"), map[string][]byte{
+					"id":    mustMarshalMsgpack(t, int64(1)),
+					"title": mustMarshalMsgpack(t, "seed"),
+				}, map[string][]byte{
+					"id":    mustMarshalMsgpack(t, int64(1)),
+					"title": mustMarshalMsgpack(t, "updated"),
+				})),
 			},
 		}
 	}
@@ -292,13 +278,10 @@ func TestReplicationHandlerReplayFailureCanRetryWithoutAdvancingWatermark(t *tes
 		Phase:        TransactionPhase_REPLAY,
 		Timestamp:    focusedHLC(clock),
 		Statements: []*Statement{
-			focusedRowStatement(dbName, pb.StatementType_INSERT, &RowChange{
-				IntentKey: []byte("docs:1"),
-				NewValues: map[string][]byte{
-					"id":    mustMarshalMsgpack(t, int64(1)),
-					"title": mustMarshalMsgpack(t, "late table"),
-				},
-			}),
+			focusedRowStatement(dbName, pb.StatementType_INSERT, testInsertRowChange("docs", []byte("docs:1"), map[string][]byte{
+				"id":    mustMarshalMsgpack(t, int64(1)),
+				"title": mustMarshalMsgpack(t, "late table"),
+			})),
 		},
 	}
 
@@ -392,14 +375,11 @@ func TestReplicationHandlerReplayVectorCDCFailureMarksDirtyButSucceeds(t *testin
 		Phase:        TransactionPhase_REPLAY,
 		Timestamp:    focusedHLC(hlc.NewClock(2)),
 		Statements: []*Statement{
-			focusedRowStatement(dbName, pb.StatementType_INSERT, &RowChange{
-				IntentKey: []byte("docs:1"),
-				NewValues: map[string][]byte{
-					"id":    mustMarshalMsgpack(t, int64(1)),
-					"embed": mustMarshalMsgpack(t, []byte{1, 2, 3, 4}),
-					"title": mustMarshalMsgpack(t, "vector row"),
-				},
-			}),
+			focusedRowStatement(dbName, pb.StatementType_INSERT, testInsertRowChange("docs", []byte("docs:1"), map[string][]byte{
+				"id":    mustMarshalMsgpack(t, int64(1)),
+				"embed": mustMarshalMsgpack(t, []byte{1, 2, 3, 4}),
+				"title": mustMarshalMsgpack(t, "vector row"),
+			})),
 		},
 	}
 
@@ -491,14 +471,11 @@ func BenchmarkReplicationHandlerReplayRowCDC(b *testing.B) {
 			Phase:        TransactionPhase_REPLAY,
 			Timestamp:    focusedHLC(sourceClock),
 			Statements: []*Statement{
-				focusedRowStatement(dbName, pb.StatementType_INSERT, &RowChange{
-					IntentKey: []byte(fmt.Sprintf("docs:%d", id)),
-					NewValues: map[string][]byte{
-						"id":    mustMarshalMsgpack(b, id),
-						"title": mustMarshalMsgpack(b, fmt.Sprintf("doc-%d", id)),
-						"score": mustMarshalMsgpack(b, id%100),
-					},
-				}),
+				focusedRowStatement(dbName, pb.StatementType_INSERT, testInsertRowChange("docs", []byte(fmt.Sprintf("docs:%d", id)), map[string][]byte{
+					"id":    mustMarshalMsgpack(b, id),
+					"title": mustMarshalMsgpack(b, fmt.Sprintf("doc-%d", id)),
+					"score": mustMarshalMsgpack(b, id%100),
+				})),
 			},
 		}
 		resp, err := handler.HandleReplicateTransaction(ctx, req)

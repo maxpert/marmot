@@ -10,17 +10,32 @@ func ConvertToCDCEvents(txnID uint64, database string, entries []common.CDCEntry
 	for _, entry := range entries {
 		// Determine operation type
 		var operation uint8
-		hasOld := len(entry.OldValues) > 0
-		hasNew := len(entry.NewValues) > 0
-
-		if hasNew && !hasOld {
-			operation = OpInsert
-		} else if hasNew && hasOld {
+		switch entry.Operation {
+		case 0:
+			if len(entry.NewValues) > 0 {
+				operation = OpInsert
+			}
+		case 1:
+			operation = OpInsert // SQLite REPLACE publishes as an insert-style after image.
+		case 2:
 			operation = OpUpdate
-		} else if !hasNew && hasOld {
+		case 3:
 			operation = OpDelete
-		} else {
-			continue // Skip invalid entries
+		default:
+			hasOld := len(entry.OldValues) > 0
+			hasNew := len(entry.NewValues) > 0
+			if hasNew && !hasOld {
+				operation = OpInsert
+			} else if hasNew && hasOld {
+				operation = OpUpdate
+			} else if !hasNew && hasOld {
+				operation = OpDelete
+			} else {
+				continue // Skip invalid entries
+			}
+		}
+		if operation == 0 {
+			operation = OpInsert
 		}
 
 		event := CDCEvent{

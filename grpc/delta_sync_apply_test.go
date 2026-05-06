@@ -114,12 +114,10 @@ func TestDeltaSyncApplyChangeEvent_ReloadsSchemaAfterDDL(t *testing.T) {
 				TableName: "delta_updates",
 				Database:  testDB,
 				Payload: &Statement_RowChange{
-					RowChange: &RowChange{
-						NewValues: map[string][]byte{
-							"id":   mustMarshalMsgpack(t, int64(1)),
-							"name": mustMarshalMsgpack(t, "alice"),
-						},
-					},
+					RowChange: testInsertRowChange("delta_updates", []byte("delta_updates:1"), map[string][]byte{
+						"id":   mustMarshalMsgpack(t, int64(1)),
+						"name": mustMarshalMsgpack(t, "alice"),
+					}),
 				},
 			},
 		},
@@ -142,16 +140,13 @@ func TestDeltaSyncApplyChangeEvent_ReloadsSchemaAfterDDL(t *testing.T) {
 				TableName: "delta_updates",
 				Database:  testDB,
 				Payload: &Statement_RowChange{
-					RowChange: &RowChange{
-						OldValues: map[string][]byte{
-							"id":   mustMarshalMsgpack(t, int64(1)),
-							"name": mustMarshalMsgpack(t, "alice"),
-						},
-						NewValues: map[string][]byte{
-							"id":   mustMarshalMsgpack(t, int64(1)),
-							"name": mustMarshalMsgpack(t, "bob"),
-						},
-					},
+					RowChange: testUpdateRowChange("delta_updates", []byte("delta_updates:1"), map[string][]byte{
+						"id":   mustMarshalMsgpack(t, int64(1)),
+						"name": mustMarshalMsgpack(t, "alice"),
+					}, map[string][]byte{
+						"id":   mustMarshalMsgpack(t, int64(1)),
+						"name": mustMarshalMsgpack(t, "bob"),
+					}),
 				},
 			},
 		},
@@ -221,14 +216,11 @@ func TestDeltaSyncApplyChangeEvent_VectorCDCFailureDoesNotBlockRows(t *testing.T
 				TableName: "docs",
 				Database:  testDB,
 				Payload: &Statement_RowChange{
-					RowChange: &RowChange{
-						IntentKey: []byte("docs:1"),
-						NewValues: map[string][]byte{
-							"id":    mustMarshalMsgpack(t, int64(1)),
-							"embed": mustMarshalMsgpack(t, []byte{1, 2, 3, 4}),
-							"title": mustMarshalMsgpack(t, "delta vector row"),
-						},
-					},
+					RowChange: testInsertRowChange("docs", []byte("docs:1"), map[string][]byte{
+						"id":    mustMarshalMsgpack(t, int64(1)),
+						"embed": mustMarshalMsgpack(t, []byte{1, 2, 3, 4}),
+						"title": mustMarshalMsgpack(t, "delta vector row"),
+					}),
 				},
 			},
 		},

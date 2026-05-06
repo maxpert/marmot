@@ -383,12 +383,10 @@ func TestStreamClient_ApplyChangeEvent(t *testing.T) {
 				TableName: "events",
 				Type:      pb.StatementType_INSERT,
 				Payload: &marmotgrpc.Statement_RowChange{
-					RowChange: &marmotgrpc.RowChange{
-						NewValues: map[string][]byte{
-							"id":   msgpackMarshal(1),
-							"data": msgpackMarshal("test event"),
-						},
-					},
+					RowChange: testInsertRowChange("events", []byte("events:1"), map[string][]byte{
+						"id":   msgpackMarshal(1),
+						"data": msgpackMarshal("test event"),
+					}),
 				},
 			},
 		},
@@ -483,12 +481,9 @@ func TestStreamClient_ApplyChangeEvent_FailureDoesNotStoreCommittedRecord(t *tes
 				Type:      pb.StatementType_INSERT,
 				TableName: "missing_table",
 				Payload: &marmotgrpc.Statement_RowChange{
-					RowChange: &marmotgrpc.RowChange{
-						IntentKey: []byte("missing:1"),
-						NewValues: map[string][]byte{
-							"id": msgpackMarshal(int64(1)),
-						},
-					},
+					RowChange: testInsertRowChange("missing_table", []byte("missing:1"), map[string][]byte{
+						"id": msgpackMarshal(int64(1)),
+					}),
 				},
 			},
 		},
@@ -548,14 +543,11 @@ func TestStreamClient_ApplyChangeEvent_VectorCDCFailureDoesNotBlockStream(t *tes
 				Type:      pb.StatementType_INSERT,
 				TableName: "docs",
 				Payload: &marmotgrpc.Statement_RowChange{
-					RowChange: &marmotgrpc.RowChange{
-						IntentKey: []byte("docs:1"),
-						NewValues: map[string][]byte{
-							"id":    msgpackMarshal(int64(1)),
-							"embed": msgpackMarshal([]byte{1, 2, 3, 4}),
-							"title": msgpackMarshal("stream vector row"),
-						},
-					},
+					RowChange: testInsertRowChange("docs", []byte("docs:1"), map[string][]byte{
+						"id":    msgpackMarshal(int64(1)),
+						"embed": msgpackMarshal([]byte{1, 2, 3, 4}),
+						"title": msgpackMarshal("stream vector row"),
+					}),
 				},
 			},
 		},
@@ -869,12 +861,10 @@ func BenchmarkStreamClient_ApplyChangeEvent(b *testing.B) {
 					TableName: "events",
 					Type:      pb.StatementType_INSERT,
 					Payload: &marmotgrpc.Statement_RowChange{
-						RowChange: &marmotgrpc.RowChange{
-							NewValues: map[string][]byte{
-								"id":   msgpackMarshal(i),
-								"data": msgpackMarshal("test"),
-							},
-						},
+						RowChange: testInsertRowChange("events", []byte("events:1"), map[string][]byte{
+							"id":   msgpackMarshal(i),
+							"data": msgpackMarshal("test"),
+						}),
 					},
 				},
 			},

@@ -32,8 +32,8 @@ func TestMultiStatementTransaction(t *testing.T) {
 	}
 
 	// Add multiple statements
-	stmt1 := protocol.Statement{SQL: "INSERT INTO users VALUES (1, 'Alice')", Type: protocol.StatementInsert}
-	stmt2 := protocol.Statement{SQL: "UPDATE users SET name='Bob' WHERE id=1", Type: protocol.StatementUpdate}
+	stmt1 := testCDCStatement("users", nil, map[string][]byte{"id": []byte("1"), "name": []byte("Alice")})
+	stmt2 := testCDCStatement("users", map[string][]byte{"id": []byte("1"), "name": []byte("Alice")}, map[string][]byte{"id": []byte("1"), "name": []byte("Bob")})
 	txnState.Statements = append(txnState.Statements, stmt1, stmt2)
 
 	// Simulate COMMIT - execute all statements via 2PC
@@ -100,9 +100,11 @@ func TestLockWaitingOnConflict(t *testing.T) {
 
 	// Transaction 1: Locks row with id=1
 	txn1 := &Transaction{
-		ID:               100,
-		NodeID:           1,
-		Statements:       []protocol.Statement{{SQL: "UPDATE users SET name='Alice' WHERE id=1", Type: protocol.StatementUpdate}},
+		ID:     100,
+		NodeID: 1,
+		Statements: []protocol.Statement{testCDCStatement("users",
+			map[string][]byte{"id": []byte("1"), "name": []byte("old")},
+			map[string][]byte{"id": []byte("1"), "name": []byte("Alice")})},
 		StartTS:          hlc.Timestamp{WallTime: 1000, Logical: 0},
 		WriteConsistency: protocol.ConsistencyQuorum,
 		Database:         "testdb",
@@ -121,9 +123,11 @@ func TestLockWaitingOnConflict(t *testing.T) {
 
 	// Transaction 2: Tries to update same row - should WAIT, not fail immediately
 	txn2 := &Transaction{
-		ID:               200,
-		NodeID:           1,
-		Statements:       []protocol.Statement{{SQL: "UPDATE users SET name='Bob' WHERE id=1", Type: protocol.StatementUpdate}},
+		ID:     200,
+		NodeID: 1,
+		Statements: []protocol.Statement{testCDCStatement("users",
+			map[string][]byte{"id": []byte("1"), "name": []byte("Alice")},
+			map[string][]byte{"id": []byte("1"), "name": []byte("Bob")})},
 		StartTS:          hlc.Timestamp{WallTime: 2000, Logical: 0},
 		WriteConsistency: protocol.ConsistencyQuorum,
 		Database:         "testdb",
@@ -180,9 +184,11 @@ func TestConflictReturnsDeadlockError(t *testing.T) {
 
 	// Transaction that will conflict
 	txn := &Transaction{
-		ID:               200,
-		NodeID:           1,
-		Statements:       []protocol.Statement{{SQL: "UPDATE users SET name='Bob' WHERE id=1", Type: protocol.StatementUpdate}},
+		ID:     200,
+		NodeID: 1,
+		Statements: []protocol.Statement{testCDCStatement("users",
+			map[string][]byte{"id": []byte("1"), "name": []byte("old")},
+			map[string][]byte{"id": []byte("1"), "name": []byte("Bob")})},
 		StartTS:          hlc.Timestamp{WallTime: 2000, Logical: 0},
 		WriteConsistency: protocol.ConsistencyQuorum,
 		Database:         "testdb",
@@ -244,9 +250,11 @@ func TestConcurrentTransactionsSerializeOnConflict(t *testing.T) {
 			defer wg.Done()
 
 			txn := &Transaction{
-				ID:               txnID,
-				NodeID:           1,
-				Statements:       []protocol.Statement{{SQL: fmt.Sprintf("UPDATE users SET name='User%d' WHERE id=1", txnID), Type: protocol.StatementUpdate}},
+				ID:     txnID,
+				NodeID: 1,
+				Statements: []protocol.Statement{testCDCStatement("users",
+					map[string][]byte{"id": []byte("1"), "name": []byte("old")},
+					map[string][]byte{"id": []byte("1"), "name": []byte(fmt.Sprintf("User%d", txnID))})},
 				StartTS:          hlc.Timestamp{WallTime: int64(1000 * txnID), Logical: 0},
 				WriteConsistency: protocol.ConsistencyQuorum,
 				Database:         "testdb",
@@ -322,9 +330,11 @@ func TestNoWaitOnDifferentRows(t *testing.T) {
 			}
 
 			txn := &Transaction{
-				ID:               rowID * 100,
-				NodeID:           1,
-				Statements:       []protocol.Statement{{SQL: fmt.Sprintf("UPDATE users SET name='User' WHERE id=%d", rowID), Type: protocol.StatementUpdate}},
+				ID:     rowID * 100,
+				NodeID: 1,
+				Statements: []protocol.Statement{testCDCStatement("users",
+					map[string][]byte{"id": []byte(fmt.Sprintf("%d", rowID)), "name": []byte("old")},
+					map[string][]byte{"id": []byte(fmt.Sprintf("%d", rowID)), "name": []byte("User")})},
 				StartTS:          hlc.Timestamp{WallTime: int64(1000 * rowID), Logical: 0},
 				WriteConsistency: protocol.ConsistencyQuorum,
 				Database:         "testdb",

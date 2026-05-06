@@ -192,7 +192,16 @@ func TestPebbleMetaStoreRecoversPreparedCDCFromSegment(t *testing.T) {
 		t.Fatalf("begin txn: %v", err)
 	}
 	newVals := map[string][]byte{"id": []byte("1")}
-	if err := store.WriteIntentEntry(txnID, 1, uint8(OpTypeInsert), "docs", "docs:1", nil, newVals); err != nil {
+	row, err := EncodeRow(&EncodedCapturedRow{
+		Table:     "docs",
+		Op:        uint8(OpTypeInsert),
+		IntentKey: []byte("docs:1"),
+		NewValues: newVals,
+	})
+	if err != nil {
+		t.Fatalf("encode CDC row: %v", err)
+	}
+	if err := store.WriteCapturedRow(txnID, 1, row); err != nil {
 		t.Fatalf("write CDC row: %v", err)
 	}
 	if err := store.sealCapturedRows(txnID, true); err != nil {

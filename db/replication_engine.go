@@ -164,11 +164,12 @@ func (re *ReplicationEngine) prepareRegularTransaction(req *PrepareRequest) *Pre
 		return &PrepareResult{Success: false, Error: err.Error()}
 	}
 
+	adoptCapturedRows := metaStore.HasCapturedRows(req.TxnID)
 	var stmtSeq uint64 = 0
 	for _, stmt := range req.Statements {
 		stmtSeq++
 
-		if result := re.processStatement(txn, txnMgr, metaStore, stmt, req, stmtSeq); result != nil {
+		if result := re.processStatement(txn, txnMgr, metaStore, stmt, req, stmtSeq, adoptCapturedRows); result != nil {
 			return result
 		}
 	}
@@ -182,7 +183,7 @@ func (re *ReplicationEngine) prepareRegularTransaction(req *PrepareRequest) *Pre
 }
 
 // processStatement processes a single statement within a transaction
-func (re *ReplicationEngine) processStatement(txn *Transaction, txnMgr *TransactionManager, metaStore MetaStore, stmt protocol.Statement, req *PrepareRequest, stmtSeq uint64) *PrepareResult {
+func (re *ReplicationEngine) processStatement(txn *Transaction, txnMgr *TransactionManager, metaStore MetaStore, stmt protocol.Statement, req *PrepareRequest, stmtSeq uint64, adoptCapturedRows bool) *PrepareResult {
 	if err := txnMgr.AddStatement(txn, stmt); err != nil {
 		_ = txnMgr.AbortTransaction(txn)
 		return &PrepareResult{Success: false, Error: err.Error()}
@@ -219,7 +220,7 @@ func (re *ReplicationEngine) processStatement(txn *Transaction, txnMgr *Transact
 		return nil
 	}
 
-	return re.createDMLIntent(txnMgr, metaStore, txn, stmt, string(intentKey), req, stmtSeq)
+	return re.createDMLIntent(txnMgr, metaStore, txn, stmt, string(intentKey), req, stmtSeq, adoptCapturedRows)
 }
 
 func isVectorIndexControlStatement(stmtType protocol.StatementCode) bool {
@@ -322,10 +323,10 @@ func (re *ReplicationEngine) createVectorIndexIntent(txnMgr *TransactionManager,
 // createDMLIntent creates the row lock and persists the DML redo image.
 // PREPARE is the durability point for 2PC, so row images must be present
 // before a participant can ACK prepare.
-func (re *ReplicationEngine) createDMLIntent(txnMgr *TransactionManager, metaStore MetaStore, txn *Transaction, stmt protocol.Statement, intentKey string, req *PrepareRequest, stmtSeq uint64) *PrepareResult {
-	if len(stmt.OldValues) == 0 && len(stmt.NewValues) == 0 {
+func (re *ReplicationEngine) createDMLIntent(txnMgr *TransactionManager, metaStore MetaStore, txn *Transaction, stmt protocol.Statement, intentKey string, req *PrepareRequest, stmtSeq uint64, adoptCapturedRows bool) *PrepareResult {
+	if !adoptCapturedRows && (len(stmt.EncodedRow) == 0 || stmt.EncodedCodec != EncodedCapturedRowCodecMsgpack()) {
 		_ = txnMgr.AbortTransaction(txn)
-		return &PrepareResult{Success: false, Error: fmt.Sprintf("DML prepare missing CDC row image for %s", stmt.TableName)}
+		return &PrepareResult{Success: false, Error: fmt.Sprintf("DML prepare missing encoded CDC row for %s", stmt.TableName)}
 	}
 
 	if err := txnMgr.WriteIntent(txn, IntentTypeDML, stmt.TableName, intentKey, stmt, nil); err != nil {
@@ -338,10 +339,15 @@ func (re *ReplicationEngine) createDMLIntent(txnMgr *TransactionManager, metaSto
 		}
 	}
 
-	op := uint8(StatementTypeToOpType(stmt.Type))
-	if err := metaStore.WriteIntentEntry(req.TxnID, stmtSeq, op, stmt.TableName, intentKey, stmt.OldValues, stmt.NewValues); err != nil {
-		_ = txnMgr.AbortTransaction(txn)
-		return &PrepareResult{Success: false, Error: fmt.Sprintf("failed to persist prepared CDC row: %v", err)}
+	if !adoptCapturedRows {
+		if _, err := DecodeRow(stmt.EncodedRow); err != nil {
+			_ = txnMgr.AbortTransaction(txn)
+			return &PrepareResult{Success: false, Error: fmt.Sprintf("failed to decode prepared CDC row: %v", err)}
+		}
+		if err := metaStore.WriteCapturedRow(req.TxnID, stmtSeq, stmt.EncodedRow); err != nil {
+			_ = txnMgr.AbortTransaction(txn)
+			return &PrepareResult{Success: false, Error: fmt.Sprintf("failed to persist prepared CDC row: %v", err)}
+		}
 	}
 
 	return nil

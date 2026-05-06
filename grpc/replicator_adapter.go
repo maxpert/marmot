@@ -121,12 +121,11 @@ func convertStatementsToProto(stmts []protocol.Statement, database string, txnID
 					ChunkBytes: 256 * 1024,
 				},
 			}
-		case isDML && (len(stmt.NewValues) > 0 || len(stmt.OldValues) > 0):
+		case isDML && len(stmt.EncodedRow) > 0:
 			protoStmt.Payload = &Statement_RowChange{
 				RowChange: &RowChange{
-					IntentKey: stmt.IntentKey,
-					OldValues: stmt.OldValues,
-					NewValues: stmt.NewValues,
+					EncodedRow:      stmt.EncodedRow,
+					EncodedRowCodec: stmt.EncodedCodec,
 				},
 			}
 		case isDML:

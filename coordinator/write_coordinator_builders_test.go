@@ -61,6 +61,7 @@ func TestValidateStatements_CDCMissingTableName(t *testing.T) {
 	txn := NewTxnBuilder().Build()
 	txn.Statements = []protocol.Statement{
 		{
+			Type:      protocol.StatementInsert,
 			TableName: "",
 			OldValues: map[string][]byte{"id": {1}},
 			NewValues: map[string][]byte{"id": {2}},
@@ -78,6 +79,7 @@ func TestValidateStatements_CDCNilOldValues(t *testing.T) {
 	txn := NewTxnBuilder().Build()
 	txn.Statements = []protocol.Statement{
 		{
+			Type:      protocol.StatementInsert,
 			TableName: "",
 			OldValues: nil,
 			NewValues: map[string][]byte{"id": {2}},
@@ -95,6 +97,7 @@ func TestValidateStatements_CDCNilNewValues(t *testing.T) {
 	txn := NewTxnBuilder().Build()
 	txn.Statements = []protocol.Statement{
 		{
+			Type:      protocol.StatementDelete,
 			TableName: "",
 			OldValues: map[string][]byte{"id": {1}},
 			NewValues: nil,
@@ -111,11 +114,7 @@ func TestValidateStatements_MixedCDCAndSQL(t *testing.T) {
 	wc := createTestCoordinator(1)
 	txn := NewTxnBuilder().Build()
 	txn.Statements = []protocol.Statement{
-		{
-			TableName: "users",
-			OldValues: map[string][]byte{"id": {1}},
-			NewValues: map[string][]byte{"id": {2}},
-		},
+		testCDCStatement("users", map[string][]byte{"id": {1}}, map[string][]byte{"id": {2}}),
 		{
 			SQL: "CREATE TABLE test (id INT)",
 		},

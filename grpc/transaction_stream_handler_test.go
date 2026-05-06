@@ -136,10 +136,7 @@ func TestTransactionStream_BasicFlow(t *testing.T) {
 							TableName: "users",
 							Database:  testDB,
 							Payload: &Statement_RowChange{
-								RowChange: &RowChange{
-									IntentKey: []byte("users:1"),
-									NewValues: newValues1,
-								},
+								RowChange: testInsertRowChange("users", []byte("users:1"), newValues1),
 							},
 						},
 					},
@@ -158,10 +155,7 @@ func TestTransactionStream_BasicFlow(t *testing.T) {
 							TableName: "users",
 							Database:  testDB,
 							Payload: &Statement_RowChange{
-								RowChange: &RowChange{
-									IntentKey: []byte("users:2"),
-									NewValues: newValues2,
-								},
+								RowChange: testInsertRowChange("users", []byte("users:2"), newValues2),
 							},
 						},
 					},

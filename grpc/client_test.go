@@ -88,10 +88,7 @@ func TestClient_TransactionStream_ChunksSentCorrectly(t *testing.T) {
 			TableName: "test_table",
 			Database:  "test_db",
 			Payload: &Statement_RowChange{
-				RowChange: &RowChange{
-					IntentKey: []byte("key"),
-					NewValues: map[string][]byte{"id": []byte("1")},
-				},
+				RowChange: testInsertRowChange("test_table", []byte("key"), map[string][]byte{"id": []byte("1")}),
 			},
 		}
 	}

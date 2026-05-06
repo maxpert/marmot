@@ -550,10 +550,13 @@ func (c *CompletedLocalExecution) GetCDCEntries() []common.CDCEntry {
 	result := make([]common.CDCEntry, len(c.cdcEntries))
 	for i, e := range c.cdcEntries {
 		result[i] = common.CDCEntry{
-			Table:     e.Table,
-			IntentKey: e.IntentKey,
-			OldValues: e.OldValues,
-			NewValues: e.NewValues,
+			Table:        e.Table,
+			IntentKey:    e.IntentKey,
+			Operation:    e.Operation,
+			OldValues:    e.OldValues,
+			NewValues:    e.NewValues,
+			EncodedRow:   e.EncodedRow,
+			EncodedCodec: e.EncodedCodec,
 		}
 	}
 	return result
@@ -606,10 +609,13 @@ func (p *PendingLocalExecution) GetCDCEntries() []common.CDCEntry {
 	result := make([]common.CDCEntry, len(entries))
 	for i, e := range entries {
 		result[i] = common.CDCEntry{
-			Table:     e.Table,
-			IntentKey: e.IntentKey,
-			OldValues: e.OldValues,
-			NewValues: e.NewValues,
+			Table:        e.Table,
+			IntentKey:    e.IntentKey,
+			Operation:    e.Operation,
+			OldValues:    e.OldValues,
+			NewValues:    e.NewValues,
+			EncodedRow:   e.EncodedRow,
+			EncodedCodec: e.EncodedCodec,
 		}
 	}
 	return result

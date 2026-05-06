@@ -922,14 +922,21 @@ func (s *StreamClient) applyVectorCDCFromEvent(ctx context.Context, database str
 	entries := make([]common.CDCEntry, 0, len(statements))
 	for _, stmt := range statements {
 		rowChange := stmt.GetRowChange()
-		if rowChange == nil || (len(rowChange.NewValues) == 0 && len(rowChange.OldValues) == 0) {
+		if rowChange == nil || len(rowChange.EncodedRow) == 0 {
 			continue
+		}
+		row, err := marmotgrpc.DecodeRowChangeForCDC(stmt)
+		if err != nil {
+			return err
 		}
 		entries = append(entries, common.CDCEntry{
 			Table:        stmt.TableName,
-			IntentKey:    rowChange.IntentKey,
-			OldValues:    rowChange.OldValues,
-			NewValues:    rowChange.NewValues,
+			IntentKey:    row.IntentKey,
+			Operation:    row.Op,
+			OldValues:    row.OldValues,
+			NewValues:    row.NewValues,
+			EncodedRow:   rowChange.EncodedRow,
+			EncodedCodec: rowChange.EncodedRowCodec,
 			CommitTxnID:  txnID,
 			CommitSeqNum: seqNum,
 		})
@@ -1005,7 +1012,7 @@ func (s *StreamClient) ensureDatabaseExists(dbName string) (bool, error) {
 // applyStatement applies a single statement within a transaction
 func (s *StreamClient) applyStatement(ctx context.Context, tx *sql.Tx, mdb *db.ReplicatedDatabase, stmt *marmotgrpc.Statement) error {
 	// CDC path: row-level changes
-	if rowChange := stmt.GetRowChange(); rowChange != nil && (len(rowChange.NewValues) > 0 || len(rowChange.OldValues) > 0) {
+	if rowChange := stmt.GetRowChange(); rowChange != nil && len(rowChange.EncodedRow) > 0 {
 		return s.applyCDCStatement(tx, mdb, stmt)
 	}
 
@@ -1054,7 +1061,11 @@ func (s *StreamClient) applyCDCStatement(tx *sql.Tx, mdb *db.ReplicatedDatabase,
 	}
 	switch stmtCode {
 	case common.StatementInsert, common.StatementUpdate, common.StatementDelete, common.StatementReplace:
-		return db.ApplyCDCValues(tx, schemaAdapter, db.StatementTypeToOpType(stmtCode), stmt.TableName, rowChange.OldValues, rowChange.NewValues)
+		row, err := marmotgrpc.DecodeRowChangeForCDC(stmt)
+		if err != nil {
+			return err
+		}
+		return db.ApplyCDCValues(tx, schemaAdapter, db.StatementTypeToOpType(stmtCode), stmt.TableName, row.OldValues, row.NewValues)
 	}
 	return fmt.Errorf("unsupported statement type: %v", stmt.Type)
 }

@@ -19,13 +19,10 @@ func TestStoreAppliedChangeEventPersistsRowsAndIsIdempotent(t *testing.T) {
 		Type:      pb.StatementType_INSERT,
 		TableName: "docs",
 		Database:  "rag",
-		Payload: &Statement_RowChange{RowChange: &RowChange{
-			IntentKey: []byte("pk:1"),
-			NewValues: map[string][]byte{
-				"id":   {1},
-				"name": []byte("doc"),
-			},
-		}},
+		Payload: &Statement_RowChange{RowChange: testInsertRowChange("docs", []byte("pk:1"), map[string][]byte{
+			"id":   {1},
+			"name": []byte("doc"),
+		})},
 	}}
 	ts := &HLC{WallTime: 100, Logical: 2, NodeId: 7}
 

@@ -22,6 +22,42 @@ func encodeTestValues(values map[string]interface{}) map[string][]byte {
 	return encoded
 }
 
+func testProtocolDMLStatement(stmtType protocol.StatementCode, database, table string, intentKey []byte, oldValues, newValues map[string][]byte) protocol.Statement {
+	var op uint8
+	switch stmtType {
+	case protocol.StatementDelete:
+		op = uint8(OpTypeDelete)
+	case protocol.StatementUpdate:
+		op = uint8(OpTypeUpdate)
+	case protocol.StatementReplace:
+		op = uint8(OpTypeReplace)
+	default:
+		op = uint8(OpTypeInsert)
+	}
+	row := &EncodedCapturedRow{
+		Table:     table,
+		Op:        op,
+		IntentKey: intentKey,
+		OldValues: oldValues,
+		NewValues: newValues,
+	}
+	encoded, err := EncodeRow(row)
+	if err != nil {
+		panic(err)
+	}
+	return protocol.Statement{
+		Type:         stmtType,
+		Database:     database,
+		TableName:    table,
+		IntentKey:    intentKey,
+		OldValues:    oldValues,
+		NewValues:    newValues,
+		Operation:    op,
+		EncodedRow:   encoded,
+		EncodedCodec: EncodedCapturedRowCodecMsgpack(),
+	}
+}
+
 // setupTestReplicationEngine creates a test DatabaseManager and ReplicationEngine
 func setupTestReplicationEngine(t *testing.T) (*ReplicationEngine, *DatabaseManager, func()) {
 	tmpDir := t.TempDir()
@@ -127,40 +163,21 @@ func TestReplicationEngine_PrepareWithCDC(t *testing.T) {
 		StartTS:  startTS,
 		Database: "testdb",
 		Statements: []protocol.Statement{
-			{
-				Type:      protocol.StatementInsert,
-				TableName: "users",
-				IntentKey: []byte("users:1"),
-				SQL:       "INSERT INTO users (id, name) VALUES (1, 'alice')",
-				NewValues: map[string][]byte{
-					"id":   []byte("1"),
-					"name": []byte("alice"),
-				},
-			},
-			{
-				Type:      protocol.StatementUpdate,
-				TableName: "users",
-				IntentKey: []byte("users:2"),
-				SQL:       "UPDATE users SET name = 'bob_updated' WHERE id = 2",
-				OldValues: map[string][]byte{
-					"id":   []byte("2"),
-					"name": []byte("bob"),
-				},
-				NewValues: map[string][]byte{
-					"id":   []byte("2"),
-					"name": []byte("bob_updated"),
-				},
-			},
-			{
-				Type:      protocol.StatementDelete,
-				TableName: "users",
-				IntentKey: []byte("users:3"),
-				SQL:       "DELETE FROM users WHERE id = 3",
-				OldValues: map[string][]byte{
-					"id":   []byte("3"),
-					"name": []byte("charlie"),
-				},
-			},
+			testProtocolDMLStatement(protocol.StatementInsert, "testdb", "users", []byte("users:1"), nil, map[string][]byte{
+				"id":   []byte("1"),
+				"name": []byte("alice"),
+			}),
+			testProtocolDMLStatement(protocol.StatementUpdate, "testdb", "users", []byte("users:2"), map[string][]byte{
+				"id":   []byte("2"),
+				"name": []byte("bob"),
+			}, map[string][]byte{
+				"id":   []byte("2"),
+				"name": []byte("bob_updated"),
+			}),
+			testProtocolDMLStatement(protocol.StatementDelete, "testdb", "users", []byte("users:3"), map[string][]byte{
+				"id":   []byte("3"),
+				"name": []byte("charlie"),
+			}, nil),
 		},
 	}
 
@@ -214,12 +231,7 @@ func TestReplicationEngine_DeferredCDCFlow(t *testing.T) {
 		StartTS:  startTS,
 		Database: "testdb",
 		Statements: []protocol.Statement{
-			{
-				Type:      protocol.StatementInsert,
-				TableName: "users",
-				IntentKey: []byte("users:1"),
-				NewValues: encodedValues,
-			},
+			testProtocolDMLStatement(protocol.StatementInsert, "testdb", "users", []byte("users:1"), nil, encodedValues),
 		},
 	}
 
@@ -379,14 +391,9 @@ func TestReplicationEngine_PrepareConflictDetection(t *testing.T) {
 		StartTS:  startTS1,
 		Database: "conflictdb",
 		Statements: []protocol.Statement{
-			{
-				Type:      protocol.StatementUpdate,
-				TableName: "items",
-				IntentKey: []byte("items:1"),
-				SQL:       "UPDATE items SET value = 'a' WHERE id = 1",
-				OldValues: map[string][]byte{"id": []byte("1"), "value": []byte("old")},
-				NewValues: map[string][]byte{"id": []byte("1"), "value": []byte("a")},
-			},
+			testProtocolDMLStatement(protocol.StatementUpdate, "conflictdb", "items", []byte("items:1"),
+				map[string][]byte{"id": []byte("1"), "value": []byte("old")},
+				map[string][]byte{"id": []byte("1"), "value": []byte("a")}),
 		},
 	}
 
@@ -400,14 +407,9 @@ func TestReplicationEngine_PrepareConflictDetection(t *testing.T) {
 		StartTS:  startTS2,
 		Database: "conflictdb",
 		Statements: []protocol.Statement{
-			{
-				Type:      protocol.StatementUpdate,
-				TableName: "items",
-				IntentKey: []byte("items:1"),
-				SQL:       "UPDATE items SET value = 'b' WHERE id = 1",
-				OldValues: map[string][]byte{"id": []byte("1"), "value": []byte("old")},
-				NewValues: map[string][]byte{"id": []byte("1"), "value": []byte("b")},
-			},
+			testProtocolDMLStatement(protocol.StatementUpdate, "conflictdb", "items", []byte("items:1"),
+				map[string][]byte{"id": []byte("1"), "value": []byte("old")},
+				map[string][]byte{"id": []byte("1"), "value": []byte("b")}),
 		},
 	}
 
@@ -496,14 +498,9 @@ func TestReplicationEngine_PrepareUpdateWithoutIntentKey(t *testing.T) {
 		StartTS:  startTS,
 		Database: "testdb",
 		Statements: []protocol.Statement{
-			{
-				Type:      protocol.StatementUpdate,
-				TableName: "data",
-				IntentKey: []byte(""), // Empty - must come from CDC preupdate hooks
-				SQL:       "UPDATE data SET val = 'new' WHERE id = 1",
-				OldValues: map[string][]byte{"id": []byte("1"), "val": []byte("old")},
-				NewValues: map[string][]byte{"id": []byte("1"), "val": []byte("new")},
-			},
+			testProtocolDMLStatement(protocol.StatementUpdate, "testdb", "data", []byte(""),
+				map[string][]byte{"id": []byte("1"), "val": []byte("old")},
+				map[string][]byte{"id": []byte("1"), "val": []byte("new")}),
 		},
 	}
 
@@ -693,16 +690,10 @@ func TestReplicationEngine_AbortSuccess(t *testing.T) {
 		StartTS:  startTS,
 		Database: "testdb",
 		Statements: []protocol.Statement{
-			{
-				Type:      protocol.StatementInsert,
-				TableName: "items",
-				IntentKey: []byte("items:1"),
-				SQL:       "INSERT INTO items (id, value) VALUES (1, 'test')",
-				NewValues: map[string][]byte{
-					"id":    []byte("1"),
-					"value": []byte("test"),
-				},
-			},
+			testProtocolDMLStatement(protocol.StatementInsert, "testdb", "items", []byte("items:1"), nil, map[string][]byte{
+				"id":    []byte("1"),
+				"value": []byte("test"),
+			}),
 		},
 	}
 

@@ -349,8 +349,11 @@ func (tm *TransactionManager) notifyVectorCDC(txn *Transaction, entries []*Inten
 		cdcEntries = append(cdcEntries, common.CDCEntry{
 			Table:        entry.Table,
 			IntentKey:    entry.IntentKey,
+			Operation:    entry.Operation,
 			OldValues:    entry.OldValues,
 			NewValues:    entry.NewValues,
+			EncodedRow:   entry.EncodedRow,
+			EncodedCodec: entry.EncodedCodec,
 			CommitTxnID:  txn.ID,
 			CommitSeqNum: seqNum,
 		})
@@ -378,11 +381,14 @@ func (tm *TransactionManager) rebuildStatementsFromCDC(cdcEntries []*IntentEntry
 	// Add DML statements from CDC entries
 	for _, entry := range cdcEntries {
 		stmt := protocol.Statement{
-			TableName: entry.Table,
-			IntentKey: entry.IntentKey,
-			OldValues: entry.OldValues,
-			NewValues: entry.NewValues,
-			Type:      OpTypeToStatementType(OpType(entry.Operation)),
+			TableName:    entry.Table,
+			IntentKey:    entry.IntentKey,
+			OldValues:    entry.OldValues,
+			NewValues:    entry.NewValues,
+			Operation:    entry.Operation,
+			EncodedRow:   entry.EncodedRow,
+			EncodedCodec: entry.EncodedCodec,
+			Type:         OpTypeToStatementType(OpType(entry.Operation)),
 		}
 		statements = append(statements, stmt)
 	}
