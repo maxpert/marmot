@@ -7,6 +7,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -33,12 +34,24 @@ type EphemeralHookSession struct {
 	schemaCache  *SchemaCache // Shared schema cache
 	lastInsertId int64        // Last insert ID from most recent insert
 	mu           sync.Mutex
+	captureMu    sync.Mutex
 
-	conflictError error // Set if conflict detected during hook
+	conflictError        error // Set if conflict detected during hook
+	capturedRows         []capturedRow
+	capturedBytes        int
+	capturedRowsMax      int
+	usePersistentCapture bool
 
 	intentEntries    []*IntentEntry
 	intentEntriesErr error
 }
+
+type capturedRow struct {
+	seq  uint64
+	data []byte
+}
+
+const defaultCapturedRowsBudget = 64 * 1024 * 1024
 
 // IntentEntry represents a CDC entry stored in the system database
 type IntentEntry struct {
@@ -69,11 +82,13 @@ func StartEphemeralSession(ctx context.Context, userDB *sql.DB, metaStore MetaSt
 	}
 
 	session := &EphemeralHookSession{
-		conn:        conn,
-		metaStore:   metaStore,
-		txnID:       txnID,
-		seq:         0,
-		schemaCache: schemaCache,
+		conn:            conn,
+		metaStore:       metaStore,
+		txnID:           txnID,
+		seq:             0,
+		schemaCache:     schemaCache,
+		capturedRows:    make([]capturedRow, 0, 4),
+		capturedRowsMax: defaultCapturedRowsBudget,
 	}
 
 	if schemaCache != nil && schemaCache.IsEmpty() {
@@ -191,9 +206,9 @@ func (s *EphemeralHookSession) Rollback() error {
 	return txErr
 }
 
-// ProcessCapturedRows iterates encoded captured rows from Pebble and acquires locks.
+// ProcessCapturedRows iterates captured rows and acquires locks.
 // Called AFTER transaction rollback when SQLite lock is released.
-// Encoding happens in hookCallback, so this only does lock acquisition and conflict detection.
+// Encoding happens in hookCallback, so this does lock acquisition and conflict detection.
 func (s *EphemeralHookSession) ProcessCapturedRows() error {
 	s.mu.Lock()
 	if s.intentEntries != nil || s.intentEntriesErr != nil {
@@ -209,6 +224,7 @@ func (s *EphemeralHookSession) ProcessCapturedRows() error {
 		s.intentEntriesErr = err
 		s.conflictError = err
 		s.mu.Unlock()
+		s.clearCapturedRows()
 		return err
 	}
 
@@ -216,22 +232,20 @@ func (s *EphemeralHookSession) ProcessCapturedRows() error {
 	s.intentEntries = entries
 	s.intentEntriesErr = nil
 	s.mu.Unlock()
+	s.clearCapturedRows()
 
 	return nil
 }
 
 func (s *EphemeralHookSession) collectCapturedRows(collectOnly bool) ([]*IntentEntry, error) {
-	cursor, err := s.metaStore.IterateCapturedRows(s.txnID)
+	rows, err := s.captureSnapshot()
 	if err != nil {
-		return nil, fmt.Errorf("failed to iterate captured rows: %w", err)
+		return nil, err
 	}
-	defer cursor.Close()
 
-	entries := make([]*IntentEntry, 0)
-	for cursor.Next() {
-		seq, data := cursor.Row()
-
-		row, err := DecodeRow(data)
+	entries := make([]*IntentEntry, 0, len(rows))
+	for _, rowRef := range rows {
+		row, err := DecodeRow(rowRef.data)
 		if err != nil {
 			return nil, fmt.Errorf("failed to decode captured row: %w", err)
 		}
@@ -250,7 +264,7 @@ func (s *EphemeralHookSession) collectCapturedRows(collectOnly bool) ([]*IntentE
 
 		entries = append(entries, &IntentEntry{
 			TxnID:     s.txnID,
-			Seq:       seq,
+			Seq:       rowRef.seq,
 			Operation: row.Op,
 			Table:     row.Table,
 			IntentKey: row.IntentKey,
@@ -258,11 +272,6 @@ func (s *EphemeralHookSession) collectCapturedRows(collectOnly bool) ([]*IntentE
 			NewValues: row.NewValues,
 		})
 	}
-
-	if err := cursor.Err(); err != nil {
-		return nil, err
-	}
-
 	return entries, nil
 }
 
@@ -296,6 +305,7 @@ func (s *EphemeralHookSession) GetIntentEntries() ([]*IntentEntry, error) {
 		s.mu.Lock()
 		s.intentEntriesErr = err
 		s.mu.Unlock()
+		s.clearCapturedRows()
 		return nil, err
 	}
 
@@ -303,6 +313,7 @@ func (s *EphemeralHookSession) GetIntentEntries() ([]*IntentEntry, error) {
 	s.intentEntries = entries
 	s.intentEntriesErr = nil
 	s.mu.Unlock()
+	s.clearCapturedRows()
 
 	return entries, nil
 }
@@ -365,6 +376,19 @@ func (s *EphemeralHookSession) releaseRowLocks() {
 func (s *EphemeralHookSession) cleanup() {
 	s.releaseConnection()
 	s.releaseRowLocks()
+	s.clearCapturedRows()
+	s.mu.Lock()
+	s.intentEntries = nil
+	s.intentEntriesErr = nil
+	s.conflictError = nil
+	s.mu.Unlock()
+}
+
+func (s *EphemeralHookSession) clearCapturedRows() {
+	s.captureMu.Lock()
+	s.capturedRows = nil
+	s.capturedBytes = 0
+	s.captureMu.Unlock()
 }
 
 // hookCallback is called by SQLite before each row modification.
@@ -430,16 +454,130 @@ func (s *EphemeralHookSession) hookCallback(data sqlite3.SQLitePreUpdateData) {
 
 	seq := atomic.AddUint64(&s.seq, 1)
 
-	nativeData, err := encoding.MarshalNative(row)
+	rowData, err := EncodeRow(row)
 	if err != nil {
 		log.Warn().Err(err).Uint64("txn_id", s.txnID).Str("table", row.Table).Msg("hookCallback: failed to marshal row")
 		return
 	}
-	defer nativeData.Dispose()
 
-	if err := s.metaStore.WriteCapturedRow(s.txnID, seq, nativeData.Bytes()); err != nil {
-		log.Warn().Err(err).Uint64("txn_id", s.txnID).Uint64("seq", seq).Str("table", row.Table).Msg("hookCallback: failed to write captured row")
+	if err := s.captureRow(seq, rowData); err != nil {
+		log.Warn().Err(err).Uint64("txn_id", s.txnID).Uint64("seq", seq).Str("table", row.Table).Msg("hookCallback: failed to capture row")
 	}
+}
+
+func (s *EphemeralHookSession) captureRow(seq uint64, encoded []byte) error {
+	if s.metaStore == nil {
+		return nil
+	}
+	if s.GetConflictError() != nil {
+		return s.GetConflictError()
+	}
+
+	dataCopy := append([]byte(nil), encoded...)
+	s.captureMu.Lock()
+	if s.usePersistentCapture {
+		s.captureMu.Unlock()
+		return s.persistCapturedRow(seq, dataCopy)
+	}
+
+	if s.capturedRowsMax > 0 && s.capturedBytes+len(dataCopy) > s.capturedRowsMax {
+		pending := make([]capturedRow, len(s.capturedRows))
+		copy(pending, s.capturedRows)
+		s.capturedRows = nil
+		s.capturedBytes = 0
+		s.usePersistentCapture = true
+		s.captureMu.Unlock()
+
+		if err := s.persistCapturedRows(pending); err != nil {
+			s.setConflictError(err)
+			return err
+		}
+		return s.persistCapturedRow(seq, dataCopy)
+	}
+
+	s.capturedRows = append(s.capturedRows, capturedRow{seq: seq, data: dataCopy})
+	s.capturedBytes += len(dataCopy)
+	s.captureMu.Unlock()
+	return nil
+}
+
+func (s *EphemeralHookSession) persistCapturedRows(rows []capturedRow) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	for _, row := range rows {
+		if err := s.metaStore.WriteCapturedRow(s.txnID, row.seq, row.data); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *EphemeralHookSession) persistCapturedRow(seq uint64, encoded []byte) error {
+	if err := s.metaStore.WriteCapturedRow(s.txnID, seq, encoded); err != nil {
+		s.setConflictError(err)
+		return err
+	}
+	return nil
+}
+
+func (s *EphemeralHookSession) captureSnapshot() ([]capturedRow, error) {
+	s.captureMu.Lock()
+	memoryRows := make([]capturedRow, len(s.capturedRows))
+	copy(memoryRows, s.capturedRows)
+	s.captureMu.Unlock()
+
+	persistedRows, err := s.loadPersistedRows()
+	if err != nil {
+		return nil, err
+	}
+
+	if len(persistedRows) == 0 {
+		return memoryRows, nil
+	}
+	if len(memoryRows) == 0 {
+		return persistedRows, nil
+	}
+
+	combined := make([]capturedRow, 0, len(memoryRows)+len(persistedRows))
+	combined = append(combined, persistedRows...)
+	combined = append(combined, memoryRows...)
+
+	sort.Slice(combined, func(i, j int) bool {
+		return combined[i].seq < combined[j].seq
+	})
+	return combined, nil
+}
+
+func (s *EphemeralHookSession) loadPersistedRows() ([]capturedRow, error) {
+	cursor, err := s.metaStore.IterateCapturedRows(s.txnID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to iterate captured rows: %w", err)
+	}
+	defer cursor.Close()
+
+	rows := make([]capturedRow, 0)
+	for cursor.Next() {
+		seq, data := cursor.Row()
+		rows = append(rows, capturedRow{
+			seq:  seq,
+			data: append([]byte(nil), data...),
+		})
+	}
+
+	if err := cursor.Err(); err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
+func (s *EphemeralHookSession) setConflictError(err error) {
+	if err == nil {
+		return
+	}
+	s.mu.Lock()
+	s.conflictError = err
+	s.mu.Unlock()
 }
 
 // =============================================================================

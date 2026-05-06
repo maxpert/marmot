@@ -371,18 +371,16 @@ func (bc *SQLiteBatchCommitter) flush(batch map[uint64]*pendingCommit, trigger s
 	}
 	defer conn.Close()
 
-	tx, err := conn.BeginTx(ctx, nil)
+	// Load schema before taking the transaction lock.
+	schemaCache, err := bc.getSchemaCache(conn)
 	if err != nil {
 		for _, pc := range batch {
 			pc.promise.Set(nil, err)
 		}
 		return
 	}
-
-	// Load schema inside transaction (atomic with writes)
-	schemaCache, err := bc.getSchemaCache(conn)
+	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
-		tx.Rollback()
 		for _, pc := range batch {
 			pc.promise.Set(nil, err)
 		}

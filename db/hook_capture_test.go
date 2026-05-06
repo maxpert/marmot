@@ -16,6 +16,13 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func loadCapturedIntents(t *testing.T, session *EphemeralHookSession) []*IntentEntry {
+	t.Helper()
+	entries, err := session.GetIntentEntries()
+	require.NoError(t, err)
+	return entries
+}
+
 // TestHookCapture_Insert verifies INSERT captures NewValues, NewRowID
 func TestHookCapture_Insert(t *testing.T) {
 	tmpDir := t.TempDir()
@@ -54,23 +61,12 @@ func TestHookCapture_Insert(t *testing.T) {
 	require.NoError(t, err)
 
 	// Verify capture WITHOUT calling ProcessCapturedRows
-	var captured []*EncodedCapturedRow
-	cursor, err := metaStore.IterateCapturedRows(txnID)
-	require.NoError(t, err)
-	defer cursor.Close()
-
-	for cursor.Next() {
-		_, data := cursor.Row()
-		row, err := DecodeRow(data)
-		require.NoError(t, err)
-		captured = append(captured, row)
-	}
-	require.NoError(t, cursor.Err())
+	captured := loadCapturedIntents(t, session)
 
 	// Assert
 	require.Len(t, captured, 1)
 	assert.Equal(t, "test", captured[0].Table)
-	assert.Equal(t, uint8(OpTypeInsert), captured[0].Op)
+	assert.Equal(t, uint8(OpTypeInsert), captured[0].Operation)
 	assert.Nil(t, captured[0].OldValues)
 	require.NotNil(t, captured[0].NewValues)
 	assert.Len(t, captured[0].NewValues, 3) // 3 columns
@@ -128,23 +124,12 @@ func TestHookCapture_Update(t *testing.T) {
 	require.NoError(t, err)
 
 	// Verify capture
-	var captured []*EncodedCapturedRow
-	cursor, err := metaStore.IterateCapturedRows(txnID)
-	require.NoError(t, err)
-	defer cursor.Close()
-
-	for cursor.Next() {
-		_, data := cursor.Row()
-		row, err := DecodeRow(data)
-		require.NoError(t, err)
-		captured = append(captured, row)
-	}
-	require.NoError(t, cursor.Err())
+	captured := loadCapturedIntents(t, session)
 
 	// Assert
 	require.Len(t, captured, 1)
 	assert.Equal(t, "test", captured[0].Table)
-	assert.Equal(t, uint8(OpTypeUpdate), captured[0].Op)
+	assert.Equal(t, uint8(OpTypeUpdate), captured[0].Operation)
 	assert.NotEmpty(t, captured[0].IntentKey)
 
 	// Verify OldValues
@@ -212,23 +197,12 @@ func TestHookCapture_Delete(t *testing.T) {
 	require.NoError(t, err)
 
 	// Verify capture
-	var captured []*EncodedCapturedRow
-	cursor, err := metaStore.IterateCapturedRows(txnID)
-	require.NoError(t, err)
-	defer cursor.Close()
-
-	for cursor.Next() {
-		_, data := cursor.Row()
-		row, err := DecodeRow(data)
-		require.NoError(t, err)
-		captured = append(captured, row)
-	}
-	require.NoError(t, cursor.Err())
+	captured := loadCapturedIntents(t, session)
 
 	// Assert
 	require.Len(t, captured, 1)
 	assert.Equal(t, "test", captured[0].Table)
-	assert.Equal(t, uint8(OpTypeDelete), captured[0].Op)
+	assert.Equal(t, uint8(OpTypeDelete), captured[0].Operation)
 	assert.NotEmpty(t, captured[0].IntentKey)
 	assert.Nil(t, captured[0].NewValues)
 
@@ -288,18 +262,7 @@ func TestHookCapture_SkipsInternalTables(t *testing.T) {
 	require.NoError(t, err)
 
 	// Verify only user table was captured
-	var captured []*EncodedCapturedRow
-	cursor, err := metaStore.IterateCapturedRows(txnID)
-	require.NoError(t, err)
-	defer cursor.Close()
-
-	for cursor.Next() {
-		_, data := cursor.Row()
-		row, err := DecodeRow(data)
-		require.NoError(t, err)
-		captured = append(captured, row)
-	}
-	require.NoError(t, cursor.Err())
+	captured := loadCapturedIntents(t, session)
 
 	// Only user_table should be captured
 	require.Len(t, captured, 1)
@@ -354,18 +317,7 @@ func TestHookCapture_AllColumnTypes(t *testing.T) {
 	require.NoError(t, err)
 
 	// Verify capture
-	var captured []*EncodedCapturedRow
-	cursor, err := metaStore.IterateCapturedRows(txnID)
-	require.NoError(t, err)
-	defer cursor.Close()
-
-	for cursor.Next() {
-		_, data := cursor.Row()
-		row, err := DecodeRow(data)
-		require.NoError(t, err)
-		captured = append(captured, row)
-	}
-	require.NoError(t, cursor.Err())
+	captured := loadCapturedIntents(t, session)
 
 	require.Len(t, captured, 1)
 	require.NotNil(t, captured[0].NewValues)
@@ -437,20 +389,11 @@ func TestHookCapture_MultipleOperations(t *testing.T) {
 	require.NoError(t, session.ExecContext(ctx, "DELETE FROM test WHERE id = 2"))
 
 	// Verify captures
-	var captured []*EncodedCapturedRow
+	captured := loadCapturedIntents(t, session)
 	var sequences []uint64
-	cursor, err := metaStore.IterateCapturedRows(txnID)
-	require.NoError(t, err)
-	defer cursor.Close()
-
-	for cursor.Next() {
-		seq, data := cursor.Row()
-		sequences = append(sequences, seq)
-		row, err := DecodeRow(data)
-		require.NoError(t, err)
-		captured = append(captured, row)
+	for _, entry := range captured {
+		sequences = append(sequences, entry.Seq)
 	}
-	require.NoError(t, cursor.Err())
 
 	// Assert 3 operations captured
 	require.Len(t, captured, 3)
@@ -461,9 +404,9 @@ func TestHookCapture_MultipleOperations(t *testing.T) {
 	assert.Equal(t, uint64(3), sequences[2])
 
 	// Verify operation types
-	assert.Equal(t, uint8(OpTypeInsert), captured[0].Op)
-	assert.Equal(t, uint8(OpTypeUpdate), captured[1].Op)
-	assert.Equal(t, uint8(OpTypeDelete), captured[2].Op)
+	assert.Equal(t, uint8(OpTypeInsert), captured[0].Operation)
+	assert.Equal(t, uint8(OpTypeUpdate), captured[1].Operation)
+	assert.Equal(t, uint8(OpTypeDelete), captured[2].Operation)
 }
 
 // TestHookCapture_ValuesRetrievable verifies data can be read back correctly
@@ -514,18 +457,7 @@ func TestHookCapture_ValuesRetrievable(t *testing.T) {
 	}
 
 	// Read back and verify all data
-	var captured []*EncodedCapturedRow
-	cursor, err := metaStore.IterateCapturedRows(txnID)
-	require.NoError(t, err)
-	defer cursor.Close()
-
-	for cursor.Next() {
-		_, data := cursor.Row()
-		row, err := DecodeRow(data)
-		require.NoError(t, err)
-		captured = append(captured, row)
-	}
-	require.NoError(t, cursor.Err())
+	captured := loadCapturedIntents(t, session)
 
 	require.Len(t, captured, 3)
 
@@ -583,21 +515,10 @@ func TestHookCapture_NoSchemaCache(t *testing.T) {
 	require.NoError(t, err)
 
 	// Verify data was captured (schema reloaded during session start)
-	var captured []*EncodedCapturedRow
-	cursor, err := metaStore.IterateCapturedRows(txnID)
-	require.NoError(t, err)
-	defer cursor.Close()
-
-	for cursor.Next() {
-		_, data := cursor.Row()
-		row, err := DecodeRow(data)
-		require.NoError(t, err)
-		captured = append(captured, row)
-	}
-	require.NoError(t, cursor.Err())
+	captured := loadCapturedIntents(t, session)
 
 	// Hook captures data because StartEphemeralSession reloads schema from connection
 	require.Len(t, captured, 1)
 	assert.Equal(t, "test", captured[0].Table)
-	assert.Equal(t, uint8(OpTypeInsert), captured[0].Op)
+	assert.Equal(t, uint8(OpTypeInsert), captured[0].Operation)
 }

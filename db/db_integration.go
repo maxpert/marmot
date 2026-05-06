@@ -678,6 +678,7 @@ func (mdb *ReplicatedDatabase) ExecuteLocalWithHooks(ctx context.Context, txnID 
 	// ROLLBACK hookDB - this also calls ProcessCapturedRows which converts
 	// raw captured data to IntentEntries
 	if err := session.Rollback(); err != nil {
+		session.cleanup()
 		return nil, fmt.Errorf("failed to rollback hook session: %w", err)
 	}
 
@@ -685,8 +686,10 @@ func (mdb *ReplicatedDatabase) ExecuteLocalWithHooks(ctx context.Context, txnID 
 	// propagated so DML never falls back to statement replication.
 	cdcEntries, err := session.GetIntentEntries()
 	if err != nil {
+		session.cleanup()
 		return nil, fmt.Errorf("failed to collect CDC entries: %w", err)
 	}
+	session.cleanup()
 
 	// Return completed execution with captured CDC data
 	return &CompletedLocalExecution{

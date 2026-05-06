@@ -52,8 +52,8 @@ type cdcSegmentTxnManifest struct {
 	inlineRows     []cdcSegmentInlineRow
 	inlineBytes    uint64
 	inlineDisabled bool
+	prepareChunks  []cdcSegmentChunk
 	sealed         bool
-	published      bool
 }
 
 type cdcSegmentInlineRow struct {
@@ -203,6 +203,11 @@ func recoverCDCSegmentPreparedManifests(dir string) (map[uint64]*cdcSegmentTxnMa
 					_ = f.Close()
 					return nil, fmt.Errorf("recover CDC prepare manifest txn mismatch: header=%d payload=%d", txnID, manifest.TxnID)
 				}
+				manifest.prepareChunks = []cdcSegmentChunk{{
+					SegmentID: id,
+					Offset:    offset,
+					Length:    cdcSegmentHeaderSize + uint64(payloadLen),
+				}}
 				prepared[txnID] = cloneCDCManifest(&manifest)
 			}
 			offset += cdcSegmentHeaderSize + uint64(payloadLen)
@@ -385,6 +390,11 @@ func (l *cdcSegmentLog) sealTxn(txnID uint64, immutable *TxnImmutableRecord, wai
 		if err := l.syncer.sync(syncManifest); err != nil {
 			return nil, err
 		}
+		l.mu.Lock()
+		if pending := l.pending[txnID]; pending != nil {
+			pending.prepareChunks = append(pending.prepareChunks, prepareChunk)
+		}
+		l.mu.Unlock()
 	} else {
 		l.syncer.queue(syncManifest)
 	}
@@ -396,14 +406,6 @@ func (l *cdcSegmentLog) sealTxn(txnID uint64, immutable *TxnImmutableRecord, wai
 	return manifest, nil
 }
 
-func (l *cdcSegmentLog) markTxnManifestPublished(txnID uint64) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if pending := l.pending[txnID]; pending != nil {
-		pending.published = true
-	}
-}
-
 func (l *cdcSegmentLog) getPendingManifest(txnID uint64) *cdcSegmentTxnManifest {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -412,6 +414,54 @@ func (l *cdcSegmentLog) getPendingManifest(txnID uint64) *cdcSegmentTxnManifest 
 		return nil
 	}
 	return cloneCDCManifest(m)
+}
+
+func (l *cdcSegmentLog) addRetainedSegments(retained map[uint64]struct{}) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	retained[l.segmentID] = struct{}{}
+	for _, manifest := range l.pending {
+		for _, chunk := range manifest.Chunks {
+			retained[chunk.SegmentID] = struct{}{}
+		}
+		for _, chunk := range manifest.prepareChunks {
+			retained[chunk.SegmentID] = struct{}{}
+		}
+	}
+}
+
+func (l *cdcSegmentLog) pruneUnreferencedSegments(retained map[uint64]struct{}) (int, error) {
+	l.mu.Lock()
+	currentID := l.segmentID
+	l.mu.Unlock()
+
+	entries, err := os.ReadDir(l.dir)
+	if err != nil {
+		return 0, err
+	}
+
+	deleted := 0
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		var id uint64
+		if _, err := fmt.Sscanf(entry.Name(), "seg-%018d.log", &id); err != nil || id == 0 {
+			continue
+		}
+		if id >= currentID {
+			continue
+		}
+		if _, ok := retained[id]; ok {
+			continue
+		}
+		if err := os.Remove(filepath.Join(l.dir, entry.Name())); err != nil && !os.IsNotExist(err) {
+			return deleted, err
+		}
+		deleted++
+	}
+	return deleted, nil
 }
 
 func (l *cdcSegmentLog) discardTxn(txnID uint64) {
@@ -464,6 +514,9 @@ func cloneCDCManifest(m *cdcSegmentTxnManifest) *cdcSegmentTxnManifest {
 				data: append([]byte(nil), row.data...),
 			}
 		}
+	}
+	if len(m.prepareChunks) > 0 {
+		cp.prepareChunks = append([]cdcSegmentChunk(nil), m.prepareChunks...)
 	}
 	return &cp
 }

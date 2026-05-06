@@ -3,6 +3,7 @@ package db
 import (
 	"bytes"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/cockroachdb/pebble"
@@ -106,6 +107,77 @@ func TestCDCSegmentLogRejectsOversizedRecord(t *testing.T) {
 	}
 }
 
+func TestCDCSegmentLogPrunesOnlyUnreferencedOldSegments(t *testing.T) {
+	baseDir := t.TempDir()
+	log, err := openCDCSegmentLog(baseDir)
+	if err != nil {
+		t.Fatalf("open log: %v", err)
+	}
+	if err := log.appendRow(1, 1, []byte("row")); err != nil {
+		t.Fatalf("append row: %v", err)
+	}
+	if err := log.close(); err != nil {
+		t.Fatalf("close log: %v", err)
+	}
+
+	segDir := filepath.Join(baseDir, cdcSegmentDirName)
+	if err := os.WriteFile(cdcSegmentPath(segDir, 2), nil, 0o644); err != nil {
+		t.Fatalf("create second segment: %v", err)
+	}
+	reopened, err := openCDCSegmentLog(baseDir)
+	if err != nil {
+		t.Fatalf("reopen log: %v", err)
+	}
+	defer reopened.close()
+
+	deleted, err := reopened.pruneUnreferencedSegments(map[uint64]struct{}{2: {}})
+	if err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+	if deleted != 1 {
+		t.Fatalf("deleted segments = %d, want 1", deleted)
+	}
+	if _, err := os.Stat(cdcSegmentPath(segDir, 1)); !os.IsNotExist(err) {
+		t.Fatalf("segment 1 should be deleted, stat err=%v", err)
+	}
+	if _, err := os.Stat(cdcSegmentPath(segDir, 2)); err != nil {
+		t.Fatalf("current segment should remain: %v", err)
+	}
+}
+
+func TestCDCSegmentLogRetainsPendingPrepareChunks(t *testing.T) {
+	log, err := openCDCSegmentLog(t.TempDir())
+	if err != nil {
+		t.Fatalf("open log: %v", err)
+	}
+	defer log.close()
+
+	log.mu.Lock()
+	log.segmentID = 3
+	log.pending[10] = &cdcSegmentTxnManifest{
+		TxnID: 10,
+		Chunks: []cdcSegmentChunk{{
+			SegmentID: 1,
+			Offset:    0,
+			Length:    64,
+		}},
+		prepareChunks: []cdcSegmentChunk{{
+			SegmentID: 2,
+			Offset:    0,
+			Length:    64,
+		}},
+	}
+	log.mu.Unlock()
+
+	retained := make(map[uint64]struct{})
+	log.addRetainedSegments(retained)
+	for _, id := range []uint64{1, 2, 3} {
+		if _, ok := retained[id]; !ok {
+			t.Fatalf("segment %d was not retained", id)
+		}
+	}
+}
+
 func TestPebbleMetaStoreRecoversPreparedCDCFromSegment(t *testing.T) {
 	dir := t.TempDir()
 	opts := PebbleMetaStoreOptions{CacheSizeMB: 8, MemTableSizeMB: 4, MemTableCount: 2}
@@ -171,5 +243,50 @@ func TestPebbleMetaStoreRecoversPreparedCDCFromSegment(t *testing.T) {
 	}
 	if !ok {
 		t.Fatal("expected recovered row lock")
+	}
+	if _, closer, err := recovered.db.Get(pebbleIntentByTxnKey(txnID, "docs", "docs:1")); err == nil {
+		closer.Close()
+		t.Fatal("recovered DML intent should remain transient, not persisted under /intent_txn")
+	} else if err != pebble.ErrNotFound {
+		t.Fatalf("get persisted DML intent: %v", err)
+	}
+}
+
+func TestPebbleMetaStoreSealReleasesPendingInlineRows(t *testing.T) {
+	store, cleanup := createTestPebbleMetaStore(t)
+	defer cleanup()
+
+	const txnID uint64 = 77
+	payload := []byte("captured row")
+	if err := store.WriteCapturedRow(txnID, 1, payload); err != nil {
+		t.Fatalf("write captured row: %v", err)
+	}
+	if store.cdcLog.getPendingManifest(txnID) == nil {
+		t.Fatal("expected pending manifest before seal")
+	}
+	if err := store.SealCapturedRows(txnID); err != nil {
+		t.Fatalf("seal captured rows: %v", err)
+	}
+	if store.cdcLog.getPendingManifest(txnID) != nil {
+		t.Fatal("pending manifest should be released after manifest publish")
+	}
+
+	cursor, err := store.IterateCapturedRows(txnID)
+	if err != nil {
+		t.Fatalf("iterate captured rows: %v", err)
+	}
+	defer cursor.Close()
+	if !cursor.Next() {
+		t.Fatalf("expected sealed captured row, err=%v", cursor.Err())
+	}
+	_, got := cursor.Row()
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("payload = %q, want %q", got, payload)
+	}
+	if cursor.Next() {
+		t.Fatal("unexpected extra row")
+	}
+	if err := cursor.Err(); err != nil {
+		t.Fatalf("cursor err: %v", err)
 	}
 }

@@ -203,14 +203,15 @@ func TestRowLockStore_PersistenceAcrossRestart(t *testing.T) {
 		require.False(t, exists1, "RowLockStore should not contain locks after restart")
 		require.False(t, exists2, "RowLockStore should not contain locks after restart")
 
-		// But /intent_txn/ index should still exist in Pebble for recovery
+		// DML redo is recovered from CDC segment manifests, not /intent_txn/.
+		// Row locks and DML intent metadata are intentionally transient.
 		intent1, err := store.GetIntentsByTxn(txnID1)
 		require.NoError(t, err)
-		require.Len(t, intent1, 1, "Intent index should persist in Pebble")
+		require.Empty(t, intent1, "DML intent index should not persist in Pebble")
 
 		intent2, err := store.GetIntentsByTxn(txnID2)
 		require.NoError(t, err)
-		require.Len(t, intent2, 1, "Intent index should persist in Pebble")
+		require.Empty(t, intent2, "DML intent index should not persist in Pebble")
 	}
 }
 
