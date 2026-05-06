@@ -276,9 +276,6 @@ func (l *cdcSegmentLog) appendRow(txnID, seq uint64, payload []byte) error {
 }
 
 func (l *cdcSegmentLog) appendRecord(recordType uint16, txnID, seq uint64, payload []byte) (cdcSegmentChunk, error) {
-	if len(payload) > int(^uint32(0)) {
-		return cdcSegmentChunk{}, fmt.Errorf("cdc row payload too large: %d bytes", len(payload))
-	}
 	recordLen := cdcSegmentHeaderSize + uint64(len(payload))
 	if recordLen > cdcSegmentFileSize {
 		return cdcSegmentChunk{}, fmt.Errorf("cdc segment record too large: %d bytes", recordLen)
