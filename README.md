@@ -243,14 +243,16 @@ Marmot v2 uses **Change Data Capture (CDC)** for replication instead of SQL stat
 ### How It Works
 
 1. **Row-Level Capture**: Instead of replicating SQL statements, Marmot captures the actual row data changes (INSERT/UPDATE/DELETE)
-2. **Binary Data Format**: Row data is serialized as CDC messages with column values, ensuring consistent replication regardless of SQL dialect
-3. **Deterministic Application**: Row data is applied directly to the target database, avoiding parsing ambiguities
+2. **Canonical Binary Row Format**: DML changes are encoded once as msgpack `EncodedCapturedRow` records and stored in Marmot's CDC segment log
+3. **Minimal Wire Payload**: DML replication sends the encoded row blob plus statement metadata; decoded before/after maps are local apply-time state only
+4. **Deterministic Application**: Row data is applied directly to the target database, avoiding parsing ambiguities
 
 ### Benefits
 
 - **Consistency**: Same row data applied everywhere, no SQL parsing differences
 - **Performance**: Binary format is more efficient than SQL text
 - **Reliability**: No issues with SQL syntax variations between MySQL and SQLite
+- **Lower Write Amplification**: Row payloads are not duplicated into Pebble intent keys; Pebble tracks transaction metadata and row locks while the CDC segment log stores DML bytes
 
 ### Row Key Extraction
 
@@ -1232,56 +1234,45 @@ See `config.toml` for complete configuration reference with detailed comments.
 
 ## Benchmarks
 
-Performance benchmarks on a local development machine (Apple M-series, 3-node cluster, single machine):
+Latest measured Pika write benchmark on a local development machine (Apple M-series, 3-node cluster, single machine):
 
 ### Test Configuration
 
 | Parameter | Value |
 |-----------|-------|
 | Nodes | 3 (ports 3307, 3308, 3309) |
-| Threads | 16 |
-| Batch Size | 10 ops/transaction |
+| Workers | 64 |
+| Batch Size | 1 op/transaction |
 | Consistency | QUORUM |
+| Workload | INSERT-only load |
 
 ### Load Phase (INSERT-only)
 
 | Metric | Value |
 |--------|-------|
-| Throughput | **4,175 ops/sec** |
-| TX Throughput | **417 tx/sec** |
-| Records Loaded | 200,000 |
+| Throughput | **2,652.87 ops/sec** |
+| Records Loaded | 500,000 |
+| Total Time | 188.48s |
 | Errors | 0 |
+| Retries | 0 |
+| Node RSS After Load | 554-561 MB |
+| Disk Per Node | 1.5 GB |
 
-### Mixed Workload
-
-| Metric | Value |
-|--------|-------|
-| Throughput | **3,370 ops/sec** |
-| TX Throughput | **337 tx/sec** |
-| Duration | 120 seconds |
-| Total Operations | 404,930 |
-| Errors | 0 |
-| Retries | 37 (0.09%) |
-
-**Operation Distribution:**
-- READ: 20%
-- UPDATE: 30%
-- INSERT: 35%
-- DELETE: 5%
-- UPSERT: 10%
-
-### Latency (Mixed Workload)
+### Latency
 
 | Percentile | Latency |
 |------------|---------|
-| P50 | 4.3ms |
-| P90 | 14.0ms |
-| P95 | 36.8ms |
-| P99 | 85.1ms |
+| Min | 5.008ms |
+| Average | 24.018ms |
+| P50 | 22.662ms |
+| P90 | 34.694ms |
+| P95 | 40.351ms |
+| P99 | 52.787ms |
+| Max | 115.407ms |
 
 ### Replication Verification
 
-All 3 nodes maintained identical row counts (346,684 rows) throughout the test, confirming consistent replication.
+All 3 nodes ended with identical row counts: 500,000 rows per node. Sample verification checked 100 rows and all 100 matched.
 
 > **Note**: These benchmarks are from a local development machine with all nodes on the same host. Production deployments across multiple machines will have different characteristics based on network latency. Expect P99 latencies of 50-200ms for cross-region QUORUM writes.
 

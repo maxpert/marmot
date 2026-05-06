@@ -48,10 +48,11 @@ Marmot's 2PC differs from traditional database 2PC by using **write intents** fo
 
 1. **Coordinator executes locally** with preupdate hooks capturing CDC data
 2. **Write intents created** for each affected row (distributed locks)
-3. **CDC entries stored** in MetaStore (msgpack-serialized row data)
-4. **Broadcast to replicas** with CDC data (not SQL)
-5. **Replicas create write intents** and store CDC entries
-6. **Return SUCCESS** or **CONFLICT** to coordinator
+3. **Captured rows encoded** as canonical msgpack `EncodedCapturedRow` records
+4. **DML bytes stored** in the local CDC segment log; Pebble tracks transaction metadata and row-lock indexes
+5. **Broadcast to replicas** with encoded row bytes (not SQL)
+6. **Replicas create write intents** and store the same encoded row bytes in their local CDC segment log
+7. **Return SUCCESS** or **CONFLICT** to coordinator
 
 ```
 Coordinator                      Replica Nodes
@@ -62,7 +63,7 @@ Execute with CDC hooks
 Create write intents
   ↓
 ReplicateTransaction(PREPARE) →  Create write intents
-                                 Store CDC entries
+                                 Store encoded rows in CDC segment log
                               ←  Return: Success/Conflict
 ```
 
@@ -80,7 +81,7 @@ Coordinator                      Replica Nodes
 
 Remote quorum PREPARE achieved ✓
   ↓
-ReplicateTransaction(COMMIT) →   Apply CDC entries to SQLite
+ReplicateTransaction(COMMIT) →   Decode and apply CDC rows to SQLite
                                  Mark transaction COMMITTED
                               ←  Return: CommitTS
 
@@ -113,7 +114,8 @@ Time: T1 (TxnID = 0x0001A2B3C4D50001)
 
 Node 1 executes UPDATE on hookDB connection
   → Preupdate hook fires: SQLITE_UPDATE on "users"
-  → Captures: oldValues={balance: 100}, newValues={balance: 75}
+  → Captures row images and primary-key intent key
+  → Encodes one msgpack EncodedCapturedRow
 ```
 
 **Step 2: Coordinator creates write intent**
@@ -139,13 +141,19 @@ gRPC ReplicateTransaction (parallel to both):
   TxnID: 0x0001A2B3C4D50001,
   NodeID: 1,
   Database: "mydb",
-  CDCEntries: [{
-    Seq: 1,
-    Operation: UPDATE,
-    Table: "users",
-    IntentKey: "users:1",
-    OldValues: {"id": [0x01], "email": [...], "name": [...], "balance": [0x64]},  // 100
-    NewValues: {"id": [0x01], "email": [...], "name": [...], "balance": [0x4B]}   // 75
+  Statements: [{
+    Type: UPDATE,
+    TableName: "users",
+    RowChange: {
+      EncodedRowCodec: 1,
+      EncodedRow: msgpack({
+        Table: "users",
+        Op: UPDATE,
+        IntentKey: binary("users:1"),
+        OldValues: {"id": msgpack(1), "balance": msgpack(100)},
+        NewValues: {"id": msgpack(1), "balance": msgpack(75)}
+      })
+    }
   }]
 }
 ```
@@ -156,13 +164,13 @@ gRPC ReplicateTransaction (parallel to both):
 Node 2:
   1. Check Cuckoo filter for "users:1" → MISS (no conflict)
   2. Create write intent: /intent/users/users:1
-  3. Store CDC entry: /cdc/0x0001A2B3C4D50001/1
+  3. Append encoded row to local cdcseg segment and publish transaction manifest
   4. Return: {Status: SUCCESS, PrepareTS: ...}
 
 Node 3:
   1. Check Cuckoo filter for "users:1" → MISS (no conflict)
   2. Create write intent: /intent/users/users:1
-  3. Store CDC entry: /cdc/0x0001A2B3C4D50001/1
+  3. Append encoded row to local cdcseg segment and publish transaction manifest
   4. Return: {Status: SUCCESS, PrepareTS: ...}
 ```
 
@@ -183,7 +191,7 @@ gRPC ReplicateTransaction to Node 2, Node 3:
 
 ```
 Node 2:
-  1. Read CDC entry from /cdc/0x0001A2B3C4D50001/1
+  1. Read encoded row from the local cdcseg transaction manifest
   2. Generate SQL: UPDATE users SET id=1, email='alice@example.com',
                    name='Alice', balance=75 WHERE id=1
   3. Execute on SQLite
@@ -199,7 +207,7 @@ Node 3: (same process)
 ```
 Node 1:
   1. Remote quorum (2/3) committed ✓
-  2. Apply own CDC entry to SQLite
+  2. Apply own encoded CDC row to SQLite
   3. Update txn record: Status=COMMITTED
   4. Cleanup write intents
   5. Return success to client
@@ -253,26 +261,26 @@ Preupdate hook fires BEFORE each row modification
   ↓
 Extract: table, intentKey, oldValues, newValues
   ↓
-Serialize to msgpack (type-preserving)
+Serialize one EncodedCapturedRow to msgpack
   ↓
-Store in MetaStore: /cdc/{txnID}/{seq}
+Keep in bounded hook-session memory or spill to cdcseg for oversized transactions
   ↓
 Release hookDB before 2PC broadcast
 ```
 
-### CDC Entry Format
+### Encoded Row Format
 
 ```go
-type IntentEntry struct {
-    TxnID     uint64              // Transaction ID
-    Seq       uint64              // Sequence within transaction
-    Operation uint8               // INSERT=0, REPLACE=1, UPDATE=2, DELETE=3
-    Table     string              // Table name
-    IntentKey string              // Serialized primary key
-    OldValues map[string][]byte   // Before image (msgpack per column)
-    NewValues map[string][]byte   // After image (msgpack per column)
+type EncodedCapturedRow struct {
+    Table     string
+    Op        uint8             // INSERT=0, REPLACE=1, UPDATE=2, DELETE=3
+    IntentKey []byte            // Binary intent key
+    OldValues map[string][]byte // Before image, msgpack per column
+    NewValues map[string][]byte // After image, msgpack per column
 }
 ```
+
+The DML wire payload is the encoded msgpack bytes plus a codec id. Decoded maps are reconstructed locally only for SQLite apply, vector-index hooks, and CDC publishing.
 
 ### Intent Key Format
 
@@ -287,24 +295,23 @@ type IntentEntry struct {
 | Operation | SQL Generated |
 |-----------|---------------|
 | INSERT | `INSERT OR REPLACE INTO table (...) VALUES (...)` |
-| UPDATE | `UPDATE table SET ... WHERE pk=...` using OldValues |
-| DELETE | `DELETE FROM table WHERE pk=...` using OldValues |
+| UPDATE | `UPDATE table SET ... WHERE pk=...` using the decoded old primary key image |
+| DELETE | `DELETE FROM table WHERE pk=...` using the decoded old primary key image |
 
-### Example: CDC Entry for Our UPDATE
+### Example: Encoded Row for Our UPDATE
 
 When Node 1 executes `UPDATE users SET balance = 75 WHERE id = 1`:
 
-**Raw CDC Entry (msgpack-serialized)**:
+**DML payload stored in `cdcseg` and referenced by `/cdc_manifest/{txnID}`**:
 
 ```
-Key: /cdc/0x0001A2B3C4D50001/1
+Manifest: /cdc_manifest/0x0001A2B3C4D50001
+Segment range: cdcseg-00000042.log offset=8192 length=148
 
-Value (IntentEntry):
+EncodedCapturedRow (msgpack):
 {
-  TxnID:     0x0001A2B3C4D50001,
-  Seq:       1,
-  Operation: 2,                    // UPDATE
   Table:     "users",
+  Op:        2,                    // UPDATE
   IntentKey: "users:1",            // Single PK format
   OldValues: {
     "id":      0x91 0x01,          // msgpack fixint: 1
@@ -338,9 +345,9 @@ WHERE id = 1
 **INSERT** `INSERT INTO users (id, email, name, balance) VALUES (3, 'carol@example.com', 'Carol', 200)`:
 
 ```
-CDC Entry:
+EncodedCapturedRow:
 {
-  Operation: 0,                    // INSERT
+  Op:        0,                    // INSERT
   Table:     "users",
   IntentKey: "users:3",
   OldValues: {},                   // Empty for INSERT
@@ -356,9 +363,9 @@ Generated SQL: INSERT OR REPLACE INTO users (id, email, name, balance)
 **DELETE** `DELETE FROM users WHERE id = 2`:
 
 ```
-CDC Entry:
+EncodedCapturedRow:
 {
-  Operation: 3,                    // DELETE
+  Op:        3,                    // DELETE
   Table:     "users",
   IntentKey: "users:2",
   OldValues: {
@@ -572,7 +579,7 @@ data_dir/
 | `/txn_idx/seq/{seqNum}/{txnID}` | Sequence-ordered index (gap detection) |
 | `/intent/{table}/{intentKey}` | Write intents |
 | `/intent_txn/{txnID}/{table}/{intentKey}` | Intent index by transaction |
-| `/cdc/{txnID}/{seq}` | CDC intent entries |
+| `/cdc_manifest/{txnID}` | Manifest pointing to the transaction's CDC segment-log range |
 | `/repl/{peerID}/{dbName}` | Replication state per peer |
 | `/schema/{dbName}` | Schema version counter |
 | `/seq/{nodeID}` | Sequence generator (pre-allocated batches) |
@@ -596,7 +603,7 @@ type TransactionRecord struct {
 
 ### Group Commit Optimization
 
-Batch writes to Pebble: 100 ops/batch or 2ms timeout, 1000 buffer size.
+SQLite commit batching groups committed DML transactions before applying decoded row changes. Pebble remains responsible for transaction metadata, row-lock indexes, schema state, and CDC manifests; DML row payload bytes live in rolling CDC segment-log files.
 
 ### Example: MetaStore Keys After Our UPDATE
 
@@ -607,7 +614,7 @@ After Node 1's `UPDATE users SET balance = 75 WHERE id = 1` completes:
 ```
 /intent/users/users:1 → WriteIntentRecord{TxnID: 0x0001A2B3C4D50001, ...}
 /intent_txn/0x0001A2B3C4D50001/users/users:1 → (index entry)
-/cdc/0x0001A2B3C4D50001/1 → IntentEntry{Operation: UPDATE, ...}
+/cdc_manifest/0x0001A2B3C4D50001 → CDCManifest{SegmentID, Offset, Length, RowCount}
 /txn/0x0001A2B3C4D50001 → TransactionRecord{Status: PENDING, ...}
 /txn_idx/pend/0x0001A2B3C4D50001 → (pending index)
 ```
@@ -631,8 +638,8 @@ After Node 1's `UPDATE users SET balance = 75 WHERE id = 1` completes:
 /intent_txn/0x0001A2B3C4D50001/users/users:1 → (removed)
 /txn_idx/pend/0x0001A2B3C4D50001 → (removed)
 
--- CDC entries kept for anti-entropy (GC'd after 2-24hrs):
-/cdc/0x0001A2B3C4D50001/1 → (kept for delta sync)
+-- CDC segment range kept for anti-entropy (GC'd after retention rules allow it):
+/cdc_manifest/0x0001A2B3C4D50001 → (kept for delta sync)
 ```
 
 **Replication State (per peer)**:
@@ -1296,11 +1303,12 @@ T0 + 2.5hr: Phase 2 GC runs again
     Cleanup:
       DELETE /txn/0x0001A2B3C4D50001
       DELETE /txn_idx/seq/42/0x0001A2B3C4D50001
-      DELETE /cdc/0x0001A2B3C4D50001/1
+      DELETE /cdc_manifest/0x0001A2B3C4D50001
+      Reclaim unreferenced cdcseg ranges/files
 
 T0 + 2.5hr: MetaStore state after GC
     - Transaction record: GONE
-    - CDC entries: GONE
+    - CDC manifest and reclaimed segment ranges: GONE
     - SQLite data: balance=75 for id=1 (permanent)
 ```
 
@@ -1384,10 +1392,10 @@ This section traces our `UPDATE users SET balance = 75 WHERE id = 1` through the
 │    ↓                                                                        │
 │  Preupdate hook fires (SQLITE_UPDATE)                                       │
 │    ↓                                                                        │
-│  CDC Entry created:                                                         │
-│    Key: /cdc/0x0001A2B3C4D50001/1                                           │
-│    Value: {Op: UPDATE, Table: "users", IntentKey: "users:1",                │
-│            OldValues: {balance: 100}, NewValues: {balance: 75}}             │
+│  EncodedCapturedRow created:                                                │
+│    {Op: UPDATE, Table: "users", IntentKey: "users:1",                      │
+│     OldValues: {balance: 100}, NewValues: {balance: 75}}                    │
+│    Stored in bounded hook memory or cdcseg spill                            │
 │                                                                              │
 │  T2: WRITE INTENT CREATION                                                   │
 │  ══════════════════════════                                                 │
@@ -1396,6 +1404,7 @@ This section traces our `UPDATE users SET balance = 75 WHERE id = 1` through the
 │  MetaStore write:                                                           │
 │    /intent/users/users:1 → {TxnID: 0x...0001, Status: PENDING}             │
 │    /intent_txn/0x...0001/users/users:1 → (index)                           │
+│    /cdc_manifest/0x...0001 → {SegmentID, Offset, Length, RowCount}         │
 │    /txn/0x...0001 → {Status: PENDING, SeqNum: 42}                          │
 │                                                                              │
 │  T3: 2PC PREPARE PHASE (parallel to Node 2, Node 3)                         │
@@ -1404,14 +1413,14 @@ This section traces our `UPDATE users SET balance = 75 WHERE id = 1` through the
 │  Node 1 ──gRPC──→ Node 2: ReplicateTransaction(PREPARE)                     │
 │           │                  ↓                                               │
 │           │                Cuckoo check "users:1" → MISS                    │
-│           │                Create intent, store CDC                          │
+│           │                Create intent, store encoded CDC row              │
 │           │                  ↓                                               │
 │           └──────────────← SUCCESS                                           │
 │                                                                              │
 │  Node 1 ──gRPC──→ Node 3: ReplicateTransaction(PREPARE)                     │
 │           │                  ↓                                               │
 │           │                Cuckoo check "users:1" → MISS                    │
-│           │                Create intent, store CDC                          │
+│           │                Create intent, store encoded CDC row              │
 │           │                  ↓                                               │
 │           └──────────────← SUCCESS                                           │
 │                                                                              │
@@ -1422,7 +1431,7 @@ This section traces our `UPDATE users SET balance = 75 WHERE id = 1` through the
 │                                                                              │
 │  Node 1 ──gRPC──→ Node 2: ReplicateTransaction(COMMIT)                      │
 │           │                  ↓                                               │
-│           │                Read /cdc/0x...0001/1                            │
+│           │                Read encoded row via /cdc_manifest/0x...0001     │
 │           │                Generate: UPDATE users SET ... WHERE id=1        │
 │           │                Execute on SQLite                                 │
 │           │                Update /txn/0x...0001 → COMMITTED                │
@@ -1468,7 +1477,7 @@ This section traces our `UPDATE users SET balance = 75 WHERE id = 1` through the
 │  SQLite: users.balance = 75 WHERE id = 1                                    │
 │  MetaStore:                                                                 │
 │    /txn/0x...0001 → {Status: COMMITTED, SeqNum: 42}                        │
-│    /cdc/0x...0001/1 → (kept for anti-entropy)                              │
+│    /cdc_manifest/0x...0001 → cdcseg range kept for anti-entropy            │
 │  Cuckoo filter: "users:1" removed                                           │
 │                                                                              │
 │  T10: GC (after 2+ hours)                                                    │
