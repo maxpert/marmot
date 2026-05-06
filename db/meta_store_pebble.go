@@ -74,6 +74,9 @@ type PebbleMetaStore struct {
 	// intent records on the prepare hot path.
 	dmlIntents *xsync.MapOf[uint64, *xsync.MapOf[string, *WriteIntentRecord]]
 
+	// Transactions with non-DML intent records under /intent_txn/.
+	persistedIntentTxns *xsync.MapOf[uint64, struct{}]
+
 	// In-memory CDC locks (row + DDL) for conflict detection
 	cdcLocks *XsyncCDCLockStore
 
@@ -214,12 +217,13 @@ func NewPebbleMetaStore(path string, opts PebbleMetaStoreOptions) (*PebbleMetaSt
 	}
 
 	store := &PebbleMetaStore{
-		db:         db,
-		path:       path,
-		sequences:  make(map[uint64]*AtomicSequence),
-		rowLocks:   NewRowLockStore(),
-		dmlIntents: xsync.NewMapOf[uint64, *xsync.MapOf[string, *WriteIntentRecord]](),
-		cdcLocks:   NewXsyncCDCLockStore(),
+		db:                  db,
+		path:                path,
+		sequences:           make(map[uint64]*AtomicSequence),
+		rowLocks:            NewRowLockStore(),
+		dmlIntents:          xsync.NewMapOf[uint64, *xsync.MapOf[string, *WriteIntentRecord]](),
+		persistedIntentTxns: xsync.NewMapOf[uint64, struct{}](),
+		cdcLocks:            NewXsyncCDCLockStore(),
 	}
 
 	// Initialize persistent counters
@@ -658,6 +662,7 @@ func (s *PebbleMetaStore) readCommitRecord(txnID uint64) (*TxnCommitRecord, erro
 // Used by MemoryMetaStore which manages status/heartbeat in memory.
 func (s *PebbleMetaStore) deleteTransactionKeys(txnID uint64, isCommitted bool) error {
 	s.dmlIntents.Delete(txnID)
+	s.persistedIntentTxns.Delete(txnID)
 	batch := s.db.NewBatch()
 	defer batch.Close()
 
@@ -939,6 +944,7 @@ func (s *PebbleMetaStore) StoreReplayedTransaction(txnID, nodeID uint64, commitT
 // AbortTransaction deletes a transaction record
 func (s *PebbleMetaStore) AbortTransaction(txnID uint64) error {
 	defer s.dmlIntents.Delete(txnID)
+	defer s.persistedIntentTxns.Delete(txnID)
 	// Read status first (1-byte read, no unmarshal)
 	status, err := s.readTxnStatus(txnID)
 	if err == pebble.ErrNotFound {
@@ -1162,6 +1168,7 @@ func (s *PebbleMetaStore) WriteIntent(txnID uint64, intentType IntentType, table
 	if err := s.db.Set(pebbleIntentByTxnKey(txnID, tableName, intentKey), recBytes.Bytes(), pebble.NoSync); err != nil {
 		return err
 	}
+	s.persistedIntentTxns.Store(txnID, struct{}{})
 
 	// Heartbeat refresh is handled by MemoryMetaStore in-memory
 
@@ -1251,6 +1258,9 @@ func (s *PebbleMetaStore) DeleteIntent(tableName, intentKey string, txnID uint64
 	s.rowLocks.ReleaseLock("", tableName, intentKey)
 	if txnMap, ok := s.dmlIntents.Load(txnID); ok {
 		txnMap.Delete(dmlIntentKey(tableName, intentKey))
+		if _, hasPersisted := s.persistedIntentTxns.Load(txnID); !hasPersisted {
+			return nil
+		}
 	}
 
 	// Delete /intent_txn/ index
@@ -1272,10 +1282,15 @@ func (s *PebbleMetaStore) DeleteIntentsByTxn(txnID uint64) (err error) {
 		return fmt.Errorf("pebble metastore closed")
 	}
 	s.dmlIntents.Delete(txnID)
+	_, hasPersisted := s.persistedIntentTxns.LoadAndDelete(txnID)
 	prefix := pebbleIntentByTxnPrefix(txnID)
 
 	// Release all row locks for this transaction
 	s.rowLocks.ReleaseByTxn(txnID)
+
+	if !hasPersisted {
+		return nil
+	}
 
 	// Collect /intent_txn/ index keys to delete
 	var indexKeys [][]byte
@@ -1332,6 +1347,10 @@ func (s *PebbleMetaStore) CleanupAfterCommit(txnID uint64) error {
 	// Single pass: mark GC, release locks, get keys (no Pebble iteration)
 	lockKeys := s.rowLocks.MarkGCAndRelease(txnID)
 	s.dmlIntents.Delete(txnID)
+	_, hasPersisted := s.persistedIntentTxns.LoadAndDelete(txnID)
+	if !hasPersisted {
+		return nil
+	}
 
 	// Single batch for intent index deletions only
 	batch := s.db.NewBatch()
