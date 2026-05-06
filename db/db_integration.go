@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -174,7 +175,7 @@ func NewReplicatedDatabase(dbPath string, nodeID uint64, clock *hlc.Clock, metaS
 		closeAll()
 		return nil, err
 	}
-	if err := repairAppliedTxnMetadata(writeDB, metaStore, ""); err != nil {
+	if err := repairAppliedTxnMetadata(writeDB, metaStore, inferDatabaseNameFromPath(dbPath)); err != nil {
 		closeAll()
 		return nil, err
 	}
@@ -682,7 +683,10 @@ func (mdb *ReplicatedDatabase) ExecuteLocalWithHooks(ctx context.Context, txnID 
 	}
 
 	// Get CDC entries cached by session processing - avoids a second cursor pass.
-	cdcEntries, _ := session.GetIntentEntries()
+	cdcEntries, err := session.GetIntentEntries()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get CDC intent entries: %w", err)
+	}
 
 	// Return completed execution with captured CDC data
 	return &CompletedLocalExecution{
@@ -691,6 +695,21 @@ func (mdb *ReplicatedDatabase) ExecuteLocalWithHooks(ctx context.Context, txnID 
 		db:           mdb,
 		rowCount:     int64(len(cdcEntries)),
 	}, nil
+}
+
+func inferDatabaseNameFromPath(dbPath string) string {
+	if beforeQuery, _, found := strings.Cut(dbPath, "?"); found {
+		dbPath = beforeQuery
+	}
+	dbPath = strings.TrimPrefix(dbPath, "file:")
+	if dbPath == "" || strings.Contains(dbPath, ":memory:") {
+		return ""
+	}
+	base := filepath.Base(dbPath)
+	if strings.EqualFold(filepath.Ext(base), ".db") {
+		return strings.TrimSuffix(base, filepath.Ext(base))
+	}
+	return base
 }
 
 // ExecuteTransaction executes a transaction with distributed transaction semantics

@@ -70,7 +70,8 @@ type PebbleMetaStore struct {
 	// In-memory CDC locks (row + DDL) for conflict detection
 	cdcLocks *XsyncCDCLockStore
 
-	cdcLog *cdcSegmentLog
+	cdcLog        *cdcSegmentLog
+	prepareSyncer *prepareSyncer
 
 	// Optional transaction getter for conflict resolution (set by MemoryMetaStore wrapper)
 	txnGetter TransactionGetter
@@ -207,6 +208,7 @@ func NewPebbleMetaStore(path string, opts PebbleMetaStoreOptions) (*PebbleMetaSt
 		return nil, fmt.Errorf("failed to open cdc segment log: %w", err)
 	}
 	store.cdcLog = cdcLog
+	store.prepareSyncer = newPrepareSyncer(store)
 
 	return store, nil
 }
@@ -242,6 +244,9 @@ func (s *PebbleMetaStore) Close() error {
 	s.sequences = nil
 	s.seqMu.Unlock()
 
+	if s.prepareSyncer != nil {
+		s.prepareSyncer.close()
+	}
 	if err := s.cdcLog.close(); err != nil {
 		log.Warn().Err(err).Str("path", filepath.Join(s.path, cdcSegmentDirName)).Msg("Failed to close CDC segment log")
 	}
@@ -604,11 +609,7 @@ func (s *PebbleMetaStore) BeginTransaction(txnID, nodeID uint64, startTS hlc.Tim
 // have been written. This keeps individual intent writes cheap while ensuring
 // a PREPARE ACK survives a local crash.
 func (s *PebbleMetaStore) DurablyPrepareTransaction(txnID uint64) error {
-	statusBuf := []byte{byte(TxnStatusPending)}
-	if err := s.db.Set(pebbleTxnStatusKey(txnID), statusBuf, pebble.NoSync); err != nil {
-		return err
-	}
-	return s.cdcLog.appendPrepareFence(txnID)
+	return s.prepareSyncer.prepare(txnID)
 }
 
 // CommitTransaction marks a transaction as COMMITTED
@@ -1640,7 +1641,11 @@ func (s *PebbleMetaStore) SealCapturedRows(txnID uint64) error {
 		return err
 	}
 	defer native.Dispose()
-	return s.db.Set(pebbleCDCManifestKey(txnID), native.Bytes(), pebble.NoSync)
+	if err := s.db.Set(pebbleCDCManifestKey(txnID), native.Bytes(), pebble.NoSync); err != nil {
+		return err
+	}
+	s.cdcLog.discardTxn(txnID)
+	return nil
 }
 
 // IterateCapturedRows returns a cursor over raw captured rows for a transaction.
@@ -1672,7 +1677,50 @@ func (s *PebbleMetaStore) DeleteCapturedRow(txnID, seq uint64) error {
 // Called after ProcessCapturedRows completes.
 func (s *PebbleMetaStore) DeleteCapturedRows(txnID uint64) error {
 	s.cdcLog.discardTxn(txnID)
-	return s.db.Delete(pebbleCDCManifestKey(txnID), pebble.NoSync)
+	if err := s.db.Delete(pebbleCDCManifestKey(txnID), pebble.NoSync); err != nil {
+		return err
+	}
+	return s.gcCDCSegments()
+}
+
+func (s *PebbleMetaStore) gcCDCSegments() error {
+	retained, err := s.retainedCDCSegments()
+	if err != nil {
+		return err
+	}
+	deleted, err := s.cdcLog.gcSegments(retained)
+	if err != nil {
+		return err
+	}
+	if deleted > 0 {
+		log.Debug().Int("deleted_segments", deleted).Msg("CDC segment GC: removed unreferenced segments")
+	}
+	return nil
+}
+
+func (s *PebbleMetaStore) retainedCDCSegments() (map[uint64]struct{}, error) {
+	retained := make(map[uint64]struct{})
+	prefix := []byte(pebblePrefixCDCManifest)
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: prefix,
+		UpperBound: prefixUpperBound(prefix),
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer iter.Close()
+
+	for iter.SeekGE(prefix); iter.Valid(); iter.Next() {
+		var manifest cdcSegmentTxnManifest
+		if err := encoding.Unmarshal(iter.Value(), &manifest); err != nil {
+			return nil, err
+		}
+		addCDCManifestSegments(retained, &manifest)
+	}
+	if err := iter.Error(); err != nil {
+		return nil, err
+	}
+	return retained, nil
 }
 
 // findOrphanedCDCRawTxnIDs finds transaction IDs that have CDC manifests but no /txn_commit/ record.

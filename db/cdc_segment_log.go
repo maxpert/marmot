@@ -25,8 +25,8 @@ const (
 	cdcSegmentRecordMagic    = uint32(0x4d434443) // "MCDC"
 	cdcSegmentRecordVersion  = uint16(1)
 	cdcSegmentRecordRow      = uint16(1)
-	cdcSegmentRecordPrepare  = uint16(2)
 	cdcSegmentHeaderSize     = 32
+	cdcSegmentMaxPayloadSize = cdcSegmentFileSize - cdcSegmentHeaderSize
 )
 
 var errCDCSegmentTxnNotFound = errors.New("cdc segment transaction not found")
@@ -64,7 +64,8 @@ type cdcSegmentLog struct {
 	offset    uint64
 	pending   map[uint64]*cdcSegmentTxnManifest
 
-	syncer *cdcSegmentSyncer
+	syncer   *cdcSegmentSyncer
+	syncFile func(*os.File) error
 }
 
 func openCDCSegmentLog(basePath string) (*cdcSegmentLog, error) {
@@ -86,6 +87,7 @@ func openCDCSegmentLog(basePath string) (*cdcSegmentLog, error) {
 		segmentID: segmentID,
 		offset:    offset,
 		pending:   make(map[uint64]*cdcSegmentTxnManifest),
+		syncFile:  func(f *os.File) error { return f.Sync() },
 	}
 	log.syncer = newCDCSegmentSyncer(log)
 	return log, nil
@@ -101,8 +103,7 @@ func recoverCDCSegmentTail(dir string) (uint64, uint64, error) {
 		if entry.IsDir() {
 			continue
 		}
-		var id uint64
-		if _, err := fmt.Sscanf(entry.Name(), "seg-%018d.log", &id); err == nil && id > 0 {
+		if id, ok := parseCDCSegmentID(entry.Name()); ok {
 			ids = append(ids, id)
 		}
 	}
@@ -155,7 +156,7 @@ func validateCDCSegment(path string) (uint64, error) {
 		if magic != cdcSegmentRecordMagic || version != cdcSegmentRecordVersion {
 			return offset, nil
 		}
-		if uint64(payloadLen) > cdcSegmentFileSize {
+		if uint64(payloadLen) > cdcSegmentMaxPayloadSize {
 			return offset, nil
 		}
 		payload := make([]byte, payloadLen)
@@ -173,23 +174,20 @@ func cdcSegmentPath(dir string, id uint64) string {
 	return filepath.Join(dir, fmt.Sprintf("seg-%018d.log", id))
 }
 
+func parseCDCSegmentID(name string) (uint64, bool) {
+	var id uint64
+	if _, err := fmt.Sscanf(name, "seg-%018d.log", &id); err != nil || id == 0 {
+		return 0, false
+	}
+	if name != fmt.Sprintf("seg-%018d.log", id) {
+		return 0, false
+	}
+	return id, true
+}
+
 func (l *cdcSegmentLog) appendRow(txnID, seq uint64, payload []byte) error {
 	_, err := l.appendRecord(cdcSegmentRecordRow, txnID, seq, payload)
 	return err
-}
-
-func (l *cdcSegmentLog) appendPrepareFence(txnID uint64) error {
-	chunk, err := l.appendRecord(cdcSegmentRecordPrepare, txnID, 0, nil)
-	if err != nil {
-		return err
-	}
-	manifest := &cdcSegmentTxnManifest{
-		TxnID:    txnID,
-		RowCount: 1,
-		Chunks:   []cdcSegmentChunk{chunk},
-	}
-	l.syncer.queue(manifest)
-	return nil
 }
 
 func (l *cdcSegmentLog) appendRecord(recordType uint16, txnID, seq uint64, payload []byte) (cdcSegmentChunk, error) {
@@ -197,6 +195,9 @@ func (l *cdcSegmentLog) appendRecord(recordType uint16, txnID, seq uint64, paylo
 		return cdcSegmentChunk{}, fmt.Errorf("cdc row payload too large: %d bytes", len(payload))
 	}
 	recordLen := cdcSegmentHeaderSize + uint64(len(payload))
+	if recordLen > cdcSegmentFileSize {
+		return cdcSegmentChunk{}, fmt.Errorf("cdc segment record too large: payload=%d max=%d", len(payload), cdcSegmentMaxPayloadSize)
+	}
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -274,15 +275,12 @@ func (l *cdcSegmentLog) appendRecord(recordType uint16, txnID, seq uint64, paylo
 
 func (l *cdcSegmentLog) sealTxn(txnID uint64) (*cdcSegmentTxnManifest, error) {
 	l.mu.Lock()
-	manifest := l.pending[txnID]
+	manifest := cloneCDCManifest(l.pending[txnID])
 	l.mu.Unlock()
 	if manifest == nil {
 		return nil, errCDCSegmentTxnNotFound
 	}
 	l.syncer.queue(manifest)
-	l.mu.Lock()
-	delete(l.pending, txnID)
-	l.mu.Unlock()
 	return manifest, nil
 }
 
@@ -300,6 +298,68 @@ func (l *cdcSegmentLog) discardTxn(txnID uint64) {
 	l.mu.Lock()
 	delete(l.pending, txnID)
 	l.mu.Unlock()
+}
+
+func (l *cdcSegmentLog) addRetainedSegments(retained map[uint64]struct{}) {
+	l.mu.Lock()
+	currentID := l.segmentID
+	if currentID > 0 {
+		retained[currentID] = struct{}{}
+	}
+	for _, manifest := range l.pending {
+		addCDCManifestSegments(retained, manifest)
+	}
+	l.mu.Unlock()
+
+	l.syncer.addRetainedSegments(retained)
+}
+
+func (l *cdcSegmentLog) gcSegments(retained map[uint64]struct{}) (int, error) {
+	if l == nil {
+		return 0, nil
+	}
+	if retained == nil {
+		retained = make(map[uint64]struct{})
+	}
+	l.addRetainedSegments(retained)
+
+	entries, err := os.ReadDir(l.dir)
+	if err != nil {
+		return 0, err
+	}
+	deleted := 0
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		segmentID, ok := parseCDCSegmentID(entry.Name())
+		if !ok {
+			continue
+		}
+		if _, ok := retained[segmentID]; ok {
+			continue
+		}
+		err := os.Remove(cdcSegmentPath(l.dir, segmentID))
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return deleted, err
+		}
+		deleted++
+	}
+	return deleted, nil
+}
+
+func addCDCManifestSegments(retained map[uint64]struct{}, manifest *cdcSegmentTxnManifest) {
+	if manifest == nil {
+		return
+	}
+	for _, chunk := range manifest.Chunks {
+		if chunk.SegmentID > 0 {
+			retained[chunk.SegmentID] = struct{}{}
+		}
+	}
 }
 
 func (l *cdcSegmentLog) pendingTxnIDs() []uint64 {
@@ -368,6 +428,9 @@ type cdcSegmentSyncer struct {
 	log *cdcSegmentLog
 	ch  chan *cdcSegmentSyncRequest
 	wg  sync.WaitGroup
+
+	mu          sync.Mutex
+	segmentRefs map[uint64]uint64
 }
 
 type cdcSegmentSyncRequest struct {
@@ -376,8 +439,9 @@ type cdcSegmentSyncRequest struct {
 
 func newCDCSegmentSyncer(log *cdcSegmentLog) *cdcSegmentSyncer {
 	s := &cdcSegmentSyncer{
-		log: log,
-		ch:  make(chan *cdcSegmentSyncRequest, 8192),
+		log:         log,
+		ch:          make(chan *cdcSegmentSyncRequest, 8192),
+		segmentRefs: make(map[uint64]uint64),
 	}
 	s.wg.Add(1)
 	go s.loop()
@@ -385,7 +449,9 @@ func newCDCSegmentSyncer(log *cdcSegmentLog) *cdcSegmentSyncer {
 }
 
 func (s *cdcSegmentSyncer) queue(manifest *cdcSegmentTxnManifest) {
-	s.ch <- &cdcSegmentSyncRequest{manifest: cloneCDCManifestForSync(manifest)}
+	req := &cdcSegmentSyncRequest{manifest: cloneCDCManifestForSync(manifest)}
+	s.retainSegments(req.manifest)
+	s.ch <- req
 }
 
 func (s *cdcSegmentSyncer) close() {
@@ -408,6 +474,7 @@ func (s *cdcSegmentSyncer) loop() {
 		if err != nil {
 			log.Warn().Err(err).Msg("CDC segment async sync failed")
 		}
+		s.releaseSegments(batch)
 		batch = nil
 		bytes = 0
 		if !timer.Stop() {
@@ -448,6 +515,54 @@ func (s *cdcSegmentSyncer) loop() {
 	}
 }
 
+func (s *cdcSegmentSyncer) retainSegments(manifest *cdcSegmentTxnManifest) {
+	if s == nil || manifest == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, chunk := range manifest.Chunks {
+		if chunk.SegmentID > 0 {
+			s.segmentRefs[chunk.SegmentID]++
+		}
+	}
+}
+
+func (s *cdcSegmentSyncer) releaseSegments(batch []*cdcSegmentSyncRequest) {
+	if s == nil || len(batch) == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, req := range batch {
+		if req == nil || req.manifest == nil {
+			continue
+		}
+		for _, chunk := range req.manifest.Chunks {
+			if chunk.SegmentID == 0 {
+				continue
+			}
+			refs := s.segmentRefs[chunk.SegmentID]
+			if refs <= 1 {
+				delete(s.segmentRefs, chunk.SegmentID)
+				continue
+			}
+			s.segmentRefs[chunk.SegmentID] = refs - 1
+		}
+	}
+}
+
+func (s *cdcSegmentSyncer) addRetainedSegments(retained map[uint64]struct{}) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for segmentID := range s.segmentRefs {
+		retained[segmentID] = struct{}{}
+	}
+}
+
 func (s *cdcSegmentSyncer) syncSegments(batch []*cdcSegmentSyncRequest) error {
 	segments := make(map[uint64]struct{})
 	for _, req := range batch {
@@ -460,6 +575,9 @@ func (s *cdcSegmentSyncer) syncSegments(batch []*cdcSegmentSyncRequest) error {
 	}
 	for segmentID := range segments {
 		if err := s.log.syncSegment(segmentID); err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
 			return err
 		}
 	}
@@ -467,21 +585,15 @@ func (s *cdcSegmentSyncer) syncSegments(batch []*cdcSegmentSyncRequest) error {
 }
 
 func (l *cdcSegmentLog) syncSegment(segmentID uint64) error {
-	l.mu.Lock()
-	currentID := l.segmentID
-	currentFile := l.file
-	l.mu.Unlock()
-	if segmentID == currentID && currentFile != nil {
-		if err := currentFile.Sync(); err == nil {
-			return nil
-		}
+	syncFile := l.syncFile
+	if syncFile == nil {
+		syncFile = func(f *os.File) error { return f.Sync() }
 	}
-
 	f, err := os.OpenFile(cdcSegmentPath(l.dir, segmentID), os.O_RDWR, 0o644)
 	if err != nil {
 		return err
 	}
-	err = f.Sync()
+	err = syncFile(f)
 	if closeErr := f.Close(); err == nil {
 		err = closeErr
 	}
@@ -560,7 +672,7 @@ func (c *cdcSegmentCursor) Next() bool {
 			c.err = fmt.Errorf("invalid cdc segment record at segment=%d offset=%d", chunk.SegmentID, c.pos)
 			return false
 		}
-		if uint64(payloadLen) > cdcSegmentFileSize {
+		if uint64(payloadLen) > cdcSegmentMaxPayloadSize {
 			c.err = fmt.Errorf("cdc segment payload too large at segment=%d offset=%d", chunk.SegmentID, c.pos)
 			return false
 		}
