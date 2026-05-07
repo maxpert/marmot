@@ -566,6 +566,8 @@ data_dir/
 │   ├── MANIFEST-*
 │   ├── CURRENT
 │   └── *.sst                 # LSM-tree files
+├── cdcseg/                   # Rolling CDC segment-log files
+│   └── seg-000000000000000001.log
 └── __marmot_system.db        # System database
     └── __marmot_system_meta.pebble/
 ```
@@ -583,6 +585,50 @@ data_dir/
 | `/repl/{peerID}/{dbName}` | Replication state per peer |
 | `/schema/{dbName}` | Schema version counter |
 | `/seq/{nodeID}` | Sequence generator (pre-allocated batches) |
+
+### CDC Segment Store
+
+The CDC segment store is the local append-only payload store for DML row changes. Pebble keeps the transaction metadata, row-lock indexes, and `/cdc_manifest/{txnID}` pointer; the actual encoded row payloads live in `cdcseg/seg-*.log`.
+
+Each row record is:
+
+```
+[32-byte header][msgpack EncodedCapturedRow payload]
+```
+
+The header stores a magic value, format version, record type, transaction id, row sequence, payload length, and payload CRC32. Segment files roll at 64 MiB, and a single record larger than one segment is rejected before append so recovery and validation use the same size rule.
+
+### Atomicity Model
+
+CDC segment publication is manifest-based:
+
+1. Encoded row records are appended to the current segment file.
+2. The in-memory transaction manifest tracks row count, first/last row sequence, CRC, and one or more `{segmentID, offset, length}` chunks.
+3. `SealCapturedRows` publishes `/cdc_manifest/{txnID}` in Pebble after the segment ranges are known.
+4. Readers never scan arbitrary segment bytes for committed DML; they read the manifest and then perform bounded `ReadAt` calls over the referenced segment ranges.
+
+This gives atomic visibility: a transaction's CDC payload is visible only when its manifest is visible. A crash before manifest publication leaves unreferenced segment bytes, which are ignored and later reclaimed. A crash after manifest publication leaves a manifest that points to specific validated byte ranges.
+
+### Durability And Prepare Sync
+
+By default Marmot keeps the hot path aligned with Pebble `NoSync`: CDC segment fsync is grouped asynchronously by bytes, transaction count, or a short timer. This avoids forcing a disk flush per row or per transaction.
+
+For deployments that require a PREPARE acknowledgement to wait for local CDC segment fsync, enable strict prepare sync:
+
+```toml
+[meta_store]
+strict_prepare_sync = true
+```
+
+or set `MARMOT_CDC_PREPARE_SYNC=strict`. Strict mode waits for the segment sync before acknowledging PREPARE, which strengthens local crash durability at the cost of write latency.
+
+### Recovery And Cleanup
+
+On startup, Marmot validates each segment record in order. If it finds a torn header, short payload, invalid magic/version, oversized payload, or CRC mismatch, it truncates the active tail to the last valid record boundary.
+
+Prepared manifests embedded in segment records can reconstruct prepared CDC state if Pebble metadata was lost after the segment record became durable. For committed transactions, `/cdc_manifest/{txnID}` is the retention root used by streaming replication, catch-up, and delta sync.
+
+GC deletes segment files only when no current manifest, pending prepare, or active writer can reference them. Current and pending segments are retained; old unreferenced segments are pruned with the transaction metadata retention rules.
 
 ### Transaction Record Format
 
@@ -1341,7 +1387,7 @@ T0 + 25hr: Force GC kicks in (> gc_max_retention=24hr)
 |--------------|-----------|
 | **Cuckoo filter** | O(1) conflict detection, FP rate ~2.3×10⁻¹⁰ |
 | **Sharded mutexes** | 256 shards reduce lock contention |
-| **Group commit** | Batch Pebble writes (100 ops or 2ms) |
+| **Grouped CDC sync** | Batch CDC segment fsync by bytes, transaction count, or timer |
 | **Sequence pre-allocation** | Batch 1000 sequence numbers |
 | **Object pooling** | Reuse allocations in hot paths |
 | **Early quorum exit** | Don't wait for slow nodes |

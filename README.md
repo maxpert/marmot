@@ -253,6 +253,7 @@ Marmot v2 uses **Change Data Capture (CDC)** for replication instead of SQL stat
 - **Performance**: Binary format is more efficient than SQL text
 - **Reliability**: No issues with SQL syntax variations between MySQL and SQLite
 - **Lower Write Amplification**: Row payloads are not duplicated into Pebble intent keys; Pebble tracks transaction metadata and row locks while the CDC segment log stores DML bytes
+- **Atomic CDC Publication**: DML bytes become visible through `/cdc_manifest/{txnID}` only after their segment ranges are known; recovery validates and truncates segment tails at record boundaries
 
 ### Row Key Extraction
 
