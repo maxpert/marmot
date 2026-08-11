@@ -240,6 +240,13 @@ func (c *CatchUpClient) applySnapshot(ctx context.Context, client MarmotServiceC
 		return fmt.Errorf("snapshot restore failed: %w", err)
 	}
 
+	// Restore the schema versions the snapshot was taken at. Skipping this leaves
+	// the node reporting version 0, after which it refuses every transaction that
+	// requires a newer schema and can never rejoin replication.
+	if err := persistSnapshotSchemaVersions(c.dataDir, info.DatabaseMetadata); err != nil {
+		return fmt.Errorf("failed to restore schema versions from snapshot: %w", err)
+	}
+
 	log.Info().
 		Uint64("snapshot_txn_id", info.SnapshotTxnId).
 		Msg("Snapshot applied successfully via unified restorer")

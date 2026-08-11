@@ -860,6 +860,11 @@ func (s *Server) GetSnapshotInfo(ctx context.Context, req *SnapshotInfoRequest) 
 		return nil, fmt.Errorf("failed to get snapshot info: %w", err)
 	}
 
+	// Schema versions travel with the snapshot: they live in the MetaStore, which
+	// is not part of the transferred files, and a receiver that cannot recover
+	// them refuses every transaction requiring a newer schema.
+	schemaVersions := snapshotSchemaVersions(dbManager)
+
 	// Calculate total size and chunks (estimates)
 	var totalSize int64
 	var dbInfos []*DatabaseFileInfo
@@ -886,6 +891,7 @@ func (s *Server) GetSnapshotInfo(ctx context.Context, req *SnapshotInfoRequest) 
 			SnapshotTxnId:  txnID,
 			SizeBytes:      snap.Size,
 			Sha256Checksum: snap.SHA256,
+			SchemaVersion:  schemaVersions[snap.Name],
 		})
 	}
 

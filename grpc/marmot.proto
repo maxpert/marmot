@@ -323,6 +323,10 @@ message DatabaseSnapshotMetadata {
   uint64 snapshot_txn_id = 2;      // Per-database CDC offset
   int64 size_bytes = 3;
   string sha256_checksum = 4;
+  // Schema version the source node had for this database. Snapshots carry only
+  // SQLite files, so without this the receiver cannot recover the version and
+  // would refuse every transaction that requires a newer schema.
+  uint64 schema_version = 5;
 }
 
 message SnapshotRequest {

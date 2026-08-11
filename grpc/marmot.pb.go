@@ -2242,8 +2242,12 @@ type DatabaseSnapshotMetadata struct {
 	SnapshotTxnId  uint64                 `protobuf:"varint,2,opt,name=snapshot_txn_id,json=snapshotTxnId,proto3" json:"snapshot_txn_id,omitempty"` // Per-database CDC offset
 	SizeBytes      int64                  `protobuf:"varint,3,opt,name=size_bytes,json=sizeBytes,proto3" json:"size_bytes,omitempty"`
 	Sha256Checksum string                 `protobuf:"bytes,4,opt,name=sha256_checksum,json=sha256Checksum,proto3" json:"sha256_checksum,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// Schema version the source node had for this database. Snapshots carry only
+	// SQLite files, so without this the receiver cannot recover the version and
+	// would refuse every transaction that requires a newer schema.
+	SchemaVersion uint64 `protobuf:"varint,5,opt,name=schema_version,json=schemaVersion,proto3" json:"schema_version,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *DatabaseSnapshotMetadata) Reset() {
@@ -2302,6 +2306,13 @@ func (x *DatabaseSnapshotMetadata) GetSha256Checksum() string {
 		return x.Sha256Checksum
 	}
 	return ""
+}
+
+func (x *DatabaseSnapshotMetadata) GetSchemaVersion() uint64 {
+	if x != nil {
+		return x.SchemaVersion
+	}
+	return 0
 }
 
 type SnapshotRequest struct {
@@ -3492,13 +3503,14 @@ const file_grpc_marmot_proto_rawDesc = "" +
 	"\bfilename\x18\x02 \x01(\tR\bfilename\x12\x1d\n" +
 	"\n" +
 	"size_bytes\x18\x03 \x01(\x03R\tsizeBytes\x12'\n" +
-	"\x0fsha256_checksum\x18\x04 \x01(\tR\x0esha256Checksum\"\xaf\x01\n" +
+	"\x0fsha256_checksum\x18\x04 \x01(\tR\x0esha256Checksum\"\xd6\x01\n" +
 	"\x18DatabaseSnapshotMetadata\x12#\n" +
 	"\rdatabase_name\x18\x01 \x01(\tR\fdatabaseName\x12&\n" +
 	"\x0fsnapshot_txn_id\x18\x02 \x01(\x04R\rsnapshotTxnId\x12\x1d\n" +
 	"\n" +
 	"size_bytes\x18\x03 \x01(\x03R\tsizeBytes\x12'\n" +
-	"\x0fsha256_checksum\x18\x04 \x01(\tR\x0esha256Checksum\"[\n" +
+	"\x0fsha256_checksum\x18\x04 \x01(\tR\x0esha256Checksum\x12%\n" +
+	"\x0eschema_version\x18\x05 \x01(\x04R\rschemaVersion\"[\n" +
 	"\x0fSnapshotRequest\x12,\n" +
 	"\x12requesting_node_id\x18\x01 \x01(\x04R\x10requestingNodeId\x12\x1a\n" +
 	"\bdatabase\x18\x02 \x01(\tR\bdatabase\"\xc8\x01\n" +
