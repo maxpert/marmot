@@ -213,7 +213,7 @@ func TestPartialCommitError(t *testing.T) {
 			remoteAcks:         0,
 			remoteQuorumNeeded: 0,
 			localError:         errors.New("database locked"),
-			expected:           "partial commit: local commit failed after remote quorum (bug in PREPARE): database locked",
+			expected:           "partial commit: local commit failed after remote quorum: database locked",
 		},
 		{
 			name:               "local commit failed with nil error",
@@ -221,7 +221,7 @@ func TestPartialCommitError(t *testing.T) {
 			remoteAcks:         0,
 			remoteQuorumNeeded: 0,
 			localError:         nil,
-			expected:           "partial commit: local commit failed after remote quorum (bug in PREPARE): <nil>",
+			expected:           "partial commit: local commit failed after remote quorum: <nil>",
 		},
 		{
 			name:               "local commit failed with wrapped error",
@@ -229,7 +229,7 @@ func TestPartialCommitError(t *testing.T) {
 			remoteAcks:         0,
 			remoteQuorumNeeded: 0,
 			localError:         errors.New("failed to acquire lock: timeout"),
-			expected:           "partial commit: local commit failed after remote quorum (bug in PREPARE): failed to acquire lock: timeout",
+			expected:           "partial commit: local commit failed after remote quorum: failed to acquire lock: timeout",
 		},
 		{
 			name:               "remote quorum failed with high numbers",

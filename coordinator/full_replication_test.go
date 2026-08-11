@@ -2,6 +2,7 @@ package coordinator
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -604,9 +605,14 @@ func TestLocalPrepareMustSucceed(t *testing.T) {
 		t.Fatal("Expected write to fail when coordinator prepare fails, but it succeeded")
 	}
 
-	// Verify error message indicates coordinator must participate
-	if !contains(err.Error(), "coordinator must participate") {
-		t.Errorf("Expected 'coordinator must participate' error message, got: %v", err)
+	// Coordinator rejection must surface the participant's own reason so the
+	// client sees the real failure instead of 2PC internals
+	var notParticipated *CoordinatorNotParticipatedError
+	if !errors.As(err, &notParticipated) {
+		t.Errorf("Expected CoordinatorNotParticipatedError, got: %v", err)
+	}
+	if !contains(err.Error(), "local prepare failed") {
+		t.Errorf("Expected local prepare failure reason in error message, got: %v", err)
 	}
 
 	// Wait for abort goroutines to complete (abortTransaction spawns goroutines)

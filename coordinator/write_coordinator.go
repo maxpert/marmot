@@ -2,6 +2,7 @@ package coordinator
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -102,6 +103,10 @@ type ReplicationResponse struct {
 	// ConflictDetected indicates write-write conflict
 	ConflictDetected bool
 	ConflictDetails  string
+	// Rejected indicates the participant refused the statement itself (for example
+	// DDL SQLite cannot apply). Timeouts and storage failures leave it false so they
+	// stay retryable missing ACKs rather than a final verdict.
+	Rejected bool
 }
 
 // NewWriteCoordinator creates a new write coordinator for full database replication
@@ -325,15 +330,31 @@ func (wc *WriteCoordinator) runPreparePhase(ctx context.Context, txn *Transactio
 
 	// Execute prepare phase on all nodes (including self) - single attempt, no retry
 	// All nodes now participate uniformly - no skipLocalReplication
-	prepResponses, conflictErr := wc.executePreparePhase(ctx, txn, prepReq, otherNodes, false)
+	prepResponses, prepErr := wc.executePreparePhase(ctx, txn, prepReq, otherNodes, false)
 	telemetry.TwoPhaseQuorumAcks.With("prepare").Observe(float64(len(prepResponses)))
 
-	if conflictErr != nil {
+	// A local rejection (invalid DDL, missing table, ...) is final - surface the
+	// underlying reason so the client gets the matching protocol error instead of
+	// a retry signal.
+	var localPrepareErr *LocalPrepareError
+	if errors.As(prepErr, &localPrepareErr) {
+		// Logged above Debug because the error returned to the client carries only
+		// the statement-level reason: this is where txn_id and reason are tied
+		// together for operators. Rejections are rare, so this is not a hot path.
+		log.Warn().
+			Uint64("txn_id", txn.ID).
+			Str("reason", localPrepareErr.Reason).
+			Msg("Local PREPARE rejected transaction - aborting")
+
+		return nil, &CoordinatorNotParticipatedError{TxnID: txn.ID, Err: localPrepareErr}
+	}
+
+	if prepErr != nil {
 		// Write-write conflict detected - abort and signal client to retry
 		telemetry.WriteConflictsTotal.With("intent", "slow").Inc()
 		log.Debug().
 			Uint64("txn_id", txn.ID).
-			Err(conflictErr).
+			Err(prepErr).
 			Msg("Conflict detected - aborting transaction, client should retry")
 		// Return MySQL 1213 (ER_LOCK_DEADLOCK) - standard signal for client retry
 		return nil, protocol.ErrDeadlock()
@@ -493,11 +514,17 @@ func (wc *WriteCoordinator) commitLocalAfterRemoteQuorum(ctx context.Context, re
 			Err(localErr).
 			Str("resp_error", errMsg).
 			Uint64("txn_id", txnID).
-			Msg("CRITICAL: Local commit failed after remote quorum achieved - this indicates a bug in PREPARE")
+			Msg("CRITICAL: Local commit failed after remote quorum achieved - node has diverged from the committed quorum")
 		// CRITICAL: Don't abort remotes - they already committed. Return error but data is partially committed.
+		// Prefer the participant's reported error: a failed COMMIT response carries
+		// the reason in localResp.Error while localErr stays nil.
+		reportedErr := localErr
+		if reportedErr == nil && errMsg != "" {
+			reportedErr = errors.New(errMsg)
+		}
 		return nil, &PartialCommitError{
 			IsLocal:    true,
-			LocalError: localErr,
+			LocalError: reportedErr,
 		}
 	}
 
@@ -647,25 +674,32 @@ func (wc *WriteCoordinator) executePreparePhase(ctx context.Context, txn *Transa
 	// Channel for collecting responses
 	prepChan := make(chan response, totalNodes)
 
+	// Every PREPARE call is bounded by the same timeout the collector gives up
+	// after. Without it an abandoned call can still durably prepare a transaction
+	// the coordinator has already stopped tracking. PREPARE does real work -
+	// persisting intents and validating DDL - so this window is not theoretical.
+	dispatch := func(nodeID uint64, replicator Replicator) {
+		prepCtx, cancel := context.WithTimeout(ctx, wc.timeout)
+		defer cancel()
+
+		resp, err := replicator.ReplicateTransaction(prepCtx, nodeID, prepReq)
+		prepChan <- response{nodeID: nodeID, resp: resp, err: err}
+	}
+
 	// Send to other nodes
 	for _, nodeID := range otherNodes {
-		go func(nid uint64) {
-			resp, err := wc.replicator.ReplicateTransaction(ctx, nid, prepReq)
-			prepChan <- response{nodeID: nid, resp: resp, err: err}
-		}(nodeID)
+		go dispatch(nodeID, wc.replicator)
 	}
 
 	// Send to self if not skipped
 	if !skipLocalReplication {
-		go func() {
-			resp, err := wc.localReplicator.ReplicateTransaction(ctx, wc.nodeID, prepReq)
-			prepChan <- response{nodeID: wc.nodeID, resp: resp, err: err}
-		}()
+		go dispatch(wc.nodeID, wc.localReplicator)
 	}
 
 	// Collect responses
 	prepResponses := make(map[uint64]*ReplicationResponse)
 	var conflictErr error
+	var localErr error
 
 	for i := 0; i < totalNodes; i++ {
 		select {
@@ -699,12 +733,30 @@ func (wc *WriteCoordinator) executePreparePhase(ctx context.Context, txn *Transa
 					Uint64("node_id", r.nodeID).
 					Str("error", r.resp.Error).
 					Msg("Prepare returned failure")
+				// Only an explicit rejection is a final answer. Anything else - a
+				// timeout, a storage error - must fall through to the quorum check so
+				// it stays retryable, exactly as before DDL was validated here.
+				if r.nodeID == wc.nodeID && r.resp.Rejected {
+					reason := r.resp.Error
+					if reason == "" {
+						reason = "local prepare rejected the transaction"
+					}
+					localErr = &LocalPrepareError{Reason: reason}
+				}
 			}
 		case <-time.After(wc.timeout):
 			log.Warn().
 				Uint64("txn_id", txn.ID).
 				Msg("Prepare phase timeout waiting for responses")
 		}
+	}
+
+	// An explicit local rejection is deterministic, so it takes precedence over a
+	// peer conflict: retrying the transaction cannot make it succeed. Transport
+	// failures and missing responses are not rejections - they fall through to the
+	// quorum check.
+	if localErr != nil {
+		return prepResponses, localErr
 	}
 
 	// If any conflict was detected, return the error

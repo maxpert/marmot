@@ -846,3 +846,159 @@ func TestReplicationEngine_ClockUpdate(t *testing.T) {
 	assert.Greater(t, updatedTime.WallTime, initialTime.WallTime, "Clock should be updated")
 	assert.GreaterOrEqual(t, updatedTime.WallTime, futureTS.WallTime, "Clock should advance to at least the request timestamp")
 }
+
+// TestReplicationEngine_PrepareRejectsInvalidDDL verifies that DDL SQLite cannot
+// apply is rejected during PREPARE. PREPARE is the 2PC promise point: accepting
+// such a statement makes COMMIT fail after peers have already committed.
+func TestReplicationEngine_PrepareRejectsInvalidDDL(t *testing.T) {
+	engine, dm, cleanup := setupTestReplicationEngine(t)
+	defer cleanup()
+
+	require.NoError(t, dm.CreateDatabase("testdb"))
+	replicatedDB, err := dm.GetDatabase("testdb")
+	require.NoError(t, err)
+
+	ctx := context.Background()
+
+	createReq := &PrepareRequest{
+		TxnID:    2001,
+		NodeID:   1,
+		StartTS:  hlc.Timestamp{WallTime: 1000, Logical: 1},
+		Database: "testdb",
+		Statements: []protocol.Statement{{
+			Type:      protocol.StatementDDL,
+			SQL:       "CREATE TABLE groups (group_id INTEGER PRIMARY KEY, creation_date datetime)",
+			TableName: "groups",
+		}},
+	}
+	require.True(t, engine.Prepare(ctx, createReq).Success)
+	commitResult := engine.Commit(ctx, &CommitRequest{
+		TxnID:      2001,
+		Database:   "testdb",
+		Statements: createReq.Statements,
+	})
+	require.True(t, commitResult.Success, "setup commit failed: %s", commitResult.Error)
+
+	// Adding an existing column can never commit - PREPARE must reject it.
+	dupReq := &PrepareRequest{
+		TxnID:    2002,
+		NodeID:   1,
+		StartTS:  hlc.Timestamp{WallTime: 2000, Logical: 1},
+		Database: "testdb",
+		Statements: []protocol.Statement{{
+			Type:      protocol.StatementDDL,
+			SQL:       "ALTER TABLE groups ADD COLUMN creation_date datetime NOT NULL DEFAULT '2026-08-10 19:38:56'",
+			TableName: "groups",
+		}},
+	}
+
+	result := engine.Prepare(ctx, dupReq)
+
+	require.False(t, result.Success, "PREPARE must reject DDL that cannot be applied")
+	require.Contains(t, result.Error, "duplicate column name: creation_date")
+
+	// A rejected PREPARE must not leave transaction or intent state behind.
+	metaStore := replicatedDB.GetMetaStore()
+	intents, err := metaStore.GetIntentsByTxn(2002)
+	require.NoError(t, err)
+	require.Empty(t, intents, "rejected DDL must not create write intents")
+	require.Nil(t, replicatedDB.GetTransactionManager().GetTransaction(2002),
+		"rejected DDL must not leave a pending transaction")
+
+	// The database must be untouched and still usable for valid DDL.
+	validReq := &PrepareRequest{
+		TxnID:    2003,
+		NodeID:   1,
+		StartTS:  hlc.Timestamp{WallTime: 3000, Logical: 1},
+		Database: "testdb",
+		Statements: []protocol.Statement{{
+			Type:      protocol.StatementDDL,
+			SQL:       "ALTER TABLE groups ADD COLUMN uuid TEXT",
+			TableName: "groups",
+		}},
+	}
+	require.True(t, engine.Prepare(ctx, validReq).Success, "valid DDL must still prepare")
+}
+
+// TestReplicationEngine_PrepareValidatesDependentDDL verifies that DDL depending
+// on an earlier statement in the same transaction is not falsely rejected.
+func TestReplicationEngine_PrepareValidatesDependentDDL(t *testing.T) {
+	engine, dm, cleanup := setupTestReplicationEngine(t)
+	defer cleanup()
+
+	require.NoError(t, dm.CreateDatabase("testdb"))
+
+	result := engine.Prepare(context.Background(), &PrepareRequest{
+		TxnID:    2101,
+		NodeID:   1,
+		StartTS:  hlc.Timestamp{WallTime: 1000, Logical: 1},
+		Database: "testdb",
+		Statements: []protocol.Statement{
+			{
+				Type:      protocol.StatementDDL,
+				SQL:       "CREATE TABLE memberships (id INTEGER PRIMARY KEY, group_id INTEGER)",
+				TableName: "memberships",
+			},
+			{
+				Type:      protocol.StatementDDL,
+				SQL:       "CREATE INDEX idx_memberships_group ON memberships(group_id)",
+				TableName: "memberships",
+			},
+		},
+	})
+
+	require.True(t, result.Success, "dependent DDL must prepare: %s", result.Error)
+}
+
+// TestReplicationEngine_PrepareCancelledDDLIsNotRejection verifies that a
+// validation that could not finish is reported as a plain failure, never as a
+// rejection. Only a verdict on the statement itself may be final: a timeout says
+// nothing about whether the DDL is applicable.
+func TestReplicationEngine_PrepareCancelledDDLIsNotRejection(t *testing.T) {
+	engine, dm, cleanup := setupTestReplicationEngine(t)
+	defer cleanup()
+
+	require.NoError(t, dm.CreateDatabase("testdb"))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	result := engine.Prepare(ctx, &PrepareRequest{
+		TxnID:    2201,
+		NodeID:   1,
+		StartTS:  hlc.Timestamp{WallTime: 1000, Logical: 1},
+		Database: "testdb",
+		Statements: []protocol.Statement{{
+			Type:      protocol.StatementDDL,
+			SQL:       "CREATE TABLE cancelled_t (id INTEGER PRIMARY KEY)",
+			TableName: "cancelled_t",
+		}},
+	})
+
+	require.False(t, result.Success, "cancelled validation must not report success")
+	require.False(t, result.Rejected, "a cancelled validation is not a rejection of the statement")
+}
+
+// A statement SQLite refuses is a final verdict and must be marked as such.
+func TestReplicationEngine_PrepareInvalidDDLIsRejection(t *testing.T) {
+	engine, dm, cleanup := setupTestReplicationEngine(t)
+	defer cleanup()
+
+	require.NoError(t, dm.CreateDatabase("testdb"))
+
+	result := engine.Prepare(context.Background(), &PrepareRequest{
+		TxnID:    2202,
+		NodeID:   1,
+		StartTS:  hlc.Timestamp{WallTime: 1000, Logical: 1},
+		Database: "testdb",
+		Statements: []protocol.Statement{{
+			Type:      protocol.StatementDDL,
+			SQL:       "ALTER TABLE missing_table ADD COLUMN x TEXT",
+			TableName: "missing_table",
+		}},
+	})
+
+	require.False(t, result.Success)
+	require.True(t, result.Rejected, "invalid DDL must be a final rejection")
+	require.True(t, result.ToCoordinatorResponse().Rejected, "rejection must survive the coordinator conversion")
+}

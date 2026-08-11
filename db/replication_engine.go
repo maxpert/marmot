@@ -34,6 +34,10 @@ type PrepareResult struct {
 	Error            string
 	ConflictDetected bool
 	ConflictDetails  string
+	// Rejected marks a deterministic refusal of the statement itself, such as DDL
+	// SQLite cannot apply. Infrastructure failures (timeouts, storage errors) leave
+	// it false so the coordinator keeps treating them as a missing ACK.
+	Rejected bool
 }
 
 // CommitRequest contains parameters for the commit phase
@@ -79,7 +83,21 @@ func (re *ReplicationEngine) Prepare(ctx context.Context, req *PrepareRequest) *
 		return re.prepareDatabaseOperation(req)
 	}
 
-	return re.prepareRegularTransaction(req)
+	return re.prepareRegularTransaction(ctx, req)
+}
+
+// ddlStatementsToValidate collects the DDL SQL that COMMIT will execute, in
+// request order. Vector index control and LOAD DATA reuse the DDL intent type but
+// are applied through their own paths, so they are excluded.
+func ddlStatementsToValidate(statements []protocol.Statement) []string {
+	var ddlSQL []string
+	for _, stmt := range statements {
+		if stmt.Type != protocol.StatementDDL || stmt.SQL == "" {
+			continue
+		}
+		ddlSQL = append(ddlSQL, stmt.SQL)
+	}
+	return ddlSQL
 }
 
 // isDatabaseOperation checks if the request contains a CREATE/DROP DATABASE statement
@@ -150,7 +168,7 @@ func (re *ReplicationEngine) prepareDatabaseOperation(req *PrepareRequest) *Prep
 }
 
 // prepareRegularTransaction handles regular transaction preparation
-func (re *ReplicationEngine) prepareRegularTransaction(req *PrepareRequest) *PrepareResult {
+func (re *ReplicationEngine) prepareRegularTransaction(ctx context.Context, req *PrepareRequest) *PrepareResult {
 	replicatedDB, err := re.dbMgr.GetDatabase(req.Database)
 	if err != nil {
 		return &PrepareResult{Success: false, Error: fmt.Sprintf("database not found: %s", req.Database)}
@@ -158,6 +176,29 @@ func (re *ReplicationEngine) prepareRegularTransaction(req *PrepareRequest) *Pre
 
 	txnMgr := replicatedDB.GetTransactionManager()
 	metaStore := replicatedDB.GetMetaStore()
+
+	// DDL is only executed during COMMIT, so validate it up front: a participant
+	// that ACKs PREPARE must be able to commit. Without this, invalid DDL fails
+	// after peers have committed and leaves the cluster inconsistent.
+	//
+	// Statements are validated together, in order, because an explicit client
+	// transaction can carry several DDL statements where a later one depends on
+	// the schema an earlier one creates.
+	if ddlSQL := ddlStatementsToValidate(req.Statements); len(ddlSQL) > 0 {
+		if err := txnMgr.ValidateDDL(ctx, ddlSQL); err != nil {
+			// Only a verdict on the statement itself is a rejection. A cancelled or
+			// timed-out validation says nothing about the DDL, so it must stay a
+			// missing ACK the coordinator can retry rather than a final answer.
+			rejected := ctx.Err() == nil && !isContextError(err)
+			log.Debug().
+				Err(err).
+				Uint64("txn_id", req.TxnID).
+				Uint64("node_id", re.nodeID).
+				Bool("rejected", rejected).
+				Msg("DDL validation failed during PREPARE")
+			return &PrepareResult{Success: false, Error: err.Error(), Rejected: rejected}
+		}
+	}
 
 	txn, err := txnMgr.BeginTransactionWithID(req.TxnID, req.NodeID, req.StartTS)
 	if err != nil {
@@ -522,6 +563,7 @@ func (pr *PrepareResult) ToCoordinatorResponse() *coordinator.ReplicationRespons
 		Error:            pr.Error,
 		ConflictDetected: pr.ConflictDetected,
 		ConflictDetails:  pr.ConflictDetails,
+		Rejected:         pr.Rejected,
 	}
 }
 

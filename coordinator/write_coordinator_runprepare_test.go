@@ -2,6 +2,7 @@ package coordinator
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -64,6 +65,79 @@ func TestRunPreparePhase_CoordinatorPrepareFails(t *testing.T) {
 	ctx := context.Background()
 	_, err := wc.runPreparePhase(ctx, txn, cluster, otherNodes)
 
+	AssertError(t, err, &CoordinatorNotParticipatedError{})
+}
+
+// Test 4.2b: CoordinatorPrepareRejectionReason
+// A deterministic local rejection (invalid DDL) must reach the client with the
+// participant's reason so it maps to the matching MySQL error code instead of a
+// generic "coordinator must participate" message.
+func TestRunPreparePhase_CoordinatorRejectionCarriesReason(t *testing.T) {
+	InitTestTelemetry()
+
+	nodeProvider := newMockNodeProvider([]uint64{1, 2, 3})
+	localReplicator := newMockReplicator()
+	remoteReplicator := newMockReplicator()
+
+	localReplicator.SetNodeResponse(1, CreateRejectionResponse("duplicate column name: creation_date"))
+
+	wc := NewWriteCoordinator(1, nodeProvider, remoteReplicator, localReplicator, 100*time.Millisecond, hlc.NewClock(1))
+
+	txn := NewTxnBuilder().WithID(1010).Build()
+	cluster, _ := GetClusterState(nodeProvider, txn.WriteConsistency)
+	otherNodes := []uint64{2, 3}
+
+	ctx := context.Background()
+	_, err := wc.runPreparePhase(ctx, txn, cluster, otherNodes)
+
+	AssertError(t, err, &CoordinatorNotParticipatedError{})
+
+	var localErr *LocalPrepareError
+	if !errors.As(err, &localErr) {
+		t.Fatalf("expected wrapped LocalPrepareError, got %v", err)
+	}
+	if localErr.Reason != "duplicate column name: creation_date" {
+		t.Errorf("reason: got %q, want %q", localErr.Reason, "duplicate column name: creation_date")
+	}
+
+	mysqlErr := protocol.ConvertToMySQLError(err)
+	if mysqlErr.Code != protocol.ErrCodeDupFieldName {
+		t.Errorf("MySQL error code: got %d, want %d", mysqlErr.Code, protocol.ErrCodeDupFieldName)
+	}
+}
+
+// Test 4.2c: A transient local failure (timeout, storage error) must NOT be
+// reported as a final rejection - it stays a missing ACK so the client keeps the
+// retryable behaviour it had before DDL was validated during PREPARE.
+func TestRunPreparePhase_TransientLocalFailureIsNotRejection(t *testing.T) {
+	InitTestTelemetry()
+
+	nodeProvider := newMockNodeProvider([]uint64{1, 2, 3})
+	localReplicator := newMockReplicator()
+	remoteReplicator := newMockReplicator()
+
+	// Success:false without Rejected - e.g. validation hit the context deadline
+	localReplicator.SetNodeResponse(1, CreateErrorResponse("failed to begin DDL validation transaction: context deadline exceeded"))
+
+	wc := NewWriteCoordinator(1, nodeProvider, remoteReplicator, localReplicator, 100*time.Millisecond, hlc.NewClock(1))
+
+	txn := NewTxnBuilder().WithID(1011).Build()
+	cluster, _ := GetClusterState(nodeProvider, txn.WriteConsistency)
+	otherNodes := []uint64{2, 3}
+
+	ctx := context.Background()
+	_, err := wc.runPreparePhase(ctx, txn, cluster, otherNodes)
+
+	if err == nil {
+		t.Fatal("expected prepare to fail when the coordinator does not participate")
+	}
+
+	var localErr *LocalPrepareError
+	if errors.As(err, &localErr) {
+		t.Errorf("transient local failure must not be classified as a rejection, got %v", err)
+	}
+
+	// It must still abort through the pre-existing coordinator-participation path.
 	AssertError(t, err, &CoordinatorNotParticipatedError{})
 }
 

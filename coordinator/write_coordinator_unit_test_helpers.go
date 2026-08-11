@@ -619,6 +619,16 @@ func CreateErrorResponse(errMsg string) *ReplicationResponse {
 	}
 }
 
+// CreateRejectionResponse builds a response for a participant that deterministically
+// refused the statement (for example DDL SQLite cannot apply).
+func CreateRejectionResponse(errMsg string) *ReplicationResponse {
+	return &ReplicationResponse{
+		Success:  false,
+		Error:    errMsg,
+		Rejected: true,
+	}
+}
+
 // InitTestTelemetry initializes telemetry for tests
 // Note: In the current implementation, telemetry metrics default to noop implementations
 // This function is provided for future use when telemetry initialization is needed

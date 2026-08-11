@@ -1,6 +1,8 @@
 package coordinator
 
 import (
+	"context"
+	"sync"
 	"testing"
 	"time"
 )
@@ -647,4 +649,66 @@ func TestExecutePreparePhase_ErrorResponsesNotAdded(t *testing.T) {
 	// Verify coordinator and node 3 are successful
 	AssertResponseSuccess(t, responses, wc.nodeID)
 	AssertResponseSuccess(t, responses, 3)
+}
+
+// deadlineRecordingReplicator captures the context deadline of each PREPARE call.
+type deadlineRecordingReplicator struct {
+	mu        sync.Mutex
+	deadlines []time.Time
+	hadNone   bool
+}
+
+func (d *deadlineRecordingReplicator) ReplicateTransaction(ctx context.Context, nodeID uint64, _ *ReplicationRequest) (*ReplicationResponse, error) {
+	deadline, ok := ctx.Deadline()
+
+	d.mu.Lock()
+	if ok {
+		d.deadlines = append(d.deadlines, deadline)
+	} else {
+		d.hadNone = true
+	}
+	d.mu.Unlock()
+
+	return &ReplicationResponse{Success: true}, nil
+}
+
+// TestExecutePreparePhase_CallsAreDeadlineBounded verifies every PREPARE call is
+// bounded by the coordinator timeout. PREPARE persists intents and validates DDL,
+// so a call the collector has given up on must not keep running and durably
+// prepare a transaction the coordinator no longer tracks.
+func TestExecutePreparePhase_CallsAreDeadlineBounded(t *testing.T) {
+	defer CheckGoroutines(t)()
+
+	recorder := &deadlineRecordingReplicator{}
+	wc := &WriteCoordinator{
+		nodeID:          1,
+		replicator:      recorder,
+		localReplicator: recorder,
+		timeout:         200 * time.Millisecond,
+	}
+
+	txn := NewTxnBuilder().WithID(100).Build()
+	req := &ReplicationRequest{TxnID: txn.ID, NodeID: wc.nodeID, Phase: PhasePrep, Database: txn.Database}
+
+	// Parent context has no deadline of its own - the bound must come from wc.timeout
+	start := time.Now()
+	responses, err := wc.executePreparePhase(context.Background(), txn, req, []uint64{2, 3}, false)
+
+	AssertNoError(t, err)
+	AssertResponseMapSize(t, responses, 3)
+
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+
+	if recorder.hadNone {
+		t.Error("PREPARE dispatched with an unbounded context")
+	}
+	if len(recorder.deadlines) != 3 {
+		t.Fatalf("recorded deadlines: got %d, want 3", len(recorder.deadlines))
+	}
+	for i, deadline := range recorder.deadlines {
+		if budget := deadline.Sub(start); budget > wc.timeout+50*time.Millisecond {
+			t.Errorf("call %d deadline exceeds coordinator timeout: %v > %v", i, budget, wc.timeout)
+		}
+	}
 }

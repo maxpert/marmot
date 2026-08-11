@@ -202,6 +202,13 @@ func (tm *TransactionManager) BeginTransactionWithID(txnID, nodeID uint64, start
 	return txn, nil
 }
 
+// ValidateDDL checks that the given DDL statements can be applied to this node's
+// database without leaving any side effects. Called during PREPARE so a node
+// never promises to commit DDL that SQLite would reject at COMMIT time.
+func (tm *TransactionManager) ValidateDDL(ctx context.Context, statements []string) error {
+	return ValidateDDLStatements(ctx, tm.db, statements)
+}
+
 // AddStatement adds a statement to the transaction buffer
 func (tm *TransactionManager) AddStatement(txn *Transaction, stmt protocol.Statement) error {
 	txn.mu.Lock()

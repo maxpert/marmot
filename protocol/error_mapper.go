@@ -67,6 +67,10 @@ func mapByMessage(msg string) *MySQLError {
 	switch {
 	case strings.Contains(lower, "no such table"):
 		return NewMySQLError(ErrCodeNoSuchTable, SQLStateNoSuchTable, msg)
+	// SQLite reports "duplicate column name: <col>" for ALTER TABLE ADD COLUMN on
+	// an existing column; clients expect MySQL's ER_DUP_FIELDNAME.
+	case strings.Contains(lower, "duplicate column name"):
+		return NewMySQLError(ErrCodeDupFieldName, SQLStateDupColumn, msg)
 	case strings.Contains(lower, "already exists"):
 		return NewMySQLError(ErrCodeTableExists, SQLStateTableExists, msg)
 	case strings.Contains(lower, "no column named"), strings.Contains(lower, "no such column"):
