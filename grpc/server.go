@@ -860,6 +860,11 @@ func (s *Server) GetSnapshotInfo(ctx context.Context, req *SnapshotInfoRequest) 
 		return nil, fmt.Errorf("failed to get snapshot info: %w", err)
 	}
 
+	// Schema versions travel with the snapshot: they live in the MetaStore, which
+	// is not part of the transferred files, and a receiver that cannot recover
+	// them refuses every transaction requiring a newer schema.
+	schemaVersions := snapshotSchemaVersions(dbManager)
+
 	// Calculate total size and chunks (estimates)
 	var totalSize int64
 	var dbInfos []*DatabaseFileInfo
@@ -886,6 +891,7 @@ func (s *Server) GetSnapshotInfo(ctx context.Context, req *SnapshotInfoRequest) 
 			SnapshotTxnId:  txnID,
 			SizeBytes:      snap.Size,
 			Sha256Checksum: snap.SHA256,
+			SchemaVersion:  schemaVersions[snap.Name],
 		})
 	}
 
@@ -924,6 +930,7 @@ func (s *Server) StreamSnapshot(req *SnapshotRequest, stream MarmotService_Strea
 
 	var snapshots []db.SnapshotInfo
 	var maxTxnID uint64
+	var schemaVersions map[string]uint64
 	var tempDir string
 	var shouldCleanup bool
 
@@ -948,6 +955,12 @@ func (s *Server) StreamSnapshot(req *SnapshotRequest, stream MarmotService_Strea
 			maxTxnID = cached.maxTxnID
 			tempDir = cached.tempDir
 			shouldCleanup = false
+
+			// Single-database snapshots don't capture schema versions in the
+			// same atomic step as the file copy (unlike TakeSnapshotToDir), so
+			// read the current value here instead - it is the best available
+			// estimate for this legacy path.
+			schemaVersions = snapshotSchemaVersions(dbManager)
 		} else {
 			// Cache miss or expired - create new snapshot
 			if exists {
@@ -979,6 +992,7 @@ func (s *Server) StreamSnapshot(req *SnapshotRequest, stream MarmotService_Strea
 			}
 			snapshots = []db.SnapshotInfo{snapshot}
 			maxTxnID = txnID
+			schemaVersions = snapshotSchemaVersions(dbManager)
 
 			// Cache the snapshot
 			ttl := time.Duration(cfg.Config.Replica.SnapshotCacheTTLSec) * time.Second
@@ -1010,7 +1024,7 @@ func (s *Server) StreamSnapshot(req *SnapshotRequest, stream MarmotService_Strea
 			return fmt.Errorf("failed to create temp directory: %w", err)
 		}
 
-		snapshots, maxTxnID, err = dbManager.TakeSnapshotToDir(tempDir)
+		snapshots, maxTxnID, schemaVersions, err = dbManager.TakeSnapshotToDir(tempDir)
 		if err != nil {
 			os.RemoveAll(tempDir)
 			return fmt.Errorf("failed to take snapshot: %w", err)
@@ -1022,6 +1036,15 @@ func (s *Server) StreamSnapshot(req *SnapshotRequest, stream MarmotService_Strea
 			Msg("Full snapshot created (no caching)")
 
 		shouldCleanup = true
+	}
+
+	// Advertise the schema versions captured with these exact files as stream
+	// trailer metadata. GetSnapshotInfo's earlier estimate can go stale if a
+	// DDL commits between that call and this one; receivers prefer this value
+	// (see grpc.SnapshotVersionsForRestore) so they never restore a version
+	// older than the files they actually received.
+	if trailer := snapshotSchemaVersionsTrailer(schemaVersions); trailer != nil {
+		stream.SetTrailer(trailer)
 	}
 
 	// Cleanup temp directory when done (only for non-cached snapshots)

@@ -1438,8 +1438,12 @@ type TransactionResponse struct {
 	// Write-write conflict detection
 	ConflictDetected bool   `protobuf:"varint,4,opt,name=conflict_detected,json=conflictDetected,proto3" json:"conflict_detected,omitempty"`
 	ConflictDetails  string `protobuf:"bytes,5,opt,name=conflict_details,json=conflictDetails,proto3" json:"conflict_details,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// Rejected marks a deterministic refusal of the statement itself during
+	// PREPARE (for example DDL SQLite cannot apply), as opposed to a timeout
+	// or storage error. See db.PrepareResult.Rejected.
+	Rejected      bool `protobuf:"varint,6,opt,name=rejected,proto3" json:"rejected,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *TransactionResponse) Reset() {
@@ -1505,6 +1509,13 @@ func (x *TransactionResponse) GetConflictDetails() string {
 		return x.ConflictDetails
 	}
 	return ""
+}
+
+func (x *TransactionResponse) GetRejected() bool {
+	if x != nil {
+		return x.Rejected
+	}
+	return false
 }
 
 type ReadRequest struct {
@@ -2242,8 +2253,12 @@ type DatabaseSnapshotMetadata struct {
 	SnapshotTxnId  uint64                 `protobuf:"varint,2,opt,name=snapshot_txn_id,json=snapshotTxnId,proto3" json:"snapshot_txn_id,omitempty"` // Per-database CDC offset
 	SizeBytes      int64                  `protobuf:"varint,3,opt,name=size_bytes,json=sizeBytes,proto3" json:"size_bytes,omitempty"`
 	Sha256Checksum string                 `protobuf:"bytes,4,opt,name=sha256_checksum,json=sha256Checksum,proto3" json:"sha256_checksum,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// Schema version the source node had for this database. Snapshots carry only
+	// SQLite files, so without this the receiver cannot recover the version and
+	// would refuse every transaction that requires a newer schema.
+	SchemaVersion uint64 `protobuf:"varint,5,opt,name=schema_version,json=schemaVersion,proto3" json:"schema_version,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *DatabaseSnapshotMetadata) Reset() {
@@ -2302,6 +2317,13 @@ func (x *DatabaseSnapshotMetadata) GetSha256Checksum() string {
 		return x.Sha256Checksum
 	}
 	return ""
+}
+
+func (x *DatabaseSnapshotMetadata) GetSchemaVersion() uint64 {
+	if x != nil {
+		return x.SchemaVersion
+	}
+	return 0
 }
 
 type SnapshotRequest struct {
@@ -3423,14 +3445,15 @@ const file_grpc_marmot_proto_rawDesc = "" +
 	"\x03HLC\x12\x1b\n" +
 	"\twall_time\x18\x01 \x01(\x03R\bwallTime\x12\x18\n" +
 	"\alogical\x18\x02 \x01(\x05R\alogical\x12\x17\n" +
-	"\anode_id\x18\x03 \x01(\x04R\x06nodeId\"\xdb\x01\n" +
+	"\anode_id\x18\x03 \x01(\x04R\x06nodeId\"\xf7\x01\n" +
 	"\x13TransactionResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12#\n" +
 	"\rerror_message\x18\x02 \x01(\tR\ferrorMessage\x12-\n" +
 	"\n" +
 	"applied_at\x18\x03 \x01(\v2\x0e.marmot.v2.HLCR\tappliedAt\x12+\n" +
 	"\x11conflict_detected\x18\x04 \x01(\bR\x10conflictDetected\x12)\n" +
-	"\x10conflict_details\x18\x05 \x01(\tR\x0fconflictDetails\"\xf4\x01\n" +
+	"\x10conflict_details\x18\x05 \x01(\tR\x0fconflictDetails\x12\x1a\n" +
+	"\brejected\x18\x06 \x01(\bR\brejected\"\xf4\x01\n" +
 	"\vReadRequest\x12\x14\n" +
 	"\x05query\x18\x01 \x01(\tR\x05query\x12$\n" +
 	"\x0esource_node_id\x18\x02 \x01(\x04R\fsourceNodeId\x12/\n" +
@@ -3492,13 +3515,14 @@ const file_grpc_marmot_proto_rawDesc = "" +
 	"\bfilename\x18\x02 \x01(\tR\bfilename\x12\x1d\n" +
 	"\n" +
 	"size_bytes\x18\x03 \x01(\x03R\tsizeBytes\x12'\n" +
-	"\x0fsha256_checksum\x18\x04 \x01(\tR\x0esha256Checksum\"\xaf\x01\n" +
+	"\x0fsha256_checksum\x18\x04 \x01(\tR\x0esha256Checksum\"\xd6\x01\n" +
 	"\x18DatabaseSnapshotMetadata\x12#\n" +
 	"\rdatabase_name\x18\x01 \x01(\tR\fdatabaseName\x12&\n" +
 	"\x0fsnapshot_txn_id\x18\x02 \x01(\x04R\rsnapshotTxnId\x12\x1d\n" +
 	"\n" +
 	"size_bytes\x18\x03 \x01(\x03R\tsizeBytes\x12'\n" +
-	"\x0fsha256_checksum\x18\x04 \x01(\tR\x0esha256Checksum\"[\n" +
+	"\x0fsha256_checksum\x18\x04 \x01(\tR\x0esha256Checksum\x12%\n" +
+	"\x0eschema_version\x18\x05 \x01(\x04R\rschemaVersion\"[\n" +
 	"\x0fSnapshotRequest\x12,\n" +
 	"\x12requesting_node_id\x18\x01 \x01(\x04R\x10requestingNodeId\x12\x1a\n" +
 	"\bdatabase\x18\x02 \x01(\tR\bdatabase\"\xc8\x01\n" +

@@ -773,11 +773,37 @@ func (s *StreamClient) applySnapshot(ctx context.Context, snapshotInfo *marmotgr
 		return fmt.Errorf("snapshot restore failed: %w", err)
 	}
 
+	// Restore the schema versions the snapshot was taken at, otherwise this node
+	// reports version 0 and refuses every transaction requiring a newer schema.
+	// Prefer the versions captured atomically with these exact files (the
+	// stream trailer) over the earlier, potentially stale read from
+	// GetSnapshotInfo.
+	versions := marmotgrpc.SnapshotVersionsForRestore(snapshotInfo.DatabaseMetadata, stream)
+	if err := s.restoreSchemaVersions(versions); err != nil {
+		return fmt.Errorf("failed to restore schema versions from snapshot: %w", err)
+	}
+
 	log.Info().
 		Uint64("snapshot_txn_id", snapshotInfo.SnapshotTxnId).
 		Msg("Snapshot applied successfully via unified restorer")
 
 	return nil
+}
+
+// restoreSchemaVersions records snapshot schema versions through the live system
+// MetaStore. The replica keeps its own system database, so the versions are
+// written to the already-open store rather than by reopening it on disk.
+func (s *StreamClient) restoreSchemaVersions(versions map[string]uint64) error {
+	if len(versions) == 0 {
+		return nil
+	}
+
+	systemDB, err := s.dbManager.GetDatabase(db.SystemDatabaseName)
+	if err != nil {
+		return fmt.Errorf("system database unavailable: %w", err)
+	}
+
+	return db.RestoreSchemaVersions(systemDB.GetMetaStore(), versions)
 }
 
 // replicaSnapshotStreamAdapter adapts MarmotService_StreamSnapshotClient to snapshot.ChunkReceiver

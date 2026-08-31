@@ -157,6 +157,7 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 		ErrorMessage:     result.Error,
 		ConflictDetected: result.ConflictDetected,
 		ConflictDetails:  result.ConflictDetails,
+		Rejected:         result.Rejected,
 	}
 	if result.Success {
 		resp.AppliedAt = &HLC{

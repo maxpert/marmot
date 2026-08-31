@@ -3,7 +3,9 @@ package db
 import (
 	"context"
 	"testing"
+	"time"
 
+	"github.com/maxpert/marmot/cfg"
 	"github.com/maxpert/marmot/encoding"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/protocol"
@@ -845,4 +847,250 @@ func TestReplicationEngine_ClockUpdate(t *testing.T) {
 	updatedTime := engine.clock.Now()
 	assert.Greater(t, updatedTime.WallTime, initialTime.WallTime, "Clock should be updated")
 	assert.GreaterOrEqual(t, updatedTime.WallTime, futureTS.WallTime, "Clock should advance to at least the request timestamp")
+}
+
+// TestReplicationEngine_PrepareRejectsInvalidDDL verifies that DDL SQLite cannot
+// apply is rejected during PREPARE. PREPARE is the 2PC promise point: accepting
+// such a statement makes COMMIT fail after peers have already committed.
+func TestReplicationEngine_PrepareRejectsInvalidDDL(t *testing.T) {
+	engine, dm, cleanup := setupTestReplicationEngine(t)
+	defer cleanup()
+
+	require.NoError(t, dm.CreateDatabase("testdb"))
+	replicatedDB, err := dm.GetDatabase("testdb")
+	require.NoError(t, err)
+
+	ctx := context.Background()
+
+	createReq := &PrepareRequest{
+		TxnID:    2001,
+		NodeID:   1,
+		StartTS:  hlc.Timestamp{WallTime: 1000, Logical: 1},
+		Database: "testdb",
+		Statements: []protocol.Statement{{
+			Type:      protocol.StatementDDL,
+			SQL:       "CREATE TABLE groups (group_id INTEGER PRIMARY KEY, creation_date datetime)",
+			TableName: "groups",
+		}},
+	}
+	require.True(t, engine.Prepare(ctx, createReq).Success)
+	commitResult := engine.Commit(ctx, &CommitRequest{
+		TxnID:      2001,
+		Database:   "testdb",
+		Statements: createReq.Statements,
+	})
+	require.True(t, commitResult.Success, "setup commit failed: %s", commitResult.Error)
+
+	// Adding an existing column can never commit - PREPARE must reject it.
+	dupReq := &PrepareRequest{
+		TxnID:    2002,
+		NodeID:   1,
+		StartTS:  hlc.Timestamp{WallTime: 2000, Logical: 1},
+		Database: "testdb",
+		Statements: []protocol.Statement{{
+			Type:      protocol.StatementDDL,
+			SQL:       "ALTER TABLE groups ADD COLUMN creation_date datetime NOT NULL DEFAULT '2026-08-10 19:38:56'",
+			TableName: "groups",
+		}},
+	}
+
+	result := engine.Prepare(ctx, dupReq)
+
+	require.False(t, result.Success, "PREPARE must reject DDL that cannot be applied")
+	require.Contains(t, result.Error, "duplicate column name: creation_date")
+
+	// A rejected PREPARE must not leave transaction or intent state behind.
+	metaStore := replicatedDB.GetMetaStore()
+	intents, err := metaStore.GetIntentsByTxn(2002)
+	require.NoError(t, err)
+	require.Empty(t, intents, "rejected DDL must not create write intents")
+	require.Nil(t, replicatedDB.GetTransactionManager().GetTransaction(2002),
+		"rejected DDL must not leave a pending transaction")
+
+	// The database must be untouched and still usable for valid DDL.
+	validReq := &PrepareRequest{
+		TxnID:    2003,
+		NodeID:   1,
+		StartTS:  hlc.Timestamp{WallTime: 3000, Logical: 1},
+		Database: "testdb",
+		Statements: []protocol.Statement{{
+			Type:      protocol.StatementDDL,
+			SQL:       "ALTER TABLE groups ADD COLUMN uuid TEXT",
+			TableName: "groups",
+		}},
+	}
+	require.True(t, engine.Prepare(ctx, validReq).Success, "valid DDL must still prepare")
+}
+
+// TestReplicationEngine_PrepareValidatesDependentDDL verifies that DDL depending
+// on an earlier statement in the same transaction is not falsely rejected.
+func TestReplicationEngine_PrepareValidatesDependentDDL(t *testing.T) {
+	engine, dm, cleanup := setupTestReplicationEngine(t)
+	defer cleanup()
+
+	require.NoError(t, dm.CreateDatabase("testdb"))
+
+	result := engine.Prepare(context.Background(), &PrepareRequest{
+		TxnID:    2101,
+		NodeID:   1,
+		StartTS:  hlc.Timestamp{WallTime: 1000, Logical: 1},
+		Database: "testdb",
+		Statements: []protocol.Statement{
+			{
+				Type:      protocol.StatementDDL,
+				SQL:       "CREATE TABLE memberships (id INTEGER PRIMARY KEY, group_id INTEGER)",
+				TableName: "memberships",
+			},
+			{
+				Type:      protocol.StatementDDL,
+				SQL:       "CREATE INDEX idx_memberships_group ON memberships(group_id)",
+				TableName: "memberships",
+			},
+		},
+	})
+
+	require.True(t, result.Success, "dependent DDL must prepare: %s", result.Error)
+}
+
+// TestReplicationEngine_PrepareCancelledDDLIsNotRejection verifies that a
+// validation that could not finish is reported as a plain failure, never as a
+// rejection. Only a verdict on the statement itself may be final: a timeout says
+// nothing about whether the DDL is applicable.
+func TestReplicationEngine_PrepareCancelledDDLIsNotRejection(t *testing.T) {
+	engine, dm, cleanup := setupTestReplicationEngine(t)
+	defer cleanup()
+
+	require.NoError(t, dm.CreateDatabase("testdb"))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	result := engine.Prepare(ctx, &PrepareRequest{
+		TxnID:    2201,
+		NodeID:   1,
+		StartTS:  hlc.Timestamp{WallTime: 1000, Logical: 1},
+		Database: "testdb",
+		Statements: []protocol.Statement{{
+			Type:      protocol.StatementDDL,
+			SQL:       "CREATE TABLE cancelled_t (id INTEGER PRIMARY KEY)",
+			TableName: "cancelled_t",
+		}},
+	})
+
+	require.False(t, result.Success, "cancelled validation must not report success")
+	require.False(t, result.Rejected, "a cancelled validation is not a rejection of the statement")
+}
+
+// A statement SQLite refuses is a final verdict and must be marked as such.
+func TestReplicationEngine_PrepareInvalidDDLIsRejection(t *testing.T) {
+	engine, dm, cleanup := setupTestReplicationEngine(t)
+	defer cleanup()
+
+	require.NoError(t, dm.CreateDatabase("testdb"))
+
+	result := engine.Prepare(context.Background(), &PrepareRequest{
+		TxnID:    2202,
+		NodeID:   1,
+		StartTS:  hlc.Timestamp{WallTime: 1000, Logical: 1},
+		Database: "testdb",
+		Statements: []protocol.Statement{{
+			Type:      protocol.StatementDDL,
+			SQL:       "ALTER TABLE missing_table ADD COLUMN x TEXT",
+			TableName: "missing_table",
+		}},
+	})
+
+	require.False(t, result.Success)
+	require.True(t, result.Rejected, "invalid DDL must be a final rejection")
+	require.True(t, result.ToCoordinatorResponse().Rejected, "rejection must survive the coordinator conversion")
+}
+
+// A DDL that loses a lock race against a concurrent DML on the same table via
+// hookDB must not be treated as a final rejection.
+//
+// db_integration.go documents writeDB and hookDB as sharing one SQLite page
+// cache via "cache=shared" so contention between them surfaces as immediate
+// SQLITE_LOCKED. In practice the DSN mattn's driver receives here is a plain
+// filesystem path with no "file:" scheme prefix, and the driver only forwards
+// query parameters (including cache=shared) to SQLite when the DSN starts
+// with "file:" - otherwise it strips them before opening
+// (github.com/mattn/go-sqlite3@v1.14.24/sqlite3.go:1450). So cache=shared is
+// silently dropped today, and contention between the two connections is an
+// ordinary whole-file SQLITE_BUSY bounded by busy_timeout, not SQLITE_LOCKED.
+// Confirmed empirically: with the exact DSN shape db_integration.go builds,
+// the error is "database is locked" with Code=sqlite3.ErrBusy, not
+// "database table is locked" with Code=sqlite3.ErrLocked. This is a
+// pre-existing gap in db_integration.go, outside this fix's scope; it is
+// exercised here, not fixed, because it changes what this test must prove.
+// Either way the classifier must not reject: SQLITE_BUSY is transient too.
+func TestReplicationEngine_PrepareHookDBLockContentionIsNotRejection(t *testing.T) {
+	// Shrink the busy-wait window so the test doesn't block for the default
+	// 50s lock_wait_timeout_seconds while still forcing a real wait long
+	// enough to prove genuine contention, not a fluke.
+	originalTimeout := cfg.Config.Transaction.LockWaitTimeoutSeconds
+	cfg.Config.Transaction.LockWaitTimeoutSeconds = 1
+	t.Cleanup(func() { cfg.Config.Transaction.LockWaitTimeoutSeconds = originalTimeout })
+
+	engine, dm, cleanup := setupTestReplicationEngine(t)
+	defer cleanup()
+
+	require.NoError(t, dm.CreateDatabase("testdb"))
+	replicatedDB, err := dm.GetDatabase("testdb")
+	require.NoError(t, err)
+
+	ctx := context.Background()
+
+	createReq := &PrepareRequest{
+		TxnID:    2301,
+		NodeID:   1,
+		StartTS:  hlc.Timestamp{WallTime: 1000, Logical: 1},
+		Database: "testdb",
+		Statements: []protocol.Statement{{
+			Type:      protocol.StatementDDL,
+			SQL:       "CREATE TABLE locked_t (id INTEGER PRIMARY KEY, val TEXT)",
+			TableName: "locked_t",
+		}},
+	}
+	require.True(t, engine.Prepare(ctx, createReq).Success)
+	commitResult := engine.Commit(ctx, &CommitRequest{
+		TxnID:      2301,
+		Database:   "testdb",
+		Statements: createReq.Statements,
+	})
+	require.True(t, commitResult.Success, "setup commit failed: %s", commitResult.Error)
+
+	// Hold a write lock on locked_t via hookDB - the same connection
+	// ExecuteLocalWithHooks uses for CDC capture - to reproduce the real
+	// production race rather than a synthetic stand-in.
+	hookTx, err := replicatedDB.hookDB.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = hookTx.Rollback() })
+	_, err = hookTx.ExecContext(ctx, "INSERT INTO locked_t (id, val) VALUES (1, 'x')")
+	require.NoError(t, err)
+
+	start := time.Now()
+	ddlReq := &PrepareRequest{
+		TxnID:    2302,
+		NodeID:   1,
+		StartTS:  hlc.Timestamp{WallTime: 2000, Logical: 1},
+		Database: "testdb",
+		Statements: []protocol.Statement{{
+			Type:      protocol.StatementDDL,
+			SQL:       "ALTER TABLE locked_t ADD COLUMN extra TEXT",
+			TableName: "locked_t",
+		}},
+	}
+	result := engine.Prepare(ctx, ddlReq)
+	elapsed := time.Since(start)
+
+	require.False(t, result.Success, "DDL contending for the hookDB lock must not succeed while the lock is held")
+	// Premise: the failure actually is lock contention with hookDB, not some
+	// unrelated failure, and it genuinely waited out busy_timeout rather than
+	// failing for a different reason entirely.
+	require.Contains(t, result.Error, "locked", "premise failed: expected a lock-contention failure")
+	require.GreaterOrEqual(t, elapsed, 900*time.Millisecond, "premise failed: did not wait out busy_timeout - contention was not provoked")
+	require.Less(t, elapsed, 5*time.Second, "premise failed: took far longer than the 1s busy_timeout budget")
+
+	require.False(t, result.Rejected,
+		"lock contention on this node is a transient condition, not a verdict on the DDL - it must stay a retryable missing ACK")
 }

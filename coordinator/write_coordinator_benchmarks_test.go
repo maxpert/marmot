@@ -66,7 +66,7 @@ func BenchmarkExecutePreparePhase(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, _ = wc.executePreparePhase(ctx, txn, req, otherNodes, false)
+		_, _, _ = wc.executePreparePhase(ctx, txn, req, otherNodes, false)
 	}
 }
 
@@ -94,7 +94,7 @@ func BenchmarkWaitForRemoteQuorum(b *testing.B) {
 		close(commitChan)
 		b.StartTimer()
 
-		_, _ = wc.waitForRemoteQuorum(commitChan, numResponses, quorumNeeded, 1)
+		_, _ = wc.waitForRemoteQuorum(commitChan, numResponses, quorumNeeded, 1, wc.timeout)
 	}
 }
 

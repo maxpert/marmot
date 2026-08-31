@@ -144,6 +144,18 @@ func TestConvertToMySQLError_MessageBased(t *testing.T) {
 			wantSQLState: SQLStateTableExists,
 		},
 		{
+			name:         "duplicate column name",
+			errMsg:       "duplicate column name: creation_date",
+			wantCode:     ErrCodeDupFieldName,
+			wantSQLState: SQLStateDupColumn,
+		},
+		{
+			name:         "duplicate column name wrapped by prepare failure",
+			errMsg:       "local prepare failed: duplicate column name: creation_date",
+			wantCode:     ErrCodeDupFieldName,
+			wantSQLState: SQLStateDupColumn,
+		},
+		{
 			name:         "no column named",
 			errMsg:       "no column named foo",
 			wantCode:     ErrCodeBadField,

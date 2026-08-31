@@ -64,6 +64,7 @@ func (gr *GRPCReplicator) ReplicateTransaction(ctx context.Context, nodeID uint6
 		Error:            grpcResp.ErrorMessage,
 		ConflictDetected: grpcResp.ConflictDetected,
 		ConflictDetails:  grpcResp.ConflictDetails,
+		Rejected:         grpcResp.Rejected,
 	}
 
 	return resp, nil

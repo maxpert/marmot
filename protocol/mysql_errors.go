@@ -8,6 +8,7 @@ const (
 	ErrCodeBadNull         uint16 = 1048
 	ErrCodeTableExists     uint16 = 1050
 	ErrCodeBadField        uint16 = 1054
+	ErrCodeDupFieldName    uint16 = 1060
 	ErrCodeDupEntry        uint16 = 1062
 	ErrCodeParseError      uint16 = 1064
 	ErrCodeTooBigRowsize   uint16 = 1118
@@ -29,6 +30,7 @@ const (
 	SQLStateTableExists = "42S01"
 	SQLStateNoSuchTable = "42S02"
 	SQLStateNoSuchCol   = "42S22"
+	SQLStateDupColumn   = "42S21"
 )
 
 // MySQLError represents a MySQL protocol error with error code and SQLSTATE
