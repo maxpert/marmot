@@ -5,12 +5,57 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+
+	"github.com/mattn/go-sqlite3"
 )
 
 // isContextError reports whether err was caused by the context being cancelled or
 // timing out, rather than by the statement being invalid.
 func isContextError(err error) bool {
 	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+// transientSQLiteCodes are primary SQLite result codes that describe a
+// resource or locking condition on this node right now, not a verdict on the
+// statement. With cache=shared, a table lock held by another connection in
+// this process (writeDB vs. hookDB) surfaces as SQLITE_LOCKED immediately -
+// busy_timeout does not apply to it, so the statement can fail here on pure
+// timing. A DDL that hits one of these must stay a retryable missing ACK: it
+// may succeed on retry, or once the condition clears.
+var transientSQLiteCodes = map[sqlite3.ErrNo]bool{
+	sqlite3.ErrBusy:     true, // SQLITE_BUSY: whole-file lock held by another connection/process
+	sqlite3.ErrLocked:   true, // SQLITE_LOCKED: table lock held by another connection, shared cache
+	sqlite3.ErrNomem:    true, // SQLITE_NOMEM: transient allocation failure
+	sqlite3.ErrIoErr:    true, // SQLITE_IOERR: transient disk I/O condition
+	sqlite3.ErrFull:     true, // SQLITE_FULL: disk or database full
+	sqlite3.ErrCantOpen: true, // SQLITE_CANTOPEN: could not open a required file
+	sqlite3.ErrProtocol: true, // SQLITE_PROTOCOL: locking protocol contention
+	sqlite3.ErrReadonly: true, // SQLITE_READONLY: database (or this connection) is read-only right now
+}
+
+// isDDLRejection reports whether err is a deterministic verdict on the DDL
+// statement itself - SQLite refuses to ever apply it, such as a constraint
+// violation or a schema conflict (duplicate column, missing table, syntax
+// error) - rather than a transient condition on this node such as lock
+// contention, a resource limit, or context cancellation.
+//
+// Only a rejection may be surfaced to the coordinator as a final refusal of
+// the transaction; everything else must stay a retryable missing ACK, exactly
+// as it was before DDL validation was added to PREPARE.
+func isDDLRejection(ctx context.Context, err error) bool {
+	if ctx.Err() != nil || isContextError(err) {
+		return false
+	}
+
+	var sqliteErr sqlite3.Error
+	if !errors.As(err, &sqliteErr) {
+		// Not a typed SQLite error - e.g. a wrapped BeginTx failure from
+		// connection-pool exhaustion. Treat conservatively as a missing ACK
+		// rather than assume it is a verdict on the statement.
+		return false
+	}
+
+	return !transientSQLiteCodes[sqliteErr.Code]
 }
 
 // ValidateDDLStatements verifies that DDL can be applied to this node before the

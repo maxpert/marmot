@@ -39,6 +39,25 @@ func (e *LocalPrepareError) Error() string {
 	return e.Reason
 }
 
+// RemotePrepareRejectedError indicates prepare quorum was not achieved and at
+// least one remote participant explicitly rejected the transaction during
+// PREPARE (a deterministic "this can never apply here" verdict, for example
+// DDL SQLite cannot apply), rather than merely failing to respond in time.
+// Retrying cannot change that participant's verdict, so this replaces the
+// retryable QuorumNotAchievedError when a rejection is on record. A remote
+// rejection alone - with quorum otherwise achieved - never produces this
+// error; it carries no veto over cluster DDL.
+type RemotePrepareRejectedError struct {
+	NodeID uint64
+	Reason string
+}
+
+// Error reports the rejecting participant's own reason so clients receive the
+// actual SQL failure rather than 2PC internals.
+func (e *RemotePrepareRejectedError) Error() string {
+	return e.Reason
+}
+
 // CoordinatorNotParticipatedError indicates the coordinator failed to participate in the prepare phase
 type CoordinatorNotParticipatedError struct {
 	TxnID uint64

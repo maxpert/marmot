@@ -33,7 +33,7 @@ func TestSendRemoteCommits_SpawnCorrectGoroutineCount(t *testing.T) {
 	beforeCalls := mock.GetCallCount()
 
 	// Execute
-	commitChan := wc.sendRemoteCommits(ctx, preparedNodes, req, 100)
+	commitChan := wc.sendRemoteCommits(ctx, preparedNodes, req, 100, wc.timeout)
 
 	// Wait for goroutines to execute
 	time.Sleep(50 * time.Millisecond)
@@ -70,7 +70,7 @@ func TestSendRemoteCommits_ExcludeCoordinator(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	wc.sendRemoteCommits(ctx, preparedNodes, req, 101)
+	wc.sendRemoteCommits(ctx, preparedNodes, req, 101, wc.timeout)
 
 	// Wait for goroutines
 	time.Sleep(50 * time.Millisecond)
@@ -137,7 +137,7 @@ func TestSendRemoteCommits_ChannelCapacityMatch(t *testing.T) {
 				Phase: PhaseCommit,
 			}
 
-			commitChan := wc.sendRemoteCommits(context.Background(), tc.preparedNodes, req, 200)
+			commitChan := wc.sendRemoteCommits(context.Background(), tc.preparedNodes, req, 200, wc.timeout)
 
 			if cap(commitChan) != tc.expectedCap {
 				t.Errorf("expected channel capacity %d, got %d", tc.expectedCap, cap(commitChan))
@@ -175,7 +175,7 @@ func TestSendRemoteCommits_DetachedContext(t *testing.T) {
 	beforeCalls := mock.GetCallCount()
 
 	// Execute
-	commitChan := wc.sendRemoteCommits(parentCtx, preparedNodes, req, 300)
+	commitChan := wc.sendRemoteCommits(parentCtx, preparedNodes, req, 300, wc.timeout)
 
 	// Cancel parent context IMMEDIATELY (before commits complete)
 	cancel()
@@ -226,7 +226,7 @@ func TestSendRemoteCommits_EmptyPreparedNodes(t *testing.T) {
 	beforeCalls := mock.GetCallCount()
 
 	// Execute
-	commitChan := wc.sendRemoteCommits(context.Background(), preparedNodes, req, 400)
+	commitChan := wc.sendRemoteCommits(context.Background(), preparedNodes, req, 400, wc.timeout)
 
 	// Wait a bit
 	time.Sleep(20 * time.Millisecond)
@@ -262,7 +262,7 @@ func TestSendRemoteCommits_SingleRemoteNode(t *testing.T) {
 	beforeCalls := mock.GetCallCount()
 
 	// Execute
-	commitChan := wc.sendRemoteCommits(context.Background(), preparedNodes, req, 500)
+	commitChan := wc.sendRemoteCommits(context.Background(), preparedNodes, req, 500, wc.timeout)
 
 	// Wait for goroutine
 	time.Sleep(50 * time.Millisecond)
@@ -308,7 +308,7 @@ func TestSendRemoteCommits_TimeoutPropagation(t *testing.T) {
 	}
 
 	// Execute - this spawns goroutines with detached context
-	wc.sendRemoteCommits(context.Background(), preparedNodes, req, 600)
+	wc.sendRemoteCommits(context.Background(), preparedNodes, req, 600, wc.timeout)
 
 	// Wait for goroutine to start
 	time.Sleep(20 * time.Millisecond)
@@ -344,7 +344,7 @@ func TestSendRemoteCommits_CorrectTxnID(t *testing.T) {
 	}
 
 	// Execute
-	wc.sendRemoteCommits(context.Background(), preparedNodes, req, expectedTxnID)
+	wc.sendRemoteCommits(context.Background(), preparedNodes, req, expectedTxnID, wc.timeout)
 
 	// Wait for goroutines
 	time.Sleep(50 * time.Millisecond)
@@ -381,7 +381,7 @@ func TestWaitForRemoteQuorum_ExactQuorumAchieved(t *testing.T) {
 	mocker.SendResponse(commitChan, 4, CreateErrorResponse("timeout"), 10*time.Millisecond)
 
 	// Execute: 3 prepared nodes, need 2 for quorum
-	responses, acks := wc.waitForRemoteQuorum(commitChan, 3, 2, 100)
+	responses, acks := wc.waitForRemoteQuorum(commitChan, 3, 2, 100, wc.timeout)
 
 	// Assert: Exactly 2 ACKs
 	if acks != 2 {
@@ -413,7 +413,7 @@ func TestWaitForRemoteQuorum_OverQuorumAchieved(t *testing.T) {
 	mocker.SendResponse(commitChan, 5, CreateSuccessResponse(), 0)
 
 	// Execute: 4 prepared nodes, need 2 for quorum
-	responses, acks := wc.waitForRemoteQuorum(commitChan, 4, 2, 200)
+	responses, acks := wc.waitForRemoteQuorum(commitChan, 4, 2, 200, wc.timeout)
 
 	// Assert: Early exit after 2 ACKs (may have 2, 3, or 4 depending on timing)
 	if acks < 2 {
@@ -443,7 +443,7 @@ func TestWaitForRemoteQuorum_UnderQuorumTimeout(t *testing.T) {
 	start := time.Now()
 
 	// Execute: 3 prepared nodes, need 2 for quorum (will timeout)
-	responses, acks := wc.waitForRemoteQuorum(commitChan, 3, 2, 300)
+	responses, acks := wc.waitForRemoteQuorum(commitChan, 3, 2, 300, wc.timeout)
 
 	elapsed := time.Since(start)
 
@@ -482,7 +482,7 @@ func TestWaitForRemoteQuorum_EarlyExitOnQuorum(t *testing.T) {
 	start := time.Now()
 
 	// Execute: 4 prepared nodes, need 2 for quorum
-	responses, acks := wc.waitForRemoteQuorum(commitChan, 4, 2, 400)
+	responses, acks := wc.waitForRemoteQuorum(commitChan, 4, 2, 400, wc.timeout)
 
 	elapsed := time.Since(start)
 
@@ -516,7 +516,7 @@ func TestWaitForRemoteQuorum_AllNodesFail(t *testing.T) {
 	mocker.SendResponse(commitChan, 4, CreateErrorResponse("unreachable"), 0)
 
 	// Execute: 3 prepared nodes, need 2 for quorum
-	responses, acks := wc.waitForRemoteQuorum(commitChan, 3, 2, 500)
+	responses, acks := wc.waitForRemoteQuorum(commitChan, 3, 2, 500, wc.timeout)
 
 	// Assert: 0 ACKs
 	if acks != 0 {
@@ -544,7 +544,7 @@ func TestWaitForRemoteQuorum_MixedSuccessError(t *testing.T) {
 	mocker.SendResponse(commitChan, 5, CreateSuccessResponse(), 0)
 
 	// Execute: 4 prepared nodes, need 2 for quorum
-	responses, acks := wc.waitForRemoteQuorum(commitChan, 4, 2, 600)
+	responses, acks := wc.waitForRemoteQuorum(commitChan, 4, 2, 600, wc.timeout)
 
 	// Assert: 2 or 3 ACKs (early exit after 2, but may collect more)
 	if acks < 2 {
@@ -580,7 +580,7 @@ func TestWaitForRemoteQuorum_TimeoutPerResponse(t *testing.T) {
 	mocker.SendResponse(commitChan, 4, CreateSuccessResponse(), 0)
 
 	// Execute: 3 prepared nodes, need 2 for quorum
-	responses, acks := wc.waitForRemoteQuorum(commitChan, 3, 2, 700)
+	responses, acks := wc.waitForRemoteQuorum(commitChan, 3, 2, 700, wc.timeout)
 
 	// Assert: Got 2 ACKs (nodes 2 and 4, node 3 timed out)
 	if acks != 2 {
@@ -607,7 +607,7 @@ func TestWaitForRemoteQuorum_ZeroQuorumNeeded(t *testing.T) {
 	// Execute: remoteQuorumNeeded = 0 (single-node or coordinator-only)
 	// Even though quorum is 0, the loop still runs once per otherPreparedNodes
 	// But should exit early after checking the condition
-	responses, acks := wc.waitForRemoteQuorum(commitChan, 2, 0, 800)
+	responses, acks := wc.waitForRemoteQuorum(commitChan, 2, 0, 800, wc.timeout)
 
 	// Assert: 0 ACKs (quorum already met)
 	if acks != 0 {
@@ -632,7 +632,7 @@ func TestWaitForRemoteQuorum_NegativeQuorumNeeded(t *testing.T) {
 
 	// Execute: remoteQuorumNeeded = -1 (invalid, but should handle gracefully)
 	// The condition remoteAcks >= -1 is always true, so should exit after first iteration
-	responses, acks := wc.waitForRemoteQuorum(commitChan, 2, -1, 900)
+	responses, acks := wc.waitForRemoteQuorum(commitChan, 2, -1, 900, wc.timeout)
 
 	// Assert: 0 ACKs (no successful responses collected before exit)
 	if acks != 0 {
@@ -667,7 +667,7 @@ func TestWaitForRemoteQuorum_ChannelClosed(t *testing.T) {
 	}()
 
 	// Execute: 2 prepared nodes, need 2 for quorum (but channel closes after 1)
-	responses, acks := wc.waitForRemoteQuorum(commitChan, 2, 2, 1000)
+	responses, acks := wc.waitForRemoteQuorum(commitChan, 2, 2, 1000, wc.timeout)
 
 	// Assert: Got only 1 ACK (channel closed early)
 	if acks != 1 {
@@ -705,7 +705,7 @@ func TestWaitForRemoteQuorum_NilResponses(t *testing.T) {
 	}
 
 	// Execute: 3 prepared nodes, need 2 for quorum
-	responses, acks := wc.waitForRemoteQuorum(commitChan, 3, 2, 1100)
+	responses, acks := wc.waitForRemoteQuorum(commitChan, 3, 2, 1100, wc.timeout)
 
 	// Assert: Only 1 ACK (nil and error not counted)
 	if acks != 1 {

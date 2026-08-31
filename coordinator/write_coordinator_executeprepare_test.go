@@ -5,7 +5,20 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/maxpert/marmot/cfg"
 )
+
+// withDDLValidationTimeout temporarily overrides the configured DDL validation
+// timeout for the duration of a test, restoring the prior value afterward.
+// cfg.Config is a process-global, so tests using this must not run in
+// parallel with each other or with anything else reading the same field.
+func withDDLValidationTimeout(t *testing.T, ms int) {
+	t.Helper()
+	original := cfg.Config.Replication.DDLValidationTimeoutMS
+	cfg.Config.Replication.DDLValidationTimeoutMS = ms
+	t.Cleanup(func() { cfg.Config.Replication.DDLValidationTimeoutMS = original })
+}
 
 // TestExecutePreparePhase_BroadcastToAllNodes verifies that prepare requests are broadcast to all nodes
 // Test 5.1: All nodes should receive prepare requests and responses should be collected
@@ -34,7 +47,7 @@ func TestExecutePreparePhase_BroadcastToAllNodes(t *testing.T) {
 	ctx, cancel := WithTimeout(200)
 	defer cancel()
 
-	responses, err := wc.executePreparePhase(ctx, txn, req, otherNodes, false)
+	responses, _, err := wc.executePreparePhase(ctx, txn, req, otherNodes, false)
 
 	AssertNoError(t, err)
 	AssertResponseMapSize(t, responses, 5) // coordinator + 4 others
@@ -77,7 +90,7 @@ func TestExecutePreparePhase_SkipLocalReplication_False(t *testing.T) {
 	ctx, cancel := WithTimeout(200)
 	defer cancel()
 
-	responses, err := wc.executePreparePhase(ctx, txn, req, otherNodes, false)
+	responses, _, err := wc.executePreparePhase(ctx, txn, req, otherNodes, false)
 
 	AssertNoError(t, err)
 	AssertResponseMapSize(t, responses, 3) // coordinator + 2 others
@@ -124,7 +137,7 @@ func TestExecutePreparePhase_SkipLocalReplication_True(t *testing.T) {
 	ctx, cancel := WithTimeout(200)
 	defer cancel()
 
-	responses, err := wc.executePreparePhase(ctx, txn, req, otherNodes, true)
+	responses, _, err := wc.executePreparePhase(ctx, txn, req, otherNodes, true)
 
 	AssertNoError(t, err)
 	AssertResponseMapSize(t, responses, 3) // only other nodes
@@ -174,7 +187,7 @@ func TestExecutePreparePhase_ConcurrentExecution(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	responses, err := wc.executePreparePhase(ctx, txn, req, otherNodes, false)
+	responses, _, err := wc.executePreparePhase(ctx, txn, req, otherNodes, false)
 	elapsed := time.Since(start)
 
 	AssertNoError(t, err)
@@ -220,7 +233,7 @@ func TestExecutePreparePhase_ResponseTimeout(t *testing.T) {
 	ctx, cancel := WithTimeout(300)
 	defer cancel()
 
-	responses, err := wc.executePreparePhase(ctx, txn, req, otherNodes, false)
+	responses, _, err := wc.executePreparePhase(ctx, txn, req, otherNodes, false)
 
 	AssertNoError(t, err)
 
@@ -271,7 +284,7 @@ func TestExecutePreparePhase_MixedResponses(t *testing.T) {
 	ctx, cancel := WithTimeout(200)
 	defer cancel()
 
-	responses, err := wc.executePreparePhase(ctx, txn, req, otherNodes, false)
+	responses, _, err := wc.executePreparePhase(ctx, txn, req, otherNodes, false)
 
 	// Conflict should be returned as error
 	if err == nil {
@@ -319,7 +332,7 @@ func TestExecutePreparePhase_AllNodesTimeout(t *testing.T) {
 	ctx, cancel := WithTimeout(300)
 	defer cancel()
 
-	responses, err := wc.executePreparePhase(ctx, txn, req, otherNodes, false)
+	responses, _, err := wc.executePreparePhase(ctx, txn, req, otherNodes, false)
 
 	AssertNoError(t, err)
 
@@ -360,7 +373,7 @@ func TestExecutePreparePhase_ContextCancelled(t *testing.T) {
 	CancelAfter(ctx, cancel, 20*time.Millisecond)
 
 	start := time.Now()
-	responses, err := wc.executePreparePhase(ctx, txn, req, otherNodes, false)
+	responses, _, err := wc.executePreparePhase(ctx, txn, req, otherNodes, false)
 	elapsed := time.Since(start)
 
 	// Should return quickly after context cancellation
@@ -406,7 +419,7 @@ func TestExecutePreparePhase_NilResponse(t *testing.T) {
 	ctx, cancel := WithTimeout(200)
 	defer cancel()
 
-	responses, err := wc.executePreparePhase(ctx, txn, req, otherNodes, false)
+	responses, _, err := wc.executePreparePhase(ctx, txn, req, otherNodes, false)
 
 	AssertNoError(t, err)
 
@@ -448,7 +461,7 @@ func TestExecutePreparePhase_ZeroTotalNodes(t *testing.T) {
 	ctx, cancel := WithTimeout(200)
 	defer cancel()
 
-	responses, err := wc.executePreparePhase(ctx, txn, req, otherNodes, true)
+	responses, _, err := wc.executePreparePhase(ctx, txn, req, otherNodes, true)
 
 	AssertNoError(t, err)
 	AssertResponseMapSize(t, responses, 0)
@@ -493,7 +506,7 @@ func TestExecutePreparePhase_ChannelBufferOverflow(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	responses, err := wc.executePreparePhase(ctx, txn, req, otherNodes, false)
+	responses, _, err := wc.executePreparePhase(ctx, txn, req, otherNodes, false)
 	elapsed := time.Since(start)
 
 	AssertNoError(t, err)
@@ -539,7 +552,7 @@ func TestExecutePreparePhase_GoroutineLeakPrevention(t *testing.T) {
 
 	beforeGoroutines := CountGoroutines()
 
-	responses, err := wc.executePreparePhase(ctx, txn, req, otherNodes, false)
+	responses, _, err := wc.executePreparePhase(ctx, txn, req, otherNodes, false)
 
 	AssertNoError(t, err)
 
@@ -588,7 +601,7 @@ func TestExecutePreparePhase_ConflictStopsCollection(t *testing.T) {
 	ctx, cancel := WithTimeout(200)
 	defer cancel()
 
-	responses, err := wc.executePreparePhase(ctx, txn, req, otherNodes, false)
+	responses, _, err := wc.executePreparePhase(ctx, txn, req, otherNodes, false)
 
 	// Should return conflict error
 	if err == nil {
@@ -636,7 +649,7 @@ func TestExecutePreparePhase_ErrorResponsesNotAdded(t *testing.T) {
 	ctx, cancel := WithTimeout(200)
 	defer cancel()
 
-	responses, err := wc.executePreparePhase(ctx, txn, req, otherNodes, false)
+	responses, _, err := wc.executePreparePhase(ctx, txn, req, otherNodes, false)
 
 	AssertNoError(t, err)
 
@@ -692,7 +705,7 @@ func TestExecutePreparePhase_CallsAreDeadlineBounded(t *testing.T) {
 
 	// Parent context has no deadline of its own - the bound must come from wc.timeout
 	start := time.Now()
-	responses, err := wc.executePreparePhase(context.Background(), txn, req, []uint64{2, 3}, false)
+	responses, _, err := wc.executePreparePhase(context.Background(), txn, req, []uint64{2, 3}, false)
 
 	AssertNoError(t, err)
 	AssertResponseMapSize(t, responses, 3)
@@ -711,4 +724,161 @@ func TestExecutePreparePhase_CallsAreDeadlineBounded(t *testing.T) {
 			t.Errorf("call %d deadline exceeds coordinator timeout: %v > %v", i, budget, wc.timeout)
 		}
 	}
+}
+
+// TestExecutePreparePhase_DDLCallsUseDDLValidationTimeout verifies that a
+// transaction carrying a DDL statement is dispatched with the DDL validation
+// timeout, not the regular (much shorter) write timeout. PREPARE for DDL
+// executes the real statement in a rolled-back transaction, which the regular
+// write timeout is not sized for.
+func TestExecutePreparePhase_DDLCallsUseDDLValidationTimeout(t *testing.T) {
+	defer CheckGoroutines(t)()
+	withDDLValidationTimeout(t, 2000)
+
+	recorder := &deadlineRecordingReplicator{}
+	wc := &WriteCoordinator{
+		nodeID:          1,
+		replicator:      recorder,
+		localReplicator: recorder,
+		timeout:         100 * time.Millisecond, // regular write timeout - deliberately short
+	}
+
+	txn := NewTxnBuilder().WithID(300).WithDDLStatement("CREATE TABLE t (id INT)").Build()
+	req := &ReplicationRequest{TxnID: txn.ID, NodeID: wc.nodeID, Phase: PhasePrep, Database: txn.Database}
+
+	start := time.Now()
+	responses, _, err := wc.executePreparePhase(context.Background(), txn, req, []uint64{2, 3}, false)
+
+	AssertNoError(t, err)
+	AssertResponseMapSize(t, responses, 3)
+
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+
+	if len(recorder.deadlines) != 3 {
+		t.Fatalf("recorded deadlines: got %d, want 3", len(recorder.deadlines))
+	}
+	for i, deadline := range recorder.deadlines {
+		budget := deadline.Sub(start)
+		// A wide margin above wc.timeout (100ms) is required, not just "greater
+		// than" it: scheduling jitter alone can push the recorded budget a few
+		// hundred microseconds past wc.timeout even when the DDL timeout was NOT
+		// applied, which would make a tight "> wc.timeout" check pass vacuously.
+		if budget < 1*time.Second {
+			t.Errorf("call %d deadline budget %v is not comfortably above the regular write timeout %v - DDL validation timeout was not applied", i, budget, wc.timeout)
+		}
+		if budget > 2000*time.Millisecond+100*time.Millisecond {
+			t.Errorf("call %d deadline budget %v exceeds the configured DDL validation timeout (2000ms)", i, budget)
+		}
+	}
+}
+
+// TestExecutePreparePhase_DMLCallsKeepRegularWriteTimeout is the control for
+// TestExecutePreparePhase_DDLCallsUseDDLValidationTimeout: a transaction with
+// no DDL statement must keep using the regular write timeout even when a much
+// larger DDL validation timeout is configured, so ordinary writes are not
+// silently slowed down by a knob meant only for DDL.
+func TestExecutePreparePhase_DMLCallsKeepRegularWriteTimeout(t *testing.T) {
+	defer CheckGoroutines(t)()
+	withDDLValidationTimeout(t, 2000)
+
+	recorder := &deadlineRecordingReplicator{}
+	wc := &WriteCoordinator{
+		nodeID:          1,
+		replicator:      recorder,
+		localReplicator: recorder,
+		timeout:         100 * time.Millisecond,
+	}
+
+	txn := NewTxnBuilder().WithID(301).
+		WithCDCStatement("users", map[string][]byte{"id": {1}}, map[string][]byte{"id": {2}}).
+		Build()
+	req := &ReplicationRequest{TxnID: txn.ID, NodeID: wc.nodeID, Phase: PhasePrep, Database: txn.Database}
+
+	start := time.Now()
+	responses, _, err := wc.executePreparePhase(context.Background(), txn, req, []uint64{2, 3}, false)
+
+	AssertNoError(t, err)
+	AssertResponseMapSize(t, responses, 3)
+
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+
+	if len(recorder.deadlines) != 3 {
+		t.Fatalf("recorded deadlines: got %d, want 3", len(recorder.deadlines))
+	}
+	for i, deadline := range recorder.deadlines {
+		if budget := deadline.Sub(start); budget > wc.timeout+50*time.Millisecond {
+			t.Errorf("call %d deadline budget %v exceeds the regular write timeout %v - DML must not inherit the DDL validation timeout", i, budget, wc.timeout)
+		}
+	}
+}
+
+// TestExecutePreparePhase_DDLTransactionSurvivesDelayBeyondWriteTimeout proves
+// the DDL validation timeout is not just recorded on the context but actually
+// changes outcomes: a remote PREPARE call slower than the regular write
+// timeout but faster than the DDL validation timeout must still succeed for a
+// DDL transaction.
+func TestExecutePreparePhase_DDLTransactionSurvivesDelayBeyondWriteTimeout(t *testing.T) {
+	defer CheckGoroutines(t)()
+	withDDLValidationTimeout(t, 2000)
+
+	mock := newMockReplicator()
+	localMock := newMockReplicator()
+	wc := &WriteCoordinator{
+		nodeID:          1,
+		replicator:      mock,
+		localReplicator: localMock,
+		timeout:         100 * time.Millisecond, // regular write timeout
+	}
+
+	txn := NewTxnBuilder().WithID(302).WithDDLStatement("CREATE TABLE t (id INT)").Build()
+	req := &ReplicationRequest{TxnID: txn.ID, NodeID: wc.nodeID, Phase: PhasePrep, Database: txn.Database}
+
+	// Slower than the regular write timeout (100ms), well under the DDL
+	// validation timeout (2s).
+	mock.SetDelay(txn.ID, 500*time.Millisecond)
+	otherNodes := []uint64{2}
+
+	ctx, cancel := WithTimeout(3000)
+	defer cancel()
+
+	responses, _, err := wc.executePreparePhase(ctx, txn, req, otherNodes, false)
+
+	AssertNoError(t, err)
+	AssertResponseSuccess(t, responses, 2)
+}
+
+// TestExecutePreparePhase_DMLTransactionTimesOutAtWriteTimeout is the control
+// for the delay test above: the same delay applied to a DML transaction must
+// still time out at the regular write timeout, proving DML did not silently
+// inherit the DDL validation timeout.
+func TestExecutePreparePhase_DMLTransactionTimesOutAtWriteTimeout(t *testing.T) {
+	defer CheckGoroutines(t)()
+	withDDLValidationTimeout(t, 2000)
+
+	mock := newMockReplicator()
+	localMock := newMockReplicator()
+	wc := &WriteCoordinator{
+		nodeID:          1,
+		replicator:      mock,
+		localReplicator: localMock,
+		timeout:         100 * time.Millisecond,
+	}
+
+	txn := NewTxnBuilder().WithID(303).
+		WithCDCStatement("users", map[string][]byte{"id": {1}}, map[string][]byte{"id": {2}}).
+		Build()
+	req := &ReplicationRequest{TxnID: txn.ID, NodeID: wc.nodeID, Phase: PhasePrep, Database: txn.Database}
+
+	mock.SetDelay(txn.ID, 500*time.Millisecond)
+	otherNodes := []uint64{2}
+
+	ctx, cancel := WithTimeout(3000)
+	defer cancel()
+
+	responses, _, err := wc.executePreparePhase(ctx, txn, req, otherNodes, false)
+
+	AssertNoError(t, err)
+	AssertNodeNotInResponses(t, responses, 2)
 }

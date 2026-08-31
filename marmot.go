@@ -245,6 +245,13 @@ func main() {
 		return
 	}
 
+	// Wire the live DatabaseManager into the catch-up client so that runtime
+	// snapshot restores (anti-entropy, below) write schema versions through the
+	// already-open system MetaStore instead of opening a second handle on the
+	// same Pebble directory, which would deadlock against Pebble's exclusive
+	// lock. Must happen before anti-entropy starts invoking CatchUpFromPeer.
+	catchUpClient.SetDatabaseManager(dbMgr)
+
 	// Initialize CDC notification hub for signal-based change streaming
 	cdcHub := notify.NewHub()
 	dbMgr.SetCDCHub(cdcHub)
@@ -368,8 +375,15 @@ func main() {
 	// Create snapshot function for anti-entropy
 	snapshotFunc := func(ctx context.Context, peerNodeID uint64, peerAddr string, database string) error {
 		// Download snapshot to disk
-		if err := catchUpClient.CatchUpFromPeer(ctx, peerNodeID, peerAddr, database); err != nil {
-			return err
+		catchUpErr := catchUpClient.CatchUpFromPeer(ctx, peerNodeID, peerAddr, database)
+
+		// The download can fail after the snapshot's files were already swapped
+		// onto disk (e.g. restoring schema versions failed post-swap). Reopen
+		// unconditionally whenever that happened, or the node keeps serving the
+		// old connection against freshly-swapped files - even though the
+		// overall catch-up is reported as failed and gets retried.
+		if !marmotgrpc.FilesSwappedDespiteError(catchUpErr) {
+			return catchUpErr
 		}
 
 		// Reload the database connection to pick up the new snapshot file
@@ -380,7 +394,7 @@ func main() {
 		}
 
 		log.Info().Str("database", database).Msg("Database reloaded after snapshot download")
-		return nil
+		return catchUpErr
 	}
 
 	antiEntropy := marmotgrpc.NewAntiEntropyServiceFromConfig(

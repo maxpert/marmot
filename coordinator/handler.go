@@ -153,6 +153,29 @@ func getWriteTimeout() time.Duration {
 	return 300 * time.Second
 }
 
+// getDDLValidationTimeout returns the configured DDL PREPARE validation
+// timeout, or the default (60s). PREPARE for a DDL statement executes the
+// real statement in a rolled-back transaction so a participant can promise a
+// valid COMMIT, which can take far longer than a DML write - so it is bounded
+// separately from write_timeout_ms, not by it.
+func getDDLValidationTimeout() time.Duration {
+	if cfg.Config != nil && cfg.Config.Replication.DDLValidationTimeoutMS > 0 {
+		return time.Duration(cfg.Config.Replication.DDLValidationTimeoutMS) * time.Millisecond
+	}
+	return 60 * time.Second
+}
+
+// writeTimeoutForStatements returns the deadline budget WriteTransaction needs
+// for this transaction: the DDL validation timeout if it carries any DDL
+// statement (PREPARE will execute-and-rollback the real statement for each
+// one), otherwise the regular write timeout.
+func writeTimeoutForStatements(stmts []protocol.Statement) time.Duration {
+	if txnHasDDL(stmts) {
+		return getDDLValidationTimeout()
+	}
+	return getWriteTimeout()
+}
+
 // NodeStatus enum
 type NodeStatus int32
 
@@ -630,7 +653,7 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, params []in
 		RequiredSchemaVersion: schemaVersion,
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), getWriteTimeout())
+	ctx, cancel := context.WithTimeout(context.Background(), writeTimeoutForStatements(txn.Statements))
 	defer cancel()
 
 	// Cancel hook context when done (safe even if nil)
@@ -826,7 +849,7 @@ func (h *CoordinatorHandler) handleVectorControlMutation(
 		Database:              stmt.Database,
 		RequiredSchemaVersion: schemaVersion,
 	}
-	writeCtx, cancel := context.WithTimeout(context.Background(), getWriteTimeout())
+	writeCtx, cancel := context.WithTimeout(context.Background(), writeTimeoutForStatements(txn.Statements))
 	defer cancel()
 	if err := h.writeCoord.WriteTransaction(writeCtx, txn); err != nil {
 		return nil, err
@@ -1254,7 +1277,7 @@ func (h *CoordinatorHandler) handleCommit(session *protocol.ConnectionSession) (
 		}
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), getWriteTimeout())
+	ctx, cancel := context.WithTimeout(context.Background(), writeTimeoutForStatements(txn.Statements))
 	defer cancel()
 
 	err := h.writeCoord.WriteTransaction(ctx, txn)

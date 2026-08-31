@@ -64,7 +64,8 @@ func (b *TxnBuilder) WithCDCStatement(tableName string, oldVals, newVals map[str
 // WithDDLStatement adds a DDL statement
 func (b *TxnBuilder) WithDDLStatement(sql string) *TxnBuilder {
 	stmt := protocol.Statement{
-		SQL: sql,
+		Type: protocol.StatementDDL,
+		SQL:  sql,
 	}
 	b.txn.Statements = append(b.txn.Statements, stmt)
 	return b

@@ -237,6 +237,10 @@ message TransactionResponse {
   // Write-write conflict detection
   bool conflict_detected = 4;
   string conflict_details = 5;
+  // Rejected marks a deterministic refusal of the statement itself during
+  // PREPARE (for example DDL SQLite cannot apply), as opposed to a timeout
+  // or storage error. See db.PrepareResult.Rejected.
+  bool rejected = 6;
 }
 
 message ReadRequest {

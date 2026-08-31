@@ -1,11 +1,21 @@
 package grpc
 
 import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net"
 	"testing"
 
 	"github.com/maxpert/marmot/cfg"
+	"github.com/maxpert/marmot/db"
+	"github.com/maxpert/marmot/hlc"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
 )
 
 // TestDetermineCatchUpStrategy_UsesConfigThreshold verifies that the catch-up strategy
@@ -261,4 +271,119 @@ func TestCatchUpDecision_FieldsPopulated(t *testing.T) {
 	assert.Equal(t, uint64(100), delta.LocalTxnID)
 	assert.Equal(t, uint64(200), delta.PeerTxnID)
 	assert.Equal(t, uint64(100), delta.TxnsBehind)
+}
+
+// Before a DatabaseManager is wired in (the startup join path), schema
+// versions must be persisted by opening the MetaStore directly by path -
+// there is nothing else running yet to hold it open.
+func TestCatchUpClient_PersistSchemaVersions_NoManagerUsesPath(t *testing.T) {
+	dataDir := t.TempDir()
+	registry := NewNodeRegistry(1, "localhost:5001")
+	client := NewCatchUpClient(1, dataDir, registry, nil)
+
+	require.NoError(t, client.persistSchemaVersions(map[string]uint64{"appdb": 6}))
+
+	require.Equal(t, int64(6), readSchemaVersions(t, dataDir)["appdb"])
+}
+
+// Once SetDatabaseManager has been called (the anti-entropy runtime path),
+// persistSchemaVersions must write through the live DatabaseManager instead -
+// opening the MetaStore by path a second time would deadlock against Pebble's
+// exclusive lock, since the DatabaseManager already holds it open.
+func TestCatchUpClient_PersistSchemaVersions_WithManagerUsesLiveStore(t *testing.T) {
+	dataDir := t.TempDir()
+	dbMgr, err := db.NewDatabaseManager(dataDir, 1, hlc.NewClock(1))
+	require.NoError(t, err)
+	defer dbMgr.Close()
+
+	registry := NewNodeRegistry(1, "localhost:5001")
+	client := NewCatchUpClient(1, dataDir, registry, nil)
+	client.SetDatabaseManager(dbMgr)
+
+	require.NoError(t, client.persistSchemaVersions(map[string]uint64{"appdb": 6}))
+
+	systemDB, err := dbMgr.GetDatabase(db.SystemDatabaseName)
+	require.NoError(t, err)
+	got, err := systemDB.GetMetaStore().GetSchemaVersion("appdb")
+	require.NoError(t, err)
+	require.Equal(t, int64(6), got)
+}
+
+// Pins the exact failure this fix removes: without SetDatabaseManager, the
+// runtime path would try to open the system MetaStore a second time while the
+// DatabaseManager already holds it open, and fail. This proves
+// persistSchemaVersions only avoids that failure because it dispatches to the
+// live-manager path once one is set.
+func TestCatchUpClient_PersistSchemaVersions_PathOpenFailsAgainstLiveManager(t *testing.T) {
+	dataDir := t.TempDir()
+	dbMgr, err := db.NewDatabaseManager(dataDir, 1, hlc.NewClock(1))
+	require.NoError(t, err)
+	defer dbMgr.Close()
+
+	registry := NewNodeRegistry(1, "localhost:5001")
+	client := NewCatchUpClient(1, dataDir, registry, nil)
+	// Deliberately do NOT call SetDatabaseManager, to force the path-based
+	// branch while dbMgr is already holding the MetaStore open.
+
+	err = client.persistSchemaVersions(map[string]uint64{"appdb": 6})
+	require.Error(t, err)
+}
+
+// SchemaVersionRestoreError must be detectable through fmt.Errorf's %w
+// wrapping, since applySnapshot's own wrapping and CatchUpFromPeer's
+// "failed to apply snapshot: %w" wrapping both sit between where the error is
+// created and where FilesSwappedDespiteError inspects it.
+func TestFilesSwappedDespiteError(t *testing.T) {
+	require.True(t, FilesSwappedDespiteError(nil), "no error at all means the snapshot succeeded")
+
+	schemaErr := &SchemaVersionRestoreError{err: errors.New("boom")}
+	wrapped := fmt.Errorf("failed to apply snapshot: %w", schemaErr)
+	require.True(t, FilesSwappedDespiteError(wrapped),
+		"a schema-version-restore error means files were already swapped")
+
+	require.False(t, FilesSwappedDespiteError(errors.New("connection refused")),
+		"an unrelated error must not be treated as files-swapped")
+}
+
+// trailerOnlyStreamSnapshotServer implements just enough of MarmotServiceServer
+// to prove schema versions set via stream.SetTrailer on the server side really
+// do arrive at stream.Trailer() on the client side over a real gRPC
+// connection - the mechanism SnapshotVersionsForRestore depends on.
+type trailerOnlyStreamSnapshotServer struct {
+	UnimplementedMarmotServiceServer
+	trailer metadata.MD
+}
+
+func (s *trailerOnlyStreamSnapshotServer) StreamSnapshot(req *SnapshotRequest, stream MarmotService_StreamSnapshotServer) error {
+	stream.SetTrailer(s.trailer)
+	return nil
+}
+
+func TestStreamSnapshotTrailer_PropagatesOverRealGRPCConnection(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer listener.Close()
+
+	wantVersions := map[string]uint64{"appdb": 4, "otherdb": 1}
+	mockServer := &trailerOnlyStreamSnapshotServer{trailer: snapshotSchemaVersionsTrailer(wantVersions)}
+	grpcServer := grpc.NewServer()
+	RegisterMarmotServiceServer(grpcServer, mockServer)
+	go func() { _ = grpcServer.Serve(listener) }()
+	defer grpcServer.Stop()
+
+	conn, err := grpc.NewClient(listener.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	require.NoError(t, err)
+	defer conn.Close()
+
+	client := NewMarmotServiceClient(conn)
+	stream, err := client.StreamSnapshot(context.Background(), &SnapshotRequest{RequestingNodeId: 1})
+	require.NoError(t, err)
+
+	// Drain the stream: trailer metadata is only populated once Recv() has
+	// observed the RPC's end (io.EOF here, since the mock sends no chunks).
+	_, err = stream.Recv()
+	require.ErrorIs(t, err, io.EOF)
+
+	got := SnapshotVersionsForRestore(nil, stream)
+	require.Equal(t, wantVersions, got)
 }

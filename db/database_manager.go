@@ -939,17 +939,27 @@ func (dm *DatabaseManager) checkpointDatabase(db *ReplicatedDatabase) error {
 // 1. Acquires write lock to block all writes
 // 2. Checkpoints all databases (TRUNCATE mode)
 // 3. Copies all database files to the target directory
-// 4. Releases write lock
+// 4. Reads schema versions for the copied databases
+// 5. Releases write lock
 //
 // The caller should stream from the target directory and clean it up when done.
 // This ensures snapshot consistency since files are copied atomically under lock.
-func (dm *DatabaseManager) TakeSnapshotToDir(targetDir string) ([]SnapshotInfo, uint64, error) {
+//
+// Schema versions are read from the system MetaStore in the same locked section
+// that produces the copied files, so the returned versions describe exactly the
+// bytes being handed back - not a value read by some earlier, separate call that
+// a concurrent DDL commit could have moved past. A caller that instead reads
+// schema versions via a different, earlier RPC (e.g. GetSnapshotInfo) can
+// observe a version that no longer matches the file bytes actually streamed
+// later; see SnapshotVersionsForRestore in the grpc package for how that is
+// resolved on the receiving side.
+func (dm *DatabaseManager) TakeSnapshotToDir(targetDir string) ([]SnapshotInfo, uint64, map[string]uint64, error) {
 	// Create target directory structure
 	if err := os.MkdirAll(targetDir, 0755); err != nil {
-		return nil, 0, fmt.Errorf("failed to create snapshot directory: %w", err)
+		return nil, 0, nil, fmt.Errorf("failed to create snapshot directory: %w", err)
 	}
 	if err := os.MkdirAll(filepath.Join(targetDir, "databases"), 0755); err != nil {
-		return nil, 0, fmt.Errorf("failed to create databases directory: %w", err)
+		return nil, 0, nil, fmt.Errorf("failed to create databases directory: %w", err)
 	}
 
 	// Acquire write lock to block all concurrent writes
@@ -963,21 +973,21 @@ func (dm *DatabaseManager) TakeSnapshotToDir(targetDir string) ([]SnapshotInfo, 
 	systemTargetPath := filepath.Join(targetDir, SystemDatabaseName+".db")
 
 	if err := dm.checkpointDatabase(dm.systemDB); err != nil {
-		return nil, 0, fmt.Errorf("failed to checkpoint system database: %w", err)
+		return nil, 0, nil, fmt.Errorf("failed to checkpoint system database: %w", err)
 	}
 
 	if err := copyFile(systemDBPath, systemTargetPath); err != nil {
-		return nil, 0, fmt.Errorf("failed to copy system database: %w", err)
+		return nil, 0, nil, fmt.Errorf("failed to copy system database: %w", err)
 	}
 
 	info, err := os.Stat(systemTargetPath)
 	if err != nil {
-		return nil, 0, fmt.Errorf("failed to stat system database copy: %w", err)
+		return nil, 0, nil, fmt.Errorf("failed to stat system database copy: %w", err)
 	}
 
 	systemSHA256, err := calculateFileSHA256(systemTargetPath)
 	if err != nil {
-		return nil, 0, fmt.Errorf("failed to hash system database: %w", err)
+		return nil, 0, nil, fmt.Errorf("failed to hash system database: %w", err)
 	}
 
 	snapshots = append(snapshots, SnapshotInfo{
@@ -1031,13 +1041,43 @@ func (dm *DatabaseManager) TakeSnapshotToDir(targetDir string) ([]SnapshotInfo, 
 	// Get max committed transaction ID (without lock since we already hold it)
 	maxTxnID := dm.getMaxCommittedTxnIDLocked()
 
+	// Read schema versions in this same locked section, immediately after the
+	// files above were checkpointed and copied, so the versions describe
+	// exactly the bytes being handed back to the caller.
+	schemaVersions := dm.schemaVersionsLocked()
+
 	log.Info().
 		Int("databases", len(snapshots)).
 		Uint64("max_txn_id", maxTxnID).
 		Str("target_dir", targetDir).
 		Msg("Snapshot copied to directory")
 
-	return snapshots, maxTxnID, nil
+	return snapshots, maxTxnID, schemaVersions, nil
+}
+
+// schemaVersionsLocked reads all schema versions from the system MetaStore.
+// Caller must hold dm.mu. Returns an empty map when the versions cannot be
+// read - the snapshot itself is still usable, the receiver simply has nothing
+// to restore and falls back to whatever it already knew.
+func (dm *DatabaseManager) schemaVersionsLocked() map[string]uint64 {
+	metaStore := dm.systemDB.GetMetaStore()
+	if metaStore == nil {
+		return nil
+	}
+
+	stored, err := metaStore.GetAllSchemaVersions()
+	if err != nil {
+		log.Warn().Err(err).Msg("Failed to read schema versions for snapshot")
+		return nil
+	}
+
+	versions := make(map[string]uint64, len(stored))
+	for database, version := range stored {
+		if version > 0 {
+			versions[database] = uint64(version)
+		}
+	}
+	return versions
 }
 
 // TakeSnapshotForDatabase creates a snapshot for a single database.

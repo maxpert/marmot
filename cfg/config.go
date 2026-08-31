@@ -41,18 +41,24 @@ func (c *ClusterConfiguration) GetShutdownGracePeriod() time.Duration {
 
 // ReplicationConfiguration controls replication behavior
 type ReplicationConfiguration struct {
-	DefaultWriteConsist       string `toml:"default_write_consistency"`
-	DefaultReadConsist        string `toml:"default_read_consistency"`
-	WriteTimeoutMS            int    `toml:"write_timeout_ms"`
-	ReadTimeoutMS             int    `toml:"read_timeout_ms"`
-	EnableAntiEntropy         bool   `toml:"enable_anti_entropy"`
-	AntiEntropyIntervalS      int    `toml:"anti_entropy_interval_seconds"`
-	GCIntervalS               int    `toml:"gc_interval_seconds"` // GC interval - MUST be >= anti_entropy_interval_seconds
-	DeltaSyncThresholdTxns    int    `toml:"delta_sync_threshold_transactions"`
-	DeltaSyncThresholdSeconds int    `toml:"delta_sync_threshold_seconds"`
-	GCMinRetentionHours       int    `toml:"gc_min_retention_hours"`
-	GCMaxRetentionHours       int    `toml:"gc_max_retention_hours"`
-	StreamChunkSizeKB         int    `toml:"stream_chunk_size_kb"` // Size in KB for streaming chunks (default: 1024 = 1MB)
+	DefaultWriteConsist string `toml:"default_write_consistency"`
+	DefaultReadConsist  string `toml:"default_read_consistency"`
+	WriteTimeoutMS      int    `toml:"write_timeout_ms"`
+	// DDLValidationTimeoutMS bounds PREPARE for transactions containing DDL.
+	// DDL validation executes the real statement in a rolled-back transaction
+	// so a participant can promise a valid COMMIT, which can take far longer
+	// than a DML write - so it is bounded separately from write_timeout_ms
+	// rather than sharing its deadline.
+	DDLValidationTimeoutMS    int  `toml:"ddl_validation_timeout_ms"`
+	ReadTimeoutMS             int  `toml:"read_timeout_ms"`
+	EnableAntiEntropy         bool `toml:"enable_anti_entropy"`
+	AntiEntropyIntervalS      int  `toml:"anti_entropy_interval_seconds"`
+	GCIntervalS               int  `toml:"gc_interval_seconds"` // GC interval - MUST be >= anti_entropy_interval_seconds
+	DeltaSyncThresholdTxns    int  `toml:"delta_sync_threshold_transactions"`
+	DeltaSyncThresholdSeconds int  `toml:"delta_sync_threshold_seconds"`
+	GCMinRetentionHours       int  `toml:"gc_min_retention_hours"`
+	GCMaxRetentionHours       int  `toml:"gc_max_retention_hours"`
+	StreamChunkSizeKB         int  `toml:"stream_chunk_size_kb"` // Size in KB for streaming chunks (default: 1024 = 1MB)
 }
 
 // MySQLConfiguration for MySQL wire protocol server
@@ -272,6 +278,7 @@ var Config = &Configuration{
 		DefaultWriteConsist:       "QUORUM",
 		DefaultReadConsist:        "LOCAL_ONE",
 		WriteTimeoutMS:            5000,
+		DDLValidationTimeoutMS:    60000,
 		ReadTimeoutMS:             2000,
 		EnableAntiEntropy:         true,
 		AntiEntropyIntervalS:      30,    // 30s - frequent watermark updates (was 60s, flipped for GC safety)

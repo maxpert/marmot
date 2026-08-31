@@ -963,7 +963,7 @@ func TestReplica_DoesNotReceiveSystemDBFromPrimary(t *testing.T) {
 	}
 
 	snapshotDir := filepath.Join(primaryDir, "snapshot")
-	snapshots, _, err := primaryDM.TakeSnapshotToDir(snapshotDir)
+	snapshots, _, _, err := primaryDM.TakeSnapshotToDir(snapshotDir)
 	if err != nil {
 		t.Fatalf("Failed to take snapshot: %v", err)
 	}
@@ -1044,6 +1044,60 @@ func TestReplica_DoesNotReceiveSystemDBFromPrimary(t *testing.T) {
 	}
 
 	t.Log("✓ Replica does not receive system DB from primary during snapshot")
+}
+
+// TakeSnapshotToDir must return the schema versions it read in the same
+// locked section that produced the copied files, so a caller streaming those
+// exact bytes later can advertise a version that actually matches them -
+// instead of a value read by an earlier, separate call that a concurrent DDL
+// commit could move past.
+func TestTakeSnapshotToDir_ReturnsSchemaVersionsCapturedWithFiles(t *testing.T) {
+	dm, tmpDir := setupTestDatabaseManager(t)
+	defer dm.Close()
+
+	if err := dm.CreateDatabase("appdb"); err != nil {
+		t.Fatalf("Failed to create appdb: %v", err)
+	}
+
+	systemMeta := dm.GetSystemDatabase().GetMetaStore()
+	if err := systemMeta.UpdateSchemaVersion("appdb", 5, "CREATE TABLE t(id INT)", 1); err != nil {
+		t.Fatalf("Failed to seed schema version: %v", err)
+	}
+
+	snapshotDir := filepath.Join(tmpDir, "snapshot")
+	_, _, schemaVersions, err := dm.TakeSnapshotToDir(snapshotDir)
+	if err != nil {
+		t.Fatalf("TakeSnapshotToDir failed: %v", err)
+	}
+
+	if got := schemaVersions["appdb"]; got != 5 {
+		t.Errorf("Expected schema version 5 for appdb, got %d", got)
+	}
+
+	// A version bumped AFTER the snapshot was taken must not appear in the
+	// already-returned map - it describes the files copied above, not
+	// whatever the live database does next.
+	if err := systemMeta.UpdateSchemaVersion("appdb", 6, "ALTER TABLE t ADD COLUMN x", 2); err != nil {
+		t.Fatalf("Failed to bump schema version after snapshot: %v", err)
+	}
+	if got := schemaVersions["appdb"]; got != 5 {
+		t.Errorf("Snapshot's schema versions map must not reflect a later change, got %d", got)
+	}
+}
+
+func TestTakeSnapshotToDir_NoSchemaVersionsIsEmptyMap(t *testing.T) {
+	dm, tmpDir := setupTestDatabaseManager(t)
+	defer dm.Close()
+
+	snapshotDir := filepath.Join(tmpDir, "snapshot")
+	_, _, schemaVersions, err := dm.TakeSnapshotToDir(snapshotDir)
+	if err != nil {
+		t.Fatalf("TakeSnapshotToDir failed: %v", err)
+	}
+
+	if len(schemaVersions) != 0 {
+		t.Errorf("Expected no schema versions for a database manager with no DDL applied, got %v", schemaVersions)
+	}
 }
 
 // TestReplica_SnapshotExcludesSystemDB tests that snapshot preparation excludes system DB for replicas

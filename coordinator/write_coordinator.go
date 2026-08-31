@@ -312,6 +312,19 @@ func isDMLStatement(stmtType protocol.StatementCode) bool {
 	}
 }
 
+// txnHasDDL reports whether any statement is DDL. PREPARE validates DDL by
+// executing the real statement in a rolled-back transaction, which can take
+// far longer than a DML write, so a transaction carrying DDL needs the DDL
+// validation timeout rather than the regular write timeout.
+func txnHasDDL(stmts []protocol.Statement) bool {
+	for _, stmt := range stmts {
+		if stmt.Type == protocol.StatementDDL {
+			return true
+		}
+	}
+	return false
+}
+
 // estimateCDCPayloadSize estimates the CDC payload size for a transaction.
 // Used to decide between regular RPC and streaming for large payloads.
 func estimateCDCPayloadSize(statements []protocol.Statement) int {
@@ -330,7 +343,7 @@ func (wc *WriteCoordinator) runPreparePhase(ctx context.Context, txn *Transactio
 
 	// Execute prepare phase on all nodes (including self) - single attempt, no retry
 	// All nodes now participate uniformly - no skipLocalReplication
-	prepResponses, prepErr := wc.executePreparePhase(ctx, txn, prepReq, otherNodes, false)
+	prepResponses, remoteRejection, prepErr := wc.executePreparePhase(ctx, txn, prepReq, otherNodes, false)
 	telemetry.TwoPhaseQuorumAcks.With("prepare").Observe(float64(len(prepResponses)))
 
 	// A local rejection (invalid DDL, missing table, ...) is final - surface the
@@ -363,6 +376,23 @@ func (wc *WriteCoordinator) runPreparePhase(ctx context.Context, txn *Transactio
 	// Check if quorum was achieved
 	totalAcks := len(prepResponses)
 	if totalAcks < cluster.RequiredQuorum {
+		// A remote rejection carries no veto on its own - it only replaces the
+		// retry signal once quorum has separately failed to form. Retrying a
+		// transaction one participant deterministically refused cannot succeed,
+		// so surface that participant's own reason instead of a generic
+		// quorum-not-achieved error the client would otherwise retry forever.
+		if remoteRejection != nil {
+			log.Warn().
+				Uint64("txn_id", txn.ID).
+				Uint64("node_id", remoteRejection.NodeID).
+				Str("reason", remoteRejection.Reason).
+				Int("total_acks", totalAcks).
+				Int("required_quorum", cluster.RequiredQuorum).
+				Msg("Prepare quorum not achieved and a remote participant rejected the transaction - aborting")
+
+			return nil, remoteRejection
+		}
+
 		log.Warn().
 			Uint64("txn_id", txn.ID).
 			Int("total_acks", totalAcks).
@@ -399,7 +429,11 @@ func (wc *WriteCoordinator) runPreparePhase(ctx context.Context, txn *Transactio
 
 // sendRemoteCommits launches goroutines to send commit requests to remote nodes.
 // Uses streaming for large payloads (≥128KB) if the replicator supports it.
-func (wc *WriteCoordinator) sendRemoteCommits(_ context.Context, preparedNodes map[uint64]*ReplicationResponse, req *ReplicationRequest, txnID uint64) chan response {
+// commitTimeout bounds each remote COMMIT RPC; the caller (runCommitPhase)
+// decides its value from the transaction's statements so a DDL COMMIT gets
+// the same DDL-aware budget PREPARE was given, instead of the fixed regular
+// write timeout.
+func (wc *WriteCoordinator) sendRemoteCommits(_ context.Context, preparedNodes map[uint64]*ReplicationResponse, req *ReplicationRequest, txnID uint64, commitTimeout time.Duration) chan response {
 	// Count other prepared nodes (excluding self)
 	otherPreparedNodes := 0
 	for nodeID := range preparedNodes {
@@ -433,8 +467,11 @@ func (wc *WriteCoordinator) sendRemoteCommits(_ context.Context, preparedNodes m
 			Uint64("target_node", nodeID).
 			Msg("sending COMMIT to remote node")
 		go func(nid uint64) {
-			// Use detached context - remote commits should complete even if parent cancelled
-			commitCtx, commitCancel := context.WithTimeout(context.Background(), wc.timeout)
+			// Use detached context - remote commits should complete even if parent cancelled.
+			// Bounded by commitTimeout (not wc.timeout): the remote already promised at
+			// PREPARE it can commit, and for a DDL transaction that can take far longer
+			// than the regular write timeout.
+			commitCtx, commitCancel := context.WithTimeout(context.Background(), commitTimeout)
 			defer commitCancel()
 
 			var resp *ReplicationResponse
@@ -451,8 +488,11 @@ func (wc *WriteCoordinator) sendRemoteCommits(_ context.Context, preparedNodes m
 	return commitChan
 }
 
-// waitForRemoteQuorum collects remote commit responses until quorum is achieved or timeout
-func (wc *WriteCoordinator) waitForRemoteQuorum(commitChan chan response, otherPreparedNodes int, remoteQuorumNeeded int, txnID uint64) (map[uint64]*ReplicationResponse, int) {
+// waitForRemoteQuorum collects remote commit responses until quorum is achieved or timeout.
+// commitTimeout must match the budget sendRemoteCommits gave each remote RPC:
+// this collector gives up on a per-response basis with the same bound, so a
+// mismatch here would abandon a response sendRemoteCommits is still waiting on.
+func (wc *WriteCoordinator) waitForRemoteQuorum(commitChan chan response, otherPreparedNodes int, remoteQuorumNeeded int, txnID uint64, commitTimeout time.Duration) (map[uint64]*ReplicationResponse, int) {
 	commitResponses := make(map[uint64]*ReplicationResponse)
 
 	// STEP 2: Collect remote commit responses until we have enough for quorum
@@ -476,7 +516,7 @@ func (wc *WriteCoordinator) waitForRemoteQuorum(commitChan chan response, otherP
 				}
 				log.Error().Err(r.err).Uint64("node_id", r.nodeID).Str("resp_error", errMsg).Msg("Remote commit failed")
 			}
-		case <-time.After(wc.timeout):
+		case <-time.After(commitTimeout):
 			log.Warn().
 				Uint64("txn_id", txnID).
 				Int("remote_acks", remoteAcks).
@@ -558,11 +598,18 @@ func (wc *WriteCoordinator) runCommitPhase(ctx context.Context, txn *Transaction
 	// Note: selfPrepared is guaranteed to be true at this point (checked above)
 	remoteQuorumNeeded := cluster.RequiredQuorum - 1 // We'll add local commit after
 
+	// A transaction carrying DDL needs the same DDL-aware budget for COMMIT
+	// that PREPARE was given: a participant that ACKed PREPARE promised it can
+	// COMMIT, and applying DDL can take far longer than the regular write
+	// timeout. Using the same writeTimeoutForStatements source of truth as
+	// PREPARE keeps both phases consistent for a given transaction.
+	commitTimeout := writeTimeoutForStatements(txn.Statements)
+
 	// Send commit requests to remote nodes
-	commitChan := wc.sendRemoteCommits(ctx, prepResponses, commitReq, txn.ID)
+	commitChan := wc.sendRemoteCommits(ctx, prepResponses, commitReq, txn.ID, commitTimeout)
 
 	// Wait for remote quorum
-	commitResponses, remoteAcks := wc.waitForRemoteQuorum(commitChan, otherPreparedNodes, remoteQuorumNeeded, txn.ID)
+	commitResponses, remoteAcks := wc.waitForRemoteQuorum(commitChan, otherPreparedNodes, remoteQuorumNeeded, txn.ID, commitTimeout)
 
 	// STEP 3: Check if we got enough remote ACKs
 	if remoteAcks < remoteQuorumNeeded {
@@ -655,9 +702,12 @@ type response struct {
 }
 
 // executePreparePhase broadcasts prepare requests to all nodes and collects responses.
-// Returns successful responses and a conflict error if any node reports a conflict.
+// Returns successful responses, the first remote (non-local) explicit rejection seen (if
+// any - the caller decides whether it matters, since a remote rejection alone must not
+// veto a transaction that otherwise reaches quorum), and a conflict error if any node
+// reports a conflict.
 func (wc *WriteCoordinator) executePreparePhase(ctx context.Context, txn *Transaction, prepReq *ReplicationRequest,
-	otherNodes []uint64, skipLocalReplication bool) (map[uint64]*ReplicationResponse, error) {
+	otherNodes []uint64, skipLocalReplication bool) (map[uint64]*ReplicationResponse, *RemotePrepareRejectedError, error) {
 
 	// Calculate total nodes to contact
 	totalNodes := len(otherNodes)
@@ -668,18 +718,28 @@ func (wc *WriteCoordinator) executePreparePhase(ctx context.Context, txn *Transa
 	if totalNodes == 0 {
 		// No nodes to contact - this is OK if local execution was already done
 		// Return empty map, caller will add self if skipLocalReplication was true
-		return make(map[uint64]*ReplicationResponse), nil
+		return make(map[uint64]*ReplicationResponse), nil, nil
 	}
 
 	// Channel for collecting responses
 	prepChan := make(chan response, totalNodes)
+
+	// A transaction carrying DDL needs the DDL validation timeout here, not the
+	// regular write timeout: PREPARE executes the real statement in a
+	// rolled-back transaction on every participant, including remote nodes -
+	// the deadline set on prepCtx below propagates over gRPC as the incoming
+	// context each participant validates under.
+	prepTimeout := wc.timeout
+	if txnHasDDL(txn.Statements) {
+		prepTimeout = getDDLValidationTimeout()
+	}
 
 	// Every PREPARE call is bounded by the same timeout the collector gives up
 	// after. Without it an abandoned call can still durably prepare a transaction
 	// the coordinator has already stopped tracking. PREPARE does real work -
 	// persisting intents and validating DDL - so this window is not theoretical.
 	dispatch := func(nodeID uint64, replicator Replicator) {
-		prepCtx, cancel := context.WithTimeout(ctx, wc.timeout)
+		prepCtx, cancel := context.WithTimeout(ctx, prepTimeout)
 		defer cancel()
 
 		resp, err := replicator.ReplicateTransaction(prepCtx, nodeID, prepReq)
@@ -700,6 +760,7 @@ func (wc *WriteCoordinator) executePreparePhase(ctx context.Context, txn *Transa
 	prepResponses := make(map[uint64]*ReplicationResponse)
 	var conflictErr error
 	var localErr error
+	var remoteRejection *RemotePrepareRejectedError
 
 	for i := 0; i < totalNodes; i++ {
 		select {
@@ -736,15 +797,25 @@ func (wc *WriteCoordinator) executePreparePhase(ctx context.Context, txn *Transa
 				// Only an explicit rejection is a final answer. Anything else - a
 				// timeout, a storage error - must fall through to the quorum check so
 				// it stays retryable, exactly as before DDL was validated here.
-				if r.nodeID == wc.nodeID && r.resp.Rejected {
+				if r.resp.Rejected {
 					reason := r.resp.Error
-					if reason == "" {
-						reason = "local prepare rejected the transaction"
+					if r.nodeID == wc.nodeID {
+						if reason == "" {
+							reason = "local prepare rejected the transaction"
+						}
+						localErr = &LocalPrepareError{Reason: reason}
+					} else if remoteRejection == nil {
+						// A remote rejection does not by itself abort the transaction -
+						// it has no veto over quorum. It is only surfaced by the caller
+						// as a final answer if quorum also fails to form.
+						if reason == "" {
+							reason = "remote prepare rejected the transaction"
+						}
+						remoteRejection = &RemotePrepareRejectedError{NodeID: r.nodeID, Reason: reason}
 					}
-					localErr = &LocalPrepareError{Reason: reason}
 				}
 			}
-		case <-time.After(wc.timeout):
+		case <-time.After(prepTimeout):
 			log.Warn().
 				Uint64("txn_id", txn.ID).
 				Msg("Prepare phase timeout waiting for responses")
@@ -756,13 +827,13 @@ func (wc *WriteCoordinator) executePreparePhase(ctx context.Context, txn *Transa
 	// failures and missing responses are not rejections - they fall through to the
 	// quorum check.
 	if localErr != nil {
-		return prepResponses, localErr
+		return prepResponses, remoteRejection, localErr
 	}
 
 	// If any conflict was detected, return the error
 	if conflictErr != nil {
-		return prepResponses, conflictErr
+		return prepResponses, remoteRejection, conflictErr
 	}
 
-	return prepResponses, nil
+	return prepResponses, remoteRejection, nil
 }

@@ -187,9 +187,11 @@ func (re *ReplicationEngine) prepareRegularTransaction(ctx context.Context, req 
 	if ddlSQL := ddlStatementsToValidate(req.Statements); len(ddlSQL) > 0 {
 		if err := txnMgr.ValidateDDL(ctx, ddlSQL); err != nil {
 			// Only a verdict on the statement itself is a rejection. A cancelled or
-			// timed-out validation says nothing about the DDL, so it must stay a
-			// missing ACK the coordinator can retry rather than a final answer.
-			rejected := ctx.Err() == nil && !isContextError(err)
+			// timed-out validation, or a transient SQLite condition such as a
+			// shared-cache lock race with hookDB (SQLITE_LOCKED, SQLITE_BUSY), says
+			// nothing about the DDL, so it must stay a missing ACK the coordinator
+			// can retry rather than a final answer.
+			rejected := isDDLRejection(ctx, err)
 			log.Debug().
 				Err(err).
 				Uint64("txn_id", req.TxnID).

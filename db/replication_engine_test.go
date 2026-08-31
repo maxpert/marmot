@@ -3,7 +3,9 @@ package db
 import (
 	"context"
 	"testing"
+	"time"
 
+	"github.com/maxpert/marmot/cfg"
 	"github.com/maxpert/marmot/encoding"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/protocol"
@@ -1001,4 +1003,94 @@ func TestReplicationEngine_PrepareInvalidDDLIsRejection(t *testing.T) {
 	require.False(t, result.Success)
 	require.True(t, result.Rejected, "invalid DDL must be a final rejection")
 	require.True(t, result.ToCoordinatorResponse().Rejected, "rejection must survive the coordinator conversion")
+}
+
+// A DDL that loses a lock race against a concurrent DML on the same table via
+// hookDB must not be treated as a final rejection.
+//
+// db_integration.go documents writeDB and hookDB as sharing one SQLite page
+// cache via "cache=shared" so contention between them surfaces as immediate
+// SQLITE_LOCKED. In practice the DSN mattn's driver receives here is a plain
+// filesystem path with no "file:" scheme prefix, and the driver only forwards
+// query parameters (including cache=shared) to SQLite when the DSN starts
+// with "file:" - otherwise it strips them before opening
+// (github.com/mattn/go-sqlite3@v1.14.24/sqlite3.go:1450). So cache=shared is
+// silently dropped today, and contention between the two connections is an
+// ordinary whole-file SQLITE_BUSY bounded by busy_timeout, not SQLITE_LOCKED.
+// Confirmed empirically: with the exact DSN shape db_integration.go builds,
+// the error is "database is locked" with Code=sqlite3.ErrBusy, not
+// "database table is locked" with Code=sqlite3.ErrLocked. This is a
+// pre-existing gap in db_integration.go, outside this fix's scope; it is
+// exercised here, not fixed, because it changes what this test must prove.
+// Either way the classifier must not reject: SQLITE_BUSY is transient too.
+func TestReplicationEngine_PrepareHookDBLockContentionIsNotRejection(t *testing.T) {
+	// Shrink the busy-wait window so the test doesn't block for the default
+	// 50s lock_wait_timeout_seconds while still forcing a real wait long
+	// enough to prove genuine contention, not a fluke.
+	originalTimeout := cfg.Config.Transaction.LockWaitTimeoutSeconds
+	cfg.Config.Transaction.LockWaitTimeoutSeconds = 1
+	t.Cleanup(func() { cfg.Config.Transaction.LockWaitTimeoutSeconds = originalTimeout })
+
+	engine, dm, cleanup := setupTestReplicationEngine(t)
+	defer cleanup()
+
+	require.NoError(t, dm.CreateDatabase("testdb"))
+	replicatedDB, err := dm.GetDatabase("testdb")
+	require.NoError(t, err)
+
+	ctx := context.Background()
+
+	createReq := &PrepareRequest{
+		TxnID:    2301,
+		NodeID:   1,
+		StartTS:  hlc.Timestamp{WallTime: 1000, Logical: 1},
+		Database: "testdb",
+		Statements: []protocol.Statement{{
+			Type:      protocol.StatementDDL,
+			SQL:       "CREATE TABLE locked_t (id INTEGER PRIMARY KEY, val TEXT)",
+			TableName: "locked_t",
+		}},
+	}
+	require.True(t, engine.Prepare(ctx, createReq).Success)
+	commitResult := engine.Commit(ctx, &CommitRequest{
+		TxnID:      2301,
+		Database:   "testdb",
+		Statements: createReq.Statements,
+	})
+	require.True(t, commitResult.Success, "setup commit failed: %s", commitResult.Error)
+
+	// Hold a write lock on locked_t via hookDB - the same connection
+	// ExecuteLocalWithHooks uses for CDC capture - to reproduce the real
+	// production race rather than a synthetic stand-in.
+	hookTx, err := replicatedDB.hookDB.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = hookTx.Rollback() })
+	_, err = hookTx.ExecContext(ctx, "INSERT INTO locked_t (id, val) VALUES (1, 'x')")
+	require.NoError(t, err)
+
+	start := time.Now()
+	ddlReq := &PrepareRequest{
+		TxnID:    2302,
+		NodeID:   1,
+		StartTS:  hlc.Timestamp{WallTime: 2000, Logical: 1},
+		Database: "testdb",
+		Statements: []protocol.Statement{{
+			Type:      protocol.StatementDDL,
+			SQL:       "ALTER TABLE locked_t ADD COLUMN extra TEXT",
+			TableName: "locked_t",
+		}},
+	}
+	result := engine.Prepare(ctx, ddlReq)
+	elapsed := time.Since(start)
+
+	require.False(t, result.Success, "DDL contending for the hookDB lock must not succeed while the lock is held")
+	// Premise: the failure actually is lock contention with hookDB, not some
+	// unrelated failure, and it genuinely waited out busy_timeout rather than
+	// failing for a different reason entirely.
+	require.Contains(t, result.Error, "locked", "premise failed: expected a lock-contention failure")
+	require.GreaterOrEqual(t, elapsed, 900*time.Millisecond, "premise failed: did not wait out busy_timeout - contention was not provoked")
+	require.Less(t, elapsed, 5*time.Second, "premise failed: took far longer than the 1s busy_timeout budget")
+
+	require.False(t, result.Rejected,
+		"lock contention on this node is a transient condition, not a verdict on the DDL - it must stay a retryable missing ACK")
 }

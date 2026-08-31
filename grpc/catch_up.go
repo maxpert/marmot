@@ -3,10 +3,12 @@ package grpc
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/maxpert/marmot/cfg"
@@ -34,6 +36,16 @@ type CatchUpClient struct {
 	dataDir   string
 	registry  *NodeRegistry
 	seedAddrs []string
+
+	// dbManager is set once the DatabaseManager exists (after the startup join
+	// path completes). Anti-entropy snapshot repairs run at runtime, long after
+	// NewDatabaseManager has opened the system MetaStore on this same dataDir -
+	// so restoring schema versions must write through that live store instead
+	// of opening a second handle on the same Pebble directory, which deadlocks
+	// against Pebble's per-process exclusive lock. nil during the startup join
+	// path, where no DatabaseManager exists yet and the MetaStore is opened
+	// directly by path.
+	dbManager atomic.Pointer[db.DatabaseManager]
 }
 
 // NewCatchUpClient creates a new catch-up client
@@ -44,6 +56,50 @@ func NewCatchUpClient(nodeID uint64, dataDir string, registry *NodeRegistry, see
 		registry:  registry,
 		seedAddrs: seedAddrs,
 	}
+}
+
+// SetDatabaseManager wires the live DatabaseManager once it exists, so runtime
+// snapshot restores (anti-entropy) write schema versions through the
+// already-open system MetaStore rather than opening a second handle on the
+// same Pebble directory. Must be called before anti-entropy starts invoking
+// CatchUpFromPeer.
+func (c *CatchUpClient) SetDatabaseManager(dbMgr *db.DatabaseManager) {
+	c.dbManager.Store(dbMgr)
+}
+
+// persistSchemaVersions restores a snapshot's schema versions, writing through
+// the live DatabaseManager's system MetaStore when one is available (the
+// anti-entropy runtime path), or by opening the MetaStore directly by path
+// when it is not (the startup join path, before the DatabaseManager exists).
+func (c *CatchUpClient) persistSchemaVersions(versions map[string]uint64) error {
+	if dbMgr := c.dbManager.Load(); dbMgr != nil {
+		return persistSnapshotSchemaVersionsViaManager(dbMgr, versions)
+	}
+	return persistSnapshotSchemaVersions(c.dataDir, versions)
+}
+
+// SchemaVersionRestoreError indicates that a snapshot's database files were
+// already swapped onto disk before restoring its schema versions failed. A
+// caller that reopens database connections only on success must still reopen
+// them when it sees this error: the files changed underneath the old
+// connection regardless of whether the schema version could be recorded.
+type SchemaVersionRestoreError struct {
+	err error
+}
+
+func (e *SchemaVersionRestoreError) Error() string { return e.err.Error() }
+func (e *SchemaVersionRestoreError) Unwrap() error { return e.err }
+
+// FilesSwappedDespiteError reports whether err indicates that a snapshot's
+// database files were already swapped onto disk, even though the overall
+// catch-up operation failed. Callers must still reopen database connections in
+// that case, or they keep serving stale connections against fresh files.
+func FilesSwappedDespiteError(err error) bool {
+	if err == nil {
+		return true
+	}
+	var schemaErr *SchemaVersionRestoreError
+	return errors.As(err, &schemaErr)
 }
 
 // CatchUpFromPeer downloads a snapshot of a specific database from a peer
@@ -240,11 +296,18 @@ func (c *CatchUpClient) applySnapshot(ctx context.Context, client MarmotServiceC
 		return fmt.Errorf("snapshot restore failed: %w", err)
 	}
 
-	// Restore the schema versions the snapshot was taken at. Skipping this leaves
-	// the node reporting version 0, after which it refuses every transaction that
-	// requires a newer schema and can never rejoin replication.
-	if err := persistSnapshotSchemaVersions(c.dataDir, info.DatabaseMetadata); err != nil {
-		return fmt.Errorf("failed to restore schema versions from snapshot: %w", err)
+	// From this point on the snapshot's files are already swapped onto disk.
+	// Restore the schema versions the snapshot was taken at - skipping this
+	// leaves the node reporting version 0, after which it refuses every
+	// transaction that requires a newer schema and can never rejoin
+	// replication. Prefer the versions captured atomically with these exact
+	// files (the stream trailer) over the earlier, potentially stale read from
+	// GetSnapshotInfo.
+	versions := SnapshotVersionsForRestore(info.DatabaseMetadata, stream)
+	if err := c.persistSchemaVersions(versions); err != nil {
+		return &SchemaVersionRestoreError{
+			err: fmt.Errorf("failed to restore schema versions from snapshot: %w", err),
+		}
 	}
 
 	log.Info().
