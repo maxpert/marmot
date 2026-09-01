@@ -198,7 +198,7 @@ func (s *MySQLServer) processLoadDataQuery(conn io.ReadWriter, session *Connecti
 			rowsAffected = rs.RowsAffected
 			lastInsertID = rs.LastInsertId
 		}
-		return s.writeOK(conn, lastSeq+1, rowsAffected, lastInsertID)
+		return s.writeOK(conn, lastSeq+1, session, rowsAffected, lastInsertID)
 	}
 
 	spec, err := parseLoadDataLocalSpec(query)
@@ -209,7 +209,7 @@ func (s *MySQLServer) processLoadDataQuery(conn io.ReadWriter, session *Connecti
 	if err != nil {
 		return err
 	}
-	return s.writeOK(conn, lastSeq+1, rows, lastInsertID)
+	return s.writeOK(conn, lastSeq+1, session, rows, lastInsertID)
 }
 
 // ExecuteLoadDataLocal applies LOAD DATA LOCAL payload by translating to parameterized INSERT batches.

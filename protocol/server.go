@@ -180,6 +180,18 @@ type LoadDataHandler interface {
 	HandleLoadData(session *ConnectionSession, sql string, data []byte) (*ResultSet, error)
 }
 
+// ResultColumnDescriber is an optional extension for handlers that can report
+// the columns a statement returns without running it.
+//
+// COM_STMT_PREPARE must describe the result set, because clients build their
+// column-name index from that response; a server that reports no columns leaves
+// strict clients unable to address any column by name, even though the rows
+// themselves arrive intact. Handlers that cannot describe a statement return no
+// columns and the prepare response omits the definitions.
+type ResultColumnDescriber interface {
+	DescribeResultColumns(session *ConnectionSession, sql string) ([]ColumnDef, error)
+}
+
 // ResultSet represents a MySQL result set
 type ResultSet struct {
 	Columns        []ColumnDef
@@ -418,7 +430,7 @@ func (s *MySQLServer) handleConnection(conn net.Conn) {
 	}
 
 	// 3. Send OK Packet (Authentication successful)
-	if err := s.writeOK(conn, 2, 0, 0); err != nil {
+	if err := s.writeOK(conn, 2, session, 0, 0); err != nil {
 		log.Error().Err(err).Msg("Failed to write OK packet")
 		return
 	}
@@ -451,7 +463,7 @@ func (s *MySQLServer) handleConnection(conn net.Conn) {
 			dbName := string(payload[1:])
 			session.CurrentDatabase = dbName
 			log.Debug().Uint64("conn_id", session.ConnID).Str("database", dbName).Msg("Changed database")
-			_ = s.writeOK(conn, 1, 0, 0)
+			_ = s.writeOK(conn, 1, session, 0, 0)
 		case 0x03: // COM_QUERY
 			query := string(payload[1:])
 			s.processQuery(conn, session, query)
@@ -471,7 +483,7 @@ func (s *MySQLServer) handleConnection(conn net.Conn) {
 			}
 			// COM_STMT_CLOSE doesn't send a response
 		case 0x0E: // COM_PING
-			_ = s.writeOK(conn, 1, 0, 0)
+			_ = s.writeOK(conn, 1, session, 0, 0)
 		case 0x01: // COM_QUIT
 			return
 		default:
@@ -508,12 +520,12 @@ func (s *MySQLServer) processQuery(conn net.Conn, session *ConnectionSession, qu
 				session.LastInsertId.Store(lastInsertId)
 			}
 		}
-		_ = s.writeOK(conn, 1, rowsAffected, lastInsertId)
+		_ = s.writeOK(conn, 1, session, rowsAffected, lastInsertId)
 		return
 	}
 
 	// Send Result Set
-	_ = s.writeResultSet(conn, 1, rs)
+	_ = s.writeResultSet(conn, 1, session, rs)
 }
 
 // --- Packet Writing Helpers ---
@@ -575,7 +587,24 @@ func (s *MySQLServer) writeHandshake(w io.Writer) error {
 	return s.writePacket(w, 0, buf.Bytes())
 }
 
-func (s *MySQLServer) writeOK(w io.Writer, seq byte, rowsAffected, lastInsertId int64) error {
+// MySQL server status flags reported in OK and EOF packets.
+const (
+	serverStatusInTrans    uint16 = 0x0001
+	serverStatusAutocommit uint16 = 0x0002
+)
+
+// sessionStatusFlags reports the server status for a session. Clients read this
+// to track transaction state: after BEGIN they expect SERVER_STATUS_IN_TRANS,
+// and a server that only ever claims autocommit leaves them unable to confirm
+// their transaction started.
+func sessionStatusFlags(session *ConnectionSession) uint16 {
+	if session != nil && session.InTransaction() {
+		return serverStatusInTrans
+	}
+	return serverStatusAutocommit
+}
+
+func (s *MySQLServer) writeOK(w io.Writer, seq byte, session *ConnectionSession, rowsAffected, lastInsertId int64) error {
 	buf := getBuffer()
 	defer putBuffer(buf)
 	buf.WriteByte(0x00) // OK packet header
@@ -584,9 +613,19 @@ func (s *MySQLServer) writeOK(w io.Writer, seq byte, rowsAffected, lastInsertId 
 	// Last insert ID (length-encoded integer)
 	buf.Write(packLengthEncodedInt(uint64(lastInsertId)))
 	// Status flags
-	_ = binary.Write(buf, binary.LittleEndian, uint16(0x0002)) // SERVER_STATUS_AUTOCOMMIT
+	_ = binary.Write(buf, binary.LittleEndian, sessionStatusFlags(session))
 	// Warnings
 	_ = binary.Write(buf, binary.LittleEndian, uint16(0))
+	return s.writePacket(w, seq, buf.Bytes())
+}
+
+// writeEOF writes an EOF packet carrying the session's current status flags.
+func (s *MySQLServer) writeEOF(w io.Writer, seq byte, session *ConnectionSession) error {
+	buf := getBuffer()
+	defer putBuffer(buf)
+	buf.WriteByte(0xFE)
+	_ = binary.Write(buf, binary.LittleEndian, uint16(0)) // warnings
+	_ = binary.Write(buf, binary.LittleEndian, sessionStatusFlags(session))
 	return s.writePacket(w, seq, buf.Bytes())
 }
 
@@ -612,7 +651,7 @@ func (s *MySQLServer) writeMySQLErr(w io.Writer, seq byte, err error) error {
 	return s.writeErrorWithState(w, seq, mysqlErr.Code, mysqlErr.SQLState, mysqlErr.Message)
 }
 
-func (s *MySQLServer) writeResultSet(w io.Writer, seq byte, rs *ResultSet) error {
+func (s *MySQLServer) writeResultSet(w io.Writer, seq byte, session *ConnectionSession, rs *ResultSet) error {
 	// 1. Column Count
 	if err := s.writePacket(w, seq, packLengthEncodedInt(uint64(len(rs.Columns)))); err != nil {
 		return err
@@ -624,21 +663,7 @@ func (s *MySQLServer) writeResultSet(w io.Writer, seq byte, rs *ResultSet) error
 	defer putBuffer(colBuf)
 	for _, col := range rs.Columns {
 		colBuf.Reset()
-
-		writeLenEncString(colBuf, "def")    // Catalog
-		writeLenEncString(colBuf, "")       // Schema
-		writeLenEncString(colBuf, "tbl")    // Table
-		writeLenEncString(colBuf, "tbl")    // Org Table
-		writeLenEncString(colBuf, col.Name) // Name
-		writeLenEncString(colBuf, col.Name) // Org Name
-
-		colBuf.WriteByte(0x0c)                                      // Length of fixed fields
-		_ = binary.Write(colBuf, binary.LittleEndian, uint16(45))   // Charset (utf8mb4_general_ci)
-		_ = binary.Write(colBuf, binary.LittleEndian, uint32(1024)) // Length
-		colBuf.WriteByte(col.Type)                                  // Type
-		_ = binary.Write(colBuf, binary.LittleEndian, uint16(0))    // Flags
-		colBuf.WriteByte(0)                                         // Decimals
-		colBuf.Write([]byte{0, 0})                                  // Filler
+		writeColumnDefinition(colBuf, col)
 
 		if err := s.writePacket(w, seq, colBuf.Bytes()); err != nil {
 			return err
@@ -647,7 +672,7 @@ func (s *MySQLServer) writeResultSet(w io.Writer, seq byte, rs *ResultSet) error
 	}
 
 	// 3. EOF Packet
-	if err := s.writePacket(w, seq, []byte{0xFE, 0, 0, 0x02, 0}); err != nil {
+	if err := s.writeEOF(w, seq, session); err != nil {
 		return err
 	}
 	seq++
@@ -661,8 +686,7 @@ func (s *MySQLServer) writeResultSet(w io.Writer, seq byte, rs *ResultSet) error
 			if val == nil {
 				rowBuf.WriteByte(0xFB) // NULL
 			} else {
-				strVal := fmt.Sprintf("%v", val)
-				writeLenEncString(rowBuf, strVal)
+				writeLenEncString(rowBuf, FormatTextValue(val))
 			}
 		}
 		if err := s.writePacket(w, seq, rowBuf.Bytes()); err != nil {
@@ -672,12 +696,12 @@ func (s *MySQLServer) writeResultSet(w io.Writer, seq byte, rs *ResultSet) error
 	}
 
 	// 5. EOF Packet
-	return s.writePacket(w, seq, []byte{0xFE, 0, 0, 0x02, 0})
+	return s.writeEOF(w, seq, session)
 }
 
 // writeBinaryResultSet writes a result set in MySQL binary protocol format (for prepared statements)
 // https://dev.mysql.com/doc/internals/en/binary-protocol-resultset.html
-func (s *MySQLServer) writeBinaryResultSet(w io.Writer, seq byte, rs *ResultSet) error {
+func (s *MySQLServer) writeBinaryResultSet(w io.Writer, seq byte, session *ConnectionSession, rs *ResultSet) error {
 	// 1. Column Count
 	if err := s.writePacket(w, seq, packLengthEncodedInt(uint64(len(rs.Columns)))); err != nil {
 		return err
@@ -689,21 +713,7 @@ func (s *MySQLServer) writeBinaryResultSet(w io.Writer, seq byte, rs *ResultSet)
 	defer putBuffer(colBuf)
 	for _, col := range rs.Columns {
 		colBuf.Reset()
-
-		writeLenEncString(colBuf, "def")    // Catalog
-		writeLenEncString(colBuf, "")       // Schema
-		writeLenEncString(colBuf, "tbl")    // Table
-		writeLenEncString(colBuf, "tbl")    // Org Table
-		writeLenEncString(colBuf, col.Name) // Name
-		writeLenEncString(colBuf, col.Name) // Org Name
-
-		colBuf.WriteByte(0x0c)                                      // Length of fixed fields
-		_ = binary.Write(colBuf, binary.LittleEndian, uint16(45))   // Charset (utf8mb4_general_ci)
-		_ = binary.Write(colBuf, binary.LittleEndian, uint32(1024)) // Length
-		colBuf.WriteByte(col.Type)                                  // Type
-		_ = binary.Write(colBuf, binary.LittleEndian, uint16(0))    // Flags
-		colBuf.WriteByte(0)                                         // Decimals
-		colBuf.Write([]byte{0, 0})                                  // Filler
+		writeColumnDefinition(colBuf, col)
 
 		if err := s.writePacket(w, seq, colBuf.Bytes()); err != nil {
 			return err
@@ -712,7 +722,7 @@ func (s *MySQLServer) writeBinaryResultSet(w io.Writer, seq byte, rs *ResultSet)
 	}
 
 	// 3. EOF Packet after columns
-	if err := s.writePacket(w, seq, []byte{0xFE, 0, 0, 0x02, 0}); err != nil {
+	if err := s.writeEOF(w, seq, session); err != nil {
 		return err
 	}
 	seq++
@@ -762,7 +772,7 @@ func (s *MySQLServer) writeBinaryResultSet(w io.Writer, seq byte, rs *ResultSet)
 	}
 
 	// 5. EOF Packet after rows
-	return s.writePacket(w, seq, []byte{0xFE, 0, 0, 0x02, 0})
+	return s.writeEOF(w, seq, session)
 }
 
 func (s *MySQLServer) writePacket(w io.Writer, seq byte, payload []byte) error {
@@ -826,6 +836,12 @@ func writeBinaryValue(buf *bytes.Buffer, scratch []byte, colType byte, val inter
 	switch colType {
 	case 0x01: // TINY
 		switch v := val.(type) {
+		case bool:
+			if v {
+				buf.WriteByte(1)
+			} else {
+				buf.WriteByte(0)
+			}
 		case int8:
 			buf.WriteByte(byte(v))
 		case int64:
@@ -905,17 +921,48 @@ func writeBinaryValue(buf *bytes.Buffer, scratch []byte, colType byte, val inter
 		}
 		binary.LittleEndian.PutUint64(scratch[:8], math.Float64bits(v))
 		buf.Write(scratch[:8])
-	default: // STRING, VARCHAR, TEXT, BLOB, etc.
-		var s string
-		switch tv := val.(type) {
-		case string:
-			s = tv
-		case []byte:
-			s = string(tv)
-		default:
-			s = fmt.Sprintf("%v", tv)
+	case 0x07, 0x0A, 0x0C: // TIMESTAMP, DATE, DATETIME
+		if t, ok := val.(time.Time); ok {
+			writeBinaryDateTime(buf, t)
+			return
 		}
-		writeLenEncString(buf, s)
+		// A non-time value in a column typed as a timestamp cannot be encoded
+		// in the binary date form; send it as text so the row stays readable.
+		writeLenEncString(buf, FormatTextValue(val))
+	default: // STRING, VARCHAR, TEXT, BLOB, etc.
+		writeLenEncString(buf, FormatTextValue(val))
+	}
+}
+
+// writeColumnDefinition writes one column definition packet body. Both the
+// COM_STMT_PREPARE response and every result set use it, so a column is
+// described identically whichever way a client asks.
+func writeColumnDefinition(buf *bytes.Buffer, col ColumnDef) {
+	writeLenEncString(buf, "def")    // Catalog
+	writeLenEncString(buf, "")       // Schema
+	writeLenEncString(buf, "tbl")    // Table
+	writeLenEncString(buf, "tbl")    // Org Table
+	writeLenEncString(buf, col.Name) // Name
+	writeLenEncString(buf, col.Name) // Org Name
+
+	buf.WriteByte(0x0c) // Length of fixed fields
+	_ = binary.Write(buf, binary.LittleEndian, columnCharset(col.Type))
+	_ = binary.Write(buf, binary.LittleEndian, uint32(1024)) // Length
+	buf.WriteByte(col.Type)                                  // Type
+	_ = binary.Write(buf, binary.LittleEndian, uint16(0))    // Flags
+	buf.WriteByte(0)                                         // Decimals
+	buf.Write([]byte{0, 0})                                  // Filler
+}
+
+// columnCharset reports the collation a column is advertised with. MySQL sends
+// the binary collation for non-textual columns and a character collation for
+// text, and clients use this to decide whether a value is text at all.
+func columnCharset(colType byte) uint16 {
+	switch colType {
+	case ColumnTypeVarString:
+		return 45 // utf8mb4_general_ci
+	default:
+		return 63 // binary
 	}
 }
 
@@ -937,6 +984,18 @@ func writeLenEncString(buf *bytes.Buffer, s string) {
 }
 
 // --- Prepared Statement Handlers ---
+
+// isDirectlyPreparable reports whether the database can prepare a statement of
+// this kind on its own. Statements Marmot answers itself never reach SQLite, so
+// a description failure for those says nothing about their validity.
+func isDirectlyPreparable(code StatementCode) bool {
+	switch code {
+	case StatementSelect, StatementInsert, StatementUpdate, StatementDelete, StatementReplace:
+		return true
+	default:
+		return false
+	}
+}
 
 func (s *MySQLServer) handleStmtPrepare(conn net.Conn, session *ConnectionSession, sql string) {
 	ctx := query.NewContext(sql, nil)
@@ -972,6 +1031,43 @@ func (s *MySQLServer) handleStmtPrepare(conn net.Conn, session *ConnectionSessio
 
 	paramCount := uint16(countPlaceholders(transpiledSQL))
 
+	// Describe the result set now: clients index columns by name from this
+	// response, so omitting the definitions makes every by-name lookup fail.
+	var resultColumns []ColumnDef
+	if describer, ok := s.handler.(ResultColumnDescriber); ok {
+		cols, err := describer.DescribeResultColumns(session, transpiledSQL)
+		switch {
+		case err == nil:
+			resultColumns = cols
+		case isDirectlyPreparable(StatementCode(ctx.Output.StatementType)) && !session.InTransaction():
+			// A statement the database itself should be able to prepare, that
+			// it rejects, is an error now rather than at execute time. Clients
+			// cache the prepare response per connection, so accepting an
+			// unpreparable statement leaves them holding metadata that stays
+			// wrong even after the schema it referenced appears.
+			//
+			// Inside an explicit transaction the buffered statements have not
+			// been applied yet, so the database's schema legitimately lags the
+			// session's: a statement referencing a column added earlier in the
+			// same transaction cannot be described, and must not be rejected.
+			log.Debug().
+				Uint64("conn_id", session.ConnID).
+				Str("query", sql).
+				Err(err).
+				Msg("PREPARE rejected by database")
+			_ = s.writeMySQLErr(conn, 1, err)
+			return
+		default:
+			// Statements Marmot answers above the database (SHOW, SET, and the
+			// like) are not preparable there; describing them is best-effort.
+			log.Debug().
+				Uint64("conn_id", session.ConnID).
+				Str("query", sql).
+				Err(err).
+				Msg("Could not describe prepared statement columns")
+		}
+	}
+
 	var stmtID uint32
 	func() {
 		session.preparedStmtLock.Lock()
@@ -1005,7 +1101,7 @@ func (s *MySQLServer) handleStmtPrepare(conn net.Conn, session *ConnectionSessio
 	_ = binary.Write(buf, binary.LittleEndian, stmtID)
 
 	// Number of columns (0 for INSERT/UPDATE/DELETE, >0 for SELECT)
-	_ = binary.Write(buf, binary.LittleEndian, uint16(0))
+	_ = binary.Write(buf, binary.LittleEndian, uint16(len(resultColumns)))
 
 	// Number of parameters
 	_ = binary.Write(buf, binary.LittleEndian, paramCount)
@@ -1045,7 +1141,21 @@ func (s *MySQLServer) handleStmtPrepare(conn net.Conn, session *ConnectionSessio
 		}
 
 		// Send EOF packet after parameters
-		_ = s.writePacket(conn, seqNum, []byte{0xFE, 0, 0, 0x02, 0})
+		_ = s.writeEOF(conn, seqNum, session)
+		seqNum++
+	}
+
+	// Column definitions follow the parameter definitions, per the protocol.
+	if len(resultColumns) > 0 {
+		colBuf := getBuffer()
+		defer putBuffer(colBuf)
+		for _, col := range resultColumns {
+			colBuf.Reset()
+			writeColumnDefinition(colBuf, col)
+			_ = s.writePacket(conn, seqNum, colBuf.Bytes())
+			seqNum++
+		}
+		_ = s.writeEOF(conn, seqNum, session)
 	}
 }
 
@@ -1176,10 +1286,10 @@ func (s *MySQLServer) handleStmtExecute(conn net.Conn, session *ConnectionSessio
 	if isSelect {
 		// Write binary result set for SELECT queries
 		if rs != nil {
-			_ = s.writeBinaryResultSet(conn, 1, rs)
+			_ = s.writeBinaryResultSet(conn, 1, session, rs)
 		} else {
 			// Empty result set
-			_ = s.writeBinaryResultSet(conn, 1, &ResultSet{Columns: []ColumnDef{}, Rows: [][]interface{}{}})
+			_ = s.writeBinaryResultSet(conn, 1, session, &ResultSet{Columns: []ColumnDef{}, Rows: [][]interface{}{}})
 		}
 	} else {
 		// Write OK packet for DML queries
@@ -1192,7 +1302,7 @@ func (s *MySQLServer) handleStmtExecute(conn net.Conn, session *ConnectionSessio
 				session.LastInsertId.Store(lastInsertId)
 			}
 		}
-		_ = s.writeOK(conn, 1, rowsAffected, lastInsertId)
+		_ = s.writeOK(conn, 1, session, rowsAffected, lastInsertId)
 	}
 }
 

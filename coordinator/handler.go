@@ -64,6 +64,8 @@ type DatabaseManager interface {
 type ReplicatedDatabaseProvider interface {
 	ExecuteLocalWithHooks(ctx context.Context, txnID uint64, requests []ExecutionRequest) (PendingExecution, error)
 	GetSchemaCache() interface{} // Returns *SchemaCache (using interface{} to avoid import cycle)
+	// DescribeResultColumns reports the columns a query returns without running it.
+	DescribeResultColumns(ctx context.Context, query string) ([]common.ResultColumn, error)
 }
 
 // ExecutionRequest for local-only execution - never replicated
@@ -586,58 +588,54 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, params []in
 
 	if protocol.IsDML(stmt) && stmt.Database != "" {
 		replicatedDB, err := h.dbManager.GetReplicatedDatabase(stmt.Database)
-		if err == nil {
-			// Use configured lock wait timeout for hook execution (default 50s like MySQL innodb_lock_wait_timeout)
-			hookTimeout := 50 * time.Second
-			if cfg.Config != nil && cfg.Config.Transaction.LockWaitTimeoutSeconds > 0 {
-				hookTimeout = time.Duration(cfg.Config.Transaction.LockWaitTimeoutSeconds) * time.Second
-			}
-			ctx, cancel := context.WithTimeout(context.Background(), hookTimeout)
-			cancelHookCtx = cancel // Store for later - DO NOT call yet
-			// Use extracted params from literal extraction, or wire protocol params
-			execParams := params
-			if len(execParams) == 0 && len(stmt.ExtractedParams) > 0 {
-				execParams = stmt.ExtractedParams
-			}
-			req := ExecutionRequest{SQL: stmt.SQL, Params: execParams}
-			pendingExec, err = replicatedDB.ExecuteLocalWithHooks(ctx, uint64(txnID), []ExecutionRequest{req})
+		if err != nil {
+			telemetry.QueriesTotal.With("dml", "failed").Inc()
+			telemetry.QueryDurationSeconds.With("dml").Observe(time.Since(queryStart).Seconds())
+			return nil, fmt.Errorf("failed to get database %s: %w", stmt.Database, err)
+		}
+		// Use configured lock wait timeout for hook execution (default 50s like MySQL innodb_lock_wait_timeout)
+		hookTimeout := 50 * time.Second
+		if cfg.Config != nil && cfg.Config.Transaction.LockWaitTimeoutSeconds > 0 {
+			hookTimeout = time.Duration(cfg.Config.Transaction.LockWaitTimeoutSeconds) * time.Second
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), hookTimeout)
+		cancelHookCtx = cancel // Store for later - DO NOT call yet
+		// Use extracted params from literal extraction, or wire protocol params
+		execParams := params
+		if len(execParams) == 0 && len(stmt.ExtractedParams) > 0 {
+			execParams = stmt.ExtractedParams
+		}
+		req := ExecutionRequest{SQL: stmt.SQL, Params: execParams}
+		pendingExec, err = replicatedDB.ExecuteLocalWithHooks(ctx, uint64(txnID), []ExecutionRequest{req})
 
-			if err != nil {
-				cancel() // Only cancel on error
-				// DML requires CDC hooks for idempotent replication (INSERT OR REPLACE)
-				// Statement-based fallback uses raw SQL which fails on duplicate keys
-				// Return error to client so they can retry
-				log.Warn().Err(err).Msg("DML execution with CDC hooks failed - client should retry")
-				telemetry.QueriesTotal.With("dml", "failed").Inc()
-				telemetry.QueryDurationSeconds.With("dml").Observe(time.Since(queryStart).Seconds())
-				return nil, fmt.Errorf("DML execution failed: %w", err)
-			}
-			rowsAffected = pendingExec.GetTotalRowCount()
+		if err != nil {
+			cancel() // Only cancel on error
+			// DML requires CDC hooks for idempotent replication (INSERT OR REPLACE)
+			// Statement-based fallback uses raw SQL which fails on duplicate keys
+			// Return error to client so they can retry
+			log.Warn().Err(err).Msg("DML execution with CDC hooks failed - client should retry")
+			telemetry.QueriesTotal.With("dml", "failed").Inc()
+			telemetry.QueryDurationSeconds.With("dml").Observe(time.Since(queryStart).Seconds())
+			return nil, fmt.Errorf("DML execution failed: %w", err)
+		}
+		rowsAffected = pendingExec.GetTotalRowCount()
 
-			// Convert CDC entries directly to statements for replication
-			cdcEntries := pendingExec.GetCDCEntries()
-			if len(cdcEntries) > 0 {
-				statements = make([]protocol.Statement, len(cdcEntries))
-				for i, entry := range cdcEntries {
-					statements[i] = ConvertToStatement(entry)
-				}
-				// Keep original SQL in first statement for debugging
-				statements[0].SQL = stmt.SQL
-				statements[0].Database = stmt.Database
-			} else {
-				// Non-hook fallback: no CDC entries captured, so replicate using
-				// the concrete SQL text with literals inlined.
-				materializedSQL, matErr := materializeSQLWithParams(stmt.SQL, execParams)
-				if matErr != nil {
-					cancel()
-					telemetry.QueriesTotal.With("dml", "failed").Inc()
-					telemetry.QueryDurationSeconds.With("dml").Observe(time.Since(queryStart).Seconds())
-					return nil, fmt.Errorf("failed to materialize DML statement for replication: %w", matErr)
-				}
-				stmt.SQL = materializedSQL
-				stmt.ExtractedParams = nil
-				statements = []protocol.Statement{stmt}
+		// Convert CDC entries directly to statements for replication
+		cdcEntries := pendingExec.GetCDCEntries()
+		if len(cdcEntries) > 0 {
+			statements = make([]protocol.Statement, len(cdcEntries))
+			for i, entry := range cdcEntries {
+				statements[i] = ConvertToStatement(entry)
 			}
+			// Keep original SQL in first statement for debugging
+			statements[0].SQL = stmt.SQL
+			statements[0].Database = stmt.Database
+		} else {
+			// The hook captured no rows, so the statement matched none (for
+			// example a DELETE on an absent key). There is no change to
+			// replicate: skip 2PC entirely and report zero rows affected.
+			// DML must never fall back to raw SQL replication.
+			statements = nil
 		}
 	}
 
@@ -663,15 +661,18 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, params []in
 		}
 	}()
 
-	err := h.writeCoord.WriteTransaction(ctx, txn)
-	if err != nil {
-		queryType := "dml"
-		if isDDL {
-			queryType = "ddl"
+	// A DML that matched no rows leaves no statements to replicate. Running 2PC
+	// for it would burn a cluster round trip to commit nothing.
+	if len(txn.Statements) > 0 {
+		if err := h.writeCoord.WriteTransaction(ctx, txn); err != nil {
+			queryType := "dml"
+			if isDDL {
+				queryType = "ddl"
+			}
+			telemetry.QueriesTotal.With(queryType, "failed").Inc()
+			telemetry.QueryDurationSeconds.With(queryType).Observe(time.Since(queryStart).Seconds())
+			return nil, err
 		}
-		telemetry.QueriesTotal.With(queryType, "failed").Inc()
-		telemetry.QueryDurationSeconds.With(queryType).Observe(time.Since(queryStart).Seconds())
-		return nil, err
 	}
 	// Success - coordinator committed via CDC replay in WriteTransaction.
 	// Vector CDC is applied by the transaction commit pipeline on every node.
@@ -913,10 +914,7 @@ func (h *CoordinatorHandler) handleRead(stmt protocol.Statement, params []interf
 		// Use columns from response if available (preserves order)
 		if len(resp.Columns) > 0 {
 			for _, colName := range resp.Columns {
-				rs.Columns = append(rs.Columns, protocol.ColumnDef{
-					Name: colName,
-					Type: 0xFD, // VAR_STRING
-				})
+				rs.Columns = append(rs.Columns, protocol.ColumnDef{Name: colName})
 			}
 		} else if len(resp.Rows) > 0 {
 			// Fallback: Infer columns from first row (sorted for consistent order)
@@ -927,10 +925,7 @@ func (h *CoordinatorHandler) handleRead(stmt protocol.Statement, params []interf
 			}
 			sort.Strings(colNames)
 			for _, colName := range colNames {
-				rs.Columns = append(rs.Columns, protocol.ColumnDef{
-					Name: colName,
-					Type: 0xFD, // VAR_STRING
-				})
+				rs.Columns = append(rs.Columns, protocol.ColumnDef{Name: colName})
 			}
 		}
 
@@ -940,6 +935,13 @@ func (h *CoordinatorHandler) handleRead(stmt protocol.Statement, params []interf
 				row[i] = rowMap[col.Name]
 			}
 			rs.Rows = append(rs.Rows, row)
+		}
+
+		// Column types come from the values themselves: SQLite types values, not
+		// columns, and strict clients refuse to decode a number out of a column
+		// declared as text.
+		for i, t := range protocol.InferColumnTypes(rs.Rows, len(rs.Columns)) {
+			rs.Columns[i].Type = t
 		}
 	}
 
@@ -1199,9 +1201,7 @@ func (h *CoordinatorHandler) handleCommit(session *protocol.ConnectionSession) (
 				return nil, fmt.Errorf("failed to get database %s: %w", stmt.Database, err)
 			}
 
-			groupStart := i
 			requests := make([]ExecutionRequest, 0, 1)
-			group := make([]protocol.Statement, 0, 1)
 			for i < len(txnState.Statements) {
 				nextStmt := txnState.Statements[i]
 				if !protocol.IsDML(nextStmt) || nextStmt.Database != stmt.Database {
@@ -1211,7 +1211,6 @@ func (h *CoordinatorHandler) handleCommit(session *protocol.ConnectionSession) (
 					SQL:    nextStmt.SQL,
 					Params: nextStmt.ExtractedParams,
 				})
-				group = append(group, nextStmt)
 				i++
 			}
 
@@ -1237,19 +1236,10 @@ func (h *CoordinatorHandler) handleCommit(session *protocol.ConnectionSession) (
 					cdcStmt.Database = stmt.Database
 					enrichedStatements = append(enrichedStatements, cdcStmt)
 				}
-			} else {
-				for _, fallbackStmt := range group {
-					materializedSQL, matErr := materializeSQLWithParams(fallbackStmt.SQL, fallbackStmt.ExtractedParams)
-					if matErr != nil {
-						session.EndTransaction()
-						h.recentTxnIDs.Delete(txnState.TxnID)
-						return nil, fmt.Errorf("failed to materialize DML statement %d for replication: %w", groupStart, matErr)
-					}
-					fallbackStmt.SQL = materializedSQL
-					fallbackStmt.ExtractedParams = nil
-					enrichedStatements = append(enrichedStatements, fallbackStmt)
-				}
 			}
+			// No captured rows means every statement in the group matched none.
+			// They contribute nothing to replicate and are dropped; DML must
+			// never fall back to raw SQL replication.
 		} else {
 			enrichedStatements = append(enrichedStatements, stmt)
 			i++
@@ -1280,7 +1270,12 @@ func (h *CoordinatorHandler) handleCommit(session *protocol.ConnectionSession) (
 	ctx, cancel := context.WithTimeout(context.Background(), writeTimeoutForStatements(txn.Statements))
 	defer cancel()
 
-	err := h.writeCoord.WriteTransaction(ctx, txn)
+	// DML that matched no rows leaves nothing to replicate. A transaction whose
+	// statements all collapsed that way is a no-op and skips 2PC.
+	var err error
+	if len(txn.Statements) > 0 {
+		err = h.writeCoord.WriteTransaction(ctx, txn)
+	}
 
 	// Clear transaction state regardless of outcome
 	session.EndTransaction()
