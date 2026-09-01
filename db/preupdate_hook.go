@@ -404,10 +404,13 @@ func (s *EphemeralHookSession) hookCallback(data sqlite3.SQLitePreUpdateData) {
 		return
 	}
 
-	// Get schema from cache; missing entries are treated as non-capturable rows.
+	// The schema cache holds every non-internal table and is reloaded after DDL,
+	// so a miss means this row cannot be captured. Dropping it would silently
+	// lose the write, so fail the statement instead.
 	schema, err := s.getSchemaForTable(data.TableName)
 	if err != nil {
-		log.Warn().Err(err).Uint64("txn_id", s.txnID).Str("table", data.TableName).Msg("hookCallback: schema not found, skipping CDC")
+		log.Error().Err(err).Uint64("txn_id", s.txnID).Str("table", data.TableName).Msg("hookCallback: schema unavailable, cannot capture CDC")
+		s.setConflictError(fmt.Errorf("cannot capture CDC for table %s: %w", data.TableName, err))
 		return
 	}
 
