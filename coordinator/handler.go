@@ -64,6 +64,8 @@ type DatabaseManager interface {
 type ReplicatedDatabaseProvider interface {
 	ExecuteLocalWithHooks(ctx context.Context, txnID uint64, requests []ExecutionRequest) (PendingExecution, error)
 	GetSchemaCache() interface{} // Returns *SchemaCache (using interface{} to avoid import cycle)
+	// DescribeResultColumns reports the columns a query returns without running it.
+	DescribeResultColumns(ctx context.Context, query string) ([]common.ResultColumn, error)
 }
 
 // ExecutionRequest for local-only execution - never replicated
@@ -912,10 +914,7 @@ func (h *CoordinatorHandler) handleRead(stmt protocol.Statement, params []interf
 		// Use columns from response if available (preserves order)
 		if len(resp.Columns) > 0 {
 			for _, colName := range resp.Columns {
-				rs.Columns = append(rs.Columns, protocol.ColumnDef{
-					Name: colName,
-					Type: 0xFD, // VAR_STRING
-				})
+				rs.Columns = append(rs.Columns, protocol.ColumnDef{Name: colName})
 			}
 		} else if len(resp.Rows) > 0 {
 			// Fallback: Infer columns from first row (sorted for consistent order)
@@ -926,10 +925,7 @@ func (h *CoordinatorHandler) handleRead(stmt protocol.Statement, params []interf
 			}
 			sort.Strings(colNames)
 			for _, colName := range colNames {
-				rs.Columns = append(rs.Columns, protocol.ColumnDef{
-					Name: colName,
-					Type: 0xFD, // VAR_STRING
-				})
+				rs.Columns = append(rs.Columns, protocol.ColumnDef{Name: colName})
 			}
 		}
 
@@ -939,6 +935,13 @@ func (h *CoordinatorHandler) handleRead(stmt protocol.Statement, params []interf
 				row[i] = rowMap[col.Name]
 			}
 			rs.Rows = append(rs.Rows, row)
+		}
+
+		// Column types come from the values themselves: SQLite types values, not
+		// columns, and strict clients refuse to decode a number out of a column
+		// declared as text.
+		for i, t := range protocol.InferColumnTypes(rs.Rows, len(rs.Columns)) {
+			rs.Columns[i].Type = t
 		}
 	}
 

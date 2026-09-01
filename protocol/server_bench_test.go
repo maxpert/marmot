@@ -49,7 +49,7 @@ func BenchmarkWriteBinaryResultSet_Small(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		buf.Reset()
-		_ = s.writeBinaryResultSet(buf, 0, rs)
+		_ = s.writeBinaryResultSet(buf, 0, nil, rs)
 	}
 }
 
@@ -82,7 +82,7 @@ func BenchmarkWriteBinaryResultSet_Medium(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		buf.Reset()
-		_ = s.writeBinaryResultSet(buf, 0, rs)
+		_ = s.writeBinaryResultSet(buf, 0, nil, rs)
 	}
 }
 
@@ -110,7 +110,7 @@ func BenchmarkWriteBinaryResultSet_Large(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		buf.Reset()
-		_ = s.writeBinaryResultSet(buf, 0, rs)
+		_ = s.writeBinaryResultSet(buf, 0, nil, rs)
 	}
 }
 
@@ -132,7 +132,7 @@ func BenchmarkWriteResultSet_Small(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		buf.Reset()
-		_ = s.writeResultSet(buf, 0, rs)
+		_ = s.writeResultSet(buf, 0, nil, rs)
 	}
 }
 
@@ -160,7 +160,7 @@ func BenchmarkWriteResultSet_Large(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		buf.Reset()
-		_ = s.writeResultSet(buf, 0, rs)
+		_ = s.writeResultSet(buf, 0, nil, rs)
 	}
 }
 
@@ -198,6 +198,6 @@ func BenchmarkWriteBinaryResultSet_MixedTypes(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		buf.Reset()
-		_ = s.writeBinaryResultSet(buf, 0, rs)
+		_ = s.writeBinaryResultSet(buf, 0, nil, rs)
 	}
 }

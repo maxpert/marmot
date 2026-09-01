@@ -1289,8 +1289,10 @@ func (h *CoordinatorHandler) tryDirectPKResult(
 	for i, item := range topK {
 		rows[i] = []interface{}{item.rowid}
 	}
+	pkCol := protocol.ColumnDef{Name: plan.DirectPKLabel}
+	pkCol.Type = protocol.InferColumnTypes(rows, 1)[0]
 	return &protocol.ResultSet{
-		Columns: []protocol.ColumnDef{{Name: plan.DirectPKLabel, Type: 0xFD}},
+		Columns: []protocol.ColumnDef{pkCol},
 		Rows:    rows,
 	}, true, nil
 }
@@ -1362,7 +1364,7 @@ func (h *CoordinatorHandler) fetchProjectionByRowID(
 
 	colDefs := make([]protocol.ColumnDef, len(cols))
 	for i, name := range cols {
-		colDefs[i] = protocol.ColumnDef{Name: name, Type: 0xFD}
+		colDefs[i] = protocol.ColumnDef{Name: name}
 	}
 
 	var resultRows [][]interface{}
@@ -1381,6 +1383,11 @@ func (h *CoordinatorHandler) fetchProjectionByRowID(
 	}
 	if err := finalRows.Err(); err != nil {
 		return nil, fmt.Errorf("MARMOT-VEC-030: final scan error: %w", err)
+	}
+
+	// Types follow the projected values; see InferColumnTypes.
+	for i, t := range protocol.InferColumnTypes(resultRows, len(colDefs)) {
+		colDefs[i].Type = t
 	}
 
 	return &protocol.ResultSet{
