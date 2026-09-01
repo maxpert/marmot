@@ -1,4 +1,4 @@
-# Marmot v2.9.14-beta - WordPress Cluster Node 3
+# Marmot v2.9.15-beta - WordPress Cluster Node 3
 
 node_id = 3
 data_dir = "/data"

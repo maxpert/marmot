@@ -119,7 +119,7 @@ func main() {
 
 	// Branch based on operating mode
 	if cfg.IsReplicaMode() {
-		log.Info().Msg("Marmot v2.9.14-beta - Read-Only Replica Mode")
+		log.Info().Msg("Marmot v2.9.15-beta - Read-Only Replica Mode")
 		log.Info().
 			Strs("follow_addresses", cfg.Config.Replica.FollowAddresses).
 			Msg("Following cluster nodes")
@@ -135,7 +135,7 @@ func main() {
 	}
 
 	// Cluster mode
-	log.Info().Msg("Marmot v2.9.14-beta - Leaderless SQLite Replication")
+	log.Info().Msg("Marmot v2.9.15-beta - Leaderless SQLite Replication")
 
 	// Warn if cluster authentication is not configured
 	if !cfg.IsClusterAuthEnabled() {
@@ -547,7 +547,7 @@ func main() {
 		log.Info().Msg("Seed node fully initialized - now ALIVE")
 	}
 
-	log.Info().Msg("Marmot v2.9.14-beta started successfully")
+	log.Info().Msg("Marmot v2.9.15-beta started successfully")
 	log.Info().
 		Uint64("node_id", cfg.Config.NodeID).
 		Int("grpc_port", cfg.Config.Cluster.GRPCPort).
