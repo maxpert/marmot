@@ -42,3 +42,9 @@ func (h *CoordinatorHandler) ExecuteVectorPlan(
 ) (*protocol.ResultSet, error) {
 	return h.executeVectorPlan(stmt, info, args, consistency)
 }
+
+// CausesImplicitCommit exposes the implicit-commit classification to external
+// test packages.
+func CausesImplicitCommit(stmt protocol.Statement) bool {
+	return causesImplicitCommit(stmt)
+}

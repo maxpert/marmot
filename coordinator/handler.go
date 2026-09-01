@@ -454,7 +454,17 @@ func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, sq
 
 	// If in explicit transaction, buffer mutations instead of immediate 2PC
 	if inTransaction && isMutation {
-		return h.bufferStatement(session, stmt)
+		// MySQL has no transactional DDL: DDL ends the open transaction before
+		// it runs. Honouring that lets DML later in the transaction see a
+		// column the DDL added, which buffering to COMMIT cannot do.
+		if causesImplicitCommit(stmt) && cfg.Config.Transaction.DDLImplicitCommit {
+			if err := h.implicitCommitBeforeDDL(session, stmt); err != nil {
+				return nil, err
+			}
+			inTransaction = false
+		} else {
+			return h.bufferStatement(session, stmt)
+		}
 	}
 
 	// Normal path - immediate execution (for YCSB and auto-commit clients)
@@ -1345,6 +1355,42 @@ func (h *CoordinatorHandler) handleRollback(session *protocol.ConnectionSession)
 }
 
 // bufferStatement adds a mutation to the active transaction buffer
+// causesImplicitCommit reports whether a statement ends an open transaction
+// before it runs, as MySQL's "statements that cause an implicit commit" do.
+// Schema changes qualify; DML does not.
+func causesImplicitCommit(stmt protocol.Statement) bool {
+	switch stmt.Type {
+	case protocol.StatementDDL,
+		protocol.StatementCreateDatabase,
+		protocol.StatementDropDatabase,
+		protocol.StatementCreateVectorIndex,
+		protocol.StatementDropVectorIndex,
+		protocol.StatementReindexVectorIndex:
+		return true
+	default:
+		return false
+	}
+}
+
+// implicitCommitBeforeDDL commits the statements buffered so far and closes the
+// transaction, so the DDL that follows runs on its own.
+//
+// The commit happens first and its failure is reported without running the DDL,
+// matching MySQL: the transaction is ended by the attempt either way, so the
+// session is left with no transaction open regardless of the outcome.
+func (h *CoordinatorHandler) implicitCommitBeforeDDL(session *protocol.ConnectionSession, stmt protocol.Statement) error {
+	log.Debug().
+		Uint64("conn_id", session.ConnID).
+		Int("stmt_type", int(stmt.Type)).
+		Msg("DDL in transaction: committing buffered statements first")
+
+	// handleCommit ends the transaction whether or not anything was buffered.
+	if _, err := h.handleCommit(session); err != nil {
+		return fmt.Errorf("implicit commit before DDL failed: %w", err)
+	}
+	return nil
+}
+
 func (h *CoordinatorHandler) bufferStatement(session *protocol.ConnectionSession, stmt protocol.Statement) (*protocol.ResultSet, error) {
 	session.AddStatement(stmt)
 

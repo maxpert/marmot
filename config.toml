@@ -26,6 +26,13 @@ conflict_window_seconds = 10
 # Lock wait timeout (seconds) - matches MySQL innodb_lock_wait_timeout
 lock_wait_timeout_seconds = 50
 
+# MySQL has no transactional DDL: CREATE/ALTER/DROP implicitly commit the open
+# transaction, then run on their own. Keep true for MySQL-compatible behaviour so
+# DML can see a schema change made earlier in the same transaction.
+# Set false to keep DDL inside the transaction and replicate it atomically with
+# the surrounding statements.
+ddl_implicit_commit = true
+
 # ==============================================================================
 # CLUSTER MEMBERSHIP
 # ==============================================================================
