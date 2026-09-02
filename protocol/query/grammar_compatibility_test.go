@@ -1068,6 +1068,90 @@ func TestMySQLLimitOffset(t *testing.T) {
 	}
 }
 
+// TestMySQLSelectStarPosition tests select-list '*' placement rules.
+// Mirrors MySQL 8.4 sql_yacc.yy select_item_list: bare '*' is legal only as the sole leading select item; elsewhere only 'table.*' is legal.
+func TestMySQLSelectStarPosition(t *testing.T) {
+	pipeline, err := NewPipeline(100, nil)
+	if err != nil {
+		t.Fatalf("failed to create pipeline: %v", err)
+	}
+
+	tests := []struct {
+		name              string
+		sql               string
+		shouldParse       bool
+		wantTranspiledSQL string
+	}{
+		// Bare '*' not in leading position - REJECTED (MySQL also rejects)
+		{
+			name:        "bare star after column",
+			sql:         "SELECT id, * FROM users",
+			shouldParse: false,
+		},
+		{
+			name:        "bare star after literal",
+			sql:         "SELECT 1, * FROM users",
+			shouldParse: false,
+		},
+		{
+			name:        "bare star after qualified column",
+			sql:         "SELECT u.id, * FROM users u",
+			shouldParse: false,
+		},
+
+		// Bare '*' as sole leading item, or qualified 'table.*' anywhere - SUPPORTED
+		{
+			name:              "bare star alone",
+			sql:               "SELECT * FROM users",
+			shouldParse:       true,
+			wantTranspiledSQL: "SELECT * FROM users",
+		},
+		{
+			name:              "bare star leading, column following",
+			sql:               "SELECT *, id FROM users",
+			shouldParse:       true,
+			wantTranspiledSQL: "SELECT *, id FROM users",
+		},
+		{
+			name:              "qualified star leading, column following",
+			sql:               "SELECT users.*, id FROM users",
+			shouldParse:       true,
+			wantTranspiledSQL: "SELECT users.*, id FROM users",
+		},
+		{
+			name:              "column leading, qualified star following",
+			sql:               "SELECT id, users.* FROM users",
+			shouldParse:       true,
+			wantTranspiledSQL: "SELECT id, users.* FROM users",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := NewContext(tt.sql, nil)
+			err := pipeline.Process(ctx)
+
+			if tt.shouldParse {
+				if err != nil {
+					t.Errorf("expected parsing to succeed, got error: %v", err)
+					return
+				}
+				transpiledSQL := ""
+				if len(ctx.Output.Statements) > 0 {
+					transpiledSQL = ctx.Output.Statements[0].SQL
+				}
+				if transpiledSQL != tt.wantTranspiledSQL {
+					t.Errorf("TranspiledSQL = %q, want %q", transpiledSQL, tt.wantTranspiledSQL)
+				}
+			} else {
+				if err == nil {
+					t.Errorf("expected parsing to fail, but succeeded")
+				}
+			}
+		})
+	}
+}
+
 // TestMySQLDDLStatements tests DDL statement variations - ALL SUPPORTED
 func TestMySQLDDLStatements(t *testing.T) {
 	pipeline, err := NewPipeline(100, nil)
