@@ -17,19 +17,40 @@ import (
 //	Input:  INSERT INTO t VALUES ('text', 123, 'binary\x00data')
 //	Output: INSERT INTO t VALUES (:v1, :v2, :v3)
 //	Params: [string("text"), int64(123), string("binary\x00data")]
-func ExtractLiterals(stmt sqlparser.Statement) []interface{} {
+//
+// The AST can also already contain placeholders of its own - e.g. a client's
+// own `?` bind marks in a prepared statement, still present as
+// *sqlparser.Argument nodes because they were never literal values to begin
+// with. order records, for EVERY placeholder in the final statement (both
+// those pre-existing ones and the newly-extracted ones) in the same
+// left-to-right order they will serialize in, whether that slot's value at
+// execution time comes from the caller's own bind values (true) or from
+// params (false, consumed in order) - see protocol.MergeExecParams, which
+// uses this to interleave the two sources correctly instead of assuming one
+// always comes before the other (a literal can appear before, after, or
+// between a statement's own placeholders in the source SQL). order is nil
+// when the statement has no pre-existing placeholders, matching today's
+// wire-params-XOR-extracted-params callers.
+func ExtractLiterals(stmt sqlparser.Statement) (params []interface{}, order []bool) {
 	if stmt == nil {
-		return nil
+		return nil, nil
 	}
 
-	var params []interface{}
+	var hasArgument bool
 	counter := 0
 
 	sqlparser.Rewrite(stmt, func(cursor *sqlparser.Cursor) bool {
+		if _, ok := cursor.Node().(*sqlparser.Argument); ok {
+			hasArgument = true
+			order = append(order, true)
+			return true
+		}
+
 		lit, ok := cursor.Node().(*sqlparser.Literal)
 		if !ok {
 			return true
 		}
+		order = append(order, false)
 
 		// Extract value based on literal type
 		var value interface{}
@@ -103,8 +124,15 @@ func ExtractLiterals(stmt sqlparser.Statement) []interface{} {
 
 	// Return nil if no literals were found
 	if len(params) == 0 {
-		return nil
+		return nil, nil
 	}
 
-	return params
+	// order is only useful to callers when there is something to interleave:
+	// a statement made only of literals (the common non-prepared case) needs
+	// no positional merge, so keep returning nil there too.
+	if !hasArgument {
+		return params, nil
+	}
+
+	return params, order
 }

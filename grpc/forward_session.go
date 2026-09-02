@@ -43,6 +43,15 @@ type ForwardSessionManager struct {
 	mu             sync.RWMutex
 	sessionTimeout time.Duration
 	stopCh         chan struct{}
+
+	// onSessionRemoved, if set, is invoked with a removed session's
+	// ConnSession whenever that session is evicted/removed from the manager
+	// (idle timeout, explicit removal, or replica disconnect) without going
+	// through an explicit COMMIT/ROLLBACK. This lets the coordinator release
+	// any pinned SQLite transaction (and its row locks/writer hold) that the
+	// session left open - see CoordinatorHandler.CloseSession, which mirrors
+	// the cleanup protocol/server.go performs on direct connection close.
+	onSessionRemoved func(*protocol.ConnectionSession)
 }
 
 // NewForwardSessionManager creates a new session manager and starts cleanup loop
@@ -54,6 +63,16 @@ func NewForwardSessionManager(timeout time.Duration) *ForwardSessionManager {
 	}
 	go m.startCleanupLoop()
 	return m
+}
+
+// SetSessionCloser registers a callback invoked with the ConnSession of every
+// forward session removed from this manager, so any pinned transaction state
+// held for that session's ConnID can be released. Must be called before the
+// manager starts evicting sessions to avoid races with the cleanup loop.
+func (m *ForwardSessionManager) SetSessionCloser(closer func(*protocol.ConnectionSession)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.onSessionRemoved = closer
 }
 
 // GetOrCreateSession retrieves an existing session or creates a new one
@@ -78,22 +97,38 @@ func (m *ForwardSessionManager) GetOrCreateSession(key ForwardSessionKey, db str
 	return session
 }
 
-// RemoveSession removes a specific session
+// RemoveSession removes a specific session, closing any pinned transaction
+// state left open on it.
 func (m *ForwardSessionManager) RemoveSession(key ForwardSessionKey) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	delete(m.sessions, key)
+	session, ok := m.sessions[key]
+	if ok {
+		delete(m.sessions, key)
+	}
+	closer := m.onSessionRemoved
+	m.mu.Unlock()
+
+	if ok {
+		closeRemovedForwardSession(closer, session)
+	}
 }
 
-// RemoveSessionsForReplica removes all sessions for a given replica node
+// RemoveSessionsForReplica removes all sessions for a given replica node,
+// closing any pinned transaction state left open on each of them.
 func (m *ForwardSessionManager) RemoveSessionsForReplica(replicaNodeID uint64) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	for key := range m.sessions {
+	var removed []*ForwardSession
+	for key, session := range m.sessions {
 		if key.ReplicaNodeID == replicaNodeID {
+			removed = append(removed, session)
 			delete(m.sessions, key)
 		}
+	}
+	closer := m.onSessionRemoved
+	m.mu.Unlock()
+
+	for _, session := range removed {
+		closeRemovedForwardSession(closer, session)
 	}
 }
 
@@ -112,13 +147,13 @@ func (m *ForwardSessionManager) startCleanupLoop() {
 	}
 }
 
-// cleanupExpiredSessions removes sessions that have been inactive beyond timeout
+// cleanupExpiredSessions removes sessions that have been inactive beyond
+// timeout, closing any pinned transaction state left open on each of them.
 func (m *ForwardSessionManager) cleanupExpiredSessions() {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 
 	now := time.Now()
-	expiredKeys := make([]ForwardSessionKey, 0)
+	expired := make([]*ForwardSession, 0)
 
 	for key, session := range m.sessions {
 		session.mu.Lock()
@@ -126,17 +161,60 @@ func (m *ForwardSessionManager) cleanupExpiredSessions() {
 		session.mu.Unlock()
 
 		if now.Sub(lastActivity) > m.sessionTimeout {
-			expiredKeys = append(expiredKeys, key)
-		}
-	}
-
-	if len(expiredKeys) > 0 {
-		for _, key := range expiredKeys {
+			expired = append(expired, session)
 			delete(m.sessions, key)
 		}
+	}
+	closer := m.onSessionRemoved
+	m.mu.Unlock()
+
+	if len(expired) > 0 {
+		for _, session := range expired {
+			closeRemovedForwardSession(closer, session)
+		}
 		log.Debug().
-			Int("count", len(expiredKeys)).
+			Int("count", len(expired)).
 			Msg("cleaned up expired forward sessions")
+	}
+}
+
+// closeRemovedForwardSession invokes closer with session's ConnSession, if
+// both are non-nil, so the coordinator can release any pinned SQLite
+// transaction (and writer lock) the session left open. Runs outside the
+// manager's lock since CloseSession may block on coordinator-side state.
+//
+// It holds session.execMu for the duration of the call, the same lock
+// Execute holds for a whole forwarded statement (including COMMIT). Without
+// this, eviction (idle timeout, explicit removal, or replica disconnect) can
+// run concurrently with an in-flight COMMIT: the coordinator's CloseSession
+// rolls back and discards the pinned transaction's captured CDC entries
+// while handleCommit is still trying to read them, so the write is silently
+// lost even though the client is told COMMIT succeeded.
+//
+// This cannot deadlock: closer (CoordinatorHandler.CloseSession) only takes
+// coordinator-side pinned-transaction state and ends the session's
+// transaction - it never calls back into the ForwardSessionManager or any
+// ForwardSession (the coordinator package does not import grpc, so no such
+// call path can exist). Nor is the manager's own mutex held while this runs
+// - every caller (cleanupExpiredSessions, RemoveSession,
+// RemoveSessionsForReplica) releases it before invoking
+// closeRemovedForwardSession. So this can only block behind an in-flight
+// Execute call on this same session, and always makes progress once that
+// call returns.
+func closeRemovedForwardSession(closer func(*protocol.ConnectionSession), session *ForwardSession) {
+	if closer == nil || session == nil {
+		return
+	}
+
+	session.execMu.Lock()
+	defer session.execMu.Unlock()
+
+	session.mu.Lock()
+	connSession := session.ConnSession
+	session.mu.Unlock()
+
+	if connSession != nil {
+		closer(connSession)
 	}
 }
 

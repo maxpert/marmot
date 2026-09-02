@@ -101,7 +101,14 @@ func setupNoopDML(t *testing.T) *noopDMLSetup {
 		noopNodeRegistry{},
 	)
 
-	session := &protocol.ConnectionSession{ConnID: 1, CurrentDatabase: dbName}
+	// Real connections enable transpilation (protocol/server.go), and without it
+	// BEGIN does not parse as transaction control, so a test meaning to exercise
+	// the explicit-transaction path would silently run in autocommit.
+	session := &protocol.ConnectionSession{
+		ConnID:               1,
+		CurrentDatabase:      dbName,
+		TranspilationEnabled: true,
+	}
 
 	_, err = handler.HandleQuery(session, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)", nil)
 	require.NoError(t, err)
@@ -207,7 +214,7 @@ func TestAllNoopTransactionSkips2PC(t *testing.T) {
 func TestUnknownDatabaseDMLReportsDatabase(t *testing.T) {
 	s := setupNoopDML(t)
 
-	session := &protocol.ConnectionSession{ConnID: 2, CurrentDatabase: "nosuchdb"}
+	session := &protocol.ConnectionSession{ConnID: 2, CurrentDatabase: "nosuchdb", TranspilationEnabled: true}
 
 	_, err := s.handler.HandleQuery(session, "DELETE FROM t WHERE id = 1", nil)
 	require.Error(t, err)

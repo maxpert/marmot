@@ -67,11 +67,17 @@ func (p *Pipeline) Process(ctx *QueryContext) error {
 		return err
 	}
 
-	// If the parser short-circuited (no AST produced), pass SQL through unchanged.
-	// This happens for statements like CREATE/DROP VECTOR INDEX that are classified
-	// by pattern but not understood by Vitess.
+	// If the parser short-circuited (no AST produced), the statement was classified by
+	// pattern rather than parsed by Vitess (e.g. CREATE/DROP VECTOR INDEX, DROP INDEX).
+	// Use the SQLite SQL the classifier built, if any; otherwise pass the SQL through
+	// unchanged (e.g. vector index DDL, which downstream code handles via extracted
+	// metadata rather than by executing the raw SQL against SQLite).
 	if ctx.MySQLState != nil && ctx.MySQLState.AST == nil {
-		ctx.Output.Statements = []TranspiledStatement{{SQL: ctx.Input.SQL, Params: ctx.Input.Parameters}}
+		sql := ctx.Input.SQL
+		if ctx.MySQLState.TranspiledSQL != "" {
+			sql = ctx.MySQLState.TranspiledSQL
+		}
+		ctx.Output.Statements = []TranspiledStatement{{SQL: sql, Params: ctx.Input.Parameters}}
 		return nil
 	}
 

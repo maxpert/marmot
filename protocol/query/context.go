@@ -112,6 +112,11 @@ type QueryOutput struct {
 type TranspiledStatement struct {
 	SQL    string
 	Params []interface{}
+	// ParamOrder is set only when SQL mixes the caller's own bind
+	// placeholders with values the pipeline itself extracted (e.g. a
+	// server-injected auto-increment id) - see transform.ExtractLiterals and
+	// protocol.MergeExecParams. nil means Params is the only source needed.
+	ParamOrder []bool
 }
 
 // MySQLParseState holds MySQL-specific parsing state and metadata.
@@ -143,6 +148,10 @@ type MySQLParseState struct {
 	// SkipVitess signals that the statement was fully classified by pattern
 	// and must not be passed to Vitess (e.g. vector index DDL, DROP INDEX).
 	SkipVitess bool
+	// TranspiledSQL holds SQLite-syntax SQL built directly by the pattern classifier for
+	// statements Vitess cannot parse at all (SkipVitess == true). When set, the pipeline
+	// uses it instead of forwarding the original MySQL SQL unchanged.
+	TranspiledSQL string
 }
 
 // QueryContext holds all state for processing a single query through the pipeline.

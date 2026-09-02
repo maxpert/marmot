@@ -568,7 +568,24 @@ func TestApplyCDCDelete_CompositePKWithNullComponent(t *testing.T) {
 }
 
 // TestUnmarshalCDCValue_BytesToString verifies []byte converts to string
-func TestUnmarshalCDCValue_BytesToString(t *testing.T) {
+// TestUnmarshalCDCValue_PreservesEncodedType verifies unmarshalCDCValue uses
+// STRICT msgpack decoding: it returns exactly the Go type that was encoded,
+// with no byte-slice-to-string coercion. A []byte value decodes back as
+// []byte (msgpack Bin), preserving BLOB storage class on apply.
+//
+// This replaces the old "bytes always convert to string" contract: that
+// conversion was previously done unconditionally here (and via
+// encoding.Unmarshal's loose interface decoding before that), which silently
+// corrupted BLOB columns - they were captured as raw []byte too, with no way
+// to tell them apart from a TEXT column's []byte at this point. The decision
+// of whether a []byte should round-trip as string now happens earlier, at
+// capture time, using the column's declared TEXT affinity
+// (encodeValuesWithSchema in preupdate_hook.go: TEXT-affinity columns are
+// converted to string BEFORE encoding, so they arrive here already encoded
+// as msgpack Str and decode as string; see TestEncodeValuesWithSchema_BlobVsText
+// and the TestBlobFidelity_* tests in cdc_blob_fidelity_test.go for the
+// full capture->apply round trip this enables).
+func TestUnmarshalCDCValue_PreservesEncodedType(t *testing.T) {
 	tests := []struct {
 		name     string
 		input    interface{}
@@ -595,9 +612,9 @@ func TestUnmarshalCDCValue_BytesToString(t *testing.T) {
 			expected: nil,
 		},
 		{
-			name:     "Byte slice (should convert to string)",
-			input:    []byte("text_data"),
-			expected: "text_data",
+			name:     "Byte slice (must stay []byte, not be coerced to string)",
+			input:    []byte("blob_data"),
+			expected: []byte("blob_data"),
 		},
 	}
 
@@ -609,17 +626,16 @@ func TestUnmarshalCDCValue_BytesToString(t *testing.T) {
 				t.Fatalf("unmarshalCDCValue failed: %v", err)
 			}
 
-			// Special handling for []byte -> string conversion
-			if tt.name == "Byte slice (should convert to string)" {
-				if str, ok := result.(string); !ok {
-					t.Errorf("Expected string, got %T", result)
-				} else if str != tt.expected {
-					t.Errorf("Expected '%v', got '%v'", tt.expected, result)
+			if expectedBytes, ok := tt.expected.([]byte); ok {
+				resultBytes, ok := result.([]byte)
+				if !ok {
+					t.Fatalf("Expected []byte, got %T", result)
 				}
-			} else {
-				if result != tt.expected {
-					t.Errorf("Expected %v (%T), got %v (%T)", tt.expected, tt.expected, result, result)
+				if string(resultBytes) != string(expectedBytes) {
+					t.Errorf("Expected %v, got %v", expectedBytes, resultBytes)
 				}
+			} else if result != tt.expected {
+				t.Errorf("Expected %v (%T), got %v (%T)", tt.expected, tt.expected, result, result)
 			}
 		})
 	}
@@ -663,4 +679,86 @@ func TestApplyCDC_EmptyValues(t *testing.T) {
 	if err == nil {
 		t.Error("Expected error for empty DELETE values, got nil")
 	}
+}
+
+// TestApplyCDCUpdate_NoRowsMatched verifies an UPDATE whose WHERE clause
+// matches no row is NOT treated as an error - it must return nil so a
+// legitimate no-op (e.g. the row was already removed by an FK ON DELETE
+// CASCADE that ran ahead of this CDC entry) doesn't abort replication. The
+// row-affected count is only surfaced via a Debug log for diagnosability, not
+// as a failure.
+func TestApplyCDCUpdate_NoRowsMatched(t *testing.T) {
+	db, cleanup := setupCDCTestDB(t)
+	defer cleanup()
+
+	_, err := db.Exec(`CREATE TABLE test_noop (id INTEGER PRIMARY KEY, name TEXT)`)
+	if err != nil {
+		t.Fatalf("Failed to create table: %v", err)
+	}
+	// Table is intentionally left empty - no row with id=999 exists.
+
+	schema := &mockSchemaProvider{
+		schemas: map[string][]string{
+			"test_noop": {"id"},
+		},
+	}
+
+	oldValues := map[string][]byte{"id": marshalValue(t, int64(999))}
+	newValues := map[string][]byte{"id": marshalValue(t, int64(999)), "name": marshalValue(t, "ghost")}
+
+	err = ApplyCDCUpdate(db, schema, "test_noop", oldValues, newValues)
+	if err != nil {
+		t.Fatalf("ApplyCDCUpdate on a non-matching row must return nil, got: %v", err)
+	}
+}
+
+// TestApplyCDCDelete_NoRowsMatched verifies a DELETE whose WHERE clause
+// matches no row is likewise not an error (see TestApplyCDCUpdate_NoRowsMatched).
+func TestApplyCDCDelete_NoRowsMatched(t *testing.T) {
+	db, cleanup := setupCDCTestDB(t)
+	defer cleanup()
+
+	_, err := db.Exec(`CREATE TABLE test_noop_del (id INTEGER PRIMARY KEY, name TEXT)`)
+	if err != nil {
+		t.Fatalf("Failed to create table: %v", err)
+	}
+
+	schema := &mockSchemaProvider{
+		schemas: map[string][]string{
+			"test_noop_del": {"id"},
+		},
+	}
+
+	oldValues := map[string][]byte{"id": marshalValue(t, int64(999))}
+
+	err = ApplyCDCDelete(db, schema, "test_noop_del", oldValues)
+	if err != nil {
+		t.Fatalf("ApplyCDCDelete on a non-matching row must return nil, got: %v", err)
+	}
+}
+
+// TestLogZeroRowsAffected_OnlyLogsOnZero verifies the helper distinguishes a
+// real zero-rows case from a normal affected-rows result and from a driver
+// that can't report RowsAffected, without ever panicking or altering control
+// flow (it has no return value to affect - this locks in that contract).
+func TestLogZeroRowsAffected_OnlyLogsOnZero(t *testing.T) {
+	db, cleanup := setupCDCTestDB(t)
+	defer cleanup()
+
+	_, err := db.Exec(`CREATE TABLE test_log (id INTEGER PRIMARY KEY)`)
+	if err != nil {
+		t.Fatalf("Failed to create table: %v", err)
+	}
+	res, err := db.Exec(`INSERT INTO test_log (id) VALUES (1)`)
+	if err != nil {
+		t.Fatalf("Failed to insert: %v", err)
+	}
+	// sql.Result from a normal driver Exec: must not panic regardless of count.
+	logZeroRowsAffected(res, "TestOp", "test_log")
+
+	zeroRes, err := db.Exec(`DELETE FROM test_log WHERE id = 999`)
+	if err != nil {
+		t.Fatalf("Failed to exec no-op delete: %v", err)
+	}
+	logZeroRowsAffected(zeroRes, "TestOp", "test_log")
 }

@@ -14,7 +14,7 @@ func TestExtractLiterals_Insert(t *testing.T) {
 		t.Fatalf("Failed to parse SQL: %v", err)
 	}
 
-	params := ExtractLiterals(stmt)
+	params, _ := ExtractLiterals(stmt)
 
 	if params == nil {
 		t.Fatal("Expected params, got nil")
@@ -62,7 +62,7 @@ func TestExtractLiterals_BinaryData(t *testing.T) {
 		t.Fatalf("Failed to parse SQL: %v", err)
 	}
 
-	params := ExtractLiterals(stmt)
+	params, _ := ExtractLiterals(stmt)
 
 	if params == nil {
 		t.Fatal("Expected params, got nil")
@@ -92,7 +92,7 @@ func TestExtractLiterals_Update(t *testing.T) {
 		t.Fatalf("Failed to parse SQL: %v", err)
 	}
 
-	params := ExtractLiterals(stmt)
+	params, _ := ExtractLiterals(stmt)
 
 	if params == nil {
 		t.Fatal("Expected params, got nil")
@@ -132,7 +132,7 @@ func TestExtractLiterals_Select(t *testing.T) {
 		t.Fatalf("Failed to parse SQL: %v", err)
 	}
 
-	params := ExtractLiterals(stmt)
+	params, _ := ExtractLiterals(stmt)
 
 	if params == nil {
 		t.Fatal("Expected params, got nil")
@@ -160,7 +160,7 @@ func TestExtractLiterals_HexLiteral(t *testing.T) {
 		t.Fatalf("Failed to parse SQL: %v", err)
 	}
 
-	params := ExtractLiterals(stmt)
+	params, _ := ExtractLiterals(stmt)
 
 	if params == nil {
 		t.Fatal("Expected params, got nil")
@@ -196,7 +196,7 @@ func TestExtractLiterals_NoLiterals(t *testing.T) {
 		t.Fatalf("Failed to parse SQL: %v", err)
 	}
 
-	params := ExtractLiterals(stmt)
+	params, _ := ExtractLiterals(stmt)
 
 	if params != nil {
 		t.Errorf("Expected nil for statement with no literals, got %d params", len(params))
@@ -212,7 +212,7 @@ func TestExtractLiterals_MixedTypes(t *testing.T) {
 		t.Fatalf("Failed to parse SQL: %v", err)
 	}
 
-	params := ExtractLiterals(stmt)
+	params, _ := ExtractLiterals(stmt)
 
 	if params == nil {
 		t.Fatal("Expected params, got nil")
@@ -248,7 +248,7 @@ func TestExtractLiterals_NestedSubquery(t *testing.T) {
 		t.Fatalf("Failed to parse SQL: %v", err)
 	}
 
-	params := ExtractLiterals(stmt)
+	params, _ := ExtractLiterals(stmt)
 
 	if params == nil {
 		t.Fatal("Expected params, got nil")
@@ -270,7 +270,7 @@ func TestExtractLiterals_NestedSubquery(t *testing.T) {
 }
 
 func TestExtractLiterals_NilStatement(t *testing.T) {
-	params := ExtractLiterals(nil)
+	params, _ := ExtractLiterals(nil)
 	if params != nil {
 		t.Errorf("Expected nil for nil statement, got %v", params)
 	}

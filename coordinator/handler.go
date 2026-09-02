@@ -66,6 +66,12 @@ type ReplicatedDatabaseProvider interface {
 	GetSchemaCache() interface{} // Returns *SchemaCache (using interface{} to avoid import cycle)
 	// DescribeResultColumns reports the columns a query returns without running it.
 	DescribeResultColumns(ctx context.Context, query string) ([]common.ResultColumn, error)
+	// BeginPinnedSession starts a PinnedSession for eager DML execution inside
+	// an explicit transaction (see PinnedSession doc). ctx governs the pinned
+	// SQLite transaction's entire lifetime: the caller must not cancel it
+	// until after calling Release, matching ExecuteLocalWithHooks's existing
+	// cancelHookCtx convention.
+	BeginPinnedSession(ctx context.Context, txnID uint64) (PinnedSession, error)
 }
 
 // ExecutionRequest for local-only execution - never replicated
@@ -167,6 +173,18 @@ func getDDLValidationTimeout() time.Duration {
 	return 60 * time.Second
 }
 
+// pinnedSessionTimeout bounds how long a pinned eager-execution SQLite
+// transaction's context stays alive - reuses the existing hook-execution lock
+// wait timeout (same knob ExecuteLocalWithHooks's autocommit path already
+// uses for hookDB sessions), applied here for its naturally longer eager
+// duration instead of a new speculative config value.
+func pinnedSessionTimeout() time.Duration {
+	if cfg.Config != nil && cfg.Config.Transaction.LockWaitTimeoutSeconds > 0 {
+		return time.Duration(cfg.Config.Transaction.LockWaitTimeoutSeconds) * time.Second
+	}
+	return 50 * time.Second
+}
+
 // writeTimeoutForStatements returns the deadline budget WriteTransaction needs
 // for this transaction: the DDL validation timeout if it carries any DDL
 // statement (PREPARE will execute-and-rollback the real statement for each
@@ -225,6 +243,15 @@ type CoordinatorHandler struct {
 	publisherMu        sync.RWMutex
 	draining           atomic.Bool
 	vecGoRankTemplates sync.Map
+
+	// pinnedTxns tracks the pinned eager-execution SQLite transactions for
+	// each connection's currently open explicit transaction (see
+	// pinned_txn.go). Keyed by ConnectionSession.ConnID; a connection has at
+	// most one open explicit transaction at a time, so ConnID alone is a
+	// sufficient key. Entries are created lazily on the first DML inside a
+	// transaction and always removed via takePinnedState at COMMIT, ROLLBACK,
+	// or CloseSession.
+	pinnedTxns sync.Map
 
 	// vecEngine is the VectorUDFProvider used by the vector-query rewriter
 	// (see coordinator/vec_rewrite.go). It is set once at startup via
@@ -359,6 +386,13 @@ func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, sq
 		Bool("transpilation", session.TranspilationEnabled).
 		Msg("PARSED")
 
+	// Fail fast on statements the parser/transpiler could not handle (e.g. a DDL
+	// statement Vitess only partially parsed) instead of forwarding the mangled
+	// SQL into the read/2PC path, where it produces a confusing downstream error.
+	if stmt.Type == protocol.StatementUnsupported && stmt.Error != "" {
+		return nil, protocol.NewMySQLError(protocol.ErrCodeParseError, protocol.SQLStateSyntax, stmt.Error)
+	}
+
 	// Handle SET commands: extract @@marmot_vec_* vars via Vitess AST; ignore others.
 	if stmt.Type == protocol.StatementSet {
 		return h.handleSetCommand(session, sql)
@@ -454,7 +488,19 @@ func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, sq
 
 	// If in explicit transaction, buffer mutations instead of immediate 2PC
 	if inTransaction && isMutation {
-		return h.bufferStatement(session, stmt)
+		// MySQL has no transactional DDL: DDL ends the open transaction before
+		// it runs. Honouring that lets DML later in the transaction see a
+		// column the DDL added, which buffering to COMMIT cannot do.
+		if causesImplicitCommit(stmt) && cfg.Config.Transaction.DDLImplicitCommit {
+			if err := h.implicitCommitBeforeDDL(session, stmt); err != nil {
+				return nil, err
+			}
+			inTransaction = false
+		} else if protocol.IsDML(stmt) {
+			return h.executeEagerDML(session, stmt, params)
+		} else {
+			return h.bufferStatement(session, stmt)
+		}
 	}
 
 	// Normal path - immediate execution (for YCSB and auto-commit clients)
@@ -474,6 +520,19 @@ func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, sq
 			rs, err := h.executeVectorPlan(stmt, info, rewrittenArgs, consistency)
 			if err != nil {
 				return nil, err
+			}
+			h.processFoundRowsResult(session, rs)
+			return rs, nil
+		}
+	}
+
+	// Read-your-own-writes: a plain SELECT inside an explicit transaction
+	// that already pinned this database reads from the pinned session so it
+	// observes the transaction's own uncommitted writes.
+	if stmt.Type == protocol.StatementSelect && inTransaction {
+		if rs, handled, readErr := h.tryPinnedRead(session, stmt, params); handled {
+			if readErr != nil {
+				return nil, readErr
 			}
 			h.processFoundRowsResult(session, rs)
 			return rs, nil
@@ -600,11 +659,9 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, params []in
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), hookTimeout)
 		cancelHookCtx = cancel // Store for later - DO NOT call yet
-		// Use extracted params from literal extraction, or wire protocol params
-		execParams := params
-		if len(execParams) == 0 && len(stmt.ExtractedParams) > 0 {
-			execParams = stmt.ExtractedParams
-		}
+		// Merge extracted-literal params with wire protocol params in
+		// serialization order (see protocol.Statement.MergeExecParams).
+		execParams := stmt.MergeExecParams(params)
 		req := ExecutionRequest{SQL: stmt.SQL, Params: execParams}
 		pendingExec, err = replicatedDB.ExecuteLocalWithHooks(ctx, uint64(txnID), []ExecutionRequest{req})
 
@@ -737,6 +794,87 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, params []in
 	return rs, nil
 }
 
+// executeEagerDML runs one DML statement inside an explicit transaction
+// eagerly, against a pinned (or newly-pinned) SQLite transaction for
+// stmt.Database, and returns the REAL rows-affected/last-insert-id SQLite
+// reports - mirroring handleMutation's autocommit pattern but keeping the
+// transaction open (via PinnedSession) instead of committing through 2PC
+// immediately. The write only becomes durable when the caller later runs
+// handleCommit, which replays every pinned session's captured CDC entries
+// through the same 2PC path autocommit DML uses.
+func (h *CoordinatorHandler) executeEagerDML(session *protocol.ConnectionSession, stmt protocol.Statement, params []interface{}) (*protocol.ResultSet, error) {
+	txnState := session.GetTransaction()
+	if txnState == nil {
+		return nil, fmt.Errorf("no active transaction")
+	}
+	if stmt.Database == "" {
+		return nil, fmt.Errorf("no database selected for statement inside transaction")
+	}
+
+	replicatedDB, err := h.dbManager.GetReplicatedDatabase(stmt.Database)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get database %s: %w", stmt.Database, err)
+	}
+
+	st := h.getOrCreatePinnedState(session.ConnID, txnState.TxnID)
+	pinned, err := st.getOrPin(stmt.Database, func() (PinnedSession, context.CancelFunc, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), pinnedSessionTimeout())
+		pinnedSession, err := replicatedDB.BeginPinnedSession(ctx, txnState.TxnID)
+		if err != nil {
+			cancel()
+			return nil, nil, err
+		}
+		return pinnedSession, cancel, nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to pin transaction on database %s: %w", stmt.Database, err)
+	}
+	session.MarkPinnedStateActive()
+
+	execParams := stmt.MergeExecParams(params)
+
+	execCtx, cancel := context.WithTimeout(context.Background(), pinnedSessionTimeout())
+	defer cancel()
+	rowsAffected, lastInsertId, err := pinned.ExecuteStatement(execCtx, stmt.SQL, execParams)
+	if err != nil {
+		return nil, fmt.Errorf("DML execution failed: %w", err)
+	}
+
+	rs := &protocol.ResultSet{RowsAffected: rowsAffected}
+	if stmt.Type == protocol.StatementInsert || stmt.Type == protocol.StatementReplace {
+		rs.LastInsertId = lastInsertId
+	}
+	return rs, nil
+}
+
+// tryPinnedRead routes a SELECT to the pinned session for stmt.Database, if
+// one exists on this connection's open transaction, so it observes the
+// transaction's own uncommitted writes (read-your-own-writes). handled is
+// false when there is no pinned session for this database (or no open
+// transaction), meaning the caller should fall through to the normal read
+// path - reads before any DML, or on a database nothing has written to yet.
+func (h *CoordinatorHandler) tryPinnedRead(session *protocol.ConnectionSession, stmt protocol.Statement, params []interface{}) (*protocol.ResultSet, bool, error) {
+	st := h.lookupPinnedState(session.ConnID)
+	if st == nil {
+		return nil, false, nil
+	}
+	pinned, ok := st.get(stmt.Database)
+	if !ok {
+		return nil, false, nil
+	}
+
+	execParams := stmt.MergeExecParams(params)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	columns, rows, err := pinned.Query(ctx, stmt.SQL, execParams)
+	if err != nil {
+		return nil, true, err
+	}
+
+	return buildResultSetFromRows(columns, rows), true, nil
+}
+
 func (h *CoordinatorHandler) handleVectorControlMutation(
 	stmt protocol.Statement,
 	txnID uint64,
@@ -858,14 +996,61 @@ func (h *CoordinatorHandler) handleVectorControlMutation(
 	return &protocol.ResultSet{RowsAffected: 0, CommittedTxnId: txnID}, nil
 }
 
+// buildResultSetFromRows converts column names and row maps (the shape both
+// ReadCoordinator.ReadTransaction and PinnedSession.Query return) into a
+// protocol.ResultSet, inferring column types from the values themselves.
+func buildResultSetFromRows(columns []string, rows []map[string]interface{}) *protocol.ResultSet {
+	rs := &protocol.ResultSet{
+		Columns: make([]protocol.ColumnDef, 0),
+		Rows:    make([][]interface{}, 0),
+	}
+
+	if len(rows) == 0 && len(columns) == 0 {
+		return rs
+	}
+
+	// Use columns from response if available (preserves order)
+	if len(columns) > 0 {
+		for _, colName := range columns {
+			rs.Columns = append(rs.Columns, protocol.ColumnDef{Name: colName})
+		}
+	} else if len(rows) > 0 {
+		// Fallback: Infer columns from first row (sorted for consistent order)
+		firstRow := rows[0]
+		colNames := make([]string, 0, len(firstRow))
+		for colName := range firstRow {
+			colNames = append(colNames, colName)
+		}
+		sort.Strings(colNames)
+		for _, colName := range colNames {
+			rs.Columns = append(rs.Columns, protocol.ColumnDef{Name: colName})
+		}
+	}
+
+	for _, rowMap := range rows {
+		row := make([]interface{}, len(rs.Columns))
+		for i, col := range rs.Columns {
+			row[i] = rowMap[col.Name]
+		}
+		rs.Rows = append(rs.Rows, row)
+	}
+
+	// Column types come from the values themselves: SQLite types values, not
+	// columns, and strict clients refuse to decode a number out of a column
+	// declared as text.
+	for i, t := range protocol.InferColumnTypes(rs.Rows, len(rs.Columns)) {
+		rs.Columns[i].Type = t
+	}
+
+	return rs
+}
+
 func (h *CoordinatorHandler) handleRead(stmt protocol.Statement, params []interface{}, consistency protocol.ConsistencyLevel) (*protocol.ResultSet, error) {
 	queryStart := time.Now()
 
-	// Use extracted params from literal extraction, or wire protocol params
-	execParams := params
-	if len(execParams) == 0 && len(stmt.ExtractedParams) > 0 {
-		execParams = stmt.ExtractedParams
-	}
+	// Merge extracted-literal params with wire protocol params in
+	// serialization order (see protocol.Statement.MergeExecParams).
+	execParams := stmt.MergeExecParams(params)
 
 	req := &ReadRequest{
 		Query:       stmt.SQL,
@@ -905,45 +1090,7 @@ func (h *CoordinatorHandler) handleRead(stmt protocol.Statement, params []interf
 	}
 
 	// Convert to protocol.ResultSet
-	rs := &protocol.ResultSet{
-		Columns: make([]protocol.ColumnDef, 0),
-		Rows:    make([][]interface{}, 0),
-	}
-
-	if len(resp.Rows) > 0 || len(resp.Columns) > 0 {
-		// Use columns from response if available (preserves order)
-		if len(resp.Columns) > 0 {
-			for _, colName := range resp.Columns {
-				rs.Columns = append(rs.Columns, protocol.ColumnDef{Name: colName})
-			}
-		} else if len(resp.Rows) > 0 {
-			// Fallback: Infer columns from first row (sorted for consistent order)
-			firstRow := resp.Rows[0]
-			colNames := make([]string, 0, len(firstRow))
-			for colName := range firstRow {
-				colNames = append(colNames, colName)
-			}
-			sort.Strings(colNames)
-			for _, colName := range colNames {
-				rs.Columns = append(rs.Columns, protocol.ColumnDef{Name: colName})
-			}
-		}
-
-		for _, rowMap := range resp.Rows {
-			row := make([]interface{}, len(rs.Columns))
-			for i, col := range rs.Columns {
-				row[i] = rowMap[col.Name]
-			}
-			rs.Rows = append(rs.Rows, row)
-		}
-
-		// Column types come from the values themselves: SQLite types values, not
-		// columns, and strict clients refuse to decode a number out of a column
-		// declared as text.
-		for i, t := range protocol.InferColumnTypes(rs.Rows, len(rs.Columns)) {
-			rs.Columns[i].Type = t
-		}
-	}
+	rs := buildResultSetFromRows(resp.Columns, resp.Rows)
 
 	// Record success metrics
 	telemetry.QueriesTotal.With("select", "success").Inc()
@@ -1165,9 +1312,31 @@ func (h *CoordinatorHandler) handleCommit(session *protocol.ConnectionSession) (
 	}
 
 	txnState := session.GetTransaction()
-	if txnState == nil || len(txnState.Statements) == 0 {
-		// Empty transaction - just clear and return OK
+	pinnedState := h.takePinnedState(session.ConnID)
+
+	bufferedCount := 0
+	hadPinnedState := false
+	if txnState != nil {
+		bufferedCount = len(txnState.Statements)
+		hadPinnedState = txnState.HadPinnedState
+	}
+	if bufferedCount == 0 && (pinnedState == nil || pinnedState.isEmpty()) {
 		session.EndTransaction()
+		if hadPinnedState {
+			// This transaction did pin eager-execution state at some point
+			// (executeEagerDML ran and called MarkPinnedStateActive), but
+			// that state is gone now without this COMMIT having read it -
+			// e.g. a concurrent forward-session eviction took and released
+			// it out from under an in-flight COMMIT. Reporting OK here would
+			// silently drop an already-executed write, so fail loud instead
+			// of taking the empty-transaction fast path.
+			log.Error().
+				Uint64("conn_id", session.ConnID).
+				Uint64("txn_id", txnState.TxnID).
+				Msg("COMMIT: pinned transaction state missing at commit time; refusing to report success")
+			return nil, fmt.Errorf("transaction state for conn_id=%d txn_id=%d was lost before commit", session.ConnID, txnState.TxnID)
+		}
+		// Empty transaction - just clear and return OK
 		log.Debug().
 			Uint64("conn_id", session.ConnID).
 			Msg("COMMIT: Empty transaction")
@@ -1177,73 +1346,55 @@ func (h *CoordinatorHandler) handleCommit(session *protocol.ConnectionSession) (
 	log.Debug().
 		Uint64("conn_id", session.ConnID).
 		Uint64("txn_id", txnState.TxnID).
-		Int("stmt_count", len(txnState.Statements)).
+		Int("stmt_count", bufferedCount).
 		Msg("COMMIT: Executing batched transaction via 2PC")
 
-	// Execute DML statements with hooks to capture CDC data
-	// This is required for 2PC replication - without CDC data, intents cannot be created
-	enrichedStatements := make([]protocol.Statement, 0, len(txnState.Statements))
+	// Gather CDC entries already captured by every pinned (eager) session,
+	// plus whatever non-DML statements are still buffered (DDL when the
+	// implicit-commit flag is off, DCL, LOAD DATA, etc.) - DML never reaches
+	// txnState.Statements anymore, it executed eagerly via executeEagerDML.
+	enrichedStatements := make([]protocol.Statement, 0, bufferedCount)
 	var totalRowsAffected int64
 	allCDCEntries := make([]common.CDCEntry, 0) // Collect all CDC entries for publishing
 
-	hookTimeout := 50 * time.Second
-	if cfg.Config != nil && cfg.Config.Transaction.LockWaitTimeoutSeconds > 0 {
-		hookTimeout = time.Duration(cfg.Config.Transaction.LockWaitTimeoutSeconds) * time.Second
+	if pinnedState != nil {
+		for _, database := range pinnedState.databasesSorted() {
+			pinned, ok := pinnedState.get(database)
+			if !ok {
+				continue
+			}
+			cdcEntries := pinned.CDCEntries()
+			if len(cdcEntries) == 0 {
+				continue
+			}
+			allCDCEntries = append(allCDCEntries, cdcEntries...)
+			for _, entry := range cdcEntries {
+				cdcStmt := ConvertToStatement(entry)
+				cdcStmt.Database = database
+				enrichedStatements = append(enrichedStatements, cdcStmt)
+			}
+			totalRowsAffected += int64(len(cdcEntries))
+		}
 	}
 
-	for i := 0; i < len(txnState.Statements); {
-		stmt := txnState.Statements[i]
-		if protocol.IsDML(stmt) && stmt.Database != "" {
-			replicatedDB, err := h.dbManager.GetReplicatedDatabase(stmt.Database)
-			if err != nil {
-				session.EndTransaction()
-				h.recentTxnIDs.Delete(txnState.TxnID)
-				return nil, fmt.Errorf("failed to get database %s: %w", stmt.Database, err)
-			}
+	for _, stmt := range txnState.Statements {
+		enrichedStatements = append(enrichedStatements, stmt)
+	}
 
-			requests := make([]ExecutionRequest, 0, 1)
-			for i < len(txnState.Statements) {
-				nextStmt := txnState.Statements[i]
-				if !protocol.IsDML(nextStmt) || nextStmt.Database != stmt.Database {
-					break
-				}
-				requests = append(requests, ExecutionRequest{
-					SQL:    nextStmt.SQL,
-					Params: nextStmt.ExtractedParams,
-				})
-				i++
-			}
-
-			ctx, cancel := context.WithTimeout(context.Background(), hookTimeout)
-			pendingExec, err := replicatedDB.ExecuteLocalWithHooks(ctx, txnState.TxnID, requests)
-			if err != nil {
-				cancel()
-				session.EndTransaction()
-				h.recentTxnIDs.Delete(txnState.TxnID)
-				return nil, fmt.Errorf("DML execution failed: %w", err)
-			}
-			cancel()
-
-			totalRowsAffected += pendingExec.GetTotalRowCount()
-
-			// Convert CDC entries directly to statements
-			cdcEntries := pendingExec.GetCDCEntries()
-			if len(cdcEntries) > 0 {
-				allCDCEntries = append(allCDCEntries, cdcEntries...)
-				for _, entry := range cdcEntries {
-					cdcStmt := ConvertToStatement(entry)
-					cdcStmt.SQL = stmt.SQL
-					cdcStmt.Database = stmt.Database
-					enrichedStatements = append(enrichedStatements, cdcStmt)
-				}
-			}
-			// No captured rows means every statement in the group matched none.
-			// They contribute nothing to replicate and are dropped; DML must
-			// never fall back to raw SQL replication.
-		} else {
-			enrichedStatements = append(enrichedStatements, stmt)
-			i++
-		}
+	// Release every pinned SQLite transaction now that its CDC entries have
+	// been read out - mirrors ExecuteLocalWithHooks's hookDB, which is rolled
+	// back immediately after capturing CDC data and well before 2PC's local
+	// commit runs (db/db_integration.go ExecuteLocalWithHooks). SQLite allows
+	// only one writer for the whole file: leaving the pinned transaction open
+	// through WriteTransaction below would contend with 2PC's own local write
+	// (TransactionManager.applyCDCEntries) on a different connection and
+	// deadlock until SQLite's busy timeout gives up with "database is
+	// locked" - confirmed by TestNoopDMLInExplicitTransaction failing that
+	// way when release was ordered after WriteTransaction as originally
+	// specified. Never commits - see PinnedSession's doc comment; the actual
+	// write only becomes durable via CDC replay in WriteTransaction below.
+	if pinnedState != nil {
+		pinnedState.releaseAll()
 	}
 
 	// Create 2PC transaction with CDC-enriched statements
@@ -1329,6 +1480,12 @@ func (h *CoordinatorHandler) handleRollback(session *protocol.ConnectionSession)
 		txnID = txnState.TxnID
 	}
 
+	// Release every pinned eager-execution session; PinnedSession.Release
+	// always rolls back, so this discards their writes.
+	if pinnedState := h.takePinnedState(session.ConnID); pinnedState != nil {
+		pinnedState.releaseAll()
+	}
+
 	// Just discard the buffer - no network activity needed
 	session.EndTransaction()
 	// Cleanup from recentTxnIDs to prevent memory growth
@@ -1344,7 +1501,63 @@ func (h *CoordinatorHandler) handleRollback(session *protocol.ConnectionSession)
 	return nil, nil // OK response
 }
 
+// CloseSession releases any pinned eager-execution transaction state left
+// open when a connection ends without an explicit COMMIT or ROLLBACK - a
+// disconnected client, or (via write forwarding) an evicted/expired forward
+// session. Satisfies protocol.SessionCloser.
+func (h *CoordinatorHandler) CloseSession(session *protocol.ConnectionSession) {
+	if session == nil {
+		return
+	}
+	if pinnedState := h.takePinnedState(session.ConnID); pinnedState != nil {
+		pinnedState.releaseAll()
+	}
+	if session.InTransaction() {
+		txnState := session.GetTransaction()
+		session.EndTransaction()
+		if txnState != nil {
+			h.recentTxnIDs.Delete(txnState.TxnID)
+		}
+	}
+}
+
 // bufferStatement adds a mutation to the active transaction buffer
+// causesImplicitCommit reports whether a statement ends an open transaction
+// before it runs, as MySQL's "statements that cause an implicit commit" do.
+// Schema changes qualify; DML does not.
+func causesImplicitCommit(stmt protocol.Statement) bool {
+	switch stmt.Type {
+	case protocol.StatementDDL,
+		protocol.StatementCreateDatabase,
+		protocol.StatementDropDatabase,
+		protocol.StatementCreateVectorIndex,
+		protocol.StatementDropVectorIndex,
+		protocol.StatementReindexVectorIndex:
+		return true
+	default:
+		return false
+	}
+}
+
+// implicitCommitBeforeDDL commits the statements buffered so far and closes the
+// transaction, so the DDL that follows runs on its own.
+//
+// The commit happens first and its failure is reported without running the DDL,
+// matching MySQL: the transaction is ended by the attempt either way, so the
+// session is left with no transaction open regardless of the outcome.
+func (h *CoordinatorHandler) implicitCommitBeforeDDL(session *protocol.ConnectionSession, stmt protocol.Statement) error {
+	log.Debug().
+		Uint64("conn_id", session.ConnID).
+		Int("stmt_type", int(stmt.Type)).
+		Msg("DDL in transaction: committing buffered statements first")
+
+	// handleCommit ends the transaction whether or not anything was buffered.
+	if _, err := h.handleCommit(session); err != nil {
+		return fmt.Errorf("implicit commit before DDL failed: %w", err)
+	}
+	return nil
+}
+
 func (h *CoordinatorHandler) bufferStatement(session *protocol.ConnectionSession, stmt protocol.Statement) (*protocol.ResultSet, error) {
 	session.AddStatement(stmt)
 

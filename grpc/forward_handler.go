@@ -29,6 +29,19 @@ type ForwardDBManager interface {
 // NewForwardHandler creates a new forward handler
 func NewForwardHandler(nodeID uint64, clock *hlc.Clock, sessionMgr *ForwardSessionManager,
 	coordHandler *coordinator.CoordinatorHandler, dbManager ForwardDBManager) *ForwardHandler {
+	// A forward session can be evicted (idle timeout, or a replica dropping
+	// its StreamChanges connection) without the replica ever sending an
+	// explicit COMMIT/ROLLBACK for a transaction it started. Since forwarded
+	// transactions run through the same eager-execution pinning as a direct
+	// MySQL connection (see HandleForwardQuery below), an evicted session
+	// left mid-transaction would otherwise leak its pinned SQLite
+	// transaction and hold the writer locked forever. Wire eviction to the
+	// same CloseSession release path protocol/server.go uses on direct
+	// connection close.
+	if sessionMgr != nil && coordHandler != nil {
+		sessionMgr.SetSessionCloser(coordHandler.CloseSession)
+	}
+
 	return &ForwardHandler{
 		nodeID:       nodeID,
 		clock:        clock,

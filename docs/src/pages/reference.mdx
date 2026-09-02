@@ -20,7 +20,12 @@ data_dir = "./marmot-data"
 heartbeat_timeout_seconds = 10  # Transaction timeout without heartbeat
 conflict_window_seconds = 10    # Conflict resolution window
 lock_wait_timeout_seconds = 50  # Lock wait timeout (MySQL: innodb_lock_wait_timeout)
+ddl_implicit_commit = true      # DDL commits the open transaction, as MySQL does
 ```
+
+**`ddl_implicit_commit`** (default `true`): MySQL has no transactional DDL. `CREATE`, `ALTER`, and `DROP` implicitly commit the transaction a session has open, then run on their own, leaving no transaction open. Marmot follows that by default, so DML can see a column added earlier in the same transaction — the pattern schema migration tools rely on.
+
+Set it to `false` to keep DDL inside the transaction and replicate it atomically with the surrounding statements. Statements are then buffered until `COMMIT`, so DML in that transaction cannot see a schema change made earlier in it.
 
 **Note**: Transaction log garbage collection is managed by the replication configuration to coordinate with anti-entropy. See `replication.gc_min_retention_hours` and `replication.gc_max_retention_hours`.
 

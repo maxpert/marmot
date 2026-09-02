@@ -94,6 +94,18 @@ type TransactionConfiguration struct {
 	HeartbeatTimeoutSeconds int `toml:"heartbeat_timeout_seconds"` // Transaction timeout without heartbeat
 	ConflictWindowSeconds   int `toml:"conflict_window_seconds"`   // LWW conflict resolution window
 	LockWaitTimeoutSeconds  int `toml:"lock_wait_timeout_seconds"` // How long to wait for locks (MySQL: innodb_lock_wait_timeout)
+
+	// DDLImplicitCommit makes DDL end an open transaction before it runs, as
+	// MySQL does. MySQL has no transactional DDL: CREATE/ALTER/DROP implicitly
+	// commit the active transaction, then run on their own, leaving the session
+	// with no transaction open.
+	//
+	// With this enabled (the default), a transaction that mixes DDL and DML
+	// behaves as it would on MySQL, so DML can see a column added earlier in
+	// the same transaction. Disable it to keep DDL inside the transaction and
+	// replicate it atomically with the surrounding statements, at the cost of
+	// DML in that transaction not seeing the pending schema change.
+	DDLImplicitCommit bool `toml:"ddl_implicit_commit"`
 }
 
 // MetaStoreConfiguration controls PebbleDB metadata storage
@@ -291,9 +303,10 @@ var Config = &Configuration{
 	},
 
 	Transaction: TransactionConfiguration{
-		HeartbeatTimeoutSeconds: 10, // Timeout transactions after 10s without heartbeat
-		ConflictWindowSeconds:   10, // 10 second window for LWW conflict resolution
-		LockWaitTimeoutSeconds:  50, // MySQL default: innodb_lock_wait_timeout
+		HeartbeatTimeoutSeconds: 10,   // Timeout transactions after 10s without heartbeat
+		ConflictWindowSeconds:   10,   // 10 second window for LWW conflict resolution
+		LockWaitTimeoutSeconds:  50,   // MySQL default: innodb_lock_wait_timeout
+		DDLImplicitCommit:       true, // MySQL semantics: DDL commits the open transaction
 	},
 
 	MetaStore: MetaStoreConfiguration{

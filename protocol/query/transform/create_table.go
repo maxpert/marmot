@@ -54,21 +54,7 @@ func (r *CreateTableRule) Transform(stmt sqlparser.Statement, params []interface
 
 	// Process columns: strip MySQL-specific options
 	for _, col := range create.TableSpec.Columns {
-		if col.Type != nil {
-			// Strip display widths from integer types: INTEGER(20) → INTEGER
-			if isIntegerType(col.Type.Type) {
-				col.Type.Length = nil
-			}
-			// Strip MySQL-specific column options
-			if col.Type.Options != nil {
-				// Strip MySQL-specific COLLATE (SQLite only supports NOCASE, BINARY, RTRIM)
-				col.Type.Options.Collate = ""
-				// Strip MySQL-specific COMMENT (not supported in SQLite column definitions)
-				col.Type.Options.Comment = nil
-			}
-			// Also strip charset (SQLite doesn't use MySQL charsets)
-			col.Type.Charset = sqlparser.ColumnCharset{}
-		}
+		stripMySQLColumnType(col.Type)
 	}
 
 	// Build results

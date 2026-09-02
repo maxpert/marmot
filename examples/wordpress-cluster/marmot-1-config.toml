@@ -1,4 +1,4 @@
-# Marmot v2.9.15-beta - WordPress Cluster Node 1
+# Marmot v2.9.16-beta - WordPress Cluster Node 1
 
 node_id = 1
 data_dir = "/data"
@@ -7,6 +7,13 @@ data_dir = "/data"
 heartbeat_timeout_seconds = 10
 conflict_window_seconds = 10
 lock_wait_timeout_seconds = 50
+
+# MySQL has no transactional DDL: CREATE/ALTER/DROP implicitly commit the open
+# transaction, then run on their own. Keep true for MySQL-compatible behaviour so
+# DML can see a schema change made earlier in the same transaction.
+# Set false to keep DDL inside the transaction and replicate it atomically with
+# the surrounding statements.
+ddl_implicit_commit = true
 
 [cluster]
 grpc_bind_address = "0.0.0.0"

@@ -28,10 +28,7 @@ func (h *CoordinatorHandler) maybeRewriteVectorSelect(
 		return nil, nil, nil
 	}
 
-	execParams := params
-	if len(execParams) == 0 && len(stmt.ExtractedParams) > 0 {
-		execParams = stmt.ExtractedParams
-	}
+	execParams := stmt.MergeExecParams(params)
 
 	querySession := &connQuerySession{vars: &session.VecVars}
 	templateKey := makeGoRankTemplateKey(stmt.SQL, session.CurrentDatabase, querySession)
@@ -129,17 +126,13 @@ func (h *CoordinatorHandler) executeVectorPlan(
 			return nil, err
 		}
 		if info.FallbackOn && rs != nil && len(rs.Rows) < info.K && info.FallbackSQL != "" {
-			fb := stmt
-			fb.SQL = info.FallbackSQL
-			fb.ExtractedParams = args
+			fb := stmt.WithResolvedParams(info.FallbackSQL, args)
 			return h.handleRead(fb, args, consistency)
 		}
 		return rs, nil
 	}
 
-	primary := stmt
-	primary.SQL = info.PrimarySQL
-	primary.ExtractedParams = args
+	primary := stmt.WithResolvedParams(info.PrimarySQL, args)
 
 	rs, err := h.handleRead(primary, args, consistency)
 	if err != nil {
@@ -148,9 +141,7 @@ func (h *CoordinatorHandler) executeVectorPlan(
 
 	// §7.5 short-result fallback: only post-filter with explicit FallbackOn.
 	if info.FallbackOn && info.Plan == PlanPostFilter && rs != nil && len(rs.Rows) < info.K && info.FallbackSQL != "" {
-		fb := stmt
-		fb.SQL = info.FallbackSQL
-		fb.ExtractedParams = args
+		fb := stmt.WithResolvedParams(info.FallbackSQL, args)
 		fbRS, fbErr := h.handleRead(fb, args, consistency)
 		if fbErr != nil {
 			return nil, fbErr

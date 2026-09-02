@@ -41,7 +41,9 @@ func NewTranspiler(cacheSize int, idGen id.Generator) (*Transpiler, error) {
 		&transform.DualTableRule{},            // Priority 1: Strip FROM dual
 		&transform.LastInsertIDRule{},         // Priority 5: LAST_INSERT_ID() → last_insert_rowid()
 		&transform.IntTypeRule{},              // Priority 5: Strip UNSIGNED, normalize int types
+		&transform.AlterTableColumnTypeRule{}, // Priority 8: Strip CHARACTER SET/COLLATE from ADD/MODIFY/CHANGE COLUMN
 		&transform.CreateTableRule{},          // Priority 10: Extract KEY → CREATE INDEX
+		&transform.AlterTableConstraintRule{}, // Priority 10: ADD CONSTRAINT UNIQUE / ADD INDEX / CREATE INDEX → CREATE [UNIQUE] INDEX
 		&transform.InsertOnDuplicateKeyRule{}, // Priority 20: ON DUPLICATE KEY → ON CONFLICT
 		&transform.DeleteJoinRule{},           // Priority 30: DELETE+JOIN → subquery
 		&transform.UpdateJoinRule{},           // Priority 40: UPDATE+JOIN → subquery
@@ -167,8 +169,9 @@ func (t *Transpiler) Transpile(ctx *QueryContext) error {
 
 	// Extract literals BEFORE serialization (AST mutation only)
 	var extractedParams []interface{}
+	var paramOrder []bool
 	if needsLiteralExtraction {
-		extractedParams = transform.ExtractLiterals(ast)
+		extractedParams, paramOrder = transform.ExtractLiterals(ast)
 	}
 
 	// Single serialization with all state
@@ -182,7 +185,7 @@ func (t *Transpiler) Transpile(ctx *QueryContext) error {
 		params = extractedParams
 	}
 
-	ctx.Output.Statements = []TranspiledStatement{{SQL: sql, Params: params}}
+	ctx.Output.Statements = []TranspiledStatement{{SQL: sql, Params: params, ParamOrder: paramOrder}}
 	ctx.MySQLState.AST = ast
 	ctx.MySQLState.Transformations = transformations
 

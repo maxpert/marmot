@@ -670,9 +670,11 @@ func (mdb *ReplicatedDatabase) ExecuteLocalWithHooks(ctx context.Context, txnID 
 		return nil, fmt.Errorf("failed to begin transaction: %w", err)
 	}
 
-	// Execute each statement - hooks capture raw CDC data to Pebble
+	// Execute each statement - hooks capture raw CDC data to Pebble.
+	// rows-affected is not used here: this autocommit path computes it from
+	// the captured CDC entries via CompletedLocalExecution.GetTotalRowCount.
 	for _, req := range requests {
-		if err := session.ExecContext(ctx, req.SQL, req.Params...); err != nil {
+		if _, err := session.ExecContext(ctx, req.SQL, req.Params...); err != nil {
 			_ = session.Rollback()
 			return nil, fmt.Errorf("failed to execute statement: %w", err)
 		}
@@ -704,6 +706,87 @@ func (mdb *ReplicatedDatabase) ExecuteLocalWithHooks(ctx context.Context, txnID 
 		db:           mdb,
 		rowCount:     int64(len(cdcEntries)),
 	}, nil
+}
+
+// pinnedHookSession implements coordinator.PinnedSession over an
+// EphemeralHookSession whose SQLite transaction is held open across multiple
+// statements (BEGIN...COMMIT/ROLLBACK), instead of the one-shot
+// execute-then-rollback flow ExecuteLocalWithHooks uses for autocommit
+// statements.
+type pinnedHookSession struct {
+	session *EphemeralHookSession
+}
+
+var _ coordinator.PinnedSession = (*pinnedHookSession)(nil)
+
+// ExecuteStatement runs one DML statement on the pinned transaction, then
+// captures and row-locks any newly captured CDC rows immediately so a
+// conflicting transaction sees the lock from statement time, not just from
+// Release.
+func (p *pinnedHookSession) ExecuteStatement(ctx context.Context, sql string, params []interface{}) (int64, int64, error) {
+	rowsAffected, err := p.session.ExecContext(ctx, sql, params...)
+	if err != nil {
+		return 0, 0, err
+	}
+	if err := p.session.captureAndLockNewRows(); err != nil {
+		return 0, 0, err
+	}
+	return rowsAffected, p.session.GetLastInsertId(), nil
+}
+
+func (p *pinnedHookSession) Query(ctx context.Context, sqlText string, params []interface{}) ([]string, []map[string]interface{}, error) {
+	rows, err := p.session.QueryContext(ctx, sqlText, params...)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+	return scanRowsToMaps(rows)
+}
+
+func (p *pinnedHookSession) CDCEntries() []common.CDCEntry {
+	entries := p.session.CapturedIntentEntries()
+	if len(entries) == 0 {
+		return nil
+	}
+	result := make([]common.CDCEntry, len(entries))
+	for i, e := range entries {
+		result[i] = common.CDCEntry{
+			Table:        e.Table,
+			IntentKey:    e.IntentKey,
+			Operation:    e.Operation,
+			OldValues:    e.OldValues,
+			NewValues:    e.NewValues,
+			EncodedRow:   e.EncodedRow,
+			EncodedCodec: e.EncodedCodec,
+		}
+	}
+	return result
+}
+
+func (p *pinnedHookSession) Release() error {
+	return p.session.Rollback()
+}
+
+// BeginPinnedSession starts a new PinnedSession: an EphemeralHookSession on
+// hookDB (never writeDB - same deadlock-avoidance reasoning as
+// ExecuteLocalWithHooks) with its SQLite transaction opened and left open.
+// ctx must stay alive (not be cancelled) until the caller calls Release - see
+// PinnedSession's doc comment in coordinator/pinned_txn.go.
+//
+// Unlike ExecuteLocalWithHooks, this does not fall back to statement-based
+// execution when the preupdate hook build tag is absent: eager execution
+// requires the hook build tag, consistent with how coordinator/pinned_txn.go
+// and its tests are gated.
+func (mdb *ReplicatedDatabase) BeginPinnedSession(ctx context.Context, txnID uint64) (coordinator.PinnedSession, error) {
+	session, err := StartEphemeralSession(ctx, mdb.hookDB, mdb.metaStore, mdb.schemaCache, txnID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to start pinned session: %w", err)
+	}
+	if err := session.BeginTx(ctx); err != nil {
+		session.cleanup()
+		return nil, fmt.Errorf("failed to begin pinned transaction: %w", err)
+	}
+	return &pinnedHookSession{session: session}, nil
 }
 
 // ExecuteTransaction executes a transaction with distributed transaction semantics
@@ -785,6 +868,13 @@ func (mdb *ReplicatedDatabase) ExecuteSnapshotRead(ctx context.Context, query st
 	}
 	defer rows.Close()
 
+	return scanRowsToMaps(rows)
+}
+
+// scanRowsToMaps drains rows into a (columns, row-maps) pair. []byte values
+// are converted to string, matching SQLite's TEXT/BLOB ambiguity handling
+// used elsewhere for query results. The caller owns closing rows.
+func scanRowsToMaps(rows *sql.Rows) ([]string, []map[string]interface{}, error) {
 	columns, err := rows.Columns()
 	if err != nil {
 		return nil, nil, err

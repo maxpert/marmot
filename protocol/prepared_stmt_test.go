@@ -9,7 +9,7 @@ import (
 func TestParseParamValue_TINY(t *testing.T) {
 	// MYSQL_TYPE_TINY = 0x01
 	payload := []byte{42}
-	offset, val, err := parseParamValue(payload, 0, 0x01)
+	offset, val, err := parseParamValue(payload, 0, 0x01, false)
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -25,7 +25,7 @@ func TestParseParamValue_SHORT(t *testing.T) {
 	// MYSQL_TYPE_SHORT = 0x02
 	payload := make([]byte, 2)
 	binary.LittleEndian.PutUint16(payload, 1234)
-	offset, val, err := parseParamValue(payload, 0, 0x02)
+	offset, val, err := parseParamValue(payload, 0, 0x02, false)
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -41,7 +41,7 @@ func TestParseParamValue_LONG(t *testing.T) {
 	// MYSQL_TYPE_LONG = 0x03
 	payload := make([]byte, 4)
 	binary.LittleEndian.PutUint32(payload, 123456)
-	offset, val, err := parseParamValue(payload, 0, 0x03)
+	offset, val, err := parseParamValue(payload, 0, 0x03, false)
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -57,7 +57,7 @@ func TestParseParamValue_LONGLONG(t *testing.T) {
 	// MYSQL_TYPE_LONGLONG = 0x08
 	payload := make([]byte, 8)
 	binary.LittleEndian.PutUint64(payload, 9876543210)
-	offset, val, err := parseParamValue(payload, 0, 0x08)
+	offset, val, err := parseParamValue(payload, 0, 0x08, false)
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -73,7 +73,7 @@ func TestParseParamValue_FLOAT(t *testing.T) {
 	// MYSQL_TYPE_FLOAT = 0x04
 	payload := make([]byte, 4)
 	binary.LittleEndian.PutUint32(payload, math.Float32bits(3.14))
-	offset, val, err := parseParamValue(payload, 0, 0x04)
+	offset, val, err := parseParamValue(payload, 0, 0x04, false)
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -93,7 +93,7 @@ func TestParseParamValue_DOUBLE(t *testing.T) {
 	// MYSQL_TYPE_DOUBLE = 0x05
 	payload := make([]byte, 8)
 	binary.LittleEndian.PutUint64(payload, math.Float64bits(3.14159265))
-	offset, val, err := parseParamValue(payload, 0, 0x05)
+	offset, val, err := parseParamValue(payload, 0, 0x05, false)
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -116,7 +116,7 @@ func TestParseParamValue_STRING(t *testing.T) {
 	payload[0] = byte(len(str)) // Length prefix
 	copy(payload[1:], str)
 
-	offset, val, err := parseParamValue(payload, 0, 0xFD)
+	offset, val, err := parseParamValue(payload, 0, 0xFD, false)
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -139,7 +139,7 @@ func TestParseParamValue_STRING(t *testing.T) {
 
 func TestParseParamValue_NULL(t *testing.T) {
 	// MYSQL_TYPE_NULL = 0x06
-	offset, val, err := parseParamValue([]byte{}, 0, 0x06)
+	offset, val, err := parseParamValue([]byte{}, 0, 0x06, false)
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -207,7 +207,7 @@ func BenchmarkParseParamValue_LONGLONG(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, _, _ = parseParamValue(payload, 0, 0x08)
+		_, _, _ = parseParamValue(payload, 0, 0x08, false)
 	}
 }
 

@@ -3,6 +3,7 @@ package protocol
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -62,6 +63,13 @@ type SessionTransaction struct {
 	StartTS    hlc.Timestamp
 	Statements []Statement
 	Database   string
+
+	// HadPinnedState records that eager DML pinned a real SQLite transaction
+	// for this txn at some point, so COMMIT can tell a genuinely empty
+	// transaction apart from one whose pinned state went missing before
+	// COMMIT read it (e.g. a concurrent session eviction released it). See
+	// ConnectionSession.MarkPinnedStateActive.
+	HadPinnedState bool
 }
 
 // ConnectionSession represents per-connection state
@@ -154,6 +162,17 @@ func (s *ConnectionSession) EndTransaction() {
 	s.activeTxn = nil
 }
 
+// MarkPinnedStateActive records that the active transaction has pinned a
+// real SQLite transaction for eager DML execution. A no-op if there is no
+// active transaction. See SessionTransaction.HadPinnedState.
+func (s *ConnectionSession) MarkPinnedStateActive() {
+	s.activeTxnMu.Lock()
+	defer s.activeTxnMu.Unlock()
+	if s.activeTxn != nil {
+		s.activeTxn.HadPinnedState = true
+	}
+}
+
 // NextForwardRequestID allocates the next idempotency key for write forwarding.
 func (s *ConnectionSession) NextForwardRequestID() uint64 {
 	return s.ForwardRequestSeq.Add(1)
@@ -167,6 +186,12 @@ type PreparedStatement struct {
 	ParamTypes   []byte // Cached parameter types for subsequent executions
 	OriginalType StatementCode
 	Context      *query.QueryContext
+
+	// LongData holds parameter data accumulated via COM_STMT_SEND_LONG_DATA,
+	// keyed by param_id. Per the MySQL protocol spec it persists across
+	// COM_STMT_EXECUTE calls and is only cleared by COM_STMT_RESET or
+	// COM_STMT_CLOSE (the latter simply drops the whole statement).
+	LongData map[uint16][]byte
 }
 
 // ConnectionHandler defines the interface for handling MySQL commands
@@ -190,6 +215,17 @@ type LoadDataHandler interface {
 // columns and the prepare response omits the definitions.
 type ResultColumnDescriber interface {
 	DescribeResultColumns(session *ConnectionSession, sql string) ([]ColumnDef, error)
+}
+
+// SessionCloser is an optional extension for handlers that need to release
+// per-session resources when a connection ends - notably an interactive
+// transaction's pinned execution state, which must be rolled back if the
+// client disconnects without sending COMMIT or ROLLBACK, so the SQLite
+// writer is not left locked forever. Called exactly once per connection,
+// after the command loop exits, regardless of how it exited (client EOF,
+// read error, or the connection being force-closed during shutdown).
+type SessionCloser interface {
+	CloseSession(session *ConnectionSession)
 }
 
 // ResultSet represents a MySQL result set
@@ -387,6 +423,16 @@ func (s *MySQLServer) handleConnection(conn net.Conn) {
 		VecVars:              vecindex.DefaultVecSessionVars(),
 	}
 
+	// Notify the handler (if it opts in) that this session is going away,
+	// on every exit path from this function. Registered first so it is the
+	// last deferred call to run, after everything else about this
+	// connection has already been torn down.
+	defer func() {
+		if closer, ok := s.handler.(SessionCloser); ok {
+			closer.CloseSession(session)
+		}
+	}()
+
 	telemetry.MySQLConnections.Inc()
 	defer telemetry.MySQLConnections.Dec()
 
@@ -473,6 +519,10 @@ func (s *MySQLServer) handleConnection(conn net.Conn) {
 		case 0x17: // COM_STMT_EXECUTE
 			log.Debug().Uint64("conn_id", session.ConnID).Msg("COM_STMT_EXECUTE received")
 			s.handleStmtExecute(conn, session, payload[1:])
+		case 0x18: // COM_STMT_SEND_LONG_DATA
+			s.handleStmtSendLongData(session, payload[1:])
+			// Per protocol spec, COM_STMT_SEND_LONG_DATA gets no response at all,
+			// success or failure - writing one here would desync the packet stream.
 		case 0x19: // COM_STMT_CLOSE
 			if len(payload) >= 5 {
 				stmtID := binary.LittleEndian.Uint32(payload[1:5])
@@ -482,6 +532,8 @@ func (s *MySQLServer) handleConnection(conn net.Conn) {
 				log.Debug().Uint64("conn_id", session.ConnID).Uint32("stmt_id", stmtID).Msg("Statement closed")
 			}
 			// COM_STMT_CLOSE doesn't send a response
+		case 0x1A: // COM_STMT_RESET
+			s.handleStmtReset(conn, session, payload[1:])
 		case 0x0E: // COM_PING
 			_ = s.writeOK(conn, 1, session, 0, 0)
 		case 0x01: // COM_QUIT
@@ -1159,6 +1211,56 @@ func (s *MySQLServer) handleStmtPrepare(conn net.Conn, session *ConnectionSessio
 	}
 }
 
+// handleStmtSendLongData implements COM_STMT_SEND_LONG_DATA. Per the MySQL
+// protocol spec, repeated calls for the same (statement_id, param_id) append
+// to the previously accumulated data, and the server never replies - not even
+// on error, since the client does not expect a packet for this command.
+func (s *MySQLServer) handleStmtSendLongData(session *ConnectionSession, payload []byte) {
+	if len(payload) < 6 {
+		log.Warn().Uint64("conn_id", session.ConnID).Msg("Malformed COM_STMT_SEND_LONG_DATA packet")
+		return
+	}
+	stmtID := binary.LittleEndian.Uint32(payload[0:4])
+	paramID := binary.LittleEndian.Uint16(payload[4:6])
+	data := payload[6:]
+
+	session.preparedStmtLock.Lock()
+	defer session.preparedStmtLock.Unlock()
+	stmt, ok := session.preparedStmts[stmtID]
+	if !ok {
+		log.Warn().Uint64("conn_id", session.ConnID).Uint32("stmt_id", stmtID).
+			Msg("COM_STMT_SEND_LONG_DATA for unknown statement")
+		return
+	}
+	if stmt.LongData == nil {
+		stmt.LongData = make(map[uint16][]byte)
+	}
+	stmt.LongData[paramID] = append(stmt.LongData[paramID], data...)
+}
+
+// handleStmtReset implements COM_STMT_RESET: it clears any parameter data
+// accumulated via COM_STMT_SEND_LONG_DATA for the statement and responds OK.
+func (s *MySQLServer) handleStmtReset(conn net.Conn, session *ConnectionSession, payload []byte) {
+	if len(payload) < 4 {
+		_ = s.writeError(conn, 1, 1064, "Invalid COM_STMT_RESET packet")
+		return
+	}
+	stmtID := binary.LittleEndian.Uint32(payload[0:4])
+
+	session.preparedStmtLock.Lock()
+	stmt, ok := session.preparedStmts[stmtID]
+	if ok {
+		stmt.LongData = nil
+	}
+	session.preparedStmtLock.Unlock()
+
+	if !ok {
+		_ = s.writeError(conn, 1, 1243, fmt.Sprintf("Unknown statement ID: %d", stmtID))
+		return
+	}
+	_ = s.writeOK(conn, 1, session, 0, 0)
+}
+
 func (s *MySQLServer) handleStmtExecute(conn net.Conn, session *ConnectionSession, payload []byte) {
 	if len(payload) < 9 {
 		_ = s.writeError(conn, 1, 1064, "Invalid COM_STMT_EXECUTE packet")
@@ -1234,15 +1336,41 @@ func (s *MySQLServer) handleStmtExecute(conn net.Conn, session *ConnectionSessio
 				continue
 			}
 
-			// Parse value based on type
-			if len(paramTypes) > int(i)*2 {
+			// Parameters that received COM_STMT_SEND_LONG_DATA carry no inline
+			// value in this packet - the client omits them entirely and the
+			// server must use the previously accumulated buffer instead.
+			// Guarded by preparedStmtLock for consistency with every write to
+			// stmt.LongData, even though the per-connection command loop is
+			// otherwise single-threaded.
+			session.preparedStmtLock.Lock()
+			longData, hasLongData := stmt.LongData[i]
+			var longDataCopy []byte
+			if hasLongData {
+				longDataCopy = make([]byte, len(longData))
+				copy(longDataCopy, longData)
+			}
+			session.preparedStmtLock.Unlock()
+			if hasLongData {
+				params[i] = longDataCopy
+				continue
+			}
+
+			// Parse value based on type. Each parameter type is 2 bytes: the
+			// type byte followed by a flags byte whose 0x80 bit marks UNSIGNED.
+			if len(paramTypes) > int(i)*2+1 {
 				paramType := paramTypes[i*2]
+				unsigned := paramTypes[i*2+1]&0x80 != 0
 
 				var val interface{}
 				var err error
-				offset, val, err = parseParamValue(payload, offset, paramType)
+				offset, val, err = parseParamValue(payload, offset, paramType, unsigned)
 				if err != nil {
-					_ = s.writeError(conn, 1, 1064, fmt.Sprintf("Failed to parse parameter %d: %v", i, err))
+					if errors.Is(err, errUnsignedBigintOutOfRange) {
+						_ = s.writeErrorWithState(conn, 1, 1264, "22003",
+							fmt.Sprintf("Out of range value for parameter %d", i))
+					} else {
+						_ = s.writeError(conn, 1, 1064, fmt.Sprintf("Failed to parse parameter %d: %v", i, err))
+					}
 					return
 				}
 				params[i] = val
@@ -1337,7 +1465,21 @@ func countPlaceholders(query string) int {
 	return count
 }
 
-func parseParamValue(payload []byte, offset int, paramType byte) (int, interface{}, error) {
+// errUnsignedBigintOutOfRange indicates an UNSIGNED BIGINT parameter's value
+// is >= 2^63 and therefore cannot be represented as the int64 that SQLite's
+// INTEGER storage (and every SQL parameter binding path in this server)
+// requires. Callers must report this distinctly from a generic parse
+// failure - see handleStmtExecute's ER_WARN_DATA_OUT_OF_RANGE (1264) handling.
+var errUnsignedBigintOutOfRange = errors.New("value out of range for signed BIGINT")
+
+// parseParamValue decodes a single COM_STMT_EXECUTE binary parameter value.
+// unsigned reflects the 0x80 bit of the parameter's flags byte. Every
+// integer type decodes to a signed Go type (int8/int16/int32/int64) because
+// every downstream SQL parameter binding path only accepts signed integers;
+// an unsigned value that fits in int64 converts explicitly, and an unsigned
+// BIGINT that doesn't fit (>= 2^63) returns errUnsignedBigintOutOfRange
+// rather than silently reinterpreting it as negative.
+func parseParamValue(payload []byte, offset int, paramType byte, unsigned bool) (int, interface{}, error) {
 	const (
 		MYSQL_TYPE_DECIMAL     = 0x00
 		MYSQL_TYPE_TINY        = 0x01
@@ -1375,25 +1517,56 @@ func parseParamValue(payload []byte, offset int, paramType byte) (int, interface
 		if len(payload) < offset+1 {
 			return offset, nil, fmt.Errorf("not enough data for TINY")
 		}
+		if unsigned {
+			// An unsigned TINY (0..255) always fits in int64; decode to it
+			// explicitly rather than handing callers a bare uint8, since
+			// downstream SQL parameter binding (database/sql, go-sqlite3)
+			// only accepts signed integers.
+			return offset + 1, int64(payload[offset]), nil
+		}
 		return offset + 1, int8(payload[offset]), nil
 
 	case MYSQL_TYPE_SHORT, MYSQL_TYPE_YEAR:
 		if len(payload) < offset+2 {
 			return offset, nil, fmt.Errorf("not enough data for SHORT")
 		}
-		return offset + 2, int16(binary.LittleEndian.Uint16(payload[offset:])), nil
+		v := binary.LittleEndian.Uint16(payload[offset:])
+		if unsigned {
+			// An unsigned SHORT (0..65535) always fits in int64.
+			return offset + 2, int64(v), nil
+		}
+		return offset + 2, int16(v), nil
 
 	case MYSQL_TYPE_LONG, MYSQL_TYPE_INT24:
 		if len(payload) < offset+4 {
 			return offset, nil, fmt.Errorf("not enough data for LONG")
 		}
-		return offset + 4, int32(binary.LittleEndian.Uint32(payload[offset:])), nil
+		v := binary.LittleEndian.Uint32(payload[offset:])
+		if unsigned {
+			// An unsigned LONG (0..2^32-1) always fits in int64.
+			return offset + 4, int64(v), nil
+		}
+		return offset + 4, int32(v), nil
 
 	case MYSQL_TYPE_LONGLONG:
 		if len(payload) < offset+8 {
 			return offset, nil, fmt.Errorf("not enough data for LONGLONG")
 		}
-		return offset + 8, int64(binary.LittleEndian.Uint64(payload[offset:])), nil
+		v := binary.LittleEndian.Uint64(payload[offset:])
+		if unsigned {
+			// SQLite's INTEGER storage is signed 64-bit, and downstream SQL
+			// parameter binding only accepts int64 (database/sql's default
+			// converter rejects a uint64 with the high bit set, and
+			// go-sqlite3 has no NamedValueChecker to work around that). A
+			// value that fits decodes to int64 cleanly; one that doesn't
+			// genuinely cannot be represented, so report it rather than
+			// silently reinterpreting it as a negative number.
+			if v > math.MaxInt64 {
+				return offset, nil, errUnsignedBigintOutOfRange
+			}
+			return offset + 8, int64(v), nil
+		}
+		return offset + 8, int64(v), nil
 
 	case MYSQL_TYPE_FLOAT:
 		if len(payload) < offset+4 {

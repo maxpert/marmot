@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+
+	"github.com/rs/zerolog/log"
 )
 
 // CDCExecutor abstracts sql.DB and sql.Tx - both have identical Exec signature.
@@ -53,8 +55,10 @@ func ApplyCDCValues(exec CDCExecutor, schema CDCSchemaProvider, opType OpType, t
 
 // ApplyCDCInsert performs INSERT OR REPLACE using CDC row data.
 // Columns are sorted alphabetically to ensure deterministic SQL generation.
-// Values are deserialized from msgpack and []byte values are converted to strings
-// to preserve TEXT type affinity in SQLite.
+// Values are deserialized from msgpack via unmarshalCDCValue: TEXT-affinity
+// columns were encoded as msgpack Str at capture time and decode as string;
+// BLOB-affinity columns were encoded as msgpack Bin and decode as []byte, so
+// they bind via sqlite3_bind_blob and keep their BLOB storage class.
 func ApplyCDCInsert(exec CDCExecutor, tableName string, newValues map[string][]byte) error {
 	if len(newValues) == 0 {
 		return fmt.Errorf("ApplyCDCInsert %s: no values to insert", tableName)
@@ -153,10 +157,11 @@ func ApplyCDCUpdate(exec CDCExecutor, schema CDCSchemaProvider, tableName string
 		strings.Join(setClauses, ", "),
 		strings.Join(whereClauses, " AND "))
 
-	_, err = exec.Exec(sqlStmt, values...)
+	result, err := exec.Exec(sqlStmt, values...)
 	if err != nil {
 		return fmt.Errorf("ApplyCDCUpdate %s: %w", tableName, err)
 	}
+	logZeroRowsAffected(result, "ApplyCDCUpdate", tableName)
 	return nil
 }
 
@@ -197,11 +202,25 @@ func ApplyCDCDelete(exec CDCExecutor, schema CDCSchemaProvider, tableName string
 		quoteSQLiteIdent(tableName),
 		strings.Join(whereClauses, " AND "))
 
-	_, err = exec.Exec(sqlStmt, values...)
+	result, err := exec.Exec(sqlStmt, values...)
 	if err != nil {
 		return fmt.Errorf("ApplyCDCDelete %s: %w", tableName, err)
 	}
+	logZeroRowsAffected(result, "ApplyCDCDelete", tableName)
 	return nil
+}
+
+// logZeroRowsAffected logs at Debug level when a CDC UPDATE/DELETE matched no
+// rows. This is not necessarily a bug - a legitimate FK ON DELETE CASCADE
+// no-op looks identical to a real divergence (e.g. bad PK encoding) - so it is
+// only logged, not treated as an error, but it must be visible for diagnosing
+// replication divergence. Debug level keeps it out of default log output.
+func logZeroRowsAffected(result sql.Result, opName, tableName string) {
+	n, err := result.RowsAffected()
+	if err != nil || n != 0 {
+		return
+	}
+	log.Debug().Str("table", tableName).Str("op", opName).Msg("CDC apply matched no rows")
 }
 
 func cdcPrimaryKeyPredicate(opName, tableName, pkCol string, pkBytes []byte, values []interface{}) (string, []interface{}, error) {
