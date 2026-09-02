@@ -168,6 +168,14 @@ type Statement struct {
 	// DML ships OldValues/NewValues via CDC, not SQL+params.
 	ExtractedParams []interface{} `msgpack:"-"` // Exclude from msgpack serialization
 
+	// ParamOrder is set only when SQL mixes caller-supplied bind placeholders
+	// with ExtractedParams (e.g. an auto-increment id injected alongside a
+	// prepared statement's own `?` marks): for every placeholder in SQL, in
+	// left-to-right order, true means "take the next wire-supplied value" and
+	// false means "take the next value from ExtractedParams". nil means only
+	// one of the two sources is in play - see MergeExecParams.
+	ParamOrder []bool `msgpack:"-"`
+
 	// ParsedAST carries the Vitess AST produced during MySQL-dialect parse.
 	// Non-nil only when the pipeline parsed the statement via Vitess (SELECT,
 	// DML, and most DDL). Downstream components that need the AST — notably
@@ -182,6 +190,58 @@ type Statement struct {
 	// LoadDataPayload carries LOAD DATA LOCAL INFILE file bytes for replicated
 	// non-DML bulk-load transactions.
 	LoadDataPayload []byte `msgpack:"LoadDataPayload,omitempty"`
+}
+
+// MergeExecParams produces the final positional argument list for executing
+// s.SQL against SQLite, combining the caller's wire-supplied params with
+// s.ExtractedParams (literals the pipeline pulled out of the SQL text, e.g. a
+// server-injected auto-increment id).
+//
+// When s.ParamOrder is nil, exactly one of the two sources is in play - the
+// common case - so whichever is non-empty is used as-is. When s.ParamOrder is
+// set, SQL contains a mix of the caller's own `?` placeholders and
+// pipeline-extracted ones interleaved in serialization order; ParamOrder
+// records that order (true = next wireParams value, false = next
+// ExtractedParams value) so the two sources are threaded back together
+// positionally instead of one being silently dropped.
+func (s Statement) MergeExecParams(wireParams []interface{}) []interface{} {
+	if len(s.ParamOrder) == 0 {
+		if len(wireParams) == 0 && len(s.ExtractedParams) > 0 {
+			return s.ExtractedParams
+		}
+		return wireParams
+	}
+
+	merged := make([]interface{}, 0, len(s.ParamOrder))
+	wireIdx, extractedIdx := 0, 0
+	for _, fromWire := range s.ParamOrder {
+		if fromWire {
+			if wireIdx < len(wireParams) {
+				merged = append(merged, wireParams[wireIdx])
+			}
+			wireIdx++
+			continue
+		}
+		if extractedIdx < len(s.ExtractedParams) {
+			merged = append(merged, s.ExtractedParams[extractedIdx])
+		}
+		extractedIdx++
+	}
+	return merged
+}
+
+// WithResolvedParams returns a copy of s for executing different SQL whose
+// params are already fully resolved and positional - e.g. a vector-search
+// rewrite's primary or fallback query, where params has already been
+// computed from the original statement's bound values. It clears
+// ParamOrder: the copy's params are complete on their own, and s.ParamOrder
+// (if any) describes sql's placeholder layout, not the new one, so
+// MergeExecParams must not try to interleave them against a second source.
+func (s Statement) WithResolvedParams(sql string, params []interface{}) Statement {
+	s.SQL = sql
+	s.ExtractedParams = params
+	s.ParamOrder = nil
+	return s
 }
 
 // Transaction represents a buffered transaction

@@ -1,5 +1,5 @@
 // Package publisher provides the CDC (Change Data Capture) Publishing System
-// foundation for Marmot v2.9.15-beta.
+// foundation for Marmot v2.9.16-beta.
 //
 // This package implements a durable, ordered event log backed by Pebble that
 // captures CDC events and tracks per-sink consumption cursors for reliable

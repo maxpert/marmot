@@ -57,7 +57,7 @@ func TestHookCapture_Insert(t *testing.T) {
 	require.NoError(t, session.BeginTx(ctx))
 
 	// Execute INSERT
-	err = session.ExecContext(ctx, "INSERT INTO test (id, name, value) VALUES (1, 'alice', 100)")
+	_, err = session.ExecContext(ctx, "INSERT INTO test (id, name, value) VALUES (1, 'alice', 100)")
 	require.NoError(t, err)
 
 	// Verify capture WITHOUT calling ProcessCapturedRows
@@ -120,7 +120,7 @@ func TestHookCapture_Update(t *testing.T) {
 	require.NoError(t, session.BeginTx(ctx))
 
 	// Execute UPDATE
-	err = session.ExecContext(ctx, "UPDATE test SET name = 'bob', value = 200 WHERE id = 1")
+	_, err = session.ExecContext(ctx, "UPDATE test SET name = 'bob', value = 200 WHERE id = 1")
 	require.NoError(t, err)
 
 	// Verify capture
@@ -193,7 +193,7 @@ func TestHookCapture_Delete(t *testing.T) {
 	require.NoError(t, session.BeginTx(ctx))
 
 	// Execute DELETE
-	err = session.ExecContext(ctx, "DELETE FROM test WHERE id = 1")
+	_, err = session.ExecContext(ctx, "DELETE FROM test WHERE id = 1")
 	require.NoError(t, err)
 
 	// Verify capture
@@ -254,11 +254,11 @@ func TestHookCapture_SkipsInternalTables(t *testing.T) {
 	require.NoError(t, session.BeginTx(ctx))
 
 	// Insert into internal table (should be skipped)
-	err = session.ExecContext(ctx, "INSERT INTO __marmot_internal (id, data) VALUES (1, 'internal')")
+	_, err = session.ExecContext(ctx, "INSERT INTO __marmot_internal (id, data) VALUES (1, 'internal')")
 	require.NoError(t, err)
 
 	// Insert into user table (should be captured)
-	err = session.ExecContext(ctx, "INSERT INTO user_table (id, name) VALUES (1, 'alice')")
+	_, err = session.ExecContext(ctx, "INSERT INTO user_table (id, name) VALUES (1, 'alice')")
 	require.NoError(t, err)
 
 	// Verify only user table was captured
@@ -384,9 +384,12 @@ func TestHookCapture_MultipleOperations(t *testing.T) {
 	require.NoError(t, session.BeginTx(ctx))
 
 	// Multiple operations
-	require.NoError(t, session.ExecContext(ctx, "INSERT INTO test (id, name) VALUES (3, 'charlie')"))
-	require.NoError(t, session.ExecContext(ctx, "UPDATE test SET name = 'ALICE' WHERE id = 1"))
-	require.NoError(t, session.ExecContext(ctx, "DELETE FROM test WHERE id = 2"))
+	_, err = session.ExecContext(ctx, "INSERT INTO test (id, name) VALUES (3, 'charlie')")
+	require.NoError(t, err)
+	_, err = session.ExecContext(ctx, "UPDATE test SET name = 'ALICE' WHERE id = 1")
+	require.NoError(t, err)
+	_, err = session.ExecContext(ctx, "DELETE FROM test WHERE id = 2")
+	require.NoError(t, err)
 
 	// Verify captures
 	captured := loadCapturedIntents(t, session)
@@ -452,7 +455,7 @@ func TestHookCapture_ValuesRetrievable(t *testing.T) {
 	}
 
 	for _, td := range testData {
-		err = session.ExecContext(ctx, "INSERT INTO test (id, name, score) VALUES (?, ?, ?)", td.id, td.name, td.score)
+		_, err = session.ExecContext(ctx, "INSERT INTO test (id, name, score) VALUES (?, ?, ?)", td.id, td.name, td.score)
 		require.NoError(t, err)
 	}
 
@@ -511,7 +514,7 @@ func TestHookCapture_NoSchemaCache(t *testing.T) {
 	require.NoError(t, session.BeginTx(ctx))
 
 	// Insert (schema was reloaded during StartEphemeralSession, so it should capture)
-	err = session.ExecContext(ctx, "INSERT INTO test (id, name) VALUES (1, 'alice')")
+	_, err = session.ExecContext(ctx, "INSERT INTO test (id, name) VALUES (1, 'alice')")
 	require.NoError(t, err)
 
 	// Verify data was captured (schema reloaded during session start)
@@ -521,4 +524,108 @@ func TestHookCapture_NoSchemaCache(t *testing.T) {
 	require.Len(t, captured, 1)
 	assert.Equal(t, "test", captured[0].Table)
 	assert.Equal(t, uint8(OpTypeInsert), captured[0].Operation)
+}
+
+// TestHookCapture_CaptureAndLockNewRows_AccumulatesAcrossCalls is a
+// regression guard for the seq high-water-mark logic in
+// captureAndLockNewRows: calling it after two separate ExecContext calls
+// must accumulate entries from both statements, not just the most recent one.
+func TestHookCapture_CaptureAndLockNewRows_AccumulatesAcrossCalls(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "test.db")
+	metaPath := filepath.Join(tmpDir, "meta")
+
+	os.MkdirAll(metaPath, 0755)
+	metaStore, err := NewPebbleMetaStore(metaPath, DefaultPebbleOptions())
+	require.NoError(t, err)
+	defer metaStore.Close()
+
+	clock := hlc.NewClock(1)
+	replicatedDB, err := NewReplicatedDatabase(dbPath, 1, clock, metaStore)
+	require.NoError(t, err)
+	defer replicatedDB.Close()
+
+	_, err = replicatedDB.GetWriteDB().Exec(`CREATE TABLE test (id INTEGER PRIMARY KEY, name TEXT)`)
+	require.NoError(t, err)
+	require.NoError(t, replicatedDB.ReloadSchema())
+
+	ctx := context.Background()
+	txnID := uint64(1101)
+	session, err := StartEphemeralSession(ctx, replicatedDB.hookDB, metaStore, replicatedDB.schemaCache, txnID)
+	require.NoError(t, err)
+	defer session.Rollback()
+	require.NoError(t, session.BeginTx(ctx))
+
+	_, err = session.ExecContext(ctx, "INSERT INTO test (id, name) VALUES (1, 'alice')")
+	require.NoError(t, err)
+	require.NoError(t, session.captureAndLockNewRows())
+
+	entriesAfterFirst := session.CapturedIntentEntries()
+	require.Len(t, entriesAfterFirst, 1, "first captureAndLockNewRows call must capture the first statement's row")
+
+	_, err = session.ExecContext(ctx, "INSERT INTO test (id, name) VALUES (2, 'bob')")
+	require.NoError(t, err)
+	require.NoError(t, session.captureAndLockNewRows())
+
+	entriesAfterSecond := session.CapturedIntentEntries()
+	require.Len(t, entriesAfterSecond, 2, "second captureAndLockNewRows call must accumulate, not replace, the first statement's entry")
+
+	var name0, name1 string
+	require.NoError(t, encoding.Unmarshal(entriesAfterSecond[0].NewValues["name"], &name0))
+	require.NoError(t, encoding.Unmarshal(entriesAfterSecond[1].NewValues["name"], &name1))
+	assert.Equal(t, "alice", name0)
+	assert.Equal(t, "bob", name1)
+}
+
+// TestHookCapture_EagerMode_GuardsAgainstDoubleProcessing verifies that once
+// captureAndLockNewRows has run (eagerCaptureUsed == true), GetIntentEntries
+// and ProcessCapturedRows do not re-run collectCapturedRows - which would
+// re-acquire already-held locks and double-append entries.
+func TestHookCapture_EagerMode_GuardsAgainstDoubleProcessing(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "test.db")
+	metaPath := filepath.Join(tmpDir, "meta")
+
+	os.MkdirAll(metaPath, 0755)
+	metaStore, err := NewPebbleMetaStore(metaPath, DefaultPebbleOptions())
+	require.NoError(t, err)
+	defer metaStore.Close()
+
+	clock := hlc.NewClock(1)
+	replicatedDB, err := NewReplicatedDatabase(dbPath, 1, clock, metaStore)
+	require.NoError(t, err)
+	defer replicatedDB.Close()
+
+	_, err = replicatedDB.GetWriteDB().Exec(`CREATE TABLE test (id INTEGER PRIMARY KEY, name TEXT)`)
+	require.NoError(t, err)
+	require.NoError(t, replicatedDB.ReloadSchema())
+
+	ctx := context.Background()
+	txnID := uint64(1102)
+	session, err := StartEphemeralSession(ctx, replicatedDB.hookDB, metaStore, replicatedDB.schemaCache, txnID)
+	require.NoError(t, err)
+	require.NoError(t, session.BeginTx(ctx))
+
+	_, err = session.ExecContext(ctx, "INSERT INTO test (id, name) VALUES (1, 'alice')")
+	require.NoError(t, err)
+	require.NoError(t, session.captureAndLockNewRows())
+	require.True(t, session.eagerCaptureUsed)
+
+	// GetIntentEntries must return the already-accumulated entries without
+	// re-collecting or erroring (which would happen if it tried to
+	// re-acquire the lock this txn already holds via a different code path).
+	entries, err := session.GetIntentEntries()
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+
+	// Calling again must not change the count.
+	entriesAgain, err := session.GetIntentEntries()
+	require.NoError(t, err)
+	assert.Len(t, entriesAgain, 1)
+
+	// ProcessCapturedRows must be a no-op under eager mode, not an error.
+	require.NoError(t, session.ProcessCapturedRows())
+	assert.Len(t, session.CapturedIntentEntries(), 1)
+
+	require.NoError(t, session.Rollback())
 }

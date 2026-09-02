@@ -67,8 +67,18 @@ func (s *SQLiteSerializer) nodeFormatter(buf *sqlparser.TrackedBuffer, node sqlp
 		// Skip MySQL-specific index hints (FORCE INDEX, USE INDEX, IGNORE INDEX)
 		// SQLite doesn't support them
 	case *sqlparser.Where:
-		// Format WHERE with uppercase keyword
-		buf.WriteString(" WHERE ")
+		// Format WHERE/HAVING with uppercase keyword. Vitess represents both
+		// clauses with the same *Where struct, distinguished by n.Type - the
+		// previous unconditional " WHERE " here silently turned HAVING clauses
+		// (including ones inside subqueries) into WHERE clauses.
+		if n == nil || n.Expr == nil {
+			return
+		}
+		if n.Type == sqlparser.HavingClause {
+			buf.WriteString(" HAVING ")
+		} else {
+			buf.WriteString(" WHERE ")
+		}
 		buf.Myprintf("%v", n.Expr)
 	case sqlparser.OrderBy:
 		// Format ORDER BY with uppercase keywords

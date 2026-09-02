@@ -39,3 +39,15 @@ func Unmarshal(data []byte, v interface{}) error {
 
 	return dec.Decode(v)
 }
+
+// UnmarshalStrict decodes msgpack data into interface{} WITHOUT loose interface
+// decoding: msgpack Bin decodes as Go []byte, msgpack Str decodes as Go string.
+// Use this where the encoder already chose Bin vs. Str deliberately (e.g. CDC
+// column values, where BLOB columns are encoded as Bin and TEXT columns as Str)
+// and that distinction must survive the round trip. Unmarshal's loose decoding
+// would collapse both to string, which is correct for the general
+// interface{}-decoding case documented on Unmarshal but corrupts BLOB data.
+func UnmarshalStrict(data []byte, v interface{}) error {
+	dec := msgpack.NewDecoder(bytes.NewReader(data))
+	return dec.Decode(v)
+}

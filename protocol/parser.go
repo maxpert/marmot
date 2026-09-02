@@ -155,11 +155,13 @@ func ParseStatementWithOptions(sql string, opts ParseOptions) Statement {
 	// Extract transpiled SQL from first statement
 	transpiledSQL := ""
 	var extractedParams []interface{}
+	var paramOrder []bool
 	if len(ctx.Output.Statements) > 0 {
 		transpiledSQL = ctx.Output.Statements[0].SQL
 		if len(ctx.Output.Statements[0].Params) > 0 {
 			extractedParams = ctx.Output.Statements[0].Params
 		}
+		paramOrder = ctx.Output.Statements[0].ParamOrder
 	}
 
 	stmt := Statement{
@@ -168,6 +170,7 @@ func ParseStatementWithOptions(sql string, opts ParseOptions) Statement {
 		Database:        ctx.Output.Database,
 		Error:           errorString(ctx.Output.ValidationErr),
 		ExtractedParams: extractedParams,
+		ParamOrder:      paramOrder,
 	}
 
 	// Extract MySQL-specific metadata (if available)
@@ -201,11 +204,13 @@ func ParseStatementWithSchema(sql string, schemaLookup SchemaLookupFunc) Stateme
 	// Extract transpiled SQL from first statement
 	transpiledSQL := ""
 	var extractedParams []interface{}
+	var paramOrder []bool
 	if len(ctx.Output.Statements) > 0 {
 		transpiledSQL = ctx.Output.Statements[0].SQL
 		if len(ctx.Output.Statements[0].Params) > 0 {
 			extractedParams = ctx.Output.Statements[0].Params
 		}
+		paramOrder = ctx.Output.Statements[0].ParamOrder
 	}
 
 	stmt := Statement{
@@ -214,6 +219,7 @@ func ParseStatementWithSchema(sql string, schemaLookup SchemaLookupFunc) Stateme
 		Database:        ctx.Output.Database,
 		Error:           errorString(ctx.Output.ValidationErr),
 		ExtractedParams: extractedParams,
+		ParamOrder:      paramOrder,
 	}
 
 	// Extract MySQL-specific metadata (if available)
@@ -265,6 +271,7 @@ func buildStatement(ctx query.QueryContext, ts query.TranspiledStatement) Statem
 		Database:        ctx.Output.Database,
 		Error:           errorString(ctx.Output.ValidationErr),
 		ExtractedParams: extractedParams,
+		ParamOrder:      ts.ParamOrder,
 	}
 
 	// Extract MySQL-specific metadata (if available)

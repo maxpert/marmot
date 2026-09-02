@@ -513,10 +513,13 @@ func (tm *TransactionManager) applyNonDMLIntents(txnID uint64, intents []*WriteI
 		log.Debug().Uint64("txn_id", txnID).Str("sql", intent.SQLStatement).Msg("DDL statement executed")
 	}
 
-	// Reload schema cache after DDL operations.
+	// Reload schema cache after DDL operations. A failed reload leaves the
+	// cache stale, so subsequent preupdate hooks would silently drop CDC data
+	// for any column the DDL added/changed - fail the DDL apply instead of
+	// swallowing the error.
 	if hasDDL && tm.schemaCache != nil {
 		if err := tm.reloadSchemaCache(); err != nil {
-			log.Warn().Err(err).Uint64("txn_id", txnID).Msg("Failed to reload schema cache after DDL")
+			return fmt.Errorf("failed to reload schema cache after DDL (txn %d): %w", txnID, err)
 		}
 	}
 
@@ -884,16 +887,21 @@ func (s *schemaCacheAdapter) GetPrimaryKeys(tableName string) ([]string, error) 
 	return schema.PrimaryKeys, nil
 }
 
-// unmarshalCDCValue deserializes a msgpack-encoded value and converts []byte to string.
-// SQLite returns TEXT values as []byte from preupdate hooks, so we convert back for proper type affinity.
+// unmarshalCDCValue deserializes a msgpack-encoded CDC column value.
+//
+// SQLite's preupdate hook hands back TEXT and BLOB storage classes identically
+// as Go []byte, so distinguishing them can only happen where the schema is
+// known: capture (encodeValuesWithSchema in preupdate_hook.go) converts
+// TEXT-affinity columns to string before encoding, so they are written as
+// msgpack Str, while BLOB-affinity columns stay []byte and are written as
+// msgpack Bin. UnmarshalStrict preserves that distinction on the way back out
+// (Bin -> []byte, Str -> string) so BLOB columns bind via sqlite3_bind_blob
+// instead of being coerced to text. Unmarshal's loose decoding must NOT be
+// used here: it collapses Bin to string, silently corrupting BLOB columns.
 func unmarshalCDCValue(data []byte) (interface{}, error) {
 	var value interface{}
-	if err := encoding.Unmarshal(data, &value); err != nil {
+	if err := encoding.UnmarshalStrict(data, &value); err != nil {
 		return nil, err
-	}
-	// Convert []byte to string - SQLite returns TEXT as []byte from preupdate hooks
-	if b, ok := value.([]byte); ok {
-		return string(b), nil
 	}
 	return value, nil
 }

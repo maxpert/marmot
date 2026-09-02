@@ -6,6 +6,31 @@ import (
 	"vitess.io/vitess/go/vt/sqlparser"
 )
 
+// stripMySQLColumnType removes MySQL-specific column type attributes that have no SQLite
+// equivalent, in place: display widths on integer types, the COLLATE/COMMENT column
+// options, and the CHARACTER SET/COLLATE charset clause. Shared by CreateTableRule (CREATE
+// TABLE columns) and AlterTableColumnTypeRule (ALTER TABLE ADD/MODIFY/CHANGE COLUMN).
+func stripMySQLColumnType(colType *sqlparser.ColumnType) {
+	if colType == nil {
+		return
+	}
+
+	// Strip display widths from integer types: INTEGER(20) → INTEGER
+	if isIntegerType(colType.Type) {
+		colType.Length = nil
+	}
+
+	if colType.Options != nil {
+		// Strip MySQL-specific COLLATE (SQLite only supports NOCASE, BINARY, RTRIM)
+		colType.Options.Collate = ""
+		// Strip MySQL-specific COMMENT (not supported in SQLite column definitions)
+		colType.Options.Comment = nil
+	}
+
+	// Strip charset (SQLite doesn't use MySQL charsets)
+	colType.Charset = sqlparser.ColumnCharset{}
+}
+
 // HasJoin checks if any TableExpr in the slice is a JoinTableExpr.
 func HasJoin(tableExprs sqlparser.TableExprs) bool {
 	for _, expr := range tableExprs {

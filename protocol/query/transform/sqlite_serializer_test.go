@@ -186,3 +186,58 @@ func TestSQLiteSerializer_SerializeBasic(t *testing.T) {
 		})
 	}
 }
+
+// TestSQLiteSerializer_Having pins a regression where HAVING clauses were
+// serialized as WHERE. Vitess represents both WHERE and HAVING with the same
+// *sqlparser.Where struct, distinguished only by its Type field; the
+// nodeFormatter's *sqlparser.Where case used to ignore that field and always
+// write " WHERE ", which silently corrupted any HAVING clause - including
+// ones nested inside a subquery, where the result was outright invalid SQL.
+func TestSQLiteSerializer_Having(t *testing.T) {
+	tests := []struct {
+		name          string
+		input         string
+		shouldContain []string // case-insensitive
+		mustNotMatch  string   // substring that must NOT appear (case-insensitive)
+	}{
+		{
+			name:          "top-level GROUP BY HAVING",
+			input:         "SELECT category, COUNT(*) FROM products GROUP BY category HAVING COUNT(*) > 5",
+			shouldContain: []string{"group by category", "having count(*) > 5"},
+		},
+		{
+			name:          "HAVING inside IN-subquery",
+			input:         "SELECT email, user_id FROM users WHERE email IN (SELECT email FROM users GROUP BY email HAVING COUNT(email) > ?) ORDER BY email",
+			shouldContain: []string{"where email in (select email from users group by email having count(email) > ?)"},
+		},
+		{
+			name:          "WHERE and HAVING together",
+			input:         "SELECT category, COUNT(*) FROM products WHERE price > 10 GROUP BY category HAVING COUNT(*) > 5",
+			shouldContain: []string{"where price > 10", "group by category", "having count(*) > 5"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stmt, err := sqlparser.NewTestParser().Parse(tt.input)
+			if err != nil {
+				t.Fatalf("failed to parse SQL: %v", err)
+			}
+
+			serializer := &SQLiteSerializer{}
+			result := serializer.Serialize(stmt)
+			lowerResult := strings.ToLower(result)
+
+			for _, expected := range tt.shouldContain {
+				if !strings.Contains(lowerResult, expected) {
+					t.Errorf("expected output to contain %q (case-insensitive), got: %s", expected, result)
+				}
+			}
+
+			// The subquery's HAVING must never degrade into a second WHERE.
+			if strings.Count(lowerResult, " where ") > 1 {
+				t.Errorf("HAVING clause was serialized as WHERE, got: %s", result)
+			}
+		})
+	}
+}

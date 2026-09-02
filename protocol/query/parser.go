@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/maxpert/marmot/protocol/query/transform"
 	"vitess.io/vitess/go/vt/sqlparser"
 )
 
@@ -36,6 +37,20 @@ var (
 
 	// DDL patterns Vitess cannot parse
 	dropIndexPattern = regexp.MustCompile(`(?i)^\s*DROP\s+INDEX\s+`)
+	// dropIndexIdent matches a MySQL identifier as either backtick-quoted (any character
+	// except a backtick, with `` as an escaped literal backtick - MySQL's own identifier
+	// quoting rule, e.g. `unique-user-email` or `has space`) or, unquoted, the strict
+	// [A-Za-z_][A-Za-z0-9_]* charset. This mirrors what AlterTableConstraintRule accepts
+	// for the equivalent ADD CONSTRAINT/ADD INDEX identifiers on the CREATE side.
+	dropIndexIdent = "(?:`(?:[^`]|``)*`|[A-Za-z_][A-Za-z0-9_]*)"
+	// dropIndexExtractPattern pulls the IF EXISTS flag and index name out of MySQL's
+	// "DROP INDEX [IF EXISTS] name ON table" - SQLite has no ON clause, so it must be
+	// stripped rather than forwarded as-is (SQLite's DROP INDEX rejects it outright).
+	// Group 1: "IF EXISTS " if present. Group 2: backtick-quoted name body (raw, with
+	// doubled backticks still escaped). Group 3: unquoted name. Exactly one of 2/3 matches.
+	dropIndexExtractPattern = regexp.MustCompile(`(?i)^\s*DROP\s+INDEX\s+(IF\s+EXISTS\s+)?` +
+		"(?:`((?:[^`]|``)*)`|([A-Za-z_][A-Za-z0-9_]*))" +
+		`\s+ON\s+` + dropIndexIdent)
 
 	// Vector index DDL patterns (sqlite-vec extension, not parsed by Vitess)
 	createVectorIndexPattern = regexp.MustCompile(`(?i)^\s*CREATE\s+VECTOR\s+INDEX\s+`)
@@ -75,6 +90,19 @@ func (p *VitessParser) Parse(ctx *QueryContext) error {
 	stmt, err := p.parser.Parse(ctx.Input.SQL)
 	if err != nil {
 		return err
+	}
+
+	// Vitess's DDL fallback path returns a syntax error alongside a partially-parsed
+	// AST (SetFullyParsed(false)) instead of failing outright - see vitess sqlparser.Parse2.
+	// Forwarding that AST would silently truncate the statement (e.g. an unparseable
+	// "ALTER TABLE t ADD CONSTRAINT ..." degrading to "ALTER TABLE t"), which then fails
+	// downstream with a confusing SQLite error instead of a clean MySQL syntax error.
+	// Treat it as a parse failure so the caller returns a proper error to the client.
+	if ddl, ok := stmt.(sqlparser.DDLStatement); ok && !ddl.IsFullyParsed() {
+		return fmt.Errorf("syntax error in DDL statement: %s", ctx.Input.SQL)
+	}
+	if dbddl, ok := stmt.(sqlparser.DBDDLStatement); ok && !dbddl.IsFullyParsed() {
+		return fmt.Errorf("syntax error in DDL statement: %s", ctx.Input.SQL)
 	}
 
 	ctx.MySQLState.AST = stmt
@@ -171,8 +199,33 @@ func classifyByPattern(ctx *QueryContext) {
 	if dropIndexPattern.MatchString(sql) {
 		ctx.Output.StatementType = StatementDDL
 		ctx.MySQLState.SkipVitess = true
+		if idx := dropIndexExtractPattern.FindStringSubmatchIndex(sql); idx != nil {
+			ifExists := idx[2] != -1
+			var name string
+			if idx[4] != -1 {
+				// Backtick-quoted: unescape MySQL's doubled-backtick literal-backtick rule.
+				name = strings.ReplaceAll(sql[idx[4]:idx[5]], "``", "`")
+			} else {
+				name = sql[idx[6]:idx[7]]
+			}
+			ctx.MySQLState.TranspiledSQL = buildDropIndexSQL(name, ifExists)
+		}
 		return
 	}
+}
+
+// buildDropIndexSQL generates SQLite's "DROP INDEX [IF EXISTS] "name"" from a MySQL
+// "DROP INDEX name ON table" statement. SQLite's DROP INDEX has no ON clause. The name is
+// double-quoted (transform.QuoteIdentifier) since MySQL identifiers may contain characters
+// (hyphens, spaces, embedded double quotes) that are not valid in an unquoted SQLite identifier.
+func buildDropIndexSQL(indexName string, ifExists bool) string {
+	var sb strings.Builder
+	sb.WriteString("DROP INDEX ")
+	if ifExists {
+		sb.WriteString("IF EXISTS ")
+	}
+	sb.WriteString(transform.QuoteIdentifier(indexName))
+	return sb.String()
 }
 
 func parseVectorWithClause(state *MySQLParseState, clause string) {

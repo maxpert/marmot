@@ -4,6 +4,7 @@ import (
 	"os"
 	"testing"
 
+	"github.com/maxpert/marmot/id"
 	"github.com/maxpert/marmot/protocol"
 )
 
@@ -14,7 +15,7 @@ import (
 // exercise the explicit-transaction path silently run in autocommit and pass
 // for the wrong reason.
 func TestMain(m *testing.M) {
-	if err := protocol.InitializePipeline(10000, nil); err != nil {
+	if err := protocol.InitializePipeline(10000, id.NewCompactGenerator(1)); err != nil {
 		panic("failed to initialize query pipeline for tests: " + err.Error())
 	}
 	os.Exit(m.Run())

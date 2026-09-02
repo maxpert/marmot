@@ -1,4 +1,4 @@
-# Marmot v2.9.15-beta Docker Image
+# Marmot v2.9.16-beta Docker Image
 # Multi-stage build
 
 FROM golang:1.26-bookworm AS builder

@@ -46,6 +46,9 @@ type EphemeralHookSession struct {
 
 	intentEntries    []*IntentEntry
 	intentEntriesErr error
+
+	lastProcessedSeq uint64 // high-water mark for captureAndLockNewRows
+	eagerCaptureUsed bool   // true once captureAndLockNewRows has run at least once
 }
 
 type capturedRow struct {
@@ -139,24 +142,112 @@ func (s *EphemeralHookSession) BeginTx(ctx context.Context) error {
 	return nil
 }
 
-// ExecContext executes a statement within the session's transaction
-func (s *EphemeralHookSession) ExecContext(ctx context.Context, query string, args ...interface{}) error {
+// ExecContext executes a statement within the session's transaction, and
+// returns the real rows-affected count SQLite reports for it. Callers that
+// need locks/CDC entries acquired incrementally (eager pinned-session
+// execution) must follow this with captureAndLockNewRows; callers that defer
+// all processing to Rollback (the autocommit ExecuteLocalWithHooks flow) do
+// not need to.
+func (s *EphemeralHookSession) ExecContext(ctx context.Context, query string, args ...interface{}) (int64, error) {
 	if s.tx == nil {
-		return fmt.Errorf("no active transaction")
+		return 0, fmt.Errorf("no active transaction")
 	}
 	result, err := s.tx.ExecContext(ctx, query, args...)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	if conflictErr := s.GetConflictError(); conflictErr != nil {
-		return conflictErr
+		return 0, conflictErr
 	}
 
 	if id, err := result.LastInsertId(); err == nil && id != 0 {
 		s.lastInsertId = id
 	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return rowsAffected, nil
+}
+
+// QueryContext runs a read on the session's still-open transaction, so it
+// observes uncommitted writes made earlier in the same transaction.
+func (s *EphemeralHookSession) QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error) {
+	if s.tx == nil {
+		return nil, fmt.Errorf("no active transaction")
+	}
+	return s.tx.QueryContext(ctx, query, args...)
+}
+
+// captureAndLockNewRows processes any rows captured (via hookCallback) since
+// the last call, converting them to IntentEntry and acquiring their CDC row
+// locks immediately - unlike the existing one-shot ProcessCapturedRows/
+// GetIntentEntries path (used by the autocommit ExecuteLocalWithHooks flow),
+// which defers lock acquisition until the whole hookDB transaction rolls
+// back. A pinned session calls this after every statement so a conflicting
+// transaction sees the lock from statement time, not just from COMMIT.
+func (s *EphemeralHookSession) captureAndLockNewRows() error {
+	rows, err := s.captureSnapshot()
+	if err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	lastSeq := s.lastProcessedSeq
+	s.mu.Unlock()
+
+	newEntries := make([]*IntentEntry, 0)
+	maxSeq := lastSeq
+	for _, rowRef := range rows {
+		if rowRef.seq <= lastSeq {
+			continue
+		}
+		row, err := DecodeRow(rowRef.data)
+		if err != nil {
+			return fmt.Errorf("failed to decode captured row: %w", err)
+		}
+
+		if ddlTxn, err := s.metaStore.GetCDCTableDDLLock(row.Table); err == nil && ddlTxn != 0 && ddlTxn != s.txnID {
+			return ErrCDCTableDDLInProgress{Table: row.Table, HeldByTxn: ddlTxn}
+		}
+		if err := s.metaStore.AcquireCDCRowLock(s.txnID, row.Table, string(row.IntentKey)); err != nil {
+			return err
+		}
+
+		newEntries = append(newEntries, &IntentEntry{
+			TxnID:        s.txnID,
+			Seq:          rowRef.seq,
+			Operation:    row.Op,
+			Table:        row.Table,
+			IntentKey:    row.IntentKey,
+			OldValues:    row.OldValues,
+			NewValues:    row.NewValues,
+			EncodedRow:   rowRef.data,
+			EncodedCodec: encodedCapturedRowCodecMsgpack,
+		})
+		if rowRef.seq > maxSeq {
+			maxSeq = rowRef.seq
+		}
+	}
+
+	s.mu.Lock()
+	s.intentEntries = append(s.intentEntries, newEntries...)
+	s.lastProcessedSeq = maxSeq
+	s.eagerCaptureUsed = true
+	s.mu.Unlock()
 	return nil
+}
+
+// CapturedIntentEntries returns the entries accumulated so far via
+// captureAndLockNewRows, without triggering any collection. Used by the
+// pinned-session wrapper to build CDC entries for 2PC at COMMIT time, before
+// the session is rolled back.
+func (s *EphemeralHookSession) CapturedIntentEntries() []*IntentEntry {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.intentEntries
 }
 
 // Commit commits the transaction and closes the connection.
@@ -215,6 +306,13 @@ func (s *EphemeralHookSession) Rollback() error {
 // Encoding happens in hookCallback, so this does lock acquisition and conflict detection.
 func (s *EphemeralHookSession) ProcessCapturedRows() error {
 	s.mu.Lock()
+	if s.eagerCaptureUsed {
+		// Entries and locks are already correct via captureAndLockNewRows;
+		// re-running collectCapturedRows would re-acquire locks already held
+		// and double-append entries.
+		s.mu.Unlock()
+		return nil
+	}
 	if s.intentEntries != nil || s.intentEntriesErr != nil {
 		err := s.intentEntriesErr
 		s.mu.Unlock()
@@ -295,6 +393,15 @@ func (s *EphemeralHookSession) GetIntentEntries() ([]*IntentEntry, error) {
 	}
 
 	s.mu.Lock()
+	if s.eagerCaptureUsed {
+		// Entries already accumulated via captureAndLockNewRows - "eager mode
+		// ran and captured zero rows" is a valid final state, not "not yet
+		// collected", so skip the collectCapturedRows(false) fallback branch
+		// entirely even when s.intentEntries is nil.
+		entries := s.intentEntries
+		s.mu.Unlock()
+		return entries, nil
+	}
 	if s.intentEntries != nil || s.intentEntriesErr != nil {
 		cached := s.intentEntries
 		err := s.intentEntriesErr
@@ -414,6 +521,36 @@ func (s *EphemeralHookSession) hookCallback(data sqlite3.SQLitePreUpdateData) {
 		return
 	}
 
+	// go-sqlite3's preupdate hook segfaults reading a VIRTUAL generated column's
+	// value: sqlite3_preupdate_new/old returns a NULL sqlite3_value* for it, and
+	// row() dereferences that pointer unconditionally (verified directly against
+	// go-sqlite3 v1.14.24; there is no way to skip just that column's index with
+	// the API as vendored). Refuse capture rather than crash the process.
+	// STORED generated columns are unaffected and are not in schema.VirtualColumns.
+	if len(schema.VirtualColumns) > 0 {
+		s.setConflictError(fmt.Errorf(
+			"cannot capture CDC for table %s: table has GENERATED ALWAYS AS (...) VIRTUAL "+
+				"column(s) %s, which go-sqlite3's preupdate hook cannot safely read - "+
+				"use STORED instead of VIRTUAL",
+			data.TableName, strings.Join(schema.VirtualColumns, ", ")))
+		return
+	}
+
+	// Tables with no explicit PRIMARY KEY replicate their identity via SQLite's
+	// rowid (schema.PKIndices == [-1]). A user-declared column that shadows one
+	// of SQLite's rowid aliases would collide with the synthetic "rowid" CDC key
+	// used below, so refuse to capture rather than silently corrupting identity.
+	if isRowidSentinelSchema(schema) {
+		if shadow := findShadowedRowidColumn(schema.Columns); shadow != "" {
+			s.setConflictError(fmt.Errorf(
+				"cannot capture CDC for table %s: column %q shadows SQLite's rowid alias; "+
+					"tables without an explicit PRIMARY KEY must not declare a column named "+
+					"rowid, oid, or _rowid_ - add an explicit PRIMARY KEY instead",
+				data.TableName, shadow))
+			return
+		}
+	}
+
 	// Determine operation type
 	var opType uint8
 	switch data.Op {
@@ -436,7 +573,16 @@ func (s *EphemeralHookSession) hookCallback(data sqlite3.SQLitePreUpdateData) {
 	if data.Op == sqlite3.SQLITE_DELETE || data.Op == sqlite3.SQLITE_UPDATE {
 		rawOld := make([]interface{}, colCount)
 		if data.Old(rawOld...) == nil {
-			oldVals = encodeValuesWithSchema(schema.Columns, rawOld)
+			oldVals, err = encodeValuesWithSchema(schema, rawOld)
+			if err != nil {
+				s.setConflictError(fmt.Errorf("cannot capture CDC for table %s: %w", data.TableName, err))
+				return
+			}
+			if isRowidSentinelSchema(schema) {
+				if encoded := encodeValue(data.OldRowID); encoded != nil {
+					oldVals[rowidColumnKey] = encoded
+				}
+			}
 			if data.Op == sqlite3.SQLITE_DELETE {
 				pkValues := extractPKFromValues(schema, rawOld, data.OldRowID)
 				intentKey = filter.EncodeIntentKeyWithPrefix(schema.IntentKeyPrefix, pkValues)
@@ -447,7 +593,16 @@ func (s *EphemeralHookSession) hookCallback(data sqlite3.SQLitePreUpdateData) {
 	if data.Op == sqlite3.SQLITE_INSERT || data.Op == sqlite3.SQLITE_UPDATE {
 		rawNew := make([]interface{}, colCount)
 		if data.New(rawNew...) == nil {
-			newVals = encodeValuesWithSchema(schema.Columns, rawNew)
+			newVals, err = encodeValuesWithSchema(schema, rawNew)
+			if err != nil {
+				s.setConflictError(fmt.Errorf("cannot capture CDC for table %s: %w", data.TableName, err))
+				return
+			}
+			if isRowidSentinelSchema(schema) {
+				if encoded := encodeValue(data.NewRowID); encoded != nil {
+					newVals[rowidColumnKey] = encoded
+				}
+			}
 			pkValues := extractPKFromValues(schema, rawNew, data.NewRowID)
 			intentKey = filter.EncodeIntentKeyWithPrefix(schema.IntentKeyPrefix, pkValues)
 		}
@@ -593,6 +748,36 @@ func (s *EphemeralHookSession) setConflictError(err error) {
 // Utility functions
 // =============================================================================
 
+// rowidColumnKey is the CDC map key used to carry a rowid-sentinel table's
+// identity (SQLite's implicit rowid) through capture and apply, so replicas
+// converge on the origin's rowid instead of assigning their own.
+const rowidColumnKey = "rowid"
+
+// reservedRowidAliases are SQLite's built-in names for the rowid column.
+// A user-declared column sharing one of these names would collide with
+// rowidColumnKey in the CDC maps, so tables relying on the rowid sentinel
+// must not declare any of them.
+var reservedRowidAliases = [...]string{"rowid", "oid", "_rowid_"}
+
+// isRowidSentinelSchema reports whether a table has no explicit PRIMARY KEY,
+// meaning its replication identity is SQLite's rowid (schema.PKIndices == [-1]).
+func isRowidSentinelSchema(schema *TableSchema) bool {
+	return len(schema.PKIndices) == 1 && schema.PKIndices[0] == -1
+}
+
+// findShadowedRowidColumn returns the first declared column name that
+// case-insensitively matches one of SQLite's rowid aliases, or "" if none do.
+func findShadowedRowidColumn(columns []string) string {
+	for _, col := range columns {
+		for _, alias := range reservedRowidAliases {
+			if strings.EqualFold(col, alias) {
+				return col
+			}
+		}
+	}
+	return ""
+}
+
 // extractPKFromValues extracts PK values from raw values slice using schema indices.
 // Returns typed PK values in PK declaration order for binary encoding.
 func extractPKFromValues(schema *TableSchema, values []interface{}, rowID int64) []filter.TypedPKValue {
@@ -615,17 +800,71 @@ func extractPKFromValues(schema *TableSchema, values []interface{}, rowID int64)
 }
 
 // encodeValuesWithSchema converts []interface{} to map[string][]byte using schema column names.
-func encodeValuesWithSchema(columns []string, values []interface{}) map[string][]byte {
+//
+// SQLite's preupdate hook hands back TEXT and BLOB storage classes identically
+// as Go []byte (see go-sqlite3's row(): both SQLITE_BLOB and SQLITE_TEXT go
+// through sqlite3_value_bytes/GoBytes), so nothing about the raw value itself
+// says which one it is. schema.BlobAffinityCols (precomputed at schema load
+// from the declared column type) resolves that by column AFFINITY, not
+// declared type name: per SQLite's dynamic typing (sqlite.org/datatype3.html
+// #3.1), only BLOB affinity never coerces a stored value - every other
+// affinity (TEXT, INTEGER, REAL, NUMERIC) converts a value that looks
+// numeric on INSERT, but a TEXT value that doesn't parse as a number is left
+// alone. So a []byte captured for a NUMERIC/INTEGER/REAL/TEXT-affinity
+// column is TEXT storage class in the overwhelming common case (numbers
+// arrive from the hook as int64/float64 already, never []byte) and is
+// converted to string here, written as msgpack Str. A []byte for a
+// BLOB-affinity column is left as-is and written as msgpack Bin.
+// unmarshalCDCValue's strict decode preserves that choice on the way back
+// out, so BLOB columns round trip as []byte -> sqlite3_bind_blob instead of
+// being coerced to text.
+//
+// This is a deliberate, accepted lesser evil, not a complete solution: SQLite
+// never coerces a genuine BLOB storage class value either, regardless of the
+// column's declared affinity (e.g. inserted via a literal blob or an explicit
+// CAST(... AS BLOB) into a NUMERIC/TEXT/etc-affinity column). Such a value
+// would incorrectly round-trip as a string here, since nothing in the raw
+// []byte or the static schema distinguishes it from ordinary TEXT storage
+// class. This is intentionally the rarer case: BLOB-affinity columns are
+// overwhelmingly used for genuine binary data (password hashes, UUIDs - the
+// motivating bug), while non-BLOB-affinity columns overwhelmingly hold text
+// or numbers, so defaulting non-BLOB affinities to string protects the
+// common case in both directions.
+//
+// Columns are looked up by their true position (schema.ColumnPositions), not
+// by their index within schema.Columns: whenever the table has a generated
+// (STORED) column, schema.Columns excludes it but the preupdate hook's raw
+// values array does not skip its slot, so index-in-Columns and
+// index-into-values diverge (see loadSchema).
+//
+// Returns an error - rather than silently dropping data - if a column's
+// position falls outside the captured values (a stale schema relative to
+// this row) or if any value fails to encode, since a partial CDC row is
+// worse than a loud failure.
+func encodeValuesWithSchema(schema *TableSchema, values []interface{}) (map[string][]byte, error) {
+	columns := schema.Columns
 	result := make(map[string][]byte, len(columns))
 	for i, col := range columns {
-		if i >= len(values) {
-			continue
+		pos := i
+		if i < len(schema.ColumnPositions) {
+			pos = schema.ColumnPositions[i]
 		}
-		if encoded := encodeValue(values[i]); encoded != nil {
-			result[col] = encoded
+		if pos < 0 || pos >= len(values) {
+			return nil, fmt.Errorf("column %s: position %d out of range for %d captured values (stale schema?)", col, pos, len(values))
 		}
+
+		v := values[pos]
+		isBlobAffinity := i < len(schema.BlobAffinityCols) && schema.BlobAffinityCols[i]
+		if b, ok := v.([]byte); ok && !isBlobAffinity {
+			v = string(b)
+		}
+		encoded, err := encoding.Marshal(v)
+		if err != nil {
+			return nil, fmt.Errorf("failed to encode column %s: %w", col, err)
+		}
+		result[col] = encoded
 	}
-	return result
+	return result, nil
 }
 
 // encodeValue encodes a single value to msgpack bytes.
