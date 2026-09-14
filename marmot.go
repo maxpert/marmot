@@ -449,7 +449,9 @@ func main() {
 
 	log.Info().Msg("Transaction coordinators initialized")
 
-	// Initialize DDL lock manager for cluster-wide DDL serialization
+	// Initialize DDL lock manager: serializes DDL for a database on THIS node only.
+	// Cross-node exclusion comes from the Pebble DB-op intent-key conflict in PREPARE,
+	// not from this lock (see DDLLockManager's own doc comment).
 	ddlLockLease := time.Duration(cfg.Config.DDL.LockLeaseSeconds) * time.Second
 	ddlLockMgr := coordinator.NewDDLLockManager(ddlLockLease)
 

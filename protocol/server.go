@@ -228,6 +228,18 @@ type SessionCloser interface {
 	CloseSession(session *ConnectionSession)
 }
 
+// DatabaseEnsurer is an optional extension for handlers that can resolve (and, if configured,
+// create) the database a client selects at handshake time or with COM_INIT_DB / USE. An error is
+// sent to the client and the database selection does not take effect.
+//
+// A missing database that requires creation runs through the handler's normal replicated DDL
+// path, so on a cluster without quorum the handshake or USE blocks up to the DDL timeout and then
+// fails with the real quorum error. That is intentional: fail at connect time with the actual
+// reason rather than layering a second timeout on top.
+type DatabaseEnsurer interface {
+	EnsureDatabase(session *ConnectionSession, name string) error
+}
+
 // ResultSet represents a MySQL result set
 type ResultSet struct {
 	Columns        []ColumnDef
@@ -452,13 +464,14 @@ func (s *MySQLServer) handleConnection(conn net.Conn) {
 	}
 
 	// Parse handshake response to extract database name and other info
+	var requestedDB string
 	if handshake, err := ParseHandshakeResponse(handshakeResp); err == nil {
 		session.ClientCaps = handshake.Capabilities
-		if handshake.Database != "" {
-			session.CurrentDatabase = handshake.Database
+		requestedDB = handshake.Database
+		if requestedDB != "" {
 			log.Debug().
 				Uint64("conn_id", session.ConnID).
-				Str("database", handshake.Database).
+				Str("database", requestedDB).
 				Str("user", handshake.Username).
 				Msg("Initial database from handshake")
 		}
@@ -475,15 +488,32 @@ func (s *MySQLServer) handleConnection(conn net.Conn) {
 		return
 	}
 
+	// Register this connection for tracking before EnsureDatabase runs: it can
+	// block for seconds doing a 2PC CREATE DATABASE, and a parked connection
+	// must still be visible to ActiveConnectionCount() and force-closable by
+	// GracefulDrain. Deregister on any exit path from here on.
+	s.activeConns.Store(session.ConnID, conn)
+	defer s.activeConns.Delete(session.ConnID)
+
+	// Resolve (and, if the handler supports it, create) the requested database
+	// before completing the handshake. A failure here (e.g. unknown database)
+	// is reported to the client and the connection is closed, matching real
+	// MySQL's behavior of refusing to authenticate against a bad database.
+	if requestedDB != "" {
+		if ensurer, ok := s.handler.(DatabaseEnsurer); ok {
+			if err := ensurer.EnsureDatabase(session, requestedDB); err != nil {
+				_ = s.writeMySQLErr(conn, 2, err)
+				return
+			}
+		}
+		session.CurrentDatabase = requestedDB
+	}
+
 	// 3. Send OK Packet (Authentication successful)
 	if err := s.writeOK(conn, 2, session, 0, 0); err != nil {
 		log.Error().Err(err).Msg("Failed to write OK packet")
 		return
 	}
-
-	// Register this connection for tracking; deregister on any exit path.
-	s.activeConns.Store(session.ConnID, conn)
-	defer s.activeConns.Delete(session.ConnID)
 
 	// 4. Command Loop
 	for {
@@ -507,6 +537,12 @@ func (s *MySQLServer) handleConnection(conn net.Conn) {
 		switch cmd {
 		case 0x02: // COM_INIT_DB (USE database)
 			dbName := string(payload[1:])
+			if ensurer, ok := s.handler.(DatabaseEnsurer); ok {
+				if err := ensurer.EnsureDatabase(session, dbName); err != nil {
+					_ = s.writeMySQLErr(conn, 1, err)
+					break
+				}
+			}
 			session.CurrentDatabase = dbName
 			log.Debug().Uint64("conn_id", session.ConnID).Str("database", dbName).Msg("Changed database")
 			_ = s.writeOK(conn, 1, session, 0, 0)

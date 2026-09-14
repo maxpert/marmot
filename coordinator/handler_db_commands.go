@@ -44,8 +44,8 @@ func (h *CoordinatorHandler) handleShowEngines() (*protocol.ResultSet, error) {
 
 // handleUseDatabase changes the current database for the session
 func (h *CoordinatorHandler) handleUseDatabase(session *protocol.ConnectionSession, dbName string) (*protocol.ResultSet, error) {
-	if h.dbManager != nil && !h.dbManager.DatabaseExists(dbName) {
-		return nil, errors.New("database does not exist: " + dbName)
+	if err := h.EnsureDatabase(session, dbName); err != nil {
+		return nil, err
 	}
 
 	session.CurrentDatabase = dbName

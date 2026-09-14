@@ -46,7 +46,7 @@ func (m *MetadataHandler) HandleShowDatabases() (*protocol.ResultSet, error) {
 // HandleUseDatabase switches the current database context
 func (m *MetadataHandler) HandleUseDatabase(dbName string) error {
 	if !m.db.DatabaseExists(dbName) {
-		return fmt.Errorf("ERROR 1049 (42000): Unknown database '%s'", dbName)
+		return protocol.ErrUnknownDatabase(dbName)
 	}
 	return nil
 }

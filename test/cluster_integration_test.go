@@ -3,14 +3,17 @@ package test
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
-	_ "github.com/go-sql-driver/mysql"
+	mysqldriver "github.com/go-sql-driver/mysql"
+	"github.com/maxpert/marmot/cfg"
 	"github.com/maxpert/marmot/coordinator"
 	"github.com/maxpert/marmot/db"
 	marmotgrpc "github.com/maxpert/marmot/grpc"
@@ -625,4 +628,242 @@ func waitForClusterWatermark(t *testing.T, nodes []*testNode, database string, t
 		targetSeqNum,
 		strings.Join(lastStatus, "; "),
 	)
+}
+
+// --- auto-create-database-on-connect integration tests ---
+//
+// Regression coverage for: a MySQL client naming a database that does not
+// exist on Marmot used to be accepted silently, then fail deep inside 2PC
+// with a confusing "prepare quorum not achieved" error on its first write.
+// These tests drive the real MySQL wire protocol (handshake database name)
+// against a real 3-node cluster, exactly as a client like LLDAP would.
+
+// startAutoCreateCluster starts a 3-node cluster on a dedicated port range (so
+// it cannot collide with TestClusterReplication's 1808x/1330x or
+// TestClusterLoadDataLocalReplication's 1818x/1340x ports) and returns it
+// once gossip has stabilized. Every node is cleaned up via t.Cleanup.
+func startAutoCreateCluster(t *testing.T, basePort int) []*testNode {
+	t.Helper()
+
+	nodes := make([]*testNode, 3)
+	for i := 0; i < 3; i++ {
+		nodeID := uint64(i + 1)
+		node := &testNode{
+			nodeID:    nodeID,
+			dataDir:   filepath.Join(os.TempDir(), fmt.Sprintf("marmot-test-autocreate-%d-%d-%d", basePort, nodeID, time.Now().UnixNano())),
+			grpcPort:  basePort + i,
+			mysqlPort: basePort + 100 + i,
+		}
+		nodes[i] = node
+		t.Cleanup(node.cleanup)
+		require.NoError(t, os.MkdirAll(node.dataDir, 0755))
+	}
+
+	for i, node := range nodes {
+		var seedNodes []string
+		if i > 0 {
+			seedNodes = []string{fmt.Sprintf("localhost:%d", nodes[0].grpcPort)}
+		}
+		startNode(t, node, seedNodes)
+		time.Sleep(startupDelay)
+	}
+
+	t.Log("Waiting for cluster to stabilize...")
+	time.Sleep(2 * time.Second)
+	for _, node := range nodes {
+		aliveNodes := node.gossip.GetNodeRegistry().GetAlive()
+		require.GreaterOrEqual(t, len(aliveNodes), 3, "Node %d should see at least 3 nodes", node.nodeID)
+	}
+
+	return nodes
+}
+
+// countDatabaseOccurrences returns how many times dbName appears in SHOW
+// DATABASES on node - a safety count (never more than once), not merely a
+// liveness check that it eventually appears.
+func countDatabaseOccurrences(t *testing.T, node *testNode, dbName string) int {
+	t.Helper()
+	rows, err := node.mysqlConn.Query("SHOW DATABASES")
+	require.NoError(t, err, "SHOW DATABASES failed on node %d", node.nodeID)
+	defer rows.Close()
+
+	count := 0
+	for rows.Next() {
+		var name string
+		require.NoError(t, rows.Scan(&name))
+		if name == dbName {
+			count++
+		}
+	}
+	require.NoError(t, rows.Err())
+	return count
+}
+
+func waitForDatabaseVisible(t *testing.T, node *testNode, dbName string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if countDatabaseOccurrences(t, node, dbName) > 0 {
+			return
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	require.FailNowf(t, "database did not become visible in time", "node=%d db=%s timeout=%s", node.nodeID, dbName, timeout)
+}
+
+// TestClusterAutoCreateDatabaseOnConnect: connecting with a database name
+// that does not exist yet creates it (auto_create_database defaults to true)
+// through the normal replicated DDL path, so subsequent DDL/DML on that
+// connection succeed immediately and the database and table propagate to
+// every other node in the cluster.
+func TestClusterAutoCreateDatabaseOnConnect(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	prevAutoCreate := cfg.Config.MySQL.AutoCreateDatabase
+	cfg.Config.MySQL.AutoCreateDatabase = true
+	t.Cleanup(func() { cfg.Config.MySQL.AutoCreateDatabase = prevAutoCreate })
+
+	nodes := startAutoCreateCluster(t, 18300)
+	const newDB = "autocreated_on_connect"
+
+	dsn := fmt.Sprintf("root:@tcp(127.0.0.1:%d)/%s", nodes[0].mysqlPort, newDB)
+	conn, err := sql.Open("mysql", dsn)
+	require.NoError(t, err)
+	defer conn.Close()
+	require.NoError(t, conn.Ping(), "connecting with an unknown database must auto-create it, not fail")
+
+	_, err = conn.Exec("CREATE TABLE widgets (id INT PRIMARY KEY, label TEXT)")
+	require.NoError(t, err, "CREATE TABLE must succeed immediately on the auto-created database")
+	_, err = conn.Exec("INSERT INTO widgets (id, label) VALUES (1, 'a')")
+	require.NoError(t, err)
+
+	var label string
+	require.NoError(t, conn.QueryRow("SELECT label FROM widgets WHERE id = 1").Scan(&label))
+	require.Equal(t, "a", label)
+
+	// The database is visible on every node (created cluster-wide, not just
+	// locally) and exactly once each - a safety count, not just "eventually".
+	for _, node := range nodes {
+		waitForDatabaseVisible(t, node, newDB, 30*time.Second)
+		require.Equal(t, 1, countDatabaseOccurrences(t, node, newDB), "node %d must list %s exactly once", node.nodeID, newDB)
+	}
+
+	// The table and row propagate to the other two nodes.
+	for _, node := range nodes[1:] {
+		peerDSN := fmt.Sprintf("root:@tcp(127.0.0.1:%d)/%s", node.mysqlPort, newDB)
+		peerConn, err := sql.Open("mysql", peerDSN)
+		require.NoError(t, err)
+		defer peerConn.Close()
+		require.NoError(t, peerConn.Ping(), "node %d should already have %s (it was just proven visible)", node.nodeID, newDB)
+
+		var peerLabel string
+		require.Eventually(t, func() bool {
+			scanErr := peerConn.QueryRow("SELECT label FROM widgets WHERE id = 1").Scan(&peerLabel)
+			return scanErr == nil
+		}, 30*time.Second, 500*time.Millisecond, "table/row should propagate to node %d", node.nodeID)
+		require.Equal(t, "a", peerLabel, "node %d row mismatch", node.nodeID)
+	}
+}
+
+// TestClusterAutoCreateDatabaseConcurrentSafety: two clients connecting to
+// two different nodes at the same instant with the same never-before-seen
+// database name must both succeed, and the database must end up existing
+// exactly once cluster-wide - not created twice, not left half-created on
+// one node. Serialization here is NOT via coordinator.DDLLockManager: that
+// lock is per-node/local only (see its own doc comment in
+// coordinator/ddl_lock.go) and plays no role across two different nodes.
+// What actually serializes the two nodes' concurrent CREATE DATABASE IF NOT
+// EXISTS attempts is the Pebble DB-op intent-key conflict during 2PC
+// PREPARE: both try to WriteIntent on the same database-op intent key, only
+// one side can gather quorum, and the loser's EnsureDatabase retry sees
+// ConflictDetected, backs off, and finds the database already created by
+// the winner.
+func TestClusterAutoCreateDatabaseConcurrentSafety(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	prevAutoCreate := cfg.Config.MySQL.AutoCreateDatabase
+	cfg.Config.MySQL.AutoCreateDatabase = true
+	t.Cleanup(func() { cfg.Config.MySQL.AutoCreateDatabase = prevAutoCreate })
+
+	nodes := startAutoCreateCluster(t, 18400)
+	const newDB = "concurrent_autocreate_db"
+
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+	targets := []int{nodes[0].mysqlPort, nodes[1].mysqlPort}
+	for i, port := range targets {
+		wg.Add(1)
+		go func(i, port int) {
+			defer wg.Done()
+			dsn := fmt.Sprintf("root:@tcp(127.0.0.1:%d)/%s", port, newDB)
+			conn, err := sql.Open("mysql", dsn)
+			if err == nil {
+				err = conn.Ping()
+			}
+			if conn != nil {
+				defer conn.Close()
+			}
+			errs[i] = err
+		}(i, port)
+	}
+	wg.Wait()
+
+	require.NoError(t, errs[0], "connection to node 1 must succeed")
+	require.NoError(t, errs[1], "connection to node 2 must succeed")
+
+	// Every node reports it exactly once - the safety property (not "eventually
+	// created", but "never created more than once" under concurrent creators).
+	for _, node := range nodes {
+		waitForDatabaseVisible(t, node, newDB, 30*time.Second)
+		require.Equal(t, 1, countDatabaseOccurrences(t, node, newDB), "node %d must list %s exactly once even under concurrent creation", node.nodeID, newDB)
+	}
+
+	// Still usable: a third connection (to the third node) can create a table.
+	dsn3 := fmt.Sprintf("root:@tcp(127.0.0.1:%d)/%s", nodes[2].mysqlPort, newDB)
+	conn3, err := sql.Open("mysql", dsn3)
+	require.NoError(t, err)
+	defer conn3.Close()
+	require.NoError(t, conn3.Ping())
+	_, err = conn3.Exec("CREATE TABLE t (id INT PRIMARY KEY)")
+	require.NoError(t, err, "the concurrently-created database must remain fully usable")
+}
+
+// TestClusterAutoCreateDatabaseDisabled: with auto_create_database off,
+// connecting with an unknown database name returns MySQL error 1049 and the
+// database is never created anywhere in the cluster - the safety net for
+// deployments that want real MySQL's default (reject) behavior.
+func TestClusterAutoCreateDatabaseDisabled(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	prevAutoCreate := cfg.Config.MySQL.AutoCreateDatabase
+	cfg.Config.MySQL.AutoCreateDatabase = false
+	t.Cleanup(func() { cfg.Config.MySQL.AutoCreateDatabase = prevAutoCreate })
+
+	nodes := startAutoCreateCluster(t, 18500)
+	const newDB = "should_not_be_created_db"
+
+	dsn := fmt.Sprintf("root:@tcp(127.0.0.1:%d)/%s", nodes[0].mysqlPort, newDB)
+	conn, err := sql.Open("mysql", dsn)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	pingErr := conn.Ping()
+	require.Error(t, pingErr, "connecting with an unknown database must fail when auto-create is off")
+
+	var mysqlErr *mysqldriver.MySQLError
+	require.True(t, errors.As(pingErr, &mysqlErr), "error must be a MySQL protocol error, got %T: %v", pingErr, pingErr)
+	require.Equal(t, uint16(1049), mysqlErr.Number, "must be MySQL error 1049 (Unknown database)")
+
+	// Give replication/gossip a moment, then confirm nothing was created
+	// anywhere - the safety property this test exists for.
+	time.Sleep(2 * time.Second)
+	for _, node := range nodes {
+		require.Equal(t, 0, countDatabaseOccurrences(t, node, newDB), "node %d must not have created %s", node.nodeID, newDB)
+	}
 }

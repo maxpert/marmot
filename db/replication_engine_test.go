@@ -1,7 +1,9 @@
 package db
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -10,6 +12,8 @@ import (
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/protocol"
 	"github.com/maxpert/marmot/protocol/filter"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -137,6 +141,75 @@ func TestReplicationEngine_PrepareWithDDL(t *testing.T) {
 	assert.Equal(t, req.Statements[0].SQL, snapshot.SQL)
 	assert.Equal(t, "users", snapshot.TableName)
 	assert.Equal(t, startTS.WallTime, snapshot.Timestamp)
+}
+
+// TestReplicationEngine_CreateDDLIntent_LoggedIntentKeyMatchesSafeRendering verifies that
+// createDDLIntent's "Created write intent for DDL statement" debug log renders
+// ddl_intent_key through the same safeIntentKeyForLog helper used for the intent-conflict
+// logs in meta_store_pebble.go, not the raw binary key (DDL intents are prefixed with
+// filter.IntentKeyMarkerDDL = 0xFE, never a valid UTF-8 lead byte).
+//
+// zerolog v1.35.0's own string encoder already substitutes invalid UTF-8 sequences with a
+// U+FFFD escape at emission time (verified directly against both the JSON and Console
+// writers: appendStringComplex in internal/json/string.go). The actual
+// defect is lossy corruption: raw logging silently replaces the marker and length bytes
+// with U+FFFD / \uXXXX escapes, destroying the exact key bytes a debugger needs. The
+// discriminating assertion is therefore exact equality with safeIntentKeyForLog's
+// lossless %q rendering of the same key.
+func TestReplicationEngine_CreateDDLIntent_LoggedIntentKeyMatchesSafeRendering(t *testing.T) {
+	engine, dm, cleanup := setupTestReplicationEngine(t)
+	defer cleanup()
+
+	require.NoError(t, dm.CreateDatabase("testdb"))
+
+	var buf bytes.Buffer
+	prevLogger := log.Logger
+	prevLevel := zerolog.GlobalLevel()
+	log.Logger = zerolog.New(&buf)
+	zerolog.SetGlobalLevel(zerolog.DebugLevel)
+	defer func() {
+		log.Logger = prevLogger
+		zerolog.SetGlobalLevel(prevLevel)
+	}()
+
+	ctx := context.Background()
+	req := &PrepareRequest{
+		TxnID:    2001,
+		NodeID:   1,
+		StartTS:  hlc.Timestamp{WallTime: 2000, Logical: 1},
+		Database: "testdb",
+		Statements: []protocol.Statement{
+			{
+				Type:      protocol.StatementDDL,
+				SQL:       "CREATE TABLE utf8_probe (id INTEGER PRIMARY KEY)",
+				TableName: "utf8_probe",
+			},
+		},
+	}
+
+	result := engine.Prepare(ctx, req)
+	require.True(t, result.Success, "Prepare should succeed")
+
+	expectedKey := filter.EncodeDDLIntentKey("utf8_probe")
+	expectedField := safeIntentKeyForLog(string(expectedKey))
+
+	found := false
+	for _, line := range bytes.Split(bytes.TrimSpace(buf.Bytes()), []byte("\n")) {
+		if len(line) == 0 {
+			continue
+		}
+		var entry map[string]any
+		require.NoErrorf(t, json.Unmarshal(line, &entry), "log line is not valid JSON: %s", line)
+		if entry["message"] != "Created write intent for DDL statement" {
+			continue
+		}
+		found = true
+		keyVal, ok := entry["ddl_intent_key"].(string)
+		require.Truef(t, ok, "log line missing string ddl_intent_key field: %s", line)
+		assert.Equalf(t, expectedField, keyVal,
+			"ddl_intent_key must be logged through safeIntentKeyForLog, not the raw binary key")
+	}
+	require.True(t, found, `expected a "Created write intent for DDL statement" log line`)
 }
 
 // TestReplicationEngine_PrepareWithCDC verifies PREPARE creates write intents but does NOT store CDC
@@ -365,6 +438,104 @@ func TestReplicationEngine_PrepareWithDatabaseOps(t *testing.T) {
 	err = DeserializeData(intents[0].DataSnapshot, &dropSnapshot)
 	require.NoError(t, err)
 	assert.Equal(t, DatabaseOpDrop, dropSnapshot.Operation)
+}
+
+// TestReplicationEngine_PrepareDatabaseOpConflictIsConflictDetected verifies
+// that two concurrent CREATE DATABASE PREPAREs for the same database name -
+// the shape produced when two MySQL clients race to auto-create the same
+// never-before-created database against different nodes - classify the
+// loser's failure as a transient conflict (ConflictDetected: true), not a
+// deterministic rejection (Rejected: false). Rejected must stay false because
+// the operation is retryable: CREATE DATABASE IF NOT EXISTS is idempotent and
+// the database will exist once the winner commits.
+func TestReplicationEngine_PrepareDatabaseOpConflictIsConflictDetected(t *testing.T) {
+	engine, _, cleanup := setupTestReplicationEngine(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	startTS1 := hlc.Timestamp{WallTime: 5000, Logical: 1}
+	startTS2 := hlc.Timestamp{WallTime: 5001, Logical: 1}
+
+	req1 := &PrepareRequest{
+		TxnID:    2001,
+		NodeID:   1,
+		StartTS:  startTS1,
+		Database: "",
+		Statements: []protocol.Statement{
+			{Type: protocol.StatementCreateDatabase, Database: "racing_autocreate_db"},
+		},
+	}
+	req2 := &PrepareRequest{
+		TxnID:    2002,
+		NodeID:   1,
+		StartTS:  startTS2,
+		Database: "",
+		Statements: []protocol.Statement{
+			{Type: protocol.StatementCreateDatabase, Database: "racing_autocreate_db"},
+		},
+	}
+
+	result1 := engine.Prepare(ctx, req1)
+	require.True(t, result1.Success, "first prepare should win the race and succeed")
+
+	result2 := engine.Prepare(ctx, req2)
+
+	require.False(t, result2.Success, "second, colliding prepare should fail")
+	require.True(t, result2.ConflictDetected, "the losing prepare must be classified as a conflict, not a plain failure")
+	require.False(t, result2.Rejected, "a write-write conflict must never be classified as a deterministic rejection")
+	require.NotEmpty(t, result2.ConflictDetails, "conflict details should be provided")
+}
+
+// TestReplicationEngine_CommitDatabaseOpIdempotentNoOpSkipsSchemaBump is a
+// regression test for a defect found while fixing concurrent auto-create: a
+// second, redundant "CREATE DATABASE IF NOT EXISTS" commit against a database
+// that already exists (the shape produced when a losing racer's retry still
+// completes after the winner already created it) must NOT report a schema
+// change. db.DatabaseManager.CreateDatabase is idempotent at the file level,
+// but before this fix Commit's DatabaseOpCreate branch always set DDLSQL
+// (which grpc/replication_handler.go and CommitResult.ToCoordinatorResponse
+// both treat as "bump the schema version"), regardless of whether anything
+// actually changed. A redundant bump widens the window in which a
+// subsequent DDL statement can transiently miss quorum because replicas
+// haven't all caught up to a version number that reflects no real second
+// change - the exact failure observed in
+// TestClusterAutoCreateDatabaseConcurrentSafety.
+func TestReplicationEngine_CommitDatabaseOpIdempotentNoOpSkipsSchemaBump(t *testing.T) {
+	engine, dm, cleanup := setupTestReplicationEngine(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// First CREATE DATABASE: genuinely creates it, must report a schema change.
+	prepReq1 := &PrepareRequest{
+		TxnID:      3001,
+		NodeID:     1,
+		StartTS:    hlc.Timestamp{WallTime: 9000, Logical: 1},
+		Database:   "",
+		Statements: []protocol.Statement{{Type: protocol.StatementCreateDatabase, Database: "idempotentdb"}},
+	}
+	require.True(t, engine.Prepare(ctx, prepReq1).Success)
+	commitResult1 := engine.Commit(ctx, &CommitRequest{TxnID: 3001, Database: ""})
+	require.True(t, commitResult1.Success)
+	require.NotEmpty(t, commitResult1.DDLSQL, "the genuine creation must report a schema change")
+	require.False(t, commitResult1.ToCoordinatorResponse().IdempotentNoOp, "a genuine creation must not be flagged as a no-op")
+	require.True(t, dm.DatabaseExists("idempotentdb"))
+
+	// Second, redundant CREATE DATABASE for the same name (a different txn,
+	// simulating a losing racer's retry landing after the database already
+	// exists): must be a no-op that reports NO schema change.
+	prepReq2 := &PrepareRequest{
+		TxnID:      3002,
+		NodeID:     1,
+		StartTS:    hlc.Timestamp{WallTime: 9001, Logical: 1},
+		Database:   "",
+		Statements: []protocol.Statement{{Type: protocol.StatementCreateDatabase, Database: "idempotentdb"}},
+	}
+	require.True(t, engine.Prepare(ctx, prepReq2).Success)
+	commitResult2 := engine.Commit(ctx, &CommitRequest{TxnID: 3002, Database: ""})
+	require.True(t, commitResult2.Success, "a redundant CREATE DATABASE IF NOT EXISTS must still succeed (idempotent)")
+	require.Empty(t, commitResult2.DDLSQL, "a redundant no-op create must not signal a schema change")
+	require.True(t, commitResult2.ToCoordinatorResponse().IdempotentNoOp, "IdempotentNoOp must reflect the no-op")
 }
 
 // TestReplicationEngine_PrepareConflictDetection verifies conflict detection
@@ -754,6 +925,39 @@ func TestReplicationEngine_AbortDatabaseNotFound(t *testing.T) {
 	// Verify success (abort is idempotent)
 	require.True(t, result.Success)
 	require.Empty(t, result.Error)
+}
+
+// TestReplicationEngine_PrepareDatabaseNotFoundIsRejection verifies that PREPARE
+// against a database that was never created is a deterministic rejection, not a
+// missing ACK. Regression test: a client (e.g. LLDAP) naming an unknown database
+// previously got "database not found" without Rejected set, so
+// coordinator/write_coordinator.go treated it as a possibly-transient missing ACK
+// and kept waiting/retrying toward quorum, surfacing the confusing
+// "prepare quorum not achieved: got 0 acks, need 1" instead of a clean rejection
+// of the actual cause. Asserting Rejected==true here proves the coordinator will
+// stop immediately instead of waiting on quorum for an input that can never
+// succeed.
+func TestReplicationEngine_PrepareDatabaseNotFoundIsRejection(t *testing.T) {
+	engine, _, cleanup := setupTestReplicationEngine(t)
+	defer cleanup()
+
+	result := engine.Prepare(context.Background(), &PrepareRequest{
+		TxnID:    9999,
+		NodeID:   1,
+		StartTS:  hlc.Timestamp{WallTime: 1000, Logical: 1},
+		Database: "nonexistent",
+		Statements: []protocol.Statement{{
+			Type:      protocol.StatementInsert,
+			TableName: "items",
+			IntentKey: []byte("1"),
+			SQL:       "INSERT INTO items (id) VALUES (1)",
+		}},
+	})
+
+	require.False(t, result.Success)
+	require.Contains(t, result.Error, "database not found")
+	require.True(t, result.Rejected, "database-not-found PREPARE must be a final rejection, not a retryable missing ACK")
+	require.True(t, result.ToCoordinatorResponse().Rejected, "rejection must survive the coordinator conversion")
 }
 
 // TestReplicationEngine_PrepareMultipleDDL verifies multiple DDL statements on different tables

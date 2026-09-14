@@ -110,7 +110,7 @@ func TestRunCommitPhase_DDLTransactionSurvivesCommitDelayBeyondWriteTimeout(t *t
 	}
 	cluster := &ClusterState{AliveNodes: nodes, TotalMembership: 3, RequiredQuorum: 2}
 
-	err := wc.runCommitPhase(context.Background(), txn, cluster, prepResponses)
+	_, err := wc.runCommitPhase(context.Background(), txn, cluster, prepResponses)
 
 	AssertNoError(t, err)
 
@@ -156,7 +156,7 @@ func TestRunCommitPhase_DMLTransactionCommitStillTimesOutAtWriteTimeout(t *testi
 	}
 	cluster := &ClusterState{AliveNodes: nodes, TotalMembership: 3, RequiredQuorum: 2}
 
-	err := wc.runCommitPhase(context.Background(), txn, cluster, prepResponses)
+	_, err := wc.runCommitPhase(context.Background(), txn, cluster, prepResponses)
 
 	AssertError(t, err, &PartialCommitError{})
 

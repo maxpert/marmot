@@ -286,10 +286,26 @@ func (dm *DatabaseManager) ensureDefaultDatabase() error {
 	return nil
 }
 
-// CreateDatabase creates a new database with its own MetaStore
+// CreateDatabase creates a new database with its own MetaStore. It is
+// idempotent (IF NOT EXISTS semantics): calling it for a database that
+// already exists returns nil without error or any other effect.
 func (dm *DatabaseManager) CreateDatabase(name string) error {
+	_, err := dm.createDatabase(name)
+	return err
+}
+
+// createDatabase is CreateDatabase's implementation. It additionally reports,
+// atomically with the existence check (both under dm.mu), whether this call
+// is the one that actually created the database (true) versus finding it
+// already existing and no-oping (false, err == nil). CreateDatabase's plain
+// nil-error result cannot distinguish those two outcomes, but a caller that
+// must not double-apply a side effect for an idempotent no-op - such as
+// bumping a database's schema version once per real structural change, not
+// once per redundant concurrent "CREATE DATABASE IF NOT EXISTS" - needs this
+// signal.
+func (dm *DatabaseManager) createDatabase(name string) (created bool, err error) {
 	if name == SystemDatabaseName {
-		return fmt.Errorf("cannot create system database")
+		return false, fmt.Errorf("cannot create system database")
 	}
 
 	dm.mu.Lock()
@@ -298,7 +314,7 @@ func (dm *DatabaseManager) CreateDatabase(name string) error {
 	// Check if database already exists - return success for idempotency (IF NOT EXISTS semantics)
 	if _, exists := dm.databases[name]; exists {
 		log.Debug().Str("database", name).Msg("Database already exists, returning success")
-		return nil
+		return false, nil
 	}
 
 	// Create database file
@@ -308,14 +324,14 @@ func (dm *DatabaseManager) CreateDatabase(name string) error {
 	// Create MetaStore for this database
 	metaStore, err := NewMetaStore(fullPath)
 	if err != nil {
-		return fmt.Errorf("failed to create meta store: %w", err)
+		return false, fmt.Errorf("failed to create meta store: %w", err)
 	}
 
 	db, err := NewReplicatedDatabase(fullPath, dm.nodeID, dm.clock, metaStore)
 	if err != nil {
 		metaStore.Close()
 		cleanupMetaStoreFiles(fullPath)
-		return fmt.Errorf("failed to create database file: %w", err)
+		return false, fmt.Errorf("failed to create database file: %w", err)
 	}
 
 	// Wire up GC coordination for newly created database
@@ -332,23 +348,35 @@ func (dm *DatabaseManager) CreateDatabase(name string) error {
 		metaStore.Close()
 		os.Remove(fullPath)
 		cleanupMetaStoreFiles(fullPath)
-		return fmt.Errorf("failed to register database in system: %w", err)
+		return false, fmt.Errorf("failed to register database in system: %w", err)
 	}
 
 	dm.databases[name] = db
 	log.Info().Str("name", name).Str("path", dbPath).Msg("Database created")
-	return nil
+	return true, nil
 }
 
-// DropDatabase drops a database
+// DropDatabase drops a database.
 // Returns nil if database doesn't exist (idempotent for IF EXISTS semantics)
 func (dm *DatabaseManager) DropDatabase(name string) error {
+	_, err := dm.dropDatabase(name)
+	return err
+}
+
+// dropDatabase is DropDatabase's implementation. It additionally reports,
+// atomically with the existence check (both under dm.mu), whether this call
+// actually dropped the database (true) versus finding it already absent and
+// no-oping (false, err == nil) - the DROP-side counterpart of
+// createDatabase's "created" signal, for the same reason: a caller must not
+// double-apply a side effect (such as a schema version bump) for an
+// idempotent no-op.
+func (dm *DatabaseManager) dropDatabase(name string) (dropped bool, err error) {
 	if name == SystemDatabaseName {
-		return fmt.Errorf("cannot drop system database")
+		return false, fmt.Errorf("cannot drop system database")
 	}
 
 	if name == DefaultDatabaseName {
-		return fmt.Errorf("cannot drop default database")
+		return false, fmt.Errorf("cannot drop default database")
 	}
 
 	dm.mu.Lock()
@@ -358,22 +386,22 @@ func (dm *DatabaseManager) DropDatabase(name string) error {
 	db, exists := dm.databases[name]
 	if !exists {
 		log.Info().Str("name", name).Msg("Database does not exist, DROP is no-op")
-		return nil
+		return false, nil
 	}
 
 	// Get path before deletion
 	var dbPath string
-	err := dm.systemDB.GetDB().QueryRow(
+	err = dm.systemDB.GetDB().QueryRow(
 		"SELECT path FROM __marmot_databases WHERE name = ?", name,
 	).Scan(&dbPath)
 	if err != nil {
-		return fmt.Errorf("failed to get database path: %w", err)
+		return false, fmt.Errorf("failed to get database path: %w", err)
 	}
 
 	// Remove from registry
 	_, err = dm.systemDB.GetDB().Exec("DELETE FROM __marmot_databases WHERE name = ?", name)
 	if err != nil {
-		return fmt.Errorf("failed to remove database from registry: %w", err)
+		return false, fmt.Errorf("failed to remove database from registry: %w", err)
 	}
 
 	// Close database connection
@@ -399,7 +427,7 @@ func (dm *DatabaseManager) DropDatabase(name string) error {
 	os.RemoveAll(metaPath)
 
 	log.Info().Str("name", name).Msg("Database dropped")
-	return nil
+	return true, nil
 }
 
 // GetDatabase returns a database by name

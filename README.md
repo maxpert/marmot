@@ -195,7 +195,7 @@ Marmot v2 supports **distributed DDL (Data Definition Language) replication** wi
 
 ### How It Works
 
-1. **Cluster-Wide Locking**: Each DDL operation acquires a distributed lock per database (default: 30-second lease)
+1. **Node-Local DDL Lock**: The coordinating node acquires an in-memory lock per database (default: 30-second lease); cross-node exclusion of concurrent DDL comes from the Pebble write-intent conflict in PREPARE
    - Prevents concurrent schema changes on the same database
    - Locks automatically expire if a node crashes
    - Different databases can have concurrent DDL operations
@@ -811,7 +811,7 @@ Marmot v2 includes an automatic anti-entropy system that continuously monitors a
 - **Selective Table Watching**: All tables in a database are replicated. Selective table replication is not supported.
 - **WAL Mode Required**: SQLite must use WAL mode for reliable multi-process changes.
 - **Eventually Consistent**: Rows may sync out of order. `SERIALIZABLE` transaction assumptions may not hold across nodes.
-- **Concurrent DDL**: Avoid running concurrent DDL operations on the same database from multiple nodes (protected by cluster-wide lock with 30s lease).
+- **Concurrent DDL**: Avoid running concurrent DDL operations on the same database from multiple nodes (the coordinating node holds a node-local lock with a 30s lease; cross-node exclusion comes from the Pebble write-intent conflict in PREPARE).
 
 ## Auto-Increment & ID Generation
 

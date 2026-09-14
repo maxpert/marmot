@@ -92,7 +92,7 @@ func TestFullReplication_QuorumWrite(t *testing.T) {
 
 	// Execute write
 	ctx := context.Background()
-	err := coordinator.WriteTransaction(ctx, txn)
+	_, err := coordinator.WriteTransaction(ctx, txn)
 
 	// Should succeed (coordinator + 4 nodes, need 3 for quorum)
 	if err != nil {
@@ -147,7 +147,7 @@ func TestFullReplication_QuorumFailure(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	err := coordinator.WriteTransaction(ctx, txn)
+	_, err := coordinator.WriteTransaction(ctx, txn)
 
 	// Should fail (only 2 out of 5 nodes)
 	if err == nil {
@@ -187,7 +187,7 @@ func TestFullReplication_AllNodesReceiveWrite(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	err := coordinator.WriteTransaction(ctx, txn)
+	_, err := coordinator.WriteTransaction(ctx, txn)
 
 	if err != nil {
 		t.Fatalf("Expected write to succeed, got error: %v", err)
@@ -238,7 +238,7 @@ func TestFullReplication_NodeFailureDuringWrite(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	err := coordinator.WriteTransaction(ctx, txn)
+	_, err := coordinator.WriteTransaction(ctx, txn)
 
 	// Should still succeed: coordinator (1) + nodes 2,3,4 = 4 nodes, need 3 for quorum
 	if err != nil {
@@ -356,7 +356,7 @@ func TestCommitQuorumFailure_CoordinatorDoesNotCommit(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	err := coordinator.WriteTransaction(ctx, txn)
+	_, err := coordinator.WriteTransaction(ctx, txn)
 
 	// Should FAIL - remote commit quorum not achieved
 	if err == nil {
@@ -415,7 +415,7 @@ func TestCommitQuorumSuccess_PartialRemoteFailure(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	err := coordinator.WriteTransaction(ctx, txn)
+	_, err := coordinator.WriteTransaction(ctx, txn)
 
 	// Should SUCCEED - node 2 + coordinator = quorum of 2
 	if err != nil {
@@ -473,7 +473,7 @@ func TestSplitBrainPrevention(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	err := coordinator.WriteTransaction(ctx, txn)
+	_, err := coordinator.WriteTransaction(ctx, txn)
 
 	// Should fail: quorum requires 4 acks (majority of 6), but only 3 nodes are reachable
 	if err == nil {
@@ -530,7 +530,7 @@ func TestNoAbortAfterCommitSent(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	err := coordinator.WriteTransaction(ctx, txn)
+	_, err := coordinator.WriteTransaction(ctx, txn)
 
 	// Should FAIL - only 1 remote ACK (node 2), need 2 remote ACKs
 	if err == nil {
@@ -598,7 +598,7 @@ func TestLocalPrepareMustSucceed(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	err := coordinator.WriteTransaction(ctx, txn)
+	_, err := coordinator.WriteTransaction(ctx, txn)
 
 	// Should FAIL - coordinator must participate
 	if err == nil {
@@ -685,7 +685,7 @@ func TestPartialCommitErrorMessage(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	err := coordinator.WriteTransaction(ctx, txn)
+	_, err := coordinator.WriteTransaction(ctx, txn)
 
 	// Should FAIL - need 2 remote ACKs (quorum-1), got only 1
 	if err == nil {

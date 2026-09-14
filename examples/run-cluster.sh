@@ -157,6 +157,7 @@ bind_address = "0.0.0.0"
 port = ${mysql_port}
 max_connections = 100
 auto_id_mode = "compact"
+auto_create_database = true
 
 [metastore]
 cache_size_mb = 128

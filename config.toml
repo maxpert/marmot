@@ -257,6 +257,10 @@ local_infile_enabled = true
 # "extended" = 64-bit HLC-based IDs for maximum uniqueness
 auto_id_mode = "compact"
 
+# Auto-create the database named in a client's handshake or USE/COM_INIT_DB when it does not
+# exist. Off means an unknown database is rejected with MySQL error 1049 (matching real MySQL).
+auto_create_database = true
+
 # ==============================================================================
 # REPLICA MODE (Read-Only Replicas)
 # ==============================================================================

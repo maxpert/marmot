@@ -48,7 +48,7 @@ func TestMultiStatementTransaction(t *testing.T) {
 
 	// Execute transaction
 	ctx := context.Background()
-	err := coordinator.WriteTransaction(ctx, txn)
+	_, err := coordinator.WriteTransaction(ctx, txn)
 	if err != nil {
 		t.Fatalf("Expected transaction to succeed, got error: %v", err)
 	}
@@ -114,7 +114,7 @@ func TestLockWaitingOnConflict(t *testing.T) {
 	var txn1Err error
 	txn1Done := make(chan struct{})
 	go func() {
-		txn1Err = coordinator.WriteTransaction(context.Background(), txn1)
+		_, txn1Err = coordinator.WriteTransaction(context.Background(), txn1)
 		close(txn1Done)
 	}()
 
@@ -141,7 +141,7 @@ func TestLockWaitingOnConflict(t *testing.T) {
 	txn2Start := time.Now()
 	txn2Done := make(chan struct{})
 	go func() {
-		txn2Err = coordinator.WriteTransaction(context.Background(), txn2)
+		_, txn2Err = coordinator.WriteTransaction(context.Background(), txn2)
 		close(txn2Done)
 	}()
 
@@ -200,7 +200,7 @@ func TestConflictReturnsDeadlockError(t *testing.T) {
 
 	// Execute - should fail immediately with deadlock error
 	start := time.Now()
-	err := coordinator.WriteTransaction(context.Background(), txn)
+	_, err := coordinator.WriteTransaction(context.Background(), txn)
 	duration := time.Since(start)
 
 	// Verify: Failed with error
@@ -263,7 +263,7 @@ func TestConcurrentTransactionsSerializeOnConflict(t *testing.T) {
 			// Simulate that each transaction takes 100ms to complete
 			replicator.SetDelay(txnID, 100*time.Millisecond)
 
-			err := coordinator.WriteTransaction(context.Background(), txn)
+			_, err := coordinator.WriteTransaction(context.Background(), txn)
 			if err != nil {
 				t.Errorf("Transaction %d failed: %v", txnID, err)
 			}
@@ -343,7 +343,7 @@ func TestNoWaitOnDifferentRows(t *testing.T) {
 			// Simulate each transaction taking 200ms
 			replicator.SetDelay(txn.ID, 200*time.Millisecond)
 
-			err := coordinator.WriteTransaction(context.Background(), txn)
+			_, err := coordinator.WriteTransaction(context.Background(), txn)
 			if err != nil {
 				t.Errorf("Transaction %d failed: %v", rowID, err)
 			}

@@ -52,6 +52,13 @@ type CommitResult struct {
 	Success bool
 	Error   string
 	DDLSQL  string // SQL for DDL statements (if any)
+	// IdempotentNoOp is true only when this commit is positively known to have
+	// changed nothing (for example a CREATE DATABASE IF NOT EXISTS that lost a
+	// race to a concurrent request which already created the database). Zero
+	// value (false) is the safe default - see
+	// coordinator.ReplicationResponse.IdempotentNoOp, which this flows into
+	// unchanged via ToCoordinatorResponse.
+	IdempotentNoOp bool
 }
 
 // AbortRequest contains parameters for the abort phase
@@ -149,7 +156,12 @@ func (re *ReplicationEngine) prepareDatabaseOperation(req *PrepareRequest) *Prep
 	err = txnMgr.WriteIntent(txn, IntentTypeDatabaseOp, "", string(dbIntentKey), stmt, dataSnapshot)
 	if err != nil {
 		_ = txnMgr.AbortTransaction(txn)
-		return &PrepareResult{Success: false, Error: fmt.Sprintf("write conflict: %v", err)}
+		return &PrepareResult{
+			Success:          false,
+			Error:            fmt.Sprintf("write conflict: %v", err),
+			ConflictDetected: true,
+			ConflictDetails:  err.Error(),
+		}
 	}
 
 	log.Info().
@@ -171,7 +183,7 @@ func (re *ReplicationEngine) prepareDatabaseOperation(req *PrepareRequest) *Prep
 func (re *ReplicationEngine) prepareRegularTransaction(ctx context.Context, req *PrepareRequest) *PrepareResult {
 	replicatedDB, err := re.dbMgr.GetDatabase(req.Database)
 	if err != nil {
-		return &PrepareResult{Success: false, Error: fmt.Sprintf("database not found: %s", req.Database)}
+		return &PrepareResult{Success: false, Error: fmt.Sprintf("database not found: %s", req.Database), Rejected: true}
 	}
 
 	txnMgr := replicatedDB.GetTransactionManager()
@@ -334,7 +346,7 @@ func (re *ReplicationEngine) createDDLIntent(txnMgr *TransactionManager, txn *Tr
 
 	log.Debug().
 		Str("table", stmt.TableName).
-		Str("ddl_intent_key", string(ddlIntentKey)).
+		Str("ddl_intent_key", safeIntentKeyForLog(string(ddlIntentKey))).
 		Msg("Created write intent for DDL statement")
 
 	return nil
@@ -432,14 +444,23 @@ func (re *ReplicationEngine) Commit(ctx context.Context, req *CommitRequest) *Co
 							return &CommitResult{Success: false, Error: "database manager does not support database operations"}
 						}
 
+						// changed reports whether this node's own call actually created/dropped
+						// the database, versus finding it already in the target state and
+						// no-oping (IF NOT EXISTS / IF EXISTS idempotency). It gates the
+						// schema version bump below: a redundant concurrent CREATE DATABASE
+						// that lost the race to an already-completed one must not bump the
+						// version again, or replicas that only saw the first bump can
+						// transiently miss quorum on a subsequent DDL statement while they
+						// catch up to a version number that reflects no real second change.
 						var dbOpErr error
+						var changed bool
 						switch dbOp {
 						case DatabaseOpCreate:
 							log.Info().Str("database", dbName).Uint64("node_id", re.nodeID).Msg("Executing CREATE DATABASE in commit phase")
-							dbOpErr = dbMgr.CreateDatabase(dbName)
+							changed, dbOpErr = dbMgr.createDatabase(dbName)
 						case DatabaseOpDrop:
 							log.Info().Str("database", dbName).Uint64("node_id", re.nodeID).Msg("Executing DROP DATABASE in commit phase")
-							dbOpErr = dbMgr.DropDatabase(dbName)
+							changed, dbOpErr = dbMgr.dropDatabase(dbName)
 						default:
 							log.Error().Str("operation", dbOp.String()).Uint64("txn_id", req.TxnID).Msg("Unknown database operation")
 							continue
@@ -464,15 +485,33 @@ func (re *ReplicationEngine) Commit(ctx context.Context, req *CommitRequest) *Co
 							Uint64("node_id", re.nodeID).
 							Msg("Database operation committed successfully")
 
-						// Return DDLSQL so replication handler can increment schema version
+						// Return DDLSQL so replication handler can increment schema version -
+						// but only when this commit actually changed something (changed==true).
+						// An idempotent no-op leaves DDLSQL empty, which
+						// grpc/replication_handler.go's remote bump gate already treats as
+						// "nothing to bump". IdempotentNoOp carries the same fact explicitly to
+						// CommitResult.ToCoordinatorResponse, for the LOCAL coordinator's own
+						// bump gate - kept as its own field rather than reusing DDLSQL's
+						// emptiness, so the two concerns (what SQL to replay vs. whether to bump
+						// locally) can't drift apart, and so a caller with no opinion on either
+						// (any test double predating this field) gets the safe "assume changed"
+						// default rather than silently inheriting an empty-string coincidence.
 						var ddlSQL string
-						switch dbOp {
-						case DatabaseOpCreate:
-							ddlSQL = fmt.Sprintf("CREATE DATABASE IF NOT EXISTS %s", dbName)
-						case DatabaseOpDrop:
-							ddlSQL = fmt.Sprintf("DROP DATABASE IF EXISTS %s", dbName)
+						if changed {
+							switch dbOp {
+							case DatabaseOpCreate:
+								ddlSQL = fmt.Sprintf("CREATE DATABASE IF NOT EXISTS %s", dbName)
+							case DatabaseOpDrop:
+								ddlSQL = fmt.Sprintf("DROP DATABASE IF EXISTS %s", dbName)
+							}
+						} else {
+							log.Debug().
+								Str("database", dbName).
+								Str("operation", dbOp.String()).
+								Uint64("node_id", re.nodeID).
+								Msg("Database operation was an idempotent no-op - skipping schema version bump")
 						}
-						return &CommitResult{Success: true, DDLSQL: ddlSQL}
+						return &CommitResult{Success: true, DDLSQL: ddlSQL, IdempotentNoOp: !changed}
 					}
 				}
 			}
@@ -574,6 +613,11 @@ func (cr *CommitResult) ToCoordinatorResponse() *coordinator.ReplicationResponse
 	return &coordinator.ReplicationResponse{
 		Success: cr.Success,
 		Error:   cr.Error,
+		// Direct passthrough, not derived from DDLSQL: only the DatabaseOp commit
+		// branch above ever sets this true, on positive knowledge of a no-op. The
+		// regular-DDL branch (and every other return in Commit) leaves it at its
+		// safe zero value, so a normal DDL commit always reports "changed" here.
+		IdempotentNoOp: cr.IdempotentNoOp,
 	}
 }
 

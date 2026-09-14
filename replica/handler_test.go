@@ -1,6 +1,7 @@
 package replica
 
 import (
+	"errors"
 	"os"
 	"testing"
 
@@ -384,6 +385,72 @@ func TestHandler_UseDatabase_NonExistent(t *testing.T) {
 	_, err := handler.HandleQuery(session, "USE nonexistent", nil)
 	if err == nil {
 		t.Fatal("Expected error for USE with non-existent database, got nil")
+	}
+
+	var mysqlErr *protocol.MySQLError
+	if !errors.As(err, &mysqlErr) {
+		t.Fatalf("Expected *protocol.MySQLError, got %T: %v", err, err)
+	}
+	if mysqlErr.Code != protocol.ErrCodeBadDB {
+		t.Fatalf("Expected error code %d (ErrCodeBadDB), got %d", protocol.ErrCodeBadDB, mysqlErr.Code)
+	}
+}
+
+// TestReadOnlyHandler_EnsureDatabase_ReservedName verifies that EnsureDatabase accepts reserved
+// system schemas (case-insensitively) without creating anything, matching the coordinator's
+// polarity for these virtual pseudo-databases.
+func TestReadOnlyHandler_EnsureDatabase_ReservedName(t *testing.T) {
+	handler, _, cleanup := testHandler(t)
+	defer cleanup()
+
+	session := &protocol.ConnectionSession{ConnID: 1}
+
+	for _, name := range []string{"information_schema", "Information_Schema"} {
+		if err := handler.EnsureDatabase(session, name); err != nil {
+			t.Fatalf("EnsureDatabase(%q): expected nil error, got %v", name, err)
+		}
+		if handler.dbManager.DatabaseExists(name) {
+			t.Fatalf("EnsureDatabase(%q): must never create a database, but DatabaseExists is now true", name)
+		}
+	}
+}
+
+// TestReadOnlyHandler_EnsureDatabase_Exists verifies that EnsureDatabase returns nil for a
+// database that already exists on the replica.
+func TestReadOnlyHandler_EnsureDatabase_Exists(t *testing.T) {
+	handler, _, cleanup := testHandler(t)
+	defer cleanup()
+
+	session := &protocol.ConnectionSession{ConnID: 1}
+
+	if err := handler.EnsureDatabase(session, "testdb"); err != nil {
+		t.Fatalf("EnsureDatabase(%q): expected nil error for existing database, got %v", "testdb", err)
+	}
+}
+
+// TestReadOnlyHandler_EnsureDatabase_Missing verifies that EnsureDatabase never creates a
+// database on a replica: a missing, non-reserved name must fail with a typed 1049 error, not be
+// silently created or silently accepted.
+func TestReadOnlyHandler_EnsureDatabase_Missing(t *testing.T) {
+	handler, _, cleanup := testHandler(t)
+	defer cleanup()
+
+	session := &protocol.ConnectionSession{ConnID: 1}
+
+	err := handler.EnsureDatabase(session, "nonexistent")
+	if err == nil {
+		t.Fatal("Expected error for missing, non-reserved database, got nil")
+	}
+
+	var mysqlErr *protocol.MySQLError
+	if !errors.As(err, &mysqlErr) {
+		t.Fatalf("Expected *protocol.MySQLError, got %T: %v", err, err)
+	}
+	if mysqlErr.Code != protocol.ErrCodeBadDB {
+		t.Fatalf("Expected error code %d (ErrCodeBadDB), got %d", protocol.ErrCodeBadDB, mysqlErr.Code)
+	}
+	if handler.dbManager.DatabaseExists("nonexistent") {
+		t.Fatal("EnsureDatabase must never create a database on a replica")
 	}
 }
 

@@ -65,6 +65,7 @@ bind_address = "0.0.0.0"
 port = 9191
 max_connections = 100
 auto_id_mode = "compact"
+auto_create_database = true  # Auto-create unknown database named by client
 
 [metastore]
 cache_size_mb = 64

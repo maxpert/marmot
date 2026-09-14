@@ -36,7 +36,7 @@ func Test_10_6_SingleNode(t *testing.T) {
 		Build()
 
 	ctx := context.Background()
-	err := coordinator.WriteTransaction(ctx, txn)
+	_, err := coordinator.WriteTransaction(ctx, txn)
 
 	AssertNoError(t, err)
 
@@ -71,7 +71,7 @@ func Test_10_7_TwoNode(t *testing.T) {
 		Build()
 
 	ctx := context.Background()
-	err := coordinator.WriteTransaction(ctx, txn)
+	_, err := coordinator.WriteTransaction(ctx, txn)
 
 	AssertNoError(t, err)
 
@@ -110,7 +110,7 @@ func Test_10_7_TwoNode_OneNodeFails(t *testing.T) {
 		Build()
 
 	ctx := context.Background()
-	err := coordinator.WriteTransaction(ctx, txn)
+	_, err := coordinator.WriteTransaction(ctx, txn)
 
 	// Should fail: only 1 node (coordinator), need 2 for quorum
 	if err == nil {
@@ -150,7 +150,7 @@ func Test_11_1_PartitionDuringPrepare(t *testing.T) {
 		Build()
 
 	ctx := context.Background()
-	err := coordinator.WriteTransaction(ctx, txn)
+	_, err := coordinator.WriteTransaction(ctx, txn)
 
 	// Should fail: coordinator + node 2 = 2 nodes, need 3 for quorum
 	if err == nil {
@@ -190,7 +190,7 @@ func Test_11_2_PartitionDuringCommit(t *testing.T) {
 		Build()
 
 	ctx := context.Background()
-	err := coordinator.WriteTransaction(ctx, txn)
+	_, err := coordinator.WriteTransaction(ctx, txn)
 
 	// Should fail: need 2 remote commits, only get 1 (node 2)
 	// remoteQuorumNeeded = quorum(3) - 1 = 2
@@ -239,7 +239,7 @@ func Test_11_3_CoordinatorPartitioned(t *testing.T) {
 		Build()
 
 	ctx := context.Background()
-	err := coordinator.WriteTransaction(ctx, txn)
+	_, err := coordinator.WriteTransaction(ctx, txn)
 
 	// Should fail: only coordinator (1 node), need 3 for quorum
 	if err == nil {
@@ -275,7 +275,7 @@ func Test_11_4_SplitBrain_3x3(t *testing.T) {
 		Build()
 
 	ctx := context.Background()
-	err := coordinator.WriteTransaction(ctx, txn)
+	_, err := coordinator.WriteTransaction(ctx, txn)
 
 	// Should fail: quorum requires 4 (majority of 6), but only 3 nodes reachable
 	if err == nil {
@@ -313,7 +313,7 @@ func Test_11_5_SplitBrain_4x2(t *testing.T) {
 		Build()
 
 	ctx := context.Background()
-	err := coordinator.WriteTransaction(ctx, txn)
+	_, err := coordinator.WriteTransaction(ctx, txn)
 
 	// Should succeed: quorum requires 4 (majority of 6), and 4 nodes are reachable
 	AssertNoError(t, err)
@@ -347,7 +347,7 @@ func Test_11_6_FlappingNode(t *testing.T) {
 		Build()
 
 	ctx := context.Background()
-	err := coordinator.WriteTransaction(ctx, txn)
+	_, err := coordinator.WriteTransaction(ctx, txn)
 
 	// Should succeed: coordinator + nodes 2,3,4 = 4 nodes (quorum = 3)
 	// remoteQuorumNeeded = 2, and we get 3 remote acks during prepare
@@ -385,7 +385,7 @@ func Test_11_7_SlowNetwork(t *testing.T) {
 
 	ctx := context.Background()
 	start := time.Now()
-	err := coordinator.WriteTransaction(ctx, txn)
+	_, err := coordinator.WriteTransaction(ctx, txn)
 
 	AssertNoError(t, err)
 
@@ -424,7 +424,7 @@ func Test_11_7_SlowNetwork_Timeout(t *testing.T) {
 		Build()
 
 	ctx := context.Background()
-	err := coordinator.WriteTransaction(ctx, txn)
+	_, err := coordinator.WriteTransaction(ctx, txn)
 
 	// Should fail due to timeout
 	if err == nil {
@@ -462,7 +462,7 @@ func Test_11_8_NetworkAsymmetry(t *testing.T) {
 		Build()
 
 	ctx := context.Background()
-	err := coordinator.WriteTransaction(ctx, txn)
+	_, err := coordinator.WriteTransaction(ctx, txn)
 
 	// Should succeed: quorum achieved before slow node responds
 	// coordinator + nodes 2,3,4 = 4 nodes (quorum = 3)
@@ -501,7 +501,7 @@ func Test_12_3_ConcurrentMapAccess(t *testing.T) {
 				Build()
 
 			ctx := context.Background()
-			err := coordinator.WriteTransaction(ctx, txn)
+			_, err := coordinator.WriteTransaction(ctx, txn)
 			if err != nil {
 				t.Logf("Transaction %d failed: %v", txnID, err)
 			}
@@ -548,7 +548,7 @@ func Test_12_4_ConcurrentTelemetry(t *testing.T) {
 				Build()
 
 			ctx := context.Background()
-			err := coordinator.WriteTransaction(ctx, txn)
+			_, err := coordinator.WriteTransaction(ctx, txn)
 			if err != nil {
 				failureCount.Add(1)
 			} else {
@@ -602,7 +602,7 @@ func Test_12_5_GoroutineLeaks(t *testing.T) {
 				Build()
 
 			ctx := context.Background()
-			_ = coordinator.WriteTransaction(ctx, txn) // Error intentionally ignored - testing goroutine leaks
+			_, _ = coordinator.WriteTransaction(ctx, txn) // Error intentionally ignored - testing goroutine leaks
 		}(uint64(i))
 	}
 
@@ -646,7 +646,7 @@ func Test_12_1_ConcurrentWrites_DifferentRows(t *testing.T) {
 				Build()
 
 			ctx := context.Background()
-			err := coordinator.WriteTransaction(ctx, txn)
+			_, err := coordinator.WriteTransaction(ctx, txn)
 			if err == nil {
 				successCount.Add(1)
 			}
@@ -702,7 +702,7 @@ func Test_12_2_ConcurrentWrites_SameRow(t *testing.T) {
 				Build()
 
 			ctx := context.Background()
-			err := coordinator.WriteTransaction(ctx, txn)
+			_, err := coordinator.WriteTransaction(ctx, txn)
 			if err == nil {
 				successCount.Add(1)
 			} else {
@@ -769,7 +769,7 @@ func Test_12_5_GoroutineLeaks_WithTimeouts(t *testing.T) {
 				Build()
 
 			ctx := context.Background()
-			_ = coordinator.WriteTransaction(ctx, txn) // Error intentionally ignored - testing goroutine leaks with timeouts
+			_, _ = coordinator.WriteTransaction(ctx, txn) // Error intentionally ignored - testing goroutine leaks with timeouts
 		}(uint64(i))
 	}
 
@@ -813,7 +813,7 @@ func Test_12_3_ConcurrentMapAccess_WithConflicts(t *testing.T) {
 				Build()
 
 			ctx := context.Background()
-			_ = coordinator.WriteTransaction(ctx, txn) // Error intentionally ignored - testing race conditions
+			_, _ = coordinator.WriteTransaction(ctx, txn) // Error intentionally ignored - testing race conditions
 		}(uint64(i))
 	}
 
@@ -850,7 +850,7 @@ func Test_NetworkPartition_Recovery(t *testing.T) {
 		Build()
 
 	ctx := context.Background()
-	err := coordinator.WriteTransaction(ctx, txn1)
+	_, err := coordinator.WriteTransaction(ctx, txn1)
 
 	// Should fail
 	if err == nil {
@@ -871,7 +871,7 @@ func Test_NetworkPartition_Recovery(t *testing.T) {
 		WithCDCStatement("users", map[string][]byte{"id": {2}}, map[string][]byte{"id": {3}}).
 		Build()
 
-	err = coordinator.WriteTransaction(ctx, txn2)
+	_, err = coordinator.WriteTransaction(ctx, txn2)
 
 	// Should succeed
 	AssertNoError(t, err)

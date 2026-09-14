@@ -3,6 +3,7 @@ package coordinator
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"math"
 	"reflect"
@@ -22,6 +23,7 @@ import (
 	"github.com/maxpert/marmot/protocol/query/transform"
 	"github.com/maxpert/marmot/telemetry"
 	"github.com/rs/zerolog/log"
+	"vitess.io/vitess/go/vt/sqlparser"
 )
 
 // VectorIndexManagerProvider manages vector index lifecycle.
@@ -311,6 +313,115 @@ func (h *CoordinatorHandler) SetPublisherRegistry(registry PublisherRegistry) {
 	h.publisherRegistry = registry
 }
 
+// ensureDatabaseRetryBackoffStart/Cap bound the capped exponential backoff
+// EnsureDatabase uses between retry attempts on transient contention: it
+// starts short so the common case (no contention) pays almost nothing, and
+// caps low so a losing attempt keeps re-checking DatabaseExists frequently
+// rather than oversleeping past the winner's commit.
+const (
+	ensureDatabaseRetryBackoffStart = 20 * time.Millisecond
+	ensureDatabaseRetryBackoffCap   = 200 * time.Millisecond
+)
+
+// isRetryableEnsureDatabaseError classifies an error from EnsureDatabase's own
+// CREATE DATABASE IF NOT EXISTS attempt as transient contention worth
+// retrying, by TYPE never by message text. Exactly two shapes qualify:
+//   - a write-write conflict surfaced as *protocol.MySQLError with
+//     Code == protocol.ErrCodeDeadlock (1213), returned by
+//     runPreparePhase/protocol.ErrDeadlock() when a concurrent transaction's
+//     intent collided with this one's during 2PC PREPARE;
+//   - this node's own local DDL lock being held by a different in-flight
+//     transaction (ErrDDLLockHeld, wrapped by DDLLockManager.AcquireLock and
+//     again by handleMutation's "failed to acquire DDL lock: %w").
+//
+// Everything else - quorum not achieved, read-only, server draining,
+// context cancelled/deadline exceeded, a local DDL validation rejection, or
+// any other unclassified error - is NOT retryable: the caller must fail fast
+// and return it unchanged.
+func isRetryableEnsureDatabaseError(err error) bool {
+	var mysqlErr *protocol.MySQLError
+	if errors.As(err, &mysqlErr) && mysqlErr.Code == protocol.ErrCodeDeadlock {
+		return true
+	}
+	return errors.Is(err, ErrDDLLockHeld)
+}
+
+// EnsureDatabase resolves the database a client selects at handshake time or with COM_INIT_DB /
+// USE, implementing protocol.DatabaseEnsurer. If the database already exists this is a no-op.
+// Reserved MySQL system schema names (protocol.IsReservedSystemSchema: information_schema,
+// performance_schema, mysql, sys) are virtual - real MySQL servers always have them, and clients
+// and admin tools select or query them for catalogue information regardless of what real
+// databases exist - so they are always accepted here and never created, independent of the
+// auto_create_database setting. Otherwise, if cfg.Config.MySQL.AutoCreateDatabase is true, the
+// database is created through the normal replicated DDL path (parse -> idempotent rewrite -> DDL
+// lock -> 2PC -> replication) so it exists cluster-wide, not just on this node - the same path a
+// client's own CREATE DATABASE IF NOT EXISTS statement would take. If auto-create is off, or the
+// create somehow did not leave the database visible afterward, it returns
+// protocol.ErrUnknownDatabase(name).
+func (h *CoordinatorHandler) EnsureDatabase(session *protocol.ConnectionSession, name string) error {
+	if h.dbManager != nil && h.dbManager.DatabaseExists(name) {
+		return nil
+	}
+
+	if protocol.IsReservedSystemSchema(name) {
+		return nil
+	}
+
+	if !cfg.Config.MySQL.AutoCreateDatabase {
+		return protocol.ErrUnknownDatabase(name)
+	}
+
+	createStmt := &sqlparser.CreateDatabase{
+		DBName:      sqlparser.NewIdentifierCS(name),
+		IfNotExists: true,
+	}
+	createSQL := sqlparser.String(createStmt)
+
+	log.Info().Str("database", name).Uint64("conn_id", session.ConnID).Msg("Auto-creating database requested by client")
+
+	// CREATE DATABASE IF NOT EXISTS is idempotent (db.DatabaseManager.CreateDatabase
+	// returns success immediately if the database already exists). When two clients
+	// race to auto-create the same missing database, the losing side's own
+	// HandleQuery call can hit a real write-write conflict, or (on the same node)
+	// find the local DDL lock held by the winner's in-flight transaction, even
+	// though the database will exist within one commit round-trip of the winner.
+	// Retry is bounded by a deadline (not an attempt count) derived from the
+	// existing DDL validation timeout - PREPARE for this CREATE DATABASE runs
+	// under that same budget - and restricted to those two transient-contention
+	// shapes; anything else fails fast on the first attempt. DatabaseExists is
+	// the real success signal, re-checked before every attempt so a losing
+	// client never burns a round trip once the winner has already committed.
+	deadline := time.Now().Add(getDDLValidationTimeout())
+	backoff := ensureDatabaseRetryBackoffStart
+
+	for {
+		_, err := h.HandleQuery(session, createSQL, nil)
+		if err == nil {
+			if h.dbManager == nil || h.dbManager.DatabaseExists(name) {
+				return nil
+			}
+			err = fmt.Errorf("database %q was not created", name)
+		}
+
+		if !isRetryableEnsureDatabaseError(err) {
+			return err
+		}
+
+		if h.dbManager != nil && h.dbManager.DatabaseExists(name) {
+			return nil
+		}
+		if !time.Now().Before(deadline) {
+			return err
+		}
+
+		time.Sleep(backoff)
+		backoff *= 2
+		if backoff > ensureDatabaseRetryBackoffCap {
+			backoff = ensureDatabaseRetryBackoffCap
+		}
+	}
+}
+
 // HandleQuery processes a SQL query
 func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, sql string, params []interface{}) (*protocol.ResultSet, error) {
 	log.Debug().
@@ -452,6 +563,26 @@ func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, sq
 	// Set database context from session if not specified in statement
 	if stmt.Database == "" {
 		stmt.Database = session.CurrentDatabase
+	}
+
+	// A statement naming a database via an explicit qualifier (e.g. `CREATE TABLE otherdb.t(...)`
+	// or `INSERT INTO otherdb.t ...`) never goes through session.CurrentDatabase / EnsureDatabase,
+	// so a nonexistent qualified database was never checked before reaching 2PC, where it produced
+	// a confusing quorum error instead of a clean rejection. CREATE/DROP DATABASE are exempt: they
+	// are the statements that legitimately target a database that may not exist yet.
+	// Reserved system schemas (information_schema, mysql, ...) are exempt too: EnsureDatabase
+	// never creates them (they are virtual - see its doc comment), so DatabaseExists is always
+	// false for them, and without this exemption every query against one - a JOIN across two
+	// information_schema tables, a mysql.* probe - would 1049 permanently. Exempting them here
+	// lets those statements fall through to the same code path they reached before this
+	// database-existence check existed.
+	if h.dbManager != nil && stmt.Database != "" &&
+		stmt.Type != protocol.StatementCreateDatabase &&
+		stmt.Type != protocol.StatementDropDatabase &&
+		!protocol.IsReservedSystemSchema(stmt.Database) {
+		if !h.dbManager.DatabaseExists(stmt.Database) {
+			return nil, protocol.ErrUnknownDatabase(stmt.Database)
+		}
 	}
 
 	isMutation := protocol.IsMutation(stmt)
@@ -604,7 +735,10 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, params []in
 	}
 
 	if isDDL && h.ddlLockMgr != nil {
-		// Acquire cluster-wide DDL lock for this database
+		// Acquire this node's local DDL lock for this database (see
+		// DDLLockManager's doc comment - it does not coordinate across nodes;
+		// cross-node exclusion comes from the Pebble DB-op intent-key conflict
+		// detected during 2PC PREPARE).
 		lockStart := time.Now()
 		_, err := h.ddlLockMgr.AcquireLock(stmt.Database, h.nodeID, uint64(txnID), startTS)
 		telemetry.DDLLockWaitSeconds.Observe(time.Since(lockStart).Seconds())
@@ -719,9 +853,15 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, params []in
 	}()
 
 	// A DML that matched no rows leaves no statements to replicate. Running 2PC
-	// for it would burn a cluster round trip to commit nothing.
+	// for it would burn a cluster round trip to commit nothing. schemaChanged
+	// defaults to true (the historical always-bump behavior for regular DDL);
+	// WriteTransaction only reports it false for a DDL transaction whose commit
+	// was an idempotent no-op, such as a CREATE DATABASE IF NOT EXISTS that lost
+	// a race to a concurrent request which had already created the database.
+	schemaChanged := true
 	if len(txn.Statements) > 0 {
-		if err := h.writeCoord.WriteTransaction(ctx, txn); err != nil {
+		changed, err := h.writeCoord.WriteTransaction(ctx, txn)
+		if err != nil {
 			queryType := "dml"
 			if isDDL {
 				queryType = "ddl"
@@ -730,6 +870,7 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, params []in
 			telemetry.QueryDurationSeconds.With(queryType).Observe(time.Since(queryStart).Seconds())
 			return nil, err
 		}
+		schemaChanged = changed
 	}
 	// Success - coordinator committed via CDC replay in WriteTransaction.
 	// Vector CDC is applied by the transaction commit pipeline on every node.
@@ -745,8 +886,11 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, params []in
 		}
 	}
 
-	// If DDL succeeded, increment schema version
-	if isDDL && h.schemaVersionMgr != nil {
+	// If DDL succeeded and actually changed schema state, increment schema
+	// version. schemaChanged is false only for an idempotent DDL no-op (see
+	// above), so this must never bump the version for a redundant concurrent
+	// CREATE/DROP DATABASE that changed nothing.
+	if isDDL && schemaChanged && h.schemaVersionMgr != nil {
 		newVersion, err := h.schemaVersionMgr.IncrementSchemaVersion(stmt.Database, stmt.SQL, uint64(txnID))
 		if err != nil {
 			log.Error().Err(err).Str("database", stmt.Database).Msg("Failed to increment schema version")
@@ -990,7 +1134,7 @@ func (h *CoordinatorHandler) handleVectorControlMutation(
 	}
 	writeCtx, cancel := context.WithTimeout(context.Background(), writeTimeoutForStatements(txn.Statements))
 	defer cancel()
-	if err := h.writeCoord.WriteTransaction(writeCtx, txn); err != nil {
+	if _, err := h.writeCoord.WriteTransaction(writeCtx, txn); err != nil {
 		return nil, err
 	}
 	return &protocol.ResultSet{RowsAffected: 0, CommittedTxnId: txnID}, nil
@@ -1425,7 +1569,7 @@ func (h *CoordinatorHandler) handleCommit(session *protocol.ConnectionSession) (
 	// statements all collapsed that way is a no-op and skips 2PC.
 	var err error
 	if len(txn.Statements) > 0 {
-		err = h.writeCoord.WriteTransaction(ctx, txn)
+		_, err = h.writeCoord.WriteTransaction(ctx, txn)
 	}
 
 	// Clear transaction state regardless of outcome

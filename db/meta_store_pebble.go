@@ -1106,7 +1106,7 @@ func (s *PebbleMetaStore) WriteIntent(txnID uint64, intentType IntentType, table
 			if !acquired {
 				// Race condition - another transaction acquired the lock
 				telemetry.WriteConflictsTotal.With("intent", "gc_race").Inc()
-				return fmt.Errorf("write-write conflict: row %s:%s locked by transaction %d (current txn: %d)",
+				return fmt.Errorf("write-write conflict: row %s:%q locked by transaction %d (current txn: %d)",
 					tableName, intentKey, existingTxnID, txnID)
 			}
 		} else {
@@ -1121,7 +1121,7 @@ func (s *PebbleMetaStore) WriteIntent(txnID uint64, intentType IntentType, table
 			if !acquired {
 				// Race condition
 				telemetry.WriteConflictsTotal.With("intent", "resolve_race").Inc()
-				return fmt.Errorf("write-write conflict: row %s:%s locked by transaction %d (current txn: %d)",
+				return fmt.Errorf("write-write conflict: row %s:%q locked by transaction %d (current txn: %d)",
 					tableName, intentKey, existingTxnID, txnID)
 			}
 		}
@@ -1175,6 +1175,17 @@ func (s *PebbleMetaStore) WriteIntent(txnID uint64, intentType IntentType, table
 	return nil
 }
 
+// safeIntentKeyForLog renders intentKey for zerolog's Str field. intentKey is
+// not text: DB-op intents are prefixed with IntentKeyMarkerDBOp (0xFF), which
+// is never a valid UTF-8 lead byte, so logging it via Str(...) as-is emits
+// invalid UTF-8 into structured log output. %q Go-quotes the string, escaping
+// any non-printable or invalid-UTF-8 bytes, matching the rendering already
+// used for this same raw value in the write-write conflict error messages
+// above.
+func safeIntentKeyForLog(intentKey string) string {
+	return fmt.Sprintf("%q", intentKey)
+}
+
 // resolveIntentConflictPebble handles conflict with existing intent from different transaction.
 // Called after GC marker check - if GC marker exists, caller handles overwrite directly.
 func (s *PebbleMetaStore) resolveIntentConflictPebble(batch *pebble.Batch, existingTxnID, txnID uint64, tableName, intentKey string) error {
@@ -1192,7 +1203,7 @@ func (s *PebbleMetaStore) resolveIntentConflictPebble(batch *pebble.Batch, exist
 		log.Debug().
 			Uint64("orphan_txn_id", existingTxnID).
 			Str("table", tableName).
-			Str("intent_key", intentKey).
+			Str("intent_key", safeIntentKeyForLog(intentKey)).
 			Msg("Cleaning up orphaned intent (no transaction record)")
 		canOverwrite = true
 
@@ -1203,7 +1214,7 @@ func (s *PebbleMetaStore) resolveIntentConflictPebble(batch *pebble.Batch, exist
 		log.Debug().
 			Uint64("aborted_txn_id", existingTxnID).
 			Str("table", tableName).
-			Str("intent_key", intentKey).
+			Str("intent_key", safeIntentKeyForLog(intentKey)).
 			Msg("Cleaning up intent from aborted transaction")
 		canOverwrite = true
 
@@ -1220,7 +1231,7 @@ func (s *PebbleMetaStore) resolveIntentConflictPebble(batch *pebble.Batch, exist
 			log.Debug().
 				Uint64("stale_txn_id", existingTxnID).
 				Str("table", tableName).
-				Str("intent_key", intentKey).
+				Str("intent_key", safeIntentKeyForLog(intentKey)).
 				Int64("heartbeat_age_ms", timeSinceHeartbeat/1e6).
 				Msg("Cleaning up stale intent (heartbeat timeout)")
 			canOverwrite = true
@@ -1228,7 +1239,7 @@ func (s *PebbleMetaStore) resolveIntentConflictPebble(batch *pebble.Batch, exist
 	}
 
 	if !canOverwrite {
-		return fmt.Errorf("write-write conflict: row %s:%s locked by transaction %d (current txn: %d)",
+		return fmt.Errorf("write-write conflict: row %s:%q locked by transaction %d (current txn: %d)",
 			tableName, intentKey, existingTxnID, txnID)
 	}
 

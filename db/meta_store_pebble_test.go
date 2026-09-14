@@ -6,13 +6,16 @@ package db
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/cockroachdb/pebble"
 	"github.com/maxpert/marmot/hlc"
+	"github.com/maxpert/marmot/protocol/filter"
 )
 
 func createTestPebbleMetaStore(t *testing.T) (*PebbleMetaStore, func()) {
@@ -201,6 +204,85 @@ func TestPebbleMetaStoreWriteIntentConflict(t *testing.T) {
 	}
 	if !isWriteWriteConflict(err) {
 		t.Errorf("Expected write-write conflict, got: %v", err)
+	}
+}
+
+// TestPebbleMetaStoreWriteIntentConflictDBOpIsValidUTF8 is a regression test for
+// a defect where two nodes concurrently PREPARE-ing the same
+// "CREATE DATABASE IF NOT EXISTS <name>" produced a write-write-conflict error
+// whose message embedded the raw binary DB-op intent key (which always starts
+// with filter.IntentKeyMarkerDBOp = 0xFF, never a valid UTF-8 lead byte). That
+// invalid-UTF-8 error string, once it reached a proto3 string field
+// (TransactionResponse.ErrorMessage), made grpc-go's marshaler reject the
+// entire RPC response instead of returning a well-formed conflict, turning a
+// legitimate transient conflict into an opaque quorum failure.
+//
+// This asserts the conflict message produced by PebbleMetaStore.WriteIntent for
+// a colliding IntentTypeDatabaseOp key is valid UTF-8 end to end, including
+// after being round-tripped through errors.New(err.Error()) the way it is
+// carried into PrepareResult.Error/ConflictDetails and ultimately the proto
+// string field.
+func TestPebbleMetaStoreWriteIntentConflictDBOpIsValidUTF8(t *testing.T) {
+	store, cleanup := createTestPebbleMetaStore(t)
+	defer cleanup()
+
+	clock := hlc.NewClock(1)
+	startTS1 := clock.Now()
+	txnID1 := startTS1.ToTxnID()
+	startTS2 := clock.Now()
+	txnID2 := startTS2.ToTxnID()
+
+	store.BeginTransaction(txnID1, 1, startTS1)
+	store.BeginTransaction(txnID2, 1, startTS2)
+
+	dbIntentKey := string(filter.EncodeDBOpIntentKey("racing_autocreate_db"))
+
+	err := store.WriteIntent(txnID1, IntentTypeDatabaseOp, "", dbIntentKey, OpTypeDDL,
+		"CREATE DATABASE IF NOT EXISTS racing_autocreate_db", nil, startTS1, 1)
+	if err != nil {
+		t.Fatalf("first WriteIntent should succeed, got: %v", err)
+	}
+
+	err = store.WriteIntent(txnID2, IntentTypeDatabaseOp, "", dbIntentKey, OpTypeDDL,
+		"CREATE DATABASE IF NOT EXISTS racing_autocreate_db", nil, startTS2, 1)
+	if err == nil {
+		t.Fatal("expected write-write conflict on second concurrent WriteIntent for the same DB-op intent key")
+	}
+	if !isWriteWriteConflict(err) {
+		t.Fatalf("expected write-write conflict, got: %v", err)
+	}
+
+	// Simulate the wire path: PrepareResult.Error/ConflictDetails carries
+	// err.Error() into what eventually becomes a proto3 string field.
+	wireErr := errors.New(err.Error())
+	if !utf8.ValidString(wireErr.Error()) {
+		t.Fatalf("conflict message is not valid UTF-8, would be rejected by grpc-go's proto marshaler: %q", wireErr.Error())
+	}
+}
+
+// TestSafeIntentKeyForLog verifies the zerolog rendering helper for
+// resolveIntentConflictPebble's Debug logs. intentKey is a raw binary key
+// (DB-op intents are prefixed with filter.IntentKeyMarkerDBOp = 0xFF, never a
+// valid UTF-8 lead byte), so the helper must never hand zerolog's Str(...) an
+// invalid-UTF-8 string, and it must not collide two distinct binary keys onto
+// the same rendered output.
+func TestSafeIntentKeyForLog(t *testing.T) {
+	dbOpKey := string(filter.EncodeDBOpIntentKey("racing_autocreate_db"))
+	otherDBOpKey := string(filter.EncodeDBOpIntentKey("other_db"))
+	rawBinary := string([]byte{filter.IntentKeyMarkerDBOp, 0x00, 0x80, 0xFE, 'a', 'b'})
+
+	for _, key := range []string{dbOpKey, otherDBOpKey, rawBinary} {
+		rendered := safeIntentKeyForLog(key)
+		if !utf8.ValidString(rendered) {
+			t.Fatalf("safeIntentKeyForLog(%v) produced invalid UTF-8: %q", []byte(key), rendered)
+		}
+	}
+
+	// Distinct binary inputs must not collapse onto the same rendering.
+	renderedA := safeIntentKeyForLog(dbOpKey)
+	renderedB := safeIntentKeyForLog(otherDBOpKey)
+	if renderedA == renderedB {
+		t.Fatalf("safeIntentKeyForLog collided distinct keys %q and %q both onto %q", dbOpKey, otherDBOpKey, renderedA)
 	}
 }
 

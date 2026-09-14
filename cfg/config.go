@@ -71,6 +71,9 @@ type MySQLConfiguration struct {
 	AutoIDMode     string `toml:"auto_id_mode"`         // "compact" (default, 53-bit) or "extended" (64-bit)
 	UnixSocket     string `toml:"unix_socket"`          // Path to Unix socket (empty = disabled)
 	UnixSocketPerm int    `toml:"unix_socket_perm"`     // Permissions, default 0660
+	// AutoCreateDatabase creates the database named in a client's handshake or COM_INIT_DB/USE
+	// when it does not exist yet, instead of accepting the connection with a phantom database.
+	AutoCreateDatabase bool `toml:"auto_create_database"`
 }
 
 // LoggingConfiguration controls logging behavior
@@ -345,13 +348,14 @@ var Config = &Configuration{
 	},
 
 	MySQL: MySQLConfiguration{
-		Enabled:        true,
-		BindAddress:    "0.0.0.0",
-		Port:           3306,
-		MaxConnections: 1000,
-		LocalInfile:    true,
-		AutoIDMode:     "compact", // Default to compact 53-bit IDs
-		UnixSocketPerm: 0660,
+		Enabled:            true,
+		BindAddress:        "0.0.0.0",
+		Port:               3306,
+		MaxConnections:     1000,
+		LocalInfile:        true,
+		AutoIDMode:         "compact", // Default to compact 53-bit IDs
+		UnixSocketPerm:     0660,
+		AutoCreateDatabase: true,
 	},
 
 	Logging: LoggingConfiguration{

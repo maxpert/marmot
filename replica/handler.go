@@ -46,6 +46,25 @@ func NewReadOnlyHandler(dbManager *db.DatabaseManager, clock *hlc.Clock, replica
 	}
 }
 
+// EnsureDatabase implements protocol.DatabaseEnsurer for a read-only replica. Unlike the
+// coordinator, a replica never creates databases: auto-create is exclusively a coordinator/leader
+// responsibility that runs through 2PC, and a replica has no way to originate a replicated DDL
+// statement of its own. Reserved system schemas (information_schema, performance_schema, mysql,
+// sys) are virtual and always accepted without a create, matching the coordinator's polarity. This
+// restores symmetry with HandleUseDatabase: a replica's handshake / COM_INIT_DB now agrees with
+// what USE <name> already does on the very same node for the very same database name.
+func (h *ReadOnlyHandler) EnsureDatabase(session *protocol.ConnectionSession, name string) error {
+	if protocol.IsReservedSystemSchema(name) {
+		return nil
+	}
+
+	if h.dbManager != nil && h.dbManager.DatabaseExists(name) {
+		return nil
+	}
+
+	return protocol.ErrUnknownDatabase(name)
+}
+
 // HandleQuery processes a SQL query (read-only)
 func (h *ReadOnlyHandler) HandleQuery(session *protocol.ConnectionSession, sql string, params []interface{}) (*protocol.ResultSet, error) {
 	log.Debug().

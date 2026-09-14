@@ -126,4 +126,4 @@ Configure via `[mysql].auto_id_mode` in config. The compact mode uses: 41 bits t
 - **Selective Table Watching**: All tables in a database are replicated. Selective table replication is not supported.
 - **WAL Mode Required**: SQLite must use WAL mode for reliable multi-process changes.
 - **Eventually Consistent**: Rows may sync out of order. `SERIALIZABLE` transaction assumptions may not hold across nodes.
-- **Concurrent DDL**: Avoid running concurrent DDL operations on the same database from multiple nodes (protected by cluster-wide lock with 30s lease).
+- **Concurrent DDL**: Avoid running concurrent DDL operations on the same database from multiple nodes (the coordinating node holds a node-local lock with a 30s lease; cross-node exclusion comes from the Pebble write-intent conflict in PREPARE).

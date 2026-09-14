@@ -107,6 +107,23 @@ type ReplicationResponse struct {
 	// DDL SQLite cannot apply). Timeouts and storage failures leave it false so they
 	// stay retryable missing ACKs rather than a final verdict.
 	Rejected bool
+	// IdempotentNoOp is meaningful only on a successful COMMIT response to a DDL
+	// transaction: it is true only when the participant has POSITIVE knowledge
+	// that its commit changed nothing (for example CREATE DATABASE IF NOT EXISTS
+	// racing a concurrent request that already created the database). The zero
+	// value (false) - "assume it changed" - is the safe default and is what any
+	// caller or test double that predates this field, or simply has no opinion,
+	// gets for free; only the one code path with positive knowledge of a no-op
+	// (db/replication_engine.go's database-op commit branch) sets it true. This
+	// is deliberate: the coordinator uses its own local commit's value to skip
+	// bumping the replicated schema version for a redundant no-op, but bumping
+	// it anyway on anything we are merely unsure about is far safer than
+	// skipping a bump that should have happened - a skipped bump is silent
+	// replication divergence, while a redundant bump is just a wasted version
+	// number. See closing.md's "suppress on positive knowledge, never admit on
+	// positive knowledge": this field is a suppression flag, not an admission
+	// flag, precisely so an unaware caller can never accidentally lose a bump.
+	IdempotentNoOp bool
 }
 
 // NewWriteCoordinator creates a new write coordinator for full database replication
@@ -132,7 +149,12 @@ func NewWriteCoordinator(nodeID uint64, nodeProvider NodeProvider, replicator Re
 // - Commits locally + returns success after quorum
 // - Background replication continues to stragglers
 // - Dead nodes catch up via snapshot + delta logs when they rejoin
-func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transaction) error {
+// WriteTransaction replicates and commits txn through 2PC. The returned bool
+// is meaningful only for a DDL transaction: it reports whether this node's
+// own commit actually changed schema state (false for an idempotent no-op,
+// such as a CREATE DATABASE IF NOT EXISTS that lost a race to a concurrent
+// request which already created the database) - see ReplicationResponse.IdempotentNoOp.
+func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transaction) (bool, error) {
 	metrics := NewTxnMetrics("write")
 	telemetry.ActiveTransactions.Inc()
 	defer telemetry.ActiveTransactions.Dec()
@@ -145,13 +167,13 @@ func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transacti
 
 	// 1. Validate statements
 	if err := wc.validateStatements(txn); err != nil {
-		return metrics.RecordFailure("failed", err)
+		return false, metrics.RecordFailure("failed", err)
 	}
 
 	// 2. Get cluster state
 	cluster, err := GetClusterState(wc.nodeProvider, txn.WriteConsistency)
 	if err != nil {
-		return metrics.RecordFailure("failed", err)
+		return false, metrics.RecordFailure("failed", err)
 	}
 
 	log.Trace().
@@ -173,15 +195,16 @@ func (wc *WriteCoordinator) WriteTransaction(ctx context.Context, txn *Transacti
 	prepResponses, err := wc.runPreparePhase(ctx, txn, cluster, otherNodes)
 	if err != nil {
 		wc.abortTransaction(ctx, cluster.AliveNodes, txn.ID, txn.Database)
-		return metrics.RecordFailure(wc.classifyPrepareError(err), err)
+		return false, metrics.RecordFailure(wc.classifyPrepareError(err), err)
 	}
 
 	// 4. Commit phase - remote-first commit to prevent coordinator-only commits
-	if err := wc.runCommitPhase(ctx, txn, cluster, prepResponses); err != nil {
-		return metrics.RecordFailure("failed", err)
+	schemaChanged, err := wc.runCommitPhase(ctx, txn, cluster, prepResponses)
+	if err != nil {
+		return false, metrics.RecordFailure("failed", err)
 	}
 
-	return metrics.RecordSuccess()
+	return schemaChanged, metrics.RecordSuccess()
 }
 
 func (wc *WriteCoordinator) cleanupStagedPayloads(txnID uint64) {
@@ -577,7 +600,7 @@ func (wc *WriteCoordinator) commitLocalAfterRemoteQuorum(ctx context.Context, re
 // CRITICAL: Commit to REMOTE nodes first, wait for quorum-1 ACKs, then commit locally.
 // This ensures if remote quorum fails, coordinator hasn't committed yet (clean abort).
 // After PREPARE ACK, commit MUST succeed (nodes promised they can commit).
-func (wc *WriteCoordinator) runCommitPhase(ctx context.Context, txn *Transaction, cluster *ClusterState, prepResponses map[uint64]*ReplicationResponse) error {
+func (wc *WriteCoordinator) runCommitPhase(ctx context.Context, txn *Transaction, cluster *ClusterState, prepResponses map[uint64]*ReplicationResponse) (bool, error) {
 	log.Debug().
 		Uint64("txn_id", txn.ID).
 		Int("prepared_nodes", len(prepResponses)).
@@ -629,7 +652,7 @@ func (wc *WriteCoordinator) runCommitPhase(ctx context.Context, txn *Transaction
 			Int("remote_commits", len(commitResponses)).
 			Msg("CRITICAL: Remote commit quorum not achieved - partial commit occurred")
 
-		return &PartialCommitError{
+		return false, &PartialCommitError{
 			IsLocal:            false,
 			RemoteAcks:         remoteAcks,
 			RemoteQuorumNeeded: remoteQuorumNeeded,
@@ -639,7 +662,7 @@ func (wc *WriteCoordinator) runCommitPhase(ctx context.Context, txn *Transaction
 	// Commit locally after remote quorum
 	localResp, err := wc.commitLocalAfterRemoteQuorum(ctx, commitReq, txn.ID)
 	if err != nil {
-		return err
+		return false, err
 	}
 	commitResponses[wc.nodeID] = localResp
 
@@ -652,7 +675,10 @@ func (wc *WriteCoordinator) runCommitPhase(ctx context.Context, txn *Transaction
 		Int("required", cluster.RequiredQuorum).
 		Msg("COMMIT phase complete")
 
-	return nil
+	// Invert here, at the one seam between the safe-zero-value wire field and
+	// WriteTransaction's public "should the caller bump schema version" return:
+	// !IdempotentNoOp is true (bump) unless we positively know this was a no-op.
+	return !localResp.IdempotentNoOp, nil
 }
 
 // classifyPrepareError classifies the prepare phase error for telemetry

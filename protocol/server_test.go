@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -300,17 +301,20 @@ func writeMySQLPacket(t *testing.T, conn net.Conn, seq byte, payload []byte) {
 	require.NoError(t, err, "writeMySQLPacket: write failed")
 }
 
-// completeHandshake performs the minimum MySQL handshake on a raw connection
-// and returns the server's authentication response payload (OK 0x00 or ERR 0xFF).
-func completeHandshake(t *testing.T, conn net.Conn) []byte {
+// sendHandshakeResponse reads the server's initial handshake packet and
+// replies with a HandshakeResponse41 requesting dbName as the initial
+// database. It does not wait for the server's OK/ERR response, so it is
+// safe to use when that response may be withheld (e.g. a DatabaseEnsurer
+// parked mid-call).
+func sendHandshakeResponse(t *testing.T, conn net.Conn, dbName string) {
 	t.Helper()
 
 	// Server sends: Initial Handshake (seq=0)
 	readMySQLPacket(t, conn)
 
 	// Client sends: HandshakeResponse41 (seq=1)
-	// Capability flags: CLIENT_PROTOCOL_41 | CLIENT_LONG_PASSWORD | CLIENT_SECURE_CONNECTION
-	caps := uint32(0x0000a201)
+	// Capability flags: CLIENT_PROTOCOL_41 | CLIENT_LONG_PASSWORD | CLIENT_SECURE_CONNECTION | CLIENT_CONNECT_WITH_DB
+	caps := uint32(0x0000a209)
 	capBytes := make([]byte, 4)
 	binary.LittleEndian.PutUint32(capBytes, caps)
 
@@ -321,9 +325,18 @@ func completeHandshake(t *testing.T, conn net.Conn) []byte {
 	resp = append(resp, make([]byte, 23)...)            // reserved (23)
 	resp = append(resp, "root\x00"...)                  // username
 	resp = append(resp, 0)                              // auth data length (empty)
-	resp = append(resp, "marmot\x00"...)                // database
+	resp = append(resp, dbName+"\x00"...)               // database
 	resp = append(resp, "mysql_native_password\x00"...) // auth plugin name
 	writeMySQLPacket(t, conn, 1, resp)
+}
+
+// completeHandshake performs the minimum MySQL handshake on a raw connection,
+// requesting dbName as the initial database, and returns the server's
+// authentication response payload (OK 0x00 or ERR 0xFF).
+func completeHandshake(t *testing.T, conn net.Conn, dbName string) []byte {
+	t.Helper()
+
+	sendHandshakeResponse(t, conn, dbName)
 
 	// Server sends: OK (seq=2) if accepted, ERR (seq=2) if draining
 	return readMySQLPacket(t, conn)
@@ -345,7 +358,7 @@ func TestServerConnTracking_ActiveConnectionCount(t *testing.T) {
 	conn1, err := net.Dial("tcp", addr)
 	require.NoError(t, err)
 	defer conn1.Close()
-	resp1 := completeHandshake(t, conn1)
+	resp1 := completeHandshake(t, conn1, "marmot")
 	require.Equal(t, byte(0x00), resp1[0], "expected OK after handshake")
 
 	require.Eventually(t, func() bool {
@@ -355,7 +368,7 @@ func TestServerConnTracking_ActiveConnectionCount(t *testing.T) {
 	conn2, err := net.Dial("tcp", addr)
 	require.NoError(t, err)
 	defer conn2.Close()
-	resp2 := completeHandshake(t, conn2)
+	resp2 := completeHandshake(t, conn2, "marmot")
 	require.Equal(t, byte(0x00), resp2[0], "expected OK after handshake")
 
 	require.Eventually(t, func() bool {
@@ -394,7 +407,7 @@ func TestServerConnTracking_DrainingRejectsNewConnections(t *testing.T) {
 	conn1, err := net.Dial("tcp", addr)
 	require.NoError(t, err)
 	defer conn1.Close()
-	resp1 := completeHandshake(t, conn1)
+	resp1 := completeHandshake(t, conn1, "marmot")
 	require.Equal(t, byte(0x00), resp1[0], "existing connection should get OK")
 
 	// Set draining flag without closing the listener so we can complete
@@ -404,7 +417,7 @@ func TestServerConnTracking_DrainingRejectsNewConnections(t *testing.T) {
 	conn2, err := net.Dial("tcp", addr)
 	require.NoError(t, err)
 	defer conn2.Close()
-	resp2 := completeHandshake(t, conn2)
+	resp2 := completeHandshake(t, conn2, "marmot")
 	// Error packet header byte is 0xFF.
 	require.Equal(t, byte(0xFF), resp2[0], "new connection during drain should receive error packet")
 	errCode := binary.LittleEndian.Uint16(resp2[1:3])
@@ -422,7 +435,7 @@ func TestServerConnTracking_GracefulDrain(t *testing.T) {
 	conn, err := net.Dial("tcp", addr)
 	require.NoError(t, err)
 	defer conn.Close()
-	resp := completeHandshake(t, conn)
+	resp := completeHandshake(t, conn, "marmot")
 	require.Equal(t, byte(0x00), resp[0], "expected OK after handshake")
 
 	require.Eventually(t, func() bool {
@@ -443,6 +456,150 @@ func TestServerConnTracking_GracefulDrain(t *testing.T) {
 	}
 
 	require.Equal(t, 0, server.ActiveConnectionCount(), "all connections should be gone after GracefulDrain")
+
+	server.Stop()
+}
+
+// blockingEnsurerHandler is a ConnectionHandler that also implements
+// DatabaseEnsurer, whose EnsureDatabase parks until release is closed. It
+// closes entered exactly once, the first time EnsureDatabase is called, so
+// tests can synchronize on "a connection is parked inside EnsureDatabase"
+// without sleeping and hoping.
+type blockingEnsurerHandler struct {
+	mockHandler
+
+	entered     chan struct{}
+	enteredOnce sync.Once
+	release     chan struct{}
+}
+
+func newBlockingEnsurerHandler() *blockingEnsurerHandler {
+	return &blockingEnsurerHandler{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+}
+
+func (h *blockingEnsurerHandler) EnsureDatabase(_ *ConnectionSession, _ string) error {
+	h.enteredOnce.Do(func() { close(h.entered) })
+	<-h.release
+	return nil
+}
+
+// TestServerConnTracking_ActiveConnectionCount_ParkedInEnsureDatabase proves
+// that a connection parked inside a slow DatabaseEnsurer.EnsureDatabase call
+// (e.g. a multi-second 2PC CREATE DATABASE) is already registered in
+// activeConns, and therefore visible to ActiveConnectionCount(), before the
+// OK packet is ever written.
+func TestServerConnTracking_ActiveConnectionCount_ParkedInEnsureDatabase(t *testing.T) {
+	t.Parallel()
+
+	handler := newBlockingEnsurerHandler()
+	server := NewMySQLServer("127.0.0.1:0", "", 0, handler)
+	require.NoError(t, server.Start())
+	defer server.Stop()
+
+	addr := server.listeners[0].Addr().String()
+	require.Equal(t, 0, server.ActiveConnectionCount(), "no connections initially")
+
+	conn, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	sendHandshakeResponse(t, conn, "newdb")
+
+	// Wait for the connection to actually be inside EnsureDatabase, rather
+	// than sleeping and hoping.
+	select {
+	case <-handler.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("EnsureDatabase was never entered")
+	}
+
+	require.Equal(t, 1, server.ActiveConnectionCount(),
+		"connection parked in EnsureDatabase must already be registered as active")
+
+	close(handler.release)
+
+	// The OK packet should now arrive, and the count should settle back to 0
+	// once the connection is closed.
+	resp := readMySQLPacket(t, conn)
+	require.Equal(t, byte(0x00), resp[0], "expected OK once EnsureDatabase returns")
+
+	conn.Close()
+	require.Eventually(t, func() bool {
+		return server.ActiveConnectionCount() == 0
+	}, time.Second, 10*time.Millisecond, "count should return to 0 after the connection finishes")
+}
+
+// TestServerConnTracking_GracefulDrain_ParkedInEnsureDatabase proves that
+// GracefulDrain can see and force-close a connection parked inside
+// EnsureDatabase, not merely that ActiveConnectionCount reports it. Closing
+// the socket does not by itself unblock a goroutine parked in EnsureDatabase
+// (it observes no context tied to the conn), so the test verifies the two
+// halves separately: (1) the Range force-close reaches and closes the
+// connection's socket while EnsureDatabase is still blocked, observable from
+// the client side, and while GracefulDrain is still waiting on connWg; then
+// (2) releasing EnsureDatabase lets the handler goroutine exit, at which
+// point GracefulDrain's connWg.Wait() unblocks and it returns.
+func TestServerConnTracking_GracefulDrain_ParkedInEnsureDatabase(t *testing.T) {
+	t.Parallel()
+
+	handler := newBlockingEnsurerHandler()
+	server := NewMySQLServer("127.0.0.1:0", "", 0, handler)
+	require.NoError(t, server.Start())
+
+	addr := server.listeners[0].Addr().String()
+
+	conn, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	sendHandshakeResponse(t, conn, "newdb")
+
+	select {
+	case <-handler.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("EnsureDatabase was never entered")
+	}
+
+	require.Equal(t, 1, server.ActiveConnectionCount(), "expected 1 active connection parked in EnsureDatabase")
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		server.GracefulDrain(200 * time.Millisecond)
+	}()
+
+	// The force-close should reach the parked connection's socket well
+	// before EnsureDatabase ever returns: prove it from the client side.
+	require.Eventually(t, func() bool {
+		_ = conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+		_, err := conn.Read(make([]byte, 1))
+		return err != nil
+	}, 2*time.Second, 20*time.Millisecond, "GracefulDrain should force-close the socket of a connection parked in EnsureDatabase")
+
+	// At this point EnsureDatabase is still blocked, so GracefulDrain must
+	// still be waiting on connWg rather than having already returned.
+	select {
+	case <-done:
+		t.Fatal("GracefulDrain returned before the parked EnsureDatabase call finished")
+	default:
+	}
+	require.Equal(t, 1, server.ActiveConnectionCount(),
+		"the connection stays registered until its handleConnection goroutine actually exits")
+
+	// Release EnsureDatabase; the handler goroutine can now exit, unblocking
+	// GracefulDrain's connWg.Wait().
+	close(handler.release)
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("GracefulDrain did not return within expected time after EnsureDatabase was released")
+	}
+
+	require.Equal(t, 0, server.ActiveConnectionCount(), "connection parked in EnsureDatabase should be gone after GracefulDrain")
 
 	server.Stop()
 }

@@ -58,7 +58,7 @@ func TestRunCommitPhase_AllNodesCommitSuccess(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	err := wc.runCommitPhase(ctx, txn, cluster, prepResponses)
+	_, err := wc.runCommitPhase(ctx, txn, cluster, prepResponses)
 
 	// Should succeed
 	AssertNoError(t, err)
@@ -111,7 +111,7 @@ func TestRunCommitPhase_QuorumCommitSuccess(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	err := wc.runCommitPhase(ctx, txn, cluster, prepResponses)
+	_, err := wc.runCommitPhase(ctx, txn, cluster, prepResponses)
 
 	// Should succeed: nodes 2,3 + local = 3 (quorum)
 	AssertNoError(t, err)
@@ -162,7 +162,7 @@ func TestRunCommitPhase_RemoteQuorumNotAchieved(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	err := wc.runCommitPhase(ctx, txn, cluster, prepResponses)
+	_, err := wc.runCommitPhase(ctx, txn, cluster, prepResponses)
 
 	// Should fail with PartialCommitError
 	AssertError(t, err, &PartialCommitError{})
@@ -207,7 +207,7 @@ func TestRunCommitPhase_AllRemotesTimeout(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	err := wc.runCommitPhase(ctx, txn, cluster, prepResponses)
+	_, err := wc.runCommitPhase(ctx, txn, cluster, prepResponses)
 
 	// Should fail
 	AssertError(t, err, &PartialCommitError{})
@@ -251,7 +251,7 @@ func TestRunCommitPhase_AllRemotesFail(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	err := wc.runCommitPhase(ctx, txn, cluster, prepResponses)
+	_, err := wc.runCommitPhase(ctx, txn, cluster, prepResponses)
 
 	// Should fail
 	AssertError(t, err, &PartialCommitError{})
@@ -300,7 +300,7 @@ func TestRunCommitPhase_LocalNotCalled(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	err := wc.runCommitPhase(ctx, txn, cluster, prepResponses)
+	_, err := wc.runCommitPhase(ctx, txn, cluster, prepResponses)
 
 	// Should fail
 	if err == nil {
@@ -354,7 +354,7 @@ func TestRunCommitPhase_LocalFailsAfterRemoteQuorum(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	err := wc.runCommitPhase(ctx, txn, cluster, prepResponses)
+	_, err := wc.runCommitPhase(ctx, txn, cluster, prepResponses)
 
 	// Should fail with PartialCommitError
 	AssertError(t, err, &PartialCommitError{})
@@ -401,7 +401,7 @@ func TestRunCommitPhase_LocalConflictAfterPrepare(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	err := wc.runCommitPhase(ctx, txn, cluster, prepResponses)
+	_, err := wc.runCommitPhase(ctx, txn, cluster, prepResponses)
 
 	// Current behavior: Succeeds because Success=true (ConflictDetected is not checked in commit phase)
 	// Ideally this should be an error, but documenting current implementation
@@ -445,7 +445,7 @@ func TestRunCommitPhase_LocalNilResponse(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	err := wc.runCommitPhase(ctx, txn, cluster, prepResponses)
+	_, err := wc.runCommitPhase(ctx, txn, cluster, prepResponses)
 
 	// Should fail
 	AssertError(t, err, &PartialCommitError{})
@@ -485,7 +485,7 @@ func TestRunCommitPhase_CommitDurationRecorded(t *testing.T) {
 
 	ctx := context.Background()
 	startTime := time.Now()
-	err := wc.runCommitPhase(ctx, txn, cluster, prepResponses)
+	_, err := wc.runCommitPhase(ctx, txn, cluster, prepResponses)
 	duration := time.Since(startTime)
 
 	AssertNoError(t, err)
@@ -529,7 +529,7 @@ func TestRunCommitPhase_QuorumAcksRecorded(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	err := wc.runCommitPhase(ctx, txn, cluster, prepResponses)
+	_, err := wc.runCommitPhase(ctx, txn, cluster, prepResponses)
 
 	AssertNoError(t, err)
 
@@ -575,7 +575,7 @@ func TestRunCommitPhase_FailureMetrics(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	err := wc.runCommitPhase(ctx, txn, cluster, prepResponses)
+	_, err := wc.runCommitPhase(ctx, txn, cluster, prepResponses)
 
 	// Should fail
 	if err == nil {
@@ -615,7 +615,7 @@ func TestRunCommitPhase_EmptyPrepResponses(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	err := wc.runCommitPhase(ctx, txn, cluster, prepResponses)
+	_, err := wc.runCommitPhase(ctx, txn, cluster, prepResponses)
 
 	// Should fail - no prepared nodes
 	if err == nil {
@@ -662,7 +662,7 @@ func TestRunCommitPhase_OnlyCoordinatorPrepared(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	err := wc.runCommitPhase(ctx, txn, cluster, prepResponses)
+	_, err := wc.runCommitPhase(ctx, txn, cluster, prepResponses)
 
 	// Should succeed - single node, quorum = 1
 	AssertNoError(t, err)
@@ -711,7 +711,7 @@ func TestRunCommitPhase_ContextCancelled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	err := wc.runCommitPhase(ctx, txn, cluster, prepResponses)
+	_, err := wc.runCommitPhase(ctx, txn, cluster, prepResponses)
 
 	// May fail or succeed depending on timing (commit goroutines are detached)
 	// The important check is that detached commits continue even if parent context cancelled
@@ -759,7 +759,7 @@ func TestRunCommitPhase_RemoteBeforeLocal(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	err := wc.runCommitPhase(ctx, txn, cluster, prepResponses)
+	_, err := wc.runCommitPhase(ctx, txn, cluster, prepResponses)
 
 	AssertNoError(t, err)
 
@@ -806,7 +806,7 @@ func TestRunCommitPhase_CoordinatorNotInRemoteCommits(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	err := wc.runCommitPhase(ctx, txn, cluster, prepResponses)
+	_, err := wc.runCommitPhase(ctx, txn, cluster, prepResponses)
 
 	AssertNoError(t, err)
 
@@ -858,7 +858,7 @@ func TestRunCommitPhase_ExactQuorumEdge(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	err := wc.runCommitPhase(ctx, txn, cluster, prepResponses)
+	_, err := wc.runCommitPhase(ctx, txn, cluster, prepResponses)
 
 	// Should succeed: 2 remote + 1 local = 3 (exact quorum)
 	AssertNoError(t, err)

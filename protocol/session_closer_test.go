@@ -64,7 +64,7 @@ func TestSessionCloser_CalledOnceOnDisconnect(t *testing.T) {
 
 	conn, err := net.Dial("tcp", addr)
 	require.NoError(t, err)
-	resp := completeHandshake(t, conn)
+	resp := completeHandshake(t, conn, "marmot")
 	require.Equal(t, byte(0x00), resp[0], "expected OK after handshake")
 
 	require.Eventually(t, func() bool {
@@ -107,7 +107,7 @@ func TestSessionCloser_HandlerWithoutSessionCloser(t *testing.T) {
 
 	conn, err := net.Dial("tcp", addr)
 	require.NoError(t, err)
-	resp := completeHandshake(t, conn)
+	resp := completeHandshake(t, conn, "marmot")
 	require.Equal(t, byte(0x00), resp[0], "expected OK after handshake")
 
 	require.Eventually(t, func() bool {

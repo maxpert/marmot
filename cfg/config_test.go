@@ -6,6 +6,11 @@ import (
 	"testing"
 )
 
+// pristineMySQLDefaults captures the package's default MySQLConfiguration before
+// any test mutates the global Config pointer. Package-level vars in a test binary
+// are initialized once, in dependency order, before any test function runs.
+var pristineMySQLDefaults = Config.MySQL
+
 func TestValidate_ValidConfig(t *testing.T) {
 	// Save original config
 	original := Config
@@ -596,5 +601,58 @@ func TestReplicaConfig_ValidationRequiresFollowAddresses(t *testing.T) {
 	err = Validate()
 	if err != nil {
 		t.Errorf("Expected no validation error with valid follow_addresses, got: %v", err)
+	}
+}
+
+func TestMySQLAutoCreateDatabase_ExplicitFalse(t *testing.T) {
+	original := Config
+	defer func() { Config = original }()
+
+	tempDir := filepath.Join(os.TempDir(), "marmot-test-auto-create-db-false")
+	defer os.RemoveAll(tempDir)
+
+	configPath := filepath.Join(tempDir, "config.toml")
+	if err := os.MkdirAll(tempDir, 0755); err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	tomlContent := "[mysql]\nauto_create_database = false\n"
+	if err := os.WriteFile(configPath, []byte(tomlContent), 0644); err != nil {
+		t.Fatalf("Failed to write temp config: %v", err)
+	}
+
+	Config = &Configuration{
+		DataDir: tempDir,
+		MySQL:   MySQLConfiguration{AutoCreateDatabase: true},
+	}
+
+	if err := Load(configPath); err != nil {
+		t.Fatalf("Expected no error loading config, got: %v", err)
+	}
+
+	if Config.MySQL.AutoCreateDatabase != false {
+		t.Errorf("Expected MySQL.AutoCreateDatabase to be false when explicitly set, got: %v", Config.MySQL.AutoCreateDatabase)
+	}
+}
+
+func TestMySQLAutoCreateDatabase_DefaultsTrue(t *testing.T) {
+	original := Config
+	defer func() { Config = original }()
+
+	tempDir := filepath.Join(os.TempDir(), "marmot-test-auto-create-db-default")
+	defer os.RemoveAll(tempDir)
+
+	// Reset Config to the package defaults, mirroring how the binary starts up.
+	Config = &Configuration{
+		DataDir: tempDir,
+		MySQL:   pristineMySQLDefaults,
+	}
+
+	// Loading a config file that omits auto_create_database must not clobber the default.
+	if err := Load("non-existent-file.toml"); err != nil {
+		t.Fatalf("Expected no error loading config, got: %v", err)
+	}
+
+	if Config.MySQL.AutoCreateDatabase != true {
+		t.Errorf("Expected MySQL.AutoCreateDatabase to default to true, got: %v", Config.MySQL.AutoCreateDatabase)
 	}
 }

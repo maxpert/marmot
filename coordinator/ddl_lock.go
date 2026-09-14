@@ -1,6 +1,7 @@
 package coordinator
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -9,8 +10,19 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-// DDLLockManager provides cluster-wide DDL serialization
-// Ensures only one DDL operation per database at a time across the cluster
+// ErrDDLLockHeld is the sentinel wrapped into AcquireLock's error when the
+// lock for a database is currently held by a different transaction, so
+// callers can classify the failure with errors.Is/errors.As instead of
+// matching on the formatted message.
+var ErrDDLLockHeld = errors.New("ddl lock held")
+
+// DDLLockManager provides local, per-node DDL serialization within this
+// process. It is an in-memory map guarded by a mutex, constructed once per
+// node, and is never gossiped or replicated: it does not coordinate DDL
+// across the cluster. Cross-node mutual exclusion for a concurrent DDL race
+// (e.g. two clients auto-creating the same missing database on different
+// nodes) is instead provided by the Pebble DB-op intent-key conflict
+// detected during 2PC PREPARE.
 type DDLLockManager struct {
 	mu sync.RWMutex
 	// activeLocks tracks active DDL locks per database
@@ -20,7 +32,8 @@ type DDLLockManager struct {
 	leaseDuration time.Duration
 }
 
-// DDLLock represents a cluster-wide DDL lock
+// DDLLock represents a local, per-node DDL lock: it serializes concurrent DDL
+// on the same database within this process only, not across the cluster.
 type DDLLock struct {
 	Database    string
 	NodeID      uint64
@@ -44,8 +57,10 @@ func NewDDLLockManager(leaseDuration time.Duration) *DDLLockManager {
 	}
 }
 
-// AcquireLock attempts to acquire a cluster-wide DDL lock for a database
-// Returns the lock if successful, error if lock is held by another transaction
+// AcquireLock attempts to acquire this node's local DDL lock for a database.
+// Returns the lock if successful; if the lock is held by another transaction
+// on this node, returns an error wrapping ErrDDLLockHeld (check with
+// errors.Is/errors.As).
 func (dlm *DDLLockManager) AcquireLock(database string, nodeID uint64, txnID uint64, ts hlc.Timestamp) (*DDLLock, error) {
 	dlm.mu.Lock()
 	defer dlm.mu.Unlock()
@@ -58,8 +73,8 @@ func (dlm *DDLLockManager) AcquireLock(database string, nodeID uint64, txnID uin
 				// Same transaction trying to reacquire (idempotent)
 				return existingLock, nil
 			}
-			return nil, fmt.Errorf("DDL lock for database '%s' is held by txn %d (node %d)",
-				database, existingLock.TxnID, existingLock.NodeID)
+			return nil, fmt.Errorf("%w: DDL lock for database '%s' is held by txn %d (node %d)",
+				ErrDDLLockHeld, database, existingLock.TxnID, existingLock.NodeID)
 		}
 		// Lock expired, can be acquired
 		log.Warn().

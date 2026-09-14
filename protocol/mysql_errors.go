@@ -6,6 +6,7 @@ import "fmt"
 const (
 	ErrCodeUnknown         uint16 = 1105
 	ErrCodeBadNull         uint16 = 1048
+	ErrCodeBadDB           uint16 = 1049
 	ErrCodeTableExists     uint16 = 1050
 	ErrCodeBadField        uint16 = 1054
 	ErrCodeDupFieldName    uint16 = 1060
@@ -73,4 +74,9 @@ func ErrReadOnly() *MySQLError {
 // ErrServerShutdown returns error 1053 - server shutdown in progress
 func ErrServerShutdown() *MySQLError {
 	return NewMySQLError(ErrCodeServerShutdown, "08S01", "Server shutdown in progress")
+}
+
+// ErrUnknownDatabase returns error 1049 - the named database does not exist
+func ErrUnknownDatabase(name string) *MySQLError {
+	return NewMySQLError(ErrCodeBadDB, SQLStateSyntax, fmt.Sprintf("Unknown database '%s'", name))
 }

@@ -190,11 +190,16 @@ port = 3306
 max_connections = 1000
 local_infile_enabled = true         # Enable LOAD DATA LOCAL INFILE
 auto_id_mode = "compact"  # "compact" (53-bit, default) or "extended" (64-bit)
+auto_create_database = true         # Auto-create unknown database named by client
 ```
 
 **Auto ID Mode:**
 - `"compact"` (default): Generates 53-bit IDs that are safe for all clients including JavaScript (`Number.MAX_SAFE_INTEGER`). Format: 41 bits timestamp + 6 bits node + 6 bits sequence. Supports ~69 years from epoch (Jan 2, 2025) with 64K IDs/sec per node.
 - `"extended"`: Generates full 64-bit HLC-based IDs for maximum uniqueness and ordering guarantees. Use when all clients support 64-bit integers natively.
+
+**Auto-Create Database:**
+- `true` (default): When a client names an unknown database in its handshake or via `USE`/`COM_INIT_DB`, Marmot creates it through the normal replicated DDL path (cluster-wide, not just locally) before the connection or `USE` succeeds.
+- `false`: Marmot rejects the unknown database with MySQL error 1049 (`Unknown database`), matching real MySQL's default behavior.
 
 **`LOAD DATA LOCAL INFILE` Notes:**
 - Supported variant is `LOAD DATA LOCAL INFILE` (client-uploaded bytes).
