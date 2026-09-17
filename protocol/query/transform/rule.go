@@ -56,6 +56,15 @@ type SchemaInfo struct {
 	// index into such a statement's VALUES tuple that holds the id.
 	// -1 when AutoIncrementColumn is empty.
 	AutoIncrementOrdinal int
+
+	// AutoIncrementWidth is the MySQL width the auto-increment column was
+	// declared with: 8, 16, 24 or 32. Zero means no width marker, which is
+	// BIGINT and every table created before markers existed; those keep the
+	// 64-bit id path.
+	AutoIncrementWidth int
+	// AutoIncrementUnsigned mirrors the MySQL UNSIGNED modifier on that column.
+	// Meaningless when AutoIncrementWidth is zero.
+	AutoIncrementUnsigned bool
 }
 
 // HasAutoIncrement returns true if table has an auto-increment column

@@ -52,7 +52,15 @@ func TestPipeline_WellFormedDDLStillParses(t *testing.T) {
 }
 
 // TestPipeline_AlterTableColumnRegressions locks in that plain ADD/DROP/RENAME
-// COLUMN still pass through unchanged after introducing AlterTableConstraintRule.
+// COLUMN are not mangled by AlterTableConstraintRule, which is what this test
+// was written for.
+//
+// The ADD COLUMN row's expected output changed when declared-width markers were
+// introduced: an integer column's type is now collapsed to SQLite's single
+// INTEGER type with the MySQL width recorded beside it, on ALTER exactly as on
+// CREATE. The assertion is not weakened - it is still an exact match on the
+// whole statement - it asserts the new intended output. DROP and RENAME carry
+// no column type and are unchanged, so the original guard still stands on them.
 func TestPipeline_AlterTableColumnRegressions(t *testing.T) {
 	pipeline, err := NewPipeline(100, nil)
 	if err != nil {
@@ -64,7 +72,7 @@ func TestPipeline_AlterTableColumnRegressions(t *testing.T) {
 		sql  string
 		want string
 	}{
-		{"ALTER TABLE users ADD COLUMN age INT", "alter table users add column age INT"},
+		{"ALTER TABLE users ADD COLUMN age INT", "alter table users add column age INTEGER /*M:32*/"},
 		{"ALTER TABLE users DROP COLUMN age", "alter table users drop column age"},
 		{"ALTER TABLE users RENAME COLUMN age TO years", "alter table users rename column age to years"},
 	}

@@ -1,38 +1,45 @@
 package protocol
 
-import "fmt"
+import (
+	"fmt"
 
-// MySQL error code constants
-const (
-	ErrCodeUnknown         uint16 = 1105
-	ErrCodeBadNull         uint16 = 1048
-	ErrCodeTableExists     uint16 = 1050
-	ErrCodeBadField        uint16 = 1054
-	ErrCodeDupFieldName    uint16 = 1060
-	ErrCodeDupEntry        uint16 = 1062
-	ErrCodeParseError      uint16 = 1064
-	ErrCodeTooBigRowsize   uint16 = 1118
-	ErrCodeNoSuchTable     uint16 = 1146
-	ErrCodeNoDB            uint16 = 1046
-	ErrCodeLockTimeout     uint16 = 1205
-	ErrCodeDeadlock        uint16 = 1213
-	ErrCodeReadOnly        uint16 = 1290
-	ErrCodeServerShutdown  uint16 = 1053
-	ErrCodeNoReferencedRow uint16 = 1452
-	ErrCodeCheckConstraint uint16 = 3819
+	"github.com/maxpert/marmot/protocol/mysqlcode"
 )
 
-// SQLSTATE constants
+// MySQL error code constants. Values live in protocol/mysqlcode so packages
+// below protocol - which cannot import protocol without an import cycle -
+// can reference the same numbers instead of duplicating them.
 const (
-	SQLStateGeneral     = "HY000"
-	SQLStateIntegrity   = "23000"
-	SQLStateSyntax      = "42000"
-	SQLStateDeadlock    = "40001"
-	SQLStateTableExists = "42S01"
-	SQLStateNoSuchTable = "42S02"
-	SQLStateNoSuchCol   = "42S22"
-	SQLStateDupColumn   = "42S21"
-	SQLStateNoDB        = "3D000"
+	ErrCodeUnknown         = mysqlcode.ErrCodeUnknown
+	ErrCodeBadNull         = mysqlcode.ErrCodeBadNull
+	ErrCodeTableExists     = mysqlcode.ErrCodeTableExists
+	ErrCodeBadField        = mysqlcode.ErrCodeBadField
+	ErrCodeDupFieldName    = mysqlcode.ErrCodeDupFieldName
+	ErrCodeDupEntry        = mysqlcode.ErrCodeDupEntry
+	ErrCodeParseError      = mysqlcode.ErrCodeParseError
+	ErrCodeTooBigRowsize   = mysqlcode.ErrCodeTooBigRowsize
+	ErrCodeNoSuchTable     = mysqlcode.ErrCodeNoSuchTable
+	ErrCodeNoDB            = mysqlcode.ErrCodeNoDB
+	ErrCodeLockTimeout     = mysqlcode.ErrCodeLockTimeout
+	ErrCodeDeadlock        = mysqlcode.ErrCodeDeadlock
+	ErrCodeReadOnly        = mysqlcode.ErrCodeReadOnly
+	ErrCodeServerShutdown  = mysqlcode.ErrCodeServerShutdown
+	ErrCodeNoReferencedRow = mysqlcode.ErrCodeNoReferencedRow
+	ErrCodeCheckConstraint = mysqlcode.ErrCodeCheckConstraint
+)
+
+// SQLSTATE constants. Values live in protocol/mysqlcode; see above.
+const (
+	SQLStateGeneral     = mysqlcode.SQLStateGeneral
+	SQLStateIntegrity   = mysqlcode.SQLStateIntegrity
+	SQLStateSyntax      = mysqlcode.SQLStateSyntax
+	SQLStateDeadlock    = mysqlcode.SQLStateDeadlock
+	SQLStateTableExists = mysqlcode.SQLStateTableExists
+	SQLStateNoSuchTable = mysqlcode.SQLStateNoSuchTable
+	SQLStateNoSuchCol   = mysqlcode.SQLStateNoSuchCol
+	SQLStateDupColumn   = mysqlcode.SQLStateDupColumn
+	SQLStateConnFailure = mysqlcode.SQLStateConnFailure
+	SQLStateNoDB        = mysqlcode.SQLStateNoDB
 )
 
 // MySQLError represents a MySQL protocol error with error code and SQLSTATE
@@ -74,5 +81,5 @@ func ErrReadOnly() *MySQLError {
 
 // ErrServerShutdown returns error 1053 - server shutdown in progress
 func ErrServerShutdown() *MySQLError {
-	return NewMySQLError(ErrCodeServerShutdown, "08S01", "Server shutdown in progress")
+	return NewMySQLError(ErrCodeServerShutdown, SQLStateConnFailure, "Server shutdown in progress")
 }

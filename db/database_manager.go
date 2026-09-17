@@ -1411,6 +1411,15 @@ func (dm *DatabaseManager) GetTranspilerSchema(database, table string) (*transfo
 		AutoIncrementColumn:  autoIncCol,
 		AutoIncrementOrdinal: columnOrdinal(schema.Columns, autoIncCol),
 	}
+	// The declared width comes from the marker the transpiler wrote into the
+	// CREATE TABLE text; a column without one keeps the 64-bit path.
+	for _, col := range schema.FullColumns {
+		if autoIncCol != "" && strings.EqualFold(col.Name, autoIncCol) {
+			info.AutoIncrementWidth = col.DeclaredWidth
+			info.AutoIncrementUnsigned = col.Unsigned
+			break
+		}
+	}
 
 	// PrimaryKeys uses "rowid" sentinel when no explicit PRIMARY KEY is defined.
 	// Keep it out of transpiler conflict targeting to preserve fallback behavior.

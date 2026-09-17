@@ -22,6 +22,21 @@ type ColumnSchema struct {
 	Nullable bool   // true if NULL allowed (notnull column == 0)
 	IsPK     bool   // true if part of primary key (pk > 0)
 	PKOrder  int    // 1-based order in composite PK (0 if not PK)
+
+	// DeclaredWidth is the MySQL integer width the column was declared with:
+	// 8, 16, 24 or 32. Zero means the column carries no width marker, which is
+	// every column declared BIGINT and every table created before markers
+	// existed; those keep the 64-bit path.
+	//
+	// It cannot come from PRAGMA table_info, which reports the type as plain
+	// INTEGER with the marker normalised away. Only sqlite_master.sql keeps it.
+	DeclaredWidth int
+	// Unsigned mirrors the MySQL UNSIGNED modifier. Meaningless when
+	// DeclaredWidth is zero.
+	Unsigned bool
+	// ExplicitAutoInc records that the column was declared AUTO_INCREMENT,
+	// as opposed to merely being a narrow integer.
+	ExplicitAutoInc bool
 }
 
 // ToPublisherSchema converts db.TableSchema to publisher.TableSchema.

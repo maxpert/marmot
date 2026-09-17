@@ -39,14 +39,19 @@ func (r *AlterTableColumnTypeRule) Transform(stmt sqlparser.Statement, params []
 		case *sqlparser.AddColumns:
 			for _, col := range o.Columns {
 				stripMySQLColumnType(col.Type)
+				collapseIntegerTypeWithMarker(col.Type)
 			}
 		case *sqlparser.ModifyColumn:
 			if o.NewColDefinition != nil {
 				stripMySQLColumnType(o.NewColDefinition.Type)
+				collapseIntegerTypeWithMarker(o.NewColDefinition.Type)
 			}
 		case *sqlparser.ChangeColumn:
+			// CHANGE renames as well as retypes; the marker travels with the
+			// new column definition, so it follows the new name.
 			if o.NewColDefinition != nil {
 				stripMySQLColumnType(o.NewColDefinition.Type)
+				collapseIntegerTypeWithMarker(o.NewColDefinition.Type)
 			}
 		}
 	}

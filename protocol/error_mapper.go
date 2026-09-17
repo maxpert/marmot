@@ -78,7 +78,7 @@ func sqlStateForCode(code uint16) string {
 	case ErrCodeNoDB:
 		return SQLStateNoDB
 	case ErrCodeServerShutdown:
-		return "08S01"
+		return SQLStateConnFailure
 	default:
 		return SQLStateGeneral
 	}

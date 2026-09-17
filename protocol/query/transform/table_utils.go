@@ -2,7 +2,9 @@ package transform
 
 import (
 	"fmt"
+	"strings"
 
+	"github.com/maxpert/marmot/protocol/query/transform/intmarker"
 	"vitess.io/vitess/go/vt/sqlparser"
 )
 
@@ -79,4 +81,66 @@ func searchTableExpr(expr sqlparser.TableExpr, targetAlias string) (tableName, a
 	}
 
 	return "", "", false
+}
+
+// collapseIntegerTypeWithMarker rewrites a MySQL integer column type into the
+// single type SQLite has, carrying the declared width as a marker comment, and
+// strips the modifiers SQLite rejects. It reports whether it changed anything.
+//
+// Shared by CREATE TABLE (IntTypeRule) and ALTER TABLE ADD/MODIFY/CHANGE COLUMN
+// (AlterTableColumnTypeRule). Before it was shared, ALTER only ran
+// stripMySQLColumnType, which does not collapse the type and does not remove
+// AUTO_INCREMENT, so "ALTER TABLE t ADD COLUMN x INT AUTO_INCREMENT" reached
+// SQLite with a keyword it cannot parse.
+//
+// The stored token must stay exactly "INTEGER": only that spelling makes a
+// PRIMARY KEY an alias of the rowid, and "INT PRIMARY KEY" does not, which
+// would make LAST_INSERT_ID() report an unrelated internal rowid. BIGINT and
+// non-integer types get no marker, so their DDL text is byte-identical to what
+// it was before markers existed.
+func collapseIntegerTypeWithMarker(colType *sqlparser.ColumnType) bool {
+	if colType == nil {
+		return false
+	}
+
+	upperType := strings.ToUpper(colType.Type)
+	if !isIntegerType(upperType) {
+		return false
+	}
+
+	// Capture the declared width BEFORE the strips below erase it.
+	marker := ""
+	if bits, narrow := intmarker.BitsForType(upperType); narrow {
+		marker = intmarker.Encode(intmarker.Attributes{
+			Bits:            bits,
+			Unsigned:        colType.Unsigned,
+			ExplicitAutoInc: colType.Options != nil && colType.Options.Autoincrement,
+		})
+	}
+
+	modified := false
+	if colType.Options != nil && colType.Options.Autoincrement {
+		colType.Options.Autoincrement = false
+		modified = true
+	}
+	if colType.Unsigned {
+		colType.Unsigned = false
+		modified = true
+	}
+	if colType.Zerofill {
+		colType.Zerofill = false
+		modified = true
+	}
+
+	want := "INTEGER"
+	if marker != "" {
+		// Spaced, matching the form verified against sqlite3 in the design:
+		// "id INTEGER /*M:32a*/ PRIMARY KEY".
+		want = "INTEGER " + marker
+	}
+	if colType.Type != want {
+		colType.Type = want
+		modified = true
+	}
+	return modified
 }

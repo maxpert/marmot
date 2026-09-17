@@ -681,7 +681,7 @@ func (s *MySQLServer) writeEOF(w io.Writer, seq byte, session *ConnectionSession
 }
 
 func (s *MySQLServer) writeError(w io.Writer, seq byte, code uint16, msg string) error {
-	return s.writeErrorWithState(w, seq, code, "HY000", msg)
+	return s.writeErrorWithState(w, seq, code, SQLStateGeneral, msg)
 }
 
 func (s *MySQLServer) writeErrorWithState(w io.Writer, seq byte, code uint16, sqlState, msg string) error {
@@ -1075,7 +1075,7 @@ func (s *MySQLServer) handleStmtPrepare(conn net.Conn, session *ConnectionSessio
 			Str("query", sql).
 			Err(err).
 			Msg("Failed to process SQL in PREPARE")
-		_ = s.writeError(conn, 1, 1064, err.Error())
+		_ = s.writeError(conn, 1, ErrCodeParseError, err.Error())
 		return
 	}
 
@@ -1089,7 +1089,7 @@ func (s *MySQLServer) handleStmtPrepare(conn net.Conn, session *ConnectionSessio
 			Str("query", sql).
 			Str("error", errorMsg).
 			Msg("Invalid SQL in PREPARE")
-		_ = s.writeError(conn, 1, 1064, errorMsg)
+		_ = s.writeError(conn, 1, ErrCodeParseError, errorMsg)
 		return
 	}
 
@@ -1259,7 +1259,7 @@ func (s *MySQLServer) handleStmtSendLongData(session *ConnectionSession, payload
 // accumulated via COM_STMT_SEND_LONG_DATA for the statement and responds OK.
 func (s *MySQLServer) handleStmtReset(conn net.Conn, session *ConnectionSession, payload []byte) {
 	if len(payload) < 4 {
-		_ = s.writeError(conn, 1, 1064, "Invalid COM_STMT_RESET packet")
+		_ = s.writeError(conn, 1, ErrCodeParseError, "Invalid COM_STMT_RESET packet")
 		return
 	}
 	stmtID := binary.LittleEndian.Uint32(payload[0:4])
@@ -1280,7 +1280,7 @@ func (s *MySQLServer) handleStmtReset(conn net.Conn, session *ConnectionSession,
 
 func (s *MySQLServer) handleStmtExecute(conn net.Conn, session *ConnectionSession, payload []byte) {
 	if len(payload) < 9 {
-		_ = s.writeError(conn, 1, 1064, "Invalid COM_STMT_EXECUTE packet")
+		_ = s.writeError(conn, 1, ErrCodeParseError, "Invalid COM_STMT_EXECUTE packet")
 		return
 	}
 
@@ -1313,7 +1313,7 @@ func (s *MySQLServer) handleStmtExecute(conn net.Conn, session *ConnectionSessio
 		// Parse NULL bitmap and new-params-bound-flag
 		nullBitmapLen := (int(stmt.ParamCount) + 7) / 8
 		if len(payload) < 9+nullBitmapLen+1 {
-			_ = s.writeError(conn, 1, 1064, "Invalid parameter data")
+			_ = s.writeError(conn, 1, ErrCodeParseError, "Invalid parameter data")
 			return
 		}
 
@@ -1327,7 +1327,7 @@ func (s *MySQLServer) handleStmtExecute(conn net.Conn, session *ConnectionSessio
 		if newParamsBoundFlag == 1 {
 			// New types provided - parse and cache them
 			if len(payload) < offset+int(stmt.ParamCount)*2 {
-				_ = s.writeError(conn, 1, 1064, "Invalid parameter types")
+				_ = s.writeError(conn, 1, ErrCodeParseError, "Invalid parameter types")
 				return
 			}
 			paramTypes = make([]byte, int(stmt.ParamCount)*2)
@@ -1386,7 +1386,7 @@ func (s *MySQLServer) handleStmtExecute(conn net.Conn, session *ConnectionSessio
 						_ = s.writeErrorWithState(conn, 1, 1264, "22003",
 							fmt.Sprintf("Out of range value for parameter %d", i))
 					} else {
-						_ = s.writeError(conn, 1, 1064, fmt.Sprintf("Failed to parse parameter %d: %v", i, err))
+						_ = s.writeError(conn, 1, ErrCodeParseError, fmt.Sprintf("Failed to parse parameter %d: %v", i, err))
 					}
 					return
 				}

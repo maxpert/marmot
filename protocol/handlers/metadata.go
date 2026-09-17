@@ -3,6 +3,7 @@ package handlers
 import (
 	"database/sql"
 	"fmt"
+	"github.com/maxpert/marmot/protocol/query/transform/intmarker"
 
 	"github.com/maxpert/marmot/protocol"
 	"github.com/rs/zerolog/log"
@@ -203,13 +204,24 @@ func (m *MetadataHandler) HandleShowCreateTable(dbName, tableName string) (*prot
 		return nil, err
 	}
 
+	// sqlite_master.sql is returned verbatim, so it would carry the width
+	// marker the transpiler writes beside narrow integer types. The marker is
+	// Marmot's own bookkeeping; a client must never see it, and a tool that
+	// round-trips SHOW CREATE TABLE output must not be handed a comment it
+	// would then feed back in.
+	//
+	// This is the ONLY client-facing reader of the DDL text: every other
+	// sqlite_master query in protocol/handlers selects `name`, and the column
+	// types shown by SHOW COLUMNS and information_schema.COLUMNS come from
+	// PRAGMA table_info, which reports plain INTEGER with the marker
+	// normalised away.
 	return &protocol.ResultSet{
 		Columns: []protocol.ColumnDef{
 			{Name: "Table", Type: 0xFD},
 			{Name: "Create Table", Type: 0xFD},
 		},
 		Rows: [][]interface{}{
-			{tableName, createSQL},
+			{tableName, intmarker.Strip(createSQL)},
 		},
 	}, nil
 }

@@ -1,17 +1,20 @@
 package transform
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/maxpert/marmot/protocol/mysqlcode"
+)
 
 // MySQL server error codes raised by transformation rules.
 //
-// These live here, rather than beside the protocol package's error codes,
-// because transform is a leaf package: protocol imports it and never the
-// reverse, so a rule cannot name protocol.ErrCode*. Only codes a rule actually
-// raises belong here, and none of them is declared by protocol as well.
+// The value lives in protocol/mysqlcode, the shared leaf package for MySQL
+// error-code constants, and is referenced here under its historical name so
+// existing callers in this package's API are unaffected.
 const (
 	// ErrCodeNotSupportedYet is MySQL's ER_NOT_SUPPORTED_YET (1235): the
 	// server understands the statement but does not implement this form of it.
-	ErrCodeNotSupportedYet uint16 = 1235
+	ErrCodeNotSupportedYet = mysqlcode.ErrCodeNotSupportedYet
 )
 
 // CodedError is the error a transformation rule returns when it refuses a
