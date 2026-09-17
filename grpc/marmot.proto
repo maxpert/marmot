@@ -423,6 +423,17 @@ message ForwardQueryResponse {
   int64 last_insert_id = 4;
   uint64 committed_txn_id = 5;   // For read-your-writes
   bool in_transaction = 6;       // True if session has active transaction on leader
+  // MySQL server error code for a failed query, so a replica can reproduce the
+  // leader's ERR packet instead of flattening every failure to ER_UNKNOWN_ERROR.
+  // 0 means "not supplied": an older leader, or a rejection raised before the
+  // statement reached the coordinator. A replica reports 1105 for 0.
+  uint32 error_code = 7;
+  // SQLSTATE for the same failure. It is sent rather than derived from the code
+  // because the mapping is not injective: the leader pairs code 1105 with both
+  // HY000 and 23000 (an unclassified error vs an unclassified CONSTRAINT
+  // failure), so a replica rebuilding it from the number alone would have to
+  // guess. Empty means "not supplied", same as error_code 0.
+  string sql_state = 8;
 }
 
 message ForwardLoadDataRequest {

@@ -197,7 +197,7 @@ func (h *ReadOnlyHandler) HandleQuery(session *protocol.ConnectionSession, sql s
 func (h *ReadOnlyHandler) HandleLoadData(session *protocol.ConnectionSession, sql string, data []byte) (*protocol.ResultSet, error) {
 	stmt := protocol.ParseStatement(sql)
 	if stmt.Type != protocol.StatementLoadData {
-		return nil, fmt.Errorf("ERROR 1105 (HY000): statement is not LOAD DATA")
+		return nil, protocol.NewMySQLError(protocol.ErrCodeUnknown, protocol.SQLStateGeneral, "statement is not LOAD DATA")
 	}
 	if !h.forwardWrites {
 		return nil, protocol.ErrReadOnly()
@@ -205,7 +205,7 @@ func (h *ReadOnlyHandler) HandleLoadData(session *protocol.ConnectionSession, sq
 
 	client := h.replica.streamClient.GetClient()
 	if client == nil {
-		return nil, fmt.Errorf("ERROR 2003 (HY000): Not connected to leader")
+		return nil, protocol.NewMySQLError(protocol.ErrCodeUnknown, protocol.SQLStateGeneral, "Not connected to leader")
 	}
 
 	requestID := session.NextForwardRequestID()
@@ -220,14 +220,13 @@ func (h *ReadOnlyHandler) HandleLoadData(session *protocol.ConnectionSession, sq
 		TimeoutMs:          uint32(h.forwardTimeout.Milliseconds()),
 	})
 	if err != nil {
-		return nil, fmt.Errorf("ERROR 2013 (HY000): Lost connection to leader during query: %v", err)
+		return nil, protocol.NewMySQLError(protocol.ErrCodeUnknown, protocol.SQLStateGeneral, fmt.Sprintf("Lost connection to leader during query: %v", err))
 	}
 	if !resp.Success {
-		return nil, fmt.Errorf("ERROR 1105 (HY000): %s", resp.ErrorMessage)
+		return nil, forwardedError(resp.ErrorCode, resp.SqlState, resp.ErrorMessage)
 	}
 
-	session.LastInsertId.Store(resp.LastInsertId)
-	session.ForwardedTxnActive = resp.InTransaction
+	h.applyForwardedSessionState(session, resp)
 
 	if session.WaitForReplication && resp.CommittedTxnId > 0 {
 		if err := h.waitForReplication(session.CurrentDatabase, resp.CommittedTxnId); err != nil {
@@ -240,6 +239,55 @@ func (h *ReadOnlyHandler) HandleLoadData(session *protocol.ConnectionSession, sq
 		LastInsertId:   resp.LastInsertId,
 		CommittedTxnId: resp.CommittedTxnId,
 	}, nil
+}
+
+// forwardedError turns a leader's failure message into the error this replica
+// returns to its client.
+//
+// It is typed rather than a formatted "ERROR 1105 (HY000): ..." string for two
+// reasons. A formatted code is re-parsed downstream by
+// protocol.ConvertToMySQLError's message matching, so a leader message that
+// merely contains "syntax error" came back to the client as 1064; and the
+// formatted prefix was duplicated into the ERR packet's message.
+//
+// forwardedError rebuilds, for this replica's client, the error the leader
+// reported. The leader sends both its MySQL error code and its SQLSTATE, so a
+// rule rejection's 1235/42000 arrives intact.
+//
+// Both travel because the code does not determine the SQLSTATE: the leader
+// pairs 1105 with HY000 for an unclassified error and with 23000 for an
+// unclassified CONSTRAINT failure, so a replica deriving the SQLSTATE from the
+// number alone reported HY000 for a genuine integrity violation, and a client
+// branching on the SQLSTATE class saw a different answer from a replica than
+// from a coordinator for the same failure.
+//
+// A zero code means "not supplied": an older leader on a partially upgraded
+// cluster, or a rejection raised before the statement reached the coordinator.
+// That keeps the previous behaviour of reporting ER_UNKNOWN_ERROR. A non-zero
+// code with an empty SQLSTATE cannot come from a current leader - forwardFailure
+// always fills both - and falls back to HY000 rather than sending an empty
+// SQLSTATE to the client.
+func forwardedError(code uint32, sqlState string, message string) error {
+	if code == 0 {
+		return protocol.NewMySQLError(protocol.ErrCodeUnknown, protocol.SQLStateGeneral, message)
+	}
+	if sqlState == "" {
+		sqlState = protocol.SQLStateGeneral
+	}
+	return protocol.NewMySQLError(uint16(code), sqlState, message)
+}
+
+// applyForwardedSessionState copies the session-visible state a leader's
+// forwarded response carries back into this session.
+//
+// The insert id goes through ConnectionSession.RecordInsertId rather than
+// storing it directly, because a forwarded zero means the leader's statement
+// generated no AUTO_INCREMENT value and MySQL leaves LAST_INSERT_ID() unchanged
+// in that case. Storing it unconditionally reset the client's value on every
+// INSERT that inserted nothing and on every upsert that updated.
+func (h *ReadOnlyHandler) applyForwardedSessionState(session *protocol.ConnectionSession, resp *marmotgrpc.ForwardQueryResponse) {
+	session.RecordInsertId(resp.LastInsertId)
+	session.ForwardedTxnActive = resp.InTransaction
 }
 
 // handleSystemQuery handles MySQL system variable queries
@@ -258,7 +306,7 @@ func (h *ReadOnlyHandler) handleSystemQuery(session *protocol.ConnectionSession,
 // executeLocalRead executes a read query locally
 func (h *ReadOnlyHandler) executeLocalRead(stmt protocol.Statement, params []interface{}) (*protocol.ResultSet, error) {
 	if stmt.Database == "" {
-		return nil, fmt.Errorf("ERROR 1046 (3D000): No database selected")
+		return nil, protocol.NewMySQLError(protocol.ErrCodeNoDB, protocol.SQLStateNoDB, "No database selected")
 	}
 
 	sqlDB, err := h.dbManager.GetDatabaseConnection(stmt.Database)
@@ -365,13 +413,13 @@ func (h *ReadOnlyHandler) handleMarmotCommand(session *protocol.ConnectionSessio
 func (h *ReadOnlyHandler) forwardMutation(session *protocol.ConnectionSession, stmt protocol.Statement, params []interface{}) (*protocol.ResultSet, error) {
 	client := h.replica.streamClient.GetClient()
 	if client == nil {
-		return nil, fmt.Errorf("ERROR 2003 (HY000): Not connected to leader")
+		return nil, protocol.NewMySQLError(protocol.ErrCodeUnknown, protocol.SQLStateGeneral, "Not connected to leader")
 	}
 
 	// Serialize params using msgpack
 	serializedParams, err := marmotgrpc.SerializeParams(params)
 	if err != nil {
-		return nil, fmt.Errorf("ERROR 1105 (HY000): Failed to serialize params: %v", err)
+		return nil, protocol.NewMySQLError(protocol.ErrCodeUnknown, protocol.SQLStateGeneral, fmt.Sprintf("Failed to serialize params: %v", err))
 	}
 
 	requestID := session.NextForwardRequestID()
@@ -388,17 +436,14 @@ func (h *ReadOnlyHandler) forwardMutation(session *protocol.ConnectionSession, s
 	})
 
 	if err != nil {
-		return nil, fmt.Errorf("ERROR 2013 (HY000): Lost connection to leader during query: %v", err)
+		return nil, protocol.NewMySQLError(protocol.ErrCodeUnknown, protocol.SQLStateGeneral, fmt.Sprintf("Lost connection to leader during query: %v", err))
 	}
 	if !resp.Success {
-		return nil, fmt.Errorf("ERROR 1105 (HY000): %s", resp.ErrorMessage)
+		return nil, forwardedError(resp.ErrorCode, resp.SqlState, resp.ErrorMessage)
 	}
 
-	// Update session state
-	session.LastInsertId.Store(resp.LastInsertId)
-
-	// Track forwarded transaction state if within a transaction
-	session.ForwardedTxnActive = resp.InTransaction
+	// Update session state, including the forwarded transaction flag.
+	h.applyForwardedSessionState(session, resp)
 
 	// Handle database operations locally after leader confirms success
 	// These don't replicate via change stream - replica must create/drop locally
@@ -438,7 +483,7 @@ func (h *ReadOnlyHandler) forwardMutation(session *protocol.ConnectionSession, s
 func (h *ReadOnlyHandler) forwardTxnControl(session *protocol.ConnectionSession, stmt protocol.Statement) (*protocol.ResultSet, error) {
 	client := h.replica.streamClient.GetClient()
 	if client == nil {
-		return nil, fmt.Errorf("ERROR 2003 (HY000): Not connected to leader")
+		return nil, protocol.NewMySQLError(protocol.ErrCodeUnknown, protocol.SQLStateGeneral, "Not connected to leader")
 	}
 
 	var txnControl marmotgrpc.ForwardTxnControl
@@ -465,10 +510,10 @@ func (h *ReadOnlyHandler) forwardTxnControl(session *protocol.ConnectionSession,
 	})
 
 	if err != nil {
-		return nil, fmt.Errorf("ERROR 2013 (HY000): %v", err)
+		return nil, protocol.NewMySQLError(protocol.ErrCodeUnknown, protocol.SQLStateGeneral, fmt.Sprintf("Lost connection to leader during query: %v", err))
 	}
 	if !resp.Success {
-		return nil, fmt.Errorf("ERROR 1105 (HY000): %s", resp.ErrorMessage)
+		return nil, forwardedError(resp.ErrorCode, resp.SqlState, resp.ErrorMessage)
 	}
 
 	// Track forwarded transaction state based on response

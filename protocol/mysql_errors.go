@@ -13,6 +13,7 @@ const (
 	ErrCodeParseError      uint16 = 1064
 	ErrCodeTooBigRowsize   uint16 = 1118
 	ErrCodeNoSuchTable     uint16 = 1146
+	ErrCodeNoDB            uint16 = 1046
 	ErrCodeLockTimeout     uint16 = 1205
 	ErrCodeDeadlock        uint16 = 1213
 	ErrCodeReadOnly        uint16 = 1290
@@ -31,6 +32,7 @@ const (
 	SQLStateNoSuchTable = "42S02"
 	SQLStateNoSuchCol   = "42S22"
 	SQLStateDupColumn   = "42S21"
+	SQLStateNoDB        = "3D000"
 )
 
 // MySQLError represents a MySQL protocol error with error code and SQLSTATE

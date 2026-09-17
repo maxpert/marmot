@@ -84,6 +84,9 @@ func (p *Pipeline) Process(ctx *QueryContext) error {
 	// Transpile (handles database qualifier stripping and literal extraction)
 	if err := p.transpiler.Transpile(ctx); err != nil {
 		log.Debug().Err(err).Str("sql", ctx.Input.SQL).Msg("Transpile failed")
+		// Record it typed and separately from a parse failure: only a
+		// transpilation error can carry a rule's own MySQL error code.
+		ctx.Output.TranspileErr = err
 		return err
 	}
 

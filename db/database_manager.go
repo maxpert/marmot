@@ -1374,6 +1374,25 @@ func (dm *DatabaseManager) GetAutoIncrementColumn(database, table string) (strin
 	return schema.GetAutoIncrementCol(), nil
 }
 
+// columnOrdinal returns name's position in a table's column order, or -1 when
+// name is empty or absent. TableSchema.Columns is declaration order with
+// GENERATED columns removed, which is exactly the tuple a column-less
+// "INSERT INTO t VALUES (...)" supplies - SQLite rejects a value for a
+// generated column - so this index is the position of that column's value in
+// such a statement. PRAGMA table_xinfo's cid is NOT usable here: it counts
+// hidden columns too (see db/schema_cache.go loadSchema).
+func columnOrdinal(columns []string, name string) int {
+	if name == "" {
+		return -1
+	}
+	for i, col := range columns {
+		if strings.EqualFold(col, name) {
+			return i
+		}
+	}
+	return -1
+}
+
 // GetTranspilerSchema returns schema information used by SQL transpilation rules.
 // Uses cached schema - does NOT query SQLite PRAGMA.
 func (dm *DatabaseManager) GetTranspilerSchema(database, table string) (*transform.SchemaInfo, error) {
@@ -1387,8 +1406,10 @@ func (dm *DatabaseManager) GetTranspilerSchema(database, table string) (*transfo
 		return nil, fmt.Errorf("schema not cached for table %s: %w", table, err)
 	}
 
+	autoIncCol := schema.GetAutoIncrementCol()
 	info := &transform.SchemaInfo{
-		AutoIncrementColumn: schema.GetAutoIncrementCol(),
+		AutoIncrementColumn:  autoIncCol,
+		AutoIncrementOrdinal: columnOrdinal(schema.Columns, autoIncCol),
 	}
 
 	// PrimaryKeys uses "rowid" sentinel when no explicit PRIMARY KEY is defined.

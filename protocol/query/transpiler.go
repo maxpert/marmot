@@ -107,7 +107,13 @@ func (t *Transpiler) Transpile(ctx *QueryContext) error {
 	// Apply ID injection FIRST if needed
 	if needsIDInjection {
 		newAST, applied, err := t.autoIncRule.ApplyAST(ast, ctx.SchemaLookup)
-		if err == nil && applied {
+		if err != nil {
+			// A rule that refuses a statement must reach the client. Returning
+			// the error unchanged keeps whatever MySQL error code the rule
+			// chose (see transform.CodedError).
+			return err
+		}
+		if applied {
 			ast = newAST
 			transformations = append(transformations, Transformation{
 				Rule:   t.autoIncRule.Name(),

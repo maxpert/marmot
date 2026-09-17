@@ -51,6 +51,28 @@ func NewForwardHandler(nodeID uint64, clock *hlc.Clock, sessionMgr *ForwardSessi
 	}
 }
 
+// forwardFailure builds the response for an error the leader's own handler
+// returned, carrying the MySQL error code the coordinator would have put in its
+// ERR packet so the replica can reproduce it rather than flattening every
+// failure to ER_UNKNOWN_ERROR.
+//
+// It goes through protocol.ConvertToMySQLError - the same mapping the protocol
+// server uses on its own ERR path - so neither the code nor the SQLSTATE is
+// ever re-derived. Both travel, because the code alone does not determine the
+// SQLSTATE: 1105 pairs with HY000 and with 23000. The
+// message is the mapped message, not err.Error(), because a *protocol.MySQLError
+// formats its own code into Error() and that string would then be sent as the
+// message text.
+func forwardFailure(err error) *ForwardQueryResponse {
+	mysqlErr := protocol.ConvertToMySQLError(err)
+	return &ForwardQueryResponse{
+		Success:      false,
+		ErrorMessage: mysqlErr.Message,
+		ErrorCode:    uint32(mysqlErr.Code),
+		SqlState:     mysqlErr.SQLState,
+	}
+}
+
 // HandleForwardQuery handles a forwarded query from a read-only replica
 func (h *ForwardHandler) HandleForwardQuery(ctx context.Context, req *ForwardQueryRequest) (*ForwardQueryResponse, error) {
 	if req.ReplicaNodeId == 0 || req.SessionId == 0 {
@@ -176,10 +198,7 @@ func (h *ForwardHandler) HandleForwardLoadData(ctx context.Context, req *Forward
 	return h.executeIdempotentLoad(ctx, session, req, func(connSession *protocol.ConnectionSession) *ForwardQueryResponse {
 		rs, err := h.coordHandler.HandleLoadData(connSession, req.Sql, req.Data)
 		if err != nil {
-			return &ForwardQueryResponse{
-				Success:      false,
-				ErrorMessage: err.Error(),
-			}
+			return forwardFailure(err)
 		}
 
 		resp := &ForwardQueryResponse{Success: true}
@@ -226,10 +245,7 @@ func (h *ForwardHandler) executeIdempotentRequest(
 		return execFn(connSession), nil
 	})
 	if execErr != nil {
-		resp = &ForwardQueryResponse{
-			Success:      false,
-			ErrorMessage: execErr.Error(),
-		}
+		resp = forwardFailure(execErr)
 	}
 	if resp == nil {
 		resp = &ForwardQueryResponse{Success: true}
@@ -252,10 +268,7 @@ func (h *ForwardHandler) handleDatabaseOp(connSession *protocol.ConnectionSessio
 
 	rs, err := h.coordHandler.HandleQuery(connSession, req.Sql, nil)
 	if err != nil {
-		return &ForwardQueryResponse{
-			Success:      false,
-			ErrorMessage: err.Error(),
-		}
+		return forwardFailure(err)
 	}
 
 	var rowsAffected int64
@@ -300,10 +313,7 @@ func (h *ForwardHandler) handleTxnControl(connSession *protocol.ConnectionSessio
 	rs, err := h.coordHandler.HandleQuery(connSession, sql, nil)
 	connSession.TranspilationEnabled = prevTranspilation
 	if err != nil {
-		return &ForwardQueryResponse{
-			Success:      false,
-			ErrorMessage: err.Error(),
-		}
+		return forwardFailure(err)
 	}
 
 	resp := &ForwardQueryResponse{Success: true}
@@ -342,10 +352,7 @@ func (h *ForwardHandler) handleStatement(connSession *protocol.ConnectionSession
 			Uint64("request_id", req.RequestId).
 			Str("sql", req.Sql).
 			Msg("Statement execution failed")
-		return &ForwardQueryResponse{
-			Success:      false,
-			ErrorMessage: execErr.Error(),
-		}
+		return forwardFailure(execErr)
 	}
 
 	var rowsAffected int64

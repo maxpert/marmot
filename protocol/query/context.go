@@ -106,6 +106,13 @@ type QueryOutput struct {
 	Database      string
 	IsValid       bool
 	ValidationErr error
+
+	// TranspileErr holds the error transpilation failed with, typed, when the
+	// failure came from a transformation rule rather than from parsing. The
+	// protocol layer needs the type to tell a rule's rejection (which carries
+	// its own MySQL error code) from a Vitess syntax error, without matching
+	// on message text. nil when parsing failed or nothing failed.
+	TranspileErr error
 }
 
 // TranspiledStatement represents a single transpiled SQL statement with parameters.
@@ -159,7 +166,7 @@ type QueryContext struct {
 	Input          QueryInput
 	Output         QueryOutput
 	MySQLState     *MySQLParseState // nil for SQLite dialect
-	SchemaLookup   func(table string) string
+	SchemaLookup   func(table string) *transform.SchemaInfo
 	SchemaProvider transform.SchemaProvider
 
 	// SkipTranspilation bypasses MySQL→SQLite transpilation when true.

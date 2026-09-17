@@ -116,10 +116,17 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 	// Convert proto statements to internal format
 	statements := make([]protocol.Statement, 0, len(req.Statements))
 	for _, stmt := range req.Statements {
-		internalStmt := protocolStatementFromProto(stmt)
+		internalStmt, err := protocolStatementFromProto(stmt)
+		if err != nil {
+			log.Error().Err(err).Uint64("txn_id", req.TxnId).Str("database", req.Database).Msg("Rejecting PREPARE: unrecognized statement on wire")
+			return &TransactionResponse{
+				Success:      false,
+				ErrorMessage: fmt.Sprintf("unrecognized statement: %v", err),
+			}, nil
+		}
+		// protocolStatementFromProto already copied SQL and the inline payload
+		// from this arm; only the out-of-band fetch below is still needed.
 		if loadData := stmt.GetLoadDataChange(); loadData != nil {
-			internalStmt.SQL = loadData.Sql
-			internalStmt.LoadDataPayload = loadData.Data
 			if len(internalStmt.LoadDataPayload) == 0 && loadData.LoadId != "" {
 				payload, err := rh.pullLoadDataPayload(ctx, req.SourceNodeId, loadData.LoadId, loadData.DataSize, loadData.ChunkBytes)
 				if err != nil {
@@ -183,7 +190,15 @@ func (rh *ReplicationHandler) handleCommit(ctx context.Context, req *Transaction
 	// durable from PREPARE; COMMIT may carry only DML intent metadata.
 	statements := make([]protocol.Statement, 0, len(req.Statements))
 	for _, stmt := range req.Statements {
-		statements = append(statements, protocolStatementFromProto(stmt))
+		internalStmt, err := protocolStatementFromProto(stmt)
+		if err != nil {
+			log.Error().Err(err).Uint64("txn_id", req.TxnId).Str("database", req.Database).Msg("Rejecting COMMIT: unrecognized statement on wire")
+			return &TransactionResponse{
+				Success:      false,
+				ErrorMessage: fmt.Sprintf("unrecognized statement: %v", err),
+			}, nil
+		}
+		statements = append(statements, internalStmt)
 	}
 
 	engineReq := &db.CommitRequest{

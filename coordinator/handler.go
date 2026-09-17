@@ -62,7 +62,10 @@ type DatabaseManager interface {
 
 // ReplicatedDatabaseProvider provides access to replicated database operations
 type ReplicatedDatabaseProvider interface {
-	ExecuteLocalWithHooks(ctx context.Context, txnID uint64, requests []ExecutionRequest) (PendingExecution, error)
+	// ExecuteLocalWithHooks executes ONE autocommit statement with CDC capture.
+	// It takes a single request, not a slice: the insert id it reports is the
+	// statement's own, and a batch would silently report the first statement's.
+	ExecuteLocalWithHooks(ctx context.Context, txnID uint64, req ExecutionRequest) (PendingExecution, error)
 	GetSchemaCache() interface{} // Returns *SchemaCache (using interface{} to avoid import cycle)
 	// DescribeResultColumns reports the columns a query returns without running it.
 	DescribeResultColumns(ctx context.Context, query string) ([]common.ResultColumn, error)
@@ -80,49 +83,12 @@ type ExecutionRequest struct {
 	Params []interface{}
 }
 
-// CDCMergeResult holds merged CDC data from preupdate hooks.
-type CDCMergeResult struct {
-	TableName string
-	IntentKey []byte
-	OldValues map[string][]byte
-	NewValues map[string][]byte
-}
-
-// MergeCDCEntries merges CDC entries captured by preupdate hooks.
-// For UPSERT (INSERT OR REPLACE), SQLite fires DELETE then INSERT hooks.
-// This function combines them to get complete old/new values.
-//
-// CRITICAL CONTRACT:
-//   - TableName is ALWAYS extracted from entries (hooks capture it)
-//   - Never rely on parsed SQL for TableName with CDC data
-//   - See TestMergeCDCEntries_TableNameRequired for enforcement
-func MergeCDCEntries(entries []common.CDCEntry) CDCMergeResult {
-	result := CDCMergeResult{
-		OldValues: make(map[string][]byte),
-		NewValues: make(map[string][]byte),
-	}
-
-	for _, e := range entries {
-		if len(result.IntentKey) == 0 {
-			result.IntentKey = e.IntentKey
-		}
-		if result.TableName == "" {
-			result.TableName = e.Table
-		}
-		for k, v := range e.OldValues {
-			result.OldValues[k] = v
-		}
-		for k, v := range e.NewValues {
-			result.NewValues[k] = v
-		}
-	}
-
-	return result
-}
-
 // PendingExecution represents a locally executed transaction waiting for quorum
 type PendingExecution interface {
 	GetTotalRowCount() int64
+	// GetLastInsertId returns the OK packet's insert id: the FIRST
+	// AUTO_INCREMENT value the statement generated, 0 when it generated none.
+	// The name mirrors MySQL's OK-packet field, not SQLite's last-rowid.
 	GetLastInsertId() int64
 	GetCDCEntries() []common.CDCEntry
 	Commit() error
@@ -330,12 +296,12 @@ func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, sq
 	var schemaLookup protocol.SchemaLookupFunc
 	if h.dbManager != nil && session.CurrentDatabase != "" {
 		dbName := session.CurrentDatabase
-		schemaLookup = func(table string) string {
-			col, err := h.dbManager.GetAutoIncrementColumn(dbName, table)
+		schemaLookup = func(table string) *transform.SchemaInfo {
+			info, err := h.dbManager.GetTranspilerSchema(dbName, table)
 			if err != nil {
-				return ""
+				return nil
 			}
-			return col
+			return info
 		}
 	}
 	schemaProvider := func(database, table string) *transform.SchemaInfo {
@@ -390,7 +356,7 @@ func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, sq
 	// statement Vitess only partially parsed) instead of forwarding the mangled
 	// SQL into the read/2PC path, where it produces a confusing downstream error.
 	if stmt.Type == protocol.StatementUnsupported && stmt.Error != "" {
-		return nil, protocol.NewMySQLError(protocol.ErrCodeParseError, protocol.SQLStateSyntax, stmt.Error)
+		return nil, protocol.UnsupportedStatementError(stmt)
 	}
 
 	// Handle SET commands: extract @@marmot_vec_* vars via Vitess AST; ignore others.
@@ -663,7 +629,7 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, params []in
 		// serialization order (see protocol.Statement.MergeExecParams).
 		execParams := stmt.MergeExecParams(params)
 		req := ExecutionRequest{SQL: stmt.SQL, Params: execParams}
-		pendingExec, err = replicatedDB.ExecuteLocalWithHooks(ctx, uint64(txnID), []ExecutionRequest{req})
+		pendingExec, err = replicatedDB.ExecuteLocalWithHooks(ctx, uint64(txnID), req)
 
 		if err != nil {
 			cancel() // Only cancel on error

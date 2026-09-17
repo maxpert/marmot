@@ -94,6 +94,7 @@ type ConnectionSession struct {
 
 	// LastInsertId stores the value returned by LAST_INSERT_ID().
 	// Updated after INSERT statements that generate auto-increment IDs.
+	// Write it only through RecordInsertId, which owns the zero rule.
 	LastInsertId atomic.Int64
 
 	// TranspilationEnabled controls MySQL→SQLite transpilation for this session.
@@ -568,9 +569,7 @@ func (s *MySQLServer) processQuery(conn net.Conn, session *ConnectionSession, qu
 		if rs != nil {
 			rowsAffected = rs.RowsAffected
 			lastInsertId = rs.LastInsertId
-			if lastInsertId != 0 {
-				session.LastInsertId.Store(lastInsertId)
-			}
+			session.RecordInsertId(lastInsertId)
 		}
 		_ = s.writeOK(conn, 1, session, rowsAffected, lastInsertId)
 		return
@@ -695,6 +694,24 @@ func (s *MySQLServer) writeErrorWithState(w io.Writer, seq byte, code uint16, sq
 	buf.WriteString(msg)
 
 	return s.writePacket(w, seq, buf.Bytes())
+}
+
+// RecordInsertId stores a statement's insert id as this session's
+// LAST_INSERT_ID(). It is the ONLY place the zero rule lives, and every path
+// that receives an insert id must go through it: the coordinator's own OK-packet
+// paths here, and a replica's forwarded responses in replica/handler.go.
+//
+// A zero id means the statement generated no AUTO_INCREMENT value - an INSERT
+// that inserted nothing, an upsert that updated an existing row, a table with no
+// auto-increment column. MySQL leaves LAST_INSERT_ID() unchanged in that case
+// ("The value of LAST_INSERT_ID() remains unchanged if no rows are successfully
+// inserted"), so a zero is dropped rather than stored. Storing it would reset a
+// value the client is entitled to keep reading.
+func (s *ConnectionSession) RecordInsertId(id int64) {
+	if id == 0 {
+		return
+	}
+	s.LastInsertId.Store(id)
 }
 
 // writeMySQLErr writes a MySQLError to the connection, extracting code/state from the error
@@ -1426,9 +1443,7 @@ func (s *MySQLServer) handleStmtExecute(conn net.Conn, session *ConnectionSessio
 		if rs != nil {
 			rowsAffected = rs.RowsAffected
 			lastInsertId = rs.LastInsertId
-			if lastInsertId != 0 {
-				session.LastInsertId.Store(lastInsertId)
-			}
+			session.RecordInsertId(lastInsertId)
 		}
 		_ = s.writeOK(conn, 1, session, rowsAffected, lastInsertId)
 	}

@@ -66,7 +66,7 @@ func TestInsertOrReplaceWithHooks(t *testing.T) {
 		SQL: "INSERT INTO test_upsert (id, value) VALUES ('key1', 'value1')",
 	}
 
-	pending1, err := replicatedDB.ExecuteLocalWithHooks(ctx, 1001, []coordinator.ExecutionRequest{req1})
+	pending1, err := replicatedDB.ExecuteLocalWithHooks(ctx, 1001, req1)
 	if err != nil {
 		t.Fatalf("Failed to execute INSERT: %v", err)
 	}
@@ -76,6 +76,12 @@ func TestInsertOrReplaceWithHooks(t *testing.T) {
 	t.Logf("INSERT captured %d CDC entries", len(entries1))
 	for _, e := range entries1 {
 		t.Logf("  Entry: intentKey=%s oldVals=%d newVals=%d", e.IntentKey, len(e.OldValues), len(e.NewValues))
+	}
+	// A plain INSERT of a fresh key touches exactly one row, so it must emit
+	// exactly one CDC entry. Reddens if the hook double-captures the row or
+	// captures a spurious implicit delete for a key that never existed.
+	if len(entries1) != 1 {
+		t.Fatalf("plain INSERT of a fresh key must emit exactly 1 CDC entry, got %d", len(entries1))
 	}
 
 	if err := pending1.Commit(); err != nil {
@@ -94,7 +100,7 @@ func TestInsertOrReplaceWithHooks(t *testing.T) {
 
 	t.Log("About to call ExecuteLocalWithHooks for INSERT OR REPLACE...")
 	start := time.Now()
-	pending2, err := replicatedDB.ExecuteLocalWithHooks(ctx2, 1002, []coordinator.ExecutionRequest{req2})
+	pending2, err := replicatedDB.ExecuteLocalWithHooks(ctx2, 1002, req2)
 	elapsed := time.Since(start)
 	t.Logf("ExecuteLocalWithHooks returned after %v", elapsed)
 
@@ -107,6 +113,15 @@ func TestInsertOrReplaceWithHooks(t *testing.T) {
 	t.Logf("INSERT OR REPLACE captured %d CDC entries", len(entries2))
 	for _, e := range entries2 {
 		t.Logf("  Entry: intentKey=%s oldVals=%d newVals=%d", e.IntentKey, len(e.OldValues), len(e.NewValues))
+	}
+	// INSERT OR REPLACE on an existing key is SQLite's implicit
+	// delete-then-insert: it must emit exactly 2 CDC entries (the delete of
+	// the old row plus the insert of the new one). This is what makes
+	// MySQL's affected_rows=2 for a REPLACE that actually replaced a row
+	// correct rather than accidental. Reddens if the hook collapses the pair
+	// into a single UPDATE-shaped entry, or captures only the insert half.
+	if len(entries2) != 2 {
+		t.Fatalf("INSERT OR REPLACE that replaces an existing row must emit exactly 2 CDC entries (implicit delete + insert), got %d", len(entries2))
 	}
 
 	if err := pending2.Commit(); err != nil {
@@ -172,7 +187,7 @@ func TestInsertOrReplaceNewRow(t *testing.T) {
 
 	t.Log("About to call ExecuteLocalWithHooks...")
 	start := time.Now()
-	pending, err := replicatedDB.ExecuteLocalWithHooks(ctx, 2001, []coordinator.ExecutionRequest{req})
+	pending, err := replicatedDB.ExecuteLocalWithHooks(ctx, 2001, req)
 	elapsed := time.Since(start)
 	t.Logf("ExecuteLocalWithHooks returned after %v", elapsed)
 
@@ -237,7 +252,7 @@ func TestLastInsertIdCapture(t *testing.T) {
 		SQL: "INSERT INTO test_autoincrement (value) VALUES ('first')",
 	}
 
-	pending1, err := replicatedDB.ExecuteLocalWithHooks(ctx1, 3001, []coordinator.ExecutionRequest{req1})
+	pending1, err := replicatedDB.ExecuteLocalWithHooks(ctx1, 3001, req1)
 	if err != nil {
 		t.Fatalf("Failed to execute INSERT: %v", err)
 	}
@@ -261,7 +276,7 @@ func TestLastInsertIdCapture(t *testing.T) {
 		SQL: "INSERT INTO test_autoincrement (value) VALUES ('second')",
 	}
 
-	pending2, err := replicatedDB.ExecuteLocalWithHooks(ctx2, 3002, []coordinator.ExecutionRequest{req2})
+	pending2, err := replicatedDB.ExecuteLocalWithHooks(ctx2, 3002, req2)
 	if err != nil {
 		t.Fatalf("Failed to execute second INSERT: %v", err)
 	}
@@ -285,15 +300,18 @@ func TestLastInsertIdCapture(t *testing.T) {
 		SQL: "UPDATE test_autoincrement SET value = 'updated' WHERE id = 1",
 	}
 
-	pending3, err := replicatedDB.ExecuteLocalWithHooks(ctx3, 3003, []coordinator.ExecutionRequest{req3})
+	pending3, err := replicatedDB.ExecuteLocalWithHooks(ctx3, 3003, req3)
 	if err != nil {
 		t.Fatalf("Failed to execute UPDATE: %v", err)
 	}
 
 	lastInsertId3 := pending3.GetLastInsertId()
 	t.Logf("UPDATE lastInsertId: %d", lastInsertId3)
+	// Reddens if EphemeralHookSession.ExecContext keeps reporting a stale
+	// sqlite3_last_insert_rowid() value from the earlier INSERT instead of 0
+	// for a statement that only updated rows.
 	if lastInsertId3 != 0 {
-		t.Logf("UPDATE returned lastInsertId=%d (expected 0, but may vary)", lastInsertId3)
+		t.Errorf("UPDATE must report lastInsertId=0, got %d", lastInsertId3)
 	}
 
 	if err := pending3.Commit(); err != nil {

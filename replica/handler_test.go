@@ -1,8 +1,16 @@
 package replica
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"os"
+	"strings"
 	"testing"
+
+	"github.com/mattn/go-sqlite3"
+	marmotgrpc "github.com/maxpert/marmot/grpc"
+	"google.golang.org/grpc"
 
 	"github.com/maxpert/marmot/db"
 	"github.com/maxpert/marmot/hlc"
@@ -600,5 +608,381 @@ func BenchmarkHandler_RejectMutation(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		handler.HandleQuery(session, "INSERT INTO users (name) VALUES ('test')", nil)
+	}
+}
+
+// TestForwardedInsertIdNeverResetBySentinelZero pins the rule that a forwarded
+// insert id of 0 must not overwrite the session's LAST_INSERT_ID().
+//
+// A leader reports 0 whenever a statement generated no AUTO_INCREMENT value: an
+// INSERT that inserted nothing, an upsert that updated an existing row, a table
+// with no auto-increment column. MySQL leaves LAST_INSERT_ID() unchanged there,
+// so a replica that stores the 0 wipes a value the client is entitled to keep.
+//
+// Mutation: make ConnectionSession.RecordInsertId store unconditionally, or
+// restore the direct session.LastInsertId.Store(resp.LastInsertId) at either
+// call site in applyForwardedSessionState. Every assertion below fires.
+func TestForwardedInsertIdNeverResetBySentinelZero(t *testing.T) {
+	h, _, cleanup := testHandler(t)
+	defer cleanup()
+
+	session := &protocol.ConnectionSession{}
+
+	// (b) a forwarded non-zero id becomes the session's value.
+	h.applyForwardedSessionState(session, &marmotgrpc.ForwardQueryResponse{LastInsertId: 41})
+	if got := session.LastInsertId.Load(); got != 41 {
+		t.Fatalf("after a forwarded id of 41, session LAST_INSERT_ID() = %d, want 41", got)
+	}
+
+	// (b) a later non-zero id replaces it.
+	h.applyForwardedSessionState(session, &marmotgrpc.ForwardQueryResponse{LastInsertId: 42})
+	if got := session.LastInsertId.Load(); got != 42 {
+		t.Fatalf("after a forwarded id of 42, session LAST_INSERT_ID() = %d, want 42", got)
+	}
+
+	// (a) a forwarded 0 leaves it alone, checked repeatedly rather than once:
+	// this is a safety property, so it must hold past its first success.
+	const noOpForwards = 3
+	observed := 0
+	for i := 0; i < noOpForwards; i++ {
+		h.applyForwardedSessionState(session, &marmotgrpc.ForwardQueryResponse{LastInsertId: 0})
+		if got := session.LastInsertId.Load(); got != 42 {
+			t.Fatalf("forward %d of 0 changed session LAST_INSERT_ID() to %d, want it to stay 42", i, got)
+		}
+		observed++
+	}
+	// Guards the loop against silently degrading to a single sample.
+	// Mutation: drop an iteration.
+	if observed != noOpForwards {
+		t.Fatalf("the zero-forward path ran %d times, want %d", observed, noOpForwards)
+	}
+
+	// The unrelated state the same helper carries must still be applied, or the
+	// guard would have been bought by skipping the whole response.
+	// Mutation: delete the ForwardedTxnActive assignment.
+	h.applyForwardedSessionState(session, &marmotgrpc.ForwardQueryResponse{LastInsertId: 0, InTransaction: true})
+	if !session.ForwardedTxnActive {
+		t.Fatal("a forwarded response with InTransaction=true did not set ForwardedTxnActive")
+	}
+}
+
+// TestSystemQueryReturnsRetainedInsertId is (c): the value a client actually
+// reads back. handleSystemQuery is the only path serving LAST_INSERT_ID() on a
+// replica, so a guard that held in the session but not here would be invisible.
+//
+// Mutation: make RecordInsertId store unconditionally; the retained 7 becomes 0.
+func TestSystemQueryReturnsRetainedInsertId(t *testing.T) {
+	h, _, cleanup := testHandler(t)
+	defer cleanup()
+
+	session := &protocol.ConnectionSession{}
+	h.applyForwardedSessionState(session, &marmotgrpc.ForwardQueryResponse{LastInsertId: 7})
+	h.applyForwardedSessionState(session, &marmotgrpc.ForwardQueryResponse{LastInsertId: 0})
+
+	stmt := protocol.ParseStatement("SELECT LAST_INSERT_ID()")
+	rs, err := h.handleSystemQuery(session, stmt)
+	if err != nil {
+		t.Fatalf("handleSystemQuery: %v", err)
+	}
+	if len(rs.Rows) != 1 || len(rs.Rows[0]) != 1 {
+		t.Fatalf("SELECT LAST_INSERT_ID() returned %d rows, want one row of one column: %#v", len(rs.Rows), rs.Rows)
+	}
+	if got := fmt.Sprintf("%v", rs.Rows[0][0]); got != "7" {
+		t.Fatalf("SELECT LAST_INSERT_ID() returned %s after a forwarded 0, want the retained 7", got)
+	}
+}
+
+// TestForwardedErrorCarriesTheLeadersCode pins the whole replica half of the
+// forwarded-error path: the leader's MySQL error code reaches the client, a
+// leader that sends no code still yields ER_UNKNOWN_ERROR, and the message is
+// never a formatted "ERROR <code> (<state>): ..." string.
+//
+// The formatted form this replaced had two defects. Its code was re-derived
+// downstream by protocol.ConvertToMySQLError's message matching, so a leader
+// message that merely contained the words "syntax error" arrived as 1064; and
+// the formatted prefix was duplicated into the ERR packet's message.
+func TestForwardedErrorCarriesTheLeadersCode(t *testing.T) {
+	cases := []struct {
+		name         string
+		code         uint32
+		sqlState     string
+		message      string
+		wantCode     uint16
+		wantSQLState string
+	}{
+		{
+			// The deliverable: D1's rule rejection keeps its own code across
+			// the wire instead of being flattened.
+			// Mutation: ignore resp.ErrorCode and always report 1105.
+			name: "a rule rejection keeps 1235", code: 1235, sqlState: protocol.SQLStateSyntax,
+			message:  "This version of MySQL doesn't yet support 'INSERT ... SELECT'",
+			wantCode: 1235, wantSQLState: protocol.SQLStateSyntax,
+		},
+		{
+			// The SQLSTATE is not on the wire; it must be derived, and derived
+			// the same way the coordinator's own ERR path derives it.
+			// Mutation: return SQLStateGeneral for every code.
+			name: "a duplicate key keeps 1062 and its integrity SQLSTATE", code: 1062, sqlState: protocol.SQLStateIntegrity,
+			message:  "Duplicate entry '7' for key 'PRIMARY'",
+			wantCode: 1062, wantSQLState: protocol.SQLStateIntegrity,
+		},
+		{
+			// Rolling upgrade: an older leader sends no code at all, and
+			// proto3 delivers that as 0. Behaviour must not change for it.
+			// Mutation: drop the `code == 0` branch; uint16(0) is reported.
+			name: "an old leader sending no code still yields 1105", code: 0, sqlState: "",
+			message:  "table is read only",
+			wantCode: protocol.ErrCodeUnknown, wantSQLState: protocol.SQLStateGeneral,
+		},
+		{
+			// The leader's wording is data, not a code: it must not be
+			// re-classified by the words inside it.
+			// Mutation: restore fmt.Errorf("ERROR 1105 (HY000): %s", message).
+			name: "a message containing the words syntax error is not re-classified", code: 0, sqlState: "",
+			message:  `near "x": syntax error`,
+			wantCode: protocol.ErrCodeUnknown, wantSQLState: protocol.SQLStateGeneral,
+		},
+		{
+			// Defensive: a current leader always fills both fields, so this
+			// shape can only come from a hand-built response. It must not put
+			// an empty SQLSTATE in the ERR packet.
+			// Mutation: drop the `sqlState == ""` fallback; the client gets "".
+			name: "a non-zero code with no SQLSTATE falls back to HY000", code: 1205, sqlState: "",
+			message:  "Lock wait timeout exceeded",
+			wantCode: protocol.ErrCodeLockTimeout, wantSQLState: protocol.SQLStateGeneral,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mysqlErr := protocol.ConvertToMySQLError(forwardedError(tc.code, tc.sqlState, tc.message))
+			if mysqlErr.Code != tc.wantCode {
+				t.Errorf("code = %d, want %d", mysqlErr.Code, tc.wantCode)
+			}
+			if mysqlErr.SQLState != tc.wantSQLState {
+				t.Errorf("SQLSTATE = %q, want %q", mysqlErr.SQLState, tc.wantSQLState)
+			}
+			// The client must see the leader's message, not one with a code
+			// spelled into it.
+			if mysqlErr.Message != tc.message {
+				t.Errorf("message = %q, want the leader's message %q verbatim", mysqlErr.Message, tc.message)
+			}
+		})
+	}
+}
+
+// leaderErrors are the shapes a leader's ConvertToMySQLError produces, with the
+// (code, SQLSTATE) pair a client connected directly to that leader would see.
+// The replica must reproduce the pair exactly; anything else means a client
+// gets a different answer from a replica than from a coordinator for the same
+// failure.
+//
+// The generic-constraint row is the one that matters: the leader pairs code
+// 1105 with TWO different SQLSTATEs (HY000 for an unclassified error, 23000 for
+// an unclassified *constraint* failure), so a replica that rebuilds the SQLSTATE
+// from the code alone has to guess, and guesses HY000.
+func leaderErrors() []struct {
+	name  string
+	err   error
+	state string
+} {
+	return []struct {
+		name  string
+		err   error
+		state string
+	}{
+		{"generic constraint failure", sqlite3.Error{Code: sqlite3.ErrConstraint, ExtendedCode: sqlite3.ErrConstraintTrigger}, protocol.SQLStateIntegrity},
+		{"unique violation", sqlite3.Error{Code: sqlite3.ErrConstraint, ExtendedCode: sqlite3.ErrConstraintUnique}, protocol.SQLStateIntegrity},
+		{"deadlock", protocol.ErrDeadlock(), protocol.SQLStateDeadlock},
+		{"server shutdown", protocol.ErrServerShutdown(), "08S01"},
+		{"read only", protocol.ErrReadOnly(), protocol.SQLStateGeneral},
+		{"lock timeout", protocol.ErrLockWaitTimeout(), protocol.SQLStateGeneral},
+	}
+}
+
+// TestForwardedErrorRoundTripsTheLeadersSQLState pins that the (code, SQLSTATE)
+// pair a replica client sees is the pair the leader itself produced.
+//
+// The two halves of the round trip are pinned separately because they live in
+// different packages: TestForwardFailureCarriesTheMySQLCode (package grpc) pins
+// that forwardFailure copies protocol.ConvertToMySQLError's output onto the
+// wire, and this test pins that forwardedError reproduces that same output. The
+// mapper is the shared seam, so neither test re-implements the other's half.
+func TestForwardedErrorRoundTripsTheLeadersSQLState(t *testing.T) {
+	for _, tc := range leaderErrors() {
+		t.Run(tc.name, func(t *testing.T) {
+			// What the leader puts on the wire.
+			leader := protocol.ConvertToMySQLError(tc.err)
+			if leader.SQLState != tc.state {
+				t.Fatalf("fixture is wrong: the leader maps this to SQLSTATE %q, not %q", leader.SQLState, tc.state)
+			}
+
+			// What the replica rebuilds from it.
+			replicaErr := protocol.ConvertToMySQLError(forwardedError(uint32(leader.Code), leader.SQLState, leader.Message))
+
+			if replicaErr.Code != leader.Code {
+				t.Errorf("code = %d, want the leader's %d", replicaErr.Code, leader.Code)
+			}
+			// Mutation: derive the SQLSTATE from the code instead of carrying
+			// it. The generic-constraint row then reports HY000 for 23000.
+			if replicaErr.SQLState != leader.SQLState {
+				t.Errorf("SQLSTATE = %q, want the leader's %q", replicaErr.SQLState, leader.SQLState)
+			}
+		})
+	}
+}
+
+// fakeLeaderClient stands in for the gRPC client a replica uses to reach its
+// leader. It embeds the interface so only the two methods the forwarding sites
+// actually call need bodies; everything else panics if it is ever reached,
+// which is what we want from a stand-in.
+type fakeLeaderClient struct {
+	marmotgrpc.MarmotServiceClient
+	err error
+}
+
+func (f fakeLeaderClient) ForwardQuery(context.Context, *marmotgrpc.ForwardQueryRequest, ...grpc.CallOption) (*marmotgrpc.ForwardQueryResponse, error) {
+	return nil, f.err
+}
+
+func (f fakeLeaderClient) ForwardLoadData(context.Context, *marmotgrpc.ForwardLoadDataRequest, ...grpc.CallOption) (*marmotgrpc.ForwardQueryResponse, error) {
+	return nil, f.err
+}
+
+// handlerWithLeaderClient builds a forwarding-enabled handler whose leader link
+// is the given client. A nil client reproduces "not connected"; a client that
+// returns an error reproduces "lost connection". Neither needs a live leader.
+func handlerWithLeaderClient(t *testing.T, client marmotgrpc.MarmotServiceClient) *ReadOnlyHandler {
+	t.Helper()
+	h, _, cleanup := testHandler(t)
+	t.Cleanup(cleanup)
+	h.forwardWrites = true
+	h.replica = &Replica{streamClient: &StreamClient{client: client}}
+	return h
+}
+
+// TestReplicaEmittedErrorCodesAreServerSide drives every site where this replica
+// raises an error of its own and asserts the code and SQLSTATE a client receives.
+//
+// The rule is that an ERR packet carries server-side codes only. 2003
+// (CR_CONN_HOST_ERROR) and 2013 (CR_SERVER_LOST) are client-library codes that no
+// MySQL server emits; a driver seeing one may tear the session down or reconnect
+// rather than surface a statement error, and they fire exactly when the leader
+// link is down, which is when a replica most wants the client to keep its
+// session. Master reported 1105/HY000 for both, with the number as decoration
+// inside the message, so 1105 is also the behaviour-preserving choice.
+//
+// 1046/3D000 stays: ER_NO_DB_ERROR is MySQL's own server code for that condition.
+func TestReplicaEmittedErrorCodesAreServerSide(t *testing.T) {
+	const noDatabase = "" // an unset Database is what reaches executeLocalRead
+
+	session := func() *protocol.ConnectionSession {
+		return &protocol.ConnectionSession{ConnID: 1, CurrentDatabase: "testdb"}
+	}
+	insert := protocol.Statement{SQL: "INSERT INTO users (name) VALUES ('x')", Database: "testdb"}
+	begin := protocol.Statement{SQL: "BEGIN", Type: protocol.StatementBegin, Database: "testdb"}
+
+	cases := []struct {
+		name         string
+		client       marmotgrpc.MarmotServiceClient
+		call         func(h *ReadOnlyHandler, s *protocol.ConnectionSession) error
+		wantCode     uint16
+		wantSQLState string
+		wantMessage  string
+	}{
+		{
+			name: "HandleLoadData, not connected", client: nil,
+			call: func(h *ReadOnlyHandler, s *protocol.ConnectionSession) error {
+				_, err := h.HandleLoadData(s, "LOAD DATA LOCAL INFILE 'x' INTO TABLE users", []byte("1\n"))
+				return err
+			},
+			wantCode: protocol.ErrCodeUnknown, wantSQLState: protocol.SQLStateGeneral,
+			wantMessage: "Not connected to leader",
+		},
+		{
+			name: "forwardMutation, not connected", client: nil,
+			call: func(h *ReadOnlyHandler, s *protocol.ConnectionSession) error {
+				_, err := h.forwardMutation(s, insert, nil)
+				return err
+			},
+			wantCode: protocol.ErrCodeUnknown, wantSQLState: protocol.SQLStateGeneral,
+			wantMessage: "Not connected to leader",
+		},
+		{
+			name: "forwardTxnControl, not connected", client: nil,
+			call: func(h *ReadOnlyHandler, s *protocol.ConnectionSession) error {
+				_, err := h.forwardTxnControl(s, begin)
+				return err
+			},
+			wantCode: protocol.ErrCodeUnknown, wantSQLState: protocol.SQLStateGeneral,
+			wantMessage: "Not connected to leader",
+		},
+		{
+			name: "HandleLoadData, lost connection", client: fakeLeaderClient{err: errors.New("boom")},
+			call: func(h *ReadOnlyHandler, s *protocol.ConnectionSession) error {
+				_, err := h.HandleLoadData(s, "LOAD DATA LOCAL INFILE 'x' INTO TABLE users", []byte("1\n"))
+				return err
+			},
+			wantCode: protocol.ErrCodeUnknown, wantSQLState: protocol.SQLStateGeneral,
+			wantMessage: "Lost connection to leader",
+		},
+		{
+			name: "forwardMutation, lost connection", client: fakeLeaderClient{err: errors.New("boom")},
+			call: func(h *ReadOnlyHandler, s *protocol.ConnectionSession) error {
+				_, err := h.forwardMutation(s, insert, nil)
+				return err
+			},
+			wantCode: protocol.ErrCodeUnknown, wantSQLState: protocol.SQLStateGeneral,
+			wantMessage: "Lost connection to leader",
+		},
+		{
+			name: "forwardTxnControl, lost connection", client: fakeLeaderClient{err: errors.New("boom")},
+			call: func(h *ReadOnlyHandler, s *protocol.ConnectionSession) error {
+				_, err := h.forwardTxnControl(s, begin)
+				return err
+			},
+			wantCode: protocol.ErrCodeUnknown, wantSQLState: protocol.SQLStateGeneral,
+			wantMessage: "Lost connection to leader",
+		},
+		{
+			// Not a leader-link failure, and deliberately not 1105: MySQL has
+			// its own server code for this one.
+			// Mutation: replace ErrCodeNoDB with ErrCodeUnknown.
+			name: "executeLocalRead, no database selected", client: nil,
+			call: func(h *ReadOnlyHandler, _ *protocol.ConnectionSession) error {
+				_, err := h.executeLocalRead(protocol.Statement{Database: noDatabase}, nil)
+				return err
+			},
+			wantCode: protocol.ErrCodeNoDB, wantSQLState: protocol.SQLStateNoDB,
+			wantMessage: "No database selected",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := handlerWithLeaderClient(t, tc.client)
+
+			err := tc.call(h, session())
+			if err == nil {
+				t.Fatalf("%s returned no error; the fixture did not reach the failure site", tc.name)
+			}
+
+			mysqlErr := protocol.ConvertToMySQLError(err)
+			// Mutation: put a client-side code back at any of these sites -
+			// 2003 at the not-connected sites, 2013 at the lost-connection
+			// ones - and the matching row fires here.
+			if mysqlErr.Code != tc.wantCode {
+				t.Errorf("code = %d, want %d", mysqlErr.Code, tc.wantCode)
+			}
+			if mysqlErr.SQLState != tc.wantSQLState {
+				t.Errorf("SQLSTATE = %q, want %q", mysqlErr.SQLState, tc.wantSQLState)
+			}
+			// Pins that the row reached the site it names rather than some
+			// other failure that happens to carry the same code.
+			// Mutation: swap two rows' call functions.
+			if !strings.Contains(mysqlErr.Message, tc.wantMessage) {
+				t.Errorf("message = %q, want it to contain %q", mysqlErr.Message, tc.wantMessage)
+			}
+		})
 	}
 }

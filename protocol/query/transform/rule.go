@@ -48,11 +48,14 @@ type SchemaInfo struct {
 	// Empty string if no auto-increment column exists.
 	// In SQLite, this is typically INTEGER PRIMARY KEY.
 	AutoIncrementColumn string
-}
 
-// HasPrimaryKey returns true if table has a PRIMARY KEY defined
-func (s *SchemaInfo) HasPrimaryKey() bool {
-	return s != nil && len(s.PrimaryKey) > 0
+	// AutoIncrementOrdinal is AutoIncrementColumn's position in the table's
+	// own column order, counting only columns a column-less
+	// "INSERT INTO t VALUES (...)" supplies a value for - that is, excluding
+	// GENERATED columns, which SQLite refuses to accept a value for. It is the
+	// index into such a statement's VALUES tuple that holds the id.
+	// -1 when AutoIncrementColumn is empty.
+	AutoIncrementOrdinal int
 }
 
 // HasAutoIncrement returns true if table has an auto-increment column

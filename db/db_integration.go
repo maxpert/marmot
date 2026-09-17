@@ -15,9 +15,6 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-// Ensure PendingLocalExecution implements coordinator.PendingExecution
-var _ coordinator.PendingExecution = (*PendingLocalExecution)(nil)
-
 // ReplicatedDatabase wraps a SQL database with distributed transaction support
 // This is the main integration point between application layer and transactional storage
 //
@@ -497,12 +494,6 @@ func (mdb *ReplicatedDatabase) ApplyCDCEntries(entries []*IntentEntry) error {
 	return mdb.txnMgr.applyCDCEntries(0, mdb.clock.Now(), entries)
 }
 
-// PendingLocalExecution represents a locally executed transaction waiting for quorum
-// The SQLite transaction is held open until Commit or Rollback is called
-type PendingLocalExecution struct {
-	session *EphemeralHookSession // Ephemeral session (owns its connection)
-}
-
 // CompletedLocalExecution represents a CDC capture that's already been rolled back.
 // Used by the new hookDB flow where we capture CDC then release the connection
 // BEFORE 2PC broadcast. Commit/Rollback are no-ops.
@@ -562,71 +553,13 @@ func (c *CompletedLocalExecution) GetCDCEntries() []common.CDCEntry {
 	return result
 }
 
-// GetLastInsertId returns the last insert ID from the most recent insert
+// GetLastInsertId returns the OK packet's insert id for this execution: the
+// first AUTO_INCREMENT value the statement generated, or 0 when it generated
+// none. The name mirrors MySQL's own OK-packet field and the coordinator
+// interface; the value is deliberately the FIRST id, not the last, which is
+// what SQLite's connection-wide last-rowid register would have given.
 func (c *CompletedLocalExecution) GetLastInsertId() int64 {
 	return c.lastInsertId
-}
-
-// GetTotalRowCount returns count from CDC entries.
-func (p *PendingLocalExecution) GetTotalRowCount() int64 {
-	entries := p.GetCDCEntries()
-	return int64(len(entries))
-}
-
-// Commit finalizes the local transaction
-func (p *PendingLocalExecution) Commit() error {
-	if p.session != nil {
-		return p.session.Commit()
-	}
-	return nil
-}
-
-// Rollback aborts the local transaction
-func (p *PendingLocalExecution) Rollback() error {
-	if p.session != nil {
-		return p.session.Rollback()
-	}
-	return nil
-}
-
-// GetIntentEntries returns CDC entries from the system database
-func (p *PendingLocalExecution) GetIntentEntries() ([]*IntentEntry, error) {
-	if p.session == nil {
-		return nil, nil
-	}
-	return p.session.GetIntentEntries()
-}
-
-// GetCDCEntries returns CDC data captured by hooks for replication
-func (p *PendingLocalExecution) GetCDCEntries() []common.CDCEntry {
-	if p.session == nil {
-		return nil
-	}
-	entries, err := p.session.GetIntentEntries()
-	if err != nil || len(entries) == 0 {
-		return nil
-	}
-	result := make([]common.CDCEntry, len(entries))
-	for i, e := range entries {
-		result[i] = common.CDCEntry{
-			Table:        e.Table,
-			IntentKey:    e.IntentKey,
-			Operation:    e.Operation,
-			OldValues:    e.OldValues,
-			NewValues:    e.NewValues,
-			EncodedRow:   e.EncodedRow,
-			EncodedCodec: e.EncodedCodec,
-		}
-	}
-	return result
-}
-
-// GetLastInsertId returns the last insert ID from the most recent insert
-func (p *PendingLocalExecution) GetLastInsertId() int64 {
-	if p.session == nil {
-		return 0
-	}
-	return p.session.GetLastInsertId()
 }
 
 // ExecuteLocalWithHooks executes SQL locally with preupdate hooks capturing CDC data.
@@ -643,7 +576,7 @@ func (p *PendingLocalExecution) GetLastInsertId() int64 {
 //
 // This design avoids deadlock: hookDB is released before 2PC broadcast,
 // so incoming COMMIT from other coordinators can acquire writeDB.
-func (mdb *ReplicatedDatabase) ExecuteLocalWithHooks(ctx context.Context, txnID uint64, requests []coordinator.ExecutionRequest) (coordinator.PendingExecution, error) {
+func (mdb *ReplicatedDatabase) ExecuteLocalWithHooks(ctx context.Context, txnID uint64, req coordinator.ExecutionRequest) (coordinator.PendingExecution, error) {
 	// Create ephemeral session with hookDB (NOT writeDB - avoids deadlock)
 	// SchemaCache must be pre-populated via ReloadSchema() before calling this
 	session, err := StartEphemeralSession(ctx, mdb.hookDB, mdb.metaStore, mdb.schemaCache, txnID)
@@ -658,7 +591,7 @@ func (mdb *ReplicatedDatabase) ExecuteLocalWithHooks(ctx context.Context, txnID 
 				cdcEntries:   nil,
 				lastInsertId: 0,
 				db:           mdb,
-				rowCount:     int64(len(requests)),
+				rowCount:     1,
 			}, nil
 		}
 		return nil, fmt.Errorf("failed to start session: %w", err)
@@ -670,18 +603,13 @@ func (mdb *ReplicatedDatabase) ExecuteLocalWithHooks(ctx context.Context, txnID 
 		return nil, fmt.Errorf("failed to begin transaction: %w", err)
 	}
 
-	// Execute each statement - hooks capture raw CDC data to Pebble.
+	// Execute the statement - hooks capture raw CDC data to Pebble.
 	// rows-affected is not used here: this autocommit path computes it from
 	// the captured CDC entries via CompletedLocalExecution.GetTotalRowCount.
-	for _, req := range requests {
-		if _, err := session.ExecContext(ctx, req.SQL, req.Params...); err != nil {
-			_ = session.Rollback()
-			return nil, fmt.Errorf("failed to execute statement: %w", err)
-		}
+	if _, err := session.ExecContext(ctx, req.SQL, req.Params...); err != nil {
+		_ = session.Rollback()
+		return nil, fmt.Errorf("failed to execute statement: %w", err)
 	}
-
-	// Get last insert ID BEFORE rollback (available immediately)
-	lastInsertId := session.GetLastInsertId()
 
 	// ROLLBACK hookDB - this also calls ProcessCapturedRows which converts
 	// raw captured data to IntentEntries
@@ -698,6 +626,12 @@ func (mdb *ReplicatedDatabase) ExecuteLocalWithHooks(ctx context.Context, txnID 
 		return nil, fmt.Errorf("failed to collect CDC entries: %w", err)
 	}
 	session.cleanup()
+
+	// The insert id comes from this statement's own CDC entries, not from
+	// SQLite's connection-wide last-rowid register: hookDB is capped at one
+	// connection, so that register is shared by every client in turn. The
+	// signature takes one request, so cdcEntries cannot span two statements.
+	lastInsertId := statementInsertID(mdb.schemaCache, cdcEntries)
 
 	// Return completed execution with captured CDC data
 	return &CompletedLocalExecution{
@@ -731,7 +665,7 @@ func (p *pinnedHookSession) ExecuteStatement(ctx context.Context, sql string, pa
 	if err := p.session.captureAndLockNewRows(); err != nil {
 		return 0, 0, err
 	}
-	return rowsAffected, p.session.GetLastInsertId(), nil
+	return rowsAffected, p.session.StatementInsertID(), nil
 }
 
 func (p *pinnedHookSession) Query(ctx context.Context, sqlText string, params []interface{}) ([]string, []map[string]interface{}, error) {

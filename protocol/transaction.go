@@ -128,6 +128,12 @@ type Statement struct {
 	IntentKey []byte        `msgpack:"IntentKey"` // Intent key for MVCC conflict detection (binary format)
 	Error     string        `msgpack:"Error"`     // Error message if Type is StatementUnsupported
 
+	// TranspileErr is the typed error transpilation failed with, set only when
+	// a transformation rule refused the statement (never when parsing failed).
+	// It carries the MySQL error code the client must see; Error holds the same
+	// failure as text. Never replicated: a peer re-parses from SQL.
+	TranspileErr error `msgpack:"-"`
+
 	// CDC: Row-level change data (for DML operations)
 	// Decoded local apply state. Replication sends EncodedRow, not raw SQL.
 	OldValues map[string][]byte `msgpack:"OldValues"` // Before image (for UPDATE/DELETE)
