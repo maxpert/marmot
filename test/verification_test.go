@@ -19,6 +19,8 @@ import (
 )
 
 // MockNodeProvider implements coordinator.NodeProvider
+func (m *MockNodeProvider) HasSeedNodes() bool { return false }
+
 type MockNodeProvider struct {
 	nodes []uint64
 }

@@ -79,6 +79,10 @@ type ServerConfig struct {
 	Address          string
 	Port             int
 	AdvertiseAddress string
+	// DataDir is where the node registry persists cluster membership so a
+	// restart does not compute a quorum from a membership of one. Empty
+	// disables persistence (tests, embedded use without a data directory).
+	DataDir string
 }
 
 // NewServer creates a new gRPC server
@@ -93,7 +97,7 @@ func NewServer(config ServerConfig) (*Server, error) {
 	}
 
 	// Initialize components with advertise address
-	s.registry = NewNodeRegistry(config.NodeID, config.AdvertiseAddress)
+	s.registry = NewNodeRegistryWithDataDir(config.NodeID, config.AdvertiseAddress, config.DataDir)
 	s.gossip = NewGossipProtocol(config.NodeID, s.registry)
 
 	// Set up callback to connect to nodes when they become ALIVE

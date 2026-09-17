@@ -419,7 +419,7 @@ func main() {
 
 	// Phase 7: Setup transaction coordinators for full database replication
 	log.Info().Msg("Setting up transaction coordinators")
-	nodeProvider := marmotgrpc.NewGossipNodeProvider(gossip.GetNodeRegistry())
+	nodeProvider := marmotgrpc.NewGossipNodeProvider(gossip.GetNodeRegistry(), len(cfg.Config.Cluster.SeedNodes) > 0)
 	replicator := marmotgrpc.NewGRPCReplicator(client)
 
 	writeTimeout := time.Duration(cfg.Config.Replication.WriteTimeoutMS) * time.Millisecond
@@ -609,6 +609,7 @@ func initializeGRPCServer() (*marmotgrpc.Server, error) {
 		Address:          cfg.Config.Cluster.GRPCBindAddress,
 		Port:             cfg.Config.Cluster.GRPCPort,
 		AdvertiseAddress: cfg.Config.Cluster.GRPCAdvertiseAddress,
+		DataDir:          cfg.Config.DataDir,
 	}
 
 	server, err := marmotgrpc.NewServer(config)

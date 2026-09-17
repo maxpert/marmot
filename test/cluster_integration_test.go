@@ -456,7 +456,7 @@ func startNode(t *testing.T, node *testNode, seedNodes []string) {
 	node.antiEntropy.Start()
 
 	// Setup coordinators
-	nodeProvider := marmotgrpc.NewGossipNodeProvider(gossip.GetNodeRegistry())
+	nodeProvider := marmotgrpc.NewGossipNodeProvider(gossip.GetNodeRegistry(), false)
 	replicator := marmotgrpc.NewGRPCReplicator(client)
 
 	localReplicator := db.NewLocalReplicator(node.nodeID, dbMgr, node.clock)

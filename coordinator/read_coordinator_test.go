@@ -25,6 +25,8 @@ func (m *mockReaderOld) ReadSnapshot(ctx context.Context, nodeID uint64, req *Re
 }
 
 // Mock NodeProvider for testing (old tests)
+func (m *mockNodeProviderOld) HasSeedNodes() bool { return false }
+
 type mockNodeProviderOld struct {
 	nodes []uint64
 }

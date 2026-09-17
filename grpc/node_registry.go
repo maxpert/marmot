@@ -1,7 +1,10 @@
 package grpc
 
 import (
+	"encoding/binary"
 	"fmt"
+	"hash/fnv"
+	"sort"
 	"sync"
 	"time"
 
@@ -43,10 +46,34 @@ type NodeRegistry struct {
 	onNodeDeadFunc    func(*NodeState) // Callback when node transitions to DEAD
 	onNodeLeavingFunc func()           // Callback when local node marked LEAVING via remote decommission
 	callbackMu        sync.RWMutex
+
+	// store persists membership so a restarted node does not compute a quorum
+	// from a membership of one. nil disables persistence.
+	store *membershipStore
+	// persistedFingerprint is the membership the snapshot on disk describes.
+	// It lets the persist hook skip the write when a mutator changed something
+	// the snapshot does not record, so an fsync only happens on a real change.
+	persistedFingerprint uint64
 }
 
-// NewNodeRegistry creates a new node registry
+// NewNodeRegistry creates a new node registry with no durable membership.
+// Used by tests and by any embedding that has no data directory; production
+// goes through NewNodeRegistryWithDataDir so a restart can re-learn what the
+// cluster looked like.
 func NewNodeRegistry(localNodeID uint64, advertiseAddress string) *NodeRegistry {
+	return NewNodeRegistryWithDataDir(localNodeID, advertiseAddress, "")
+}
+
+// NewNodeRegistryWithDataDir creates a registry that persists membership under
+// dataDir and restores it before returning.
+//
+// Restoring matters because quorum is a majority of TOTAL membership. A registry
+// that starts with self only makes a lone restarted node its own majority, so it
+// can commit a write - or, once narrow id ranges exist, grant itself a range -
+// that overlaps a live peer's. The invariant this establishes: a node that has
+// ever known a multi-node membership does not compute a quorum from fewer
+// members than it last knew, until gossip re-learns membership from a live peer.
+func NewNodeRegistryWithDataDir(localNodeID uint64, advertiseAddress string, dataDir string) *NodeRegistry {
 	log.Debug().
 		Uint64("node_id", localNodeID).
 		Str("advertise_address", advertiseAddress).
@@ -57,6 +84,7 @@ func NewNodeRegistry(localNodeID uint64, advertiseAddress string) *NodeRegistry 
 		localNodeID: localNodeID,
 		nodes:       make(map[uint64]*NodeState),
 		lastSeen:    make(map[uint64]time.Time),
+		store:       newMembershipStore(dataDir),
 	}
 
 	// Add self to registry as ALIVE
@@ -69,10 +97,19 @@ func NewNodeRegistry(localNodeID uint64, advertiseAddress string) *NodeRegistry 
 	}
 	nr.lastSeen[localNodeID] = now
 
-	// Initialize cluster metrics with self
 	nr.mu.Lock()
+	restored := nr.restoreMembershipLocked()
+	// Initialize cluster metrics with the membership we start from.
 	nr.updateClusterMetricsLocked()
 	nr.mu.Unlock()
+
+	if restored > 0 {
+		log.Info().
+			Uint64("node_id", localNodeID).
+			Int("restored_peers", restored).
+			Int("membership", nr.Count()).
+			Msg("BOOT: Restored persisted cluster membership; peers start SUSPECT until gossip confirms them")
+	}
 
 	log.Debug().
 		Uint64("node_id", localNodeID).
@@ -127,6 +164,15 @@ func (nr *NodeRegistry) Update(node *NodeState) {
 
 	// Rule 4: Apply SWIM state update rules
 	stateChanged := false
+	// recordReplaced is separate from stateChanged because the higher-incarnation
+	// branch swaps the whole record: address and incarnation can change with the
+	// status staying put. Persistence must follow the record, not just the
+	// status - a peer that restarted on a new address, or refuted a suspicion,
+	// otherwise stayed at its old address and incarnation on disk, and a restart
+	// restored the stale one. The stale incarnation is the dangerous half: SWIM
+	// compares incarnations to decide who wins, so an older rumour could then
+	// overwrite the record.
+	recordReplaced := false
 	if node.Incarnation > existing.Incarnation {
 		// Higher incarnation always wins, EXCEPT:
 		// - REMOVED status is sticky (can only be cleared via admin API AllowRejoin)
@@ -151,6 +197,7 @@ func (nr *NodeRegistry) Update(node *NodeState) {
 			Uint64("new_inc", node.Incarnation).
 			Msg("REGISTRY: Updating node (higher incarnation)")
 		nr.nodes[node.NodeId] = node
+		recordReplaced = true
 
 		// Record state transition if status changed
 		if oldStatus != node.Status {
@@ -189,8 +236,10 @@ func (nr *NodeRegistry) Update(node *NodeState) {
 	}
 	// Ignore updates with same/older incarnation that don't escalate
 
-	// Update cluster metrics if state changed
-	if stateChanged {
+	// Refresh metrics and persist when the record changed at all. The persist
+	// hook fingerprints exactly the fields the snapshot stores, so a call here
+	// that changed nothing it records performs no write.
+	if stateChanged || recordReplaced {
 		nr.updateClusterMetricsLocked()
 	}
 
@@ -873,6 +922,121 @@ func (nr *NodeRegistry) updateClusterMetricsLocked() {
 	} else {
 		telemetry.ClusterQuorumAvailable.Set(0)
 	}
+
+	nr.persistMembershipLocked()
+}
+
+// membershipFingerprintLocked summarises exactly the state the snapshot records,
+// so the persist hook can tell a real membership change from a mutator that
+// touched something the snapshot does not store.
+func (nr *NodeRegistry) membershipFingerprintLocked() uint64 {
+	ids := make([]uint64, 0, len(nr.nodes))
+	for id := range nr.nodes {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+
+	h := fnv.New64a()
+	var buf [8]byte
+	write := func(v uint64) {
+		binary.LittleEndian.PutUint64(buf[:], v)
+		_, _ = h.Write(buf[:])
+	}
+	for _, id := range ids {
+		node := nr.nodes[id]
+		write(id)
+		write(uint64(node.Status))
+		write(node.Incarnation)
+		_, _ = h.Write([]byte(node.Address))
+	}
+	return h.Sum64()
+}
+
+// persistMembershipLocked writes the snapshot when the membership actually
+// changed. It runs under the registry's write lock, which is acceptable because
+// it is reached only on a real membership change - never from TouchLastSeen,
+// the per-heartbeat path - and a synchronous write has no window in which a
+// crash loses the very change that would have widened the quorum denominator.
+func (nr *NodeRegistry) persistMembershipLocked() {
+	if nr.store == nil {
+		return
+	}
+
+	fingerprint := nr.membershipFingerprintLocked()
+	if fingerprint == nr.persistedFingerprint {
+		return
+	}
+
+	snapshot := membershipSnapshot{Nodes: make([]membershipSnapshotNode, 0, len(nr.nodes))}
+	for id, node := range nr.nodes {
+		snapshot.Nodes = append(snapshot.Nodes, membershipSnapshotNode{
+			NodeID:      id,
+			Address:     node.Address,
+			Incarnation: node.Incarnation,
+			Status:      int32(node.Status),
+		})
+	}
+
+	if err := nr.store.save(snapshot); err != nil {
+		// Not fatal: the running node's in-memory membership is still correct.
+		// The cost is that a restart falls back to self-only membership, which
+		// the seed-node belt in coordinator.GetClusterState still refuses to
+		// treat as a quorum.
+		log.Error().Err(err).Msg("Failed to persist cluster membership snapshot")
+		return
+	}
+	nr.persistedFingerprint = fingerprint
+}
+
+// restoreMembershipLocked loads the persisted membership and returns how many
+// peers it restored. Caller holds the write lock and has already added self.
+//
+// Restored peers enter as SUSPECT rather than at their persisted status: this
+// node has heard from none of them since booting, so their liveness is unknown.
+// SUSPECT counts toward TOTAL membership (Count) and is excluded from
+// GetAliveNodes, which is exactly the fail-closed shape wanted - the quorum
+// denominator is restored immediately while nothing is treated as reachable
+// until gossip says so.
+//
+// REMOVED stays REMOVED, so a decommissioned peer does not come back as a
+// member. Incarnation is restored because SWIM refutation compares incarnations:
+// Update() rejects an update whose incarnation is not newer (see the SWIM rules
+// in Update), so a peer that has moved on refutes our stale record and wins,
+// while a restored record is not silently overwritten by an older rumour.
+func (nr *NodeRegistry) restoreMembershipLocked() int {
+	snapshot, ok := nr.store.load()
+	if !ok {
+		return 0
+	}
+
+	restored := 0
+	for _, record := range snapshot.Nodes {
+		if record.NodeID == nr.localNodeID {
+			// Self is ALIVE by construction and was added by the caller.
+			continue
+		}
+
+		status := NodeStatus_SUSPECT
+		if NodeStatus(record.Status) == NodeStatus_REMOVED {
+			status = NodeStatus_REMOVED
+		}
+
+		nr.nodes[record.NodeID] = &NodeState{
+			NodeId:      record.NodeID,
+			Address:     record.Address,
+			Status:      status,
+			Incarnation: record.Incarnation,
+		}
+		// Deliberately NOT time.Now(): a restored peer has not been seen, and
+		// dating it now would delay the failure detector by a full timeout.
+		nr.lastSeen[record.NodeID] = time.Time{}
+		restored++
+	}
+
+	// The snapshot we just read is what is on disk; record it so an unchanged
+	// membership does not rewrite the same bytes on the first mutation.
+	nr.persistedFingerprint = nr.membershipFingerprintLocked()
+	return restored
 }
 
 // QuorumInfo returns quorum calculation information

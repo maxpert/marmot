@@ -25,6 +25,10 @@ func (p *BenchNodeProvider) GetAliveNodes() ([]uint64, error) { return p.nodes, 
 func (p *BenchNodeProvider) GetClusterSize() int              { return len(p.nodes) }
 func (p *BenchNodeProvider) GetTotalMembershipSize() int      { return len(p.nodes) }
 
+// HasSeedNodes is false: the benchmark harness is a single-node deployment, so
+// the quorum-of-one belt in GetClusterState does not apply to it.
+func (p *BenchNodeProvider) HasSeedNodes() bool { return false }
+
 // NewBenchHandler builds a CoordinatorHandler wired only for the read + vector
 // rewrite paths — suitable for benchmark tooling (cmd/vec-bench). Writes,
 // DDL, schema-version replication, and node-membership broadcasts are all
