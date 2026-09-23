@@ -27,6 +27,14 @@ const (
 	// ErrCodeNotSupportedYet is MySQL's ER_NOT_SUPPORTED_YET: the server
 	// understands the statement but does not implement this form of it.
 	ErrCodeNotSupportedYet uint16 = 1235
+
+	// ErrCodeTableAccessDenied is MySQL's ER_TABLEACCESS_DENIED_ERROR: the
+	// table exists but the client is not permitted to touch it.
+	ErrCodeTableAccessDenied uint16 = 1142
+
+	// ErrCodeDataOutOfRange is MySQL's ER_WARN_DATA_OUT_OF_RANGE: a value used
+	// in an operation is outside the range its target can represent.
+	ErrCodeDataOutOfRange uint16 = 1264
 )
 
 // SQLSTATE constants.
@@ -43,4 +51,7 @@ const (
 	// used for ER_SERVER_SHUTDOWN.
 	SQLStateConnFailure = "08S01"
 	SQLStateNoDB        = "3D000"
+	// SQLStateDataOutOfRange is MySQL's SQLSTATE class for
+	// ER_WARN_DATA_OUT_OF_RANGE.
+	SQLStateDataOutOfRange = "22003"
 )

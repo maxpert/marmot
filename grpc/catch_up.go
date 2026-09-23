@@ -16,6 +16,8 @@ import (
 	"github.com/maxpert/marmot/db/snapshot"
 	"github.com/rs/zerolog/log"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // CatchUpStrategy determines how a node should catch up with the cluster
@@ -78,30 +80,6 @@ func (c *CatchUpClient) persistSchemaVersions(versions map[string]uint64) error 
 	return persistSnapshotSchemaVersions(c.dataDir, versions)
 }
 
-// SchemaVersionRestoreError indicates that a snapshot's database files were
-// already swapped onto disk before restoring its schema versions failed. A
-// caller that reopens database connections only on success must still reopen
-// them when it sees this error: the files changed underneath the old
-// connection regardless of whether the schema version could be recorded.
-type SchemaVersionRestoreError struct {
-	err error
-}
-
-func (e *SchemaVersionRestoreError) Error() string { return e.err.Error() }
-func (e *SchemaVersionRestoreError) Unwrap() error { return e.err }
-
-// FilesSwappedDespiteError reports whether err indicates that a snapshot's
-// database files were already swapped onto disk, even though the overall
-// catch-up operation failed. Callers must still reopen database connections in
-// that case, or they keep serving stale connections against fresh files.
-func FilesSwappedDespiteError(err error) bool {
-	if err == nil {
-		return true
-	}
-	var schemaErr *SchemaVersionRestoreError
-	return errors.As(err, &schemaErr)
-}
-
 // CatchUpFromPeer downloads a snapshot of a specific database from a peer
 // Used by anti-entropy to trigger snapshots for lagging databases
 func (c *CatchUpClient) CatchUpFromPeer(ctx context.Context, peerNodeID uint64, peerAddr string, database string) error {
@@ -120,23 +98,31 @@ func (c *CatchUpClient) CatchUpFromPeer(ctx context.Context, peerNodeID uint64, 
 
 	client := NewMarmotServiceClient(conn)
 
-	// Get snapshot info (will include all databases, we filter later)
-	snapshotInfo, err := client.GetSnapshotInfo(ctx, &SnapshotInfoRequest{
-		RequestingNodeId: c.nodeID,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to get snapshot info: %w", err)
+	// Take the database out of service before the peer describes and takes
+	// its snapshot and keep it out until its file is replaced, so no write is
+	// ACKed into a file this restore then discards; the reattach opens
+	// whatever file is in place, the peer's or, if the restore failed first,
+	// the old one. A detach whose drain did not finish leaves the file in
+	// place: a write that passed the gate first may still commit into it.
+	dbMgr := c.dbManager.Load()
+	if dbMgr == nil {
+		return fmt.Errorf("catch-up of %s needs the running node's DatabaseManager", database)
 	}
-
-	log.Info().
-		Str("database", database).
-		Uint64("snapshot_txn_id", snapshotInfo.SnapshotTxnId).
-		Int64("size_bytes", snapshotInfo.SnapshotSizeBytes).
-		Msg("Received snapshot info for database")
-
-	// Apply snapshot for this database
-	if err := c.applySnapshot(ctx, client, snapshotInfo); err != nil {
-		return fmt.Errorf("failed to apply snapshot: %w", err)
+	var snapshotInfo *SnapshotInfoResponse
+	var applyErr error
+	switch detachErr := dbMgr.DetachDatabase(ctx, database); {
+	case errors.Is(detachErr, db.ErrDrainIncomplete):
+		applyErr = fmt.Errorf("restore of %s aborted before replacing its file: %w", database, detachErr)
+	case detachErr != nil:
+		return fmt.Errorf("failed to detach %s for restore: %w", database, detachErr)
+	default:
+		snapshotInfo, applyErr = c.downloadDatabaseSnapshot(ctx, client, database)
+	}
+	if err := dbMgr.AttachDatabase(database); err != nil {
+		return errors.Join(applyErr, fmt.Errorf("failed to reattach %s after restore: %w", database, err))
+	}
+	if applyErr != nil {
+		return fmt.Errorf("failed to apply snapshot: %w", applyErr)
 	}
 
 	log.Info().
@@ -145,6 +131,31 @@ func (c *CatchUpClient) CatchUpFromPeer(ctx context.Context, peerNodeID uint64, 
 		Msg("Snapshot download completed for database")
 
 	return nil
+}
+
+// downloadDatabaseSnapshot gets the peer's snapshot info for database alone
+// and streams and installs that database's file. Both requests name the
+// database, so the peer refuses them only while that database is out of
+// service there, not while another of its databases awaits a restore.
+func (c *CatchUpClient) downloadDatabaseSnapshot(ctx context.Context, client MarmotServiceClient, database string) (*SnapshotInfoResponse, error) {
+	snapshotInfo, err := client.GetSnapshotInfo(ctx, &SnapshotInfoRequest{
+		RequestingNodeId: c.nodeID,
+		Database:         database,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get snapshot info: %w", err)
+	}
+
+	log.Info().
+		Str("database", database).
+		Uint64("snapshot_txn_id", snapshotInfo.SnapshotTxnId).
+		Int64("size_bytes", snapshotInfo.SnapshotSizeBytes).
+		Msg("Received snapshot info for database")
+
+	if err := c.applySnapshot(ctx, client, snapshotInfo, database); err != nil {
+		return nil, err
+	}
+	return snapshotInfo, nil
 }
 
 // CatchUp performs the full catch-up process
@@ -174,24 +185,23 @@ func (c *CatchUpClient) CatchUp(ctx context.Context) (uint64, error) {
 
 	client := NewMarmotServiceClient(conn)
 
-	// Step 1: Get snapshot info
-	snapshotInfo, err := client.GetSnapshotInfo(ctx, &SnapshotInfoRequest{
-		RequestingNodeId: c.nodeID,
-	})
-	if err != nil {
-		return 0, fmt.Errorf("failed to get snapshot info: %w", err)
+	// Steps 1 and 2, retried while the seed's snapshot is unavailable (a
+	// database of its own is out of service for a restore) until ctx ends.
+	var snapshotInfo *SnapshotInfoResponse
+	for {
+		snapshotInfo, err = c.downloadFullSnapshot(ctx, client)
+		if status.Code(err) != codes.Unavailable {
+			break
+		}
+		log.Warn().Err(err).Str("seed", seedAddr).Msg("Seed snapshot unavailable, retrying")
+		select {
+		case <-ctx.Done():
+			return 0, errors.Join(err, ctx.Err())
+		case <-time.After(snapshotRetryInterval):
+		}
 	}
-
-	log.Info().
-		Uint64("snapshot_txn_id", snapshotInfo.SnapshotTxnId).
-		Int64("size_bytes", snapshotInfo.SnapshotSizeBytes).
-		Int32("total_chunks", snapshotInfo.TotalChunks).
-		Int("databases", len(snapshotInfo.Databases)).
-		Msg("Received snapshot info")
-
-	// Step 2: Stream and apply snapshot
-	if err := c.applySnapshot(ctx, client, snapshotInfo); err != nil {
-		return 0, fmt.Errorf("failed to apply snapshot: %w", err)
+	if err != nil {
+		return 0, err
 	}
 
 	// Step 3: Apply delta changes (transactions after snapshot)
@@ -203,6 +213,33 @@ func (c *CatchUpClient) CatchUp(ctx context.Context) (uint64, error) {
 		Msg("Catch-up completed successfully - node stays JOINING until fully initialized")
 
 	return snapshotInfo.SnapshotTxnId, nil
+}
+
+// snapshotRetryInterval is how long CatchUp waits before asking a seed again
+// whose snapshot is unavailable.
+const snapshotRetryInterval = time.Second
+
+// downloadFullSnapshot gets the seed's snapshot info (step 1) and streams and
+// applies every database in it (step 2).
+func (c *CatchUpClient) downloadFullSnapshot(ctx context.Context, client MarmotServiceClient) (*SnapshotInfoResponse, error) {
+	snapshotInfo, err := client.GetSnapshotInfo(ctx, &SnapshotInfoRequest{
+		RequestingNodeId: c.nodeID,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get snapshot info: %w", err)
+	}
+
+	log.Info().
+		Uint64("snapshot_txn_id", snapshotInfo.SnapshotTxnId).
+		Int64("size_bytes", snapshotInfo.SnapshotSizeBytes).
+		Int32("total_chunks", snapshotInfo.TotalChunks).
+		Int("databases", len(snapshotInfo.Databases)).
+		Msg("Received snapshot info")
+
+	if err := c.applySnapshot(ctx, client, snapshotInfo, ""); err != nil {
+		return nil, fmt.Errorf("failed to apply snapshot: %w", err)
+	}
+	return snapshotInfo, nil
 }
 
 // findAvailableSeed finds an available seed node to catch up from
@@ -254,7 +291,15 @@ func (c *CatchUpClient) checkNodeAvailable(ctx context.Context, addr string) boo
 
 // applySnapshot downloads and applies a snapshot from the seed node.
 // Uses the unified snapshot.Restorer for atomic download and apply.
-func (c *CatchUpClient) applySnapshot(ctx context.Context, client MarmotServiceClient, info *SnapshotInfoResponse) error {
+//
+// database names the one database to install, or is empty to install every
+// file the snapshot carries (startup catch-up, before any database is open).
+// A running node must name its database: every other file, the system
+// database included, is open and in use, and swapping it would leave its
+// connections writing to an unlinked file while the next restart loads the
+// peer's copy. A system database that is installed has this node's
+// AUTO_INCREMENT claim bases merged into it first, so none is ever lowered.
+func (c *CatchUpClient) applySnapshot(ctx context.Context, client MarmotServiceClient, info *SnapshotInfoResponse, database string) error {
 	log.Info().Msg("Downloading snapshot using unified restorer")
 
 	// Create data directory structure
@@ -265,32 +310,30 @@ func (c *CatchUpClient) applySnapshot(ctx context.Context, client MarmotServiceC
 		return fmt.Errorf("failed to create databases directory: %w", err)
 	}
 
-	// Stream snapshot
+	// Stream the snapshot: every database, or only database when named.
 	stream, err := client.StreamSnapshot(ctx, &SnapshotRequest{
 		RequestingNodeId: c.nodeID,
+		Database:         database,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to start snapshot stream: %w", err)
 	}
 
-	// Convert gRPC DatabaseFileInfo to snapshot.DatabaseFileInfo
-	files := make([]snapshot.DatabaseFileInfo, 0, len(info.Databases))
-	for _, dbInfo := range info.Databases {
-		files = append(files, snapshot.DatabaseFileInfo{
-			Name:           dbInfo.Name,
-			Filename:       dbInfo.Filename,
-			SizeBytes:      dbInfo.SizeBytes,
-			SHA256Checksum: dbInfo.Sha256Checksum,
-		})
+	files, err := snapshotFilesToRestore(info.Databases, database)
+	if err != nil {
+		return err
 	}
 
 	// Create adapter for gRPC stream
 	adapter := &grpcSnapshotStreamAdapter{stream: stream}
 
-	// Use snapshot.Restorer for atomic download and apply
-	// Note: For cluster catch-up, we don't have a connection manager since
-	// the DatabaseManager hasn't been initialized yet
+	// Use snapshot.Restorer for atomic download and apply. It is given no
+	// ConnectionManager: during startup catch-up nothing is open yet, and on a
+	// running node CatchUpFromPeer has detached the database for the whole
+	// restore. Closing the pools here instead would nil them under callers
+	// that already hold the database.
 	restorer := snapshot.NewRestorer(c.dataDir, nil)
+	restorer.SetSystemDBMerge(db.RaiseAutoIncBasesFrom)
 
 	if err := restorer.RestoreFromStream(adapter, files); err != nil {
 		return fmt.Errorf("snapshot restore failed: %w", err)
@@ -304,10 +347,11 @@ func (c *CatchUpClient) applySnapshot(ctx context.Context, client MarmotServiceC
 	// files (the stream trailer) over the earlier, potentially stale read from
 	// GetSnapshotInfo.
 	versions := SnapshotVersionsForRestore(info.DatabaseMetadata, stream)
+	if database != "" {
+		versions = versionsFor(versions, database)
+	}
 	if err := c.persistSchemaVersions(versions); err != nil {
-		return &SchemaVersionRestoreError{
-			err: fmt.Errorf("failed to restore schema versions from snapshot: %w", err),
-		}
+		return fmt.Errorf("failed to restore schema versions from snapshot: %w", err)
 	}
 
 	log.Info().
@@ -315,6 +359,36 @@ func (c *CatchUpClient) applySnapshot(ctx context.Context, client MarmotServiceC
 		Msg("Snapshot applied successfully via unified restorer")
 
 	return nil
+}
+
+// snapshotFilesToRestore converts a snapshot's file list into the restorer's
+// form, keeping only database when it is non-empty.
+func snapshotFilesToRestore(databases []*DatabaseFileInfo, database string) ([]snapshot.DatabaseFileInfo, error) {
+	files := make([]snapshot.DatabaseFileInfo, 0, len(databases))
+	for _, dbInfo := range databases {
+		if database != "" && dbInfo.Name != database {
+			continue
+		}
+		files = append(files, snapshot.DatabaseFileInfo{
+			Name:           dbInfo.Name,
+			Filename:       dbInfo.Filename,
+			SizeBytes:      dbInfo.SizeBytes,
+			SHA256Checksum: dbInfo.Sha256Checksum,
+		})
+	}
+	if database != "" && len(files) == 0 {
+		return nil, fmt.Errorf("peer snapshot carries no database %q", database)
+	}
+	return files, nil
+}
+
+// versionsFor keeps only database's entry of a snapshot's schema versions.
+func versionsFor(versions map[string]uint64, database string) map[string]uint64 {
+	v, ok := versions[database]
+	if !ok {
+		return nil
+	}
+	return map[string]uint64{database: v}
 }
 
 // grpcSnapshotStreamAdapter adapts MarmotService_StreamSnapshotClient to snapshot.ChunkReceiver

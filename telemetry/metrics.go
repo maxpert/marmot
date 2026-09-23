@@ -134,9 +134,6 @@ var (
 	// RowLockTransactions tracks number of transactions holding row locks
 	RowLockTransactions Gauge = NoopStat{}
 
-	// RowLockGCMarkers tracks number of GC markers pending cleanup
-	RowLockGCMarkers Gauge = NoopStat{}
-
 	// RowLockTables tracks number of tables with active locks
 	RowLockTables Gauge = NoopStat{}
 )
@@ -309,10 +306,6 @@ func InitMetrics() {
 		"row_lock_transactions",
 		"Number of transactions holding row locks",
 	)
-	RowLockGCMarkers = NewGauge(
-		"row_lock_gc_markers",
-		"Number of GC markers pending cleanup",
-	)
 	RowLockTables = NewGauge(
 		"row_lock_tables",
 		"Number of tables with active locks",
@@ -320,9 +313,8 @@ func InitMetrics() {
 }
 
 // UpdateRowLockStats updates row lock gauges from stats
-func UpdateRowLockStats(activeLocks, activeTransactions, gcMarkers, tablesWithLocks int) {
+func UpdateRowLockStats(activeLocks, activeTransactions, tablesWithLocks int) {
 	RowLocksActive.Set(float64(activeLocks))
 	RowLockTransactions.Set(float64(activeTransactions))
-	RowLockGCMarkers.Set(float64(gcMarkers))
 	RowLockTables.Set(float64(tablesWithLocks))
 }

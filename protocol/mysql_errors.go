@@ -10,36 +10,39 @@ import (
 // below protocol - which cannot import protocol without an import cycle -
 // can reference the same numbers instead of duplicating them.
 const (
-	ErrCodeUnknown         = mysqlcode.ErrCodeUnknown
-	ErrCodeBadNull         = mysqlcode.ErrCodeBadNull
-	ErrCodeTableExists     = mysqlcode.ErrCodeTableExists
-	ErrCodeBadField        = mysqlcode.ErrCodeBadField
-	ErrCodeDupFieldName    = mysqlcode.ErrCodeDupFieldName
-	ErrCodeDupEntry        = mysqlcode.ErrCodeDupEntry
-	ErrCodeParseError      = mysqlcode.ErrCodeParseError
-	ErrCodeTooBigRowsize   = mysqlcode.ErrCodeTooBigRowsize
-	ErrCodeNoSuchTable     = mysqlcode.ErrCodeNoSuchTable
-	ErrCodeNoDB            = mysqlcode.ErrCodeNoDB
-	ErrCodeLockTimeout     = mysqlcode.ErrCodeLockTimeout
-	ErrCodeDeadlock        = mysqlcode.ErrCodeDeadlock
-	ErrCodeReadOnly        = mysqlcode.ErrCodeReadOnly
-	ErrCodeServerShutdown  = mysqlcode.ErrCodeServerShutdown
-	ErrCodeNoReferencedRow = mysqlcode.ErrCodeNoReferencedRow
-	ErrCodeCheckConstraint = mysqlcode.ErrCodeCheckConstraint
+	ErrCodeUnknown           = mysqlcode.ErrCodeUnknown
+	ErrCodeBadNull           = mysqlcode.ErrCodeBadNull
+	ErrCodeTableExists       = mysqlcode.ErrCodeTableExists
+	ErrCodeBadField          = mysqlcode.ErrCodeBadField
+	ErrCodeDupFieldName      = mysqlcode.ErrCodeDupFieldName
+	ErrCodeDupEntry          = mysqlcode.ErrCodeDupEntry
+	ErrCodeParseError        = mysqlcode.ErrCodeParseError
+	ErrCodeTooBigRowsize     = mysqlcode.ErrCodeTooBigRowsize
+	ErrCodeNoSuchTable       = mysqlcode.ErrCodeNoSuchTable
+	ErrCodeNoDB              = mysqlcode.ErrCodeNoDB
+	ErrCodeLockTimeout       = mysqlcode.ErrCodeLockTimeout
+	ErrCodeDeadlock          = mysqlcode.ErrCodeDeadlock
+	ErrCodeReadOnly          = mysqlcode.ErrCodeReadOnly
+	ErrCodeServerShutdown    = mysqlcode.ErrCodeServerShutdown
+	ErrCodeNoReferencedRow   = mysqlcode.ErrCodeNoReferencedRow
+	ErrCodeCheckConstraint   = mysqlcode.ErrCodeCheckConstraint
+	ErrCodeTableAccessDenied = mysqlcode.ErrCodeTableAccessDenied
+	ErrCodeDataOutOfRange    = mysqlcode.ErrCodeDataOutOfRange
 )
 
 // SQLSTATE constants. Values live in protocol/mysqlcode; see above.
 const (
-	SQLStateGeneral     = mysqlcode.SQLStateGeneral
-	SQLStateIntegrity   = mysqlcode.SQLStateIntegrity
-	SQLStateSyntax      = mysqlcode.SQLStateSyntax
-	SQLStateDeadlock    = mysqlcode.SQLStateDeadlock
-	SQLStateTableExists = mysqlcode.SQLStateTableExists
-	SQLStateNoSuchTable = mysqlcode.SQLStateNoSuchTable
-	SQLStateNoSuchCol   = mysqlcode.SQLStateNoSuchCol
-	SQLStateDupColumn   = mysqlcode.SQLStateDupColumn
-	SQLStateConnFailure = mysqlcode.SQLStateConnFailure
-	SQLStateNoDB        = mysqlcode.SQLStateNoDB
+	SQLStateGeneral        = mysqlcode.SQLStateGeneral
+	SQLStateIntegrity      = mysqlcode.SQLStateIntegrity
+	SQLStateSyntax         = mysqlcode.SQLStateSyntax
+	SQLStateDeadlock       = mysqlcode.SQLStateDeadlock
+	SQLStateTableExists    = mysqlcode.SQLStateTableExists
+	SQLStateNoSuchTable    = mysqlcode.SQLStateNoSuchTable
+	SQLStateNoSuchCol      = mysqlcode.SQLStateNoSuchCol
+	SQLStateDupColumn      = mysqlcode.SQLStateDupColumn
+	SQLStateConnFailure    = mysqlcode.SQLStateConnFailure
+	SQLStateNoDB           = mysqlcode.SQLStateNoDB
+	SQLStateDataOutOfRange = mysqlcode.SQLStateDataOutOfRange
 )
 
 // MySQLError represents a MySQL protocol error with error code and SQLSTATE

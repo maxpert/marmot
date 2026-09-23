@@ -113,11 +113,13 @@ func protocolStatementFromProto(stmt *Statement) (protocol.Statement, error) {
 	}
 
 	internalStmt := protocol.Statement{
-		SQL:       stmt.GetSQL(),
-		Type:      code,
-		TableName: stmt.TableName,
-		Database:  stmt.Database,
-		IntentKey: stmt.GetIntentKey(),
+		SQL:                stmt.GetSQL(),
+		Type:               code,
+		TableName:          stmt.TableName,
+		Database:           stmt.Database,
+		IntentKey:          stmt.GetIntentKey(),
+		AutoIDClaim:        stmt.GetAutoIdClaim(),
+		AutoIDClaimPayload: stmt.GetAutoIdClaimPayload(),
 	}
 
 	switch payload := stmt.Payload.(type) {

@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -71,6 +72,7 @@ type TransactionManager struct {
 	batchCommitter           *SQLiteBatchCommitter        // SQLite write batcher (nil if disabled)
 	notifier                 CDCNotifier                  // Injected, can be nil
 	vectorCDCNotifier        VectorCDCNotifier            // Injected, can be nil
+	autoIncClaimStore        *AutoIncClaimStore           // AUTO_INCREMENT claim store; always backed by the system database
 }
 
 // NewTransactionManager creates a new transaction manager
@@ -167,6 +169,26 @@ func (tm *TransactionManager) SetVectorCDCNotifier(notifier VectorCDCNotifier) {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 	tm.vectorCDCNotifier = notifier
+}
+
+// SetAutoIncClaimStore injects the AUTO_INCREMENT claim store used by
+// seedAutoIncBasesForDDL (db/autoinc_seed.go). The store always backs onto
+// the system database, never onto tm's own db; DatabaseManager.wireGCCoordination
+// wires the same store instance into every TransactionManager, user and
+// system alike (db/database_manager.go).
+func (tm *TransactionManager) SetAutoIncClaimStore(s *AutoIncClaimStore) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	tm.autoIncClaimStore = s
+}
+
+// autoIncClaimStoreAndDatabaseName returns the injected claim store and this
+// manager's database name under a single read lock, for callers (currently
+// only seedAutoIncBasesForDDL) that need both together.
+func (tm *TransactionManager) autoIncClaimStoreAndDatabaseName() (*AutoIncClaimStore, string) {
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+	return tm.autoIncClaimStore, tm.databaseName
 }
 
 // BeginTransaction starts a new distributed transaction with auto-generated ID
@@ -292,6 +314,10 @@ func (tm *TransactionManager) CommitTransaction(txn *Transaction) error {
 			txn.Statements = tm.rebuildStatementsFromCDC(cdcEntries, nil)
 		}
 	} else {
+		if statementsNamePreparedRows(txn.Statements) {
+			return fmt.Errorf("transaction %d: %w", txn.ID, ErrPreparedRowsMissing)
+		}
+
 		// Statement/DDL path: flush pending DML first to ensure isolation
 		if tm.batchCommitEnabled() {
 			tm.batchCommitter.Flush()
@@ -333,6 +359,27 @@ func (tm *TransactionManager) CommitTransaction(txn *Transaction) error {
 	tm.cleanupAfterCommit(txn)
 
 	return nil
+}
+
+// ErrPreparedRowsMissing refuses the COMMIT of a transaction that names DML
+// rows whose captured images are gone. Every such row was captured at PREPARE
+// (createDMLIntent refuses a DML row without its image), so finding none means
+// something discarded them - the stale-transaction GC aborting the transaction
+// while this COMMIT was under way, or a recovery that dropped them - and
+// committing would ACK a write this node never applied.
+var ErrPreparedRowsMissing = errors.New("prepared DML rows are gone; refusing to commit nothing")
+
+// statementsNamePreparedRows reports whether statements carry a DML row that
+// PREPARE captured: a row change with an intent key. An INSERT without one
+// (an auto-increment key the CDC hook assigns) and an AUTO_INCREMENT claim
+// capture nothing at PREPARE.
+func statementsNamePreparedRows(statements []protocol.Statement) bool {
+	for _, stmt := range statements {
+		if protocol.IsDML(stmt) && len(stmt.IntentKey) > 0 && !stmt.AutoIDClaim {
+			return true
+		}
+	}
+	return false
 }
 
 func (tm *TransactionManager) notifyVectorCDC(txn *Transaction, entries []*IntentEntry) {
@@ -483,6 +530,7 @@ func (tm *TransactionManager) applyNonDMLIntents(txnID uint64, intents []*WriteI
 	})
 
 	hasDDL := false
+	var ddlTables []ddlTableOwner
 	for _, intent := range nonDMLIntents {
 		var vectorChange common.VectorIndexChange
 		if err := DeserializeData(intent.DataSnapshot, &vectorChange); err == nil && vectorChange.Action != 0 {
@@ -509,6 +557,7 @@ func (tm *TransactionManager) applyNonDMLIntents(txnID uint64, intents []*WriteI
 			return fmt.Errorf("failed to execute DDL statement: %w", err)
 		}
 		hasDDL = true
+		ddlTables = append(ddlTables, ddlTableOwner{table: intent.TableName, owner: intent.NodeID})
 
 		log.Debug().Uint64("txn_id", txnID).Str("sql", intent.SQLStatement).Msg("DDL statement executed")
 	}
@@ -520,6 +569,22 @@ func (tm *TransactionManager) applyNonDMLIntents(txnID uint64, intents []*WriteI
 	if hasDDL && tm.schemaCache != nil {
 		if err := tm.reloadSchemaCache(); err != nil {
 			return fmt.Errorf("failed to reload schema cache after DDL (txn %d): %w", txnID, err)
+		}
+	}
+
+	// Seed __marmot__autoinc for every table this DDL tagged AUTO_INCREMENT,
+	// after the DDL has executed and the schema cache reflects it. The claim table now lives in the system database - a
+	// separate SQLite file from tm.db (db/autoinc_claim.go) - so the seed can
+	// no longer share the DDL's own transaction the way it once did: it is
+	// written in its own system-database transaction, still before this
+	// COMMIT is ACKed. A seeding failure therefore still fails the DDL apply
+	// and the COMMIT with it, the same durability boundary
+	// AutoIncClaimStore.ApplyClaims relies on for the claim itself: a table
+	// left untagged here would let a subsequent range claim be evaluated
+	// against a missing base row.
+	if len(ddlTables) > 0 {
+		if err := tm.seedAutoIncBasesForDDL(ddlTables); err != nil {
+			return fmt.Errorf("failed to seed auto-increment base after DDL (txn %d): %w", txnID, err)
 		}
 	}
 

@@ -1,9 +1,11 @@
 package db
 
 import (
+	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -29,10 +31,20 @@ type DatabaseProvider interface {
 	GetDatabase(name string) (*ReplicatedDatabase, error)
 }
 
-// DatabaseManager manages multiple MVCC databases
+// DatabaseManager manages multiple MVCC databases.
+//
+// Locking: mu guards the maps and the wiring fields and is only ever held for
+// map access and wiring, never while a database's GC is stopped, because a GC
+// pass takes mu (GetMinAppliedTxnID, and anti-entropy's refresh through
+// ListDatabases). lifecycleMu serialises the operations that open, close,
+// register or delete a database (Create, Drop, Detach, Attach, Import, Close),
+// so one of them can close a database outside mu while the others wait; no GC
+// pass ever takes lifecycleMu.
 type DatabaseManager struct {
+	lifecycleMu              sync.Mutex
 	mu                       sync.RWMutex
 	databases                map[string]*ReplicatedDatabase
+	detached                 map[string]*detachedDatabase // user databases out of service for a snapshot restore
 	systemDB                 *ReplicatedDatabase
 	dataDir                  string
 	nodeID                   uint64
@@ -40,6 +52,7 @@ type DatabaseManager struct {
 	refreshReplicationStates RefreshReplicationStatesFunc // Callback to refresh peer states before GC
 	cdcHub                   CDCHub                       // CDC notification hub, can be nil
 	vecIndexMgr              *VectorIndexManager          // Optional vector index manager
+	autoIncClaimStore        *AutoIncClaimStore           // AUTO_INCREMENT claim store, backed by systemDB
 }
 
 // DatabaseMetadata represents database registry information
@@ -53,6 +66,7 @@ type DatabaseMetadata struct {
 func NewDatabaseManager(dataDir string, nodeID uint64, clock *hlc.Clock) (*DatabaseManager, error) {
 	dm := &DatabaseManager{
 		databases: make(map[string]*ReplicatedDatabase),
+		detached:  make(map[string]*detachedDatabase),
 		dataDir:   dataDir,
 		nodeID:    nodeID,
 		clock:     clock,
@@ -94,15 +108,20 @@ func (dm *DatabaseManager) initSystemDatabase() error {
 		return fmt.Errorf("failed to create system meta store: %w", err)
 	}
 
-	systemDB, err := NewReplicatedDatabase(systemDBPath, dm.nodeID, dm.clock, metaStore)
+	// The system database holds the AUTO_INCREMENT claim bases, and a claim
+	// COMMIT this node ACKs counts toward the majority the claim protocol's
+	// safety rests on: the base must survive an OS crash or power loss, not
+	// only a process crash. User databases keep synchronous=NORMAL.
+	systemDB, err := NewReplicatedDatabase(systemDBPath, dm.nodeID, dm.clock, metaStore, WithDurableCommits())
 	if err != nil {
 		metaStore.Close()
 		return fmt.Errorf("failed to create system database: %w", err)
 	}
 
-	// Wire up GC coordination for system database
-	dm.wireGCCoordination(systemDB, SystemDatabaseName)
-
+	// dm.systemDB must be assigned BEFORE wireGCCoordination runs: that call
+	// wires the AUTO_INCREMENT claim store (db/autoinc_claim.go), which is
+	// always backed by dm.systemDB, and wireGCCoordination is itself called
+	// below for this very database.
 	dm.systemDB = systemDB
 
 	// Add system database to the databases map so it can be retrieved via GetDatabase()
@@ -119,6 +138,16 @@ func (dm *DatabaseManager) initSystemDatabase() error {
 	if err != nil {
 		return fmt.Errorf("failed to create database registry table: %w", err)
 	}
+
+	// Create the AUTO_INCREMENT claim table (db/autoinc_claim.go). It lives
+	// here, in the system database, rather than in each user database: see
+	// AutoIncClaimTable's doc comment for why.
+	if _, err = systemDB.GetDB().Exec(autoIncClaimDDL); err != nil {
+		return fmt.Errorf("failed to create auto-increment claim table: %w", err)
+	}
+
+	// Wire up GC coordination for system database
+	dm.wireGCCoordination(systemDB, SystemDatabaseName)
 
 	log.Info().Str("path", systemDBPath).Msg("System database initialized")
 	return nil
@@ -180,7 +209,7 @@ func (dm *DatabaseManager) openDatabase(name, path string) error {
 // This ensures transaction logs are retained until all peers have applied them
 //
 // NOTE: This function must NOT acquire dm.mu as it is called from contexts
-// that already hold the write lock (CreateDatabase, ReopenDatabase, etc.)
+// that already hold the write lock (CreateDatabase, AttachDatabase, etc.)
 // or during single-threaded initialization. Reading refreshReplicationStates
 // is safe because the caller either has exclusive access via write lock
 // or we're in initialization before any concurrent access is possible.
@@ -201,6 +230,19 @@ func (dm *DatabaseManager) wireGCCoordination(mdb *ReplicatedDatabase, dbName st
 	}
 	if dm.vecIndexMgr != nil {
 		txnMgr.SetVectorCDCNotifier(dm.vecIndexMgr)
+	}
+
+	// Wire the AUTO_INCREMENT claim store (db/autoinc_claim.go). It always
+	// backs onto the system database, never onto mdb itself, so this wires the
+	// same store instance into every TransactionManager - user databases and
+	// the system database alike. dm.systemDB is nil only during the brief
+	// window before initSystemDatabase assigns it, which precedes this
+	// function's own call for the system database.
+	if dm.systemDB != nil {
+		if dm.autoIncClaimStore == nil {
+			dm.autoIncClaimStore = NewAutoIncClaimStore(dm.systemDB)
+		}
+		txnMgr.SetAutoIncClaimStore(dm.autoIncClaimStore)
 	}
 }
 
@@ -292,11 +334,19 @@ func (dm *DatabaseManager) CreateDatabase(name string) error {
 		return fmt.Errorf("cannot create system database")
 	}
 
-	dm.mu.Lock()
-	defer dm.mu.Unlock()
+	dm.lifecycleMu.Lock()
+	defer dm.lifecycleMu.Unlock()
 
 	// Check if database already exists - return success for idempotency (IF NOT EXISTS semantics)
-	if _, exists := dm.databases[name]; exists {
+	dm.mu.RLock()
+	_, exists := dm.databases[name]
+	detached := dm.detached[name]
+	dm.mu.RUnlock()
+	if detached != nil && detached.dropped {
+		// Its files go when the restore that holds them ends (AttachDatabase).
+		return fmt.Errorf("database %s is being dropped: %w", name, ErrDatabaseDetached)
+	}
+	if exists || detached != nil {
 		log.Debug().Str("database", name).Msg("Database already exists, returning success")
 		return nil
 	}
@@ -318,9 +368,6 @@ func (dm *DatabaseManager) CreateDatabase(name string) error {
 		return fmt.Errorf("failed to create database file: %w", err)
 	}
 
-	// Wire up GC coordination for newly created database
-	dm.wireGCCoordination(db, name)
-
 	// Register in system database
 	createdAt := time.Now().UnixNano()
 	_, err = dm.systemDB.GetDB().Exec(
@@ -329,19 +376,28 @@ func (dm *DatabaseManager) CreateDatabase(name string) error {
 	)
 	if err != nil {
 		db.Close()
-		metaStore.Close()
 		os.Remove(fullPath)
 		cleanupMetaStoreFiles(fullPath)
 		return fmt.Errorf("failed to register database in system: %w", err)
 	}
 
+	// Wire up GC coordination only once the database is registered: until
+	// then its GC cannot reach mu, so the failure path above can close it.
+	dm.mu.Lock()
+	dm.wireGCCoordination(db, name)
 	dm.databases[name] = db
+	dm.mu.Unlock()
 	log.Info().Str("name", name).Str("path", dbPath).Msg("Database created")
 	return nil
 }
 
 // DropDatabase drops a database
 // Returns nil if database doesn't exist (idempotent for IF EXISTS semantics)
+//
+// A database detached for a snapshot restore is dropped at once in the
+// registry; its files go when the restore ends (AttachDatabase), and until
+// then it no longer exists for lookups. A database whose reattach failed is
+// dropped outright.
 func (dm *DatabaseManager) DropDatabase(name string) error {
 	if name == SystemDatabaseName {
 		return fmt.Errorf("cannot drop system database")
@@ -351,12 +407,16 @@ func (dm *DatabaseManager) DropDatabase(name string) error {
 		return fmt.Errorf("cannot drop default database")
 	}
 
-	dm.mu.Lock()
-	defer dm.mu.Unlock()
+	dm.lifecycleMu.Lock()
+	defer dm.lifecycleMu.Unlock()
+
+	dm.mu.RLock()
+	db, exists := dm.databases[name]
+	detached := dm.detached[name]
+	dm.mu.RUnlock()
 
 	// Check if database exists - if not, return success (idempotent)
-	db, exists := dm.databases[name]
-	if !exists {
+	if (!exists && detached == nil) || (detached != nil && detached.dropped) {
 		log.Info().Str("name", name).Msg("Database does not exist, DROP is no-op")
 		return nil
 	}
@@ -369,6 +429,7 @@ func (dm *DatabaseManager) DropDatabase(name string) error {
 	if err != nil {
 		return fmt.Errorf("failed to get database path: %w", err)
 	}
+	fullPath := filepath.Join(dm.dataDir, dbPath)
 
 	// Remove from registry
 	_, err = dm.systemDB.GetDB().Exec("DELETE FROM __marmot_databases WHERE name = ?", name)
@@ -376,42 +437,75 @@ func (dm *DatabaseManager) DropDatabase(name string) error {
 		return fmt.Errorf("failed to remove database from registry: %w", err)
 	}
 
-	// Close database connection
+	// Remove this database's AUTO_INCREMENT claim rows (db/autoinc_claim.go).
+	// DROP TABLE deliberately does NOT reach this path and leaves its row in
+	// place; only DROP DATABASE removes claim rows.
+	_, err = dm.systemDB.GetDB().Exec("DELETE FROM "+AutoIncClaimTable+" WHERE db = ?", name)
+	if err != nil {
+		return fmt.Errorf("failed to remove auto-increment claims for database %s: %w", name, err)
+	}
+
+	if detached != nil {
+		dm.mu.Lock()
+		if !detached.restoreFailed {
+			detached.dropped = true
+			detached.dropPath = fullPath
+			dm.mu.Unlock()
+			log.Info().Str("name", name).Msg("Database dropped; its files go when its snapshot restore ends")
+			return nil
+		}
+		delete(dm.detached, name)
+		dm.mu.Unlock()
+		if err := detached.metaStore.Close(); err != nil {
+			log.Error().Err(err).Str("name", name).Msg("Failed to close meta store")
+		}
+		removeDatabaseFiles(fullPath)
+		log.Info().Str("name", name).Msg("Database dropped")
+		return nil
+	}
+
+	// Out of the map under mu, closed outside it (see DatabaseManager).
+	dm.mu.Lock()
+	delete(dm.databases, name)
+	dm.mu.Unlock()
 	if err := db.Close(); err != nil {
 		log.Error().Err(err).Str("name", name).Msg("Failed to close database")
 	}
-
-	// Delete from map
-	delete(dm.databases, name)
-
-	// Delete database files
-	fullPath := filepath.Join(dm.dataDir, dbPath)
-	if err := os.Remove(fullPath); err != nil && !os.IsNotExist(err) {
-		log.Error().Err(err).Str("path", fullPath).Msg("Failed to delete database file")
-	}
-
-	// Delete WAL and SHM files
-	os.Remove(fullPath + "-wal")
-	os.Remove(fullPath + "-shm")
-
-	// Delete meta database directory (PebbleDB)
-	metaPath := strings.TrimSuffix(fullPath, ".db") + "_meta.pebble"
-	os.RemoveAll(metaPath)
+	removeDatabaseFiles(fullPath)
 
 	log.Info().Str("name", name).Msg("Database dropped")
 	return nil
+}
+
+// removeDatabaseFiles deletes a closed database's SQLite file, its WAL and SHM
+// files, and its meta store directory.
+func removeDatabaseFiles(fullPath string) {
+	if err := os.Remove(fullPath); err != nil && !os.IsNotExist(err) {
+		log.Error().Err(err).Str("path", fullPath).Msg("Failed to delete database file")
+	}
+	os.Remove(fullPath + "-wal")
+	os.Remove(fullPath + "-shm")
+	cleanupMetaStoreFiles(fullPath)
 }
 
 // GetDatabase returns a database by name
 func (dm *DatabaseManager) GetDatabase(name string) (*ReplicatedDatabase, error) {
 	dm.mu.RLock()
 	defer dm.mu.RUnlock()
+	return dm.getDatabaseLocked(name)
+}
 
+// getDatabaseLocked returns the database in service under name, or
+// ErrDatabaseDetached while it is out of service for a restore. Caller must
+// hold mu.
+func (dm *DatabaseManager) getDatabaseLocked(name string) (*ReplicatedDatabase, error) {
 	db, exists := dm.databases[name]
 	if !exists {
+		if detached := dm.detached[name]; detached != nil && !detached.dropped {
+			return nil, fmt.Errorf("database %s: %w", name, ErrDatabaseDetached)
+		}
 		return nil, fmt.Errorf("database %s does not exist", name)
 	}
-
 	return db, nil
 }
 
@@ -448,7 +542,8 @@ func (dm *DatabaseManager) DatabaseExists(name string) bool {
 	defer dm.mu.RUnlock()
 
 	_, exists := dm.databases[name]
-	return exists
+	detached := dm.detached[name]
+	return exists || (detached != nil && !detached.dropped)
 }
 
 // ListDatabases returns all database names
@@ -474,15 +569,37 @@ func (dm *DatabaseManager) GetSystemDatabase() *ReplicatedDatabase {
 
 // Close closes all databases
 func (dm *DatabaseManager) Close() error {
-	dm.mu.Lock()
-	defer dm.mu.Unlock()
+	dm.lifecycleMu.Lock()
+	defer dm.lifecycleMu.Unlock()
+
+	// Closed outside mu (see DatabaseManager).
+	dm.mu.RLock()
+	databases := make(map[string]*ReplicatedDatabase, len(dm.databases))
+	for name, db := range dm.databases {
+		databases[name] = db
+	}
+	detached := make(map[string]*detachedDatabase, len(dm.detached))
+	for name, d := range dm.detached {
+		detached[name] = d
+	}
+	dm.mu.RUnlock()
 
 	var lastErr error
 
 	// Close all user databases
-	for name, db := range dm.databases {
+	for name, db := range databases {
+		if name == SystemDatabaseName {
+			continue
+		}
 		if err := db.Close(); err != nil {
 			log.Error().Err(err).Str("name", name).Msg("Failed to close database")
+			lastErr = err
+		}
+	}
+
+	for name, d := range detached {
+		if err := d.metaStore.Close(); err != nil {
+			log.Error().Err(err).Str("name", name).Msg("Failed to close detached database's meta store")
 			lastErr = err
 		}
 	}
@@ -497,73 +614,166 @@ func (dm *DatabaseManager) Close() error {
 	return lastErr
 }
 
-// ReopenDatabase atomically swaps in a new database connection after snapshot apply.
-// Uses "create-swap-close" pattern to avoid closing connections while queries are in-flight:
-// 1. Create new database connection (before closing old one)
-// 2. Atomically swap in the new connection (under lock)
-// 3. Close old database after a delay (in goroutine, lets in-flight queries complete)
-func (dm *DatabaseManager) ReopenDatabase(name string) error {
+// ErrDatabaseDetached is returned for a database taken out of service while a
+// snapshot restore replaces its file (DetachDatabase).
+var ErrDatabaseDetached = errors.New("database is detached for a snapshot restore")
+
+// ErrDrainIncomplete is returned by DetachDatabase when the database was
+// detached but a write in flight on it did not finish in time.
+var ErrDrainIncomplete = errors.New("detached, but in-flight writes did not drain")
+
+// detachedDatabase is a user database out of service for a snapshot restore.
+type detachedDatabase struct {
+	metaStore     MetaStore // kept open across the restore for AttachDatabase
+	restoreFailed bool      // AttachDatabase failed; the next restore of it may take it over
+	dropped       bool      // DROP DATABASE arrived during the restore; AttachDatabase completes it
+	dropPath      string    // the dropped database's file, removed by AttachDatabase
+}
+
+// DetachDatabase takes a user database out of service so a snapshot restore
+// can replace its SQLite file. It leaves the map at once, so lookups get
+// ErrDatabaseDetached, and every commit on its connections is refused from
+// then on (writeGate). It then drains: it waits, bounded by ctx, for the write
+// transaction in flight on the database to finish, and stops its batch
+// committer, GC and pools. When it returns nil, no write on the database can
+// be ACKed until AttachDatabase: a caller still holding the old
+// *ReplicatedDatabase gets a refused commit or "sql: database is closed",
+// never a nil pool. The meta store stays open, so prepared transactions keep
+// their intents, row locks and registration, and commit records are
+// untouched. The system database and every other database are left alone.
+//
+// A database whose reattach failed (DatabasesAwaitingRestore) is already out
+// of service, and the call hands it to the new restore.
+//
+// If the drain does not finish within ctx, DetachDatabase returns
+// ErrDrainIncomplete with the database still detached: the caller must
+// AttachDatabase it without replacing its file, because a commit that passed
+// the gate before it closed may still complete into that file. Any other
+// error leaves the database as it was.
+func (dm *DatabaseManager) DetachDatabase(ctx context.Context, name string) error {
+	mdb, err := dm.takeOutOfService(name)
+	if err != nil || mdb == nil {
+		return err
+	}
+	// Drained outside both locks (see DatabaseManager): the detached entry
+	// fences Create and Drop.
+	if err := mdb.drainSQLite(ctx); err != nil {
+		return fmt.Errorf("database %s: %w: %w", name, ErrDrainIncomplete, err)
+	}
+	return nil
+}
+
+// takeOutOfService is DetachDatabase's locked step. It returns the database
+// to drain, or nil when a database whose reattach failed is handed to the new
+// restore with nothing left to drain.
+func (dm *DatabaseManager) takeOutOfService(name string) (*ReplicatedDatabase, error) {
+	if name == SystemDatabaseName {
+		return nil, fmt.Errorf("cannot detach the system database")
+	}
+	dm.lifecycleMu.Lock()
+	defer dm.lifecycleMu.Unlock()
 	dm.mu.Lock()
+	defer dm.mu.Unlock()
 
-	// Get the existing database
-	oldDB, exists := dm.databases[name]
+	if detached := dm.detached[name]; detached != nil {
+		if detached.restoreFailed && !detached.dropped {
+			detached.restoreFailed = false
+			return nil, nil
+		}
+		return nil, fmt.Errorf("database %s: %w", name, ErrDatabaseDetached)
+	}
+	mdb, exists := dm.databases[name]
 	if !exists {
+		return nil, fmt.Errorf("database %s does not exist", name)
+	}
+	// Commits are refused before the database leaves the map, so a caller
+	// that sees it detached cannot still commit through a copy it holds.
+	mdb.gate.close()
+	delete(dm.databases, name)
+	dm.detached[name] = &detachedDatabase{metaStore: mdb.GetMetaStore()}
+	return mdb, nil
+}
+
+// AttachDatabase returns a database detached by DetachDatabase to service,
+// opening whatever file is now at its path over the meta store it kept. If
+// that fails, the database stays out of service and is listed by
+// DatabasesAwaitingRestore until a later restore of it succeeds. If the
+// database was dropped during the restore, the drop is completed instead.
+func (dm *DatabaseManager) AttachDatabase(name string) error {
+	dm.lifecycleMu.Lock()
+	defer dm.lifecycleMu.Unlock()
+
+	dm.mu.RLock()
+	detached := dm.detached[name]
+	dm.mu.RUnlock()
+	if detached == nil {
+		return fmt.Errorf("database %s is not detached", name)
+	}
+	if detached.dropped {
+		dm.mu.Lock()
+		delete(dm.detached, name)
 		dm.mu.Unlock()
-		return fmt.Errorf("database %s does not exist", name)
+		if err := detached.metaStore.Close(); err != nil {
+			log.Error().Err(err).Str("name", name).Msg("Failed to close dropped database's meta store")
+		}
+		removeDatabaseFiles(detached.dropPath)
+		log.Info().Str("name", name).Msg("Database dropped during its snapshot restore; drop completed")
+		return nil
 	}
 
-	// Get the path from system database before closing
-	var dbPath string
-	err := dm.systemDB.GetDB().QueryRow(
-		"SELECT path FROM __marmot_databases WHERE name = ?", name,
-	).Scan(&dbPath)
+	mdb, err := dm.openDetached(name, detached.metaStore)
 	if err != nil {
+		dm.mu.Lock()
+		detached.restoreFailed = true
 		dm.mu.Unlock()
-		return fmt.Errorf("failed to get database path: %w", err)
+		return fmt.Errorf("failed to reattach database %s: %w", name, err)
 	}
+	dm.mu.Lock()
+	dm.wireGCCoordination(mdb, name)
+	delete(dm.detached, name)
+	dm.databases[name] = mdb
+	dm.mu.Unlock()
+	log.Info().Str("name", name).Msg("Database reattached after snapshot restore")
+	return nil
+}
 
-	fullPath := filepath.Join(dm.dataDir, dbPath)
-
-	// Get old MetaStore and close it FIRST to release PebbleDB lock
-	// This must happen before creating the new MetaStore
-	oldMetaStore := oldDB.GetMetaStore()
-
-	// Close old database and MetaStore synchronously (we hold the mutex, so no new queries can start)
-	log.Info().Str("name", name).Msg("Closing old database for snapshot reload")
-	if err := oldDB.Close(); err != nil {
-		log.Warn().Err(err).Str("name", name).Msg("Error closing old database connection")
+// openDetached opens the file registered for a detached database over the
+// meta store it kept.
+func (dm *DatabaseManager) openDetached(name string, metaStore MetaStore) (*ReplicatedDatabase, error) {
+	var dbPath string
+	if err := dm.systemDB.GetDB().QueryRow(
+		"SELECT path FROM __marmot_databases WHERE name = ?", name,
+	).Scan(&dbPath); err != nil {
+		return nil, fmt.Errorf("failed to get database path: %w", err)
 	}
-	if oldMetaStore != nil {
-		if err := oldMetaStore.Close(); err != nil {
-			dm.mu.Unlock()
-			return fmt.Errorf("failed to close old meta store for %s: %w", name, err)
+	return NewReplicatedDatabase(filepath.Join(dm.dataDir, dbPath), dm.nodeID, dm.clock, metaStore)
+}
+
+// DatabasesAwaitingRestore lists the databases whose reattach after a
+// snapshot restore failed. They stay out of service until a restore of them
+// succeeds; anti-entropy retries one each round.
+func (dm *DatabaseManager) DatabasesAwaitingRestore() []string {
+	dm.mu.RLock()
+	defer dm.mu.RUnlock()
+	var names []string
+	for name, detached := range dm.detached {
+		if detached.restoreFailed && !detached.dropped {
+			names = append(names, name)
 		}
 	}
+	return names
+}
 
-	// Now create new MetaStore (PebbleDB lock is released)
-	metaStore, err := NewMetaStore(fullPath)
-	if err != nil {
-		dm.mu.Unlock()
-		return fmt.Errorf("failed to create meta store for %s: %w", name, err)
+// errIfDetachedLocked refuses a snapshot of every database while one the
+// registry names is detached: the snapshot would ship a registry naming a
+// database it has no file for. The caller retries once it is back. Caller
+// must hold mu.
+func (dm *DatabaseManager) errIfDetachedLocked() error {
+	for name, detached := range dm.detached {
+		if !detached.dropped {
+			return fmt.Errorf("cannot snapshot while database %s is out of service: %w", name, ErrDatabaseDetached)
+		}
 	}
-
-	// Create new database connection
-	newDB, err := NewReplicatedDatabase(fullPath, dm.nodeID, dm.clock, metaStore)
-	if err != nil {
-		metaStore.Close()
-		dm.mu.Unlock()
-		return fmt.Errorf("failed to reopen database %s: %w", name, err)
-	}
-
-	// Wire up GC coordination for new connection
-	dm.wireGCCoordination(newDB, name)
-
-	// Atomically swap in the new connection
-	dm.databases[name] = newDB
-	dm.mu.Unlock()
-
-	log.Info().Str("name", name).Msg("Database connection swapped after snapshot")
-
 	return nil
 }
 
@@ -632,8 +842,8 @@ func (dm *DatabaseManager) GetDatabasePath(name string) (string, error) {
 // and imports them into the database manager. This is used on first startup
 // of a seed node to make existing databases available.
 func (dm *DatabaseManager) ImportExistingDatabases(importDir string) (int, error) {
-	dm.mu.Lock()
-	defer dm.mu.Unlock()
+	dm.lifecycleMu.Lock()
+	defer dm.lifecycleMu.Unlock()
 
 	if importDir == "" {
 		return 0, nil
@@ -683,7 +893,10 @@ func (dm *DatabaseManager) ImportExistingDatabases(importDir string) (int, error
 		dbName := strings.TrimSuffix(name, ".db")
 
 		// Check if database already exists
-		if existingDB, exists := dm.databases[dbName]; exists {
+		dm.mu.RLock()
+		existingDB, exists := dm.databases[dbName]
+		dm.mu.RUnlock()
+		if exists {
 			// Check if existing database is empty (no user tables)
 			// If so, we can replace it with the imported version
 			srcPath := filepath.Join(importDir, name)
@@ -691,10 +904,13 @@ func (dm *DatabaseManager) ImportExistingDatabases(importDir string) (int, error
 				log.Debug().Str("name", dbName).Msg("Database already exists with data, skipping import")
 				continue
 			}
-			// Close existing empty database before replacing
+			// Close existing empty database before replacing: out of the map
+			// under mu, closed outside it (see DatabaseManager).
 			log.Info().Str("name", dbName).Msg("Replacing empty database with imported version")
-			existingDB.Close()
+			dm.mu.Lock()
 			delete(dm.databases, dbName)
+			dm.mu.Unlock()
+			existingDB.Close()
 		}
 
 		// Copy database file to databases directory
@@ -732,9 +948,6 @@ func (dm *DatabaseManager) ImportExistingDatabases(importDir string) (int, error
 			continue
 		}
 
-		// Wire up GC coordination for imported database
-		dm.wireGCCoordination(db, dbName)
-
 		// Register in system database
 		createdAt := time.Now().UnixNano()
 		relPath := filepath.Join("databases", name)
@@ -748,7 +961,12 @@ func (dm *DatabaseManager) ImportExistingDatabases(importDir string) (int, error
 			continue
 		}
 
+		// Wire up GC coordination only once the database is registered: until
+		// then its GC cannot reach mu, so the failure path above can close it.
+		dm.mu.Lock()
+		dm.wireGCCoordination(db, dbName)
 		dm.databases[dbName] = db
+		dm.mu.Unlock()
 		imported++
 		log.Info().Str("name", dbName).Str("src", srcPath).Msg("Imported existing database")
 	}
@@ -848,6 +1066,10 @@ func (dm *DatabaseManager) TakeSnapshot() ([]SnapshotInfo, uint64, error) {
 	dm.mu.RLock()
 	defer dm.mu.RUnlock()
 
+	if err := dm.errIfDetachedLocked(); err != nil {
+		return nil, 0, err
+	}
+
 	var snapshots []SnapshotInfo
 
 	// Checkpoint and get info for system database
@@ -886,39 +1108,17 @@ func (dm *DatabaseManager) TakeSnapshot() ([]SnapshotInfo, uint64, error) {
 			continue
 		}
 
-		if err := dm.checkpointDatabase(db); err != nil {
-			log.Warn().Err(err).Str("database", name).Msg("Failed to checkpoint database")
-			continue
-		}
-
-		dbPath := filepath.Join(dm.dataDir, "databases", name+".db")
-		info, err := os.Stat(dbPath)
+		snapshot, err := dm.describeDatabaseFile(name, db)
 		if err != nil {
-			log.Warn().Err(err).Str("database", name).Msg("Failed to stat database")
+			log.Warn().Err(err).Str("database", name).Msg("Failed to describe database for snapshot")
 			continue
 		}
-
-		dbSHA256, err := calculateFileSHA256(dbPath)
-		if err != nil {
-			log.Warn().Err(err).Str("database", name).Msg("Failed to hash database")
-			continue
-		}
-
-		snapshots = append(snapshots, SnapshotInfo{
-			Name:     name,
-			Filename: filepath.Join("databases", name+".db"),
-			FullPath: dbPath,
-			Size:     info.Size(),
-			SHA256:   dbSHA256,
-		})
+		snapshots = append(snapshots, snapshot)
 		// MetaStore (PebbleDB) is NOT included - see note above
 	}
 
-	// Get max committed transaction ID
-	maxTxnID, err := dm.GetMaxCommittedTxnID()
-	if err != nil {
-		return nil, 0, fmt.Errorf("failed to get max txn id: %w", err)
-	}
+	// Get max committed transaction ID (without lock since we already hold it)
+	maxTxnID := dm.getMaxCommittedTxnIDLocked()
 
 	log.Info().
 		Int("databases", len(snapshots)).
@@ -926,6 +1126,54 @@ func (dm *DatabaseManager) TakeSnapshot() ([]SnapshotInfo, uint64, error) {
 		Msg("Snapshot prepared")
 
 	return snapshots, maxTxnID, nil
+}
+
+// TakeDatabaseSnapshotInfo checkpoints one user database and describes its
+// file, with its max transaction ID, as TakeSnapshot does for every database.
+// Unlike TakeSnapshot it is refused only while this database is out of
+// service, never because another one is.
+func (dm *DatabaseManager) TakeDatabaseSnapshotInfo(name string) (SnapshotInfo, uint64, error) {
+	dm.mu.RLock()
+	defer dm.mu.RUnlock()
+
+	db, err := dm.getDatabaseLocked(name)
+	if err != nil {
+		return SnapshotInfo{}, 0, err
+	}
+	snapshot, err := dm.describeDatabaseFile(name, db)
+	if err != nil {
+		return SnapshotInfo{}, 0, err
+	}
+	maxTxnID, err := dm.getMaxTxnIDLocked(name)
+	if err != nil {
+		return SnapshotInfo{}, 0, fmt.Errorf("failed to get max txn id: %w", err)
+	}
+	return snapshot, maxTxnID, nil
+}
+
+// describeDatabaseFile checkpoints user database name and describes its file
+// in place. Caller must hold mu.
+func (dm *DatabaseManager) describeDatabaseFile(name string, db *ReplicatedDatabase) (SnapshotInfo, error) {
+	if err := dm.checkpointDatabase(db); err != nil {
+		return SnapshotInfo{}, fmt.Errorf("failed to checkpoint database %s: %w", name, err)
+	}
+	filename := filepath.Join("databases", name+".db")
+	dbPath := filepath.Join(dm.dataDir, filename)
+	info, err := os.Stat(dbPath)
+	if err != nil {
+		return SnapshotInfo{}, fmt.Errorf("failed to stat database %s: %w", name, err)
+	}
+	dbSHA256, err := calculateFileSHA256(dbPath)
+	if err != nil {
+		return SnapshotInfo{}, fmt.Errorf("failed to hash database %s: %w", name, err)
+	}
+	return SnapshotInfo{
+		Name:     name,
+		Filename: filename,
+		FullPath: dbPath,
+		Size:     info.Size(),
+		SHA256:   dbSHA256,
+	}, nil
 }
 
 // checkpointDatabase forces a WAL checkpoint to ensure data is in the main database file
@@ -965,6 +1213,10 @@ func (dm *DatabaseManager) TakeSnapshotToDir(targetDir string) ([]SnapshotInfo, 
 	// Acquire write lock to block all concurrent writes
 	dm.mu.Lock()
 	defer dm.mu.Unlock()
+
+	if err := dm.errIfDetachedLocked(); err != nil {
+		return nil, 0, nil, err
+	}
 
 	var snapshots []SnapshotInfo
 
@@ -1101,10 +1353,11 @@ func (dm *DatabaseManager) TakeSnapshotForDatabase(
 	dm.mu.RLock()
 	defer dm.mu.RUnlock()
 
-	// Get database handle
-	db, exists := dm.databases[dbName]
-	if !exists {
-		return SnapshotInfo{}, 0, fmt.Errorf("database %s not found", dbName)
+	// Only this database's own detach refuses its snapshot; other databases
+	// out of service are not part of it.
+	db, err := dm.getDatabaseLocked(dbName)
+	if err != nil {
+		return SnapshotInfo{}, 0, err
 	}
 
 	// Checkpoint the database (PRAGMA wal_checkpoint(TRUNCATE))
@@ -1138,8 +1391,8 @@ func (dm *DatabaseManager) TakeSnapshotForDatabase(
 		return SnapshotInfo{}, 0, fmt.Errorf("failed to calculate checksum: %w", err)
 	}
 
-	// Get max txn ID for this specific database
-	maxTxnID, err := dm.GetMaxTxnID(dbName)
+	// Get max txn ID for this specific database (without lock since we already hold it)
+	maxTxnID, err := dm.getMaxTxnIDLocked(dbName)
 	if err != nil {
 		return SnapshotInfo{}, 0, fmt.Errorf("failed to get max txn id: %w", err)
 	}
@@ -1326,7 +1579,12 @@ func (dm *DatabaseManager) GetMinAppliedTxnID(database string) (uint64, error) {
 func (dm *DatabaseManager) GetMaxTxnID(database string) (uint64, error) {
 	dm.mu.RLock()
 	defer dm.mu.RUnlock()
+	return dm.getMaxTxnIDLocked(database)
+}
 
+// getMaxTxnIDLocked is GetMaxTxnID for a caller that holds dm.mu: taking the
+// read lock again would deadlock behind a writer waiting for it.
+func (dm *DatabaseManager) getMaxTxnIDLocked(database string) (uint64, error) {
 	db, ok := dm.databases[database]
 	if !ok {
 		return 0, fmt.Errorf("database %s not found", database)

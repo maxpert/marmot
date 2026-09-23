@@ -84,6 +84,10 @@ type PebbleMetaStore struct {
 
 	// Optional transaction getter for conflict resolution (set by MemoryMetaStore wrapper)
 	txnGetter TransactionGetter
+
+	// Prepared transactions whose row locks recoverPreparedCDCState restored
+	// at open, held until the memory tier takes them (takeRecoveredPrepared).
+	recoveredPrepared []TxnImmutableRecord
 }
 
 func cdcPrepareSyncStrict() bool {
@@ -265,6 +269,14 @@ func rejectLegacyCDCRawKeys(db *pebble.DB) error {
 	return iter.Error()
 }
 
+// recoverPreparedCDCState restores the row locks of every transaction that was
+// prepared, and had neither committed nor aborted, when the store last closed.
+// Its manifest survives in one of two places: a prepare record in the segment
+// log (strict prepare sync, which outlives the loss of unsynced Pebble keys),
+// or the manifest key DurablyPrepareTransaction writes. Each recovered
+// transaction is listed in recoveredPrepared for the memory tier, which must
+// register it so the stale-transaction GC can end it if its decision never
+// arrives (see takeRecoveredPrepared).
 func (s *PebbleMetaStore) recoverPreparedCDCState() error {
 	for _, txnID := range s.cdcLog.pendingTxnIDs() {
 		commit, err := s.readCommitRecord(txnID)
@@ -289,24 +301,32 @@ func (s *PebbleMetaStore) recoverPreparedCDCState() error {
 		if manifest == nil {
 			continue
 		}
-		if err := s.ensureRecoveredPreparedTransaction(txnID, manifest, status, err); err != nil {
+		immutable, err := s.ensureRecoveredPreparedTransaction(txnID, manifest, status, err)
+		if err != nil {
 			return err
+		}
+		if immutable == nil {
+			continue
 		}
 		if err := s.restorePreparedDMLIntents(txnID, manifest); err != nil {
 			return err
 		}
+		s.recoveredPrepared = append(s.recoveredPrepared, *immutable)
 	}
-	return nil
+	return s.recoverSealedPreparedTransactions()
 }
 
-func (s *PebbleMetaStore) ensureRecoveredPreparedTransaction(txnID uint64, manifest *cdcSegmentTxnManifest, status TxnStatus, statusErr error) error {
+// ensureRecoveredPreparedTransaction rewrites the PENDING record of a
+// transaction recovered from a segment prepare record, and returns its
+// immutable record, or nil when the manifest cannot rebuild one.
+func (s *PebbleMetaStore) ensureRecoveredPreparedTransaction(txnID uint64, manifest *cdcSegmentTxnManifest, status TxnStatus, statusErr error) (*TxnImmutableRecord, error) {
 	immutable, err := s.readImmutableTxnRecord(txnID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if immutable == nil {
 		if manifest.NodeID == 0 {
-			return nil
+			return nil, nil
 		}
 		startTS := hlc.Timestamp{
 			WallTime: manifest.StartTSWall,
@@ -314,19 +334,133 @@ func (s *PebbleMetaStore) ensureRecoveredPreparedTransaction(txnID uint64, manif
 			NodeID:   manifest.NodeID,
 		}
 		if err := s.writeImmutableTxnRecord(txnID, manifest.NodeID, startTS); err != nil {
-			return err
+			return nil, err
+		}
+		immutable = &TxnImmutableRecord{
+			TxnID:          txnID,
+			NodeID:         manifest.NodeID,
+			StartTSWall:    manifest.StartTSWall,
+			StartTSLogical: manifest.StartTSLogical,
 		}
 	}
 	if statusErr == pebble.ErrNotFound {
 		if err := s.db.Set(pebbleTxnStatusKey(txnID), []byte{byte(TxnStatusPending)}, pebble.NoSync); err != nil {
+			return nil, err
+		}
+	}
+	if statusErr == pebble.ErrNotFound || status == TxnStatusPending {
+		if err := s.db.Set(pebbleTxnPendingKey(txnID), nil, pebble.NoSync); err != nil {
+			return nil, err
+		}
+	}
+	return immutable, nil
+}
+
+// recoverSealedPreparedTransactions recovers the prepared transactions whose
+// manifest is the Pebble key alone (the default, grouped prepare sync). Pebble
+// applies its writes in order, so a surviving manifest key means the immutable
+// record and the PENDING status written before it survived too; a transaction
+// without them was aborted, and its manifest is an orphan.
+//
+// Under grouped sync PREPARE may ACK before its CDC rows reach the disk, so an
+// OS crash can leave a manifest whose rows are gone. Such a transaction cannot
+// keep its promise to commit: it is aborted here, so its COMMIT is refused
+// rather than ACKed having applied nothing.
+func (s *PebbleMetaStore) recoverSealedPreparedTransactions() error {
+	recovered := make(map[uint64]struct{}, len(s.recoveredPrepared))
+	for _, rec := range s.recoveredPrepared {
+		recovered[rec.TxnID] = struct{}{}
+	}
+
+	prefix := []byte(pebblePrefixCDCManifest)
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: prefix,
+		UpperBound: prefixUpperBound(prefix),
+	})
+	if err != nil {
+		return err
+	}
+	manifests := make(map[uint64]*cdcSegmentTxnManifest)
+	for iter.SeekGE(prefix); iter.Valid(); iter.Next() {
+		key := iter.Key()
+		if len(key) < len(pebblePrefixCDCManifest)+8 {
+			continue
+		}
+		txnID := binary.BigEndian.Uint64(key[len(pebblePrefixCDCManifest):])
+		if _, done := recovered[txnID]; done {
+			continue
+		}
+		val, err := iter.ValueAndErr()
+		if err != nil {
+			_ = iter.Close()
 			return err
 		}
-		return s.db.Set(pebbleTxnPendingKey(txnID), nil, pebble.NoSync)
+		var manifest cdcSegmentTxnManifest
+		if err := encoding.Unmarshal(val, &manifest); err != nil {
+			_ = iter.Close()
+			return fmt.Errorf("decode CDC manifest txn %d: %w", txnID, err)
+		}
+		manifests[txnID] = &manifest
 	}
-	if status == TxnStatusPending {
-		return s.db.Set(pebbleTxnPendingKey(txnID), nil, pebble.NoSync)
+	if err := iter.Close(); err != nil {
+		return err
+	}
+
+	for txnID, manifest := range manifests {
+		status, err := s.readTxnStatus(txnID)
+		if err == pebble.ErrNotFound {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if status != TxnStatusPending {
+			continue
+		}
+		commit, err := s.readCommitRecord(txnID)
+		if err != nil {
+			return err
+		}
+		if commit != nil {
+			continue
+		}
+		immutable, err := s.readImmutableTxnRecord(txnID)
+		if err != nil {
+			return err
+		}
+		if immutable == nil {
+			continue
+		}
+		if err := s.restorePreparedDMLIntents(txnID, manifest); err != nil {
+			log.Warn().Err(err).Uint64("txn_id", txnID).
+				Msg("Prepared transaction lost its CDC rows before they were synced; aborting it")
+			if err := s.abortUnrecoverablePrepared(txnID); err != nil {
+				return err
+			}
+			continue
+		}
+		s.recoveredPrepared = append(s.recoveredPrepared, *immutable)
 	}
 	return nil
+}
+
+// abortUnrecoverablePrepared releases whatever row locks a failed recovery
+// took and aborts the transaction, so its COMMIT finds no record.
+func (s *PebbleMetaStore) abortUnrecoverablePrepared(txnID uint64) error {
+	s.rowLocks.ReleaseByTxn(txnID)
+	s.dmlIntents.Delete(txnID)
+	if err := s.AbortTransaction(txnID); err != nil {
+		return err
+	}
+	return s.DeleteCapturedRows(txnID)
+}
+
+// takeRecoveredPrepared returns the prepared transactions recovered at open
+// and forgets them; the caller owns their resolution from then on.
+func (s *PebbleMetaStore) takeRecoveredPrepared() []TxnImmutableRecord {
+	recovered := s.recoveredPrepared
+	s.recoveredPrepared = nil
+	return recovered
 }
 
 func (s *PebbleMetaStore) restorePreparedDMLIntents(txnID uint64, manifest *cdcSegmentTxnManifest) error {
@@ -674,6 +808,18 @@ func (s *PebbleMetaStore) deleteTransactionKeys(txnID uint64, isCommitted bool) 
 	// Delete commit record if exists
 	_ = batch.Delete(pebbleTxnCommitKey(txnID), nil)
 
+	// A prepared transaction's status stays behind as ABORTED: a segment
+	// prepare record outlives the abort, and recovery must not take it for a
+	// prepare whose Pebble keys were lost (recoverPreparedCDCState).
+	if _, err := s.readTxnStatus(txnID); err == nil {
+		if err := batch.Set(pebbleTxnStatusKey(txnID), []byte{byte(TxnStatusAborted)}, nil); err != nil {
+			return err
+		}
+		_ = batch.Delete(pebbleTxnPendingKey(txnID), nil)
+	} else if err != pebble.ErrNotFound {
+		return err
+	}
+
 	// If committed, try to remove from sequence index
 	if isCommitted {
 		// Try to read commit record to get seqNum before deleting
@@ -973,12 +1119,15 @@ func (s *PebbleMetaStore) AbortTransaction(txnID uint64) error {
 	batch := s.db.NewBatch()
 	defer batch.Close()
 
-	// Delete all keys: /txn/, /txn_commit/, /txn_status/
+	// Delete /txn/ and /txn_commit/; the status stays, as ABORTED, for the
+	// reason given in deleteTransactionKeys.
 	if err := batch.Delete(pebbleTxnKey(txnID), nil); err != nil {
 		return err
 	}
 	_ = batch.Delete(pebbleTxnCommitKey(txnID), nil)
-	_ = batch.Delete(pebbleTxnStatusKey(txnID), nil)
+	if err := batch.Set(pebbleTxnStatusKey(txnID), []byte{byte(TxnStatusAborted)}, nil); err != nil {
+		return err
+	}
 
 	// Remove from pending index (best-effort cleanup)
 	_ = batch.Delete(pebbleTxnPendingKey(txnID), nil)
@@ -1097,33 +1246,23 @@ func (s *PebbleMetaStore) WriteIntent(txnID uint64, intentType IntentType, table
 	// Try to acquire row lock
 	existingTxnID, acquired := s.rowLocks.AcquireLock("", tableName, intentKey, txnID)
 	if !acquired {
-		// Lock held by different transaction - check GC marker first
-		if s.rowLocks.CheckGCMarker("", tableName, intentKey) {
-			// GC marker exists - intent is marked for cleanup, delete marker and acquire
-			s.rowLocks.DeleteGCMarker("", tableName, intentKey)
-			s.rowLocks.ReleaseLock("", tableName, intentKey)
-			existingTxnID, acquired = s.rowLocks.AcquireLock("", tableName, intentKey, txnID)
-			if !acquired {
-				// Race condition - another transaction acquired the lock
-				telemetry.WriteConflictsTotal.With("intent", "gc_race").Inc()
-				return fmt.Errorf("write-write conflict: row %s:%s locked by transaction %d (current txn: %d)",
-					tableName, intentKey, existingTxnID, txnID)
-			}
-		} else {
-			// No GC marker - resolve conflict
-			if err := s.resolveIntentConflictPebble(nil, existingTxnID, txnID, tableName, intentKey); err != nil {
-				telemetry.WriteConflictsTotal.With("intent", "conflict").Inc()
-				return err
-			}
-			// Conflict resolved - release old lock and acquire new one
-			s.rowLocks.ReleaseLock("", tableName, intentKey)
-			existingTxnID, acquired = s.rowLocks.AcquireLock("", tableName, intentKey, txnID)
-			if !acquired {
-				// Race condition
-				telemetry.WriteConflictsTotal.With("intent", "resolve_race").Inc()
-				return fmt.Errorf("write-write conflict: row %s:%s locked by transaction %d (current txn: %d)",
-					tableName, intentKey, existingTxnID, txnID)
-			}
+		// Lock held by a different transaction: the holder's intent may be
+		// overwritten only once that transaction has ended.
+		if err := s.resolveIntentConflictPebble(existingTxnID, txnID, tableName, intentKey); err != nil {
+			telemetry.WriteConflictsTotal.With("intent", "conflict").Inc()
+			return err
+		}
+		// Conflict resolved - release the resolved holder's lock and acquire
+		// it. The release is conditional on that holder still owning the row:
+		// resolveIntentConflictPebble judged THAT transaction, and the verdict
+		// does not transfer to a newer one.
+		s.rowLocks.ReleaseLockIfHeldBy("", tableName, intentKey, existingTxnID)
+		existingTxnID, acquired = s.rowLocks.AcquireLock("", tableName, intentKey, txnID)
+		if !acquired {
+			// Race condition
+			telemetry.WriteConflictsTotal.With("intent", "resolve_race").Inc()
+			return fmt.Errorf("write-write conflict: row %s:%s locked by transaction %d (current txn: %d)",
+				tableName, intentKey, existingTxnID, txnID)
 		}
 	}
 
@@ -1175,10 +1314,21 @@ func (s *PebbleMetaStore) WriteIntent(txnID uint64, intentType IntentType, table
 	return nil
 }
 
-// resolveIntentConflictPebble handles conflict with existing intent from different transaction.
-// Called after GC marker check - if GC marker exists, caller handles overwrite directly.
-func (s *PebbleMetaStore) resolveIntentConflictPebble(batch *pebble.Batch, existingTxnID, txnID uint64, tableName, intentKey string) error {
-	// Check conflicting transaction status
+// resolveIntentConflictPebble decides whether the intent existingTxnID holds on
+// a row may be overwritten by txnID. Only an ended holder yields: one with no
+// transaction record, or one that committed or aborted.
+//
+// A PENDING holder never yields, however old its heartbeat. Participants do
+// not refresh heartbeats, so every prepared transaction whose coordinator is
+// slower than heartbeat_timeout_seconds looks stale, and a prepared
+// transaction has promised its coordinator it can commit. Overwriting its
+// intent here would leave its record pending and its COMMIT still accepted,
+// so two transactions would each commit a write the other's lock was meant to
+// exclude - for an AUTO_INCREMENT claim, two ranges over the same ids. A
+// holder whose coordinator is gone is ended by the stale-transaction GC
+// (TransactionManager.cleanupStaleTransactions -> CleanupStaleTransactions),
+// which aborts it; after that this function sees an aborted or missing record.
+func (s *PebbleMetaStore) resolveIntentConflictPebble(existingTxnID, txnID uint64, tableName, intentKey string) error {
 	// Use custom txnGetter if set (allows MemoryMetaStore to inject its GetTransaction)
 	getTxn := s.GetTransaction
 	if s.txnGetter != nil {
@@ -1186,7 +1336,6 @@ func (s *PebbleMetaStore) resolveIntentConflictPebble(batch *pebble.Batch, exist
 	}
 	conflictTxnRec, _ := getTxn(existingTxnID)
 
-	canOverwrite := false
 	switch {
 	case conflictTxnRec == nil:
 		log.Debug().
@@ -1194,10 +1343,8 @@ func (s *PebbleMetaStore) resolveIntentConflictPebble(batch *pebble.Batch, exist
 			Str("table", tableName).
 			Str("intent_key", intentKey).
 			Msg("Cleaning up orphaned intent (no transaction record)")
-		canOverwrite = true
 
 	case conflictTxnRec.Status == TxnStatusCommitted:
-		canOverwrite = true
 
 	case conflictTxnRec.Status == TxnStatusAborted:
 		log.Debug().
@@ -1205,39 +1352,14 @@ func (s *PebbleMetaStore) resolveIntentConflictPebble(batch *pebble.Batch, exist
 			Str("table", tableName).
 			Str("intent_key", intentKey).
 			Msg("Cleaning up intent from aborted transaction")
-		canOverwrite = true
 
 	default:
-		// Check heartbeat timeout - use heartbeat from txnGetter (in-memory via MemoryMetaStore)
-		heartbeatTimeout := int64(10 * time.Second)
-		if cfg.Config != nil && cfg.Config.Transaction.HeartbeatTimeoutSeconds > 0 {
-			heartbeatTimeout = int64(time.Duration(cfg.Config.Transaction.HeartbeatTimeoutSeconds) * time.Second)
-		}
-
-		heartbeat := conflictTxnRec.LastHeartbeat
-		timeSinceHeartbeat := time.Now().UnixNano() - heartbeat
-		if timeSinceHeartbeat > heartbeatTimeout {
-			log.Debug().
-				Uint64("stale_txn_id", existingTxnID).
-				Str("table", tableName).
-				Str("intent_key", intentKey).
-				Int64("heartbeat_age_ms", timeSinceHeartbeat/1e6).
-				Msg("Cleaning up stale intent (heartbeat timeout)")
-			canOverwrite = true
-		}
-	}
-
-	if !canOverwrite {
 		return fmt.Errorf("write-write conflict: row %s:%s locked by transaction %d (current txn: %d)",
 			tableName, intentKey, existingTxnID, txnID)
 	}
 
 	// Delete /intent_txn/ index for the overwritten transaction
-	if err := s.db.Delete(pebbleIntentByTxnKey(existingTxnID, tableName, intentKey), pebble.NoSync); err != nil {
-		return err
-	}
-
-	return nil
+	return s.db.Delete(pebbleIntentByTxnKey(existingTxnID, tableName, intentKey), pebble.NoSync)
 }
 
 // ValidateIntent checks if the intent is still held by the expected transaction
@@ -1335,20 +1457,13 @@ func (s *PebbleMetaStore) deleteIntentTxnIndexByPrefix(txnID uint64) error {
 	return nil
 }
 
-// MarkIntentsForCleanup marks all intents for a transaction as ready for overwrite.
-// Uses in-memory RowLockStore.byTxn index instead of Pebble iteration.
-func (s *PebbleMetaStore) MarkIntentsForCleanup(txnID uint64) error {
-	s.rowLocks.MarkGCByTxn(txnID)
-	return nil
-}
-
 // CleanupAfterCommit performs cleanup operations for a committed transaction.
-// Phase 1: Marks intents with GC markers (other txns can overwrite)
+// Phase 1: Releases the transaction's row locks
 // Phase 2: Deletes intent index entries only (NOT CDC raw entries)
 // Note: CDC raw entries are retained for streaming replication and deleted by GC.
 func (s *PebbleMetaStore) CleanupAfterCommit(txnID uint64) error {
-	// Single pass: mark GC, release locks, get keys (no Pebble iteration)
-	lockKeys := s.rowLocks.MarkGCAndRelease(txnID)
+	// Single pass: release locks, get keys (no Pebble iteration)
+	lockKeys := s.rowLocks.ReleaseByTxn(txnID)
 	_, hadDML := s.dmlIntents.LoadAndDelete(txnID)
 	_, hasPersisted := s.persistedIntentTxns.LoadAndDelete(txnID)
 	if hadDML && !hasPersisted {
@@ -2364,7 +2479,7 @@ func (s *PebbleMetaStore) GetCDCTableDDLLock(tableName string) (uint64, error) {
 }
 
 // GetRowLockStats returns statistics from the in-memory row lock store
-func (s *PebbleMetaStore) GetRowLockStats() (activeLocks, activeTransactions, gcMarkers, tablesWithLocks int) {
+func (s *PebbleMetaStore) GetRowLockStats() (activeLocks, activeTransactions, tablesWithLocks int) {
 	return s.rowLocks.Stats()
 }
 

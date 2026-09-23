@@ -51,7 +51,6 @@ type MetaStore interface {
 	ValidateIntent(tableName, intentKey string, expectedTxnID uint64) (bool, error)
 	DeleteIntent(tableName, intentKey string, txnID uint64) error
 	DeleteIntentsByTxn(txnID uint64) error
-	MarkIntentsForCleanup(txnID uint64) error // Fast path: mark intents as ready for overwrite
 	GetIntentsByTxn(txnID uint64) ([]*WriteIntentRecord, error)
 	GetIntent(tableName, intentKey string) (*WriteIntentRecord, error)
 
@@ -114,7 +113,7 @@ type MetaStore interface {
 	ScanTransactions(fromTxnID uint64, descending bool, callback func(*TransactionRecord) error) error
 
 	// Stats methods for telemetry
-	GetRowLockStats() (activeLocks, activeTransactions, gcMarkers, tablesWithLocks int)
+	GetRowLockStats() (activeLocks, activeTransactions, tablesWithLocks int)
 	IntentStats() (pendingIntents int, err error)
 
 	// Lifecycle
@@ -212,7 +211,8 @@ func NewMetaStore(basePath string) (MetaStore, error) {
 	// Wrap with MemoryMetaStore for transitionary state optimization
 	memStore := NewMemoryMetaStore(pebble)
 
-	// Clean up orphaned CDC data from crashed transactions
+	// Register recovered prepared transactions and clean up orphaned CDC data
+	// from crashed ones. The registration cannot fail; only the cleanup can.
 	if err := memStore.ReconstructFromPebble(); err != nil {
 		// Log warning but don't fail startup - orphaned data is just wasted space
 		log.Warn().Err(err).Msg("Failed to reconstruct from Pebble at startup")

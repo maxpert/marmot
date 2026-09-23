@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -35,21 +36,55 @@ type ReplicatedDatabase struct {
 	replicationFn  ReplicationFunc
 	batchCommitter *SQLiteBatchCommitter
 	schemaCache    *SchemaCache // Shared schema cache for preupdate hooks
+	gate           *writeGate   // refuses every commit once the database leaves service
 }
 
 // ReplicationFunc is called to replicate transactions to other nodes
 // This is injected from the coordinator layer
 type ReplicationFunc func(ctx context.Context, txn *Transaction) error
 
+// ReplicatedDatabaseOption configures NewReplicatedDatabase.
+type ReplicatedDatabaseOption func(*replicatedDatabaseOptions)
+
+type replicatedDatabaseOptions struct {
+	driverName  string
+	synchronous string
+	batchCommit bool
+}
+
+// WithDurableCommits makes every commit on the database survive an OS crash
+// or power loss, not only a process crash. Every connection it opens runs
+// synchronous=FULL, carried in the DSN because the driver resets the mode on
+// each new connection, through SQLiteDurableDriverName. It gets no batch
+// committer, whose connection would commit and checkpoint the same file at
+// synchronous=NORMAL.
+func WithDurableCommits() ReplicatedDatabaseOption {
+	return func(o *replicatedDatabaseOptions) {
+		o.driverName = SQLiteDurableDriverName
+		o.synchronous = "FULL"
+		o.batchCommit = false
+	}
+}
+
 // NewReplicatedDatabase creates a new transaction-enabled database
 // metaStore is the MetaStore for storing transaction metadata (intent entries, txn records, etc.)
-func NewReplicatedDatabase(dbPath string, nodeID uint64, clock *hlc.Clock, metaStore MetaStore) (*ReplicatedDatabase, error) {
+func NewReplicatedDatabase(dbPath string, nodeID uint64, clock *hlc.Clock, metaStore MetaStore, opts ...ReplicatedDatabaseOption) (*ReplicatedDatabase, error) {
+	o := replicatedDatabaseOptions{
+		driverName:  SQLiteDriverName,
+		synchronous: "NORMAL",
+		batchCommit: cfg.Config.BatchCommit.Enabled,
+	}
+	for _, opt := range opts {
+		opt(&o)
+	}
+
 	// Get timeout from config (LockWaitTimeoutSeconds is in seconds, SQLite needs milliseconds)
 	busyTimeoutMS := cfg.Config.Transaction.LockWaitTimeoutSeconds * 1000
 	poolCfg := cfg.Config.ConnectionPool
 	isMemoryDB := strings.Contains(dbPath, ":memory:")
 
 	var writeDB, hookDB, readDB *sql.DB
+	gate := &writeGate{}
 
 	// Helper to close all opened connections on error
 	closeAll := func() {
@@ -71,14 +106,14 @@ func NewReplicatedDatabase(dbPath string, nodeID uint64, clock *hlc.Clock, metaS
 	writeDSN := dbPath
 	if !isMemoryDB {
 		if strings.Contains(writeDSN, "?") {
-			writeDSN += fmt.Sprintf("&_journal_mode=WAL&_busy_timeout=%d&_txlock=immediate&cache=shared", busyTimeoutMS)
+			writeDSN += fmt.Sprintf("&_journal_mode=WAL&_busy_timeout=%d&_txlock=immediate&_sync=%s&cache=shared", busyTimeoutMS, o.synchronous)
 		} else {
-			writeDSN += fmt.Sprintf("?_journal_mode=WAL&_busy_timeout=%d&_txlock=immediate&cache=shared", busyTimeoutMS)
+			writeDSN += fmt.Sprintf("?_journal_mode=WAL&_busy_timeout=%d&_txlock=immediate&_sync=%s&cache=shared", busyTimeoutMS, o.synchronous)
 		}
 	}
 
 	var err error
-	writeDB, err = sql.Open(SQLiteDriverName, writeDSN)
+	writeDB, err = gate.openDB(o.driverName, writeDSN)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open write database: %w", err)
 	}
@@ -93,7 +128,7 @@ func NewReplicatedDatabase(dbPath string, nodeID uint64, clock *hlc.Clock, metaS
 	// This connection is acquired during ExecuteLocalWithHooks, captures CDC,
 	// then releases BEFORE 2PC broadcast - avoiding deadlock with incoming commits.
 	hookDSN := writeDSN // Same settings as write connection
-	hookDB, err = sql.Open(SQLiteDriverName, hookDSN)
+	hookDB, err = gate.openDB(o.driverName, hookDSN)
 	if err != nil {
 		closeAll()
 		return nil, fmt.Errorf("failed to open hook database: %w", err)
@@ -110,13 +145,13 @@ func NewReplicatedDatabase(dbPath string, nodeID uint64, clock *hlc.Clock, metaS
 	readDSN := dbPath
 	if !isMemoryDB {
 		if strings.Contains(readDSN, "?") {
-			readDSN += fmt.Sprintf("&_journal_mode=WAL&_busy_timeout=%d&cache=shared", busyTimeoutMS)
+			readDSN += fmt.Sprintf("&_journal_mode=WAL&_busy_timeout=%d&_sync=%s&cache=shared", busyTimeoutMS, o.synchronous)
 		} else {
-			readDSN += fmt.Sprintf("?_journal_mode=WAL&_busy_timeout=%d&cache=shared", busyTimeoutMS)
+			readDSN += fmt.Sprintf("?_journal_mode=WAL&_busy_timeout=%d&_sync=%s&cache=shared", busyTimeoutMS, o.synchronous)
 		}
 	}
 
-	readDB, err = sql.Open(SQLiteDriverName, readDSN)
+	readDB, err = gate.openDB(o.driverName, readDSN)
 	if err != nil {
 		closeAll()
 		return nil, fmt.Errorf("failed to open read database: %w", err)
@@ -142,10 +177,6 @@ func NewReplicatedDatabase(dbPath string, nodeID uint64, clock *hlc.Clock, metaS
 			if _, err = db.Exec(fmt.Sprintf("PRAGMA busy_timeout=%d", busyTimeoutMS)); err != nil {
 				closeAll()
 				return nil, fmt.Errorf("failed to set busy timeout: %w", err)
-			}
-			if _, err = db.Exec("PRAGMA synchronous=NORMAL"); err != nil {
-				closeAll()
-				return nil, fmt.Errorf("failed to set synchronous mode: %w", err)
 			}
 			if _, err = db.Exec("PRAGMA cache_size=-64000"); err != nil {
 				closeAll()
@@ -184,7 +215,7 @@ func NewReplicatedDatabase(dbPath string, nodeID uint64, clock *hlc.Clock, metaS
 
 	// Create batch committer for SQLite-level batching (opens its own optimized connection)
 	var batchCommitter *SQLiteBatchCommitter
-	if cfg.Config.BatchCommit.Enabled {
+	if o.batchCommit {
 		batchCommitter = NewSQLiteBatchCommitter(
 			dbPath,
 			cfg.Config.BatchCommit.MaxBatchSize,
@@ -197,6 +228,7 @@ func NewReplicatedDatabase(dbPath string, nodeID uint64, clock *hlc.Clock, metaS
 			cfg.Config.BatchCommit.IncrementalVacuumPages,
 			cfg.Config.BatchCommit.IncrementalVacuumTimeLimitMS,
 		)
+		batchCommitter.gate = gate
 		if err := batchCommitter.Start(); err != nil {
 			closeAll()
 			return nil, fmt.Errorf("failed to start batch committer: %w", err)
@@ -213,6 +245,7 @@ func NewReplicatedDatabase(dbPath string, nodeID uint64, clock *hlc.Clock, metaS
 		nodeID:         nodeID,
 		batchCommitter: batchCommitter,
 		schemaCache:    schemaCache,
+		gate:           gate,
 	}
 
 	// Wire batch committer to transaction manager
@@ -296,46 +329,83 @@ func (mdb *ReplicatedDatabase) GetClock() *hlc.Clock {
 	return mdb.clock
 }
 
-// Close closes the database connections, MetaStore, and stops GC.
-// Order is important: stop GC first, then close connections.
+// Close closes the database connections and the MetaStore and stops GC
+// (closeSQLite). It does not wait for a write transaction in flight: that
+// transaction's commit is refused (see writeGate).
 func (mdb *ReplicatedDatabase) Close() error {
-	// Stop GC goroutine first to prevent it from accessing closed connections
-	if mdb.txnMgr != nil {
-		mdb.txnMgr.StopGarbageCollection()
+	err := mdb.closeSQLite()
+	if mdb.metaStore != nil {
+		if msErr := mdb.metaStore.Close(); err == nil {
+			err = msErr
+		}
 	}
+	return err
+}
 
-	// Stop batch committer (flushes pending)
+// closeSQLite closes the database's SQLite file for good, leaving the meta
+// store open: the batch committer stops after committing what is queued, no
+// later commit on any of the database's connections succeeds (writeGate), the
+// GC stops, and the pools close. The pool fields keep their closed *sql.DB, so
+// a caller still holding the database gets "sql: database is closed", never a
+// nil pool.
+//
+// The caller must not hold DatabaseManager.mu: stopping the GC waits for a
+// pass that may itself be waiting on that lock.
+func (mdb *ReplicatedDatabase) closeSQLite() error {
 	if mdb.batchCommitter != nil {
 		mdb.batchCommitter.Stop()
 	}
+	mdb.gate.close()
+	return mdb.closePools()
+}
 
-	var errs []error
-
-	if mdb.writeDB != nil {
-		if err := mdb.writeDB.Close(); err != nil {
-			errs = append(errs, err)
-		}
+// drainSQLite takes the database's SQLite file out of service for a restore
+// that will replace it, leaving the meta store open. Unlike closeSQLite it
+// refuses first: the gate closes before the batch committer stops, so the
+// commits it has queued are refused rather than written into the file being
+// replaced (their transactions stay prepared). It then waits, bounded by ctx,
+// for the write transaction in flight on writeDB to finish: when it returns
+// nil, every commit that passed the gate before it closed has completed, and
+// none can complete later. If ctx ends first it returns that error, still
+// tearing everything down; a commit already past the gate may then complete
+// later. A failure to close a pool is logged, not returned: it says nothing
+// about what the database's file holds.
+//
+// The caller must not hold DatabaseManager.mu (see closeSQLite).
+func (mdb *ReplicatedDatabase) drainSQLite(ctx context.Context) error {
+	mdb.gate.close()
+	if mdb.batchCommitter != nil {
+		mdb.batchCommitter.Stop()
 	}
-	if mdb.hookDB != nil {
-		if err := mdb.hookDB.Close(); err != nil {
-			errs = append(errs, err)
-		}
+	// writeDB has a single connection: getting it means the transaction that
+	// held it has committed or rolled back. Holding it through the pool's
+	// Close keeps every other caller off it.
+	held, err := mdb.writeDB.Conn(ctx)
+	if closeErr := mdb.closePools(); closeErr != nil {
+		log.Warn().Err(closeErr).Msg("Error closing a drained database's SQLite pools")
 	}
-	if mdb.readDB != nil {
-		if err := mdb.readDB.Close(); err != nil {
-			errs = append(errs, err)
-		}
+	if err != nil {
+		return fmt.Errorf("drain in-flight writes: %w", err)
 	}
-	if mdb.metaStore != nil {
-		if err := mdb.metaStore.Close(); err != nil {
-			errs = append(errs, err)
-		}
-	}
-
-	if len(errs) > 0 {
-		return errs[0]
-	}
+	_ = held.Close()
 	return nil
+}
+
+// closePools stops the GC and closes the SQLite pools.
+func (mdb *ReplicatedDatabase) closePools() error {
+	if mdb.txnMgr != nil {
+		mdb.txnMgr.StopGarbageCollection()
+	}
+	var errs []error
+	for _, pool := range []*sql.DB{mdb.writeDB, mdb.hookDB, mdb.readDB} {
+		if pool == nil {
+			continue
+		}
+		if err := pool.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // CloseSQLiteConnections closes all SQLite connections synchronously.
@@ -359,6 +429,8 @@ func (mdb *ReplicatedDatabase) CloseSQLiteConnections() {
 
 // OpenSQLiteConnections opens new SQLite connections to the database file.
 // This MUST be called AFTER database files have been replaced during snapshot apply.
+// Like the pools NewReplicatedDatabase opens, they are gated: once the
+// database leaves service, their commits are refused.
 // Note: This does NOT touch MetaStore (PebbleDB) - only SQLite connections.
 func (mdb *ReplicatedDatabase) OpenSQLiteConnections(dbPath string) error {
 	busyTimeoutMS := cfg.Config.Transaction.LockWaitTimeoutSeconds * 1000
@@ -366,7 +438,7 @@ func (mdb *ReplicatedDatabase) OpenSQLiteConnections(dbPath string) error {
 
 	// Open write connection
 	writeDSN := fmt.Sprintf("%s?_journal_mode=WAL&_busy_timeout=%d&_txlock=immediate&cache=shared", dbPath, busyTimeoutMS)
-	writeDB, err := sql.Open(SQLiteDriverName, writeDSN)
+	writeDB, err := mdb.gate.openDB(SQLiteDriverName, writeDSN)
 	if err != nil {
 		return fmt.Errorf("failed to open write connection: %w", err)
 	}
@@ -381,7 +453,7 @@ func (mdb *ReplicatedDatabase) OpenSQLiteConnections(dbPath string) error {
 	}
 
 	// Open hook connection
-	hookDB, err := sql.Open(SQLiteDriverName, writeDSN)
+	hookDB, err := mdb.gate.openDB(SQLiteDriverName, writeDSN)
 	if err != nil {
 		writeDB.Close()
 		return fmt.Errorf("failed to open hook connection: %w", err)
@@ -392,7 +464,7 @@ func (mdb *ReplicatedDatabase) OpenSQLiteConnections(dbPath string) error {
 
 	// Open read connection pool
 	readDSN := fmt.Sprintf("%s?_journal_mode=WAL&_busy_timeout=%d&cache=shared", dbPath, busyTimeoutMS)
-	readDB, err := sql.Open(SQLiteDriverName, readDSN)
+	readDB, err := mdb.gate.openDB(SQLiteDriverName, readDSN)
 	if err != nil {
 		writeDB.Close()
 		hookDB.Close()

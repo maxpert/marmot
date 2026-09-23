@@ -128,6 +128,21 @@ type Statement struct {
 	IntentKey []byte        `msgpack:"IntentKey"` // Intent key for MVCC conflict detection (binary format)
 	Error     string        `msgpack:"Error"`     // Error message if Type is StatementUnsupported
 
+	// AutoIDClaim marks this statement as a narrow AUTO_INCREMENT range claim
+	// rather than ordinary DML. The claim's payload travels in the
+	// transaction's intent DataSnapshot, not here.
+	//
+	// It is a flag on an existing StatementType, never a new StatementType: an
+	// older binary ignores the unknown wire field, sees a DML statement with no
+	// row image, and rejects it at the "DML prepare missing encoded CDC row"
+	// gate, which is a clean failed transaction rather than a statement it
+	// mishandles.
+	AutoIDClaim bool `msgpack:"AutoIDClaim,omitempty"`
+	// AutoIDClaimPayload is the claim itself, msgpack-encoded. Each participant
+	// writes it into its own transaction intent at PREPARE; the COMMIT handler
+	// reads it back from there to write the new base.
+	AutoIDClaimPayload []byte `msgpack:"AutoIDClaimPayload,omitempty"`
+
 	// TranspileErr is the typed error transpilation failed with, set only when
 	// a transformation rule refused the statement (never when parsing failed).
 	// It carries the MySQL error code the client must see; Error holds the same

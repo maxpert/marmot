@@ -286,7 +286,34 @@ func (ae *AntiEntropyService) performAntiEntropy() {
 		}
 	}
 
+	ae.restoreAwaitingDatabases(ctx, aliveNodes)
+
 	log.Debug().Msg("Anti-entropy round completed")
+}
+
+// restoreAwaitingDatabases retries the snapshot restore of every database
+// whose reattach after an earlier restore failed (DatabasesAwaitingRestore).
+// Such a database is out of service and absent from ListDatabases, so the
+// loop above never reaches it; each alive peer is tried in turn until one
+// restore succeeds.
+func (ae *AntiEntropyService) restoreAwaitingDatabases(ctx context.Context, aliveNodes []*NodeState) {
+	if ae.snapshotFunc == nil {
+		return
+	}
+	for _, dbName := range ae.dbManager.DatabasesAwaitingRestore() {
+		for _, peer := range aliveNodes {
+			err := ae.snapshotFunc(ctx, peer.NodeId, peer.Address, dbName)
+			if err == nil {
+				telemetry.AntiEntropySyncsTotal.With("snapshot", "success").Inc()
+				log.Info().Uint64("peer_node", peer.NodeId).Str("database", dbName).
+					Msg("Restored a database whose earlier reattach failed")
+				break
+			}
+			telemetry.AntiEntropySyncsTotal.With("snapshot", "failed").Inc()
+			log.Warn().Err(err).Uint64("peer_node", peer.NodeId).Str("database", dbName).
+				Msg("Restore of a database awaiting one failed")
+		}
+	}
 }
 
 // findBestPeerForDatabase finds the peer with highest max_txn_id or most transactions

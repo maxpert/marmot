@@ -93,3 +93,28 @@ func TestProcessLeavesTranspileErrNilOnParseFailure(t *testing.T) {
 		t.Errorf("TranspileErr = %v for a parse failure; want nil", ctx.Output.TranspileErr)
 	}
 }
+
+// TestTranspileRefusesAnAlterFloorNoColumnTakes pins that the ALTER refusal
+// reaches the protocol layer as ER_NOT_SUPPORTED_YET through the real rule set,
+// rather than the floor being dropped or the statement reaching SQLite, which
+// would report a syntax error (1064).
+func TestTranspileRefusesAnAlterFloorNoColumnTakes(t *testing.T) {
+	pipeline, err := NewPipeline(1000, &mockIDGenerator{})
+	if err != nil {
+		t.Fatalf("NewPipeline: %v", err)
+	}
+	for _, sql := range []string{
+		"ALTER TABLE orders AUTO_INCREMENT=5000",
+		"ALTER TABLE orders ADD COLUMN note TEXT, AUTO_INCREMENT=5000",
+	} {
+		ctx := NewContext(sql, nil)
+		ctx.SchemaLookup = mockSchemaLookup(ruleErrorSchemas)
+		if err := pipeline.parser.Parse(ctx); err != nil {
+			t.Fatalf("parse %q: %v", sql, err)
+		}
+		coded, ok := pipeline.transpiler.Transpile(ctx).(*transform.CodedError)
+		if !ok || coded.Code != transform.ErrCodeNotSupportedYet {
+			t.Errorf("%q: Transpile did not refuse with ER_NOT_SUPPORTED_YET", sql)
+		}
+	}
+}

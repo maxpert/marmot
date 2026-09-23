@@ -802,9 +802,32 @@ type Statement struct {
 	//	*Statement_LoadDataChange
 	//	*Statement_VectorIndexChange
 	//	*Statement_DmlIntent
-	Payload       isStatement_Payload `protobuf_oneof:"payload"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Payload isStatement_Payload `protobuf_oneof:"payload"`
+	// auto_id_claim marks this statement as a narrow AUTO_INCREMENT range claim
+	// rather than ordinary DML.
+	//
+	// It is a FLAG on an existing StatementType, never a new StatementType, and
+	// that is a rolling-upgrade requirement. A node running an older binary
+	// ignores an unknown field, sees a DML statement carrying no row image, and
+	// rejects it at the "DML prepare missing encoded CDC row" gate - which is a
+	// clean failed transaction. A new StatementType would instead reach a
+	// conversion that does not know it, and before that gate.
+	//
+	// The claim's payload does not travel here: it is written into the
+	// transaction's intent DataSnapshot, which is what the COMMIT handler reads.
+	AutoIdClaim bool `protobuf:"varint,9,opt,name=auto_id_claim,json=autoIdClaim,proto3" json:"auto_id_claim,omitempty"`
+	// auto_id_claim_payload carries the claim itself: {table, prevBase, newBase,
+	// size}, msgpack-encoded.
+	//
+	// It needs a field of its own because each PARTICIPANT writes the claim into
+	// its own transaction intent at PREPARE, and the COMMIT handler reads it back
+	// from there - so the payload has to reach the participant. It cannot ride in
+	// the oneof: RowChange would give the statement a row image and defeat the
+	// rolling-upgrade gate above, DDLChange is the wrong statement type, and
+	// DMLIntent carries only an intent key.
+	AutoIdClaimPayload []byte `protobuf:"bytes,10,opt,name=auto_id_claim_payload,json=autoIdClaimPayload,proto3" json:"auto_id_claim_payload,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *Statement) Reset() {
@@ -906,6 +929,20 @@ func (x *Statement) GetDmlIntent() *DMLIntent {
 		if x, ok := x.Payload.(*Statement_DmlIntent); ok {
 			return x.DmlIntent
 		}
+	}
+	return nil
+}
+
+func (x *Statement) GetAutoIdClaim() bool {
+	if x != nil {
+		return x.AutoIdClaim
+	}
+	return false
+}
+
+func (x *Statement) GetAutoIdClaimPayload() []byte {
+	if x != nil {
+		return x.AutoIdClaimPayload
 	}
 	return nil
 }
@@ -1441,7 +1478,23 @@ type TransactionResponse struct {
 	// Rejected marks a deterministic refusal of the statement itself during
 	// PREPARE (for example DDL SQLite cannot apply), as opposed to a timeout
 	// or storage error. See db.PrepareResult.Rejected.
-	Rejected      bool `protobuf:"varint,6,opt,name=rejected,proto3" json:"rejected,omitempty"`
+	Rejected bool `protobuf:"varint,6,opt,name=rejected,proto3" json:"rejected,omitempty"`
+	// auto_id_stored_base is the participant's own committed base for the table a
+	// rejected AUTO_INCREMENT range claim named.
+	//
+	// The claimant retries with the maximum base any participant returned, so a
+	// rejection has to carry a number. Encoding it into error_message and parsing
+	// it back out would be exactly the string matching this codebase forbids.
+	// Zero means "not applicable": every response that is not a claim rejection.
+	AutoIdStoredBase uint64 `protobuf:"varint,7,opt,name=auto_id_stored_base,json=autoIdStoredBase,proto3" json:"auto_id_stored_base,omitempty"`
+	// error_code is the MySQL server error code the rejecting participant chose
+	// for this refusal (for example 1264 ER_WARN_DATA_OUT_OF_RANGE for a
+	// width-ceiling refusal). error_message carries the text; a typed error
+	// cannot cross the wire, so without this field every deterministic remote
+	// refusal reaches the client as 1105 HY000. Zero means "not supplied": an
+	// older participant, or a failure that named no code, and the coordinator
+	// then classifies the message as before.
+	ErrorCode     uint32 `protobuf:"varint,8,opt,name=error_code,json=errorCode,proto3" json:"error_code,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1516,6 +1569,20 @@ func (x *TransactionResponse) GetRejected() bool {
 		return x.Rejected
 	}
 	return false
+}
+
+func (x *TransactionResponse) GetAutoIdStoredBase() uint64 {
+	if x != nil {
+		return x.AutoIdStoredBase
+	}
+	return 0
+}
+
+func (x *TransactionResponse) GetErrorCode() uint32 {
+	if x != nil {
+		return x.ErrorCode
+	}
+	return 0
 }
 
 type ReadRequest struct {
@@ -2053,8 +2120,13 @@ func (x *DatabaseReplicationState) GetMaxSeqNum() uint64 {
 type SnapshotInfoRequest struct {
 	state            protoimpl.MessageState `protogen:"open.v1"`
 	RequestingNodeId uint64                 `protobuf:"varint,1,opt,name=requesting_node_id,json=requestingNodeId,proto3" json:"requesting_node_id,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// Optional: describe only this database, for a StreamSnapshot naming the
+	// same database; empty = every database. A per-database request is refused
+	// only while that database is out of service, a whole-node request while
+	// any database is. An older server ignores it and describes every database.
+	Database      string `protobuf:"bytes,2,opt,name=database,proto3" json:"database,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *SnapshotInfoRequest) Reset() {
@@ -2092,6 +2164,13 @@ func (x *SnapshotInfoRequest) GetRequestingNodeId() uint64 {
 		return x.RequestingNodeId
 	}
 	return 0
+}
+
+func (x *SnapshotInfoRequest) GetDatabase() string {
+	if x != nil {
+		return x.Database
+	}
+	return ""
 }
 
 type SnapshotInfoResponse struct {
@@ -3409,7 +3488,7 @@ const file_grpc_marmot_proto_rawDesc = "" +
 	"\x05phase\x18\x05 \x01(\x0e2\x1b.marmot.v2.TransactionPhaseR\x05phase\x12=\n" +
 	"\vconsistency\x18\x06 \x01(\x0e2\x1b.marmot.v2.ConsistencyLevelR\vconsistency\x12\x1a\n" +
 	"\bdatabase\x18\a \x01(\tR\bdatabase\x126\n" +
-	"\x17required_schema_version\x18\t \x01(\x04R\x15requiredSchemaVersionJ\x04\b\b\x10\t\"\xbf\x03\n" +
+	"\x17required_schema_version\x18\t \x01(\x04R\x15requiredSchemaVersionJ\x04\b\b\x10\t\"\x96\x04\n" +
 	"\tStatement\x120\n" +
 	"\x04type\x18\x01 \x01(\x0e2\x1c.marmot.common.StatementTypeR\x04type\x12\x1d\n" +
 	"\n" +
@@ -3422,7 +3501,10 @@ const file_grpc_marmot_proto_rawDesc = "" +
 	"\x10load_data_change\x18\x06 \x01(\v2\x19.marmot.v2.LoadDataChangeH\x00R\x0eloadDataChange\x12N\n" +
 	"\x13vector_index_change\x18\a \x01(\v2\x1c.marmot.v2.VectorIndexChangeH\x00R\x11vectorIndexChange\x125\n" +
 	"\n" +
-	"dml_intent\x18\b \x01(\v2\x14.marmot.v2.DMLIntentH\x00R\tdmlIntentB\t\n" +
+	"dml_intent\x18\b \x01(\v2\x14.marmot.v2.DMLIntentH\x00R\tdmlIntent\x12\"\n" +
+	"\rauto_id_claim\x18\t \x01(\bR\vautoIdClaim\x121\n" +
+	"\x15auto_id_claim_payload\x18\n" +
+	" \x01(\fR\x12autoIdClaimPayloadB\t\n" +
 	"\apayload\"\xe4\x05\n" +
 	"\x11VectorIndexChange\x124\n" +
 	"\x06action\x18\x01 \x01(\x0e2\x1c.marmot.v2.VectorIndexActionR\x06action\x12\x1a\n" +
@@ -3470,7 +3552,7 @@ const file_grpc_marmot_proto_rawDesc = "" +
 	"\x03HLC\x12\x1b\n" +
 	"\twall_time\x18\x01 \x01(\x03R\bwallTime\x12\x18\n" +
 	"\alogical\x18\x02 \x01(\x05R\alogical\x12\x17\n" +
-	"\anode_id\x18\x03 \x01(\x04R\x06nodeId\"\xf7\x01\n" +
+	"\anode_id\x18\x03 \x01(\x04R\x06nodeId\"\xc5\x02\n" +
 	"\x13TransactionResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12#\n" +
 	"\rerror_message\x18\x02 \x01(\tR\ferrorMessage\x12-\n" +
@@ -3478,7 +3560,10 @@ const file_grpc_marmot_proto_rawDesc = "" +
 	"applied_at\x18\x03 \x01(\v2\x0e.marmot.v2.HLCR\tappliedAt\x12+\n" +
 	"\x11conflict_detected\x18\x04 \x01(\bR\x10conflictDetected\x12)\n" +
 	"\x10conflict_details\x18\x05 \x01(\tR\x0fconflictDetails\x12\x1a\n" +
-	"\brejected\x18\x06 \x01(\bR\brejected\"\xf4\x01\n" +
+	"\brejected\x18\x06 \x01(\bR\brejected\x12-\n" +
+	"\x13auto_id_stored_base\x18\a \x01(\x04R\x10autoIdStoredBase\x12\x1d\n" +
+	"\n" +
+	"error_code\x18\b \x01(\rR\terrorCode\"\xf4\x01\n" +
 	"\vReadRequest\x12\x14\n" +
 	"\x05query\x18\x01 \x01(\tR\x05query\x12$\n" +
 	"\x0esource_node_id\x18\x02 \x01(\x04R\fsourceNodeId\x12/\n" +
@@ -3525,9 +3610,10 @@ const file_grpc_marmot_proto_rawDesc = "" +
 	"syncStatus\x12+\n" +
 	"\x12current_max_txn_id\x18\x06 \x01(\x04R\x0fcurrentMaxTxnId\x12.\n" +
 	"\x13committed_txn_count\x18\a \x01(\x03R\x11committedTxnCount\x12\x1e\n" +
-	"\vmax_seq_num\x18\b \x01(\x04R\tmaxSeqNum\"C\n" +
+	"\vmax_seq_num\x18\b \x01(\x04R\tmaxSeqNum\"_\n" +
 	"\x13SnapshotInfoRequest\x12,\n" +
-	"\x12requesting_node_id\x18\x01 \x01(\x04R\x10requestingNodeId\"\xcc\x02\n" +
+	"\x12requesting_node_id\x18\x01 \x01(\x04R\x10requestingNodeId\x12\x1a\n" +
+	"\bdatabase\x18\x02 \x01(\tR\bdatabase\"\xcc\x02\n" +
 	"\x14SnapshotInfoResponse\x12&\n" +
 	"\x0fsnapshot_txn_id\x18\x01 \x01(\x04R\rsnapshotTxnId\x12.\n" +
 	"\x13snapshot_size_bytes\x18\x02 \x01(\x03R\x11snapshotSizeBytes\x12!\n" +

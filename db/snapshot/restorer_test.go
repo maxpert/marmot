@@ -512,3 +512,63 @@ func TestRestorer_RemovesOldWALAndSHM(t *testing.T) {
 		t.Error("expected new content in database file")
 	}
 }
+
+// TestRestorer_SystemDBMergeRunsBeforeTheSwap: the merge sees the downloaded
+// system database and the local one it is about to replace, and a failed
+// merge leaves every local file untouched.
+//
+// Mutation: skip mergeSystemDB in atomicApply. "the system database was
+// installed without the merge" fires.
+func TestRestorer_SystemDBMergeRunsBeforeTheSwap(t *testing.T) {
+	srcDir := t.TempDir()
+	dstDir := t.TempDir()
+	incoming := []byte("peer system db")
+	local := []byte("local system db")
+	userDB := []byte("peer user db")
+	if err := os.MkdirAll(filepath.Join(srcDir, "databases"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dstDir, "databases"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	srcSys := filepath.Join(srcDir, "__marmot_system.db")
+	srcUser := filepath.Join(srcDir, "databases", "app.db")
+	dstSys := filepath.Join(dstDir, "__marmot_system.db")
+	dstUser := filepath.Join(dstDir, "databases", "app.db")
+	for path, content := range map[string][]byte{srcSys: incoming, srcUser: userDB, dstSys: local, dstUser: []byte("local user db")} {
+		if err := os.WriteFile(path, content, 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	files := []DatabaseFileInfo{
+		{Name: "__marmot_system", Filename: "__marmot_system.db", SizeBytes: int64(len(incoming)), SHA256Checksum: calculateSHA256(incoming)},
+		{Name: "app", Filename: "databases/app.db", SizeBytes: int64(len(userDB)), SHA256Checksum: calculateSHA256(userDB)},
+	}
+
+	var gotIncoming, gotLocal string
+	failing := NewRestorer(dstDir, nil)
+	failing.SetSystemDBMerge(func(in, loc string) error {
+		gotIncoming, gotLocal = in, loc
+		return os.ErrPermission
+	})
+	if err := failing.RestoreFiles(srcDir, files); err == nil {
+		t.Fatal("a failed merge must abort the restore")
+	}
+	if gotIncoming != srcSys || gotLocal != dstSys {
+		t.Fatalf("merge saw (%s, %s), want (%s, %s)", gotIncoming, gotLocal, srcSys, dstSys)
+	}
+	for path, want := range map[string]string{dstSys: "local system db", dstUser: "local user db"} {
+		if got, _ := os.ReadFile(path); string(got) != want {
+			t.Fatalf("%s was swapped although the merge failed: %q", path, got)
+		}
+	}
+
+	r := NewRestorer(dstDir, nil)
+	r.SetSystemDBMerge(func(in, _ string) error { return os.WriteFile(in, []byte("merged"), 0644) })
+	if err := r.RestoreFiles(srcDir, files); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	if got, _ := os.ReadFile(dstSys); string(got) != "merged" {
+		t.Fatalf("the system database was installed without the merge: %q", got)
+	}
+}

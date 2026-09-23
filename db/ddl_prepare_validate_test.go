@@ -303,3 +303,109 @@ func TestIsDDLRejection_ReadonlyIsNotRejected(t *testing.T) {
 	require.False(t, isDDLRejection(context.Background(), verr),
 		"a read-only database is a condition on this node, not a verdict on the DDL")
 }
+
+// TestValidateDDLStatements_AutoIncWidthExceededIsRejected pins that a table whose explicitly declared AUTO_INCREMENT column
+// cannot hold a row's existing value must be rejected at PREPARE, not left to
+// fail later at COMMIT.
+func TestValidateDDLStatements_AutoIncWidthExceededIsRejected(t *testing.T) {
+	t.Parallel()
+	db := openDDLValidationDB(t)
+
+	err := ValidateDDLStatements(context.Background(), db, []string{
+		`CREATE TABLE narrow (id INTEGER /*M:8a*/ PRIMARY KEY)`,
+		`INSERT INTO narrow (id) VALUES (200)`,
+	})
+	require.Error(t, err)
+
+	var widthErr *AutoIncWidthExceededError
+	require.True(t, errors.As(err, &widthErr), "expected *AutoIncWidthExceededError, got %T: %v", err, err)
+	require.Equal(t, "narrow", widthErr.Table)
+	require.Equal(t, "id", widthErr.Column)
+	require.Equal(t, uint64(200), widthErr.Max)
+	require.Equal(t, uint64(127), widthErr.WidthMax) // TINYINT signed ceiling
+
+	require.True(t, isDDLRejection(context.Background(), err),
+		"a width-ceiling violation is always a deterministic rejection")
+
+	// Validation always rolls back: the table must not exist afterwards.
+	var count int
+	require.NoError(t, db.QueryRow(
+		`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='narrow'`).Scan(&count))
+	require.Equal(t, 0, count)
+}
+
+// TestValidateDDLStatements_ExistingRowsExceedNarrowedWidthIsRejected covers
+// the scenario 2c exists for: a table that already held rows before this
+// DDL ran gets narrowed (here, via a rebuild - CREATE + copy + DROP + RENAME,
+// the only way SQLite can ever change a column's declared type) to a width
+// its own existing data no longer fits.
+func TestValidateDDLStatements_ExistingRowsExceedNarrowedWidthIsRejected(t *testing.T) {
+	t.Parallel()
+	db := openDDLValidationDB(t)
+
+	_, err := db.Exec(`CREATE TABLE wide (id INTEGER /*M:32a*/ PRIMARY KEY)`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO wide (id) VALUES (200)`)
+	require.NoError(t, err)
+
+	verr := ValidateDDLStatements(context.Background(), db, []string{
+		`CREATE TABLE wide_new (id INTEGER /*M:8a*/ PRIMARY KEY)`,
+		`INSERT INTO wide_new SELECT id FROM wide`,
+		`DROP TABLE wide`,
+		`ALTER TABLE wide_new RENAME TO wide`,
+	})
+	require.Error(t, verr)
+
+	var widthErr *AutoIncWidthExceededError
+	require.True(t, errors.As(verr, &widthErr), "expected *AutoIncWidthExceededError, got %T: %v", verr, verr)
+	require.Equal(t, "wide", widthErr.Table)
+	require.True(t, isDDLRejection(context.Background(), verr))
+
+	// Rolled back: the table's original (wide) declared type is unchanged.
+	var createSQL string
+	require.NoError(t, db.QueryRow(`SELECT sql FROM sqlite_master WHERE name='wide'`).Scan(&createSQL))
+	require.Contains(t, createSQL, "/*M:32a*/")
+}
+
+// TestValidateDDLStatements_AutoIncWidthWithinCeilingIsAccepted is the
+// negative case: a row within the declared width's ceiling must not be
+// rejected.
+func TestValidateDDLStatements_AutoIncWidthWithinCeilingIsAccepted(t *testing.T) {
+	t.Parallel()
+	db := openDDLValidationDB(t)
+
+	require.NoError(t, ValidateDDLStatements(context.Background(), db, []string{
+		`CREATE TABLE narrow (id INTEGER /*M:8a*/ PRIMARY KEY)`,
+		`INSERT INTO narrow (id) VALUES (127)`,
+	}))
+}
+
+// TestValidateDDLStatements_NewEmptyMarkedTableIsAccepted covers the common
+// case: a brand-new marked table with no rows has nothing to violate the
+// ceiling.
+func TestValidateDDLStatements_NewEmptyMarkedTableIsAccepted(t *testing.T) {
+	t.Parallel()
+	db := openDDLValidationDB(t)
+
+	require.NoError(t, ValidateDDLStatements(context.Background(), db, []string{
+		`CREATE TABLE narrow (id INTEGER /*M:8a*/ PRIMARY KEY)`,
+	}))
+}
+
+// TestValidateDDLStatements_UnrelatedTableIsNotChecked proves the ceiling
+// check is scoped to tables this DDL actually touched: a pre-existing table
+// that already violates its own declared ceiling must not fail an unrelated
+// CREATE TABLE that never references it.
+func TestValidateDDLStatements_UnrelatedTableIsNotChecked(t *testing.T) {
+	t.Parallel()
+	db := openDDLValidationDB(t)
+
+	_, err := db.Exec(`CREATE TABLE already_bad (id INTEGER /*M:8a*/ PRIMARY KEY)`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO already_bad (id) VALUES (200)`)
+	require.NoError(t, err)
+
+	require.NoError(t, ValidateDDLStatements(context.Background(), db, []string{
+		`CREATE TABLE unrelated (id INTEGER PRIMARY KEY)`,
+	}))
+}

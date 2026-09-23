@@ -1383,7 +1383,7 @@ func (s *MySQLServer) handleStmtExecute(conn net.Conn, session *ConnectionSessio
 				offset, val, err = parseParamValue(payload, offset, paramType, unsigned)
 				if err != nil {
 					if errors.Is(err, errUnsignedBigintOutOfRange) {
-						_ = s.writeErrorWithState(conn, 1, 1264, "22003",
+						_ = s.writeErrorWithState(conn, 1, ErrCodeDataOutOfRange, SQLStateDataOutOfRange,
 							fmt.Sprintf("Out of range value for parameter %d", i))
 					} else {
 						_ = s.writeError(conn, 1, ErrCodeParseError, fmt.Sprintf("Failed to parse parameter %d: %v", i, err))

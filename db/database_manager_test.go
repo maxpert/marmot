@@ -537,7 +537,7 @@ func TestTakeSnapshotForDatabaseNotFound(t *testing.T) {
 		t.Fatal("Expected error for non-existent database, got nil")
 	}
 
-	expectedErr := "database nonexistent not found"
+	expectedErr := "database nonexistent does not exist"
 	if !strings.Contains(err.Error(), expectedErr) {
 		t.Errorf("Expected error containing '%s', got '%s'", expectedErr, err.Error())
 	}

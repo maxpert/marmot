@@ -27,6 +27,10 @@ type Restorer struct {
 	connMgr  ConnectionManager
 	systemDB string // "__marmot_system" by default
 
+	// systemDBMerge, when set, rewrites a downloaded system database before
+	// it replaces the local one (see SetSystemDBMerge).
+	systemDBMerge func(incomingPath, localPath string) error
+
 	mu       sync.RWMutex
 	progress Progress
 }
@@ -39,6 +43,14 @@ func NewRestorer(dataDir string, connMgr ConnectionManager) *Restorer {
 		systemDB: "__marmot_system",
 		progress: Progress{Phase: PhaseIdle},
 	}
+}
+
+// SetSystemDBMerge installs fn, which runs on a downloaded system database
+// before it replaces the local one: fn(incomingPath, localPath) may rewrite
+// incomingPath, and an error aborts the restore before any file is swapped.
+// It carries state the local system database must not lose to a peer's copy.
+func (r *Restorer) SetSystemDBMerge(fn func(incomingPath, localPath string) error) {
+	r.systemDBMerge = fn
 }
 
 // GetProgress returns current restore progress (thread-safe)
@@ -254,6 +266,10 @@ func (r *Restorer) updateFilesComplete(filesComplete int) {
 
 // atomicApply swaps snapshot files into place atomically
 func (r *Restorer) atomicApply(tempDir string, files []DatabaseFileInfo) error {
+	if err := r.mergeSystemDB(tempDir, files); err != nil {
+		return err
+	}
+
 	// STEP 5: Close all SQLite connections
 	for _, dbInfo := range files {
 		if dbInfo.Name == r.systemDB {
@@ -317,6 +333,28 @@ func (r *Restorer) atomicApply(tempDir string, files []DatabaseFileInfo) error {
 	}
 
 	log.Info().Msg("Snapshot applied successfully")
+	return nil
+}
+
+// mergeSystemDB runs systemDBMerge on the downloaded system database, if the
+// snapshot carries one, before anything is swapped.
+func (r *Restorer) mergeSystemDB(tempDir string, files []DatabaseFileInfo) error {
+	if r.systemDBMerge == nil {
+		return nil
+	}
+	for _, dbInfo := range files {
+		if dbInfo.Name != r.systemDB {
+			continue
+		}
+		relPath := r.systemDB + ".db"
+		srcPath := filepath.Join(tempDir, relPath)
+		if _, err := os.Stat(srcPath); os.IsNotExist(err) {
+			return nil
+		}
+		if err := r.systemDBMerge(srcPath, filepath.Join(r.dataDir, relPath)); err != nil {
+			return fmt.Errorf("merge local state into snapshot system database: %w", err)
+		}
+	}
 	return nil
 }
 

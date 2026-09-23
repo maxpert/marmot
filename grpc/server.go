@@ -21,21 +21,14 @@ import (
 	"github.com/rs/zerolog/log"
 	"github.com/soheilhy/cmux"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/reflection"
+	"google.golang.org/grpc/status"
 )
 
 // errStopIteration is a sentinel error used to exit early from transaction iteration.
 var errStopIteration = errors.New("stop iteration")
-
-// snapshotCacheEntry represents a cached snapshot for a database
-type snapshotCacheEntry struct {
-	snapshotInfo db.SnapshotInfo
-	maxTxnID     uint64
-	createdAt    time.Time
-	expiresAt    time.Time
-	tempDir      string
-}
 
 // Server implements the gRPC server for Marmot
 type Server struct {
@@ -62,9 +55,8 @@ type Server struct {
 	// CDC signal-based change streaming
 	cdcSubscriber db.CDCSubscriber
 
-	// Snapshot caching
-	snapshotCache   map[string]*snapshotCacheEntry
-	snapshotCacheMu sync.RWMutex
+	// Per-database snapshot exports served within snapshot_cache_ttl_seconds
+	snapshotExports snapshotExportCache
 
 	mu       sync.RWMutex
 	stopCh   chan struct{}
@@ -88,12 +80,11 @@ type ServerConfig struct {
 // NewServer creates a new gRPC server
 func NewServer(config ServerConfig) (*Server, error) {
 	s := &Server{
-		nodeID:        config.NodeID,
-		address:       config.Address,
-		port:          config.Port,
-		httpMux:       http.NewServeMux(),
-		snapshotCache: make(map[string]*snapshotCacheEntry),
-		stopCh:        make(chan struct{}),
+		nodeID:  config.NodeID,
+		address: config.Address,
+		port:    config.Port,
+		httpMux: http.NewServeMux(),
+		stopCh:  make(chan struct{}),
 	}
 
 	// Initialize components with advertise address
@@ -841,9 +832,20 @@ func (s *Server) GetReplicationState(ctx context.Context, req *ReplicationStateR
 // SNAPSHOT METHODS
 // =======================
 
+// snapshotError reports a snapshot producer's failure. A database detached for
+// its own restore makes this node's snapshot temporarily unavailable rather
+// than incomplete, so that case is codes.Unavailable, which callers retry.
+func snapshotError(msg string, err error) error {
+	if errors.Is(err, db.ErrDatabaseDetached) {
+		return status.Errorf(codes.Unavailable, "%s: %v", msg, err)
+	}
+	return fmt.Errorf("%s: %w", msg, err)
+}
+
 // GetSnapshotInfo returns snapshot metadata for bootstrap.
 // NOTE: This returns estimated info. The actual snapshot is taken atomically
-// during StreamSnapshot to ensure consistency.
+// during StreamSnapshot to ensure consistency; a receiver verifies the files
+// it streams against this info.
 func (s *Server) GetSnapshotInfo(ctx context.Context, req *SnapshotInfoRequest) (*SnapshotInfoResponse, error) {
 	s.mu.RLock()
 	dbManager := s.dbManager
@@ -855,13 +857,18 @@ func (s *Server) GetSnapshotInfo(ctx context.Context, req *SnapshotInfoRequest) 
 
 	log.Info().
 		Uint64("requesting_node", req.RequestingNodeId).
+		Str("database", req.Database).
 		Msg("Snapshot info requested")
+
+	if req.Database != "" {
+		return s.databaseSnapshotInfo(dbManager, req.Database)
+	}
 
 	// Use TakeSnapshot for metadata estimation only
 	// The actual atomic snapshot is taken in StreamSnapshot
 	snapshots, maxTxnID, err := dbManager.TakeSnapshot()
 	if err != nil {
-		return nil, fmt.Errorf("failed to get snapshot info: %w", err)
+		return nil, snapshotError("failed to get snapshot info", err)
 	}
 
 	// Schema versions travel with the snapshot: they live in the MetaStore, which
@@ -911,9 +918,36 @@ func (s *Server) GetSnapshotInfo(ctx context.Context, req *SnapshotInfoRequest) 
 	}, nil
 }
 
+// databaseSnapshotInfo is GetSnapshotInfo for database alone.
+func (s *Server) databaseSnapshotInfo(dbManager *db.DatabaseManager, database string) (*SnapshotInfoResponse, error) {
+	snap, txnID, err := dbManager.TakeDatabaseSnapshotInfo(database)
+	if err != nil {
+		return nil, snapshotError("failed to get snapshot info", err)
+	}
+	chunkSize := int64(coordinator.GetStreamChunkSize())
+	return &SnapshotInfoResponse{
+		SnapshotTxnId:     txnID,
+		SnapshotSizeBytes: snap.Size,
+		TotalChunks:       int32((snap.Size + chunkSize - 1) / chunkSize),
+		Databases: []*DatabaseFileInfo{{
+			Name:           snap.Name,
+			Filename:       snap.Filename,
+			SizeBytes:      snap.Size,
+			Sha256Checksum: snap.SHA256,
+		}},
+		DatabaseMetadata: []*DatabaseSnapshotMetadata{{
+			DatabaseName:   snap.Name,
+			SnapshotTxnId:  txnID,
+			SizeBytes:      snap.Size,
+			Sha256Checksum: snap.SHA256,
+			SchemaVersion:  snapshotSchemaVersions(dbManager)[snap.Name],
+		}},
+	}, nil
+}
+
 // StreamSnapshot streams snapshot chunks to requesting node.
 // Uses atomic snapshot: copies files to temp dir under write lock, then streams from temp.
-// Implements caching with TTL to avoid repeated checkpoints when multiple replicas request same snapshot.
+// A single-database export is shared for snapshot_cache_ttl_seconds when that is above 0.
 func (s *Server) StreamSnapshot(req *SnapshotRequest, stream MarmotService_StreamSnapshotServer) error {
 	s.mu.RLock()
 	dbManager := s.dbManager
@@ -932,128 +966,29 @@ func (s *Server) StreamSnapshot(req *SnapshotRequest, stream MarmotService_Strea
 		Str("database", req.Database).
 		Msg("Starting snapshot stream")
 
-	var snapshots []db.SnapshotInfo
-	var maxTxnID uint64
-	var schemaVersions map[string]uint64
-	var tempDir string
-	var shouldCleanup bool
-
-	if req.Database != "" {
-		// Single database snapshot - use cache
-		cacheKey := req.Database
-
-		// Check cache first
-		s.snapshotCacheMu.RLock()
-		cached, exists := s.snapshotCache[cacheKey]
-		s.snapshotCacheMu.RUnlock()
-
-		if exists && time.Now().Before(cached.expiresAt) {
-			// Cache hit - use cached snapshot
-			log.Debug().
-				Str("database", req.Database).
-				Uint64("cached_txn_id", cached.maxTxnID).
-				Time("expires_at", cached.expiresAt).
-				Msg("Serving cached snapshot")
-
-			snapshots = []db.SnapshotInfo{cached.snapshotInfo}
-			maxTxnID = cached.maxTxnID
-			tempDir = cached.tempDir
-			shouldCleanup = false
-
-			// Single-database snapshots don't capture schema versions in the
-			// same atomic step as the file copy (unlike TakeSnapshotToDir), so
-			// read the current value here instead - it is the best available
-			// estimate for this legacy path.
-			schemaVersions = snapshotSchemaVersions(dbManager)
-		} else {
-			// Cache miss or expired - create new snapshot
-			if exists {
-				log.Debug().
-					Str("database", req.Database).
-					Msg("Cache expired, creating new snapshot")
-				// Clean up old cache entry
-				s.snapshotCacheMu.Lock()
-				delete(s.snapshotCache, cacheKey)
-				s.snapshotCacheMu.Unlock()
-				os.RemoveAll(cached.tempDir)
-			} else {
-				log.Debug().
-					Str("database", req.Database).
-					Msg("Cache miss, creating new snapshot")
-			}
-
-			// Create temp directory for atomic snapshot
-			var err error
-			tempDir, err = os.MkdirTemp(dataDir, "snapshot-export-")
-			if err != nil {
-				return fmt.Errorf("failed to create temp directory: %w", err)
-			}
-
-			snapshot, txnID, err := dbManager.TakeSnapshotForDatabase(tempDir, req.Database)
-			if err != nil {
-				os.RemoveAll(tempDir)
-				return fmt.Errorf("failed to snapshot database %s: %w", req.Database, err)
-			}
-			snapshots = []db.SnapshotInfo{snapshot}
-			maxTxnID = txnID
-			schemaVersions = snapshotSchemaVersions(dbManager)
-
-			// Cache the snapshot
-			ttl := time.Duration(cfg.Config.Replica.SnapshotCacheTTLSec) * time.Second
-			now := time.Now()
-			s.snapshotCacheMu.Lock()
-			s.snapshotCache[cacheKey] = &snapshotCacheEntry{
-				snapshotInfo: snapshot,
-				maxTxnID:     txnID,
-				createdAt:    now,
-				expiresAt:    now.Add(ttl),
-				tempDir:      tempDir,
-			}
-			s.snapshotCacheMu.Unlock()
-
-			log.Info().
-				Str("database", req.Database).
-				Uint64("snapshot_txn_id", txnID).
-				Dur("ttl", ttl).
-				Msg("Single database snapshot created and cached")
-
-			shouldCleanup = false
-		}
-
-	} else {
-		// All databases snapshot (backward compatible, no caching for full snapshots)
-		var err error
-		tempDir, err = os.MkdirTemp(dataDir, "snapshot-export-")
-		if err != nil {
-			return fmt.Errorf("failed to create temp directory: %w", err)
-		}
-
-		snapshots, maxTxnID, schemaVersions, err = dbManager.TakeSnapshotToDir(tempDir)
-		if err != nil {
-			os.RemoveAll(tempDir)
-			return fmt.Errorf("failed to take snapshot: %w", err)
-		}
-
-		log.Info().
-			Int("databases", len(snapshots)).
-			Uint64("snapshot_txn_id", maxTxnID).
-			Msg("Full snapshot created (no caching)")
-
-		shouldCleanup = true
+	export, err := s.exportSnapshot(dbManager, dataDir, req.Database)
+	if err != nil {
+		return err
 	}
+	defer export.release()
+	snapshots := export.snapshots
+	maxTxnID := export.maxTxnID
 
 	// Advertise the schema versions captured with these exact files as stream
 	// trailer metadata. GetSnapshotInfo's earlier estimate can go stale if a
 	// DDL commits between that call and this one; receivers prefer this value
 	// (see grpc.SnapshotVersionsForRestore) so they never restore a version
 	// older than the files they actually received.
+	schemaVersions := export.schemaVersions
+	if req.Database != "" {
+		// Single-database snapshots don't capture schema versions in the
+		// same atomic step as the file copy (unlike TakeSnapshotToDir), so
+		// read the current value here instead - it is the best available
+		// estimate for this legacy path.
+		schemaVersions = snapshotSchemaVersions(dbManager)
+	}
 	if trailer := snapshotSchemaVersionsTrailer(schemaVersions); trailer != nil {
 		stream.SetTrailer(trailer)
-	}
-
-	// Cleanup temp directory when done (only for non-cached snapshots)
-	if shouldCleanup {
-		defer os.RemoveAll(tempDir)
 	}
 
 	log.Info().
@@ -1139,6 +1074,49 @@ func (s *Server) StreamSnapshot(req *SnapshotRequest, stream MarmotService_Strea
 	return nil
 }
 
+// exportSnapshot returns an export of database (every database when empty)
+// with one reference held for the caller, who must release it. A
+// single-database export is served from, and published to, the cache only
+// when snapshot_cache_ttl_seconds is above 0; otherwise the caller's release
+// removes it, as it does every whole-node export.
+func (s *Server) exportSnapshot(dbManager *db.DatabaseManager, dataDir, database string) (*snapshotExport, error) {
+	ttl := time.Duration(cfg.Config.Replica.SnapshotCacheTTLSec) * time.Second
+	cached := database != "" && ttl > 0
+	if cached {
+		if export := s.snapshotExports.acquire(database, time.Now()); export != nil {
+			log.Debug().Str("database", database).Uint64("cached_txn_id", export.maxTxnID).Msg("Serving cached snapshot")
+			return export, nil
+		}
+	}
+
+	export, err := newSnapshotExport(dataDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temp directory: %w", err)
+	}
+
+	if database == "" {
+		export.snapshots, export.maxTxnID, export.schemaVersions, err = dbManager.TakeSnapshotToDir(export.dir)
+		if err != nil {
+			export.release()
+			return nil, snapshotError("failed to take snapshot", err)
+		}
+		return export, nil
+	}
+
+	snapshot, txnID, err := dbManager.TakeSnapshotForDatabase(export.dir, database)
+	if err != nil {
+		export.release()
+		return nil, snapshotError(fmt.Sprintf("failed to snapshot database %s", database), err)
+	}
+	export.snapshots = []db.SnapshotInfo{snapshot}
+	export.maxTxnID = txnID
+	if cached {
+		export.expiresAt = time.Now().Add(ttl)
+		s.snapshotExports.publish(database, export)
+	}
+	return export, nil
+}
+
 // GetNodeRegistry returns the node registry (for testing/debugging)
 func (s *Server) GetNodeRegistry() *NodeRegistry {
 	return s.registry
@@ -1199,10 +1177,15 @@ func (s *Server) SetMetricsHandler(handler http.Handler) {
 	s.metricsHandler = handler
 }
 
-// SetDatabaseManager sets the database manager for snapshot operations
+// SetDatabaseManager sets the database manager for snapshot operations.
+// On first wiring it removes the export directories a crash left behind: no
+// stream can export before the manager is set.
 func (s *Server) SetDatabaseManager(manager *db.DatabaseManager) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.dbManager == nil && manager != nil {
+		removeOrphanedSnapshotExports(manager.GetDataDir())
+	}
 	s.dbManager = manager
 }
 
@@ -1394,48 +1377,12 @@ func (s *Server) runSnapshotCacheCleanup() {
 	}
 }
 
-// cleanupExpiredSnapshots removes expired cache entries and their temp directories
+// cleanupExpiredSnapshots evicts expired cached exports. A stream still
+// reading one keeps its directory until the stream finishes.
 func (s *Server) cleanupExpiredSnapshots() {
-	now := time.Now()
-	var toDelete []string
-
-	// Collect expired entries
-	s.snapshotCacheMu.RLock()
-	for dbName, entry := range s.snapshotCache {
-		if now.After(entry.expiresAt) {
-			toDelete = append(toDelete, dbName)
-		}
+	if n := s.snapshotExports.evictExpired(time.Now()); n > 0 {
+		log.Debug().Int("evicted", n).Msg("Snapshot cache cleanup completed")
 	}
-	s.snapshotCacheMu.RUnlock()
-
-	if len(toDelete) == 0 {
-		return
-	}
-
-	// Delete expired entries
-	s.snapshotCacheMu.Lock()
-	for _, dbName := range toDelete {
-		entry, exists := s.snapshotCache[dbName]
-		if !exists {
-			continue
-		}
-
-		// Remove temp directory
-		if err := os.RemoveAll(entry.tempDir); err != nil {
-			log.Warn().Err(err).Str("database", dbName).Str("temp_dir", entry.tempDir).Msg("Failed to cleanup expired snapshot cache")
-		}
-
-		delete(s.snapshotCache, dbName)
-
-		log.Debug().
-			Str("database", dbName).
-			Time("created_at", entry.createdAt).
-			Time("expired_at", entry.expiresAt).
-			Msg("Cleaned up expired snapshot cache entry")
-	}
-	s.snapshotCacheMu.Unlock()
-
-	log.Debug().Int("cleaned", len(toDelete)).Msg("Snapshot cache cleanup completed")
 }
 
 // =======================

@@ -40,7 +40,7 @@ func consistencyNeedsMajority(level protocol.ConsistencyLevel) bool {
 // It is ErrCodeLockTimeout (1205) because the condition is transient and the
 // client should retry: gossip converges within a few seconds of a peer becoming
 // reachable. 1205 is the code ORM retry layers already key on, alongside 1213,
-// and FINAL.md section 4 picks it for the same reason on the claim path. A
+// and the AUTO_INCREMENT claim path returns it for the same reason. A
 // non-retryable code would turn a few seconds of convergence into a failed
 // transaction the application has to handle itself.
 func ErrMembershipNotLearned() *protocol.MySQLError {

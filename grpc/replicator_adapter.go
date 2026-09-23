@@ -58,16 +58,24 @@ func (gr *GRPCReplicator) ReplicateTransaction(ctx context.Context, nodeID uint6
 		return nil, fmt.Errorf("gRPC call failed: %w", err)
 	}
 
-	// Convert gRPC TransactionResponse to coordinator.ReplicationResponse
-	resp := &coordinator.ReplicationResponse{
-		Success:          grpcResp.Success,
-		Error:            grpcResp.ErrorMessage,
-		ConflictDetected: grpcResp.ConflictDetected,
-		ConflictDetails:  grpcResp.ConflictDetails,
-		Rejected:         grpcResp.Rejected,
-	}
+	return convertTransactionResponse(grpcResp), nil
+}
 
-	return resp, nil
+// convertTransactionResponse converts a gRPC TransactionResponse into
+// coordinator.ReplicationResponse. Shared by the regular and streaming RPC
+// paths so both carry every field, including AutoIDStoredBase - the
+// participant's own committed base on a rejected AUTO_INCREMENT range claim,
+// which the claimant needs to retry above rather than spin.
+func convertTransactionResponse(resp *TransactionResponse) *coordinator.ReplicationResponse {
+	return &coordinator.ReplicationResponse{
+		Success:          resp.Success,
+		Error:            resp.ErrorMessage,
+		ConflictDetected: resp.ConflictDetected,
+		ConflictDetails:  resp.ConflictDetails,
+		Rejected:         resp.Rejected,
+		AutoIDStoredBase: resp.AutoIdStoredBase,
+		ErrorCode:        uint16(resp.GetErrorCode()),
+	}
 }
 
 // convertStatementsToProto converts protocol.Statement to gRPC Statement with CDC
@@ -94,8 +102,9 @@ func convertStatementsToProto(stmts []protocol.Statement, database string, txnID
 			Database:  stmtDB,
 		}
 
-		// For DML operations: send CDC row data
-		// For DDL operations: send SQL
+		protoStmt.AutoIdClaim = stmt.AutoIDClaim
+		protoStmt.AutoIdClaimPayload = stmt.AutoIDClaimPayload
+
 		isDML := stmt.Type == protocol.StatementInsert ||
 			stmt.Type == protocol.StatementUpdate ||
 			stmt.Type == protocol.StatementDelete ||
@@ -106,6 +115,8 @@ func convertStatementsToProto(stmts []protocol.Statement, database string, txnID
 			stmt.VectorIndexChange = &change
 		}
 
+		// For DML operations: send CDC row data
+		// For DDL operations: send SQL
 		switch {
 		case stmt.VectorIndexChange != nil:
 			protoStmt.Payload = &Statement_VectorIndexChange{
@@ -229,13 +240,5 @@ func (gr *GRPCReplicator) StreamReplicateTransaction(ctx context.Context, nodeID
 		return nil, fmt.Errorf("streaming gRPC call failed: %w", err)
 	}
 
-	// Convert gRPC TransactionResponse to coordinator.ReplicationResponse
-	resp := &coordinator.ReplicationResponse{
-		Success:          grpcResp.Success,
-		Error:            grpcResp.ErrorMessage,
-		ConflictDetected: grpcResp.ConflictDetected,
-		ConflictDetails:  grpcResp.ConflictDetails,
-	}
-
-	return resp, nil
+	return convertTransactionResponse(grpcResp), nil
 }

@@ -38,6 +38,19 @@ type PrepareResult struct {
 	// SQLite cannot apply. Infrastructure failures (timeouts, storage errors) leave
 	// it false so the coordinator keeps treating them as a missing ACK.
 	Rejected bool
+	// AutoIDStoredBase is this participant's own committed base for the table a
+	// rejected AUTO_INCREMENT range claim named, so the claimant can retry above
+	// it rather than spin. Zero on every response that is not such a rejection.
+	AutoIDStoredBase uint64
+	// ErrorCode is the MySQL server error code this rejection must reach the
+	// client with, when the underlying error named one (a
+	// transform.CodedError, for example the width-ceiling refusal's
+	// ER_WARN_DATA_OUT_OF_RANGE). Zero means "not supplied": the coordinator
+	// then falls back to classifying the message, as it did before. It exists
+	// because Error is a string - the typed error cannot survive the hop to
+	// the coordinator, local or remote, and without the code every
+	// deterministic refusal reaches the client as 1105 HY000.
+	ErrorCode uint16
 }
 
 // CommitRequest contains parameters for the commit phase
@@ -107,6 +120,19 @@ func (re *ReplicationEngine) isDatabaseOperation(statements []protocol.Statement
 	}
 	stmt := statements[0]
 	return stmt.Type == protocol.StatementCreateDatabase || stmt.Type == protocol.StatementDropDatabase
+}
+
+// statementsCarryAutoIDClaim reports whether a transaction carries an
+// AUTO_INCREMENT range claim. It reads the flag only, never the payload: the
+// COMMIT message is decision metadata, and the claim's values are read from the
+// intent this node wrote at PREPARE.
+func statementsCarryAutoIDClaim(statements []protocol.Statement) bool {
+	for _, stmt := range statements {
+		if stmt.AutoIDClaim {
+			return true
+		}
+	}
+	return false
 }
 
 // prepareDatabaseOperation handles CREATE/DROP DATABASE operations using system database
@@ -198,7 +224,8 @@ func (re *ReplicationEngine) prepareRegularTransaction(ctx context.Context, req 
 				Uint64("node_id", re.nodeID).
 				Bool("rejected", rejected).
 				Msg("DDL validation failed during PREPARE")
-			return &PrepareResult{Success: false, Error: err.Error(), Rejected: rejected}
+			return &PrepareResult{Success: false, Error: err.Error(), Rejected: rejected,
+				ErrorCode: mysqlCodeForError(err)}
 		}
 	}
 
@@ -212,6 +239,19 @@ func (re *ReplicationEngine) prepareRegularTransaction(ctx context.Context, req 
 	for _, stmt := range req.Statements {
 		stmtSeq++
 
+		// An AUTO_INCREMENT range claim is evaluated here, before
+		// processStatement, because it needs replicatedDB - this node's own
+		// SQLite - and because it must not reach either the empty-IntentKey
+		// gate or createDMLIntent's row-image check, both of which are written
+		// for ordinary DML.
+		if stmt.AutoIDClaim {
+			if result := re.prepareAutoIncClaim(replicatedDB, txn, txnMgr, metaStore, stmt, req); result != nil {
+				_ = txnMgr.AbortTransaction(txn)
+				return result
+			}
+			continue
+		}
+
 		if result := re.processStatement(txn, txnMgr, metaStore, stmt, req, stmtSeq, adoptCapturedRows); result != nil {
 			return result
 		}
@@ -223,6 +263,167 @@ func (re *ReplicationEngine) prepareRegularTransaction(ctx context.Context, req 
 	}
 
 	return &PrepareResult{Success: true}
+}
+
+// autoIncClaimStore resolves the AUTO_INCREMENT claim store, which is always
+// backed by the system database rather than req.Database (db/autoinc_claim.go):
+// a claim applied inside a pinned session on the user database would try to
+// take that database's single SQLite writer a second time and block on its
+// own BEGIN. Callers must reject the PREPARE / refuse the COMMIT on error
+// rather than silently skip the claim.
+func (re *ReplicationEngine) autoIncClaimStore() (*AutoIncClaimStore, error) {
+	systemDB, err := re.dbMgr.GetDatabase(SystemDatabaseName)
+	if err != nil {
+		return nil, fmt.Errorf("system database unavailable: %w", err)
+	}
+	return NewAutoIncClaimStore(systemDB), nil
+}
+
+// prepareAutoIncClaim evaluates an AUTO_INCREMENT range claim on this
+// participant and, on acceptance, writes the claim intent whose DataSnapshot
+// the COMMIT handler will apply. It returns nil to accept and a failed
+// PrepareResult to reject.
+//
+// The condition, evaluated against this node's OWN committed state:
+//
+//	storedBase <= prevBase && newBase == prevBase && size >= 1 && newBase+size <= widthMax
+//
+// The second term is not "newBase > prevBase": a claim proposes its own view
+// of the base as newBase, so that form could never hold and no claim would
+// ever be accepted. The quantity that increases monotonically is the
+// COMMITTED base, which COMMIT sets to newBase + size, and size >= 1.
+//
+// The term is "==" rather than ">=" on purpose: allocation is lowest-free, so a
+// claimant never proposes above its own view of the base. A claimant that wants
+// a higher base gets one only by retrying with the base a participant returned,
+// which is what keeps a single-node cluster minting 1, 2, 3 with no jump at any
+// range boundary.
+//
+// and an ABSENT stored base REJECTS. That last clause is the protocol's whole
+// safety argument and it is the one an implementer will get wrong: the natural
+// implementation is "absent means 0 means yes", and a cache that defaults to 0
+// and accepts is precisely the thing that cannot cast the rejection that would
+// repair it.
+//
+// widthMax is derived from THIS node's own sqlite_master, never taken from the
+// claimant: the width marker rides in the replicated DDL text so every node
+// derives it identically, and trusting the claimant would let a node with a
+// stale schema be rubber-stamped.
+//
+// Soundness: any committed claim reached a majority, this claim needs a
+// majority, and majorities intersect, so at least one participant holds a
+// storedBase above prevBase and rejects. A rejection returns this node's own
+// base so the claimant can retry above it rather than spin.
+//
+// That argument only holds if a participant's read of its own base and its
+// vote on that read cannot straddle another claimant's commit. The intent
+// this function writes is what makes them atomic: MetaStore.WriteIntent takes
+// the per-(table, intentKey) row lock and holds it until the transaction
+// commits or aborts (db/meta_store_pebble.go WriteIntent -> rowLocks.
+// AcquireLock; released by DeleteIntentsByTxn / ReleaseByTxn on abort and by
+// CommitTransaction on commit; a pending holder is never overwritten by
+// another writer, however old its heartbeat - see resolveIntentConflictPebble),
+// and every claim for one table shares one intent key
+// (protocol.AutoIncClaimKey). The COMMIT handler writes the new base BEFORE
+// it marks the transaction committed (Commit's ApplyClaims call runs ahead of
+// txnMgr.CommitTransaction), so the base is durable while the lock is still
+// held. ApplyClaims also refuses a COMMIT whose claim intent is gone or whose
+// prevBase the stored base has passed, so an ACK never depends on the lock
+// alone (see ApplyClaims for the per-node disjointness argument).
+//
+// The intent is therefore written FIRST and the base read SECOND. Read first
+// and the read is unlocked: two claimants can both read the pre-commit base,
+// both find themselves in range, and both be granted the same ids - a
+// check-then-act gap that -race cannot see, because each half is individually
+// synchronised and only the pair is not. A claimant that loses the race for
+// the lock gets a write-write conflict rather than a rejection, which the
+// coordinator surfaces as the retryable 1205; a claimant that takes the lock
+// after the winner committed reads the advanced base and rejects with it.
+//
+// Every rejection below returns a non-nil PrepareResult, and Prepare aborts
+// the transaction on one (db/replication_engine.go, the AutoIDClaim branch of
+// the statement loop), which releases the intent and its lock. No rejection
+// path may return without going through that abort.
+func (re *ReplicationEngine) prepareAutoIncClaim(
+	replicatedDB *ReplicatedDatabase,
+	txn *Transaction,
+	txnMgr *TransactionManager,
+	metaStore MetaStore,
+	stmt protocol.Statement,
+	req *PrepareRequest,
+) *PrepareResult {
+	claim, err := protocol.DecodeAutoIncClaim(stmt.AutoIDClaimPayload)
+	if err != nil {
+		return &PrepareResult{Success: false, Rejected: true, Error: err.Error()}
+	}
+	if len(stmt.IntentKey) == 0 {
+		return &PrepareResult{Success: false, Rejected: true,
+			Error: "auto-increment claim carries no intent key"}
+	}
+
+	// Take the claim's row lock before reading anything this node will vote
+	// on - see the "Soundness" paragraph above. AddStatement precedes it for
+	// the same reason processStatement orders the two that way: the statement
+	// must be on the transaction before an intent refers to it.
+	if err := txnMgr.AddStatement(txn, stmt); err != nil {
+		return &PrepareResult{Success: false, Error: err.Error()}
+	}
+	if err := metaStore.WriteIntent(req.TxnID, IntentTypeAutoIDClaim, AutoIncClaimTable,
+		string(stmt.IntentKey), OpTypeInsert, "", stmt.AutoIDClaimPayload, req.StartTS, req.NodeID); err != nil {
+		// A lost race for the lock is not a verdict on the claim, so it is a
+		// missing ACK rather than a rejection: the coordinator turns it into
+		// the retryable 1205 and the claimant tries again.
+		return &PrepareResult{Success: false, Error: err.Error()}
+	}
+
+	claimStore, err := re.autoIncClaimStore()
+	if err != nil {
+		// The claim store is backed by the system database (db/autoinc_claim.go);
+		// if it cannot be resolved this node must refuse the claim rather than
+		// silently skip the check.
+		return &PrepareResult{Success: false, Rejected: true,
+			Error: fmt.Sprintf("auto-increment claim for %s refused: %v", claim.Table, err)}
+	}
+
+	storedBase, err := claimStore.ReadBase(req.Database, claim.Table)
+	if err != nil {
+		// Absent, unreadable - either way this node cannot vote yes.
+		return &PrepareResult{Success: false, Rejected: true,
+			Error: fmt.Sprintf("auto-increment claim for %s refused: %v", claim.Table, err)}
+	}
+
+	widthMax, err := replicatedDB.AutoIncWidthMax(claim.Table)
+	if err != nil {
+		return &PrepareResult{Success: false, Rejected: true,
+			Error:            fmt.Sprintf("auto-increment claim for %s refused: %v", claim.Table, err),
+			AutoIDStoredBase: storedBase}
+	}
+
+	switch {
+	case storedBase > claim.PrevBase:
+		return &PrepareResult{Success: false, Rejected: true,
+			Error:            fmt.Sprintf("auto-increment claim for %s is stale: this node holds base %d", claim.Table, storedBase),
+			AutoIDStoredBase: storedBase}
+	case claim.NewBase != claim.PrevBase:
+		return &PrepareResult{Success: false, Rejected: true,
+			Error:            fmt.Sprintf("auto-increment claim for %s must propose its own view of the base, not %d over %d", claim.Table, claim.NewBase, claim.PrevBase),
+			AutoIDStoredBase: storedBase}
+	case claim.Size == 0:
+		// A zero-size claim would commit base = newBase + 0, leaving the base
+		// where it was, so the same range could be handed out again.
+		return &PrepareResult{Success: false, Rejected: true,
+			Error:            fmt.Sprintf("auto-increment claim for %s does not advance the base", claim.Table),
+			AutoIDStoredBase: storedBase}
+	case claim.NewBase > widthMax || claim.Size > widthMax-claim.NewBase:
+		return &PrepareResult{Success: false, Rejected: true,
+			// Written as two subtractions rather than newBase+size > widthMax:
+			// the sum is uint64 and a large size wraps, so the additive form
+			// lets a claim past the ceiling read as if it were inside it.
+			Error:            fmt.Sprintf("auto-increment claim for %s exhausts the column: %d+%d > %d", claim.Table, claim.NewBase, claim.Size, widthMax),
+			AutoIDStoredBase: storedBase}
+	}
+
+	return nil
 }
 
 // processStatement processes a single statement within a transaction
@@ -498,6 +699,47 @@ func (re *ReplicationEngine) Commit(ctx context.Context, req *CommitRequest) *Co
 	}
 	txn.Statements = req.Statements
 
+	// Apply any AUTO_INCREMENT range claim BEFORE committing, and refuse the
+	// commit if it cannot be applied (the claim's first invariant: a
+	// participant must never ACK COMMIT unless the claim row is durably in its
+	// own SQLite). The order follows the CREATE DATABASE precedent above, which
+	// executes its operation first and only then marks the transaction
+	// committed; applying afterwards would leave the transaction committed
+	// locally while this node correctly reports failure.
+	//
+	// Unlike that precedent this does NOT abort the transaction. A database
+	// operation is alone in its transaction, so aborting discards only itself,
+	// whereas a user-database transaction may carry client DML beside the
+	// claim. Leaving it prepared is what 2PC expects of a participant that
+	// cannot complete: it withholds the ACK and lets recovery resolve the
+	// transaction, instead of unilaterally discarding writes the rest of the
+	// cluster may be committing.
+	//
+	// The gate is the statement flag, not a store lookup: reading intents on
+	// every commit would put a Pebble scan on the write path. The flag decides
+	// only whether to look; every value written comes from the intent.
+	if statementsCarryAutoIDClaim(req.Statements) {
+		claimStore, csErr := re.autoIncClaimStore()
+		if csErr != nil {
+			log.Error().
+				Err(csErr).
+				Uint64("txn_id", req.TxnID).
+				Uint64("node_id", re.nodeID).
+				Str("database", req.Database).
+				Msg("COMMIT REFUSED: system database unavailable for auto-increment claim apply")
+			return &CommitResult{Success: false, Error: fmt.Sprintf("auto-increment claim apply failed: %v", csErr)}
+		}
+		if err := claimStore.ApplyClaims(req.Database, req.TxnID, replicatedDB.GetMetaStore()); err != nil {
+			log.Error().
+				Err(err).
+				Uint64("txn_id", req.TxnID).
+				Uint64("node_id", re.nodeID).
+				Str("database", req.Database).
+				Msg("COMMIT REFUSED: auto-increment claim could not be applied")
+			return &CommitResult{Success: false, Error: fmt.Sprintf("auto-increment claim apply failed: %v", err)}
+		}
+	}
+
 	if err := txnMgr.CommitTransaction(txn); err != nil {
 		return &CommitResult{Success: false, Error: err.Error()}
 	}
@@ -566,6 +808,8 @@ func (pr *PrepareResult) ToCoordinatorResponse() *coordinator.ReplicationRespons
 		ConflictDetected: pr.ConflictDetected,
 		ConflictDetails:  pr.ConflictDetails,
 		Rejected:         pr.Rejected,
+		ErrorCode:        pr.ErrorCode,
+		AutoIDStoredBase: pr.AutoIDStoredBase,
 	}
 }
 

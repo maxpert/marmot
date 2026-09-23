@@ -380,8 +380,8 @@ func TestIntTypeRuleMarkerSurvivesSerialization(t *testing.T) {
 	}
 }
 
-// TestIntegerSpelledOutIsMarked records a deliberate deviation from FINAL.md
-// touch point 1, which says Encode returns "" for BIGINT *and* INTEGER.
+// TestIntegerSpelledOutIsMarked records a deliberate choice: INTEGER is
+// marked, although a looser reading would leave BIGINT *and* INTEGER unmarked.
 //
 // Marking INTEGER is correct and the design text is loose: in MySQL, INTEGER is
 // a synonym for INT and is 32 bits, so a column declared INTEGER AUTO_INCREMENT
@@ -414,5 +414,88 @@ func TestIntegerSpelledOutIsMarked(t *testing.T) {
 				t.Errorf("declared type = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestCreateTableAutoIncrementOptionBecomesMarkerFloor pins the
+// AUTO_INCREMENT=N floor end to end: a client's table-level AUTO_INCREMENT=N option must survive
+// the transpiler not as a table option (CreateTableRule discards
+// TableSpec.Options entirely - see create_table.go) but as the floor riding in
+// the AUTO_INCREMENT column's own marker, because DDL replicates as raw SQL
+// text and every node must derive the same floor from that text alone.
+//
+// Runs both rules in the same priority order the transpiler pipeline uses
+// (IntTypeRule, priority 5, mutates the AST; CreateTableRule, priority 10,
+// clears TableSpec.Options and serializes), matching how transpiler.go
+// actually drives them.
+//
+// Mutation: read the AUTO_INCREMENT=N option after CreateTableRule has
+// already nilled TableSpec.Options; floor is always 0 and this test's core
+// assertion (":4999") never appears.
+func TestCreateTableAutoIncrementOptionBecomesMarkerFloor(t *testing.T) {
+	stmt, err := sqlparser.NewTestParser().Parse(
+		"CREATE TABLE t (id INT AUTO_INCREMENT PRIMARY KEY, v TEXT) AUTO_INCREMENT=5000")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	if _, err := (&IntTypeRule{}).Transform(stmt, nil, nil, "testdb", &SQLiteSerializer{}); err != ErrRuleNotApplicable {
+		t.Fatalf("IntTypeRule.Transform returned %v, want ErrRuleNotApplicable", err)
+	}
+
+	results, err := (&CreateTableRule{}).Transform(stmt, nil, nil, "testdb", &SQLiteSerializer{})
+	if err != nil {
+		t.Fatalf("CreateTableRule.Transform: %v", err)
+	}
+	if len(results) == 0 {
+		t.Fatal("expected at least one statement")
+	}
+	sql := results[0].SQL
+
+	// N=5000 means the next id MySQL issues is 5000, so the stored base floor
+	// is N-1: the id treated as already issued just before it.
+	if !strings.Contains(sql, "/*M:32a:4999*/") {
+		t.Fatalf("emitted SQL missing floor marker /*M:32a:4999*/, got: %q", sql)
+	}
+	// The raw table option must not itself leak into the SQLite text - SQLite
+	// has no AUTO_INCREMENT=N table option syntax.
+	if strings.Contains(strings.ToUpper(sql), "AUTO_INCREMENT=5000") ||
+		strings.Contains(strings.ToUpper(sql), "AUTO_INCREMENT = 5000") {
+		t.Fatalf("emitted SQL leaked the raw table option: %q", sql)
+	}
+
+	decoded := intmarker.Decode(sql)
+	got, ok := decoded["id"]
+	if !ok {
+		t.Fatalf("Decode found no marker for column id in: %q", sql)
+	}
+	want := intmarker.Attributes{Bits: 32, ExplicitAutoInc: true, AutoIncFloor: 4999}
+	if got != want {
+		t.Errorf("decoded attributes = %+v, want %+v", got, want)
+	}
+}
+
+// TestCreateTableNoAutoIncrementOptionMeansNoFloor guards the other direction:
+// a CREATE TABLE with no AUTO_INCREMENT=N table option must emit a marker
+// byte-identical to what the transpiler produced before floors existed.
+func TestCreateTableNoAutoIncrementOptionMeansNoFloor(t *testing.T) {
+	stmt, err := sqlparser.NewTestParser().Parse(
+		"CREATE TABLE t (id INT AUTO_INCREMENT PRIMARY KEY, v TEXT)")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if _, err := (&IntTypeRule{}).Transform(stmt, nil, nil, "testdb", &SQLiteSerializer{}); err != ErrRuleNotApplicable {
+		t.Fatalf("IntTypeRule.Transform returned %v, want ErrRuleNotApplicable", err)
+	}
+	results, err := (&CreateTableRule{}).Transform(stmt, nil, nil, "testdb", &SQLiteSerializer{})
+	if err != nil {
+		t.Fatalf("CreateTableRule.Transform: %v", err)
+	}
+	sql := results[0].SQL
+	if !strings.Contains(sql, "/*M:32a*/") {
+		t.Fatalf("expected unfloored marker /*M:32a*/, got: %q", sql)
+	}
+	if strings.Contains(sql, ":4999") || strings.Contains(sql, "/*M:32a:") {
+		t.Fatalf("no AUTO_INCREMENT=N was declared, but a floor was emitted anyway: %q", sql)
 	}
 }

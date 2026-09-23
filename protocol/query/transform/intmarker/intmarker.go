@@ -9,8 +9,10 @@
 // a comment beside the type, which SQLite preserves verbatim in
 // sqlite_master.sql and normalises away everywhere else.
 //
-// The grammar is /*M:<bits>[u][a]*/ - bits in {8,16,24,32}, u for UNSIGNED,
-// a for an explicitly declared AUTO_INCREMENT. It is deliberately NOT MySQL's
+// The grammar is /*M:<bits>[u][a][:<floor>]*/ - bits in {8,16,24,32}, u for
+// UNSIGNED, a for an explicitly declared AUTO_INCREMENT, and an optional
+// decimal <floor> - the base floor a client's AUTO_INCREMENT=N table option
+// declared (N-1), present only when non-zero. It is deliberately NOT MySQL's
 // /*! ... */ executable-comment syntax: that syntax asks another MySQL to
 // execute the contents, which is the opposite of what this is for.
 package intmarker
@@ -36,6 +38,10 @@ type Attributes struct {
 	// ExplicitAutoInc records that the column was declared AUTO_INCREMENT,
 	// as opposed to merely being a narrow integer.
 	ExplicitAutoInc bool
+	// AutoIncFloor is the base floor a client's AUTO_INCREMENT=N table option
+	// declared: N-1. Zero means the client did not declare one. Only ever set
+	// on the marker of the column ExplicitAutoInc names.
+	AutoIncFloor uint64
 }
 
 // Marked reports whether a marker was present.
@@ -93,6 +99,10 @@ func Encode(a Attributes) string {
 	if a.ExplicitAutoInc {
 		b.WriteByte('a')
 	}
+	if a.AutoIncFloor != 0 {
+		b.WriteByte(':')
+		b.WriteString(strconv.FormatUint(a.AutoIncFloor, 10))
+	}
 	b.WriteString(markerClose)
 	return b.String()
 }
@@ -117,14 +127,24 @@ func parseMarkerBody(body string) (Attributes, error) {
 	default:
 		return a, fmt.Errorf("marker width %d is not one of 8, 16, 24, 32", bits)
 	}
-	for ; i < len(body); i++ {
+	for i < len(body) {
 		switch body[i] {
 		case 'u':
 			a.Unsigned = true
+			i++
 		case 'a':
 			a.ExplicitAutoInc = true
+			i++
+		case ':':
+			floorStr := body[i+1:]
+			floor, err := strconv.ParseUint(floorStr, 10, 64)
+			if err != nil {
+				return Attributes{}, fmt.Errorf("marker floor %q: %w", floorStr, err)
+			}
+			a.AutoIncFloor = floor
+			i = len(body)
 		default:
-			return a, fmt.Errorf("marker flag %q is not u or a", body[i])
+			return a, fmt.Errorf("marker flag %q is not u, a or :<floor>", body[i])
 		}
 	}
 	return a, nil

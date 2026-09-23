@@ -45,7 +45,7 @@ func TestEncodeRoundTrip(t *testing.T) {
 }
 
 // TestWidthMax is the single source of the ceiling every other component
-// derives its bound from, so the numbers are pinned against FINAL.md's table
+// derives its bound from, so the numbers are pinned against MySQL's ranges
 // rather than recomputed at each use.
 //
 // Mutation: use 1<<bits for the signed case; every signed row fires.
@@ -211,5 +211,87 @@ func TestStrip(t *testing.T) {
 				t.Errorf("Strip =\n %q\nwant\n %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestAutoIncFloorGrammar pins the ":<floor>" extension to the marker grammar
+// that carries AUTO_INCREMENT=N. A marker with no floor must render byte-identical
+// to what Encode produced before AutoIncFloor existed, and a floor must
+// round-trip through Decode exactly like every other flag.
+//
+// Mutation: encode the floor even when it is 0, or drop it from parseMarkerBody;
+// the "no floor" and "round trip" cases below both fire.
+func TestAutoIncFloorGrammar(t *testing.T) {
+	cases := []struct {
+		name  string
+		attrs Attributes
+		want  string
+	}{
+		{"auto-increment, no declared floor, byte-identical to pre-floor grammar",
+			Attributes{Bits: 32, ExplicitAutoInc: true}, "/*M:32a*/"},
+		{"auto-increment, unsigned, no declared floor, byte-identical",
+			Attributes{Bits: 16, Unsigned: true, ExplicitAutoInc: true}, "/*M:16ua*/"},
+		{"auto-increment with declared floor",
+			Attributes{Bits: 32, ExplicitAutoInc: true, AutoIncFloor: 4999}, "/*M:32a:4999*/"},
+		{"unsigned auto-increment with declared floor",
+			Attributes{Bits: 8, Unsigned: true, ExplicitAutoInc: true, AutoIncFloor: 200}, "/*M:8ua:200*/"},
+		{"plain narrow column, no auto-increment, floor is meaningless and stays off",
+			Attributes{Bits: 16}, "/*M:16*/"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := Encode(tc.attrs)
+			if got != tc.want {
+				t.Fatalf("Encode = %q, want %q", got, tc.want)
+			}
+			decoded := Decode("CREATE TABLE t (id INTEGER " + got + " PRIMARY KEY)")
+			attrs, ok := decoded["id"]
+			if !ok {
+				t.Fatalf("Decode lost the marker %q entirely", got)
+			}
+			if attrs != tc.attrs {
+				t.Errorf("round trip = %+v, want %+v", attrs, tc.attrs)
+			}
+		})
+	}
+}
+
+// TestDecodeMalformedFloorIsRejected mirrors the existing "malformed marker
+// degrades to no marker" contract for the new ":<floor>" suffix: a floor that
+// is not a valid decimal number must fail to parse, and Decode's caller-facing
+// behaviour is to omit the column entirely rather than propagate a partial
+// Attributes.
+func TestDecodeMalformedFloorIsRejected(t *testing.T) {
+	cases := []string{
+		"CREATE TABLE t (id INTEGER /*M:32a:*/ PRIMARY KEY)",     // empty floor
+		"CREATE TABLE t (id INTEGER /*M:32a:12x*/ PRIMARY KEY)",  // non-numeric floor
+		"CREATE TABLE t (id INTEGER /*M:32:4999a*/ PRIMARY KEY)", // floor before a flag
+	}
+	for _, sql := range cases {
+		t.Run(sql, func(t *testing.T) {
+			decoded := Decode(sql)
+			if _, ok := decoded["id"]; ok {
+				t.Fatalf("expected malformed marker to yield no entry, got %+v", decoded["id"])
+			}
+		})
+	}
+}
+
+// TestStripRemovesFloorMarker pins that Strip (decode.go:229), which matches
+// only markerOpen/markerClose and treats everything between them as one
+// opaque span, already removes the ":<floor>" extension (TestAutoIncFloorGrammar)
+// with no code change: a longer body between the same two delimiters is still
+// one span to Strip. A multi-column CREATE TABLE carries a floor marker on one
+// column and a plain marker on another so both forms, and the spacing repair
+// around each, are proven in the same pass.
+//
+// Mutation: require the close brace immediately after the flags, breaking the
+// floor form's longer span; this fires because the floor marker survives.
+func TestStripRemovesFloorMarker(t *testing.T) {
+	in := "CREATE TABLE t (id INTEGER /*M:32a:4999*/ PRIMARY KEY, count INTEGER /*M:16u*/ DEFAULT 0, v TEXT)"
+	want := "CREATE TABLE t (id INTEGER PRIMARY KEY, count INTEGER DEFAULT 0, v TEXT)"
+	if got := Strip(in); got != want {
+		t.Errorf("Strip =\n %q\nwant\n %q", got, want)
 	}
 }

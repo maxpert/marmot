@@ -5,6 +5,7 @@ package db
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -1009,5 +1010,33 @@ func TestBatchCommitter_CheckpointMetrics(t *testing.T) {
 	}
 	if batchCommitterCheckpointEfficiency == nil {
 		t.Error("checkpoint efficiency metric should be initialized")
+	}
+}
+
+// TestEnqueueAfterStopIsRefused: a stopped committer never flushes again, so
+// a commit queued after Stop - a COMMIT still holding a database that was
+// detached for a snapshot restore - must be refused, not left waiting forever
+// on its future.
+//
+// Mutation: drop the stopped check in Enqueue. "a commit queued after Stop
+// was never answered" fires.
+func TestEnqueueAfterStopIsRefused(t *testing.T) {
+	bc, _, cleanup := setupTestBatchCommitter(t, 10, 10*time.Millisecond)
+	defer cleanup()
+	bc.Stop()
+
+	fut := bc.Enqueue(1, hlc.Timestamp{WallTime: 1}, nil, nil)
+	answered := make(chan error, 1)
+	go func() {
+		_, err := fut.Get()
+		answered <- err
+	}()
+	select {
+	case err := <-answered:
+		if !errors.Is(err, ErrBatchCommitterStopped) {
+			t.Fatalf("a commit queued after Stop got %v, want ErrBatchCommitterStopped", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a commit queued after Stop was never answered")
 	}
 }

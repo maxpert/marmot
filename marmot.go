@@ -372,29 +372,11 @@ func main() {
 		log.Info().Msg("Delta sync completed successfully")
 	}
 
-	// Create snapshot function for anti-entropy
+	// Create snapshot function for anti-entropy. CatchUpFromPeer keeps the
+	// database detached from before the peer's snapshot until its file is
+	// replaced, and reattaches it on every path.
 	snapshotFunc := func(ctx context.Context, peerNodeID uint64, peerAddr string, database string) error {
-		// Download snapshot to disk
-		catchUpErr := catchUpClient.CatchUpFromPeer(ctx, peerNodeID, peerAddr, database)
-
-		// The download can fail after the snapshot's files were already swapped
-		// onto disk (e.g. restoring schema versions failed post-swap). Reopen
-		// unconditionally whenever that happened, or the node keeps serving the
-		// old connection against freshly-swapped files - even though the
-		// overall catch-up is reported as failed and gets retried.
-		if !marmotgrpc.FilesSwappedDespiteError(catchUpErr) {
-			return catchUpErr
-		}
-
-		// Reload the database connection to pick up the new snapshot file
-		// This is critical: the old connection still points to the old data
-		if err := dbMgr.ReopenDatabase(database); err != nil {
-			log.Error().Err(err).Str("database", database).Msg("Failed to reload database after snapshot")
-			return fmt.Errorf("database reload failed after snapshot: %w", err)
-		}
-
-		log.Info().Str("database", database).Msg("Database reloaded after snapshot download")
-		return catchUpErr
+		return catchUpClient.CatchUpFromPeer(ctx, peerNodeID, peerAddr, database)
 	}
 
 	antiEntropy := marmotgrpc.NewAntiEntropyServiceFromConfig(

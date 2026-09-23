@@ -47,7 +47,7 @@ func TestExecutePreparePhase_BroadcastToAllNodes(t *testing.T) {
 	ctx, cancel := WithTimeout(200)
 	defer cancel()
 
-	responses, _, err := wc.executePreparePhase(ctx, txn, req, otherNodes, false)
+	responses, _, _, err := wc.executePreparePhase(ctx, txn, req, otherNodes, false)
 
 	AssertNoError(t, err)
 	AssertResponseMapSize(t, responses, 5) // coordinator + 4 others
@@ -90,7 +90,7 @@ func TestExecutePreparePhase_SkipLocalReplication_False(t *testing.T) {
 	ctx, cancel := WithTimeout(200)
 	defer cancel()
 
-	responses, _, err := wc.executePreparePhase(ctx, txn, req, otherNodes, false)
+	responses, _, _, err := wc.executePreparePhase(ctx, txn, req, otherNodes, false)
 
 	AssertNoError(t, err)
 	AssertResponseMapSize(t, responses, 3) // coordinator + 2 others
@@ -137,7 +137,7 @@ func TestExecutePreparePhase_SkipLocalReplication_True(t *testing.T) {
 	ctx, cancel := WithTimeout(200)
 	defer cancel()
 
-	responses, _, err := wc.executePreparePhase(ctx, txn, req, otherNodes, true)
+	responses, _, _, err := wc.executePreparePhase(ctx, txn, req, otherNodes, true)
 
 	AssertNoError(t, err)
 	AssertResponseMapSize(t, responses, 3) // only other nodes
@@ -187,7 +187,7 @@ func TestExecutePreparePhase_ConcurrentExecution(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	responses, _, err := wc.executePreparePhase(ctx, txn, req, otherNodes, false)
+	responses, _, _, err := wc.executePreparePhase(ctx, txn, req, otherNodes, false)
 	elapsed := time.Since(start)
 
 	AssertNoError(t, err)
@@ -233,7 +233,7 @@ func TestExecutePreparePhase_ResponseTimeout(t *testing.T) {
 	ctx, cancel := WithTimeout(300)
 	defer cancel()
 
-	responses, _, err := wc.executePreparePhase(ctx, txn, req, otherNodes, false)
+	responses, _, _, err := wc.executePreparePhase(ctx, txn, req, otherNodes, false)
 
 	AssertNoError(t, err)
 
@@ -284,7 +284,7 @@ func TestExecutePreparePhase_MixedResponses(t *testing.T) {
 	ctx, cancel := WithTimeout(200)
 	defer cancel()
 
-	responses, _, err := wc.executePreparePhase(ctx, txn, req, otherNodes, false)
+	responses, _, _, err := wc.executePreparePhase(ctx, txn, req, otherNodes, false)
 
 	// Conflict should be returned as error
 	if err == nil {
@@ -332,7 +332,7 @@ func TestExecutePreparePhase_AllNodesTimeout(t *testing.T) {
 	ctx, cancel := WithTimeout(300)
 	defer cancel()
 
-	responses, _, err := wc.executePreparePhase(ctx, txn, req, otherNodes, false)
+	responses, _, _, err := wc.executePreparePhase(ctx, txn, req, otherNodes, false)
 
 	AssertNoError(t, err)
 
@@ -373,7 +373,7 @@ func TestExecutePreparePhase_ContextCancelled(t *testing.T) {
 	CancelAfter(ctx, cancel, 20*time.Millisecond)
 
 	start := time.Now()
-	responses, _, err := wc.executePreparePhase(ctx, txn, req, otherNodes, false)
+	responses, _, _, err := wc.executePreparePhase(ctx, txn, req, otherNodes, false)
 	elapsed := time.Since(start)
 
 	// Should return quickly after context cancellation
@@ -419,7 +419,7 @@ func TestExecutePreparePhase_NilResponse(t *testing.T) {
 	ctx, cancel := WithTimeout(200)
 	defer cancel()
 
-	responses, _, err := wc.executePreparePhase(ctx, txn, req, otherNodes, false)
+	responses, _, _, err := wc.executePreparePhase(ctx, txn, req, otherNodes, false)
 
 	AssertNoError(t, err)
 
@@ -461,7 +461,7 @@ func TestExecutePreparePhase_ZeroTotalNodes(t *testing.T) {
 	ctx, cancel := WithTimeout(200)
 	defer cancel()
 
-	responses, _, err := wc.executePreparePhase(ctx, txn, req, otherNodes, true)
+	responses, _, _, err := wc.executePreparePhase(ctx, txn, req, otherNodes, true)
 
 	AssertNoError(t, err)
 	AssertResponseMapSize(t, responses, 0)
@@ -506,7 +506,7 @@ func TestExecutePreparePhase_ChannelBufferOverflow(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	responses, _, err := wc.executePreparePhase(ctx, txn, req, otherNodes, false)
+	responses, _, _, err := wc.executePreparePhase(ctx, txn, req, otherNodes, false)
 	elapsed := time.Since(start)
 
 	AssertNoError(t, err)
@@ -552,7 +552,7 @@ func TestExecutePreparePhase_GoroutineLeakPrevention(t *testing.T) {
 
 	beforeGoroutines := CountGoroutines()
 
-	responses, _, err := wc.executePreparePhase(ctx, txn, req, otherNodes, false)
+	responses, _, _, err := wc.executePreparePhase(ctx, txn, req, otherNodes, false)
 
 	AssertNoError(t, err)
 
@@ -601,7 +601,7 @@ func TestExecutePreparePhase_ConflictStopsCollection(t *testing.T) {
 	ctx, cancel := WithTimeout(200)
 	defer cancel()
 
-	responses, _, err := wc.executePreparePhase(ctx, txn, req, otherNodes, false)
+	responses, _, _, err := wc.executePreparePhase(ctx, txn, req, otherNodes, false)
 
 	// Should return conflict error
 	if err == nil {
@@ -649,7 +649,7 @@ func TestExecutePreparePhase_ErrorResponsesNotAdded(t *testing.T) {
 	ctx, cancel := WithTimeout(200)
 	defer cancel()
 
-	responses, _, err := wc.executePreparePhase(ctx, txn, req, otherNodes, false)
+	responses, _, _, err := wc.executePreparePhase(ctx, txn, req, otherNodes, false)
 
 	AssertNoError(t, err)
 
@@ -705,7 +705,7 @@ func TestExecutePreparePhase_CallsAreDeadlineBounded(t *testing.T) {
 
 	// Parent context has no deadline of its own - the bound must come from wc.timeout
 	start := time.Now()
-	responses, _, err := wc.executePreparePhase(context.Background(), txn, req, []uint64{2, 3}, false)
+	responses, _, _, err := wc.executePreparePhase(context.Background(), txn, req, []uint64{2, 3}, false)
 
 	AssertNoError(t, err)
 	AssertResponseMapSize(t, responses, 3)
@@ -747,7 +747,7 @@ func TestExecutePreparePhase_DDLCallsUseDDLValidationTimeout(t *testing.T) {
 	req := &ReplicationRequest{TxnID: txn.ID, NodeID: wc.nodeID, Phase: PhasePrep, Database: txn.Database}
 
 	start := time.Now()
-	responses, _, err := wc.executePreparePhase(context.Background(), txn, req, []uint64{2, 3}, false)
+	responses, _, _, err := wc.executePreparePhase(context.Background(), txn, req, []uint64{2, 3}, false)
 
 	AssertNoError(t, err)
 	AssertResponseMapSize(t, responses, 3)
@@ -796,7 +796,7 @@ func TestExecutePreparePhase_DMLCallsKeepRegularWriteTimeout(t *testing.T) {
 	req := &ReplicationRequest{TxnID: txn.ID, NodeID: wc.nodeID, Phase: PhasePrep, Database: txn.Database}
 
 	start := time.Now()
-	responses, _, err := wc.executePreparePhase(context.Background(), txn, req, []uint64{2, 3}, false)
+	responses, _, _, err := wc.executePreparePhase(context.Background(), txn, req, []uint64{2, 3}, false)
 
 	AssertNoError(t, err)
 	AssertResponseMapSize(t, responses, 3)
@@ -843,7 +843,7 @@ func TestExecutePreparePhase_DDLTransactionSurvivesDelayBeyondWriteTimeout(t *te
 	ctx, cancel := WithTimeout(3000)
 	defer cancel()
 
-	responses, _, err := wc.executePreparePhase(ctx, txn, req, otherNodes, false)
+	responses, _, _, err := wc.executePreparePhase(ctx, txn, req, otherNodes, false)
 
 	AssertNoError(t, err)
 	AssertResponseSuccess(t, responses, 2)
@@ -877,7 +877,7 @@ func TestExecutePreparePhase_DMLTransactionTimesOutAtWriteTimeout(t *testing.T) 
 	ctx, cancel := WithTimeout(3000)
 	defer cancel()
 
-	responses, _, err := wc.executePreparePhase(ctx, txn, req, otherNodes, false)
+	responses, _, _, err := wc.executePreparePhase(ctx, txn, req, otherNodes, false)
 
 	AssertNoError(t, err)
 	AssertNodeNotInResponses(t, responses, 2)

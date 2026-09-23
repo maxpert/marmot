@@ -1,6 +1,10 @@
 package coordinator
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/maxpert/marmot/protocol/query/transform"
+)
 
 // PrepareConflictError represents a write-write conflict detected during the prepare phase
 type PrepareConflictError struct {
@@ -20,6 +24,10 @@ type QuorumNotAchievedError struct {
 	TotalMembership int
 	AliveNodes      int
 	IsRemoteQuorum  bool // True if this is remote commit quorum (quorum-1)
+	// Declined counts participants that answered PREPARE without preparing
+	// and without a verdict - a lost race for a row lock, a storage error -
+	// as opposed to participants that never answered.
+	Declined int
 }
 
 func (e *QuorumNotAchievedError) Error() string {
@@ -33,10 +41,29 @@ func (e *QuorumNotAchievedError) Error() string {
 // of the retry signal used for write-write conflicts.
 type LocalPrepareError struct {
 	Reason string
+	// AutoIDStoredBase is the highest base any participant reported this
+	// PREPARE round, when this rejection came from an AUTO_INCREMENT range
+	// claim. Zero for every other rejection.
+	AutoIDStoredBase uint64
+	// ErrorCode is the MySQL server error code the participant chose for this
+	// refusal, or 0 when it named none.
+	ErrorCode uint16
 }
 
 func (e *LocalPrepareError) Error() string {
 	return e.Reason
+}
+
+// Unwrap re-types the rejection as the coded error the participant raised, so
+// the protocol layer maps it to the participant's own MySQL error code rather
+// than flattening every deterministic refusal to ER_UNKNOWN_ERROR. It returns
+// nil when the participant named no code, which leaves the existing
+// message-based classification in charge.
+func (e *LocalPrepareError) Unwrap() error {
+	if e.ErrorCode == 0 {
+		return nil
+	}
+	return &transform.CodedError{Code: e.ErrorCode, Message: e.Reason}
 }
 
 // RemotePrepareRejectedError indicates prepare quorum was not achieved and at
@@ -50,12 +77,28 @@ func (e *LocalPrepareError) Error() string {
 type RemotePrepareRejectedError struct {
 	NodeID uint64
 	Reason string
+	// AutoIDStoredBase is the highest base any participant reported this
+	// PREPARE round, when this rejection came from an AUTO_INCREMENT range
+	// claim. Zero for every other rejection.
+	AutoIDStoredBase uint64
+	// ErrorCode is the MySQL server error code the rejecting participant chose,
+	// or 0 when it named none.
+	ErrorCode uint16
 }
 
 // Error reports the rejecting participant's own reason so clients receive the
 // actual SQL failure rather than 2PC internals.
 func (e *RemotePrepareRejectedError) Error() string {
 	return e.Reason
+}
+
+// Unwrap re-types the rejection as the coded error the remote participant
+// raised; see LocalPrepareError.Unwrap.
+func (e *RemotePrepareRejectedError) Unwrap() error {
+	if e.ErrorCode == 0 {
+		return nil
+	}
+	return &transform.CodedError{Code: e.ErrorCode, Message: e.Reason}
 }
 
 // CoordinatorNotParticipatedError indicates the coordinator failed to participate in the prepare phase

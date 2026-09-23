@@ -107,6 +107,15 @@ type ReplicationResponse struct {
 	// DDL SQLite cannot apply). Timeouts and storage failures leave it false so they
 	// stay retryable missing ACKs rather than a final verdict.
 	Rejected bool
+	// AutoIDStoredBase is this participant's own committed base for the table a
+	// rejected AUTO_INCREMENT range claim named, so the claimant can retry above
+	// it rather than spin. Zero on every response that is not such a rejection.
+	AutoIDStoredBase uint64
+	// ErrorCode is the MySQL server error code the rejecting participant chose
+	// for this refusal, or 0 when it named none. Error carries the message;
+	// this carries the code, because a typed error cannot cross either the
+	// local or the remote participant boundary.
+	ErrorCode uint16
 }
 
 // NewWriteCoordinator creates a new write coordinator for full database replication
@@ -197,7 +206,14 @@ func (wc *WriteCoordinator) cleanupStagedPayloads(txnID uint64) {
 func (wc *WriteCoordinator) validateStatements(txn *Transaction) error {
 	for i, stmt := range txn.Statements {
 		isDML := isDMLStatement(stmt.Type)
-		if isDML && len(stmt.EncodedRow) == 0 {
+		// An AUTO_INCREMENT range claim rides an existing DML StatementType but
+		// carries no row image by design: its payload is AutoIDClaimPayload,
+		// applied from the PREPARE-time intent at COMMIT, never from EncodedRow
+		// (protocol/transaction.go). Exempting it here is what lets an old
+		// binary's own DML gate reject the same wire statement when it does not
+		// understand the claim flag, while this coordinator's own validation of
+		// its own claim does not.
+		if isDML && len(stmt.EncodedRow) == 0 && !stmt.AutoIDClaim {
 			return fmt.Errorf("DML statement missing encoded CDC row (stmt %d)", i)
 		}
 		if isDML && stmt.TableName == "" {
@@ -227,6 +243,12 @@ func (wc *WriteCoordinator) buildPrepareRequest(txn *Transaction) *ReplicationRe
 			Operation:    stmt.Operation,
 			EncodedRow:   stmt.EncodedRow,
 			EncodedCodec: stmt.EncodedCodec,
+			// The claim flag AND its payload must reach PREPARE: this is where
+			// prepareAutoIncClaim evaluates the payload against the participant's
+			// own stored base and schema, before either the empty-IntentKey gate
+			// or the ordinary DML row-image check would otherwise apply to it.
+			AutoIDClaim:        stmt.AutoIDClaim,
+			AutoIDClaimPayload: stmt.AutoIDClaimPayload,
 		}
 		if !isDML {
 			prepareStmts[i].SQL = stmt.SQL
@@ -279,6 +301,13 @@ func (wc *WriteCoordinator) buildCommitRequest(txn *Transaction) *ReplicationReq
 			TableName: stmt.TableName,
 			Database:  stmt.Database,
 			IntentKey: stmt.IntentKey,
+			// The AUTO_INCREMENT claim FLAG is decision metadata and must reach
+			// COMMIT: it is what tells a participant to apply the claim it
+			// prepared. The PAYLOAD beside it is deliberately not copied. A
+			// participant reads the claim's values from the intent it wrote at
+			// PREPARE, when it checked them against its own schema and its own
+			// stored base, so nothing it writes comes off the COMMIT wire.
+			AutoIDClaim: stmt.AutoIDClaim,
 		}
 		if !isDMLStatement(stmt.Type) {
 			commitStmts[i].SQL = stmt.SQL
@@ -343,7 +372,7 @@ func (wc *WriteCoordinator) runPreparePhase(ctx context.Context, txn *Transactio
 
 	// Execute prepare phase on all nodes (including self) - single attempt, no retry
 	// All nodes now participate uniformly - no skipLocalReplication
-	prepResponses, remoteRejection, prepErr := wc.executePreparePhase(ctx, txn, prepReq, otherNodes, false)
+	prepResponses, remoteRejection, declined, prepErr := wc.executePreparePhase(ctx, txn, prepReq, otherNodes, false)
 	telemetry.TwoPhaseQuorumAcks.With("prepare").Observe(float64(len(prepResponses)))
 
 	// A local rejection (invalid DDL, missing table, ...) is final - surface the
@@ -404,6 +433,7 @@ func (wc *WriteCoordinator) runPreparePhase(ctx context.Context, txn *Transactio
 		return nil, &QuorumNotAchievedError{
 			Phase:           "prepare",
 			AcksReceived:    totalAcks,
+			Declined:        declined,
 			QuorumRequired:  cluster.RequiredQuorum,
 			TotalMembership: cluster.TotalMembership,
 			AliveNodes:      len(cluster.AliveNodes),
@@ -704,10 +734,11 @@ type response struct {
 // executePreparePhase broadcasts prepare requests to all nodes and collects responses.
 // Returns successful responses, the first remote (non-local) explicit rejection seen (if
 // any - the caller decides whether it matters, since a remote rejection alone must not
-// veto a transaction that otherwise reaches quorum), and a conflict error if any node
-// reports a conflict.
+// veto a transaction that otherwise reaches quorum), the number of participants that
+// answered but declined without a verdict (for example a lost race for a row lock),
+// and a conflict error if any node reports a conflict.
 func (wc *WriteCoordinator) executePreparePhase(ctx context.Context, txn *Transaction, prepReq *ReplicationRequest,
-	otherNodes []uint64, skipLocalReplication bool) (map[uint64]*ReplicationResponse, *RemotePrepareRejectedError, error) {
+	otherNodes []uint64, skipLocalReplication bool) (map[uint64]*ReplicationResponse, *RemotePrepareRejectedError, int, error) {
 
 	// Calculate total nodes to contact
 	totalNodes := len(otherNodes)
@@ -718,7 +749,7 @@ func (wc *WriteCoordinator) executePreparePhase(ctx context.Context, txn *Transa
 	if totalNodes == 0 {
 		// No nodes to contact - this is OK if local execution was already done
 		// Return empty map, caller will add self if skipLocalReplication was true
-		return make(map[uint64]*ReplicationResponse), nil, nil
+		return make(map[uint64]*ReplicationResponse), nil, 0, nil
 	}
 
 	// Channel for collecting responses
@@ -759,8 +790,16 @@ func (wc *WriteCoordinator) executePreparePhase(ctx context.Context, txn *Transa
 	// Collect responses
 	prepResponses := make(map[uint64]*ReplicationResponse)
 	var conflictErr error
-	var localErr error
+	var localErr *LocalPrepareError
 	var remoteRejection *RemotePrepareRejectedError
+	// maxAutoIDStoredBase is the highest base any participant reported this
+	// round, tracked over every response regardless of outcome (zero on
+	// anything that is not an AUTO_INCREMENT claim rejection). A claimant
+	// retries above this, not above the first rejection it happens to see, so
+	// two participants rejecting with different bases converge to the
+	// participant that is furthest ahead.
+	var maxAutoIDStoredBase uint64
+	declined := 0
 
 	for i := 0; i < totalNodes; i++ {
 		select {
@@ -775,6 +814,9 @@ func (wc *WriteCoordinator) executePreparePhase(ctx context.Context, txn *Transa
 			}
 			if r.resp == nil {
 				continue
+			}
+			if r.resp.AutoIDStoredBase > maxAutoIDStoredBase {
+				maxAutoIDStoredBase = r.resp.AutoIDStoredBase
 			}
 			if r.resp.ConflictDetected {
 				// Any conflict -> return error, client will retry
@@ -797,13 +839,16 @@ func (wc *WriteCoordinator) executePreparePhase(ctx context.Context, txn *Transa
 				// Only an explicit rejection is a final answer. Anything else - a
 				// timeout, a storage error - must fall through to the quorum check so
 				// it stays retryable, exactly as before DDL was validated here.
+				if !r.resp.Rejected {
+					declined++
+				}
 				if r.resp.Rejected {
 					reason := r.resp.Error
 					if r.nodeID == wc.nodeID {
 						if reason == "" {
 							reason = "local prepare rejected the transaction"
 						}
-						localErr = &LocalPrepareError{Reason: reason}
+						localErr = &LocalPrepareError{Reason: reason, ErrorCode: r.resp.ErrorCode}
 					} else if remoteRejection == nil {
 						// A remote rejection does not by itself abort the transaction -
 						// it has no veto over quorum. It is only surfaced by the caller
@@ -811,7 +856,8 @@ func (wc *WriteCoordinator) executePreparePhase(ctx context.Context, txn *Transa
 						if reason == "" {
 							reason = "remote prepare rejected the transaction"
 						}
-						remoteRejection = &RemotePrepareRejectedError{NodeID: r.nodeID, Reason: reason}
+						remoteRejection = &RemotePrepareRejectedError{NodeID: r.nodeID, Reason: reason,
+							ErrorCode: r.resp.ErrorCode}
 					}
 				}
 			}
@@ -822,18 +868,28 @@ func (wc *WriteCoordinator) executePreparePhase(ctx context.Context, txn *Transa
 		}
 	}
 
+	// Attach the round's maximum reported base to whichever rejection is on
+	// record. Both are nil on every transaction that is not a claim, so this
+	// changes nothing else.
+	if localErr != nil {
+		localErr.AutoIDStoredBase = maxAutoIDStoredBase
+	}
+	if remoteRejection != nil {
+		remoteRejection.AutoIDStoredBase = maxAutoIDStoredBase
+	}
+
 	// An explicit local rejection is deterministic, so it takes precedence over a
 	// peer conflict: retrying the transaction cannot make it succeed. Transport
 	// failures and missing responses are not rejections - they fall through to the
 	// quorum check.
 	if localErr != nil {
-		return prepResponses, remoteRejection, localErr
+		return prepResponses, remoteRejection, declined, localErr
 	}
 
 	// If any conflict was detected, return the error
 	if conflictErr != nil {
-		return prepResponses, remoteRejection, conflictErr
+		return prepResponses, remoteRejection, declined, conflictErr
 	}
 
-	return prepResponses, remoteRejection, nil
+	return prepResponses, remoteRejection, declined, nil
 }

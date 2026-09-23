@@ -201,11 +201,6 @@ func (m *MemoryMetaStore) DeleteIntentsByTxn(txnID uint64) error {
 	return m.pebble.DeleteIntentsByTxn(txnID)
 }
 
-// MarkIntentsForCleanup delegates to Pebble.
-func (m *MemoryMetaStore) MarkIntentsForCleanup(txnID uint64) error {
-	return m.pebble.MarkIntentsForCleanup(txnID)
-}
-
 // GetIntentsByTxn delegates to Pebble.
 func (m *MemoryMetaStore) GetIntentsByTxn(txnID uint64) ([]*WriteIntentRecord, error) {
 	return m.pebble.GetIntentsByTxn(txnID)
@@ -438,7 +433,7 @@ func (m *MemoryMetaStore) Checkpoint() error {
 }
 
 // GetRowLockStats returns row lock statistics (stub for memory store)
-func (m *MemoryMetaStore) GetRowLockStats() (activeLocks, activeTransactions, gcMarkers, tablesWithLocks int) {
+func (m *MemoryMetaStore) GetRowLockStats() (activeLocks, activeTransactions, tablesWithLocks int) {
 	return m.pebble.GetRowLockStats()
 }
 
@@ -447,13 +442,35 @@ func (m *MemoryMetaStore) IntentStats() (pendingIntents int, err error) {
 	return m.pebble.IntentStats()
 }
 
-// ReconstructFromPebble cleans up orphaned CDC data from crashed transactions.
-// Called at startup to ensure consistency.
-// Memory stores start empty - no pending transaction state survives crash.
+// ReconstructFromPebble rebuilds the memory tier's view of a store just opened.
+//
+// Every prepared transaction the Pebble store recovered holds its row locks
+// again. It is registered here as pending, with a heartbeat of now, so that
+// the stale-transaction GC aborts it heartbeat_timeout after this restart
+// unless its COMMIT or ABORT arrives first; until then its captured rows are
+// kept for that COMMIT. The captured rows of any other transaction without a
+// commit record are orphans of a crash and are deleted.
 func (m *MemoryMetaStore) ReconstructFromPebble() error {
-	orphanedTxnIDs, err := m.pebble.findOrphanedCDCRawTxnIDs()
+	now := time.Now().UnixNano()
+	for _, rec := range m.pebble.takeRecoveredPrepared() {
+		m.txnStore.Begin(rec.TxnID, &TxnState{
+			NodeID:         rec.NodeID,
+			Status:         TxnStatusPending,
+			StartTSWall:    rec.StartTSWall,
+			StartTSLogical: rec.StartTSLogical,
+			LastHeartbeat:  now,
+		})
+	}
+
+	candidates, err := m.pebble.findOrphanedCDCRawTxnIDs()
 	if err != nil {
 		return fmt.Errorf("failed to find orphaned CDC txnIDs: %w", err)
+	}
+	orphanedTxnIDs := candidates[:0]
+	for _, txnID := range candidates {
+		if _, prepared := m.txnStore.Get(txnID); !prepared {
+			orphanedTxnIDs = append(orphanedTxnIDs, txnID)
+		}
 	}
 
 	if len(orphanedTxnIDs) == 0 {

@@ -165,6 +165,8 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 		ConflictDetected: result.ConflictDetected,
 		ConflictDetails:  result.ConflictDetails,
 		Rejected:         result.Rejected,
+		AutoIdStoredBase: result.AutoIDStoredBase,
+		ErrorCode:        uint32(result.ErrorCode),
 	}
 	if result.Success {
 		resp.AppliedAt = &HLC{

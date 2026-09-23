@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/mattn/go-sqlite3"
@@ -78,6 +79,31 @@ func TestConvertToMySQLError_SQLiteExtendedCodes(t *testing.T) {
 				t.Errorf("SQLState = %s, want %s", result.SQLState, tt.wantSQLState)
 			}
 		})
+	}
+}
+
+// TestConvertToMySQLError_CommitHookRefusalIsRetryable: a commit the write
+// gate refused was rolled back whole while its database was out of service,
+// so the client must restart the transaction (1213, SQLSTATE 40001), not
+// treat it as an integrity violation. It is told apart by its extended code,
+// not its text: a plain constraint error with the same message stays an
+// integrity error.
+//
+// Mutation: drop the ErrConstraintCommitHook case. "a refused commit was not
+// reported as retryable" fires.
+func TestConvertToMySQLError_CommitHookRefusalIsRetryable(t *testing.T) {
+	refused := sqlite3.Error{Code: sqlite3.ErrConstraint, ExtendedCode: sqlite3.ErrConstraintCommitHook}
+	for _, err := range []error{refused, fmt.Errorf("commit: %w", refused)} {
+		result := ConvertToMySQLError(err)
+		if result.Code != ErrCodeDeadlock || result.SQLState != SQLStateDeadlock {
+			t.Errorf("a refused commit was not reported as retryable: %v gave %d/%s", err, result.Code, result.SQLState)
+		}
+	}
+
+	plain := sqlite3.Error{Code: sqlite3.ErrConstraint, ExtendedCode: sqlite3.ErrNoExtended(sqlite3.ErrConstraint)}
+	result := ConvertToMySQLError(fmt.Errorf("%w: constraint failed", plain))
+	if result.Code == ErrCodeDeadlock || result.SQLState != SQLStateIntegrity {
+		t.Errorf("a plain constraint error was reported as %d/%s", result.Code, result.SQLState)
 	}
 }
 

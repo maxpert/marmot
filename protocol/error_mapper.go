@@ -73,12 +73,14 @@ func sqlStateForCode(code uint16) string {
 		return SQLStateNoSuchCol
 	case ErrCodeDupFieldName:
 		return SQLStateDupColumn
-	case ErrCodeParseError, transform.ErrCodeNotSupportedYet:
+	case ErrCodeParseError, transform.ErrCodeNotSupportedYet, ErrCodeTableAccessDenied:
 		return SQLStateSyntax
 	case ErrCodeNoDB:
 		return SQLStateNoDB
 	case ErrCodeServerShutdown:
 		return SQLStateConnFailure
+	case ErrCodeDataOutOfRange:
+		return SQLStateDataOutOfRange
 	default:
 		return SQLStateGeneral
 	}
@@ -97,6 +99,14 @@ func mapSQLiteError(e sqlite3.Error, msg string) *MySQLError {
 		return NewMySQLError(ErrCodeNoReferencedRow, SQLStateIntegrity, msg)
 	case sqlite3.ErrConstraintCheck:
 		return NewMySQLError(ErrCodeCheckConstraint, SQLStateIntegrity, msg)
+	case sqlite3.ErrConstraintCommitHook:
+		// A commit hook refused the commit and SQLite rolled the whole
+		// transaction back. Marmot's only commit hook is a database's write
+		// gate, which refuses while the database is out of service (restore,
+		// drop, shutdown): transient, and nothing was written, so the client
+		// restarts the transaction as after a deadlock (1213, SQLSTATE 40001).
+		return NewMySQLError(ErrCodeDeadlock, SQLStateDeadlock,
+			"Transaction rolled back while its database was out of service; try restarting transaction")
 	}
 
 	// Check primary codes

@@ -2,10 +2,10 @@ package grpc
 
 import (
 	"context"
-	"errors"
-	"fmt"
 	"io"
 	"net"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/maxpert/marmot/cfg"
@@ -329,22 +329,6 @@ func TestCatchUpClient_PersistSchemaVersions_PathOpenFailsAgainstLiveManager(t *
 	require.Error(t, err)
 }
 
-// SchemaVersionRestoreError must be detectable through fmt.Errorf's %w
-// wrapping, since applySnapshot's own wrapping and CatchUpFromPeer's
-// "failed to apply snapshot: %w" wrapping both sit between where the error is
-// created and where FilesSwappedDespiteError inspects it.
-func TestFilesSwappedDespiteError(t *testing.T) {
-	require.True(t, FilesSwappedDespiteError(nil), "no error at all means the snapshot succeeded")
-
-	schemaErr := &SchemaVersionRestoreError{err: errors.New("boom")}
-	wrapped := fmt.Errorf("failed to apply snapshot: %w", schemaErr)
-	require.True(t, FilesSwappedDespiteError(wrapped),
-		"a schema-version-restore error means files were already swapped")
-
-	require.False(t, FilesSwappedDespiteError(errors.New("connection refused")),
-		"an unrelated error must not be treated as files-swapped")
-}
-
 // trailerOnlyStreamSnapshotServer implements just enough of MarmotServiceServer
 // to prove schema versions set via stream.SetTrailer on the server side really
 // do arrive at stream.Trailer() on the client side over a real gRPC
@@ -386,4 +370,177 @@ func TestStreamSnapshotTrailer_PropagatesOverRealGRPCConnection(t *testing.T) {
 
 	got := SnapshotVersionsForRestore(nil, stream)
 	require.Equal(t, wantVersions, got)
+}
+
+// TestSnapshotFilesToRestore_RunningNodeInstallsOnlyItsDatabase: anti-entropy
+// on a running node restores one database. Every other file in the peer's
+// snapshot, the system database included, is open on this node; swapping it
+// would leave its connections writing to an unlinked file and hand the peer's
+// AUTO_INCREMENT claim bases to the next restart.
+//
+// Mutation: ignore the database argument. "a running node's restore would
+// install" fires.
+func TestSnapshotFilesToRestore_RunningNodeInstallsOnlyItsDatabase(t *testing.T) {
+	dbs := []*DatabaseFileInfo{
+		{Name: db.SystemDatabaseName, Filename: db.SystemDatabaseName + ".db"},
+		{Name: "app", Filename: "databases/app.db"},
+		{Name: "other", Filename: "databases/other.db"},
+	}
+
+	files, err := snapshotFilesToRestore(dbs, "app")
+	require.NoError(t, err)
+	names := make([]string, 0, len(files))
+	for _, f := range files {
+		names = append(names, f.Name)
+	}
+	require.Equal(t, []string{"app"}, names, "a running node's restore would install %v", names)
+
+	all, err := snapshotFilesToRestore(dbs, "")
+	require.NoError(t, err)
+	require.Len(t, all, 3, "startup catch-up installs every file")
+
+	_, err = snapshotFilesToRestore(dbs, "missing")
+	require.Error(t, err)
+}
+
+// gatedSnapshotServer is a real peer Server whose StreamSnapshot waits for the
+// test, so the test can act while the requesting node's catch-up is between
+// its detach and the peer taking its snapshot.
+type gatedSnapshotServer struct {
+	*Server
+	requested chan struct{}
+	release   chan struct{}
+}
+
+func (g *gatedSnapshotServer) StreamSnapshot(req *SnapshotRequest, stream MarmotService_StreamSnapshotServer) error {
+	close(g.requested)
+	<-g.release
+	return g.Server.StreamSnapshot(req, stream)
+}
+
+func newCatchUpTestDB(t *testing.T, dir string, nodeID uint64, rows map[int]string) *db.DatabaseManager {
+	t.Helper()
+	dm, err := db.NewDatabaseManager(dir, nodeID, hlc.NewClock(nodeID))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = dm.Close() })
+	require.NoError(t, dm.CreateDatabase("app"))
+	app, err := dm.GetDatabase("app")
+	require.NoError(t, err)
+	_, err = app.GetWriteDB().Exec("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+	require.NoError(t, err)
+	for id, v := range rows {
+		_, err = app.GetWriteDB().Exec("INSERT INTO t (id, v) VALUES (?, ?)", id, v)
+		require.NoError(t, err)
+	}
+	return dm
+}
+
+// TestCatchUpFromPeer_RunningNodeDetachesTheDatabaseForTheRestore:
+// anti-entropy replaces one database's file on a running node while clients
+// and 2PC keep using it. From before the peer takes its snapshot until the
+// file is replaced, the database is detached: a caller that looks it up gets
+// ErrDatabaseDetached, a caller still holding it gets "sql: database is
+// closed", no pool is ever nil, and so no write is ACKed into the file the
+// restore discards. Afterwards the node serves exactly the peer's rows, and
+// the system database and other databases were never touched.
+//
+// Mutation: make DetachDatabase leave the database in service (no map
+// removal, no close). "a write was ACKed during the restore window" fires.
+// Mutation: close the detached pools the way CloseSQLiteConnections does,
+// setting them nil. "a caller holding the database observed a nil pool" fires,
+// and under -race so does the race detector.
+func TestCatchUpFromPeer_RunningNodeDetachesTheDatabaseForTheRestore(t *testing.T) {
+	peer := newCatchUpTestDB(t, t.TempDir(), 2, map[int]string{1: "peer"})
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	peerServer := &Server{}
+	peerServer.SetDatabaseManager(peer)
+	gated := &gatedSnapshotServer{Server: peerServer, requested: make(chan struct{}), release: make(chan struct{})}
+	grpcServer := grpc.NewServer()
+	RegisterMarmotServiceServer(grpcServer, gated)
+	go func() { _ = grpcServer.Serve(listener) }()
+	defer grpcServer.Stop()
+
+	localDir := t.TempDir()
+	local := newCatchUpTestDB(t, localDir, 1, map[int]string{1: "local", 2: "local-only"})
+	require.NoError(t, local.CreateDatabase("other"))
+	held, err := local.GetDatabase("app")
+	require.NoError(t, err)
+
+	client := NewCatchUpClient(1, localDir, NewNodeRegistry(1, "localhost:5001"), nil)
+	client.SetDatabaseManager(local)
+
+	// A caller that holds the database across the whole catch-up, detach and
+	// reattach included, must only ever see a pool or an error.
+	var nilPools atomic.Int64
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			writeDB, readDB := held.GetWriteDB(), held.GetReadDB()
+			if writeDB == nil || readDB == nil {
+				nilPools.Add(1)
+				continue
+			}
+			var n int
+			_ = readDB.QueryRow("SELECT COUNT(*) FROM t").Scan(&n)
+		}
+	}()
+
+	done := make(chan error, 1)
+	go func() { done <- client.CatchUpFromPeer(context.Background(), 2, listener.Addr().String(), "app") }()
+	<-gated.requested
+
+	// The window: the peer has not taken its snapshot yet.
+	acked := 0
+	if _, err := local.GetDatabase("app"); err == nil {
+		acked++
+	} else {
+		require.ErrorIs(t, err, db.ErrDatabaseDetached)
+	}
+	heldWrite, heldRead := held.GetWriteDB(), held.GetReadDB()
+	require.NotNil(t, heldWrite, "a caller holding the database observed a nil pool")
+	require.NotNil(t, heldRead, "a caller holding the database observed a nil pool")
+	if _, err := heldWrite.Exec("INSERT INTO t (id, v) VALUES (100, 'window')"); err == nil {
+		acked++
+	}
+	require.Zero(t, acked, "a write was ACKed during the restore window")
+	var n int
+	require.Error(t, heldRead.QueryRow("SELECT COUNT(*) FROM t").Scan(&n), "a read was served from the file being replaced")
+	other, err := local.GetDatabase("other")
+	require.NoError(t, err, "a database not being restored left service")
+	_, err = other.GetWriteDB().Exec("CREATE TABLE IF NOT EXISTS o (id INTEGER PRIMARY KEY)")
+	require.NoError(t, err)
+	_, err = local.GetSystemDatabase().GetReadDB().Exec("SELECT 1")
+	require.NoError(t, err, "the system database left service")
+
+	close(gated.release)
+	require.NoError(t, <-done)
+	close(stop)
+	wg.Wait()
+	require.Zero(t, nilPools.Load(), "a caller holding the database observed a nil pool")
+
+	app, err := local.GetDatabase("app")
+	require.NoError(t, err)
+	rows, err := app.GetReadDB().Query("SELECT id, v FROM t ORDER BY id")
+	require.NoError(t, err)
+	got := map[int]string{}
+	for rows.Next() {
+		var id int
+		var v string
+		require.NoError(t, rows.Scan(&id, &v))
+		got[id] = v
+	}
+	require.NoError(t, rows.Err())
+	require.NoError(t, rows.Close())
+	require.Equal(t, map[int]string{1: "peer"}, got, "the restored database mixes rows from both files")
+	_, err = app.GetWriteDB().Exec("INSERT INTO t (id, v) VALUES (3, 'after')")
+	require.NoError(t, err, "the reattached database does not accept writes")
 }

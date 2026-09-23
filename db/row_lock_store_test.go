@@ -2,7 +2,9 @@ package db
 
 import (
 	"fmt"
+	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -14,7 +16,6 @@ func TestNewRowLockStore(t *testing.T) {
 	store := NewRowLockStore()
 	require.NotNil(t, store)
 	require.NotNil(t, store.tables)
-	require.NotNil(t, store.gc)
 	require.NotNil(t, store.byTxn)
 }
 
@@ -127,50 +128,6 @@ func TestGetLockHolder(t *testing.T) {
 	require.Equal(t, uint64(100), holder)
 }
 
-func TestSetGCMarker(t *testing.T) {
-	t.Parallel()
-
-	store := NewRowLockStore()
-	store.SetGCMarker("db1", "table1", "row1")
-
-	hasMarker := store.CheckGCMarker("db1", "table1", "row1")
-	require.True(t, hasMarker)
-}
-
-func TestCheckGCMarker_Exists(t *testing.T) {
-	t.Parallel()
-
-	store := NewRowLockStore()
-	store.SetGCMarker("db1", "table1", "row1")
-
-	hasMarker := store.CheckGCMarker("db1", "table1", "row1")
-	require.True(t, hasMarker)
-}
-
-func TestCheckGCMarker_NotExists(t *testing.T) {
-	t.Parallel()
-
-	store := NewRowLockStore()
-	hasMarker := store.CheckGCMarker("db1", "table1", "row1")
-	require.False(t, hasMarker)
-}
-
-func TestDeleteGCMarker(t *testing.T) {
-	t.Parallel()
-
-	store := NewRowLockStore()
-	store.SetGCMarker("db1", "table1", "row1")
-	require.True(t, store.CheckGCMarker("db1", "table1", "row1"))
-
-	store.DeleteGCMarker("db1", "table1", "row1")
-	require.False(t, store.CheckGCMarker("db1", "table1", "row1"))
-
-	// Deleting non-existent marker should not panic
-	require.NotPanics(t, func() {
-		store.DeleteGCMarker("db1", "table1", "row2")
-	})
-}
-
 func TestReleaseByTxn_SingleLock(t *testing.T) {
 	t.Parallel()
 
@@ -225,123 +182,6 @@ func TestReleaseByTxn_NoLocks(t *testing.T) {
 	require.NotPanics(t, func() {
 		store.ReleaseByTxn(999)
 	})
-}
-
-func TestReleaseByTable_SingleTable(t *testing.T) {
-	t.Parallel()
-
-	store := NewRowLockStore()
-	_, acquired := store.AcquireLock("db1", "table1", "row1", 100)
-	require.True(t, acquired)
-
-	store.ReleaseByTable("db1", "table1")
-
-	holder := store.GetLockHolder("db1", "table1", "row1")
-	require.Equal(t, uint64(0), holder)
-}
-
-func TestReleaseByTable_MultipleRows(t *testing.T) {
-	t.Parallel()
-
-	store := NewRowLockStore()
-	_, acquired1 := store.AcquireLock("db1", "table1", "row1", 100)
-	require.True(t, acquired1)
-
-	_, acquired2 := store.AcquireLock("db1", "table1", "row2", 200)
-	require.True(t, acquired2)
-
-	_, acquired3 := store.AcquireLock("db1", "table1", "row3", 300)
-	require.True(t, acquired3)
-
-	store.ReleaseByTable("db1", "table1")
-
-	require.Equal(t, uint64(0), store.GetLockHolder("db1", "table1", "row1"))
-	require.Equal(t, uint64(0), store.GetLockHolder("db1", "table1", "row2"))
-	require.Equal(t, uint64(0), store.GetLockHolder("db1", "table1", "row3"))
-}
-
-func TestReleaseByTable_OtherTablesUnaffected(t *testing.T) {
-	t.Parallel()
-
-	store := NewRowLockStore()
-	_, acquired1 := store.AcquireLock("db1", "table1", "row1", 100)
-	require.True(t, acquired1)
-
-	_, acquired2 := store.AcquireLock("db1", "table2", "row2", 200)
-	require.True(t, acquired2)
-
-	_, acquired3 := store.AcquireLock("db2", "table1", "row3", 300)
-	require.True(t, acquired3)
-
-	store.ReleaseByTable("db1", "table1")
-
-	// table1 in db1 should be released
-	require.Equal(t, uint64(0), store.GetLockHolder("db1", "table1", "row1"))
-
-	// Other tables should be unaffected
-	require.Equal(t, uint64(200), store.GetLockHolder("db1", "table2", "row2"))
-	require.Equal(t, uint64(300), store.GetLockHolder("db2", "table1", "row3"))
-}
-
-func TestReleaseByDatabase_SingleDB(t *testing.T) {
-	t.Parallel()
-
-	store := NewRowLockStore()
-	_, acquired1 := store.AcquireLock("db1", "table1", "row1", 100)
-	require.True(t, acquired1)
-
-	_, acquired2 := store.AcquireLock("db1", "table2", "row2", 200)
-	require.True(t, acquired2)
-
-	store.ReleaseByDatabase("db1")
-
-	require.Equal(t, uint64(0), store.GetLockHolder("db1", "table1", "row1"))
-	require.Equal(t, uint64(0), store.GetLockHolder("db1", "table2", "row2"))
-}
-
-func TestReleaseByDatabase_OtherDBsUnaffected(t *testing.T) {
-	t.Parallel()
-
-	store := NewRowLockStore()
-	_, acquired1 := store.AcquireLock("db1", "table1", "row1", 100)
-	require.True(t, acquired1)
-
-	_, acquired2 := store.AcquireLock("db2", "table1", "row2", 200)
-	require.True(t, acquired2)
-
-	store.ReleaseByDatabase("db1")
-
-	// db1 should be released
-	require.Equal(t, uint64(0), store.GetLockHolder("db1", "table1", "row1"))
-
-	// db2 should be unaffected
-	require.Equal(t, uint64(200), store.GetLockHolder("db2", "table1", "row2"))
-}
-
-func TestClear(t *testing.T) {
-	t.Parallel()
-
-	store := NewRowLockStore()
-	_, acquired1 := store.AcquireLock("db1", "table1", "row1", 100)
-	require.True(t, acquired1)
-
-	_, acquired2 := store.AcquireLock("db2", "table2", "row2", 200)
-	require.True(t, acquired2)
-
-	store.SetGCMarker("db1", "table1", "row1")
-
-	store.Clear()
-
-	// All locks should be cleared
-	require.Equal(t, uint64(0), store.GetLockHolder("db1", "table1", "row1"))
-	require.Equal(t, uint64(0), store.GetLockHolder("db2", "table2", "row2"))
-
-	// All GC markers should be cleared
-	require.False(t, store.CheckGCMarker("db1", "table1", "row1"))
-
-	// Should be empty
-	locks := store.GetLocksByTxn(100)
-	require.Empty(t, locks)
 }
 
 func TestGetLocksByTxn(t *testing.T) {
@@ -604,52 +444,6 @@ func TestLargeNumberOfLocks(t *testing.T) {
 	}
 }
 
-func TestGCMarkerWithLocks(t *testing.T) {
-	t.Parallel()
-
-	store := NewRowLockStore()
-
-	// Set GC marker and lock on same row
-	store.SetGCMarker("db1", "table1", "row1")
-	_, acquired := store.AcquireLock("db1", "table1", "row1", 100)
-	require.True(t, acquired)
-
-	// Both should exist independently
-	require.True(t, store.CheckGCMarker("db1", "table1", "row1"))
-	require.Equal(t, uint64(100), store.GetLockHolder("db1", "table1", "row1"))
-
-	// Release lock shouldn't affect GC marker
-	store.ReleaseLock("db1", "table1", "row1")
-	require.True(t, store.CheckGCMarker("db1", "table1", "row1"))
-	require.Equal(t, uint64(0), store.GetLockHolder("db1", "table1", "row1"))
-
-	// Delete GC marker shouldn't affect lock (if re-acquired)
-	_, acquired = store.AcquireLock("db1", "table1", "row1", 200)
-	require.True(t, acquired)
-
-	store.DeleteGCMarker("db1", "table1", "row1")
-	require.False(t, store.CheckGCMarker("db1", "table1", "row1"))
-	require.Equal(t, uint64(200), store.GetLockHolder("db1", "table1", "row1"))
-}
-
-func TestReleaseByTable_WithGCMarkers(t *testing.T) {
-	t.Parallel()
-
-	store := NewRowLockStore()
-
-	// Add locks and GC markers
-	_, acquired1 := store.AcquireLock("db1", "table1", "row1", 100)
-	require.True(t, acquired1)
-
-	store.SetGCMarker("db1", "table1", "row2")
-
-	// ReleaseByTable releases locks and also cleans up GC markers for that table
-	store.ReleaseByTable("db1", "table1")
-
-	require.Equal(t, uint64(0), store.GetLockHolder("db1", "table1", "row1"))
-	require.False(t, store.CheckGCMarker("db1", "table1", "row2"))
-}
-
 func TestMultipleTxnsSameRow_Sequential(t *testing.T) {
 	t.Parallel()
 
@@ -674,29 +468,119 @@ func TestMultipleTxnsSameRow_Sequential(t *testing.T) {
 	require.Equal(t, uint64(200), store.GetLockHolder("db1", "table1", "row1"))
 }
 
-func TestReleaseByDatabase_WithGCMarkers(t *testing.T) {
+// TestReleaseKeepsTheTableMapAnAcquirerAlreadyLoaded replays, step by step,
+// the interleaving that let two transactions hold one row. AcquireLock loads a
+// table's row map and inserts into it as two separate steps. A release that
+// empties the map used to delete it from the store in between, so the insert
+// landed in a detached map and the next acquirer took the same row in a fresh
+// one. Every release path is driven.
+//
+// Mutation: in releaseRowIfHeldBy (or ReleaseLock), delete the table's row map
+// from s.tables once it is empty. "a third acquirer took a row B holds" fires.
+func TestReleaseKeepsTheTableMapAnAcquirerAlreadyLoaded(t *testing.T) {
+	t.Parallel()
+
+	const table, row = "t", "autoinc:testdb:users"
+	releases := map[string]func(s *RowLockStore){
+		"ReleaseLockIfHeldBy": func(s *RowLockStore) { s.ReleaseLockIfHeldBy("", table, row, 1) },
+		"ReleaseByTxn":        func(s *RowLockStore) { s.ReleaseByTxn(1) },
+		"ReleaseLock":         func(s *RowLockStore) { s.ReleaseLock("", table, row) },
+	}
+	for name, release := range releases {
+		t.Run(name, func(t *testing.T) {
+			s := NewRowLockStore()
+			_, ok := s.AcquireLock("", table, row, 1)
+			require.True(t, ok)
+
+			// B has done AcquireLock's first step: it holds the table's row map.
+			rowMap, ok := s.tables.Load(makeTableKey("", table))
+			require.True(t, ok)
+
+			// A releases the only lock in the table.
+			release(s)
+
+			// B's second step inserts into the map it loaded.
+			_, loaded := rowMap.LoadOrStore(row, 2)
+			require.False(t, loaded, "A's lock survived its release")
+
+			holder, acquired := s.AcquireLock("", table, row, 3)
+			require.False(t, acquired, "a third acquirer took a row B holds: B's lock was dropped with a detached map")
+			require.Equal(t, uint64(2), holder)
+		})
+	}
+}
+
+// TestConcurrentAcquireReleaseKeepsMutualExclusion is a soak for the same
+// property under real scheduling; the deterministic proof is
+// TestReleaseKeepsTheTableMapAnAcquirerAlreadyLoaded. The mutex stands in for
+// PebbleMetaStore.intentLockFor, which serialises acquires on one key while the
+// commit path releases without it.
+func TestConcurrentAcquireReleaseKeepsMutualExclusion(t *testing.T) {
+	t.Parallel()
+
+	const (
+		goroutines = 4
+		iterations = 20000
+		row        = "autoinc:testdb:users"
+	)
+	store := NewRowLockStore()
+	var (
+		acquireMu sync.Mutex
+		holders   atomic.Int32
+		overlaps  atomic.Int32
+		wg        sync.WaitGroup
+	)
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for i := uint64(1); i <= iterations; i++ {
+				txnID := uint64(g+1)<<40 | i
+				acquireMu.Lock()
+				_, acquired := store.AcquireLock("", "t", row, txnID)
+				acquireMu.Unlock()
+				if !acquired {
+					continue
+				}
+				if holders.Add(1) > 1 {
+					overlaps.Add(1)
+				}
+				runtime.Gosched()
+				holders.Add(-1)
+				store.ReleaseByTxn(txnID)
+			}
+		}(g)
+	}
+	wg.Wait()
+	require.Zero(t, overlaps.Load(), "two transactions held the same row at once")
+}
+
+// TestReleaseByTxnLeavesARowAnotherTransactionHolds pins the holder check in
+// ReleaseByTxn. A transaction's reverse index and the row map are updated in
+// separate steps, so the index can still name a row whose lock was released
+// and retaken: ReleaseLockIfHeldBy deletes the row entry before it removes the
+// index entry, and another transaction can acquire the row in between.
+//
+// Mutation: release each indexed row unconditionally (ReleaseLock) instead of
+// releaseRowIfHeldBy. "ReleaseByTxn released a row another transaction holds"
+// fires.
+func TestReleaseByTxnLeavesARowAnotherTransactionHolds(t *testing.T) {
 	t.Parallel()
 
 	store := NewRowLockStore()
+	_, ok := store.AcquireLock("", "t", "r", 1)
+	require.True(t, ok)
 
-	// Add locks and GC markers
-	_, acquired1 := store.AcquireLock("db1", "table1", "row1", 100)
-	require.True(t, acquired1)
+	// The row passes to txn 2 while txn 1's index still names it.
+	rowMap, ok := store.tables.Load(makeTableKey("", "t"))
+	require.True(t, ok)
+	rowMap.Store("r", 2)
 
-	store.SetGCMarker("db1", "table1", "row2")
+	keys := store.ReleaseByTxn(1)
+	require.Equal(t, []string{makeFullKey("", "t", "r")}, keys,
+		"every key the index named must be returned for intent-record cleanup")
 
-	_, acquired2 := store.AcquireLock("db2", "table1", "row3", 200)
-	require.True(t, acquired2)
-
-	store.SetGCMarker("db2", "table1", "row4")
-
-	// ReleaseByDatabase releases locks and GC markers for all tables in that DB
-	store.ReleaseByDatabase("db1")
-
-	require.Equal(t, uint64(0), store.GetLockHolder("db1", "table1", "row1"))
-	require.Equal(t, uint64(200), store.GetLockHolder("db2", "table1", "row3"))
-
-	// GC markers for db1 should be cleaned up, but db2 should remain
-	require.False(t, store.CheckGCMarker("db1", "table1", "row2"))
-	require.True(t, store.CheckGCMarker("db2", "table1", "row4"))
+	holder, held := store.CheckLock("", "t", "r")
+	require.True(t, held, "ReleaseByTxn released a row another transaction holds")
+	require.Equal(t, uint64(2), holder)
 }

@@ -7,6 +7,8 @@ import (
 	"fmt"
 
 	"github.com/mattn/go-sqlite3"
+	"github.com/maxpert/marmot/protocol/mysqlcode"
+	"github.com/maxpert/marmot/protocol/query/transform"
 )
 
 // isContextError reports whether err was caused by the context being cancelled or
@@ -33,11 +35,47 @@ var transientSQLiteCodes = map[sqlite3.ErrNo]bool{
 	sqlite3.ErrReadonly: true, // SQLITE_READONLY: database (or this connection) is read-only right now
 }
 
+// AutoIncWidthExceededError reports that MAX(id) in an existing table exceeds
+// the range its explicitly declared AUTO_INCREMENT column can hold - e.g. an
+// ALTER that narrows the column to TINYINT after 200 rows already exist.
+//
+// It is raised only after DDL validation has re-derived the column's marker
+// from THIS node's own (in-transaction) sqlite_master, so - unlike a raw
+// SQLite runtime error - it carries no ambiguity about transient node state:
+// it is always a deterministic verdict on the statement, and isDDLRejection
+// treats it as an unconditional rejection.
+type AutoIncWidthExceededError struct {
+	Table    string
+	Column   string
+	Max      uint64
+	WidthMax uint64
+}
+
+func (e *AutoIncWidthExceededError) Error() string {
+	return fmt.Sprintf(
+		"table %s: existing max value %d of AUTO_INCREMENT column %s exceeds its declared width ceiling %d",
+		e.Table, e.Max, e.Column, e.WidthMax)
+}
+
+// Unwrap exposes this rejection's MySQL error code (ER_WARN_DATA_OUT_OF_RANGE)
+// through *transform.CodedError, the same coded-error mechanism a
+// transformation rule uses to choose its own client-facing code.
+// protocol.ConvertToMySQLError already recognises *transform.CodedError via
+// errors.As, so this alone is enough for the width-ceiling rejection to reach
+// the client with the right code - no separate mapping mechanism is needed,
+// and protocol.ConvertToMySQLError never has to reference this db type by
+// name, which would create an import cycle (db already imports protocol;
+// protocol must not import db).
+func (e *AutoIncWidthExceededError) Unwrap() error {
+	return &transform.CodedError{Code: mysqlcode.ErrCodeDataOutOfRange, Message: e.Error()}
+}
+
 // isDDLRejection reports whether err is a deterministic verdict on the DDL
 // statement itself - SQLite refuses to ever apply it, such as a constraint
 // violation or a schema conflict (duplicate column, missing table, syntax
-// error) - rather than a transient condition on this node such as lock
-// contention, a resource limit, or context cancellation.
+// error), or this node's own width-ceiling check found existing rows the
+// declared column cannot hold - rather than a transient condition on this
+// node such as lock contention, a resource limit, or context cancellation.
 //
 // Only a rejection may be surfaced to the coordinator as a final refusal of
 // the transaction; everything else must stay a retryable missing ACK, exactly
@@ -45,6 +83,11 @@ var transientSQLiteCodes = map[sqlite3.ErrNo]bool{
 func isDDLRejection(ctx context.Context, err error) bool {
 	if ctx.Err() != nil || isContextError(err) {
 		return false
+	}
+
+	var widthErr *AutoIncWidthExceededError
+	if errors.As(err, &widthErr) {
+		return true
 	}
 
 	var sqliteErr sqlite3.Error
@@ -56,6 +99,22 @@ func isDDLRejection(ctx context.Context, err error) bool {
 	}
 
 	return !transientSQLiteCodes[sqliteErr.Code]
+}
+
+// mysqlCodeForError returns the MySQL server error code an error names, or 0
+// when it names none.
+//
+// A rejection crosses to the coordinator as a string (PrepareResult.Error), so
+// the typed error is gone by the time anything maps it to a client-visible
+// code. Reading the code here, where the typed error still exists, is what
+// lets a participant's deterministic refusal keep its own code instead of
+// being flattened to ER_UNKNOWN_ERROR.
+func mysqlCodeForError(err error) uint16 {
+	var coded *transform.CodedError
+	if errors.As(err, &coded) {
+		return coded.Code
+	}
+	return 0
 }
 
 // ValidateDDLStatements verifies that DDL can be applied to this node before the
@@ -86,6 +145,11 @@ func ValidateDDLStatements(ctx context.Context, dbConn *sql.DB, statements []str
 	// Always discard the validation transaction - it exists only to surface errors.
 	defer func() { _ = tx.Rollback() }()
 
+	before, err := tableSchemaSnapshot(ctx, tx)
+	if err != nil {
+		return err
+	}
+
 	for _, stmt := range statements {
 		if stmt == "" {
 			continue
@@ -95,5 +159,88 @@ func ValidateDDLStatements(ctx context.Context, dbConn *sql.DB, statements []str
 		}
 	}
 
+	after, err := tableSchemaSnapshot(ctx, tx)
+	if err != nil {
+		return err
+	}
+
+	// Refuse the DDL when it leaves an explicitly declared AUTO_INCREMENT
+	// column unable to hold ids the table already contains. Scoped to tables whose sqlite_master row this DDL actually changed
+	// - derived from the schema itself, not by parsing the statement text - so
+	// a CREATE TABLE for an unrelated table is never rejected over a
+	// pre-existing condition on some other table it never touched.
+	return checkAutoIncWidthCeilings(ctx, tx, changedTables(before, after))
+}
+
+// tableSchemaSnapshot reads every table's CREATE TABLE text from
+// sqlite_master, keyed by name.
+func tableSchemaSnapshot(ctx context.Context, tx *sql.Tx) (map[string]string, error) {
+	rows, err := tx.QueryContext(ctx, "SELECT name, sql FROM sqlite_master WHERE type = 'table'")
+	if err != nil {
+		return nil, fmt.Errorf("snapshot sqlite_master: %w", err)
+	}
+	defer rows.Close()
+
+	snapshot := make(map[string]string)
+	for rows.Next() {
+		var name string
+		var createSQL sql.NullString
+		if err := rows.Scan(&name, &createSQL); err != nil {
+			return nil, fmt.Errorf("scan sqlite_master row: %w", err)
+		}
+		snapshot[name] = createSQL.String
+	}
+	return snapshot, rows.Err()
+}
+
+// changedTables returns the names of tables in `after` whose CREATE TABLE
+// text differs from (or is absent from) `before` - the set of tables this
+// validation's DDL actually touched, derived from the schema rather than the
+// statement text so it covers CREATE TABLE and every ALTER shape uniformly.
+func changedTables(before, after map[string]string) []string {
+	var touched []string
+	for name, createSQL := range after {
+		if before[name] != createSQL {
+			touched = append(touched, name)
+		}
+	}
+	return touched
+}
+
+// checkAutoIncWidthCeilings rejects the DDL when a table's explicitly
+// declared AUTO_INCREMENT column can no longer hold the ids the table already
+// contains. It runs inside the validation transaction, so it sees the NEW
+// schema (this DDL's own effect) against the OLD rows the DDL has not
+// touched, and is always rolled back with the rest of validation.
+func checkAutoIncWidthCeilings(ctx context.Context, tx *sql.Tx, tables []string) error {
+	for _, table := range tables {
+		col, attrs, ok, err := autoIncMarkedColumn(tx, table)
+		if err != nil {
+			return fmt.Errorf("derive auto-increment column for %s: %w", table, err)
+		}
+		if !ok {
+			continue
+		}
+
+		var max sql.NullInt64
+		q := fmt.Sprintf("SELECT MAX(%s) FROM %s", quoteIdent(col), quoteIdent(table))
+		if err := tx.QueryRowContext(ctx, q).Scan(&max); err != nil {
+			return fmt.Errorf("compute existing max for %s.%s: %w", table, col, err)
+		}
+		if !max.Valid || max.Int64 < 0 {
+			// No rows, or every id is negative: negative ids are never issued
+			// by the allocator (it only ever advances upward from a
+			// non-negative base), so they carry nothing for this ceiling to
+			// check against.
+			continue
+		}
+
+		widthMax := attrs.WidthMax()
+		if uint64(max.Int64) > widthMax {
+			return &AutoIncWidthExceededError{
+				Table: table, Column: col, Max: uint64(max.Int64), WidthMax: widthMax,
+			}
+		}
+	}
 	return nil
 }

@@ -36,6 +36,10 @@ func (r *IntTypeRule) Transform(stmt sqlparser.Statement, params []interface{}, 
 		return nil, ErrRuleNotApplicable
 	}
 
+	// Read BEFORE CreateTableRule (priority 10, runs after this rule in the
+	// same transpile pass) clears TableSpec.Options for SQLite serialization.
+	floor := autoIncFloorFromOptions(create.TableSpec.Options)
+
 	modified := false
 
 	for _, col := range create.TableSpec.Columns {
@@ -50,7 +54,7 @@ func (r *IntTypeRule) Transform(stmt sqlparser.Statement, params []interface{}, 
 			continue
 		}
 
-		if collapseIntegerTypeWithMarker(col.Type) {
+		if collapseIntegerTypeWithMarker(col.Type, floor) {
 			modified = true
 		}
 	}

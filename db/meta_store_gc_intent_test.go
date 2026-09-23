@@ -1,76 +1,15 @@
 package db
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/maxpert/marmot/hlc"
 	"github.com/stretchr/testify/require"
 )
 
-// TestMarkIntentsForCleanup_CreatesGCMarkers tests that MarkIntentsForCleanup creates GC markers in RowLockStore
-func TestMarkIntentsForCleanup_CreatesGCMarkers(t *testing.T) {
-	store := newTestPebbleStore(t)
-	defer cleanupTestPebbleStore(t, store)
-
-	txnID := uint64(100)
-	tableName := "users"
-	intentKey := "pk:1"
-
-	// Create transaction and write intent
-	ts := hlc.Timestamp{WallTime: 1000, Logical: 0}
-	err := store.BeginTransaction(txnID, 1, ts)
-	require.NoError(t, err)
-
-	err = store.WriteIntent(txnID, IntentTypeDML, tableName, intentKey, OpTypeInsert, "INSERT INTO users...", []byte("data"), ts, 1)
-	require.NoError(t, err)
-
-	// Mark intents for cleanup
-	err = store.MarkIntentsForCleanup(txnID)
-	require.NoError(t, err)
-
-	// Verify GC marker exists in RowLockStore
-	gcExists := store.rowLocks.CheckGCMarker("", tableName, intentKey)
-	require.True(t, gcExists, "GC marker should exist in RowLockStore")
-
-	// Verify intent still exists in RowLockStore
-	holder, exists := store.rowLocks.CheckLock("", tableName, intentKey)
-	require.True(t, exists, "Intent lock should still exist in RowLockStore")
-	require.Equal(t, txnID, holder, "Intent should belong to correct transaction")
-}
-
-// TestMarkIntentsForCleanup_MultipleIntents tests marking multiple intents
-func TestMarkIntentsForCleanup_MultipleIntents(t *testing.T) {
-	store := newTestPebbleStore(t)
-	defer cleanupTestPebbleStore(t, store)
-
-	txnID := uint64(200)
-	tableName := "products"
-	ts := hlc.Timestamp{WallTime: 1000, Logical: 0}
-
-	// Create transaction
-	err := store.BeginTransaction(txnID, 1, ts)
-	require.NoError(t, err)
-
-	// Write multiple intents
-	intentKeys := []string{"pk:1", "pk:2", "pk:3"}
-	for _, intentKey := range intentKeys {
-		err = store.WriteIntent(txnID, IntentTypeDML, tableName, intentKey, OpTypeInsert, "INSERT INTO products...", []byte("data"), ts, 1)
-		require.NoError(t, err)
-	}
-
-	// Mark all intents for cleanup
-	err = store.MarkIntentsForCleanup(txnID)
-	require.NoError(t, err)
-
-	// Verify all GC markers exist in RowLockStore
-	for _, intentKey := range intentKeys {
-		gcExists := store.rowLocks.CheckGCMarker("", tableName, intentKey)
-		require.True(t, gcExists, "GC marker should exist for %s", intentKey)
-	}
-}
-
-// TestDeleteIntentsByTxn_DeletesGCMarkers tests that DeleteIntentsByTxn removes locks from RowLockStore
-func TestDeleteIntentsByTxn_DeletesGCMarkers(t *testing.T) {
+// TestDeleteIntentsByTxn_ReleasesLocks tests that DeleteIntentsByTxn removes locks from RowLockStore
+func TestDeleteIntentsByTxn_ReleasesLocks(t *testing.T) {
 	store := newTestPebbleStore(t)
 	defer cleanupTestPebbleStore(t, store)
 
@@ -79,37 +18,19 @@ func TestDeleteIntentsByTxn_DeletesGCMarkers(t *testing.T) {
 	intentKey := "pk:100"
 	ts := hlc.Timestamp{WallTime: 1000, Logical: 0}
 
-	// Create transaction and write intent
-	err := store.BeginTransaction(txnID, 1, ts)
-	require.NoError(t, err)
+	require.NoError(t, store.BeginTransaction(txnID, 1, ts))
+	require.NoError(t, store.WriteIntent(txnID, IntentTypeDML, tableName, intentKey, OpTypeInsert, "INSERT INTO orders...", []byte("data"), ts, 1))
 
-	err = store.WriteIntent(txnID, IntentTypeDML, tableName, intentKey, OpTypeInsert, "INSERT INTO orders...", []byte("data"), ts, 1)
-	require.NoError(t, err)
+	require.NoError(t, store.DeleteIntentsByTxn(txnID))
 
-	// Mark for cleanup
-	err = store.MarkIntentsForCleanup(txnID)
-	require.NoError(t, err)
-
-	// Verify GC marker exists in RowLockStore
-	gcExists := store.rowLocks.CheckGCMarker("", tableName, intentKey)
-	require.True(t, gcExists, "GC marker should exist")
-
-	// Delete intents by txn
-	err = store.DeleteIntentsByTxn(txnID)
-	require.NoError(t, err)
-
-	// Verify lock is released from RowLockStore
 	_, exists := store.rowLocks.CheckLock("", tableName, intentKey)
 	require.False(t, exists, "Lock should be released from RowLockStore")
-
-	// Note: GC markers are separate from locks and not automatically cleaned up
-	// They remain in memory until overwritten or the store is restarted (ephemeral)
-	gcExists = store.rowLocks.CheckGCMarker("", tableName, intentKey)
-	require.True(t, gcExists, "GC marker persists in memory even after lock release")
 }
 
-// TestWriteIntent_DetectsGCMarker tests that WriteIntent detects GC marker and allows overwrite
-func TestWriteIntent_DetectsGCMarker(t *testing.T) {
+// TestWriteIntent_OverwritesACommittedHolder tests that an intent whose
+// transaction has committed, but whose lock is still held, is overwritten by
+// the next writer.
+func TestWriteIntent_OverwritesACommittedHolder(t *testing.T) {
 	store := newTestPebbleStore(t)
 	defer cleanupTestPebbleStore(t, store)
 
@@ -119,34 +40,47 @@ func TestWriteIntent_DetectsGCMarker(t *testing.T) {
 	intentKey := "pk:500"
 	ts := hlc.Timestamp{WallTime: 1000, Logical: 0}
 
-	// Create first transaction and write intent
-	err := store.BeginTransaction(txnID1, 1, ts)
-	require.NoError(t, err)
+	require.NoError(t, store.BeginTransaction(txnID1, 1, ts))
+	require.NoError(t, store.WriteIntent(txnID1, IntentTypeDML, tableName, intentKey, OpTypeInsert, "INSERT INTO inventory...", []byte("data1"), ts, 1))
+	require.NoError(t, store.CommitTransaction(txnID1, hlc.Timestamp{WallTime: 1500}, nil, "testdb", tableName, 0, 1))
 
-	err = store.WriteIntent(txnID1, IntentTypeDML, tableName, intentKey, OpTypeInsert, "INSERT INTO inventory...", []byte("data1"), ts, 1)
-	require.NoError(t, err)
+	require.NoError(t, store.BeginTransaction(txnID2, 1, hlc.Timestamp{WallTime: 2000, Logical: 0}))
+	require.NoError(t, store.WriteIntent(txnID2, IntentTypeDML, tableName, intentKey, OpTypeUpdate, "UPDATE inventory...", []byte("data2"), ts, 1),
+		"a committed holder's intent must be overwritable")
 
-	// Mark intent for cleanup
-	err = store.MarkIntentsForCleanup(txnID1)
-	require.NoError(t, err)
-
-	// Create second transaction
-	err = store.BeginTransaction(txnID2, 1, hlc.Timestamp{WallTime: 2000, Logical: 0})
-	require.NoError(t, err)
-
-	// Write intent from second transaction - should detect GC marker and overwrite
-	err = store.WriteIntent(txnID2, IntentTypeDML, tableName, intentKey, OpTypeUpdate, "UPDATE inventory...", []byte("data2"), ts, 1)
-	require.NoError(t, err, "Should be able to overwrite intent marked for cleanup")
-
-	// Verify GC marker is deleted from RowLockStore
-	gcExists := store.rowLocks.CheckGCMarker("", tableName, intentKey)
-	require.False(t, gcExists, "GC marker should be deleted after overwrite")
-
-	// Verify new intent exists with txnID2
 	intent, err := store.GetIntent(tableName, intentKey)
 	require.NoError(t, err)
 	require.Equal(t, txnID2, intent.TxnID, "Intent should belong to new transaction")
 	require.Nil(t, intent.DataSnapshot, "DML row payloads live in CDC segment storage, not write intents")
+}
+
+// TestCommittedTransactionsLeaveNoPerRowState: committing leaves nothing behind
+// per row written. The store used to keep a GC marker for every row a
+// finished transaction had locked, one entry per distinct row ever written.
+//
+// Mutation: in RowLockStore.ReleaseByTxn, read the reverse index with Load
+// instead of LoadAndDelete. "committed transactions left reverse-index
+// entries" fires.
+func TestCommittedTransactionsLeaveNoPerRowState(t *testing.T) {
+	store := newTestPebbleStore(t)
+	defer cleanupTestPebbleStore(t, store)
+
+	const commits = 2000
+	ts := hlc.Timestamp{WallTime: 1000}
+	for i := uint64(1); i <= commits; i++ {
+		require.NoError(t, store.BeginTransaction(i, 1, ts))
+		require.NoError(t, store.WriteIntent(i, IntentTypeDML, "rows", fmt.Sprintf("pk:%d", i), OpTypeInsert, "", nil, ts, 1))
+		require.NoError(t, store.CleanupAfterCommit(i))
+	}
+
+	locks, txns, tables := store.rowLocks.Stats()
+	require.Zero(t, locks)
+	require.Zero(t, txns)
+	require.Zero(t, tables)
+	require.Zero(t, store.rowLocks.byTxn.Size(), "committed transactions left reverse-index entries")
+	rowMap, ok := store.rowLocks.tables.Load(makeTableKey("", "rows"))
+	require.True(t, ok)
+	require.Zero(t, rowMap.Size(), "committed transactions left row entries")
 }
 
 // TestRowLockStore_PersistenceAcrossRestart tests that RowLockStore is ephemeral and starts empty after restart
@@ -163,7 +97,7 @@ func TestRowLockStore_PersistenceAcrossRestart(t *testing.T) {
 	tableName := "accounts"
 	ts := hlc.Timestamp{WallTime: 1000, Logical: 0}
 
-	// Create first store, add intents, and mark one for cleanup
+	// Create first store and add intents
 	{
 		store, err := NewPebbleMetaStore(dbPath, *opts)
 		require.NoError(t, err)
@@ -175,11 +109,7 @@ func TestRowLockStore_PersistenceAcrossRestart(t *testing.T) {
 		err = store.WriteIntent(txnID1, IntentTypeDML, tableName, "pk:1", OpTypeInsert, "INSERT INTO accounts...", []byte("data1"), ts, 1)
 		require.NoError(t, err)
 
-		// Mark first intent for cleanup
-		err = store.MarkIntentsForCleanup(txnID1)
-		require.NoError(t, err)
-
-		// Create second transaction and write intent (not marked for cleanup)
+		// Create second transaction and write intent
 		err = store.BeginTransaction(txnID2, 1, hlc.Timestamp{WallTime: 2000, Logical: 0})
 		require.NoError(t, err)
 
@@ -215,50 +145,6 @@ func TestRowLockStore_PersistenceAcrossRestart(t *testing.T) {
 	}
 }
 
-// TestGCMarker_InMemory tests the GC marker is stored in memory
-func TestGCMarker_InMemory(t *testing.T) {
-	store := newTestPebbleStore(t)
-	defer cleanupTestPebbleStore(t, store)
-
-	tableName := "test_table"
-	intentKey := "test_key"
-	txnID := uint64(700)
-
-	// Write intent
-	ts := hlc.Timestamp{WallTime: 1000, Logical: 0}
-	err := store.BeginTransaction(txnID, 1, ts)
-	require.NoError(t, err)
-
-	err = store.WriteIntent(txnID, IntentTypeDML, tableName, intentKey, OpTypeInsert, "INSERT...", []byte("data"), ts, 1)
-	require.NoError(t, err)
-
-	// Set GC marker
-	store.rowLocks.SetGCMarker("", tableName, intentKey)
-
-	// Verify marker exists in memory
-	gcExists := store.rowLocks.CheckGCMarker("", tableName, intentKey)
-	require.True(t, gcExists, "GC marker should exist in RowLockStore")
-
-	// Delete marker
-	store.rowLocks.DeleteGCMarker("", tableName, intentKey)
-
-	// Verify marker is gone
-	gcExists = store.rowLocks.CheckGCMarker("", tableName, intentKey)
-	require.False(t, gcExists, "GC marker should be deleted from RowLockStore")
-}
-
-// TestMarkIntentsForCleanup_EmptyTxn tests marking cleanup for transaction with no intents
-func TestMarkIntentsForCleanup_EmptyTxn(t *testing.T) {
-	store := newTestPebbleStore(t)
-	defer cleanupTestPebbleStore(t, store)
-
-	txnID := uint64(600)
-
-	// Mark intents for cleanup for non-existent transaction
-	err := store.MarkIntentsForCleanup(txnID)
-	require.NoError(t, err, "Should succeed even if no intents exist")
-}
-
 // Helper functions for testing
 
 func newTestPebbleStore(t *testing.T) *PebbleMetaStore {
@@ -276,4 +162,30 @@ func newTestPebbleStore(t *testing.T) *PebbleMetaStore {
 func cleanupTestPebbleStore(t *testing.T, store *PebbleMetaStore) {
 	err := store.Close()
 	require.NoError(t, err)
+}
+
+// BenchmarkWriteIntentThenCleanupAfterCommit measures one DML row lock taken
+// and released through the commit path: the row-lock work every replicated
+// row write pays at PREPARE and COMMIT.
+func BenchmarkWriteIntentThenCleanupAfterCommit(b *testing.B) {
+	store, err := NewPebbleMetaStore(b.TempDir()+"/bench.db", PebbleMetaStoreOptions{CacheSizeMB: 8, MemTableSizeMB: 4, MemTableCount: 2})
+	require.NoError(b, err)
+	defer store.Close()
+	ts := hlc.Timestamp{WallTime: 1000}
+	keys := make([]string, 1024)
+	for i := range keys {
+		keys[i] = fmt.Sprintf("pk:%d", i)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		txnID := uint64(i + 1)
+		if err := store.WriteIntent(txnID, IntentTypeDML, "rows", keys[i%len(keys)], OpTypeInsert, "", nil, ts, 1); err != nil {
+			b.Fatalf("WriteIntent: %v", err)
+		}
+		if err := store.CleanupAfterCommit(txnID); err != nil {
+			b.Fatalf("CleanupAfterCommit: %v", err)
+		}
+	}
 }

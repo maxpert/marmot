@@ -49,7 +49,7 @@ func TestExecutePreparePhase_RemoteRejectionTracked(t *testing.T) {
 	ctx, cancel := WithTimeout(200)
 	defer cancel()
 
-	responses, remoteRejection, err := wc.executePreparePhase(ctx, txn, req, otherNodes, false)
+	responses, remoteRejection, _, err := wc.executePreparePhase(ctx, txn, req, otherNodes, false)
 
 	AssertNoError(t, err)
 	if remoteRejection == nil {

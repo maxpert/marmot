@@ -84,7 +84,7 @@ func TestClusterReplication(t *testing.T) {
 		nodeID := uint64(i + 1)
 		node := &testNode{
 			nodeID:    nodeID,
-			dataDir:   filepath.Join(os.TempDir(), fmt.Sprintf("marmot-test-node-%d-%d", nodeID, time.Now().UnixNano())),
+			dataDir:   filepath.Join(testDataRoot, fmt.Sprintf("marmot-test-node-%d-%d", nodeID, time.Now().UnixNano())),
 			grpcPort:  18081 + i,
 			mysqlPort: 13307 + i,
 		}
@@ -265,7 +265,7 @@ func TestClusterLoadDataLocalReplication(t *testing.T) {
 		nodeID := uint64(i + 1)
 		node := &testNode{
 			nodeID:    nodeID,
-			dataDir:   filepath.Join(os.TempDir(), fmt.Sprintf("marmot-load-test-node-%d-%d", nodeID, time.Now().UnixNano())),
+			dataDir:   filepath.Join(testDataRoot, fmt.Sprintf("marmot-load-test-node-%d-%d", nodeID, time.Now().UnixNano())),
 			grpcPort:  18181 + i,
 			mysqlPort: 13407 + i,
 		}
@@ -422,6 +422,7 @@ func startNode(t *testing.T, node *testNode, seedNodes []string) {
 		grpcServer.GetNodeRegistry(),
 		seedNodes,
 	)
+	node.catchUpClient.SetDatabaseManager(dbMgr)
 
 	node.deltaSync = marmotgrpc.NewDeltaSyncClient(marmotgrpc.DeltaSyncConfig{
 		NodeID:           node.nodeID,
@@ -433,13 +434,7 @@ func startNode(t *testing.T, node *testNode, seedNodes []string) {
 	})
 
 	snapshotFunc := func(ctx context.Context, peerNodeID uint64, peerAddr string, database string) error {
-		if err := node.catchUpClient.CatchUpFromPeer(ctx, peerNodeID, peerAddr, database); err != nil {
-			return err
-		}
-		if err := dbMgr.ReopenDatabase(database); err != nil {
-			return fmt.Errorf("database reload failed after snapshot: %w", err)
-		}
-		return nil
+		return node.catchUpClient.CatchUpFromPeer(ctx, peerNodeID, peerAddr, database)
 	}
 
 	schemaVersionMgr = db.NewSchemaVersionManager(systemDB.GetMetaStore())

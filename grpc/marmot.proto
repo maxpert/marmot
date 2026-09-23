@@ -162,6 +162,30 @@ message Statement {
     VectorIndexChange vector_index_change = 7; // For vector index control metadata
     DMLIntent dml_intent = 8; // DML decision metadata without row payload
   }
+
+  // auto_id_claim marks this statement as a narrow AUTO_INCREMENT range claim
+  // rather than ordinary DML.
+  //
+  // It is a FLAG on an existing StatementType, never a new StatementType, and
+  // that is a rolling-upgrade requirement. A node running an older binary
+  // ignores an unknown field, sees a DML statement carrying no row image, and
+  // rejects it at the "DML prepare missing encoded CDC row" gate - which is a
+  // clean failed transaction. A new StatementType would instead reach a
+  // conversion that does not know it, and before that gate.
+  //
+  // The claim's payload does not travel here: it is written into the
+  // transaction's intent DataSnapshot, which is what the COMMIT handler reads.
+  bool auto_id_claim = 9;
+  // auto_id_claim_payload carries the claim itself: {table, prevBase, newBase,
+  // size}, msgpack-encoded.
+  //
+  // It needs a field of its own because each PARTICIPANT writes the claim into
+  // its own transaction intent at PREPARE, and the COMMIT handler reads it back
+  // from there - so the payload has to reach the participant. It cannot ride in
+  // the oneof: RowChange would give the statement a row image and defeat the
+  // rolling-upgrade gate above, DDLChange is the wrong statement type, and
+  // DMLIntent carries only an intent key.
+  bytes auto_id_claim_payload = 10;
 }
 
 enum VectorIndexAction {
@@ -241,6 +265,22 @@ message TransactionResponse {
   // PREPARE (for example DDL SQLite cannot apply), as opposed to a timeout
   // or storage error. See db.PrepareResult.Rejected.
   bool rejected = 6;
+  // auto_id_stored_base is the participant's own committed base for the table a
+  // rejected AUTO_INCREMENT range claim named.
+  //
+  // The claimant retries with the maximum base any participant returned, so a
+  // rejection has to carry a number. Encoding it into error_message and parsing
+  // it back out would be exactly the string matching this codebase forbids.
+  // Zero means "not applicable": every response that is not a claim rejection.
+  uint64 auto_id_stored_base = 7;
+  // error_code is the MySQL server error code the rejecting participant chose
+  // for this refusal (for example 1264 ER_WARN_DATA_OUT_OF_RANGE for a
+  // width-ceiling refusal). error_message carries the text; a typed error
+  // cannot cross the wire, so without this field every deterministic remote
+  // refusal reaches the client as 1105 HY000. Zero means "not supplied": an
+  // older participant, or a failure that named no code, and the coordinator
+  // then classifies the message as before.
+  uint32 error_code = 8;
 }
 
 message ReadRequest {
@@ -303,6 +343,11 @@ message DatabaseReplicationState {
 // ===== SNAPSHOT MESSAGES =====
 message SnapshotInfoRequest {
   uint64 requesting_node_id = 1;
+  // Optional: describe only this database, for a StreamSnapshot naming the
+  // same database; empty = every database. A per-database request is refused
+  // only while that database is out of service, a whole-node request while
+  // any database is. An older server ignores it and describes every database.
+  string database = 2;
 }
 
 message SnapshotInfoResponse {

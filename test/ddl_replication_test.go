@@ -314,7 +314,7 @@ func TestDDLIdempotencyRewriter(t *testing.T) {
 // TestSchemaVersionManager validates schema version tracking per database
 func TestSchemaVersionManager(t *testing.T) {
 	// Create temp directory for PebbleDB
-	tmpDir, err := os.MkdirTemp("", "schema-version-test-*")
+	tmpDir, err := testDataDir("schema-version-test-*")
 	require.NoError(t, err)
 	defer os.RemoveAll(tmpDir)
 
@@ -475,7 +475,7 @@ func TestDDLReplicationBasic(t *testing.T) {
 	dbMgr := NewDDLMockDatabaseManager()
 
 	// Create temp directory for PebbleDB
-	tmpDir, err := os.MkdirTemp("", "ddl-replication-test-*")
+	tmpDir, err := testDataDir("ddl-replication-test-*")
 	require.NoError(t, err)
 	defer os.RemoveAll(tmpDir)
 
@@ -572,7 +572,7 @@ func TestDDLWithConcurrentDML(t *testing.T) {
 	dbMgr := NewDDLMockDatabaseManager()
 
 	// Create temp directory for PebbleDB
-	tmpDir, err := os.MkdirTemp("", "ddl-concurrent-dml-test-*")
+	tmpDir, err := testDataDir("ddl-concurrent-dml-test-*")
 	require.NoError(t, err)
 	defer os.RemoveAll(tmpDir)
 

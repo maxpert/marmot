@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -106,7 +107,7 @@ type ClusterHarness struct {
 func NewClusterHarness(t *testing.T) *ClusterHarness {
 	cleanupStalePorts()
 
-	baseDir := filepath.Join(os.TempDir(), fmt.Sprintf("marmot_crash_test_%d", time.Now().UnixNano()))
+	baseDir := filepath.Join(testDataRoot, fmt.Sprintf("marmot_crash_test_%d", time.Now().UnixNano()))
 	marmotBin, err := getCrashHarnessBinary(t)
 	if err != nil {
 		t.Fatalf("Failed to build Marmot: %v", err)
@@ -127,13 +128,32 @@ func NewClusterHarness(t *testing.T) *ClusterHarness {
 	return harness
 }
 
+// testDataRoot holds the integration tests' node data and binaries: Marmot's
+// runtime files live under /tmp/marmot.
+const testDataRoot = "/tmp/marmot/test"
+
+// testDataDir creates a fresh directory under testDataRoot.
+func testDataDir(pattern string) (string, error) {
+	if err := os.MkdirAll(testDataRoot, 0o755); err != nil {
+		return "", err
+	}
+	return os.MkdirTemp(testDataRoot, pattern)
+}
+
+// repoRoot is the module root: the directory above this test package, taken
+// from this file's own path so the harness builds the tree it is compiled from.
+func repoRoot() string {
+	_, file, _, _ := runtime.Caller(0)
+	return filepath.Dir(filepath.Dir(file))
+}
+
 func getCrashHarnessBinary(t *testing.T) (string, error) {
 	t.Helper()
 
 	crashHarnessBuildOnce.Do(func() {
 		t.Logf("Building shared Marmot binary for crash-recovery tests...")
 
-		buildDir, err := os.MkdirTemp("", "marmot_crash_bin_")
+		buildDir, err := testDataDir("marmot_crash_bin_")
 		if err != nil {
 			crashHarnessBuildErr = fmt.Errorf("failed to create build dir: %w", err)
 			return
@@ -141,7 +161,7 @@ func getCrashHarnessBinary(t *testing.T) (string, error) {
 
 		binPath := filepath.Join(buildDir, "marmot")
 		cmd := exec.Command("go", "build", "-tags", "sqlite_preupdate_hook sqlite_fts5 sqlite_json sqlite_math_functions sqlite_foreign_keys sqlite_stat4 sqlite_vacuum_incr", "-o", binPath, ".")
-		cmd.Dir = "/Users/zohaib/repos/marmot"
+		cmd.Dir = repoRoot()
 		output, err := cmd.CombinedOutput()
 		if err != nil {
 			crashHarnessBuildErr = fmt.Errorf("build failed: %v\n%s", err, output)

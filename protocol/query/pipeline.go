@@ -1,9 +1,11 @@
 package query
 
 import (
+	"sort"
 	"strings"
 
 	"github.com/maxpert/marmot/id"
+	"github.com/maxpert/marmot/protocol/query/rules"
 	"github.com/rs/zerolog/log"
 )
 
@@ -25,11 +27,26 @@ func NewPipeline(cacheSize int, idGen id.Generator) (*Pipeline, error) {
 	if err != nil {
 		return nil, err
 	}
+	registerClaimTableGuard(t)
 
 	return &Pipeline{
 		parser:     p,
 		transpiler: t,
 	}, nil
+}
+
+// registerClaimTableGuard adds rules.ClaimTableGuardRule to the transpiler's
+// rule set. It reaches into Transpiler.transformRules directly, rather than
+// editing the literal in transpiler.go, because pipeline.go and
+// transpiler.go share this package - this is the pipeline construction step
+// registering one more rule, not a new extension mechanism. The set is
+// re-sorted by priority exactly as NewTranspiler itself sorts it, since the
+// guard (priority 0) must run before every rule already in the set.
+func registerClaimTableGuard(t *Transpiler) {
+	t.transformRules = append(t.transformRules, &rules.ClaimTableGuardRule{})
+	sort.Slice(t.transformRules, func(i, j int) bool {
+		return t.transformRules[i].Priority() < t.transformRules[j].Priority()
+	})
 }
 
 // Close releases any resources held by the pipeline. Currently a no-op.
