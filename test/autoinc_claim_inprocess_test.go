@@ -23,6 +23,7 @@ import (
 	"github.com/maxpert/marmot/db"
 	"github.com/maxpert/marmot/db/snapshot"
 	"github.com/maxpert/marmot/hlc"
+	"github.com/maxpert/marmot/id"
 	"github.com/maxpert/marmot/protocol"
 	"github.com/stretchr/testify/require"
 )
@@ -65,13 +66,23 @@ type fanoutReplicator struct {
 	mu           sync.Mutex
 	nodes        map[uint64]*db.LocalReplicator
 	prepareCalls map[uint64][]prepareRecord
+	unreachable  map[uint64]bool
 }
 
 func newFanoutReplicator() *fanoutReplicator {
 	return &fanoutReplicator{
 		nodes:        make(map[uint64]*db.LocalReplicator),
 		prepareCalls: make(map[uint64][]prepareRecord),
+		unreachable:  make(map[uint64]bool),
 	}
+}
+
+// setUnreachable makes every call to nodeID fail as a transport error, so the
+// node misses whatever the cluster decides meanwhile.
+func (f *fanoutReplicator) setUnreachable(nodeID uint64, unreachable bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.unreachable[nodeID] = unreachable
 }
 
 func (f *fanoutReplicator) register(nodeID uint64, lr *db.LocalReplicator) {
@@ -83,7 +94,11 @@ func (f *fanoutReplicator) register(nodeID uint64, lr *db.LocalReplicator) {
 func (f *fanoutReplicator) ReplicateTransaction(ctx context.Context, nodeID uint64, req *coordinator.ReplicationRequest) (*coordinator.ReplicationResponse, error) {
 	f.mu.Lock()
 	lr := f.nodes[nodeID]
+	unreachable := f.unreachable[nodeID]
 	f.mu.Unlock()
+	if unreachable {
+		return nil, fmt.Errorf("node %d unreachable", nodeID)
+	}
 
 	resp, err := lr.ReplicateTransaction(ctx, nodeID, req)
 
@@ -117,26 +132,39 @@ func (f *fanoutReplicator) prepareCallsSince(nodeID uint64, since int) []prepare
 }
 
 // fixedNodeProvider implements coordinator.NodeProvider (coordinator/node_provider.go:6)
-// with a static, never-mutated node set - this fixture never simulates
-// membership changes, only claim-protocol behaviour, so the interface's
-// four methods are all that is needed. HasSeedNodes is false: this is a
+// with a node set that changes only when a test grows the cluster
+// (setNodes); the interface's four methods are all that is needed. HasSeedNodes is false: this is a
 // legitimate fixed-size deployment, not a node still learning its peers
 // (coordinator/cluster.go:90's quorum-of-one guard), matching
 // coordinator's own mockNodeProvider zero value
 // (coordinator/full_replication_test.go:15-18).
 type fixedNodeProvider struct {
+	mu    sync.Mutex
 	nodes []uint64
 }
 
 func (p *fixedNodeProvider) GetAliveNodes() ([]uint64, error) {
-	out := make([]uint64, len(p.nodes))
-	copy(out, p.nodes)
-	return out, nil
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]uint64(nil), p.nodes...), nil
 }
 
-func (p *fixedNodeProvider) GetClusterSize() int         { return len(p.nodes) }
-func (p *fixedNodeProvider) GetTotalMembershipSize() int { return len(p.nodes) }
-func (p *fixedNodeProvider) HasSeedNodes() bool          { return false }
+func (p *fixedNodeProvider) GetClusterSize() int { return p.GetTotalMembershipSize() }
+
+func (p *fixedNodeProvider) GetTotalMembershipSize() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.nodes)
+}
+
+func (p *fixedNodeProvider) HasSeedNodes() bool { return false }
+
+// setNodes replaces the membership every node sees.
+func (p *fixedNodeProvider) setNodes(nodes []uint64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.nodes = append([]uint64(nil), nodes...)
+}
 
 // inprocNode is one participant: its own data directory, clock, DatabaseManager,
 // LocalReplicator (db/local_replicator.go:20, which owns the real
@@ -183,6 +211,7 @@ func newInprocCluster(t *testing.T, nodeIDs []uint64) *inprocCluster {
 	for _, id := range nodeIDs {
 		c.nodes[id] = c.buildNode(id, t.TempDir())
 	}
+	c.releaseNewCluster()
 	t.Cleanup(func() {
 		for _, n := range c.nodes {
 			_ = n.dm.Close()
@@ -196,10 +225,31 @@ func (c *inprocCluster) buildNode(id uint64, dataDir string) *inprocNode {
 	clock := hlc.NewClock(id)
 	dm, err := db.NewDatabaseManager(dataDir, id, clock)
 	require.NoError(c.t, err)
+	// Every node counts the cluster exactly as every claimant does.
+	dm.SetClusterMembership(c.provider.GetTotalMembershipSize)
 	lr := db.NewLocalReplicator(id, dm, clock)
 	wc := coordinator.NewWriteCoordinator(id, c.provider, c.fanout, lr, inprocCoordinatorTimeout, clock)
 	c.fanout.register(id, lr)
 	return &inprocNode{id: id, dataDir: dataDir, clock: clock, dm: dm, lr: lr, wc: wc}
+}
+
+// releaseNewCluster releases the votes of a cluster whose every node is held
+// because it initialised its system database: once every member answers
+// held, each releases with no bases (grpc.autoIncMergeSafe, all-held case),
+// which is what the merge loop does in a node process. A cluster reopened
+// over existing claim history has no held node and is left alone.
+func (c *inprocCluster) releaseNewCluster() {
+	c.t.Helper()
+	for _, n := range c.nodes {
+		held, err := n.dm.AutoIncVotesHeld()
+		require.NoError(c.t, err)
+		if !held {
+			return
+		}
+	}
+	for _, n := range c.nodes {
+		require.NoError(c.t, n.dm.MergeAutoIncBasesAndReleaseVotes(nil))
+	}
 }
 
 // closeNode stops a node's DatabaseManager without reopening it.
@@ -257,6 +307,7 @@ func newInprocClusterFromDirs(t *testing.T, dataDirs map[uint64]string) *inprocC
 	for _, id := range nodeIDs {
 		c.nodes[id] = c.buildNode(id, dataDirs[id])
 	}
+	c.releaseNewCluster()
 	t.Cleanup(func() {
 		for _, n := range c.nodes {
 			_ = n.dm.Close()
@@ -391,7 +442,7 @@ func setupClaimCluster(t *testing.T, database, table string) *inprocCluster {
 	for _, id := range []uint64{1, 2, 3} {
 		require.NoError(t, c.nodes[id].dm.CreateDatabase(database))
 	}
-	assertAbsentClaimRowRejected(t, c, database, table+"_absent")
+	assertAbsentClaimRowBackfilled(t, c, database, table+"_absent")
 	assertWidthCeilingRejected(t, c, database, table+"_narrow")
 	driveDDL(t, c.nodes[1], database, table, sprintfDDL(table))
 	for _, id := range []uint64{1, 2, 3} {
@@ -410,7 +461,7 @@ const narrowMarkedTableDDL = `CREATE TABLE %s (id INTEGER /*M:8a*/ PRIMARY KEY, 
 // asserts a claim whose range exceeds that ceiling is rejected.
 //
 // This is run ahead of every one of the five tests for the same reason
-// assertAbsentClaimRowRejected is: every one of prepareAutoIncClaim's
+// assertAbsentClaimRowBackfilled is: every one of prepareAutoIncClaim's
 // rejection clauses needs at least one assertion that isolates it, or a
 // mutation to that specific clause can slip through five tests whose own
 // claim sizes never approach the (very large, 32-bit) ceiling their main
@@ -429,7 +480,7 @@ func assertWidthCeilingRejected(t *testing.T, c *inprocCluster, database, table 
 	}
 
 	mark2 := c.fanout.prepareCallCount(2)
-	_, _, err := c.nodes[1].wc.ClaimRange(context.Background(), database, table, 0, 200)
+	_, _, err := c.nodes[1].wc.ClaimRange(context.Background(), database, table, 0, fixedClaimSize(200))
 	require.Error(t, err, "a claim whose range exceeds the column's width ceiling must be rejected")
 
 	round1Node2 := c.fanout.prepareCallsSince(2, mark2)
@@ -444,46 +495,51 @@ func sprintfDDL(table string) string {
 	return strings.Replace(markedTableDDL, "%s", table, 1)
 }
 
-// assertAbsentClaimRowRejected creates `table` directly on every node's own
-// SQLite connection - bypassing the coordinator's replicated DDL and its
-// automatic claim-row seeding (db/autoinc_seed.go's
-// seedAutoIncBasesForDDL) - so the table has a valid, width-resolvable
-// schema on every node but NO claim row anywhere, then asserts a claim
-// against it is rejected.
+// assertAbsentClaimRowBackfilled creates `table` directly on every node's
+// own SQLite connection - bypassing the coordinator's replicated DDL and its
+// automatic claim-row seeding (db/autoinc_seed.go's seedAutoIncBasesForDDL)
+// - with ids 1..5 already in it, so the table has a valid, width-resolvable
+// schema on every node but NO claim row anywhere. A claim proposing base 0
+// must then be rejected with the base each participant backfills from its
+// own table (5), and the retry above it granted.
 //
-// This isolates the absent-row rejection
-// (db/replication_engine.go:337-343, db.ErrAutoIncBaseAbsent's doc at
-// db/autoinc_claim.go:90-97) from the width check that runs right after it:
-// with a real schema present, AutoIncWidthMax succeeds regardless, so only
-// the absent-row check itself stands between this claim and acceptance. It
-// is run ahead of every one of the five tests (setupClaimCluster is their
-// shared entry point) because "the table has not been created yet" is a
-// precondition every one of them briefly passes through.
+// It is run ahead of every one of the five tests (setupClaimCluster is their
+// shared entry point) because "the claim row does not exist yet" is a state
+// a table created before claim rows existed passes through.
 //
 // Mutation: a regression that treats an absent claim row as base 0 instead
-// of rejecting would make prepareAutoIncClaim fall through here - with a
-// real schema present, nothing else in the condition would stop the claim,
-// so it would be wrongly accepted where this assertion expects rejection.
-func assertAbsentClaimRowRejected(t *testing.T, c *inprocCluster, database, table string) {
+// of backfilling it would accept the round-1 proposal at base 0, over ids
+// 1..5, where this assertion expects a rejection carrying base 5.
+func assertAbsentClaimRowBackfilled(t *testing.T, c *inprocCluster, database, table string) {
 	t.Helper()
 	for _, id := range []uint64{1, 2, 3} {
 		mdb, err := c.nodes[id].dm.GetDatabase(database)
 		require.NoError(t, err)
 		_, err = mdb.GetWriteDB().Exec(sprintfDDL(table))
 		require.NoError(t, err)
+		for row := 1; row <= 5; row++ {
+			_, err = mdb.GetWriteDB().Exec(fmt.Sprintf("INSERT INTO %s (id, v) VALUES (?, 'x')", table), row)
+			require.NoError(t, err)
+		}
 		require.NoError(t, mdb.ReloadSchema())
 	}
 
 	mark2 := c.fanout.prepareCallCount(2)
-	_, _, err := c.nodes[1].wc.ClaimRange(context.Background(), database, table, 0, 1)
-	require.Error(t, err, "a claim against a table with a real schema but no claim row must be rejected, not silently accepted as base 0")
+	newBase, _, err := c.nodes[1].wc.ClaimRange(context.Background(), database, table, 0, fixedClaimSize(1))
 
+	// The vote is checked before the claim's outcome: a participant that read
+	// the absent row as 0 would accept here, and only a later COMMIT would
+	// then fail, which must not be what reports it.
 	round1Node2 := c.fanout.prepareCallsSince(2, mark2)
 	require.NotEmpty(t, round1Node2)
-	require.False(t, round1Node2[0].resp.Success)
+	require.False(t, round1Node2[0].resp.Success,
+		"a claim against a table with a real schema but no claim row must never be accepted as base 0")
 	require.True(t, round1Node2[0].resp.Rejected)
-	require.Contains(t, round1Node2[0].resp.Error, "no auto-increment claim row",
-		"rejection must name the absent-row cause, not some other failure")
+	require.Equal(t, uint64(5), round1Node2[0].resp.AutoIDStoredBase,
+		"the rejection must carry the base backfilled from the table's own ids")
+
+	require.NoError(t, err, "a claim against a table with no claim row must backfill and be granted above the table's ids")
+	require.Equal(t, uint64(5), newBase, "the range must start above the ids the table already holds")
 }
 
 // ---------------------------------------------------------------------
@@ -514,7 +570,7 @@ func TestClaimRange_SequentialSafety(t *testing.T) {
 	c := setupClaimCluster(t, "testdb", "seqsafety")
 
 	// Node 1 claims [1,100].
-	newBase1, granted1, err := c.nodes[1].wc.ClaimRange(context.Background(), "testdb", "seqsafety", 0, 100)
+	newBase1, granted1, err := c.nodes[1].wc.ClaimRange(context.Background(), "testdb", "seqsafety", 0, fixedClaimSize(100))
 	require.NoError(t, err)
 	require.Equal(t, uint64(0), newBase1)
 	require.Equal(t, uint64(100), granted1)
@@ -525,7 +581,7 @@ func TestClaimRange_SequentialSafety(t *testing.T) {
 	// Node 2 proposes the SAME stale prevBase=0, unaware of node 1's claim.
 	mark1 := c.fanout.prepareCallCount(1)
 	mark3 := c.fanout.prepareCallCount(3)
-	newBase2, granted2, err := c.nodes[2].wc.ClaimRange(context.Background(), "testdb", "seqsafety", 0, 50)
+	newBase2, granted2, err := c.nodes[2].wc.ClaimRange(context.Background(), "testdb", "seqsafety", 0, fixedClaimSize(50))
 	require.NoError(t, err, "node 2's retry must still succeed after the stale round is rejected")
 	require.Equal(t, uint64(100), newBase2, "node 2 must retry starting at node 1's committed base, not spin on 0")
 	require.Equal(t, uint64(50), granted2)
@@ -600,7 +656,7 @@ const maxLockWaitClientRetries = 10
 // that signal; this helper stands in for that caller.
 func claimRangeRetryingOnLockWait(ctx context.Context, node *inprocNode, database, table string, prevBase, size uint64) (newBase, granted uint64, err error) {
 	for attempt := 0; attempt < maxLockWaitClientRetries; attempt++ {
-		newBase, granted, err = node.wc.ClaimRange(ctx, database, table, prevBase, size)
+		newBase, granted, err = node.wc.ClaimRange(ctx, database, table, prevBase, fixedClaimSize(size))
 		if err == nil {
 			return newBase, granted, nil
 		}
@@ -715,7 +771,7 @@ func TestClaimRange_ConcurrentBoundary(t *testing.T) {
 func TestClaimRange_RestartRecoversCommittedBase(t *testing.T) {
 	c := setupClaimCluster(t, "testdb", "restart")
 
-	newBase, granted, err := c.nodes[1].wc.ClaimRange(context.Background(), "testdb", "restart", 0, 40)
+	newBase, granted, err := c.nodes[1].wc.ClaimRange(context.Background(), "testdb", "restart", 0, fixedClaimSize(40))
 	require.NoError(t, err)
 	require.Equal(t, uint64(0), newBase)
 	require.Equal(t, uint64(40), granted)
@@ -733,7 +789,7 @@ func TestClaimRange_RestartRecoversCommittedBase(t *testing.T) {
 	// rejected (including by node 3, over the rewired fanout) and retry above
 	// 40 - never reissue [1,40].
 	mark3 := c.fanout.prepareCallCount(3)
-	newBase2, granted2, err := c.nodes[1].wc.ClaimRange(context.Background(), "testdb", "restart", 0, 25)
+	newBase2, granted2, err := c.nodes[1].wc.ClaimRange(context.Background(), "testdb", "restart", 0, fixedClaimSize(25))
 	require.NoError(t, err)
 	require.Equal(t, uint64(40), newBase2, "subsequent claim must start above the base node 3 recovered on reopen")
 	require.Equal(t, uint64(25), granted2)
@@ -860,7 +916,7 @@ func TestClaimRange_KillNineRecoversCommittedBase(t *testing.T) {
 
 	// A stale claim (prevBase=0) must be rejected and retried above the
 	// recovered base, not reissue [1,20].
-	newBase2, granted2, err := c.nodes[1].wc.ClaimRange(context.Background(), killNineDatabase, killNineTable, 0, 15)
+	newBase2, granted2, err := c.nodes[1].wc.ClaimRange(context.Background(), killNineDatabase, killNineTable, 0, fixedClaimSize(15))
 	require.NoError(t, err)
 	require.Equal(t, newBase+granted, newBase2, "post-kill claim must start above the recovered base, not reissue the same range")
 	require.Equal(t, uint64(15), granted2)
@@ -889,7 +945,7 @@ func TestClaimRangeKillNineChild(t *testing.T) {
 		waitForBase(t, c.nodes[id], killNineDatabase, killNineTable, 0)
 	}
 
-	newBase, granted, err := c.nodes[1].wc.ClaimRange(context.Background(), killNineDatabase, killNineTable, 0, killNineClaimSize)
+	newBase, granted, err := c.nodes[1].wc.ClaimRange(context.Background(), killNineDatabase, killNineTable, 0, fixedClaimSize(killNineClaimSize))
 	require.NoError(t, err)
 	for _, id := range []uint64{1, 2, 3} {
 		waitForBase(t, c.nodes[id], killNineDatabase, killNineTable, newBase+granted)
@@ -933,7 +989,7 @@ func metaPebbleDirFor(dbFilePath string) string {
 func TestClaimRange_SurvivesMetaStoreWipe(t *testing.T) {
 	c := setupClaimCluster(t, "testdb", "metawipe")
 
-	newBase, granted, err := c.nodes[1].wc.ClaimRange(context.Background(), "testdb", "metawipe", 0, 10)
+	newBase, granted, err := c.nodes[1].wc.ClaimRange(context.Background(), "testdb", "metawipe", 0, fixedClaimSize(10))
 	require.NoError(t, err)
 	require.Equal(t, uint64(0), newBase)
 	require.Equal(t, uint64(10), granted)
@@ -965,7 +1021,7 @@ func TestClaimRange_SurvivesMetaStoreWipe(t *testing.T) {
 	// A stale proposal from node 2 must be rejected BY NODE 3 specifically,
 	// carrying its real base.
 	mark3 := c.fanout.prepareCallCount(3)
-	newBase2, granted2, err := c.nodes[2].wc.ClaimRange(context.Background(), "testdb", "metawipe", 0, 5)
+	newBase2, granted2, err := c.nodes[2].wc.ClaimRange(context.Background(), "testdb", "metawipe", 0, fixedClaimSize(5))
 	require.NoError(t, err)
 	require.Equal(t, uint64(10), newBase2)
 	require.Equal(t, uint64(5), granted2)
@@ -1006,7 +1062,7 @@ func TestClaimRange_SurvivesMetaStoreWipe(t *testing.T) {
 func TestClaimRange_SurvivesFullClusterSnapshotRestore(t *testing.T) {
 	c := setupClaimCluster(t, "testdb", "snaprestore")
 
-	newBase, granted, err := c.nodes[1].wc.ClaimRange(context.Background(), "testdb", "snaprestore", 0, 20)
+	newBase, granted, err := c.nodes[1].wc.ClaimRange(context.Background(), "testdb", "snaprestore", 0, fixedClaimSize(20))
 	require.NoError(t, err)
 	require.Equal(t, uint64(0), newBase)
 	require.Equal(t, uint64(20), granted)
@@ -1039,8 +1095,13 @@ func TestClaimRange_SurvivesFullClusterSnapshotRestore(t *testing.T) {
 
 	// Restore each node's files into its fresh, empty directory through the
 	// SAME production restorer a real node uses to apply a snapshot
-	// (db/snapshot/restorer.go), including its system-database merge hook -
-	// not a fixture-only file copy. The manager is fully closed at this
+	// (db/snapshot/restorer.go) - not a fixture-only file copy. Each node gets
+	// back its OWN snapshot, its own claim history, so the restorer runs
+	// without the system-database merge hook: that hook belongs to catching
+	// up from a PEER (grpc/catch_up.go), and there it holds a node with no
+	// local system database until it merges bases from a majority
+	// (db.AutoIncHoldTable) - which in a cluster where every node was rebuilt
+	// that way nobody could ever supply. The manager is fully closed at this
 	// point, not live, exactly like a node coming up against a freshly
 	// provisioned data directory, so no ConnectionManager is needed.
 	for _, id := range []uint64{1, 2, 3} {
@@ -1055,7 +1116,6 @@ func TestClaimRange_SurvivesFullClusterSnapshotRestore(t *testing.T) {
 			})
 		}
 		r := snapshot.NewRestorer(dataDir, nil)
-		r.SetSystemDBMerge(db.RaiseAutoIncBasesFrom)
 		require.NoError(t, r.RestoreFiles(snapDirByNode[id], files))
 	}
 
@@ -1072,7 +1132,7 @@ func TestClaimRange_SurvivesFullClusterSnapshotRestore(t *testing.T) {
 
 	// A stale claim, from node 1, must retry above the restored base rather
 	// than reissue [1,20].
-	newBase2, granted2, err := c.nodes[1].wc.ClaimRange(context.Background(), "testdb", "snaprestore", 0, 15)
+	newBase2, granted2, err := c.nodes[1].wc.ClaimRange(context.Background(), "testdb", "snaprestore", 0, fixedClaimSize(15))
 	require.NoError(t, err)
 	require.Equal(t, uint64(20), newBase2, "post-restore claim must start above the restored base, not reissue [1,20]")
 	require.Equal(t, uint64(15), granted2)
@@ -1080,4 +1140,10 @@ func TestClaimRange_SurvivesFullClusterSnapshotRestore(t *testing.T) {
 	for _, id := range []uint64{1, 2, 3} {
 		waitForBase(t, c.nodes[id], "testdb", "snaprestore", 35)
 	}
+}
+
+// fixedClaimSize is a RangeSizer asking for the same size above any base:
+// these tests pin the claim protocol, not the allocator's sizing policy.
+func fixedClaimSize(size uint64) id.RangeSizer {
+	return func(uint64) (uint64, error) { return size, nil }
 }

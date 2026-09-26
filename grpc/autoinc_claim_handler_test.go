@@ -19,6 +19,9 @@ func newClaimTestHandler(t *testing.T, ddl string) (*ReplicationHandler, *db.Dat
 	dm, err := db.NewDatabaseManager(t.TempDir(), 1, clock)
 	require.NoError(t, err)
 	t.Cleanup(func() { dm.Close() })
+	// A participant of a cluster that has merged: a new system database
+	// holds the node's claim votes until then.
+	require.NoError(t, dm.MergeAutoIncBasesAndReleaseVotes(nil))
 	require.NoError(t, dm.CreateDatabase("testdb"))
 	mdb, err := dm.GetDatabase("testdb")
 	require.NoError(t, err)
@@ -85,7 +88,8 @@ func TestHandlePrepareReturnsTheStoredBaseOfARejectedClaim(t *testing.T) {
 }
 
 // TestHandlePrepareReturnsTheParticipantsErrorCode: a DDL this participant
-// refuses with a MySQL-coded error (here the width ceiling, 1264) returns that
+// refuses with a MySQL-coded error (here the width ceiling, 1264: it declares a
+// TINYINT AUTO_INCREMENT column over the value 200) returns that
 // code on the wire, so a client whose coordinator is another node sees 1264
 // rather than 1105.
 //
@@ -93,17 +97,17 @@ func TestHandlePrepareReturnsTheStoredBaseOfARejectedClaim(t *testing.T) {
 // ReplicationHandler.handlePrepare. "the participant's MySQL code did not
 // reach the wire" fires.
 func TestHandlePrepareReturnsTheParticipantsErrorCode(t *testing.T) {
-	rh, dm := newClaimTestHandler(t, "CREATE TABLE t (id INTEGER /*M:8a*/ PRIMARY KEY, v TEXT)")
+	rh, dm := newClaimTestHandler(t, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
 	mdb, err := dm.GetDatabase("testdb")
 	require.NoError(t, err)
-	_, err = mdb.GetWriteDB().Exec("INSERT INTO t (id, v) VALUES (200, 'x')")
+	_, err = mdb.GetWriteDB().Exec("INSERT INTO t (id, v) VALUES (1, 'x')")
 	require.NoError(t, err)
 
 	resp := prepareOverWire(t, rh, 101, []protocol.Statement{{
 		Type:      protocol.StatementDDL,
 		Database:  "testdb",
 		TableName: "t",
-		SQL:       "ALTER TABLE t ADD COLUMN extra INTEGER",
+		SQL:       "ALTER TABLE t ADD COLUMN seq INTEGER /*M:8a*/ DEFAULT 200",
 	}}, unchanged)
 	require.False(t, resp.Success)
 	require.True(t, resp.Rejected)

@@ -686,7 +686,7 @@ func (h *ClusterHarness) StartCluster() error {
 
 func (h *ClusterHarness) StopCluster() {
 	h.t.Logf("Stopping cluster...")
-	for i := 1; i <= numNodes; i++ {
+	for i := 1; i <= len(h.Nodes); i++ {
 		h.StopNode(i)
 	}
 }

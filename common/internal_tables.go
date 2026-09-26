@@ -21,6 +21,11 @@ const InternalTablePrefix = "__marmot__"
 // this constant; see db/autoinc_claim.go for the schema and write path.
 const AutoIncClaimTableName = InternalTablePrefix + "autoinc"
 
+// AutoIncHoldTableName is the hidden system-database table whose single row,
+// while present, holds this node's AUTO_INCREMENT claim votes until it has
+// merged claim bases from a majority of its peers. See db/autoinc_vote_hold.go.
+const AutoIncHoldTableName = InternalTablePrefix + "autoinc_hold"
+
 // IsInternalTableName reports whether name - compared case-insensitively, as
 // MySQL/SQLite identifiers are - names one of Marmot's own internal tables
 // rather than a client table. Used to refuse client SQL that targets Marmot's

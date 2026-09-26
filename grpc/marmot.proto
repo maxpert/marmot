@@ -59,6 +59,15 @@ service MarmotService {
   // Fetch staged LOAD DATA payload chunk by chunk.
   rpc GetLoadDataChunk(LoadDataChunkRequest) returns (LoadDataChunkResponse);
 
+  // ===== AUTO_INCREMENT CLAIMS =====
+  // This node's committed AUTO_INCREMENT claim bases, which a node whose
+  // claim votes are held merges from a majority before voting again.
+  rpc GetAutoIncBases(AutoIncBasesRequest) returns (AutoIncBasesResponse);
+
+  // Runs one claim base sync on this node now: it raises its bases to the
+  // maximum every alive peer reports, and reports which members it reached.
+  rpc SyncAutoIncBases(AutoIncSyncRequest) returns (AutoIncSyncResponse);
+
   // ===== CDC STREAMING =====
   // Client-streaming RPC for large CDC payloads (≥128KB)
   // Sends TransactionChunks followed by TransactionCommit
@@ -407,6 +416,38 @@ message DatabaseInfo {
 message LatestTxnIDsResponse {
   map<string, uint64> database_txn_ids = 1;  // Keep for backward compatibility
   repeated DatabaseInfo database_info = 2;   // Detailed database info
+}
+
+// ===== AUTO_INCREMENT CLAIMS =====
+message AutoIncBasesRequest {
+  uint64 requesting_node_id = 1;
+}
+
+message AutoIncBase {
+  string database = 1;
+  string table = 2;
+  uint64 base = 3;
+}
+
+message AutoIncBasesResponse {
+  repeated AutoIncBase bases = 1;
+  // The responder's own votes are held: its bases may be missing claims, so
+  // a merge must not count it toward its majority.
+  bool votes_held = 2;
+}
+
+message AutoIncSyncRequest {
+  uint64 requesting_node_id = 1;
+}
+
+message AutoIncSyncResponse {
+  uint64 node_id = 1;
+  // The node's own votes are held: it has not merged claim bases yet.
+  bool votes_held = 2;
+  // Every member of the node's membership, itself included.
+  repeated uint64 members = 3;
+  // The members whose bases this sync merged, itself included.
+  repeated uint64 reached = 4;
 }
 
 // ===== CLUSTER NODES =====

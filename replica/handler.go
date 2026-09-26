@@ -83,6 +83,7 @@ func (h *ReadOnlyHandler) HandleQuery(session *protocol.ConnectionSession, sql s
 	stmt := protocol.ParseStatementWithOptions(sql, protocol.ParseOptions{
 		SkipTranspilation: !session.TranspilationEnabled,
 		SchemaProvider:    schemaProvider,
+		BoundParams:       params,
 	})
 
 	// Handle system variable queries (@@version, DATABASE(), etc.)
@@ -101,7 +102,7 @@ func (h *ReadOnlyHandler) HandleQuery(session *protocol.ConnectionSession, sql s
 	// Reject all mutations with MySQL read-only error
 	if protocol.IsMutation(stmt) {
 		if h.forwardWrites {
-			return h.forwardMutation(session, stmt, params)
+			return h.forwardMutation(session, sql, stmt, params)
 		}
 		log.Debug().
 			Uint64("conn_id", session.ConnID).
@@ -409,8 +410,11 @@ func (h *ReadOnlyHandler) handleMarmotCommand(session *protocol.ConnectionSessio
 	return nil, fmt.Errorf("unrecognized marmot command: %s", sql)
 }
 
-// forwardMutation forwards a mutation to the leader
-func (h *ReadOnlyHandler) forwardMutation(session *protocol.ConnectionSession, stmt protocol.Statement, params []interface{}) (*protocol.ResultSet, error) {
+// forwardMutation forwards a mutation to the leader. It forwards the client's
+// own SQL, never stmt.SQL: the leader transpiles the statement exactly once,
+// as it would a client's, and the transpiled text has already lost what the
+// leader needs from the original, such as a table's database qualifier.
+func (h *ReadOnlyHandler) forwardMutation(session *protocol.ConnectionSession, sql string, stmt protocol.Statement, params []interface{}) (*protocol.ResultSet, error) {
 	client := h.replica.streamClient.GetClient()
 	if client == nil {
 		return nil, protocol.NewMySQLError(protocol.ErrCodeUnknown, protocol.SQLStateGeneral, "Not connected to leader")
@@ -428,7 +432,7 @@ func (h *ReadOnlyHandler) forwardMutation(session *protocol.ConnectionSession, s
 		SessionId:          session.ConnID,
 		RequestId:          requestID,
 		Database:           session.CurrentDatabase,
-		Sql:                stmt.SQL,
+		Sql:                sql,
 		TxnControl:         marmotgrpc.ForwardTxnControl_FWD_TXN_NONE,
 		WaitForReplication: session.WaitForReplication,
 		Params:             serializedParams,

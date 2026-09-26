@@ -67,6 +67,10 @@ func setupTestReplicationEngine(t *testing.T) (*ReplicationEngine, *DatabaseMana
 
 	dm, err := NewDatabaseManager(tmpDir, 1, clock)
 	require.NoError(t, err, "Failed to create DatabaseManager")
+	// A new system database holds the node's claim votes; these tests model
+	// a node of a cluster that has merged. A test about the hold places it
+	// itself.
+	require.NoError(t, dm.MergeAutoIncBasesAndReleaseVotes(nil))
 
 	engine := NewReplicationEngine(1, dm, clock)
 

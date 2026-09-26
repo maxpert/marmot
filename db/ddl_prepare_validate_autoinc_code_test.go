@@ -75,9 +75,9 @@ func TestPrepareRejectionCarriesTheMySQLCode(t *testing.T) {
 }
 
 // TestPrepareOfARefusedDDLCarriesTheMySQLCode drives the DDL rejection site in
-// ReplicationEngine.Prepare itself: a DDL that would leave a TINYINT
-// AUTO_INCREMENT column unable to hold the id 200 it already contains is
-// refused, and the PrepareResult carries 1264 for the coordinator.
+// ReplicationEngine.Prepare itself: a DDL that declares a TINYINT
+// AUTO_INCREMENT column over a value (200) it cannot hold is refused, and the
+// PrepareResult carries 1264 for the coordinator.
 //
 // Mutation: drop ErrorCode from the PrepareResult literal at the DDL rejection
 // site in prepareRegularTransaction. "the DDL rejection lost its MySQL code"
@@ -85,14 +85,14 @@ func TestPrepareRejectionCarriesTheMySQLCode(t *testing.T) {
 func TestPrepareOfARefusedDDLCarriesTheMySQLCode(t *testing.T) {
 	engine, dm, cleanup := setupTestReplicationEngine(t)
 	defer cleanup()
-	mdb := markedTableDB(t, engine, dm, "CREATE TABLE t (id INTEGER /*M:8a*/ PRIMARY KEY, v TEXT)")
-	_, err := mdb.GetWriteDB().Exec("INSERT INTO t (id, v) VALUES (200, 'x')")
+	mdb := markedTableDB(t, engine, dm, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+	_, err := mdb.GetWriteDB().Exec("INSERT INTO t (id, v) VALUES (1, 'x')")
 	require.NoError(t, err)
 
 	result := engine.Prepare(context.Background(), &PrepareRequest{
 		TxnID: 7600, NodeID: 1, StartTS: hlc.Timestamp{WallTime: 14}, Database: "testdb",
 		Statements: []protocol.Statement{{Type: protocol.StatementDDL, Database: "testdb", TableName: "t",
-			SQL: "ALTER TABLE t ADD COLUMN extra INTEGER"}},
+			SQL: "ALTER TABLE t ADD COLUMN seq INTEGER /*M:8a*/ DEFAULT 200"}},
 	})
 	require.False(t, result.Success)
 	require.True(t, result.Rejected)

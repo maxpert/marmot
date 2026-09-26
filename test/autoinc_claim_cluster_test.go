@@ -6,26 +6,15 @@ package test
 // over the real MySQL wire protocol against a 3-node ClusterHarness
 // (test/crash_recovery_test.go).
 //
-// coordinator.WriteCoordinator.ClaimRange itself has no caller reachable
-// over the MySQL wire protocol or any admin endpoint yet - the range
-// allocator that will wire an INSERT against a narrow AUTO_INCREMENT table
-// to ClaimRange has not landed. Its only callers today are in-process Go
-// tests (coordinator/autoinc_claim_test.go). This ClusterHarness only talks
-// to a node over its MySQL listener (database/sql + the MySQL wire
-// protocol) and a small JSON admin API for gossip membership - neither can
-// drive a claim - so the claim-protocol scenarios (sequential claim safety,
-// concurrent boundary claims, restart and crash recovery, meta-store wipe,
-// full-cluster snapshot restore) are covered instead in
-// test/autoinc_claim_inprocess_test.go, which drives the real coordinator
-// and participant engines directly, in-process, replacing only the gRPC
-// transport. Standing up an ad hoc coordinator inside test/ that dials each
-// node's gRPC PrepareTransaction/CommitTransaction RPCs directly was
-// considered and rejected: WriteCoordinator.localReplicator is written
-// assuming in-process co-location with the participant it calls "local"
-// (coordinator/write_coordinator.go dispatches with wc.nodeID against it),
-// so reproducing it faithfully from outside the process would mean
-// re-deriving quorum membership, retry and rejection-base bookkeeping that
-// belongs to the coordinator itself, not to a test fixture.
+// The claim protocol's own scenarios (sequential claim safety, concurrent
+// boundary claims, restart and crash recovery, meta-store wipe, full-cluster
+// snapshot restore, membership growth) are covered in
+// test/autoinc_claim_inprocess_test.go and
+// test/autoinc_membership_inprocess_test.go, which drive the real coordinator
+// and participant engines in-process, replacing only the gRPC transport, so
+// they can script which node sees which round. Inserts that reach
+// ClaimRange over the MySQL wire protocol are covered in
+// test/autoinc_narrow_cluster_test.go.
 
 import (
 	"database/sql"
@@ -53,8 +42,8 @@ func systemDBFile(dataDir string) string {
 }
 
 // readAutoIncBase opens a node's system database file directly, outside the
-// MySQL wire protocol, and reads the committed base for (database, table)
-// from __marmot__autoinc. This is the only channel available to a cluster
+// MySQL wire protocol, and reads the base for (database, table) - the
+// largest of its committed, seed and merged floors - from __marmot__autoinc. This is the only channel available to a cluster
 // test: the table is deliberately hidden from client SQL (see
 // common.IsInternalTableName and protocol/query/rules/claim_table_guard.go),
 // and nothing on the wire path reveals it. found is false, with no error,
@@ -71,7 +60,7 @@ func readAutoIncBase(dataDir, database, table string) (base uint64, found bool, 
 
 	var got int64
 	scanErr := conn.QueryRow(
-		"SELECT base FROM "+common.AutoIncClaimTableName+" WHERE db = ? AND tbl = ?",
+		"SELECT MAX(committed, seed, merged) FROM "+common.AutoIncClaimTableName+" WHERE db = ? AND tbl = ?",
 		database, table).Scan(&got)
 	switch {
 	case scanErr == sql.ErrNoRows:
@@ -215,13 +204,14 @@ func TestAutoIncSeed_CreateTableWithFloorOption(t *testing.T) {
 	}
 }
 
-// TestAutoIncSeed_AlterSeedsFromExistingMax exercises DDL-time seeding's
-// derivation from a table's actual MAX(id), not just a declared floor
-// option: rows carrying explicit ids are inserted directly (DML never seeds
-// - only a DDL that changes the table's CREATE text does, db/autoinc_seed.go),
-// so the claim base must still reflect CREATE TABLE's own empty-table seed
-// right up until an unrelated ALTER TABLE ADD COLUMN re-triggers seeding and
-// picks up MAX(id) fresh.
+// TestAutoIncSeed_AlterSeedsFromExistingMax: a table filled with explicit
+// ids 1..rowCount holds a base at or above rowCount on every node, both
+// before and after an unrelated ALTER TABLE ADD COLUMN re-triggers DDL-time
+// seeding. The explicit ids raise the base as they are inserted (the range
+// allocator observes every explicit id), and the ALTER's seed from MAX(id)
+// can only raise it further. That the seed itself derives from MAX(id) is
+// pinned without the allocator in the way by
+// db/autoinc_seed_test.go TestSeedAutoIncBasesForDDL_ExistingRowsRaiseTheFloor.
 func TestAutoIncSeed_AlterSeedsFromExistingMax(t *testing.T) {
 	harness := NewClusterHarness(t)
 	defer harness.Cleanup()
@@ -261,9 +251,9 @@ func TestAutoIncSeed_AlterSeedsFromExistingMax(t *testing.T) {
 		t.Fatalf("explicit-id rows did not replicate: %v", err)
 	}
 
-	// Before the ALTER: proves the assertion below is the ALTER's own
-	// seeding at work, not a base that was already >= rowCount for some
-	// other reason (e.g. DML itself seeding, which it must not).
+	// Before the ALTER: explicit ids above the base raise it through the
+	// claim protocol as they are inserted (id.RangeAllocator.Observe), so no
+	// node can later issue one of them.
 	preDataDir := harness.Nodes[0].DataDir
 	preBase, found, err := readAutoIncBase(preDataDir, db.DefaultDatabaseName, table)
 	if err != nil {
@@ -272,8 +262,8 @@ func TestAutoIncSeed_AlterSeedsFromExistingMax(t *testing.T) {
 	if !found {
 		t.Fatalf("no claim row for %s before ALTER", table)
 	}
-	if preBase >= rowCount {
-		t.Fatalf("pre-ALTER base = %d, want < %d (DML must not have seeded the claim row)", preBase, rowCount)
+	if preBase < rowCount {
+		t.Fatalf("pre-ALTER base = %d, want >= %d: explicit ids must raise the base as they are inserted", preBase, rowCount)
 	}
 
 	if _, err := harness.ExecNode(1, fmt.Sprintf("ALTER TABLE %s ADD COLUMN w INT", table)); err != nil {
@@ -283,7 +273,7 @@ func TestAutoIncSeed_AlterSeedsFromExistingMax(t *testing.T) {
 	for _, nodeID := range allNodes {
 		dataDir := harness.Nodes[nodeID-1].DataDir
 		base := waitForAutoIncBaseAtLeast(t, dataDir, db.DefaultDatabaseName, table, rowCount, 15*time.Second)
-		t.Logf("node %d: ALTER seeded base = %d (want >= %d)", nodeID, base, rowCount)
+		t.Logf("node %d: base after ALTER = %d (want >= %d)", nodeID, base, rowCount)
 	}
 }
 
@@ -341,22 +331,18 @@ func TestAutoIncSeed_AlterFloorWithoutAColumnIsRefused(t *testing.T) {
 	}
 }
 
-// TestAutoIncSeed_RefusesWhenExistingMaxExceedsWidth: a TINYINT
-// AUTO_INCREMENT column (widthMax = 127, intmarker.Attributes.WidthMax) whose
-// table already holds a row above that ceiling must refuse the next DDL that
-// touches that table's schema, with MySQL error 1264
-// (ER_WARN_DATA_OUT_OF_RANGE) / SQLSTATE 22003
-// (db/ddl_prepare_validate.go checkAutoIncWidthCeilings,
-// AutoIncWidthExceededError).
-//
-// SQLite does not enforce MySQL's column width, so INSERT INTO ... (id, ...)
-// VALUES (200, ...) against a TINYINT column succeeds; the refusal has to
-// come from a later DDL. checkAutoIncWidthCeilings scopes to every table
-// whose sqlite_master CREATE TABLE text this DDL statement changed - not
-// only DDL that redeclares AUTO_INCREMENT - so an unrelated ADD COLUMN on
-// the same table is enough to re-trigger the check and is the shape used
-// here.
-func TestAutoIncSeed_RefusesWhenExistingMaxExceedsWidth(t *testing.T) {
+// TestAutoIncSeed_RefusesAnIDBeyondTheWidth: a TINYINT AUTO_INCREMENT column
+// (widthMax = 127, intmarker.Attributes.WidthMax) refuses an explicit id
+// above its ceiling at INSERT, with MySQL error 1264
+// (ER_WARN_DATA_OUT_OF_RANGE) / SQLSTATE 22003, as MySQL does in strict
+// mode. SQLite would store it; letting it in would leave the table holding an
+// id its declared width cannot, so it is refused before it reaches SQLite
+// (protocol/query/rules/autoincrement_id.go). A DDL that declares a width the
+// existing data does not fit is refused with the same code at PREPARE
+// (db/ddl_prepare_validate.go checkAutoIncWidthCeilings), pinned by
+// db/ddl_prepare_validate_autoinc_code_test.go and
+// grpc/autoinc_claim_handler_test.go.
+func TestAutoIncSeed_RefusesAnIDBeyondTheWidth(t *testing.T) {
 	harness := NewClusterHarness(t)
 	defer harness.Cleanup()
 
@@ -376,22 +362,16 @@ func TestAutoIncSeed_RefusesWhenExistingMaxExceedsWidth(t *testing.T) {
 		t.Fatalf("DDL did not replicate: %v", err)
 	}
 
-	if _, err := harness.ExecNode(1, fmt.Sprintf(
-		"INSERT INTO %s (id, v) VALUES (200, 'beyond_tinyint')", table)); err != nil {
-		t.Fatalf("explicit-id INSERT beyond widthMax: %v", err)
-	}
-	if err := harness.WaitForRowCount(table, allNodes, 1, 15*time.Second); err != nil {
-		t.Fatalf("row did not replicate: %v", err)
-	}
-
-	_, err := harness.ExecNode(1, fmt.Sprintf("ALTER TABLE %s ADD COLUMN extra INT", table))
-	mysqlErr := asMySQLError(t, err, "ALTER TABLE ADD COLUMN on a table whose MAX(id) exceeds widthMax")
-
+	_, err := harness.ExecNode(1, fmt.Sprintf("INSERT INTO %s (id, v) VALUES (200, 'beyond_tinyint')", table))
+	mysqlErr := asMySQLError(t, err, "explicit-id INSERT beyond widthMax")
 	if mysqlErr.Number != mysqlcode.ErrCodeDataOutOfRange {
 		t.Errorf("error code = %d, want %d (ER_WARN_DATA_OUT_OF_RANGE)", mysqlErr.Number, mysqlcode.ErrCodeDataOutOfRange)
 	}
 	if got := string(mysqlErr.SQLState[:]); got != mysqlcode.SQLStateDataOutOfRange {
 		t.Errorf("SQLSTATE = %q, want %q", got, mysqlcode.SQLStateDataOutOfRange)
+	}
+	if n := harness.getRowCount(1, table); n != 0 {
+		t.Errorf("the refused row reached the table: %d rows", n)
 	}
 	t.Logf("refused as required: %v", mysqlErr)
 }
@@ -485,8 +465,8 @@ func TestAutoIncHiddenTable_RejectsClientWrites(t *testing.T) {
 	table := common.AutoIncClaimTableName
 	statements := map[string]string{
 		"INSERT": fmt.Sprintf(
-			"INSERT INTO %s (db, tbl, base, owner, granted_at) VALUES ('marmot', 'x', 1, 1, 1)", table),
-		"UPDATE": fmt.Sprintf("UPDATE %s SET base = 999 WHERE tbl = 'x'", table),
+			"INSERT INTO %s (db, tbl, committed, owner, granted_at) VALUES ('marmot', 'x', 1, 1, 1)", table),
+		"UPDATE": fmt.Sprintf("UPDATE %s SET committed = 999 WHERE tbl = 'x'", table),
 		"DELETE": fmt.Sprintf("DELETE FROM %s WHERE tbl = 'x'", table),
 		"DROP":   fmt.Sprintf("DROP TABLE %s", table),
 	}

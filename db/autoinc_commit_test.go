@@ -241,6 +241,107 @@ func TestDroppedTableKeepsItsClaimRow(t *testing.T) {
 	require.Equal(t, uint64(1000), base)
 }
 
+// applyDDLForTest runs one DDL statement through PREPARE and COMMIT, the
+// replicated path every node applies DDL through.
+func applyDDLForTest(t *testing.T, engine *ReplicationEngine, txnID uint64, table, ddl string) {
+	t.Helper()
+	stmt := protocol.Statement{Type: protocol.StatementDDL, Database: "testdb", TableName: table, SQL: ddl}
+	prep := engine.Prepare(context.Background(), &PrepareRequest{
+		TxnID: txnID, NodeID: 1, StartTS: hlc.Timestamp{WallTime: int64(txnID)}, Database: "testdb",
+		Statements: []protocol.Statement{stmt},
+	})
+	require.True(t, prep.Success, "PREPARE of %q: %s", ddl, prep.Error)
+	res := engine.Commit(context.Background(), &CommitRequest{
+		TxnID: txnID, Database: "testdb", Statements: []protocol.Statement{stmt},
+	})
+	require.True(t, res.Success, "COMMIT of %q: %s", ddl, res.Error)
+}
+
+// incarnationRecorder records what a DDL apply reports to the node's
+// AutoIncIncarnationListener.
+type incarnationRecorder struct {
+	tables    []string
+	databases []string
+}
+
+func (r *incarnationRecorder) TableIncarnationEnded(database, table string) {
+	r.tables = append(r.tables, database+"."+table)
+}
+
+func (r *incarnationRecorder) DatabaseIncarnationEnded(database string) {
+	r.databases = append(r.databases, database)
+}
+
+// takeTables returns the table incarnations reported so far and resets them.
+func (r *incarnationRecorder) takeTables() []string {
+	tables := r.tables
+	r.tables = nil
+	return tables
+}
+
+// TestRenamedTableInheritsTheBasesOfTheNamesItReplaces holds the invariant
+// that, with forget-on-incarnation-change, makes a node's stale in-memory
+// ranges harmless: a base is monotone per name, and a table that takes
+// another's place is raised to the base of the name its rows came from.
+//
+// Reviewer B's round trip: t has base 64, t RENAME TO t2, t2 grants up to
+// 128, t2 RENAME TO t. Without the inheritance t2 would start from its
+// backfill and t would stay at 64 below ids the table holds. Each rename ends
+// the incarnations of both names, and the node's listener hears of both.
+//
+// Mutation: skip AutoIncClaimStore.Inherit in seedAutoIncBasesForDDL. t2's
+// row is absent and "the rename did not raise t2" fires.
+func TestRenamedTableInheritsTheBasesOfTheNamesItReplaces(t *testing.T) {
+	engine, dm, cleanup := setupTestReplicationEngine(t)
+	defer cleanup()
+	markedTableDB(t, engine, dm, "CREATE TABLE t (id INTEGER /*M:32a*/ PRIMARY KEY, v TEXT)")
+	seedClaimBase(t, dm, "testdb", "t", 64, 1)
+
+	rec := &incarnationRecorder{}
+	dm.SetAutoIncIncarnationListener(rec)
+
+	applyDDLForTest(t, engine, 7410, "t", "ALTER TABLE t RENAME TO t2")
+	base, err := autoIncClaimStoreForTest(dm).ReadBase("testdb", "t2")
+	require.NoError(t, err, "the rename did not raise t2")
+	require.Equal(t, uint64(64), base, "the rename did not raise t2 to t's base")
+	require.Equal(t, uint64(64), readClaimBase(t, dm, "testdb", "t"), "the rename changed the source's row")
+	require.Equal(t, []string{"testdb.t", "testdb.t2"}, rec.takeTables(), "a rename did not end both names' incarnations")
+
+	seedClaimBase(t, dm, "testdb", "t2", 128, 2)
+	applyDDLForTest(t, engine, 7411, "t2", "ALTER TABLE t2 RENAME TO t")
+	require.Equal(t, uint64(128), readClaimBase(t, dm, "testdb", "t"), "renaming back did not raise t above t2's grants")
+	require.Equal(t, uint64(128), readClaimBase(t, dm, "testdb", "t2"), "renaming back changed t2's row")
+	require.Equal(t, []string{"testdb.t", "testdb.t2"}, rec.takeTables(), "renaming back did not end both names' incarnations")
+}
+
+// TestDDLEndsTheIncarnationsItChanges pins which DDL ends a name's
+// incarnation: DROP TABLE, CREATE TABLE and any change to the table's
+// definition do; an index does not. A recreated table keeps the base of the
+// name it reuses (DROP TABLE keeps the row) and inherits nothing lower.
+//
+// Mutation: make endedIncarnations report only removed tables. The CREATE is
+// not reported and "CREATE TABLE did not end t's incarnation" fires.
+func TestDDLEndsTheIncarnationsItChanges(t *testing.T) {
+	engine, dm, cleanup := setupTestReplicationEngine(t)
+	defer cleanup()
+	markedTableDB(t, engine, dm, "CREATE TABLE t (id INTEGER /*M:32a*/ PRIMARY KEY, v TEXT)")
+	seedClaimBase(t, dm, "testdb", "t", 127, 1)
+
+	rec := &incarnationRecorder{}
+	dm.SetAutoIncIncarnationListener(rec)
+
+	applyDDLForTest(t, engine, 7420, "t", "DROP TABLE t")
+	require.Equal(t, []string{"testdb.t"}, rec.takeTables(), "DROP TABLE did not end t's incarnation")
+	applyDDLForTest(t, engine, 7421, "t", "CREATE TABLE t (id INTEGER /*M:8a*/ PRIMARY KEY, v TEXT)")
+	require.Equal(t, []string{"testdb.t"}, rec.takeTables(), "CREATE TABLE did not end t's incarnation")
+	require.Equal(t, uint64(127), readClaimBase(t, dm, "testdb", "t"), "DROP + CREATE lowered the base")
+
+	applyDDLForTest(t, engine, 7422, "t", "CREATE INDEX t_v ON t (v)")
+	require.Empty(t, rec.takeTables(), "an index ended the table's incarnation")
+	applyDDLForTest(t, engine, 7423, "t", "ALTER TABLE t ADD COLUMN w INTEGER")
+	require.Equal(t, []string{"testdb.t"}, rec.takeTables(), "redefining t did not end its incarnation")
+}
+
 // dmlLogInsertStatement builds a real client DML statement (not a claim) that
 // carries a CDC row image, exactly as PREPARE requires for the DML path
 // (createDMLIntent, db/replication_engine.go). Riding alongside a claim

@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/maxpert/marmot/coordinator"
@@ -29,6 +30,9 @@ const (
 // DatabaseProvider interface for accessing databases
 type DatabaseProvider interface {
 	GetDatabase(name string) (*ReplicatedDatabase, error)
+	// ClusterMembership returns this node's current view of the cluster's
+	// total membership, the denominator of every quorum it computes.
+	ClusterMembership() (int, error)
 }
 
 // DatabaseManager manages multiple MVCC databases.
@@ -53,6 +57,24 @@ type DatabaseManager struct {
 	cdcHub                   CDCHub                       // CDC notification hub, can be nil
 	vecIndexMgr              *VectorIndexManager          // Optional vector index manager
 	autoIncClaimStore        *AutoIncClaimStore           // AUTO_INCREMENT claim store, backed by systemDB
+	membershipView           atomic.Pointer[func() int]   // this node's view of total cluster membership
+}
+
+// SetClusterMembership installs view as the source of this node's view of
+// the cluster's total membership (ClusterMembership).
+func (dm *DatabaseManager) SetClusterMembership(view func() int) {
+	dm.membershipView.Store(&view)
+}
+
+// ClusterMembership returns this node's current view of the cluster's total
+// membership. An AUTO_INCREMENT claim participant compares it with the
+// claimant's, so it fails rather than guess when no view is installed.
+func (dm *DatabaseManager) ClusterMembership() (int, error) {
+	view := dm.membershipView.Load()
+	if view == nil {
+		return 0, errors.New("no cluster membership view installed")
+	}
+	return (*view)(), nil
 }
 
 // DatabaseMetadata represents database registry information
@@ -139,11 +161,12 @@ func (dm *DatabaseManager) initSystemDatabase() error {
 		return fmt.Errorf("failed to create database registry table: %w", err)
 	}
 
-	// Create the AUTO_INCREMENT claim table (db/autoinc_claim.go). It lives
-	// here, in the system database, rather than in each user database: see
-	// AutoIncClaimTable's doc comment for why.
-	if _, err = systemDB.GetDB().Exec(autoIncClaimDDL); err != nil {
-		return fmt.Errorf("failed to create auto-increment claim table: %w", err)
+	// Create the AUTO_INCREMENT claim table (db/autoinc_claim.go) and its vote
+	// hold (db/autoinc_vote_hold.go). They live here, in the system database,
+	// rather than in each user database: see AutoIncClaimTable's doc comment
+	// for why.
+	if err = createAutoIncTables(systemDB.GetDB()); err != nil {
+		return fmt.Errorf("failed to create auto-increment tables: %w", err)
 	}
 
 	// Wire up GC coordination for system database
@@ -244,6 +267,17 @@ func (dm *DatabaseManager) wireGCCoordination(mdb *ReplicatedDatabase, dbName st
 		}
 		txnMgr.SetAutoIncClaimStore(dm.autoIncClaimStore)
 	}
+}
+
+// SetAutoIncIncarnationListener registers l to learn of every table
+// incarnation a DDL statement ends on this node (AutoIncIncarnationListener).
+func (dm *DatabaseManager) SetAutoIncIncarnationListener(l AutoIncIncarnationListener) {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+	if dm.autoIncClaimStore == nil {
+		dm.autoIncClaimStore = NewAutoIncClaimStore(dm.systemDB)
+	}
+	dm.autoIncClaimStore.SetIncarnationListener(l)
 }
 
 // SetRefreshReplicationStatesFunc sets the callback for refreshing peer replication states
@@ -437,12 +471,16 @@ func (dm *DatabaseManager) DropDatabase(name string) error {
 		return fmt.Errorf("failed to remove database from registry: %w", err)
 	}
 
-	// Remove this database's AUTO_INCREMENT claim rows (db/autoinc_claim.go).
-	// DROP TABLE deliberately does NOT reach this path and leaves its row in
-	// place; only DROP DATABASE removes claim rows.
-	_, err = dm.systemDB.GetDB().Exec("DELETE FROM "+AutoIncClaimTable+" WHERE db = ?", name)
-	if err != nil {
-		return fmt.Errorf("failed to remove auto-increment claims for database %s: %w", name, err)
+	// This database's AUTO_INCREMENT claim rows (db/autoinc_claim.go) stay,
+	// as DROP TABLE's do: a base is monotone per (database, table) name for
+	// the life of the cluster, so a range granted before the drop is never
+	// granted again after the database is recreated. The in-memory ranges of
+	// its tables end with it.
+	dm.mu.RLock()
+	claimStore := dm.autoIncClaimStore
+	dm.mu.RUnlock()
+	if claimStore != nil {
+		claimStore.databaseIncarnationEnded(name)
 	}
 
 	if detached != nil {
@@ -628,6 +666,9 @@ type detachedDatabase struct {
 	restoreFailed bool      // AttachDatabase failed; the next restore of it may take it over
 	dropped       bool      // DROP DATABASE arrived during the restore; AttachDatabase completes it
 	dropPath      string    // the dropped database's file, removed by AttachDatabase
+	// tables are the replaced file's table definitions, which AttachDatabase
+	// compares with the restored file's (SchemaChange).
+	tables map[string]string
 }
 
 // DetachDatabase takes a user database out of service so a snapshot restore
@@ -655,6 +696,18 @@ func (dm *DatabaseManager) DetachDatabase(ctx context.Context, name string) erro
 	if err != nil || mdb == nil {
 		return err
 	}
+	// The file's tables, read before the drain closes its pools, are what the
+	// restored file's schema is compared with when it is attached. A DDL
+	// commit still in flight here reports its own change as it applies.
+	tables, err := tableDefinitions(ctx, mdb.GetReadDB())
+	if err != nil {
+		log.Warn().Err(err).Str("name", name).Msg("Could not read the detached database's tables; its restore ends every table's incarnation without inheritance")
+	}
+	dm.mu.Lock()
+	if detached := dm.detached[name]; detached != nil {
+		detached.tables = tables
+	}
+	dm.mu.Unlock()
 	// Drained outside both locks (see DatabaseManager): the detached entry
 	// fences Create and Drop.
 	if err := mdb.drainSQLite(ctx); err != nil {
@@ -730,11 +783,45 @@ func (dm *DatabaseManager) AttachDatabase(name string) error {
 	}
 	dm.mu.Lock()
 	dm.wireGCCoordination(mdb, name)
+	claimStore := dm.autoIncClaimStore
+	dm.mu.Unlock()
+	if err := restoredSchemaChange(mdb, name, detached.tables, claimStore); err != nil {
+		if closeErr := mdb.closeSQLite(); closeErr != nil {
+			log.Warn().Err(closeErr).Str("name", name).Msg("Error closing a restored database that failed to reattach")
+		}
+		dm.mu.Lock()
+		detached.restoreFailed = true
+		dm.mu.Unlock()
+		return fmt.Errorf("failed to reattach database %s: %w", name, err)
+	}
+	dm.mu.Lock()
 	delete(dm.detached, name)
 	dm.databases[name] = mdb
 	dm.mu.Unlock()
 	log.Info().Str("name", name).Msg("Database reattached after snapshot restore")
 	return nil
+}
+
+// restoredSchemaChange applies to a restored database what any DDL applied
+// on this node would (SchemaChange), before the database is back in service:
+// every table in it may be a new incarnation, so the whole database's ranges
+// are forgotten, as DROP DATABASE's are; every table that took the place of
+// one the replaced file had inherits its base; and every table is seeded from
+// its own MAX(id).
+func restoredSchemaChange(mdb *ReplicatedDatabase, name string, before map[string]string, claimStore *AutoIncClaimStore) error {
+	after, err := tableDefinitions(context.Background(), mdb.GetDB())
+	if err != nil {
+		return fmt.Errorf("read restored tables: %w", err)
+	}
+	var change SchemaChange
+	change.record(before, after, 0)
+	for table := range after {
+		change.tables = append(change.tables, ddlTableOwner{table: table})
+	}
+	if claimStore != nil {
+		claimStore.databaseIncarnationEnded(name)
+	}
+	return mdb.txnMgr.seedSchemaChange(mdb.GetDB(), &change)
 }
 
 // openDetached opens the file registered for a detached database over the
@@ -1668,6 +1755,7 @@ func (dm *DatabaseManager) GetTranspilerSchema(database, table string) (*transfo
 	info := &transform.SchemaInfo{
 		AutoIncrementColumn:  autoIncCol,
 		AutoIncrementOrdinal: columnOrdinal(schema.Columns, autoIncCol),
+		Database:             database,
 	}
 	// The declared width comes from the marker the transpiler wrote into the
 	// CREATE TABLE text; a column without one keeps the 64-bit path.
@@ -1675,6 +1763,7 @@ func (dm *DatabaseManager) GetTranspilerSchema(database, table string) (*transfo
 		if autoIncCol != "" && strings.EqualFold(col.Name, autoIncCol) {
 			info.AutoIncrementWidth = col.DeclaredWidth
 			info.AutoIncrementUnsigned = col.Unsigned
+			info.AutoIncrementExplicit = col.ExplicitAutoInc
 			break
 		}
 	}

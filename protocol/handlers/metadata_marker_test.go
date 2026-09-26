@@ -13,7 +13,7 @@ type fakeDatabaseProvider struct{ db *sql.DB }
 
 func (f fakeDatabaseProvider) ListDatabases() []string         { return []string{"testdb"} }
 func (f fakeDatabaseProvider) DatabaseExists(name string) bool { return name == "testdb" }
-func (f fakeDatabaseProvider) GetDatabaseConnection(string) (*sql.DB, error) {
+func (f fakeDatabaseProvider) GetDatabaseReadConnection(string) (*sql.DB, error) {
 	return f.db, nil
 }
 

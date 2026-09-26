@@ -6,6 +6,7 @@ import (
 
 	"github.com/maxpert/marmot/id"
 	"github.com/maxpert/marmot/protocol/query"
+	"github.com/maxpert/marmot/protocol/query/rules"
 	"github.com/maxpert/marmot/protocol/query/transform"
 	"github.com/rs/zerolog/log"
 )
@@ -76,7 +77,7 @@ func InitializePipeline(cacheSize int, idGen id.Generator) error {
 
 // SchemaLookupFunc returns the schema facts an INSERT needs for auto-increment
 // id injection, or nil if the table is unknown.
-type SchemaLookupFunc func(table string) *transform.SchemaInfo
+type SchemaLookupFunc func(database, table string) *transform.SchemaInfo
 
 // ParseOptions holds options for parsing SQL statements.
 type ParseOptions struct {
@@ -84,6 +85,14 @@ type ParseOptions struct {
 	SchemaProvider    transform.SchemaProvider // For ON CONFLICT target resolution
 	SkipTranspilation bool
 	ExtractLiterals   bool // Enable literal extraction for parameterized execution
+
+	// NarrowIDs mints ids for AUTO_INCREMENT columns declared narrower than
+	// BIGINT. Nil refuses any INSERT that needs one.
+	NarrowIDs rules.NarrowAllocator
+
+	// BoundParams are the statement's bound values, nil for a text query
+	// (query.QueryContext.BoundParams).
+	BoundParams []interface{}
 }
 
 // ParseStatement analyzes a SQL statement and returns its type and metadata.
@@ -97,6 +106,8 @@ func ParseStatement(sql string) Statement {
 func ParseStatementWithOptions(sql string, opts ParseOptions) Statement {
 	ctx := query.NewContext(sql, nil)
 	ctx.SchemaLookup = opts.SchemaLookup
+	ctx.NarrowIDs = opts.NarrowIDs
+	ctx.BoundParams = opts.BoundParams
 	ctx.SchemaProvider = opts.SchemaProvider
 	ctx.SkipTranspilation = opts.SkipTranspilation
 	ctx.ExtractLiterals = opts.ExtractLiterals
@@ -119,12 +130,14 @@ func ParseStatementWithOptions(sql string, opts ParseOptions) Statement {
 	transpiledSQL := ""
 	var extractedParams []interface{}
 	var paramOrder []bool
+	var boundIDs map[int]uint64
 	if len(ctx.Output.Statements) > 0 {
 		transpiledSQL = ctx.Output.Statements[0].SQL
 		if len(ctx.Output.Statements[0].Params) > 0 {
 			extractedParams = ctx.Output.Statements[0].Params
 		}
 		paramOrder = ctx.Output.Statements[0].ParamOrder
+		boundIDs = ctx.Output.Statements[0].BoundIDs
 	}
 
 	stmt := Statement{
@@ -134,6 +147,7 @@ func ParseStatementWithOptions(sql string, opts ParseOptions) Statement {
 		Error:           errorString(ctx.Output.ValidationErr),
 		ExtractedParams: extractedParams,
 		ParamOrder:      paramOrder,
+		BoundIDs:        boundIDs,
 	}
 
 	// Extract MySQL-specific metadata (if available)
@@ -169,12 +183,14 @@ func ParseStatementWithSchema(sql string, schemaLookup SchemaLookupFunc) Stateme
 	transpiledSQL := ""
 	var extractedParams []interface{}
 	var paramOrder []bool
+	var boundIDs map[int]uint64
 	if len(ctx.Output.Statements) > 0 {
 		transpiledSQL = ctx.Output.Statements[0].SQL
 		if len(ctx.Output.Statements[0].Params) > 0 {
 			extractedParams = ctx.Output.Statements[0].Params
 		}
 		paramOrder = ctx.Output.Statements[0].ParamOrder
+		boundIDs = ctx.Output.Statements[0].BoundIDs
 	}
 
 	stmt := Statement{
@@ -184,6 +200,7 @@ func ParseStatementWithSchema(sql string, schemaLookup SchemaLookupFunc) Stateme
 		Error:           errorString(ctx.Output.ValidationErr),
 		ExtractedParams: extractedParams,
 		ParamOrder:      paramOrder,
+		BoundIDs:        boundIDs,
 	}
 
 	// Extract MySQL-specific metadata (if available)
@@ -237,6 +254,7 @@ func buildStatement(ctx query.QueryContext, ts query.TranspiledStatement) Statem
 		Error:           errorString(ctx.Output.ValidationErr),
 		ExtractedParams: extractedParams,
 		ParamOrder:      ts.ParamOrder,
+		BoundIDs:        ts.BoundIDs,
 	}
 
 	// Extract MySQL-specific metadata (if available)

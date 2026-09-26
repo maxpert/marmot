@@ -213,9 +213,10 @@ type LoadDataHandler interface {
 // column-name index from that response; a server that reports no columns leaves
 // strict clients unable to address any column by name, even though the rows
 // themselves arrive intact. Handlers that cannot describe a statement return no
-// columns and the prepare response omits the definitions.
+// columns and the prepare response omits the definitions. database is the
+// database the statement runs in: the one it names, or the session's.
 type ResultColumnDescriber interface {
-	DescribeResultColumns(session *ConnectionSession, sql string) ([]ColumnDef, error)
+	DescribeResultColumns(session *ConnectionSession, database, sql string) ([]ColumnDef, error)
 }
 
 // SessionCloser is an optional extension for handlers that need to release
@@ -236,6 +237,12 @@ type ResultSet struct {
 	RowsAffected   int64
 	LastInsertId   int64
 	CommittedTxnId uint64 // For write forwarding: actual CDC txnID
+}
+
+// HasResultSet reports whether rs is answered to a client as a result set
+// rather than an OK packet: it carries columns or rows. A nil rs has none.
+func (rs *ResultSet) HasResultSet() bool {
+	return rs != nil && (len(rs.Columns) > 0 || len(rs.Rows) > 0)
 }
 
 // ColumnDef represents a column definition
@@ -562,7 +569,7 @@ func (s *MySQLServer) processQuery(conn net.Conn, session *ConnectionSession, qu
 		_ = s.writeMySQLErr(conn, 1, err)
 		return
 	}
-	if rs == nil || (len(rs.Columns) == 0 && len(rs.Rows) == 0) {
+	if !rs.HasResultSet() {
 		// OK response for non-SELECT (INSERT/UPDATE/DELETE/etc)
 		rowsAffected := int64(0)
 		lastInsertId := int64(0)
@@ -1103,8 +1110,16 @@ func (s *MySQLServer) handleStmtPrepare(conn net.Conn, session *ConnectionSessio
 	// Describe the result set now: clients index columns by name from this
 	// response, so omitting the definitions makes every by-name lookup fail.
 	var resultColumns []ColumnDef
-	if describer, ok := s.handler.(ResultColumnDescriber); ok {
-		cols, err := describer.DescribeResultColumns(session, transpiledSQL)
+	if StatementCode(ctx.Output.StatementType) == StatementInformationSchema {
+		// Marmot answers INFORMATION_SCHEMA itself, with a fixed column set
+		// per table; the database has no such table to describe.
+		resultColumns = InformationSchemaColumns(InformationSchemaTableType(ctx.MySQLState.ISTableType))
+	} else if describer, ok := s.handler.(ResultColumnDescriber); ok {
+		database := ctx.Output.Database
+		if database == "" {
+			database = session.CurrentDatabase
+		}
+		cols, err := describer.DescribeResultColumns(session, database, transpiledSQL)
 		switch {
 		case err == nil:
 			resultColumns = cols
@@ -1143,9 +1158,13 @@ func (s *MySQLServer) handleStmtPrepare(conn net.Conn, session *ConnectionSessio
 		defer session.preparedStmtLock.Unlock()
 		stmtID = session.nextStmtID
 		session.nextStmtID++
+		// The client's own SQL is kept, not the transpiled text: execution
+		// runs it through the handler exactly as a text query, and the
+		// transpiled text has already lost what the handler needs from the
+		// original, such as a table's database qualifier.
 		session.preparedStmts[stmtID] = &PreparedStatement{
 			ID:           stmtID,
-			Query:        transpiledSQL,
+			Query:        sql,
 			ParamCount:   paramCount,
 			OriginalType: StatementCode(ctx.Output.StatementType),
 			Context:      ctx,
@@ -1402,23 +1421,25 @@ func (s *MySQLServer) handleStmtExecute(conn net.Conn, session *ConnectionSessio
 		Int("param_count", len(params)).
 		Msg("Executing prepared statement")
 
-	// Execute the query directly (it's already transpiled SQLite syntax)
-	// We need to determine if it's a SELECT to know how to format the response
-	// Use the original statement type we stored during PREPARE
-	isSelect := stmt.OriginalType == StatementSelect
-
 	// Execute query with params passed to handler (no string interpolation!)
+	// The handler transpiles the client's SQL as it does a text query.
 	rs, err := s.handler.HandleQuery(session, stmt.Query, params)
 	if err != nil {
 		_ = s.writeMySQLErr(conn, 1, err)
 		return
 	}
 
+	// A prepared statement answers as its text form does: a result set when
+	// the answer carries one (INFORMATION_SCHEMA, SHOW and the like), an OK
+	// packet otherwise. A SELECT always answers with a result set, even an
+	// empty one.
+	answersRows := stmt.OriginalType == StatementSelect || rs.HasResultSet()
+
 	log.Debug().
 		Uint64("conn_id", session.ConnID).
 		Uint32("stmt_id", stmtID).
 		Int("original_type", int(stmt.OriginalType)).
-		Bool("is_select", isSelect).
+		Bool("answers_rows", answersRows).
 		Int64("rows_affected", func() int64 {
 			if rs != nil {
 				return rs.RowsAffected
@@ -1427,9 +1448,7 @@ func (s *MySQLServer) handleStmtExecute(conn net.Conn, session *ConnectionSessio
 		}()).
 		Msg("Prepared statement result")
 
-	// Use the original statement type to determine response format
-	if isSelect {
-		// Write binary result set for SELECT queries
+	if answersRows {
 		if rs != nil {
 			_ = s.writeBinaryResultSet(conn, 1, session, rs)
 		} else {

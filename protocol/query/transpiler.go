@@ -73,7 +73,7 @@ func NewTranspiler(cacheSize int, idGen id.Generator) (*Transpiler, error) {
 func (t *Transpiler) Transpile(ctx *QueryContext) error {
 	// Check if this statement needs ID injection
 	needsIDInjection := t.autoIncRule != nil && ctx.SchemaLookup != nil &&
-		t.autoIncRule.NeedsIDInjection(ctx.MySQLState.AST, ctx.SchemaLookup)
+		t.autoIncRule.NeedsIDInjection(ctx.MySQLState.AST, ctx.SchemaLookup, ctx.BoundParams)
 
 	// Check if literal extraction will be applied
 	needsLiteralExtraction := ctx.ExtractLiterals &&
@@ -102,17 +102,19 @@ func (t *Transpiler) Transpile(ctx *QueryContext) error {
 	transformations := []Transformation{}
 	ast := ctx.MySQLState.AST
 	var conflictColumns []string
+	var boundIDs map[int]uint64
 	ruleApplied := false
 
 	// Apply ID injection FIRST if needed
 	if needsIDInjection {
-		newAST, applied, err := t.autoIncRule.ApplyAST(ast, ctx.SchemaLookup)
+		newAST, applied, ids, err := t.autoIncRule.ApplyAST(ast, ctx.SchemaLookup, ctx.NarrowIDs, ctx.BoundParams)
 		if err != nil {
 			// A rule that refuses a statement must reach the client. Returning
 			// the error unchanged keeps whatever MySQL error code the rule
 			// chose (see transform.CodedError).
 			return err
 		}
+		boundIDs = ids
 		if applied {
 			ast = newAST
 			transformations = append(transformations, Transformation{
@@ -191,7 +193,7 @@ func (t *Transpiler) Transpile(ctx *QueryContext) error {
 		params = extractedParams
 	}
 
-	ctx.Output.Statements = []TranspiledStatement{{SQL: sql, Params: params, ParamOrder: paramOrder}}
+	ctx.Output.Statements = []TranspiledStatement{{SQL: sql, Params: params, ParamOrder: paramOrder, BoundIDs: boundIDs}}
 	ctx.MySQLState.AST = ast
 	ctx.MySQLState.Transformations = transformations
 

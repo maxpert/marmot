@@ -8,7 +8,9 @@ import (
 	"time"
 
 	"github.com/maxpert/marmot/hlc"
+	"github.com/maxpert/marmot/id"
 	"github.com/maxpert/marmot/protocol"
+	"github.com/maxpert/marmot/protocol/mysqlcode"
 )
 
 // claimStepReplicator is a minimal fake Replicator used only by the
@@ -123,7 +125,7 @@ func TestClaimRange_SuccessfulClaimSingleRound(t *testing.T) {
 	nodeProvider := newMockNodeProvider([]uint64{1})
 	wc := NewWriteCoordinator(1, nodeProvider, fake, fake, 200*time.Millisecond, hlc.NewClock(1))
 
-	newBase, granted, err := wc.ClaimRange(context.Background(), "testdb", "orders", 100, 50)
+	newBase, granted, err := wc.ClaimRange(context.Background(), "testdb", "orders", 100, fixedClaimSize(50))
 	if err != nil {
 		t.Fatalf("ClaimRange: %v", err)
 	}
@@ -173,7 +175,7 @@ func TestClaimRange_ConsistencyIsAlwaysQuorum(t *testing.T) {
 	nodeProvider := newMockNodeProvider([]uint64{1, 2, 3})
 	wc := NewWriteCoordinator(1, nodeProvider, fake, fake, 100*time.Millisecond, hlc.NewClock(1))
 
-	_, _, err := wc.ClaimRange(context.Background(), "testdb", "orders", 100, 50)
+	_, _, err := wc.ClaimRange(context.Background(), "testdb", "orders", 100, fixedClaimSize(50))
 	if err == nil {
 		t.Fatal("expected ClaimRange to fail with only 1 of 3 nodes acking - it would succeed under a quorum of 1, proving consistency was not pinned to QUORUM")
 	}
@@ -198,7 +200,7 @@ func TestClaimRange_RetriesAboveRejectedBase(t *testing.T) {
 	nodeProvider := newMockNodeProvider([]uint64{1})
 	wc := NewWriteCoordinator(1, nodeProvider, fake, fake, 200*time.Millisecond, hlc.NewClock(1))
 
-	newBase, granted, err := wc.ClaimRange(context.Background(), "testdb", "orders", 100, 50)
+	newBase, granted, err := wc.ClaimRange(context.Background(), "testdb", "orders", 100, fixedClaimSize(50))
 	if err != nil {
 		t.Fatalf("ClaimRange: %v", err)
 	}
@@ -234,7 +236,7 @@ func TestClaimRange_RetriesAboveMaximumRejectedBase(t *testing.T) {
 	nodeProvider := newMockNodeProvider([]uint64{1, 2, 3})
 	wc := NewWriteCoordinator(1, nodeProvider, fake, fake, 200*time.Millisecond, hlc.NewClock(1))
 
-	newBase, granted, err := wc.ClaimRange(context.Background(), "testdb", "orders", 40, 10)
+	newBase, granted, err := wc.ClaimRange(context.Background(), "testdb", "orders", 40, fixedClaimSize(10))
 	if err != nil {
 		t.Fatalf("ClaimRange: %v", err)
 	}
@@ -273,7 +275,7 @@ func TestClaimRange_EightConsecutiveRejectionsReturn1205(t *testing.T) {
 	nodeProvider := newMockNodeProvider([]uint64{1})
 	wc := NewWriteCoordinator(1, nodeProvider, fake, fake, 200*time.Millisecond, hlc.NewClock(1))
 
-	_, _, err := wc.ClaimRange(context.Background(), "testdb", "orders", 100, 50)
+	_, _, err := wc.ClaimRange(context.Background(), "testdb", "orders", 100, fixedClaimSize(50))
 	if err == nil {
 		t.Fatal("expected ClaimRange to give up after 8 rejections, got nil error")
 	}
@@ -333,7 +335,7 @@ func TestClaimRange_BacksOffWhileAnotherClaimHoldsTheKey(t *testing.T) {
 	wc := NewWriteCoordinator(1, nodeProvider, holder, holder, 200*time.Millisecond, hlc.NewClock(1))
 
 	start := time.Now()
-	newBase, granted, err := wc.ClaimRange(context.Background(), "testdb", "orders", 100, 50)
+	newBase, granted, err := wc.ClaimRange(context.Background(), "testdb", "orders", 100, fixedClaimSize(50))
 	if err != nil {
 		t.Fatalf("a claim gave up while another claim held the key: %v", err)
 	}
@@ -367,7 +369,7 @@ func TestClaimRange_QuorumNotAchievedReturns1205WithoutRetrying(t *testing.T) {
 	nodeProvider := newMockNodeProvider([]uint64{1, 2, 3})
 	wc := NewWriteCoordinator(1, nodeProvider, fake, fake, 100*time.Millisecond, hlc.NewClock(1))
 
-	_, _, err := wc.ClaimRange(context.Background(), "testdb", "orders", 100, 50)
+	_, _, err := wc.ClaimRange(context.Background(), "testdb", "orders", 100, fixedClaimSize(50))
 	if err == nil {
 		t.Fatal("expected an error when quorum cannot be achieved")
 	}
@@ -381,5 +383,98 @@ func TestClaimRange_QuorumNotAchievedReturns1205WithoutRetrying(t *testing.T) {
 
 	if got := fake.prepareCallCount(1); got != 1 {
 		t.Fatalf("PREPARE calls to the coordinator's own node = %d, want exactly 1 (no retry spin on an unusable failure)", got)
+	}
+}
+
+// fixedClaimSize is a RangeSizer asking for the same size above any base:
+// these tests pin the claim protocol, not the allocator's sizing policy.
+func fixedClaimSize(size uint64) id.RangeSizer {
+	return func(uint64) (uint64, error) { return size, nil }
+}
+
+// TestClaimRange_SizerExhaustionIsTerminal pins the claimant-side half of
+// exhaustion: when the sizer finds no room above the base a rejection taught
+// it, ClaimRange stops without another round and reports
+// id.ErrRangeExhausted - never the retryable 1205.
+//
+// Mutation: treat a sizer error as a retryable failure. The error is then
+// the lock-wait timeout and "exhaustion reached the client as retryable"
+// fires.
+func TestClaimRange_SizerExhaustionIsTerminal(t *testing.T) {
+	InitTestTelemetry()
+
+	fake := newClaimStepReplicator()
+	fake.push(1, rejectionWithBase(127))
+	wc := NewWriteCoordinator(1, newMockNodeProvider([]uint64{1}), fake, fake, 200*time.Millisecond, hlc.NewClock(1))
+
+	sizer := func(base uint64) (uint64, error) {
+		if base >= 127 {
+			return 0, id.ErrRangeExhausted
+		}
+		return 1, nil
+	}
+	_, _, err := wc.ClaimRange(context.Background(), "testdb", "tiny", 120, sizer)
+	if !errors.Is(err, id.ErrRangeExhausted) {
+		t.Fatalf("err = %v, want id.ErrRangeExhausted", err)
+	}
+	var mysqlErr *protocol.MySQLError
+	if errors.As(err, &mysqlErr) {
+		t.Fatalf("exhaustion reached the client as retryable %d", mysqlErr.Code)
+	}
+	if got := fake.prepareCallCount(1); got != 1 {
+		t.Fatalf("PREPARE calls = %d, want 1: no round may be sent once the sizer finds no room", got)
+	}
+}
+
+// TestClaimRange_ParticipantExhaustionIsTerminal pins the participant-side
+// half: a rejection carrying ER_DUP_ENTRY - the one prepareAutoIncClaim gives
+// a range past its own column ceiling - ends the claim as exhausted, while a
+// rejection with no code and no usable base stays the retryable 1205.
+//
+// Mutation: drop the exhaustedByParticipant check. The participant's verdict
+// then reaches the client as 1205 and "a full column was reported as
+// retryable" fires.
+func TestClaimRange_ParticipantExhaustionIsTerminal(t *testing.T) {
+	InitTestTelemetry()
+
+	fake := newClaimStepReplicator()
+	fake.push(1, &ReplicationResponse{Rejected: true, Error: "auto-increment claim for tiny exhausts the column",
+		AutoIDStoredBase: 120, ErrorCode: mysqlcode.ErrCodeDupEntry})
+	wc := NewWriteCoordinator(1, newMockNodeProvider([]uint64{1}), fake, fake, 200*time.Millisecond, hlc.NewClock(1))
+	_, _, err := wc.ClaimRange(context.Background(), "testdb", "tiny", 120, fixedClaimSize(64))
+	if !errors.Is(err, id.ErrRangeExhausted) {
+		t.Fatalf("a full column was reported as retryable: %v", err)
+	}
+
+	unavailable := newClaimStepReplicator()
+	unavailable.push(1, &ReplicationResponse{Rejected: true, Error: "refused", AutoIDStoredBase: 120})
+	wc = NewWriteCoordinator(1, newMockNodeProvider([]uint64{1}), unavailable, unavailable, 200*time.Millisecond, hlc.NewClock(1))
+	_, _, err = wc.ClaimRange(context.Background(), "testdb", "tiny", 120, fixedClaimSize(64))
+	if errors.Is(err, id.ErrRangeExhausted) {
+		t.Fatalf("a rejection without the exhaustion code was reported as exhaustion: %v", err)
+	}
+	var mysqlErr *protocol.MySQLError
+	if !errors.As(err, &mysqlErr) || mysqlErr.Code != protocol.ErrCodeLockTimeout {
+		t.Fatalf("err = %v, want the retryable 1205", err)
+	}
+}
+
+// TestClaimRange_CarriesTheClaimantsMembership pins that every attempt
+// carries the membership this node's quorum is computed over, so a
+// participant that counts the cluster differently can refuse it.
+//
+// Mutation: leave Membership unset. "claim carries membership 0" fires.
+func TestClaimRange_CarriesTheClaimantsMembership(t *testing.T) {
+	InitTestTelemetry()
+
+	fake := newClaimStepReplicator()
+	wc := NewWriteCoordinator(1, newMockNodeProvider([]uint64{1, 2, 3}), fake, fake, 200*time.Millisecond, hlc.NewClock(1))
+	_, _, err := wc.ClaimRange(context.Background(), "testdb", "orders", 0, fixedClaimSize(8))
+	if err != nil {
+		t.Fatalf("ClaimRange: %v", err)
+	}
+	claim := decodePreparedClaim(t, fake.prepareCall(2, 0))
+	if claim.Membership != 3 {
+		t.Fatalf("claim carries membership %d, want 3", claim.Membership)
 	}
 }

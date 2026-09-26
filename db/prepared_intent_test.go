@@ -176,6 +176,7 @@ func TestCommitRefusesAClaimWhoseIntentIsGone(t *testing.T) {
 	res := commitClaim(engine, a)
 	require.False(t, res.Success, "a claim COMMIT was ACKed with no claim intent to apply")
 	require.Contains(t, res.Error, ErrAutoIncClaimNotApplicable.Error())
+	require.True(t, res.ToCoordinatorResponse().ClaimNotApplicable, "the refusal reached the coordinator unclassified")
 	require.Equal(t, uint64(500), readClaimBase(t, dm, "testdb", "users"))
 }
 
@@ -185,8 +186,8 @@ func TestCommitRefusesAClaimWhoseIntentIsGone(t *testing.T) {
 // new floor, so the COMMIT must be refused and the base left where the seed
 // put it.
 //
-// Mutation: drop "AND base <= ?" from applyClaimTx's UPDATE. The COMMIT is
-// ACKed and "the claim lowered a base a seed had raised" fires.
+// Mutation: drop "AND seed <= ?" from applyClaimTx's UPDATE. The COMMIT is
+// ACKed and "a claim below the raised floor was ACKed" fires.
 func TestCommitRefusesAClaimOnceTheBaseMovedPastItsPrevBase(t *testing.T) {
 	engine, dm, cleanup := setupTestReplicationEngine(t)
 	defer cleanup()
@@ -198,9 +199,10 @@ func TestCommitRefusesAClaimOnceTheBaseMovedPastItsPrevBase(t *testing.T) {
 	seedClaimBase(t, dm, "testdb", "users", 800, 2)
 
 	res := commitClaim(engine, a)
-	require.Equal(t, uint64(800), readClaimBase(t, dm, "testdb", "users"), "the claim lowered a base a seed had raised")
 	require.False(t, res.Success, "a claim below the raised floor was ACKed")
+	require.Equal(t, uint64(800), readClaimBase(t, dm, "testdb", "users"), "the claim lowered a base a seed had raised")
 	require.Contains(t, res.Error, ErrAutoIncClaimNotApplicable.Error())
+	require.True(t, res.ClaimNotApplicable, "the refusal was not classified as a claim that cannot be applied")
 }
 
 // intentsFrom is a MetaStore whose GetIntentsByTxn replays intents captured
@@ -222,7 +224,7 @@ func (m intentsFrom) GetIntentsByTxn(uint64) ([]*WriteIntentRecord, error) {
 // must now be refused, so this node ACKs one of the two and never both; two
 // majorities that each ACKed one would have to share a node that ACKed both.
 //
-// Mutation: drop "AND base <= ?" from applyClaimTx's UPDATE. A's apply
+// Mutation: drop "AND committed <= ?" from applyClaimTx's UPDATE. A's apply
 // succeeds and "this node applied two overlapping claims" fires.
 func TestApplyClaimsACKsAtMostOneOfTwoOverlappingClaims(t *testing.T) {
 	engine, dm, cleanup := setupTestReplicationEngine(t)

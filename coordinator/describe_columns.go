@@ -22,18 +22,20 @@ const describeColumnsTimeout = 5 * time.Second
 // far from its cause.
 //
 // Statements that return nothing, and statements the database cannot prepare,
-// yield no columns; the caller then omits the definitions.
-func (h *CoordinatorHandler) DescribeResultColumns(session *protocol.ConnectionSession, sql string) ([]protocol.ColumnDef, error) {
-	if session == nil || session.CurrentDatabase == "" {
+// yield no columns; the caller then omits the definitions. The statement is
+// described in database, the one it names or the session's: a qualified
+// table's name has already been stripped from sql.
+func (h *CoordinatorHandler) DescribeResultColumns(session *protocol.ConnectionSession, database, sql string) ([]protocol.ColumnDef, error) {
+	if session == nil || database == "" {
 		return nil, nil
 	}
 	if h.dbManager == nil {
 		return nil, nil
 	}
 
-	replicatedDB, err := h.dbManager.GetReplicatedDatabase(session.CurrentDatabase)
+	replicatedDB, err := h.dbManager.GetReplicatedDatabase(database)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get database %s: %w", session.CurrentDatabase, err)
+		return nil, fmt.Errorf("failed to get database %s: %w", database, err)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), describeColumnsTimeout)

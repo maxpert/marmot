@@ -65,6 +65,13 @@ type SchemaInfo struct {
 	// AutoIncrementUnsigned mirrors the MySQL UNSIGNED modifier on that column.
 	// Meaningless when AutoIncrementWidth is zero.
 	AutoIncrementUnsigned bool
+	// AutoIncrementExplicit reports that the column was declared
+	// AUTO_INCREMENT, as opposed to being a narrow INTEGER PRIMARY KEY that
+	// SQLite treats as a rowid alias. Meaningless when AutoIncrementWidth is
+	// zero.
+	AutoIncrementExplicit bool
+	// Database is the database the table was resolved in.
+	Database string
 }
 
 // HasAutoIncrement returns true if table has an auto-increment column

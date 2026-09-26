@@ -30,6 +30,11 @@ func RegisterRoutes(mux *http.ServeMux, handlers *AdminHandlers) {
 		r.Post("/decommission/{nodeID}", handlers.handleDecommission)
 		r.Get("/decommission/{nodeID}/status", handlers.handleDecommissionStatus)
 		r.Post("/decommission/{nodeID}/cancel", handlers.handleDecommissionCancel)
+		r.Group(func(r chi.Router) {
+			r.Use(RequireSecretMiddleware)
+			r.Post("/autoinc/release-votes", handlers.handleAutoIncReleaseVotes)
+			r.Post("/autoinc/sync", handlers.handleAutoIncSync)
+		})
 	})
 
 	// Per-database transaction operations (outside metadata path)

@@ -15,10 +15,13 @@ import (
 	"github.com/maxpert/marmot/cfg"
 	"github.com/maxpert/marmot/common"
 	"github.com/maxpert/marmot/hlc"
+	"github.com/maxpert/marmot/id"
 	"github.com/maxpert/marmot/modules/vecindex"
 	"github.com/maxpert/marmot/protocol"
 	"github.com/maxpert/marmot/protocol/determinism"
 	"github.com/maxpert/marmot/protocol/handlers"
+	"github.com/maxpert/marmot/protocol/mysqlcode"
+	"github.com/maxpert/marmot/protocol/query/rules"
 	"github.com/maxpert/marmot/protocol/query/transform"
 	"github.com/maxpert/marmot/telemetry"
 	"github.com/rs/zerolog/log"
@@ -195,15 +198,19 @@ type PublisherRegistry interface {
 // CoordinatorHandler implements protocol.ConnectionHandler
 // It routes queries to the appropriate coordinator (Read or Write)
 type CoordinatorHandler struct {
-	nodeID             uint64
-	writeCoord         *WriteCoordinator
-	readCoord          *ReadCoordinator
-	clock              *hlc.Clock
-	dbManager          DatabaseManager
-	ddlLockMgr         *DDLLockManager
-	schemaVersionMgr   SchemaVersionManager
-	nodeRegistry       NodeRegistry
-	metadata           *handlers.MetadataHandler
+	nodeID           uint64
+	writeCoord       *WriteCoordinator
+	readCoord        *ReadCoordinator
+	clock            *hlc.Clock
+	dbManager        DatabaseManager
+	ddlLockMgr       *DDLLockManager
+	schemaVersionMgr SchemaVersionManager
+	nodeRegistry     NodeRegistry
+	metadata         *handlers.MetadataHandler
+	// narrowIDs mints ids for AUTO_INCREMENT columns declared narrower than
+	// BIGINT, from ranges this node claims through writeCoord. Nil when the
+	// handler has no write coordinator to claim through.
+	narrowIDs          *id.RangeAllocator
 	recentTxnIDs       sync.Map // txn_id -> conn_id for duplicate detection
 	publisherRegistry  PublisherRegistry
 	publisherMu        sync.RWMutex
@@ -228,7 +235,15 @@ type CoordinatorHandler struct {
 
 // NewCoordinatorHandler creates a new handler
 func NewCoordinatorHandler(nodeID uint64, writeCoord *WriteCoordinator, readCoord *ReadCoordinator, clock *hlc.Clock, dbManager DatabaseManager, ddlLockMgr *DDLLockManager, schemaVersionMgr SchemaVersionManager, nodeRegistry NodeRegistry) *CoordinatorHandler {
+	// The narrow allocator claims through this handler's own write
+	// coordinator, so it is built here, beside it, rather than in the shared
+	// query pipeline. A claim gets the same bound as any other write.
+	var narrowIDs *id.RangeAllocator
+	if writeCoord != nil {
+		narrowIDs = id.NewRangeAllocator(writeCoord, getWriteTimeout())
+	}
 	return &CoordinatorHandler{
+		narrowIDs:        narrowIDs,
 		nodeID:           nodeID,
 		writeCoord:       writeCoord,
 		readCoord:        readCoord,
@@ -238,6 +253,31 @@ func NewCoordinatorHandler(nodeID uint64, writeCoord *WriteCoordinator, readCoor
 		schemaVersionMgr: schemaVersionMgr,
 		nodeRegistry:     nodeRegistry,
 		metadata:         handlers.NewMetadataHandler(dbManager, SystemDatabaseName),
+	}
+}
+
+// narrowAllocator returns the narrow allocator as the interface the parser
+// takes, keeping a nil allocator a nil interface.
+func (h *CoordinatorHandler) narrowAllocator() rules.NarrowAllocator {
+	if h.narrowIDs == nil {
+		return nil
+	}
+	return h.narrowIDs
+}
+
+// TableIncarnationEnded discards this node's in-memory id range for a table
+// whose incarnation a DDL statement ended (db.AutoIncIncarnationListener).
+func (h *CoordinatorHandler) TableIncarnationEnded(database, table string) {
+	if h.narrowIDs != nil {
+		h.narrowIDs.Forget(database, table)
+	}
+}
+
+// DatabaseIncarnationEnded discards this node's in-memory id ranges for every
+// table of a dropped database (db.AutoIncIncarnationListener).
+func (h *CoordinatorHandler) DatabaseIncarnationEnded(database string) {
+	if h.narrowIDs != nil {
+		h.narrowIDs.ForgetDatabase(database)
 	}
 }
 
@@ -291,19 +331,6 @@ func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, sq
 		return h.handleMarmotCommand(session, sql)
 	}
 
-	// Build schema lookup function for auto-increment ID injection.
-	// Uses cached schema via DatabaseManager - does NOT query SQLite PRAGMA.
-	var schemaLookup protocol.SchemaLookupFunc
-	if h.dbManager != nil && session.CurrentDatabase != "" {
-		dbName := session.CurrentDatabase
-		schemaLookup = func(table string) *transform.SchemaInfo {
-			info, err := h.dbManager.GetTranspilerSchema(dbName, table)
-			if err != nil {
-				return nil
-			}
-			return info
-		}
-	}
 	schemaProvider := func(database, table string) *transform.SchemaInfo {
 		if table == "" || h.dbManager == nil {
 			return nil
@@ -322,10 +349,18 @@ func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, sq
 		}
 		return schemaInfo
 	}
+	// Auto-increment id injection looks tables up in the statement's own
+	// database when it names one, and in the session's otherwise.
+	var schemaLookup protocol.SchemaLookupFunc
+	if h.dbManager != nil {
+		schemaLookup = protocol.SchemaLookupFunc(schemaProvider)
+	}
 
 	// Parse with options based on session state
 	stmt := protocol.ParseStatementWithOptions(sql, protocol.ParseOptions{
 		SchemaLookup:      schemaLookup,
+		NarrowIDs:         h.narrowAllocator(),
+		BoundParams:       params,
 		SchemaProvider:    schemaProvider,
 		SkipTranspilation: !session.TranspilationEnabled,
 		ExtractLiterals:   true, // Enable literal extraction for parameterized execution
@@ -528,14 +563,59 @@ func (h *CoordinatorHandler) HandleLoadData(session *protocol.ConnectionSession,
 	// Preserve the original SQL text so replicated peers re-apply the same
 	// LOAD DATA LOCAL INFILE semantics (parser normalization can drop LOCAL).
 	stmt.SQL = sql
-	stmt.Database = session.CurrentDatabase
 	stmt.LoadDataPayload = data
+	database, table, targetErr := protocol.LoadDataTarget(sql)
+	if database == "" {
+		database = session.CurrentDatabase
+	}
+	stmt.Database = database
+
+	// A table with a narrow AUTO_INCREMENT column takes its rows as ordinary
+	// INSERTs through this handler, so their ids are generated or admitted
+	// like any other INSERT's (admitNarrowIDs). Replicated as a statement,
+	// every node would instead apply the file itself and let SQLite assign
+	// any missing key on its own.
+	if targetErr == nil && h.hasNarrowAutoIncrement(database, table) {
+		return h.loadNarrowData(session, database, sql, data)
+	}
 
 	consistency, _ := protocol.ParseConsistencyLevel(cfg.Config.Replication.DefaultWriteConsist)
 	if session.InTransaction() {
 		return h.bufferStatement(session, stmt)
 	}
 	return h.handleMutation(stmt, nil, consistency)
+}
+
+// loadNarrowData runs a LOAD DATA into a narrow table in database as INSERTs
+// through this handler. A target in another database than the session's is
+// loaded as its own autocommit work on a session of that database, since an
+// explicit transaction commits to the database it began in; inside an open
+// transaction that is refused.
+func (h *CoordinatorHandler) loadNarrowData(session *protocol.ConnectionSession, database, sql string, data []byte) (*protocol.ResultSet, error) {
+	if database == session.CurrentDatabase {
+		return protocol.ExecuteLoadDataLocal(session, h, sql, data)
+	}
+	if session.InTransaction() {
+		return nil, transform.NewCodedError(mysqlcode.ErrCodeNotSupportedYet,
+			"This version of MySQL doesn't yet support 'LOAD DATA into database `%s` inside a transaction begun in `%s`'",
+			database, session.CurrentDatabase)
+	}
+	target := &protocol.ConnectionSession{
+		ConnID:               session.ConnID,
+		CurrentDatabase:      database,
+		TranspilationEnabled: session.TranspilationEnabled,
+	}
+	return protocol.ExecuteLoadDataLocal(target, h, sql, data)
+}
+
+// hasNarrowAutoIncrement reports whether table has a narrow AUTO_INCREMENT
+// column (rules.IsNarrow).
+func (h *CoordinatorHandler) hasNarrowAutoIncrement(database, table string) bool {
+	if h.dbManager == nil || database == "" || table == "" {
+		return false
+	}
+	info, err := h.dbManager.GetTranspilerSchema(database, table)
+	return err == nil && rules.IsNarrow(info)
 }
 
 func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, params []interface{}, consistency protocol.ConsistencyLevel) (*protocol.ResultSet, error) {
@@ -683,6 +763,16 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, params []in
 			cancelHookCtx()
 		}
 	}()
+
+	// Every id the statement put into a narrow AUTO_INCREMENT column must be
+	// admitted before it replicates; a refusal fails the statement and
+	// releases what its local execution left behind.
+	if err := h.admitNarrowIDs(stmt.Database, txn.Statements); err != nil {
+		h.writeCoord.abortTransaction(ctx, []uint64{h.nodeID}, txn.ID, txn.Database)
+		telemetry.QueriesTotal.With("dml", "failed").Inc()
+		telemetry.QueryDurationSeconds.With("dml").Observe(time.Since(queryStart).Seconds())
+		return nil, err
+	}
 
 	// A DML that matched no rows leaves no statements to replicate. Running 2PC
 	// for it would burn a cluster round trip to commit nothing.
@@ -1387,10 +1477,14 @@ func (h *CoordinatorHandler) handleCommit(session *protocol.ConnectionSession) (
 	ctx, cancel := context.WithTimeout(context.Background(), writeTimeoutForStatements(txn.Statements))
 	defer cancel()
 
-	// DML that matched no rows leaves nothing to replicate. A transaction whose
+	// Every id the transaction put into a narrow AUTO_INCREMENT column must be
+	// admitted before it replicates; a refusal fails the COMMIT. DML that
+	// matched no rows leaves nothing to replicate. A transaction whose
 	// statements all collapsed that way is a no-op and skips 2PC.
-	var err error
-	if len(txn.Statements) > 0 {
+	err := h.admitNarrowIDs(txn.Database, txn.Statements)
+	if err != nil {
+		h.writeCoord.abortTransaction(ctx, []uint64{h.nodeID}, txn.ID, txn.Database)
+	} else if len(txn.Statements) > 0 {
 		err = h.writeCoord.WriteTransaction(ctx, txn)
 	}
 

@@ -68,7 +68,7 @@ func TestSeedAutoIncBasesForDDL_NewMarkedTableSeedsZero(t *testing.T) {
 	tm := NewTransactionManager(db, nil, hlc.NewClock(1), nil)
 	tm.SetAutoIncClaimStore(store)
 	tm.SetDatabaseName("testdb")
-	require.NoError(t, tm.seedAutoIncBasesForDDL([]ddlTableOwner{{table: "t", owner: 7}}))
+	require.NoError(t, tm.seedAutoIncBasesForDDL(tm.db, nil, []ddlTableOwner{{table: "t", owner: 7}}))
 
 	base, owner, ok := readClaimRow(t, store, "testdb", "t")
 	require.True(t, ok, "expected a claim row to be created")
@@ -92,7 +92,7 @@ func TestSeedAutoIncBasesForDDL_ExistingRowsRaiseTheFloor(t *testing.T) {
 	tm := NewTransactionManager(db, nil, hlc.NewClock(1), nil)
 	tm.SetAutoIncClaimStore(store)
 	tm.SetDatabaseName("testdb")
-	require.NoError(t, tm.seedAutoIncBasesForDDL([]ddlTableOwner{{table: "t", owner: 1}}))
+	require.NoError(t, tm.seedAutoIncBasesForDDL(tm.db, nil, []ddlTableOwner{{table: "t", owner: 1}}))
 
 	base, _, ok := readClaimRow(t, store, "testdb", "t")
 	require.True(t, ok)
@@ -117,7 +117,7 @@ func TestSeedAutoIncBasesForDDL_DeclaredFloorWins(t *testing.T) {
 	tm := NewTransactionManager(db, nil, hlc.NewClock(1), nil)
 	tm.SetAutoIncClaimStore(store)
 	tm.SetDatabaseName("testdb")
-	require.NoError(t, tm.seedAutoIncBasesForDDL([]ddlTableOwner{{table: "t", owner: 1}}))
+	require.NoError(t, tm.seedAutoIncBasesForDDL(tm.db, nil, []ddlTableOwner{{table: "t", owner: 1}}))
 
 	base, _, ok := readClaimRow(t, store, "testdb", "t")
 	require.True(t, ok)
@@ -140,7 +140,7 @@ func TestSeedAutoIncBasesForDDL_OnlyRaises(t *testing.T) {
 	tm := NewTransactionManager(db, nil, hlc.NewClock(1), nil)
 	tm.SetAutoIncClaimStore(store)
 	tm.SetDatabaseName("testdb")
-	require.NoError(t, tm.seedAutoIncBasesForDDL([]ddlTableOwner{{table: "t", owner: 1}}))
+	require.NoError(t, tm.seedAutoIncBasesForDDL(tm.db, nil, []ddlTableOwner{{table: "t", owner: 1}}))
 	base1, _, ok := readClaimRow(t, store, "testdb", "t")
 	require.True(t, ok)
 	require.GreaterOrEqual(t, base1, int64(1000))
@@ -150,7 +150,7 @@ func TestSeedAutoIncBasesForDDL_OnlyRaises(t *testing.T) {
 	// move down to it.
 	_, err = db.Exec(`DELETE FROM t WHERE id > 5`)
 	require.NoError(t, err)
-	require.NoError(t, tm.seedAutoIncBasesForDDL([]ddlTableOwner{{table: "t", owner: 1}}))
+	require.NoError(t, tm.seedAutoIncBasesForDDL(tm.db, nil, []ddlTableOwner{{table: "t", owner: 1}}))
 
 	base2, _, ok := readClaimRow(t, store, "testdb", "t")
 	require.True(t, ok)
@@ -172,7 +172,7 @@ func TestSeedAutoIncBasesForDDL_NoMarkerSeedsNothing(t *testing.T) {
 	tm := NewTransactionManager(db, nil, hlc.NewClock(1), nil)
 	tm.SetAutoIncClaimStore(store)
 	tm.SetDatabaseName("testdb")
-	require.NoError(t, tm.seedAutoIncBasesForDDL([]ddlTableOwner{{table: "t", owner: 1}}))
+	require.NoError(t, tm.seedAutoIncBasesForDDL(tm.db, nil, []ddlTableOwner{{table: "t", owner: 1}}))
 
 	_, _, ok := readClaimRow(t, store, "testdb", "t")
 	require.False(t, ok, "a table with no AUTO_INCREMENT marker must get no claim row")
@@ -190,7 +190,7 @@ func TestSeedAutoIncBasesForDDL_MarkedButNotExplicitAutoIncSeedsNothing(t *testi
 	tm := NewTransactionManager(db, nil, hlc.NewClock(1), nil)
 	tm.SetAutoIncClaimStore(store)
 	tm.SetDatabaseName("testdb")
-	require.NoError(t, tm.seedAutoIncBasesForDDL([]ddlTableOwner{{table: "t", owner: 1}}))
+	require.NoError(t, tm.seedAutoIncBasesForDDL(tm.db, nil, []ddlTableOwner{{table: "t", owner: 1}}))
 
 	_, _, ok := readClaimRow(t, store, "testdb", "t")
 	require.False(t, ok)
@@ -202,7 +202,7 @@ func TestSeedAutoIncBasesForDDL_MarkedButNotExplicitAutoIncSeedsNothing(t *testi
 func TestSeedAutoIncBasesForDDL_MissingTableIsANoOp(t *testing.T) {
 	db := newSeedTestDB(t)
 	tm := NewTransactionManager(db, nil, hlc.NewClock(1), nil)
-	require.NoError(t, tm.seedAutoIncBasesForDDL([]ddlTableOwner{{table: "gone", owner: 1}}))
+	require.NoError(t, tm.seedAutoIncBasesForDDL(tm.db, nil, []ddlTableOwner{{table: "gone", owner: 1}}))
 }
 
 // TestSeedAutoIncBasesForDDL_DedupesRepeatedTable pins that a table named by
@@ -217,7 +217,7 @@ func TestSeedAutoIncBasesForDDL_DedupesRepeatedTable(t *testing.T) {
 	tm := NewTransactionManager(db, nil, hlc.NewClock(1), nil)
 	tm.SetAutoIncClaimStore(store)
 	tm.SetDatabaseName("testdb")
-	require.NoError(t, tm.seedAutoIncBasesForDDL([]ddlTableOwner{
+	require.NoError(t, tm.seedAutoIncBasesForDDL(tm.db, nil, []ddlTableOwner{
 		{table: "t", owner: 42},
 		{table: "t", owner: 99},
 	}))
@@ -298,7 +298,7 @@ func TestSeedAutoIncBasesForDDL_NoStoreWiredFailsFast(t *testing.T) {
 	tm.SetDatabaseName("testdb")
 	// Deliberately no SetAutoIncClaimStore call.
 
-	err = tm.seedAutoIncBasesForDDL([]ddlTableOwner{{table: "t", owner: 1}})
+	err = tm.seedAutoIncBasesForDDL(tm.db, nil, []ddlTableOwner{{table: "t", owner: 1}})
 	require.Error(t, err, "seeding a marked table with no store wired must fail, not silently skip")
 	require.Contains(t, err.Error(), "no auto-increment claim store wired")
 	require.Contains(t, err.Error(), "t", "the error should name the table it failed to seed")
@@ -326,9 +326,29 @@ func TestSeedAutoIncBasesForDDL_NegativeIdsSeedZero(t *testing.T) {
 	tm := NewTransactionManager(db, nil, hlc.NewClock(1), nil)
 	tm.SetAutoIncClaimStore(store)
 	tm.SetDatabaseName("testdb")
-	require.NoError(t, tm.seedAutoIncBasesForDDL([]ddlTableOwner{{table: "t", owner: 1}}))
+	require.NoError(t, tm.seedAutoIncBasesForDDL(tm.db, nil, []ddlTableOwner{{table: "t", owner: 1}}))
 
 	base, err := store.ReadBase("testdb", "t")
 	require.NoError(t, err, "a table with only negative ids must seed base 0")
 	require.Equal(t, uint64(0), base, "a table with only negative ids must seed base 0")
+}
+
+// TestAutoIncSeedFloorIgnoresIDsAboveTheWidth pins the seed on a table
+// holding ids its width cannot: only the ids the allocator could ever issue
+// raise the base. Counting the wide ones would put the base past the ceiling,
+// and every later insert would fail as exhausted.
+//
+// Mutation: drop the "<= widthMax" filter from autoIncSeedFloor. The floor
+// becomes 5000000000000 and this fires.
+func TestAutoIncSeedFloorIgnoresIDsAboveTheWidth(t *testing.T) {
+	conn := newSeedTestDB(t)
+	_, err := conn.Exec(`CREATE TABLE legacy (id INTEGER /*M:32a*/ PRIMARY KEY, v TEXT)`)
+	require.NoError(t, err)
+	_, err = conn.Exec(`INSERT INTO legacy (id, v) VALUES (41, 'narrow'), (5000000000000, 'wide')`)
+	require.NoError(t, err)
+
+	floor, ok, err := autoIncSeedFloor(conn, "legacy")
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, uint64(41), floor, "an id above the column's width raised the base past the ceiling")
 }

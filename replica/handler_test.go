@@ -849,6 +849,55 @@ func (f fakeLeaderClient) ForwardLoadData(context.Context, *marmotgrpc.ForwardLo
 	return nil, f.err
 }
 
+// capturingLeaderClient accepts every forwarded query and records it.
+type capturingLeaderClient struct {
+	marmotgrpc.MarmotServiceClient
+	got *[]*marmotgrpc.ForwardQueryRequest
+}
+
+func (c capturingLeaderClient) ForwardQuery(_ context.Context, req *marmotgrpc.ForwardQueryRequest, _ ...grpc.CallOption) (*marmotgrpc.ForwardQueryResponse, error) {
+	*c.got = append(*c.got, req)
+	return &marmotgrpc.ForwardQueryResponse{Success: true, RowsAffected: 1}, nil
+}
+
+// TestForwardedMutationCarriesTheClientSQL pins R3c-13: a replica forwards the
+// client's own SQL, so a qualified write keeps its database through a
+// replica, and the leader transpiles it once. Forwarding the transpiled text
+// stripped the qualifier, so the leader applied the write in the session's
+// database: 1146 there, or a same-named table silently written.
+//
+// Mutation: forward stmt.SQL again. "the forwarded SQL lost the client's
+// qualifier" fires.
+func TestForwardedMutationCarriesTheClientSQL(t *testing.T) {
+	var got []*marmotgrpc.ForwardQueryRequest
+	h := handlerWithLeaderClient(t, capturingLeaderClient{got: &got})
+	session := &protocol.ConnectionSession{ConnID: 1, CurrentDatabase: "testdb", TranspilationEnabled: true}
+
+	for _, tc := range []struct {
+		sql    string
+		params []interface{}
+	}{
+		{"INSERT INTO other.users (name) VALUES ('x')", nil},
+		{"INSERT INTO `other`.`users` (name) VALUES (?)", []interface{}{"y"}},
+		{"UPDATE other.users SET name = ? WHERE id = ?", []interface{}{"z", int64(1)}},
+	} {
+		got = nil
+		_, err := h.HandleQuery(session, tc.sql, tc.params)
+		if err != nil {
+			t.Fatalf("%q: %v", tc.sql, err)
+		}
+		if len(got) != 1 {
+			t.Fatalf("%q: forwarded %d requests, want 1", tc.sql, len(got))
+		}
+		if got[0].Sql != tc.sql {
+			t.Errorf("the forwarded SQL lost the client's qualifier: forwarded %q, client sent %q", got[0].Sql, tc.sql)
+		}
+		if got[0].Database != "testdb" {
+			t.Errorf("%q: forwarded with database %q, want the session's", tc.sql, got[0].Database)
+		}
+	}
+}
+
 // handlerWithLeaderClient builds a forwarding-enabled handler whose leader link
 // is the given client. A nil client reproduces "not connected"; a client that
 // returns an error reproduces "lost connection". Neither needs a live leader.
@@ -902,7 +951,7 @@ func TestReplicaEmittedErrorCodesAreServerSide(t *testing.T) {
 		{
 			name: "forwardMutation, not connected", client: nil,
 			call: func(h *ReadOnlyHandler, s *protocol.ConnectionSession) error {
-				_, err := h.forwardMutation(s, insert, nil)
+				_, err := h.forwardMutation(s, insert.SQL, insert, nil)
 				return err
 			},
 			wantCode: protocol.ErrCodeUnknown, wantSQLState: protocol.SQLStateGeneral,
@@ -929,7 +978,7 @@ func TestReplicaEmittedErrorCodesAreServerSide(t *testing.T) {
 		{
 			name: "forwardMutation, lost connection", client: fakeLeaderClient{err: errors.New("boom")},
 			call: func(h *ReadOnlyHandler, s *protocol.ConnectionSession) error {
-				_, err := h.forwardMutation(s, insert, nil)
+				_, err := h.forwardMutation(s, insert.SQL, insert, nil)
 				return err
 			},
 			wantCode: protocol.ErrCodeUnknown, wantSQLState: protocol.SQLStateGeneral,

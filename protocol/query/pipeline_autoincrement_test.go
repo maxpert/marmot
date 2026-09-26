@@ -13,15 +13,18 @@ type mockIDGenerator struct {
 	counter atomic.Uint64
 }
 
-func (m *mockIDGenerator) NextID() uint64 {
-	return m.counter.Add(1)
+func (m *mockIDGenerator) NextIDs(ids []uint64) error {
+	for i := range ids {
+		ids[i] = m.counter.Add(1)
+	}
+	return nil
 }
 
 // mockSchemaLookup returns a schema lookup that knows about specific tables.
 // The ordinal is the auto-increment column's position in the table's own column
 // order, which is what a column-less INSERT's VALUES tuple is indexed by.
-func mockSchemaLookup(tables map[string]transform.SchemaInfo) func(string) *transform.SchemaInfo {
-	return func(table string) *transform.SchemaInfo {
+func mockSchemaLookup(tables map[string]transform.SchemaInfo) func(string, string) *transform.SchemaInfo {
+	return func(_, table string) *transform.SchemaInfo {
 		info, ok := tables[table]
 		if !ok {
 			return nil

@@ -33,12 +33,28 @@ func (gr *GRPCReplicator) CleanupStagedPayload(txnID uint64) {
 
 // ReplicateTransaction implements coordinator.Replicator
 func (gr *GRPCReplicator) ReplicateTransaction(ctx context.Context, nodeID uint64, req *coordinator.ReplicationRequest) (*coordinator.ReplicationResponse, error) {
+	grpcReq, err := transactionRequestToProto(req)
+	if err != nil {
+		return nil, err
+	}
+
+	// Call gRPC client
+	grpcResp, err := gr.client.ReplicateTransaction(ctx, nodeID, grpcReq)
+	if err != nil {
+		return nil, fmt.Errorf("gRPC call failed: %w", err)
+	}
+
+	return convertTransactionResponse(grpcResp), nil
+}
+
+// transactionRequestToProto converts a coordinator.ReplicationRequest into
+// the gRPC TransactionRequest a participant's ReplicationHandler receives.
+func transactionRequestToProto(req *coordinator.ReplicationRequest) (*TransactionRequest, error) {
 	statements, err := convertStatementsToProto(req.Statements, req.Database, req.TxnID)
 	if err != nil {
 		return nil, err
 	}
-	// Convert coordinator.ReplicationRequest to gRPC TransactionRequest
-	grpcReq := &TransactionRequest{
+	return &TransactionRequest{
 		TxnId:        req.TxnID,
 		SourceNodeId: req.NodeID,
 		Statements:   statements,
@@ -50,15 +66,7 @@ func (gr *GRPCReplicator) ReplicateTransaction(ctx context.Context, nodeID uint6
 		Phase:                 convertPhaseToProto(req.Phase),
 		Database:              req.Database,
 		RequiredSchemaVersion: req.RequiredSchemaVersion,
-	}
-
-	// Call gRPC client
-	grpcResp, err := gr.client.ReplicateTransaction(ctx, nodeID, grpcReq)
-	if err != nil {
-		return nil, fmt.Errorf("gRPC call failed: %w", err)
-	}
-
-	return convertTransactionResponse(grpcResp), nil
+	}, nil
 }
 
 // convertTransactionResponse converts a gRPC TransactionResponse into

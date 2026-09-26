@@ -20,6 +20,8 @@ grpc_bind_address = "0.0.0.0"
 grpc_advertise_address = "marmot:8090"
 grpc_port = 8090
 seed_nodes = []
+# A deliberate single-node deployment: AUTO_INCREMENT claims need no peers.
+standalone = true
 gossip_interval_ms = 1000
 gossip_fanout = 2
 suspect_timeout_ms = 5000

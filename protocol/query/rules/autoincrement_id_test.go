@@ -14,11 +14,16 @@ import (
 // the serialized statement and the order of injection is observable.
 type seqGenerator struct{ n atomic.Uint64 }
 
-func (g *seqGenerator) NextID() uint64 { return 1000 + g.n.Add(1) - 1 }
+func (g *seqGenerator) NextIDs(ids []uint64) error {
+	for i := range ids {
+		ids[i] = 1000 + g.n.Add(1) - 1
+	}
+	return nil
+}
 
 // lookupFor builds the schema lookup the rule receives.
 func lookupFor(tables map[string]transform.SchemaInfo) SchemaLookup {
-	return func(table string) *transform.SchemaInfo {
+	return func(_, table string) *transform.SchemaInfo {
 		info, ok := tables[table]
 		if !ok {
 			return nil
@@ -140,8 +145,8 @@ func TestAutoIncrementIDRuleInjectionShapes(t *testing.T) {
 			stmt := parseOne(t, tc.sql)
 			before := sqlparser.String(stmt)
 
-			needs := rule.NeedsIDInjection(stmt, lookup)
-			got, applied, err := rule.ApplyAST(stmt, lookup)
+			needs := rule.NeedsIDInjection(stmt, lookup, nil)
+			got, applied, _, err := rule.ApplyAST(stmt, lookup, nil, nil)
 			if err != nil {
 				t.Fatalf("ApplyAST returned an error for %q: %v", tc.sql, err)
 			}
@@ -181,11 +186,11 @@ func TestAutoIncrementIDRuleRejectsUnprojectedInsertSelect(t *testing.T) {
 		// Mutation: restore the `insert.Rows.(sqlparser.Values)` early return
 		// in analyzeInsert. The statement is then accepted, SQLite assigns the
 		// rowid, and two nodes both mint 1, 2, 3.
-		if !rule.NeedsIDInjection(stmt, lookup) {
+		if !rule.NeedsIDInjection(stmt, lookup, nil) {
 			t.Fatalf("NeedsIDInjection = false for %q: the transpiler would cache it and never call ApplyAST", sql)
 		}
 
-		_, applied, err := rule.ApplyAST(stmt, lookup)
+		_, applied, _, err := rule.ApplyAST(stmt, lookup, nil, nil)
 		if err == nil {
 			t.Fatalf("ApplyAST accepted %q; want a rejection", sql)
 		}
@@ -236,10 +241,10 @@ func TestAutoIncrementIDRuleRejectsRowConstructor(t *testing.T) {
 
 		// Mutation: drop the *sqlparser.ValuesStatement arm in analyzeInsert.
 		// The column-listed form then returns nothing-to-do and this fires.
-		if !rule.NeedsIDInjection(stmt, lookup) {
+		if !rule.NeedsIDInjection(stmt, lookup, nil) {
 			t.Fatalf("NeedsIDInjection = false for %q: the transpiler would cache it and never call ApplyAST", sql)
 		}
-		_, applied, err := rule.ApplyAST(stmt, lookup)
+		_, applied, _, err := rule.ApplyAST(stmt, lookup, nil, nil)
 		if err == nil {
 			t.Fatalf("ApplyAST accepted %q; want a 1235 rejection", sql)
 		}
@@ -270,18 +275,18 @@ func TestAutoIncrementIDRuleNoLookupOrGenerator(t *testing.T) {
 	// Mutation: drop either nil guard in ApplyAST/NeedsIDInjection; the rule
 	// dereferences a nil generator or a nil lookup and panics.
 	rule := NewAutoIncrementIDRule(nil)
-	if rule.NeedsIDInjection(stmt, lookupFor(injectionSchemas)) {
+	if rule.NeedsIDInjection(stmt, lookupFor(injectionSchemas), nil) {
 		t.Error("NeedsIDInjection = true with a nil generator")
 	}
-	if _, applied, err := rule.ApplyAST(stmt, lookupFor(injectionSchemas)); applied || err != nil {
+	if _, applied, _, err := rule.ApplyAST(stmt, lookupFor(injectionSchemas), nil, nil); applied || err != nil {
 		t.Errorf("ApplyAST with a nil generator: applied=%v err=%v", applied, err)
 	}
 
 	rule = NewAutoIncrementIDRule(&seqGenerator{})
-	if rule.NeedsIDInjection(stmt, nil) {
+	if rule.NeedsIDInjection(stmt, nil, nil) {
 		t.Error("NeedsIDInjection = true with a nil schema lookup")
 	}
-	if _, applied, err := rule.ApplyAST(stmt, nil); applied || err != nil {
+	if _, applied, _, err := rule.ApplyAST(stmt, nil, nil, nil); applied || err != nil {
 		t.Errorf("ApplyAST with a nil schema lookup: applied=%v err=%v", applied, err)
 	}
 }
@@ -295,10 +300,10 @@ func TestAutoIncrementIDRuleUnknownTable(t *testing.T) {
 	lookup := lookupFor(injectionSchemas)
 	stmt := parseOne(t, "insert into nosuchtable values (null, 'a')")
 
-	if rule.NeedsIDInjection(stmt, lookup) {
+	if rule.NeedsIDInjection(stmt, lookup, nil) {
 		t.Error("NeedsIDInjection = true for a table the lookup does not know")
 	}
-	if _, applied, err := rule.ApplyAST(stmt, lookup); applied || err != nil {
+	if _, applied, _, err := rule.ApplyAST(stmt, lookup, nil, nil); applied || err != nil {
 		t.Errorf("ApplyAST on an unknown table: applied=%v err=%v", applied, err)
 	}
 }

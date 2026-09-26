@@ -191,6 +191,15 @@ func (tm *TransactionManager) autoIncClaimStoreAndDatabaseName() (*AutoIncClaimS
 	return tm.autoIncClaimStore, tm.databaseName
 }
 
+// autoIncIncarnationEnded tells the claim store's listener that a DDL
+// statement ended the incarnation of table in this manager's database
+// (AutoIncIncarnationListener).
+func (tm *TransactionManager) autoIncIncarnationEnded(table string) {
+	if claimStore, dbName := tm.autoIncClaimStoreAndDatabaseName(); claimStore != nil {
+		claimStore.tableIncarnationEnded(dbName, table)
+	}
+}
+
 // BeginTransaction starts a new distributed transaction with auto-generated ID
 func (tm *TransactionManager) BeginTransaction(nodeID uint64) (*Transaction, error) {
 	startTS := tm.clock.Now()
@@ -529,8 +538,7 @@ func (tm *TransactionManager) applyNonDMLIntents(txnID uint64, intents []*WriteI
 		return nonDMLIntents[i].CreatedAt < nonDMLIntents[j].CreatedAt
 	})
 
-	hasDDL := false
-	var ddlTables []ddlTableOwner
+	var change SchemaChange
 	for _, intent := range nonDMLIntents {
 		var vectorChange common.VectorIndexChange
 		if err := DeserializeData(intent.DataSnapshot, &vectorChange); err == nil && vectorChange.Action != 0 {
@@ -553,42 +561,56 @@ func (tm *TransactionManager) applyNonDMLIntents(txnID uint64, intents []*WriteI
 			log.Debug().Uint64("txn_id", txnID).Msg("LOAD DATA statement executed")
 			continue
 		}
-		if _, err := tm.db.Exec(intent.SQLStatement); err != nil {
-			return fmt.Errorf("failed to execute DDL statement: %w", err)
+		if err := tm.execDDL(&change, intent); err != nil {
+			return err
 		}
-		hasDDL = true
-		ddlTables = append(ddlTables, ddlTableOwner{table: intent.TableName, owner: intent.NodeID})
-
 		log.Debug().Uint64("txn_id", txnID).Str("sql", intent.SQLStatement).Msg("DDL statement executed")
 	}
+	if change.Empty() {
+		return nil
+	}
+
+	// Reported before the schema cache reload below makes the new definitions
+	// visible to queries, so no insert into a new incarnation can take an id
+	// from a range claimed for an old one.
+	tm.endIncarnations(&change)
 
 	// Reload schema cache after DDL operations. A failed reload leaves the
 	// cache stale, so subsequent preupdate hooks would silently drop CDC data
 	// for any column the DDL added/changed - fail the DDL apply instead of
 	// swallowing the error.
-	if hasDDL && tm.schemaCache != nil {
+	if tm.schemaCache != nil {
 		if err := tm.reloadSchemaCache(); err != nil {
 			return fmt.Errorf("failed to reload schema cache after DDL (txn %d): %w", txnID, err)
 		}
 	}
 
 	// Seed __marmot__autoinc for every table this DDL tagged AUTO_INCREMENT,
-	// after the DDL has executed and the schema cache reflects it. The claim table now lives in the system database - a
-	// separate SQLite file from tm.db (db/autoinc_claim.go) - so the seed can
-	// no longer share the DDL's own transaction the way it once did: it is
-	// written in its own system-database transaction, still before this
-	// COMMIT is ACKed. A seeding failure therefore still fails the DDL apply
-	// and the COMMIT with it, the same durability boundary
+	// after the DDL has executed and the schema cache reflects it. The claim
+	// table lives in the system database - a separate SQLite file from tm.db
+	// (db/autoinc_claim.go) - so the seed cannot share the DDL's own
+	// transaction: it is written in its own system-database transaction,
+	// still before this COMMIT is ACKed. A seeding failure therefore still
+	// fails the DDL apply and the COMMIT with it, the same durability boundary
 	// AutoIncClaimStore.ApplyClaims relies on for the claim itself: a table
 	// left untagged here would let a subsequent range claim be evaluated
 	// against a missing base row.
-	if len(ddlTables) > 0 {
-		if err := tm.seedAutoIncBasesForDDL(ddlTables); err != nil {
-			return fmt.Errorf("failed to seed auto-increment base after DDL (txn %d): %w", txnID, err)
-		}
+	if err := tm.seedSchemaChange(tm.db, &change); err != nil {
+		return fmt.Errorf("failed to seed auto-increment base after DDL (txn %d): %w", txnID, err)
 	}
-
 	return nil
+}
+
+// execDDL executes one DDL intent on one connection, so the schema reads
+// SchemaChange.Exec takes around it bracket exactly this statement.
+func (tm *TransactionManager) execDDL(change *SchemaChange, intent *WriteIntentRecord) error {
+	ctx := context.Background()
+	conn, err := tm.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to execute DDL statement: %w", err)
+	}
+	defer conn.Close()
+	return change.Exec(ctx, conn, intent.SQLStatement, intent.TableName, intent.NodeID)
 }
 
 // writeNonDMLToCDC writes DDL/LOAD DATA statements to CDC storage for streaming replication.

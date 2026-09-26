@@ -5,6 +5,7 @@ package db
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -13,12 +14,16 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// testClaimMembership is the cluster size every claim in these tests counts,
+// and the view markedTableDB installs on the participant.
+const testClaimMembership = 1
+
 // claimStatement builds the wire shape a range claim takes: an existing DML
 // statement type, a non-empty intent key, the payload, and no row image.
 func claimStatement(t *testing.T, database, table string, prevBase, newBase, size uint64) protocol.Statement {
 	t.Helper()
 	payload, err := protocol.EncodeAutoIncClaim(AutoIncClaim{
-		Table: table, PrevBase: prevBase, NewBase: newBase, Size: size,
+		Table: table, PrevBase: prevBase, NewBase: newBase, Size: size, Membership: testClaimMembership,
 	})
 	require.NoError(t, err)
 	return protocol.Statement{
@@ -31,9 +36,11 @@ func claimStatement(t *testing.T, database, table string, prevBase, newBase, siz
 	}
 }
 
-// markedTableDB sets up a database holding one marked AUTO_INCREMENT table.
+// markedTableDB sets up a database holding one marked AUTO_INCREMENT table,
+// on a participant whose view of the cluster is testClaimMembership nodes.
 func markedTableDB(t *testing.T, engine *ReplicationEngine, dm *DatabaseManager, ddl string) *ReplicatedDatabase {
 	t.Helper()
+	dm.SetClusterMembership(func() int { return testClaimMembership })
 	require.NoError(t, dm.CreateDatabase("testdb"))
 	mdb, err := dm.GetDatabase("testdb")
 	require.NoError(t, err)
@@ -69,35 +76,126 @@ func readClaimBase(t *testing.T, dm *DatabaseManager, database, table string) ui
 	return base
 }
 
-// TestPrepareClaimRejectsAbsentBase is the fail-closed clause, and it is the one
-// an implementer gets wrong: the natural implementation is "absent means 0
-// means yes", and a cache that defaults to 0 and accepts is precisely the thing
-// that cannot cast the rejection that would repair it.
+// claimRequest wraps one claim statement in a PREPARE request.
+func claimRequest(txnID uint64, stmt protocol.Statement) *PrepareRequest {
+	return &PrepareRequest{
+		TxnID:      txnID,
+		NodeID:     1,
+		StartTS:    hlc.Timestamp{WallTime: int64(txnID)},
+		Database:   "testdb",
+		Statements: []protocol.Statement{stmt},
+	}
+}
+
+// TestPrepareClaimBackfillsAnAbsentBaseFromTheTable pins the absent-row rule.
+// "Absent means 0 means yes" is the mistake the protocol exists to prevent: a
+// table whose ids reach 50 must not grant a range starting at 0. A node whose
+// votes are not held backfills the base the DDL-time seed would have written
+// - MAX(id) - and votes on that.
 //
 // Mutation: treat ErrAutoIncBaseAbsent as base 0 and fall through to the
 // comparison. The claim is accepted and this fires.
-func TestPrepareClaimRejectsAbsentBase(t *testing.T) {
+func TestPrepareClaimBackfillsAnAbsentBaseFromTheTable(t *testing.T) {
+	engine, dm, cleanup := setupTestReplicationEngine(t)
+	defer cleanup()
+	mdb := markedTableDB(t, engine, dm, "CREATE TABLE users (id INTEGER /*M:32a*/ PRIMARY KEY, v TEXT)")
+	for id := 1; id <= 50; id++ {
+		_, err := mdb.GetWriteDB().Exec("INSERT INTO users (id, v) VALUES (?, 'x')", id)
+		require.NoError(t, err)
+	}
+
+	// No claim row has ever been written for this table.
+	result := engine.Prepare(context.Background(), claimRequest(5001, claimStatement(t, "testdb", "users", 0, 0, 64)))
+	if result.Success {
+		t.Fatal("a participant with no stored base ACKed a range starting at 0 over ids up to 50; absent must never read as 0")
+	}
+	if !result.Rejected || result.AutoIDStoredBase != 50 {
+		t.Fatalf("rejection = {rejected:%v base:%d}, want a rejection carrying the backfilled base 50", result.Rejected, result.AutoIDStoredBase)
+	}
+	if base := readClaimBase(t, dm, "testdb", "users"); base != 50 {
+		t.Fatalf("stored base after backfill = %d, want 50", base)
+	}
+
+	result = engine.Prepare(context.Background(), claimRequest(5002, claimStatement(t, "testdb", "users", 50, 50, 64)))
+	require.True(t, result.Success, "a claim above the backfilled base must be accepted: %s", result.Error)
+}
+
+// TestPrepareClaimRefusesWhenThereIsNothingToBackfill pins that the backfill
+// applies only to a narrow auto-increment column: anything else stays absent
+// and refused.
+//
+// Mutation: backfill every absent row with 0. The claim is accepted and this
+// fires.
+func TestPrepareClaimRefusesWhenThereIsNothingToBackfill(t *testing.T) {
 	engine, dm, cleanup := setupTestReplicationEngine(t)
 	defer cleanup()
 	markedTableDB(t, engine, dm, "CREATE TABLE users (id INTEGER /*M:32a*/ PRIMARY KEY, v TEXT)")
 
-	// No claim row has ever been written for this table.
-	result := engine.Prepare(context.Background(), &PrepareRequest{
-		TxnID:      5001,
-		NodeID:     1,
-		StartTS:    hlc.Timestamp{WallTime: 1},
-		Database:   "testdb",
-		Statements: []protocol.Statement{claimStatement(t, "testdb", "users", 0, 0, 64)},
-	})
-
+	result := engine.Prepare(context.Background(), claimRequest(5001, claimStatement(t, "testdb", "ghost", 0, 0, 64)))
 	if result.Success {
-		t.Fatal("a participant with no stored base ACKed a range claim; absent must reject")
+		t.Fatal("a claim for a table this node does not have was ACKed")
 	}
-	if !result.Rejected {
-		t.Error("the refusal was not marked Rejected, so the coordinator would retry it as a timeout")
+	if !result.Rejected || !strings.Contains(result.Error, "ghost") {
+		t.Fatalf("refusal = {rejected:%v error:%q}, want a rejection naming the table", result.Rejected, result.Error)
 	}
-	if !strings.Contains(result.Error, "users") {
-		t.Errorf("rejection %q does not name the table", result.Error)
+	if _, err := autoIncClaimStoreForTest(dm).ReadBase("testdb", "ghost"); !errors.Is(err, ErrAutoIncBaseAbsent) {
+		t.Fatalf("ReadBase after the refusal = %v, want the row still absent", err)
+	}
+}
+
+// TestPrepareClaimDeclinesWhileVotesAreHeld pins the vote hold: a node whose
+// bases may be missing claims it or a majority granted declines every claim,
+// without a verdict and without backfilling, until it has merged bases.
+//
+// Mutation: ignore the hold in prepareAutoIncClaim. The claim is accepted
+// and this fires.
+func TestPrepareClaimDeclinesWhileVotesAreHeld(t *testing.T) {
+	engine, dm, cleanup := setupTestReplicationEngine(t)
+	defer cleanup()
+	markedTableDB(t, engine, dm, "CREATE TABLE users (id INTEGER /*M:32a*/ PRIMARY KEY, v TEXT)")
+	seedClaimBase(t, dm, "testdb", "users", 0, 1)
+	_, err := dm.GetSystemDatabase().GetWriteDB().Exec(holdVotesSQL, 1)
+	require.NoError(t, err)
+
+	result := engine.Prepare(context.Background(), claimRequest(5001, claimStatement(t, "testdb", "users", 0, 0, 64)))
+	if result.Success {
+		t.Fatal("a node whose claim votes are held ACKed a claim")
+	}
+	if result.Rejected {
+		t.Fatal("a held node cast a verdict; it must only decline, so the claim is decided by the rest of the cluster")
+	}
+
+	require.NoError(t, dm.MergeAutoIncBasesAndReleaseVotes(nil))
+	result = engine.Prepare(context.Background(), claimRequest(5002, claimStatement(t, "testdb", "users", 0, 0, 64)))
+	require.True(t, result.Success, "after the merge released the hold the claim must be accepted: %s", result.Error)
+}
+
+// TestPrepareClaimRejectsAnotherMembershipCount pins the membership check: a
+// claim is voted on only by a node that counts the cluster the way the
+// claimant did, since majorities of two memberships need not intersect. A
+// claimant that predates the field sends 0 and is refused, not read as a size.
+//
+// Mutation: drop the membership comparison. The mismatched claim is accepted
+// and this fires.
+func TestPrepareClaimRejectsAnotherMembershipCount(t *testing.T) {
+	engine, dm, cleanup := setupTestReplicationEngine(t)
+	defer cleanup()
+	markedTableDB(t, engine, dm, "CREATE TABLE users (id INTEGER /*M:32a*/ PRIMARY KEY, v TEXT)")
+	seedClaimBase(t, dm, "testdb", "users", 30, 1)
+
+	for i, membership := range []uint32{testClaimMembership + 2, 0} {
+		stmt := claimStatement(t, "testdb", "users", 30, 30, 64)
+		payload, err := protocol.EncodeAutoIncClaim(AutoIncClaim{Table: "users", PrevBase: 30, NewBase: 30, Size: 64, Membership: membership})
+		require.NoError(t, err)
+		stmt.AutoIDClaimPayload = payload
+
+		result := engine.Prepare(context.Background(), claimRequest(uint64(5001+i), stmt))
+		if result.Success {
+			t.Fatalf("a claim counting %d members was ACKed by a node counting %d", membership, testClaimMembership)
+		}
+		if !result.Rejected || result.AutoIDStoredBase != 30 {
+			t.Fatalf("membership %d: refusal = {rejected:%v base:%d}, want a rejection carrying base 30", membership, result.Rejected, result.AutoIDStoredBase)
+		}
 	}
 }
 

@@ -52,6 +52,9 @@ func setupLostPinnedState(t *testing.T) *lostPinnedStateSetup {
 	dbMgr, err := db.NewDatabaseManager(tmpDir, 1, clock)
 	require.NoError(t, err)
 	t.Cleanup(func() { dbMgr.Close() })
+	// A single node releases the claim votes its new system database holds,
+	// as a standalone node's merge does.
+	require.NoError(t, dbMgr.MergeAutoIncBasesAndReleaseVotes(nil))
 
 	const dbName = "lostpinned"
 	require.NoError(t, dbMgr.CreateDatabase(dbName))
@@ -61,6 +64,8 @@ func setupLostPinnedState(t *testing.T) *lostPinnedStateSetup {
 	schemaVersionMgr := db.NewSchemaVersionManager(systemDB.GetMetaStore())
 
 	nodeProvider := coordinator.NewMockNodeProvider([]uint64{1})
+	// A claim participant counts the cluster as the claimant does.
+	dbMgr.SetClusterMembership(nodeProvider.GetTotalMembershipSize)
 	writeCoord := coordinator.NewWriteCoordinator(
 		1,
 		nodeProvider,

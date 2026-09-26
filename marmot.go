@@ -239,6 +239,9 @@ func main() {
 		}
 	}
 
+	// A node whose system database this process initialises holds its
+	// AUTO_INCREMENT claim votes until it has merged claim bases from its
+	// peers (db.AutoIncHoldTable), whatever the catch-up decision was.
 	dbMgr, err := db.NewDatabaseManager(cfg.Config.DataDir, cfg.Config.NodeID, clock)
 	if err != nil {
 		log.Fatal().Err(err).Msg("Failed to initialize Database Manager")
@@ -399,9 +402,22 @@ func main() {
 
 	log.Info().Msg("Anti-entropy service initialized")
 
+	// A node whose AUTO_INCREMENT claim votes are held (a joiner, or one whose
+	// system database came from a peer) votes again only after merging claim
+	// bases from enough members. From then on - at once on any other node -
+	// it raises its bases to every alive peer's, every interval, so a
+	// membership change leaves a claim unknown to a new quorum for at most one
+	// interval.
+	autoIncMergeCtx, autoIncMergeCancel := context.WithCancel(context.Background())
+	defer autoIncMergeCancel()
+	go marmotgrpc.RunAutoIncBaseMerge(autoIncMergeCtx, cfg.Config.NodeID, dbMgr, grpcServer.GetNodeRegistry(), client, cfg.Config.Cluster.Standalone)
+
 	// Phase 7: Setup transaction coordinators for full database replication
 	log.Info().Msg("Setting up transaction coordinators")
 	nodeProvider := marmotgrpc.NewGossipNodeProvider(gossip.GetNodeRegistry(), len(cfg.Config.Cluster.SeedNodes) > 0)
+	// An AUTO_INCREMENT claim participant counts the cluster exactly as a
+	// claimant's quorum does.
+	dbMgr.SetClusterMembership(nodeProvider.GetTotalMembershipSize)
 	replicator := marmotgrpc.NewGRPCReplicator(client)
 
 	writeTimeout := time.Duration(cfg.Config.Replication.WriteTimeoutMS) * time.Millisecond
@@ -418,6 +434,9 @@ func main() {
 		writeTimeout,
 		clock,
 	)
+	// AUTO_INCREMENT claims carry this node's schema version, so a voter
+	// that lags a DDL declines them as it declines DML.
+	writeCoordinator.SetSchemaVersionSource(schemaVersionMgr.GetSchemaVersion)
 
 	// Initialize LocalReader for ReadCoordinator
 	localReader := db.NewLocalReader(dbMgr)
@@ -453,6 +472,7 @@ func main() {
 		registryAdapter,
 	)
 	handler.SetVectorEngine(vecEngine)
+	dbMgr.SetAutoIncIncarnationListener(handler)
 
 	// Initialize write forwarding for read-only replicas
 	forwardSessionMgr := marmotgrpc.NewForwardSessionManager(60 * time.Second)

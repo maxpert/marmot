@@ -39,6 +39,7 @@ lock_wait_timeout_seconds = 50
 grpc_bind_address = "0.0.0.0"
 grpc_port = 8080
 seed_nodes = []  # No peers - single node
+standalone = true  # A deliberate single-node deployment: AUTO_INCREMENT claims need no peers
 gossip_interval_ms = 1000
 gossip_fanout = 2
 suspect_timeout_ms = 5000

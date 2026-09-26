@@ -452,6 +452,9 @@ func startNode(t *testing.T, node *testNode, seedNodes []string) {
 
 	// Setup coordinators
 	nodeProvider := marmotgrpc.NewGossipNodeProvider(gossip.GetNodeRegistry(), false)
+	// As marmot.go does: a claim participant counts the cluster exactly as a
+	// claimant's quorum does.
+	dbMgr.SetClusterMembership(nodeProvider.GetTotalMembershipSize)
 	replicator := marmotgrpc.NewGRPCReplicator(client)
 
 	localReplicator := db.NewLocalReplicator(node.nodeID, dbMgr, node.clock)

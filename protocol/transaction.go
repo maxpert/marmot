@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"fmt"
+	"slices"
 	"sync"
 
 	"github.com/maxpert/marmot/common"
@@ -197,6 +198,12 @@ type Statement struct {
 	// one of the two sources is in play - see MergeExecParams.
 	ParamOrder []bool `msgpack:"-"`
 
+	// BoundIDs are server-generated ids that replace the caller's bound
+	// values, keyed by the value's position among them: a narrow
+	// AUTO_INCREMENT placeholder bound to NULL or 0 gets an id exactly as the
+	// literal would. MergeExecParams binds them in place.
+	BoundIDs map[int]uint64 `msgpack:"-"`
+
 	// ParsedAST carries the Vitess AST produced during MySQL-dialect parse.
 	// Non-nil only when the pipeline parsed the statement via Vitess (SELECT,
 	// DML, and most DDL). Downstream components that need the AST — notably
@@ -224,8 +231,17 @@ type Statement struct {
 // pipeline-extracted ones interleaved in serialization order; ParamOrder
 // records that order (true = next wireParams value, false = next
 // ExtractedParams value) so the two sources are threaded back together
-// positionally instead of one being silently dropped.
+// positionally instead of one being silently dropped. Any BoundIDs replace
+// the caller's values at their positions first.
 func (s Statement) MergeExecParams(wireParams []interface{}) []interface{} {
+	if len(s.BoundIDs) > 0 {
+		wireParams = slices.Clone(wireParams)
+		for pos, id := range s.BoundIDs {
+			if pos < len(wireParams) {
+				wireParams[pos] = int64(id)
+			}
+		}
+	}
 	if len(s.ParamOrder) == 0 {
 		if len(wireParams) == 0 && len(s.ExtractedParams) > 0 {
 			return s.ExtractedParams
@@ -262,6 +278,7 @@ func (s Statement) WithResolvedParams(sql string, params []interface{}) Statemen
 	s.SQL = sql
 	s.ExtractedParams = params
 	s.ParamOrder = nil
+	s.BoundIDs = nil
 	return s
 }
 

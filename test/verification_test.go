@@ -58,6 +58,12 @@ func (tdm *TestDatabaseManager) GetDatabase(name string) (*db.ReplicatedDatabase
 	return tdm.db, nil
 }
 
+// ClusterMembership reports a single-node cluster: this fixture serves one
+// node and claims no AUTO_INCREMENT ranges across any other.
+func (tdm *TestDatabaseManager) ClusterMembership() (int, error) {
+	return 1, nil
+}
+
 func (tdm *TestDatabaseManager) ListDatabases() []string {
 	return []string{"marmot"}
 }

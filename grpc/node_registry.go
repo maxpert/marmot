@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"hash/fnv"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -42,7 +43,7 @@ type NodeRegistry struct {
 	nodes             map[uint64]*NodeState
 	lastSeen          map[uint64]time.Time
 	mu                sync.RWMutex
-	onNodeAliveFunc   func(*NodeState) // Callback when node transitions to ALIVE
+	onNodeAliveFunc   func(*NodeState) // Callback when node transitions to ALIVE, or is discovered ALIVE
 	onNodeDeadFunc    func(*NodeState) // Callback when node transitions to DEAD
 	onNodeLeavingFunc func()           // Callback when local node marked LEAVING via remote decommission
 	callbackMu        sync.RWMutex
@@ -140,7 +141,10 @@ func (nr *NodeRegistry) Update(node *NodeState) {
 		return
 	}
 
-	// Rule 2: Discover new nodes
+	// Rule 2: Discover new nodes. A node discovered ALIVE gets the same
+	// callback as one that becomes ALIVE: it may never change status again
+	// (a restarted peer keeps its incarnation), and the callback is what
+	// opens this node's connection to it.
 	existing, exists := nr.nodes[node.NodeId]
 	if !exists {
 		log.Debug().
@@ -153,6 +157,9 @@ func (nr *NodeRegistry) Update(node *NodeState) {
 		nr.lastSeen[node.NodeId] = time.Now()
 		nr.updateClusterMetricsLocked()
 		nr.mu.Unlock()
+		if node.Status == NodeStatus_ALIVE {
+			nr.fireOnNodeAlive(node)
+		}
 		return
 	}
 
@@ -247,13 +254,19 @@ func (nr *NodeRegistry) Update(node *NodeState) {
 
 	// Call callback outside lock to avoid deadlock
 	if becameAlive {
-		nr.callbackMu.RLock()
-		callback := nr.onNodeAliveFunc
-		nr.callbackMu.RUnlock()
+		nr.fireOnNodeAlive(node)
+	}
+}
 
-		if callback != nil {
-			callback(node)
-		}
+// fireOnNodeAlive runs the ALIVE callback for node. The caller must not hold
+// nr.mu.
+func (nr *NodeRegistry) fireOnNodeAlive(node *NodeState) {
+	nr.callbackMu.RLock()
+	callback := nr.onNodeAliveFunc
+	nr.callbackMu.RUnlock()
+
+	if callback != nil {
+		callback(node)
 	}
 }
 
@@ -501,6 +514,21 @@ func (nr *NodeRegistry) CheckTimeouts(suspectTimeout, deadTimeout time.Duration)
 			}
 		}
 	}
+}
+
+// MemberIDs returns the IDs of the nodes Count counts, sorted.
+func (nr *NodeRegistry) MemberIDs() []uint64 {
+	nr.mu.RLock()
+	defer nr.mu.RUnlock()
+
+	ids := make([]uint64, 0, len(nr.nodes))
+	for id, node := range nr.nodes {
+		if node.Status != NodeStatus_REMOVED && node.Status != NodeStatus_LEAVING {
+			ids = append(ids, id)
+		}
+	}
+	slices.Sort(ids)
+	return ids
 }
 
 // Count returns the number of nodes in membership (excludes REMOVED and LEAVING nodes)

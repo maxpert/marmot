@@ -409,3 +409,26 @@ func TestValidateDDLStatements_UnrelatedTableIsNotChecked(t *testing.T) {
 		`CREATE TABLE unrelated (id INTEGER PRIMARY KEY)`,
 	}))
 }
+
+// TestValidateDDLStatements_OverWidthTableKeepsAcceptingDDL is the path back
+// for a table filled with wide ids before narrow allocation existed: its ids
+// already exceed its declared width, and a DDL that leaves that width alone
+// must not be refused, or the table could never be altered again - including
+// by the DDL that repairs it.
+//
+// Mutation: check every changed table regardless of whether its width
+// changed. The ALTER is refused with AutoIncWidthExceededError and this
+// fires.
+func TestValidateDDLStatements_OverWidthTableKeepsAcceptingDDL(t *testing.T) {
+	t.Parallel()
+	db := openDDLValidationDB(t)
+
+	_, err := db.Exec(`CREATE TABLE legacy (id INTEGER /*M:32a*/ PRIMARY KEY, v TEXT)`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO legacy (id, v) VALUES (5000000000000, 'wide id from before narrow allocation')`)
+	require.NoError(t, err)
+
+	require.NoError(t, ValidateDDLStatements(context.Background(), db, []string{
+		`ALTER TABLE legacy ADD COLUMN note TEXT`,
+	}), "a DDL that does not re-declare the column's width was refused over ids the width never held")
+}

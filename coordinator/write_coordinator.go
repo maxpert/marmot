@@ -29,6 +29,18 @@ type WriteCoordinator struct {
 	localReplicator Replicator
 	timeout         time.Duration
 	clock           *hlc.Clock
+	// schemaVersion returns this node's schema version for a database. A
+	// claim carries it as RequiredSchemaVersion, so a participant that has
+	// not applied the DDL this node has declines the claim instead of voting
+	// with a base kept for an incarnation this node has already replaced.
+	// Nil stamps claims with 0, which no participant checks.
+	schemaVersion func(database string) (uint64, error)
+}
+
+// SetSchemaVersionSource sets where claims read this node's schema version
+// (WriteCoordinator.schemaVersion). Call it before the coordinator is used.
+func (wc *WriteCoordinator) SetSchemaVersionSource(source func(database string) (uint64, error)) {
+	wc.schemaVersion = source
 }
 
 // Replicator sends replication requests to remote nodes
@@ -107,15 +119,21 @@ type ReplicationResponse struct {
 	// DDL SQLite cannot apply). Timeouts and storage failures leave it false so they
 	// stay retryable missing ACKs rather than a final verdict.
 	Rejected bool
-	// AutoIDStoredBase is this participant's own committed base for the table a
-	// rejected AUTO_INCREMENT range claim named, so the claimant can retry above
-	// it rather than spin. Zero on every response that is not such a rejection.
+	// AutoIDStoredBase is this participant's own base (the largest of its claim
+	// row's floors) for the table a rejected AUTO_INCREMENT range claim named,
+	// so the claimant can retry above it rather than spin. Zero on every
+	// response that is not such a rejection.
 	AutoIDStoredBase uint64
 	// ErrorCode is the MySQL server error code the rejecting participant chose
 	// for this refusal, or 0 when it named none. Error carries the message;
 	// this carries the code, because a typed error cannot cross either the
 	// local or the remote participant boundary.
 	ErrorCode uint16
+	// ClaimNotApplicable reports a COMMIT the participant refused because it
+	// could not apply the AUTO_INCREMENT claim the transaction carries
+	// (protocol.ErrAutoIncClaimNotApplicable). Set only by the local
+	// participant.
+	ClaimNotApplicable bool
 }
 
 // NewWriteCoordinator creates a new write coordinator for full database replication
@@ -579,6 +597,19 @@ func (wc *WriteCoordinator) commitLocalAfterRemoteQuorum(ctx context.Context, re
 		errMsg := ""
 		if localResp != nil {
 			errMsg = localResp.Error
+		}
+		if localErr == nil && localResp != nil && localResp.ClaimNotApplicable {
+			// Not a divergence: this node refused to apply an AUTO_INCREMENT
+			// claim the remote quorum committed, so it withholds its ACK and
+			// never issues from the range. The ids are burnt, which is safe.
+			log.Warn().
+				Str("resp_error", errMsg).
+				Uint64("txn_id", txnID).
+				Msg("Local AUTO_INCREMENT claim apply refused after remote quorum committed it; its range is not used")
+			return nil, &PartialCommitError{
+				IsLocal:    true,
+				LocalError: fmt.Errorf("%w: %s", protocol.ErrAutoIncClaimNotApplicable, errMsg),
+			}
 		}
 		log.Error().
 			Err(localErr).

@@ -5,10 +5,12 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/mattn/go-sqlite3"
 	"github.com/maxpert/marmot/protocol/mysqlcode"
 	"github.com/maxpert/marmot/protocol/query/transform"
+	"github.com/maxpert/marmot/protocol/query/transform/intmarker"
 )
 
 // isContextError reports whether err was caused by the context being cancelled or
@@ -169,7 +171,7 @@ func ValidateDDLStatements(ctx context.Context, dbConn *sql.DB, statements []str
 	// - derived from the schema itself, not by parsing the statement text - so
 	// a CREATE TABLE for an unrelated table is never rejected over a
 	// pre-existing condition on some other table it never touched.
-	return checkAutoIncWidthCeilings(ctx, tx, changedTables(before, after))
+	return checkAutoIncWidthCeilings(ctx, tx, before, changedTables(before, after))
 }
 
 // tableSchemaSnapshot reads every table's CREATE TABLE text from
@@ -207,18 +209,41 @@ func changedTables(before, after map[string]string) []string {
 	return touched
 }
 
-// checkAutoIncWidthCeilings rejects the DDL when a table's explicitly
-// declared AUTO_INCREMENT column can no longer hold the ids the table already
-// contains. It runs inside the validation transaction, so it sees the NEW
-// schema (this DDL's own effect) against the OLD rows the DDL has not
-// touched, and is always rolled back with the rest of validation.
-func checkAutoIncWidthCeilings(ctx context.Context, tx *sql.Tx, tables []string) error {
+// widthUnchanged reports whether beforeSQL already declared col with the
+// width and signedness attrs records.
+func widthUnchanged(beforeSQL, col string, attrs intmarker.Attributes) bool {
+	for name, prior := range intmarker.Decode(beforeSQL) {
+		if strings.EqualFold(name, col) {
+			return prior.Bits == attrs.Bits && prior.Unsigned == attrs.Unsigned
+		}
+	}
+	return false
+}
+
+// checkAutoIncWidthCeilings rejects the DDL when it declares a table's
+// explicitly declared AUTO_INCREMENT column (autoIncMarkedColumn) with a width
+// that cannot hold
+// the ids the table already contains. It runs inside the validation
+// transaction, so it sees the NEW schema (this DDL's own effect) against the
+// OLD rows the DDL has not touched, and is always rolled back with the rest
+// of validation.
+//
+// A DDL that leaves the column's declared width as it was is not checked.
+// The check exists to refuse declaring a width the data does not fit; a
+// table whose ids already exceed a width it was declared with earlier - one
+// filled with wide ids before narrow allocation existed - would otherwise
+// refuse every later DDL, including the ones that repair it. Such a table
+// keeps working: the allocator issues ids at or below the width, which can
+// never meet the wider ones, and its base is seeded from the ids the width
+// can hold (autoIncSeedFloor). before is sqlite_master's CREATE text per
+// table ahead of this DDL.
+func checkAutoIncWidthCeilings(ctx context.Context, tx *sql.Tx, before map[string]string, tables []string) error {
 	for _, table := range tables {
 		col, attrs, ok, err := autoIncMarkedColumn(tx, table)
 		if err != nil {
 			return fmt.Errorf("derive auto-increment column for %s: %w", table, err)
 		}
-		if !ok {
+		if !ok || widthUnchanged(before[table], col, attrs) {
 			continue
 		}
 

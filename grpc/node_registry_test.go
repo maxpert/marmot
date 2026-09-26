@@ -1211,3 +1211,41 @@ func TestLeavingThenCrashesSuspect(t *testing.T) {
 		t.Errorf("LEAVING -> SUSPECT should be valid via escalation, got %v", node.Status)
 	}
 }
+
+// TestNodeRegistry_DiscoveringAnAliveNodeConnectsToIt pins R3c-14 (reviewer
+// A's F-L1): the ALIVE callback, which opens this node's connection to a
+// peer, fires when gossip first tells us of a peer that is already ALIVE, not
+// only when a known peer turns ALIVE. A wiped node that learned of its
+// restarted seed as ALIVE, from another member, never saw that seed change
+// status again, so it never connected to it and stayed held.
+//
+// Mutation: drop the callback from Update's discovery branch. "a peer
+// discovered ALIVE was never connected" fires, and so does the re-gossip
+// row: the same state again is not a transition either.
+func TestNodeRegistry_DiscoveringAnAliveNodeConnectsToIt(t *testing.T) {
+	nr := NewNodeRegistry(3, "localhost:8083")
+	var connected []uint64
+	nr.SetOnNodeAlive(func(node *NodeState) { connected = append(connected, node.NodeId) })
+
+	nr.Update(&NodeState{NodeId: 1, Address: "localhost:8081", Status: NodeStatus_ALIVE, Incarnation: 1})
+	if len(connected) != 1 || connected[0] != 1 {
+		t.Fatalf("a peer discovered ALIVE was never connected: callbacks for %v", connected)
+	}
+
+	// The restarted seed announces the same state; no second callback is
+	// needed, the connection the first opened reconnects on its own.
+	nr.Update(&NodeState{NodeId: 1, Address: "localhost:8081", Status: NodeStatus_ALIVE, Incarnation: 1})
+	if len(connected) != 1 {
+		t.Fatalf("an unchanged ALIVE peer fired the callback again: %v", connected)
+	}
+
+	// A peer discovered in any other state is connected when it turns ALIVE.
+	nr.Update(&NodeState{NodeId: 2, Address: "localhost:8082", Status: NodeStatus_SUSPECT, Incarnation: 1})
+	if len(connected) != 1 {
+		t.Fatalf("a peer discovered SUSPECT fired the ALIVE callback: %v", connected)
+	}
+	nr.Update(&NodeState{NodeId: 2, Address: "localhost:8082", Status: NodeStatus_ALIVE, Incarnation: 2})
+	if len(connected) != 2 || connected[1] != 2 {
+		t.Fatalf("a peer that turned ALIVE was never connected: %v", connected)
+	}
+}

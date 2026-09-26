@@ -7,6 +7,7 @@ import (
 	"math"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/maxpert/marmot/common"
@@ -56,14 +57,80 @@ const AutoIncClaimTable = common.AutoIncClaimTableName
 // addressed only by (db, tbl) and a rowid would be dead weight. The
 // composite primary key is what lets one system-database table serve every
 // user database at once.
+//
+// A row keeps three floors apart, because they differ in what a COMMIT may
+// be refused for (ApplyClaims):
+//   - committed: the end of the last range this node applied. Only
+//     ApplyClaims advances it, and the per-node disjointness of ACKed ranges
+//     rests on it alone.
+//   - seed: ids this node's own rows hold - the DDL-time and restore-time
+//     MAX(id) seeds, the PREPARE-time backfill, and a rename's inheritance.
+//   - merged: bases peers reported - the vote-hold merge, the membership
+//     backstop, the sync command and a snapshot restore.
+//
+// A table's base, the value PREPARE votes against and every reader reports,
+// is the largest of the three (autoIncBaseExpr). The column order is the one
+// migrateAutoIncClaimTable leaves a table from before the split in.
 var autoIncClaimDDL = `CREATE TABLE IF NOT EXISTS ` + AutoIncClaimTable + ` (
 	db         TEXT    NOT NULL,
 	tbl        TEXT    NOT NULL,
-	base       INTEGER NOT NULL,
+	committed  INTEGER NOT NULL,
 	owner      INTEGER NOT NULL,
 	granted_at INTEGER NOT NULL,
+	seed       INTEGER NOT NULL DEFAULT 0,
+	merged     INTEGER NOT NULL DEFAULT 0,
 	PRIMARY KEY (db, tbl)
 ) WITHOUT ROWID`
+
+// autoIncBaseExpr is a claim row's base: the largest of its three floors.
+const autoIncBaseExpr = "MAX(committed, seed, merged)"
+
+// claimTableQuerier is what inspecting and migrating the claim table needs.
+// *sql.DB and *sql.Tx both satisfy it.
+type claimTableQuerier interface {
+	Exec(query string, args ...interface{}) (sql.Result, error)
+	QueryRow(query string, args ...interface{}) *sql.Row
+}
+
+// autoIncClaimTableIsPreSplit reports whether the claim table in schema
+// ("main", or an attached database's name) still has the single base column
+// of a binary from before the split into committed, seed and merged.
+func autoIncClaimTableIsPreSplit(q claimTableQuerier, schema string) (bool, error) {
+	var n int
+	if err := q.QueryRow("SELECT COUNT(*) FROM pragma_table_info(?, ?) WHERE name = 'base'",
+		AutoIncClaimTable, schema).Scan(&n); err != nil {
+		return false, fmt.Errorf("inspect %s.%s: %w", schema, AutoIncClaimTable, err)
+	}
+	return n > 0, nil
+}
+
+// migrateAutoIncClaimTable splits a claim table from before the split: the
+// base column becomes committed, and seed and merged start at that base.
+//
+// A pre-split base B was the largest of everything the three floors now keep
+// apart, so B bounds each of them, and giving all three B keeps every check
+// this node made before the upgrade exactly as strict: committed = B still
+// covers every range the node applied, which is all the disjointness argument
+// needs of it. The caller runs it inside the transaction that opens the
+// table, so no crash leaves a half-migrated table. A split table is left as
+// it is.
+func migrateAutoIncClaimTable(q claimTableQuerier) error {
+	preSplit, err := autoIncClaimTableIsPreSplit(q, "main")
+	if err != nil || !preSplit {
+		return err
+	}
+	for _, stmt := range []string{
+		"ALTER TABLE " + AutoIncClaimTable + " RENAME COLUMN base TO committed",
+		"ALTER TABLE " + AutoIncClaimTable + " ADD COLUMN seed INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE " + AutoIncClaimTable + " ADD COLUMN merged INTEGER NOT NULL DEFAULT 0",
+		"UPDATE " + AutoIncClaimTable + " SET seed = committed, merged = committed",
+	} {
+		if _, err := q.Exec(stmt); err != nil {
+			return fmt.Errorf("split %s: %w", AutoIncClaimTable, err)
+		}
+	}
+	return nil
+}
 
 // AutoIncClaim is the payload a claim statement carries in its intent's
 // DataSnapshot. It is defined in protocol (protocol/autoinc_claim.go), which
@@ -75,25 +142,23 @@ type AutoIncClaim = protocol.AutoIncClaim
 // ErrAutoIncBaseAbsent reports that a table has no claim row.
 //
 // It is an error and never a zero, and the distinction is the protocol's whole
-// safety argument. The natural implementation is "absent means 0 means yes",
+// safety argument (the PREPARE handler backfills from the table itself rather
+// than read absence as 0, see backfillAutoIncBase). The natural implementation is "absent means 0 means yes",
 // and an engineer will write that unless told not to: a cache that defaults to
 // 0 and accepts is precisely the thing that cannot cast the rejection that
 // would repair it.
 var ErrAutoIncBaseAbsent = errors.New("no auto-increment claim row for table")
 
-// ErrAutoIncClaimNotApplicable reports a COMMIT whose claim this node cannot
-// apply: the claim intent written at PREPARE is gone, or the stored base has
-// moved past the claim's newBase since PREPARE. Either way this node did not
-// hold the claim continuously from its vote to its commit, and ACKing would
-// let it count toward a quorum for a range it may also have granted to
-// another claimant.
-var ErrAutoIncClaimNotApplicable = errors.New("auto-increment claim cannot be applied")
+// ErrAutoIncClaimNotApplicable is protocol.ErrAutoIncClaimNotApplicable,
+// which ApplyClaims returns for a COMMIT whose claim this node cannot apply.
+var ErrAutoIncClaimNotApplicable = protocol.ErrAutoIncClaimNotApplicable
 
 // AutoIncClaimStore is the node's AUTO_INCREMENT base store: one row per
 // (database, table). The receiver is ALWAYS the SYSTEM database, never a user
 // database, and every method therefore names its database explicitly.
 type AutoIncClaimStore struct {
-	sys *ReplicatedDatabase
+	sys         *ReplicatedDatabase
+	incarnation atomic.Pointer[AutoIncIncarnationListener]
 }
 
 // NewAutoIncClaimStore wraps the system database as a claim store. sys must
@@ -102,7 +167,8 @@ func NewAutoIncClaimStore(sys *ReplicatedDatabase) *AutoIncClaimStore {
 	return &AutoIncClaimStore{sys: sys}
 }
 
-// ReadBase returns a table's committed base.
+// ReadBase returns a table's base: the largest of its committed, seed and
+// merged floors, which is what PREPARE votes against.
 //
 // It reads through the READ pool, not the write handle: writeDB is capped at a
 // single connection, so reading a base through it would put every claim behind
@@ -115,7 +181,7 @@ func NewAutoIncClaimStore(sys *ReplicatedDatabase) *AutoIncClaimStore {
 func (s *AutoIncClaimStore) ReadBase(database, table string) (uint64, error) {
 	var base int64
 	err := s.sys.GetReadDB().QueryRow(
-		"SELECT base FROM "+AutoIncClaimTable+" WHERE db = ? AND tbl = ?", database, table).Scan(&base)
+		"SELECT "+autoIncBaseExpr+" FROM "+AutoIncClaimTable+" WHERE db = ? AND tbl = ?", database, table).Scan(&base)
 	switch {
 	case err == sql.ErrNoRows:
 		return 0, ErrAutoIncBaseAbsent
@@ -128,7 +194,10 @@ func (s *AutoIncClaimStore) ReadBase(database, table string) (uint64, error) {
 	return uint64(base), nil
 }
 
-// Seed creates or RAISES a table's base at DDL time. Never lowers.
+// Seed creates or RAISES a table's seed floor to floor, the largest id this
+// node's own rows hold for it (or the declared floor). Never lowers. It runs
+// at DDL time, when a restored database is reattached, and when PREPARE
+// backfills an absent row.
 //
 // Tagging an existing table holding ids 1..1000 with an absent row would leave
 // the base at 0, so the first range would be [0,R) and the allocator would
@@ -144,8 +213,8 @@ func (s *AutoIncClaimStore) Seed(database, table string, floor, owner uint64) er
 		return fmt.Errorf("create %s: %w", AutoIncClaimTable, err)
 	}
 	_, err := writeDB.Exec(
-		"INSERT INTO "+AutoIncClaimTable+" (db, tbl, base, owner, granted_at) VALUES (?, ?, ?, ?, ?) "+
-			"ON CONFLICT(db, tbl) DO UPDATE SET base = MAX(base, excluded.base), owner = excluded.owner, granted_at = excluded.granted_at",
+		"INSERT INTO "+AutoIncClaimTable+" (db, tbl, committed, seed, merged, owner, granted_at) VALUES (?, ?, 0, ?, 0, ?, ?) "+
+			"ON CONFLICT(db, tbl) DO UPDATE SET seed = MAX(seed, excluded.seed), owner = excluded.owner, granted_at = excluded.granted_at",
 		database, table, int64(floor), int64(owner), time.Now().UnixNano())
 	if err != nil {
 		return fmt.Errorf("seed auto-increment base for %s.%s: %w", database, table, err)
@@ -153,20 +222,116 @@ func (s *AutoIncClaimStore) Seed(database, table string, floor, owner uint64) er
 	return nil
 }
 
-// RaiseAutoIncBasesFrom raises every claim base in the system database file at
-// incomingPath to at least the base the system database file at localPath
-// holds for the same (database, table), and copies in any row only localPath
-// has. It is run on a peer's system database before a restore installs it in
-// place of this node's own.
+// Inherit raises table's seed floor to at least the base of every table in
+// from, creating its row if needed, and keeps the rows of from. It runs when
+// one DDL statement created table while removing the tables in from (a
+// RENAME): table may now hold their rows, and so ids granted under their
+// names. Every range granted under a name ends at or below that name's base
+// on a majority, so after Inherit every later grant for table lies above
+// every id table can hold. Never lowers, and never deletes a row: a base is
+// monotone per (database, table) name for the life of the cluster.
+//
+// It raises the seed floor, not the merged one: the rows came into this
+// node's own table inside the DDL, exactly as the MAX(id) seed that runs
+// after it records, so a claim on table PREPARED before the rename and
+// committed after it is refused like one a DDL seed overtook.
+func (s *AutoIncClaimStore) Inherit(database, table string, from []string, owner uint64) (err error) {
+	tx, err := s.sys.GetWriteDB().Begin()
+	if err != nil {
+		return fmt.Errorf("begin auto-increment base inheritance for %s.%s: %w", database, table, err)
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	now := time.Now().UnixNano()
+	for _, f := range from {
+		if _, err = tx.Exec("INSERT INTO "+AutoIncClaimTable+" (db, tbl, committed, seed, merged, owner, granted_at) "+
+			"SELECT db, ?, 0, "+autoIncBaseExpr+", 0, ?, ? FROM "+AutoIncClaimTable+" WHERE db = ? AND tbl = ? "+
+			"ON CONFLICT(db, tbl) DO UPDATE SET seed = excluded.seed, owner = excluded.owner, granted_at = excluded.granted_at "+
+			"WHERE excluded.seed > seed",
+			table, int64(owner), now, database, f); err != nil {
+			return fmt.Errorf("raise auto-increment base of %s.%s to %s's: %w", database, table, f, err)
+		}
+	}
+	if err = tx.Commit(); err != nil {
+		return fmt.Errorf("commit auto-increment base inheritance for %s.%s: %w", database, table, err)
+	}
+	return nil
+}
+
+// AutoIncIncarnationListener learns of every table incarnation a DDL
+// statement ends on this node, before the new definitions become visible to
+// queries: a table dropped, created, renamed from or to a name, or redefined
+// (TableIncarnationEnded), and every table of a dropped database
+// (DatabaseIncarnationEnded). The node's narrow allocator discards its
+// in-memory ranges for them. Such a range was granted for the old
+// incarnation; it is disjoint from every later grant under the same name,
+// but the rows of a new incarnation may come from grants under another name
+// (RENAME).
+type AutoIncIncarnationListener interface {
+	TableIncarnationEnded(database, table string)
+	DatabaseIncarnationEnded(database string)
+}
+
+// SetIncarnationListener registers l (AutoIncIncarnationListener).
+func (s *AutoIncClaimStore) SetIncarnationListener(l AutoIncIncarnationListener) {
+	s.incarnation.Store(&l)
+}
+
+// tableIncarnationEnded reports table to the registered listener, if any.
+func (s *AutoIncClaimStore) tableIncarnationEnded(database, table string) {
+	if l := s.incarnation.Load(); l != nil {
+		(*l).TableIncarnationEnded(database, table)
+	}
+}
+
+// databaseIncarnationEnded reports database to the registered listener, if
+// any.
+func (s *AutoIncClaimStore) databaseIncarnationEnded(database string) {
+	if l := s.incarnation.Load(); l != nil {
+		(*l).DatabaseIncarnationEnded(database)
+	}
+}
+
+// RaiseAutoIncBasesFrom prepares the peer's system database file at
+// incomingPath to become this node's: it keeps every floor the system
+// database file at localPath holds for the same (database, table), and copies
+// in any row only localPath has. It is run on a peer's system database before
+// a restore installs it in place of this node's own.
 //
 // A restore must never lower a base this node committed. The peer may have
 // missed a claim this node was in the majority for; installing the peer's
 // lower base would let this node accept that range again, and majority
-// intersection - the protocol's whole safety argument - would be gone. A
-// missing localPath (a node with no prior state) leaves incomingPath as it is.
+// intersection - the protocol's whole safety argument - would be gone.
+//
+// Where each floor lands (see autoIncClaimDDL):
+//   - the peer's committed and merged floors become merged: they record
+//     ranges other nodes applied, which is what a merge carries, and a merge
+//     never refuses a COMMIT;
+//   - the peer's seed stays seed: it counts ids the peer's rows hold, and the
+//     snapshot this file travels with makes those rows this node's own;
+//   - this node's own committed, seed and merged floors are kept, each as the
+//     larger of the two, so committed stays exactly this node's.
+//
+// A peer file from before the split holds one base B, which cannot be taken
+// apart, so B becomes all three floors (migrateAutoIncClaimTable) and only its
+// committed moves to merged: B, the peer's committed included, stays in seed.
+// That is the conservative choice, and it costs liveness only: during a rolling
+// upgrade, a claim this node holds PREPAREd across such a restore can have its
+// COMMIT refused until the pending-transaction GC.
+//
+// The vote hold (AutoIncHoldTable) is this node's, never the peer's: the
+// incoming file keeps the local file's hold. A missing localPath - a node with
+// no claim history of its own, which may nonetheless have ACKed claims before
+// it lost its data - adds nothing to the peer's floors and HOLDS this node's
+// votes until it has merged bases from a majority.
 func RaiseAutoIncBasesFrom(incomingPath, localPath string) (err error) {
+	hasLocal := true
 	if _, statErr := os.Stat(localPath); errors.Is(statErr, os.ErrNotExist) {
-		return nil
+		hasLocal = false
 	} else if statErr != nil {
 		return fmt.Errorf("stat local system database: %w", statErr)
 	}
@@ -187,10 +352,20 @@ func RaiseAutoIncBasesFrom(incomingPath, localPath string) (err error) {
 	// ATTACH is per connection, so every statement below must run on one.
 	conn.SetMaxOpenConns(1)
 
-	// A peer running a binary older than the claim table ships a system
-	// database without it; the local rows still have to land.
-	if _, err := conn.Exec(autoIncClaimDDL); err != nil {
-		return fmt.Errorf("create %s in incoming system database: %w", AutoIncClaimTable, err)
+	if err := adoptPeerClaimTable(conn); err != nil {
+		return err
+	}
+	if _, err := conn.Exec(autoIncHoldDDL); err != nil {
+		return fmt.Errorf("create %s in incoming system database: %w", AutoIncHoldTable, err)
+	}
+	if _, err := conn.Exec("DELETE FROM main." + AutoIncHoldTable); err != nil {
+		return fmt.Errorf("clear the peer's vote hold: %w", err)
+	}
+	if !hasLocal {
+		if _, err := conn.Exec(holdVotesSQL, time.Now().UnixNano()); err != nil {
+			return fmt.Errorf("hold auto-increment votes: %w", err)
+		}
+		return nil
 	}
 	if _, err := conn.Exec("ATTACH DATABASE ? AS local", localPath); err != nil {
 		return fmt.Errorf("attach local system database: %w", err)
@@ -200,14 +375,35 @@ func RaiseAutoIncBasesFrom(incomingPath, localPath string) (err error) {
 		AutoIncClaimTable).Scan(&localHasTable); err != nil {
 		return fmt.Errorf("inspect local system database: %w", err)
 	}
+	var localHasHold int
+	if err := conn.QueryRow("SELECT COUNT(*) FROM local.sqlite_master WHERE type = 'table' AND name = ?",
+		AutoIncHoldTable).Scan(&localHasHold); err != nil {
+		return fmt.Errorf("inspect local system database: %w", err)
+	}
+	if localHasHold > 0 {
+		if _, err := conn.Exec("INSERT INTO main." + AutoIncHoldTable + " (id, since) SELECT id, since FROM local." + AutoIncHoldTable); err != nil {
+			return fmt.Errorf("keep this node's vote hold: %w", err)
+		}
+	}
 	if localHasTable > 0 {
+		// The local file is only read: a binary from before the split wrote
+		// one base, which bounds all three floors (migrateAutoIncClaimTable).
+		localPreSplit, err := autoIncClaimTableIsPreSplit(conn, "local")
+		if err != nil {
+			return err
+		}
+		floors := "committed, seed, merged"
+		if localPreSplit {
+			floors = "base, base, base"
+		}
 		// "WHERE true" disambiguates the upsert's ON CONFLICT from a join
 		// constraint, as SQLite requires for INSERT ... SELECT.
-		if _, err := conn.Exec("INSERT INTO main." + AutoIncClaimTable + " (db, tbl, base, owner, granted_at) " +
-			"SELECT db, tbl, base, owner, granted_at FROM local." + AutoIncClaimTable + " WHERE true " +
-			"ON CONFLICT(db, tbl) DO UPDATE SET base = excluded.base, owner = excluded.owner, granted_at = excluded.granted_at " +
-			"WHERE excluded.base > base"); err != nil {
-			return fmt.Errorf("raise incoming auto-increment bases: %w", err)
+		if _, err := conn.Exec("INSERT INTO main." + AutoIncClaimTable + " (db, tbl, committed, seed, merged, owner, granted_at) " +
+			"SELECT db, tbl, " + floors + ", owner, granted_at FROM local." + AutoIncClaimTable + " WHERE true " +
+			"ON CONFLICT(db, tbl) DO UPDATE SET committed = MAX(committed, excluded.committed), " +
+			"seed = MAX(seed, excluded.seed), merged = MAX(merged, excluded.merged), " +
+			"owner = excluded.owner, granted_at = excluded.granted_at"); err != nil {
+			return fmt.Errorf("keep this node's auto-increment floors: %w", err)
 		}
 	}
 	if _, err := conn.Exec("DETACH DATABASE local"); err != nil {
@@ -216,6 +412,37 @@ func RaiseAutoIncBasesFrom(incomingPath, localPath string) (err error) {
 	// The restorer moves only the main database file into place. Closing the
 	// last connection checkpoints the write-ahead log into it; a failed close
 	// is returned by the deferred Close above.
+	return nil
+}
+
+// adoptPeerClaimTable readies the claim table of the peer's system database
+// on conn to become this node's, in one transaction: it creates the table if
+// the peer's binary predates it (the local rows still have to land), splits a
+// table from before the split, and moves the peer's committed floor into
+// merged. A pre-split table's base also stays in seed, as the split gives it
+// to all three floors (RaiseAutoIncBasesFrom).
+func adoptPeerClaimTable(conn *sql.DB) (err error) {
+	tx, err := conn.Begin()
+	if err != nil {
+		return fmt.Errorf("begin adopting the peer's %s: %w", AutoIncClaimTable, err)
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+	if _, err = tx.Exec(autoIncClaimDDL); err != nil {
+		return fmt.Errorf("create %s in incoming system database: %w", AutoIncClaimTable, err)
+	}
+	if err = migrateAutoIncClaimTable(tx); err != nil {
+		return err
+	}
+	if _, err = tx.Exec("UPDATE " + AutoIncClaimTable + " SET merged = MAX(committed, merged), committed = 0"); err != nil {
+		return fmt.Errorf("record the peer's committed floors as merged: %w", err)
+	}
+	if err = tx.Commit(); err != nil {
+		return fmt.Errorf("commit adopting the peer's %s: %w", AutoIncClaimTable, err)
+	}
 	return nil
 }
 
@@ -256,7 +483,7 @@ func (mdb *ReplicatedDatabase) AutoIncWidthMax(table string) (uint64, error) {
 	return 0, fmt.Errorf("table %s auto-increment column %s is absent from its schema", table, autoIncCol)
 }
 
-// ApplyClaims writes the committed base for every AUTO_INCREMENT range claim
+// ApplyClaims writes the committed floor for every AUTO_INCREMENT range claim
 // prepared under txnID against database. It is called by the COMMIT handler,
 // on the user-database path, only for a COMMIT that carries the claim flag,
 // and before the transaction is committed.
@@ -265,24 +492,47 @@ func (mdb *ReplicatedDatabase) AutoIncWidthMax(table string) (uint64, error) {
 // being read is against the user database, even though the write this method
 // performs lands in the system database.
 //
-// The stored base becomes newBase + size. The claimant owns
-// newBase+1 .. newBase+size, so newBase+size is both the
-// last id handed out and the prevBase the next claimant proposes. That sum is
-// the quantity the protocol advances monotonically.
+// The committed floor becomes newBase + size (autoIncClaimDDL). The claimant
+// owns newBase+1 .. newBase+size, so newBase+size is both the last id handed
+// out and the prevBase the next claimant proposes.
 //
-// The write is conditional on the stored base still being at or below the
-// claim's newBase, where its range starts, and ApplyClaims fails with ErrAutoIncClaimNotApplicable
-// when it is not, or when the transaction holds no claim intent at all. This
-// is what makes a node's COMMIT ACKs safe without trusting the claim key's
-// row lock to have survived from PREPARE to COMMIT: the system database has
-// one writer, so the conditional writes a node applies are serialised, and
-// each applies only if no range it already committed reaches past the new
-// claim's newBase. The condition is on newBase rather than prevBase so that it
-// holds on its own, not only because PREPARE admitted newBase == prevBase. The ranges one node ACKs are therefore pairwise disjoint,
-// and two overlapping ranges cannot both gather a commit majority, because
-// any two majorities share a node. The same condition keeps a base that a DDL
-// seed raised between PREPARE and COMMIT from being lowered, and refuses a
-// range that would sit below that raised floor.
+// The write is conditional on the committed and seed floors both being at or
+// below the claim's newBase, where its range starts, and ApplyClaims fails
+// with ErrAutoIncClaimNotApplicable when either is not, or when the
+// transaction holds no claim intent at all. The merged floor is not tested.
+//
+// Why the ranges one node ACKs are pairwise disjoint, from committed alone:
+//  1. After the row is created (committed 0, or a pre-split base on upgrade),
+//     only this method writes committed, and a restore keeps this node's own
+//     committed (RaiseAutoIncBasesFrom). The write happens only where
+//     committed <= newBase and sets newBase+size > newBase, since size > 0:
+//     committed never decreases.
+//  2. So once this node applied (n, n+s], committed >= n+s from then on.
+//  3. The system database has one writer, so applies are serialised. A later
+//     apply of (n', n'+s'] needs committed <= n' at that moment, so
+//     n' >= n+s: it starts at or above the end of every earlier range.
+//  4. Two overlapping ranges can therefore not both gather a commit majority:
+//     any two majorities share a node, and it would have applied both.
+//
+// That argument does not trust the claim key's row lock to have survived from
+// PREPARE to COMMIT. The one way it does not - a stale-transaction abort
+// racing a COMMIT that already read its intent - lives inside one call of
+// this method, during which committed can only rise. While the lock does hold
+// (a pending holder is never overwritten, and it persists across a restart),
+// nothing else is applied for the table between this claim's PREPARE and its
+// COMMIT, and PREPARE voted against the largest of all three floors.
+//
+// A merged floor is left out because it records ranges other nodes applied.
+// A peer that committed this same claim first reports exactly newBase+size,
+// so testing it would refuse the claim this node voted for; and a range
+// overlapping this claim that another majority committed is excluded by 4.
+// Merged does its work at PREPARE: a node that lost its claim state votes
+// again only after its merged floor covers every claim it may have ACKed
+// before (grpc autoIncMergeSafe), so every PREPARE it answers sees them.
+//
+// The seed floor counts ids this node's own rows hold. A seed raised between
+// PREPARE and COMMIT - a DDL, a rename's inheritance, a reattach after
+// restore - refuses a range that would sit below ids now in the table.
 //
 // Every claim in the transaction lands in ONE SQLite transaction against the
 // system database. A partially applied set would leave this node holding a
@@ -296,9 +546,9 @@ func (mdb *ReplicatedDatabase) AutoIncWidthMax(table string) (uint64, error) {
 // rather than from the payload, so a claimant cannot misattribute a range to
 // another node.
 //
-// The row is updated in place and never deleted: an absent row is a hard rejection at PREPARE, so any code that
-// removed rows would create a window in which a live table re-mints ids it has
-// already used.
+// The row is updated in place and never deleted, by this or any DDL: a base
+// is monotone per (database, table) name for the life of the cluster, and a
+// removed row would let a name be granted a range it was granted before.
 func (s *AutoIncClaimStore) ApplyClaims(database string, txnID uint64, meta MetaStore) error {
 	intents, err := meta.GetIntentsByTxn(txnID)
 	if err != nil {
@@ -330,8 +580,9 @@ func (s *AutoIncClaimStore) ApplyClaims(database string, txnID uint64, meta Meta
 	return nil
 }
 
-// applyClaimTx applies one claim intent inside tx, conditional on the stored
-// base not having passed the claim's newBase (see ApplyClaims).
+// applyClaimTx applies one claim intent inside tx, conditional on neither the
+// committed nor the seed floor having passed the claim's newBase (see
+// ApplyClaims).
 func applyClaimTx(tx *sql.Tx, database string, intent *WriteIntentRecord) error {
 	claim, err := protocol.DecodeAutoIncClaim(intent.DataSnapshot)
 	if err != nil {
@@ -346,8 +597,10 @@ func applyClaimTx(tx *sql.Tx, database string, intent *WriteIntentRecord) error 
 			claim.Table, claim.Size, claim.NewBase)
 	}
 	res, err := tx.Exec(
-		"UPDATE "+AutoIncClaimTable+" SET base = ?, owner = ?, granted_at = ? WHERE db = ? AND tbl = ? AND base <= ?",
-		int64(claim.NewBase+claim.Size), int64(intent.NodeID), intent.TSWall, database, claim.Table, int64(claim.NewBase))
+		"UPDATE "+AutoIncClaimTable+" SET committed = ?, owner = ?, granted_at = ? "+
+			"WHERE db = ? AND tbl = ? AND committed <= ? AND seed <= ?",
+		int64(claim.NewBase+claim.Size), int64(intent.NodeID), intent.TSWall, database, claim.Table,
+		int64(claim.NewBase), int64(claim.NewBase))
 	if err != nil {
 		return fmt.Errorf("write auto-increment base for %s.%s: %w", database, claim.Table, err)
 	}
@@ -356,7 +609,7 @@ func applyClaimTx(tx *sql.Tx, database string, intent *WriteIntentRecord) error 
 		return fmt.Errorf("write auto-increment base for %s.%s: %w", database, claim.Table, err)
 	}
 	if n != 1 {
-		return fmt.Errorf("%w: the stored base for %s.%s is absent or has passed the claim's newBase %d",
+		return fmt.Errorf("%w: the claim row for %s.%s is absent or its committed or seed floor has passed the claim's newBase %d",
 			ErrAutoIncClaimNotApplicable, database, claim.Table, claim.NewBase)
 	}
 	return nil

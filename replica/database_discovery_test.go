@@ -114,6 +114,22 @@ func (m *mockMarmotServiceClient) ForwardLoadData(ctx context.Context, req *marm
 	return args.Get(0).(*marmotgrpc.ForwardQueryResponse), args.Error(1)
 }
 
+func (m *mockMarmotServiceClient) GetAutoIncBases(ctx context.Context, req *marmotgrpc.AutoIncBasesRequest, opts ...grpc.CallOption) (*marmotgrpc.AutoIncBasesResponse, error) {
+	args := m.Called(ctx, req)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*marmotgrpc.AutoIncBasesResponse), args.Error(1)
+}
+
+func (m *mockMarmotServiceClient) SyncAutoIncBases(ctx context.Context, req *marmotgrpc.AutoIncSyncRequest, opts ...grpc.CallOption) (*marmotgrpc.AutoIncSyncResponse, error) {
+	args := m.Called(ctx, req)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*marmotgrpc.AutoIncSyncResponse), args.Error(1)
+}
+
 func (m *mockMarmotServiceClient) GetLoadDataChunk(ctx context.Context, req *marmotgrpc.LoadDataChunkRequest, opts ...grpc.CallOption) (*marmotgrpc.LoadDataChunkResponse, error) {
 	args := m.Called(ctx, req)
 	if args.Get(0) == nil {

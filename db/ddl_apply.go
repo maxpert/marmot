@@ -9,26 +9,16 @@ import (
 )
 
 // ApplyDDLSQLInTx rewrites DDL for idempotent replay and executes it in the
-// provided transaction.
+// provided transaction. It is for a read-only replica, which issues no
+// AUTO_INCREMENT ids; a cluster node replays DDL through
+// ReplicatedDatabase.ApplyReplayedDDL, which also records the change to its
+// tables (SchemaChange).
 func ApplyDDLSQLInTx(ctx context.Context, tx *sql.Tx, ddlSQL string) error {
 	if tx == nil {
 		return fmt.Errorf("transaction is nil")
 	}
 	idempotentSQL := protocol.RewriteDDLForIdempotency(ddlSQL)
 	if _, err := tx.ExecContext(ctx, idempotentSQL); err != nil {
-		return err
-	}
-	return nil
-}
-
-// ApplyDDLSQL rewrites DDL for idempotent replay and executes it directly
-// against a DB connection.
-func ApplyDDLSQL(dbConn *sql.DB, ddlSQL string) error {
-	if dbConn == nil {
-		return fmt.Errorf("database handle is nil")
-	}
-	idempotentSQL := protocol.RewriteDDLForIdempotency(ddlSQL)
-	if _, err := dbConn.ExecContext(context.Background(), idempotentSQL); err != nil {
 		return err
 	}
 	return nil

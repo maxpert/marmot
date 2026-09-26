@@ -121,7 +121,7 @@ func TestSeedAutoIncBaseOnlyRaises(t *testing.T) {
 	// A later seed with a LOWER floor must not lower the base: re-applying a
 	// replicated DDL on a node that has since committed claims would otherwise
 	// wind the base backwards and remint over ids already handed out.
-	// Mutation: use excluded.base instead of MAX(base, excluded.base).
+	// Mutation: use excluded.seed instead of MAX(seed, excluded.seed).
 	if err := store.Seed("testdb", "users", 5, 1); err != nil {
 		t.Fatalf("Seed (lower): %v", err)
 	}
@@ -168,23 +168,25 @@ func TestClaimTableIsCDCSkipped(t *testing.T) {
 	}
 
 	entries := captureEntries(t, source, 7001,
-		"INSERT INTO "+AutoIncClaimTable+" (db, tbl, base, owner, granted_at) VALUES ('testdb', 'users', 64, 1, 0)")
+		"INSERT INTO "+AutoIncClaimTable+" (db, tbl, committed, owner, granted_at) VALUES ('testdb', 'users', 64, 1, 0)")
 	if len(entries) != 0 {
 		t.Errorf("writing the claim table produced %d CDC entries, want 0", len(entries))
 	}
 }
 
-// TestDropDatabaseRemovesItsClaimRowsAndLeavesOthersIntact pins the DROP
-// DATABASE side of the relocation: removing a database must take its claim
-// rows with it (db/database_manager.go DropDatabase), but must not touch
-// another database's rows in the same shared system-database table. This is
-// the opposite of DROP TABLE (TestDroppedTableKeepsItsClaimRow,
-// db/autoinc_commit_test.go), which deliberately leaves the row behind.
+// TestDropDatabaseKeepsItsClaimRows pins that a claim base is monotone per
+// (database, table) name for the life of the cluster: DROP DATABASE keeps its
+// claim rows exactly as DROP TABLE does (TestDroppedTableKeepsItsClaimRow,
+// db/autoinc_commit_test.go), and recreating the database and its table
+// cannot lower them. A lowered base would grant a range some node still holds
+// in memory from before the drop.
 //
-// Mutation: scope the DELETE without a WHERE db = ? clause, or drop it
-// entirely. Either the row survives its own database's removal, or a
-// surviving database's row is deleted too, and the assertions below fire.
-func TestDropDatabaseRemovesItsClaimRowsAndLeavesOthersIntact(t *testing.T) {
+// The drop also ends the in-memory ranges of the database's tables on this
+// node.
+//
+// Mutation: delete the database's claim rows in DropDatabase. The rows are
+// gone and "DROP DATABASE deleted its claim row" fires.
+func TestDropDatabaseKeepsItsClaimRows(t *testing.T) {
 	_, dm, cleanup := setupTestReplicationEngine(t)
 	defer cleanup()
 
@@ -195,17 +197,23 @@ func TestDropDatabaseRemovesItsClaimRowsAndLeavesOthersIntact(t *testing.T) {
 	require.NoError(t, store.Seed("dropme", "users", 1000, 1))
 	require.NoError(t, store.Seed("keepme", "users", 2000, 1))
 
+	rec := &incarnationRecorder{}
+	dm.SetAutoIncIncarnationListener(rec)
 	require.NoError(t, dm.DropDatabase("dropme"))
+	require.Equal(t, []string{"dropme"}, rec.databases, "DROP DATABASE did not end its tables' incarnations")
+	base, err := store.ReadBase("dropme", "users")
+	require.NoError(t, err, "DROP DATABASE deleted its claim row")
+	require.Equal(t, uint64(1000), base, "DROP DATABASE changed its claim base")
 
-	if _, err := store.ReadBase("dropme", "users"); !errors.Is(err, ErrAutoIncBaseAbsent) {
-		t.Errorf("dropme.users claim row survived DROP DATABASE: ReadBase returned %v, want ErrAutoIncBaseAbsent", err)
-	}
+	require.NoError(t, dm.CreateDatabase("dropme"))
+	require.NoError(t, store.Seed("dropme", "users", 0, 2))
+	base, err = store.ReadBase("dropme", "users")
+	require.NoError(t, err)
+	require.Equal(t, uint64(1000), base, "recreating the database and its table lowered the claim base")
 
-	base, err := store.ReadBase("keepme", "users")
-	require.NoError(t, err, "DROP DATABASE of one database must not disturb another's claim rows")
-	if base != 2000 {
-		t.Errorf("keepme.users base = %d after dropping a different database, want 2000", base)
-	}
+	base, err = store.ReadBase("keepme", "users")
+	require.NoError(t, err)
+	require.Equal(t, uint64(2000), base, "DROP DATABASE of one database changed another's claim base")
 }
 
 // TestSystemDatabaseCommitsAreDurable: a claim COMMIT this node ACKs counts

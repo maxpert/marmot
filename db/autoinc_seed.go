@@ -1,8 +1,10 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
+	"sort"
 
 	"github.com/maxpert/marmot/protocol/query/transform/intmarker"
 )
@@ -44,9 +46,14 @@ func autoIncMarkedColumn(q rowQuerier, table string) (col string, attrs intmarke
 }
 
 // autoIncSeedFloor computes the base floor a table's DDL-declared
-// AUTO_INCREMENT column implies right now: max(MAX(<col>) over the table's
-// existing rows, the marker's own declared floor). ok is false when the table
-// carries no explicitly declared AUTO_INCREMENT marker.
+// AUTO_INCREMENT column implies right now: max(the marker's own declared
+// floor, the largest existing id the column's width can hold). ok is false
+// when the table carries no explicitly declared AUTO_INCREMENT marker.
+//
+// Ids above the width are left out. The allocator can never issue one, so no
+// base has to clear them, and counting them would put the base past the
+// ceiling and make every later insert fail as exhausted - the table the width
+// check exempts (checkAutoIncWidthCeilings) would be unusable instead.
 func autoIncSeedFloor(q rowQuerier, table string) (floor uint64, ok bool, err error) {
 	col, attrs, marked, err := autoIncMarkedColumn(q, table)
 	if err != nil || !marked {
@@ -54,8 +61,8 @@ func autoIncSeedFloor(q rowQuerier, table string) (floor uint64, ok bool, err er
 	}
 
 	var max sql.NullInt64
-	query := fmt.Sprintf("SELECT MAX(%s) FROM %s", quoteIdent(col), quoteIdent(table))
-	if scanErr := q.QueryRow(query).Scan(&max); scanErr != nil {
+	query := fmt.Sprintf("SELECT MAX(%s) FROM %s WHERE %s <= ?", quoteIdent(col), quoteIdent(table), quoteIdent(col))
+	if scanErr := q.QueryRow(query, int64(attrs.WidthMax())).Scan(&max); scanErr != nil {
 		return 0, false, fmt.Errorf("compute existing max for %s.%s: %w", table, col, scanErr)
 	}
 
@@ -69,6 +76,90 @@ func autoIncSeedFloor(q rowQuerier, table string) (floor uint64, ok bool, err er
 	return floor, true, nil
 }
 
+// schemaQuerier is the read surface tableDefinitions needs: *sql.DB,
+// *sql.Conn and *sql.Tx all satisfy it.
+type schemaQuerier interface {
+	QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error)
+}
+
+// tableDefinitions returns every table in q's schema, by name, with the
+// CREATE statement sqlite_master holds for it.
+func tableDefinitions(ctx context.Context, q schemaQuerier) (map[string]string, error) {
+	rows, err := q.QueryContext(ctx, "SELECT name, sql FROM sqlite_master WHERE type = 'table'")
+	if err != nil {
+		return nil, fmt.Errorf("list tables: %w", err)
+	}
+	defer rows.Close()
+
+	defs := make(map[string]string)
+	for rows.Next() {
+		var name string
+		var def sql.NullString
+		if err := rows.Scan(&name, &def); err != nil {
+			return nil, fmt.Errorf("list tables: %w", err)
+		}
+		defs[name] = def.String
+	}
+	return defs, rows.Err()
+}
+
+// endedIncarnations returns, sorted, every table name whose incarnation one DDL
+// statement ended: a table it removed, created or redefined. A redefinition
+// includes re-declaring the AUTO_INCREMENT column's width; any other change
+// to the table's definition ends the incarnation too, which costs the
+// unissued part of a range and nothing else.
+func endedIncarnations(before, after map[string]string) []string {
+	var changed []string
+	for name, def := range before {
+		if newDef, ok := after[name]; !ok || newDef != def {
+			changed = append(changed, name)
+		}
+	}
+	for name := range after {
+		if _, ok := before[name]; !ok {
+			changed = append(changed, name)
+		}
+	}
+	sort.Strings(changed)
+	return changed
+}
+
+// autoIncInheritance names a table that one DDL statement brought into being
+// while it removed others: a RENAME, or any statement with the same effect.
+// The table may hold the removed tables' rows, and with them ids granted
+// under their names, so its claim base must reach theirs (AutoIncClaimStore.Inherit).
+type autoIncInheritance struct {
+	table string
+	from  []string
+	owner uint64
+}
+
+// inheritedTables compares a database's tables before and after one DDL
+// statement. When the statement removed tables, every table it created is
+// treated as having inherited their rows. It is conservative on purpose: a
+// statement that dropped one table and created an unrelated one only raises
+// the new table's base, which burns ids but can never reissue one, while a
+// missed rename could.
+func inheritedTables(before, after map[string]string, owner uint64) []autoIncInheritance {
+	var removed []string
+	for name := range before {
+		if _, ok := after[name]; !ok {
+			removed = append(removed, name)
+		}
+	}
+	if len(removed) == 0 {
+		return nil
+	}
+	sort.Strings(removed)
+	var inherited []autoIncInheritance
+	for name := range after {
+		if _, ok := before[name]; !ok {
+			inherited = append(inherited, autoIncInheritance{table: name, from: removed, owner: owner})
+		}
+	}
+	return inherited
+}
+
 // ddlTableOwner names one table a DDL intent in the current transaction
 // touched, paired with the node that authored that intent. The owner comes
 // from the intent record's own NodeID - identical on every node applying the
@@ -80,13 +171,15 @@ type ddlTableOwner struct {
 	owner uint64
 }
 
-// seedAutoIncBasesForDDL seeds __marmot__autoinc, in the system database, for
-// every table named by a DDL intent in this transaction that carries an
-// explicitly declared AUTO_INCREMENT marker. It is a
-// no-op for a table with no such marker.
+// seedAutoIncBasesForDDL first raises every table in inherited to the bases of
+// the tables it took the place of (AutoIncClaimStore.Inherit), then seeds
+// __marmot__autoinc, in the system database, for every table named by a DDL
+// intent in this transaction that carries an explicitly declared
+// AUTO_INCREMENT marker. Both only ever raise a base. Seeding is a no-op for a
+// table with no such marker.
 //
 // The seed floor is derived from THIS node's own sqlite_master and MAX(id) on
-// the USER database (tm.db), read after the DDL has executed - not by parsing
+// the USER database, read through q after the DDL has executed - not by parsing
 // the DDL statement text - so the same logic uniformly covers CREATE TABLE and
 // every ALTER shape that can leave a marker in sqlite_master. That derivation
 // is unchanged by the claim table's relocation to the system database; only
@@ -97,16 +190,25 @@ type ddlTableOwner struct {
 // backed by the system database (db/autoinc_claim.go). A marked table found
 // with no store wired is a configuration error, not a "nothing to do" case,
 // so it fails fast rather than silently skipping the seed.
-func (tm *TransactionManager) seedAutoIncBasesForDDL(tables []ddlTableOwner) error {
-	seen := make(map[string]bool, len(tables))
+func (tm *TransactionManager) seedAutoIncBasesForDDL(q rowQuerier, inherited []autoIncInheritance, tables []ddlTableOwner) error {
 	claimStore, dbName := tm.autoIncClaimStoreAndDatabaseName()
+	for _, in := range inherited {
+		if claimStore == nil {
+			return fmt.Errorf("inherit auto-increment base for %s.%s: no auto-increment claim store wired", dbName, in.table)
+		}
+		if err := claimStore.Inherit(dbName, in.table, in.from, in.owner); err != nil {
+			return err
+		}
+	}
+
+	seen := make(map[string]bool, len(tables))
 	for _, t := range tables {
 		if t.table == "" || seen[t.table] {
 			continue
 		}
 		seen[t.table] = true
 
-		floor, ok, err := autoIncSeedFloor(tm.db, t.table)
+		floor, ok, err := autoIncSeedFloor(q, t.table)
 		if err != nil {
 			return fmt.Errorf("derive auto-increment seed for %s: %w", t.table, err)
 		}

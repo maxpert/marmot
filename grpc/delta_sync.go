@@ -343,7 +343,7 @@ func (ds *DeltaSyncClient) applyChangeEvent(ctx context.Context, event *ChangeEv
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer tx.Rollback()
-	hasDDL := false
+	var schemaChange db.SchemaChange
 
 	for _, stmt := range event.Statements {
 		// Check for CDC data (RowChange payload)
@@ -386,10 +386,9 @@ func (ds *DeltaSyncClient) applyChangeEvent(ctx context.Context, event *ChangeEv
 			// Fail the sync so anti-entropy knows to try again or use snapshot
 			return fmt.Errorf("statement has no SQL and no CDC data (table=%s, type=%d) - CDC data may have been lost during serialization", stmt.TableName, stmt.Type)
 		}
-		if err := db.ApplyDDLSQLInTx(ctx, tx, sql); err != nil {
+		if err := mdb.ApplyReplayedDDL(ctx, tx, sql, stmt.TableName, event.Timestamp.GetNodeId(), &schemaChange); err != nil {
 			return fmt.Errorf("failed to execute statement: %w", err)
 		}
-		hasDDL = true
 		log.Debug().
 			Str("sql_prefix", func() string {
 				if len(sql) > 50 {
@@ -400,6 +399,10 @@ func (ds *DeltaSyncClient) applyChangeEvent(ctx context.Context, event *ChangeEv
 			Msg("DELTA-SYNC: Executed SQL")
 	}
 
+	if err := mdb.FinishReplayedSchemaChange(tx, &schemaChange); err != nil {
+		return fmt.Errorf("failed to finish replayed DDL: %w", err)
+	}
+
 	// Commit the transaction
 	if err := db.MarkSQLiteTxnApplied(tx, event.TxnId, HLCToTimestamp(event.Timestamp)); err != nil {
 		return fmt.Errorf("failed to mark applied txn: %w", err)
@@ -407,7 +410,7 @@ func (ds *DeltaSyncClient) applyChangeEvent(ctx context.Context, event *ChangeEv
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("failed to commit: %w", err)
 	}
-	if hasDDL {
+	if !schemaChange.Empty() {
 		if err := mdb.ReloadSchema(); err != nil {
 			log.Warn().Err(err).Str("database", database).Msg("DELTA-SYNC: failed to reload schema after DDL")
 		}

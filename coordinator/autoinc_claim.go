@@ -7,7 +7,10 @@ import (
 	"math/rand/v2"
 	"time"
 
+	"github.com/maxpert/marmot/id"
 	"github.com/maxpert/marmot/protocol"
+	"github.com/maxpert/marmot/protocol/mysqlcode"
+	"github.com/maxpert/marmot/protocol/query/transform"
 )
 
 // maxClaimAttempts bounds how many PREPARE rounds ClaimRange spends on one
@@ -31,9 +34,9 @@ const (
 	claimBackoffCap  = 64 * time.Millisecond
 )
 
-// ClaimRange is the entry point the range allocator will call to obtain a narrow AUTO_INCREMENT range: it is not dead code
-// despite having no production caller yet, since that allocator is a
-// separate, later step. Its only callers today are the tests in this file.
+// ClaimRange obtains a narrow AUTO_INCREMENT range for the range allocator
+// (id.RangeAllocator): on success (newBase, newBase+granted] belongs to this
+// node alone.
 //
 // It pushes one protocol.Statement through the existing 2PC machinery per
 // attempt: an AUTO_INCREMENT range claim, carrying AutoIDClaim=true and a
@@ -42,6 +45,17 @@ const (
 // matching the shape prepareAutoIncClaim (db/replication_engine.go) requires:
 // storedBase <= prevBase && newBase == prevBase && size >= 1 &&
 // newBase+size <= widthMax.
+//
+// Every attempt carries this node's current view of the cluster's total
+// membership, the denominator its quorum is computed over, and a participant
+// whose own view differs rejects it (prepareAutoIncClaim): majorities of two
+// different memberships need not intersect.
+//
+// size is evaluated afresh for every attempt against the base that attempt
+// proposes, because a rejection moves the base and the range's size depends
+// on where it starts (the endgame taper and the width ceiling). When size
+// reports id.ErrRangeExhausted no claim is sent and ClaimRange returns that
+// error.
 //
 // WriteConsistency is pinned to ConsistencyQuorum unconditionally - it never
 // reads a caller-supplied level or the cluster's configured write default.
@@ -70,39 +84,52 @@ const (
 // fix by itself, so it ends the attempt loop immediately rather than spending
 // the full budget.
 //
-// On exhausting maxClaimAttempts, or on hitting a failure with no usable
-// base, ClaimRange returns protocol.ErrLockWaitTimeout() (MySQL 1205): the
-// standard signal this codebase already uses for "retry me" (see
-// runPreparePhase's handling of write-write conflicts). It is wrapped with
-// %w around the last attempt's cause so a caller using errors.As can still
-// recover the retryable code, and errors.Unwrap the underlying reason for
-// logs.
+// The two ways a claim can end are kept apart structurally, because a client
+// must retry one and must never retry the other:
+//   - exhaustion - size found no room above the base, or a participant
+//     rejected the range as passing its own column ceiling (the rejection
+//     carries ER_DUP_ENTRY, see prepareAutoIncClaim) - returns an error
+//     wrapping id.ErrRangeExhausted;
+//   - anything else, on exhausting maxClaimAttempts or on a failure with no
+//     usable base, returns protocol.ErrLockWaitTimeout() (MySQL 1205), the
+//     standard "retry me" signal (see runPreparePhase's handling of
+//     write-write conflicts), wrapped with %w around the last attempt's cause.
 //
 // It never touches hookDB and never calls ExecuteLocalWithHooks: it only
 // builds a statement and drives it through WriteTransaction, exactly like
 // any other 2PC write.
-func (wc *WriteCoordinator) ClaimRange(ctx context.Context, database, table string, prevBase, size uint64) (newBase uint64, granted uint64, err error) {
-	newBase = prevBase
-
+func (wc *WriteCoordinator) ClaimRange(ctx context.Context, database, table string, prevBase uint64, size id.RangeSizer) (newBase uint64, granted uint64, err error) {
 	var lastErr error
 	declinedRounds := 0
 	for attempt := 0; attempt < maxClaimAttempts; attempt++ {
+		claimSize, sizeErr := size(prevBase)
+		if sizeErr != nil {
+			return 0, 0, fmt.Errorf("auto-increment claim for %s.%s: %w", database, table, sizeErr)
+		}
 		payload, encErr := protocol.EncodeAutoIncClaim(protocol.AutoIncClaim{
-			Table:    table,
-			PrevBase: prevBase,
-			NewBase:  newBase,
-			Size:     size,
+			Table:      table,
+			PrevBase:   prevBase,
+			NewBase:    prevBase,
+			Size:       claimSize,
+			Membership: uint32(wc.nodeProvider.GetTotalMembershipSize()),
 		})
 		if encErr != nil {
 			return 0, 0, fmt.Errorf("encode auto-increment claim for %s.%s: %w", database, table, encErr)
 		}
 
+		// Read each attempt: a DDL applied between attempts raises it.
+		schemaVersion, versionErr := wc.claimSchemaVersion(database)
+		if versionErr != nil {
+			return 0, 0, fmt.Errorf("auto-increment claim for %s.%s: read schema version: %w", database, table, versionErr)
+		}
+
 		startTS := wc.clock.Now()
 		txn := &Transaction{
-			ID:       startTS.ToTxnID(),
-			NodeID:   wc.nodeID,
-			StartTS:  startTS,
-			Database: database,
+			ID:                    startTS.ToTxnID(),
+			NodeID:                wc.nodeID,
+			StartTS:               startTS,
+			Database:              database,
+			RequiredSchemaVersion: schemaVersion,
 			// Pinned regardless of any caller or cluster default - see the
 			// method doc for why a quorum of 1 cannot be trusted here.
 			WriteConsistency: protocol.ConsistencyQuorum,
@@ -118,13 +145,15 @@ func (wc *WriteCoordinator) ClaimRange(ctx context.Context, database, table stri
 
 		attemptErr := wc.WriteTransaction(ctx, txn)
 		if attemptErr == nil {
-			return newBase, size, nil
+			return prevBase, claimSize, nil
 		}
 		lastErr = attemptErr
 
+		if exhaustedByParticipant(attemptErr) {
+			return 0, 0, fmt.Errorf("auto-increment claim for %s.%s: %w (%v)", database, table, id.ErrRangeExhausted, attemptErr)
+		}
 		if base, ok := autoIDStoredBaseFromRejection(attemptErr); ok && base > prevBase {
 			prevBase = base
-			newBase = base
 			continue
 		}
 		if !declinedByParticipant(attemptErr) || attempt == maxClaimAttempts-1 {
@@ -139,6 +168,15 @@ func (wc *WriteCoordinator) ClaimRange(ctx context.Context, database, table stri
 
 	return 0, 0, fmt.Errorf("auto-increment claim for %s.%s could not be granted: %w (last cause: %v)",
 		database, table, protocol.ErrLockWaitTimeout(), lastErr)
+}
+
+// exhaustedByParticipant reports whether a claim round was rejected because
+// the range passed a participant's own column ceiling: prepareAutoIncClaim
+// gives exactly that rejection ER_DUP_ENTRY, the code MySQL reports when an
+// AUTO_INCREMENT column is full, and no other claim rejection carries it.
+func exhaustedByParticipant(err error) bool {
+	var coded *transform.CodedError
+	return errors.As(err, &coded) && coded.Code == mysqlcode.ErrCodeDupEntry
 }
 
 // autoIDStoredBaseFromRejection extracts the highest base a rejecting
@@ -166,6 +204,20 @@ func autoIDStoredBaseFromRejection(err error) (base uint64, ok bool) {
 func declinedByParticipant(err error) bool {
 	var quorumErr *QuorumNotAchievedError
 	return errors.As(err, &quorumErr) && quorumErr.Phase == "prepare" && quorumErr.Declined > 0
+}
+
+// claimSchemaVersion is the schema version a claim for database carries:
+// this node's own, so a participant that has not applied every DDL this node
+// has declines the claim, exactly as it declines DML
+// (grpc ReplicationHandler's schema version check). A base a lagging
+// participant kept for a table name belongs to the incarnation this node
+// may already have replaced, a rename's source for one, and voting with it
+// could grant ids the new incarnation already holds.
+func (wc *WriteCoordinator) claimSchemaVersion(database string) (uint64, error) {
+	if wc.schemaVersion == nil {
+		return 0, nil
+	}
+	return wc.schemaVersion(database)
 }
 
 // sleepClaimBackoff waits the k-th jittered claim backoff, or until ctx ends.

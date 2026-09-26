@@ -21,10 +21,15 @@ type PromotionConfiguration struct {
 
 // ClusterConfiguration controls cluster membership and communication
 type ClusterConfiguration struct {
-	GRPCBindAddress       string                 `toml:"grpc_bind_address"`
-	GRPCAdvertiseAddress  string                 `toml:"grpc_advertise_address"` // Address other nodes use to connect (defaults to hostname:port)
-	GRPCPort              int                    `toml:"grpc_port"`
-	SeedNodes             []string               `toml:"seed_nodes"`
+	GRPCBindAddress      string   `toml:"grpc_bind_address"`
+	GRPCAdvertiseAddress string   `toml:"grpc_advertise_address"` // Address other nodes use to connect (defaults to hostname:port)
+	GRPCPort             int      `toml:"grpc_port"`
+	SeedNodes            []string `toml:"seed_nodes"`
+	// Standalone marks a deliberate single-node deployment. Only such a node
+	// releases its held AUTO_INCREMENT claim votes while it is its own whole
+	// membership; any other node with a membership of one may simply not have
+	// learned its cluster yet.
+	Standalone            bool                   `toml:"standalone"`
 	ClusterSecret         string                 `toml:"cluster_secret"` // PSK for cluster authentication (env: MARMOT_CLUSTER_SECRET)
 	GossipIntervalMS      int                    `toml:"gossip_interval_ms"`
 	GossipFanout          int                    `toml:"gossip_fanout"`
@@ -547,6 +552,13 @@ func Validate() error {
 		log.Info().
 			Str("advertise_address", Config.Cluster.GRPCAdvertiseAddress).
 			Msg("Auto-configured gRPC advertise address")
+	}
+
+	if Config.Cluster.Standalone && len(Config.Cluster.SeedNodes) > 0 {
+		return fmt.Errorf("cluster.standalone is set but seed_nodes is not empty: a standalone node joins no cluster")
+	}
+	if Config.Cluster.Standalone && Config.Replica.Enabled {
+		return fmt.Errorf("cluster.standalone is set but replica.enabled is true: a read-only replica follows a cluster")
 	}
 
 	if Config.MySQL.Enabled && (Config.MySQL.Port < 1 || Config.MySQL.Port > 65535) {

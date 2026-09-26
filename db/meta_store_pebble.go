@@ -88,6 +88,11 @@ type PebbleMetaStore struct {
 	// Prepared transactions whose row locks recoverPreparedCDCState restored
 	// at open, held until the memory tier takes them (takeRecoveredPrepared).
 	recoveredPrepared []TxnImmutableRecord
+
+	// syncWrite is pebble.Sync, or pebble.NoSync for a store opened without
+	// a WAL (PebbleMetaStoreOptions.DisableWAL, tests only), which has no
+	// durable write to offer and refuses a synced one.
+	syncWrite *pebble.WriteOptions
 }
 
 func cdcPrepareSyncStrict() bool {
@@ -228,6 +233,10 @@ func NewPebbleMetaStore(path string, opts PebbleMetaStoreOptions) (*PebbleMetaSt
 		dmlIntents:          xsync.NewMapOf[uint64, *xsync.MapOf[string, *WriteIntentRecord]](),
 		persistedIntentTxns: xsync.NewMapOf[uint64, struct{}](),
 		cdcLocks:            NewXsyncCDCLockStore(),
+		syncWrite:           pebble.Sync,
+	}
+	if opts.DisableWAL {
+		store.syncWrite = pebble.NoSync
 	}
 
 	// Initialize persistent counters
@@ -1713,7 +1722,14 @@ func (s *PebbleMetaStore) GetSchemaVersion(dbName string) (int64, error) {
 	return rec.Version, nil
 }
 
-// UpdateSchemaVersion updates the schema version for a database
+// UpdateSchemaVersion updates the schema version for a database.
+//
+// Unlike the transaction records, the write is synced. The DDL it counts is
+// already durable in SQLite, and a version lost to a crash is not healed by
+// replication: the node reports a lower version than the schema it runs, and
+// every peer's transaction that requires the newer version is refused on it.
+// Every schema-version write goes through here - a DDL's increment, catch-up
+// and a snapshot restore - and DDL is rare, so the sync stays off the hot path.
 func (s *PebbleMetaStore) UpdateSchemaVersion(dbName string, version int64, ddlSQL string, txnID uint64) error {
 	rec := &pebbleSchemaVersionRecord{
 		Version:   version,
@@ -1727,7 +1743,7 @@ func (s *PebbleMetaStore) UpdateSchemaVersion(dbName string, version int64, ddlS
 		return err
 	}
 
-	return s.db.Set(pebbleSchemaKey(dbName), data, pebble.NoSync)
+	return s.db.Set(pebbleSchemaKey(dbName), data, s.syncWrite)
 }
 
 // GetAllSchemaVersions returns all schema versions indexed by database name

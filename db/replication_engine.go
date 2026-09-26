@@ -2,12 +2,14 @@ package db
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/maxpert/marmot/coordinator"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/protocol"
 	"github.com/maxpert/marmot/protocol/filter"
+	"github.com/maxpert/marmot/protocol/mysqlcode"
 	"github.com/rs/zerolog/log"
 )
 
@@ -38,9 +40,10 @@ type PrepareResult struct {
 	// SQLite cannot apply. Infrastructure failures (timeouts, storage errors) leave
 	// it false so the coordinator keeps treating them as a missing ACK.
 	Rejected bool
-	// AutoIDStoredBase is this participant's own committed base for the table a
-	// rejected AUTO_INCREMENT range claim named, so the claimant can retry above
-	// it rather than spin. Zero on every response that is not such a rejection.
+	// AutoIDStoredBase is this participant's own base (the largest of its claim
+	// row's floors) for the table a rejected AUTO_INCREMENT range claim named,
+	// so the claimant can retry above it rather than spin. Zero on every
+	// response that is not such a rejection.
 	AutoIDStoredBase uint64
 	// ErrorCode is the MySQL server error code this rejection must reach the
 	// client with, when the underlying error named one (a
@@ -65,6 +68,9 @@ type CommitResult struct {
 	Success bool
 	Error   string
 	DDLSQL  string // SQL for DDL statements (if any)
+	// ClaimNotApplicable reports a COMMIT refused because this node could not
+	// apply the AUTO_INCREMENT claim it carries (ErrAutoIncClaimNotApplicable).
+	ClaimNotApplicable bool
 }
 
 // AbortRequest contains parameters for the abort phase
@@ -299,11 +305,17 @@ func (re *ReplicationEngine) autoIncClaimStore() (*AutoIncClaimStore, error) {
 // which is what keeps a single-node cluster minting 1, 2, 3 with no jump at any
 // range boundary.
 //
-// and an ABSENT stored base REJECTS. That last clause is the protocol's whole
-// safety argument and it is the one an implementer will get wrong: the natural
-// implementation is "absent means 0 means yes", and a cache that defaults to 0
-// and accepts is precisely the thing that cannot cast the rejection that would
-// repair it.
+// and an ABSENT stored base is never read as 0. That clause is the one an
+// implementer will get wrong: the natural implementation is "absent means 0
+// means yes", and a cache that defaults to 0 and accepts is precisely the
+// thing that cannot cast the rejection that would repair it. An absent row is
+// instead backfilled from the table itself (backfillAutoIncBase) on a node
+// whose votes are not held, and refused otherwise.
+//
+// Two more gates come before the condition. A node whose votes are held
+// (AutoIncHoldTable) declines without a verdict. A claim whose Membership is
+// not this node's own count of the cluster is rejected: majorities of two
+// different memberships need not intersect.
 //
 // widthMax is derived from THIS node's own sqlite_master, never taken from the
 // claimant: the width marker rides in the replicated DDL text so every node
@@ -328,8 +340,10 @@ func (re *ReplicationEngine) autoIncClaimStore() (*AutoIncClaimStore, error) {
 // it marks the transaction committed (Commit's ApplyClaims call runs ahead of
 // txnMgr.CommitTransaction), so the base is durable while the lock is still
 // held. ApplyClaims also refuses a COMMIT whose claim intent is gone or whose
-// prevBase the stored base has passed, so an ACK never depends on the lock
-// alone (see ApplyClaims for the per-node disjointness argument).
+// newBase this node's committed or seed floor has passed, so an ACK never
+// depends on the lock alone (see ApplyClaims for the per-node disjointness
+// argument). The base read below is the largest of the row's committed, seed
+// and merged floors (AutoIncClaimStore.ReadBase).
 //
 // The intent is therefore written FIRST and the base read SECOND. Read first
 // and the read is unlocked: two claimants can both read the pre-commit base,
@@ -385,11 +399,42 @@ func (re *ReplicationEngine) prepareAutoIncClaim(
 			Error: fmt.Sprintf("auto-increment claim for %s refused: %v", claim.Table, err)}
 	}
 
-	storedBase, err := claimStore.ReadBase(req.Database, claim.Table)
+	held, err := claimStore.VotesHeld()
 	if err != nil {
-		// Absent, unreadable - either way this node cannot vote yes.
 		return &PrepareResult{Success: false, Rejected: true,
 			Error: fmt.Sprintf("auto-increment claim for %s refused: %v", claim.Table, err)}
+	}
+	if held {
+		// Not a verdict on the claim: this node's bases may be below a range
+		// it or a majority granted, until it has merged bases from a
+		// majority (AutoIncHoldTable). A missing ACK leaves the claim to the
+		// rest of the cluster, and to this node once the merge completes.
+		return &PrepareResult{Success: false,
+			Error: fmt.Sprintf("auto-increment claim for %s declined: this node's votes are held until it merges claim bases from a majority", claim.Table)}
+	}
+
+	storedBase, err := claimStore.ReadBase(req.Database, claim.Table)
+	if errors.Is(err, ErrAutoIncBaseAbsent) {
+		storedBase, err = re.backfillAutoIncBase(replicatedDB, claimStore, req.Database, claim.Table)
+	}
+	if err != nil {
+		// Absent with nothing to backfill from, or unreadable - either way
+		// this node cannot vote yes.
+		return &PrepareResult{Success: false, Rejected: true,
+			Error: fmt.Sprintf("auto-increment claim for %s refused: %v", claim.Table, err)}
+	}
+
+	membership, err := re.dbMgr.ClusterMembership()
+	if err != nil || claim.Membership == 0 || int(claim.Membership) != membership {
+		// Majorities of two different memberships need not intersect, so a
+		// claim is only voted on by a node that counts the cluster the way
+		// the claimant did. A claimant that predates the field sends 0,
+		// which no membership equals. The base rides along like any
+		// rejection's; the claimant retries once gossip has converged.
+		return &PrepareResult{Success: false, Rejected: true,
+			Error: fmt.Sprintf("auto-increment claim for %s counted a membership of %d, this node counts %d (%v)",
+				claim.Table, claim.Membership, membership, err),
+			AutoIDStoredBase: storedBase}
 	}
 
 	widthMax, err := replicatedDB.AutoIncWidthMax(claim.Table)
@@ -420,10 +465,45 @@ func (re *ReplicationEngine) prepareAutoIncClaim(
 			// the sum is uint64 and a large size wraps, so the additive form
 			// lets a claim past the ceiling read as if it were inside it.
 			Error:            fmt.Sprintf("auto-increment claim for %s exhausts the column: %d+%d > %d", claim.Table, claim.NewBase, claim.Size, widthMax),
-			AutoIDStoredBase: storedBase}
+			AutoIDStoredBase: storedBase,
+			// ER_DUP_ENTRY is what MySQL reports for a full AUTO_INCREMENT
+			// column, and it is how the claimant tells this terminal verdict
+			// apart from every retryable one (coordinator.ClaimRange).
+			ErrorCode: mysqlcode.ErrCodeDupEntry}
 	}
 
 	return nil
+}
+
+// backfillAutoIncBase gives a table with no claim row the base the DDL-time
+// seed would have written (autoIncSeedFloor: the declared floor, raised by
+// the largest id the column's width can hold) and returns it. It runs under
+// the claim key's lock, only on a node whose votes are not held.
+//
+// That is what makes it sound where "absent means 0" is not. On such a node
+// an absent row means this node never ACKed a claim on the table: an ACK
+// writes the row durably, no DDL removes a row, a restore never lowers or
+// drops one, and a node that lost its rows is held (AutoIncHoldTable). So the node is exactly one that missed every claim on
+// the table, whose low base majority intersection already tolerates. Rows
+// go missing this way for a table marked before claim rows existed, and on a
+// node whose user database was restored from a peer while it was down for
+// the table's CREATE.
+//
+// A table with no explicitly declared AUTO_INCREMENT marker has nothing to
+// backfill and
+// stays refused.
+func (re *ReplicationEngine) backfillAutoIncBase(replicatedDB *ReplicatedDatabase, claimStore *AutoIncClaimStore, database, table string) (uint64, error) {
+	floor, ok, err := autoIncSeedFloor(replicatedDB.GetReadDB(), table)
+	if err != nil {
+		return 0, fmt.Errorf("backfill auto-increment base: %w", err)
+	}
+	if !ok {
+		return 0, ErrAutoIncBaseAbsent
+	}
+	if err := claimStore.Seed(database, table, floor, re.nodeID); err != nil {
+		return 0, fmt.Errorf("backfill auto-increment base: %w", err)
+	}
+	return claimStore.ReadBase(database, table)
 }
 
 // processStatement processes a single statement within a transaction
@@ -730,13 +810,20 @@ func (re *ReplicationEngine) Commit(ctx context.Context, req *CommitRequest) *Co
 			return &CommitResult{Success: false, Error: fmt.Sprintf("auto-increment claim apply failed: %v", csErr)}
 		}
 		if err := claimStore.ApplyClaims(req.Database, req.TxnID, replicatedDB.GetMetaStore()); err != nil {
-			log.Error().
-				Err(err).
+			// A claim this node cannot apply is the protocol refusing an ACK
+			// it must not give; anything else is a failed write.
+			notApplicable := errors.Is(err, ErrAutoIncClaimNotApplicable)
+			ev := log.Error()
+			if notApplicable {
+				ev = log.Warn()
+			}
+			ev.Err(err).
 				Uint64("txn_id", req.TxnID).
 				Uint64("node_id", re.nodeID).
 				Str("database", req.Database).
 				Msg("COMMIT REFUSED: auto-increment claim could not be applied")
-			return &CommitResult{Success: false, Error: fmt.Sprintf("auto-increment claim apply failed: %v", err)}
+			return &CommitResult{Success: false, ClaimNotApplicable: notApplicable,
+				Error: fmt.Sprintf("auto-increment claim apply failed: %v", err)}
 		}
 	}
 
@@ -816,8 +903,9 @@ func (pr *PrepareResult) ToCoordinatorResponse() *coordinator.ReplicationRespons
 // ToCoordinatorResponse converts CommitResult to coordinator.ReplicationResponse
 func (cr *CommitResult) ToCoordinatorResponse() *coordinator.ReplicationResponse {
 	return &coordinator.ReplicationResponse{
-		Success: cr.Success,
-		Error:   cr.Error,
+		Success:            cr.Success,
+		Error:              cr.Error,
+		ClaimNotApplicable: cr.ClaimNotApplicable,
 	}
 }
 

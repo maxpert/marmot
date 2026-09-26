@@ -3,12 +3,14 @@ package grpc
 import (
 	"context"
 	"os"
+	"sync"
 	"testing"
 
 	"github.com/maxpert/marmot/db"
 	"github.com/maxpert/marmot/encoding"
 	pb "github.com/maxpert/marmot/grpc/common"
 	"github.com/maxpert/marmot/hlc"
+	"github.com/stretchr/testify/require"
 )
 
 // TestSchemaVersionRejection verifies that transactions with higher required schema version are rejected
@@ -478,4 +480,81 @@ func TestReplicationHandler_AcceptsPrepareWhenNotLeaving(t *testing.T) {
 			t.Fatal("PREPARE incorrectly rejected as if node is LEAVING")
 		}
 	}
+}
+
+// incarnationRecorder records what a DDL apply reports to the node's
+// AutoIncIncarnationListener.
+type incarnationRecorder struct {
+	mu     sync.Mutex
+	tables []string
+}
+
+func (r *incarnationRecorder) TableIncarnationEnded(database, table string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.tables = append(r.tables, database+"."+table)
+}
+
+func (r *incarnationRecorder) DatabaseIncarnationEnded(string) {}
+
+func (r *incarnationRecorder) take() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	tables := r.tables
+	r.tables = nil
+	return tables
+}
+
+// TestReplicationHandler_ReplayedDDLEndsIncarnations pins R3c-10 end to end
+// on the anti-entropy replay RPC: a DDL a node catches up on through REPLAY
+// ends table incarnations, inherits and seeds claim bases exactly as the
+// same DDL's 2PC COMMIT would.
+//
+// Mutation: handleReplay executes DDL with db.ApplyDDLSQLInTx again. "a
+// replayed CREATE did not end nt's incarnation" fires.
+func TestReplicationHandler_ReplayedDDLEndsIncarnations(t *testing.T) {
+	clock := hlc.NewClock(1)
+	dbMgr, err := db.NewDatabaseManager(t.TempDir(), 1, clock)
+	require.NoError(t, err)
+	defer dbMgr.Close()
+	const testDB = "replay_incarnations"
+	require.NoError(t, dbMgr.CreateDatabase(testDB))
+	systemDB, err := dbMgr.GetDatabase(db.SystemDatabaseName)
+	require.NoError(t, err)
+	handler := NewReplicationHandler(1, dbMgr, clock, db.NewSchemaVersionManager(systemDB.GetMetaStore()))
+	rec := &incarnationRecorder{}
+	dbMgr.SetAutoIncIncarnationListener(rec)
+
+	replay := func(txnID uint64, table, ddl string) {
+		t.Helper()
+		now := clock.Now()
+		resp, err := handler.HandleReplicateTransaction(context.Background(), &TransactionRequest{
+			TxnId:        txnID,
+			SourceNodeId: 2,
+			Database:     testDB,
+			Phase:        TransactionPhase_REPLAY,
+			Timestamp:    &HLC{WallTime: now.WallTime, Logical: now.Logical, NodeId: 2},
+			Statements: []*Statement{{
+				Type:      pb.StatementType_DDL,
+				TableName: table,
+				Database:  testDB,
+				Payload:   &Statement_DdlChange{DdlChange: &DDLChange{Sql: ddl}},
+			}},
+		})
+		require.NoError(t, err)
+		require.True(t, resp.Success, "replay of %q: %s", ddl, resp.ErrorMessage)
+	}
+
+	claims := db.NewAutoIncClaimStore(dbMgr.GetSystemDatabase())
+	replay(300, "nt", "CREATE TABLE nt (id INTEGER /*M:32a*/ PRIMARY KEY, v TEXT)")
+	require.Equal(t, []string{testDB + ".nt"}, rec.take(), "a replayed CREATE did not end nt's incarnation")
+	_, err = claims.ReadBase(testDB, "nt")
+	require.NoError(t, err, "a replayed CREATE was not seeded")
+
+	require.NoError(t, claims.Seed(testDB, "nt", 400, 1))
+	replay(301, "nt", "ALTER TABLE nt RENAME TO nt2")
+	require.Equal(t, []string{testDB + ".nt", testDB + ".nt2"}, rec.take(), "a replayed rename did not end both names' incarnations")
+	base, err := claims.ReadBase(testDB, "nt2")
+	require.NoError(t, err)
+	require.Equal(t, uint64(400), base, "a replayed rename did not inherit nt's base")
 }

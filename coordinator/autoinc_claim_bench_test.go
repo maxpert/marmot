@@ -27,7 +27,7 @@ func BenchmarkClaimRange(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if _, _, err := wc.ClaimRange(ctx, "testdb", "orders", uint64(i), 50); err != nil {
+		if _, _, err := wc.ClaimRange(ctx, "testdb", "orders", uint64(i), fixedClaimSize(50)); err != nil {
 			b.Fatalf("ClaimRange: %v", err)
 		}
 	}
