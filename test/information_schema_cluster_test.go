@@ -27,6 +27,7 @@ type isAnswer struct {
 func queryAnswer(conn *sql.DB, query string, args ...interface{}) (isAnswer, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), clusterQueryTimeout)
 	defer cancel()
+	defer noteClientCall()
 	rows, err := conn.QueryContext(ctx, query, args...)
 	if err != nil {
 		return isAnswer{}, err
@@ -64,8 +65,8 @@ func queryAnswer(conn *sql.DB, query string, args ...interface{}) (isAnswer, err
 	return answer, rows.Err()
 }
 
-// TestInformationSchemaAnswersOnEveryPath is R3c-9 (reviewer A's F-P1 and
-// F-P2) end to end: every INFORMATION_SCHEMA table Marmot serves answers,
+// TestInformationSchemaAnswersOnEveryPath checks end to end that every
+// INFORMATION_SCHEMA table Marmot serves answers,
 // with and without filters, the same rows and columns to a prepared
 // statement as to the text query, on every node; and DDL coordinated from
 // the node afterwards completes. Before, a prepared COLUMNS or TABLES query

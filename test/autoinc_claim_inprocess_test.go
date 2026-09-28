@@ -1076,7 +1076,7 @@ func TestClaimRange_SurvivesFullClusterSnapshotRestore(t *testing.T) {
 	// Snapshot every node BEFORE any of them stop.
 	for _, id := range []uint64{1, 2, 3} {
 		snapDir := t.TempDir()
-		snapshots, _, _, err := c.nodes[id].dm.TakeSnapshotToDir(snapDir)
+		snapshots, _, err := c.nodes[id].dm.TakeSnapshotToDir(snapDir)
 		require.NoError(t, err)
 		require.NotEmpty(t, snapshots)
 		snapDirByNode[id] = snapDir

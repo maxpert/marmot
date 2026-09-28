@@ -256,10 +256,10 @@ func TestShutdown_ReplicationHandlerLifecycle(t *testing.T) {
 	const testDB = "lifecycle_db"
 	require.NoError(t, dbMgr.CreateDatabase(testDB))
 
-	systemDB, err := dbMgr.GetDatabase(db.SystemDatabaseName)
+	_, err = dbMgr.GetDatabase(db.SystemDatabaseName)
 	require.NoError(t, err)
 
-	handler := NewReplicationHandler(localNodeID, dbMgr, clock, db.NewSchemaVersionManager(systemDB.GetMetaStore()))
+	handler := NewReplicationHandler(localNodeID, dbMgr, clock, db.NewSchemaVersionManager(dbMgr))
 	registry := NewNodeRegistry(localNodeID, "localhost:9000")
 	handler.SetRegistry(registry)
 

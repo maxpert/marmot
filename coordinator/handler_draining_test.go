@@ -7,10 +7,13 @@ import (
 	"github.com/maxpert/marmot/protocol"
 )
 
-// stubNodeRegistry satisfies coordinator.NodeRegistry with configurable leaving state.
+// stubNodeRegistry satisfies coordinator.NodeRegistry with configurable
+// leaving state and legacy members (ones not serving the commit-log pull
+// protocol yet).
 type stubNodeRegistry struct {
-	localNodeID uint64
-	leaving     bool
+	localNodeID   uint64
+	leaving       bool
+	legacyMembers []uint64
 }
 
 func (s *stubNodeRegistry) UpdateSchemaVersions(_ map[string]uint64) {}
@@ -18,6 +21,7 @@ func (s *stubNodeRegistry) CountAlive() int                          { return 1 
 func (s *stubNodeRegistry) GetAll() []any                            { return []any{} }
 func (s *stubNodeRegistry) IsLeaving(nodeID uint64) bool             { return s.leaving && nodeID == s.localNodeID }
 func (s *stubNodeRegistry) GetLocalNodeID() uint64                   { return s.localNodeID }
+func (s *stubNodeRegistry) LegacyLogProtocolMembers() []uint64       { return s.legacyMembers }
 
 // newDrainingHandler builds a CoordinatorHandler with no real coordinators,
 // suitable for testing the draining/mutation-rejection path only.

@@ -229,6 +229,78 @@ func TestStreamPSKAuthentication(t *testing.T) {
 	})
 }
 
+// TestLogPullRPCsRequireClusterSecret confirms the log-pull RPCs
+// (ListCommittedLog, FetchTransactions, ListDatabaseRegistry) go through the
+// same blanket cluster-secret interceptor as every other peer RPC: they are
+// registered on the same grpc.Server under the same
+// ChainUnaryInterceptor/ChainStreamInterceptor as Ping and StreamChanges
+// above, so nothing method-specific is required, but this pins that a wrong
+// secret is refused for them too rather than silently falling through
+// testMarmotServer's Unimplemented default.
+func TestLogPullRPCsRequireClusterSecret(t *testing.T) {
+	origSecret := cfg.Config.Cluster.ClusterSecret
+	cfg.Config.Cluster.ClusterSecret = "log-pull-secret"
+	defer func() { cfg.Config.Cluster.ClusterSecret = origSecret }()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer listener.Close()
+
+	server := grpc.NewServer(
+		grpc.ChainUnaryInterceptor(UnaryServerInterceptor()),
+		grpc.ChainStreamInterceptor(StreamServerInterceptor()),
+	)
+	RegisterMarmotServiceServer(server, &testMarmotServer{})
+	go server.Serve(listener)
+	defer server.Stop()
+
+	conn, err := grpc.NewClient(
+		listener.Addr().String(),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithChainUnaryInterceptor(clientInterceptorWithSecret("wrong-secret")),
+		grpc.WithChainStreamInterceptor(streamClientInterceptorWithSecret("wrong-secret")),
+	)
+	if err != nil {
+		t.Fatalf("failed to connect: %v", err)
+	}
+	defer conn.Close()
+	client := NewMarmotServiceClient(conn)
+
+	t.Run("ListCommittedLog", func(t *testing.T) {
+		_, err := client.ListCommittedLog(context.Background(), &LogListRequest{Database: "app"})
+		st, ok := status.FromError(err)
+		if !ok || st.Code() != codes.Unauthenticated {
+			t.Fatalf("expected Unauthenticated, got: %v", err)
+		}
+	})
+
+	t.Run("ListDatabaseRegistry", func(t *testing.T) {
+		_, err := client.ListDatabaseRegistry(context.Background(), &DatabaseRegistryRequest{})
+		st, ok := status.FromError(err)
+		if !ok || st.Code() != codes.Unauthenticated {
+			t.Fatalf("expected Unauthenticated, got: %v", err)
+		}
+	})
+
+	t.Run("FetchTransactions", func(t *testing.T) {
+		stream, err := client.FetchTransactions(context.Background(), &FetchTransactionsRequest{Database: "app", TxnIds: []uint64{1}})
+		if err != nil {
+			st, ok := status.FromError(err)
+			if ok && st.Code() == codes.Unauthenticated {
+				return
+			}
+			t.Fatalf("failed to create stream: %v", err)
+		}
+		_, err = stream.Recv()
+		st, ok := status.FromError(err)
+		if !ok || st.Code() != codes.Unauthenticated {
+			t.Fatalf("expected Unauthenticated, got: %v", err)
+		}
+	})
+}
+
 // testMarmotServer implements MarmotServiceServer for testing
 type testMarmotServer struct {
 	UnimplementedMarmotServiceServer

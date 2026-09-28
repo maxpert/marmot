@@ -3,39 +3,51 @@ package grpc
 import (
 	"context"
 	"fmt"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/maxpert/marmot/cfg"
 	"github.com/maxpert/marmot/db"
-	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/telemetry"
 	"github.com/rs/zerolog/log"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
-// AntiEntropyService manages background anti-entropy process
-// It periodically checks for lagging peers and brings them up to date
+// AntiEntropyService periodically reconciles this node's databases and
+// their local commit logs with every alive cluster member: it merges each
+// peer's database
+// registry, pulls each database's log through a LogPuller with a
+// per-pair deadline, and falls back to a full snapshot plus local-log
+// re-apply when a peer's log has been truncated past this node's cursor.
 type AntiEntropyService struct {
-	nodeID           uint64
-	registry         *NodeRegistry
-	client           *Client
-	dbManager        *db.DatabaseManager
-	deltaSync        *DeltaSyncClient
-	clock            *hlc.Clock
-	snapshotFunc     SnapshotTransferFunc
-	schemaVersionMgr *db.SchemaVersionManager
+	nodeID       uint64
+	registry     *NodeRegistry
+	client       *Client
+	dbManager    *db.DatabaseManager
+	logPuller    *LogPuller
+	snapshotFunc SnapshotTransferFunc
 
 	// Configuration
-	interval              time.Duration
-	deltaThresholdTxns    int
-	deltaThresholdSeconds int
-	enabled               bool
+	interval time.Duration
+	enabled  bool
+
+	// snapshotRestoreTimeout bounds the whole restore sequence
+	// (restoreContext), independent of interval: a restore
+	// transfers a database's full current size and can run far longer than
+	// one anti-entropy round.
+	snapshotRestoreTimeout time.Duration
 
 	// Control
 	stopCh  chan struct{}
 	running bool
 	mu      sync.Mutex
+
+	// Per-database status as of the last completed round,
+	// read by admin and tests.
+	statusMu       sync.RWMutex
+	caughtUp       map[string]bool
+	promotionReady map[string]bool
 }
 
 // SnapshotTransferFunc initiates a snapshot transfer to a peer
@@ -44,36 +56,45 @@ type SnapshotTransferFunc func(ctx context.Context, peerNodeID uint64, peerAddr 
 
 // AntiEntropyConfig holds configuration for anti-entropy service
 type AntiEntropyConfig struct {
-	NodeID                uint64
-	Registry              *NodeRegistry
-	Client                *Client
-	DBManager             *db.DatabaseManager
-	DeltaSync             *DeltaSyncClient
-	Clock                 *hlc.Clock
-	SnapshotFunc          SnapshotTransferFunc
-	SchemaVersionMgr      *db.SchemaVersionManager
-	Interval              time.Duration
-	DeltaThresholdTxns    int
-	DeltaThresholdSeconds int
-	Enabled               bool
+	NodeID       uint64
+	Registry     *NodeRegistry
+	Client       *Client
+	DBManager    *db.DatabaseManager
+	LogPuller    *LogPuller
+	SnapshotFunc SnapshotTransferFunc
+	Interval     time.Duration
+	Enabled      bool
+	// SnapshotRestoreTimeout bounds a snapshot restore's own deadline,
+	// independent of Interval. Zero or negative falls back to
+	// defaultSnapshotRestoreTimeout.
+	SnapshotRestoreTimeout time.Duration
 }
+
+// defaultSnapshotRestoreTimeout is used when AntiEntropyConfig does not name
+// one - direct construction (tests, embedded use) rather than
+// NewAntiEntropyServiceFromConfig, which always sets it from
+// cfg.Config.Replication.SnapshotRestoreTimeoutS.
+const defaultSnapshotRestoreTimeout = 30 * time.Minute
 
 // NewAntiEntropyService creates a new anti-entropy service
 func NewAntiEntropyService(config AntiEntropyConfig) *AntiEntropyService {
+	restoreTimeout := config.SnapshotRestoreTimeout
+	if restoreTimeout <= 0 {
+		restoreTimeout = defaultSnapshotRestoreTimeout
+	}
 	return &AntiEntropyService{
-		nodeID:                config.NodeID,
-		registry:              config.Registry,
-		client:                config.Client,
-		dbManager:             config.DBManager,
-		deltaSync:             config.DeltaSync,
-		clock:                 config.Clock,
-		snapshotFunc:          config.SnapshotFunc,
-		schemaVersionMgr:      config.SchemaVersionMgr,
-		interval:              config.Interval,
-		deltaThresholdTxns:    config.DeltaThresholdTxns,
-		deltaThresholdSeconds: config.DeltaThresholdSeconds,
-		enabled:               config.Enabled,
-		stopCh:                make(chan struct{}),
+		nodeID:                 config.NodeID,
+		registry:               config.Registry,
+		client:                 config.Client,
+		dbManager:              config.DBManager,
+		logPuller:              config.LogPuller,
+		snapshotFunc:           config.SnapshotFunc,
+		interval:               config.Interval,
+		enabled:                config.Enabled,
+		snapshotRestoreTimeout: restoreTimeout,
+		stopCh:                 make(chan struct{}),
+		caughtUp:               make(map[string]bool),
+		promotionReady:         make(map[string]bool),
 	}
 }
 
@@ -83,27 +104,38 @@ func NewAntiEntropyServiceFromConfig(
 	registry *NodeRegistry,
 	client *Client,
 	dbManager *db.DatabaseManager,
-	deltaSync *DeltaSyncClient,
-	clock *hlc.Clock,
+	logPuller *LogPuller,
 	snapshotFunc SnapshotTransferFunc,
-	schemaVersionMgr *db.SchemaVersionManager,
 ) *AntiEntropyService {
 	config := cfg.Config.Replication
 
 	return NewAntiEntropyService(AntiEntropyConfig{
-		NodeID:                nodeID,
-		Registry:              registry,
-		Client:                client,
-		DBManager:             dbManager,
-		DeltaSync:             deltaSync,
-		Clock:                 clock,
-		SnapshotFunc:          snapshotFunc,
-		SchemaVersionMgr:      schemaVersionMgr,
-		Interval:              time.Duration(config.AntiEntropyIntervalS) * time.Second,
-		DeltaThresholdTxns:    config.DeltaSyncThresholdTxns,
-		DeltaThresholdSeconds: config.DeltaSyncThresholdSeconds,
-		Enabled:               config.EnableAntiEntropy,
+		NodeID:                 nodeID,
+		Registry:               registry,
+		Client:                 client,
+		DBManager:              dbManager,
+		LogPuller:              logPuller,
+		SnapshotFunc:           snapshotFunc,
+		Interval:               time.Duration(config.AntiEntropyIntervalS) * time.Second,
+		Enabled:                config.EnableAntiEntropy,
+		SnapshotRestoreTimeout: time.Duration(config.SnapshotRestoreTimeoutS) * time.Second,
 	})
+}
+
+// restoreContext returns a context bounded by snapshotRestoreTimeout, used by
+// every call site that runs a snapshot restore (syncDatabase's fallback and
+// restoreAwaitingDatabases): deliberately not ae.interval, which bounds one
+// anti-entropy round, not a one-shot transfer of a database's full current
+// size.
+func (ae *AntiEntropyService) restoreContext() (context.Context, context.CancelFunc) {
+	timeout := ae.snapshotRestoreTimeout
+	if timeout <= 0 {
+		// A zero value here means an AntiEntropyService built as a struct
+		// literal rather than through NewAntiEntropyService (some tests do
+		// this) - fall back rather than expire the context immediately.
+		timeout = defaultSnapshotRestoreTimeout
+	}
+	return context.WithTimeout(context.Background(), timeout)
 }
 
 // Start starts the anti-entropy background process
@@ -128,8 +160,6 @@ func (ae *AntiEntropyService) Start() {
 
 	log.Info().
 		Dur("interval", ae.interval).
-		Int("delta_threshold_txns", ae.deltaThresholdTxns).
-		Int("delta_threshold_seconds", ae.deltaThresholdSeconds).
 		Msg("Anti-entropy service started")
 }
 
@@ -167,31 +197,23 @@ func (ae *AntiEntropyService) runLoop() {
 	}
 }
 
-// runStartupSync performs anti-entropy at startup, waiting for peers if needed
+// runStartupSync performs anti-entropy at startup, waiting briefly for peers
+// if needed, and always runs one round itself before returning: a JOINING
+// node's first round must not wait a full ae.interval for the ticker
+// (the promotion gate - checkPromotionCriteria needs a completed
+// round to see PromotionReady at all).
 func (ae *AntiEntropyService) runStartupSync() {
-	log.Debug().
-		Uint64("node_id", ae.nodeID).
-		Str("timestamp", time.Now().Format("15:04:05.000")).
-		Msg("ANTI-ENTROPY: Running startup sync")
-
 	// Try up to 5 times with 2 second delays to find ALIVE peers
 	// This gives gossip time to propagate membership after a restart
 	maxAttempts := 5
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		nodes := ae.registry.GetAll()
-		aliveCount := 0
-		for _, node := range nodes {
-			if node.Status == NodeStatus_ALIVE && node.NodeId != ae.nodeID {
-				aliveCount++
-			}
-		}
+		_, alive := ae.currentMembers()
 
-		if aliveCount > 0 {
+		if len(alive) > 0 {
 			log.Debug().
 				Uint64("node_id", ae.nodeID).
-				Int("alive_peers", aliveCount).
+				Int("alive_peers", len(alive)).
 				Int("attempt", attempt).
-				Str("timestamp", time.Now().Format("15:04:05.000")).
 				Msg("ANTI-ENTROPY: Found ALIVE peers, starting sync")
 			ae.performAntiEntropy()
 			return
@@ -201,7 +223,6 @@ func (ae *AntiEntropyService) runStartupSync() {
 			Uint64("node_id", ae.nodeID).
 			Int("attempt", attempt).
 			Int("max_attempts", maxAttempts).
-			Str("timestamp", time.Now().Format("15:04:05.000")).
 			Msg("ANTI-ENTROPY: No ALIVE peers found, waiting for gossip")
 
 		// Wait for gossip to discover peers (unless this is the last attempt)
@@ -217,92 +238,317 @@ func (ae *AntiEntropyService) runStartupSync() {
 
 	log.Debug().
 		Uint64("node_id", ae.nodeID).
-		Str("timestamp", time.Now().Format("15:04:05.000")).
-		Msg("ANTI-ENTROPY: No ALIVE peers after startup wait, will sync on next interval")
+		Msg("ANTI-ENTROPY: No ALIVE peers found within the startup wait, running the first round anyway")
+	// performAntiEntropy is a cheap no-op with no alive peers; running it now
+	// still means the first round runs at Start(), not after waiting a full
+	// ae.interval on the ticker.
+	ae.performAntiEntropy()
 }
 
-// performAntiEntropy performs a single anti-entropy round
+// currentMembers returns two views of this node's cluster membership,
+// self excluded: members is every registry
+// node whose status is not REMOVED (LEAVING, DEAD and SUSPECT are members;
+// only ALIVE ones are contacted), and alive is the subset of those that are
+// ALIVE.
+func (ae *AntiEntropyService) currentMembers() (members, alive []*NodeState) {
+	for _, node := range ae.registry.GetAll() {
+		if node.NodeId == ae.nodeID || node.Status == NodeStatus_REMOVED {
+			continue
+		}
+		members = append(members, node)
+		if node.Status == NodeStatus_ALIVE {
+			alive = append(alive, node)
+		}
+	}
+	return members, alive
+}
+
+// performAntiEntropy performs a single anti-entropy round. Every network
+// step gets its own deadline: no pair, and no peer's registry listing,
+// shares one with another, so one slow peer cannot starve the rest.
 func (ae *AntiEntropyService) performAntiEntropy() {
 	roundStart := time.Now()
 	telemetry.AntiEntropyRoundsTotal.Inc()
-
-	ctx, cancel := context.WithTimeout(context.Background(), ae.interval)
-	defer cancel()
 	defer func() {
 		telemetry.AntiEntropyDurationSeconds.Observe(time.Since(roundStart).Seconds())
 	}()
 
-	log.Debug().Msg("Starting anti-entropy round")
-
-	// Get all ALIVE nodes from registry
-	nodes := ae.registry.GetAll()
-	aliveNodes := make([]*NodeState, 0)
-	for _, node := range nodes {
-		if node.Status == NodeStatus_ALIVE && node.NodeId != ae.nodeID {
-			aliveNodes = append(aliveNodes, node)
-		}
-	}
-
-	if len(aliveNodes) == 0 {
-		log.Debug().Msg("No alive peers to sync with")
+	members, alive := ae.currentMembers()
+	if len(alive) == 0 {
+		log.Debug().Msg("Anti-entropy: no alive peers to sync with")
 		return
 	}
 
 	log.Debug().
 		Uint64("node_id", ae.nodeID).
-		Int("peer_count", len(aliveNodes)).
-		Str("timestamp", time.Now().Format("15:04:05.000")).
+		Int("member_count", len(members)).
+		Int("alive_count", len(alive)).
 		Msg("ANTI-ENTROPY: Starting round")
 
-	// For each database, find the peer with highest max_txn_id and sync ONLY from that peer
-	// This prevents race conditions from concurrent snapshot downloads
-	databases := ae.dbManager.ListDatabases()
-	log.Debug().
-		Uint64("node_id", ae.nodeID).
-		Int("database_count", len(databases)).
-		Strs("databases", databases).
-		Msg("ANTI-ENTROPY: Checking databases for sync")
+	// Reconcile the database set with every alive peer before pulling any
+	// log, so a database this node missed CREATE for exists before its log
+	// is ever pulled.
+	ae.reconcileDatabaseRegistry(alive)
 
-	for _, dbName := range databases {
-		bestPeer := ae.findBestPeerForDatabase(ctx, aliveNodes, dbName)
-		if bestPeer != nil {
-			log.Debug().
-				Uint64("node_id", ae.nodeID).
-				Uint64("best_peer", bestPeer.NodeId).
-				Str("database", dbName).
-				Msg("ANTI-ENTROPY: Found best peer, starting sync")
-			if err := ae.syncPeerDatabase(ctx, bestPeer, dbName); err != nil {
-				log.Warn().
-					Err(err).
-					Uint64("peer_node", bestPeer.NodeId).
-					Str("database", dbName).
-					Msg("Failed to sync from best peer")
+	for _, dbName := range ae.dbManager.ListDatabases() {
+		ae.syncDatabase(dbName, members, alive)
+	}
+
+	ae.restoreAwaitingDatabases(alive)
+
+	log.Debug().Msg("Anti-entropy round completed")
+}
+
+// reconcileDatabaseRegistry merges every alive peer's database registry
+// into this node's own (reconcileRegistryWithPeer). A peer that answers
+// Unimplemented (rolling upgrade) has its registry skipped; every other
+// per-peer error is logged and never aborts the round.
+func (ae *AntiEntropyService) reconcileDatabaseRegistry(alive []*NodeState) {
+	for _, peer := range alive {
+		ctx, cancel := context.WithTimeout(context.Background(), ae.interval)
+		err := reconcileRegistryWithPeer(ctx, ae.client, ae.dbManager, ae.nodeID, peer.Address)
+		cancel()
+		if err == nil {
+			continue
+		}
+		if status.Code(err) == codes.Unimplemented {
+			log.Warn().Uint64("peer_node", peer.NodeId).
+				Msg("anti-entropy: peer does not support database registry listing yet, skipping (rolling upgrade)")
+			continue
+		}
+		log.Debug().Err(err).Uint64("peer_node", peer.NodeId).
+			Msg("anti-entropy: database registry reconciliation failed")
+	}
+}
+
+// reconcileRegistryWithPeer merges the database registry of the peer at
+// address into dbMgr's own: a database this node
+// missed CREATE for is created, and one this node still has that the peer
+// already tombstoned is dropped - never the reverse, by DatabaseRegistryKey's
+// total order (db.DatabaseManager.ApplyDatabaseOp). A failure to apply one
+// entry is logged and does not stop the others; the returned error is the
+// listing's own.
+//
+// A legacy live entry (see db.DatabaseManager.ApplyDatabaseOp's doc
+// comment) is never applied when this node has no row at all for the name:
+// that is the one case where applying it would CREATE the database, spreading
+// a pre-upgrade divergence this node never had a chance to see for itself.
+// Every other entry, legacy or not, is merged as usual.
+func reconcileRegistryWithPeer(ctx context.Context, client *Client, dbMgr *db.DatabaseManager, nodeID uint64, address string) error {
+	conn, err := client.GetClientByAddress(address)
+	if err != nil {
+		return err
+	}
+	resp, err := conn.ListDatabaseRegistry(ctx, &DatabaseRegistryRequest{RequestingNodeId: nodeID})
+	if err != nil {
+		return err
+	}
+	for _, entry := range resp.Entries {
+		key := db.DatabaseRegistryKey{Generation: entry.Generation, Dropped: entry.Dropped}
+		if entry.Legacy && !entry.Dropped {
+			local, err := dbMgr.RegistryKey(entry.Name)
+			if err != nil {
+				log.Warn().Err(err).Str("peer", address).Str("database", entry.Name).
+					Msg("failed to read local database registry key")
+				continue
 			}
+			if local.Generation == 0 {
+				log.Debug().Str("peer", address).Str("database", entry.Name).
+					Msg("anti-entropy: skipping peer's legacy live registry row for a database this node never had (pre-upgrade divergence, not repaired)")
+				continue
+			}
+		}
+		if _, err := dbMgr.ApplyDatabaseOp(entry.Name, key); err != nil {
+			log.Warn().Err(err).Str("peer", address).Str("database", entry.Name).
+				Msg("failed to apply peer database registry entry")
+		}
+	}
+	return nil
+}
+
+// snapshotSource is the alive member selected as a database's restore
+// source: the one with the highest schema version among the members that
+// answered this round, ties broken by the lowest node id.
+type snapshotSource struct {
+	peer          *NodeState
+	schemaVersion uint64
+}
+
+// considerSnapshotSource updates best with candidate if candidate outranks
+// it (higher schema version, or the same version and a lower node id).
+func considerSnapshotSource(best *snapshotSource, candidate snapshotSource) *snapshotSource {
+	if best == nil {
+		return &candidate
+	}
+	if candidate.schemaVersion > best.schemaVersion {
+		return &candidate
+	}
+	if candidate.schemaVersion == best.schemaVersion && candidate.peer.NodeId < best.peer.NodeId {
+		return &candidate
+	}
+	return best
+}
+
+// syncDatabase runs one database's pull round against every alive peer,
+// each pair under its own deadline, falls back
+// to a snapshot restore when any member's log no longer covers this node's
+// cursor into it, and records the resulting caught-up status.
+func (ae *AntiEntropyService) syncDatabase(dbName string, members, alive []*NodeState) {
+	// Finish a pending re-apply of this node's own log, left by a
+	// restore that crashed or failed before completing it, before pulling
+	// anything more for dbName.
+	ae.reapplyIfPending(dbName)
+
+	dbCaughtUp := len(alive) == len(members)
+	dbPromotionReady, needsSnapshot, source := ae.pullEveryAlivePeer(dbName, alive, &dbCaughtUp)
+
+	if needsSnapshot {
+		dbCaughtUp = false
+		ctx, cancel := ae.restoreContext()
+		err := ae.restoreFromPeer(ctx, dbName, source.peer)
+		cancel()
+		if err != nil {
+			telemetry.AntiEntropySyncsTotal.With("snapshot", "failed").Inc()
+			log.Warn().Err(err).Str("database", dbName).Uint64("source_peer", source.peer.NodeId).
+				Msg("anti-entropy: snapshot fallback failed")
 		} else {
-			log.Debug().
-				Uint64("node_id", ae.nodeID).
-				Str("database", dbName).
-				Msg("ANTI-ENTROPY: No better peer found (we may be up to date)")
+			telemetry.AntiEntropySyncsTotal.With("snapshot", "success").Inc()
 		}
 	}
 
-	ae.restoreAwaitingDatabases(ctx, aliveNodes)
+	ae.setCaughtUp(dbName, dbCaughtUp)
+	ae.setPromotionReady(dbName, dbPromotionReady)
+}
 
-	log.Debug().Msg("Anti-entropy round completed")
+// pullEveryAlivePeer runs dbName's PullPair against every alive peer, each
+// under its own deadline, and folds the results into three outputs:
+// dbCaughtUp (an in-out pointer, cleared by any pair that did not fully
+// succeed - it starts set from len(alive)==len(members)), promotionReady
+// (see below) and the best snapshot source seen, for the
+// needsSnapshot fallback.
+//
+// promotionReady is deliberately over alive peers only, never all members
+// (checkPromotionCriteria): requiring CaughtUp over every member, DEAD ones
+// included, would keep a restarted node JOINING forever while any member
+// stays down. It starts true and is cleared by any alive peer's pair that
+// did not fully succeed; it also requires at least one alive peer was
+// actually pulled, so a node with no alive peers yet is never
+// promotion-ready.
+func (ae *AntiEntropyService) pullEveryAlivePeer(dbName string, alive []*NodeState, dbCaughtUp *bool) (promotionReady, needsSnapshot bool, source *snapshotSource) {
+	promotionReady = len(alive) > 0
+
+	for _, peer := range alive {
+		pairCtx, cancel := context.WithTimeout(context.Background(), ae.interval)
+		result, err := ae.logPuller.PullPair(pairCtx, PeerRef{NodeID: peer.NodeId, Address: peer.Address}, dbName)
+		cancel()
+
+		if err != nil {
+			log.Warn().Err(err).Uint64("peer_node", peer.NodeId).Str("database", dbName).
+				Msg("anti-entropy: pull failed")
+			*dbCaughtUp = false
+			promotionReady = false
+			continue
+		}
+		if result.Unimplemented || result.DatabaseAbsent {
+			// A rolling-upgrade peer, or a peer whose registry has not caught
+			// up yet: its log cannot count toward caught-up this round.
+			*dbCaughtUp = false
+			promotionReady = false
+			continue
+		}
+		source = considerSnapshotSource(source, snapshotSource{peer: peer, schemaVersion: result.PeerSchemaVersion})
+		if result.NeedsSnapshot {
+			needsSnapshot = true
+			promotionReady = false
+		}
+		if !result.CaughtUp {
+			*dbCaughtUp = false
+			promotionReady = false
+		}
+	}
+	return promotionReady, needsSnapshot, source
+}
+
+// restoreFromPeer restores dbName from source's snapshot and then runs the
+// rest of the restore sequence (restoreDatabase).
+func (ae *AntiEntropyService) restoreFromPeer(ctx context.Context, dbName string, source *NodeState) error {
+	if ae.snapshotFunc == nil {
+		return fmt.Errorf("snapshot transfer not configured")
+	}
+	return restoreDatabase(ctx, ae.dbManager, ae.logPuller, dbName, func(ctx context.Context) error {
+		return ae.snapshotFunc(ctx, source.NodeId, source.Address, dbName)
+	})
+}
+
+// restoreDatabase is the one restore sequence, used by anti-entropy's snapshot fallback, its retry of databases awaiting
+// a restore, and startup catch-up:
+//  1. durably mark the re-apply of this node's own log pending, before the
+//     restore replaces the file, so a crash anywhere after it still re-applies;
+//  2. restore;
+//  3. re-apply every entry of this node's own log the restored file lacks,
+//     clearing the mark only on success - a failure leaves it for
+//     the next round (reapplyIfPending);
+//  4. let every member's next pull move its cursor up to that member's
+//     truncation point (LogPuller.MarkRestored).
+func restoreDatabase(ctx context.Context, dbMgr *db.DatabaseManager, lp *LogPuller, dbName string, restore func(context.Context) error) error {
+	if mdb, err := dbMgr.GetDatabase(dbName); err == nil {
+		if err := mdb.GetMetaStore().SetReapplyPending(true); err != nil {
+			return fmt.Errorf("mark local-log re-apply pending for %s: %w", dbName, err)
+		}
+	}
+	if err := restore(ctx); err != nil {
+		return err
+	}
+	mdb, err := dbMgr.GetDatabase(dbName)
+	if err != nil {
+		return fmt.Errorf("database %s not available after restore: %w", dbName, err)
+	}
+	if err := mdb.GetMetaStore().SetReapplyPending(true); err != nil {
+		return fmt.Errorf("mark local-log re-apply pending for %s: %w", dbName, err)
+	}
+	if applied, err := mdb.ReapplyLocalLogIfPending(ctx); err != nil {
+		log.Warn().Err(err).Str("database", dbName).Int("applied", applied).
+			Msg("local-log re-apply after restore failed; retried every anti-entropy round")
+	}
+	lp.MarkRestored(dbName)
+	return nil
+}
+
+// reapplyIfPending runs dbName's pending local-log re-apply, if its durable
+// mark is set.
+func (ae *AntiEntropyService) reapplyIfPending(dbName string) {
+	mdb, err := ae.dbManager.GetDatabase(dbName)
+	if err != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), ae.interval)
+	defer cancel()
+	applied, err := mdb.ReapplyLocalLogIfPending(ctx)
+	if err != nil {
+		log.Warn().Err(err).Str("database", dbName).Int("applied", applied).
+			Msg("anti-entropy: local-log re-apply failed, will retry next round")
+		return
+	}
+	if applied > 0 {
+		log.Info().Str("database", dbName).Int("applied", applied).
+			Msg("anti-entropy: local-log re-apply completed after restore")
+	}
 }
 
 // restoreAwaitingDatabases retries the snapshot restore of every database
 // whose reattach after an earlier restore failed (DatabasesAwaitingRestore).
 // Such a database is out of service and absent from ListDatabases, so the
-// loop above never reaches it; each alive peer is tried in turn until one
-// restore succeeds.
-func (ae *AntiEntropyService) restoreAwaitingDatabases(ctx context.Context, aliveNodes []*NodeState) {
+// loop in performAntiEntropy never reaches it; each alive peer is tried in
+// turn until one restore succeeds.
+func (ae *AntiEntropyService) restoreAwaitingDatabases(alive []*NodeState) {
 	if ae.snapshotFunc == nil {
 		return
 	}
 	for _, dbName := range ae.dbManager.DatabasesAwaitingRestore() {
-		for _, peer := range aliveNodes {
-			err := ae.snapshotFunc(ctx, peer.NodeId, peer.Address, dbName)
+		for _, peer := range alive {
+			ctx, cancel := ae.restoreContext()
+			err := ae.restoreFromPeer(ctx, dbName, peer)
+			cancel()
 			if err == nil {
 				telemetry.AntiEntropySyncsTotal.With("snapshot", "success").Inc()
 				log.Info().Uint64("peer_node", peer.NodeId).Str("database", dbName).
@@ -316,348 +562,58 @@ func (ae *AntiEntropyService) restoreAwaitingDatabases(ctx context.Context, aliv
 	}
 }
 
-// findBestPeerForDatabase finds the peer with highest max_txn_id or most transactions
-// Uses two criteria:
-// 1. Higher max_txn_id indicates more recent transactions
-// 2. Higher committed_txn_count indicates more data (tiebreaker when max_txn_id is the same)
-// CRITICAL: Skips peers with older schema versions to prevent data loss from DDL changes
-// Returns nil if we're already up to date with all peers
-func (ae *AntiEntropyService) findBestPeerForDatabase(ctx context.Context, aliveNodes []*NodeState, database string) *NodeState {
-	localMaxTxnID, err := ae.dbManager.GetMaxTxnID(database)
-	if err != nil {
-		log.Warn().Err(err).Str("database", database).Msg("Failed to get local max txn_id")
-		localMaxTxnID = 0
-	}
-
-	localTxnCount, err := ae.dbManager.GetCommittedTxnCount(database)
-	if err != nil {
-		log.Warn().Err(err).Str("database", database).Msg("Failed to get local txn count")
-		localTxnCount = 0
-	}
-
-	var localSchemaVersion uint64 = 0
-	if ae.schemaVersionMgr != nil {
-		localSchemaVersion, err = ae.schemaVersionMgr.GetSchemaVersion(database)
-		if err != nil {
-			log.Warn().Err(err).Str("database", database).Msg("Failed to get local schema version, treating as 0")
-			localSchemaVersion = 0
-		}
-	}
-
-	log.Debug().
-		Uint64("node_id", ae.nodeID).
-		Str("database", database).
-		Uint64("local_max_txn", localMaxTxnID).
-		Int64("local_txn_count", localTxnCount).
-		Uint64("local_schema_version", localSchemaVersion).
-		Int("peers_to_check", len(aliveNodes)).
-		Msg("ANTI-ENTROPY: Comparing with peers")
-
-	var bestPeer *NodeState
-	var bestMaxTxnID uint64 = localMaxTxnID
-	var bestTxnCount int64 = localTxnCount
-
-	for _, peer := range aliveNodes {
-		peerSchemaVersion := uint64(0)
-		if peer.DatabaseSchemaVersions != nil {
-			if version, exists := peer.DatabaseSchemaVersions[database]; exists {
-				peerSchemaVersion = version
-			}
-		}
-
-		if peerSchemaVersion < localSchemaVersion {
-			log.Debug().
-				Uint64("node_id", ae.nodeID).
-				Uint64("peer_node", peer.NodeId).
-				Str("database", database).
-				Uint64("local_schema_version", localSchemaVersion).
-				Uint64("peer_schema_version", peerSchemaVersion).
-				Msg("ANTI-ENTROPY: Skipping peer with older schema version")
-			continue
-		}
-
-		client, err := ae.client.GetClientByAddress(peer.Address)
-		if err != nil {
-			log.Debug().
-				Err(err).
-				Uint64("node_id", ae.nodeID).
-				Uint64("peer_node", peer.NodeId).
-				Msg("ANTI-ENTROPY: Failed to get client for peer")
-			continue
-		}
-
-		resp, err := client.GetReplicationState(ctx, &ReplicationStateRequest{
-			RequestingNodeId: ae.nodeID,
-			Database:         database,
-		})
-		if err != nil {
-			log.Debug().
-				Err(err).
-				Uint64("node_id", ae.nodeID).
-				Uint64("peer_node", peer.NodeId).
-				Msg("ANTI-ENTROPY: Failed to get replication state from peer")
-			continue
-		}
-
-		for _, state := range resp.States {
-			if state.DatabaseName != database {
-				continue
-			}
-
-			peerMaxTxn := state.CurrentMaxTxnId
-			peerTxnCount := state.CommittedTxnCount
-
-			log.Debug().
-				Uint64("node_id", ae.nodeID).
-				Uint64("peer_node", peer.NodeId).
-				Str("state_db", state.DatabaseName).
-				Uint64("peer_max_txn", peerMaxTxn).
-				Int64("peer_txn_count", peerTxnCount).
-				Uint64("peer_schema_version", peerSchemaVersion).
-				Uint64("best_max_txn", bestMaxTxnID).
-				Int64("best_txn_count", bestTxnCount).
-				Msg("ANTI-ENTROPY: Checking peer state")
-
-			// Select peer if:
-			// 1. Peer has higher max_txn_id, OR
-			// 2. Peer has same max_txn_id but more committed transactions (more data)
-			shouldSelect := peerMaxTxn > bestMaxTxnID ||
-				(peerMaxTxn == bestMaxTxnID && peerTxnCount > bestTxnCount)
-
-			if shouldSelect {
-				bestMaxTxnID = peerMaxTxn
-				bestTxnCount = peerTxnCount
-				bestPeer = peer
-				log.Debug().
-					Uint64("node_id", ae.nodeID).
-					Uint64("new_best_peer", peer.NodeId).
-					Uint64("new_best_txn", bestMaxTxnID).
-					Int64("new_best_count", bestTxnCount).
-					Msg("ANTI-ENTROPY: Found better peer")
-			}
-		}
-	}
-
-	if bestPeer != nil {
-		log.Debug().
-			Uint64("node_id", ae.nodeID).
-			Uint64("best_peer", bestPeer.NodeId).
-			Str("database", database).
-			Uint64("local_max_txn", localMaxTxnID).
-			Int64("local_txn_count", localTxnCount).
-			Uint64("peer_max_txn", bestMaxTxnID).
-			Int64("peer_txn_count", bestTxnCount).
-			Msg("ANTI-ENTROPY: Found best peer for sync")
-	} else {
-		log.Debug().
-			Uint64("node_id", ae.nodeID).
-			Str("database", database).
-			Uint64("local_max_txn", localMaxTxnID).
-			Int64("local_txn_count", localTxnCount).
-			Msg("ANTI-ENTROPY: We have the most data, no sync needed")
-	}
-
-	return bestPeer
+// setCaughtUp records dbName's caught-up status for the round just
+// completed.
+func (ae *AntiEntropyService) setCaughtUp(dbName string, caughtUp bool) {
+	ae.statusMu.Lock()
+	defer ae.statusMu.Unlock()
+	ae.caughtUp[dbName] = caughtUp
 }
 
-// syncPeerDatabase syncs a single database with a peer
-// In a leaderless system, we need to compare our local max txn ID with the peer's
-// If peer has more transactions, we pull from them
-func (ae *AntiEntropyService) syncPeerDatabase(ctx context.Context, peer *NodeState, database string) error {
-	// Get peer's replication state (peer returns their max txn ID)
-	client, err := ae.client.GetClientByAddress(peer.Address)
-	if err != nil {
-		return fmt.Errorf("failed to connect to peer: %w", err)
-	}
-
-	resp, err := client.GetReplicationState(ctx, &ReplicationStateRequest{
-		RequestingNodeId: ae.nodeID,
-		Database:         database,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to get replication state: %w", err)
-	}
-
-	// Find the state for this database
-	var dbState *DatabaseReplicationState
-	for _, state := range resp.States {
-		if state.DatabaseName == database {
-			dbState = state
-			break
-		}
-	}
-
-	if dbState == nil {
-		// Peer doesn't have this database yet
-		log.Debug().
-			Uint64("peer_node", peer.NodeId).
-			Str("database", database).
-			Msg("Peer doesn't have replication state for database")
-		return nil
-	}
-
-	// Get our local max txn ID for comparison
-	localMaxTxnID, err := ae.dbManager.GetMaxTxnID(database)
-	if err != nil {
-		log.Warn().Err(err).Str("database", database).Msg("Failed to get local max txn_id")
-		localMaxTxnID = 0
-	}
-
-	peerMaxTxnID := dbState.CurrentMaxTxnId
-	peerTxnCount := dbState.CommittedTxnCount
-
-	// Get local committed txn count
-	localTxnCount, err := ae.dbManager.GetCommittedTxnCount(database)
-	if err != nil {
-		log.Warn().Err(err).Str("database", database).Msg("Failed to get local txn count")
-		localTxnCount = 0
-	}
-
-	log.Debug().
-		Uint64("node_id", ae.nodeID).
-		Uint64("peer_node", peer.NodeId).
-		Str("database", database).
-		Uint64("local_max_txn", localMaxTxnID).
-		Uint64("peer_max_txn", peerMaxTxnID).
-		Int64("local_txn_count", localTxnCount).
-		Int64("peer_txn_count", peerTxnCount).
-		Msg("ANTI-ENTROPY: Comparing with peer")
-
-	// Determine if we need to sync from peer
-	// Primary metric: transaction COUNT (number of committed transactions)
-	// Secondary metric: max txn ID (HLC timestamp) as tiebreaker when counts are equal
-	// This avoids spurious syncs due to HLC drift between nodes
-	needsSync := peerTxnCount > localTxnCount ||
-		(peerTxnCount == localTxnCount && peerMaxTxnID > localMaxTxnID)
-
-	if needsSync {
-		// Use transaction count difference for lag calculation, NOT HLC difference
-		// HLC differences can be millions even for near-simultaneous transactions
-		txnCountDiff := peerTxnCount - localTxnCount
-		var lag uint64
-		if txnCountDiff > 0 {
-			lag = uint64(txnCountDiff)
-		}
-
-		log.Debug().
-			Uint64("node_id", ae.nodeID).
-			Uint64("peer_node", peer.NodeId).
-			Str("database", database).
-			Uint64("lag_txns", lag).
-			Int64("txn_count_diff", txnCountDiff).
-			Msg("ANTI-ENTROPY: We are behind peer, pulling transactions")
-
-		// If txn_count is the same but max_txn_id differs, we have divergent HLC timestamps
-		// This is normal in a leaderless system - different nodes may commit at slightly different times
-		// Delta sync should work fine since both nodes have the same number of transactions
-		// Only use snapshot if we can't determine which transactions we're missing
-		if lag == 0 && peerMaxTxnID > localMaxTxnID {
-			log.Debug().
-				Uint64("node_id", ae.nodeID).
-				Uint64("peer_node", peer.NodeId).
-				Str("database", database).
-				Int64("local_txn_count", localTxnCount).
-				Int64("peer_txn_count", peerTxnCount).
-				Uint64("local_max_txn", localMaxTxnID).
-				Uint64("peer_max_txn", peerMaxTxnID).
-				Msg("ANTI-ENTROPY: Same txn count but different max HLC - using delta sync to verify")
-
-			// Try delta sync - it will pull any transactions we're missing
-			// If there are no missing transactions, it will be a no-op
-		}
-
-		// Calculate time lag based on last sync time
-		// If LastSyncTime is 0 (first sync), use 0 duration to avoid ~54 year lag
-		var timeLag time.Duration
-		if dbState.LastSyncTime > 0 {
-			timeLag = time.Since(time.Unix(0, dbState.LastSyncTime))
-		}
-
-		// Decide: delta sync or snapshot?
-		if ae.shouldUseDeltaSync(lag, timeLag) {
-			// Use delta sync - pull transactions from peer starting after our local max
-			log.Debug().
-				Uint64("peer_node", peer.NodeId).
-				Str("database", database).
-				Uint64("from_txn_id", localMaxTxnID).
-				Msg("ANTI-ENTROPY: Using delta sync for catch-up")
-
-			result, err := ae.deltaSync.SyncFromPeer(
-				ctx,
-				peer.NodeId,
-				peer.Address,
-				database,
-				localMaxTxnID, // Start from our local max, pull newer transactions
-			)
-			if err != nil {
-				// Check if error is due to gap detection (missing transactions)
-				// If so, fall back to snapshot instead of failing
-				errMsg := err.Error()
-				if strings.Contains(errMsg, "gap detected") {
-					log.Warn().
-						Err(err).
-						Uint64("peer_node", peer.NodeId).
-						Str("database", database).
-						Msg("Gap detected in delta sync, falling back to snapshot")
-
-					// Try snapshot instead
-					if ae.snapshotFunc != nil {
-						if snapErr := ae.snapshotFunc(ctx, peer.NodeId, peer.Address, database); snapErr != nil {
-							telemetry.AntiEntropySyncsTotal.With("snapshot", "failed").Inc()
-							return fmt.Errorf("delta sync failed with gap (transactions GC'd) and snapshot fallback failed: %w", snapErr)
-						}
-						telemetry.AntiEntropySyncsTotal.With("snapshot", "success").Inc()
-						return nil
-					}
-					telemetry.AntiEntropySyncsTotal.With("delta", "failed").Inc()
-					return fmt.Errorf("delta sync failed with gap (transactions GC'd) but snapshot function not configured: %w", err)
-				}
-				// Other errors - fail normally
-				telemetry.AntiEntropySyncsTotal.With("delta", "failed").Inc()
-				return fmt.Errorf("delta sync failed: %w", err)
-			}
-
-			telemetry.AntiEntropySyncsTotal.With("delta", "success").Inc()
-			telemetry.DeltaSyncTxnsTotal.Add(float64(result.TxnsApplied))
-			log.Debug().
-				Uint64("peer_node", peer.NodeId).
-				Str("database", database).
-				Int("txns_applied", result.TxnsApplied).
-				Msg("ANTI-ENTROPY: Delta sync completed")
-		} else {
-			// Use snapshot (full database transfer)
-			log.Debug().
-				Uint64("peer_node", peer.NodeId).
-				Str("database", database).
-				Uint64("lag_txns", lag).
-				Msg("ANTI-ENTROPY: Lag too large, using snapshot")
-
-			if ae.snapshotFunc != nil {
-				if err := ae.snapshotFunc(ctx, peer.NodeId, peer.Address, database); err != nil {
-					telemetry.AntiEntropySyncsTotal.With("snapshot", "failed").Inc()
-					return fmt.Errorf("snapshot transfer failed: %w", err)
-				}
-				telemetry.AntiEntropySyncsTotal.With("snapshot", "success").Inc()
-			} else {
-				log.Warn().Msg("Snapshot function not configured, skipping snapshot transfer")
-			}
-		}
-	}
-
-	return nil
+// CaughtUp reports whether, in anti-entropy's last completed round for
+// database, every current member's log was reachable and this node's
+// cursor into it had reached that member's stable point. False before
+// anti-entropy has run a round
+// for database.
+func (ae *AntiEntropyService) CaughtUp(database string) bool {
+	ae.statusMu.RLock()
+	defer ae.statusMu.RUnlock()
+	return ae.caughtUp[database]
 }
 
-// shouldUseDeltaSync determines whether to use delta sync vs snapshot
-// Returns true if lag is small enough for delta sync
-func (ae *AntiEntropyService) shouldUseDeltaSync(lagTxns uint64, lagTime time.Duration) bool {
-	// Use delta sync if BOTH conditions are met:
-	// 1. Transaction lag is below threshold
-	// 2. Time lag is below threshold
+// setPromotionReady records dbName's promotion-readiness for the round just
+// completed (see syncDatabase's dbPromotionReady comment).
+func (ae *AntiEntropyService) setPromotionReady(dbName string, ready bool) {
+	ae.statusMu.Lock()
+	defer ae.statusMu.Unlock()
+	ae.promotionReady[dbName] = ready
+}
 
-	txnThreshold := uint64(ae.deltaThresholdTxns)
-	timeThreshold := time.Duration(ae.deltaThresholdSeconds) * time.Second
+// PromotionReady reports whether database is ready for this node to be
+// promoted from JOINING to ALIVE: true iff, in anti-entropy's
+// last completed round, at least one alive peer was pulled and every alive
+// peer's pair returned no error, was not Unimplemented or DatabaseAbsent,
+// reported CaughtUp and did not need a snapshot. Unlike CaughtUp, this is
+// deliberately evaluated over alive peers only, never every member: waiting
+// for a DEAD member's log too would keep a restarted node JOINING forever
+// while that member stays down. False before anti-entropy has run a round
+// for database.
+func (ae *AntiEntropyService) PromotionReady(database string) bool {
+	ae.statusMu.RLock()
+	defer ae.statusMu.RUnlock()
+	return ae.promotionReady[database]
+}
 
-	return lagTxns < txnThreshold && lagTime < timeThreshold
+// StuckTxnCount returns how many of database's transactions LogPuller
+// currently reports STUCK on a deterministic replay failure.
+func (ae *AntiEntropyService) StuckTxnCount(database string) int {
+	count := 0
+	for _, t := range ae.logPuller.StuckTxns() {
+		if t.Database == database {
+			count++
+		}
+	}
+	return count
 }
 
 // ForceSync forces an immediate anti-entropy round
@@ -667,104 +623,29 @@ func (ae *AntiEntropyService) ForceSync() {
 	ae.performAntiEntropy()
 }
 
-// GetStats returns current anti-entropy statistics
+// GetStats returns current anti-entropy statistics: overall service state
+// plus, per database, whether it is caught up and how many of its
+// transactions are stuck.
 func (ae *AntiEntropyService) GetStats() map[string]interface{} {
 	ae.mu.Lock()
-	defer ae.mu.Unlock()
+	enabled := ae.enabled
+	running := ae.running
+	ae.mu.Unlock()
+
+	databases := ae.dbManager.ListDatabases()
+	dbStats := make(map[string]interface{}, len(databases))
+	for _, dbName := range databases {
+		dbStats[dbName] = map[string]interface{}{
+			"caught_up":       ae.CaughtUp(dbName),
+			"promotion_ready": ae.PromotionReady(dbName),
+			"stuck_txns":      ae.StuckTxnCount(dbName),
+		}
+	}
 
 	return map[string]interface{}{
-		"enabled":                 ae.enabled,
-		"running":                 ae.running,
-		"interval_seconds":        ae.interval.Seconds(),
-		"delta_threshold_txns":    ae.deltaThresholdTxns,
-		"delta_threshold_seconds": ae.deltaThresholdSeconds,
+		"enabled":          enabled,
+		"running":          running,
+		"interval_seconds": ae.interval.Seconds(),
+		"databases":        dbStats,
 	}
-}
-
-// RefreshPeerReplicationStates queries all alive peers for their replication state
-// and updates local state. This ensures GC has fresh watermarks before making decisions.
-// Called by GC before Phase 2 to prevent data loss from stale watermarks.
-func (ae *AntiEntropyService) RefreshPeerReplicationStates(ctx context.Context) error {
-	if !ae.enabled {
-		return nil
-	}
-
-	// Get all ALIVE nodes from registry
-	nodes := ae.registry.GetAll()
-	var alivePeers []*NodeState
-	for _, node := range nodes {
-		if node.Status == NodeStatus_ALIVE && node.NodeId != ae.nodeID {
-			alivePeers = append(alivePeers, node)
-		}
-	}
-
-	if len(alivePeers) == 0 {
-		// No peers to query - single node cluster
-		return nil
-	}
-
-	// Get all databases to query
-	databases := ae.dbManager.ListDatabases()
-	if len(databases) == 0 {
-		return nil
-	}
-
-	var refreshErrors []string
-
-	// Query each peer for their replication state
-	for _, peer := range alivePeers {
-		client, err := ae.client.GetClientByAddress(peer.Address)
-		if err != nil {
-			refreshErrors = append(refreshErrors, fmt.Sprintf("peer %d: connection failed", peer.NodeId))
-			continue
-		}
-
-		for _, dbName := range databases {
-			resp, err := client.GetReplicationState(ctx, &ReplicationStateRequest{
-				RequestingNodeId: ae.nodeID,
-				Database:         dbName,
-			})
-			if err != nil {
-				refreshErrors = append(refreshErrors, fmt.Sprintf("peer %d db %s: %v", peer.NodeId, dbName, err))
-				continue
-			}
-
-			// Update local state with peer's current max txn_id
-			for _, state := range resp.States {
-				if state.DatabaseName != dbName {
-					continue
-				}
-
-				// Store the peer's current max txn_id as their replication state
-				// This is what we track for GC safe point calculation
-				repState := &db.ReplicationState{
-					PeerNodeID:        peer.NodeId,
-					DatabaseName:      dbName,
-					LastAppliedTxnID:  state.CurrentMaxTxnId,
-					LastAppliedTSWall: ae.clock.Now().WallTime,
-					LastAppliedTSLog:  0,
-					LastSyncTime:      time.Now().UnixNano(),
-					SyncStatus:        "REFRESHED",
-				}
-
-				if err := ae.dbManager.UpdateReplicationState(repState); err != nil {
-					log.Warn().
-						Err(err).
-						Uint64("peer_node", peer.NodeId).
-						Str("database", dbName).
-						Msg("Failed to update replication state during refresh")
-				}
-			}
-		}
-	}
-
-	if len(refreshErrors) > 0 {
-		// Log but don't fail - we may have partial success
-		log.Warn().
-			Strs("errors", refreshErrors).
-			Int("peer_count", len(alivePeers)).
-			Msg("Some peers failed during replication state refresh")
-	}
-
-	return nil
 }

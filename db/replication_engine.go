@@ -67,7 +67,6 @@ type CommitRequest struct {
 type CommitResult struct {
 	Success bool
 	Error   string
-	DDLSQL  string // SQL for DDL statements (if any)
 	// ClaimNotApplicable reports a COMMIT refused because this node could not
 	// apply the AUTO_INCREMENT claim it carries (ErrAutoIncClaimNotApplicable).
 	ClaimNotApplicable bool
@@ -145,6 +144,19 @@ func statementsCarryAutoIDClaim(statements []protocol.Statement) bool {
 func (re *ReplicationEngine) prepareDatabaseOperation(req *PrepareRequest) *PrepareResult {
 	stmt := req.Statements[0]
 
+	dbOp := DatabaseOpCreate
+	if stmt.Type == protocol.StatementDropDatabase {
+		dbOp = DatabaseOpDrop
+	}
+
+	// Fail fast: resolve and fence the op's registry key before touching the
+	// system database's transaction manager, so a stale coordinator's PREPARE
+	// is refused without leaving a transaction behind to abort.
+	opKey, rejected := re.resolveDatabaseOpKey(stmt, dbOp)
+	if rejected != nil {
+		return rejected
+	}
+
 	systemDB, err := re.dbMgr.GetDatabase(SystemDatabaseName)
 	if err != nil {
 		return &PrepareResult{Success: false, Error: fmt.Sprintf("system database not found: %v", err)}
@@ -162,16 +174,13 @@ func (re *ReplicationEngine) prepareDatabaseOperation(req *PrepareRequest) *Prep
 	}
 
 	dbIntentKey := filter.EncodeDBOpIntentKey(stmt.Database)
-	dbOp := DatabaseOpCreate
-	if stmt.Type == protocol.StatementDropDatabase {
-		dbOp = DatabaseOpDrop
-	}
 
 	snapshotData := DatabaseOperationSnapshot{
 		Type:         int(stmt.Type),
 		Timestamp:    req.StartTS.WallTime,
 		DatabaseName: stmt.Database,
 		Operation:    dbOp,
+		Generation:   opKey.Generation,
 	}
 	dataSnapshot, err := SerializeData(snapshotData)
 	if err != nil {
@@ -187,6 +196,7 @@ func (re *ReplicationEngine) prepareDatabaseOperation(req *PrepareRequest) *Prep
 	log.Info().
 		Str("database", stmt.Database).
 		Str("operation", dbOp.String()).
+		Uint64("generation", opKey.Generation).
 		Uint64("node_id", re.nodeID).
 		Uint64("txn_id", req.TxnID).
 		Msg("Database operation prepared (intent created)")
@@ -197,6 +207,55 @@ func (re *ReplicationEngine) prepareDatabaseOperation(req *PrepareRequest) *Prep
 	}
 
 	return &PrepareResult{Success: true}
+}
+
+// resolveDatabaseOpKey computes the DatabaseRegistryKey a CREATE/DROP
+// DATABASE statement's PREPARE resolves to for stmt.Database, and gates a
+// coordinator's stamp against this participant's local key.
+//
+// stmt.DatabaseGeneration == 0 means "unstamped": a coordinator that predates
+// Statement.DatabaseGeneration (rolling upgrade). The key is then computed
+// locally, the same way a stamping coordinator would from its own registry
+// (CREATE: the current key if live, else one generation above it; DROP: the
+// current key), and the gate below is skipped - this participant simply
+// trusts the legacy request, as it always has.
+//
+// Otherwise the stamped key is compared with the local key: below local means
+// the coordinator's view of the database's history is stale, so the PREPARE
+// is refused with ErrStaleDatabaseOpCoordinator (see
+// DatabaseManager.ApplyDatabaseOp's proof for why this is required for
+// convergence). Equal or above is accepted unchanged.
+func (re *ReplicationEngine) resolveDatabaseOpKey(stmt protocol.Statement, dbOp DatabaseOpType) (DatabaseRegistryKey, *PrepareResult) {
+	dbMgr, ok := re.dbMgr.(*DatabaseManager)
+	if !ok {
+		return DatabaseRegistryKey{}, &PrepareResult{Success: false, Error: "database manager does not support database operations"}
+	}
+
+	local, err := dbMgr.RegistryKey(stmt.Database)
+	if err != nil {
+		return DatabaseRegistryKey{}, &PrepareResult{Success: false, Error: fmt.Sprintf("failed to read database registry: %v", err)}
+	}
+
+	if stmt.DatabaseGeneration == 0 {
+		if dbOp == DatabaseOpDrop {
+			return local, nil
+		}
+		if !local.Dropped {
+			return local, nil // already live: CREATE is a no-op at the current generation
+		}
+		return DatabaseRegistryKey{Generation: local.Generation + 1, Dropped: false}, nil
+	}
+
+	opKey := DatabaseRegistryKey{Generation: stmt.DatabaseGeneration, Dropped: dbOp == DatabaseOpDrop}
+	if opKey.Compare(local) < 0 {
+		return DatabaseRegistryKey{}, &PrepareResult{
+			Success:  false,
+			Rejected: true,
+			Error: fmt.Sprintf("%v: database %s op key %+v is below local key %+v",
+				ErrStaleDatabaseOpCoordinator, stmt.Database, opKey, local),
+		}
+	}
+	return opKey, nil
 }
 
 // prepareRegularTransaction handles regular transaction preparation
@@ -278,7 +337,13 @@ func (re *ReplicationEngine) prepareRegularTransaction(ctx context.Context, req 
 // own BEGIN. Callers must reject the PREPARE / refuse the COMMIT on error
 // rather than silently skip the claim.
 func (re *ReplicationEngine) autoIncClaimStore() (*AutoIncClaimStore, error) {
-	systemDB, err := re.dbMgr.GetDatabase(SystemDatabaseName)
+	return autoIncClaimStoreOf(re.dbMgr)
+}
+
+// autoIncClaimStoreOf resolves dbMgr's AUTO_INCREMENT claim store (see
+// ReplicationEngine.autoIncClaimStore).
+func autoIncClaimStoreOf(dbMgr DatabaseProvider) (*AutoIncClaimStore, error) {
+	systemDB, err := dbMgr.GetDatabase(SystemDatabaseName)
 	if err != nil {
 		return nil, fmt.Errorf("system database unavailable: %w", err)
 	}
@@ -705,28 +770,28 @@ func (re *ReplicationEngine) Commit(ctx context.Context, req *CommitRequest) *Co
 
 						dbOp := snapshotData.Operation
 						dbName := snapshotData.DatabaseName
+						if dbOp != DatabaseOpCreate && dbOp != DatabaseOpDrop {
+							log.Error().Str("operation", dbOp.String()).Uint64("txn_id", req.TxnID).Msg("Unknown database operation")
+							continue
+						}
 
-						// Execute the database operation BEFORE committing the transaction
+						// Execute the database operation BEFORE committing the transaction,
+						// through the same key-fenced merge ApplyDatabaseOp gives
+						// anti-entropy reconciliation.
 						dbMgr, ok := re.dbMgr.(*DatabaseManager)
 						if !ok {
 							_ = systemTxnMgr.AbortTransaction(systemTxn)
 							return &CommitResult{Success: false, Error: "database manager does not support database operations"}
 						}
 
-						var dbOpErr error
-						switch dbOp {
-						case DatabaseOpCreate:
-							log.Info().Str("database", dbName).Uint64("node_id", re.nodeID).Msg("Executing CREATE DATABASE in commit phase")
-							dbOpErr = dbMgr.CreateDatabase(dbName)
-						case DatabaseOpDrop:
-							log.Info().Str("database", dbName).Uint64("node_id", re.nodeID).Msg("Executing DROP DATABASE in commit phase")
-							dbOpErr = dbMgr.DropDatabase(dbName)
-						default:
-							log.Error().Str("operation", dbOp.String()).Uint64("txn_id", req.TxnID).Msg("Unknown database operation")
-							continue
-						}
-
-						if dbOpErr != nil {
+						opKey := DatabaseRegistryKey{Generation: snapshotData.Generation, Dropped: dbOp == DatabaseOpDrop}
+						log.Info().
+							Str("database", dbName).
+							Str("operation", dbOp.String()).
+							Uint64("generation", opKey.Generation).
+							Uint64("node_id", re.nodeID).
+							Msg("Applying database operation in commit phase")
+						if _, dbOpErr := dbMgr.ApplyDatabaseOp(dbName, opKey); dbOpErr != nil {
 							log.Error().Err(dbOpErr).Str("database", dbName).Str("operation", dbOp.String()).Msg("Database operation failed in commit phase")
 							_ = systemTxnMgr.AbortTransaction(systemTxn)
 							return &CommitResult{Success: false, Error: fmt.Sprintf("database operation failed: %v", dbOpErr)}
@@ -745,15 +810,7 @@ func (re *ReplicationEngine) Commit(ctx context.Context, req *CommitRequest) *Co
 							Uint64("node_id", re.nodeID).
 							Msg("Database operation committed successfully")
 
-						// Return DDLSQL so replication handler can increment schema version
-						var ddlSQL string
-						switch dbOp {
-						case DatabaseOpCreate:
-							ddlSQL = fmt.Sprintf("CREATE DATABASE IF NOT EXISTS %s", dbName)
-						case DatabaseOpDrop:
-							ddlSQL = fmt.Sprintf("DROP DATABASE IF EXISTS %s", dbName)
-						}
-						return &CommitResult{Success: true, DDLSQL: ddlSQL}
+						return &CommitResult{Success: true}
 					}
 				}
 			}
@@ -766,10 +823,12 @@ func (re *ReplicationEngine) Commit(ctx context.Context, req *CommitRequest) *Co
 		return &CommitResult{Success: false, Error: fmt.Sprintf("database not found: %s", req.Database)}
 	}
 
-	txnMgr := replicatedDB.GetTransactionManager()
-
-	txn := txnMgr.GetTransaction(req.TxnID)
+	txn := replicatedDB.GetTransactionManager().GetTransaction(req.TxnID)
 	if txn == nil {
+		if committedLocally(replicatedDB, req.TxnID) {
+			// The log puller already committed it here (CommitLocallyPrepared).
+			return &CommitResult{Success: true}
+		}
 		log.Error().
 			Uint64("txn_id", req.TxnID).
 			Uint64("node_id", re.nodeID).
@@ -779,6 +838,60 @@ func (re *ReplicationEngine) Commit(ctx context.Context, req *CommitRequest) *Co
 	}
 	txn.Statements = req.Statements
 
+	// The gate is the statement flag, not a store lookup: reading intents on
+	// every commit would put a Pebble scan on the write path. The flag decides
+	// only whether to look; every value written comes from the intent.
+	result, _ := commitPreparedTxn(re.dbMgr, replicatedDB, txn, req.Database, statementsCarryAutoIDClaim(req.Statements))
+	return result
+}
+
+// CommitLocallyPrepared commits database's durably prepared transaction
+// txnID through the same local commit path a COMMIT RPC takes, for a
+// transaction some peer's committed log proves was decided COMMITTED while
+// this node never received (or failed to apply) its COMMIT. With no
+// coordinator statements to read the claim flag from, whether the
+// transaction carries an AUTO_INCREMENT claim is read from its intents.
+func (dm *DatabaseManager) CommitLocallyPrepared(database string, txnID uint64) error {
+	replicatedDB, err := dm.GetDatabase(database)
+	if err != nil {
+		return fmt.Errorf("database %s: %w", database, err)
+	}
+	txn := replicatedDB.GetTransactionManager().GetTransaction(txnID)
+	if txn == nil {
+		if committedLocally(replicatedDB, txnID) {
+			return nil
+		}
+		return fmt.Errorf("transaction %d is not pending in %s", txnID, database)
+	}
+	intents, err := replicatedDB.GetMetaStore().GetIntentsByTxn(txnID)
+	if err != nil {
+		return fmt.Errorf("read intents for txn %d: %w", txnID, err)
+	}
+	carriesClaim := false
+	for _, intent := range intents {
+		if intent.IntentType == IntentTypeAutoIDClaim {
+			carriesClaim = true
+			break
+		}
+	}
+	_, err = commitPreparedTxn(dm, replicatedDB, txn, database, carriesClaim)
+	return err
+}
+
+// committedLocally reports whether replicatedDB's local record for txnID is
+// COMMITTED.
+func committedLocally(replicatedDB *ReplicatedDatabase, txnID uint64) bool {
+	rec, err := replicatedDB.GetMetaStore().GetTransaction(txnID)
+	return err == nil && rec != nil && rec.Status == TxnStatusCommitted
+}
+
+// commitPreparedTxn is the user-database half of the COMMIT phase, shared by
+// ReplicationEngine.Commit and DatabaseManager.CommitLocallyPrepared: apply
+// txn's AUTO_INCREMENT claim first when applyClaims is set, then commit txn
+// and refresh the read pool after DDL. It returns the result to answer a
+// COMMIT with and the underlying error (nil when that result is a success,
+// including for a transaction another caller already committed).
+func commitPreparedTxn(dbMgr DatabaseProvider, replicatedDB *ReplicatedDatabase, txn *Transaction, database string, applyClaims bool) (*CommitResult, error) {
 	// Apply any AUTO_INCREMENT range claim BEFORE committing, and refuse the
 	// commit if it cannot be applied (the claim's first invariant: a
 	// participant must never ACK COMMIT unless the claim row is durably in its
@@ -795,61 +908,59 @@ func (re *ReplicationEngine) Commit(ctx context.Context, req *CommitRequest) *Co
 	// transaction, instead of unilaterally discarding writes the rest of the
 	// cluster may be committing.
 	//
-	// The gate is the statement flag, not a store lookup: reading intents on
-	// every commit would put a Pebble scan on the write path. The flag decides
-	// only whether to look; every value written comes from the intent.
-	if statementsCarryAutoIDClaim(req.Statements) {
-		claimStore, csErr := re.autoIncClaimStore()
-		if csErr != nil {
-			log.Error().
-				Err(csErr).
-				Uint64("txn_id", req.TxnID).
-				Uint64("node_id", re.nodeID).
-				Str("database", req.Database).
-				Msg("COMMIT REFUSED: system database unavailable for auto-increment claim apply")
-			return &CommitResult{Success: false, Error: fmt.Sprintf("auto-increment claim apply failed: %v", csErr)}
+	// The claim is applied under CommitTransactionAfter's concurrent-commit
+	// guard: it is conditional on the claim row's floors, so applying it a
+	// second time, for a transaction the log puller (or an earlier COMMIT)
+	// already committed, would be refused as not applicable.
+	var claimErr error
+	applyClaim := func() error {
+		if applyClaims {
+			claimErr = applyCommitClaims(dbMgr, replicatedDB, txn.ID, database)
 		}
-		if err := claimStore.ApplyClaims(req.Database, req.TxnID, replicatedDB.GetMetaStore()); err != nil {
-			// A claim this node cannot apply is the protocol refusing an ACK
-			// it must not give; anything else is a failed write.
-			notApplicable := errors.Is(err, ErrAutoIncClaimNotApplicable)
-			ev := log.Error()
-			if notApplicable {
-				ev = log.Warn()
-			}
-			ev.Err(err).
-				Uint64("txn_id", req.TxnID).
-				Uint64("node_id", re.nodeID).
-				Str("database", req.Database).
-				Msg("COMMIT REFUSED: auto-increment claim could not be applied")
-			return &CommitResult{Success: false, ClaimNotApplicable: notApplicable,
-				Error: fmt.Sprintf("auto-increment claim apply failed: %v", err)}
-		}
+		return claimErr
+	}
+	err := replicatedDB.GetTransactionManager().CommitTransactionAfter(txn, applyClaim)
+	switch {
+	case claimErr != nil:
+		return &CommitResult{Success: false, ClaimNotApplicable: errors.Is(claimErr, ErrAutoIncClaimNotApplicable),
+			Error: fmt.Sprintf("auto-increment claim apply failed: %v", claimErr)}, claimErr
+	case errors.Is(err, ErrTxnAlreadyCommitted):
+		return &CommitResult{Success: true}, nil
+	case err != nil:
+		return &CommitResult{Success: false, Error: err.Error()}, err
 	}
 
-	if err := txnMgr.CommitTransaction(txn); err != nil {
-		return &CommitResult{Success: false, Error: err.Error()}
-	}
-
-	// Extract DDL SQL from committed statements (populated during CommitTransaction)
-	var ddlSQL string
+	// If DDL was committed, refresh read pool to pick up schema changes.
+	// SQLite caches schema per-connection; read connections need refresh.
 	for _, stmt := range txn.Statements {
 		if stmt.Type == protocol.StatementDDL {
-			ddlSQL = stmt.SQL
+			replicatedDB.RefreshReadPool()
 			break
 		}
 	}
+	return &CommitResult{Success: true}, nil
+}
 
-	// If DDL was committed, refresh read pool to pick up schema changes
-	// SQLite caches schema per-connection; read connections need refresh
-	if ddlSQL != "" {
-		replicatedDB.RefreshReadPool()
+// applyCommitClaims applies txnID's AUTO_INCREMENT claim intents. An error
+// wrapping ErrAutoIncClaimNotApplicable is the protocol refusing an ACK this
+// node must not give; any other is a failed write.
+func applyCommitClaims(dbMgr DatabaseProvider, replicatedDB *ReplicatedDatabase, txnID uint64, database string) error {
+	claimStore, err := autoIncClaimStoreOf(dbMgr)
+	if err != nil {
+		log.Error().Err(err).Uint64("txn_id", txnID).Str("database", database).
+			Msg("COMMIT REFUSED: system database unavailable for auto-increment claim apply")
+		return err
 	}
-
-	return &CommitResult{
-		Success: true,
-		DDLSQL:  ddlSQL,
+	if err := claimStore.ApplyClaims(database, txnID, replicatedDB.GetMetaStore()); err != nil {
+		ev := log.Error()
+		if errors.Is(err, ErrAutoIncClaimNotApplicable) {
+			ev = log.Warn()
+		}
+		ev.Err(err).Uint64("txn_id", txnID).Str("database", database).
+			Msg("COMMIT REFUSED: auto-increment claim could not be applied")
+		return err
 	}
+	return nil
 }
 
 // Abort handles the abort phase of 2PC replication

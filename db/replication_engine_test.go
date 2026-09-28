@@ -647,6 +647,103 @@ func TestReplicationEngine_CommitDatabaseOp(t *testing.T) {
 	assert.Equal(t, TxnStatusCommitted, txnRec.Status)
 }
 
+// TestReplicationEngine_CommitDatabaseOp_UnstampedComputesGenerationLocally
+// pins the rolling-upgrade fallback: a
+// CREATE/DROP DATABASE statement with DatabaseGeneration left at its zero
+// value (an old coordinator that predates the field) is not gated, and
+// PREPARE computes its registry key the same way a stamping coordinator
+// would - here, generation 1, live, for a name never seen before.
+func TestReplicationEngine_CommitDatabaseOp_UnstampedComputesGenerationLocally(t *testing.T) {
+	engine, dm, cleanup := setupTestReplicationEngine(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	prepReq := &PrepareRequest{
+		TxnID:   2004,
+		NodeID:  1,
+		StartTS: hlc.Timestamp{WallTime: 9003, Logical: 1},
+		Statements: []protocol.Statement{
+			{Type: protocol.StatementCreateDatabase, Database: "legacydb"}, // DatabaseGeneration left unset (0)
+		},
+	}
+	prepResult := engine.Prepare(ctx, prepReq)
+	require.True(t, prepResult.Success)
+
+	commitResult := engine.Commit(ctx, &CommitRequest{TxnID: 2004})
+	require.True(t, commitResult.Success)
+
+	key, err := dm.RegistryKey("legacydb")
+	require.NoError(t, err)
+	require.Equal(t, DatabaseRegistryKey{Generation: 1, Dropped: false}, key)
+}
+
+// TestReplicationEngine_PrepareDatabaseOp_RefusesStaleCoordinatorStamp
+// verifies PREPARE refuses a CREATE/DROP DATABASE whose stamped
+// DatabaseGeneration is below the participant's local registry key: a
+// coordinator whose view of the database's history predates a drop and
+// re-create the participant already knows about.
+func TestReplicationEngine_PrepareDatabaseOp_RefusesStaleCoordinatorStamp(t *testing.T) {
+	engine, dm, cleanup := setupTestReplicationEngine(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	// Drive the database to generation 2, live (create, drop, re-create), so
+	// a stamp of 1 is stale.
+	require.NoError(t, dm.CreateDatabase("staledb"))
+	require.NoError(t, dm.DropDatabase("staledb"))
+	require.NoError(t, dm.CreateDatabase("staledb"))
+	local, err := dm.RegistryKey("staledb")
+	require.NoError(t, err)
+	require.Equal(t, DatabaseRegistryKey{Generation: 2, Dropped: false}, local)
+
+	result := engine.Prepare(ctx, &PrepareRequest{
+		TxnID:   2005,
+		NodeID:  1,
+		StartTS: hlc.Timestamp{WallTime: 9004, Logical: 1},
+		Statements: []protocol.Statement{
+			{Type: protocol.StatementCreateDatabase, Database: "staledb", DatabaseGeneration: 1},
+		},
+	})
+	require.False(t, result.Success)
+	require.True(t, result.Rejected, "a stale coordinator stamp must be a deterministic refusal")
+}
+
+// TestReplicationEngine_PrepareDatabaseOp_AcceptsStampAtOrAboveLocalKey
+// verifies PREPARE accepts a stamp equal to, or above, the participant's
+// local registry key.
+func TestReplicationEngine_PrepareDatabaseOp_AcceptsStampAtOrAboveLocalKey(t *testing.T) {
+	engine, dm, cleanup := setupTestReplicationEngine(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	// Equal to local: eqdb is live at generation 1; a DROP stamped at
+	// generation 1 matches it exactly.
+	require.NoError(t, dm.CreateDatabase("eqdb"))
+	result := engine.Prepare(ctx, &PrepareRequest{
+		TxnID:   2006,
+		NodeID:  1,
+		StartTS: hlc.Timestamp{WallTime: 9005, Logical: 1},
+		Statements: []protocol.Statement{
+			{Type: protocol.StatementDropDatabase, Database: "eqdb", DatabaseGeneration: 1},
+		},
+	})
+	require.True(t, result.Success, "a stamp equal to the local key must be accepted: %s", result.Error)
+
+	// Above local: hidb is tombstoned at generation 1; a CREATE stamped at
+	// generation 5 is well above the tombstone and must still be accepted.
+	require.NoError(t, dm.CreateDatabase("hidb"))
+	require.NoError(t, dm.DropDatabase("hidb"))
+	result = engine.Prepare(ctx, &PrepareRequest{
+		TxnID:   2007,
+		NodeID:  1,
+		StartTS: hlc.Timestamp{WallTime: 9006, Logical: 1},
+		Statements: []protocol.Statement{
+			{Type: protocol.StatementCreateDatabase, Database: "hidb", DatabaseGeneration: 5},
+		},
+	})
+	require.True(t, result.Success, "a stamp above the local key must be accepted: %s", result.Error)
+}
+
 // TestReplicationEngine_CommitNotFound verifies error when transaction doesn't exist
 func TestReplicationEngine_CommitNotFound(t *testing.T) {
 	engine, dm, cleanup := setupTestReplicationEngine(t)

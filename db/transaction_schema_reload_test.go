@@ -54,6 +54,19 @@ func newSchemaReloadFaultDB(t *testing.T) (faultyDB *sql.DB, dbPath string) {
 // propagate the error and fail the DDL apply instead.
 func TestApplyNonDMLIntents_PropagatesSchemaReloadFailure(t *testing.T) {
 	db, dbPath := newSchemaReloadFaultDB(t)
+
+	// applyNonDMLIntents needs __marmot_applied_txn and
+	// __marmot_schema_version to already exist, as NewReplicatedDatabase
+	// would create them. Create them through a separate, unfaulty connection
+	// to the same file so this doesn't consume one of the two connections the
+	// faulty driver below deliberately limits this test to.
+	setupDB, err := sql.Open(SQLiteDriverName, dbPath)
+	require.NoError(t, err)
+	require.NoError(t, ensureAppliedTxnTable(setupDB))
+	_, err = ensureSchemaVersionTable(setupDB, "testdb", false, nil)
+	require.NoError(t, err)
+	require.NoError(t, setupDB.Close())
+
 	schemaCache := NewSchemaCache()
 	tm := NewTransactionManager(db, nil, hlc.NewClock(1), schemaCache)
 
@@ -64,11 +77,12 @@ func TestApplyNonDMLIntents_PropagatesSchemaReloadFailure(t *testing.T) {
 		},
 	}
 
-	// The DDL exec itself is the first connection (succeeds); the schema
-	// reload that follows needs a second, fresh connection (fails). Every
-	// connection through this faulty driver after the first fails, so this
-	// is the last operation this test can perform against `db` itself.
-	err := tm.applyNonDMLIntents(1, intents)
+	// The whole non-DML tx (DDL exec, marker, schema-version bump, commit) is
+	// the first connection (succeeds); the schema reload that follows needs a
+	// second, fresh connection (fails). Every connection through this faulty
+	// driver after the first fails, so this is the last operation this test
+	// can perform against `db` itself.
+	err = tm.applyNonDMLIntents(1, hlc.Timestamp{}, intents)
 	require.Error(t, err, "a failed post-DDL schema reload must fail the DDL apply, not be silently logged and swallowed")
 	assert.Contains(t, err.Error(), "reload schema cache")
 
@@ -90,12 +104,23 @@ func TestApplyNonDMLIntents_PropagatesSchemaReloadFailure(t *testing.T) {
 // list (e.g. only LOAD DATA) does not attempt a schema reload at all, so it
 // is unaffected by this fix.
 func TestApplyNonDMLIntents_NoDDLNeverReloads(t *testing.T) {
-	db, _ := newSchemaReloadFaultDB(t)
+	db, dbPath := newSchemaReloadFaultDB(t)
+
+	// The marker table must exist for the marker-only tx below to succeed; see
+	// TestApplyNonDMLIntents_PropagatesSchemaReloadFailure for why this uses a
+	// separate, unfaulty connection instead of consuming the one the faulty
+	// driver allows.
+	setupDB, err := sql.Open(SQLiteDriverName, dbPath)
+	require.NoError(t, err)
+	require.NoError(t, ensureAppliedTxnTable(setupDB))
+	require.NoError(t, setupDB.Close())
+
 	schemaCache := NewSchemaCache()
 	tm := NewTransactionManager(db, nil, hlc.NewClock(1), schemaCache)
 
 	// No intents at all: hasDDL stays false, so reloadSchemaCache must never
-	// be called, and the second (failing) connection must never be needed.
-	err := tm.applyNonDMLIntents(1, nil)
+	// be called, and the second (failing) connection must never be needed -
+	// only the marker-only tx's own (first, successful) connection is used.
+	err = tm.applyNonDMLIntents(1, hlc.Timestamp{}, nil)
 	require.NoError(t, err)
 }

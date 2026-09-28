@@ -19,8 +19,8 @@ const (
 	localCommitFailedLog  = "Local commit failed after remote quorum achieved"
 )
 
-// TestNarrowAutoInc_ClaimsCommitUnderConstantBaseSync is reviewer rr-s3cf2's
-// H1 hunt, amplified without touching the backstop's interval: while every
+// TestNarrowAutoInc_ClaimsCommitUnderConstantBaseSync amplifies the base
+// sync without touching the backstop's interval: while every
 // node inserts into two SMALLINT tables (a claim every 31 ids), the test runs
 // the operator's sync command back to back on every node, so each node pulls
 // its peers' bases many times a second. A peer that committed a claim first
@@ -43,8 +43,11 @@ func TestNarrowAutoInc_ClaimsCommitUnderConstantBaseSync(t *testing.T) {
 	if err := harness.WaitForTableExists(tables[1], []int{1, 2, 3}, 30*time.Second); err != nil {
 		t.Fatal(err)
 	}
+	harness.Phase("start")
 
-	const load = 45 * time.Second
+	// 35s (not 45s): amplifies the backstop enough (100+ syncs) while keeping
+	// the whole test under a 55s budget.
+	const load = 35 * time.Second
 	stop := time.Now().Add(load)
 	var syncs, syncErrs atomic.Int64
 	var wg sync.WaitGroup
@@ -94,6 +97,7 @@ func TestNarrowAutoInc_ClaimsCommitUnderConstantBaseSync(t *testing.T) {
 		}(n)
 	}
 	wg.Wait()
+	harness.Phase("load-stopped")
 
 	t.Logf("syncs=%d sync errors=%d inserted per node=%v ids=%d", syncs.Load(), syncErrs.Load(), inserted[1:], len(ledger))
 	if len(dups) > 0 {
@@ -123,6 +127,6 @@ func TestNarrowAutoInc_ClaimsCommitUnderConstantBaseSync(t *testing.T) {
 		}
 	}
 	if syncs.Load() < 100 {
-		t.Fatalf("only %d syncs ran in %s; the hunt did not amplify the backstop", syncs.Load(), load)
+		t.Fatalf("only %d syncs ran in %s; the test did not amplify the backstop", syncs.Load(), load)
 	}
 }

@@ -79,9 +79,7 @@ func newGateCluster(t *testing.T, ids []uint64) (*handlerFanout, map[uint64]*gat
 		require.NoError(t, dm.MergeAutoIncBasesAndReleaseVotes(nil))
 		dm.SetClusterMembership(provider.GetTotalMembershipSize)
 		require.NoError(t, dm.CreateDatabase("gate"))
-		systemDB, err := dm.GetDatabase(db.SystemDatabaseName)
-		require.NoError(t, err)
-		versions := db.NewSchemaVersionManager(systemDB.GetMetaStore())
+		versions := db.NewSchemaVersionManager(dm)
 		wc := coordinator.NewWriteCoordinator(id, provider, fanout, db.NewLocalReplicator(id, dm, clock), 30*time.Second, clock)
 		wc.SetSchemaVersionSource(versions.GetSchemaVersion)
 		fanout.nodes[id] = &gateNode{id: id, clock: clock, dm: dm, versions: versions,
@@ -90,9 +88,11 @@ func newGateCluster(t *testing.T, ids []uint64) (*handlerFanout, map[uint64]*gat
 	return fanout, fanout.nodes
 }
 
-// gateDDL replicates ddl from node through 2PC and bumps that node's own
-// schema version, as CoordinatorHandler does after a DDL commit; remote
-// participants bump theirs when they apply the COMMIT.
+// gateDDL replicates ddl from node through 2PC. Every participant's own
+// commit (TransactionManager.applyNonDMLIntents) bumps its
+// __marmot_schema_version atomically with the DDL itself as part of that
+// commit, coordinator and remotes alike - there is nothing left to do here
+// after WriteTransaction returns.
 func gateDDL(t *testing.T, node *gateNode, table, ddl string) {
 	t.Helper()
 	startTS := node.clock.Now()
@@ -102,8 +102,6 @@ func gateDDL(t *testing.T, node *gateNode, table, ddl string) {
 		Statements:       []protocol.Statement{{Type: protocol.StatementDDL, SQL: ddl, TableName: table, Database: "gate"}},
 	}
 	require.NoError(t, node.wc.WriteTransaction(context.Background(), txn), ddl)
-	_, err := node.versions.IncrementSchemaVersion("gate", ddl, txn.ID)
-	require.NoError(t, err)
 }
 
 // waitGate polls until check passes, failing after a deadline: a commit
@@ -129,7 +127,7 @@ func (n *gateNode) base(table string) (uint64, error) {
 	return db.NewAutoIncClaimStore(n.dm.GetSystemDatabase()).ReadBase("gate", table)
 }
 
-// TestClaimFromALaggingVoterIsDeclined is R3c-12's counterexample, driven
+// TestClaimFromALaggingVoterIsDeclined is a lagging voter's counterexample, driven
 // through the real DDL apply path and every participant's ReplicationHandler.
 //
 // Nodes g=1, h=2, k=3. A claim on t2, (0,64], commits on {k,g} while h is

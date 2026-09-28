@@ -65,9 +65,6 @@ var (
 	// ReplicaCommitSeconds measures replica-side commit phase latency
 	ReplicaCommitSeconds Histogram = NoopStat{}
 
-	// ReplicaReplaySeconds measures replica-side replay phase latency (anti-entropy)
-	ReplicaReplaySeconds Histogram = NoopStat{}
-
 	// TwoPhaseQuorumAcks measures number of acks received per phase
 	TwoPhaseQuorumAcks HistogramVec = noopHistogramVec{}
 
@@ -121,9 +118,6 @@ var (
 
 	// ReplicationLagTxns tracks transaction lag per peer
 	ReplicationLagTxns GaugeVec = noopGaugeVec{}
-
-	// DeltaSyncTxnsTotal counts transactions applied via delta sync
-	DeltaSyncTxnsTotal Counter = NoopStat{}
 )
 
 // RowLockStore metrics
@@ -136,6 +130,23 @@ var (
 
 	// RowLockTables tracks number of tables with active locks
 	RowLockTables Gauge = NoopStat{}
+)
+
+// LogPuller metrics: the per-peer log-pull anti-entropy round.
+var (
+	// LogPullStuckTxns tracks, per database, the number of transactions a
+	// LogPuller has given up retrying every round because they failed to
+	// replay MaxReplayAttempts times in a row. It is exported as marmot_v2_anti_entropy_stuck_txns, following
+	// this package's existing namespace/subsystem convention.
+	LogPullStuckTxns GaugeVec = noopGaugeVec{}
+
+	// LogPullTxnsAppliedTotal counts transactions a LogPuller has applied
+	// (not merely covered by an existing marker) while pulling peers' logs.
+	LogPullTxnsAppliedTotal Counter = NoopStat{}
+
+	// LogPullPairResultsTotal counts LogPuller.PullPair calls by outcome:
+	// caught_up, behind, needs_snapshot, unimplemented, error.
+	LogPullPairResultsTotal CounterVec = noopCounterVec{}
 )
 
 // InitMetrics initializes all Prometheus metrics.
@@ -205,11 +216,6 @@ func InitMetrics() {
 	ReplicaCommitSeconds = NewHistogramWithBuckets(
 		"replica_commit_seconds",
 		"Replica-side commit phase latency in seconds",
-		TwoPCBuckets,
-	)
-	ReplicaReplaySeconds = NewHistogramWithBuckets(
-		"replica_replay_seconds",
-		"Replica-side replay phase latency in seconds",
 		TwoPCBuckets,
 	)
 	TwoPhaseQuorumAcks = NewHistogramVec(
@@ -292,10 +298,6 @@ func InitMetrics() {
 		"Transaction lag behind peer",
 		[]string{"peer"},
 	)
-	DeltaSyncTxnsTotal = NewCounter(
-		"delta_sync_txns_total",
-		"Total transactions applied via delta sync",
-	)
 
 	// RowLockStore metrics
 	RowLocksActive = NewGauge(
@@ -309,6 +311,22 @@ func InitMetrics() {
 	RowLockTables = NewGauge(
 		"row_lock_tables",
 		"Number of tables with active locks",
+	)
+
+	// LogPuller metrics
+	LogPullStuckTxns = NewGaugeVec(
+		"anti_entropy_stuck_txns",
+		"Number of transactions a log-pull round has stopped retrying every round after repeated replay failures",
+		[]string{"database"},
+	)
+	LogPullTxnsAppliedTotal = NewCounter(
+		"log_pull_txns_applied_total",
+		"Total transactions applied by pulling peers' local commit logs",
+	)
+	LogPullPairResultsTotal = NewCounterVec(
+		"log_pull_pair_results_total",
+		"LogPuller.PullPair calls by outcome",
+		[]string{"outcome"},
 	)
 }
 

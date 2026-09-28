@@ -218,6 +218,18 @@ type Statement struct {
 	// LoadDataPayload carries LOAD DATA LOCAL INFILE file bytes for replicated
 	// non-DML bulk-load transactions.
 	LoadDataPayload []byte `msgpack:"LoadDataPayload,omitempty"`
+
+	// DatabaseGeneration fences a CREATE/DROP DATABASE statement against a
+	// stale coordinator. The coordinator stamps it
+	// from its own database registry view: CREATE stamps the database's next
+	// generation (or its current one, as a no-op, when the database is
+	// already live); DROP stamps the database's current generation. A
+	// participant refuses PREPARE when this is below its own local key for the
+	// database. Zero means "unstamped" - a coordinator that predates this
+	// field - and a participant computes the key itself instead of gating on
+	// it, for rolling-upgrade compatibility. Meaningless on every other
+	// statement type.
+	DatabaseGeneration uint64 `msgpack:"DatabaseGeneration,omitempty"`
 }
 
 // MergeExecParams produces the final positional argument list for executing

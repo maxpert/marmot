@@ -37,6 +37,15 @@ var transientSQLiteCodes = map[sqlite3.ErrNo]bool{
 	sqlite3.ErrReadonly: true, // SQLITE_READONLY: database (or this connection) is read-only right now
 }
 
+// IsTransientSQLiteError reports whether err carries one of
+// transientSQLiteCodes: a condition on this node right now - typically the
+// single writer held by another connection - not a verdict on the work that
+// hit it.
+func IsTransientSQLiteError(err error) bool {
+	var sqliteErr sqlite3.Error
+	return errors.As(err, &sqliteErr) && transientSQLiteCodes[sqliteErr.Code]
+}
+
 // AutoIncWidthExceededError reports that MAX(id) in an existing table exceeds
 // the range its explicitly declared AUTO_INCREMENT column can hold - e.g. an
 // ALTER that narrows the column to TINYINT after 200 rows already exist.

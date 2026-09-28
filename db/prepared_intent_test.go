@@ -248,6 +248,30 @@ func TestApplyClaimsACKsAtMostOneOfTwoOverlappingClaims(t *testing.T) {
 	require.Equal(t, uint64(520), readClaimBase(t, dm, "testdb", "users"))
 }
 
+// TestCommitOfAClaimAppliedBeforeAFailedCommitIsACKed: a COMMIT applied the
+// claim in the system database and then failed before the user-database
+// commit (its writer busy, or a crash), leaving the transaction PENDING. The
+// transaction was decided COMMITTED, so committing it again - a retried
+// COMMIT, or the log puller committing it because a peer's log holds it -
+// must succeed rather than be refused for the floor its own claim raised.
+//
+// Mutation: drop claimAlreadyApplied from applyClaimTx. The second commit is
+// refused and "a claim this node already applied was refused" fires.
+func TestCommitOfAClaimAppliedBeforeAFailedCommitIsACKed(t *testing.T) {
+	engine, dm, cleanup := setupTestReplicationEngine(t)
+	defer cleanup()
+	mdb := markedTableDB(t, engine, dm, "CREATE TABLE users (id INTEGER /*M:32a*/ PRIMARY KEY, v TEXT)")
+	seedClaimBase(t, dm, "testdb", "users", 500, 1)
+
+	const a = 9560
+	require.True(t, prepareClaim(engine, t, a, 1, 500, 10).Success)
+	require.NoError(t, autoIncClaimStoreForTest(dm).ApplyClaims("testdb", a, mdb.GetMetaStore()))
+
+	res := commitClaim(engine, a)
+	require.True(t, res.Success, "a claim this node already applied was refused: %s", res.Error)
+	require.Equal(t, uint64(510), readClaimBase(t, dm, "testdb", "users"))
+}
+
 // TestApplyClaimsIsConditionedOnTheRangeItWrites: the COMMIT's conditional
 // write guards the range it hands out, newBase+1..newBase+size, so it must not
 // depend on PREPARE having admitted only newBase == prevBase. Here the intent
@@ -287,7 +311,7 @@ func TestApplyClaimsIsConditionedOnTheRangeItWrites(t *testing.T) {
 // heartbeat_timeout + gc_interval after its PREPARE. The pass is driven
 // directly here so the test does not race the GC goroutine.
 //
-// Mutation: make MemoryMetaStore.CleanupStaleTransactions never treat a
+// Mutation: make MemoryMetaStore.isStale never treat a
 // pending transaction as stale. "the GC did not abort a prepared transaction
 // past heartbeat_timeout" fires. (Dropping only its DeleteIntentsByTxn does
 // not strand the row: once the record is aborted, the next writer's conflict
@@ -344,7 +368,7 @@ func TestDeadCoordinatorsPreparedRowIsFreedByTheStaleTransactionGC(t *testing.T)
 // racing the stale-transaction GC on one node. The COMMIT has loaded the
 // transaction while it was still pending (engine.Commit ->
 // TransactionManager.GetTransaction); the GC then deletes the transaction's
-// intents and captured rows (MemoryMetaStore.CleanupStaleTransactions, in its
+// intents and captured rows (MemoryMetaStore.AbortStaleTransaction, in its
 // own order), and the COMMIT runs before the GC's abort reaches the record.
 // The COMMIT used to find no rows, take the statement branch, write a commit
 // record and ACK a write it never applied.

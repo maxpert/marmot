@@ -8,7 +8,9 @@ import (
 	"testing"
 
 	"github.com/maxpert/marmot/cfg"
+	"github.com/maxpert/marmot/db"
 	marmotgrpc "github.com/maxpert/marmot/grpc"
+	"github.com/maxpert/marmot/hlc"
 )
 
 // TestAutoIncReleaseVotesRequiresTheRiskToken pins that the forced release is
@@ -32,7 +34,7 @@ func TestAutoIncReleaseVotesRequiresTheRiskToken(t *testing.T) {
 	}
 }
 
-// TestAutoIncEndpointsRequireTheClusterSecret pins R3c-15: the release and
+// TestAutoIncEndpointsRequireTheClusterSecret pins that the release and
 // sync endpoints are refused on a cluster with no secret, and served only
 // with the right one on a cluster that has one - unlike the other admin
 // endpoints, which AuthMiddleware serves to anyone when no secret is set.
@@ -91,5 +93,35 @@ func TestAutoIncSyncBodyIsCompleteOnlyWhenEveryMemberIs(t *testing.T) {
 	}
 	if autoIncSyncBody(nil)["complete"] != false {
 		t.Fatal("no outcome at all reported complete")
+	}
+}
+
+// TestAutoIncVotesReportsTheHold pins the read-only readiness signal: a node
+// whose system database was just created holds its claim votes, and reports
+// them released once the hold row is gone.
+func TestAutoIncVotesReportsTheHold(t *testing.T) {
+	dm, err := db.NewDatabaseManager(t.TempDir(), 1, hlc.NewClock(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dm.Close()
+	h := &AdminHandlers{dbManager: dm}
+
+	votesHeld := func() string {
+		rec := httptest.NewRecorder()
+		h.handleAutoIncVotes(rec, httptest.NewRequest(http.MethodGet, "/cluster/autoinc/votes", nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+		}
+		return rec.Body.String()
+	}
+	if body := votesHeld(); !strings.Contains(body, `"votes_held":true`) {
+		t.Fatalf("a fresh node must report its votes held: %s", body)
+	}
+	if _, err := dm.GetSystemDatabase().GetWriteDB().Exec("DELETE FROM " + db.AutoIncHoldTable); err != nil {
+		t.Fatal(err)
+	}
+	if body := votesHeld(); !strings.Contains(body, `"votes_held":false`) {
+		t.Fatalf("a released node must report its votes unheld: %s", body)
 	}
 }

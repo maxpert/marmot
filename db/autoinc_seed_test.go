@@ -18,6 +18,12 @@ func newSeedTestDB(t *testing.T) *sql.DB {
 	require.NoError(t, err)
 	db.SetMaxOpenConns(1)
 	t.Cleanup(func() { db.Close() })
+	// applyNonDMLIntents writes the applied-txn marker, and bumps
+	// __marmot_schema_version for real DDL, unconditionally as part of its one
+	// SQLite tx; a raw *sql.DB like this one otherwise lacks both tables.
+	require.NoError(t, ensureAppliedTxnTable(db))
+	_, err = ensureSchemaVersionTable(db, "testdb", false, nil)
+	require.NoError(t, err)
 	return db
 }
 
@@ -247,7 +253,7 @@ func TestApplyNonDMLIntents_SeedsAutoIncBaseAfterCreateTable(t *testing.T) {
 			SQLStatement: `CREATE TABLE orders (id INTEGER /*M:16a*/ PRIMARY KEY, total INTEGER)`,
 		},
 	}
-	require.NoError(t, tm.applyNonDMLIntents(1, intents))
+	require.NoError(t, tm.applyNonDMLIntents(1, hlc.Timestamp{}, intents))
 
 	base, owner, ok := readClaimRow(t, store, "testdb", "orders")
 	require.True(t, ok, "expected applyNonDMLIntents to seed a claim row for the tagged table")
@@ -273,7 +279,7 @@ func TestApplyNonDMLIntents_UnmarkedDDLSeedsNothing(t *testing.T) {
 			SQLStatement: `CREATE TABLE plain (id INTEGER PRIMARY KEY, name TEXT)`,
 		},
 	}
-	require.NoError(t, tm.applyNonDMLIntents(1, intents))
+	require.NoError(t, tm.applyNonDMLIntents(1, hlc.Timestamp{}, intents))
 
 	_, _, ok := readClaimRow(t, store, "testdb", "plain")
 	require.False(t, ok)

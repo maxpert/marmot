@@ -30,18 +30,20 @@ func newDetachTestManager(t *testing.T) *DatabaseManager {
 	return dm
 }
 
-// holdGCPassBeforeTheManagerLock restarts tm's GC with a short interval and a
-// refresh step that blocks the first pass until release is closed. When the
-// returned channel closes, a pass is inside that step; its next call is the
-// manager's GetMinAppliedTxnID, which takes DatabaseManager.mu.
+// holdGCPassBeforeTheManagerLock restarts tm's GC with a short interval and
+// a GC-safe-position step that blocks the first pass until release is
+// closed. When the returned channel closes, a pass is inside that step; a
+// real GCSafePositionFunc implementation is expected to take
+// DatabaseManager.mu to aggregate consumed positions across databases, the
+// same way the GetMinAppliedTxnID callback it replaced did.
 func holdGCPassBeforeTheManagerLock(tm *TransactionManager, release <-chan struct{}) <-chan struct{} {
 	entered := make(chan struct{})
 	var once sync.Once
 	tm.StopGarbageCollection()
-	tm.SetRefreshReplicationStatesFunc(func(context.Context) error {
+	tm.SetGCSafePositionFunc(func() (LogPosition, bool) {
 		once.Do(func() { close(entered) })
 		<-release
-		return nil
+		return LogPosition{}, false
 	})
 	tm.gcInterval = 5 * time.Millisecond
 	tm.StartGarbageCollection()
@@ -57,10 +59,11 @@ func gcStopRequested(tm *TransactionManager) bool {
 
 // TestClosingADatabaseDoesNotDeadlockWithAGCPassWaitingOnTheManager: detach,
 // drop and shutdown each stop a database's GC and wait for its pass to end,
-// while that pass may be about to take DatabaseManager.mu
-// (GetMinAppliedTxnID). None of them may hold mu while it waits. The pass is
-// held in its refresh step until the operation is waiting for it, then let go
-// towards the lock.
+// while that pass may be about to take DatabaseManager.mu (a
+// GCSafePositionFunc implementation aggregating consumed positions across
+// databases). None of them may hold mu while it waits. The pass is held in
+// its GC-safe-position step until the operation is waiting for it, then let
+// go towards the lock.
 //
 // Mutation: hold dm.mu across DetachDatabase's drain (or DropDatabase's
 // db.Close, or Close's database loop). The pass then waits on the lock the
@@ -197,14 +200,14 @@ func TestSnapshotsRefuseWhileADatabaseIsDetached(t *testing.T) {
 
 	_, _, err := dm.TakeSnapshot()
 	require.ErrorIs(t, err, ErrDatabaseDetached, "a snapshot omitted a detached database (TakeSnapshot)")
-	_, _, _, err = dm.TakeSnapshotToDir(t.TempDir())
+	_, _, err = dm.TakeSnapshotToDir(t.TempDir())
 	require.ErrorIs(t, err, ErrDatabaseDetached, "a snapshot omitted a detached database (TakeSnapshotToDir)")
 
 	require.NoError(t, dm.AttachDatabase("app"))
 	infos, _, err := dm.TakeSnapshot()
 	require.NoError(t, err)
 	require.Contains(t, snapshotNames(infos), "app")
-	infos, _, _, err = dm.TakeSnapshotToDir(t.TempDir())
+	infos, _, err = dm.TakeSnapshotToDir(t.TempDir())
 	require.NoError(t, err)
 	require.Contains(t, snapshotNames(infos), "app")
 }
@@ -317,7 +320,13 @@ func TestDropDatabaseDuringARestore(t *testing.T) {
 	_, err = dm.GetDatabase("app")
 	require.Error(t, err)
 	require.NotErrorIs(t, err, ErrDatabaseDetached)
-	require.NotContains(t, registryNames(t, dm), "app", "the registry still names a dropped database")
+	// The registry keeps the row as a tombstone (dropped=1) rather than
+	// deleting it (DatabaseRegistryKey), so a later
+	// CREATE can fence a stale peer with a strictly higher generation.
+	require.Contains(t, registryNames(t, dm), "app", "the registry must keep a dropped database's row as a tombstone")
+	key, err := dm.RegistryKey("app")
+	require.NoError(t, err)
+	require.True(t, key.Dropped, "a dropped database's registry row must be tombstoned")
 	require.ErrorIs(t, dm.CreateDatabase("app"), ErrDatabaseDetached, "a CREATE raced the files of a drop in progress")
 	require.NoError(t, dm.DropDatabase("app"), "a repeated DROP must stay idempotent")
 

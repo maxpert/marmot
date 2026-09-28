@@ -254,7 +254,7 @@ func TestReplicationHandlerPrepareConflictAbortRecovery(t *testing.T) {
 }
 
 func TestReplicationHandlerReplayFailureCanRetryWithoutAdvancingWatermark(t *testing.T) {
-	tmpDir, dbMgr, schemaVersionMgr := setupTestEnvironment(t, "focused_replay_failure_retry")
+	tmpDir, dbMgr, _ := setupTestEnvironment(t, "focused_replay_failure_retry")
 	t.Cleanup(func() {
 		dbMgr.Close()
 		os.RemoveAll(tmpDir)
@@ -268,14 +268,13 @@ func TestReplicationHandlerReplayFailureCanRetryWithoutAdvancingWatermark(t *tes
 	if err != nil {
 		t.Fatalf("GetDatabase: %v", err)
 	}
-	handler := NewReplicationHandler(1, dbMgr, hlc.NewClock(1), schemaVersionMgr)
 	clock := hlc.NewClock(2)
 
-	req := &TransactionRequest{
-		TxnId:        3001,
-		SourceNodeId: 2,
+	const txnID = 3001
+	ev := &ChangeEvent{
+		TxnId:        txnID,
+		OriginNodeId: 2,
 		Database:     dbName,
-		Phase:        TransactionPhase_REPLAY,
 		Timestamp:    focusedHLC(clock),
 		Statements: []*Statement{
 			focusedRowStatement(dbName, pb.StatementType_INSERT, testInsertRowChange("docs", []byte("docs:1"), map[string][]byte{
@@ -283,17 +282,22 @@ func TestReplicationHandlerReplayFailureCanRetryWithoutAdvancingWatermark(t *tes
 				"title": mustMarshalMsgpack(t, "late table"),
 			})),
 		},
+		RowCount: 1,
 	}
 
-	resp, err := handler.HandleReplicateTransaction(context.Background(), req)
-	if err != nil {
-		t.Fatalf("first replay call: %v", err)
-	}
-	if resp.Success {
+	if _, err := ApplyPulledEvent(context.Background(), dbMgr, ev); err == nil {
 		t.Fatal("replay against a missing table should fail")
 	}
-	if rec, err := mdb.GetMetaStore().GetTransaction(req.TxnId); err == nil && rec != nil && rec.Status == db.TxnStatusCommitted {
-		t.Fatalf("failed replay advanced committed transaction: %+v", rec)
+	// The local log entry is written log-first, before the SQLite
+	// apply is attempted, so it is expected to exist and read COMMITTED even
+	// though the apply below failed; what must NOT exist yet is the
+	// __marmot_applied_txn marker.
+	applied, err := mdb.AppliedTxns([]uint64{txnID})
+	if err != nil {
+		t.Fatalf("AppliedTxns: %v", err)
+	}
+	if applied[txnID] {
+		t.Fatalf("failed replay wrote the applied marker for txn %d", txnID)
 	}
 
 	if _, err := mdb.GetDB().Exec(`CREATE TABLE docs (id INTEGER PRIMARY KEY, title TEXT)`); err != nil {
@@ -303,12 +307,12 @@ func TestReplicationHandlerReplayFailureCanRetryWithoutAdvancingWatermark(t *tes
 		t.Fatalf("ReloadSchema: %v", err)
 	}
 
-	resp, err = handler.HandleReplicateTransaction(context.Background(), req)
+	replayed, err := ApplyPulledEvent(context.Background(), dbMgr, ev)
 	if err != nil {
 		t.Fatalf("retry replay call: %v", err)
 	}
-	if !resp.Success {
-		t.Fatalf("retry replay failed: %s", resp.ErrorMessage)
+	if !replayed {
+		t.Fatal("retry replay reported not applied")
 	}
 	var title string
 	if err := mdb.GetDB().QueryRow(`SELECT title FROM docs WHERE id = 1`).Scan(&title); err != nil {
@@ -317,17 +321,24 @@ func TestReplicationHandlerReplayFailureCanRetryWithoutAdvancingWatermark(t *tes
 	if title != "late table" {
 		t.Fatalf("replayed title=%q, want late table", title)
 	}
-	rec, err := mdb.GetMetaStore().GetTransaction(req.TxnId)
+	rec, err := mdb.GetMetaStore().GetTransaction(txnID)
 	if err != nil {
 		t.Fatalf("GetTransaction after retry: %v", err)
 	}
 	if rec == nil || rec.Status != db.TxnStatusCommitted {
 		t.Fatalf("replay retry did not record committed transaction: %+v", rec)
 	}
+	applied, err = mdb.AppliedTxns([]uint64{txnID})
+	if err != nil {
+		t.Fatalf("AppliedTxns after retry: %v", err)
+	}
+	if !applied[txnID] {
+		t.Fatalf("retry replay did not write the applied marker for txn %d", txnID)
+	}
 }
 
 func TestReplicationHandlerReplayVectorCDCFailureMarksDirtyButSucceeds(t *testing.T) {
-	tmpDir, dbMgr, schemaVersionMgr := setupTestEnvironment(t, "focused_replay_vector_dirty")
+	tmpDir, dbMgr, _ := setupTestEnvironment(t, "focused_replay_vector_dirty")
 	t.Cleanup(func() {
 		dbMgr.Close()
 		os.RemoveAll(tmpDir)
@@ -367,12 +378,11 @@ func TestReplicationHandlerReplayVectorCDCFailureMarksDirtyButSucceeds(t *testin
 		t.Fatalf("ApplyVectorControl: %v", err)
 	}
 
-	handler := NewReplicationHandler(1, dbMgr, hlc.NewClock(1), schemaVersionMgr)
-	req := &TransactionRequest{
-		TxnId:        3101,
-		SourceNodeId: 2,
+	const txnID = 3101
+	ev := &ChangeEvent{
+		TxnId:        txnID,
+		OriginNodeId: 2,
 		Database:     dbName,
-		Phase:        TransactionPhase_REPLAY,
 		Timestamp:    focusedHLC(hlc.NewClock(2)),
 		Statements: []*Statement{
 			focusedRowStatement(dbName, pb.StatementType_INSERT, testInsertRowChange("docs", []byte("docs:1"), map[string][]byte{
@@ -381,14 +391,11 @@ func TestReplicationHandlerReplayVectorCDCFailureMarksDirtyButSucceeds(t *testin
 				"title": mustMarshalMsgpack(t, "vector row"),
 			})),
 		},
+		RowCount: 1,
 	}
 
-	resp, err := handler.HandleReplicateTransaction(context.Background(), req)
-	if err != nil {
-		t.Fatalf("replay call: %v", err)
-	}
-	if !resp.Success {
-		t.Fatalf("vector CDC failure should not fail row replay, got: %s", resp.ErrorMessage)
+	if _, err := ApplyPulledEvent(context.Background(), dbMgr, ev); err != nil {
+		t.Fatalf("vector CDC failure should not fail row replay, got: %v", err)
 	}
 
 	var title string
@@ -408,7 +415,7 @@ func TestReplicationHandlerReplayVectorCDCFailureMarksDirtyButSucceeds(t *testin
 	if status != "dirty" {
 		t.Fatalf("vector status=%q, want dirty", status)
 	}
-	rec, err := mdb.GetMetaStore().GetTransaction(req.TxnId)
+	rec, err := mdb.GetMetaStore().GetTransaction(txnID)
 	if err != nil {
 		t.Fatalf("GetTransaction: %v", err)
 	}
@@ -435,11 +442,10 @@ func BenchmarkReplicationHandlerReplayRowCDC(b *testing.B) {
 	}
 	defer dbMgr.Close()
 
-	systemDB, err := dbMgr.GetDatabase(db.SystemDatabaseName)
+	_, err = dbMgr.GetDatabase(db.SystemDatabaseName)
 	if err != nil {
 		b.Fatalf("system database: %v", err)
 	}
-	schemaVersionMgr := db.NewSchemaVersionManager(systemDB.GetMetaStore())
 
 	const dbName = "bench_replay"
 	if err := dbMgr.CreateDatabase(dbName); err != nil {
@@ -456,7 +462,7 @@ func BenchmarkReplicationHandlerReplayRowCDC(b *testing.B) {
 		b.Fatalf("ReloadSchema: %v", err)
 	}
 
-	handler := NewReplicationHandler(1, dbMgr, clock, schemaVersionMgr)
+	_ = clock
 	sourceClock := hlc.NewClock(2)
 	ctx := context.Background()
 
@@ -464,11 +470,10 @@ func BenchmarkReplicationHandlerReplayRowCDC(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		id := int64(i + 1)
-		req := &TransactionRequest{
+		ev := &ChangeEvent{
 			TxnId:        uint64(i + 1),
-			SourceNodeId: 2,
+			OriginNodeId: 2,
 			Database:     dbName,
-			Phase:        TransactionPhase_REPLAY,
 			Timestamp:    focusedHLC(sourceClock),
 			Statements: []*Statement{
 				focusedRowStatement(dbName, pb.StatementType_INSERT, testInsertRowChange("docs", []byte(fmt.Sprintf("docs:%d", id)), map[string][]byte{
@@ -477,13 +482,10 @@ func BenchmarkReplicationHandlerReplayRowCDC(b *testing.B) {
 					"score": mustMarshalMsgpack(b, id%100),
 				})),
 			},
+			RowCount: 1,
 		}
-		resp, err := handler.HandleReplicateTransaction(ctx, req)
-		if err != nil {
-			b.Fatalf("HandleReplicateTransaction: %v", err)
-		}
-		if !resp.Success {
-			b.Fatalf("replay failed: %s", resp.ErrorMessage)
+		if _, err := ApplyPulledEvent(ctx, dbMgr, ev); err != nil {
+			b.Fatalf("ApplyPulledEvent: %v", err)
 		}
 	}
 }

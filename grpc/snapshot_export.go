@@ -22,12 +22,11 @@ const snapshotExportPrefix = "snapshot-export-"
 // cache while the export is mapped. The last release removes the directory,
 // so no directory outlives its readers and none is removed while one reads.
 type snapshotExport struct {
-	dir            string
-	snapshots      []db.SnapshotInfo
-	maxTxnID       uint64
-	schemaVersions map[string]uint64
-	expiresAt      time.Time
-	refs           atomic.Int32
+	dir       string
+	snapshots []db.SnapshotInfo
+	maxTxnID  uint64
+	expiresAt time.Time
+	refs      atomic.Int32
 }
 
 // newSnapshotExport creates an empty export directory under dataDir, with one

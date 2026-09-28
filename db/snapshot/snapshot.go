@@ -92,6 +92,10 @@ type Chunk struct {
 	Data          []byte
 	MD5Checksum   string
 	IsLastForFile bool
+	// FileSHA256 and FileSizeBytes, set on a file's last chunk by a sender
+	// that reports them, describe the whole file exactly as streamed.
+	FileSHA256    string
+	FileSizeBytes int64
 }
 
 // ChunkReceiver abstracts the gRPC stream for testability

@@ -23,10 +23,12 @@ import (
 
 const narrowInt32Max = 2147483647
 
-// startNarrowCluster starts a 3-node cluster and creates table on it.
-func startNarrowCluster(t *testing.T, table, ddl string) *ClusterHarness {
+// startNarrowCluster starts a 3-node cluster and creates table on it. opts
+// configure the harness (e.g. GCIntervalSeconds) before any node config is
+// written.
+func startNarrowCluster(t *testing.T, table, ddl string, opts ...func(*ClusterHarness)) *ClusterHarness {
 	t.Helper()
-	harness := NewClusterHarness(t)
+	harness := NewClusterHarness(t, opts...)
 	if err := harness.StartCluster(); err != nil {
 		harness.Cleanup()
 		t.Fatalf("StartCluster: %v", err)

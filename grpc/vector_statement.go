@@ -120,6 +120,7 @@ func protocolStatementFromProto(stmt *Statement) (protocol.Statement, error) {
 		IntentKey:          stmt.GetIntentKey(),
 		AutoIDClaim:        stmt.GetAutoIdClaim(),
 		AutoIDClaimPayload: stmt.GetAutoIdClaimPayload(),
+		DatabaseGeneration: stmt.GetDatabaseGeneration(),
 	}
 
 	switch payload := stmt.Payload.(type) {

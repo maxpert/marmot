@@ -39,7 +39,6 @@ type testNode struct {
 	antiEntropy   *marmotgrpc.AntiEntropyService
 	writeCoord    *coordinator.WriteCoordinator
 	readCoord     *coordinator.ReadCoordinator
-	deltaSync     *marmotgrpc.DeltaSyncClient
 	catchUpClient *marmotgrpc.CatchUpClient
 }
 
@@ -400,9 +399,9 @@ func startNode(t *testing.T, node *testNode, seedNodes []string) {
 	node.dbMgr = dbMgr
 
 	// Get system database for schema versioning
-	systemDB, err := dbMgr.GetDatabase(db.SystemDatabaseName)
+	_, err = dbMgr.GetDatabase(db.SystemDatabaseName)
 	require.NoError(t, err, "Failed to get system database for node %d", node.nodeID)
-	schemaVersionMgr := db.NewSchemaVersionManager(systemDB.GetMetaStore())
+	schemaVersionMgr := db.NewSchemaVersionManager(dbMgr)
 
 	// Wire up replication handlers
 	replicationHandler := marmotgrpc.NewReplicationHandler(
@@ -424,29 +423,23 @@ func startNode(t *testing.T, node *testNode, seedNodes []string) {
 	)
 	node.catchUpClient.SetDatabaseManager(dbMgr)
 
-	node.deltaSync = marmotgrpc.NewDeltaSyncClient(marmotgrpc.DeltaSyncConfig{
-		NodeID:           node.nodeID,
-		Client:           client,
-		DBManager:        dbMgr,
-		Clock:            node.clock,
-		ApplyTxnsFn:      replicationHandler.HandleReplicateTransaction,
-		SchemaVersionMgr: schemaVersionMgr,
+	logPuller := marmotgrpc.NewLogPuller(marmotgrpc.LogPullerConfig{
+		NodeID:    node.nodeID,
+		Client:    client,
+		DBManager: dbMgr,
 	})
 
 	snapshotFunc := func(ctx context.Context, peerNodeID uint64, peerAddr string, database string) error {
 		return node.catchUpClient.CatchUpFromPeer(ctx, peerNodeID, peerAddr, database)
 	}
 
-	schemaVersionMgr = db.NewSchemaVersionManager(systemDB.GetMetaStore())
 	node.antiEntropy = marmotgrpc.NewAntiEntropyServiceFromConfig(
 		node.nodeID,
 		grpcServer.GetNodeRegistry(),
 		client,
 		dbMgr,
-		node.deltaSync,
-		node.clock,
+		logPuller,
 		snapshotFunc,
-		schemaVersionMgr,
 	)
 	node.antiEntropy.Start()
 

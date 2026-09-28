@@ -64,6 +64,13 @@ type ReplicationConfiguration struct {
 	GCMinRetentionHours       int  `toml:"gc_min_retention_hours"`
 	GCMaxRetentionHours       int  `toml:"gc_max_retention_hours"`
 	StreamChunkSizeKB         int  `toml:"stream_chunk_size_kb"` // Size in KB for streaming chunks (default: 1024 = 1MB)
+	// SnapshotRestoreTimeoutS bounds anti-entropy's whole snapshot restore
+	// sequence (transfer, re-attach, and the local-log re-apply),
+	// independent of anti_entropy_interval_seconds: a restore is a one-shot
+	// transfer of a database's full current size, which can take far longer
+	// than one anti-entropy round, while the round interval is tuned for
+	// pulling a bounded page of log entries.
+	SnapshotRestoreTimeoutS int `toml:"snapshot_restore_timeout_seconds"`
 }
 
 // MySQLConfiguration for MySQL wire protocol server
@@ -305,6 +312,7 @@ var Config = &Configuration{
 		GCMinRetentionHours:       2,     // 2 hours - MUST be >= 2x delta threshold (safety margin)
 		GCMaxRetentionHours:       24,    // 24 hours - 24x delta threshold (like Cassandra's 10-day gc_grace)
 		StreamChunkSizeKB:         1024,  // 1MB - use streaming for large payloads >= this size
+		SnapshotRestoreTimeoutS:   1800,  // 30 minutes - bounds a full database transfer, independent of the AE round interval
 	},
 
 	Transaction: TransactionConfiguration{

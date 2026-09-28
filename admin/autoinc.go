@@ -3,8 +3,25 @@ package admin
 import (
 	"net/http"
 
+	"github.com/maxpert/marmot/db"
 	marmotgrpc "github.com/maxpert/marmot/grpc"
 )
+
+// handleAutoIncVotes handles GET /admin/cluster/autoinc/votes: whether this
+// node's AUTO_INCREMENT claim votes are held (db.AutoIncHoldTable). While
+// they are, the node declines every claim at PREPARE, so narrow
+// AUTO_INCREMENT inserts that need a new range can return 1205 until enough
+// members answered its merge. It is the "unheld" check of the
+// membership-change procedure (handleAutoIncSync), and a readiness signal
+// after a node's first start.
+func (h *AdminHandlers) handleAutoIncVotes(w http.ResponseWriter, r *http.Request) {
+	held, err := db.NewAutoIncClaimStore(h.dbManager.GetSystemDatabase()).VotesHeld()
+	if err != nil {
+		writeErrorResponse(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSONResponse(w, map[string]interface{}{"votes_held": held}, false, "")
+}
 
 // handleAutoIncReleaseVotes handles POST
 // /admin/cluster/autoinc/release-votes?accept_risk=duplicate-ids.

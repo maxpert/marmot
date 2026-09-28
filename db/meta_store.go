@@ -14,6 +14,46 @@ import (
 // ErrStopIteration signals scan callbacks to stop iteration without error
 var ErrStopIteration = errors.New("stop iteration")
 
+// ErrAbortCommitted is returned by AbortTransaction when the transaction is
+// already COMMITTED: the local log is append-only, so only GC may ever remove
+// a committed entry.
+var ErrAbortCommitted = errors.New("cannot abort a committed transaction")
+
+// ErrNotAbandonedBegin is returned by DiscardAbandonedBegin for a transaction
+// whose record is not PendingBegunAbandoned.
+var ErrNotAbandonedBegin = errors.New("transaction record is not an abandoned begin")
+
+// PreparedPayload is what a transaction's durable prepare
+// (DurablyPrepareTransaction) recorded it holds: its captured row count and
+// its persisted (non-DML) intent count. A commit compares what it finds
+// against it, so a transaction whose payload something deleted after the
+// prepare is refused rather than committed empty.
+type PreparedPayload struct {
+	Rows    uint64 `msgpack:"r"`
+	Intents uint64 `msgpack:"i"`
+}
+
+// PendingKind classifies a transaction's local PENDING record by how far its
+// PREPARE got. A transaction some peer's committed log holds was decided
+// COMMITTED, and the log puller resolves this node's PENDING record for it
+// by kind: commit a prepared one through the local commit path, discard an
+// abandoned begin and replay, and leave a live begin to finish first.
+type PendingKind uint8
+
+const (
+	// PendingNone: no PENDING record (absent, COMMITTED or ABORTED).
+	PendingNone PendingKind = iota
+	// PendingBegunLive: begun but not durably prepared, and still tracked by
+	// this process - a PREPARE executing right now.
+	PendingBegunLive
+	// PendingBegunAbandoned: begun but never durably prepared, and not
+	// tracked by this process - left by a PREPARE that died with the
+	// process (kill -9) before its durable prepare.
+	PendingBegunAbandoned
+	// PendingPrepared: durably prepared (DurablyPrepareTransaction).
+	PendingPrepared
+)
+
 // CapturedRowCursor iterates over raw captured rows for a transaction.
 // Must call Close() when done to release resources.
 type CapturedRowCursor interface {
@@ -41,10 +81,26 @@ type MetaStore interface {
 	GetPendingTransactions() ([]*TransactionRecord, error)
 	Heartbeat(txnID uint64) error
 
+	// PreparedPayload returns what txnID's durable prepare recorded it holds
+	// (PreparedPayload); found is false for a transaction with no such record
+	// (never durably prepared, or prepared before the record existed).
+	PreparedPayload(txnID uint64) (payload PreparedPayload, found bool, err error)
+
+	// ClassifyPending reports how far txnID's local PENDING record got (see
+	// PendingKind); PendingNone when there is no PENDING record.
+	ClassifyPending(txnID uint64) (PendingKind, error)
+
+	// DiscardAbandonedBegin deletes txnID's PendingBegunAbandoned record with
+	// every row lock, intent and captured row it holds. It refuses, with
+	// ErrNotAbandonedBegin, a record in any other state.
+	DiscardAbandonedBegin(txnID uint64) error
+
 	// StoreReplayedTransaction inserts a fully-committed transaction record directly.
-	// Used by delta sync to record transactions that were replayed from other nodes.
-	// Unlike CommitTransaction, this doesn't require a prior BeginTransaction call.
-	StoreReplayedTransaction(txnID, nodeID uint64, commitTS hlc.Timestamp, dbName string, rowCount uint32) error
+	// Used to record transactions that were replayed (pulled) from another
+	// node's log. Unlike CommitTransaction, this doesn't require a prior
+	// BeginTransaction call. originNodeID is the transaction's coordinator
+	// (persisted as the immutable NodeID), not the replaying node.
+	StoreReplayedTransaction(txnID, originNodeID uint64, commitTS hlc.Timestamp, dbName string, rowCount uint32, requiredSchemaVersion uint64) error
 
 	// Write intents (distributed locks)
 	WriteIntent(txnID uint64, intentType IntentType, tableName, intentKey string, op OpType, sqlStmt string, data []byte, ts hlc.Timestamp, nodeID uint64) error
@@ -54,21 +110,56 @@ type MetaStore interface {
 	GetIntentsByTxn(txnID uint64) ([]*WriteIntentRecord, error)
 	GetIntent(tableName, intentKey string) (*WriteIntentRecord, error)
 
-	// Replication state
-	GetReplicationState(peerNodeID uint64, dbName string) (*ReplicationStateRecord, error)
-	UpdateReplicationState(peerNodeID uint64, dbName string, lastTxnID uint64, lastTS hlc.Timestamp) error
-	GetMinAppliedTxnID(dbName string) (uint64, error)
-	GetAllReplicationStates() ([]*ReplicationStateRecord, error)
-
-	// Sequence numbers for gap-free replication
-	GetNextSeqNum(nodeID uint64) (uint64, error)
+	// GetMaxSeqNum returns the highest seq ever recorded in this store's
+	// seq index (LogPosition.Seq), including entries from before this
+	// process's own allocations.
 	GetMaxSeqNum() (uint64, error)
-	GetMinAppliedSeqNum(dbName string) (uint64, error)
 
-	// Schema/DDL
+	// StableSeq returns the highest seq s such that every seq <= s this
+	// process has allocated from the store-wide local commit sequence has
+	// finished, successfully or not (see logSeqTracker's doc comment in
+	// log_position.go for the proof this is safe to read before listing).
+	StableSeq() uint64
+
+	// ListCommittedLog returns this store's local log entries strictly
+	// after `after`, in position order, restricted to COMMITTED
+	// transactions with Seq <= the stable point read at the start of the
+	// call, up to limit. more is true when further stable entries exist
+	// beyond the returned page.
+	ListCommittedLog(after LogPosition, limit int) (entries []LogPosition, stable uint64, more bool, err error)
+
+	// GetPullCursor and SetPullCursor persist C[self,peer,d]: this node's
+	// pull position in peerNodeID's log for this database.
+	GetPullCursor(peerNodeID uint64) (LogPosition, error)
+	SetPullCursor(peerNodeID uint64, pos LogPosition) error
+
+	// SetConsumedPosition stores R[self,requester,d]: the `after` position
+	// requesterNodeID last sent when listing this store's log, as is, not
+	// as a max. ConsumedPositions returns every requester's last
+	// reported position; DeleteConsumedPosition removes a departed member's
+	// so it stops pinning GC.
+	SetConsumedPosition(requesterNodeID uint64, pos LogPosition) error
+	ConsumedPositions() (map[uint64]LogPosition, error)
+	DeleteConsumedPosition(nodeID uint64) error
+
+	// TruncatedThrough returns T[self,d]: the highest LogPosition this
+	// store's GC has deleted through. It never decreases.
+	TruncatedThrough() (LogPosition, error)
+
+	// SetReapplyPending durably records whether this database's local log
+	// must be re-applied to its SQLite file (set before a snapshot restore
+	// replaces the file, cleared once ReapplyLocalLog succeeds), so a crash
+	// between the two never loses a transaction only this node held.
+	SetReapplyPending(pending bool) error
+	ReapplyPending() (bool, error)
+
+	// GetSchemaVersion is kept only as the migration read for the
+	// __marmot_schema_version table now living in each user database's own
+	// SQLite file: NewReplicatedDatabase consults it once, through the
+	// system database's store, the first time it opens a pre-existing
+	// database file. There is no write path any more - UpdateSchemaVersion is
+	// removed - and no other production caller should read it.
 	GetSchemaVersion(dbName string) (int64, error)
-	UpdateSchemaVersion(dbName string, version int64, ddlSQL string, txnID uint64) error
-	GetAllSchemaVersions() (map[string]int64, error)
 	TryAcquireDDLLock(dbName string, nodeID uint64, leaseDuration time.Duration) (bool, error)
 	ReleaseDDLLock(dbName string, nodeID uint64) error
 
@@ -96,9 +187,23 @@ type MetaStore interface {
 	HasCDCRowLocksForTable(tableName string) (bool, error) // For DDL to check if DML in progress
 	GetCDCTableDDLLock(tableName string) (uint64, error)   // Returns txnID or 0 if no lock
 
-	// GC
-	CleanupStaleTransactions(timeout time.Duration) (int, error)
-	CleanupOldTransactionRecords(minRetention, maxRetention time.Duration, minAppliedTxnID, minAppliedSeqNum uint64) (int, error)
+	// Stale-transaction GC. StaleTransactionIDs lists the PENDING
+	// transactions whose heartbeat is older than timeout.
+	// AbortStaleTransaction re-checks one of them and, if it is still PENDING
+	// and stale, deletes its intents and captured rows and aborts it,
+	// reporting whether it did. The caller must hold the transaction's commit
+	// guard (TransactionManager.acquireCommit) across the call, so the abort
+	// can never interleave with a commit of the same transaction.
+	StaleTransactionIDs(timeout time.Duration) ([]uint64, error)
+	AbortStaleTransaction(txnID uint64, timeout time.Duration) (bool, error)
+
+	// CleanupOldTransactionRecords deletes committed log entries whose
+	// position is <= safe and whose CommittedAt is older than minRetention,
+	// or whose CommittedAt is older than maxRetention regardless of safe.
+	// It only ever deletes a prefix of the log in position order (see the
+	// implementation's doc comment) and advances TruncatedThrough to the
+	// highest position it deleted.
+	CleanupOldTransactionRecords(minRetention, maxRetention time.Duration, safe LogPosition) (int, error)
 
 	// Aggregation queries for anti-entropy
 	GetMaxCommittedTxnID() (uint64, error)
@@ -137,6 +242,7 @@ type TransactionRecord struct {
 	TablesInvolved        string
 	DatabaseName          string
 	RequiredSchemaVersion uint64 // Minimum schema version required for this transaction
+	RowCount              uint32 // Number of captured rows for this transaction (0 until committed)
 }
 
 // TxnImmutableRecord contains fields set once at transaction start (never modified)
@@ -179,17 +285,6 @@ type WriteIntentRecord struct {
 // Contains only fields needed for lock validation - full data is in /intent_by_txn/.
 type IntentLock struct {
 	TxnID uint64
-}
-
-// ReplicationStateRecord represents replication state for a peer
-type ReplicationStateRecord struct {
-	PeerNodeID           uint64
-	DatabaseName         string
-	LastAppliedTxnID     uint64
-	LastAppliedTSWall    int64
-	LastAppliedTSLogical int32
-	LastSyncTime         int64
-	SyncStatus           SyncStatus
 }
 
 // NewMetaStore creates a MemoryMetaStore (which wraps PebbleMetaStore).

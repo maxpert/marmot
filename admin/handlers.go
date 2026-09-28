@@ -19,8 +19,9 @@ var uiHTML embed.FS
 
 // AdminHandlers handles admin API endpoints for MetaStore operations
 type AdminHandlers struct {
-	server    *grpc.Server
-	dbManager *db.DatabaseManager
+	server      *grpc.Server
+	dbManager   *db.DatabaseManager
+	antiEntropy *grpc.AntiEntropyService // set once anti-entropy is constructed (SetAntiEntropy); nil until then
 }
 
 // NewAdminHandlers creates a new AdminHandlers instance
@@ -29,6 +30,16 @@ func NewAdminHandlers(server *grpc.Server, dbManager *db.DatabaseManager) *Admin
 		server:    server,
 		dbManager: dbManager,
 	}
+}
+
+// SetAntiEntropy wires the running AntiEntropyService into the admin
+// surface, so cluster/replication status can report per-database caught-up
+// state and stuck transactions. marmot.go calls
+// this once anti-entropy is constructed, which happens after
+// NewAdminHandlers (anti-entropy needs the DatabaseManager and replication
+// handler that are wired after admin routes are registered).
+func (h *AdminHandlers) SetAntiEntropy(ae *grpc.AntiEntropyService) {
+	h.antiEntropy = ae
 }
 
 // ServeUI serves the admin UI HTML file

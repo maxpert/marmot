@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/maxpert/marmot/cfg"
@@ -37,6 +38,9 @@ type ReplicatedDatabase struct {
 	batchCommitter *SQLiteBatchCommitter
 	schemaCache    *SchemaCache // Shared schema cache for preupdate hooks
 	gate           *writeGate   // refuses every commit once the database leaves service
+
+	dbName        string        // database name, "" for the system database
+	schemaVersion atomic.Uint64 // cached __marmot_schema_version value; unused for the system database
 }
 
 // ReplicationFunc is called to replicate transactions to other nodes
@@ -50,6 +54,29 @@ type replicatedDatabaseOptions struct {
 	driverName  string
 	synchronous string
 	batchCommit bool
+
+	dbName              string                             // "" when unnamed (the system database): no legacy schema version to migrate
+	legacySchemaVersion func(dbName string) (int64, error) // migration read source, nil if not applicable
+}
+
+// WithDatabaseName names the database being opened: the name its
+// __marmot_schema_version table migrates a legacy value under, and the
+// name its applied-transaction repair records. The system database is opened
+// without it; its table stays at 0, since no replicated DDL targets it.
+func WithDatabaseName(name string) ReplicatedDatabaseOption {
+	return func(o *replicatedDatabaseOptions) {
+		o.dbName = name
+	}
+}
+
+// WithLegacySchemaVersionSource supplies the retiring pebble-stored schema
+// version counter, read once at open to migrate a pre-existing database's
+// version into __marmot_schema_version. Only consulted when the
+// SQLite file already existed before this open; see ensureSchemaVersionTable.
+func WithLegacySchemaVersionSource(read func(dbName string) (int64, error)) ReplicatedDatabaseOption {
+	return func(o *replicatedDatabaseOptions) {
+		o.legacySchemaVersion = read
+	}
 }
 
 // WithDurableCommits makes every commit on the database survive an OS crash
@@ -198,13 +225,35 @@ func NewReplicatedDatabase(dbPath string, nodeID uint64, clock *hlc.Clock, metaS
 		}
 	}
 
+	// The migration rule for __marmot_schema_version turns on whether
+	// __marmot_applied_txn already existed before this open, so it must be
+	// checked before ensureAppliedTxnTable creates it.
+	filePreexisted := false
+	if !isMemoryDB {
+		if existed, err := sqliteTableExists(writeDB, "__marmot_applied_txn"); err != nil {
+			closeAll()
+			return nil, err
+		} else {
+			filePreexisted = existed
+		}
+	}
+
 	if err := ensureAppliedTxnTable(writeDB); err != nil {
 		closeAll()
 		return nil, err
 	}
-	if err := repairAppliedTxnMetadata(writeDB, metaStore, ""); err != nil {
+	if err := repairAppliedTxnMetadata(writeDB, metaStore, o.dbName); err != nil {
 		closeAll()
 		return nil, err
+	}
+
+	// Every database file carries __marmot_schema_version, whichever path
+	// opened it: a commit that bumps it must never find it missing. Only a
+	// named user database migrates a legacy value into it.
+	schemaVersion, err := ensureSchemaVersionTable(writeDB, o.dbName, filePreexisted, o.legacySchemaVersion)
+	if err != nil {
+		closeAll()
+		return nil, fmt.Errorf("failed to prepare schema version table: %w", err)
 	}
 
 	// Create schema cache (shared by TransactionManager and preupdate hooks)
@@ -246,7 +295,13 @@ func NewReplicatedDatabase(dbPath string, nodeID uint64, clock *hlc.Clock, metaS
 		batchCommitter: batchCommitter,
 		schemaCache:    schemaCache,
 		gate:           gate,
+		dbName:         o.dbName,
 	}
+	mdb.schemaVersion.Store(schemaVersion)
+	if o.dbName != "" {
+		txnMgr.SetSchemaVersionBumped(func(v uint64) { mdb.advanceSchemaVersion(v) })
+	}
+	txnMgr.SetAppliedMarkerCheck(mdb.appliedMarkerExists)
 
 	// Wire batch committer to transaction manager
 	if batchCommitter != nil {
@@ -263,6 +318,16 @@ func NewReplicatedDatabase(dbPath string, nodeID uint64, clock *hlc.Clock, metaS
 	}
 
 	return mdb, nil
+}
+
+// appliedMarkerExists reports whether __marmot_applied_txn holds txnID,
+// read through the read pool so it never waits on the single writer.
+func (mdb *ReplicatedDatabase) appliedMarkerExists(txnID uint64) (bool, error) {
+	readDB := mdb.readDB
+	if readDB == nil {
+		return false, errors.New("database connections are closed")
+	}
+	return markerExists(readDB, txnID)
 }
 
 // SetReplicationFunc sets the replication function
@@ -539,6 +604,39 @@ func (mdb *ReplicatedDatabase) OpenSQLiteConnections(dbPath string) error {
 // GetMetaStore returns the MetaStore for transaction metadata
 func (mdb *ReplicatedDatabase) GetMetaStore() MetaStore {
 	return mdb.metaStore
+}
+
+// DatabaseName returns the name this database was opened under ("" for the
+// system database).
+func (mdb *ReplicatedDatabase) DatabaseName() string {
+	return mdb.dbName
+}
+
+// SchemaVersion returns the cached __marmot_schema_version value. It
+// is always 0 for the system database, which has no such table.
+func (mdb *ReplicatedDatabase) SchemaVersion() uint64 {
+	return mdb.schemaVersion.Load()
+}
+
+// advanceSchemaVersion raises the cached __marmot_schema_version value to v,
+// never lowering it: every post-commit store of a value read
+// from the database itself - the replay path and the 2PC non-DML commit
+// callback - goes through this instead of a plain Store, because two such
+// commits can finish in either order (replay's anti-entropy goroutine versus
+// this node's own DDL committer) and an out-of-order Store would regress the
+// cache below a value SQLite itself already has committed, wrongly declining
+// the PREPARE gate until the next DDL. The initial Store at open (a restore
+// reopen legitimately resets the cache) is exempt and stays a plain Store.
+func (mdb *ReplicatedDatabase) advanceSchemaVersion(v uint64) {
+	for {
+		cur := mdb.schemaVersion.Load()
+		if v <= cur {
+			return
+		}
+		if mdb.schemaVersion.CompareAndSwap(cur, v) {
+			return
+		}
+	}
 }
 
 // GetCachedTableSchema returns the cached schema for a table.

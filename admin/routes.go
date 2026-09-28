@@ -24,6 +24,7 @@ func RegisterRoutes(mux *http.ServeMux, handlers *AdminHandlers) {
 		r.Use(chiAuthMiddleware)
 		r.Get("/members", handlers.handleClusterMembers)
 		r.Get("/health", handlers.handleClusterHealth)
+		r.Get("/autoinc/votes", handlers.handleAutoIncVotes)
 		r.Get("/replication", handlers.handleClusterReplication)
 		r.Post("/remove/{nodeID}", handlers.handleClusterRemove)
 		r.Post("/allow/{nodeID}", handlers.handleClusterAllow)
@@ -198,7 +199,7 @@ func (h *AdminHandlers) replicationStates(w http.ResponseWriter, r *http.Request
 		writeErrorResponse(w, http.StatusNotFound, err.Error())
 		return
 	}
-	h.handleReplicationAll(w, r, metaStore)
+	h.handleReplicationAll(w, r, metaStore, database)
 }
 
 func (h *AdminHandlers) replicationStatePeer(w http.ResponseWriter, r *http.Request) {
@@ -219,20 +220,9 @@ func (h *AdminHandlers) replicationStatePeer(w http.ResponseWriter, r *http.Requ
 // Schema handlers
 func (h *AdminHandlers) schemaVersion(w http.ResponseWriter, r *http.Request) {
 	database := chi.URLParam(r, "database")
-	metaStore, err := h.getMetaStore(database)
-	if err != nil {
-		writeErrorResponse(w, http.StatusNotFound, err.Error())
-		return
-	}
-	h.handleSchemaDatabase(w, r, metaStore, database)
+	h.handleSchemaDatabase(w, r, database)
 }
 
 func (h *AdminHandlers) schemaVersions(w http.ResponseWriter, r *http.Request) {
-	database := chi.URLParam(r, "database")
-	metaStore, err := h.getMetaStore(database)
-	if err != nil {
-		writeErrorResponse(w, http.StatusNotFound, err.Error())
-		return
-	}
-	h.handleSchemaAll(w, r, metaStore)
+	h.handleSchemaAll(w, r)
 }

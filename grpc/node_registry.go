@@ -13,6 +13,14 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
+// LogPullProtocolVersion is the log-pull anti-entropy protocol generation this
+// binary serves (ListCommittedLog / FetchTransactions / ListDatabaseRegistry,
+// and a per-database DDL history counter comparable across the cluster). A
+// release before this protocol never sets NodeState.LogProtocolVersion, so it
+// is always observed as 0 for such a node, and DDL is refused cluster-wide
+// while any member reports less than this (LegacyLogProtocolMembers).
+const LogPullProtocolVersion uint32 = 1
+
 // copySchemaVersionMap creates a deep copy of a schema version map
 func copySchemaVersionMap(m map[string]uint64) map[string]uint64 {
 	if m == nil {
@@ -34,6 +42,7 @@ func copyNodeState(node *NodeState) *NodeState {
 		Incarnation:            node.Incarnation,
 		DatabaseSchemaVersions: copySchemaVersionMap(node.DatabaseSchemaVersions),
 		MinAppliedSeq:          node.MinAppliedSeq,
+		LogProtocolVersion:     node.LogProtocolVersion,
 	}
 }
 
@@ -91,10 +100,11 @@ func NewNodeRegistryWithDataDir(localNodeID uint64, advertiseAddress string, dat
 	// Add self to registry as ALIVE
 	now := time.Now()
 	nr.nodes[localNodeID] = &NodeState{
-		NodeId:      localNodeID,
-		Address:     advertiseAddress,
-		Status:      NodeStatus_ALIVE,
-		Incarnation: 0,
+		NodeId:             localNodeID,
+		Address:            advertiseAddress,
+		Status:             NodeStatus_ALIVE,
+		Incarnation:        0,
+		LogProtocolVersion: LogPullProtocolVersion,
 	}
 	nr.lastSeen[localNodeID] = now
 
@@ -227,9 +237,20 @@ func (nr *NodeRegistry) Update(node *NodeState) {
 			Uint64("incarnation", node.Incarnation).
 			Msg("REGISTRY: Escalating node status (same incarnation)")
 		existing.Status = node.Status
+		if node.LogProtocolVersion > existing.LogProtocolVersion {
+			existing.LogProtocolVersion = node.LogProtocolVersion
+		}
 
 		// Record state transition
 		telemetry.NodeStateTransitionsTotal.With(oldStatus.String(), node.Status.String()).Inc()
+		stateChanged = true
+	} else if node.Incarnation == existing.Incarnation && node.LogProtocolVersion > existing.LogProtocolVersion {
+		// Same incarnation, no status escalation: a relayed gossip copy of a
+		// node's own state can lack the version an earlier copy carried (for
+		// example a seed's Join response, which builds a bare NodeState for
+		// the joining node - see grpc/server.go Join). Never downgrade a
+		// known version; take the max for the same incarnation.
+		existing.LogProtocolVersion = node.LogProtocolVersion
 		stateChanged = true
 	} else {
 		log.Debug().
@@ -241,7 +262,8 @@ func (nr *NodeRegistry) Update(node *NodeState) {
 			Uint64("incoming_inc", node.Incarnation).
 			Msg("REGISTRY: Ignoring update (stale or invalid)")
 	}
-	// Ignore updates with same/older incarnation that don't escalate
+	// Ignore updates with same/older incarnation that don't escalate and
+	// don't raise the known log protocol version
 
 	// Refresh metrics and persist when the record changed at all. The persist
 	// hook fingerprints exactly the fields the snapshot stores, so a call here
@@ -313,8 +335,21 @@ func (nr *NodeRegistry) handleSelfUpdateLocked(node *NodeState) {
 		return
 	}
 
-	// If someone claims we're not ALIVE, refute by incrementing incarnation
-	if node.Status != NodeStatus_ALIVE && node.Incarnation >= self.Incarnation {
+	// If someone claims we're not ALIVE, refute by incrementing incarnation.
+	//
+	// A view of us with an older log protocol version (the one we had before
+	// a restart onto a newer binary, which does not bump our incarnation) is
+	// refuted only when it carries a HIGHER incarnation than ours: SWIM never
+	// lets a lower incarnation replace it, so without the refutation it would
+	// stay stale forever and keep DDL refused as if we had not been upgraded
+	// (LegacyLogProtocolMembers). At our own incarnation it is left alone:
+	// every current peer keeps the max version per incarnation (Update), so
+	// our own gossip corrects it, and a peer on an older release relays our
+	// state with the version stripped - refuting every such relay would climb our incarnation for as
+	// long as that peer runs.
+	stale := node.Status != NodeStatus_ALIVE && node.Incarnation >= self.Incarnation
+	staleVersion := node.LogProtocolVersion < self.LogProtocolVersion && node.Incarnation > self.Incarnation
+	if stale || staleVersion {
 		self.Incarnation = node.Incarnation + 1
 		// Only set to ALIVE if we're not JOINING
 		// JOINING nodes stay JOINING until explicitly promoted
@@ -325,7 +360,7 @@ func (nr *NodeRegistry) handleSelfUpdateLocked(node *NodeState) {
 			Uint64("refuted_incarnation", node.Incarnation).
 			Uint64("new_incarnation", self.Incarnation).
 			Str("current_status", self.Status.String()).
-			Msg("SWIM refutation: rejecting SUSPECT/DEAD claim")
+			Msg("SWIM refutation: rejecting a stale view of this node")
 	}
 }
 
@@ -524,6 +559,29 @@ func (nr *NodeRegistry) MemberIDs() []uint64 {
 	ids := make([]uint64, 0, len(nr.nodes))
 	for id, node := range nr.nodes {
 		if node.Status != NodeStatus_REMOVED && node.Status != NodeStatus_LEAVING {
+			ids = append(ids, id)
+		}
+	}
+	slices.Sort(ids)
+	return ids
+}
+
+// LegacyLogProtocolMembers returns the ids of every current member (any
+// status except REMOVED, self included) whose LogProtocolVersion is below
+// LogPullProtocolVersion, sorted ascending. A non-empty result means at least
+// one member runs an older release: DDL and CREATE/DROP DATABASE must be
+// refused cluster-wide until every member reports LogPullProtocolVersion
+// (coordinator.LegacyMembersDDLRefusal).
+func (nr *NodeRegistry) LegacyLogProtocolMembers() []uint64 {
+	nr.mu.RLock()
+	defer nr.mu.RUnlock()
+
+	ids := make([]uint64, 0)
+	for id, node := range nr.nodes {
+		if node.Status == NodeStatus_REMOVED {
+			continue
+		}
+		if node.LogProtocolVersion < LogPullProtocolVersion {
 			ids = append(ids, id)
 		}
 	}
@@ -1084,70 +1142,4 @@ func (nr *NodeRegistry) QuorumInfo() (totalMembership int, aliveCount int, quoru
 	// Quorum = majority of total membership
 	quorumSize = (totalMembership / 2) + 1
 	return
-}
-
-// =======================
-// WATERMARK PROTOCOL
-// =======================
-
-// UpdateLocalWatermark updates the minimum applied sequence number for the local node
-// This watermark is gossiped to all peers and used for GC coordination
-func (nr *NodeRegistry) UpdateLocalWatermark(minSeq uint64) {
-	nr.mu.Lock()
-	defer nr.mu.Unlock()
-
-	node, exists := nr.nodes[nr.localNodeID]
-	if !exists {
-		log.Error().
-			Uint64("node_id", nr.localNodeID).
-			Msg("BUG: Local node not found in registry during watermark update")
-		return
-	}
-
-	// Only update if the new watermark is higher (watermarks only advance)
-	if minSeq > node.MinAppliedSeq {
-		node.MinAppliedSeq = minSeq
-		log.Debug().
-			Uint64("node_id", nr.localNodeID).
-			Uint64("watermark", minSeq).
-			Msg("Updated local watermark")
-	}
-}
-
-// GetLocalWatermark returns the local node's watermark
-func (nr *NodeRegistry) GetLocalWatermark() uint64 {
-	nr.mu.RLock()
-	defer nr.mu.RUnlock()
-
-	if node, exists := nr.nodes[nr.localNodeID]; exists {
-		return node.MinAppliedSeq
-	}
-	return 0
-}
-
-// GetClusterMinWatermark returns the minimum watermark across all ALIVE nodes
-// This is the safe point for garbage collection - transactions with seq_num below
-// this value have been applied by all nodes and can be safely cleaned up
-func (nr *NodeRegistry) GetClusterMinWatermark() uint64 {
-	nr.mu.RLock()
-	defer nr.mu.RUnlock()
-
-	var minWatermark uint64 = ^uint64(0) // Max uint64
-	hasAliveNodes := false
-
-	for _, node := range nr.nodes {
-		if node.Status == NodeStatus_ALIVE {
-			hasAliveNodes = true
-			if node.MinAppliedSeq < minWatermark {
-				minWatermark = node.MinAppliedSeq
-			}
-		}
-	}
-
-	// If no alive nodes (shouldn't happen, we're always alive), return 0
-	if !hasAliveNodes {
-		return 0
-	}
-
-	return minWatermark
 }

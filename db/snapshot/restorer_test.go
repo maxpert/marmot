@@ -572,3 +572,35 @@ func TestRestorer_SystemDBMergeRunsBeforeTheSwap(t *testing.T) {
 		t.Fatalf("the system database was installed without the merge: %q", got)
 	}
 }
+
+// TestRestorer_VerifiesAgainstTheStreamedManifest: GetSnapshotInfo's list
+// describes an earlier snapshot than the one StreamSnapshot sends, so under
+// write load its checksum and size are stale. A restore verifies each file
+// against the checksum and size the stream reported with the file itself,
+// and still refuses bytes that do not match those.
+//
+// Mutation: ignore the streamed manifest (withStreamedManifest returns files
+// unchanged). "a file written after the info call was refused" fires.
+func TestRestorer_VerifiesAgainstTheStreamedManifest(t *testing.T) {
+	content := []byte("SQLite format 3\x00written after the info call")
+	stale := []DatabaseFileInfo{{
+		Name:           "test",
+		Filename:       "databases/test.db",
+		SizeBytes:      7,
+		SHA256Checksum: calculateSHA256([]byte("earlier")),
+	}}
+
+	chunks := createTestChunksWithMD5("databases/test.db", content)
+	chunks[0].FileSHA256 = calculateSHA256(content)
+	chunks[0].FileSizeBytes = int64(len(content))
+	if err := NewRestorer(t.TempDir(), nil).RestoreFromStream(&mockChunkStream{chunks: chunks}, stale); err != nil {
+		t.Fatalf("a file written after the info call was refused: %v", err)
+	}
+
+	corrupt := createTestChunksWithMD5("databases/test.db", content)
+	corrupt[0].FileSHA256 = calculateSHA256([]byte("other bytes"))
+	corrupt[0].FileSizeBytes = int64(len(content))
+	if err := NewRestorer(t.TempDir(), nil).RestoreFromStream(&mockChunkStream{chunks: corrupt}, stale); err == nil {
+		t.Fatal("bytes that do not match the streamed checksum were accepted")
+	}
+}

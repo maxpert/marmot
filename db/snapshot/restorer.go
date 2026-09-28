@@ -118,13 +118,16 @@ func (r *Restorer) RestoreFromStream(
 	}
 
 	// STEP 2: Download all chunks to temp directory
-	if err := r.downloadToTemp(stream, tempDir); err != nil {
+	streamed, err := r.downloadToTemp(stream, tempDir)
+	if err != nil {
 		r.setError(err)
 		return err
 	}
 
-	// STEP 3: Verify integrity
+	// STEP 3: Verify integrity, against what the stream itself reported for
+	// each file when it reported it (withStreamedManifest).
 	r.setPhase(PhaseVerifying)
+	files = withStreamedManifest(files, streamed)
 	if err := VerifyFileList(tempDir, files); err != nil {
 		r.setError(err)
 		return fmt.Errorf("snapshot integrity verification failed: %w", err)
@@ -142,8 +145,37 @@ func (r *Restorer) RestoreFromStream(
 	return nil
 }
 
-// downloadToTemp downloads all chunks from stream to temp directory
-func (r *Restorer) downloadToTemp(stream ChunkReceiver, tempDir string) error {
+// streamedFile is what a sender reported, on a file's last chunk, about the
+// whole file it streamed.
+type streamedFile struct {
+	sha256    string
+	sizeBytes int64
+}
+
+// withStreamedManifest returns files with each entry's checksum and size
+// replaced by what the stream reported for that file, where it reported
+// them. The stream's values describe exactly the bytes it sent; the list a
+// caller got from GetSnapshotInfo describes a separate, earlier snapshot of
+// a database that may have been written since, so under write load it can
+// never match. An entry the stream reported nothing for (an older sender)
+// keeps the caller's values.
+func withStreamedManifest(files []DatabaseFileInfo, streamed map[string]streamedFile) []DatabaseFileInfo {
+	out := make([]DatabaseFileInfo, len(files))
+	for i, f := range files {
+		if sf, ok := streamed[f.Filename]; ok {
+			f.SHA256Checksum = sf.sha256
+			f.SizeBytes = sf.sizeBytes
+		}
+		out[i] = f
+	}
+	return out
+}
+
+// downloadToTemp downloads all chunks from stream to temp directory and
+// returns, per filename, the whole-file checksum and size the stream
+// reported on that file's last chunk.
+func (r *Restorer) downloadToTemp(stream ChunkReceiver, tempDir string) (map[string]streamedFile, error) {
+	streamed := make(map[string]streamedFile)
 	openFiles := make(map[string]*os.File)
 	defer func() {
 		for _, f := range openFiles {
@@ -160,13 +192,16 @@ func (r *Restorer) downloadToTemp(stream ChunkReceiver, tempDir string) error {
 			break
 		}
 		if err != nil {
-			return fmt.Errorf("snapshot stream error: %w", err)
+			return nil, fmt.Errorf("snapshot stream error: %w", err)
 		}
 
 		// Process single chunk
 		bytesWritten, fileCompleted, err := r.processChunk(chunk, tempDir, openFiles)
 		if err != nil {
-			return err
+			return nil, err
+		}
+		if chunk.IsLastForFile && chunk.FileSHA256 != "" {
+			streamed[chunk.Filename] = streamedFile{sha256: chunk.FileSHA256, sizeBytes: chunk.FileSizeBytes}
 		}
 
 		// Update progress
@@ -185,7 +220,7 @@ func (r *Restorer) downloadToTemp(stream ChunkReceiver, tempDir string) error {
 		Str("temp_dir", tempDir).
 		Msg("Snapshot downloaded to temp directory")
 
-	return nil
+	return streamed, nil
 }
 
 // processChunk handles a single chunk: verify, write, and optionally close file

@@ -119,6 +119,13 @@ func (tdm *TestDatabaseManager) GetVectorIndexManager() coordinator.VectorIndexM
 	return nil
 }
 
+// RegistryKeyGeneration reports generation 1, live, for every name: this
+// fixture serves a single always-present database regardless of name (see
+// GetDatabase/DatabaseExists above).
+func (tdm *TestDatabaseManager) RegistryKeyGeneration(name string) (uint64, bool, error) {
+	return 1, true, nil
+}
+
 func TestMySQLServerIntegration(t *testing.T) {
 	// Setup temporary DB with MetaStore
 	tmpDir := t.TempDir()

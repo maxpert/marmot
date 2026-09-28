@@ -35,6 +35,9 @@ const (
 	MarmotService_GetLoadDataChunk_FullMethodName     = "/marmot.v2.MarmotService/GetLoadDataChunk"
 	MarmotService_GetAutoIncBases_FullMethodName      = "/marmot.v2.MarmotService/GetAutoIncBases"
 	MarmotService_SyncAutoIncBases_FullMethodName     = "/marmot.v2.MarmotService/SyncAutoIncBases"
+	MarmotService_ListCommittedLog_FullMethodName     = "/marmot.v2.MarmotService/ListCommittedLog"
+	MarmotService_FetchTransactions_FullMethodName    = "/marmot.v2.MarmotService/FetchTransactions"
+	MarmotService_ListDatabaseRegistry_FullMethodName = "/marmot.v2.MarmotService/ListDatabaseRegistry"
 	MarmotService_TransactionStream_FullMethodName    = "/marmot.v2.MarmotService/TransactionStream"
 )
 
@@ -83,6 +86,16 @@ type MarmotServiceClient interface {
 	// Runs one claim base sync on this node now: it raises its bases to the
 	// maximum every alive peer reports, and reports which members it reached.
 	SyncAutoIncBases(ctx context.Context, in *AutoIncSyncRequest, opts ...grpc.CallOption) (*AutoIncSyncResponse, error)
+	// ===== LOG PULL (anti-entropy) =====
+	// Lists this node's local commit log for one database strictly after a
+	// position, up to its stable point, and records that position as how far
+	// the requester has consumed this log.
+	ListCommittedLog(ctx context.Context, in *LogListRequest, opts ...grpc.CallOption) (*LogListResponse, error)
+	// Streams the named committed transactions of one database, then ends.
+	// Fails the call rather than send a transaction whose rows cannot be read.
+	FetchTransactions(ctx context.Context, in *FetchTransactionsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ChangeEvent], error)
+	// Lists this node's database registry, tombstones included.
+	ListDatabaseRegistry(ctx context.Context, in *DatabaseRegistryRequest, opts ...grpc.CallOption) (*DatabaseRegistryResponse, error)
 	// ===== CDC STREAMING =====
 	// Client-streaming RPC for large CDC payloads (≥128KB)
 	// Sends TransactionChunks followed by TransactionCommit
@@ -275,9 +288,48 @@ func (c *marmotServiceClient) SyncAutoIncBases(ctx context.Context, in *AutoIncS
 	return out, nil
 }
 
+func (c *marmotServiceClient) ListCommittedLog(ctx context.Context, in *LogListRequest, opts ...grpc.CallOption) (*LogListResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(LogListResponse)
+	err := c.cc.Invoke(ctx, MarmotService_ListCommittedLog_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *marmotServiceClient) FetchTransactions(ctx context.Context, in *FetchTransactionsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ChangeEvent], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &MarmotService_ServiceDesc.Streams[2], MarmotService_FetchTransactions_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[FetchTransactionsRequest, ChangeEvent]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type MarmotService_FetchTransactionsClient = grpc.ServerStreamingClient[ChangeEvent]
+
+func (c *marmotServiceClient) ListDatabaseRegistry(ctx context.Context, in *DatabaseRegistryRequest, opts ...grpc.CallOption) (*DatabaseRegistryResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DatabaseRegistryResponse)
+	err := c.cc.Invoke(ctx, MarmotService_ListDatabaseRegistry_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *marmotServiceClient) TransactionStream(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[TransactionStreamMessage, TransactionResponse], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &MarmotService_ServiceDesc.Streams[2], MarmotService_TransactionStream_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &MarmotService_ServiceDesc.Streams[3], MarmotService_TransactionStream_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -333,6 +385,16 @@ type MarmotServiceServer interface {
 	// Runs one claim base sync on this node now: it raises its bases to the
 	// maximum every alive peer reports, and reports which members it reached.
 	SyncAutoIncBases(context.Context, *AutoIncSyncRequest) (*AutoIncSyncResponse, error)
+	// ===== LOG PULL (anti-entropy) =====
+	// Lists this node's local commit log for one database strictly after a
+	// position, up to its stable point, and records that position as how far
+	// the requester has consumed this log.
+	ListCommittedLog(context.Context, *LogListRequest) (*LogListResponse, error)
+	// Streams the named committed transactions of one database, then ends.
+	// Fails the call rather than send a transaction whose rows cannot be read.
+	FetchTransactions(*FetchTransactionsRequest, grpc.ServerStreamingServer[ChangeEvent]) error
+	// Lists this node's database registry, tombstones included.
+	ListDatabaseRegistry(context.Context, *DatabaseRegistryRequest) (*DatabaseRegistryResponse, error)
 	// ===== CDC STREAMING =====
 	// Client-streaming RPC for large CDC payloads (≥128KB)
 	// Sends TransactionChunks followed by TransactionCommit
@@ -394,6 +456,15 @@ func (UnimplementedMarmotServiceServer) GetAutoIncBases(context.Context, *AutoIn
 }
 func (UnimplementedMarmotServiceServer) SyncAutoIncBases(context.Context, *AutoIncSyncRequest) (*AutoIncSyncResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method SyncAutoIncBases not implemented")
+}
+func (UnimplementedMarmotServiceServer) ListCommittedLog(context.Context, *LogListRequest) (*LogListResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ListCommittedLog not implemented")
+}
+func (UnimplementedMarmotServiceServer) FetchTransactions(*FetchTransactionsRequest, grpc.ServerStreamingServer[ChangeEvent]) error {
+	return status.Errorf(codes.Unimplemented, "method FetchTransactions not implemented")
+}
+func (UnimplementedMarmotServiceServer) ListDatabaseRegistry(context.Context, *DatabaseRegistryRequest) (*DatabaseRegistryResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ListDatabaseRegistry not implemented")
 }
 func (UnimplementedMarmotServiceServer) TransactionStream(grpc.ClientStreamingServer[TransactionStreamMessage, TransactionResponse]) error {
 	return status.Errorf(codes.Unimplemented, "method TransactionStream not implemented")
@@ -693,6 +764,53 @@ func _MarmotService_SyncAutoIncBases_Handler(srv interface{}, ctx context.Contex
 	return interceptor(ctx, in, info, handler)
 }
 
+func _MarmotService_ListCommittedLog_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(LogListRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MarmotServiceServer).ListCommittedLog(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: MarmotService_ListCommittedLog_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MarmotServiceServer).ListCommittedLog(ctx, req.(*LogListRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _MarmotService_FetchTransactions_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(FetchTransactionsRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(MarmotServiceServer).FetchTransactions(m, &grpc.GenericServerStream[FetchTransactionsRequest, ChangeEvent]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type MarmotService_FetchTransactionsServer = grpc.ServerStreamingServer[ChangeEvent]
+
+func _MarmotService_ListDatabaseRegistry_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DatabaseRegistryRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MarmotServiceServer).ListDatabaseRegistry(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: MarmotService_ListDatabaseRegistry_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MarmotServiceServer).ListDatabaseRegistry(ctx, req.(*DatabaseRegistryRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _MarmotService_TransactionStream_Handler(srv interface{}, stream grpc.ServerStream) error {
 	return srv.(MarmotServiceServer).TransactionStream(&grpc.GenericServerStream[TransactionStreamMessage, TransactionResponse]{ServerStream: stream})
 }
@@ -763,6 +881,14 @@ var MarmotService_ServiceDesc = grpc.ServiceDesc{
 			MethodName: "SyncAutoIncBases",
 			Handler:    _MarmotService_SyncAutoIncBases_Handler,
 		},
+		{
+			MethodName: "ListCommittedLog",
+			Handler:    _MarmotService_ListCommittedLog_Handler,
+		},
+		{
+			MethodName: "ListDatabaseRegistry",
+			Handler:    _MarmotService_ListDatabaseRegistry_Handler,
+		},
 	},
 	Streams: []grpc.StreamDesc{
 		{
@@ -773,6 +899,11 @@ var MarmotService_ServiceDesc = grpc.ServiceDesc{
 		{
 			StreamName:    "StreamSnapshot",
 			Handler:       _MarmotService_StreamSnapshot_Handler,
+			ServerStreams: true,
+		},
+		{
+			StreamName:    "FetchTransactions",
+			Handler:       _MarmotService_FetchTransactions_Handler,
 			ServerStreams: true,
 		},
 		{

@@ -68,6 +68,19 @@ service MarmotService {
   // maximum every alive peer reports, and reports which members it reached.
   rpc SyncAutoIncBases(AutoIncSyncRequest) returns (AutoIncSyncResponse);
 
+  // ===== LOG PULL (anti-entropy) =====
+  // Lists this node's local commit log for one database strictly after a
+  // position, up to its stable point, and records that position as how far
+  // the requester has consumed this log.
+  rpc ListCommittedLog(LogListRequest) returns (LogListResponse);
+
+  // Streams the named committed transactions of one database, then ends.
+  // Fails the call rather than send a transaction whose rows cannot be read.
+  rpc FetchTransactions(FetchTransactionsRequest) returns (stream ChangeEvent);
+
+  // Lists this node's database registry, tombstones included.
+  rpc ListDatabaseRegistry(DatabaseRegistryRequest) returns (DatabaseRegistryResponse);
+
   // ===== CDC STREAMING =====
   // Client-streaming RPC for large CDC payloads (≥128KB)
   // Sends TransactionChunks followed by TransactionCommit
@@ -95,6 +108,13 @@ message NodeState {
   map<string, uint64> database_schema_versions = 5;
   // Minimum applied sequence number (watermark for GC coordination)
   uint64 min_applied_seq = 6;
+  // log_protocol_version is the node's log-pull anti-entropy protocol
+  // generation: 0 means an older release (no ListCommittedLog /
+  // FetchTransactions / ListDatabaseRegistry RPCs, and a per-database DDL
+  // history counter that is not comparable with this protocol's), 1
+  // (LogPullProtocolVersion) means it serves those RPCs. An older release
+  // never sets this for itself, so it always reports 0 here.
+  uint32 log_protocol_version = 7;
 }
 
 enum NodeStatus {
@@ -195,6 +215,10 @@ message Statement {
   // rolling-upgrade gate above, DDLChange is the wrong statement type, and
   // DMLIntent carries only an intent key.
   bytes auto_id_claim_payload = 10;
+  // database_generation stamps a CREATE or DROP DATABASE statement with the
+  // registry generation the coordinator computed for it; with the statement
+  // type it forms the key participants order database operations by.
+  uint64 database_generation = 11;
 }
 
 enum VectorIndexAction {
@@ -326,7 +350,58 @@ message ChangeEvent {
   HLC timestamp = 3;
   string database = 4;  // Target database for these changes
   uint64 required_schema_version = 5;  // Minimum schema version required for this transaction
-  uint64 seq_num = 6;  // Monotonic sequence number for gap detection
+  uint64 seq_num = 6;  // Position of this transaction in the sender's local commit log
+  uint64 origin_node_id = 7;  // Node that coordinated the transaction
+  uint32 row_count = 8;  // Statement count recorded at commit; a receiver refuses a mismatch
+}
+
+// ===== LOG PULL MESSAGES =====
+message LogListRequest {
+  string database = 1;
+  uint64 requesting_node_id = 2;
+  uint64 after_seq = 3;     // List strictly after the position (after_seq, after_txn_id)
+  uint64 after_txn_id = 4;
+  uint32 limit = 5;
+  uint64 consumed_seq = 6;  // Position (consumed_seq, consumed_txn_id) the requester has applied every entry through
+  uint64 consumed_txn_id = 7;
+}
+
+message LogEntry {
+  uint64 seq = 1;
+  uint64 txn_id = 2;
+}
+
+message LogListResponse {
+  repeated LogEntry entries = 1;
+  uint64 stable_seq = 2;         // No entry at or below it can still become visible
+  uint64 truncated_seq = 3;      // Highest position GC has deleted
+  uint64 truncated_txn_id = 4;
+  bool more = 5;                 // More stable entries follow the last one returned
+  uint64 schema_version = 6;
+  bool database_absent = 7;
+}
+
+message FetchTransactionsRequest {
+  string database = 1;
+  uint64 requesting_node_id = 2;
+  repeated uint64 txn_ids = 3;
+}
+
+message DatabaseRegistryRequest {
+  uint64 requesting_node_id = 1;
+}
+
+message DatabaseRegistryEntry {
+  string name = 1;
+  uint64 generation = 2;
+  bool dropped = 3;
+  // legacy marks a registry row migrated from an older release's registry; a legacy
+  // live row never creates the database on a peer that lacks it.
+  bool legacy = 4;
+}
+
+message DatabaseRegistryResponse {
+  repeated DatabaseRegistryEntry entries = 1;
 }
 
 message ReplicationStateRequest {
@@ -399,6 +474,12 @@ message SnapshotChunk {
   string checksum = 4;
   string filename = 5;      // Which database file this chunk belongs to
   bool is_last_for_file = 6; // True if this is the last chunk for this file
+  // Set on a file's last chunk: the SHA256 and size of the file exactly as
+  // this stream sent it. A receiver verifies against these rather than the
+  // checksums GetSnapshotInfo reported, which describe an earlier, separate
+  // snapshot of a database that may have been written since.
+  string file_sha256 = 7;
+  int64 file_size_bytes = 8;
 }
 
 // ===== DELTA SYNC DETECTION =====

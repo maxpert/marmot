@@ -608,9 +608,38 @@ func applyClaimTx(tx *sql.Tx, database string, intent *WriteIntentRecord) error 
 	if err != nil {
 		return fmt.Errorf("write auto-increment base for %s.%s: %w", database, claim.Table, err)
 	}
-	if n != 1 {
-		return fmt.Errorf("%w: the claim row for %s.%s is absent or its committed or seed floor has passed the claim's newBase %d",
-			ErrAutoIncClaimNotApplicable, database, claim.Table, claim.NewBase)
+	if n == 1 {
+		return nil
 	}
-	return nil
+	applied, err := claimAlreadyApplied(tx, database, claim, intent)
+	if err != nil {
+		return err
+	}
+	if applied {
+		return nil
+	}
+	return fmt.Errorf("%w: the claim row for %s.%s is absent or its committed or seed floor has passed the claim's newBase %d",
+		ErrAutoIncClaimNotApplicable, database, claim.Table, claim.NewBase)
+}
+
+// claimAlreadyApplied reports whether the claim row still holds exactly what
+// applying this very claim wrote: committed at its end, with its owner and
+// grant time. The claim applies in the system database before the
+// transaction's user-database commit, so a commit that failed after it (the
+// user database's writer busy, a crash) leaves the claim applied and the
+// transaction PENDING; committing that transaction again must not be refused
+// for the floor its own claim raised. No other claim for the table can have
+// been applied since: this transaction's PENDING claim intent still holds the
+// claim key's row lock, which every other claim's PREPARE needs first.
+func claimAlreadyApplied(tx *sql.Tx, database string, claim protocol.AutoIncClaim, intent *WriteIntentRecord) (bool, error) {
+	var committed, owner, grantedAt int64
+	err := tx.QueryRow("SELECT committed, owner, granted_at FROM "+AutoIncClaimTable+" WHERE db = ? AND tbl = ?",
+		database, claim.Table).Scan(&committed, &owner, &grantedAt)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read auto-increment base for %s.%s: %w", database, claim.Table, err)
+	}
+	return committed == int64(claim.NewBase+claim.Size) && owner == int64(intent.NodeID) && grantedAt == intent.TSWall, nil
 }

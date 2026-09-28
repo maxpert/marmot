@@ -230,7 +230,6 @@ func main() {
 
 			case marmotgrpc.DELTA_SYNC:
 				log.Info().
-					Int("databases_behind", len(decision.DatabaseDeltas)).
 					Str("peer", decision.PeerAddr).
 					Msg("Delta sync required - will catch up after database initialization")
 				// Delta sync will be performed after database manager is initialized
@@ -326,14 +325,14 @@ func main() {
 		}
 	}
 
-	// Phase 5: Initialize schema version manager using system database's MetaStore
+	// Phase 5: Initialize schema version manager, reading each database's own
+	// __marmot_schema_version table.
 	log.Info().Msg("Initializing schema version manager")
-	systemDB, err := dbMgr.GetDatabase(db.SystemDatabaseName)
-	if err != nil {
+	if _, err := dbMgr.GetDatabase(db.SystemDatabaseName); err != nil {
 		log.Fatal().Err(err).Msg("Failed to get system database for schema versioning")
 		return
 	}
-	schemaVersionMgr := db.NewSchemaVersionManager(systemDB.GetMetaStore())
+	schemaVersionMgr := db.NewSchemaVersionManager(dbMgr)
 
 	// Wire up replication handlers
 	log.Info().Msg("Wiring up replication handlers")
@@ -353,26 +352,25 @@ func main() {
 
 	// Phase 6: Setup anti-entropy service for catching up lagging nodes
 	log.Info().Msg("Setting up anti-entropy service")
-	deltaSync := marmotgrpc.NewDeltaSyncClient(marmotgrpc.DeltaSyncConfig{
-		NodeID:           cfg.Config.NodeID,
-		Client:           client,
-		DBManager:        dbMgr,
-		Clock:            clock,
-		ApplyTxnsFn:      replicationHandler.HandleReplicateTransaction,
-		SchemaVersionMgr: schemaVersionMgr,
+	logPuller := marmotgrpc.NewLogPuller(marmotgrpc.LogPullerConfig{
+		NodeID:    cfg.Config.NodeID,
+		Client:    client,
+		DBManager: dbMgr,
 	})
 
-	// If we determined we need delta sync, perform it now that database manager is initialized
+	// If we determined we need targeted catch-up, perform it now that the
+	// database manager is initialized: one bounded LogPuller pass per
+	// database behind, over the seed peer.
 	if isJoiningCluster && catchUpDecision != nil && catchUpDecision.Strategy == marmotgrpc.DELTA_SYNC {
-		log.Info().Msg("Performing delta sync now that database manager is initialized")
+		log.Info().Msg("Performing startup log pull now that database manager is initialized")
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-		err := catchUpClient.PerformDeltaSync(ctx, catchUpDecision, deltaSync)
+		err := catchUpClient.PerformLogPull(ctx, catchUpDecision, logPuller, client)
 		cancel()
 		if err != nil {
-			log.Fatal().Err(err).Msg("Failed to perform delta sync")
+			log.Fatal().Err(err).Msg("Failed to perform startup log pull")
 			return
 		}
-		log.Info().Msg("Delta sync completed successfully")
+		log.Info().Msg("Startup log pull completed successfully")
 	}
 
 	// Create snapshot function for anti-entropy. CatchUpFromPeer keeps the
@@ -387,15 +385,31 @@ func main() {
 		grpcServer.GetNodeRegistry(),
 		client,
 		dbMgr,
-		deltaSync,
-		clock,
+		logPuller,
 		snapshotFunc,
-		schemaVersionMgr,
 	)
+	adminHandlers.SetAntiEntropy(antiEntropy)
+	grpcServer.SetAntiEntropy(antiEntropy)
 
-	// Wire anti-entropy refresh to DatabaseManager for GC watermark freshness
-	// This ensures GC queries fresh peer states before making deletion decisions
-	dbMgr.SetRefreshReplicationStatesFunc(antiEntropy.RefreshPeerReplicationStates)
+	// Wire GC's safe deletion position to this node's current cluster
+	// membership: every registry node
+	// whose status is not REMOVED, self included (LEAVING/DEAD/SUSPECT are
+	// still members, same as anti-entropy's own view -
+	// AntiEntropyService.currentMembers - unlike NodeRegistry.MemberIDs,
+	// which also excludes LEAVING for quorum purposes). wireGCCoordination
+	// (db/database_manager.go) turns this into each database's min consumed
+	// position across every other current member.
+	registry := grpcServer.GetNodeRegistry()
+	dbMgr.SetGCMembershipFunc(func() []uint64 {
+		nodes := registry.GetAll()
+		ids := make([]uint64, 0, len(nodes))
+		for _, n := range nodes {
+			if n.Status != marmotgrpc.NodeStatus_REMOVED {
+				ids = append(ids, n.NodeId)
+			}
+		}
+		return ids
+	})
 
 	// Start anti-entropy service
 	antiEntropy.Start()

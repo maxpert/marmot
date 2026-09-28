@@ -112,6 +112,7 @@ func convertStatementsToProto(stmts []protocol.Statement, database string, txnID
 
 		protoStmt.AutoIdClaim = stmt.AutoIDClaim
 		protoStmt.AutoIdClaimPayload = stmt.AutoIDClaimPayload
+		protoStmt.DatabaseGeneration = stmt.DatabaseGeneration
 
 		isDML := stmt.Type == protocol.StatementInsert ||
 			stmt.Type == protocol.StatementUpdate ||

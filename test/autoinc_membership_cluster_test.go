@@ -44,6 +44,7 @@ func openTimedNodeDatabase(t *testing.T, harness *ClusterHarness, nodeID int, da
 func execTimed(conn *sql.DB, query string, args ...interface{}) (sql.Result, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), clusterQueryTimeout)
 	defer cancel()
+	defer noteClientCall()
 	return conn.ExecContext(ctx, query, args...)
 }
 
@@ -108,6 +109,7 @@ func runAutoIncSync(harness *ClusterHarness, nodeID int) (autoIncSyncAnswer, err
 	}
 	req.Header.Set("X-Marmot-Secret", "test-secret")
 	resp, err := (&http.Client{Timeout: 90 * time.Second}).Do(req)
+	noteClientCall()
 	if err != nil {
 		return autoIncSyncAnswer{}, err
 	}
@@ -213,12 +215,12 @@ func insertOnEvery(t *testing.T, harness *ClusterHarness, ledger idLedger, table
 	}
 }
 
-// TestNarrowAutoInc_HeldNodeReleasesAfterItsSeedReturns is reviewer B's C2
-// (b) and (d) - a wiped node whose only seed is down, so its join fails and
-// its catch-up strategy cannot use the seed - and reviewer A's F-L1: the node
-// is held while it cannot reach enough members, and releases once its seed
-// is back. Before the R3c-14 fix it never connected to the returned seed,
-// which it had learned of as ALIVE from another member, and stayed held.
+// TestNarrowAutoInc_HeldNodeReleasesAfterItsSeedReturns: a wiped node whose
+// only seed is down, so its join fails and its catch-up strategy cannot use
+// the seed, is held while it cannot reach enough members, and releases once
+// its seed is back. That needs it to connect to the returned seed, which it
+// learned of as ALIVE from another member; a node that never connected
+// stayed held.
 //
 // Mutations: never hold (both hold sites) - "was not held while its seed was
 // down" fires; drop the ALIVE callback on discovery (node_registry.go) - "did
@@ -337,8 +339,7 @@ func waitForCompleteSync(t *testing.T, harness *ClusterHarness, nodeID int, rest
 	}
 }
 
-// TestNarrowAutoInc_WipedSeedAndItsJoinerHold is reviewer B's C2 (a) and
-// (c): the seed node, which has no seeds of its own, loses its data
+// TestNarrowAutoInc_WipedSeedAndItsJoinerHold: the seed node, which has no seeds of its own, loses its data
 // directory, and so does a node whose only seed it is, which therefore
 // catches up from an empty seed. Both restart held and release only by
 // merging claim bases from the member that kept them, and the sync command
@@ -386,7 +387,7 @@ func TestNarrowAutoInc_WipedSeedAndItsJoinerHold(t *testing.T) {
 }
 
 // TestNarrowAutoInc_SyncAfterAddingAMember is the membership-change procedure
-// (R3c-8b) on a growing cluster: a fourth node joins, becomes ALIVE and
+// on a growing cluster: a fourth node joins, becomes ALIVE and
 // releases, the operator runs the sync command, and it reports every member
 // answered, unheld and reaching every member. Ids stay unique across all four.
 //

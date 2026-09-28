@@ -313,6 +313,8 @@ func TestAntiEntropyRestoresADatabaseWhoseReattachFailed(t *testing.T) {
 	var tried []uint64
 	ae := &AntiEntropyService{
 		dbManager: local,
+		interval:  30 * time.Second,
+		logPuller: NewLogPuller(LogPullerConfig{NodeID: 1, Client: NewClient(1), DBManager: local}),
 		snapshotFunc: func(ctx context.Context, peerNodeID uint64, peerAddr string, database string) error {
 			tried = append(tried, peerNodeID)
 			return client.CatchUpFromPeer(ctx, peerNodeID, peerAddr, database)
@@ -323,9 +325,8 @@ func TestAntiEntropyRestoresADatabaseWhoseReattachFailed(t *testing.T) {
 	require.NoError(t, err)
 	unreachable := closed.Addr().String()
 	require.NoError(t, closed.Close())
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	ae.restoreAwaitingDatabases(ctx, []*NodeState{{NodeId: 2, Address: unreachable}, {NodeId: 3, Address: addr}})
+	nodes := []*NodeState{{NodeId: 2, Address: unreachable}, {NodeId: 3, Address: addr}}
+	ae.restoreAwaitingDatabases(nodes)
 
 	require.Empty(t, local.DatabasesAwaitingRestore(), "a database whose reattach failed was never restored")
 	require.Equal(t, []uint64{2, 3}, tried)
@@ -387,10 +388,17 @@ func TestTwoNodesAwaitingRestoresRecoverFromEachOther(t *testing.T) {
 	antiEntropy := func(dm *db.DatabaseManager, nodeID uint64, dir string) *AntiEntropyService {
 		client := NewCatchUpClient(nodeID, dir, NewNodeRegistry(nodeID, "localhost:5001"), nil)
 		client.SetDatabaseManager(dm)
-		return &AntiEntropyService{dbManager: dm, snapshotFunc: client.CatchUpFromPeer}
+		return &AntiEntropyService{
+			dbManager:    dm,
+			interval:     30 * time.Second,
+			logPuller:    NewLogPuller(LogPullerConfig{NodeID: nodeID, Client: NewClient(nodeID), DBManager: dm}),
+			snapshotFunc: client.CatchUpFromPeer,
+		}
 	}
-	antiEntropy(x, 1, xDir).restoreAwaitingDatabases(ctx, []*NodeState{{NodeId: 2, Address: yAddr}})
-	antiEntropy(y, 2, yDir).restoreAwaitingDatabases(ctx, []*NodeState{{NodeId: 1, Address: xAddr}})
+	yNode := []*NodeState{{NodeId: 2, Address: yAddr}}
+	xNode := []*NodeState{{NodeId: 1, Address: xAddr}}
+	antiEntropy(x, 1, xDir).restoreAwaitingDatabases(yNode)
+	antiEntropy(y, 2, yDir).restoreAwaitingDatabases(xNode)
 
 	require.Empty(t, x.DatabasesAwaitingRestore(), "a database awaiting a restore was never restored by a peer awaiting another")
 	require.Empty(t, y.DatabasesAwaitingRestore(), "a database awaiting a restore was never restored by a peer awaiting another")

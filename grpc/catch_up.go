@@ -26,9 +26,9 @@ type CatchUpStrategy int
 const (
 	// NO_CATCHUP - Node is up to date, no catch-up needed
 	NO_CATCHUP CatchUpStrategy = iota
-	// DELTA_SYNC - Node is slightly behind, use transaction log replay
+	// DELTA_SYNC - Node has data: pull the seed's log for every database
 	DELTA_SYNC
-	// FULL_SNAPSHOT - Node is far behind or has no data, need full snapshot
+	// FULL_SNAPSHOT - Node has no data, need full snapshot
 	FULL_SNAPSHOT
 )
 
@@ -67,17 +67,6 @@ func NewCatchUpClient(nodeID uint64, dataDir string, registry *NodeRegistry, see
 // CatchUpFromPeer.
 func (c *CatchUpClient) SetDatabaseManager(dbMgr *db.DatabaseManager) {
 	c.dbManager.Store(dbMgr)
-}
-
-// persistSchemaVersions restores a snapshot's schema versions, writing through
-// the live DatabaseManager's system MetaStore when one is available (the
-// anti-entropy runtime path), or by opening the MetaStore directly by path
-// when it is not (the startup join path, before the DatabaseManager exists).
-func (c *CatchUpClient) persistSchemaVersions(versions map[string]uint64) error {
-	if dbMgr := c.dbManager.Load(); dbMgr != nil {
-		return persistSnapshotSchemaVersionsViaManager(dbMgr, versions)
-	}
-	return persistSnapshotSchemaVersions(c.dataDir, versions)
 }
 
 // CatchUpFromPeer downloads a snapshot of a specific database from a peer
@@ -340,19 +329,8 @@ func (c *CatchUpClient) applySnapshot(ctx context.Context, client MarmotServiceC
 	}
 
 	// From this point on the snapshot's files are already swapped onto disk.
-	// Restore the schema versions the snapshot was taken at - skipping this
-	// leaves the node reporting version 0, after which it refuses every
-	// transaction that requires a newer schema and can never rejoin
-	// replication. Prefer the versions captured atomically with these exact
-	// files (the stream trailer) over the earlier, potentially stale read from
-	// GetSnapshotInfo.
-	versions := SnapshotVersionsForRestore(info.DatabaseMetadata, stream)
-	if database != "" {
-		versions = versionsFor(versions, database)
-	}
-	if err := c.persistSchemaVersions(versions); err != nil {
-		return fmt.Errorf("failed to restore schema versions from snapshot: %w", err)
-	}
+	// Each installed SQLite file carries its own __marmot_schema_version
+	// table, so nothing needs to be restored out of band here any more.
 
 	log.Info().
 		Uint64("snapshot_txn_id", info.SnapshotTxnId).
@@ -382,15 +360,6 @@ func snapshotFilesToRestore(databases []*DatabaseFileInfo, database string) ([]s
 	return files, nil
 }
 
-// versionsFor keeps only database's entry of a snapshot's schema versions.
-func versionsFor(versions map[string]uint64, database string) map[string]uint64 {
-	v, ok := versions[database]
-	if !ok {
-		return nil
-	}
-	return map[string]uint64{database: v}
-}
-
 // grpcSnapshotStreamAdapter adapts MarmotService_StreamSnapshotClient to snapshot.ChunkReceiver
 type grpcSnapshotStreamAdapter struct {
 	stream MarmotService_StreamSnapshotClient
@@ -409,6 +378,8 @@ func (a *grpcSnapshotStreamAdapter) Recv() (*snapshot.Chunk, error) {
 		Data:          chunk.GetData(),
 		MD5Checksum:   chunk.GetChecksum(),
 		IsLastForFile: chunk.GetIsLastForFile(),
+		FileSHA256:    chunk.GetFileSha256(),
+		FileSizeBytes: chunk.GetFileSizeBytes(),
 	}, nil
 }
 
@@ -528,29 +499,44 @@ func (c *CatchUpClient) GetPeerMaxTxnIDs(ctx context.Context, peerAddr string) (
 	return resp.DatabaseTxnIds, nil
 }
 
-// CatchUpDecision contains the strategy and sync information
+// CatchUpDecision is the chosen strategy and the seed it runs against.
 type CatchUpDecision struct {
-	Strategy       CatchUpStrategy
-	PeerNodeID     uint64
-	PeerAddr       string
-	DatabaseDeltas map[string]DeltaInfo // Per-database sync info
+	Strategy   CatchUpStrategy
+	PeerNodeID uint64
+	PeerAddr   string
 }
 
-// DeltaInfo contains delta sync information for a database
-type DeltaInfo struct {
-	DatabaseName string
-	LocalTxnID   uint64
-	PeerTxnID    uint64
-	TxnsBehind   uint64
+// catchUpStrategyFor decides how a starting node catches up with a seed from
+// the max txn ids each side reports per database:
+//   - a seed with no data: nothing to catch up;
+//   - a node with no data of its own: a full snapshot;
+//   - otherwise a log pull of every database the seed has. Whether a node is
+//     behind cannot be read from txn ids (they are not a position in any
+//     one node's log), and a
+//     pull that finds nothing new costs one listing; PerformLogPull restores
+//     a database from a snapshot only when the seed's log no longer covers
+//     this node's cursor into it.
+func catchUpStrategyFor(localTxnIDs, peerTxnIDs map[string]uint64) CatchUpStrategy {
+	peerHasData := false
+	for _, txnID := range peerTxnIDs {
+		if txnID > 0 {
+			peerHasData = true
+			break
+		}
+	}
+	if !peerHasData {
+		return NO_CATCHUP
+	}
+	if len(localTxnIDs) == 0 {
+		return FULL_SNAPSHOT
+	}
+	return DELTA_SYNC
 }
 
 // DetermineCatchUpStrategy determines the best catch-up strategy by comparing local vs cluster state
 // This is the main entry point for catch-up detection
 func (c *CatchUpClient) DetermineCatchUpStrategy(ctx context.Context) (*CatchUpDecision, error) {
-	decision := &CatchUpDecision{
-		Strategy:       NO_CATCHUP,
-		DatabaseDeltas: make(map[string]DeltaInfo),
-	}
+	decision := &CatchUpDecision{Strategy: NO_CATCHUP}
 
 	// Step 1: Get local transaction IDs
 	localTxnIDs, err := c.GetLocalMaxTxnID(ctx)
@@ -572,136 +558,89 @@ func (c *CatchUpClient) DetermineCatchUpStrategy(ctx context.Context) (*CatchUpD
 		return nil, fmt.Errorf("failed to get peer txn IDs: %w", err)
 	}
 
-	// Step 4: Compare local vs peer state
-	// Check if peer has any actual data (non-zero txn IDs)
-	// A peer with {"marmot": 0} has no data, just an empty database
-	var peerHasData bool
-	for _, txnID := range peerTxnIDs {
-		if txnID > 0 {
-			peerHasData = true
-			break
-		}
-	}
-
-	if len(localTxnIDs) == 0 && peerHasData {
-		// We have no data, peer has actual data - need full snapshot
-		decision.Strategy = FULL_SNAPSHOT
-		log.Info().
-			Str("peer", seedAddr).
-			Msg("No local data found - full snapshot required")
-		return decision, nil
-	}
-
-	if !peerHasData {
-		// Peer has no actual data - we're up to date (or we're the first node)
-		decision.Strategy = NO_CATCHUP
-		log.Info().Msg("Peer has no data - no catch-up needed")
-		return decision, nil
-	}
-
-	// Step 5: Calculate deltas per database
-	var totalTxnsBehind uint64
-	var maxDeltaForAnyDB uint64
-
-	// Check all databases that exist on peer
-	for dbName, peerTxnID := range peerTxnIDs {
-		localTxnID := localTxnIDs[dbName] // 0 if database doesn't exist locally
-
-		if peerTxnID > localTxnID {
-			delta := peerTxnID - localTxnID
-			totalTxnsBehind += delta
-
-			if delta > maxDeltaForAnyDB {
-				maxDeltaForAnyDB = delta
-			}
-
-			decision.DatabaseDeltas[dbName] = DeltaInfo{
-				DatabaseName: dbName,
-				LocalTxnID:   localTxnID,
-				PeerTxnID:    peerTxnID,
-				TxnsBehind:   delta,
-			}
-
-			log.Debug().
-				Str("database", dbName).
-				Uint64("local_txn_id", localTxnID).
-				Uint64("peer_txn_id", peerTxnID).
-				Uint64("behind_by", delta).
-				Msg("Database delta calculated")
-		}
-	}
-
-	// Step 6: Determine strategy based on delta size
-	if totalTxnsBehind == 0 {
-		decision.Strategy = NO_CATCHUP
-		log.Info().Msg("Node is up to date - no catch-up needed")
-	} else if maxDeltaForAnyDB > uint64(cfg.Config.Replication.DeltaSyncThresholdTxns) {
-		// Any database is too far behind - use snapshot
-		decision.Strategy = FULL_SNAPSHOT
-		log.Info().
-			Uint64("max_delta", maxDeltaForAnyDB).
-			Int("threshold", cfg.Config.Replication.DeltaSyncThresholdTxns).
-			Msg("Delta too large for any database - full snapshot required")
-	} else {
-		// Small delta - use incremental sync
-		decision.Strategy = DELTA_SYNC
-		log.Info().
-			Uint64("total_txns_behind", totalTxnsBehind).
-			Uint64("max_delta", maxDeltaForAnyDB).
-			Int("databases_to_sync", len(decision.DatabaseDeltas)).
-			Msg("Delta sync strategy selected")
-	}
-
+	decision.Strategy = catchUpStrategyFor(localTxnIDs, peerTxnIDs)
+	log.Info().
+		Str("peer", seedAddr).
+		Int("strategy", int(decision.Strategy)).
+		Msg("Catch-up strategy selected")
 	return decision, nil
 }
 
-// PerformDeltaSync performs incremental catch-up using transaction logs
-// This is called when the node is only slightly behind and can catch up via delta sync
-func (c *CatchUpClient) PerformDeltaSync(ctx context.Context, decision *CatchUpDecision, deltaSyncClient *DeltaSyncClient) error {
-	if deltaSyncClient == nil {
-		return fmt.Errorf("delta sync client not provided")
+// PerformLogPull catches a starting node up with its seed: it merges the seed's database registry, so a database created
+// while this node was down exists before its log is pulled, then runs one
+// bounded LogPuller.PullPair pass over the seed for every database, restoring
+// one from the seed's snapshot when the seed's log no longer covers this
+// node's cursor into it. Every step terminates: ListCommittedLog is a bounded
+// RPC and FetchTransactions ends with EOF.
+//
+// A database that fails is logged and left to anti-entropy, which pulls every
+// member's log every round; startup is not failed for it. Only a missing
+// puller or database manager is an error.
+func (c *CatchUpClient) PerformLogPull(ctx context.Context, decision *CatchUpDecision, lp *LogPuller, client *Client) error {
+	if lp == nil {
+		return fmt.Errorf("log puller not provided")
+	}
+	dbMgr := c.dbManager.Load()
+	if dbMgr == nil {
+		return fmt.Errorf("startup log pull needs the running node's DatabaseManager")
 	}
 
-	log.Info().
-		Int("databases_to_sync", len(decision.DatabaseDeltas)).
-		Str("peer", decision.PeerAddr).
-		Msg("Starting delta sync")
+	log.Info().Str("peer", decision.PeerAddr).Msg("Starting startup log pull")
 
-	// Mark ourselves as JOINING during sync
-	c.registry.MarkJoining(c.nodeID)
-
-	// Sync each database that's behind
-	for dbName, deltaInfo := range decision.DatabaseDeltas {
-		log.Info().
-			Str("database", dbName).
-			Uint64("from_txn_id", deltaInfo.LocalTxnID).
-			Uint64("to_txn_id", deltaInfo.PeerTxnID).
-			Uint64("txns_to_apply", deltaInfo.TxnsBehind).
-			Msg("Starting database delta sync")
-
-		// Use existing DeltaSyncClient to sync from peer
-		result, err := deltaSyncClient.SyncFromPeer(
-			ctx,
-			decision.PeerNodeID,
-			decision.PeerAddr,
-			dbName,
-			deltaInfo.LocalTxnID,
-		)
-
-		if err != nil {
-			return fmt.Errorf("failed to sync database %s: %w", dbName, err)
+	// A node the pull finds behind is marked JOINING, so it stays out of
+	// quorums until the promotion checker admits it. A node the pull finds
+	// current keeps its status: every startup of a node with data runs this
+	// pull, and a current node is exactly what a restart of an idle cluster
+	// brings back.
+	behind := false
+	defer func() {
+		if behind {
+			c.registry.MarkJoining(c.nodeID)
 		}
+	}()
 
-		log.Info().
-			Str("database", dbName).
-			Int("txns_applied", result.TxnsApplied).
-			Uint64("final_txn_id", result.LastAppliedTxnID).
-			Msg("Database delta sync completed")
+	if err := reconcileRegistryWithPeer(ctx, client, dbMgr, c.nodeID, decision.PeerAddr); err != nil {
+		log.Warn().Err(err).Str("peer", decision.PeerAddr).
+			Msg("Startup log pull: database registry reconciliation failed; anti-entropy will retry it")
 	}
 
-	log.Info().
-		Int("databases_synced", len(decision.DatabaseDeltas)).
-		Msg("Delta sync completed successfully")
-
+	peer := PeerRef{NodeID: decision.PeerNodeID, Address: decision.PeerAddr}
+	for _, dbName := range dbMgr.ListDatabases() {
+		result, err := lp.PullPair(ctx, peer, dbName)
+		if err != nil || result.NeedsSnapshot || result.Applied > 0 || !result.CaughtUp {
+			behind = true
+		}
+		if err != nil {
+			log.Warn().Err(err).Str("database", dbName).
+				Msg("Startup log pull failed; anti-entropy will retry it")
+			continue
+		}
+		if result.NeedsSnapshot {
+			log.Info().Str("database", dbName).Uint64("peer", decision.PeerNodeID).
+				Msg("Startup log pull: the seed's log no longer covers this node's cursor, restoring from its snapshot")
+			if err := c.restoreFromSeed(ctx, dbName, peer, lp); err != nil {
+				log.Warn().Err(err).Str("database", dbName).
+					Msg("Startup restore failed; anti-entropy will retry it")
+			}
+			continue
+		}
+		log.Info().Str("database", dbName).Int("txns_applied", result.Applied).Bool("caught_up", result.CaughtUp).
+			Msg("Startup log pull: database pass completed")
+	}
 	return nil
+}
+
+// restoreFromSeed restores dbName from peer's snapshot through the same
+// restore sequence anti-entropy runs (restoreDatabase).
+func (c *CatchUpClient) restoreFromSeed(ctx context.Context, dbName string, peer PeerRef, lp *LogPuller) error {
+	dbMgr := c.dbManager.Load()
+	if dbMgr == nil {
+		return fmt.Errorf("startup log pull of %s needs the running node's DatabaseManager", dbName)
+	}
+	return restoreDatabase(ctx, dbMgr, lp, dbName, func(ctx context.Context) error {
+		if err := c.CatchUpFromPeer(ctx, peer.NodeID, peer.Address, dbName); err != nil {
+			return fmt.Errorf("failed to restore database %s from peer: %w", dbName, err)
+		}
+		return nil
+	})
 }

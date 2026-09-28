@@ -44,8 +44,8 @@ func NewMemoryMetaStore(pebble *PebbleMetaStore) *MemoryMetaStore {
 
 // BeginTransaction writes immutable record to Pebble and stores status/heartbeat in memory.
 func (m *MemoryMetaStore) BeginTransaction(txnID, nodeID uint64, startTS hlc.Timestamp) error {
-	// Write immutable record to Pebble /txn/{txnID}
-	if err := m.pebble.writeImmutableTxnRecord(txnID, nodeID, startTS); err != nil {
+	// Write immutable record and pending-index key to Pebble
+	if err := m.pebble.writeBegunTxnRecord(txnID, nodeID, startTS); err != nil {
 		return err
 	}
 
@@ -66,6 +66,36 @@ func (m *MemoryMetaStore) BeginTransaction(txnID, nodeID uint64, startTS hlc.Tim
 // DurablyPrepareTransaction delegates the durable prepare fence to Pebble.
 func (m *MemoryMetaStore) DurablyPrepareTransaction(txnID uint64) error {
 	return m.pebble.DurablyPrepareTransaction(txnID)
+}
+
+// ClassifyPending implements MetaStore: a begin Pebble alone would call
+// abandoned is live while this process still tracks it PENDING.
+func (m *MemoryMetaStore) ClassifyPending(txnID uint64) (PendingKind, error) {
+	kind, err := m.pebble.ClassifyPending(txnID)
+	if err != nil || kind != PendingBegunAbandoned {
+		return kind, err
+	}
+	if state, found := m.txnStore.Get(txnID); found {
+		if state.Status == TxnStatusPending {
+			return PendingBegunLive, nil
+		}
+		return PendingNone, nil
+	}
+	return PendingBegunAbandoned, nil
+}
+
+// DiscardAbandonedBegin implements MetaStore.
+func (m *MemoryMetaStore) DiscardAbandonedBegin(txnID uint64) error {
+	if _, found := m.txnStore.Get(txnID); found {
+		return fmt.Errorf("transaction %d: %w", txnID, ErrNotAbandonedBegin)
+	}
+	m.lockStore.ReleaseByTxn(txnID)
+	return m.pebble.DiscardAbandonedBegin(txnID)
+}
+
+// PreparedPayload delegates to Pebble.
+func (m *MemoryMetaStore) PreparedPayload(txnID uint64) (PreparedPayload, bool, error) {
+	return m.pebble.PreparedPayload(txnID)
 }
 
 // GetTransaction reconstructs TransactionRecord from Pebble and memory state.
@@ -111,6 +141,7 @@ func (m *MemoryMetaStore) GetTransaction(txnID uint64) (*TransactionRecord, erro
 			rec.TablesInvolved = commit.TablesInvolved
 			rec.DatabaseName = commit.DatabaseName
 			rec.RequiredSchemaVersion = commit.RequiredSchemaVersion
+			rec.RowCount = commit.RowCount
 		}
 	}
 
@@ -153,7 +184,12 @@ func (m *MemoryMetaStore) CommitTransaction(txnID uint64, commitTS hlc.Timestamp
 	return nil
 }
 
-// AbortTransaction updates memory status and cleans up Pebble records.
+// AbortTransaction updates memory status and cleans up Pebble records. A
+// transaction already COMMITTED is refused (ErrAbortCommitted): the
+// memory tier removes a transaction from txnStore as soon as it commits
+// (see CommitTransaction), so finding it here still marked committed is a
+// narrow race with that removal, not the common case of "not tracked in
+// memory" below.
 func (m *MemoryMetaStore) AbortTransaction(txnID uint64) error {
 	// Check if transaction exists in memory
 	state, found := m.txnStore.Get(txnID)
@@ -161,12 +197,15 @@ func (m *MemoryMetaStore) AbortTransaction(txnID uint64) error {
 		// Not in memory - might be a committed/replayed transaction, delegate to Pebble
 		return m.pebble.AbortTransaction(txnID)
 	}
+	if state.Status == TxnStatusCommitted {
+		return ErrAbortCommitted
+	}
 
 	// Update memory status to aborted
 	m.txnStore.UpdateStatus(txnID, TxnStatusAborted)
 
 	// Manually clean up Pebble keys (can't call pebble.AbortTransaction because it expects status in Pebble)
-	if err := m.pebble.deleteTransactionKeys(txnID, state.Status == TxnStatusCommitted); err != nil {
+	if err := m.pebble.deleteTransactionKeys(txnID); err != nil {
 		return err
 	}
 
@@ -177,8 +216,8 @@ func (m *MemoryMetaStore) AbortTransaction(txnID uint64) error {
 }
 
 // StoreReplayedTransaction delegates to Pebble for replayed transactions.
-func (m *MemoryMetaStore) StoreReplayedTransaction(txnID, nodeID uint64, commitTS hlc.Timestamp, dbName string, rowCount uint32) error {
-	return m.pebble.StoreReplayedTransaction(txnID, nodeID, commitTS, dbName, rowCount)
+func (m *MemoryMetaStore) StoreReplayedTransaction(txnID, originNodeID uint64, commitTS hlc.Timestamp, dbName string, rowCount uint32, requiredSchemaVersion uint64) error {
+	return m.pebble.StoreReplayedTransaction(txnID, originNodeID, commitTS, dbName, rowCount, requiredSchemaVersion)
 }
 
 // WriteIntent delegates to Pebble (not migrated to memory yet).
@@ -211,54 +250,66 @@ func (m *MemoryMetaStore) GetIntent(tableName, intentKey string) (*WriteIntentRe
 	return m.pebble.GetIntent(tableName, intentKey)
 }
 
-// GetReplicationState delegates to Pebble.
-func (m *MemoryMetaStore) GetReplicationState(peerNodeID uint64, dbName string) (*ReplicationStateRecord, error) {
-	return m.pebble.GetReplicationState(peerNodeID, dbName)
-}
-
-// UpdateReplicationState delegates to Pebble.
-func (m *MemoryMetaStore) UpdateReplicationState(peerNodeID uint64, dbName string, lastTxnID uint64, lastTS hlc.Timestamp) error {
-	return m.pebble.UpdateReplicationState(peerNodeID, dbName, lastTxnID, lastTS)
-}
-
-// GetMinAppliedTxnID delegates to Pebble.
-func (m *MemoryMetaStore) GetMinAppliedTxnID(dbName string) (uint64, error) {
-	return m.pebble.GetMinAppliedTxnID(dbName)
-}
-
-// GetAllReplicationStates delegates to Pebble.
-func (m *MemoryMetaStore) GetAllReplicationStates() ([]*ReplicationStateRecord, error) {
-	return m.pebble.GetAllReplicationStates()
-}
-
-// GetNextSeqNum delegates to Pebble.
-func (m *MemoryMetaStore) GetNextSeqNum(nodeID uint64) (uint64, error) {
-	return m.pebble.GetNextSeqNum(nodeID)
-}
-
 // GetMaxSeqNum delegates to Pebble.
 func (m *MemoryMetaStore) GetMaxSeqNum() (uint64, error) {
 	return m.pebble.GetMaxSeqNum()
 }
 
-// GetMinAppliedSeqNum delegates to Pebble.
-func (m *MemoryMetaStore) GetMinAppliedSeqNum(dbName string) (uint64, error) {
-	return m.pebble.GetMinAppliedSeqNum(dbName)
+// StableSeq delegates to Pebble.
+func (m *MemoryMetaStore) StableSeq() uint64 {
+	return m.pebble.StableSeq()
 }
 
-// GetSchemaVersion delegates to Pebble.
+// ListCommittedLog delegates to Pebble.
+func (m *MemoryMetaStore) ListCommittedLog(after LogPosition, limit int) ([]LogPosition, uint64, bool, error) {
+	return m.pebble.ListCommittedLog(after, limit)
+}
+
+// GetPullCursor delegates to Pebble.
+func (m *MemoryMetaStore) GetPullCursor(peerNodeID uint64) (LogPosition, error) {
+	return m.pebble.GetPullCursor(peerNodeID)
+}
+
+// SetPullCursor delegates to Pebble.
+func (m *MemoryMetaStore) SetPullCursor(peerNodeID uint64, pos LogPosition) error {
+	return m.pebble.SetPullCursor(peerNodeID, pos)
+}
+
+// SetConsumedPosition delegates to Pebble.
+func (m *MemoryMetaStore) SetConsumedPosition(requesterNodeID uint64, pos LogPosition) error {
+	return m.pebble.SetConsumedPosition(requesterNodeID, pos)
+}
+
+// ConsumedPositions delegates to Pebble.
+func (m *MemoryMetaStore) ConsumedPositions() (map[uint64]LogPosition, error) {
+	return m.pebble.ConsumedPositions()
+}
+
+// DeleteConsumedPosition delegates to Pebble.
+func (m *MemoryMetaStore) DeleteConsumedPosition(nodeID uint64) error {
+	return m.pebble.DeleteConsumedPosition(nodeID)
+}
+
+// TruncatedThrough delegates to Pebble.
+func (m *MemoryMetaStore) TruncatedThrough() (LogPosition, error) {
+	return m.pebble.TruncatedThrough()
+}
+
+// SetReapplyPending delegates to Pebble.
+func (m *MemoryMetaStore) SetReapplyPending(pending bool) error {
+	return m.pebble.SetReapplyPending(pending)
+}
+
+// ReapplyPending delegates to Pebble.
+func (m *MemoryMetaStore) ReapplyPending() (bool, error) {
+	return m.pebble.ReapplyPending()
+}
+
+// GetSchemaVersion delegates to Pebble. Kept only as the schema-version
+// migration read;
+// see MetaStore.GetSchemaVersion's doc comment.
 func (m *MemoryMetaStore) GetSchemaVersion(dbName string) (int64, error) {
 	return m.pebble.GetSchemaVersion(dbName)
-}
-
-// UpdateSchemaVersion delegates to Pebble.
-func (m *MemoryMetaStore) UpdateSchemaVersion(dbName string, version int64, ddlSQL string, txnID uint64) error {
-	return m.pebble.UpdateSchemaVersion(dbName, version, ddlSQL, txnID)
-}
-
-// GetAllSchemaVersions delegates to Pebble.
-func (m *MemoryMetaStore) GetAllSchemaVersions() (map[string]int64, error) {
-	return m.pebble.GetAllSchemaVersions()
 }
 
 // TryAcquireDDLLock delegates to Pebble.
@@ -362,44 +413,50 @@ func (m *MemoryMetaStore) GetCDCTableDDLLock(tableName string) (uint64, error) {
 	return txnID, nil
 }
 
-// CleanupStaleTransactions iterates memory txnStore instead of Pebble /txn_idx/pend/.
-func (m *MemoryMetaStore) CleanupStaleTransactions(timeout time.Duration) (int, error) {
+// StaleTransactionIDs implements MetaStore from the memory txnStore: every
+// PENDING transaction whose last heartbeat is older than timeout.
+func (m *MemoryMetaStore) StaleTransactionIDs(timeout time.Duration) ([]uint64, error) {
 	cutoff := time.Now().Add(-timeout).UnixNano()
-	cleaned := 0
-
-	var staleTxnIDs []uint64
-
-	// Iterate memory txnStore for pending transactions
+	var stale []uint64
 	m.txnStore.RangePending(func(txnID uint64) bool {
-		state, found := m.txnStore.Get(txnID)
-		if !found {
-			return true
-		}
-
-		if state.LastHeartbeat < cutoff {
-			staleTxnIDs = append(staleTxnIDs, txnID)
+		if m.isStale(txnID, cutoff) {
+			stale = append(stale, txnID)
 		}
 		return true
 	})
+	return stale, nil
+}
 
-	// Abort each stale transaction and clean up intents
-	for _, txnID := range staleTxnIDs {
-		// Clean up write intents first
-		_ = m.DeleteIntentsByTxn(txnID)
-		_ = m.pebble.DeleteIntentEntries(txnID)
-
-		// Then abort the transaction
-		if err := m.AbortTransaction(txnID); err == nil {
-			cleaned++
-		}
+// AbortStaleTransaction implements MetaStore: it re-checks, under the
+// caller's per-txn commit guard, that txnID is still PENDING with a stale
+// heartbeat, and only then deletes its intents and captured rows and aborts
+// it.
+func (m *MemoryMetaStore) AbortStaleTransaction(txnID uint64, timeout time.Duration) (bool, error) {
+	if !m.isStale(txnID, time.Now().Add(-timeout).UnixNano()) {
+		return false, nil
 	}
+	if err := m.DeleteIntentsByTxn(txnID); err != nil {
+		return false, fmt.Errorf("delete intents of stale txn %d: %w", txnID, err)
+	}
+	if err := m.pebble.DeleteIntentEntries(txnID); err != nil {
+		return false, fmt.Errorf("delete captured rows of stale txn %d: %w", txnID, err)
+	}
+	if err := m.AbortTransaction(txnID); err != nil {
+		return false, fmt.Errorf("abort stale txn %d: %w", txnID, err)
+	}
+	return true, nil
+}
 
-	return cleaned, nil
+// isStale reports whether txnID is PENDING in the memory txnStore with a
+// last heartbeat before cutoff.
+func (m *MemoryMetaStore) isStale(txnID uint64, cutoff int64) bool {
+	state, found := m.txnStore.Get(txnID)
+	return found && state.Status == TxnStatusPending && state.LastHeartbeat < cutoff
 }
 
 // CleanupOldTransactionRecords delegates to Pebble.
-func (m *MemoryMetaStore) CleanupOldTransactionRecords(minRetention, maxRetention time.Duration, minAppliedTxnID, minAppliedSeqNum uint64) (int, error) {
-	return m.pebble.CleanupOldTransactionRecords(minRetention, maxRetention, minAppliedTxnID, minAppliedSeqNum)
+func (m *MemoryMetaStore) CleanupOldTransactionRecords(minRetention, maxRetention time.Duration, safe LogPosition) (int, error) {
+	return m.pebble.CleanupOldTransactionRecords(minRetention, maxRetention, safe)
 }
 
 // GetMaxCommittedTxnID delegates to Pebble.
@@ -450,6 +507,11 @@ func (m *MemoryMetaStore) IntentStats() (pendingIntents int, err error) {
 // unless its COMMIT or ABORT arrives first; until then its captured rows are
 // kept for that COMMIT. The captured rows of any other transaction without a
 // commit record are orphans of a crash and are deleted.
+//
+// A begin the previous process died holding before its durable prepare
+// (PendingBegunAbandoned) promised nothing to its coordinator and is
+// discarded, so it can never read PENDING forever and block the log pull of
+// the transaction a peer committed under its id.
 func (m *MemoryMetaStore) ReconstructFromPebble() error {
 	now := time.Now().UnixNano()
 	for _, rec := range m.pebble.takeRecoveredPrepared() {
@@ -460,6 +522,19 @@ func (m *MemoryMetaStore) ReconstructFromPebble() error {
 			StartTSLogical: rec.StartTSLogical,
 			LastHeartbeat:  now,
 		})
+	}
+
+	abandoned, err := m.pebble.abandonedBeginTxnIDs()
+	if err != nil {
+		return fmt.Errorf("failed to find abandoned transaction begins: %w", err)
+	}
+	for _, txnID := range abandoned {
+		if err := m.DiscardAbandonedBegin(txnID); err != nil {
+			return fmt.Errorf("failed to discard abandoned begin %d: %w", txnID, err)
+		}
+	}
+	if len(abandoned) > 0 {
+		log.Info().Int("count", len(abandoned)).Msg("Discarded transaction begins abandoned before their durable prepare")
 	}
 
 	candidates, err := m.pebble.findOrphanedCDCRawTxnIDs()

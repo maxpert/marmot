@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/maxpert/marmot/cfg"
-	"github.com/maxpert/marmot/common"
 	"github.com/maxpert/marmot/coordinator"
 	"github.com/maxpert/marmot/db"
 	"github.com/rs/zerolog/log"
@@ -54,6 +53,11 @@ type Server struct {
 
 	// CDC signal-based change streaming
 	cdcSubscriber db.CDCSubscriber
+
+	// antiEntropy reports each local database's caught-up/stuck status.
+	// nil until SetAntiEntropy is called
+	// (marmot.go, once AntiEntropyService is constructed).
+	antiEntropy *AntiEntropyService
 
 	// Per-database snapshot exports served within snapshot_cache_ttl_seconds
 	snapshotExports snapshotExportCache
@@ -451,97 +455,27 @@ func (s *Server) Read(ctx context.Context, req *ReadRequest) (*ReadResponse, err
 	return &ReadResponse{}, nil
 }
 
-// sendChangeEvent converts a TransactionRecord to ChangeEvent and sends it on the stream.
-// Handles both CDC (Change Data Capture) path with row data and DDL path with SQL statements.
-// Reads CDC entries from MetaStore for the transaction and converts them to Statement objects.
+// sendChangeEvent converts a TransactionRecord to ChangeEvent and sends it on
+// the stream, using the same captured-row-to-Statement conversion
+// FetchTransactions shares (statementFromCapturedRow, grpc/log_server.go).
+// StreamChanges keeps its existing lenient semantics for read replicas: an
+// iterate or decode error is logged and that row is skipped
+// rather than failing the whole stream (lenientStatementsFromLog) - unlike
+// FetchTransactions, which fails the call outright.
 func (s *Server) sendChangeEvent(rec *db.TransactionRecord, metaStore db.MetaStore, stream MarmotService_StreamChangesServer) error {
-	// Build statements from CDC entries in MetaStore
-	var statements []*Statement
-
-	cursor, err := metaStore.IterateCapturedRows(rec.TxnID)
-	if err != nil {
-		log.Warn().Err(err).Uint64("txn_id", rec.TxnID).Msg("Failed to iterate captured rows for streaming")
-	} else {
-		defer cursor.Close()
-		for cursor.Next() {
-			_, data := cursor.Row()
-			row, err := db.DecodeRow(data)
-			if err != nil {
-				log.Warn().Err(err).Uint64("txn_id", rec.TxnID).Msg("Failed to decode captured row")
-				continue
-			}
-
-			// Convert OpType to wire StatementType
-			stmtCode := db.OpTypeToStatementType(db.OpType(row.Op))
-			wireType := common.MustToWireType(stmtCode)
-
-			var stmt *Statement
-			switch db.OpType(row.Op) {
-			case db.OpTypeVectorIndex:
-				if row.VectorIndexChange == nil {
-					log.Warn().Uint64("txn_id", rec.TxnID).Msg("Vector index CDC row missing payload")
-					continue
-				}
-				stmt = &Statement{
-					Type:      common.MustToWireType(common.StatementVectorIndexControl),
-					TableName: row.Table,
-					Database:  rec.DatabaseName,
-					Payload: &Statement_VectorIndexChange{
-						VectorIndexChange: vectorChangeToProto(*row.VectorIndexChange),
-					},
-				}
-			case db.OpTypeDDL:
-				// DDL statement - use DDLChange payload
-				stmt = &Statement{
-					Type:      wireType,
-					TableName: row.Table,
-					Database:  rec.DatabaseName,
-					Payload: &Statement_DdlChange{
-						DdlChange: &DDLChange{
-							Sql: row.DDLSQL,
-						},
-					},
-				}
-			case db.OpTypeLoadData:
-				stmt = &Statement{
-					Type:      wireType,
-					TableName: row.Table,
-					Database:  rec.DatabaseName,
-					Payload: &Statement_LoadDataChange{
-						LoadDataChange: &LoadDataChange{
-							Sql:  row.LoadSQL,
-							Data: row.LoadData,
-						},
-					},
-				}
-			default:
-				// DML statement - use RowChange payload
-				stmt = &Statement{
-					Type:      wireType,
-					TableName: row.Table,
-					Database:  rec.DatabaseName,
-					Payload: &Statement_RowChange{
-						RowChange: &RowChange{
-							EncodedRow:      append([]byte(nil), data...),
-							EncodedRowCodec: db.EncodedCapturedRowCodecMsgpack(),
-						},
-					},
-				}
-			}
-			statements = append(statements, stmt)
-		}
-	}
-
 	event := &ChangeEvent{
 		TxnId:  rec.TxnID,
 		SeqNum: rec.SeqNum,
 		Timestamp: &HLC{
 			WallTime: rec.CommitTSWall,
 			Logical:  rec.CommitTSLogical,
+			NodeId:   rec.NodeID,
 		},
-		Statements:            statements,
+		Statements:            lenientStatementsFromLog(rec, metaStore),
 		Database:              rec.DatabaseName,
 		RequiredSchemaVersion: rec.RequiredSchemaVersion,
+		OriginNodeId:          rec.NodeID,
+		RowCount:              rec.RowCount,
 	}
 
 	return stream.Send(event)
@@ -736,11 +670,25 @@ func (s *Server) streamHistoricalTransactions(
 	return nil
 }
 
-// GetReplicationState returns current replication state for anti-entropy
-// Returns per-database replication progress for the requesting peer
+// GetReplicationState is kept only for rolling upgrades: a peer on a release
+// before the commit-log pull protocol still calls it, during its own
+// anti-entropy negotiation. Its wire shape is frozen - no field is ever added
+// to it again - so it reports the log-pull replication state mapped into the
+// old fields rather than the removed MetaStore.ReplicationState table:
+//   - LastAppliedTxnId is req.RequestingNodeId's last-consumed position in
+//     this database's log (MetaStore.ConsumedPositions), i.e. how far that
+//     peer has pulled from this node - the closest equivalent of "last
+//     applied txn id from this peer".
+//   - SyncStatus is derived from AntiEntropyService: STUCK if the database
+//     has any stuck transaction (LogPuller.StuckTxns), SYNCED if
+//     AntiEntropyService.CaughtUp, CATCHING_UP otherwise.
+//   - LastAppliedTimestamp has no equivalent (log positions are (seq,
+//     txnID), not HLC) and is always the zero timestamp.
+//   - LastSyncTime has no equivalent and is always zero.
 func (s *Server) GetReplicationState(ctx context.Context, req *ReplicationStateRequest) (*ReplicationStateResponse, error) {
 	s.mu.RLock()
 	dbManager := s.dbManager
+	antiEntropy := s.antiEntropy
 	s.mu.RUnlock()
 
 	if dbManager == nil {
@@ -752,80 +700,68 @@ func (s *Server) GetReplicationState(ctx context.Context, req *ReplicationStateR
 		Str("database_filter", req.Database).
 		Msg("Replication state requested")
 
-	var states []*DatabaseReplicationState
-
-	// Get list of databases to query
 	var databases []string
 	if req.Database != "" {
-		// Specific database requested
 		databases = []string{req.Database}
 	} else {
-		// All databases
 		databases = dbManager.ListDatabases()
 	}
 
-	// Query replication state for each database
+	states := make([]*DatabaseReplicationState, 0, len(databases))
 	for _, dbName := range databases {
-		// Get last applied txn_id from replication_state table for this peer
-		repState, err := dbManager.GetReplicationState(req.RequestingNodeId, dbName)
-		var lastAppliedTxnID uint64
-		var lastAppliedTS *HLC
-		var lastSyncTime int64
-		var syncStatus string
-
-		if err != nil || repState == nil {
-			// No replication state yet for this peer/database - use defaults
-			lastAppliedTxnID = 0
-			lastAppliedTS = &HLC{WallTime: 0, Logical: 0, NodeId: s.nodeID}
-			lastSyncTime = 0
-			syncStatus = "SYNCED"
-		} else {
-			lastAppliedTxnID = repState.LastAppliedTxnID
-			lastAppliedTS = &HLC{
-				WallTime: repState.LastAppliedTSWall,
-				Logical:  repState.LastAppliedTSLog,
-				NodeId:   s.nodeID,
-			}
-			lastSyncTime = repState.LastSyncTime
-			syncStatus = repState.SyncStatus
-		}
-
-		// Get current max txn_id in this database
-		maxTxnID, err := dbManager.GetMaxTxnID(dbName)
-		if err != nil {
-			log.Warn().Err(err).Str("database", dbName).Msg("Failed to get max txn_id")
-			maxTxnID = 0
-		}
-
-		// Get committed transaction count for data completeness comparison
-		txnCount, err := dbManager.GetCommittedTxnCount(dbName)
-		if err != nil {
-			log.Warn().Err(err).Str("database", dbName).Msg("Failed to get committed txn count")
-			txnCount = 0
-		}
-
-		// Get max sequence number for gap detection
-		maxSeqNum, err := dbManager.GetMaxSeqNum(dbName)
-		if err != nil {
-			log.Warn().Err(err).Str("database", dbName).Msg("Failed to get max seq_num")
-			maxSeqNum = 0
-		}
-
-		states = append(states, &DatabaseReplicationState{
-			DatabaseName:         dbName,
-			LastAppliedTxnId:     lastAppliedTxnID,
-			LastAppliedTimestamp: lastAppliedTS,
-			LastSyncTime:         lastSyncTime,
-			SyncStatus:           syncStatus,
-			CurrentMaxTxnId:      maxTxnID,
-			CommittedTxnCount:    txnCount,
-			MaxSeqNum:            maxSeqNum,
-		})
+		states = append(states, s.legacyReplicationStateFor(dbName, req.RequestingNodeId, dbManager, antiEntropy))
 	}
 
 	return &ReplicationStateResponse{
 		States: states,
 	}, nil
+}
+
+// legacyReplicationStateFor builds one database's entry for the
+// GetReplicationState shim (see its doc comment).
+func (s *Server) legacyReplicationStateFor(dbName string, requestingNodeID uint64, dbManager *db.DatabaseManager, antiEntropy *AntiEntropyService) *DatabaseReplicationState {
+	var lastAppliedTxnID uint64
+	if mdb, err := dbManager.GetDatabase(dbName); err == nil {
+		if metaStore := mdb.GetMetaStore(); metaStore != nil {
+			if positions, err := metaStore.ConsumedPositions(); err == nil {
+				lastAppliedTxnID = positions[requestingNodeID].TxnID
+			}
+		}
+	}
+
+	syncStatus := "CATCHING_UP"
+	if antiEntropy != nil {
+		switch {
+		case antiEntropy.StuckTxnCount(dbName) > 0:
+			syncStatus = "STUCK"
+		case antiEntropy.CaughtUp(dbName):
+			syncStatus = "SYNCED"
+		}
+	}
+
+	maxTxnID, err := dbManager.GetMaxTxnID(dbName)
+	if err != nil {
+		log.Warn().Err(err).Str("database", dbName).Msg("Failed to get max txn_id")
+	}
+	txnCount, err := dbManager.GetCommittedTxnCount(dbName)
+	if err != nil {
+		log.Warn().Err(err).Str("database", dbName).Msg("Failed to get committed txn count")
+	}
+	maxSeqNum, err := dbManager.GetMaxSeqNum(dbName)
+	if err != nil {
+		log.Warn().Err(err).Str("database", dbName).Msg("Failed to get max seq_num")
+	}
+
+	return &DatabaseReplicationState{
+		DatabaseName:         dbName,
+		LastAppliedTxnId:     lastAppliedTxnID,
+		LastAppliedTimestamp: &HLC{WallTime: 0, Logical: 0, NodeId: s.nodeID},
+		LastSyncTime:         0,
+		SyncStatus:           syncStatus,
+		CurrentMaxTxnId:      maxTxnID,
+		CommittedTxnCount:    txnCount,
+		MaxSeqNum:            maxSeqNum,
+	}
 }
 
 // =======================
@@ -871,11 +807,6 @@ func (s *Server) GetSnapshotInfo(ctx context.Context, req *SnapshotInfoRequest) 
 		return nil, snapshotError("failed to get snapshot info", err)
 	}
 
-	// Schema versions travel with the snapshot: they live in the MetaStore, which
-	// is not part of the transferred files, and a receiver that cannot recover
-	// them refuses every transaction requiring a newer schema.
-	schemaVersions := snapshotSchemaVersions(dbManager)
-
 	// Calculate total size and chunks (estimates)
 	var totalSize int64
 	var dbInfos []*DatabaseFileInfo
@@ -902,7 +833,6 @@ func (s *Server) GetSnapshotInfo(ctx context.Context, req *SnapshotInfoRequest) 
 			SnapshotTxnId:  txnID,
 			SizeBytes:      snap.Size,
 			Sha256Checksum: snap.SHA256,
-			SchemaVersion:  schemaVersions[snap.Name],
 		})
 	}
 
@@ -940,7 +870,6 @@ func (s *Server) databaseSnapshotInfo(dbManager *db.DatabaseManager, database st
 			SnapshotTxnId:  txnID,
 			SizeBytes:      snap.Size,
 			Sha256Checksum: snap.SHA256,
-			SchemaVersion:  snapshotSchemaVersions(dbManager)[snap.Name],
 		}},
 	}, nil
 }
@@ -973,23 +902,6 @@ func (s *Server) StreamSnapshot(req *SnapshotRequest, stream MarmotService_Strea
 	defer export.release()
 	snapshots := export.snapshots
 	maxTxnID := export.maxTxnID
-
-	// Advertise the schema versions captured with these exact files as stream
-	// trailer metadata. GetSnapshotInfo's earlier estimate can go stale if a
-	// DDL commits between that call and this one; receivers prefer this value
-	// (see grpc.SnapshotVersionsForRestore) so they never restore a version
-	// older than the files they actually received.
-	schemaVersions := export.schemaVersions
-	if req.Database != "" {
-		// Single-database snapshots don't capture schema versions in the
-		// same atomic step as the file copy (unlike TakeSnapshotToDir), so
-		// read the current value here instead - it is the best available
-		// estimate for this legacy path.
-		schemaVersions = snapshotSchemaVersions(dbManager)
-	}
-	if trailer := snapshotSchemaVersionsTrailer(schemaVersions); trailer != nil {
-		stream.SetTrailer(trailer)
-	}
 
 	log.Info().
 		Uint64("requesting_node", req.RequestingNodeId).
@@ -1049,6 +961,10 @@ func (s *Server) StreamSnapshot(req *SnapshotRequest, stream MarmotService_Strea
 					Filename:      snap.Filename,
 					IsLastForFile: isLastForFile,
 				}
+				if isLastForFile {
+					chunk.FileSha256 = snap.SHA256
+					chunk.FileSizeBytes = snap.Size
+				}
 
 				if err := stream.Send(chunk); err != nil {
 					return fmt.Errorf("failed to send chunk: %w", err)
@@ -1095,7 +1011,7 @@ func (s *Server) exportSnapshot(dbManager *db.DatabaseManager, dataDir, database
 	}
 
 	if database == "" {
-		export.snapshots, export.maxTxnID, export.schemaVersions, err = dbManager.TakeSnapshotToDir(export.dir)
+		export.snapshots, export.maxTxnID, err = dbManager.TakeSnapshotToDir(export.dir)
 		if err != nil {
 			export.release()
 			return nil, snapshotError("failed to take snapshot", err)
@@ -1196,6 +1112,17 @@ func (s *Server) SetCDCSubscriber(subscriber db.CDCSubscriber) {
 	s.cdcSubscriber = subscriber
 }
 
+// SetAntiEntropy wires the running AntiEntropyService into the server, so
+// checkPromotionCriteria can additionally require PromotionReady for every
+// local database and GetReplicationState can report real
+// caught-up/stuck status. marmot.go calls this once anti-entropy is
+// constructed.
+func (s *Server) SetAntiEntropy(ae *AntiEntropyService) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.antiEntropy = ae
+}
+
 // =======================
 // PROMOTION CHECKER
 // =======================
@@ -1276,6 +1203,7 @@ func (s *Server) checkPromotionCriteria() bool {
 	s.mu.RLock()
 	dbManager := s.dbManager
 	replicationHandler := s.replicationHandler
+	antiEntropy := s.antiEntropy
 	s.mu.RUnlock()
 
 	if dbManager == nil {
@@ -1295,20 +1223,42 @@ func (s *Server) checkPromotionCriteria() bool {
 		return false
 	}
 
+	// Schema versions matching is not enough - a database can be current on schema
+	// but still missing committed rows anti-entropy has not pulled yet.
+	// Require every local database to be PromotionReady (AntiEntropyService,
+	// evaluated over alive peers only) before promoting.
+	if antiEntropy != nil {
+		for _, dbName := range localDatabases {
+			if dbName == db.SystemDatabaseName {
+				continue
+			}
+			if !antiEntropy.PromotionReady(dbName) {
+				log.Debug().Str("database", dbName).Msg("Database not promotion-ready, delaying promotion")
+				return false
+			}
+		}
+	}
+
 	// Verify schema versions match or exceed all ALIVE peers
 	// This prevents premature promotion before DDL replication completes
 	if replicationHandler == nil {
 		return false
 	}
+	return schemaVersionsMatchOrExceedPeers(replicationHandler, localDatabases, aliveNodes)
+}
 
+// schemaVersionsMatchOrExceedPeers reports whether every ALIVE peer's
+// reported schema version, for every database it and this node both have, is
+// no higher than this node's own cached version - the second half of
+// checkPromotionCriteria's promotion gate.
+func schemaVersionsMatchOrExceedPeers(replicationHandler *ReplicationHandler, localDatabases []string, aliveNodes []*NodeState) bool {
 	localSchemaVersions, err := replicationHandler.GetAllSchemaVersions()
 	if err != nil {
 		log.Warn().Err(err).Msg("Failed to get local schema versions for promotion check")
 		return false
 	}
 
-	// Build a set of local database names for quick lookup
-	localDBSet := make(map[string]bool)
+	localDBSet := make(map[string]bool, len(localDatabases))
 	for _, dbName := range localDatabases {
 		localDBSet[dbName] = true
 	}
@@ -1322,39 +1272,34 @@ func (s *Server) checkPromotionCriteria() bool {
 
 		// For each database the peer has, check if our schema is at least as recent
 		for dbName, peerVersion := range peerSchemaVersions {
-			// Skip system database - it's not subject to DDL replication
-			if dbName == db.SystemDatabaseName {
+			if dbName == db.SystemDatabaseName || !localDBSet[dbName] {
+				// System database is not subject to DDL replication; a
+				// database we don't have yet arrives via replication - both
+				// are acceptable, continue checking.
 				continue
 			}
-
-			localVersion, hasSchemaEntry := localSchemaVersions[dbName]
-			hasLocalDB := localDBSet[dbName]
-
-			if !hasLocalDB {
-				// Peer has a database we don't have yet - we'll get it via replication
-				// This is acceptable, continue checking
-				continue
-			}
-
-			// If we have the database locally but no schema version entry,
-			// treat it as version 0 (fresh database, no DDL applied yet)
-			if !hasSchemaEntry {
-				localVersion = 0
-			}
-
-			// If peer has higher schema version, we're behind on DDL
-			if localVersion < peerVersion {
-				log.Debug().
-					Str("database", dbName).
-					Uint64("local_version", localVersion).
-					Uint64("peer_version", peerVersion).
-					Uint64("peer_id", peer.NodeId).
-					Msg("Schema version behind peer, delaying promotion")
+			if schemaVersionBehindPeer(localSchemaVersions[dbName], peerVersion, dbName, peer.NodeId) {
 				return false
 			}
 		}
 	}
 
+	return true
+}
+
+// schemaVersionBehindPeer reports (and logs) whether localVersion is behind
+// peerVersion for dbName. A missing local schema version entry is treated as
+// version 0 (fresh database, no DDL applied yet).
+func schemaVersionBehindPeer(localVersion, peerVersion uint64, dbName string, peerNodeID uint64) bool {
+	if localVersion >= peerVersion {
+		return false
+	}
+	log.Debug().
+		Str("database", dbName).
+		Uint64("local_version", localVersion).
+		Uint64("peer_version", peerVersion).
+		Uint64("peer_id", peerNodeID).
+		Msg("Schema version behind peer, delaying promotion")
 	return true
 }
 

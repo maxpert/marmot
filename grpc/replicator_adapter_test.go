@@ -53,9 +53,9 @@ func TestGRPCReplicator_PrepareRejectionCarriesOverRealGRPCConnection(t *testing
 	_, err = dbInstance.GetDB().Exec(`CREATE TABLE groups (group_id INTEGER PRIMARY KEY, creation_date datetime)`)
 	require.NoError(t, err)
 
-	systemDB, err := dbMgr.GetDatabase(db.SystemDatabaseName)
+	_, err = dbMgr.GetDatabase(db.SystemDatabaseName)
 	require.NoError(t, err)
-	handler := NewReplicationHandler(1, dbMgr, clock, db.NewSchemaVersionManager(systemDB.GetMetaStore()))
+	handler := NewReplicationHandler(1, dbMgr, clock, db.NewSchemaVersionManager(dbMgr))
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)

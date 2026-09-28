@@ -110,6 +110,16 @@ func (m *DDLMockDatabaseManager) GetVectorIndexManager() coordinator.VectorIndex
 	return nil
 }
 
+// RegistryKeyGeneration reports generation 1 for any database this mock is
+// tracking (live) and 0 for any it is not (never seen); the DDL mock has no
+// tombstone/generation history of its own to model.
+func (m *DDLMockDatabaseManager) RegistryKeyGeneration(name string) (uint64, bool, error) {
+	if m.DatabaseExists(name) {
+		return 1, true, nil
+	}
+	return 0, false, nil
+}
+
 // DDLMockReader implements coordinator.Reader for testing
 type DDLMockReader struct{}
 
@@ -129,6 +139,11 @@ func (m *MockNodeRegistry) CountAlive() int                                 { re
 func (m *MockNodeRegistry) GetAll() []any                                   { return []any{} }
 func (m *MockNodeRegistry) IsLeaving(nodeID uint64) bool                    { return false }
 func (m *MockNodeRegistry) GetLocalNodeID() uint64                          { return 0 }
+
+// LegacyLogProtocolMembers reports no legacy members: this mock has no real
+// membership, so every member implicitly serves the commit-log pull protocol
+// (coordinator.NodeRegistry).
+func (m *MockNodeRegistry) LegacyLogProtocolMembers() []uint64 { return nil }
 
 // TestDDLStatementDetection validates that DDL statements are correctly identified
 func TestDDLStatementDetection(t *testing.T) {
@@ -311,19 +326,45 @@ func TestDDLIdempotencyRewriter(t *testing.T) {
 	}
 }
 
-// TestSchemaVersionManager validates schema version tracking per database
+// commitDDLForTest commits one DDL statement against database through its
+// TransactionManager directly (the same WriteIntent+CommitTransaction shape
+// db/replication_engine.go's createDDLIntent/Commit use), so its
+// __marmot_schema_version bumps for real. Schema versions are no
+// longer settable directly - they are always derived from a committed DDL's
+// own transaction.
+func commitDDLForTest(t *testing.T, dbMgr *db.DatabaseManager, database, ddlSQL, table string) {
+	t.Helper()
+	mdb, err := dbMgr.GetDatabase(database)
+	require.NoError(t, err)
+	txnMgr := mdb.GetTransactionManager()
+
+	txn, err := txnMgr.BeginTransaction(1)
+	require.NoError(t, err)
+	stmt := protocol.Statement{Type: protocol.StatementDDL, SQL: ddlSQL, TableName: table, Database: database}
+	snapshot, err := db.SerializeData(db.DDLSnapshot{Type: int(stmt.Type), SQL: ddlSQL, TableName: table})
+	require.NoError(t, err)
+	require.NoError(t, txnMgr.WriteIntent(txn, db.IntentTypeDDL, table, "ddl:"+table, stmt, snapshot))
+	require.NoError(t, txnMgr.CommitTransaction(txn))
+}
+
+// TestSchemaVersionManager validates schema version tracking per database:
+// each database's own __marmot_schema_version SQLite table, read
+// through SchemaVersionManager and bumped atomically by each committed DDL
+// transaction - not by a direct setter, which no longer exists.
 func TestSchemaVersionManager(t *testing.T) {
-	// Create temp directory for PebbleDB
 	tmpDir, err := testDataDir("schema-version-test-*")
 	require.NoError(t, err)
 	defer os.RemoveAll(tmpDir)
 
-	// Create PebbleMetaStore
-	metaStore, err := db.NewPebbleMetaStore(tmpDir, db.DefaultPebbleOptions())
+	clock := hlc.NewClock(1)
+	dbMgr, err := db.NewDatabaseManager(tmpDir, 1, clock)
 	require.NoError(t, err)
-	defer metaStore.Close()
+	defer dbMgr.Close()
 
-	svm := db.NewSchemaVersionManager(metaStore)
+	require.NoError(t, dbMgr.CreateDatabase("testdb"))
+	require.NoError(t, dbMgr.CreateDatabase("otherdb"))
+
+	svm := db.NewSchemaVersionManager(dbMgr)
 
 	// Test: Initial version is 0
 	t.Run("Initial version is 0", func(t *testing.T) {
@@ -332,27 +373,23 @@ func TestSchemaVersionManager(t *testing.T) {
 		require.Equal(t, uint64(0), version, "initial version should be 0")
 	})
 
-	// Test: Increment version
-	t.Run("Increment version", func(t *testing.T) {
-		newVersion, err := svm.IncrementSchemaVersion("testdb", "CREATE TABLE users (id INT)", 1001)
-		require.NoError(t, err)
-		require.Equal(t, uint64(1), newVersion, "version should increment to 1")
+	// Test: A committed DDL bumps the version
+	t.Run("Commit bumps version", func(t *testing.T) {
+		commitDDLForTest(t, dbMgr, "testdb", "CREATE TABLE users (id INT)", "users")
 
-		// Verify version persisted
 		version, err := svm.GetSchemaVersion("testdb")
 		require.NoError(t, err)
-		require.Equal(t, uint64(1), version)
+		require.Equal(t, uint64(1), version, "version should bump to 1")
 	})
 
-	// Test: Multiple increments
-	t.Run("Multiple increments", func(t *testing.T) {
-		newVersion, err := svm.IncrementSchemaVersion("testdb", "ALTER TABLE users ADD COLUMN name TEXT", 1002)
-		require.NoError(t, err)
-		require.Equal(t, uint64(2), newVersion)
+	// Test: Multiple DDL commits
+	t.Run("Multiple commits", func(t *testing.T) {
+		commitDDLForTest(t, dbMgr, "testdb", "ALTER TABLE users ADD COLUMN name TEXT", "users")
+		commitDDLForTest(t, dbMgr, "testdb", "CREATE INDEX idx ON users(name)", "users")
 
-		newVersion, err = svm.IncrementSchemaVersion("testdb", "CREATE INDEX idx ON users(name)", 1003)
+		version, err := svm.GetSchemaVersion("testdb")
 		require.NoError(t, err)
-		require.Equal(t, uint64(3), newVersion)
+		require.Equal(t, uint64(3), version)
 	})
 
 	// Test: Independent version counters per database
@@ -367,10 +404,11 @@ func TestSchemaVersionManager(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, uint64(0), version2)
 
-		// Increment otherdb
-		newVersion, err := svm.IncrementSchemaVersion("otherdb", "CREATE TABLE products (id INT)", 2001)
+		// Bump otherdb
+		commitDDLForTest(t, dbMgr, "otherdb", "CREATE TABLE products (id INT)", "products")
+		version2, err = svm.GetSchemaVersion("otherdb")
 		require.NoError(t, err)
-		require.Equal(t, uint64(1), newVersion)
+		require.Equal(t, uint64(1), version2)
 
 		// testdb still at 3
 		version1, err = svm.GetSchemaVersion("testdb")
@@ -472,36 +510,38 @@ func TestDDLLockManager(t *testing.T) {
 // TestDDLReplicationBasic validates end-to-end DDL execution and replication
 func TestDDLReplicationBasic(t *testing.T) {
 	// Setup test infrastructure
-	dbMgr := NewDDLMockDatabaseManager()
-
-	// Create temp directory for PebbleDB
+	// Create temp directory for the real DatabaseManager. Schema versions are
+	// now read from each database's own __marmot_schema_version SQLite table,
+	// so DDL must commit for real through a real DatabaseManager -
+	// the DDLMockDatabaseManager has no such table.
 	tmpDir, err := testDataDir("ddl-replication-test-*")
 	require.NoError(t, err)
 	defer os.RemoveAll(tmpDir)
 
-	// Create PebbleMetaStore
-	metaStore, err := db.NewPebbleMetaStore(tmpDir, db.DefaultPebbleOptions())
+	clock := hlc.NewClock(1)
+	dbMgr, err := db.NewDatabaseManager(tmpDir, 1, clock)
 	require.NoError(t, err)
-	defer metaStore.Close()
+	defer dbMgr.Close()
 
-	svm := db.NewSchemaVersionManager(metaStore)
+	svm := db.NewSchemaVersionManager(dbMgr)
 	lockMgr := coordinator.NewDDLLockManager(5 * time.Second)
 
 	// Create test database
 	err = dbMgr.CreateDatabase("testdb")
 	require.NoError(t, err)
 
-	// Setup coordinators
+	// Setup coordinators. Remote nodes 2 and 3 stay mocked (MockReplicator);
+	// only node 1's own commit needs to be real for these assertions, which
+	// read node 1's own schema version.
 	nodeProvider := &MockNodeProvider{nodes: []uint64{1, 2, 3}}
 	replicator := &MockReplicator{}
-	clock := hlc.NewClock(1)
 	reader := &DDLMockReader{}
 
 	writeCoord := coordinator.NewWriteCoordinator(
 		1,
 		nodeProvider,
 		replicator,
-		replicator,
+		db.NewLocalReplicator(1, dbMgr, clock),
 		1*time.Second,
 		clock,
 	)
@@ -568,20 +608,19 @@ func TestDDLReplicationBasic(t *testing.T) {
 
 // TestDDLWithConcurrentDML validates DDL and DML interleaved execution
 func TestDDLWithConcurrentDML(t *testing.T) {
-	// Setup test infrastructure
-	dbMgr := NewDDLMockDatabaseManager()
-
-	// Create temp directory for PebbleDB
+	// Setup test infrastructure. Schema versions are read from each
+	// database's own __marmot_schema_version SQLite table, so this
+	// needs a real DatabaseManager, not DDLMockDatabaseManager.
 	tmpDir, err := testDataDir("ddl-concurrent-dml-test-*")
 	require.NoError(t, err)
 	defer os.RemoveAll(tmpDir)
 
-	// Create PebbleMetaStore
-	metaStore, err := db.NewPebbleMetaStore(tmpDir, db.DefaultPebbleOptions())
+	clock := hlc.NewClock(1)
+	dbMgr, err := db.NewDatabaseManager(tmpDir, 1, clock)
 	require.NoError(t, err)
-	defer metaStore.Close()
+	defer dbMgr.Close()
 
-	svm := db.NewSchemaVersionManager(metaStore)
+	svm := db.NewSchemaVersionManager(dbMgr)
 	lockMgr := coordinator.NewDDLLockManager(5 * time.Second)
 
 	err = dbMgr.CreateDatabase("testdb")
@@ -589,14 +628,13 @@ func TestDDLWithConcurrentDML(t *testing.T) {
 
 	nodeProvider := &MockNodeProvider{nodes: []uint64{1}}
 	replicator := &MockReplicator{}
-	clock := hlc.NewClock(1)
 	reader := &DDLMockReader{}
 
 	writeCoord := coordinator.NewWriteCoordinator(
 		1,
 		nodeProvider,
 		replicator,
-		replicator,
+		db.NewLocalReplicator(1, dbMgr, clock),
 		1*time.Second,
 		clock,
 	)

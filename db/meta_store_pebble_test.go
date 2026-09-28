@@ -8,8 +8,10 @@ import (
 	"encoding/binary"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/cockroachdb/pebble"
 	"github.com/maxpert/marmot/hlc"
@@ -114,6 +116,52 @@ func TestPebbleMetaStoreTransactionAbort(t *testing.T) {
 	}
 }
 
+// TestPebbleMetaStoreAbortRefusesCommitted: the local log is
+// append-only, so AbortTransaction must refuse a COMMITTED transaction and
+// must not touch its seq-index entry or records.
+func TestPebbleMetaStoreAbortRefusesCommitted(t *testing.T) {
+	store, cleanup := createTestPebbleMetaStore(t)
+	defer cleanup()
+
+	clock := hlc.NewClock(1)
+	startTS := clock.Now()
+	txnID := startTS.ToTxnID()
+
+	if err := store.BeginTransaction(txnID, 1, startTS); err != nil {
+		t.Fatalf("BeginTransaction failed: %v", err)
+	}
+	commitTS := clock.Now()
+	if err := store.CommitTransaction(txnID, commitTS, nil, "testdb", "", 0, 0); err != nil {
+		t.Fatalf("CommitTransaction failed: %v", err)
+	}
+
+	if err := store.AbortTransaction(txnID); err != ErrAbortCommitted {
+		t.Fatalf("AbortTransaction on a committed txn = %v, want ErrAbortCommitted", err)
+	}
+
+	rec, err := store.GetTransaction(txnID)
+	if err != nil {
+		t.Fatalf("GetTransaction failed: %v", err)
+	}
+	if rec == nil || rec.Status != TxnStatusCommitted {
+		t.Fatalf("committed transaction record must survive a refused abort, got %+v", rec)
+	}
+
+	entries, _, _, err := store.ListCommittedLog(LogPosition{}, 10)
+	if err != nil {
+		t.Fatalf("ListCommittedLog failed: %v", err)
+	}
+	found := false
+	for _, e := range entries {
+		if e.TxnID == txnID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("committed txn's seq-index entry must survive a refused abort")
+	}
+}
+
 func TestPebbleMetaStoreWriteIntents(t *testing.T) {
 	store, cleanup := createTestPebbleMetaStore(t)
 	defer cleanup()
@@ -204,40 +252,32 @@ func TestPebbleMetaStoreWriteIntentConflict(t *testing.T) {
 	}
 }
 
-func TestPebbleMetaStoreReplicationState(t *testing.T) {
+// TestPebbleMetaStoreWriteIntentConflictBinaryKeyIsValidUTF8 pins that a
+// conflict on a row whose intent key is not valid UTF-8 (an encoded binary
+// primary key) yields an error message that is: the message is sent as a
+// protobuf string field in the PREPARE response, and an invalid one fails
+// the whole gRPC response's encoding.
+func TestPebbleMetaStoreWriteIntentConflictBinaryKeyIsValidUTF8(t *testing.T) {
 	store, cleanup := createTestPebbleMetaStore(t)
 	defer cleanup()
 
-	peerNodeID := uint64(2)
-	dbName := "testdb"
-	clock := hlc.NewClock(1)
-	ts := clock.Now()
-
-	// Initially no state
-	state, err := store.GetReplicationState(peerNodeID, dbName)
-	if err != nil {
-		t.Fatalf("GetReplicationState failed: %v", err)
+	ts := hlc.NewClock(1).Now()
+	key := string([]byte{0xff, 0xfe, 0x00, 0x81})
+	if err := store.WriteIntent(1, IntentTypeDML, "blobs", key, OpTypeInsert, "", nil, ts, 1); err != nil {
+		t.Fatalf("first WriteIntent: %v", err)
 	}
-	if state != nil {
-		t.Error("Expected no initial state")
+	if err := store.BeginTransaction(1, 1, ts); err != nil {
+		t.Fatalf("BeginTransaction: %v", err)
 	}
-
-	// Update state
-	err = store.UpdateReplicationState(peerNodeID, dbName, 100, ts)
-	if err != nil {
-		t.Fatalf("UpdateReplicationState failed: %v", err)
+	err := store.WriteIntent(2, IntentTypeDML, "blobs", key, OpTypeUpdate, "", nil, ts, 1)
+	if !isWriteWriteConflict(err) {
+		t.Fatalf("expected a write-write conflict, got %v", err)
 	}
-
-	// Verify state
-	state, err = store.GetReplicationState(peerNodeID, dbName)
-	if err != nil {
-		t.Fatalf("GetReplicationState failed: %v", err)
+	if !utf8.ValidString(err.Error()) {
+		t.Fatalf("conflict message is not valid UTF-8: %q", err.Error())
 	}
-	if state == nil {
-		t.Fatal("State not found")
-	}
-	if state.LastAppliedTxnID != 100 {
-		t.Errorf("Expected txn_id 100, got %d", state.LastAppliedTxnID)
+	if !strings.Contains(err.Error(), "fffe0081") {
+		t.Fatalf("conflict message must carry the key hex-encoded: %q", err.Error())
 	}
 }
 
@@ -408,23 +448,23 @@ func TestPebbleMetaStoreSequenceNumbers(t *testing.T) {
 	store, cleanup := createTestPebbleMetaStore(t)
 	defer cleanup()
 
-	nodeID := uint64(1)
-
-	// Get sequence numbers - should be monotonically increasing
-	seq1, err := store.GetNextSeqNum(nodeID)
+	// The store-wide log sequence (formerly per-node GetNextSeqNum) should
+	// be monotonically increasing regardless of origin.
+	seq1, err := store.nextLogSeq()
 	if err != nil {
-		t.Fatalf("GetNextSeqNum failed: %v", err)
+		t.Fatal(err)
 	}
-
-	seq2, err := store.GetNextSeqNum(nodeID)
+	defer store.logSeq.markDone(seq1)
+	seq2, err := store.nextLogSeq()
 	if err != nil {
-		t.Fatalf("GetNextSeqNum failed: %v", err)
+		t.Fatal(err)
 	}
-
-	seq3, err := store.GetNextSeqNum(nodeID)
+	defer store.logSeq.markDone(seq2)
+	seq3, err := store.nextLogSeq()
 	if err != nil {
-		t.Fatalf("GetNextSeqNum failed: %v", err)
+		t.Fatal(err)
 	}
+	defer store.logSeq.markDone(seq3)
 
 	if seq2 != seq1+1 {
 		t.Errorf("Expected seq2 (%d) = seq1 (%d) + 1", seq2, seq1)
@@ -464,33 +504,20 @@ func TestPebbleMetaStoreCommitCounters(t *testing.T) {
 	}
 }
 
+// TestPebbleMetaStoreSchemaVersion covers what remains of GetSchemaVersion:
+// the schema-version migration read. UpdateSchemaVersion is removed - versions now live
+// in each user database's own __marmot_schema_version SQLite table - so there
+// is nothing left to write here; an unset key just reads back 0.
 func TestPebbleMetaStoreSchemaVersion(t *testing.T) {
 	store, cleanup := createTestPebbleMetaStore(t)
 	defer cleanup()
 
-	dbName := "testdb"
-
-	// Initial version
-	version, err := store.GetSchemaVersion(dbName)
+	version, err := store.GetSchemaVersion("testdb")
 	if err != nil {
 		t.Fatalf("GetSchemaVersion failed: %v", err)
 	}
 	if version != 0 {
 		t.Errorf("Expected initial version 0, got %d", version)
-	}
-
-	// Update version
-	err = store.UpdateSchemaVersion(dbName, 1, "CREATE TABLE users (id INT)", 100)
-	if err != nil {
-		t.Fatalf("UpdateSchemaVersion failed: %v", err)
-	}
-
-	version, err = store.GetSchemaVersion(dbName)
-	if err != nil {
-		t.Fatalf("GetSchemaVersion failed: %v", err)
-	}
-	if version != 1 {
-		t.Errorf("Expected version 1, got %d", version)
 	}
 }
 
@@ -582,7 +609,7 @@ func TestPebbleMetaStoreStoreReplayedTransaction(t *testing.T) {
 	nodeID := uint64(2)
 
 	// Store a replayed transaction (no prior BeginTransaction)
-	err := store.StoreReplayedTransaction(txnID, nodeID, commitTS, "testdb", 1)
+	err := store.StoreReplayedTransaction(txnID, nodeID, commitTS, "testdb", 1, 5)
 	if err != nil {
 		t.Fatalf("StoreReplayedTransaction failed: %v", err)
 	}
@@ -599,7 +626,10 @@ func TestPebbleMetaStoreStoreReplayedTransaction(t *testing.T) {
 		t.Errorf("Expected COMMITTED, got %s", rec.Status.String())
 	}
 	if rec.NodeID != nodeID {
-		t.Errorf("Expected nodeID %d, got %d", nodeID, rec.NodeID)
+		t.Errorf("Expected origin nodeID %d, got %d", nodeID, rec.NodeID)
+	}
+	if rec.RequiredSchemaVersion != 5 {
+		t.Errorf("Expected RequiredSchemaVersion 5, got %d", rec.RequiredSchemaVersion)
 	}
 }
 

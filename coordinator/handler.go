@@ -61,6 +61,15 @@ type DatabaseManager interface {
 	GetTranspilerSchema(database, table string) (*transform.SchemaInfo, error)
 	// GetVectorIndexManager returns the vector index manager (may be nil).
 	GetVectorIndexManager() VectorIndexManagerProvider
+	// RegistryKeyGeneration reports database name's current registry
+	// generation and whether it is presently live (as opposed to tombstoned
+	// by a DROP, or never created). handleMutation uses it to stamp a
+	// CREATE/DROP DATABASE statement's Statement.DatabaseGeneration, which
+	// fences a stale coordinator at PREPARE (see
+	// db.DatabaseManager.ApplyDatabaseOp). It
+	// is db.DatabaseManager.RegistryKey with the same information carried as
+	// two primitives, to avoid an import cycle with package db.
+	RegistryKeyGeneration(name string) (generation uint64, live bool, err error)
 }
 
 // ReplicatedDatabaseProvider provides access to replicated database operations
@@ -101,7 +110,6 @@ type PendingExecution interface {
 // SchemaVersionManager interface to avoid import cycles
 type SchemaVersionManager interface {
 	GetSchemaVersion(database string) (uint64, error)
-	IncrementSchemaVersion(database string, ddlSQL string, txnID uint64) (uint64, error)
 	GetAllSchemaVersions() (map[string]uint64, error)
 }
 
@@ -112,6 +120,11 @@ type NodeRegistry interface {
 	GetAll() []any // Returns slice of node states (avoids import cycle)
 	IsLeaving(nodeID uint64) bool
 	GetLocalNodeID() uint64
+	// LegacyLogProtocolMembers returns the ids of current members (self
+	// included) running an older release that does not serve the commit-log
+	// pull protocol, sorted ascending; empty means every member serves it.
+	// See grpc.NodeRegistry's method of the same name.
+	LegacyLogProtocolMembers() []uint64
 }
 
 // NodeState represents cluster node state
@@ -637,6 +650,16 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, params []in
 		stmt.Type == protocol.StatementCreateDatabase ||
 		stmt.Type == protocol.StatementDropDatabase
 
+	// Rolling-upgrade gate: while any member does not serve the commit-log
+	// pull protocol yet, DDL and CREATE/DROP DATABASE are refused cluster-wide,
+	// retryable, until every member is upgraded (LegacyMembersDDLRefusal).
+	if isDDL && h.nodeRegistry != nil {
+		if legacy := h.nodeRegistry.LegacyLogProtocolMembers(); len(legacy) > 0 {
+			telemetry.QueriesTotal.With("ddl", "failed").Inc()
+			return nil, NewLegacyMembersDDLRefusal(legacy)
+		}
+	}
+
 	// Rewrite DDL for idempotency (safe to replay)
 	if isDDL {
 		originalSQL := stmt.SQL
@@ -665,6 +688,28 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, params []in
 				log.Error().Err(releaseErr).Str("database", stmt.Database).Msg("Failed to release DDL lock")
 			}
 		}()
+	}
+
+	// CREATE/DROP DATABASE statements carry a fencing generation, stamped from
+	// this coordinator's own registry view under the cluster-wide DDL lock
+	// above (so the read is not racing another coordinator's create/drop of
+	// the same name). A participant's PREPARE gate refuses a stamp below its
+	// own local key - see db.DatabaseManager.ApplyDatabaseOp. A failed read leaves DatabaseGeneration at
+	// its zero value, which participants treat as "unstamped" and compute
+	// locally instead of gating on: a safe, graceful degradation.
+	if stmt.Type == protocol.StatementCreateDatabase || stmt.Type == protocol.StatementDropDatabase {
+		if h.dbManager != nil {
+			generation, live, genErr := h.dbManager.RegistryKeyGeneration(stmt.Database)
+			if genErr != nil {
+				log.Warn().Err(genErr).Str("database", stmt.Database).Msg("Failed to read database registry; leaving the operation unstamped")
+			} else if stmt.Type == protocol.StatementDropDatabase {
+				stmt.DatabaseGeneration = generation
+			} else if live {
+				stmt.DatabaseGeneration = generation // already live: CREATE is a no-op at the current generation
+			} else {
+				stmt.DatabaseGeneration = generation + 1
+			}
+		}
 	}
 
 	// Get current schema version for this database
@@ -801,27 +846,16 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, params []in
 		}
 	}
 
-	// If DDL succeeded, increment schema version
-	if isDDL && h.schemaVersionMgr != nil {
-		newVersion, err := h.schemaVersionMgr.IncrementSchemaVersion(stmt.Database, stmt.SQL, uint64(txnID))
+	// The DDL's schema version bump is already durable, atomic with the DDL
+	// itself, in the database's own SQLite file: TransactionManager
+	// bumped and cached it as part of committing txn above. Refresh gossip with
+	// the current versions so peers learn it without waiting for their own poll.
+	if isDDL && h.schemaVersionMgr != nil && h.nodeRegistry != nil {
+		allVersions, err := h.schemaVersionMgr.GetAllSchemaVersions()
 		if err != nil {
-			log.Error().Err(err).Str("database", stmt.Database).Msg("Failed to increment schema version")
+			log.Error().Err(err).Msg("Failed to get schema versions for gossip")
 		} else {
-			log.Info().
-				Str("database", stmt.Database).
-				Uint64("new_version", newVersion).
-				Uint64("txn_id", uint64(txnID)).
-				Msg("Schema version incremented after DDL")
-
-			// Update gossip with new schema versions
-			if h.nodeRegistry != nil {
-				allVersions, err := h.schemaVersionMgr.GetAllSchemaVersions()
-				if err != nil {
-					log.Error().Err(err).Msg("Failed to get schema versions for gossip")
-				} else {
-					h.nodeRegistry.UpdateSchemaVersions(allVersions)
-				}
-			}
+			h.nodeRegistry.UpdateSchemaVersions(allVersions)
 		}
 	}
 

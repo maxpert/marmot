@@ -1,8 +1,10 @@
 package coordinator
 
 import (
+	"errors"
 	"fmt"
 
+	"github.com/maxpert/marmot/protocol/mysqlcode"
 	"github.com/maxpert/marmot/protocol/query/transform"
 )
 
@@ -137,4 +139,45 @@ func (e *PartialCommitError) Error() string {
 	}
 	return fmt.Sprintf("partial commit: got %d remote commit acks, needed %d (some nodes may have committed)",
 		e.RemoteAcks, e.RemoteQuorumNeeded)
+}
+
+// ErrLegacyMembersPresent is what LegacyMembersDDLRefusal matches with
+// errors.Is: DDL or CREATE/DROP DATABASE refused because a cluster member does
+// not serve the commit-log pull protocol yet.
+var ErrLegacyMembersPresent = errors.New("DDL refused while a cluster member does not serve the commit-log pull protocol")
+
+// LegacyMembersDDLRefusal refuses DDL and CREATE/DROP DATABASE cluster-wide
+// while LegacyIDs names members whose log protocol version is below the one
+// this binary serves (grpc.LegacyLogProtocolMembers). Such a member counts a
+// database's DDL history differently, so a schema version bumped by DDL run
+// now would never match between the two kinds of node, and every write
+// coordinated across them would then be refused at the schema-version gates.
+// The refusal is the same on the coordinator (coordinator.handleMutation) and
+// on a participant's PREPARE (grpc.ReplicationHandler), so an old coordinator's
+// DDL cannot reach a quorum either.
+//
+// It carries 1213 ER_LOCK_DEADLOCK / SQLSTATE 40001 (through its unwrapped
+// *transform.CodedError), the code this codebase pairs with "nothing was
+// written, safe to retry the whole transaction" (see mapSQLiteError's
+// ErrConstraintCommitHook case in protocol/error_mapper.go): MySQL clients and
+// ORMs already treat 1213 as retryable, while 1105 carries no such
+// convention.
+type LegacyMembersDDLRefusal struct {
+	LegacyIDs []uint64
+}
+
+// NewLegacyMembersDDLRefusal returns the refusal naming legacyIDs.
+func NewLegacyMembersDDLRefusal(legacyIDs []uint64) *LegacyMembersDDLRefusal {
+	return &LegacyMembersDDLRefusal{LegacyIDs: legacyIDs}
+}
+
+func (e *LegacyMembersDDLRefusal) Error() string {
+	return fmt.Sprintf("DDL and CREATE/DROP DATABASE are refused cluster-wide: node(s) %v do not serve the "+
+		"commit-log pull protocol yet (an older Marmot release); upgrade every node, then retry", e.LegacyIDs)
+}
+
+// Unwrap exposes ErrLegacyMembersPresent for errors.Is and the coded MySQL
+// error for protocol.ConvertToMySQLError.
+func (e *LegacyMembersDDLRefusal) Unwrap() []error {
+	return []error{ErrLegacyMembersPresent, transform.NewCodedError(mysqlcode.ErrCodeDeadlock, "%s", e.Error())}
 }

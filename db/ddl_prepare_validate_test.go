@@ -432,3 +432,12 @@ func TestValidateDDLStatements_OverWidthTableKeepsAcceptingDDL(t *testing.T) {
 		`ALTER TABLE legacy ADD COLUMN note TEXT`,
 	}), "a DDL that does not re-declare the column's width was refused over ids the width never held")
 }
+
+// TestIsTransientSQLiteError pins that a wrapped busy or locked SQLite error
+// is transient and a verdict such as a constraint violation is not.
+func TestIsTransientSQLiteError(t *testing.T) {
+	require.True(t, IsTransientSQLiteError(fmt.Errorf("commit: %w", sqlite3.Error{Code: sqlite3.ErrBusy})))
+	require.True(t, IsTransientSQLiteError(fmt.Errorf("commit: %w", sqlite3.Error{Code: sqlite3.ErrLocked})))
+	require.False(t, IsTransientSQLiteError(fmt.Errorf("commit: %w", sqlite3.Error{Code: sqlite3.ErrConstraint})))
+	require.False(t, IsTransientSQLiteError(errors.New("not a SQLite error")))
+}

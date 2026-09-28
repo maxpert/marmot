@@ -28,7 +28,7 @@ func newClaimTestHandler(t *testing.T, ddl string) (*ReplicationHandler, *db.Dat
 	_, err = mdb.GetWriteDB().Exec(ddl)
 	require.NoError(t, err)
 	require.NoError(t, mdb.ReloadSchema())
-	return NewReplicationHandler(1, dm, clock, db.NewSchemaVersionManager(dm.GetSystemDatabase().GetMetaStore())), dm
+	return NewReplicationHandler(1, dm, clock, db.NewSchemaVersionManager(dm)), dm
 }
 
 // prepareOverWire sends statements through the wire conversion and the

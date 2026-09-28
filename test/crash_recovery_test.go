@@ -14,16 +14,54 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
+
+	"github.com/maxpert/marmot/test/stallwatch"
 )
 
 const (
 	baseGRPCPort  = 8080
 	baseMySQLPort = 3306
 	numNodes      = 3
+
+	// clusterStallTimeout bounds how long a cluster may go with no progress:
+	// no file written under any node's directory (logs, SQLite, meta store),
+	// no client call returned (noteClientCall) and no progress reported by
+	// the test (ClusterHarness.Progress).
+	clusterStallTimeout = 20 * time.Second
+	// clusterStallPoll is how often the stall watchdog looks.
+	clusterStallPoll = 250 * time.Millisecond
+	// clusterReadyDeadline bounds StartCluster's wait for each node to be
+	// ready for writes (WaitForReady).
+	clusterReadyDeadline = 20 * time.Second
+	// clusterConvergencePoll is how often WaitForClusterConvergence asks a
+	// node for its membership.
+	clusterConvergencePoll = 250 * time.Millisecond
+	// stallLogTailLines is how much of each node's log a stall report shows.
+	stallLogTailLines = 30
+	// stallStackWait bounds the wait for a node to write its goroutine dump.
+	stallStackWait = 3 * time.Second
+
+	// clusterTestBudget is the hard wall-clock budget for any test built on
+	// ClusterHarness (user rule: every cluster test finishes in <60s). It is
+	// enforced independently of the stall watchdog: a test can keep making
+	// progress (writes, restarts) and still blow well past a sane budget.
+	clusterTestBudget = 60 * time.Second
+
+	// defaultGCIntervalSeconds is the harness's [replication] gc_interval_seconds.
+	defaultGCIntervalSeconds = 30
+	// defaultHeartbeatTimeoutSeconds is the harness's [transaction]
+	// heartbeat_timeout_seconds.
+	defaultHeartbeatTimeoutSeconds = 10
+	// unsetOverride marks a ClusterHarness int override field as "use the
+	// harness default" (0 is a real value for some of these fields, so it
+	// cannot double as the sentinel).
+	unsetOverride = -1
 )
 
 var (
@@ -101,10 +139,49 @@ type ClusterHarness struct {
 	MarmotBin   string
 	t           *testing.T
 	cleanupOnce sync.Once
+	watchdog    *stallwatch.Watchdog
+
+	// NodeBin overrides MarmotBin for one node id, so a test can run a mix of
+	// binaries (e.g. a rolling-upgrade test). Set it before StartNode.
+	NodeBin map[int]string
+
+	// GCIntervalSeconds overrides [replication] gc_interval_seconds on every
+	// node's config. unsetOverride (the default) keeps defaultGCIntervalSeconds.
+	GCIntervalSeconds int
+	// GCMinRetentionHours overrides [replication] gc_min_retention_hours.
+	// unsetOverride keeps the config's own default (2h).
+	GCMinRetentionHours int
+	// DeltaSyncThresholdSeconds overrides [replication] delta_sync_threshold_seconds.
+	// unsetOverride keeps the config's own default (3600s). A live-GC test
+	// needs this lowered together with GCMinRetentionHours: cfg.Validate
+	// requires gc_min_retention_hours >= delta_sync_threshold_seconds in hours.
+	DeltaSyncThresholdSeconds int
+	// HeartbeatTimeoutSeconds overrides [transaction] heartbeat_timeout_seconds,
+	// after which the stale-transaction GC aborts a PENDING transaction.
+	// unsetOverride keeps defaultHeartbeatTimeoutSeconds.
+	HeartbeatTimeoutSeconds int
+
+	// budgetStart is when the harness (and so the test using it) began.
+	budgetStart time.Time
+	budgetDone  chan struct{}
+	budgetOnce  sync.Once
+
+	phaseMu   sync.Mutex
+	lastPhase time.Time
+	phases    []phaseRecord
 }
 
-// NewClusterHarness creates a new cluster harness for testing
-func NewClusterHarness(t *testing.T) *ClusterHarness {
+// phaseRecord is one named phase of a cluster test and how long it took
+// since the previous phase (or since the harness was created).
+type phaseRecord struct {
+	name    string
+	elapsed time.Duration
+}
+
+// NewClusterHarness creates a new cluster harness for testing. Options run
+// before any node config is written, so they can set GCIntervalSeconds and
+// friends.
+func NewClusterHarness(t *testing.T, opts ...func(*ClusterHarness)) *ClusterHarness {
 	cleanupStalePorts()
 
 	baseDir := filepath.Join(testDataRoot, fmt.Sprintf("marmot_crash_test_%d", time.Now().UnixNano()))
@@ -113,19 +190,155 @@ func NewClusterHarness(t *testing.T) *ClusterHarness {
 		t.Fatalf("Failed to build Marmot: %v", err)
 	}
 
+	now := time.Now()
 	harness := &ClusterHarness{
-		Nodes:     make([]*ClusterNode, numNodes),
-		BaseDir:   baseDir,
-		MarmotBin: marmotBin,
-		t:         t,
+		Nodes:                     make([]*ClusterNode, numNodes),
+		BaseDir:                   baseDir,
+		MarmotBin:                 marmotBin,
+		t:                         t,
+		GCIntervalSeconds:         unsetOverride,
+		HeartbeatTimeoutSeconds:   unsetOverride,
+		GCMinRetentionHours:       unsetOverride,
+		DeltaSyncThresholdSeconds: unsetOverride,
+		budgetStart:               now,
+		budgetDone:                make(chan struct{}),
+		lastPhase:                 now,
+	}
+	for _, opt := range opts {
+		opt(harness)
 	}
 
 	for i := 0; i < numNodes; i++ {
 		node := harness.createNode(i + 1)
 		harness.Nodes[i] = node
 	}
+	harness.watchdog = stallwatch.Start(clusterStallTimeout, clusterStallPoll, harness.activity, harness.reportStall)
+	go harness.watchBudget()
 
 	return harness
+}
+
+// Progress tells the stall watchdog the test saw the cluster make progress,
+// such as an ACKed write.
+func (h *ClusterHarness) Progress() {
+	h.watchdog.Progress()
+}
+
+// Phase logs how long this phase of the test took (since the previous phase,
+// or since the harness was created) and records it for the budget report.
+// Call it at each phase of a cluster test: start, load, kill/restart,
+// converge, verify, ...
+func (h *ClusterHarness) Phase(name string) {
+	h.phaseMu.Lock()
+	now := time.Now()
+	elapsed := now.Sub(h.lastPhase)
+	h.lastPhase = now
+	h.phases = append(h.phases, phaseRecord{name: name, elapsed: elapsed})
+	h.phaseMu.Unlock()
+	h.t.Logf("phase=%s elapsed=%s", name, elapsed.Round(time.Millisecond))
+}
+
+// watchBudget fails the test once the harness has lived past clusterTestBudget,
+// independently of the stall watchdog: a test can keep making progress and
+// still blow well past the budget the user rule sets.
+func (h *ClusterHarness) watchBudget() {
+	timer := time.NewTimer(clusterTestBudget)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		h.reportBudgetExceeded()
+	case <-h.budgetDone:
+	}
+}
+
+// reportBudgetExceeded fails the test with every recorded phase's elapsed
+// time and every node's log tail, then stops the nodes so the test's own
+// calls fail at once. A goroutine cannot call t.Fatalf, so this mirrors
+// reportStall's pattern (t.Errorf + StopCluster).
+func (h *ClusterHarness) reportBudgetExceeded() {
+	h.t.Errorf("cluster test exceeded its %s budget", clusterTestBudget)
+	h.phaseMu.Lock()
+	for _, p := range h.phases {
+		h.t.Logf("phase=%s elapsed=%s", p.name, p.elapsed.Round(time.Millisecond))
+	}
+	h.phaseMu.Unlock()
+	for i := range h.Nodes {
+		nodeID := i + 1
+		h.t.Logf("=== node %d: last %d log lines ===\n%s", nodeID, stallLogTailLines, h.getNodeLogTail(nodeID, stallLogTailLines))
+	}
+	h.StopCluster()
+}
+
+// clientCalls counts client calls the tests' shared helpers completed
+// (noteClientCall); the stall watchdog counts each as progress.
+var clientCalls atomic.Int64
+
+// noteClientCall records that one client call to a node returned, with or
+// without an error: a cluster answering its clients is not stalled.
+func noteClientCall() {
+	clientCalls.Add(1)
+}
+
+// activity digests everything the stall watchdog counts as progress: every
+// file write under the harness's directory (size and modification time, so
+// a write into a preallocated file counts too) and every returned client
+// call.
+func (h *ClusterHarness) activity() int64 {
+	total := clientCalls.Load()
+	_ = filepath.WalkDir(h.BaseDir, func(_ string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		if info, err := d.Info(); err == nil {
+			total += info.Size() + info.ModTime().UnixNano()
+		}
+		return nil
+	})
+	return total
+}
+
+// reportStall fails the test for a cluster that made no progress for
+// clusterStallTimeout: it shows each node's log tail, has every running node
+// dump its goroutines (SIGQUIT, into its log) and shows them, and stops the
+// nodes so the test's own calls fail at once.
+func (h *ClusterHarness) reportStall(idle time.Duration) {
+	h.t.Errorf("cluster stalled: no node wrote anything, no client call returned and the test reported no progress for %s", idle.Round(time.Second))
+	for i, node := range h.Nodes {
+		nodeID := i + 1
+		h.t.Logf("=== node %d: last %d log lines ===\n%s", nodeID, stallLogTailLines, h.getNodeLogTail(nodeID, stallLogTailLines))
+		node.mu.Lock()
+		running, cmd := node.isRunning, node.Cmd
+		node.mu.Unlock()
+		if !running || cmd == nil || cmd.Process == nil {
+			continue
+		}
+		before, err := os.Stat(node.LogFile)
+		if err != nil {
+			continue
+		}
+		if err := cmd.Process.Signal(syscall.SIGQUIT); err != nil {
+			h.t.Logf("node %d: SIGQUIT: %v", nodeID, err)
+			continue
+		}
+		deadline := time.Now().Add(stallStackWait)
+		for time.Now().Before(deadline) {
+			if after, err := os.Stat(node.LogFile); err == nil && after.Size() > before.Size() {
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		time.Sleep(100 * time.Millisecond)
+		data, err := os.ReadFile(node.LogFile)
+		if err != nil || int64(len(data)) <= before.Size() {
+			h.t.Logf("node %d wrote no goroutine dump", nodeID)
+			continue
+		}
+		stackPath := filepath.Join(node.DataDir, "stall-stacks.txt")
+		if err := os.WriteFile(stackPath, data[before.Size():], 0o644); err == nil {
+			h.t.Logf("node %d goroutine dump: %s", nodeID, stackPath)
+		}
+	}
+	h.StopCluster()
 }
 
 // testDataRoot holds the integration tests' node data and binaries: Marmot's
@@ -200,14 +413,28 @@ func (h *ClusterHarness) createNodeConfig(node *ClusterNode) {
 		seedNodes = append(seedNodes, fmt.Sprintf("\"localhost:%d\"", baseGRPCPort+1))
 	}
 
+	gcInterval := defaultGCIntervalSeconds
+	if h.GCIntervalSeconds != unsetOverride {
+		gcInterval = h.GCIntervalSeconds
+	}
+	heartbeatTimeout := defaultHeartbeatTimeoutSeconds
+	if h.HeartbeatTimeoutSeconds != unsetOverride {
+		heartbeatTimeout = h.HeartbeatTimeoutSeconds
+	}
+	gcMinRetentionLine, deltaSyncThresholdLine := "", ""
+	if h.GCMinRetentionHours != unsetOverride {
+		gcMinRetentionLine = fmt.Sprintf("gc_min_retention_hours = %d\n", h.GCMinRetentionHours)
+	}
+	if h.DeltaSyncThresholdSeconds != unsetOverride {
+		deltaSyncThresholdLine = fmt.Sprintf("delta_sync_threshold_seconds = %d\n", h.DeltaSyncThresholdSeconds)
+	}
+
 	config := fmt.Sprintf(`# Marmot v2.9.16-beta Test Node %d
 node_id = %d
 data_dir = "%s"
 
-[mvcc]
-gc_interval_seconds = 30
-gc_retention_hours = 1
-heartbeat_timeout_seconds = 10
+[transaction]
+heartbeat_timeout_seconds = %d
 conflict_window_seconds = 10
 
 [connection_pool]
@@ -248,7 +475,8 @@ write_timeout_ms = 10000
 read_timeout_ms = 5000
 enable_anti_entropy = true
 anti_entropy_interval_seconds = 5
-
+gc_interval_seconds = %d
+%s%s
 [mysql]
 enabled = true
 bind_address = "0.0.0.0"
@@ -265,9 +493,13 @@ enabled = false
 		node.NodeID,
 		node.NodeID,
 		node.DataDir,
+		heartbeatTimeout,
 		node.GRPCPort,
 		node.GRPCPort,
 		strings.Join(seedNodes, ", "),
+		gcInterval,
+		gcMinRetentionLine,
+		deltaSyncThresholdLine,
 		node.MySQLPort,
 	)
 
@@ -289,12 +521,19 @@ func (h *ClusterHarness) StartNode(nodeID int) error {
 
 	h.t.Logf("Starting node %d...", nodeID)
 
-	logFile, err := os.Create(node.LogFile)
+	// Append across restarts: a rolling-restart or kill/restart test needs
+	// every incarnation's log, not just the last one's.
+	logFile, err := os.OpenFile(node.LogFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
 		return fmt.Errorf("failed to create log file: %v", err)
 	}
+	fmt.Fprintf(logFile, "=== node %d start %s ===\n", nodeID, time.Now().Format(time.RFC3339Nano))
 
-	cmd := exec.Command(h.MarmotBin, "--config", node.ConfigPath)
+	bin := h.MarmotBin
+	if b, ok := h.NodeBin[nodeID]; ok {
+		bin = b
+	}
+	cmd := exec.Command(bin, "--config", node.ConfigPath)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 
@@ -338,9 +577,6 @@ func (h *ClusterHarness) StopNode(nodeID int) error {
 	node.Cmd = nil
 
 	os.Remove(node.PIDFile)
-
-	// Small wait to ensure clean shutdown
-	time.Sleep(1 * time.Second)
 
 	h.t.Logf("Node %d stopped", nodeID)
 	return nil
@@ -451,6 +687,7 @@ func (h *ClusterHarness) QueryNode(nodeID int, query string, args ...interface{}
 	if err != nil {
 		return nil, err
 	}
+	defer noteClientCall()
 	return db.Query(query, args...)
 }
 
@@ -459,6 +696,7 @@ func (h *ClusterHarness) ExecNode(nodeID int, query string, args ...interface{})
 	if err != nil {
 		return nil, err
 	}
+	defer noteClientCall()
 	return db.Exec(query, args...)
 }
 
@@ -554,6 +792,88 @@ type AdminAPIResponse struct {
 	Data []ClusterMember `json:"data"`
 }
 
+// votesHeld asks node's admin API whether its AUTO_INCREMENT claim votes are
+// held (GET /admin/cluster/autoinc/votes).
+func (h *ClusterHarness) votesHeld(nodeID int) (bool, error) {
+	url := fmt.Sprintf("http://localhost:%d/admin/cluster/autoinc/votes", h.Nodes[nodeID-1].GRPCPort)
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return false, err
+	}
+	req.Header.Set("X-Marmot-Secret", "test-secret")
+	resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+	noteClientCall()
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return false, fmt.Errorf("status %d: %s", resp.StatusCode, string(body))
+	}
+	var apiResp struct {
+		Data struct {
+			VotesHeld bool `json:"votes_held"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
+		return false, err
+	}
+	return apiResp.Data.VotesHeld, nil
+}
+
+// WaitForVotesReleased polls until node's AUTO_INCREMENT claim votes are not
+// held: a node whose system database is new declines every claim at PREPARE
+// until it merged claim bases from enough members, so a narrow
+// AUTO_INCREMENT insert right after a cluster's first start can return 1205
+// until then.
+func (h *ClusterHarness) WaitForVotesReleased(nodeID int, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		h.Progress()
+		held, err := h.votesHeld(nodeID)
+		if err == nil && !held {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("node %d claim votes still held after %v (err=%v); log tail:\n%s", nodeID, timeout, err, h.getNodeLogTail(nodeID, 40))
+		}
+		time.Sleep(clusterConvergencePoll)
+	}
+}
+
+// WaitForReady polls until node is ready for any write: it reports itself
+// ALIVE (a JOINING node is still catching up) and its claim votes are not
+// held (WaitForVotesReleased), both within one named deadline.
+func (h *ClusterHarness) WaitForReady(nodeID int, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		h.Progress()
+		if status, err := h.selfStatus(nodeID); err == nil && status == "ALIVE" {
+			break
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("node %d not ALIVE within %v; log tail:\n%s", nodeID, timeout, h.getNodeLogTail(nodeID, 40))
+		}
+		time.Sleep(clusterConvergencePoll)
+	}
+	return h.WaitForVotesReleased(nodeID, time.Until(deadline))
+}
+
+// selfStatus is node's own membership status as its admin API reports it.
+func (h *ClusterHarness) selfStatus(nodeID int) (string, error) {
+	members, err := h.getClusterStatus(nodeID)
+	if err != nil {
+		return "", err
+	}
+	for _, m := range members {
+		if m.NodeID == uint64(nodeID) {
+			return m.Status, nil
+		}
+	}
+	return "", fmt.Errorf("node %d absent from its own membership", nodeID)
+}
+
 // getClusterStatus fetches cluster status from a node's admin API
 func (h *ClusterHarness) getClusterStatus(nodeID int) ([]ClusterMember, error) {
 	node := h.Nodes[nodeID-1]
@@ -567,6 +887,7 @@ func (h *ClusterHarness) getClusterStatus(nodeID int) ([]ClusterMember, error) {
 
 	client := &http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Do(req)
+	noteClientCall()
 	if err != nil {
 		return nil, err
 	}
@@ -585,43 +906,42 @@ func (h *ClusterHarness) getClusterStatus(nodeID int) ([]ClusterMember, error) {
 	return apiResp.Data, nil
 }
 
-// WaitForClusterConvergence waits for all nodes to be ALIVE according to cluster membership
+// WaitForClusterConvergence waits until every node sees every node ALIVE
+// in its cluster membership, polling each node's admin API until timeout.
 func (h *ClusterHarness) WaitForClusterConvergence(timeout time.Duration) error {
-	h.t.Logf("Waiting for cluster to converge (all nodes ALIVE)...")
+	h.t.Logf("Waiting for cluster to converge (all nodes ALIVE on every node)...")
 
 	deadline := time.Now().Add(timeout)
-	errorLogged := false
-	for time.Now().Before(deadline) {
-		// Check from node 1's perspective
-		members, err := h.getClusterStatus(1)
-		if err != nil {
-			if !errorLogged {
-				h.t.Logf("Error getting cluster status (will retry): %v", err)
-				errorLogged = true
+	for node := 1; node <= numNodes; node++ {
+		for {
+			alive, err := h.aliveCount(node)
+			if err == nil && alive >= numNodes {
+				break
 			}
-			time.Sleep(500 * time.Millisecond)
-			continue
-		}
-		errorLogged = false
-
-		// Count ALIVE nodes
-		aliveCount := 0
-		for _, m := range members {
-			if m.Status == "ALIVE" {
-				aliveCount++
+			if time.Now().After(deadline) {
+				return fmt.Errorf("cluster did not converge on node %d within %v (alive=%d, err=%v)", node, timeout, alive, err)
 			}
+			time.Sleep(clusterConvergencePoll)
 		}
-
-		if aliveCount >= numNodes {
-			h.t.Logf("Cluster converged: %d nodes ALIVE", aliveCount)
-			return nil
-		}
-
-		h.t.Logf("Cluster not yet converged: %d/%d nodes ALIVE", aliveCount, numNodes)
-		time.Sleep(1 * time.Second)
 	}
+	h.t.Logf("Cluster converged: every node sees %d nodes ALIVE", numNodes)
+	return nil
+}
 
-	return fmt.Errorf("cluster did not converge within %v", timeout)
+// aliveCount returns how many members node's cluster membership reports
+// ALIVE.
+func (h *ClusterHarness) aliveCount(node int) (int, error) {
+	members, err := h.getClusterStatus(node)
+	if err != nil {
+		return 0, err
+	}
+	alive := 0
+	for _, m := range members {
+		if m.Status == "ALIVE" {
+			alive++
+		}
+	}
+	return alive, nil
 }
 
 // dumpNodeLogs saves node logs to /tmp for debugging
@@ -663,22 +983,31 @@ func (h *ClusterHarness) StartCluster() error {
 	}
 
 	h.t.Logf("Waiting for MySQL servers to be ready...")
-	time.Sleep(3 * time.Second)
-
 	for i := 1; i <= numNodes; i++ {
 		if err := h.WaitForAlive(i, 30*time.Second); err != nil {
 			return err
 		}
 	}
 
-	// Wait for gossip cluster to fully converge (all nodes ALIVE)
+	// Wait for gossip cluster to fully converge (all nodes ALIVE, as seen
+	// by every node).
 	if err := h.WaitForClusterConvergence(30 * time.Second); err != nil {
 		h.dumpNodeLogs("cluster_start_fail")
 		return err
 	}
 
-	// Additional wait for gRPC connections to stabilize
-	time.Sleep(2 * time.Second)
+	// Every node on the harness's own binary must be ready for writes. A
+	// node on an overridden binary (NodeBin) may predate the readiness
+	// endpoint; a test mixing binaries waits for readiness itself.
+	for i := 1; i <= numNodes; i++ {
+		if _, overridden := h.NodeBin[i]; overridden {
+			continue
+		}
+		if err := h.WaitForReady(i, clusterReadyDeadline); err != nil {
+			h.dumpNodeLogs("cluster_start_not_ready")
+			return err
+		}
+	}
 
 	h.t.Logf("Cluster started successfully")
 	return nil
@@ -693,6 +1022,8 @@ func (h *ClusterHarness) StopCluster() {
 
 func (h *ClusterHarness) Cleanup() {
 	h.cleanupOnce.Do(func() {
+		h.watchdog.Stop()
+		h.budgetOnce.Do(func() { close(h.budgetDone) })
 		h.t.Logf("Cleaning up cluster harness...")
 		h.StopCluster()
 		time.Sleep(500 * time.Millisecond)
@@ -733,6 +1064,7 @@ func TestDDLReplication(t *testing.T) {
 		harness.dumpNodeLogs("ddl_test")
 		t.Fatalf("DDL replication failed: %v", err)
 	}
+	harness.Phase("converged")
 
 	t.Logf("SUCCESS: Table %s replicated to all nodes", tableName)
 }
@@ -745,6 +1077,7 @@ func TestBasicReplication(t *testing.T) {
 	if err := harness.StartCluster(); err != nil {
 		t.Fatalf("Failed to start cluster: %v", err)
 	}
+	harness.Phase("start")
 
 	tableName := "basic_test"
 
@@ -772,16 +1105,14 @@ func TestBasicReplication(t *testing.T) {
 	}
 
 	// Wait for replication
-	time.Sleep(3 * time.Second)
+	if err := harness.WaitForRowCount(tableName, allNodes, 10, 15*time.Second); err != nil {
+		harness.dumpNodeLogs("basic_replication_fail")
+		t.Fatalf("rows did not replicate: %v", err)
+	}
+	harness.Phase("converged")
 
-	// Verify all nodes have the data
 	for _, nodeID := range allNodes {
-		count := harness.getRowCount(nodeID, tableName)
-		if count != 10 {
-			harness.dumpNodeLogs("basic_replication_fail")
-			t.Fatalf("Node %d has %d rows, expected 10", nodeID, count)
-		}
-		t.Logf("Node %d has %d rows", nodeID, count)
+		t.Logf("Node %d has %d rows", nodeID, harness.getRowCount(nodeID, tableName))
 	}
 
 	t.Logf("SUCCESS: Basic replication verified")
@@ -795,6 +1126,7 @@ func TestNodeRestartRecovery(t *testing.T) {
 	if err := harness.StartCluster(); err != nil {
 		t.Fatalf("Failed to start cluster: %v", err)
 	}
+	harness.Phase("start")
 
 	tableName := "recovery_test"
 
@@ -820,22 +1152,18 @@ func TestNodeRestartRecovery(t *testing.T) {
 			t.Fatalf("Insert failed: %v", err)
 		}
 	}
-	time.Sleep(2 * time.Second)
-
-	// Verify all nodes have initial data
-	for _, nodeID := range allNodes {
-		count := harness.getRowCount(nodeID, tableName)
-		if count != 5 {
-			t.Fatalf("Node %d has %d rows before crash, expected 5", nodeID, count)
-		}
+	if err := harness.WaitForRowCount(tableName, allNodes, 5, 15*time.Second); err != nil {
+		t.Fatalf("initial rows did not replicate: %v", err)
 	}
 	t.Logf("All nodes have 5 rows before crash")
+	harness.Phase("initial-load")
 
 	// Kill node 3
 	t.Logf("Killing node 3...")
 	if err := harness.KillNode(3); err != nil {
 		t.Fatalf("Failed to kill node 3: %v", err)
 	}
+	harness.Phase("node3-killed")
 
 	// Write more data while node 3 is down
 	t.Logf("Writing 5 more rows while node 3 is down...")
@@ -846,16 +1174,11 @@ func TestNodeRestartRecovery(t *testing.T) {
 			t.Fatalf("Insert failed while node 3 down: %v", err)
 		}
 	}
-	time.Sleep(2 * time.Second)
-
-	// Verify nodes 1 & 2 have all data
-	for _, nodeID := range []int{1, 2} {
-		count := harness.getRowCount(nodeID, tableName)
-		if count != 10 {
-			t.Fatalf("Node %d has %d rows, expected 10", nodeID, count)
-		}
+	if err := harness.WaitForRowCount(tableName, []int{1, 2}, 10, 15*time.Second); err != nil {
+		t.Fatalf("rows did not replicate to nodes 1&2: %v", err)
 	}
 	t.Logf("Nodes 1 & 2 have 10 rows")
+	harness.Phase("missed-load")
 
 	// Restart node 3
 	t.Logf("Restarting node 3...")
@@ -865,23 +1188,15 @@ func TestNodeRestartRecovery(t *testing.T) {
 	if err := harness.WaitForAlive(3, 20*time.Second); err != nil {
 		t.Fatalf("Node 3 did not become ALIVE: %v", err)
 	}
+	harness.Phase("node3-alive")
 
 	// Wait for anti-entropy to catch up
 	t.Logf("Waiting for node 3 to catch up via anti-entropy...")
-	var count3 int
-	for attempt := 0; attempt < 12; attempt++ {
-		time.Sleep(5 * time.Second)
-		count3 = harness.getRowCount(3, tableName)
-		t.Logf("Attempt %d: Node 3 has %d rows", attempt+1, count3)
-		if count3 == 10 {
-			break
-		}
-	}
-
-	if count3 != 10 {
+	if err := harness.WaitForRowCount(tableName, []int{3}, 10, 20*time.Second); err != nil {
 		harness.dumpNodeLogs("recovery_test_fail")
-		t.Fatalf("Node 3 did not catch up: has %d rows, expected 10", count3)
+		t.Fatalf("Node 3 did not catch up: %v", err)
 	}
+	harness.Phase("caught-up")
 
 	t.Logf("SUCCESS: Node 3 caught up after restart")
 }
@@ -890,6 +1205,10 @@ func TestNodeRestartRecovery(t *testing.T) {
 // This test verifies that:
 // 1. Writes continue to succeed (on remaining nodes) during rolling restarts
 // 2. After all restarts complete, anti-entropy brings all nodes to eventual consistency
+//
+// Every wait here is a poll on a named deadline (WaitForRowCount / WaitForAlive),
+// not a flat sleep, so the test finishes as soon as the cluster actually
+// converges, keeping it well under the 60 s cluster test budget.
 func TestRollingRestart(t *testing.T) {
 	harness := NewClusterHarness(t)
 	defer harness.Cleanup()
@@ -897,6 +1216,7 @@ func TestRollingRestart(t *testing.T) {
 	if err := harness.StartCluster(); err != nil {
 		t.Fatalf("Failed to start cluster: %v", err)
 	}
+	harness.Phase("start")
 
 	tableName := "rolling_test"
 
@@ -914,26 +1234,23 @@ func TestRollingRestart(t *testing.T) {
 	}
 
 	// Insert baseline data before rolling restart
-	t.Logf("Inserting baseline 20 rows before rolling restart...")
-	for i := 1; i <= 20; i++ {
+	const baseline = 20
+	t.Logf("Inserting baseline %d rows before rolling restart...", baseline)
+	for i := 1; i <= baseline; i++ {
 		_, err := harness.ExecNode(1, fmt.Sprintf(
 			"INSERT INTO %s (id, value) VALUES (%d, 'baseline_%d')", tableName, i, i))
 		if err != nil {
 			t.Fatalf("Baseline insert failed: %v", err)
 		}
 	}
-	time.Sleep(3 * time.Second)
-
-	// Verify all nodes have baseline data
-	for _, nodeID := range allNodes {
-		count := harness.getRowCount(nodeID, tableName)
-		if count != 20 {
-			t.Fatalf("Node %d has %d baseline rows, expected 20", nodeID, count)
-		}
+	if err := harness.WaitForRowCount(tableName, allNodes, baseline, 15*time.Second); err != nil {
+		t.Fatalf("baseline rows did not replicate: %v", err)
 	}
-	t.Logf("All nodes have 20 baseline rows")
+	t.Logf("All nodes have %d baseline rows", baseline)
+	harness.Phase("baseline-load")
 
-	// Rolling restart each node - no writes during restart to test pure recovery
+	// Rolling restart each node - writes continue against the nodes still up.
+	expected := baseline
 	for nodeID := 1; nodeID <= 3; nodeID++ {
 		t.Logf("Rolling restart: stopping node %d...", nodeID)
 		if err := harness.StopNode(nodeID); err != nil {
@@ -947,14 +1264,25 @@ func TestRollingRestart(t *testing.T) {
 		}
 		t.Logf("Writing 5 rows to node %d while node %d is down...", targetNode, nodeID)
 		for i := 0; i < 5; i++ {
-			rowID := 20 + (nodeID-1)*5 + i + 1 // Unique IDs: 21-25, 26-30, 31-35
+			rowID := baseline + (nodeID-1)*5 + i + 1 // Unique IDs: 21-25, 26-30, 31-35
 			_, err := harness.ExecNode(targetNode, fmt.Sprintf(
 				"INSERT INTO %s (id, value) VALUES (%d, 'rolling_%d')", tableName, rowID, rowID))
 			if err != nil {
 				t.Logf("Warning: write during rolling restart failed: %v", err)
+				continue
+			}
+			expected++
+		}
+
+		var stillUp []int
+		for _, n := range allNodes {
+			if n != nodeID {
+				stillUp = append(stillUp, n)
 			}
 		}
-		time.Sleep(2 * time.Second)
+		if err := harness.WaitForRowCount(tableName, stillUp, expected, 10*time.Second); err != nil {
+			t.Fatalf("writes during node %d's downtime did not land on the up nodes: %v", nodeID, err)
+		}
 
 		if err := harness.StartNode(nodeID); err != nil {
 			t.Fatalf("Failed to restart node %d: %v", nodeID, err)
@@ -964,42 +1292,22 @@ func TestRollingRestart(t *testing.T) {
 		}
 		t.Logf("Node %d restarted", nodeID)
 
-		// Wait for anti-entropy to sync the restarted node
-		time.Sleep(10 * time.Second)
+		if err := harness.WaitForRowCount(tableName, []int{nodeID}, expected, 20*time.Second); err != nil {
+			harness.dumpNodeLogs("rolling_test_catchup")
+			t.Fatalf("node %d did not catch up via anti-entropy: %v", nodeID, err)
+		}
+		harness.Phase(fmt.Sprintf("node%d-rolled", nodeID))
 	}
 
-	// Wait for eventual consistency across all nodes
-	t.Logf("Waiting for eventual consistency...")
-	var converged bool
-	var counts [3]int
-
-	for attempt := 0; attempt < 12; attempt++ {
-		time.Sleep(5 * time.Second)
-
-		for i := 1; i <= 3; i++ {
-			counts[i-1] = harness.getRowCount(i, tableName)
-		}
-		t.Logf("Attempt %d: node1=%d, node2=%d, node3=%d", attempt+1, counts[0], counts[1], counts[2])
-
-		// Check if all nodes have the same count
-		if counts[0] == counts[1] && counts[1] == counts[2] && counts[0] > 0 {
-			converged = true
-			break
-		}
-	}
-
-	if !converged {
+	// Final verification - all nodes converge on the same count.
+	if err := harness.WaitForRowCount(tableName, allNodes, expected, 15*time.Second); err != nil {
 		harness.dumpNodeLogs("rolling_test_fail")
-		t.Fatalf("Cluster did not converge: node1=%d, node2=%d, node3=%d", counts[0], counts[1], counts[2])
+		t.Fatalf("cluster did not converge: %v", err)
 	}
+	harness.Phase("converged")
 
-	// Verify we have baseline + rolling restart writes (20 baseline + up to 15 rolling)
-	expectedMin := 20 // At least baseline data
-	if counts[0] < expectedMin {
-		t.Fatalf("Expected at least %d rows, got %d", expectedMin, counts[0])
-	}
-
-	t.Logf("SUCCESS: Rolling restart maintained availability and consistency (final count: %d)", counts[0])
+	finalCount := harness.getRowCount(1, tableName)
+	t.Logf("SUCCESS: Rolling restart maintained availability and consistency (final count: %d)", finalCount)
 }
 
 // TestCrashMidTransaction tests that uncommitted transactions are rolled back
@@ -1010,6 +1318,7 @@ func TestCrashMidTransaction(t *testing.T) {
 	if err := harness.StartCluster(); err != nil {
 		t.Fatalf("Failed to start cluster: %v", err)
 	}
+	harness.Phase("start")
 
 	tableName := "crash_txn_test"
 
@@ -1071,6 +1380,7 @@ func TestCrashMidTransaction(t *testing.T) {
 	if err := harness.WaitForAlive(1, 15*time.Second); err != nil {
 		t.Fatalf("Node 1 did not become ALIVE: %v", err)
 	}
+	harness.Phase("node1-alive")
 
 	time.Sleep(3 * time.Second)
 
@@ -1091,6 +1401,7 @@ func TestHighLoadRecovery(t *testing.T) {
 	if err := harness.StartCluster(); err != nil {
 		t.Fatalf("Failed to start cluster: %v", err)
 	}
+	harness.Phase("start")
 
 	tableName := "highload_test"
 	allNodes := []int{1, 2, 3}
@@ -1123,10 +1434,12 @@ func TestHighLoadRecovery(t *testing.T) {
 		t.Fatalf("Initial replication failed: %v", err)
 	}
 	t.Logf("Phase 1 complete: All nodes have %d rows", initialRows)
+	harness.Phase("initial-load")
 
 	// Phase 2: Kill node 3
 	t.Logf("Phase 2: Killing node 3...")
 	harness.KillNode(3)
+	harness.Phase("node3-killed")
 
 	// Phase 3: Insert more rows while node 3 is down
 	additionalRows := 30
@@ -1146,6 +1459,7 @@ func TestHighLoadRecovery(t *testing.T) {
 		t.Fatalf("Replication to nodes 1&2 failed: %v", err)
 	}
 	t.Logf("Phase 3 complete: Nodes 1 & 2 have %d rows", expectedTotal)
+	harness.Phase("missed-load")
 
 	// Phase 4: Restart node 3
 	t.Logf("Phase 4: Restarting node 3...")
@@ -1156,13 +1470,15 @@ func TestHighLoadRecovery(t *testing.T) {
 		harness.dumpNodeLogs("highload_restart_alive")
 		t.Fatalf("Node 3 did not become ALIVE: %v", err)
 	}
+	harness.Phase("node3-alive")
 
 	// Phase 5: Wait for node 3 to catch up
 	t.Logf("Phase 5: Waiting for node 3 to catch up to %d rows...", expectedTotal)
-	if err := harness.WaitForRowCount(tableName, []int{3}, expectedTotal, 60*time.Second); err != nil {
+	if err := harness.WaitForRowCount(tableName, []int{3}, expectedTotal, 25*time.Second); err != nil {
 		harness.dumpNodeLogs("highload_catchup")
 		t.Fatalf("Node 3 failed to catch up: %v", err)
 	}
+	harness.Phase("caught-up")
 
 	// Final verification - all nodes have exact same count
 	for _, nodeID := range allNodes {

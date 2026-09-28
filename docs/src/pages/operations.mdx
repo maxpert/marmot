@@ -178,6 +178,58 @@ curl -X POST -H "X-Marmot-Secret: $SECRET" http://node1:8080/admin/cluster/remov
 # 5-node cluster → 3-node cluster, quorum: 3 → 2
 ```
 
+## Rolling Upgrades
+
+This release replaces how nodes catch up with each other: every node now
+pulls the commit log of every peer, and it keeps a per-database schema version
+inside each database file. Releases before it count a database's DDL history
+differently (their counter also counts CREATE DATABASE and DROP DATABASE), so
+the same history yields a different schema version on the two kinds of node.
+Because of this, DDL and CREATE/DROP DATABASE are **refused cluster-wide** —
+with a retryable error (MySQL 1213) naming the node ids still to upgrade — for
+as long as any cluster member runs an earlier release. Ordinary DML keeps
+replicating normally throughout.
+
+**Procedure:**
+
+1. Upgrade every node in the cluster, one at a time, letting each rejoin as
+   ALIVE before moving to the next.
+2. Once every node runs this release, DDL and CREATE/DROP DATABASE are
+   accepted again.
+3. Do not run DDL or CREATE/DROP DATABASE while the upgrade is in progress —
+   it will be refused, not queued.
+
+A database dropped on some nodes but not others before the upgrade started
+(a node that missed a DROP DATABASE while it was down) is a divergence that
+database-set reconciliation does not repair after the upgrade either; resolve
+it before or after the upgrade like any other registry mismatch between nodes.
+
+**Snapshot restores during the upgrade.** A snapshot taken on a node that has
+not been upgraded yet carries no schema version in its database file, so a
+node restoring from it takes the version it recorded for that database before
+its own upgrade. This is another reason DDL waits until every node is
+upgraded: until then, every node's recorded version comes from the same DDL
+history and they agree.
+
+## Log Retention and Membership
+
+Each node keeps its own commit log so peers can pull what they missed. An
+entry is deleted by GC once it is older than `gc_min_retention_hours` **and**
+every current cluster member has pulled past it, or unconditionally once it is
+older than `gc_max_retention_hours`.
+
+"Every current member" includes members that are down (SUSPECT or DEAD), not
+only the ones that are reachable:
+
+- While a member is down, GC keeps every entry it has not pulled yet, up to
+  `gc_max_retention_hours`. Plan disk space for that much log on every node.
+- A member down longer than `gc_max_retention_hours` finds that its peers'
+  logs no longer cover the point it stopped at. When it returns, anti-entropy
+  restores the affected databases from a peer's snapshot automatically, then
+  resumes pulling logs.
+- A node removed through `/admin/cluster/remove` stops counting at once: its
+  pull positions are dropped, and it no longer holds back GC on any node.
+
 ## Prometheus Metrics
 
 ```toml

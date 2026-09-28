@@ -39,25 +39,25 @@ type DatabaseProvider interface {
 //
 // Locking: mu guards the maps and the wiring fields and is only ever held for
 // map access and wiring, never while a database's GC is stopped, because a GC
-// pass takes mu (GetMinAppliedTxnID, and anti-entropy's refresh through
-// ListDatabases). lifecycleMu serialises the operations that open, close,
+// pass takes mu (anti-entropy's refresh through ListDatabases). lifecycleMu
+// serialises the operations that open, close,
 // register or delete a database (Create, Drop, Detach, Attach, Import, Close),
 // so one of them can close a database outside mu while the others wait; no GC
 // pass ever takes lifecycleMu.
 type DatabaseManager struct {
-	lifecycleMu              sync.Mutex
-	mu                       sync.RWMutex
-	databases                map[string]*ReplicatedDatabase
-	detached                 map[string]*detachedDatabase // user databases out of service for a snapshot restore
-	systemDB                 *ReplicatedDatabase
-	dataDir                  string
-	nodeID                   uint64
-	clock                    *hlc.Clock
-	refreshReplicationStates RefreshReplicationStatesFunc // Callback to refresh peer states before GC
-	cdcHub                   CDCHub                       // CDC notification hub, can be nil
-	vecIndexMgr              *VectorIndexManager          // Optional vector index manager
-	autoIncClaimStore        *AutoIncClaimStore           // AUTO_INCREMENT claim store, backed by systemDB
-	membershipView           atomic.Pointer[func() int]   // this node's view of total cluster membership
+	lifecycleMu       sync.Mutex
+	mu                sync.RWMutex
+	databases         map[string]*ReplicatedDatabase
+	detached          map[string]*detachedDatabase // user databases out of service for a snapshot restore
+	systemDB          *ReplicatedDatabase
+	dataDir           string
+	nodeID            uint64
+	clock             *hlc.Clock
+	cdcHub            CDCHub                          // CDC notification hub, can be nil
+	vecIndexMgr       *VectorIndexManager             // Optional vector index manager
+	autoIncClaimStore *AutoIncClaimStore              // AUTO_INCREMENT claim store, backed by systemDB
+	membershipView    atomic.Pointer[func() int]      // this node's view of total cluster membership
+	gcMembershipFunc  atomic.Pointer[func() []uint64] // current member node ids (self included, not REMOVED); source for each database's GC safe position
 }
 
 // SetClusterMembership installs view as the source of this node's view of
@@ -75,6 +75,16 @@ func (dm *DatabaseManager) ClusterMembership() (int, error) {
 		return 0, errors.New("no cluster membership view installed")
 	}
 	return (*view)(), nil
+}
+
+// SetGCMembershipFunc installs view as the source of this node's current
+// cluster membership (self included, every node whose registry status is
+// not REMOVED) for every database's GC safe deletion position
+// (wireGCCoordination). It keeps this package free of a grpc import: the
+// caller (marmot.go) closes over grpc's NodeRegistry itself. Until this is
+// called, GC treats nothing as safe except entries past max retention.
+func (dm *DatabaseManager) SetGCMembershipFunc(view func() []uint64) {
+	dm.gcMembershipFunc.Store(&view)
 }
 
 // DatabaseMetadata represents database registry information
@@ -149,16 +159,27 @@ func (dm *DatabaseManager) initSystemDatabase() error {
 	// Add system database to the databases map so it can be retrieved via GetDatabase()
 	dm.databases[SystemDatabaseName] = systemDB
 
-	// Create database registry table
+	// Create database registry table. generation and dropped implement the
+	// registry key (DatabaseRegistryKey): a tombstoned DROP keeps its
+	// row (dropped=1) instead of deleting it, so a later CREATE can fence a
+	// stale peer with a strictly higher generation. See DatabaseRegistryKey.
+	// legacy marks a row that carries no real generation history; see
+	// migrateDatabaseRegistrySchema and ApplyDatabaseOp's doc comment.
 	_, err = systemDB.GetDB().Exec(`
 		CREATE TABLE IF NOT EXISTS __marmot_databases (
 			name TEXT PRIMARY KEY,
 			created_at INTEGER NOT NULL,
-			path TEXT NOT NULL
+			path TEXT NOT NULL,
+			generation INTEGER NOT NULL DEFAULT 1,
+			dropped INTEGER NOT NULL DEFAULT 0,
+			legacy INTEGER NOT NULL DEFAULT 0
 		)
 	`)
 	if err != nil {
 		return fmt.Errorf("failed to create database registry table: %w", err)
+	}
+	if err := migrateDatabaseRegistrySchema(systemDB.GetDB()); err != nil {
+		return fmt.Errorf("failed to migrate database registry schema: %w", err)
 	}
 
 	// Create the AUTO_INCREMENT claim table (db/autoinc_claim.go) and its vote
@@ -176,9 +197,67 @@ func (dm *DatabaseManager) initSystemDatabase() error {
 	return nil
 }
 
-// loadDatabases loads all databases from the registry
+// migrateDatabaseRegistrySchema adds the generation, dropped and legacy
+// columns to __marmot_databases when an existing system database predates
+// them. It is idempotent: safe to call on
+// every startup, including against a brand-new table that already has the
+// columns. A row that predates the migration has no generation history of
+// its own, so it becomes (generation 1, live) - the same key CREATE DATABASE
+// stamps for a name's first-ever generation - and legacy=1: before this
+// migration existed, DROP DATABASE deleted its registry row outright, so every row an upgrade finds
+// still there was live, and its (1, live) key is a migration default, not a
+// stamp from a real CREATE. ApplyDatabaseOp treats a legacy live row
+// specially until a real CREATE or DROP stamps the name (createDatabaseAt
+// GenerationLocked and dropDatabaseAtGenerationLocked both clear legacy).
+func migrateDatabaseRegistrySchema(sqlDB *sql.DB) error {
+	rows, err := sqlDB.Query("PRAGMA table_info(__marmot_databases)")
+	if err != nil {
+		return fmt.Errorf("failed to inspect database registry schema: %w", err)
+	}
+	have := make(map[string]bool, 5)
+	for rows.Next() {
+		var cid int
+		var name, colType string
+		var notNull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &dflt, &pk); err != nil {
+			rows.Close()
+			return fmt.Errorf("failed to read database registry schema: %w", err)
+		}
+		have[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("failed to read database registry schema: %w", err)
+	}
+	rows.Close()
+
+	if !have["generation"] {
+		if _, err := sqlDB.Exec("ALTER TABLE __marmot_databases ADD COLUMN generation INTEGER NOT NULL DEFAULT 1"); err != nil {
+			return fmt.Errorf("failed to add generation column to database registry: %w", err)
+		}
+	}
+	if !have["dropped"] {
+		if _, err := sqlDB.Exec("ALTER TABLE __marmot_databases ADD COLUMN dropped INTEGER NOT NULL DEFAULT 0"); err != nil {
+			return fmt.Errorf("failed to add dropped column to database registry: %w", err)
+		}
+	}
+	if !have["legacy"] {
+		// DEFAULT 1: every row already in the table when this ALTER first
+		// runs predates generation stamps and has no real generation history
+		// (see this function's doc comment). A row inserted after the column exists
+		// always states its own legacy value explicitly.
+		if _, err := sqlDB.Exec("ALTER TABLE __marmot_databases ADD COLUMN legacy INTEGER NOT NULL DEFAULT 1"); err != nil {
+			return fmt.Errorf("failed to add legacy column to database registry: %w", err)
+		}
+	}
+	return nil
+}
+
+// loadDatabases loads every live database from the registry. Tombstoned rows
+// (dropped=1) are excluded: a dropped database is never opened.
 func (dm *DatabaseManager) loadDatabases() error {
-	rows, err := dm.systemDB.GetDB().Query("SELECT name, created_at, path FROM __marmot_databases")
+	rows, err := dm.systemDB.GetDB().Query("SELECT name, created_at, path FROM __marmot_databases WHERE dropped = 0")
 	if err != nil {
 		return fmt.Errorf("failed to query database registry: %w", err)
 	}
@@ -206,6 +285,18 @@ func (dm *DatabaseManager) loadDatabases() error {
 	return rows.Err()
 }
 
+// schemaVersionOptions returns the NewReplicatedDatabase options that name a
+// user database and wire its __marmot_schema_version migration read
+// from the retiring pebble-stored counter in the system database's MetaStore.
+// dm.systemDB must already be assigned; every call site below runs after
+// initSystemDatabase.
+func (dm *DatabaseManager) schemaVersionOptions(name string) []ReplicatedDatabaseOption {
+	return []ReplicatedDatabaseOption{
+		WithDatabaseName(name),
+		WithLegacySchemaVersionSource(dm.systemDB.GetMetaStore().GetSchemaVersion),
+	}
+}
+
 // openDatabase opens a database and adds it to the registry
 // Creates a MetaStore for the database (stored in dbname_meta.pebble/)
 func (dm *DatabaseManager) openDatabase(name, path string) error {
@@ -215,7 +306,7 @@ func (dm *DatabaseManager) openDatabase(name, path string) error {
 		return fmt.Errorf("failed to create meta store for %s: %w", name, err)
 	}
 
-	db, err := NewReplicatedDatabase(path, dm.nodeID, dm.clock, metaStore)
+	db, err := NewReplicatedDatabase(path, dm.nodeID, dm.clock, metaStore, dm.schemaVersionOptions(name)...)
 	if err != nil {
 		metaStore.Close()
 		return fmt.Errorf("failed to open database %s: %w", name, err)
@@ -233,19 +324,84 @@ func (dm *DatabaseManager) openDatabase(name, path string) error {
 //
 // NOTE: This function must NOT acquire dm.mu as it is called from contexts
 // that already hold the write lock (CreateDatabase, AttachDatabase, etc.)
-// or during single-threaded initialization. Reading refreshReplicationStates
-// is safe because the caller either has exclusive access via write lock
-// or we're in initialization before any concurrent access is possible.
+// or during single-threaded initialization.
+//
+// GC with partial membership: gcMembershipFunc's
+// view of current membership can be only partly populated right after a
+// restart, before gossip has re-learned every peer. GC can run against that
+// partial view: it then treats a not-yet-gossiped member as absent from
+// dm.gcMembershipFunc's list, so its consumed position is deleted
+// (SetGCSafePositionFunc's DeleteConsumedPosition loop below) and it no
+// longer holds back the safe deletion point. This is never a correctness
+// problem - GC's own safe-position computation still only deletes what every
+// member it does know about has consumed - but it means that member may find
+// its cursor behind this node's truncation point once gossip reports it
+// again, forcing a snapshot restore (AntiEntropyService's snapshot fallback)
+// where a further log pull round would otherwise
+// have sufficed. The cost is one unnecessary snapshot for that member, never
+// a lost transaction.
 func (dm *DatabaseManager) wireGCCoordination(mdb *ReplicatedDatabase, dbName string) {
 	txnMgr := mdb.GetTransactionManager()
 	txnMgr.SetDatabaseName(dbName)
-	txnMgr.SetMinAppliedTxnIDFunc(dm.GetMinAppliedTxnID)
 
-	// Wire refresh function if available (set via SetRefreshReplicationStatesFunc)
-	// No lock needed: caller either holds write lock or we're in init
-	if dm.refreshReplicationStates != nil {
-		txnMgr.SetRefreshReplicationStatesFunc(dm.refreshReplicationStates)
-	}
+	// GC's safe deletion position is the min, across every current member
+	// other than self, of this database's log R[self,m,d]
+	// (db/meta_store.go's ConsumedPositions). A
+	// member with no recorded position counts as the zero position, so GC
+	// deletes nothing for that database until every member has reported at
+	// least once (bounded by gcMaxRetention regardless). A member no longer
+	// current has its consumed position deleted so it stops pinning GC.
+	//
+	// A member down for longer than gc_max_retention_hours finds its
+	// consumed position has been superseded by GC's unconditional
+	// max-retention deletion; it restores by snapshot, which anti-entropy
+	// does automatically (AntiEntropyService's snapshot fallback).
+	metaStore := mdb.GetMetaStore()
+	selfID := dm.nodeID
+	txnMgr.SetGCSafePositionFunc(func() (LogPosition, bool) {
+		viewPtr := dm.gcMembershipFunc.Load()
+		if viewPtr == nil {
+			return LogPosition{}, false
+		}
+		members := (*viewPtr)()
+
+		positions, err := metaStore.ConsumedPositions()
+		if err != nil {
+			log.Warn().Err(err).Str("database", dbName).Msg("GC: failed to read consumed positions")
+			return LogPosition{}, false
+		}
+
+		memberSet := make(map[uint64]bool, len(members))
+		for _, m := range members {
+			memberSet[m] = true
+		}
+		for nodeID := range positions {
+			if memberSet[nodeID] {
+				continue
+			}
+			if err := metaStore.DeleteConsumedPosition(nodeID); err != nil {
+				log.Warn().Err(err).Str("database", dbName).Uint64("node_id", nodeID).
+					Msg("GC: failed to delete consumed position of a departed member")
+			}
+		}
+
+		var safe LogPosition
+		haveOther := false
+		for _, m := range members {
+			if m == selfID {
+				continue
+			}
+			pos := positions[m] // zero LogPosition when this member has never reported
+			if !haveOther || pos.Less(safe) {
+				safe = pos
+			}
+			haveOther = true
+		}
+		if !haveOther {
+			return LogPosition{}, false
+		}
+		return safe, true
+	})
 
 	// Wire CDC notifier if available
 	if dm.cdcHub != nil {
@@ -278,24 +434,6 @@ func (dm *DatabaseManager) SetAutoIncIncarnationListener(l AutoIncIncarnationLis
 		dm.autoIncClaimStore = NewAutoIncClaimStore(dm.systemDB)
 	}
 	dm.autoIncClaimStore.SetIncarnationListener(l)
-}
-
-// SetRefreshReplicationStatesFunc sets the callback for refreshing peer replication states
-// This is called by GC before Phase 2 to ensure fresh watermarks before deletion decisions
-// The callback is wired to all existing and future TransactionManagers
-func (dm *DatabaseManager) SetRefreshReplicationStatesFunc(fn RefreshReplicationStatesFunc) {
-	dm.mu.Lock()
-	dm.refreshReplicationStates = fn
-	dm.mu.Unlock()
-
-	// Wire to all existing databases
-	dm.mu.RLock()
-	defer dm.mu.RUnlock()
-
-	for _, mdb := range dm.databases {
-		txnMgr := mdb.GetTransactionManager()
-		txnMgr.SetRefreshReplicationStatesFunc(fn)
-	}
 }
 
 // SetCDCHub sets the CDC notification hub and wires it to all existing databases
@@ -362,7 +500,10 @@ func (dm *DatabaseManager) ensureDefaultDatabase() error {
 	return nil
 }
 
-// CreateDatabase creates a new database with its own MetaStore
+// CreateDatabase creates a new database with its own MetaStore. Returns nil
+// if the database already exists (idempotent, IF NOT EXISTS semantics). A
+// name previously dropped (tombstoned in the registry) is re-created one
+// generation above its tombstone; see DatabaseRegistryKey.
 func (dm *DatabaseManager) CreateDatabase(name string) error {
 	if name == SystemDatabaseName {
 		return fmt.Errorf("cannot create system database")
@@ -385,6 +526,39 @@ func (dm *DatabaseManager) CreateDatabase(name string) error {
 		return nil
 	}
 
+	local, err := dm.registryKeyRow(name)
+	if err != nil {
+		return err
+	}
+	return dm.createDatabaseAtGenerationLocked(name, local.Generation+1)
+}
+
+// createDatabaseAtGenerationLocked creates name's file and wires it into
+// service, stamping the registry row (name, generation, live). Caller must
+// hold lifecycleMu.
+//
+// If a live local incarnation of name already exists, it is retired first -
+// closed, its files removed, its AUTO_INCREMENT incarnation ended - exactly
+// as DropDatabase would. This only happens through ApplyDatabaseOp
+// reconciling a peer's higher live key: DatabaseRegistryKey's total order
+// means a live key above the local one can only follow a DROP this node has
+// not learned of yet, so the local incarnation is stale and must not survive
+// under the new generation.
+func (dm *DatabaseManager) createDatabaseAtGenerationLocked(name string, generation uint64) error {
+	dm.mu.RLock()
+	existingDB, exists := dm.databases[name]
+	detached := dm.detached[name]
+	dm.mu.RUnlock()
+
+	if detached != nil {
+		return fmt.Errorf("database %s is out of service for a snapshot restore: %w", name, ErrDatabaseDetached)
+	}
+	if exists {
+		if err := dm.retireLiveIncarnationLocked(name, existingDB); err != nil {
+			return err
+		}
+	}
+
 	// Create database file
 	dbPath := filepath.Join("databases", name+".db")
 	fullPath := filepath.Join(dm.dataDir, dbPath)
@@ -395,21 +569,32 @@ func (dm *DatabaseManager) CreateDatabase(name string) error {
 		return fmt.Errorf("failed to create meta store: %w", err)
 	}
 
-	db, err := NewReplicatedDatabase(fullPath, dm.nodeID, dm.clock, metaStore)
+	newDB, err := NewReplicatedDatabase(fullPath, dm.nodeID, dm.clock, metaStore, dm.schemaVersionOptions(name)...)
 	if err != nil {
 		metaStore.Close()
 		cleanupMetaStoreFiles(fullPath)
 		return fmt.Errorf("failed to create database file: %w", err)
 	}
 
-	// Register in system database
+	// Register in system database. ON CONFLICT covers re-creating a
+	// tombstoned name: the row already exists, dropped=1, and this brings it
+	// back live at the given generation. legacy=0: this is a real CREATE with
+	// a generation stamp, so any legacy divergence for name is resolved
+	// (see ApplyDatabaseOp's doc comment).
 	createdAt := time.Now().UnixNano()
 	_, err = dm.systemDB.GetDB().Exec(
-		"INSERT INTO __marmot_databases (name, created_at, path) VALUES (?, ?, ?)",
-		name, createdAt, dbPath,
+		`INSERT INTO __marmot_databases (name, created_at, path, generation, dropped, legacy)
+		 VALUES (?, ?, ?, ?, 0, 0)
+		 ON CONFLICT(name) DO UPDATE SET
+		   created_at = excluded.created_at,
+		   path = excluded.path,
+		   generation = excluded.generation,
+		   dropped = 0,
+		   legacy = 0`,
+		name, createdAt, dbPath, generation,
 	)
 	if err != nil {
-		db.Close()
+		newDB.Close()
 		os.Remove(fullPath)
 		cleanupMetaStoreFiles(fullPath)
 		return fmt.Errorf("failed to register database in system: %w", err)
@@ -418,10 +603,39 @@ func (dm *DatabaseManager) CreateDatabase(name string) error {
 	// Wire up GC coordination only once the database is registered: until
 	// then its GC cannot reach mu, so the failure path above can close it.
 	dm.mu.Lock()
-	dm.wireGCCoordination(db, name)
-	dm.databases[name] = db
+	dm.wireGCCoordination(newDB, name)
+	dm.databases[name] = newDB
 	dm.mu.Unlock()
-	log.Info().Str("name", name).Str("path", dbPath).Msg("Database created")
+	log.Info().Str("name", name).Str("path", dbPath).Uint64("generation", generation).Msg("Database created")
+	return nil
+}
+
+// retireLiveIncarnationLocked closes and removes a live local database
+// incarnation that a newer registry generation is about to replace, and ends
+// its AUTO_INCREMENT incarnation. Caller must hold lifecycleMu.
+func (dm *DatabaseManager) retireLiveIncarnationLocked(name string, liveDB *ReplicatedDatabase) error {
+	var dbPath string
+	if err := dm.systemDB.GetDB().QueryRow(
+		"SELECT path FROM __marmot_databases WHERE name = ?", name,
+	).Scan(&dbPath); err != nil {
+		return fmt.Errorf("failed to get database path: %w", err)
+	}
+	fullPath := filepath.Join(dm.dataDir, dbPath)
+
+	dm.mu.Lock()
+	delete(dm.databases, name)
+	dm.mu.Unlock()
+	if err := liveDB.Close(); err != nil {
+		log.Error().Err(err).Str("name", name).Msg("Failed to close a stale database incarnation being replaced by a newer registry generation")
+	}
+	removeDatabaseFiles(fullPath)
+
+	dm.mu.RLock()
+	claimStore := dm.autoIncClaimStore
+	dm.mu.RUnlock()
+	if claimStore != nil {
+		claimStore.databaseIncarnationEnded(name)
+	}
 	return nil
 }
 
@@ -445,7 +659,7 @@ func (dm *DatabaseManager) DropDatabase(name string) error {
 	defer dm.lifecycleMu.Unlock()
 
 	dm.mu.RLock()
-	db, exists := dm.databases[name]
+	_, exists := dm.databases[name]
 	detached := dm.detached[name]
 	dm.mu.RUnlock()
 
@@ -455,20 +669,51 @@ func (dm *DatabaseManager) DropDatabase(name string) error {
 		return nil
 	}
 
-	// Get path before deletion
+	local, err := dm.registryKeyRow(name)
+	if err != nil {
+		return err
+	}
+	return dm.dropDatabaseAtGenerationLocked(name, local.Generation)
+}
+
+// dropDatabaseAtGenerationLocked tombstones name's registry row at
+// (generation, dropped) - keeping the row rather than deleting it, so a later
+// CREATE can fence a stale peer with a strictly higher generation - and, if
+// this node has a local incarnation, retires it: closes and removes its
+// files, keeps its AUTO_INCREMENT claim rows, ends its incarnation.
+//
+// A name this node never created locally is tombstoned all the same: the
+// registry row is what ApplyDatabaseOp reconciles against, not local file
+// presence, so a node that missed both CREATE and DROP must still end up with
+// the tombstone. Caller must hold lifecycleMu.
+func (dm *DatabaseManager) dropDatabaseAtGenerationLocked(name string, generation uint64) error {
+	dm.mu.RLock()
+	liveDB, exists := dm.databases[name]
+	detached := dm.detached[name]
+	dm.mu.RUnlock()
+
 	var dbPath string
 	err := dm.systemDB.GetDB().QueryRow(
 		"SELECT path FROM __marmot_databases WHERE name = ?", name,
 	).Scan(&dbPath)
-	if err != nil {
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("failed to get database path: %w", err)
+	}
+	if dbPath == "" {
+		dbPath = filepath.Join("databases", name+".db")
 	}
 	fullPath := filepath.Join(dm.dataDir, dbPath)
 
-	// Remove from registry
-	_, err = dm.systemDB.GetDB().Exec("DELETE FROM __marmot_databases WHERE name = ?", name)
+	// legacy=0: this is a real DROP with a generation stamp, so any legacy
+	// divergence for name is resolved (see ApplyDatabaseOp's doc comment).
+	_, err = dm.systemDB.GetDB().Exec(
+		`INSERT INTO __marmot_databases (name, created_at, path, generation, dropped, legacy)
+		 VALUES (?, ?, ?, ?, 1, 0)
+		 ON CONFLICT(name) DO UPDATE SET generation = excluded.generation, dropped = 1, legacy = 0`,
+		name, time.Now().UnixNano(), dbPath, generation,
+	)
 	if err != nil {
-		return fmt.Errorf("failed to remove database from registry: %w", err)
+		return fmt.Errorf("failed to tombstone database in registry: %w", err)
 	}
 
 	// This database's AUTO_INCREMENT claim rows (db/autoinc_claim.go) stay,
@@ -502,11 +747,17 @@ func (dm *DatabaseManager) DropDatabase(name string) error {
 		return nil
 	}
 
+	if !exists {
+		log.Info().Str("name", name).Uint64("generation", generation).
+			Msg("Database tombstoned in registry; no local incarnation to retire")
+		return nil
+	}
+
 	// Out of the map under mu, closed outside it (see DatabaseManager).
 	dm.mu.Lock()
 	delete(dm.databases, name)
 	dm.mu.Unlock()
-	if err := db.Close(); err != nil {
+	if err := liveDB.Close(); err != nil {
 		log.Error().Err(err).Str("name", name).Msg("Failed to close database")
 	}
 	removeDatabaseFiles(fullPath)
@@ -524,6 +775,224 @@ func removeDatabaseFiles(fullPath string) {
 	os.Remove(fullPath + "-wal")
 	os.Remove(fullPath + "-shm")
 	cleanupMetaStoreFiles(fullPath)
+}
+
+// ErrStaleDatabaseOpCoordinator is returned by ReplicationEngine's PREPARE
+// gate (prepareDatabaseOperation) when a CREATE/DROP DATABASE statement's
+// stamped DatabaseRegistryKey is below this participant's local key for the
+// database: the coordinator's view of the database's history is stale. See
+// ApplyDatabaseOp's proof for why refusing it here keeps every peer's
+// registry from ever regressing.
+var ErrStaleDatabaseOpCoordinator = errors.New("stale coordinator: database operation key is below the local registry key")
+
+// DatabaseRegistryKey orders one database name's registry history so that a
+// higher key always wins a merge. It is ordered
+// lexicographically by (Generation, Dropped), with Dropped=true ranking above
+// Dropped=false at the same generation, so a DROP always outranks the CREATE
+// it follows. A name this node has never seen has key (0, dropped): lower
+// than every generation a real CREATE ever stamps, since CREATE always
+// stamps generation >= 1.
+type DatabaseRegistryKey struct {
+	Generation uint64
+	Dropped    bool
+}
+
+// Less reports whether k sorts strictly before other in the registry's total
+// order.
+func (k DatabaseRegistryKey) Less(other DatabaseRegistryKey) bool {
+	return k.Compare(other) < 0
+}
+
+// Compare returns -1, 0, or 1 as k sorts before, equal to, or after other,
+// matching the conventions of cmp.Compare.
+func (k DatabaseRegistryKey) Compare(other DatabaseRegistryKey) int {
+	if k.Generation != other.Generation {
+		if k.Generation < other.Generation {
+			return -1
+		}
+		return 1
+	}
+	if k.Dropped == other.Dropped {
+		return 0
+	}
+	if other.Dropped {
+		return -1
+	}
+	return 1
+}
+
+// DatabaseRegistryEntry is one database name's current registry key, as
+// listed by RegistryEntries. Legacy is true when Key carries no real
+// generation history - it is a migration default for a row from before
+// generation stamps, not a stamp from an actual CREATE or DROP (see
+// ApplyDatabaseOp's doc comment).
+type DatabaseRegistryEntry struct {
+	Name   string
+	Key    DatabaseRegistryKey
+	Legacy bool
+}
+
+// registryKeyRow reads name's raw registry key. It does not take dm.mu:
+// dm.systemDB is fixed for the DatabaseManager's lifetime and its *sql.DB is
+// safe for concurrent use, so callers that already hold dm.lifecycleMu (the
+// Create/Drop/Apply family) can call it directly, while the exported readers
+// below take dm.mu themselves for the same lock discipline as this file's
+// other exported accessors.
+func (dm *DatabaseManager) registryKeyRow(name string) (DatabaseRegistryKey, error) {
+	var generation uint64
+	var dropped bool
+	err := dm.systemDB.GetDB().QueryRow(
+		"SELECT generation, dropped FROM __marmot_databases WHERE name = ?", name,
+	).Scan(&generation, &dropped)
+	if errors.Is(err, sql.ErrNoRows) {
+		return DatabaseRegistryKey{Generation: 0, Dropped: true}, nil
+	}
+	if err != nil {
+		return DatabaseRegistryKey{}, fmt.Errorf("failed to read database registry key for %s: %w", name, err)
+	}
+	return DatabaseRegistryKey{Generation: generation, Dropped: dropped}, nil
+}
+
+// RegistryKey returns name's current DatabaseRegistryKey: (0, dropped) when
+// the name has never been created on this node.
+func (dm *DatabaseManager) RegistryKey(name string) (DatabaseRegistryKey, error) {
+	dm.mu.RLock()
+	defer dm.mu.RUnlock()
+	return dm.registryKeyRow(name)
+}
+
+// RegistryKeyGeneration reports name's current registry generation and
+// whether it is presently live. It exists for coordinator.DatabaseManager,
+// which cannot import package db's DatabaseRegistryKey without an import
+// cycle: it is RegistryKey with the same information carried as two
+// primitives instead. The coordinator stamps Statement.DatabaseGeneration
+// from it: CREATE stamps generation when
+// live (a no-op) or generation+1 otherwise; DROP stamps generation.
+func (dm *DatabaseManager) RegistryKeyGeneration(name string) (generation uint64, live bool, err error) {
+	key, err := dm.RegistryKey(name)
+	if err != nil {
+		return 0, false, err
+	}
+	return key.Generation, !key.Dropped, nil
+}
+
+// RegistryEntries lists every database name this node's registry has ever
+// known, live or tombstoned, excluding the system database. Anti-entropy
+// reconciles a peer's listing with this one by merging each entry through
+// ApplyDatabaseOp.
+func (dm *DatabaseManager) RegistryEntries() ([]DatabaseRegistryEntry, error) {
+	dm.mu.RLock()
+	defer dm.mu.RUnlock()
+
+	rows, err := dm.systemDB.GetDB().Query(
+		"SELECT name, generation, dropped, legacy FROM __marmot_databases WHERE name != ?", SystemDatabaseName,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list database registry: %w", err)
+	}
+	defer rows.Close()
+
+	var entries []DatabaseRegistryEntry
+	for rows.Next() {
+		var e DatabaseRegistryEntry
+		if err := rows.Scan(&e.Name, &e.Key.Generation, &e.Key.Dropped, &e.Legacy); err != nil {
+			return nil, fmt.Errorf("failed to read database registry row: %w", err)
+		}
+		entries = append(entries, e)
+	}
+	return entries, rows.Err()
+}
+
+// ApplyDatabaseOp merges a peer's or a coordinator's DatabaseRegistryKey for
+// name into this node's registry, adopting it if and only if it exceeds the
+// local key: key.Dropped tombstones name at key.Generation through the same
+// path DropDatabase uses; otherwise it creates name live at key.Generation
+// through the same path CreateDatabase uses. changed reports whether key was
+// adopted.
+//
+// It is the one merge function both the 2PC COMMIT (ReplicationEngine.Commit)
+// and anti-entropy's database-set reconciliation use, and it is what the
+// PREPARE gate (prepareDatabaseOperation) fences for by refusing a stamp
+// below the local key.
+//
+// Proof that this converges every node's registry for name, and that a
+// dropped database stays dropped:
+//  1. Local keys only ever increase - this function is a no-op unless
+//     key > local - and the merge is a max over a total order
+//     (DatabaseRegistryKey.Compare), so every node's registry for name
+//     converges to the same key.
+//  2. The last op on name that committed was applied by at least Q nodes,
+//     2PC's write quorum.
+//  3. Any later op's quorum contains at least one of them. That node's
+//     PREPARE gate refuses a stamp below its local key, and at most N-Q < Q
+//     nodes are stale (behind the last committed op), so a stale coordinator
+//     can never gather a quorum to commit an op with a lower key.
+//  4. Hence each committed op's key exceeds every earlier committed op's key
+//     on name. The maximum over all committed ops is the last one to commit,
+//     so an older peer, whose key is lower, can never undo a drop by
+//     resurrecting an earlier live key.
+//  5. A CREATE that follows a DROP stamps generation+1, live - strictly above
+//     the tombstone's (generation, dropped) key - so re-creating a dropped
+//     database always wins the merge over the tombstone.
+//
+// Legacy rows and the pre-upgrade divergence: before generation stamps,
+// DROP DATABASE deleted the registry row outright, so
+// a node that was down for a pre-upgrade DROP still has name's row after
+// upgrading, migrated to (1, live) with Legacy=true
+// (migrateDatabaseRegistrySchema). That row is a real disagreement about
+// whether name exists, not a case this function's merge proof covers - no
+// quorum ever stamped (1, live) for it post-upgrade. Reconciling it as an
+// ordinary key would let the stale node's peers adopt it and create name
+// empty cluster-wide, spreading a divergence that used to stay on one node.
+// The caller (reconcileRegistryWithPeer, grpc/anti_entropy.go) is therefore
+// responsible for never calling this function with a legacy live entry when
+// the local registry has no row for name at all (DatabaseRegistryKey{0,
+// dropped}, i.e. this peer never had name): that is the one case where
+// applying the key would CREATE the database. Reconciliation does not
+// spread this divergence, and it does not repair it either - the node that missed the
+// DROP keeps the database until an operator drops it directly. A legacy row
+// stops being legacy the moment any post-upgrade CREATE or DROP - local or
+// merged - stamps name with a real generation
+// (createDatabaseAtGenerationLocked, dropDatabaseAtGenerationLocked), at
+// which point ordinary merge semantics apply to it from then on.
+func (dm *DatabaseManager) ApplyDatabaseOp(name string, key DatabaseRegistryKey) (bool, error) {
+	if name == SystemDatabaseName {
+		return false, fmt.Errorf("cannot apply a database operation to the system database")
+	}
+	if key.Dropped && name == DefaultDatabaseName {
+		return false, fmt.Errorf("cannot drop default database")
+	}
+
+	if local, err := dm.RegistryKey(name); err != nil {
+		return false, err
+	} else if key.Compare(local) <= 0 {
+		return false, nil
+	}
+
+	dm.lifecycleMu.Lock()
+	defer dm.lifecycleMu.Unlock()
+
+	// Re-check under lifecycleMu: a concurrent ApplyDatabaseOp, CreateDatabase
+	// or DropDatabase may have advanced the local key past key since the
+	// unlocked read above.
+	local, err := dm.registryKeyRow(name)
+	if err != nil {
+		return false, err
+	}
+	if key.Compare(local) <= 0 {
+		return false, nil
+	}
+
+	if key.Dropped {
+		if err := dm.dropDatabaseAtGenerationLocked(name, key.Generation); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	if err := dm.createDatabaseAtGenerationLocked(name, key.Generation); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // GetDatabase returns a database by name
@@ -833,7 +1302,7 @@ func (dm *DatabaseManager) openDetached(name string, metaStore MetaStore) (*Repl
 	).Scan(&dbPath); err != nil {
 		return nil, fmt.Errorf("failed to get database path: %w", err)
 	}
-	return NewReplicatedDatabase(filepath.Join(dm.dataDir, dbPath), dm.nodeID, dm.clock, metaStore)
+	return NewReplicatedDatabase(filepath.Join(dm.dataDir, dbPath), dm.nodeID, dm.clock, metaStore, dm.schemaVersionOptions(name)...)
 }
 
 // DatabasesAwaitingRestore lists the databases whose reattach after a
@@ -979,6 +1448,17 @@ func (dm *DatabaseManager) ImportExistingDatabases(importDir string) (int, error
 		// Extract database name (remove .db suffix)
 		dbName := strings.TrimSuffix(name, ".db")
 
+		// A name this cluster has dropped must never be silently resurrected
+		// by an import: the registry, not file presence, is the source of
+		// truth for whether a database exists (see DatabaseRegistryKey).
+		if key, err := dm.registryKeyRow(dbName); err != nil {
+			log.Warn().Err(err).Str("name", dbName).Msg("Failed to read database registry, skipping import")
+			continue
+		} else if key.Dropped && key.Generation > 0 {
+			log.Debug().Str("name", dbName).Msg("Database is tombstoned in the registry, skipping import")
+			continue
+		}
+
 		// Check if database already exists
 		dm.mu.RLock()
 		existingDB, exists := dm.databases[dbName]
@@ -1026,7 +1506,7 @@ func (dm *DatabaseManager) ImportExistingDatabases(importDir string) (int, error
 		}
 
 		// Open and register the database
-		db, err := NewReplicatedDatabase(dstPath, dm.nodeID, dm.clock, metaStore)
+		db, err := NewReplicatedDatabase(dstPath, dm.nodeID, dm.clock, metaStore, dm.schemaVersionOptions(dbName)...)
 		if err != nil {
 			log.Warn().Err(err).Str("name", dbName).Msg("Failed to open imported database")
 			metaStore.Close()
@@ -1274,27 +1754,21 @@ func (dm *DatabaseManager) checkpointDatabase(db *ReplicatedDatabase) error {
 // 1. Acquires write lock to block all writes
 // 2. Checkpoints all databases (TRUNCATE mode)
 // 3. Copies all database files to the target directory
-// 4. Reads schema versions for the copied databases
-// 5. Releases write lock
+// 4. Releases write lock
 //
 // The caller should stream from the target directory and clean it up when done.
 // This ensures snapshot consistency since files are copied atomically under lock.
 //
-// Schema versions are read from the system MetaStore in the same locked section
-// that produces the copied files, so the returned versions describe exactly the
-// bytes being handed back - not a value read by some earlier, separate call that
-// a concurrent DDL commit could have moved past. A caller that instead reads
-// schema versions via a different, earlier RPC (e.g. GetSnapshotInfo) can
-// observe a version that no longer matches the file bytes actually streamed
-// later; see SnapshotVersionsForRestore in the grpc package for how that is
-// resolved on the receiving side.
-func (dm *DatabaseManager) TakeSnapshotToDir(targetDir string) ([]SnapshotInfo, uint64, map[string]uint64, error) {
+// Schema versions no longer travel out of band with a snapshot: each
+// copied SQLite file carries its own __marmot_schema_version table, so the
+// receiver's restored file is authoritative on its own.
+func (dm *DatabaseManager) TakeSnapshotToDir(targetDir string) ([]SnapshotInfo, uint64, error) {
 	// Create target directory structure
 	if err := os.MkdirAll(targetDir, 0755); err != nil {
-		return nil, 0, nil, fmt.Errorf("failed to create snapshot directory: %w", err)
+		return nil, 0, fmt.Errorf("failed to create snapshot directory: %w", err)
 	}
 	if err := os.MkdirAll(filepath.Join(targetDir, "databases"), 0755); err != nil {
-		return nil, 0, nil, fmt.Errorf("failed to create databases directory: %w", err)
+		return nil, 0, fmt.Errorf("failed to create databases directory: %w", err)
 	}
 
 	// Acquire write lock to block all concurrent writes
@@ -1302,7 +1776,7 @@ func (dm *DatabaseManager) TakeSnapshotToDir(targetDir string) ([]SnapshotInfo, 
 	defer dm.mu.Unlock()
 
 	if err := dm.errIfDetachedLocked(); err != nil {
-		return nil, 0, nil, err
+		return nil, 0, err
 	}
 
 	var snapshots []SnapshotInfo
@@ -1312,21 +1786,21 @@ func (dm *DatabaseManager) TakeSnapshotToDir(targetDir string) ([]SnapshotInfo, 
 	systemTargetPath := filepath.Join(targetDir, SystemDatabaseName+".db")
 
 	if err := dm.checkpointDatabase(dm.systemDB); err != nil {
-		return nil, 0, nil, fmt.Errorf("failed to checkpoint system database: %w", err)
+		return nil, 0, fmt.Errorf("failed to checkpoint system database: %w", err)
 	}
 
 	if err := copyFile(systemDBPath, systemTargetPath); err != nil {
-		return nil, 0, nil, fmt.Errorf("failed to copy system database: %w", err)
+		return nil, 0, fmt.Errorf("failed to copy system database: %w", err)
 	}
 
 	info, err := os.Stat(systemTargetPath)
 	if err != nil {
-		return nil, 0, nil, fmt.Errorf("failed to stat system database copy: %w", err)
+		return nil, 0, fmt.Errorf("failed to stat system database copy: %w", err)
 	}
 
 	systemSHA256, err := calculateFileSHA256(systemTargetPath)
 	if err != nil {
-		return nil, 0, nil, fmt.Errorf("failed to hash system database: %w", err)
+		return nil, 0, fmt.Errorf("failed to hash system database: %w", err)
 	}
 
 	snapshots = append(snapshots, SnapshotInfo{
@@ -1380,43 +1854,13 @@ func (dm *DatabaseManager) TakeSnapshotToDir(targetDir string) ([]SnapshotInfo, 
 	// Get max committed transaction ID (without lock since we already hold it)
 	maxTxnID := dm.getMaxCommittedTxnIDLocked()
 
-	// Read schema versions in this same locked section, immediately after the
-	// files above were checkpointed and copied, so the versions describe
-	// exactly the bytes being handed back to the caller.
-	schemaVersions := dm.schemaVersionsLocked()
-
 	log.Info().
 		Int("databases", len(snapshots)).
 		Uint64("max_txn_id", maxTxnID).
 		Str("target_dir", targetDir).
 		Msg("Snapshot copied to directory")
 
-	return snapshots, maxTxnID, schemaVersions, nil
-}
-
-// schemaVersionsLocked reads all schema versions from the system MetaStore.
-// Caller must hold dm.mu. Returns an empty map when the versions cannot be
-// read - the snapshot itself is still usable, the receiver simply has nothing
-// to restore and falls back to whatever it already knew.
-func (dm *DatabaseManager) schemaVersionsLocked() map[string]uint64 {
-	metaStore := dm.systemDB.GetMetaStore()
-	if metaStore == nil {
-		return nil
-	}
-
-	stored, err := metaStore.GetAllSchemaVersions()
-	if err != nil {
-		log.Warn().Err(err).Msg("Failed to read schema versions for snapshot")
-		return nil
-	}
-
-	versions := make(map[string]uint64, len(stored))
-	for database, version := range stored {
-		if version > 0 {
-			versions[database] = uint64(version)
-		}
-	}
-	return versions
+	return snapshots, maxTxnID, nil
 }
 
 // TakeSnapshotForDatabase creates a snapshot for a single database.
@@ -1535,129 +1979,6 @@ func (dm *DatabaseManager) getMaxCommittedTxnIDLocked() uint64 {
 // GetDataDir returns the data directory path
 func (dm *DatabaseManager) GetDataDir() string {
 	return dm.dataDir
-}
-
-// ReplicationState tracks replication progress with a peer node per database
-type ReplicationState struct {
-	PeerNodeID        uint64
-	DatabaseName      string
-	LastAppliedTxnID  uint64
-	LastAppliedTSWall int64
-	LastAppliedTSLog  int32
-	LastSyncTime      int64
-	SyncStatus        string // SYNCED, CATCHING_UP, FAILED
-}
-
-// GetReplicationState gets the replication state for a specific peer and database
-func (dm *DatabaseManager) GetReplicationState(peerNodeID uint64, database string) (*ReplicationState, error) {
-	dm.mu.RLock()
-	defer dm.mu.RUnlock()
-
-	db, ok := dm.databases[database]
-	if !ok {
-		return nil, fmt.Errorf("database %s not found", database)
-	}
-
-	metaStore := db.GetMetaStore()
-	if metaStore == nil {
-		return nil, fmt.Errorf("database %s has no meta store", database)
-	}
-
-	rec, err := metaStore.GetReplicationState(peerNodeID, database)
-	if err != nil {
-		return nil, err
-	}
-	if rec == nil {
-		// No replication state yet for this peer/database combination
-		return nil, nil
-	}
-
-	return &ReplicationState{
-		PeerNodeID:        rec.PeerNodeID,
-		DatabaseName:      rec.DatabaseName,
-		LastAppliedTxnID:  rec.LastAppliedTxnID,
-		LastAppliedTSWall: rec.LastAppliedTSWall,
-		LastAppliedTSLog:  rec.LastAppliedTSLogical,
-		LastSyncTime:      rec.LastSyncTime,
-		SyncStatus:        rec.SyncStatus.String(),
-	}, nil
-}
-
-// UpdateReplicationState updates or inserts replication state for a peer and database
-func (dm *DatabaseManager) UpdateReplicationState(state *ReplicationState) error {
-	dm.mu.RLock()
-	defer dm.mu.RUnlock()
-
-	db, ok := dm.databases[state.DatabaseName]
-	if !ok {
-		return fmt.Errorf("database %s not found", state.DatabaseName)
-	}
-
-	metaStore := db.GetMetaStore()
-	if metaStore == nil {
-		return fmt.Errorf("database %s has no meta store", state.DatabaseName)
-	}
-
-	return metaStore.UpdateReplicationState(
-		state.PeerNodeID,
-		state.DatabaseName,
-		state.LastAppliedTxnID,
-		hlc.Timestamp{WallTime: state.LastAppliedTSWall, Logical: state.LastAppliedTSLog},
-	)
-}
-
-// GetAllReplicationStates returns replication state for all known peers across all databases
-func (dm *DatabaseManager) GetAllReplicationStates() ([]ReplicationState, error) {
-	dm.mu.RLock()
-	defer dm.mu.RUnlock()
-
-	var allStates []ReplicationState
-
-	// Query each database's MetaStore for its replication state
-	for _, mdb := range dm.databases {
-		metaStore := mdb.GetMetaStore()
-		if metaStore == nil {
-			continue // System DB has no MetaStore
-		}
-
-		states, err := metaStore.GetAllReplicationStates()
-		if err != nil {
-			continue
-		}
-
-		for _, rec := range states {
-			allStates = append(allStates, ReplicationState{
-				PeerNodeID:        rec.PeerNodeID,
-				DatabaseName:      rec.DatabaseName,
-				LastAppliedTxnID:  rec.LastAppliedTxnID,
-				LastAppliedTSWall: rec.LastAppliedTSWall,
-				LastAppliedTSLog:  rec.LastAppliedTSLogical,
-				LastSyncTime:      rec.LastSyncTime,
-				SyncStatus:        rec.SyncStatus.String(),
-			})
-		}
-	}
-
-	return allStates, nil
-}
-
-// GetMinAppliedTxnID returns the minimum last_applied_txn_id across all peers for a specific database
-// This is used to determine the GC safe point - we can only GC transactions that all peers have applied
-func (dm *DatabaseManager) GetMinAppliedTxnID(database string) (uint64, error) {
-	dm.mu.RLock()
-	defer dm.mu.RUnlock()
-
-	db, ok := dm.databases[database]
-	if !ok {
-		return 0, fmt.Errorf("database %s not found", database)
-	}
-
-	metaStore := db.GetMetaStore()
-	if metaStore == nil {
-		return 0, nil // System DB has no replication state
-	}
-
-	return metaStore.GetMinAppliedTxnID(database)
 }
 
 // GetMaxTxnID returns the maximum COMMITTED transaction ID in a database

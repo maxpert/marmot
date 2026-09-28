@@ -59,9 +59,9 @@ func setupLostPinnedState(t *testing.T) *lostPinnedStateSetup {
 	const dbName = "lostpinned"
 	require.NoError(t, dbMgr.CreateDatabase(dbName))
 
-	systemDB, err := dbMgr.GetDatabase(db.SystemDatabaseName)
+	_, err = dbMgr.GetDatabase(db.SystemDatabaseName)
 	require.NoError(t, err)
-	schemaVersionMgr := db.NewSchemaVersionManager(systemDB.GetMetaStore())
+	schemaVersionMgr := db.NewSchemaVersionManager(dbMgr)
 
 	nodeProvider := coordinator.NewMockNodeProvider([]uint64{1})
 	// A claim participant counts the cluster as the claimant does.

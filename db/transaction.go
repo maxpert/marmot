@@ -33,17 +33,12 @@ type Transaction struct {
 	mu                    sync.RWMutex
 }
 
-// MinAppliedTxnIDFunc returns the minimum last_applied_txn_id across all peers for a database
-// Used for GC coordination to prevent deleting logs needed by lagging peers
-type MinAppliedTxnIDFunc func(database string) (uint64, error)
-
-// ClusterMinWatermarkFunc returns the minimum applied seq_num across all alive nodes
-// Used for GC coordination via gossip protocol (no extra RPC calls needed)
-type ClusterMinWatermarkFunc func() uint64
-
-// RefreshReplicationStatesFunc refreshes peer replication states before GC decisions
-// This queries all alive peers and updates local state, ensuring fresh watermarks
-type RefreshReplicationStatesFunc func(ctx context.Context) error
+// GCSafePositionFunc returns the highest LogPosition below which GC may
+// delete committed log entries (the min of every current member's
+// consumed position, R[self,m,d], in this database's log), and whether
+// that position is known yet. Absent, or returning false, GC treats
+// nothing as safe except entries past max retention.
+type GCSafePositionFunc func() (LogPosition, bool)
 
 type VectorCDCNotifier interface {
 	ApplyCommittedVectorCDC(ctx context.Context, database string, txnID, seqNum uint64, entries []common.CDCEntry) error
@@ -52,28 +47,50 @@ type VectorCDCNotifier interface {
 // TransactionManager manages distributed transactions
 // All transaction state is stored in MetaStore (PebbleDB) - no in-memory caching
 type TransactionManager struct {
-	db                       *sql.DB   // User database for data operations
-	metaStore                MetaStore // MetaStore for transaction metadata
-	clock                    *hlc.Clock
-	schemaCache              *SchemaCache // Schema cache for table metadata
-	mu                       sync.RWMutex
-	gcInterval               time.Duration
-	gcThreshold              time.Duration
-	gcMinRetention           time.Duration // Minimum retention for replication
-	gcMaxRetention           time.Duration // Force GC after this duration
-	heartbeatTimeout         time.Duration
-	stopGC                   chan struct{}
-	gcDone                   chan struct{}
-	gcRunning                bool
-	databaseName             string                       // Name of database this manager manages
-	getMinAppliedTxnID       MinAppliedTxnIDFunc          // Callback for GC coordination
-	getClusterMinWatermark   ClusterMinWatermarkFunc      // Callback for GC via gossip watermark
-	refreshReplicationStates RefreshReplicationStatesFunc // Callback to refresh watermarks before GC
-	batchCommitter           *SQLiteBatchCommitter        // SQLite write batcher (nil if disabled)
-	notifier                 CDCNotifier                  // Injected, can be nil
-	vectorCDCNotifier        VectorCDCNotifier            // Injected, can be nil
-	autoIncClaimStore        *AutoIncClaimStore           // AUTO_INCREMENT claim store; always backed by the system database
+	db                  *sql.DB   // User database for data operations
+	metaStore           MetaStore // MetaStore for transaction metadata
+	clock               *hlc.Clock
+	schemaCache         *SchemaCache // Schema cache for table metadata
+	mu                  sync.RWMutex
+	gcInterval          time.Duration
+	gcThreshold         time.Duration
+	gcMinRetention      time.Duration // Minimum retention for replication
+	gcMaxRetention      time.Duration // Force GC after this duration
+	heartbeatTimeout    time.Duration
+	stopGC              chan struct{}
+	gcDone              chan struct{}
+	gcRunning           bool
+	databaseName        string                     // Name of database this manager manages
+	gcSafePosition      GCSafePositionFunc         // Callback for GC's safe deletion position
+	batchCommitter      *SQLiteBatchCommitter      // SQLite write batcher (nil if disabled)
+	notifier            CDCNotifier                // Injected, can be nil
+	vectorCDCNotifier   VectorCDCNotifier          // Injected, can be nil
+	autoIncClaimStore   *AutoIncClaimStore         // AUTO_INCREMENT claim store; always backed by the system database
+	schemaVersionBumped func(uint64)               // Injected; told the new value whenever a non-DML commit bumps __marmot_schema_version
+	appliedMarker       func(uint64) (bool, error) // Injected; reports whether __marmot_applied_txn holds a txn id (SetAppliedMarkerCheck)
+
+	// commitInProgress serializes CommitTransaction across *Transaction
+	// objects that name the same txn id: txn id -> a channel closed when
+	// that id's commit attempt ends. A locally PREPARED transaction the log
+	// puller commits through the normal 2PC path can then never race a COMMIT
+	// RPC for the same id into a double apply. See CommitTransaction.
+	commitInProgress sync.Map
+
+	// txnIDLocks gates BeginTransactionWithID and
+	// ReplicatedDatabase.LogReplayedTxn against each other for the same txn
+	// id, so a local PREPARE's begin and a replay of the same txn id
+	// can never interleave. See lockTxnID's doc comment.
+	txnIDLocks [txnIDLockStripes]sync.Mutex
+
+	// failBeforeFinalizeForTest stops CommitTransaction after the data and
+	// marker are committed and before the commit record: the crash window a
+	// test drives. Only tests set it.
+	failBeforeFinalizeForTest bool
 }
+
+// errInjectedCrashBeforeFinalize is what CommitTransaction returns when a
+// test injects a crash before the commit record (failBeforeFinalizeForTest).
+var errInjectedCrashBeforeFinalize = errors.New("injected crash before the commit record")
 
 // NewTransactionManager creates a new transaction manager
 func NewTransactionManager(db *sql.DB, metaStore MetaStore, clock *hlc.Clock, schemaCache *SchemaCache) *TransactionManager {
@@ -121,28 +138,15 @@ func (tm *TransactionManager) SetDatabaseName(name string) {
 	tm.databaseName = name
 }
 
-// SetMinAppliedTxnIDFunc sets the callback for querying minimum applied txn_id across peers
-// Used for GC safe point calculation
-func (tm *TransactionManager) SetMinAppliedTxnIDFunc(fn MinAppliedTxnIDFunc) {
+// SetGCSafePositionFunc sets the callback GC uses to learn the safe
+// deletion position. It replaces SetMinAppliedTxnIDFunc,
+// SetClusterMinWatermarkFunc and SetRefreshReplicationStatesFunc, whose
+// txn-id/seq-num watermarks could not tell GC which log positions every
+// member had pulled (see CleanupOldTransactionRecords).
+func (tm *TransactionManager) SetGCSafePositionFunc(fn GCSafePositionFunc) {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
-	tm.getMinAppliedTxnID = fn
-}
-
-// SetClusterMinWatermarkFunc sets the callback for getting cluster minimum watermark
-// This is obtained from the gossip protocol without extra RPC calls
-func (tm *TransactionManager) SetClusterMinWatermarkFunc(fn ClusterMinWatermarkFunc) {
-	tm.mu.Lock()
-	defer tm.mu.Unlock()
-	tm.getClusterMinWatermark = fn
-}
-
-// SetRefreshReplicationStatesFunc sets the callback for refreshing peer replication states
-// This is called before GC Phase 2 to ensure watermarks are fresh before deletion decisions
-func (tm *TransactionManager) SetRefreshReplicationStatesFunc(fn RefreshReplicationStatesFunc) {
-	tm.mu.Lock()
-	defer tm.mu.Unlock()
-	tm.refreshReplicationStates = fn
+	tm.gcSafePosition = fn
 }
 
 // SetNotifier sets the CDC notifier for signaling after commits
@@ -169,6 +173,25 @@ func (tm *TransactionManager) SetVectorCDCNotifier(notifier VectorCDCNotifier) {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 	tm.vectorCDCNotifier = notifier
+}
+
+// VectorCDCNotifier returns the injected vector CDC notifier, or nil if none
+// is configured. Used by db/replay_apply.go to apply vector-control rows and
+// committed vector CDC for a replayed transaction.
+func (tm *TransactionManager) VectorCDCNotifier() VectorCDCNotifier {
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+	return tm.vectorCDCNotifier
+}
+
+// SetSchemaVersionBumped injects the callback applyNonDMLIntents notifies,
+// with the new value, whenever it bumps this database's
+// __marmot_schema_version. Wired by NewReplicatedDatabase to update
+// its own cached atomic; nil is fine and just means nothing is told.
+func (tm *TransactionManager) SetSchemaVersionBumped(fn func(uint64)) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	tm.schemaVersionBumped = fn
 }
 
 // SetAutoIncClaimStore injects the AUTO_INCREMENT claim store used by
@@ -211,13 +234,88 @@ func (tm *TransactionManager) BeginTransaction(nodeID uint64) (*Transaction, err
 	return tm.BeginTransactionWithID(txnID, nodeID, startTS)
 }
 
+// txnIDLockStripes is the stripe count for TransactionManager.txnIDLocks: a
+// power of two so a stripe index is a cheap mask, sized well above the
+// expected number of transactions racing this window concurrently.
+const txnIDLockStripes = 64
+
+// lockTxnID acquires the stripe of txnIDLocks that guards txnID and returns
+// a function that releases it. Held by BeginTransactionWithID around
+// tm.metaStore.BeginTransaction, and by ReplicatedDatabase.LogReplayedTxn
+// across its whole body, so a local PREPARE's begin can never interleave
+// with a replay of the same txn id: either the replay logs the txn
+// completely first - LogReplayedTxn's own COMMITTED check then makes the
+// later begin observe it - or the begin runs first and the replay's status
+// check (or its caller's PENDING refusal) resolves the race instead.
+func (tm *TransactionManager) lockTxnID(txnID uint64) (unlock func()) {
+	stripe := &tm.txnIDLocks[txnID%txnIDLockStripes]
+	stripe.Lock()
+	return stripe.Unlock
+}
+
+// ErrTxnAlreadyCommitted refuses to begin a transaction id that this node
+// already holds COMMITTED or already applied (see BeginTransactionWithID).
+var ErrTxnAlreadyCommitted = errors.New("transaction already committed on this node")
+
+// SetAppliedMarkerCheck installs the read-only lookup of the database's
+// applied-txn marker that BeginTransactionWithID consults. The owning
+// ReplicatedDatabase installs one reading through its read pool, so the check
+// never waits on the single SQLite writer.
+func (tm *TransactionManager) SetAppliedMarkerCheck(check func(txnID uint64) (bool, error)) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	tm.appliedMarker = check
+}
+
+// refuseCommittedTxnID returns ErrTxnAlreadyCommitted when txnID's local
+// record is COMMITTED or, lacking a record, its applied-txn marker exists.
+func (tm *TransactionManager) refuseCommittedTxnID(txnID uint64) error {
+	rec, err := tm.metaStore.GetTransaction(txnID)
+	if err != nil {
+		return fmt.Errorf("check transaction %d status: %w", txnID, err)
+	}
+	if rec != nil {
+		if rec.Status == TxnStatusCommitted {
+			return fmt.Errorf("transaction %d: %w", txnID, ErrTxnAlreadyCommitted)
+		}
+		return nil
+	}
+	tm.mu.RLock()
+	check := tm.appliedMarker
+	tm.mu.RUnlock()
+	if check == nil {
+		return nil
+	}
+	applied, err := check(txnID)
+	if err != nil {
+		return fmt.Errorf("check transaction %d applied marker: %w", txnID, err)
+	}
+	if applied {
+		return fmt.Errorf("transaction %d: %w", txnID, ErrTxnAlreadyCommitted)
+	}
+	return nil
+}
+
 // BeginTransactionWithID starts a distributed transaction with a specific ID
 // Used by coordinator replication to ensure consistent txn_id across cluster
 // Transaction state is persisted to MetaStore only - no in-memory caching
+//
+// A txn id this node already holds COMMITTED, or whose applied-txn marker its
+// database already carries, is refused with ErrTxnAlreadyCommitted: it was
+// pulled from a peer's log (or arrived in a restored snapshot) before this
+// late PREPARE, and beginning it again would overwrite the committed record
+// with a PENDING one whose abort or commit would corrupt the log entry.
 func (tm *TransactionManager) BeginTransactionWithID(txnID, nodeID uint64, startTS hlc.Timestamp) (*Transaction, error) {
-	// Persist transaction record to MetaStore
-	if err := tm.metaStore.BeginTransaction(txnID, nodeID, startTS); err != nil {
-		return nil, fmt.Errorf("failed to create transaction record: %w", err)
+	unlock := tm.lockTxnID(txnID)
+	err := tm.refuseCommittedTxnID(txnID)
+	if err == nil {
+		if err = tm.metaStore.BeginTransaction(txnID, nodeID, startTS); err != nil {
+			err = fmt.Errorf("failed to create transaction record: %w", err)
+		}
+	}
+	unlock()
+	if err != nil {
+		return nil, err
 	}
 
 	// Return a transient object for use during this request
@@ -288,7 +386,29 @@ func (tm *TransactionManager) WriteIntent(txn *Transaction, intentType IntentTyp
 // CommitTransaction commits the transaction.
 // DML: Get CDC entries → apply via batch committer → cleanup
 // DDL: Flush pending DML → get intents → apply DDL → cleanup
+//
+// Concurrent-commit guard: commitInProgress serializes commits of the same
+// txn id across distinct *Transaction objects (txn.mu only guards one
+// object, not the id) - the log puller commits a locally prepared
+// transaction through this path (DatabaseManager.CommitLocallyPrepared),
+// which can race the COMMIT RPC, or the coordinator's own local commit, for
+// the same id. A second caller waits for the first to finish, then re-reads
+// the authoritative status from MetaStore - not just txn.Status, which an
+// independently reconstructed *Transaction object still shows as PENDING -
+// and gets ErrTxnAlreadyCommitted, without redoing any of the apply, if the
+// first committed it (MarkSQLiteTxnApplied is INSERT OR IGNORE, so its own
+// idempotence would otherwise mask a duplicate finalizeCommit writing a
+// second log entry).
 func (tm *TransactionManager) CommitTransaction(txn *Transaction) error {
+	return tm.CommitTransactionAfter(txn, nil)
+}
+
+// CommitTransactionAfter is CommitTransaction with before run first, under
+// the concurrent-commit guard and after the status check, so work that must
+// happen exactly once before the commit (applying an AUTO_INCREMENT claim)
+// never runs for a transaction another caller already committed. An error
+// from before aborts the commit and is returned as is.
+func (tm *TransactionManager) CommitTransactionAfter(txn *Transaction, before func() error) error {
 	txn.mu.Lock()
 	defer txn.mu.Unlock()
 
@@ -296,10 +416,25 @@ func (tm *TransactionManager) CommitTransaction(txn *Transaction) error {
 		return fmt.Errorf("transaction %d is not pending", txn.ID)
 	}
 
+	release, err := tm.acquireCommit(txn.ID)
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	if before != nil {
+		if err := before(); err != nil {
+			return err
+		}
+	}
+
 	// Get CDC entries - determines DML vs DDL path
 	cdcEntries, err := tm.metaStore.GetIntentEntries(txn.ID)
 	if err != nil {
 		return fmt.Errorf("failed to load CDC entries: %w", err)
+	}
+	if err := tm.verifyPreparedPayload(txn.ID, len(cdcEntries)); err != nil {
+		return err
 	}
 
 	// Calculate commit timestamp
@@ -337,17 +472,24 @@ func (tm *TransactionManager) CommitTransaction(txn *Transaction) error {
 			return fmt.Errorf("failed to fetch write intents: %w", err)
 		}
 
-		if err := tm.applyNonDMLIntents(txn.ID, intents); err != nil {
-			return err
-		}
-		// Write non-DML statements to CDC storage for streaming replication
+		// The captured rows are written before the SQLite commit that writes
+		// the marker: a crash after that commit then leaves rows for
+		// repairAppliedTxnMetadata to finish the commit record from at the
+		// next open, so the applied DDL still enters this node's log.
 		if err := tm.writeNonDMLToCDC(txn.ID, intents); err != nil {
 			return err
 		}
 		if err := tm.metaStore.SealCapturedRows(txn.ID); err != nil {
 			return fmt.Errorf("failed to seal CDC rows: %w", err)
 		}
+		if err := tm.applyNonDMLIntents(txn.ID, txn.CommitTS, intents); err != nil {
+			return err
+		}
 		txn.Statements = tm.rebuildStatementsFromCDC(nil, intents)
+	}
+
+	if tm.failBeforeFinalizeForTest {
+		return errInjectedCrashBeforeFinalize
 	}
 
 	// Finalize commit in MetaStore
@@ -370,13 +512,86 @@ func (tm *TransactionManager) CommitTransaction(txn *Transaction) error {
 	return nil
 }
 
-// ErrPreparedRowsMissing refuses the COMMIT of a transaction that names DML
-// rows whose captured images are gone. Every such row was captured at PREPARE
-// (createDMLIntent refuses a DML row without its image), so finding none means
-// something discarded them - the stale-transaction GC aborting the transaction
-// while this COMMIT was under way, or a recovery that dropped them - and
-// committing would ACK a write this node never applied.
+// acquireCommit takes txnID's commitInProgress entry, waiting for any
+// commit of the same id already under way to finish first, and re-reads its
+// authoritative status (see CommitTransaction's concurrent-commit guard):
+// ErrTxnAlreadyCommitted if it is COMMITTED, an error if it is otherwise not
+// PENDING. The caller runs release once its commit attempt ends.
+func (tm *TransactionManager) acquireCommit(txnID uint64) (release func(), err error) {
+	done := make(chan struct{})
+	for {
+		prev, busy := tm.commitInProgress.LoadOrStore(txnID, done)
+		if !busy {
+			break
+		}
+		<-prev.(chan struct{})
+	}
+	release = func() {
+		tm.commitInProgress.Delete(txnID)
+		close(done)
+	}
+	rec, err := tm.metaStore.GetTransaction(txnID)
+	switch {
+	case err != nil:
+		err = fmt.Errorf("read transaction %d status: %w", txnID, err)
+	case rec != nil && rec.Status == TxnStatusCommitted:
+		err = fmt.Errorf("transaction %d: %w", txnID, ErrTxnAlreadyCommitted)
+	case rec == nil || rec.Status != TxnStatusPending:
+		err = fmt.Errorf("transaction %d is not pending", txnID)
+	}
+	if err != nil {
+		release()
+		return nil, err
+	}
+	return release, nil
+}
+
+// ErrPreparedRowsMissing refuses the COMMIT of a transaction whose prepared
+// payload is gone: DML rows its statements name, or fewer captured rows or
+// persisted intents than its durable prepare recorded (PreparedPayload).
+// Every such row and intent was written at PREPARE, so finding fewer means
+// something discarded them - a stale-transaction abort, or a recovery that
+// dropped them - and committing would ACK a write this node never applied.
 var ErrPreparedRowsMissing = errors.New("prepared DML rows are gone; refusing to commit nothing")
+
+// verifyPreparedPayload refuses, with ErrPreparedRowsMissing, a commit of
+// txnID when what it finds - rows captured rows and its persisted intents -
+// differs from what its durable prepare recorded. A transaction with no such
+// record (never durably prepared) is not checked. The check reads the
+// durable record, not the Statements of the *Transaction being committed,
+// which a commit that reconstructed the transaction (the log puller, a
+// COMMIT RPC) never has.
+func (tm *TransactionManager) verifyPreparedPayload(txnID uint64, rows int) error {
+	payload, found, err := tm.metaStore.PreparedPayload(txnID)
+	if err != nil {
+		return fmt.Errorf("read prepared payload of transaction %d: %w", txnID, err)
+	}
+	if !found {
+		return nil
+	}
+	if uint64(rows) != payload.Rows {
+		return fmt.Errorf("transaction %d: %w: prepared %d captured rows, found %d",
+			txnID, ErrPreparedRowsMissing, payload.Rows, rows)
+	}
+	if payload.Intents == 0 {
+		return nil
+	}
+	intents, err := tm.metaStore.GetIntentsByTxn(txnID)
+	if err != nil {
+		return fmt.Errorf("failed to fetch write intents: %w", err)
+	}
+	var persisted uint64
+	for _, intent := range intents {
+		if intent.IntentType != IntentTypeDML {
+			persisted++
+		}
+	}
+	if persisted != payload.Intents {
+		return fmt.Errorf("transaction %d: %w: prepared %d intents, found %d",
+			txnID, ErrPreparedRowsMissing, payload.Intents, persisted)
+	}
+	return nil
+}
 
 // statementsNamePreparedRows reports whether statements carry a DML row that
 // PREPARE captured: a row change with an intent key. An INSERT without one
@@ -525,92 +740,222 @@ func (tm *TransactionManager) applyCDCEntries(txnID uint64, commitTS hlc.Timesta
 	return nil
 }
 
-// applyNonDMLIntents executes DDL and LOAD DATA statements from write intents.
-func (tm *TransactionManager) applyNonDMLIntents(txnID uint64, intents []*WriteIntentRecord) error {
-	nonDMLIntents := make([]*WriteIntentRecord, 0, len(intents))
+// nonDMLIntentKind classifies one non-DML write intent by what its data
+// snapshot decodes as: vector-control metadata, a LOAD DATA payload, or (the
+// default) a raw DDL statement.
+type nonDMLIntentKind struct {
+	intent *WriteIntentRecord
+	vector *common.VectorIndexChange
+	load   *LoadDataSnapshot
+}
+
+// classifyNonDMLIntents filters intents down to the DDL-carrying ones (the
+// same filter applyNonDMLIntents has always used) and decodes each one's
+// kind, in CreatedAt order.
+func classifyNonDMLIntents(intents []*WriteIntentRecord) []nonDMLIntentKind {
+	filtered := make([]*WriteIntentRecord, 0, len(intents))
 	for _, intent := range intents {
 		if intent.IntentType == IntentTypeDDL && (intent.SQLStatement != "" || len(intent.DataSnapshot) > 0) {
-			nonDMLIntents = append(nonDMLIntents, intent)
+			filtered = append(filtered, intent)
 		}
 	}
-
-	sort.Slice(nonDMLIntents, func(i, j int) bool {
-		return nonDMLIntents[i].CreatedAt < nonDMLIntents[j].CreatedAt
+	sort.Slice(filtered, func(i, j int) bool {
+		return filtered[i].CreatedAt < filtered[j].CreatedAt
 	})
 
-	var change SchemaChange
-	for _, intent := range nonDMLIntents {
+	kinds := make([]nonDMLIntentKind, 0, len(filtered))
+	for _, intent := range filtered {
 		var vectorChange common.VectorIndexChange
 		if err := DeserializeData(intent.DataSnapshot, &vectorChange); err == nil && vectorChange.Action != 0 {
-			controlApplier, ok := tm.vectorCDCNotifier.(interface {
-				ApplyVectorControl(context.Context, common.VectorIndexChange) error
-			})
-			if !ok {
-				return fmt.Errorf("vector index control %s: vector manager not configured", vectorChange.IndexName)
-			}
-			if err := controlApplier.ApplyVectorControl(context.Background(), vectorChange); err != nil {
-				return fmt.Errorf("failed to apply vector index control: %w", err)
-			}
+			kinds = append(kinds, nonDMLIntentKind{intent: intent, vector: &vectorChange})
 			continue
 		}
 		var loadSnap LoadDataSnapshot
 		if err := DeserializeData(intent.DataSnapshot, &loadSnap); err == nil && loadSnap.Type == int(protocol.StatementLoadData) {
-			if _, err := ApplyLoadData(tm.db, loadSnap.SQL, loadSnap.Data); err != nil {
-				return fmt.Errorf("failed to execute LOAD DATA statement: %w", err)
-			}
-			log.Debug().Uint64("txn_id", txnID).Msg("LOAD DATA statement executed")
+			kinds = append(kinds, nonDMLIntentKind{intent: intent, load: &loadSnap})
 			continue
 		}
-		if err := tm.execDDL(&change, intent); err != nil {
-			return err
-		}
-		log.Debug().Uint64("txn_id", txnID).Str("sql", intent.SQLStatement).Msg("DDL statement executed")
+		kinds = append(kinds, nonDMLIntentKind{intent: intent})
 	}
-	if change.Empty() {
+	return kinds
+}
+
+// applyNonDMLIntents applies a non-DML transaction's DDL, LOAD DATA and
+// vector-control intents, atomically with the applied-txn marker and (when
+// the txn carries real DDL) the schema-version bump.
+//
+// Exactly-once / idempotence, per effect:
+//   - DDL, LOAD DATA, the schema-version bump and the marker all commit in one
+//     SQLite transaction: a crash anywhere before commit leaves none of them
+//     applied, and replay (db/replay_apply.go) sees no marker and reapplies
+//     the whole txn from scratch. A crash after commit is a normal completed
+//     commit.
+//   - Vector control (CREATE/DROP/CHECKPOINT/REINDEX on __marmot_vector_indexes)
+//     is not SQLite and cannot share that transaction, so it is applied first,
+//     outside it. CREATE, DROP and CHECKPOINT are no-ops on repeat and REINDEX
+//     is a repeatable rebuild (VectorIndexManager.ApplyVectorControl), so a
+//     crash between applying the control and committing the marker tx just
+//     re-runs it once on the next apply - replay is gated on the marker
+//     before the control runs (db/replay_apply.go).
+//   - A claim-only txn (an AUTO_INCREMENT range claim, which has no DDL/LOAD
+//     DATA/vector intents at all) writes NO marker here and opens no SQLite
+//     tx at all, as explained below.
+//
+// A claim-only commit writes no marker because it cannot take the user
+// database's writer: ReplicationEngine.Commit calls this after
+// AutoIncClaimStore.ApplyClaims for every claim-carrying txn, including the
+// LLDAP shape where a pinned session already holds the user database's one
+// SQLite writer (_txlock=immediate) for the whole surrounding transaction.
+// __marmot_applied_txn lives in that same user database file, so writing it
+// needs that same writer - which would self-deadlock the claim behind the
+// pinned session that is waiting on it, defeating the entire reason
+// AutoIncClaimStore lives in the system database (a separate file with its
+// own writer) rather than the user database
+// (TestClaimCompletesWhilePinnedSessionOpen pins this).
+//
+// Skipping it is safe: a claim-only txn still gets a local log entry
+// (finalizeCommit writes its commit record), so a peer's anti-entropy, and
+// this node's own restore re-apply, will find it without a marker and replay
+// it. That replay is a zero-row ReplayTxn: ApplyReplayedTxn only writes the
+// marker, off this commit path, and never re-applies the claim - claim
+// payloads never travel in CDC, and a bystander's floor comes from the claim
+// protocol's merged base (AutoIncHoldTable, grpc.RunAutoIncBaseMerge), not
+// from replay. The marker is therefore bookkeeping for the pull diff only,
+// and writing it later, once, is equivalent to writing it here.
+func (tm *TransactionManager) applyNonDMLIntents(txnID uint64, commitTS hlc.Timestamp, intents []*WriteIntentRecord) error {
+	kinds := classifyNonDMLIntents(intents)
+	if len(kinds) == 0 {
+		// Claim-only (or otherwise empty): no marker, no SQLite tx. See the
+		// doc comment for why.
 		return nil
 	}
 
-	// Reported before the schema cache reload below makes the new definitions
-	// visible to queries, so no insert into a new incarnation can take an id
-	// from a range claimed for an old one.
-	tm.endIncarnations(&change)
+	if err := tm.applyNonDMLVectorControl(kinds); err != nil {
+		return err
+	}
 
-	// Reload schema cache after DDL operations. A failed reload leaves the
-	// cache stale, so subsequent preupdate hooks would silently drop CDC data
-	// for any column the DDL added/changed - fail the DDL apply instead of
-	// swallowing the error.
-	if tm.schemaCache != nil {
+	ctx := context.Background()
+	tx, err := tm.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin non-DML transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	change, hasDDL, err := tm.execNonDMLIntentsInTx(ctx, tx, txnID, kinds)
+	if err != nil {
+		return err
+	}
+
+	var newSchemaVersion uint64
+	if hasDDL {
+		newSchemaVersion, err = bumpSchemaVersionInTx(tx)
+		if err != nil {
+			return fmt.Errorf("failed to bump schema version (txn %d): %w", txnID, err)
+		}
+	}
+
+	if err := MarkSQLiteTxnApplied(tx, txnID, commitTS); err != nil {
+		return err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit non-DML transaction: %w", err)
+	}
+
+	return tm.afterNonDMLCommit(txnID, hasDDL, newSchemaVersion, &change)
+}
+
+// applyNonDMLVectorControl applies every vector-index control intent in
+// kinds. It runs first, outside SQLite - vector control is not SQLite and
+// cannot share the tx applyNonDMLIntents opens afterward - matching the order
+// applyNonDMLIntents's doc comment describes and depends on.
+func (tm *TransactionManager) applyNonDMLVectorControl(kinds []nonDMLIntentKind) error {
+	for _, k := range kinds {
+		if k.vector == nil {
+			continue
+		}
+		controlApplier, ok := tm.vectorCDCNotifier.(interface {
+			ApplyVectorControl(context.Context, common.VectorIndexChange) error
+		})
+		if !ok {
+			return fmt.Errorf("vector index control %s: vector manager not configured", k.vector.IndexName)
+		}
+		if err := controlApplier.ApplyVectorControl(context.Background(), *k.vector); err != nil {
+			return fmt.Errorf("failed to apply vector index control: %w", err)
+		}
+	}
+	return nil
+}
+
+// execNonDMLIntentsInTx runs every non-vector intent in kinds inside tx
+// (LOAD DATA and DDL, vector control having already run outside it), seeds
+// AUTO_INCREMENT bases for any DDL this txn ran, and reports the accumulated
+// schema change and whether any DDL ran.
+func (tm *TransactionManager) execNonDMLIntentsInTx(ctx context.Context, tx *sql.Tx, txnID uint64, kinds []nonDMLIntentKind) (SchemaChange, bool, error) {
+	var change SchemaChange
+	hasDDL := false
+	for _, k := range kinds {
+		switch {
+		case k.vector != nil:
+			continue // already applied above
+		case k.load != nil:
+			if _, err := ApplyLoadDataInTx(tx, k.load.SQL, k.load.Data); err != nil {
+				return change, false, fmt.Errorf("failed to execute LOAD DATA statement: %w", err)
+			}
+			log.Debug().Uint64("txn_id", txnID).Msg("LOAD DATA statement executed")
+		default:
+			if err := change.Exec(ctx, tx, k.intent.SQLStatement, k.intent.TableName, k.intent.NodeID); err != nil {
+				return change, false, fmt.Errorf("failed to execute DDL statement: %w", err)
+			}
+			hasDDL = true
+			log.Debug().Uint64("txn_id", txnID).Str("sql", k.intent.SQLStatement).Msg("DDL statement executed")
+		}
+	}
+
+	if !change.Empty() {
+		// Reported before the schema cache reload below makes the new
+		// definitions visible to queries, so no insert into a new incarnation
+		// can take an id from a range claimed for an old one.
+		tm.endIncarnations(&change)
+
+		// Seed __marmot__autoinc for every table this DDL tagged
+		// AUTO_INCREMENT, reading floors through tx (same as
+		// FinishReplayedSchemaChange does for replay) so the seed sees
+		// exactly the rows this transaction's own DDL left behind.
+		if err := tm.seedSchemaChange(tx, &change); err != nil {
+			return change, false, fmt.Errorf("failed to seed auto-increment base after DDL (txn %d): %w", txnID, err)
+		}
+	}
+
+	return change, hasDDL, nil
+}
+
+// afterNonDMLCommit runs applyNonDMLIntents's post-commit refresh: notifying
+// the injected schema-version-bumped callback (which advances the owning
+// ReplicatedDatabase's cached __marmot_schema_version, monotonically) and
+// reloading the schema cache when DDL ran. A failed reload leaves the cache
+// stale, so subsequent preupdate hooks would silently drop CDC data for any
+// column the DDL added/changed - fail the commit instead of swallowing the
+// error, even though the DDL itself already committed (the same shape as
+// handleReplay's post-commit ReloadSchema, but propagated instead of only
+// logged, matching this path's existing contract).
+func (tm *TransactionManager) afterNonDMLCommit(txnID uint64, hasDDL bool, newSchemaVersion uint64, change *SchemaChange) error {
+	if hasDDL {
+		tm.mu.RLock()
+		bumped := tm.schemaVersionBumped
+		tm.mu.RUnlock()
+		if bumped != nil {
+			bumped(newSchemaVersion)
+		}
+	}
+
+	if !change.Empty() && tm.schemaCache != nil {
 		if err := tm.reloadSchemaCache(); err != nil {
 			return fmt.Errorf("failed to reload schema cache after DDL (txn %d): %w", txnID, err)
 		}
 	}
 
-	// Seed __marmot__autoinc for every table this DDL tagged AUTO_INCREMENT,
-	// after the DDL has executed and the schema cache reflects it. The claim
-	// table lives in the system database - a separate SQLite file from tm.db
-	// (db/autoinc_claim.go) - so the seed cannot share the DDL's own
-	// transaction: it is written in its own system-database transaction,
-	// still before this COMMIT is ACKed. A seeding failure therefore still
-	// fails the DDL apply and the COMMIT with it, the same durability boundary
-	// AutoIncClaimStore.ApplyClaims relies on for the claim itself: a table
-	// left untagged here would let a subsequent range claim be evaluated
-	// against a missing base row.
-	if err := tm.seedSchemaChange(tm.db, &change); err != nil {
-		return fmt.Errorf("failed to seed auto-increment base after DDL (txn %d): %w", txnID, err)
-	}
 	return nil
-}
-
-// execDDL executes one DDL intent on one connection, so the schema reads
-// SchemaChange.Exec takes around it bracket exactly this statement.
-func (tm *TransactionManager) execDDL(change *SchemaChange, intent *WriteIntentRecord) error {
-	ctx := context.Background()
-	conn, err := tm.db.Conn(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to execute DDL statement: %w", err)
-	}
-	defer conn.Close()
-	return change.Exec(ctx, conn, intent.SQLStatement, intent.TableName, intent.NodeID)
 }
 
 // writeNonDMLToCDC writes DDL/LOAD DATA statements to CDC storage for streaming replication.
@@ -711,7 +1056,18 @@ func (tm *TransactionManager) cleanupAfterCommit(txn *Transaction) {
 	}
 }
 
-// AbortTransaction aborts the transaction and cleans up write intents
+// AbortTransaction aborts the transaction and cleans up write intents.
+//
+// A late PREPARE's abort can hit a txn id that was already replayed and
+// COMMITTED in the log: MetaStore.AbortTransaction then refuses with
+// ErrAbortCommitted instead of deleting the commit record. This still
+// releases the PREPARE's own write intents (DeleteIntentsByTxn) - they are
+// this abort's to clean up regardless - but it must NOT delete the CDC
+// intent entries or captured rows (DeleteIntentEntries, DeleteCapturedRows):
+// those now belong to the committed log entry, and deleting them would
+// destroy rows a peer's next pull, or this node's own restore re-apply,
+// still needs to read back. The error is returned so the caller knows the
+// abort did not take effect.
 func (tm *TransactionManager) AbortTransaction(txn *Transaction) error {
 	txn.mu.Lock()
 	defer txn.mu.Unlock()
@@ -720,15 +1076,22 @@ func (tm *TransactionManager) AbortTransaction(txn *Transaction) error {
 		return fmt.Errorf("transaction %d is not pending", txn.ID)
 	}
 
-	// Abort the transaction in MetaStore (deletes record)
-	if err := tm.metaStore.AbortTransaction(txn.ID); err != nil {
-		return fmt.Errorf("failed to abort transaction: %w", err)
+	abortErr := tm.metaStore.AbortTransaction(txn.ID)
+	if abortErr != nil && !errors.Is(abortErr, ErrAbortCommitted) {
+		return fmt.Errorf("failed to abort transaction: %w", abortErr)
+	}
+
+	// Clean up this PREPARE's own write intents unconditionally: they are
+	// never the committed log entry's data.
+	_ = tm.metaStore.DeleteIntentsByTxn(txn.ID)
+
+	if abortErr != nil {
+		// ErrAbortCommitted: leave the CDC intent entries and captured rows
+		// alone, they belong to the committed log entry now.
+		return abortErr
 	}
 
 	txn.Status = TxnStatusAborted
-
-	// Clean up all write intents via MetaStore
-	_ = tm.metaStore.DeleteIntentsByTxn(txn.ID)
 
 	// Clean up CDC intent entries
 	_ = tm.metaStore.DeleteIntentEntries(txn.ID)
@@ -885,56 +1248,59 @@ func (tm *TransactionManager) runGarbageCollection() {
 }
 
 // cleanupStaleTransactions aborts transactions that haven't had a heartbeat within the timeout
+//
+// Each abort runs under the transaction's commit guard (acquireCommit), so it
+// never interleaves with a commit of the same transaction - the log puller's
+// CommitLocallyPrepared or a COMMIT RPC: a commit that wins commits the
+// transaction's whole prepared payload, and one that loses finds it no longer
+// PENDING. A transaction a commit ended while this pass waited is skipped.
 func (tm *TransactionManager) cleanupStaleTransactions() (int, error) {
-	return tm.metaStore.CleanupStaleTransactions(tm.heartbeatTimeout)
+	stale, err := tm.metaStore.StaleTransactionIDs(tm.heartbeatTimeout)
+	if err != nil {
+		return 0, err
+	}
+	cleaned := 0
+	for _, txnID := range stale {
+		release, err := tm.acquireCommit(txnID)
+		if err != nil {
+			continue // committed, aborted or gone since it was listed
+		}
+		aborted, err := tm.metaStore.AbortStaleTransaction(txnID, tm.heartbeatTimeout)
+		release()
+		if err != nil {
+			log.Warn().Err(err).Uint64("txn_id", txnID).Msg("GC: failed to abort stale transaction")
+			continue
+		}
+		if aborted {
+			cleaned++
+		}
+	}
+	if cleaned > 0 {
+		log.Info().Int("stale_txns", cleaned).Msg("GC: aborted stale transactions")
+	}
+	return cleaned, nil
 }
 
-// cleanupOldTransactionRecords removes old COMMITTED/ABORTED transaction records
-// with GC safe point coordination to prevent deleting logs needed by lagging peers
-// Uses belt-and-suspenders: both txn_id from anti-entropy and seq_num from gossip watermark
+// cleanupOldTransactionRecords deletes committed log entries at or below
+// the GC-safe position (see GCSafePositionFunc) once they are older than
+// gcMinRetention, or unconditionally once they are older than gcMaxRetention.
 func (tm *TransactionManager) cleanupOldTransactionRecords() (int, error) {
-	// Get callbacks under lock
+	// Get callback under lock
 	tm.mu.RLock()
-	refreshFn := tm.refreshReplicationStates
-	getMinAppliedFn := tm.getMinAppliedTxnID
-	getWatermarkFn := tm.getClusterMinWatermark
+	safeFn := tm.gcSafePosition
 	dbName := tm.databaseName
 	tm.mu.RUnlock()
 
-	var minAppliedTxnID uint64 = 0
-	var minAppliedSeqNum uint64 = 0
+	var safe LogPosition
 
 	// Skip replication tracking for system database (it's not replicated)
-	if dbName != "" && dbName != SystemDatabaseName {
-		// CRITICAL: Refresh peer replication states BEFORE getting watermarks
-		// This ensures we have fresh data before making GC deletion decisions
-		if refreshFn != nil {
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			if err := refreshFn(ctx); err != nil {
-				// Log warning but continue with potentially stale data
-				// The retention windows provide safety margin
-				log.Warn().Err(err).Str("database", dbName).Msg("GC: Failed to refresh replication states, using cached watermarks")
-			}
-			cancel()
-		}
-
-		// Get min applied txn_id from anti-entropy (now refreshed)
-		if getMinAppliedFn != nil {
-			minTxnID, err := getMinAppliedFn(dbName)
-			if err == nil {
-				minAppliedTxnID = minTxnID
-			} else {
-				log.Warn().Err(err).Str("database", dbName).Msg("GC: Failed to get min applied txn_id")
-			}
-		}
-
-		// Get cluster min watermark from gossip (if available)
-		if getWatermarkFn != nil {
-			minAppliedSeqNum = getWatermarkFn()
+	if dbName != "" && dbName != SystemDatabaseName && safeFn != nil {
+		if pos, ok := safeFn(); ok {
+			safe = pos
 		}
 	}
 
-	count, err := tm.metaStore.CleanupOldTransactionRecords(tm.gcMinRetention, tm.gcMaxRetention, minAppliedTxnID, minAppliedSeqNum)
+	count, err := tm.metaStore.CleanupOldTransactionRecords(tm.gcMinRetention, tm.gcMaxRetention, safe)
 	if err != nil {
 		return 0, err
 	}
@@ -943,8 +1309,8 @@ func (tm *TransactionManager) cleanupOldTransactionRecords() (int, error) {
 		log.Info().
 			Str("database", dbName).
 			Int("deleted_records", count).
-			Uint64("min_txn_id", minAppliedTxnID).
-			Uint64("min_seq_num", minAppliedSeqNum).
+			Uint64("safe_seq", safe.Seq).
+			Uint64("safe_txn_id", safe.TxnID).
 			Msg("GC: Cleaned up old transaction records")
 	}
 

@@ -45,6 +45,7 @@ func (noopNodeRegistry) CountAlive() int                        { return 1 }
 func (noopNodeRegistry) GetAll() []any                          { return nil }
 func (noopNodeRegistry) IsLeaving(uint64) bool                  { return false }
 func (noopNodeRegistry) GetLocalNodeID() uint64                 { return 1 }
+func (noopNodeRegistry) LegacyLogProtocolMembers() []uint64     { return nil }
 
 // noopDMLSetup builds a single-node handler over a real DatabaseManager so the
 // CDC preupdate hook runs for real.
@@ -75,9 +76,9 @@ func setupNoopDML(t testing.TB) *noopDMLSetup {
 	const dbName = "noopdml"
 	require.NoError(t, dbMgr.CreateDatabase(dbName))
 
-	systemDB, err := dbMgr.GetDatabase(db.SystemDatabaseName)
+	_, err = dbMgr.GetDatabase(db.SystemDatabaseName)
 	require.NoError(t, err)
-	schemaVersionMgr := db.NewSchemaVersionManager(systemDB.GetMetaStore())
+	schemaVersionMgr := db.NewSchemaVersionManager(dbMgr)
 
 	replicator := &countingReplicator{}
 	nodeProvider := coordinator.NewMockNodeProvider([]uint64{1})
