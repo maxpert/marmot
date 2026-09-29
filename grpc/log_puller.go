@@ -432,7 +432,11 @@ func (lp *LogPuller) applyPage(ctx context.Context, st *pullState, entries []*Lo
 //   - no PENDING record: fetch;
 //   - durably prepared: commit it through the local commit path
 //     (db.DatabaseManager.CommitLocallyPrepared) and mark it covered; on
-//     failure leave it for the next call, never replaying over it;
+//     failure leave it for the next call, never replaying over it - except
+//     when its captured rows are gone (db.ErrPreparedRowsMissing, what a
+//     crash leaves when the rows were not yet synced): that prepare can never
+//     commit, so discard it (db.DatabaseManager.DiscardLocallyPrepared) and
+//     fetch the peer's committed copy;
 //   - begun but abandoned (its PREPARE died with an earlier process): it
 //     promised nothing, so discard it and fetch;
 //   - begun and live (a PREPARE executing now): leave it for the next call.
@@ -450,6 +454,20 @@ func (lp *LogPuller) resolveLocalPending(st *pullState, e *LogEntry, covered *bo
 			return false, nil
 		}
 		if err := lp.dbMgr.CommitLocallyPrepared(st.database, txnID, HLCToTimestamp(e.CommitTimestamp)); err != nil {
+			if errors.Is(err, db.ErrPreparedRowsMissing) {
+				err := lp.dbMgr.DiscardLocallyPrepared(st.database, txnID)
+				switch {
+				case errors.Is(err, db.ErrTxnAlreadyCommitted):
+					// Another path (a pull of another peer's copy) committed
+					// it in between: it is covered.
+					*covered = true
+					lp.clearAttempt(st.database, st.peer.NodeID, txnID)
+					return false, nil
+				case err != nil:
+					return false, fmt.Errorf("discard local prepare of txn %d whose rows are gone: %w", txnID, err)
+				}
+				return true, nil
+			}
 			st.localCommitFailed = true
 			// A busy writer (a pinned session holding it, say) is not this
 			// transaction's fault and must not push it toward STUCK, whose

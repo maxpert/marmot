@@ -1,6 +1,7 @@
 package protocol
 
 import (
+	"database/sql"
 	"errors"
 	"strings"
 
@@ -23,6 +24,15 @@ func ConvertToMySQLError(err error) *MySQLError {
 	var coded *transform.CodedError
 	if errors.As(err, &coded) {
 		return NewMySQLError(coded.Code, sqlStateForCode(coded.Code), coded.Message)
+	}
+
+	// The statement's SQLite transaction has already ended: an explicit
+	// transaction's pinned session that outlived the lock wait was rolled
+	// back. MySQL answers a rolled-back transaction with 1213, which tells the
+	// client to run the whole transaction again.
+	if errors.Is(err, sql.ErrTxDone) {
+		return NewMySQLError(ErrCodeDeadlock, SQLStateDeadlock,
+			"Deadlock found when trying to get lock; try restarting transaction ("+err.Error()+")")
 	}
 
 	// Try to extract sqlite3.Error

@@ -15,11 +15,12 @@ import (
 // deletes a prepared transaction's intents and captured rows, and the log
 // puller then reaches that transaction in a peer's log. Its local commit must
 // be refused - committing it would record it COMMITTED with no rows, and the
-// cursor would pass it for good - so the cursor stays before it; once the
-// transaction is aborted, the next pull replays it from the peer.
+// cursor would pass it for good - so the puller discards the local prepare
+// and replays the peer's committed copy in the same call.
 //
 // Mutation: make TransactionManager.verifyPreparedPayload return nil. The
-// first pull passes the cursor over txn 2000 and row 2 is never applied.
+// pull commits txn 2000 locally with no rows, passes the cursor over it, and
+// row 2 is never applied.
 func TestLogPuller_PreparedPayloadGoneNeverPassesTheCursor(t *testing.T) {
 	peer := newPullTestNode(t, 2, "app")
 	peer.serve(t, nil)
@@ -51,21 +52,12 @@ func TestLogPuller_PreparedPayloadGoneNeverPassesTheCursor(t *testing.T) {
 	peerRef := PeerRef{NodeID: 2, Address: peer.addr}
 	res, err := lp.PullPair(context.Background(), peerRef, "app")
 	require.NoError(t, err)
-	require.False(t, res.CaughtUp)
-
-	rec, err := ms.GetTransaction(2000)
-	require.NoError(t, err)
-	require.NotNil(t, rec)
-	require.Equal(t, db.TxnStatusPending, rec.Status, "a txn whose prepared payload is gone must not be committed")
-	cursor, err := ms.GetPullCursor(2)
-	require.NoError(t, err)
-	require.Equal(t, uint64(1000), cursor.TxnID, "the cursor must stay before the refused txn")
-
-	require.NoError(t, ms.AbortTransaction(2000))
-	res, err = lp.PullPair(context.Background(), peerRef, "app")
-	require.NoError(t, err)
 	require.True(t, res.CaughtUp)
-	require.Equal(t, map[int64]string{1: "a", 2: "b", 3: "c"}, local.rows(t, "app"))
+	require.Zero(t, res.Stuck)
+	require.Equal(t, map[int64]string{1: "a", 2: "b", 3: "c"}, local.rows(t, "app"), "row 2 must come from the peer's committed copy")
+	applied, err := mdb.AppliedTxns([]uint64{2000})
+	require.NoError(t, err)
+	require.True(t, applied[2000])
 }
 
 // fetchHookServer serves FetchTransactions like the real server, running

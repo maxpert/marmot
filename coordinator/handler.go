@@ -3,6 +3,7 @@ package coordinator
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"math"
 	"reflect"
@@ -927,6 +928,13 @@ func (h *CoordinatorHandler) executeEagerDML(session *protocol.ConnectionSession
 	defer cancel()
 	rowsAffected, lastInsertId, err := pinned.ExecuteStatement(execCtx, stmt.SQL, execParams)
 	if err != nil {
+		if errors.Is(err, sql.ErrTxDone) {
+			// The pinned session's SQLite transaction is gone: it outlived
+			// the lock wait and was rolled back. The client is answered 1213
+			// (protocol.ConvertToMySQLError), so end the whole transaction as
+			// MySQL does: a later COMMIT must find nothing of it to commit.
+			_, _ = h.handleRollback(session)
+		}
 		return nil, fmt.Errorf("DML execution failed: %w", err)
 	}
 

@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/maxpert/marmot/cfg"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/protocol"
 	"github.com/stretchr/testify/require"
@@ -406,4 +407,113 @@ func TestCommitRefusesADMLTransactionWhoseRowsTheGCDeleted(t *testing.T) {
 	var n int
 	require.NoError(t, mdb.GetReadDB().QueryRow("SELECT COUNT(*) FROM log").Scan(&n))
 	require.Zero(t, n)
+}
+
+// TestClaimCommitDoesNotWaitOnQueuedDMLCommits: an explicit transaction's
+// session holds this node's SQLite writer; one peer DML commit is being
+// flushed and waits for that writer, and a second one is queued behind it in
+// the batch committer. The session's next narrow insert claims a range. The
+// claim writes nothing to the user database, so its local commit must not
+// wait for the queued DML: that DML waits for the writer the session holds,
+// and the session waits for the claim, so waiting deadlocked until the lock
+// wait ran out and the whole transaction failed.
+//
+// Mutation: flush the batch committer before every non-DML commit (the old
+// behaviour). The claim's COMMIT takes the queued DML and waits on the writer.
+func TestClaimCommitDoesNotWaitOnQueuedDMLCommits(t *testing.T) {
+	// A long batch window keeps a queued commit observable before a flush
+	// takes it.
+	oldWait := cfg.Config.BatchCommit.MaxWaitMS
+	cfg.Config.BatchCommit.MaxWaitMS = 200
+	t.Cleanup(func() { cfg.Config.BatchCommit.MaxWaitMS = oldWait })
+
+	engine, dm, cleanup := setupTestReplicationEngine(t)
+	defer cleanup()
+	mdb := markedTableDB(t, engine, dm, "CREATE TABLE users (id INTEGER /*M:32a*/ PRIMARY KEY, v TEXT)")
+	_, err := mdb.GetWriteDB().Exec("CREATE TABLE log (id INTEGER PRIMARY KEY, v TEXT)")
+	require.NoError(t, err)
+	seedClaimBase(t, dm, "testdb", "users", 500, 1)
+	bc := mdb.batchCommitter
+	require.NotNil(t, bc, "the test needs the batch committer")
+
+	const flushing, claim, queued = 9300, 9301, 9302
+	prepareRow := func(txnID uint64, key string, id int64) {
+		prep := engine.Prepare(context.Background(), &PrepareRequest{
+			TxnID: txnID, NodeID: 2, StartTS: hlc.Timestamp{WallTime: int64(txnID)}, Database: "testdb",
+			Statements: []protocol.Statement{dmlLogInsertStatement("testdb", key, id, "peer")},
+		})
+		require.True(t, prep.Success, "prepare %d: %s", txnID, prep.Error)
+	}
+	commitRow := func(txnID uint64, key string) <-chan *CommitResult {
+		done := make(chan *CommitResult, 1)
+		go func() {
+			done <- engine.Commit(context.Background(), &CommitRequest{TxnID: txnID, Database: "testdb",
+				Statements: []protocol.Statement{dmlLogCommitStatement("testdb", key)}})
+		}()
+		return done
+	}
+	prepareRow(flushing, "log:1", 1)
+	prepareRow(queued, "log:3", 3)
+	prep := prepareClaim(engine, t, claim, 1, 500, 10)
+	require.True(t, prep.Success, "claim prepare: %s", prep.Error)
+
+	// The session's open transaction holds the writer.
+	session, err := mdb.GetWriteDB().Begin()
+	require.NoError(t, err)
+	_, err = session.Exec("INSERT INTO log (id, v) VALUES (2, 'session')")
+	require.NoError(t, err)
+
+	// The first DML is queued, then taken by the timer's flush, which waits
+	// on the writer; the second is then queued and stays there.
+	flushingDone := commitRow(flushing, "log:1")
+	require.Eventually(t, func() bool { return pendingInBatch(bc, flushing) }, 5*time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return !pendingInBatch(bc, flushing) }, 5*time.Second, time.Millisecond)
+	queuedDone := commitRow(queued, "log:3")
+	require.Eventually(t, func() bool { return pendingInBatch(bc, queued) }, 5*time.Second, time.Millisecond)
+
+	claimDone := make(chan *CommitResult, 1)
+	go func() { claimDone <- commitClaim(engine, claim) }()
+	select {
+	case res := <-claimDone:
+		require.True(t, res.Success, "claim COMMIT: %s", res.Error)
+	case <-time.After(2 * time.Second):
+		t.Fatal("the claim's COMMIT waited on DML queued behind the writer the session holds")
+	}
+	require.Equal(t, uint64(510), readClaimBase(t, dm, "testdb", "users"))
+
+	require.NoError(t, session.Rollback())
+	for _, done := range []<-chan *CommitResult{flushingDone, queuedDone} {
+		res := <-done
+		require.True(t, res.Success, "DML COMMIT: %s", res.Error)
+	}
+}
+
+// TestDiscardPreparedOfACommittedTxnReportsItCommitted: the log puller
+// discards a prepare whose rows are gone and replays the peer's copy; if
+// another path committed the transaction in between, DiscardPrepared must
+// leave it alone and report ErrTxnAlreadyCommitted, which the puller counts
+// as covered (grpc/log_puller.go resolveLocalPending).
+func TestDiscardPreparedOfACommittedTxnReportsItCommitted(t *testing.T) {
+	engine, dm, cleanup := setupTestReplicationEngine(t)
+	defer cleanup()
+	mdb := markedTableDB(t, engine, dm, "CREATE TABLE log (id INTEGER PRIMARY KEY, v TEXT)")
+	const txnID = 9400
+	require.True(t, prepareLogRow(engine, txnID, "committed").Success)
+	res := commitLogRow(engine, txnID)
+	require.True(t, res.Success, res.Error)
+
+	err := mdb.GetTransactionManager().DiscardPrepared(txnID)
+	require.ErrorIs(t, err, ErrTxnAlreadyCommitted)
+	var v string
+	require.NoError(t, mdb.GetReadDB().QueryRow("SELECT v FROM log WHERE id = 1").Scan(&v))
+	require.Equal(t, "committed", v, "the discard must leave a committed transaction's row alone")
+}
+
+// pendingInBatch reports whether txnID is queued in bc, not yet taken by a
+// flush.
+func pendingInBatch(bc *SQLiteBatchCommitter, txnID uint64) bool {
+	bc.mu.Lock()
+	defer bc.mu.Unlock()
+	_, ok := bc.pending[txnID]
+	return ok
 }

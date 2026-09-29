@@ -63,6 +63,16 @@ seed_nodes = []
 # seed_nodes.
 standalone = false
 
+# How often a node whose AUTO_INCREMENT claim votes are held retries merging
+# claim bases from its peers: after enough peers are reachable, the node
+# declines claims for at most this long.
+autoinc_merge_interval_ms = 2000
+
+# How often every node raises its AUTO_INCREMENT claim bases to every alive
+# peer's: after a membership change, a claim committed under the old
+# membership stays unknown to a new quorum for at most this long.
+autoinc_base_sync_interval_ms = 10000
+
 # PSK for cluster authentication (or set MARMOT_CLUSTER_SECRET env var)
 # Leave empty to disable authentication. The AUTO_INCREMENT endpoints
 # (/admin/cluster/autoinc/release-votes and /admin/cluster/autoinc/sync) are

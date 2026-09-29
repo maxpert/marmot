@@ -882,6 +882,18 @@ func (dm *DatabaseManager) CommitLocallyPrepared(database string, txnID uint64, 
 	return err
 }
 
+// DiscardLocallyPrepared aborts this node's local prepare of txnID in
+// database (TransactionManager.DiscardPrepared). The log puller calls it when
+// CommitLocallyPrepared refused with ErrPreparedRowsMissing, and then
+// replays the peer's committed copy.
+func (dm *DatabaseManager) DiscardLocallyPrepared(database string, txnID uint64) error {
+	replicatedDB, err := dm.GetDatabase(database)
+	if err != nil {
+		return fmt.Errorf("database %s: %w", database, err)
+	}
+	return replicatedDB.GetTransactionManager().DiscardPrepared(txnID)
+}
+
 // committedLocally reports whether replicatedDB's local record for txnID is
 // COMMITTED.
 func committedLocally(replicatedDB *ReplicatedDatabase, txnID uint64) bool {

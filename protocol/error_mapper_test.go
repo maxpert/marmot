@@ -1,6 +1,7 @@
 package protocol
 
 import (
+	"database/sql"
 	"errors"
 	"fmt"
 	"testing"
@@ -283,6 +284,19 @@ func TestConvertToMySQLError_GenericConstraint(t *testing.T) {
 				t.Errorf("Code = %d, want %d", result.Code, tt.wantCode)
 			}
 		})
+	}
+}
+
+// TestConvertToMySQLError_EndedTransactionIsRetryableDeadlock: a statement of
+// an explicit transaction whose SQLite transaction already ended (its pinned
+// session outlived the lock wait and was rolled back) is answered with 1213,
+// MySQL's "the transaction was rolled back, run it again", never the
+// unknown error 1105 a client would not retry.
+func TestConvertToMySQLError_EndedTransactionIsRetryableDeadlock(t *testing.T) {
+	err := fmt.Errorf("DML execution failed: failed to execute statement: %w", sql.ErrTxDone)
+	result := ConvertToMySQLError(err)
+	if result.Code != ErrCodeDeadlock || result.SQLState != SQLStateDeadlock {
+		t.Fatalf("got %d/%s (%s), want %d/%s", result.Code, result.SQLState, result.Message, ErrCodeDeadlock, SQLStateDeadlock)
 	}
 }
 

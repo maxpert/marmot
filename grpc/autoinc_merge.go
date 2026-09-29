@@ -12,21 +12,27 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-// autoIncMergeInterval is how often a node whose claim votes are held retries
-// the merge that releases them, and autoIncMergePeerTimeout bounds each
-// peer's answer within one round.
-//
-// autoIncBaseSyncInterval is how often an unheld node raises its claim bases
-// to the maximum every alive peer reports (the membership backstop). Claim
-// safety is proved for a stable membership; after a membership change a
-// claim committed under the old membership may be known only to members a
-// new quorum can avoid. Every node pulling every peer's bases bounds that
-// window to one interval.
-const (
-	autoIncMergeInterval    = 2 * time.Second
-	autoIncMergePeerTimeout = 5 * time.Second
-	autoIncBaseSyncInterval = 10 * time.Second
-)
+// autoIncMergePeerTimeout bounds each peer's answer within one merge round.
+const autoIncMergePeerTimeout = 5 * time.Second
+
+// AutoIncMergeConfig is how a node runs its claim base merge and sync
+// (RunAutoIncBaseMerge).
+type AutoIncMergeConfig struct {
+	// Standalone is the node's cluster.standalone setting: only such a node
+	// releases while it is its own whole membership, and only while it has
+	// never seen another member (standaloneRelease).
+	Standalone bool
+	// MergeInterval is how often a node whose claim votes are held retries
+	// the merge that releases them.
+	MergeInterval time.Duration
+	// BaseSyncInterval is how often an unheld node raises its claim bases to
+	// the maximum every alive peer reports (the membership backstop). Claim
+	// safety is proved for a stable membership; after a membership change a
+	// claim committed under the old membership may be known only to members
+	// a new quorum can avoid. Every node pulling every peer's bases bounds
+	// that window to one interval.
+	BaseSyncInterval time.Duration
+}
 
 // GetAutoIncBases serves this node's AUTO_INCREMENT claim bases
 // (db.AutoIncClaimStore.Bases) to a peer's vote-hold merge or base sync.
@@ -196,24 +202,20 @@ func peerAutoIncBases(nodeID uint64, client *Client) fetchAutoIncBases {
 
 // RunAutoIncBaseMerge releases this node's held claim votes once it has merged
 // claim bases from enough of its membership (autoIncMergeSafe), retrying
-// every autoIncMergeInterval until then. From then on - at once on a node
+// every conf.MergeInterval until then. From then on - at once on a node
 // whose votes were never held - it runs the membership backstop: one sync
-// immediately, then one every autoIncBaseSyncInterval, until ctx ends.
-//
-// standalone is the node's cluster.standalone setting: only such a node
-// releases while it is its own whole membership, and only while it has never
-// seen another member (standaloneRelease).
-func RunAutoIncBaseMerge(ctx context.Context, nodeID uint64, store autoIncBaseStore, registry *NodeRegistry, client *Client, standalone bool) {
-	runAutoIncBaseMerge(ctx, nodeID, store, registry, standalone, peerAutoIncBases(nodeID, client))
+// immediately, then one every conf.BaseSyncInterval, until ctx ends.
+func RunAutoIncBaseMerge(ctx context.Context, nodeID uint64, store autoIncBaseStore, registry *NodeRegistry, client *Client, conf AutoIncMergeConfig) {
+	runAutoIncBaseMerge(ctx, nodeID, store, registry, conf, peerAutoIncBases(nodeID, client))
 }
 
 // runAutoIncBaseMerge is RunAutoIncBaseMerge over an explicit membership and
 // peer fetch.
-func runAutoIncBaseMerge(ctx context.Context, nodeID uint64, store autoIncBaseStore, registry autoIncMembership, standalone bool, fetch fetchAutoIncBases) {
-	if !holdUntilMerged(ctx, nodeID, store, registry, standalone, fetch) {
+func runAutoIncBaseMerge(ctx context.Context, nodeID uint64, store autoIncBaseStore, registry autoIncMembership, conf AutoIncMergeConfig, fetch fetchAutoIncBases) {
+	if !holdUntilMerged(ctx, nodeID, store, registry, conf, fetch) {
 		return
 	}
-	ticker := time.NewTicker(autoIncBaseSyncInterval)
+	ticker := time.NewTicker(conf.BaseSyncInterval)
 	defer ticker.Stop()
 	for {
 		if _, err := syncAutoIncBasesOnce(ctx, nodeID, store, registry, fetch); err != nil {
@@ -227,15 +229,15 @@ func runAutoIncBaseMerge(ctx context.Context, nodeID uint64, store autoIncBaseSt
 	}
 }
 
-// holdUntilMerged runs merge rounds every autoIncMergeInterval until this
+// holdUntilMerged runs merge rounds every conf.MergeInterval until this
 // node's votes are released. It reports false when ctx ended first.
-func holdUntilMerged(ctx context.Context, nodeID uint64, store autoIncBaseStore, registry autoIncMembership, standalone bool, fetch fetchAutoIncBases) bool {
+func holdUntilMerged(ctx context.Context, nodeID uint64, store autoIncBaseStore, registry autoIncMembership, conf AutoIncMergeConfig, fetch fetchAutoIncBases) bool {
 	if held, err := store.AutoIncVotesHeld(); err == nil && !held {
 		return true
 	}
-	ticker := time.NewTicker(autoIncMergeInterval)
+	ticker := time.NewTicker(conf.MergeInterval)
 	defer ticker.Stop()
-	release := standaloneRelease{configured: standalone}
+	release := standaloneRelease{configured: conf.Standalone}
 	warned := false
 	for {
 		membership := registry.Count()
@@ -249,7 +251,7 @@ func holdUntilMerged(ctx context.Context, nodeID uint64, store autoIncBaseStore,
 		}
 		if !warned && err == nil {
 			warned = true
-			log.Warn().Int("membership", membership).Bool("standalone", standalone).
+			log.Warn().Int("membership", membership).Bool("standalone", conf.Standalone).
 				Msg("AUTO_INCREMENT claim votes held until claim bases are merged from enough cluster members; " +
 					"narrow AUTO_INCREMENT inserts may return 1205 until then. A single-node deployment sets " +
 					"cluster.standalone = true; an operator can force a release with " +

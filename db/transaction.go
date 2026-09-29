@@ -475,14 +475,18 @@ func (tm *TransactionManager) CommitTransactionAfter(txn *Transaction, commitTS 
 			return fmt.Errorf("transaction %d: %w", txn.ID, ErrPreparedRowsMissing)
 		}
 
-		// Statement/DDL path: flush pending DML first to ensure isolation
-		if tm.batchCommitEnabled() {
-			tm.batchCommitter.Flush()
-		}
-
 		intents, err := tm.metaStore.GetIntentsByTxn(txn.ID)
 		if err != nil {
 			return fmt.Errorf("failed to fetch write intents: %w", err)
+		}
+
+		// Statement/DDL path: flush pending DML first to ensure isolation. A
+		// claim-only commit writes nothing to this database
+		// (applyNonDMLIntents), so it must not wait for queued DML: that DML
+		// may be waiting for the writer an explicit transaction holds while
+		// that transaction waits for this very claim.
+		if tm.batchCommitEnabled() && len(classifyNonDMLIntents(intents)) > 0 {
+			tm.batchCommitter.Flush()
 		}
 
 		// The captured rows are written before the SQLite commit that writes
@@ -1298,6 +1302,25 @@ func (tm *TransactionManager) runGarbageCollection() {
 	if tombstones > 0 {
 		log.Info().Int64("tombstones", tombstones).Msg("GC Phase 2: Purged row version tombstones")
 	}
+}
+
+// DiscardPrepared aborts txnID's local prepare under its commit guard
+// (acquireCommit), releasing its intents. It is for a prepare that can never
+// be committed here - its captured rows are gone (ErrPreparedRowsMissing) -
+// of a transaction whose committed copy a peer's log serves instead. A
+// transaction that a commit ended while this waited is left alone and
+// reported by acquireCommit's error.
+func (tm *TransactionManager) DiscardPrepared(txnID uint64) error {
+	release, err := tm.acquireCommit(txnID)
+	if err != nil {
+		return err
+	}
+	defer release()
+	txn := tm.GetTransaction(txnID)
+	if txn == nil {
+		return fmt.Errorf("transaction %d is not pending", txnID)
+	}
+	return tm.AbortTransaction(txn)
 }
 
 // cleanupStaleTransactions aborts transactions that haven't had a heartbeat within the timeout

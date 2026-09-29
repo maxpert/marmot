@@ -191,7 +191,8 @@ A node decommissioned through `/admin/cluster/decommission` while ALIVE also rej
 
 Ids of `AUTO_INCREMENT` columns narrower than `BIGINT` come from ranges each node claims through a quorum (see
 Narrow AUTO_INCREMENT Columns in [Compatibility](/compatibility)). They are unique while the membership is stable.
-Every node also raises its claim bases to the highest base every ALIVE peer reports, every 10 seconds, which closes
+Every node also raises its claim bases to the highest base every ALIVE peer reports, every
+`cluster.autoinc_base_sync_interval_ms` (10 seconds by default), which closes
 the window a membership change opens. To add or remove nodes, change the membership one node at a time:
 
 1. Add or remove **one** node.
@@ -204,6 +205,14 @@ the window a membership change opens. To add or remove nodes, change the members
 4. Make the next change only when the answer's `complete` is `true`: every member answered, is not holding its
    votes, and reached every member. A sync gathers only from the peers a node sees ALIVE, so right after a change
    it can be incomplete; re-run it until it is complete.
+
+**Rebuilding nodes that lost their data directory:** rebuild them one at a time, the same way. A rebuilt
+node holds its claim votes until it has merged claim bases from enough members, which is safe only while at most
+one member has lost its claim state. Start one rebuilt node, wait until it is ALIVE, its claim votes are released
+(`GET /admin/cluster/autoinc/votes` answers `votes_held: false`) and the sync above reports `complete`, and only then
+touch the next one. If a majority lost its data at once, the rebuilt nodes can count each other as the whole
+cluster and reissue ids until the periodic base sync raises their bases; such an id is refused with 1062, never
+stored twice, but inserts through those nodes fail until the sync has run.
 
 The sync endpoint requires `cluster_secret`; on a cluster without one it answers 403.
 

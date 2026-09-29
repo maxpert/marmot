@@ -30,20 +30,34 @@ func (s *XsyncTransactionStore) Get(txnID uint64) (*TxnState, bool) {
 }
 
 func (s *XsyncTransactionStore) UpdateStatus(txnID uint64, status TxnStatus) {
-	if state, ok := s.txns.Load(txnID); ok {
-		state.Status = status
-		if status != TxnStatusPending {
-			s.pending.Delete(txnID)
-		} else {
-			s.pending.Store(txnID, struct{}{})
-		}
+	if !s.update(txnID, func(state *TxnState) { state.Status = status }) {
+		return
+	}
+	if status != TxnStatusPending {
+		s.pending.Delete(txnID)
+	} else {
+		s.pending.Store(txnID, struct{}{})
 	}
 }
 
 func (s *XsyncTransactionStore) UpdateHeartbeat(txnID uint64, ts int64) {
-	if state, ok := s.txns.Load(txnID); ok {
-		state.LastHeartbeat = ts
-	}
+	s.update(txnID, func(state *TxnState) { state.LastHeartbeat = ts })
+}
+
+// update replaces txnID's state with a copy that change modified, atomically
+// with any other update of it, and reports whether txnID was present. A
+// TxnState a reader got from Get or RangeAll is never written again, so the
+// reader needs no lock.
+func (s *XsyncTransactionStore) update(txnID uint64, change func(*TxnState)) bool {
+	_, ok := s.txns.Compute(txnID, func(old *TxnState, loaded bool) (*TxnState, bool) {
+		if !loaded {
+			return nil, true
+		}
+		next := *old
+		change(&next)
+		return &next, false
+	})
+	return ok
 }
 
 func (s *XsyncTransactionStore) Remove(txnID uint64) {

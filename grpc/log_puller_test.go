@@ -204,6 +204,64 @@ func TestLogPuller_PreparedLocalTxnCommittedLocallyInSamePull(t *testing.T) {
 	require.Equal(t, 1, countLocalLogEntries(t, mdb, 2000), "the late COMMIT must not log the txn twice")
 }
 
+// TestLogPuller_PreparedLocalTxnWithLostRowsReplayedFromPeer pins the case a
+// SIGKILL leaves behind: a txn durably prepared here whose captured rows did
+// not survive (they are synced after the prepare record unless
+// strict_prepare_sync is set). The peer's log proves it committed, but it
+// cannot be committed locally: that would commit nothing where its prepare
+// recorded a row. The pull must discard the local prepare and replay the
+// peer's committed copy in the same call - never leave it STUCK, which kept
+// the node JOINING, and never skip it.
+//
+// Mutation: leave a failed local commit for the next call (the old
+// behaviour). The txn is never covered: "must not be stuck" fires.
+func TestLogPuller_PreparedLocalTxnWithLostRowsReplayedFromPeer(t *testing.T) {
+	peer := newPullTestNode(t, 2, "app")
+	peer.serve(t, nil)
+	local := newPullTestNode(t, 1, "app")
+
+	peer.seed(t, "app", 1000, 2, 1000, 1, "a")
+	peer.seed(t, "app", 2000, 2, 2000, 2, "b")
+	peer.seed(t, "app", 3000, 2, 3000, 3, "c")
+
+	mdb, err := local.dm.GetDatabase("app")
+	require.NoError(t, err)
+	rh := NewReplicationHandler(1, local.dm, hlc.NewClock(1), db.NewSchemaVersionManager(local.dm))
+	resp, err := rh.HandleReplicateTransaction(context.Background(), &TransactionRequest{
+		TxnId: 2000, SourceNodeId: 2, Database: "app", Phase: TransactionPhase_PREPARE,
+		Timestamp: &HLC{WallTime: 2000, NodeId: 2}, RequiredSchemaVersion: mdb.SchemaVersion(),
+		Statements: []*Statement{{Type: pb.StatementType_INSERT, TableName: "t", Database: "app",
+			Payload: &Statement_RowChange{RowChange: testInsertRowChange("t", []byte("t:2"), map[string][]byte{
+				"id": mustMarshalMsgpack(t, int64(2)), "v": mustMarshalMsgpack(t, "b"),
+			})}}},
+	})
+	require.NoError(t, err)
+	require.True(t, resp.Success, resp.ErrorMessage)
+	// The captured rows are lost; the durable prepare record still claims one.
+	require.NoError(t, mdb.GetMetaStore().DeleteIntentEntries(2000))
+
+	lp := NewLogPuller(LogPullerConfig{NodeID: 1, Client: NewClient(1), DBManager: local.dm})
+	for round := 0; round <= DefaultMaxReplayAttempts; round++ {
+		res, err := lp.PullPair(context.Background(), PeerRef{NodeID: 2, Address: peer.addr}, "app")
+		require.NoError(t, err)
+		require.Zero(t, res.Stuck, "the txn must not be stuck (round %d)", round)
+		if res.CaughtUp {
+			break
+		}
+	}
+	require.Equal(t, map[int64]string{1: "a", 2: "b", 3: "c"}, local.rows(t, "app"), "the peer's committed copy must be replayed")
+
+	applied, err := mdb.AppliedTxns([]uint64{2000})
+	require.NoError(t, err)
+	require.True(t, applied[2000], "the replay must leave the applied marker")
+	kind, err := mdb.GetMetaStore().ClassifyPending(2000)
+	require.NoError(t, err)
+	require.Equal(t, db.PendingNone, kind, "the local prepare must be gone")
+	cursor, err := mdb.GetMetaStore().GetPullCursor(2)
+	require.NoError(t, err)
+	require.Equal(t, uint64(3000), cursor.TxnID)
+}
+
 // countLocalLogEntries counts mdb's local log entries for txnID.
 func countLocalLogEntries(t *testing.T, mdb *db.ReplicatedDatabase, txnID uint64) int {
 	t.Helper()

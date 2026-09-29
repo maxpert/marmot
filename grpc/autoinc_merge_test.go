@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/maxpert/marmot/cfg"
 	"github.com/maxpert/marmot/db"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/stretchr/testify/require"
@@ -283,6 +284,12 @@ func TestSyncAutoIncBasesRaisesFromEveryAlivePeer(t *testing.T) {
 	require.False(t, report.ReachedEveryMember())
 }
 
+// testMergeConfig is the production default merge configuration.
+var testMergeConfig = AutoIncMergeConfig{
+	MergeInterval:    cfg.DefaultAutoIncMergeIntervalMS * time.Millisecond,
+	BaseSyncInterval: cfg.DefaultAutoIncBaseSyncIntervalMS * time.Millisecond,
+}
+
 // TestReleasedNodeSyncsAtOnce pins that a node whose votes are released runs
 // the backstop immediately, not an interval later: a node that just merged
 // is exactly one whose membership just changed.
@@ -299,7 +306,7 @@ func TestReleasedNodeSyncsAtOnce(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
-		runAutoIncBaseMerge(ctx, 1, store, fakeMembership{members: []uint64{1, 2, 3}}, false, peerAnswers(answers))
+		runAutoIncBaseMerge(ctx, 1, store, fakeMembership{members: []uint64{1, 2, 3}}, testMergeConfig, peerAnswers(answers))
 		close(done)
 	}()
 	defer func() {
@@ -307,7 +314,7 @@ func TestReleasedNodeSyncsAtOnce(t *testing.T) {
 		<-done
 	}()
 
-	deadline := time.Now().Add(autoIncBaseSyncInterval / 2)
+	deadline := time.Now().Add(testMergeConfig.BaseSyncInterval / 2)
 	for store.raiseCount() == 0 {
 		if time.Now().After(deadline) {
 			t.Fatal("a released node did not sync at once")

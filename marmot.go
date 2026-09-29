@@ -429,7 +429,11 @@ func main() {
 	// interval.
 	autoIncMergeCtx, autoIncMergeCancel := context.WithCancel(context.Background())
 	defer autoIncMergeCancel()
-	go marmotgrpc.RunAutoIncBaseMerge(autoIncMergeCtx, cfg.Config.NodeID, dbMgr, grpcServer.GetNodeRegistry(), client, cfg.Config.Cluster.Standalone)
+	go marmotgrpc.RunAutoIncBaseMerge(autoIncMergeCtx, cfg.Config.NodeID, dbMgr, grpcServer.GetNodeRegistry(), client, marmotgrpc.AutoIncMergeConfig{
+		Standalone:       cfg.Config.Cluster.Standalone,
+		MergeInterval:    cfg.Config.Cluster.GetAutoIncMergeInterval(),
+		BaseSyncInterval: cfg.Config.Cluster.GetAutoIncBaseSyncInterval(),
+	})
 
 	// Phase 7: Setup transaction coordinators for full database replication
 	log.Info().Msg("Setting up transaction coordinators")

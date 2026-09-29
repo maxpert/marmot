@@ -189,6 +189,77 @@ func TestRecoveredPreparedTransactionCommitsItsRows(t *testing.T) {
 	}
 }
 
+// TestRecoveredPreparedTransactionLeavesNoIntentOnceCommitted: a transaction
+// recovered at restart and then committed - by the coordinator's COMMIT, or
+// by the log pull's local commit - holds no intent on its row afterwards. A
+// replay of a later transaction on the row refuses on any intent another
+// transaction holds (ErrReplayIntentConflict), so a leftover one keeps every
+// later change to that row from ever reaching this node.
+func TestRecoveredPreparedTransactionLeavesNoIntentOnceCommitted(t *testing.T) {
+	for _, mode := range prepareSyncModes {
+		for _, path := range []string{"commit-rpc", "local-commit"} {
+			t.Run(mode.name+"/"+path, func(t *testing.T) {
+				const txnID = 9720
+				engine, dm, mdb := restartedLogDB(t, mode.env, txnID, "prepared")
+				if path == "commit-rpc" {
+					res := commitLogRow(engine, txnID)
+					require.True(t, res.Success, res.Error)
+				} else {
+					require.NoError(t, dm.CommitLocallyPrepared("testdb", txnID, hlc.Timestamp{WallTime: txnID + 1}))
+				}
+				intent, err := mdb.GetMetaStore().GetIntent("log", "log:1")
+				require.NoError(t, err)
+				require.Nil(t, intent, "the committed recovered transaction left an intent on its row")
+			})
+		}
+	}
+}
+
+// TestCommitRepairedAtOpenLeavesNoIntent: a transaction committed to SQLite
+// (its applied marker written) whose commit record did not survive a crash
+// is recovered at open as prepared - its captured rows are still there - and
+// then its commit record is repaired from the marker. The repaired commit
+// must free what the recovery restored: a leftover intent refuses the replay
+// of every later change to the row (ErrReplayIntentConflict), for good.
+//
+// Mutation: drop the CleanupAfterCommit of repairAppliedTxnMetadata. The
+// intent is still held and "left an intent" fires.
+func TestCommitRepairedAtOpenLeavesNoIntent(t *testing.T) {
+	for _, mode := range prepareSyncModes {
+		t.Run(mode.name, func(t *testing.T) {
+			const txnID = 9730
+			t.Setenv("MARMOT_CDC_PREPARE_SYNC", mode.env)
+			engine, dm, cleanup := setupTestReplicationEngine(t)
+			t.Cleanup(cleanup)
+			markedTableDB(t, engine, dm, "CREATE TABLE log (id INTEGER PRIMARY KEY, v TEXT)")
+			prep := prepareLogRow(engine, txnID, "committed-before-crash")
+			require.True(t, prep.Success, "prepare: %s", prep.Error)
+
+			mdb, err := dm.GetDatabase("testdb")
+			require.NoError(t, err)
+			// The SQLite commit landed (its marker with it); the commit record
+			// is what the crash lost.
+			tx, err := mdb.GetWriteDB().Begin()
+			require.NoError(t, err)
+			require.NoError(t, MarkSQLiteTxnApplied(tx, txnID, hlc.Timestamp{WallTime: txnID + 1, NodeID: 1}))
+			require.NoError(t, tx.Commit())
+
+			_, dm = restartNode(t, dm)
+			mdb, err = dm.GetDatabase("testdb")
+			require.NoError(t, err)
+			mdb.GetTransactionManager().StopGarbageCollection()
+
+			rec, err := mdb.GetMetaStore().GetTransaction(txnID)
+			require.NoError(t, err)
+			require.NotNil(t, rec)
+			require.Equal(t, TxnStatusCommitted, rec.Status, "the commit record must be repaired from the marker")
+			intent, err := mdb.GetMetaStore().GetIntent("log", "log:1")
+			require.NoError(t, err)
+			require.Nil(t, intent, "the repaired commit left an intent on its row")
+		})
+	}
+}
+
 // TestRecoveredPreparedTransactionEndsOnItsAbort: the coordinator's ABORT
 // for a transaction recovered at restart finds it pending, and ending it frees
 // its row at once, without waiting for the stale-transaction GC.

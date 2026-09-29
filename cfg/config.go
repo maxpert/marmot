@@ -37,6 +37,32 @@ type ClusterConfiguration struct {
 	DeadTimeoutMS         int                    `toml:"dead_timeout_ms"`
 	ShutdownGracePeriodMS int                    `toml:"shutdown_grace_period_ms"` // Grace period for in-flight queries during shutdown (default: 15000ms)
 	Promotion             PromotionConfiguration `toml:"promotion"`
+
+	// AutoIncMergeIntervalMS is how often a node whose AUTO_INCREMENT claim
+	// votes are held retries merging claim bases from its peers: the most a
+	// node declines claims after enough of its peers became reachable
+	// (default: 2000ms).
+	AutoIncMergeIntervalMS int `toml:"autoinc_merge_interval_ms"`
+	// AutoIncBaseSyncIntervalMS is how often a node raises its AUTO_INCREMENT
+	// claim bases to every alive peer's: the longest a claim committed before
+	// a membership change can stay unknown to a new quorum (default: 10000ms).
+	AutoIncBaseSyncIntervalMS int `toml:"autoinc_base_sync_interval_ms"`
+}
+
+// Defaults of ClusterConfiguration's AUTO_INCREMENT claim base intervals.
+const (
+	DefaultAutoIncMergeIntervalMS    = 2000
+	DefaultAutoIncBaseSyncIntervalMS = 10000
+)
+
+// GetAutoIncMergeInterval returns AutoIncMergeIntervalMS as a time.Duration.
+func (c *ClusterConfiguration) GetAutoIncMergeInterval() time.Duration {
+	return time.Duration(c.AutoIncMergeIntervalMS) * time.Millisecond
+}
+
+// GetAutoIncBaseSyncInterval returns AutoIncBaseSyncIntervalMS as a time.Duration.
+func (c *ClusterConfiguration) GetAutoIncBaseSyncInterval() time.Duration {
+	return time.Duration(c.AutoIncBaseSyncIntervalMS) * time.Millisecond
 }
 
 // GetShutdownGracePeriod returns the configured shutdown grace period as a time.Duration.
@@ -296,6 +322,9 @@ var Config = &Configuration{
 			CheckIntervalSeconds:  2, // Check every 2 seconds
 			MinHealthyDurationSec: 3, // Must be healthy for 3 seconds
 		},
+
+		AutoIncMergeIntervalMS:    DefaultAutoIncMergeIntervalMS,
+		AutoIncBaseSyncIntervalMS: DefaultAutoIncBaseSyncIntervalMS,
 	},
 
 	Replication: ReplicationConfiguration{
@@ -809,6 +838,16 @@ func Validate() error {
 	}
 	if Config.Cluster.ShutdownGracePeriodMS < 1000 || Config.Cluster.ShutdownGracePeriodMS > 300000 {
 		return fmt.Errorf("cluster.shutdown_grace_period_ms must be between 1000ms and 300000ms (5 minutes)")
+	}
+	// 0 means the default, as for the grace period above.
+	if Config.Cluster.AutoIncMergeIntervalMS == 0 {
+		Config.Cluster.AutoIncMergeIntervalMS = DefaultAutoIncMergeIntervalMS
+	}
+	if Config.Cluster.AutoIncBaseSyncIntervalMS == 0 {
+		Config.Cluster.AutoIncBaseSyncIntervalMS = DefaultAutoIncBaseSyncIntervalMS
+	}
+	if Config.Cluster.AutoIncMergeIntervalMS < 0 || Config.Cluster.AutoIncBaseSyncIntervalMS < 0 {
+		return fmt.Errorf("cluster.autoinc_merge_interval_ms and cluster.autoinc_base_sync_interval_ms must be positive")
 	}
 
 	// Validate publisher configuration

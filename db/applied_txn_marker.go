@@ -81,6 +81,12 @@ func repairAppliedTxnMetadata(db *sql.DB, metaStore MetaStore, dbName string) er
 			if err := metaStore.CommitTransaction(txnID, commitTS, nil, dbName, "", 0, uint32(len(entries))); err != nil {
 				return fmt.Errorf("commit txn %d: %w", txnID, err)
 			}
+			// The open recovered this transaction as prepared, with its row
+			// locks and intents; free them as any commit does, or every later
+			// replay touching those rows is refused.
+			if err := metaStore.CleanupAfterCommit(txnID); err != nil {
+				return fmt.Errorf("clean up repaired commit of txn %d: %w", txnID, err)
+			}
 			continue
 		}
 		if err := metaStore.StoreReplayedTransaction(txnID, nodeID, commitTS, dbName, uint32(len(entries)), 0); err != nil {
