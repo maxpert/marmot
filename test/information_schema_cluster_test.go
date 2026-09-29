@@ -1,7 +1,7 @@
 package test
 
 // INFORMATION_SCHEMA over the real MySQL wire protocol, text and prepared,
-// against a 3-node ClusterHarness. Every query carries its own timeout: the
+// against a 3-node cluster. Every query carries its own timeout: the
 // failure these tests exist for is a query that never answers.
 
 import (
@@ -11,7 +11,6 @@ import (
 	"reflect"
 	"strconv"
 	"testing"
-	"time"
 )
 
 // isAnswer is one INFORMATION_SCHEMA answer, normalised so the text
@@ -21,13 +20,13 @@ type isAnswer struct {
 	rows    [][]string
 }
 
-// queryAnswer runs one query under clusterQueryTimeout. With args, the driver
+// queryAnswer runs one query under clientTimeout. With args, the driver
 // prepares it on the server (COM_STMT_PREPARE/EXECUTE); without, it is a text
 // query.
 func queryAnswer(conn *sql.DB, query string, args ...interface{}) (isAnswer, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), clusterQueryTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), clientTimeout)
 	defer cancel()
-	defer noteClientCall()
+	defer clientCalls.Add(1)
 	rows, err := conn.QueryContext(ctx, query, args...)
 	if err != nil {
 		return isAnswer{}, err
@@ -80,28 +79,17 @@ func queryAnswer(conn *sql.DB, query string, args ...interface{}) (isAnswer, err
 // times out; a prepared statement answers a result set only for SELECT - the
 // prepared answers come back with no columns.
 func TestInformationSchemaAnswersOnEveryPath(t *testing.T) {
-	harness := NewClusterHarness(t)
-	defer harness.Cleanup()
-	if err := harness.StartCluster(); err != nil {
-		t.Fatalf("StartCluster: %v", err)
-	}
-
-	if _, err := execTimed(openTimedNodeDatabase(t, harness, 1, "marmot"), "CREATE DATABASE isdb"); err != nil {
-		t.Fatalf("CREATE DATABASE: %v", err)
-	}
-	waitForDatabase(t, harness, "isdb", 30*time.Second)
-	isdb := openTimedNodeDatabase(t, harness, 1, "isdb")
+	c := newCluster(t)
+	c.start()
+	c.createDatabase(1, "isdb")
 	for _, ddl := range []string{
 		"CREATE TABLE users (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(64) NOT NULL, email VARCHAR(128))",
 		"CREATE INDEX idx_users_email ON users (email)",
 		"CREATE TABLE posts (id BIGINT PRIMARY KEY, body TEXT)",
 	} {
-		if _, err := execTimed(isdb, ddl); err != nil {
-			t.Fatalf("%s: %v", ddl, err)
-		}
+		c.mustExec(1, "isdb", ddl)
 	}
-	waitForTableIn(t, harness, "isdb", "posts", 30*time.Second)
-
+	c.waitTable("isdb", "posts", 1, 2, 3)
 	cases := []struct {
 		name     string
 		database string
@@ -148,10 +136,9 @@ func TestInformationSchemaAnswersOnEveryPath(t *testing.T) {
 		// Prepared first: before the fix the first prepared query wedged the
 		// node, so every later query on it would time out.
 		for _, tc := range cases {
-			conn := openTimedNodeDatabase(t, harness, nodeID, tc.database)
+			conn := c.db(nodeID, tc.database)
 			prepared, err := queryAnswer(conn, tc.prepared, tc.args...)
 			if err != nil {
-				harness.dumpNodeLogs("is_prepared")
 				t.Fatalf("node %d %s, prepared: %v", nodeID, tc.name, err)
 			}
 			text, err := queryAnswer(conn, tc.text)
@@ -174,8 +161,7 @@ func TestInformationSchemaAnswersOnEveryPath(t *testing.T) {
 		// database they read, completes. An index on posts leaves every answer
 		// above unchanged for the next node.
 		ddl := fmt.Sprintf("CREATE INDEX after_is_%d ON posts (body)", nodeID)
-		if _, err := execTimed(openTimedNodeDatabase(t, harness, nodeID, "isdb"), ddl); err != nil {
-			harness.dumpNodeLogs("is_ddl")
+		if _, err := c.exec(nodeID, "isdb", ddl); err != nil {
 			t.Fatalf("node %d: %s after INFORMATION_SCHEMA queries: %v", nodeID, ddl, err)
 		}
 	}

@@ -40,7 +40,7 @@ func TestClaimRange_JoinersHoldVotesUntilMerged(t *testing.T) {
 	require.Equal(t, uint64(0), base3, "n3 must have missed C for the sequence to mean anything")
 
 	for _, id := range []uint64{4, 5} {
-		joiner := c.buildNode(id, t.TempDir())
+		joiner := c.buildNode(id, freshDir(t))
 		c.nodes[id] = joiner
 		require.NoError(t, joiner.dm.CreateDatabase(database))
 		mdb, err := joiner.dm.GetDatabase(database)
@@ -89,7 +89,7 @@ func TestClaimRange_RebuiltNodeHoldsVotesUntilMerged(t *testing.T) {
 	c.fanout.setUnreachable(3, false)
 
 	c.closeNode(1)
-	rebuilt := c.buildNode(1, t.TempDir())
+	rebuilt := c.buildNode(1, freshDir(t))
 	c.nodes[1] = rebuilt
 	require.NoError(t, rebuilt.dm.CreateDatabase(database))
 	mdb, err := rebuilt.dm.GetDatabase(database)

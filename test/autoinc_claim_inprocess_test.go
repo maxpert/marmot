@@ -195,7 +195,7 @@ type inprocCluster struct {
 
 const inprocCoordinatorTimeout = 30 * time.Second
 
-// newInprocCluster builds nodeIDs participants, each with its own t.TempDir()
+// newInprocCluster builds nodeIDs participants, each with its own freshDir
 // data directory (db/replication_engine_test.go:64-78's own-tempdir
 // pattern). It registers a cleanup that closes whatever DatabaseManager is
 // current for each node at test end, so a test that reopens a node (restart,
@@ -209,7 +209,7 @@ func newInprocCluster(t *testing.T, nodeIDs []uint64) *inprocCluster {
 		nodes:    make(map[uint64]*inprocNode),
 	}
 	for _, id := range nodeIDs {
-		c.nodes[id] = c.buildNode(id, t.TempDir())
+		c.nodes[id] = c.buildNode(id, freshDir(t))
 	}
 	c.releaseNewCluster()
 	t.Cleanup(func() {
@@ -285,7 +285,7 @@ func (c *inprocCluster) reopenNode(id uint64) {
 
 // newInprocClusterFromDirs rebuilds an inprocCluster from data directories a
 // prior process already populated - one per node ID - instead of creating
-// fresh t.TempDir() storage the way newInprocCluster does. This is what a
+// fresh freshDir storage the way newInprocCluster does. This is what a
 // node process reopening its own on-disk state, potentially from a separate
 // os.Process that no longer exists, looks like from the test's side; it is
 // how TestClaimRange_KillNineRecoversCommittedBase inspects a cluster after
@@ -350,21 +350,10 @@ func driveDDL(t *testing.T, node *inprocNode, database, table, ddl string) {
 func waitForBase(t *testing.T, node *inprocNode, database, table string, want uint64) {
 	t.Helper()
 	store := node.claimStore()
-	deadline := time.Now().Add(5 * time.Second)
-	var last uint64
-	var lastErr error
-	for {
-		last, lastErr = store.ReadBase(database, table)
-		if lastErr == nil && last == want {
-			return
-		}
-		if time.Now().After(deadline) {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	require.NoError(t, lastErr, "node %d: final ReadBase(%s.%s)", node.id, database, table)
-	require.Equal(t, want, last, "node %d: base for %s.%s did not converge in time", node.id, database, table)
+	waitFor(t, fmt.Sprintf("node %d base for %s.%s = %d", node.id, database, table, want), 5*time.Second, func() (bool, string) {
+		last, err := store.ReadBase(database, table)
+		return err == nil && last == want, fmt.Sprintf("base %d, err %v", last, err)
+	})
 }
 
 // waitForQuorumBase polls until at least minNodes of nodes read `want` for
@@ -395,25 +384,15 @@ func waitForBase(t *testing.T, node *inprocNode, database, table string, want ui
 // coordinator itself required (RequiredQuorum for 3 nodes = 2, coordinator/cluster.go:100).
 func waitForQuorumBase(t *testing.T, nodes []*inprocNode, database, table string, want uint64, minNodes int) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	var lastCount int
-	for {
-		lastCount = 0
+	waitFor(t, fmt.Sprintf("%d of %d nodes base for %s.%s = %d", minNodes, len(nodes), database, table, want), 5*time.Second, func() (bool, string) {
+		count := 0
 		for _, n := range nodes {
 			if b, err := n.claimStore().ReadBase(database, table); err == nil && b == want {
-				lastCount++
+				count++
 			}
 		}
-		if lastCount >= minNodes {
-			return
-		}
-		if time.Now().After(deadline) {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	require.GreaterOrEqual(t, lastCount, minNodes,
-		"only %d/%d nodes converged to %d for %s.%s within the deadline", lastCount, len(nodes), want, database, table)
+		return count >= minNodes, fmt.Sprintf("%d nodes converged", count)
+	})
 }
 
 // rangesDisjoint reports whether two claimed ranges (newBase, newBase+size]
@@ -842,7 +821,7 @@ func killNineNodeDir(root string, id uint64) string {
 // three nodes from the same directories and asserts the committed base and
 // the claim protocol's staleness rejection both survived the kill.
 func TestClaimRange_KillNineRecoversCommittedBase(t *testing.T) {
-	root := t.TempDir()
+	root := freshDir(t)
 	dataDirs := make(map[uint64]string, 3)
 	for _, id := range []uint64{1, 2, 3} {
 		dir := killNineNodeDir(root, id)
@@ -1075,7 +1054,7 @@ func TestClaimRange_SurvivesFullClusterSnapshotRestore(t *testing.T) {
 
 	// Snapshot every node BEFORE any of them stop.
 	for _, id := range []uint64{1, 2, 3} {
-		snapDir := t.TempDir()
+		snapDir := freshDir(t)
 		snapshots, _, err := c.nodes[id].dm.TakeSnapshotToDir(snapDir)
 		require.NoError(t, err)
 		require.NotEmpty(t, snapshots)

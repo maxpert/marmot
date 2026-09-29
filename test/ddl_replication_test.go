@@ -4,8 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"os"
-	"sync"
 	"testing"
 	"time"
 
@@ -13,112 +11,8 @@ import (
 	"github.com/maxpert/marmot/db"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/protocol"
-	"github.com/maxpert/marmot/protocol/query/transform"
 	"github.com/stretchr/testify/require"
 )
-
-// DDLMockDatabaseManager implements coordinator.DatabaseManager for testing
-type DDLMockDatabaseManager struct {
-	mu        sync.RWMutex
-	databases map[string]*sql.DB
-}
-
-func NewDDLMockDatabaseManager() *DDLMockDatabaseManager {
-	return &DDLMockDatabaseManager{
-		databases: make(map[string]*sql.DB),
-	}
-}
-
-func (m *DDLMockDatabaseManager) ListDatabases() []string {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	names := make([]string, 0, len(m.databases))
-	for name := range m.databases {
-		names = append(names, name)
-	}
-	return names
-}
-
-func (m *DDLMockDatabaseManager) DatabaseExists(name string) bool {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	_, exists := m.databases[name]
-	return exists
-}
-
-func (m *DDLMockDatabaseManager) CreateDatabase(name string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if _, exists := m.databases[name]; exists {
-		return nil // Idempotent
-	}
-
-	// Create in-memory SQLite database
-	sqlDB, err := sql.Open("sqlite3_marmot", ":memory:")
-	if err != nil {
-		return err
-	}
-
-	m.databases[name] = sqlDB
-	return nil
-}
-
-func (m *DDLMockDatabaseManager) DropDatabase(name string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if sqlDB, exists := m.databases[name]; exists {
-		sqlDB.Close()
-		delete(m.databases, name)
-	}
-	return nil
-}
-
-func (m *DDLMockDatabaseManager) GetDatabaseConnection(name string) (*sql.DB, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	sqlDB, exists := m.databases[name]
-	if !exists {
-		return nil, fmt.Errorf("database '%s' does not exist", name)
-	}
-	return sqlDB, nil
-}
-
-func (m *DDLMockDatabaseManager) GetDatabaseReadConnection(name string) (*sql.DB, error) {
-	return m.GetDatabaseConnection(name)
-}
-
-func (m *DDLMockDatabaseManager) GetReplicatedDatabase(name string) (coordinator.ReplicatedDatabaseProvider, error) {
-	// Not implemented in DDL mock
-	return nil, fmt.Errorf("not implemented in DDL mock")
-}
-
-func (m *DDLMockDatabaseManager) GetAutoIncrementColumn(database, table string) (string, error) {
-	// Not implemented in DDL mock - return empty
-	return "", nil
-}
-
-func (m *DDLMockDatabaseManager) GetTranspilerSchema(database, table string) (*transform.SchemaInfo, error) {
-	// Not implemented in DDL mock
-	return nil, nil
-}
-
-func (m *DDLMockDatabaseManager) GetVectorIndexManager() coordinator.VectorIndexManagerProvider {
-	return nil
-}
-
-// RegistryKeyGeneration reports generation 1 for any database this mock is
-// tracking (live) and 0 for any it is not (never seen); the DDL mock has no
-// tombstone/generation history of its own to model.
-func (m *DDLMockDatabaseManager) RegistryKeyGeneration(name string) (uint64, bool, error) {
-	if m.DatabaseExists(name) {
-		return 1, true, nil
-	}
-	return 0, false, nil
-}
 
 // DDLMockReader implements coordinator.Reader for testing
 type DDLMockReader struct{}
@@ -352,9 +246,7 @@ func commitDDLForTest(t *testing.T, dbMgr *db.DatabaseManager, database, ddlSQL,
 // through SchemaVersionManager and bumped atomically by each committed DDL
 // transaction - not by a direct setter, which no longer exists.
 func TestSchemaVersionManager(t *testing.T) {
-	tmpDir, err := testDataDir("schema-version-test-*")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpDir)
+	tmpDir := testDir(t)
 
 	clock := hlc.NewClock(1)
 	dbMgr, err := db.NewDatabaseManager(tmpDir, 1, clock)
@@ -495,13 +387,15 @@ func TestDDLLockManager(t *testing.T) {
 		lock, err := shortLockMgr.AcquireLock("expiredb", 1, 3001, ts)
 		require.NoError(t, err)
 		require.NotNil(t, lock)
+		_, err = shortLockMgr.AcquireLock("expiredb", 2, 3002, ts)
+		require.Error(t, err, "the lock is held until it expires")
 
-		// Wait for lock to expire
-		time.Sleep(150 * time.Millisecond)
-
-		// Another transaction should be able to acquire the expired lock
-		lock2, err := shortLockMgr.AcquireLock("expiredb", 2, 3002, ts)
-		require.NoError(t, err)
+		// Once the lock expires, another transaction acquires it.
+		var lock2 *coordinator.DDLLock
+		waitFor(t, "expired DDL lock acquired by another transaction", time.Second, func() (bool, string) {
+			lock2, err = shortLockMgr.AcquireLock("expiredb", 2, 3002, ts)
+			return err == nil, fmt.Sprint(err)
+		})
 		require.NotNil(t, lock2)
 		require.Equal(t, uint64(2), lock2.NodeID)
 	})
@@ -513,10 +407,8 @@ func TestDDLReplicationBasic(t *testing.T) {
 	// Create temp directory for the real DatabaseManager. Schema versions are
 	// now read from each database's own __marmot_schema_version SQLite table,
 	// so DDL must commit for real through a real DatabaseManager -
-	// the DDLMockDatabaseManager has no such table.
-	tmpDir, err := testDataDir("ddl-replication-test-*")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpDir)
+	// a mock database manager has no such table.
+	tmpDir := testDir(t)
 
 	clock := hlc.NewClock(1)
 	dbMgr, err := db.NewDatabaseManager(tmpDir, 1, clock)
@@ -611,9 +503,7 @@ func TestDDLWithConcurrentDML(t *testing.T) {
 	// Setup test infrastructure. Schema versions are read from each
 	// database's own __marmot_schema_version SQLite table, so this
 	// needs a real DatabaseManager, not DDLMockDatabaseManager.
-	tmpDir, err := testDataDir("ddl-concurrent-dml-test-*")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpDir)
+	tmpDir := testDir(t)
 
 	clock := hlc.NewClock(1)
 	dbMgr, err := db.NewDatabaseManager(tmpDir, 1, clock)
@@ -768,47 +658,20 @@ func TestDDLSerializationWithLocking(t *testing.T) {
 	lockMgr := coordinator.NewDDLLockManager(5 * time.Second)
 	clock := hlc.NewClock(1)
 
-	// Simulate two concurrent DDL operations on the same database
+	// Two DDL operations on the same database: while the first holds the
+	// lock, the second is refused; once the first releases it, the second
+	// acquires it.
 	t.Run("Concurrent DDL operations serialized", func(t *testing.T) {
-		var wg sync.WaitGroup
-		errors := make([]error, 2)
+		_, err := lockMgr.AcquireLock("testdb", 1, 1001, clock.Now())
+		require.NoError(t, err, "first DDL should acquire lock")
 
-		// Transaction 1: Acquire lock first
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			ts := clock.Now()
-			lock, err := lockMgr.AcquireLock("testdb", 1, 1001, ts)
-			if err != nil {
-				errors[0] = err
-				return
-			}
+		_, err = lockMgr.AcquireLock("testdb", 2, 1002, clock.Now())
+		require.Error(t, err, "second DDL should fail to acquire lock")
+		require.Contains(t, err.Error(), "DDL lock for database 'testdb' is held")
 
-			// Hold lock briefly
-			time.Sleep(100 * time.Millisecond)
-
-			lockMgr.ReleaseLock("testdb", 1001)
-			_ = lock
-		}()
-
-		// Transaction 2: Try to acquire lock (should wait/fail)
-		time.Sleep(10 * time.Millisecond) // Ensure txn1 acquires first
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			ts := clock.Now()
-			_, err := lockMgr.AcquireLock("testdb", 2, 1002, ts)
-			errors[1] = err
-		}()
-
-		wg.Wait()
-
-		// First transaction should succeed
-		require.NoError(t, errors[0], "first DDL should acquire lock")
-
-		// Second transaction should fail (lock held)
-		require.Error(t, errors[1], "second DDL should fail to acquire lock")
-		require.Contains(t, errors[1].Error(), "DDL lock for database 'testdb' is held")
+		require.NoError(t, lockMgr.ReleaseLock("testdb", 1001))
+		_, err = lockMgr.AcquireLock("testdb", 2, 1002, clock.Now())
+		require.NoError(t, err, "second DDL should acquire the released lock")
 	})
 }
 

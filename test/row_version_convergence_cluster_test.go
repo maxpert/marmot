@@ -2,145 +2,103 @@ package test
 
 // Cluster test for row-value convergence: nodes 1 and 2 keep overwriting the
 // same rows while node 3 is down and for a moment after it returns, then
-// node 3 writes each row once more. Every node must end with the same value
-// for every row. The order in which a node meets older and newer images of
-// a row is pinned deterministically by grpc's log puller tests; this checks
-// the end-to-end outcome.
+// node 3 writes each row once more. Every node must end with exactly node
+// 3's last value for every row. The order in which a node meets older and
+// newer images of a row is pinned deterministically by grpc's log puller
+// tests; this checks the end-to-end outcome.
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
-	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
-	"time"
 )
 
-const (
-	// hotRows is how many rows the writers keep overwriting.
-	hotRows = 10
-	// hotOutage is how long node 3 stays down under load.
-	hotOutage = 10 * time.Second
-	// hotAfterRestart is how long the load continues once node 3 is back.
-	hotAfterRestart = 2 * time.Second
-)
+// hotRows is how many rows the hot writers keep overwriting.
+const hotRows = 10
 
-// tableChecksum hashes every (id, v) of table on node, in id order.
-func tableChecksum(t *testing.T, h *ClusterHarness, node int, database, table string) (string, error) {
-	a, err := queryAnswer(openTimedNodeDatabase(t, h, node, database), "SELECT id, v FROM "+table+" ORDER BY id")
-	if err != nil {
-		return "", fmt.Errorf("node %d: %v", node, err)
-	}
-	sum := sha256.New()
-	for _, r := range a.rows {
-		fmt.Fprintf(sum, "%s=%s\n", r[0], r[1])
-	}
-	return hex.EncodeToString(sum.Sum(nil))[:16], nil
-}
-
-// waitChecksumsEqual polls until table's checksum is identical on every
-// node, within deadline.
-func waitChecksumsEqual(t *testing.T, h *ClusterHarness, database, table string, deadline time.Duration) {
-	t.Helper()
-	start := time.Now()
-	for {
-		h.Progress()
-		sums := make([]string, 0, numNodes)
-		for node := 1; node <= numNodes; node++ {
-			sum, err := tableChecksum(t, h, node, database, table)
-			if err != nil {
-				sum = err.Error()
-			}
-			sums = append(sums, sum)
-		}
-		equal := true
-		for _, s := range sums[1:] {
-			equal = equal && s == sums[0]
-		}
-		if equal {
-			t.Logf("checksums equal on every node %s after load stopped", time.Since(start).Round(time.Millisecond))
-			return
-		}
-		if time.Since(start) > deadline {
-			h.dumpNodeLogs("cluster_" + strings.ReplaceAll(t.Name(), "/", "_"))
-			t.Fatalf("%s.%s checksums still differ %s after load stopped: %v", database, table, deadline, sums)
-		}
-		time.Sleep(convergencePoll)
-	}
+// hotWriters counts the ACKed updates of runHotWriters and keeps the last
+// failure, for a wait that times out to print.
+type hotWriters struct {
+	acked   atomic.Int64
+	lastErr atomic.Value
 }
 
 // runHotWriters has each node in nodes overwrite rows 1..hotRows in turn
-// until stop closes. A statement that fails is retried on the next turn.
-func runHotWriters(t *testing.T, h *ClusterHarness, database, table string, nodes []int, stop <-chan struct{}) *sync.WaitGroup {
+// until the returned stop is called, counting ACKed updates in w.
+func runHotWriters(c *cluster, database, table string, nodes []int, w *hotWriters) (stop func()) {
+	done := make(chan struct{})
 	var wg sync.WaitGroup
 	for _, n := range nodes {
 		wg.Add(1)
 		go func(n int) {
 			defer wg.Done()
-			conn := openTimedNodeDatabase(t, h, n, database)
 			for i := 0; ; i++ {
 				select {
-				case <-stop:
+				case <-done:
 					return
 				default:
 				}
-				id := i%hotRows + 1
-				if _, err := execTimed(conn, "UPDATE "+table+" SET v = ? WHERE id = ?", fmt.Sprintf("n%d#%d", n, i), id); err != nil {
-					time.Sleep(convergencePoll)
-					continue
+				q := "UPDATE " + table + " SET v = ? WHERE id = ?"
+				if _, ok, lastErr := writeRetrying(c, n, database, done, q, fmt.Sprintf("n%d#%d", n, i), i%hotRows+1); ok {
+					w.acked.Add(1)
+				} else if lastErr != "" {
+					w.lastErr.Store(fmt.Sprintf("node %d: %s", n, lastErr))
 				}
-				h.Progress()
 			}
 		}(n)
 	}
-	return &wg
+	return func() {
+		close(done)
+		wg.Wait()
+	}
 }
 
+// waitAcked waits until w's ACKed updates have grown by n.
+func waitAcked(c *cluster, w *hotWriters, n int64, phase string) {
+	c.t.Helper()
+	want := w.acked.Load() + n
+	waitFor(c.t, fmt.Sprintf("%s: %d ACKed updates", phase, want), replicationDeadline, func() (bool, string) {
+		c.progress()
+		return w.acked.Load() >= want, fmt.Sprintf("%d ACKed, last error: %v", w.acked.Load(), w.lastErr.Load())
+	})
+}
+
+// TestSameRowsOverwrittenAcrossOutageConvergeByValue: rows overwritten on
+// nodes 1 and 2 while node 3 is down, and just after it returns, then
+// written once more by node 3 before it may have pulled what it missed, end
+// with node 3's last value on every node.
 func TestSameRowsOverwrittenAcrossOutageConvergeByValue(t *testing.T) {
-	h := NewClusterHarness(t)
-	defer h.Cleanup()
 	const database, table = "hotrows", "t"
-	startWithTables(t, h, map[string][]string{database: {table}})
-	conn := openTimedNodeDatabase(t, h, 1, database)
+	// Two writers overwriting the same rows block on each other's intents; a
+	// short lock wait turns each such conflict into a quick retryable 1205.
+	c := newCluster(t, func(cfg *clusterConfig) { cfg.lockWaitTimeoutSecs = 1 })
+	c.start()
+	c.createDatabase(1, database)
+	c.createTable(1, database, table, "CREATE TABLE "+table+" (id INT PRIMARY KEY, v TEXT)")
+	values, _ := idValueRows(1, hotRows, "seed")
+	c.mustExec(1, database, "INSERT INTO "+table+" (id, v) VALUES "+values)
+	c.waitSameRows(database, "SELECT id, v FROM "+table+" ORDER BY id", 1, 2, 3)
+
+	c.phase("seeded")
+	c.kill(3)
+	var w hotWriters
+	stop := runHotWriters(c, database, table, []int{1, 2}, &w)
+	waitAcked(c, &w, 3*ledgerStep, "while node 3 is down")
+	c.phase("outage-load")
+	c.startNode(3)
+	c.waitMySQL(3)
+	c.phase("restart")
+	waitAcked(c, &w, ledgerStep, "after node 3 returned")
+	stop()
+	c.phase("after-load")
+
+	var want []string
 	for id := 1; id <= hotRows; id++ {
-		if _, err := execTimed(conn, "INSERT INTO "+table+" (id, v) VALUES (?, 'seed')", id); err != nil {
-			t.Fatalf("seed row %d: %v", id, err)
-		}
+		c.mustExec(3, database, "UPDATE "+table+" SET v = ? WHERE id = ?", fmt.Sprintf("final#%d", id), id)
+		want = append(want, fmt.Sprintf("%d|final#%d", id, id))
 	}
-	waitChecksumsEqual(t, h, database, table, convergenceDeadline)
-	h.Phase("seeded")
-
-	if err := h.StopNode(3); err != nil {
-		t.Fatal(err)
-	}
-	h.Phase("node3-stopped")
-	stop := make(chan struct{})
-	wg := runHotWriters(t, h, database, table, []int{1, 2}, stop)
-	sleepWithProgress(h, hotOutage)
-
-	if err := h.StartNode(3); err != nil {
-		t.Fatal(err)
-	}
-	if err := h.WaitForAlive(3, restartDeadline); err != nil {
-		t.Fatal(err)
-	}
-	h.Phase("node3-alive")
-	sleepWithProgress(h, hotAfterRestart)
-	close(stop)
-	wg.Wait()
-	h.Phase("load-stopped")
-
-	// One last live write per row, coordinated by node 3 itself, while the
-	// writes it missed during the outage may still be waiting to be pulled.
-	conn3 := openTimedNodeDatabase(t, h, 3, database)
-	for id := 1; id <= hotRows; id++ {
-		if _, err := execTimed(conn3, "UPDATE "+table+" SET v = ? WHERE id = ?", fmt.Sprintf("final#%d", id), id); err != nil {
-			t.Fatalf("final update of row %d: %v", id, err)
-		}
-	}
-	h.Phase("final-writes")
-
-	waitChecksumsEqual(t, h, database, table, convergenceDeadline)
-	h.Phase("converged")
+	c.phase("final-writes")
+	c.waitRows(database, "SELECT id, v FROM "+table+" ORDER BY id", want, 1, 2, 3)
+	c.phase("converged")
 }
