@@ -97,6 +97,9 @@ type ReplicationRequest struct {
 	Database string
 	// Minimum schema version required to execute this transaction
 	RequiredSchemaVersion uint64
+	// CommitTS is, on COMMIT, the commit timestamp every participant commits
+	// with (decideCommitTS).
+	CommitTS hlc.Timestamp
 }
 
 // ReplicationPhase indicates which phase of 2PC
@@ -112,6 +115,10 @@ const (
 type ReplicationResponse struct {
 	Success bool
 	Error   string
+	// AppliedAt is the participant's clock when it answered; zero when it
+	// sent none. The coordinator merges every PREPARE's into its clock
+	// before deciding the commit timestamp.
+	AppliedAt hlc.Timestamp
 	// ConflictDetected indicates write-write conflict
 	ConflictDetected bool
 	ConflictDetails  string
@@ -344,6 +351,7 @@ func (wc *WriteCoordinator) buildCommitRequest(txn *Transaction) *ReplicationReq
 		TxnID:      txn.ID,
 		Phase:      PhaseCommit,
 		StartTS:    txn.StartTS,
+		CommitTS:   txn.CommitTS,
 		NodeID:     wc.nodeID,
 		Database:   txn.Database,
 		Statements: commitStmts,
@@ -632,6 +640,21 @@ func (wc *WriteCoordinator) commitLocalAfterRemoteQuorum(ctx context.Context, re
 	return localResp, nil
 }
 
+// decideCommitTS returns the transaction's commit timestamp, identical on
+// every node that commits it. Every participant's PREPARE-time clock is
+// merged in first: a participant grants a row's intent only after it has
+// committed that row's previous writer, merging that writer's commit
+// timestamp into its clock, so the result is later than the commit
+// timestamp of every earlier conflicting transaction.
+func (wc *WriteCoordinator) decideCommitTS(prepResponses map[uint64]*ReplicationResponse) hlc.Timestamp {
+	for _, resp := range prepResponses {
+		if resp != nil && !resp.AppliedAt.IsZero() {
+			wc.clock.Update(resp.AppliedAt)
+		}
+	}
+	return wc.clock.Now()
+}
+
 // runCommitPhase orchestrates the commit phase of 2PC.
 // Quorum of write intents created successfully with no conflicts.
 //
@@ -644,6 +667,7 @@ func (wc *WriteCoordinator) runCommitPhase(ctx context.Context, txn *Transaction
 		Int("prepared_nodes", len(prepResponses)).
 		Msg("PREPARE phase complete, starting COMMIT")
 
+	txn.CommitTS = wc.decideCommitTS(prepResponses)
 	commitReq := wc.buildCommitRequest(txn)
 
 	// Count other prepared nodes (excluding self)

@@ -54,7 +54,7 @@ func transactionRequestToProto(req *coordinator.ReplicationRequest) (*Transactio
 	if err != nil {
 		return nil, err
 	}
-	return &TransactionRequest{
+	protoReq := &TransactionRequest{
 		TxnId:        req.TxnID,
 		SourceNodeId: req.NodeID,
 		Statements:   statements,
@@ -66,7 +66,11 @@ func transactionRequestToProto(req *coordinator.ReplicationRequest) (*Transactio
 		Phase:                 convertPhaseToProto(req.Phase),
 		Database:              req.Database,
 		RequiredSchemaVersion: req.RequiredSchemaVersion,
-	}, nil
+	}
+	if !req.CommitTS.IsZero() {
+		protoReq.CommitTimestamp = convertTimestampToHLC(req.CommitTS)
+	}
+	return protoReq, nil
 }
 
 // convertTransactionResponse converts a gRPC TransactionResponse into
@@ -78,6 +82,7 @@ func convertTransactionResponse(resp *TransactionResponse) *coordinator.Replicat
 	return &coordinator.ReplicationResponse{
 		Success:          resp.Success,
 		Error:            resp.ErrorMessage,
+		AppliedAt:        HLCToTimestamp(resp.AppliedAt),
 		ConflictDetected: resp.ConflictDetected,
 		ConflictDetails:  resp.ConflictDetails,
 		Rejected:         resp.Rejected,
@@ -244,7 +249,11 @@ func (gr *GRPCReplicator) StreamReplicateTransaction(ctx context.Context, nodeID
 
 	// Call streaming client with configured chunk size
 	chunkSize := coordinator.GetStreamChunkSize()
-	grpcResp, err := gr.client.TransactionStream(ctx, nodeID, req.TxnID, req.Database, statements, chunkSize, timestamp, req.NodeID)
+	var commitTimestamp *HLC
+	if !req.CommitTS.IsZero() {
+		commitTimestamp = convertTimestampToHLC(req.CommitTS)
+	}
+	grpcResp, err := gr.client.TransactionStream(ctx, nodeID, req.TxnID, req.Database, statements, chunkSize, timestamp, commitTimestamp, req.NodeID)
 	if err != nil {
 		return nil, fmt.Errorf("streaming gRPC call failed: %w", err)
 	}

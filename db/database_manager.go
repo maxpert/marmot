@@ -45,19 +45,20 @@ type DatabaseProvider interface {
 // so one of them can close a database outside mu while the others wait; no GC
 // pass ever takes lifecycleMu.
 type DatabaseManager struct {
-	lifecycleMu       sync.Mutex
-	mu                sync.RWMutex
-	databases         map[string]*ReplicatedDatabase
-	detached          map[string]*detachedDatabase // user databases out of service for a snapshot restore
-	systemDB          *ReplicatedDatabase
-	dataDir           string
-	nodeID            uint64
-	clock             *hlc.Clock
-	cdcHub            CDCHub                          // CDC notification hub, can be nil
-	vecIndexMgr       *VectorIndexManager             // Optional vector index manager
-	autoIncClaimStore *AutoIncClaimStore              // AUTO_INCREMENT claim store, backed by systemDB
-	membershipView    atomic.Pointer[func() int]      // this node's view of total cluster membership
-	gcMembershipFunc  atomic.Pointer[func() []uint64] // current member node ids (self included, not REMOVED); source for each database's GC safe position
+	lifecycleMu          sync.Mutex
+	mu                   sync.RWMutex
+	databases            map[string]*ReplicatedDatabase
+	detached             map[string]*detachedDatabase // user databases out of service for a snapshot restore
+	systemDB             *ReplicatedDatabase
+	dataDir              string
+	nodeID               uint64
+	clock                *hlc.Clock
+	cdcHub               CDCHub                          // CDC notification hub, can be nil
+	vecIndexMgr          *VectorIndexManager             // Optional vector index manager
+	autoIncClaimStore    *AutoIncClaimStore              // AUTO_INCREMENT claim store, backed by systemDB
+	membershipView       atomic.Pointer[func() int]      // this node's view of total cluster membership
+	gcMembershipFunc     atomic.Pointer[func() []uint64] // current member node ids (self included, not REMOVED); source for each database's GC safe position
+	tombstoneMemberCount atomic.Pointer[func() int]      // members for the tombstone horizon (SetTombstoneMemberCountFunc)
 }
 
 // SetClusterMembership installs view as the source of this node's view of
@@ -85,6 +86,15 @@ func (dm *DatabaseManager) ClusterMembership() (int, error) {
 // called, GC treats nothing as safe except entries past max retention.
 func (dm *DatabaseManager) SetGCMembershipFunc(view func() []uint64) {
 	dm.gcMembershipFunc.Store(&view)
+}
+
+// SetTombstoneMemberCountFunc installs count as the member count every
+// database's tombstone GC bounds its horizon with (purgeTombstones): every
+// member whose log could still hold an entry, which is every member this
+// node has known, REMOVED ones included. count returns 0 while that is not
+// yet known, and no tombstone is purged. Until this is called, none is.
+func (dm *DatabaseManager) SetTombstoneMemberCountFunc(count func() int) {
+	dm.tombstoneMemberCount.Store(&count)
 }
 
 // DatabaseMetadata represents database registry information
@@ -401,6 +411,14 @@ func (dm *DatabaseManager) wireGCCoordination(mdb *ReplicatedDatabase, dbName st
 			return LogPosition{}, false
 		}
 		return safe, true
+	})
+
+	txnMgr.SetMemberCountFunc(func() int {
+		countPtr := dm.tombstoneMemberCount.Load()
+		if countPtr == nil {
+			return 0
+		}
+		return (*countPtr)()
 	})
 
 	// Wire CDC notifier if available

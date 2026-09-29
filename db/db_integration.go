@@ -242,6 +242,10 @@ func NewReplicatedDatabase(dbPath string, nodeID uint64, clock *hlc.Clock, metaS
 		closeAll()
 		return nil, err
 	}
+	if err := ensureRowVersionTable(writeDB); err != nil {
+		closeAll()
+		return nil, err
+	}
 	if err := repairAppliedTxnMetadata(writeDB, metaStore, o.dbName); err != nil {
 		closeAll()
 		return nil, err
@@ -261,6 +265,10 @@ func NewReplicatedDatabase(dbPath string, nodeID uint64, clock *hlc.Clock, metaS
 
 	// Create transaction manager (uses write connection + MetaStore + schema cache)
 	txnMgr := NewTransactionManager(writeDB, metaStore, clock, schemaCache)
+	if err := seedClockFromLog(clock, metaStore); err != nil {
+		closeAll()
+		return nil, err
+	}
 
 	// Create batch committer for SQLite-level batching (opens its own optimized connection)
 	var batchCommitter *SQLiteBatchCommitter

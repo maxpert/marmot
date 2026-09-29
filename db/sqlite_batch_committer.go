@@ -242,6 +242,10 @@ func (bc *SQLiteBatchCommitter) openOptimizedConnection() (*sql.DB, error) {
 		db.Close()
 		return nil, err
 	}
+	if err := ensureRowVersionTable(db); err != nil {
+		db.Close()
+		return nil, err
+	}
 
 	return db, nil
 }
@@ -441,8 +445,14 @@ func (bc *SQLiteBatchCommitter) flush(batch map[uint64]*pendingCommit, trigger s
 		return
 	}
 
-	// Create schema adapter for the unified applier
-	schemaAdapter := &schemaCacheAdapter{cache: schemaCache}
+	applier, err := newVersionedApplier(tx, &schemaCacheAdapter{cache: schemaCache})
+	if err != nil {
+		tx.Rollback()
+		for _, pc := range batch {
+			pc.promise.Set(nil, err)
+		}
+		return
+	}
 
 	// Apply each logical transaction under a savepoint. A failed transaction
 	// rolls back its own row changes without poisoning successful peers in the
@@ -458,7 +468,7 @@ func (bc *SQLiteBatchCommitter) flush(batch map[uint64]*pendingCommit, trigger s
 			continue
 		}
 		for _, entry := range pc.cdcEntries {
-			if err := ApplyCDCEntry(tx, schemaAdapter, entry); err != nil {
+			if err := applier.applyEntry(entry, pc.commitTS); err != nil {
 				pc.err = err
 				break
 			}
@@ -476,6 +486,7 @@ func (bc *SQLiteBatchCommitter) flush(batch map[uint64]*pendingCommit, trigger s
 		}
 	}
 
+	applier.Close()
 	// Commit (single fsync for entire batch)
 	if err := tx.Commit(); err != nil {
 		tx.Rollback()

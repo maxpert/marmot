@@ -1189,3 +1189,36 @@ func TestNodeRegistry_DiscoveringAnAliveNodeConnectsToIt(t *testing.T) {
 		t.Fatalf("a peer that turned ALIVE was never connected: %v", connected)
 	}
 }
+
+// A REMOVED member still counts toward the tombstone horizon, and the count
+// survives a restart through the persisted membership.
+func TestNodeRegistry_KnownMemberCountKeepsRemovedMembersAcrossRestart(t *testing.T) {
+	dir := t.TempDir()
+	nr := NewNodeRegistryWithDataDir(1, "localhost:8081", dir)
+	nr.Add(&NodeState{NodeId: 2, Status: NodeStatus_ALIVE})
+	nr.Add(&NodeState{NodeId: 3, Status: NodeStatus_ALIVE})
+	if err := nr.MarkRemoved(3); err != nil {
+		t.Fatalf("MarkRemoved: %v", err)
+	}
+	if got := nr.KnownMemberCount(true); got != 3 {
+		t.Fatalf("KnownMemberCount = %d, want 3 (a REMOVED member counts)", got)
+	}
+
+	restarted := NewNodeRegistryWithDataDir(1, "localhost:8081", dir)
+	if got := restarted.KnownMemberCount(true); got != 3 {
+		t.Fatalf("KnownMemberCount after restart = %d, want 3", got)
+	}
+}
+
+// A seeded node that knows only itself has not learned its membership: the
+// count is unknown (0) until it does. An unseeded, standalone node is a
+// membership of one.
+func TestNodeRegistry_KnownMemberCountUnknownUntilASeededNodeLearnsPeers(t *testing.T) {
+	nr := NewNodeRegistry(1, "localhost:8081")
+	if got := nr.KnownMemberCount(true); got != 0 {
+		t.Fatalf("seeded, alone: KnownMemberCount = %d, want 0", got)
+	}
+	if got := nr.KnownMemberCount(false); got != 1 {
+		t.Fatalf("standalone: KnownMemberCount = %d, want 1", got)
+	}
+}

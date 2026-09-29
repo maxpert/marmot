@@ -61,7 +61,7 @@ func TestStaleGCAndLocalCommitNeverCommitAnEmptyTransaction(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < staleGCRaceTxns; i++ {
-			_ = dm.CommitLocallyPrepared("testdb", uint64(firstTxn+i))
+			_ = dm.CommitLocallyPrepared("testdb", uint64(firstTxn+i), hlc.Timestamp{})
 		}
 	}()
 	wg.Wait()

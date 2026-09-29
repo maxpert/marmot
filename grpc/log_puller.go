@@ -405,7 +405,7 @@ func (lp *LogPuller) applyPage(ctx context.Context, st *pullState, entries []*Lo
 			st.result.Stuck++
 			continue
 		}
-		fetch, err := lp.resolveLocalPending(st, e.TxnId, &covered[i])
+		fetch, err := lp.resolveLocalPending(st, e, &covered[i])
 		if err != nil {
 			return 0, err
 		}
@@ -426,8 +426,8 @@ func (lp *LogPuller) applyPage(ctx context.Context, st *pullState, entries []*Lo
 	return prefix, nil
 }
 
-// resolveLocalPending resolves this node's own record for txnID, which the
-// peer's log proves COMMITTED, and reports whether the entry must be fetched
+// resolveLocalPending resolves this node's own record for e's transaction,
+// which the peer's log proves COMMITTED (at e's commit timestamp), and reports whether the entry must be fetched
 // and replayed from the peer:
 //   - no PENDING record: fetch;
 //   - durably prepared: commit it through the local commit path
@@ -436,7 +436,8 @@ func (lp *LogPuller) applyPage(ctx context.Context, st *pullState, entries []*Lo
 //   - begun but abandoned (its PREPARE died with an earlier process): it
 //     promised nothing, so discard it and fetch;
 //   - begun and live (a PREPARE executing now): leave it for the next call.
-func (lp *LogPuller) resolveLocalPending(st *pullState, txnID uint64, covered *bool) (fetch bool, err error) {
+func (lp *LogPuller) resolveLocalPending(st *pullState, e *LogEntry, covered *bool) (fetch bool, err error) {
+	txnID := e.TxnId
 	kind, err := st.metaStore.ClassifyPending(txnID)
 	if err != nil {
 		return false, fmt.Errorf("check local status for txn %d: %w", txnID, err)
@@ -448,7 +449,7 @@ func (lp *LogPuller) resolveLocalPending(st *pullState, txnID uint64, covered *b
 		if st.localCommitFailed {
 			return false, nil
 		}
-		if err := lp.dbMgr.CommitLocallyPrepared(st.database, txnID); err != nil {
+		if err := lp.dbMgr.CommitLocallyPrepared(st.database, txnID, HLCToTimestamp(e.CommitTimestamp)); err != nil {
 			st.localCommitFailed = true
 			// A busy writer (a pinned session holding it, say) is not this
 			// transaction's fault and must not push it toward STUCK, whose

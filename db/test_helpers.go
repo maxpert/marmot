@@ -68,6 +68,10 @@ func openTestDBWithMeta(t *testing.T, dbPath string) *testDBWithMetaStore {
 		db.Close()
 		t.Fatalf("Failed to create applied transaction marker table: %v", err)
 	}
+	if err := ensureRowVersionTable(db); err != nil {
+		db.Close()
+		t.Fatalf("Failed to create row version table: %v", err)
+	}
 	// applyNonDMLIntents bumps __marmot_schema_version for any real DDL
 	// intent inside its one SQLite tx, same as NewReplicatedDatabase would
 	// have created it; this raw test *sql.DB needs it too.

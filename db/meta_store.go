@@ -125,8 +125,8 @@ type MetaStore interface {
 	// after `after`, in position order, restricted to COMMITTED
 	// transactions with Seq <= the stable point read at the start of the
 	// call, up to limit. more is true when further stable entries exist
-	// beyond the returned page.
-	ListCommittedLog(after LogPosition, limit int) (entries []LogPosition, stable uint64, more bool, err error)
+	// beyond the returned page. Each entry carries its commit timestamp.
+	ListCommittedLog(after LogPosition, limit int) (entries []CommittedLogEntry, stable uint64, more bool, err error)
 
 	// GetPullCursor and SetPullCursor persist C[self,peer,d]: this node's
 	// pull position in peerNodeID's log for this database.
@@ -207,6 +207,9 @@ type MetaStore interface {
 
 	// Aggregation queries for anti-entropy
 	GetMaxCommittedTxnID() (uint64, error)
+	// MaxCommitWall returns the largest commit wall time this store has
+	// logged, local or replayed, surviving restarts; 0 for an empty log.
+	MaxCommitWall() (int64, error)
 	GetCommittedTxnCount() (int64, error)
 
 	// Streaming for anti-entropy delta sync

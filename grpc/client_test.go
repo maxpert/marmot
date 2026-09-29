@@ -108,6 +108,7 @@ func TestClient_TransactionStream_ChunksSentCorrectly(t *testing.T) {
 		statements,
 		1024, // 1KB chunks
 		timestamp,
+		nil,
 		1,
 	)
 
@@ -176,6 +177,7 @@ func TestClient_TransactionStream_SingleChunk(t *testing.T) {
 		statements,
 		1024*1024, // 1MB chunks
 		timestamp,
+		nil,
 		5,
 	)
 
@@ -240,6 +242,7 @@ func TestClient_TransactionStream_ExactlyFiftyStatements(t *testing.T) {
 		statements,
 		1024*1024, // 1MB chunks
 		timestamp,
+		nil,
 		10,
 	)
 
@@ -294,6 +297,7 @@ func TestClient_TransactionStream_EmptyStatements(t *testing.T) {
 		[]*Statement{},
 		1024*1024, // 1MB chunks
 		timestamp,
+		nil,
 		7,
 	)
 
@@ -319,6 +323,7 @@ func TestClient_TransactionStream_NotConnected(t *testing.T) {
 		[]*Statement{},
 		1024*1024, // 1MB chunks
 		&HLC{},
+		nil,
 		1,
 	)
 

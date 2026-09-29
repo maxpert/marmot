@@ -161,6 +161,9 @@ message TransactionRequest {
   reserved 8;
   // Minimum schema version required to execute this transaction
   uint64 required_schema_version = 9;
+  // COMMIT only: the commit timestamp the coordinator decided, which every
+  // participant commits with. Unset from an older coordinator.
+  HLC commit_timestamp = 10;
 }
 
 enum TransactionPhase {
@@ -369,6 +372,7 @@ message LogListRequest {
 message LogEntry {
   uint64 seq = 1;
   uint64 txn_id = 2;
+  HLC commit_timestamp = 3;  // The entry's commit timestamp; unset from an older peer
 }
 
 message LogListResponse {
@@ -553,6 +557,7 @@ message TransactionCommit {
   string database = 2;
   HLC timestamp = 3;
   uint64 source_node_id = 4;
+  HLC commit_timestamp = 5;  // As TransactionRequest.commit_timestamp; unset from an older coordinator
 }
 
 // Wrapper for streaming (oneof for chunk vs commit)

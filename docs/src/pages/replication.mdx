@@ -298,6 +298,21 @@ The DML wire payload is the encoded msgpack bytes plus a codec id. Decoded maps 
 | UPDATE | `UPDATE table SET ... WHERE pk=...` using the decoded old primary key image |
 | DELETE | `DELETE FROM table WHERE pk=...` using the decoded old primary key image |
 
+Every applied row change is versioned per primary key in `__marmot_row_version`, in the same SQLite
+transaction, with its transaction's commit timestamp: the HLC the coordinator decides after PREPARE and
+sends with COMMIT, tie-broken by the coordinator's node id. It is the same on every node. A change older
+than the row's stored version is skipped, so replaying peers' logs in any order ends with the newest image.
+A DELETE leaves a tombstone, so an older INSERT or UPDATE cannot bring the row back, and an UPDATE whose row
+is absent inserts its after-image. Tombstones are removed once older than `gc_max_retention_hours` times
+the member count; with unlimited retention they are kept. DROP TABLE removes a table's versions, RENAME
+TABLE carries them, and a change of primary-key columns clears them. LOAD DATA rows are versioned the same
+way, each at its transaction's commit timestamp.
+
+Known limits: a table rebuilt by DDL (create a new table, copy the rows, drop the old one, rename) loses the
+old table's versions, so changes to its rows replayed afterwards apply as if the rows were unversioned. Read
+replicas apply their source's stream in order without row versions, so a replica that switches to another
+source may apply that source's order.
+
 ### Example: Encoded Row for Our UPDATE
 
 When Node 1 executes `UPDATE users SET balance = 75 WHERE id = 1`:

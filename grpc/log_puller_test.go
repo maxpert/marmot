@@ -187,6 +187,7 @@ func TestLogPuller_PreparedLocalTxnCommittedLocallyInSamePull(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, rec)
 	require.Equal(t, db.TxnStatusCommitted, rec.Status, "the prepared txn must be committed locally")
+	require.Equal(t, int64(2000), rec.CommitTSWall, "the local commit must take the commit timestamp the peer's log records")
 
 	cursor, err := mdb.GetMetaStore().GetPullCursor(2)
 	require.NoError(t, err)

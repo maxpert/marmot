@@ -46,7 +46,7 @@ func TestListCommittedLogOrderingLimitMoreStable(t *testing.T) {
 	if len(entries) != 2 {
 		t.Fatalf("page 1 len = %d, want 2", len(entries))
 	}
-	if entries[0] != positions[0] || entries[1] != positions[1] {
+	if entries[0].LogPosition != positions[0] || entries[1].LogPosition != positions[1] {
 		t.Fatalf("page 1 = %v, want %v", entries, positions[:2])
 	}
 	if !more {
@@ -57,7 +57,7 @@ func TestListCommittedLogOrderingLimitMoreStable(t *testing.T) {
 	}
 
 	// Second page: continue after the last entry of page 1.
-	entries2, _, more2, err := store.ListCommittedLog(entries[len(entries)-1], 10)
+	entries2, _, more2, err := store.ListCommittedLog(entries[len(entries)-1].LogPosition, 10)
 	if err != nil {
 		t.Fatalf("ListCommittedLog page 2: %v", err)
 	}
@@ -65,7 +65,7 @@ func TestListCommittedLogOrderingLimitMoreStable(t *testing.T) {
 		t.Fatalf("page 2 len = %d, want 3", len(entries2))
 	}
 	for i, want := range positions[2:] {
-		if entries2[i] != want {
+		if entries2[i].LogPosition != want {
 			t.Fatalf("page 2[%d] = %v, want %v", i, entries2[i], want)
 		}
 	}
@@ -99,7 +99,7 @@ func TestListCommittedLogExcludesUncommitted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListCommittedLog: %v", err)
 	}
-	if len(entries) != 1 || entries[0] != committed {
+	if len(entries) != 1 || entries[0].LogPosition != committed {
 		t.Fatalf("entries = %v, want only %v", entries, committed)
 	}
 }

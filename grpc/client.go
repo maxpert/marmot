@@ -280,6 +280,7 @@ func (c *Client) TransactionStream(
 	statements []*Statement,
 	chunkSize int,
 	timestamp *HLC,
+	commitTimestamp *HLC,
 	sourceNodeID uint64,
 ) (*TransactionResponse, error) {
 	conn, err := c.getConn(nodeID)
@@ -331,10 +332,11 @@ func (c *Client) TransactionStream(
 	commitMsg := &TransactionStreamMessage{
 		Payload: &TransactionStreamMessage_Commit{
 			Commit: &TransactionCommit{
-				TxnId:        txnID,
-				Database:     database,
-				Timestamp:    timestamp,
-				SourceNodeId: sourceNodeID,
+				TxnId:           txnID,
+				Database:        database,
+				Timestamp:       timestamp,
+				CommitTimestamp: commitTimestamp,
+				SourceNodeId:    sourceNodeID,
 			},
 		},
 	}

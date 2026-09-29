@@ -1119,8 +1119,12 @@ func (s *PebbleMetaStore) CommitTransaction(txnID uint64, commitTS hlc.Timestamp
 		return err
 	}
 
-	// Add to sequence index (kept for backward compatibility and GC)
-	if err := batch.Set(pebbleTxnSeqKey(seqNum, txnID), nil, nil); err != nil {
+	// Add to sequence index, carrying the commit timestamp with the position
+	stamp, err := encodeLogEntryStamp(commitTS)
+	if err != nil {
+		return err
+	}
+	if err := batch.Set(pebbleTxnSeqKey(seqNum, txnID), stamp, nil); err != nil {
 		return err
 	}
 
@@ -1131,6 +1135,9 @@ func (s *PebbleMetaStore) CommitTransaction(txnID uint64, commitTS hlc.Timestamp
 
 	// Update commit counters (O(1) lookups via PersistentCounter)
 	if err := s.counters.UpdateMaxInBatch(batch, "max_committed_txn_id", int64(txnID)); err != nil {
+		return err
+	}
+	if err := s.counters.UpdateMaxInBatch(batch, maxCommitWallCounter, commitTS.WallTime); err != nil {
 		return err
 	}
 	if err := s.counters.IncInBatch(batch, "committed_txn_count", 1); err != nil {
@@ -1223,8 +1230,12 @@ func (s *PebbleMetaStore) StoreReplayedTransaction(txnID, originNodeID uint64, c
 
 	// Heartbeat not needed for replayed transactions (already committed)
 
-	// Add to sequence index (kept for backward compatibility and GC)
-	if err := batch.Set(pebbleTxnSeqKey(seqNum, txnID), nil, nil); err != nil {
+	// Add to sequence index, carrying the commit timestamp with the position
+	stamp, err := encodeLogEntryStamp(hlc.Timestamp{WallTime: commitTS.WallTime, Logical: commitTS.Logical, NodeID: originNodeID})
+	if err != nil {
+		return err
+	}
+	if err := batch.Set(pebbleTxnSeqKey(seqNum, txnID), stamp, nil); err != nil {
 		return err
 	}
 
@@ -1234,6 +1245,9 @@ func (s *PebbleMetaStore) StoreReplayedTransaction(txnID, originNodeID uint64, c
 	}
 
 	if err := s.counters.UpdateMaxInBatch(batch, "max_committed_txn_id", int64(txnID)); err != nil {
+		return err
+	}
+	if err := s.counters.UpdateMaxInBatch(batch, maxCommitWallCounter, commitTS.WallTime); err != nil {
 		return err
 	}
 	if err := s.counters.IncInBatch(batch, "committed_txn_count", 1); err != nil {
@@ -1737,7 +1751,7 @@ func (s *PebbleMetaStore) GetIntent(tableName, intentKey string) (*WriteIntentRe
 // Seq <= the stable point read at the start of the call (StableSeq, taken
 // before the iterator opens; see logSeqTracker's doc comment for why that
 // snapshot is safe), up to limit.
-func (s *PebbleMetaStore) ListCommittedLog(after LogPosition, limit int) ([]LogPosition, uint64, bool, error) {
+func (s *PebbleMetaStore) ListCommittedLog(after LogPosition, limit int) ([]CommittedLogEntry, uint64, bool, error) {
 	stable := s.StableSeq()
 	if limit <= 0 {
 		return nil, stable, false, nil
@@ -1751,7 +1765,7 @@ func (s *PebbleMetaStore) ListCommittedLog(after LogPosition, limit int) ([]LogP
 	}
 	defer iter.Close()
 
-	var entries []LogPosition
+	var entries []CommittedLogEntry
 	more := false
 	for iter.SeekGE(lower); iter.Valid(); iter.Next() {
 		key := iter.Key()
@@ -1781,7 +1795,11 @@ func (s *PebbleMetaStore) ListCommittedLog(after LogPosition, limit int) ([]LogP
 			more = true
 			break
 		}
-		entries = append(entries, pos)
+		commitTS, err := decodeLogEntryStamp(iter.Value())
+		if err != nil {
+			return nil, stable, false, err
+		}
+		entries = append(entries, CommittedLogEntry{LogPosition: pos, CommitTS: commitTS})
 	}
 	if err := iter.Error(); err != nil {
 		return nil, stable, false, err
@@ -2512,6 +2530,15 @@ func (s *PebbleMetaStore) StableSeq() uint64 {
 // GetMaxSeqNum returns the maximum sequence number across all committed transactions
 func (s *PebbleMetaStore) GetMaxSeqNum() (uint64, error) {
 	return maxSeqNumFromIndex(s.db)
+}
+
+// maxCommitWallCounter records the largest commit wall time this store has
+// logged, local or replayed (MaxCommitWall).
+const maxCommitWallCounter = "max_commit_wall"
+
+// MaxCommitWall implements MetaStore.
+func (s *PebbleMetaStore) MaxCommitWall() (int64, error) {
+	return s.counters.Load(maxCommitWallCounter)
 }
 
 // GetMaxCommittedTxnID returns the maximum committed transaction ID

@@ -355,3 +355,30 @@ func executeLocalLoadDataRowsWithHandler(session *ConnectionSession, handler Con
 	}
 	return inserted, lastInsertID, committedTxnID, nil
 }
+
+// LoadDataRows is what a LOAD DATA LOCAL statement inserts: its target
+// table (unquoted), its column list (empty for every column in table
+// order), and the payload's rows, split exactly as ExecuteLoadDataLocal
+// splits them.
+type LoadDataRows struct {
+	Table   string
+	Columns []string
+	Rows    [][]string
+}
+
+// ParseLoadDataRows parses query and splits data into the rows it inserts.
+// A row whose field count differs from the column list is an error, as in
+// ExecuteLoadDataLocal.
+func ParseLoadDataRows(query string, data []byte) (*LoadDataRows, error) {
+	spec, err := parseLoadDataLocalSpec(query)
+	if err != nil {
+		return nil, err
+	}
+	rows := splitLoadDataRows(data, spec)
+	for _, row := range rows {
+		if len(spec.Columns) > 0 && len(row) != len(spec.Columns) {
+			return nil, fmt.Errorf("LOAD DATA LOCAL row column mismatch: got %d, expected %d", len(row), len(spec.Columns))
+		}
+	}
+	return &LoadDataRows{Table: spec.Table, Columns: spec.Columns, Rows: rows}, nil
+}

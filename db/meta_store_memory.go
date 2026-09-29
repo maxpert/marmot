@@ -261,7 +261,7 @@ func (m *MemoryMetaStore) StableSeq() uint64 {
 }
 
 // ListCommittedLog delegates to Pebble.
-func (m *MemoryMetaStore) ListCommittedLog(after LogPosition, limit int) ([]LogPosition, uint64, bool, error) {
+func (m *MemoryMetaStore) ListCommittedLog(after LogPosition, limit int) ([]CommittedLogEntry, uint64, bool, error) {
 	return m.pebble.ListCommittedLog(after, limit)
 }
 
@@ -457,6 +457,11 @@ func (m *MemoryMetaStore) isStale(txnID uint64, cutoff int64) bool {
 // CleanupOldTransactionRecords delegates to Pebble.
 func (m *MemoryMetaStore) CleanupOldTransactionRecords(minRetention, maxRetention time.Duration, safe LogPosition) (int, error) {
 	return m.pebble.CleanupOldTransactionRecords(minRetention, maxRetention, safe)
+}
+
+// MaxCommitWall delegates to Pebble.
+func (m *MemoryMetaStore) MaxCommitWall() (int64, error) {
+	return m.pebble.MaxCommitWall()
 }
 
 // GetMaxCommittedTxnID delegates to Pebble.

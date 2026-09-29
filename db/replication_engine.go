@@ -61,6 +61,9 @@ type CommitRequest struct {
 	TxnID      uint64
 	Database   string
 	Statements []protocol.Statement // decision metadata; DML row images are durable from PREPARE
+	// CommitTS is the commit timestamp the coordinator decided, identical on
+	// every node; zero from a coordinator too old to send one.
+	CommitTS hlc.Timestamp
 }
 
 // CommitResult contains the result of the commit phase
@@ -841,17 +844,18 @@ func (re *ReplicationEngine) Commit(ctx context.Context, req *CommitRequest) *Co
 	// The gate is the statement flag, not a store lookup: reading intents on
 	// every commit would put a Pebble scan on the write path. The flag decides
 	// only whether to look; every value written comes from the intent.
-	result, _ := commitPreparedTxn(re.dbMgr, replicatedDB, txn, req.Database, statementsCarryAutoIDClaim(req.Statements))
+	result, _ := commitPreparedTxn(re.dbMgr, replicatedDB, txn, req.Database, req.CommitTS, statementsCarryAutoIDClaim(req.Statements))
 	return result
 }
 
 // CommitLocallyPrepared commits database's durably prepared transaction
 // txnID through the same local commit path a COMMIT RPC takes, for a
 // transaction some peer's committed log proves was decided COMMITTED while
-// this node never received (or failed to apply) its COMMIT. With no
+// this node never received (or failed to apply) its COMMIT, with the commit
+// timestamp that log records for it (zero if the peer sent none). With no
 // coordinator statements to read the claim flag from, whether the
 // transaction carries an AUTO_INCREMENT claim is read from its intents.
-func (dm *DatabaseManager) CommitLocallyPrepared(database string, txnID uint64) error {
+func (dm *DatabaseManager) CommitLocallyPrepared(database string, txnID uint64, commitTS hlc.Timestamp) error {
 	replicatedDB, err := dm.GetDatabase(database)
 	if err != nil {
 		return fmt.Errorf("database %s: %w", database, err)
@@ -874,7 +878,7 @@ func (dm *DatabaseManager) CommitLocallyPrepared(database string, txnID uint64) 
 			break
 		}
 	}
-	_, err = commitPreparedTxn(dm, replicatedDB, txn, database, carriesClaim)
+	_, err = commitPreparedTxn(dm, replicatedDB, txn, database, commitTS, carriesClaim)
 	return err
 }
 
@@ -891,7 +895,7 @@ func committedLocally(replicatedDB *ReplicatedDatabase, txnID uint64) bool {
 // and refresh the read pool after DDL. It returns the result to answer a
 // COMMIT with and the underlying error (nil when that result is a success,
 // including for a transaction another caller already committed).
-func commitPreparedTxn(dbMgr DatabaseProvider, replicatedDB *ReplicatedDatabase, txn *Transaction, database string, applyClaims bool) (*CommitResult, error) {
+func commitPreparedTxn(dbMgr DatabaseProvider, replicatedDB *ReplicatedDatabase, txn *Transaction, database string, commitTS hlc.Timestamp, applyClaims bool) (*CommitResult, error) {
 	// Apply any AUTO_INCREMENT range claim BEFORE committing, and refuse the
 	// commit if it cannot be applied (the claim's first invariant: a
 	// participant must never ACK COMMIT unless the claim row is durably in its
@@ -919,7 +923,7 @@ func commitPreparedTxn(dbMgr DatabaseProvider, replicatedDB *ReplicatedDatabase,
 		}
 		return claimErr
 	}
-	err := replicatedDB.GetTransactionManager().CommitTransactionAfter(txn, applyClaim)
+	err := replicatedDB.GetTransactionManager().CommitTransactionAfter(txn, commitTS, applyClaim)
 	switch {
 	case claimErr != nil:
 		return &CommitResult{Success: false, ClaimNotApplicable: errors.Is(claimErr, ErrAutoIncClaimNotApplicable),

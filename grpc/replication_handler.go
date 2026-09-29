@@ -236,6 +236,7 @@ func (rh *ReplicationHandler) handleCommit(ctx context.Context, req *Transaction
 		TxnID:      req.TxnId,
 		Database:   req.Database,
 		Statements: statements,
+		CommitTS:   HLCToTimestamp(req.CommitTimestamp),
 	}
 
 	result := rh.engine.Commit(ctx, engineReq)

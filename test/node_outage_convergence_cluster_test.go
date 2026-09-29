@@ -6,11 +6,9 @@ package test
 // catch-up, convergence with GC actually running, and transactions a killed
 // node had prepared but never committed.
 //
-// These check row presence (missing=0) and duplicate ids only, never row
-// values. A value mismatch across nodes - an older row image overwriting a
-// newer one - is a separate, known limitation of replaying a peer's log over
-// rows a node already changed; comparing values here would conflate it with
-// the presence guarantees these tests exist to check.
+// These check row presence (missing=0) and duplicate ids only. Row values
+// converging across nodes is checked separately
+// (row_version_convergence_cluster_test.go).
 //
 // A transaction a node holds locally PENDING (its own coordinator killed
 // before its local commit, or a participant COMMIT that failed against a

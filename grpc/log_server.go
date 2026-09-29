@@ -7,6 +7,7 @@ import (
 
 	"github.com/maxpert/marmot/common"
 	"github.com/maxpert/marmot/db"
+	"github.com/maxpert/marmot/hlc"
 	"github.com/rs/zerolog/log"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -85,9 +86,9 @@ func (s *Server) ListCommittedLog(ctx context.Context, req *LogListRequest) (*Lo
 		return nil, status.Errorf(codes.Internal, "read truncation point: %v", err)
 	}
 
-	pbEntries := make([]*LogEntry, 0, len(entries))
-	for _, e := range entries {
-		pbEntries = append(pbEntries, &LogEntry{Seq: e.Seq, TxnId: e.TxnID})
+	pbEntries, err := logEntriesToProto(metaStore, entries)
+	if err != nil {
+		return nil, err
 	}
 
 	return &LogListResponse{
@@ -98,6 +99,33 @@ func (s *Server) ListCommittedLog(ctx context.Context, req *LogListRequest) (*Lo
 		More:           more,
 		SchemaVersion:  mdb.SchemaVersion(),
 	}, nil
+}
+
+// logEntriesToProto converts listed log entries to LogEntry messages, each
+// carrying the commit timestamp stored with its position, which a puller
+// that holds the transaction prepared commits it with. Only an entry
+// written before positions carried a timestamp reads it from the
+// transaction's record.
+func logEntriesToProto(metaStore db.MetaStore, entries []db.CommittedLogEntry) ([]*LogEntry, error) {
+	pbEntries := make([]*LogEntry, 0, len(entries))
+	for _, e := range entries {
+		commitTS := e.CommitTS
+		if commitTS.IsZero() {
+			rec, err := metaStore.GetTransaction(e.TxnID)
+			if err != nil {
+				return nil, status.Errorf(codes.Internal, "read transaction %d: %v", e.TxnID, err)
+			}
+			if rec != nil {
+				commitTS = hlc.Timestamp{WallTime: rec.CommitTSWall, Logical: rec.CommitTSLogical, NodeID: rec.NodeID}
+			}
+		}
+		entry := &LogEntry{Seq: e.Seq, TxnId: e.TxnID}
+		if !commitTS.IsZero() {
+			entry.CommitTimestamp = &HLC{WallTime: commitTS.WallTime, Logical: commitTS.Logical, NodeId: commitTS.NodeID}
+		}
+		pbEntries = append(pbEntries, entry)
+	}
+	return pbEntries, nil
 }
 
 // FetchTransactions streams the named committed transactions of one

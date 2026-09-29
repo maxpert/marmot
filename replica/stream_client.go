@@ -1050,7 +1050,9 @@ func (s *StreamClient) applyStatement(ctx context.Context, tx *sql.Tx, mdb *db.R
 }
 
 // applyCDCStatement applies a CDC statement using unified CDC applier.
-// Uses cached schema from mdb - does NOT query SQLite PRAGMA.
+// Uses cached schema from mdb - does NOT query SQLite PRAGMA. It applies
+// rows unversioned, in the order its one source streams them; a replica
+// that switches to another source applies that source's order.
 func (s *StreamClient) applyCDCStatement(tx *sql.Tx, mdb *db.ReplicatedDatabase, stmt *marmotgrpc.Statement) error {
 	rowChange := stmt.GetRowChange()
 	if rowChange == nil {

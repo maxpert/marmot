@@ -38,12 +38,18 @@ type SchemaChange struct {
 }
 
 // Exec runs one DDL statement on q, with the database's table definitions
-// read on q just before and just after it, and records what it changed.
-// table is the table the statement names, owner the node that authored it.
+// and primary keys read on q just before and just after it, records what it
+// changed, and brings the row version table in line with it
+// (reconcileRowVersions). table is the table the statement names, owner the
+// node that authored it.
 func (c *SchemaChange) Exec(ctx context.Context, q sqlExecQuerier, stmt, table string, owner uint64) error {
 	before, err := tableDefinitions(ctx, q)
 	if err != nil {
 		return fmt.Errorf("failed to read tables before DDL: %w", err)
+	}
+	keysBefore, err := tablePrimaryKeys(ctx, q)
+	if err != nil {
+		return err
 	}
 	if _, err := q.ExecContext(ctx, stmt); err != nil {
 		return fmt.Errorf("failed to execute DDL statement: %w", err)
@@ -51,6 +57,13 @@ func (c *SchemaChange) Exec(ctx context.Context, q sqlExecQuerier, stmt, table s
 	after, err := tableDefinitions(ctx, q)
 	if err != nil {
 		return fmt.Errorf("failed to read tables after DDL: %w", err)
+	}
+	keysAfter, err := tablePrimaryKeys(ctx, q)
+	if err != nil {
+		return err
+	}
+	if err := reconcileRowVersions(ctx, q, keysBefore, keysAfter); err != nil {
+		return err
 	}
 	c.record(before, after, owner)
 	c.tables = append(c.tables, ddlTableOwner{table: table, owner: owner})

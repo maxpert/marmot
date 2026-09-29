@@ -1544,7 +1544,7 @@ func (s *Server) TransactionStream(stream grpc.ClientStreamingServer[Transaction
 			}
 
 			// Commit the transaction
-			if err := txnMgr.CommitTransaction(txn); err != nil {
+			if err := txnMgr.CommitTransactionAfter(txn, HLCToTimestamp(commit.CommitTimestamp), nil); err != nil {
 				log.Error().Err(err).
 					Uint64("txn_id", txnID).
 					Str("database", database).

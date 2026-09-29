@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/maxpert/marmot/cfg"
+	"github.com/maxpert/marmot/hlc"
 )
 
 // =============================================================================
@@ -101,7 +102,7 @@ func TestRunCommitPhase_DDLTransactionSurvivesCommitDelayBeyondWriteTimeout(t *t
 	remoteReplicator.SetDelay(txn.ID, 500*time.Millisecond)
 
 	// wc.timeout stands in for the regular write timeout (write_timeout_ms).
-	wc := NewWriteCoordinator(1, nodeProvider, remoteReplicator, localReplicator, 100*time.Millisecond, nil)
+	wc := NewWriteCoordinator(1, nodeProvider, remoteReplicator, localReplicator, 100*time.Millisecond, hlc.NewClock(1))
 
 	prepResponses := map[uint64]*ReplicationResponse{
 		1: CreateSuccessResponse(),
@@ -147,7 +148,7 @@ func TestRunCommitPhase_DMLTransactionCommitStillTimesOutAtWriteTimeout(t *testi
 
 	remoteReplicator.SetDelay(txn.ID, 500*time.Millisecond)
 
-	wc := NewWriteCoordinator(1, nodeProvider, remoteReplicator, localReplicator, 100*time.Millisecond, nil)
+	wc := NewWriteCoordinator(1, nodeProvider, remoteReplicator, localReplicator, 100*time.Millisecond, hlc.NewClock(1))
 
 	prepResponses := map[uint64]*ReplicationResponse{
 		1: CreateSuccessResponse(),

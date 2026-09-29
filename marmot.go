@@ -411,6 +411,11 @@ func main() {
 		return ids
 	})
 
+	// The tombstone horizon counts every member this node has known
+	// (NodeRegistry.KnownMemberCount).
+	seeded := len(cfg.Config.Cluster.SeedNodes) > 0
+	dbMgr.SetTombstoneMemberCountFunc(func() int { return registry.KnownMemberCount(seeded) })
+
 	// Start anti-entropy service
 	antiEntropy.Start()
 

@@ -41,6 +41,12 @@ var ErrReplayPending = errors.New("replay: local transaction is PENDING")
 // HolderTxnID.
 var ErrReplayIntentConflict = errors.New("replay: row held by a different local transaction")
 
+// ErrReplayRowWithoutKey is returned by ApplyReplayedTxn, before anything
+// is logged or applied, for a transaction carrying a DML row with no intent
+// key: such a row cannot be versioned, so it is neither applied unversioned
+// nor skipped. The puller counts it as the transaction's failed attempt.
+var ErrReplayRowWithoutKey = errors.New("replay: DML row carries no intent key")
+
 // ReplayIntentConflictError is ErrReplayIntentConflict's concrete form: it
 // additionally names the local transaction (HolderTxnID) whose intent or CDC
 // row lock blocked the replay - either the intent holder or the CDC row-lock
@@ -187,11 +193,13 @@ func (mdb *ReplicatedDatabase) DiscardAbandonedBegin(txnID uint64) error {
 //  5. One SQLite tx: re-check the marker inside the tx (authoritative - the
 //     read-only check above can race a concurrent apply); if present, roll
 //     back and return applied=false. Otherwise apply every remaining row (DML
-//     via ApplyCDCValues, DDL via ApplyReplayedDDL with owner=t.OriginNodeID,
-//     LOAD DATA via ApplyLoadDataInTx), finish any schema change, bump the
-//     schema version iff the txn carries DDL, write the marker, commit.
-//  6. After commit: reload the schema cache and refresh the read pool if DDL
-//     changed it (warn-only, matching handleReplay's existing contract),
+//     and LOAD DATA versioned per row at t.CommitTS, skipping a row a newer
+//     change already owns, DDL via ApplyReplayedDDL with owner=t.OriginNodeID),
+//     finish any schema change, bump the schema version iff the txn carries
+//     DDL, write the marker, commit.
+//  6. After commit: merge t.CommitTS into this node's clock, reload the
+//     schema cache and refresh the read pool if DDL changed it (warn-only,
+//     matching handleReplay's existing contract),
 //     update the cached schema version, then apply committed vector CDC for
 //     the DML rows (idempotent by txn/seq; errors are logged, not returned -
 //     the row data itself already committed).
@@ -293,8 +301,9 @@ func (mdb *ReplicatedDatabase) commitReplayedTx(ctx context.Context, t *ReplayTx
 // anything if this node itself holds t.TxnID PENDING (ErrReplayPending), or
 // if a DML row t touches is locally held, by intent or CDC row lock, by a
 // different transaction (*ReplayIntentConflictError, matching
-// errors.Is(err, ErrReplayIntentConflict)). Returns t's existing log
-// record, if any, for the caller to reuse its SeqNum.
+// errors.Is(err, ErrReplayIntentConflict)), or if a DML row carries no
+// intent key (ErrReplayRowWithoutKey). Returns t's existing log record, if
+// any, for the caller to reuse its SeqNum.
 func (mdb *ReplicatedDatabase) replayPrecheck(t *ReplayTxn) (*TransactionRecord, error) {
 	rec, err := mdb.metaStore.GetTransaction(t.TxnID)
 	if err != nil {
@@ -305,8 +314,11 @@ func (mdb *ReplicatedDatabase) replayPrecheck(t *ReplayTxn) (*TransactionRecord,
 	}
 
 	for _, row := range t.Rows {
-		if !isDMLOp(OpType(row.Op)) || len(row.IntentKey) == 0 {
+		if !isDMLOp(OpType(row.Op)) {
 			continue
+		}
+		if len(row.IntentKey) == 0 {
+			return nil, fmt.Errorf("%w: txn %d, table %s", ErrReplayRowWithoutKey, t.TxnID, row.Table)
 		}
 		key := string(row.IntentKey)
 		if intent, ierr := mdb.metaStore.GetIntent(row.Table, key); ierr == nil && intent != nil && intent.TxnID != t.TxnID {
@@ -351,19 +363,29 @@ func (mdb *ReplicatedDatabase) applyReplayVectorControl(ctx context.Context, t *
 	return nil
 }
 
-// applyReplayedRowsInTx applies every row of t inside tx - DML via
-// ApplyCDCValues, DDL via ApplyReplayedDDL (accumulating into change), LOAD
-// DATA via ApplyLoadDataInTx - and returns the CDC entries to notify vector
-// CDC with after commit, and whether any row was DDL.
+// applyReplayedRowsInTx applies every row of t inside tx - DML and LOAD
+// DATA versioned per row at t.CommitTS (versionedApplier), DDL via
+// ApplyReplayedDDL (accumulating into change) - and returns
+// the CDC entries of the DML rows actually applied, to notify vector CDC with
+// after commit, and whether any row was DDL.
 func (mdb *ReplicatedDatabase) applyReplayedRowsInTx(ctx context.Context, tx *sql.Tx, t *ReplayTxn, seqNum uint64, schemaAdapter *schemaCacheAdapter, change *SchemaChange) ([]common.CDCEntry, bool, error) {
 	hasDDL := false
 	dmlEntries := make([]common.CDCEntry, 0, len(t.Rows))
+	applier, err := newVersionedApplier(tx, schemaAdapter)
+	if err != nil {
+		return nil, false, err
+	}
+	defer applier.Close()
 
 	for _, row := range t.Rows {
 		switch OpType(row.Op) {
 		case OpTypeInsert, OpTypeReplace, OpTypeUpdate, OpTypeDelete:
-			if err := ApplyCDCValues(tx, schemaAdapter, OpType(row.Op), row.Table, row.OldValues, row.NewValues); err != nil {
+			applied, err := applier.apply(OpType(row.Op), row.Table, row.IntentKey, row.OldValues, row.NewValues, t.CommitTS)
+			if err != nil {
 				return nil, false, fmt.Errorf("apply replayed CDC row for %s: %w", row.Table, err)
+			}
+			if !applied {
+				continue
 			}
 			dmlEntries = append(dmlEntries, common.CDCEntry{
 				Table:        row.Table,
@@ -380,7 +402,7 @@ func (mdb *ReplicatedDatabase) applyReplayedRowsInTx(ctx context.Context, tx *sq
 			}
 			hasDDL = true
 		case OpTypeLoadData:
-			if _, err := ApplyLoadDataInTx(tx, row.LoadSQL, row.LoadData); err != nil {
+			if err := applier.applyLoadData(row.LoadSQL, row.LoadData, t.CommitTS); err != nil {
 				return nil, false, fmt.Errorf("apply replayed LOAD DATA: %w", err)
 			}
 		case OpTypeVectorIndex:
@@ -395,11 +417,14 @@ func (mdb *ReplicatedDatabase) applyReplayedRowsInTx(ctx context.Context, tx *sq
 }
 
 // afterReplayCommit runs ApplyReplayedTxn's step 6 post-commit refresh:
-// reload the schema cache and refresh the read pool when DDL changed it,
+// merge t's commit timestamp into this node's clock, so a transaction this
+// node prepares next on the same rows is ordered after it, reload the
+// schema cache and refresh the read pool when DDL changed it,
 // advance the cached schema version, and apply committed vector CDC for the
 // DML rows. Every failure here is logged, not returned - the row data itself
 // already committed in SQLite.
 func (mdb *ReplicatedDatabase) afterReplayCommit(ctx context.Context, t *ReplayTxn, seqNum uint64, change *SchemaChange, hasDDL bool, newSchemaVersion uint64, dmlEntries []common.CDCEntry) {
+	mdb.txnMgr.clock.Update(t.CommitTS)
 	if !change.Empty() {
 		if err := mdb.ReloadSchema(); err != nil {
 			log.Warn().Err(err).Uint64("txn_id", t.TxnID).Str("database", mdb.dbName).Msg("ApplyReplayedTxn: failed to reload schema after DDL")
@@ -506,7 +531,7 @@ func (mdb *ReplicatedDatabase) ReapplyLocalLog(ctx context.Context) (int, error)
 		}
 
 		for _, pos := range entries {
-			after = pos
+			after = pos.LogPosition
 			if markers[pos.TxnID] {
 				continue
 			}

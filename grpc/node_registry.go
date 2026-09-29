@@ -419,6 +419,21 @@ func (nr *NodeRegistry) GetAll() []*NodeState {
 	return nodes
 }
 
+// KnownMemberCount returns how many members this node has ever known and
+// still records, in any status, REMOVED included: every member whose log
+// could still hold an entry. The registry restores the persisted
+// membership at boot, so the count survives a restart. A node configured
+// with seeds (seeded) that knows only itself has not learned its
+// membership yet and returns 0: unknown.
+func (nr *NodeRegistry) KnownMemberCount(seeded bool) int {
+	nr.mu.RLock()
+	defer nr.mu.RUnlock()
+	if seeded && len(nr.nodes) < 2 {
+		return 0
+	}
+	return len(nr.nodes)
+}
+
 // GetAlive returns all alive nodes (returns copies to avoid race conditions)
 func (nr *NodeRegistry) GetAlive() []*NodeState {
 	nr.mu.RLock()

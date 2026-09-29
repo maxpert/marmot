@@ -8,6 +8,8 @@ import (
 	"sync/atomic"
 
 	"github.com/cockroachdb/pebble"
+	"github.com/maxpert/marmot/encoding"
+	"github.com/maxpert/marmot/hlc"
 	"github.com/rs/zerolog/log"
 )
 
@@ -352,4 +354,38 @@ func computeInitialLogSeq(db *pebble.DB) (uint64, error) {
 	}
 
 	return max + 1, nil
+}
+
+// CommittedLogEntry is one committed log entry: its position, and the commit
+// timestamp its transaction committed at (NodeID is its origin). The
+// timestamp is stored with the position itself, so a listed entry carries
+// it however its transaction's other records fare. It is zero for an entry
+// written before positions carried one.
+type CommittedLogEntry struct {
+	LogPosition
+	CommitTS hlc.Timestamp
+}
+
+// logEntryStamp is the seq-index value: the entry's commit timestamp.
+type logEntryStamp struct {
+	Wall    int64  `msgpack:"w"`
+	Logical int32  `msgpack:"l"`
+	Node    uint64 `msgpack:"n"`
+}
+
+func encodeLogEntryStamp(commitTS hlc.Timestamp) ([]byte, error) {
+	return encoding.Marshal(logEntryStamp{Wall: commitTS.WallTime, Logical: commitTS.Logical, Node: commitTS.NodeID})
+}
+
+// decodeLogEntryStamp decodes a seq-index value; an empty one, from before
+// positions carried a timestamp, is the zero timestamp.
+func decodeLogEntryStamp(val []byte) (hlc.Timestamp, error) {
+	if len(val) == 0 {
+		return hlc.Timestamp{}, nil
+	}
+	var stamp logEntryStamp
+	if err := encoding.Unmarshal(val, &stamp); err != nil {
+		return hlc.Timestamp{}, fmt.Errorf("decode log entry commit timestamp: %w", err)
+	}
+	return hlc.Timestamp{WallTime: stamp.Wall, Logical: stamp.Logical, NodeID: stamp.Node}, nil
 }

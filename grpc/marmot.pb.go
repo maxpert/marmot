@@ -710,8 +710,11 @@ type TransactionRequest struct {
 	Database string `protobuf:"bytes,7,opt,name=database,proto3" json:"database,omitempty"`
 	// Minimum schema version required to execute this transaction
 	RequiredSchemaVersion uint64 `protobuf:"varint,9,opt,name=required_schema_version,json=requiredSchemaVersion,proto3" json:"required_schema_version,omitempty"`
-	unknownFields         protoimpl.UnknownFields
-	sizeCache             protoimpl.SizeCache
+	// COMMIT only: the commit timestamp the coordinator decided, which every
+	// participant commits with. Unset from an older coordinator.
+	CommitTimestamp *HLC `protobuf:"bytes,10,opt,name=commit_timestamp,json=commitTimestamp,proto3" json:"commit_timestamp,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *TransactionRequest) Reset() {
@@ -798,6 +801,13 @@ func (x *TransactionRequest) GetRequiredSchemaVersion() uint64 {
 		return x.RequiredSchemaVersion
 	}
 	return 0
+}
+
+func (x *TransactionRequest) GetCommitTimestamp() *HLC {
+	if x != nil {
+		return x.CommitTimestamp
+	}
+	return nil
 }
 
 // Statement represents either a DML row change or a DDL schema change
@@ -2055,11 +2065,12 @@ func (x *LogListRequest) GetConsumedTxnId() uint64 {
 }
 
 type LogEntry struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Seq           uint64                 `protobuf:"varint,1,opt,name=seq,proto3" json:"seq,omitempty"`
-	TxnId         uint64                 `protobuf:"varint,2,opt,name=txn_id,json=txnId,proto3" json:"txn_id,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	Seq             uint64                 `protobuf:"varint,1,opt,name=seq,proto3" json:"seq,omitempty"`
+	TxnId           uint64                 `protobuf:"varint,2,opt,name=txn_id,json=txnId,proto3" json:"txn_id,omitempty"`
+	CommitTimestamp *HLC                   `protobuf:"bytes,3,opt,name=commit_timestamp,json=commitTimestamp,proto3" json:"commit_timestamp,omitempty"` // The entry's commit timestamp; unset from an older peer
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *LogEntry) Reset() {
@@ -2104,6 +2115,13 @@ func (x *LogEntry) GetTxnId() uint64 {
 		return x.TxnId
 	}
 	return 0
+}
+
+func (x *LogEntry) GetCommitTimestamp() *HLC {
+	if x != nil {
+		return x.CommitTimestamp
+	}
+	return nil
 }
 
 type LogListResponse struct {
@@ -3649,13 +3667,14 @@ func (x *TransactionChunk) GetChunkIndex() uint32 {
 
 // Final commit signal for streaming
 type TransactionCommit struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	TxnId         uint64                 `protobuf:"varint,1,opt,name=txn_id,json=txnId,proto3" json:"txn_id,omitempty"`
-	Database      string                 `protobuf:"bytes,2,opt,name=database,proto3" json:"database,omitempty"`
-	Timestamp     *HLC                   `protobuf:"bytes,3,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
-	SourceNodeId  uint64                 `protobuf:"varint,4,opt,name=source_node_id,json=sourceNodeId,proto3" json:"source_node_id,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	TxnId           uint64                 `protobuf:"varint,1,opt,name=txn_id,json=txnId,proto3" json:"txn_id,omitempty"`
+	Database        string                 `protobuf:"bytes,2,opt,name=database,proto3" json:"database,omitempty"`
+	Timestamp       *HLC                   `protobuf:"bytes,3,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
+	SourceNodeId    uint64                 `protobuf:"varint,4,opt,name=source_node_id,json=sourceNodeId,proto3" json:"source_node_id,omitempty"`
+	CommitTimestamp *HLC                   `protobuf:"bytes,5,opt,name=commit_timestamp,json=commitTimestamp,proto3" json:"commit_timestamp,omitempty"` // As TransactionRequest.commit_timestamp; unset from an older coordinator
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *TransactionCommit) Reset() {
@@ -3714,6 +3733,13 @@ func (x *TransactionCommit) GetSourceNodeId() uint64 {
 		return x.SourceNodeId
 	}
 	return 0
+}
+
+func (x *TransactionCommit) GetCommitTimestamp() *HLC {
+	if x != nil {
+		return x.CommitTimestamp
+	}
+	return nil
 }
 
 // Wrapper for streaming (oneof for chunk vs commit)
@@ -4268,7 +4294,7 @@ const file_grpc_marmot_proto_rawDesc = "" +
 	"\x0esource_node_id\x18\x01 \x01(\x04R\fsourceNodeId\"V\n" +
 	"\fPingResponse\x12\x17\n" +
 	"\anode_id\x18\x01 \x01(\x04R\x06nodeId\x12-\n" +
-	"\x06status\x18\x02 \x01(\x0e2\x15.marmot.v2.NodeStatusR\x06status\"\x81\x03\n" +
+	"\x06status\x18\x02 \x01(\x0e2\x15.marmot.v2.NodeStatusR\x06status\"\xbc\x03\n" +
 	"\x12TransactionRequest\x12\x15\n" +
 	"\x06txn_id\x18\x01 \x01(\x04R\x05txnId\x12$\n" +
 	"\x0esource_node_id\x18\x02 \x01(\x04R\fsourceNodeId\x124\n" +
@@ -4279,7 +4305,9 @@ const file_grpc_marmot_proto_rawDesc = "" +
 	"\x05phase\x18\x05 \x01(\x0e2\x1b.marmot.v2.TransactionPhaseR\x05phase\x12=\n" +
 	"\vconsistency\x18\x06 \x01(\x0e2\x1b.marmot.v2.ConsistencyLevelR\vconsistency\x12\x1a\n" +
 	"\bdatabase\x18\a \x01(\tR\bdatabase\x126\n" +
-	"\x17required_schema_version\x18\t \x01(\x04R\x15requiredSchemaVersionJ\x04\b\b\x10\t\"\xc7\x04\n" +
+	"\x17required_schema_version\x18\t \x01(\x04R\x15requiredSchemaVersion\x129\n" +
+	"\x10commit_timestamp\x18\n" +
+	" \x01(\v2\x0e.marmot.v2.HLCR\x0fcommitTimestampJ\x04\b\b\x10\t\"\xc7\x04\n" +
 	"\tStatement\x120\n" +
 	"\x04type\x18\x01 \x01(\x0e2\x1c.marmot.common.StatementTypeR\x04type\x12\x1d\n" +
 	"\n" +
@@ -4398,10 +4426,11 @@ const file_grpc_marmot_proto_rawDesc = "" +
 	"afterTxnId\x12\x14\n" +
 	"\x05limit\x18\x05 \x01(\rR\x05limit\x12!\n" +
 	"\fconsumed_seq\x18\x06 \x01(\x04R\vconsumedSeq\x12&\n" +
-	"\x0fconsumed_txn_id\x18\a \x01(\x04R\rconsumedTxnId\"3\n" +
+	"\x0fconsumed_txn_id\x18\a \x01(\x04R\rconsumedTxnId\"n\n" +
 	"\bLogEntry\x12\x10\n" +
 	"\x03seq\x18\x01 \x01(\x04R\x03seq\x12\x15\n" +
-	"\x06txn_id\x18\x02 \x01(\x04R\x05txnId\"\x92\x02\n" +
+	"\x06txn_id\x18\x02 \x01(\x04R\x05txnId\x129\n" +
+	"\x10commit_timestamp\x18\x03 \x01(\v2\x0e.marmot.v2.HLCR\x0fcommitTimestamp\"\x92\x02\n" +
 	"\x0fLogListResponse\x12-\n" +
 	"\aentries\x18\x01 \x03(\v2\x13.marmot.v2.LogEntryR\aentries\x12\x1d\n" +
 	"\n" +
@@ -4522,12 +4551,13 @@ const file_grpc_marmot_proto_rawDesc = "" +
 	"statements\x18\x03 \x03(\v2\x14.marmot.v2.StatementR\n" +
 	"statements\x12\x1f\n" +
 	"\vchunk_index\x18\x04 \x01(\rR\n" +
-	"chunkIndex\"\x9a\x01\n" +
+	"chunkIndex\"\xd5\x01\n" +
 	"\x11TransactionCommit\x12\x15\n" +
 	"\x06txn_id\x18\x01 \x01(\x04R\x05txnId\x12\x1a\n" +
 	"\bdatabase\x18\x02 \x01(\tR\bdatabase\x12,\n" +
 	"\ttimestamp\x18\x03 \x01(\v2\x0e.marmot.v2.HLCR\ttimestamp\x12$\n" +
-	"\x0esource_node_id\x18\x04 \x01(\x04R\fsourceNodeId\"\x92\x01\n" +
+	"\x0esource_node_id\x18\x04 \x01(\x04R\fsourceNodeId\x129\n" +
+	"\x10commit_timestamp\x18\x05 \x01(\v2\x0e.marmot.v2.HLCR\x0fcommitTimestamp\"\x92\x01\n" +
 	"\x18TransactionStreamMessage\x123\n" +
 	"\x05chunk\x18\x01 \x01(\v2\x1b.marmot.v2.TransactionChunkH\x00R\x05chunk\x126\n" +
 	"\x06commit\x18\x02 \x01(\v2\x1c.marmot.v2.TransactionCommitH\x00R\x06commitB\t\n" +
@@ -4720,82 +4750,85 @@ var file_grpc_marmot_proto_depIdxs = []int32{
 	19, // 7: marmot.v2.TransactionRequest.timestamp:type_name -> marmot.v2.HLC
 	1,  // 8: marmot.v2.TransactionRequest.phase:type_name -> marmot.v2.TransactionPhase
 	2,  // 9: marmot.v2.TransactionRequest.consistency:type_name -> marmot.v2.ConsistencyLevel
-	63, // 10: marmot.v2.Statement.type:type_name -> marmot.common.StatementType
-	15, // 11: marmot.v2.Statement.row_change:type_name -> marmot.v2.RowChange
-	17, // 12: marmot.v2.Statement.ddl_change:type_name -> marmot.v2.DDLChange
-	18, // 13: marmot.v2.Statement.load_data_change:type_name -> marmot.v2.LoadDataChange
-	14, // 14: marmot.v2.Statement.vector_index_change:type_name -> marmot.v2.VectorIndexChange
-	16, // 15: marmot.v2.Statement.dml_intent:type_name -> marmot.v2.DMLIntent
-	3,  // 16: marmot.v2.VectorIndexChange.action:type_name -> marmot.v2.VectorIndexAction
-	19, // 17: marmot.v2.TransactionResponse.applied_at:type_name -> marmot.v2.HLC
-	19, // 18: marmot.v2.ReadRequest.snapshot_ts:type_name -> marmot.v2.HLC
-	2,  // 19: marmot.v2.ReadRequest.consistency:type_name -> marmot.v2.ConsistencyLevel
-	23, // 20: marmot.v2.ReadResponse.rows:type_name -> marmot.v2.Row
-	19, // 21: marmot.v2.ReadResponse.timestamp:type_name -> marmot.v2.HLC
-	61, // 22: marmot.v2.Row.columns:type_name -> marmot.v2.Row.ColumnsEntry
-	13, // 23: marmot.v2.ChangeEvent.statements:type_name -> marmot.v2.Statement
-	19, // 24: marmot.v2.ChangeEvent.timestamp:type_name -> marmot.v2.HLC
-	27, // 25: marmot.v2.LogListResponse.entries:type_name -> marmot.v2.LogEntry
-	31, // 26: marmot.v2.DatabaseRegistryResponse.entries:type_name -> marmot.v2.DatabaseRegistryEntry
-	35, // 27: marmot.v2.ReplicationStateResponse.states:type_name -> marmot.v2.DatabaseReplicationState
-	19, // 28: marmot.v2.DatabaseReplicationState.last_applied_timestamp:type_name -> marmot.v2.HLC
-	19, // 29: marmot.v2.SnapshotInfoResponse.timestamp:type_name -> marmot.v2.HLC
-	38, // 30: marmot.v2.SnapshotInfoResponse.databases:type_name -> marmot.v2.DatabaseFileInfo
-	39, // 31: marmot.v2.SnapshotInfoResponse.database_metadata:type_name -> marmot.v2.DatabaseSnapshotMetadata
-	62, // 32: marmot.v2.LatestTxnIDsResponse.database_txn_ids:type_name -> marmot.v2.LatestTxnIDsResponse.DatabaseTxnIdsEntry
-	43, // 33: marmot.v2.LatestTxnIDsResponse.database_info:type_name -> marmot.v2.DatabaseInfo
-	46, // 34: marmot.v2.AutoIncBasesResponse.bases:type_name -> marmot.v2.AutoIncBase
-	7,  // 35: marmot.v2.GetClusterNodesResponse.nodes:type_name -> marmot.v2.NodeState
-	13, // 36: marmot.v2.TransactionChunk.statements:type_name -> marmot.v2.Statement
-	19, // 37: marmot.v2.TransactionCommit.timestamp:type_name -> marmot.v2.HLC
-	52, // 38: marmot.v2.TransactionStreamMessage.chunk:type_name -> marmot.v2.TransactionChunk
-	53, // 39: marmot.v2.TransactionStreamMessage.commit:type_name -> marmot.v2.TransactionCommit
-	4,  // 40: marmot.v2.ForwardQueryRequest.txn_control:type_name -> marmot.v2.ForwardTxnControl
-	5,  // 41: marmot.v2.MarmotService.Gossip:input_type -> marmot.v2.GossipRequest
-	8,  // 42: marmot.v2.MarmotService.Join:input_type -> marmot.v2.JoinRequest
-	10, // 43: marmot.v2.MarmotService.Ping:input_type -> marmot.v2.PingRequest
-	12, // 44: marmot.v2.MarmotService.ReplicateTransaction:input_type -> marmot.v2.TransactionRequest
-	21, // 45: marmot.v2.MarmotService.Read:input_type -> marmot.v2.ReadRequest
-	24, // 46: marmot.v2.MarmotService.StreamChanges:input_type -> marmot.v2.StreamRequest
-	33, // 47: marmot.v2.MarmotService.GetReplicationState:input_type -> marmot.v2.ReplicationStateRequest
-	36, // 48: marmot.v2.MarmotService.GetSnapshotInfo:input_type -> marmot.v2.SnapshotInfoRequest
-	40, // 49: marmot.v2.MarmotService.StreamSnapshot:input_type -> marmot.v2.SnapshotRequest
-	42, // 50: marmot.v2.MarmotService.GetLatestTxnIDs:input_type -> marmot.v2.LatestTxnIDsRequest
-	50, // 51: marmot.v2.MarmotService.GetClusterNodes:input_type -> marmot.v2.GetClusterNodesRequest
-	55, // 52: marmot.v2.MarmotService.ForwardQuery:input_type -> marmot.v2.ForwardQueryRequest
-	57, // 53: marmot.v2.MarmotService.ForwardLoadData:input_type -> marmot.v2.ForwardLoadDataRequest
-	58, // 54: marmot.v2.MarmotService.GetLoadDataChunk:input_type -> marmot.v2.LoadDataChunkRequest
-	45, // 55: marmot.v2.MarmotService.GetAutoIncBases:input_type -> marmot.v2.AutoIncBasesRequest
-	48, // 56: marmot.v2.MarmotService.SyncAutoIncBases:input_type -> marmot.v2.AutoIncSyncRequest
-	26, // 57: marmot.v2.MarmotService.ListCommittedLog:input_type -> marmot.v2.LogListRequest
-	29, // 58: marmot.v2.MarmotService.FetchTransactions:input_type -> marmot.v2.FetchTransactionsRequest
-	30, // 59: marmot.v2.MarmotService.ListDatabaseRegistry:input_type -> marmot.v2.DatabaseRegistryRequest
-	54, // 60: marmot.v2.MarmotService.TransactionStream:input_type -> marmot.v2.TransactionStreamMessage
-	6,  // 61: marmot.v2.MarmotService.Gossip:output_type -> marmot.v2.GossipResponse
-	9,  // 62: marmot.v2.MarmotService.Join:output_type -> marmot.v2.JoinResponse
-	11, // 63: marmot.v2.MarmotService.Ping:output_type -> marmot.v2.PingResponse
-	20, // 64: marmot.v2.MarmotService.ReplicateTransaction:output_type -> marmot.v2.TransactionResponse
-	22, // 65: marmot.v2.MarmotService.Read:output_type -> marmot.v2.ReadResponse
-	25, // 66: marmot.v2.MarmotService.StreamChanges:output_type -> marmot.v2.ChangeEvent
-	34, // 67: marmot.v2.MarmotService.GetReplicationState:output_type -> marmot.v2.ReplicationStateResponse
-	37, // 68: marmot.v2.MarmotService.GetSnapshotInfo:output_type -> marmot.v2.SnapshotInfoResponse
-	41, // 69: marmot.v2.MarmotService.StreamSnapshot:output_type -> marmot.v2.SnapshotChunk
-	44, // 70: marmot.v2.MarmotService.GetLatestTxnIDs:output_type -> marmot.v2.LatestTxnIDsResponse
-	51, // 71: marmot.v2.MarmotService.GetClusterNodes:output_type -> marmot.v2.GetClusterNodesResponse
-	56, // 72: marmot.v2.MarmotService.ForwardQuery:output_type -> marmot.v2.ForwardQueryResponse
-	56, // 73: marmot.v2.MarmotService.ForwardLoadData:output_type -> marmot.v2.ForwardQueryResponse
-	59, // 74: marmot.v2.MarmotService.GetLoadDataChunk:output_type -> marmot.v2.LoadDataChunkResponse
-	47, // 75: marmot.v2.MarmotService.GetAutoIncBases:output_type -> marmot.v2.AutoIncBasesResponse
-	49, // 76: marmot.v2.MarmotService.SyncAutoIncBases:output_type -> marmot.v2.AutoIncSyncResponse
-	28, // 77: marmot.v2.MarmotService.ListCommittedLog:output_type -> marmot.v2.LogListResponse
-	25, // 78: marmot.v2.MarmotService.FetchTransactions:output_type -> marmot.v2.ChangeEvent
-	32, // 79: marmot.v2.MarmotService.ListDatabaseRegistry:output_type -> marmot.v2.DatabaseRegistryResponse
-	20, // 80: marmot.v2.MarmotService.TransactionStream:output_type -> marmot.v2.TransactionResponse
-	61, // [61:81] is the sub-list for method output_type
-	41, // [41:61] is the sub-list for method input_type
-	41, // [41:41] is the sub-list for extension type_name
-	41, // [41:41] is the sub-list for extension extendee
-	0,  // [0:41] is the sub-list for field type_name
+	19, // 10: marmot.v2.TransactionRequest.commit_timestamp:type_name -> marmot.v2.HLC
+	63, // 11: marmot.v2.Statement.type:type_name -> marmot.common.StatementType
+	15, // 12: marmot.v2.Statement.row_change:type_name -> marmot.v2.RowChange
+	17, // 13: marmot.v2.Statement.ddl_change:type_name -> marmot.v2.DDLChange
+	18, // 14: marmot.v2.Statement.load_data_change:type_name -> marmot.v2.LoadDataChange
+	14, // 15: marmot.v2.Statement.vector_index_change:type_name -> marmot.v2.VectorIndexChange
+	16, // 16: marmot.v2.Statement.dml_intent:type_name -> marmot.v2.DMLIntent
+	3,  // 17: marmot.v2.VectorIndexChange.action:type_name -> marmot.v2.VectorIndexAction
+	19, // 18: marmot.v2.TransactionResponse.applied_at:type_name -> marmot.v2.HLC
+	19, // 19: marmot.v2.ReadRequest.snapshot_ts:type_name -> marmot.v2.HLC
+	2,  // 20: marmot.v2.ReadRequest.consistency:type_name -> marmot.v2.ConsistencyLevel
+	23, // 21: marmot.v2.ReadResponse.rows:type_name -> marmot.v2.Row
+	19, // 22: marmot.v2.ReadResponse.timestamp:type_name -> marmot.v2.HLC
+	61, // 23: marmot.v2.Row.columns:type_name -> marmot.v2.Row.ColumnsEntry
+	13, // 24: marmot.v2.ChangeEvent.statements:type_name -> marmot.v2.Statement
+	19, // 25: marmot.v2.ChangeEvent.timestamp:type_name -> marmot.v2.HLC
+	19, // 26: marmot.v2.LogEntry.commit_timestamp:type_name -> marmot.v2.HLC
+	27, // 27: marmot.v2.LogListResponse.entries:type_name -> marmot.v2.LogEntry
+	31, // 28: marmot.v2.DatabaseRegistryResponse.entries:type_name -> marmot.v2.DatabaseRegistryEntry
+	35, // 29: marmot.v2.ReplicationStateResponse.states:type_name -> marmot.v2.DatabaseReplicationState
+	19, // 30: marmot.v2.DatabaseReplicationState.last_applied_timestamp:type_name -> marmot.v2.HLC
+	19, // 31: marmot.v2.SnapshotInfoResponse.timestamp:type_name -> marmot.v2.HLC
+	38, // 32: marmot.v2.SnapshotInfoResponse.databases:type_name -> marmot.v2.DatabaseFileInfo
+	39, // 33: marmot.v2.SnapshotInfoResponse.database_metadata:type_name -> marmot.v2.DatabaseSnapshotMetadata
+	62, // 34: marmot.v2.LatestTxnIDsResponse.database_txn_ids:type_name -> marmot.v2.LatestTxnIDsResponse.DatabaseTxnIdsEntry
+	43, // 35: marmot.v2.LatestTxnIDsResponse.database_info:type_name -> marmot.v2.DatabaseInfo
+	46, // 36: marmot.v2.AutoIncBasesResponse.bases:type_name -> marmot.v2.AutoIncBase
+	7,  // 37: marmot.v2.GetClusterNodesResponse.nodes:type_name -> marmot.v2.NodeState
+	13, // 38: marmot.v2.TransactionChunk.statements:type_name -> marmot.v2.Statement
+	19, // 39: marmot.v2.TransactionCommit.timestamp:type_name -> marmot.v2.HLC
+	19, // 40: marmot.v2.TransactionCommit.commit_timestamp:type_name -> marmot.v2.HLC
+	52, // 41: marmot.v2.TransactionStreamMessage.chunk:type_name -> marmot.v2.TransactionChunk
+	53, // 42: marmot.v2.TransactionStreamMessage.commit:type_name -> marmot.v2.TransactionCommit
+	4,  // 43: marmot.v2.ForwardQueryRequest.txn_control:type_name -> marmot.v2.ForwardTxnControl
+	5,  // 44: marmot.v2.MarmotService.Gossip:input_type -> marmot.v2.GossipRequest
+	8,  // 45: marmot.v2.MarmotService.Join:input_type -> marmot.v2.JoinRequest
+	10, // 46: marmot.v2.MarmotService.Ping:input_type -> marmot.v2.PingRequest
+	12, // 47: marmot.v2.MarmotService.ReplicateTransaction:input_type -> marmot.v2.TransactionRequest
+	21, // 48: marmot.v2.MarmotService.Read:input_type -> marmot.v2.ReadRequest
+	24, // 49: marmot.v2.MarmotService.StreamChanges:input_type -> marmot.v2.StreamRequest
+	33, // 50: marmot.v2.MarmotService.GetReplicationState:input_type -> marmot.v2.ReplicationStateRequest
+	36, // 51: marmot.v2.MarmotService.GetSnapshotInfo:input_type -> marmot.v2.SnapshotInfoRequest
+	40, // 52: marmot.v2.MarmotService.StreamSnapshot:input_type -> marmot.v2.SnapshotRequest
+	42, // 53: marmot.v2.MarmotService.GetLatestTxnIDs:input_type -> marmot.v2.LatestTxnIDsRequest
+	50, // 54: marmot.v2.MarmotService.GetClusterNodes:input_type -> marmot.v2.GetClusterNodesRequest
+	55, // 55: marmot.v2.MarmotService.ForwardQuery:input_type -> marmot.v2.ForwardQueryRequest
+	57, // 56: marmot.v2.MarmotService.ForwardLoadData:input_type -> marmot.v2.ForwardLoadDataRequest
+	58, // 57: marmot.v2.MarmotService.GetLoadDataChunk:input_type -> marmot.v2.LoadDataChunkRequest
+	45, // 58: marmot.v2.MarmotService.GetAutoIncBases:input_type -> marmot.v2.AutoIncBasesRequest
+	48, // 59: marmot.v2.MarmotService.SyncAutoIncBases:input_type -> marmot.v2.AutoIncSyncRequest
+	26, // 60: marmot.v2.MarmotService.ListCommittedLog:input_type -> marmot.v2.LogListRequest
+	29, // 61: marmot.v2.MarmotService.FetchTransactions:input_type -> marmot.v2.FetchTransactionsRequest
+	30, // 62: marmot.v2.MarmotService.ListDatabaseRegistry:input_type -> marmot.v2.DatabaseRegistryRequest
+	54, // 63: marmot.v2.MarmotService.TransactionStream:input_type -> marmot.v2.TransactionStreamMessage
+	6,  // 64: marmot.v2.MarmotService.Gossip:output_type -> marmot.v2.GossipResponse
+	9,  // 65: marmot.v2.MarmotService.Join:output_type -> marmot.v2.JoinResponse
+	11, // 66: marmot.v2.MarmotService.Ping:output_type -> marmot.v2.PingResponse
+	20, // 67: marmot.v2.MarmotService.ReplicateTransaction:output_type -> marmot.v2.TransactionResponse
+	22, // 68: marmot.v2.MarmotService.Read:output_type -> marmot.v2.ReadResponse
+	25, // 69: marmot.v2.MarmotService.StreamChanges:output_type -> marmot.v2.ChangeEvent
+	34, // 70: marmot.v2.MarmotService.GetReplicationState:output_type -> marmot.v2.ReplicationStateResponse
+	37, // 71: marmot.v2.MarmotService.GetSnapshotInfo:output_type -> marmot.v2.SnapshotInfoResponse
+	41, // 72: marmot.v2.MarmotService.StreamSnapshot:output_type -> marmot.v2.SnapshotChunk
+	44, // 73: marmot.v2.MarmotService.GetLatestTxnIDs:output_type -> marmot.v2.LatestTxnIDsResponse
+	51, // 74: marmot.v2.MarmotService.GetClusterNodes:output_type -> marmot.v2.GetClusterNodesResponse
+	56, // 75: marmot.v2.MarmotService.ForwardQuery:output_type -> marmot.v2.ForwardQueryResponse
+	56, // 76: marmot.v2.MarmotService.ForwardLoadData:output_type -> marmot.v2.ForwardQueryResponse
+	59, // 77: marmot.v2.MarmotService.GetLoadDataChunk:output_type -> marmot.v2.LoadDataChunkResponse
+	47, // 78: marmot.v2.MarmotService.GetAutoIncBases:output_type -> marmot.v2.AutoIncBasesResponse
+	49, // 79: marmot.v2.MarmotService.SyncAutoIncBases:output_type -> marmot.v2.AutoIncSyncResponse
+	28, // 80: marmot.v2.MarmotService.ListCommittedLog:output_type -> marmot.v2.LogListResponse
+	25, // 81: marmot.v2.MarmotService.FetchTransactions:output_type -> marmot.v2.ChangeEvent
+	32, // 82: marmot.v2.MarmotService.ListDatabaseRegistry:output_type -> marmot.v2.DatabaseRegistryResponse
+	20, // 83: marmot.v2.MarmotService.TransactionStream:output_type -> marmot.v2.TransactionResponse
+	64, // [64:84] is the sub-list for method output_type
+	44, // [44:64] is the sub-list for method input_type
+	44, // [44:44] is the sub-list for extension type_name
+	44, // [44:44] is the sub-list for extension extendee
+	0,  // [0:44] is the sub-list for field type_name
 }
 
 func init() { file_grpc_marmot_proto_init() }

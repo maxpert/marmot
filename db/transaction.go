@@ -62,6 +62,7 @@ type TransactionManager struct {
 	gcRunning           bool
 	databaseName        string                     // Name of database this manager manages
 	gcSafePosition      GCSafePositionFunc         // Callback for GC's safe deletion position
+	memberCount         func() int                 // Current member count, for tombstone GC (SetMemberCountFunc)
 	batchCommitter      *SQLiteBatchCommitter      // SQLite write batcher (nil if disabled)
 	notifier            CDCNotifier                // Injected, can be nil
 	vectorCDCNotifier   VectorCDCNotifier          // Injected, can be nil
@@ -147,6 +148,14 @@ func (tm *TransactionManager) SetGCSafePositionFunc(fn GCSafePositionFunc) {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 	tm.gcSafePosition = fn
+}
+
+// SetMemberCountFunc sets the callback tombstone GC (purgeTombstones) uses
+// to learn how many members the cluster has.
+func (tm *TransactionManager) SetMemberCountFunc(fn func() int) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	tm.memberCount = fn
 }
 
 // SetNotifier sets the CDC notifier for signaling after commits
@@ -400,7 +409,7 @@ func (tm *TransactionManager) WriteIntent(txn *Transaction, intentType IntentTyp
 // idempotence would otherwise mask a duplicate finalizeCommit writing a
 // second log entry).
 func (tm *TransactionManager) CommitTransaction(txn *Transaction) error {
-	return tm.CommitTransactionAfter(txn, nil)
+	return tm.CommitTransactionAfter(txn, hlc.Timestamp{}, nil)
 }
 
 // CommitTransactionAfter is CommitTransaction with before run first, under
@@ -408,7 +417,12 @@ func (tm *TransactionManager) CommitTransaction(txn *Transaction) error {
 // happen exactly once before the commit (applying an AUTO_INCREMENT claim)
 // never runs for a transaction another caller already committed. An error
 // from before aborts the commit and is returned as is.
-func (tm *TransactionManager) CommitTransactionAfter(txn *Transaction, before func() error) error {
+//
+// commitTS is the commit timestamp the transaction's coordinator decided,
+// the same on every node; every row the commit writes is versioned with it.
+// A zero commitTS (a coordinator or peer too old to send one) falls back to
+// a timestamp computed here, as every commit did before.
+func (tm *TransactionManager) CommitTransactionAfter(txn *Transaction, commitTS hlc.Timestamp, before func() error) error {
 	txn.mu.Lock()
 	defer txn.mu.Unlock()
 
@@ -437,8 +451,7 @@ func (tm *TransactionManager) CommitTransactionAfter(txn *Transaction, before fu
 		return err
 	}
 
-	// Calculate commit timestamp
-	txn.CommitTS = tm.calculateCommitTS(txn.StartTS)
+	txn.CommitTS = tm.resolveCommitTS(txn, commitTS)
 
 	if len(cdcEntries) > 0 {
 		// DML path: apply CDC entries
@@ -641,6 +654,22 @@ func (tm *TransactionManager) notifyVectorCDC(txn *Transaction, entries []*Inten
 	}
 }
 
+// resolveCommitTS returns txn's commit timestamp: decided, the
+// coordinator's, merged into this node's clock so any transaction this node
+// prepares later is ordered after it, or, when decided is zero,
+// calculateCommitTS. Its NodeID is always txn's origin (its coordinator),
+// the tie-break every node applying txn uses for its row versions.
+func (tm *TransactionManager) resolveCommitTS(txn *Transaction, decided hlc.Timestamp) hlc.Timestamp {
+	commitTS := decided
+	if decided.IsZero() {
+		commitTS = tm.calculateCommitTS(txn.StartTS)
+	} else {
+		tm.clock.Update(decided)
+	}
+	commitTS.NodeID = txn.NodeID
+	return commitTS
+}
+
 // calculateCommitTS determines the commit timestamp (must be > start_ts).
 func (tm *TransactionManager) calculateCommitTS(startTS hlc.Timestamp) hlc.Timestamp {
 	commitTS := tm.clock.Now()
@@ -722,10 +751,14 @@ func (tm *TransactionManager) applyCDCEntries(txnID uint64, commitTS hlc.Timesta
 	}
 	defer tx.Rollback()
 
-	schemaAdapter := &schemaCacheAdapter{cache: tm.schemaCache}
+	applier, err := newVersionedApplier(tx, &schemaCacheAdapter{cache: tm.schemaCache})
+	if err != nil {
+		return err
+	}
+	defer applier.Close()
 
 	for _, entry := range entries {
-		if err := ApplyCDCEntry(tx, schemaAdapter, entry); err != nil {
+		if err := applier.applyEntry(entry, commitTS); err != nil {
 			return fmt.Errorf("failed to write CDC data for %s: %w", entry.Table, err)
 		}
 	}
@@ -841,7 +874,7 @@ func (tm *TransactionManager) applyNonDMLIntents(txnID uint64, commitTS hlc.Time
 	}
 	defer tx.Rollback()
 
-	change, hasDDL, err := tm.execNonDMLIntentsInTx(ctx, tx, txnID, kinds)
+	change, hasDDL, err := tm.execNonDMLIntentsInTx(ctx, tx, txnID, commitTS, kinds)
 	if err != nil {
 		return err
 	}
@@ -891,15 +924,27 @@ func (tm *TransactionManager) applyNonDMLVectorControl(kinds []nonDMLIntentKind)
 // (LOAD DATA and DDL, vector control having already run outside it), seeds
 // AUTO_INCREMENT bases for any DDL this txn ran, and reports the accumulated
 // schema change and whether any DDL ran.
-func (tm *TransactionManager) execNonDMLIntentsInTx(ctx context.Context, tx *sql.Tx, txnID uint64, kinds []nonDMLIntentKind) (SchemaChange, bool, error) {
+func (tm *TransactionManager) execNonDMLIntentsInTx(ctx context.Context, tx *sql.Tx, txnID uint64, commitTS hlc.Timestamp, kinds []nonDMLIntentKind) (SchemaChange, bool, error) {
 	var change SchemaChange
 	hasDDL := false
+	var applier *versionedApplier
+	defer func() {
+		if applier != nil {
+			applier.Close()
+		}
+	}()
 	for _, k := range kinds {
 		switch {
 		case k.vector != nil:
 			continue // already applied above
 		case k.load != nil:
-			if _, err := ApplyLoadDataInTx(tx, k.load.SQL, k.load.Data); err != nil {
+			if applier == nil {
+				var err error
+				if applier, err = newVersionedApplier(tx, &schemaCacheAdapter{cache: tm.schemaCache}); err != nil {
+					return change, false, err
+				}
+			}
+			if err := applier.applyLoadData(k.load.SQL, k.load.Data, commitTS); err != nil {
 				return change, false, fmt.Errorf("failed to execute LOAD DATA statement: %w", err)
 			}
 			log.Debug().Uint64("txn_id", txnID).Msg("LOAD DATA statement executed")
@@ -1244,6 +1289,14 @@ func (tm *TransactionManager) runGarbageCollection() {
 		log.Info().
 			Int("old_txn_records", oldTxnCount).
 			Msg("GC Phase 2: Cleaned up old data")
+	}
+
+	tombstones, err := tm.purgeTombstones()
+	if err != nil {
+		log.Error().Err(err).Msg("GC Phase 2: Failed to purge row version tombstones")
+	}
+	if tombstones > 0 {
+		log.Info().Int64("tombstones", tombstones).Msg("GC Phase 2: Purged row version tombstones")
 	}
 }
 

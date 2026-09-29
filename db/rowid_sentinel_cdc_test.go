@@ -69,7 +69,7 @@ func applyEntries(t *testing.T, replica *ReplicatedDatabase, entries []*IntentEn
 	t.Helper()
 	adapter := &schemaCacheAdapter{cache: replica.schemaCache}
 	for _, entry := range entries {
-		require.NoError(t, ApplyCDCEntry(replica.GetWriteDB(), adapter, entry))
+		require.NoError(t, applyEntryInTx(t, replica.GetWriteDB(), adapter, entry, hlc.Timestamp{WallTime: 1, NodeID: 1}))
 	}
 }
 
