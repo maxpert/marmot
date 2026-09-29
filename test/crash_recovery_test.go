@@ -582,6 +582,47 @@ func (h *ClusterHarness) StopNode(nodeID int) error {
 	return nil
 }
 
+// GracefulStopNode sends SIGTERM and waits for the node's own shutdown - the
+// path that announces LEAVING to its peers - unlike StopNode, which kills it.
+func (h *ClusterHarness) GracefulStopNode(nodeID int, timeout time.Duration) error {
+	node := h.Nodes[nodeID-1]
+	node.mu.Lock()
+	defer node.mu.Unlock()
+
+	if !node.isRunning {
+		return fmt.Errorf("node %d is not running", nodeID)
+	}
+	if node.DB != nil {
+		node.DB.Close()
+		node.DB = nil
+	}
+	if err := node.Cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		return fmt.Errorf("SIGTERM node %d: %w", nodeID, err)
+	}
+
+	exited := make(chan error, 1)
+	go func() { exited <- node.Cmd.Wait() }()
+	var err error
+	select {
+	case waitErr := <-exited:
+		if waitErr != nil {
+			err = fmt.Errorf("node %d exited with an error after SIGTERM: %w", nodeID, waitErr)
+		} else {
+			h.t.Logf("Node %d stopped gracefully", nodeID)
+		}
+	case <-time.After(timeout):
+		err = fmt.Errorf("node %d did not shut down within %v of SIGTERM", nodeID, timeout)
+		if killErr := node.Cmd.Process.Kill(); killErr != nil {
+			err = fmt.Errorf("%w; kill: %v", err, killErr)
+		}
+		<-exited
+	}
+	node.isRunning = false
+	node.Cmd = nil
+	os.Remove(node.PIDFile)
+	return err
+}
+
 func (h *ClusterHarness) KillNode(nodeID int) error {
 	node := h.Nodes[nodeID-1]
 	node.mu.Lock()

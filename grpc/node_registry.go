@@ -311,8 +311,16 @@ func (nr *NodeRegistry) handleSelfUpdateLocked(node *NodeState) {
 		return
 	}
 
+	// REMOVED is terminal: every peer keeps it sticky, so refuting it would only
+	// climb our incarnation. Only the admin allow endpoint clears it.
+	if node.Status == NodeStatus_REMOVED {
+		return
+	}
+
 	// Accept LEAVING from higher incarnation — this is a remote decommission
-	// via admin API, not a failure detection. Don't refute it.
+	// via admin API, not a failure detection. Don't refute it. The departure
+	// a previous run of this node gossiped never reaches here: a restart
+	// starts above the incarnation it was persisted at (restoreMembershipLocked).
 	if node.Status == NodeStatus_LEAVING && node.Incarnation > self.Incarnation {
 		oldStatus := self.Status
 		oldIncarnation := self.Incarnation
@@ -356,6 +364,8 @@ func (nr *NodeRegistry) handleSelfUpdateLocked(node *NodeState) {
 		if self.Status != NodeStatus_JOINING {
 			self.Status = NodeStatus_ALIVE
 		}
+		// Persist the bump, so a restart starts above what this run announced.
+		nr.updateClusterMetricsLocked()
 		log.Debug().
 			Uint64("refuted_incarnation", node.Incarnation).
 			Uint64("new_incarnation", self.Incarnation).
@@ -686,8 +696,9 @@ func (nr *NodeRegistry) MarkAlive(nodeID uint64) {
 		// Record state transition if status changed
 		if oldStatus != NodeStatus_ALIVE {
 			telemetry.NodeStateTransitionsTotal.With(oldStatus.String(), NodeStatus_ALIVE.String()).Inc()
-			nr.updateClusterMetricsLocked()
 		}
+		// The incarnation changed even when the status did not: persist it.
+		nr.updateClusterMetricsLocked()
 	}
 }
 
@@ -1111,9 +1122,12 @@ func (nr *NodeRegistry) restoreMembershipLocked() int {
 	}
 
 	restored := 0
+	var selfIncarnation uint64
+	selfRecorded := false
 	for _, record := range snapshot.Nodes {
 		if record.NodeID == nr.localNodeID {
 			// Self is ALIVE by construction and was added by the caller.
+			selfIncarnation, selfRecorded = record.Incarnation, true
 			continue
 		}
 
@@ -1137,6 +1151,17 @@ func (nr *NodeRegistry) restoreMembershipLocked() int {
 	// The snapshot we just read is what is on disk; record it so an unchanged
 	// membership does not rewrite the same bytes on the first mutation.
 	nr.persistedFingerprint = nr.membershipFingerprintLocked()
+
+	// Start above every incarnation the previous run announced: every change
+	// of our own incarnation is persisted (MarkLeaving, MarkAlive and SWIM
+	// refutation all reach persistMembershipLocked). Peers keep that run's
+	// last record of us - LEAVING after a graceful stop - and a restart at or
+	// below it would lose to it. Set after the fingerprint so the next
+	// membership change persists the new value. A failed persist is logged
+	// and leaves the older incarnation on disk.
+	if selfRecorded {
+		nr.nodes[nr.localNodeID].Incarnation = selfIncarnation + 1
+	}
 	return restored
 }
 

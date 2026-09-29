@@ -178,6 +178,35 @@ curl -X POST -H "X-Marmot-Secret: $SECRET" http://node1:8080/admin/cluster/remov
 # 5-node cluster → 3-node cluster, quorum: 3 → 2
 ```
 
+**Restarting a Node:** a node stopped with SIGTERM announces that it is leaving, and its peers keep that record.
+Started again, it supersedes the record and rejoins as ALIVE; no admin call is needed. This relies on the
+membership record in its data directory: a node restarted on a wiped data directory after a graceful stop
+still takes its old departure as a decommission and shuts down again. Handle it like a replaced node (see
+Replacing a Failed Node): remove it, and allow it before reusing its `node_id`, or bring it back with a new one.
+
+A node decommissioned through `/admin/cluster/decommission` while ALIVE also rejoins if it is started again
+(for example by a service manager that restarts it). `/admin/cluster/remove` (REMOVED) is the permanent exclusion.
+
+### Membership Changes and Narrow AUTO_INCREMENT Ids
+
+Ids of `AUTO_INCREMENT` columns narrower than `BIGINT` come from ranges each node claims through a quorum (see
+Narrow AUTO_INCREMENT Columns in [Compatibility](/compatibility)). They are unique while the membership is stable.
+Every node also raises its claim bases to the highest base every ALIVE peer reports, every 10 seconds, which closes
+the window a membership change opens. To add or remove nodes, change the membership one node at a time:
+
+1. Add or remove **one** node.
+2. Wait until it is ALIVE and its claim votes are released: its log says `AUTO_INCREMENT claim votes released after merging claim bases`,
+   or it never held them.
+3. Run the sync on any node:
+   ```bash
+   curl -X POST -H "X-Marmot-Secret: $SECRET" http://node1:8080/admin/cluster/autoinc/sync
+   ```
+4. Make the next change only when the answer's `complete` is `true`: every member answered, is not holding its
+   votes, and reached every member. A sync gathers only from the peers a node sees ALIVE, so right after a change
+   it can be incomplete; re-run it until it is complete.
+
+The sync endpoint requires `cluster_secret`; on a cluster without one it answers 403.
+
 ## Rolling Upgrades
 
 This release replaces how nodes catch up with each other: every node now

@@ -894,7 +894,8 @@ See the [Vector Search](/vector-search) page for the full startup guide, RAG sch
 | `INT UNSIGNED` | `INTEGER` | UNSIGNED removed |
 | `VARCHAR(n)` | `TEXT` | Length constraint removed |
 | `DATETIME` | `TEXT` | Date stored as ISO string |
-| `INT AUTO_INCREMENT` | `BIGINT` | Auto-generated distributed IDs (see Auto ID Mode) |
+| `INT AUTO_INCREMENT` | `INTEGER` | Ids fit the declared width (see Narrow AUTO_INCREMENT Columns in [Compatibility](/compatibility)) |
+| `BIGINT AUTO_INCREMENT` | `INTEGER` | Auto-generated distributed IDs (see Auto ID Mode) |
 | `BOOLEAN` | `INTEGER` | Type changed |
 | `HIGH_PRIORITY` | (removed) | MySQL-only hint |
 | `SQL_NO_CACHE` | (removed) | MySQL-only hint |

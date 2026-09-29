@@ -5,6 +5,7 @@
   "replication": "Replication",
   "integrations": "Integrations",
   "compatibility": "Compatibility",
+  "lldap": "LLDAP",
   "sql-reference": "SQL Reference",
   "vector-search": "Vector Search",
   "operations": "Operations",

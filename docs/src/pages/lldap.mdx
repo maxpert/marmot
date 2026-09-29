@@ -1,0 +1,38 @@
+---
+title: LLDAP
+---
+
+# LLDAP
+
+[LLDAP](https://github.com/lldap/lldap) runs on Marmot through its MySQL backend. Tested version: **0.6.3**
+(`lldap/lldap:v0.6.3`).
+
+## Configuration
+
+Create the database once, on any node:
+
+```sql
+CREATE DATABASE lldap;
+```
+
+Point LLDAP at a node's MySQL port:
+
+```bash
+LLDAP_DATABASE_URL=mysql://root@marmot-node-1:3306/lldap
+```
+
+LLDAP's migrations run through Marmot and replicate like any other DDL. Its `groups` table uses an
+`INT AUTO_INCREMENT` key, so group ids fit 32 bits (see Narrow AUTO_INCREMENT Columns in
+[Compatibility](/compatibility)):
+
+- A single node needs `cluster.standalone = true`.
+- On a new cluster, start LLDAP after the node it connects to logs `AUTO_INCREMENT claim votes released after merging claim bases`. Each node
+  issues group ids from its own range, so groups created through different nodes get ids from different ranges.
+
+## Verified Scenarios
+
+| Scenario | Verified |
+|----------|----------|
+| Single node | LLDAP boots and runs its migrations; users, groups and memberships created through the GraphQL API; a password set with `lldap_set_password`; LDAP bind as that user; all ids fit their columns; data and login survive a restart of LLDAP and then of Marmot |
+| Three nodes, LLDAP on two of them | LLDAP instances on node 1 and node 2 see each other's users and groups and bind the same users; a node stopped gracefully while both keep writing, then restarted, holds identical rows in every LLDAP table (checked with a 30-second bound); no id collisions |
+| Cold start on a cluster | LLDAP started against a new database on one node of three: its migrations reach every node, and the schema is identical on all nodes |
