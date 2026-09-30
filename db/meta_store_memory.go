@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"fmt"
 	"time"
 
@@ -263,6 +264,11 @@ func (m *MemoryMetaStore) StableSeq() uint64 {
 // ListCommittedLog delegates to Pebble.
 func (m *MemoryMetaStore) ListCommittedLog(after LogPosition, limit int) ([]CommittedLogEntry, uint64, bool, error) {
 	return m.pebble.ListCommittedLog(after, limit)
+}
+
+// CountCommittedLog delegates to Pebble.
+func (m *MemoryMetaStore) CountCommittedLog(ctx context.Context, after LogPosition, stable uint64) (uint64, error) {
+	return m.pebble.CountCommittedLog(ctx, after, stable)
 }
 
 // GetPullCursor delegates to Pebble.

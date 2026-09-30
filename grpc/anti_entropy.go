@@ -3,6 +3,7 @@ package grpc
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"sync"
 	"time"
 
@@ -48,6 +49,13 @@ type AntiEntropyService struct {
 	statusMu       sync.RWMutex
 	caughtUp       map[string]bool
 	promotionReady map[string]bool
+
+	// lagGauge is telemetry.ReplicationLagTxns; lagPeers holds the peer
+	// label values it currently exports, so a peer that leaves membership
+	// has its series deleted.
+	lagGauge telemetry.GaugeVec
+	lagMu    sync.Mutex
+	lagPeers map[uint64]struct{}
 }
 
 // SnapshotTransferFunc initiates a snapshot transfer to a peer
@@ -95,6 +103,8 @@ func NewAntiEntropyService(config AntiEntropyConfig) *AntiEntropyService {
 		stopCh:                 make(chan struct{}),
 		caughtUp:               make(map[string]bool),
 		promotionReady:         make(map[string]bool),
+		lagGauge:               telemetry.ReplicationLagTxns,
+		lagPeers:               make(map[uint64]struct{}),
 	}
 }
 
@@ -274,6 +284,7 @@ func (ae *AntiEntropyService) performAntiEntropy() {
 	}()
 
 	members, alive := ae.currentMembers()
+	ae.deleteDepartedPeerLag(members)
 	if len(alive) == 0 {
 		log.Debug().Msg("Anti-entropy: no alive peers to sync with")
 		return
@@ -290,9 +301,11 @@ func (ae *AntiEntropyService) performAntiEntropy() {
 	// is ever pulled.
 	ae.reconcileDatabaseRegistry(alive)
 
+	lag := newReplicationLag()
 	for _, dbName := range ae.dbManager.ListDatabases() {
-		ae.syncDatabase(dbName, members, alive)
+		ae.syncDatabase(dbName, members, alive, lag)
 	}
+	ae.publishLag(lag)
 
 	ae.restoreAwaitingDatabases(alive)
 
@@ -392,15 +405,16 @@ func considerSnapshotSource(best *snapshotSource, candidate snapshotSource) *sna
 // syncDatabase runs one database's pull round against every alive peer,
 // each pair under its own deadline, falls back
 // to a snapshot restore when any member's log no longer covers this node's
-// cursor into it, and records the resulting caught-up status.
-func (ae *AntiEntropyService) syncDatabase(dbName string, members, alive []*NodeState) {
+// cursor into it, and records the resulting caught-up status and each
+// pair's unapplied count in lag.
+func (ae *AntiEntropyService) syncDatabase(dbName string, members, alive []*NodeState, lag *replicationLag) {
 	// Finish a pending re-apply of this node's own log, left by a
 	// restore that crashed or failed before completing it, before pulling
 	// anything more for dbName.
 	ae.reapplyIfPending(dbName)
 
 	dbCaughtUp := len(alive) == len(members)
-	dbPromotionReady, needsSnapshot, source := ae.pullEveryAlivePeer(dbName, alive, &dbCaughtUp)
+	dbPromotionReady, needsSnapshot, source := ae.pullEveryAlivePeer(dbName, alive, &dbCaughtUp, lag)
 
 	if needsSnapshot {
 		dbCaughtUp = false
@@ -425,7 +439,7 @@ func (ae *AntiEntropyService) syncDatabase(dbName string, members, alive []*Node
 // dbCaughtUp (an in-out pointer, cleared by any pair that did not fully
 // succeed - it starts set from len(alive)==len(members)), promotionReady
 // (see below) and the best snapshot source seen, for the
-// needsSnapshot fallback.
+// needsSnapshot fallback. Each pair's outcome is also recorded in lag.
 //
 // promotionReady is deliberately over alive peers only, never all members
 // (checkPromotionCriteria): requiring CaughtUp over every member, DEAD ones
@@ -434,13 +448,14 @@ func (ae *AntiEntropyService) syncDatabase(dbName string, members, alive []*Node
 // did not fully succeed; it also requires at least one alive peer was
 // actually pulled, so a node with no alive peers yet is never
 // promotion-ready.
-func (ae *AntiEntropyService) pullEveryAlivePeer(dbName string, alive []*NodeState, dbCaughtUp *bool) (promotionReady, needsSnapshot bool, source *snapshotSource) {
+func (ae *AntiEntropyService) pullEveryAlivePeer(dbName string, alive []*NodeState, dbCaughtUp *bool, lag *replicationLag) (promotionReady, needsSnapshot bool, source *snapshotSource) {
 	promotionReady = len(alive) > 0
 
 	for _, peer := range alive {
 		pairCtx, cancel := context.WithTimeout(context.Background(), ae.interval)
 		result, err := ae.logPuller.PullPair(pairCtx, PeerRef{NodeID: peer.NodeId, Address: peer.Address}, dbName)
 		cancel()
+		lag.record(peer.NodeId, result, err)
 
 		if err != nil {
 			log.Warn().Err(err).Uint64("peer_node", peer.NodeId).Str("database", dbName).
@@ -467,6 +482,60 @@ func (ae *AntiEntropyService) pullEveryAlivePeer(dbName string, alive []*NodeSta
 		}
 	}
 	return promotionReady, needsSnapshot, source
+}
+
+// replicationLag sums one round's PairResult.Unapplied per peer over the
+// databases pulled. A peer with any pair of unknown count (an error, a
+// snapshot fallback, an older peer that cannot report the rest of its log)
+// is marked unknown and not published that round: a partial sum would
+// understate its lag.
+type replicationLag struct {
+	unapplied map[uint64]uint64
+	unknown   map[uint64]bool
+}
+
+func newReplicationLag() *replicationLag {
+	return &replicationLag{unapplied: make(map[uint64]uint64), unknown: make(map[uint64]bool)}
+}
+
+// record adds one pair's outcome for peer.
+func (l *replicationLag) record(peer uint64, result PairResult, err error) {
+	if err != nil || !result.UnappliedKnown {
+		l.unknown[peer] = true
+		return
+	}
+	l.unapplied[peer] += result.Unapplied
+}
+
+// publishLag sets ReplicationLagTxns for every peer lag counted in full,
+// leaving every other peer's series as it was.
+func (ae *AntiEntropyService) publishLag(lag *replicationLag) {
+	ae.lagMu.Lock()
+	defer ae.lagMu.Unlock()
+	for peer, n := range lag.unapplied {
+		if lag.unknown[peer] {
+			continue
+		}
+		ae.lagGauge.With(strconv.FormatUint(peer, 10)).Set(float64(n))
+		ae.lagPeers[peer] = struct{}{}
+	}
+}
+
+// deleteDepartedPeerLag deletes the ReplicationLagTxns series of every peer
+// no longer among members.
+func (ae *AntiEntropyService) deleteDepartedPeerLag(members []*NodeState) {
+	current := make(map[uint64]struct{}, len(members))
+	for _, m := range members {
+		current[m.NodeId] = struct{}{}
+	}
+	ae.lagMu.Lock()
+	defer ae.lagMu.Unlock()
+	for peer := range ae.lagPeers {
+		if _, ok := current[peer]; !ok {
+			ae.lagGauge.Delete(strconv.FormatUint(peer, 10))
+			delete(ae.lagPeers, peer)
+		}
+	}
 }
 
 // restoreFromPeer restores dbName from source's snapshot and then runs the

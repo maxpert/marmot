@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -1758,16 +1759,65 @@ func (s *PebbleMetaStore) ListCommittedLog(after LogPosition, limit int) ([]Comm
 		return nil, stable, false, nil
 	}
 
+	var entries []CommittedLogEntry
+	more := false
+	err := s.iterateCommittedLog(after, stable, func(pos LogPosition, stamp func() []byte) (bool, error) {
+		if len(entries) >= limit {
+			more = true
+			return false, nil
+		}
+		commitTS, err := decodeLogEntryStamp(stamp())
+		if err != nil {
+			return false, err
+		}
+		entries = append(entries, CommittedLogEntry{LogPosition: pos, CommitTS: commitTS})
+		return true, nil
+	})
+	if err != nil {
+		return nil, stable, false, err
+	}
+	return entries, stable, more, nil
+}
+
+// CountCommittedLog returns how many of this store's local log entries lie
+// strictly after `after` with Seq <= stable and are COMMITTED: the entries a
+// ListCommittedLog walk from `after` would list against that stable point.
+// It reads each such entry's index key, never its value, plus the
+// transaction's status (a stray index entry is not COMMITTED), so its cost
+// grows with the count. It stops with ctx's error once ctx is done, checked
+// every countCtxCheckInterval entries.
+func (s *PebbleMetaStore) CountCommittedLog(ctx context.Context, after LogPosition, stable uint64) (uint64, error) {
+	var n uint64
+	err := s.iterateCommittedLog(after, stable, func(LogPosition, func() []byte) (bool, error) {
+		if n%countCtxCheckInterval == 0 {
+			if err := ctx.Err(); err != nil {
+				return false, err
+			}
+		}
+		n++
+		return true, nil
+	})
+	return n, err
+}
+
+// countCtxCheckInterval is how many entries CountCommittedLog counts
+// between checks of its context.
+const countCtxCheckInterval = 1024
+
+// iterateCommittedLog calls fn, in position order, for every local log
+// entry strictly after `after` with Seq <= stable whose transaction is
+// COMMITTED, passing a reader of the entry's stored commit stamp (the index
+// value, read only if fn calls it), until fn returns false or an error.
+func (s *PebbleMetaStore) iterateCommittedLog(after LogPosition, stable uint64, fn func(pos LogPosition, stamp func() []byte) (bool, error)) error {
 	lower := buildKeyUint64x2(pebblePrefixTxnSeq, after.Seq, after.TxnID)
 	prefix := []byte(pebblePrefixTxnSeq)
 	iter, err := s.db.NewIter(&pebble.IterOptions{LowerBound: prefix, UpperBound: prefixUpperBound(prefix)})
 	if err != nil {
-		return nil, stable, false, err
+		return err
 	}
 	defer iter.Close()
 
-	var entries []CommittedLogEntry
-	more := false
+	stamp := iter.Value
 	for iter.SeekGE(lower); iter.Valid(); iter.Next() {
 		key := iter.Key()
 		if len(key) < len(pebblePrefixTxnSeq)+16 {
@@ -1786,26 +1836,21 @@ func (s *PebbleMetaStore) ListCommittedLog(after LogPosition, limit int) ([]Comm
 
 		status, statusErr := s.readTxnStatus(pos.TxnID)
 		if statusErr != nil && statusErr != pebble.ErrNotFound {
-			return nil, stable, false, statusErr
+			return statusErr
 		}
 		if statusErr == pebble.ErrNotFound || status != TxnStatusCommitted {
 			continue
 		}
 
-		if len(entries) >= limit {
-			more = true
+		cont, err := fn(pos, stamp)
+		if err != nil {
+			return err
+		}
+		if !cont {
 			break
 		}
-		commitTS, err := decodeLogEntryStamp(iter.Value())
-		if err != nil {
-			return nil, stable, false, err
-		}
-		entries = append(entries, CommittedLogEntry{LogPosition: pos, CommitTS: commitTS})
 	}
-	if err := iter.Error(); err != nil {
-		return nil, stable, false, err
-	}
-	return entries, stable, more, nil
+	return iter.Error()
 }
 
 // GetPullCursor returns C[self,peer,d]: this store's pull position in

@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"errors"
 	"path/filepath"
 	"strings"
@@ -127,6 +128,11 @@ type MetaStore interface {
 	// call, up to limit. more is true when further stable entries exist
 	// beyond the returned page. Each entry carries its commit timestamp.
 	ListCommittedLog(after LogPosition, limit int) (entries []CommittedLogEntry, stable uint64, more bool, err error)
+
+	// CountCommittedLog returns how many COMMITTED local log entries lie
+	// strictly after `after` with Seq <= stable. Its cost grows with the
+	// count; it stops with ctx's error once ctx is done.
+	CountCommittedLog(ctx context.Context, after LogPosition, stable uint64) (uint64, error)
 
 	// GetPullCursor and SetPullCursor persist C[self,peer,d]: this node's
 	// pull position in peerNodeID's log for this database.

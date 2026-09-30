@@ -69,7 +69,7 @@ curl http://localhost:8080/metrics
 | `marmot_v2_log_pull_txns_applied_total` | Counter | - | Transactions applied by pulling peers' local commit logs |
 | `marmot_v2_log_pull_pair_results_total` | Counter | `outcome` | Per-(peer, database) pulls by outcome: `caught_up`, `behind`, `needs_snapshot`, `unimplemented`, `error` |
 | `marmot_v2_anti_entropy_stuck_txns` | Gauge | `database` | Pulled transactions no longer retried every round after repeated replay failures |
-| `marmot_v2_replication_lag_txns` | Gauge | `peer` | Registered but not currently updated |
+| `marmot_v2_replication_lag_txns` | Gauge | `peer` | Committed transactions past this node's pull cursor, as of the last pull round, summed over databases. It is not a real-time value. It is an upper bound on what catch-up still has to do: some of them may already be applied through the write path, because entries beyond one round's page limit are counted without being checked. A round that cannot count every entry leaves the value from the previous round: a pull error, a snapshot fallback, or an older peer that stops at the page limit. A peer that is not alive (SUSPECT or DEAD, but not REMOVED) is not pulled, so it keeps its last value until it is pulled again or removed. The series is deleted when the peer is removed from membership |
 
 There is no delta sync counter: anti-entropy is a log pull, counted by the `log_pull_*` metrics.
 
@@ -144,6 +144,6 @@ sum(rate(marmot_v2_write_conflicts_total[1m])) by (type)
 
 **Replication lag:**
 ```promql
-# Max replication lag across all peers
+# Per node, the most transactions past its pull cursor into any one peer's log, as of its last pull round
 max(marmot_v2_replication_lag_txns) by (node_id)
 ```

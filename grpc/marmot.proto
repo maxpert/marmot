@@ -367,6 +367,7 @@ message LogListRequest {
   uint32 limit = 5;
   uint64 consumed_seq = 6;  // Position (consumed_seq, consumed_txn_id) the requester has applied every entry through
   uint64 consumed_txn_id = 7;
+  bool count_remaining = 8;  // Ask for remaining_committed in the response
 }
 
 message LogEntry {
@@ -383,6 +384,10 @@ message LogListResponse {
   bool more = 5;                 // More stable entries follow the last one returned
   uint64 schema_version = 6;
   bool database_absent = 7;
+  // COMMITTED entries after the last one returned (or after the request's
+  // position, for an empty page), through stable_seq. Set only when the
+  // request asked (count_remaining); unset from an older peer.
+  optional uint64 remaining_committed = 8;
 }
 
 message FetchTransactionsRequest {

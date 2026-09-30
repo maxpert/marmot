@@ -89,6 +89,17 @@ type PairResult struct {
 	// Stuck counts STUCK transactions this call encountered for this pair
 	// (see LogPuller.StuckTxns).
 	Stuck int
+
+	// Unapplied counts the COMMITTED entries of the peer's log, through its
+	// stable point, past this pair's cursor when the call ends: the listed
+	// entries left uncovered plus every entry past the last one listed,
+	// which is not checked against applied markers, so it is an upper bound
+	// on what is still unapplied. It is meaningful only when UnappliedKnown is set: the walk
+	// reached the peer's stable point, or ended at maxPagesPerPull with the
+	// peer reporting the rest (LogListResponse.remaining_committed, unset
+	// from an older peer). Any other outcome leaves it unknown.
+	Unapplied      uint64
+	UnappliedKnown bool
 }
 
 // StuckTxn describes one transaction a LogPuller has stopped retrying every
@@ -242,6 +253,10 @@ type pullState struct {
 	// the same busy timeout.
 	localCommitFailed bool
 
+	// uncovered counts the entries listed so far this call that are not
+	// covered, for PairResult.Unapplied.
+	uncovered uint64
+
 	result PairResult
 }
 
@@ -254,12 +269,20 @@ func (lp *LogPuller) pullPair(ctx context.Context, peer PeerRef, database string
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return st.result, ctxErr
 		}
-		done, err := lp.pullPage(ctx, st)
+		done, err := lp.pullPage(ctx, st, page == maxPagesPerPull-1)
 		if err != nil || done {
 			return st.result, err
 		}
 	}
 	return st.result, nil
+}
+
+// setUnapplied records the call's final unapplied count: the listed
+// entries left uncovered plus remaining, the peer's count of those past the
+// last one listed.
+func (st *pullState) setUnapplied(remaining uint64) {
+	st.result.Unapplied = st.uncovered + remaining
+	st.result.UnappliedKnown = true
 }
 
 // newPullState resolves the local database, the peer's client and the
@@ -293,7 +316,9 @@ func (lp *LogPuller) newPullState(peer PeerRef, database string) (*pullState, er
 
 // pullPage lists and applies one page of the peer's log. done reports that
 // the call is over (caught up, or an outcome recorded in st.result).
-func (lp *LogPuller) pullPage(ctx context.Context, st *pullState) (done bool, err error) {
+// lastPage asks the peer to count the entries past this page, the only
+// part of its log this call does not list.
+func (lp *LogPuller) pullPage(ctx context.Context, st *pullState, lastPage bool) (done bool, err error) {
 	resp, err := st.client.ListCommittedLog(ctx, &LogListRequest{
 		Database:         st.database,
 		RequestingNodeId: lp.nodeID,
@@ -302,6 +327,7 @@ func (lp *LogPuller) pullPage(ctx context.Context, st *pullState) (done bool, er
 		Limit:            uint32(lp.pageSize),
 		ConsumedSeq:      st.cursor.Seq,
 		ConsumedTxnId:    st.cursor.TxnID,
+		CountRemaining:   lastPage,
 	})
 	if err != nil {
 		if status.Code(err) == codes.Unimplemented {
@@ -334,15 +360,21 @@ func (lp *LogPuller) pullPage(ctx context.Context, st *pullState) (done bool, er
 	}
 	if len(resp.Entries) == 0 {
 		st.result.CaughtUp = st.contiguous && !resp.More
+		st.setUnapplied(0)
 		return true, nil
 	}
-	return lp.applyListedPage(ctx, st, resp)
+	done, err = lp.applyListedPage(ctx, st, resp)
+	if err == nil && !done && resp.RemainingCommitted != nil {
+		st.setUnapplied(*resp.RemainingCommitted)
+	}
+	return done, err
 }
 
 // applyListedPage applies one non-empty page, advances the cursor over the
 // covered prefix, and moves listAfter past the page.
 func (lp *LogPuller) applyListedPage(ctx context.Context, st *pullState, resp *LogListResponse) (done bool, err error) {
-	coveredPrefixLen, err := lp.applyPage(ctx, st, resp.Entries)
+	coveredPrefixLen, uncovered, err := lp.applyPage(ctx, st, resp.Entries)
+	st.uncovered += uint64(uncovered)
 	if st.contiguous && coveredPrefixLen > 0 {
 		last := resp.Entries[coveredPrefixLen-1]
 		st.cursor = db.LogPosition{Seq: last.Seq, TxnID: last.TxnId}
@@ -358,6 +390,7 @@ func (lp *LogPuller) applyListedPage(ctx context.Context, st *pullState, resp *L
 	}
 	if !resp.More {
 		st.result.CaughtUp = st.contiguous
+		st.setUnapplied(0)
 		return true, nil
 	}
 	last := resp.Entries[len(resp.Entries)-1]
@@ -375,21 +408,22 @@ func (lp *LogPuller) persistCursor(st *pullState) error {
 
 // applyPage classifies and applies one ListCommittedLog page's entries, in
 // order, and returns the length of the page's contiguous prefix now
-// covered. It returns an error only for a failure that is not attributable
-// to a specific transaction (checking local state).
+// covered and how many of its entries are still not covered. It returns an
+// error only for a failure that is not attributable to a specific
+// transaction (checking local state).
 //
 // Every listed entry is COMMITTED in the peer's log, so a transaction this
 // node holds PENDING under the same id was decided COMMITTED, and its
 // local record is resolved here, in the same call (resolveLocalPending),
 // instead of stopping the walk until the stale-transaction GC ends it.
-func (lp *LogPuller) applyPage(ctx context.Context, st *pullState, entries []*LogEntry) (int, error) {
+func (lp *LogPuller) applyPage(ctx context.Context, st *pullState, entries []*LogEntry) (prefix, uncovered int, err error) {
 	ids := make([]uint64, len(entries))
 	for i, e := range entries {
 		ids[i] = e.TxnId
 	}
 	appliedMarkers, err := st.mdb.AppliedTxns(ids)
 	if err != nil {
-		return 0, fmt.Errorf("check applied markers: %w", err)
+		return 0, 0, fmt.Errorf("check applied markers: %w", err)
 	}
 
 	covered := make([]bool, len(entries))
@@ -407,7 +441,7 @@ func (lp *LogPuller) applyPage(ctx context.Context, st *pullState, entries []*Lo
 		}
 		fetch, err := lp.resolveLocalPending(st, e, &covered[i])
 		if err != nil {
-			return 0, err
+			return 0, 0, err
 		}
 		if fetch {
 			fetchIdx[e.TxnId] = i
@@ -419,11 +453,15 @@ func (lp *LogPuller) applyPage(ctx context.Context, st *pullState, entries []*Lo
 		lp.fetchAndApply(ctx, st, toFetch, fetchIdx, covered)
 	}
 
-	prefix := 0
 	for prefix < len(covered) && covered[prefix] {
 		prefix++
 	}
-	return prefix, nil
+	for _, c := range covered[prefix:] {
+		if !c {
+			uncovered++
+		}
+	}
+	return prefix, uncovered, nil
 }
 
 // resolveLocalPending resolves this node's own record for e's transaction,

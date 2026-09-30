@@ -1981,6 +1981,7 @@ type LogListRequest struct {
 	Limit            uint32                 `protobuf:"varint,5,opt,name=limit,proto3" json:"limit,omitempty"`
 	ConsumedSeq      uint64                 `protobuf:"varint,6,opt,name=consumed_seq,json=consumedSeq,proto3" json:"consumed_seq,omitempty"` // Position (consumed_seq, consumed_txn_id) the requester has applied every entry through
 	ConsumedTxnId    uint64                 `protobuf:"varint,7,opt,name=consumed_txn_id,json=consumedTxnId,proto3" json:"consumed_txn_id,omitempty"`
+	CountRemaining   bool                   `protobuf:"varint,8,opt,name=count_remaining,json=countRemaining,proto3" json:"count_remaining,omitempty"` // Ask for remaining_committed in the response
 	unknownFields    protoimpl.UnknownFields
 	sizeCache        protoimpl.SizeCache
 }
@@ -2064,6 +2065,13 @@ func (x *LogListRequest) GetConsumedTxnId() uint64 {
 	return 0
 }
 
+func (x *LogListRequest) GetCountRemaining() bool {
+	if x != nil {
+		return x.CountRemaining
+	}
+	return false
+}
+
 type LogEntry struct {
 	state           protoimpl.MessageState `protogen:"open.v1"`
 	Seq             uint64                 `protobuf:"varint,1,opt,name=seq,proto3" json:"seq,omitempty"`
@@ -2133,8 +2141,12 @@ type LogListResponse struct {
 	More           bool                   `protobuf:"varint,5,opt,name=more,proto3" json:"more,omitempty"` // More stable entries follow the last one returned
 	SchemaVersion  uint64                 `protobuf:"varint,6,opt,name=schema_version,json=schemaVersion,proto3" json:"schema_version,omitempty"`
 	DatabaseAbsent bool                   `protobuf:"varint,7,opt,name=database_absent,json=databaseAbsent,proto3" json:"database_absent,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// COMMITTED entries after the last one returned (or after the request's
+	// position, for an empty page), through stable_seq. Set only when the
+	// request asked (count_remaining); unset from an older peer.
+	RemainingCommitted *uint64 `protobuf:"varint,8,opt,name=remaining_committed,json=remainingCommitted,proto3,oneof" json:"remaining_committed,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *LogListResponse) Reset() {
@@ -2214,6 +2226,13 @@ func (x *LogListResponse) GetDatabaseAbsent() bool {
 		return x.DatabaseAbsent
 	}
 	return false
+}
+
+func (x *LogListResponse) GetRemainingCommitted() uint64 {
+	if x != nil && x.RemainingCommitted != nil {
+		return *x.RemainingCommitted
+	}
+	return 0
 }
 
 type FetchTransactionsRequest struct {
@@ -4417,7 +4436,7 @@ const file_grpc_marmot_proto_rawDesc = "" +
 	"\x17required_schema_version\x18\x05 \x01(\x04R\x15requiredSchemaVersion\x12\x17\n" +
 	"\aseq_num\x18\x06 \x01(\x04R\x06seqNum\x12$\n" +
 	"\x0eorigin_node_id\x18\a \x01(\x04R\foriginNodeId\x12\x1b\n" +
-	"\trow_count\x18\b \x01(\rR\browCount\"\xfa\x01\n" +
+	"\trow_count\x18\b \x01(\rR\browCount\"\xa3\x02\n" +
 	"\x0eLogListRequest\x12\x1a\n" +
 	"\bdatabase\x18\x01 \x01(\tR\bdatabase\x12,\n" +
 	"\x12requesting_node_id\x18\x02 \x01(\x04R\x10requestingNodeId\x12\x1b\n" +
@@ -4426,11 +4445,12 @@ const file_grpc_marmot_proto_rawDesc = "" +
 	"afterTxnId\x12\x14\n" +
 	"\x05limit\x18\x05 \x01(\rR\x05limit\x12!\n" +
 	"\fconsumed_seq\x18\x06 \x01(\x04R\vconsumedSeq\x12&\n" +
-	"\x0fconsumed_txn_id\x18\a \x01(\x04R\rconsumedTxnId\"n\n" +
+	"\x0fconsumed_txn_id\x18\a \x01(\x04R\rconsumedTxnId\x12'\n" +
+	"\x0fcount_remaining\x18\b \x01(\bR\x0ecountRemaining\"n\n" +
 	"\bLogEntry\x12\x10\n" +
 	"\x03seq\x18\x01 \x01(\x04R\x03seq\x12\x15\n" +
 	"\x06txn_id\x18\x02 \x01(\x04R\x05txnId\x129\n" +
-	"\x10commit_timestamp\x18\x03 \x01(\v2\x0e.marmot.v2.HLCR\x0fcommitTimestamp\"\x92\x02\n" +
+	"\x10commit_timestamp\x18\x03 \x01(\v2\x0e.marmot.v2.HLCR\x0fcommitTimestamp\"\xe0\x02\n" +
 	"\x0fLogListResponse\x12-\n" +
 	"\aentries\x18\x01 \x03(\v2\x13.marmot.v2.LogEntryR\aentries\x12\x1d\n" +
 	"\n" +
@@ -4439,7 +4459,9 @@ const file_grpc_marmot_proto_rawDesc = "" +
 	"\x10truncated_txn_id\x18\x04 \x01(\x04R\x0etruncatedTxnId\x12\x12\n" +
 	"\x04more\x18\x05 \x01(\bR\x04more\x12%\n" +
 	"\x0eschema_version\x18\x06 \x01(\x04R\rschemaVersion\x12'\n" +
-	"\x0fdatabase_absent\x18\a \x01(\bR\x0edatabaseAbsent\"}\n" +
+	"\x0fdatabase_absent\x18\a \x01(\bR\x0edatabaseAbsent\x124\n" +
+	"\x13remaining_committed\x18\b \x01(\x04H\x00R\x12remainingCommitted\x88\x01\x01B\x16\n" +
+	"\x14_remaining_committed\"}\n" +
 	"\x18FetchTransactionsRequest\x12\x1a\n" +
 	"\bdatabase\x18\x01 \x01(\tR\bdatabase\x12,\n" +
 	"\x12requesting_node_id\x18\x02 \x01(\x04R\x10requestingNodeId\x12\x17\n" +
@@ -4843,6 +4865,7 @@ func file_grpc_marmot_proto_init() {
 		(*Statement_VectorIndexChange)(nil),
 		(*Statement_DmlIntent)(nil),
 	}
+	file_grpc_marmot_proto_msgTypes[23].OneofWrappers = []any{}
 	file_grpc_marmot_proto_msgTypes[49].OneofWrappers = []any{
 		(*TransactionStreamMessage_Chunk)(nil),
 		(*TransactionStreamMessage_Commit)(nil),

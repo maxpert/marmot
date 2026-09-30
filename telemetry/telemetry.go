@@ -38,6 +38,9 @@ type CounterVec interface {
 
 type GaugeVec interface {
 	With(labels ...string) Gauge
+	// Delete removes the series for labels, if any, so a label value that
+	// no longer exists (a removed peer, say) stops being exported.
+	Delete(labels ...string)
 }
 
 type HistogramVec interface {
@@ -53,6 +56,7 @@ type noopHistogramVec struct{}
 
 func (n noopCounterVec) With(labels ...string) Counter     { return NoopStat{} }
 func (n noopGaugeVec) With(labels ...string) Gauge         { return NoopStat{} }
+func (n noopGaugeVec) Delete(labels ...string)             {}
 func (n noopHistogramVec) With(labels ...string) Histogram { return NoopStat{} }
 
 // Prometheus Vec wrappers
@@ -72,6 +76,10 @@ type prometheusGaugeVec struct {
 
 func (p *prometheusGaugeVec) With(labelValues ...string) Gauge {
 	return p.vec.WithLabelValues(labelValues...)
+}
+
+func (p *prometheusGaugeVec) Delete(labelValues ...string) {
+	p.vec.DeleteLabelValues(labelValues...)
 }
 
 type prometheusHistogramVec struct {

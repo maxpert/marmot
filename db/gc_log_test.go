@@ -4,6 +4,8 @@
 package db
 
 import (
+	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -101,6 +103,48 @@ func TestListCommittedLogExcludesUncommitted(t *testing.T) {
 	}
 	if len(entries) != 1 || entries[0].LogPosition != committed {
 		t.Fatalf("entries = %v, want only %v", entries, committed)
+	}
+}
+
+// TestCountCommittedLogMatchesWhatAListingWouldReturn: the count after a
+// position, through a stable point, is the number of entries a listing from
+// there returns - COMMITTED only, and none past stable.
+func TestCountCommittedLogMatchesWhatAListingWouldReturn(t *testing.T) {
+	store, cleanup := createTestPebbleMetaStore(t)
+	defer cleanup()
+
+	var positions []LogPosition
+	for i := uint64(1); i <= 4; i++ {
+		positions = append(positions, commitTestTxn(t, store, 3000+i, 1))
+	}
+	if err := store.BeginTransaction(3100, 1, hlc.NewClock(1).Now()); err != nil {
+		t.Fatalf("BeginTransaction: %v", err)
+	}
+	stable := store.StableSeq()
+
+	for _, tc := range []struct {
+		after  LogPosition
+		stable uint64
+		want   uint64
+	}{
+		{LogPosition{}, stable, 4},
+		{positions[1], stable, 2},
+		{positions[3], stable, 0},
+		{LogPosition{}, positions[2].Seq, 3},
+	} {
+		got, err := store.CountCommittedLog(context.Background(), tc.after, tc.stable)
+		if err != nil {
+			t.Fatalf("CountCommittedLog(%v, %d): %v", tc.after, tc.stable, err)
+		}
+		if got != tc.want {
+			t.Fatalf("CountCommittedLog(%v, %d) = %d, want %d", tc.after, tc.stable, got, tc.want)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := store.CountCommittedLog(ctx, LogPosition{}, stable); !errors.Is(err, context.Canceled) {
+		t.Fatalf("CountCommittedLog with a cancelled ctx: err = %v, want context.Canceled", err)
 	}
 }
 

@@ -58,12 +58,23 @@ func newAERegNode(t *testing.T, id uint64, databases ...string) *aeRegNode {
 // serve starts n over real gRPC and records its listen address.
 func (n *aeRegNode) serve(t *testing.T) {
 	t.Helper()
+	n.serveWrapped(t, nil)
+}
+
+// serveWrapped is serve through wrap, when non-nil (a peer that behaves
+// differently on one RPC, say).
+func (n *aeRegNode) serveWrapped(t *testing.T, wrap func(*Server) MarmotServiceServer) {
+	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	server := &Server{nodeID: n.id, registry: NewNodeRegistry(n.id, listener.Addr().String())}
 	server.SetDatabaseManager(n.dm)
+	var service MarmotServiceServer = server
+	if wrap != nil {
+		service = wrap(server)
+	}
 	gs := grpc.NewServer()
-	RegisterMarmotServiceServer(gs, server)
+	RegisterMarmotServiceServer(gs, service)
 	go func() { _ = gs.Serve(listener) }()
 	t.Cleanup(gs.Stop)
 	n.addr = listener.Addr().String()
@@ -93,8 +104,8 @@ func (n *aeRegNode) seed(t *testing.T, d string, txnID, origin uint64, wall int6
 	require.True(t, applied)
 }
 
-// truncateThrough forces d's GC to unconditionally delete every currently
-// committed log entry (maxRetention=0), so ListCommittedLog reports a
+// truncateThrough forces d's GC to delete every currently committed log
+// entry (every position safe, no minimum retention), so ListCommittedLog reports a
 // non-zero TruncatedThrough to any puller whose cursor is still behind it.
 // Used to force a PullPair NeedsSnapshot outcome deterministically, without
 // waiting out a real retention window.
@@ -102,8 +113,9 @@ func (n *aeRegNode) truncateThrough(t *testing.T, d string) {
 	t.Helper()
 	mdb, err := n.dm.GetDatabase(d)
 	require.NoError(t, err)
-	_, err = mdb.GetMetaStore().CleanupOldTransactionRecords(time.Hour, 0, db.LogPosition{})
+	deleted, err := mdb.GetMetaStore().CleanupOldTransactionRecords(0, 0, db.LogPosition{Seq: ^uint64(0), TxnID: ^uint64(0)})
 	require.NoError(t, err)
+	require.NotZero(t, deleted, "nothing was truncated")
 }
 
 // rows reads table t of database d.

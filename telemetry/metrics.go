@@ -116,7 +116,10 @@ var (
 	// AntiEntropyDurationSeconds measures anti-entropy round duration
 	AntiEntropyDurationSeconds Histogram = NoopStat{}
 
-	// ReplicationLagTxns tracks transaction lag per peer
+	// ReplicationLagTxns tracks, per peer, the committed transactions of
+	// that peer's local commit log past this node's pull cursor, summed over
+	// databases, as of the last pull round that could count them all: an
+	// upper bound on what catch-up still has to do
 	ReplicationLagTxns GaugeVec = noopGaugeVec{}
 )
 
@@ -295,7 +298,7 @@ func InitMetrics() {
 	)
 	ReplicationLagTxns = NewGaugeVec(
 		"replication_lag_txns",
-		"Transaction lag behind peer",
+		"Committed transactions past this node's pull cursor into the peer's log, as of the last pull round, summed over databases (an upper bound on catch-up still to do)",
 		[]string{"peer"},
 	)
 

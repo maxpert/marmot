@@ -91,14 +91,43 @@ func (s *Server) ListCommittedLog(ctx context.Context, req *LogListRequest) (*Lo
 		return nil, err
 	}
 
-	return &LogListResponse{
+	resp := &LogListResponse{
 		Entries:        pbEntries,
 		StableSeq:      stable,
 		TruncatedSeq:   truncated.Seq,
 		TruncatedTxnId: truncated.TxnID,
 		More:           more,
 		SchemaVersion:  mdb.SchemaVersion(),
-	}, nil
+	}
+	if req.CountRemaining {
+		resp.RemainingCommitted = remainingCommitted(ctx, metaStore, req.Database, after, entries, stable, more)
+	}
+	return resp, nil
+}
+
+// remainingCommitted counts the COMMITTED entries through stable after the
+// page listed from `after`: none when the page was the last one, and
+// otherwise every entry past the page's last, which walks them all. The
+// count only feeds a metric, so a count that fails or outlasts ctx returns
+// nil (unknown) rather than failing the page.
+func remainingCommitted(ctx context.Context, metaStore db.MetaStore, database string, after db.LogPosition, entries []db.CommittedLogEntry, stable uint64, more bool) *uint64 {
+	var n uint64
+	if !more {
+		return &n
+	}
+	if len(entries) > 0 {
+		after = entries[len(entries)-1].LogPosition
+	}
+	n, err := metaStore.CountCommittedLog(ctx, after, stable)
+	if err != nil {
+		ev := log.Warn()
+		if ctx.Err() != nil {
+			ev = log.Debug() // the requester gave up; nothing is wrong here
+		}
+		ev.Err(err).Str("database", database).Msg("count of remaining committed log entries abandoned; left unset")
+		return nil
+	}
+	return &n
 }
 
 // logEntriesToProto converts listed log entries to LogEntry messages, each
