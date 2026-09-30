@@ -75,7 +75,7 @@ func TestNarrowAutoInc_HeldInsertInTransactionDoesNotStallJoin(t *testing.T) {
 
 // TestNarrowAutoInc_InsertWaitsOutStartupVoteHold: a client that writes to a
 // narrow AUTO_INCREMENT table the moment a new cluster's first node answers
-// MySQL - LLDAP creating its first group - gets its row, not 1205. Every
+// MySQL - an application creating its first row - gets it, not 1205. Every
 // node of a new cluster starts with its claim votes held (db.AutoIncHoldTable)
 // and releases them only after merging claim bases from its peers; a narrow
 // insert waits for that release, up to the lock wait.

@@ -74,8 +74,8 @@ func isLockWaitTimeout(err error) bool {
 
 // TestClaimRange_HeldCoordinatorWaitsForRelease: a narrow id allocated on a
 // node whose claim votes are held waits for the release, then claims a fresh
-// range - the LLDAP startup failure, where the other two nodes had released
-// and node 1 answered 1205 at once.
+// range - the startup failure where the other two nodes had released and
+// node 1 answered 1205 at once.
 //
 // Mutations: ClaimRange not waiting on ErrLocalVotesHeld returns 1205 within
 // milliseconds, before the release; a release that does not wake waiters
@@ -201,10 +201,11 @@ func TestNarrowInsert_HeldInsidePinnedTransactionFailsFast(t *testing.T) {
 	require.NoError(t, err)
 }
 
-// TestNarrowInsert_FirstWriteOfTransactionWaitsForRelease: LLDAP creates each
-// startup group in its own transaction whose first write is the narrow
-// INSERT. No writer is pinned yet when it claims, so it waits for the release
-// and succeeds - the LLDAP startup failure stays fixed.
+// TestNarrowInsert_FirstWriteOfTransactionWaitsForRelease: an ORM-style client
+// that starts while a node still holds its claim votes creates each startup
+// row in its own transaction whose first write is the narrow INSERT. No
+// writer is pinned yet when it claims, so it waits for the release and
+// succeeds instead of answering 1205.
 //
 // Mutation: fail fast in every explicit transaction. The INSERT answers 1205
 // before the release.
@@ -219,7 +220,7 @@ func TestNarrowInsert_FirstWriteOfTransactionWaitsForRelease(t *testing.T) {
 	require.NoError(t, err)
 	done := make(chan error, 1)
 	go func() {
-		_, err := handler.HandleQuery(session, "INSERT INTO "+table+" (v) VALUES ('lldap_admin')", nil)
+		_, err := handler.HandleQuery(session, "INSERT INTO "+table+" (v) VALUES ('app_admin')", nil)
 		done <- err
 	}()
 	select {

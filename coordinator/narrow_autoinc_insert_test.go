@@ -54,15 +54,15 @@ func TestNarrowAutoIncrementLastInsertIDAutocommit(t *testing.T) {
 	require.Equal(t, ids[0], res.LastInsertId, "LAST_INSERT_ID must be the statement's first id")
 }
 
-// TestNarrowAutoIncrementLLDAPTransactionShape pins D5 on the pinned
-// explicit-transaction path, in the shape LLDAP boots with: one transaction
-// inserting into two narrow tables, both of which need their first claim.
+// TestNarrowAutoIncrementFirstWriteInTransactionShape pins D5 on the pinned
+// explicit-transaction path, in the shape an ORM-style application boots
+// with: one transaction inserting into two narrow tables, both of which need their first claim.
 // It must complete, every id must fit 32 bits, and each statement must report
 // its own first id - not the transaction's first insert.
 //
 // Mutation: report the transaction's first captured insert instead of the
 // statement's. The groups INSERT then reports the users id and this fires.
-func TestNarrowAutoIncrementLLDAPTransactionShape(t *testing.T) {
+func TestNarrowAutoIncrementFirstWriteInTransactionShape(t *testing.T) {
 	s := setupNoopDML(t)
 	for _, ddl := range []string{
 		"CREATE TABLE users (user_id INT AUTO_INCREMENT PRIMARY KEY, name TEXT)",
@@ -77,7 +77,7 @@ func TestNarrowAutoIncrementLLDAPTransactionShape(t *testing.T) {
 	usersRes, err := s.handler.HandleQuery(s.session, "INSERT INTO users (name) VALUES ('admin')", nil)
 	require.NoError(t, err)
 	groupsRes, err := s.handler.HandleQuery(s.session,
-		"INSERT INTO `groups` (display_name) VALUES (?), (?)", []interface{}{"lldap_admin", "lldap_password_manager"})
+		"INSERT INTO `groups` (display_name) VALUES (?), (?)", []interface{}{"app_admin", "app_editor"})
 	require.NoError(t, err)
 	_, err = s.handler.HandleQuery(s.session, "COMMIT", nil)
 	require.NoError(t, err)

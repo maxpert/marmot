@@ -58,7 +58,7 @@ func TestApplyNonDMLIntents_AtomicAcrossDDLFailure(t *testing.T) {
 // is filtered out entirely) must NOT open a SQLite tx or write a marker.
 // Writing one here would need the user database's single writer
 // (_txlock=immediate) even when a concurrent pinned session already holds
-// it for the whole surrounding LLDAP-shaped transaction - see
+// it for the whole surrounding explicit transaction - see
 // TestClaimCompletesWhilePinnedSessionOpen (db/autoinc_hookdb_test.go),
 // which this behavior exists to keep passing.
 func TestApplyNonDMLIntents_ClaimOnlyWritesNoMarkerAndNoSQLiteTx(t *testing.T) {

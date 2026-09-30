@@ -149,10 +149,11 @@ func TestNarrowAutoInc_TinyIntExhaustionIsDupEntry(t *testing.T) {
 	c.waitRows("marmot", idStats(table, "id"), []string{"127|127|127"}, 1, 2, 3)
 }
 
-// TestNarrowAutoInc_LLDAPTransactionShape: LLDAP boots with one transaction
-// inserting into two narrow tables that both need their first claim. It
-// commits, and each INSERT's LAST_INSERT_ID is its own first id.
-func TestNarrowAutoInc_LLDAPTransactionShape(t *testing.T) {
+// TestNarrowAutoInc_FirstWriteInTransactionShape: an ORM-style application
+// boots with one transaction inserting into two narrow tables that both need
+// their first claim. It commits, and each INSERT's LAST_INSERT_ID is its own
+// first id.
+func TestNarrowAutoInc_FirstWriteInTransactionShape(t *testing.T) {
 	c := startNarrowCluster(t, "users", "CREATE TABLE users (user_id INT AUTO_INCREMENT PRIMARY KEY, name TEXT)")
 	c.createTable(1, "marmot", "groups", "CREATE TABLE `groups` (group_id INT AUTO_INCREMENT PRIMARY KEY, display_name TEXT)")
 
@@ -164,7 +165,7 @@ func TestNarrowAutoInc_LLDAPTransactionShape(t *testing.T) {
 	if err != nil {
 		t.Fatalf("INSERT users: %v", err)
 	}
-	groupsRes, err := tx.Exec("INSERT INTO `groups` (display_name) VALUES (?), (?)", "lldap_admin", "lldap_password_manager")
+	groupsRes, err := tx.Exec("INSERT INTO `groups` (display_name) VALUES (?), (?)", "app_admin", "app_editor")
 	if err != nil {
 		t.Fatalf("INSERT groups: %v", err)
 	}
@@ -178,7 +179,7 @@ func TestNarrowAutoInc_LLDAPTransactionShape(t *testing.T) {
 	}
 	c.waitRows("marmot", "SELECT user_id, name FROM users ORDER BY user_id", []string{fmt.Sprintf("%d|admin", userID)}, 1, 2, 3)
 	c.waitRows("marmot", "SELECT group_id, display_name FROM `groups` ORDER BY group_id",
-		[]string{fmt.Sprintf("%d|lldap_admin", groupID), fmt.Sprintf("%d|lldap_password_manager", groupID+1)}, 1, 2, 3)
+		[]string{fmt.Sprintf("%d|app_admin", groupID), fmt.Sprintf("%d|app_editor", groupID+1)}, 1, 2, 3)
 }
 
 // TestNarrowAutoInc_UnmarkedTableKeepsWideIDs: a BIGINT AUTO_INCREMENT table

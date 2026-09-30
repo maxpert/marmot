@@ -26,8 +26,9 @@ LLDAP's migrations run through Marmot and replicate like any other DDL. Its `gro
 [Compatibility](/compatibility)):
 
 - A single node needs `cluster.standalone = true`.
-- On a new cluster, start LLDAP after the node it connects to logs `AUTO_INCREMENT claim votes released after merging claim bases`. Each node
-  issues group ids from its own range, so groups created through different nodes get ids from different ranges.
+- On a cluster, LLDAP can start together with the nodes: while a node still holds its claim votes, the first
+  group insert waits for the release (see [Compatibility](/compatibility)). Each node issues group ids from its own
+  range, so groups created through different nodes get ids from different ranges.
 
 ## Verified Scenarios
 

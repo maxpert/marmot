@@ -840,9 +840,10 @@ func classifyNonDMLIntents(intents []*WriteIntentRecord) []nonDMLIntentKind {
 //
 // A claim-only commit writes no marker because it cannot take the user
 // database's writer: ReplicationEngine.Commit calls this after
-// AutoIncClaimStore.ApplyClaims for every claim-carrying txn, including the
-// LLDAP shape where a pinned session already holds the user database's one
-// SQLite writer (_txlock=immediate) for the whole surrounding transaction.
+// AutoIncClaimStore.ApplyClaims for every claim-carrying txn, including an
+// ORM-style explicit transaction where a pinned session already holds the
+// user database's one SQLite writer (_txlock=immediate) for the whole
+// surrounding transaction.
 // __marmot_applied_txn lives in that same user database file, so writing it
 // needs that same writer - which would self-deadlock the claim behind the
 // pinned session that is waiting on it, defeating the entire reason

@@ -14,11 +14,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestClaimCompletesWhilePinnedSessionOpen is the LLDAP-shape property, and it
-// is the reason the claim row lives in the system database rather than in the
-// user database it is about.
+// TestClaimCompletesWhilePinnedSessionOpen is the ORM-transaction property,
+// and it is the reason the claim row lives in the system database rather than
+// in the user database it is about.
 //
-// The sea-orm/LLDAP shape is: BEGIN; INSERT INTO users ...; INSERT INTO
+// The ORM-style transaction shape is: BEGIN; INSERT INTO users ...; INSERT INTO
 // groups ...; COMMIT. Marmot serves that shape with a pinned session
 // (db/db_integration.go BeginPinnedSession), which takes hookDB's single
 // connection (hookDB.SetMaxOpenConns(1)) and opens a SQLite transaction on it

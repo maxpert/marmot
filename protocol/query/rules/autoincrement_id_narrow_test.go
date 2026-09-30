@@ -51,10 +51,10 @@ func (f *fakeNarrow) Admit(database, table string, widthMax, explicit uint64) er
 // with it third, a TINYINT one, and a narrow INTEGER PRIMARY KEY not declared
 // AUTO_INCREMENT.
 var narrowSchemas = map[string]transform.SchemaInfo{
-	"alias":  {AutoIncrementColumn: "id", AutoIncrementOrdinal: 0, AutoIncrementWidth: 32, Database: "lldap"},
-	"groups": {AutoIncrementColumn: "group_id", AutoIncrementOrdinal: 0, AutoIncrementWidth: 32, AutoIncrementExplicit: true, Database: "lldap"},
-	"late":   {AutoIncrementColumn: "id", AutoIncrementOrdinal: 2, AutoIncrementWidth: 32, AutoIncrementExplicit: true, Database: "lldap"},
-	"tiny":   {AutoIncrementColumn: "id", AutoIncrementOrdinal: 0, AutoIncrementWidth: 8, AutoIncrementExplicit: true, Database: "lldap"},
+	"alias":  {AutoIncrementColumn: "id", AutoIncrementOrdinal: 0, AutoIncrementWidth: 32, Database: "app"},
+	"groups": {AutoIncrementColumn: "group_id", AutoIncrementOrdinal: 0, AutoIncrementWidth: 32, AutoIncrementExplicit: true, Database: "app"},
+	"late":   {AutoIncrementColumn: "id", AutoIncrementOrdinal: 2, AutoIncrementWidth: 32, AutoIncrementExplicit: true, Database: "app"},
+	"tiny":   {AutoIncrementColumn: "id", AutoIncrementOrdinal: 0, AutoIncrementWidth: 8, AutoIncrementExplicit: true, Database: "app"},
 }
 
 func applyNarrow(t *testing.T, sql string, narrow NarrowAllocator) (string, bool, error) {
@@ -103,8 +103,8 @@ func TestNarrowInjectionShapes(t *testing.T) {
 			if fmt.Sprint(narrow.allocs) != fmt.Sprint(tc.wantAllocs) {
 				t.Fatalf("Allocate calls %v, want %v: a statement takes its ids in one call", narrow.allocs, tc.wantAllocs)
 			}
-			if narrow.database != "lldap" || narrow.lastWidth != 2147483647 {
-				t.Fatalf("allocated for %q with ceiling %d, want lldap / 2147483647", narrow.database, narrow.lastWidth)
+			if narrow.database != "app" || narrow.lastWidth != 2147483647 {
+				t.Fatalf("allocated for %q with ceiling %d, want app / 2147483647", narrow.database, narrow.lastWidth)
 			}
 		})
 	}
