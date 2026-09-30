@@ -7,10 +7,10 @@ import (
 )
 
 // handleSchemaDatabase returns schema version for current database
-func (h *AdminHandlers) handleSchemaDatabase(w http.ResponseWriter, r *http.Request, metaStore db.MetaStore, database string) {
-	version, err := metaStore.GetSchemaVersion(database)
+func (h *AdminHandlers) handleSchemaDatabase(w http.ResponseWriter, r *http.Request, database string) {
+	version, err := db.NewSchemaVersionManager(h.dbManager).GetSchemaVersion(database)
 	if err != nil {
-		writeErrorResponse(w, http.StatusInternalServerError, err.Error())
+		writeErrorResponse(w, http.StatusNotFound, err.Error())
 		return
 	}
 
@@ -23,8 +23,8 @@ func (h *AdminHandlers) handleSchemaDatabase(w http.ResponseWriter, r *http.Requ
 }
 
 // handleSchemaAll returns schema versions for all databases
-func (h *AdminHandlers) handleSchemaAll(w http.ResponseWriter, r *http.Request, metaStore db.MetaStore) {
-	versions, err := metaStore.GetAllSchemaVersions()
+func (h *AdminHandlers) handleSchemaAll(w http.ResponseWriter, r *http.Request) {
+	versions, err := db.NewSchemaVersionManager(h.dbManager).GetAllSchemaVersions()
 	if err != nil {
 		writeErrorResponse(w, http.StatusInternalServerError, err.Error())
 		return

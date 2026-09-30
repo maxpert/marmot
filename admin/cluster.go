@@ -82,7 +82,15 @@ func (h *AdminHandlers) handleClusterHealth(w http.ResponseWriter, r *http.Reque
 	}, false, "")
 }
 
-// handleClusterReplication handles GET /admin/cluster/replication
+// handleClusterReplication handles GET /admin/cluster/replication. It
+// reports the log-pull replication state per peer and per database,
+// instead of the removed MetaStore.ReplicationState table: for each peer,
+// its last-consumed position in this node's log for the database
+// (MetaStore.ConsumedPositions), and, separately, this node's own pull
+// cursor into that peer's log (MetaStore.GetPullCursor) - the two directions
+// of replication progress between this node and the peer. The per-database
+// caught-up/stuck status (h.antiEntropyStatus) is not per peer: it is this
+// node's own view of the whole database.
 func (h *AdminHandlers) handleClusterReplication(w http.ResponseWriter, r *http.Request) {
 	registry := h.resolveRegistryOrError(w)
 	if registry == nil {
@@ -107,33 +115,26 @@ func (h *AdminHandlers) handleClusterReplication(w http.ResponseWriter, r *http.
 			if err != nil {
 				continue
 			}
-
 			metaStore := mdb.GetMetaStore()
-			state, _ := metaStore.GetReplicationState(member.NodeID, dbName)
-			localMaxTxn, _ := metaStore.GetMaxCommittedTxnID()
 
-			var lastAppliedTxnID uint64
-			var lastSyncTime string
-			var syncStatus string
-			if state != nil {
-				lastAppliedTxnID = state.LastAppliedTxnID
-				lastSyncTime = formatTimestamp(state.LastSyncTime)
-				syncStatus = state.SyncStatus.String()
-			} else {
-				syncStatus = "UNKNOWN"
+			consumed, err := metaStore.ConsumedPositions()
+			if err != nil {
+				continue
+			}
+			cursor, err := metaStore.GetPullCursor(member.NodeID)
+			if err != nil {
+				continue
 			}
 
-			lag := uint64(0)
-			if localMaxTxn > lastAppliedTxnID {
-				lag = localMaxTxn - lastAppliedTxnID
-			}
+			consumedPos, hasConsumed := consumed[member.NodeID]
 
 			dbStates = append(dbStates, map[string]interface{}{
-				"database":            dbName,
-				"last_applied_txn_id": lastAppliedTxnID,
-				"last_sync_time":      lastSyncTime,
-				"sync_status":         syncStatus,
-				"lag_txns":            lag,
+				"database":                 dbName,
+				"peer_consumed_seq":        consumedPos.Seq,
+				"peer_consumed_txn_id":     consumedPos.TxnID,
+				"peer_has_consumed_at_all": hasConsumed,
+				"local_pull_cursor_seq":    cursor.Seq,
+				"local_pull_cursor_txn_id": cursor.TxnID,
 			})
 		}
 
@@ -146,10 +147,30 @@ func (h *AdminHandlers) handleClusterReplication(w http.ResponseWriter, r *http.
 	}
 
 	writeJSONResponse(w, map[string]interface{}{
-		"peers":                 result,
-		"cluster_min_watermark": registry.GetClusterMinWatermark(),
-		"local_watermark":       registry.GetLocalWatermark(),
+		"peers":        result,
+		"anti_entropy": h.antiEntropyStatus(databases),
 	}, false, "")
+}
+
+// antiEntropyStatus reports, per database, anti-entropy's status as of its
+// last round: whether every current member's
+// log was reachable and fully pulled (CaughtUp), and how many transactions
+// are STUCK on a deterministic replay failure (LogPuller.StuckTxns). Empty
+// until anti-entropy is wired in (SetAntiEntropy).
+func (h *AdminHandlers) antiEntropyStatus(databases []string) []map[string]interface{} {
+	result := make([]map[string]interface{}, 0, len(databases))
+	if h.antiEntropy == nil {
+		return result
+	}
+	for _, dbName := range databases {
+		result = append(result, map[string]interface{}{
+			"database":        dbName,
+			"caught_up":       h.antiEntropy.CaughtUp(dbName),
+			"promotion_ready": h.antiEntropy.PromotionReady(dbName),
+			"stuck_txns":      h.antiEntropy.StuckTxnCount(dbName),
+		})
+	}
+	return result
 }
 
 // handleClusterRemove handles POST /admin/cluster/remove/{node_id}

@@ -68,6 +68,7 @@ func (lr *LocalReplicator) handleCommit(ctx context.Context, req *coordinator.Re
 		TxnID:      req.TxnID,
 		Database:   req.Database,
 		Statements: req.Statements,
+		CommitTS:   req.CommitTS,
 	}
 
 	result := lr.engine.Commit(ctx, engineReq)

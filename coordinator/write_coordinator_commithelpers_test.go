@@ -4,6 +4,8 @@ import (
 	"context"
 	"testing"
 	"time"
+
+	"github.com/maxpert/marmot/hlc"
 )
 
 // =============================================================================
@@ -14,7 +16,7 @@ import (
 func TestSendRemoteCommits_SpawnCorrectGoroutineCount(t *testing.T) {
 	InitTestTelemetry()
 	mock := newMockReplicator()
-	wc := NewWriteCoordinator(1, nil, mock, mock, 100*time.Millisecond, nil)
+	wc := NewWriteCoordinator(1, nil, mock, mock, 100*time.Millisecond, hlc.NewClock(1))
 
 	// Setup: 4 prepared nodes (3 remote + coordinator)
 	preparedNodes := map[uint64]*ReplicationResponse{
@@ -56,7 +58,7 @@ func TestSendRemoteCommits_SpawnCorrectGoroutineCount(t *testing.T) {
 func TestSendRemoteCommits_ExcludeCoordinator(t *testing.T) {
 	InitTestTelemetry()
 	mock := newMockReplicator()
-	wc := NewWriteCoordinator(1, nil, mock, mock, 100*time.Millisecond, nil)
+	wc := NewWriteCoordinator(1, nil, mock, mock, 100*time.Millisecond, hlc.NewClock(1))
 
 	preparedNodes := map[uint64]*ReplicationResponse{
 		1: CreateSuccessResponse(), // Coordinator (should be excluded)
@@ -93,7 +95,7 @@ func TestSendRemoteCommits_ExcludeCoordinator(t *testing.T) {
 func TestSendRemoteCommits_ChannelCapacityMatch(t *testing.T) {
 	InitTestTelemetry()
 	mock := newMockReplicator()
-	wc := NewWriteCoordinator(1, nil, mock, mock, 100*time.Millisecond, nil)
+	wc := NewWriteCoordinator(1, nil, mock, mock, 100*time.Millisecond, hlc.NewClock(1))
 
 	testCases := []struct {
 		name          string
@@ -156,7 +158,7 @@ func TestSendRemoteCommits_DetachedContext(t *testing.T) {
 	mock.commitLatency = 100 * time.Millisecond
 	mock.mu.Unlock()
 
-	wc := NewWriteCoordinator(1, nil, mock, mock, 200*time.Millisecond, nil)
+	wc := NewWriteCoordinator(1, nil, mock, mock, 200*time.Millisecond, hlc.NewClock(1))
 
 	preparedNodes := map[uint64]*ReplicationResponse{
 		1: CreateSuccessResponse(), // Coordinator
@@ -214,7 +216,7 @@ collectLoop:
 func TestSendRemoteCommits_EmptyPreparedNodes(t *testing.T) {
 	InitTestTelemetry()
 	mock := newMockReplicator()
-	wc := NewWriteCoordinator(1, nil, mock, mock, 100*time.Millisecond, nil)
+	wc := NewWriteCoordinator(1, nil, mock, mock, 100*time.Millisecond, hlc.NewClock(1))
 
 	preparedNodes := map[uint64]*ReplicationResponse{}
 
@@ -247,7 +249,7 @@ func TestSendRemoteCommits_EmptyPreparedNodes(t *testing.T) {
 func TestSendRemoteCommits_SingleRemoteNode(t *testing.T) {
 	InitTestTelemetry()
 	mock := newMockReplicator()
-	wc := NewWriteCoordinator(1, nil, mock, mock, 100*time.Millisecond, nil)
+	wc := NewWriteCoordinator(1, nil, mock, mock, 100*time.Millisecond, hlc.NewClock(1))
 
 	preparedNodes := map[uint64]*ReplicationResponse{
 		1: CreateSuccessResponse(), // Coordinator
@@ -295,7 +297,7 @@ func TestSendRemoteCommits_TimeoutPropagation(t *testing.T) {
 
 	// Set coordinator timeout to 3 seconds
 	coordinatorTimeout := 3 * time.Second
-	wc := NewWriteCoordinator(1, nil, mock, mock, coordinatorTimeout, nil)
+	wc := NewWriteCoordinator(1, nil, mock, mock, coordinatorTimeout, hlc.NewClock(1))
 
 	preparedNodes := map[uint64]*ReplicationResponse{
 		1: CreateSuccessResponse(), // Coordinator
@@ -327,7 +329,7 @@ func TestSendRemoteCommits_TimeoutPropagation(t *testing.T) {
 func TestSendRemoteCommits_CorrectTxnID(t *testing.T) {
 	InitTestTelemetry()
 	mock := newMockReplicator()
-	wc := NewWriteCoordinator(1, nil, mock, mock, 100*time.Millisecond, nil)
+	wc := NewWriteCoordinator(1, nil, mock, mock, 100*time.Millisecond, hlc.NewClock(1))
 
 	expectedTxnID := uint64(12345)
 
@@ -370,7 +372,7 @@ func TestSendRemoteCommits_CorrectTxnID(t *testing.T) {
 // Test 7.1: Exact quorum achieved
 func TestWaitForRemoteQuorum_ExactQuorumAchieved(t *testing.T) {
 	InitTestTelemetry()
-	wc := NewWriteCoordinator(1, nil, nil, nil, 100*time.Millisecond, nil)
+	wc := NewWriteCoordinator(1, nil, nil, nil, 100*time.Millisecond, hlc.NewClock(1))
 
 	mocker := NewChannelMocker()
 	commitChan := make(chan response, 3)
@@ -401,7 +403,7 @@ func TestWaitForRemoteQuorum_ExactQuorumAchieved(t *testing.T) {
 // Test 7.2: Over quorum achieved - all nodes respond successfully
 func TestWaitForRemoteQuorum_OverQuorumAchieved(t *testing.T) {
 	InitTestTelemetry()
-	wc := NewWriteCoordinator(1, nil, nil, nil, 100*time.Millisecond, nil)
+	wc := NewWriteCoordinator(1, nil, nil, nil, 100*time.Millisecond, hlc.NewClock(1))
 
 	mocker := NewChannelMocker()
 	commitChan := make(chan response, 4)
@@ -431,7 +433,7 @@ func TestWaitForRemoteQuorum_UnderQuorumTimeout(t *testing.T) {
 	InitTestTelemetry()
 
 	// Set very short timeout to speed up test
-	wc := NewWriteCoordinator(1, nil, nil, nil, 50*time.Millisecond, nil)
+	wc := NewWriteCoordinator(1, nil, nil, nil, 50*time.Millisecond, hlc.NewClock(1))
 
 	mocker := NewChannelMocker()
 	commitChan := make(chan response, 3)
@@ -468,7 +470,7 @@ func TestWaitForRemoteQuorum_UnderQuorumTimeout(t *testing.T) {
 // Test 7.4: Early exit on quorum - don't wait for all responses
 func TestWaitForRemoteQuorum_EarlyExitOnQuorum(t *testing.T) {
 	InitTestTelemetry()
-	wc := NewWriteCoordinator(1, nil, nil, nil, 100*time.Millisecond, nil)
+	wc := NewWriteCoordinator(1, nil, nil, nil, 100*time.Millisecond, hlc.NewClock(1))
 
 	mocker := NewChannelMocker()
 	commitChan := make(chan response, 4)
@@ -505,7 +507,7 @@ func TestWaitForRemoteQuorum_EarlyExitOnQuorum(t *testing.T) {
 // Test 7.5: All nodes fail - no ACKs
 func TestWaitForRemoteQuorum_AllNodesFail(t *testing.T) {
 	InitTestTelemetry()
-	wc := NewWriteCoordinator(1, nil, nil, nil, 50*time.Millisecond, nil)
+	wc := NewWriteCoordinator(1, nil, nil, nil, 50*time.Millisecond, hlc.NewClock(1))
 
 	mocker := NewChannelMocker()
 	commitChan := make(chan response, 3)
@@ -532,7 +534,7 @@ func TestWaitForRemoteQuorum_AllNodesFail(t *testing.T) {
 // Test 7.6: Mixed success and error - count only successes
 func TestWaitForRemoteQuorum_MixedSuccessError(t *testing.T) {
 	InitTestTelemetry()
-	wc := NewWriteCoordinator(1, nil, nil, nil, 100*time.Millisecond, nil)
+	wc := NewWriteCoordinator(1, nil, nil, nil, 100*time.Millisecond, hlc.NewClock(1))
 
 	mocker := NewChannelMocker()
 	commitChan := make(chan response, 4)
@@ -567,7 +569,7 @@ func TestWaitForRemoteQuorum_TimeoutPerResponse(t *testing.T) {
 	InitTestTelemetry()
 
 	// Coordinator timeout is 100ms per response
-	wc := NewWriteCoordinator(1, nil, nil, nil, 100*time.Millisecond, nil)
+	wc := NewWriteCoordinator(1, nil, nil, nil, 100*time.Millisecond, hlc.NewClock(1))
 
 	mocker := NewChannelMocker()
 	commitChan := make(chan response, 3)
@@ -600,7 +602,7 @@ func TestWaitForRemoteQuorum_TimeoutPerResponse(t *testing.T) {
 // Test 7.8: Zero quorum needed - early exit on first iteration
 func TestWaitForRemoteQuorum_ZeroQuorumNeeded(t *testing.T) {
 	InitTestTelemetry()
-	wc := NewWriteCoordinator(1, nil, nil, nil, 50*time.Millisecond, nil)
+	wc := NewWriteCoordinator(1, nil, nil, nil, 50*time.Millisecond, hlc.NewClock(1))
 
 	commitChan := make(chan response, 2)
 
@@ -626,7 +628,7 @@ func TestWaitForRemoteQuorum_ZeroQuorumNeeded(t *testing.T) {
 // Test 7.9: Negative quorum needed - early exit on first iteration
 func TestWaitForRemoteQuorum_NegativeQuorumNeeded(t *testing.T) {
 	InitTestTelemetry()
-	wc := NewWriteCoordinator(1, nil, nil, nil, 50*time.Millisecond, nil)
+	wc := NewWriteCoordinator(1, nil, nil, nil, 50*time.Millisecond, hlc.NewClock(1))
 
 	commitChan := make(chan response, 2)
 
@@ -651,7 +653,7 @@ func TestWaitForRemoteQuorum_NegativeQuorumNeeded(t *testing.T) {
 // Test 7.10: Channel closed early - handle gracefully
 func TestWaitForRemoteQuorum_ChannelClosed(t *testing.T) {
 	InitTestTelemetry()
-	wc := NewWriteCoordinator(1, nil, nil, nil, 100*time.Millisecond, nil)
+	wc := NewWriteCoordinator(1, nil, nil, nil, 100*time.Millisecond, hlc.NewClock(1))
 
 	commitChan := make(chan response, 2)
 
@@ -683,7 +685,7 @@ func TestWaitForRemoteQuorum_ChannelClosed(t *testing.T) {
 // Test 7.11: Nil responses - not counted as ACK
 func TestWaitForRemoteQuorum_NilResponses(t *testing.T) {
 	InitTestTelemetry()
-	wc := NewWriteCoordinator(1, nil, nil, nil, 100*time.Millisecond, nil)
+	wc := NewWriteCoordinator(1, nil, nil, nil, 100*time.Millisecond, hlc.NewClock(1))
 
 	commitChan := make(chan response, 3)
 

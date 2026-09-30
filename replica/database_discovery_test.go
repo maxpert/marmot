@@ -114,6 +114,22 @@ func (m *mockMarmotServiceClient) ForwardLoadData(ctx context.Context, req *marm
 	return args.Get(0).(*marmotgrpc.ForwardQueryResponse), args.Error(1)
 }
 
+func (m *mockMarmotServiceClient) GetAutoIncBases(ctx context.Context, req *marmotgrpc.AutoIncBasesRequest, opts ...grpc.CallOption) (*marmotgrpc.AutoIncBasesResponse, error) {
+	args := m.Called(ctx, req)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*marmotgrpc.AutoIncBasesResponse), args.Error(1)
+}
+
+func (m *mockMarmotServiceClient) SyncAutoIncBases(ctx context.Context, req *marmotgrpc.AutoIncSyncRequest, opts ...grpc.CallOption) (*marmotgrpc.AutoIncSyncResponse, error) {
+	args := m.Called(ctx, req)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*marmotgrpc.AutoIncSyncResponse), args.Error(1)
+}
+
 func (m *mockMarmotServiceClient) GetLoadDataChunk(ctx context.Context, req *marmotgrpc.LoadDataChunkRequest, opts ...grpc.CallOption) (*marmotgrpc.LoadDataChunkResponse, error) {
 	args := m.Called(ctx, req)
 	if args.Get(0) == nil {
@@ -136,6 +152,30 @@ func (m *mockMarmotServiceClient) TransactionStream(ctx context.Context, opts ..
 		return nil, args.Error(1)
 	}
 	return args.Get(0).(grpc.ClientStreamingClient[marmotgrpc.TransactionStreamMessage, marmotgrpc.TransactionResponse]), args.Error(1)
+}
+
+func (m *mockMarmotServiceClient) ListCommittedLog(ctx context.Context, req *marmotgrpc.LogListRequest, opts ...grpc.CallOption) (*marmotgrpc.LogListResponse, error) {
+	args := m.Called(ctx, req)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*marmotgrpc.LogListResponse), args.Error(1)
+}
+
+func (m *mockMarmotServiceClient) FetchTransactions(ctx context.Context, req *marmotgrpc.FetchTransactionsRequest, opts ...grpc.CallOption) (marmotgrpc.MarmotService_FetchTransactionsClient, error) {
+	args := m.Called(ctx, req)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(marmotgrpc.MarmotService_FetchTransactionsClient), args.Error(1)
+}
+
+func (m *mockMarmotServiceClient) ListDatabaseRegistry(ctx context.Context, req *marmotgrpc.DatabaseRegistryRequest, opts ...grpc.CallOption) (*marmotgrpc.DatabaseRegistryResponse, error) {
+	args := m.Called(ctx, req)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*marmotgrpc.DatabaseRegistryResponse), args.Error(1)
 }
 
 // TestDiscoverNewDatabases_DetectsNewDatabase tests that discovery loop detects new databases

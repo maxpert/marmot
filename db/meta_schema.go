@@ -13,6 +13,20 @@ const (
 	IntentTypeDML        IntentType = 0 // Regular row operations (INSERT/UPDATE/DELETE)
 	IntentTypeDDL        IntentType = 1 // Schema operations (CREATE/ALTER/DROP TABLE)
 	IntentTypeDatabaseOp IntentType = 2 // Database operations (CREATE/DROP DATABASE)
+	// IntentTypeAutoIDClaim is a narrow auto-increment range claim.
+	//
+	// It must NOT be IntentTypeDML, and that is a correctness requirement
+	// rather than a taxonomy preference. WriteIntent short-circuits
+	// IntentTypeDML into storeDMLIntent, whose record omits DataSnapshot and
+	// which writes only to an in-memory map; GetIntentsByTxn iterates the
+	// Pebble prefix only, so a claim stored that way would never be returned
+	// and its payload would never have existed. The COMMIT handler reads
+	// exactly that payload to write the new base, so a claim on the DML branch
+	// would pass PREPARE, apply nothing at COMMIT, leave every participant's
+	// base where it was, and let the next claimant anywhere compute the same
+	// range and mint the same ids. Selecting storage is precisely what this
+	// type is for.
+	IntentTypeAutoIDClaim IntentType = 3
 )
 
 func (t IntentType) String() string {
@@ -23,6 +37,8 @@ func (t IntentType) String() string {
 		return "DDL"
 	case IntentTypeDatabaseOp:
 		return "DATABASE_OP"
+	case IntentTypeAutoIDClaim:
+		return "AUTO_ID_CLAIM"
 	default:
 		return "UNKNOWN"
 	}
@@ -87,28 +103,6 @@ func (s TxnStatus) String() string {
 	}
 }
 
-// SyncStatus represents replication sync state
-type SyncStatus uint8
-
-const (
-	SyncStatusSynced     SyncStatus = 0
-	SyncStatusCatchingUp SyncStatus = 1
-	SyncStatusFailed     SyncStatus = 2
-)
-
-func (s SyncStatus) String() string {
-	switch s {
-	case SyncStatusSynced:
-		return "SYNCED"
-	case SyncStatusCatchingUp:
-		return "CATCHING_UP"
-	case SyncStatusFailed:
-		return "FAILED"
-	default:
-		return "UNKNOWN"
-	}
-}
-
 // DatabaseOpType represents CREATE/DROP DATABASE operations
 type DatabaseOpType uint8
 
@@ -134,6 +128,12 @@ type DatabaseOperationSnapshot struct {
 	Timestamp    int64          `msgpack:"timestamp"`
 	DatabaseName string         `msgpack:"database_name"`
 	Operation    DatabaseOpType `msgpack:"operation"`
+	// Generation is the registry generation PREPARE resolved for this op (the
+	// coordinator's stamp, or - when unstamped - this participant's own
+	// locally computed value; see ReplicationEngine.prepareDatabaseOperation).
+	// COMMIT combines it with Operation to form the DatabaseRegistryKey it
+	// applies through DatabaseManager.ApplyDatabaseOp.
+	Generation uint64 `msgpack:"generation"`
 }
 
 // DDLSnapshot is a typed struct for DDL operation intents

@@ -21,10 +21,15 @@ type PromotionConfiguration struct {
 
 // ClusterConfiguration controls cluster membership and communication
 type ClusterConfiguration struct {
-	GRPCBindAddress       string                 `toml:"grpc_bind_address"`
-	GRPCAdvertiseAddress  string                 `toml:"grpc_advertise_address"` // Address other nodes use to connect (defaults to hostname:port)
-	GRPCPort              int                    `toml:"grpc_port"`
-	SeedNodes             []string               `toml:"seed_nodes"`
+	GRPCBindAddress      string   `toml:"grpc_bind_address"`
+	GRPCAdvertiseAddress string   `toml:"grpc_advertise_address"` // Address other nodes use to connect (defaults to hostname:port)
+	GRPCPort             int      `toml:"grpc_port"`
+	SeedNodes            []string `toml:"seed_nodes"`
+	// Standalone marks a deliberate single-node deployment. Only such a node
+	// releases its held AUTO_INCREMENT claim votes while it is its own whole
+	// membership; any other node with a membership of one may simply not have
+	// learned its cluster yet.
+	Standalone            bool                   `toml:"standalone"`
 	ClusterSecret         string                 `toml:"cluster_secret"` // PSK for cluster authentication (env: MARMOT_CLUSTER_SECRET)
 	GossipIntervalMS      int                    `toml:"gossip_interval_ms"`
 	GossipFanout          int                    `toml:"gossip_fanout"`
@@ -32,6 +37,32 @@ type ClusterConfiguration struct {
 	DeadTimeoutMS         int                    `toml:"dead_timeout_ms"`
 	ShutdownGracePeriodMS int                    `toml:"shutdown_grace_period_ms"` // Grace period for in-flight queries during shutdown (default: 15000ms)
 	Promotion             PromotionConfiguration `toml:"promotion"`
+
+	// AutoIncMergeIntervalMS is how often a node whose AUTO_INCREMENT claim
+	// votes are held retries merging claim bases from its peers: the most a
+	// node declines claims after enough of its peers became reachable
+	// (default: 2000ms).
+	AutoIncMergeIntervalMS int `toml:"autoinc_merge_interval_ms"`
+	// AutoIncBaseSyncIntervalMS is how often a node raises its AUTO_INCREMENT
+	// claim bases to every alive peer's: the longest a claim committed before
+	// a membership change can stay unknown to a new quorum (default: 10000ms).
+	AutoIncBaseSyncIntervalMS int `toml:"autoinc_base_sync_interval_ms"`
+}
+
+// Defaults of ClusterConfiguration's AUTO_INCREMENT claim base intervals.
+const (
+	DefaultAutoIncMergeIntervalMS    = 2000
+	DefaultAutoIncBaseSyncIntervalMS = 10000
+)
+
+// GetAutoIncMergeInterval returns AutoIncMergeIntervalMS as a time.Duration.
+func (c *ClusterConfiguration) GetAutoIncMergeInterval() time.Duration {
+	return time.Duration(c.AutoIncMergeIntervalMS) * time.Millisecond
+}
+
+// GetAutoIncBaseSyncInterval returns AutoIncBaseSyncIntervalMS as a time.Duration.
+func (c *ClusterConfiguration) GetAutoIncBaseSyncInterval() time.Duration {
+	return time.Duration(c.AutoIncBaseSyncIntervalMS) * time.Millisecond
 }
 
 // GetShutdownGracePeriod returns the configured shutdown grace period as a time.Duration.
@@ -59,6 +90,13 @@ type ReplicationConfiguration struct {
 	GCMinRetentionHours       int  `toml:"gc_min_retention_hours"`
 	GCMaxRetentionHours       int  `toml:"gc_max_retention_hours"`
 	StreamChunkSizeKB         int  `toml:"stream_chunk_size_kb"` // Size in KB for streaming chunks (default: 1024 = 1MB)
+	// SnapshotRestoreTimeoutS bounds anti-entropy's whole snapshot restore
+	// sequence (transfer, re-attach, and the local-log re-apply),
+	// independent of anti_entropy_interval_seconds: a restore is a one-shot
+	// transfer of a database's full current size, which can take far longer
+	// than one anti-entropy round, while the round interval is tuned for
+	// pulling a bounded page of log entries.
+	SnapshotRestoreTimeoutS int `toml:"snapshot_restore_timeout_seconds"`
 }
 
 // MySQLConfiguration for MySQL wire protocol server
@@ -284,6 +322,9 @@ var Config = &Configuration{
 			CheckIntervalSeconds:  2, // Check every 2 seconds
 			MinHealthyDurationSec: 3, // Must be healthy for 3 seconds
 		},
+
+		AutoIncMergeIntervalMS:    DefaultAutoIncMergeIntervalMS,
+		AutoIncBaseSyncIntervalMS: DefaultAutoIncBaseSyncIntervalMS,
 	},
 
 	Replication: ReplicationConfiguration{
@@ -300,6 +341,7 @@ var Config = &Configuration{
 		GCMinRetentionHours:       2,     // 2 hours - MUST be >= 2x delta threshold (safety margin)
 		GCMaxRetentionHours:       24,    // 24 hours - 24x delta threshold (like Cassandra's 10-day gc_grace)
 		StreamChunkSizeKB:         1024,  // 1MB - use streaming for large payloads >= this size
+		SnapshotRestoreTimeoutS:   1800,  // 30 minutes - bounds a full database transfer, independent of the AE round interval
 	},
 
 	Transaction: TransactionConfiguration{
@@ -549,6 +591,13 @@ func Validate() error {
 			Msg("Auto-configured gRPC advertise address")
 	}
 
+	if Config.Cluster.Standalone && len(Config.Cluster.SeedNodes) > 0 {
+		return fmt.Errorf("cluster.standalone is set but seed_nodes is not empty: a standalone node joins no cluster")
+	}
+	if Config.Cluster.Standalone && Config.Replica.Enabled {
+		return fmt.Errorf("cluster.standalone is set but replica.enabled is true: a read-only replica follows a cluster")
+	}
+
 	if Config.MySQL.Enabled && (Config.MySQL.Port < 1 || Config.MySQL.Port > 65535) {
 		return fmt.Errorf("invalid MySQL port: %d", Config.MySQL.Port)
 	}
@@ -789,6 +838,16 @@ func Validate() error {
 	}
 	if Config.Cluster.ShutdownGracePeriodMS < 1000 || Config.Cluster.ShutdownGracePeriodMS > 300000 {
 		return fmt.Errorf("cluster.shutdown_grace_period_ms must be between 1000ms and 300000ms (5 minutes)")
+	}
+	// 0 means the default, as for the grace period above.
+	if Config.Cluster.AutoIncMergeIntervalMS == 0 {
+		Config.Cluster.AutoIncMergeIntervalMS = DefaultAutoIncMergeIntervalMS
+	}
+	if Config.Cluster.AutoIncBaseSyncIntervalMS == 0 {
+		Config.Cluster.AutoIncBaseSyncIntervalMS = DefaultAutoIncBaseSyncIntervalMS
+	}
+	if Config.Cluster.AutoIncMergeIntervalMS < 0 || Config.Cluster.AutoIncBaseSyncIntervalMS < 0 {
+		return fmt.Errorf("cluster.autoinc_merge_interval_ms and cluster.autoinc_base_sync_interval_ms must be positive")
 	}
 
 	// Validate publisher configuration

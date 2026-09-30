@@ -7,7 +7,7 @@ import (
 
 // StatsProvider interface for components that provide stats
 type StatsProvider interface {
-	GetRowLockStats() (activeLocks, activeTransactions, gcMarkers, tablesWithLocks int)
+	GetRowLockStats() (activeLocks, activeTransactions, tablesWithLocks int)
 	IntentStats() (pendingIntents int, err error)
 }
 
@@ -69,7 +69,7 @@ func (mc *MetricsCollector) collect() {
 		return
 	}
 
-	var totalLocks, totalTxns, totalGC, totalTables, totalIntents int
+	var totalLocks, totalTxns, totalTables, totalIntents int
 
 	for _, dbName := range mc.dbLister.ListDatabases() {
 		provider := mc.dbLister.GetDatabase(dbName)
@@ -77,10 +77,9 @@ func (mc *MetricsCollector) collect() {
 			continue
 		}
 
-		locks, txns, gc, tables := provider.GetRowLockStats()
+		locks, txns, tables := provider.GetRowLockStats()
 		totalLocks += locks
 		totalTxns += txns
-		totalGC += gc
 		totalTables += tables
 
 		if intents, err := provider.IntentStats(); err == nil {
@@ -88,6 +87,6 @@ func (mc *MetricsCollector) collect() {
 		}
 	}
 
-	UpdateRowLockStats(totalLocks, totalTxns, totalGC, totalTables)
+	UpdateRowLockStats(totalLocks, totalTxns, totalTables)
 	PendingIntents.Set(float64(totalIntents))
 }

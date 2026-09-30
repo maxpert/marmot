@@ -3,6 +3,7 @@ package test
 import (
 	"context"
 	"fmt"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -370,12 +371,10 @@ func TestConcurrentWritesDuringPartition(t *testing.T) {
 	node1 := cluster.GetNode(1)
 	node2 := cluster.GetNode(2)
 
-	// Add delay to ensure different timestamps
-	time.Sleep(1 * time.Millisecond)
 	txn1, _ := node1.Write("key", "value_from_node1")
-
-	time.Sleep(1 * time.Millisecond)
-	txn2, _ := node2.Write("key", "value_from_node2") // This should win (later timestamp)
+	// node2's clock has seen txn1, so its write is strictly later and wins.
+	node2.clock.Update(txn1.Timestamp)
+	txn2, _ := node2.Write("key", "value_from_node2")
 
 	// Replicate within partitions (will fail quorum for node1)
 	cluster.ReplicateToQuorum(txn1)
@@ -489,9 +488,9 @@ func TestConsistencyInvariant(t *testing.T) {
 			default:
 				// Create random partition
 				cluster.partitionSim.PartitionNodes([]uint64{1}, []uint64{2, 3})
-				time.Sleep(50 * time.Millisecond)
+				runtime.Gosched()
 				cluster.partitionSim.Reset()
-				time.Sleep(50 * time.Millisecond)
+				runtime.Gosched()
 			}
 		}
 	}()

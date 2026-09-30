@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -107,6 +108,7 @@ type sealCapturedRowsFunc func(txnID uint64) error
 type SQLiteBatchCommitter struct {
 	dbPath string
 	db     *sql.DB
+	gate   *writeGate // the owning ReplicatedDatabase's gate; nil when standalone
 
 	mu      sync.Mutex
 	pending map[uint64]*pendingCommit
@@ -202,7 +204,13 @@ func (bc *SQLiteBatchCommitter) openOptimizedConnection() (*sql.DB, error) {
 		}
 	}
 
-	db, err := sql.Open(SQLiteDriverName, dsn)
+	var db *sql.DB
+	var err error
+	if bc.gate != nil {
+		db, err = bc.gate.openDB(SQLiteDriverName, dsn)
+	} else {
+		db, err = sql.Open(SQLiteDriverName, dsn)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -234,9 +242,17 @@ func (bc *SQLiteBatchCommitter) openOptimizedConnection() (*sql.DB, error) {
 		db.Close()
 		return nil, err
 	}
+	if err := ensureRowVersionTable(db); err != nil {
+		db.Close()
+		return nil, err
+	}
 
 	return db, nil
 }
+
+// ErrBatchCommitterStopped refuses a commit queued after the committer
+// stopped - for example on a database detached for a snapshot restore.
+var ErrBatchCommitterStopped = errors.New("batch committer stopped")
 
 func (bc *SQLiteBatchCommitter) Stop() {
 	if !bc.stopped.CompareAndSwap(false, true) {
@@ -255,6 +271,14 @@ func (bc *SQLiteBatchCommitter) Enqueue(txnID uint64, commitTS hlc.Timestamp, cd
 	p := future.NewPromise[error]()
 
 	bc.mu.Lock()
+	// A stopped committer never flushes again, so a commit queued now would
+	// wait forever. Stop sets stopped before its final flush takes bc.mu, so
+	// every commit queued before this check is in that flush.
+	if bc.stopped.Load() {
+		bc.mu.Unlock()
+		p.Set(nil, ErrBatchCommitterStopped)
+		return p.Future()
+	}
 	bc.pending[txnID] = &pendingCommit{
 		cdcEntries: cdcEntries,
 		stmts:      stmts,
@@ -421,8 +445,14 @@ func (bc *SQLiteBatchCommitter) flush(batch map[uint64]*pendingCommit, trigger s
 		return
 	}
 
-	// Create schema adapter for the unified applier
-	schemaAdapter := &schemaCacheAdapter{cache: schemaCache}
+	applier, err := newVersionedApplier(tx, &schemaCacheAdapter{cache: schemaCache})
+	if err != nil {
+		tx.Rollback()
+		for _, pc := range batch {
+			pc.promise.Set(nil, err)
+		}
+		return
+	}
 
 	// Apply each logical transaction under a savepoint. A failed transaction
 	// rolls back its own row changes without poisoning successful peers in the
@@ -438,7 +468,7 @@ func (bc *SQLiteBatchCommitter) flush(batch map[uint64]*pendingCommit, trigger s
 			continue
 		}
 		for _, entry := range pc.cdcEntries {
-			if err := ApplyCDCEntry(tx, schemaAdapter, entry); err != nil {
+			if err := applier.applyEntry(entry, pc.commitTS); err != nil {
 				pc.err = err
 				break
 			}
@@ -456,6 +486,7 @@ func (bc *SQLiteBatchCommitter) flush(batch map[uint64]*pendingCommit, trigger s
 		}
 	}
 
+	applier.Close()
 	// Commit (single fsync for entire batch)
 	if err := tx.Commit(); err != nil {
 		tx.Rollback()

@@ -403,6 +403,18 @@ func (l *cdcSegmentLog) sealTxn(txnID uint64, immutable *TxnImmutableRecord, wai
 	return manifest, nil
 }
 
+// pendingRowCount reports how many rows txnID has appended and not yet
+// sealed, and whether it has any pending manifest at all.
+func (l *cdcSegmentLog) pendingRowCount(txnID uint64) (uint64, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	m := l.pending[txnID]
+	if m == nil {
+		return 0, false
+	}
+	return m.RowCount, true
+}
+
 func (l *cdcSegmentLog) getPendingManifest(txnID uint64) *cdcSegmentTxnManifest {
 	l.mu.Lock()
 	defer l.mu.Unlock()

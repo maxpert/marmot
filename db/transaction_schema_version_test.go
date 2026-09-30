@@ -23,6 +23,7 @@ func TestTransactionRecord_SchemaVersionPersistence(t *testing.T) {
 	db, err := sql.Open("sqlite3", dbPath)
 	require.NoError(t, err)
 	defer db.Close()
+	require.NoError(t, ensureAppliedTxnTable(db))
 
 	// Create test table
 	_, err = db.Exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
@@ -90,6 +91,7 @@ func TestTransactionRecord_SchemaVersionZeroDefault(t *testing.T) {
 	db, err := sql.Open("sqlite3", dbPath)
 	require.NoError(t, err)
 	defer db.Close()
+	require.NoError(t, ensureAppliedTxnTable(db))
 
 	// Create test table
 	_, err = db.Exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
@@ -153,6 +155,7 @@ func TestStreamCommittedTransactions_IncludesSchemaVersion(t *testing.T) {
 	db, err := sql.Open("sqlite3", dbPath)
 	require.NoError(t, err)
 	defer db.Close()
+	require.NoError(t, ensureAppliedTxnTable(db))
 
 	// Create test table
 	_, err = db.Exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")

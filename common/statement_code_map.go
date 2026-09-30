@@ -63,12 +63,3 @@ func MustToWireType(code StatementCode) pb.StatementType {
 	}
 	panic(fmt.Sprintf("unknown StatementCode %d: cannot convert to wire type", code))
 }
-
-// MustFromWireType converts wire StatementType to internal StatementCode.
-// Panics on unknown type - use at gRPC receive boundary where invalid data is unacceptable.
-func MustFromWireType(st pb.StatementType) StatementCode {
-	if code, ok := wireToCode[st]; ok {
-		return code
-	}
-	panic(fmt.Sprintf("unknown wire StatementType %d: cannot convert to internal code", st))
-}

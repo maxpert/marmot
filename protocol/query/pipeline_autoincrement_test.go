@@ -4,6 +4,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+
+	"github.com/maxpert/marmot/protocol/query/transform"
 )
 
 // mockIDGenerator is a test ID generator that returns predictable IDs
@@ -11,14 +13,23 @@ type mockIDGenerator struct {
 	counter atomic.Uint64
 }
 
-func (m *mockIDGenerator) NextID() uint64 {
-	return m.counter.Add(1)
+func (m *mockIDGenerator) NextIDs(ids []uint64) error {
+	for i := range ids {
+		ids[i] = m.counter.Add(1)
+	}
+	return nil
 }
 
-// mockSchemaLookup returns a SchemaLookup function that knows about specific tables
-func mockSchemaLookup(tableColumns map[string]string) func(string) string {
-	return func(table string) string {
-		return tableColumns[table]
+// mockSchemaLookup returns a schema lookup that knows about specific tables.
+// The ordinal is the auto-increment column's position in the table's own column
+// order, which is what a column-less INSERT's VALUES tuple is indexed by.
+func mockSchemaLookup(tables map[string]transform.SchemaInfo) func(string, string) *transform.SchemaInfo {
+	return func(_, table string) *transform.SchemaInfo {
+		info, ok := tables[table]
+		if !ok {
+			return nil
+		}
+		return &info
 	}
 }
 
@@ -52,8 +63,8 @@ func TestPipelineAutoIncrementIDInjection(t *testing.T) {
 	}
 
 	// Set up schema lookup for sbtest1 table
-	schemaLookup := mockSchemaLookup(map[string]string{
-		"sbtest1": "id",
+	schemaLookup := mockSchemaLookup(map[string]transform.SchemaInfo{
+		"sbtest1": {AutoIncrementColumn: "id", AutoIncrementOrdinal: 0},
 	})
 
 	// Now test INSERT with 0 value
@@ -104,8 +115,8 @@ func TestPipelineAutoIncrementIDInjection_NullValue(t *testing.T) {
 	}
 
 	// Set up schema lookup for users table
-	schemaLookup := mockSchemaLookup(map[string]string{
-		"users": "id",
+	schemaLookup := mockSchemaLookup(map[string]transform.SchemaInfo{
+		"users": {AutoIncrementColumn: "id", AutoIncrementOrdinal: 0},
 	})
 
 	// Test INSERT with NULL value
@@ -158,8 +169,8 @@ func TestPipelineAutoIncrementIDInjection_ExplicitID(t *testing.T) {
 	}
 
 	// Set up schema lookup for users table
-	schemaLookup := mockSchemaLookup(map[string]string{
-		"users": "id",
+	schemaLookup := mockSchemaLookup(map[string]transform.SchemaInfo{
+		"users": {AutoIncrementColumn: "id", AutoIncrementOrdinal: 0},
 	})
 
 	// When user provides explicit non-zero ID, it should not be modified
@@ -188,8 +199,8 @@ func TestPipelineAutoIncrementIDInjection_MultiRow(t *testing.T) {
 	}
 
 	// Set up schema lookup for users table
-	schemaLookup := mockSchemaLookup(map[string]string{
-		"users": "id",
+	schemaLookup := mockSchemaLookup(map[string]transform.SchemaInfo{
+		"users": {AutoIncrementColumn: "id", AutoIncrementOrdinal: 0},
 	})
 
 	sql := "INSERT INTO users (id, name) VALUES (0, 'alice'), (0, 'bob'), (100, 'charlie')"
@@ -248,8 +259,8 @@ func TestPipelineAutoIncrementIDInjection_CacheBypassForIDInjection(t *testing.T
 	}
 
 	// Set up schema lookup for users table
-	schemaLookup := mockSchemaLookup(map[string]string{
-		"users": "id",
+	schemaLookup := mockSchemaLookup(map[string]transform.SchemaInfo{
+		"users": {AutoIncrementColumn: "id", AutoIncrementOrdinal: 0},
 	})
 
 	// Process the same INSERT twice - each should get unique ID
@@ -295,8 +306,8 @@ func TestPipelineAutoIncrementIDInjection_InsertIgnoreWithPatternTransform(t *te
 	}
 
 	// Set up schema lookup for users table
-	schemaLookup := mockSchemaLookup(map[string]string{
-		"users": "id",
+	schemaLookup := mockSchemaLookup(map[string]transform.SchemaInfo{
+		"users": {AutoIncrementColumn: "id", AutoIncrementOrdinal: 0},
 	})
 
 	// Test INSERT IGNORE with 0 value - should apply both ID injection AND pattern transform

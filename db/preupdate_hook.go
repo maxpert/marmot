@@ -28,15 +28,14 @@ import (
 // keep them in bounded session memory until SQLite rollback releases the writer;
 // oversized transactions spill directly to the CDC segment log.
 type EphemeralHookSession struct {
-	conn         *sql.Conn    // Dedicated user DB connection (closed on end)
-	tx           *sql.Tx      // Active transaction on user DB
-	metaStore    MetaStore    // MetaStore for intent entry storage
-	txnID        uint64       // Transaction ID for intent entries
-	seq          uint64       // Sequence counter for entries
-	schemaCache  *SchemaCache // Shared schema cache
-	lastInsertId int64        // Last insert ID from most recent insert
-	mu           sync.Mutex
-	captureMu    sync.Mutex
+	conn        *sql.Conn    // Dedicated user DB connection (closed on end)
+	tx          *sql.Tx      // Active transaction on user DB
+	metaStore   MetaStore    // MetaStore for intent entry storage
+	txnID       uint64       // Transaction ID for intent entries
+	seq         uint64       // Sequence counter for entries
+	schemaCache *SchemaCache // Shared schema cache
+	mu          sync.Mutex
+	captureMu   sync.Mutex
 
 	conflictError        error // Set if conflict detected during hook
 	capturedRows         []capturedRow
@@ -49,6 +48,12 @@ type EphemeralHookSession struct {
 
 	lastProcessedSeq uint64 // high-water mark for captureAndLockNewRows
 	eagerCaptureUsed bool   // true once captureAndLockNewRows has run at least once
+
+	// stmtInsertID is the insert id the LAST statement captured by
+	// captureAndLockNewRows reports to its client. It is recomputed per
+	// statement, so a transaction writing to two tables reports each
+	// statement's own id rather than the transaction's first.
+	stmtInsertID int64
 }
 
 type capturedRow struct {
@@ -161,10 +166,6 @@ func (s *EphemeralHookSession) ExecContext(ctx context.Context, query string, ar
 		return 0, conflictErr
 	}
 
-	if id, err := result.LastInsertId(); err == nil && id != 0 {
-		s.lastInsertId = id
-	}
-
 	rowsAffected, err := result.RowsAffected()
 	if err != nil {
 		return 0, err
@@ -232,10 +233,17 @@ func (s *EphemeralHookSession) captureAndLockNewRows() error {
 		}
 	}
 
+	// newEntries holds exactly the rows THIS statement produced: the caller
+	// runs one statement then calls this, and lastProcessedSeq excludes every
+	// earlier statement's rows. s.intentEntries, by contrast, accumulates
+	// across the whole pinned transaction.
+	insertID := statementInsertID(s.schemaCache, newEntries)
+
 	s.mu.Lock()
 	s.intentEntries = append(s.intentEntries, newEntries...)
 	s.lastProcessedSeq = maxSeq
 	s.eagerCaptureUsed = true
+	s.stmtInsertID = insertID
 	s.mu.Unlock()
 	return nil
 }
@@ -436,9 +444,13 @@ func (s *EphemeralHookSession) GetTxnID() uint64 {
 	return s.txnID
 }
 
-// GetLastInsertId returns the last insert ID from the most recent insert
-func (s *EphemeralHookSession) GetLastInsertId() int64 {
-	return s.lastInsertId
+// StatementInsertID returns the insert id the most recently captured statement
+// reports to its client - see statementInsertID. Valid only after
+// captureAndLockNewRows has run for that statement.
+func (s *EphemeralHookSession) StatementInsertID() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.stmtInsertID
 }
 
 // GetConflictError returns any conflict error that occurred during CDC capture.

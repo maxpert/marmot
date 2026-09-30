@@ -174,7 +174,7 @@ func Run() {
 	// Initialize read-only handler
 	replica.handler = NewReadOnlyHandler(dbMgr, replica.clock, replica)
 
-	// Initialize query pipeline (nil ID generator - replicas are read-only)
+	// Initialize query pipeline (no ID generators - replicas are read-only)
 	if err := protocol.InitializePipeline(
 		cfg.Config.QueryPipeline.TranspilerCacheSize,
 		nil,

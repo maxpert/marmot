@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"fmt"
+	"slices"
 	"sync"
 
 	"github.com/maxpert/marmot/common"
@@ -128,6 +129,27 @@ type Statement struct {
 	IntentKey []byte        `msgpack:"IntentKey"` // Intent key for MVCC conflict detection (binary format)
 	Error     string        `msgpack:"Error"`     // Error message if Type is StatementUnsupported
 
+	// AutoIDClaim marks this statement as a narrow AUTO_INCREMENT range claim
+	// rather than ordinary DML. The claim's payload travels in the
+	// transaction's intent DataSnapshot, not here.
+	//
+	// It is a flag on an existing StatementType, never a new StatementType: an
+	// older binary ignores the unknown wire field, sees a DML statement with no
+	// row image, and rejects it at the "DML prepare missing encoded CDC row"
+	// gate, which is a clean failed transaction rather than a statement it
+	// mishandles.
+	AutoIDClaim bool `msgpack:"AutoIDClaim,omitempty"`
+	// AutoIDClaimPayload is the claim itself, msgpack-encoded. Each participant
+	// writes it into its own transaction intent at PREPARE; the COMMIT handler
+	// reads it back from there to write the new base.
+	AutoIDClaimPayload []byte `msgpack:"AutoIDClaimPayload,omitempty"`
+
+	// TranspileErr is the typed error transpilation failed with, set only when
+	// a transformation rule refused the statement (never when parsing failed).
+	// It carries the MySQL error code the client must see; Error holds the same
+	// failure as text. Never replicated: a peer re-parses from SQL.
+	TranspileErr error `msgpack:"-"`
+
 	// CDC: Row-level change data (for DML operations)
 	// Decoded local apply state. Replication sends EncodedRow, not raw SQL.
 	OldValues map[string][]byte `msgpack:"OldValues"` // Before image (for UPDATE/DELETE)
@@ -176,6 +198,12 @@ type Statement struct {
 	// one of the two sources is in play - see MergeExecParams.
 	ParamOrder []bool `msgpack:"-"`
 
+	// BoundIDs are server-generated ids that replace the caller's bound
+	// values, keyed by the value's position among them: a narrow
+	// AUTO_INCREMENT placeholder bound to NULL or 0 gets an id exactly as the
+	// literal would. MergeExecParams binds them in place.
+	BoundIDs map[int]uint64 `msgpack:"-"`
+
 	// ParsedAST carries the Vitess AST produced during MySQL-dialect parse.
 	// Non-nil only when the pipeline parsed the statement via Vitess (SELECT,
 	// DML, and most DDL). Downstream components that need the AST — notably
@@ -190,6 +218,18 @@ type Statement struct {
 	// LoadDataPayload carries LOAD DATA LOCAL INFILE file bytes for replicated
 	// non-DML bulk-load transactions.
 	LoadDataPayload []byte `msgpack:"LoadDataPayload,omitempty"`
+
+	// DatabaseGeneration fences a CREATE/DROP DATABASE statement against a
+	// stale coordinator. The coordinator stamps it
+	// from its own database registry view: CREATE stamps the database's next
+	// generation (or its current one, as a no-op, when the database is
+	// already live); DROP stamps the database's current generation. A
+	// participant refuses PREPARE when this is below its own local key for the
+	// database. Zero means "unstamped" - a coordinator that predates this
+	// field - and a participant computes the key itself instead of gating on
+	// it, for rolling-upgrade compatibility. Meaningless on every other
+	// statement type.
+	DatabaseGeneration uint64 `msgpack:"DatabaseGeneration,omitempty"`
 }
 
 // MergeExecParams produces the final positional argument list for executing
@@ -203,8 +243,17 @@ type Statement struct {
 // pipeline-extracted ones interleaved in serialization order; ParamOrder
 // records that order (true = next wireParams value, false = next
 // ExtractedParams value) so the two sources are threaded back together
-// positionally instead of one being silently dropped.
+// positionally instead of one being silently dropped. Any BoundIDs replace
+// the caller's values at their positions first.
 func (s Statement) MergeExecParams(wireParams []interface{}) []interface{} {
+	if len(s.BoundIDs) > 0 {
+		wireParams = slices.Clone(wireParams)
+		for pos, id := range s.BoundIDs {
+			if pos < len(wireParams) {
+				wireParams[pos] = int64(id)
+			}
+		}
+	}
 	if len(s.ParamOrder) == 0 {
 		if len(wireParams) == 0 && len(s.ExtractedParams) > 0 {
 			return s.ExtractedParams
@@ -241,6 +290,7 @@ func (s Statement) WithResolvedParams(sql string, params []interface{}) Statemen
 	s.SQL = sql
 	s.ExtractedParams = params
 	s.ParamOrder = nil
+	s.BoundIDs = nil
 	return s
 }
 

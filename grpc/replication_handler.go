@@ -5,10 +5,11 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/maxpert/marmot/common"
+	"github.com/maxpert/marmot/coordinator"
 	"github.com/maxpert/marmot/db"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/protocol"
+	"github.com/maxpert/marmot/protocol/mysqlcode"
 	"github.com/maxpert/marmot/telemetry"
 	"github.com/rs/zerolog/log"
 )
@@ -63,8 +64,6 @@ func (rh *ReplicationHandler) HandleReplicateTransaction(ctx context.Context, re
 		return rh.handleCommit(ctx, req)
 	case TransactionPhase_ABORT:
 		return rh.handleAbort(ctx, req)
-	case TransactionPhase_REPLAY:
-		return rh.handleReplay(ctx, req)
 	default:
 		return &TransactionResponse{
 			Success:      false,
@@ -116,10 +115,17 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 	// Convert proto statements to internal format
 	statements := make([]protocol.Statement, 0, len(req.Statements))
 	for _, stmt := range req.Statements {
-		internalStmt := protocolStatementFromProto(stmt)
+		internalStmt, err := protocolStatementFromProto(stmt)
+		if err != nil {
+			log.Error().Err(err).Uint64("txn_id", req.TxnId).Str("database", req.Database).Msg("Rejecting PREPARE: unrecognized statement on wire")
+			return &TransactionResponse{
+				Success:      false,
+				ErrorMessage: fmt.Sprintf("unrecognized statement: %v", err),
+			}, nil
+		}
+		// protocolStatementFromProto already copied SQL and the inline payload
+		// from this arm; only the out-of-band fetch below is still needed.
 		if loadData := stmt.GetLoadDataChange(); loadData != nil {
-			internalStmt.SQL = loadData.Sql
-			internalStmt.LoadDataPayload = loadData.Data
 			if len(internalStmt.LoadDataPayload) == 0 && loadData.LoadId != "" {
 				payload, err := rh.pullLoadDataPayload(ctx, req.SourceNodeId, loadData.LoadId, loadData.DataSize, loadData.ChunkBytes)
 				if err != nil {
@@ -132,6 +138,23 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 			}
 		}
 		statements = append(statements, internalStmt)
+	}
+
+	// Rolling-upgrade gate, participant half: refuse a PREPARE carrying DDL or
+	// a CREATE/DROP DATABASE while any member does not serve the commit-log
+	// pull protocol yet, so a coordinator running an older release, which has
+	// no gate of its own, cannot reach a quorum for DDL either
+	// (coordinator.LegacyMembersDDLRefusal).
+	if rh.registry != nil && statementsCarryDDLOrDatabaseOp(statements) {
+		if legacy := rh.registry.LegacyLogProtocolMembers(); len(legacy) > 0 {
+			telemetry.ReplicationRequestsTotal.With("prepare", "failed").Inc()
+			return &TransactionResponse{
+				Success:      false,
+				Rejected:     true,
+				ErrorMessage: coordinator.NewLegacyMembersDDLRefusal(legacy).Error(),
+				ErrorCode:    uint32(mysqlcode.ErrCodeDeadlock),
+			}, nil
+		}
 	}
 
 	// Build engine request
@@ -158,6 +181,8 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 		ConflictDetected: result.ConflictDetected,
 		ConflictDetails:  result.ConflictDetails,
 		Rejected:         result.Rejected,
+		AutoIdStoredBase: result.AutoIDStoredBase,
+		ErrorCode:        uint32(result.ErrorCode),
 	}
 	if result.Success {
 		resp.AppliedAt = &HLC{
@@ -172,6 +197,19 @@ func (rh *ReplicationHandler) handlePrepare(ctx context.Context, req *Transactio
 	return resp, nil
 }
 
+// statementsCarryDDLOrDatabaseOp reports whether any statement is DDL or a
+// CREATE/DROP DATABASE, matching the isDDL classification in
+// coordinator.CoordinatorHandler.handleMutation.
+func statementsCarryDDLOrDatabaseOp(statements []protocol.Statement) bool {
+	for _, stmt := range statements {
+		switch stmt.Type {
+		case protocol.StatementDDL, protocol.StatementCreateDatabase, protocol.StatementDropDatabase:
+			return true
+		}
+	}
+	return false
+}
+
 // handleCommit processes Phase 2 of 2PC: Commit transaction
 func (rh *ReplicationHandler) handleCommit(ctx context.Context, req *TransactionRequest) (*TransactionResponse, error) {
 	commitStart := time.Now()
@@ -183,13 +221,22 @@ func (rh *ReplicationHandler) handleCommit(ctx context.Context, req *Transaction
 	// durable from PREPARE; COMMIT may carry only DML intent metadata.
 	statements := make([]protocol.Statement, 0, len(req.Statements))
 	for _, stmt := range req.Statements {
-		statements = append(statements, protocolStatementFromProto(stmt))
+		internalStmt, err := protocolStatementFromProto(stmt)
+		if err != nil {
+			log.Error().Err(err).Uint64("txn_id", req.TxnId).Str("database", req.Database).Msg("Rejecting COMMIT: unrecognized statement on wire")
+			return &TransactionResponse{
+				Success:      false,
+				ErrorMessage: fmt.Sprintf("unrecognized statement: %v", err),
+			}, nil
+		}
+		statements = append(statements, internalStmt)
 	}
 
 	engineReq := &db.CommitRequest{
 		TxnID:      req.TxnId,
 		Database:   req.Database,
 		Statements: statements,
+		CommitTS:   HLCToTimestamp(req.CommitTimestamp),
 	}
 
 	result := rh.engine.Commit(ctx, engineReq)
@@ -202,14 +249,10 @@ func (rh *ReplicationHandler) handleCommit(ctx context.Context, req *Transaction
 		}, nil
 	}
 
-	// Schema version increment for DDL transactions (MUST happen after successful commit)
-	// DDL information is returned by the engine (extracted from committed intents)
-	if rh.schemaVersionMgr != nil && result.DDLSQL != "" {
-		_, verErr := rh.schemaVersionMgr.IncrementSchemaVersion(req.Database, result.DDLSQL, req.TxnId)
-		if verErr != nil {
-			log.Error().Err(verErr).Str("database", req.Database).Uint64("txn_id", req.TxnId).Msg("Failed to increment schema version after DDL replication")
-		}
-	}
+	// The schema version bump for a DDL transaction is already durable, atomic
+	// with the DDL itself, in the database's own SQLite file: the
+	// engine's commit path bumped and cached it as part of committing above.
+	// There is nothing left to do here.
 
 	telemetry.ReplicationRequestsTotal.With("commit", "success").Inc()
 	return &TransactionResponse{
@@ -274,278 +317,6 @@ func (rh *ReplicationHandler) handleAbort(ctx context.Context, req *TransactionR
 		Success:      result.Success,
 		ErrorMessage: result.Error,
 	}, nil
-}
-
-// handleReplay processes anti-entropy replay: Apply already-committed transactions directly.
-// This bypasses 2PC state tracking since these transactions are already committed on the source.
-// Used by delta sync to repair divergent nodes without requiring PREPARE phase.
-func (rh *ReplicationHandler) handleReplay(ctx context.Context, req *TransactionRequest) (*TransactionResponse, error) {
-	replayStart := time.Now()
-	defer func() {
-		telemetry.ReplicaReplaySeconds.Observe(time.Since(replayStart).Seconds())
-	}()
-
-	log.Debug().
-		Uint64("node_id", rh.nodeID).
-		Str("database", req.Database).
-		Uint64("txn_id", req.TxnId).
-		Int("num_statements", len(req.Statements)).
-		Msg("handleReplay called - applying already-committed transaction")
-
-	// Get the target database from request (database name is required)
-	dbName := req.Database
-	if dbName == "" {
-		telemetry.ReplicationRequestsTotal.With("replay", "failed").Inc()
-		return &TransactionResponse{
-			Success:      false,
-			ErrorMessage: "database name is required in replay request",
-		}, nil
-	}
-
-	// Get database instance
-	dbInstance, err := rh.dbMgr.GetDatabase(dbName)
-	if err != nil {
-		telemetry.ReplicationRequestsTotal.With("replay", "failed").Inc()
-		return &TransactionResponse{
-			Success:      false,
-			ErrorMessage: fmt.Sprintf("database %s not found: %v", dbName, err),
-		}, nil
-	}
-	if len(req.Statements) == 1 {
-		if change := req.Statements[0].GetVectorIndexChange(); change != nil {
-			if err := rh.applyVectorIndexChange(ctx, vectorChangeFromProto(change)); err != nil {
-				telemetry.ReplicationRequestsTotal.With("replay", "failed").Inc()
-				return &TransactionResponse{
-					Success:      false,
-					ErrorMessage: fmt.Sprintf("failed to apply vector index control: %v", err),
-				}, nil
-			}
-			if _, err := StoreAppliedChangeEvent(dbInstance.GetMetaStore(), req.TxnId, req.Timestamp, dbName, req.Statements); err != nil {
-				telemetry.ReplicationRequestsTotal.With("replay", "failed").Inc()
-				return &TransactionResponse{
-					Success:      false,
-					ErrorMessage: fmt.Sprintf("failed to store vector index control rows: %v", err),
-				}, nil
-			}
-			now := rh.clock.Now()
-			telemetry.ReplicationRequestsTotal.With("replay", "success").Inc()
-			return &TransactionResponse{
-				Success: true,
-				AppliedAt: &HLC{
-					WallTime: now.WallTime,
-					Logical:  now.Logical,
-					NodeId:   rh.nodeID,
-				},
-			}, nil
-		}
-	}
-
-	sqliteDB := dbInstance.GetDB()
-
-	// Execute statements directly in a SQLite transaction
-	tx, err := sqliteDB.BeginTx(ctx, nil)
-	if err != nil {
-		telemetry.ReplicationRequestsTotal.With("replay", "failed").Inc()
-		return &TransactionResponse{
-			Success:      false,
-			ErrorMessage: fmt.Sprintf("failed to begin transaction: %v", err),
-		}, nil
-	}
-	defer tx.Rollback()
-
-	// Create schema adapter for CDC operations
-	schemaAdapter := &replicationSchemaAdapter{dbMgr: rh.dbMgr, dbName: dbName}
-	hasDDL := false
-
-	for _, stmt := range req.Statements {
-		// Check for CDC data (RowChange payload)
-		if rowChange := stmt.GetRowChange(); rowChange != nil && len(rowChange.EncodedRow) > 0 {
-			// CDC path: apply row data directly using unified applier
-			opType, opErr := wireDMLToOp(stmt.Type)
-			if opErr != nil {
-				telemetry.ReplicationRequestsTotal.With("replay", "failed").Inc()
-				return &TransactionResponse{
-					Success:      false,
-					ErrorMessage: opErr.Error(),
-				}, nil
-			}
-			row, rowErr := decodeRowChange(stmt)
-			if rowErr != nil {
-				telemetry.ReplicationRequestsTotal.With("replay", "failed").Inc()
-				return &TransactionResponse{Success: false, ErrorMessage: rowErr.Error()}, nil
-			}
-			if err := db.ApplyCDCValues(tx, schemaAdapter, opType, stmt.TableName, row.OldValues, row.NewValues); err != nil {
-				telemetry.ReplicationRequestsTotal.With("replay", "failed").Inc()
-				return &TransactionResponse{
-					Success:      false,
-					ErrorMessage: fmt.Sprintf("failed to apply CDC statement: %v", err),
-				}, nil
-			}
-			continue
-		}
-
-		// DDL path: execute SQL directly
-		if ddl := stmt.GetDdlChange(); ddl != nil && ddl.Sql != "" {
-			if err := db.ApplyDDLSQLInTx(ctx, tx, ddl.Sql); err != nil {
-				telemetry.ReplicationRequestsTotal.With("replay", "failed").Inc()
-				return &TransactionResponse{
-					Success:      false,
-					ErrorMessage: fmt.Sprintf("failed to execute DDL: %v", err),
-				}, nil
-			}
-			hasDDL = true
-			continue
-		}
-
-		// LOAD DATA path: apply via shared bulk-load executor.
-		if loadData := stmt.GetLoadDataChange(); loadData != nil {
-			if _, err := db.ApplyLoadDataInTx(tx, loadData.Sql, loadData.Data); err != nil {
-				telemetry.ReplicationRequestsTotal.With("replay", "failed").Inc()
-				return &TransactionResponse{
-					Success:      false,
-					ErrorMessage: fmt.Sprintf("failed to apply LOAD DATA: %v", err),
-				}, nil
-			}
-			continue
-		}
-
-		// No CDC data and no DDL - this shouldn't happen for replay
-		log.Warn().
-			Str("table", stmt.TableName).
-			Int32("type", int32(stmt.Type)).
-			Msg("handleReplay: statement has no CDC data or DDL")
-	}
-
-	// Commit the transaction
-	if err := db.MarkSQLiteTxnApplied(tx, req.TxnId, HLCToTimestamp(req.Timestamp)); err != nil {
-		telemetry.ReplicationRequestsTotal.With("replay", "failed").Inc()
-		return &TransactionResponse{
-			Success:      false,
-			ErrorMessage: fmt.Sprintf("failed to mark applied txn: %v", err),
-		}, nil
-	}
-	if err := tx.Commit(); err != nil {
-		telemetry.ReplicationRequestsTotal.With("replay", "failed").Inc()
-		return &TransactionResponse{
-			Success:      false,
-			ErrorMessage: fmt.Sprintf("failed to commit: %v", err),
-		}, nil
-	}
-	if hasDDL {
-		if err := dbInstance.ReloadSchema(); err != nil {
-			log.Warn().Err(err).Str("database", dbName).Msg("handleReplay: failed to reload schema after DDL")
-		}
-	}
-
-	// Store TransactionRecord in MetaStore so GetCommittedTxnCount/GetMaxTxnID return correct values.
-	// Without this, anti-entropy keeps thinking we're behind because these metrics read from PebbleDB.
-	seqNum, err := StoreAppliedChangeEvent(dbInstance.GetMetaStore(), req.TxnId, req.Timestamp, dbName, req.Statements)
-	if err != nil {
-		telemetry.ReplicationRequestsTotal.With("replay", "failed").Inc()
-		return &TransactionResponse{
-			Success:      false,
-			ErrorMessage: fmt.Sprintf("failed to store replay captured rows: %v", err),
-		}, nil
-	}
-	if err := rh.applyVectorCDCFromStatements(ctx, dbName, req.TxnId, seqNum, req.Statements); err != nil {
-		log.Error().
-			Err(err).
-			Str("database", dbName).
-			Uint64("txn_id", req.TxnId).
-			Uint64("seq_num", seqNum).
-			Msg("handleReplay: vector CDC failed after row commit; local vector index is dirty")
-	}
-
-	log.Debug().
-		Uint64("txn_id", req.TxnId).
-		Str("database", dbName).
-		Int("statements", len(req.Statements)).
-		Msg("handleReplay: transaction applied successfully")
-
-	telemetry.ReplicationRequestsTotal.With("replay", "success").Inc()
-	now := rh.clock.Now()
-	return &TransactionResponse{
-		Success: true,
-		AppliedAt: &HLC{
-			WallTime: now.WallTime,
-			Logical:  now.Logical,
-			NodeId:   rh.nodeID,
-		},
-	}, nil
-}
-
-func (rh *ReplicationHandler) applyVectorIndexChange(ctx context.Context, change common.VectorIndexChange) error {
-	vecMgr := rh.dbMgr.GetVectorIndexManager()
-	if vecMgr == nil {
-		return fmt.Errorf("vector index manager not configured")
-	}
-	applier, ok := vecMgr.(interface {
-		ApplyVectorControl(context.Context, common.VectorIndexChange) error
-	})
-	if !ok {
-		return fmt.Errorf("vector index manager cannot apply replicated control metadata")
-	}
-	return applier.ApplyVectorControl(ctx, change)
-}
-
-func (rh *ReplicationHandler) applyVectorCDCFromStatements(ctx context.Context, database string, txnID, seqNum uint64, statements []*Statement) error {
-	entries := make([]common.CDCEntry, 0, len(statements))
-	for _, stmt := range statements {
-		rowChange := stmt.GetRowChange()
-		if rowChange == nil || len(rowChange.EncodedRow) == 0 {
-			continue
-		}
-		row, err := decodeRowChange(stmt)
-		if err != nil {
-			return err
-		}
-		entries = append(entries, common.CDCEntry{
-			Table:        stmt.TableName,
-			IntentKey:    row.IntentKey,
-			Operation:    row.Op,
-			OldValues:    row.OldValues,
-			NewValues:    row.NewValues,
-			EncodedRow:   rowChange.EncodedRow,
-			EncodedCodec: rowChange.EncodedRowCodec,
-			CommitTxnID:  txnID,
-			CommitSeqNum: seqNum,
-		})
-	}
-	if len(entries) == 0 {
-		return nil
-	}
-	vecMgr := rh.dbMgr.GetVectorIndexManager()
-	if vecMgr == nil {
-		return nil
-	}
-	applier, ok := vecMgr.(interface {
-		ApplyCommittedVectorCDC(context.Context, string, uint64, uint64, []common.CDCEntry) error
-	})
-	if !ok {
-		return nil
-	}
-	if err := applier.ApplyCommittedVectorCDC(ctx, database, txnID, seqNum, entries); err != nil {
-		return fmt.Errorf("handleReplay: apply vector CDC: %w", err)
-	}
-	return nil
-}
-
-// replicationSchemaAdapter adapts DatabaseManager schema access to CDCSchemaProvider
-type replicationSchemaAdapter struct {
-	dbMgr  *db.DatabaseManager
-	dbName string
-}
-
-func (a *replicationSchemaAdapter) GetPrimaryKeys(tableName string) ([]string, error) {
-	dbInstance, err := a.dbMgr.GetDatabase(a.dbName)
-	if err != nil {
-		return nil, fmt.Errorf("database %s not found: %w", a.dbName, err)
-	}
-	schema, err := dbInstance.GetCachedTableSchema(tableName)
-	if err != nil {
-		return nil, fmt.Errorf("schema not found for table %s: %w", tableName, err)
-	}
-	return schema.PrimaryKeys, nil
 }
 
 // HandleRead handles incoming read requests with MVCC snapshot isolation

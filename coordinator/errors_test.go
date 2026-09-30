@@ -3,6 +3,10 @@ package coordinator
 import (
 	"errors"
 	"testing"
+
+	"github.com/mattn/go-sqlite3"
+	"github.com/maxpert/marmot/protocol"
+	"github.com/stretchr/testify/require"
 )
 
 func TestPrepareConflictError(t *testing.T) {
@@ -253,5 +257,49 @@ func TestPartialCommitError(t *testing.T) {
 				t.Errorf("PartialCommitError.Error() = %q, want %q", got, tt.expected)
 			}
 		})
+	}
+}
+
+// TestPartialCommitRefusedLocallyIsNotRetryable: a local commit the write
+// gate refused after the remote quorum committed is a partial commit, not a
+// rolled-back transaction. Telling the client to restart it (1213) would apply
+// its writes twice, so the refusal must not show through PartialCommitError.
+//
+// Mutation: give PartialCommitError an Unwrap returning LocalError. "a partial
+// commit was reported as retryable" fires.
+func TestPartialCommitRefusedLocallyIsNotRetryable(t *testing.T) {
+	refused := sqlite3.Error{Code: sqlite3.ErrConstraint, ExtendedCode: sqlite3.ErrConstraintCommitHook}
+	require.Equal(t, protocol.ErrCodeDeadlock, protocol.ConvertToMySQLError(refused).Code)
+	got := protocol.ConvertToMySQLError(&PartialCommitError{IsLocal: true, LocalError: refused})
+	require.NotEqual(t, protocol.ErrCodeDeadlock, got.Code, "a partial commit was reported as retryable")
+	require.NotEqual(t, protocol.SQLStateDeadlock, got.SQLState, "a partial commit was reported as retryable")
+}
+
+// TestPrepareRejectionErrorsCarryTheParticipantsCode pins the last hop of the
+// same plumbing: the coordinator turns a participant's refusal into an error
+// whose only typed content is its own struct, so unless that struct re-types
+// itself as the coded error the participant raised, every deterministic
+// refusal reaches the client as ER_UNKNOWN_ERROR (1105, HY000).
+//
+// Mutation: delete either Unwrap, or make it return the error unconditionally
+// instead of nil at code 0. The matching assertion below fires.
+func TestPrepareRejectionErrorsCarryTheParticipantsCode(t *testing.T) {
+	t.Parallel()
+
+	local := &LocalPrepareError{Reason: "existing max value 200 exceeds width ceiling 127", ErrorCode: 1264}
+	if got := protocol.ConvertToMySQLError(local); got.Code != 1264 {
+		t.Errorf("local rejection reached the client as %d, want 1264 (the participant's own code)", got.Code)
+	}
+
+	remote := &RemotePrepareRejectedError{NodeID: 2, Reason: "same refusal on a remote participant", ErrorCode: 1264}
+	if got := protocol.ConvertToMySQLError(remote); got.Code != 1264 {
+		t.Errorf("remote rejection reached the client as %d, want 1264", got.Code)
+	}
+
+	// A refusal that named no code must NOT be dressed up as one: the
+	// message-based classification stays in charge.
+	plain := &LocalPrepareError{Reason: "local prepare rejected the transaction"}
+	if got := protocol.ConvertToMySQLError(plain); got.Code == 1264 {
+		t.Error("a rejection with no code was given one")
 	}
 }

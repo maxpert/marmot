@@ -1,4 +1,4 @@
-# Marmot v2.9.16-beta Configuration
+# Marmot v2.10.0-beta Configuration
 # Leaderless SQLite Replication
 
 # ==============================================================================
@@ -53,9 +53,45 @@ grpc_port = 8080
 # Example: ["node1.example.com:8080", "node2.example.com:8080"]
 seed_nodes = []
 
+# Set to true only for a deliberate single-node deployment (seed_nodes empty).
+# A node that initialises a new system database holds its AUTO_INCREMENT claim
+# votes until it has merged claim bases from enough cluster members; only a
+# standalone node may release them while it is its own whole membership. A
+# first cluster node that others will join must leave this false. A
+# standalone node that has ever seen another cluster member no longer
+# releases alone (it logs why); validation refuses standalone together with
+# seed_nodes.
+standalone = false
+
+# How often a node whose AUTO_INCREMENT claim votes are held retries merging
+# claim bases from its peers: after enough peers are reachable, the node
+# declines claims for at most this long.
+autoinc_merge_interval_ms = 2000
+
+# How often every node raises its AUTO_INCREMENT claim bases to every alive
+# peer's: after a membership change, a claim committed under the old
+# membership stays unknown to a new quorum for at most this long.
+autoinc_base_sync_interval_ms = 10000
+
 # PSK for cluster authentication (or set MARMOT_CLUSTER_SECRET env var)
-# Leave empty to disable authentication
+# Leave empty to disable authentication. The AUTO_INCREMENT endpoints
+# (/admin/cluster/autoinc/release-votes and /admin/cluster/autoinc/sync) are
+# never served without it: on a cluster with no secret they answer 403.
 cluster_secret = ""
+
+# Membership changes and narrow AUTO_INCREMENT ids. Ids of AUTO_INCREMENT
+# columns narrower than BIGINT are unique for a stable membership. Every node
+# also raises its claim bases to the maximum every alive peer reports, every
+# 10 seconds, which closes the window a membership change opens. Change the
+# membership one node at a time:
+#   1. add or remove ONE node;
+#   2. wait until it is ALIVE and its claim votes are released (its log says
+#      "AUTO_INCREMENT claim votes released", or it was never held);
+#   3. POST /admin/cluster/autoinc/sync (with the cluster secret) on any node;
+#   4. make the next change only when the answer's "complete" is true: every
+#      member answered, is unheld and reached every member. A sync gathers
+#      only from the peers a node sees ALIVE, so right after a change it can
+#      be incomplete: re-run until the report is complete.
 
 # Gossip protocol interval (milliseconds)
 gossip_interval_ms = 1000

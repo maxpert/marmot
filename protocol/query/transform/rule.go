@@ -48,11 +48,30 @@ type SchemaInfo struct {
 	// Empty string if no auto-increment column exists.
 	// In SQLite, this is typically INTEGER PRIMARY KEY.
 	AutoIncrementColumn string
-}
 
-// HasPrimaryKey returns true if table has a PRIMARY KEY defined
-func (s *SchemaInfo) HasPrimaryKey() bool {
-	return s != nil && len(s.PrimaryKey) > 0
+	// AutoIncrementOrdinal is AutoIncrementColumn's position in the table's
+	// own column order, counting only columns a column-less
+	// "INSERT INTO t VALUES (...)" supplies a value for - that is, excluding
+	// GENERATED columns, which SQLite refuses to accept a value for. It is the
+	// index into such a statement's VALUES tuple that holds the id.
+	// -1 when AutoIncrementColumn is empty.
+	AutoIncrementOrdinal int
+
+	// AutoIncrementWidth is the MySQL width the auto-increment column was
+	// declared with: 8, 16, 24 or 32. Zero means no width marker, which is
+	// BIGINT and every table created before markers existed; those keep the
+	// 64-bit id path.
+	AutoIncrementWidth int
+	// AutoIncrementUnsigned mirrors the MySQL UNSIGNED modifier on that column.
+	// Meaningless when AutoIncrementWidth is zero.
+	AutoIncrementUnsigned bool
+	// AutoIncrementExplicit reports that the column was declared
+	// AUTO_INCREMENT, as opposed to being a narrow INTEGER PRIMARY KEY that
+	// SQLite treats as a rowid alias. Meaningless when AutoIncrementWidth is
+	// zero.
+	AutoIncrementExplicit bool
+	// Database is the database the table was resolved in.
+	Database string
 }
 
 // HasAutoIncrement returns true if table has an auto-increment column

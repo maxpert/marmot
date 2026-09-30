@@ -773,37 +773,14 @@ func (s *StreamClient) applySnapshot(ctx context.Context, snapshotInfo *marmotgr
 		return fmt.Errorf("snapshot restore failed: %w", err)
 	}
 
-	// Restore the schema versions the snapshot was taken at, otherwise this node
-	// reports version 0 and refuses every transaction requiring a newer schema.
-	// Prefer the versions captured atomically with these exact files (the
-	// stream trailer) over the earlier, potentially stale read from
-	// GetSnapshotInfo.
-	versions := marmotgrpc.SnapshotVersionsForRestore(snapshotInfo.DatabaseMetadata, stream)
-	if err := s.restoreSchemaVersions(versions); err != nil {
-		return fmt.Errorf("failed to restore schema versions from snapshot: %w", err)
-	}
+	// Each installed SQLite file carries its own __marmot_schema_version
+	// table, so nothing needs to be restored out of band here any more.
 
 	log.Info().
 		Uint64("snapshot_txn_id", snapshotInfo.SnapshotTxnId).
 		Msg("Snapshot applied successfully via unified restorer")
 
 	return nil
-}
-
-// restoreSchemaVersions records snapshot schema versions through the live system
-// MetaStore. The replica keeps its own system database, so the versions are
-// written to the already-open store rather than by reopening it on disk.
-func (s *StreamClient) restoreSchemaVersions(versions map[string]uint64) error {
-	if len(versions) == 0 {
-		return nil
-	}
-
-	systemDB, err := s.dbManager.GetDatabase(db.SystemDatabaseName)
-	if err != nil {
-		return fmt.Errorf("system database unavailable: %w", err)
-	}
-
-	return db.RestoreSchemaVersions(systemDB.GetMetaStore(), versions)
 }
 
 // replicaSnapshotStreamAdapter adapts MarmotService_StreamSnapshotClient to snapshot.ChunkReceiver
@@ -824,6 +801,8 @@ func (a *replicaSnapshotStreamAdapter) Recv() (*snapshot.Chunk, error) {
 		Data:          chunk.GetData(),
 		MD5Checksum:   chunk.GetChecksum(),
 		IsLastForFile: chunk.GetIsLastForFile(),
+		FileSHA256:    chunk.GetFileSha256(),
+		FileSizeBytes: chunk.GetFileSizeBytes(),
 	}, nil
 }
 
@@ -878,7 +857,7 @@ func (s *StreamClient) applyChangeEvent(ctx context.Context, event *marmotgrpc.C
 			if err := s.applyVectorIndexChange(ctx, marmotgrpc.VectorChangeFromProto(change)); err != nil {
 				return err
 			}
-			_, err := marmotgrpc.StoreAppliedChangeEvent(mdb.GetMetaStore(), event.TxnId, event.Timestamp, database, event.Statements)
+			_, err := marmotgrpc.StoreAppliedChangeEvent(mdb, event.TxnId, event.Timestamp, event.Statements, event.OriginNodeId, event.RequiredSchemaVersion)
 			return err
 		}
 	}
@@ -914,7 +893,7 @@ func (s *StreamClient) applyChangeEvent(ctx context.Context, event *marmotgrpc.C
 			log.Warn().Err(err).Str("database", database).Msg("Failed to reload schema after DDL")
 		}
 	}
-	seqNum, err := marmotgrpc.StoreAppliedChangeEvent(mdb.GetMetaStore(), event.TxnId, event.Timestamp, database, event.Statements)
+	seqNum, err := marmotgrpc.StoreAppliedChangeEvent(mdb, event.TxnId, event.Timestamp, event.Statements, event.OriginNodeId, event.RequiredSchemaVersion)
 	if err != nil {
 		return fmt.Errorf("failed to store streamed rows: %w", err)
 	}
@@ -1071,7 +1050,9 @@ func (s *StreamClient) applyStatement(ctx context.Context, tx *sql.Tx, mdb *db.R
 }
 
 // applyCDCStatement applies a CDC statement using unified CDC applier.
-// Uses cached schema from mdb - does NOT query SQLite PRAGMA.
+// Uses cached schema from mdb - does NOT query SQLite PRAGMA. It applies
+// rows unversioned, in the order its one source streams them; a replica
+// that switches to another source applies that source's order.
 func (s *StreamClient) applyCDCStatement(tx *sql.Tx, mdb *db.ReplicatedDatabase, stmt *marmotgrpc.Statement) error {
 	rowChange := stmt.GetRowChange()
 	if rowChange == nil {

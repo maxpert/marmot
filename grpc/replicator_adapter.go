@@ -33,12 +33,28 @@ func (gr *GRPCReplicator) CleanupStagedPayload(txnID uint64) {
 
 // ReplicateTransaction implements coordinator.Replicator
 func (gr *GRPCReplicator) ReplicateTransaction(ctx context.Context, nodeID uint64, req *coordinator.ReplicationRequest) (*coordinator.ReplicationResponse, error) {
+	grpcReq, err := transactionRequestToProto(req)
+	if err != nil {
+		return nil, err
+	}
+
+	// Call gRPC client
+	grpcResp, err := gr.client.ReplicateTransaction(ctx, nodeID, grpcReq)
+	if err != nil {
+		return nil, fmt.Errorf("gRPC call failed: %w", err)
+	}
+
+	return convertTransactionResponse(grpcResp), nil
+}
+
+// transactionRequestToProto converts a coordinator.ReplicationRequest into
+// the gRPC TransactionRequest a participant's ReplicationHandler receives.
+func transactionRequestToProto(req *coordinator.ReplicationRequest) (*TransactionRequest, error) {
 	statements, err := convertStatementsToProto(req.Statements, req.Database, req.TxnID)
 	if err != nil {
 		return nil, err
 	}
-	// Convert coordinator.ReplicationRequest to gRPC TransactionRequest
-	grpcReq := &TransactionRequest{
+	protoReq := &TransactionRequest{
 		TxnId:        req.TxnID,
 		SourceNodeId: req.NodeID,
 		Statements:   statements,
@@ -51,23 +67,28 @@ func (gr *GRPCReplicator) ReplicateTransaction(ctx context.Context, nodeID uint6
 		Database:              req.Database,
 		RequiredSchemaVersion: req.RequiredSchemaVersion,
 	}
-
-	// Call gRPC client
-	grpcResp, err := gr.client.ReplicateTransaction(ctx, nodeID, grpcReq)
-	if err != nil {
-		return nil, fmt.Errorf("gRPC call failed: %w", err)
+	if !req.CommitTS.IsZero() {
+		protoReq.CommitTimestamp = convertTimestampToHLC(req.CommitTS)
 	}
+	return protoReq, nil
+}
 
-	// Convert gRPC TransactionResponse to coordinator.ReplicationResponse
-	resp := &coordinator.ReplicationResponse{
-		Success:          grpcResp.Success,
-		Error:            grpcResp.ErrorMessage,
-		ConflictDetected: grpcResp.ConflictDetected,
-		ConflictDetails:  grpcResp.ConflictDetails,
-		Rejected:         grpcResp.Rejected,
+// convertTransactionResponse converts a gRPC TransactionResponse into
+// coordinator.ReplicationResponse. Shared by the regular and streaming RPC
+// paths so both carry every field, including AutoIDStoredBase - the
+// participant's own committed base on a rejected AUTO_INCREMENT range claim,
+// which the claimant needs to retry above rather than spin.
+func convertTransactionResponse(resp *TransactionResponse) *coordinator.ReplicationResponse {
+	return &coordinator.ReplicationResponse{
+		Success:          resp.Success,
+		Error:            resp.ErrorMessage,
+		AppliedAt:        HLCToTimestamp(resp.AppliedAt),
+		ConflictDetected: resp.ConflictDetected,
+		ConflictDetails:  resp.ConflictDetails,
+		Rejected:         resp.Rejected,
+		AutoIDStoredBase: resp.AutoIdStoredBase,
+		ErrorCode:        uint16(resp.GetErrorCode()),
 	}
-
-	return resp, nil
 }
 
 // convertStatementsToProto converts protocol.Statement to gRPC Statement with CDC
@@ -94,8 +115,10 @@ func convertStatementsToProto(stmts []protocol.Statement, database string, txnID
 			Database:  stmtDB,
 		}
 
-		// For DML operations: send CDC row data
-		// For DDL operations: send SQL
+		protoStmt.AutoIdClaim = stmt.AutoIDClaim
+		protoStmt.AutoIdClaimPayload = stmt.AutoIDClaimPayload
+		protoStmt.DatabaseGeneration = stmt.DatabaseGeneration
+
 		isDML := stmt.Type == protocol.StatementInsert ||
 			stmt.Type == protocol.StatementUpdate ||
 			stmt.Type == protocol.StatementDelete ||
@@ -106,6 +129,8 @@ func convertStatementsToProto(stmts []protocol.Statement, database string, txnID
 			stmt.VectorIndexChange = &change
 		}
 
+		// For DML operations: send CDC row data
+		// For DDL operations: send SQL
 		switch {
 		case stmt.VectorIndexChange != nil:
 			protoStmt.Payload = &Statement_VectorIndexChange{
@@ -224,18 +249,14 @@ func (gr *GRPCReplicator) StreamReplicateTransaction(ctx context.Context, nodeID
 
 	// Call streaming client with configured chunk size
 	chunkSize := coordinator.GetStreamChunkSize()
-	grpcResp, err := gr.client.TransactionStream(ctx, nodeID, req.TxnID, req.Database, statements, chunkSize, timestamp, req.NodeID)
+	var commitTimestamp *HLC
+	if !req.CommitTS.IsZero() {
+		commitTimestamp = convertTimestampToHLC(req.CommitTS)
+	}
+	grpcResp, err := gr.client.TransactionStream(ctx, nodeID, req.TxnID, req.Database, statements, chunkSize, timestamp, commitTimestamp, req.NodeID)
 	if err != nil {
 		return nil, fmt.Errorf("streaming gRPC call failed: %w", err)
 	}
 
-	// Convert gRPC TransactionResponse to coordinator.ReplicationResponse
-	resp := &coordinator.ReplicationResponse{
-		Success:          grpcResp.Success,
-		Error:            grpcResp.ErrorMessage,
-		ConflictDetected: grpcResp.ConflictDetected,
-		ConflictDetails:  grpcResp.ConflictDetails,
-	}
-
-	return resp, nil
+	return convertTransactionResponse(grpcResp), nil
 }

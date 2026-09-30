@@ -178,6 +178,96 @@ curl -X POST -H "X-Marmot-Secret: $SECRET" http://node1:8080/admin/cluster/remov
 # 5-node cluster → 3-node cluster, quorum: 3 → 2
 ```
 
+**Restarting a Node:** a node stopped with SIGTERM announces that it is leaving, and its peers keep that record.
+Started again, it supersedes the record and rejoins as ALIVE; no admin call is needed. This relies on the
+membership record in its data directory: a node restarted on a wiped data directory after a graceful stop
+still takes its old departure as a decommission and shuts down again. Handle it like a replaced node (see
+Replacing a Failed Node): remove it, and allow it before reusing its `node_id`, or bring it back with a new one.
+
+A node decommissioned through `/admin/cluster/decommission` while ALIVE also rejoins if it is started again
+(for example by a service manager that restarts it). `/admin/cluster/remove` (REMOVED) is the permanent exclusion.
+
+### Membership Changes and Narrow AUTO_INCREMENT Ids
+
+Ids of `AUTO_INCREMENT` columns narrower than `BIGINT` come from ranges each node claims through a quorum (see
+Narrow AUTO_INCREMENT Columns in [Compatibility](/compatibility)). They are unique while the membership is stable.
+Every node also raises its claim bases to the highest base every ALIVE peer reports, every
+`cluster.autoinc_base_sync_interval_ms` (10 seconds by default), which closes
+the window a membership change opens. To add or remove nodes, change the membership one node at a time:
+
+1. Add or remove **one** node.
+2. Wait until it is ALIVE and its claim votes are released: its log says `AUTO_INCREMENT claim votes released after merging claim bases`,
+   or it never held them.
+3. Run the sync on any node:
+   ```bash
+   curl -X POST -H "X-Marmot-Secret: $SECRET" http://node1:8080/admin/cluster/autoinc/sync
+   ```
+4. Make the next change only when the answer's `complete` is `true`: every member answered, is not holding its
+   votes, and reached every member. A sync gathers only from the peers a node sees ALIVE, so right after a change
+   it can be incomplete; re-run it until it is complete.
+
+**Rebuilding nodes that lost their data directory:** rebuild them one at a time, the same way. A rebuilt
+node holds its claim votes until it has merged claim bases from enough members, which is safe only while at most
+one member has lost its claim state. Start one rebuilt node, wait until it is ALIVE, its claim votes are released
+(`GET /admin/cluster/autoinc/votes` answers `votes_held: false`) and the sync above reports `complete`, and only then
+touch the next one. If a majority lost its data at once, the rebuilt nodes can count each other as the whole
+cluster and reissue ids until the periodic base sync raises their bases; such an id is refused with 1062, never
+stored twice, but inserts through those nodes fail until the sync has run.
+
+The sync endpoint requires `cluster_secret`; on a cluster without one it answers 403.
+
+## Rolling Upgrades
+
+This release replaces how nodes catch up with each other: every node now
+pulls the commit log of every peer, and it keeps a per-database schema version
+inside each database file. Releases before it count a database's DDL history
+differently (their counter also counts CREATE DATABASE and DROP DATABASE), so
+the same history yields a different schema version on the two kinds of node.
+Because of this, DDL and CREATE/DROP DATABASE are **refused cluster-wide** —
+with a retryable error (MySQL 1213) naming the node ids still to upgrade — for
+as long as any cluster member runs an earlier release. Ordinary DML keeps
+replicating normally throughout.
+
+**Procedure:**
+
+1. Upgrade every node in the cluster, one at a time, letting each rejoin as
+   ALIVE before moving to the next.
+2. Once every node runs this release, DDL and CREATE/DROP DATABASE are
+   accepted again.
+3. Do not run DDL or CREATE/DROP DATABASE while the upgrade is in progress —
+   it will be refused, not queued.
+
+A database dropped on some nodes but not others before the upgrade started
+(a node that missed a DROP DATABASE while it was down) is a divergence that
+database-set reconciliation does not repair after the upgrade either; resolve
+it before or after the upgrade like any other registry mismatch between nodes.
+
+**Snapshot restores during the upgrade.** A snapshot taken on a node that has
+not been upgraded yet carries no schema version in its database file, so a
+node restoring from it takes the version it recorded for that database before
+its own upgrade. This is another reason DDL waits until every node is
+upgraded: until then, every node's recorded version comes from the same DDL
+history and they agree.
+
+## Log Retention and Membership
+
+Each node keeps its own commit log so peers can pull what they missed. An
+entry is deleted by GC once it is older than `gc_min_retention_hours` **and**
+every current cluster member has pulled past it, or unconditionally once it is
+older than `gc_max_retention_hours`.
+
+"Every current member" includes members that are down (SUSPECT or DEAD), not
+only the ones that are reachable:
+
+- While a member is down, GC keeps every entry it has not pulled yet, up to
+  `gc_max_retention_hours`. Plan disk space for that much log on every node.
+- A member down longer than `gc_max_retention_hours` finds that its peers'
+  logs no longer cover the point it stopped at. When it returns, anti-entropy
+  restores the affected databases from a peer's snapshot automatically, then
+  resumes pulling logs.
+- A node removed through `/admin/cluster/remove` stops counting at once: its
+  pull positions are dropped, and it no longer holds back GC on any node.
+
 ## Prometheus Metrics
 
 ```toml

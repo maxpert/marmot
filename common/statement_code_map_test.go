@@ -86,6 +86,7 @@ func TestFromWireType(t *testing.T) {
 		{"DROP_DATABASE", pb.StatementType_DROP_DATABASE, StatementDropDatabase, true},
 		{"LOAD_DATA", pb.StatementType_LOAD_DATA, StatementLoadData, true},
 		{"VECTOR_INDEX", pb.StatementType_VECTOR_INDEX, StatementVectorIndexControl, true},
+		{"UNKNOWN_WIRE_TYPE", pb.StatementType(999), StatementCode(0), false},
 	}
 
 	for _, tt := range tests {
@@ -103,12 +104,6 @@ func TestMustToWireTypePanicsOnUnknown(t *testing.T) {
 	assert.Panics(t, func() {
 		MustToWireType(StatementSelect) // SELECT has no wire representation
 	}, "MustToWireType should panic on code without wire representation")
-}
-
-func TestMustFromWireTypePanicsOnUnknown(t *testing.T) {
-	assert.Panics(t, func() {
-		MustFromWireType(pb.StatementType(999))
-	}, "MustFromWireType should panic on unknown wire type")
 }
 
 func TestMustToWireType(t *testing.T) {
@@ -131,31 +126,6 @@ func TestMustToWireType(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := MustToWireType(tt.code)
-			assert.Equal(t, tt.want, got)
-		})
-	}
-}
-
-func TestMustFromWireType(t *testing.T) {
-	tests := []struct {
-		name string
-		wire pb.StatementType
-		want StatementCode
-	}{
-		{"INSERT", pb.StatementType_INSERT, StatementInsert},
-		{"UPDATE", pb.StatementType_UPDATE, StatementUpdate},
-		{"DELETE", pb.StatementType_DELETE, StatementDelete},
-		{"REPLACE", pb.StatementType_REPLACE, StatementReplace},
-		{"DDL", pb.StatementType_DDL, StatementDDL},
-		{"CREATE_DATABASE", pb.StatementType_CREATE_DATABASE, StatementCreateDatabase},
-		{"DROP_DATABASE", pb.StatementType_DROP_DATABASE, StatementDropDatabase},
-		{"LOAD_DATA", pb.StatementType_LOAD_DATA, StatementLoadData},
-		{"VECTOR_INDEX", pb.StatementType_VECTOR_INDEX, StatementVectorIndexControl},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := MustFromWireType(tt.wire)
 			assert.Equal(t, tt.want, got)
 		})
 	}

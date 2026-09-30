@@ -173,6 +173,7 @@ func TestTransactionStream_BasicFlow(t *testing.T) {
 						Logical:  0,
 						NodeId:   2,
 					},
+					CommitTimestamp: &HLC{WallTime: startTS.WallTime + 2000, Logical: 5, NodeId: 2},
 				},
 			},
 		},
@@ -200,6 +201,13 @@ func TestTransactionStream_BasicFlow(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "Alice", name)
 	assert.Equal(t, "alice@example.com", email)
+
+	// The participant committed with the coordinator's decided timestamp.
+	rec, err := dbInstance.GetMetaStore().GetTransaction(txnID)
+	require.NoError(t, err)
+	require.NotNil(t, rec)
+	assert.Equal(t, startTS.WallTime+2000, rec.CommitTSWall)
+	assert.Equal(t, int32(5), rec.CommitTSLogical)
 }
 
 func TestTransactionStream_CommitNotFound(t *testing.T) {

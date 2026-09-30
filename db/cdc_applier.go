@@ -33,13 +33,6 @@ func quoteSQLiteIdentList(columns []string) []string {
 	return quoted
 }
 
-func ApplyCDCEntry(exec CDCExecutor, schema CDCSchemaProvider, entry *IntentEntry) error {
-	if entry == nil {
-		return nil
-	}
-	return ApplyCDCValues(exec, schema, OpType(entry.Operation), entry.Table, entry.OldValues, entry.NewValues)
-}
-
 func ApplyCDCValues(exec CDCExecutor, schema CDCSchemaProvider, opType OpType, tableName string, oldValues, newValues map[string][]byte) error {
 	switch opType {
 	case OpTypeInsert, OpTypeReplace:
@@ -101,14 +94,27 @@ func ApplyCDCInsert(exec CDCExecutor, tableName string, newValues map[string][]b
 func ApplyCDCUpdate(exec CDCExecutor, schema CDCSchemaProvider, tableName string,
 	oldValues, newValues map[string][]byte) error {
 
+	result, err := execCDCUpdate(exec, schema, "UPDATE", tableName, oldValues, newValues)
+	if err != nil {
+		return err
+	}
+	logZeroRowsAffected(result, "ApplyCDCUpdate", tableName)
+	return nil
+}
+
+// execCDCUpdate runs ApplyCDCUpdate's UPDATE, as verb ("UPDATE" or
+// "UPDATE OR REPLACE"), and returns its result.
+func execCDCUpdate(exec CDCExecutor, schema CDCSchemaProvider, verb, tableName string,
+	oldValues, newValues map[string][]byte) (sql.Result, error) {
+
 	if len(newValues) == 0 {
-		return fmt.Errorf("ApplyCDCUpdate %s: no values to update", tableName)
+		return nil, fmt.Errorf("ApplyCDCUpdate %s: no values to update", tableName)
 	}
 
 	// Get primary key columns from schema
 	primaryKeys, err := schema.GetPrimaryKeys(tableName)
 	if err != nil {
-		return fmt.Errorf("ApplyCDCUpdate %s: failed to get primary keys: %w", tableName, err)
+		return nil, fmt.Errorf("ApplyCDCUpdate %s: failed to get primary keys: %w", tableName, err)
 	}
 
 	// Build SET clause from newValues (sorted for determinism)
@@ -125,7 +131,7 @@ func ApplyCDCUpdate(exec CDCExecutor, schema CDCSchemaProvider, tableName string
 		setClauses[i] = fmt.Sprintf("%s = ?", quoteSQLiteIdent(col))
 		value, err := unmarshalCDCValue(newValues[col])
 		if err != nil {
-			return fmt.Errorf("ApplyCDCUpdate %s: failed to deserialize column %s: %w", tableName, col, err)
+			return nil, fmt.Errorf("ApplyCDCUpdate %s: failed to deserialize column %s: %w", tableName, col, err)
 		}
 		values = append(values, value)
 	}
@@ -140,29 +146,29 @@ func ApplyCDCUpdate(exec CDCExecutor, schema CDCSchemaProvider, tableName string
 			// Fallback to newValues if oldValues doesn't have PK
 			pkBytes, ok = newValues[pkCol]
 			if !ok {
-				return fmt.Errorf("ApplyCDCUpdate %s: primary key column %s not found in CDC data", tableName, pkCol)
+				return nil, fmt.Errorf("ApplyCDCUpdate %s: primary key column %s not found in CDC data", tableName, pkCol)
 			}
 		}
 
 		clause, nextValues, err := cdcPrimaryKeyPredicate("ApplyCDCUpdate", tableName, pkCol, pkBytes, values)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		whereClauses[i] = clause
 		values = nextValues
 	}
 
-	sqlStmt := fmt.Sprintf("UPDATE %s SET %s WHERE %s",
+	sqlStmt := fmt.Sprintf("%s %s SET %s WHERE %s",
+		verb,
 		quoteSQLiteIdent(tableName),
 		strings.Join(setClauses, ", "),
 		strings.Join(whereClauses, " AND "))
 
 	result, err := exec.Exec(sqlStmt, values...)
 	if err != nil {
-		return fmt.Errorf("ApplyCDCUpdate %s: %w", tableName, err)
+		return nil, fmt.Errorf("ApplyCDCUpdate %s: %w", tableName, err)
 	}
-	logZeroRowsAffected(result, "ApplyCDCUpdate", tableName)
-	return nil
+	return result, nil
 }
 
 // ApplyCDCDelete performs DELETE using CDC row data.

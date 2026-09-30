@@ -119,7 +119,7 @@ func main() {
 
 	// Branch based on operating mode
 	if cfg.IsReplicaMode() {
-		log.Info().Msg("Marmot v2.9.16-beta - Read-Only Replica Mode")
+		log.Info().Msg("Marmot v2.10.0-beta - Read-Only Replica Mode")
 		log.Info().
 			Strs("follow_addresses", cfg.Config.Replica.FollowAddresses).
 			Msg("Following cluster nodes")
@@ -135,7 +135,7 @@ func main() {
 	}
 
 	// Cluster mode
-	log.Info().Msg("Marmot v2.9.16-beta - Leaderless SQLite Replication")
+	log.Info().Msg("Marmot v2.10.0-beta - Leaderless SQLite Replication")
 
 	// Warn if cluster authentication is not configured
 	if !cfg.IsClusterAuthEnabled() {
@@ -230,7 +230,6 @@ func main() {
 
 			case marmotgrpc.DELTA_SYNC:
 				log.Info().
-					Int("databases_behind", len(decision.DatabaseDeltas)).
 					Str("peer", decision.PeerAddr).
 					Msg("Delta sync required - will catch up after database initialization")
 				// Delta sync will be performed after database manager is initialized
@@ -239,6 +238,9 @@ func main() {
 		}
 	}
 
+	// A node whose system database this process initialises holds its
+	// AUTO_INCREMENT claim votes until it has merged claim bases from its
+	// peers (db.AutoIncHoldTable), whatever the catch-up decision was.
 	dbMgr, err := db.NewDatabaseManager(cfg.Config.DataDir, cfg.Config.NodeID, clock)
 	if err != nil {
 		log.Fatal().Err(err).Msg("Failed to initialize Database Manager")
@@ -323,14 +325,14 @@ func main() {
 		}
 	}
 
-	// Phase 5: Initialize schema version manager using system database's MetaStore
+	// Phase 5: Initialize schema version manager, reading each database's own
+	// __marmot_schema_version table.
 	log.Info().Msg("Initializing schema version manager")
-	systemDB, err := dbMgr.GetDatabase(db.SystemDatabaseName)
-	if err != nil {
+	if _, err := dbMgr.GetDatabase(db.SystemDatabaseName); err != nil {
 		log.Fatal().Err(err).Msg("Failed to get system database for schema versioning")
 		return
 	}
-	schemaVersionMgr := db.NewSchemaVersionManager(systemDB.GetMetaStore())
+	schemaVersionMgr := db.NewSchemaVersionManager(dbMgr)
 
 	// Wire up replication handlers
 	log.Info().Msg("Wiring up replication handlers")
@@ -350,51 +352,32 @@ func main() {
 
 	// Phase 6: Setup anti-entropy service for catching up lagging nodes
 	log.Info().Msg("Setting up anti-entropy service")
-	deltaSync := marmotgrpc.NewDeltaSyncClient(marmotgrpc.DeltaSyncConfig{
-		NodeID:           cfg.Config.NodeID,
-		Client:           client,
-		DBManager:        dbMgr,
-		Clock:            clock,
-		ApplyTxnsFn:      replicationHandler.HandleReplicateTransaction,
-		SchemaVersionMgr: schemaVersionMgr,
+	logPuller := marmotgrpc.NewLogPuller(marmotgrpc.LogPullerConfig{
+		NodeID:    cfg.Config.NodeID,
+		Client:    client,
+		DBManager: dbMgr,
 	})
 
-	// If we determined we need delta sync, perform it now that database manager is initialized
+	// If we determined we need targeted catch-up, perform it now that the
+	// database manager is initialized: one bounded LogPuller pass per
+	// database behind, over the seed peer.
 	if isJoiningCluster && catchUpDecision != nil && catchUpDecision.Strategy == marmotgrpc.DELTA_SYNC {
-		log.Info().Msg("Performing delta sync now that database manager is initialized")
+		log.Info().Msg("Performing startup log pull now that database manager is initialized")
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-		err := catchUpClient.PerformDeltaSync(ctx, catchUpDecision, deltaSync)
+		err := catchUpClient.PerformLogPull(ctx, catchUpDecision, logPuller, client)
 		cancel()
 		if err != nil {
-			log.Fatal().Err(err).Msg("Failed to perform delta sync")
+			log.Fatal().Err(err).Msg("Failed to perform startup log pull")
 			return
 		}
-		log.Info().Msg("Delta sync completed successfully")
+		log.Info().Msg("Startup log pull completed successfully")
 	}
 
-	// Create snapshot function for anti-entropy
+	// Create snapshot function for anti-entropy. CatchUpFromPeer keeps the
+	// database detached from before the peer's snapshot until its file is
+	// replaced, and reattaches it on every path.
 	snapshotFunc := func(ctx context.Context, peerNodeID uint64, peerAddr string, database string) error {
-		// Download snapshot to disk
-		catchUpErr := catchUpClient.CatchUpFromPeer(ctx, peerNodeID, peerAddr, database)
-
-		// The download can fail after the snapshot's files were already swapped
-		// onto disk (e.g. restoring schema versions failed post-swap). Reopen
-		// unconditionally whenever that happened, or the node keeps serving the
-		// old connection against freshly-swapped files - even though the
-		// overall catch-up is reported as failed and gets retried.
-		if !marmotgrpc.FilesSwappedDespiteError(catchUpErr) {
-			return catchUpErr
-		}
-
-		// Reload the database connection to pick up the new snapshot file
-		// This is critical: the old connection still points to the old data
-		if err := dbMgr.ReopenDatabase(database); err != nil {
-			log.Error().Err(err).Str("database", database).Msg("Failed to reload database after snapshot")
-			return fmt.Errorf("database reload failed after snapshot: %w", err)
-		}
-
-		log.Info().Str("database", database).Msg("Database reloaded after snapshot download")
-		return catchUpErr
+		return catchUpClient.CatchUpFromPeer(ctx, peerNodeID, peerAddr, database)
 	}
 
 	antiEntropy := marmotgrpc.NewAntiEntropyServiceFromConfig(
@@ -402,24 +385,62 @@ func main() {
 		grpcServer.GetNodeRegistry(),
 		client,
 		dbMgr,
-		deltaSync,
-		clock,
+		logPuller,
 		snapshotFunc,
-		schemaVersionMgr,
 	)
+	adminHandlers.SetAntiEntropy(antiEntropy)
+	grpcServer.SetAntiEntropy(antiEntropy)
 
-	// Wire anti-entropy refresh to DatabaseManager for GC watermark freshness
-	// This ensures GC queries fresh peer states before making deletion decisions
-	dbMgr.SetRefreshReplicationStatesFunc(antiEntropy.RefreshPeerReplicationStates)
+	// Wire GC's safe deletion position to this node's current cluster
+	// membership: every registry node
+	// whose status is not REMOVED, self included (LEAVING/DEAD/SUSPECT are
+	// still members, same as anti-entropy's own view -
+	// AntiEntropyService.currentMembers - unlike NodeRegistry.MemberIDs,
+	// which also excludes LEAVING for quorum purposes). wireGCCoordination
+	// (db/database_manager.go) turns this into each database's min consumed
+	// position across every other current member.
+	registry := grpcServer.GetNodeRegistry()
+	dbMgr.SetGCMembershipFunc(func() []uint64 {
+		nodes := registry.GetAll()
+		ids := make([]uint64, 0, len(nodes))
+		for _, n := range nodes {
+			if n.Status != marmotgrpc.NodeStatus_REMOVED {
+				ids = append(ids, n.NodeId)
+			}
+		}
+		return ids
+	})
+
+	// The tombstone horizon counts every member this node has known
+	// (NodeRegistry.KnownMemberCount).
+	seeded := len(cfg.Config.Cluster.SeedNodes) > 0
+	dbMgr.SetTombstoneMemberCountFunc(func() int { return registry.KnownMemberCount(seeded) })
 
 	// Start anti-entropy service
 	antiEntropy.Start()
 
 	log.Info().Msg("Anti-entropy service initialized")
 
+	// A node whose AUTO_INCREMENT claim votes are held (a joiner, or one whose
+	// system database came from a peer) votes again only after merging claim
+	// bases from enough members. From then on - at once on any other node -
+	// it raises its bases to every alive peer's, every interval, so a
+	// membership change leaves a claim unknown to a new quorum for at most one
+	// interval.
+	autoIncMergeCtx, autoIncMergeCancel := context.WithCancel(context.Background())
+	defer autoIncMergeCancel()
+	go marmotgrpc.RunAutoIncBaseMerge(autoIncMergeCtx, cfg.Config.NodeID, dbMgr, grpcServer.GetNodeRegistry(), client, marmotgrpc.AutoIncMergeConfig{
+		Standalone:       cfg.Config.Cluster.Standalone,
+		MergeInterval:    cfg.Config.Cluster.GetAutoIncMergeInterval(),
+		BaseSyncInterval: cfg.Config.Cluster.GetAutoIncBaseSyncInterval(),
+	})
+
 	// Phase 7: Setup transaction coordinators for full database replication
 	log.Info().Msg("Setting up transaction coordinators")
-	nodeProvider := marmotgrpc.NewGossipNodeProvider(gossip.GetNodeRegistry())
+	nodeProvider := marmotgrpc.NewGossipNodeProvider(gossip.GetNodeRegistry(), len(cfg.Config.Cluster.SeedNodes) > 0)
+	// An AUTO_INCREMENT claim participant counts the cluster exactly as a
+	// claimant's quorum does.
+	dbMgr.SetClusterMembership(nodeProvider.GetTotalMembershipSize)
 	replicator := marmotgrpc.NewGRPCReplicator(client)
 
 	writeTimeout := time.Duration(cfg.Config.Replication.WriteTimeoutMS) * time.Millisecond
@@ -436,6 +457,11 @@ func main() {
 		writeTimeout,
 		clock,
 	)
+	// AUTO_INCREMENT claims carry this node's schema version, so a voter
+	// that lags a DDL declines them as it declines DML.
+	writeCoordinator.SetSchemaVersionSource(schemaVersionMgr.GetSchemaVersion)
+	// A claim this node declines for its held votes waits for their release.
+	writeCoordinator.SetVoteHold(dbMgr)
 
 	// Initialize LocalReader for ReadCoordinator
 	localReader := db.NewLocalReader(dbMgr)
@@ -471,6 +497,7 @@ func main() {
 		registryAdapter,
 	)
 	handler.SetVectorEngine(vecEngine)
+	dbMgr.SetAutoIncIncarnationListener(handler)
 
 	// Initialize write forwarding for read-only replicas
 	forwardSessionMgr := marmotgrpc.NewForwardSessionManager(60 * time.Second)
@@ -547,7 +574,7 @@ func main() {
 		log.Info().Msg("Seed node fully initialized - now ALIVE")
 	}
 
-	log.Info().Msg("Marmot v2.9.16-beta started successfully")
+	log.Info().Msg("Marmot v2.10.0-beta started successfully")
 	log.Info().
 		Uint64("node_id", cfg.Config.NodeID).
 		Int("grpc_port", cfg.Config.Cluster.GRPCPort).
@@ -609,6 +636,7 @@ func initializeGRPCServer() (*marmotgrpc.Server, error) {
 		Address:          cfg.Config.Cluster.GRPCBindAddress,
 		Port:             cfg.Config.Cluster.GRPCPort,
 		AdvertiseAddress: cfg.Config.Cluster.GRPCAdvertiseAddress,
+		DataDir:          cfg.Config.DataDir,
 	}
 
 	server, err := marmotgrpc.NewServer(config)

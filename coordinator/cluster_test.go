@@ -2,6 +2,7 @@ package coordinator
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/maxpert/marmot/protocol"
@@ -452,6 +453,8 @@ func TestGetClusterState_SingleNode(t *testing.T) {
 }
 
 // errorNodeProvider is a mock NodeProvider that returns errors
+func (e *errorNodeProvider) HasSeedNodes() bool { return false }
+
 type errorNodeProvider struct {
 	err error
 }
@@ -466,4 +469,97 @@ func (e *errorNodeProvider) GetClusterSize() int {
 
 func (e *errorNodeProvider) GetTotalMembershipSize() int {
 	return 0
+}
+
+// TestGetClusterStateRefusesQuorumOfOne pins the belt that stops a node which
+// was configured to join a cluster from acting as a quorum of one.
+//
+// A node with seed nodes whose membership is itself alone has not learned the
+// cluster yet: it restarted before gossip converged, or booted with its seeds
+// unreachable. Quorum of one is one, so it would commit alone and diverge from
+// peers that are up. A node with no seeds is a legitimate single-node
+// deployment and is unaffected.
+func TestGetClusterStateRefusesQuorumOfOne(t *testing.T) {
+	cases := []struct {
+		name         string
+		aliveNodes   []uint64
+		membership   int
+		hasSeedNodes bool
+		wantErr      bool
+		wantQuorum   int
+	}{
+		{
+			// The defect. Mutation: delete the belt in GetClusterState.
+			name:       "seeds configured, membership of one, refuses",
+			aliveNodes: []uint64{1}, membership: 1, hasSeedNodes: true,
+			wantErr: true,
+		},
+		{
+			// Ruling 4: single-node deployments are unaffected.
+			// Mutation: drop the HasSeedNodes() condition from the belt; this
+			// fires, and every single-node deployment stops accepting writes.
+			name:       "no seeds, membership of one, accepted",
+			aliveNodes: []uint64{1}, membership: 1, hasSeedNodes: false,
+			wantErr: false, wantQuorum: 1,
+		},
+		{
+			// Once membership is learned the belt lets go.
+			// Mutation: make the belt fire on membership <= 2.
+			name:       "seeds configured, membership of two, accepted",
+			aliveNodes: []uint64{1, 2}, membership: 2, hasSeedNodes: true,
+			wantErr: false, wantQuorum: 2,
+		},
+		{
+			name:       "seeds configured, membership of three, accepted",
+			aliveNodes: []uint64{1, 2, 3}, membership: 3, hasSeedNodes: true,
+			wantErr: false, wantQuorum: 2,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			provider := &mockNodeProvider{
+				nodes:           tc.aliveNodes,
+				totalMembership: tc.membership,
+				hasSeedNodes:    tc.hasSeedNodes,
+			}
+
+			// A level that does not depend on the denominator must be served
+			// even in the refusing case: an earlier revision of the belt
+			// refused these too, which made a booting node fail "SELECT 1" and
+			// look dead to liveness probes.
+			// Mutation: drop consistencyNeedsMajority from the belt's condition.
+			for _, level := range []protocol.ConsistencyLevel{protocol.ConsistencyLocalOne, protocol.ConsistencyOne} {
+				if _, err := GetClusterState(provider, level); err != nil {
+					t.Errorf("GetClusterState at %v returned %v; levels that ask for no quorum must not be refused", level, err)
+				}
+			}
+
+			state, err := GetClusterState(provider, protocol.ConsistencyQuorum)
+
+			if !tc.wantErr {
+				if err != nil {
+					t.Fatalf("GetClusterState returned %v, want success", err)
+				}
+				if state.RequiredQuorum != tc.wantQuorum {
+					t.Errorf("RequiredQuorum = %d, want %d", state.RequiredQuorum, tc.wantQuorum)
+				}
+				return
+			}
+
+			if err == nil {
+				t.Fatal("GetClusterState accepted a membership of one on a node configured with seeds")
+			}
+			// The client must be told to retry, not handed a permanent failure:
+			// gossip converges within seconds of a peer becoming reachable.
+			// Mutation: return a plain fmt.Errorf, or a non-retryable code.
+			mysqlErr := protocol.ConvertToMySQLError(err)
+			if mysqlErr.Code != protocol.ErrCodeLockTimeout {
+				t.Errorf("code = %d, want %d (ER_LOCK_WAIT_TIMEOUT, retryable)", mysqlErr.Code, protocol.ErrCodeLockTimeout)
+			}
+			if !strings.Contains(mysqlErr.Message, "membership") {
+				t.Errorf("message = %q, want it to name the membership condition", mysqlErr.Message)
+			}
+		})
+	}
 }

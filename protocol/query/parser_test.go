@@ -433,7 +433,7 @@ func TestExtractInformationSchemaFilter(t *testing.T) {
 				t.Fatalf("expected SELECT statement")
 			}
 
-			filter := extractInformationSchemaFilter(sel)
+			filter := extractInformationSchemaFilter(sel, filterValues{})
 
 			if filter.SchemaName != tt.wantSchemaName {
 				t.Errorf("SchemaName = %q, want %q", filter.SchemaName, tt.wantSchemaName)

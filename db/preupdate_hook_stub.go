@@ -225,8 +225,8 @@ func (s *EphemeralHookSession) GetTxnID() uint64 {
 	return 0
 }
 
-// GetLastInsertId returns 0 (stub)
-func (s *EphemeralHookSession) GetLastInsertId() int64 {
+// StatementInsertID returns 0 (stub)
+func (s *EphemeralHookSession) StatementInsertID() int64 {
 	return 0
 }
 

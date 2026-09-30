@@ -233,6 +233,30 @@ func TestMemoryMetaStore_AbortTransaction(t *testing.T) {
 	require.Nil(t, rec)
 }
 
+// TestMemoryMetaStore_AbortRefusesCommitted enforces the append-only local
+// log through the memory tier: once CommitTransaction removes a transaction from the
+// in-memory store, AbortTransaction delegates to Pebble, which must refuse.
+func TestMemoryMetaStore_AbortRefusesCommitted(t *testing.T) {
+	store, cleanup := setupMemoryMetaStore(t)
+	defer cleanup()
+
+	txnID := uint64(601)
+	nodeID := uint64(6)
+	startTS := hlc.Timestamp{WallTime: time.Now().UnixNano(), Logical: 0}
+
+	require.NoError(t, store.BeginTransaction(txnID, nodeID, startTS))
+	commitTS := hlc.Timestamp{WallTime: time.Now().UnixNano(), Logical: 1}
+	require.NoError(t, store.CommitTransaction(txnID, commitTS, nil, "testdb", "", 0, 0))
+
+	err := store.AbortTransaction(txnID)
+	require.ErrorIs(t, err, ErrAbortCommitted)
+
+	rec, err := store.GetTransaction(txnID)
+	require.NoError(t, err)
+	require.NotNil(t, rec)
+	require.Equal(t, TxnStatusCommitted, rec.Status)
+}
+
 func TestMemoryMetaStore_CDCRowLocks(t *testing.T) {
 	store, cleanup := setupMemoryMetaStore(t)
 	defer cleanup()
@@ -340,10 +364,18 @@ func TestMemoryMetaStore_CleanupStaleTransactions(t *testing.T) {
 	state3, _ := store.txnStore.Get(txn3)
 	state3.LastHeartbeat = time.Now().Add(-3 * time.Hour).UnixNano()
 
-	// Cleanup stale transactions (older than 1 hour)
-	cleaned, err := store.CleanupStaleTransactions(1 * time.Hour)
+	// Stale transactions (older than 1 hour): txn1 and txn3
+	stale, err := store.StaleTransactionIDs(1 * time.Hour)
 	require.NoError(t, err)
-	require.Equal(t, 2, cleaned) // txn1 and txn3
+	require.ElementsMatch(t, []uint64{txn1, txn3}, stale)
+	for _, txnID := range stale {
+		aborted, err := store.AbortStaleTransaction(txnID, 1*time.Hour)
+		require.NoError(t, err)
+		require.True(t, aborted)
+	}
+	aborted, err := store.AbortStaleTransaction(txn2, 1*time.Hour)
+	require.NoError(t, err)
+	require.False(t, aborted, "a fresh transaction must not be aborted")
 
 	// Verify txn1 and txn3 are removed
 	_, found1 := store.txnStore.Get(txn1)
@@ -368,23 +400,33 @@ func TestMemoryMetaStore_DelegationMethods(t *testing.T) {
 		require.Equal(t, int64(0), version)
 	})
 
-	t.Run("UpdateSchemaVersion", func(t *testing.T) {
-		err := store.UpdateSchemaVersion("testdb", 1, "CREATE TABLE test", 1)
-		require.NoError(t, err)
+	// UpdateSchemaVersion is removed: schema versions now live in each
+	// user database's own __marmot_schema_version SQLite table, not here.
+	// GetSchemaVersion above is kept only as the migration read.
 
-		version, err := store.GetSchemaVersion("testdb")
-		require.NoError(t, err)
-		require.Equal(t, int64(1), version)
-	})
+	// The store-wide log sequence (formerly GetNextSeqNum(nodeID), now
+	// internal to CommitTransaction/StoreReplayedTransaction) is exercised
+	// through the public API: consecutive commits get increasing positions,
+	// and StableSeq catches up once both have finished.
+	t.Run("LogSequenceAdvancesAcrossCommits", func(t *testing.T) {
+		nodeID := uint64(1)
+		startTS := hlc.Timestamp{WallTime: time.Now().UnixNano(), Logical: 0}
 
-	t.Run("GetNextSeqNum", func(t *testing.T) {
-		seq1, err := store.GetNextSeqNum(1)
+		txnA := uint64(9001)
+		require.NoError(t, store.BeginTransaction(txnA, nodeID, startTS))
+		require.NoError(t, store.CommitTransaction(txnA, startTS, nil, "testdb", "", 0, 0))
+		recA, err := store.GetTransaction(txnA)
 		require.NoError(t, err)
-		require.Greater(t, seq1, uint64(0))
+		require.Greater(t, recA.SeqNum, uint64(0))
 
-		seq2, err := store.GetNextSeqNum(1)
+		txnB := uint64(9002)
+		require.NoError(t, store.BeginTransaction(txnB, nodeID, startTS))
+		require.NoError(t, store.CommitTransaction(txnB, startTS, nil, "testdb", "", 0, 0))
+		recB, err := store.GetTransaction(txnB)
 		require.NoError(t, err)
-		require.Equal(t, seq1+1, seq2)
+		require.Greater(t, recB.SeqNum, recA.SeqNum)
+
+		require.GreaterOrEqual(t, store.StableSeq(), recB.SeqNum)
 	})
 }
 
@@ -483,10 +525,81 @@ func TestReconstructFromPebble_CleansOrphanedCDCRaw(t *testing.T) {
 	cursor.Close()
 	require.Equal(t, 0, count, "Orphaned CDC raw data should be deleted")
 
-	// Verify immutable record still exists
+	// The begin was never durably prepared: the whole record is discarded, so
+	// it can never read PENDING forever after the restart.
 	immutable, err := newStore.pebble.readImmutableTxnRecord(txnID)
 	require.NoError(t, err)
-	require.NotNil(t, immutable, "Immutable record should still exist")
+	require.Nil(t, immutable, "an abandoned begin's record must be discarded at reconstruction")
+	rec, err := newStore.GetTransaction(txnID)
+	require.NoError(t, err)
+	require.Nil(t, rec)
+}
+
+// TestReconstructFromPebble_KeepsDurablyPreparedBegin pins the other side of
+// the abandoned-begin discard: a begin that reached its durable prepare is
+// kept PENDING across the restart, for its COMMIT.
+func TestReconstructFromPebble_KeepsDurablyPreparedBegin(t *testing.T) {
+	store, cleanup := setupMemoryMetaStore(t)
+	defer cleanup()
+
+	txnID := uint64(1150)
+	require.NoError(t, store.BeginTransaction(txnID, 11, hlc.Timestamp{WallTime: time.Now().UnixNano()}))
+	require.NoError(t, store.DurablyPrepareTransaction(txnID))
+	store.txnStore.Remove(txnID)
+
+	newStore := NewMemoryMetaStore(store.pebble)
+	require.NoError(t, newStore.ReconstructFromPebble())
+
+	kind, err := newStore.ClassifyPending(txnID)
+	require.NoError(t, err)
+	require.Equal(t, PendingPrepared, kind)
+	rec, err := newStore.GetTransaction(txnID)
+	require.NoError(t, err)
+	require.NotNil(t, rec)
+	require.Equal(t, TxnStatusPending, rec.Status)
+}
+
+// TestMemoryMetaStore_ClassifyPendingAndDiscard pins each PendingKind and
+// that DiscardAbandonedBegin refuses every record that is not abandoned.
+func TestMemoryMetaStore_ClassifyPendingAndDiscard(t *testing.T) {
+	store, cleanup := setupMemoryMetaStore(t)
+	defer cleanup()
+	ts := hlc.Timestamp{WallTime: time.Now().UnixNano()}
+
+	kind, err := store.ClassifyPending(1)
+	require.NoError(t, err)
+	require.Equal(t, PendingNone, kind, "no record")
+
+	require.NoError(t, store.BeginTransaction(2, 1, ts))
+	kind, err = store.ClassifyPending(2)
+	require.NoError(t, err)
+	require.Equal(t, PendingBegunLive, kind)
+	require.ErrorIs(t, store.DiscardAbandonedBegin(2), ErrNotAbandonedBegin, "a live begin must not be discarded")
+
+	store.txnStore.Remove(2)
+	kind, err = store.ClassifyPending(2)
+	require.NoError(t, err)
+	require.Equal(t, PendingBegunAbandoned, kind)
+	require.NoError(t, store.WriteCapturedRow(2, 1, []byte("row")))
+	require.NoError(t, store.DiscardAbandonedBegin(2))
+	rec, err := store.GetTransaction(2)
+	require.NoError(t, err)
+	require.Nil(t, rec)
+	require.False(t, store.HasCapturedRows(2), "discard must drop the begin's captured rows")
+
+	require.NoError(t, store.BeginTransaction(3, 1, ts))
+	require.NoError(t, store.DurablyPrepareTransaction(3))
+	kind, err = store.ClassifyPending(3)
+	require.NoError(t, err)
+	require.Equal(t, PendingPrepared, kind)
+	store.txnStore.Remove(3)
+	require.ErrorIs(t, store.DiscardAbandonedBegin(3), ErrNotAbandonedBegin, "a prepared txn must not be discarded")
+
+	require.NoError(t, store.BeginTransaction(4, 1, ts))
+	require.NoError(t, store.CommitTransaction(4, ts, nil, "db", "", 0, 0))
+	kind, err = store.ClassifyPending(4)
+	require.NoError(t, err)
+	require.Equal(t, PendingNone, kind, "committed")
 }
 
 func TestReconstructFromPebble_KeepsCommittedCDCRaw(t *testing.T) {

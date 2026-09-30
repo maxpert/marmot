@@ -3,6 +3,7 @@ package coordinator
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"math"
 	"reflect"
@@ -15,10 +16,13 @@ import (
 	"github.com/maxpert/marmot/cfg"
 	"github.com/maxpert/marmot/common"
 	"github.com/maxpert/marmot/hlc"
+	"github.com/maxpert/marmot/id"
 	"github.com/maxpert/marmot/modules/vecindex"
 	"github.com/maxpert/marmot/protocol"
 	"github.com/maxpert/marmot/protocol/determinism"
 	"github.com/maxpert/marmot/protocol/handlers"
+	"github.com/maxpert/marmot/protocol/mysqlcode"
+	"github.com/maxpert/marmot/protocol/query/rules"
 	"github.com/maxpert/marmot/protocol/query/transform"
 	"github.com/maxpert/marmot/telemetry"
 	"github.com/rs/zerolog/log"
@@ -58,11 +62,23 @@ type DatabaseManager interface {
 	GetTranspilerSchema(database, table string) (*transform.SchemaInfo, error)
 	// GetVectorIndexManager returns the vector index manager (may be nil).
 	GetVectorIndexManager() VectorIndexManagerProvider
+	// RegistryKeyGeneration reports database name's current registry
+	// generation and whether it is presently live (as opposed to tombstoned
+	// by a DROP, or never created). handleMutation uses it to stamp a
+	// CREATE/DROP DATABASE statement's Statement.DatabaseGeneration, which
+	// fences a stale coordinator at PREPARE (see
+	// db.DatabaseManager.ApplyDatabaseOp). It
+	// is db.DatabaseManager.RegistryKey with the same information carried as
+	// two primitives, to avoid an import cycle with package db.
+	RegistryKeyGeneration(name string) (generation uint64, live bool, err error)
 }
 
 // ReplicatedDatabaseProvider provides access to replicated database operations
 type ReplicatedDatabaseProvider interface {
-	ExecuteLocalWithHooks(ctx context.Context, txnID uint64, requests []ExecutionRequest) (PendingExecution, error)
+	// ExecuteLocalWithHooks executes ONE autocommit statement with CDC capture.
+	// It takes a single request, not a slice: the insert id it reports is the
+	// statement's own, and a batch would silently report the first statement's.
+	ExecuteLocalWithHooks(ctx context.Context, txnID uint64, req ExecutionRequest) (PendingExecution, error)
 	GetSchemaCache() interface{} // Returns *SchemaCache (using interface{} to avoid import cycle)
 	// DescribeResultColumns reports the columns a query returns without running it.
 	DescribeResultColumns(ctx context.Context, query string) ([]common.ResultColumn, error)
@@ -80,49 +96,12 @@ type ExecutionRequest struct {
 	Params []interface{}
 }
 
-// CDCMergeResult holds merged CDC data from preupdate hooks.
-type CDCMergeResult struct {
-	TableName string
-	IntentKey []byte
-	OldValues map[string][]byte
-	NewValues map[string][]byte
-}
-
-// MergeCDCEntries merges CDC entries captured by preupdate hooks.
-// For UPSERT (INSERT OR REPLACE), SQLite fires DELETE then INSERT hooks.
-// This function combines them to get complete old/new values.
-//
-// CRITICAL CONTRACT:
-//   - TableName is ALWAYS extracted from entries (hooks capture it)
-//   - Never rely on parsed SQL for TableName with CDC data
-//   - See TestMergeCDCEntries_TableNameRequired for enforcement
-func MergeCDCEntries(entries []common.CDCEntry) CDCMergeResult {
-	result := CDCMergeResult{
-		OldValues: make(map[string][]byte),
-		NewValues: make(map[string][]byte),
-	}
-
-	for _, e := range entries {
-		if len(result.IntentKey) == 0 {
-			result.IntentKey = e.IntentKey
-		}
-		if result.TableName == "" {
-			result.TableName = e.Table
-		}
-		for k, v := range e.OldValues {
-			result.OldValues[k] = v
-		}
-		for k, v := range e.NewValues {
-			result.NewValues[k] = v
-		}
-	}
-
-	return result
-}
-
 // PendingExecution represents a locally executed transaction waiting for quorum
 type PendingExecution interface {
 	GetTotalRowCount() int64
+	// GetLastInsertId returns the OK packet's insert id: the FIRST
+	// AUTO_INCREMENT value the statement generated, 0 when it generated none.
+	// The name mirrors MySQL's OK-packet field, not SQLite's last-rowid.
 	GetLastInsertId() int64
 	GetCDCEntries() []common.CDCEntry
 	Commit() error
@@ -132,7 +111,6 @@ type PendingExecution interface {
 // SchemaVersionManager interface to avoid import cycles
 type SchemaVersionManager interface {
 	GetSchemaVersion(database string) (uint64, error)
-	IncrementSchemaVersion(database string, ddlSQL string, txnID uint64) (uint64, error)
 	GetAllSchemaVersions() (map[string]uint64, error)
 }
 
@@ -143,6 +121,11 @@ type NodeRegistry interface {
 	GetAll() []any // Returns slice of node states (avoids import cycle)
 	IsLeaving(nodeID uint64) bool
 	GetLocalNodeID() uint64
+	// LegacyLogProtocolMembers returns the ids of current members (self
+	// included) running an older release that does not serve the commit-log
+	// pull protocol, sorted ascending; empty means every member serves it.
+	// See grpc.NodeRegistry's method of the same name.
+	LegacyLogProtocolMembers() []uint64
 }
 
 // NodeState represents cluster node state
@@ -179,6 +162,12 @@ func getDDLValidationTimeout() time.Duration {
 // uses for hookDB sessions), applied here for its naturally longer eager
 // duration instead of a new speculative config value.
 func pinnedSessionTimeout() time.Duration {
+	return lockWaitTimeout()
+}
+
+// lockWaitTimeout returns transaction.lock_wait_timeout_seconds, or MySQL's
+// innodb_lock_wait_timeout default (50s).
+func lockWaitTimeout() time.Duration {
 	if cfg.Config != nil && cfg.Config.Transaction.LockWaitTimeoutSeconds > 0 {
 		return time.Duration(cfg.Config.Transaction.LockWaitTimeoutSeconds) * time.Second
 	}
@@ -229,15 +218,22 @@ type PublisherRegistry interface {
 // CoordinatorHandler implements protocol.ConnectionHandler
 // It routes queries to the appropriate coordinator (Read or Write)
 type CoordinatorHandler struct {
-	nodeID             uint64
-	writeCoord         *WriteCoordinator
-	readCoord          *ReadCoordinator
-	clock              *hlc.Clock
-	dbManager          DatabaseManager
-	ddlLockMgr         *DDLLockManager
-	schemaVersionMgr   SchemaVersionManager
-	nodeRegistry       NodeRegistry
-	metadata           *handlers.MetadataHandler
+	nodeID           uint64
+	writeCoord       *WriteCoordinator
+	readCoord        *ReadCoordinator
+	clock            *hlc.Clock
+	dbManager        DatabaseManager
+	ddlLockMgr       *DDLLockManager
+	schemaVersionMgr SchemaVersionManager
+	nodeRegistry     NodeRegistry
+	metadata         *handlers.MetadataHandler
+	// narrowIDs mints ids for AUTO_INCREMENT columns declared narrower than
+	// BIGINT, from ranges this node claims through writeCoord. Nil when the
+	// handler has no write coordinator to claim through.
+	narrowIDs *id.RangeAllocator
+	// narrowIDsFailFast shares narrowIDs' ranges but never waits out a vote
+	// hold; statements inside a transaction that pinned a writer use it.
+	narrowIDsFailFast  *id.RangeAllocator
 	recentTxnIDs       sync.Map // txn_id -> conn_id for duplicate detection
 	publisherRegistry  PublisherRegistry
 	publisherMu        sync.RWMutex
@@ -262,16 +258,59 @@ type CoordinatorHandler struct {
 
 // NewCoordinatorHandler creates a new handler
 func NewCoordinatorHandler(nodeID uint64, writeCoord *WriteCoordinator, readCoord *ReadCoordinator, clock *hlc.Clock, dbManager DatabaseManager, ddlLockMgr *DDLLockManager, schemaVersionMgr SchemaVersionManager, nodeRegistry NodeRegistry) *CoordinatorHandler {
+	// The narrow allocator claims through this handler's own write
+	// coordinator, so it is built here, beside it, rather than in the shared
+	// query pipeline. A claim gets the bound of any other write plus the lock
+	// wait: a claim on a node whose votes are held waits for their release up
+	// to the lock wait (ClaimRange), and then still needs its own rounds.
+	var narrowIDs, narrowIDsFailFast *id.RangeAllocator
+	if writeCoord != nil {
+		narrowIDs = id.NewRangeAllocator(writeCoord, getWriteTimeout()+lockWaitTimeout())
+		narrowIDsFailFast = narrowIDs.Through(writeCoord.FailFastClaimer())
+	}
 	return &CoordinatorHandler{
-		nodeID:           nodeID,
-		writeCoord:       writeCoord,
-		readCoord:        readCoord,
-		clock:            clock,
-		dbManager:        dbManager,
-		ddlLockMgr:       ddlLockMgr,
-		schemaVersionMgr: schemaVersionMgr,
-		nodeRegistry:     nodeRegistry,
-		metadata:         handlers.NewMetadataHandler(dbManager, SystemDatabaseName),
+		narrowIDs:         narrowIDs,
+		narrowIDsFailFast: narrowIDsFailFast,
+		nodeID:            nodeID,
+		writeCoord:        writeCoord,
+		readCoord:         readCoord,
+		clock:             clock,
+		dbManager:         dbManager,
+		ddlLockMgr:        ddlLockMgr,
+		schemaVersionMgr:  schemaVersionMgr,
+		nodeRegistry:      nodeRegistry,
+		metadata:          handlers.NewMetadataHandler(dbManager, SystemDatabaseName),
+	}
+}
+
+// narrowAllocator returns the narrow allocator for a statement on session as
+// the interface the parser takes, keeping a nil allocator a nil interface.
+// A session whose explicit transaction has pinned a SQLite writer gets the
+// fail-fast one (WriteCoordinator.FailFastClaimer): it must not wait for a
+// vote release while holding a writer the release can depend on.
+func (h *CoordinatorHandler) narrowAllocator(session *protocol.ConnectionSession) rules.NarrowAllocator {
+	if h.narrowIDs == nil {
+		return nil
+	}
+	if pinned := h.lookupPinnedState(session.ConnID); pinned != nil && !pinned.isEmpty() {
+		return h.narrowIDsFailFast
+	}
+	return h.narrowIDs
+}
+
+// TableIncarnationEnded discards this node's in-memory id range for a table
+// whose incarnation a DDL statement ended (db.AutoIncIncarnationListener).
+func (h *CoordinatorHandler) TableIncarnationEnded(database, table string) {
+	if h.narrowIDs != nil {
+		h.narrowIDs.Forget(database, table)
+	}
+}
+
+// DatabaseIncarnationEnded discards this node's in-memory id ranges for every
+// table of a dropped database (db.AutoIncIncarnationListener).
+func (h *CoordinatorHandler) DatabaseIncarnationEnded(database string) {
+	if h.narrowIDs != nil {
+		h.narrowIDs.ForgetDatabase(database)
 	}
 }
 
@@ -325,19 +364,6 @@ func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, sq
 		return h.handleMarmotCommand(session, sql)
 	}
 
-	// Build schema lookup function for auto-increment ID injection.
-	// Uses cached schema via DatabaseManager - does NOT query SQLite PRAGMA.
-	var schemaLookup protocol.SchemaLookupFunc
-	if h.dbManager != nil && session.CurrentDatabase != "" {
-		dbName := session.CurrentDatabase
-		schemaLookup = func(table string) string {
-			col, err := h.dbManager.GetAutoIncrementColumn(dbName, table)
-			if err != nil {
-				return ""
-			}
-			return col
-		}
-	}
 	schemaProvider := func(database, table string) *transform.SchemaInfo {
 		if table == "" || h.dbManager == nil {
 			return nil
@@ -356,10 +382,18 @@ func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, sq
 		}
 		return schemaInfo
 	}
+	// Auto-increment id injection looks tables up in the statement's own
+	// database when it names one, and in the session's otherwise.
+	var schemaLookup protocol.SchemaLookupFunc
+	if h.dbManager != nil {
+		schemaLookup = protocol.SchemaLookupFunc(schemaProvider)
+	}
 
 	// Parse with options based on session state
 	stmt := protocol.ParseStatementWithOptions(sql, protocol.ParseOptions{
 		SchemaLookup:      schemaLookup,
+		NarrowIDs:         h.narrowAllocator(session),
+		BoundParams:       params,
 		SchemaProvider:    schemaProvider,
 		SkipTranspilation: !session.TranspilationEnabled,
 		ExtractLiterals:   true, // Enable literal extraction for parameterized execution
@@ -390,7 +424,7 @@ func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, sq
 	// statement Vitess only partially parsed) instead of forwarding the mangled
 	// SQL into the read/2PC path, where it produces a confusing downstream error.
 	if stmt.Type == protocol.StatementUnsupported && stmt.Error != "" {
-		return nil, protocol.NewMySQLError(protocol.ErrCodeParseError, protocol.SQLStateSyntax, stmt.Error)
+		return nil, protocol.UnsupportedStatementError(stmt)
 	}
 
 	// Handle SET commands: extract @@marmot_vec_* vars via Vitess AST; ignore others.
@@ -562,14 +596,59 @@ func (h *CoordinatorHandler) HandleLoadData(session *protocol.ConnectionSession,
 	// Preserve the original SQL text so replicated peers re-apply the same
 	// LOAD DATA LOCAL INFILE semantics (parser normalization can drop LOCAL).
 	stmt.SQL = sql
-	stmt.Database = session.CurrentDatabase
 	stmt.LoadDataPayload = data
+	database, table, targetErr := protocol.LoadDataTarget(sql)
+	if database == "" {
+		database = session.CurrentDatabase
+	}
+	stmt.Database = database
+
+	// A table with a narrow AUTO_INCREMENT column takes its rows as ordinary
+	// INSERTs through this handler, so their ids are generated or admitted
+	// like any other INSERT's (admitNarrowIDs). Replicated as a statement,
+	// every node would instead apply the file itself and let SQLite assign
+	// any missing key on its own.
+	if targetErr == nil && h.hasNarrowAutoIncrement(database, table) {
+		return h.loadNarrowData(session, database, sql, data)
+	}
 
 	consistency, _ := protocol.ParseConsistencyLevel(cfg.Config.Replication.DefaultWriteConsist)
 	if session.InTransaction() {
 		return h.bufferStatement(session, stmt)
 	}
 	return h.handleMutation(stmt, nil, consistency)
+}
+
+// loadNarrowData runs a LOAD DATA into a narrow table in database as INSERTs
+// through this handler. A target in another database than the session's is
+// loaded as its own autocommit work on a session of that database, since an
+// explicit transaction commits to the database it began in; inside an open
+// transaction that is refused.
+func (h *CoordinatorHandler) loadNarrowData(session *protocol.ConnectionSession, database, sql string, data []byte) (*protocol.ResultSet, error) {
+	if database == session.CurrentDatabase {
+		return protocol.ExecuteLoadDataLocal(session, h, sql, data)
+	}
+	if session.InTransaction() {
+		return nil, transform.NewCodedError(mysqlcode.ErrCodeNotSupportedYet,
+			"This version of MySQL doesn't yet support 'LOAD DATA into database `%s` inside a transaction begun in `%s`'",
+			database, session.CurrentDatabase)
+	}
+	target := &protocol.ConnectionSession{
+		ConnID:               session.ConnID,
+		CurrentDatabase:      database,
+		TranspilationEnabled: session.TranspilationEnabled,
+	}
+	return protocol.ExecuteLoadDataLocal(target, h, sql, data)
+}
+
+// hasNarrowAutoIncrement reports whether table has a narrow AUTO_INCREMENT
+// column (rules.IsNarrow).
+func (h *CoordinatorHandler) hasNarrowAutoIncrement(database, table string) bool {
+	if h.dbManager == nil || database == "" || table == "" {
+		return false
+	}
+	info, err := h.dbManager.GetTranspilerSchema(database, table)
+	return err == nil && rules.IsNarrow(info)
 }
 
 func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, params []interface{}, consistency protocol.ConsistencyLevel) (*protocol.ResultSet, error) {
@@ -590,6 +669,16 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, params []in
 	isDDL := stmt.Type == protocol.StatementDDL ||
 		stmt.Type == protocol.StatementCreateDatabase ||
 		stmt.Type == protocol.StatementDropDatabase
+
+	// Rolling-upgrade gate: while any member does not serve the commit-log
+	// pull protocol yet, DDL and CREATE/DROP DATABASE are refused cluster-wide,
+	// retryable, until every member is upgraded (LegacyMembersDDLRefusal).
+	if isDDL && h.nodeRegistry != nil {
+		if legacy := h.nodeRegistry.LegacyLogProtocolMembers(); len(legacy) > 0 {
+			telemetry.QueriesTotal.With("ddl", "failed").Inc()
+			return nil, NewLegacyMembersDDLRefusal(legacy)
+		}
+	}
 
 	// Rewrite DDL for idempotency (safe to replay)
 	if isDDL {
@@ -619,6 +708,28 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, params []in
 				log.Error().Err(releaseErr).Str("database", stmt.Database).Msg("Failed to release DDL lock")
 			}
 		}()
+	}
+
+	// CREATE/DROP DATABASE statements carry a fencing generation, stamped from
+	// this coordinator's own registry view under the cluster-wide DDL lock
+	// above (so the read is not racing another coordinator's create/drop of
+	// the same name). A participant's PREPARE gate refuses a stamp below its
+	// own local key - see db.DatabaseManager.ApplyDatabaseOp. A failed read leaves DatabaseGeneration at
+	// its zero value, which participants treat as "unstamped" and compute
+	// locally instead of gating on: a safe, graceful degradation.
+	if stmt.Type == protocol.StatementCreateDatabase || stmt.Type == protocol.StatementDropDatabase {
+		if h.dbManager != nil {
+			generation, live, genErr := h.dbManager.RegistryKeyGeneration(stmt.Database)
+			if genErr != nil {
+				log.Warn().Err(genErr).Str("database", stmt.Database).Msg("Failed to read database registry; leaving the operation unstamped")
+			} else if stmt.Type == protocol.StatementDropDatabase {
+				stmt.DatabaseGeneration = generation
+			} else if live {
+				stmt.DatabaseGeneration = generation // already live: CREATE is a no-op at the current generation
+			} else {
+				stmt.DatabaseGeneration = generation + 1
+			}
+		}
 	}
 
 	// Get current schema version for this database
@@ -663,7 +774,7 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, params []in
 		// serialization order (see protocol.Statement.MergeExecParams).
 		execParams := stmt.MergeExecParams(params)
 		req := ExecutionRequest{SQL: stmt.SQL, Params: execParams}
-		pendingExec, err = replicatedDB.ExecuteLocalWithHooks(ctx, uint64(txnID), []ExecutionRequest{req})
+		pendingExec, err = replicatedDB.ExecuteLocalWithHooks(ctx, uint64(txnID), req)
 
 		if err != nil {
 			cancel() // Only cancel on error
@@ -718,6 +829,16 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, params []in
 		}
 	}()
 
+	// Every id the statement put into a narrow AUTO_INCREMENT column must be
+	// admitted before it replicates; a refusal fails the statement and
+	// releases what its local execution left behind.
+	if err := h.admitNarrowIDs(stmt.Database, txn.Statements); err != nil {
+		h.writeCoord.abortTransaction(ctx, []uint64{h.nodeID}, txn.ID, txn.Database)
+		telemetry.QueriesTotal.With("dml", "failed").Inc()
+		telemetry.QueryDurationSeconds.With("dml").Observe(time.Since(queryStart).Seconds())
+		return nil, err
+	}
+
 	// A DML that matched no rows leaves no statements to replicate. Running 2PC
 	// for it would burn a cluster round trip to commit nothing.
 	if len(txn.Statements) > 0 {
@@ -745,27 +866,16 @@ func (h *CoordinatorHandler) handleMutation(stmt protocol.Statement, params []in
 		}
 	}
 
-	// If DDL succeeded, increment schema version
-	if isDDL && h.schemaVersionMgr != nil {
-		newVersion, err := h.schemaVersionMgr.IncrementSchemaVersion(stmt.Database, stmt.SQL, uint64(txnID))
+	// The DDL's schema version bump is already durable, atomic with the DDL
+	// itself, in the database's own SQLite file: TransactionManager
+	// bumped and cached it as part of committing txn above. Refresh gossip with
+	// the current versions so peers learn it without waiting for their own poll.
+	if isDDL && h.schemaVersionMgr != nil && h.nodeRegistry != nil {
+		allVersions, err := h.schemaVersionMgr.GetAllSchemaVersions()
 		if err != nil {
-			log.Error().Err(err).Str("database", stmt.Database).Msg("Failed to increment schema version")
+			log.Error().Err(err).Msg("Failed to get schema versions for gossip")
 		} else {
-			log.Info().
-				Str("database", stmt.Database).
-				Uint64("new_version", newVersion).
-				Uint64("txn_id", uint64(txnID)).
-				Msg("Schema version incremented after DDL")
-
-			// Update gossip with new schema versions
-			if h.nodeRegistry != nil {
-				allVersions, err := h.schemaVersionMgr.GetAllSchemaVersions()
-				if err != nil {
-					log.Error().Err(err).Msg("Failed to get schema versions for gossip")
-				} else {
-					h.nodeRegistry.UpdateSchemaVersions(allVersions)
-				}
-			}
+			h.nodeRegistry.UpdateSchemaVersions(allVersions)
 		}
 	}
 
@@ -837,6 +947,13 @@ func (h *CoordinatorHandler) executeEagerDML(session *protocol.ConnectionSession
 	defer cancel()
 	rowsAffected, lastInsertId, err := pinned.ExecuteStatement(execCtx, stmt.SQL, execParams)
 	if err != nil {
+		if errors.Is(err, sql.ErrTxDone) {
+			// The pinned session's SQLite transaction is gone: it outlived
+			// the lock wait and was rolled back. The client is answered 1213
+			// (protocol.ConvertToMySQLError), so end the whole transaction as
+			// MySQL does: a later COMMIT must find nothing of it to commit.
+			_, _ = h.handleRollback(session)
+		}
 		return nil, fmt.Errorf("DML execution failed: %w", err)
 	}
 
@@ -1421,10 +1538,14 @@ func (h *CoordinatorHandler) handleCommit(session *protocol.ConnectionSession) (
 	ctx, cancel := context.WithTimeout(context.Background(), writeTimeoutForStatements(txn.Statements))
 	defer cancel()
 
-	// DML that matched no rows leaves nothing to replicate. A transaction whose
+	// Every id the transaction put into a narrow AUTO_INCREMENT column must be
+	// admitted before it replicates; a refusal fails the COMMIT. DML that
+	// matched no rows leaves nothing to replicate. A transaction whose
 	// statements all collapsed that way is a no-op and skips 2PC.
-	var err error
-	if len(txn.Statements) > 0 {
+	err := h.admitNarrowIDs(txn.Database, txn.Statements)
+	if err != nil {
+		h.writeCoord.abortTransaction(ctx, []uint64{h.nodeID}, txn.ID, txn.Database)
+	} else if len(txn.Statements) > 0 {
 		err = h.writeCoord.WriteTransaction(ctx, txn)
 	}
 

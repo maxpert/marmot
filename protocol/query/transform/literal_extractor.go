@@ -6,6 +6,21 @@ import (
 	"vitess.io/vitess/go/vt/sqlparser"
 )
 
+// ArgumentPositions numbers the statement's placeholders in the order its
+// bound values apply to them: the walk order ExtractLiterals and
+// protocol.Statement.MergeExecParams rely on. Every reader of a bound value
+// finds its placeholder's value through this one numbering.
+func ArgumentPositions(stmt sqlparser.SQLNode) map[*sqlparser.Argument]int {
+	args := make(map[*sqlparser.Argument]int)
+	sqlparser.Rewrite(stmt, func(cursor *sqlparser.Cursor) bool {
+		if arg, ok := cursor.Node().(*sqlparser.Argument); ok {
+			args[arg] = len(args)
+		}
+		return true
+	}, nil)
+	return args
+}
+
 // ExtractLiterals walks the AST and replaces literal values with argument placeholders.
 // Returns the extracted values in order of appearance, suitable for parameterized execution.
 //

@@ -545,3 +545,46 @@ func TestXsyncCDCLockStore_HasRowLocks(t *testing.T) {
 		t.Error("should have no locks after release")
 	}
 }
+
+// TestXsyncTransactionStore_UpdatesDoNotRaceReaders: a transaction's
+// heartbeat and status are updated by one goroutine (the heartbeat RPC, the
+// commit path) while another reads the state it got from Get or RangeAll (the
+// stale-transaction GC). Run under -race, this fails if an update writes into
+// a TxnState a reader already holds.
+func TestXsyncTransactionStore_UpdatesDoNotRaceReaders(t *testing.T) {
+	store := NewXsyncTransactionStore()
+	const txnID = 1
+	store.Begin(txnID, &TxnState{NodeID: 1, Status: TxnStatusPending, LastHeartbeat: 1})
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := int64(2); i < 2000; i++ {
+			store.UpdateHeartbeat(txnID, i)
+		}
+		store.UpdateStatus(txnID, TxnStatusAborted)
+	}()
+	var lastSeen int64
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 2000; i++ {
+			if state, ok := store.Get(txnID); ok && state.Status == TxnStatusPending {
+				lastSeen = max(lastSeen, state.LastHeartbeat)
+			}
+			store.RangeAll(func(_ uint64, state *TxnState) bool {
+				lastSeen = max(lastSeen, state.LastHeartbeat)
+				return true
+			})
+		}
+	}()
+	wg.Wait()
+
+	state, ok := store.Get(txnID)
+	if !ok || state.Status != TxnStatusAborted || state.LastHeartbeat != 1999 {
+		t.Fatalf("final state = %+v (found %v), want ABORTED with heartbeat 1999", state, ok)
+	}
+	if lastSeen > 1999 {
+		t.Fatalf("a reader saw heartbeat %d, never written", lastSeen)
+	}
+}

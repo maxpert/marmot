@@ -9,8 +9,13 @@ import (
 
 // Generator provides unique IDs for distributed autoincrement columns.
 // IDs are guaranteed unique across nodes and roughly time-ordered.
+//
+// It mints every id one statement needs in one call, and returns an error so
+// that a generator which must coordinate to mint ids can refuse; every caller
+// has to hand that error to the client.
 type Generator interface {
-	NextID() uint64
+	// NextIDs fills ids with distinct ids in ascending order.
+	NextIDs(ids []uint64) error
 }
 
 // HLCGenerator generates unique IDs using the Hybrid Logical Clock.
@@ -24,11 +29,15 @@ func NewHLCGenerator(clock *hlc.Clock) *HLCGenerator {
 	return &HLCGenerator{clock: clock}
 }
 
-// NextID generates a unique 64-bit ID.
+// NextIDs fills ids with successive unique 64-bit ids. The clock is strictly
+// monotonic, so they ascend.
 // Format: (physical_ms << 22) | (node_id << 16) | logical
 // See hlc.Timestamp.ToTxnID for bit allocation details.
-func (g *HLCGenerator) NextID() uint64 {
-	return g.clock.Now().ToTxnID()
+func (g *HLCGenerator) NextIDs(ids []uint64) error {
+	for i := range ids {
+		ids[i] = g.clock.Now().ToTxnID()
+	}
+	return nil
 }
 
 // Compact ID format constants (53-bit)
@@ -61,12 +70,20 @@ func NewCompactGenerator(nodeID uint64) *CompactGenerator {
 	}
 }
 
-// NextID generates a unique 53-bit ID safe for JavaScript.
-// Thread-safe. IDs are monotonically increasing and unique.
-func (g *CompactGenerator) NextID() uint64 {
+// NextIDs fills ids with unique 53-bit ids safe for JavaScript. Thread-safe.
+// IDs are monotonically increasing and unique; they are minted under one lock
+// acquisition, so no other caller's id lands between them.
+func (g *CompactGenerator) NextIDs(ids []uint64) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	for i := range ids {
+		ids[i] = g.next()
+	}
+	return nil
+}
 
+// next mints one id. The caller holds g.mu.
+func (g *CompactGenerator) next() uint64 {
 	nowMS := time.Now().UnixMilli()
 	relativeMS := nowMS - CompactEpoch
 

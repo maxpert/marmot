@@ -3,8 +3,10 @@ package db
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/maxpert/marmot/cfg"
@@ -14,9 +16,6 @@ import (
 	"github.com/maxpert/marmot/protocol"
 	"github.com/rs/zerolog/log"
 )
-
-// Ensure PendingLocalExecution implements coordinator.PendingExecution
-var _ coordinator.PendingExecution = (*PendingLocalExecution)(nil)
 
 // ReplicatedDatabase wraps a SQL database with distributed transaction support
 // This is the main integration point between application layer and transactional storage
@@ -38,21 +37,81 @@ type ReplicatedDatabase struct {
 	replicationFn  ReplicationFunc
 	batchCommitter *SQLiteBatchCommitter
 	schemaCache    *SchemaCache // Shared schema cache for preupdate hooks
+	gate           *writeGate   // refuses every commit once the database leaves service
+
+	dbName        string        // database name, "" for the system database
+	schemaVersion atomic.Uint64 // cached __marmot_schema_version value; unused for the system database
 }
 
 // ReplicationFunc is called to replicate transactions to other nodes
 // This is injected from the coordinator layer
 type ReplicationFunc func(ctx context.Context, txn *Transaction) error
 
+// ReplicatedDatabaseOption configures NewReplicatedDatabase.
+type ReplicatedDatabaseOption func(*replicatedDatabaseOptions)
+
+type replicatedDatabaseOptions struct {
+	driverName  string
+	synchronous string
+	batchCommit bool
+
+	dbName              string                             // "" when unnamed (the system database): no legacy schema version to migrate
+	legacySchemaVersion func(dbName string) (int64, error) // migration read source, nil if not applicable
+}
+
+// WithDatabaseName names the database being opened: the name its
+// __marmot_schema_version table migrates a legacy value under, and the
+// name its applied-transaction repair records. The system database is opened
+// without it; its table stays at 0, since no replicated DDL targets it.
+func WithDatabaseName(name string) ReplicatedDatabaseOption {
+	return func(o *replicatedDatabaseOptions) {
+		o.dbName = name
+	}
+}
+
+// WithLegacySchemaVersionSource supplies the retiring pebble-stored schema
+// version counter, read once at open to migrate a pre-existing database's
+// version into __marmot_schema_version. Only consulted when the
+// SQLite file already existed before this open; see ensureSchemaVersionTable.
+func WithLegacySchemaVersionSource(read func(dbName string) (int64, error)) ReplicatedDatabaseOption {
+	return func(o *replicatedDatabaseOptions) {
+		o.legacySchemaVersion = read
+	}
+}
+
+// WithDurableCommits makes every commit on the database survive an OS crash
+// or power loss, not only a process crash. Every connection it opens runs
+// synchronous=FULL, carried in the DSN because the driver resets the mode on
+// each new connection, through SQLiteDurableDriverName. It gets no batch
+// committer, whose connection would commit and checkpoint the same file at
+// synchronous=NORMAL.
+func WithDurableCommits() ReplicatedDatabaseOption {
+	return func(o *replicatedDatabaseOptions) {
+		o.driverName = SQLiteDurableDriverName
+		o.synchronous = "FULL"
+		o.batchCommit = false
+	}
+}
+
 // NewReplicatedDatabase creates a new transaction-enabled database
 // metaStore is the MetaStore for storing transaction metadata (intent entries, txn records, etc.)
-func NewReplicatedDatabase(dbPath string, nodeID uint64, clock *hlc.Clock, metaStore MetaStore) (*ReplicatedDatabase, error) {
+func NewReplicatedDatabase(dbPath string, nodeID uint64, clock *hlc.Clock, metaStore MetaStore, opts ...ReplicatedDatabaseOption) (*ReplicatedDatabase, error) {
+	o := replicatedDatabaseOptions{
+		driverName:  SQLiteDriverName,
+		synchronous: "NORMAL",
+		batchCommit: cfg.Config.BatchCommit.Enabled,
+	}
+	for _, opt := range opts {
+		opt(&o)
+	}
+
 	// Get timeout from config (LockWaitTimeoutSeconds is in seconds, SQLite needs milliseconds)
 	busyTimeoutMS := cfg.Config.Transaction.LockWaitTimeoutSeconds * 1000
 	poolCfg := cfg.Config.ConnectionPool
 	isMemoryDB := strings.Contains(dbPath, ":memory:")
 
 	var writeDB, hookDB, readDB *sql.DB
+	gate := &writeGate{}
 
 	// Helper to close all opened connections on error
 	closeAll := func() {
@@ -74,14 +133,14 @@ func NewReplicatedDatabase(dbPath string, nodeID uint64, clock *hlc.Clock, metaS
 	writeDSN := dbPath
 	if !isMemoryDB {
 		if strings.Contains(writeDSN, "?") {
-			writeDSN += fmt.Sprintf("&_journal_mode=WAL&_busy_timeout=%d&_txlock=immediate&cache=shared", busyTimeoutMS)
+			writeDSN += fmt.Sprintf("&_journal_mode=WAL&_busy_timeout=%d&_txlock=immediate&_sync=%s&cache=shared", busyTimeoutMS, o.synchronous)
 		} else {
-			writeDSN += fmt.Sprintf("?_journal_mode=WAL&_busy_timeout=%d&_txlock=immediate&cache=shared", busyTimeoutMS)
+			writeDSN += fmt.Sprintf("?_journal_mode=WAL&_busy_timeout=%d&_txlock=immediate&_sync=%s&cache=shared", busyTimeoutMS, o.synchronous)
 		}
 	}
 
 	var err error
-	writeDB, err = sql.Open(SQLiteDriverName, writeDSN)
+	writeDB, err = gate.openDB(o.driverName, writeDSN)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open write database: %w", err)
 	}
@@ -96,7 +155,7 @@ func NewReplicatedDatabase(dbPath string, nodeID uint64, clock *hlc.Clock, metaS
 	// This connection is acquired during ExecuteLocalWithHooks, captures CDC,
 	// then releases BEFORE 2PC broadcast - avoiding deadlock with incoming commits.
 	hookDSN := writeDSN // Same settings as write connection
-	hookDB, err = sql.Open(SQLiteDriverName, hookDSN)
+	hookDB, err = gate.openDB(o.driverName, hookDSN)
 	if err != nil {
 		closeAll()
 		return nil, fmt.Errorf("failed to open hook database: %w", err)
@@ -113,13 +172,13 @@ func NewReplicatedDatabase(dbPath string, nodeID uint64, clock *hlc.Clock, metaS
 	readDSN := dbPath
 	if !isMemoryDB {
 		if strings.Contains(readDSN, "?") {
-			readDSN += fmt.Sprintf("&_journal_mode=WAL&_busy_timeout=%d&cache=shared", busyTimeoutMS)
+			readDSN += fmt.Sprintf("&_journal_mode=WAL&_busy_timeout=%d&_sync=%s&cache=shared", busyTimeoutMS, o.synchronous)
 		} else {
-			readDSN += fmt.Sprintf("?_journal_mode=WAL&_busy_timeout=%d&cache=shared", busyTimeoutMS)
+			readDSN += fmt.Sprintf("?_journal_mode=WAL&_busy_timeout=%d&_sync=%s&cache=shared", busyTimeoutMS, o.synchronous)
 		}
 	}
 
-	readDB, err = sql.Open(SQLiteDriverName, readDSN)
+	readDB, err = gate.openDB(o.driverName, readDSN)
 	if err != nil {
 		closeAll()
 		return nil, fmt.Errorf("failed to open read database: %w", err)
@@ -146,10 +205,6 @@ func NewReplicatedDatabase(dbPath string, nodeID uint64, clock *hlc.Clock, metaS
 				closeAll()
 				return nil, fmt.Errorf("failed to set busy timeout: %w", err)
 			}
-			if _, err = db.Exec("PRAGMA synchronous=NORMAL"); err != nil {
-				closeAll()
-				return nil, fmt.Errorf("failed to set synchronous mode: %w", err)
-			}
 			if _, err = db.Exec("PRAGMA cache_size=-64000"); err != nil {
 				closeAll()
 				return nil, fmt.Errorf("failed to set cache size: %w", err)
@@ -170,13 +225,39 @@ func NewReplicatedDatabase(dbPath string, nodeID uint64, clock *hlc.Clock, metaS
 		}
 	}
 
+	// The migration rule for __marmot_schema_version turns on whether
+	// __marmot_applied_txn already existed before this open, so it must be
+	// checked before ensureAppliedTxnTable creates it.
+	filePreexisted := false
+	if !isMemoryDB {
+		if existed, err := sqliteTableExists(writeDB, "__marmot_applied_txn"); err != nil {
+			closeAll()
+			return nil, err
+		} else {
+			filePreexisted = existed
+		}
+	}
+
 	if err := ensureAppliedTxnTable(writeDB); err != nil {
 		closeAll()
 		return nil, err
 	}
-	if err := repairAppliedTxnMetadata(writeDB, metaStore, ""); err != nil {
+	if err := ensureRowVersionTable(writeDB); err != nil {
 		closeAll()
 		return nil, err
+	}
+	if err := repairAppliedTxnMetadata(writeDB, metaStore, o.dbName); err != nil {
+		closeAll()
+		return nil, err
+	}
+
+	// Every database file carries __marmot_schema_version, whichever path
+	// opened it: a commit that bumps it must never find it missing. Only a
+	// named user database migrates a legacy value into it.
+	schemaVersion, err := ensureSchemaVersionTable(writeDB, o.dbName, filePreexisted, o.legacySchemaVersion)
+	if err != nil {
+		closeAll()
+		return nil, fmt.Errorf("failed to prepare schema version table: %w", err)
 	}
 
 	// Create schema cache (shared by TransactionManager and preupdate hooks)
@@ -184,10 +265,14 @@ func NewReplicatedDatabase(dbPath string, nodeID uint64, clock *hlc.Clock, metaS
 
 	// Create transaction manager (uses write connection + MetaStore + schema cache)
 	txnMgr := NewTransactionManager(writeDB, metaStore, clock, schemaCache)
+	if err := seedClockFromLog(clock, metaStore); err != nil {
+		closeAll()
+		return nil, err
+	}
 
 	// Create batch committer for SQLite-level batching (opens its own optimized connection)
 	var batchCommitter *SQLiteBatchCommitter
-	if cfg.Config.BatchCommit.Enabled {
+	if o.batchCommit {
 		batchCommitter = NewSQLiteBatchCommitter(
 			dbPath,
 			cfg.Config.BatchCommit.MaxBatchSize,
@@ -200,6 +285,7 @@ func NewReplicatedDatabase(dbPath string, nodeID uint64, clock *hlc.Clock, metaS
 			cfg.Config.BatchCommit.IncrementalVacuumPages,
 			cfg.Config.BatchCommit.IncrementalVacuumTimeLimitMS,
 		)
+		batchCommitter.gate = gate
 		if err := batchCommitter.Start(); err != nil {
 			closeAll()
 			return nil, fmt.Errorf("failed to start batch committer: %w", err)
@@ -216,7 +302,14 @@ func NewReplicatedDatabase(dbPath string, nodeID uint64, clock *hlc.Clock, metaS
 		nodeID:         nodeID,
 		batchCommitter: batchCommitter,
 		schemaCache:    schemaCache,
+		gate:           gate,
+		dbName:         o.dbName,
 	}
+	mdb.schemaVersion.Store(schemaVersion)
+	if o.dbName != "" {
+		txnMgr.SetSchemaVersionBumped(func(v uint64) { mdb.advanceSchemaVersion(v) })
+	}
+	txnMgr.SetAppliedMarkerCheck(mdb.appliedMarkerExists)
 
 	// Wire batch committer to transaction manager
 	if batchCommitter != nil {
@@ -233,6 +326,16 @@ func NewReplicatedDatabase(dbPath string, nodeID uint64, clock *hlc.Clock, metaS
 	}
 
 	return mdb, nil
+}
+
+// appliedMarkerExists reports whether __marmot_applied_txn holds txnID,
+// read through the read pool so it never waits on the single writer.
+func (mdb *ReplicatedDatabase) appliedMarkerExists(txnID uint64) (bool, error) {
+	readDB := mdb.readDB
+	if readDB == nil {
+		return false, errors.New("database connections are closed")
+	}
+	return markerExists(readDB, txnID)
 }
 
 // SetReplicationFunc sets the replication function
@@ -299,46 +402,83 @@ func (mdb *ReplicatedDatabase) GetClock() *hlc.Clock {
 	return mdb.clock
 }
 
-// Close closes the database connections, MetaStore, and stops GC.
-// Order is important: stop GC first, then close connections.
+// Close closes the database connections and the MetaStore and stops GC
+// (closeSQLite). It does not wait for a write transaction in flight: that
+// transaction's commit is refused (see writeGate).
 func (mdb *ReplicatedDatabase) Close() error {
-	// Stop GC goroutine first to prevent it from accessing closed connections
-	if mdb.txnMgr != nil {
-		mdb.txnMgr.StopGarbageCollection()
+	err := mdb.closeSQLite()
+	if mdb.metaStore != nil {
+		if msErr := mdb.metaStore.Close(); err == nil {
+			err = msErr
+		}
 	}
+	return err
+}
 
-	// Stop batch committer (flushes pending)
+// closeSQLite closes the database's SQLite file for good, leaving the meta
+// store open: the batch committer stops after committing what is queued, no
+// later commit on any of the database's connections succeeds (writeGate), the
+// GC stops, and the pools close. The pool fields keep their closed *sql.DB, so
+// a caller still holding the database gets "sql: database is closed", never a
+// nil pool.
+//
+// The caller must not hold DatabaseManager.mu: stopping the GC waits for a
+// pass that may itself be waiting on that lock.
+func (mdb *ReplicatedDatabase) closeSQLite() error {
 	if mdb.batchCommitter != nil {
 		mdb.batchCommitter.Stop()
 	}
+	mdb.gate.close()
+	return mdb.closePools()
+}
 
-	var errs []error
-
-	if mdb.writeDB != nil {
-		if err := mdb.writeDB.Close(); err != nil {
-			errs = append(errs, err)
-		}
+// drainSQLite takes the database's SQLite file out of service for a restore
+// that will replace it, leaving the meta store open. Unlike closeSQLite it
+// refuses first: the gate closes before the batch committer stops, so the
+// commits it has queued are refused rather than written into the file being
+// replaced (their transactions stay prepared). It then waits, bounded by ctx,
+// for the write transaction in flight on writeDB to finish: when it returns
+// nil, every commit that passed the gate before it closed has completed, and
+// none can complete later. If ctx ends first it returns that error, still
+// tearing everything down; a commit already past the gate may then complete
+// later. A failure to close a pool is logged, not returned: it says nothing
+// about what the database's file holds.
+//
+// The caller must not hold DatabaseManager.mu (see closeSQLite).
+func (mdb *ReplicatedDatabase) drainSQLite(ctx context.Context) error {
+	mdb.gate.close()
+	if mdb.batchCommitter != nil {
+		mdb.batchCommitter.Stop()
 	}
-	if mdb.hookDB != nil {
-		if err := mdb.hookDB.Close(); err != nil {
-			errs = append(errs, err)
-		}
+	// writeDB has a single connection: getting it means the transaction that
+	// held it has committed or rolled back. Holding it through the pool's
+	// Close keeps every other caller off it.
+	held, err := mdb.writeDB.Conn(ctx)
+	if closeErr := mdb.closePools(); closeErr != nil {
+		log.Warn().Err(closeErr).Msg("Error closing a drained database's SQLite pools")
 	}
-	if mdb.readDB != nil {
-		if err := mdb.readDB.Close(); err != nil {
-			errs = append(errs, err)
-		}
+	if err != nil {
+		return fmt.Errorf("drain in-flight writes: %w", err)
 	}
-	if mdb.metaStore != nil {
-		if err := mdb.metaStore.Close(); err != nil {
-			errs = append(errs, err)
-		}
-	}
-
-	if len(errs) > 0 {
-		return errs[0]
-	}
+	_ = held.Close()
 	return nil
+}
+
+// closePools stops the GC and closes the SQLite pools.
+func (mdb *ReplicatedDatabase) closePools() error {
+	if mdb.txnMgr != nil {
+		mdb.txnMgr.StopGarbageCollection()
+	}
+	var errs []error
+	for _, pool := range []*sql.DB{mdb.writeDB, mdb.hookDB, mdb.readDB} {
+		if pool == nil {
+			continue
+		}
+		if err := pool.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // CloseSQLiteConnections closes all SQLite connections synchronously.
@@ -362,6 +502,8 @@ func (mdb *ReplicatedDatabase) CloseSQLiteConnections() {
 
 // OpenSQLiteConnections opens new SQLite connections to the database file.
 // This MUST be called AFTER database files have been replaced during snapshot apply.
+// Like the pools NewReplicatedDatabase opens, they are gated: once the
+// database leaves service, their commits are refused.
 // Note: This does NOT touch MetaStore (PebbleDB) - only SQLite connections.
 func (mdb *ReplicatedDatabase) OpenSQLiteConnections(dbPath string) error {
 	busyTimeoutMS := cfg.Config.Transaction.LockWaitTimeoutSeconds * 1000
@@ -369,7 +511,7 @@ func (mdb *ReplicatedDatabase) OpenSQLiteConnections(dbPath string) error {
 
 	// Open write connection
 	writeDSN := fmt.Sprintf("%s?_journal_mode=WAL&_busy_timeout=%d&_txlock=immediate&cache=shared", dbPath, busyTimeoutMS)
-	writeDB, err := sql.Open(SQLiteDriverName, writeDSN)
+	writeDB, err := mdb.gate.openDB(SQLiteDriverName, writeDSN)
 	if err != nil {
 		return fmt.Errorf("failed to open write connection: %w", err)
 	}
@@ -384,7 +526,7 @@ func (mdb *ReplicatedDatabase) OpenSQLiteConnections(dbPath string) error {
 	}
 
 	// Open hook connection
-	hookDB, err := sql.Open(SQLiteDriverName, writeDSN)
+	hookDB, err := mdb.gate.openDB(SQLiteDriverName, writeDSN)
 	if err != nil {
 		writeDB.Close()
 		return fmt.Errorf("failed to open hook connection: %w", err)
@@ -395,7 +537,7 @@ func (mdb *ReplicatedDatabase) OpenSQLiteConnections(dbPath string) error {
 
 	// Open read connection pool
 	readDSN := fmt.Sprintf("%s?_journal_mode=WAL&_busy_timeout=%d&cache=shared", dbPath, busyTimeoutMS)
-	readDB, err := sql.Open(SQLiteDriverName, readDSN)
+	readDB, err := mdb.gate.openDB(SQLiteDriverName, readDSN)
 	if err != nil {
 		writeDB.Close()
 		hookDB.Close()
@@ -472,6 +614,39 @@ func (mdb *ReplicatedDatabase) GetMetaStore() MetaStore {
 	return mdb.metaStore
 }
 
+// DatabaseName returns the name this database was opened under ("" for the
+// system database).
+func (mdb *ReplicatedDatabase) DatabaseName() string {
+	return mdb.dbName
+}
+
+// SchemaVersion returns the cached __marmot_schema_version value. It
+// is always 0 for the system database, which has no such table.
+func (mdb *ReplicatedDatabase) SchemaVersion() uint64 {
+	return mdb.schemaVersion.Load()
+}
+
+// advanceSchemaVersion raises the cached __marmot_schema_version value to v,
+// never lowering it: every post-commit store of a value read
+// from the database itself - the replay path and the 2PC non-DML commit
+// callback - goes through this instead of a plain Store, because two such
+// commits can finish in either order (replay's anti-entropy goroutine versus
+// this node's own DDL committer) and an out-of-order Store would regress the
+// cache below a value SQLite itself already has committed, wrongly declining
+// the PREPARE gate until the next DDL. The initial Store at open (a restore
+// reopen legitimately resets the cache) is exempt and stays a plain Store.
+func (mdb *ReplicatedDatabase) advanceSchemaVersion(v uint64) {
+	for {
+		cur := mdb.schemaVersion.Load()
+		if v <= cur {
+			return
+		}
+		if mdb.schemaVersion.CompareAndSwap(cur, v) {
+			return
+		}
+	}
+}
+
 // GetCachedTableSchema returns the cached schema for a table.
 // This uses the in-memory schema cache and does NOT query SQLite.
 func (mdb *ReplicatedDatabase) GetCachedTableSchema(tableName string) (*TableSchema, error) {
@@ -495,12 +670,6 @@ func (mdb *ReplicatedDatabase) ApplyCDCEntries(entries []*IntentEntry) error {
 		return fmt.Errorf("transaction manager not initialized")
 	}
 	return mdb.txnMgr.applyCDCEntries(0, mdb.clock.Now(), entries)
-}
-
-// PendingLocalExecution represents a locally executed transaction waiting for quorum
-// The SQLite transaction is held open until Commit or Rollback is called
-type PendingLocalExecution struct {
-	session *EphemeralHookSession // Ephemeral session (owns its connection)
 }
 
 // CompletedLocalExecution represents a CDC capture that's already been rolled back.
@@ -562,71 +731,13 @@ func (c *CompletedLocalExecution) GetCDCEntries() []common.CDCEntry {
 	return result
 }
 
-// GetLastInsertId returns the last insert ID from the most recent insert
+// GetLastInsertId returns the OK packet's insert id for this execution: the
+// first AUTO_INCREMENT value the statement generated, or 0 when it generated
+// none. The name mirrors MySQL's own OK-packet field and the coordinator
+// interface; the value is deliberately the FIRST id, not the last, which is
+// what SQLite's connection-wide last-rowid register would have given.
 func (c *CompletedLocalExecution) GetLastInsertId() int64 {
 	return c.lastInsertId
-}
-
-// GetTotalRowCount returns count from CDC entries.
-func (p *PendingLocalExecution) GetTotalRowCount() int64 {
-	entries := p.GetCDCEntries()
-	return int64(len(entries))
-}
-
-// Commit finalizes the local transaction
-func (p *PendingLocalExecution) Commit() error {
-	if p.session != nil {
-		return p.session.Commit()
-	}
-	return nil
-}
-
-// Rollback aborts the local transaction
-func (p *PendingLocalExecution) Rollback() error {
-	if p.session != nil {
-		return p.session.Rollback()
-	}
-	return nil
-}
-
-// GetIntentEntries returns CDC entries from the system database
-func (p *PendingLocalExecution) GetIntentEntries() ([]*IntentEntry, error) {
-	if p.session == nil {
-		return nil, nil
-	}
-	return p.session.GetIntentEntries()
-}
-
-// GetCDCEntries returns CDC data captured by hooks for replication
-func (p *PendingLocalExecution) GetCDCEntries() []common.CDCEntry {
-	if p.session == nil {
-		return nil
-	}
-	entries, err := p.session.GetIntentEntries()
-	if err != nil || len(entries) == 0 {
-		return nil
-	}
-	result := make([]common.CDCEntry, len(entries))
-	for i, e := range entries {
-		result[i] = common.CDCEntry{
-			Table:        e.Table,
-			IntentKey:    e.IntentKey,
-			Operation:    e.Operation,
-			OldValues:    e.OldValues,
-			NewValues:    e.NewValues,
-			EncodedRow:   e.EncodedRow,
-			EncodedCodec: e.EncodedCodec,
-		}
-	}
-	return result
-}
-
-// GetLastInsertId returns the last insert ID from the most recent insert
-func (p *PendingLocalExecution) GetLastInsertId() int64 {
-	if p.session == nil {
-		return 0
-	}
-	return p.session.GetLastInsertId()
 }
 
 // ExecuteLocalWithHooks executes SQL locally with preupdate hooks capturing CDC data.
@@ -643,7 +754,7 @@ func (p *PendingLocalExecution) GetLastInsertId() int64 {
 //
 // This design avoids deadlock: hookDB is released before 2PC broadcast,
 // so incoming COMMIT from other coordinators can acquire writeDB.
-func (mdb *ReplicatedDatabase) ExecuteLocalWithHooks(ctx context.Context, txnID uint64, requests []coordinator.ExecutionRequest) (coordinator.PendingExecution, error) {
+func (mdb *ReplicatedDatabase) ExecuteLocalWithHooks(ctx context.Context, txnID uint64, req coordinator.ExecutionRequest) (coordinator.PendingExecution, error) {
 	// Create ephemeral session with hookDB (NOT writeDB - avoids deadlock)
 	// SchemaCache must be pre-populated via ReloadSchema() before calling this
 	session, err := StartEphemeralSession(ctx, mdb.hookDB, mdb.metaStore, mdb.schemaCache, txnID)
@@ -658,7 +769,7 @@ func (mdb *ReplicatedDatabase) ExecuteLocalWithHooks(ctx context.Context, txnID 
 				cdcEntries:   nil,
 				lastInsertId: 0,
 				db:           mdb,
-				rowCount:     int64(len(requests)),
+				rowCount:     1,
 			}, nil
 		}
 		return nil, fmt.Errorf("failed to start session: %w", err)
@@ -670,18 +781,13 @@ func (mdb *ReplicatedDatabase) ExecuteLocalWithHooks(ctx context.Context, txnID 
 		return nil, fmt.Errorf("failed to begin transaction: %w", err)
 	}
 
-	// Execute each statement - hooks capture raw CDC data to Pebble.
+	// Execute the statement - hooks capture raw CDC data to Pebble.
 	// rows-affected is not used here: this autocommit path computes it from
 	// the captured CDC entries via CompletedLocalExecution.GetTotalRowCount.
-	for _, req := range requests {
-		if _, err := session.ExecContext(ctx, req.SQL, req.Params...); err != nil {
-			_ = session.Rollback()
-			return nil, fmt.Errorf("failed to execute statement: %w", err)
-		}
+	if _, err := session.ExecContext(ctx, req.SQL, req.Params...); err != nil {
+		_ = session.Rollback()
+		return nil, fmt.Errorf("failed to execute statement: %w", err)
 	}
-
-	// Get last insert ID BEFORE rollback (available immediately)
-	lastInsertId := session.GetLastInsertId()
 
 	// ROLLBACK hookDB - this also calls ProcessCapturedRows which converts
 	// raw captured data to IntentEntries
@@ -698,6 +804,12 @@ func (mdb *ReplicatedDatabase) ExecuteLocalWithHooks(ctx context.Context, txnID 
 		return nil, fmt.Errorf("failed to collect CDC entries: %w", err)
 	}
 	session.cleanup()
+
+	// The insert id comes from this statement's own CDC entries, not from
+	// SQLite's connection-wide last-rowid register: hookDB is capped at one
+	// connection, so that register is shared by every client in turn. The
+	// signature takes one request, so cdcEntries cannot span two statements.
+	lastInsertId := statementInsertID(mdb.schemaCache, cdcEntries)
 
 	// Return completed execution with captured CDC data
 	return &CompletedLocalExecution{
@@ -731,7 +843,7 @@ func (p *pinnedHookSession) ExecuteStatement(ctx context.Context, sql string, pa
 	if err := p.session.captureAndLockNewRows(); err != nil {
 		return 0, 0, err
 	}
-	return rowsAffected, p.session.GetLastInsertId(), nil
+	return rowsAffected, p.session.StatementInsertID(), nil
 }
 
 func (p *pinnedHookSession) Query(ctx context.Context, sqlText string, params []interface{}) ([]string, []map[string]interface{}, error) {

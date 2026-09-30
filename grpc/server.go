@@ -15,27 +15,19 @@ import (
 	"time"
 
 	"github.com/maxpert/marmot/cfg"
-	"github.com/maxpert/marmot/common"
 	"github.com/maxpert/marmot/coordinator"
 	"github.com/maxpert/marmot/db"
 	"github.com/rs/zerolog/log"
 	"github.com/soheilhy/cmux"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/reflection"
+	"google.golang.org/grpc/status"
 )
 
 // errStopIteration is a sentinel error used to exit early from transaction iteration.
 var errStopIteration = errors.New("stop iteration")
-
-// snapshotCacheEntry represents a cached snapshot for a database
-type snapshotCacheEntry struct {
-	snapshotInfo db.SnapshotInfo
-	maxTxnID     uint64
-	createdAt    time.Time
-	expiresAt    time.Time
-	tempDir      string
-}
 
 // Server implements the gRPC server for Marmot
 type Server struct {
@@ -62,9 +54,13 @@ type Server struct {
 	// CDC signal-based change streaming
 	cdcSubscriber db.CDCSubscriber
 
-	// Snapshot caching
-	snapshotCache   map[string]*snapshotCacheEntry
-	snapshotCacheMu sync.RWMutex
+	// antiEntropy reports each local database's caught-up/stuck status.
+	// nil until SetAntiEntropy is called
+	// (marmot.go, once AntiEntropyService is constructed).
+	antiEntropy *AntiEntropyService
+
+	// Per-database snapshot exports served within snapshot_cache_ttl_seconds
+	snapshotExports snapshotExportCache
 
 	mu       sync.RWMutex
 	stopCh   chan struct{}
@@ -79,21 +75,24 @@ type ServerConfig struct {
 	Address          string
 	Port             int
 	AdvertiseAddress string
+	// DataDir is where the node registry persists cluster membership so a
+	// restart does not compute a quorum from a membership of one. Empty
+	// disables persistence (tests, embedded use without a data directory).
+	DataDir string
 }
 
 // NewServer creates a new gRPC server
 func NewServer(config ServerConfig) (*Server, error) {
 	s := &Server{
-		nodeID:        config.NodeID,
-		address:       config.Address,
-		port:          config.Port,
-		httpMux:       http.NewServeMux(),
-		snapshotCache: make(map[string]*snapshotCacheEntry),
-		stopCh:        make(chan struct{}),
+		nodeID:  config.NodeID,
+		address: config.Address,
+		port:    config.Port,
+		httpMux: http.NewServeMux(),
+		stopCh:  make(chan struct{}),
 	}
 
 	// Initialize components with advertise address
-	s.registry = NewNodeRegistry(config.NodeID, config.AdvertiseAddress)
+	s.registry = NewNodeRegistryWithDataDir(config.NodeID, config.AdvertiseAddress, config.DataDir)
 	s.gossip = NewGossipProtocol(config.NodeID, s.registry)
 
 	// Set up callback to connect to nodes when they become ALIVE
@@ -456,97 +455,27 @@ func (s *Server) Read(ctx context.Context, req *ReadRequest) (*ReadResponse, err
 	return &ReadResponse{}, nil
 }
 
-// sendChangeEvent converts a TransactionRecord to ChangeEvent and sends it on the stream.
-// Handles both CDC (Change Data Capture) path with row data and DDL path with SQL statements.
-// Reads CDC entries from MetaStore for the transaction and converts them to Statement objects.
+// sendChangeEvent converts a TransactionRecord to ChangeEvent and sends it on
+// the stream, using the same captured-row-to-Statement conversion
+// FetchTransactions shares (statementFromCapturedRow, grpc/log_server.go).
+// StreamChanges keeps its existing lenient semantics for read replicas: an
+// iterate or decode error is logged and that row is skipped
+// rather than failing the whole stream (lenientStatementsFromLog) - unlike
+// FetchTransactions, which fails the call outright.
 func (s *Server) sendChangeEvent(rec *db.TransactionRecord, metaStore db.MetaStore, stream MarmotService_StreamChangesServer) error {
-	// Build statements from CDC entries in MetaStore
-	var statements []*Statement
-
-	cursor, err := metaStore.IterateCapturedRows(rec.TxnID)
-	if err != nil {
-		log.Warn().Err(err).Uint64("txn_id", rec.TxnID).Msg("Failed to iterate captured rows for streaming")
-	} else {
-		defer cursor.Close()
-		for cursor.Next() {
-			_, data := cursor.Row()
-			row, err := db.DecodeRow(data)
-			if err != nil {
-				log.Warn().Err(err).Uint64("txn_id", rec.TxnID).Msg("Failed to decode captured row")
-				continue
-			}
-
-			// Convert OpType to wire StatementType
-			stmtCode := db.OpTypeToStatementType(db.OpType(row.Op))
-			wireType := common.MustToWireType(stmtCode)
-
-			var stmt *Statement
-			switch db.OpType(row.Op) {
-			case db.OpTypeVectorIndex:
-				if row.VectorIndexChange == nil {
-					log.Warn().Uint64("txn_id", rec.TxnID).Msg("Vector index CDC row missing payload")
-					continue
-				}
-				stmt = &Statement{
-					Type:      common.MustToWireType(common.StatementVectorIndexControl),
-					TableName: row.Table,
-					Database:  rec.DatabaseName,
-					Payload: &Statement_VectorIndexChange{
-						VectorIndexChange: vectorChangeToProto(*row.VectorIndexChange),
-					},
-				}
-			case db.OpTypeDDL:
-				// DDL statement - use DDLChange payload
-				stmt = &Statement{
-					Type:      wireType,
-					TableName: row.Table,
-					Database:  rec.DatabaseName,
-					Payload: &Statement_DdlChange{
-						DdlChange: &DDLChange{
-							Sql: row.DDLSQL,
-						},
-					},
-				}
-			case db.OpTypeLoadData:
-				stmt = &Statement{
-					Type:      wireType,
-					TableName: row.Table,
-					Database:  rec.DatabaseName,
-					Payload: &Statement_LoadDataChange{
-						LoadDataChange: &LoadDataChange{
-							Sql:  row.LoadSQL,
-							Data: row.LoadData,
-						},
-					},
-				}
-			default:
-				// DML statement - use RowChange payload
-				stmt = &Statement{
-					Type:      wireType,
-					TableName: row.Table,
-					Database:  rec.DatabaseName,
-					Payload: &Statement_RowChange{
-						RowChange: &RowChange{
-							EncodedRow:      append([]byte(nil), data...),
-							EncodedRowCodec: db.EncodedCapturedRowCodecMsgpack(),
-						},
-					},
-				}
-			}
-			statements = append(statements, stmt)
-		}
-	}
-
 	event := &ChangeEvent{
 		TxnId:  rec.TxnID,
 		SeqNum: rec.SeqNum,
 		Timestamp: &HLC{
 			WallTime: rec.CommitTSWall,
 			Logical:  rec.CommitTSLogical,
+			NodeId:   rec.NodeID,
 		},
-		Statements:            statements,
+		Statements:            lenientStatementsFromLog(rec, metaStore),
 		Database:              rec.DatabaseName,
 		RequiredSchemaVersion: rec.RequiredSchemaVersion,
+		OriginNodeId:          rec.NodeID,
+		RowCount:              rec.RowCount,
 	}
 
 	return stream.Send(event)
@@ -741,11 +670,25 @@ func (s *Server) streamHistoricalTransactions(
 	return nil
 }
 
-// GetReplicationState returns current replication state for anti-entropy
-// Returns per-database replication progress for the requesting peer
+// GetReplicationState is kept only for rolling upgrades: a peer on a release
+// before the commit-log pull protocol still calls it, during its own
+// anti-entropy negotiation. Its wire shape is frozen - no field is ever added
+// to it again - so it reports the log-pull replication state mapped into the
+// old fields rather than the removed MetaStore.ReplicationState table:
+//   - LastAppliedTxnId is req.RequestingNodeId's last-consumed position in
+//     this database's log (MetaStore.ConsumedPositions), i.e. how far that
+//     peer has pulled from this node - the closest equivalent of "last
+//     applied txn id from this peer".
+//   - SyncStatus is derived from AntiEntropyService: STUCK if the database
+//     has any stuck transaction (LogPuller.StuckTxns), SYNCED if
+//     AntiEntropyService.CaughtUp, CATCHING_UP otherwise.
+//   - LastAppliedTimestamp has no equivalent (log positions are (seq,
+//     txnID), not HLC) and is always the zero timestamp.
+//   - LastSyncTime has no equivalent and is always zero.
 func (s *Server) GetReplicationState(ctx context.Context, req *ReplicationStateRequest) (*ReplicationStateResponse, error) {
 	s.mu.RLock()
 	dbManager := s.dbManager
+	antiEntropy := s.antiEntropy
 	s.mu.RUnlock()
 
 	if dbManager == nil {
@@ -757,75 +700,16 @@ func (s *Server) GetReplicationState(ctx context.Context, req *ReplicationStateR
 		Str("database_filter", req.Database).
 		Msg("Replication state requested")
 
-	var states []*DatabaseReplicationState
-
-	// Get list of databases to query
 	var databases []string
 	if req.Database != "" {
-		// Specific database requested
 		databases = []string{req.Database}
 	} else {
-		// All databases
 		databases = dbManager.ListDatabases()
 	}
 
-	// Query replication state for each database
+	states := make([]*DatabaseReplicationState, 0, len(databases))
 	for _, dbName := range databases {
-		// Get last applied txn_id from replication_state table for this peer
-		repState, err := dbManager.GetReplicationState(req.RequestingNodeId, dbName)
-		var lastAppliedTxnID uint64
-		var lastAppliedTS *HLC
-		var lastSyncTime int64
-		var syncStatus string
-
-		if err != nil || repState == nil {
-			// No replication state yet for this peer/database - use defaults
-			lastAppliedTxnID = 0
-			lastAppliedTS = &HLC{WallTime: 0, Logical: 0, NodeId: s.nodeID}
-			lastSyncTime = 0
-			syncStatus = "SYNCED"
-		} else {
-			lastAppliedTxnID = repState.LastAppliedTxnID
-			lastAppliedTS = &HLC{
-				WallTime: repState.LastAppliedTSWall,
-				Logical:  repState.LastAppliedTSLog,
-				NodeId:   s.nodeID,
-			}
-			lastSyncTime = repState.LastSyncTime
-			syncStatus = repState.SyncStatus
-		}
-
-		// Get current max txn_id in this database
-		maxTxnID, err := dbManager.GetMaxTxnID(dbName)
-		if err != nil {
-			log.Warn().Err(err).Str("database", dbName).Msg("Failed to get max txn_id")
-			maxTxnID = 0
-		}
-
-		// Get committed transaction count for data completeness comparison
-		txnCount, err := dbManager.GetCommittedTxnCount(dbName)
-		if err != nil {
-			log.Warn().Err(err).Str("database", dbName).Msg("Failed to get committed txn count")
-			txnCount = 0
-		}
-
-		// Get max sequence number for gap detection
-		maxSeqNum, err := dbManager.GetMaxSeqNum(dbName)
-		if err != nil {
-			log.Warn().Err(err).Str("database", dbName).Msg("Failed to get max seq_num")
-			maxSeqNum = 0
-		}
-
-		states = append(states, &DatabaseReplicationState{
-			DatabaseName:         dbName,
-			LastAppliedTxnId:     lastAppliedTxnID,
-			LastAppliedTimestamp: lastAppliedTS,
-			LastSyncTime:         lastSyncTime,
-			SyncStatus:           syncStatus,
-			CurrentMaxTxnId:      maxTxnID,
-			CommittedTxnCount:    txnCount,
-			MaxSeqNum:            maxSeqNum,
-		})
+		states = append(states, s.legacyReplicationStateFor(dbName, req.RequestingNodeId, dbManager, antiEntropy))
 	}
 
 	return &ReplicationStateResponse{
@@ -833,13 +717,71 @@ func (s *Server) GetReplicationState(ctx context.Context, req *ReplicationStateR
 	}, nil
 }
 
+// legacyReplicationStateFor builds one database's entry for the
+// GetReplicationState shim (see its doc comment).
+func (s *Server) legacyReplicationStateFor(dbName string, requestingNodeID uint64, dbManager *db.DatabaseManager, antiEntropy *AntiEntropyService) *DatabaseReplicationState {
+	var lastAppliedTxnID uint64
+	if mdb, err := dbManager.GetDatabase(dbName); err == nil {
+		if metaStore := mdb.GetMetaStore(); metaStore != nil {
+			if positions, err := metaStore.ConsumedPositions(); err == nil {
+				lastAppliedTxnID = positions[requestingNodeID].TxnID
+			}
+		}
+	}
+
+	syncStatus := "CATCHING_UP"
+	if antiEntropy != nil {
+		switch {
+		case antiEntropy.StuckTxnCount(dbName) > 0:
+			syncStatus = "STUCK"
+		case antiEntropy.CaughtUp(dbName):
+			syncStatus = "SYNCED"
+		}
+	}
+
+	maxTxnID, err := dbManager.GetMaxTxnID(dbName)
+	if err != nil {
+		log.Warn().Err(err).Str("database", dbName).Msg("Failed to get max txn_id")
+	}
+	txnCount, err := dbManager.GetCommittedTxnCount(dbName)
+	if err != nil {
+		log.Warn().Err(err).Str("database", dbName).Msg("Failed to get committed txn count")
+	}
+	maxSeqNum, err := dbManager.GetMaxSeqNum(dbName)
+	if err != nil {
+		log.Warn().Err(err).Str("database", dbName).Msg("Failed to get max seq_num")
+	}
+
+	return &DatabaseReplicationState{
+		DatabaseName:         dbName,
+		LastAppliedTxnId:     lastAppliedTxnID,
+		LastAppliedTimestamp: &HLC{WallTime: 0, Logical: 0, NodeId: s.nodeID},
+		LastSyncTime:         0,
+		SyncStatus:           syncStatus,
+		CurrentMaxTxnId:      maxTxnID,
+		CommittedTxnCount:    txnCount,
+		MaxSeqNum:            maxSeqNum,
+	}
+}
+
 // =======================
 // SNAPSHOT METHODS
 // =======================
 
+// snapshotError reports a snapshot producer's failure. A database detached for
+// its own restore makes this node's snapshot temporarily unavailable rather
+// than incomplete, so that case is codes.Unavailable, which callers retry.
+func snapshotError(msg string, err error) error {
+	if errors.Is(err, db.ErrDatabaseDetached) {
+		return status.Errorf(codes.Unavailable, "%s: %v", msg, err)
+	}
+	return fmt.Errorf("%s: %w", msg, err)
+}
+
 // GetSnapshotInfo returns snapshot metadata for bootstrap.
 // NOTE: This returns estimated info. The actual snapshot is taken atomically
-// during StreamSnapshot to ensure consistency.
+// during StreamSnapshot to ensure consistency; a receiver verifies the files
+// it streams against this info.
 func (s *Server) GetSnapshotInfo(ctx context.Context, req *SnapshotInfoRequest) (*SnapshotInfoResponse, error) {
 	s.mu.RLock()
 	dbManager := s.dbManager
@@ -851,19 +793,19 @@ func (s *Server) GetSnapshotInfo(ctx context.Context, req *SnapshotInfoRequest) 
 
 	log.Info().
 		Uint64("requesting_node", req.RequestingNodeId).
+		Str("database", req.Database).
 		Msg("Snapshot info requested")
+
+	if req.Database != "" {
+		return s.databaseSnapshotInfo(dbManager, req.Database)
+	}
 
 	// Use TakeSnapshot for metadata estimation only
 	// The actual atomic snapshot is taken in StreamSnapshot
 	snapshots, maxTxnID, err := dbManager.TakeSnapshot()
 	if err != nil {
-		return nil, fmt.Errorf("failed to get snapshot info: %w", err)
+		return nil, snapshotError("failed to get snapshot info", err)
 	}
-
-	// Schema versions travel with the snapshot: they live in the MetaStore, which
-	// is not part of the transferred files, and a receiver that cannot recover
-	// them refuses every transaction requiring a newer schema.
-	schemaVersions := snapshotSchemaVersions(dbManager)
 
 	// Calculate total size and chunks (estimates)
 	var totalSize int64
@@ -891,7 +833,6 @@ func (s *Server) GetSnapshotInfo(ctx context.Context, req *SnapshotInfoRequest) 
 			SnapshotTxnId:  txnID,
 			SizeBytes:      snap.Size,
 			Sha256Checksum: snap.SHA256,
-			SchemaVersion:  schemaVersions[snap.Name],
 		})
 	}
 
@@ -907,9 +848,35 @@ func (s *Server) GetSnapshotInfo(ctx context.Context, req *SnapshotInfoRequest) 
 	}, nil
 }
 
+// databaseSnapshotInfo is GetSnapshotInfo for database alone.
+func (s *Server) databaseSnapshotInfo(dbManager *db.DatabaseManager, database string) (*SnapshotInfoResponse, error) {
+	snap, txnID, err := dbManager.TakeDatabaseSnapshotInfo(database)
+	if err != nil {
+		return nil, snapshotError("failed to get snapshot info", err)
+	}
+	chunkSize := int64(coordinator.GetStreamChunkSize())
+	return &SnapshotInfoResponse{
+		SnapshotTxnId:     txnID,
+		SnapshotSizeBytes: snap.Size,
+		TotalChunks:       int32((snap.Size + chunkSize - 1) / chunkSize),
+		Databases: []*DatabaseFileInfo{{
+			Name:           snap.Name,
+			Filename:       snap.Filename,
+			SizeBytes:      snap.Size,
+			Sha256Checksum: snap.SHA256,
+		}},
+		DatabaseMetadata: []*DatabaseSnapshotMetadata{{
+			DatabaseName:   snap.Name,
+			SnapshotTxnId:  txnID,
+			SizeBytes:      snap.Size,
+			Sha256Checksum: snap.SHA256,
+		}},
+	}, nil
+}
+
 // StreamSnapshot streams snapshot chunks to requesting node.
 // Uses atomic snapshot: copies files to temp dir under write lock, then streams from temp.
-// Implements caching with TTL to avoid repeated checkpoints when multiple replicas request same snapshot.
+// A single-database export is shared for snapshot_cache_ttl_seconds when that is above 0.
 func (s *Server) StreamSnapshot(req *SnapshotRequest, stream MarmotService_StreamSnapshotServer) error {
 	s.mu.RLock()
 	dbManager := s.dbManager
@@ -928,129 +895,13 @@ func (s *Server) StreamSnapshot(req *SnapshotRequest, stream MarmotService_Strea
 		Str("database", req.Database).
 		Msg("Starting snapshot stream")
 
-	var snapshots []db.SnapshotInfo
-	var maxTxnID uint64
-	var schemaVersions map[string]uint64
-	var tempDir string
-	var shouldCleanup bool
-
-	if req.Database != "" {
-		// Single database snapshot - use cache
-		cacheKey := req.Database
-
-		// Check cache first
-		s.snapshotCacheMu.RLock()
-		cached, exists := s.snapshotCache[cacheKey]
-		s.snapshotCacheMu.RUnlock()
-
-		if exists && time.Now().Before(cached.expiresAt) {
-			// Cache hit - use cached snapshot
-			log.Debug().
-				Str("database", req.Database).
-				Uint64("cached_txn_id", cached.maxTxnID).
-				Time("expires_at", cached.expiresAt).
-				Msg("Serving cached snapshot")
-
-			snapshots = []db.SnapshotInfo{cached.snapshotInfo}
-			maxTxnID = cached.maxTxnID
-			tempDir = cached.tempDir
-			shouldCleanup = false
-
-			// Single-database snapshots don't capture schema versions in the
-			// same atomic step as the file copy (unlike TakeSnapshotToDir), so
-			// read the current value here instead - it is the best available
-			// estimate for this legacy path.
-			schemaVersions = snapshotSchemaVersions(dbManager)
-		} else {
-			// Cache miss or expired - create new snapshot
-			if exists {
-				log.Debug().
-					Str("database", req.Database).
-					Msg("Cache expired, creating new snapshot")
-				// Clean up old cache entry
-				s.snapshotCacheMu.Lock()
-				delete(s.snapshotCache, cacheKey)
-				s.snapshotCacheMu.Unlock()
-				os.RemoveAll(cached.tempDir)
-			} else {
-				log.Debug().
-					Str("database", req.Database).
-					Msg("Cache miss, creating new snapshot")
-			}
-
-			// Create temp directory for atomic snapshot
-			var err error
-			tempDir, err = os.MkdirTemp(dataDir, "snapshot-export-")
-			if err != nil {
-				return fmt.Errorf("failed to create temp directory: %w", err)
-			}
-
-			snapshot, txnID, err := dbManager.TakeSnapshotForDatabase(tempDir, req.Database)
-			if err != nil {
-				os.RemoveAll(tempDir)
-				return fmt.Errorf("failed to snapshot database %s: %w", req.Database, err)
-			}
-			snapshots = []db.SnapshotInfo{snapshot}
-			maxTxnID = txnID
-			schemaVersions = snapshotSchemaVersions(dbManager)
-
-			// Cache the snapshot
-			ttl := time.Duration(cfg.Config.Replica.SnapshotCacheTTLSec) * time.Second
-			now := time.Now()
-			s.snapshotCacheMu.Lock()
-			s.snapshotCache[cacheKey] = &snapshotCacheEntry{
-				snapshotInfo: snapshot,
-				maxTxnID:     txnID,
-				createdAt:    now,
-				expiresAt:    now.Add(ttl),
-				tempDir:      tempDir,
-			}
-			s.snapshotCacheMu.Unlock()
-
-			log.Info().
-				Str("database", req.Database).
-				Uint64("snapshot_txn_id", txnID).
-				Dur("ttl", ttl).
-				Msg("Single database snapshot created and cached")
-
-			shouldCleanup = false
-		}
-
-	} else {
-		// All databases snapshot (backward compatible, no caching for full snapshots)
-		var err error
-		tempDir, err = os.MkdirTemp(dataDir, "snapshot-export-")
-		if err != nil {
-			return fmt.Errorf("failed to create temp directory: %w", err)
-		}
-
-		snapshots, maxTxnID, schemaVersions, err = dbManager.TakeSnapshotToDir(tempDir)
-		if err != nil {
-			os.RemoveAll(tempDir)
-			return fmt.Errorf("failed to take snapshot: %w", err)
-		}
-
-		log.Info().
-			Int("databases", len(snapshots)).
-			Uint64("snapshot_txn_id", maxTxnID).
-			Msg("Full snapshot created (no caching)")
-
-		shouldCleanup = true
+	export, err := s.exportSnapshot(dbManager, dataDir, req.Database)
+	if err != nil {
+		return err
 	}
-
-	// Advertise the schema versions captured with these exact files as stream
-	// trailer metadata. GetSnapshotInfo's earlier estimate can go stale if a
-	// DDL commits between that call and this one; receivers prefer this value
-	// (see grpc.SnapshotVersionsForRestore) so they never restore a version
-	// older than the files they actually received.
-	if trailer := snapshotSchemaVersionsTrailer(schemaVersions); trailer != nil {
-		stream.SetTrailer(trailer)
-	}
-
-	// Cleanup temp directory when done (only for non-cached snapshots)
-	if shouldCleanup {
-		defer os.RemoveAll(tempDir)
-	}
+	defer export.release()
+	snapshots := export.snapshots
+	maxTxnID := export.maxTxnID
 
 	log.Info().
 		Uint64("requesting_node", req.RequestingNodeId).
@@ -1110,6 +961,10 @@ func (s *Server) StreamSnapshot(req *SnapshotRequest, stream MarmotService_Strea
 					Filename:      snap.Filename,
 					IsLastForFile: isLastForFile,
 				}
+				if isLastForFile {
+					chunk.FileSha256 = snap.SHA256
+					chunk.FileSizeBytes = snap.Size
+				}
 
 				if err := stream.Send(chunk); err != nil {
 					return fmt.Errorf("failed to send chunk: %w", err)
@@ -1133,6 +988,49 @@ func (s *Server) StreamSnapshot(req *SnapshotRequest, stream MarmotService_Strea
 		Msg("Snapshot stream completed")
 
 	return nil
+}
+
+// exportSnapshot returns an export of database (every database when empty)
+// with one reference held for the caller, who must release it. A
+// single-database export is served from, and published to, the cache only
+// when snapshot_cache_ttl_seconds is above 0; otherwise the caller's release
+// removes it, as it does every whole-node export.
+func (s *Server) exportSnapshot(dbManager *db.DatabaseManager, dataDir, database string) (*snapshotExport, error) {
+	ttl := time.Duration(cfg.Config.Replica.SnapshotCacheTTLSec) * time.Second
+	cached := database != "" && ttl > 0
+	if cached {
+		if export := s.snapshotExports.acquire(database, time.Now()); export != nil {
+			log.Debug().Str("database", database).Uint64("cached_txn_id", export.maxTxnID).Msg("Serving cached snapshot")
+			return export, nil
+		}
+	}
+
+	export, err := newSnapshotExport(dataDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temp directory: %w", err)
+	}
+
+	if database == "" {
+		export.snapshots, export.maxTxnID, err = dbManager.TakeSnapshotToDir(export.dir)
+		if err != nil {
+			export.release()
+			return nil, snapshotError("failed to take snapshot", err)
+		}
+		return export, nil
+	}
+
+	snapshot, txnID, err := dbManager.TakeSnapshotForDatabase(export.dir, database)
+	if err != nil {
+		export.release()
+		return nil, snapshotError(fmt.Sprintf("failed to snapshot database %s", database), err)
+	}
+	export.snapshots = []db.SnapshotInfo{snapshot}
+	export.maxTxnID = txnID
+	if cached {
+		export.expiresAt = time.Now().Add(ttl)
+		s.snapshotExports.publish(database, export)
+	}
+	return export, nil
 }
 
 // GetNodeRegistry returns the node registry (for testing/debugging)
@@ -1195,10 +1093,15 @@ func (s *Server) SetMetricsHandler(handler http.Handler) {
 	s.metricsHandler = handler
 }
 
-// SetDatabaseManager sets the database manager for snapshot operations
+// SetDatabaseManager sets the database manager for snapshot operations.
+// On first wiring it removes the export directories a crash left behind: no
+// stream can export before the manager is set.
 func (s *Server) SetDatabaseManager(manager *db.DatabaseManager) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.dbManager == nil && manager != nil {
+		removeOrphanedSnapshotExports(manager.GetDataDir())
+	}
 	s.dbManager = manager
 }
 
@@ -1207,6 +1110,17 @@ func (s *Server) SetCDCSubscriber(subscriber db.CDCSubscriber) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.cdcSubscriber = subscriber
+}
+
+// SetAntiEntropy wires the running AntiEntropyService into the server, so
+// checkPromotionCriteria can additionally require PromotionReady for every
+// local database and GetReplicationState can report real
+// caught-up/stuck status. marmot.go calls this once anti-entropy is
+// constructed.
+func (s *Server) SetAntiEntropy(ae *AntiEntropyService) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.antiEntropy = ae
 }
 
 // =======================
@@ -1289,6 +1203,7 @@ func (s *Server) checkPromotionCriteria() bool {
 	s.mu.RLock()
 	dbManager := s.dbManager
 	replicationHandler := s.replicationHandler
+	antiEntropy := s.antiEntropy
 	s.mu.RUnlock()
 
 	if dbManager == nil {
@@ -1308,20 +1223,42 @@ func (s *Server) checkPromotionCriteria() bool {
 		return false
 	}
 
+	// Schema versions matching is not enough - a database can be current on schema
+	// but still missing committed rows anti-entropy has not pulled yet.
+	// Require every local database to be PromotionReady (AntiEntropyService,
+	// evaluated over alive peers only) before promoting.
+	if antiEntropy != nil {
+		for _, dbName := range localDatabases {
+			if dbName == db.SystemDatabaseName {
+				continue
+			}
+			if !antiEntropy.PromotionReady(dbName) {
+				log.Debug().Str("database", dbName).Msg("Database not promotion-ready, delaying promotion")
+				return false
+			}
+		}
+	}
+
 	// Verify schema versions match or exceed all ALIVE peers
 	// This prevents premature promotion before DDL replication completes
 	if replicationHandler == nil {
 		return false
 	}
+	return schemaVersionsMatchOrExceedPeers(replicationHandler, localDatabases, aliveNodes)
+}
 
+// schemaVersionsMatchOrExceedPeers reports whether every ALIVE peer's
+// reported schema version, for every database it and this node both have, is
+// no higher than this node's own cached version - the second half of
+// checkPromotionCriteria's promotion gate.
+func schemaVersionsMatchOrExceedPeers(replicationHandler *ReplicationHandler, localDatabases []string, aliveNodes []*NodeState) bool {
 	localSchemaVersions, err := replicationHandler.GetAllSchemaVersions()
 	if err != nil {
 		log.Warn().Err(err).Msg("Failed to get local schema versions for promotion check")
 		return false
 	}
 
-	// Build a set of local database names for quick lookup
-	localDBSet := make(map[string]bool)
+	localDBSet := make(map[string]bool, len(localDatabases))
 	for _, dbName := range localDatabases {
 		localDBSet[dbName] = true
 	}
@@ -1335,39 +1272,34 @@ func (s *Server) checkPromotionCriteria() bool {
 
 		// For each database the peer has, check if our schema is at least as recent
 		for dbName, peerVersion := range peerSchemaVersions {
-			// Skip system database - it's not subject to DDL replication
-			if dbName == db.SystemDatabaseName {
+			if dbName == db.SystemDatabaseName || !localDBSet[dbName] {
+				// System database is not subject to DDL replication; a
+				// database we don't have yet arrives via replication - both
+				// are acceptable, continue checking.
 				continue
 			}
-
-			localVersion, hasSchemaEntry := localSchemaVersions[dbName]
-			hasLocalDB := localDBSet[dbName]
-
-			if !hasLocalDB {
-				// Peer has a database we don't have yet - we'll get it via replication
-				// This is acceptable, continue checking
-				continue
-			}
-
-			// If we have the database locally but no schema version entry,
-			// treat it as version 0 (fresh database, no DDL applied yet)
-			if !hasSchemaEntry {
-				localVersion = 0
-			}
-
-			// If peer has higher schema version, we're behind on DDL
-			if localVersion < peerVersion {
-				log.Debug().
-					Str("database", dbName).
-					Uint64("local_version", localVersion).
-					Uint64("peer_version", peerVersion).
-					Uint64("peer_id", peer.NodeId).
-					Msg("Schema version behind peer, delaying promotion")
+			if schemaVersionBehindPeer(localSchemaVersions[dbName], peerVersion, dbName, peer.NodeId) {
 				return false
 			}
 		}
 	}
 
+	return true
+}
+
+// schemaVersionBehindPeer reports (and logs) whether localVersion is behind
+// peerVersion for dbName. A missing local schema version entry is treated as
+// version 0 (fresh database, no DDL applied yet).
+func schemaVersionBehindPeer(localVersion, peerVersion uint64, dbName string, peerNodeID uint64) bool {
+	if localVersion >= peerVersion {
+		return false
+	}
+	log.Debug().
+		Str("database", dbName).
+		Uint64("local_version", localVersion).
+		Uint64("peer_version", peerVersion).
+		Uint64("peer_id", peerNodeID).
+		Msg("Schema version behind peer, delaying promotion")
 	return true
 }
 
@@ -1390,48 +1322,12 @@ func (s *Server) runSnapshotCacheCleanup() {
 	}
 }
 
-// cleanupExpiredSnapshots removes expired cache entries and their temp directories
+// cleanupExpiredSnapshots evicts expired cached exports. A stream still
+// reading one keeps its directory until the stream finishes.
 func (s *Server) cleanupExpiredSnapshots() {
-	now := time.Now()
-	var toDelete []string
-
-	// Collect expired entries
-	s.snapshotCacheMu.RLock()
-	for dbName, entry := range s.snapshotCache {
-		if now.After(entry.expiresAt) {
-			toDelete = append(toDelete, dbName)
-		}
+	if n := s.snapshotExports.evictExpired(time.Now()); n > 0 {
+		log.Debug().Int("evicted", n).Msg("Snapshot cache cleanup completed")
 	}
-	s.snapshotCacheMu.RUnlock()
-
-	if len(toDelete) == 0 {
-		return
-	}
-
-	// Delete expired entries
-	s.snapshotCacheMu.Lock()
-	for _, dbName := range toDelete {
-		entry, exists := s.snapshotCache[dbName]
-		if !exists {
-			continue
-		}
-
-		// Remove temp directory
-		if err := os.RemoveAll(entry.tempDir); err != nil {
-			log.Warn().Err(err).Str("database", dbName).Str("temp_dir", entry.tempDir).Msg("Failed to cleanup expired snapshot cache")
-		}
-
-		delete(s.snapshotCache, dbName)
-
-		log.Debug().
-			Str("database", dbName).
-			Time("created_at", entry.createdAt).
-			Time("expired_at", entry.expiresAt).
-			Msg("Cleaned up expired snapshot cache entry")
-	}
-	s.snapshotCacheMu.Unlock()
-
-	log.Debug().Int("cleaned", len(toDelete)).Msg("Snapshot cache cleanup completed")
 }
 
 // =======================
@@ -1648,7 +1544,7 @@ func (s *Server) TransactionStream(stream grpc.ClientStreamingServer[Transaction
 			}
 
 			// Commit the transaction
-			if err := txnMgr.CommitTransaction(txn); err != nil {
+			if err := txnMgr.CommitTransactionAfter(txn, HLCToTimestamp(commit.CommitTimestamp), nil); err != nil {
 				log.Error().Err(err).
 					Uint64("txn_id", txnID).
 					Str("database", database).

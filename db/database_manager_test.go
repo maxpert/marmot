@@ -1,6 +1,7 @@
 package db
 
 import (
+	"database/sql"
 	"os"
 	"path/filepath"
 	"strings"
@@ -167,17 +168,29 @@ func TestDropDatabase(t *testing.T) {
 		t.Error("Database file was not deleted")
 	}
 
-	// Verify not in registry
+	// The row stays as a tombstone (generation, dropped) rather than being
+	// deleted - see DatabaseRegistryKey - so a later CREATE can fence a stale
+	// peer with a strictly higher generation.
 	var count int
+	var dropped bool
 	err = dm.systemDB.GetDB().QueryRow(
-		"SELECT COUNT(*) FROM __marmot_databases WHERE name = ?", "testdb",
-	).Scan(&count)
+		"SELECT COUNT(*), dropped FROM __marmot_databases WHERE name = ? GROUP BY dropped", "testdb",
+	).Scan(&count, &dropped)
 	if err != nil {
-		t.Errorf("Failed to query registry: %v", err)
+		t.Fatalf("Failed to query registry: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("Expected exactly 1 registry row for 'testdb' after drop, got %d", count)
+	}
+	if !dropped {
+		t.Error("Expected 'testdb' row to be tombstoned (dropped=1) after drop")
 	}
 
-	if count != 0 {
-		t.Error("Database still in registry after drop")
+	// ListDatabases must exclude the tombstone.
+	for _, name := range dm.ListDatabases() {
+		if name == "testdb" {
+			t.Error("ListDatabases still lists a tombstoned database")
+		}
 	}
 }
 
@@ -537,7 +550,7 @@ func TestTakeSnapshotForDatabaseNotFound(t *testing.T) {
 		t.Fatal("Expected error for non-existent database, got nil")
 	}
 
-	expectedErr := "database nonexistent not found"
+	expectedErr := "database nonexistent does not exist"
 	if !strings.Contains(err.Error(), expectedErr) {
 		t.Errorf("Expected error containing '%s', got '%s'", expectedErr, err.Error())
 	}
@@ -656,70 +669,6 @@ func TestTakeSnapshotForDatabaseMaxTxnID(t *testing.T) {
 	}
 
 	t.Logf("✓ TakeSnapshotForDatabase returns correct max_txn_id")
-}
-
-// TestGetReplicationStateNilHandling verifies that GetReplicationState handles nil correctly
-func TestGetReplicationStateNilHandling(t *testing.T) {
-	dm, _ := setupTestDatabaseManager(t)
-	defer dm.Close()
-
-	// Get replication state for a non-existent peer
-	// This should return nil, nil (not found) rather than panic
-	state, err := dm.GetReplicationState(999, DefaultDatabaseName)
-	if err != nil {
-		t.Fatalf("GetReplicationState returned unexpected error: %v", err)
-	}
-
-	// State should be nil when no replication state exists
-	if state != nil {
-		t.Errorf("Expected nil state for non-existent peer, got %+v", state)
-	}
-
-	t.Log("✓ GetReplicationState handles nil correctly for non-existent peers")
-}
-
-// TestGetReplicationStateAfterUpdate verifies that replication state can be set and retrieved
-func TestGetReplicationStateAfterUpdate(t *testing.T) {
-	dm, _ := setupTestDatabaseManager(t)
-	defer dm.Close()
-
-	// Update replication state for a peer
-	state := &ReplicationState{
-		PeerNodeID:        42,
-		DatabaseName:      DefaultDatabaseName,
-		LastAppliedTxnID:  100,
-		LastAppliedTSWall: 1234567890,
-		LastAppliedTSLog:  5,
-		SyncStatus:        "SYNCED",
-	}
-
-	err := dm.UpdateReplicationState(state)
-	if err != nil {
-		t.Fatalf("UpdateReplicationState failed: %v", err)
-	}
-
-	// Get replication state for the peer
-	retrieved, err := dm.GetReplicationState(42, DefaultDatabaseName)
-	if err != nil {
-		t.Fatalf("GetReplicationState returned error: %v", err)
-	}
-
-	if retrieved == nil {
-		t.Fatal("GetReplicationState returned nil for existing peer")
-	}
-
-	// Verify values
-	if retrieved.PeerNodeID != 42 {
-		t.Errorf("Expected PeerNodeID 42, got %d", retrieved.PeerNodeID)
-	}
-	if retrieved.LastAppliedTxnID != 100 {
-		t.Errorf("Expected LastAppliedTxnID 100, got %d", retrieved.LastAppliedTxnID)
-	}
-	if retrieved.SyncStatus != "SYNCED" {
-		t.Errorf("Expected SyncStatus SYNCED, got %s", retrieved.SyncStatus)
-	}
-
-	t.Log("✓ GetReplicationState retrieves correct values after update")
 }
 
 // TestReplica_CreatesOwnSystemDatabase tests that replica creates its own __marmot_system.db
@@ -851,15 +800,19 @@ func TestReplica_DropDatabaseDDL_UpdatesLocalSystemDB(t *testing.T) {
 		t.Fatalf("Failed to drop database: %v", err)
 	}
 
+	// The registry row is kept as a tombstone, not deleted (DatabaseRegistryKey).
+	var dropped bool
 	err = dm.GetSystemDatabase().GetDB().QueryRow(
-		"SELECT COUNT(*) FROM __marmot_databases WHERE name = ?", "db1",
-	).Scan(&count)
+		"SELECT COUNT(*), dropped FROM __marmot_databases WHERE name = ? GROUP BY dropped", "db1",
+	).Scan(&count, &dropped)
 	if err != nil {
 		t.Fatalf("Failed to query system DB after drop: %v", err)
 	}
-
-	if count != 0 {
-		t.Errorf("Expected 0 rows for 'db1' after drop, got %d", count)
+	if count != 1 {
+		t.Errorf("Expected 1 tombstone row for 'db1' after drop, got %d", count)
+	}
+	if !dropped {
+		t.Error("Expected 'db1' row to be tombstoned (dropped=1) after drop")
 	}
 
 	if dm.DatabaseExists("db1") {
@@ -963,7 +916,7 @@ func TestReplica_DoesNotReceiveSystemDBFromPrimary(t *testing.T) {
 	}
 
 	snapshotDir := filepath.Join(primaryDir, "snapshot")
-	snapshots, _, _, err := primaryDM.TakeSnapshotToDir(snapshotDir)
+	snapshots, _, err := primaryDM.TakeSnapshotToDir(snapshotDir)
 	if err != nil {
 		t.Fatalf("Failed to take snapshot: %v", err)
 	}
@@ -1044,60 +997,6 @@ func TestReplica_DoesNotReceiveSystemDBFromPrimary(t *testing.T) {
 	}
 
 	t.Log("✓ Replica does not receive system DB from primary during snapshot")
-}
-
-// TakeSnapshotToDir must return the schema versions it read in the same
-// locked section that produced the copied files, so a caller streaming those
-// exact bytes later can advertise a version that actually matches them -
-// instead of a value read by an earlier, separate call that a concurrent DDL
-// commit could move past.
-func TestTakeSnapshotToDir_ReturnsSchemaVersionsCapturedWithFiles(t *testing.T) {
-	dm, tmpDir := setupTestDatabaseManager(t)
-	defer dm.Close()
-
-	if err := dm.CreateDatabase("appdb"); err != nil {
-		t.Fatalf("Failed to create appdb: %v", err)
-	}
-
-	systemMeta := dm.GetSystemDatabase().GetMetaStore()
-	if err := systemMeta.UpdateSchemaVersion("appdb", 5, "CREATE TABLE t(id INT)", 1); err != nil {
-		t.Fatalf("Failed to seed schema version: %v", err)
-	}
-
-	snapshotDir := filepath.Join(tmpDir, "snapshot")
-	_, _, schemaVersions, err := dm.TakeSnapshotToDir(snapshotDir)
-	if err != nil {
-		t.Fatalf("TakeSnapshotToDir failed: %v", err)
-	}
-
-	if got := schemaVersions["appdb"]; got != 5 {
-		t.Errorf("Expected schema version 5 for appdb, got %d", got)
-	}
-
-	// A version bumped AFTER the snapshot was taken must not appear in the
-	// already-returned map - it describes the files copied above, not
-	// whatever the live database does next.
-	if err := systemMeta.UpdateSchemaVersion("appdb", 6, "ALTER TABLE t ADD COLUMN x", 2); err != nil {
-		t.Fatalf("Failed to bump schema version after snapshot: %v", err)
-	}
-	if got := schemaVersions["appdb"]; got != 5 {
-		t.Errorf("Snapshot's schema versions map must not reflect a later change, got %d", got)
-	}
-}
-
-func TestTakeSnapshotToDir_NoSchemaVersionsIsEmptyMap(t *testing.T) {
-	dm, tmpDir := setupTestDatabaseManager(t)
-	defer dm.Close()
-
-	snapshotDir := filepath.Join(tmpDir, "snapshot")
-	_, _, schemaVersions, err := dm.TakeSnapshotToDir(snapshotDir)
-	if err != nil {
-		t.Fatalf("TakeSnapshotToDir failed: %v", err)
-	}
-
-	if len(schemaVersions) != 0 {
-		t.Errorf("Expected no schema versions for a database manager with no DDL applied, got %v", schemaVersions)
-	}
 }
 
 // TestReplica_SnapshotExcludesSystemDB tests that snapshot preparation excludes system DB for replicas
@@ -1211,4 +1110,371 @@ func TestReplica_SnapshotFileListExcludesSystemDB(t *testing.T) {
 	}
 
 	t.Log("✓ Replica filters system DB from snapshot file list")
+}
+
+// TestMigrateDatabaseRegistrySchema_ExistingRowsBecomeLiveGenerationOne pins
+// the idempotent migration: a system database
+// created before the generation/dropped columns existed gets them added, and
+// its existing rows become (generation 1, live) - the same key a first-ever
+// CREATE stamps.
+func TestMigrateDatabaseRegistrySchema_ExistingRowsBecomeLiveGenerationOne(t *testing.T) {
+	sqlDB, err := sql.Open(SQLiteDriverName, ":memory:")
+	if err != nil {
+		t.Fatalf("Failed to open sqlite: %v", err)
+	}
+	defer sqlDB.Close()
+
+	// Pre-migration shape: no generation/dropped columns.
+	if _, err := sqlDB.Exec(`CREATE TABLE __marmot_databases (
+		name TEXT PRIMARY KEY,
+		created_at INTEGER NOT NULL,
+		path TEXT NOT NULL
+	)`); err != nil {
+		t.Fatalf("Failed to create pre-migration table: %v", err)
+	}
+	if _, err := sqlDB.Exec(
+		"INSERT INTO __marmot_databases (name, created_at, path) VALUES (?, ?, ?)",
+		"legacy", 123, "databases/legacy.db",
+	); err != nil {
+		t.Fatalf("Failed to seed pre-migration row: %v", err)
+	}
+
+	if err := migrateDatabaseRegistrySchema(sqlDB); err != nil {
+		t.Fatalf("migrateDatabaseRegistrySchema failed: %v", err)
+	}
+	// Idempotent: a second call over the now-migrated schema must not error.
+	if err := migrateDatabaseRegistrySchema(sqlDB); err != nil {
+		t.Fatalf("migrateDatabaseRegistrySchema failed on re-run: %v", err)
+	}
+
+	var generation int64
+	var dropped bool
+	if err := sqlDB.QueryRow(
+		"SELECT generation, dropped FROM __marmot_databases WHERE name = ?", "legacy",
+	).Scan(&generation, &dropped); err != nil {
+		t.Fatalf("Failed to read migrated row: %v", err)
+	}
+	if generation != 1 {
+		t.Errorf("Expected migrated row's generation to be 1, got %d", generation)
+	}
+	if dropped {
+		t.Error("Expected migrated row to be live (dropped=0)")
+	}
+}
+
+// TestCreateDatabase_RecreateAfterDrop_YieldsNextGenerationLive pins that
+// CREATE DATABASE on a tombstoned name stamps one generation above the
+// tombstone, live.
+func TestCreateDatabase_RecreateAfterDrop_YieldsNextGenerationLive(t *testing.T) {
+	dm, _ := setupTestDatabaseManager(t)
+	defer dm.Close()
+
+	if err := dm.CreateDatabase("recreatedb"); err != nil {
+		t.Fatalf("Failed to create database: %v", err)
+	}
+	if err := dm.DropDatabase("recreatedb"); err != nil {
+		t.Fatalf("Failed to drop database: %v", err)
+	}
+	if err := dm.CreateDatabase("recreatedb"); err != nil {
+		t.Fatalf("Failed to re-create database: %v", err)
+	}
+
+	key, err := dm.RegistryKey("recreatedb")
+	if err != nil {
+		t.Fatalf("RegistryKey failed: %v", err)
+	}
+	if key != (DatabaseRegistryKey{Generation: 2, Dropped: false}) {
+		t.Errorf("Expected (2, live) after re-create, got %+v", key)
+	}
+	if !dm.DatabaseExists("recreatedb") {
+		t.Error("Expected re-created database to exist")
+	}
+}
+
+// TestRegistryEntries_IncludesTombstonesExcludesSystem pins RegistryEntries'
+// contract: every name ever seen, live or tombstoned, and never the system
+// database.
+func TestRegistryEntries_IncludesTombstonesExcludesSystem(t *testing.T) {
+	dm, _ := setupTestDatabaseManager(t)
+	defer dm.Close()
+
+	if err := dm.CreateDatabase("liveentry"); err != nil {
+		t.Fatalf("Failed to create database: %v", err)
+	}
+	if err := dm.CreateDatabase("droppedentry"); err != nil {
+		t.Fatalf("Failed to create database: %v", err)
+	}
+	if err := dm.DropDatabase("droppedentry"); err != nil {
+		t.Fatalf("Failed to drop database: %v", err)
+	}
+
+	entries, err := dm.RegistryEntries()
+	if err != nil {
+		t.Fatalf("RegistryEntries failed: %v", err)
+	}
+
+	byName := make(map[string]DatabaseRegistryKey, len(entries))
+	for _, e := range entries {
+		if e.Name == SystemDatabaseName {
+			t.Error("RegistryEntries must exclude the system database")
+		}
+		byName[e.Name] = e.Key
+	}
+
+	if got, ok := byName["liveentry"]; !ok || got != (DatabaseRegistryKey{Generation: 1, Dropped: false}) {
+		t.Errorf("Expected liveentry (1, live), got %+v (present=%v)", got, ok)
+	}
+	if got, ok := byName["droppedentry"]; !ok || got != (DatabaseRegistryKey{Generation: 1, Dropped: true}) {
+		t.Errorf("Expected droppedentry (1, dropped), got %+v (present=%v)", got, ok)
+	}
+}
+
+// TestApplyDatabaseOp_HigherKeyApplies verifies ApplyDatabaseOp adopts a key
+// strictly above the local one and reports changed=true.
+func TestApplyDatabaseOp_HigherKeyApplies(t *testing.T) {
+	dm, _ := setupTestDatabaseManager(t)
+	defer dm.Close()
+
+	changed, err := dm.ApplyDatabaseOp("applyhigher", DatabaseRegistryKey{Generation: 1, Dropped: false})
+	if err != nil {
+		t.Fatalf("ApplyDatabaseOp failed: %v", err)
+	}
+	if !changed {
+		t.Error("Expected changed=true for a key above local (never seen)")
+	}
+	if !dm.DatabaseExists("applyhigher") {
+		t.Error("Expected database to be created")
+	}
+}
+
+// TestApplyDatabaseOp_EqualOrLowerIsNoOp verifies ApplyDatabaseOp is a
+// no-op, reporting changed=false, for a key at or below the local one.
+func TestApplyDatabaseOp_EqualOrLowerIsNoOp(t *testing.T) {
+	dm, _ := setupTestDatabaseManager(t)
+	defer dm.Close()
+
+	if err := dm.CreateDatabase("applyeq"); err != nil {
+		t.Fatalf("Failed to create database: %v", err)
+	}
+
+	// Equal.
+	changed, err := dm.ApplyDatabaseOp("applyeq", DatabaseRegistryKey{Generation: 1, Dropped: false})
+	if err != nil {
+		t.Fatalf("ApplyDatabaseOp failed: %v", err)
+	}
+	if changed {
+		t.Error("Expected changed=false for a key equal to local")
+	}
+
+	// Below: generation 0 is only ever below a real (>=1) live generation.
+	changed, err = dm.ApplyDatabaseOp("applyeq", DatabaseRegistryKey{Generation: 0, Dropped: true})
+	if err != nil {
+		t.Fatalf("ApplyDatabaseOp failed: %v", err)
+	}
+	if changed {
+		t.Error("Expected changed=false for a key below local")
+	}
+	if !dm.DatabaseExists("applyeq") {
+		t.Error("A no-op ApplyDatabaseOp must not drop the database")
+	}
+}
+
+// TestApplyDatabaseOp_DroppedBeatsLiveAtSameGeneration verifies (g, dropped)
+// outranks (g, live): a DROP at the same generation as the local live key is
+// applied.
+func TestApplyDatabaseOp_DroppedBeatsLiveAtSameGeneration(t *testing.T) {
+	dm, _ := setupTestDatabaseManager(t)
+	defer dm.Close()
+
+	if err := dm.CreateDatabase("dropbeatslive"); err != nil {
+		t.Fatalf("Failed to create database: %v", err)
+	}
+
+	changed, err := dm.ApplyDatabaseOp("dropbeatslive", DatabaseRegistryKey{Generation: 1, Dropped: true})
+	if err != nil {
+		t.Fatalf("ApplyDatabaseOp failed: %v", err)
+	}
+	if !changed {
+		t.Error("Expected (1, dropped) to outrank and replace local (1, live)")
+	}
+	if dm.DatabaseExists("dropbeatslive") {
+		t.Error("Expected database to be dropped")
+	}
+}
+
+// TestApplyDatabaseOp_LiveAtNextGenerationBeatsDropped verifies (g+1, live)
+// outranks a local (g, dropped) tombstone: a re-create is applied over a
+// drop.
+func TestApplyDatabaseOp_LiveAtNextGenerationBeatsDropped(t *testing.T) {
+	dm, _ := setupTestDatabaseManager(t)
+	defer dm.Close()
+
+	if err := dm.CreateDatabase("recreatebeatsdrop"); err != nil {
+		t.Fatalf("Failed to create database: %v", err)
+	}
+	if err := dm.DropDatabase("recreatebeatsdrop"); err != nil {
+		t.Fatalf("Failed to drop database: %v", err)
+	}
+
+	changed, err := dm.ApplyDatabaseOp("recreatebeatsdrop", DatabaseRegistryKey{Generation: 2, Dropped: false})
+	if err != nil {
+		t.Fatalf("ApplyDatabaseOp failed: %v", err)
+	}
+	if !changed {
+		t.Error("Expected (2, live) to outrank and replace local (1, dropped)")
+	}
+	if !dm.DatabaseExists("recreatebeatsdrop") {
+		t.Error("Expected database to be re-created")
+	}
+}
+
+// TestApplyDatabaseOp_PeerLiveNeverResurrectsLocalDropped verifies a peer's
+// (g, live) entry can never resurrect a local (g, dropped) tombstone - the
+// core convergence guarantee (ApplyDatabaseOp's proof).
+func TestApplyDatabaseOp_PeerLiveNeverResurrectsLocalDropped(t *testing.T) {
+	dm, _ := setupTestDatabaseManager(t)
+	defer dm.Close()
+
+	if err := dm.CreateDatabase("neverresurrect"); err != nil {
+		t.Fatalf("Failed to create database: %v", err)
+	}
+	if err := dm.DropDatabase("neverresurrect"); err != nil {
+		t.Fatalf("Failed to drop database: %v", err)
+	}
+
+	// A peer that missed the DROP still reports (1, live) - the key from
+	// before the drop.
+	changed, err := dm.ApplyDatabaseOp("neverresurrect", DatabaseRegistryKey{Generation: 1, Dropped: false})
+	if err != nil {
+		t.Fatalf("ApplyDatabaseOp failed: %v", err)
+	}
+	if changed {
+		t.Error("Expected a peer's (1, live) to lose to local (1, dropped)")
+	}
+	if dm.DatabaseExists("neverresurrect") {
+		t.Error("Database must stay dropped")
+	}
+}
+
+// TestApplyDatabaseOp_MissedCreate_CreatesDatabase models a node that missed
+// the original CREATE DATABASE entirely: it has never seen the name (local
+// key (0, dropped)), and a peer's key creates it.
+func TestApplyDatabaseOp_MissedCreate_CreatesDatabase(t *testing.T) {
+	dm, _ := setupTestDatabaseManager(t)
+	defer dm.Close()
+
+	if dm.DatabaseExists("missedcreate") {
+		t.Fatal("Database must not exist before ApplyDatabaseOp")
+	}
+
+	changed, err := dm.ApplyDatabaseOp("missedcreate", DatabaseRegistryKey{Generation: 1, Dropped: false})
+	if err != nil {
+		t.Fatalf("ApplyDatabaseOp failed: %v", err)
+	}
+	if !changed {
+		t.Error("Expected changed=true")
+	}
+	if !dm.DatabaseExists("missedcreate") {
+		t.Error("Expected the missed database to be created")
+	}
+}
+
+// TestApplyDatabaseOp_MissedDrop_DropsDatabase models a node that missed a
+// DROP DATABASE: it still has the database live locally, and a peer's
+// tombstone key drops it.
+func TestApplyDatabaseOp_MissedDrop_DropsDatabase(t *testing.T) {
+	dm, _ := setupTestDatabaseManager(t)
+	defer dm.Close()
+
+	if err := dm.CreateDatabase("misseddrop"); err != nil {
+		t.Fatalf("Failed to create database: %v", err)
+	}
+
+	changed, err := dm.ApplyDatabaseOp("misseddrop", DatabaseRegistryKey{Generation: 1, Dropped: true})
+	if err != nil {
+		t.Fatalf("ApplyDatabaseOp failed: %v", err)
+	}
+	if !changed {
+		t.Error("Expected changed=true")
+	}
+	if dm.DatabaseExists("misseddrop") {
+		t.Error("Expected the missed drop to be applied")
+	}
+}
+
+// TestApplyDatabaseOp_RefusesSystemAndDefaultDatabase verifies ApplyDatabaseOp
+// keeps the same drop protections DropDatabase enforces directly.
+func TestApplyDatabaseOp_RefusesSystemAndDefaultDatabase(t *testing.T) {
+	dm, _ := setupTestDatabaseManager(t)
+	defer dm.Close()
+
+	if _, err := dm.ApplyDatabaseOp(SystemDatabaseName, DatabaseRegistryKey{Generation: 1, Dropped: false}); err == nil {
+		t.Error("Expected an error applying a create op to the system database")
+	}
+	if _, err := dm.ApplyDatabaseOp(SystemDatabaseName, DatabaseRegistryKey{Generation: 1, Dropped: true}); err == nil {
+		t.Error("Expected an error applying a drop op to the system database")
+	}
+
+	defaultKey, err := dm.RegistryKey(DefaultDatabaseName)
+	if err != nil {
+		t.Fatalf("RegistryKey failed: %v", err)
+	}
+	if _, err := dm.ApplyDatabaseOp(DefaultDatabaseName, DatabaseRegistryKey{Generation: defaultKey.Generation + 1, Dropped: true}); err == nil {
+		t.Error("Expected an error applying a drop op to the default database")
+	}
+	if !dm.DatabaseExists(DefaultDatabaseName) {
+		t.Error("Default database must survive a refused drop")
+	}
+}
+
+// TestApplyDatabaseOpClearsLegacyOnAStampedCreate (see ApplyDatabaseOp's doc
+// comment): a legacy registry row (migrated from an older release's registry,
+// no real generation
+// history) stops being legacy the moment a real, post-upgrade CREATE merges
+// a higher generation into it, so it reconciles as an ordinary live key from
+// then on - including on a peer that has no row for the name at all, which
+// a still-legacy row must never create (reconcileRegistryWithPeer,
+// grpc/anti_entropy.go).
+func TestApplyDatabaseOpClearsLegacyOnAStampedCreate(t *testing.T) {
+	dm, _ := setupTestDatabaseManager(t)
+	defer dm.Close()
+
+	if err := dm.CreateDatabase("legacydb"); err != nil {
+		t.Fatalf("CreateDatabase failed: %v", err)
+	}
+	// Simulate a row migrated from an older release's registry (migrateDatabaseRegistrySchema).
+	if _, err := dm.systemDB.GetDB().Exec("UPDATE __marmot_databases SET legacy = 1 WHERE name = ?", "legacydb"); err != nil {
+		t.Fatalf("failed to mark row legacy: %v", err)
+	}
+
+	// A peer's real, post-upgrade CREATE at a higher generation - merged the
+	// same way anti-entropy's registry reconciliation would.
+	changed, err := dm.ApplyDatabaseOp("legacydb", DatabaseRegistryKey{Generation: 5, Dropped: false})
+	if err != nil {
+		t.Fatalf("ApplyDatabaseOp failed: %v", err)
+	}
+	if !changed {
+		t.Fatal("expected the higher-generation key to be adopted")
+	}
+
+	entries, err := dm.RegistryEntries()
+	if err != nil {
+		t.Fatalf("RegistryEntries failed: %v", err)
+	}
+	var found bool
+	for _, e := range entries {
+		if e.Name != "legacydb" {
+			continue
+		}
+		found = true
+		if e.Legacy {
+			t.Error("a stamped CREATE merged via ApplyDatabaseOp did not clear the legacy flag")
+		}
+		if e.Key.Generation != 5 || e.Key.Dropped {
+			t.Errorf("expected key (5, live), got (%d, dropped=%v)", e.Key.Generation, e.Key.Dropped)
+		}
+	}
+	if !found {
+		t.Fatal("legacydb not found in RegistryEntries")
+	}
 }

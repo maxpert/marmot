@@ -1,6 +1,8 @@
 package grpc
 
 import (
+	"fmt"
+
 	appcommon "github.com/maxpert/marmot/common"
 	"github.com/maxpert/marmot/protocol"
 )
@@ -98,16 +100,34 @@ func vectorActionFromProto(action VectorIndexAction) appcommon.VectorIndexAction
 	}
 }
 
-func protocolStatementFromProto(stmt *Statement) protocol.Statement {
-	internalStmt := protocol.Statement{
-		SQL:       stmt.GetSQL(),
-		Type:      appcommon.MustFromWireType(stmt.Type),
-		TableName: stmt.TableName,
-		Database:  stmt.Database,
-		IntentKey: stmt.GetIntentKey(),
+// protocolStatementFromProto converts a wire Statement into the internal
+// protocol.Statement representation. It returns an error - rather than
+// panicking - when the wire carries a StatementType or a oneof payload case
+// this binary does not recognise, so that a newer peer talking to an older
+// node fails the transaction instead of crashing the process or silently
+// dropping the change.
+func protocolStatementFromProto(stmt *Statement) (protocol.Statement, error) {
+	code, ok := appcommon.FromWireType(stmt.Type)
+	if !ok {
+		return protocol.Statement{}, fmt.Errorf("unknown wire StatementType %d", stmt.Type)
 	}
-	if change := stmt.GetVectorIndexChange(); change != nil {
-		vectorChange := vectorChangeFromProto(change)
+
+	internalStmt := protocol.Statement{
+		SQL:                stmt.GetSQL(),
+		Type:               code,
+		TableName:          stmt.TableName,
+		Database:           stmt.Database,
+		IntentKey:          stmt.GetIntentKey(),
+		AutoIDClaim:        stmt.GetAutoIdClaim(),
+		AutoIDClaimPayload: stmt.GetAutoIdClaimPayload(),
+		DatabaseGeneration: stmt.GetDatabaseGeneration(),
+	}
+
+	switch payload := stmt.Payload.(type) {
+	case nil:
+		// No payload set - accepted as-is (e.g. tests, control-only statements).
+	case *Statement_VectorIndexChange:
+		vectorChange := vectorChangeFromProto(payload.VectorIndexChange)
 		internalStmt.Type = statementTypeForVectorAction(vectorChange.Action)
 		internalStmt.TableName = vectorChange.TableName
 		internalStmt.Database = vectorChange.Database
@@ -120,23 +140,27 @@ func protocolStatementFromProto(stmt *Statement) protocol.Statement {
 		internalStmt.VectorNprobe = vectorChange.Nprobe
 		internalStmt.VectorMaxNorm = vectorChange.MaxNorm
 		internalStmt.VectorIndexChange = &vectorChange
-		return internalStmt
-	}
-	if rowChange := stmt.GetRowChange(); rowChange != nil {
-		internalStmt.EncodedRow = rowChange.EncodedRow
-		internalStmt.EncodedCodec = rowChange.EncodedRowCodec
+		return internalStmt, nil
+	case *Statement_RowChange:
+		internalStmt.EncodedRow = payload.RowChange.EncodedRow
+		internalStmt.EncodedCodec = payload.RowChange.EncodedRowCodec
 		if row, err := decodeRowChange(stmt); err == nil && row != nil {
 			internalStmt.IntentKey = row.IntentKey
 			internalStmt.Operation = row.Op
 			internalStmt.OldValues = row.OldValues
 			internalStmt.NewValues = row.NewValues
 		}
+	case *Statement_LoadDataChange:
+		internalStmt.SQL = payload.LoadDataChange.Sql
+		internalStmt.LoadDataPayload = payload.LoadDataChange.Data
+	case *Statement_DdlChange:
+		// Already consumed above via stmt.GetSQL().
+	case *Statement_DmlIntent:
+		// Already consumed above via stmt.GetIntentKey().
+	default:
+		return protocol.Statement{}, fmt.Errorf("unknown statement payload type %T", payload)
 	}
-	if loadData := stmt.GetLoadDataChange(); loadData != nil {
-		internalStmt.SQL = loadData.Sql
-		internalStmt.LoadDataPayload = loadData.Data
-	}
-	return internalStmt
+	return internalStmt, nil
 }
 
 func statementTypeForVectorAction(action appcommon.VectorIndexAction) protocol.StatementCode {

@@ -96,7 +96,7 @@ func TestProcessQueryLoadDataLocal(t *testing.T) {
 
 	require.Equal(t, []string{
 		"BEGIN",
-		"INSERT INTO users (name, email) VALUES (?, ?), (?, ?)",
+		"INSERT INTO `users` (name, email) VALUES (?, ?), (?, ?)",
 		"COMMIT",
 	}, handler.queries)
 	require.Len(t, handler.params, 1)
@@ -306,4 +306,31 @@ func TestHandshakeOmitsLocalInfileCapabilityWhenDisabled(t *testing.T) {
 	offset += 4 + 8 + 1
 	capsLower := binary.LittleEndian.Uint16(payload[offset : offset+2])
 	require.Zero(t, capsLower&0x0080, "CLIENT_LOCAL_FILES should not be advertised")
+}
+
+// TestLoadDataLocalSpecQualifiedTarget is L3: the target's database
+// qualifier is parsed, bare or backquoted, and the INSERTs name it only when
+// it is not the session's database - never on a session with no current
+// database, which is a replicated apply on the target's own connection.
+//
+// Mutation: go back to one capture for the whole target. "`hq`.`t`" parses
+// as table "hq" and the first assertion fires.
+func TestLoadDataLocalSpecQualifiedTarget(t *testing.T) {
+	for _, tc := range []struct{ sql, database, table string }{
+		{"LOAD DATA LOCAL INFILE 'f' INTO TABLE `hq`.`t` (v)", "hq", "t"},
+		{"LOAD DATA LOCAL INFILE 'f' INTO TABLE hq.t (v)", "hq", "t"},
+		{"LOAD DATA LOCAL INFILE 'f' INTO TABLE `h``q`.t (v)", "h`q", "t"},
+		{"LOAD DATA LOCAL INFILE 'f' INTO TABLE `t` (v)", "", "t"},
+	} {
+		database, table, err := LoadDataTarget(tc.sql)
+		require.NoError(t, err, tc.sql)
+		require.Equal(t, tc.database, database, tc.sql)
+		require.Equal(t, tc.table, table, tc.sql)
+	}
+
+	spec, err := parseLoadDataLocalSpec("LOAD DATA LOCAL INFILE 'f' INTO TABLE hq.t (v)")
+	require.NoError(t, err)
+	require.Equal(t, "`hq`.`t`", spec.target(&ConnectionSession{CurrentDatabase: "marmot"}))
+	require.Equal(t, "`t`", spec.target(&ConnectionSession{CurrentDatabase: "hq"}))
+	require.Equal(t, "`t`", spec.target(&ConnectionSession{}), "a replicated apply must not name an attached schema")
 }

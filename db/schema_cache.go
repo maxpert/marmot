@@ -6,6 +6,7 @@ package db
 import (
 	"database/sql/driver"
 	"fmt"
+	"github.com/maxpert/marmot/protocol/query/transform/intmarker"
 	"io"
 	"strings"
 	"sync"
@@ -192,6 +193,33 @@ func (c *SchemaCache) Update(tableName string, schema *TableSchema) {
 	c.cache[tableName] = schema
 }
 
+// applyWidthMarkers copies each column's declared MySQL integer width out of
+// the CREATE TABLE text and onto its ColumnSchema.
+//
+// The text is the only place the width survives: the transpiler collapses
+// TINYINT..INT to SQLite's single INTEGER type and records the original width
+// as a marker comment, which SQLite preserves verbatim in sqlite_master.sql and
+// normalises away from PRAGMA table_info. Reading the PRAGMA instead would
+// silently give every narrow column the 64-bit path.
+//
+// A table with no markers leaves every field zero, which is exactly the
+// behaviour every table had before markers existed.
+func applyWidthMarkers(schema *TableSchema, createSQL string) {
+	markers := intmarker.Decode(createSQL)
+	if len(markers) == 0 {
+		return
+	}
+	for i := range schema.FullColumns {
+		attrs, ok := markers[strings.ToLower(schema.FullColumns[i].Name)]
+		if !ok {
+			continue
+		}
+		schema.FullColumns[i].DeclaredWidth = attrs.Bits
+		schema.FullColumns[i].Unsigned = attrs.Unsigned
+		schema.FullColumns[i].ExplicitAutoInc = attrs.ExplicitAutoInc
+	}
+}
+
 // loadSchema fetches schema from DB using the raw SQLite connection.
 // Uses PRAGMA table_xinfo (a superset of table_info) rather than table_info:
 //   - cid: column's TRUE ordinal position in the table, including hidden
@@ -356,6 +384,7 @@ func loadSchema(conn *sqlite3.SQLiteConn, tableName string) (*TableSchema, error
 		if createRows.Next(dest) == nil {
 			if sqlText, ok := dest[0].(string); ok {
 				schema.CreateSQL = sqlText
+				applyWidthMarkers(schema, sqlText)
 			}
 		}
 	}

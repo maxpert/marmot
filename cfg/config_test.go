@@ -3,6 +3,7 @@ package cfg
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -596,5 +597,56 @@ func TestReplicaConfig_ValidationRequiresFollowAddresses(t *testing.T) {
 	err = Validate()
 	if err != nil {
 		t.Errorf("Expected no validation error with valid follow_addresses, got: %v", err)
+	}
+}
+
+// TestValidate_StandaloneWithSeedsIsRefused: a standalone node joins no
+// cluster, so naming seeds with it is a contradiction the node must refuse
+// rather than release its AUTO_INCREMENT claim votes alone.
+func TestValidate_StandaloneWithSeedsIsRefused(t *testing.T) {
+	original := Config
+	defer func() { Config = original }()
+
+	Config = &Configuration{
+		Cluster: ClusterConfiguration{
+			GRPCPort:   8080,
+			Standalone: true,
+			SeedNodes:  []string{"node1:8080"},
+		},
+		Replication: ReplicationConfiguration{
+			DefaultWriteConsist: "QUORUM",
+			DefaultReadConsist:  "LOCAL_ONE",
+		},
+	}
+	if err := Validate(); err == nil || !strings.Contains(err.Error(), "standalone") {
+		t.Fatalf("Validate() = %v, want a standalone/seed_nodes refusal", err)
+	}
+}
+
+// TestValidate_StandaloneReplicaIsRefused pins R3c-11's configuration half:
+// a read-only replica follows a cluster, so it is never a standalone node.
+//
+// Mutation: drop the replica check. Validate refuses an unrelated field
+// instead and the assertion names the missing refusal.
+func TestValidate_StandaloneReplicaIsRefused(t *testing.T) {
+	original := Config
+	defer func() { Config = original }()
+
+	Config = &Configuration{
+		Cluster: ClusterConfiguration{
+			GRPCPort:   8080,
+			Standalone: true,
+		},
+		Replica: ReplicaConfiguration{
+			Enabled:         true,
+			FollowAddresses: []string{"node1:8080"},
+		},
+		Replication: ReplicationConfiguration{
+			DefaultWriteConsist: "QUORUM",
+			DefaultReadConsist:  "LOCAL_ONE",
+		},
+	}
+	if err := Validate(); err == nil || !strings.Contains(err.Error(), "replica.enabled") {
+		t.Fatalf("Validate() = %v, want a standalone/replica refusal", err)
 	}
 }

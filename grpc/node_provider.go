@@ -7,14 +7,22 @@ import (
 // GossipNodeProvider implements coordinator.NodeProvider using the gossip protocol's
 // node registry. It returns all alive nodes in the cluster for full database replication.
 type GossipNodeProvider struct {
-	registry *NodeRegistry
+	registry     *NodeRegistry
+	hasSeedNodes bool
 }
 
 // NewGossipNodeProvider creates a new NodeProvider backed by the gossip node registry
-func NewGossipNodeProvider(registry *NodeRegistry) coordinator.NodeProvider {
+func NewGossipNodeProvider(registry *NodeRegistry, hasSeedNodes bool) coordinator.NodeProvider {
 	return &GossipNodeProvider{
-		registry: registry,
+		registry:     registry,
+		hasSeedNodes: hasSeedNodes,
 	}
+}
+
+// HasSeedNodes reports whether this node was configured to join an existing
+// cluster. See coordinator.NodeProvider for why the coordinator needs it.
+func (gnp *GossipNodeProvider) HasSeedNodes() bool {
+	return gnp.hasSeedNodes
 }
 
 // GetAliveNodes returns all ALIVE nodes for replication

@@ -53,9 +53,9 @@ func TestGRPCReplicator_PrepareRejectionCarriesOverRealGRPCConnection(t *testing
 	_, err = dbInstance.GetDB().Exec(`CREATE TABLE groups (group_id INTEGER PRIMARY KEY, creation_date datetime)`)
 	require.NoError(t, err)
 
-	systemDB, err := dbMgr.GetDatabase(db.SystemDatabaseName)
+	_, err = dbMgr.GetDatabase(db.SystemDatabaseName)
 	require.NoError(t, err)
-	handler := NewReplicationHandler(1, dbMgr, clock, db.NewSchemaVersionManager(systemDB.GetMetaStore()))
+	handler := NewReplicationHandler(1, dbMgr, clock, db.NewSchemaVersionManager(dbMgr))
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
@@ -105,4 +105,48 @@ func TestGRPCReplicator_PrepareRejectionCarriesOverRealGRPCConnection(t *testing
 	if mysqlErr.Code != protocol.ErrCodeDupFieldName {
 		t.Errorf("MySQL error code: got %d, want %d (ErrCodeDupFieldName)", mysqlErr.Code, protocol.ErrCodeDupFieldName)
 	}
+}
+
+// commitCapturingStreamServer records the TransactionCommit a streamed
+// transaction ends with.
+type commitCapturingStreamServer struct {
+	UnimplementedMarmotServiceServer
+	commit chan *TransactionCommit
+}
+
+func (s *commitCapturingStreamServer) TransactionStream(stream grpc.ClientStreamingServer[TransactionStreamMessage, TransactionResponse]) error {
+	for {
+		msg, err := stream.Recv()
+		if err != nil {
+			return err
+		}
+		if commit := msg.GetCommit(); commit != nil {
+			s.commit <- commit
+			return stream.SendAndClose(&TransactionResponse{Success: true})
+		}
+	}
+}
+
+// A streamed COMMIT carries the decided commit timestamp, as a unary one does.
+func TestGRPCReplicator_StreamedCommitCarriesCommitTimestamp(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	server := &commitCapturingStreamServer{commit: make(chan *TransactionCommit, 1)}
+	grpcServer := grpc.NewServer()
+	RegisterMarmotServiceServer(grpcServer, server)
+	go func() { _ = grpcServer.Serve(listener) }()
+	defer grpcServer.Stop()
+
+	client := NewClient(1)
+	require.NoError(t, client.Connect(2, listener.Addr().String()))
+	defer client.Close()
+
+	decided := hlc.Timestamp{WallTime: 555, Logical: 6, NodeID: 1}
+	resp, err := NewGRPCReplicator(client).StreamReplicateTransaction(context.Background(), 2, &coordinator.ReplicationRequest{
+		TxnID: 77, NodeID: 1, Database: "app", Phase: coordinator.PhaseCommit,
+		StartTS: hlc.Timestamp{WallTime: 1, NodeID: 1}, CommitTS: decided,
+	})
+	require.NoError(t, err)
+	require.True(t, resp.Success)
+	require.Equal(t, decided, HLCToTimestamp((<-server.commit).CommitTimestamp))
 }

@@ -1,6 +1,19 @@
 package coordinator
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+
+	"github.com/maxpert/marmot/protocol/mysqlcode"
+	"github.com/maxpert/marmot/protocol/query/transform"
+)
+
+// ErrLocalVotesHeld reports an AUTO_INCREMENT range claim this node declined
+// at PREPARE because its own claim votes are held until it merges claim bases
+// from its peers. The coordinator must participate in every quorum, so no
+// claim it coordinates can commit before the release; ClaimRange waits for it,
+// up to transaction.lock_wait_timeout_seconds, and FailFastClaimer does not.
+var ErrLocalVotesHeld = errors.New("this node's auto-increment claim votes are held until it merges claim bases from its peers")
 
 // PrepareConflictError represents a write-write conflict detected during the prepare phase
 type PrepareConflictError struct {
@@ -20,6 +33,10 @@ type QuorumNotAchievedError struct {
 	TotalMembership int
 	AliveNodes      int
 	IsRemoteQuorum  bool // True if this is remote commit quorum (quorum-1)
+	// Declined counts participants that answered PREPARE without preparing
+	// and without a verdict - a lost race for a row lock, a storage error -
+	// as opposed to participants that never answered.
+	Declined int
 }
 
 func (e *QuorumNotAchievedError) Error() string {
@@ -33,10 +50,29 @@ func (e *QuorumNotAchievedError) Error() string {
 // of the retry signal used for write-write conflicts.
 type LocalPrepareError struct {
 	Reason string
+	// AutoIDStoredBase is the highest base any participant reported this
+	// PREPARE round, when this rejection came from an AUTO_INCREMENT range
+	// claim. Zero for every other rejection.
+	AutoIDStoredBase uint64
+	// ErrorCode is the MySQL server error code the participant chose for this
+	// refusal, or 0 when it named none.
+	ErrorCode uint16
 }
 
 func (e *LocalPrepareError) Error() string {
 	return e.Reason
+}
+
+// Unwrap re-types the rejection as the coded error the participant raised, so
+// the protocol layer maps it to the participant's own MySQL error code rather
+// than flattening every deterministic refusal to ER_UNKNOWN_ERROR. It returns
+// nil when the participant named no code, which leaves the existing
+// message-based classification in charge.
+func (e *LocalPrepareError) Unwrap() error {
+	if e.ErrorCode == 0 {
+		return nil
+	}
+	return &transform.CodedError{Code: e.ErrorCode, Message: e.Reason}
 }
 
 // RemotePrepareRejectedError indicates prepare quorum was not achieved and at
@@ -50,12 +86,28 @@ func (e *LocalPrepareError) Error() string {
 type RemotePrepareRejectedError struct {
 	NodeID uint64
 	Reason string
+	// AutoIDStoredBase is the highest base any participant reported this
+	// PREPARE round, when this rejection came from an AUTO_INCREMENT range
+	// claim. Zero for every other rejection.
+	AutoIDStoredBase uint64
+	// ErrorCode is the MySQL server error code the rejecting participant chose,
+	// or 0 when it named none.
+	ErrorCode uint16
 }
 
 // Error reports the rejecting participant's own reason so clients receive the
 // actual SQL failure rather than 2PC internals.
 func (e *RemotePrepareRejectedError) Error() string {
 	return e.Reason
+}
+
+// Unwrap re-types the rejection as the coded error the remote participant
+// raised; see LocalPrepareError.Unwrap.
+func (e *RemotePrepareRejectedError) Unwrap() error {
+	if e.ErrorCode == 0 {
+		return nil
+	}
+	return &transform.CodedError{Code: e.ErrorCode, Message: e.Reason}
 }
 
 // CoordinatorNotParticipatedError indicates the coordinator failed to participate in the prepare phase
@@ -94,4 +146,45 @@ func (e *PartialCommitError) Error() string {
 	}
 	return fmt.Sprintf("partial commit: got %d remote commit acks, needed %d (some nodes may have committed)",
 		e.RemoteAcks, e.RemoteQuorumNeeded)
+}
+
+// ErrLegacyMembersPresent is what LegacyMembersDDLRefusal matches with
+// errors.Is: DDL or CREATE/DROP DATABASE refused because a cluster member does
+// not serve the commit-log pull protocol yet.
+var ErrLegacyMembersPresent = errors.New("DDL refused while a cluster member does not serve the commit-log pull protocol")
+
+// LegacyMembersDDLRefusal refuses DDL and CREATE/DROP DATABASE cluster-wide
+// while LegacyIDs names members whose log protocol version is below the one
+// this binary serves (grpc.LegacyLogProtocolMembers). Such a member counts a
+// database's DDL history differently, so a schema version bumped by DDL run
+// now would never match between the two kinds of node, and every write
+// coordinated across them would then be refused at the schema-version gates.
+// The refusal is the same on the coordinator (coordinator.handleMutation) and
+// on a participant's PREPARE (grpc.ReplicationHandler), so an old coordinator's
+// DDL cannot reach a quorum either.
+//
+// It carries 1213 ER_LOCK_DEADLOCK / SQLSTATE 40001 (through its unwrapped
+// *transform.CodedError), the code this codebase pairs with "nothing was
+// written, safe to retry the whole transaction" (see mapSQLiteError's
+// ErrConstraintCommitHook case in protocol/error_mapper.go): MySQL clients and
+// ORMs already treat 1213 as retryable, while 1105 carries no such
+// convention.
+type LegacyMembersDDLRefusal struct {
+	LegacyIDs []uint64
+}
+
+// NewLegacyMembersDDLRefusal returns the refusal naming legacyIDs.
+func NewLegacyMembersDDLRefusal(legacyIDs []uint64) *LegacyMembersDDLRefusal {
+	return &LegacyMembersDDLRefusal{LegacyIDs: legacyIDs}
+}
+
+func (e *LegacyMembersDDLRefusal) Error() string {
+	return fmt.Sprintf("DDL and CREATE/DROP DATABASE are refused cluster-wide: node(s) %v do not serve the "+
+		"commit-log pull protocol yet (an older Marmot release); upgrade every node, then retry", e.LegacyIDs)
+}
+
+// Unwrap exposes ErrLegacyMembersPresent for errors.Is and the coded MySQL
+// error for protocol.ConvertToMySQLError.
+func (e *LegacyMembersDDLRefusal) Unwrap() []error {
+	return []error{ErrLegacyMembersPresent, transform.NewCodedError(mysqlcode.ErrCodeDeadlock, "%s", e.Error())}
 }

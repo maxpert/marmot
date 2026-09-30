@@ -3,12 +3,14 @@ package grpc
 import (
 	"context"
 	"os"
+	"sync"
 	"testing"
 
 	"github.com/maxpert/marmot/db"
 	"github.com/maxpert/marmot/encoding"
 	pb "github.com/maxpert/marmot/grpc/common"
 	"github.com/maxpert/marmot/hlc"
+	"github.com/stretchr/testify/require"
 )
 
 // TestSchemaVersionRejection verifies that transactions with higher required schema version are rejected
@@ -33,20 +35,12 @@ func TestSchemaVersionRejection(t *testing.T) {
 		t.Fatalf("Failed to create test database: %v", err)
 	}
 
-	// Get system database (already created by DatabaseManager)
-	systemDB, err := dbMgr.GetDatabase(db.SystemDatabaseName)
-	if err != nil {
-		t.Fatalf("Failed to get system database: %v", err)
-	}
-	schemaVersionMgr := db.NewSchemaVersionManager(systemDB.GetMetaStore())
+	schemaVersionMgr := db.NewSchemaVersionManager(dbMgr)
 
 	handler := NewReplicationHandler(1, dbMgr, clock, schemaVersionMgr)
 
 	// Set local schema version to 5
-	err = schemaVersionMgr.SetSchemaVersion(testDB, 5, "CREATE TABLE test (id INT)", 100)
-	if err != nil {
-		t.Fatalf("Failed to set schema version: %v", err)
-	}
+	bumpSchemaVersionForTest(t, dbMgr, testDB, 5)
 
 	// Transaction with RequiredSchemaVersion = 10 should be rejected (10 > 5)
 	req := &TransactionRequest{
@@ -105,11 +99,10 @@ func TestReplicationHandler_ReplayDDLIdempotent(t *testing.T) {
 		t.Fatalf("Failed to create test database: %v", err)
 	}
 
-	systemDB, err := dbMgr.GetDatabase(db.SystemDatabaseName)
+	_, err = dbMgr.GetDatabase(db.SystemDatabaseName)
 	if err != nil {
 		t.Fatalf("Failed to get system database: %v", err)
 	}
-	handler := NewReplicationHandler(1, dbMgr, clock, db.NewSchemaVersionManager(systemDB.GetMetaStore()))
 
 	ddlStmt := &Statement{
 		Type:     pb.StatementType_DDL,
@@ -122,25 +115,21 @@ func TestReplicationHandler_ReplayDDLIdempotent(t *testing.T) {
 	}
 
 	for i := 0; i < 2; i++ {
-		req := &TransactionRequest{
+		ev := &ChangeEvent{
 			TxnId:        uint64(100 + i),
-			SourceNodeId: 2,
+			OriginNodeId: 2,
 			Database:     testDB,
-			Phase:        TransactionPhase_REPLAY,
 			Timestamp: &HLC{
 				WallTime: clock.Now().WallTime,
 				Logical:  clock.Now().Logical,
 				NodeId:   2,
 			},
 			Statements: []*Statement{ddlStmt},
+			RowCount:   1,
 		}
 
-		resp, err := handler.HandleReplicateTransaction(context.Background(), req)
-		if err != nil {
-			t.Fatalf("Replay DDL call %d failed: %v", i+1, err)
-		}
-		if !resp.Success {
-			t.Fatalf("Replay DDL call %d should be idempotent, got error: %s", i+1, resp.ErrorMessage)
+		if _, err := ApplyPulledEvent(context.Background(), dbMgr, ev); err != nil {
+			t.Fatalf("Replay DDL call %d should be idempotent, got error: %v", i+1, err)
 		}
 	}
 }
@@ -164,17 +153,15 @@ func TestReplicationHandler_ReplayReloadsSchemaAfterDDL(t *testing.T) {
 		t.Fatalf("Failed to create test database: %v", err)
 	}
 
-	systemDB, err := dbMgr.GetDatabase(db.SystemDatabaseName)
+	_, err = dbMgr.GetDatabase(db.SystemDatabaseName)
 	if err != nil {
 		t.Fatalf("Failed to get system database: %v", err)
 	}
-	handler := NewReplicationHandler(1, dbMgr, clock, db.NewSchemaVersionManager(systemDB.GetMetaStore()))
 
-	ddlReq := &TransactionRequest{
+	ddlEvent := &ChangeEvent{
 		TxnId:        200,
-		SourceNodeId: 2,
+		OriginNodeId: 2,
 		Database:     testDB,
-		Phase:        TransactionPhase_REPLAY,
 		Timestamp: &HLC{
 			WallTime: clock.Now().WallTime,
 			Logical:  clock.Now().Logical,
@@ -191,20 +178,16 @@ func TestReplicationHandler_ReplayReloadsSchemaAfterDDL(t *testing.T) {
 				},
 			},
 		},
+		RowCount: 1,
 	}
-	resp, err := handler.HandleReplicateTransaction(context.Background(), ddlReq)
-	if err != nil {
+	if _, err := ApplyPulledEvent(context.Background(), dbMgr, ddlEvent); err != nil {
 		t.Fatalf("Replay DDL failed: %v", err)
 	}
-	if !resp.Success {
-		t.Fatalf("Replay DDL failed with response error: %s", resp.ErrorMessage)
-	}
 
-	insertReq := &TransactionRequest{
+	insertEvent := &ChangeEvent{
 		TxnId:        201,
-		SourceNodeId: 2,
+		OriginNodeId: 2,
 		Database:     testDB,
-		Phase:        TransactionPhase_REPLAY,
 		Timestamp: &HLC{
 			WallTime: clock.Now().WallTime,
 			Logical:  clock.Now().Logical,
@@ -223,20 +206,16 @@ func TestReplicationHandler_ReplayReloadsSchemaAfterDDL(t *testing.T) {
 				},
 			},
 		},
+		RowCount: 1,
 	}
-	resp, err = handler.HandleReplicateTransaction(context.Background(), insertReq)
-	if err != nil {
+	if _, err := ApplyPulledEvent(context.Background(), dbMgr, insertEvent); err != nil {
 		t.Fatalf("Replay insert failed: %v", err)
 	}
-	if !resp.Success {
-		t.Fatalf("Replay insert failed with response error: %s", resp.ErrorMessage)
-	}
 
-	updateReq := &TransactionRequest{
+	updateEvent := &ChangeEvent{
 		TxnId:        202,
-		SourceNodeId: 2,
+		OriginNodeId: 2,
 		Database:     testDB,
-		Phase:        TransactionPhase_REPLAY,
 		Timestamp: &HLC{
 			WallTime: clock.Now().WallTime,
 			Logical:  clock.Now().Logical,
@@ -258,13 +237,10 @@ func TestReplicationHandler_ReplayReloadsSchemaAfterDDL(t *testing.T) {
 				},
 			},
 		},
+		RowCount: 1,
 	}
-	resp, err = handler.HandleReplicateTransaction(context.Background(), updateReq)
-	if err != nil {
+	if _, err := ApplyPulledEvent(context.Background(), dbMgr, updateEvent); err != nil {
 		t.Fatalf("Replay update failed: %v", err)
-	}
-	if !resp.Success {
-		t.Fatalf("Replay update failed with response error: %s", resp.ErrorMessage)
 	}
 }
 
@@ -309,12 +285,12 @@ func newLeavingHandlerFixture(t *testing.T) (*ReplicationHandler, *NodeRegistry,
 		t.Fatalf("Failed to reload test schema: %v", err)
 	}
 
-	systemDB, err := dbMgr.GetDatabase(db.SystemDatabaseName)
+	_, err = dbMgr.GetDatabase(db.SystemDatabaseName)
 	if err != nil {
 		t.Fatalf("Failed to get system database: %v", err)
 	}
 
-	handler := NewReplicationHandler(localNodeID, dbMgr, clock, db.NewSchemaVersionManager(systemDB.GetMetaStore()))
+	handler := NewReplicationHandler(localNodeID, dbMgr, clock, db.NewSchemaVersionManager(dbMgr))
 
 	registry := NewNodeRegistry(localNodeID, "localhost:9000")
 	handler.SetRegistry(registry)
@@ -478,4 +454,79 @@ func TestReplicationHandler_AcceptsPrepareWhenNotLeaving(t *testing.T) {
 			t.Fatal("PREPARE incorrectly rejected as if node is LEAVING")
 		}
 	}
+}
+
+// incarnationRecorder records what a DDL apply reports to the node's
+// AutoIncIncarnationListener.
+type incarnationRecorder struct {
+	mu     sync.Mutex
+	tables []string
+}
+
+func (r *incarnationRecorder) TableIncarnationEnded(database, table string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.tables = append(r.tables, database+"."+table)
+}
+
+func (r *incarnationRecorder) DatabaseIncarnationEnded(string) {}
+
+func (r *incarnationRecorder) take() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	tables := r.tables
+	r.tables = nil
+	return tables
+}
+
+// TestReplicationHandler_ReplayedDDLEndsIncarnations checks end to end,
+// on the anti-entropy replay RPC: a DDL a node catches up on through REPLAY
+// ends table incarnations, inherits and seeds claim bases exactly as the
+// same DDL's 2PC COMMIT would.
+//
+// Mutation: handleReplay executes DDL with db.ApplyDDLSQLInTx again. "a
+// replayed CREATE did not end nt's incarnation" fires.
+func TestReplicationHandler_ReplayedDDLEndsIncarnations(t *testing.T) {
+	clock := hlc.NewClock(1)
+	dbMgr, err := db.NewDatabaseManager(t.TempDir(), 1, clock)
+	require.NoError(t, err)
+	defer dbMgr.Close()
+	const testDB = "replay_incarnations"
+	require.NoError(t, dbMgr.CreateDatabase(testDB))
+	_, err = dbMgr.GetDatabase(db.SystemDatabaseName)
+	require.NoError(t, err)
+	rec := &incarnationRecorder{}
+	dbMgr.SetAutoIncIncarnationListener(rec)
+
+	replay := func(txnID uint64, table, ddl string) {
+		t.Helper()
+		now := clock.Now()
+		_, err := ApplyPulledEvent(context.Background(), dbMgr, &ChangeEvent{
+			TxnId:        txnID,
+			OriginNodeId: 2,
+			Database:     testDB,
+			Timestamp:    &HLC{WallTime: now.WallTime, Logical: now.Logical, NodeId: 2},
+			Statements: []*Statement{{
+				Type:      pb.StatementType_DDL,
+				TableName: table,
+				Database:  testDB,
+				Payload:   &Statement_DdlChange{DdlChange: &DDLChange{Sql: ddl}},
+			}},
+			RowCount: 1,
+		})
+		require.NoError(t, err, "replay of %q", ddl)
+	}
+
+	claims := db.NewAutoIncClaimStore(dbMgr.GetSystemDatabase())
+	replay(300, "nt", "CREATE TABLE nt (id INTEGER /*M:32a*/ PRIMARY KEY, v TEXT)")
+	require.Equal(t, []string{testDB + ".nt"}, rec.take(), "a replayed CREATE did not end nt's incarnation")
+	_, err = claims.ReadBase(testDB, "nt")
+	require.NoError(t, err, "a replayed CREATE was not seeded")
+
+	require.NoError(t, claims.Seed(testDB, "nt", 400, 1))
+	replay(301, "nt", "ALTER TABLE nt RENAME TO nt2")
+	require.Equal(t, []string{testDB + ".nt", testDB + ".nt2"}, rec.take(), "a replayed rename did not end both names' incarnations")
+	base, err := claims.ReadBase(testDB, "nt2")
+	require.NoError(t, err)
+	require.Equal(t, uint64(400), base, "a replayed rename did not inherit nt's base")
 }

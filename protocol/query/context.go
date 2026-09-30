@@ -4,6 +4,7 @@ import (
 	"strings"
 
 	"github.com/maxpert/marmot/common"
+	"github.com/maxpert/marmot/protocol/query/rules"
 	"github.com/maxpert/marmot/protocol/query/transform"
 	"vitess.io/vitess/go/vt/sqlparser"
 )
@@ -106,6 +107,13 @@ type QueryOutput struct {
 	Database      string
 	IsValid       bool
 	ValidationErr error
+
+	// TranspileErr holds the error transpilation failed with, typed, when the
+	// failure came from a transformation rule rather than from parsing. The
+	// protocol layer needs the type to tell a rule's rejection (which carries
+	// its own MySQL error code) from a Vitess syntax error, without matching
+	// on message text. nil when parsing failed or nothing failed.
+	TranspileErr error
 }
 
 // TranspiledStatement represents a single transpiled SQL statement with parameters.
@@ -117,6 +125,10 @@ type TranspiledStatement struct {
 	// server-injected auto-increment id) - see transform.ExtractLiterals and
 	// protocol.MergeExecParams. nil means Params is the only source needed.
 	ParamOrder []bool
+	// BoundIDs are server-generated ids that replace the caller's bound
+	// values, keyed by the value's position: a narrow AUTO_INCREMENT
+	// placeholder bound to NULL or 0 (rules.AutoIncrementIDRule.ApplyAST).
+	BoundIDs map[int]uint64
 }
 
 // MySQLParseState holds MySQL-specific parsing state and metadata.
@@ -159,8 +171,19 @@ type QueryContext struct {
 	Input          QueryInput
 	Output         QueryOutput
 	MySQLState     *MySQLParseState // nil for SQLite dialect
-	SchemaLookup   func(table string) string
+	SchemaLookup   func(database, table string) *transform.SchemaInfo
 	SchemaProvider transform.SchemaProvider
+
+	// NarrowIDs mints ids for AUTO_INCREMENT columns declared narrower than
+	// BIGINT. It belongs to the node's write coordinator, which claims the
+	// ranges, so it travels with the query rather than living in the shared
+	// pipeline. Nil refuses any INSERT that needs one.
+	NarrowIDs rules.NarrowAllocator
+
+	// BoundParams are a prepared statement's bound values, nil for a text
+	// query. Only AUTO_INCREMENT id injection reads them, to generate the id
+	// of a placeholder bound to NULL or 0.
+	BoundParams []interface{}
 
 	// SkipTranspilation bypasses MySQL→SQLite transpilation when true.
 	// SQL is passed through unchanged, only statement type classification is performed.

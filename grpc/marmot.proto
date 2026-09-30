@@ -59,6 +59,28 @@ service MarmotService {
   // Fetch staged LOAD DATA payload chunk by chunk.
   rpc GetLoadDataChunk(LoadDataChunkRequest) returns (LoadDataChunkResponse);
 
+  // ===== AUTO_INCREMENT CLAIMS =====
+  // This node's committed AUTO_INCREMENT claim bases, which a node whose
+  // claim votes are held merges from a majority before voting again.
+  rpc GetAutoIncBases(AutoIncBasesRequest) returns (AutoIncBasesResponse);
+
+  // Runs one claim base sync on this node now: it raises its bases to the
+  // maximum every alive peer reports, and reports which members it reached.
+  rpc SyncAutoIncBases(AutoIncSyncRequest) returns (AutoIncSyncResponse);
+
+  // ===== LOG PULL (anti-entropy) =====
+  // Lists this node's local commit log for one database strictly after a
+  // position, up to its stable point, and records that position as how far
+  // the requester has consumed this log.
+  rpc ListCommittedLog(LogListRequest) returns (LogListResponse);
+
+  // Streams the named committed transactions of one database, then ends.
+  // Fails the call rather than send a transaction whose rows cannot be read.
+  rpc FetchTransactions(FetchTransactionsRequest) returns (stream ChangeEvent);
+
+  // Lists this node's database registry, tombstones included.
+  rpc ListDatabaseRegistry(DatabaseRegistryRequest) returns (DatabaseRegistryResponse);
+
   // ===== CDC STREAMING =====
   // Client-streaming RPC for large CDC payloads (≥128KB)
   // Sends TransactionChunks followed by TransactionCommit
@@ -86,6 +108,13 @@ message NodeState {
   map<string, uint64> database_schema_versions = 5;
   // Minimum applied sequence number (watermark for GC coordination)
   uint64 min_applied_seq = 6;
+  // log_protocol_version is the node's log-pull anti-entropy protocol
+  // generation: 0 means an older release (no ListCommittedLog /
+  // FetchTransactions / ListDatabaseRegistry RPCs, and a per-database DDL
+  // history counter that is not comparable with this protocol's), 1
+  // (LogPullProtocolVersion) means it serves those RPCs. An older release
+  // never sets this for itself, so it always reports 0 here.
+  uint32 log_protocol_version = 7;
 }
 
 enum NodeStatus {
@@ -132,6 +161,9 @@ message TransactionRequest {
   reserved 8;
   // Minimum schema version required to execute this transaction
   uint64 required_schema_version = 9;
+  // COMMIT only: the commit timestamp the coordinator decided, which every
+  // participant commits with. Unset from an older coordinator.
+  HLC commit_timestamp = 10;
 }
 
 enum TransactionPhase {
@@ -162,6 +194,34 @@ message Statement {
     VectorIndexChange vector_index_change = 7; // For vector index control metadata
     DMLIntent dml_intent = 8; // DML decision metadata without row payload
   }
+
+  // auto_id_claim marks this statement as a narrow AUTO_INCREMENT range claim
+  // rather than ordinary DML.
+  //
+  // It is a FLAG on an existing StatementType, never a new StatementType, and
+  // that is a rolling-upgrade requirement. A node running an older binary
+  // ignores an unknown field, sees a DML statement carrying no row image, and
+  // rejects it at the "DML prepare missing encoded CDC row" gate - which is a
+  // clean failed transaction. A new StatementType would instead reach a
+  // conversion that does not know it, and before that gate.
+  //
+  // The claim's payload does not travel here: it is written into the
+  // transaction's intent DataSnapshot, which is what the COMMIT handler reads.
+  bool auto_id_claim = 9;
+  // auto_id_claim_payload carries the claim itself: {table, prevBase, newBase,
+  // size}, msgpack-encoded.
+  //
+  // It needs a field of its own because each PARTICIPANT writes the claim into
+  // its own transaction intent at PREPARE, and the COMMIT handler reads it back
+  // from there - so the payload has to reach the participant. It cannot ride in
+  // the oneof: RowChange would give the statement a row image and defeat the
+  // rolling-upgrade gate above, DDLChange is the wrong statement type, and
+  // DMLIntent carries only an intent key.
+  bytes auto_id_claim_payload = 10;
+  // database_generation stamps a CREATE or DROP DATABASE statement with the
+  // registry generation the coordinator computed for it; with the statement
+  // type it forms the key participants order database operations by.
+  uint64 database_generation = 11;
 }
 
 enum VectorIndexAction {
@@ -241,6 +301,22 @@ message TransactionResponse {
   // PREPARE (for example DDL SQLite cannot apply), as opposed to a timeout
   // or storage error. See db.PrepareResult.Rejected.
   bool rejected = 6;
+  // auto_id_stored_base is the participant's own committed base for the table a
+  // rejected AUTO_INCREMENT range claim named.
+  //
+  // The claimant retries with the maximum base any participant returned, so a
+  // rejection has to carry a number. Encoding it into error_message and parsing
+  // it back out would be exactly the string matching this codebase forbids.
+  // Zero means "not applicable": every response that is not a claim rejection.
+  uint64 auto_id_stored_base = 7;
+  // error_code is the MySQL server error code the rejecting participant chose
+  // for this refusal (for example 1264 ER_WARN_DATA_OUT_OF_RANGE for a
+  // width-ceiling refusal). error_message carries the text; a typed error
+  // cannot cross the wire, so without this field every deterministic remote
+  // refusal reaches the client as 1105 HY000. Zero means "not supplied": an
+  // older participant, or a failure that named no code, and the coordinator
+  // then classifies the message as before.
+  uint32 error_code = 8;
 }
 
 message ReadRequest {
@@ -277,7 +353,64 @@ message ChangeEvent {
   HLC timestamp = 3;
   string database = 4;  // Target database for these changes
   uint64 required_schema_version = 5;  // Minimum schema version required for this transaction
-  uint64 seq_num = 6;  // Monotonic sequence number for gap detection
+  uint64 seq_num = 6;  // Position of this transaction in the sender's local commit log
+  uint64 origin_node_id = 7;  // Node that coordinated the transaction
+  uint32 row_count = 8;  // Statement count recorded at commit; a receiver refuses a mismatch
+}
+
+// ===== LOG PULL MESSAGES =====
+message LogListRequest {
+  string database = 1;
+  uint64 requesting_node_id = 2;
+  uint64 after_seq = 3;     // List strictly after the position (after_seq, after_txn_id)
+  uint64 after_txn_id = 4;
+  uint32 limit = 5;
+  uint64 consumed_seq = 6;  // Position (consumed_seq, consumed_txn_id) the requester has applied every entry through
+  uint64 consumed_txn_id = 7;
+  bool count_remaining = 8;  // Ask for remaining_committed in the response
+}
+
+message LogEntry {
+  uint64 seq = 1;
+  uint64 txn_id = 2;
+  HLC commit_timestamp = 3;  // The entry's commit timestamp; unset from an older peer
+}
+
+message LogListResponse {
+  repeated LogEntry entries = 1;
+  uint64 stable_seq = 2;         // No entry at or below it can still become visible
+  uint64 truncated_seq = 3;      // Highest position GC has deleted
+  uint64 truncated_txn_id = 4;
+  bool more = 5;                 // More stable entries follow the last one returned
+  uint64 schema_version = 6;
+  bool database_absent = 7;
+  // COMMITTED entries after the last one returned (or after the request's
+  // position, for an empty page), through stable_seq. Set only when the
+  // request asked (count_remaining); unset from an older peer.
+  optional uint64 remaining_committed = 8;
+}
+
+message FetchTransactionsRequest {
+  string database = 1;
+  uint64 requesting_node_id = 2;
+  repeated uint64 txn_ids = 3;
+}
+
+message DatabaseRegistryRequest {
+  uint64 requesting_node_id = 1;
+}
+
+message DatabaseRegistryEntry {
+  string name = 1;
+  uint64 generation = 2;
+  bool dropped = 3;
+  // legacy marks a registry row migrated from an older release's registry; a legacy
+  // live row never creates the database on a peer that lacks it.
+  bool legacy = 4;
+}
+
+message DatabaseRegistryResponse {
+  repeated DatabaseRegistryEntry entries = 1;
 }
 
 message ReplicationStateRequest {
@@ -303,6 +436,11 @@ message DatabaseReplicationState {
 // ===== SNAPSHOT MESSAGES =====
 message SnapshotInfoRequest {
   uint64 requesting_node_id = 1;
+  // Optional: describe only this database, for a StreamSnapshot naming the
+  // same database; empty = every database. A per-database request is refused
+  // only while that database is out of service, a whole-node request while
+  // any database is. An older server ignores it and describes every database.
+  string database = 2;
 }
 
 message SnapshotInfoResponse {
@@ -345,6 +483,12 @@ message SnapshotChunk {
   string checksum = 4;
   string filename = 5;      // Which database file this chunk belongs to
   bool is_last_for_file = 6; // True if this is the last chunk for this file
+  // Set on a file's last chunk: the SHA256 and size of the file exactly as
+  // this stream sent it. A receiver verifies against these rather than the
+  // checksums GetSnapshotInfo reported, which describe an earlier, separate
+  // snapshot of a database that may have been written since.
+  string file_sha256 = 7;
+  int64 file_size_bytes = 8;
 }
 
 // ===== DELTA SYNC DETECTION =====
@@ -362,6 +506,38 @@ message DatabaseInfo {
 message LatestTxnIDsResponse {
   map<string, uint64> database_txn_ids = 1;  // Keep for backward compatibility
   repeated DatabaseInfo database_info = 2;   // Detailed database info
+}
+
+// ===== AUTO_INCREMENT CLAIMS =====
+message AutoIncBasesRequest {
+  uint64 requesting_node_id = 1;
+}
+
+message AutoIncBase {
+  string database = 1;
+  string table = 2;
+  uint64 base = 3;
+}
+
+message AutoIncBasesResponse {
+  repeated AutoIncBase bases = 1;
+  // The responder's own votes are held: its bases may be missing claims, so
+  // a merge must not count it toward its majority.
+  bool votes_held = 2;
+}
+
+message AutoIncSyncRequest {
+  uint64 requesting_node_id = 1;
+}
+
+message AutoIncSyncResponse {
+  uint64 node_id = 1;
+  // The node's own votes are held: it has not merged claim bases yet.
+  bool votes_held = 2;
+  // Every member of the node's membership, itself included.
+  repeated uint64 members = 3;
+  // The members whose bases this sync merged, itself included.
+  repeated uint64 reached = 4;
 }
 
 // ===== CLUSTER NODES =====
@@ -386,6 +562,7 @@ message TransactionCommit {
   string database = 2;
   HLC timestamp = 3;
   uint64 source_node_id = 4;
+  HLC commit_timestamp = 5;  // As TransactionRequest.commit_timestamp; unset from an older coordinator
 }
 
 // Wrapper for streaming (oneof for chunk vs commit)
@@ -423,6 +600,17 @@ message ForwardQueryResponse {
   int64 last_insert_id = 4;
   uint64 committed_txn_id = 5;   // For read-your-writes
   bool in_transaction = 6;       // True if session has active transaction on leader
+  // MySQL server error code for a failed query, so a replica can reproduce the
+  // leader's ERR packet instead of flattening every failure to ER_UNKNOWN_ERROR.
+  // 0 means "not supplied": an older leader, or a rejection raised before the
+  // statement reached the coordinator. A replica reports 1105 for 0.
+  uint32 error_code = 7;
+  // SQLSTATE for the same failure. It is sent rather than derived from the code
+  // because the mapping is not injective: the leader pairs code 1105 with both
+  // HY000 and 23000 (an unclassified error vs an unclassified CONSTRAINT
+  // failure), so a replica rebuilding it from the number alone would have to
+  // guess. Empty means "not supplied", same as error_code 0.
+  string sql_state = 8;
 }
 
 message ForwardLoadDataRequest {

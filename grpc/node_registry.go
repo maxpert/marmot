@@ -1,13 +1,26 @@
 package grpc
 
 import (
+	"encoding/binary"
 	"fmt"
+	"hash/fnv"
+	"slices"
+	"sort"
 	"sync"
 	"time"
 
+	"github.com/maxpert/marmot/common"
 	"github.com/maxpert/marmot/telemetry"
 	"github.com/rs/zerolog/log"
 )
+
+// LogPullProtocolVersion is the log-pull anti-entropy protocol generation this
+// binary serves (ListCommittedLog / FetchTransactions / ListDatabaseRegistry,
+// and a per-database DDL history counter comparable across the cluster). A
+// release before this protocol never sets NodeState.LogProtocolVersion, so it
+// is always observed as 0 for such a node, and DDL is refused cluster-wide
+// while any member reports less than this (LegacyLogProtocolMembers).
+const LogPullProtocolVersion uint32 = 1
 
 // copySchemaVersionMap creates a deep copy of a schema version map
 func copySchemaVersionMap(m map[string]uint64) map[string]uint64 {
@@ -30,6 +43,7 @@ func copyNodeState(node *NodeState) *NodeState {
 		Incarnation:            node.Incarnation,
 		DatabaseSchemaVersions: copySchemaVersionMap(node.DatabaseSchemaVersions),
 		MinAppliedSeq:          node.MinAppliedSeq,
+		LogProtocolVersion:     node.LogProtocolVersion,
 	}
 }
 
@@ -39,14 +53,42 @@ type NodeRegistry struct {
 	nodes             map[uint64]*NodeState
 	lastSeen          map[uint64]time.Time
 	mu                sync.RWMutex
-	onNodeAliveFunc   func(*NodeState) // Callback when node transitions to ALIVE
+	onNodeAliveFunc   func(*NodeState) // Callback when node transitions to ALIVE, or is discovered ALIVE
 	onNodeDeadFunc    func(*NodeState) // Callback when node transitions to DEAD
 	onNodeLeavingFunc func()           // Callback when local node marked LEAVING via remote decommission
 	callbackMu        sync.RWMutex
+	// aliveChanged is notified, after onNodeAliveFunc, whenever a node turns
+	// or is discovered ALIVE, and when an ALIVE node announces ALIVE at a
+	// higher incarnation (AliveChanged).
+	aliveChanged common.Broadcast
+
+	// store persists membership so a restarted node does not compute a quorum
+	// from a membership of one. nil disables persistence.
+	store *membershipStore
+	// persistedFingerprint is the membership the snapshot on disk describes.
+	// It lets the persist hook skip the write when a mutator changed something
+	// the snapshot does not record, so an fsync only happens on a real change.
+	persistedFingerprint uint64
 }
 
-// NewNodeRegistry creates a new node registry
+// NewNodeRegistry creates a new node registry with no durable membership.
+// Used by tests and by any embedding that has no data directory; production
+// goes through NewNodeRegistryWithDataDir so a restart can re-learn what the
+// cluster looked like.
 func NewNodeRegistry(localNodeID uint64, advertiseAddress string) *NodeRegistry {
+	return NewNodeRegistryWithDataDir(localNodeID, advertiseAddress, "")
+}
+
+// NewNodeRegistryWithDataDir creates a registry that persists membership under
+// dataDir and restores it before returning.
+//
+// Restoring matters because quorum is a majority of TOTAL membership. A registry
+// that starts with self only makes a lone restarted node its own majority, so it
+// can commit a write - or, once narrow id ranges exist, grant itself a range -
+// that overlaps a live peer's. The invariant this establishes: a node that has
+// ever known a multi-node membership does not compute a quorum from fewer
+// members than it last knew, until gossip re-learns membership from a live peer.
+func NewNodeRegistryWithDataDir(localNodeID uint64, advertiseAddress string, dataDir string) *NodeRegistry {
 	log.Debug().
 		Uint64("node_id", localNodeID).
 		Str("advertise_address", advertiseAddress).
@@ -57,22 +99,33 @@ func NewNodeRegistry(localNodeID uint64, advertiseAddress string) *NodeRegistry 
 		localNodeID: localNodeID,
 		nodes:       make(map[uint64]*NodeState),
 		lastSeen:    make(map[uint64]time.Time),
+		store:       newMembershipStore(dataDir),
 	}
 
 	// Add self to registry as ALIVE
 	now := time.Now()
 	nr.nodes[localNodeID] = &NodeState{
-		NodeId:      localNodeID,
-		Address:     advertiseAddress,
-		Status:      NodeStatus_ALIVE,
-		Incarnation: 0,
+		NodeId:             localNodeID,
+		Address:            advertiseAddress,
+		Status:             NodeStatus_ALIVE,
+		Incarnation:        0,
+		LogProtocolVersion: LogPullProtocolVersion,
 	}
 	nr.lastSeen[localNodeID] = now
 
-	// Initialize cluster metrics with self
 	nr.mu.Lock()
+	restored := nr.restoreMembershipLocked()
+	// Initialize cluster metrics with the membership we start from.
 	nr.updateClusterMetricsLocked()
 	nr.mu.Unlock()
+
+	if restored > 0 {
+		log.Info().
+			Uint64("node_id", localNodeID).
+			Int("restored_peers", restored).
+			Int("membership", nr.Count()).
+			Msg("BOOT: Restored persisted cluster membership; peers start SUSPECT until gossip confirms them")
+	}
 
 	log.Debug().
 		Uint64("node_id", localNodeID).
@@ -103,7 +156,10 @@ func (nr *NodeRegistry) Update(node *NodeState) {
 		return
 	}
 
-	// Rule 2: Discover new nodes
+	// Rule 2: Discover new nodes. A node discovered ALIVE gets the same
+	// callback as one that becomes ALIVE: it may never change status again
+	// (a restarted peer keeps its incarnation), and the callback is what
+	// opens this node's connection to it.
 	existing, exists := nr.nodes[node.NodeId]
 	if !exists {
 		log.Debug().
@@ -116,6 +172,9 @@ func (nr *NodeRegistry) Update(node *NodeState) {
 		nr.lastSeen[node.NodeId] = time.Now()
 		nr.updateClusterMetricsLocked()
 		nr.mu.Unlock()
+		if node.Status == NodeStatus_ALIVE {
+			nr.fireOnNodeAlive(node)
+		}
 		return
 	}
 
@@ -124,9 +183,21 @@ func (nr *NodeRegistry) Update(node *NodeState) {
 
 	// Track if node transitions to ALIVE for callback
 	becameAlive := false
+	// reannouncedAlive is an ALIVE node at a higher incarnation: no status
+	// change, so no callback, but AliveChanged waiters may now get an answer.
+	reannouncedAlive := false
 
 	// Rule 4: Apply SWIM state update rules
 	stateChanged := false
+	// recordReplaced is separate from stateChanged because the higher-incarnation
+	// branch swaps the whole record: address and incarnation can change with the
+	// status staying put. Persistence must follow the record, not just the
+	// status - a peer that restarted on a new address, or refuted a suspicion,
+	// otherwise stayed at its old address and incarnation on disk, and a restart
+	// restored the stale one. The stale incarnation is the dangerous half: SWIM
+	// compares incarnations to decide who wins, so an older rumour could then
+	// overwrite the record.
+	recordReplaced := false
 	if node.Incarnation > existing.Incarnation {
 		// Higher incarnation always wins, EXCEPT:
 		// - REMOVED status is sticky (can only be cleared via admin API AllowRejoin)
@@ -151,6 +222,7 @@ func (nr *NodeRegistry) Update(node *NodeState) {
 			Uint64("new_inc", node.Incarnation).
 			Msg("REGISTRY: Updating node (higher incarnation)")
 		nr.nodes[node.NodeId] = node
+		recordReplaced = true
 
 		// Record state transition if status changed
 		if oldStatus != node.Status {
@@ -158,9 +230,15 @@ func (nr *NodeRegistry) Update(node *NodeState) {
 			stateChanged = true
 		}
 
-		// Check if node became ALIVE
-		if oldStatus != NodeStatus_ALIVE && node.Status == NodeStatus_ALIVE {
-			becameAlive = true
+		// Check if node became ALIVE, or announced ALIVE again: a joiner's
+		// promotion reads ALIVE -> ALIVE here when its JOINING, set without a
+		// bump (MarkJoining), never reached this node.
+		if node.Status == NodeStatus_ALIVE {
+			if oldStatus != NodeStatus_ALIVE {
+				becameAlive = true
+			} else {
+				reannouncedAlive = true
+			}
 		}
 	} else if node.Incarnation == existing.Incarnation && nr.shouldEscalate(existing.Status, node.Status) {
 		// Same incarnation: only allow escalation (ALIVE -> SUSPECT -> DEAD)
@@ -173,9 +251,20 @@ func (nr *NodeRegistry) Update(node *NodeState) {
 			Uint64("incarnation", node.Incarnation).
 			Msg("REGISTRY: Escalating node status (same incarnation)")
 		existing.Status = node.Status
+		if node.LogProtocolVersion > existing.LogProtocolVersion {
+			existing.LogProtocolVersion = node.LogProtocolVersion
+		}
 
 		// Record state transition
 		telemetry.NodeStateTransitionsTotal.With(oldStatus.String(), node.Status.String()).Inc()
+		stateChanged = true
+	} else if node.Incarnation == existing.Incarnation && node.LogProtocolVersion > existing.LogProtocolVersion {
+		// Same incarnation, no status escalation: a relayed gossip copy of a
+		// node's own state can lack the version an earlier copy carried (for
+		// example a seed's Join response, which builds a bare NodeState for
+		// the joining node - see grpc/server.go Join). Never downgrade a
+		// known version; take the max for the same incarnation.
+		existing.LogProtocolVersion = node.LogProtocolVersion
 		stateChanged = true
 	} else {
 		log.Debug().
@@ -187,10 +276,13 @@ func (nr *NodeRegistry) Update(node *NodeState) {
 			Uint64("incoming_inc", node.Incarnation).
 			Msg("REGISTRY: Ignoring update (stale or invalid)")
 	}
-	// Ignore updates with same/older incarnation that don't escalate
+	// Ignore updates with same/older incarnation that don't escalate and
+	// don't raise the known log protocol version
 
-	// Update cluster metrics if state changed
-	if stateChanged {
+	// Refresh metrics and persist when the record changed at all. The persist
+	// hook fingerprints exactly the fields the snapshot stores, so a call here
+	// that changed nothing it records performs no write.
+	if stateChanged || recordReplaced {
 		nr.updateClusterMetricsLocked()
 	}
 
@@ -198,14 +290,31 @@ func (nr *NodeRegistry) Update(node *NodeState) {
 
 	// Call callback outside lock to avoid deadlock
 	if becameAlive {
-		nr.callbackMu.RLock()
-		callback := nr.onNodeAliveFunc
-		nr.callbackMu.RUnlock()
-
-		if callback != nil {
-			callback(node)
-		}
+		nr.fireOnNodeAlive(node)
+	} else if reannouncedAlive {
+		nr.aliveChanged.Notify()
 	}
+}
+
+// fireOnNodeAlive runs the ALIVE callback for node. The caller must not hold
+// nr.mu.
+func (nr *NodeRegistry) fireOnNodeAlive(node *NodeState) {
+	nr.callbackMu.RLock()
+	callback := nr.onNodeAliveFunc
+	nr.callbackMu.RUnlock()
+
+	if callback != nil {
+		callback(node)
+	}
+	nr.aliveChanged.Notify()
+}
+
+// AliveChanged returns a channel closed the next time a node turns or is
+// discovered ALIVE, once the ALIVE callback has run for it, or an ALIVE node
+// announces ALIVE at a higher incarnation (a promotion this node saw no
+// JOINING for, or a restart).
+func (nr *NodeRegistry) AliveChanged() <-chan struct{} {
+	return nr.aliveChanged.Next()
 }
 
 // handleSelfUpdateLocked implements SWIM refutation for local node
@@ -227,8 +336,16 @@ func (nr *NodeRegistry) handleSelfUpdateLocked(node *NodeState) {
 		return
 	}
 
+	// REMOVED is terminal: every peer keeps it sticky, so refuting it would only
+	// climb our incarnation. Only the admin allow endpoint clears it.
+	if node.Status == NodeStatus_REMOVED {
+		return
+	}
+
 	// Accept LEAVING from higher incarnation — this is a remote decommission
-	// via admin API, not a failure detection. Don't refute it.
+	// via admin API, not a failure detection. Don't refute it. The departure
+	// a previous run of this node gossiped never reaches here: a restart
+	// starts above the incarnation it was persisted at (restoreMembershipLocked).
 	if node.Status == NodeStatus_LEAVING && node.Incarnation > self.Incarnation {
 		oldStatus := self.Status
 		oldIncarnation := self.Incarnation
@@ -251,19 +368,34 @@ func (nr *NodeRegistry) handleSelfUpdateLocked(node *NodeState) {
 		return
 	}
 
-	// If someone claims we're not ALIVE, refute by incrementing incarnation
-	if node.Status != NodeStatus_ALIVE && node.Incarnation >= self.Incarnation {
+	// If someone claims we're not ALIVE, refute by incrementing incarnation.
+	//
+	// A view of us with an older log protocol version (the one we had before
+	// a restart onto a newer binary, which does not bump our incarnation) is
+	// refuted only when it carries a HIGHER incarnation than ours: SWIM never
+	// lets a lower incarnation replace it, so without the refutation it would
+	// stay stale forever and keep DDL refused as if we had not been upgraded
+	// (LegacyLogProtocolMembers). At our own incarnation it is left alone:
+	// every current peer keeps the max version per incarnation (Update), so
+	// our own gossip corrects it, and a peer on an older release relays our
+	// state with the version stripped - refuting every such relay would climb our incarnation for as
+	// long as that peer runs.
+	stale := node.Status != NodeStatus_ALIVE && node.Incarnation >= self.Incarnation
+	staleVersion := node.LogProtocolVersion < self.LogProtocolVersion && node.Incarnation > self.Incarnation
+	if stale || staleVersion {
 		self.Incarnation = node.Incarnation + 1
 		// Only set to ALIVE if we're not JOINING
 		// JOINING nodes stay JOINING until explicitly promoted
 		if self.Status != NodeStatus_JOINING {
 			self.Status = NodeStatus_ALIVE
 		}
+		// Persist the bump, so a restart starts above what this run announced.
+		nr.updateClusterMetricsLocked()
 		log.Debug().
 			Uint64("refuted_incarnation", node.Incarnation).
 			Uint64("new_incarnation", self.Incarnation).
 			Str("current_status", self.Status.String()).
-			Msg("SWIM refutation: rejecting SUSPECT/DEAD claim")
+			Msg("SWIM refutation: rejecting a stale view of this node")
 	}
 }
 
@@ -320,6 +452,21 @@ func (nr *NodeRegistry) GetAll() []*NodeState {
 	}
 
 	return nodes
+}
+
+// KnownMemberCount returns how many members this node has ever known and
+// still records, in any status, REMOVED included: every member whose log
+// could still hold an entry. The registry restores the persisted
+// membership at boot, so the count survives a restart. A node configured
+// with seeds (seeded) that knows only itself has not learned its
+// membership yet and returns 0: unknown.
+func (nr *NodeRegistry) KnownMemberCount(seeded bool) int {
+	nr.mu.RLock()
+	defer nr.mu.RUnlock()
+	if seeded && len(nr.nodes) < 2 {
+		return 0
+	}
+	return len(nr.nodes)
 }
 
 // GetAlive returns all alive nodes (returns copies to avoid race conditions)
@@ -454,6 +601,44 @@ func (nr *NodeRegistry) CheckTimeouts(suspectTimeout, deadTimeout time.Duration)
 	}
 }
 
+// MemberIDs returns the IDs of the nodes Count counts, sorted.
+func (nr *NodeRegistry) MemberIDs() []uint64 {
+	nr.mu.RLock()
+	defer nr.mu.RUnlock()
+
+	ids := make([]uint64, 0, len(nr.nodes))
+	for id, node := range nr.nodes {
+		if node.Status != NodeStatus_REMOVED && node.Status != NodeStatus_LEAVING {
+			ids = append(ids, id)
+		}
+	}
+	slices.Sort(ids)
+	return ids
+}
+
+// LegacyLogProtocolMembers returns the ids of every current member (any
+// status except REMOVED, self included) whose LogProtocolVersion is below
+// LogPullProtocolVersion, sorted ascending. A non-empty result means at least
+// one member runs an older release: DDL and CREATE/DROP DATABASE must be
+// refused cluster-wide until every member reports LogPullProtocolVersion
+// (coordinator.LegacyMembersDDLRefusal).
+func (nr *NodeRegistry) LegacyLogProtocolMembers() []uint64 {
+	nr.mu.RLock()
+	defer nr.mu.RUnlock()
+
+	ids := make([]uint64, 0)
+	for id, node := range nr.nodes {
+		if node.Status == NodeStatus_REMOVED {
+			continue
+		}
+		if node.LogProtocolVersion < LogPullProtocolVersion {
+			ids = append(ids, id)
+		}
+	}
+	slices.Sort(ids)
+	return ids
+}
+
 // Count returns the number of nodes in membership (excludes REMOVED and LEAVING nodes)
 // Used for quorum calculation to prevent split-brain. LEAVING nodes are excluded
 // because they are intentionally departing and should not count toward quorum.
@@ -536,8 +721,9 @@ func (nr *NodeRegistry) MarkAlive(nodeID uint64) {
 		// Record state transition if status changed
 		if oldStatus != NodeStatus_ALIVE {
 			telemetry.NodeStateTransitionsTotal.With(oldStatus.String(), NodeStatus_ALIVE.String()).Inc()
-			nr.updateClusterMetricsLocked()
 		}
+		// The incarnation changed even when the status did not: persist it.
+		nr.updateClusterMetricsLocked()
 	}
 }
 
@@ -873,6 +1059,135 @@ func (nr *NodeRegistry) updateClusterMetricsLocked() {
 	} else {
 		telemetry.ClusterQuorumAvailable.Set(0)
 	}
+
+	nr.persistMembershipLocked()
+}
+
+// membershipFingerprintLocked summarises exactly the state the snapshot records,
+// so the persist hook can tell a real membership change from a mutator that
+// touched something the snapshot does not store.
+func (nr *NodeRegistry) membershipFingerprintLocked() uint64 {
+	ids := make([]uint64, 0, len(nr.nodes))
+	for id := range nr.nodes {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+
+	h := fnv.New64a()
+	var buf [8]byte
+	write := func(v uint64) {
+		binary.LittleEndian.PutUint64(buf[:], v)
+		_, _ = h.Write(buf[:])
+	}
+	for _, id := range ids {
+		node := nr.nodes[id]
+		write(id)
+		write(uint64(node.Status))
+		write(node.Incarnation)
+		_, _ = h.Write([]byte(node.Address))
+	}
+	return h.Sum64()
+}
+
+// persistMembershipLocked writes the snapshot when the membership actually
+// changed. It runs under the registry's write lock, which is acceptable because
+// it is reached only on a real membership change - never from TouchLastSeen,
+// the per-heartbeat path - and a synchronous write has no window in which a
+// crash loses the very change that would have widened the quorum denominator.
+func (nr *NodeRegistry) persistMembershipLocked() {
+	if nr.store == nil {
+		return
+	}
+
+	fingerprint := nr.membershipFingerprintLocked()
+	if fingerprint == nr.persistedFingerprint {
+		return
+	}
+
+	snapshot := membershipSnapshot{Nodes: make([]membershipSnapshotNode, 0, len(nr.nodes))}
+	for id, node := range nr.nodes {
+		snapshot.Nodes = append(snapshot.Nodes, membershipSnapshotNode{
+			NodeID:      id,
+			Address:     node.Address,
+			Incarnation: node.Incarnation,
+			Status:      int32(node.Status),
+		})
+	}
+
+	if err := nr.store.save(snapshot); err != nil {
+		// Not fatal: the running node's in-memory membership is still correct.
+		// The cost is that a restart falls back to self-only membership, which
+		// the seed-node belt in coordinator.GetClusterState still refuses to
+		// treat as a quorum.
+		log.Error().Err(err).Msg("Failed to persist cluster membership snapshot")
+		return
+	}
+	nr.persistedFingerprint = fingerprint
+}
+
+// restoreMembershipLocked loads the persisted membership and returns how many
+// peers it restored. Caller holds the write lock and has already added self.
+//
+// Restored peers enter as SUSPECT rather than at their persisted status: this
+// node has heard from none of them since booting, so their liveness is unknown.
+// SUSPECT counts toward TOTAL membership (Count) and is excluded from
+// GetAliveNodes, which is exactly the fail-closed shape wanted - the quorum
+// denominator is restored immediately while nothing is treated as reachable
+// until gossip says so.
+//
+// REMOVED stays REMOVED, so a decommissioned peer does not come back as a
+// member. Incarnation is restored because SWIM refutation compares incarnations:
+// Update() rejects an update whose incarnation is not newer (see the SWIM rules
+// in Update), so a peer that has moved on refutes our stale record and wins,
+// while a restored record is not silently overwritten by an older rumour.
+func (nr *NodeRegistry) restoreMembershipLocked() int {
+	snapshot, ok := nr.store.load()
+	if !ok {
+		return 0
+	}
+
+	restored := 0
+	var selfIncarnation uint64
+	selfRecorded := false
+	for _, record := range snapshot.Nodes {
+		if record.NodeID == nr.localNodeID {
+			// Self is ALIVE by construction and was added by the caller.
+			selfIncarnation, selfRecorded = record.Incarnation, true
+			continue
+		}
+
+		status := NodeStatus_SUSPECT
+		if NodeStatus(record.Status) == NodeStatus_REMOVED {
+			status = NodeStatus_REMOVED
+		}
+
+		nr.nodes[record.NodeID] = &NodeState{
+			NodeId:      record.NodeID,
+			Address:     record.Address,
+			Status:      status,
+			Incarnation: record.Incarnation,
+		}
+		// Deliberately NOT time.Now(): a restored peer has not been seen, and
+		// dating it now would delay the failure detector by a full timeout.
+		nr.lastSeen[record.NodeID] = time.Time{}
+		restored++
+	}
+
+	// The snapshot we just read is what is on disk; record it so an unchanged
+	// membership does not rewrite the same bytes on the first mutation.
+	nr.persistedFingerprint = nr.membershipFingerprintLocked()
+
+	// Start above every incarnation the previous run announced: every change
+	// of our own incarnation is persisted (MarkLeaving, MarkAlive and SWIM
+	// refutation all reach persistMembershipLocked). Peers keep that run's
+	// last record of us - LEAVING after a graceful stop - and a restart at or
+	// below it would lose to it. Set after the fingerprint so the next
+	// membership change persists the new value. A failed persist is logged
+	// and leaves the older incarnation on disk.
+	if selfRecorded {
+		nr.nodes[nr.localNodeID].Incarnation = selfIncarnation + 1
+	}
+	return restored
 }
 
 // QuorumInfo returns quorum calculation information
@@ -892,70 +1207,4 @@ func (nr *NodeRegistry) QuorumInfo() (totalMembership int, aliveCount int, quoru
 	// Quorum = majority of total membership
 	quorumSize = (totalMembership / 2) + 1
 	return
-}
-
-// =======================
-// WATERMARK PROTOCOL
-// =======================
-
-// UpdateLocalWatermark updates the minimum applied sequence number for the local node
-// This watermark is gossiped to all peers and used for GC coordination
-func (nr *NodeRegistry) UpdateLocalWatermark(minSeq uint64) {
-	nr.mu.Lock()
-	defer nr.mu.Unlock()
-
-	node, exists := nr.nodes[nr.localNodeID]
-	if !exists {
-		log.Error().
-			Uint64("node_id", nr.localNodeID).
-			Msg("BUG: Local node not found in registry during watermark update")
-		return
-	}
-
-	// Only update if the new watermark is higher (watermarks only advance)
-	if minSeq > node.MinAppliedSeq {
-		node.MinAppliedSeq = minSeq
-		log.Debug().
-			Uint64("node_id", nr.localNodeID).
-			Uint64("watermark", minSeq).
-			Msg("Updated local watermark")
-	}
-}
-
-// GetLocalWatermark returns the local node's watermark
-func (nr *NodeRegistry) GetLocalWatermark() uint64 {
-	nr.mu.RLock()
-	defer nr.mu.RUnlock()
-
-	if node, exists := nr.nodes[nr.localNodeID]; exists {
-		return node.MinAppliedSeq
-	}
-	return 0
-}
-
-// GetClusterMinWatermark returns the minimum watermark across all ALIVE nodes
-// This is the safe point for garbage collection - transactions with seq_num below
-// this value have been applied by all nodes and can be safely cleaned up
-func (nr *NodeRegistry) GetClusterMinWatermark() uint64 {
-	nr.mu.RLock()
-	defer nr.mu.RUnlock()
-
-	var minWatermark uint64 = ^uint64(0) // Max uint64
-	hasAliveNodes := false
-
-	for _, node := range nr.nodes {
-		if node.Status == NodeStatus_ALIVE {
-			hasAliveNodes = true
-			if node.MinAppliedSeq < minWatermark {
-				minWatermark = node.MinAppliedSeq
-			}
-		}
-	}
-
-	// If no alive nodes (shouldn't happen, we're always alive), return 0
-	if !hasAliveNodes {
-		return 0
-	}
-
-	return minWatermark
 }

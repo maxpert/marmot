@@ -68,7 +68,8 @@ func TestConvertStatementsToProtoUsesVectorControlPayload(t *testing.T) {
 	require.NotNil(t, stmts[0].GetVectorIndexChange())
 	require.Empty(t, stmts[0].GetSQL())
 
-	internal := protocolStatementFromProto(stmts[0])
+	internal, err := protocolStatementFromProto(stmts[0])
+	require.NoError(t, err)
 	require.Equal(t, protocol.StatementCreateVectorIndex, internal.Type)
 	require.Equal(t, "docs_embed_idx", internal.VectorIndexName)
 	require.NotNil(t, internal.VectorIndexChange)

@@ -1,9 +1,11 @@
 package db
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -31,7 +33,6 @@ const (
 	pebblePrefixTxnByID     = "/txn_idx/txnid/" // /txn_idx/txnid/{8 bytes txnID} - primary index for streaming
 	pebblePrefixCDCRaw      = "/cdc/raw/"       // legacy per-row CDC prefix; rejected on open
 	pebblePrefixCDCManifest = "/cdc/manifest/"  // /cdc/manifest/{8 bytes txnID}
-	pebblePrefixRepl        = "/repl/"          // /repl/{8 bytes peerNodeID}/{dbName}
 	pebblePrefixSchema      = "/schema/"        // /schema/{dbName}
 	pebblePrefixDDLLock     = "/ddl/"           // /ddl/{dbName}
 	pebblePrefixSeq         = "/seq/"           // /seq/{8 bytes nodeID}
@@ -39,6 +40,31 @@ const (
 	pebblePrefixCounter     = "/meta/"          // /meta/{counterName}
 	pebblePrefixTxnCommit   = "/txn_commit/"    // /txn_commit/{8 bytes txnID}
 	pebblePrefixTxnStatus   = "/txn_status/"    // /txn_status/{8 bytes txnID}
+	pebblePrefixTxnPrepared = "/txn_prepared/"  // /txn_prepared/{8 bytes txnID} -> PreparedPayload
+
+	// pebblePrefixLogSeq is the single, store-wide key holding the durable
+	// end of the local commit sequence's current lease (logSeqAllocator). It
+	// replaces the per-origin /seq/{nodeID} leases as the source of
+	// LogPosition.Seq for every committed transaction, whatever its origin.
+	pebblePrefixLogSeq = "/log_seq/current"
+
+	// pebblePrefixPullCursor stores C[n,p,d]: this node's pull position in
+	// peer p's log for this database, kept apart from the per-peer consumed
+	// positions.
+	pebblePrefixPullCursor = "/log_pull_cursor/" // /log_pull_cursor/{8 bytes peerNodeID}
+
+	// pebblePrefixConsumedPos stores R[self,requester,d]: the last `after`
+	// position a requester reported when listing this store's log, kept as
+	// is rather than as a max.
+	pebblePrefixConsumedPos = "/log_consumed_pos/" // /log_consumed_pos/{8 bytes requesterNodeID}
+
+	// pebbleKeyTruncatedThrough stores T[self,d]: the highest LogPosition
+	// this store's GC has deleted through. It only ever increases.
+	pebbleKeyTruncatedThrough = "/log_truncated_through"
+
+	// pebbleKeyReapplyPending marks that this database's local log must be
+	// re-applied to a restored SQLite file. Present means pending.
+	pebbleKeyReapplyPending = "/log_reapply_pending"
 )
 
 // Sharded lock for WriteIntent serialization (prevents TOCTOU race)
@@ -56,9 +82,9 @@ type PebbleMetaStore struct {
 	// Idempotent close
 	closed atomic.Bool
 
-	// Sequence generators (Pebble doesn't have native Sequence API)
-	sequences map[uint64]*AtomicSequence
-	seqMu     sync.Mutex
+	// logSeq mints the store-wide local commit sequence (LogPosition.Seq)
+	// shared by every origin's committed transactions (log_position.go).
+	logSeq *logSeqAllocator
 
 	// Persistent counters for O(1) lookups
 	counters *PebbleCounter
@@ -84,6 +110,15 @@ type PebbleMetaStore struct {
 
 	// Optional transaction getter for conflict resolution (set by MemoryMetaStore wrapper)
 	txnGetter TransactionGetter
+
+	// Prepared transactions whose row locks recoverPreparedCDCState restored
+	// at open, held until the memory tier takes them (takeRecoveredPrepared).
+	recoveredPrepared []TxnImmutableRecord
+
+	// syncWrite is pebble.Sync, or pebble.NoSync for a store opened without
+	// a WAL (PebbleMetaStoreOptions.DisableWAL, tests only), which has no
+	// durable write to offer and refuses a synced one.
+	syncWrite *pebble.WriteOptions
 }
 
 func cdcPrepareSyncStrict() bool {
@@ -219,15 +254,27 @@ func NewPebbleMetaStore(path string, opts PebbleMetaStoreOptions) (*PebbleMetaSt
 	store := &PebbleMetaStore{
 		db:                  db,
 		path:                path,
-		sequences:           make(map[uint64]*AtomicSequence),
 		rowLocks:            NewRowLockStore(),
 		dmlIntents:          xsync.NewMapOf[uint64, *xsync.MapOf[string, *WriteIntentRecord]](),
 		persistedIntentTxns: xsync.NewMapOf[uint64, struct{}](),
 		cdcLocks:            NewXsyncCDCLockStore(),
+		syncWrite:           pebble.Sync,
+	}
+	if opts.DisableWAL {
+		store.syncWrite = pebble.NoSync
 	}
 
 	// Initialize persistent counters
 	store.counters = NewPebbleCounter(db, pebblePrefixCounter, 10)
+
+	logSeq, err := newLogSeqAllocator(db, []byte(pebblePrefixLogSeq), store.syncWrite, func() (uint64, error) {
+		return computeInitialLogSeq(db)
+	})
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to open log sequence: %w", err)
+	}
+	store.logSeq = logSeq
 
 	cdcLog, err := openCDCSegmentLog(path)
 	if err != nil {
@@ -265,6 +312,14 @@ func rejectLegacyCDCRawKeys(db *pebble.DB) error {
 	return iter.Error()
 }
 
+// recoverPreparedCDCState restores the row locks of every transaction that was
+// prepared, and had neither committed nor aborted, when the store last closed.
+// Its manifest survives in one of two places: a prepare record in the segment
+// log (strict prepare sync, which outlives the loss of unsynced Pebble keys),
+// or the manifest key DurablyPrepareTransaction writes. Each recovered
+// transaction is listed in recoveredPrepared for the memory tier, which must
+// register it so the stale-transaction GC can end it if its decision never
+// arrives (see takeRecoveredPrepared).
 func (s *PebbleMetaStore) recoverPreparedCDCState() error {
 	for _, txnID := range s.cdcLog.pendingTxnIDs() {
 		commit, err := s.readCommitRecord(txnID)
@@ -289,24 +344,32 @@ func (s *PebbleMetaStore) recoverPreparedCDCState() error {
 		if manifest == nil {
 			continue
 		}
-		if err := s.ensureRecoveredPreparedTransaction(txnID, manifest, status, err); err != nil {
+		immutable, err := s.ensureRecoveredPreparedTransaction(txnID, manifest, status, err)
+		if err != nil {
 			return err
+		}
+		if immutable == nil {
+			continue
 		}
 		if err := s.restorePreparedDMLIntents(txnID, manifest); err != nil {
 			return err
 		}
+		s.recoveredPrepared = append(s.recoveredPrepared, *immutable)
 	}
-	return nil
+	return s.recoverSealedPreparedTransactions()
 }
 
-func (s *PebbleMetaStore) ensureRecoveredPreparedTransaction(txnID uint64, manifest *cdcSegmentTxnManifest, status TxnStatus, statusErr error) error {
+// ensureRecoveredPreparedTransaction rewrites the PENDING record of a
+// transaction recovered from a segment prepare record, and returns its
+// immutable record, or nil when the manifest cannot rebuild one.
+func (s *PebbleMetaStore) ensureRecoveredPreparedTransaction(txnID uint64, manifest *cdcSegmentTxnManifest, status TxnStatus, statusErr error) (*TxnImmutableRecord, error) {
 	immutable, err := s.readImmutableTxnRecord(txnID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if immutable == nil {
 		if manifest.NodeID == 0 {
-			return nil
+			return nil, nil
 		}
 		startTS := hlc.Timestamp{
 			WallTime: manifest.StartTSWall,
@@ -314,19 +377,133 @@ func (s *PebbleMetaStore) ensureRecoveredPreparedTransaction(txnID uint64, manif
 			NodeID:   manifest.NodeID,
 		}
 		if err := s.writeImmutableTxnRecord(txnID, manifest.NodeID, startTS); err != nil {
-			return err
+			return nil, err
+		}
+		immutable = &TxnImmutableRecord{
+			TxnID:          txnID,
+			NodeID:         manifest.NodeID,
+			StartTSWall:    manifest.StartTSWall,
+			StartTSLogical: manifest.StartTSLogical,
 		}
 	}
 	if statusErr == pebble.ErrNotFound {
 		if err := s.db.Set(pebbleTxnStatusKey(txnID), []byte{byte(TxnStatusPending)}, pebble.NoSync); err != nil {
+			return nil, err
+		}
+	}
+	if statusErr == pebble.ErrNotFound || status == TxnStatusPending {
+		if err := s.db.Set(pebbleTxnPendingKey(txnID), nil, pebble.NoSync); err != nil {
+			return nil, err
+		}
+	}
+	return immutable, nil
+}
+
+// recoverSealedPreparedTransactions recovers the prepared transactions whose
+// manifest is the Pebble key alone (the default, grouped prepare sync). Pebble
+// applies its writes in order, so a surviving manifest key means the immutable
+// record and the PENDING status written before it survived too; a transaction
+// without them was aborted, and its manifest is an orphan.
+//
+// Under grouped sync PREPARE may ACK before its CDC rows reach the disk, so an
+// OS crash can leave a manifest whose rows are gone. Such a transaction cannot
+// keep its promise to commit: it is aborted here, so its COMMIT is refused
+// rather than ACKed having applied nothing.
+func (s *PebbleMetaStore) recoverSealedPreparedTransactions() error {
+	recovered := make(map[uint64]struct{}, len(s.recoveredPrepared))
+	for _, rec := range s.recoveredPrepared {
+		recovered[rec.TxnID] = struct{}{}
+	}
+
+	prefix := []byte(pebblePrefixCDCManifest)
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: prefix,
+		UpperBound: prefixUpperBound(prefix),
+	})
+	if err != nil {
+		return err
+	}
+	manifests := make(map[uint64]*cdcSegmentTxnManifest)
+	for iter.SeekGE(prefix); iter.Valid(); iter.Next() {
+		key := iter.Key()
+		if len(key) < len(pebblePrefixCDCManifest)+8 {
+			continue
+		}
+		txnID := binary.BigEndian.Uint64(key[len(pebblePrefixCDCManifest):])
+		if _, done := recovered[txnID]; done {
+			continue
+		}
+		val, err := iter.ValueAndErr()
+		if err != nil {
+			_ = iter.Close()
 			return err
 		}
-		return s.db.Set(pebbleTxnPendingKey(txnID), nil, pebble.NoSync)
+		var manifest cdcSegmentTxnManifest
+		if err := encoding.Unmarshal(val, &manifest); err != nil {
+			_ = iter.Close()
+			return fmt.Errorf("decode CDC manifest txn %d: %w", txnID, err)
+		}
+		manifests[txnID] = &manifest
 	}
-	if status == TxnStatusPending {
-		return s.db.Set(pebbleTxnPendingKey(txnID), nil, pebble.NoSync)
+	if err := iter.Close(); err != nil {
+		return err
+	}
+
+	for txnID, manifest := range manifests {
+		status, err := s.readTxnStatus(txnID)
+		if err == pebble.ErrNotFound {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if status != TxnStatusPending {
+			continue
+		}
+		commit, err := s.readCommitRecord(txnID)
+		if err != nil {
+			return err
+		}
+		if commit != nil {
+			continue
+		}
+		immutable, err := s.readImmutableTxnRecord(txnID)
+		if err != nil {
+			return err
+		}
+		if immutable == nil {
+			continue
+		}
+		if err := s.restorePreparedDMLIntents(txnID, manifest); err != nil {
+			log.Warn().Err(err).Uint64("txn_id", txnID).
+				Msg("Prepared transaction lost its CDC rows before they were synced; aborting it")
+			if err := s.abortUnrecoverablePrepared(txnID); err != nil {
+				return err
+			}
+			continue
+		}
+		s.recoveredPrepared = append(s.recoveredPrepared, *immutable)
 	}
 	return nil
+}
+
+// abortUnrecoverablePrepared releases whatever row locks a failed recovery
+// took and aborts the transaction, so its COMMIT finds no record.
+func (s *PebbleMetaStore) abortUnrecoverablePrepared(txnID uint64) error {
+	s.rowLocks.ReleaseByTxn(txnID)
+	s.dmlIntents.Delete(txnID)
+	if err := s.AbortTransaction(txnID); err != nil {
+		return err
+	}
+	return s.DeleteCapturedRows(txnID)
+}
+
+// takeRecoveredPrepared returns the prepared transactions recovered at open
+// and forgets them; the caller owns their resolution from then on.
+func (s *PebbleMetaStore) takeRecoveredPrepared() []TxnImmutableRecord {
+	recovered := s.recoveredPrepared
+	s.recoveredPrepared = nil
+	return recovered
 }
 
 func (s *PebbleMetaStore) restorePreparedDMLIntents(txnID uint64, manifest *cdcSegmentTxnManifest) error {
@@ -369,13 +546,8 @@ func (s *PebbleMetaStore) Close() error {
 		return nil // Already closed
 	}
 
-	// Release all sequence generators (persist final values)
-	s.seqMu.Lock()
-	for _, seq := range s.sequences {
-		seq.Close()
-	}
-	s.sequences = nil
-	s.seqMu.Unlock()
+	// Wait for any in-flight async lease extension before the pebble.DB closes.
+	s.logSeq.close()
 
 	if err := s.cdcLog.close(); err != nil {
 		log.Warn().Err(err).Str("path", filepath.Join(s.path, cdcSegmentDirName)).Msg("Failed to close CDC segment log")
@@ -388,82 +560,6 @@ func (s *PebbleMetaStore) Close() error {
 func (s *PebbleMetaStore) Checkpoint() error {
 	return nil
 }
-
-// AtomicSequence provides contention-free sequence number generation.
-// Pre-allocates batches of IDs to minimize disk writes.
-type AtomicSequence struct {
-	db        *pebble.DB
-	key       []byte
-	bandwidth uint64 // IDs to pre-allocate (e.g., 1000)
-
-	mu       sync.Mutex
-	nextVal  uint64 // Next value to return
-	leaseEnd uint64 // End of current lease
-}
-
-// NewAtomicSequence creates a new sequence generator.
-// On startup, reads the persisted lease end and continues from there.
-func NewAtomicSequence(db *pebble.DB, key []byte, bandwidth uint64) (*AtomicSequence, error) {
-	var leaseEnd uint64
-
-	val, closer, err := db.Get(key)
-	if err == nil {
-		if len(val) >= 8 {
-			leaseEnd = binary.BigEndian.Uint64(val)
-		}
-		closer.Close()
-	} else if err != pebble.ErrNotFound {
-		return nil, fmt.Errorf("failed to read sequence: %w", err)
-	}
-
-	return &AtomicSequence{
-		db:        db,
-		key:       key,
-		bandwidth: bandwidth,
-		nextVal:   leaseEnd, // Resume from where we left off
-		leaseEnd:  leaseEnd,
-	}, nil
-}
-
-// Next returns the next sequence number.
-// Pre-allocates a batch of IDs when the current lease is exhausted.
-func (s *AtomicSequence) Next() (uint64, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.nextVal >= s.leaseEnd {
-		// Allocate new batch
-		newLease := s.leaseEnd + s.bandwidth
-
-		// Persist new lease end to disk
-		buf := make([]byte, 8)
-		binary.BigEndian.PutUint64(buf, newLease)
-		if err := s.db.Set(s.key, buf, pebble.NoSync); err != nil {
-			return 0, fmt.Errorf("failed to persist sequence: %w", err)
-		}
-
-		s.leaseEnd = newLease
-	}
-
-	val := s.nextVal
-	s.nextVal++
-	return val, nil
-}
-
-// Close persists any unused portion of the current lease.
-// This minimizes gaps on restart.
-func (s *AtomicSequence) Close() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	// Persist current nextVal so we don't have gaps on restart
-	buf := make([]byte, 8)
-	binary.BigEndian.PutUint64(buf, s.nextVal)
-	return s.db.Set(s.key, buf, pebble.NoSync)
-}
-
-// seqBandwidth is the number of sequence numbers to pre-allocate at once
-const pebbleSeqBandwidth = 1000
 
 // Key helper functions - use binary encoding for uint64 (8 bytes vs 16 hex chars)
 // Big-endian preserves lexicographic sort order for range scans
@@ -515,6 +611,10 @@ func pebbleTxnCommitKey(txnID uint64) []byte {
 	return buildKeyUint64(pebblePrefixTxnCommit, txnID)
 }
 
+func pebbleTxnPreparedKey(txnID uint64) []byte {
+	return buildKeyUint64(pebblePrefixTxnPrepared, txnID)
+}
+
 func pebbleTxnStatusKey(txnID uint64) []byte {
 	return buildKeyUint64(pebblePrefixTxnStatus, txnID)
 }
@@ -540,16 +640,6 @@ func pebbleCDCManifestKey(txnID uint64) []byte {
 	return buildKeyUint64(pebblePrefixCDCManifest, txnID)
 }
 
-func pebbleReplKey(peerNodeID uint64, dbName string) []byte {
-	key := make([]byte, len(pebblePrefixRepl)+8+1+len(dbName))
-	n := copy(key, pebblePrefixRepl)
-	binary.BigEndian.PutUint64(key[n:], peerNodeID)
-	n += 8
-	key[n] = '/'
-	copy(key[n+1:], dbName)
-	return key
-}
-
 func pebbleSchemaKey(dbName string) []byte {
 	return buildKeyString(pebblePrefixSchema, dbName)
 }
@@ -560,6 +650,14 @@ func pebbleDdlLockKey(dbName string) []byte {
 
 func pebbleSeqKey(nodeID uint64) []byte {
 	return buildKeyUint64(pebblePrefixSeq, nodeID)
+}
+
+func pebblePullCursorKey(peerNodeID uint64) []byte {
+	return buildKeyUint64(pebblePrefixPullCursor, peerNodeID)
+}
+
+func pebbleConsumedPosKey(requesterNodeID uint64) []byte {
+	return buildKeyUint64(pebblePrefixConsumedPos, requesterNodeID)
 }
 
 // prefixUpperBound returns prefix + 0xFF... for range iteration
@@ -620,6 +718,127 @@ func (s *PebbleMetaStore) writeImmutableTxnRecord(txnID, nodeID uint64, startTS 
 	return s.db.Set(pebbleTxnKey(txnID), native.Bytes(), pebble.NoSync)
 }
 
+// writeBegunTxnRecord writes a memory-tier begin: the immutable record plus
+// the pending-index key, in one batch. The index key is what lets
+// ReconstructFromPebble find a begin the process died holding before its
+// durable prepare (PendingBegunAbandoned) without scanning every /txn/ key.
+func (s *PebbleMetaStore) writeBegunTxnRecord(txnID, nodeID uint64, startTS hlc.Timestamp) error {
+	immutable := &TxnImmutableRecord{
+		TxnID:          txnID,
+		NodeID:         nodeID,
+		StartTSWall:    startTS.WallTime,
+		StartTSLogical: startTS.Logical,
+		CreatedAt:      time.Now().UnixNano(),
+	}
+	native, err := encoding.MarshalNative(immutable)
+	if err != nil {
+		return fmt.Errorf("failed to marshal immutable record: %w", err)
+	}
+	defer native.Dispose()
+
+	batch := s.db.NewBatch()
+	defer batch.Close()
+	if err := batch.Set(pebbleTxnKey(txnID), native.Bytes(), nil); err != nil {
+		return err
+	}
+	if err := batch.Set(pebbleTxnPendingKey(txnID), nil, nil); err != nil {
+		return err
+	}
+	return batch.Commit(pebble.NoSync)
+}
+
+// ClassifyPending implements MetaStore. Without a memory tier a record whose
+// status key is missing is always abandoned: PebbleMetaStore.BeginTransaction
+// writes the PENDING status with the record itself.
+func (s *PebbleMetaStore) ClassifyPending(txnID uint64) (PendingKind, error) {
+	immutable, err := s.readImmutableTxnRecord(txnID)
+	if err != nil || immutable == nil {
+		return PendingNone, err
+	}
+	status, err := s.readTxnStatus(txnID)
+	if err == pebble.ErrNotFound {
+		commit, cerr := s.readCommitRecord(txnID)
+		if cerr != nil {
+			return PendingNone, cerr
+		}
+		if commit != nil {
+			return PendingNone, nil
+		}
+		return PendingBegunAbandoned, nil
+	}
+	if err != nil {
+		return PendingNone, err
+	}
+	if status == TxnStatusPending {
+		return PendingPrepared, nil
+	}
+	return PendingNone, nil
+}
+
+// DiscardAbandonedBegin implements MetaStore.
+func (s *PebbleMetaStore) DiscardAbandonedBegin(txnID uint64) error {
+	kind, err := s.ClassifyPending(txnID)
+	if err != nil {
+		return err
+	}
+	if kind != PendingBegunAbandoned {
+		return fmt.Errorf("transaction %d: %w", txnID, ErrNotAbandonedBegin)
+	}
+	s.rowLocks.ReleaseByTxn(txnID)
+	if err := s.DeleteIntentsByTxn(txnID); err != nil {
+		return fmt.Errorf("delete intents of abandoned txn %d: %w", txnID, err)
+	}
+	if err := s.DeleteCapturedRows(txnID); err != nil {
+		return fmt.Errorf("delete captured rows of abandoned txn %d: %w", txnID, err)
+	}
+	s.dmlIntents.Delete(txnID)
+	s.persistedIntentTxns.Delete(txnID)
+
+	batch := s.db.NewBatch()
+	defer batch.Close()
+	if err := batch.Delete(pebbleTxnKey(txnID), nil); err != nil {
+		return err
+	}
+	if err := batch.Delete(pebbleTxnPendingKey(txnID), nil); err != nil {
+		return err
+	}
+	return batch.Commit(pebble.NoSync)
+}
+
+// abandonedBeginTxnIDs lists every pending-index entry whose record is
+// PendingBegunAbandoned from this store's own view - the caller excludes
+// begins it still tracks.
+func (s *PebbleMetaStore) abandonedBeginTxnIDs() ([]uint64, error) {
+	prefix := []byte(pebblePrefixTxnPending)
+	iter, err := s.db.NewIter(&pebble.IterOptions{LowerBound: prefix, UpperBound: prefixUpperBound(prefix)})
+	if err != nil {
+		return nil, err
+	}
+	var candidates []uint64
+	for iter.SeekGE(prefix); iter.Valid(); iter.Next() {
+		key := iter.Key()
+		if len(key) < len(pebblePrefixTxnPending)+8 {
+			continue
+		}
+		candidates = append(candidates, binary.BigEndian.Uint64(key[len(pebblePrefixTxnPending):]))
+	}
+	if err := iter.Close(); err != nil {
+		return nil, err
+	}
+
+	abandoned := candidates[:0]
+	for _, txnID := range candidates {
+		kind, err := s.ClassifyPending(txnID)
+		if err != nil {
+			return nil, err
+		}
+		if kind == PendingBegunAbandoned {
+			abandoned = append(abandoned, txnID)
+		}
+	}
+	return abandoned, nil
+}
+
 // readImmutableTxnRecord reads the immutable transaction record from /txn/{txnID}.
 func (s *PebbleMetaStore) readImmutableTxnRecord(txnID uint64) (*TxnImmutableRecord, error) {
 	val, closer, err := s.db.Get(pebbleTxnKey(txnID))
@@ -658,9 +877,12 @@ func (s *PebbleMetaStore) readCommitRecord(txnID uint64) (*TxnCommitRecord, erro
 	return &commit, nil
 }
 
-// deleteTransactionKeys deletes transaction records from Pebble.
-// Used by MemoryMetaStore which manages status/heartbeat in memory.
-func (s *PebbleMetaStore) deleteTransactionKeys(txnID uint64, isCommitted bool) error {
+// deleteTransactionKeys deletes a non-committed transaction's records from
+// Pebble. Used by MemoryMetaStore, which manages status/heartbeat in
+// memory, to abort a transaction it still holds PENDING; the memory tier
+// refuses to abort a COMMITTED one before ever calling this, so it
+// never touches the seq index, which only GC may delete.
+func (s *PebbleMetaStore) deleteTransactionKeys(txnID uint64) error {
 	s.dmlIntents.Delete(txnID)
 	s.persistedIntentTxns.Delete(txnID)
 	batch := s.db.NewBatch()
@@ -673,14 +895,19 @@ func (s *PebbleMetaStore) deleteTransactionKeys(txnID uint64, isCommitted bool) 
 
 	// Delete commit record if exists
 	_ = batch.Delete(pebbleTxnCommitKey(txnID), nil)
+	// A memory-tier begin writes the pending-index key too (writeBegunTxnRecord).
+	_ = batch.Delete(pebbleTxnPendingKey(txnID), nil)
+	_ = batch.Delete(pebbleTxnPreparedKey(txnID), nil)
 
-	// If committed, try to remove from sequence index
-	if isCommitted {
-		// Try to read commit record to get seqNum before deleting
-		commit, err := s.readCommitRecord(txnID)
-		if err == nil && commit != nil {
-			_ = batch.Delete(pebbleTxnSeqKey(commit.SeqNum, txnID), nil)
+	// A prepared transaction's status stays behind as ABORTED: a segment
+	// prepare record outlives the abort, and recovery must not take it for a
+	// prepare whose Pebble keys were lost (recoverPreparedCDCState).
+	if _, err := s.readTxnStatus(txnID); err == nil {
+		if err := batch.Set(pebbleTxnStatusKey(txnID), []byte{byte(TxnStatusAborted)}, nil); err != nil {
+			return err
 		}
+	} else if err != pebble.ErrNotFound {
+		return err
 	}
 
 	return batch.Commit(pebble.NoSync)
@@ -741,12 +968,79 @@ func (s *PebbleMetaStore) BeginTransaction(txnID, nodeID uint64, startTS hlc.Tim
 // have been written. The default path queues segment fsync through the grouped
 // CDC syncer to match Pebble NoSync hot-path behavior; set
 // MARMOT_CDC_PREPARE_SYNC=strict to wait for fsync before PREPARE ACK.
+//
+// It also records the transaction's PreparedPayload, in the same batch as the
+// PENDING status, for its commit to check against (PreparedPayload).
 func (s *PebbleMetaStore) DurablyPrepareTransaction(txnID uint64) error {
-	statusBuf := []byte{byte(TxnStatusPending)}
-	if err := s.db.Set(pebbleTxnStatusKey(txnID), statusBuf, pebble.NoSync); err != nil {
+	payload, err := s.currentPayload(txnID)
+	if err != nil {
+		return err
+	}
+	encoded, err := encoding.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("encode prepared payload: %w", err)
+	}
+	batch := s.db.NewBatch()
+	defer batch.Close()
+	if err := batch.Set(pebbleTxnStatusKey(txnID), []byte{byte(TxnStatusPending)}, nil); err != nil {
+		return err
+	}
+	if err := batch.Set(pebbleTxnPreparedKey(txnID), encoded, nil); err != nil {
+		return err
+	}
+	if err := batch.Commit(pebble.NoSync); err != nil {
 		return err
 	}
 	return s.sealCapturedRows(txnID, cdcPrepareSyncStrict())
+}
+
+// currentPayload counts what txnID holds right now: its captured rows
+// (pending or already sealed) and its persisted intents.
+func (s *PebbleMetaStore) currentPayload(txnID uint64) (PreparedPayload, error) {
+	var payload PreparedPayload
+	if rows, pending := s.cdcLog.pendingRowCount(txnID); pending {
+		payload.Rows = rows
+	} else {
+		data, err := s.getValueCopy(pebbleCDCManifestKey(txnID))
+		if err != nil && err != pebble.ErrNotFound {
+			return payload, err
+		}
+		if err == nil {
+			var manifest cdcSegmentTxnManifest
+			if err := encoding.Unmarshal(data, &manifest); err != nil {
+				return payload, fmt.Errorf("decode CDC manifest txn %d: %w", txnID, err)
+			}
+			payload.Rows = manifest.RowCount
+		}
+	}
+	if _, persisted := s.persistedIntentTxns.Load(txnID); !persisted {
+		return payload, nil
+	}
+	prefix := pebbleIntentByTxnPrefix(txnID)
+	iter, err := s.db.NewIter(&pebble.IterOptions{LowerBound: prefix, UpperBound: prefixUpperBound(prefix)})
+	if err != nil {
+		return payload, err
+	}
+	for iter.SeekGE(prefix); iter.Valid(); iter.Next() {
+		payload.Intents++
+	}
+	return payload, iter.Close()
+}
+
+// PreparedPayload implements MetaStore.
+func (s *PebbleMetaStore) PreparedPayload(txnID uint64) (PreparedPayload, bool, error) {
+	var payload PreparedPayload
+	data, err := s.getValueCopy(pebbleTxnPreparedKey(txnID))
+	if err == pebble.ErrNotFound {
+		return payload, false, nil
+	}
+	if err != nil {
+		return payload, false, err
+	}
+	if err := encoding.Unmarshal(data, &payload); err != nil {
+		return payload, false, fmt.Errorf("decode prepared payload of txn %d: %w", txnID, err)
+	}
+	return payload, true, nil
 }
 
 // CommitTransaction marks a transaction as COMMITTED
@@ -759,28 +1053,27 @@ func (s *PebbleMetaStore) CommitTransaction(txnID uint64, commitTS hlc.Timestamp
 		Uint64("required_schema_version", requiredSchemaVersion).
 		Msg("CDC: CommitTransaction")
 
+	// Allocate the store-wide log position first, and mark it done on every
+	// exit path from here on (logSeqTracker): a seq that turns out unused (an
+	// early return below) is simply a gap, never reissued, and the tracker
+	// still reports it done immediately since no commit record was written
+	// for it.
+	seqNum, err := s.nextLogSeq()
+	if err != nil {
+		return err
+	}
+	defer s.logSeq.markDone(seqNum)
+
 	if err := s.SealCapturedRows(txnID); err != nil {
 		return fmt.Errorf("seal captured rows: %w", err)
 	}
 
-	// Step 1: Read ONLY immutable record to get NodeID
-	immutableData, err := s.getValueCopy(pebbleTxnKey(txnID))
-	if err == pebble.ErrNotFound {
-		return fmt.Errorf("transaction %d not found", txnID)
-	}
-	if err != nil {
+	// Step 1: Confirm the transaction exists.
+	if _, err := s.getValueCopy(pebbleTxnKey(txnID)); err != nil {
+		if err == pebble.ErrNotFound {
+			return fmt.Errorf("transaction %d not found", txnID)
+		}
 		return err
-	}
-
-	var immutable TxnImmutableRecord
-	if err := encoding.Unmarshal(immutableData, &immutable); err != nil {
-		return err
-	}
-
-	// Step 2: Get sequence number using contention-free Sequence API
-	seqNum, err := s.GetNextSeqNum(immutable.NodeID)
-	if err != nil {
-		return fmt.Errorf("failed to get next seq_num: %w", err)
 	}
 
 	now := time.Now().UnixNano()
@@ -819,13 +1112,21 @@ func (s *PebbleMetaStore) CommitTransaction(txnID uint64, commitTS hlc.Timestamp
 
 	// Heartbeat is in-memory only - no need to write at commit
 
-	// Remove from pending index
+	// Remove from pending index, and the prepared payload the commit no
+	// longer needs.
 	if err := batch.Delete(pebbleTxnPendingKey(txnID), nil); err != nil {
 		return err
 	}
+	if err := batch.Delete(pebbleTxnPreparedKey(txnID), nil); err != nil {
+		return err
+	}
 
-	// Add to sequence index (kept for backward compatibility and GC)
-	if err := batch.Set(pebbleTxnSeqKey(seqNum, txnID), nil, nil); err != nil {
+	// Add to sequence index, carrying the commit timestamp with the position
+	stamp, err := encodeLogEntryStamp(commitTS)
+	if err != nil {
+		return err
+	}
+	if err := batch.Set(pebbleTxnSeqKey(seqNum, txnID), stamp, nil); err != nil {
 		return err
 	}
 
@@ -838,6 +1139,9 @@ func (s *PebbleMetaStore) CommitTransaction(txnID uint64, commitTS hlc.Timestamp
 	if err := s.counters.UpdateMaxInBatch(batch, "max_committed_txn_id", int64(txnID)); err != nil {
 		return err
 	}
+	if err := s.counters.UpdateMaxInBatch(batch, maxCommitWallCounter, commitTS.WallTime); err != nil {
+		return err
+	}
 	if err := s.counters.IncInBatch(batch, "committed_txn_count", 1); err != nil {
 		return err
 	}
@@ -845,24 +1149,31 @@ func (s *PebbleMetaStore) CommitTransaction(txnID uint64, commitTS hlc.Timestamp
 	return batch.Commit(pebble.NoSync) // Rely on replication for durability (like CDB/TiKV/FDB)
 }
 
-// StoreReplayedTransaction inserts a fully-committed transaction record directly.
-func (s *PebbleMetaStore) StoreReplayedTransaction(txnID, nodeID uint64, commitTS hlc.Timestamp, dbName string, rowCount uint32) error {
+// StoreReplayedTransaction inserts a fully-committed transaction record
+// directly, from a txn replayed from another node's log. originNodeID is
+// persisted as the immutable NodeID (the owner of the DDL incarnations the
+// txn creates, which must be the same on every node that replays it); it
+// is the node that coordinated the transaction, not the node replaying it.
+// requiredSchemaVersion is persisted on the commit record exactly as the
+// originating commit recorded it.
+func (s *PebbleMetaStore) StoreReplayedTransaction(txnID, originNodeID uint64, commitTS hlc.Timestamp, dbName string, rowCount uint32, requiredSchemaVersion uint64) error {
 	log.Debug().
 		Uint64("txn_id", txnID).
-		Uint64("node_id", nodeID).
+		Uint64("origin_node_id", originNodeID).
 		Int64("commit_ts", commitTS.WallTime).
 		Str("database", dbName).
 		Uint32("row_count", rowCount).
+		Uint64("required_schema_version", requiredSchemaVersion).
 		Msg("StoreReplayedTransaction: storing replayed transaction")
+
+	seqNum, err := s.nextLogSeq()
+	if err != nil {
+		return err
+	}
+	defer s.logSeq.markDone(seqNum)
 
 	if err := s.SealCapturedRows(txnID); err != nil {
 		return fmt.Errorf("seal replayed rows: %w", err)
-	}
-
-	// Get sequence number
-	seqNum, err := s.GetNextSeqNum(nodeID)
-	if err != nil {
-		return fmt.Errorf("failed to get next seq_num: %w", err)
 	}
 
 	now := time.Now().UnixNano()
@@ -870,7 +1181,7 @@ func (s *PebbleMetaStore) StoreReplayedTransaction(txnID, nodeID uint64, commitT
 	// Create immutable record
 	immutable := &TxnImmutableRecord{
 		TxnID:          txnID,
-		NodeID:         nodeID,
+		NodeID:         originNodeID,
 		StartTSWall:    commitTS.WallTime,
 		StartTSLogical: commitTS.Logical,
 		CreatedAt:      now,
@@ -890,7 +1201,7 @@ func (s *PebbleMetaStore) StoreReplayedTransaction(txnID, nodeID uint64, commitT
 		CommittedAt:           now,
 		TablesInvolved:        "",
 		DatabaseName:          dbName,
-		RequiredSchemaVersion: 0,
+		RequiredSchemaVersion: requiredSchemaVersion,
 		RowCount:              rowCount,
 	}
 
@@ -921,8 +1232,12 @@ func (s *PebbleMetaStore) StoreReplayedTransaction(txnID, nodeID uint64, commitT
 
 	// Heartbeat not needed for replayed transactions (already committed)
 
-	// Add to sequence index (kept for backward compatibility and GC)
-	if err := batch.Set(pebbleTxnSeqKey(seqNum, txnID), nil, nil); err != nil {
+	// Add to sequence index, carrying the commit timestamp with the position
+	stamp, err := encodeLogEntryStamp(hlc.Timestamp{WallTime: commitTS.WallTime, Logical: commitTS.Logical, NodeID: originNodeID})
+	if err != nil {
+		return err
+	}
+	if err := batch.Set(pebbleTxnSeqKey(seqNum, txnID), stamp, nil); err != nil {
 		return err
 	}
 
@@ -934,6 +1249,9 @@ func (s *PebbleMetaStore) StoreReplayedTransaction(txnID, nodeID uint64, commitT
 	if err := s.counters.UpdateMaxInBatch(batch, "max_committed_txn_id", int64(txnID)); err != nil {
 		return err
 	}
+	if err := s.counters.UpdateMaxInBatch(batch, maxCommitWallCounter, commitTS.WallTime); err != nil {
+		return err
+	}
 	if err := s.counters.IncInBatch(batch, "committed_txn_count", 1); err != nil {
 		return err
 	}
@@ -941,7 +1259,10 @@ func (s *PebbleMetaStore) StoreReplayedTransaction(txnID, nodeID uint64, commitT
 	return batch.Commit(pebble.NoSync)
 }
 
-// AbortTransaction deletes a transaction record
+// AbortTransaction deletes a PENDING transaction's record. A COMMITTED
+// transaction is refused with ErrAbortCommitted: the local log is
+// append-only, and only GC ever removes a
+// committed entry's seq-index key or records.
 func (s *PebbleMetaStore) AbortTransaction(txnID uint64) error {
 	defer s.dmlIntents.Delete(txnID)
 	defer s.persistedIntentTxns.Delete(txnID)
@@ -954,39 +1275,26 @@ func (s *PebbleMetaStore) AbortTransaction(txnID uint64) error {
 		return err
 	}
 
-	var seqNum uint64
-	// If committed, read commit record to get SeqNum for cleanup
 	if status == TxnStatusCommitted {
-		commitData, err := s.getValueCopy(pebbleTxnCommitKey(txnID))
-		if err != nil && err != pebble.ErrNotFound {
-			return err
-		}
-		if err == nil {
-			var commit TxnCommitRecord
-			if err := encoding.Unmarshal(commitData, &commit); err != nil {
-				return err
-			}
-			seqNum = commit.SeqNum
-		}
+		return ErrAbortCommitted
 	}
 
 	batch := s.db.NewBatch()
 	defer batch.Close()
 
-	// Delete all keys: /txn/, /txn_commit/, /txn_status/
+	// Delete /txn/ and /txn_commit/; the status stays, as ABORTED, for the
+	// reason given in deleteTransactionKeys.
 	if err := batch.Delete(pebbleTxnKey(txnID), nil); err != nil {
 		return err
 	}
 	_ = batch.Delete(pebbleTxnCommitKey(txnID), nil)
-	_ = batch.Delete(pebbleTxnStatusKey(txnID), nil)
-
-	// Remove from pending index (best-effort cleanup)
-	_ = batch.Delete(pebbleTxnPendingKey(txnID), nil)
-
-	// Remove from sequence index if it had one (best-effort cleanup)
-	if seqNum > 0 {
-		_ = batch.Delete(pebbleTxnSeqKey(seqNum, txnID), nil)
+	if err := batch.Set(pebbleTxnStatusKey(txnID), []byte{byte(TxnStatusAborted)}, nil); err != nil {
+		return err
 	}
+
+	// Remove from pending index and the prepared payload (best-effort cleanup)
+	_ = batch.Delete(pebbleTxnPendingKey(txnID), nil)
+	_ = batch.Delete(pebbleTxnPreparedKey(txnID), nil)
 
 	// NoSync: AbortTransaction is cleanup. Idempotent - can be redone.
 	return batch.Commit(pebble.NoSync)
@@ -1010,9 +1318,14 @@ func (s *PebbleMetaStore) GetTransaction(txnID uint64) (*TransactionRecord, erro
 		return nil, err
 	}
 
-	// Read status from /txn_status/
+	// Read status from /txn_status/. A transaction begun through the memory
+	// tier has only its immutable record here until it is durably prepared
+	// or committed; one found that way after a restart was abandoned while
+	// PENDING, and reads as PENDING rather than failing the lookup.
 	status, err := s.readTxnStatus(txnID)
-	if err != nil {
+	if err == pebble.ErrNotFound {
+		status = TxnStatusPending
+	} else if err != nil {
 		return nil, err
 	}
 
@@ -1046,6 +1359,7 @@ func (s *PebbleMetaStore) GetTransaction(txnID uint64) (*TransactionRecord, erro
 			rec.TablesInvolved = commit.TablesInvolved
 			rec.DatabaseName = commit.DatabaseName
 			rec.RequiredSchemaVersion = commit.RequiredSchemaVersion
+			rec.RowCount = commit.RowCount
 		}
 	}
 
@@ -1097,33 +1411,22 @@ func (s *PebbleMetaStore) WriteIntent(txnID uint64, intentType IntentType, table
 	// Try to acquire row lock
 	existingTxnID, acquired := s.rowLocks.AcquireLock("", tableName, intentKey, txnID)
 	if !acquired {
-		// Lock held by different transaction - check GC marker first
-		if s.rowLocks.CheckGCMarker("", tableName, intentKey) {
-			// GC marker exists - intent is marked for cleanup, delete marker and acquire
-			s.rowLocks.DeleteGCMarker("", tableName, intentKey)
-			s.rowLocks.ReleaseLock("", tableName, intentKey)
-			existingTxnID, acquired = s.rowLocks.AcquireLock("", tableName, intentKey, txnID)
-			if !acquired {
-				// Race condition - another transaction acquired the lock
-				telemetry.WriteConflictsTotal.With("intent", "gc_race").Inc()
-				return fmt.Errorf("write-write conflict: row %s:%s locked by transaction %d (current txn: %d)",
-					tableName, intentKey, existingTxnID, txnID)
-			}
-		} else {
-			// No GC marker - resolve conflict
-			if err := s.resolveIntentConflictPebble(nil, existingTxnID, txnID, tableName, intentKey); err != nil {
-				telemetry.WriteConflictsTotal.With("intent", "conflict").Inc()
-				return err
-			}
-			// Conflict resolved - release old lock and acquire new one
-			s.rowLocks.ReleaseLock("", tableName, intentKey)
-			existingTxnID, acquired = s.rowLocks.AcquireLock("", tableName, intentKey, txnID)
-			if !acquired {
-				// Race condition
-				telemetry.WriteConflictsTotal.With("intent", "resolve_race").Inc()
-				return fmt.Errorf("write-write conflict: row %s:%s locked by transaction %d (current txn: %d)",
-					tableName, intentKey, existingTxnID, txnID)
-			}
+		// Lock held by a different transaction: the holder's intent may be
+		// overwritten only once that transaction has ended.
+		if err := s.resolveIntentConflictPebble(existingTxnID, txnID, tableName, intentKey); err != nil {
+			telemetry.WriteConflictsTotal.With("intent", "conflict").Inc()
+			return err
+		}
+		// Conflict resolved - release the resolved holder's lock and acquire
+		// it. The release is conditional on that holder still owning the row:
+		// resolveIntentConflictPebble judged THAT transaction, and the verdict
+		// does not transfer to a newer one.
+		s.rowLocks.ReleaseLockIfHeldBy("", tableName, intentKey, existingTxnID)
+		existingTxnID, acquired = s.rowLocks.AcquireLock("", tableName, intentKey, txnID)
+		if !acquired {
+			// Race condition
+			telemetry.WriteConflictsTotal.With("intent", "resolve_race").Inc()
+			return writeConflictError(tableName, intentKey, existingTxnID, txnID)
 		}
 	}
 
@@ -1175,10 +1478,30 @@ func (s *PebbleMetaStore) WriteIntent(txnID uint64, intentType IntentType, table
 	return nil
 }
 
-// resolveIntentConflictPebble handles conflict with existing intent from different transaction.
-// Called after GC marker check - if GC marker exists, caller handles overwrite directly.
-func (s *PebbleMetaStore) resolveIntentConflictPebble(batch *pebble.Batch, existingTxnID, txnID uint64, tableName, intentKey string) error {
-	// Check conflicting transaction status
+// writeConflictError reports txnID's write-write conflict with holderTxnID on
+// one row. The intent key is binary (an encoded primary key), and the message
+// travels as a protobuf string, which must be valid UTF-8, so the key is
+// hex-encoded rather than printed raw.
+func writeConflictError(tableName, intentKey string, holderTxnID, txnID uint64) error {
+	return fmt.Errorf("write-write conflict: row %s:%x locked by transaction %d (current txn: %d)",
+		tableName, intentKey, holderTxnID, txnID)
+}
+
+// resolveIntentConflictPebble decides whether the intent existingTxnID holds on
+// a row may be overwritten by txnID. Only an ended holder yields: one with no
+// transaction record, or one that committed or aborted.
+//
+// A PENDING holder never yields, however old its heartbeat. Participants do
+// not refresh heartbeats, so every prepared transaction whose coordinator is
+// slower than heartbeat_timeout_seconds looks stale, and a prepared
+// transaction has promised its coordinator it can commit. Overwriting its
+// intent here would leave its record pending and its COMMIT still accepted,
+// so two transactions would each commit a write the other's lock was meant to
+// exclude - for an AUTO_INCREMENT claim, two ranges over the same ids. A
+// holder whose coordinator is gone is ended by the stale-transaction GC
+// (TransactionManager.cleanupStaleTransactions -> CleanupStaleTransactions),
+// which aborts it; after that this function sees an aborted or missing record.
+func (s *PebbleMetaStore) resolveIntentConflictPebble(existingTxnID, txnID uint64, tableName, intentKey string) error {
 	// Use custom txnGetter if set (allows MemoryMetaStore to inject its GetTransaction)
 	getTxn := s.GetTransaction
 	if s.txnGetter != nil {
@@ -1186,7 +1509,6 @@ func (s *PebbleMetaStore) resolveIntentConflictPebble(batch *pebble.Batch, exist
 	}
 	conflictTxnRec, _ := getTxn(existingTxnID)
 
-	canOverwrite := false
 	switch {
 	case conflictTxnRec == nil:
 		log.Debug().
@@ -1194,10 +1516,8 @@ func (s *PebbleMetaStore) resolveIntentConflictPebble(batch *pebble.Batch, exist
 			Str("table", tableName).
 			Str("intent_key", intentKey).
 			Msg("Cleaning up orphaned intent (no transaction record)")
-		canOverwrite = true
 
 	case conflictTxnRec.Status == TxnStatusCommitted:
-		canOverwrite = true
 
 	case conflictTxnRec.Status == TxnStatusAborted:
 		log.Debug().
@@ -1205,39 +1525,13 @@ func (s *PebbleMetaStore) resolveIntentConflictPebble(batch *pebble.Batch, exist
 			Str("table", tableName).
 			Str("intent_key", intentKey).
 			Msg("Cleaning up intent from aborted transaction")
-		canOverwrite = true
 
 	default:
-		// Check heartbeat timeout - use heartbeat from txnGetter (in-memory via MemoryMetaStore)
-		heartbeatTimeout := int64(10 * time.Second)
-		if cfg.Config != nil && cfg.Config.Transaction.HeartbeatTimeoutSeconds > 0 {
-			heartbeatTimeout = int64(time.Duration(cfg.Config.Transaction.HeartbeatTimeoutSeconds) * time.Second)
-		}
-
-		heartbeat := conflictTxnRec.LastHeartbeat
-		timeSinceHeartbeat := time.Now().UnixNano() - heartbeat
-		if timeSinceHeartbeat > heartbeatTimeout {
-			log.Debug().
-				Uint64("stale_txn_id", existingTxnID).
-				Str("table", tableName).
-				Str("intent_key", intentKey).
-				Int64("heartbeat_age_ms", timeSinceHeartbeat/1e6).
-				Msg("Cleaning up stale intent (heartbeat timeout)")
-			canOverwrite = true
-		}
-	}
-
-	if !canOverwrite {
-		return fmt.Errorf("write-write conflict: row %s:%s locked by transaction %d (current txn: %d)",
-			tableName, intentKey, existingTxnID, txnID)
+		return writeConflictError(tableName, intentKey, existingTxnID, txnID)
 	}
 
 	// Delete /intent_txn/ index for the overwritten transaction
-	if err := s.db.Delete(pebbleIntentByTxnKey(existingTxnID, tableName, intentKey), pebble.NoSync); err != nil {
-		return err
-	}
-
-	return nil
+	return s.db.Delete(pebbleIntentByTxnKey(existingTxnID, tableName, intentKey), pebble.NoSync)
 }
 
 // ValidateIntent checks if the intent is still held by the expected transaction
@@ -1335,20 +1629,13 @@ func (s *PebbleMetaStore) deleteIntentTxnIndexByPrefix(txnID uint64) error {
 	return nil
 }
 
-// MarkIntentsForCleanup marks all intents for a transaction as ready for overwrite.
-// Uses in-memory RowLockStore.byTxn index instead of Pebble iteration.
-func (s *PebbleMetaStore) MarkIntentsForCleanup(txnID uint64) error {
-	s.rowLocks.MarkGCByTxn(txnID)
-	return nil
-}
-
 // CleanupAfterCommit performs cleanup operations for a committed transaction.
-// Phase 1: Marks intents with GC markers (other txns can overwrite)
+// Phase 1: Releases the transaction's row locks
 // Phase 2: Deletes intent index entries only (NOT CDC raw entries)
 // Note: CDC raw entries are retained for streaming replication and deleted by GC.
 func (s *PebbleMetaStore) CleanupAfterCommit(txnID uint64) error {
-	// Single pass: mark GC, release locks, get keys (no Pebble iteration)
-	lockKeys := s.rowLocks.MarkGCAndRelease(txnID)
+	// Single pass: release locks, get keys (no Pebble iteration)
+	lockKeys := s.rowLocks.ReleaseByTxn(txnID)
 	_, hadDML := s.dmlIntents.LoadAndDelete(txnID)
 	_, hasPersisted := s.persistedIntentTxns.LoadAndDelete(txnID)
 	if hadDML && !hasPersisted {
@@ -1461,115 +1748,221 @@ func (s *PebbleMetaStore) GetIntent(tableName, intentKey string) (*WriteIntentRe
 	return intent, nil
 }
 
-// GetReplicationState retrieves replication state for a peer
-func (s *PebbleMetaStore) GetReplicationState(peerNodeID uint64, dbName string) (*ReplicationStateRecord, error) {
-	val, closer, err := s.db.Get(pebbleReplKey(peerNodeID, dbName))
-	if err == pebble.ErrNotFound {
-		return nil, nil
+// ListCommittedLog returns this store's local log entries strictly after
+// `after`, in position order, restricted to COMMITTED transactions with
+// Seq <= the stable point read at the start of the call (StableSeq, taken
+// before the iterator opens; see logSeqTracker's doc comment for why that
+// snapshot is safe), up to limit.
+func (s *PebbleMetaStore) ListCommittedLog(after LogPosition, limit int) ([]CommittedLogEntry, uint64, bool, error) {
+	stable := s.StableSeq()
+	if limit <= 0 {
+		return nil, stable, false, nil
 	}
-	if err != nil {
-		return nil, err
-	}
-	defer closer.Close()
 
-	state := &ReplicationStateRecord{}
-	if err := encoding.Unmarshal(val, state); err != nil {
-		return nil, err
+	var entries []CommittedLogEntry
+	more := false
+	err := s.iterateCommittedLog(after, stable, func(pos LogPosition, stamp func() []byte) (bool, error) {
+		if len(entries) >= limit {
+			more = true
+			return false, nil
+		}
+		commitTS, err := decodeLogEntryStamp(stamp())
+		if err != nil {
+			return false, err
+		}
+		entries = append(entries, CommittedLogEntry{LogPosition: pos, CommitTS: commitTS})
+		return true, nil
+	})
+	if err != nil {
+		return nil, stable, false, err
 	}
-	return state, nil
+	return entries, stable, more, nil
 }
 
-// UpdateReplicationState updates replication state for a peer
-func (s *PebbleMetaStore) UpdateReplicationState(peerNodeID uint64, dbName string, lastTxnID uint64, lastTS hlc.Timestamp) error {
-	state := &ReplicationStateRecord{
-		PeerNodeID:           peerNodeID,
-		DatabaseName:         dbName,
-		LastAppliedTxnID:     lastTxnID,
-		LastAppliedTSWall:    lastTS.WallTime,
-		LastAppliedTSLogical: lastTS.Logical,
-		LastSyncTime:         time.Now().UnixNano(),
-		SyncStatus:           SyncStatusSynced,
-	}
+// CountCommittedLog returns how many of this store's local log entries lie
+// strictly after `after` with Seq <= stable and are COMMITTED: the entries a
+// ListCommittedLog walk from `after` would list against that stable point.
+// It reads each such entry's index key, never its value, plus the
+// transaction's status (a stray index entry is not COMMITTED), so its cost
+// grows with the count. It stops with ctx's error once ctx is done, checked
+// every countCtxCheckInterval entries.
+func (s *PebbleMetaStore) CountCommittedLog(ctx context.Context, after LogPosition, stable uint64) (uint64, error) {
+	var n uint64
+	err := s.iterateCommittedLog(after, stable, func(LogPosition, func() []byte) (bool, error) {
+		if n%countCtxCheckInterval == 0 {
+			if err := ctx.Err(); err != nil {
+				return false, err
+			}
+		}
+		n++
+		return true, nil
+	})
+	return n, err
+}
 
-	data, err := encoding.Marshal(state)
+// countCtxCheckInterval is how many entries CountCommittedLog counts
+// between checks of its context.
+const countCtxCheckInterval = 1024
+
+// iterateCommittedLog calls fn, in position order, for every local log
+// entry strictly after `after` with Seq <= stable whose transaction is
+// COMMITTED, passing a reader of the entry's stored commit stamp (the index
+// value, read only if fn calls it), until fn returns false or an error.
+func (s *PebbleMetaStore) iterateCommittedLog(after LogPosition, stable uint64, fn func(pos LogPosition, stamp func() []byte) (bool, error)) error {
+	lower := buildKeyUint64x2(pebblePrefixTxnSeq, after.Seq, after.TxnID)
+	prefix := []byte(pebblePrefixTxnSeq)
+	iter, err := s.db.NewIter(&pebble.IterOptions{LowerBound: prefix, UpperBound: prefixUpperBound(prefix)})
 	if err != nil {
 		return err
 	}
-
-	return s.db.Set(pebbleReplKey(peerNodeID, dbName), data, pebble.NoSync)
-}
-
-// GetMinAppliedTxnID returns the minimum applied txn_id across all peers for a database
-func (s *PebbleMetaStore) GetMinAppliedTxnID(dbName string) (uint64, error) {
-	var minTxnID uint64 = ^uint64(0) // Max uint64
-	found := false
-	prefix := []byte(pebblePrefixRepl)
-
-	iter, err := s.db.NewIter(&pebble.IterOptions{
-		LowerBound: prefix,
-		UpperBound: prefixUpperBound(prefix),
-	})
-	if err != nil {
-		return 0, err
-	}
 	defer iter.Close()
 
-	for iter.SeekGE(prefix); iter.Valid(); iter.Next() {
-		val, err := iter.ValueAndErr()
+	stamp := iter.Value
+	for iter.SeekGE(lower); iter.Valid(); iter.Next() {
+		key := iter.Key()
+		if len(key) < len(pebblePrefixTxnSeq)+16 {
+			continue
+		}
+		pos := LogPosition{
+			Seq:   binary.BigEndian.Uint64(key[len(pebblePrefixTxnSeq):]),
+			TxnID: binary.BigEndian.Uint64(key[len(pebblePrefixTxnSeq)+8:]),
+		}
+		if !after.Less(pos) {
+			continue
+		}
+		if pos.Seq > stable {
+			break
+		}
+
+		status, statusErr := s.readTxnStatus(pos.TxnID)
+		if statusErr != nil && statusErr != pebble.ErrNotFound {
+			return statusErr
+		}
+		if statusErr == pebble.ErrNotFound || status != TxnStatusCommitted {
+			continue
+		}
+
+		cont, err := fn(pos, stamp)
 		if err != nil {
-			continue
+			return err
 		}
-
-		var state ReplicationStateRecord
-		if err := encoding.Unmarshal(val, &state); err != nil {
-			continue
-		}
-
-		if state.DatabaseName == dbName {
-			found = true
-			if state.LastAppliedTxnID < minTxnID {
-				minTxnID = state.LastAppliedTxnID
-			}
+		if !cont {
+			break
 		}
 	}
-
-	if err := iter.Error(); err != nil {
-		return 0, err
-	}
-	if !found {
-		return 0, nil
-	}
-	return minTxnID, nil
+	return iter.Error()
 }
 
-// GetAllReplicationStates returns all replication state records
-func (s *PebbleMetaStore) GetAllReplicationStates() ([]*ReplicationStateRecord, error) {
-	var states []*ReplicationStateRecord
-	prefix := []byte(pebblePrefixRepl)
+// GetPullCursor returns C[self,peer,d]: this store's pull position in
+// peerNodeID's log for this database. The zero position means nothing has
+// been pulled from that peer yet.
+func (s *PebbleMetaStore) GetPullCursor(peerNodeID uint64) (LogPosition, error) {
+	val, closer, err := s.db.Get(pebblePullCursorKey(peerNodeID))
+	if err == pebble.ErrNotFound {
+		return LogPosition{}, nil
+	}
+	if err != nil {
+		return LogPosition{}, err
+	}
+	defer closer.Close()
+	return decodeLogPosition(val), nil
+}
 
-	iter, err := s.db.NewIter(&pebble.IterOptions{
-		LowerBound: prefix,
-		UpperBound: prefixUpperBound(prefix),
-	})
+// SetPullCursor persists C[self,peer,d].
+func (s *PebbleMetaStore) SetPullCursor(peerNodeID uint64, pos LogPosition) error {
+	return s.db.Set(pebblePullCursorKey(peerNodeID), encodeLogPosition(pos), pebble.NoSync)
+}
+
+// SetConsumedPosition stores R[self,requesterNodeID,d]: the `after`
+// position requesterNodeID last sent when listing this store's log. It is
+// stored as is, not as a max: after a restore, a requester's cursor
+// can regress, and it must be able to pull entries again that a stale,
+// higher recorded position would otherwise make this store's GC treat as
+// already consumed.
+func (s *PebbleMetaStore) SetConsumedPosition(requesterNodeID uint64, pos LogPosition) error {
+	return s.db.Set(pebbleConsumedPosKey(requesterNodeID), encodeLogPosition(pos), pebble.NoSync)
+}
+
+// ConsumedPositions returns every requester's last-reported consumed
+// position in this store's log.
+func (s *PebbleMetaStore) ConsumedPositions() (map[uint64]LogPosition, error) {
+	result := make(map[uint64]LogPosition)
+	prefix := []byte(pebblePrefixConsumedPos)
+	iter, err := s.db.NewIter(&pebble.IterOptions{LowerBound: prefix, UpperBound: prefixUpperBound(prefix)})
 	if err != nil {
 		return nil, err
 	}
 	defer iter.Close()
-
 	for iter.SeekGE(prefix); iter.Valid(); iter.Next() {
+		key := iter.Key()
+		if len(key) < len(pebblePrefixConsumedPos)+8 {
+			continue
+		}
+		nodeID := binary.BigEndian.Uint64(key[len(pebblePrefixConsumedPos):])
 		val, err := iter.ValueAndErr()
 		if err != nil {
-			continue
+			return nil, err
 		}
-
-		state := &ReplicationStateRecord{}
-		if err := encoding.Unmarshal(val, state); err != nil {
-			continue
-		}
-		states = append(states, state)
+		result[nodeID] = decodeLogPosition(val)
 	}
+	return result, iter.Error()
+}
 
-	return states, iter.Error()
+// DeleteConsumedPosition removes a departed member's consumed position so
+// it no longer pins GC.
+func (s *PebbleMetaStore) DeleteConsumedPosition(nodeID uint64) error {
+	return s.db.Delete(pebbleConsumedPosKey(nodeID), pebble.NoSync)
+}
+
+// TruncatedThrough returns T[self,d]: the highest LogPosition this store's
+// GC has deleted through. The zero position means GC has never run.
+func (s *PebbleMetaStore) TruncatedThrough() (LogPosition, error) {
+	val, closer, err := s.db.Get([]byte(pebbleKeyTruncatedThrough))
+	if err == pebble.ErrNotFound {
+		return LogPosition{}, nil
+	}
+	if err != nil {
+		return LogPosition{}, err
+	}
+	defer closer.Close()
+	return decodeLogPosition(val), nil
+}
+
+// SetReapplyPending durably sets or clears the re-apply-pending mark. It is
+// written with the store's durable write option: the mark must survive the
+// crash it exists for.
+func (s *PebbleMetaStore) SetReapplyPending(pending bool) error {
+	if pending {
+		return s.db.Set([]byte(pebbleKeyReapplyPending), []byte{1}, s.syncWrite)
+	}
+	return s.db.Delete([]byte(pebbleKeyReapplyPending), s.syncWrite)
+}
+
+// ReapplyPending reports whether the re-apply-pending mark is set.
+func (s *PebbleMetaStore) ReapplyPending() (bool, error) {
+	_, closer, err := s.db.Get([]byte(pebbleKeyReapplyPending))
+	if err == pebble.ErrNotFound {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	closer.Close()
+	return true, nil
+}
+
+// advanceTruncatedThroughInBatch adds a Set for TruncatedThrough to batch
+// iff candidate sorts after the currently persisted value, so that T never
+// decreases.
+func (s *PebbleMetaStore) advanceTruncatedThroughInBatch(batch *pebble.Batch, candidate LogPosition) error {
+	current, err := s.TruncatedThrough()
+	if err != nil {
+		return err
+	}
+	if !current.Less(candidate) {
+		return nil
+	}
+	return batch.Set([]byte(pebbleKeyTruncatedThrough), encodeLogPosition(candidate), nil)
 }
 
 // pebbleSchemaVersionRecord is internal storage for schema
@@ -1580,7 +1973,12 @@ type pebbleSchemaVersionRecord struct {
 	UpdatedAt int64
 }
 
-// GetSchemaVersion retrieves the schema version for a database
+// GetSchemaVersion retrieves the database's schema version as last written by
+// the retired pebble-backed counter. Kept only as the one-time migration
+// read into __marmot_schema_version:
+// NewReplicatedDatabase's __marmot_schema_version table is now the source of
+// truth, and nothing writes this key any more (UpdateSchemaVersion is
+// removed). See MetaStore.GetSchemaVersion's doc comment.
 func (s *PebbleMetaStore) GetSchemaVersion(dbName string) (int64, error) {
 	val, closer, err := s.db.Get(pebbleSchemaKey(dbName))
 	if err == pebble.ErrNotFound {
@@ -1596,56 +1994,6 @@ func (s *PebbleMetaStore) GetSchemaVersion(dbName string) (int64, error) {
 		return 0, err
 	}
 	return rec.Version, nil
-}
-
-// UpdateSchemaVersion updates the schema version for a database
-func (s *PebbleMetaStore) UpdateSchemaVersion(dbName string, version int64, ddlSQL string, txnID uint64) error {
-	rec := &pebbleSchemaVersionRecord{
-		Version:   version,
-		LastDDL:   ddlSQL,
-		TxnID:     txnID,
-		UpdatedAt: time.Now().UnixNano(),
-	}
-
-	data, err := encoding.Marshal(rec)
-	if err != nil {
-		return err
-	}
-
-	return s.db.Set(pebbleSchemaKey(dbName), data, pebble.NoSync)
-}
-
-// GetAllSchemaVersions returns all schema versions indexed by database name
-func (s *PebbleMetaStore) GetAllSchemaVersions() (map[string]int64, error) {
-	versions := make(map[string]int64)
-	prefix := []byte(pebblePrefixSchema)
-
-	iter, err := s.db.NewIter(&pebble.IterOptions{
-		LowerBound: prefix,
-		UpperBound: prefixUpperBound(prefix),
-	})
-	if err != nil {
-		return nil, err
-	}
-	defer iter.Close()
-
-	for iter.SeekGE(prefix); iter.Valid(); iter.Next() {
-		key := iter.Key()
-		dbName := string(key[len(prefix):])
-
-		val, err := iter.ValueAndErr()
-		if err != nil {
-			continue
-		}
-
-		var rec pebbleSchemaVersionRecord
-		if err := encoding.Unmarshal(val, &rec); err != nil {
-			continue
-		}
-		versions[dbName] = rec.Version
-	}
-
-	return versions, iter.Error()
 }
 
 // pebbleDdlLockRecord is internal storage for DDL locks
@@ -1963,263 +2311,285 @@ func (s *PebbleMetaStore) cleanupCDCSegmentFiles() (int, error) {
 	return s.cdcLog.pruneUnreferencedSegments(retained)
 }
 
-// CleanupStaleTransactions aborts transactions that haven't had a heartbeat within the timeout
-func (s *PebbleMetaStore) CleanupStaleTransactions(timeout time.Duration) (int, error) {
-	// Check if store is closed - return early to avoid pebble: closed panic
+// StaleTransactionIDs implements MetaStore. Without a memory tier there
+// are no heartbeats, so a PENDING transaction is stale once its record's
+// CreatedAt is older than timeout.
+func (s *PebbleMetaStore) StaleTransactionIDs(timeout time.Duration) ([]uint64, error) {
 	if s.closed.Load() {
-		return 0, nil
+		return nil, nil
 	}
-
-	cleaned := 0
-
-	// Phase 1: Find stale PENDING transactions
-	var staleTxnIDs []uint64
 	prefix := []byte(pebblePrefixTxnPending)
-
-	iter, err := s.db.NewIter(&pebble.IterOptions{
-		LowerBound: prefix,
-		UpperBound: prefixUpperBound(prefix),
-	})
+	iter, err := s.db.NewIter(&pebble.IterOptions{LowerBound: prefix, UpperBound: prefixUpperBound(prefix)})
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-
+	var candidates []uint64
 	for iter.SeekGE(prefix); iter.Valid(); iter.Next() {
 		key := iter.Key()
 		if len(key) < len(pebblePrefixTxnPending)+8 {
 			continue
 		}
-		txnID := binary.BigEndian.Uint64(key[len(pebblePrefixTxnPending):])
-
-		// Heartbeats are in-memory only - for PebbleMetaStore direct use,
-		// use CreatedAt to determine staleness (MemoryMetaStore uses in-memory heartbeats)
-		rec, err := s.GetTransaction(txnID)
-		if err != nil || rec == nil {
-			continue
-		}
-
-		nowNs := time.Now().UnixNano()
-		ageNs := nowNs - rec.CreatedAt
-		if ageNs > timeout.Nanoseconds() {
-			staleTxnIDs = append(staleTxnIDs, txnID)
-			log.Warn().
-				Uint64("txn_id", txnID).
-				Int64("age_ms", ageNs/1e6).
-				Int64("timeout_ms", timeout.Milliseconds()).
-				Msg("GC: Found stale PENDING transaction (no active heartbeat)")
-		}
+		candidates = append(candidates, binary.BigEndian.Uint64(key[len(pebblePrefixTxnPending):]))
 	}
 	if err := iter.Close(); err != nil {
-		return 0, err
+		return nil, err
 	}
 
-	// Delete stale transactions and their intents (best-effort cleanup)
-	for _, txnID := range staleTxnIDs {
-		log.Warn().
-			Uint64("txn_id", txnID).
-			Msg("GC: Aborting and deleting stale transaction")
-		_ = s.AbortTransaction(txnID)
-		_ = s.DeleteIntentsByTxn(txnID)
-		_ = s.DeleteIntentEntries(txnID)
-		cleaned++
+	cutoff := time.Now().Add(-timeout).UnixNano()
+	stale := candidates[:0]
+	for _, txnID := range candidates {
+		ok, err := s.isStale(txnID, cutoff)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			stale = append(stale, txnID)
+		}
 	}
-
-	// Phase 2: No orphaned intent cleanup needed - RowLockStore is ephemeral
-	// ReleaseByTxn in Phase 1 already cleaned up in-memory locks
-
-	if cleaned > 0 {
-		log.Info().
-			Int("stale_txns", len(staleTxnIDs)).
-			Msg("MetaStore GC: Cleaned up stale transactions")
-	}
-
-	return cleaned, nil
+	return stale, nil
 }
 
-// CleanupOldTransactionRecords removes old COMMITTED/ABORTED transaction records
-func (s *PebbleMetaStore) CleanupOldTransactionRecords(minRetention, maxRetention time.Duration, minAppliedTxnID, minAppliedSeqNum uint64) (int, error) {
+// AbortStaleTransaction implements MetaStore.
+func (s *PebbleMetaStore) AbortStaleTransaction(txnID uint64, timeout time.Duration) (bool, error) {
+	ok, err := s.isStale(txnID, time.Now().Add(-timeout).UnixNano())
+	if err != nil || !ok {
+		return false, err
+	}
+	log.Warn().Uint64("txn_id", txnID).Msg("GC: Aborting stale PENDING transaction (no active heartbeat)")
+	if err := s.AbortTransaction(txnID); err != nil {
+		return false, fmt.Errorf("abort stale txn %d: %w", txnID, err)
+	}
+	if err := s.DeleteIntentsByTxn(txnID); err != nil {
+		return false, fmt.Errorf("delete intents of stale txn %d: %w", txnID, err)
+	}
+	if err := s.DeleteIntentEntries(txnID); err != nil {
+		return false, fmt.Errorf("delete captured rows of stale txn %d: %w", txnID, err)
+	}
+	return true, nil
+}
+
+// isStale reports whether txnID is PENDING with a record created before
+// cutoff.
+func (s *PebbleMetaStore) isStale(txnID uint64, cutoff int64) (bool, error) {
+	rec, err := s.GetTransaction(txnID)
+	if err != nil || rec == nil {
+		return false, err
+	}
+	return rec.Status == TxnStatusPending && rec.CreatedAt < cutoff, nil
+}
+
+// gcEntryVerdict is what one CleanupOldTransactionRecords pass does with one
+// seq-index entry.
+type gcEntryVerdict uint8
+
+const (
+	gcDelete gcEntryVerdict = iota // delete it and keep walking
+	gcSkip                         // keep it and keep walking
+	gcStop                         // keep it and end the pass
+)
+
+// gcVerdict decides one seq-index entry's fate. A COMMITTED entry is
+// deleted once past max retention, or past min retention at or below safe;
+// otherwise it ends the pass, which keeps the deleted set a prefix of the
+// committed log. An entry whose status is not COMMITTED (a record a late
+// PREPARE overwrote before BeginTransactionWithID refused that) is not a log
+// entry ListCommittedLog ever serves, so it can neither end the pass forever
+// nor pin TruncatedThrough: it is skipped until its own begin is past max
+// retention, and then deleted.
+func (s *PebbleMetaStore) gcVerdict(pos LogPosition, minCutoff, maxCutoff int64, safe LogPosition) (gcEntryVerdict, error) {
+	status, err := s.readTxnStatus(pos.TxnID)
+	if err != nil && err != pebble.ErrNotFound {
+		return gcStop, err
+	}
+	if err == nil && status == TxnStatusCommitted {
+		commit, err := s.readCommitRecord(pos.TxnID)
+		if err != nil {
+			return gcStop, err
+		}
+		if commit != nil {
+			if commit.CommittedAt < maxCutoff || (pos.Compare(safe) <= 0 && commit.CommittedAt < minCutoff) {
+				return gcDelete, nil
+			}
+			return gcStop, nil
+		}
+	}
+	immutable, err := s.readImmutableTxnRecord(pos.TxnID)
+	if err != nil {
+		return gcStop, err
+	}
+	if immutable != nil && immutable.CreatedAt >= maxCutoff {
+		return gcSkip, nil
+	}
+	return gcDelete, nil
+}
+
+// gcMaxEntriesPerPass bounds how many log entries one
+// CleanupOldTransactionRecords pass deletes, so one batch stays bounded; the
+// next pass continues from the new truncation point.
+const gcMaxEntriesPerPass = 10000
+
+// CleanupOldTransactionRecords deletes a prefix of the committed log.
+//
+// It reads each entry's actual status key and commit record: decoding a
+// /txn/ value (TxnImmutableRecord, which has no Status field) into
+// TransactionRecord would read every status as the zero value
+// TxnStatusPending, and nothing would ever be deleted.
+//
+// It walks the seq index in position order (the log's own order) and stops
+// at the first committed entry that is not deletable, so that "every
+// committed entry below TruncatedThrough is deleted" holds without creating
+// holes: a later pass cannot delete an entry whose position is higher than
+// one it left behind this time, because doing so would let TruncatedThrough
+// advance past a gap. In practice this costs nothing, because max-retention
+// entries are the oldest and so are already a prefix; a younger committed
+// entry (newer than max retention and above safe) simply ends this pass's
+// walk, and is revisited on the next one. A seq-index entry whose status is
+// not COMMITTED is not a log entry at all and never ends the walk (gcVerdict).
+//
+// ABORTED transactions have no seq-index entry (AbortTransaction never adds
+// one, and refuses to touch one that exists for a COMMITTED txn), so they
+// are never visited by this walk. Their /txn_status/ key is left in place:
+// a known limitation, nothing garbage-collects it.
+func (s *PebbleMetaStore) CleanupOldTransactionRecords(minRetention, maxRetention time.Duration, safe LogPosition) (int, error) {
 	// Check if store is closed - return early to avoid pebble: closed panic
 	if s.closed.Load() {
 		return 0, nil
 	}
 
 	now := time.Now()
-	minRetentionCutoff := now.Add(-minRetention).UnixNano()
-	maxRetentionCutoff := now.Add(-maxRetention).UnixNano()
-	deleted := 0
-	committedDeleted := 0
+	minCutoff := now.Add(-minRetention).UnixNano()
+	// maxRetention <= 0 is "no maximum": no timestamp is below MinInt64, so
+	// nothing is deleted past safe and a non-committed entry is never forced.
+	maxCutoff := int64(math.MinInt64)
+	if maxRetention > 0 {
+		maxCutoff = now.Add(-maxRetention).UnixNano()
+	}
 
-	prefix := []byte(pebblePrefixTxn)
-	var keysToDelete [][]byte
-	var seqKeysToDelete [][]byte
-	var txnIDsToClean []uint64
+	type deletable struct {
+		pos LogPosition
+	}
+	var toDelete []deletable
+	var highest LogPosition
 
-	iter, err := s.db.NewIter(&pebble.IterOptions{
-		LowerBound: prefix,
-		UpperBound: prefixUpperBound(prefix),
-	})
+	prefix := []byte(pebblePrefixTxnSeq)
+	iter, err := s.db.NewIter(&pebble.IterOptions{LowerBound: prefix, UpperBound: prefixUpperBound(prefix)})
 	if err != nil {
 		return 0, err
 	}
 
 	for iter.SeekGE(prefix); iter.Valid(); iter.Next() {
-		val, err := iter.ValueAndErr()
+		key := iter.Key()
+		if len(key) < len(pebblePrefixTxnSeq)+16 {
+			continue
+		}
+		pos := LogPosition{
+			Seq:   binary.BigEndian.Uint64(key[len(pebblePrefixTxnSeq):]),
+			TxnID: binary.BigEndian.Uint64(key[len(pebblePrefixTxnSeq)+8:]),
+		}
+
+		verdict, err := s.gcVerdict(pos, minCutoff, maxCutoff, safe)
 		if err != nil {
+			_ = iter.Close()
+			return 0, err
+		}
+		if verdict == gcSkip {
 			continue
 		}
-
-		var rec TransactionRecord
-		if err := encoding.Unmarshal(val, &rec); err != nil {
-			continue
+		if verdict == gcStop || len(toDelete) >= gcMaxEntriesPerPass {
+			break
 		}
 
-		// Only clean COMMITTED or ABORTED
-		if rec.Status != TxnStatusCommitted && rec.Status != TxnStatusAborted {
-			continue
-		}
-
-		// Check deletion criteria
-		shouldDelete := false
-		if rec.CreatedAt < maxRetentionCutoff {
-			shouldDelete = true
-		} else if rec.CreatedAt < minRetentionCutoff {
-			if minAppliedTxnID > 0 && minAppliedSeqNum > 0 {
-				if rec.TxnID < minAppliedTxnID && (rec.SeqNum == 0 || rec.SeqNum < minAppliedSeqNum) {
-					shouldDelete = true
-				}
-			} else if minAppliedTxnID > 0 {
-				if rec.TxnID < minAppliedTxnID {
-					shouldDelete = true
-				}
-			} else if minAppliedSeqNum > 0 {
-				if rec.SeqNum == 0 || rec.SeqNum < minAppliedSeqNum {
-					shouldDelete = true
-				}
-			}
-		}
-
-		if shouldDelete {
-			key := make([]byte, len(iter.Key()))
-			copy(key, iter.Key())
-			keysToDelete = append(keysToDelete, key)
-			if rec.SeqNum > 0 {
-				seqKeysToDelete = append(seqKeysToDelete, pebbleTxnSeqKey(rec.SeqNum, rec.TxnID))
-			}
-			if rec.Status == TxnStatusCommitted {
-				committedDeleted++
-				txnIDsToClean = append(txnIDsToClean, rec.TxnID)
-			}
+		toDelete = append(toDelete, deletable{pos: pos})
+		if highest.Less(pos) {
+			highest = pos
 		}
 	}
 	if err := iter.Close(); err != nil {
 		return 0, err
 	}
 
-	if len(keysToDelete) == 0 {
+	if len(toDelete) == 0 {
 		return 0, nil
 	}
 
 	batch := s.db.NewBatch()
 	defer batch.Close()
 
-	for _, key := range keysToDelete {
-		if err := batch.Delete(key, nil); err == nil {
-			deleted++
+	for _, d := range toDelete {
+		if err := batch.Delete(pebbleTxnKey(d.pos.TxnID), nil); err != nil {
+			return 0, err
+		}
+		if err := batch.Delete(pebbleTxnCommitKey(d.pos.TxnID), nil); err != nil {
+			return 0, err
+		}
+		if err := batch.Delete(pebbleTxnStatusKey(d.pos.TxnID), nil); err != nil {
+			return 0, err
+		}
+		if err := batch.Delete(pebbleTxnByIDKey(d.pos.TxnID), nil); err != nil {
+			return 0, err
+		}
+		if err := batch.Delete(pebbleTxnSeqKey(d.pos.Seq, d.pos.TxnID), nil); err != nil {
+			return 0, err
+		}
+		// Only a stray entry (see gcVerdict) can still have one.
+		if err := batch.Delete(pebbleTxnPendingKey(d.pos.TxnID), nil); err != nil {
+			return 0, err
 		}
 	}
-	for _, key := range seqKeysToDelete {
-		_ = batch.Delete(key, nil)
+	// Every entry here, a stray one included, was counted when it committed.
+	if err := s.counters.DecInBatch(batch, "committed_txn_count", int64(len(toDelete))); err != nil {
+		return 0, err
+	}
+	if err := s.advanceTruncatedThroughInBatch(batch, highest); err != nil {
+		return 0, err
 	}
 
 	if err := batch.Commit(pebble.NoSync); err != nil {
 		return 0, err
 	}
 
-	// Clean up CDC raw captured rows for deleted committed transactions
-	for _, txnID := range txnIDsToClean {
-		if err := s.DeleteCapturedRows(txnID); err != nil {
-			log.Debug().Err(err).Uint64("txn_id", txnID).Msg("MetaStore GC: Failed to delete CDC raw rows")
+	// Clean up CDC raw captured rows for deleted transactions (best-effort;
+	// the metadata keys above are the source of truth for "deleted").
+	for _, d := range toDelete {
+		if err := s.DeleteCapturedRows(d.pos.TxnID); err != nil {
+			log.Debug().Err(err).Uint64("txn_id", d.pos.TxnID).Msg("MetaStore GC: Failed to delete CDC raw rows")
 		}
 	}
 	if _, err := s.cleanupCDCSegmentFiles(); err != nil {
 		log.Debug().Err(err).Msg("MetaStore GC: Failed to delete unreferenced CDC segment files")
 	}
 
-	// Decrement committed transaction counter
-	if committedDeleted > 0 {
-		if _, err := s.counters.Dec("committed_txn_count", int64(committedDeleted)); err != nil {
-			log.Warn().Err(err).Int("count", committedDeleted).Msg("MetaStore GC: Failed to decrement counter")
-		}
-	}
-
-	if deleted > 0 {
-		log.Info().Int("deleted_records", deleted).Int("committed_deleted", committedDeleted).Msg("MetaStore GC: Cleaned up old transaction records")
-	}
-
-	return deleted, nil
+	log.Info().Int("deleted_records", len(toDelete)).Msg("MetaStore GC: Cleaned up old transaction records")
+	return len(toDelete), nil
 }
 
-// GetNextSeqNum returns the next sequence number for a node
-func (s *PebbleMetaStore) GetNextSeqNum(nodeID uint64) (uint64, error) {
-	seq, err := s.getOrCreateSequence(nodeID)
-	if err != nil {
-		return 0, err
-	}
-	num, err := seq.Next()
-	if err != nil {
-		return 0, err
-	}
-	// We want 1-based sequence numbers
-	return num + 1, nil
+// nextLogSeq allocates the next value of the store-wide local commit
+// sequence (LogPosition.Seq), shared by every origin's committed
+// transactions in this store. Callers must call s.logSeq.markDone(seq) via
+// defer on every exit path once allocated (see logSeqTracker).
+func (s *PebbleMetaStore) nextLogSeq() (uint64, error) {
+	return s.logSeq.allocate()
 }
 
-// getOrCreateSequence returns or creates an AtomicSequence for the given nodeID
-func (s *PebbleMetaStore) getOrCreateSequence(nodeID uint64) (*AtomicSequence, error) {
-	s.seqMu.Lock()
-	defer s.seqMu.Unlock()
-
-	if seq, ok := s.sequences[nodeID]; ok {
-		return seq, nil
-	}
-
-	seq, err := NewAtomicSequence(s.db, pebbleSeqKey(nodeID), pebbleSeqBandwidth)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create sequence for node %d: %w", nodeID, err)
-	}
-
-	s.sequences[nodeID] = seq
-	return seq, nil
+// StableSeq returns the highest seq s such that every seq <= s this
+// process has allocated from the store-wide log sequence has finished
+// (logSeqTracker's doc comment has the full proof).
+func (s *PebbleMetaStore) StableSeq() uint64 {
+	return s.logSeq.StableSeq()
 }
 
 // GetMaxSeqNum returns the maximum sequence number across all committed transactions
 func (s *PebbleMetaStore) GetMaxSeqNum() (uint64, error) {
-	var maxSeq uint64
-	prefix := []byte(pebblePrefixTxnSeq)
-
-	iter, err := s.db.NewIter(&pebble.IterOptions{
-		LowerBound: prefix,
-		UpperBound: prefixUpperBound(prefix),
-	})
-	if err != nil {
-		return 0, err
-	}
-	defer iter.Close()
-
-	// Go to last key in range (key format: prefix + 8 bytes seqNum + 8 bytes txnID)
-	if iter.Last() {
-		key := iter.Key()
-		if len(key) >= len(pebblePrefixTxnSeq)+8 {
-			maxSeq = binary.BigEndian.Uint64(key[len(pebblePrefixTxnSeq):])
-		}
-	}
-
-	return maxSeq, iter.Error()
+	return maxSeqNumFromIndex(s.db)
 }
 
-// GetMinAppliedSeqNum returns the minimum applied sequence number across all peers for a database
-func (s *PebbleMetaStore) GetMinAppliedSeqNum(dbName string) (uint64, error) {
-	// Proxy through GetMinAppliedTxnID since we track by txn_id
-	return s.GetMinAppliedTxnID(dbName)
+// maxCommitWallCounter records the largest commit wall time this store has
+// logged, local or replayed (MaxCommitWall).
+const maxCommitWallCounter = "max_commit_wall"
+
+// MaxCommitWall implements MetaStore.
+func (s *PebbleMetaStore) MaxCommitWall() (int64, error) {
+	return s.counters.Load(maxCommitWallCounter)
 }
 
 // GetMaxCommittedTxnID returns the maximum committed transaction ID
@@ -2364,7 +2734,7 @@ func (s *PebbleMetaStore) GetCDCTableDDLLock(tableName string) (uint64, error) {
 }
 
 // GetRowLockStats returns statistics from the in-memory row lock store
-func (s *PebbleMetaStore) GetRowLockStats() (activeLocks, activeTransactions, gcMarkers, tablesWithLocks int) {
+func (s *PebbleMetaStore) GetRowLockStats() (activeLocks, activeTransactions, tablesWithLocks int) {
 	return s.rowLocks.Stats()
 }
 

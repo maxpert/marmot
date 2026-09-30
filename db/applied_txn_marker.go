@@ -64,14 +64,14 @@ func repairAppliedTxnMetadata(db *sql.DB, metaStore MetaStore, dbName string) er
 		nodeID := uint64(nodeIDRaw)
 		rec, err := metaStore.GetTransaction(txnID)
 		if err != nil {
-			return err
+			return fmt.Errorf("read txn %d: %w", txnID, err)
 		}
 		if rec != nil && rec.Status == TxnStatusCommitted {
 			continue
 		}
 		entries, err := metaStore.GetIntentEntries(txnID)
 		if err != nil {
-			return err
+			return fmt.Errorf("read captured rows of txn %d: %w", txnID, err)
 		}
 		if len(entries) == 0 {
 			continue
@@ -79,11 +79,17 @@ func repairAppliedTxnMetadata(db *sql.DB, metaStore MetaStore, dbName string) er
 		commitTS := hlc.Timestamp{WallTime: wall, Logical: logical, NodeID: nodeID}
 		if rec != nil {
 			if err := metaStore.CommitTransaction(txnID, commitTS, nil, dbName, "", 0, uint32(len(entries))); err != nil {
-				return err
+				return fmt.Errorf("commit txn %d: %w", txnID, err)
+			}
+			// The open recovered this transaction as prepared, with its row
+			// locks and intents; free them as any commit does, or every later
+			// replay touching those rows is refused.
+			if err := metaStore.CleanupAfterCommit(txnID); err != nil {
+				return fmt.Errorf("clean up repaired commit of txn %d: %w", txnID, err)
 			}
 			continue
 		}
-		if err := metaStore.StoreReplayedTransaction(txnID, nodeID, commitTS, dbName, uint32(len(entries))); err != nil {
+		if err := metaStore.StoreReplayedTransaction(txnID, nodeID, commitTS, dbName, uint32(len(entries)), 0); err != nil {
 			return err
 		}
 	}

@@ -7,13 +7,16 @@ import (
 )
 
 // RowLockStore implements in-memory row locking using lock-free concurrent maps.
-// Supports fine-grained row locks, GC markers, and efficient bulk cleanup operations.
 type RowLockStore struct {
-	// tables: "db:table" → ("rowkey" → txnID)
+	// tables: "db:table" → ("rowkey" → txnID).
+	//
+	// A table's row map is created on first use and never removed, even once
+	// it is empty. AcquireLock loads the row map and inserts into it as two
+	// separate steps; a release that deleted an empty map in between would
+	// detach the map holding the new lock, and the next acquirer would take
+	// the same row in a fresh map. The maps are bounded by the number of
+	// distinct tables this meta store has locked rows in.
 	tables *xsync.MapOf[string, *xsync.MapOf[string, uint64]]
-
-	// gc: "db:table" → ("rowkey" → struct{})
-	gc *xsync.MapOf[string, *xsync.MapOf[string, struct{}]]
 
 	// byTxn: reverse index txnID → set of "db:table:rowkey"
 	byTxn *xsync.MapOf[uint64, *xsync.MapOf[string, struct{}]]
@@ -23,7 +26,6 @@ type RowLockStore struct {
 func NewRowLockStore() *RowLockStore {
 	return &RowLockStore{
 		tables: xsync.NewMapOf[string, *xsync.MapOf[string, uint64]](),
-		gc:     xsync.NewMapOf[string, *xsync.MapOf[string, struct{}]](),
 		byTxn:  xsync.NewMapOf[uint64, *xsync.MapOf[string, struct{}]](),
 	}
 }
@@ -64,11 +66,47 @@ func (s *RowLockStore) ReleaseLock(db, table, rowKey string) {
 			if txnMap, ok := s.byTxn.Load(txnID); ok {
 				txnMap.Delete(fullKey)
 			}
-
-			// Clean up empty maps
-			s.cleanupEmptyRowMap(tableKey, rowMap)
 		}
 	}
+}
+
+// ReleaseLockIfHeldBy releases the row lock only while txnID still holds it,
+// and reports whether it did. Unconditional release is a bug wherever the
+// caller has a specific transaction in mind: between the decision to release
+// and the release itself another transaction can take the lock, and dropping
+// its lock hands the row to a third writer that never resolved the conflict.
+func (s *RowLockStore) ReleaseLockIfHeldBy(db, table, rowKey string, txnID uint64) bool {
+	if !s.releaseRowIfHeldBy(db, table, rowKey, txnID) {
+		return false
+	}
+
+	fullKey := makeFullKey(db, table, rowKey)
+	if txnMap, ok := s.byTxn.Load(txnID); ok {
+		txnMap.Delete(fullKey)
+		s.cleanupEmptyTxnMap(txnID, txnMap)
+	}
+
+	return true
+}
+
+// releaseRowIfHeldBy atomically deletes a row's lock entry if txnID holds it.
+// It does not touch the reverse index.
+func (s *RowLockStore) releaseRowIfHeldBy(db, table, rowKey string, txnID uint64) bool {
+	rowMap, ok := s.tables.Load(makeTableKey(db, table))
+	if !ok {
+		return false
+	}
+	released := false
+	rowMap.Compute(rowKey, func(holder uint64, loaded bool) (uint64, bool) {
+		if loaded && holder == txnID {
+			released = true
+			return 0, true
+		}
+		// Leave a lock held by anyone else exactly as it is; an absent row
+		// (loaded false) is deleted, which is a no-op.
+		return holder, !loaded
+	})
+	return released
 }
 
 // CheckLock checks if a lock exists on the specified row.
@@ -91,154 +129,34 @@ func (s *RowLockStore) GetLockHolder(db, table, rowKey string) uint64 {
 	return txnID
 }
 
-// SetGCMarker marks a row for garbage collection.
-func (s *RowLockStore) SetGCMarker(db, table, rowKey string) {
-	tableKey := makeTableKey(db, table)
-
-	gcMap, _ := s.gc.LoadOrStore(tableKey, xsync.NewMapOf[string, struct{}]())
-	gcMap.Store(rowKey, struct{}{})
-}
-
-// CheckGCMarker checks if a row is marked for garbage collection.
-func (s *RowLockStore) CheckGCMarker(db, table, rowKey string) bool {
-	tableKey := makeTableKey(db, table)
-
-	if gcMap, ok := s.gc.Load(tableKey); ok {
-		_, exists := gcMap.Load(rowKey)
-		return exists
-	}
-
-	return false
-}
-
-// DeleteGCMarker removes the GC marker for the specified row.
-func (s *RowLockStore) DeleteGCMarker(db, table, rowKey string) {
-	tableKey := makeTableKey(db, table)
-
-	if gcMap, ok := s.gc.Load(tableKey); ok {
-		gcMap.Delete(rowKey)
-		s.cleanupEmptyGCMap(tableKey, gcMap)
-	}
-}
-
-// MarkGCAndRelease marks GC for all locks, releases them, and returns the keys.
-// Single iteration over byTxn instead of three separate passes.
-// Uses LoadAndDelete to atomically remove from byTxn before iteration,
-// preventing race with concurrent AcquireLock.
-func (s *RowLockStore) MarkGCAndRelease(txnID uint64) []string {
-	// Atomically load and delete to prevent concurrent AcquireLock from adding
-	// to this map while we iterate. New locks will create a fresh map.
+// ReleaseByTxn releases every row lock txnID still holds and returns the
+// "db:table:rowkey" keys its reverse index named.
+//
+// The reverse index is removed with LoadAndDelete before it is walked, so a
+// concurrent AcquireLock by the same transaction lands in a fresh map rather
+// than in one being iterated. Each release is conditional on txnID still
+// holding the row: the reverse index can name a row whose lock was already
+// released and retaken by another transaction, and releasing that row is not
+// this transaction's business. All keys are returned regardless, because the
+// caller deletes this transaction's own intent records by them.
+func (s *RowLockStore) ReleaseByTxn(txnID uint64) []string {
 	txnMap, ok := s.byTxn.LoadAndDelete(txnID)
 	if !ok {
 		return nil
 	}
 
-	// Collect keys and process in single pass
 	var keys []string
 	txnMap.Range(func(fullKey string, _ struct{}) bool {
 		keys = append(keys, fullKey)
 		return true
 	})
 
-	// Mark GC and release locks
 	for _, fullKey := range keys {
 		db, table, rowKey := parseFullKey(fullKey)
-		tableKey := makeTableKey(db, table)
-
-		// Set GC marker
-		s.SetGCMarker(db, table, rowKey)
-
-		// Release lock
-		if rowMap, ok := s.tables.Load(tableKey); ok {
-			rowMap.Delete(rowKey)
-			s.cleanupEmptyRowMap(tableKey, rowMap)
-		}
+		s.releaseRowIfHeldBy(db, table, rowKey, txnID)
 	}
 
 	return keys
-}
-
-// MarkGCByTxn sets GC markers for all locks without releasing them.
-func (s *RowLockStore) MarkGCByTxn(txnID uint64) {
-	if txnMap, ok := s.byTxn.Load(txnID); ok {
-		txnMap.Range(func(fullKey string, _ struct{}) bool {
-			db, table, rowKey := parseFullKey(fullKey)
-			s.SetGCMarker(db, table, rowKey)
-			return true
-		})
-	}
-}
-
-// ReleaseByTxn releases all locks held by the specified transaction.
-func (s *RowLockStore) ReleaseByTxn(txnID uint64) {
-	s.MarkGCAndRelease(txnID)
-}
-
-// ReleaseByTable releases all locks for the specified table.
-func (s *RowLockStore) ReleaseByTable(db, table string) {
-	tableKey := makeTableKey(db, table)
-
-	if rowMap, ok := s.tables.Load(tableKey); ok {
-		// Collect all row keys and their transaction IDs
-		type lockInfo struct {
-			rowKey string
-			txnID  uint64
-		}
-		var locks []lockInfo
-
-		rowMap.Range(func(rowKey string, txnID uint64) bool {
-			locks = append(locks, lockInfo{rowKey: rowKey, txnID: txnID})
-			return true
-		})
-
-		// Release all locks and update reverse index
-		fullKeyPrefix := tableKey + ":"
-		for _, lock := range locks {
-			rowMap.Delete(lock.rowKey)
-
-			fullKey := fullKeyPrefix + lock.rowKey
-			if txnMap, ok := s.byTxn.Load(lock.txnID); ok {
-				txnMap.Delete(fullKey)
-				s.cleanupEmptyTxnMap(lock.txnID, txnMap)
-			}
-		}
-
-		// Remove the table map
-		s.tables.Delete(tableKey)
-	}
-
-	// Clean up GC markers for this table
-	s.gc.Delete(tableKey)
-}
-
-// ReleaseByDatabase releases all locks for the specified database.
-func (s *RowLockStore) ReleaseByDatabase(db string) {
-	prefix := db + ":"
-
-	// Collect all table keys for this database
-	var tableKeys []string
-	s.tables.Range(func(tableKey string, _ *xsync.MapOf[string, uint64]) bool {
-		if strings.HasPrefix(tableKey, prefix) {
-			tableKeys = append(tableKeys, tableKey)
-			return true
-		}
-		return true
-	})
-
-	// Release locks for each table
-	for _, tableKey := range tableKeys {
-		parts := strings.SplitN(tableKey, ":", 2)
-		if len(parts) == 2 {
-			s.ReleaseByTable(parts[0], parts[1])
-		}
-	}
-}
-
-// Clear removes all locks from the store.
-func (s *RowLockStore) Clear() {
-	s.tables = xsync.NewMapOf[string, *xsync.MapOf[string, uint64]]()
-	s.gc = xsync.NewMapOf[string, *xsync.MapOf[string, struct{}]]()
-	s.byTxn = xsync.NewMapOf[uint64, *xsync.MapOf[string, struct{}]]()
 }
 
 // GetLocksByTxn returns all "db:table:rowkey" strings held by the specified transaction.
@@ -290,32 +208,6 @@ func parseFullKey(fullKey string) (db, table, rowKey string) {
 	return "", "", ""
 }
 
-// cleanupEmptyRowMap removes the row map if it's empty to prevent memory leaks.
-func (s *RowLockStore) cleanupEmptyRowMap(tableKey string, rowMap *xsync.MapOf[string, uint64]) {
-	isEmpty := true
-	rowMap.Range(func(_ string, _ uint64) bool {
-		isEmpty = false
-		return false // Stop after first element
-	})
-
-	if isEmpty {
-		s.tables.Delete(tableKey)
-	}
-}
-
-// cleanupEmptyGCMap removes the GC map if it's empty to prevent memory leaks.
-func (s *RowLockStore) cleanupEmptyGCMap(tableKey string, gcMap *xsync.MapOf[string, struct{}]) {
-	isEmpty := true
-	gcMap.Range(func(_ string, _ struct{}) bool {
-		isEmpty = false
-		return false // Stop after first element
-	})
-
-	if isEmpty {
-		s.gc.Delete(tableKey)
-	}
-}
-
 // cleanupEmptyTxnMap removes the transaction map if it's empty to prevent memory leaks.
 func (s *RowLockStore) cleanupEmptyTxnMap(txnID uint64, txnMap *xsync.MapOf[string, struct{}]) {
 	isEmpty := true
@@ -330,8 +222,8 @@ func (s *RowLockStore) cleanupEmptyTxnMap(txnID uint64, txnMap *xsync.MapOf[stri
 }
 
 // Stats returns current statistics about the lock store.
-// Returns: (activeLocks, activeTransactions, gcMarkers, tablesWithLocks)
-func (s *RowLockStore) Stats() (activeLocks int, activeTransactions int, gcMarkers int, tablesWithLocks int) {
+// Returns: (activeLocks, activeTransactions, tablesWithLocks)
+func (s *RowLockStore) Stats() (activeLocks int, activeTransactions int, tablesWithLocks int) {
 	// Count active transactions (transactions holding locks)
 	s.byTxn.Range(func(_ uint64, txnMap *xsync.MapOf[string, struct{}]) bool {
 		hasLocks := false
@@ -359,14 +251,5 @@ func (s *RowLockStore) Stats() (activeLocks int, activeTransactions int, gcMarke
 		return true
 	})
 
-	// Count GC markers
-	s.gc.Range(func(_ string, gcMap *xsync.MapOf[string, struct{}]) bool {
-		gcMap.Range(func(_ string, _ struct{}) bool {
-			gcMarkers++
-			return true
-		})
-		return true
-	})
-
-	return activeLocks, activeTransactions, gcMarkers, tablesWithLocks
+	return activeLocks, activeTransactions, tablesWithLocks
 }

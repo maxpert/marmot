@@ -66,7 +66,7 @@ func BenchmarkExecutePreparePhase(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, _, _ = wc.executePreparePhase(ctx, txn, req, otherNodes, false)
+		_, _, _, _ = wc.executePreparePhase(ctx, txn, req, otherNodes, false)
 	}
 }
 

@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"os"
 	"testing"
 
@@ -131,7 +132,7 @@ func TestDatabaseManager_CDCHubNilSafe(t *testing.T) {
 	assert.NotNil(t, db)
 }
 
-func TestDatabaseManager_ReopenDatabasePreservesCDCHub(t *testing.T) {
+func TestDatabaseManager_ReattachPreservesCDCHub(t *testing.T) {
 	// Create temp directory for test
 	tmpDir, err := os.MkdirTemp("", "marmot-test-*")
 	require.NoError(t, err)
@@ -151,9 +152,9 @@ func TestDatabaseManager_ReopenDatabasePreservesCDCHub(t *testing.T) {
 	err = dm.CreateDatabase("test_db")
 	require.NoError(t, err)
 
-	// Reopen the database (simulates snapshot reload)
-	err = dm.ReopenDatabase("test_db")
-	require.NoError(t, err)
+	// Detach and reattach the database, as a snapshot restore does
+	require.NoError(t, dm.DetachDatabase(context.Background(), "test_db"))
+	require.NoError(t, dm.AttachDatabase("test_db"))
 
 	// Verify CDC hub is still set
 	assert.Equal(t, hub, dm.GetCDCHub())

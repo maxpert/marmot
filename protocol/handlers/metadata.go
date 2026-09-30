@@ -5,14 +5,23 @@ import (
 	"fmt"
 
 	"github.com/maxpert/marmot/protocol"
+	"github.com/maxpert/marmot/protocol/query/transform/intmarker"
 	"github.com/rs/zerolog/log"
 )
 
-// DatabaseProvider abstracts database access for metadata queries
+// userTablesQuery selects the names of a database's user tables: Marmot's own
+// bookkeeping tables and SQLite's are never shown to a client.
+const userTablesQuery = "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '__marmot__%'"
+
+// DatabaseProvider abstracts database access for metadata queries.
+//
+// Metadata is read through the database's read pool, never its write handle:
+// the write handle has one connection, and a metadata read waiting on it would
+// wait behind every write, or behind itself.
 type DatabaseProvider interface {
 	ListDatabases() []string
 	DatabaseExists(name string) bool
-	GetDatabaseConnection(name string) (*sql.DB, error)
+	GetDatabaseReadConnection(name string) (*sql.DB, error)
 }
 
 // MetadataHandler provides shared SHOW command implementations
@@ -60,43 +69,34 @@ func (m *MetadataHandler) HandleShowTables(dbName string, likeFilter string) (*p
 
 	log.Debug().Str("database", dbName).Str("filter", likeFilter).Msg("Handling SHOW TABLES")
 
-	sqlDB, err := m.db.GetDatabaseConnection(dbName)
+	sqlDB, err := m.db.GetDatabaseReadConnection(dbName)
 	if err != nil {
 		return nil, err
 	}
 
-	// Build query with optional LIKE filter
-	query := "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '__marmot__%'"
+	// MySQL LIKE is case-insensitive by default, as SQLite's LIKE is, and both
+	// use the same % and _ wildcards.
+	query := userTablesQuery
 	var args []interface{}
 	if likeFilter != "" {
-		// SQLite uses GLOB for case-sensitive matching or LIKE for case-insensitive
-		// MySQL LIKE is case-insensitive by default, so we use SQLite LIKE
-		// Convert MySQL LIKE pattern (% and _) to be used directly (SQLite supports same syntax)
 		query += " AND name LIKE ?"
 		args = append(args, likeFilter)
 	}
 	query += " ORDER BY name"
 
-	rows, err := sqlDB.Query(query, args...)
+	tables, err := queryStrings(sqlDB, query, args...)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 
 	result := &protocol.ResultSet{
 		Columns: []protocol.ColumnDef{{Name: fmt.Sprintf("Tables_in_%s", dbName)}},
-		Rows:    make([][]interface{}, 0),
+		Rows:    make([][]interface{}, 0, len(tables)),
 	}
-
-	for rows.Next() {
-		var tableName string
-		if err := rows.Scan(&tableName); err != nil {
-			return nil, err
-		}
+	for _, tableName := range tables {
 		result.Rows = append(result.Rows, []interface{}{tableName})
 	}
-
-	return result, rows.Err()
+	return result, nil
 }
 
 // HandleShowColumns returns column information for a table
@@ -114,16 +114,10 @@ func (m *MetadataHandler) HandleShowColumns(dbName, tableName string) (*protocol
 		Str("table", tableName).
 		Msg("Handling SHOW COLUMNS")
 
-	sqlDB, err := m.db.GetDatabaseConnection(dbName)
+	infos, err := m.columnInfos(dbName, tableName)
 	if err != nil {
 		return nil, err
 	}
-
-	rows, err := sqlDB.Query(fmt.Sprintf("PRAGMA table_info(%s)", tableName))
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
 
 	result := &protocol.ResultSet{
 		Columns: []protocol.ColumnDef{
@@ -134,44 +128,14 @@ func (m *MetadataHandler) HandleShowColumns(dbName, tableName string) (*protocol
 			{Name: "Default", Type: 0xFD},
 			{Name: "Extra", Type: 0xFD},
 		},
-		Rows: make([][]interface{}, 0),
+		Rows: make([][]interface{}, 0, len(infos)),
 	}
-
-	for rows.Next() {
-		var cid int
-		var name, colType string
-		var notNull int
-		var dfltValue sql.NullString
-		var pk int
-
-		if err := rows.Scan(&cid, &name, &colType, &notNull, &dfltValue, &pk); err != nil {
-			return nil, err
-		}
-
-		// Convert SQLite types to MySQL-compatible format
-		mysqlType := sqliteToMySQLType(colType)
-
-		nullStr := "YES"
-		if notNull == 1 {
-			nullStr = "NO"
-		}
-
-		keyStr := ""
-		if pk > 0 {
-			keyStr = "PRI"
-		}
-
-		defaultVal := interface{}(nil)
-		if dfltValue.Valid {
-			defaultVal = dfltValue.String
-		}
-
+	for _, info := range infos {
 		result.Rows = append(result.Rows, []interface{}{
-			name, mysqlType, nullStr, keyStr, defaultVal, "",
+			info.name, sqliteToMySQLType(info.declType), info.nullable(), info.key(), info.defaultValue(), "",
 		})
 	}
-
-	return result, rows.Err()
+	return result, nil
 }
 
 // HandleShowCreateTable returns the CREATE TABLE statement
@@ -189,7 +153,7 @@ func (m *MetadataHandler) HandleShowCreateTable(dbName, tableName string) (*prot
 		Str("table", tableName).
 		Msg("Handling SHOW CREATE TABLE")
 
-	sqlDB, err := m.db.GetDatabaseConnection(dbName)
+	sqlDB, err := m.db.GetDatabaseReadConnection(dbName)
 	if err != nil {
 		return nil, err
 	}
@@ -203,13 +167,24 @@ func (m *MetadataHandler) HandleShowCreateTable(dbName, tableName string) (*prot
 		return nil, err
 	}
 
+	// sqlite_master.sql is returned verbatim, so it would carry the width
+	// marker the transpiler writes beside narrow integer types. The marker is
+	// Marmot's own bookkeeping; a client must never see it, and a tool that
+	// round-trips SHOW CREATE TABLE output must not be handed a comment it
+	// would then feed back in.
+	//
+	// This is the ONLY client-facing reader of the DDL text: every other
+	// sqlite_master query in protocol/handlers selects `name`, and the column
+	// types shown by SHOW COLUMNS and information_schema.COLUMNS come from
+	// PRAGMA table_info, which reports plain INTEGER with the marker
+	// normalised away.
 	return &protocol.ResultSet{
 		Columns: []protocol.ColumnDef{
 			{Name: "Table", Type: 0xFD},
 			{Name: "Create Table", Type: 0xFD},
 		},
 		Rows: [][]interface{}{
-			{tableName, createSQL},
+			{tableName, intmarker.Strip(createSQL)},
 		},
 	}, nil
 }
@@ -229,16 +204,36 @@ func (m *MetadataHandler) HandleShowIndexes(dbName, tableName string) (*protocol
 		Str("table", tableName).
 		Msg("Handling SHOW INDEXES")
 
-	sqlDB, err := m.db.GetDatabaseConnection(dbName)
+	sqlDB, err := m.db.GetDatabaseReadConnection(dbName)
 	if err != nil {
 		return nil, err
 	}
 
-	rows, err := sqlDB.Query(fmt.Sprintf("PRAGMA index_list(%s)", tableName))
+	// The index list is read to the end before any index's columns are read,
+	// so no query runs while another holds a connection.
+	type indexEntry struct {
+		name   string
+		unique int
+	}
+	var indexes []indexEntry
+	err = func() error {
+		rows, err := sqlDB.Query("SELECT name, \"unique\" FROM pragma_index_list(?)", tableName)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var e indexEntry
+			if err := rows.Scan(&e.name, &e.unique); err != nil {
+				return err
+			}
+			indexes = append(indexes, e)
+		}
+		return rows.Err()
+	}()
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 
 	result := &protocol.ResultSet{
 		Columns: []protocol.ColumnDef{
@@ -256,44 +251,28 @@ func (m *MetadataHandler) HandleShowIndexes(dbName, tableName string) (*protocol
 			{Name: "Comment", Type: 0xFD},
 			{Name: "Index_comment", Type: 0xFD},
 		},
-		Rows: make([][]interface{}, 0),
+		Rows: make([][]interface{}, 0, len(indexes)),
 	}
 
-	for rows.Next() {
-		var seq int
-		var name string
-		var unique int
-		var origin, partial string
-
-		if err := rows.Scan(&seq, &name, &unique, &origin, &partial); err != nil {
-			continue
-		}
-
+	for _, idx := range indexes {
 		nonUnique := 1
-		if unique == 1 {
+		if idx.unique == 1 {
 			nonUnique = 0
 		}
 
-		// Get index column info
-		var columnName string
-		indexRows, err := sqlDB.Query(fmt.Sprintf("PRAGMA index_info(%s)", name))
-		if err == nil {
-			if indexRows.Next() {
-				var seqno, cid int
-				var colName sql.NullString
-				if err := indexRows.Scan(&seqno, &cid, &colName); err == nil && colName.Valid {
-					columnName = colName.String
-				}
-			}
-			indexRows.Close()
+		// An expression index has no column name; it shows an empty one.
+		var columnName sql.NullString
+		err := sqlDB.QueryRow("SELECT name FROM pragma_index_info(?) ORDER BY seqno LIMIT 1", idx.name).Scan(&columnName)
+		if err != nil && err != sql.ErrNoRows {
+			return nil, err
 		}
 
 		result.Rows = append(result.Rows, []interface{}{
-			tableName, nonUnique, name, 1, columnName, "A", nil, nil, nil, "YES", "BTREE", "", "",
+			tableName, nonUnique, idx.name, 1, columnName.String, "A", nil, nil, nil, "YES", "BTREE", "", "",
 		})
 	}
 
-	return result, rows.Err()
+	return result, nil
 }
 
 // HandleShowTableStatus returns table status information
@@ -307,13 +286,13 @@ func (m *MetadataHandler) HandleShowTableStatus(dbName, tableName string) (*prot
 		Str("table", tableName).
 		Msg("Handling SHOW TABLE STATUS")
 
-	sqlDB, err := m.db.GetDatabaseConnection(dbName)
+	sqlDB, err := m.db.GetDatabaseReadConnection(dbName)
 	if err != nil {
 		return nil, err
 	}
 
 	// Build query to get table info
-	query := "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '__marmot__%'"
+	query := userTablesQuery
 	var args []interface{}
 	if tableName != "" {
 		query = "SELECT name FROM sqlite_master WHERE type='table' AND name = ?"
@@ -379,4 +358,66 @@ func (m *MetadataHandler) HandleShowTableStatus(dbName, tableName string) (*prot
 	}
 
 	return result, rows.Err()
+}
+
+// userTables lists a database's user tables by name, or only name when it is
+// set.
+func (m *MetadataHandler) userTables(dbName, name string) ([]string, error) {
+	sqlDB, err := m.db.GetDatabaseReadConnection(dbName)
+	if err != nil {
+		return nil, err
+	}
+	query := userTablesQuery
+	var args []interface{}
+	if name != "" {
+		query += " AND name = ?"
+		args = append(args, name)
+	}
+	return queryStrings(sqlDB, query+" ORDER BY name", args...)
+}
+
+// columnInfos reads a table's columns from SQLite's table_info pragma. The
+// table name is bound, never spliced into the statement.
+func (m *MetadataHandler) columnInfos(dbName, tableName string) ([]columnInfo, error) {
+	sqlDB, err := m.db.GetDatabaseReadConnection(dbName)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := sqlDB.Query(`SELECT cid, name, type, "notnull", dflt_value, pk FROM pragma_table_info(?)`, tableName)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var infos []columnInfo
+	for rows.Next() {
+		var c columnInfo
+		if err := rows.Scan(&c.cid, &c.name, &c.declType, &c.notNull, &c.dflt, &c.pk); err != nil {
+			return nil, err
+		}
+		infos = append(infos, c)
+	}
+	return infos, rows.Err()
+}
+
+// queryStrings runs a query selecting one text column and reads it to the
+// end. The rows are closed before it returns, so the connection is free for
+// the caller's next query: metadata handlers never issue a query while
+// another one's rows are open.
+func queryStrings(db *sql.DB, query string, args ...interface{}) ([]string, error) {
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var s string
+		if err := rows.Scan(&s); err != nil {
+			return nil, err
+		}
+		out = append(out, s)
+	}
+	return out, rows.Err()
 }

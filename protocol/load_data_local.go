@@ -13,10 +13,13 @@ const maxLoadDataLocalBytes = 64 << 20 // 64 MiB safety cap for phase-1 LOCAL IN
 const capabilityClientLocalFiles uint32 = 1 << 7
 const loadDataInsertBatchSize = 500
 
+// loadDataIdent matches one identifier, backquoted or bare.
+const loadDataIdent = "`(?:[^`]|``)+`|[A-Za-z0-9_$]+"
+
 var (
 	loadDataAnyPattern       = regexp.MustCompile(`(?is)^\s*LOAD\s+DATA\s+`)
 	loadDataLocalPattern     = regexp.MustCompile(`(?is)^\s*LOAD\s+DATA\s+(?:LOW_PRIORITY|CONCURRENT\s+)?LOCAL\s+INFILE\s+`)
-	loadDataTablePattern     = regexp.MustCompile(`(?is)\bINTO\s+TABLE\s+((?:` + "`" + `[^` + "`" + `]+` + "`" + `)|(?:[A-Za-z0-9_\.]+))`)
+	loadDataTablePattern     = regexp.MustCompile(`(?is)\bINTO\s+TABLE\s+(?:(` + loadDataIdent + `)\s*\.\s*)?(` + loadDataIdent + `)`)
 	loadDataLocalPathPattern = regexp.MustCompile(`(?is)\bLOCAL\s+INFILE\s+'((?:\\.|[^'])*)'`)
 	loadDataFieldsTerminated = regexp.MustCompile(`(?is)\bFIELDS\s+TERMINATED\s+BY\s+'((?:\\.|[^'])*)'`)
 	loadDataLinesTerminated  = regexp.MustCompile(`(?is)\bLINES\s+TERMINATED\s+BY\s+'((?:\\.|[^'])*)'`)
@@ -26,6 +29,9 @@ var (
 )
 
 type loadDataLocalSpec struct {
+	// Database is the target's qualifier, "" when the statement names none;
+	// Database and Table are unquoted.
+	Database        string
 	Table           string
 	Columns         []string
 	FieldTerminator string
@@ -50,12 +56,13 @@ func parseLoadDataLocalSpec(sql string) (*loadDataLocalSpec, error) {
 	}
 
 	matches := loadDataTablePattern.FindStringSubmatch(sql)
-	if len(matches) < 2 {
+	if len(matches) < 3 {
 		return nil, fmt.Errorf("LOAD DATA LOCAL missing INTO TABLE target")
 	}
 
 	spec := &loadDataLocalSpec{
-		Table:           strings.TrimSpace(matches[1]),
+		Database:        unquoteLoadDataIdent(matches[1]),
+		Table:           unquoteLoadDataIdent(matches[2]),
 		FieldTerminator: "\t",
 		LineTerminator:  "\n",
 	}
@@ -102,6 +109,32 @@ func parseLoadDataLocalSpec(sql string) (*loadDataLocalSpec, error) {
 	return spec, nil
 }
 
+// unquoteLoadDataIdent removes an identifier's backquotes, undoing a doubled
+// backquote inside it.
+func unquoteLoadDataIdent(s string) string {
+	if len(s) >= 2 && s[0] == '`' && s[len(s)-1] == '`' {
+		return strings.ReplaceAll(s[1:len(s)-1], "``", "`")
+	}
+	return s
+}
+
+// quoteLoadDataIdent backquotes an identifier.
+func quoteLoadDataIdent(s string) string {
+	return "`" + strings.ReplaceAll(s, "`", "``") + "`"
+}
+
+// target renders the table the INSERTs name. It is qualified only when the
+// statement names a database other than the session's: a session with no
+// current database is one applying a replicated LOAD DATA on the target
+// database's own connection (db.ApplyLoadData), where a qualifier would name
+// an attached schema instead.
+func (s *loadDataLocalSpec) target(session *ConnectionSession) string {
+	if s.Database == "" || session.CurrentDatabase == "" || s.Database == session.CurrentDatabase {
+		return quoteLoadDataIdent(s.Table)
+	}
+	return quoteLoadDataIdent(s.Database) + "." + quoteLoadDataIdent(s.Table)
+}
+
 func unescapeLoadDataToken(s string) (string, error) {
 	if !strings.Contains(s, `\`) {
 		return s, nil
@@ -114,7 +147,7 @@ func unescapeLoadDataToken(s string) (string, error) {
 	return v, nil
 }
 
-func buildInsertForLoadData(spec *loadDataLocalSpec, fieldCount, rowCount int) string {
+func buildInsertForLoadData(spec *loadDataLocalSpec, target string, fieldCount, rowCount int) string {
 	rowPlaceholder := make([]string, fieldCount)
 	for i := range rowPlaceholder {
 		rowPlaceholder[i] = "?"
@@ -128,9 +161,9 @@ func buildInsertForLoadData(spec *loadDataLocalSpec, fieldCount, rowCount int) s
 		cols = "(" + strings.Join(spec.Columns, ", ") + ")"
 	}
 	if cols != "" {
-		return fmt.Sprintf("INSERT INTO %s %s VALUES %s", spec.Table, cols, strings.Join(rows, ", "))
+		return fmt.Sprintf("INSERT INTO %s %s VALUES %s", target, cols, strings.Join(rows, ", "))
 	}
-	return fmt.Sprintf("INSERT INTO %s VALUES %s", spec.Table, strings.Join(rows, ", "))
+	return fmt.Sprintf("INSERT INTO %s VALUES %s", target, strings.Join(rows, ", "))
 }
 
 func splitLoadDataRows(data []byte, spec *loadDataLocalSpec) [][]string {
@@ -212,6 +245,16 @@ func (s *MySQLServer) processLoadDataQuery(conn io.ReadWriter, session *Connecti
 	return s.writeOK(conn, lastSeq+1, session, rows, lastInsertID)
 }
 
+// LoadDataTarget returns the database qualifier ("" when the statement names
+// none) and the table a LOAD DATA LOCAL statement loads into, unquoted.
+func LoadDataTarget(sql string) (database, table string, err error) {
+	spec, err := parseLoadDataLocalSpec(sql)
+	if err != nil {
+		return "", "", err
+	}
+	return spec.Database, spec.Table, nil
+}
+
 // ExecuteLoadDataLocal applies LOAD DATA LOCAL payload by translating to parameterized INSERT batches.
 func ExecuteLoadDataLocal(session *ConnectionSession, handler ConnectionHandler, query string, data []byte) (*ResultSet, error) {
 	spec, err := parseLoadDataLocalSpec(query)
@@ -267,7 +310,7 @@ func executeLocalLoadDataRowsWithHandler(session *ConnectionSession, handler Con
 			}
 		}
 
-		stmt := buildInsertForLoadData(spec, fieldCount, batchEnd-i)
+		stmt := buildInsertForLoadData(spec, spec.target(session), fieldCount, batchEnd-i)
 		params := make([]interface{}, 0, (batchEnd-i)*fieldCount)
 		for _, row := range rows[i:batchEnd] {
 			for _, col := range row {
@@ -311,4 +354,31 @@ func executeLocalLoadDataRowsWithHandler(session *ConnectionSession, handler Con
 		}
 	}
 	return inserted, lastInsertID, committedTxnID, nil
+}
+
+// LoadDataRows is what a LOAD DATA LOCAL statement inserts: its target
+// table (unquoted), its column list (empty for every column in table
+// order), and the payload's rows, split exactly as ExecuteLoadDataLocal
+// splits them.
+type LoadDataRows struct {
+	Table   string
+	Columns []string
+	Rows    [][]string
+}
+
+// ParseLoadDataRows parses query and splits data into the rows it inserts.
+// A row whose field count differs from the column list is an error, as in
+// ExecuteLoadDataLocal.
+func ParseLoadDataRows(query string, data []byte) (*LoadDataRows, error) {
+	spec, err := parseLoadDataLocalSpec(query)
+	if err != nil {
+		return nil, err
+	}
+	rows := splitLoadDataRows(data, spec)
+	for _, row := range rows {
+		if len(spec.Columns) > 0 && len(row) != len(spec.Columns) {
+			return nil, fmt.Errorf("LOAD DATA LOCAL row column mismatch: got %d, expected %d", len(row), len(spec.Columns))
+		}
+	}
+	return &LoadDataRows{Table: spec.Table, Columns: spec.Columns, Rows: rows}, nil
 }

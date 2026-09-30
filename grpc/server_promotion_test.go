@@ -21,10 +21,7 @@ func TestCheckPromotionCriteria_NoAliveNodes(t *testing.T) {
 		t.Fatalf("Failed to create test database: %v", err)
 	}
 
-	err = schemaVersionMgr.SetSchemaVersion("test_db", 1, "CREATE TABLE test (id INT)", 1)
-	if err != nil {
-		t.Fatalf("Failed to set schema version: %v", err)
-	}
+	bumpSchemaVersionForTest(t, dbMgr, "test_db", 1)
 
 	clock := hlc.NewClock(1)
 	replicationHandler := NewReplicationHandler(1, dbMgr, clock, schemaVersionMgr)
@@ -56,10 +53,7 @@ func TestCheckPromotionCriteria_SchemaMatches(t *testing.T) {
 		t.Fatalf("Failed to create test database: %v", err)
 	}
 
-	err = schemaVersionMgr.SetSchemaVersion("test_db", 5, "CREATE TABLE test (id INT)", 1)
-	if err != nil {
-		t.Fatalf("Failed to set schema version: %v", err)
-	}
+	bumpSchemaVersionForTest(t, dbMgr, "test_db", 5)
 
 	// Add an ALIVE peer with same schema version
 	registry.Add(&NodeState{
@@ -101,10 +95,7 @@ func TestCheckPromotionCriteria_SchemaAhead(t *testing.T) {
 		t.Fatalf("Failed to create test database: %v", err)
 	}
 
-	err = schemaVersionMgr.SetSchemaVersion("test_db", 5, "CREATE TABLE test (id INT)", 1)
-	if err != nil {
-		t.Fatalf("Failed to set schema version: %v", err)
-	}
+	bumpSchemaVersionForTest(t, dbMgr, "test_db", 5)
 
 	// Add an ALIVE peer with lower schema version
 	registry.Add(&NodeState{
@@ -146,10 +137,7 @@ func TestCheckPromotionCriteria_SchemaBehind(t *testing.T) {
 		t.Fatalf("Failed to create test database: %v", err)
 	}
 
-	err = schemaVersionMgr.SetSchemaVersion("test_db", 5, "CREATE TABLE test (id INT)", 1)
-	if err != nil {
-		t.Fatalf("Failed to set schema version: %v", err)
-	}
+	bumpSchemaVersionForTest(t, dbMgr, "test_db", 5)
 
 	// Add an ALIVE peer with higher schema version
 	registry.Add(&NodeState{
@@ -191,10 +179,7 @@ func TestCheckPromotionCriteria_PeerHasNewDatabase(t *testing.T) {
 		t.Fatalf("Failed to create test database: %v", err)
 	}
 
-	err = schemaVersionMgr.SetSchemaVersion("test_db", 5, "CREATE TABLE test (id INT)", 1)
-	if err != nil {
-		t.Fatalf("Failed to set schema version: %v", err)
-	}
+	bumpSchemaVersionForTest(t, dbMgr, "test_db", 5)
 
 	// Add an ALIVE peer with an additional database we don't have
 	registry.Add(&NodeState{
@@ -241,14 +226,8 @@ func TestCheckPromotionCriteria_MultipleDatabase(t *testing.T) {
 		t.Fatalf("Failed to create db2: %v", err)
 	}
 
-	err = schemaVersionMgr.SetSchemaVersion("db1", 5, "CREATE TABLE test (id INT)", 1)
-	if err != nil {
-		t.Fatalf("Failed to set schema version for db1: %v", err)
-	}
-	err = schemaVersionMgr.SetSchemaVersion("db2", 3, "CREATE TABLE test (id INT)", 2)
-	if err != nil {
-		t.Fatalf("Failed to set schema version for db2: %v", err)
-	}
+	bumpSchemaVersionForTest(t, dbMgr, "db1", 5)
+	bumpSchemaVersionForTest(t, dbMgr, "db2", 3)
 
 	// Add an ALIVE peer with multiple databases
 	registry.Add(&NodeState{
@@ -295,14 +274,8 @@ func TestCheckPromotionCriteria_MultipleDatabaseOneBehind(t *testing.T) {
 		t.Fatalf("Failed to create db2: %v", err)
 	}
 
-	err = schemaVersionMgr.SetSchemaVersion("db1", 5, "CREATE TABLE test (id INT)", 1)
-	if err != nil {
-		t.Fatalf("Failed to set schema version for db1: %v", err)
-	}
-	err = schemaVersionMgr.SetSchemaVersion("db2", 3, "CREATE TABLE test (id INT)", 2)
-	if err != nil {
-		t.Fatalf("Failed to set schema version for db2: %v", err)
-	}
+	bumpSchemaVersionForTest(t, dbMgr, "db1", 5)
+	bumpSchemaVersionForTest(t, dbMgr, "db2", 3)
 
 	// Add an ALIVE peer where one database has higher schema version
 	registry.Add(&NodeState{
@@ -424,10 +397,7 @@ func TestCheckPromotionCriteria_PeerNilSchemaVersions(t *testing.T) {
 		t.Fatalf("Failed to create test database: %v", err)
 	}
 
-	err = schemaVersionMgr.SetSchemaVersion("test_db", 5, "CREATE TABLE test (id INT)", 1)
-	if err != nil {
-		t.Fatalf("Failed to set schema version: %v", err)
-	}
+	bumpSchemaVersionForTest(t, dbMgr, "test_db", 5)
 
 	// Add an ALIVE peer with nil schema versions
 	registry.Add(&NodeState{
@@ -613,10 +583,7 @@ func TestPromotionCriteria_CatchUpThenPromote(t *testing.T) {
 	}
 
 	// Now simulate catching up by setting our schema version to 2
-	err = schemaVersionMgr.SetSchemaVersion("marmot", 2, "CREATE TABLE test (id INT)", 2)
-	if err != nil {
-		t.Fatalf("Failed to set schema version: %v", err)
-	}
+	bumpSchemaVersionForTest(t, dbMgr, "marmot", 2)
 
 	// Second check: should SUCCEED because we've caught up
 	result = server.checkPromotionCriteria()

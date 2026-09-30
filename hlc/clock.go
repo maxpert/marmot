@@ -191,6 +191,11 @@ func After(a, b Timestamp) bool {
 	return Compare(a, b) > 0
 }
 
+// IsZero reports whether t is the zero Timestamp, which no clock issues.
+func (t Timestamp) IsZero() bool {
+	return t == Timestamp{}
+}
+
 // PhysicalTime returns the physical time component as time.Time
 func (t Timestamp) PhysicalTime() time.Time {
 	return time.Unix(0, t.WallTime)

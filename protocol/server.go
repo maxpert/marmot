@@ -94,6 +94,7 @@ type ConnectionSession struct {
 
 	// LastInsertId stores the value returned by LAST_INSERT_ID().
 	// Updated after INSERT statements that generate auto-increment IDs.
+	// Write it only through RecordInsertId, which owns the zero rule.
 	LastInsertId atomic.Int64
 
 	// TranspilationEnabled controls MySQL→SQLite transpilation for this session.
@@ -212,9 +213,10 @@ type LoadDataHandler interface {
 // column-name index from that response; a server that reports no columns leaves
 // strict clients unable to address any column by name, even though the rows
 // themselves arrive intact. Handlers that cannot describe a statement return no
-// columns and the prepare response omits the definitions.
+// columns and the prepare response omits the definitions. database is the
+// database the statement runs in: the one it names, or the session's.
 type ResultColumnDescriber interface {
-	DescribeResultColumns(session *ConnectionSession, sql string) ([]ColumnDef, error)
+	DescribeResultColumns(session *ConnectionSession, database, sql string) ([]ColumnDef, error)
 }
 
 // SessionCloser is an optional extension for handlers that need to release
@@ -235,6 +237,12 @@ type ResultSet struct {
 	RowsAffected   int64
 	LastInsertId   int64
 	CommittedTxnId uint64 // For write forwarding: actual CDC txnID
+}
+
+// HasResultSet reports whether rs is answered to a client as a result set
+// rather than an OK packet: it carries columns or rows. A nil rs has none.
+func (rs *ResultSet) HasResultSet() bool {
+	return rs != nil && (len(rs.Columns) > 0 || len(rs.Rows) > 0)
 }
 
 // ColumnDef represents a column definition
@@ -561,16 +569,14 @@ func (s *MySQLServer) processQuery(conn net.Conn, session *ConnectionSession, qu
 		_ = s.writeMySQLErr(conn, 1, err)
 		return
 	}
-	if rs == nil || (len(rs.Columns) == 0 && len(rs.Rows) == 0) {
+	if !rs.HasResultSet() {
 		// OK response for non-SELECT (INSERT/UPDATE/DELETE/etc)
 		rowsAffected := int64(0)
 		lastInsertId := int64(0)
 		if rs != nil {
 			rowsAffected = rs.RowsAffected
 			lastInsertId = rs.LastInsertId
-			if lastInsertId != 0 {
-				session.LastInsertId.Store(lastInsertId)
-			}
+			session.RecordInsertId(lastInsertId)
 		}
 		_ = s.writeOK(conn, 1, session, rowsAffected, lastInsertId)
 		return
@@ -682,7 +688,7 @@ func (s *MySQLServer) writeEOF(w io.Writer, seq byte, session *ConnectionSession
 }
 
 func (s *MySQLServer) writeError(w io.Writer, seq byte, code uint16, msg string) error {
-	return s.writeErrorWithState(w, seq, code, "HY000", msg)
+	return s.writeErrorWithState(w, seq, code, SQLStateGeneral, msg)
 }
 
 func (s *MySQLServer) writeErrorWithState(w io.Writer, seq byte, code uint16, sqlState, msg string) error {
@@ -695,6 +701,24 @@ func (s *MySQLServer) writeErrorWithState(w io.Writer, seq byte, code uint16, sq
 	buf.WriteString(msg)
 
 	return s.writePacket(w, seq, buf.Bytes())
+}
+
+// RecordInsertId stores a statement's insert id as this session's
+// LAST_INSERT_ID(). It is the ONLY place the zero rule lives, and every path
+// that receives an insert id must go through it: the coordinator's own OK-packet
+// paths here, and a replica's forwarded responses in replica/handler.go.
+//
+// A zero id means the statement generated no AUTO_INCREMENT value - an INSERT
+// that inserted nothing, an upsert that updated an existing row, a table with no
+// auto-increment column. MySQL leaves LAST_INSERT_ID() unchanged in that case
+// ("The value of LAST_INSERT_ID() remains unchanged if no rows are successfully
+// inserted"), so a zero is dropped rather than stored. Storing it would reset a
+// value the client is entitled to keep reading.
+func (s *ConnectionSession) RecordInsertId(id int64) {
+	if id == 0 {
+		return
+	}
+	s.LastInsertId.Store(id)
 }
 
 // writeMySQLErr writes a MySQLError to the connection, extracting code/state from the error
@@ -1058,7 +1082,7 @@ func (s *MySQLServer) handleStmtPrepare(conn net.Conn, session *ConnectionSessio
 			Str("query", sql).
 			Err(err).
 			Msg("Failed to process SQL in PREPARE")
-		_ = s.writeError(conn, 1, 1064, err.Error())
+		_ = s.writeError(conn, 1, ErrCodeParseError, err.Error())
 		return
 	}
 
@@ -1072,7 +1096,7 @@ func (s *MySQLServer) handleStmtPrepare(conn net.Conn, session *ConnectionSessio
 			Str("query", sql).
 			Str("error", errorMsg).
 			Msg("Invalid SQL in PREPARE")
-		_ = s.writeError(conn, 1, 1064, errorMsg)
+		_ = s.writeError(conn, 1, ErrCodeParseError, errorMsg)
 		return
 	}
 
@@ -1086,8 +1110,16 @@ func (s *MySQLServer) handleStmtPrepare(conn net.Conn, session *ConnectionSessio
 	// Describe the result set now: clients index columns by name from this
 	// response, so omitting the definitions makes every by-name lookup fail.
 	var resultColumns []ColumnDef
-	if describer, ok := s.handler.(ResultColumnDescriber); ok {
-		cols, err := describer.DescribeResultColumns(session, transpiledSQL)
+	if StatementCode(ctx.Output.StatementType) == StatementInformationSchema {
+		// Marmot answers INFORMATION_SCHEMA itself, with a fixed column set
+		// per table; the database has no such table to describe.
+		resultColumns = InformationSchemaColumns(InformationSchemaTableType(ctx.MySQLState.ISTableType))
+	} else if describer, ok := s.handler.(ResultColumnDescriber); ok {
+		database := ctx.Output.Database
+		if database == "" {
+			database = session.CurrentDatabase
+		}
+		cols, err := describer.DescribeResultColumns(session, database, transpiledSQL)
 		switch {
 		case err == nil:
 			resultColumns = cols
@@ -1126,9 +1158,13 @@ func (s *MySQLServer) handleStmtPrepare(conn net.Conn, session *ConnectionSessio
 		defer session.preparedStmtLock.Unlock()
 		stmtID = session.nextStmtID
 		session.nextStmtID++
+		// The client's own SQL is kept, not the transpiled text: execution
+		// runs it through the handler exactly as a text query, and the
+		// transpiled text has already lost what the handler needs from the
+		// original, such as a table's database qualifier.
 		session.preparedStmts[stmtID] = &PreparedStatement{
 			ID:           stmtID,
-			Query:        transpiledSQL,
+			Query:        sql,
 			ParamCount:   paramCount,
 			OriginalType: StatementCode(ctx.Output.StatementType),
 			Context:      ctx,
@@ -1242,7 +1278,7 @@ func (s *MySQLServer) handleStmtSendLongData(session *ConnectionSession, payload
 // accumulated via COM_STMT_SEND_LONG_DATA for the statement and responds OK.
 func (s *MySQLServer) handleStmtReset(conn net.Conn, session *ConnectionSession, payload []byte) {
 	if len(payload) < 4 {
-		_ = s.writeError(conn, 1, 1064, "Invalid COM_STMT_RESET packet")
+		_ = s.writeError(conn, 1, ErrCodeParseError, "Invalid COM_STMT_RESET packet")
 		return
 	}
 	stmtID := binary.LittleEndian.Uint32(payload[0:4])
@@ -1263,7 +1299,7 @@ func (s *MySQLServer) handleStmtReset(conn net.Conn, session *ConnectionSession,
 
 func (s *MySQLServer) handleStmtExecute(conn net.Conn, session *ConnectionSession, payload []byte) {
 	if len(payload) < 9 {
-		_ = s.writeError(conn, 1, 1064, "Invalid COM_STMT_EXECUTE packet")
+		_ = s.writeError(conn, 1, ErrCodeParseError, "Invalid COM_STMT_EXECUTE packet")
 		return
 	}
 
@@ -1296,7 +1332,7 @@ func (s *MySQLServer) handleStmtExecute(conn net.Conn, session *ConnectionSessio
 		// Parse NULL bitmap and new-params-bound-flag
 		nullBitmapLen := (int(stmt.ParamCount) + 7) / 8
 		if len(payload) < 9+nullBitmapLen+1 {
-			_ = s.writeError(conn, 1, 1064, "Invalid parameter data")
+			_ = s.writeError(conn, 1, ErrCodeParseError, "Invalid parameter data")
 			return
 		}
 
@@ -1310,7 +1346,7 @@ func (s *MySQLServer) handleStmtExecute(conn net.Conn, session *ConnectionSessio
 		if newParamsBoundFlag == 1 {
 			// New types provided - parse and cache them
 			if len(payload) < offset+int(stmt.ParamCount)*2 {
-				_ = s.writeError(conn, 1, 1064, "Invalid parameter types")
+				_ = s.writeError(conn, 1, ErrCodeParseError, "Invalid parameter types")
 				return
 			}
 			paramTypes = make([]byte, int(stmt.ParamCount)*2)
@@ -1366,10 +1402,10 @@ func (s *MySQLServer) handleStmtExecute(conn net.Conn, session *ConnectionSessio
 				offset, val, err = parseParamValue(payload, offset, paramType, unsigned)
 				if err != nil {
 					if errors.Is(err, errUnsignedBigintOutOfRange) {
-						_ = s.writeErrorWithState(conn, 1, 1264, "22003",
+						_ = s.writeErrorWithState(conn, 1, ErrCodeDataOutOfRange, SQLStateDataOutOfRange,
 							fmt.Sprintf("Out of range value for parameter %d", i))
 					} else {
-						_ = s.writeError(conn, 1, 1064, fmt.Sprintf("Failed to parse parameter %d: %v", i, err))
+						_ = s.writeError(conn, 1, ErrCodeParseError, fmt.Sprintf("Failed to parse parameter %d: %v", i, err))
 					}
 					return
 				}
@@ -1385,23 +1421,25 @@ func (s *MySQLServer) handleStmtExecute(conn net.Conn, session *ConnectionSessio
 		Int("param_count", len(params)).
 		Msg("Executing prepared statement")
 
-	// Execute the query directly (it's already transpiled SQLite syntax)
-	// We need to determine if it's a SELECT to know how to format the response
-	// Use the original statement type we stored during PREPARE
-	isSelect := stmt.OriginalType == StatementSelect
-
 	// Execute query with params passed to handler (no string interpolation!)
+	// The handler transpiles the client's SQL as it does a text query.
 	rs, err := s.handler.HandleQuery(session, stmt.Query, params)
 	if err != nil {
 		_ = s.writeMySQLErr(conn, 1, err)
 		return
 	}
 
+	// A prepared statement answers as its text form does: a result set when
+	// the answer carries one (INFORMATION_SCHEMA, SHOW and the like), an OK
+	// packet otherwise. A SELECT always answers with a result set, even an
+	// empty one.
+	answersRows := stmt.OriginalType == StatementSelect || rs.HasResultSet()
+
 	log.Debug().
 		Uint64("conn_id", session.ConnID).
 		Uint32("stmt_id", stmtID).
 		Int("original_type", int(stmt.OriginalType)).
-		Bool("is_select", isSelect).
+		Bool("answers_rows", answersRows).
 		Int64("rows_affected", func() int64 {
 			if rs != nil {
 				return rs.RowsAffected
@@ -1410,9 +1448,7 @@ func (s *MySQLServer) handleStmtExecute(conn net.Conn, session *ConnectionSessio
 		}()).
 		Msg("Prepared statement result")
 
-	// Use the original statement type to determine response format
-	if isSelect {
-		// Write binary result set for SELECT queries
+	if answersRows {
 		if rs != nil {
 			_ = s.writeBinaryResultSet(conn, 1, session, rs)
 		} else {
@@ -1426,9 +1462,7 @@ func (s *MySQLServer) handleStmtExecute(conn net.Conn, session *ConnectionSessio
 		if rs != nil {
 			rowsAffected = rs.RowsAffected
 			lastInsertId = rs.LastInsertId
-			if lastInsertId != 0 {
-				session.LastInsertId.Store(lastInsertId)
-			}
+			session.RecordInsertId(lastInsertId)
 		}
 		_ = s.writeOK(conn, 1, session, rowsAffected, lastInsertId)
 	}

@@ -2,10 +2,12 @@ package coordinator
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/maxpert/marmot/hlc"
+	"github.com/maxpert/marmot/protocol"
 )
 
 // TestCommitLocalAfterRemoteQuorum_SuccessfulLocalCommit tests the happy path
@@ -134,6 +136,54 @@ func TestCommitLocalAfterRemoteQuorum_LocalCommitFailure_Bug(t *testing.T) {
 	calls := localReplicator.GetPhaseCalls(PhaseCommit)
 	if len(calls) != 1 {
 		t.Errorf("expected 1 COMMIT call to local replicator, got %d", len(calls))
+	}
+}
+
+// TestCommitLocalAfterRemoteQuorum_RefusedClaimApplyIsNotDivergence: the local
+// participant refused to apply the AUTO_INCREMENT claim the remote quorum
+// committed (db.ApplyClaims, protocol.ErrAutoIncClaimNotApplicable). That is
+// the protocol withholding an ACK, not a node that diverged, so the error must
+// carry the claim sentinel; any other local failure must not.
+//
+// Mutation: ignore ReplicationResponse.ClaimNotApplicable in
+// commitLocalAfterRemoteQuorum. "a refused claim apply was reported as a
+// failed local commit" fires.
+func TestCommitLocalAfterRemoteQuorum_RefusedClaimApplyIsNotDivergence(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name    string
+		resp    *ReplicationResponse
+		refusal bool
+	}{
+		{"claim not applicable", &ReplicationResponse{Error: "auto-increment claim apply failed", ClaimNotApplicable: true}, true},
+		{"failed commit", CreateErrorResponse("disk full"), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			localReplicator := newMockReplicator()
+			wc := NewWriteCoordinator(1, newMockNodeProvider([]uint64{1, 2, 3}), nil, localReplicator,
+				100*time.Millisecond, hlc.NewClock(1))
+			txn := NewTxnBuilder().
+				WithID(250).
+				WithNodeID(1).
+				WithDatabase("test").
+				WithCDCStatement("users", map[string][]byte{"id": {1}}, map[string][]byte{"id": {2}}).
+				Build()
+			localReplicator.SetNodeCommitResponse(1, tc.resp)
+
+			_, err := wc.commitLocalAfterRemoteQuorum(context.Background(), wc.buildCommitRequest(txn), txn.ID)
+			AssertPartialCommitError(t, err, true)
+			var pErr *PartialCommitError
+			if !errors.As(err, &pErr) {
+				t.Fatalf("expected PartialCommitError, got %T", err)
+			}
+			if got := errors.Is(pErr.LocalError, protocol.ErrAutoIncClaimNotApplicable); got != tc.refusal {
+				if tc.refusal {
+					t.Fatalf("a refused claim apply was reported as a failed local commit: %v", pErr.LocalError)
+				}
+				t.Fatalf("a failed local commit was reported as a refused claim apply: %v", pErr.LocalError)
+			}
+		})
 	}
 }
 

@@ -45,6 +45,7 @@ func (noopNodeRegistry) CountAlive() int                        { return 1 }
 func (noopNodeRegistry) GetAll() []any                          { return nil }
 func (noopNodeRegistry) IsLeaving(uint64) bool                  { return false }
 func (noopNodeRegistry) GetLocalNodeID() uint64                 { return 1 }
+func (noopNodeRegistry) LegacyLogProtocolMembers() []uint64     { return nil }
 
 // noopDMLSetup builds a single-node handler over a real DatabaseManager so the
 // CDC preupdate hook runs for real.
@@ -53,9 +54,13 @@ type noopDMLSetup struct {
 	session    *protocol.ConnectionSession
 	replicator *countingReplicator
 	conn       *sql.DB
+	dbMgr      *db.DatabaseManager
+	// restartHandler builds a fresh handler over the same node, as a
+	// restarted process would have: same data, no in-memory allocator state.
+	restartHandler func() *coordinator.CoordinatorHandler
 }
 
-func setupNoopDML(t *testing.T) *noopDMLSetup {
+func setupNoopDML(t testing.TB) *noopDMLSetup {
 	t.Helper()
 
 	tmpDir := t.TempDir()
@@ -64,16 +69,21 @@ func setupNoopDML(t *testing.T) *noopDMLSetup {
 	dbMgr, err := db.NewDatabaseManager(tmpDir, 1, clock)
 	require.NoError(t, err)
 	t.Cleanup(func() { dbMgr.Close() })
+	// A single node releases the claim votes its new system database holds,
+	// as a standalone node's merge does.
+	require.NoError(t, dbMgr.MergeAutoIncBasesAndReleaseVotes(nil))
 
 	const dbName = "noopdml"
 	require.NoError(t, dbMgr.CreateDatabase(dbName))
 
-	systemDB, err := dbMgr.GetDatabase(db.SystemDatabaseName)
+	_, err = dbMgr.GetDatabase(db.SystemDatabaseName)
 	require.NoError(t, err)
-	schemaVersionMgr := db.NewSchemaVersionManager(systemDB.GetMetaStore())
+	schemaVersionMgr := db.NewSchemaVersionManager(dbMgr)
 
 	replicator := &countingReplicator{}
 	nodeProvider := coordinator.NewMockNodeProvider([]uint64{1})
+	// A claim participant counts the cluster as the claimant does.
+	dbMgr.SetClusterMembership(nodeProvider.GetTotalMembershipSize)
 
 	writeCoord := coordinator.NewWriteCoordinator(
 		1,
@@ -90,16 +100,19 @@ func setupNoopDML(t *testing.T) *noopDMLSetup {
 		10*time.Second,
 	)
 
-	handler := coordinator.NewCoordinatorHandler(
-		1,
-		writeCoord,
-		readCoord,
-		clock,
-		dbMgr,
-		coordinator.NewDDLLockManager(30*time.Second),
-		schemaVersionMgr,
-		noopNodeRegistry{},
-	)
+	newHandler := func() *coordinator.CoordinatorHandler {
+		return coordinator.NewCoordinatorHandler(
+			1,
+			writeCoord,
+			readCoord,
+			clock,
+			dbMgr,
+			coordinator.NewDDLLockManager(30*time.Second),
+			schemaVersionMgr,
+			noopNodeRegistry{},
+		)
+	}
+	handler := newHandler()
 
 	// Real connections enable transpilation (protocol/server.go), and without it
 	// BEGIN does not parse as transaction control, so a test meaning to exercise
@@ -120,7 +133,7 @@ func setupNoopDML(t *testing.T) *noopDMLSetup {
 	conn, err := dbMgr.GetDatabaseConnection(dbName)
 	require.NoError(t, err)
 
-	return &noopDMLSetup{handler: handler, session: session, replicator: replicator, conn: conn}
+	return &noopDMLSetup{handler: handler, session: session, replicator: replicator, conn: conn, dbMgr: dbMgr, restartHandler: newHandler}
 }
 
 // TestNoopDMLSucceeds pins that a DML matching zero rows is a successful no-op.

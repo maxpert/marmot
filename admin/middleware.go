@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"crypto/subtle"
 	"net/http"
 	"strings"
 
@@ -36,12 +37,28 @@ func AuthMiddleware(next http.Handler) http.Handler {
 			providedSecret = parts[1]
 		}
 
-		if providedSecret != secret {
+		if subtle.ConstantTimeCompare([]byte(providedSecret), []byte(secret)) != 1 {
 			writeErrorResponse(w, http.StatusUnauthorized, "invalid secret")
 			return
 		}
 
 		// Authenticated - proceed to next handler
 		next.ServeHTTP(w, r)
+	})
+}
+
+// RequireSecretMiddleware serves an endpoint only to a caller holding the
+// cluster secret, and refuses it outright on a cluster with none. It guards
+// the endpoints that change which AUTO_INCREMENT ids the cluster can issue,
+// which AuthMiddleware alone would serve to anyone when no secret is set.
+func RequireSecretMiddleware(next http.Handler) http.Handler {
+	authenticated := AuthMiddleware(next)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !cfg.IsClusterAuthEnabled() {
+			writeErrorResponse(w, http.StatusForbidden,
+				"this endpoint is never served unauthenticated: set cluster.cluster_secret to use it")
+			return
+		}
+		authenticated.ServeHTTP(w, r)
 	})
 }

@@ -19,6 +19,8 @@ import (
 )
 
 // MockNodeProvider implements coordinator.NodeProvider
+func (m *MockNodeProvider) HasSeedNodes() bool { return false }
+
 type MockNodeProvider struct {
 	nodes []uint64
 }
@@ -54,6 +56,12 @@ func NewTestDatabaseManager(replicatedDB *db.ReplicatedDatabase) *TestDatabaseMa
 func (tdm *TestDatabaseManager) GetDatabase(name string) (*db.ReplicatedDatabase, error) {
 	// For testing, always return the single database regardless of name
 	return tdm.db, nil
+}
+
+// ClusterMembership reports a single-node cluster: this fixture serves one
+// node and claims no AUTO_INCREMENT ranges across any other.
+func (tdm *TestDatabaseManager) ClusterMembership() (int, error) {
+	return 1, nil
 }
 
 func (tdm *TestDatabaseManager) ListDatabases() []string {
@@ -111,9 +119,16 @@ func (tdm *TestDatabaseManager) GetVectorIndexManager() coordinator.VectorIndexM
 	return nil
 }
 
+// RegistryKeyGeneration reports generation 1, live, for every name: this
+// fixture serves a single always-present database regardless of name (see
+// GetDatabase/DatabaseExists above).
+func (tdm *TestDatabaseManager) RegistryKeyGeneration(name string) (uint64, bool, error) {
+	return 1, true, nil
+}
+
 func TestMySQLServerIntegration(t *testing.T) {
 	// Setup temporary DB with MetaStore
-	tmpDir := t.TempDir()
+	tmpDir := testDir(t)
 	dbPath := tmpDir + "/test.db"
 
 	// Create MetaStore using factory (PebbleDB)
@@ -143,15 +158,20 @@ func TestMySQLServerIntegration(t *testing.T) {
 	handler := coordinator.NewCoordinatorHandler(1, writeCoord, readCoord, clock, dbMgr, nil, nil, nil)
 
 	// Setup server on an ephemeral port to avoid collisions with other tests.
-	port := findFreeTCPPort(t)
+	port := freePorts(t, 1)[0]
 	server := protocol.NewMySQLServer(fmt.Sprintf("127.0.0.1:%d", port), "", 0, handler)
 
 	err = server.Start()
 	require.NoError(t, err)
 	defer server.Stop()
-
-	// Give server time to start
-	time.Sleep(100 * time.Millisecond)
+	waitFor(t, "MySQL server listening", time.Second, func() (bool, string) {
+		conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), clientTimeout)
+		if err != nil {
+			return false, err.Error()
+		}
+		conn.Close()
+		return true, ""
+	})
 
 	// Connect with MySQL client
 	cfg := mysql.Config{
@@ -203,12 +223,4 @@ func TestMySQLServerIntegration(t *testing.T) {
 	// Test snapshot read (Implicit via ExecuteSnapshotRead)
 	// We can't easily verify internal snapshot state here without exposing it,
 	// but success means the read path is working.
-}
-
-func findFreeTCPPort(t *testing.T) int {
-	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	defer l.Close()
-	return l.Addr().(*net.TCPAddr).Port
 }

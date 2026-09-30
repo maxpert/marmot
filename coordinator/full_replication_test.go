@@ -12,7 +12,13 @@ import (
 )
 
 // mockNodeProvider implements NodeProvider for testing
+// hasSeedNodes drives coordinator.GetClusterState's quorum-of-one belt. The
+// zero value is false, which is a single-node deployment: existing tests that
+// run with a membership of one keep passing unchanged.
+func (m *mockNodeProvider) HasSeedNodes() bool { return m.hasSeedNodes }
+
 type mockNodeProvider struct {
+	hasSeedNodes    bool
 	nodes           []uint64
 	totalMembership int // Total membership for split-brain prevention (0 = use len(nodes))
 	mu              sync.RWMutex

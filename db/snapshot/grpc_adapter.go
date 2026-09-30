@@ -12,6 +12,8 @@ type GRPCChunk interface {
 	GetData() []byte
 	GetChecksum() string
 	GetIsLastForFile() bool
+	GetFileSha256() string
+	GetFileSizeBytes() int64
 }
 
 // GRPCStream represents a gRPC streaming client that can receive chunks
@@ -43,6 +45,8 @@ func (a *GRPCChunkAdapter) Recv() (*Chunk, error) {
 		Data:          grpcChunk.GetData(),
 		MD5Checksum:   grpcChunk.GetChecksum(),
 		IsLastForFile: grpcChunk.GetIsLastForFile(),
+		FileSHA256:    grpcChunk.GetFileSha256(),
+		FileSizeBytes: grpcChunk.GetFileSizeBytes(),
 	}, nil
 }
 
@@ -76,6 +80,8 @@ func (a *GenericStreamAdapter[T]) Recv() (*Chunk, error) {
 		Data:          grpcChunk.GetData(),
 		MD5Checksum:   grpcChunk.GetChecksum(),
 		IsLastForFile: grpcChunk.GetIsLastForFile(),
+		FileSHA256:    grpcChunk.GetFileSha256(),
+		FileSizeBytes: grpcChunk.GetFileSizeBytes(),
 	}, nil
 }
 

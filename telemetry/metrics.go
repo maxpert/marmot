@@ -65,9 +65,6 @@ var (
 	// ReplicaCommitSeconds measures replica-side commit phase latency
 	ReplicaCommitSeconds Histogram = NoopStat{}
 
-	// ReplicaReplaySeconds measures replica-side replay phase latency (anti-entropy)
-	ReplicaReplaySeconds Histogram = NoopStat{}
-
 	// TwoPhaseQuorumAcks measures number of acks received per phase
 	TwoPhaseQuorumAcks HistogramVec = noopHistogramVec{}
 
@@ -119,11 +116,11 @@ var (
 	// AntiEntropyDurationSeconds measures anti-entropy round duration
 	AntiEntropyDurationSeconds Histogram = NoopStat{}
 
-	// ReplicationLagTxns tracks transaction lag per peer
+	// ReplicationLagTxns tracks, per peer, the committed transactions of
+	// that peer's local commit log past this node's pull cursor, summed over
+	// databases, as of the last pull round that could count them all: an
+	// upper bound on what catch-up still has to do
 	ReplicationLagTxns GaugeVec = noopGaugeVec{}
-
-	// DeltaSyncTxnsTotal counts transactions applied via delta sync
-	DeltaSyncTxnsTotal Counter = NoopStat{}
 )
 
 // RowLockStore metrics
@@ -134,11 +131,25 @@ var (
 	// RowLockTransactions tracks number of transactions holding row locks
 	RowLockTransactions Gauge = NoopStat{}
 
-	// RowLockGCMarkers tracks number of GC markers pending cleanup
-	RowLockGCMarkers Gauge = NoopStat{}
-
 	// RowLockTables tracks number of tables with active locks
 	RowLockTables Gauge = NoopStat{}
+)
+
+// LogPuller metrics: the per-peer log-pull anti-entropy round.
+var (
+	// LogPullStuckTxns tracks, per database, the number of transactions a
+	// LogPuller has given up retrying every round because they failed to
+	// replay MaxReplayAttempts times in a row. It is exported as marmot_v2_anti_entropy_stuck_txns, following
+	// this package's existing namespace/subsystem convention.
+	LogPullStuckTxns GaugeVec = noopGaugeVec{}
+
+	// LogPullTxnsAppliedTotal counts transactions a LogPuller has applied
+	// (not merely covered by an existing marker) while pulling peers' logs.
+	LogPullTxnsAppliedTotal Counter = NoopStat{}
+
+	// LogPullPairResultsTotal counts LogPuller.PullPair calls by outcome:
+	// caught_up, behind, needs_snapshot, unimplemented, error.
+	LogPullPairResultsTotal CounterVec = noopCounterVec{}
 )
 
 // InitMetrics initializes all Prometheus metrics.
@@ -208,11 +219,6 @@ func InitMetrics() {
 	ReplicaCommitSeconds = NewHistogramWithBuckets(
 		"replica_commit_seconds",
 		"Replica-side commit phase latency in seconds",
-		TwoPCBuckets,
-	)
-	ReplicaReplaySeconds = NewHistogramWithBuckets(
-		"replica_replay_seconds",
-		"Replica-side replay phase latency in seconds",
 		TwoPCBuckets,
 	)
 	TwoPhaseQuorumAcks = NewHistogramVec(
@@ -292,12 +298,8 @@ func InitMetrics() {
 	)
 	ReplicationLagTxns = NewGaugeVec(
 		"replication_lag_txns",
-		"Transaction lag behind peer",
+		"Committed transactions past this node's pull cursor into the peer's log, as of the last pull round, summed over databases (an upper bound on catch-up still to do)",
 		[]string{"peer"},
-	)
-	DeltaSyncTxnsTotal = NewCounter(
-		"delta_sync_txns_total",
-		"Total transactions applied via delta sync",
 	)
 
 	// RowLockStore metrics
@@ -309,20 +311,31 @@ func InitMetrics() {
 		"row_lock_transactions",
 		"Number of transactions holding row locks",
 	)
-	RowLockGCMarkers = NewGauge(
-		"row_lock_gc_markers",
-		"Number of GC markers pending cleanup",
-	)
 	RowLockTables = NewGauge(
 		"row_lock_tables",
 		"Number of tables with active locks",
 	)
+
+	// LogPuller metrics
+	LogPullStuckTxns = NewGaugeVec(
+		"anti_entropy_stuck_txns",
+		"Number of transactions a log-pull round has stopped retrying every round after repeated replay failures",
+		[]string{"database"},
+	)
+	LogPullTxnsAppliedTotal = NewCounter(
+		"log_pull_txns_applied_total",
+		"Total transactions applied by pulling peers' local commit logs",
+	)
+	LogPullPairResultsTotal = NewCounterVec(
+		"log_pull_pair_results_total",
+		"LogPuller.PullPair calls by outcome",
+		[]string{"outcome"},
+	)
 }
 
 // UpdateRowLockStats updates row lock gauges from stats
-func UpdateRowLockStats(activeLocks, activeTransactions, gcMarkers, tablesWithLocks int) {
+func UpdateRowLockStats(activeLocks, activeTransactions, tablesWithLocks int) {
 	RowLocksActive.Set(float64(activeLocks))
 	RowLockTransactions.Set(float64(activeTransactions))
-	RowLockGCMarkers.Set(float64(gcMarkers))
 	RowLockTables.Set(float64(tablesWithLocks))
 }

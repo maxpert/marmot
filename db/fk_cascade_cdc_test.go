@@ -7,6 +7,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/maxpert/marmot/hlc"
 	"github.com/stretchr/testify/require"
 )
 
@@ -156,7 +157,7 @@ func TestFKCascadeCDC_ReplicaOwnCascadeThenRedundantDeleteNoOps(t *testing.T) {
 	require.NotNil(t, parentEntry)
 	require.NotNil(t, childEntry)
 
-	require.NoError(t, ApplyCDCEntry(replica.GetWriteDB(), &schemaCacheAdapter{cache: replica.schemaCache}, parentEntry))
+	require.NoError(t, applyEntryInTx(t, replica.GetWriteDB(), &schemaCacheAdapter{cache: replica.schemaCache}, parentEntry, hlc.Timestamp{WallTime: 1, NodeID: 1}))
 
 	var childCountAfterParentDelete int
 	require.NoError(t, replica.GetWriteDB().QueryRow(`SELECT COUNT(*) FROM child`).Scan(&childCountAfterParentDelete))
@@ -164,7 +165,7 @@ func TestFKCascadeCDC_ReplicaOwnCascadeThenRedundantDeleteNoOps(t *testing.T) {
 
 	// Now apply the source's redundant, explicit child-delete CDC entry:
 	// must be a harmless no-op, not an error.
-	require.NoError(t, ApplyCDCEntry(replica.GetWriteDB(), &schemaCacheAdapter{cache: replica.schemaCache}, childEntry))
+	require.NoError(t, applyEntryInTx(t, replica.GetWriteDB(), &schemaCacheAdapter{cache: replica.schemaCache}, childEntry, hlc.Timestamp{WallTime: 1, NodeID: 1}))
 
 	var finalParentCount, finalChildCount int
 	require.NoError(t, replica.GetWriteDB().QueryRow(`SELECT COUNT(*) FROM parent`).Scan(&finalParentCount))

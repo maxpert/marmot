@@ -1,5 +1,5 @@
 #!/bin/bash
-# Marmot v2.9.16-beta - Single Node Example
+# Marmot v2.10.0-beta - Single Node Example
 # Simplest way to run Marmot
 
 set -e
@@ -7,7 +7,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-echo "=== Marmot v2.9.16-beta Single Node ==="
+echo "=== Marmot v2.10.0-beta Single Node ==="
 echo ""
 
 # Kill any existing marmot processes
@@ -25,7 +25,7 @@ mkdir -p /tmp/marmot-single
 
 # Create config
 cat > /tmp/marmot-single/config.toml <<'TOML'
-# Marmot v2.9.16-beta - Single Node Configuration (Optimized for Benchmarks)
+# Marmot v2.10.0-beta - Single Node Configuration (Optimized for Benchmarks)
 
 node_id = 1
 data_dir = "/tmp/marmot-single"
@@ -39,6 +39,7 @@ lock_wait_timeout_seconds = 50
 grpc_bind_address = "0.0.0.0"
 grpc_port = 8080
 seed_nodes = []  # No peers - single node
+standalone = true  # A deliberate single-node deployment: AUTO_INCREMENT claims need no peers
 gossip_interval_ms = 1000
 gossip_fanout = 2
 suspect_timeout_ms = 5000

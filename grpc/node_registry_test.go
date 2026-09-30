@@ -790,72 +790,12 @@ func TestNodeRegistry_GetMembershipInfo(t *testing.T) {
 }
 
 // =======================
-// WATERMARK PROTOCOL TESTS
+// WATERMARK FIELD GOSSIP TEST
 // =======================
-
-func TestNodeRegistry_UpdateLocalWatermark(t *testing.T) {
-	nr := NewNodeRegistry(1, "localhost:8081")
-
-	// Initial watermark should be 0
-	if wm := nr.GetLocalWatermark(); wm != 0 {
-		t.Errorf("Expected initial watermark 0, got %d", wm)
-	}
-
-	// Update watermark
-	nr.UpdateLocalWatermark(100)
-	if wm := nr.GetLocalWatermark(); wm != 100 {
-		t.Errorf("Expected watermark 100, got %d", wm)
-	}
-
-	// Update to higher value
-	nr.UpdateLocalWatermark(200)
-	if wm := nr.GetLocalWatermark(); wm != 200 {
-		t.Errorf("Expected watermark 200, got %d", wm)
-	}
-
-	// Update to lower value should be ignored (watermarks only advance)
-	nr.UpdateLocalWatermark(150)
-	if wm := nr.GetLocalWatermark(); wm != 200 {
-		t.Errorf("Watermark should not decrease, expected 200, got %d", wm)
-	}
-}
-
-func TestNodeRegistry_GetClusterMinWatermark(t *testing.T) {
-	nr := NewNodeRegistry(1, "localhost:8081")
-
-	// Set local watermark
-	nr.UpdateLocalWatermark(100)
-
-	// Add other nodes with different watermarks
-	nr.Add(&NodeState{NodeId: 2, Address: "localhost:8082", Status: NodeStatus_ALIVE, MinAppliedSeq: 50})
-	nr.Add(&NodeState{NodeId: 3, Address: "localhost:8083", Status: NodeStatus_ALIVE, MinAppliedSeq: 75})
-
-	// Minimum should be 50 (node 2)
-	min := nr.GetClusterMinWatermark()
-	if min != 50 {
-		t.Errorf("Expected min watermark 50, got %d", min)
-	}
-
-	// Add a dead node with lower watermark - should not affect minimum
-	nr.Add(&NodeState{NodeId: 4, Address: "localhost:8084", Status: NodeStatus_DEAD, MinAppliedSeq: 10})
-
-	// Minimum should still be 50 (dead nodes excluded)
-	min = nr.GetClusterMinWatermark()
-	if min != 50 {
-		t.Errorf("Expected min watermark 50 (dead excluded), got %d", min)
-	}
-}
-
-func TestNodeRegistry_GetClusterMinWatermark_SingleNode(t *testing.T) {
-	nr := NewNodeRegistry(1, "localhost:8081")
-	nr.UpdateLocalWatermark(500)
-
-	// Single node cluster, min should be local watermark
-	min := nr.GetClusterMinWatermark()
-	if min != 500 {
-		t.Errorf("Expected min watermark 500, got %d", min)
-	}
-}
+// NodeState.MinAppliedSeq stays on the wire for compat, but the local watermark plumbing that used to read and write
+// it (UpdateLocalWatermark, GetLocalWatermark, GetClusterMinWatermark) is
+// removed: GC's safe position now comes from GCSafePositionFunc
+// (db/transaction.go), driven by consumed positions, not this field.
 
 func TestNodeRegistry_WatermarkGossipPropagation(t *testing.T) {
 	nr := NewNodeRegistry(1, "localhost:8081")
@@ -881,12 +821,12 @@ func TestNodeRegistry_WatermarkGossipPropagation(t *testing.T) {
 
 func TestNodeRegistry_CopyNodeStateIncludesWatermark(t *testing.T) {
 	nr := NewNodeRegistry(1, "localhost:8081")
-	nr.UpdateLocalWatermark(999)
+	nr.Add(&NodeState{NodeId: 2, Address: "localhost:8082", Status: NodeStatus_ALIVE, MinAppliedSeq: 999})
 
 	// Get returns a copy
-	node, _ := nr.Get(1)
+	node, _ := nr.Get(2)
 
-	// Verify watermark is included in copy
+	// Verify the wire-compat field is included in copyNodeState's copy
 	if node.MinAppliedSeq != 999 {
 		t.Errorf("Expected watermark 999 in copy, got %d", node.MinAppliedSeq)
 	}
@@ -1209,5 +1149,145 @@ func TestLeavingThenCrashesSuspect(t *testing.T) {
 	node, _ := nr.Get(2)
 	if node.Status != NodeStatus_SUSPECT {
 		t.Errorf("LEAVING -> SUSPECT should be valid via escalation, got %v", node.Status)
+	}
+}
+
+// TestNodeRegistry_AliveChangedFiresOnAlive pins that AliveChanged wakes its
+// waiters when a peer is discovered ALIVE or turns ALIVE, and not otherwise.
+//
+// Mutation: drop the Notify from fireOnNodeAlive. "discovered ALIVE" fires.
+func TestNodeRegistry_AliveChangedFiresOnAlive(t *testing.T) {
+	nr := NewNodeRegistry(1, "localhost:8081")
+	closed := func(ch <-chan struct{}) bool {
+		select {
+		case <-ch:
+			return true
+		default:
+			return false
+		}
+	}
+
+	ch := nr.AliveChanged()
+	nr.Update(&NodeState{NodeId: 2, Address: "localhost:8082", Status: NodeStatus_ALIVE, Incarnation: 1})
+	if !closed(ch) {
+		t.Fatal("discovered ALIVE did not signal AliveChanged")
+	}
+
+	ch = nr.AliveChanged()
+	nr.Update(&NodeState{NodeId: 3, Address: "localhost:8083", Status: NodeStatus_SUSPECT, Incarnation: 1})
+	if closed(ch) {
+		t.Fatal("a peer discovered SUSPECT signalled AliveChanged")
+	}
+	nr.Update(&NodeState{NodeId: 3, Address: "localhost:8083", Status: NodeStatus_ALIVE, Incarnation: 2})
+	if !closed(ch) {
+		t.Fatal("a peer turning ALIVE did not signal AliveChanged")
+	}
+}
+
+// TestNodeRegistry_AliveChangedFiresOnJoinerPromotion: a joiner that refutes
+// the seed's JOINING record before it marks itself JOINING is ALIVE in the
+// seed's view throughout its catch-up, because MarkJoining does not bump its
+// incarnation. Its promotion must still wake the seed's AliveChanged waiters:
+// a held seed merges claim bases only on that signal or its merge interval,
+// and a catching-up joiner cannot answer the merge.
+//
+// Mutation: signal AliveChanged only when a peer's status turns ALIVE. The
+// promotion does not signal.
+func TestNodeRegistry_AliveChangedFiresOnJoinerPromotion(t *testing.T) {
+	seed := NewNodeRegistry(1, "localhost:8081")
+	joiner := NewNodeRegistry(2, "localhost:8082")
+	gossip := func() {
+		self, _ := joiner.Get(2)
+		seed.Update(self)
+	}
+
+	seed.Add(&NodeState{NodeId: 2, Address: "localhost:8082", Status: NodeStatus_JOINING})
+	rumour, _ := seed.Get(2)
+	joiner.Update(rumour)
+	gossip()
+	if v, _ := seed.Get(2); v.Status != NodeStatus_ALIVE {
+		t.Fatalf("fixture: seed view after the refutation %v, want ALIVE", v.Status)
+	}
+
+	joiner.MarkJoining(2)
+	gossip()
+	ch := seed.AliveChanged()
+	joiner.MarkAlive(2)
+	gossip()
+	select {
+	case <-ch:
+	default:
+		t.Fatal("the joiner's promotion did not signal AliveChanged on the seed")
+	}
+}
+
+// TestNodeRegistry_DiscoveringAnAliveNodeConnectsToIt pins that the ALIVE
+// callback, which opens this node's connection to a
+// peer, fires when gossip first tells us of a peer that is already ALIVE, not
+// only when a known peer turns ALIVE. A wiped node that learned of its
+// restarted seed as ALIVE, from another member, never saw that seed change
+// status again, so it never connected to it and stayed held.
+//
+// Mutation: drop the callback from Update's discovery branch. "a peer
+// discovered ALIVE was never connected" fires, and so does the re-gossip
+// row: the same state again is not a transition either.
+func TestNodeRegistry_DiscoveringAnAliveNodeConnectsToIt(t *testing.T) {
+	nr := NewNodeRegistry(3, "localhost:8083")
+	var connected []uint64
+	nr.SetOnNodeAlive(func(node *NodeState) { connected = append(connected, node.NodeId) })
+
+	nr.Update(&NodeState{NodeId: 1, Address: "localhost:8081", Status: NodeStatus_ALIVE, Incarnation: 1})
+	if len(connected) != 1 || connected[0] != 1 {
+		t.Fatalf("a peer discovered ALIVE was never connected: callbacks for %v", connected)
+	}
+
+	// The restarted seed announces the same state; no second callback is
+	// needed, the connection the first opened reconnects on its own.
+	nr.Update(&NodeState{NodeId: 1, Address: "localhost:8081", Status: NodeStatus_ALIVE, Incarnation: 1})
+	if len(connected) != 1 {
+		t.Fatalf("an unchanged ALIVE peer fired the callback again: %v", connected)
+	}
+
+	// A peer discovered in any other state is connected when it turns ALIVE.
+	nr.Update(&NodeState{NodeId: 2, Address: "localhost:8082", Status: NodeStatus_SUSPECT, Incarnation: 1})
+	if len(connected) != 1 {
+		t.Fatalf("a peer discovered SUSPECT fired the ALIVE callback: %v", connected)
+	}
+	nr.Update(&NodeState{NodeId: 2, Address: "localhost:8082", Status: NodeStatus_ALIVE, Incarnation: 2})
+	if len(connected) != 2 || connected[1] != 2 {
+		t.Fatalf("a peer that turned ALIVE was never connected: %v", connected)
+	}
+}
+
+// A REMOVED member still counts toward the tombstone horizon, and the count
+// survives a restart through the persisted membership.
+func TestNodeRegistry_KnownMemberCountKeepsRemovedMembersAcrossRestart(t *testing.T) {
+	dir := t.TempDir()
+	nr := NewNodeRegistryWithDataDir(1, "localhost:8081", dir)
+	nr.Add(&NodeState{NodeId: 2, Status: NodeStatus_ALIVE})
+	nr.Add(&NodeState{NodeId: 3, Status: NodeStatus_ALIVE})
+	if err := nr.MarkRemoved(3); err != nil {
+		t.Fatalf("MarkRemoved: %v", err)
+	}
+	if got := nr.KnownMemberCount(true); got != 3 {
+		t.Fatalf("KnownMemberCount = %d, want 3 (a REMOVED member counts)", got)
+	}
+
+	restarted := NewNodeRegistryWithDataDir(1, "localhost:8081", dir)
+	if got := restarted.KnownMemberCount(true); got != 3 {
+		t.Fatalf("KnownMemberCount after restart = %d, want 3", got)
+	}
+}
+
+// A seeded node that knows only itself has not learned its membership: the
+// count is unknown (0) until it does. An unseeded, standalone node is a
+// membership of one.
+func TestNodeRegistry_KnownMemberCountUnknownUntilASeededNodeLearnsPeers(t *testing.T) {
+	nr := NewNodeRegistry(1, "localhost:8081")
+	if got := nr.KnownMemberCount(true); got != 0 {
+		t.Fatalf("seeded, alone: KnownMemberCount = %d, want 0", got)
+	}
+	if got := nr.KnownMemberCount(false); got != 1 {
+		t.Fatalf("standalone: KnownMemberCount = %d, want 1", got)
 	}
 }

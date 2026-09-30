@@ -6,6 +6,7 @@ import (
 
 	"github.com/maxpert/marmot/id"
 	"github.com/maxpert/marmot/protocol/query"
+	"github.com/maxpert/marmot/protocol/query/rules"
 	"github.com/maxpert/marmot/protocol/query/transform"
 	"github.com/rs/zerolog/log"
 )
@@ -56,51 +57,12 @@ var (
 	// Load XML pattern (MySQL specific)
 	loadXMLPattern = regexp.MustCompile(`(?i)^\s*LOAD\s+XML\s+`)
 
-	// DDL patterns for MySQL-specific objects not in Vitess
-	createTriggerPattern       = regexp.MustCompile(`(?i)^\s*CREATE\s+TRIGGER\s+`)
-	dropTriggerPattern         = regexp.MustCompile(`(?i)^\s*DROP\s+TRIGGER\s+`)
-	createProcedurePattern     = regexp.MustCompile(`(?i)^\s*CREATE\s+PROCEDURE\s+`)
-	dropProcedurePattern       = regexp.MustCompile(`(?i)^\s*DROP\s+PROCEDURE\s+`)
-	alterProcedurePattern      = regexp.MustCompile(`(?i)^\s*ALTER\s+PROCEDURE\s+`)
-	createFunctionPattern      = regexp.MustCompile(`(?i)^\s*CREATE\s+FUNCTION\s+`)
-	dropFunctionPattern        = regexp.MustCompile(`(?i)^\s*DROP\s+FUNCTION\s+`)
-	alterFunctionPattern       = regexp.MustCompile(`(?i)^\s*ALTER\s+FUNCTION\s+`)
-	createEventPattern         = regexp.MustCompile(`(?i)^\s*CREATE\s+EVENT\s+`)
-	dropEventPattern           = regexp.MustCompile(`(?i)^\s*DROP\s+EVENT\s+`)
-	alterEventPattern          = regexp.MustCompile(`(?i)^\s*ALTER\s+EVENT\s+`)
-	createTablespacePattern    = regexp.MustCompile(`(?i)^\s*CREATE\s+TABLESPACE\s+`)
-	dropTablespacePattern      = regexp.MustCompile(`(?i)^\s*DROP\s+TABLESPACE\s+`)
-	alterTablespacePattern     = regexp.MustCompile(`(?i)^\s*ALTER\s+TABLESPACE\s+`)
-	createLogfileGroupPattern  = regexp.MustCompile(`(?i)^\s*CREATE\s+LOGFILE\s+GROUP\s+`)
-	dropLogfileGroupPattern    = regexp.MustCompile(`(?i)^\s*DROP\s+LOGFILE\s+GROUP\s+`)
-	alterLogfileGroupPattern   = regexp.MustCompile(`(?i)^\s*ALTER\s+LOGFILE\s+GROUP\s+`)
-	createServerPattern        = regexp.MustCompile(`(?i)^\s*CREATE\s+SERVER\s+`)
-	dropServerPattern          = regexp.MustCompile(`(?i)^\s*DROP\s+SERVER\s+`)
-	alterServerPattern         = regexp.MustCompile(`(?i)^\s*ALTER\s+SERVER\s+`)
-	createSpatialRefPattern    = regexp.MustCompile(`(?i)^\s*CREATE\s+SPATIAL\s+REFERENCE\s+SYSTEM\s+`)
-	dropSpatialRefPattern      = regexp.MustCompile(`(?i)^\s*DROP\s+SPATIAL\s+REFERENCE\s+SYSTEM\s+`)
-	createResourceGroupPattern = regexp.MustCompile(`(?i)^\s*CREATE\s+RESOURCE\s+GROUP\s+`)
-	dropResourceGroupPattern   = regexp.MustCompile(`(?i)^\s*DROP\s+RESOURCE\s+GROUP\s+`)
-	alterResourceGroupPattern  = regexp.MustCompile(`(?i)^\s*ALTER\s+RESOURCE\s+GROUP\s+`)
-	dropIndexPattern           = regexp.MustCompile(`(?i)^\s*DROP\s+INDEX\s+`)
-	renameTablePattern         = regexp.MustCompile(`(?i)^\s*RENAME\s+TABLE\s+`)
+	// DDL pattern for an object Vitess does not parse
+	dropIndexPattern = regexp.MustCompile(`(?i)^\s*DROP\s+INDEX\s+`)
 
 	// Vector index DDL patterns
 	createVectorIndexPattern = regexp.MustCompile(`(?i)^\s*CREATE\s+VECTOR\s+INDEX\s+`)
 	dropVectorIndexPattern   = regexp.MustCompile(`(?i)^\s*DROP\s+VECTOR\s+INDEX\s+`)
-
-	// DCL patterns
-	createUserPattern     = regexp.MustCompile(`(?i)^\s*CREATE\s+USER\s+`)
-	dropUserPattern       = regexp.MustCompile(`(?i)^\s*DROP\s+USER\s+`)
-	alterUserPattern      = regexp.MustCompile(`(?i)^\s*ALTER\s+USER\s+`)
-	renameUserPattern     = regexp.MustCompile(`(?i)^\s*RENAME\s+USER\s+`)
-	setPasswordPattern    = regexp.MustCompile(`(?i)^\s*SET\s+PASSWORD\s+`)
-	grantPattern          = regexp.MustCompile(`(?i)^\s*GRANT\s+`)
-	revokePattern         = regexp.MustCompile(`(?i)^\s*REVOKE\s+`)
-	createRolePattern     = regexp.MustCompile(`(?i)^\s*CREATE\s+ROLE\s+`)
-	dropRolePattern       = regexp.MustCompile(`(?i)^\s*DROP\s+ROLE\s+`)
-	setRolePattern        = regexp.MustCompile(`(?i)^\s*SET\s+ROLE\s+`)
-	setDefaultRolePattern = regexp.MustCompile(`(?i)^\s*SET\s+DEFAULT\s+ROLE\s+`)
 )
 
 var globalPipeline *query.Pipeline
@@ -113,8 +75,9 @@ func InitializePipeline(cacheSize int, idGen id.Generator) error {
 	return err
 }
 
-// SchemaLookupFunc returns the auto-increment column name for a table, or empty string if none.
-type SchemaLookupFunc func(table string) string
+// SchemaLookupFunc returns the schema facts an INSERT needs for auto-increment
+// id injection, or nil if the table is unknown.
+type SchemaLookupFunc func(database, table string) *transform.SchemaInfo
 
 // ParseOptions holds options for parsing SQL statements.
 type ParseOptions struct {
@@ -122,6 +85,14 @@ type ParseOptions struct {
 	SchemaProvider    transform.SchemaProvider // For ON CONFLICT target resolution
 	SkipTranspilation bool
 	ExtractLiterals   bool // Enable literal extraction for parameterized execution
+
+	// NarrowIDs mints ids for AUTO_INCREMENT columns declared narrower than
+	// BIGINT. Nil refuses any INSERT that needs one.
+	NarrowIDs rules.NarrowAllocator
+
+	// BoundParams are the statement's bound values, nil for a text query
+	// (query.QueryContext.BoundParams).
+	BoundParams []interface{}
 }
 
 // ParseStatement analyzes a SQL statement and returns its type and metadata.
@@ -135,6 +106,8 @@ func ParseStatement(sql string) Statement {
 func ParseStatementWithOptions(sql string, opts ParseOptions) Statement {
 	ctx := query.NewContext(sql, nil)
 	ctx.SchemaLookup = opts.SchemaLookup
+	ctx.NarrowIDs = opts.NarrowIDs
+	ctx.BoundParams = opts.BoundParams
 	ctx.SchemaProvider = opts.SchemaProvider
 	ctx.SkipTranspilation = opts.SkipTranspilation
 	ctx.ExtractLiterals = opts.ExtractLiterals
@@ -146,9 +119,10 @@ func ParseStatementWithOptions(sql string, opts ParseOptions) Statement {
 			Bool("skip_transpilation", opts.SkipTranspilation).
 			Msg("PARSE: Pipeline processing failed")
 		return Statement{
-			SQL:   sql,
-			Type:  StatementUnsupported,
-			Error: err.Error(),
+			SQL:          sql,
+			Type:         StatementUnsupported,
+			Error:        err.Error(),
+			TranspileErr: ctx.Output.TranspileErr,
 		}
 	}
 
@@ -156,12 +130,14 @@ func ParseStatementWithOptions(sql string, opts ParseOptions) Statement {
 	transpiledSQL := ""
 	var extractedParams []interface{}
 	var paramOrder []bool
+	var boundIDs map[int]uint64
 	if len(ctx.Output.Statements) > 0 {
 		transpiledSQL = ctx.Output.Statements[0].SQL
 		if len(ctx.Output.Statements[0].Params) > 0 {
 			extractedParams = ctx.Output.Statements[0].Params
 		}
 		paramOrder = ctx.Output.Statements[0].ParamOrder
+		boundIDs = ctx.Output.Statements[0].BoundIDs
 	}
 
 	stmt := Statement{
@@ -171,6 +147,7 @@ func ParseStatementWithOptions(sql string, opts ParseOptions) Statement {
 		Error:           errorString(ctx.Output.ValidationErr),
 		ExtractedParams: extractedParams,
 		ParamOrder:      paramOrder,
+		BoundIDs:        boundIDs,
 	}
 
 	// Extract MySQL-specific metadata (if available)
@@ -195,9 +172,10 @@ func ParseStatementWithSchema(sql string, schemaLookup SchemaLookupFunc) Stateme
 			Str("sql_prefix", truncateSQLForLog(sql, 80)).
 			Msg("PARSE: Pipeline processing failed")
 		return Statement{
-			SQL:   sql,
-			Type:  StatementUnsupported,
-			Error: err.Error(),
+			SQL:          sql,
+			Type:         StatementUnsupported,
+			Error:        err.Error(),
+			TranspileErr: ctx.Output.TranspileErr,
 		}
 	}
 
@@ -205,12 +183,14 @@ func ParseStatementWithSchema(sql string, schemaLookup SchemaLookupFunc) Stateme
 	transpiledSQL := ""
 	var extractedParams []interface{}
 	var paramOrder []bool
+	var boundIDs map[int]uint64
 	if len(ctx.Output.Statements) > 0 {
 		transpiledSQL = ctx.Output.Statements[0].SQL
 		if len(ctx.Output.Statements[0].Params) > 0 {
 			extractedParams = ctx.Output.Statements[0].Params
 		}
 		paramOrder = ctx.Output.Statements[0].ParamOrder
+		boundIDs = ctx.Output.Statements[0].BoundIDs
 	}
 
 	stmt := Statement{
@@ -220,6 +200,7 @@ func ParseStatementWithSchema(sql string, schemaLookup SchemaLookupFunc) Stateme
 		Error:           errorString(ctx.Output.ValidationErr),
 		ExtractedParams: extractedParams,
 		ParamOrder:      paramOrder,
+		BoundIDs:        boundIDs,
 	}
 
 	// Extract MySQL-specific metadata (if available)
@@ -244,9 +225,10 @@ func ParseStatementsWithSchema(sql string, schemaLookup SchemaLookupFunc) []Stat
 			Str("sql_prefix", truncateSQLForLog(sql, 80)).
 			Msg("PARSE: Pipeline processing failed")
 		return []Statement{{
-			SQL:   sql,
-			Type:  StatementUnsupported,
-			Error: err.Error(),
+			SQL:          sql,
+			Type:         StatementUnsupported,
+			Error:        err.Error(),
+			TranspileErr: ctx.Output.TranspileErr,
 		}}
 	}
 
@@ -272,6 +254,7 @@ func buildStatement(ctx query.QueryContext, ts query.TranspiledStatement) Statem
 		Error:           errorString(ctx.Output.ValidationErr),
 		ExtractedParams: extractedParams,
 		ParamOrder:      ts.ParamOrder,
+		BoundIDs:        ts.BoundIDs,
 	}
 
 	// Extract MySQL-specific metadata (if available)
@@ -317,16 +300,6 @@ func NormalizeSQLForSQLite(sql string) string {
 	sql = strings.ReplaceAll(sql, `\\`, `\`)
 
 	return sql
-}
-
-// extractTableName extracts table name using a regex pattern
-func extractTableName(sql, pattern string) string {
-	re := regexp.MustCompile(pattern)
-	matches := re.FindStringSubmatch(sql)
-	if len(matches) > 1 {
-		return matches[1]
-	}
-	return ""
 }
 
 // ExtractConsistencyHint extracts consistency hint from SQL comment

@@ -14,10 +14,12 @@ type TxnState struct {
 // TransactionStore manages in-memory transaction state for active transactions.
 // This interface provides fast lookups and updates without disk I/O overhead.
 type TransactionStore interface {
-	// Begin registers a new transaction with initial state.
+	// Begin registers a new transaction with initial state. The store owns
+	// state from then on: the caller must not write it again.
 	Begin(txnID uint64, state *TxnState)
 
 	// Get retrieves transaction state. Returns false if transaction not found.
+	// The state is a snapshot that is never written again: updates replace it.
 	Get(txnID uint64) (*TxnState, bool)
 
 	// UpdateStatus updates transaction status (Pending, Committed, Aborted).
@@ -34,7 +36,8 @@ type TransactionStore interface {
 	RangePending(fn func(txnID uint64) bool)
 
 	// RangeAll iterates over all transactions regardless of status.
-	// Iterator returns true to continue, false to stop.
+	// Iterator returns true to continue, false to stop. Each state is a
+	// snapshot, as from Get.
 	RangeAll(fn func(txnID uint64, state *TxnState) bool)
 
 	// CountPending returns the number of pending transactions.

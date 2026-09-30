@@ -89,3 +89,24 @@ func TestStatement_WithResolvedParams_LeavesOriginalUntouched(t *testing.T) {
 	require.Equal(t, []interface{}{"active"}, original.ExtractedParams)
 	require.Equal(t, []bool{true, false}, original.ParamOrder)
 }
+
+// TestMergeExecParams_BoundIDsReplaceTheCallersValues: a narrow
+// AUTO_INCREMENT placeholder the caller bound to NULL executes with the id
+// the server generated for it, at its own position, interleaved with a
+// pipeline-extracted literal; the caller's slice is not modified.
+//
+// Mutation: skip the BoundIDs loop. NULL reaches SQLite and the first
+// assertion fires.
+func TestMergeExecParams_BoundIDsReplaceTheCallersValues(t *testing.T) {
+	stmt := Statement{
+		SQL:             "INSERT INTO g (group_id, name, kind) VALUES (?, ?, ?)",
+		ExtractedParams: []interface{}{"k"},
+		ParamOrder:      []bool{true, true, false},
+		BoundIDs:        map[int]uint64{0: 42},
+	}
+	wire := []interface{}{nil, "a"}
+	require.Equal(t, []interface{}{int64(42), "a", "k"}, stmt.MergeExecParams(wire))
+	require.Nil(t, wire[0], "MergeExecParams modified the caller's values")
+
+	require.Nil(t, stmt.WithResolvedParams("SELECT 1", nil).BoundIDs, "resolved params kept stale bound ids")
+}
