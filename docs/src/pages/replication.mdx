@@ -109,7 +109,7 @@ This keeps `LOAD DATA LOCAL INFILE` deterministic and durable across cluster mem
 **Step 1: Node 1 (Coordinator) executes locally**
 
 ```
-Time: T1 (TxnID = 0x0001A2B3C4D50001)
+Time: T1 (TxnID = 0x...0001)
       Physical: 1736000000000ms | NodeID: 1 | Logical: 1
 
 Node 1 executes UPDATE on hookDB connection
@@ -121,10 +121,10 @@ Node 1 executes UPDATE on hookDB connection
 **Step 2: Coordinator creates write intent**
 
 ```
-MetaStore Write on Node 1:
-  Key:   /intent/users/users:1
+Row lock on Node 1 (in memory):
+  Key:   users/users:1
   Value: {
-    TxnID: 0x0001A2B3C4D50001,
+    TxnID: 0x...0001,
     NodeID: 1,
     StartTS: {Wall: 1736000000000000000, Logical: 1},
     IntentType: UPDATE,
@@ -138,7 +138,7 @@ MetaStore Write on Node 1:
 gRPC ReplicateTransaction (parallel to both):
 {
   Phase: PREPARE,
-  TxnID: 0x0001A2B3C4D50001,
+  TxnID: 0x...0001,
   NodeID: 1,
   Database: "mydb",
   Statements: [{
@@ -163,13 +163,13 @@ gRPC ReplicateTransaction (parallel to both):
 ```
 Node 2:
   1. Check Cuckoo filter for "users:1" → MISS (no conflict)
-  2. Create write intent: /intent/users/users:1
+  2. Acquire row lock users/users:1 (in memory)
   3. Append encoded row to local cdcseg segment and publish transaction manifest
   4. Return: {Status: SUCCESS, PrepareTS: ...}
 
 Node 3:
   1. Check Cuckoo filter for "users:1" → MISS (no conflict)
-  2. Create write intent: /intent/users/users:1
+  2. Acquire row lock users/users:1 (in memory)
   3. Append encoded row to local cdcseg segment and publish transaction manifest
   4. Return: {Status: SUCCESS, PrepareTS: ...}
 ```
@@ -182,7 +182,7 @@ Node 1 received 2 SUCCESS responses (quorum = 2 for 3-node cluster)
 gRPC ReplicateTransaction to Node 2, Node 3:
 {
   Phase: COMMIT,
-  TxnID: 0x0001A2B3C4D50001,
+  TxnID: 0x...0001,
   CommitTS: {Wall: 1736000000005000000, Logical: 0}
 }
 ```
@@ -317,10 +317,10 @@ source may apply that source's order.
 
 When Node 1 executes `UPDATE users SET balance = 75 WHERE id = 1`:
 
-**DML payload stored in `cdcseg` and referenced by `/cdc_manifest/{txnID}`**:
+**DML payload stored in `cdcseg` and referenced by `/cdc/manifest/{txnID}`**:
 
 ```
-Manifest: /cdc_manifest/0x0001A2B3C4D50001
+Manifest: /cdc/manifest/0x...0001
 Segment range: cdcseg-00000042.log offset=8192 length=148
 
 EncodedCapturedRow (msgpack):
@@ -421,13 +421,11 @@ IntentKey Format: "order_items:c:MTAw:NDI="
 Write intents are **distributed locks** stored in MetaStore:
 
 ```
-Key:   /intent/{tableName}/{intentKey}
+Row lock: (table, intentKey) → txnID, held in memory (RowLockStore); non-DML intents are also persisted under /intent_txn/{txnID}/{table}/{intentKey}
 Value: WriteIntentRecord {
     TxnID, NodeID, StartTS, IntentType,
     Statement, DataSnapshot, MarkedForCleanup
 }
-
-Index: /intent_txn/{txnID}/{tableName}/{intentKey}  // For cleanup
 ```
 
 ### Cuckoo Filter Fast Path
@@ -493,15 +491,15 @@ Time T2: Node 2 starts UPDATE users SET balance = 30 WHERE id = 2
 
 ```
 Time T1: Node 1 starts UPDATE users SET balance = 75 WHERE id = 1
-         TxnID: 0x0001A2B3C4D50001
-         → Creates intent: /intent/users/users:1 → {TxnID: 0x0001A2B3C4D50001}
+         TxnID: 0x...0001
+         → Creates intent: row lock users/users:1 → {TxnID: 0x...0001}
          → Adds to Cuckoo filter: hash("users:1")
 
 Time T2: Node 2 starts UPDATE users SET balance = 50 WHERE id = 1
-         TxnID: 0x0001A2B3C4D60001
+         TxnID: 0x...0002
          → Cuckoo filter check for "users:1" → HIT
-         → Lookup Pebble: /intent/users/users:1
-         → Found intent with different TxnID (0x0001A2B3C4D50001)
+         → Look up row lock: users/users:1
+         → Found intent with different TxnID (0x...0001)
          → Check if overwritable:
            - MarkedForCleanup = false
            - Status = PENDING (not COMMITTED/ABORTED)
@@ -514,7 +512,7 @@ Time T2: Node 2 starts UPDATE users SET balance = 50 WHERE id = 1
 
 ```
 Time T1: Node 1 starts UPDATE users SET balance = 75 WHERE id = 1
-         → Creates intent: /intent/users/users:1
+         → Creates intent: row lock users/users:1
          → Node 1 crashes before COMMIT
 
 Time T2: (10 seconds later, heartbeat timeout)
@@ -524,7 +522,7 @@ Time T2: (10 seconds later, heartbeat timeout)
 
 Time T3: Node 3 starts UPDATE users SET balance = 50 WHERE id = 1
          → Cuckoo filter check → HIT
-         → Lookup Pebble → Found intent
+         → Look up row lock → Found intent
          → Check: MarkedForCleanup = true
          → Overwrite allowed → Creates new intent
          → Transaction succeeds
@@ -534,11 +532,11 @@ Time T3: Node 3 starts UPDATE users SET balance = 50 WHERE id = 1
 
 ```
 Time T1: Node 1 PREPARE phase creates intent for "users:1"
-         TxnID: 0x0001A2B3C4D50001
+         TxnID: 0x...0001
 
 Time T2: Network hiccup, Node 1 retries PREPARE
          → Cuckoo filter check → HIT
-         → Lookup Pebble → Found intent with SAME TxnID
+         → Look up row lock → Found intent with SAME TxnID
          → Update in-place (idempotent)
          → No conflict
 ```
@@ -555,8 +553,8 @@ COMMIT;
 
 ```
 Time T1: Node 1 creates intents for both rows:
-         → /intent/users/users:1 → TxnID: 0x...0001
-         → /intent/users/users:2 → TxnID: 0x...0001
+         → row lock users/users:1 → TxnID: 0x...0001
+         → row lock users/users:2 → TxnID: 0x...0001
 
 Time T2: Node 2 tries UPDATE users SET name = 'Robert' WHERE id = 2
          → Cuckoo filter check for "users:2" → HIT
@@ -591,19 +589,24 @@ data_dir/
 
 | Prefix | Purpose |
 |--------|---------|
-| `/txn/{txnID}` | Transaction records (status, timestamps, statements) |
+| `/txn/{txnID}` | Immutable transaction record (id, node, start ts, database) |
+| `/txn_status/{txnID}` | Transaction status |
+| `/txn_commit/{txnID}` | Commit record |
+| `/txn_idx/txnid/{txnID}` | Transaction index by id (used for streaming) |
+| `/txn_prepared/{txnID}` | Prepared payload |
 | `/txn_idx/pend/{txnID}` | Pending transaction index |
-| `/txn_idx/seq/{seqNum}/{txnID}` | Sequence-ordered index (gap detection) |
-| `/intent/{table}/{intentKey}` | Write intents |
-| `/intent_txn/{txnID}/{table}/{intentKey}` | Intent index by transaction |
-| `/cdc_manifest/{txnID}` | Manifest pointing to the transaction's CDC segment-log range |
-| `/repl/{peerID}/{dbName}` | Replication state per peer |
-| `/schema/{dbName}` | Schema version counter |
-| `/seq/{nodeID}` | Sequence generator (pre-allocated batches) |
+| `/txn_idx/seq/{seqNum}/{txnID}` | Local commit log, in position order |
+| `/intent_txn/{txnID}/{table}/{intentKey}` | Non-DML intents by transaction (DML row locks are in memory) |
+| `/cdc/manifest/{txnID}` | Manifest pointing to the transaction's CDC segment-log range |
+| `/log_seq/current` | Lease end of the local commit log's sequence |
+| `/log_pull_cursor/{peerID}` | This node's pull cursor into a peer's log |
+| `/log_consumed_pos/{peerID}` | How far a peer has consumed this node's log (for GC) |
+| `/log_truncated_through` | Highest log position GC has deleted through |
+| `/log_reapply_pending` | Local-log re-apply after a snapshot restore is pending |
 
 ### CDC Segment Store
 
-The CDC segment store is the local append-only payload store for DML row changes. Pebble keeps the transaction metadata, row-lock indexes, and `/cdc_manifest/{txnID}` pointer; the actual encoded row payloads live in `cdcseg/seg-*.log`.
+The CDC segment store is the local append-only payload store for DML row changes. Pebble keeps the transaction metadata, row-lock indexes, and `/cdc/manifest/{txnID}` pointer; the actual encoded row payloads live in `cdcseg/seg-*.log`.
 
 Each row record is:
 
@@ -619,7 +622,7 @@ CDC segment publication is manifest-based:
 
 1. Encoded row records are appended to the current segment file.
 2. The in-memory transaction manifest tracks row count, first/last row sequence, CRC, and one or more `{segmentID, offset, length}` chunks.
-3. `SealCapturedRows` publishes `/cdc_manifest/{txnID}` in Pebble after the segment ranges are known.
+3. `SealCapturedRows` publishes `/cdc/manifest/{txnID}` in Pebble after the segment ranges are known.
 4. Readers never scan arbitrary segment bytes for committed DML; they read the manifest and then perform bounded `ReadAt` calls over the referenced segment ranges.
 
 This gives atomic visibility: a transaction's CDC payload is visible only when its manifest is visible. A crash before manifest publication leaves unreferenced segment bytes, which are ignored and later reclaimed. A crash after manifest publication leaves a manifest that points to specific validated byte ranges.
@@ -631,7 +634,7 @@ By default Marmot keeps the hot path aligned with Pebble `NoSync`: CDC segment f
 For deployments that require a PREPARE acknowledgement to wait for local CDC segment fsync, enable strict prepare sync:
 
 ```toml
-[meta_store]
+[metastore]
 strict_prepare_sync = true
 ```
 
@@ -641,7 +644,7 @@ or set `MARMOT_CDC_PREPARE_SYNC=strict`. Strict mode waits for the segment sync 
 
 On startup, Marmot validates each segment record in order. If it finds a torn header, short payload, invalid magic/version, oversized payload, or CRC mismatch, it truncates the active tail to the last valid record boundary.
 
-Prepared manifests embedded in segment records can reconstruct prepared CDC state if Pebble metadata was lost after the segment record became durable. For committed transactions, `/cdc_manifest/{txnID}` is the retention root used by streaming replication, catch-up, and delta sync.
+Prepared manifests embedded in segment records can reconstruct prepared CDC state if Pebble metadata was lost after the segment record became durable. For committed transactions, `/cdc/manifest/{txnID}` is the retention root used by read-replica streaming, catch-up, and the anti-entropy log pull (`FetchTransactions`).
 
 GC deletes segment files only when no current manifest, pending prepare, or active writer can reference them. Current and pending segments are retained; old unreferenced segments are pruned with the transaction metadata retention rules.
 
@@ -651,7 +654,7 @@ GC deletes segment files only when no current manifest, pending prepare, or acti
 type TransactionRecord struct {
     TxnID                uint64
     NodeID               uint64
-    SeqNum               uint64      // For gap-free replication
+    SeqNum               uint64      // Position in this node's local commit log
     Status               TxnStatus   // PENDING/COMMITTED/ABORTED
     StartTSWall          int64       // HLC wall time
     StartTSLogical       int32       // HLC logical
@@ -673,18 +676,17 @@ After Node 1's `UPDATE users SET balance = 75 WHERE id = 1` completes:
 **During PREPARE phase (all 3 nodes)**:
 
 ```
-/intent/users/users:1 → WriteIntentRecord{TxnID: 0x0001A2B3C4D50001, ...}
-/intent_txn/0x0001A2B3C4D50001/users/users:1 → (index entry)
-/cdc_manifest/0x0001A2B3C4D50001 → CDCManifest{SegmentID, Offset, Length, RowCount}
-/txn/0x0001A2B3C4D50001 → TransactionRecord{Status: PENDING, ...}
-/txn_idx/pend/0x0001A2B3C4D50001 → (pending index)
+row lock users/users:1 → TxnID 0x...0001 (in memory, not a Pebble key)
+/cdc/manifest/0x...0001 → CDCManifest{SegmentID, Offset, Length, RowCount}
+/txn/0x...0001 → TransactionRecord{Status: PENDING, ...}
+/txn_idx/pend/0x...0001 → (pending index)
 ```
 
 **After COMMIT phase**:
 
 ```
-/txn/0x0001A2B3C4D50001 → TransactionRecord{
-  TxnID: 0x0001A2B3C4D50001,
+/txn/0x...0001 → TransactionRecord{
+  TxnID: 0x...0001,
   NodeID: 1,
   SeqNum: 42,
   Status: COMMITTED,
@@ -692,25 +694,25 @@ After Node 1's `UPDATE users SET balance = 75 WHERE id = 1` completes:
   CommitTSWall: 1736000000005000000,
   DatabaseName: "mydb"
 }
-/txn_idx/seq/42/0x0001A2B3C4D50001 → (sequence index for gap detection)
+/txn_idx/seq/42/0x...0001 → (local commit log entry at seq 42)
 
 -- Deleted (cleanup):
-/intent/users/users:1 → (removed)
-/intent_txn/0x0001A2B3C4D50001/users/users:1 → (removed)
-/txn_idx/pend/0x0001A2B3C4D50001 → (removed)
+row lock users/users:1 → (released)
+/txn_idx/pend/0x...0001 → (removed)
 
--- CDC segment range kept for anti-entropy (GC'd after retention rules allow it):
-/cdc_manifest/0x0001A2B3C4D50001 → (kept for delta sync)
+-- CDC segment range kept for peers' log pulls (GC'd after retention rules allow it):
+/cdc/manifest/0x...0001 → (kept for peers' log pulls)
 ```
 
-**Replication State (per peer)**:
+**Log Pull State (per peer, in mydb's MetaStore)**:
 
 ```
--- On Node 2, tracking what Node 1 has sent:
-/repl/node1/mydb → {LastAppliedTxnID: 0x0001A2B3C4D50001, LastSeqNum: 42}
+-- On Node 2: its cursor into Node 1's log, and how far Node 1 has consumed Node 2's log
+/log_pull_cursor/node1 → (42, 0x...0001)
+/log_consumed_pos/node1 → (last position Node 1 reported)
 
--- On Node 3:
-/repl/node1/mydb → {LastAppliedTxnID: 0x0001A2B3C4D50001, LastSeqNum: 42}
+-- Seq is local: Node 2 logged the same transaction at its own position
+/txn_idx/seq/{node2 seq}/0x...0001
 ```
 
 ---
@@ -758,45 +760,43 @@ On receiving remote timestamp:
 
 1. Take max of: local wall, remote wall, physical now
 2. If same wall time: increment logical beyond both local and remote
-3. If new millisecond: reset logical to 0
-4. **Overflow protection**: Spin-wait if logical exceeds 65535
+3. If the remote wall is the max: logical = remote logical + 1
+4. If physical time is ahead of both and the millisecond changed: reset logical to 0
+5. **Overflow protection**: Spin-wait if logical exceeds 65535
 
 ### Example: HLC and TxnID Generation
 
 **Our UPDATE transaction on Node 1**:
 
 ```
-Physical time: 1736000000000 ms since epoch (Jan 5, 2025 ~12:26 UTC)
+Physical time: 1736000000000 ms since epoch (Jan 4, 2025 14:13:20 UTC)
 Node ID: 1
 Logical: 1 (first transaction this millisecond)
 
 TxnID calculation:
-  Physical bits (42): 1736000000000 << 22 = 0x0001A2B3C4D50000
+  Physical bits (42): 1736000000000 << 22 = 0x650C6A7400000000
   NodeID bits (6):    1 << 16              = 0x0000000000010000
   Logical bits (16):  1                    = 0x0000000000000001
   ─────────────────────────────────────────────────────────────
-  TxnID:              0x0001A2B3C4D50001
+  TxnID:              0x650C6A7400010001
 
 Binary layout:
   |---- 42 bits ----|-- 6 --|-- 16 --|
   |  1736000000000  |   1   |    1   |
 ```
 
+Later examples abbreviate this id as `0x...0001`.
+
 **Conflict resolution using HLC** (Last-Write-Wins):
 
 ```
 Scenario: Two updates to same row arrive at Node 3
 
-Update A (from Node 1):
-  TxnID: 0x0001A2B3C4D50001
-  Wall:  1736000000000ns, Logical: 1
-
-Update B (from Node 2):
-  TxnID: 0x0001A2B3C4D60002
-  Wall:  1736000000001ns, Logical: 2
-
-Comparison: B.Wall > A.Wall → Update B wins
-Result: Node 3 applies Update B (higher timestamp)
+Update A: commit ts (wall=1736000000000000000, logical=1, node=1)
+Update B: commit ts (wall=1736000000001000000, logical=0, node=2)
+Node 3 stamps __marmot_row_version with each applied change's commit ts;
+a change older than the stored (wall, logical, node) is skipped.
+B.wall > A.wall → B wins in either arrival order. Equal wall and logical → higher node wins.
 ```
 
 **Clock advance on message receive**:
@@ -808,9 +808,9 @@ Receives PREPARE from Node 1: Wall=1736000000002, Logical=1
 Update logic:
   localWall (1736000000000) < remoteWall (1736000000002)
   → Set wall = max(local, remote, physicalNow) = 1736000000002
-  → Reset logical = 0 (new millisecond)
+  → Remote wall is the max: logical = remote logical + 1 = 2
 
-Node 2 new clock: Wall=1736000000002, Logical=0
+Node 2 new clock: Wall=1736000000002, Logical=2
 ```
 
 ---
@@ -824,148 +824,147 @@ Repairs divergence caused by:
 - Node restarts with stale data
 - Missed transactions during temporary failures
 
-### Sync Strategy Decision
+### Local Commit Log
 
-```
-Lag Detection:
-  localMaxTxnID vs peerMaxTxnID
-  localTxnCount vs peerTxnCount
+Every node keeps a commit log per database. Each committed transaction gets a position `(seq, txnID)` in it, whether this node coordinated it, took part in its 2PC, or pulled it from a peer. Positions are local: the same transaction has a different `seq` on each node.
 
-Decision:
-  IF lag < DeltaSyncThreshold (default 10K txns)
-     AND timeLag < DeltaSyncThresholdSeconds (default 1hr)
-  THEN → Delta Sync (incremental)
-  ELSE → Snapshot Transfer (full)
-```
+Because a pulled transaction is logged too, a node can receive any transaction from any member that holds it, even when no single peer holds everything it lacks.
 
-### Delta Sync Flow
+### Log Pull Flow
 
-1. **Query peer's replication state**
-2. **Stream transactions** via `StreamChanges` RPC
-3. **Gap detection**: If `event.SeqNum - expectedNext > threshold` → snapshot fallback
-4. **Apply each transaction** via REPLAY phase (bypasses 2PC)
-5. **Update local replication state**
+Anti-entropy runs every `anti_entropy_interval_seconds`. Each round:
 
-### Gap Detection Algorithm
+1. **Reconcile databases**: merge every ALIVE peer's database registry (`ListDatabaseRegistry`), so a missed CREATE or DROP DATABASE is repaired before any log is pulled.
+2. **Pull every ALIVE peer's log** for each database. Each (peer, database) pair has its own deadline, so one slow peer does not hold up the others.
 
-```go
-if event.SeqNum > expectedNextTxn {
-    gap := event.SeqNum - expectedNextTxn
-    if gap > DeltaSyncThresholdTxns {
-        // Transactions GC'd - fall back to snapshot
-        return ErrGapDetected
-    }
-}
-expectedNextTxn = event.SeqNum + 1
-```
+One pull for one pair:
 
-### Snapshot Transfer
+1. **List**: `ListCommittedLog` returns up to 256 entries after the pair's cursor, the peer's truncation point and its schema version. The request also carries how far this node has consumed the peer's log; the peer stores that position for its GC.
+2. **Diff**: an entry whose txn id already has a `__marmot_applied_txn` marker is covered and skipped. Every commit writes its marker in the same SQLite transaction as its rows, whether it came through 2PC or a pull.
+3. **Fetch**: missing ids are fetched with `FetchTransactions`. The peer fails the call for a missing, uncommitted or incomplete transaction rather than send part of one.
+4. **Apply**: each fetched transaction is first written to this node's own log, then applied in one SQLite transaction together with its marker. Rows are stamped with the transaction's commit timestamp in `__marmot_row_version`, and a row a newer version owns is skipped. DDL in the transaction bumps `__marmot_schema_version` in that same SQLite transaction. The commit timestamp is merged into this node's clock.
+5. **Advance the cursor**: the pair's cursor moves over the contiguous prefix of covered entries and is persisted after every page. An entry that cannot be applied yet (a row held by a local write intent, say) keeps the cursor before it while the entries after it still apply.
 
-1. **Get snapshot info**: Files, checksums, txn_id
-2. **Stream chunks**: 4MB each with MD5 verification
-3. **Atomic restore**: Replace database files
-4. **Resume normal replication** from snapshot txn_id
+The marker makes replay idempotent: a crash between logging and applying re-applies the transaction on the next pass, and a transaction reached through two peers applies once. A transaction whose replay fails 5 times in a row is reported STUCK and then retried every 20th pull of its pair.
+
+### Unfinished Local Transactions
+
+Every listed entry is committed in the peer's log. When this node holds the same transaction unfinished:
+
+| Local state | Action |
+|-------------|--------|
+| Prepared | Committed locally with the peer's commit timestamp |
+| Prepared, but its captured rows were lost (crash before sync) | Prepare discarded; the peer's copy is fetched and replayed |
+| Begun, and its PREPARE died with an earlier process | Discarded; the peer's copy is fetched and replayed |
+| Begun, PREPARE still running | Left for a later pull |
+
+### Caught Up and Promotion
+
+A database is caught up when, in the last round, every member's log was reachable and this node's cursor reached each one's stable point.
+
+A JOINING node turns ALIVE only when, for every database, at least one ALIVE peer was pulled and every ALIVE peer's pull succeeded, reached the end of the log and needed no snapshot, and its schema versions match or exceed every ALIVE peer's. The check covers ALIVE peers only, so a member that stays down does not keep a restarted node JOINING.
+
+### Log Truncation
+
+GC deletes a prefix of the local log:
+
+- An entry older than `gc_min_retention_hours` is deleted once every current member has consumed past it. A member that has never reported a position counts as position zero and blocks the deletion.
+- An entry older than `gc_max_retention_hours` is deleted regardless. `0` sets no maximum.
+
+A departed member's consumed position is dropped, so it no longer blocks GC. The truncation point only moves forward.
+
+### Snapshot Fallback
+
+When a peer's truncation point is past this node's cursor into its log, the pull applies nothing and reports that a snapshot is needed. The restore:
+
+1. Durably marks a re-apply of this node's own log as pending.
+2. Restores the database from the ALIVE peer with the highest schema version (ties go to the lowest node id): `GetSnapshotInfo`, then `StreamSnapshot` in `stream_chunk_size_kb` chunks, each checked with MD5 and the file with SHA-256.
+3. Re-applies every entry of this node's own log that the restored file lacks (the markers say which). A failure leaves the mark set, and the next round retries.
+4. On the next pull from each peer, sets that pair's cursor to the peer's truncation point.
+
+### Startup Catch-Up
+
+A starting node picks a seed. With no data of its own it restores a full snapshot. With data, it reconciles the database registry and pulls the seed's log for every database, restoring any database whose cursor the seed has truncated past. A node the pull finds behind is marked JOINING until the promotion check passes.
+
+### Mixed-Version Clusters
+
+A peer that does not serve `ListCommittedLog` is skipped for the round and counts as not caught up. DDL and CREATE/DROP DATABASE return error 1213 (retryable) cluster-wide while any member does not report the log-pull protocol, on the coordinator and on each participant's PREPARE.
+
+### Read Replicas
+
+`StreamChanges` serves read replicas only. A replica starting up compares its max txn id per database with its source's: a gap above `delta_sync_threshold_transactions` takes a snapshot, a smaller one is streamed. Cluster nodes do not use either threshold for catch-up; `delta_sync_threshold_seconds` is only read by config validation, which, with anti-entropy enabled, requires `gc_min_retention_hours` to be at least that long and a `gc_max_retention_hours` above 0 to be at least twice that.
 
 ### Example: Anti-Entropy Scenarios
 
 Using our 3-node cluster with the `users` table:
 
-**Scenario 1: Node 3 Brief Network Partition (Delta Sync)**
+**Scenario 1: Node 3 Brief Network Partition (Log Pull)**
 
 ```
 Timeline:
-  T0: All nodes in sync, SeqNum=40
+  T0: All nodes in sync
   T1: Node 3 loses network for 5 minutes
-  T2: Node 1, Node 2 continue processing:
-      - SeqNum 41: UPDATE users SET balance=75 WHERE id=1
-      - SeqNum 42: INSERT INTO users VALUES (3, 'carol@...', 'Carol', 200)
-      - SeqNum 43: DELETE FROM users WHERE id=2
+  T2: Node 1, Node 2 continue processing (quorum 2 of 3):
+      - TxnID ...0001: UPDATE users SET balance=75 WHERE id=1
+      - TxnID ...0002: INSERT INTO users VALUES (3, 'carol@...', 'Carol', 200)
+      - TxnID ...0003: DELETE FROM users WHERE id=2
   T3: Node 3 reconnects
 
-Anti-Entropy on Node 3:
-  1. Query Node 1: "What's your max SeqNum?" → 43
-  2. Local state: LastSeqNum=40
-  3. Lag = 43 - 40 = 3 transactions (< 10K threshold)
-  4. Decision: Delta Sync
+Anti-Entropy on Node 3, pair (Node 1, mydb):
+  Node 3 → Node 1: ListCommittedLog(after=cursor, consumed=cursor)
+  Node 1 returns: [(41, ...0001), (42, ...0002), (43, ...0003)], truncated=(0,0)
+  Markers: none of the three applied
+  Node 3 → Node 1: FetchTransactions([...0001, ...0002, ...0003])
+  Node 3 applies each with its marker and row versions:
+    - ...0001 → balance=75 for id=1
+    - ...0002 → insert id=3
+    - ...0003 → delete id=2, tombstone for users:2
+  Cursor for (Node 1, mydb) → (43, ...0003)
 
-Delta Sync Flow:
-  Node 3 → Node 1: StreamChanges(fromSeqNum=41)
-  Node 1 streams:
-    {SeqNum: 41, TxnID: 0x...0001, CDC: [UPDATE users...]}
-    {SeqNum: 42, TxnID: 0x...0002, CDC: [INSERT users...]}
-    {SeqNum: 43, TxnID: 0x...0003, CDC: [DELETE users...]}
-
-  Node 3 applies each via REPLAY (bypasses 2PC):
-    - Execute CDC for SeqNum 41 → balance=75 for id=1
-    - Execute CDC for SeqNum 42 → insert id=3
-    - Execute CDC for SeqNum 43 → delete id=2
-
-  Node 3 now in sync: SeqNum=43
+Pair (Node 2, mydb):
+  Node 2's log lists the same three txns at its own positions
+  Markers: all three applied → covered, nothing fetched
+  Cursor for (Node 2, mydb) advances
 ```
 
 **Scenario 2: New Node Joining (Snapshot Transfer)**
 
 ```
 Initial state:
-  Node 1: SeqNum=50000, users table has 10K rows
-  Node 2: SeqNum=50000
+  Node 1, Node 2: users table has 10K rows
   Node 4: New node, empty database
 
-Node 4 joins cluster:
-  1. Gossip announces Node 4 as JOINING
-  2. Anti-entropy runs on Node 4
-  3. Query Node 1: "What's your max SeqNum?" → 50000
-  4. Local state: SeqNum=0
-  5. Lag = 50000 (> 10K threshold)
-  6. Decision: Snapshot Transfer
-
-Snapshot Transfer Flow:
-  Node 4 → Node 1: GetSnapshotInfo(db="mydb")
-  Node 1 returns:
-    {
-      Files: ["mydb.db", "mydb.db-wal"],
-      TotalSize: 50MB,
-      Checksums: {...},
-      AtTxnID: 0x...C350,
-      AtSeqNum: 50000
-    }
-
-  Node 4 → Node 1: StreamSnapshot(db="mydb")
-  Node 1 streams 4MB chunks:
-    Chunk 1: bytes[0..4MB], MD5=abc123
-    Chunk 2: bytes[4MB..8MB], MD5=def456
-    ...
-    Chunk 13: bytes[48MB..50MB], MD5=xyz789
-
-  Node 4 assembles and verifies:
-    - Write chunks to temp file
-    - Verify each chunk MD5
-    - Atomic rename to mydb.db
-    - Set replication state: SeqNum=50000
-
-  Node 4 state: JOINING → ALIVE
+Node 4 starts:
+  1. Startup catch-up: no local data → full snapshot from a seed
+  2. Node 4 → Node 1: GetSnapshotInfo(db="mydb")
+     Node 4 → Node 1: StreamSnapshot(db="mydb")
+       chunks of stream_chunk_size_kb, each with an MD5,
+       file verified with SHA-256
+  3. Anti-entropy rounds pull Node 1's and Node 2's logs;
+     transactions already in the snapshot have markers and are skipped
+  4. Every database promotion-ready, schema versions match
+  5. Node 4: JOINING → ALIVE
 ```
 
-**Scenario 3: Gap Detection (Partial GC)**
+**Scenario 3: Cursor Behind the Truncation Point**
 
 ```
 Timeline:
-  T0: Node 3 offline for 25 hours
-  T1: GC runs on Node 1, Node 2:
-      - Transactions SeqNum 1-1000 are > 24hrs old
-      - Force GC deletes them (gc_max_retention=24hr)
-  T2: Node 3 reconnects, has SeqNum=500
+  T0: Node 3 goes offline
+  T1: Entries on Node 1 pass gc_max_retention_hours (24hr)
+      GC deletes them even though Node 3 has not consumed them
+      Node 1 truncation point → (1000, ...)
+  T2: Node 3 reconnects, its cursor into Node 1's log is (500, ...)
 
-Delta Sync Attempt:
-  Node 3 → Node 1: StreamChanges(fromSeqNum=501)
-  Node 1 scans /txn_idx/seq/:
-    - First available: SeqNum=1001
-    - Requested: SeqNum=501
-    - Gap detected: 501-1000 are missing (GC'd)
+Pull (Node 1, mydb):
+  ListCommittedLog returns truncated=(1000, ...)
+  cursor (500) < truncated (1000) → needs snapshot, nothing applied
 
-  Node 1 returns: ErrGapDetected
-
-  Node 3 falls back to Snapshot Transfer
+Snapshot fallback on Node 3:
+  1. Mark re-apply of its own log pending
+  2. Restore mydb from the ALIVE peer with the highest schema version
+  3. Re-apply entries of Node 3's own log the restored file lacks
+  4. Next pull from each peer starts at that peer's truncation point
 ```
 
 ---
@@ -977,9 +976,10 @@ Delta Sync Attempt:
 | State | Description | Replication |
 |-------|-------------|-------------|
 | `ALIVE` | Healthy, responding | Receives writes |
-| `SUSPECT` | May be dead, awaiting confirmation | Receives writes |
+| `SUSPECT` | May be dead, awaiting confirmation | Excluded |
 | `DEAD` | Confirmed failed | Excluded |
 | `JOINING` | Catching up | Gossip only |
+| `LEAVING` | Graceful shutdown in progress | Excluded |
 | `REMOVED` | Admin removed | Excluded |
 
 ### State Transitions
@@ -989,14 +989,18 @@ New node → JOINING → (catch-up complete) → ALIVE
 ALIVE → (no response for SuspectTimeout) → SUSPECT
 SUSPECT → (no response for DeadTimeout) → DEAD
 SUSPECT → (received message) → ALIVE
+SUSPECT/DEAD → (higher incarnation, node back) → ALIVE
+ALIVE → (graceful stop) → LEAVING
+any → (admin remove) → REMOVED
+REMOVED → (admin allow) → DEAD, then rejoins with a higher incarnation
 ```
 
 ### SWIM Protocol
 
 - **Gossip interval**: 1 second
 - **Fanout**: 3 random peers per round
-- **Suspect timeout**: 15 seconds
-- **Dead timeout**: 30 seconds
+- **Suspect timeout**: 5 seconds (`suspect_timeout_ms`)
+- **Dead timeout**: 10 seconds (`dead_timeout_ms`)
 
 ### Incarnation Numbers
 
@@ -1103,10 +1107,11 @@ DDL automatically rewritten for safe replay:
 
 ### Schema Version Tracking
 
-Each database maintains a version counter:
-- Incremented on every DDL
+Each database keeps its schema version in its own `__marmot_schema_version` table:
+- Bumped in the same SQLite transaction as the DDL, on the node that runs it and on every node that replays it from a log pull
 - Exchanged via gossip
-- Delta sync validates schema version before applying DML
+- A PREPARE whose required schema version is above the participant's local version is refused
+- Anti-entropy restores a snapshot from the peer with the highest schema version
 
 ### Example: DDL Replication for ALTER TABLE
 
@@ -1127,7 +1132,7 @@ T1: Node 1 broadcasts DDL lock acquisition via gossip
 
 T2: Node 1 executes locally
   - ALTER TABLE users ADD COLUMN ...
-  - Increment schema version: /schema/mydb → 2
+  - Bump __marmot_schema_version → 2 (same SQLite transaction)
 
 T3: Node 1 broadcasts DDL to replicas (not CDC, raw SQL)
   gRPC ReplicateDDL:
@@ -1194,15 +1199,15 @@ Node 2:
 |----------|----------|
 | Minority partition | Writes **fail** (cannot achieve quorum) |
 | Majority partition | Writes **succeed** |
-| Partition heals | Delta sync + LWW merges data |
+| Partition heals | Log pull from every ALIVE peer; per-row versions keep the newest image |
 
 ### Node Failure & Recovery
 
 | Scenario | Recovery Method |
 |----------|-----------------|
-| Brief outage (&lt;1hr) | Delta sync from peers |
-| Extended outage | Snapshot transfer |
-| New node joining | Full snapshot + delta sync |
+| Restart with data | Startup log pull from a seed, then log pull from every ALIVE peer; ALIVE once every database is caught up |
+| Down while peers truncated past its cursor (`gc_max_retention_hours`) | Snapshot restore, then re-apply of its own log |
+| New node joining | Full snapshot, then log pull |
 
 ### Transaction Failure
 
@@ -1212,7 +1217,7 @@ Node 2:
 | Partial PREPARE success | Abort if quorum not achieved |
 | COMMIT after remote quorum | Local must succeed (prepared) |
 | Node crash during PREPARE | Heartbeat timeout → intents cleaned |
-| Node crash during COMMIT | Anti-entropy replays from peers |
+| Node crash during COMMIT | Log pull: a prepared txn a peer committed is committed locally; if its rows were lost, it is replayed from the peer |
 
 ### Example: Recovery Scenarios for Our UPDATE
 
@@ -1231,7 +1236,7 @@ T1: Network partition isolates Node 1 from Node 2, Node 3
     - Decision: ABORT
 
   Node 1 rollback:
-    - Delete local intent: /intent/users/users:1
+    - Release local row lock users/users:1
     - Update txn record: Status=ABORTED
     - Return error to client: "quorum not achieved"
 
@@ -1253,7 +1258,7 @@ T2 (+10s): Heartbeat timeout on Node 2
     - Marks intents for cleanup
 
 T3: Cleanup on Node 2, Node 3
-    - Delete intent: /intent/users/users:1
+    - Release row lock users/users:1
     - Update txn: Status=ABORTED
     - Remove from Cuckoo filter
 
@@ -1276,10 +1281,10 @@ State:
 T3: Node 3 restarts
 
 T4: Anti-entropy on Node 3
-  - Local SeqNum = 40 (before crash)
-  - Query Node 1: SeqNum = 41
-  - Delta sync: get SeqNum 41 (our UPDATE)
-  - Apply CDC via REPLAY
+  - Node 1's log lists our UPDATE; Node 3 has no marker for it
+  - Node 3 still holds it prepared → commit it locally with
+    the commit timestamp from Node 1's log entry
+    (rows lost in the crash → discard the prepare, fetch and replay)
   - Node 3 now has balance=75 for id=1
 
 Result: All nodes converged, transaction successful
@@ -1324,16 +1329,17 @@ T3: Decision depends on consistency level
 - Abort transactions without heartbeat for `HeartbeatTimeout` (10s)
 - Clean orphaned write intents
 
-**Phase 2 (Background, skipped under load)**:
-- Delete COMMITTED/ABORTED records older than `GCMinRetention` (2hr)
-- Force delete after `GCMaxRetention` (24hr) regardless of peer state
+**Phase 2 (Background)**:
+- Delete a prefix of the local commit log (below)
+- Purge row-version tombstones, in chunks, once older than `gc_max_retention_hours` times the member count
 
 ### GC Coordination
 
-- Track per-peer replication state
-- Query minimum applied txn_id across peers
-- Only GC transactions all peers have applied
-- **Gap detection** prevents data loss if GC runs while nodes offline
+- Each peer reports, on every `ListCommittedLog` call, how far it has consumed this node's log; the position is stored per peer (`/log_consumed_pos/{peerID}`)
+- The safe position is the minimum across current members; a member that never reported counts as zero
+- An entry older than `gc_min_retention_hours` is deleted only at or below the safe position
+- An entry older than `gc_max_retention_hours` (when above 0) is deleted regardless; a peer whose cursor ends up behind the truncation point restores from a snapshot
+- GC stops at the first entry it may not delete, so the log never has holes, and records the truncation point (`/log_truncated_through`)
 
 ### Example: Garbage Collection Timeline
 
@@ -1341,7 +1347,7 @@ T3: Decision depends on consistency level
 
 ```
 T0: UPDATE users SET balance = 75 WHERE id = 1 committed
-    TxnID: 0x0001A2B3C4D50001, SeqNum: 42
+    TxnID: 0x...0001, at seq 42 in Node 1's log
     All nodes: Status=COMMITTED
 
 T0 + 5s: Phase 1 GC runs
@@ -1351,20 +1357,21 @@ T0 + 5s: Phase 1 GC runs
 
 T0 + 1hr: Phase 2 GC considers deletion
     - Transaction age: 1 hour (< gc_min_retention=2hr)
-    - Skipped: too recent
+    - Stop: too recent
 
-T0 + 2.5hr: Phase 2 GC runs again
+T0 + 2.5hr: Phase 2 GC runs again on Node 1
     - Transaction age: 2.5 hours (> gc_min_retention=2hr)
-    - Check peer replication state:
-      /repl/node2/mydb → LastSeqNum: 42 ✓
-      /repl/node3/mydb → LastSeqNum: 42 ✓
-    - All peers have applied SeqNum 42
+    - Consumed positions of Node 1's log:
+      /log_consumed_pos/node2 → seq 42 ✓
+      /log_consumed_pos/node3 → seq 42 ✓
+    - Safe position = min = seq 42
     - Safe to delete
 
     Cleanup:
-      DELETE /txn/0x0001A2B3C4D50001
-      DELETE /txn_idx/seq/42/0x0001A2B3C4D50001
-      DELETE /cdc_manifest/0x0001A2B3C4D50001
+      DELETE /txn/0x...0001
+      DELETE /txn_idx/seq/42/0x...0001
+      DELETE /cdc/manifest/0x...0001
+      /log_truncated_through → (42, 0x...0001)
       Reclaim unreferenced cdcseg ranges/files
 
 T0 + 2.5hr: MetaStore state after GC
@@ -1376,22 +1383,22 @@ T0 + 2.5hr: MetaStore state after GC
 **GC blocked by lagging peer**:
 
 ```
-T0: Transactions SeqNum 40-50 committed
+T0: Transactions at seq 40-50 committed on Node 1
 
 T1: Node 3 goes offline
 
 T0 + 3hr: Phase 2 GC on Node 1
-    - Check peer states:
-      /repl/node2/mydb → LastSeqNum: 50 ✓
-      /repl/node3/mydb → LastSeqNum: 39 ✗ (offline, stale)
-    - Minimum across peers: 39
-    - Cannot GC SeqNum 40-50 (Node 3 hasn't applied them)
-    - Skip cleanup to preserve delta sync capability
+    - Consumed positions:
+      /log_consumed_pos/node2 → seq 50 ✓
+      /log_consumed_pos/node3 → seq 39 ✗ (offline, stale)
+    - Safe position = min = seq 39
+    - Cannot delete seq 40-50 (Node 3 hasn't consumed them)
 
-T0 + 25hr: Force GC kicks in (> gc_max_retention=24hr)
-    - Transaction SeqNum 40-50 are > 24 hours old
-    - Force delete regardless of peer state
-    - Node 3 will need snapshot transfer when it returns
+T0 + 25hr: Max retention kicks in (> gc_max_retention=24hr)
+    - Entries at seq 40-50 are > 24 hours old
+    - Deleted regardless of consumed positions
+    - Node 3's cursor is now behind Node 1's truncation point:
+      it restores from a snapshot when it returns
 ```
 
 ---
@@ -1463,9 +1470,8 @@ This section traces our `UPDATE users SET balance = 75 WHERE id = 1` through the
 │  Cuckoo filter: Add hash("users:1")                                         │
 │  Mutex: Lock shard[hash("users:1") % 256]                                   │
 │  MetaStore write:                                                           │
-│    /intent/users/users:1 → {TxnID: 0x...0001, Status: PENDING}             │
-│    /intent_txn/0x...0001/users/users:1 → (index)                           │
-│    /cdc_manifest/0x...0001 → {SegmentID, Offset, Length, RowCount}         │
+│    row lock users/users:1 → TxnID 0x...0001 (in memory)                      │
+│    /cdc/manifest/0x...0001 → {SegmentID, Offset, Length, RowCount}         │
 │    /txn/0x...0001 → {Status: PENDING, SeqNum: 42}                          │
 │                                                                              │
 │  T3: 2PC PREPARE PHASE (parallel to Node 2, Node 3)                         │
@@ -1492,7 +1498,7 @@ This section traces our `UPDATE users SET balance = 75 WHERE id = 1` through the
 │                                                                              │
 │  Node 1 ──gRPC──→ Node 2: ReplicateTransaction(COMMIT)                      │
 │           │                  ↓                                               │
-│           │                Read encoded row via /cdc_manifest/0x...0001     │
+│           │                Read encoded row via /cdc/manifest/0x...0001     │
 │           │                Generate: UPDATE users SET ... WHERE id=1        │
 │           │                Execute on SQLite                                 │
 │           │                Update /txn/0x...0001 → COMMITTED                │
@@ -1521,24 +1527,22 @@ This section traces our `UPDATE users SET balance = 75 WHERE id = 1` through the
 │  T7: BACKGROUND CLEANUP (async)                                              │
 │  ═════════════════════════════                                              │
 │  All nodes:                                                                  │
-│    - Delete /intent/users/users:1                                           │
-│    - Delete /intent_txn/0x...0001/users/users:1                             │
+│    - Release row lock users/users:1                                          │
 │    - Remove from Cuckoo filter                                              │
 │    - Move /txn_idx/pend/0x...0001 → /txn_idx/seq/42/0x...0001              │
 │                                                                              │
-│  T8: GOSSIP PROPAGATION                                                      │
-│  ═══════════════════════                                                    │
-│  Node 1 gossips to random peers:                                            │
-│    {Type: TXN_COMMITTED, TxnID: 0x...0001, SeqNum: 42}                      │
-│  Replication state updated:                                                 │
-│    /repl/node1/mydb → {LastSeqNum: 42}                                      │
+│  T8: LATER ANTI-ENTROPY ROUNDS                                               │
+│  ═════════════════════════════                                               │
+│  Each node pulls its peers' logs; our txn already has a                      │
+│  __marmot_applied_txn marker everywhere, so it is skipped                    │
+│  and each pull cursor moves past it                                          │
 │                                                                              │
 │  T9: FINAL STATE (all nodes)                                                 │
 │  ════════════════════════════                                               │
 │  SQLite: users.balance = 75 WHERE id = 1                                    │
 │  MetaStore:                                                                 │
 │    /txn/0x...0001 → {Status: COMMITTED, SeqNum: 42}                        │
-│    /cdc_manifest/0x...0001 → cdcseg range kept for anti-entropy            │
+│    /cdc/manifest/0x...0001 → cdcseg range kept for anti-entropy            │
 │  Cuckoo filter: "users:1" removed                                           │
 │                                                                              │
 │  T10: GC (after 2+ hours)                                                    │
@@ -1563,8 +1567,8 @@ read_timeout_ms = 2000
 enable_anti_entropy = true
 anti_entropy_interval_seconds = 30
 gc_interval_seconds = 60
-delta_sync_threshold_transactions = 10000
-delta_sync_threshold_seconds = 3600
+delta_sync_threshold_transactions = 10000   # read-replica bootstrap: snapshot above this txn-id gap
+delta_sync_threshold_seconds = 3600         # only checked against the gc_*_retention_hours values
 
 # Garbage Collection
 gc_min_retention_hours = 2
@@ -1599,8 +1603,12 @@ dead_timeout_ms = 10000
 | `db/intent_filter.go` | Cuckoo filter for conflict detection |
 | `db/transaction.go` | Transaction lifecycle, GC |
 | `grpc/replication_handler.go` | Remote 2PC phase handling |
-| `grpc/anti_entropy.go` | Background sync coordination |
-| `grpc/delta_sync.go` | Incremental catch-up |
+| `grpc/anti_entropy.go` | Anti-entropy rounds, snapshot fallback, promotion readiness |
+| `grpc/log_puller.go` | Pulls a peer's commit log (cursor, markers, STUCK tracking) |
+| `grpc/log_server.go` | Serves `ListCommittedLog` and `FetchTransactions` |
+| `grpc/catch_up.go` | Startup catch-up and snapshot restore |
+| `db/replay_apply.go` | Applies pulled transactions with their markers |
+| `db/row_version.go` | Per-row versions and tombstone purge |
 | `grpc/gossip.go` | SWIM protocol, membership |
 | `hlc/clock.go` | Hybrid Logical Clock |
 | `publisher/` | CDC publishing system |

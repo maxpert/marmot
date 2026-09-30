@@ -171,7 +171,7 @@ Marmot v2 uses a fundamentally different architecture from other SQLite replicat
 
 **How It Works:**
 1. **Write Coordination**: 2PC (Two-Phase Commit) with configurable consistency (ONE, QUORUM, ALL)
-2. **Conflict Resolution**: Last-Write-Wins (LWW) with HLC timestamps
+2. **Conflict Resolution**: Per-row Last-Write-Wins (LWW) on the transaction's commit HLC timestamp
 3. **Cluster Membership**: SWIM-style gossip with failure detection
 4. **Data Replication**: Full database replication - all nodes receive all data
 5. **DDL Replication**: Cluster-wide schema changes with automatic idempotency
@@ -209,12 +209,16 @@ Marmot v2 supports **distributed DDL (Data Definition Language) replication** wi
    → DROP TABLE IF EXISTS users
    ```
 
-3. **Schema Version Tracking**: Each database maintains a schema version counter
+3. **Schema Version Tracking**: Each database maintains a schema version counter (`__marmot_schema_version`)
    - Incremented on every DDL operation
    - Exchanged via gossip protocol for drift detection
-   - Used by delta sync to validate transaction applicability
+   - A joining node is not promoted until its schema versions match or exceed its alive peers'; anti-entropy restores a
+     snapshot from the peer with the highest schema version
 
-4. **Quorum-Based Replication**: DDL replicates like DML through the same 2PC mechanism
+4. **Rolling Upgrades**: DDL and `CREATE`/`DROP DATABASE` return the retryable error 1213 while any cluster member does
+   not serve the commit-log pull protocol (an older release). Upgrade every node, then retry.
+
+5. **Quorum-Based Replication**: DDL replicates like DML through the same 2PC mechanism
    - No special master node needed
    - Works with existing consistency levels (QUORUM, ALL, etc.)
 
@@ -253,7 +257,7 @@ Marmot v2 uses **Change Data Capture (CDC)** for replication instead of SQL stat
 - **Performance**: Binary format is more efficient than SQL text
 - **Reliability**: No issues with SQL syntax variations between MySQL and SQLite
 - **Lower Write Amplification**: Row payloads are not duplicated into Pebble intent keys; Pebble tracks transaction metadata and row locks while the CDC segment log stores DML bytes
-- **Atomic CDC Publication**: DML bytes become visible through `/cdc_manifest/{txnID}` only after their segment ranges are known; recovery validates and truncates segment tails at record boundaries
+- **Atomic CDC Publication**: DML bytes become visible through `/cdc/manifest/{txnID}` only after their segment ranges are known; recovery validates and truncates segment tails at record boundaries
 
 ### Row Key Extraction
 
@@ -746,52 +750,59 @@ Marmot handles various failure and recovery scenarios automatically:
 |----------|----------|
 | **Minority partition** | Writes **fail** - cannot achieve quorum |
 | **Majority partition** | Writes **succeed** - quorum achieved |
-| **Partition heals** | Delta sync + LWW merges divergent data |
+| **Partition heals** | Anti-entropy log pull + per-row LWW merges divergent data |
 
 **How it works:**
 1. During partition, only the majority side can commit writes (quorum enforcement)
-2. When partition heals, nodes exchange transaction logs via `StreamChanges` RPC
-3. Conflicts resolved using Last-Writer-Wins (LWW) with HLC timestamps
-4. Higher node ID breaks ties for simultaneous writes
+2. When partition heals, each node pulls the commit logs of its alive peers (see Anti-Entropy below)
+3. Each row keeps the version of its last change; an older change never overwrites a newer one (per-row LWW)
+4. For equal HLC timestamps, the higher node ID wins
 
 ### Node Failure & Recovery
 
 | Scenario | Recovery Method |
 |----------|-----------------|
-| **Brief outage** | Delta sync - replay missed transactions |
-| **Extended outage** | Snapshot transfer + delta sync |
+| **Brief outage** | Log pull - fetch the transactions it missed from every alive peer |
+| **Outage longer than log retention** | Snapshot transfer, then log pull from the snapshot onward |
 | **New node joining** | Full snapshot from existing node |
+
+A node's membership is persisted. A restarted node is not a quorum by itself, and a gracefully stopped node rejoins
+on restart. A node marked REMOVED stays out until an operator allows it back (see Cluster Membership Management).
 
 **Anti-Entropy Background Process:**
 
-Marmot v2 includes an automatic anti-entropy system that continuously monitors and repairs replication lag across the cluster:
+Every `anti_entropy_interval_seconds` (default 30), each node pulls every alive peer's local commit log, for every
+database:
 
-1. **Lag Detection**: Every 30 seconds (configurable), each node queries peers for their replication state
-2. **Smart Recovery Decision**:
-   - **Delta Sync** if lag < 10,000 transactions AND < 1 hour: Streams missed transactions incrementally
-   - **Snapshot Transfer** if lag exceeds thresholds: Full database file transfer for efficiency
-3. **Gap Detection**: Detects when transaction logs have been GC'd and automatically falls back to snapshot
-4. **Multi-Database Support**: Tracks and syncs each database independently
-5. **GC Coordination**: Garbage collection respects peer replication state - logs aren't deleted until all peers have applied them
+1. **Durable cursors**: Each (peer, database) pair has its own cursor, persisted after every page, so a restart resumes
+   where it stopped. The node lists the peer's committed log entries after the cursor (`ListCommittedLog` RPC) and
+   fetches the transactions it lacks (`FetchTransactions` RPC).
+2. **Exactly once**: A replayed transaction writes an applied marker (`__marmot_applied_txn`) in the same SQLite
+   transaction, so a transaction received from several peers applies once.
+3. **Unfinished local transactions**: A transaction left prepared locally that a peer committed is committed locally
+   with the peer's commit timestamp. An abandoned local begin is discarded and the transaction replayed. A prepare
+   whose rows were lost is discarded and replayed from the peer.
+4. **Snapshot fallback**: If a peer has truncated its log past this node's cursor, the node restores the database from a
+   snapshot, re-applies its own local log, and resumes pulling.
+5. **Promotion**: A joining node turns ALIVE only once every database has caught up with its alive peers.
 
-**Delta Sync Process:**
-1. Lagging node queries `last_applied_txn_id` for each peer/database
-2. Requests transactions since that ID via `StreamChanges` RPC
-3. **Gap Detection**: Checks if first received txn_id has a large gap from requested ID
-   - If gap > delta_sync_threshold_txns, indicates missing (GC'd) transactions
-   - Automatically falls back to snapshot transfer to prevent data loss
-4. Applies changes using LWW conflict resolution
-5. Updates replication state tracking (per-database)
-6. Progress logged every 100 transactions
+**Log Garbage Collection:**
+- A log entry is deleted once every current member has consumed it and it is older than `gc_min_retention_hours`
+- An entry older than `gc_max_retention_hours` is deleted regardless; a member that was down longer restores by snapshot
+- A departed member's consumed position is dropped, so it no longer holds back GC
+- DELETE tombstones in the row-version table are purged in chunks, once they are older than the member count times
+  `gc_max_retention_hours`, and never when `gc_max_retention_hours` is 0
 
-**GC Coordination with Anti-Entropy:**
-- Transaction logs are retained with a two-tier policy:
-  - **Min retention** (2 hours): Must be >= delta sync threshold, respects peer lag
-  - **Max retention** (24 hours): Force delete after this time to prevent unbounded growth
-- Config validation enforces: `gc_min >= delta_threshold` and `gc_max >= 2x delta_threshold`
-- Each database tracks replication progress per peer
-- GC queries minimum applied txn_id across all peers before cleanup
-- **Gap detection** prevents data loss if GC runs while nodes are offline
+**Commit Timestamps and Per-Row Versions:**
+- The coordinator merges the participants' PREPARE clocks and picks one commit HLC timestamp, sent on COMMIT and
+  stored in the log. Every node commits with it and merges it into its clock; on startup the clock is seeded past the
+  highest recorded commit.
+- Every applied row change stamps `__marmot_row_version` (table, key, timestamp, node, tombstone flag) in the same
+  SQLite transaction. An incoming change applies only if its version is at least the stored one.
+- A DELETE leaves a tombstone, so an older INSERT or UPDATE cannot bring the row back. A primary-key change stamps
+  both the old and the new key. `LOAD DATA` stamps every row.
+- DDL keeps versions consistent: dropping a table removes its versions, renaming re-keys them, and changing a table's
+  primary key clears them.
 
 ### Consistency Guarantees
 
@@ -802,8 +813,9 @@ Marmot v2 includes an automatic anti-entropy system that continuously monitors a
 | `ALL` | Returns after all nodes ACK (slow, most durable) |
 
 **Conflict Resolution:**
-- All conflicts resolved via LWW using HLC timestamps
-- No data loss - later write always wins deterministically
+- Concurrent writes to the same row conflict at PREPARE (write intents); only one commits
+- Replicated and replayed changes resolve per row via LWW on the commit HLC timestamp, so every node converges on the
+  same row regardless of the order changes arrive
 - Tie-breaker: higher node ID wins for equal timestamps
 
 ## Limitations
@@ -840,7 +852,8 @@ TiDB's answer? "Use strings." But that breaks ORMs, existing application code, a
 
 ### Marmot's Solution: Compact ID Mode
 
-Marmot offers **two ID generation modes** to solve this:
+For `BIGINT AUTO_INCREMENT` columns, Marmot offers **two ID generation modes** to solve this (narrower columns are
+covered in [Narrow AUTO_INCREMENT Columns](#narrow-auto_increment-columns)):
 
 | Mode | Bits | Range | Use Case |
 |------|------|-------|----------|
@@ -869,31 +882,47 @@ JSON.parse('{"id": 4503599627370496}');  // {id: 4503599627370496} - Correct!
 
 ### How Auto-Increment Works
 
-> **Note:** Marmot automatically converts `INT AUTO_INCREMENT` to `BIGINT` to support distributed ID generation.
-
-1. **DDL Transformation**: When you create a table with `AUTO_INCREMENT`:
+1. **DDL Transformation**: An integer `AUTO_INCREMENT` column is stored as SQLite `INTEGER`. A column declared narrower
+   than `BIGINT` keeps its declared width (and `UNSIGNED`) in a comment marker in the stored schema.
    ```sql
-   CREATE TABLE users (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(100))
+   CREATE TABLE users (id BIGINT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(100))
    -- Becomes internally:
-   CREATE TABLE users (id BIGINT PRIMARY KEY, name TEXT)
+   CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)
    ```
 
-2. **DML ID Injection**: When inserting with `0` or `NULL` for an auto-increment column:
+2. **DML ID Injection**: When inserting with `0` or `NULL` for a `BIGINT` auto-increment column:
    ```sql
    INSERT INTO users (id, name) VALUES (0, 'alice')
    -- Becomes internally (compact mode):
    INSERT INTO users (id, name) VALUES (4503599627370496, 'alice')
    ```
 
-3. **Explicit IDs Preserved**: If you provide an explicit non-zero ID, it is used as-is.
+3. **Explicit IDs Preserved**: If you provide an explicit non-zero ID in a `BIGINT` column, it is used as-is.
 
 **Schema-Based Detection:**
 
 Marmot automatically detects auto-increment columns by querying SQLite schema directly:
-- Single-column `INTEGER PRIMARY KEY` (SQLite rowid alias)
+- Single-column `INTEGER PRIMARY KEY` (SQLite rowid alias), with the declared width read from its marker
 - Single-column `BIGINT PRIMARY KEY` (Marmot's transformed columns)
 
 No registration required - columns are detected from schema at runtime, works across restarts, and works with existing databases.
+
+### Narrow AUTO_INCREMENT Columns
+
+`TINYINT`, `SMALLINT`, `MEDIUMINT` and `INT` `AUTO_INCREMENT` columns get ids that fit their declared width. Each node
+takes ids from ranges of the column it claims through a quorum two-phase commit, so no two nodes issue the same id
+while cluster membership is stable.
+
+- On a node that is still merging claim bases from its peers after startup, an insert waits up to
+  `transaction.lock_wait_timeout_seconds` and then returns the retryable 1205; inside a transaction that has already
+  written a row, it returns 1205 at once.
+- An explicit id outside the declared width returns 1264; an id another node may issue returns 1235; a column whose
+  ids are used up returns 1062.
+- Ids are not reset by `DROP TABLE`/`CREATE TABLE` or `DROP DATABASE`/`CREATE DATABASE`.
+
+The full rules are in [Compatibility](https://maxpert.github.io/marmot/compatibility#narrow-auto_increment-columns);
+adding or removing nodes follows the procedure in
+[Operations](https://maxpert.github.io/marmot/operations#membership-changes-and-narrow-auto_increment-ids).
 
 ## Configuration
 
@@ -914,6 +943,9 @@ heartbeat_timeout_seconds = 10  # Transaction timeout without heartbeat
 conflict_window_seconds = 10    # Conflict resolution window
 lock_wait_timeout_seconds = 50  # Lock wait timeout (MySQL: innodb_lock_wait_timeout)
 ```
+
+An insert into a narrow `AUTO_INCREMENT` column also waits up to `lock_wait_timeout_seconds` while its node is still
+merging claim bases after startup (see [Narrow AUTO_INCREMENT Columns](#narrow-auto_increment-columns)).
 
 **Note**: Transaction log garbage collection is managed by the replication configuration to coordinate with anti-entropy. See `replication.gc_min_retention_hours` and `replication.gc_max_retention_hours`.
 
@@ -957,6 +989,8 @@ gossip_interval_ms = 1000      # Gossip interval
 gossip_fanout = 3              # Number of peers to gossip to
 suspect_timeout_ms = 5000      # Suspect timeout
 dead_timeout_ms = 10000        # Dead timeout
+autoinc_merge_interval_ms = 2000       # Narrow AUTO_INCREMENT: retry merging claim bases while votes are held
+autoinc_base_sync_interval_ms = 10000  # Narrow AUTO_INCREMENT: raise claim bases to every alive peer's
 ```
 
 ### Security
@@ -1089,34 +1123,32 @@ default_read_consistency = "LOCAL_ONE"    # Read consistency level
 write_timeout_ms = 5000                   # Write operation timeout
 read_timeout_ms = 2000                    # Read operation timeout
 
-# Anti-Entropy: Background healing for eventual consistency
-# - Detects and repairs divergence between replicas
-# - Uses delta sync for small lags, snapshot for large lags
-# - Includes gap detection to prevent incomplete data after GC
-enable_anti_entropy = true                 # Enable automatic catch-up for lagging nodes
-anti_entropy_interval_seconds = 30         # How often to check for lag (default: 30s)
+# Anti-Entropy: each node pulls every alive peer's commit log (snapshot when a peer's log no longer covers it)
+enable_anti_entropy = true                 # Enable the background log pull
+anti_entropy_interval_seconds = 30         # How often each node pulls its peers' logs (default: 30s)
 gc_interval_seconds = 60                   # GC interval (MUST be >= anti_entropy_interval)
-delta_sync_threshold_transactions = 10000  # Delta sync if lag < 10K txns
-delta_sync_threshold_seconds = 3600        # Snapshot if lag > 1 hour
+delta_sync_threshold_transactions = 10000  # Read replicas only: snapshot instead of catch-up above this txn gap
+delta_sync_threshold_seconds = 3600        # Only used by the GC retention checks below
 
 # Garbage Collection: Reclaim disk space by deleting old transaction records
-# - gc_interval must be >= anti_entropy_interval (validated at startup)
-# - gc_min must be >= delta_sync_threshold (validated at startup)
-# - gc_max should be >= 2x delta_sync_threshold (recommended)
+# - A log entry is deleted once every member consumed it and it is older than gc_min,
+#   or once it is older than gc_max regardless
 # - Set gc_max = 0 for unlimited retention
-gc_min_retention_hours = 2   # Keep at least 2 hours (>= 1 hour delta threshold)
-gc_max_retention_hours = 24  # Force delete after 24 hours
+gc_min_retention_hours = 2
+gc_max_retention_hours = 24
 ```
 
 **Anti-Entropy Tuning:**
 - **Small clusters (2-3 nodes)**: Use default settings (30s AE, 60s GC)
 - **Large clusters (5+ nodes)**: Consider increasing AE interval to 60-120s and GC to 2x that value
-- **High write throughput**: Increase `delta_sync_threshold_transactions` to 50000+
-- **Long-running clusters**: Keep `gc_max_retention_hours` at 24+ to handle extended outages
+- **Long-running clusters**: Keep `gc_max_retention_hours` at 24+ so a node down for a while catches up from the log
+  instead of a snapshot
 
-**GC Configuration Rules (Validated at Startup):**
+**GC Configuration Rules (validated at startup when `enable_anti_entropy` is true):**
+- `gc_interval_seconds` must be >= `anti_entropy_interval_seconds`
 - `gc_min_retention_hours` must be >= `delta_sync_threshold_seconds` (in hours)
-- `gc_max_retention_hours` should be >= 2x `delta_sync_threshold_seconds`
+- `gc_max_retention_hours` must be >= 2x `delta_sync_threshold_seconds` (in hours) and > `gc_min_retention_hours`,
+  unless it is 0 (unlimited)
 - Violating these rules will cause startup failure with helpful error messages
 
 ### Query Pipeline

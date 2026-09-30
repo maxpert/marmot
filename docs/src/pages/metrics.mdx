@@ -64,10 +64,14 @@ curl http://localhost:8080/metrics
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
 | `marmot_v2_antientropy_rounds_total` | Counter | - | Total anti-entropy rounds executed |
-| `marmot_v2_antientropy_syncs_total` | Counter | `type`, `result` | Anti-entropy syncs by type (delta, snapshot) and result |
+| `marmot_v2_antientropy_syncs_total` | Counter | `type`, `result` | Snapshot restores by result (`success`, `failed`); `type` is always `snapshot` |
 | `marmot_v2_antientropy_duration_seconds` | Histogram | - | Anti-entropy round duration in seconds |
-| `marmot_v2_replication_lag_txns` | Gauge | `peer` | Transaction lag behind peer |
-| `marmot_v2_delta_sync_txns_total` | Counter | - | Total transactions applied via delta sync |
+| `marmot_v2_log_pull_txns_applied_total` | Counter | - | Transactions applied by pulling peers' local commit logs |
+| `marmot_v2_log_pull_pair_results_total` | Counter | `outcome` | Per-(peer, database) pulls by outcome: `caught_up`, `behind`, `needs_snapshot`, `unimplemented`, `error` |
+| `marmot_v2_anti_entropy_stuck_txns` | Gauge | `database` | Pulled transactions no longer retried every round after repeated replay failures |
+| `marmot_v2_replication_lag_txns` | Gauge | `peer` | Registered but not currently updated |
+
+There is no delta sync counter: anti-entropy is a log pull, counted by the `log_pull_*` metrics.
 
 ## Histogram Buckets
 

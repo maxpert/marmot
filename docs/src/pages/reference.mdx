@@ -82,7 +82,11 @@ gossip_interval_ms = 1000      # Gossip interval
 gossip_fanout = 3              # Number of peers to gossip to
 suspect_timeout_ms = 5000      # Suspect timeout
 dead_timeout_ms = 10000        # Dead timeout
+autoinc_merge_interval_ms = 2000       # Retry interval for merging narrow AUTO_INCREMENT claim bases while votes are held
+autoinc_base_sync_interval_ms = 10000  # Interval for raising claim bases to every alive peer's
 ```
+
+The two `autoinc_*` intervals drive narrow (`TINYINT`/`SMALLINT`/`MEDIUMINT`/`INT`) `AUTO_INCREMENT` id ranges. `0` selects the default and negative values fail validation. `autoinc_base_sync_interval_ms` bounds how long a claim committed before a membership change can stay unknown to a new quorum. See [Compatibility](/compatibility) and [Operations](/operations).
 
 ## Replication
 
@@ -93,35 +97,45 @@ default_read_consistency = "LOCAL_ONE"    # Read consistency level
 write_timeout_ms = 5000                   # Write operation timeout
 read_timeout_ms = 2000                    # Read operation timeout
 
-# Anti-Entropy: Background healing for eventual consistency
-# - Detects and repairs divergence between replicas
-# - Uses delta sync for small lags, snapshot for large lags
-# - Includes gap detection to prevent incomplete data after GC
-enable_anti_entropy = true                 # Enable automatic catch-up for lagging nodes
-anti_entropy_interval_seconds = 30         # How often to check for lag (default: 30s)
+# Anti-Entropy: each round pulls every alive peer's local commit log from a
+# durable per-(peer, database) cursor; falls back to a snapshot when a peer's
+# log is truncated past that cursor
+enable_anti_entropy = true                 # Enable anti-entropy log pull
+anti_entropy_interval_seconds = 30         # Interval between rounds (default: 30s)
 gc_interval_seconds = 60                   # GC interval (MUST be >= anti_entropy_interval)
-delta_sync_threshold_transactions = 10000  # Delta sync if lag < 10K txns
-delta_sync_threshold_seconds = 3600        # Snapshot if lag > 1 hour
+delta_sync_threshold_transactions = 10000  # Read replica only: bootstrap snapshot if gap > this
+delta_sync_threshold_seconds = 3600        # Only used by the GC validation rules below
 
-# Garbage Collection: Reclaim disk space by deleting old transaction records
-# - gc_interval must be >= anti_entropy_interval (validated at startup)
-# - gc_min must be >= delta_sync_threshold (validated at startup)
-# - gc_max should be >= 2x delta_sync_threshold (recommended)
-# - Set gc_max = 0 for unlimited retention
-gc_min_retention_hours = 2   # Keep at least 2 hours (>= 1 hour delta threshold)
-gc_max_retention_hours = 24  # Force delete after 24 hours
+# Garbage Collection: deletes committed log entries once every current member
+# has consumed them and they are older than gc_min, or unconditionally once
+# they are older than gc_max
+gc_min_retention_hours = 2   # Minimum age before a consumed entry is deleted
+gc_max_retention_hours = 24  # Entries older than this are deleted regardless; 0 = no maximum
 ```
 
 **Anti-Entropy Tuning:**
 - **Small clusters (2-3 nodes)**: Use default settings (30s AE, 60s GC)
 - **Large clusters (5+ nodes)**: Consider increasing AE interval to 60-120s and GC to 2x that value
-- **High write throughput**: Increase `delta_sync_threshold_transactions` to 50000+
-- **Long-running clusters**: Keep `gc_max_retention_hours` at 24+ to handle extended outages
+- **Long-running clusters**: Keep `gc_max_retention_hours` at 24+ to handle extended outages. A node whose cursor falls behind a peer's truncated log restores that database by snapshot
+- `gc_max_retention_hours = 0` sets no maximum: an entry is kept until every current member has consumed it, and row-version tombstones are never purged
 
-**GC Configuration Rules (Validated at Startup):**
+**Legacy `delta_sync_*` keys:** cluster nodes no longer run a delta sync. `delta_sync_threshold_transactions` is read only by a read replica at bootstrap: a database more than this many transactions behind its source is restored by snapshot, a smaller gap is streamed with `StreamChanges`. `delta_sync_threshold_seconds` has no runtime effect; it only feeds the GC rules below.
+
+**GC Configuration Rules (Validated at Startup when `enable_anti_entropy` is true):**
 - `gc_min_retention_hours` must be >= `delta_sync_threshold_seconds` (in hours)
-- `gc_max_retention_hours` should be >= 2x `delta_sync_threshold_seconds`
+- `gc_max_retention_hours` must be >= 2x `delta_sync_threshold_seconds` (in hours), unless it is `0`
+- `gc_min_retention_hours` must be < `gc_max_retention_hours` (when it is not `0`)
+- `gc_interval_seconds` must be >= `anti_entropy_interval_seconds`
 - Violating these rules will cause startup failure with helpful error messages
+
+## Metastore
+
+```toml
+[metastore]
+strict_prepare_sync = false  # Wait for CDC segment fsync before acknowledging PREPARE
+```
+
+`strict_prepare_sync = true` (or `MARMOT_CDC_PREPARE_SYNC=strict`) strengthens local crash durability at the cost of write latency. The default groups segment syncs asynchronously.
 
 ## Query Pipeline
 

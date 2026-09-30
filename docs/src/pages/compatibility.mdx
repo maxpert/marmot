@@ -112,7 +112,7 @@ Marmot supports key MySQL functions for application compatibility:
 
 ### Auto-Increment ID Generation
 
-Marmot generates unique distributed IDs for `AUTO_INCREMENT` columns. Two modes are available:
+Marmot generates unique distributed IDs for `BIGINT AUTO_INCREMENT` columns. Two modes are available:
 
 | Mode | Bits | Max Value | Use Case |
 |------|------|-----------|----------|
@@ -121,7 +121,7 @@ Marmot generates unique distributed IDs for `AUTO_INCREMENT` columns. Two modes 
 
 Configure via `[mysql].auto_id_mode` in config. The compact mode uses: 41 bits timestamp + 6 bits node ID + 6 bits sequence.
 
-These modes apply to `BIGINT AUTO_INCREMENT` columns.
+These modes apply only to `BIGINT AUTO_INCREMENT` columns. Narrower columns use range claims instead (below).
 
 ### Narrow AUTO_INCREMENT Columns
 
