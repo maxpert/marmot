@@ -54,6 +54,10 @@ type PrepareResult struct {
 	// the coordinator, local or remote, and without the code every
 	// deterministic refusal reaches the client as 1105 HY000.
 	ErrorCode uint16
+	// VotesHeld reports an AUTO_INCREMENT range claim declined because this
+	// node's claim votes are held (AutoIncHoldTable): a claimant coordinating
+	// on this node waits for the release instead of failing the claim.
+	VotesHeld bool
 }
 
 // CommitRequest contains parameters for the commit phase
@@ -477,7 +481,7 @@ func (re *ReplicationEngine) prepareAutoIncClaim(
 		// it or a majority granted, until it has merged bases from a
 		// majority (AutoIncHoldTable). A missing ACK leaves the claim to the
 		// rest of the cluster, and to this node once the merge completes.
-		return &PrepareResult{Success: false,
+		return &PrepareResult{Success: false, VotesHeld: true,
 			Error: fmt.Sprintf("auto-increment claim for %s declined: this node's votes are held until it merges claim bases from a majority", claim.Table)}
 	}
 
@@ -1024,6 +1028,7 @@ func (pr *PrepareResult) ToCoordinatorResponse() *coordinator.ReplicationRespons
 		Rejected:         pr.Rejected,
 		ErrorCode:        pr.ErrorCode,
 		AutoIDStoredBase: pr.AutoIDStoredBase,
+		VotesHeld:        pr.VotesHeld,
 	}
 }
 

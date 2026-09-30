@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/maxpert/marmot/id"
 	"github.com/maxpert/marmot/protocol"
 )
 
@@ -39,7 +40,9 @@ func TestMain(m *testing.M) {
 		fmt.Fprintln(os.Stderr, "skipping cluster integration tests; set MARMOT_RUN_CLUSTER_INTEGRATION_TESTS=1 to run")
 		os.Exit(0)
 	}
-	if err := protocol.InitializePipeline(10000, nil); err != nil {
+	// A real generator enables id injection, as in a node process, for the
+	// in-process tests that drive statements through a CoordinatorHandler.
+	if err := protocol.InitializePipeline(10000, id.NewCompactGenerator(1)); err != nil {
 		fmt.Fprintln(os.Stderr, "initialize query pipeline:", err)
 		os.Exit(1)
 	}

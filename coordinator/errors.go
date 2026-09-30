@@ -8,6 +8,13 @@ import (
 	"github.com/maxpert/marmot/protocol/query/transform"
 )
 
+// ErrLocalVotesHeld reports an AUTO_INCREMENT range claim this node declined
+// at PREPARE because its own claim votes are held until it merges claim bases
+// from its peers. The coordinator must participate in every quorum, so no
+// claim it coordinates can commit before the release; ClaimRange waits for it,
+// up to transaction.lock_wait_timeout_seconds, and FailFastClaimer does not.
+var ErrLocalVotesHeld = errors.New("this node's auto-increment claim votes are held until it merges claim bases from its peers")
+
 // PrepareConflictError represents a write-write conflict detected during the prepare phase
 type PrepareConflictError struct {
 	NodeID  uint64

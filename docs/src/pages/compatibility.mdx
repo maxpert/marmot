@@ -132,8 +132,11 @@ Membership Changes and Narrow AUTO_INCREMENT Ids in [Operations](/operations)).
 
 - **Single node:** set `cluster.standalone = true` with `seed_nodes` empty. The node claims ranges without peers.
 - **Cluster:** a node whose system database is new holds its claim votes until it has merged claim bases from
-  enough cluster members; until its log says `AUTO_INCREMENT claim votes released after merging claim bases`, narrow inserts can return the
-  retryable 1205. Start applications that insert at boot after that line.
+  enough cluster members, and logs `AUTO_INCREMENT claim votes released after merging claim bases` when it does.
+  A narrow insert through that node during the hold waits for the release, up to
+  `transaction.lock_wait_timeout_seconds`, and returns the retryable 1205 only if the hold outlasts it. Inside an
+  explicit transaction that has already written a row, the insert does not wait: it returns 1205 at once, because
+  the release can depend on peers joining from a snapshot that waits for that transaction.
 - Ids increase within one node's range, not across nodes: two nodes inserting into the same table issue ids from
   different ranges. Ids a range did not issue are skipped for good, for example after a restart.
 - `LAST_INSERT_ID()` reports the generated id as usual.

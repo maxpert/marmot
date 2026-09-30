@@ -89,16 +89,21 @@ func (c *cluster) waitCompleteSync(id int, restarted ...uint64) autoIncSyncAnswe
 // TestNarrowAutoInc_HeldNodeReleasesAfterItsSeedReturns: a wiped node whose
 // only seed is down - so its join fails and its catch-up cannot use the seed
 // - is held while it cannot reach enough members: the sync reports it held
-// and incomplete, and a narrow insert through it returns 1205. It releases
-// once its seed is back, which needs it to connect to the returned seed it
-// learned of as ALIVE from another member.
+// and incomplete, and a narrow insert through it waits out the lock wait and
+// returns 1205. It releases once its seed is back, which needs it to connect
+// to the returned seed it learned of as ALIVE from another member.
+//
+// The lock wait is 1s, inside the client's read timeout, so the insert's
+// bounded wait ends in 1205 rather than a dropped connection.
 //
 // Mutations: never hold (both hold sites) - "was not held while its seed was
 // down" fires; drop the ALIVE callback on discovery (node_registry.go) - the
-// cluster never becomes ready after the seed returns.
+// cluster never becomes ready after the seed returns; an unbounded hold wait
+// - the insert never answers 1205.
 func TestNarrowAutoInc_HeldNodeReleasesAfterItsSeedReturns(t *testing.T) {
 	const table = "seedback"
-	c := startNarrowCluster(t, table, "CREATE TABLE "+table+" (id INT AUTO_INCREMENT PRIMARY KEY, v TEXT)")
+	c := startNarrowCluster(t, table, "CREATE TABLE "+table+" (id INT AUTO_INCREMENT PRIMARY KEY, v TEXT)",
+		func(cfg *clusterConfig) { cfg.lockWaitTimeoutSecs = 1 })
 	ledger := newIDLedger(t)
 	insertOnEvery(c, ledger, table, "before", 3, 1, 2, 3)
 	c.wipe(3)

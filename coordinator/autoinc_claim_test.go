@@ -386,6 +386,78 @@ func TestClaimRange_QuorumNotAchievedReturns1205WithoutRetrying(t *testing.T) {
 	}
 }
 
+// countingVoteHold is a VoteHold that is always released and counts waits.
+type countingVoteHold struct {
+	mu    sync.Mutex
+	waits int
+}
+
+func (h *countingVoteHold) WaitAutoIncVotesReleased(context.Context) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.waits++
+	return nil
+}
+
+// TestClaimRange_WaitsOutLocalVotesHeld pins the startup shape of a new
+// cluster: every node declines while its votes are held, so the round fails
+// quorum with this node's decline marked VotesHeld. ClaimRange waits for the
+// release after each such round and claims once the node votes, and a held
+// round is not an attempt: more held rounds than maxClaimAttempts still end
+// in a grant.
+//
+// Mutations: breaking out on the decline (HEAD's behaviour) returns 1205;
+// counting held rounds as attempts returns 1205 after maxClaimAttempts.
+func TestClaimRange_WaitsOutLocalVotesHeld(t *testing.T) {
+	InitTestTelemetry()
+
+	fake := newClaimStepReplicator()
+	heldRounds := maxClaimAttempts + 2
+	for range heldRounds {
+		fake.push(1, &ReplicationResponse{Error: "votes held", VotesHeld: true})
+		fake.push(2, &ReplicationResponse{Error: "votes held"})
+		fake.push(3, &ReplicationResponse{Error: "votes held"})
+	}
+	hold := &countingVoteHold{}
+	wc := NewWriteCoordinator(1, newMockNodeProvider([]uint64{1, 2, 3}), fake, fake, 200*time.Millisecond, hlc.NewClock(1))
+	wc.SetVoteHold(hold)
+
+	newBase, granted, err := wc.ClaimRange(context.Background(), "testdb", "orders", 100, fixedClaimSize(50))
+	if err != nil {
+		t.Fatalf("ClaimRange: %v", err)
+	}
+	if newBase != 100 || granted != 50 {
+		t.Errorf("claim = (%d, +%d), want (100, +50)", newBase, granted)
+	}
+	if hold.waits != heldRounds {
+		t.Errorf("waits for the release = %d, want %d (one per held round)", hold.waits, heldRounds)
+	}
+}
+
+// TestClaimRange_RemoteVotesHeldIsNotALocalWait pins that only this node's
+// own held votes make ClaimRange wait: a peer's held decline carries no
+// VotesHeld flag across the wire and stays an ordinary decline.
+//
+// Mutation: classify any declined round as held. The claim waits on the
+// hold instead of backing off, and waits becomes non-zero.
+func TestClaimRange_RemoteVotesHeldIsNotALocalWait(t *testing.T) {
+	InitTestTelemetry()
+
+	fake := newClaimStepReplicator()
+	fake.push(2, &ReplicationResponse{Error: "votes held"})
+	fake.push(3, &ReplicationResponse{Error: "votes held"})
+	hold := &countingVoteHold{}
+	wc := NewWriteCoordinator(1, newMockNodeProvider([]uint64{1, 2, 3}), fake, fake, 200*time.Millisecond, hlc.NewClock(1))
+	wc.SetVoteHold(hold)
+
+	if _, _, err := wc.ClaimRange(context.Background(), "testdb", "orders", 100, fixedClaimSize(50)); err != nil {
+		t.Fatalf("ClaimRange: %v", err)
+	}
+	if hold.waits != 0 {
+		t.Errorf("waits for the release = %d, want 0: only this node's own hold is waited on", hold.waits)
+	}
+}
+
 // fixedClaimSize is a RangeSizer asking for the same size above any base:
 // these tests pin the claim protocol, not the allocator's sizing policy.
 func fixedClaimSize(size uint64) id.RangeSizer {

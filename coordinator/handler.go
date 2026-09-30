@@ -162,6 +162,12 @@ func getDDLValidationTimeout() time.Duration {
 // uses for hookDB sessions), applied here for its naturally longer eager
 // duration instead of a new speculative config value.
 func pinnedSessionTimeout() time.Duration {
+	return lockWaitTimeout()
+}
+
+// lockWaitTimeout returns transaction.lock_wait_timeout_seconds, or MySQL's
+// innodb_lock_wait_timeout default (50s).
+func lockWaitTimeout() time.Duration {
 	if cfg.Config != nil && cfg.Config.Transaction.LockWaitTimeoutSeconds > 0 {
 		return time.Duration(cfg.Config.Transaction.LockWaitTimeoutSeconds) * time.Second
 	}
@@ -224,7 +230,10 @@ type CoordinatorHandler struct {
 	// narrowIDs mints ids for AUTO_INCREMENT columns declared narrower than
 	// BIGINT, from ranges this node claims through writeCoord. Nil when the
 	// handler has no write coordinator to claim through.
-	narrowIDs          *id.RangeAllocator
+	narrowIDs *id.RangeAllocator
+	// narrowIDsFailFast shares narrowIDs' ranges but never waits out a vote
+	// hold; statements inside a transaction that pinned a writer use it.
+	narrowIDsFailFast  *id.RangeAllocator
 	recentTxnIDs       sync.Map // txn_id -> conn_id for duplicate detection
 	publisherRegistry  PublisherRegistry
 	publisherMu        sync.RWMutex
@@ -251,30 +260,40 @@ type CoordinatorHandler struct {
 func NewCoordinatorHandler(nodeID uint64, writeCoord *WriteCoordinator, readCoord *ReadCoordinator, clock *hlc.Clock, dbManager DatabaseManager, ddlLockMgr *DDLLockManager, schemaVersionMgr SchemaVersionManager, nodeRegistry NodeRegistry) *CoordinatorHandler {
 	// The narrow allocator claims through this handler's own write
 	// coordinator, so it is built here, beside it, rather than in the shared
-	// query pipeline. A claim gets the same bound as any other write.
-	var narrowIDs *id.RangeAllocator
+	// query pipeline. A claim gets the bound of any other write plus the lock
+	// wait: a claim on a node whose votes are held waits for their release up
+	// to the lock wait (ClaimRange), and then still needs its own rounds.
+	var narrowIDs, narrowIDsFailFast *id.RangeAllocator
 	if writeCoord != nil {
-		narrowIDs = id.NewRangeAllocator(writeCoord, getWriteTimeout())
+		narrowIDs = id.NewRangeAllocator(writeCoord, getWriteTimeout()+lockWaitTimeout())
+		narrowIDsFailFast = narrowIDs.Through(writeCoord.FailFastClaimer())
 	}
 	return &CoordinatorHandler{
-		narrowIDs:        narrowIDs,
-		nodeID:           nodeID,
-		writeCoord:       writeCoord,
-		readCoord:        readCoord,
-		clock:            clock,
-		dbManager:        dbManager,
-		ddlLockMgr:       ddlLockMgr,
-		schemaVersionMgr: schemaVersionMgr,
-		nodeRegistry:     nodeRegistry,
-		metadata:         handlers.NewMetadataHandler(dbManager, SystemDatabaseName),
+		narrowIDs:         narrowIDs,
+		narrowIDsFailFast: narrowIDsFailFast,
+		nodeID:            nodeID,
+		writeCoord:        writeCoord,
+		readCoord:         readCoord,
+		clock:             clock,
+		dbManager:         dbManager,
+		ddlLockMgr:        ddlLockMgr,
+		schemaVersionMgr:  schemaVersionMgr,
+		nodeRegistry:      nodeRegistry,
+		metadata:          handlers.NewMetadataHandler(dbManager, SystemDatabaseName),
 	}
 }
 
-// narrowAllocator returns the narrow allocator as the interface the parser
-// takes, keeping a nil allocator a nil interface.
-func (h *CoordinatorHandler) narrowAllocator() rules.NarrowAllocator {
+// narrowAllocator returns the narrow allocator for a statement on session as
+// the interface the parser takes, keeping a nil allocator a nil interface.
+// A session whose explicit transaction has pinned a SQLite writer gets the
+// fail-fast one (WriteCoordinator.FailFastClaimer): it must not wait for a
+// vote release while holding a writer the release can depend on.
+func (h *CoordinatorHandler) narrowAllocator(session *protocol.ConnectionSession) rules.NarrowAllocator {
 	if h.narrowIDs == nil {
 		return nil
+	}
+	if pinned := h.lookupPinnedState(session.ConnID); pinned != nil && !pinned.isEmpty() {
+		return h.narrowIDsFailFast
 	}
 	return h.narrowIDs
 }
@@ -373,7 +392,7 @@ func (h *CoordinatorHandler) HandleQuery(session *protocol.ConnectionSession, sq
 	// Parse with options based on session state
 	stmt := protocol.ParseStatementWithOptions(sql, protocol.ParseOptions{
 		SchemaLookup:      schemaLookup,
-		NarrowIDs:         h.narrowAllocator(),
+		NarrowIDs:         h.narrowAllocator(session),
 		BoundParams:       params,
 		SchemaProvider:    schemaProvider,
 		SkipTranspilation: !session.TranspilationEnabled,

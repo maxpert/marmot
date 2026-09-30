@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/maxpert/marmot/common"
 	"github.com/maxpert/marmot/coordinator"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/maxpert/marmot/protocol/query/transform"
@@ -59,6 +60,7 @@ type DatabaseManager struct {
 	membershipView       atomic.Pointer[func() int]      // this node's view of total cluster membership
 	gcMembershipFunc     atomic.Pointer[func() []uint64] // current member node ids (self included, not REMOVED); source for each database's GC safe position
 	tombstoneMemberCount atomic.Pointer[func() int]      // members for the tombstone horizon (SetTombstoneMemberCountFunc)
+	voteRelease          common.Broadcast                // wakes WaitAutoIncVotesReleased on every vote release
 }
 
 // SetClusterMembership installs view as the source of this node's view of

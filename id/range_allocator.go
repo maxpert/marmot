@@ -130,6 +130,13 @@ func NewRangeAllocator(claimer Claimer, timeout time.Duration) *RangeAllocator {
 	}
 }
 
+// Through returns an allocator that shares a's ranges and timeout but claims
+// through claimer. A table's cursor is one for both, so neither ever issues
+// an id the other did.
+func (a *RangeAllocator) Through(claimer Claimer) *RangeAllocator {
+	return &RangeAllocator{claimer: claimer, timeout: a.timeout, cursors: a.cursors}
+}
+
 func (a *RangeAllocator) cursorFor(database, table string) *cursor {
 	c, _ := a.cursors.LoadOrCompute(tableKey{database: database, table: table}, func() *cursor {
 		return &cursor{ramp: rampInitial}

@@ -229,8 +229,10 @@ func runAutoIncBaseMerge(ctx context.Context, nodeID uint64, store autoIncBaseSt
 	}
 }
 
-// holdUntilMerged runs merge rounds every conf.MergeInterval until this
-// node's votes are released. It reports false when ctx ended first.
+// holdUntilMerged runs merge rounds until this node's votes are released:
+// every conf.MergeInterval, and at once whenever a peer turns ALIVE - a new
+// answer is what a held node waits for, and narrow inserts wait on the
+// release. It reports false when ctx ended first.
 func holdUntilMerged(ctx context.Context, nodeID uint64, store autoIncBaseStore, registry autoIncMembership, conf AutoIncMergeConfig, fetch fetchAutoIncBases) bool {
 	if held, err := store.AutoIncVotesHeld(); err == nil && !held {
 		return true
@@ -240,6 +242,9 @@ func holdUntilMerged(ctx context.Context, nodeID uint64, store autoIncBaseStore,
 	release := standaloneRelease{configured: conf.Standalone}
 	warned := false
 	for {
+		// Taken before the round, so a peer that turns ALIVE during it
+		// triggers another.
+		aliveChanged := registry.AliveChanged()
 		membership := registry.Count()
 		released, err := mergeAutoIncBasesOnce(ctx, store, alivePeers(registry, nodeID), membership, release.allowed(membership), fetch)
 		if err != nil {
@@ -253,7 +258,8 @@ func holdUntilMerged(ctx context.Context, nodeID uint64, store autoIncBaseStore,
 			warned = true
 			log.Warn().Int("membership", membership).Bool("standalone", conf.Standalone).
 				Msg("AUTO_INCREMENT claim votes held until claim bases are merged from enough cluster members; " +
-					"narrow AUTO_INCREMENT inserts may return 1205 until then. A single-node deployment sets " +
+					"narrow AUTO_INCREMENT inserts wait for the release, up to transaction.lock_wait_timeout_seconds, " +
+					"and return 1205 after it (at once inside a transaction that already wrote). A single-node deployment sets " +
 					"cluster.standalone = true; an operator can force a release with " +
 					"POST /admin/cluster/autoinc/release-votes?accept_risk=" + ForceReleaseRiskToken)
 		}
@@ -261,6 +267,7 @@ func holdUntilMerged(ctx context.Context, nodeID uint64, store autoIncBaseStore,
 		case <-ctx.Done():
 			return false
 		case <-ticker.C:
+		case <-aliveChanged:
 		}
 	}
 }
@@ -324,6 +331,7 @@ type autoIncMembership interface {
 	Count() int
 	MemberIDs() []uint64
 	GetAlive() []*NodeState
+	AliveChanged() <-chan struct{}
 }
 
 // syncAutoIncBasesOnce asks every alive peer - not a quorum, every one, held

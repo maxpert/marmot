@@ -460,6 +460,8 @@ func main() {
 	// AUTO_INCREMENT claims carry this node's schema version, so a voter
 	// that lags a DDL declines them as it declines DML.
 	writeCoordinator.SetSchemaVersionSource(schemaVersionMgr.GetSchemaVersion)
+	// A claim this node declines for its held votes waits for their release.
+	writeCoordinator.SetVoteHold(dbMgr)
 
 	// Initialize LocalReader for ReadCoordinator
 	localReader := db.NewLocalReader(dbMgr)

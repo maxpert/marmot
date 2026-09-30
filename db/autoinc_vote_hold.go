@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"math"
@@ -221,9 +222,35 @@ func (dm *DatabaseManager) AutoIncBases() ([]AutoIncBase, bool, error) {
 }
 
 // MergeAutoIncBasesAndReleaseVotes raises this node's merged floors to at
-// least bases and releases its vote hold, atomically.
+// least bases and releases its vote hold, atomically, then wakes every
+// WaitAutoIncVotesReleased.
 func (dm *DatabaseManager) MergeAutoIncBasesAndReleaseVotes(bases []AutoIncBase) error {
-	return NewAutoIncClaimStore(dm.systemDB).MergeAndReleaseVotes(bases)
+	if err := NewAutoIncClaimStore(dm.systemDB).MergeAndReleaseVotes(bases); err != nil {
+		return err
+	}
+	dm.voteRelease.Notify()
+	return nil
+}
+
+// WaitAutoIncVotesReleased returns once this node's claim votes are not held,
+// or with ctx's error once ctx ends first. A claimant coordinating on this
+// node waits here: while its own votes are held no claim it coordinates can
+// commit.
+func (dm *DatabaseManager) WaitAutoIncVotesReleased(ctx context.Context) error {
+	for {
+		// Taken before reading the hold, so a release committed after the
+		// read closes this very channel.
+		released := dm.voteRelease.Next()
+		held, err := dm.AutoIncVotesHeld()
+		if err != nil || !held {
+			return err
+		}
+		select {
+		case <-released:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 }
 
 // RaiseAutoIncBases raises this node's merged floors to at least bases, in

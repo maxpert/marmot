@@ -229,6 +229,7 @@ func (c *inprocCluster) buildNode(id uint64, dataDir string) *inprocNode {
 	dm.SetClusterMembership(c.provider.GetTotalMembershipSize)
 	lr := db.NewLocalReplicator(id, dm, clock)
 	wc := coordinator.NewWriteCoordinator(id, c.provider, c.fanout, lr, inprocCoordinatorTimeout, clock)
+	wc.SetVoteHold(dm)
 	c.fanout.register(id, lr)
 	return &inprocNode{id: id, dataDir: dataDir, clock: clock, dm: dm, lr: lr, wc: wc}
 }

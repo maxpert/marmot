@@ -1152,6 +1152,38 @@ func TestLeavingThenCrashesSuspect(t *testing.T) {
 	}
 }
 
+// TestNodeRegistry_AliveChangedFiresOnAlive pins that AliveChanged wakes its
+// waiters when a peer is discovered ALIVE or turns ALIVE, and not otherwise.
+//
+// Mutation: drop the Notify from fireOnNodeAlive. "discovered ALIVE" fires.
+func TestNodeRegistry_AliveChangedFiresOnAlive(t *testing.T) {
+	nr := NewNodeRegistry(1, "localhost:8081")
+	closed := func(ch <-chan struct{}) bool {
+		select {
+		case <-ch:
+			return true
+		default:
+			return false
+		}
+	}
+
+	ch := nr.AliveChanged()
+	nr.Update(&NodeState{NodeId: 2, Address: "localhost:8082", Status: NodeStatus_ALIVE, Incarnation: 1})
+	if !closed(ch) {
+		t.Fatal("discovered ALIVE did not signal AliveChanged")
+	}
+
+	ch = nr.AliveChanged()
+	nr.Update(&NodeState{NodeId: 3, Address: "localhost:8083", Status: NodeStatus_SUSPECT, Incarnation: 1})
+	if closed(ch) {
+		t.Fatal("a peer discovered SUSPECT signalled AliveChanged")
+	}
+	nr.Update(&NodeState{NodeId: 3, Address: "localhost:8083", Status: NodeStatus_ALIVE, Incarnation: 2})
+	if !closed(ch) {
+		t.Fatal("a peer turning ALIVE did not signal AliveChanged")
+	}
+}
+
 // TestNodeRegistry_DiscoveringAnAliveNodeConnectsToIt pins that the ALIVE
 // callback, which opens this node's connection to a
 // peer, fires when gossip first tells us of a peer that is already ALIVE, not

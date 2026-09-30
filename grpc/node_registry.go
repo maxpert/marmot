@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/maxpert/marmot/common"
 	"github.com/maxpert/marmot/telemetry"
 	"github.com/rs/zerolog/log"
 )
@@ -56,6 +57,9 @@ type NodeRegistry struct {
 	onNodeDeadFunc    func(*NodeState) // Callback when node transitions to DEAD
 	onNodeLeavingFunc func()           // Callback when local node marked LEAVING via remote decommission
 	callbackMu        sync.RWMutex
+	// aliveChanged is notified, after onNodeAliveFunc, whenever a node turns
+	// or is discovered ALIVE (AliveChanged).
+	aliveChanged common.Broadcast
 
 	// store persists membership so a restarted node does not compute a quorum
 	// from a membership of one. nil disables persistence.
@@ -290,6 +294,13 @@ func (nr *NodeRegistry) fireOnNodeAlive(node *NodeState) {
 	if callback != nil {
 		callback(node)
 	}
+	nr.aliveChanged.Notify()
+}
+
+// AliveChanged returns a channel closed the next time a node turns or is
+// discovered ALIVE, once the ALIVE callback has run for it.
+func (nr *NodeRegistry) AliveChanged() <-chan struct{} {
+	return nr.aliveChanged.Next()
 }
 
 // handleSelfUpdateLocked implements SWIM refutation for local node

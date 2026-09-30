@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/maxpert/marmot/cfg"
+	"github.com/maxpert/marmot/common"
 	"github.com/maxpert/marmot/db"
 	"github.com/maxpert/marmot/hlc"
 	"github.com/stretchr/testify/require"
@@ -227,10 +229,18 @@ func TestForceReleaseAutoIncVotesReleasesWithoutASafeMerge(t *testing.T) {
 type fakeMembership struct {
 	members []uint64
 	down    map[uint64]bool
+	// alive signals a peer turning ALIVE; nil never does.
+	alive *common.Broadcast
 }
 
 func (m fakeMembership) Count() int          { return len(m.members) }
 func (m fakeMembership) MemberIDs() []uint64 { return m.members }
+func (m fakeMembership) AliveChanged() <-chan struct{} {
+	if m.alive == nil {
+		return nil
+	}
+	return m.alive.Next()
+}
 func (m fakeMembership) GetAlive() []*NodeState {
 	var alive []*NodeState
 	for _, id := range m.members {
@@ -324,6 +334,48 @@ func TestReleasedNodeSyncsAtOnce(t *testing.T) {
 	held, err := store.AutoIncVotesHeld()
 	require.NoError(t, err)
 	require.False(t, held)
+}
+
+// TestHeldNodeMergesWhenPeerTurnsAlive pins that a held node retries its
+// merge the moment a peer turns ALIVE, not a merge interval later: narrow
+// inserts on a held node wait for the release.
+//
+// Mutation: drop the AliveChanged case from holdUntilMerged's wait. The node
+// stays held until the hour-long interval, and "not released on ALIVE" fires.
+func TestHeldNodeMergesWhenPeerTurnsAlive(t *testing.T) {
+	var reachable atomic.Bool
+	answers := peerAnswers(map[uint64]*AutoIncBasesResponse{2: {VotesHeld: true}, 3: {VotesHeld: true}})
+	fetch := func(ctx context.Context, peer uint64) (*AutoIncBasesResponse, error) {
+		if !reachable.Load() {
+			return nil, errors.New("unreachable")
+		}
+		return answers(ctx, peer)
+	}
+	store := &fakeBaseStore{held: true}
+	alive := &common.Broadcast{}
+	conf := AutoIncMergeConfig{MergeInterval: time.Hour, BaseSyncInterval: time.Hour}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		runAutoIncBaseMerge(ctx, 1, store, fakeMembership{members: []uint64{1, 2, 3}, alive: alive}, conf, fetch)
+		close(done)
+	}()
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	// The first round finds no peer; only an ALIVE can start the next.
+	require.Never(t, func() bool {
+		held, _ := store.AutoIncVotesHeld()
+		return !held
+	}, 100*time.Millisecond, 10*time.Millisecond, "released with no peer answering")
+	reachable.Store(true)
+	alive.Notify()
+	require.Eventually(t, func() bool {
+		held, _ := store.AutoIncVotesHeld()
+		return !held
+	}, time.Second, 10*time.Millisecond, "not released on ALIVE")
 }
 
 // TestStandaloneNeverReleasesAloneAfterSeeingPeers pins R3c-11: a node

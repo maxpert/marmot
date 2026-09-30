@@ -35,12 +35,29 @@ type WriteCoordinator struct {
 	// with a base kept for an incarnation this node has already replaced.
 	// Nil stamps claims with 0, which no participant checks.
 	schemaVersion func(database string) (uint64, error)
+	// voteHold is this node's claim vote hold, which a claim declined with
+	// ErrLocalVotesHeld waits out. Nil fails such a claim at once.
+	voteHold VoteHold
+}
+
+// VoteHold is this node's AUTO_INCREMENT claim vote hold, as a claimant
+// coordinating on this node waits it out.
+type VoteHold interface {
+	// WaitAutoIncVotesReleased returns once this node's claim votes are not
+	// held, or with ctx's error once ctx ends first.
+	WaitAutoIncVotesReleased(ctx context.Context) error
 }
 
 // SetSchemaVersionSource sets where claims read this node's schema version
 // (WriteCoordinator.schemaVersion). Call it before the coordinator is used.
 func (wc *WriteCoordinator) SetSchemaVersionSource(source func(database string) (uint64, error)) {
 	wc.schemaVersion = source
+}
+
+// SetVoteHold sets the vote hold claims wait out (WriteCoordinator.voteHold).
+// Call it before the coordinator is used.
+func (wc *WriteCoordinator) SetVoteHold(hold VoteHold) {
+	wc.voteHold = hold
 }
 
 // Replicator sends replication requests to remote nodes
@@ -141,6 +158,10 @@ type ReplicationResponse struct {
 	// (protocol.ErrAutoIncClaimNotApplicable). Set only by the local
 	// participant.
 	ClaimNotApplicable bool
+	// VotesHeld reports a PREPARE of an AUTO_INCREMENT range claim declined
+	// because the participant's claim votes are held. Set only by the local
+	// participant.
+	VotesHeld bool
 }
 
 // NewWriteCoordinator creates a new write coordinator for full database replication
@@ -415,6 +436,10 @@ func (wc *WriteCoordinator) runPreparePhase(ctx context.Context, txn *Transactio
 			Msg("Local PREPARE rejected transaction - aborting")
 
 		return nil, &CoordinatorNotParticipatedError{TxnID: txn.ID, Err: localPrepareErr}
+	}
+
+	if errors.Is(prepErr, ErrLocalVotesHeld) {
+		return nil, &CoordinatorNotParticipatedError{TxnID: txn.ID, Err: prepErr}
 	}
 
 	if prepErr != nil {
@@ -791,7 +816,8 @@ type response struct {
 // any - the caller decides whether it matters, since a remote rejection alone must not
 // veto a transaction that otherwise reaches quorum), the number of participants that
 // answered but declined without a verdict (for example a lost race for a row lock),
-// and a conflict error if any node reports a conflict.
+// and a conflict error if any node reports a conflict - or ErrLocalVotesHeld when this
+// node declined a claim because its own votes are held.
 func (wc *WriteCoordinator) executePreparePhase(ctx context.Context, txn *Transaction, prepReq *ReplicationRequest,
 	otherNodes []uint64, skipLocalReplication bool) (map[uint64]*ReplicationResponse, *RemotePrepareRejectedError, int, error) {
 
@@ -855,6 +881,7 @@ func (wc *WriteCoordinator) executePreparePhase(ctx context.Context, txn *Transa
 	// participant that is furthest ahead.
 	var maxAutoIDStoredBase uint64
 	declined := 0
+	localVotesHeld := false
 
 	for i := 0; i < totalNodes; i++ {
 		select {
@@ -896,6 +923,9 @@ func (wc *WriteCoordinator) executePreparePhase(ctx context.Context, txn *Transa
 				// it stays retryable, exactly as before DDL was validated here.
 				if !r.resp.Rejected {
 					declined++
+				}
+				if r.nodeID == wc.nodeID && r.resp.VotesHeld {
+					localVotesHeld = true
 				}
 				if r.resp.Rejected {
 					reason := r.resp.Error
@@ -939,6 +969,12 @@ func (wc *WriteCoordinator) executePreparePhase(ctx context.Context, txn *Transa
 	// quorum check.
 	if localErr != nil {
 		return prepResponses, remoteRejection, declined, localErr
+	}
+
+	// This node's own vote is held: nothing any peer answered can let the
+	// claim commit before the release, so that is the round's answer.
+	if localVotesHeld {
+		return prepResponses, remoteRejection, declined, ErrLocalVotesHeld
 	}
 
 	// If any conflict was detected, return the error

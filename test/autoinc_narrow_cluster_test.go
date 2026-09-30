@@ -26,10 +26,11 @@ const (
 	claimRetryDeadline = 3 * time.Second
 )
 
-// startNarrowCluster starts a cluster and creates table with ddl on it.
-func startNarrowCluster(t *testing.T, table, ddl string) *cluster {
+// startNarrowCluster starts a cluster, configured by opts, and creates table
+// with ddl on it.
+func startNarrowCluster(t *testing.T, table, ddl string, opts ...func(*clusterConfig)) *cluster {
 	t.Helper()
-	c := newCluster(t)
+	c := newCluster(t, opts...)
 	c.start()
 	c.createTable(1, "marmot", table, ddl)
 	return c

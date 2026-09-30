@@ -84,6 +84,16 @@ const (
 // fix by itself, so it ends the attempt loop immediately rather than spending
 // the full budget.
 //
+// A round this node itself declined because its claim votes are held
+// (ErrLocalVotesHeld) cannot commit whatever its peers answer: the
+// coordinator must participate. ClaimRange waits for the release
+// (WriteCoordinator.voteHold) and then retries, without spending an attempt;
+// every such wait in one call shares a single deadline of
+// transaction.lock_wait_timeout_seconds. ctx bounds it too, so a caller that
+// promises the lock wait gives ctx at least the lock wait on top of the
+// claim's own rounds (the handler's narrow allocator does). FailFastClaimer
+// never waits.
+//
 // The two ways a claim can end are kept apart structurally, because a client
 // must retry one and must never retry the other:
 //   - exhaustion - size found no room above the base, or a participant
@@ -99,9 +109,37 @@ const (
 // builds a statement and drives it through WriteTransaction, exactly like
 // any other 2PC write.
 func (wc *WriteCoordinator) ClaimRange(ctx context.Context, database, table string, prevBase uint64, size id.RangeSizer) (newBase uint64, granted uint64, err error) {
+	return wc.claimRange(ctx, database, table, prevBase, size, true)
+}
+
+// FailFastClaimer returns a claimer that claims exactly as ClaimRange does,
+// except that it never waits out this node's held votes: a round this node
+// declines for them ends the claim at once with 1205. A claimant holding a
+// pinned SQLite writer - an explicit transaction that already wrote - claims
+// through it: the release it would wait for can need a joining peer's
+// snapshot of this node, whose checkpoint waits on that very writer.
+func (wc *WriteCoordinator) FailFastClaimer() id.Claimer {
+	return failFastClaimer{wc: wc}
+}
+
+// failFastClaimer is WriteCoordinator.FailFastClaimer.
+type failFastClaimer struct {
+	wc *WriteCoordinator
+}
+
+// ClaimRange is WriteCoordinator.ClaimRange without the hold wait.
+func (c failFastClaimer) ClaimRange(ctx context.Context, database, table string, prevBase uint64, size id.RangeSizer) (uint64, uint64, error) {
+	return c.wc.claimRange(ctx, database, table, prevBase, size, false)
+}
+
+// claimRange is ClaimRange, waiting out this node's held votes only when
+// waitForRelease is set.
+func (wc *WriteCoordinator) claimRange(ctx context.Context, database, table string, prevBase uint64, size id.RangeSizer, waitForRelease bool) (newBase uint64, granted uint64, err error) {
 	var lastErr error
 	declinedRounds := 0
-	for attempt := 0; attempt < maxClaimAttempts; attempt++ {
+	holdWait := votesHeldWait{ctx: ctx}
+	defer holdWait.stop()
+	for attempt := 0; attempt < maxClaimAttempts; {
 		claimSize, sizeErr := size(prevBase)
 		if sizeErr != nil {
 			return 0, 0, fmt.Errorf("auto-increment claim for %s.%s: %w", database, table, sizeErr)
@@ -149,6 +187,17 @@ func (wc *WriteCoordinator) ClaimRange(ctx context.Context, database, table stri
 		}
 		lastErr = attemptErr
 
+		// A round this node declined for its held votes is not an attempt: it
+		// waits for the release, and only the lock wait bounds that.
+		if waitForRelease && wc.voteHold != nil && errors.Is(attemptErr, ErrLocalVotesHeld) {
+			if waitErr := holdWait.wait(wc.voteHold); waitErr != nil {
+				lastErr = fmt.Errorf("%w (waiting for the release: %v)", attemptErr, waitErr)
+				break
+			}
+			continue
+		}
+		attempt++
+
 		if exhaustedByParticipant(attemptErr) {
 			return 0, 0, fmt.Errorf("auto-increment claim for %s.%s: %w (%v)", database, table, id.ErrRangeExhausted, attemptErr)
 		}
@@ -156,7 +205,7 @@ func (wc *WriteCoordinator) ClaimRange(ctx context.Context, database, table stri
 			prevBase = base
 			continue
 		}
-		if !declinedByParticipant(attemptErr) || attempt == maxClaimAttempts-1 {
+		if !declinedByParticipant(attemptErr) || attempt == maxClaimAttempts {
 			break
 		}
 		if err := sleepClaimBackoff(ctx, declinedRounds); err != nil {
@@ -218,6 +267,33 @@ func (wc *WriteCoordinator) claimSchemaVersion(database string) (uint64, error) 
 		return 0, nil
 	}
 	return wc.schemaVersion(database)
+}
+
+// votesHeldWait bounds every wait one ClaimRange call spends on this node's
+// held votes by a single lock-wait deadline, set when the first wait starts:
+// the claim is a statement waiting for a lock the release frees, so it waits
+// exactly as long as MySQL waits for a row lock.
+type votesHeldWait struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+}
+
+// wait blocks until hold is released or the deadline passes.
+func (w *votesHeldWait) wait(hold VoteHold) error {
+	if w.cancel == nil {
+		w.ctx, w.cancel = context.WithTimeout(w.ctx, lockWaitTimeout())
+	}
+	if err := w.ctx.Err(); err != nil {
+		return err
+	}
+	return hold.WaitAutoIncVotesReleased(w.ctx)
+}
+
+// stop releases the deadline's timer.
+func (w *votesHeldWait) stop() {
+	if w.cancel != nil {
+		w.cancel()
+	}
 }
 
 // sleepClaimBackoff waits the k-th jittered claim backoff, or until ctx ends.
