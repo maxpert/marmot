@@ -361,7 +361,7 @@ func (dm *DatabaseManager) wireGCCoordination(mdb *ReplicatedDatabase, dbName st
 	// (db/meta_store.go's ConsumedPositions). A
 	// member with no recorded position counts as the zero position, so GC
 	// deletes nothing for that database until every member has reported at
-	// least once (bounded by gcMaxRetention regardless). A member no longer
+	// least once (bounded by gcMaxRetention when it is set). A member no longer
 	// current has its consumed position deleted so it stops pinning GC.
 	//
 	// A member down for longer than gc_max_retention_hours finds its

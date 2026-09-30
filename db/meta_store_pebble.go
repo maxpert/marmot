@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -2412,7 +2413,12 @@ func (s *PebbleMetaStore) CleanupOldTransactionRecords(minRetention, maxRetentio
 
 	now := time.Now()
 	minCutoff := now.Add(-minRetention).UnixNano()
-	maxCutoff := now.Add(-maxRetention).UnixNano()
+	// maxRetention <= 0 is "no maximum": no timestamp is below MinInt64, so
+	// nothing is deleted past safe and a non-committed entry is never forced.
+	maxCutoff := int64(math.MinInt64)
+	if maxRetention > 0 {
+		maxCutoff = now.Add(-maxRetention).UnixNano()
+	}
 
 	type deletable struct {
 		pos LogPosition

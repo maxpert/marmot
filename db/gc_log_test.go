@@ -224,15 +224,51 @@ func TestGCDeletesOlderThanMaxRetentionRegardlessOfSafe(t *testing.T) {
 	commitTestTxn(t, store, 3201, 1)
 	time.Sleep(2 * time.Millisecond)
 
-	// maxRetention=0 forces unconditional deletion; minRetention huge so
-	// that branch alone would not fire; safe is zero (would refuse via the
-	// min-retention branch, but must not block the max-retention branch).
-	n, err := store.CleanupOldTransactionRecords(time.Hour, 0, LogPosition{})
+	// maxRetention=1ms (the entry is 2ms old) forces unconditional deletion;
+	// minRetention huge so that branch alone would not fire; safe is zero
+	// (would refuse via the min-retention branch, but must not block the
+	// max-retention branch).
+	n, err := store.CleanupOldTransactionRecords(time.Hour, time.Millisecond, LogPosition{})
 	if err != nil {
 		t.Fatalf("CleanupOldTransactionRecords: %v", err)
 	}
 	if n != 1 {
 		t.Fatalf("deleted = %d, want 1 (max retention is unconditional)", n)
+	}
+}
+
+// TestGCZeroMaxRetentionMeansNoForcedDeletion pins that maxRetention 0 is
+// "no maximum": nothing is deleted past the safe position, however old, and
+// consumed entries are still deleted once older than min retention.
+func TestGCZeroMaxRetentionMeansNoForcedDeletion(t *testing.T) {
+	store, cleanup := createTestPebbleMetaStore(t)
+	defer cleanup()
+
+	posA := commitTestTxn(t, store, 3251, 1)
+	commitTestTxn(t, store, 3252, 1)
+	posC := commitTestTxn(t, store, 3253, 1)
+	time.Sleep(2 * time.Millisecond)
+
+	if n, err := store.CleanupOldTransactionRecords(0, 0, LogPosition{}); err != nil || n != 0 {
+		t.Fatalf("nothing consumed: deleted = %d, err = %v; want 0", n, err)
+	}
+	if n, err := store.CleanupOldTransactionRecords(time.Hour, 0, posC); err != nil || n != 0 {
+		t.Fatalf("all consumed but younger than min retention: deleted = %d, err = %v; want 0", n, err)
+	}
+	if n, err := store.CleanupOldTransactionRecords(0, 0, posA); err != nil || n != 1 {
+		t.Fatalf("safe covers A only: deleted = %d, err = %v; want 1", n, err)
+	}
+	for _, id := range []uint64{3252, 3253} {
+		if rec, _ := store.GetTransaction(id); rec == nil {
+			t.Fatalf("txn %d is above safe and must survive", id)
+		}
+	}
+	if through, err := store.TruncatedThrough(); err != nil || through != posA {
+		t.Fatalf("TruncatedThrough = %v, err = %v; want %v", through, err, posA)
+	}
+
+	if n, err := store.CleanupOldTransactionRecords(0, 0, posC); err != nil || n != 2 {
+		t.Fatalf("safe covers C: deleted = %d, err = %v; want 2", n, err)
 	}
 }
 
@@ -350,7 +386,12 @@ func TestGCSkipsANonCommittedSeqEntryUntilMaxRetention(t *testing.T) {
 		t.Fatalf("TruncatedThrough = %v, want %v", through, posC)
 	}
 
-	n, err = store.CleanupOldTransactionRecords(0, 0, posC)
+	// With no maximum, nothing ever forces the stray entry out.
+	if n, err := store.CleanupOldTransactionRecords(0, 0, posC); err != nil || n != 0 {
+		t.Fatalf("max retention 0: deleted = %d, err = %v; want 0", n, err)
+	}
+
+	n, err = store.CleanupOldTransactionRecords(0, time.Millisecond, posC)
 	if err != nil {
 		t.Fatalf("CleanupOldTransactionRecords: %v", err)
 	}

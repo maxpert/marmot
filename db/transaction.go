@@ -1360,7 +1360,8 @@ func (tm *TransactionManager) cleanupStaleTransactions() (int, error) {
 
 // cleanupOldTransactionRecords deletes committed log entries at or below
 // the GC-safe position (see GCSafePositionFunc) once they are older than
-// gcMinRetention, or unconditionally once they are older than gcMaxRetention.
+// gcMinRetention, or unconditionally once they are older than gcMaxRetention
+// (never, when gcMaxRetention is 0).
 func (tm *TransactionManager) cleanupOldTransactionRecords() (int, error) {
 	// Get callback under lock
 	tm.mu.RLock()

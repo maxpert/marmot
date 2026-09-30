@@ -200,6 +200,7 @@ type MetaStore interface {
 	// CleanupOldTransactionRecords deletes committed log entries whose
 	// position is <= safe and whose CommittedAt is older than minRetention,
 	// or whose CommittedAt is older than maxRetention regardless of safe.
+	// A maxRetention <= 0 means no maximum: nothing above safe is deleted.
 	// It only ever deletes a prefix of the log in position order (see the
 	// implementation's doc comment) and advances TruncatedThrough to the
 	// highest position it deleted.
