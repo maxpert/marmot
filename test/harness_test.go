@@ -317,6 +317,11 @@ delta_sync_threshold_seconds = %d
 [metastore]
 strict_prepare_sync = %t
 
+[batch_commit]
+# A test client writes one statement at a time: each commit waits out the
+# whole flush window.
+max_wait_ms = 1
+
 [mysql]
 bind_address = "127.0.0.1"
 port = %d

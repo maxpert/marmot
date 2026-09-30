@@ -58,7 +58,8 @@ type NodeRegistry struct {
 	onNodeLeavingFunc func()           // Callback when local node marked LEAVING via remote decommission
 	callbackMu        sync.RWMutex
 	// aliveChanged is notified, after onNodeAliveFunc, whenever a node turns
-	// or is discovered ALIVE (AliveChanged).
+	// or is discovered ALIVE, and when an ALIVE node announces ALIVE at a
+	// higher incarnation (AliveChanged).
 	aliveChanged common.Broadcast
 
 	// store persists membership so a restarted node does not compute a quorum
@@ -182,6 +183,9 @@ func (nr *NodeRegistry) Update(node *NodeState) {
 
 	// Track if node transitions to ALIVE for callback
 	becameAlive := false
+	// reannouncedAlive is an ALIVE node at a higher incarnation: no status
+	// change, so no callback, but AliveChanged waiters may now get an answer.
+	reannouncedAlive := false
 
 	// Rule 4: Apply SWIM state update rules
 	stateChanged := false
@@ -226,9 +230,15 @@ func (nr *NodeRegistry) Update(node *NodeState) {
 			stateChanged = true
 		}
 
-		// Check if node became ALIVE
-		if oldStatus != NodeStatus_ALIVE && node.Status == NodeStatus_ALIVE {
-			becameAlive = true
+		// Check if node became ALIVE, or announced ALIVE again: a joiner's
+		// promotion reads ALIVE -> ALIVE here when its JOINING, set without a
+		// bump (MarkJoining), never reached this node.
+		if node.Status == NodeStatus_ALIVE {
+			if oldStatus != NodeStatus_ALIVE {
+				becameAlive = true
+			} else {
+				reannouncedAlive = true
+			}
 		}
 	} else if node.Incarnation == existing.Incarnation && nr.shouldEscalate(existing.Status, node.Status) {
 		// Same incarnation: only allow escalation (ALIVE -> SUSPECT -> DEAD)
@@ -281,6 +291,8 @@ func (nr *NodeRegistry) Update(node *NodeState) {
 	// Call callback outside lock to avoid deadlock
 	if becameAlive {
 		nr.fireOnNodeAlive(node)
+	} else if reannouncedAlive {
+		nr.aliveChanged.Notify()
 	}
 }
 
@@ -298,7 +310,9 @@ func (nr *NodeRegistry) fireOnNodeAlive(node *NodeState) {
 }
 
 // AliveChanged returns a channel closed the next time a node turns or is
-// discovered ALIVE, once the ALIVE callback has run for it.
+// discovered ALIVE, once the ALIVE callback has run for it, or an ALIVE node
+// announces ALIVE at a higher incarnation (a promotion this node saw no
+// JOINING for, or a restart).
 func (nr *NodeRegistry) AliveChanged() <-chan struct{} {
 	return nr.aliveChanged.Next()
 }

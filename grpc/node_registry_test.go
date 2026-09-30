@@ -1184,6 +1184,43 @@ func TestNodeRegistry_AliveChangedFiresOnAlive(t *testing.T) {
 	}
 }
 
+// TestNodeRegistry_AliveChangedFiresOnJoinerPromotion: a joiner that refutes
+// the seed's JOINING record before it marks itself JOINING is ALIVE in the
+// seed's view throughout its catch-up, because MarkJoining does not bump its
+// incarnation. Its promotion must still wake the seed's AliveChanged waiters:
+// a held seed merges claim bases only on that signal or its merge interval,
+// and a catching-up joiner cannot answer the merge.
+//
+// Mutation: signal AliveChanged only when a peer's status turns ALIVE. The
+// promotion does not signal.
+func TestNodeRegistry_AliveChangedFiresOnJoinerPromotion(t *testing.T) {
+	seed := NewNodeRegistry(1, "localhost:8081")
+	joiner := NewNodeRegistry(2, "localhost:8082")
+	gossip := func() {
+		self, _ := joiner.Get(2)
+		seed.Update(self)
+	}
+
+	seed.Add(&NodeState{NodeId: 2, Address: "localhost:8082", Status: NodeStatus_JOINING})
+	rumour, _ := seed.Get(2)
+	joiner.Update(rumour)
+	gossip()
+	if v, _ := seed.Get(2); v.Status != NodeStatus_ALIVE {
+		t.Fatalf("fixture: seed view after the refutation %v, want ALIVE", v.Status)
+	}
+
+	joiner.MarkJoining(2)
+	gossip()
+	ch := seed.AliveChanged()
+	joiner.MarkAlive(2)
+	gossip()
+	select {
+	case <-ch:
+	default:
+		t.Fatal("the joiner's promotion did not signal AliveChanged on the seed")
+	}
+}
+
 // TestNodeRegistry_DiscoveringAnAliveNodeConnectsToIt pins that the ALIVE
 // callback, which opens this node's connection to a
 // peer, fires when gossip first tells us of a peer that is already ALIVE, not
