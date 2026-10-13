@@ -1676,7 +1676,8 @@ func readLengthEncodedInt(b []byte) (uint64, int) {
 		if len(b) < 4 {
 			return 0, 0
 		}
-		return uint64(binary.LittleEndian.Uint32(b[1:4])), 4
+		// 3-byte little-endian integer; binary.LittleEndian.Uint32 needs 4 bytes.
+		return uint64(b[1]) | uint64(b[2])<<8 | uint64(b[3])<<16, 4
 	case 0xFE:
 		if len(b) < 9 {
 			return 0, 0
